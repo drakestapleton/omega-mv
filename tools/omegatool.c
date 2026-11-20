@@ -4077,6 +4077,10 @@ int main(int argc, char **argv) {
         return run_m18_gates();
     }
 
+    if (strcmp(argv[1], "--run-m18-nested-gates") == 0) {
+        return run_m18_nested_gates();
+    }
+
     if (strcmp(argv[1], "--run-m17-gates") == 0) {
         return run_m17_gates();
     }

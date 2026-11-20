@@ -1007,12 +1007,87 @@ static void m18_clean_clone_remove_checkout(const char *clone) {
     }
 }
 
-static bool test_m18_gate16_clean_clone(void) {
-    if (getenv("OMEGA_IN_CLEAN_CLONE") != NULL) {
-        return true;
+/* These identities belong to this invocation of the M18 gate suite. */
+#ifndef OMEGA_M18_BUILD_COMMIT
+#define OMEGA_M18_BUILD_COMMIT ""
+#endif
+static char m18_checked_commit[41], m18_checked_tree[41], m18_pin_digest[65];
+static char m18_pin_dirs[3][PATH_MAX];
+static bool m18_staging_proved, m18_nested_execution;
+
+static bool m18_source_identity(const char *dir, char commit[41], char tree[41]) {
+    char id[64];
+    char *tree_argv[] = {"git", "rev-parse", "--verify", "HEAD^{tree}", NULL};
+    if (!omega_cc_clean_revision(dir, commit) || strcmp(commit, OMEGA_M18_BUILD_COMMIT) != 0 ||
+        !omega_cc_capture_line(dir, "git", tree_argv, id, sizeof id) ||
+        strlen(id) != 40 || strspn(id, "0123456789abcdef") != 40) return false;
+    memcpy(tree, id, 41);
+    return true;
+}
+
+/* Bind the bytes consumed by the nested make to the SHA-256 manifest in the
+ * verified commit. Canonical tar metadata excludes filesystem owner, time and
+ * inherited directory setgid while retaining executable bits and symlink targets.
+ * The offline pin helper separately validates the Git object
+ * graph, worktree paths, symlink targets and executable modes against each lock. */
+static bool m18_verify_pins(const char *root, const char *scratch) {
+    static const char *const labels[] = {"physics", "aienos", "argus"};
+    static const char *const env[] = {"PHYSICS_DIR", "AIENOS_R7_DIR", "ARGUS_REPO"};
+    static const char *const defaults[] = {"../physics", "../aienos", "../aienos-argus"};
+    char manifest[PATH_MAX], output[PATH_MAX + 80];
+    int n = snprintf(manifest, sizeof manifest, "%s/tools/m18/build-pins.sha256", root);
+    if (n < 0 || (size_t)n >= sizeof manifest) return false;
+    char *digest_argv[] = {"sha256sum", "--", manifest, NULL};
+    if (!omega_cc_capture_line(NULL, "sha256sum", digest_argv, output, sizeof output) ||
+        strspn(output, "0123456789abcdef") != 64 || output[64] != ' ') return false;
+    char manifest_hash[65];
+    memcpy(manifest_hash, output, 64);
+    manifest_hash[64] = 0;
+    FILE *expected = fopen(manifest, "r");
+    if (!expected) return false;
+    bool ok = true;
+    for (size_t i = 0; i < 3 && ok; i++) {
+        char row[128], suffix[32];
+        snprintf(suffix, sizeof suffix, "  %s.tar\n", labels[i]);
+        if (!fgets(row, sizeof row, expected) || strspn(row, "0123456789abcdef") != 64 ||
+            strcmp(row + 64, suffix) != 0) { ok = false; break; }
+        const char *loc = getenv(env[i]);
+        char lock[32], archive[PATH_MAX], rev[64];
+        char *pin = m18_pin_dirs[i];
+        if (!realpath(loc && *loc ? loc : defaults[i], pin) || !omega_cc_path_is_plain(pin)) { ok = false; break; }
+        snprintf(lock, sizeof lock, "%s.lock", labels[i]);
+        n = snprintf(archive, sizeof archive, "%s/%s.tar", scratch, labels[i]);
+        if (n < 0 || (size_t)n >= sizeof archive) { ok = false; break; }
+        char *lock_argv[] = {"cat", "--", lock, NULL};
+        char *verify_argv[] = {"tools/pinned_checkout.sh", "verify", pin, rev, NULL};
+        char *modes[] = {"find", ".", "!", "-type", "l", "-perm", "/222", "-print", "-quit", NULL};
+        char *tar_argv[] = {"tar", "--sort=name", "--format=gnu", "--mtime=@0", "--owner=0", "--group=0",
+                            "--numeric-owner", "--mode=a-s,a-t,u=rwX,go=rX", "--exclude=./.git", "-cf", archive, ".", NULL};
+        ok = omega_cc_capture_line(root, "cat", lock_argv, rev, sizeof rev) && strlen(rev) == 40 &&
+             strspn(rev, "0123456789abcdef") == 40 && omega_cc_run(root, verify_argv[0], verify_argv, NULL, false) == 0 &&
+             omega_cc_output_empty(pin, "find", modes) && omega_cc_run(pin, "tar", tar_argv, NULL, false) == 0;
+        if (!ok) fprintf(stderr, "M18 staging: could not verify or archive the read-only %s input\n", labels[i]);
     }
-    /* Copy the repo this omegatool runs from (the code under test), not a
-     * hardcoded checkout, and pass the PHYSICS_DIR this process resolves at run time
+    if (fgetc(expected) != EOF || ferror(expected)) ok = false;
+    fclose(expected);
+    char *check[] = {"sha256sum", "--check", "--strict", "--", manifest, NULL};
+    if (ok && omega_cc_run(scratch, "sha256sum", check, NULL, false) != 0) {
+        fprintf(stderr, "M18 staging: dependency bytes differ from %s\n", manifest);
+        ok = false;
+    }
+    if (ok) memcpy(m18_pin_digest, manifest_hash, sizeof manifest_hash);
+    return ok;
+}
+
+static bool test_m18_gate16_clean_clone(void) {
+    const char *nested = getenv("OMEGA_M18_STAGED_COMMIT");
+    if (m18_nested_execution) {
+        const char *tree = getenv("OMEGA_M18_STAGED_TREE"), *pins = getenv("OMEGA_M18_STAGED_PINS");
+        return nested && tree && pins && !strcmp(nested, m18_checked_commit) &&
+               !strcmp(tree, m18_checked_tree) && !strcmp(pins, m18_pin_digest);
+    }
+    /* Rebuild the committed source of the running omegatool in an independent
+     * checkout. Pass the PHYSICS_DIR this process resolves at run time
      * (omega_physics_dir.h) as an absolute path so the copy does not fall back to
      * the Makefile default ../physics. Mirrors M19.
      *
@@ -1065,16 +1140,51 @@ static bool test_m18_gate16_clean_clone(void) {
         (void)rmdir(clone);
         return false;
     }
-    char *cp_argv[] = {"cp", "-r", "--", root, checkout, NULL};
-    char *clean_argv[] = {"make", "clean", NULL};
-    char *make_argv[] = {"make", "-j", physics_arg, NULL};
-    char *run_argv[] = {"./build/omegatool", "--run-m18-gates", NULL};
-    const char *step = "cp";
-    int rc = omega_cc_run(NULL, "cp", cp_argv, NULL, false);
+    char source_head[41], source_tree[41], clone_head[41], clone_tree[41];
+    if (!m18_source_identity(root, source_head, source_tree) || strcmp(source_head, m18_checked_commit) != 0 ||
+        strcmp(source_tree, m18_checked_tree) != 0) {
+        fprintf(stderr, "M18 clean clone: could not verify a clean source revision\n");
+        (void)rmdir(clone);
+        return false;
+    }
+    char *clone_argv[] = {"git", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "clone", "--quiet", "--no-local", "--", root, checkout, NULL};
+    char *clean_argv[] = {"make", "OUT_DIR=build", "clean", NULL};
+    char aienos_arg[PATH_MAX + 24], argus_arg[PATH_MAX + 24];
+    char staged_commit[80], staged_tree[80], staged_pins[96];
+    snprintf(staged_commit, sizeof staged_commit, "OMEGA_M18_STAGED_COMMIT=%s", source_head);
+    snprintf(staged_tree, sizeof staged_tree, "OMEGA_M18_STAGED_TREE=%s", source_tree);
+    snprintf(staged_pins, sizeof staged_pins, "OMEGA_M18_STAGED_PINS=%s", m18_pin_digest);
+    snprintf(aienos_arg, sizeof aienos_arg, "AIENOS_R7_DIR=%s", m18_pin_dirs[1]);
+    snprintf(argus_arg, sizeof argus_arg, "ARGUS_REPO=%s", m18_pin_dirs[2]);
+    char *make_argv[] = {"env", "GIT_ALLOW_PROTOCOL=file", "make", "-j", "OUT_DIR=build", "PHYSICS_LOCK_CHECK=1", physics_arg, aienos_arg, argus_arg, NULL};
+    char *run_argv[] = {"env", physics_arg, aienos_arg, argus_arg, staged_commit, staged_tree, staged_pins, "GIT_ALLOW_PROTOCOL=file",
+                        "./build/omegatool", "--run-m18-nested-gates", NULL};
+    const char *step = "git clone";
+    int rc = omega_cc_run(NULL, "git", clone_argv, NULL, false);
+    if (rc == 0) {
+        step = "verify checkout";
+        if (!m18_source_identity(checkout, clone_head, clone_tree) || strcmp(source_head, clone_head) != 0 ||
+            strcmp(source_tree, clone_tree) != 0) rc = 1;
+    }
     if (rc == 0) { step = "make clean"; rc = omega_cc_run(checkout, "make", clean_argv, NULL, false); }
-    if (rc == 0) { step = "make"; rc = omega_cc_run(checkout, "make", make_argv, NULL, false); }
+    if (rc == 0) { step = "make"; rc = omega_cc_run(checkout, "env", make_argv, NULL, false); }
+    if (rc == 0) {
+        /* A source stamp on one object cannot vouch for every other linked
+         * object. Compare the running executable to the fresh staged build. */
+        char executing[64];
+        snprintf(executing, sizeof executing, "/proc/%ld/exe", (long)getpid());
+        char *compare[] = {"cmp", "-s", "--", executing, "./build/omegatool", NULL};
+        step = "compare rebuilt executable";
+        rc = omega_cc_run(checkout, "cmp", compare, NULL, false);
+    }
     /* The log sits beside the checkout: <clone>/clean_clone_m18.log. */
-    if (rc == 0) { step = "omegatool --run-m18-gates"; rc = omega_cc_run(checkout, "./build/omegatool", run_argv, "../clean_clone_m18.log", true); }
+    if (rc == 0) { step = "omegatool --run-m18-gates"; rc = omega_cc_run(checkout, "env", run_argv, "../clean_clone_m18.log", true); }
+    if (rc == 0) {
+        step = "verify rebuilt checkout";
+        if (!m18_source_identity(checkout, clone_head, clone_tree) || strcmp(source_head, clone_head) ||
+            strcmp(source_tree, clone_tree)) rc = 1;
+    }
+    m18_staging_proved = rc == 0;
     if (rc != 0) fprintf(stderr, "M18 clean clone failed at %s (rc %d); log: %s\n", step, rc, log_path);
     m18_clean_clone_remove_checkout(clone);
     return (rc == 0);
@@ -1181,9 +1291,10 @@ static bool test_m18_gate18_receipt(void) {
     omega_blackwell_kernel_free(&k_bf16);
 
     /* 2. Commit / physics identity: observed, not asserted. */
-    char run_commit[41] = "UNKNOWN";
-    if (!omega_evidence_run_commit(run_commit)) strcpy(run_commit, "UNKNOWN");
-    bool tree_dirty = omega_evidence_tree_dirty();
+    char run_commit[41], run_tree[41];
+    if (!m18_source_identity(".", run_commit, run_tree) || strcmp(run_commit, m18_checked_commit) ||
+        strcmp(run_tree, m18_checked_tree)) return false;
+    bool tree_dirty = false;
 
     char physics_commit[65] = "UNKNOWN";
     if (!omega_evidence_physics_commit(physics_commit, sizeof(physics_commit))) strcpy(physics_commit, "UNKNOWN");
@@ -1283,6 +1394,11 @@ static bool test_m18_gate18_receipt(void) {
     fprintf(f, "  \"architecture_canonical_head\": \"%s\",\n", "f4d86c8587ef87f5fba9088daf638c4d563d0c0a");
     fprintf(f, "  \"m16_authority_commit\": \"%s\",\n", physics_commit);
     fprintf(f, "  \"physics_commit\": \"%s\",\n", physics_commit);
+    fprintf(f, "  \"source_staging\": \"%s\",\n", m18_staging_proved ? "verified-clean-git-checkout" :
+            m18_nested_execution ? "nested-execution-only" : "unverified");
+    fprintf(f, "  \"checked_out_commit\": \"%s\",\n", m18_checked_commit);
+    fprintf(f, "  \"checked_out_tree\": \"%s\",\n", m18_checked_tree);
+    fprintf(f, "  \"pin_manifest_sha256\": \"%s\",\n", m18_pin_digest);
     fprintf(f, "  \"run_commit\": \"%s\",\n", run_commit);
     fprintf(f, "  \"tree_dirty\": %s,\n", tree_dirty ? "true" : "false");
     {
@@ -1363,7 +1479,8 @@ static bool m18_receipt_finish(void) {
     return write_ok;
 }
 
-int run_m18_gates(void) {
+static int run_m18_suite(bool nested) {
+    m18_nested_execution = nested;
     printf("================================================================================\n");
     printf("    AIEN OMEGA SUBSTRATE: MILESTONE 18: OMEGA_BLACKWELL_MATMUL QUALIFICATION GATES\n");
     printf("================================================================================\n");
@@ -1378,6 +1495,26 @@ int run_m18_gates(void) {
     if (m18_receipt_file) {
         fclose(m18_receipt_file);
         m18_receipt_file = NULL;
+    }
+
+    m18_staging_proved = false;
+    char root[PATH_MAX], scratch[] = "/tmp/omega_m18_pin_proof_XXXXXX";
+    char *top[] = {"git", "rev-parse", "--show-toplevel", NULL};
+    if (!omega_cc_capture_line(NULL, "git", top, root, sizeof root) ||
+        !m18_source_identity(root, m18_checked_commit, m18_checked_tree)) {
+        report_m18_gate("OMEGA_BW_MATMUL_CLEAN_CLONE_PASS", false, "source revision preflight refused");
+        fprintf(stderr, "M18 refused: source is dirty, unreadable, or differs from the running binary's build commit\n");
+        return 1;
+    }
+    if (!mkdtemp(scratch)) {
+        report_m18_gate("OMEGA_BW_MATMUL_CLEAN_CLONE_PASS", false, "pin verification scratch unavailable");
+        return 1;
+    }
+    bool pins_ok = m18_verify_pins(root, scratch);
+    if (omega_cc_remove_tree(scratch) != 0 || !pins_ok) {
+        report_m18_gate("OMEGA_BW_MATMUL_CLEAN_CLONE_PASS", false, "offline build pin preflight refused");
+        fprintf(stderr, "M18 refused: offline read-only inputs failed lock or SHA-256 verification\n");
+        return 1;
     }
 
     report_m18_gate("OMEGA_BW_MATMUL_SEMANTIC_CONTRACT_PASS", test_m18_gate1_semantic_contract(), "Formal mathematical contract & CPU oracle parity");
@@ -1422,6 +1559,13 @@ int run_m18_gates(void) {
     printf("================================================================================\n");
     return (receipt_finished && m18_gate_passed == m18_gate_count) ? 0 : 1;
 }
+
+int run_m18_gates(void) { return run_m18_suite(false); }
+
+/* The nested child exercises the same gates. Only its parent can attest
+ * that a clean checkout was created and rebuilt. */
+int run_m18_nested_gates(void) { return run_m18_suite(true); }
+
 void run_demonstration_blackwell_matmul(void) {
     printf("================================================================================\n");
     printf("  AIEN OMEGA SUBSTRATE: DEMONSTRATION: PHYSICAL BLACKWELL GB10 MATMUL EXECUTION\n");
