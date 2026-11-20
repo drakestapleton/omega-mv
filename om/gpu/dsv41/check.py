@@ -85,6 +85,10 @@ def check(device):
     x = normal(b, 4, d)
     pre, post, mat = normal(b, 4), normal(b, 4), normal(b, 4, 4)
     (mixed,) = verify("hc_pre", (40, b, 1), 128, [x, pre], [np.einsum("bid,bi->bd", x, pre)])
+    cancellation = np.repeat(np.array([[[-1.], [129/128], [0.], [0.]]], np.float32), d, axis=2)
+    coefficients = np.array([[8454145/16777216, 8388609/16777216, .5, .5]], np.float32)
+    verify("hc_pre", (40, 1, 1), 128, [cancellation, coefficients],
+           [np.zeros((1, d), np.float32)], atol=0, rtol=0)
     verify("hc_post", (40, b, 1), 128, [mixed, x, post, mat],
            [mixed[:, None, :] * post[:, :, None] + np.einsum("bid,bij->bjd", x, mat)])
     raw, scale, bias = normal(b, 24), normal(3), normal(24)

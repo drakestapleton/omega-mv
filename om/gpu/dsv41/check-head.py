@@ -50,6 +50,8 @@ def fixture(path):
               rows[40960:] + struct.pack("<4f", -.2, .4, 1., .25))
     cancellation = b"".join(struct.pack("<H", word) * 5120 for word in (0xbf80, 0x3f81, 0, 0))
     frames += cancellation + struct.pack("<4f", 8454145/16777216, 8388609/16777216, .5, .5)
+    # BF16 2**70 is finite. Its FP32 square overflows, giving this frame zero RMS gain.
+    frames += struct.pack("<H", 0x6280) * 5120 + bytes(30720) + struct.pack("<4f", 1, 0, 0, 0)
     with path.open("xb") as f:
         f.write(frames)
 
@@ -71,7 +73,9 @@ def verify(shard, frames, logits):
         streams = widened(np.frombuffer(data, "<u2", 4*width, offset).reshape(4, width))
         mix = np.frombuffer(data, "<f4", 4, offset+8*width)
         state = rounded((streams * mix[:, None]).sum(axis=0, dtype=np.float32))
-        rms = np.float32(1 / np.sqrt(np.mean(state.astype(np.float64)**2) + 1e-20))
+        with np.errstate(over="ignore"):
+            var = np.mean(np.square(state), dtype=np.float32)
+        rms = np.float32(1) / np.sqrt(var + np.float32(1e-20))
         hidden.append(rounded(state*rms*gain))
     hidden = np.stack(hidden)
     reference = np.empty_like(actual)
