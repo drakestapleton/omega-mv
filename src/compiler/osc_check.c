@@ -76,13 +76,7 @@ enum { OM_LIVE = 0, OM_MOVED = 1, OM_GONE = 2 /* released (scope gone) */, OM_MA
 
 typedef OscCheckedOwner Obj;
 
-typedef struct {
-    uint8_t live, mut;
-    int obj, parent;
-    uint16_t kids_shared, kids_mut;
-    uint32_t line;
-    int sym;   /* binding symbol or -1 (call argument) */
-} Bor;
+typedef OscCheckedBorrow Bor;
 
 typedef struct {
     Obj obj[OSC_CHECK_MAX_OBJS];
@@ -210,8 +204,7 @@ static int new_obj(C *c, int sym, uint32_t line)
 {
     if (c->nobj >= OSC_CHECK_MAX_OBJS) return cap_fail(c, line, "owner capacity");
     Obj *o = &c->obj[c->nobj];
-    memset(o, 0, sizeof *o);
-    o->sym = sym;
+    osc_init_owner(o, sym);
     return c->nobj++;
 }
 
@@ -219,18 +212,10 @@ static int new_bor(C *c, int obj, int parent, int mut, uint32_t line)
 {
     if (c->nbor >= OSC_CHECK_MAX_BORS) return cap_fail(c, line, "borrow capacity");
     Bor *b = &c->bor[c->nbor];
-    memset(b, 0, sizeof *b);
-    b->live = 1;
-    b->mut = (uint8_t)mut;
-    b->obj = obj;
-    b->parent = parent;
-    b->line = line;
-    b->sym = -1;
-    if (parent >= 0) {
-        if (mut) c->bor[parent].kids_mut++; else c->bor[parent].kids_shared++;
-    } else {
-        if (mut) c->obj[obj].n_mut++; else c->obj[obj].n_shared++;
-    }
+    if (parent >= 0)
+        osc_open_reborrow(&c->bor[parent], b, obj, parent, mut, line);
+    else
+        osc_open_borrow(&c->obj[obj], b, obj, mut, line);
     return c->nbor++;
 }
 
@@ -238,12 +223,10 @@ static void end_bor(C *c, int b, uint32_t line)
 {
     Bor *x = &c->bor[b];
     tr_ev(c, OSC_EV_END_BORROW, -1, -1, b, -1, line, 0);
-    x->live = 0;
-    if (x->parent >= 0) {
-        if (x->mut) c->bor[x->parent].kids_mut--; else c->bor[x->parent].kids_shared--;
-    } else {
-        if (x->mut) c->obj[x->obj].n_mut--; else c->obj[x->obj].n_shared--;
-    }
+    if (x->parent >= 0)
+        osc_close_reborrow(&c->bor[x->parent], x);
+    else
+        osc_close_borrow(&c->obj[x->obj], x);
 }
 
 /* describe a live borrow conflicting on object o (direct) or as a child of borrow p */
@@ -308,7 +291,7 @@ static int access(C *c, int s, int wr, uint32_t line, uint32_t col)
     int b = y->bor;
     Bor *x = &c->bor[b];
     uint32_t k = wr ? OSC_EV_USE_WRITE : OSC_EV_USE_READ;
-    uint64_t decision = osc_borrow_access(x->mut, wr, x->kids_shared, x->kids_mut);
+    uint64_t decision = osc_borrow_access(x->mut, wr, x->n_shared, x->n_mut);
     if (decision == OSC_OWN_READ_ONLY) {
         tr_ev(c, k, x->obj, -1, -1, b, line, 1);
         snprintf(msg, sizeof msg, "store through shared borrow '%s' (read only)", y->name);
@@ -355,7 +338,7 @@ static int take_borrow(C *c, int s, int mut, uint32_t line, uint32_t col)
     }
     int p = y->bor;
     Bor *x = &c->bor[p];
-    uint64_t decision = osc_borrow_access(x->mut, mut, x->kids_shared, x->kids_mut);
+    uint64_t decision = osc_borrow_access(x->mut, mut, x->n_shared, x->n_mut);
     if (decision == OSC_OWN_READ_ONLY) {
         tr_ev(c, k, x->obj, -1, c->nbor, p, line, 1);
         snprintf(msg, sizeof msg, "&mut reborrow through shared borrow '%s' (read only)", y->name);
@@ -2049,7 +2032,7 @@ static int chk_stmt(C *c, int i)
             return -1;
         }
         Bor *old = &c->bor[y->bor];
-        if (old->kids_shared || old->kids_mut) {
+        if (old->n_shared || old->n_mut) {
             char other[64];
             conflict_name(c, -1, y->bor, 0, other, sizeof other);
             tr_ev(c, OSC_EV_END_BORROW, -1, -1, y->bor, -1, n->line, 1);

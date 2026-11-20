@@ -282,6 +282,26 @@ OMBR_ASSERT(offsetof(OscCheckedOwner, n_mut) == 4, "layout oscowner field n_mut"
 OMBR_ASSERT(offsetof(OscCheckedOwner, moveline) == 8, "layout oscowner field moveline");
 OMBR_ASSERT(offsetof(OscCheckedOwner, sym) == 12, "layout oscowner field sym");
 OMBR_ASSERT(offsetof(OscCheckedOwner, arena1) == 16, "layout oscowner field arena1");
+typedef struct {
+    uint8_t live;
+    uint8_t mut;
+    uint8_t ombr_pad2[2];
+    int32_t obj;
+    int32_t parent;
+    uint16_t n_shared;
+    uint16_t n_mut;
+    uint32_t line;
+    int32_t sym;
+} OscCheckedBorrow;
+OMBR_ASSERT(sizeof(OscCheckedBorrow) == 24, "layout oscbor size");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, live) == 0, "layout oscbor field live");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, mut) == 1, "layout oscbor field mut");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, obj) == 4, "layout oscbor field obj");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, parent) == 8, "layout oscbor field parent");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, n_shared) == 12, "layout oscbor field n_shared");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, n_mut) == 14, "layout oscbor field n_mut");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, line) == 16, "layout oscbor field line");
+OMBR_ASSERT(offsetof(OscCheckedBorrow, sym) == 20, "layout oscbor field sym");
 /* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
 uint64_t osc_owner_access(uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
 /* export fn osc_borrow_access writable ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
@@ -294,6 +314,16 @@ uint64_t osc_join_owner(const OscCheckedOwner *o_taken, OscCheckedOwner *o_remai
 int64_t osc_join_handle(int64_t o_before, int64_t o_current, int64_t o_other);
 /* export fn osc_join_frees taken view uchar * remaining edit uchar * to void */
 void osc_join_frees(const uint8_t *o_taken, size_t o_taken_len, uint8_t *o_remaining, size_t o_remaining_len);
+/* export fn osc_init_owner item edit oscowner symbol long to void */
+void osc_init_owner(OscCheckedOwner *o_item, int64_t o_symbol);
+/* export fn osc_open_borrow owner edit oscowner child edit oscbor object long mutable ulong source_line ulong to void */
+void osc_open_borrow(OscCheckedOwner *o_owner, OscCheckedBorrow *o_child, int64_t o_object, uint64_t o_mutable, uint64_t o_source_line);
+/* export fn osc_open_reborrow parent edit oscbor child edit oscbor object long parent_id long mutable ulong source_line ulong to void */
+void osc_open_reborrow(OscCheckedBorrow *o_parent, OscCheckedBorrow *o_child, int64_t o_object, int64_t o_parent_id, uint64_t o_mutable, uint64_t o_source_line);
+/* export fn osc_close_borrow owner edit oscowner child edit oscbor to void */
+void osc_close_borrow(OscCheckedOwner *o_owner, OscCheckedBorrow *o_child);
+/* export fn osc_close_reborrow parent edit oscbor child edit oscbor to void */
+void osc_close_reborrow(OscCheckedBorrow *o_parent, OscCheckedBorrow *o_child);
 #ifdef __cplusplus
 }
 #endif
