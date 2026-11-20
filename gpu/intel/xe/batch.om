@@ -1,0 +1,289 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note batch.om: pure seeded-Omega Intel Xe2/Xe3 Compute Command Streamer (CCS) batch buffer builder & checker.
+note Emits a 64-byte-aligned CCS batch buffer:
+note   PIPELINE_SELECT (Compute) -> STATE_BASE_ADDRESS -> CFE_STATE -> COMPUTE_WALKER ->
+note   PIPE_CONTROL (CS stall + DC flush + QWORD user-fence write) -> MI_BATCH_BUFFER_END.
+note
+note Usage:
+note   batch emit KERNEL_VA INLINE_VA FENCE_VA FENCE_VAL GX GY GZ SIMD
+note   batch check FILE.bin
+note Exit: 0 ok; 1 invalid batch; 2 usage; 3 I/O error.
+om2
+
+text tuse "usage: batch emit KERNEL_VA INLINE_VA FENCE_VA FENCE_VAL GX GY GZ SIMD | check FILE.bin\n"
+text temit "emit"
+text tchk "check"
+text tbad "batch: invalid CCS batch buffer\n"
+text tio "batch: I/O error\n"
+
+note Intel Xe2/Xe3 CCS command opcodes (32-bit dword headers):
+note   PIPELINE_SELECT (GPGPU/Compute): 0x69040002 (mask=0x300, select=2 Compute -> 0x69040302)
+note   STATE_BASE_ADDRESS (22 dwords):  0x61010014
+note   CFE_STATE (6 dwords):            0x70000004
+note   COMPUTE_WALKER (40 dwords):      0x70020026
+note   PIPE_CONTROL (6 dwords):         0x7a000004
+note   MI_BATCH_BUFFER_END (1 dword):   0x05000000
+note   MI_NOOP (1 dword):               0x00000000
+
+const OP_PIPE_SEL uint 0x69040302
+const OP_SBA uint 0x61010014
+const OP_CFE uint 0x70000004
+const OP_WALKER uint 0x70020026
+const OP_PIPE_CTL uint 0x7a000004
+const OP_BB_END uint 0x05000000
+
+global gdw uint 256
+global gbuf uchar 1024
+global gpath uchar 4096
+global garg uchar 64
+global gst ulong 4
+
+fn fail code int msg view uchar * to void
+n = write 2 msg 0 len msg
+exit code
+end
+
+fn argis i ulong t view uchar * to bool
+n = argread i garg 0 len garg
+if ne n long len t
+ret false
+end
+for k ulong len t
+if ne get garg k get t k
+ret false
+end
+end
+ret true
+end
+
+fn parseu ai ulong to ulong
+n = argread ai garg 0 len garg
+if or le n 0 gt n 20
+fail 2 tuse
+end
+v = ulong 0
+for i ulong ulong n
+c = get garg i
+if or lt c 48 gt c 57
+fail 2 tuse
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn dw v uint to void
+n = get gst 0
+put gdw n v
+put gst 0 add n 1
+end
+
+fn dw64 v ulong to void
+dw uint and v 4294967295
+dw uint shr v 32
+end
+
+fn emit_sba kva ulong to void
+dw OP_SBA
+for i ulong 11
+dw 0
+end
+note Instruction base address at dword 12..13 (bit 0 = modify enable)
+dw64 or and kva 18446744073709547520 1
+for i ulong 8
+dw 0
+end
+end
+
+fn emit_cfe to void
+dw OP_CFE
+dw 0
+dw 0
+note Max threads (bits 31:16) = 1024, compute dispatch mode
+dw 0x04000000
+dw 0
+dw 0
+end
+
+fn emit_walker kva ulong iva ulong gx uint gy uint gz uint simd uint to void
+dw OP_WALKER
+dw 0
+note dword 2: SIMD size (1=SIMD16, 2=SIMD32) in bits 31:30
+sbits = uint 0x40000000
+if eq simd 32
+sbits = 0x80000000
+end
+dw sbits
+note dword 3: indirect data length (64 bytes)
+dw 64
+note dword 4: indirect data start address (low 32)
+dw uint and iva 4294967295
+note dword 5..7: thread group dimensions X, Y, Z
+dw gx
+dw gy
+dw gz
+note dword 8..10: partition / local size (64, 1, 1)
+dw 64
+dw 1
+dw 1
+note dword 11..17: execution masks & reserved
+dw 0xffffffff
+dw 0xffffffff
+for i ulong 5
+dw 0
+end
+note dword 18..19: InterfaceDescriptorData.KernelStartPointer (64-byte aligned offset)
+dw64 and kva 4095
+note dword 20..39: remaining IDD + inline data (inline_va in dword 26..27)
+for i ulong 6
+dw 0
+end
+dw64 iva
+for i ulong 12
+dw 0
+end
+end
+
+fn emit_pipe_ctl fva ulong fval ulong to void
+dw OP_PIPE_CTL
+note CS stall (bit 20) | DC flush (bit 5) | post-sync write immediate (bits 15:14 = 1) | 64-bit GTT
+dw 0x00104020
+dw64 fva
+dw64 fval
+end
+
+fn flush_dw to void
+while ne rem get gst 0 16 0 bound 16
+dw 0
+end
+ndw = get gst 0
+for i ulong ndw
+v = get gdw i
+o = mul i 4
+for k ulong 4
+put gbuf add o k uchar and shr v mul uint k 8 255
+end
+end
+nb = mul ndw 4
+r = write 1 gbuf 0 nb
+if ne r long nb
+fail 3 tio
+end
+end
+
+fn do_emit to void
+if ne argcnt 10
+fail 2 tuse
+end
+kva = parseu 2
+iva = parseu 3
+fva = parseu 4
+fval = parseu 5
+gx = uint parseu 6
+gy = uint parseu 7
+gz = uint parseu 8
+simd = uint parseu 9
+if and ne simd 16 ne simd 32
+fail 2 tuse
+end
+dw OP_PIPE_SEL
+emit_sba kva
+emit_cfe
+emit_walker kva iva gx gy gz simd
+emit_pipe_ctl fva fval
+dw OP_BB_END
+flush_dw
+end
+
+fn gbu32 i ulong to uint
+o = mul i 4
+v = uint 0
+for k ulong 4
+v = or v shl uint get gbuf add o k mul uint k 8
+end
+ret v
+end
+
+fn do_check to void
+if ne argcnt 3
+fail 2 tuse
+end
+pn = argread 2 gpath 0 len gpath
+if le pn 0
+fail 2 tuse
+end
+fd = fopen gpath 0 ulong pn 0 0
+if lt fd 0
+fail 3 tio
+end
+sz = fseek int fd 0 2
+if or lt sz 64 gt sz 1024
+c = fclose int fd
+fail 1 tbad
+end
+if ne rem ulong sz 64 0
+c = fclose int fd
+fail 1 tbad
+end
+r = pread int fd gbuf 0 ulong sz 0
+c = fclose int fd
+if ne r sz
+fail 3 tio
+end
+ndw = div ulong sz 4
+p = ulong 0
+seen_walk = false
+seen_end = false
+while lt p ndw bound 256
+h = gbu32 p
+if eq h 0
+p = add p 1
+continue
+end
+if eq h OP_BB_END
+seen_end = true
+break
+end
+if eq h OP_PIPE_SEL
+p = add p 1
+continue
+end
+if eq h OP_SBA
+p = add p 22
+continue
+end
+if eq h OP_CFE
+p = add p 6
+continue
+end
+if eq h OP_WALKER
+seen_walk = true
+p = add p 40
+continue
+end
+if eq h OP_PIPE_CTL
+p = add p 6
+continue
+end
+fail 1 tbad
+end
+if or not seen_walk not seen_end
+fail 1 tbad
+end
+end
+
+fn main to int
+if lt argcnt 3
+fail 2 tuse
+end
+if argis 1 temit
+do_emit
+ret 0
+end
+if argis 1 tchk
+do_check
+ret 0
+end
+fail 2 tuse
+ret 2
+end
