@@ -35,6 +35,8 @@ spark-window run ./wtrain gb10 ./ollm-gb10 base.ck merges.bin training.om held-o
 
 The GPU invocation runs inside an authorized exclusive Spark window. The harness creates a private directory, writes the token streams and `candidate.ck` there, and records native tokenizer, optimizer and evaluator output in `run.log`. An existing output directory is refused. A failed run retains its partial files. A successful run ends with `TRAINING_COMPLETE` after the final evaluation. The E lines report held-out language-model loss. Coding accuracy requires separate execution tests.
 
+The [contrast-training experiment and example-checked coding chain](tools/contrast/README.md) include a CPU replay of generated functions against their expected outputs.
+
 ## Units
 
 Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`); `build.sh` has no Darwin target, so the `ollm_darwin` row follows upstream `tests/omegallm/ollm_metrics_bench.py` (`darwin-arm64`):
