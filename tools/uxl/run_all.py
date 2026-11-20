@@ -497,7 +497,7 @@ def install_command(machine):
     like = (release.get("ID_LIKE") or "").lower()
     family = ident + " " + like
     if "debian" in family or "ubuntu" in family or ident in ("debian", "ubuntu"):
-        packages = ["python3", "ocl-icd-libopencl1"]
+        packages = ["python3"]
         if machine.arch == "x86_64":
             packages[1:1] = ["qemu-user-static", "binfmt-support"]
         command = (
@@ -515,12 +515,12 @@ def install_command(machine):
             command += " && sudo " + binfmt_register_command()
         return command
     if "fedora" in family or "rhel" in family or ident in ("fedora", "rhel", "centos"):
-        packages = "python3 ocl-icd"
+        packages = "python3"
         if machine.arch == "x86_64":
             packages = "qemu-user-static " + packages
         return "sudo dnf install -y " + packages
     if ident == "arch" or "arch" in like.split():
-        packages = "python ocl-icd"
+        packages = "python"
         if machine.arch == "x86_64":
             packages = "qemu-user-static " + packages
         return "sudo pacman -Sy --needed --noconfirm " + packages
