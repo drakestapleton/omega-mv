@@ -1,0 +1,524 @@
+note A single-layer host transport. The parent is the only metadata writer. One child reads the pack.
+global handles long 3
+global pipes int 4
+global packRows uint 384
+global warmCount uint 1
+global fileBytes ulong 1
+const cacheSlots uint 4
+const hotSlots uint 2
+const ringSlots uint 2
+fn leWord buf view uchar * off ulong to uint
+v = uint 0
+for i ulong 4
+v = or v shl uint get buf add off i mul i 8
+end
+ret v
+end
+fn recvAll fd int buf edit uchar * to int
+n = ulong 0
+while lt n len buf
+r = read fd buf n sub len buf n
+if eq r -4
+continue
+end
+if lt r 0
+ret -1
+end
+if eq r 0
+if eq n 0
+ret 0
+end
+ret -1
+end
+n = add n ulong r
+end
+ret 1
+end
+fn sendAll fd int buf view uchar * size ulong to bool
+n = ulong 0
+while lt n size
+r = write fd buf n sub size n
+if eq r -4
+continue
+end
+if le r 0
+ret false
+end
+n = add n ulong r
+end
+ret true
+end
+fn packIndex fd int to bool
+h = new uchar 4096 0
+if ne pread fd h 0 4096 0 4096
+ret false
+end
+if or ne leWord h 0 0x31505844 ne leWord h 4 1
+ret false
+end
+count = leWord h 8
+if or eq count 0 gt count 384
+ret false
+end
+if ne leWord h 12 expertBytes
+ret false
+end
+size = add 4096 mul ulong count ulong expertBytes
+if ne fseek fd 0 2 long size
+ret false
+end
+put fileBytes 0 size
+for i uint count
+key = leWord h add 16 mul ulong i 4
+if ge key 384
+ret false
+end
+if ne get packRows key 0
+ret false
+end
+put packRows key add i 1
+end
+ret true
+end
+fn transfer fd int r edit nvreq to bool
+if ge get r slot cacheSlots
+ret false
+end
+if or ne get r length expertBytes ne get r arenaoff mul ulong get r slot ulong expertBytes
+ret false
+end
+if gt get r fileoff sub get fileBytes 0 ulong expertBytes
+ret false
+end
+b = new uchar 65536 0
+n = ulong 0
+while lt n ulong expertBytes
+k = minChunk sub ulong expertBytes n
+got = pread fd b 0 k long add get r fileoff n
+if eq got -4
+continue
+end
+if le got 0
+ret false
+end
+if ne mapwrite get handles 2 add get r arenaoff n b 0 ulong got got
+ret false
+end
+n = add n ulong got
+put r got uint n
+end
+ret true
+end
+fn minChunk n ulong to ulong
+if gt n 65536
+ret 65536
+end
+ret n
+end
+fn workOne fd int r edit nvreq to void
+if not transfer fd r
+put r status -1
+end
+end
+fn worker fd int to int
+r = new uchar 64 0
+for turn ulong 1000000000
+n = recvAll get pipes 0 r
+if eq n 0
+ret 0
+end
+if lt n 0
+ret 74
+end
+workOne fd r
+cpufence
+if not sendAll get pipes 3 r 64
+ret 74
+end
+end
+ret 75
+end
+fn tableRead slot uint s edit slab to bool
+ret eq mapread get handles 0 mul ulong slot 64 s 0 64 64
+end
+fn tableWrite slot uint s view slab to bool
+ret eq mapwrite get handles 0 mul ulong slot 64 s 0 64 64
+end
+fn queuePos ticket ulong to ulong
+ret mul rem sub ticket 1 ulong ringSlots 64
+end
+fn sameRequest a view nvreq b view nvreq to bool
+if or ne get a key get b key ne get a slot get b slot
+ret false
+end
+if or ne get a fileoff get b fileoff ne get a arenaoff get b arenaoff
+ret false
+end
+if or ne get a length get b length ne get a pack get b pack
+ret false
+end
+ret and eq get b phase 1 eq get a version get b version
+end
+fn acceptResult q edit nvqueue doneRec view nvreq s edit slab r edit nvreq to bool
+seq = get doneRec ticket
+if ne seq add get q retire 1
+ret false
+end
+if ne mapread get handles 1 queuePos seq r 0 64 64
+ret false
+end
+if not sameRequest r doneRec
+ret false
+end
+slot = get r slot
+if not tableRead slot s
+ret false
+end
+if not complete s r seq get doneRec got get doneRec status
+ret false
+end
+if not tableWrite slot s
+ret false
+end
+if not reap q r
+ret false
+end
+ret eq get s state 2
+end
+fn waitOne q edit nvqueue to bool
+if eq get q retire get q submit
+ret false
+end
+msg = new uchar 64 0
+s = new uchar 64 0
+r = new uchar 64 0
+if ne recvAll get pipes 2 msg 1
+ret false
+end
+ret acceptResult q msg s r
+end
+fn drain q edit nvqueue to bool
+while lt get q retire get q submit
+if not waitOne q
+ret false
+end
+end
+ret true
+end
+fn startSlot t edit slabtab q edit nvqueue s edit slab r edit nvreq slot uint key uint to bool
+if not tableRead slot s
+ret false
+end
+row = get packRows key
+if eq row 0
+ret false
+end
+request r slot key add 4096 mul ulong sub row 1 ulong expertBytes
+if not beginRead t q s r
+ret false
+end
+if not tableWrite slot s
+ret false
+end
+if ne mapwrite get handles 1 queuePos get r ticket r 0 64 64
+ret false
+end
+if not sendAll get pipes 1 r 64
+ret false
+end
+if ge slot hotSlots
+bumpFifo t
+end
+ret true
+end
+fn startKey t edit slabtab q edit nvqueue slot uint key uint to bool
+s = new uchar 64 0
+r = new uchar 64 0
+ret startSlot t q s r slot key
+end
+fn matchSlot t view slabtab s view slab key uint to uint
+if and eq get s zone 2 ne get s epoch get t epoch
+ret 0
+end
+if ne get s key key
+ret 0
+end
+ret get s state
+end
+note Encoded result is slot plus one for READY, its negative for LOADING, zero for a miss.
+fn lookup t view slabtab s edit slab key uint to int
+for i uint cacheSlots
+if not tableRead i s
+ret -127
+end
+st = matchSlot t s key
+if eq st 2
+ret int add i 1
+end
+if eq st 1
+ret neg int add i 1
+end
+end
+ret 0
+end
+fn probe t view slabtab key uint to int
+s = new uchar 64 0
+ret lookup t s key
+end
+fn canDispatch t view slabtab q view nvqueue s edit slab to bool
+if not freeEntry q
+ret false
+end
+if not tableRead fifoSlot t s
+ret false
+end
+ret not busy s
+end
+fn maybeRead t edit slabtab q edit nvqueue key uint to bool
+s = new uchar 64 0
+if ne probe t key 0
+ret true
+end
+if not canDispatch t q s
+ret true
+end
+ret startKey t q fifoSlot t key
+end
+fn consume t view slabtab s edit slab slot uint key uint hit uint to bool
+v = acquire t s key
+if eq v 0
+ret false
+end
+if not tableWrite slot s
+ret false
+end
+header = new uchar 8 0
+for i ulong 4
+put header i uchar and shr key mul i 8 255
+end
+put header 4 uchar hit
+put header 5 uchar get s zone
+if not sendAll 1 header 8
+ret false
+end
+if not emitSlab get s offset
+ret false
+end
+if not release s key v
+ret false
+end
+ret tableWrite slot s
+end
+fn emitSlab base ulong to bool
+b = new uchar 65536 0
+n = ulong 0
+while lt n ulong expertBytes
+k = minChunk sub ulong expertBytes n
+if ne mapread get handles 2 add base n b 0 k long k
+ret false
+end
+if not sendAll 1 b k
+ret false
+end
+n = add n k
+end
+ret true
+end
+fn demand t edit slabtab q edit nvqueue key uint to bool
+s = new uchar 64 0
+hit = uint 1
+for attempt uint 6
+found = lookup t s key
+if gt found 0
+ret consume t s uint sub found 1 key hit
+end
+if eq found -127
+ret false
+end
+hit = 0
+if eq found 0
+if canDispatch t q s
+if not startKey t q fifoSlot t key
+ret false
+end
+end
+end
+if not waitOne q
+ret false
+end
+end
+ret false
+end
+fn warm t edit slabtab q edit nvqueue key uint to bool
+slot = get warmCount 0
+if ge slot hotSlots
+ret false
+end
+if not drain q
+ret false
+end
+found = probe t key
+if lt found 0
+ret false
+end
+if and gt found 0 le found int hotSlots
+ret false
+end
+note A newly protected key can already have a scratch copy. Both carry identical immutable bytes.
+if not startKey t q slot key
+ret false
+end
+put warmCount 0 add slot 1
+ret waitOne q
+end
+fn pollReady q edit nvqueue to bool
+while lt get q retire get q submit
+p = waitio get pipes 2 1 0
+if eq p 0
+ret true
+end
+if eq p -4
+continue
+end
+if lt p 0
+ret false
+end
+if not waitOne q
+ret false
+end
+end
+ret true
+end
+fn step t edit slabtab q edit nvqueue op uint value uint to bool
+if eq op 4
+vote = observe t add get t turn 1 value
+ret true
+end
+if eq op 5
+if ne get t pending value
+ret false
+end
+if not drain q
+ret false
+end
+if not commitPack t q get handles 0
+ret false
+end
+put warmCount 0 0
+ret true
+end
+if ge value 384
+ret false
+end
+if eq get packRows value 0
+ret false
+end
+if eq op 1
+ret warm t q value
+end
+if eq op 2
+ret demand t q value
+end
+if eq op 3
+ret maybeRead t q value
+end
+ret false
+end
+fn dispatch to int
+t = new uchar 64 0
+q = new uchar 64 0
+b = new uchar 8 0
+if not cacheStart t hotSlots sub cacheSlots hotSlots
+ret 70
+end
+if not ringStart q ringSlots
+ret 70
+end
+for i ulong 1000000000
+n = recvAll 0 b
+if eq n 0
+if drain q
+ret 0
+end
+ret 74
+end
+if lt n 0
+ret 65
+end
+if not pollReady q
+ret 74
+end
+if not step t q leWord b 0 leWord b 4
+ret 65
+end
+end
+ret 75
+end
+fn pipeAt index ulong to bool
+b = new uchar 8 0
+if lt pipefds b 0 8 524288 0
+ret false
+end
+put pipes index int leWord b 0
+put pipes add index 1 int leWord b 4
+ret true
+end
+fn runCache fd int to int
+put handles 0 mapnew -1 0 mul ulong cacheSlots 64 3 33
+put handles 1 mapnew -1 0 mul ulong ringSlots 64 3 33
+put handles 2 mapnew -1 0 mul ulong cacheSlots ulong expertBytes 3 33
+for i ulong 3
+if le get handles i 0
+ret 74
+end
+end
+if not pipeAt 0
+ret 74
+end
+if not pipeAt 2
+ret 74
+end
+pid = fork
+if lt pid 0
+ret 74
+end
+if eq pid 0
+x = fclose get pipes 1
+x = fclose get pipes 2
+ret worker fd
+end
+x = fclose get pipes 0
+x = fclose get pipes 3
+rc = dispatch
+x = fclose get pipes 1
+x = fclose get pipes 2
+status = new uchar 4 0
+w = waitpid int pid status 0 4 0
+while eq w -4
+w = waitpid int pid status 0 4 0
+end
+if and eq rc 0 or ne w pid ne leWord status 0 0
+ret 74
+end
+ret rc
+end
+fn main to int
+if ne argcnt 2
+ret 64
+end
+p = new uchar 4096 0
+n = argread 1 p 0 4096
+if le n 0
+ret 64
+end
+fd = fopen p 0 ulong n 524288 0
+if lt fd 0
+ret 66
+end
+if not packIndex int fd
+ret 65
+end
+rc = runCache int fd
+x = fclose int fd
+ret rc
+end

@@ -551,3 +551,7 @@ Trinary Doctrine wake-signal tool (`trit`, T-002) in seeded OM-2 sharing `tools/
 ## `seed/omc/tests/struct-bool/`
 
 Boolean struct-field execution regressions, exact expected outcomes, scalar controls and deliberate broken-compiler controls. Run by the seeded host gate. Results are kept in unique build directories.
+
+## `om/gpu/dsv41/cache/`
+
+Seeded OM-2 expert slab and I/O ring records, the DeepSeek V4.1 Flash layer-0 packer, a bounded two-zone cache replay, and its independent checkpoint-byte checks.

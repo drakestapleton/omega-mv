@@ -1,0 +1,260 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note One scheduler owns the tables. The file worker receives immutable request records.
+om2
+layout slabtab 64
+field abi uint at 0 little
+field protect uint at 4 little
+field scratch uint at 8 little
+field stride uint at 12 little
+field fifo uint at 16 little
+field domain uint at 20 little
+field pending uint at 24 little
+field streak uint at 28 little
+field turn ulong at 32 little
+field epoch ulong at 40 little
+field span ulong at 48 little
+field pad ulong at 56 little
+end
+layout slab 64
+field state uint at 0 little
+field key uint at 4 little
+field version ulong at 8 little
+field refs uint at 16 little
+field zone uint at 20 little
+field offset ulong at 24 little
+field length uint at 32 little
+field pad uint at 36 little
+field epoch ulong at 40 little
+field ticket ulong at 48 little
+field spare ulong at 56 little
+end
+layout nvqueue 64
+field abi uint at 0 little
+field capacity uint at 4 little
+field entsize uint at 8 little
+field pad uint at 12 little
+field submit ulong at 16 little
+field retire ulong at 24 little
+field spare ulong 4 at 32 little
+end
+layout nvreq 64
+field ticket ulong at 0 little
+field version ulong at 8 little
+field key uint at 16 little
+field slot uint at 20 little
+field fileoff ulong at 24 little
+field arenaoff ulong at 32 little
+field length uint at 40 little
+field got uint at 44 little
+field status int at 48 little
+field phase uint at 52 little
+field pack uint at 56 little
+field pad uint at 60 little
+end
+const expertBytes uint 18800640
+const noDomain uint 4294967295
+note An empty header and all slots initially contain zeroes. Keys are layer * 384 + expert.
+fn cacheStart t edit slabtab protectedCount uint scratchCount uint to bool
+if or eq protectedCount 0 eq scratchCount 0
+ret false
+end
+if gt add ulong protectedCount ulong scratchCount 15360
+ret false
+end
+put t abi 1
+put t protect protectedCount
+put t scratch scratchCount
+put t stride expertBytes
+put t pending noDomain
+put t span mul add ulong protectedCount ulong scratchCount ulong expertBytes
+ret true
+end
+fn ringStart q edit nvqueue cap uint to bool
+if or eq cap 0 gt cap 15360
+ret false
+end
+put q abi 1
+put q capacity cap
+put q entsize 64
+ret true
+end
+note One vote per distinct consecutive turn. Unknown or current domain breaks a streak.
+fn observe t edit slabtab turn ulong domain uint to bool
+if le turn get t turn
+ret false
+end
+if gt sub turn get t turn 1
+put t streak 0
+end
+put t turn turn
+if or eq domain noDomain eq domain get t domain
+put t pending noDomain
+put t streak 0
+ret false
+end
+if ne domain get t pending
+put t pending domain
+put t streak 0
+end
+if lt get t streak 3
+put t streak add get t streak 1
+end
+ret eq get t streak 3
+end
+note Caller drains all leases and I/O before publishing the new protected pack.
+fn busy s view slab to bool
+ret or eq get s state 1 ne get s refs 0
+end
+fn request r edit nvreq slot uint key uint offset ulong to void
+put r slot slot
+put r key key
+put r fileoff offset
+end
+fn freeEntry q view nvqueue to bool
+tail = get q submit
+if or lt tail get q retire eq tail 18446744073709551615
+ret false
+end
+ret lt sub tail get q retire ulong get q capacity
+end
+fn targetOK t view slabtab s view slab r view nvreq to bool
+if ge get r key 15360
+ret false
+end
+if ge ulong get r slot add ulong get t protect ulong get t scratch
+ret false
+end
+if lt get r slot get t protect
+if and eq get s state 2 eq get s epoch get t epoch
+ret false
+end
+end
+if or busy s ne rem get r fileoff 4096 0
+ret false
+end
+if gt get r fileoff sub 9223372036854775807 ulong get t stride
+ret false
+end
+ret ne get s version 18446744073709551615
+end
+fn beginRead t view slabtab q edit nvqueue s edit slab r edit nvreq to bool
+if or ne get t abi 1 ne get q abi 1
+ret false
+end
+if not freeEntry q
+ret false
+end
+if not targetOK t s r
+ret false
+end
+put q submit add get q submit 1
+put s state 1
+put s key get r key
+put s version add get s version 1
+put s refs 0
+put s zone 3
+if lt get r slot get t protect
+put s zone 2
+end
+put s offset mul ulong get r slot ulong get t stride
+put s length get t stride
+put s epoch get t epoch
+put s ticket get q submit
+put r ticket get s ticket
+put r version get s version
+put r arenaoff get s offset
+put r length get s length
+put r got 0
+put r status 0
+put r phase 1
+put r pack 0
+ret true
+end
+note Completion is consumed by the owner. A short read makes the slot EMPTY.
+fn complete s edit slab r edit nvreq seq ulong got uint status int to bool
+if or ne get r phase 1 ne get r ticket seq
+ret false
+end
+if or ne get s state 1 ne get s ticket seq
+ret false
+end
+if or ne get s version get r version ne get s key get r key
+ret false
+end
+if or ne get s offset get r arenaoff ne get s length get r length
+ret false
+end
+put r got got
+put r status status
+put r phase 2
+put s state 0
+if and eq status 0 eq got get r length
+put s state 2
+end
+ret true
+end
+fn reap q edit nvqueue r view nvreq to bool
+if ge get q retire get q submit
+ret false
+end
+if or ne get r phase 2 ne get r ticket add get q retire 1
+ret false
+end
+put q retire get r ticket
+ret true
+end
+fn acquire t view slabtab s edit slab key uint to ulong
+if and eq get s zone 2 ne get s epoch get t epoch
+ret 0
+end
+if or ne get s state 2 ne get s key key
+ret 0
+end
+if eq get s refs 4294967295
+ret 0
+end
+put s refs add get s refs 1
+ret get s version
+end
+fn release s edit slab key uint version ulong to bool
+if or ne get s state 2 ne get s key key
+ret false
+end
+if or ne get s version version eq get s refs 0
+ret false
+end
+put s refs sub get s refs 1
+ret true
+end
+fn fifoSlot t view slabtab to uint
+ret add get t protect get t fifo
+end
+fn bumpFifo t edit slabtab to void
+put t fifo rem add get t fifo 1 get t scratch
+end
+
+fn blockedSlot buf view slab to bool
+ret busy buf
+end
+fn commitPack t edit slabtab q view nvqueue table long to bool
+if or ne get t streak 3 ne get q submit get q retire
+ret false
+end
+if or eq get t pending noDomain eq get t epoch 18446744073709551615
+ret false
+end
+buf = new uchar 64 0
+for i uint get t protect
+if ne mapread table mul ulong i 64 buf 0 64 64
+ret false
+end
+if blockedSlot buf
+ret false
+end
+end
+put t domain get t pending
+put t epoch add get t epoch 1
+put t pending noDomain
+put t streak 0
+ret true
+end
