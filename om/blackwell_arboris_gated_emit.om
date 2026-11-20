@@ -1,6 +1,6 @@
 note SPDX-License-Identifier: AGPL-3.0-only
-note One SM121 launch over a locked preorder forest. A warp owns 32 FP16
-note pairs per feature tile, grid Y tiles D in units of 64 coordinates.
+note One SM121 launch over a locked preorder forest. A warp owns 32 aligned FP16
+note vectors per feature tile, grid Y tiles D in units of 256 coordinates.
 note Standard somas precede hubs. Four warps share one hub: accumulate raw
 note branch vectors into SMEM in parallel, synchronize, then warp 0 folds the
 note tree in CPU order using the consumed slots as its stack. No global temps.
@@ -8,9 +8,9 @@ note Args at 0x380 are ten uint64 VAs: soma row offsets, branch row offsets,
 note source handles, branch metadata, synapse W, branch bias, gate W, pred W,
 note read bank, write bank. The dispatcher validates CSR, depth and scratch.
 note Physical registers: R0..7 coordinates, R8..23 temporaries/addresses,
-note R24..39 FP32 values, R40..51 traversal, R52..63 constants and work,
-note R64..83 arena argument bases. At least 88 GPRs and one CTA barrier.
-note cfg words 0..4 hold N,D,standard,standardCTAs,pairs per active warp.
+note R24..31 branch, R32..39 soma FP32 accumulators, R40..51 traversal,
+note R52..63 constants, R64..83 arena argument bases, R84..87 scalar temps. At least 88 GPRs and one CTA barrier.
+note cfg words 0..4 hold N,D,standard,standardCTAs,vectors per active warp.
 note Label offsets at 16; branch relocation triples at 64, count at 15.
 
 fn gv_mark s view ulong 5 cfg edit ulong 192 label ulong to void
@@ -57,7 +57,7 @@ fn gv_imad code edit uchar 16384 s edit ulong 5 dst ulong a ulong imm ulong c ul
 end
 fn gv_address code edit uchar 16384 s edit ulong 5 cfg view ulong 192 row ulong base ulong to void
   wave_wide code s 16 row mul 2 get cfg 1 base
-  wave_wide code s 16 6 4 16
+  wave_wide code s 16 6 16 16
 end
 fn gv_index code edit uchar 16384 s edit ulong 5 row ulong base ulong dst ulong to void
   wave_wide code s 16 row 4 base
@@ -66,32 +66,40 @@ end
 
 note A half magnitude shifted left by 13 is the exact binary32 magnitude
 note scaled by 2^-112. FMUL without FTZ restores both normals and subnormals.
-note Insert the sign afterwards to preserve signed zero. R8 is the FP16 pair.
-fn gv_unpack code edit uchar 16384 s edit ulong 5 outreg ulong high bool to void
-  if high
-    gv_opimm code s 17 9 8 16
-    gv_opimm code s 18 10 8 0x80000000
+note Insert the sign afterwards to preserve signed zero.
+fn gv_unpack code edit uchar 16384 s edit ulong 5 outreg ulong packed ulong index ulong to void
+  src = add packed div index 2
+  if ne and index 1 0
+    gv_opimm code s 17 84 src 16
+    gv_opimm code s 18 85 src 0x80000000
   else
-    gv_imad code s 9 8 1 wave_rz
-    gv_opimm code s 18 10 8 0x8000
-    gv_imad code s 10 10 65536 wave_rz
+    gv_imad code s 84 src 1 wave_rz
+    gv_opimm code s 18 85 src 0x8000
+    gv_imad code s 85 85 65536 wave_rz
   end
-  gv_opimm code s 18 outreg 9 0x7fff
+  gv_opimm code s 18 outreg 84 0x7fff
   gv_imad code s outreg outreg 8192 wave_rz
   wave_ins code s 32 outreg outreg 56
-  wave_ins code s 29 outreg outreg 10
+  wave_ins code s 29 outreg outreg 85
 end
-fn gv_pair code edit uchar 16384 s edit ulong 5 cfg view ulong 192 row ulong base ulong dst ulong to void
+fn gv_vector code edit uchar 16384 s edit ulong 5 cfg view ulong 192 row ulong base ulong dst ulong to void
   gv_address code s cfg row base
-  wave_ins code s 11 8 16 wave_rz
-  gv_unpack code s dst false
-  gv_unpack code s add dst 1 true
+  wave_ins code s 57 dst 16 wave_rz
 end
 fn gv_frame code edit uchar 16384 s edit ulong 5 index ulong to void
-  note R50 is the thread's pair offset, R51 is the FP32 frame stride.
   put s 2 50
   wave_ins code s 8 18 index 51
-  gv_imad code s 19 7 4 18
+end
+fn gv_shared_load code edit uchar 16384 s edit ulong 5 dst ulong to void
+  wave_ins code s 58 dst 18 wave_rz
+  put s 1 16
+  wave_ins code s 58 add dst 4 18 wave_rz
+end
+fn gv_shared_store code edit uchar 16384 s edit ulong 5 src ulong to void
+  for i ulong 8
+    gv_imad code s 19 7 mul i 4 18
+    wave_ins code s 50 wave_rz 19 add src i
+  end
 end
 fn gv_pop code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   gv_mark s cfg 10
@@ -99,24 +107,24 @@ fn gv_pop code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   gv_jump code s cfg 12 1
   wave_ins code s 14 43 43 55
   gv_frame code s 43
-  wave_ins code s 49 24 18 wave_rz
-  wave_ins code s 49 25 19 wave_rz
-  wave_ins code s 37 24 24 wave_rz
-  wave_ins code s 37 25 25 wave_rz
+  gv_shared_load code s 24
+  for i ulong 8
+    wave_ins code s 37 add 24 i add 24 i wave_rz
+  end
   wave_ins code s 28 0 wave_rz 43
   gv_jump code s cfg 11 1
   wave_ins code s 14 49 43 55
   gv_frame code s 49
-  wave_ins code s 49 26 18 wave_rz
-  wave_ins code s 49 27 19 wave_rz
-  wave_ins code s 30 26 26 24
-  wave_ins code s 30 27 27 25
-  wave_ins code s 50 wave_rz 18 26
-  wave_ins code s 50 wave_rz 19 27
+  gv_shared_load code s 8
+  for i ulong 8
+    wave_ins code s 30 add 8 i add 8 i add 24 i
+  end
+  gv_shared_store code s 8
   gv_jump code s cfg 10 0
   gv_mark s cfg 11
-  wave_ins code s 30 32 32 24
-  wave_ins code s 30 33 33 25
+  for i ulong 8
+    wave_ins code s 30 add 32 i add 32 i add 24 i
+  end
   gv_jump code s cfg 10 0
 end
 
@@ -127,7 +135,7 @@ fn gv_setup code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   gv_opimm code s 18 3 0 31
   gv_opimm code s 17 4 0 5
   gv_imad code s 6 2 32 3
-  wave_imm code s 2 52 div get cfg 1 2
+  wave_imm code s 2 52 div get cfg 1 8
   wave_ins code s 28 0 6 52
   put s 3 1
   wave_ins code s 45 wave_rz wave_rz wave_rz
@@ -151,8 +159,8 @@ fn gv_setup code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   wave_ins code s 45 wave_rz wave_rz wave_rz
   wave_imm code s 2 48 0
   gv_imad code s 50 4 get cfg 4 3
-  gv_imad code s 50 50 8 wave_rz
-  wave_imm code s 2 51 mul get cfg 4 32
+  gv_imad code s 50 50 32 wave_rz
+  wave_imm code s 2 51 mul get cfg 4 128
   gv_jump code s cfg 2 0
   gv_mark s cfg 1
   wave_imm code s 2 52 sub get cfg 2 get cfg 3
@@ -161,15 +169,16 @@ fn gv_setup code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   wave_ins code s 28 0 5 52
   put s 3 1
   wave_ins code s 45 wave_rz wave_rz wave_rz
-  gv_imad code s 50 3 8 wave_rz
-  wave_imm code s 2 51 mul get cfg 4 8
+  gv_imad code s 50 3 32 wave_rz
+  wave_imm code s 2 51 mul get cfg 4 32
   wave_imm code s 2 48 1
   gv_mark s cfg 2
   gv_index code s 5 64 40
   put s 1 4
   wave_ins code s 11 41 16 wave_rz
-  wave_imm code s 2 32 0
-  wave_imm code s 2 33 0
+  for i ulong 8
+    wave_imm code s 2 add 32 i 0
+  end
   wave_imm code s 2 43 0
   gv_imad code s 42 40 1 wave_rz
   wave_ins code s 28 0 48 7
@@ -182,7 +191,10 @@ end
 
 fn gv_raw code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   gv_mark s cfg 4
-  gv_pair code s cfg 42 74 24
+  gv_vector code s cfg 42 74 8
+  for i ulong 8
+    gv_unpack code s add 24 i 8 i
+  end
   gv_index code s 42 66 44
   put s 1 4
   wave_ins code s 11 45 16 wave_rz
@@ -190,12 +202,14 @@ fn gv_raw code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   wave_ins code s 28 0 44 45
   gv_jump code s cfg 6 1
   gv_index code s 44 68 47
-  gv_pair code s cfg 47 80 28
-  gv_pair code s cfg 44 72 30
-  put s 2 24
-  wave_ins code s 33 24 28 30
-  put s 2 25
-  wave_ins code s 33 25 29 31
+  gv_vector code s cfg 47 80 8
+  gv_vector code s cfg 44 72 12
+  for i ulong 8
+    gv_unpack code s 86 8 i
+    gv_unpack code s 87 12 i
+    put s 2 add 24 i
+    wave_ins code s 33 add 24 i 86 87
+  end
   wave_ins code s 14 44 44 7
   gv_jump code s cfg 5 0
   gv_mark s cfg 6
@@ -203,8 +217,7 @@ fn gv_raw code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   gv_jump code s cfg 14 2
   gv_imad code s 49 40 0xffffffff 42
   gv_frame code s 49
-  wave_ins code s 50 wave_rz 18 24
-  wave_ins code s 50 wave_rz 19 25
+  gv_shared_store code s 24
   gv_imad code s 42 7 4 42
   gv_jump code s cfg 3 0
   gv_mark s cfg 7
@@ -230,54 +243,59 @@ fn gv_tree code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   gv_jump code s cfg 4 2
   gv_imad code s 49 40 0xffffffff 42
   gv_frame code s 49
-  wave_ins code s 49 24 18 wave_rz
-  wave_ins code s 49 25 19 wave_rz
+  gv_shared_load code s 24
   gv_mark s cfg 14
   gv_frame code s 43
-  wave_ins code s 50 wave_rz 18 24
-  wave_ins code s 50 wave_rz 19 25
+  gv_shared_store code s 24
   wave_ins code s 14 43 43 7
   wave_ins code s 14 42 42 7
   gv_jump code s cfg 8 0
 end
 
-fn gv_sigmoid code edit uchar 16384 s edit ulong 5 gate ulong prev ulong to void
-  wave_ins code s 32 gate gate prev
-  gv_opimm code s 18 20 gate 0x7fffffff
-  wave_ins code s 32 20 20 58
-  wave_ins code s 47 20 20 wave_rz
-  wave_ins code s 30 21 57 20
-  wave_ins code s 40 21 21 wave_rz
-  wave_ins code s 28 0 gate 59
-  gv_imad code s gate 21 1 wave_rz
+fn gv_sigmoid code edit uchar 16384 s edit ulong 5 to void
+  wave_ins code s 32 87 87 86
+  gv_opimm code s 18 84 87 0x7fffffff
+  wave_ins code s 32 84 84 58
+  wave_ins code s 47 84 84 wave_rz
+  wave_ins code s 30 85 57 84
+  wave_ins code s 40 85 85 wave_rz
+  wave_ins code s 28 0 87 59
+  gv_imad code s 87 85 1 wave_rz
   put s 3 1
-  wave_ins code s 32 gate 21 20
+  wave_ins code s 32 87 85 84
 end
 
 fn gv_gate code edit uchar 16384 s edit ulong 5 cfg edit ulong 192 to void
   gv_mark s cfg 15
-  gv_pair code s cfg 5 80 34
-  gv_pair code s cfg 5 76 38
-  gv_pair code s cfg 5 78 36
-  for i ulong 2
-    y = add 36 i
-    g = add 38 i
-    old = add 34 i
-    gv_sigmoid code s g old
+  gv_vector code s cfg 5 80 8
+  gv_vector code s cfg 5 76 12
+  gv_vector code s cfg 5 78 20
+  for i ulong 8
+    y = add 24 i
+    gv_unpack code s y 20 i
+    gv_unpack code s 86 8 i
+    gv_unpack code s 87 12 i
+    gv_sigmoid code s
     wave_ins code s 32 y y add 32 i
     wave_ins code s 37 y y wave_rz
-    wave_ins code s 31 20 57 g
-    wave_ins code s 32 20 20 old
-    put s 2 20
-    wave_ins code s 33 y g y
+    wave_ins code s 31 84 57 87
+    wave_ins code s 32 84 84 86
+    put s 2 84
+    wave_ins code s 33 y 87 y
   end
-  note SM121 F2FP.F16.F32.PACK_AB is the BF16 pack with format bit 12 clear.
-  note ptxas/nvdisasm 13.0 oracle: R5,R4,R5 gives 000000050405723e / 004fca00000000ff.
-  pack = mul get s 0 16
-  wave_ins code s 61 8 37 36
-  put code add pack 9 and get code add pack 9 239
+  for i ulong 4
+    note F2FP.F16.F32.PACK_AB selects FP16 by clearing the BF16 format bit.
+    pack = mul get s 0 16
+    low = add 24 mul i 2
+    wave_ins code s 61 add 8 i add low 1 low
+    put code add pack 9 and get code add pack 9 239
+  end
   gv_address code s cfg 5 82
+  note STG.E.128 has the same address and source operands as STG.E.
+  note The vector width is 6 in word two bits 11:9 (scalar width 4).
+  store_pc = mul get s 0 16
   wave_ins code s 12 wave_rz 16 8
+  put code add store_pc 9 or get code add store_pc 9 4
   wave_exit code s
 end
 
@@ -298,7 +316,7 @@ export fn arboris_emit_gated n ulong d ulong standard ulong code edit uchar 1638
   put cfg 1 d
   put cfg 2 standard
   put cfg 3 div add standard 3 4
-  cols = div d 2
+  cols = div d 8
   if gt cols 32
     cols = ulong 32
   end

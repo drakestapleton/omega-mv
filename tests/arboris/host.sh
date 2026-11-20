@@ -42,7 +42,7 @@ echo om2 > "$out/profile.om"
 compile "$out/emit" "$out/profile.om" om/encoder/bw_enc_sm121.om om/blackwell_arboris_emit.om tests/arboris/emit-spread.om
 compile "$out/emit-gated" "$out/profile.om" om/encoder/bw_enc_sm121.om om/blackwell_arboris_emit.om om/blackwell_arboris_gated_emit.om tests/arboris/emit-gated.om
 "$out/emit-gated" > "$out/gated.sass"
-echo "80727df94388dc8ca2e6e0d8e8cc6bf3b4e50bbde2c431cceed51bafef1f89ee  $out/gated.sass" | sha256sum -c -
+echo "66efbbc55e3e0434aa0e43416d25c22112c383a3f4c91da5337304d1fea85182  $out/gated.sass" | sha256sum -c -
 grep -qx "output_sha256=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089" "$out/gated-reference.log"
 "$dis" -b SM121 "$out/gated.sass" > "$out/gated.dis"
 diff -u tests/arboris/gated-sm121.dis "$out/gated.dis"

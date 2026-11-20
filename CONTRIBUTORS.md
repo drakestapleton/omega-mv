@@ -391,3 +391,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Implemented the fused SM121 gated-vector emitter, its native QMD worker and standard-soma and hub differential fixtures. |
 | Codex (under Drake Stapleton's direction) | Selected 4 KiB system-memory pages for guarded Arboris allocations and exercised RM extent checks on duplicate objects. |
 | Codex (under Drake Stapleton's direction) | Connected the device completion word to the Arboris receipt, verified Ed25519 step signatures, and published the epoch and bank through a single ordered cursor store. |
+| Codex (under Drake Stapleton's direction) | Vectorized the fused Arboris tick to process eight FP16 coordinates per lane with aligned 128-bit global loads and stores. |

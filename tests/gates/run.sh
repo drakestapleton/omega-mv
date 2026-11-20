@@ -655,7 +655,7 @@ case "$step" in
     }
     cat "$OUT_DIR/gated-device.log"
     grep -qx 'matching_fp16_elements=40' "$OUT_DIR/gated-device.log"
-    grep -qx 'kernel_sha256=80727df94388dc8ca2e6e0d8e8cc6bf3b4e50bbde2c431cceed51bafef1f89ee' "$OUT_DIR/gated-device.log"
+    grep -qx 'kernel_sha256=66efbbc55e3e0434aa0e43416d25c22112c383a3f4c91da5337304d1fea85182' "$OUT_DIR/gated-device.log"
     grep -qx 'output_sha256=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089' "$OUT_DIR/gated-device.log"
     ;;
   arboris-sparse-silicon)
