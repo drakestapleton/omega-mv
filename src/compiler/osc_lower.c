@@ -81,6 +81,12 @@ static int newblk(L *l, uint32_t line)
     return l->nblk++;
 }
 
+_Static_assert(offsetof(OscInsn, op) == 0 && offsetof(OscInsn, dst) == 2 &&
+               offsetof(OscInsn, a) == 4 && offsetof(OscInsn, b) == 6 && offsetof(OscInsn, c) == 8 &&
+               offsetof(OscInsn, blk_t) == 10 && offsetof(OscInsn, blk_f) == 12 &&
+               offsetof(OscInsn, callee) == 14 && offsetof(OscInsn, line) == 40 &&
+               OSC_I_BR == 13 && OSC_I_CBR == 14 && OSC_I_RET == 15, "OSC instruction emission layout");
+
 static OscInsn *emit(L *l, uint8_t op, uint32_t line)
 {
     static OscInsn sink;
@@ -89,11 +95,7 @@ static OscInsn *emit(L *l, uint8_t op, uint32_t line)
     OscInsn *x = &l->ins[l->nins];
     l->iblk[l->nins] = (int16_t)l->cur;
     l->nins++;
-    memset(x, 0, sizeof *x);
-    x->op = op;
-    x->dst = x->a = x->b = x->c = x->blk_t = x->blk_f = x->callee = -1;
-    x->line = line;
-    if (op == OSC_I_BR || op == OSC_I_CBR || op == OSC_I_RET) {
+    if (osc_begin_insn((uint8_t *)x, op, line)) {
         l->closed[l->cur] = 1;
         l->cur = -1;
     }
