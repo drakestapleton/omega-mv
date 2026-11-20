@@ -8,8 +8,10 @@ Since 2026-11-19 this directory is the source of truth for Omega LLM `.om` code 
 | --- | --- |
 | `native/` | `native/omegallm/` |
 | `tests/` | `tests/omegallm/*.om` |
-| `tools/` | `tools/omegallm/**/*.om`, plus the Python bundle builder and compiler feedback harness |
+| `tools/` | `tools/omegallm/**/*.om` |
 | `docs/` | `docs/omegallm/*.md` (contracts V1-V3 and BF16, specialists, bundles, WSP) |
+
+The Python corpus builder and compile feedback loop live in `tools/omega-llm/` at the omega-mv repository root.
 
 Stays in aien-train (listed in `train/NOT-YET-OMEGA.tsv`): the shell/Python harness `tests/omegallm/` (`build.sh`, `oracle.py`, `pre-review.py`, ...), `evidence/OMEGALLM/` receipts, and the C++ llama.cpp UI bridge `tools/omegallm-ui/`. The docs here still cite those upstream paths and commits. Unless a citation names a different commit, upstream paths refer to aien-train `f1bebdf3c5b08ec624005e5bc39d0427a87f9537`; they are not local omega-mv paths.
 

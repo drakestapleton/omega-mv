@@ -38,7 +38,7 @@ Sovereign Intelligence front-door tools, architecture/benchmark/receipt checkers
 
 ## `train/`
 
-Training, neural-network primitives and accelerator kernel labs of Sovereign Intelligence (`aien-train`, with Omega LLM (`ollm`) in `train/omega-llm/` across `aarch64`/`x86linux`/`x86efi`/`a64efi`/`darwin`, `omega-dnn`, `omega-blas`, `openaccel-lab`, `omega-kernel-template`), mirroring `gpu/`: pure-Omega `.om` units only, moved with full Git history (`train/import/`), gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`, 78 units). Remaining non-Omega files stay upstream (`train/NOT-YET-OMEGA.tsv`).
+Training, neural-network primitives and accelerator kernel labs of Sovereign Intelligence (`aien-train`, with Omega LLM (`ollm`) in `train/omega-llm/` across `aarch64`/`x86linux`/`x86efi`/`a64efi`/`darwin`, `omega-dnn`, `omega-blas`, `openaccel-lab`, `omega-kernel-template`), mirroring `gpu/`: pure-Omega `.om` units only, moved with full Git history (`train/import/`), gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`, 78 units). The Python specialist corpus and compile feedback harnesses are in `tools/omega-llm/`. The inventory records the remaining upstream files (`train/NOT-YET-OMEGA.tsv`).
 
 ## `bench/inference_cost/`
 

@@ -15,7 +15,7 @@ Everything moved under `train/` is pure seeded Omega (`.om`) built by `omega-mv`
 | `train/openaccel-lab/` | `openaccel-lab` (`rad:zv2LrXa7mmHpfSKbS6ZAYMNrm9QS`) | `6623508d7280` | 32 | 1 | 188 |
 | `train/kernel-template/` | `omega-kernel-template` (`rad:z22odFP9kDcxcbzmc2vapZy72ztjT`) | `02050226cf24` | 1 | 1 | 14 |
 
-Total imported in `train/`: **195 `.om` files** across **168 history-preserving commits**, plus 15 Omega LLM docs (130 commits) (1730 non-`.om` first-party files stayed upstream and are listed in [`train/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
+Total imported in `train/`: **195 `.om` files** across **168 history-preserving commits**, plus 15 Omega LLM docs (130 commits) (1730 non-`.om` first-party files are listed in [`train/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
 
 ## One compiler
 

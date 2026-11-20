@@ -60,7 +60,7 @@ Rather than stopping at flat single-layer bundles, `.om` specialists are organiz
 
 ## 4. Measured Local `.om` Corpus Inventory
 
-Measured on Apple Silicon M2 CPU via `python3 train/omega-llm/tools/om_bundle_data.py audit`:
+Measured on Apple Silicon M2 CPU via `python3 tools/omega-llm/om_bundle_data.py audit`:
 
 - **Total `.om` across all workspace directories:** `12,502` files, `5,870,743` LOC (`119,417,595` bytes; `6,960` duplicate files across git worktrees/clones).
 - **Unique `.om` (SHA-256 deduplicated):** `5,542` files, `1,727,419` LOC (`35,730,214` bytes).
@@ -90,7 +90,7 @@ Measured on Apple Silicon M2 CPU via `python3 train/omega-llm/tools/om_bundle_da
 
 ## 5. Measured Local `omc` Compile Latency (Apple Silicon M2 CPU)
 
-Measured via `python3 train/omega-llm/tools/om_compile_loop.py bench --runs 20` against local Darwin ARM64 `omc` (`sha256: 68a590c37dfb1ec37a183f0032e02db1570db299266f574f65556edfc70feb9c`):
+Measured via `python3 tools/omega-llm/om_compile_loop.py bench --runs 20` against local Darwin ARM64 `omc` (`sha256: 68a590c37dfb1ec37a183f0032e02db1570db299266f574f65556edfc70feb9c`):
 
 | Unit | LOC | Runs | Min (ms) | Median (ms) | P95 (ms) | Max (ms) | Output Binary (bytes) |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -105,7 +105,7 @@ Typical single-function and module-sized `.om` edits (`6–565` LOC) compile in 
 
 ### Local Compile-Retry Harness Self-Test (Apple Silicon M2 CPU)
 
-`python3 train/omega-llm/tools/om_compile_loop.py selftest` exercised both:
+`python3 tools/omega-llm/om_compile_loop.py selftest` exercised both:
 1. **Deterministic refusal -> repair:** `x = 5` refused by `omc` (`rc=11`, `omc: line 2: error 11`) in `5.947 ms`; repaired `x = int 5` compiled cleanly (`rc=0`, `212` bytes) in `4.831 ms`.
 2. **Live `ollm spsamp` + `omc` retry loop (`omega-code_pro.sp` on `omega-v2.ck`):** 3 attempts (`3.95–5.57 s` CPU `spsamp` + `5.80–6.86 ms` `omc` check per attempt), capturing real `omc` refusals (`error 16` -> `error 4`) and feeding them back into each retry prompt.
 
@@ -115,16 +115,16 @@ Typical single-function and module-sized `.om` edits (`6–565` LOC) compile in 
 
 ```sh
 # 1. Audit local .om corpus (total + SHA-256 deduplicated)
-python3 train/omega-llm/tools/om_bundle_data.py audit --workspace "$HOME/workspace"
+python3 tools/omega-llm/om_bundle_data.py audit --workspace "$HOME/workspace"
 
 # 2. Generate and live-verify all 30 omc refusal-repair pairs (errors 1..30)
-python3 train/omega-llm/tools/om_bundle_data.py refusals \
+python3 tools/omega-llm/om_bundle_data.py refusals \
   --omc "$HOME/.local/bin/omc" \
   --include-err24 \
   --out "$OUT/refusals.jsonl"
 
 # 3. Build deterministic, zero-leakage .tok + .msk chain splits and verify fcachem
-python3 train/omega-llm/tools/om_bundle_data.py build \
+python3 tools/omega-llm/om_bundle_data.py build \
   --workspace "$HOME/workspace" \
   --omc "$HOME/.local/bin/omc" \
   --ollm "$HOME/.local/bin/ollm" \
@@ -202,13 +202,13 @@ DATA="$OUT/bundles"
 
 ```sh
 # 20-run omc latency benchmark
-python3 train/omega-llm/tools/om_compile_loop.py bench --runs 20
+python3 tools/omega-llm/om_compile_loop.py bench --runs 20
 
 # End-to-end self-test (deterministic refusal->repair + live spsamp->omc retry)
-python3 train/omega-llm/tools/om_compile_loop.py selftest
+python3 tools/omega-llm/om_compile_loop.py selftest
 
 # Single-prompt compile-retry loop with any trained pack
-python3 train/omega-llm/tools/om_compile_loop.py loop \
+python3 tools/omega-llm/om_compile_loop.py loop \
   --pack "$OUT/om-core.sp" \
   --prompt "note return sum of two ulong values\nfn add2 a ulong b ulong to ulong\n" \
   --max-retries 3 \
