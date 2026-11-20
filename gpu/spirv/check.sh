@@ -1,20 +1,30 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# gpu/spirv/check.sh: host-only check of emit.om, conform.om, and run.om (AArch64 Linux, no GPU opened).
-# Compiles all three with seed/out/omc, emits every kernel for cl and vk, runs spirv-val, executes
-# every emitted SPIR-V module directly in pure Omega (run.om), verifies 0-ulp parity with conform.om,
-# and checks mutant and cross-kernel negative controls.
+# gpu/spirv/check.sh: host-only check of emit.om, val.om, run.om, and conform.om (AArch64 Linux, no GPU opened).
+# Compiles all four with seed/out/omc, emits every kernel for cl and vk, validates every module with
+# pure-Omega val.om (and optionally cross-checks with external spirv-val if installed), executes every
+# emitted SPIR-V module directly in pure Omega (run.om), verifies 0-ulp parity with conform.om, and
+# checks validator, mutant, and cross-kernel negative controls.
 # Usage: sh gpu/spirv/check.sh   (env: OMC=seed/out/omc, SPIRV_VAL=spirv-val). Exit 0 all pass, 1 fail.
 OMC=${OMC:-seed/out/omc}; SV=${SPIRV_VAL:-spirv-val}; S=$(dirname "$0"); B=${B:-$(mktemp -d)}
 fail=0
-for f in emit conform run; do "$OMC" < "$S/$f.om" > "$B/$f" || { echo "FAIL compile $f"; exit 1; }; chmod +x "$B/$f"; done
+have_sv=0
+if command -v "$SV" >/dev/null 2>&1 || [ -x "$SV" ]; then have_sv=1; fi
+for f in emit val run conform; do "$OMC" < "$S/$f.om" > "$B/$f" || { echo "FAIL compile $f"; exit 1; }; chmod +x "$B/$f"; done
 for k in vadd vmul vsub vmax fsum16 rmsnorm gemm16; do for e in cl vk; do
   env=opencl2.2; [ $e = vk ] && env=vulkan1.1
   "$B/emit" $k $e > "$B/$k.$e.spv" || fail=1
-  if "$SV" --target-env $env "$B/$k.$e.spv"; then echo "PASS spirv-val $k $e"; else echo "FAIL spirv-val $k $e"; fail=1; fi
+  if "$B/val" --target-env $env "$B/$k.$e.spv"; then echo "PASS omega-val $k $e"; else echo "FAIL omega-val $k $e"; fail=1; fi
+  if [ "$have_sv" = 1 ]; then
+    if "$SV" --target-env $env "$B/$k.$e.spv"; then echo "PASS spirv-val $k $e"; else echo "FAIL spirv-val $k $e"; fail=1; fi
+  fi
   "$B/emit" $k $e mutant > "$B/$k.$e.mut.spv"
   if cmp -s "$B/$k.$e.spv" "$B/$k.$e.mut.spv"; then echo "FAIL mutant identical $k $e"; fail=1; else echo "PASS mutant differs $k $e"; fi
 done; done
+"$B/val" --target-env vulkan1.1 "$B/gemm16.cl.spv" 2>/dev/null && { echo "FAIL control: val accepted cl as vulkan1.1"; fail=1; } || echo "PASS control: val rejects cl as vulkan1.1"
+"$B/val" --target-env opencl2.2 "$B/gemm16.vk.spv" 2>/dev/null && { echo "FAIL control: val accepted vk as opencl2.2"; fail=1; } || echo "PASS control: val rejects vk as opencl2.2"
+printf 'BAD!' > "$B/bad.spv"
+"$B/val" "$B/bad.spv" 2>/dev/null && { echo "FAIL control: val accepted bad magic"; fail=1; } || echo "PASS control: val rejects bad magic"
 for k in vadd vmul vsub vmax; do
   "$B/conform" in $k "$B/A.bin" "$B/B.bin" && "$B/conform" ref $k "$B/$k.ref" || fail=1
   "$B/conform" check $k "$B/$k.ref" || fail=1

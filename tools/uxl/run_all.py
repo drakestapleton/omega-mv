@@ -497,7 +497,7 @@ def install_command(machine):
     like = (release.get("ID_LIKE") or "").lower()
     family = ident + " " + like
     if "debian" in family or "ubuntu" in family or ident in ("debian", "ubuntu"):
-        packages = ["python3", "spirv-tools", "ocl-icd-libopencl1"]
+        packages = ["python3", "ocl-icd-libopencl1"]
         if machine.arch == "x86_64":
             packages[1:1] = ["qemu-user-static", "binfmt-support"]
         command = (
@@ -515,12 +515,12 @@ def install_command(machine):
             command += " && sudo " + binfmt_register_command()
         return command
     if "fedora" in family or "rhel" in family or ident in ("fedora", "rhel", "centos"):
-        packages = "python3 spirv-tools ocl-icd"
+        packages = "python3 ocl-icd"
         if machine.arch == "x86_64":
             packages = "qemu-user-static " + packages
         return "sudo dnf install -y " + packages
     if ident == "arch" or "arch" in like.split():
-        packages = "python spirv-tools ocl-icd"
+        packages = "python ocl-icd"
         if machine.arch == "x86_64":
             packages = "qemu-user-static " + packages
         return "sudo pacman -Sy --needed --noconfirm " + packages
@@ -531,8 +531,8 @@ def toolchain_gap(machine):
     if machine.os == "windows":
         return not machine.wsl
     if machine.os == "macos":
-        return machine.spirv_val == "no"
-    if machine.omc == "not-run" or machine.spirv_val == "no":
+        return False
+    if machine.omc == "not-run":
         return True
     return False
 
@@ -783,7 +783,7 @@ def plan_status(passed, failed, not_run, empty_reason):
 
 
 def spirv_stage():
-    stage("5. SPIR-V spirv-val, mutants, conform")
+    stage("5. SPIR-V omega-val, omega-run, mutants, conform")
     check = ROOT / "gpu/spirv/check.sh"
     if not check.is_file():
         print("MISSING gpu/spirv/check.sh")
@@ -791,12 +791,6 @@ def spirv_stage():
         return "MISSING", "gpu/spirv/check.sh is not in this checkout", 0, 0, 0
     if MACHINE is not None and MACHINE.omc == "not-run":
         hint = omc_hint(MACHINE)
-        print("NOT_RUN %s" % hint)
-        print("spirv counts: pass=0 fail=0 not_run=1")
-        return "NOT_RUN", hint, 0, 0, 0
-    spirv_val = os.environ.get("SPIRV_VAL", "spirv-val")
-    if shutil.which(spirv_val) is None and not Path(spirv_val).is_file():
-        hint = (MACHINE.install if MACHINE is not None and MACHINE.install else spirv_val_install_line())
         print("NOT_RUN %s" % hint)
         print("spirv counts: pass=0 fail=0 not_run=1")
         return "NOT_RUN", hint, 0, 0, 0

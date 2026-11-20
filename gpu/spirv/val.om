@@ -1,0 +1,511 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note val.om: pure seeded-Omega SPIR-V binary validator (replaces external spirv-val).
+note Checks header, framing, profile capabilities/memory-model/decorations (opencl2.2 vs vulkan1.1),
+note SSA result-ID uniqueness and bounds, OpEntryPoint target, and function/CFG block structure.
+note
+note Usage:
+note   val [--target-env opencl2.2|vulkan1.1] FILE.spv
+note Exit: 0 valid; 1 invalid (diagnostic on stderr); 2 usage; 3 I/O error. Traps exit 100 + code.
+om2
+
+text tuse "usage: val [--target-env opencl2.2|vulkan1.1] FILE.spv\n"
+text tio "val: I/O error\n"
+text tenv "--target-env"
+text tocl "opencl2.2"
+text tvk "vulkan1.1"
+text te_hdr "val: bad SPIR-V header or magic\n"
+text te_frm "val: truncated or malformed instruction framing\n"
+text te_id "val: invalid or duplicate SSA id\n"
+text te_prof "val: profile mismatch (memory model, capability, execution mode, or decoration)\n"
+text te_cfg "val: invalid function or CFG block structure\n"
+text te_ep "val: missing or undefined entry point\n"
+
+const MAXIDS ulong 4096
+
+global gspv uchar 65536
+global gw uint 16384
+global gdef uchar 4096
+global gneed uchar 4096
+global gpath uchar 4096
+global garg uchar 32
+note gst:
+note   0 env (0 auto, 1 cl, 2 vk), 1 nwords, 2 id_bound, 3 caps_mask,
+note   4 mem_seen, 5 ep_seen, 6 ep_fn, 7 in_fn, 8 blk_state (0 params, 1 open, 2 term),
+note   9 expect_brc (1 after OpSelectionMerge), 10 fn_count, 11 file_arg_idx
+global gst ulong 16
+
+fn fail code int msg view uchar * to void
+n = write 2 msg 0 len msg
+exit code
+end
+
+fn argis i ulong t view uchar * to bool
+n = argread i garg 0 len garg
+if ne n long len t
+ret false
+end
+for k ulong len t
+if ne get garg k get t k
+ret false
+end
+end
+ret true
+end
+
+fn spvu32 i ulong to uint
+o = mul i 4
+v = uint 0
+for k ulong 4
+v = or v shl uint get gspv add o k mul uint k 8
+end
+ret v
+end
+
+fn readspv ai ulong to void
+n = argread ai gpath 0 len gpath
+if le n 0
+fail 2 tuse
+end
+fd = fopen gpath 0 ulong n 0 0
+if lt fd 0
+fail 3 tio
+end
+sz = fseek int fd 0 2
+if or lt sz 20 gt sz 65536
+c = fclose int fd
+fail 1 te_hdr
+end
+if ne rem ulong sz 4 0
+c = fclose int fd
+fail 1 te_hdr
+end
+r = pread int fd gspv 0 ulong sz 0
+c = fclose int fd
+if ne r sz
+fail 3 tio
+end
+nw = div ulong sz 4
+put gst 1 nw
+for i ulong nw
+put gw i spvu32 i
+end
+end
+
+fn chk_id id uint to void
+if or eq id 0 ge ulong id get gst 2
+fail 1 te_id
+end
+end
+
+fn def_id id uint kind uchar to void
+chk_id id
+if ne get gdef ulong id 0
+fail 1 te_id
+end
+put gdef ulong id kind
+end
+
+fn need_lbl id uint to void
+chk_id id
+put gneed ulong id 1
+end
+
+fn chk_header to void
+if ne get gw 0 0x07230203
+fail 1 te_hdr
+end
+ver = get gw 1
+if or lt ver 0x00010000 gt ver 0x00010600
+fail 1 te_hdr
+end
+if eq get gst 0 1
+if gt ver 0x00010400
+fail 1 te_hdr
+end
+end
+if eq get gst 0 2
+if gt ver 0x00010300
+fail 1 te_hdr
+end
+end
+bnd = ulong get gw 3
+if or eq bnd 0 gt bnd MAXIDS
+fail 1 te_hdr
+end
+if ne get gw 4 0
+fail 1 te_hdr
+end
+put gst 2 bnd
+end
+
+fn chk_cap cap uint to void
+m = get gst 3
+if eq cap 1
+put gst 3 or m 1
+end
+if eq cap 4
+put gst 3 or m 2
+end
+if eq cap 6
+put gst 3 or m 4
+end
+if eq cap 11
+put gst 3 or m 8
+end
+end
+
+fn chk_memmodel addr uint mem uint to void
+if ne get gst 4 0
+fail 1 te_prof
+end
+put gst 4 1
+env = get gst 0
+if eq env 0
+if and eq addr 2 eq mem 2
+put gst 0 1
+ret
+end
+if and eq addr 0 eq mem 1
+put gst 0 2
+ret
+end
+fail 1 te_prof
+end
+if eq env 1
+if or ne addr 2 ne mem 2
+fail 1 te_prof
+end
+ret
+end
+if or ne addr 0 ne mem 1
+fail 1 te_prof
+end
+end
+
+fn chk_ep em uint fnid uint to void
+chk_id fnid
+env = get gst 0
+if eq env 1
+if ne em 6
+fail 1 te_prof
+end
+end
+if eq env 2
+if ne em 5
+fail 1 te_prof
+end
+end
+put gst 5 1
+put gst 6 ulong fnid
+end
+
+fn chk_execmode mode uint to void
+if and eq mode 31 eq get gst 0 2
+fail 1 te_prof
+end
+end
+
+fn chk_decor dec uint to void
+if and eq dec 42 eq get gst 0 1
+fail 1 te_prof
+end
+end
+
+fn is_type_op op uint to bool
+if eq op 19
+ret true
+end
+if eq op 20
+ret true
+end
+if eq op 21
+ret true
+end
+if eq op 22
+ret true
+end
+if eq op 23
+ret true
+end
+if eq op 29
+ret true
+end
+if eq op 30
+ret true
+end
+if eq op 32
+ret true
+end
+ret eq op 33
+end
+
+fn chk_global_op op uint p ulong wc ulong to void
+if eq op 17
+if ne wc 2
+fail 1 te_frm
+end
+chk_cap get gw add p 1
+ret
+end
+if eq op 11
+if lt wc 3
+fail 1 te_frm
+end
+def_id get gw add p 1 4
+ret
+end
+if eq op 14
+if ne wc 3
+fail 1 te_frm
+end
+chk_memmodel get gw add p 1 get gw add p 2
+ret
+end
+if eq op 15
+if lt wc 4
+fail 1 te_frm
+end
+chk_ep get gw add p 1 get gw add p 2
+ret
+end
+if eq op 16
+if lt wc 3
+fail 1 te_frm
+end
+chk_id get gw add p 1
+chk_execmode get gw add p 2
+ret
+end
+if eq op 71
+if lt wc 3
+fail 1 te_frm
+end
+chk_id get gw add p 1
+chk_decor get gw add p 2
+ret
+end
+if eq op 72
+if lt wc 4
+fail 1 te_frm
+end
+chk_id get gw add p 1
+ret
+end
+if is_type_op op
+if lt wc 2
+fail 1 te_frm
+end
+def_id get gw add p 1 1
+ret
+end
+if eq op 43
+if lt wc 4
+fail 1 te_frm
+end
+chk_id get gw add p 1
+def_id get gw add p 2 2
+ret
+end
+if eq op 59
+if lt wc 4
+fail 1 te_frm
+end
+chk_id get gw add p 1
+def_id get gw add p 2 3
+ret
+end
+fail 1 te_frm
+end
+
+fn chk_fn_op op uint p ulong wc ulong to void
+if eq get gst 9 1
+if ne op 250
+fail 1 te_cfg
+end
+put gst 9 0
+end
+if eq op 55
+if or ne wc 3 ne get gst 8 0
+fail 1 te_cfg
+end
+chk_id get gw add p 1
+def_id get gw add p 2 6
+ret
+end
+if eq op 248
+if ne wc 2
+fail 1 te_frm
+end
+if eq get gst 8 1
+fail 1 te_cfg
+end
+def_id get gw add p 1 7
+put gst 8 1
+ret
+end
+if ne get gst 8 1
+fail 1 te_cfg
+end
+if eq op 247
+if lt wc 3
+fail 1 te_frm
+end
+need_lbl get gw add p 1
+put gst 9 1
+ret
+end
+if eq op 249
+if ne wc 2
+fail 1 te_frm
+end
+need_lbl get gw add p 1
+put gst 8 2
+ret
+end
+if eq op 250
+if lt wc 4
+fail 1 te_frm
+end
+chk_id get gw add p 1
+need_lbl get gw add p 2
+need_lbl get gw add p 3
+put gst 8 2
+ret
+end
+if eq op 253
+if ne wc 1
+fail 1 te_frm
+end
+put gst 8 2
+ret
+end
+if eq op 62
+if lt wc 3
+fail 1 te_frm
+end
+chk_id get gw add p 1
+chk_id get gw add p 2
+ret
+end
+if lt wc 4
+fail 1 te_frm
+end
+chk_id get gw add p 1
+def_id get gw add p 2 8
+end
+
+fn chk_labels to void
+bnd = get gst 2
+for i ulong bnd
+if eq get gneed i 1
+if ne get gdef i 7
+fail 1 te_cfg
+end
+put gneed i 0
+end
+end
+end
+
+fn validate to void
+chk_header
+nw = get gst 1
+p = ulong 5
+while lt p nw bound 16384
+hd = get gw p
+wc = ulong shr hd 16
+op = and hd 65535
+if or eq wc 0 gt add p wc nw
+fail 1 te_frm
+end
+if eq op 54
+if or ne get gst 7 0 ne wc 5
+fail 1 te_cfg
+end
+chk_id get gw add p 1
+def_id get gw add p 2 5
+chk_id get gw add p 4
+put gst 7 1
+put gst 8 0
+put gst 9 0
+put gst 10 add get gst 10 1
+p = add p wc
+continue
+end
+if eq op 56
+if ne get gst 7 1
+fail 1 te_cfg
+end
+if ne wc 1
+fail 1 te_cfg
+end
+if ne get gst 8 2
+fail 1 te_cfg
+end
+if ne get gst 9 0
+fail 1 te_cfg
+end
+chk_labels
+put gst 7 0
+p = add p wc
+continue
+end
+if eq get gst 7 1
+chk_fn_op op p wc
+else
+chk_global_op op p wc
+end
+p = add p wc
+end
+if ne get gst 7 0
+fail 1 te_cfg
+end
+if eq get gst 4 0
+fail 1 te_cfg
+end
+if eq get gst 5 0
+fail 1 te_cfg
+end
+if ne get gdef get gst 6 5
+fail 1 te_ep
+end
+caps = get gst 3
+if eq get gst 0 1
+if ne and caps 14 14
+fail 1 te_prof
+end
+end
+if eq get gst 0 2
+if eq and caps 1 0
+fail 1 te_prof
+end
+end
+end
+
+fn main to int
+ac = argcnt
+if eq ac 2
+put gst 0 0
+put gst 11 1
+else
+if eq ac 4
+if not argis 1 tenv
+fail 2 tuse
+end
+if argis 2 tocl
+put gst 0 1
+else
+if argis 2 tvk
+put gst 0 2
+else
+fail 2 tuse
+end
+end
+put gst 11 3
+else
+fail 2 tuse
+end
+end
+readspv get gst 11
+validate
+ret 0
+end
