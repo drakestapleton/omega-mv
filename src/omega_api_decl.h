@@ -265,12 +265,35 @@ uint64_t osc_parse_literal(const uint8_t *o_spelling, size_t o_spelling_len, uin
 #define OSC_OWN_ALIAS 2
 #define OSC_OWN_READ_ONLY 3
 #define OSC_OWN_LOOP_MOVE 4
+typedef struct {
+    uint8_t moved;
+    uint8_t ombr_pad1[1];
+    uint16_t n_shared;
+    uint16_t n_mut;
+    uint8_t ombr_pad6[2];
+    uint32_t moveline;
+    int32_t sym;
+    int32_t arena1;
+} OscCheckedOwner;
+OMBR_ASSERT(sizeof(OscCheckedOwner) == 20, "layout oscowner size");
+OMBR_ASSERT(offsetof(OscCheckedOwner, moved) == 0, "layout oscowner field moved");
+OMBR_ASSERT(offsetof(OscCheckedOwner, n_shared) == 2, "layout oscowner field n_shared");
+OMBR_ASSERT(offsetof(OscCheckedOwner, n_mut) == 4, "layout oscowner field n_mut");
+OMBR_ASSERT(offsetof(OscCheckedOwner, moveline) == 8, "layout oscowner field moveline");
+OMBR_ASSERT(offsetof(OscCheckedOwner, sym) == 12, "layout oscowner field sym");
+OMBR_ASSERT(offsetof(OscCheckedOwner, arena1) == 16, "layout oscowner field arena1");
 /* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
 uint64_t osc_owner_access(uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
 /* export fn osc_borrow_access writable ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
 uint64_t osc_borrow_access(uint64_t o_writable, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
 /* export fn osc_owner_move moved ulong shared_count ulong mut_count ulong declaration_depth long loop_depth long to ulong */
 uint64_t osc_owner_move(uint64_t o_moved, uint64_t o_shared_count, uint64_t o_mut_count, int64_t o_declaration_depth, int64_t o_loop_depth);
+/* export fn osc_join_owner taken view oscowner remaining edit oscowner to ulong */
+uint64_t osc_join_owner(const OscCheckedOwner *o_taken, OscCheckedOwner *o_remaining);
+/* export fn osc_join_handle before long current long other long to long */
+int64_t osc_join_handle(int64_t o_before, int64_t o_current, int64_t o_other);
+/* export fn osc_join_frees taken view uchar * remaining edit uchar * to void */
+void osc_join_frees(const uint8_t *o_taken, size_t o_taken_len, uint8_t *o_remaining, size_t o_remaining_len);
 #ifdef __cplusplus
 }
 #endif
