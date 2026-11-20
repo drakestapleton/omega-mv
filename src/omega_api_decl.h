@@ -837,6 +837,12 @@ int64_t tensor_view_bounds(const uint64_t *o_dims, size_t o_dims_len, const uint
 int64_t tensor_broadcast_dims(const uint64_t *o_lhs, size_t o_lhs_len, const uint64_t *o_rhs, size_t o_rhs_len, uint64_t *o_result_dims, size_t o_result_dims_len);
 /* export fn tensor_is_row_major dims view ulong * strides view ulong * to ulong */
 uint64_t tensor_is_row_major(const uint64_t *o_dims, size_t o_dims_len, const uint64_t *o_strides, size_t o_strides_len);
+/* export fn tg_sgd_mode learning ulong momentum ulong to long */
+int64_t tg_sgd_mode(uint64_t o_learning, uint64_t o_momentum);
+/* export fn tg_update_velocity velocity edit uint * gradient view uint * bits ulong to void */
+void tg_update_velocity(uint32_t *o_velocity, size_t o_velocity_len, const uint32_t *o_gradient, size_t o_gradient_len, uint64_t o_bits);
+/* export fn tg_update_params params edit uint * direction view uint * bits ulong to void */
+void tg_update_params(uint32_t *o_params, size_t o_params_len, const uint32_t *o_direction, size_t o_direction_len, uint64_t o_bits);
 #ifdef __cplusplus
 }
 #endif

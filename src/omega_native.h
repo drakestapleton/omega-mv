@@ -499,6 +499,14 @@ uint32_t omega2_tensor_view_bounds(uint64_t *result, const uint64_t *o_dims, uin
 uint32_t omega2_tensor_broadcast_dims(uint64_t *result, const uint64_t *o_lhs, uint64_t o_lhs_len, const uint64_t *o_rhs, uint64_t o_rhs_len, uint64_t *o_result_dims, uint64_t o_result_dims_len);
 /* export fn tensor_is_row_major dims view ulong * strides view ulong * to ulong */
 uint32_t omega2_tensor_is_row_major(uint64_t *result, const uint64_t *o_dims, uint64_t o_dims_len, const uint64_t *o_strides, uint64_t o_strides_len);
+#define OMEGA2_IDENT_sgd_update "omega-ident 1 unit=sgd_update abi=2 profile=OM-2 src=2924c0f1756773bed88e1fb2ff3ef9c259668c55081b9e704c3d026bc2df0b26 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_sgd_update(void);
+/* export fn tg_sgd_mode learning ulong momentum ulong to long */
+uint32_t omega2_tg_sgd_mode(uint64_t *result, uint64_t o_learning, uint64_t o_momentum);
+/* export fn tg_update_velocity velocity edit uint * gradient view uint * bits ulong to void */
+uint32_t omega2_tg_update_velocity(uint64_t *result, uint32_t *o_velocity, uint64_t o_velocity_len, const uint32_t *o_gradient, uint64_t o_gradient_len, uint64_t o_bits);
+/* export fn tg_update_params params edit uint * direction view uint * bits ulong to void */
+uint32_t omega2_tg_update_params(uint64_t *result, uint32_t *o_params, uint64_t o_params_len, const uint32_t *o_direction, uint64_t o_direction_len, uint64_t o_bits);
 #ifdef __cplusplus
 }
 #endif
