@@ -146,6 +146,10 @@ uint64_t cg_tern_sched_stalls(uint64_t o_ins[8192], uint64_t o_n, const uint64_t
 uint64_t cg_attn256_spec_ok(const uint64_t o_sp[8]);
 /* export fn cg_attn256_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_attn256_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* fn cg_dec_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_dec_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* fn cg_gdn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_gdn_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 #ifdef __cplusplus
 }
 #endif

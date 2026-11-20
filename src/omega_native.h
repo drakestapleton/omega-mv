@@ -185,6 +185,14 @@ const char *omega2_ident_cg_attn256(void);
 uint32_t omega2_cg_attn256_spec_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
 /* export fn cg_attn256_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_attn256_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_dec "omega-ident 1 unit=cg_dec abi=2 profile=OM-2 src=83a578178c23abd29ab714149014e31f08d9f38d2128b39c58c0f7b603cb5011 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_dec(void);
+/* fn cg_dec_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_dec_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_gdn "omega-ident 1 unit=cg_gdn abi=2 profile=OM-2 src=fd403aeed75423fe3549f98a25d364b5ee07b035cea30512245358ea023674c7 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_gdn(void);
+/* fn cg_gdn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_gdn_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 #ifdef __cplusplus
 }
 #endif
