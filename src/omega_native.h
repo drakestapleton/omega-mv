@@ -377,7 +377,7 @@ uint32_t omega2_osc_constant_tree(uint64_t *result, const uint8_t *o_nodes, uint
 uint32_t omega2_osc_fold_tree(uint64_t *result, uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t o_typ, uint64_t *o_stack, uint64_t o_stack_len, uint64_t *o_report, uint64_t o_report_len);
 /* export fn osc_infer_step nodes edit uchar * stack edit ulong * frame edit infer checked ulong to ulong */
 uint32_t omega2_osc_infer_step(uint64_t *result, uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t *o_stack, uint64_t o_stack_len, uint8_t *o_frame, uint64_t o_checked);
-#define OMEGA2_IDENT_osc_a64_fields "omega-ident 1 unit=osc_a64_fields abi=2 profile=OM-2 src=9611ed84cd164f070399a77dcae62086f741201bcc972d969f912b21ce8824b4 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_a64_fields "omega-ident 1 unit=osc_a64_fields abi=2 profile=OM-2 src=6b0d855c4b12c67d8413d184d84f0005b737a1b73d5bc462dd6c4aff99f8e266 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_a64_fields(void);
 /* export fn osc_a64_pack_fields form ulong base ulong f view a64field to ulong */
 uint32_t omega2_osc_a64_pack_fields(uint64_t *result, uint64_t o_form, uint64_t o_base, const uint8_t *o_f);
@@ -385,6 +385,10 @@ uint32_t omega2_osc_a64_pack_fields(uint64_t *result, uint64_t o_form, uint64_t 
 uint32_t omega2_osc_a64_unpack_fields(uint64_t *result, uint64_t o_form, uint64_t o_word, uint8_t *o_f);
 /* export fn osc_a64_check_fields cls ulong f view a64field writeback ulong loadpair ulong to ulong */
 uint32_t omega2_osc_a64_check_fields(uint64_t *result, uint64_t o_cls, const uint8_t *o_f, uint64_t o_writeback, uint64_t o_loadpair);
+/* export fn osc_a64_checked_word form ulong base ulong f view a64field flags ulong to ulong */
+uint32_t omega2_osc_a64_checked_word(uint64_t *result, uint64_t o_form, uint64_t o_base, const uint8_t *o_f, uint64_t o_flags);
+/* export fn osc_a64_canonical_word form ulong base ulong word ulong flags ulong fields edit a64field to ulong */
+uint32_t omega2_osc_a64_canonical_word(uint64_t *result, uint64_t o_form, uint64_t o_base, uint64_t o_word, uint64_t o_flags, uint8_t *o_fields);
 #define OMEGA2_IDENT_osc_statement "omega-ident 1 unit=osc_statement abi=2 profile=OM-2 src=a7b0105f7f6556f4b78142c36b3208d8d5072df232898491f5fc010a7903c914 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_statement(void);
 /* export fn osc_for_range kinds view ushort 7 values view ulong 7 limit ulong range edit forrange to ulong */

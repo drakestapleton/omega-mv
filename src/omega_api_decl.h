@@ -502,6 +502,10 @@ uint64_t osc_a64_pack_fields(uint64_t o_form, uint64_t o_base, const OscA64Field
 void osc_a64_unpack_fields(uint64_t o_form, uint64_t o_word, OscA64Fields *o_f);
 /* export fn osc_a64_check_fields cls ulong f view a64field writeback ulong loadpair ulong to ulong */
 uint64_t osc_a64_check_fields(uint64_t o_cls, const OscA64Fields *o_f, uint64_t o_writeback, uint64_t o_loadpair);
+/* export fn osc_a64_checked_word form ulong base ulong f view a64field flags ulong to ulong */
+uint64_t osc_a64_checked_word(uint64_t o_form, uint64_t o_base, const OscA64Fields *o_f, uint64_t o_flags);
+/* export fn osc_a64_canonical_word form ulong base ulong word ulong flags ulong fields edit a64field to ulong */
+uint64_t osc_a64_canonical_word(uint64_t o_form, uint64_t o_base, uint64_t o_word, uint64_t o_flags, OscA64Fields *o_fields);
 #define OSC_FOR_WINDOW 7
 #define OSC_FOR_NAME 1
 #define OSC_FOR_IN 2
