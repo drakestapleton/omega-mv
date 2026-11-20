@@ -1,0 +1,213 @@
+om2
+note rx_regulate.om -- ADAPTIVE-M4 bounded resource regulation in pure OM-2.
+note Replaces the pure decision, envelope validation, policy derivation,
+note bounds checking, and state-transition logic of src/runtime/rx_regulate.c.
+note
+note Packed env[16] layout (ulong):
+note   0 slots_min      1 slots_max
+note   2 memory_min     3 memory_max
+note   4 energy_min     5 energy_max
+note   6 base_slots     7 base_memory     8 base_energy
+note   9 contention_hi 10 contention_lo
+note  11 pressure_hi   12 pressure_lo
+note  13 min_dwell
+note
+note Regimes: 0 = NOMINAL, 1 = EXPAND, 2 = PROTECT.
+
+const REG_NOMINAL ulong 0
+const REG_EXPAND ulong 1
+const REG_PROTECT ulong 2
+const U32_MAX ulong 4294967295
+
+fn decide_impl env view ulong 16 regime ulong dwell ulong contention ulong pressure ulong to ulong
+  min_dw = get env 13
+  settled = ge dwell min_dw
+  p_hi = get env 11
+  if ge pressure p_hi
+    ret REG_PROTECT
+  end
+  if eq regime REG_PROTECT
+    p_lo = get env 12
+    if not settled
+      ret REG_PROTECT
+    end
+    if gt pressure p_lo
+      ret REG_PROTECT
+    end
+    c_hi = get env 9
+    if ge contention c_hi
+      ret REG_EXPAND
+    end
+    ret REG_NOMINAL
+  end
+  if eq regime REG_EXPAND
+    c_lo = get env 10
+    if not settled
+      ret REG_EXPAND
+    end
+    if gt contention c_lo
+      ret REG_EXPAND
+    end
+    ret REG_NOMINAL
+  end
+  c_hi2 = get env 9
+  if ge contention c_hi2
+    ret REG_EXPAND
+  end
+  ret REG_NOMINAL
+end
+
+fn policy_fill env view ulong 16 regime ulong dst edit ulong 4 to void
+  if eq regime REG_EXPAND
+    put dst 0 get env 1
+    put dst 1 get env 3
+    put dst 2 get env 5
+    ret
+  end
+  if eq regime REG_PROTECT
+    put dst 0 get env 0
+    put dst 1 get env 2
+    put dst 2 get env 4
+    ret
+  end
+  put dst 0 get env 6
+  put dst 1 get env 7
+  put dst 2 get env 8
+end
+
+note Returns 0 (RX_OK) when envelope is consistent, -1 (RX_ERR_ARG) otherwise.
+export fn rx_reg_envelope_ok env view ulong 16 to long
+  smin = get env 0
+  smax = get env 1
+  if eq smin 0
+    ret -1
+  end
+  if gt smin smax
+    ret -1
+  end
+  if gt smax U32_MAX
+    ret -1
+  end
+  mmin = get env 2
+  mmax = get env 3
+  if gt mmin mmax
+    ret -1
+  end
+  emin = get env 4
+  emax = get env 5
+  if gt emin emax
+    ret -1
+  end
+  bs = get env 6
+  if lt bs smin
+    ret -1
+  end
+  if gt bs smax
+    ret -1
+  end
+  bm = get env 7
+  if lt bm mmin
+    ret -1
+  end
+  if gt bm mmax
+    ret -1
+  end
+  be = get env 8
+  if lt be emin
+    ret -1
+  end
+  if gt be emax
+    ret -1
+  end
+  chi = get env 9
+  clo = get env 10
+  if ge clo chi
+    ret -1
+  end
+  phi = get env 11
+  plo = get env 12
+  if ge plo phi
+    ret -1
+  end
+  if gt phi 100
+    ret -1
+  end
+  mdw = get env 13
+  if eq mdw 0
+    ret -1
+  end
+  ret 0
+end
+
+note Pure regime decision with hysteresis and dwell.
+export fn rx_reg_decide env view ulong 16 regime ulong dwell ulong contention ulong pressure ulong to ulong
+  ret decide_impl env regime dwell contention pressure
+end
+
+note Write the (slots, memory, energy) budget for regime into dst[0..2].
+export fn rx_reg_policy_for env view ulong 16 regime ulong dst edit ulong 4 to void
+  policy_fill env regime dst
+end
+
+note Validate a policy object's fields[0..7] against the fixed envelope.
+note Returns 0 (RX_OK) or -20 (RX_ERR_BOUNDS).
+export fn rx_reg_apply_check env view ulong 16 pol view ulong 8 to long
+  slots = get pol 1
+  if gt slots U32_MAX
+    ret -20
+  end
+  if lt slots get env 0
+    ret -20
+  end
+  if gt slots get env 1
+    ret -20
+  end
+  mem = get pol 2
+  if lt mem get env 2
+    ret -20
+  end
+  if gt mem get env 3
+    ret -20
+  end
+  eng = get pol 3
+  if lt eng get env 4
+    ret -20
+  end
+  if gt eng get env 5
+    ret -20
+  end
+  reg = get pol 4
+  if gt reg REG_PROTECT
+    ret -20
+  end
+  ret 0
+end
+
+note Complete reaction step (fn_regulate):
+note   returns 0 = no-op (cseq == pol[5])
+note   returns 1 = same regime (dst[5]=cseq, dst[6]=dwell+1)
+note   returns 2 = regime flip (dst[0..7] populated with new policy fields)
+export fn rx_reg_step env view ulong 16 cond view ulong 8 pol view ulong 8 dst edit ulong 8 to ulong
+  cseq = get cond 0
+  if eq cseq get pol 5
+    ret 0
+  end
+  regime = get pol 4
+  dwell = get pol 6
+  nxt = decide_impl env regime dwell get cond 1 get cond 3
+  put dst 5 cseq
+  if eq nxt regime
+    put dst 6 add dwell 1
+    ret 1
+  end
+  b = new ulong 4 0
+  policy_fill env nxt b
+  put dst 0 add get pol 0 1
+  put dst 1 get b 0
+  put dst 2 get b 1
+  put dst 3 get b 2
+  put dst 4 nxt
+  put dst 6 0
+  put dst 7 add get pol 7 1
+  ret 2
+end

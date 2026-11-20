@@ -178,6 +178,84 @@ uint64_t cg_attn256_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t 
 uint64_t cg_dec_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* fn cg_gdn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_gdn_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn rx_reg_envelope_ok env view ulong 16 to long */
+int64_t rx_reg_envelope_ok(const uint64_t o_env[16]);
+/* export fn rx_reg_decide env view ulong 16 regime ulong dwell ulong contention ulong pressure ulong to ulong */
+uint64_t rx_reg_decide(const uint64_t o_env[16], uint64_t o_regime, uint64_t o_dwell, uint64_t o_contention, uint64_t o_pressure);
+/* export fn rx_reg_policy_for env view ulong 16 regime ulong dst edit ulong 4 to void */
+void rx_reg_policy_for(const uint64_t o_env[16], uint64_t o_regime, uint64_t o_dst[4]);
+/* export fn rx_reg_apply_check env view ulong 16 pol view ulong 8 to long */
+int64_t rx_reg_apply_check(const uint64_t o_env[16], const uint64_t o_pol[8]);
+/* export fn rx_reg_step env view ulong 16 cond view ulong 8 pol view ulong 8 dst edit ulong 8 to ulong */
+uint64_t rx_reg_step(const uint64_t o_env[16], const uint64_t o_cond[8], const uint64_t o_pol[8], uint64_t o_dst[8]);
+/* export fn rx_mid_is_zero buf view uchar 32 to ulong */
+uint64_t rx_mid_is_zero(const uint8_t o_buf[32]);
+/* export fn rx_mid_equal a view uchar 32 b view uchar 32 to ulong */
+uint64_t rx_mid_equal(const uint8_t o_a[32], const uint8_t o_b[32]);
+/* export fn rx_mid_compare a view uchar 32 b view uchar 32 to long */
+int64_t rx_mid_compare(const uint8_t o_a[32], const uint8_t o_b[32]);
+/* export fn rx_mid_hash buf view uchar 32 to ulong */
+uint64_t rx_mid_hash(const uint8_t o_buf[32]);
+/* export fn rx_mid_pack_hdr root ulong id view uchar 32 rec edit uchar 44 to long */
+int64_t rx_mid_pack_hdr(uint64_t o_root, const uint8_t o_id[32], uint8_t o_rec[44]);
+/* export fn rx_mid_val_rec rec view uchar 44 chk view uchar 4 dst edit uchar 33 to long */
+int64_t rx_mid_val_rec(const uint8_t o_rec[44], const uint8_t o_chk[4], uint8_t o_dst[33]);
+/* export fn rx_mid_to_hex rec view uchar 44 hex edit uchar 88 to void */
+void rx_mid_to_hex(const uint8_t o_rec[44], uint8_t o_hex[88]);
+/* export fn rx_mid_from_hex hex view uchar 88 rec edit uchar 44 to long */
+int64_t rx_mid_from_hex(const uint8_t o_hex[88], uint8_t o_rec[44]);
+/* export fn rx_cx_kind_of ckind ulong dst edit ulong 4 to void */
+void rx_cx_kind_of(uint64_t o_ckind, uint64_t o_dst[4]);
+/* export fn rx_cx_pack_digest dig view uchar 32 dst edit ulong 4 to void */
+void rx_cx_pack_digest(const uint8_t o_dig[32], uint64_t o_dst[4]);
+/* export fn rx_cx_dedup_links cause ulong parents view ulong * dst edit ulong 8 max_links ulong to ulong */
+uint64_t rx_cx_dedup_links(uint64_t o_cause, const uint64_t *o_parents, size_t o_parents_len, uint64_t o_dst[8], uint64_t o_max_links);
+/* export fn rx_pl_word dig view uchar 32 k ulong to ulong */
+uint64_t rx_pl_word(const uint8_t o_dig[32], uint64_t o_k);
+/* export fn rx_pla_fact_pack xid ulong xgen ulong is_floor ulong tid ulong tgen ulong to ulong */
+uint64_t rx_pla_fact_pack(uint64_t o_xid, uint64_t o_xgen, uint64_t o_is_floor, uint64_t o_tid, uint64_t o_tgen);
+/* export fn rx_pla_fact_unpack f ulong dst edit ulong 5 to void */
+void rx_pla_fact_unpack(uint64_t o_f, uint64_t o_dst[5]);
+/* export fn rx_pl_sort_preds buf edit ulong 288 n ulong to void */
+void rx_pl_sort_preds(uint64_t o_buf[288], uint64_t o_n);
+/* export fn rx_pj_summarize w view ulong * dst edit ulong 5 to void */
+void rx_pj_summarize(const uint64_t *o_w, size_t o_w_len, uint64_t o_dst[5]);
+/* export fn rx_pj_section_of protect ulong cls ulong treatment ulong temporal ulong to ulong */
+uint64_t rx_pj_section_of(uint64_t o_protect, uint64_t o_cls, uint64_t o_treatment, uint64_t o_temporal);
+/* export fn rx_pj_form_of treatment ulong to ulong */
+uint64_t rx_pj_form_of(uint64_t o_treatment);
+/* export fn rx_cq_key_hash cap_id ulong real_id ulong mach_id ulong skill_id ulong to ulong */
+uint64_t rx_cq_key_hash(uint64_t o_cap_id, uint64_t o_real_id, uint64_t o_mach_id, uint64_t o_skill_id);
+/* export fn rx_cq_dim_value vals view ulong 7 dim ulong to ulong */
+uint64_t rx_cq_dim_value(const uint64_t o_vals[7], uint64_t o_dim);
+/* export fn rx_cq_dominates a view ulong 7 b view ulong 7 dims view uchar 7 nd ulong to ulong */
+uint64_t rx_cq_dominates(const uint64_t o_a[7], const uint64_t o_b[7], const uint8_t o_dims[7], uint64_t o_nd);
+/* export fn rx_cq_cmp_full a view ulong 11 b view ulong 11 dims view uchar 7 nd ulong to long */
+int64_t rx_cq_cmp_full(const uint64_t o_a[11], const uint64_t o_b[11], const uint8_t o_dims[7], uint64_t o_nd);
+/* export fn rx_cq_within v ulong best ulong tol_ppm ulong to ulong */
+uint64_t rx_cq_within(uint64_t o_v, uint64_t o_best, uint64_t o_tol_ppm);
+/* export fn rx_cm_fit_predict tri view ulong 36 xty_u view ulong 8 phi_u view ulong 8 meta view ulong 2 dst edit ulong 4 to ulong */
+uint64_t rx_cm_fit_predict(const uint64_t o_tri[36], const uint64_t o_xty_u[8], const uint64_t o_phi_u[8], const uint64_t o_meta[2], uint64_t o_dst[4]);
+/* export fn rx_cm_rank1_update tri edit ulong 36 xty edit ulong 8 phi view ulong 8 y_bits ulong to void */
+void rx_cm_rank1_update(uint64_t o_tri[36], uint64_t o_xty[8], const uint64_t o_phi[8], uint64_t o_y_bits);
+/* export fn rx_rt_conf_bin conf ulong conf_one ulong bins ulong to ulong */
+uint64_t rx_rt_conf_bin(uint64_t o_conf, uint64_t o_conf_one, uint64_t o_bins);
+/* export fn rx_rt_wilson k ulong n ulong dst edit ulong 2 to void */
+void rx_rt_wilson(uint64_t o_k, uint64_t o_n, uint64_t o_dst[2]);
+/* export fn rx_world_state_legal from ulong dest ulong to ulong */
+uint64_t rx_world_state_legal(uint64_t o_from, uint64_t o_dest);
+/* export fn rx_world_res_fits used view ulong 4 budget view ulong 6 need view ulong 5 to ulong */
+uint64_t rx_world_res_fits(const uint64_t o_used[4], const uint64_t o_budget[6], const uint64_t o_need[5]);
+/* export fn rx_world_better_admit a view ulong 3 b view ulong 3 to ulong */
+uint64_t rx_world_better_admit(const uint64_t o_a[3], const uint64_t o_b[3]);
+/* export fn rx_sr_digest_zero d view uchar 32 to ulong */
+uint64_t rx_sr_digest_zero(const uint8_t o_d[32]);
+/* export fn rx_sr_why_of counts view ulong 10 to ulong */
+uint64_t rx_sr_why_of(const uint64_t o_counts[10]);
+/* export fn rx_fus_word64 d view uchar 8 to ulong */
+uint64_t rx_fus_word64(const uint8_t o_d[8]);
+/* export fn rx_fus_eligible_kind k ulong to ulong */
+uint64_t rx_fus_eligible_kind(uint64_t o_k);
 #ifdef __cplusplus
 }
 #endif

@@ -221,6 +221,10 @@ Bounded untrusted representation envelopes and explicit checked Omega decoding; 
 
 Independent SHA-256 envelope fixtures and exact decoded-source oracles for the native Omega host conductor
 
+## `om/runtime/`
+
+Pure seeded OM-2 runtime units bound through `om/units.sh` into `src/omega_om_units.c`, backing the C runtime facades under `src/runtime/`: `rx_regulate.om`, `rx_mid.om`, `rx_cortex_rec.om`, `rx_plan_core.om`, `rx_projection.om`, `rx_capq_core.om`, `rx_costmodel_core.om`, `rx_route_core.om`, `rx_world_core.om`, `rx_skillroute_core.om`, and `rx_fusion_core.om`.
+
 ## `om/tls/`
 
 TLS 1.3 client (chacha20-poly1305, aes-gcm, x25519, P-256/RSA signatures, X.509 path validation) in seeded Omega with its KAT, DNS, interop and mutant suites

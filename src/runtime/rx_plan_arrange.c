@@ -20,6 +20,7 @@
  */
 #include "rx_plan_arrange.h"
 
+#include "omega_native.h"
 #include "omega_types.h"
 #include "sha256.h"
 
@@ -30,17 +31,22 @@
 #define NONE  0xFFu
 
 uint64_t pla_fact(RxObjRef x, const RxObjRef *t) {
-    uint64_t v = (1ull << 63) | (x.id & 0xffu) | ((uint64_t)(x.generation & 0xffffffu) << 8);
-    if (!t) return v | (1ull << 62);
-    return v | ((uint64_t)(t->id & 0xffu) << 32) | ((uint64_t)(t->generation & 0x3fffffu) << 40);
+    uint64_t res = 0;
+    (void)omega2_rx_pla_fact_pack(&res, (uint64_t)x.id, (uint64_t)x.generation,
+                                  t ? 0ull : 1ull,
+                                  t ? (uint64_t)t->id : 0ull,
+                                  t ? (uint64_t)t->generation : 0ull);
+    return res;
 }
 
 static void fact_unpack(uint64_t f, RxObjRef *x, RxObjRef *t, uint8_t *floor) {
-    x->id = (uint32_t)(f & 0xffu);
-    x->generation = (uint32_t)((f >> 8) & 0xffffffu);
-    *floor = (uint8_t)((f >> 62) & 1u);
-    t->id = (uint32_t)((f >> 32) & 0xffu);
-    t->generation = (uint32_t)((f >> 40) & 0x3fffffu);
+    uint64_t dst[5] = { 0 }, res = 0;
+    (void)omega2_rx_pla_fact_unpack(&res, f, dst, 5);
+    x->id = (uint32_t)dst[0];
+    x->generation = (uint32_t)dst[1];
+    *floor = (uint8_t)dst[2];
+    t->id = (uint32_t)dst[3];
+    t->generation = (uint32_t)dst[4];
 }
 
 static int same(RxObjRef a, RxObjRef b) { return a.id == b.id && a.generation == b.generation; }

@@ -21,6 +21,7 @@
  * authority, no generation store.
  */
 #include "runtime/rx_costmodel.h"
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <math.h>
@@ -81,65 +82,23 @@ void rx_cm_basis(const RxCmFeatures *f, double phi[RX_CM_D]) {
     phi[7] = ov;
 }
 
-/* Cholesky of the D x D matrix held as an upper triangle. 0 on success. */
-static int cholesky(const double *tri, double L[RX_CM_D][RX_CM_D]) {
-    double A[RX_CM_D][RX_CM_D];
-    for (uint32_t i = 0, k = 0; i < RX_CM_D; i++)
-        for (uint32_t j = i; j < RX_CM_D; j++, k++) A[i][j] = A[j][i] = tri[k];
-    memset(L, 0, sizeof(double) * RX_CM_D * RX_CM_D);
-    for (uint32_t j = 0; j < RX_CM_D; j++) {
-        double s = A[j][j];
-        for (uint32_t k = 0; k < j; k++) s -= L[j][k] * L[j][k];
-        if (!(s > 0.0)) return -1;
-        L[j][j] = sqrt(s);
-        for (uint32_t i = j + 1; i < RX_CM_D; i++) {
-            double t = A[i][j];
-            for (uint32_t k = 0; k < j; k++) t -= L[i][k] * L[j][k];
-            L[i][j] = t / L[j][j];
-        }
-    }
-    return 0;
-}
-
-static void forward(double L[RX_CM_D][RX_CM_D], const double *b, double *v) {
-    for (uint32_t i = 0; i < RX_CM_D; i++) {
-        double s = b[i];
-        for (uint32_t k = 0; k < i; k++) s -= L[i][k] * v[k];
-        v[i] = s / L[i][i];
-    }
-}
-
-static void backward(double L[RX_CM_D][RX_CM_D], const double *v, double *x) {
-    for (int i = (int)RX_CM_D - 1; i >= 0; i--) {
-        double s = v[i];
-        for (uint32_t k = (uint32_t)i + 1; k < RX_CM_D; k++) s -= L[k][i] * x[k];
-        x[i] = s / L[i][i];
-    }
-}
-
-/* Predictive t for one (cell, arm). Returns 0 if there is no data. */
+/* Predictive t for one (cell, arm), executed in pure OM-2 (om/runtime/rx_costmodel_core.om).
+ * Returns 0 if there is no data or matrix is not positive definite. */
 static int fit_predict(const RxCmArmStats *s, const double phi[RX_CM_D], double *mean,
                        double *sd, double *dof) {
     if (s->n == 0) return 0;
-    double L[RX_CM_D][RX_CM_D], v[RX_CM_D], mu[RX_CM_D], w[RX_CM_D];
-    if (cholesky(s->tri, L) != 0) return 0;
-    forward(L, s->xty, v);
-    backward(L, v, mu);
-    double quad = 0.0;          /* mu' Lambda mu = |L' mu|^2 = v . v */
-    for (uint32_t i = 0; i < RX_CM_D; i++) quad += v[i] * v[i];
-    double a = PRIOR_A + 0.5 * (double)s->n;
-    double b = PRIOR_B + 0.5 * (s->yty - quad);
-    if (b < PRIOR_B) b = PRIOR_B;
-    double sigma2 = b / a;
-    if (sigma2 < NOISE_FLOOR) sigma2 = NOISE_FLOOR;
-    forward(L, phi, w);
-    double lev = 0.0;
-    for (uint32_t i = 0; i < RX_CM_D; i++) lev += w[i] * w[i];
-    double m = 0.0;
-    for (uint32_t i = 0; i < RX_CM_D; i++) m += mu[i] * phi[i];
-    *mean = m;
-    *sd = sqrt(sigma2 * (1.0 + lev));
-    *dof = 2.0 * a;
+    uint64_t tri_u[36], xty_u[8], phi_u[8], meta[2], dst[4] = { 0 }, ok = 0;
+    memcpy(tri_u, s->tri, sizeof tri_u);
+    memcpy(xty_u, s->xty, sizeof xty_u);
+    memcpy(phi_u, phi, sizeof phi_u);
+    meta[0] = s->n;
+    memcpy(&meta[1], &s->yty, sizeof(uint64_t));
+    if (omega2_rx_cm_fit_predict(&ok, tri_u, 36, xty_u, 8, phi_u, 8, meta, 2, dst, 4) != OMEGA_OK ||
+        ok == 0)
+        return 0;
+    memcpy(mean, &dst[0], sizeof(double));
+    memcpy(sd, &dst[1], sizeof(double));
+    memcpy(dof, &dst[2], sizeof(double));
     return 1;
 }
 
@@ -253,9 +212,15 @@ int rx_cm_observe(RxCostModel *m, const RxCmFeatures *f, uint32_t arm, const RxC
         residual_basis(f, phi);
         y -= qm;
     }
-    for (uint32_t i = 0, k = 0; i < RX_CM_D; i++) {
-        for (uint32_t j = i; j < RX_CM_D; j++, k++) s->tri[k] += phi[i] * phi[j];
-        s->xty[i] += phi[i] * y;
+    {
+        uint64_t tri_u[36], xty_u[8], phi_u[8], y_bits = 0, res = 0;
+        memcpy(tri_u, s->tri, sizeof tri_u);
+        memcpy(xty_u, s->xty, sizeof xty_u);
+        memcpy(phi_u, phi, sizeof phi_u);
+        memcpy(&y_bits, &y, sizeof(uint64_t));
+        (void)omega2_rx_cm_rank1_update(&res, tri_u, 36, xty_u, 8, phi_u, 8, y_bits);
+        memcpy(s->tri, tri_u, sizeof tri_u);
+        memcpy(s->xty, xty_u, sizeof xty_u);
     }
     s->yty += y * y;
     s->n++;
