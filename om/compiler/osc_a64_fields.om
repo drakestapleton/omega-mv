@@ -22,7 +22,25 @@ note bridge c-define OSC_A64_ERR_WRITEBACK_ALIAS 16
 note bridge c-define OSC_A64_ERR_LOAD_ALIAS 17
 note bridge c-define OSC_A64_ERR_BRANCH_OFFSET 18
 note bridge c-define OSC_A64_ERR_BRANCH_COND 19
+note bridge c-define OSC_A64_ERR_UNUSED_REG 32
+note bridge c-define OSC_A64_ERR_REG_SP 36
+note bridge c-define OSC_A64_ERR_REG_ZR 40
+note bridge c-define OSC_A64_ERR_BAD_REG 44
 om2
+layout a64spec 24
+field base uint at 8 little
+field form uchar at 12 little
+field role uchar 4 at 13 little
+field flags uchar at 17 little
+end
+layout a64insn 24
+field opcode uchar at 0 little
+field reg uchar 4 at 1 little
+field shift uchar at 5 little
+field cond uchar at 6 little
+field imm long at 8 little
+field imm2 long at 16 little
+end
 layout a64field 40
 field rd uint at 0 little
 field rn uint at 4 little
@@ -340,4 +358,167 @@ export fn osc_a64_materialize value ulong plan edit ulong 4 to ulong
     ret 1
   end
   ret count
+end
+
+note The descriptor table is indexed in public opcode order. Class masks
+note select the variable bits excluded from the fixed opcode comparison.
+fn a64_mask form ulong to ulong
+  if eq form CLS_RRR_SH
+    ret 0x00dfffff
+  end
+  if eq form CLS_RI
+    ret 0x007fffff
+  end
+  if eq form CLS_R4
+    ret 0x001f7fff
+  end
+  if eq form CLS_MULH
+    ret 0x001f03ff
+  end
+  if eq form CLS_R3
+    ret 0x001f03ff
+  end
+  if eq form CLS_BFM
+    ret 0x003fffff
+  end
+  if eq form CLS_CSINC
+    ret 0x001ff3ff
+  end
+  if eq form CLS_MOV16
+    ret 0x007fffff
+  end
+  if eq form CLS_MEM
+    ret 0x003fffff
+  end
+  if eq form CLS_PAIR
+    ret 0x003fffff
+  end
+  if eq form CLS_B26
+    ret 0x03ffffff
+  end
+  if eq form CLS_BCOND
+    ret 0x00ffffef
+  end
+  if eq form CLS_CB
+    ret 0x00ffffff
+  end
+  if eq form CLS_BREG
+    ret 0x000003e0
+  end
+  if eq form CLS_BRK
+    ret 0x001fffe0
+  end
+  ret 0
+end
+
+fn a64_encode_registers spec view a64spec insn view a64insn fields edit a64field to ulong
+  regs = new uint 4 0
+  for i ulong 4
+    if and eq get spec role i 0 ne get insn reg i 0
+      ret shl add 32 i 32
+    end
+  end
+  for i ulong 4
+    role = get spec role i
+    regno = get insn reg i
+    if le regno 30
+      put regs i uint regno
+    else
+      if eq regno 33
+        if ne role 2
+          ret shl add 36 i 32
+        end
+      else
+        if eq regno 32
+          if ne role 1
+            ret shl add 40 i 32
+          end
+        else
+          ret shl add 44 i 32
+        end
+      end
+      put regs i 31
+    end
+  end
+  put fields rd get regs 0
+  put fields rn get regs 1
+  put fields rm get regs 2
+  put fields ra get regs 3
+  put fields shift uint get insn shift
+  put fields cond uint get insn cond
+  put fields imm get insn imm
+  put fields imm2 get insn imm2
+  ret osc_a64_checked_word ulong get spec form ulong get spec base fields ulong get spec flags
+end
+
+export fn osc_a64_write spec view uchar 24 insn view uchar 24 to ulong
+  fields = new uchar 40 0
+  ret a64_encode_registers spec insn fields
+end
+
+fn a64_decode_register role uchar bits uint to uchar
+  if eq role 0
+    ret 0
+  end
+  if lt bits 31
+    ret uchar bits
+  end
+  if eq role 1
+    ret 32
+  end
+  if eq role 2
+    ret 33
+  end
+  ret 255
+end
+
+fn a64_try_opcode word ulong op ulong spec view a64spec insn edit a64insn fields edit a64field to ulong
+  form = ulong get spec form
+  base = ulong get spec base
+  if eq osc_a64_canonical_word form base word ulong get spec flags fields 0
+    ret 0
+  end
+  put insn opcode uchar op
+  put insn reg 0 a64_decode_register get spec role 0 get fields rd
+  put insn reg 1 a64_decode_register get spec role 1 get fields rn
+  put insn reg 2 a64_decode_register get spec role 2 get fields rm
+  put insn reg 3 a64_decode_register get spec role 3 get fields ra
+  put insn shift uchar get fields shift
+  put insn cond uchar get fields cond
+  put insn imm get fields imm
+  put insn imm2 get fields imm2
+  ret 1
+end
+
+fn a64_matches specs view uchar * pos ulong word ulong to bool
+  form = ulong get specs add pos 12
+  base = ulong get specs add pos 8
+  base = or base shl ulong get specs add pos 9 8
+  base = or base shl ulong get specs add pos 10 16
+  base = or base shl ulong get specs add pos 11 24
+  ret and ne form 0 eq and word xor a64_mask form 0xffffffff base
+end
+
+fn a64_copy_spec specs view uchar * pos ulong spec edit uchar 24 to void
+  for i ulong 10
+    put spec add 8 i get specs add add pos 8 i
+  end
+end
+
+export fn osc_a64_read word ulong specs view uchar * insn edit uchar 24 to ulong
+  fields = new uchar 40 0
+  spec = new uchar 24 0
+  n = div len specs 24
+  op = ulong 1
+  while lt op n bound 255
+    pos = mul op 24
+    if a64_matches specs pos word
+      a64_copy_spec specs pos spec
+      if ne a64_try_opcode word op spec insn fields 0
+        ret 1
+      end
+    end
+    op = add op 1
+  end
+  ret 0
 end

@@ -514,6 +514,39 @@ uint64_t osc_return_ensures(const uint8_t *o_nodes, size_t o_nodes_len, const ui
 #define OSC_A64_ERR_LOAD_ALIAS 17
 #define OSC_A64_ERR_BRANCH_OFFSET 18
 #define OSC_A64_ERR_BRANCH_COND 19
+#define OSC_A64_ERR_UNUSED_REG 32
+#define OSC_A64_ERR_REG_SP 36
+#define OSC_A64_ERR_REG_ZR 40
+#define OSC_A64_ERR_BAD_REG 44
+typedef struct {
+    uint8_t ombr_pad0[8];
+    uint32_t base;
+    uint8_t form;
+    uint8_t role[4];
+    uint8_t flags;
+    uint8_t ombr_pad18[6];
+} a64spec;
+OMBR_ASSERT(sizeof(a64spec) == 24, "layout a64spec size");
+OMBR_ASSERT(offsetof(a64spec, base) == 8, "layout a64spec field base");
+OMBR_ASSERT(offsetof(a64spec, form) == 12, "layout a64spec field form");
+OMBR_ASSERT(offsetof(a64spec, role) == 13, "layout a64spec field role");
+OMBR_ASSERT(offsetof(a64spec, flags) == 17, "layout a64spec field flags");
+typedef struct {
+    uint8_t opcode;
+    uint8_t reg[4];
+    uint8_t shift;
+    uint8_t cond;
+    uint8_t ombr_pad7[1];
+    int64_t imm;
+    int64_t imm2;
+} a64insn;
+OMBR_ASSERT(sizeof(a64insn) == 24, "layout a64insn size");
+OMBR_ASSERT(offsetof(a64insn, opcode) == 0, "layout a64insn field opcode");
+OMBR_ASSERT(offsetof(a64insn, reg) == 1, "layout a64insn field reg");
+OMBR_ASSERT(offsetof(a64insn, shift) == 5, "layout a64insn field shift");
+OMBR_ASSERT(offsetof(a64insn, cond) == 6, "layout a64insn field cond");
+OMBR_ASSERT(offsetof(a64insn, imm) == 8, "layout a64insn field imm");
+OMBR_ASSERT(offsetof(a64insn, imm2) == 16, "layout a64insn field imm2");
 typedef struct {
     uint32_t rd;
     uint32_t rn;
@@ -545,6 +578,10 @@ uint64_t osc_a64_checked_word(uint64_t o_form, uint64_t o_base, const OscA64Fiel
 uint64_t osc_a64_canonical_word(uint64_t o_form, uint64_t o_base, uint64_t o_word, uint64_t o_flags, OscA64Fields *o_fields);
 /* export fn osc_a64_materialize value ulong plan edit ulong 4 to ulong */
 uint64_t osc_a64_materialize(uint64_t o_value, uint64_t o_plan[4]);
+/* export fn osc_a64_write spec view uchar 24 insn view uchar 24 to ulong */
+uint64_t osc_a64_write(const uint8_t o_spec[24], const uint8_t o_insn[24]);
+/* export fn osc_a64_read word ulong specs view uchar * insn edit uchar 24 to ulong */
+uint64_t osc_a64_read(uint64_t o_word, const uint8_t *o_specs, size_t o_specs_len, uint8_t o_insn[24]);
 #define OSC_FOR_WINDOW 7
 #define OSC_FOR_NAME 1
 #define OSC_FOR_IN 2
