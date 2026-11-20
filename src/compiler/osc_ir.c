@@ -20,6 +20,7 @@
  * OSC-1 slice; not a general Omega compiler; no self-hosting.
  */
 #include "osc_ir.h"
+#include "omega_api_decl.h"
 #include "sha256.h"
 
 #include <stdarg.h>
@@ -875,20 +876,16 @@ int osc_ir_encoding_version(const uint8_t *buf, size_t len) {
     return (buf[7] >= 1 && buf[7] <= OSC_IR_VERSION_MAX) ? buf[7] : -1;
 }
 
+_Static_assert(sizeof(OscType) == 4 * sizeof(uint32_t) && offsetof(OscType, s) == 0 &&
+               sizeof(OscScalar) == sizeof(uint32_t) && OSC_T_BYTES == 11 && OSC_T_CELLS == 12,
+               "OSC slice validator reads each argument's scalar tag");
+
 int osc_ir_slice_args_ok(const OscFunc *f, const uint64_t *args, unsigned nargs) {
     if (!f || nargs != f->nparams || (nargs && !args)) return -1;
-    for (unsigned p = 0; p + 1 < nargs; p++) {
-        if (!type_is_slice(&f->vtype[p])) continue;
-        uint64_t ptr = args[p], n = args[p + 1], sz = n * (f->vtype[p].s == OSC_T_CELLS ? 8 : 1);
-        if ((f->vtype[p].s == OSC_T_CELLS && (n > UINT64_MAX / 8 || (n && (ptr & 7)))) || (n && !ptr) || sz > UINT64_MAX - ptr) return -1;
-        for (unsigned q = 0; q + 1 < nargs; q++) {
-            if (q == p || !type_is_slice(&f->vtype[q])) continue;
-            if (f->vtype[p].s != OSC_T_CELLS && f->vtype[q].s != OSC_T_CELLS) continue;
-            uint64_t qn = args[q + 1], qsz = qn * (f->vtype[q].s == OSC_T_CELLS ? 8 : 1);
-            if (!sz || !qn || (f->vtype[q].s == OSC_T_CELLS && qn > UINT64_MAX / 8) || qsz > UINT64_MAX - args[q]) continue;
-            if (ptr < args[q] + qsz && args[q] < ptr + sz) return -1;
-        }
-    }
+    /* Scalar-only entries run for every interpreter and native invocation. */
+    for (unsigned p = 0; p + 1 < nargs; p++)
+        if (type_is_slice(&f->vtype[p]))
+            return (int)osc_slice_args((const uint32_t *)f->vtype, (size_t)nargs * 4, args, nargs);
     return 0;
 }
 
