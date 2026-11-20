@@ -21,7 +21,7 @@ const char *omega2_ident_arboris_arena(void);
 uint32_t omega2_arboris_plan_arena(uint64_t *result, uint64_t *o_m, uint64_t o_m_len, uint64_t o_budget, uint64_t o_page, uint64_t *o_offsets, uint64_t o_offsets_len);
 /* export fn arboris_check_csr m view ulong 16 data view uint * to ulong */
 uint32_t omega2_arboris_check_csr(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint32_t *o_data, uint64_t o_data_len);
-#define OMEGA2_IDENT_arboris_spread "omega-ident 1 unit=arboris_spread abi=2 profile=OM-2 src=d222fcb6591e0bae98f42f031660b3e432a40adae15b8ae06ab4fc29a35ef5ae omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_arboris_spread "omega-ident 1 unit=arboris_spread abi=2 profile=OM-2 src=b1ed3d7a6d2e9b4b1203ad80da630e6399bb3a0f22fb123b61b07aa8e99684c2 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_spread(void);
 /* export fn arboris_load_records r view uint * topo edit uint * weights edit uint * to ulong */
 uint32_t omega2_arboris_load_records(uint64_t *result, const uint32_t *o_r, uint64_t o_r_len, uint32_t *o_topo, uint64_t o_topo_len, uint32_t *o_weights, uint64_t o_weights_len);
@@ -29,14 +29,28 @@ uint32_t omega2_arboris_load_records(uint64_t *result, const uint32_t *o_r, uint
 uint32_t omega2_arboris_topology_digest(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint8_t *o_digest, uint64_t o_digest_len);
 /* export fn arboris_spread_step topo view uint * weights view uint * state edit uint * to ulong */
 uint32_t omega2_arboris_spread_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
+/* export fn arboris_relax_step topo view uint * weights view uint * state edit uint * to ulong */
+uint32_t omega2_arboris_relax_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
 #define OMEGA2_IDENT_arboris_gated "omega-ident 1 unit=arboris_gated abi=2 profile=OM-2 src=82c17768f03ee099a90c71a379dd3592b2a80eda81a8de45f4c61d3d19890688 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_gated(void);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
 uint32_t omega2_arboris_gated_tick(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint64_t *o_offsets, uint64_t o_offsets_len, uint16_t *o_arena, uint64_t o_arena_len, uint64_t o_page);
-#define OMEGA2_IDENT_blackwell_arboris_emit "omega-ident 1 unit=blackwell_arboris_emit abi=2 profile=OM-2 src=007348dc1169818a02e5c6eeb15330ccfe0e33d12c45173a687a0cd81e4d50d3 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_blackwell_arboris_emit "omega-ident 1 unit=blackwell_arboris_emit abi=2 profile=OM-2 src=87d6b4b03256d3042522912dedd6523e1b35b12a7559c0e60dd6a84dae730b57 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_blackwell_arboris_emit(void);
 /* export fn arboris_emit_spread n ulong code edit uchar 16384 to ulong */
 uint32_t omega2_arboris_emit_spread(uint64_t *result, uint64_t o_n, uint8_t *o_code, uint64_t o_code_len);
+/* export fn arboris_emit_relax n ulong code edit uchar 16384 to ulong */
+uint32_t omega2_arboris_emit_relax(uint64_t *result, uint64_t o_n, uint8_t *o_code, uint64_t o_code_len);
+#define OMEGA2_IDENT_blackwell_arboris_qmd "omega-ident 1 unit=blackwell_arboris_qmd abi=2 profile=OM-2 src=2e17ac73b902b21a5ac76d003e8141dd947d47b6e8bc60bbdd3f5b1308155449 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_blackwell_arboris_qmd(void);
+/* export fn arboris_wave_qmd shape view ulong 7 slots view ulong 20 driver view uint 224 bank edit uint 236 q0 edit uint 96 q1 edit uint 96 to ulong */
+uint32_t omega2_arboris_wave_qmd(uint64_t *result, const uint64_t *o_shape, uint64_t o_shape_len, const uint64_t *o_slots, uint64_t o_slots_len, const uint32_t *o_driver, uint64_t o_driver_len, uint32_t *o_bank, uint64_t o_bank_len, uint32_t *o_q0, uint64_t o_q0_len, uint32_t *o_q1, uint64_t o_q1_len);
+/* export fn arboris_relax_qmd shape view ulong 7 slots view ulong 20 driver view uint 224 bank edit uint 236 q0 edit uint 96 q1 edit uint 96 to ulong */
+uint32_t omega2_arboris_relax_qmd(uint64_t *result, const uint64_t *o_shape, uint64_t o_shape_len, const uint64_t *o_slots, uint64_t o_slots_len, const uint32_t *o_driver, uint64_t o_driver_len, uint32_t *o_bank, uint64_t o_bank_len, uint32_t *o_q0, uint64_t o_q0_len, uint32_t *o_q1, uint64_t o_q1_len);
+#define OMEGA2_IDENT_bw_hazard "omega-ident 1 unit=bw_hazard abi=2 profile=OM-2 src=f311490d65d5046e2f82618bcb43ea5e25c7857476a8c4380be35d5b7a323840 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_bw_hazard(void);
+/* export fn hz_chk c view uchar 32768 lc ulong m edit ulong 3203584 to long */
+uint32_t omega2_hz_chk(uint64_t *result, const uint8_t *o_c, uint64_t o_c_len, uint64_t o_lc, uint64_t *o_m, uint64_t o_m_len);
 #define OMEGA2_IDENT_sha256_om2 "omega-ident 1 unit=sha256_om2 abi=2 profile=OM-2 src=dbf002dd6aa36585632b9d01d98ac3f0bd2fa0f0475082940de53638847994bb omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_sha256_om2(void);
 /* export fn sha256_init c edit shactx to void */

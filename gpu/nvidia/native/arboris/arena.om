@@ -1,0 +1,181 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note One arena per serialized native context. A trusted producer supplies six
+note distinct, exact-size RM share records and relinquishes mutable input aliases
+note before step admission. The first three imports are read-only on CPU and GPU.
+note This module owns five PROT_NONE CPU reservations at VAs left out of both
+note the RM DMA map and UVM external mappings. The native ABI uses 4096 B pages.
+global ar_maps long 6
+global ar_guards long 5
+
+fn ar_share_word records view uchar 144 pos ulong to ulong
+  word = ulong 0
+  for i ulong 4
+    word = or word shl ulong get records add pos i mul i 8
+  end
+  ret word
+end
+
+fn ar_region_bytes m view ulong 16 starts view ulong 6 i ulong to ulong
+  if eq i 5
+    ret sub get m 12 get starts i
+  end
+  ret sub sub get starts add i 1 get starts i 4096
+end
+
+fn ar_shares_valid records view uchar 144 m view ulong 16 starts view ulong 6 to bool
+  owner = ar_share_word records 8
+  if or eq owner 0 eq owner ulong get nvobj 0
+    ret false
+  end
+  for i ulong 6
+    off = mul i 24
+    if or ne ar_share_word records off 1129991503 ne ar_share_word records add off 4 1
+      ret false
+    end
+    if ne ar_share_word records add off 8 owner
+      ret false
+    end
+    obj = ar_share_word records add off 12
+    if eq obj 0
+      ret false
+    end
+    for j ulong i bound 6
+      if eq obj ar_share_word records add mul j 24 12
+        ret false
+      end
+    end
+    size = or ar_share_word records add off 16 shl ar_share_word records add off 20 32
+    if ne size ar_region_bytes m starts i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_mapper_idle to bool
+  for i ulong 6
+    if ne get ar_maps i 0
+      ret false
+    end
+  end
+  for i ulong 5
+    if ne get ar_guards i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_unmap to bool
+  note A failed or outstanding submission retains its mappings until retirement.
+  if ne get nvput 0 get nvret 0
+    ret false
+  end
+  for j ulong 6
+    i = sub ulong 5 j
+    tok = get ar_maps i
+    if gt tok 0
+      if eq get nvstate 0 1
+        if not nvdrop tok
+          ret false
+        end
+      else
+        note A successful nvstop has already retired all imported mappings.
+        if ne get nvstate 0 0
+          ret false
+        end
+      end
+      put ar_maps i 0
+    end
+  end
+  for j ulong 5
+    tok = get ar_guards j
+    if gt tok 0
+      if ne mapdrop tok 0
+        ret false
+      end
+      put ar_guards j 0
+    end
+  end
+  ret true
+end
+
+fn ar_guard i ulong to bool
+  va = get nvnext 0
+  g = maphold va 4096
+  if le g 0
+    ret false
+  end
+  put ar_guards i g
+  put nvnext 0 add va 4096
+  ret eq mapaddr g va
+end
+
+fn ar_import_range records view uchar 144 i ulong size ulong va ulong to bool
+  if ne get nvnext 0 va
+    ret false
+  end
+  for j ulong 24
+    put nvshrec j get records add mul i 24 j
+  end
+  tok = nvimport size lt i 3
+  if le tok 0
+    ret false
+  end
+  put ar_maps i tok
+  if ne mapaddr tok va
+    ret false
+  end
+  if lt i 5
+    ret ar_guard i
+  end
+  ret true
+end
+
+fn ar_map_arena records view uchar 144 meta view ulong 16 budget ulong to bool
+  if or not ar_mapper_idle ne get nvstate 0 1
+    ret false
+  end
+  if or eq get nvreg 1 0 ne get nvfault 0 0
+    ret false
+  end
+  checked = new ulong 16 0
+  offsets = new ulong 6 0
+  for i ulong 16
+    put checked i get meta i
+  end
+  if ne arboris_plan_arena checked budget 4096 offsets 0
+    ret false
+  end
+  for i ulong 16
+    if ne get checked i get meta i
+      ret false
+    end
+  end
+  base = get nvnext 0
+  if or lt base 65536 ne and base 4095 0
+    ret false
+  end
+  if or ge base 0x10000000000 gt get meta 12 sub 0x10000000000 base
+    ret false
+  end
+  if not ar_shares_valid records meta offsets
+    ret false
+  end
+  for i ulong 6
+    size = ar_region_bytes meta offsets i
+    if not ar_import_range records i size add base get offsets i
+      unused = ar_unmap
+      ret false
+    end
+    if eq i 0
+      for j ulong 16
+        if ne mapget get ar_maps 0 mul j 8 8 get meta j
+          unused = ar_unmap
+          ret false
+        end
+      end
+    end
+  end
+  ret true
+end
