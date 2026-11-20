@@ -363,6 +363,18 @@ uint32_t omega2_osc_trace_record(uint64_t *result, uint8_t *o_trace, uint64_t o_
 const char *omega2_ident_osc_lifetimes(void);
 /* export fn osc_scope_exit visible view ushort 480 symbols view uchar 76800 owners edit uchar 5120 borrows edit uchar 12288 work edit exitwork to ulong */
 uint32_t omega2_osc_scope_exit(uint64_t *result, const uint16_t *o_visible, uint64_t o_visible_len, const uint8_t *o_symbols, uint64_t o_symbols_len, uint8_t *o_owners, uint64_t o_owners_len, uint8_t *o_borrows, uint64_t o_borrows_len, uint8_t *o_work);
+#define OMEGA2_IDENT_tensor_shape "omega-ident 1 unit=tensor_shape abi=2 profile=OM-2 src=c28554bdff536175775cdf0bf99e71054300e9341059f24c9dbe65cccc0c0aac omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_tensor_shape(void);
+/* export fn tensor_shape_size dims view ulong * elems edit ulong 1 to long */
+uint32_t omega2_tensor_shape_size(uint64_t *result, const uint64_t *o_dims, uint64_t o_dims_len, uint64_t *o_elems, uint64_t o_elems_len);
+/* export fn tensor_dense_strides dims view ulong * strides edit ulong * to void */
+uint32_t omega2_tensor_dense_strides(uint64_t *result, const uint64_t *o_dims, uint64_t o_dims_len, uint64_t *o_strides, uint64_t o_strides_len);
+/* export fn tensor_view_bounds dims view ulong * strides view ulong * offset ulong storage ulong to long */
+uint32_t omega2_tensor_view_bounds(uint64_t *result, const uint64_t *o_dims, uint64_t o_dims_len, const uint64_t *o_strides, uint64_t o_strides_len, uint64_t o_offset, uint64_t o_storage);
+/* export fn tensor_broadcast_dims lhs view ulong * rhs view ulong * result_dims edit ulong * to long */
+uint32_t omega2_tensor_broadcast_dims(uint64_t *result, const uint64_t *o_lhs, uint64_t o_lhs_len, const uint64_t *o_rhs, uint64_t o_rhs_len, uint64_t *o_result_dims, uint64_t o_result_dims_len);
+/* export fn tensor_is_row_major dims view ulong * strides view ulong * to ulong */
+uint32_t omega2_tensor_is_row_major(uint64_t *result, const uint64_t *o_dims, uint64_t o_dims_len, const uint64_t *o_strides, uint64_t o_strides_len);
 #ifdef __cplusplus
 }
 #endif
