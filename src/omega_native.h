@@ -323,6 +323,10 @@ uint32_t omega2_osc_pool_init(uint64_t *result, uint8_t *o_p, uint64_t o_cap, ui
 uint32_t omega2_osc_pool_alloc(uint64_t *result, uint8_t *o_p, uint64_t o_loop_depth, uint64_t o_cond_depth);
 /* export fn osc_pool_free p edit poolstat loop_depth long cond_depth long to void */
 uint32_t omega2_osc_pool_free(uint64_t *result, uint8_t *o_p, uint64_t o_loop_depth, uint64_t o_cond_depth);
+#define OMEGA2_IDENT_osc_trace "omega-ident 1 unit=osc_trace abi=2 profile=OM-2 src=9db7adbb499a43db3ccff00093c4601eebc89450ea9f35e5d0a23ad9c014389a omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_osc_trace(void);
+/* export fn osc_trace_record trace edit uchar * event view trinput to void */
+uint32_t omega2_osc_trace_record(uint64_t *result, uint8_t *o_trace, uint64_t o_trace_len, const uint8_t *o_event);
 #ifdef __cplusplus
 }
 #endif
