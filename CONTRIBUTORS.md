@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Trained and tested the seeded Omega coding controller on Spark, including its learned second-example check and CPU behavior replay. |
 | OpenAI Codex (OSC semantic checker) | Ported the owner access, borrow, reborrow and move decisions to seeded Omega. Ported branch joins for ownership, handle provenance and definite frees. Migrated owner initialization and direct and nested borrow lifecycles. Integrated the OSC parser and scalar series, migrated the scoped symbol index, pool accounting and whole-input token scan, and batched owner joins. |
 | OpenAI Codex | Replaced single-token Qwen hd256 attention argument and command-slot construction with seeded Omega. |
 | Antigravity and OpenAI Codex | Antigravity wrote the OM-2 paged attention emitter. Codex integrated it with hosted and freestanding builds and compared its instructions and register allocation against the previous C emitter. |

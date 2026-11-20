@@ -35,6 +35,8 @@ The GPU invocation runs inside an authorized exclusive Spark window. The harness
 
 The [contrast-training experiment and example-checked coding chain](tools/contrast/README.md) include a CPU replay of generated functions against their expected outputs.
 
+The [learned coding controller](tools/controller/README.md) trains routing and second-example policies and replays the two Spark evaluations.
+
 ## Units
 
 Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`); `build.sh` has no Darwin target, so the `ollm_darwin` row follows upstream `tests/omegallm/ollm_metrics_bench.py` (`darwin-arm64`):
