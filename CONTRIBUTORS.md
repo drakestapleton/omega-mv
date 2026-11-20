@@ -386,3 +386,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Built the resident pure-Omega DeepSeek-V4.1-Flash final-head executor, native QMD submission chain, packed-BF16 vocabulary projection, and full-vocabulary checkpoint comparison. |
 
 - Drake Stapleton and Codex — calibrated and measured DeepSeek mixed-format SM121a expert projections against the pinned checkpoint on GB10.
+- Codex, under Drake Stapleton’s direction, documented the partner researcher setup and benchmark replay.
