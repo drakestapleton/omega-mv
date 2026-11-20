@@ -23,5 +23,12 @@ done < om/gpu/dsv41/kernels.list
 ) > "$tmp/head.om"
 seed/out/omc < "$tmp/head.om" > "$tmp/dsv41-head"
 chmod +x "$tmp/dsv41-head"
+for src in om/gpu/dsv41/mma/*.om; do
+    name=$(basename "$src" .om)
+    seed/out/omc < "$src" > "$tmp/$name"
+    chmod +x "$tmp/$name"
+    "$tmp/$name" > "$tmp/$name.bin"
+    "$tmp/kpack" 121-tk "$name" "$tmp/$name.bin" "$tmp/$name.cubin" 64 0 p8 p8 p8 p8 p8 4
+done
 mv "$tmp/dsv41-head" "$out"
 mv "$tmp"/*.cubin "$tmp/decode.f32le" "$out"
