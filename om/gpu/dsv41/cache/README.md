@@ -42,7 +42,7 @@ sh om/gpu/dsv41/cache/build.sh build/dsv41-cache
 python3 om/gpu/dsv41/cache/check.py --all-experts /path/to/model-00003-of-00048.safetensors build/dsv41-cache
 ```
 
-The full-layer check streams all 384 experts through the packer and compares every slab with the six source tensor extents. The detour replay then uses eight selected experts. For an arbitrary layer-0 routing trace, include all 384 IDs in the pack. An unknown ID ends the replay before emitting any substitute.
+The full-layer check streams all 384 experts through the packer and compares every slab with the six source tensor extents. The detour replay then uses eight selected experts. For an arbitrary layer-0 routing trace, include all 384 IDs in the pack. A demand for an unlisted ID ends the replay before emitting any substitute. A speculative hint for a valid unlisted layer-0 expert is dropped.
 
 To build an ordered pack for a lane, pass distinct expert IDs as arguments. Publish the output only after the command exits successfully and its checksum has been recorded.
 

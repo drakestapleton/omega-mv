@@ -13,6 +13,11 @@ IDS = (0, 383, 12, 2, 103, 4, 256, 5)
 WARM, DEMAND, PREFETCH, TURN, COMMIT = range(1, 6)
 
 
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
 def events(records):
     return b"".join(struct.pack("<II", *record) for record in records)
 
@@ -33,10 +38,10 @@ def read_experts(shard, ids):
                     lo, hi = header[f"layers.0.ffn.experts.{expert}.{projection}.{kind}"]["data_offsets"]
                     f.seek(8 + hlen + lo)
                     payload = f.read(hi - lo)
-                    assert len(payload) == hi - lo
+                    require(len(payload) == hi - lo, f"short tensor read for expert {expert}, {projection}.{kind}")
                     sha.update(payload)
                     total += len(payload)
-            assert total == EXPERT_BYTES
+            require(total == EXPERT_BYTES, f"unexpected payload size for expert {expert}")
             digests[expert] = sha.digest()
         return digests
 
@@ -52,12 +57,12 @@ def check_whole_layer(command, ids, digests):
     with subprocess.Popen([*command, *map(str, ids)], stdout=subprocess.PIPE) as proc:
         try:
             header = proc.stdout.read(4096)
-            assert struct.unpack_from("<4I", header) == (0x31505844, 1, len(ids), EXPERT_BYTES)
-            assert struct.unpack_from(f"<{len(ids)}I", header, 16) == tuple(ids)
+            require(struct.unpack_from("<4I", header) == (0x31505844, 1, len(ids), EXPERT_BYTES), "full-layer pack header mismatch")
+            require(struct.unpack_from(f"<{len(ids)}I", header, 16) == tuple(ids), "full-layer expert order mismatch")
             for expert in ids:
                 block = proc.stdout.read(EXPERT_BYTES)
-                assert len(block) == EXPERT_BYTES and hashlib.sha256(block).digest() == digests[expert]
-            assert proc.stdout.read(1) == b""
+                require(len(block) == EXPERT_BYTES and hashlib.sha256(block).digest() == digests[expert], f"full-layer bytes mismatch for expert {expert}")
+            require(proc.stdout.read(1) == b"", "trailing full-layer pack data")
         finally:
             proc.stdout.close()
         if proc.wait() != 0:
@@ -77,15 +82,15 @@ def check(shard, binaries, scratch, whole_layer):
         subprocess.run([*cmd, *map(str, IDS)], stdout=f, check=True)
     with pack.open("rb") as f:
         header = f.read(4096)
-        assert struct.unpack_from("<4I", header) == (0x31505844, 1, len(IDS), EXPERT_BYTES)
-        assert struct.unpack_from(f"<{len(IDS)}I", header, 16) == IDS
+        require(struct.unpack_from("<4I", header) == (0x31505844, 1, len(IDS), EXPERT_BYTES), "fixture pack header mismatch")
+        require(struct.unpack_from(f"<{len(IDS)}I", header, 16) == IDS, "fixture expert order mismatch")
         for expert in IDS:
-            assert hashlib.sha256(f.read(EXPERT_BYTES)).digest() == digests[expert]
-        assert f.read(1) == b""
+            require(hashlib.sha256(f.read(EXPERT_BYTES)).digest() == digests[expert], f"fixture bytes mismatch for expert {expert}")
+        require(f.read(1) == b"", "trailing fixture pack data")
     rejected([*cmd, "383", "383"], code=64)
     rejected([*cmd, "384"], code=64)
     replay = [binaries / "replay", pack]
-    route = [(WARM, 0), (WARM, 383), (DEMAND, 0), (TURN, 7), (PREFETCH, 12), (PREFETCH, 2),
+    route = [(WARM, 0), (WARM, 383), (DEMAND, 0), (TURN, 7), (PREFETCH, 33), (PREFETCH, 12), (PREFETCH, 2),
              (DEMAND, 12), (DEMAND, 2), (DEMAND, 103), (DEMAND, 4), (DEMAND, 256), (DEMAND, 5),
              (TURN, 0), (DEMAND, 0), (DEMAND, 383), (TURN, 7), (TURN, 7), (TURN, 7),
              (COMMIT, 7), (WARM, 12), (WARM, 2), (DEMAND, 12), (DEMAND, 0)]
@@ -97,13 +102,13 @@ def check(shard, binaries, scratch, whole_layer):
         observations = []
         for expert in keys:
             key, hit, zone, pad = struct.unpack("<IBBH", f.read(8))
-            assert key == expert and pad == 0 and hit in (0, 1)
-            assert hashlib.sha256(f.read(EXPERT_BYTES)).digest() == digests[key]
+            require(key == expert and pad == 0 and hit in (0, 1), f"invalid demand metadata for expert {expert}")
+            require(hashlib.sha256(f.read(EXPERT_BYTES)).digest() == digests[key], f"wrong demand payload for expert {key}")
             observations.append((key, hit, zone))
-        assert f.read(1) == b""
-    assert observations[0] == (0, 1, 2)
-    assert observations[-4:] == [(0, 1, 2), (383, 1, 2), (12, 1, 2), (0, 0, 3)]
-    assert all(zone == 3 for _, _, zone in observations[1:-4])
+        require(f.read(1) == b"", "unexpected demand output")
+    require(observations[0] == (0, 1, 2), "initial protected expert missed")
+    require(observations[-4:] == [(0, 1, 2), (383, 1, 2), (12, 1, 2), (0, 0, 3)], f"detour return or pack switch mismatch: {observations[-4:]}")
+    require(all(zone == 3 for _, _, zone in observations[1:-4]), "detour expert entered the protected zone")
     rejected(replay, events([(TURN, 7), (COMMIT, 7)]))
     rejected(replay, events([(TURN, 7), (TURN, 7), (COMMIT, 7)]))
     rejected(replay, events([(TURN, 7), (TURN, 0), (TURN, 7), (COMMIT, 7)]))
