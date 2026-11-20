@@ -40,6 +40,26 @@ test-osc-lex: $(OSC_DIR)/test_osc_lex
 
 test-compiler test-compiler-quick: test-osc-lex
 
+# Optional differential run for source checkouts with Git history. Compile the
+# last all-C parser independently and keep it out of the production link.
+OSC_PARSE_BASE = ee7a49c27d75357312eea21c369f45a35c0ae163
+OSC_PARSE_ORACLE = $(OSC_DIR)/osc_parse_$(OSC_PARSE_BASE)
+$(OSC_PARSE_ORACLE).c:
+	@mkdir -p $(OSC_DIR)
+	git show $(OSC_PARSE_BASE):src/compiler/osc_parse.c > $@.tmp && mv $@.tmp $@
+
+$(OSC_PARSE_ORACLE).o: $(OSC_PARSE_ORACLE).c $(OSC_HDRS)
+	$(CC) $(OSC_CFLAGS) -Dosc_parse=osc_parse_reference -Dosc_node_name=osc_node_name_reference -c $< -o $@
+
+OSC_PARSE_PARITY_SRC = tests/compiler/test_osc_parse_parity.c src/compiler/osc_parse.c \
+                       src/compiler/osc_lex.c src/compiler/osc_diag.c src/omega_om_units.c
+$(OSC_DIR)/test_osc_parse_parity: $(OSC_PARSE_PARITY_SRC) $(OSC_PARSE_ORACLE).o $(OSC_HDRS) src/omega_api_decl.h
+	$(CC) $(OSC_CFLAGS) -o $@ $(OSC_PARSE_PARITY_SRC) $(OSC_PARSE_ORACLE).o
+
+.PHONY: test-osc-parse-parity
+test-osc-parse-parity: $(OSC_DIR)/test_osc_parse_parity
+	@$(OSC_DIR)/test_osc_parse_parity $(OSC_LEX_FIXTURES)
+
 $(OSC_DIR)/test_osc_model: tests/compiler/test_osc_model.c $(OSC_MODEL) $(OSC_MODEL_GEN) $(OSC_HDRS)
 	@mkdir -p $(OSC_DIR)
 	$(CC) $(OSC_CFLAGS) -o $@ tests/compiler/test_osc_model.c $(OSC_MODEL) $(OSC_MODEL_GEN)

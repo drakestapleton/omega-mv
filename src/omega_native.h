@@ -337,6 +337,10 @@ const char *omega2_ident_osc_literal(void);
 uint32_t omega2_osc_parse_literal(uint64_t *result, const uint8_t *o_spelling, uint64_t o_spelling_len, uint64_t *o_value);
 /* export fn osc_lex_next src view uchar * cursor edit lexstate room ulong namemax ulong to ulong */
 uint32_t omega2_osc_lex_next(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_cursor, uint64_t o_room, uint64_t o_namemax);
+#define OMEGA2_IDENT_osc_type "omega-ident 1 unit=osc_type abi=2 profile=OM-2 src=a33e7745e4cdb1a968b06aff6016de192ef8a2a9d0d2946f5b1f79c91c7f2cba omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_osc_type(void);
+/* export fn osc_read_type kinds view ushort 7 values view ulong 7 form ulong refkind ulong limit ulong result edit typerec to ulong */
+uint32_t omega2_osc_read_type(uint64_t *result, const uint16_t *o_kinds, uint64_t o_kinds_len, const uint64_t *o_values, uint64_t o_values_len, uint64_t o_form, uint64_t o_refkind, uint64_t o_limit, uint8_t *o_result);
 #ifdef __cplusplus
 }
 #endif

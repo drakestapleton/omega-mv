@@ -283,6 +283,37 @@ OMBR_ASSERT(offsetof(OscLexState, kind) == 36, "layout lexstate field kind");
 uint64_t osc_parse_literal(const uint8_t *o_spelling, size_t o_spelling_len, uint64_t o_value[1]);
 /* export fn osc_lex_next src view uchar * cursor edit lexstate room ulong namemax ulong to ulong */
 uint64_t osc_lex_next(const uint8_t *o_src, size_t o_src_len, OscLexState *o_cursor, uint64_t o_room, uint64_t o_namemax);
+#define OSC_TYPE_WINDOW 7
+#define OSC_TYPE_SCALAR 1
+#define OSC_TYPE_ARRAY 2
+#define OSC_TYPE_REF_BODY 3
+#define OSC_TYPE_PARAM 4
+#define OSC_TYPE_EXPECT_SCALAR 1
+#define OSC_TYPE_SLICE_ESCAPE 2
+#define OSC_TYPE_EXPECT_OPEN 3
+#define OSC_TYPE_EXPECT_SEMI 4
+#define OSC_TYPE_EXPECT_LENGTH 5
+#define OSC_TYPE_ZERO_LENGTH 6
+#define OSC_TYPE_LONG_ARRAY 7
+#define OSC_TYPE_EXPECT_CLOSE 8
+#define OSC_TYPE_NAMED_REF 9
+#define OSC_TYPE_BARE_NAME 10
+#define OSC_TYPE_LOCAL_ONLY 11
+typedef struct {
+    uint32_t used;
+    uint32_t scalar;
+    uint32_t refkind;
+    uint32_t elem;
+    uint64_t count;
+} OscParsedType;
+OMBR_ASSERT(sizeof(OscParsedType) == 24, "layout typerec size");
+OMBR_ASSERT(offsetof(OscParsedType, used) == 0, "layout typerec field used");
+OMBR_ASSERT(offsetof(OscParsedType, scalar) == 4, "layout typerec field scalar");
+OMBR_ASSERT(offsetof(OscParsedType, refkind) == 8, "layout typerec field refkind");
+OMBR_ASSERT(offsetof(OscParsedType, elem) == 12, "layout typerec field elem");
+OMBR_ASSERT(offsetof(OscParsedType, count) == 16, "layout typerec field count");
+/* export fn osc_read_type kinds view ushort 7 values view ulong 7 form ulong refkind ulong limit ulong result edit typerec to ulong */
+uint64_t osc_read_type(const uint16_t o_kinds[7], const uint64_t o_values[7], uint64_t o_form, uint64_t o_refkind, uint64_t o_limit, OscParsedType *o_result);
 #ifdef __cplusplus
 }
 #endif

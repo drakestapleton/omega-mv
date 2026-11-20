@@ -20,8 +20,10 @@
  * OSC-1 slice; not a general Omega compiler; no self-hosting.
  */
 #include "osc_parse.h"
+#include "omega_api_decl.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LOOP_BOUND_MAX 1000000
@@ -97,62 +99,6 @@ static int enter(P *p)
 }
 static void leave(P *p) { p->depth--; }
 
-static int scalar_of(int k)
-{
-    switch (k) {
-    case OT_U8: return OSC_T_U8; case OT_U16: return OSC_T_U16; case OT_U32: return OSC_T_U32;
-    case OT_U64: return OSC_T_U64; case OT_I8: return OSC_T_I8; case OT_I16: return OSC_T_I16;
-    case OT_I32: return OSC_T_I32; case OT_I64: return OSC_T_I64; case OT_BOOL: return OSC_T_BOOL;
-    default: return 0;
-    }
-}
-
-static int parse_scalar(P *p, OscType *ty)
-{
-    int s = scalar_of(cur(p)->kind);
-    if (at(p, OT_BYTES) || at(p, OT_CELLS)) {
-        const OscToken *t = cur(p);
-        osc_diag_set(p->d, OSC_DIAG_SLICE_ESCAPE, t->line, t->col, at(p, OT_BYTES) ? "bytes" : "cells", 0, NULL,
-                     "slice type outside a parameter", "'%s' is a parameter type only: a slice is never a local, field, element or result",
-                     at(p, OT_BYTES) ? "bytes" : "cells");
-        return -1;
-    }
-    if (!s) return syntax(p, "a type (u8 u16 u32 u64 i8 i16 i32 i64 bool)");
-    memset(ty, 0, sizeof *ty);
-    ty->s = (OscScalar)s;
-    adv(p);
-    return 0;
-}
-
-/* "[" type ";" INT "]" with ref kind already consumed */
-static int parse_arr_body(P *p, OscType *ty, OscRefKind rk)
-{
-    OscType el;
-    if (expect(p, OT_LBRACK)) return -1;
-    if (parse_scalar(p, &el)) return -1;
-    if (expect(p, OT_SEMI)) return -1;
-    if (!at(p, OT_INT)) return syntax(p, "array length INT");
-    const OscToken *lt = cur(p);
-    if (lt->ival == 0) {
-        osc_diag_set(p->d, OSC_DIAG_UNSUPPORTED, lt->line, lt->col, "array", 0, NULL, "array length 0",
-                     "array length must be 1..%d", OSC_MAX_ARRAY_LEN);
-        return -1;
-    }
-    if (lt->ival > OSC_MAX_ARRAY_LEN) {
-        osc_diag_set(p->d, OSC_DIAG_CAPACITY, lt->line, lt->col, "array", 0, NULL, "array length",
-                     "array length %llu > %d", (unsigned long long)lt->ival, OSC_MAX_ARRAY_LEN);
-        return -1;
-    }
-    adv(p);
-    if (expect(p, OT_RBRACK)) return -1;
-    memset(ty, 0, sizeof *ty);
-    ty->s = OSC_T_REF;
-    ty->ref = rk;
-    ty->elem = el.s;
-    ty->len = (uint16_t)lt->ival;
-    return 0;
-}
-
 static int parse_expr(P *p);
 
 /* ---- OSC-2 structs (docs/osc/OSC-2-DESIGN.md section 2) ---------------- */
@@ -215,13 +161,6 @@ static int parse_struct_ref(P *p, OscType *ty, OscRefKind rk)
     return 0;
 }
 
-/* "[" ... (array) or NAME (struct), ref kind already consumed */
-static int parse_ref_body(P *p, OscType *ty, OscRefKind rk)
-{
-    if (at(p, OT_NAME)) return parse_struct_ref(p, ty, rk);
-    return parse_arr_body(p, ty, rk);
-}
-
 /* OSC-3 item 2: pools and handles are function-local (never parameters or
  * results) */
 static int local_only(P *p)
@@ -233,24 +172,57 @@ static int local_only(P *p)
     return -1;
 }
 
-/* ptype: scalar | own[..] | &[..] | &mut[..] | own S | &S | &mut S */
-static int parse_ptype(P *p, OscType *ty)
+/* The longest type spelling has OSC_TYPE_WINDOW tokens. A zero kind pads
+ * the end of the stream with EOF, as peek_kind does. The grammar consumes
+ * only its prefix and returns the offset of the exact failure token. */
+static int parse_type(P *p, OscType *ty, unsigned form, OscRefKind ref)
 {
-    if (at(p, OT_OWN)) { adv(p); return parse_ref_body(p, ty, OSC_REF_OWN); }
-    if (at(p, OT_AMP)) {
-        adv(p);
-        if (at(p, OT_MUT)) { adv(p); return parse_ref_body(p, ty, OSC_REF_MUT); }
-        return parse_ref_body(p, ty, OSC_REF_SHARED);
+    uint16_t kinds[OSC_TYPE_WINDOW] = {0};
+    uint64_t values[OSC_TYPE_WINDOW] = {0};
+    uint32_t remaining = p->ast->ntok - p->pos;
+    for (unsigned i = 0; i < remaining && i < OSC_TYPE_WINDOW; ++i) {
+        kinds[i] = p->ast->toks[p->pos + i].kind;
+        values[i] = p->ast->toks[p->pos + i].ival;
     }
-    if (at(p, OT_NAME) && find_struct(p, cur(p)) >= 0) return struct_by_value(p, cur(p), "struct by value");
-    if (at(p, OT_BYTES) || at(p, OT_CELLS)) { /* external byte slice: pointer + length registers */
-        memset(ty, 0, sizeof *ty);
-        ty->s = at(p, OT_BYTES) ? OSC_T_BYTES : OSC_T_CELLS;
-        adv(p);
+    OscParsedType parsed;
+    uint64_t status = osc_read_type(kinds, values, form, ref, OSC_MAX_ARRAY_LEN, &parsed);
+    p->pos += parsed.used;
+    if (status == 0) {
+        *ty = (OscType){.s = (OscScalar)parsed.scalar, .ref = (OscRefKind)parsed.refkind,
+                        .elem = (OscScalar)parsed.elem, .len = (uint16_t)parsed.count};
         return 0;
     }
-    if (at(p, OT_HANDLE) || at(p, OT_POOL)) return local_only(p);
-    return parse_scalar(p, ty);
+    const OscToken *t = cur(p);
+    switch (status) {
+    case OSC_TYPE_NAMED_REF:
+        return parse_struct_ref(p, ty, (OscRefKind)parsed.refkind);
+    case OSC_TYPE_BARE_NAME:
+        if (find_struct(p, t) >= 0) return struct_by_value(p, t, "struct by value");
+        /* fall through */
+    case OSC_TYPE_EXPECT_SCALAR:
+        return syntax(p, "a type (u8 u16 u32 u64 i8 i16 i32 i64 bool)");
+    case OSC_TYPE_LOCAL_ONLY:
+        return local_only(p);
+    case OSC_TYPE_SLICE_ESCAPE: {
+        const char *name = osc_tok_kind_name(t->kind);
+        osc_diag_set(p->d, OSC_DIAG_SLICE_ESCAPE, t->line, t->col, name, 0, NULL,
+                     "slice type outside a parameter", "'%s' is a parameter type only: a slice is never a local, field, element or result", name);
+        return -1;
+    }
+    case OSC_TYPE_EXPECT_OPEN: return syntax(p, osc_tok_kind_name(OT_LBRACK));
+    case OSC_TYPE_EXPECT_SEMI: return syntax(p, osc_tok_kind_name(OT_SEMI));
+    case OSC_TYPE_EXPECT_LENGTH: return syntax(p, "array length INT");
+    case OSC_TYPE_EXPECT_CLOSE: return syntax(p, osc_tok_kind_name(OT_RBRACK));
+    case OSC_TYPE_ZERO_LENGTH:
+        osc_diag_set(p->d, OSC_DIAG_UNSUPPORTED, t->line, t->col, "array", 0, NULL, "array length 0",
+                     "array length must be 1..%d", OSC_MAX_ARRAY_LEN);
+        return -1;
+    case OSC_TYPE_LONG_ARRAY:
+        osc_diag_set(p->d, OSC_DIAG_CAPACITY, t->line, t->col, "array", 0, NULL, "array length",
+                     "array length %llu > %d", (unsigned long long)t->ival, OSC_MAX_ARRAY_LEN);
+        return -1;
+    default: abort();
+    }
 }
 
 /* struct_decl = "struct" NAME "{" field { "," field } [","] "}" ;
@@ -325,12 +297,12 @@ static int parse_struct(P *p)
         }
         if (at(p, OT_LBRACK)) {
             OscType at_;
-            if (parse_arr_body(p, &at_, OSC_REF_OWN)) return -1;
+            if (parse_type(p, &at_, OSC_TYPE_ARRAY, OSC_REF_OWN)) return -1;
             fd->s = at_.elem;
             fd->alen = at_.len;
         } else {
             OscType sc;
-            if (parse_scalar(p, &sc)) return -1;
+            if (parse_type(p, &sc, OSC_TYPE_SCALAR, OSC_REF_NONE)) return -1;
             fd->s = sc.s;
         }
         fd->off = (uint16_t)cells;
@@ -576,7 +548,7 @@ static int parse_postfix(P *p)
         int n = new_node(p, ON_CAST, cur(p));
         if (n < 0) return -1;
         adv(p);
-        if (parse_scalar(p, &N(n)->ty)) return -1;
+        if (parse_type(p, &N(n)->ty, OSC_TYPE_SCALAR, OSC_REF_NONE)) return -1;
         N(n)->a = e;
         N(n)->line = N(e)->line;
         N(n)->col = N(e)->col;
@@ -715,7 +687,7 @@ static int parse_stmt(P *p)
                 return -1;
             }
             adv(p);
-            if (parse_ref_body(p, &N(n)->ty, OSC_REF_OWN)) return -1;
+            if (parse_type(p, &N(n)->ty, OSC_TYPE_REF_BODY, OSC_REF_OWN)) return -1;
             int in_arena = -1; /* OSC-2 arenas: "in NAME" */
             if (at(p, OT_IN)) {
                 adv(p);
@@ -760,7 +732,7 @@ static int parse_stmt(P *p)
             adv(p);
             OscRefKind rk = OSC_REF_SHARED;
             if (at(p, OT_MUT)) { rk = OSC_REF_MUT; adv(p); }
-            if (parse_ref_body(p, &N(n)->ty, rk)) return -1;
+            if (parse_type(p, &N(n)->ty, OSC_TYPE_REF_BODY, rk)) return -1;
             if (expect(p, OT_ASSIGN)) return -1;
             if (!at(p, OT_AMP)) return syntax(p, "a borrow '&name' or '&mut name'");
             int b = parse_borrow(p);
@@ -769,7 +741,7 @@ static int parse_stmt(P *p)
         } else {
             N(n)->mut = (uint8_t)mut;
             if (at(p, OT_NAME) && find_struct(p, cur(p)) >= 0) return struct_by_value(p, cur(p), "struct by value");
-            if (parse_scalar(p, &N(n)->ty)) return -1;
+            if (parse_type(p, &N(n)->ty, OSC_TYPE_SCALAR, OSC_REF_NONE)) return -1;
             if (expect(p, OT_ASSIGN)) return -1;
             int e = parse_expr(p);
             if (e < 0) return -1;
@@ -855,7 +827,7 @@ static int parse_stmt(P *p)
         if (parse_name_tok(p, n)) return -1;
         if (expect(p, OT_COLON)) return -1;
         if (expect(p, OT_LBRACK)) return -1;
-        if (parse_scalar(p, &N(n)->ty)) return -1;
+        if (parse_type(p, &N(n)->ty, OSC_TYPE_SCALAR, OSC_REF_NONE)) return -1;
         if (expect(p, OT_SEMI)) return -1;
         if (!at(p, OT_INT)) return syntax(p, "a slot count INT");
         const OscToken *kt = cur(p);
@@ -1080,7 +1052,7 @@ static int parse_fn(P *p)
             if (pn < 0) return -1;
             if (parse_name_tok(p, pn)) return -1;
             if (expect(p, OT_COLON)) return -1;
-            if (parse_ptype(p, &N(pn)->ty)) return -1;
+            if (parse_type(p, &N(pn)->ty, OSC_TYPE_PARAM, OSC_REF_NONE)) return -1;
             int is_slice = N(pn)->ty.s == OSC_T_BYTES || N(pn)->ty.s == OSC_T_CELLS;
             nslice += is_slice;
             np += is_slice ? 2 : 1; /* parameter registers: a slice is pointer + length */
@@ -1118,7 +1090,7 @@ static int parse_fn(P *p)
                          "array return type", "OSC-1 functions return a scalar only");
             return -1;
         }
-        if (parse_scalar(p, &N(f)->ty)) return -1;
+        if (parse_type(p, &N(f)->ty, OSC_TYPE_SCALAR, OSC_REF_NONE)) return -1;
     }
     uint32_t fi = a->nfns;
     a->req[fi][0] = a->ens[fi][0] = 0;
