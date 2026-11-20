@@ -34,4 +34,9 @@ for mode in example compile; do
 done
 "$bin/contrast" > contrast.om
 sha256sum -c "$data/contrast.sha256"
+# Cross both original limits. Compare the complete record multiset including duplicates.
+for _ in {1..12}; do cat contrast.om; done >old.om
+"$bin/mix"
+cat old.om contrast.om | LC_ALL=C sort -z >expected.records
+LC_ALL=C sort -z mixed.om | cmp - expected.records
 echo "All reference functions, archived generations and fresh chain selections reproduced."
