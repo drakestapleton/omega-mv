@@ -4,7 +4,22 @@
 #include <stdlib.h>
 void omega_blake3_hash(const uint8_t *, size_t, uint8_t *); void orc_blake3_hash(const uint8_t *, size_t, uint8_t *);
 static uint64_t s=88172645463325252ULL; static uint64_t rnd(void){s^=s<<13;s^=s>>7;s^=s<<17;return s;}
-int main(int argc,char**argv){ static uint8_t buf[3<<20]; int cases=0,bad=0;
+/* The public one-shot call permits empty input and a digest inside the input. */
+static int check_buffers(void) {
+    uint8_t input[2050], expected[32], empty[32];
+    orc_blake3_hash((const uint8_t *)"", 0, expected);
+    omega_blake3_hash(NULL, 0, empty);
+    if (memcmp(empty, expected, sizeof empty)) return 1;
+    const size_t offsets[] = {0, 1023, sizeof input - sizeof expected};
+    for (size_t j = 0; j < sizeof offsets / sizeof *offsets; ++j) {
+        for (size_t i = 0; i < sizeof input; ++i) input[i] = (uint8_t)(i % 251);
+        orc_blake3_hash(input, sizeof input, expected);
+        omega_blake3_hash(input, sizeof input, input + offsets[j]);
+        if (memcmp(input + offsets[j], expected, sizeof expected)) return 1;
+    }
+    return 0;
+}
+int main(int argc,char**argv){ static uint8_t buf[3<<20]; int cases=0,bad=check_buffers();
  /* official vectors: input i mod 251 */
  FILE *f=fopen(argv[1],"r"); char h[200]; size_t L; int nv=0, vb=0;
  while(fscanf(f,"%zu %199s",&L,h)==2){ for(size_t i=0;i<L;i++)buf[i]=(uint8_t)(i%251); uint8_t o[32]; omega_blake3_hash(buf,L,o); char x[65]; for(int j=0;j<32;j++)sprintf(x+2*j,"%02x",o[j]); nv++; if(strncmp(x,h,64)){vb++; printf("VEC FAIL %zu\n",L);} }
