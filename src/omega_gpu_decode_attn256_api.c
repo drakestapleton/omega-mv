@@ -218,32 +218,42 @@ static int dattn_core(OmegaGpuDecodeAttn256Cache *c, uint32_t layer, uint32_t po
         if (omega_gpu_session_sync_to_gpu(&c->qkv) != 0 || omega_gpu_session_sync_to_gpu(&c->out) != 0 || omega_gpu_session_sync_to_gpu(&c->cnt) != 0) rc = OMEGA_GPU_DATTN_CHIP_FAIL;
     }
 
-    uint32_t args[OMEGA_DATTN256_ARGS_WORDS];
-    const uint64_t kc = c->kv[layer].va, vc = kc + c->plane_bytes, nm = c->norms.va + (uint64_t)layer * 2 * HD * 4;
-    const uint64_t qkv_va = rec ? dev_qkv : c->qkv.va, out_va = rec ? dev_out : c->out.va;
-    float fe = eps, fo = out_scale, fq = (float)(0.0625 * 1.4426950408889634); /* log2(e) / sqrt(256) */
-    uint32_t ue, uo, uq; memcpy(&ue, &fe, 4); memcpy(&uo, &fo, 4); memcpy(&uq, &fq, 4);
-#define A64(i, v) do { args[i] = (uint32_t)(v); args[(i) + 1] = (uint32_t)((v) >> 32); } while (0)
-    A64(0, qkv_va); A64(2, kc); A64(4, vc); A64(6, c->rope.va); A64(8, nm); A64(10, nm + HD * 4); A64(12, out_va); A64(14, c->part.va); A64(16, c->cnt.va);
-#undef A64
-    args[18] = pos; args[19] = per; args[20] = splits; args[21] = (uint32_t)(c->max_pos * RB); args[22] = ue; args[23] = uo; args[24] = uq;
+    const float log2_scale = (float)(0.0625 * 1.4426950408889634);
+    uint32_t eps_bits, scale_bits, log2_bits;
+    memcpy(&eps_bits, &eps, sizeof eps_bits);
+    memcpy(&scale_bits, &out_scale, sizeof scale_bits);
+    memcpy(&log2_bits, &log2_scale, sizeof log2_bits);
+    const uint64_t launch_spec[16] = {
+        rec ? dev_qkv : c->qkv.va, c->kv[layer].va, c->plane_bytes, c->rope.va,
+        c->norms.va, rec ? dev_out : c->out.va, c->part.va, c->cnt.va,
+        layer, pos, per, splits, c->max_pos, eps_bits, scale_bits, log2_bits,
+    };
     if (info) {
         info->layer = layer; info->pos = pos; info->splits = splits; info->per_split = per; info->depth = spec.depth;
         info->grid_x = splits; info->grid_y = c->sh.vy; info->threads = OMEGA_DATTN256_CHUNK;
         info->kv_bytes = 2ull * c->sh.kvh * (pos + 1ull) * RB;
         info->kernel_cache_hit = hit;
     }
-    if (rc == OMEGA_GPU_DATTN_OK) {
+    const uint32_t declared = gpr_declared(ks->kernel.gpr_count);
+    if (rc == OMEGA_GPU_DATTN_OK && !omega_bw_gpr_declared_ok(declared, ks->kernel.gpr_count)) {
+        omega_gpu_session_set_error("declared registers below peak + 2: refusing to launch");
+        rc = OMEGA_GPU_DATTN_CHIP_FAIL;
+    }
+    if (rc == OMEGA_GPU_DATTN_OK && rec) {
+        if (omega_gpu_cmdlist_record_attn256(rec, launch_spec, ks->code.va, declared, c->sh.vy, c->sh.out_words) < 0)
+            rc = OMEGA_GPU_DATTN_CHIP_FAIL;
+    } else if (rc == OMEGA_GPU_DATTN_OK) {
+        uint32_t args[OMEGA_DATTN256_ARGS_WORDS];
+        uint64_t result = 1;
         OmegaGpuLaunch L = {
-            .code_va = ks->code.va, .gpr_count = gpr_declared(ks->kernel.gpr_count),
+            .code_va = ks->code.va, .gpr_count = declared,
             .threads_x = OMEGA_DATTN256_CHUNK, .threads_y = 1, .grid_x = splits, .grid_y = c->sh.vy,
-            .num_elements = (size_t)c->sh.out_words,
-            .args = args, .n_args = OMEGA_DATTN256_ARGS_WORDS, .timeout_ms = MARKER_TIMEOUT_MS,
-            .shared_bytes = OMEGA_DATTN256_SHARED_BYTES,
+            .num_elements = (size_t)c->sh.out_words, .args = args, .n_args = OMEGA_DATTN256_ARGS_WORDS,
+            .timeout_ms = MARKER_TIMEOUT_MS, .shared_bytes = OMEGA_DATTN256_SHARED_BYTES,
         };
-        if (!omega_bw_gpr_declared_ok(L.gpr_count, ks->kernel.gpr_count)) { omega_gpu_session_set_error("declared registers below peak + 2: refusing to launch"); rc = OMEGA_GPU_DATTN_CHIP_FAIL; }
-        else if (rec) { if (omega_gpu_cmdlist_add(rec, &L) < 0) rc = OMEGA_GPU_DATTN_CHIP_FAIL; }
-        else if (omega_gpu_session_launch(&L, info ? &info->elapsed_ns : NULL, info ? &info->completion_marker : NULL) != 0) rc = OMEGA_GPU_DATTN_CHIP_FAIL;
+        if (omega2_bw_attn256_args(&result, launch_spec, 16, args, OMEGA_DATTN256_ARGS_WORDS) != OMEGA_OK || result != 0 ||
+            omega_gpu_session_launch(&L, info ? &info->elapsed_ns : NULL, info ? &info->completion_marker : NULL) != 0)
+            rc = OMEGA_GPU_DATTN_CHIP_FAIL;
     }
     if (rc == OMEGA_GPU_DATTN_OK && !rec && (omega_gpu_session_sync_to_cpu(&c->out) != 0 || omega_gpu_session_sync_to_cpu(&c->cnt) != 0)) rc = OMEGA_GPU_DATTN_CHIP_FAIL;
     if (rc == OMEGA_GPU_DATTN_OK && !rec) {

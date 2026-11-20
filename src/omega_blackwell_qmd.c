@@ -22,7 +22,7 @@
  * Driver constant buffer 0 base template (224 words, 896 bytes).
  * Empirically captured from physical Blackwell GB10 compute channel bring-up.
  */
-static const uint32_t CBANK0_DRIVER_TEMPLATE[OMEGA_BW_CBANK_DRIVER_WORDS] = {
+const uint32_t omega_bw_cbank_driver_template[OMEGA_BW_CBANK_DRIVER_WORDS] = {
     0x26420000, 0x00000003, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -76,7 +76,7 @@ int omega_blackwell_build_qmd1(uint32_t *qmd1_words, const OmegaBlackwellQmdConf
 
 int omega_blackwell_build_cbank_driver(uint32_t *cbank_words, uint64_t cbank_va) {
     if (!cbank_words) return -1;
-    memcpy(cbank_words, CBANK0_DRIVER_TEMPLATE, sizeof(CBANK0_DRIVER_TEMPLATE));
+    memcpy(cbank_words, omega_bw_cbank_driver_template, sizeof(omega_bw_cbank_driver_template));
 
     /* Patch driver template addresses with actual cbank_va */
     cbank_words[68] = (uint32_t)(cbank_va >> 32);

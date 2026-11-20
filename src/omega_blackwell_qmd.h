@@ -64,6 +64,7 @@ int omega_blackwell_build_qmd0(uint32_t *qmd0_words, uint64_t qmd0_va, uint64_t 
 int omega_blackwell_build_qmd1(uint32_t *qmd1_words, const OmegaBlackwellQmdConfig *cfg);
 
 /* Build driver constant bank 0 (224 words) with hardware descriptor addresses */
+extern const uint32_t omega_bw_cbank_driver_template[OMEGA_BW_CBANK_DRIVER_WORDS];
 int omega_blackwell_build_cbank_driver(uint32_t *cbank_words, uint64_t cbank_va);
 
 /* Build driver constant bank 0 (224 words) with 2D tile geometry */

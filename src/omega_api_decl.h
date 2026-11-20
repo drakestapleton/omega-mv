@@ -38,6 +38,10 @@ uint64_t bw_qmd0(uint32_t o_q[96], uint64_t o_qmd1_va);
 uint64_t bw_qmd1(const uint64_t o_m[16], uint32_t o_q[96]);
 /* export fn bw_qmd_verify q view uint 96 to ulong */
 uint64_t bw_qmd_verify(const uint32_t o_q[96]);
+/* export fn bw_attn256_args s view ulong 16 args edit uint 25 to ulong */
+uint64_t bw_attn256_args(const uint64_t o_s[16], uint32_t o_args[25]);
+/* export fn bw_attn256_record s view ulong 16 slot view ulong 8 driver view uint 224 bank edit uint 249 q1 edit uint 96 q0 edit uint 96 to ulong */
+uint64_t bw_attn256_record(const uint64_t o_s[16], const uint64_t o_slot[8], const uint32_t o_driver[224], uint32_t o_bank[249], uint32_t o_q1[96], uint32_t o_q0[96]);
 /* export fn bw_sched_stalls ins edit ulong 8192 phys view ulong 256 bsz view ulong 256 n ulong to ulong */
 uint64_t bw_sched_stalls(uint64_t o_ins[8192], const uint64_t o_phys[256], const uint64_t o_bsz[256], uint64_t o_n);
 /* export fn bw_regalloc_solve cfg view ulong 4 vinfo view long 768 uinfo view ulong 32 res edit long 290 to ulong */
