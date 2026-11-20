@@ -26,6 +26,20 @@ OSC_MODEL = src/compiler/model/osc_model.c
 OSC_MODEL_GEN = src/compiler/model/osc_model_gen.c
 OSC_HDRS = $(wildcard src/compiler/*.h) $(wildcard src/compiler/model/*.h) src/sha256.h
 
+OSC_LEX_TEST_SRC = tests/compiler/test_osc_lex.c tests/compiler/osc_lex_reference.c \
+                   src/compiler/osc_lex.c src/compiler/osc_diag.c src/omega_om_units.c
+OSC_LEX_FIXTURES = $(wildcard tests/compiler/progs/*.osc tests/compiler/neg/*.osc)
+
+$(OSC_DIR)/test_osc_lex: $(OSC_LEX_TEST_SRC) $(OSC_HDRS) src/omega_api_decl.h
+	@mkdir -p $(OSC_DIR)
+	$(CC) $(OSC_CFLAGS) -o $@ $(OSC_LEX_TEST_SRC)
+
+.PHONY: test-osc-lex
+test-osc-lex: $(OSC_DIR)/test_osc_lex
+	@$(OSC_DIR)/test_osc_lex $(OSC_LEX_FIXTURES)
+
+test-compiler test-compiler-quick: test-osc-lex
+
 $(OSC_DIR)/test_osc_model: tests/compiler/test_osc_model.c $(OSC_MODEL) $(OSC_MODEL_GEN) $(OSC_HDRS)
 	@mkdir -p $(OSC_DIR)
 	$(CC) $(OSC_CFLAGS) -o $@ tests/compiler/test_osc_model.c $(OSC_MODEL) $(OSC_MODEL_GEN)

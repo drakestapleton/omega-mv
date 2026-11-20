@@ -258,8 +258,31 @@ uint64_t rx_fus_word64(const uint8_t o_d[8]);
 uint64_t rx_fus_eligible_kind(uint64_t o_k);
 #define OSC_LITERAL_MALFORMED 1
 #define OSC_LITERAL_OVERFLOW 2
+#define OSC_LEX_COMMENT 3
+#define OSC_LEX_FULL 4
+#define OSC_LEX_NAME_LONG 5
+#define OSC_LEX_BAD_BYTE 6
+typedef struct {
+    uint64_t pos;
+    uint64_t start;
+    uint64_t value;
+    uint32_t line;
+    uint32_t col;
+    uint32_t width;
+    uint32_t kind;
+} OscLexState;
+OMBR_ASSERT(sizeof(OscLexState) == 40, "layout lexstate size");
+OMBR_ASSERT(offsetof(OscLexState, pos) == 0, "layout lexstate field pos");
+OMBR_ASSERT(offsetof(OscLexState, start) == 8, "layout lexstate field start");
+OMBR_ASSERT(offsetof(OscLexState, value) == 16, "layout lexstate field value");
+OMBR_ASSERT(offsetof(OscLexState, line) == 24, "layout lexstate field line");
+OMBR_ASSERT(offsetof(OscLexState, col) == 28, "layout lexstate field col");
+OMBR_ASSERT(offsetof(OscLexState, width) == 32, "layout lexstate field width");
+OMBR_ASSERT(offsetof(OscLexState, kind) == 36, "layout lexstate field kind");
 /* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
 uint64_t osc_parse_literal(const uint8_t *o_spelling, size_t o_spelling_len, uint64_t o_value[1]);
+/* export fn osc_lex_next src view uchar * cursor edit lexstate room ulong namemax ulong to ulong */
+uint64_t osc_lex_next(const uint8_t *o_src, size_t o_src_len, OscLexState *o_cursor, uint64_t o_room, uint64_t o_namemax);
 #ifdef __cplusplus
 }
 #endif

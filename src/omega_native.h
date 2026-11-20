@@ -331,10 +331,12 @@ const char *omega2_ident_rx_fusion_core(void);
 uint32_t omega2_rx_fus_word64(uint64_t *result, const uint8_t *o_d, uint64_t o_d_len);
 /* export fn rx_fus_eligible_kind k ulong to ulong */
 uint32_t omega2_rx_fus_eligible_kind(uint64_t *result, uint64_t o_k);
-#define OMEGA2_IDENT_osc_literal "omega-ident 1 unit=osc_literal abi=2 profile=OM-2 src=c61bdcbb9f71b01df86fba045b4206809091e709eba208939a4270b67dabbce2 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_literal "omega-ident 1 unit=osc_literal abi=2 profile=OM-2 src=a3fa19176dbf6193b157f84e4b7330e7065215e2ea0bccb0f9dfe706645267fb omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_literal(void);
 /* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
 uint32_t omega2_osc_parse_literal(uint64_t *result, const uint8_t *o_spelling, uint64_t o_spelling_len, uint64_t *o_value);
+/* export fn osc_lex_next src view uchar * cursor edit lexstate room ulong namemax ulong to ulong */
+uint32_t omega2_osc_lex_next(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_cursor, uint64_t o_room, uint64_t o_namemax);
 #ifdef __cplusplus
 }
 #endif
