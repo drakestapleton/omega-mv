@@ -315,7 +315,7 @@ uint32_t omega2_osc_scope_bind(uint64_t *result, uint8_t *o_table, uint64_t o_id
 uint32_t omega2_osc_scope_push(uint64_t *result, uint8_t *o_table);
 /* export fn osc_scope_pop table edit scopetab to void */
 uint32_t omega2_osc_scope_pop(uint64_t *result, uint8_t *o_table);
-#define OMEGA2_IDENT_osc_pool "omega-ident 1 unit=osc_pool abi=2 profile=OM-2 src=739af9855c5a25c5c3322dade4200fec3d7ee380ddc97de7afa7875618888711 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+#define OMEGA2_IDENT_osc_pool "omega-ident 1 unit=osc_pool abi=2 profile=OM-2 src=e4198750f150c94c266f9e64627ec9ad1ecbd3f6dd462814038991ab0916b968 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_pool(void);
 /* export fn osc_pool_init p edit poolstat cap ulong base ulong loop_depth long cond_depth long to void */
 uint32_t omega2_osc_pool_init(uint64_t *result, uint8_t *o_p, uint64_t o_cap, uint64_t o_base, uint64_t o_loop_depth, uint64_t o_cond_depth);
@@ -323,6 +323,20 @@ uint32_t omega2_osc_pool_init(uint64_t *result, uint8_t *o_p, uint64_t o_cap, ui
 uint32_t omega2_osc_pool_alloc(uint64_t *result, uint8_t *o_p, uint64_t o_loop_depth, uint64_t o_cond_depth);
 /* export fn osc_pool_free p edit poolstat loop_depth long cond_depth long to void */
 uint32_t omega2_osc_pool_free(uint64_t *result, uint8_t *o_p, uint64_t o_loop_depth, uint64_t o_cond_depth);
+/* export fn osc_handle_allocate h edit handles to long */
+uint32_t omega2_osc_handle_allocate(uint64_t *result, uint8_t *o_h);
+/* export fn osc_handle_bind h edit handles provenance long to ulong */
+uint32_t omega2_osc_handle_bind(uint64_t *result, uint8_t *o_h, uint64_t o_provenance);
+/* export fn osc_handle_visit h edit handles sites edit ulong 1024 b ulong freeing ulong symbol long line ulong to ulong */
+uint32_t omega2_osc_handle_visit(uint64_t *result, uint8_t *o_h, uint64_t *o_sites, uint64_t o_sites_len, uint64_t o_b, uint64_t o_freeing, uint64_t o_symbol, uint64_t o_line);
+/* export fn osc_handles_save h view handles s edit handles to void */
+uint32_t omega2_osc_handles_save(uint64_t *result, const uint8_t *o_h, uint8_t *o_s);
+/* export fn osc_handles_restore h edit handles s view handles bindings ulong to void */
+uint32_t omega2_osc_handles_restore(uint64_t *result, uint8_t *o_h, const uint8_t *o_s, uint64_t o_bindings);
+/* export fn osc_handles_settle h edit handles before view handles other view handles to void */
+uint32_t omega2_osc_handles_settle(uint64_t *result, uint8_t *o_h, const uint8_t *o_before, const uint8_t *o_other);
+/* export fn osc_handle_frees h view handles before view handles ids edit uint 1024 to ulong */
+uint32_t omega2_osc_handle_frees(uint64_t *result, const uint8_t *o_h, const uint8_t *o_before, uint32_t *o_ids, uint64_t o_ids_len);
 #define OMEGA2_IDENT_osc_trace "omega-ident 1 unit=osc_trace abi=2 profile=OM-2 src=9db7adbb499a43db3ccff00093c4601eebc89450ea9f35e5d0a23ad9c014389a omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_trace(void);
 /* export fn osc_trace_record trace edit uchar * event view trinput to void */

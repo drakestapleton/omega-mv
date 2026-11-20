@@ -51,17 +51,15 @@ typedef struct {
     uint16_t cap, used;
     int cond_depth;
     OscCheckedPool slots; /* SK_POOL: definite capacity and generation accounting */
-    /* SK_HANDLE: pool symbol and static allocation provenance (-1 unknown). */
-    int pool, prov;
+    /* SK_HANDLE: declaring pool and index into the handle binding table. */
+    int pool, handle;
     int decl;  /* OSC-3 item 3: declaring AST node (owners: carries the drop-flag mark) */
 } Sym;
 
 /* OSC-3 item 2: handle state saved around branches and loop bodies */
-typedef struct {
-    uint8_t pfreed[MAX_PROV];
-    int hprov[OSC_CHECK_MAX_SYMS];
-    int nprov, nsym;
-} HSave;
+typedef OscHandleState HSave;
+_Static_assert(sizeof(((HSave *)0)->freed) == MAX_PROV &&
+               sizeof(((HSave *)0)->binding) / sizeof(int32_t) == OSC_CHECK_MAX_SYMS, "OSC handle capacities");
 
 /* Obj.moved. OSC-3 item 3 (drop flags) adds OM_MAYBE: moved on some but not
  * all paths that reach the current point. Such an owner cannot be used,
@@ -102,19 +100,15 @@ typedef struct {
     int contract;         /* 0 body; 1 checking a requires clause; 2 an ensures clause (OSC-2) */
     int cond_depth;       /* OSC-2 arenas: nesting of if/else branches */
     uint32_t nregion;     /* OSC-2 arenas: model region ids handed out in this function */
-    /* OSC-3 item 2: provenances of this function. pfreed = freed on every path
-     * reaching the current point; pmslot / pmhnd = model slot and handle ids
-     * (fresh per provenance); pfree_sym = handle symbol named by the free. */
-    int nprov;
-    uint32_t nmslot, nmhnd;
     /* Each table entry is initialized when its ID is allocated. */
     Sym sym[OSC_CHECK_MAX_SYMS];
     Obj obj[OSC_CHECK_MAX_OBJS];
     Bor bor[OSC_CHECK_MAX_BORS];
     OscCheckedScope names;
-    uint8_t pfreed[MAX_PROV];
-    uint32_t pfree_line[MAX_PROV], pmslot[MAX_PROV], pmhnd[MAX_PROV];
-    int pfree_sym[MAX_PROV];
+    OscHandleState handles;
+    /* The first free site is consulted only for a definitely freed provenance.
+     * Source line occupies the low word, freeing symbol the high word. */
+    uint64_t free_site[MAX_PROV];
 } C;
 
 #define NODE(i) (&c->ast->nodes[(i)])
@@ -507,32 +501,20 @@ static HSave *hs_take(C *c)
 {
     HSave *s = c->a->alloc(c->a->ctx, sizeof *s);
     if (!s) return NULL;
-    memcpy(s->pfreed, c->pfreed, (size_t)c->nprov);
-    for (int i = 0; i < c->nsym; i++) s->hprov[i] = c->sym[i].prov;
-    s->nprov = c->nprov;
-    s->nsym = c->nsym;
+    osc_handles_save(&c->handles, s);
     return s;
 }
 static void hs_free(C *c, HSave *s) { c->a->free(c->a->ctx, s, sizeof *s); }
-static void hs_restore(C *c, const HSave *s)
-{
-    memcpy(c->pfreed, s->pfreed, (size_t)s->nprov);
-    for (int i = 0; i < s->nsym; i++) c->sym[i].prov = s->hprov[i];
-}
-/* after a branch or loop: a handle whose provenance differs from the one it
- * had before (assigned on some path) becomes unknown; the model trace was
- * restored at OSC_TR_RESTORE, so provenances freed on every surviving path
- * since `before` are re-emitted as SLOT_FREE */
+/* Re-emit newly definite frees in model ID order after trace restore. */
 static void hs_settle(C *c, const HSave *before, const HSave *other, uint32_t line)
 {
-    for (int i = 0; i < before->nsym; i++) {
-        if (c->sym[i].kind != SK_HANDLE) continue;
-        int initial = before->hprov[i];
-        c->sym[i].prov = (int)osc_join_handle(initial, c->sym[i].prov, other ? other->hprov[i] : initial);
+    if (before->nbind)
+        osc_handles_settle(&c->handles, before, other ? other : before);
+    if (c->tr && before->count) {
+        uint32_t ids[MAX_PROV];
+        size_t n = osc_handle_frees(&c->handles, before, ids);
+        for (size_t i = 0; i < n; i++) tr_slot(c, OSC_EV_SLOT_FREE, 0, ids[i], 0, line, 0);
     }
-    for (int p = 0; p < before->nprov; p++)
-        if (c->pfreed[p] && !before->pfreed[p] && c->pmhnd[p])
-            tr_slot(c, OSC_EV_SLOT_FREE, 0, c->pmhnd[p], 0, line, 0);
 }
 
 /* restore state of the entities that existed at the snapshot; later ones stay
@@ -784,27 +766,32 @@ static int handle_operand(C *c, const OscNode *hn, int ps, const char *what)
     return s;
 }
 
-/* use of handle hs (read wr = 0 / write wr = 1): refused when its provenance
- * was freed on every path here. The refused event is the model's HANDLE_USE
- * (stale-generation). */
-static int handle_use(C *c, const OscNode *at, int hs, int wr)
+/* Omega decides if the binding is known, live or already freed and records
+ * successful frees. Model IDs start at one, checker provenances at zero. */
+static int handle_event(C *c, const OscNode *at, int hs, uint32_t kind, uint64_t rights)
 {
     Sym *h = &c->sym[hs];
-    int pv = h->prov;
-    if (pv < 0) return 0;
-    if (c->pfreed[pv]) {
-        int copy = c->pfree_sym[pv] != hs;
-        char tr[64];
-        snprintf(tr, sizeof tr, "%s after free%s", wr ? "write" : "read", copy ? " via a copy" : "");
-        tr_slot(c, OSC_EV_HANDLE_USE, 0, c->pmhnd[pv], wr ? 2 : 1, at->line, 1);
-        osc_diag_set(c->d, OSC_DIAG_STALE_HANDLE, at->line, at->col, h->name, c->pfree_line[pv],
-                     copy ? c->sym[c->pfree_sym[pv]].name : NULL, tr,
-                     "'%s' is stale: its slot was freed at line %u%s%s (generation mismatch)", h->name,
-                     c->pfree_line[pv], copy ? " through " : "", copy ? c->sym[c->pfree_sym[pv]].name : "");
-        return -1;
-    }
-    tr_slot(c, OSC_EV_HANDLE_USE, 0, c->pmhnd[pv], wr ? 2 : 1, at->line, 0);
-    return 0;
+    int freeing = kind == OSC_EV_SLOT_FREE;
+    uint64_t state = osc_handle_visit(&c->handles, c->free_site, h->handle, freeing, hs, at->line);
+    if (state == OSC_HANDLE_UNKNOWN) return 0;
+    int pv = c->handles.binding[h->handle];
+    tr_slot(c, kind, 0, (uint32_t)pv + 1, rights, at->line, state != OSC_HANDLE_LIVE);
+    if (state == OSC_HANDLE_LIVE) return 0;
+
+    uint64_t site = c->free_site[pv];
+    uint32_t first_line = (uint32_t)site;
+    const char *copy = state == OSC_HANDLE_STALE_COPY ? c->sym[site >> 32].name : NULL;
+    const char *action = freeing ? "free" : rights == 2 ? "write" : "read";
+    char transition[64];
+    snprintf(transition, sizeof transition, "%s after free%s", action, copy ? " via a copy" : "");
+    if (freeing)
+        osc_diag_set(c->d, OSC_DIAG_STALE_HANDLE, at->line, at->col, h->name, first_line, copy, transition,
+                     "'%s' is stale: its slot was already freed at line %u (double free)", h->name, first_line);
+    else
+        osc_diag_set(c->d, OSC_DIAG_STALE_HANDLE, at->line, at->col, h->name, first_line, copy, transition,
+                     "'%s' is stale: its slot was freed at line %u%s%s (generation mismatch)", h->name, first_line,
+                     copy ? " through " : "", copy ? copy : "");
+    return -1;
 }
 
 /* `P.alloc(e)` (ON_PALLOC an) for a handle of pool ps: returns the new
@@ -840,14 +827,10 @@ static int handle_alloc(C *c, OscNode *an, int ps)
                      (unsigned long long)generations, (unsigned long long)p->slots.gbase);
         return -1;
     }
-    if (c->nprov >= MAX_PROV) return cap_fail(c, an->line, "handle provenance capacity");
-    int pv = c->nprov++;
-    c->pfreed[pv] = 0;
-    c->pfree_line[pv] = 0;
-    c->pfree_sym[pv] = -1;
-    c->pmslot[pv] = ++c->nmslot;
-    c->pmhnd[pv] = ++c->nmhnd;
-    tr_slot(c, OSC_EV_SLOT_ALLOC, c->pmslot[pv], c->pmhnd[pv], 3, an->line, 0);
+    int pv = (int)osc_handle_allocate(&c->handles);
+    if (pv < 0) return cap_fail(c, an->line, "handle provenance capacity");
+    uint32_t id = (uint32_t)pv + 1;
+    tr_slot(c, OSC_EV_SLOT_ALLOC, id, id, 3, an->line, 0);
     return pv;
 }
 
@@ -863,7 +846,7 @@ static int handle_value(C *c, OscNode *v, int ps, const char *target)
         int s = handle_operand(c, v, ps, "a handle binding");
         if (s < 0) return -2;
         v->sym = s;
-        return c->sym[s].prov;
+        return c->handles.binding[c->sym[s].handle];
     }
     char msg[200];
     snprintf(msg, sizeof msg, "handle '%s' takes '%s.alloc(e)' or another handle of pool '%s'", target,
@@ -1054,7 +1037,7 @@ static int chk(C *c, int i, OscScalar want)
             n->sym = ps;
             n->sym2 = hs;
             NODE(n->a)->sym = hs;
-            if (handle_use(c, n, hs, 0)) return -1;
+            if (handle_event(c, n, hs, OSC_EV_HANDLE_USE, 1)) return -1;
             t = c->sym[ps].ty.s;
             break;
         }
@@ -1492,7 +1475,7 @@ static int chk_if(C *c, int i)
     if (!s1 || !h1) { cap_fail(c, n->line, "checker memory"); goto out; }
     tr_control(c, OSC_TR_RESTORE, n->line);
     snap_restore(c, s0);
-    hs_restore(c, h0);
+    osc_handles_restore(&c->handles, h0, 1);
     c->term = 0;
     int t2 = 0;
     if (n->c >= 0) {
@@ -1510,10 +1493,10 @@ static int chk_if(C *c, int i)
     }
     if (t2) {
         snap_restore(c, s1);
-        hs_restore(c, h1);
+        osc_handles_restore(&c->handles, h1, 1);
     } else if (!t1) {
         /* OSC-3 item 2: freed only if freed on both paths */
-        osc_join_frees(h1->pfreed, h0->nprov, c->pfreed, h0->nprov);
+        if (h0->count) osc_join_frees(h1->freed, h0->count, c->handles.freed, h0->count);
         /* OSC-3 item 3 (drop flags): an owner moved on one path and not (or
          * only maybe) on the other is maybe-moved after the `if`. Its
          * declaration gets a drop flag: set at the declaration, cleared at
@@ -1572,7 +1555,7 @@ static int chk_loop_body(C *c, OscNode *n, int is_for)
     snap_restore(c, s0);
     /* A loop can run zero times. Restore the definite frees from before
      * entry, then settle handle assignments against the body that ran. */
-    memcpy(c->pfreed, h0->pfreed, (size_t)h0->nprov);
+    osc_handles_restore(&c->handles, h0, 0);
     hs_settle(c, h0, NULL, n->line);
     c->term = 0;
     rc = 0;
@@ -1723,7 +1706,7 @@ static int chk_stmt(C *c, int i)
                 int pv = handle_value(c, NODE(n->a), y->pool, y->name);
                 if (pv == -2) return -1;
                 n->sym = hs;
-                y->prov = pv;
+                c->handles.binding[y->handle] = pv;
                 return 0;
             }
         }
@@ -1788,7 +1771,7 @@ static int chk_stmt(C *c, int i)
             n->sym2 = hs;
             NODE(n->a)->sym = hs;
             if (slice_noescape(c, n->b) || chk(c, n->b, c->sym[ps].ty.s) < 0) return -1;
-            return handle_use(c, n, hs, 1);
+            return handle_event(c, n, hs, OSC_EV_HANDLE_USE, 2);
         }
         int s = resolve(c, n);
         if (s < 0) return -1;
@@ -1909,7 +1892,7 @@ static int chk_stmt(C *c, int i)
         int s = declare(c, n, SK_HANDLE, &th, n->mut);
         if (s < 0) return -1;
         c->sym[s].pool = ps;
-        c->sym[s].prov = pv;
+        c->sym[s].handle = (int)osc_handle_bind(&c->handles, pv);
         n->sym = s;
         n->sym2 = ps;
         return 0;
@@ -1923,23 +1906,8 @@ static int chk_stmt(C *c, int i)
         n->sym = ps;
         n->sym2 = hs;
         NODE(n->a)->sym = hs;
-        Sym *p = &c->sym[ps], *h = &c->sym[hs];
-        osc_pool_free(&p->slots, c->loop_depth, c->cond_depth);
-        int pv = h->prov;
-        if (pv < 0) return 0;
-        if (c->pfreed[pv]) {
-            int copy = c->pfree_sym[pv] != hs;
-            tr_slot(c, OSC_EV_SLOT_FREE, 0, c->pmhnd[pv], 0, n->line, 1);
-            osc_diag_set(c->d, OSC_DIAG_STALE_HANDLE, n->line, n->col, h->name, c->pfree_line[pv],
-                         copy ? c->sym[c->pfree_sym[pv]].name : NULL, copy ? "free after free via a copy" : "free after free",
-                         "'%s' is stale: its slot was already freed at line %u (double free)", h->name, c->pfree_line[pv]);
-            return -1;
-        }
-        tr_slot(c, OSC_EV_SLOT_FREE, 0, c->pmhnd[pv], 0, n->line, 0);
-        c->pfreed[pv] = 1;
-        c->pfree_line[pv] = n->line;
-        c->pfree_sym[pv] = hs;
-        return 0;
+        osc_pool_free(&c->sym[ps].slots, c->loop_depth, c->cond_depth);
+        return handle_event(c, n, hs, OSC_EV_SLOT_FREE, 0);
     }
     case ON_CALLSTMT:
         set_sobj_tok(c, NODE(n->a));
@@ -1981,8 +1949,7 @@ static int chk_fn(C *c, int fi)
     c->nsym = c->nobj = c->nbor = c->loop_depth = c->term = 0;
     c->cond_depth = 0;
     c->nregion = 0;
-    c->nprov = 0;          /* OSC-3 item 2 */
-    c->nmslot = c->nmhnd = 0;
+    c->handles.count = c->handles.nbind = 0;
     char fname[64];
     osc_node_name(a, fn, fname, sizeof fname);
     snprintf(c->sobj, sizeof c->sobj, "%s", fname);
