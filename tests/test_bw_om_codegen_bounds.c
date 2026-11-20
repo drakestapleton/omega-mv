@@ -20,6 +20,8 @@
 #include "omega_blackwell_codegen_tc2.h"
 #include "omega_blackwell_codegen_qg.h"
 #include "omega_blackwell_codegen_tc.h"
+#include "omega_blackwell_codegen_pattn256.h"
+#include "omega_blackwell_codegen_router.h"
 #include "sha256.h"
 
 static int g_pass = 0, g_fail = 0;
@@ -559,6 +561,59 @@ static void dump_metrics(void) {
         CHK(omega_blackwell_codegen_tc_bw_prog(64, 4, 256, &p) == 0, "tc_bw");
         report_kernel("tc_bw_g4_t256", &p, 8);
     }
+    {
+        OmegaPrefillAttn256Spec s = { .mutant = 0, .q_heads = 24, .kv_heads = 4 };
+        CHK(omega_blackwell_codegen_prefill_attn256_prog(&s, &p) == 0, "pattn256 q24 kv4");
+        report_kernel("pattn256_q24_kv4", &p, 8);
+    }
+    {
+        OmegaPrefillAttn256Spec s = { .mutant = 0, .q_heads = 16, .kv_heads = 2 };
+        CHK(omega_blackwell_codegen_prefill_attn256_prog(&s, &p) == 0, "pattn256 q16 kv2");
+        report_kernel("pattn256_q16_kv2", &p, 8);
+    }
+    {
+        OmegaRouterSpec s = { .warps = 8, .depth = 4, .mutant = 0, .experts = 128, .shared = 0, .xstride = 0, .lbstride = 0 };
+        CHK(omega_blackwell_codegen_router_prog(&s, &p) == 0, "router w8 d4 e128");
+        report_kernel("router_w8_d4_e128", &p, 8);
+    }
+    {
+        OmegaRouterSpec s = { .warps = 8, .depth = 4, .mutant = 0, .experts = 256, .shared = 1, .xstride = 8192, .lbstride = 16384 };
+        CHK(omega_blackwell_codegen_router_prog(&s, &p) == 0, "router w8 d4 e256 sh1 rows");
+        report_kernel("router_w8_d4_e256_sh1_rows", &p, 8);
+    }
+}
+
+static void test_pattn256_and_router_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_prefill_attn256_prog(NULL, &prog) != 0 && prog.count == 0, "pattn256 NULL spec");
+    OmegaPrefillAttn256Spec pa_bad[] = {
+        { .mutant = -1, .q_heads = 24, .kv_heads = 4 },
+        { .mutant = 3,  .q_heads = 24, .kv_heads = 4 },
+        { .mutant = 0,  .q_heads = 25, .kv_heads = 4 },
+        { .mutant = 0,  .q_heads = 36, .kv_heads = 4 },
+    };
+    for (size_t i = 0; i < sizeof(pa_bad) / sizeof(pa_bad[0]); i++) {
+        prog.count = 51;
+        CHK(omega_blackwell_codegen_prefill_attn256_prog(&pa_bad[i], &prog) != 0 && prog.count == 0, "pattn256 invalid spec");
+        CHK(omega_pattn256_spec_ok(&pa_bad[i]) == 0, "pattn256_spec_ok 0");
+    }
+    CHK(omega_blackwell_codegen_router_prog(NULL, &prog) != 0 && prog.count == 0, "router NULL spec");
+    OmegaRouterSpec rt_bad[] = {
+        { .warps = 4,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 3, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = -1, .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 7,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 5,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 6,  .experts = 128, .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 64,  .shared = 0, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 2, .xstride = 0,    .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 8192, .lbstride = 0 },
+        { .warps = 8,  .depth = 4, .mutant = 0,  .experts = 128, .shared = 0, .xstride = 4096, .lbstride = 16 },
+    };
+    for (size_t i = 0; i < sizeof(rt_bad) / sizeof(rt_bad[0]); i++) {
+        prog.count = 52;
+        CHK(omega_blackwell_codegen_router_prog(&rt_bad[i], &prog) != 0 && prog.count == 0, "router invalid spec");
+    }
 }
 
 int main(void) {
@@ -567,6 +622,7 @@ int main(void) {
     test_qmma_and_pfhost_error_paths();
     test_tgemm_and_tc2_error_paths();
     test_qg_and_tc_error_paths();
+    test_pattn256_and_router_error_paths();
     test_max_size_legal_inputs();
     dump_metrics();
     printf("test_bw_om_codegen_bounds: %d passed, %d failed: %s\n", g_pass, g_fail, g_fail ? "FAIL" : "PASS");

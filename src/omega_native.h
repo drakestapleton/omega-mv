@@ -147,6 +147,18 @@ uint32_t omega2_cg_tcgemm_emit(uint64_t *result, const uint64_t *o_sp, uint64_t 
 uint32_t omega2_cg_tc_peak_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 /* export fn cg_tc_bw_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_tc_bw_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_pattn256 "omega-ident 1 unit=cg_pattn256 abi=2 profile=OM-2 src=26a9dbc721c0f234ccbbac2f342a407ba59cbd166fda2d0e0d9c5ed730c0a1c9 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_pattn256(void);
+/* export fn cg_pattn256_spec_ok sp view ulong 4 to ulong */
+uint32_t omega2_cg_pattn256_spec_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
+/* export fn cg_pattn256_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_pattn256_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_router "omega-ident 1 unit=cg_router abi=2 profile=OM-2 src=eff9e2831c786108e8bafe42974fda90c003aed93dea256de36e94666299a467 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_router(void);
+/* export fn cg_router_spec_ok sp view ulong 8 to ulong */
+uint32_t omega2_cg_router_spec_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
+/* export fn cg_router_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_router_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 #ifdef __cplusplus
 }
 #endif
