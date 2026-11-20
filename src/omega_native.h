@@ -211,7 +211,7 @@ uint32_t omega2_rx_fus_eligible_kind(uint64_t *result, uint64_t o_k);
 const char *omega2_ident_osc_literal(void);
 /* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
 uint32_t omega2_osc_parse_literal(uint64_t *result, const uint8_t *o_spelling, uint64_t o_spelling_len, uint64_t *o_value);
-#define OMEGA2_IDENT_osc_ownership "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=b947984425bedd6508a3b9f6154fb9ef35c0fada6ba0a81a609767cb54515e2d omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+#define OMEGA2_IDENT_osc_ownership "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=3b8225e233352af8e7e8c6546751d24884d4d5f3f85305e9b924b8da0003707a omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_osc_ownership(void);
 /* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
 uint32_t omega2_osc_owner_access(uint64_t *result, uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
@@ -219,6 +219,12 @@ uint32_t omega2_osc_owner_access(uint64_t *result, uint64_t o_moved, uint64_t o_
 uint32_t omega2_osc_borrow_access(uint64_t *result, uint64_t o_writable, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
 /* export fn osc_owner_move moved ulong shared_count ulong mut_count ulong declaration_depth long loop_depth long to ulong */
 uint32_t omega2_osc_owner_move(uint64_t *result, uint64_t o_moved, uint64_t o_shared_count, uint64_t o_mut_count, uint64_t o_declaration_depth, uint64_t o_loop_depth);
+/* export fn osc_join_owner taken view oscowner remaining edit oscowner to ulong */
+uint32_t omega2_osc_join_owner(uint64_t *result, const uint8_t *o_taken, uint8_t *o_remaining);
+/* export fn osc_join_handle before long current long other long to long */
+uint32_t omega2_osc_join_handle(uint64_t *result, uint64_t o_before, uint64_t o_current, uint64_t o_other);
+/* export fn osc_join_frees taken view uchar * remaining edit uchar * to void */
+uint32_t omega2_osc_join_frees(uint64_t *result, const uint8_t *o_taken, uint64_t o_taken_len, uint8_t *o_remaining, uint64_t o_remaining_len);
 #ifdef __cplusplus
 }
 #endif
