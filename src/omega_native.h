@@ -231,6 +231,10 @@ uint32_t omega2_cg_dec_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_s
 const char *omega2_ident_cg_gdn(void);
 /* fn cg_gdn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_gdn_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_osc_literal "omega-ident 1 unit=osc_literal abi=2 profile=OM-2 src=c61bdcbb9f71b01df86fba045b4206809091e709eba208939a4270b67dabbce2 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_osc_literal(void);
+/* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
+uint32_t omega2_osc_parse_literal(uint64_t *result, const uint8_t *o_spelling, uint64_t o_spelling_len, uint64_t *o_value);
 #ifdef __cplusplus
 }
 #endif

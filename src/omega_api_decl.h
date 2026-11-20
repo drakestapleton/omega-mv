@@ -178,6 +178,10 @@ uint64_t cg_attn256_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t 
 uint64_t cg_dec_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 /* fn cg_gdn_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_gdn_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+#define OSC_LITERAL_MALFORMED 1
+#define OSC_LITERAL_OVERFLOW 2
+/* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
+uint64_t osc_parse_literal(const uint8_t *o_spelling, size_t o_spelling_len, uint64_t o_value[1]);
 #ifdef __cplusplus
 }
 #endif
