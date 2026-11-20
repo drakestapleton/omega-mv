@@ -48,6 +48,38 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The Spark judge provisions sibling worktrees from operator-owned mirrors.
+# Git discovery as aien-run refuses their ownership. Use their object store
+# only as input to pack-objects in the newly initialized destination.
+spark_sibling_objects() {
+    local source=$1 root sibling project mirror link admin path
+    [ "$(id -un)" = aien-run ] || return 1
+    root=$(pwd -P)
+    [[ "$root" =~ ^/var/lib/aien-run/wt/omega/[0-9a-f]{40}/omega$ ]] || return 1
+    sibling=${source##*/}
+    [ "$source" = "${root%/*}/$sibling" ] || return 1
+    case "$sibling" in
+        physics|omega-bridge|aien-train|aien-architecture) project=$sibling ;;
+        aienos) project=aienux ;;
+        *) return 1 ;;
+    esac
+    mirror=/var/lib/aien-run/mirror/$project.git
+    [ -f "$source/.git" ] && [ ! -L "$source/.git" ] || return 1
+    link=$(<"$source/.git")
+    admin=${link#gitdir: }
+    [[ "$link" = "gitdir: $admin" && "$admin" = "$mirror/worktrees/"* ]] || return 1
+    [[ "${admin#"$mirror/worktrees/"}" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+    [ "$(realpath -e -- "$admin")" = "$admin" ] || return 1
+    [ "$(realpath -e -- "$mirror/objects")" = "$mirror/objects" ] || return 1
+    for path in /var/lib/aien-run /var/lib/aien-run/wt /var/lib/aien-run/wt/omega "${root%/*}" "$source" "$source/.git" /var/lib/aien-run/mirror \
+                "$mirror" "$mirror/worktrees" "$admin" "$admin/gitdir" "$admin/commondir" "$mirror/objects"; do
+        [ ! -w "$path" ] && [ ! -L "$path" ] || return 1
+    done
+    [ "$(<"$admin/gitdir")" = "$source/.git" ] && [ "$(<"$admin/commondir")" = ../.. ] || return 1
+    [ ! -e "$mirror/objects/info/alternates" ] && [ ! -L "$mirror/objects/info/alternates" ] || return 1
+    printf '%s\n' "$mirror/objects"
+}
+
 full_commit() {
     [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die "commit must be one full lowercase 40-hex id: '$1'"
 }
@@ -55,7 +87,7 @@ full_commit() {
 rehash() {
     local repo=$1 type=$2 id=$3 got
     got=$(gitc -C "$repo" cat-file "$type" "$id" 2>/dev/null |
-          gitc hash-object -t "$type" --stdin 2>/dev/null) ||
+          gitc -C "$repo" hash-object -t "$type" --stdin 2>/dev/null) ||
         die "cannot read $type object $id from $repo"
     [ "$got" = "$id" ] || die "$type object $id fails its content hash in $repo"
 }
@@ -188,7 +220,10 @@ materialize)
     full_commit "$commit"
     [ -d "$source_repo" ] || die "$source_repo is not a repository directory"
     source_repo=$(cd "$source_repo" && pwd -P) || die "cannot resolve $source_repo"
-    gitc -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1 || die "$source_repo is not a Git repository"
+    objects=""
+    if ! gitc -C "$source_repo" rev-parse --git-dir >/dev/null 2>&1; then
+        objects=$(spark_sibling_objects "$source_repo") || die "$source_repo is not a readable Git repository"
+    fi
     [ ! -e "$destination" ] && [ ! -L "$destination" ] || die "destination already exists: $destination"
     mkdir -p -- "$(dirname "$destination")" || die "cannot create destination parent"
     empty=$(mktemp -d "${TMPDIR:-/tmp}/omega-pin-template.XXXXXX") || die "mktemp failed"
@@ -201,8 +236,14 @@ materialize)
     # packObjectsHook. A raw commit id is not a bundle tip (git refuses an
     # "empty" bundle), and a shared clone would keep the source object store.
     tmpd=$(mktemp -d "${TMPDIR:-/tmp}/omega-pinned-checkout.XXXXXX") || die "mktemp failed"
-    printf '%s\n' "$commit" | gitc -C "$source_repo" pack-objects --revs --quiet --stdout > "$tmpd/pin.pack" ||
-        die "cannot copy locked commit $commit from $source_repo"
+    if [ -n "$objects" ]; then
+        printf '%s\n' "$commit" | GIT_ALTERNATE_OBJECT_DIRECTORIES="$objects" \
+            gitc -C "$destination" pack-objects --revs --quiet --stdout > "$tmpd/pin.pack" ||
+            die "cannot copy locked commit $commit from the Spark mirror"
+    else
+        printf '%s\n' "$commit" | gitc -C "$source_repo" pack-objects --revs --quiet --stdout > "$tmpd/pin.pack" ||
+            die "cannot copy locked commit $commit from $source_repo"
+    fi
     gitc -C "$destination" unpack-objects -q < "$tmpd/pin.pack" ||
         die "cannot import locked commit $commit"
     gitc -C "$destination" checkout --quiet --detach "$commit" || die "cannot check out $commit"
