@@ -527,10 +527,10 @@ OMBR_ASSERT(offsetof(OscCheckedScope, count) == 3664, "layout scopetab field cou
 OMBR_ASSERT(offsetof(OscCheckedScope, depth) == 3668, "layout scopetab field depth");
 /* export fn osc_scope_reset table edit scopetab to void */
 void osc_scope_reset(OscCheckedScope *o_table);
-/* export fn osc_scope_find table view scopetab words view uchar 30720 name view uchar * to long */
-int64_t osc_scope_find(const OscCheckedScope *o_table, const uint8_t o_words[30720], const uint8_t *o_name, size_t o_name_len);
-/* export fn osc_scope_bind table edit scopetab words edit uchar 30720 id ulong name view uchar * to void */
-void osc_scope_bind(OscCheckedScope *o_table, uint8_t o_words[30720], uint64_t o_id, const uint8_t *o_name, size_t o_name_len);
+/* export fn osc_scope_find table view scopetab symbols view uchar * stride ulong name view uchar * to long */
+int64_t osc_scope_find(const OscCheckedScope *o_table, const uint8_t *o_symbols, size_t o_symbols_len, uint64_t o_stride, const uint8_t *o_name, size_t o_name_len);
+/* export fn osc_scope_bind table edit scopetab id ulong name view uchar * to void */
+void osc_scope_bind(OscCheckedScope *o_table, uint64_t o_id, const uint8_t *o_name, size_t o_name_len);
 /* export fn osc_scope_push table edit scopetab to ulong */
 uint64_t osc_scope_push(OscCheckedScope *o_table);
 /* export fn osc_scope_pop table edit scopetab to void */

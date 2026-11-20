@@ -81,7 +81,7 @@ typedef struct {
 
 _Static_assert(sizeof(((OscCheckedScope *)0)->visible) / sizeof(uint16_t) == OSC_CHECK_MAX_SYMS, "OSC scope symbol capacity");
 _Static_assert(sizeof(((OscCheckedScope *)0)->start) / sizeof(uint16_t) == OSC_AST_MAX_DEPTH * 2 + 8, "OSC scope depth");
-_Static_assert(OSC_LEX_NAME_MAX == 63, "OSC scope name width");
+_Static_assert(offsetof(Sym, name) == 0 && sizeof(((Sym *)0)->name) == OSC_LEX_NAME_MAX + 1, "OSC symbol name layout");
 
 typedef struct {
     const OscAlloc *a;    /* every heap byte of the checker (state snapshots, this struct) comes from here */
@@ -100,7 +100,6 @@ typedef struct {
     Bor bor[OSC_CHECK_MAX_BORS];
     int nbor;
     OscCheckedScope names;
-    uint8_t words[OSC_CHECK_MAX_SYMS * (OSC_LEX_NAME_MAX + 1)];
     int loop_depth;
     int term;             /* current path has returned */
     char sobj[64];        /* statement object (diagnostics) */
@@ -391,7 +390,8 @@ static int do_move(C *c, int s, int dest, uint32_t line, uint32_t col)
 /* ------------------------------------------------------------ scopes */
 static int lookup(C *c, const char *name)
 {
-    return (int)osc_scope_find(&c->names, c->words, (const uint8_t *)name, strlen(name));
+    return (int)osc_scope_find(&c->names, (const uint8_t *)c->sym, sizeof c->sym, sizeof(Sym),
+                               (const uint8_t *)name, strlen(name));
 }
 
 static int declare(C *c, const OscNode *n, uint8_t kind, const OscType *ty, int mut)
@@ -417,7 +417,7 @@ static int declare(C *c, const OscNode *n, uint8_t kind, const OscType *ty, int 
     y->loop_depth = c->loop_depth;
     y->obj = y->bor = -1;
     y->decl = (int)(n - c->ast->nodes);
-    osc_scope_bind(&c->names, c->words, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
+    osc_scope_bind(&c->names, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
     return s;
 }
 
@@ -1279,7 +1279,7 @@ static int chk_contracts(C *c, int fi)
             y->kind = SK_SCALAR;
             y->ty = c->fret;
             y->obj = y->bor = -1;
-            osc_scope_bind(&c->names, c->words, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
+            osc_scope_bind(&c->names, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
             a->res_sym[fi] = s;
         }
         c->contract = 2;
