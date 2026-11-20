@@ -171,6 +171,20 @@ const char *omega2_ident_cg_attn(void);
 uint32_t omega2_cg_attn_spec_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
 /* export fn cg_attn_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint32_t omega2_cg_attn_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+#define OMEGA2_IDENT_cg_tern "omega-ident 1 unit=cg_tern abi=2 profile=OM-2 src=9bb7d4ff42155fa52accca0459e66166a5bdf25a2734fbce202ec77efe89e4f3 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_tern(void);
+/* export fn cg_tern_spec_ok sp view ulong 8 to ulong */
+uint32_t omega2_cg_tern_spec_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
+/* export fn cg_tern_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_tern_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
+/* export fn cg_tern_sched_stalls ins edit ulong 8192 n ulong v2p view ulong 256 bsz view ulong 256 to ulong */
+uint32_t omega2_cg_tern_sched_stalls(uint64_t *result, uint64_t *o_ins, uint64_t o_ins_len, uint64_t o_n, const uint64_t *o_v2p, uint64_t o_v2p_len, const uint64_t *o_bsz, uint64_t o_bsz_len);
+#define OMEGA2_IDENT_cg_attn256 "omega-ident 1 unit=cg_attn256 abi=2 profile=OM-2 src=374306672c4e286ea74708374405a22130146186eb104315be9a141892e395be omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_cg_attn256(void);
+/* export fn cg_attn256_spec_ok sp view ulong 8 to ulong */
+uint32_t omega2_cg_attn256_spec_ok(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len);
+/* export fn cg_attn256_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint32_t omega2_cg_attn256_emit(uint64_t *result, const uint64_t *o_sp, uint64_t o_sp_len, uint64_t *o_ins, uint64_t o_ins_len, uint64_t *o_meta, uint64_t o_meta_len);
 #ifdef __cplusplus
 }
 #endif

@@ -24,6 +24,8 @@
 #include "omega_blackwell_codegen_router.h"
 #include "omega_blackwell_codegen_pattn.h"
 #include "omega_blackwell_codegen_attn.h"
+#include "omega_blackwell_codegen_tern.h"
+#include "omega_blackwell_codegen_attn256.h"
 #include "sha256.h"
 
 static int g_pass = 0, g_fail = 0;
@@ -608,6 +610,64 @@ static void dump_metrics(void) {
         CHK(omega_blackwell_codegen_decode_attn_prog(&s, &p) == 0, "attn d4");
         report_kernel("attn_d4", &p, 8);
     }
+    {
+        OmegaTernGemvSpec s = { .k = 2560, .layout = OMEGA_TERN_LAYOUT_ROWMAJOR, .rows = 1, .warps = 8, .depth = 2, .epi = OMEGA_TERN_EPI_F32, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tern_gemv_prog(&s, &p) == 0, "tern rm r1 w8 d2 f32");
+        report_kernel("tern_rm_r1_w8_d2_f32", &p, 8);
+    }
+    {
+        OmegaTernGemvSpec s = { .k = 10240, .layout = OMEGA_TERN_LAYOUT_BLOCK, .rows = 4, .warps = 8, .depth = 2, .epi = OMEGA_TERN_EPI_I32, .mutant = 0 };
+        CHK(omega_blackwell_codegen_tern_gemv_prog(&s, &p) == 0, "tern blk r4 w8 d2 2ch");
+        report_kernel("tern_blk_r4_w8_d2_2ch", &p, 8);
+    }
+    {
+        OmegaDecodeAttn256Spec s = { .depth = 2, .mutant = 0, .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 };
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&s, &p) == 0, "attn256 d2 q24");
+        report_kernel("attn256_d2_q24", &p, 8);
+    }
+    {
+        OmegaDecodeAttn256Spec s = { .depth = 2, .mutant = 0, .prep = 1, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 };
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&s, &p) == 0, "attn256 prep q24");
+        report_kernel("attn256_prep_q24", &p, 8);
+    }
+    {
+        OmegaDecodeAttn256Spec s = { .depth = 2, .mutant = 0, .prep = 0, .q_heads = 16, .kv_heads = 2, .q_per_cta = 4, .multi = 1 };
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&s, &p) == 0, "attn256 multi q16");
+        report_kernel("attn256_multi_q16", &p, 8);
+    }
+}
+
+static void test_tern_and_attn256_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_tern_gemv_prog(NULL, &prog) != 0 && prog.count == 0, "tern NULL spec");
+    OmegaTernGemvSpec tn_bad[] = {
+        { .k = 0,     .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 16640, .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 2560,  .layout = 1, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 2560,  .layout = 2, .rows = 2, .warps = 8,  .depth = 1, .epi = 0, .mutant = 0 },
+        { .k = 10240, .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 1, .mutant = 0 },
+        { .k = 2560,  .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = -1 },
+        { .k = 2560,  .layout = 0, .rows = 1, .warps = 8,  .depth = 1, .epi = 0, .mutant = 6 },
+    };
+    for (size_t i = 0; i < sizeof(tn_bad) / sizeof(tn_bad[0]); i++) {
+        prog.count = 55;
+        CHK(omega_blackwell_codegen_tern_gemv_prog(&tn_bad[i], &prog) != 0 && prog.count == 0, "tern invalid spec");
+        CHK(omega_tern_gemv_spec_ok(&tn_bad[i]) == 0, "tern_spec_ok 0");
+    }
+    CHK(omega_blackwell_codegen_decode_attn256_prog(NULL, &prog) != 0 && prog.count == 0, "attn256 NULL spec");
+    OmegaDecodeAttn256Spec a2_bad[] = {
+        { .depth = 0, .mutant = 0,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 5, .mutant = 0,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = -1, .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = 6,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = 0,  .prep = 2, .q_heads = 24, .kv_heads = 4, .q_per_cta = 6, .multi = 0 },
+        { .depth = 2, .mutant = 0,  .prep = 0, .q_heads = 24, .kv_heads = 4, .q_per_cta = 7, .multi = 0 },
+        { .depth = 2, .mutant = 0,  .prep = 0, .q_heads = 18, .kv_heads = 3, .q_per_cta = 6, .multi = 1 },
+    };
+    for (size_t i = 0; i < sizeof(a2_bad) / sizeof(a2_bad[0]); i++) {
+        prog.count = 56;
+        CHK(omega_blackwell_codegen_decode_attn256_prog(&a2_bad[i], &prog) != 0 && prog.count == 0, "attn256 invalid spec");
+    }
 }
 
 static void test_pattn_and_attn_error_paths(void) {
@@ -680,6 +740,7 @@ int main(void) {
     test_qg_and_tc_error_paths();
     test_pattn256_and_router_error_paths();
     test_pattn_and_attn_error_paths();
+    test_tern_and_attn256_error_paths();
     test_max_size_legal_inputs();
     dump_metrics();
     printf("test_bw_om_codegen_bounds: %d passed, %d failed: %s\n", g_pass, g_fail, g_fail ? "FAIL" : "PASS");

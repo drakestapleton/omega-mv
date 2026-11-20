@@ -136,6 +136,16 @@ uint64_t cg_pattn_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t o_
 uint64_t cg_attn_spec_ok(const uint64_t o_sp[4]);
 /* export fn cg_attn_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_attn_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_tern_spec_ok sp view ulong 8 to ulong */
+uint64_t cg_tern_spec_ok(const uint64_t o_sp[8]);
+/* export fn cg_tern_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_tern_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_tern_sched_stalls ins edit ulong 8192 n ulong v2p view ulong 256 bsz view ulong 256 to ulong */
+uint64_t cg_tern_sched_stalls(uint64_t o_ins[8192], uint64_t o_n, const uint64_t o_v2p[256], const uint64_t o_bsz[256]);
+/* export fn cg_attn256_spec_ok sp view ulong 8 to ulong */
+uint64_t cg_attn256_spec_ok(const uint64_t o_sp[8]);
+/* export fn cg_attn256_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_attn256_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
 #ifdef __cplusplus
 }
 #endif
