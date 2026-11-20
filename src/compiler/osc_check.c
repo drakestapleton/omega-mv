@@ -120,62 +120,54 @@ typedef struct {
 #define NODE(i) (&c->ast->nodes[(i)])
 
 /* ------------------------------------------------------------ trace */
-static void tr_push(C *c, uint8_t op, const OscModelEvent *ev, uint32_t line, int refused)
-{
-    OscTrace *t = c->tr;
-    if (!t) return;
-    if (t->n >= OSC_TRACE_MAX) { t->overflow = 1; return; }
-    OscTraceEntry *e = &t->e[t->n++];
-    memset(e, 0, sizeof *e);
-    e->op = op;
-    e->refused = (uint8_t)refused;
-    e->func = (uint16_t)c->fi;
-    e->line = line;
-    if (ev) {
-        e->ev = *ev;
-        if (ev->obj > OSC_MODEL_MAX_OBJECTS || ev->obj2 > OSC_MODEL_MAX_OBJECTS ||
-            ev->borrow > OSC_MODEL_MAX_BORROWS || ev->via > OSC_MODEL_MAX_BORROWS ||
-            ev->region > OSC_MODEL_MAX_REGIONS || ev->slot > OSC_MODEL_MAX_SLOTS ||
-            ev->handle > OSC_MODEL_MAX_HANDLES)
-            t->overflow = 1;
-    }
-    if (refused) t->refused = 1;
-}
+/* The model trace is a public, replayable byte layout. The Omega writer
+ * accepts absent checker IDs as -1 and performs model ID conversion. */
+_Static_assert(offsetof(OscTrace, n) == 0 && offsetof(OscTrace, overflow) == 4 &&
+               offsetof(OscTrace, refused) == 5 && offsetof(OscTrace, e) == 8 &&
+               sizeof(OscTrace) == 8 + 16384 * 88 && OSC_TRACE_MAX == 16384, "OSC trace header");
+_Static_assert(sizeof(OscTraceEntry) == 88 && offsetof(OscTraceEntry, op) == 0 &&
+               offsetof(OscTraceEntry, refused) == 1 && offsetof(OscTraceEntry, func) == 2 &&
+               offsetof(OscTraceEntry, line) == 4 && offsetof(OscTraceEntry, ev) == 8, "OSC trace entry");
+_Static_assert(offsetof(OscModelEvent, kind) == 0 && offsetof(OscModelEvent, obj) == 4 &&
+               offsetof(OscModelEvent, obj2) == 8 && offsetof(OscModelEvent, borrow) == 12 &&
+               offsetof(OscModelEvent, via) == 16 && offsetof(OscModelEvent, region) == 20 &&
+               offsetof(OscModelEvent, slot) == 24 && offsetof(OscModelEvent, handle) == 28 &&
+               offsetof(OscModelEvent, rights) == 72, "OSC model event fields");
+_Static_assert(OSC_MODEL_MAX_OBJECTS == 64 && OSC_MODEL_MAX_BORROWS == 64 && OSC_MODEL_MAX_REGIONS == 16 &&
+               OSC_MODEL_MAX_SLOTS == 16 && OSC_MODEL_MAX_HANDLES == 64, "OSC model trace capacities");
+
 static void tr_ev(C *c, uint32_t kind, int obj, int obj2, int borrow, int via, uint32_t line, int refused)
 {
-    OscModelEvent ev;
-    memset(&ev, 0, sizeof ev);
-    ev.kind = kind;
-    ev.obj = obj >= 0 ? (uint32_t)obj + 1 : 0;
-    ev.obj2 = obj2 >= 0 ? (uint32_t)obj2 + 1 : 0;
-    ev.borrow = borrow >= 0 ? (uint32_t)borrow + 1 : 0;
-    ev.via = via >= 0 ? (uint32_t)via + 1 : 0;
-    tr_push(c, OSC_TR_EVENT, &ev, line, refused);
+    if (!c->tr) return;
+    OscTraceInput event = {.op = OSC_TR_EVENT, .refused = (uint8_t)refused, .func = (uint16_t)c->fi, .line = line,
+                           .kind = kind, .obj = obj, .obj2 = obj2, .borrow = borrow, .via = via};
+    osc_trace_record((uint8_t *)c->tr, sizeof *c->tr, &event);
 }
-/* OSC-2 arenas: REGION_OPEN / REGION_DESTROY of region, ALLOC of obj in region */
+
 static void tr_region(C *c, uint32_t kind, int obj, uint32_t region, uint32_t line, int refused)
 {
-    OscModelEvent ev;
-    memset(&ev, 0, sizeof ev);
-    ev.kind = kind;
-    ev.obj = obj >= 0 ? (uint32_t)obj + 1 : 0;
-    ev.region = region;
-    tr_push(c, OSC_TR_EVENT, &ev, line, refused);
+    if (!c->tr) return;
+    OscTraceInput event = {.op = OSC_TR_EVENT, .refused = (uint8_t)refused, .func = (uint16_t)c->fi, .line = line,
+                           .kind = kind, .obj = obj, .obj2 = -1, .borrow = -1, .via = -1, .region = region};
+    osc_trace_record((uint8_t *)c->tr, sizeof *c->tr, &event);
 }
-/* OSC-3 item 2: SLOT_ALLOC (slot, handle, rights) / SLOT_FREE (handle) /
- * HANDLE_USE (handle, rights) */
+
 static void tr_slot(C *c, uint32_t kind, uint32_t slot, uint32_t handle, uint64_t rights, uint32_t line, int refused)
 {
-    OscModelEvent ev;
-    memset(&ev, 0, sizeof ev);
-    ev.kind = kind;
-    ev.slot = slot;
-    ev.handle = handle;
-    ev.rights = rights;
-    tr_push(c, OSC_TR_EVENT, &ev, line, refused);
+    if (!c->tr) return;
+    OscTraceInput event = {.op = OSC_TR_EVENT, .refused = (uint8_t)refused, .func = (uint16_t)c->fi, .line = line,
+                           .kind = kind, .obj = -1, .obj2 = -1, .borrow = -1, .via = -1,
+                           .slot = slot, .handle = handle, .rights = rights};
+    osc_trace_record((uint8_t *)c->tr, sizeof *c->tr, &event);
 }
-static void tr_save(C *c, uint32_t line) { tr_push(c, OSC_TR_SAVE, NULL, line, 0); }
-static void tr_restore(C *c, uint32_t line) { tr_push(c, OSC_TR_RESTORE, NULL, line, 0); }
+
+static void tr_control(C *c, OscTraceOp op, uint32_t line)
+{
+    if (!c->tr) return;
+    OscTraceInput event = {.op = (uint8_t)op, .func = (uint16_t)c->fi, .line = line,
+                           .obj = -1, .obj2 = -1, .borrow = -1, .via = -1};
+    osc_trace_record((uint8_t *)c->tr, sizeof *c->tr, &event);
+}
 
 /* ------------------------------------------------------------ diag helpers */
 static int cap_fail(C *c, uint32_t line, const char *what)
@@ -1490,23 +1482,23 @@ static int chk_if(C *c, int i)
     Snap *s1 = NULL;
     HSave *h0 = hs_take(c), *h1 = NULL; /* OSC-3 item 2 */
     if (!h0) { cap_fail(c, n->line, "checker memory"); goto out; }
-    tr_save(c, n->line);
+    tr_control(c, OSC_TR_SAVE, n->line);
     if (chk_block(c, n->b, 1)) goto out;
     int t1 = c->term;
     s1 = snap_take(c);
     h1 = hs_take(c);
     if (!s1 || !h1) { cap_fail(c, n->line, "checker memory"); goto out; }
-    tr_restore(c, n->line);
+    tr_control(c, OSC_TR_RESTORE, n->line);
     snap_restore(c, s0);
     hs_restore(c, h0);
     c->term = 0;
     int t2 = 0;
     if (n->c >= 0) {
-        tr_save(c, n->line);
+        tr_control(c, OSC_TR_SAVE, n->line);
         if (NODE(n->c)->kind == ON_IF) { if (chk_if(c, n->c)) goto out; }
         else if (chk_block(c, n->c, 1)) goto out;
         t2 = c->term;
-        tr_restore(c, n->line);
+        tr_control(c, OSC_TR_RESTORE, n->line);
     }
     /* state after else is in c; after then is s1 */
     if (t1 && t2) {
@@ -1558,7 +1550,7 @@ static int chk_loop_body(C *c, OscNode *n, int is_for)
     HSave *h0 = hs_take(c); /* OSC-3 item 2 */
     if (!h0) { snap_free(c, s0); return cap_fail(c, n->line, "checker memory"); }
     int rc = -1;
-    tr_save(c, n->line);
+    tr_control(c, OSC_TR_SAVE, n->line);
     c->loop_depth++;
     if (is_for) {
         if (push_scope(c, n->line)) goto out;
@@ -1574,7 +1566,7 @@ static int chk_loop_body(C *c, OscNode *n, int is_for)
         if (chk_block(c, n->b, 1)) goto out;
     }
     c->loop_depth--;
-    tr_restore(c, n->line);
+    tr_control(c, OSC_TR_RESTORE, n->line);
     snap_restore(c, s0);
     /* A loop can run zero times. Restore the definite frees from before
      * entry, then settle handle assignments against the body that ran. */

@@ -691,6 +691,37 @@ void osc_pool_init(OscCheckedPool *o_p, uint64_t o_cap, uint64_t o_base, int64_t
 uint64_t osc_pool_alloc(OscCheckedPool *o_p, int64_t o_loop_depth, int64_t o_cond_depth);
 /* export fn osc_pool_free p edit poolstat loop_depth long cond_depth long to void */
 void osc_pool_free(OscCheckedPool *o_p, int64_t o_loop_depth, int64_t o_cond_depth);
+typedef struct {
+    uint8_t op;
+    uint8_t refused;
+    uint16_t func;
+    uint32_t line;
+    uint32_t kind;
+    int32_t obj;
+    int32_t obj2;
+    int32_t borrow;
+    int32_t via;
+    uint32_t region;
+    uint32_t slot;
+    uint32_t handle;
+    uint64_t rights;
+} OscTraceInput;
+OMBR_ASSERT(sizeof(OscTraceInput) == 48, "layout trinput size");
+OMBR_ASSERT(offsetof(OscTraceInput, op) == 0, "layout trinput field op");
+OMBR_ASSERT(offsetof(OscTraceInput, refused) == 1, "layout trinput field refused");
+OMBR_ASSERT(offsetof(OscTraceInput, func) == 2, "layout trinput field func");
+OMBR_ASSERT(offsetof(OscTraceInput, line) == 4, "layout trinput field line");
+OMBR_ASSERT(offsetof(OscTraceInput, kind) == 8, "layout trinput field kind");
+OMBR_ASSERT(offsetof(OscTraceInput, obj) == 12, "layout trinput field obj");
+OMBR_ASSERT(offsetof(OscTraceInput, obj2) == 16, "layout trinput field obj2");
+OMBR_ASSERT(offsetof(OscTraceInput, borrow) == 20, "layout trinput field borrow");
+OMBR_ASSERT(offsetof(OscTraceInput, via) == 24, "layout trinput field via");
+OMBR_ASSERT(offsetof(OscTraceInput, region) == 28, "layout trinput field region");
+OMBR_ASSERT(offsetof(OscTraceInput, slot) == 32, "layout trinput field slot");
+OMBR_ASSERT(offsetof(OscTraceInput, handle) == 36, "layout trinput field handle");
+OMBR_ASSERT(offsetof(OscTraceInput, rights) == 40, "layout trinput field rights");
+/* export fn osc_trace_record trace edit uchar * event view trinput to void */
+void osc_trace_record(uint8_t *o_trace, size_t o_trace_len, const OscTraceInput *o_event);
 #ifdef __cplusplus
 }
 #endif

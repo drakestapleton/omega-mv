@@ -371,3 +371,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Converted the OSC constant-expression walk, integer folding and contract expression evaluation to seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Migrated scalar operator type inference, operand contexts and checked refusal ordering into seeded Omega. |
 | Codex (under Drake Stapleton's direction) | Moved OSC AArch64 instruction round-trip verification into the seeded encoder and combined field validation with packing. Reduced checker initialization and literal-classification work. |
+| Codex (under Drake Stapleton's direction) | Converted OSC ownership, arena, handle and branch trace serialization, model ID limits and overflow tracking to seeded Omega. |
