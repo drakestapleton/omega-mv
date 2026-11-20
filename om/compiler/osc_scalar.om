@@ -41,6 +41,35 @@ const node_known ulong 75
 const node_value ulong 80
 const node_symbol ulong 88
 
+note The checker calls back into its general expression checker for each
+note operand. The frame preserves the exact evaluation order and type context.
+note bridge c-type infer OscInference
+note bridge c-define OSC_INFER_DONE 0
+note bridge c-define OSC_INFER_CHECK 1
+note bridge c-define OSC_INFER_CAST_LITERAL 2
+note bridge c-define OSC_INFER_COMPARE_LITERALS 3
+note bridge c-define OSC_INFER_COMPARE_BOOL 4
+note bridge c-define OSC_INFER_ARITH_BOOL 5
+note bridge c-define OSC_INFER_UNARY_TYPE 6
+note bridge c-define OSC_INFER_CAST_TYPE 7
+note bridge c-define OSC_INFER_SHIFT_TYPE 8
+note bridge c-define OSC_INFER_AMOUNT_TYPE 9
+note bridge c-define OSC_INFER_SHIFT_RANGE 10
+note bridge c-define OSC_INFER_ARITH_TYPE 11
+note bridge c-define OSC_INFER_ZERO_DIVISOR 12
+
+layout infer 72
+field root ulong at 0 little
+field want ulong at 8 little
+field phase ulong at 16 little
+field first ulong at 24 little
+field second ulong at 32 little
+field literal2 ulong at 40 little
+field optype ulong at 48 little
+field site ulong at 56 little
+field context ulong at 64 little
+end
+
 fn alu_signed t ulong to bool
 ret and ge t T_I8 le t T_I64
 end
@@ -645,4 +674,158 @@ export fn osc_fold_tree nodes edit uchar * typ ulong stack edit ulong * report e
   end
   put report 0 ast_read nodes add mul id ast_stride node_value 8
   ret 0
+end
+
+fn infer_integer t ulong to bool
+  ret and ge t T_U8 le t T_I64
+end
+
+fn infer_begin nodes view uchar * stack edit ulong * frame edit infer to ulong
+  base = mul get frame root ast_stride
+  op = ast_read nodes add base 2 2
+  kind = ast_read nodes base 2
+  a = ast_read nodes add base 12 4
+  b = ast_read nodes add base 16 4
+  put frame first a
+  put frame second b
+  put frame context 0
+  if or eq op 51 or eq op 52 eq op 53
+    put frame context T_BOOL
+  else
+    left_literal = osc_constant_tree nodes a 0 stack
+    if eq kind node_cast
+      if ne left_literal 0
+        put frame site a
+        ret 2
+      end
+    else
+      if eq kind node_un
+        if ne left_literal 0
+          put frame context get frame want
+        end
+      else
+        right_literal = osc_constant_tree nodes b 0 stack
+        if or eq op TOK_SHL eq op TOK_SHR
+          if ne left_literal 0
+            put frame context get frame want
+          end
+        else
+          if ne left_literal 0
+            if ne right_literal 0
+              if ne osc_compare_opcode op 0
+                put frame site get frame root
+                ret 3
+              end
+              put frame context get frame want
+            else
+              put frame first b
+              put frame second a
+              right_literal = 1
+            end
+          end
+        end
+        put frame literal2 right_literal
+      end
+    end
+  end
+  put frame site get frame first
+  put frame phase 1
+  ret 1
+end
+
+fn infer_after_first nodes view uchar * frame edit infer t ulong to ulong
+  base = mul get frame root ast_stride
+  kind = ast_read nodes base 2
+  op = ast_read nodes add base 2 2
+  put frame optype t
+  put frame site get frame root
+  if eq kind node_un
+    if and ne op 51 not infer_integer t
+      ret 6
+    end
+    put frame context t
+    ret 0
+  end
+  if eq kind node_cast
+    target = ast_read nodes add base node_type 4
+    if not and infer_integer t infer_integer target
+      ret 7
+    end
+    put frame context target
+    ret 0
+  end
+  context = t
+  if or eq op TOK_SHL eq op TOK_SHR
+    if not infer_integer t
+      ret 8
+    end
+    if eq get frame literal2 0
+      context = 0
+    end
+  else
+    if ne osc_compare_opcode op 0
+      if and eq t T_BOOL ne get frame literal2 0
+        put frame site get frame second
+        ret 4
+      end
+    else
+      if and eq t T_BOOL not or eq op 52 eq op 53
+        put frame site get frame first
+        ret 5
+      end
+    end
+  end
+  put frame site get frame second
+  put frame context context
+  put frame phase 2
+  ret 1
+end
+
+fn infer_after_second nodes edit uchar * frame edit infer second_type ulong to ulong
+  base = mul get frame root ast_stride
+  op = ast_read nodes add base 2 2
+  t = get frame optype
+  put frame context t
+  if or eq op 52 eq op 53
+    ret 0
+  end
+  if ne osc_compare_opcode op 0
+    put nodes add base node_flag uchar t
+    put frame context T_BOOL
+    ret 0
+  end
+  right = ast_read nodes add base 16 4
+  rb = mul right ast_stride
+  if or eq op TOK_SHL eq op TOK_SHR
+    if not infer_integer second_type
+      put frame optype second_type
+      ret 9
+    end
+    if and ne get nodes add rb node_known 0 ge ast_read nodes add rb node_value 8 osc_alu_width t
+      ret 10
+    end
+  else
+    if not infer_integer t
+      put frame site get frame root
+      ret 11
+    end
+    if or eq op 45 eq op 46
+      if and ne get nodes add rb node_known 0 eq ast_read nodes add rb node_value 8 0
+        put frame site right
+        ret 12
+      end
+    end
+  end
+  ret 0
+end
+
+export fn osc_infer_step nodes edit uchar * stack edit ulong * frame edit infer checked ulong to ulong
+  phase = get frame phase
+  if eq phase 0
+    ret infer_begin nodes stack frame
+  end
+  if eq phase 1
+    ret infer_after_first nodes frame checked
+  end
+  ret infer_after_second nodes frame checked
 end
