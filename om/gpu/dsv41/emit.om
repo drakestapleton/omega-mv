@@ -1,0 +1,1159 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Compose after om/encoder/bw_enc_sm121.om. The public encoder receives physical operands.
+note R0..R13 pointer pairs, R14 lane, R15 CTA.x, R18 CTA.y, R19 CTA.z, R16:R17 address.
+const Z ulong 255
+global dsPc ulong 1
+global dsGuard ulong 1
+fn dsCtrl op ulong to ulong
+note Conservative issue schedule: wait on both barriers, long fixed stalls, no dual issue.
+wb = ulong 7
+rbar = ulong 7
+if or or and ge op 3 le op 7 and ge op 38 le op 42 or eq op 47 eq op 59
+wb = ulong 0
+end
+if or eq op 11 eq op 19
+wb = ulong 0
+rbar = ulong 1
+end
+if eq op 12
+rbar = ulong 1
+end
+stall = ulong 6
+if or ne wb 7 ne rbar 7
+stall = ulong 4
+end
+if or eq op 28 eq op 34
+stall = ulong 14
+end
+ret or 0x300000 or shl stall 9 or shl wb 14 shl rbar 17
+end
+fn inst op ulong dst ulong a ulong b ulong c ulong imm ulong to void
+o = new ulong 16 0
+w = new ulong 4 0
+native = op
+if or eq op 65 eq op 66
+native = ulong 61
+end
+if or eq op 67 eq op 68
+native = ulong 12
+end
+if or eq op 69 eq op 70
+native = ulong 40
+end
+put o 0 native
+put o 1 dst
+put o 2 a
+put o 3 b
+put o 4 c
+put o 5 4
+put o 6 and imm 0xffffffff
+put o 7 dsCtrl native
+if ne get dsGuard 0 0
+put o 9 1
+end
+if eq get dsGuard 0 2
+put o 10 1
+end
+put dsGuard 0 0
+if ne a Z
+put o 12 1
+end
+if ne b Z
+put o 13 1
+end
+if ne enc1 o w 0
+exit 3
+end
+note F2FP.SATFINITE PACK_AB_MERGE_C and narrow STG encodings, SM121.
+if eq op 65
+put w 2 0x048070ff
+end
+if eq op 66
+put w 2 0x042070ff
+end
+if eq op 67
+put w 2 sub get w 2 0x800
+end
+if eq op 68
+put w 2 sub get w 2 0x400
+end
+if eq op 69
+put w 2 0xc00
+end
+if eq op 70
+put w 2 0x2000
+end
+dsWrite w
+put dsPc 0 add get dsPc 0 1
+end
+fn literal d ulong x ulong to void
+inst 2 d Z Z Z x
+end
+fn number d ulong x f32 to void
+literal d ulong bitcast uint x
+end
+fn mad d ulong a ulong scale ulong c ulong to void
+inst 8 d a Z c scale
+end
+fn madreg d ulong a ulong b ulong c ulong to void
+inst 8 d a b c 0
+end
+fn iadd d ulong a ulong b ulong to void
+inst 14 d a b Z 0
+end
+fn fop op ulong d ulong a ulong b ulong to void
+inst op d a b Z 0
+end
+fn fmaReg d ulong a ulong b ulong c ulong to void
+inst 33 d a b c 0
+end
+fn parameter d ulong offset ulong to void
+inst 4 d Z Z Z add 896 offset
+end
+fn dsStart pointers ulong to void
+inst 7 4 Z Z Z 856
+for i ulong pointers
+inst 5 mul i 2 Z Z Z add 896 mul i 8
+end
+inst 3 14 Z Z Z 33
+inst 3 15 Z Z Z 37
+inst 3 18 Z Z Z 38
+inst 3 19 Z Z Z 39
+end
+fn readAt d ulong base ulong idx ulong offset ulong to void
+inst 9 16 idx Z base 4
+inst 11 d 16 Z Z offset
+end
+fn writeAt d ulong base ulong idx ulong offset ulong to void
+inst 9 16 idx Z base 4
+inst 12 Z 16 d Z offset
+end
+fn nextLoop counter ulong limit ulong mark ulong one ulong to void
+iadd counter counter one
+inst 28 Z counter limit Z 0
+put dsGuard 0 2
+inst 46 Z Z Z Z sub mark get dsPc 0
+end
+fn expReg d ulong a ulong logtwo ulong to void
+fop 32 d a logtwo
+fop 47 d d Z
+end
+fn sigmoid d ulong a ulong neglog ulong one ulong to void
+expReg d a neglog
+fop 30 d d one
+fop 40 d d Z
+end
+fn done to void
+inst 45 Z Z Z Z 0
+while or lt get dsPc 0 32 ne rem get dsPc 0 8 0
+inst 0 Z Z Z Z 0
+end
+end
+
+note Four-stream pre mix. CTA.y is the token; x covers the 5120 components with 128 threads per CTA.
+fn hcPre to void
+dsStart 3
+mad 20 15 128 14
+mad 21 18 20480 20
+mad 22 18 4 Z
+number 23 0.0f32
+for stream ulong 4
+readAt 24 0 21 mul stream 20480
+readAt 25 2 22 mul stream 4
+fop 32 24 24 25
+fop 30 23 23 24
+end
+mad 21 18 5120 20
+writeAt 23 4 21 0
+end
+
+
+note post[j] * sublayer + sum_i residual[i] * comb[i,j]. Each thread writes all four streams.
+fn hcPost to void
+dsStart 5
+mad 20 15 128 14
+mad 21 18 20480 20
+mad 22 18 5120 20
+mad 23 18 4 Z
+mad 24 18 16 Z
+readAt 25 0 22 0
+for i ulong 4
+readAt add i 26 2 21 mul i 20480
+end
+for j ulong 4
+readAt 30 4 23 mul j 4
+fop 32 31 25 30
+for i ulong 4
+readAt 30 6 24 mul add mul i 4 j 4
+fmaReg 31 add i 26 30 31
+end
+writeAt 31 8 21 mul j 20480
+end
+end
+
+note One thread per token; registers 32..47 are the 4x4 transport matrix.
+fn normalize columns bool epsilon bool to void
+for i ulong 4
+number 30 0.0f32
+for j ulong 4
+reg = add 32 add mul i 4 j
+if columns
+reg = add 32 add mul j 4 i
+end
+fop 30 30 30 reg
+end
+if epsilon
+fop 30 30 30 28
+end
+fop 40 30 30 Z
+for j ulong 4
+reg = add 32 add mul i 4 j
+if columns
+reg = add 32 add mul j 4 i
+end
+fop 32 reg reg 30
+if not epsilon
+fop 30 reg reg 28
+end
+end
+end
+end
+fn sinkhorn to void
+dsStart 6
+mad 20 15 24 Z
+mad 21 15 4 Z
+mad 22 15 16 Z
+literal 23 0
+for i ulong 3
+readAt add 24 i 2 23 mul i 4
+end
+number 27 -1.4426950408889634f32
+number 28 0.000001f32
+number 29 1.0f32
+for i ulong 24
+readAt 30 0 20 mul i 4
+readAt 31 4 23 mul i 4
+if lt i 8
+fmaReg 30 30 add 24 div i 4 31
+sigmoid 30 30 27 29
+if lt i 4
+fop 30 30 30 28
+writeAt 30 6 21 mul i 4
+else
+fop 30 30 30 30
+writeAt 30 8 21 mul sub i 4 4
+end
+else
+fmaReg add 32 sub i 8 30 26 31
+end
+end
+number 27 1.4426950408889634f32
+for i ulong 4
+base = add 32 mul i 4
+fop 37 31 base add base 1
+fop 37 31 31 add base 2
+fop 37 31 31 add base 3
+for j ulong 4
+r = add base j
+fop 31 r r 31
+expReg r r 27
+end
+end
+normalize false false
+normalize true true
+literal 48 0
+literal 49 19
+literal 50 1
+mark = get dsPc 0
+normalize false true
+normalize true true
+nextLoop 48 49 mark 50
+for i ulong 16
+writeAt add 32 i 10 22 mul i 4
+end
+end
+fn swiglu to void
+dsStart 4
+mad 20 15 128 14
+mad 21 18 2304 20
+readAt 22 0 21 0
+readAt 23 2 21 0
+readAt 24 4 18 0
+number 25 10.0f32
+number 26 -10.0f32
+fop 36 22 22 25
+fop 36 23 23 25
+fop 37 23 23 26
+number 27 -1.4426950408889634f32
+number 28 1.0f32
+sigmoid 29 22 27 28
+fop 32 29 29 22
+fop 32 29 29 23
+fop 32 29 29 24
+writeAt 29 6 21 0
+end
+
+note Read a packed uint8 with an aligned 32-bit load. Source has padding to the next word.
+fn byteRead d ulong base ulong idx ulong to void
+inst 17 52 idx Z Z 2
+readAt 53 base 52 0
+inst 18 52 idx Z Z 3
+literal 54 3
+fop 29 52 52 54
+mad 52 52 8 Z
+inst 52 53 53 52 Z 0
+inst 17 d 53 Z Z 24
+end
+fn e8Scale d ulong base ulong idx ulong to void
+byteRead d base idx
+mad 55 d 1 Z
+literal 54 23
+inst 52 d d 54 Z 0
+literal 54 1
+inst 28 Z d 54 Z 0
+put dsGuard 0 2
+literal d 0x00400000
+literal 54 255
+inst 28 Z 55 54 Z 0
+put dsGuard 0 1
+literal d 0x7fc00000
+end
+
+note Pointers A[E4M3], W[E4M3 or packed E2M1], A_scale[E8M0], W_scale[E8M0], LUT[f32], C[f32].
+note Params K and N. LUT has 256 E4M3 then 16 E2M1 values. CTA.y = m. K divisible by 32.
+fn gemm fp4 bool to void
+dsStart 6
+parameter 21 48
+parameter 22 52
+mad 20 15 128 14
+inst 28 Z 20 22 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+inst 17 23 21 Z Z 5
+madreg 24 18 23 Z
+madreg 25 20 23 Z
+if fp4
+mad 26 25 4 Z
+mad 27 25 1 Z
+else
+mad 26 25 8 Z
+inst 17 27 20 Z Z 5
+madreg 27 27 23 Z
+end
+mad 28 24 8 Z
+literal 29 0
+literal 30 1
+number 31 0.0f32
+mark = get dsPc 0
+number 32 0.0f32
+for k ulong 32
+if eq rem k 4 0
+readAt 33 0 28 mul div k 4 4
+end
+pack = ulong 4
+width = ulong 8
+mask = ulong 255
+if fp4
+pack = ulong 8
+width = ulong 4
+mask = ulong 15
+end
+if eq rem k pack 0
+readAt 34 2 26 mul div k pack 4
+end
+inst 17 35 33 Z Z mul rem k 4 8
+inst 18 35 35 Z Z 255
+readAt 35 8 35 0
+inst 17 36 34 Z Z mul rem k pack width
+inst 18 36 36 Z Z mask
+if fp4
+readAt 36 8 36 1024
+else
+readAt 36 8 36 0
+end
+fmaReg 32 35 36 32
+end
+iadd 37 24 29
+e8Scale 38 4 37
+iadd 37 27 29
+e8Scale 39 6 37
+fop 32 32 32 38
+fmaReg 31 32 39 31
+literal 40 8
+iadd 28 28 40
+if fp4
+literal 40 4
+end
+iadd 26 26 40
+nextLoop 29 23 mark 30
+madreg 41 18 22 20
+writeAt 31 10 41 0
+end
+
+note Split latent attention: one CTA.x per selected entry, CTA.y per query head,
+note CTA.z per batch row. Q [B,H,512], KV [B,T,512], indices [B,S]. BF16 inputs widened to F32.
+note Input indices can use -1. A masked score is -infinity. Each CTA has one thread in the baseline.
+fn sparseScore to void
+dsStart 4
+parameter 21 32
+parameter 22 36
+parameter 23 40
+madreg 24 19 23 15
+readAt 25 4 24 0
+madreg 26 19 21 18
+madreg 27 26 23 15
+inst 28 Z 25 22 Z 0
+literal 28 0xff800000
+inst 9 16 27 Z 6 4
+put dsGuard 0 1
+inst 12 Z 16 28 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+mad 29 26 512 Z
+madreg 30 19 22 25
+mad 30 30 512 Z
+number 31 0.0f32
+literal 32 0
+literal 33 32
+literal 34 1
+literal 37 16
+mark = get dsPc 0
+for j ulong 16
+readAt 35 0 29 mul j 4
+readAt 36 2 30 mul j 4
+fmaReg 31 35 36 31
+end
+iadd 29 29 37
+iadd 30 30 37
+nextLoop 32 33 mark 34
+number 38 0.04419417382415922f32
+fop 32 31 31 38
+writeAt 31 6 27 0
+end
+
+note Sparse reduce: CTA.x = 128-component tile, CTA.y head, CTA.z row; full-width result.
+note Rescale numerator and denominator every 64 entries and incorporate the sink after the final tile.
+fn sparseMix to void
+dsStart 5
+parameter 21 40
+parameter 22 44
+parameter 23 48
+mad 20 15 128 14
+madreg 24 19 21 18
+madreg 25 24 23 Z
+madreg 26 19 23 Z
+number 27 -1e30f32
+literal 29 1
+number 32 1.4426950408889634f32
+number 33 0.0f32
+number 34 0.0f32
+literal 40 0
+literal 41 64
+tile = get dsPc 0
+iadd 42 40 41
+inst 28 Z 42 23 Z 0
+put dsGuard 0 1
+mad 42 23 1 Z
+mad 43 27 1 Z
+mad 28 40 1 Z
+mark = get dsPc 0
+iadd 30 25 28
+readAt 31 0 30 0
+fop 37 27 27 31
+nextLoop 28 42 mark 29
+fop 31 43 43 27
+expReg 43 43 32
+fop 32 33 33 43
+fop 32 34 34 43
+mad 28 40 1 Z
+mark = get dsPc 0
+iadd 30 25 28
+readAt 31 0 30 0
+fop 31 31 31 27
+expReg 31 31 32
+fop 30 33 33 31
+iadd 30 26 28
+readAt 35 4 30 0
+inst 28 Z 35 22 Z 0
+put dsGuard 0 1
+literal 35 0
+madreg 36 19 22 35
+mad 36 36 512 20
+readAt 37 2 36 0
+inst 61 31 Z 31 Z 0
+inst 18 31 31 Z Z 0xffff
+mad 31 31 65536 Z
+fmaReg 34 31 37 34
+nextLoop 28 42 mark 29
+nextLoop 40 23 tile 41
+readAt 31 6 18 0
+fop 31 31 31 27
+expReg 31 31 32
+fop 30 33 33 31
+fop 40 33 33 Z
+fop 32 34 34 33
+mad 36 24 512 20
+writeAt 34 8 36 0
+end
+note Each CTA owns one group. One thread encodes a pair, so no packed-byte RMW or shared atomics.
+note x is widened BF16, lookup is the GEMM decode table. Outputs packed data, u8 scales, widened BF16 reconstructions.
+fn quant fp4 bool kv bool to void
+dsStart 5
+group = ulong 32
+if kv
+group = ulong 16
+end
+mad 20 15 group Z
+number 21 0.0001f32
+number 24 0.002232142857142857f32
+if fp4
+literal 21 0x01c00000
+number 24 0.16666666666666667f32
+end
+if kv
+number 21 0.01171875f32
+end
+for j ulong group
+readAt 22 0 20 mul j 4
+inst 18 22 22 Z Z 0x7fffffff
+fop 37 21 21 22
+end
+fop 32 21 21 24
+if kv
+inst 65 23 Z 21 Z 0
+inst 18 23 23 Z Z 255
+readAt 25 2 23 0
+else
+inst 17 23 21 Z Z 23
+inst 18 22 21 Z Z 0x7fffff
+literal 26 1
+inst 28 Z 22 26 Z 0
+put dsGuard 0 1
+iadd 23 23 26
+mad 25 23 8388608 Z
+end
+literal 26 1
+inst 28 Z 14 26 Z 0
+inst 9 16 15 Z 6 1
+put dsGuard 0 2
+inst 67 Z 16 23 Z 0
+mad 26 14 2 20
+readAt 27 0 26 0
+readAt 28 0 26 4
+fop 40 29 25 Z
+fop 32 30 27 29
+fop 32 31 28 29
+if kv
+note Residual correction for non-power-of-two scales before native round-to-nearest.
+number 32 -1.0f32
+fop 32 32 32 25
+fmaReg 33 30 32 27
+fmaReg 30 33 29 30
+fmaReg 33 31 32 28
+fmaReg 31 33 29 31
+note Restore signed zero after the FMA correction.
+inst 18 30 30 Z Z 0x7fffffff
+inst 18 31 31 Z Z 0x7fffffff
+inst 18 33 27 Z Z 0x80000000
+iadd 30 30 33
+inst 18 33 28 Z Z 0x80000000
+iadd 31 31 33
+end
+if fp4
+inst 66 32 31 30 Z 0
+inst 17 33 26 Z Z 1
+inst 9 16 33 Z 4 1
+inst 67 Z 16 32 Z 0
+inst 18 34 32 Z Z 15
+inst 17 35 32 Z Z 4
+inst 18 35 35 Z Z 15
+readAt 34 2 34 1024
+readAt 35 2 35 1024
+else
+inst 65 32 31 30 Z 0
+inst 9 16 26 Z 4 1
+inst 68 Z 16 32 Z 0
+inst 18 34 32 Z Z 255
+inst 17 35 32 Z Z 8
+inst 18 35 35 Z Z 255
+readAt 34 2 34 0
+readAt 35 2 35 0
+end
+fop 32 34 34 25
+fop 32 35 35 25
+inst 61 34 35 34 Z 0
+inst 18 35 34 Z Z 0xffff0000
+mad 34 34 65536 Z
+writeAt 34 8 26 0
+writeAt 35 8 26 4
+end
+note Scalar reference projection with FP32 accumulation, for BF16-widened or FP32 dense matrices.
+fn dense to void
+dsStart 3
+parameter 21 24
+parameter 22 28
+mad 20 15 128 14
+inst 28 Z 20 22 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+madreg 23 18 21 Z
+madreg 24 20 21 Z
+number 25 0.0f32
+literal 26 0
+literal 27 1
+mark = get dsPc 0
+iadd 28 23 26
+readAt 28 0 28 0
+iadd 29 24 26
+readAt 29 2 29 0
+fmaReg 25 28 29 25
+nextLoop 26 21 mark 27
+madreg 28 18 22 20
+writeAt 25 4 28 0
+end
+
+note One scalar per row. RMSNorm or the normalization statistic for the 20480-wide hc projection.
+fn rmsStat to void
+dsStart 2
+parameter 20 16
+madreg 21 15 20 Z
+number 22 0.0f32
+literal 23 0
+literal 24 1
+mark = get dsPc 0
+iadd 25 21 23
+readAt 25 0 25 0
+fmaReg 22 25 25 22
+nextLoop 23 20 mark 24
+fop 38 25 20 Z
+fop 40 25 25 Z
+number 26 1e-20f32
+fmaReg 22 22 25 26
+fop 41 22 22 Z
+writeAt 22 2 15 0
+end
+fn rmsApply to void
+dsStart 4
+parameter 21 32
+mad 20 15 128 14
+inst 28 Z 20 21 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+madreg 22 18 21 20
+readAt 23 0 22 0
+readAt 24 2 20 0
+readAt 25 4 18 0
+fop 32 23 23 25
+fop 32 23 23 24
+writeAt 23 6 22 0
+end
+
+note In-place 64-wide adjacent-pair rotary tail. Precomputed cos,sin per token, sign +1 or -1.
+fn rotary to void
+dsStart 2
+parameter 20 16
+parameter 21 20
+parameter 22 24
+literal 23 64
+inst 28 Z 20 23 Z 0
+put dsGuard 0 2
+inst 45 Z Z Z Z 0
+madreg 23 18 21 15
+madreg 23 23 20 Z
+literal 24 0xffffffc0
+iadd 23 23 20
+iadd 23 23 24
+mad 23 14 2 23
+mad 24 18 64 Z
+mad 24 14 2 24
+readAt 25 0 23 0
+readAt 26 0 23 4
+readAt 27 2 24 0
+readAt 28 2 24 4
+fop 32 28 28 22
+fop 32 29 25 27
+fop 32 30 26 28
+fop 31 29 29 30
+fop 32 30 26 27
+fmaReg 30 25 28 30
+writeAt 29 0 23 0
+writeAt 30 0 23 4
+end
+
+note Per-feature two-token softmax pooling for completed compression groups.
+fn poolPair to void
+dsStart 3
+mad 20 15 128 14
+mad 21 18 1024 20
+readAt 22 0 21 0
+readAt 23 0 21 2048
+readAt 24 2 21 0
+readAt 25 2 21 2048
+fop 37 26 24 25
+fop 31 24 24 26
+fop 31 25 25 26
+number 27 1.4426950408889634f32
+expReg 24 24 27
+expReg 25 25 27
+fop 30 26 24 25
+fop 40 26 26 Z
+fop 32 24 24 26
+fop 32 25 25 26
+fop 32 22 22 24
+fmaReg 22 23 25 22
+mad 21 18 512 20
+writeAt 22 4 21 0
+end
+
+note One thread per token. Keep six largest (sqrt(softplus(logit))+bias) and their raw scores.
+fn route to void
+dsStart 4
+mad 20 15 384 Z
+mad 21 15 6 Z
+for k ulong 6
+literal add 32 k 0xff800000
+literal add 38 k 0
+number add 44 k 0.0f32
+end
+literal 22 0
+literal 23 384
+literal 24 1
+number 25 1.4426950408889634f32
+number 26 0.6931471805599453f32
+number 27 1.0f32
+mark = get dsPc 0
+iadd 28 20 22
+readAt 28 0 28 0
+readAt 29 2 22 0
+note Stable log1p(z) corrects for rounding in u=1+z with log(u)*z/(u-1).
+inst 18 30 28 Z Z 0x7fffffff
+fop 31 30 Z 30
+expReg 30 30 25
+fop 30 31 30 27
+fop 31 50 31 27
+fop 69 31 31 Z
+fop 32 31 31 26
+fop 40 51 50 Z
+fop 32 51 30 51
+fop 32 31 31 51
+inst 34 0 50 Z Z 0x03f04000
+put dsGuard 0 2
+mad 31 30 1 Z
+fop 37 28 28 Z
+fop 30 28 28 31
+fop 70 28 28 Z
+fop 30 29 29 28
+mad 30 22 1 Z
+literal 54 0
+for k ulong 6
+r = add 32 k
+ix = add 38 k
+raw = add 44 k
+inst 34 0 29 r Z 0x03f04000
+put dsGuard 0 1
+literal 54 1
+note After the first insertion shift the entire suffix, retaining the order of older ties.
+inst 28 Z 54 24 Z 0
+mad 51 r 1 Z
+mad 52 ix 1 Z
+mad 53 raw 1 Z
+put dsGuard 0 1
+mad r 29 1 Z
+put dsGuard 0 1
+mad ix 30 1 Z
+put dsGuard 0 1
+mad raw 28 1 Z
+put dsGuard 0 1
+mad 29 51 1 Z
+put dsGuard 0 1
+mad 30 52 1 Z
+put dsGuard 0 1
+mad 28 53 1 Z
+end
+nextLoop 22 23 mark 24
+number 28 1e-20f32
+for k ulong 6
+fop 30 28 28 add 44 k
+end
+fop 40 28 28 Z
+number 29 1.5f32
+fop 32 29 28 29
+for k ulong 6
+fop 32 30 add 44 k 29
+writeAt add 38 k 4 21 mul k 4
+writeAt 30 6 21 mul k 4
+end
+end
+
+note Local Engram shard gather. Form the row address in 64 bits before adding the column.
+fn engramRows to void
+dsStart 5
+parameter 20 40
+parameter 21 44
+readAt 22 0 15 0
+literal 23 0xffffffff
+madreg 23 20 23 22
+mad 24 15 256 14
+inst 28 Z 23 21 Z 0
+inst 9 16 24 Z 8 4
+put dsGuard 0 1
+inst 12 Z 16 Z Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+inst 9 56 23 Z 2 256
+byteRead 25 56 14
+readAt 25 6 25 0
+inst 9 56 23 Z 4 8
+inst 17 26 14 Z Z 5
+e8Scale 26 56 26
+fop 32 25 25 26
+writeAt 25 8 24 0
+end
+fn bfRound d ulong a ulong to void
+inst 61 d Z a Z 0
+mad d d 65536 Z
+end
+note Either pack to BF16, or widen packed BF16 with the bit pattern preserved.
+fn convert unpack bool to void
+dsStart 2
+parameter 20 16
+mad 21 15 128 14
+inst 28 Z 21 20 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+if unpack
+inst 17 22 21 Z Z 1
+readAt 23 0 22 0
+inst 18 24 21 Z Z 1
+literal 25 1
+inst 28 Z 24 25 Z 0
+put dsGuard 0 2
+mad 23 23 65536 Z
+inst 18 23 23 Z Z 0xffff0000
+writeAt 23 2 21 0
+else
+readAt 23 0 21 0
+inst 61 23 Z 23 Z 0
+inst 9 16 21 Z 2 2
+inst 68 Z 16 23 Z 0
+end
+end
+
+note Causal, candidate-filtered weighted ReLU index score for one decode query per row.
+fn indexScore to void
+dsStart 6
+parameter 21 48
+parameter 22 52
+mad 20 15 128 14
+inst 28 Z 20 22 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+madreg 23 18 22 20
+madreg 24 18 21 Z
+mad 25 24 128 Z
+mad 26 23 128 Z
+literal 27 7
+iadd 28 22 27
+inst 17 28 28 Z Z 3
+inst 17 29 20 Z Z 3
+madreg 29 18 28 29
+readAt 29 8 29 0
+readAt 30 6 18 0
+inst 28 Z 20 30 Z 0
+put dsGuard 0 1
+literal 29 0
+literal 31 1
+inst 28 Z 29 31 Z 0
+literal 32 0xff800000
+inst 9 16 23 Z 10 4
+put dsGuard 0 2
+inst 12 Z 16 32 Z 0
+put dsGuard 0 2
+inst 45 Z Z Z Z 0
+literal 28 0
+number 32 0.0f32
+mark = get dsPc 0
+number 33 0.0f32
+for k ulong 128
+readAt 34 0 25 mul k 4
+readAt 35 2 26 mul k 4
+fmaReg 33 34 35 33
+end
+bfRound 33 33
+fop 37 33 33 Z
+iadd 34 24 28
+readAt 35 4 34 0
+fop 32 33 33 35
+bfRound 33 33
+fop 30 32 32 33
+literal 34 128
+iadd 25 25 34
+nextLoop 28 21 mark 31
+bfRound 32 32
+writeAt 32 10 23 0
+end
+
+note Eight contiguous candidate positions. Pin the last reachable block.
+fn blockScores to void
+dsStart 3
+parameter 20 24
+mad 21 15 8 Z
+madreg 22 18 20 21
+readAt 23 2 18 0
+literal 24 0xff800000
+literal 25 1
+for k ulong 8
+literal 26 k
+iadd 27 21 26
+inst 28 Z 27 20 Z 0
+inst 9 16 22 Z 0 4
+literal 28 0xff800000
+put dsGuard 0 2
+inst 11 28 16 Z Z mul k 4
+inst 28 Z 27 23 Z 0
+put dsGuard 0 1
+literal 28 0xff800000
+fop 37 24 24 28
+end
+literal 26 0xffffffff
+iadd 27 23 26
+inst 17 27 27 Z Z 3
+note CTAs are always real blocks. A zero length yields a last-block index outside their range.
+fop 29 28 27 15
+inst 28 Z 28 25 Z 0
+put dsGuard 0 2
+literal 24 0x7f800000
+literal 26 7
+iadd 26 26 20
+inst 17 26 26 Z Z 3
+madreg 26 18 26 15
+writeAt 24 4 26 0
+end
+
+note IEEE key preserves score order for finite values and infinities. Signed zeros compare equal.
+fn orderedKey value ulong key ulong to void
+literal 49 0x80000000
+inst 18 50 value Z Z 0x7fffffff
+literal 51 1
+inst 28 Z 50 51 Z 0
+put dsGuard 0 2
+literal value 0
+inst 28 Z value 49 Z 0
+put dsGuard 0 1
+literal 49 0xffffffff
+fop 29 key value 49
+end
+note Find the kth largest key by counting prefixes. Emit in increasing position order; ties use lower positions.
+note Returns both indices padded with -1 and an int32 keep mask. Input can be masked with -infinity.
+fn topPositions to void
+dsStart 3
+parameter 20 24
+parameter 21 28
+parameter 22 32
+madreg 23 15 20 Z
+madreg 24 15 21 Z
+literal 25 1
+literal 26 0
+literal 27 0x80000000
+literal 31 32
+literal 32 0
+outer = get dsPc 0
+iadd 28 26 27
+literal 29 0
+literal 30 0
+mark = get dsPc 0
+iadd 33 23 30
+readAt 34 0 33 0
+orderedKey 34 35
+inst 28 Z 35 28 Z 0
+put dsGuard 0 1
+iadd 29 29 25
+nextLoop 30 20 mark 25
+inst 28 Z 29 21 Z 0
+put dsGuard 0 1
+mad 26 28 1 Z
+inst 17 27 27 Z Z 1
+nextLoop 32 31 outer 25
+literal 30 0
+literal 29 0
+mark = get dsPc 0
+iadd 33 23 30
+readAt 34 0 33 0
+orderedKey 34 35
+inst 28 Z 26 35 Z 0
+put dsGuard 0 2
+iadd 29 29 25
+nextLoop 30 20 mark 25
+literal 36 0xffffffff
+madreg 37 29 36 21
+literal 30 0
+literal 38 0
+mark = get dsPc 0
+iadd 33 23 30
+readAt 34 0 33 0
+orderedKey 34 35
+literal 39 0
+inst 28 Z 35 26 Z 0
+put dsGuard 0 1
+literal 39 1
+fop 29 40 35 26
+inst 28 Z 40 25 Z 0
+put dsGuard 0 2
+mad 39 37 1 Z
+literal 41 0xff800000
+fop 29 41 34 41
+inst 28 Z 41 25 Z 0
+put dsGuard 0 2
+literal 39 0
+inst 28 Z 39 25 Z 0
+put dsGuard 0 1
+literal 39 1
+writeAt 39 4 33 0
+iadd 42 24 38
+iadd 43 22 30
+inst 9 16 42 Z 2 4
+put dsGuard 0 1
+inst 12 Z 16 43 Z 0
+iadd 38 38 39
+inst 28 Z 40 25 Z 0
+put dsGuard 0 2
+madreg 37 39 36 37
+nextLoop 30 20 mark 25
+mark = get dsPc 0
+inst 28 Z 38 21 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+iadd 42 24 38
+writeAt 36 2 42 0
+iadd 38 38 25
+inst 46 Z Z Z Z sub mark get dsPc 0
+end
+
+note Compute the Engram normalized signed-sqrt gate for each token and residual stream.
+fn engramGate to void
+dsStart 5
+mad 20 18 4 15
+mad 21 20 5120 Z
+mad 22 15 5120 Z
+literal 23 0
+literal 24 5120
+literal 25 1
+number 26 0.0f32
+number 27 0.0f32
+number 28 0.0f32
+mark = get dsPc 0
+iadd 29 21 23
+readAt 30 0 29 0
+readAt 31 2 29 0
+iadd 29 22 23
+readAt 32 4 29 0
+fmaReg 26 30 30 26
+fmaReg 27 31 31 27
+fop 32 30 30 32
+fmaReg 28 30 31 28
+nextLoop 23 24 mark 25
+number 29 0.0001953125f32
+number 30 1e-20f32
+fmaReg 26 26 29 30
+fmaReg 27 27 29 30
+fop 41 26 26 Z
+fop 41 27 27 Z
+fop 32 26 26 27
+fop 32 28 28 26
+number 29 0.013975424859373685f32
+fop 32 28 28 29
+inst 18 30 28 Z Z 0x80000000
+inst 18 28 28 Z Z 0x7fffffff
+number 29 0.000001f32
+fop 37 28 28 29
+fop 70 28 28 Z
+iadd 28 28 30
+number 29 -1.4426950408889634f32
+number 30 1.0f32
+sigmoid 28 28 29 30
+readAt 31 6 18 0
+inst 28 Z 31 25 Z 0
+put dsGuard 0 2
+number 28 0.0f32
+writeAt 28 8 20 0
+end
+fn engramAdd to void
+dsStart 4
+mad 20 15 128 14
+mad 21 19 4 18
+mad 22 21 5120 20
+mad 23 19 5120 20
+readAt 24 0 22 0
+readAt 25 2 23 0
+readAt 26 4 21 0
+fmaReg 24 25 26 24
+bfRound 24 24
+writeAt 24 6 22 0
+end
+note Widen the BF16 vocabulary row and replicate it into four initial residual streams.
+fn tokenEmbed to void
+dsStart 3
+parameter 20 24
+parameter 21 28
+mad 22 15 128 14
+readAt 23 0 18 0
+literal 24 0xffffffff
+madreg 24 20 24 23
+inst 28 Z 24 21 Z 0
+inst 9 56 24 Z 2 10240
+inst 17 25 22 Z Z 1
+inst 9 16 25 Z 56 4
+literal 26 0
+put dsGuard 0 2
+inst 11 26 16 Z Z 0
+inst 18 25 22 Z Z 1
+literal 24 1
+inst 28 Z 25 24 Z 0
+put dsGuard 0 2
+mad 26 26 65536 Z
+inst 18 26 26 Z Z 0xffff0000
+mad 23 18 20480 22
+for j ulong 4
+writeAt 26 4 23 mul j 20480
+end
+end
+note Assemble six routed down projections plus the shared expert. Routing weights were applied before w2.
+fn moeSum to void
+dsStart 3
+mad 20 15 128 14
+mad 21 18 30720 20
+mad 22 18 5120 20
+number 23 0.0f32
+for j ulong 6
+readAt 24 0 21 mul j 20480
+fop 30 23 23 24
+end
+readAt 24 2 22 0
+fop 30 23 23 24
+bfRound 23 23
+writeAt 23 4 22 0
+end
+note Write the current KV into slot pos mod 128 and give one query its 128 oldest-first window indices.
+fn windowStep to void
+dsStart 4
+mad 20 15 128 14
+readAt 21 2 18 0
+inst 18 22 21 Z Z 127
+mad 23 18 128 22
+mad 24 23 512 20
+mad 25 18 512 20
+readAt 26 0 25 0
+writeAt 26 4 24 0
+literal 27 1
+inst 28 Z 15 27 Z 0
+put dsGuard 0 1
+inst 45 Z Z Z Z 0
+iadd 28 22 27
+iadd 28 28 14
+inst 18 28 28 Z Z 127
+inst 28 Z 21 28 Z 0
+put dsGuard 0 2
+literal 28 0xffffffff
+mad 29 18 128 14
+writeAt 28 6 29 0
+end
