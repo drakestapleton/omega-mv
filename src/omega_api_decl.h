@@ -722,6 +722,26 @@ OMBR_ASSERT(offsetof(OscTraceInput, handle) == 36, "layout trinput field handle"
 OMBR_ASSERT(offsetof(OscTraceInput, rights) == 40, "layout trinput field rights");
 /* export fn osc_trace_record trace edit uchar * event view trinput to void */
 void osc_trace_record(uint8_t *o_trace, size_t o_trace_len, const OscTraceInput *o_event);
+#define OSC_SCOPE_END_BORROW 1
+#define OSC_SCOPE_RELEASE_OWNER 2
+#define OSC_SCOPE_DESTROY_ARENA 3
+#define OSC_SCOPE_CLOSE_POOL 4
+#define OSC_SCOPE_REFUSE_ESCAPE 5
+typedef struct {
+    uint32_t first;
+    uint32_t count;
+    uint32_t objects;
+    uint32_t borrows;
+    uint32_t actions[480];
+} OscScopeExit;
+OMBR_ASSERT(sizeof(OscScopeExit) == 1936, "layout exitwork size");
+OMBR_ASSERT(offsetof(OscScopeExit, first) == 0, "layout exitwork field first");
+OMBR_ASSERT(offsetof(OscScopeExit, count) == 4, "layout exitwork field count");
+OMBR_ASSERT(offsetof(OscScopeExit, objects) == 8, "layout exitwork field objects");
+OMBR_ASSERT(offsetof(OscScopeExit, borrows) == 12, "layout exitwork field borrows");
+OMBR_ASSERT(offsetof(OscScopeExit, actions) == 16, "layout exitwork field actions");
+/* export fn osc_scope_exit visible view ushort 480 symbols view uchar 76800 owners edit uchar 5120 borrows edit uchar 12288 work edit exitwork to ulong */
+uint64_t osc_scope_exit(const uint16_t o_visible[480], const uint8_t o_symbols[76800], uint8_t o_owners[5120], uint8_t o_borrows[12288], OscScopeExit *o_work);
 #ifdef __cplusplus
 }
 #endif
