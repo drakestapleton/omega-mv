@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Updated the historical tensor mutation comparison to link the current seeded SHA-256 binding. |
 | OpenAI Codex | Preserve the resolved offline pin paths in M19’s clean-build and gate child processes. |
 | OpenAI Codex | Bound M18 clean Git staging, offline SHA-256 dependency verification and execution receipt identities to the hardware proof. |
 | OpenAI Codex | Replaced the BLAKE3 C chunk adapter with a seeded Omega one-shot entry sharing the original compression and tree functions. |
