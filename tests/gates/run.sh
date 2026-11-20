@@ -647,7 +647,6 @@ case "$step" in
                       # Host only (gcc for -aux-info), no GPU, no physics checkout.
     make $NOPHYS test-runtime-api ;;
   arboris)
-    physics_pin
     sh seed/omega-from-seed.sh > "$OUT_DIR/seed.log" 2>&1
     OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
     ;;

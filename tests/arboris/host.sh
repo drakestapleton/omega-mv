@@ -26,10 +26,10 @@ compile "$out/emit" "$out/profile.om" om/encoder/bw_enc_sm121.om om/blackwell_ar
 echo "53058a3139706a7688ef68192a8bf8a679ef5dbad77cebc6c65b7081dfc7eb42  $out/wave.bin" | sha256sum -c -
 "$dis" -b SM121 "$out/wave.bin" > "$out/wave.dis"
 diff -u tests/arboris/spread-sm121.dis "$out/wave.dis"
-make OUT_DIR="$out" "$out/bw_hazard_test"
-"$out/bw_hazard_test" --kernel "$out/wave.bin"
+cc -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/scoreboard_oracle.c src/omega_bw_hazard.c -o "$out/check-wave"
+"$out/check-wave" < "$out/wave.bin"
 "$out/emit" mutant > "$out/wave-mutant.bin"
-if "$out/bw_hazard_test" --kernel "$out/wave-mutant.bin" > "$out/negative.log"; then
+if "$out/check-wave" < "$out/wave-mutant.bin" > "$out/negative.log"; then
     echo "FAIL: scoreboard accepted a missing load wait"
     exit 1
 fi
