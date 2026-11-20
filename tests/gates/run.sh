@@ -654,6 +654,7 @@ case "$step" in
       exit 1
     }
     cat "$OUT_DIR/gated-device.log"
+    grep -Eq '^step_message=4152425354503032[0-9a-f]{352}$' "$OUT_DIR/gated-device.log"
     grep -qx 'matching_fp16_elements=40' "$OUT_DIR/gated-device.log"
     grep -qx 'kernel_sha256=66efbbc55e3e0434aa0e43416d25c22112c383a3f4c91da5337304d1fea85182' "$OUT_DIR/gated-device.log"
     grep -qx 'output_sha256=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089' "$OUT_DIR/gated-device.log"
@@ -673,6 +674,7 @@ case "$step" in
         small) words=4096; code=small.bin; output=33dfc6bc867a2bfbe09192038538c209c9b8bc89e16b6cedcaf0e7cf32b1a8f6 ;;
         wave) words=400000; code=wave.bin; output=b2d9f9458d97db2f5415078fbc43ad0256229175bbc28127eeaad941a708dc7a ;;
       esac
+      grep -Eq '^step_message=4152425354503032[0-9a-f]{352}$' "$log"
       grep -qx "matching_fp32_words=$words" "$log"
       grep -qx "kernel_sha256=$(sha256sum "$OUT_DIR/$code" | cut -d' ' -f1)" "$log"
       grep -qx "output_sha256=$output" "$log"
