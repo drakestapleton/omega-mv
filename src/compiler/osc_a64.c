@@ -138,6 +138,12 @@ static int unreg(int kind, uint32_t f) {
     return 255; /* not encodable: re-encode check refuses */
 }
 
+static unsigned pair_flags(int op) {
+    int writeback = op == OSC_A64_STP_PRE || op == OSC_A64_STP_POST || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
+    int loadpair = op == OSC_A64_LDP_OFF || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
+    return (unsigned)writeback | ((unsigned)loadpair << 1);
+}
+
 int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
     if (!in || !word) return fail(err, n, "null");
     int op = in->op;
@@ -157,9 +163,8 @@ int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
     if (oi->ka != K_NONE && regfield(oi->ka, in->ra, &ra, "ra", nm, err, n)) return -1;
     const OscA64Fields f = {.rd = rd, .rn = rn, .rm = rm, .ra = ra, .shift = in->shift,
                             .cond = in->cond, .imm = in->imm, .imm2 = in->imm2};
-    int writeback = op == OSC_A64_STP_PRE || op == OSC_A64_STP_POST || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
-    int loadpair = op == OSC_A64_LDP_OFF || op == OSC_A64_LDP_PRE || op == OSC_A64_LDP_POST;
-    switch (osc_a64_check_fields(oi->cls, &f, writeback, loadpair)) {
+    uint64_t packed = osc_a64_checked_word(oi->cls, oi->base, &f, pair_flags(op));
+    switch (packed >> 32) {
     case 0: break;
     case OSC_A64_ERR_UNUSED_SHIFT:
         return fail(err, n, "%s: shift unused but set", nm);
@@ -201,7 +206,7 @@ int osc_a64_encode(const OscA64Insn *in, uint32_t *word, char *err, size_t n) {
         return fail(err, n, "%s: cond %u refused (AL/NV not used)", nm, in->cond);
     default: return fail(err, n, "bad class");
     }
-    *word = (uint32_t)osc_a64_pack_fields(oi->cls, oi->base, &f);
+    *word = (uint32_t)packed;
     return 0;
 }
 
@@ -218,7 +223,8 @@ int osc_a64_decode(uint32_t w, OscA64Insn *out) {
         memset(&d, 0, sizeof d);
         d.op = (uint8_t)op;
         OscA64Fields f;
-        osc_a64_unpack_fields(oi->cls, w, &f);
+        if (!osc_a64_canonical_word(oi->cls, oi->base, w, pair_flags(op), &f)) continue;
+        if (!out) return 0;
         if (oi->kd != K_NONE) d.rd = (uint8_t)unreg(oi->kd, f.rd);
         if (oi->kn != K_NONE) d.rn = (uint8_t)unreg(oi->kn, f.rn);
         if (oi->km != K_NONE) d.rm = (uint8_t)unreg(oi->km, f.rm);
@@ -227,9 +233,7 @@ int osc_a64_decode(uint32_t w, OscA64Insn *out) {
         d.cond = (uint8_t)f.cond;
         d.imm = f.imm;
         d.imm2 = f.imm2;
-        uint32_t re;
-        if (osc_a64_encode(&d, &re, NULL, 0) != 0 || re != w) continue;
-        if (out) *out = d;
+        *out = d;
         return 0;
     }
     return -1;

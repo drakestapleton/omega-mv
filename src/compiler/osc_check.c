@@ -93,13 +93,9 @@ typedef struct {
     int fi;               /* current function index */
     int fnode;
     OscType fret;
-    Sym sym[OSC_CHECK_MAX_SYMS];
     int nsym;
-    Obj obj[OSC_CHECK_MAX_OBJS];
     int nobj;
-    Bor bor[OSC_CHECK_MAX_BORS];
     int nbor;
-    OscCheckedScope names;
     int loop_depth;
     int term;             /* current path has returned */
     char sobj[64];        /* statement object (diagnostics) */
@@ -110,10 +106,15 @@ typedef struct {
      * reaching the current point; pmslot / pmhnd = model slot and handle ids
      * (fresh per provenance); pfree_sym = handle symbol named by the free. */
     int nprov;
+    uint32_t nmslot, nmhnd;
+    /* Each table entry is initialized when its ID is allocated. */
+    Sym sym[OSC_CHECK_MAX_SYMS];
+    Obj obj[OSC_CHECK_MAX_OBJS];
+    Bor bor[OSC_CHECK_MAX_BORS];
+    OscCheckedScope names;
     uint8_t pfreed[MAX_PROV];
     uint32_t pfree_line[MAX_PROV], pmslot[MAX_PROV], pmhnd[MAX_PROV];
     int pfree_sym[MAX_PROV];
-    uint32_t nmslot, nmhnd;
 } C;
 
 #define NODE(i) (&c->ast->nodes[(i)])
@@ -409,7 +410,7 @@ static int declare(C *c, const OscNode *n, uint8_t kind, const OscType *ty, int 
     int s = c->nsym++;
     Sym *y = &c->sym[s];
     memset(y, 0, sizeof *y);
-    memcpy(y->name, name, sizeof name);
+    memcpy(y->name, name, strlen(name) + 1);
     y->line = n->line;
     y->kind = kind;
     y->mut = (uint8_t)mut;
@@ -1007,23 +1008,28 @@ static int check_operator(C *c, int i, OscScalar want)
     }
 }
 
-static int chk(C *c, int i, OscScalar want)
+static int check_numeric_expression(C *c, int i, OscScalar want)
 {
-    OscNode *n = NODE(i);
-    char msg[320];
-    if (!want && ctxfree(c, i)) {
+    const OscNode *n = NODE(i);
+    if (!want && (n->kind == ON_INT || ctxfree(c, i))) {
         osc_diag_set(c->d, OSC_DIAG_AMBIGUOUS_WIDTH, n->line, n->col, c->sobj, 0, NULL, "literal without type context",
                      "integer literal has no type from context (ambiguous width)");
         return -1;
     }
-    if (want && constexpr_(c, i)) {
+    if (want && (n->kind == ON_INT || constexpr_(c, i))) {
         uint64_t v;
         if (fold(c, i, want, &v)) return -1;
         return (int)want;
     }
+    return check_operator(c, i, want);
+}
+
+static int chk(C *c, int i, OscScalar want)
+{
+    OscNode *n = NODE(i);
+    char msg[320];
     OscScalar t;
     switch (n->kind) {
-    case ON_INT: { uint64_t v; if (fold(c, i, want, &v)) return -1; return (int)want; } /* unreachable: constexpr */
     case ON_BOOL:
         t = OSC_T_BOOL;
         break;
@@ -1132,8 +1138,8 @@ static int chk(C *c, int i, OscScalar want)
     }
     case ON_BORROW:
         return tmismatch(c, n, NULL, "a borrow is not a value here");
-    case ON_UN: case ON_CAST: case ON_BIN: {
-        int result = check_operator(c, i, want);
+    case ON_INT: case ON_UN: case ON_BIN: case ON_CAST: {
+        int result = n->kind == ON_CAST ? check_operator(c, i, want) : check_numeric_expression(c, i, want);
         if (result < 0) return -1;
         t = (OscScalar)result;
         break;
@@ -2044,7 +2050,7 @@ int osc_check(const OscAlloc *a, OscAst *ast, OscDiag *d, OscTrace *trace)
     size_t bytes = sizeof(C) + expr_words * sizeof(uint64_t);
     C *c = a->alloc(a->ctx, bytes);
     if (c) {
-        memset(c, 0, sizeof *c);
+        memset(c, 0, offsetof(C, sym));
         c->expr_work = (uint64_t *)(c + 1);
         c->expr_words = expr_words;
     }
