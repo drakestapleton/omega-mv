@@ -526,6 +526,49 @@ static void t_replay(const float *t)
     CHECK(ok == STEPS, "each committed step re-derived from its base generation + dispatch record (%d/%d)", ok, STEPS);
 }
 
+/* The seeded loop limit is per invocation. A whole update may exceed it. */
+static void t_sgd_limits(void)
+{
+    const size_t count = 1000001;
+    char dir[1024];
+    newdir(dir, sizeof dir, "sgd-limits");
+    float *gradient = malloc(count * sizeof *gradient);
+    CHECK(gradient != NULL, "allocate large gradient");
+    if (!gradient) return;
+    for (size_t i = 0; i < count; i++) gradient[i] = 1.0f;
+    tg_store *store = NULL;
+    int rc = tg_create(dir, gradient, count * sizeof(float), gradient, count * sizeof(float));
+    if (!rc) rc = tg_open(dir, &store, NULL);
+    tg_shadow shadow;
+    if (!rc) rc = tg_shadow_begin(store, &shadow);
+    CHECK(rc == TG_OK, "create large SGD shadow");
+    if (!rc) {
+        rc = tg_sgd_step(store, &shadow, gradient, count, 1.0f, 0.0f, 29);
+        CHECK(rc == TG_OK && shadow.n_dispatch == 1, "large plain SGD dispatch");
+        size_t zeroes = 0;
+        const float *params = (const float *)(const void *)shadow.params;
+        for (size_t i = 0; i < count; i++) zeroes += params[i] == 0.0f;
+        CHECK(zeroes == count, "large SGD updated every element");
+#ifdef __aarch64__
+        uint64_t fpcr;
+        __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+        uint64_t flush = fpcr | (UINT64_C(1) << 24);
+        __asm__ volatile("msr fpcr, %0; isb" :: "r"(flush) : "memory");
+        const float subnormal = 0x1p-149f;
+        int bad_rate = tg_sgd_step(store, &shadow, gradient, count, subnormal, 0.0f, 30);
+        gradient[count - 1] = 2.0f;
+        int zero_momentum = tg_sgd_step(store, &shadow, gradient, count, 1.0f, subnormal, 31);
+        __asm__ volatile("msr fpcr, %0; isb" :: "r"(fpcr) : "memory");
+        CHECK(bad_rate == TG_E_ARG && zero_momentum == TG_OK && shadow.n_dispatch == 2,
+              "flushed learning rate and momentum use the caller's FP mode");
+        CHECK(((const float *)(const void *)shadow.opt)[count - 1] == 1.0f, "flushed momentum preserves velocity");
+#endif
+        tg_shadow_discard(&shadow);
+    }
+    if (store) tg_close(store);
+    free(gradient);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) { fprintf(stderr, "usage: test_train <scratch-dir>\n"); return 2; }
@@ -536,6 +579,7 @@ int main(int argc, char **argv)
     target(t, N_SMALL);
     t_basic(t);
     t_training(t);
+    t_sgd_limits();
     t_crash(t);
     t_reader_race(t);
     t_negatives(t);
