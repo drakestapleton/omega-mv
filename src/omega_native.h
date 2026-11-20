@@ -27,6 +27,10 @@ uint32_t omega2_sha256_final(uint64_t *result, uint8_t *o_c, uint8_t *o_o);
 uint32_t omega2_sha256_hash(uint64_t *result, const uint8_t *o_d, uint64_t o_d_len, uint8_t *o_o);
 /* fn omb3 st edit ulong 448 b view uchar 1024 n ulong fin ulong o edit uchar 32 to void */
 uint32_t omega_omb3(uint64_t *result, void *o_st, uint64_t o_st_len, const void *o_b, uint64_t o_b_len, uint64_t o_n, uint64_t o_fin, void *o_o, uint64_t o_o_len);
+#define OMEGA2_IDENT_b3hash "omega-ident 1 unit=b3hash abi=2 profile=OM-2 src=ff878c665a43b1a66cfae59441c98b722b31da01eae55c95dbbcc49a65dd2f25 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+const char *omega2_ident_b3hash(void);
+/* export fn omega_blake3_hash input view uchar * digest out uchar 32 to void */
+uint32_t omega2_omega_blake3_hash(uint64_t *result, const uint8_t *o_input, uint64_t o_input_len, uint8_t *o_digest);
 /* fn bw_enc_sm121 ins view ulong 8192 phys view ulong 288 n ulong pad ulong code edit uchar 16384 to ulong */
 uint32_t omega_bw_enc_sm121(uint64_t *result, const void *o_ins, uint64_t o_ins_len, const void *o_phys, uint64_t o_phys_len, uint64_t o_n, uint64_t o_pad, void *o_code, uint64_t o_code_len);
 #define OMEGA2_IDENT_bw_qmd "omega-ident 1 unit=bw_qmd abi=2 profile=OM-2 src=93f12b4c551939191ac5666f0b2d03b90bb05086425367e548c0840dbb9ea377 omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
