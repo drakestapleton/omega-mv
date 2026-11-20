@@ -46,6 +46,8 @@ for k in vadd fsum16 gemm16 rmsnorm; do
   "$B/isa" check "$B/$k.isa.bin" && echo "PASS isa check $k" || { echo "FAIL isa check $k"; fail=1; }
   "$B/plan" "$k" > "$B/$k.plan.txt" && echo "PASS plan $k" || { echo "FAIL plan $k"; fail=1; }
 done
+"$B/batch" fence 4303355904 305419896 > "$B/fence.batch.bin" || { echo "FAIL batch fence"; fail=1; }
+"$B/batch" check "$B/fence.batch.bin" && echo "PASS batch check fence" || { echo "FAIL batch check fence"; fail=1; }
 
 # 3. Negative controls
 printf 'BAD_BATCH_000000000000000000000000000000000000000000000000000000' > "$B/bad.batch.bin"

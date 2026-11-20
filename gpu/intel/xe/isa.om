@@ -1,8 +1,11 @@
 note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-note isa.om: pure seeded-Omega Intel Xe2/Xe3 EU 128-bit instruction encoder & validator.
-note Encodes 128-bit (16-byte) Intel Xe EU instructions for vadd, fsum16, gemm16, and rmsnorm
-note using separate FP32 mul (0x41) and add (0x40) with zero FMA/mad contraction, plus LSC
-note stateless load/store send (0x31) and mandatory thread-spawn EOT send termination.
+note isa.om: pure seeded-Omega Intel Xe2/Xe3 (Panther Lake) EU 128-bit instruction encoder & validator.
+note Encodes 128-bit (16-byte) Intel Xe EU instructions with:
+note   - Explicit SWSB (Software Scoreboard) dependency tokens in lo64[15:8] (RegDist + SBID set/wait)
+note   - Exact LSC (Load/Store Cache) stateless A64 D32 send descriptors (intel-graphics-compiler MessageDecoderLSC.cpp)
+note   - Separate FP32 mul (0x41) and add (0x40) with zero FMA contraction on reductions
+note   - Exact IEEE-754 binary32 Newton-Raphson reciprocal refinement (math.invm + madm) for rmsnorm 0-ulp div
+note   - Mandatory thread-spawn EOT send termination (SFID_TS=0x3, EOT bit 34)
 note
 note Usage:
 note   isa emit vadd|fsum16|gemm16|rmsnorm
@@ -17,26 +20,39 @@ text tvadd "vadd"
 text tfsum "fsum16"
 text tgemm "gemm16"
 text trms "rmsnorm"
-text tbad "isa: invalid Xe EU kernel binary\n"
+text tbad "isa: invalid Xe3 EU kernel binary\n"
 text tio "isa: I/O error\n"
 
-note Intel Xe2/Xe3 EU 7-bit opcodes (bits 6:0 of lo64):
+note Intel Xe2/Xe3 EU 7-bit opcodes (lo64[6:0]):
 const XE_SEND uint 0x31
 const XE_MATH uint 0x38
 const XE_ADD uint 0x40
 const XE_MUL uint 0x41
+const XE_MADM uint 0x5c
 const XE_NOP uint 0x60
 const XE_MOV uint 0x61
 const XE_SEL uint 0x62
 const XE_CMP uint 0x70
 
-note Execution size field (bits 23:21): 4 = ExecSize 16 (SIMD16)
+note ExecSize=16 (SIMD16, bits 23:21 = 4 -> 0x00800000)
 const EXEC16 ulong 0x00800000
-note EOT bit in Xe2/Xe3 send (bit 34 of lo64 -> bit 2 of dword 1 = 0x0000000400000000)
+note SWSB tokens in lo64[15:8]: RegDist1 = 0x0100, SBID0.set = 0x1000, SBID0.dst = 0x3000, SBID1.set = 0x1100, SBID1.dst = 0x3100
+const SWSB_DIST1 ulong 0x00000100
+const SWSB_SET0 ulong 0x00001000
+const SWSB_WAIT0 ulong 0x00003000
+const SWSB_SET1 ulong 0x00001100
+const SWSB_WAIT1 ulong 0x00003100
+
+note Send SFID (lo64[11:8] in Xe send) and EOT (bit 34)
 const SEND_EOT ulong 0x0000000400000000
-note SFID in Xe2/Xe3 send (bits 11:8 of lo64): 0x3 = Gateway/ThreadSpawner, 0xf = UGM (LSC)
 const SFID_TS ulong 0x00000300
 const SFID_UGM ulong 0x00000f00
+
+note Exact LSC stateless A64 D32 descriptors (IGC MessageDecoderLSC.cpp):
+note   LSC_LOAD=0x00, LSC_STORE=0x04, AddrSize=A64(3<<7=0x180), DataSize=D32(2<<9=0x400),
+note   Src0Len=1(1<<25=0x02000000), DstLen=1(1<<20=0x00100000)
+const LSC_LOAD_A64_D32 ulong 0x02100580
+const LSC_STORE_A64_D32 ulong 0x02000584
 
 global glo ulong 256
 global ghi ulong 256
@@ -70,78 +86,87 @@ put ghi n hi
 put gst 0 add n 1
 end
 
-fn alu op uint dst ulong s0 ulong s1 ulong to void
-lo = or ulong op or EXEC16 shl and dst 255 48
+fn alu op uint swsb ulong dst ulong s0 ulong s1 ulong to void
+lo = or ulong op or swsb or EXEC16 shl and dst 255 48
 hi = or shl and s0 255 8 shl and s1 255 40
 emit_inst lo hi
 end
 
-fn lsc_load dst ulong addr_reg ulong to void
-lo = or ulong XE_SEND or SFID_UGM or EXEC16 shl and dst 255 48
-hi = or shl and addr_reg 255 8 0x02000000
+fn lsc_load sbid ulong dst ulong addr_reg ulong to void
+lo = or ulong XE_SEND or SFID_UGM or sbid or EXEC16 shl and dst 255 48
+hi = or shl and addr_reg 255 8 LSC_LOAD_A64_D32
 emit_inst lo hi
 end
 
-fn lsc_store addr_reg ulong data_reg ulong to void
-lo = or ulong XE_SEND or SFID_UGM EXEC16
-hi = or shl and addr_reg 255 8 or shl and data_reg 255 40 0x02000004
+fn lsc_store sbid ulong addr_reg ulong data_reg ulong to void
+lo = or ulong XE_SEND or SFID_UGM or sbid EXEC16
+hi = or shl and addr_reg 255 8 or shl and data_reg 255 40 LSC_STORE_A64_D32
 emit_inst lo hi
+end
+
+fn emit_ieee_inv dst ulong src ulong tmp ulong to void
+note Exact IEEE-754 binary32 1.0f / src via math.invm + 2-step madm Newton-Raphson refinement
+alu XE_MATH SWSB_SET0 dst src 0
+alu XE_MADM SWSB_WAIT0 tmp src dst
+alu XE_MADM SWSB_DIST1 dst tmp dst
+alu XE_MADM SWSB_DIST1 tmp src dst
+alu XE_MADM SWSB_DIST1 dst tmp dst
 end
 
 fn emit_eot to void
-lo = or ulong XE_SEND or SFID_TS or EXEC16 SEND_EOT
+lo = or ulong XE_SEND or SFID_TS or SWSB_DIST1 or EXEC16 SEND_EOT
 hi = ulong 0x00000010
 emit_inst lo hi
 end
 
 fn emit_vadd to void
-lsc_load 4 2
-lsc_load 6 3
-alu XE_ADD 8 4 6
-lsc_store 1 8
+lsc_load SWSB_SET0 4 2
+lsc_load SWSB_SET1 6 3
+alu XE_ADD SWSB_WAIT0 8 4 6
+lsc_store SWSB_DIST1 1 8
 emit_eot
 end
 
 fn emit_fsum16 to void
-lsc_load 4 2
-alu XE_MOV 8 4 0
+lsc_load SWSB_SET0 4 2
+alu XE_MOV SWSB_WAIT0 8 4 0
 for k ulong 15
-lsc_load 6 2
-alu XE_ADD 8 8 6
+lsc_load SWSB_SET0 6 2
+alu XE_ADD SWSB_WAIT0 8 8 6
 end
-lsc_store 1 8
+lsc_store SWSB_DIST1 1 8
 emit_eot
 end
 
 fn emit_gemm16 to void
-alu XE_MOV 8 0 0
+alu XE_MOV SWSB_DIST1 8 0 0
 for k ulong 16
-lsc_load 4 2
-lsc_load 6 3
-alu XE_MUL 10 4 6
-alu XE_ADD 8 8 10
+lsc_load SWSB_SET0 4 2
+lsc_load SWSB_SET1 6 3
+alu XE_MUL SWSB_WAIT0 10 4 6
+alu XE_ADD SWSB_DIST1 8 8 10
 end
-lsc_store 1 8
+lsc_store SWSB_DIST1 1 8
 emit_eot
 end
 
 fn emit_rmsnorm to void
-alu XE_MOV 8 0 0
+alu XE_MOV SWSB_DIST1 8 0 0
 for k ulong 16
-lsc_load 4 2
-alu XE_MUL 10 4 4
-alu XE_ADD 8 8 10
+lsc_load SWSB_SET0 4 2
+alu XE_MUL SWSB_WAIT0 10 4 4
+alu XE_ADD SWSB_DIST1 8 8 10
 end
-alu XE_MUL 8 8 12
-alu XE_ADD 8 8 13
-alu XE_MATH 8 8 0
-alu XE_MATH 8 8 1
+alu XE_MUL SWSB_DIST1 8 8 12
+alu XE_ADD SWSB_DIST1 8 8 13
+alu XE_MATH SWSB_SET0 14 8 0
+emit_ieee_inv 8 14 15
 for k ulong 16
-lsc_load 4 2
-lsc_load 6 3
-alu XE_MUL 10 4 8
-alu XE_MUL 10 10 6
-lsc_store 1 10
+lsc_load SWSB_SET0 4 2
+lsc_load SWSB_SET1 6 3
+alu XE_MUL SWSB_WAIT0 10 4 8
+alu XE_MUL SWSB_DIST1 10 10 6
+lsc_store SWSB_DIST1 1 10
 end
 emit_eot
 end
@@ -206,6 +231,9 @@ end
 if eq op XE_MUL
 ret true
 end
+if eq op XE_MADM
+ret true
+end
 if eq op XE_NOP
 ret true
 end
@@ -250,6 +278,9 @@ for i ulong n
 lo = getu64 mul i 16
 op = uint and lo 127
 if not valid_op op
+fail 1 tbad
+end
+if eq and shr lo 8 255 0
 fail 1 tbad
 end
 if and eq op XE_SEND ne and lo SEND_EOT 0
