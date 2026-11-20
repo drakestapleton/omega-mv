@@ -15,6 +15,26 @@ The Python corpus builder and compile feedback loop live in `tools/omega-llm/` a
 
 Stays in aien-train (listed in `train/NOT-YET-OMEGA.tsv`): the shell/Python harness `tests/omegallm/` (`build.sh`, `oracle.py`, `pre-review.py`, ...), `evidence/OMEGALLM/` receipts, and the C++ llama.cpp UI bridge `tools/omegallm-ui/`. The docs here still cite those upstream paths and commits. Unless a citation names a different commit, upstream paths refer to aien-train `f1bebdf3c5b08ec624005e5bc39d0427a87f9537`; they are not local omega-mv paths.
 
+## Training from source text
+
+The seeded `wtrain` harness fine-tunes an existing checkpoint on a training text file and evaluates both checkpoints on the same held-out text. For a coding run, supply Omega source or instruction-and-function records. Keep the evaluation corpus separate before starting the run. The trainer uses full-token loss.
+
+Build on AArch64 Linux from the repository root with the seeded compiler. The first source supplies the existing Omega driver library.
+
+```sh
+driver=train/omega-llm/tools/wdrive
+{ sed "s/^fn main to int$/fn wbmain to int/" "$driver/wbuild.om"; cat "$driver/wtrain.om"; } | seed/out/omc > wtrain && chmod +x wtrain
+```
+
+Pass an Omega LLM executable, base checkpoint, tokenizer merges, training file, held-out file, new output directory, step count, learning rate in millionths and number of held-out windows. Byte checkpoints use `-` for the merges argument. BPE checkpoints use the native `bpeenc` command with the vocabulary size from the base checkpoint. Each corpus must supply at least one context window plus the next token. The held-out file must cover the requested number of windows.
+
+```sh
+./wtrain cpu ./ollm base.ck merges.bin training.om held-out.om run-01 100 250 3
+spark-window run ./wtrain gb10 ./ollm-gb10 base.ck merges.bin training.om held-out.om run-02 100 250 3
+```
+
+The GPU invocation runs inside an authorized exclusive Spark window. The harness creates a private directory, writes the token streams and `candidate.ck` there, and records native tokenizer, optimizer and evaluator output in `run.log`. An existing output directory is refused. A failed run retains its partial files. A successful run ends with `TRAINING_COMPLETE` after the final evaluation. The E lines report held-out language-model loss. Coding accuracy requires separate execution tests.
+
 ## Units
 
 Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`); `build.sh` has no Darwin target, so the `ollm_darwin` row follows upstream `tests/omegallm/ollm_metrics_bench.py` (`darwin-arm64`):

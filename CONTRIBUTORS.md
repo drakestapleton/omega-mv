@@ -360,3 +360,4 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Ported OSC integer-literal decoding and overflow detection to seeded Omega and connected the lexer to the generated binding. |
 
 | Codex (under Drake Stapleton’s direction) | Replayed the nine-check Spark GB10 Q38 stress suite on `371a882a5` and published the [November 20 measurements](docs/gpu/Q38_27B_GB10_STRESS_20261120.md). |
+| Codex (under Drake Stapleton’s direction) | Implemented the seeded Omega training harness for native tokenization, CPU and GB10 fine-tuning and held-out evaluation. |
