@@ -70,8 +70,9 @@ static int exercise(const char *program, RxCapRoot *root, RxCapAdmin *admin) {
 int main(int argc, char **argv) {
     RxCapRoot root;
     RxCapAdmin admin;
-    int device = argc == 3 && (strcmp(argv[2], "--sparse-silicon") == 0 ||
-                               strcmp(argv[2], "--arboris-silicon") == 0);
+    int signed_step = argc == 3 && strcmp(argv[2], "--arboris-signed-silicon") == 0;
+    int device = signed_step || (argc == 3 && (strcmp(argv[2], "--sparse-silicon") == 0 ||
+                               strcmp(argv[2], "--arboris-silicon") == 0));
     if ((!device && argc != 2) || rx_caproot_start(&root, &admin) != RX_CAP_OK) return 1;
     int result;
     if (device) {
@@ -79,7 +80,7 @@ int main(int argc, char **argv) {
                           .parent = {UINT32_MAX, 0}, .authority = admin.office};
         RxCapRef ref;
         result = rx_capadmin_mint(&admin, &mint, &ref) != RX_CAP_OK ||
-                 check(argv[1], &root, 42, ref, 1, ref.generation, 1);
+                 check(argv[1], &root, 42, ref, 1, ref.generation, signed_step ? 2 : 1);
     } else {
         result = exercise(argv[1], &root, &admin);
     }

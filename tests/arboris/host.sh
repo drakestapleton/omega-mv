@@ -13,6 +13,14 @@ compile() {
     "$OMC" < "$out/program.om" > "$dest"
     chmod +x "$dest"
 }
+printf 'om2\n' > "$out/signer-profile.om"
+compile "$out/world-signer" "$out/signer-profile.om" om/tls/sha2.om \
+    protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om seed/authority/arboris-signer.om
+sed '/^fn main to int/,$d' seed/authority/arboris-signer.om > "$out/signer-unit.om"
+compile "$out/signer-ledger" "$out/signer-profile.om" om/tls/sha2.om \
+    protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om "$out/signer-unit.om" tests/arboris/signer-ledger.om
+mkdir -p "$out/signer-ledger-fixture"
+(cd "$out/signer-ledger-fixture" && ../signer-ledger)
 grep -Fq "Arboris, Copyright 2026 Adam Pippert" NOTICE
 compile "$out/arena" om/arboris_arena.om tests/arboris_arena_test.om
 "$out/arena"
