@@ -66,6 +66,10 @@ static int expect(P *p, int k)
     return 0;
 }
 
+_Static_assert(sizeof(OscNode) == 104 && offsetof(OscNode, kind) == 0 && offsetof(OscNode, line) == 4 &&
+               offsetof(OscNode, col) == 8 && offsetof(OscNode, a) == 12 && offsetof(OscNode, b) == 16 &&
+               offsetof(OscNode, c) == 20 && offsetof(OscNode, next) == 24 && offsetof(OscNode, tok) == 28 &&
+               offsetof(OscNode, sym) == 88 && offsetof(OscNode, sym2) == 92, "OSC initial AST layout");
 static int new_node(P *p, int kind, const OscToken *t)
 {
     OscAst *a = p->ast;
@@ -75,14 +79,7 @@ static int new_node(P *p, int kind, const OscToken *t)
         return -1;
     }
     int i = (int)a->nnodes++;
-    OscNode *n = &a->nodes[i];
-    memset(n, 0, sizeof *n);
-    n->kind = (uint16_t)kind;
-    n->line = t->line;
-    n->col = t->col;
-    n->a = n->b = n->c = n->next = -1;
-    n->sym = n->sym2 = -1;
-    n->tok = (uint32_t)(t - a->toks);
+    osc_new_node((uint8_t *)&a->nodes[i], (uint16_t)kind, (uint32_t)(t - a->toks), t->line, t->col);
     return i;
 }
 #define N(i) (&p->ast->nodes[(i)])
@@ -968,7 +965,8 @@ static int parse_block(P *p)
  * source text is still recorded (token spellings joined by single spaces,
  * none after '(' or before ')') and carried into the IR; the expression node
  * is checked and lowered into runtime checks by the checker / lowerer. */
-_Static_assert(OSC_CLAUSE_MAX == 256, "OSC clause buffer must match the Omega binding");
+_Static_assert(OSC_CLAUSE_MAX == 256 && sizeof(OscToken) == 32 && offsetof(OscToken, kind) == 0 &&
+               offsetof(OscToken, off) == 12 && offsetof(OscToken, len) == 16, "OSC clause spelling layout");
 static int parse_clause(P *p, char *out, const OscToken *kw, int32_t *node)
 {
     uint32_t start = p->pos;
@@ -978,19 +976,14 @@ static int parse_clause(P *p, char *out, const OscToken *kw, int32_t *node)
     if (e < 0) return -1;
     if (!at(p, OT_LBRACE) && !at(p, OT_ENSURES))
         return syntax(p, "'ensures' or a function body '{' after the contract expression");
-    size_t len = 0;
-    int prev = -1;
-    for (uint32_t i = start; i < p->pos; i++) {
-        const OscToken *t = &p->ast->toks[i];
-        int k = t->kind;
-        len = osc_clause_word((uint8_t *)out, len, (uint64_t)prev, k,
-                              (const uint8_t *)p->ast->src + t->off, t->len);
-        if (len == OSC_CLAUSE_MAX) {
-            osc_diag_set(p->d, OSC_DIAG_CAPACITY, kw->line, kw->col, osc_tok_kind_name(kw->kind), 0, NULL,
-                         "contract text length", "contract clause longer than %d bytes", OSC_CLAUSE_MAX - 1);
-            return -1;
-        }
-        prev = k;
+    const OscToken *last = &p->ast->toks[p->pos - 1];
+    size_t source_end = (size_t)last->off + last->len;
+    size_t token_bytes = (size_t)(p->pos - start) * sizeof(OscToken);
+    if (osc_clause_text((uint8_t *)out, (const uint8_t *)&p->ast->toks[start], token_bytes,
+                        (const uint8_t *)p->ast->src, source_end) == OSC_CLAUSE_MAX) {
+        osc_diag_set(p->d, OSC_DIAG_CAPACITY, kw->line, kw->col, osc_tok_kind_name(kw->kind), 0, NULL,
+                     "contract text length", "contract clause longer than %d bytes", OSC_CLAUSE_MAX - 1);
+        return -1;
     }
     *node = e;
     return 0;

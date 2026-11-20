@@ -238,6 +238,10 @@ uint64_t rx_cq_within(uint64_t o_v, uint64_t o_best, uint64_t o_tol_ppm);
 uint64_t rx_cm_fit_predict(const uint64_t o_tri[36], const uint64_t o_xty_u[8], const uint64_t o_phi_u[8], const uint64_t o_meta[2], uint64_t o_dst[4]);
 /* export fn rx_cm_rank1_update tri edit ulong 36 xty edit ulong 8 phi view ulong 8 y_bits ulong to void */
 void rx_cm_rank1_update(uint64_t o_tri[36], uint64_t o_xty[8], const uint64_t o_phi[8], uint64_t o_y_bits);
+/* export fn rx_cm_pack_v1 model view uchar 28072 wire out uchar 28080 to void */
+void rx_cm_pack_v1(const uint8_t o_model[28072], uint8_t o_wire[28080]);
+/* export fn rx_cm_unpack_v1 wire view uchar 28080 model edit uchar 28072 to ulong */
+uint64_t rx_cm_unpack_v1(const uint8_t o_wire[28080], uint8_t o_model[28072]);
 /* export fn rx_rt_conf_bin conf ulong conf_one ulong bins ulong to ulong */
 uint64_t rx_rt_conf_bin(uint64_t o_conf, uint64_t o_conf_one, uint64_t o_bins);
 /* export fn rx_rt_wilson k ulong n ulong dst edit ulong 2 to void */
@@ -644,6 +648,10 @@ uint64_t osc_read_bound(uint64_t o_keyword, uint64_t o_kind, uint64_t o_value, u
 uint64_t osc_read_import(OscImportParse *o_state, uint64_t o_kind, const uint8_t *o_spelling, size_t o_spelling_len, uint8_t *o_table, size_t o_table_len);
 /* export fn osc_clause_word dst edit uchar 256 used ulong prev ulong kind ulong word view uchar * to ulong */
 uint64_t osc_clause_word(uint8_t o_dst[256], uint64_t o_used, uint64_t o_prev, uint64_t o_kind, const uint8_t *o_word, size_t o_word_len);
+/* export fn osc_clause_text dst edit uchar 256 tokens view uchar * source view uchar * to ulong */
+uint64_t osc_clause_text(uint8_t o_dst[256], const uint8_t *o_tokens, size_t o_tokens_len, const uint8_t *o_source, size_t o_source_len);
+/* export fn osc_new_node node out uchar 104 kind ulong token ulong line ulong col ulong to void */
+void osc_new_node(uint8_t o_node[104], uint64_t o_kind, uint64_t o_token, uint64_t o_line, uint64_t o_col);
 /* export fn osc_statement_plan plan edit stmtplan kind ulong nextkind ulong third ulong spelling view uchar * to ulong */
 uint64_t osc_statement_plan(OscStmtPlan *o_plan, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third, const uint8_t *o_spelling, size_t o_spelling_len);
 #define OSC_OWN_ALLOWED 0
@@ -733,6 +741,8 @@ void osc_snapshot_restore(const OscSnapshotShape *o_shape, uint32_t o_owners[128
 uint64_t osc_join_snapshot(const uint32_t *o_saved, size_t o_saved_len, uint32_t o_owners[1280], int32_t *o_changes, size_t o_changes_len);
 /* export fn osc_snapshot_moves saved view uint * owners view uint 1280 ids edit int * to ulong */
 uint64_t osc_snapshot_moves(const uint32_t *o_saved, size_t o_saved_len, const uint32_t o_owners[1280], int32_t *o_ids, size_t o_ids_len);
+/* export fn osc_join_branch_owners saved view uint * owners edit uint 1280 symbols view uint 19200 nodes edit uchar * to void */
+void osc_join_branch_owners(const uint32_t *o_saved, size_t o_saved_len, uint32_t o_owners[1280], const uint32_t o_symbols[19200], uint8_t *o_nodes, size_t o_nodes_len);
 typedef struct {
     uint32_t id;
     uint32_t line;
@@ -888,6 +898,8 @@ OMBR_ASSERT(offsetof(OscScopeExit, borrows) == 12, "layout exitwork field borrow
 OMBR_ASSERT(offsetof(OscScopeExit, actions) == 16, "layout exitwork field actions");
 /* export fn osc_scope_exit visible view ushort 480 symbols view uchar 76800 owners edit uchar 5120 borrows edit uchar 12288 work edit exitwork to ulong */
 uint64_t osc_scope_exit(const uint16_t o_visible[480], const uint8_t o_symbols[76800], uint8_t o_owners[5120], uint8_t o_borrows[12288], OscScopeExit *o_work);
+/* export fn osc_reserve_arena symbol edit uchar 160 loop_depth ulong branch_depth ulong cells ulong to ulong */
+uint64_t osc_reserve_arena(uint8_t o_symbol[160], uint64_t o_loop_depth, uint64_t o_branch_depth, uint64_t o_cells);
 #define OSC_FLOW_RETURNS 1
 #define OSC_FLOW_UNREACHABLE 2
 #define OSC_BLOCK_BAD_RANGE 1
@@ -915,6 +927,8 @@ uint64_t osc_ir_block_reads(const uint8_t *o_insns, size_t o_insns_len, uint64_t
 uint64_t osc_ir_canonical(uint64_t o_scalar, uint64_t o_value);
 /* export fn osc_ir_contract terms view uchar * params view uchar 256 result ulong to ulong */
 uint64_t osc_ir_contract(const uint8_t *o_terms, size_t o_terms_len, const uint8_t o_params[256], uint64_t o_result);
+/* export fn osc_begin_insn record out uchar 48 opcode ulong line ulong to ulong */
+uint64_t osc_begin_insn(uint8_t o_record[48], uint64_t o_opcode, uint64_t o_line);
 typedef struct {
     uint32_t index;
     uint32_t count;
@@ -942,12 +956,20 @@ int64_t tensor_view_bounds(const uint64_t *o_dims, size_t o_dims_len, const uint
 int64_t tensor_broadcast_dims(const uint64_t *o_lhs, size_t o_lhs_len, const uint64_t *o_rhs, size_t o_rhs_len, uint64_t *o_result_dims, size_t o_result_dims_len);
 /* export fn tensor_is_row_major dims view ulong * strides view ulong * to ulong */
 uint64_t tensor_is_row_major(const uint64_t *o_dims, size_t o_dims_len, const uint64_t *o_strides, size_t o_strides_len);
+/* export fn tensor_canonical_word dtype ulong word ulong to ulong */
+uint64_t tensor_canonical_word(uint64_t o_dtype, uint64_t o_word);
+/* export fn tensor_value_bytes data edit uchar * dtype ulong native_le ulong to void */
+void tensor_value_bytes(uint8_t *o_data, size_t o_data_len, uint64_t o_dtype, uint64_t o_native_le);
 /* export fn tg_sgd_mode learning ulong momentum ulong to long */
 int64_t tg_sgd_mode(uint64_t o_learning, uint64_t o_momentum);
 /* export fn tg_update_velocity velocity edit uint * gradient view uint * bits ulong to void */
 void tg_update_velocity(uint32_t *o_velocity, size_t o_velocity_len, const uint32_t *o_gradient, size_t o_gradient_len, uint64_t o_bits);
 /* export fn tg_update_params params edit uint * direction view uint * bits ulong to void */
 void tg_update_params(uint32_t *o_params, size_t o_params_len, const uint32_t *o_direction, size_t o_direction_len, uint64_t o_bits);
+/* export fn tg_encode_generation fields view ulong 5 dispatch view uchar 32 previous view uchar 32 header out uchar 152 to void */
+void tg_encode_generation(const uint64_t o_fields[5], const uint8_t o_dispatch[32], const uint8_t o_previous[32], uint8_t o_header[152]);
+/* export fn tg_decode_generation header view uchar 152 size ulong expected ulong fields edit ulong 5 to ulong */
+uint64_t tg_decode_generation(const uint8_t o_header[152], uint64_t o_size, uint64_t o_expected, uint64_t o_fields[5]);
 /* export fn ad_unbroadcast_steps source view ulong * target view ulong * steps edit uchar 8 to long */
 int64_t ad_unbroadcast_steps(const uint64_t *o_source, size_t o_source_len, const uint64_t *o_target, size_t o_target_len, uint8_t o_steps[8]);
 /* export fn ad_same_shape lhs view ulong * rhs view ulong * to ulong */
