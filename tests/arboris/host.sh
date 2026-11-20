@@ -13,6 +13,7 @@ compile() {
     "$OMC" < "$out/program.om" > "$dest"
     chmod +x "$dest"
 }
+grep -Fq "Arboris, Copyright 2026 Adam Pippert" NOTICE
 compile "$out/arena" om/arboris_arena.om tests/arboris_arena_test.om
 "$out/arena"
 compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om tests/arboris_spread_test.om
