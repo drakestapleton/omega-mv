@@ -15,23 +15,32 @@ note   vmul    c[gid] = a[gid] * b[gid]                      for gid < n
 note   vsub    c[gid] = a[gid] - b[gid]                      for gid < n
 note   vmax    c[gid] = a[gid] > b[gid] ? a[gid] : b[gid]    for gid < n (OpFOrdGreaterThan, OpSelect)
 note   fsum16  o[gid] = (((x[16g] + x[16g+1]) + x[16g+2]) ... + x[16g+15])  frozen left-to-right order
+note   gemm16  one work-item per element of a 16x16 f32 tile, 4096 tiles (n = 1048576):
+note     gid = tile * 256 + row * 16 + col
+note     C = 0; for k in 0..15 left to right: C = C + (A[row,k] * B[k,col])
+note     each * and + is its own op. No OpFma.
+note     Vulkan decorates every mul and add with NoContraction (42). spirv-val --target-env opencl2.2
+note     rejects that decoration (requires Capability Shader, which OpenCL forbids), so the OpenCL
+note     module uses ExecutionMode ContractionOff (31) instead. spirv-val --target-env vulkan1.1
+note     rejects ContractionOff (requires Capability Kernel, which Vulkan does not grant).
+note     A and B are row-major 16x16 inside the tile (256 floats per tile, same length as C).
 note   rmsnorm one work-item per row of 16 (train/openaccel-lab/workloads/rmsnorm/omega.om, frozen):
 note     ss = (((x0*x0 + x1*x1) + x2*x2) ... + x15*x15)
 note     yk = (xk * (1 / sqrt(ss * (1/16) + eps))) * wk     eps = binary32(0.000001) = 0x358637BD
 note     sqrt then div, not rsqrt and not fma. 1/16 is 0.0625 and is exact.
-note cl arguments: vadd, vmul, vsub, vmax (a, b, c, uint n), fsum16 (x, o, uint n),
+note cl arguments: vadd, vmul, vsub, vmax, gemm16 (a, b, c, uint n), fsum16 (x, o, uint n),
 note   rmsnorm (x, w, y, uint nrows). w is 16 floats, shared by every row.
-note vk bindings set 0: vadd, vmul, vsub, vmax a=0 b=1 c=2, fsum16 x=0 o=1, rmsnorm x=0 w=1 y=2;
+note vk bindings set 0: vadd, vmul, vsub, vmax, gemm16 a=0 b=1 c=2, fsum16 x=0 o=1, rmsnorm x=0 w=1 y=2;
 note n = OpArrayLength of the output buffer (rmsnorm divides that length by 16);
 note LocalSize 64 1 1.
 note
-note Usage: emit vadd|vmul|vsub|vmax|fsum16|rmsnorm cl|vk [mutant]
+note Usage: emit vadd|vmul|vsub|vmax|fsum16|rmsnorm|gemm16 cl|vk [mutant]
 note mutant plants a wrong kernel for negative controls: vadd uses OpFSub, vmul and vsub use OpFAdd,
-note vmax selects the other operand (min), fsum16 and rmsnorm add right-to-left.
+note vmax selects the other operand (min), fsum16, rmsnorm and gemm16 add right-to-left.
 note Exit: 0 module written; 2 usage; 3 stdout write failed. Traps exit 100 + code.
 om2
 
-text tuse "usage: emit vadd|vmul|vsub|vmax|fsum16|rmsnorm cl|vk [mutant]\n"
+text tuse "usage: emit vadd|vmul|vsub|vmax|fsum16|rmsnorm|gemm16 cl|vk [mutant]\n"
 text tio "emit: stdout write failed\n"
 text tvadd "vadd"
 text tfsum "fsum16"
@@ -39,6 +48,7 @@ text tvmul "vmul"
 text tvsub "vsub"
 text tvmax "vmax"
 text trms "rmsnorm"
+text tgemm "gemm16"
 text tocls "OpenCL.std"
 text tglsl "GLSL.std.450"
 text tcl "cl"
@@ -65,16 +75,21 @@ const IB2 uint 17
 const IN uint 18
 const IK0 uint 20
 const IK16 uint 36
-const IDYN uint 40
 const IEXT uint 19
 const IONE uint 37
 const IEPS uint 38
 const IINV uint 39
+note gemm16 ids: 256 and f32 0, then 16 mul results and 16 add results. Each is NoContraction.
+const I256 uint 74
+const IZERO uint 75
+const IMUL0 uint 80
+const IADD0 uint 96
+const IDYN uint 112
 
-global gw uint 4096
-global gob uchar 16384
+global gw uint 8192
+global gob uchar 65536
 global garg uchar 16
-note gst: 0 word fill, 1 next id, 2 env (0 cl, 1 vk), 3 kernel (0 vadd, 1 fsum16, 2 vmul, 3 vsub, 4 vmax), 4 mutant
+note gst: 0 word fill, 1 next id, 2 env (0 cl, 1 vk), 3 kernel (0 vadd, 1 fsum16, 2 vmul, 3 vsub, 4 vmax, 5 rmsnorm, 6 gemm16), 4 mutant
 global gst ulong 8
 
 fn usage to void
@@ -155,6 +170,10 @@ if eq get gst 3 5
 wstr trms
 ret
 end
+if eq get gst 3 6
+wstr tgemm
+ret
+end
 wstr tfsum
 end
 
@@ -173,6 +192,9 @@ ret strwc tvmax
 end
 if eq get gst 3 5
 ret strwc trms
+end
+if eq get gst 3 6
+ret strwc tgemm
 end
 ret strwc tfsum
 end
@@ -244,6 +266,20 @@ w 6
 w IMAIN
 kname
 w IGID
+nocon
+end
+
+note Execution mode 31 is ContractionOff, OpenCL only. Vulkan rejects it (needs Kernel).
+fn nocon to void
+if isvk
+ret
+end
+if ne get gst 3 6
+ret
+end
+op 16 3
+w IMAIN
+w 31
 end
 
 fn decor to void
@@ -255,8 +291,8 @@ if not isvk
 op 71 3
 w IGID
 w 22
-ret
 end
+if isvk
 op 71 4
 w IRTA
 w 6
@@ -278,6 +314,19 @@ op 71 4
 w bufid i
 w 33
 w i
+end
+end
+if ne get gst 3 6
+ret
+end
+if not isvk
+ret
+end
+note Decoration 42 is NoContraction. Vulkan only: OpenCL forbids it without Shader.
+for i uint 32
+op 71 3
+w add IMUL0 i
+w 42
 end
 end
 
@@ -363,6 +412,26 @@ w add IK0 k
 w k
 w 0
 end
+end
+if eq get gst 3 6
+if isvk
+op 43 4
+w IU32
+w I256
+w 256
+end
+if not isvk
+op 43 5
+w IU64
+w I256
+w 256
+w 0
+end
+op 43 4
+w IF32
+w IZERO
+w 0
+ret
 end
 if ne get gst 3 5
 ret
@@ -456,6 +525,15 @@ end
 
 fn farith c uint a uint b uint to uint
 r = nid
+op c 5
+w IF32
+w r
+w a
+w b
+ret r
+end
+
+fn farithid c uint a uint b uint r uint to uint
 op c 5
 w IF32
 w r
@@ -599,6 +677,37 @@ end
 st eptr IB1 x acc
 end
 
+note gemm16: C = 0; for k left to right, C = C + (A[row,k] * B[k,col]).
+note Mul is OpFMul 133 and add is OpFAdd 129, each with its own result id (NoContraction).
+note The mutant walks k from 15 down to 0. No OpFma.
+fn gacc rowb uint j uint base uint s uint acc uint to uint
+q = fsel s
+q = add IK0 q
+a = iarith 128 rowb q
+a = iarith 128 base a
+b = iarith 132 q IK16
+b = iarith 128 b j
+b = iarith 128 base b
+a = ld eptr IB0 a
+b = ld eptr IB1 b
+q = farithid 133 a b add IMUL0 s
+ret farithid 129 acc q add IADD0 s
+end
+
+fn bgemm x uint to void
+p = iarith 134 x I256
+q = iarith 137 x I256
+i = iarith 134 q IK16
+j = iarith 137 q IK16
+rowb = iarith 132 i IK16
+base = iarith 132 p I256
+acc = IZERO
+for s uint 16
+acc = gacc rowb j base s acc
+end
+st eptr IB2 x acc
+end
+
 fn count x uint to uint
 n = nid
 if isvk
@@ -679,9 +788,14 @@ end
 if eq k 5
 brms x
 end
+if eq k 6
+bgemm x
+end
 if ne k 1
 if ne k 5
+if ne k 6
 bvadd x
+end
 end
 end
 op 249 2
@@ -744,6 +858,9 @@ put gst 3 4
 end
 if argis 1 trms
 put gst 3 5
+end
+if argis 1 tgemm
+put gst 3 6
 end
 put gst 2 9
 if argis 2 tcl

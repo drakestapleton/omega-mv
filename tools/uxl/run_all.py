@@ -4,7 +4,8 @@
   python3 tools/uxl/run_all.py
   py tools\\uxl\\run_all.py
 
-Optional: --level1 DIR, --evidence URL (Zenodo API record; default 24237047).
+Optional: --level1 DIR, --evidence URL (Zenodo API record; default 24237047),
+--install-deps (run this distro's one install command; the only path that uses sudo).
 SKIP, NOT_RUN, and MISSING are reported and do not count as passes.
 Exit 0 only when nothing FAILed.
 """
@@ -40,6 +41,8 @@ def _read_pinned_omc_sha256():
 
 PINNED_OMC_SHA256 = _read_pinned_omc_sha256()
 SHA256_RE = re.compile(r"sha256=([0-9a-fA-F]{64})")
+MACHINE = None
+ALLOW_GPU = False
 
 
 class Tee(object):
@@ -196,10 +199,9 @@ def opencl_probe():
     return present_gpu, present_runtime, "; ".join(details) if details else "no OpenCL probe data"
 
 
-def header():
+def identity():
     omc = ROOT / "seed/out/omc"
     omc_hash = sha256_file(omc) if omc.is_file() else "MISSING"
-    print("uxl-run log")
     print("git HEAD %s" % git_head())
     print("omc sha256 %s" % omc_hash)
     print("python %s" % sys.version.replace("\n", " "))
@@ -305,6 +307,16 @@ def level1_stage(directory):
 
 def level2_stage():
     stage("3. Level 2 rebuild")
+    if MACHINE is not None and MACHINE.omc == "not-run":
+        hint = omc_hint(MACHINE)
+        print("NOT_RUN Level 2: %s" % hint)
+        print("level2 counts: pass=0 fail=0 not_run=1")
+        if MACHINE.arch == "arm64":
+            arm = ("NOT_RUN", hint, 0, 0, 0)
+        else:
+            print("SKIP trace.c is arm64-only and was not run")
+            arm = ("SKIP", "1 arm64-only test(s) not run", 0, 0, 1)
+        return ("NOT_RUN", hint, 0, 0, 0), arm
     print("driver tests/amd-kfd-launch/check.py")
     print("hashes gpu/amd/card.tsv, cross-checked against Zenodo %s for launch-x86 and vadd" % ZENODO_DOI)
     proc = subprocess.Popen(
@@ -377,6 +389,8 @@ def omc_can_run(omc):
 
 
 def qemu_install_line():
+    if MACHINE is not None and MACHINE.omc == "not-run":
+        return omc_hint(MACHINE)
     return (
         "omc is the pinned AArch64 binary sha256 %s. On x86 Linux install "
         "qemu-user-static and binfmt-support, mount binfmt_misc, and register "
@@ -384,6 +398,259 @@ def qemu_install_line():
         "On Windows, use WSL with that binfmt setup."
         % PINNED_OMC_SHA256
     )
+
+
+class Machine(object):
+    def __init__(self):
+        self.os = "linux"
+        self.wsl = ""
+        self.arch = "x86_64"
+        self.distro = "linux"
+        self.omc = "not-run"
+        self.spirv_val = "no"
+        self.vulkan = "no"
+        self.opencl_intel = "no"
+        self.levelzero = "no"
+        self.install = ""
+
+
+def norm_arch(name):
+    low = (name or "").lower()
+    if low in ("x86_64", "amd64", "x64"):
+        return "x86_64"
+    if low in ("aarch64", "arm64", "armv8l"):
+        return "arm64"
+    return low or "unknown"
+
+
+def read_os_release():
+    data = {}
+    path = Path("/etc/os-release")
+    if not path.is_file():
+        return data
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return data
+    for line in lines:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key] = value.strip().strip('"')
+    return data
+
+
+def wsl_name():
+    name = os.environ.get("WSL_DISTRO_NAME") or ""
+    if name:
+        return name
+    try:
+        version = Path("/proc/version").read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return ""
+    if "microsoft" in version or "wsl" in version:
+        return "yes"
+    return ""
+
+
+def spirv_val_present():
+    name = os.environ.get("SPIRV_VAL", "spirv-val")
+    if shutil.which(name) or Path(name).is_file():
+        return "yes"
+    return "no"
+
+
+def vulkan_backend():
+    found = []
+    directories = (
+        Path("/usr/share/vulkan/icd.d"),
+        Path("/usr/local/share/vulkan/icd.d"),
+        Path("/etc/vulkan/icd.d"),
+    )
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.json")):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                text = path.name.lower()
+            if "lvp" in text or "lavapipe" in text:
+                found.append("lavapipe")
+            elif "intel" in text:
+                found.append("intel")
+            else:
+                found.append("other")
+    if not found:
+        return "no"
+    ordered = []
+    for name in ("lavapipe", "intel", "other"):
+        if name in found:
+            ordered.append(name)
+    return ",".join(ordered)
+
+
+def levelzero_backend():
+    names = (
+        "/usr/lib/x86_64-linux-gnu/libze_loader.so.1",
+        "/usr/lib/aarch64-linux-gnu/libze_loader.so.1",
+        "/usr/lib/libze_loader.so.1",
+    )
+    for name in names:
+        if Path(name).is_file():
+            return "yes"
+    if shutil.which("ze_info"):
+        return "yes"
+    return "no"
+
+
+def binfmt_register_command():
+    # One sh -c. The kernel decodes the \x escapes. No-op when qemu-aarch64 is already enabled.
+    body = (
+        "grep -q ^enabled /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null || "
+        "{ mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true; "
+        "interp=/usr/libexec/qemu-binfmt/aarch64-binfmt-P; "
+        '[ -x "$interp" ] || interp=/usr/bin/qemu-aarch64-static; '
+        'printf "%s%s\\n" ":qemu-aarch64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00:'
+        '\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:" '
+        '"$interp:OPF" > /proc/sys/fs/binfmt_misc/register; }'
+    )
+    return "sh -c '%s'" % body
+
+
+def install_command(machine):
+    if machine.os == "windows":
+        return "wsl --install -d Ubuntu"
+    if machine.os == "macos":
+        return "brew install spirv-tools"
+    release = read_os_release()
+    ident = (release.get("ID") or "").lower()
+    like = (release.get("ID_LIKE") or "").lower()
+    family = ident + " " + like
+    if "debian" in family or "ubuntu" in family or ident in ("debian", "ubuntu"):
+        packages = ["python3", "spirv-tools", "mesa-vulkan-drivers", "ocl-icd-libopencl1"]
+        if machine.arch == "x86_64":
+            packages[1:1] = ["qemu-user-static", "binfmt-support"]
+        command = (
+            "sudo sh -c '"
+            "if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then "
+            "sed -i \"s/^Components: .*/Components: main universe/\" /etc/apt/sources.list.d/ubuntu.sources; "
+            "fi; "
+            "if [ -f /etc/apt/sources.list ]; then "
+            "sed -i \"s/ main$/ main universe/\" /etc/apt/sources.list; "
+            "fi' && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get update && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y " + " ".join(packages)
+        )
+        if machine.arch == "x86_64":
+            command += " && sudo " + binfmt_register_command()
+        return command
+    if "fedora" in family or "rhel" in family or ident in ("fedora", "rhel", "centos"):
+        packages = "python3 spirv-tools mesa-vulkan-drivers ocl-icd"
+        if machine.arch == "x86_64":
+            packages = "qemu-user-static " + packages
+        return "sudo dnf install -y " + packages
+    if ident == "arch" or "arch" in like.split():
+        packages = "python spirv-tools vulkan-swrast ocl-icd"
+        if machine.arch == "x86_64":
+            packages = "qemu-user-static " + packages
+        return "sudo pacman -Sy --needed --noconfirm " + packages
+    return ""
+
+
+def toolchain_gap(machine):
+    if machine.os == "windows":
+        return not machine.wsl
+    if machine.os == "macos":
+        return machine.spirv_val == "no"
+    if machine.omc == "not-run" or machine.spirv_val == "no" or machine.vulkan == "no":
+        return True
+    return False
+
+
+def omc_hint(machine):
+    if machine.os == "macos":
+        return (
+            "omc is an AArch64 Linux binary and cannot exec on macOS. "
+            "Use a Linux VM. NOT_RUN is not a failure."
+        )
+    if machine.os == "windows":
+        return (
+            "omc is an AArch64 Linux binary and cannot exec on native Windows. "
+            "Install WSL2 Ubuntu and rerun .\\uxl-run.ps1, which hands off to ./uxl-run.sh. "
+            "wsl --install -d Ubuntu"
+        )
+    if machine.install:
+        return machine.install
+    return (
+        "omc is the pinned AArch64 binary sha256 %s and did not execute."
+        % PINNED_OMC_SHA256
+    )
+
+
+def detect():
+    machine = Machine()
+    system = platform.system().lower()
+    if system == "darwin":
+        machine.os = "macos"
+        machine.distro = "macos"
+    elif system == "windows":
+        machine.os = "windows"
+        machine.distro = "windows"
+    else:
+        machine.os = "linux"
+        release = read_os_release()
+        ident = release.get("ID") or "linux"
+        version = release.get("VERSION_ID") or ""
+        machine.distro = (ident + " " + version).strip()
+    machine.wsl = wsl_name()
+    machine.arch = norm_arch(platform.machine())
+    machine.spirv_val = spirv_val_present()
+    machine.vulkan = vulkan_backend()
+    gpu, _runtime, _detail = opencl_probe()
+    machine.opencl_intel = "yes" if gpu else "no"
+    machine.levelzero = levelzero_backend()
+    if machine.os in ("macos", "windows"):
+        machine.omc = "not-run"
+    else:
+        ok, _detail = omc_can_run(ROOT / "seed/out/omc")
+        if ok and machine.arch == "arm64":
+            machine.omc = "native"
+        elif ok:
+            machine.omc = "qemu"
+        else:
+            machine.omc = "not-run"
+    if toolchain_gap(machine):
+        machine.install = install_command(machine)
+    return machine
+
+
+def print_detected(machine):
+    print("detected")
+    print("  os %s" % machine.os)
+    print("  wsl %s" % (machine.wsl or "no"))
+    print("  arch %s" % machine.arch)
+    print("  distro %s" % machine.distro)
+    print("  omc %s" % machine.omc)
+    print("  spirv-val %s" % machine.spirv_val)
+    print("  vulkan %s" % machine.vulkan)
+    print("  opencl-intel %s" % machine.opencl_intel)
+    print("  levelzero %s" % machine.levelzero)
+    hint = omc_hint(machine) if machine.omc == "not-run" else ""
+    if hint and hint != machine.install:
+        print("hint %s" % hint)
+    if machine.install:
+        print("install %s" % machine.install)
+    elif hint:
+        print("hint %s" % hint)
+
+
+def execute_install(command):
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        command = command.replace("sudo ", "")
+    print(command, flush=True)
+    proc = subprocess.run(["sh", "-c", command])
+    return proc.returncode == 0
 
 
 def spirv_val_install_line():
@@ -397,6 +664,10 @@ def child_env():
     env = dict(os.environ)
     env["OMC"] = "seed/out/omc"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if ALLOW_GPU:
+        env["UXL_GPU"] = "1"
+    else:
+        env.pop("UXL_GPU", None)
     return env
 
 
@@ -457,6 +728,22 @@ def parse_plan(path):
     return rows, None
 
 
+def omc_did_not_start(lines):
+    text = "\n".join(lines)
+    if "NOT_RUN rmsnorm: cannot execute" in text:
+        return True
+    if "seed/out/omc" in text or "Exec format error" in text:
+        if (
+            "Exec format error" in text
+            or "Errno 8" in text
+            or "WinError 193" in text
+            or "not a valid Win32 application" in text
+            or "cannot execute" in text
+        ):
+            return True
+    return False
+
+
 def row_argv(command):
     argv = shlex.split(command)
     if argv and argv[0] in ("python3", "python", "py"):
@@ -489,12 +776,17 @@ def run_plan(path):
         code, lines = stream(argv, ROOT)
         digest = sha_from_lines(lines)
         computed = digest if digest else "NONE"
-        if code == 2:
+        if code == 2 or omc_did_not_start(lines):
+            why = "prerequisite %s missing" % (prereq or "runtime")
+            if omc_did_not_start(lines):
+                why = "omc cannot run"
+                if not any(qemu_install_line() in line for line in lines):
+                    print(qemu_install_line())
             print(
                 "HASH %s expected %s computed NOT_RUN NOT_RUN" % (name, expected or "sha256"),
                 flush=True,
             )
-            print("NOT_RUN %s exit 2 (prerequisite %s missing; not a pass)" % (name, prereq or "runtime"))
+            print("NOT_RUN %s exit %s (%s; not a pass)" % (name, code, why))
             not_run += 1
             continue
         phrase_ok = (not stdout_need) or any(stdout_need in line for line in lines)
@@ -532,19 +824,25 @@ def spirv_stage():
         print("MISSING gpu/spirv/check.sh")
         print("spirv counts: pass=0 fail=0 skip=0")
         return "MISSING", "gpu/spirv/check.sh is not in this checkout", 0, 0, 0
-    reasons = []
+    if MACHINE is not None and MACHINE.omc == "not-run":
+        hint = omc_hint(MACHINE)
+        print("NOT_RUN %s" % hint)
+        print("spirv counts: pass=0 fail=0 not_run=1")
+        return "NOT_RUN", hint, 0, 0, 0
     spirv_val = os.environ.get("SPIRV_VAL", "spirv-val")
     if shutil.which(spirv_val) is None and not Path(spirv_val).is_file():
-        reasons.append(spirv_val_install_line())
+        hint = (MACHINE.install if MACHINE is not None and MACHINE.install else spirv_val_install_line())
+        print("NOT_RUN %s" % hint)
+        print("spirv counts: pass=0 fail=0 not_run=1")
+        return "NOT_RUN", hint, 0, 0, 0
     omc = ROOT / "seed/out/omc"
     ok, detail = omc_can_run(omc)
     print("OMC %s" % detail)
     if not ok:
-        reasons.append("%s. %s" % (detail, qemu_install_line()))
-    if reasons:
-        print("SKIP " + " ".join(reasons))
-        print("spirv counts: pass=0 fail=0 skip=1")
-        return "SKIP", " ".join(reasons), 0, 0, 1
+        hint = qemu_install_line()
+        print("NOT_RUN %s. %s" % (detail, hint))
+        print("spirv counts: pass=0 fail=0 not_run=1")
+        return "NOT_RUN", "%s. %s" % (detail, hint), 0, 0, 0
     print("RUN OMC=seed/out/omc sh gpu/spirv/check.sh", flush=True)
     code, _lines = stream(["sh", "gpu/spirv/check.sh"], ROOT)
     verdict = "MATCH" if code == 0 else "MISMATCH"
@@ -565,13 +863,6 @@ def spirv_rmsnorm_stage():
         print("MISSING gpu/spirv/intel-rmsnorm.tsv")
         print("spirv-rmsnorm counts: pass=0 fail=0 not_run=0")
         return "MISSING", "gpu/spirv/intel-rmsnorm.tsv is not in this checkout", 0, 0, 0
-    ok, detail = omc_can_run(ROOT / "seed/out/omc")
-    print("OMC %s" % detail)
-    if not ok:
-        reason = "%s. %s" % (detail, qemu_install_line())
-        print("SKIP " + reason)
-        print("spirv-rmsnorm counts: pass=0 fail=0 skip=1")
-        return "SKIP", reason, 0, 0, 1
     print("PLAN gpu/spirv/intel-rmsnorm.tsv")
     passed, failed, not_run = run_plan(path)
     print("spirv-rmsnorm counts: pass=%d fail=%d not_run=%d" % (passed, failed, not_run))
@@ -581,39 +872,14 @@ def spirv_rmsnorm_stage():
 def intel_opencl_stage():
     stage("7. Intel OpenCL vadd/fsum16/gemm16")
     plan = ROOT / "gpu/spirv/intel-opencl.tsv"
-    print("expect %s" % plan.relative_to(ROOT).as_posix())
-    gemm = []
-    for base in (ROOT / "gpu", ROOT / "tests"):
-        if not base.is_dir():
-            continue
-        for found in base.rglob("*"):
-            if found.is_file() and "gemm16" in found.name.lower():
-                gemm.append(found.relative_to(ROOT).as_posix())
-    if gemm:
-        print("found gemm16 files: %s" % ", ".join(sorted(gemm)))
-    else:
-        print("MISSING gemm16 under gpu/ and tests/ (no file name contains gemm16)")
-    conform = ROOT / "gpu/spirv/conform.om"
-    emit = ROOT / "gpu/spirv/emit.om"
-    if conform.is_file():
-        body = conform.read_text(encoding="utf-8", errors="replace")
-        print("gpu/spirv/conform.om gemm16 %s" % ("present" if "gemm16" in body else "absent"))
-    else:
-        print("MISSING gpu/spirv/conform.om")
-    if emit.is_file():
-        body = emit.read_text(encoding="utf-8", errors="replace")
-        print("gpu/spirv/emit.om gemm16 %s" % ("present" if "gemm16" in body else "absent"))
-    else:
-        print("MISSING gpu/spirv/emit.om")
     print(
-        "gpu/spirv/conform.om has host references for vadd and fsum16. "
-        "Those run in the spirv stage via gpu/spirv/check.sh. "
-        "There is no OpenCL device plan for vadd, fsum16, and gemm16."
+        "reference sha256 vadd 72d0c1b2928779e83518f0b4c7d101d933cf89f210cd4627e138c33c9ce9b6a6"
     )
     print(
-        "Zenodo %s uxl-brief.tex does not define those Intel OpenCL rows "
-        "(its vadd is the AMD hsaco). No result was invented."
-        % ZENODO_DOI
+        "reference sha256 fsum16 6a6de93787e333d506d50996589af3e025c16b9bfc7c9493e1af34578e076290"
+    )
+    print(
+        "reference sha256 gemm16 d1e02b7d8dd06cd84ee45294b0525000cf7c61e6f6fa32bfa81d3719e47a6987"
     )
     if not plan.is_file():
         print("MISSING gpu/spirv/intel-opencl.tsv")
@@ -741,12 +1007,40 @@ def main(argv):
     parser = argparse.ArgumentParser(description="Run the UXL checks")
     parser.add_argument("--level1", help="directory with SHA256.json and verify.py")
     parser.add_argument("--evidence", help="Zenodo API record URL (default: record 24237047)")
+    parser.add_argument(
+        "--install-deps",
+        action="store_true",
+        help="run the distro install command printed for missing tools (uses sudo)",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="allow a non-Intel hardware Vulkan GPU (default is Intel or lavapipe only)",
+    )
     args = parser.parse_args(argv)
     path = log_path()
     tee = Tee(path)
     sys.stdout = tee
     try:
-        header()
+        global MACHINE, ALLOW_GPU
+        ALLOW_GPU = args.gpu
+        print("uxl-run log")
+        print("vulkan policy %s" % ("--gpu" if ALLOW_GPU else "intel-or-software"))
+        MACHINE = detect()
+        print_detected(MACHINE)
+        if args.install_deps:
+            if not MACHINE.install:
+                print("install-deps: already present")
+            else:
+                print("install-deps running", flush=True)
+                if not execute_install(MACHINE.install):
+                    print("FAIL install-deps")
+                    print("")
+                    print("log %s" % path.resolve())
+                    return 1
+                MACHINE = detect()
+                print_detected(MACHINE)
+        identity()
         rows = []
         rows.append(("host",) + host_stage())
         rows.append(("level1",) + level1_stage(level1_dir(args.level1)))
