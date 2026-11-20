@@ -18,7 +18,7 @@ TRAIN_DIR = $(OUT_DIR)/train
 TRAIN_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -ffp-contract=off -Isrc
 TRAIN_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
 TRAIN_SRCS = src/train/tg_store.c src/train/tg_sgd.c src/omega_om_units.c
-TRAIN_HDRS = src/train/tg_store.h src/train/tg_sgd.h src/sha256.h
+TRAIN_HDRS = src/train/tg_store.h src/train/tg_sgd.h src/sha256.h src/omega_api_decl.h
 
 $(TRAIN_DIR)/test_train: tests/train/test_train.c $(TRAIN_SRCS) $(TRAIN_HDRS)
 	@mkdir -p $(TRAIN_DIR)
@@ -29,10 +29,11 @@ $(TRAIN_DIR)/test_train_asan: tests/train/test_train.c $(TRAIN_SRCS) $(TRAIN_HDR
 	$(CC) $(TRAIN_CFLAGS) $(TRAIN_ASAN) -o $@ tests/train/test_train.c $(TRAIN_SRCS) -lm
 
 train-purity:
-	@bad=$$(grep -hE '^[[:space:]]*#[[:space:]]*include' src/train/*.c src/train/*.h | \
+	@bad=$$(grep -HE '^[[:space:]]*#[[:space:]]*include' src/train/*.c src/train/*.h | \
+		grep -vE '^src/train/tg_sgd\.c:#[[:space:]]*include[[:space:]]+"omega_api_decl\.h"$$' | \
 		grep -vE '#[[:space:]]*include[[:space:]]+(<[a-z/]+\.h>|"sha256\.h"|"train/tg_[a-z]+\.h")' || true); \
 	if [ -n "$$bad" ]; then echo "train-purity: FAIL, unexpected includes:"; echo "$$bad"; exit 1; fi; \
-	echo "train-purity: src/train depends only on libc, sha256 and itself"
+	echo "train-purity: src/train depends only on libc, sha256, the seeded SGD binding and itself"
 
 test-train: train-purity $(TRAIN_DIR)/test_train $(TRAIN_DIR)/test_train_asan
 	./$(TRAIN_DIR)/test_train $(TRAIN_DIR)/scratch > $(TRAIN_DIR)/plain.log 2>&1; rc=$$?; \
