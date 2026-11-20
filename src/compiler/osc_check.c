@@ -103,6 +103,7 @@ typedef struct {
     Obj obj[OSC_CHECK_MAX_OBJS];
     Bor bor[OSC_CHECK_MAX_BORS];
     OscCheckedScope names;
+    char fn_names[OSC_MAX_FUNCS][64];
     OscHandleState handles;
     /* The first free site is consulted only for a definitely freed provenance.
      * Source line occupies the low word, freeing symbol the high word. */
@@ -1147,19 +1148,10 @@ static int chk(C *c, int i, OscScalar want)
     return (int)t;
 }
 
-static int find_fn(C *c, const char *name, int *after)
+static int find_fn(const C *c, const char *name, uint32_t count)
 {
-    *after = 0;
-    for (uint32_t k = 0; k < c->ast->nfns; k++) {
-        char fn[64];
-        osc_node_name(c->ast, NODE(c->ast->fns[k]), fn, sizeof fn);
-        if (strcmp(fn, name) == 0) {
-            if ((int)k < c->fi) return (int)k;
-            *after = 1;
-            return -1;
-        }
-    }
-    return -1;
+    return (int)osc_find_function((const uint8_t *)c->fn_names, count * sizeof c->fn_names[0],
+                                  (const uint8_t *)name, strlen(name));
 }
 
 static int same_arr(const OscType *a, const OscType *b)
@@ -1247,22 +1239,22 @@ static int chk_contracts(C *c, int fi)
 
 /* OSC-2: refuse a call whose literal / constant arguments make the callee's
  * requires clause fold to false. */
-static int chk_call_requires(C *c, int i, int g, const int *args, int na)
+_Static_assert(OSC_MAX_PARAMS == 6 && offsetof(OscNode, next) == 24 &&
+               offsetof(OscNode, ty.ref) == 60 && offsetof(OscNode, mut) == 72 &&
+               ON_NAME == 17 && ON_BORROW == 20 && OSC_T_REF == 10 &&
+               OSC_T_BYTES == 11 && OSC_T_CELLS == 12 && OSC_REF_OWN == 1 &&
+               OSC_REF_MUT == 3, "OSC call checker layout and tags");
+
+static int chk_call_requires(C *c, int i, int g, OscCallArgs *call)
 {
     OscAst *a = c->ast;
     if (a->reqn[g] < 0 || a->req_elide[g]) return 0;
     const OscNode *n = NODE(i);
-    const OscNode *f = NODE(a->fns[g]);
-    CEnv env, none;
-    memset(&env, 0, sizeof env);
-    memset(&none, 0, sizeof none);
-    env.res_sym = none.res_sym = -1;
-    env.nk = na;
-    int k = 0;
-    for (int p = f->a; p >= 0 && k < na; p = NODE(p)->next, k++)
-        if (NODE(p)->ty.s != OSC_T_REF && NODE(p)->ty.s != OSC_T_BYTES && NODE(p)->ty.s != OSC_T_CELLS && ceval(c, args[k], &none, &env.v[k])) env.k[k] = 1;
-    uint64_t v;
-    if (ceval(c, a->reqn[g], &env, &v) && !v) {
+    call->clause = (uint32_t)a->reqn[g];
+    CEnv bindings = {.res_sym = -1};
+    if (!osc_call_requires((const uint8_t *)a->nodes, a->nnodes * sizeof(OscNode),
+                           call, &bindings,
+                           c->expr_work, c->expr_words)) {
         char name[64];
         osc_node_name(a, n, name, sizeof name);
         osc_diag_set(c->d, OSC_DIAG_CONTRACT_VIOLATION, n->line, n->col, name, NODE(a->reqn[g])->line, a->req[g],
@@ -1278,9 +1270,9 @@ static int chk_call(C *c, int i, OscScalar want, int as_stmt)
     OscNode *n = NODE(i);
     char name[64], msg[160];
     osc_node_name(c->ast, n, name, sizeof name);
-    int after;
-    int g = find_fn(c, name, &after);
-    if (g < 0) {
+    int g = find_fn(c, name, c->ast->nfns);
+    if (g < 0 || g >= c->fi) {
+        int after = g >= c->fi;
         osc_diag_set(c->d, OSC_DIAG_UNDEFINED_NAME, n->line, n->col, name, 0, NULL,
                      after ? "call before definition" : "call of undefined function",
                      after ? "'%s' is called before its definition is complete (no recursion, no forward reference)"
@@ -1289,26 +1281,22 @@ static int chk_call(C *c, int i, OscScalar want, int as_stmt)
     }
     n->sym = g;
     const OscNode *f = NODE(c->ast->fns[g]);
-    int params[OSC_MAX_PARAMS], np = 0;
-    for (int p = f->a; p >= 0; p = NODE(p)->next) params[np++] = p;
-    int args[OSC_MAX_PARAMS + 1], na = 0;
-    for (int a = n->a; a >= 0; a = NODE(a)->next) {
-        if (na > OSC_MAX_PARAMS) break;
-        args[na++] = a;
-    }
-    if (na != np) {
-        snprintf(msg, sizeof msg, "'%s' takes %d argument(s), %d given", name, np, na);
+    OscCallArgs call;
+    osc_call_args((const uint8_t *)c->ast->nodes, c->ast->nnodes * sizeof(OscNode), f->a, n->a, &call);
+    if (call.na != call.np) {
+        snprintf(msg, sizeof msg, "'%s' takes %u argument(s), %u given", name, call.np, call.na);
         osc_diag_set(c->d, OSC_DIAG_TYPE_MISMATCH, n->line, n->col, name, f->line, NULL, "arity mismatch", "%s", msg);
         return -1;
     }
     int cb[OSC_MAX_PARAMS], ncb = 0;
-    for (int k = 0; k < na; k++) {
-        OscNode *a = NODE(args[k]);
-        const OscType *pt = &NODE(params[k])->ty;
-        if (pt->s == OSC_T_BYTES || pt->s == OSC_T_CELLS) { /* a slice goes down whole, by name, to a slice of the same type */
-            int ss = slice_name(c, args[k]);
+    for (uint32_t k = 0; k < call.na; k++) {
+        OscNode *a = NODE(call.args[k]);
+        const OscType *pt = &NODE(call.params[k])->ty;
+        if (call.actions[k] == OSC_ARG_SLICE_BORROW)
+            return tmismatch(c, a, name, "borrow passed to a slice parameter");
+        if (call.actions[k] == OSC_ARG_SLICE) { /* a slice goes down whole, by name, to a slice of the same type */
+            int ss = slice_name(c, call.args[k]);
             if (ss < 0) {
-                if (a->kind == ON_BORROW) return tmismatch(c, a, name, "borrow passed to a slice parameter");
                 if (a->kind == ON_NAME) { int ns = resolve(c, a); if (ns < 0) return -1; }
                 return tmismatch(c, a, name, "a slice parameter takes the name of a slice of the same type");
             }
@@ -1318,21 +1306,21 @@ static int chk_call(C *c, int i, OscScalar want, int as_stmt)
                          c->sym[ss].ty.s == OSC_T_BYTES ? "bytes" : "cells", name, pt->s == OSC_T_BYTES ? "bytes" : "cells");
                 return tmismatch(c, a, c->sym[ss].name, msg);
             }
-            for (int j = 0; j < k; j++) /* the same cells twice would give the callee two aliasing parameters */
-                if (c->sym[ss].ty.s == OSC_T_CELLS && NODE(args[j])->kind == ON_NAME && NODE(args[j])->sym == ss &&
-                    (NODE(params[j])->ty.s == OSC_T_CELLS || NODE(params[j])->ty.s == OSC_T_BYTES)) {
-                    snprintf(msg, sizeof msg, "cells slice '%s' is passed twice to '%s': the parameters would alias", c->sym[ss].name, name);
-                    return slice_diag(c, a, OSC_DIAG_SLICE_ALIAS, &c->sym[ss], "slice passed twice", msg);
-                }
+            if (pt->s == OSC_T_CELLS && !osc_bind_cell_argument(&call, k, ss)) {
+                snprintf(msg, sizeof msg, "cells slice '%s' is passed twice to '%s': the parameters would alias", c->sym[ss].name, name);
+                return slice_diag(c, a, OSC_DIAG_SLICE_ALIAS, &c->sym[ss], "slice passed twice", msg);
+            }
             continue;
         }
-        if (pt->s != OSC_T_REF) {
-            if (a->kind == ON_BORROW) return tmismatch(c, a, name, "borrow passed to a scalar parameter");
-            if (chk(c, args[k], pt->s) < 0) return -1;
+        if (call.actions[k] == OSC_ARG_SCALAR_BORROW)
+            return tmismatch(c, a, name, "borrow passed to a scalar parameter");
+        if (call.actions[k] == OSC_ARG_SCALAR) {
+            if (chk(c, call.args[k], pt->s) < 0) return -1;
             continue;
         }
-        if (pt->ref == OSC_REF_OWN) {
-            if (a->kind != ON_NAME) return tmismatch(c, a, name, "an 'own' parameter takes an owner name (move)");
+        if (call.actions[k] == OSC_ARG_OWNER_FORM)
+            return tmismatch(c, a, name, "an 'own' parameter takes an owner name (move)");
+        if (call.actions[k] == OSC_ARG_OWNER) {
             int s = resolve(c, a);
             if (s < 0) return -1;
             a->sym = s;
@@ -1345,8 +1333,8 @@ static int chk_call(C *c, int i, OscScalar want, int as_stmt)
             if (do_move(c, s, -1, a->line, a->col)) return -1;
             continue;
         }
-        if (a->kind != ON_BORROW || (a->mut != 0) != (pt->ref == OSC_REF_MUT)) {
-            snprintf(msg, sizeof msg, "parameter %d of '%s' takes %s", k + 1, name,
+        if (call.actions[k] == OSC_ARG_BORROW_FORM) {
+            snprintf(msg, sizeof msg, "parameter %u of '%s' takes %s", k + 1, name,
                      pt->ref == OSC_REF_MUT ? "'&mut name'" : "'&name'");
             return tmismatch(c, a, name, msg);
         }
@@ -1365,7 +1353,7 @@ static int chk_call(C *c, int i, OscScalar want, int as_stmt)
         if (b < 0) return -1;
         cb[ncb++] = b;
     }
-    if (chk_call_requires(c, i, g, args, na)) return -1;
+    if (chk_call_requires(c, i, g, &call)) return -1;
     for (int k = ncb - 1; k >= 0; k--) end_bor(c, cb[k], n->line);
     if (as_stmt) return (int)f->ty.s;
     if (f->ty.s == OSC_T_VOID) {
@@ -1969,18 +1957,14 @@ static int chk_fn(C *c, int fi)
     c->cond_depth = 0;
     c->nregion = 0;
     c->handles.count = c->handles.nbind = 0;
-    char fname[64];
-    osc_node_name(a, fn, fname, sizeof fname);
+    const char *fname = c->fn_names[fi];
     snprintf(c->sobj, sizeof c->sobj, "%s", fname);
-    for (int k = 0; k < fi; k++) {
-        char g[64];
-        osc_node_name(a, NODE(a->fns[k]), g, sizeof g);
-        if (strcmp(g, fname) == 0) {
-            osc_diag_set(c->d, OSC_DIAG_REDEFINED_NAME, fn->line, fn->col, fname, NODE(a->fns[k])->line, NULL,
-                         "redefine function", "function '%s' is already defined at line %u", fname,
-                         NODE(a->fns[k])->line);
-            return -1;
-        }
+    int previous = fi ? find_fn(c, fname, (uint32_t)fi) : -1;
+    if (previous >= 0) {
+        uint32_t line = NODE(a->fns[previous])->line;
+        osc_diag_set(c->d, OSC_DIAG_REDEFINED_NAME, fn->line, fn->col, fname, line, NULL,
+                     "redefine function", "function '%s' is already defined at line %u", fname, line);
+        return -1;
     }
     if (c->tr) c->tr->nfuncs = (uint16_t)(fi + 1);
     if (push_scope(c, fn->line)) return -1;
@@ -2045,6 +2029,8 @@ int osc_check(const OscAlloc *a, OscAst *ast, OscDiag *d, OscTrace *trace)
     if (trace) { trace->n = 0; trace->overflow = 0; trace->refused = 0; trace->nfuncs = 0; }
     ast->nrel = 0;
     int rc = 0;
+    for (uint32_t fi = 0; fi < ast->nfns; fi++)
+        osc_node_name(ast, NODE(ast->fns[fi]), c->fn_names[fi], sizeof c->fn_names[fi]);
     for (uint32_t fi = 0; fi < ast->nfns && rc == 0; fi++) rc = chk_fn(c, (int)fi);
     if (rc == 0 && ast->nrel >= OSC_AST_MAX_REL) {
         osc_diag_set(d, OSC_DIAG_CAPACITY, 0, 0, "unit", 0, NULL, "release list capacity", "too many scope-exit releases");

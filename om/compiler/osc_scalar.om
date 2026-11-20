@@ -18,6 +18,27 @@ const BAD_OPCODE ulong 8
 
 note Contract bindings contain known scalar arguments and the optional result.
 note bridge c-type contract OscContractBindings
+note Function calls preserve left-to-right checking. This frame pairs parsed
+note arguments with parameters and records cell slices already bound at the call.
+note bridge c-type callargs OscCallArgs
+note bridge c-define OSC_ARG_SCALAR 1
+note bridge c-define OSC_ARG_SLICE 2
+note bridge c-define OSC_ARG_OWNER 3
+note bridge c-define OSC_ARG_BORROW 4
+note bridge c-define OSC_ARG_SCALAR_BORROW 5
+note bridge c-define OSC_ARG_SLICE_BORROW 6
+note bridge c-define OSC_ARG_OWNER_FORM 7
+note bridge c-define OSC_ARG_BORROW_FORM 8
+layout callargs 112
+field params int 6 at 0 little
+field args int 7 at 24 little
+field actions uint 6 at 52 little
+field cells int 6 at 76 little
+field np uint at 100 little
+field na uint at 104 little
+field clause uint at 108 little
+end
+
 layout contract 80
 field v ulong 6 at 0 little
 field k uchar 6 at 48 little
@@ -29,6 +50,20 @@ end
 
 note Offsets refer to the OscNode representation asserted at its C boundary.
 const ast_stride ulong 104
+const arg_scalar uint 1
+const arg_slice uint 2
+const arg_owner uint 3
+const arg_borrow uint 4
+const bad_scalar_borrow uint 5
+const bad_slice_borrow uint 6
+const bad_owner_form uint 7
+const bad_borrow_form uint 8
+const node_borrow ulong 20
+const type_ref ulong 10
+const type_bytes ulong 11
+const type_cells ulong 12
+const ref_own ulong 1
+const ref_mut ulong 3
 const node_int ulong 15
 const node_bool ulong 16
 const node_name ulong 17
@@ -828,4 +863,190 @@ export fn osc_infer_step nodes edit uchar * stack edit ulong * frame edit infer 
     ret infer_after_first nodes frame checked
   end
   ret infer_after_second nodes frame checked
+end
+
+fn arg_action nodes view uchar * param ulong arg ulong to uint
+  typ = ast_read nodes add param 56 4
+  kind = ast_read nodes arg 2
+  if or eq typ type_bytes eq typ type_cells
+    if eq kind node_borrow
+      ret bad_slice_borrow
+    end
+    ret arg_slice
+  end
+  if ne typ type_ref
+    if eq kind node_borrow
+      ret bad_scalar_borrow
+    end
+    ret arg_scalar
+  end
+  refkind = ast_read nodes add param 60 4
+  if eq refkind ref_own
+    if ne kind node_name
+      ret bad_owner_form
+    end
+    ret arg_owner
+  end
+  mutable = ne get nodes add arg 72 0
+  expected_mutable = eq refkind ref_mut
+  if or ne kind node_borrow ne mutable expected_mutable
+    ret bad_borrow_form
+  end
+  ret arg_borrow
+end
+
+fn call_next nodes view uchar * id long to long
+  raw = ast_read nodes add mul ulong id ast_stride 24 4
+  if eq raw 4294967295
+    ret -1
+  end
+  ret long raw
+end
+
+export fn osc_call_args nodes view uchar * param long arg long call edit callargs to void
+  np = ulong 0
+  while and ge param 0 lt np 6 bound 6
+    put call params np int param
+    param = call_next nodes param
+    np = add np 1
+  end
+  na = ulong 0
+  while and ge arg 0 lt na 7 bound 7
+    put call args na int arg
+    arg = call_next nodes arg
+    na = add na 1
+  end
+  put call np uint np
+  put call na uint na
+  if eq np na
+    for k ulong na
+      p = mul ulong get call params k ast_stride
+      a = mul ulong get call args k ast_stride
+      put call actions k arg_action nodes p a
+      put call cells k int -1
+    end
+  end
+end
+
+export fn osc_bind_cell_argument call edit callargs index ulong symbol long to ulong
+requires lt index 6
+  for k ulong index
+    if eq long get call cells k symbol
+      ret 0
+    end
+  end
+  put call cells index int symbol
+  ret 1
+end
+
+note Only scalar parameters bind constants. Unknown actual arguments keep
+note their slots unknown, including names in the caller's scope.
+export fn osc_call_requires nodes view uchar * call view callargs bindings edit contract stack edit ulong * to ulong
+  request = new ulong 2 0
+  count = ulong get call na
+  note nk stays zero while actuals are evaluated in the caller.
+  for i ulong count
+    if eq get call actions i arg_scalar
+      put request 0 ulong get call args i
+      if ne osc_contract_value nodes bindings stack request 0
+        put bindings k i uchar 1
+        put bindings v i get request 1
+      end
+    end
+  end
+  put bindings nk int count
+  put request 0 ulong get call clause
+  if eq osc_contract_value nodes bindings stack request 0
+    ret 1
+  end
+  ret alu_truth ne get request 1 0
+end
+
+note Native and interpreted calls use the same byte range rule. A pair of
+note read-only byte slices may overlap. A nonempty cell slice is exclusive.
+fn slice_width types view uint * p ulong to ulong
+  base = mul p 4
+  if ne get types add base 1 0
+    ret 0
+  end
+  if ne get types add base 2 0
+    ret 0
+  end
+  note Length and struct id occupy the low 24 bits of the last word.
+  if ne and get types add base 3 0x00ffffff 0
+    ret 0
+  end
+  typ = get types base
+  if eq ulong typ type_bytes
+    ret 1
+  end
+  if eq ulong typ type_cells
+    ret 8
+  end
+  ret 0
+end
+
+fn slice_limit base ulong count ulong width ulong to ulong
+  maxaddr = ulong 0xffffffffffffffff
+  if eq base 0
+    ret 0
+  end
+  if eq width 8
+    if or ne and base 7 0 gt count shr maxaddr 3
+      ret 0
+    end
+  end
+  size = mul count width
+  if gt size sub maxaddr base
+    ret 0
+  end
+  ret add base size
+end
+
+fn slices_overlap args view ulong * p ulong q ulong limit ulong width ulong to bool
+  count = get args add q 1
+  if eq count 0
+    ret false
+  end
+  begin = get args q
+  note This earlier range passed the arithmetic checks.
+  ret and lt begin limit lt get args p add begin mul count width
+end
+
+fn check_aliases types view uint * args view ulong * p ulong limit ulong to bool
+  for q ulong p
+    width = slice_width types q
+    if ne width 0
+      if or eq width 8 eq ulong get types mul p 4 type_cells
+        if slices_overlap args p q limit width
+          ret false
+        end
+      end
+    end
+  end
+  ret true
+end
+
+export fn osc_slice_args types view uint * args view ulong * to long
+requires eq len types mul len args 4
+  if lt len args 2
+    ret 0
+  end
+  for p ulong sub len args 1
+    width = slice_width types p
+    if eq width 0
+      continue
+    end
+    count = get args add p 1
+    if ne count 0
+      limit = slice_limit get args p count width
+      if eq limit 0
+        ret -1
+      end
+      if not check_aliases types args p limit
+        ret -1
+      end
+    end
+  end
+  ret 0
 end
