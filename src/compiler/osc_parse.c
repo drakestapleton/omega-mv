@@ -576,53 +576,41 @@ static int parse_unary(P *p)
     return parse_postfix(p);
 }
 
-/* binary precedence levels, lowest first */
-static const int levels[][3] = {
-    {OT_OROR, 0, 0}, {OT_ANDAND, 0, 0}, {0, 0, 0} /* cmp */, {OT_PIPE, 0, 0}, {OT_CARET, 0, 0},
-    {OT_AMP, 0, 0}, {OT_SHL, OT_SHR, 0}, {OT_PLUS, OT_MINUS, 0}, {OT_STAR, OT_SLASH, OT_PERCENT},
-};
-#define NLEVELS ((int)(sizeof levels / sizeof levels[0]))
-#define CMP_LEVEL 2
-
-static int is_cmp(int k) { return k == OT_EQ || k == OT_NE || k == OT_LT || k == OT_LE || k == OT_GT || k == OT_GE; }
-
-static int parse_level(P *p, int lv)
+/* Omega decides when to consume the next operator and when to finish an
+ * existing node. Allocate at the operator token and attach edges only after
+ * the right operand parses, preserving the AST prefix on syntax errors. */
+static int parse_expr(P *p)
 {
-    if (lv >= NLEVELS) return parse_unary(p);
-    int l = parse_level(p, lv + 1);
-    if (l < 0) return -1;
-    if (lv == CMP_LEVEL) {
-        if (is_cmp(cur(p)->kind)) {
+    OscExprStack stack = {0};
+    int operand = parse_unary(p);
+    while (operand >= 0) {
+        uint64_t action = osc_expr_step(&stack, cur(p)->kind, (uint64_t)operand);
+        switch (action) {
+        case OSC_EXPR_DONE:
+            return operand;
+        case OSC_EXPR_SHIFT: {
             int n = new_node(p, ON_BIN, cur(p));
             if (n < 0) return -1;
+            stack.node[stack.depth - 1] = n;
             N(n)->op = cur(p)->kind;
             adv(p);
-            int r = parse_level(p, lv + 1);
-            if (r < 0) return -1;
-            N(n)->a = l;
-            N(n)->b = r;
-            l = n;
-            if (is_cmp(cur(p)->kind)) return syntax(p, "no second comparison (comparisons do not chain)");
+            operand = parse_unary(p);
+            break;
         }
-        return l;
+        case OSC_EXPR_REDUCE:
+        case OSC_EXPR_CHAINED:
+            N(stack.parent)->a = stack.left;
+            N(stack.parent)->b = operand;
+            if (action == OSC_EXPR_CHAINED)
+                return syntax(p, "no second comparison (comparisons do not chain)");
+            operand = stack.parent;
+            break;
+        default:
+            abort();
+        }
     }
-    for (;;) {
-        int k = cur(p)->kind;
-        if (k == 0 || !(k == levels[lv][0] || k == levels[lv][1] || k == levels[lv][2])) break;
-        int n = new_node(p, ON_BIN, cur(p));
-        if (n < 0) return -1;
-        N(n)->op = (uint16_t)k;
-        adv(p);
-        int r = parse_level(p, lv + 1);
-        if (r < 0) return -1;
-        N(n)->a = l;
-        N(n)->b = r;
-        l = n;
-    }
-    return l;
+    return -1;
 }
-
-static int parse_expr(P *p) { return parse_level(p, 0); }
 
 static int parse_name_tok(P *p, int n)
 {

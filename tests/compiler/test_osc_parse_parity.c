@@ -50,6 +50,38 @@ static void file_case(const char *path)
     free(src);
 }
 
+static void expression_cases(void)
+{
+    static const char *const operators[] = {
+        "||", "&&", "==", "!=", "<", "<=", ">", ">=", "|", "^", "&",
+        "<<", ">>", "+", "-", "*", "/", "%"
+    };
+    static const char *const forms[] = {
+        "a %s b %s c", "(a %s b) %s c", "a %s (b %s c)", "a %s -b %s"
+    };
+    char src[256];
+    for (size_t i = 0; i < sizeof operators / sizeof *operators; ++i) {
+        for (size_t j = 0; j < sizeof operators / sizeof *operators; ++j) {
+            for (size_t k = 0; k < sizeof forms / sizeof *forms; ++k) {
+                char expr[64];
+                int ne = snprintf(expr, sizeof expr, forms[k], operators[i], operators[j]);
+                int n = snprintf(src, sizeof src, "fn f() -> u64 { return %s; }", expr);
+                if (ne < 0 || (size_t)ne >= sizeof expr || n < 0 || (size_t)n >= sizeof src) abort();
+                compare(src, src, (size_t)n);
+            }
+        }
+    }
+    static const char *const edge[] = {
+        "fn f() -> u64 { return a || b && c == d | e ^ f & g << h + i * j; }",
+        "fn f() -> u64 { return a * b + c << d & e ^ f | g == h && i || j; }",
+        "fn f() -> u64 { return a == b * c < d; }",
+        "fn f() -> u64 { return a == b && c == d; }",
+        "fn f() -> u64 { return a * (b + c", "fn f() -> u64 { return -(-a) << ~b; }"
+    };
+    for (size_t i = 0; i < sizeof edge / sizeof *edge; ++i)
+        compare(edge[i], edge[i], strlen(edge[i]));
+}
+
 int main(int argc, char **argv)
 {
     static const char *const contexts[] = {
@@ -82,6 +114,7 @@ int main(int argc, char **argv)
         if (n < 0 || (size_t)n >= sizeof src) abort();
         compare(src, src, (size_t)n);
     }
+    expression_cases();
     if (lex_refusals != before) abort(); /* All constructed cases must reach the parser. */
     printf("OSC_PARSE_PARITY_PASS parsed=%u lexer_refusals=%u files=%d\n", passed, lex_refusals, argc - 1);
     return 0;

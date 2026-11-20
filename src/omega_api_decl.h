@@ -314,6 +314,27 @@ OMBR_ASSERT(offsetof(OscParsedType, elem) == 12, "layout typerec field elem");
 OMBR_ASSERT(offsetof(OscParsedType, count) == 16, "layout typerec field count");
 /* export fn osc_read_type kinds view ushort 7 values view ulong 7 form ulong refkind ulong limit ulong result edit typerec to ulong */
 uint64_t osc_read_type(const uint16_t o_kinds[7], const uint64_t o_values[7], uint64_t o_form, uint64_t o_refkind, uint64_t o_limit, OscParsedType *o_result);
+#define OSC_EXPR_DONE 0
+#define OSC_EXPR_SHIFT 1
+#define OSC_EXPR_REDUCE 2
+#define OSC_EXPR_CHAINED 3
+typedef struct {
+    uint32_t depth;
+    uint32_t rank[9];
+    int32_t node[9];
+    int32_t lhs[9];
+    int32_t parent;
+    int32_t left;
+} OscExprStack;
+OMBR_ASSERT(sizeof(OscExprStack) == 120, "layout exprstk size");
+OMBR_ASSERT(offsetof(OscExprStack, depth) == 0, "layout exprstk field depth");
+OMBR_ASSERT(offsetof(OscExprStack, rank) == 4, "layout exprstk field rank");
+OMBR_ASSERT(offsetof(OscExprStack, node) == 40, "layout exprstk field node");
+OMBR_ASSERT(offsetof(OscExprStack, lhs) == 76, "layout exprstk field lhs");
+OMBR_ASSERT(offsetof(OscExprStack, parent) == 112, "layout exprstk field parent");
+OMBR_ASSERT(offsetof(OscExprStack, left) == 116, "layout exprstk field left");
+/* export fn osc_expr_step stack edit exprstk look ulong operand ulong to ulong */
+uint64_t osc_expr_step(OscExprStack *o_stack, uint64_t o_look, uint64_t o_operand);
 #ifdef __cplusplus
 }
 #endif
