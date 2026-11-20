@@ -128,6 +128,14 @@ uint64_t cg_pattn256_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t
 uint64_t cg_router_spec_ok(const uint64_t o_sp[8]);
 /* export fn cg_router_emit sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to ulong */
 uint64_t cg_router_emit(const uint64_t o_sp[8], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_pattn_spec_ok sp view ulong 4 to ulong */
+uint64_t cg_pattn_spec_ok(const uint64_t o_sp[4]);
+/* export fn cg_pattn_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_pattn_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t o_meta[512]);
+/* export fn cg_attn_spec_ok sp view ulong 4 to ulong */
+uint64_t cg_attn_spec_ok(const uint64_t o_sp[4]);
+/* export fn cg_attn_emit sp view ulong 4 ins edit ulong 8192 meta edit ulong 512 to ulong */
+uint64_t cg_attn_emit(const uint64_t o_sp[4], uint64_t o_ins[8192], uint64_t o_meta[512]);
 #ifdef __cplusplus
 }
 #endif

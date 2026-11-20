@@ -22,6 +22,8 @@
 #include "omega_blackwell_codegen_tc.h"
 #include "omega_blackwell_codegen_pattn256.h"
 #include "omega_blackwell_codegen_router.h"
+#include "omega_blackwell_codegen_pattn.h"
+#include "omega_blackwell_codegen_attn.h"
 #include "sha256.h"
 
 static int g_pass = 0, g_fail = 0;
@@ -581,6 +583,60 @@ static void dump_metrics(void) {
         CHK(omega_blackwell_codegen_router_prog(&s, &p) == 0, "router w8 d4 e256 sh1 rows");
         report_kernel("router_w8_d4_e256_sh1_rows", &p, 8);
     }
+    {
+        OmegaPrefillAttnSpec s = { .warps = 8, .mutant = 0, .mode = OMEGA_PATTN_MODE_FUSED, .mirror = 0 };
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&s, &p) == 0, "pattn w8 fused");
+        report_kernel("pattn_w8_fused", &p, 8);
+    }
+    {
+        OmegaPrefillAttnSpec s = { .warps = 4, .mutant = 0, .mode = OMEGA_PATTN_MODE_ATTEND, .mirror = 0 };
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&s, &p) == 0, "pattn w4 attend");
+        report_kernel("pattn_w4_attend", &p, 4);
+    }
+    {
+        OmegaPrefillAttnSpec s = { .warps = 8, .mutant = 0, .mode = OMEGA_PATTN_MODE_APPEND, .mirror = 1 };
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&s, &p) == 0, "pattn w8 append mirror");
+        report_kernel("pattn_w8_append_mirror", &p, 8);
+    }
+    {
+        OmegaDecodeAttnSpec s = { .depth = 2, .mutant = 0 };
+        CHK(omega_blackwell_codegen_decode_attn_prog(&s, &p) == 0, "attn d2");
+        report_kernel("attn_d2", &p, 8);
+    }
+    {
+        OmegaDecodeAttnSpec s = { .depth = 4, .mutant = 0 };
+        CHK(omega_blackwell_codegen_decode_attn_prog(&s, &p) == 0, "attn d4");
+        report_kernel("attn_d4", &p, 8);
+    }
+}
+
+static void test_pattn_and_attn_error_paths(void) {
+    static BlackwellIRProgram prog;
+    CHK(omega_blackwell_codegen_prefill_attn_prog(NULL, &prog) != 0 && prog.count == 0, "pattn NULL spec");
+    OmegaPrefillAttnSpec pa_bad[] = {
+        { .warps = 2, .mutant = 0,  .mode = 0, .mirror = 0 },
+        { .warps = 8, .mutant = -1, .mode = 0, .mirror = 0 },
+        { .warps = 8, .mutant = 5,  .mode = 0, .mirror = 0 },
+        { .warps = 8, .mutant = 0,  .mode = 3, .mirror = 0 },
+        { .warps = 8, .mutant = 0,  .mode = 0, .mirror = 1 },
+        { .warps = 8, .mutant = 0,  .mode = 1, .mirror = 2 },
+    };
+    for (size_t i = 0; i < sizeof(pa_bad) / sizeof(pa_bad[0]); i++) {
+        prog.count = 53;
+        CHK(omega_blackwell_codegen_prefill_attn_prog(&pa_bad[i], &prog) != 0 && prog.count == 0, "pattn invalid spec");
+        CHK(omega_pattn_spec_ok(&pa_bad[i]) == 0, "pattn_spec_ok 0");
+    }
+    CHK(omega_blackwell_codegen_decode_attn_prog(NULL, &prog) != 0 && prog.count == 0, "attn NULL spec");
+    OmegaDecodeAttnSpec da_bad[] = {
+        { .depth = 0, .mutant = 0 },
+        { .depth = 5, .mutant = 0 },
+        { .depth = 2, .mutant = -1 },
+        { .depth = 2, .mutant = 5 },
+    };
+    for (size_t i = 0; i < sizeof(da_bad) / sizeof(da_bad[0]); i++) {
+        prog.count = 54;
+        CHK(omega_blackwell_codegen_decode_attn_prog(&da_bad[i], &prog) != 0 && prog.count == 0, "attn invalid spec");
+    }
 }
 
 static void test_pattn256_and_router_error_paths(void) {
@@ -623,6 +679,7 @@ int main(void) {
     test_tgemm_and_tc2_error_paths();
     test_qg_and_tc_error_paths();
     test_pattn256_and_router_error_paths();
+    test_pattn_and_attn_error_paths();
     test_max_size_legal_inputs();
     dump_metrics();
     printf("test_bw_om_codegen_bounds: %d passed, %d failed: %s\n", g_pass, g_fail, g_fail ? "FAIL" : "PASS");
