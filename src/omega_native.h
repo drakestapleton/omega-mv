@@ -421,14 +421,14 @@ uint32_t omega2_osc_close_borrow(uint64_t *result, uint8_t *o_owner, uint8_t *o_
 uint32_t omega2_osc_close_reborrow(uint64_t *result, uint8_t *o_parent, uint8_t *o_child);
 /* export fn osc_join_owners taken view uchar * remaining edit uchar * changes edit int * to ulong */
 uint32_t omega2_osc_join_owners(uint64_t *result, const uint8_t *o_taken, uint64_t o_taken_len, uint8_t *o_remaining, uint64_t o_remaining_len, int32_t *o_changes, uint64_t o_changes_len);
-#define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=a1a888d550d9eba8c5d1b7922d003df2cf5274cbf9dc900cbf63c984f81f792d omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=04d9c3dead3cabf5dbfa96da36fe4c58c64aa20ea36494bbfa92d1d0d3a17c4e omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_scope(void);
 /* export fn osc_scope_reset table edit scopetab to void */
 uint32_t omega2_osc_scope_reset(uint64_t *result, uint8_t *o_table);
-/* export fn osc_scope_find table view scopetab words view uchar 30720 name view uchar * to long */
-uint32_t omega2_osc_scope_find(uint64_t *result, const uint8_t *o_table, const uint8_t *o_words, uint64_t o_words_len, const uint8_t *o_name, uint64_t o_name_len);
-/* export fn osc_scope_bind table edit scopetab words edit uchar 30720 id ulong name view uchar * to void */
-uint32_t omega2_osc_scope_bind(uint64_t *result, uint8_t *o_table, uint8_t *o_words, uint64_t o_words_len, uint64_t o_id, const uint8_t *o_name, uint64_t o_name_len);
+/* export fn osc_scope_find table view scopetab symbols view uchar * stride ulong name view uchar * to long */
+uint32_t omega2_osc_scope_find(uint64_t *result, const uint8_t *o_table, const uint8_t *o_symbols, uint64_t o_symbols_len, uint64_t o_stride, const uint8_t *o_name, uint64_t o_name_len);
+/* export fn osc_scope_bind table edit scopetab id ulong name view uchar * to void */
+uint32_t omega2_osc_scope_bind(uint64_t *result, uint8_t *o_table, uint64_t o_id, const uint8_t *o_name, uint64_t o_name_len);
 /* export fn osc_scope_push table edit scopetab to ulong */
 uint32_t omega2_osc_scope_push(uint64_t *result, uint8_t *o_table);
 /* export fn osc_scope_pop table edit scopetab to void */

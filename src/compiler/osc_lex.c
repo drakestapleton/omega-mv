@@ -20,6 +20,7 @@
  */
 #include "osc_lex.h"
 #include "omega_api_decl.h"
+#include "omega_native.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,8 +105,19 @@ int osc_lex(const char *src, size_t len, OscToken *toks, uint32_t cap, uint32_t 
                    offsetof(OscToken, ival) == 24, "OSC token layout must match osc_lex_stream");
     _Static_assert(OSC_LEX_NAME_MAX == 63, "OSC scanner identifier width");
     uint64_t count = 0;
-    uint64_t status = osc_lex_stream((const uint8_t *)src, len, &cursor, (uint8_t *)toks,
-                                     (size_t)cap * sizeof *toks, &count);
+    if (len > UINT32_MAX) {
+        osc_diag_set(d, OSC_DIAG_CAPACITY, 1, 1, "unit", 0, NULL, "source offset capacity",
+                     "source exceeds the OSC 32-bit offset range");
+        return -1;
+    }
+    uint64_t status;
+    uint32_t bridge = omega2_osc_lex_stream(&status, (const uint8_t *)src, len, (uint8_t *)&cursor,
+                                            (uint8_t *)toks, (size_t)cap * sizeof *toks, &count, 1);
+    if (bridge != OMEGA_OK) {
+        osc_diag_set(d, OSC_DIAG_CAPACITY, cursor.line, cursor.col, "unit", 0, NULL, "scanner capacity",
+                     "scanner could not represent or allocate its input state");
+        return -1;
+    }
     if (status) {
         const OscToken *t = status == OSC_LEX_FULL || status == OSC_LEX_COMMENT ? NULL : &toks[count];
         lex_diag(d, status, src, &cursor, t, cap);
