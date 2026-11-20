@@ -99,28 +99,18 @@ static void lex_diag(OscDiag *d, uint64_t status, const char *src, const OscLexS
 int osc_lex(const char *src, size_t len, OscToken *toks, uint32_t cap, uint32_t *ntok, OscDiag *d)
 {
     OscLexState cursor = {.line = 1, .col = 1};
-    uint32_t count = 0;
-    for (;;) {
-        uint64_t status = osc_lex_next((const uint8_t *)src, len, &cursor, cap - count, OSC_LEX_NAME_MAX);
-        OscToken *t = NULL;
-        if (status != OSC_LEX_FULL && status != OSC_LEX_COMMENT) {
-            t = &toks[count];
-            memset(t, 0, sizeof *t);
-            t->kind = (uint16_t)cursor.kind;
-            t->off = (uint32_t)cursor.start;
-            t->len = cursor.width;
-            t->line = cursor.line;
-            t->col = cursor.col;
-            t->ival = cursor.value;
-        }
-        if (status) {
-            lex_diag(d, status, src, &cursor, t, cap);
-            return -1;
-        }
-        count++;
-        if (cursor.kind == OT_EOF) {
-            *ntok = count;
-            return 0;
-        }
+    _Static_assert(sizeof(OscToken) == 32 && offsetof(OscToken, kind) == 0 && offsetof(OscToken, line) == 4 &&
+                   offsetof(OscToken, col) == 8 && offsetof(OscToken, off) == 12 && offsetof(OscToken, len) == 16 &&
+                   offsetof(OscToken, ival) == 24, "OSC token layout must match osc_lex_stream");
+    _Static_assert(OSC_LEX_NAME_MAX == 63, "OSC scanner identifier width");
+    uint64_t count = 0;
+    uint64_t status = osc_lex_stream((const uint8_t *)src, len, &cursor, (uint8_t *)toks,
+                                     (size_t)cap * sizeof *toks, &count);
+    if (status) {
+        const OscToken *t = status == OSC_LEX_FULL || status == OSC_LEX_COMMENT ? NULL : &toks[count];
+        lex_diag(d, status, src, &cursor, t, cap);
+        return -1;
     }
+    *ntok = (uint32_t)count;
+    return 0;
 }

@@ -331,12 +331,14 @@ const char *omega2_ident_rx_fusion_core(void);
 uint32_t omega2_rx_fus_word64(uint64_t *result, const uint8_t *o_d, uint64_t o_d_len);
 /* export fn rx_fus_eligible_kind k ulong to ulong */
 uint32_t omega2_rx_fus_eligible_kind(uint64_t *result, uint64_t o_k);
-#define OMEGA2_IDENT_osc_literal "omega-ident 1 unit=osc_literal abi=2 profile=OM-2 src=a3fa19176dbf6193b157f84e4b7330e7065215e2ea0bccb0f9dfe706645267fb omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_literal "omega-ident 1 unit=osc_literal abi=2 profile=OM-2 src=ed2da39b4adba054db253cd7bd5b5f7e7c68a773f7b676be6fb7ed9825cb0c0f omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_literal(void);
 /* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
 uint32_t omega2_osc_parse_literal(uint64_t *result, const uint8_t *o_spelling, uint64_t o_spelling_len, uint64_t *o_value);
 /* export fn osc_lex_next src view uchar * cursor edit lexstate room ulong namemax ulong to ulong */
 uint32_t omega2_osc_lex_next(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_cursor, uint64_t o_room, uint64_t o_namemax);
+/* export fn osc_lex_stream src view uchar * cursor edit lexstate dest edit uchar * count edit ulong 1 to ulong */
+uint32_t omega2_osc_lex_stream(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_cursor, uint8_t *o_dest, uint64_t o_dest_len, uint64_t *o_count, uint64_t o_count_len);
 #define OMEGA2_IDENT_osc_type "omega-ident 1 unit=osc_type abi=2 profile=OM-2 src=a33e7745e4cdb1a968b06aff6016de192ef8a2a9d0d2946f5b1f79c91c7f2cba omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_type(void);
 /* export fn osc_read_type kinds view ushort 7 values view ulong 7 form ulong refkind ulong limit ulong result edit typerec to ulong */
@@ -347,7 +349,7 @@ const char *omega2_ident_osc_expr(void);
 uint32_t omega2_osc_expr_step(uint64_t *result, uint8_t *o_stack, uint64_t o_look, uint64_t o_operand);
 /* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
 uint32_t omega2_osc_operand_step(uint64_t *result, uint8_t *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
-#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=9f5f4721178d24ba8a31a2053da0464bc02950d353c67a11c53f0f89df7cf858 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=f89175447a9a8bc9666757c30931f59e8d4d37b14c3ca48408dca0ce56fbb7ea omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_scalar(void);
 /* export fn osc_alu_width t ulong to ulong */
 uint32_t omega2_osc_alu_width(uint64_t *result, uint64_t o_t);
@@ -367,6 +369,12 @@ uint32_t omega2_osc_binary_opcode(uint64_t *result, uint64_t o_tok);
 uint32_t omega2_osc_compare_opcode(uint64_t *result, uint64_t o_tok);
 /* export fn osc_literal_fits t ulong magnitude ulong negative ulong to ulong */
 uint32_t omega2_osc_literal_fits(uint64_t *result, uint64_t o_t, uint64_t o_magnitude, uint64_t o_negative);
+/* export fn osc_contract_value nodes view uchar * env view contract stack edit ulong * request edit ulong 2 to ulong */
+uint32_t omega2_osc_contract_value(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, const uint8_t *o_env, uint64_t *o_stack, uint64_t o_stack_len, uint64_t *o_request, uint64_t o_request_len);
+/* export fn osc_constant_tree nodes view uchar * id ulong require_literals ulong pending edit ulong * to ulong */
+uint32_t omega2_osc_constant_tree(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t o_id, uint64_t o_require_literals, uint64_t *o_pending, uint64_t o_pending_len);
+/* export fn osc_fold_tree nodes edit uchar * typ ulong stack edit ulong * report edit ulong 3 to ulong */
+uint32_t omega2_osc_fold_tree(uint64_t *result, uint8_t *o_nodes, uint64_t o_nodes_len, uint64_t o_typ, uint64_t *o_stack, uint64_t o_stack_len, uint64_t *o_report, uint64_t o_report_len);
 #define OMEGA2_IDENT_osc_a64_fields "omega-ident 1 unit=osc_a64_fields abi=2 profile=OM-2 src=9611ed84cd164f070399a77dcae62086f741201bcc972d969f912b21ce8824b4 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_a64_fields(void);
 /* export fn osc_a64_pack_fields form ulong base ulong f view a64field to ulong */
@@ -387,7 +395,7 @@ uint32_t omega2_osc_read_import(uint64_t *result, uint8_t *o_state, uint64_t o_k
 uint32_t omega2_osc_clause_word(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_used, uint64_t o_prev, uint64_t o_kind, const uint8_t *o_word, uint64_t o_word_len);
 /* export fn osc_statement_plan plan edit stmtplan kind ulong nextkind ulong third ulong spelling view uchar * to ulong */
 uint32_t omega2_osc_statement_plan(uint64_t *result, uint8_t *o_plan, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third, const uint8_t *o_spelling, uint64_t o_spelling_len);
-#define OMEGA2_IDENT_osc_ownership "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=4057f369075c9ea7e8df9c208f640eb5361dacd2608138cb04b853db082c4d33 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_ownership "omega-ident 1 unit=osc_ownership abi=2 profile=OM-2 src=b89c54bb7edd8e242def52f184a2df63754b02bf921b39839344f1d5d7f6fdec omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_ownership(void);
 /* export fn osc_owner_access moved ulong exclusive ulong shared_count ulong mut_count ulong to ulong */
 uint32_t omega2_osc_owner_access(uint64_t *result, uint64_t o_moved, uint64_t o_exclusive, uint64_t o_shared_count, uint64_t o_mut_count);
@@ -411,6 +419,28 @@ uint32_t omega2_osc_open_reborrow(uint64_t *result, uint8_t *o_parent, uint8_t *
 uint32_t omega2_osc_close_borrow(uint64_t *result, uint8_t *o_owner, uint8_t *o_child);
 /* export fn osc_close_reborrow parent edit oscbor child edit oscbor to void */
 uint32_t omega2_osc_close_reborrow(uint64_t *result, uint8_t *o_parent, uint8_t *o_child);
+/* export fn osc_join_owners taken view uchar * remaining edit uchar * changes edit int * to ulong */
+uint32_t omega2_osc_join_owners(uint64_t *result, const uint8_t *o_taken, uint64_t o_taken_len, uint8_t *o_remaining, uint64_t o_remaining_len, int32_t *o_changes, uint64_t o_changes_len);
+#define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=a1a888d550d9eba8c5d1b7922d003df2cf5274cbf9dc900cbf63c984f81f792d omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_osc_scope(void);
+/* export fn osc_scope_reset table edit scopetab to void */
+uint32_t omega2_osc_scope_reset(uint64_t *result, uint8_t *o_table);
+/* export fn osc_scope_find table view scopetab words view uchar 30720 name view uchar * to long */
+uint32_t omega2_osc_scope_find(uint64_t *result, const uint8_t *o_table, const uint8_t *o_words, uint64_t o_words_len, const uint8_t *o_name, uint64_t o_name_len);
+/* export fn osc_scope_bind table edit scopetab words edit uchar 30720 id ulong name view uchar * to void */
+uint32_t omega2_osc_scope_bind(uint64_t *result, uint8_t *o_table, uint8_t *o_words, uint64_t o_words_len, uint64_t o_id, const uint8_t *o_name, uint64_t o_name_len);
+/* export fn osc_scope_push table edit scopetab to ulong */
+uint32_t omega2_osc_scope_push(uint64_t *result, uint8_t *o_table);
+/* export fn osc_scope_pop table edit scopetab to void */
+uint32_t omega2_osc_scope_pop(uint64_t *result, uint8_t *o_table);
+#define OMEGA2_IDENT_osc_pool "omega-ident 1 unit=osc_pool abi=2 profile=OM-2 src=739af9855c5a25c5c3322dade4200fec3d7ee380ddc97de7afa7875618888711 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_osc_pool(void);
+/* export fn osc_pool_init p edit poolstat cap ulong base ulong loop_depth long cond_depth long to void */
+uint32_t omega2_osc_pool_init(uint64_t *result, uint8_t *o_p, uint64_t o_cap, uint64_t o_base, uint64_t o_loop_depth, uint64_t o_cond_depth);
+/* export fn osc_pool_alloc p edit poolstat loop_depth long cond_depth long to ulong */
+uint32_t omega2_osc_pool_alloc(uint64_t *result, uint8_t *o_p, uint64_t o_loop_depth, uint64_t o_cond_depth);
+/* export fn osc_pool_free p edit poolstat loop_depth long cond_depth long to void */
+uint32_t omega2_osc_pool_free(uint64_t *result, uint8_t *o_p, uint64_t o_loop_depth, uint64_t o_cond_depth);
 #ifdef __cplusplus
 }
 #endif

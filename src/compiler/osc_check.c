@@ -50,14 +50,8 @@ typedef struct {
     uint32_t region;
     uint16_t cap, used;
     int cond_depth;
-    /* OSC-3 item 2. SK_POOL: cap = K slots, gbase = declared generation base,
-     * dallocs = definite allocations so far, dlive = definite live slots (a
-     * lower bound; valid while cap_off == 0), cap_off = 1 once a free that is
-     * not definite was seen. SK_HANDLE: pool = its pool symbol, prov = the
-     * static provenance it holds (-1 unknown). */
-    uint64_t gbase, dallocs;
-    uint16_t dlive;
-    uint8_t cap_off;
+    OscCheckedPool slots; /* SK_POOL: definite capacity and generation accounting */
+    /* SK_HANDLE: pool symbol and static allocation provenance (-1 unknown). */
     int pool, prov;
     int decl;  /* OSC-3 item 3: declaring AST node (owners: carries the drop-flag mark) */
 } Sym;
@@ -85,11 +79,15 @@ typedef struct {
     int nobj, nbor, nsym;
 } Snap;
 
-#define MAX_SCOPES (OSC_AST_MAX_DEPTH * 2 + 8)
+_Static_assert(sizeof(((OscCheckedScope *)0)->visible) / sizeof(uint16_t) == OSC_CHECK_MAX_SYMS, "OSC scope symbol capacity");
+_Static_assert(sizeof(((OscCheckedScope *)0)->start) / sizeof(uint16_t) == OSC_AST_MAX_DEPTH * 2 + 8, "OSC scope depth");
+_Static_assert(OSC_LEX_NAME_MAX == 63, "OSC scope name width");
 
 typedef struct {
     const OscAlloc *a;    /* every heap byte of the checker (state snapshots, this struct) comes from here */
     OscAst *ast;
+    uint64_t *expr_work;
+    size_t expr_words;
     OscDiag *d;
     OscTrace *tr;
     int fi;               /* current function index */
@@ -101,10 +99,8 @@ typedef struct {
     int nobj;
     Bor bor[OSC_CHECK_MAX_BORS];
     int nbor;
-    int vis[OSC_CHECK_MAX_SYMS];
-    int nvis;
-    int scope_start[MAX_SCOPES];
-    int depth;
+    OscCheckedScope names;
+    uint8_t words[OSC_CHECK_MAX_SYMS * (OSC_LEX_NAME_MAX + 1)];
     int loop_depth;
     int term;             /* current path has returned */
     char sobj[64];        /* statement object (diagnostics) */
@@ -395,9 +391,7 @@ static int do_move(C *c, int s, int dest, uint32_t line, uint32_t col)
 /* ------------------------------------------------------------ scopes */
 static int lookup(C *c, const char *name)
 {
-    for (int i = c->nvis - 1; i >= 0; i--)
-        if (strcmp(c->sym[c->vis[i]].name, name) == 0) return c->vis[i];
-    return -1;
+    return (int)osc_scope_find(&c->names, c->words, (const uint8_t *)name, strlen(name));
 }
 
 static int declare(C *c, const OscNode *n, uint8_t kind, const OscType *ty, int mut)
@@ -423,14 +417,13 @@ static int declare(C *c, const OscNode *n, uint8_t kind, const OscType *ty, int 
     y->loop_depth = c->loop_depth;
     y->obj = y->bor = -1;
     y->decl = (int)(n - c->ast->nodes);
-    c->vis[c->nvis++] = s;
+    osc_scope_bind(&c->names, c->words, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
     return s;
 }
 
 static int push_scope(C *c, uint32_t line)
 {
-    if (c->depth >= MAX_SCOPES) return cap_fail(c, line, "scope depth");
-    c->scope_start[c->depth++] = c->nvis;
+    if (!osc_scope_push(&c->names)) return cap_fail(c, line, "scope depth");
     return 0;
 }
 
@@ -460,11 +453,11 @@ static int scope_exit_events(C *c, int levels, uint32_t line, OscNode *rec)
     rec->rel_start = a->nrel;
     rec->rel_count = 0;
     for (int lv = 0; lv < levels; lv++) {
-        int d = c->depth - 1 - lv;
+        int d = c->names.depth - 1 - lv;
         /* each level visits only its own symbols (inner levels were done) */
-        int hi = lv == 0 ? c->nvis : c->scope_start[d + 1];
-        for (int i = hi - 1; i >= c->scope_start[d]; i--) {
-            int s = c->vis[i];
+        int hi = lv == 0 ? c->names.count : c->names.start[d + 1];
+        for (int i = hi - 1; i >= c->names.start[d]; i--) {
+            int s = c->names.visible[i];
             Sym *y = &c->sym[s];
             if (y->kind == SK_BORROW) {
                 if (y->bor >= 0 && c->bor[y->bor].live) end_bor(c, y->bor, line);
@@ -497,8 +490,7 @@ static int scope_exit_events(C *c, int levels, uint32_t line, OscNode *rec)
 
 static void pop_scope(C *c)
 {
-    c->depth--;
-    c->nvis = c->scope_start[c->depth];
+    osc_scope_pop(&c->names);
 }
 
 /* ------------------------------------------------------------ state snapshots */
@@ -560,37 +552,26 @@ static void snap_restore(C *c, const Snap *s)
 
 /* ------------------------------------------------------------ integer helpers */
 static int is_shift(int op) { return op == OT_SHL || op == OT_SHR; }
-static int is_arith(int op)
-{
-    return op == OT_PLUS || op == OT_MINUS || op == OT_STAR || op == OT_SLASH || op == OT_PERCENT || op == OT_AMP ||
-           op == OT_PIPE || op == OT_CARET;
-}
 static int is_cmpop(int op) { return op == OT_EQ || op == OT_NE || op == OT_LT || op == OT_LE || op == OT_GT || op == OT_GE; }
 
-/* type comes only from context */
+/* The expression walkers read parsed OSC nodes directly. Guard every ABI
+ * field they consume; diagnostic strings continue to use the host API. */
+_Static_assert(OSC_AST_MAX_NODES == 16384 && sizeof(OscNode) == 104 && offsetof(OscNode, kind) == 0 && offsetof(OscNode, op) == 2 &&
+               offsetof(OscNode, a) == 12 && offsetof(OscNode, b) == 16 && offsetof(OscNode, ival) == 32 &&
+               offsetof(OscNode, ty.s) == 56 && sizeof(OscScalar) == 4 && offsetof(OscNode, flag) == 73 &&
+               offsetof(OscNode, is_const) == 75 && offsetof(OscNode, cval) == 80 && offsetof(OscNode, sym) == 88,
+               "OSC scalar walkers must match the native AST layout");
+_Static_assert(ON_INT == 15 && ON_BOOL == 16 && ON_NAME == 17 && ON_BIN == 21 && ON_UN == 22 && ON_CAST == 23 &&
+               OT_TILDE == 50 && OT_BANG == 51 && OT_ANDAND == 52 && OT_OROR == 53, "OSC scalar walker node tags");
+
 static int ctxfree(C *c, int i)
 {
-    const OscNode *n = NODE(i);
-    switch (n->kind) {
-    case ON_INT: return 1;
-    case ON_UN: return n->op != OT_BANG && ctxfree(c, n->a);
-    case ON_BIN:
-        if (is_shift(n->op)) return ctxfree(c, n->a);
-        if (is_arith(n->op)) return ctxfree(c, n->a) && ctxfree(c, n->b);
-        return 0;
-    default: return 0;
-    }
+    return (int)osc_constant_tree((const uint8_t *)c->ast->nodes, c->ast->nnodes * sizeof(OscNode), i, 0, c->expr_work, c->expr_words);
 }
-/* all leaves literal */
+
 static int constexpr_(C *c, int i)
 {
-    const OscNode *n = NODE(i);
-    switch (n->kind) {
-    case ON_INT: return 1;
-    case ON_UN: return n->op != OT_BANG && constexpr_(c, n->a);
-    case ON_BIN: return (is_shift(n->op) || is_arith(n->op)) && constexpr_(c, n->a) && constexpr_(c, n->b);
-    default: return 0;
-    }
+    return (int)osc_constant_tree((const uint8_t *)c->ast->nodes, c->ast->nnodes * sizeof(OscNode), i, 1, c->expr_work, c->expr_words);
 }
 
 static int ovf(C *c, const OscNode *n, const char *transition, const char *msg)
@@ -603,70 +584,37 @@ static int ovf(C *c, const OscNode *n, const char *transition, const char *msg)
  * Constant negation of a nonzero unsigned value is refused by the front end. */
 static int fold(C *c, int i, OscScalar t, uint64_t *out)
 {
-    OscNode *n = NODE(i);
+    uint64_t report[3] = {0, (uint64_t)i, 0};
+    uint64_t status = osc_fold_tree((uint8_t *)c->ast->nodes, c->ast->nnodes * sizeof(OscNode),
+                                    t, c->expr_work, c->expr_words, report);
+    if (!status) {
+        *out = report[0];
+        return 0;
+    }
+    OscNode *at = NODE(report[1]);
     char msg[320];
-    if (t == OSC_T_BOOL) return tmismatch(c, n, "bool", "integer literal where bool is required");
-    uint64_t v, a, b;
-    switch (n->kind) {
-    case ON_INT:
-        v = n->ival;
-        if (!osc_literal_fits(t, v, 0)) {
-            snprintf(msg, sizeof msg, "literal %llu does not fit %s", (unsigned long long)n->ival, tname(t));
-            return ovf(c, n, "literal does not fit type", msg);
-        }
-        break;
-    case ON_UN:
-        if (n->op == OT_MINUS && NODE(n->a)->kind == ON_INT) {
-            OscNode *l = NODE(n->a);
-            if (!osc_scalar_signed(t) && l->ival) {
-                snprintf(msg, sizeof msg, "negative literal -%llu for unsigned %s", (unsigned long long)l->ival, tname(t));
-                return ovf(c, n, "negative literal for unsigned type", msg);
-            }
-            if (!osc_literal_fits(t, l->ival, 1)) {
-                snprintf(msg, sizeof msg, "literal -%llu does not fit %s", (unsigned long long)l->ival, tname(t));
-                return ovf(c, n, "literal does not fit type", msg);
-            }
-            l->ty.s = t;
-            l->is_const = 1;
-            l->cval = l->ival;
-            v = 0 - l->ival;
-            break;
-        }
-        if (fold(c, n->a, t, &a)) return -1;
-        if (n->op == OT_MINUS && !osc_scalar_signed(t) && a)
-            return ovf(c, n, "negative constant for unsigned type", "negation of a non-zero unsigned constant");
-        if (osc_alu_un(n->op == OT_MINUS ? OSC_U_NEG : OSC_U_BNOT, t, a, &v))
-            return ovf(c, n, "signed constant overflow", "constant negation overflows");
-        break;
-    case ON_BIN: {
-        if (fold(c, n->a, t, &a) || fold(c, n->b, t, &b)) return -1;
-        uint64_t code = osc_alu_bin(osc_binary_opcode(n->op), t, a, b, &v);
-        switch (code) {
-        case OSC_TRAP_NONE: break;
-        case OSC_TRAP_DIV0:
-            return ovf(c, NODE(n->b), "literal zero divisor", "division by a constant zero");
-        case OSC_TRAP_SHIFT:
-            snprintf(msg, sizeof msg, "constant shift amount %lld outside 0..%u",
-                     (long long)b, osc_scalar_width(t) - 1);
-            return ovf(c, NODE(n->b), "literal shift >= width", msg);
-        case OSC_TRAP_OVERFLOW:
-            if (n->op == OT_SHL)
-                return ovf(c, n, "signed constant overflow", "constant left shift overflows");
-            snprintf(msg, sizeof msg, "constant expression overflows %s", tname(t));
-            return ovf(c, n, "signed constant overflow", msg);
-        default:
-            return tmismatch(c, n, NULL, "operator not allowed in a constant");
-        }
-        break;
+    switch (status) {
+    case 1: return tmismatch(c, at, "bool", "integer literal where bool is required");
+    case 2: case 4:
+        snprintf(msg, sizeof msg, "literal %s%llu does not fit %s", status == 4 ? "-" : "",
+                 (unsigned long long)report[2], tname(t));
+        return ovf(c, at, "literal does not fit type", msg);
+    case 3:
+        snprintf(msg, sizeof msg, "negative literal -%llu for unsigned %s", (unsigned long long)report[2], tname(t));
+        return ovf(c, at, "negative literal for unsigned type", msg);
+    case 5: return ovf(c, at, "negative constant for unsigned type", "negation of a non-zero unsigned constant");
+    case 6: return ovf(c, at, "signed constant overflow", "constant negation overflows");
+    case 7: return ovf(c, at, "literal zero divisor", "division by a constant zero");
+    case 8:
+        snprintf(msg, sizeof msg, "constant shift amount %lld outside 0..%u", (long long)report[2], osc_scalar_width(t) - 1);
+        return ovf(c, at, "literal shift >= width", msg);
+    case 9: return ovf(c, at, "signed constant overflow", "constant left shift overflows");
+    case 10:
+        snprintf(msg, sizeof msg, "constant expression overflows %s", tname(t));
+        return ovf(c, at, "signed constant overflow", msg);
+    case 11: return tmismatch(c, at, NULL, "operator not allowed in a constant");
+    default: return tmismatch(c, at, NULL, "not a constant");
     }
-    default:
-        return tmismatch(c, n, NULL, "not a constant");
-    }
-    n->ty.s = t;
-    n->is_const = 1;
-    n->cval = v;
-    *out = v;
-    return 0;
 }
 
 /* ------------------------------------------------------------ contracts (OSC-2) */
@@ -678,56 +626,16 @@ static int fold(C *c, int i, OscScalar t, uint64_t *out)
  * (overflow, divide by zero, shift range, cast range) makes the result
  * unknown, as do array reads and calls. `&&` / `||` are decided left to
  * right: the right operand is consulted only when the left one is known. */
-typedef struct {
-    int nk;                         /* symbols 0..nk-1 may be known (parameters) */
-    uint64_t v[OSC_MAX_PARAMS];
-    uint8_t k[OSC_MAX_PARAMS];
-    int res_sym;                    /* `result` symbol, or -1 */
-    uint8_t res_known;
-    uint64_t res_val;
-} CEnv;
+typedef OscContractBindings CEnv;
+_Static_assert(sizeof(((CEnv *)0)->k) == OSC_MAX_PARAMS, "OSC contract argument capacity");
 
-/* 1 known (*out canonical for the node's type), 0 unknown */
 static int ceval(C *c, int i, const CEnv *env, uint64_t *out)
 {
-    const OscNode *n = NODE(i);
-    if (n->is_const) { *out = n->cval; return 1; }
-    uint64_t a, b;
-    switch (n->kind) {
-    case ON_BOOL: *out = n->ival ? 1 : 0; return 1;
-    case ON_NAME:
-        if (n->sym >= 0 && n->sym < env->nk && env->k[n->sym]) { *out = env->v[n->sym]; return 1; }
-        if (n->sym >= 0 && n->sym == env->res_sym && env->res_known) { *out = env->res_val; return 1; }
-        return 0;
-    case ON_UN: {
-        if (!ceval(c, n->a, env, &a)) return 0;
-        OscUnOp op = n->op == OT_BANG ? OSC_U_LNOT : n->op == OT_TILDE ? OSC_U_BNOT : OSC_U_NEG;
-        return osc_alu_un(op, n->ty.s, a, out) == OSC_TRAP_NONE;
-    }
-    case ON_CAST:
-        if (!ceval(c, n->a, env, &a)) return 0;
-        return osc_alu_cast(n->ty.s, NODE(n->a)->ty.s, a, out) == OSC_TRAP_NONE;
-    case ON_BIN: {
-        int op = n->op;
-        if (op == OT_ANDAND || op == OT_OROR) {
-            if (!ceval(c, n->a, env, &a)) return 0;
-            if (op == OT_ANDAND && !a) { *out = 0; return 1; }
-            if (op == OT_OROR && a) { *out = 1; return 1; }
-            if (!ceval(c, n->b, env, &b)) return 0;
-            *out = b;
-            return 1;
-        }
-        if (!ceval(c, n->a, env, &a) || !ceval(c, n->b, env, &b)) return 0;
-        uint64_t cc = osc_compare_opcode(op);
-        if (cc) {
-            *out = osc_alu_cmp(cc, n->flag, a, b);
-            return 1;
-        }
-        return osc_alu_bin(osc_binary_opcode(op), n->ty.s, a, b, out) == OSC_TRAP_NONE;
-    }
-    default:
-        return 0; /* ON_INDEX (memory), ON_CALL (refused in clauses anyway) */
-    }
+    uint64_t request[2] = {(uint64_t)i, 0};
+    if (!osc_contract_value((const uint8_t *)c->ast->nodes, c->ast->nnodes * sizeof(OscNode),
+                            env, c->expr_work, c->expr_words, request)) return 0;
+    *out = request[1];
+    return 1;
 }
 
 /* name check inside a clause: `result` is reserved there */
@@ -923,25 +831,21 @@ static int handle_alloc(C *c, OscNode *an, int ps)
     }
     an->sym = ps;
     if (slice_noescape(c, an->a) || chk(c, an->a, p->ty.s) < 0) return -1;
-    if (c->loop_depth == p->loop_depth && c->cond_depth == p->cond_depth) {
-        if (!p->cap_off && p->dlive + 1u > p->cap) {
-            osc_diag_set(c->d, OSC_DIAG_POOL_CAPACITY, an->line, an->col, p->name, p->line, NULL, "pool full",
-                         "allocation needs %u live slots, pool '%s' has %u", p->dlive + 1u, p->name, p->cap);
-            return -1;
-        }
-        /* each slot serves generations gbase..UINT64_MAX: K * (2^64 - gbase) allocations in all */
-        uint64_t per = UINT64_MAX - p->gbase; /* + 1 */
-        if (per < (1ull << 32) && p->dallocs + 1 > (uint64_t)p->cap * (per + 1)) {
-            osc_diag_set(c->d, OSC_DIAG_GENERATION_EXHAUSTED, an->line, an->col, p->name, p->line, NULL,
-                         "retired slot reused",
-                         "allocation %llu from pool '%s' exceeds its generation budget (%u slots x %llu generations "
-                         "from base %llu); every slot is live or retired",
-                         (unsigned long long)(p->dallocs + 1), p->name, p->cap, (unsigned long long)(per + 1),
-                         (unsigned long long)p->gbase);
-            return -1;
-        }
-        p->dallocs++;
-        if (!p->cap_off) p->dlive++;
+    uint64_t decision = osc_pool_alloc(&p->slots, c->loop_depth, c->cond_depth);
+    if (decision == OSC_POOL_FULL) {
+        osc_diag_set(c->d, OSC_DIAG_POOL_CAPACITY, an->line, an->col, p->name, p->line, NULL, "pool full",
+                     "allocation needs %u live slots, pool '%s' has %u", p->slots.dlive + 1u, p->name, p->slots.cap);
+        return -1;
+    }
+    if (decision == OSC_POOL_RETIRED) {
+        uint64_t generations = UINT64_MAX - p->slots.gbase + 1;
+        osc_diag_set(c->d, OSC_DIAG_GENERATION_EXHAUSTED, an->line, an->col, p->name, p->line, NULL,
+                     "retired slot reused",
+                     "allocation %llu from pool '%s' exceeds its generation budget (%u slots x %llu generations "
+                     "from base %llu); every slot is live or retired",
+                     (unsigned long long)(p->slots.dallocs + 1), p->name, p->slots.cap,
+                     (unsigned long long)generations, (unsigned long long)p->slots.gbase);
+        return -1;
     }
     if (c->nprov >= MAX_PROV) return cap_fail(c, an->line, "handle provenance capacity");
     int pv = c->nprov++;
@@ -1375,7 +1279,7 @@ static int chk_contracts(C *c, int fi)
             y->kind = SK_SCALAR;
             y->ty = c->fret;
             y->obj = y->bor = -1;
-            c->vis[c->nvis++] = s;
+            osc_scope_bind(&c->names, c->words, (uint64_t)s, (const uint8_t *)y->name, strlen(y->name));
             a->res_sym[fi] = s;
         }
         c->contract = 2;
@@ -1676,9 +1580,12 @@ static int chk_if(C *c, int i)
          * every move, tested by its scope-end release. Both paths moved:
          * definitely moved (no flag). Neither: unchanged. Pre-existing
          * objects are never OM_GONE on a path that falls through. */
-        for (int o = 0; o < nobj0; o++) {
-            if (!osc_join_owner(&s1->obj[o], &c->obj[o])) continue;
-            int sym = c->obj[o].sym;
+        int32_t changed[OSC_CHECK_MAX_OBJS];
+        size_t bytes = (size_t)nobj0 * sizeof(Obj);
+        size_t nchanged = osc_join_owners((const uint8_t *)s1->obj, bytes, (uint8_t *)c->obj, bytes,
+                                          changed, (size_t)nobj0);
+        for (size_t j = 0; j < nchanged; j++) {
+            int sym = c->obj[changed[j]].sym;
             if (sym >= 0) NODE(c->sym[sym].decl)->dflag = 1;
         }
     }
@@ -1749,8 +1656,8 @@ static int chk_return_ensures(C *c, OscNode *n)
     uint64_t rv, v;
     if (!ceval(c, n->a, &env, &rv)) return 0;
     env.res_sym = a->res_sym[fi];
-    env.res_known = 1;
-    env.res_val = rv;
+    env.known = 1;
+    env.result = rv;
     if (!ceval(c, a->ensn[fi], &env, &v)) return 0;
     if (!v) {
         char fname[64];
@@ -2011,7 +1918,7 @@ static int chk_stmt(C *c, int i)
             if (chk(c, n->a, c->fret.s) < 0) return -1;
             if (chk_return_ensures(c, n)) return -1;
         }
-        if (scope_exit_events(c, c->depth, n->line, n)) return -1;
+        if (scope_exit_events(c, c->names.depth, n->line, n)) return -1;
         c->term = 1;
         return 0;
     }
@@ -2041,12 +1948,7 @@ static int chk_stmt(C *c, int i)
         int s = declare(c, n, SK_POOL, &tp, 0);
         if (s < 0) return -1;
         Sym *y = &c->sym[s];
-        y->cap = (uint16_t)n->ival;
-        y->gbase = (uint64_t)n->lo;
-        y->cond_depth = c->cond_depth;
-        y->dallocs = 0;
-        y->dlive = 0;
-        y->cap_off = 0;
+        osc_pool_init(&y->slots, (uint16_t)n->ival, (uint64_t)n->lo, c->loop_depth, c->cond_depth);
         n->sym = s;
         if (chk_block(c, n->b, 1)) return -1;
         if (!c->term && scope_exit_events(c, 1, (uint32_t)NODE(n->b)->ival, n)) return -1;
@@ -2082,11 +1984,7 @@ static int chk_stmt(C *c, int i)
         n->sym2 = hs;
         NODE(n->a)->sym = hs;
         Sym *p = &c->sym[ps], *h = &c->sym[hs];
-        if (c->loop_depth == p->loop_depth && c->cond_depth == p->cond_depth) {
-            if (p->dlive) p->dlive--;
-        } else {
-            p->cap_off = 1;
-        }
+        osc_pool_free(&p->slots, c->loop_depth, c->cond_depth);
         int pv = h->prov;
         if (pv < 0) return 0;
         if (c->pfreed[pv]) {
@@ -2136,10 +2034,11 @@ static int chk_fn(C *c, int fi)
     OscAst *a = c->ast;
     int f = a->fns[fi];
     OscNode *fn = NODE(f);
+    osc_scope_reset(&c->names);
     c->fi = fi;
     c->fnode = f;
     c->fret = fn->ty;
-    c->nsym = c->nobj = c->nbor = c->nvis = c->depth = c->loop_depth = c->term = 0;
+    c->nsym = c->nobj = c->nbor = c->loop_depth = c->term = 0;
     c->cond_depth = 0;
     c->nregion = 0;
     c->nprov = 0;          /* OSC-3 item 2 */
@@ -2201,7 +2100,14 @@ static int chk_fn(C *c, int fi)
 
 int osc_check(const OscAlloc *a, OscAst *ast, OscDiag *d, OscTrace *trace)
 {
-    C *c = osc_alloc_zero(a, sizeof *c);
+    size_t expr_words = (size_t)ast->nnodes * 2 + 1;
+    size_t bytes = sizeof(C) + expr_words * sizeof(uint64_t);
+    C *c = a->alloc(a->ctx, bytes);
+    if (c) {
+        memset(c, 0, sizeof *c);
+        c->expr_work = (uint64_t *)(c + 1);
+        c->expr_words = expr_words;
+    }
     if (!c) {
         osc_diag_set(d, OSC_DIAG_CAPACITY, 0, 0, "unit", 0, NULL, "checker memory", "out of memory");
         return -1;
@@ -2218,6 +2124,6 @@ int osc_check(const OscAlloc *a, OscAst *ast, OscDiag *d, OscTrace *trace)
         osc_diag_set(d, OSC_DIAG_CAPACITY, 0, 0, "unit", 0, NULL, "release list capacity", "too many scope-exit releases");
         rc = -1;
     }
-    a->free(a->ctx, c, sizeof *c);
+    a->free(a->ctx, c, bytes);
     return rc;
 }

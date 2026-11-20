@@ -16,6 +16,31 @@ const CAST_RANGE ulong 5
 const BAD_SHIFT ulong 7
 const BAD_OPCODE ulong 8
 
+note Contract bindings contain known scalar arguments and the optional result.
+note bridge c-type contract OscContractBindings
+layout contract 80
+field v ulong 6 at 0 little
+field k uchar 6 at 48 little
+field nk int at 56 little
+field res_sym int at 60 little
+field known uchar at 64 little
+field result ulong at 72 little
+end
+
+note Offsets refer to the OscNode representation asserted at its C boundary.
+const ast_stride ulong 104
+const node_int ulong 15
+const node_bool ulong 16
+const node_name ulong 17
+const node_bin ulong 21
+const node_un ulong 22
+const node_cast ulong 23
+const node_type ulong 56
+const node_flag ulong 73
+const node_known ulong 75
+const node_value ulong 80
+const node_symbol ulong 88
+
 fn alu_signed t ulong to bool
 ret and ge t T_I8 le t T_I64
 end
@@ -310,4 +335,314 @@ if ne negative 0
   ret alu_truth eq magnitude 0
 end
 ret alu_truth le magnitude alu_mask w
+end
+
+fn ast_read nodes view uchar * atbyte ulong bytes ulong to ulong
+  v = ulong 0
+  for i ulong bytes
+    v = or v shl ulong get nodes add atbyte i mul i 8
+  end
+  ret v
+end
+
+fn contract_leaf nodes view uchar * base ulong env view contract value edit ulong 1 to ulong
+  if ne get nodes add base node_known 0
+    put value 0 ast_read nodes add base node_value 8
+    ret 1
+  end
+  kind = ast_read nodes base 2
+  if eq kind node_bool
+    put value 0 alu_truth ne ast_read nodes add base 32 8 0
+    ret 1
+  end
+  if eq kind node_name
+    symbol = long int uint ast_read nodes add base node_symbol 4
+    if lt symbol 0
+      ret 0
+    end
+    if lt symbol long get env nk
+      if ne get env k ulong symbol 0
+        put value 0 get env v ulong symbol
+        ret 1
+      end
+    end
+    if and eq symbol long get env res_sym ne get env known 0
+      put value 0 get env result
+      ret 1
+    end
+    ret 0
+  end
+  if or eq kind node_un or eq kind node_cast eq kind node_bin
+    ret 2
+  end
+  ret 0
+end
+
+fn contract_unary nodes view uchar * base ulong value edit ulong 1 to ulong
+  typ = ast_read nodes add base node_type 4
+  if eq ast_read nodes base 2 node_cast
+    child = ast_read nodes add base 12 4
+    src = ast_read nodes add mul child ast_stride node_type 4
+    ret alu_truth eq osc_alu_cast typ src get value 0 value 0
+  end
+  tok = ast_read nodes add base 2 2
+  unop = ulong 1
+  if eq tok 51
+    unop = 3
+  else
+    if eq tok 50
+      unop = 2
+    end
+  end
+  ret alu_truth eq osc_alu_un unop typ get value 0 value 0
+end
+
+fn contract_binary nodes view uchar * base ulong left ulong value edit ulong 1 to ulong
+  tok = ast_read nodes add base 2 2
+  if or eq tok 52 eq tok 53
+    ret 1
+  end
+  cc = osc_compare_opcode tok
+  if ne cc 0
+    put value 0 osc_alu_cmp cc ulong get nodes add base node_flag left get value 0
+    ret 1
+  end
+  typ = ast_read nodes add base node_type 4
+  ret alu_truth eq osc_alu_bin osc_binary_opcode tok typ left get value 0 value 0
+end
+
+fn short_circuit nodes view uchar * base ulong value ulong to bool
+  op = ast_read nodes add base 2 2
+  ret or and eq op 52 eq value 0 and eq op 53 ne value 0
+end
+
+note Each work entry holds the node and its continuation. The second half of
+note the stack holds left operands while right subtrees are being evaluated.
+export fn osc_contract_value nodes view uchar * env view contract stack edit ulong * request edit ulong 2 to ulong
+  value = new ulong 1 0
+  depth = ulong 1
+  put stack 0 mul get request 0 4
+  while ne depth 0 bound 65537
+    top = sub depth 1
+    base = mul shr get stack top 2 ast_stride
+    phase = and get stack top 3
+    if eq phase 0
+      choice = contract_leaf nodes base env value
+      if eq choice 0
+        ret 0
+      end
+      if eq choice 2
+        put stack top add get stack top 1
+        put stack depth mul ast_read nodes add base 12 4 4
+        depth = add depth 1
+        continue
+      end
+    else
+      if ne ast_read nodes base 2 node_bin
+        if eq contract_unary nodes base value 0
+          ret 0
+        end
+      else
+        if eq phase 1
+          if short_circuit nodes base get value 0
+            put value 0 alu_truth ne get value 0 0
+          else
+            put stack add top div len stack 2 get value 0
+            put stack top add get stack top 1
+            put stack depth mul ast_read nodes add base 16 4 4
+            depth = add depth 1
+            continue
+          end
+        else
+          if eq contract_binary nodes base get stack add top div len stack 2 value 0
+            ret 0
+          end
+        end
+      end
+    end
+    depth = top
+  end
+  put request 1 get value 0
+  ret 1
+end
+
+note Both classifications accept integer literals and arithmetic subtrees.
+note Shift width comes from its left child; folding also needs a literal RHS.
+fn needs_rhs op ulong literals ulong to bool
+  ret or ne literals 0 not or eq op TOK_SHL eq op TOK_SHR
+end
+
+export fn osc_constant_tree nodes view uchar * id ulong require_literals ulong pending edit ulong * to ulong
+  count = ulong 1
+  put pending 0 id
+  while ne count 0 bound 16384
+    count = sub count 1
+    base = mul get pending count ast_stride
+    kind = ast_read nodes base 2
+    if eq kind node_int
+      continue
+    end
+    op = ast_read nodes add base 2 2
+    if eq kind node_un
+      if eq op 51
+        ret 0
+      end
+    else
+      if or ne kind node_bin eq osc_binary_opcode op 0
+        ret 0
+      end
+      if needs_rhs op require_literals
+        put pending count ast_read nodes add base 16 4
+        count = add count 1
+      end
+    end
+    put pending count ast_read nodes add base 12 4
+    count = add count 1
+  end
+  ret 1
+end
+
+note Folding annotates the node only after its operands succeed. Negative
+note signed minimum is allowed as a single literal, though its positive
+note magnitude cannot stand alone in that type.
+fn ast_write nodes edit uchar * pos ulong bytes ulong v ulong to void
+  for j ulong bytes
+    put nodes add pos j uchar shr v mul j 8
+  end
+end
+
+fn mark_folded nodes edit uchar * base ulong typ ulong v ulong to void
+  ast_write nodes add base node_type 4 typ
+  put nodes add base node_known 1
+  ast_write nodes add base node_value 8 v
+end
+
+fn fold_leaf nodes edit uchar * base ulong typ ulong report edit ulong 3 to ulong
+  magnitude = ast_read nodes add base 32 8
+  if eq osc_literal_fits typ magnitude 0 0
+    put report 2 magnitude
+    ret 2
+  end
+  mark_folded nodes base typ magnitude
+  ret 0
+end
+
+fn fold_neg_literal nodes edit uchar * base ulong typ ulong report edit ulong 3 to ulong
+  child = mul ast_read nodes add base 12 4 ast_stride
+  magnitude = ast_read nodes add child 32 8
+  put report 2 magnitude
+  if and not alu_signed typ ne magnitude 0
+    ret 3
+  end
+  if eq osc_literal_fits typ magnitude 1 0
+    ret 4
+  end
+  mark_folded nodes child typ magnitude
+  mark_folded nodes base typ sub ulong 0 magnitude
+  ret 0
+end
+
+fn fold_unary nodes edit uchar * base ulong typ ulong to ulong
+  input = ast_read nodes add mul ast_read nodes add base 12 4 ast_stride node_value 8
+  op = ulong 2
+  if eq ast_read nodes add base 2 2 43
+    op = 1
+    if and not alu_signed typ ne input 0
+      ret 5
+    end
+  end
+  value = new ulong 1 0
+  if ne osc_alu_un op typ input value 0
+    ret 6
+  end
+  mark_folded nodes base typ get value 0
+  ret 0
+end
+
+fn fold_binary nodes edit uchar * base ulong typ ulong report edit ulong 3 to ulong
+  left = ast_read nodes add mul ast_read nodes add base 12 4 ast_stride node_value 8
+  right_id = ast_read nodes add base 16 4
+  right = ast_read nodes add mul right_id ast_stride node_value 8
+  tok = ast_read nodes add base 2 2
+  value = new ulong 1 0
+  status = osc_alu_bin osc_binary_opcode tok typ left right value
+  if eq status 0
+    mark_folded nodes base typ get value 0
+    ret 0
+  end
+  if or eq status DIV_ZERO eq status BAD_SHIFT
+    put report 1 right_id
+    put report 2 right
+    if eq status DIV_ZERO
+      ret 7
+    end
+    ret 8
+  end
+  if eq status OVERFLOW
+    if eq tok TOK_SHL
+      ret 9
+    end
+    ret 10
+  end
+  ret 11
+end
+
+fn fold_enter nodes edit uchar * base ulong typ ulong report edit ulong 3 to ulong
+  kind = ast_read nodes base 2
+  if eq kind node_int
+    ret fold_leaf nodes base typ report
+  end
+  if not or eq kind node_un eq kind node_bin
+    ret 12
+  end
+  if and eq kind node_un eq ast_read nodes add base 2 2 43
+    child = ast_read nodes add base 12 4
+    if eq ast_read nodes mul child ast_stride 2 node_int
+      ret fold_neg_literal nodes base typ report
+    end
+  end
+  ret 13
+end
+
+export fn osc_fold_tree nodes edit uchar * typ ulong stack edit ulong * report edit ulong 3 to ulong
+  id = get report 1
+  if eq typ T_BOOL
+    ret 1
+  end
+  depth = ulong 1
+  put stack 0 mul id 4
+  while ne depth 0 bound 65537
+    top = sub depth 1
+    base = mul shr get stack top 2 ast_stride
+    put report 1 shr get stack top 2
+    phase = and get stack top 3
+    status = ulong 0
+    if eq phase 0
+      status = fold_enter nodes base typ report
+      if eq status 13
+        put stack top add get stack top 1
+        put stack depth mul ast_read nodes add base 12 4 4
+        depth = add depth 1
+        continue
+      end
+    else
+      if eq ast_read nodes base 2 node_un
+        status = fold_unary nodes base typ
+      else
+        if eq phase 1
+          put stack top add get stack top 1
+          put stack depth mul ast_read nodes add base 16 4 4
+          depth = add depth 1
+          continue
+        end
+        status = fold_binary nodes base typ report
+      end
+    end
+    if ne status 0
+      ret status
+    end
+    depth = top
+  end
+  put report 0 ast_read nodes add mul id ast_stride node_value 8
+  ret 0
 end
