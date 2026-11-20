@@ -15,7 +15,7 @@ extern "C" {
 #define OMEGA_REENTRY 33u
 #define OMEGA_BAD_RT 34u
 #define OMEGA_NO_STACK 35u
-#define OMEGA2_IDENT_arboris_arena "omega-ident 1 unit=arboris_arena abi=2 profile=OM-2 src=8ebd9677c1863b5747f0fda2f1d31f5186d7758a7f89d9dd136e7caa681aed11 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_arboris_arena "omega-ident 1 unit=arboris_arena abi=2 profile=OM-2 src=85b8522d6c42fc7b1ae4eb190556480a362ae489f0c5808660d9d18a66f3b957 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_arena(void);
 /* export fn arboris_plan_arena m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong */
 uint32_t omega2_arboris_plan_arena(uint64_t *result, uint64_t *o_m, uint64_t o_m_len, uint64_t o_budget, uint64_t o_page, uint64_t *o_offsets, uint64_t o_offsets_len);
@@ -31,7 +31,7 @@ uint32_t omega2_arboris_topology_digest(uint64_t *result, const uint32_t *o_topo
 uint32_t omega2_arboris_spread_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
 /* export fn arboris_relax_step topo view uint * weights view uint * state edit uint * to ulong */
 uint32_t omega2_arboris_relax_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
-#define OMEGA2_IDENT_arboris_gated "omega-ident 1 unit=arboris_gated abi=2 profile=OM-2 src=82c17768f03ee099a90c71a379dd3592b2a80eda81a8de45f4c61d3d19890688 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_arboris_gated "omega-ident 1 unit=arboris_gated abi=2 profile=OM-2 src=cb0d78228d9cedc23c3c1c8ef121a1395d3b11e393991c1086929dbf49a43175 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_gated(void);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
 uint32_t omega2_arboris_gated_tick(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint64_t *o_offsets, uint64_t o_offsets_len, uint16_t *o_arena, uint64_t o_arena_len, uint64_t o_page);

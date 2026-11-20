@@ -22,6 +22,8 @@ compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.o
 "$out/spread"
 compile "$out/gated" om/arboris_arena.om gpu/nvidia/om/numeric/numeric.om om/arboris_gated.om tests/arboris_gated_test.om
 "$out/gated"
+compile "$out/capq" om/runtime/rx_capq_core.om seed/authority/capq.om tests/arboris/capq.om
+"$out/capq"
 compile "$out/caproot-check" seed/authority/caproot.om tests/arboris/caproot-check.om
 cc -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/caproot_issuer.c src/runtime/rx_caproot.c -o "$out/caproot-issuer"
 "$out/caproot-issuer" "$out/caproot-check"
