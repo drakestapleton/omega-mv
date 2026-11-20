@@ -349,7 +349,7 @@ const char *omega2_ident_osc_expr(void);
 uint32_t omega2_osc_expr_step(uint64_t *result, uint8_t *o_stack, uint64_t o_look, uint64_t o_operand);
 /* export fn osc_operand_step state edit opstate kind ulong nextkind ulong third ulong to ulong */
 uint32_t omega2_osc_operand_step(uint64_t *result, uint8_t *o_state, uint64_t o_kind, uint64_t o_nextkind, uint64_t o_third);
-#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=240de03d7ba091cca571b3afc84decd3c412e467b362866f8258fc104ce34328 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_scalar "omega-ident 1 unit=osc_scalar abi=2 profile=OM-2 src=d1543d9e21205ee46927dc57cbbad2585c43f0c008fdc8193c84f0d2cf0c380f omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_scalar(void);
 /* export fn osc_alu_width t ulong to ulong */
 uint32_t omega2_osc_alu_width(uint64_t *result, uint64_t o_t);
@@ -383,6 +383,8 @@ uint32_t omega2_osc_call_args(uint64_t *result, const uint8_t *o_nodes, uint64_t
 uint32_t omega2_osc_bind_cell_argument(uint64_t *result, uint8_t *o_call, uint64_t o_index, uint64_t o_symbol);
 /* export fn osc_call_requires nodes view uchar * call view callargs bindings edit contract stack edit ulong * to ulong */
 uint32_t omega2_osc_call_requires(uint64_t *result, const uint8_t *o_nodes, uint64_t o_nodes_len, const uint8_t *o_call, uint8_t *o_bindings, uint64_t *o_stack, uint64_t o_stack_len);
+/* export fn osc_slice_args types view uint * args view ulong * to long */
+uint32_t omega2_osc_slice_args(uint64_t *result, const uint32_t *o_types, uint64_t o_types_len, const uint64_t *o_args, uint64_t o_args_len);
 #define OMEGA2_IDENT_osc_a64_fields "omega-ident 1 unit=osc_a64_fields abi=2 profile=OM-2 src=6b0d855c4b12c67d8413d184d84f0005b737a1b73d5bc462dd6c4aff99f8e266 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_a64_fields(void);
 /* export fn osc_a64_pack_fields form ulong base ulong f view a64field to ulong */

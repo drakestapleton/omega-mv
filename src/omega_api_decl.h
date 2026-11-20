@@ -489,6 +489,8 @@ void osc_call_args(const uint8_t *o_nodes, size_t o_nodes_len, int64_t o_param, 
 uint64_t osc_bind_cell_argument(OscCallArgs *o_call, uint64_t o_index, int64_t o_symbol);
 /* export fn osc_call_requires nodes view uchar * call view callargs bindings edit contract stack edit ulong * to ulong */
 uint64_t osc_call_requires(const uint8_t *o_nodes, size_t o_nodes_len, const OscCallArgs *o_call, OscContractBindings *o_bindings, uint64_t *o_stack, size_t o_stack_len);
+/* export fn osc_slice_args types view uint * args view ulong * to long */
+int64_t osc_slice_args(const uint32_t *o_types, size_t o_types_len, const uint64_t *o_args, size_t o_args_len);
 #define OSC_A64_ERR_UNUSED_SHIFT 1
 #define OSC_A64_ERR_UNUSED_COND 2
 #define OSC_A64_ERR_UNUSED_IMM2 3
