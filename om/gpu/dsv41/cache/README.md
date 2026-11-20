@@ -39,8 +39,10 @@ From the repository root on AArch64 Linux, with the original shard available loc
 ```sh
 sh seed/omega-from-seed.sh
 sh om/gpu/dsv41/cache/build.sh build/dsv41-cache
-python3 om/gpu/dsv41/cache/check.py /path/to/model-00003-of-00048.safetensors build/dsv41-cache
+python3 om/gpu/dsv41/cache/check.py --all-experts /path/to/model-00003-of-00048.safetensors build/dsv41-cache
 ```
+
+The full-layer check streams all 384 experts through the packer and compares every slab with the six source tensor extents. The detour replay then uses eight selected experts. For an arbitrary layer-0 routing trace, include all 384 IDs in the pack. An unknown ID ends the replay before emitting any substitute.
 
 To build an ordered pack for a lane, pass distinct expert IDs as arguments. Publish the output only after the command exits successfully and its checksum has been recorded.
 

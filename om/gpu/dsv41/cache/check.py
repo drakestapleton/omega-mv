@@ -17,7 +17,7 @@ def events(records):
     return b"".join(struct.pack("<II", *record) for record in records)
 
 
-def read_experts(shard):
+def read_experts(shard, ids):
     with shard.open("rb") as f:
         if hashlib.file_digest(f, "sha256").hexdigest() != SHARD_HASH:
             raise ValueError("expected pinned original shard 3")
@@ -25,7 +25,7 @@ def read_experts(shard):
         hlen, = struct.unpack("<Q", f.read(8))
         header = json.loads(f.read(hlen))
         digests = {}
-        for expert in IDS:
+        for expert in ids:
             sha = hashlib.sha256()
             total = 0
             for kind in ("weight", "scale"):
@@ -47,11 +47,32 @@ def rejected(command, data=b"", code=65):
         raise AssertionError(f"expected exit {code}, got {result.returncode}")
 
 
-def check(shard, binaries, scratch):
+def check_whole_layer(command, ids, digests):
+    # The entire pack goes through a pipe so qualification does not require a second copy of the layer.
+    with subprocess.Popen([*command, *map(str, ids)], stdout=subprocess.PIPE) as proc:
+        try:
+            header = proc.stdout.read(4096)
+            assert struct.unpack_from("<4I", header) == (0x31505844, 1, len(ids), EXPERT_BYTES)
+            assert struct.unpack_from(f"<{len(ids)}I", header, 16) == tuple(ids)
+            for expert in ids:
+                block = proc.stdout.read(EXPERT_BYTES)
+                assert len(block) == EXPERT_BYTES and hashlib.sha256(block).digest() == digests[expert]
+            assert proc.stdout.read(1) == b""
+        finally:
+            proc.stdout.close()
+        if proc.wait() != 0:
+            raise RuntimeError("native full-layer pack failed")
+    print(f"PASS all {len(ids)} routed experts, {len(ids)*EXPERT_BYTES} payload bytes")
+
+
+def check(shard, binaries, scratch, whole_layer):
     subprocess.run([binaries / "contract"], check=True)
-    digests = read_experts(shard)
+    all_ids = [*IDS, *(i for i in range(384) if i not in IDS)]
+    digests = read_experts(shard, all_ids if whole_layer else IDS)
     pack = scratch / "layer0.pack"
     cmd = [binaries / "pack", shard]
+    if whole_layer:
+        check_whole_layer(cmd, all_ids, digests)
     with pack.open("xb") as f:
         subprocess.run([*cmd, *map(str, IDS)], stdout=f, check=True)
     with pack.open("rb") as f:
@@ -101,6 +122,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("shard", type=Path)
     parser.add_argument("binaries", type=Path)
+    parser.add_argument("--all-experts", action="store_true", help="check all 384 layer-0 pack extents")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="dsv41-cache-") as path:
-        check(args.shard.resolve(), args.binaries.resolve(), Path(path))
+        check(args.shard.resolve(), args.binaries.resolve(), Path(path), args.all_experts)
