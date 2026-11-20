@@ -649,7 +649,14 @@ case "$step" in
   arboris-sparse-silicon)
     sh seed/omega-from-seed.sh
     OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
-    "$OUT_DIR/caproot-issuer" "$OUT_DIR/sparse-chip" --sparse-silicon
+    "$OUT_DIR/caproot-issuer" "$OUT_DIR/sparse-chip" --sparse-silicon > "$OUT_DIR/arboris-device.log" || {
+      cat "$OUT_DIR/arboris-device.log"
+      exit 1
+    }
+    cat "$OUT_DIR/arboris-device.log"
+    grep -qx 'matching_fp32_words=200000' "$OUT_DIR/arboris-device.log"
+    grep -qx 'kernel_sha256=c9c1f2a6c5c7de7f8379d85d8bba1ad49e20479c76d0dde70b1fca1becfeba5b' "$OUT_DIR/arboris-device.log"
+    grep -qx 'output_sha256=8ded4456ffe03d54cad43b7b7b8d07ff1997919c103dd1b49b61c6782d6e3d19' "$OUT_DIR/arboris-device.log"
     ;;
   arboris)
     sh seed/omega-from-seed.sh > "$OUT_DIR/seed.log" 2>&1
