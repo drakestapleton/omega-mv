@@ -49,7 +49,7 @@ const char *omega2_ident_arboris_spread_cpu(void);
 uint32_t omega2_arboris_spread_cpu_hop(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint32_t *o_csr, uint64_t o_csr_len, uint32_t *o_state, uint64_t o_state_len, uint64_t *o_receipt, uint64_t o_receipt_len);
 /* export fn arboris_spread_cpu_run hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong */
 uint32_t omega2_arboris_spread_cpu_run(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint32_t *o_csr, uint64_t o_csr_len, uint32_t *o_state, uint64_t o_state_len, uint64_t *o_receipt, uint64_t o_receipt_len);
-#define OMEGA2_IDENT_bw_arboris_spread_emit "omega-ident 1 unit=bw_arboris_spread_emit abi=2 profile=OM-2 src=af8ebe43c33c7e4bb21b3dddc4f9812787440a0c69dd08156f2cca8f7c3f6874 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_bw_arboris_spread_emit "omega-ident 1 unit=bw_arboris_spread_emit abi=2 profile=OM-2 src=d4c737df23b6906d406224562afbc6cc1841e42606d28906d7e23c861a03ff3e omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_bw_arboris_spread_emit(void);
 /* export fn bw_arboris_spread_emit_mode0 code edit uchar 16384 to ulong */
 uint32_t omega2_bw_arboris_spread_emit_mode0(uint64_t *result, uint8_t *o_code, uint64_t o_code_len);
@@ -851,7 +851,7 @@ uint32_t omega2_est_om_check_hdr(uint64_t *result, const uint8_t *o_src, uint64_
 uint32_t omega2_est_om_mix_check(uint64_t *result, const uint64_t *o_w, uint64_t o_w_len, const uint64_t *o_v, uint64_t o_v_len, uint64_t o_k, uint64_t o_tol_bits);
 /* export fn est_om_mix_total_var w view ulong 3 v view ulong 3 k ulong to ulong */
 uint32_t omega2_est_om_mix_total_var(uint64_t *result, const uint64_t *o_w, uint64_t o_w_len, const uint64_t *o_v, uint64_t o_v_len, uint64_t o_k);
-#define OMEGA2_IDENT_st_core "omega-ident 1 unit=st_core abi=2 profile=OM-2 src=56795ac4fbe8b791190dff9c12d3165f1e41a10bd86d69dc36fc8161c0948168 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_st_core "omega-ident 1 unit=st_core abi=2 profile=OM-2 src=52883dffb8b8f611a158a89a1861b7843ba50e3fd0912d5372bcb8f6a7112a18 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_st_core(void);
 /* export fn st_om_hex_lower src view uchar * n ulong dst edit uchar * to void */
 uint32_t omega2_st_om_hex_lower(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_n, uint8_t *o_dst, uint64_t o_dst_len);
@@ -893,7 +893,7 @@ uint32_t omega2_visor_om_check_bytes(uint64_t *result, const uint8_t *o_p, uint6
 uint32_t omega2_visor_om_trim_blanks(uint64_t *result, const uint8_t *o_p, uint64_t o_p_len, uint64_t o_n, uint64_t *o_dst, uint64_t o_dst_len);
 /* export fn visor_om_cmd_arity cmd ulong dst edit ulong 2 to ulong */
 uint32_t omega2_visor_om_cmd_arity(uint64_t *result, uint64_t o_cmd, uint64_t *o_dst, uint64_t o_dst_len);
-#define OMEGA2_IDENT_fab_core "omega-ident 1 unit=fab_core abi=2 profile=OM-2 src=17128614e2a0dff17fff58b57676b7549c79dd8d9a091570f0980d58a2ddadb7 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_fab_core "omega-ident 1 unit=fab_core abi=2 profile=OM-2 src=6b9d30ebcc7e6a128c598004d1c0d5c7ffb084fa1a96868c4eea11102a554e75 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_fab_core(void);
 /* export fn fab_om_ct_equal a view uchar * b view uchar * n ulong to ulong */
 uint32_t omega2_fab_om_ct_equal(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len, uint64_t o_n);
