@@ -1441,6 +1441,172 @@ qic 12 QZ 16 48 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
 
+note =========================================================================
+note l (11): w4_b32_grouped8_fast -- 1-launch 8-expert W4 block-32 MoE GEMV (LDG.E.128, ZERO LUT!)
+note Args: x (R0:1), W_pool[256,N,K/8] u32 (R2:3), S_pool[256,N,K/64] u32 packed BF16 (R4:5),
+note       ids[8] (R6:7), C[8,N] (R8:9), K (40), N (44), x_stride (48).
+note Grid: (ceil(N/32), 8, 1), Block: 256 (16 half-warps x 2 rows = 32 rows/CTA), SMEM: 8192.
+note Half-warp (16 lanes) x 32 weights/lane (1x LDG.E.128) = 512 weights/iter (1 iter for K=512, 4 iters for K=2048!).
+note =========================================================================
+fn qW4G8Mac2 smOffReg ulong sc0 ulong sc1 ulong to void
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 60 0.0f32
+for w ulong 4
+qic 58 40 smOffReg QZ mul w 32 qLd
+qic 58 44 smOffReg QZ add mul w 32 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+for xi ulong 8
+qic 30 60 60 add 40 xi 0 qAlu4
+end
+qW4Unpack4 add 24 w 40 41 42 43 56
+qic 17 61 add 24 w QZ 16 qAlu4
+qW4Unpack4 61 44 45 46 47 56
+qW4Unpack4 add 28 w 40 41 42 43 57
+qic 17 61 add 28 w QZ 16 qAlu4
+qW4Unpack4 61 44 45 46 47 57
+end
+qNum 61 -8.0f32
+qic 32 60 60 61 0 qAlu4
+qic 30 56 56 60 0 qAlu1
+qic 30 57 57 60 0 qAlu4
+qic4 33 48 56 sc0 48 qAlu1
+qic4 33 49 57 sc1 49 qAlu4
+end
+
+fn qW4B32Grouped8Fast to void
+qStart 5
+qParam 20 40
+qParam 21 44
+qParam 22 48
+note Stage x[blockIdx.y * x_stride + 0..K-1] into SMEM[0..4*K-1]
+qMadReg 55 18 22 QZ
+qLit 56 0
+qLit 57 256
+mSx = get q36Pc 0
+qIadd 52 56 14
+bX = qBssy
+qic 28 QZ 52 20 0 qCmp
+skX = qBraFwd 1
+qIadd 53 55 52
+qicImm 9 16 53 0 4 qW1
+qic 11 54 16 QZ 0 qLd
+qMad 53 52 4 QZ
+qic 0 QZ QZ QZ 0 qW0
+qic 50 QZ 53 54 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skX 1
+qBsync bX
+qIadd 56 56 57
+qic 28 QZ 56 20 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mSx get q36Pc 0 qAlu4
+qBar
+note Load expert ID = ids[blockIdx.y] -> R23
+qicImm 9 16 18 6 4 qAlu4
+qic 11 23 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+note Half-warp geometry: hw = tid >> 4 (0..15), lane = tid & 15 (R39)
+note row0 = blockIdx.x * 32 + hw * 2 (R36), row1 = row0 + 1
+qic 17 52 14 QZ 4 qAlu4
+qic 18 39 14 QZ 15 qAlu4
+qMad 36 15 32 QZ
+qMad 36 52 2 36
+qLit 59 0xffffffff
+qIadd 59 21 59
+note wRowU32 = K >> 3 (R12), sRowU32 = K >> 6 (R13), nIters = K >> 9 (R33)
+qic 17 12 20 QZ 3 qAlu4
+qic 17 13 20 QZ 6 qAlu4
+qic 17 33 20 QZ 9 qAlu4
+qMadReg 54 23 21 QZ
+qMad 58 39 4 QZ
+qic 17 37 39 QZ 1 qAlu4
+qic 18 38 39 QZ 1 qAlu4
+note Row 0 W ptr -> R0:1, S ptr -> R10:11 (R0:1 x ptr no longer needed!)
+qMad 52 36 1 QZ
+qic 28 QZ 52 21 0 qCmp
+put q36Guard 0 1
+qMad 52 59 1 QZ
+qIadd 53 54 52
+qMadReg 32 53 12 58
+qicImm 9 0 32 2 4 qAlu4
+qMadReg 32 53 13 37
+qicImm 9 10 32 4 4 qAlu4
+note Row 1 W ptr -> R2:3, S ptr -> R4:5 (after computing from R2:3 and R4:5!)
+qLit 52 1
+qIadd 52 36 52
+qic 28 QZ 52 21 0 qCmp
+put q36Guard 0 1
+qMad 52 59 1 QZ
+qIadd 53 54 52
+qMadReg 32 53 12 58
+qicImm 9 2 32 2 4 qAlu4
+qMadReg 32 53 13 37
+qicImm 9 4 32 4 4 qAlu4
+note SMEM x offset = lane * 128 bytes (R32)
+qMad 32 39 128 QZ
+qNum 48 0.0f32
+qNum 49 0.0f32
+qLit 34 0
+qLit 35 1
+mLoop = get q36Pc 0
+note 2x LDG.E.128 (row0 + row1 weights) + 2x LDG.E.32 (packed BF16 scales)
+qic 57 24 0 QZ 0 qLdW1
+qic 57 28 2 QZ 0 qLd
+qic 11 50 10 QZ 0 qLd
+qic 11 51 4 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+note Extract lo16 or hi16 BF16 scale depending on (lane & 1) in R38
+qicImm 8 52 50 QZ 65536 qAlu1
+qic 18 53 50 QZ 0xffff0000 qAlu4
+qic 28 QZ 38 35 0 qCmp
+put q36Guard 0 1
+qicImm 8 52 53 QZ 1 qAlu4
+qicImm 8 54 51 QZ 65536 qAlu1
+qic 18 55 51 QZ 0xffff0000 qAlu4
+qic 28 QZ 38 35 0 qCmp
+put q36Guard 0 1
+qicImm 8 54 55 QZ 1 qAlu4
+note Save unpacked scales in R6, R7 (ids ptr R6:7 no longer needed!)
+qicImm 8 6 52 QZ 1 qAlu1
+qicImm 8 7 54 QZ 1 qAlu4
+qW4G8Mac2 32 6 7
+note Advance W ptrs by +256 bytes (64 u32 = 512 weights), S ptrs by +32 bytes (8 u32 = 16 scales), SMEM by +2048 B
+qicImm 9 0 35 0 256 qAlu1
+qicImm 9 2 35 2 256 qAlu1
+qicImm 9 10 35 10 32 qAlu1
+qicImm 9 4 35 4 32 qAlu1
+qLit 58 2048
+qIadd 32 32 58
+qIadd 34 34 35
+qic 28 QZ 34 33 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+note Half-warp sum (16 lanes -> delta 8, 4, 2, 1)
+qWarpRedSum 48 52 8
+qWarpRedSum 49 52 8
+qic 28 QZ 39 35 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qMadReg 54 18 21 QZ
+qic 28 QZ 36 21 0 qCmp
+sk0 = qBraFwd 1
+qIadd 53 54 36
+qicImm 9 16 53 8 4 qAlu4
+qic 12 QZ 16 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch sk0 1
+qLit 52 1
+qIadd 36 36 52
+qic 28 QZ 36 21 0 qCmp
+sk1 = qBraFwd 1
+qIadd 53 54 36
+qicImm 9 16 53 8 4 qAlu4
+qic 12 QZ 16 49 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch sk1 1
+end
+
 fn q36Kernel mode uchar to bool
 if eq mode 97
 qBf16GemvFast
@@ -1484,6 +1650,10 @@ ret true
 end
 if eq mode 107
 qBf16RescoreCands
+ret true
+end
+if eq mode 108
+qW4B32Grouped8Fast
 ret true
 end
 ret false

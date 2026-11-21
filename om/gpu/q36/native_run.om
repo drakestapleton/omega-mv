@@ -52,6 +52,10 @@ global qWExpGu long 4
 global qWExpGuS long 4
 global qWExpDn long 4
 global qWExpDnS long 4
+global qW4ExpGu long 4
+global qW4ExpGuS long 4
+global qW4ExpDn long 4
+global qW4ExpDnS long 4
 global qWShGu long 4
 global qWShGuS long 4
 global qWShDn long 4
@@ -69,10 +73,10 @@ text qArbOk "PASS: Arboris online adaptive sum-over-paths prefetcher (40L x 256E
 text qArbFail "FAIL: Arboris self-test failed\n"
 text qP1Ok "PASS: native GB10 9-kernel numerical parity self-test (bf16_gemv, fp8_b128_gemv, fp8_b128_grouped8, router_top8_256, swiglu8_q36, moe_combine_rms, gdn_step_bf16, attn_hd256_split+reduce_gate)\n"
 text qP1Fail "FAIL: native GB10 kernel parity check failed at test id: "
-text qRes0 "NATIVE_GPFIFO_40L_BACKBONE_2.57GB: median_us="
-text qRes1 "NATIVE_GPFIFO_40L_W4_EXACT_HEAD_2.86GB: median_us="
-text qRes2 "NATIVE_GPFIFO_40L_FP8_EXACT_HEAD_3.08GB: median_us="
-text qRes3 "NATIVE_GPFIFO_40L_FULL_248K_BF16_HEAD_3.59GB: median_us="
+text qRes0 "NATIVE_GPFIFO_40L_FP8_BACKBONE_2.57GB: median_us="
+text qRes1 "NATIVE_GPFIFO_40L_FP8_W4HEAD_2.86GB: median_us="
+text qRes2 "NATIVE_GPFIFO_40L_W4MOE_BACKBONE_1.85GB: median_us="
+text qRes3 "NATIVE_GPFIFO_40L_W4MOE_W4HEAD_2.13GB: median_us="
 text qArbRes "ARBORIS_40L_ONLINE_OVERHEAD: us_per_tok="
 text qArbHit " hit_rate_pct="
 text qTokS " tok_s_x100="
@@ -122,7 +126,7 @@ end
 
 fn qEmitAll to void
 put qCodePos 0 0
-for i ulong 11
+for i ulong 12
 p = mul div add get qCodePos 0 255 256 256
 put qEntry i p
 put qCodePos 0 p
@@ -145,6 +149,7 @@ put qSmem 7 0
 put qSmem 8 0
 put qSmem 9 8192
 put qSmem 10 0
+put qSmem 11 8192
 end
 
 fn qArg u uint to void
@@ -236,6 +241,7 @@ gbinline q false
 gbdma add q 8192 1
 gbemit 1
 gbinline add q 4096 true
+gbrel add mapaddr get gbmem 3 32 6
 put qBindN 0 0
 ret gbappend id get gbst 1
 end
@@ -497,6 +503,25 @@ if not qRunOne 8 16 1 1 256 9
 ret false
 end
 
+note 10. w4_b32_grouped8_fast (8x128x512, W=0x99999999 -> q-8=1.0, S=0x3f003f00 -> 0.5, x=1.0 -> C=256.0)
+for i ulong 65536
+r = mapset wk add 0x600000 mul i 4 4 0x99999999
+end
+for i ulong 8192
+r = mapset wk add 0x680000 mul i 4 4 0x3f003f00
+end
+qPtr add wva 0x040000
+qPtr add wva 0x600000
+qPtr add wva 0x680000
+qPtr add wva 0x0f0000
+qPtr add wva 0x690000
+qArg 512
+qArg 128
+qArg 0
+if not qRunOne 11 4 8 1 256 10
+ret false
+end
+
 if not qCheckF32 wk 0x050000 1024.0f32 0.5f32
 qPrint qP1Fail
 qPrintU 1
@@ -551,6 +576,12 @@ qPrintU 9
 qPrint qNl
 ret false
 end
+if not qCheckF32 wk 0x690000 256.0f32 0.5f32
+qPrint qP1Fail
+qPrintU 10
+qPrint qNl
+ret false
+end
 qPrint qP1Ok
 ret true
 end
@@ -586,7 +617,7 @@ end
 ret eq mapget get gbmem 3 0 4 1145324612
 end
 
-fn qRecordLayer l ulong bk ulong to bool
+fn qRecordLayer l ulong bk ulong useW4Moe bool to bool
 lutva = mapaddr get qLut 0
 isAttn = eq rem l 4 3
 if isAttn
@@ -676,7 +707,38 @@ qPtr qW 0x029100
 if not qRecord 3 1 1 1 256
 ret false
 end
-note Routed MoE: fp8_b128_grouped8_fast gate_up[8, 1024, 2048] + swiglu8 + down[8, 2048, 512]
+note Routed MoE: either W4 block-32 grouped-8 or FP8 block-128 grouped-8
+if useW4Moe
+qPtr qW 0x004000
+qPtr mapaddr get qW4ExpGu bk
+qPtr add mapaddr get qW4ExpGu bk 268435456
+qPtr qW 0x029000
+qPtr qW 0x080000
+qArg 2048
+qArg 1024
+qArg 0
+if not qRecord 11 32 8 1 256
+ret false
+end
+qPtr qW 0x080000
+qPtr qW 0x029100
+qPtr qW 0x090000
+qArg 512
+if not qRecord 4 4 8 1 128
+ret false
+end
+qPtr qW 0x090000
+qPtr mapaddr get qW4ExpDn bk
+qPtr add mapaddr get qW4ExpDn bk 134217728
+qPtr qW 0x029000
+qPtr qW 0x0a0000
+qArg 512
+qArg 2048
+qArg 512
+if not qRecord 11 64 8 1 256
+ret false
+end
+else
 qPtr qW 0x004000
 qPtr mapaddr get qWExpGu bk
 qPtr mapaddr get qWExpGuS bk
@@ -707,6 +769,7 @@ qArg 2048
 qArg 512
 if not qRecord 2 64 8 1 256
 ret false
+end
 end
 note Shared expert: gate_up[1024, 2048] FP8 + down[2048, 512] FP8
 qPtr qW 0x004000
@@ -764,15 +827,16 @@ if ne mapwrite get qPkt slot 0 gbcmd 0 n long n
 ret false
 end
 put qFastPos 0 n
+useW4 = ge headMode 2
 for l ulong 40
 bk = rem l 4
-if not qRecordLayer l bk
+if not qRecordLayer l bk useW4
 put qFastMode 0 0
 ret false
 end
 end
 lutva = mapaddr get qLut 0
-if eq headMode 1
+if or eq headMode 1 eq headMode 3
 note W4 block-32 two-pass exact lm_head: 0.286 GB W4 screen + Top-64 exact BF16 rescore!
 qPtr mapaddr get qLmW4 0
 qPtr mapaddr get qLmW4S 0
@@ -789,32 +853,6 @@ qPtr mapaddr get qCandIds 0
 qPtr mapaddr get qCandLog 0
 qArg 64
 if not qRecord 10 64 1 1 32
-put qFastMode 0 0
-ret false
-end
-end
-if eq headMode 2
-note FP8 two-pass screen lm_head: [248320, 2048] FP8 block-128x128
-qPtr qW 0x004000
-qPtr mapaddr get qLmFp8 0
-qPtr mapaddr get qLmFp8S 0
-qPtr lutva
-qPtr mapaddr get qLogits 0
-qArg 2048
-qArg 248320
-if not qRecord 1 7760 1 1 256
-put qFastMode 0 0
-ret false
-end
-end
-if eq headMode 3
-note Full 248k BF16 lm_head: [248320, 2048] BF16
-qPtr mapaddr get qLmBf16 0
-qPtr qW 0x004000
-qPtr mapaddr get qLogits 0
-qArg 2048
-qArg 248320
-if not qRecord 0 7760 1 1 256
 put qFastMode 0 0
 ret false
 end
@@ -937,6 +975,10 @@ put qWExpDnS b m
 if not qFillPattern m 65536 0x3b800000
 ret false
 end
+note W4 Routed Experts share the 4 cold banks (zero extra nvalloc slots!): gu at +0 (256 MiB), guS at +256 MiB (32 MiB)
+note dn at +0 (128 MiB), dnS at +128 MiB (16 MiB)
+put qW4ExpGu b get qWExpGu b
+put qW4ExpDn b get qWExpDn b
 note Shared Expert: gu[1024,2048] = 2 MiB, dn[2048,512] = 1 MiB
 m = nvalloc 2097152 true
 if le m 0

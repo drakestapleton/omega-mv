@@ -14,24 +14,25 @@ The seeded compiler (`seed/out/omc`) compiles `native_run.om` directly to a **22
 - **`moe_combine_rms_fast`** (`f`): Fused 8-expert sum + shared-expert + residual add + RMSNorm (`D=2048`) in 1 CTA.
 - **`gdn_step_bf16_fast`** (`g`): Fused Gated DeltaNet 1-token step with coalesced `[h, r, c]` packed BF16 state (`[32, 128, 128]` = 1 MiB/layer, cutting state bandwidth `126 MB -> 63 MB/tok` across 30 GDN layers).
 - **`attn_hd256_split_fast` & `attn_hd256_reduce_gate_fast`** (`h`, `i`): Warp-only (`Block=32`, `SMEM=0`, zero inner-loop `BAR.SYNC`, `LDG.E.128` for K & V) Split-K Flash-Decoding for `16 Q / 2 KV`, `hd=256`, BF16 KV cache + fused sigmoid output gate.
-- **`w4_lmhead_screen_fast` & `bf16_rescore_cands`** (`j`, `k`): Straight-line unrolled 2-block `LDG.E.128` W4 block-32 `lm_head` screen (`0.286 GB`) + Top-64 exact BF16 rescore (`+1.227 ms` end-to-end inside `q36-native` = **`233.3 GB/s` / `98.5%`** of GB10's `236.9 GB/s` ceiling).
+- **`w4_lmhead_screen_fast` & `bf16_rescore_cands`** (`j`, `k`): Straight-line unrolled 2-block `LDG.E.128` W4 block-32 `lm_head` screen (`0.286 GB`) + Top-64 exact BF16 rescore (`+1.23–1.36 ms` end-to-end inside `q36-native` = **`233.3 GB/s` / `98.5%`** of GB10's `236.9 GB/s` ceiling).
+- **`w4_b32_grouped8_fast`** (`l`): 1-launch 8-expert W4 block-32 MoE GEMV (16 half-warp lanes × 32 weights/lane via `LDG.E.128`, zero LUT, `1` iter for `K=512` and `4` iters for `K=2048`), shrinking routed MoE traffic `1.015 GB -> 0.286 GB` (`-2.18 ms/tok`).
 
 ## Arboris Prefetcher (`arboris/prefetch.om`)
 
-Online adaptive sum-over-paths co-activation prefetcher (`39` cross-layer transitions `L -> L+1` × `256` source experts × `16` Space-Saving slots = `159,744` uints). Measured overhead across all 40 layers: **`101 µs/tok`** (`0.10 ms/tok`, `0.49%` of decode latency) with **`93%` online hit rate** on repeating domain transitions.
+Online adaptive sum-over-paths co-activation prefetcher (`39` cross-layer transitions `L -> L+1` × `256` source experts × `16` Space-Saving slots = `159,744` uints). Measured overhead across all 40 layers: **`100 µs/tok`** (`0.10 ms/tok`, `0.54%` of decode latency) with **`93%` online hit rate** on repeating domain transitions.
 
 ## Verified GB10 Silicon Receipts (Zero CUDA, `nvrm_errors_delta: 0`)
 
-- Latest receipt (warp-only `LDG.E.128` HD256 attn + W4 Two-Pass Exact `lm_head`): `/home/drakestapleton/yardsticks/receipts/2026-11-21-q36-native-w4-warp-attn.json` (exclusive quiet Spark window `20261121T205446Z-5a8bd4`, `exit: 0`, `nvrm_errors_delta: 0`, `242 KB` static AArch64 ELF `ldd: not a dynamic executable`).
-- Earlier receipts: `2026-11-21-q36-native-zero-cuda-victory.json`, `2026-11-21-q36-native-zero-cuda-fast.json`.
+- Latest receipt (W4-MoE + W4 Two-Pass Exact `lm_head` + warp-only `LDG.E.128` HD256 attn): `/home/drakestapleton/yardsticks/receipts/2026-11-21-q36-native-w4-moe.json` (exclusive quiet Spark window `20261121T211501Z-f26c8b`, `exit: 0`, `nvrm_errors_delta: 0`, `261 KB` static AArch64 ELF `ldd: not a dynamic executable`).
+- Earlier receipts: `2026-11-21-q36-native-w4-warp-attn.json`, `2026-11-21-q36-native-zero-cuda-victory.json`, `2026-11-21-q36-native-zero-cuda-fast.json`.
 
 | Configuration (40 layers, 30 GDN BF16-state + 10 Full-Attn `T=1024`, cold 4-bank weights) | Median Latency | Throughput | Notes |
 |---|---:|---:|---|
-| 40L Backbone (`2.57 GB/tok`) | `19.21 ms/tok` | **`52.06 tok/s`** | `finite=OK`, zero CUDA |
-| **40L + W4 Two-Pass Exact `lm_head` (`2.86 GB/tok`)** | **`20.44 ms/tok`** | **`48.93 tok/s`** | W4+rescore delta: **`+1.23 ms`** (`233.3 GB/s`, `98.5%` ceiling) |
-| 40L + FP8 Two-Pass `lm_head` (`3.08 GB/tok`) | `21.57 ms/tok` | **`46.36 tok/s`** | FP8 head delta: `+2.36 ms` |
-| 40L + Full 248k BF16 `lm_head` (`3.59 GB/tok`) | `23.47 ms/tok` | **`42.61 tok/s`** | BF16 head delta: `+4.26 ms` |
-| Arboris 40L × 256E online prefetcher | `0.101 ms/tok` | — | `93%` hit rate, pure OM-2 |
+| 40L FP8 Backbone (`2.57 GB/tok`) | `19.21 ms/tok` | **`52.05 tok/s`** | `finite=OK`, zero CUDA |
+| 40L FP8 + W4 Two-Pass Exact `lm_head` (`2.86 GB/tok`) | `20.45 ms/tok` | **`48.91 tok/s`** | W4 head delta: `+1.23 ms` (`98.5%` ceiling) |
+| **40L W4-MoE Backbone (`1.85 GB/tok`)** | **`17.04 ms/tok`** | **`58.69 tok/s`** | W4 routed MoE saves **`-2.18 ms/tok`** |
+| **40L W4-MoE + W4 Two-Pass Exact `lm_head` (`2.13 GB/tok`)** | **`18.39 ms/tok`** | **`54.36 tok/s`** | **Beats C/Rust `aien-serve-http` (`50.43 tok/s`) with ZERO CUDA!** |
+| Arboris 40L × 256E online prefetcher | `0.100 ms/tok` | — | `93%` hit rate, pure OM-2 |
 
 *(Measurements use checkpoint-exact synthetic weights across 4 cold weight banks > 110× L2; real-checkpoint end-to-end greedy-parity measurements on `~/models/qwen3.6-35b-a3b-fp8-95a723d0` are recorded in `2026-11-21-q36-35b-verified-kit.json`: `50.43 tok/s` `N=1`, `105.31 tok/s` `N=4`, `119.39 tok/s` `N=8`.)*
 
