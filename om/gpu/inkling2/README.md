@@ -2,9 +2,10 @@
 
 This directory is **100% pure seeded Omega (`.om`)** — zero Python, zero C, zero `libc`, and zero CUDA (`libcuda.so.1` / `nvcc` / `ptxas`) anywhere. It contains:
 
-- **43 SM121 cubins** (`22` baseline reference kernels in `emit.om` + `21` high-speed pipelined/fused kernels in `emit_fast.om`) implementing the complete operator set for Thinking Machines Lab's **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, architecture `Inkling2LoopForConditionalGeneration`).
+- **43 SM121 cubins** (`22` baseline reference kernels in `emit.om` + `21` high-speed pipelined/fused kernels in `emit_fast.om`) plus **3 small-batch / deduplicated-MoE SM121 kernels** (`emit_batch.om`: `bf16_gemm_batch_fast`, `nvfp4_gemm_dedup_fast`, `mxfp8_gemm_dedup_fast`) implementing the complete single-stream and multi-stream (`M = 1..8`) operator set for Thinking Machines Lab's **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, architecture `Inkling2LoopForConditionalGeneration`).
 - **`inkling2-native` (`native_run.om`)**: 384 KB statically linked AArch64 ELF (`ldd`: `not a dynamic executable`) that runs a **21/21** live-silicon kernel parity self-test and a **single-submit 48-logical-layer native GPFIFO** benchmark directly over `/dev/nvidia*`.
 - **`inkling2-decode` (`decoder/{safetensors,tokenizer,decode}.om`)**: 421 KB statically linked AArch64 ELF (`ldd`: `not a dynamic executable`) that loads the real 19.5 GB `model-00001-of-00001.safetensors` checkpoint (~18.3 GB text weights across 4 UVM arenas) and `tokenizer.json`, executes all 48 logical layers end-to-end on GB10 silicon, and runs **live online Arboris co-activation tracking** (`arboris/prefetch.om`) on real router outputs across all 24 transitions (including `L17 -> L6`).
+- **`inkling2-multistream` & `check-ms-server` (`emit_batch.om`, `multistream/{batcher,ms_run,serve_ms}.om`)**: statically linked AArch64 ELFs (`ldd`: `not a dynamic executable`) implementing a **zero-heap static `N = 8` paged-KV table** (`128` 64-token pages), **deduplicated cross-stream MoE expert grouping** (`B * 8 <= 64` routed slots → `U <= 64` unique experts loaded once), a **fixed-slot `N = 8` HTTP continuous batcher** (`503 server_busy` + `Retry-After: 1` only when all 8 static slots are full), and a **single-submit 48-layer multi-stream GPFIFO** benchmark (`B = 1 / 4 / 8`).
 
 The seeded compiler (`seed/out/omc`) compiles `emit.om`, `emit_fast.om`, `native_run.om`, and `decoder/*.om` with the repository's SM121 encoder (`om/encoder/bw_enc_sm121.om`) and native NVRM/UVM/GPFIFO/QMD units (`gpu/nvidia/native/`). `seed/kflow/kpack.om` packs each SASS image into an SM121 `.cubin`. `lookup.om` generates the shared 272-entry FP32 decode table (`256` E4M3FN + `16` E2M1).
 
@@ -42,6 +43,21 @@ Single-submit native zero-CUDA receipt: `/home/drakestapleton/yardsticks/receipt
 
 *(Physical zero-overhead GB10 DRAM roofline at `236.9 GB/s`: `19.92 ms/tok` / `50.2 tok/s` without unembed, `23.85 ms/tok` / `41.9 tok/s` with full 201k BF16 unembed.)*
 
+### Multi-stream GB10 silicon throughput (`inkling2-multistream`, `M = 1 → 4 → 8`, ZERO CUDA)
+
+Multi-stream receipt: `/home/drakestapleton/yardsticks/receipts/2026-11-21-inkling2-multistream-b1-b4-b8-final.json` (exclusive quiet Spark window `20261121T183420Z-0ad544`, `exit: 0`, `nvrm_errors_delta: 4`, static AArch64 ELFs `ldd: not a dynamic executable`, static 8-slot paged-KV + `check-ms-server` PASS, `bf16_gemm_batch_fast` / `nvfp4_gemm_dedup_fast` / `mxfp8_gemm_dedup_fast` `B=8` live-silicon parity PASS, disjoint 64 MB K + 64 MB V slabs).
+
+| Configuration (48 logical layers, single-submit native GPFIFO, `T_swa=1024`, `T_full=4096`) | Median step | Aggregate throughput | Per-stream | Scaling vs `B=1` |
+|---|---:|---:|---:|---:|
+| `B = 1` (`U = 8` unique experts, no unembed) | `32.93 ms` | `30.36 tok/s` | `30.36 tok/s` | `1.00×` |
+| **`B = 4` (`U = 16` unique experts, no unembed)** | **`56.03 ms`** | **`71.39 tok/s`** | `17.85 tok/s` | **`2.35×`** |
+| **`B = 8` (`U = 24` unique experts, no unembed)** | **`87.66 ms`** | **`91.26 tok/s`** | `11.41 tok/s` | **`3.01×`** |
+| `B = 1` (`U = 8` unique experts + full 201k BF16 `unembed`) | `37.65 ms` | `26.55 tok/s` | `26.55 tok/s` | `1.00×` |
+| **`B = 4` (`U = 16` unique experts + full 201k BF16 `unembed`)** | **`59.94 ms`** | **`66.73 tok/s`** | `16.68 tok/s` | **`2.51×`** |
+| **`B = 8` (`U = 24` unique experts + full 201k BF16 `unembed`)** | **`91.86 ms`** | **`87.08 tok/s`** | `10.89 tok/s` | **`3.28×`** |
+
+Notice that sharing the 926 MB `unembed [201024, 2304]` weight matrix across all 8 streams adds only **`4.20 ms`** total (`87.66 ms -> 91.86 ms` = **`0.53 ms/stream`**).
+
 ## Architecture coverage
 
 - **NVFP4 (`modelopt`, layers `0..19` MoE experts):** `nvfp4_quant` (block-16 `E2M1`, `E4M3FN` block scales, `fouroversix_mae` 4-vs-6 scale selection, per-row outer scale) and `nvfp4_gemm` (packed `E2M1 x E2M1`, block-16 `E4M3` scales + FP32 outer scale product).
@@ -62,6 +78,7 @@ From the repository root on AArch64 Linux after growing `seed/out/omc`:
 sh seed/omega-from-seed.sh
 sh om/gpu/inkling2/build.sh build/inkling2
 build/inkling2/check-arboris
+build/inkling2/check-ms-server
 ```
 
 Inside an authorized Spark GB10 window:
@@ -69,6 +86,7 @@ Inside an authorized Spark GB10 window:
 ```sh
 spark-window run build/inkling2/inkling2-native                                               # 21/21 kernel parity + single-submit 48L GPFIFO (zero CUDA)
 spark-window run build/inkling2/inkling2-decode ~/models/inkling-2-mini-ed40e7da "Hello"      # real-weight 48L decoder + live Arboris (zero CUDA)
+spark-window run build/inkling2/inkling2-multistream                                          # N=8 paged-KV + dedup MoE parity + B=1/4/8 GPFIFO (zero CUDA)
 ```
 
 ## Launch contract

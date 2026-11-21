@@ -1,0 +1,181 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Arboris online adaptive sum-over-paths expert prefetcher for Qwen 3.6 35B-A3B FP8.
+note Architecture: 40 layers, 256 experts/layer, top-8 routed experts per token.
+note 39 cross-layer transitions (L -> L+1) x 256 source experts x 16 Space-Saving slots
+note packed as (count << 16) | target_eid = 159,744 uints (~624 KiB static table).
+
+global q36ArbEdges uint 159744
+global q36ArbPrev uint 8
+global q36ArbPrevLayer ulong 1
+global q36ArbHits ulong 1
+global q36ArbTotal ulong 1
+global q36ArbPred uint 8
+
+fn q36ArbResetToken to void
+  put q36ArbPrevLayer 0 40
+  for k ulong 8
+    put q36ArbPrev k 0xffffffff
+  end
+end
+
+fn q36ArbResetAll to void
+  for i ulong 159744
+    put q36ArbEdges i 0
+  end
+  put q36ArbHits 0 0
+  put q36ArbTotal 0 0
+  q36ArbResetToken
+end
+
+fn q36ArbPack cnt ulong tgt ulong to uint
+  ret or shl uint cnt 16 uint tgt
+end
+
+fn q36ArbHalve base ulong to void
+  for h ulong 16
+    hw = get q36ArbEdges add base h
+    if ne hw 0
+      hc = shr ulong shr hw 16 1
+      if eq hc 0
+        hc = ulong 1
+      end
+      put q36ArbEdges add base h q36ArbPack hc ulong and hw 65535
+    end
+  end
+end
+
+fn q36ArbUpdateEdge trans ulong src ulong tgt ulong to void
+  base = mul add mul trans 256 src 16
+  minIdx = ulong 0
+  minCnt = ulong 65536
+  for s ulong 16
+    w = get q36ArbEdges add base s
+    if eq w 0
+      put q36ArbEdges add base s q36ArbPack 1 tgt
+      ret
+    end
+    e = ulong and w 65535
+    c = ulong shr w 16
+    if eq e tgt
+      c = add c 1
+      if gt c 65000
+        q36ArbHalve base
+        c = shr c 1
+      end
+      put q36ArbEdges add base s q36ArbPack c tgt
+      ret
+    end
+    if lt c minCnt
+      minCnt = c
+      minIdx = s
+    end
+  end
+  if gt minCnt 1
+    put q36ArbEdges add base minIdx q36ArbPack sub minCnt 1 ulong and get q36ArbEdges add base minIdx 65535
+  else
+    put q36ArbEdges add base minIdx q36ArbPack 1 tgt
+  end
+end
+
+fn q36ArbObserve layer ulong ids view uint 8 to void
+  prevL = get q36ArbPrevLayer 0
+  if and lt prevL 39 eq layer add prevL 1
+    for i ulong 8
+      src = ulong get q36ArbPrev i
+      if lt src 256
+        for j ulong 8
+          tgt = ulong get ids j
+          if lt tgt 256
+            q36ArbUpdateEdge prevL src tgt
+          end
+        end
+      end
+    end
+  end
+  put q36ArbPrevLayer 0 layer
+  for k ulong 8
+    put q36ArbPrev k get ids k
+  end
+end
+
+fn q36ArbPredict layer ulong ids view uint 8 budget ulong outIds edit uint 8 to ulong
+  if ge layer 39
+    ret 0
+  end
+  scores = new ulong 256 0
+  for i ulong 8
+    src = ulong get ids i
+    if lt src 256
+      base = mul add mul layer 256 src 16
+      for s ulong 16
+        w = get q36ArbEdges add base s
+        if ne w 0
+          tgt = ulong and w 65535
+          cnt = ulong shr w 16
+          if lt tgt 256
+            put scores tgt add get scores tgt cnt
+          end
+        end
+      end
+    end
+  end
+  picked = ulong 0
+  lim = budget
+  if gt lim 8
+    lim = ulong 8
+  end
+  for slot ulong lim bound 8
+    best = ulong 256
+    bestSc = ulong 0
+    for e ulong 256
+      sc = get scores e
+      if gt sc bestSc
+        bestSc = sc
+        best = e
+      end
+    end
+    if eq best 256
+      ret picked
+    end
+    put outIds slot uint best
+    put scores best 0
+    picked = add picked 1
+  end
+  ret picked
+end
+
+fn q36ArbScorePred pr view uint 8 np ulong act view uint 8 to ulong
+  hits = ulong 0
+  for i ulong np bound 8
+    p = get pr i
+    for j ulong 8
+      if eq p get act j
+        hits = add hits 1
+        break
+      end
+    end
+  end
+  ret hits
+end
+
+fn q36ArbSelfTest to bool
+  q36ArbResetAll
+  a0 = new uint 8 0
+  a1 = new uint 8 0
+  pr = new uint 8 0
+  for k ulong 8
+    put a0 k uint add 10 mul k 3
+    put a1 k uint add 100 mul k 5
+  end
+  for rep ulong 4
+    q36ArbResetToken
+    q36ArbObserve 0 a0
+    q36ArbObserve 1 a1
+  end
+  n = q36ArbPredict 0 a0 8 pr
+  if ne n 8
+    ret false
+  end
+  hits = q36ArbScorePred pr n a1
+  ret eq hits 8
+end

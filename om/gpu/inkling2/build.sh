@@ -48,6 +48,23 @@ seed/out/omc < "$tmp/native-input.om" > "$tmp/inkling2-native"
     om/gpu/inkling2/decoder/decode.om
 ) > "$tmp/decode-input.om"
 seed/out/omc < "$tmp/decode-input.om" > "$tmp/inkling2-decode"
-chmod +x "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$tmp/inkling2-decode"
-mv "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$tmp/inkling2-decode" "$out"
+( echo om2
+  cat gpu/nvidia/native/nvrm/context.om \
+    gpu/nvidia/native/blackwell/vector.om \
+    gpu/nvidia/native/blackwell/launch.om \
+    gpu/nvidia/native/blackwell/batch.om \
+    om/encoder/bw_enc_sm121.om \
+    om/gpu/inkling2/emit_fast.om \
+    om/gpu/inkling2/emit_batch.om \
+    om/gpu/inkling2/multistream/batcher.om \
+    om/gpu/inkling2/multistream/ms_run.om
+) > "$tmp/ms-input.om"
+seed/out/omc < "$tmp/ms-input.om" > "$tmp/inkling2-multistream"
+( echo om2
+  cat om/gpu/inkling2/multistream/batcher.om \
+    om/gpu/inkling2/multistream/serve_ms.om
+) > "$tmp/serve-ms-input.om"
+seed/out/omc < "$tmp/serve-ms-input.om" > "$tmp/check-ms-server"
+chmod +x "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$tmp/inkling2-decode" "$tmp/inkling2-multistream" "$tmp/check-ms-server"
+mv "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$tmp/inkling2-decode" "$tmp/inkling2-multistream" "$tmp/check-ms-server" "$out"
 mv "$tmp"/*.cubin "$tmp/decode.f32le" "$out"

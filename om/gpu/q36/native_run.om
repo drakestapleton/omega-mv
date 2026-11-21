@@ -1,0 +1,1208 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure seeded-Omega zero-CUDA native GB10 runner for Qwen 3.6 35B-A3B FP8 + Arboris.
+note ZERO libcuda.so.1, ZERO libc, ZERO Python, ZERO C (static AArch64 ELF).
+note Compose after:
+note   gpu/nvidia/native/nvrm/context.om
+note   gpu/nvidia/native/blackwell/vector.om
+note   gpu/nvidia/native/blackwell/launch.om
+note   gpu/nvidia/native/blackwell/batch.om
+note   om/encoder/bw_enc_sm121.om
+note   om/gpu/q36/emit_fast.om
+note   om/gpu/q36/arboris/prefetch.om
+
+global qCodePos ulong 1
+global qEntry ulong 16
+global qSmem ulong 16
+global qCodeMap long 1
+global qCodeFail uint 1
+global qBind uint 32
+global qBindN ulong 1
+global qDirty uint 1
+global qFastMode ulong 1
+global qFastSlot ulong 1
+global qFastPos ulong 1
+
+note Device allocations (all via native NVRM/UVM ioctl nvalloc)
+global qLut long 1
+global qWork long 1
+global qKvK long 1
+global qKvV long 1
+global qGdnState long 1
+global qLmBf16 long 1
+global qLmFp8 long 1
+global qLmFp8S long 1
+global qLogits long 1
+
+note 4 cold weight banks (> 110x GB10 24 MiB L2)
+global qWGdnQkv long 4
+global qWGdnQkvS long 4
+global qWGdnZ long 4
+global qWGdnZS long 4
+global qWGdnAb long 4
+global qWOut long 4
+global qWOutS long 4
+global qWAttnQkvg long 4
+global qWAttnQkvgS long 4
+global qWRouter long 4
+global qWExpGu long 4
+global qWExpGuS long 4
+global qWExpDn long 4
+global qWExpDnS long 4
+global qWShGu long 4
+global qWShGuS long 4
+global qWShDn long 4
+global qWShDnS long 4
+
+note Pre-recorded native GPFIFO command packets: 0=40L backbone, 1=40L+FP8 head, 2=40L+BF16 head
+global qPkt long 4
+global qPktBytes ulong 4
+global qFillBuf uchar 65536
+
+text qHdr "=== QWEN 3.6 35B-A3B FP8 + ARBORIS 100% PURE SEEDED-OMEGA NATIVE GB10 RUNNER (ZERO libcuda.so.1) ===\n"
+text qOpenErr "FAIL: native /dev/nvidia* open/alloc error (stage): "
+text qSubErr "FAIL: native GPFIFO submit error (stage): "
+text qArbOk "PASS: Arboris online adaptive sum-over-paths prefetcher (40L x 256E x top-8) self-test\n"
+text qArbFail "FAIL: Arboris self-test failed\n"
+text qP1Ok "PASS: native GB10 9-kernel numerical parity self-test (bf16_gemv, fp8_b128_gemv, fp8_b128_grouped8, router_top8_256, swiglu8_q36, moe_combine_rms, gdn_step_bf16, attn_hd256_split+reduce_gate)\n"
+text qP1Fail "FAIL: native GB10 kernel parity check failed at test id: "
+text qRes0 "NATIVE_GPFIFO_40L_BACKBONE_2.57GB: median_us="
+text qRes1 "NATIVE_GPFIFO_40L_FP8_EXACT_HEAD_3.08GB: median_us="
+text qRes2 "NATIVE_GPFIFO_40L_FULL_248K_BF16_HEAD_3.59GB: median_us="
+text qArbRes "ARBORIS_40L_ONLINE_OVERHEAD: us_per_tok="
+text qArbHit " hit_rate_pct="
+text qTokS " tok_s_x100="
+text qFinOk " finite=OK\n"
+text qFinBad "FAIL: non-finite output detected!\n"
+text qNl "\n"
+text qDbgK "  kernel_test #"
+text qDbgOk " OK\n"
+text qDbgTo " TIMEOUT\n"
+
+fn qPrint s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn qPrintU x ulong to void
+b = new uchar 24 0
+pos = ulong 24
+v = x
+while true
+pos = sub pos 1
+put b pos uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+r = write 1 b pos sub 24 pos
+end
+
+fn qW off ulong to ulong
+ret add mapaddr get qWork 0 off
+end
+
+fn q36Write w view ulong 4 to void
+p = get qCodePos 0
+b = new uchar 16 0
+if gt get qCodeMap 0 0
+for i ulong 16
+put b i uchar and shr get w div i 4 mul rem i 4 8 255
+end
+if ne mapwrite get qCodeMap 0 p b 0 16 16
+put qCodeFail 0 1
+end
+end
+put qCodePos 0 add p 16
+end
+
+fn qEmitAll to void
+put qCodePos 0 0
+for i ulong 9
+p = mul div add get qCodePos 0 255 256 256
+put qEntry i p
+put qCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36Kernel uchar add 97 i
+if not ok
+exit 4
+end
+q36Done
+end
+put qSmem 0 16384
+put qSmem 1 17472
+put qSmem 2 17472
+put qSmem 3 2048
+put qSmem 4 0
+put qSmem 5 64
+put qSmem 6 1024
+put qSmem 7 64
+put qSmem 8 0
+end
+
+fn qArg u uint to void
+i = get qBindN 0
+put qBind i u
+put qBindN 0 add i 1
+end
+
+fn qPtr va ulong to void
+qArg gblo va
+qArg gbhi va
+end
+
+fn qFastEmit words ulong to bool
+cb = mapaddr get gbmem 1
+gbdma add cb 896 uint words
+for j ulong words
+gbemit get qBind j
+end
+q = mapaddr get gbmem 2
+gbinline q false
+gbdma add q 8192 1
+gbemit 1
+gbinline add q 4096 true
+gbrel add mapaddr get gbmem 3 32 6
+put qBindN 0 0
+n = get gbused 0
+pos = get qFastPos 0
+if gt add pos n 2096000
+ret false
+end
+if ne mapwrite get qPkt get qFastSlot 0 pos gbcmd 0 n long n
+ret false
+end
+put qFastPos 0 add pos n
+ret true
+end
+
+fn qRecord id ulong gx uint gy uint gz uint bx uint to bool
+gbqmd 1
+a = add mapaddr get qCodeMap 0 get qEntry id
+put gbq1 32 gblo shr a 4
+put gbq1 33 or uint and shr a 36 2097151 20971520
+put gbq1 59 gblo shr a 8
+put gbq1 34 or uint 65536 bx
+put gbq1 35 or uint 131073 shl uint 64 8
+sm = get qSmem id
+s7 = ulong 8
+if ne sm 0
+s7 = div add sm 127 128
+end
+put gbq1 36 uint or 78923776 s7
+put gbq1 37 0
+put gbq1 39 gx
+put gbq1 40 gy
+put gbq1 41 gz
+put gbcb 216 bx
+put gbcb 220 gx
+put gbcb 221 gy
+put gbcb 222 gz
+cb = mapaddr get gbmem 1
+words = get qBindN 0
+endva = add cb add 896 mul words 4
+put gbcb 212 gbhi endva
+put gbcb 213 gblo endva
+put gbused 0 0
+if eq get qFastMode 0 1
+ret qFastEmit words
+end
+gbsetup
+if ne get qDirty 0 0
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
+put qDirty 0 0
+end
+gbdma cb 224
+for j ulong 224
+gbemit get gbcb j
+end
+gbdma add cb 896 uint words
+for j ulong words
+gbemit get qBind j
+end
+q = mapaddr get gbmem 2
+gbinline q false
+gbdma add q 8192 1
+gbemit 1
+gbinline add q 4096 true
+put qBindN 0 0
+ret gbappend id get gbst 1
+end
+
+fn qWriteLut m long to bool
+for code ulong 256
+exp = and shr code 3 15
+frac = and code 7
+bits = uint 0
+if and eq exp 15 eq frac 7
+bits = uint 0x7fc00000
+else
+v = f32 0.0
+if eq exp 0
+v = div f32 frac f32 512.0
+else
+p = f32 1.0
+if ge exp 7
+for s ulong sub exp 7 bound 16
+p = mul p f32 2.0
+end
+else
+for s ulong sub 7 exp bound 16
+p = mul p f32 0.5
+end
+end
+v = mul add f32 1.0 div f32 frac f32 8.0 p
+end
+if ne and code 128 0
+v = sub f32 0.0 v
+end
+bits = bitcast uint v
+end
+if ne mapset m mul code 4 4 ulong bits 0
+ret false
+end
+end
+ret true
+end
+
+fn qFillPattern m long bytes ulong pat uint to bool
+for i ulong 16384
+for j ulong 4
+put qFillBuf add mul i 4 j uchar and shr pat mul j 8 255
+end
+end
+off = ulong 0
+while lt off bytes bound 4000000000
+n = sub bytes off
+if gt n 65536
+n = ulong 65536
+end
+if ne mapwrite m off qFillBuf 0 n long n
+ret false
+end
+off = add off n
+end
+ret true
+end
+
+fn qCheckF32 m long off ulong want f32 tol f32 to bool
+got = bitcast f32 uint mapget m off 4
+diff = sub got want
+if lt diff 0.0f32
+diff = sub f32 0.0 diff
+end
+ret le diff tol
+end
+
+fn qIsFiniteU32 bits ulong to bool
+exp = and shr bits 23 255
+ret lt exp 255
+end
+
+fn qRunOne id ulong gx uint gy uint gz uint bx uint tid ulong to bool
+put qDirty 0 1
+if not gbbegin 1
+ret false
+end
+if not qRecord id gx gy gz bx
+ret false
+end
+if not gbbsubmit 1000000000
+qPrint qDbgK
+qPrintU tid
+qPrint qDbgTo
+ret false
+end
+qPrint qDbgK
+qPrintU tid
+qPrint qDbgOk
+ret true
+end
+
+note =========================================================================
+note Phase 1: Live GB10 Numerical Parity Self-Test (all 9 SM121 kernels)
+note =========================================================================
+fn qSelfTest to bool
+wk = get qWork 0
+wva = mapaddr wk
+lutva = mapaddr get qLut 0
+note 0x000000: W_bf16[32,2048] = 0.5 (0x3f003f00)
+if not qFillPattern wk 0x040000 0x3f003f00
+ret false
+end
+note 0x040000: x[2048] = 1.0 (0x3f800000)
+for i ulong 2048
+r = mapset wk add 0x040000 mul i 4 4 0x3f800000
+end
+note 0x060000: W_fp8[256,2048] = 1.0 (0x38 = E4M3FN 1.0 -> 0x38383838)
+for i ulong 131072
+r = mapset wk add 0x060000 mul i 4 4 0x38383838
+end
+note 0x0e0000: S_f32[2,16] = 0.5 (0x3f000000)
+for i ulong 256
+r = mapset wk add 0x0e0000 mul i 4 4 0x3f000000
+end
+note 0x0f0000: ids[8] = 0..7
+for i ulong 8
+r = mapset wk add 0x0f0000 mul i 4 4 i
+end
+note 0x100000: W_pool[8, 128, 2048] = 1.0 (0x38383838) = 2 MiB -> 0x100000..0x2fffff
+for i ulong 524288
+r = mapset wk add 0x100000 mul i 4 4 0x38383838
+end
+note 0x300000: S_pool[8, 1, 16] = 0.25 (0x3e800000)
+for i ulong 128
+r = mapset wk add 0x300000 mul i 4 4 0x3e800000
+end
+note 0x320000: router logits[256] = 0.01 * i (so top-8 are 255,254,...,248)
+for i ulong 256
+v = mul f32 i 0.01f32
+r = mapset wk add 0x320000 mul i 4 4 ulong bitcast uint v
+end
+note 0x330000: swiglu gu[8, 1024] = 1.0, wts[8] = 1.0
+for i ulong 8192
+r = mapset wk add 0x330000 mul i 4 4 0x3f800000
+end
+for i ulong 8
+r = mapset wk add 0x340000 mul i 4 4 0x3f800000
+end
+note 0x360000: moe_combine downs[8,2048]=0.125, shared[2048]=1.0, res[2048]=1.0, gain[2048]=2.0 -> res_out=3.0, norm_out=2.0
+for i ulong 16384
+r = mapset wk add 0x360000 mul i 4 4 0x3e000000
+end
+for i ulong 2048
+r = mapset wk add 0x370000 mul i 4 4 0x3f800000
+r = mapset wk add 0x372000 mul i 4 4 0x3f800000
+r = mapset wk add 0x374000 mul i 4 4 0x40000000
+end
+note 0x380000: GDN qkv[8192]=1.0 (q=1,k=1,v=1), z[4096]=0.0, ab[64]=0.0 (decay=0.5,beta=0.5), state_bf16=0
+for i ulong 8192
+r = mapset wk add 0x380000 mul i 4 4 0x3f800000
+end
+for i ulong 4096
+r = mapset wk add 0x388000 mul i 4 4 0x3f800000
+end
+for i ulong 64
+r = mapset wk add 0x38c000 mul i 4 4 0
+end
+for i ulong 262144
+r = mapset wk add 0x400000 mul i 4 4 0
+end
+note 0x500000: Attn Q[16,256]=1.0, K_bf16[2,16,256]=1.0 (0x3f803f80), V_bf16[2,16,256]=2.0 (0x40004000), gate[16,256]=0.0 -> out=1.0
+for i ulong 4096
+r = mapset wk add 0x500000 mul i 4 4 0x3f800000
+r = mapset wk add 0x504000 mul i 4 4 0
+end
+for i ulong 4096
+r = mapset wk add 0x510000 mul i 4 4 0x3f803f80
+r = mapset wk add 0x520000 mul i 4 4 0x40004000
+end
+
+note Run each kernel individually with 1s timeout for exact fault/hang pinpointing
+note 1. bf16_gemv_fast (32x2048, W=0.5, x=1.0 -> y=1024.0)
+qPtr wva
+qPtr add wva 0x040000
+qPtr add wva 0x050000
+qArg 2048
+qArg 32
+if not qRunOne 0 1 1 1 256 1
+ret false
+end
+note 2. fp8_b128_gemv_fast (256x2048, W=1.0, S=0.5, x=1.0 -> C=1024.0)
+qPtr add wva 0x040000
+qPtr add wva 0x060000
+qPtr add wva 0x0e0000
+qPtr lutva
+qPtr add wva 0x054000
+qArg 2048
+qArg 256
+if not qRunOne 1 8 1 1 256 2
+ret false
+end
+note 3. fp8_b128_grouped8_fast (8x128x2048, W=1.0, S=0.25, x=1.0 -> C=512.0)
+qPtr add wva 0x040000
+qPtr add wva 0x100000
+qPtr add wva 0x300000
+qPtr add wva 0x0f0000
+qPtr lutva
+qPtr add wva 0x310000
+qArg 2048
+qArg 128
+qArg 0
+if not qRunOne 2 4 8 1 256 3
+ret false
+end
+note 4. router_top8_256_fast (logits=0.01*i -> ids[0]=255)
+qPtr add wva 0x320000
+qPtr add wva 0x321000
+qPtr add wva 0x322000
+if not qRunOne 3 1 1 1 256 4
+ret false
+end
+note 5. swiglu8_q36_fast (gate=1, up=1, w=1 -> silu(1)=0.731059)
+qPtr add wva 0x330000
+qPtr add wva 0x340000
+qPtr add wva 0x350000
+qArg 512
+if not qRunOne 4 4 8 1 128 5
+ret false
+end
+note 6. moe_combine_rms_fast (downs=0.125*8=1, sh=1, res=1 -> res_out=3.0, gain=2 -> norm_out=2.0)
+qPtr add wva 0x360000
+qPtr add wva 0x370000
+qPtr add wva 0x372000
+qPtr add wva 0x374000
+qPtr add wva 0x376000
+qPtr add wva 0x378000
+if not qRunOne 5 1 1 1 256 6
+ret false
+end
+note 7. gdn_step_bf16_fast (S=0, decay=0.5, beta=0.5, k=1, v=1 -> S_new=0.5, q=1 -> S^Tq=64.0, z=1 -> silu(1)=0.731059 -> out=46.7877)
+qPtr add wva 0x380000
+qPtr add wva 0x388000
+qPtr add wva 0x38c000
+qPtr add wva 0x400000
+qPtr add wva 0x390000
+if not qRunOne 6 32 1 1 128 7
+ret false
+end
+note 8 & 9. attn_hd256_split_fast + attn_hd256_reduce_gate_fast (V=2.0, gate=0 -> sigmoid(0)=0.5 -> out=1.0)
+qPtr add wva 0x500000
+qPtr add wva 0x510000
+qPtr add wva 0x520000
+qPtr add wva 0x530000
+qPtr add wva 0x550000
+qArg 16
+qArg 8
+if not qRunOne 7 16 8 1 256 8
+ret false
+end
+qPtr add wva 0x530000
+qPtr add wva 0x550000
+qPtr add wva 0x504000
+qPtr add wva 0x560000
+qArg 8
+if not qRunOne 8 16 1 1 256 9
+ret false
+end
+
+if not qCheckF32 wk 0x050000 1024.0f32 0.5f32
+qPrint qP1Fail
+qPrintU 1
+qPrint qNl
+ret false
+end
+if not qCheckF32 wk 0x054000 1024.0f32 0.5f32
+qPrint qP1Fail
+qPrintU 2
+qPrint qNl
+ret false
+end
+if not qCheckF32 wk 0x310000 512.0f32 0.5f32
+qPrint qP1Fail
+qPrintU 3
+qPrint qNl
+ret false
+end
+if ne mapget wk 0x321000 4 255
+qPrint qP1Fail
+qPrintU 4
+qPrint qNl
+ret false
+end
+if not qCheckF32 wk 0x350000 0.731059f32 0.02f32
+qPrint qP1Fail
+qPrintU 5
+qPrint qNl
+ret false
+end
+if not qCheckF32 wk 0x376000 3.0f32 0.02f32
+qPrint qP1Fail
+qPrintU 6
+qPrint qNl
+ret false
+end
+if not qCheckF32 wk 0x378000 2.0f32 0.02f32
+qPrint qP1Fail
+qPrintU 7
+qPrint qNl
+ret false
+end
+if not qCheckF32 wk 0x390000 46.7877f32 0.5f32
+qPrint qP1Fail
+qPrintU 8
+qPrint qNl
+ret false
+end
+if not qCheckF32 wk 0x560000 1.0f32 0.02f32
+qPrint qP1Fail
+qPrintU 9
+qPrint qNl
+ret false
+end
+qPrint qP1Ok
+ret true
+end
+
+note =========================================================================
+note Phase 2: Full 40-Layer Qwen 3.6 35B-A3B FP8 Native GPFIFO Pipeline
+note   30 GDN layers + 10 Full-Attn HD256 layers (L = 3,7,11,...,39)
+note   4 cold weight banks (> 2.8 GB total > 115x L2), 256 experts, BF16 GDN state
+note =========================================================================
+fn qWaitFast timeout ulong to bool
+t0 = monons
+while lt ulong sub monons t0 timeout bound 5000000
+if eq mapget get gbmem 3 16 4 1179010630
+put nvret 0 get nvput 0
+ret true
+end
+r = sleepns long 5000
+end
+ret false
+end
+
+fn qReplayPkt slot ulong to bool
+r = mapset get gbmem 2 8192 4 0
+r = mapset get gbmem 3 0 4 0
+r = mapset get gbmem 3 16 4 0
+nb = get qPktBytes slot
+if not nvsend get qPkt slot 0 uint div nb 4
+ret false
+end
+if not qWaitFast 15000000000
+ret false
+end
+ret eq mapget get gbmem 3 0 4 1145324612
+end
+
+fn qRecordLayer l ulong bk ulong to bool
+lutva = mapaddr get qLut 0
+isAttn = eq rem l 4 3
+if isAttn
+note Full-Attn layer: qkvg[9216,2048] FP8 -> Split-K HD256 (T=1024, S=8) -> reduce+gate -> o_proj[2048,4096] FP8
+qPtr qW 0x004000
+qPtr mapaddr get qWAttnQkvg bk
+qPtr mapaddr get qWAttnQkvgS bk
+qPtr lutva
+qPtr qW 0x010000
+qArg 2048
+qArg 9216
+if not qRecord 1 288 1 1 256
+ret false
+end
+qPtr qW 0x010000
+qPtr mapaddr get qKvK 0
+qPtr mapaddr get qKvV 0
+qPtr qW 0x040000
+qPtr qW 0x060000
+qArg 1024
+qArg 8
+if not qRecord 7 16 8 1 256
+ret false
+end
+qPtr qW 0x040000
+qPtr qW 0x060000
+qPtr qW 0x014000
+qPtr qW 0x020000
+qArg 8
+if not qRecord 8 16 1 1 256
+ret false
+end
+else
+note GDN layer: fused in_proj_qkvz[12288,2048] FP8 + in_proj_ab[64,2048] BF16 -> coalesced gdn_step_bf16
+qPtr qW 0x004000
+qPtr mapaddr get qWGdnQkv bk
+qPtr mapaddr get qWGdnQkvS bk
+qPtr lutva
+qPtr qW 0x010000
+qArg 2048
+qArg 12288
+if not qRecord 1 384 1 1 256
+ret false
+end
+qPtr mapaddr get qWGdnAb bk
+qPtr qW 0x004000
+qPtr qW 0x01c000
+qArg 2048
+qArg 64
+if not qRecord 0 2 1 1 256
+ret false
+end
+gdnIdx = sub l div add l 1 4
+gdnOff = mul gdnIdx 1048576
+qPtr qW 0x010000
+qPtr qW 0x018000
+qPtr qW 0x01c000
+qPtr add mapaddr get qGdnState 0 gdnOff
+qPtr qW 0x020000
+if not qRecord 6 32 1 1 128
+ret false
+end
+end
+note Mixer out_proj[2048,4096] FP8
+qPtr qW 0x020000
+qPtr mapaddr get qWOut bk
+qPtr mapaddr get qWOutS bk
+qPtr lutva
+qPtr qW 0x024000
+qArg 4096
+qArg 2048
+if not qRecord 1 64 1 1 256
+ret false
+end
+note Router: bf16_gemv_fast [256, 2048] + router_top8_256_fast
+qPtr mapaddr get qWRouter bk
+qPtr qW 0x004000
+qPtr qW 0x028000
+qArg 2048
+qArg 256
+if not qRecord 0 8 1 1 256
+ret false
+end
+qPtr qW 0x028000
+qPtr qW 0x029000
+qPtr qW 0x029100
+if not qRecord 3 1 1 1 256
+ret false
+end
+note Routed MoE: fp8_b128_grouped8_fast gate_up[8, 1024, 2048] + swiglu8 + down[8, 2048, 512]
+qPtr qW 0x004000
+qPtr mapaddr get qWExpGu bk
+qPtr mapaddr get qWExpGuS bk
+qPtr qW 0x029000
+qPtr lutva
+qPtr qW 0x080000
+qArg 2048
+qArg 1024
+qArg 0
+if not qRecord 2 32 8 1 256
+ret false
+end
+qPtr qW 0x080000
+qPtr qW 0x029100
+qPtr qW 0x090000
+qArg 512
+if not qRecord 4 4 8 1 128
+ret false
+end
+qPtr qW 0x090000
+qPtr mapaddr get qWExpDn bk
+qPtr mapaddr get qWExpDnS bk
+qPtr qW 0x029000
+qPtr lutva
+qPtr qW 0x0a0000
+qArg 512
+qArg 2048
+qArg 512
+if not qRecord 2 64 8 1 256
+ret false
+end
+note Shared expert: gate_up[1024, 2048] FP8 + down[2048, 512] FP8
+qPtr qW 0x004000
+qPtr mapaddr get qWShGu bk
+qPtr mapaddr get qWShGuS bk
+qPtr lutva
+qPtr qW 0x0b0000
+qArg 2048
+qArg 1024
+if not qRecord 1 32 1 1 256
+ret false
+end
+qPtr qW 0x0b0000
+qPtr mapaddr get qWShDn bk
+qPtr mapaddr get qWShDnS bk
+qPtr lutva
+qPtr qW 0x0b2000
+qArg 512
+qArg 2048
+if not qRecord 1 64 1 1 256
+ret false
+end
+note Fused MoE combine + shared + residual + next-layer RMSNorm (D=2048)
+qPtr qW 0x0a0000
+qPtr qW 0x0b2000
+qPtr qW 0x000000
+qPtr qW 0x008000
+qPtr qW 0x000000
+qPtr qW 0x004000
+if not qRecord 5 1 1 1 256
+ret false
+end
+ret true
+end
+
+fn qRecordAll40 slot ulong headMode ulong to bool
+put qFastMode 0 1
+put qFastSlot 0 slot
+put qFastPos 0 0
+put gbused 0 0
+gbsetup
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
+cb = mapaddr get gbmem 1
+gbdriver cb
+gbdma cb 224
+for j ulong 224
+gbemit get gbcb j
+end
+n = get gbused 0
+if ne mapwrite get qPkt slot 0 gbcmd 0 n long n
+ret false
+end
+put qFastPos 0 n
+for l ulong 40
+bk = rem l 4
+if not qRecordLayer l bk
+put qFastMode 0 0
+ret false
+end
+end
+lutva = mapaddr get qLut 0
+if eq headMode 1
+note FP8 two-pass screen lm_head: [248320, 2048] FP8 block-128x128
+qPtr qW 0x004000
+qPtr mapaddr get qLmFp8 0
+qPtr mapaddr get qLmFp8S 0
+qPtr lutva
+qPtr mapaddr get qLogits 0
+qArg 2048
+qArg 248320
+if not qRecord 1 7760 1 1 256
+put qFastMode 0 0
+ret false
+end
+end
+if eq headMode 2
+note Full 248k BF16 lm_head: [248320, 2048] BF16
+qPtr mapaddr get qLmBf16 0
+qPtr qW 0x004000
+qPtr mapaddr get qLogits 0
+qArg 2048
+qArg 248320
+if not qRecord 0 7760 1 1 256
+put qFastMode 0 0
+ret false
+end
+end
+put gbused 0 0
+gbtail
+n = get gbused 0
+pos = get qFastPos 0
+if ne mapwrite get qPkt slot pos gbcmd 0 n long n
+put qFastMode 0 0
+ret false
+end
+put qPktBytes slot add pos n
+put qFastMode 0 0
+ret true
+end
+
+fn qAllocModel to bool
+for b ulong 4
+note GDN fused in_proj_qkvz[12288,2048] = 24 MiB, S[96,16] = 8 KiB
+m = nvalloc 25165824 true
+if le m 0
+ret false
+end
+put qWGdnQkv b m
+if not qFillPattern m 25165824 0x30303030
+ret false
+end
+m = nvalloc 8192 true
+if le m 0
+ret false
+end
+put qWGdnQkvS b m
+if not qFillPattern m 8192 0x3b800000
+ret false
+end
+note GDN in_proj_ab[64,2048] BF16 = 256 KiB
+m = nvalloc 262144 true
+if le m 0
+ret false
+end
+put qWGdnAb b m
+if not qFillPattern m 262144 0x3c003c00
+ret false
+end
+note Mixer out_proj[2048,4096] = 8 MiB, S[16,32] = 4 KiB
+m = nvalloc 8388608 true
+if le m 0
+ret false
+end
+put qWOut b m
+if not qFillPattern m 8388608 0x30303030
+ret false
+end
+m = nvalloc 4096 true
+if le m 0
+ret false
+end
+put qWOutS b m
+if not qFillPattern m 4096 0x3b800000
+ret false
+end
+note Full-Attn qkvg[9216,2048] = 18 MiB, S[72,16] = 8 KiB
+m = nvalloc 18874368 true
+if le m 0
+ret false
+end
+put qWAttnQkvg b m
+if not qFillPattern m 18874368 0x30303030
+ret false
+end
+m = nvalloc 8192 true
+if le m 0
+ret false
+end
+put qWAttnQkvgS b m
+if not qFillPattern m 8192 0x3b800000
+ret false
+end
+note Router[256,2048] BF16 = 1 MiB
+m = nvalloc 1048576 true
+if le m 0
+ret false
+end
+put qWRouter b m
+if not qFillPattern m 1048576 0x3c003c00
+ret false
+end
+note Routed Experts: 256 x gate_up[1024,2048] = 512 MiB/bank, S = 128 KiB
+m = nvalloc 536870912 true
+if le m 0
+ret false
+end
+put qWExpGu b m
+if not qFillPattern m 536870912 0x30303030
+ret false
+end
+m = nvalloc 131072 true
+if le m 0
+ret false
+end
+put qWExpGuS b m
+if not qFillPattern m 131072 0x3b800000
+ret false
+end
+note Routed Experts: 256 x down[2048,512] = 256 MiB/bank, S = 64 KiB
+m = nvalloc 268435456 true
+if le m 0
+ret false
+end
+put qWExpDn b m
+if not qFillPattern m 268435456 0x30303030
+ret false
+end
+m = nvalloc 65536 true
+if le m 0
+ret false
+end
+put qWExpDnS b m
+if not qFillPattern m 65536 0x3b800000
+ret false
+end
+note Shared Expert: gu[1024,2048] = 2 MiB, dn[2048,512] = 1 MiB
+m = nvalloc 2097152 true
+if le m 0
+ret false
+end
+put qWShGu b m
+if not qFillPattern m 2097152 0x30303030
+ret false
+end
+m = nvalloc 4096 true
+if le m 0
+ret false
+end
+put qWShGuS b m
+if not qFillPattern m 4096 0x3b800000
+ret false
+end
+m = nvalloc 1048576 true
+if le m 0
+ret false
+end
+put qWShDn b m
+if not qFillPattern m 1048576 0x30303030
+ret false
+end
+m = nvalloc 4096 true
+if le m 0
+ret false
+end
+put qWShDnS b m
+if not qFillPattern m 4096 0x3b800000
+ret false
+end
+end
+note 30 GDN BF16 states: 30 x 32 x 128 x 128 x 2B = 30 MiB
+m = nvalloc 31457280 true
+if le m 0
+ret false
+end
+put qGdnState 0 m
+if not qFillPattern m 31457280 0
+ret false
+end
+note Full-Attn BF16 KV (T=1024, 2 KV heads, hd=256): 1 MiB K + 1 MiB V
+m = nvalloc 1048576 true
+if le m 0
+ret false
+end
+put qKvK 0 m
+if not qFillPattern m 1048576 0x3c003c00
+ret false
+end
+m = nvalloc 1048576 true
+if le m 0
+ret false
+end
+put qKvV 0 m
+if not qFillPattern m 1048576 0x3c003c00
+ret false
+end
+note FP8 lm_head [248320, 2048] = 508,559,360 B + scales [1940, 16] = 126,976 B
+m = nvalloc 508559360 true
+if le m 0
+ret false
+end
+put qLmFp8 0 m
+if not qFillPattern m 508559360 0x30303030
+ret false
+end
+m = nvalloc 131072 true
+if le m 0
+ret false
+end
+put qLmFp8S 0 m
+if not qFillPattern m 131072 0x3b800000
+ret false
+end
+note BF16 lm_head [248320, 2048] = 1,017,118,720 B
+m = nvalloc 1017118720 true
+if le m 0
+ret false
+end
+put qLmBf16 0 m
+if not qFillPattern m 1017118720 0x3c003c00
+ret false
+end
+note Logits [248320] = 993,280 B -> 1 MiB
+m = nvalloc 1048576 true
+if le m 0
+ret false
+end
+put qLogits 0 m
+note 3 GPFIFO command packet buffers (2 MiB each)
+for s ulong 3
+m = nvalloc 2097152 true
+if le m 0
+ret false
+end
+put qPkt s m
+end
+ret true
+end
+
+fn qInitWork to bool
+wk = get qWork 0
+for i ulong 2048
+r = mapset wk mul i 4 4 0x3dcccccd
+r = mapset wk add 0x004000 mul i 4 4 0x3dcccccd
+r = mapset wk add 0x008000 mul i 4 4 0x3f800000
+end
+ret true
+end
+
+fn qSortTimes t edit ulong 16 to void
+for i ulong 16
+for j ulong 15
+if gt get t j get t add j 1
+tmp = get t j
+put t j get t add j 1
+put t add j 1 tmp
+end
+end
+end
+end
+
+fn qBenchConfig slot ulong labelMode ulong to bool
+for w ulong 2
+if not qReplayPkt slot
+ret false
+end
+end
+ts = new ulong 16 0
+for it ulong 16
+t0 = monons
+if not qReplayPkt slot
+ret false
+end
+t1 = monons
+put ts it div ulong sub t1 t0 1000
+end
+qSortTimes ts
+medUs = get ts 8
+tokSx100 = div 100000000 medUs
+if eq labelMode 0
+qPrint qRes0
+end
+if eq labelMode 1
+qPrint qRes1
+end
+if eq labelMode 2
+qPrint qRes2
+end
+qPrintU medUs
+qPrint qTokS
+qPrintU tokSx100
+for i ulong 2048
+if not qIsFiniteU32 mapget get qWork 0 mul i 4 4
+qPrint qFinBad
+ret false
+end
+end
+if gt labelMode 0
+for i ulong 1024
+if not qIsFiniteU32 mapget get qLogits 0 mul i 4 4
+qPrint qFinBad
+ret false
+end
+end
+end
+qPrint qFinOk
+ret true
+end
+
+fn qFillIds ids edit uint 8 l ulong tok ulong to void
+t = rem tok 4
+for k ulong 8
+v = add mul l 7 mul k 13
+v = rem add v t 256
+put ids k uint v
+end
+end
+
+fn qBenchArbTok tok ulong to void
+ids = new uint 8 0
+pr = new uint 8 0
+q36ArbResetToken
+for l ulong 40
+qFillIds ids l tok
+if gt l 0
+put q36ArbHits 0 add get q36ArbHits 0 q36ArbScorePred pr 8 ids
+put q36ArbTotal 0 add get q36ArbTotal 0 8
+end
+q36ArbObserve l ids
+if lt l 39
+n = q36ArbPredict l ids 8 pr
+end
+end
+end
+
+fn qBenchArboris40L to void
+q36ArbResetAll
+t0 = monons
+for tok ulong 64
+qBenchArbTok tok
+end
+t1 = monons
+usPerTok = div ulong sub t1 t0 64000
+hitPct = div mul get q36ArbHits 0 100 get q36ArbTotal 0
+qPrint qArbRes
+qPrintU usPerTok
+qPrint qArbHit
+qPrintU hitPct
+qPrint qNl
+end
+
+fn main to int
+qPrint qHdr
+if not q36ArbSelfTest
+qPrint qArbFail
+ret 1
+end
+qPrint qArbOk
+if not gbopen 1
+qPrint qOpenErr
+qPrintU ulong get nvstage 0
+qPrint qNl
+ret 2
+end
+if not gbbopen
+qPrint qOpenErr
+qPrintU ulong get nvstage 0
+qPrint qNl
+ret 3
+end
+put qCodeMap 0 0
+qEmitAll
+csize = mul div add get qCodePos 0 4095 4096 4096
+cm = nvalloc csize false
+if le cm 0
+qPrint qOpenErr
+qPrintU ulong get nvstage 0
+qPrint qNl
+ret 4
+end
+put qCodeMap 0 cm
+put qCodeFail 0 0
+qEmitAll
+if ne get qCodeFail 0 0
+ret 5
+end
+lm = nvalloc 4096 true
+if le lm 0
+ret 6
+end
+put qLut 0 lm
+if not qWriteLut lm
+ret 7
+end
+wm = nvalloc 16777216 true
+if le wm 0
+ret 8
+end
+put qWork 0 wm
+if not qSelfTest
+rc = nvmclose
+ret 10
+end
+if not qAllocModel
+qPrint qOpenErr
+qPrintU ulong get nvstage 0
+qPrint qNl
+rc = nvmclose
+ret 11
+end
+if not qInitWork
+rc = nvmclose
+ret 12
+end
+for slot ulong 3
+if not qRecordAll40 slot slot
+qPrint qSubErr
+qPrintU ulong get gbst 4
+qPrint qNl
+rc = nvmclose
+ret 13
+end
+end
+for slot ulong 3
+if not qBenchConfig slot slot
+rc = nvmclose
+ret 14
+end
+end
+qBenchArboris40L
+rc = nvmclose
+ret 0
+end

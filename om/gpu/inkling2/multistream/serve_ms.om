@@ -1,0 +1,170 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure Seeded-Omega Fixed-Slot Continuous Batcher HTTP Server for Inkling-2-Mini (N = 8 static KV slots).
+note ZERO heap, ZERO libc, ZERO Python, ZERO CUDA.
+note Replaces the 1-slot `503 server_busy` gate with an N=8 static-slot continuous batcher:
+note   - GET  /health              -> 200 JSON with active_slots / max_slots / free_slots
+note   - GET  /v1/models           -> 200 JSON listing inkling-2-mini
+note   - POST /v1/chat/completions -> admits into static slot 0..7, or returns 503 server_busy + Retry-After: 1
+note                                  ONLY when all 8 static KV slots are occupied.
+note Compose after: om/gpu/inkling2/multistream/batcher.om.
+
+global svReqBuf uchar 4096
+global svOutBuf uchar 4096
+
+text sv200Hdr "HTTP/1.1 200 OK\nContent-Type: application/json\nConnection: close\n\n"
+text sv503Full "HTTP/1.1 503 Service Unavailable\nRetry-After: 1\nContent-Type: application/json\nConnection: close\n\n{\"error\":{\"message\":\"all 8 static KV slots are occupied: retry after 1 s\",\"type\":\"server_error\",\"code\":\"server_busy\"}}\n"
+text svModels "{\"object\":\"list\",\"data\":[{\"id\":\"inkling-2-mini\",\"object\":\"model\",\"max_concurrent_streams\":8}]}\n"
+text svHealthPre "{\"status\":\"ok\",\"max_slots\":8,\"active_slots\":"
+text svHealthMid ",\"free_slots\":"
+text svHealthEnd "}\n"
+text svAdmitPre "{\"status\":\"admitted\",\"slot\":"
+text svAdmitEnd ",\"max_slots\":8,\"engine\":\"omega-inkling2-multistream\"}\n"
+text sv404 "HTTP/1.1 404 Not Found\nContent-Type: application/json\nConnection: close\n\n{\"error\":\"not_found\"}\n"
+text svSelfOk "PASS: fixed-slot N=8 HTTP continuous batcher self-test (8 admitted, 9th -> 503 server_busy, retire -> 200 reused)\n"
+text svSelfFail "FAIL: fixed-slot N=8 HTTP continuous batcher self-test step="
+text svNl "\n"
+
+fn svWriteAll fd int buf view uchar * n ulong to bool
+done = ulong 0
+while lt done n bound 4096
+r = write fd buf done sub n done
+if eq r -4
+continue
+end
+if le r 0
+ret false
+end
+done = add done ulong r
+end
+ret true
+end
+
+fn svAppendDst dst edit uchar 4096 pos ulong src view uchar * to ulong
+p = pos
+for i ulong len src bound 512
+if lt p 4096
+put dst p get src i
+p = add p 1
+end
+end
+ret p
+end
+
+fn svAppendU dst edit uchar 4096 pos ulong v ulong to ulong
+tmp = new uchar 32 0
+p = pos
+if eq v 0
+put dst p 48
+ret add p 1
+end
+n = ulong 0
+x = v
+while gt x 0 bound 32
+put tmp n uchar add 48 rem x 10
+x = div x 10
+n = add n 1
+end
+for i ulong n bound 32
+put dst p get tmp sub sub n 1 i
+p = add p 1
+end
+ret p
+end
+
+fn svHandleRequest req view uchar * rlen ulong outBuf edit uchar 4096 outLen edit ulong 1 to ulong
+if lt rlen 12
+p = svAppendDst outBuf 0 sv404
+put outLen 0 p
+ret 404
+end
+c0 = get req 0
+c4 = get req 4
+c5 = get req 5
+note GET /health
+if eq c0 71
+if eq c4 47
+if eq c5 104
+act = get msActiveCnt 0
+remSlots = sub MS_MAX_STREAMS act
+p = svAppendDst outBuf 0 sv200Hdr
+p = svAppendDst outBuf p svHealthPre
+p = svAppendU outBuf p act
+p = svAppendDst outBuf p svHealthMid
+p = svAppendU outBuf p remSlots
+p = svAppendDst outBuf p svHealthEnd
+put outLen 0 p
+ret 200
+end
+note GET /v1/models
+if eq c5 118
+p = svAppendDst outBuf 0 sv200Hdr
+p = svAppendDst outBuf p svModels
+put outLen 0 p
+ret 200
+end
+end
+end
+note POST /v1/chat/completions
+if eq c0 80
+if eq c5 47
+slot = msAdmit 0 64 1
+if lt slot 0
+p = svAppendDst outBuf 0 sv503Full
+put outLen 0 p
+ret 503
+end
+p = svAppendDst outBuf 0 sv200Hdr
+p = svAppendDst outBuf p svAdmitPre
+p = svAppendU outBuf p ulong slot
+p = svAppendDst outBuf p svAdmitEnd
+put outLen 0 p
+ret 200
+end
+end
+p = svAppendDst outBuf 0 sv404
+put outLen 0 p
+ret 404
+end
+
+text svTReqPost "POST /v1/chat/completions HTTP/1.1\nHost: localhost\n\n{}"
+text svTReqHealth "GET /health HTTP/1.1\nHost: localhost\n\n"
+
+fn svRunSelfTest to int
+msInit
+outB = new uchar 4096 0
+outL = new ulong 1 0
+for s ulong 8
+code = svHandleRequest svTReqPost len svTReqPost outB outL
+if ne code 200
+w = write 1 svSelfFail 0 len svSelfFail
+ret 1
+end
+end
+code9 = svHandleRequest svTReqPost len svTReqPost outB outL
+if ne code9 503
+w = write 1 svSelfFail 0 len svSelfFail
+ret 2
+end
+ch = svHandleRequest svTReqHealth len svTReqHealth outB outL
+if ne ch 200
+w = write 1 svSelfFail 0 len svSelfFail
+ret 3
+end
+msRetire 5
+code10 = svHandleRequest svTReqPost len svTReqPost outB outL
+if ne code10 200
+w = write 1 svSelfFail 0 len svSelfFail
+ret 4
+end
+code11 = svHandleRequest svTReqPost len svTReqPost outB outL
+if ne code11 503
+w = write 1 svSelfFail 0 len svSelfFail
+ret 5
+end
+w = write 1 svSelfOk 0 len svSelfOk
+ret 0
+end
+
+fn main to int
+ret svRunSelfTest
+end
