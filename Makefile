@@ -1768,6 +1768,13 @@ bench-mixed-algebra: $(OMA_RZ_BENCH) $(OMA_RZ_SELECT)
 # phase-twin-receipt: from a clean committed tree only, copies the full
 #   receipt to evidence/MIXED_ALGEBRA/phase_twin_receipt.<sha256>.json.
 .PHONY: test-phase-twin phase-twin-receipt
+test-phase-twin: full run -> $(OUT_DIR) receipt (never into evidence/);
+#   quick run plain and under ASan+UBSan, receipts must be byte-identical;
+#   if a committed receipt exists, the full run must reproduce it (all fields
+#   except git_commit / tree_dirty / run_id / toolchain).
+# phase-twin-receipt: from a clean committed tree only, copies the full
+#   receipt to evidence/MIXED_ALGEBRA/phase_twin_receipt.<sha256>.json.
+.PHONY: test-phase-twin phase-twin-receipt
 PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c src/omega_om_units.c
 PT_HDRS = src/algebra/phase_twin.h src/algebra/oma_z3.h src/algebra/oma_trit.h
 PT_OUT = $(OUT_DIR)/tests-algebra
