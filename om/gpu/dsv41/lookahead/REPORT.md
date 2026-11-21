@@ -44,3 +44,7 @@ python3 "$dir/calibrate.py" "$pack" "$verified_pack_sha256" > "$out/nvme.csv"
 ```
 
 The host controls exercise LRU eviction, causal correlation learning, hint ordering and serialization of read service. They do not qualify a conversational prediction, a physical DMA path, or a payload audit.
+
+## Conversation stimuli
+
+`turns.csv` supplies ten shared coding prompts, three rotating one-turn detours and ten technical-writing prompts. For A, retain the generated conversation and verify that its observed token count meets the 10k to 20k target. For B, reuse A's coding prompt order. Insert one detour at the nearest coding-turn boundary to each 1,500-token milestone from A where another coding turn follows. Record the actual positions. Pair the first generated token of each returning coding turn with the same coding ordinal in A. For C, follow the ten coding turns with the ten writing turns. Keep domain and coding ordinal in evaluation metadata outside the predictor input. Record actual model responses, token IDs and native gate records independently for each conversation.
