@@ -1,0 +1,280 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Arboris expert-prefetch adapter and online sum-over-paths co-activation
+note predictor for Inkling-2-Mini (24 layers, 128 experts, top-8, looped passes).
+note
+note Static ABI: scores are the settled logical FP32 score plane in [0, 1];
+note a node maps to one expert in 0..127 or 0xffffffff (ignored). Duplicate
+note mappings aggregate by maximum score. Zero scores never issue I/O. Lower
+note expert ID breaks exact ties. Caller controls I/O budget via the number of
+note 2-word OP3 records in outbuf (up to 128 records = 256 uints). -1 rejects
+note invalid input.
+note
+note Online predictor: 24 transitions (0..22 for L->L+1, including 17 for
+note L17->L18 exiting the looped core on pass 2; 23 for looped core pass wrap
+note L17->L6 on passes 0/1, matching core_start=6, core_end=18, num_passes=3)
+note x 128 source experts x 16 Space-Saving slots packed as
+note (count << 16) | target_eid.
+
+global ikArbEdges uint 49152
+global ikArbPrev uint 8
+global ikArbPrevLayer ulong 1
+
+fn ik_ar_select_experts peak edit uint 128 outbuf edit uint * to long
+  for slot ulong div len outbuf 2 bound 128
+    best = ulong 0
+    for id ulong 128
+      if gt get peak id get peak best
+        best = id
+      end
+    end
+    if eq get peak best 0
+      ret long slot
+    end
+    put outbuf mul slot 2 3
+    put outbuf add 1 mul slot 2 uint best
+    put peak best 0
+  end
+  ret long div len outbuf 2
+end
+
+fn ik_ar_vote_expert peak edit uint 128 id uint score uint to bool
+  if gt score 0x3f800000
+    ret false
+  end
+  if ne id 0xffffffff
+    if ge id 128
+      ret false
+    end
+    if gt score get peak ulong id
+      put peak ulong id score
+    end
+  end
+  ret true
+end
+
+fn ik_arboris_expert_hints scores view uint * experts view uint * outbuf edit uint * to long
+  if or ne len scores len experts ne and len outbuf 1 0
+    ret long -1
+  end
+  if or gt len scores 0xffffffff gt len outbuf 256
+    ret long -1
+  end
+  peak = new uint 128 0
+  for i ulong len scores bound 0xffffffff
+    id = get experts i
+    score = get scores i
+    if not ik_ar_vote_expert peak id score
+      ret long -1
+    end
+  end
+  ret ik_ar_select_experts peak outbuf
+end
+
+note Send advisory OP3 records to the read-ring consumer. The demand router path
+note retains authority over the actual experts executed for inference.
+fn ik_arboris_send_hints fd int records view uint * count ulong to bool
+  if or gt count 128 gt count div len records 2
+    ret false
+  end
+  b = new uchar 8 0
+  for i ulong count bound 128
+    pos = mul i 2
+    if or ne get records pos 3 ge get records add pos 1 128
+      ret false
+    end
+  end
+  for i ulong count bound 128
+    expert = get records add 1 mul i 2
+    put b 0 3
+    put b 4 uchar and expert 255
+    put b 5 uchar shr expert 8
+    sent = ulong 0
+    while lt sent 8 bound 8
+      n = write fd b sent sub 8 sent
+      if le n 0
+        ret false
+      end
+      sent = add sent ulong n
+    end
+  end
+  ret true
+end
+
+fn ikArbResetToken to void
+  put ikArbPrevLayer 0 24
+  for k ulong 8
+    put ikArbPrev k 0xffffffff
+  end
+end
+
+fn ikArbResetAll to void
+  for i ulong 49152
+    put ikArbEdges i 0
+  end
+  ikArbResetToken
+end
+
+fn ikArbPack cnt ulong tgt ulong to uint
+  ret or shl uint cnt 16 uint tgt
+end
+
+fn ikArbHalveRow rowBase ulong to void
+  for h ulong 16
+    e2 = get ikArbEdges add rowBase h
+    c2 = ulong shr e2 16
+    if gt c2 1
+      put ikArbEdges add rowBase h ikArbPack shr c2 1 ulong and e2 65535
+    else
+      put ikArbEdges add rowBase h 0
+    end
+  end
+end
+
+fn ikArbBumpEdge trans ulong src ulong tgt ulong to void
+  if or ge trans 24 or ge src 128 ge tgt 128
+    ret
+  end
+  rowBase = mul add mul trans 128 src 16
+  emptySlot = ulong 16
+  minSlot = ulong 0
+  minCnt = ulong 65536
+  for j ulong 16
+    ent = get ikArbEdges add rowBase j
+    c = ulong shr ent 16
+    if eq c 0
+      if eq emptySlot 16
+        emptySlot = j
+      end
+    else
+      if eq ulong and ent 65535 tgt
+        nc = add c 1
+        if ge nc 60000
+          ikArbHalveRow rowBase
+          nc = ulong 30000
+        end
+        put ikArbEdges add rowBase j ikArbPack nc tgt
+        ret
+      end
+      if lt c minCnt
+        minCnt = c
+        minSlot = j
+      end
+    end
+  end
+  if lt emptySlot 16
+    put ikArbEdges add rowBase emptySlot ikArbPack 1 tgt
+    ret
+  end
+  if le minCnt 1
+    put ikArbEdges add rowBase minSlot ikArbPack 1 tgt
+  else
+    oldTgt = ulong and get ikArbEdges add rowBase minSlot 65535
+    put ikArbEdges add rowBase minSlot ikArbPack sub minCnt 1 oldTgt
+  end
+end
+
+note Update online co-activation graph on observing layer's top-8 experts.
+note Only learns genuine adjacent transitions: prevLayer == layer - 1 for layer
+note in 1..23 (transitions 0..22, including 17 for L17 -> L18 on pass 2), or
+note prevLayer == 17 when layer == 6 (transition 23 for looped core pass wrap
+note L17 -> L6 on passes 0 and 1, matching core_start=6, core_end=18, num_passes=3).
+note Non-adjacent or repeated-layer calls update prev without corrupting edges.
+fn ikArbUpdate layer ulong curIds view uint 8 to void
+  if ge layer 24
+    ret
+  end
+  prevL = get ikArbPrevLayer 0
+  trans = ulong 24
+  if and gt layer 0 eq add prevL 1 layer
+    trans = prevL
+  end
+  if and eq layer 6 eq prevL 17
+    trans = ulong 23
+  end
+  if lt trans 24
+    for s ulong 8
+      src = ulong get ikArbPrev s
+      if lt src 128
+        for d ulong 8
+          tgt = ulong get curIds d
+          if lt tgt 128
+            ikArbBumpEdge trans src tgt
+          end
+        end
+      end
+    end
+  end
+  for k ulong 8
+    put ikArbPrev k get curIds k
+  end
+  put ikArbPrevLayer 0 layer
+end
+
+note Sum-over-paths scoring for transition `trans` (0..22 for L -> L+1, including
+note 17 for L17 -> L18 on final loop pass 2; 23 for looped core wrap L17 -> L6 on
+note loop passes 0 and 1).
+fn ikArbScoreNext trans ulong curIds view uint 8 scores edit ulong 128 to void
+  for i ulong 128
+    put scores i 0
+  end
+  if ge trans 24
+    ret
+  end
+  for s ulong 8
+    src = ulong get curIds s
+    if lt src 128
+      rowBase = mul add mul trans 128 src 16
+      for j ulong 16
+        ent = get ikArbEdges add rowBase j
+        c = ulong shr ent 16
+        if gt c 0
+          tgt = ulong and ent 65535
+          if lt tgt 128
+            put scores tgt add get scores tgt c
+          end
+        end
+      end
+    end
+  end
+end
+
+fn ikArbPickOne nextLayer ulong scores view ulong 128 resident view long 3072 to ulong
+  base = mul nextLayer 128
+  best = ulong 128
+  bestScore = ulong 0
+  for eid ulong 128
+    sc = get scores eid
+    if gt sc bestScore
+      idx = add base eid
+      if lt get resident idx 0
+        bestScore = sc
+        best = eid
+      end
+    end
+  end
+  ret best
+end
+
+note Pick up to len(outbuf)/2 highest-scoring non-resident experts for nextLayer (0..23).
+note resident[nextLayer * 128 + eid] >= 0 marks an already-resident expert to skip.
+note Emits 2-word OP3 records [3, eid] into outbuf and zeros consumed scores.
+fn ikArbPickTopK nextLayer ulong scores edit ulong 128 resident view long 3072 outbuf edit uint * to long
+  if or ge nextLayer 24 ne and len outbuf 1 0
+    ret long -1
+  end
+  if gt len outbuf 256
+    ret long -1
+  end
+  lim = div len outbuf 2
+  for slot ulong lim bound 128
+    best = ikArbPickOne nextLayer scores resident
+    if eq best 128
+      ret long slot
+    end
+    pos = mul slot 2
+    put outbuf pos 3
+    put outbuf add pos 1 uint best
+    put scores best 0
+  end
+  ret long lim
+end

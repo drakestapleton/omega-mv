@@ -1,0 +1,289 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure OM-2 CPU host gate for Inkling-2-Mini Arboris prefetch adapter and
+note online sum-over-paths looped cross-layer co-activation prefetcher.
+note Compose after om/gpu/inkling2/arboris/prefetch.om.
+
+fn ckStaticHints to int
+  scores = new uint 6 0
+  experts = new uint 6 0
+  recs = new uint 6 0
+  badRecs = new uint 3 0
+  note Node 0: exp 5 score 0.5 (0x3f000000)
+  note Node 1: exp 5 score 0.75 (0x3f400000) -> max wins (0.75)
+  note Node 2: exp 2 score 0.75 (0x3f400000) -> tie with exp 5, lower ID (2) wins first
+  note Node 3: 0xffffffff score 1.0 (0x3f800000) -> ignored
+  note Node 4: exp 9 score 0.0 -> zero score never issues I/O
+  note Node 5: exp 7 score 0.25 (0x3e800000) -> 3rd
+  put scores 0 0x3f000000
+  put experts 0 5
+  put scores 1 0x3f400000
+  put experts 1 5
+  put scores 2 0x3f400000
+  put experts 2 2
+  put scores 3 0x3f800000
+  put experts 3 0xffffffff
+  put scores 4 0
+  put experts 4 9
+  put scores 5 0x3e800000
+  put experts 5 7
+  cnt = ik_arboris_expert_hints scores experts recs
+  if ne cnt 3
+    ret 11
+  end
+  if or ne get recs 0 3 ne get recs 1 2
+    ret 12
+  end
+  if or ne get recs 2 3 ne get recs 3 5
+    ret 13
+  end
+  if or ne get recs 4 3 ne get recs 5 7
+    ret 14
+  end
+  note Budget cap: 2-word slice -> only top 1 (exp 2)
+  cnt2 = ik_arboris_expert_hints scores experts part recs 0 2
+  if or ne cnt2 1 ne get recs 1 2
+    ret 15
+  end
+  note Reject odd outbuf length
+  if ne ik_arboris_expert_hints scores experts badRecs -1
+    ret 16
+  end
+  note Reject score > 1.0 (0x3f800001)
+  put scores 0 0x3f800001
+  if ne ik_arboris_expert_hints scores experts recs -1
+    ret 17
+  end
+  note Reject out-of-range expert ID 128
+  put scores 0 0x3f000000
+  put experts 0 128
+  if ne ik_arboris_expert_hints scores experts recs -1
+    ret 18
+  end
+  note Reject mismatched input lengths
+  put experts 0 5
+  if ne ik_arboris_expert_hints part scores 0 5 experts recs -1
+    ret 19
+  end
+  note Reject negative zero (0x80000000), NaN (0x7fc00000), and sentinel with score > 1.0
+  put scores 0 0x80000000
+  if ne ik_arboris_expert_hints scores experts recs -1
+    ret 41
+  end
+  put scores 0 0x7fc00000
+  if ne ik_arboris_expert_hints scores experts recs -1
+    ret 42
+  end
+  put scores 0 0x3f800001
+  put experts 0 0xffffffff
+  if ne ik_arboris_expert_hints scores experts recs -1
+    ret 43
+  end
+  note Reject invalid records in ik_arboris_send_hints before any write
+  put recs 0 99
+  put recs 1 2
+  if ik_arboris_send_hints 1 recs 1
+    ret 44
+  end
+  put recs 0 3
+  put recs 1 128
+  if ik_arboris_send_hints 1 recs 1
+    ret 45
+  end
+  if ik_arboris_send_hints 1 recs 4
+    ret 46
+  end
+  ret 0
+end
+
+fn ckOnlineAndLoop to int
+  ikArbResetAll
+  idsA = new uint 8 0
+  idsB = new uint 8 0
+  idsC = new uint 8 0
+  scores = new ulong 128 0
+  resident = new long 3072 -1
+  recs = new uint 16 0
+  note Train L0 -> L1 across two tokens (8 active experts each):
+  note   Token 1: L0={10..17} -> L1={1..8}
+  note   Token 2: L0={10,11,20..25} -> L1={1,2,30..35}
+  for k ulong 8
+    put idsA k uint add 10 k
+    put idsB k uint add 1 k
+  end
+  ikArbResetToken
+  ikArbUpdate 0 idsA
+  ikArbUpdate 1 idsB
+
+  put idsC 0 10
+  put idsC 1 11
+  for k ulong 6
+    put idsC add k 2 uint add 20 k
+  end
+  put idsB 0 1
+  put idsB 1 2
+  for k ulong 6
+    put idsB add k 2 uint add 30 k
+  end
+  ikArbResetToken
+  ikArbUpdate 0 idsC
+  ikArbUpdate 1 idsB
+
+  note Query L0={10..17}:
+  note   tgt 1, 2: from 10(2) + 11(2) + 12..17(1 each = 6) = 10
+  note   tgt 3..8: from 10..17(1 each) = 8
+  note   tgt 30..35: from 10(1) + 11(1) = 2
+  ikArbScoreNext 0 idsA scores
+  if or ne get scores 1 10 ne get scores 2 10
+    ret 21
+  end
+  if or ne get scores 3 8 ne get scores 8 8
+    ret 22
+  end
+  if ne get scores 30 2
+    ret 23
+  end
+
+  note Mark L1 expert 1 as already resident -> PickTopK must skip 1 and pick 2 first!
+  put resident add ulong 128 1 0
+  got = ikArbPickTopK 1 scores resident part recs 0 4
+  if ne got 2
+    ret 24
+  end
+  if or ne get recs 0 3 ne get recs 1 2
+    ret 25
+  end
+  if or ne get recs 2 3 ne get recs 3 3
+    ret 26
+  end
+
+  note Verify looped core pass wrap L17 -> L6 (core_start=6, core_end=18, num_passes=3):
+  note First, confirm ikArbResetToken blocks cross-token L17 -> L6 learning.
+  for k ulong 8
+    put idsA k uint add 40 k
+    put idsB k uint add 50 k
+    put idsC k uint add 60 k
+  end
+  ikArbResetToken
+  ikArbUpdate 17 idsA
+  ikArbResetToken
+  ikArbUpdate 6 idsB
+  ikArbScoreNext 23 idsA scores
+  if ne get scores 50 0
+    ret 27
+  end
+  note Confirm L23 -> L0 (coda to stem) without reset does NOT learn transition 23.
+  ikArbResetToken
+  ikArbUpdate 23 idsA
+  ikArbUpdate 0 idsB
+  ikArbScoreNext 23 idsA scores
+  if ne get scores 50 0
+    ret 35
+  end
+  note Intra-token looped core pass wrap (passes 0/1): L17 -> L6 WITHOUT reset learns transition 23!
+  ikArbResetToken
+  ikArbUpdate 17 idsA
+  ikArbUpdate 6 idsB
+  ikArbScoreNext 23 idsA scores
+  if ne get scores 50 8
+    ret 28
+  end
+  note Transition 17 (L17 -> L18 on pass 2) must remain separate from transition 23.
+  ikArbScoreNext 17 idsA scores
+  if ne get scores 50 0
+    ret 36
+  end
+  note Now learn pass 2 exit L17 -> L18 into transition 17 with distinct targets 60..67.
+  ikArbResetToken
+  ikArbUpdate 17 idsA
+  ikArbUpdate 18 idsC
+  ikArbScoreNext 17 idsA scores
+  if or ne get scores 60 8 ne get scores 50 0
+    ret 37
+  end
+  got = ikArbPickTopK 18 scores resident part recs 0 2
+  if or ne got 1 ne get recs 1 60
+    ret 38
+  end
+  note Transition 23 must still predict L6 targets 50..57 without pollution from L18.
+  ikArbScoreNext 23 idsA scores
+  if or ne get scores 50 8 ne get scores 60 0
+    ret 39
+  end
+  got = ikArbPickTopK 6 scores resident part recs 0 2
+  if or ne got 1 ne get recs 1 50
+    ret 40
+  end
+  note Verify non-adjacent layer skip (L0 -> L5) does NOT corrupt transition 4!
+  ikArbResetToken
+  ikArbUpdate 0 idsA
+  ikArbUpdate 5 idsB
+  ikArbScoreNext 4 idsA scores
+  if ne get scores 50 0
+    ret 29
+  end
+  note Verify repeated L6 -> L6 and L0 -> L0 without reset do NOT corrupt transition 23!
+  ikArbResetToken
+  ikArbUpdate 6 idsA
+  ikArbUpdate 6 idsB
+  ikArbUpdate 0 idsA
+  ikArbUpdate 0 idsB
+  ikArbScoreNext 23 idsA scores
+  if ne get scores 50 8
+    ret 30
+  end
+  note Verify ikArbPickTopK rejects invalid nextLayer and odd outbuf
+  badRecs = new uint 3 0
+  if ne ikArbPickTopK 24 scores resident recs -1
+    ret 33
+  end
+  if ne ikArbPickTopK 1 scores resident badRecs -1
+    ret 34
+  end
+  ret 0
+end
+
+fn ckDomainShiftAndHalve to int
+  ikArbResetAll
+  ids = new uint 8 0
+  scores = new ulong 128 0
+  note Fill all 16 slots of (trans 5, src 3) with targets 10..25 (count=1 each),
+  note then observe new target 99 twice -> must replace a stale entry and score > 0.
+  for i ulong 16
+    ikArbBumpEdge 5 3 add 10 i
+  end
+  ikArbBumpEdge 5 3 99
+  ikArbBumpEdge 5 3 99
+  put ids 0 3
+  for k ulong 7
+    put ids add k 1 127
+  end
+  ikArbScoreNext 5 ids scores
+  if eq get scores 99 0
+    ret 31
+  end
+  note Test ikArbHalveRow directly on a saturated slot
+  rowBase = mul add mul ulong 6 128 4 16
+  put ikArbEdges rowBase ikArbPack 59999 77
+  ikArbBumpEdge 6 4 77
+  ent = get ikArbEdges rowBase
+  if or ne ulong shr ent 16 30000 ne ulong and ent 65535 77
+    ret 32
+  end
+  ret 0
+end
+
+fn main to int
+  rc = ckStaticHints
+  if ne rc 0
+    ret rc
+  end
+  rc = ckOnlineAndLoop
+  if ne rc 0
+    ret rc
+  end
+  rc = ckDomainShiftAndHalve
+  if ne rc 0
+    ret rc
+  end
+  ret 0
+end
