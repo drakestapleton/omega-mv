@@ -124,12 +124,8 @@ static void host_only(void) {
       printf("codegen XBATCH 4 k 2048 warps 16 depth 8: %u instructions, %u registers (declared %u), shared %u bytes\n", ni, gg, decl, omega_bf16_gemv_shared_bytes(&s)); }
     { OmegaBf16GemvSpec s = { 2048, 1, 16, 8, 0, 249856, 5, 0 }; CHECK(omega_bf16_gemv_prog_stats(&s, NULL, NULL) != 0, "xbatch 5 refused"); }
     { OmegaBf16GemvSpec s = { 2048, 1, 16, 8, 0, 0, 2, 0 }; CHECK(omega_bf16_gemv_prog_stats(&s, NULL, NULL) != 0, "xbatch without ystride refused"); }
-    { OmegaBf16GemvSpec s = { 5120, 1, 16, 5, 0, 249856, 4, 0 }; uint32_t ni = 0, gg = 0; int rc = omega_bf16_gemv_prog_stats(&s, &ni, &gg);
-      uint32_t decl = ((gg + 2 + 7) / 8) * 8;
-      CHECK(rc == 0 && omega_bf16_gemv_shared_bytes(&s) == 81920u && 32u * 16u * decl <= 65536u, "codegen XBATCH 4 k 5120 warps 16 depth 5: rc %d insns %u gprs %u shared %u", rc, ni, gg, omega_bf16_gemv_shared_bytes(&s));
-      printf("codegen XBATCH 4 k 5120 warps 16 depth 5: %u instructions, %u registers (declared %u), shared %u bytes\n", ni, gg, decl, omega_bf16_gemv_shared_bytes(&s)); }
-    { OmegaBf16GemvSpec s = { 6400, 1, 16, 5, 0, 249856, 4, 0 }; CHECK(omega_bf16_gemv_prog_stats(&s, NULL, NULL) != 0, "xbatch 4 x k 6400 (> 96 KiB shared) refused"); }
-    { OmegaBf16GemvSpec s = { 2048, 1, 2, 8, 0, 249856, 4, 0 }; CHECK(omega_bf16_gemv_prog_stats(&s, NULL, NULL) != 0, "xbatch 4 x k 2048 at 2 warps (> 64 staging rounds) refused"); }
+    { OmegaBf16GemvSpec s = { 4096, 1, 16, 16, 0, 249856, 4, 0 }; CHECK(omega_bf16_gemv_prog_stats(&s, NULL, NULL) != 0, "xbatch 4 x k 4096 (64 KiB shared) refused"); }
+    { OmegaBf16GemvSpec s = { 2048, 1, 8, 8, 0, 249856, 4, 0 }; CHECK(omega_bf16_gemv_prog_stats(&s, NULL, NULL) != 0, "xbatch 4 x k 2048 at 8 warps (more than 16 staging rounds) refused"); }
     { OmegaBf16GemvSpec s = { 2048, 1, 16, 8, 4, 249856, 1, 0 }; CHECK(omega_bf16_gemv_prog_stats(&s, NULL, NULL) != 0, "mutant 4 at xbatch 1 refused"); }
     CHECK(OMEGA_BF16_ARGS_WORDS <= OMEGA_GPU_SESSION_MAX_ARGS, "argument words fit the constant bank window");
     uint16_t bad[256]; memset(bad, 0, sizeof bad); bad[7] = 0x7f80;

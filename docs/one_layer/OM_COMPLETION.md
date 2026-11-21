@@ -31,10 +31,7 @@ with 510 top-level `fn` (source sha256 `7995e0e3...7189`); the committed `seed/o
 sha256 `6d1b1cf5a44803389a831b67f750ea4cd1c9f53edfde9d6d9241d7352887f1f8`, as `seed/out/omc.sha256` records.
 Rechecked 2026-11-19 at main `100a9a914`: `seed/omc/omc.om` is 25,250 lines (587,337 bytes) with 653 top-level `fn`
 (source sha256 `d8a9cdc0...c833`); the committed `seed/out/omc` is 937,288 bytes, sha256
-`b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2`.
-Rechecked 2026-11-19 at main `48e84f0d3` (Linux `drm/xe` ioctl allowlist in `kfdctl`): `seed/omc/omc.om` is 25,316 lines (588,414 bytes) with 654 top-level `fn`
-(source sha256 `86bc3d1f...5105`); the committed `seed/out/omc` is 939,036 bytes, sha256
-`210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c`, matching `seed/out/omc.sha256`.
+`b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2`, matching `seed/out/omc.sha256`.
 The error registry still lists codes 1..25 and 27..30 with 26 unused.
 
 Benchmark parity: 103 authored `.om` sources and 53 build-plan targets compile to identical bytes

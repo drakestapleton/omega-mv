@@ -265,7 +265,7 @@ uint32_t omega_gpu_fp8_depth_for(const OmegaFp8GemvSpec *spec, uint32_t n, uint3
      * count that divides KS within the 128-byte lane budget; x' still has to fit the launch descriptor's shared memory */
     const int partial = ks * spec->rows * spec->lane_bytes > 128u && spec->k > 4096u && groups == 1u && omega_gpu_fp8_bigk();
     if (partial) { do ks--; while (ks > 1u && (spec->k / (32u * spec->lane_bytes) % ks || ks * spec->rows * spec->lane_bytes > 128u)); if (ks < 2u) return 0; }
-    if (ks * spec->rows * spec->lane_bytes > 128u || spec->k % (32u * spec->warps) || spec->k > 2048u * spec->warps) return 0;
+    if (ks * spec->rows * spec->lane_bytes > 128u || spec->k % (32u * spec->warps) || spec->k > 512u * spec->warps) return 0;
     /* Measured (evidence OWN30B-FP8-GEMV-fc05176a-*, main vs depth0 in one run, before variant A): the deep kernel won on
      * single projections up to a few MB (gate+up 1536x2048: 30 us vs 51; k_proj: 30 vs 44) and lost on the grouped
      * 8-expert launches (its per-CTA x staging re-reads 8 KB per CTA: 188 us vs 150) and on o_proj (79 vs 64), so the rule

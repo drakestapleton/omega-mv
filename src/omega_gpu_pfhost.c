@@ -73,33 +73,3 @@ int omega_gpu_pf_moe_combine(uint32_t h, uint32_t top_k, uint32_t rows, uint64_t
     omega_gpu_session_unlock();
     return rc;
 }
-
-int omega_gpu_pf_router_logits_record(struct OmegaGpuCmdList *cl, uint32_t k, uint32_t e, uint32_t rows,
-                                      uint64_t x_va, uint64_t wq_va, uint64_t logits_va) {
-    OmegaRlSpec s; memset(&s, 0, sizeof s); s.k = k; s.e = e; s.t = omega_gpu_pf_router_rows(); s.mutant = rl_mutant;
-    if (!cl || !omega_rl_spec_ok(&s) || !x_va || !wq_va || !logits_va || (x_va & 15u) || (wq_va & 15u) || (logits_va & 3u)) return OMEGA_GPU_PF_BAD_ARGS;
-    if (rows == 0) return OMEGA_GPU_PF_OK;
-    OmegaPfKey key; memset(&key, 0, sizeof key); key.kind = KIND_RL; memcpy(key.words, &s, sizeof s);
-    const uint32_t args[OMEGA_RL_ARGS_WORDS] = { (uint32_t)x_va, (uint32_t)(x_va >> 32), (uint32_t)wq_va, (uint32_t)(wq_va >> 32), (uint32_t)logits_va, (uint32_t)(logits_va >> 32) };
-    int rc = omega_gpu_pf_open_locked();
-    OmegaPfKernel kern;
-    if (rc == OMEGA_GPU_PF_OK) rc = omega_gpu_pf_kernel_locked(&key, gen_rl, &kern);
-    if (rc == OMEGA_GPU_PF_OK) rc = omega_gpu_pf_record_locked(cl, &kern, e, (rows + s.t - 1u) / s.t, 1, omega_rl_shared_bytes(&s), args, OMEGA_RL_ARGS_WORDS);
-    return rc;
-}
-
-int omega_gpu_pf_moe_combine_record(struct OmegaGpuCmdList *cl, uint32_t h, uint32_t top_k, uint32_t rows,
-                                    uint64_t down_va, uint64_t inv_va, uint64_t wt_va, uint64_t out_va) {
-    OmegaMcSpec s; memset(&s, 0, sizeof s); s.h = h; s.top_k = top_k; s.mutant = mc_mutant;
-    if (!cl || !omega_mc_spec_ok(&s) || !down_va || !inv_va || !wt_va || !out_va) return OMEGA_GPU_PF_BAD_ARGS;
-    if ((down_va | inv_va | wt_va | out_va) & 15u) return OMEGA_GPU_PF_BAD_ARGS;
-    if (rows == 0) return OMEGA_GPU_PF_OK;
-    OmegaPfKey key; memset(&key, 0, sizeof key); key.kind = KIND_MC; memcpy(key.words, &s, sizeof s);
-    const uint32_t args[OMEGA_MC_ARGS_WORDS] = { (uint32_t)down_va, (uint32_t)(down_va >> 32), (uint32_t)inv_va, (uint32_t)(inv_va >> 32),
-                                                 (uint32_t)wt_va, (uint32_t)(wt_va >> 32), (uint32_t)out_va, (uint32_t)(out_va >> 32) };
-    int rc = omega_gpu_pf_open_locked();
-    OmegaPfKernel kern;
-    if (rc == OMEGA_GPU_PF_OK) rc = omega_gpu_pf_kernel_locked(&key, gen_mc, &kern);
-    if (rc == OMEGA_GPU_PF_OK) rc = omega_gpu_pf_record_locked(cl, &kern, h / 4u, rows, 1, 0, args, OMEGA_MC_ARGS_WORDS);
-    return rc;
-}

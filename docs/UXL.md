@@ -1,19 +1,25 @@
 # UXL checks
 
+One command, from a fresh clone. It prints each stage as it runs and writes `uxl-run-<host>-<UTC>.log`.
+
 ```sh
 git clone https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./uxl-run.sh
 ```
 
-On Windows: `git clone https://interplane.io/drakestapleton/omega-mv.git; cd omega-mv; .\uxl-run.ps1`
+PowerShell. If the default execution policy refuses the script, use the Bypass form.
 
-`uxl-run.ps1` is a thin entry. When a WSL distro is installed it runs `./uxl-run.sh` there, including `--install-deps` if you passed it. When WSL is absent it runs the Python checks on Windows, and the omc stages are NOT_RUN with the hint `wsl --install -d Ubuntu`.
+```powershell
+git clone https://interplane.io/drakestapleton/omega-mv.git; cd omega-mv; .\uxl-run.ps1
+```
 
-The first block of the log is the detected machine: OS (linux, macos, windows), WSL distro or `no`, arch (`x86_64` or `arm64`), distro, and the backends it found (`omc` as `qemu`, `native`, or `not-run`; `omega-spirv` via `gpu/spirv/val.om` and `gpu/spirv/run.om`; optional external `spirv-val`; Intel OpenCL; Level Zero). x86 Linux uses qemu-aarch64 binfmt when that exec works. arm64 Linux runs `omc` as a native binary. macOS cannot exec `omc`; those stages are NOT_RUN and the hint says to use a Linux VM. If qemu is missing on x86 Linux, the log prints one install command for that distro (`apt-get` on Debian/Ubuntu, `dnf` on Fedora, `pacman` on Arch) and does not run it. `./uxl-run.sh --install-deps` is the only way the script uses sudo. Portable SPIR-V validation and execution use pure seeded Omega (`gpu/spirv/val.om` and `gpu/spirv/run.om`) with no `spirv-tools`, Vulkan, or lavapipe dependency. On a Debian/Ubuntu machine with no `python3`, the shell wrapper installs `python3` first, and only because the flag was set.
+```powershell
+git clone https://interplane.io/drakestapleton/omega-mv.git; cd omega-mv; powershell -ExecutionPolicy Bypass -File .\uxl-run.ps1
+```
 
 Same work, without the wrapper: `python3 tools/uxl/run_all.py` (Windows: `py tools\uxl\run_all.py`). Python 3.8 or newer, standard library only.
 
-The run prints the OS, architecture, Python, `git core.autocrlf`, whether `qemu-aarch64` binfmt can run `seed/out/omc`, and whether an Intel GPU and OpenCL runtime are present. It does not require the GPU. Level 1 checks the published 65-file record under `tools/uxl/level1/` (path comparison uses `as_posix()`). Level 2 rebuilds the launcher and the 18 gfx942 kernels with `seed/out/omc` and compares them to `gpu/amd/card.tsv`. Those receipt hashes are the ones in the brief: `launch-x86` and `vadd` match Zenodo record 10.5281/zenodo.24237047. On x86 the arm64-only `trace.c` instruments are skipped, not passed. `omc` is the pinned AArch64 binary `210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c` (read from `seed/out/omc.sha256`). It runs natively on arm64 Linux and through qemu-aarch64 binfmt on x86 Linux. Without that, Level 2 and the SPIR-V stage are NOT_RUN and the log prints the install command. NOT_RUN is not a failure.
+The run prints the OS, architecture, Python, `git core.autocrlf`, whether `qemu-aarch64` binfmt can run `seed/out/omc`, and whether an Intel GPU and OpenCL runtime are present. It does not require the GPU. Level 1 checks the published 65-file record under `tools/uxl/level1/` (path comparison uses `as_posix()`). Level 2 rebuilds the launcher and the 18 gfx942 kernels with `seed/out/omc` and compares them to `gpu/amd/card.tsv`. Those receipt hashes are the ones in the brief: `launch-x86` and `vadd` match Zenodo record 10.5281/zenodo.24237047. On x86 the arm64-only `trace.c` instruments are skipped, not passed. `omc` is the pinned AArch64 binary `b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2` (read from `seed/out/omc.sha256`). It runs natively on arm64 Linux and through qemu-aarch64 binfmt on x86 Linux. Without that, Level 2 is skipped and the log says how to enable it.
 
-The SPIR-V stage runs `OMC=seed/out/omc sh gpu/spirv/check.sh` (pure-Omega `val.om`, `run.om`, mutants, host `conform.om`) and streams each line. It is NOT_RUN only when `omc` cannot run. The RMSNorm stage reads `gpu/spirv/intel-rmsnorm.tsv` and executes both OpenCL SPIR-V (`cl`) and Vulkan SPIR-V (`vk`) directly in pure seeded Omega (`gpu/spirv/omega-run.sh` -> `emit.om`, `val.om`, `run.om`, `conform.om`). The reference sha256 is `144c89820d5d005af741dfcace8f9882bae481d72f1745aef36b5014cbaadb46`. Stage 7 reads `gpu/spirv/intel-opencl.tsv` and executes `vadd`, `fsum16`, and `gemm16` in both `cl` and `vk` SPIR-V the same way (zero OpenCL ICD, zero Level Zero, zero Vulkan/lavapipe, zero Python). The gemm16 reference sha256 is `d1e02b7d8dd06cd84ee45294b0525000cf7c61e6f6fa32bfa81d3719e47a6987`. Host execution in `run.om` is not physical Intel GPU qualification.
+The SPIR-V stage runs `OMC=seed/out/omc sh gpu/spirv/check.sh` (spirv-val, mutants, host conform) and streams each line. It skips only when `spirv-val` or `omc` cannot run, and the skip line says how to install `spirv-tools` or `qemu-user-static`. The RMSNorm stage reads `gpu/spirv/intel-rmsnorm.tsv` and runs every row. Exit 0 is PASS, exit 2 is NOT_RUN (prerequisite missing), anything else is FAIL. NOT_RUN is not a pass. The reference sha256 is `144c89820d5d005af741dfcace8f9882bae481d72f1745aef36b5014cbaadb46`. The Intel OpenCL stage (`vadd`, `fsum16`, `gemm16`) looks for `gpu/spirv/intel-opencl.tsv` and runs it the same way when it is present. That file is not in this checkout, and neither is a `gemm16` kernel; the stage says so and does not invent a result. Host conform for `vadd` and `fsum16` still runs inside `gpu/spirv/check.sh`.
 
 The evidence stage fetches `https://zenodo.org/api/records/24237047`, downloads each file, and checks the checksum the API published. There is no evidence archive on that record. Offline, the stage skips and says why. The last table is PASS, FAIL, SKIP, NOT_RUN, or MISSING per step. Skip, NOT_RUN, and MISSING are never passes. The process exits 0 only when nothing failed. `--evidence URL` overrides the Zenodo API URL.

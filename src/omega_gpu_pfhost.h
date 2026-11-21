@@ -43,10 +43,6 @@ size_t omega_gpu_pf_router_packed_bytes(uint32_t e, uint32_t k);
 void omega_gpu_pf_router_pack(uint32_t e, uint32_t k, const float *w, float *wq);
 int omega_gpu_pf_router_logits(uint32_t k, uint32_t e, uint32_t rows, uint64_t x_va, uint64_t wq_va, uint64_t logits_va, uint64_t *ns);
 int omega_gpu_pf_moe_combine(uint32_t h, uint32_t top_k, uint32_t rows, uint64_t down_va, uint64_t inv_va, uint64_t wt_va, uint64_t out_va, uint64_t *ns);
-/* Record paths for single-submit command lists (caller holds omega_gpu_session_lock() with device open). */
-struct OmegaGpuCmdList;
-int omega_gpu_pf_router_logits_record(struct OmegaGpuCmdList *cl, uint32_t k, uint32_t e, uint32_t rows, uint64_t x_va, uint64_t wq_va, uint64_t logits_va);
-int omega_gpu_pf_moe_combine_record(struct OmegaGpuCmdList *cl, uint32_t h, uint32_t top_k, uint32_t rows, uint64_t down_va, uint64_t inv_va, uint64_t wt_va, uint64_t out_va);
 /* tests only: kernel mutants (0 restores) and the router's rows per CTA (0 = default 16) */
 void omega_gpu_pf_router_test_set_mutant(int m);
 void omega_gpu_pf_combine_test_set_mutant(int m);

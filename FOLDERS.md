@@ -126,7 +126,7 @@ Immutable receipts of learner development runs (seeds 1..5 per level, HOLDOUT/TR
 
 ## `gpu/`
 
-Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047): one directory per back end (`gpu/amd/`, `gpu/nvidia/`, `gpu/intel/`, `gpu/spirv/`, `gpu/hw/`), moved here from CUDApp one piece per landing with the history of its Omega files (`gpu/units.tsv`, 405 units, `OMEGA-GPU-UNITS`), plus `gpu/driver/`, `gpu/cuda-crack/`, and pure-Omega conversions `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, and `gpu/turing/` (gated separately by `gpu/extra-units.tsv` / `gpu/extra-units-gate.om`, 22 units, `OMEGA-GPU-EXTRA-UNITS`). `gpu/README.md` gives the layout.
+Omega GPU, the GPU layer of Sovereign Intelligence (SI) (aien-architecture-mv ADR 0047): one directory per back end (`gpu/amd/`, `gpu/nvidia/`, `gpu/spirv/`, `gpu/hw/`), moved here from CUDApp one piece per landing with the history of its Omega files (`gpu/units.tsv`, 405 units, `OMEGA-GPU-UNITS`), plus `gpu/driver/`, `gpu/cuda-crack/`, and pure-Omega conversions `gpu/adapters/`, `gpu/head-to-head/`, `gpu/forge/`, `gpu/algebra/`, `gpu/checker2/`, `gpu/rx/`, `gpu/physics0/`, and `gpu/turing/` (gated separately by `gpu/extra-units.tsv` / `gpu/extra-units-gate.om`, 22 units, `OMEGA-GPU-EXTRA-UNITS`). `gpu/README.md` gives the layout.
 
 Rules:
 
@@ -193,9 +193,9 @@ Rules:
 - `ports.tsv` is the only hand-written input; `INVENTORY.tsv` is written by `inventory.om` from it, a CUDApp checkout and the `gpu/` file list, and the gate fails when it disagrees with `ports.tsv` or names a `gpu/` file this tree does not have
 - every check has a table control, every row of `mutants.tsv` must compile and be caught, and a FROM must match exactly one line of its part
 
-## `gpu/spirv/`, `gpu/intel/`, and `gpu/hw/`
+## `gpu/spirv/` and `gpu/hw/`
 
-Seeded-Omega SPIR-V and Intel Xe GPU units: `gpu/spirv/` holds the pure-Omega SPIR-V emitter (`emit.om`), validator (`val.om`), compute executor (`run.om`), bit-exact 0-ulp reference/checker with SHA-256 (`conform.om`), and `omega-run.sh` / `check.sh` (replacing Vulkan/lavapipe, external `spirv-val`, and Python OpenCL/Level Zero runners). `gpu/intel/` holds the pure-Omega Intel Xe2/Xe3 (Panther Lake) direct `drm/xe` backend (`xe/requests.tsv`, `records.om`, `batch.om`, `isa.om`, `plan.om`, `launch.om`, and `gate.sh`). `gpu/hw/` holds `hwman`, the hardware capability manifest (`gpu/hw/*.om` with `gpu/hw/manifest.tsv`).
+Seeded-Omega programs moved from CUDApp `backend/` (ADR 0047, step 3): the SPIR-V kernel builder and its bit-exact host reference (`gpu/spirv/emit.om`, `conform.om`), and `hwman`, the hardware capability manifest (`gpu/hw/*.om` with the table `gpu/hw/manifest.tsv` it reads). Their run-time checks are still shell and C in CUDApp; here they are compiled by `tests/gates/run.sh gpu-units`.
 
 ## `native/`
 
