@@ -481,7 +481,7 @@ uint32_t omega2_rx_pj_summarize(uint64_t *result, const uint64_t *o_w, uint64_t 
 uint32_t omega2_rx_pj_section_of(uint64_t *result, uint64_t o_protect, uint64_t o_cls, uint64_t o_treatment, uint64_t o_temporal);
 /* export fn rx_pj_form_of treatment ulong to ulong */
 uint32_t omega2_rx_pj_form_of(uint64_t *result, uint64_t o_treatment);
-#define OMEGA2_IDENT_rx_capq_core "omega-ident 1 unit=rx_capq_core abi=2 profile=OM-2 src=55e7902df4087d1329ae1c21fb10a1c3a2b66a9a42dca73d3a27f98c88714f51 omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
+#define OMEGA2_IDENT_rx_capq_core "omega-ident 1 unit=rx_capq_core abi=2 profile=OM-2 src=6f0014d66caae68532b9f1bb11a445089a87e94abc7b68c1c9956fec17c3c953 omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
 const char *omega2_ident_rx_capq_core(void);
 /* export fn rx_cq_key_hash cap_id ulong real_id ulong mach_id ulong skill_id ulong to ulong */
 uint32_t omega2_rx_cq_key_hash(uint64_t *result, uint64_t o_cap_id, uint64_t o_real_id, uint64_t o_mach_id, uint64_t o_skill_id);
@@ -493,6 +493,16 @@ uint32_t omega2_rx_cq_dominates(uint64_t *result, const uint64_t *o_a, uint64_t 
 uint32_t omega2_rx_cq_cmp_full(uint64_t *result, const uint64_t *o_a, uint64_t o_a_len, const uint64_t *o_b, uint64_t o_b_len, const uint8_t *o_dims, uint64_t o_dims_len, uint64_t o_nd);
 /* export fn rx_cq_within v ulong best ulong tol_ppm ulong to ulong */
 uint32_t omega2_rx_cq_within(uint64_t *result, uint64_t o_v, uint64_t o_best, uint64_t o_tol_ppm);
+/* export fn rx_cq_plan_sources domains ulong need_src ulong loc ulong pin ulong self_mach ulong to ulong */
+uint32_t omega2_rx_cq_plan_sources(uint64_t *result, uint64_t o_domains, uint64_t o_need_src, uint64_t o_loc, uint64_t o_pin, uint64_t o_self_mach);
+/* export fn rx_cq_filter_entry ent view ulong 14 need view ulong 14 to ulong */
+uint32_t omega2_rx_cq_filter_entry(uint64_t *result, const uint64_t *o_ent, uint64_t o_ent_len, const uint64_t *o_need, uint64_t o_need_len);
+/* export fn rx_cq_wire_encode_body hdr view ulong 4 fields view ulong 17 mid view uchar 44 sdig view uchar 32 dst edit uchar 188 to ulong */
+uint32_t omega2_rx_cq_wire_encode_body(uint64_t *result, const uint64_t *o_hdr, uint64_t o_hdr_len, const uint64_t *o_fields, uint64_t o_fields_len, const uint8_t *o_mid, uint64_t o_mid_len, const uint8_t *o_sdig, uint64_t o_sdig_len, uint8_t *o_dst, uint64_t o_dst_len);
+/* export fn rx_cq_wire_decode_body src view uchar 188 hdr edit ulong 4 fields edit ulong 17 sdig edit uchar 32 to ulong */
+uint32_t omega2_rx_cq_wire_decode_body(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t *o_hdr, uint64_t o_hdr_len, uint64_t *o_fields, uint64_t o_fields_len, uint8_t *o_sdig, uint64_t o_sdig_len);
+/* export fn rx_cq_wire_apply_check has_old ulong old_gen ulong old_live ulong new_gen ulong kind ulong to long */
+uint32_t omega2_rx_cq_wire_apply_check(uint64_t *result, uint64_t o_has_old, uint64_t o_old_gen, uint64_t o_old_live, uint64_t o_new_gen, uint64_t o_kind);
 #define OMEGA2_IDENT_rx_costmodel_core "omega-ident 1 unit=rx_costmodel_core abi=2 profile=OM-2 src=39250ea0b62254f60f3695bbb8830aeb500f84c7a80d08ed70ee28f4c7eef297 omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
 const char *omega2_ident_rx_costmodel_core(void);
 /* export fn rx_cm_fit_predict tri view ulong 36 xty_u view ulong 8 phi_u view ulong 8 meta view ulong 2 dst edit ulong 4 to ulong */
@@ -517,6 +527,24 @@ uint32_t omega2_rx_world_state_legal(uint64_t *result, uint64_t o_from, uint64_t
 uint32_t omega2_rx_world_res_fits(uint64_t *result, const uint64_t *o_used, uint64_t o_used_len, const uint64_t *o_budget, uint64_t o_budget_len, const uint64_t *o_need, uint64_t o_need_len);
 /* export fn rx_world_better_admit a view ulong 3 b view ulong 3 to ulong */
 uint32_t omega2_rx_world_better_admit(uint64_t *result, const uint64_t *o_a, uint64_t o_a_len, const uint64_t *o_b, uint64_t o_b_len);
+#define OMEGA2_IDENT_rx_coherent_om2 "omega-ident 1 unit=rx_coherent_om2 abi=2 profile=OM-2 src=3a59a6d76cca7660be15a6e6a03b2baf4d05958ac011f67589eef8902e14d159 omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
+const char *omega2_ident_rx_coherent_om2(void);
+/* export fn rx_coh_crc32c data view uchar * n ulong to ulong */
+uint32_t omega2_rx_coh_crc32c(uint64_t *result, const uint8_t *o_data, uint64_t o_data_len, uint64_t o_n);
+/* export fn rx_coh_ring_msg t ulong to ulong */
+uint32_t omega2_rx_coh_ring_msg(uint64_t *result, uint64_t o_t);
+/* export fn rx_coh_msg_rights t ulong to ulong */
+uint32_t omega2_rx_coh_msg_rights(uint64_t *result, uint64_t o_t);
+/* export fn rx_coh_fault_err fault ulong to long */
+uint32_t omega2_rx_coh_fault_err(uint64_t *result, uint64_t o_fault);
+#define OMEGA2_IDENT_rx_semantic_om2 "omega-ident 1 unit=rx_semantic_om2 abi=2 profile=OM-2 src=002f4eaffc42f7a37dd96c92ca33da3c5e54a4ca30c4c2e00d4cf30d3924afcf omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
+const char *omega2_ident_rx_semantic_om2(void);
+/* export fn rx_sem_digest_eq_om2 a view uchar 32 b view uchar 32 to ulong */
+uint32_t omega2_rx_sem_digest_eq_om2(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len);
+/* export fn rx_sem_node_id_from_hash d view uchar 32 kind ulong to ulong */
+uint32_t omega2_rx_sem_node_id_from_hash(uint64_t *result, const uint8_t *o_d, uint64_t o_d_len, uint64_t o_kind);
+/* export fn rx_sem_inputs_unique inputs view ulong * n ulong to ulong */
+uint32_t omega2_rx_sem_inputs_unique(uint64_t *result, const uint64_t *o_inputs, uint64_t o_inputs_len, uint64_t o_n);
 #define OMEGA2_IDENT_rx_skillroute_core "omega-ident 1 unit=rx_skillroute_core abi=2 profile=OM-2 src=568e2a8345feaffe9d1c119697426be1564d2b2317f8bdd192ad7756c39a6c3d omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
 const char *omega2_ident_rx_skillroute_core(void);
 /* export fn rx_sr_digest_zero d view uchar 32 to ulong */
@@ -529,6 +557,40 @@ const char *omega2_ident_rx_fusion_core(void);
 uint32_t omega2_rx_fus_word64(uint64_t *result, const uint8_t *o_d, uint64_t o_d_len);
 /* export fn rx_fus_eligible_kind k ulong to ulong */
 uint32_t omega2_rx_fus_eligible_kind(uint64_t *result, uint64_t o_k);
+#define OMEGA2_IDENT_cap_table_om2 "omega-ident 1 unit=cap_table_om2 abi=2 profile=OM-2 src=9d6d3476248a3bfb077081cd61742ce108b5b821af9525dd117bed017fc28e5f omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
+const char *omega2_ident_cap_table_om2(void);
+/* export fn cap_token_eq a view uchar 32 b view uchar 32 to ulong */
+uint32_t omega2_cap_token_eq(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len);
+/* export fn cap_add_u64 a ulong b ulong dst edit ulong 1 to long */
+uint32_t omega2_cap_add_u64(uint64_t *result, uint64_t o_a, uint64_t o_b, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn cap_gen_advance gen ulong dst edit ulong 1 to long */
+uint32_t omega2_cap_gen_advance(uint64_t *result, uint64_t o_gen, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn cap_table_init hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 boot_gen ulong to long */
+uint32_t omega2_cap_table_init(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, uint64_t *o_slots, uint64_t o_slots_len, uint8_t *o_delivered, uint64_t o_delivered_len, uint64_t o_boot_gen);
+/* export fn cap_table_validate hdr view ulong 4 slots view ulong 3328 args view ulong 5 out_slot edit ulong 13 to long */
+uint32_t omega2_cap_table_validate(uint64_t *result, const uint64_t *o_hdr, uint64_t o_hdr_len, const uint64_t *o_slots, uint64_t o_slots_len, const uint64_t *o_args, uint64_t o_args_len, uint64_t *o_out_slot, uint64_t o_out_slot_len);
+/* export fn cap_table_inspect hdr view ulong 4 slots view ulong 3328 cap_id ulong gen ulong out_slot edit ulong 13 to long */
+uint32_t omega2_cap_table_inspect(uint64_t *result, const uint64_t *o_hdr, uint64_t o_hdr_len, const uint64_t *o_slots, uint64_t o_slots_len, uint64_t o_cap_id, uint64_t o_gen, uint64_t *o_out_slot, uint64_t o_out_slot_len);
+/* export fn cap_table_auth_use hdr view ulong 4 slots view ulong 3328 delivered view uchar 256 args view ulong 3 to long */
+uint32_t omega2_cap_table_auth_use(uint64_t *result, const uint64_t *o_hdr, uint64_t o_hdr_len, const uint64_t *o_slots, uint64_t o_slots_len, const uint8_t *o_delivered, uint64_t o_delivered_len, const uint64_t *o_args, uint64_t o_args_len);
+/* export fn cap_table_mint hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 req view ulong 9 out_ref edit ulong 2 to long */
+uint32_t omega2_cap_table_mint(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, uint64_t *o_slots, uint64_t o_slots_len, uint8_t *o_delivered, uint64_t o_delivered_len, const uint64_t *o_req, uint64_t o_req_len, uint64_t *o_out_ref, uint64_t o_out_ref_len);
+/* export fn cap_table_revoke hdr edit ulong 4 slots edit ulong 3328 delivered view uchar 256 args view ulong 4 rev_list edit ulong 257 to long */
+uint32_t omega2_cap_table_revoke(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, uint64_t *o_slots, uint64_t o_slots_len, const uint8_t *o_delivered, uint64_t o_delivered_len, const uint64_t *o_args, uint64_t o_args_len, uint64_t *o_rev_list, uint64_t o_rev_list_len);
+/* export fn cap_table_reclaim hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 args view ulong 3 to long */
+uint32_t omega2_cap_table_reclaim(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, uint64_t *o_slots, uint64_t o_slots_len, uint8_t *o_delivered, uint64_t o_delivered_len, const uint64_t *o_args, uint64_t o_args_len);
+/* export fn cap_table_clock hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 args view ulong 3 to long */
+uint32_t omega2_cap_table_clock(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint64_t *o_slots, uint64_t o_slots_len, const uint8_t *o_delivered, uint64_t o_delivered_len, const uint64_t *o_args, uint64_t o_args_len);
+/* export fn cap_table_epoch hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 aid ulong agen ulong to long */
+uint32_t omega2_cap_table_epoch(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint64_t *o_slots, uint64_t o_slots_len, const uint8_t *o_delivered, uint64_t o_delivered_len, uint64_t o_aid, uint64_t o_agen);
+#define OMEGA2_IDENT_aegis_om2 "omega-ident 1 unit=aegis_om2 abi=2 profile=OM-2 src=acee92a0cca19b7dd8879aa315d458259eadddc85e9d25615a98eb82a97f1f38 omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
+const char *omega2_ident_aegis_om2(void);
+/* export fn aegis_evaluate rules view ulong 112 n_rules ulong req view ulong 4 res edit ulong 3 to ulong */
+uint32_t omega2_aegis_evaluate(uint64_t *result, const uint64_t *o_rules, uint64_t o_rules_len, uint64_t o_n_rules, const uint64_t *o_req, uint64_t o_req_len, uint64_t *o_res, uint64_t o_res_len);
+/* export fn aegis_decide rules view ulong 112 n_rules ulong subject ulong in_f view ulong 10 out_dec edit ulong 8 to ulong */
+uint32_t omega2_aegis_decide(uint64_t *result, const uint64_t *o_rules, uint64_t o_rules_len, uint64_t o_n_rules, uint64_t o_subject, const uint64_t *o_in_f, uint64_t o_in_f_len, uint64_t *o_out_dec, uint64_t o_out_dec_len);
+/* export fn aegis_install_check dec view ulong 8 req view ulong 6 client view ulong 3 to ulong */
+uint32_t omega2_aegis_install_check(uint64_t *result, const uint64_t *o_dec, uint64_t o_dec_len, const uint64_t *o_req, uint64_t o_req_len, const uint64_t *o_client, uint64_t o_client_len);
 #define OMEGA2_IDENT_osc_literal "omega-ident 1 unit=osc_literal abi=2 profile=OM-2 src=ed2da39b4adba054db253cd7bd5b5f7e7c68a773f7b676be6fb7ed9825cb0c0f omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
 const char *omega2_ident_osc_literal(void);
 /* export fn osc_parse_literal spelling view uchar * value out ulong 1 to ulong */
@@ -1125,7 +1187,7 @@ uint32_t omega2_omx_om_sort_d(uint64_t *result, uint64_t *o_v, uint64_t o_v_len,
 uint32_t omega2_omx_om_median_sorted(uint64_t *result, const uint64_t *o_v, uint64_t o_v_len, uint64_t o_n);
 /* export fn omx_om_abs_dev v view ulong * n ulong med_b ulong dst edit ulong * to void */
 uint32_t omega2_omx_om_abs_dev(uint64_t *result, const uint64_t *o_v, uint64_t o_v_len, uint64_t o_n, uint64_t o_med_b, uint64_t *o_dst, uint64_t o_dst_len);
-#define OMEGA2_IDENT_osh_core "omega-ident 1 unit=osh_core abi=2 profile=OM-2 src=575eb9e72690b7b33087a0fbaae574094a9f0f08b317ae291d3999cc6a27cd91 omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
+#define OMEGA2_IDENT_osh_core "omega-ident 1 unit=osh_core abi=2 profile=OM-2 src=372db83af04a9bc9aca1554942762b41d7f8fe7be3f9ba1c416f593699dd71db omc=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
 const char *omega2_ident_osh_core(void);
 /* export fn osh_om_name_valid s view uchar * n ulong to ulong */
 uint32_t omega2_osh_om_name_valid(uint64_t *result, const uint8_t *o_s, uint64_t o_s_len, uint64_t o_n);
@@ -1133,6 +1195,14 @@ uint32_t omega2_osh_om_name_valid(uint64_t *result, const uint8_t *o_s, uint64_t
 uint32_t omega2_osh_om_check_req_hdr(uint64_t *result, const uint64_t *o_rec, uint64_t o_rec_len, uint64_t o_nrec, uint64_t o_nout, uint64_t o_has_out);
 /* export fn osh_om_check_cmd_reserved b view ulong * na ulong ns ulong nr ulong to ulong */
 uint32_t omega2_osh_om_check_cmd_reserved(uint64_t *result, const uint64_t *o_b, uint64_t o_b_len, uint64_t o_na, uint64_t o_ns, uint64_t o_nr);
+/* export fn osh_om_op_right op ulong to ulong */
+uint32_t omega2_osh_om_op_right(uint64_t *result, uint64_t o_op);
+/* export fn osh_om_map_cap_rc rc long to long */
+uint32_t omega2_osh_om_map_cap_rc(uint64_t *result, uint64_t o_rc);
+/* export fn osh_om_path_under pref view uchar * np ulong path view uchar * npath ulong to ulong */
+uint32_t omega2_osh_om_path_under(uint64_t *result, const uint8_t *o_pref, uint64_t o_pref_len, uint64_t o_np, const uint8_t *o_path, uint64_t o_path_len, uint64_t o_npath);
+/* export fn osh_om_check_binding domain ulong pid view uchar 32 to long */
+uint32_t omega2_osh_om_check_binding(uint64_t *result, uint64_t o_domain, const uint8_t *o_pid, uint64_t o_pid_len);
 #ifdef __cplusplus
 }
 #endif

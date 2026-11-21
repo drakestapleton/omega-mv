@@ -18,7 +18,7 @@ AIENOS_LOCK_REPO ?= ../aienos-argus-cap
 # AIENOS_LOCK: the validated commit parsed at the top of the Makefile (before this include).
 AIENOS_R7_DEFAULT = $(OUT_DIR)/aienos-authority/$(AIENOS_LOCK)
 AIENOS_R7_DIR ?= $(AIENOS_R7_DEFAULT)
-AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/$(AIENOS_LOCK)/libaienos_capability.a
+AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/libaienos_capability_om2.a
 VISOR_AUTH_CAP_LIB ?= $(AIENOS_CAP_LIB)
 VISOR_AUTH_RX_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
 	src/runtime/rx_generation.c src/runtime/rx_aegis.c

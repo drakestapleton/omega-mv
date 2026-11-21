@@ -158,3 +158,266 @@ export fn rx_cq_within v ulong best ulong tol_ppm ulong to ulong
   end
   ret 0
 end
+
+note Compute allowed source mask for a compiled query plan.
+export fn rx_cq_plan_sources domains ulong need_src ulong loc ulong pin ulong self_mach ulong to ulong
+  ns = need_src
+  if eq ns 0
+    ns = ulong 31
+  end
+  s = and domains ns
+  aloc = loc
+  if eq aloc 0
+    aloc = ulong 3
+  end
+  if eq and aloc 1 0
+    s = and s 16
+  end
+  if eq and aloc 2 0
+    s = and s 15
+  end
+  if ne pin 0
+    if eq pin self_mach
+      s = and s 15
+    else
+      s = and s 16
+    end
+  end
+  ret s
+end
+
+note Check feasibility of one catalog entry against need + tradeoffs.
+note ent[14]: 0=mach, 1=in_t, 2=out_t, 3=fx, 4=auth_res, 5=auth_r, 6=lat,
+note          7=eng, 8=rel, 9=ev, 10=cost, 11=conf, 12=local, 13=live
+note need[14]: 0=loc, 1=pin, 2=acc_in, 3=req_out, 4=fx_cls, 5=res_lo, 6=res_hi,
+note           7=max_r, 8=lat_b, 9=eng_b, 10=rel_req, 11=ev_req, 12=max_cost, 13=min_conf
+export fn rx_cq_filter_entry ent view ulong 14 need view ulong 14 to ulong
+  loc = get need 0
+  local_bit = ulong 2
+  if ne get ent 12 0
+    local_bit = ulong 1
+  end
+  if eq and loc local_bit 0
+    ret 0
+  end
+  pin = get need 1
+  if ne pin 0
+    if ne get ent 0 pin
+      ret 0
+    end
+  end
+  if ne and get ent 1 xor get need 2 0xffffffffffffffff 0
+    ret 0
+  end
+  if ne and get need 3 xor get ent 2 0xffffffffffffffff 0
+    ret 0
+  end
+  if ne and get ent 3 xor get need 4 0xffffffffffffffff 0
+    ret 0
+  end
+  ar = get ent 5
+  if ne and ar xor get need 7 0xffffffffffffffff 0
+    ret 0
+  end
+  if ne ar 0
+    res = get ent 4
+    if or lt res get need 5 gt res get need 6
+      ret 0
+    end
+  end
+  lb = get need 8
+  if ne lb 0
+    if gt get ent 6 lb
+      ret 0
+    end
+  end
+  eb = get need 9
+  if ne eb 0
+    if gt get ent 7 eb
+      ret 0
+    end
+  end
+  if lt get ent 8 get need 10
+    ret 0
+  end
+  if lt get ent 9 get need 11
+    ret 0
+  end
+  mc = get need 12
+  if ne mc 0
+    if gt get ent 10 mc
+      ret 0
+    end
+  end
+  if lt get ent 11 get need 13
+    ret 0
+  end
+  ret 1
+end
+
+fn cq_put_u16 dst edit uchar 188 off ulong v ulong to void
+  put dst off uchar and v 255
+  put dst add off 1 uchar and shr v 8 255
+end
+
+fn cq_put_u32 dst edit uchar 188 off ulong v ulong to void
+  cq_put_u16 dst off v
+  cq_put_u16 dst add off 2 shr v 16
+end
+
+fn cq_put_u64 dst edit uchar 188 off ulong v ulong to void
+  cq_put_u32 dst off v
+  cq_put_u32 dst add off 4 shr v 32
+end
+
+fn cq_get_u16 src view uchar 188 off ulong to ulong
+  b0 = ulong get src off
+  b1 = ulong get src add off 1
+  ret or b0 shl b1 8
+end
+
+fn cq_get_u32 src view uchar 188 off ulong to ulong
+  lo = cq_get_u16 src off
+  hi = cq_get_u16 src add off 2
+  ret or lo shl hi 16
+end
+
+fn cq_get_u64 src view uchar 188 off ulong to ulong
+  lo = cq_get_u32 src off
+  hi = cq_get_u32 src add off 4
+  ret or lo shl hi 32
+end
+
+note Encode 184-byte ACGR wire record body (caller appends 4-byte SHA-256 check).
+note hdr[4]: 0=kind (1..3), 1=source, 2=evidence_level, 3=live
+note fields[17]: cap_id, real_id, skill_id, skill_ver, op, effects, in_types,
+note   out_types, auth_res, auth_rights, conf, rel, cost, lat, eng, ev_ref, gen
+export fn rx_cq_wire_encode_body hdr view ulong 4 fields view ulong 17 mid view uchar 44 sdig view uchar 32 dst edit uchar 188 to ulong
+  kind = get hdr 0
+  src = get hdr 1
+  ev = get hdr 2
+  live = get hdr 3
+  if or lt kind 1 gt kind 3
+    ret 0
+  end
+  if or ge src 5 eq src 4
+    ret 0
+  end
+  if gt live 2
+    ret 0
+  end
+  for i ulong 188
+    put dst i uchar 0
+  end
+  put dst 0 uchar 65
+  put dst 1 uchar 67
+  put dst 2 uchar 71
+  put dst 3 uchar 82
+  put dst 4 uchar 1
+  put dst 5 uchar and kind 255
+  put dst 6 uchar and src 255
+  put dst 7 uchar and ev 255
+  for i ulong 44
+    put dst add 8 i get mid i
+  end
+  cq_put_u32 dst 52 get fields 0
+  cq_put_u32 dst 56 get fields 1
+  cq_put_u32 dst 60 get fields 2
+  cq_put_u32 dst 64 get fields 3
+  for i ulong 32
+    put dst add 68 i get sdig i
+  end
+  cq_put_u32 dst 100 get fields 4
+  cq_put_u16 dst 104 get fields 5
+  wlive = live
+  if eq kind 3
+    wlive = ulong 0
+  end
+  cq_put_u16 dst 106 wlive
+  cq_put_u64 dst 108 get fields 6
+  cq_put_u64 dst 116 get fields 7
+  cq_put_u64 dst 124 get fields 8
+  cq_put_u32 dst 132 get fields 9
+  cq_put_u32 dst 136 get fields 10
+  cq_put_u32 dst 140 get fields 11
+  cq_put_u64 dst 144 get fields 12
+  cq_put_u64 dst 152 get fields 13
+  cq_put_u64 dst 160 get fields 14
+  cq_put_u64 dst 168 get fields 15
+  cq_put_u64 dst 176 get fields 16
+  ret 1
+end
+
+note Decode and validate 188-byte ACGR wire record body (caller verifies 4-byte SHA-256 check).
+export fn rx_cq_wire_decode_body src view uchar 188 hdr edit ulong 4 fields edit ulong 17 sdig edit uchar 32 to ulong
+  if or ne get src 0 uchar 65 ne get src 1 uchar 67
+    ret 0
+  end
+  if or ne get src 2 uchar 71 ne get src 3 uchar 82
+    ret 0
+  end
+  if ne get src 4 uchar 1
+    ret 0
+  end
+  kind = ulong get src 5
+  source = ulong get src 6
+  ev = ulong get src 7
+  live = cq_get_u16 src 106
+  if or lt kind 1 gt kind 3
+    ret 0
+  end
+  if or ge source 5 eq source 4
+    ret 0
+  end
+  if or gt ev 3 gt live 2
+    ret 0
+  end
+  is_w = eq kind 3
+  is_lw = eq live 0
+  if ne is_w is_lw
+    ret 0
+  end
+  put hdr 0 kind
+  put hdr 1 source
+  put hdr 2 ev
+  put hdr 3 live
+  put fields 0 cq_get_u32 src 52
+  put fields 1 cq_get_u32 src 56
+  put fields 2 cq_get_u32 src 60
+  put fields 3 cq_get_u32 src 64
+  for i ulong 32
+    put sdig i get src add 68 i
+  end
+  put fields 4 cq_get_u32 src 100
+  put fields 5 cq_get_u16 src 104
+  put fields 6 cq_get_u64 src 108
+  put fields 7 cq_get_u64 src 116
+  put fields 8 cq_get_u64 src 124
+  put fields 9 cq_get_u32 src 132
+  put fields 10 cq_get_u32 src 136
+  put fields 11 cq_get_u32 src 140
+  put fields 12 cq_get_u64 src 144
+  put fields 13 cq_get_u64 src 152
+  put fields 14 cq_get_u64 src 160
+  put fields 15 cq_get_u64 src 168
+  put fields 16 cq_get_u64 src 176
+  ret 1
+end
+
+note Validate wire-apply generation and withdrawal state transitions.
+note Returns 0 (CQ_OK), -11 (CQ_E_STALE), -7 (CQ_E_NOT_FOUND), -8 (CQ_E_WITHDRAWN).
+export fn rx_cq_wire_apply_check has_old ulong old_gen ulong old_live ulong new_gen ulong kind ulong to long
+  if ne has_old 0
+    if le new_gen old_gen
+      ret -11
+    end
+  else
+    if ne kind 1
+      ret -7
+    end
+  end
+  if and eq kind 2 eq old_live 0
+    ret -8
+  end
+  ret 0
+end

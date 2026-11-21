@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-/* osh_caps.c -- see osh_caps.h. */
+/* osh_caps.c -- see osh_caps.h. Policy/mapping/prefix logic in src/osh/osh_core.om. */
 #include "osh_caps.h"
+#include "omega_native.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -41,11 +42,9 @@ static void set_err(char *err, size_t n, const char *fmt, int line, const char *
 
 static int op_right(int op)
 {
-    switch (op) {
-    case OSH_OP_SPAWN: return RX_RIGHT_EFFECT;
-    case OSH_OP_OPEN_WRITE: return RX_RIGHT_WRITE;
-    default: return RX_RIGHT_READ; /* read, chdir */
-    }
+    uint64_t r = 0;
+    (void)omega2_osh_om_op_right(&r, (uint64_t)op);
+    return (int)r;
 }
 
 /* Canonical absolute form of a target: realpath(), or realpath(parent) + "/" + base when the target does not exist yet.
@@ -87,9 +86,11 @@ static int canon_target(const char *path, char *out, size_t cap)
 
 static int under(const char *prefix, const char *p)
 {
-    size_t n = strlen(prefix);
-    if (n == 1 && prefix[0] == '/') return 1;
-    return strncmp(prefix, p, n) == 0 && (p[n] == 0 || p[n] == '/');
+    size_t np = strlen(prefix), npath = strlen(p);
+    uint64_t ok = 0;
+    (void)omega2_osh_om_path_under(&ok, (const uint8_t *)prefix, np, (uint64_t)np,
+                                   (const uint8_t *)p, npath, (uint64_t)npath);
+    return ok != 0;
 }
 
 int osh_caps_load(OshCaps *c, const char *text, char *err, size_t errsz)
@@ -172,23 +173,19 @@ void osh_caps_attach(OshCaps *c, OshSession *s)
 
 static int map_rc(int rc)
 {
-    switch (rc) {
-    case RX_CAP_OK: return OSH_E_OK;
-    case RX_CAP_ERR_STALE_GEN: return OSH_E_STALE;
-    case RX_CAP_ERR_REVOKED: case RX_CAP_ERR_EPOCH: case RX_CAP_ERR_EXPIRED: case RX_CAP_ERR_CHAIN: return OSH_E_REVOKED;
-    default: return OSH_E_DENIED;
-    }
+    uint64_t r = 0;
+    (void)omega2_osh_om_map_cap_rc(&r, (uint64_t)(int64_t)rc);
+    return (int)(int64_t)r;
 }
 
 int osh_caps_effect(void *ctx, const OshBinding *b, int op, const char *path)
 {
     OshCaps *c = ctx;
     if (!c || !c->started || !b || !b->valid) return OSH_E_DENIED;
-    if (b->domain != 2) return OSH_E_CAP_DOMAIN_MISMATCH; /* no bridge in v1; never narrow or reinterpret */
-    for (int i = 4; i < 32; i++)
-        if (b->principal_id[i]) return OSH_E_DENIED;
-    uint32_t subject = (uint32_t)b->principal_id[0] | (uint32_t)b->principal_id[1] << 8 |
-                       (uint32_t)b->principal_id[2] << 16 | (uint32_t)b->principal_id[3] << 24;
+    uint64_t chk = 0;
+    (void)omega2_osh_om_check_binding(&chk, (uint64_t)b->domain, b->principal_id, 32);
+    if ((int64_t)chk < 0) return (int)(-(int64_t)chk);
+    uint32_t subject = (uint32_t)chk;
     /* 1. the session's own principal capability, with the generation exactly as bound (64 bits) */
     RxCapRef pref = {b->cap_index, b->cap_generation};
     int rc = rx_caproot_validate(&c->root, pref, subject, 0, RX_RIGHT_READ, NULL);

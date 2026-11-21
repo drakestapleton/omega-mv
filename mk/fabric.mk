@@ -34,10 +34,9 @@ FAB_HDRS = src/fabric/fabric.h src/fabric/fab_hmac.h src/fabric/fab_loopback.h s
 # Routing discovers and carries records; it never grants authority, never
 # touches the World, and F5-0 opens no socket and starts no process.
 FAB_FORBIDDEN = ' U (aienos_|rx_caproot_|rx_world_|rx_aegis|argus_|ag_cap|socket$$|connect$$|bind$$|listen$$|accept$$|sendto$$|recvfrom$$|fork$$|exec|system$$|dlopen$$|mmap$$)'
-# Same support set test-capability-graph links for rx_capq.o.
-FAB_LINK_SRCS = src/runtime/rx_caproot.c src/runtime/rx_world.c src/runtime/rx_coherent.c \
-	src/runtime/rx_native_bind.c src/runtime/rx_aegis.c src/omega_om_units.c src/omega_evidence.c \
-	src/omega_core.c src/omega_canonical.c src/runtime/aien_machine_id.c
+# Decoupled from legacy C runtime & libaienos_capability.a: Fabric links only
+# rx_capq.o (backed by om/runtime/rx_capq_core.om), aien_machine_id.c, and OM-2 units.
+FAB_LINK_SRCS = src/omega_om_units.c src/runtime/aien_machine_id.c
 
 $(FAB_DIR)/%.o: src/fabric/%.c $(FAB_HDRS)
 	@mkdir -p $(FAB_DIR)
@@ -49,12 +48,11 @@ fabric-purity: $(FAB_DIR)/fabric.o $(FAB_DIR)/fab_hmac.o $(FAB_DIR)/fab_loopback
 	@echo "fabric-purity: fabric.o, fab_hmac.o, fab_loopback.o and fab_dispatch.o reference no forbidden symbol"
 
 test-fabric: fabric-purity
-	@$(MAKE) --no-print-directory $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) $(AIENOS_CAP_LIB)
+	@$(MAKE) --no-print-directory $(RX_CAPQ_OBJ)
 	$(CC) $(CFLAGS) $(FAB_CFLAGS) -pthread -o $(FAB_DIR)/fabric_test tests/fabric/fabric_test.c \
-		$(FAB_SRCS) $(FAB_LINK_SRCS) $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) $(AIENOS_CAP_LIB) -lm
+		$(FAB_SRCS) $(FAB_LINK_SRCS) $(RX_CAPQ_OBJ) -lm
 	$(CC) $(CFLAGS) $(FAB_CFLAGS) $(FAB_ASAN) -pthread -o $(FAB_DIR)/fabric_test_asan \
-		tests/fabric/fabric_test.c $(FAB_SRCS) $(FAB_LINK_SRCS) $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) \
-		$(AIENOS_CAP_LIB) -lm
+		tests/fabric/fabric_test.c $(FAB_SRCS) $(FAB_LINK_SRCS) $(RX_CAPQ_OBJ) -lm
 	$(abspath $(FAB_DIR)/fabric_test)
 	$(abspath $(FAB_DIR)/fabric_test_asan) > $(FAB_DIR)/asan.out
 	@grep -q '^F5_0_FABRIC_LOOPBACK_PASS$$' $(FAB_DIR)/asan.out && echo "test-fabric: ASan/UBSan run PASS"

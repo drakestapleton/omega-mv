@@ -20,6 +20,7 @@
  */
 #include "rx_semantic.h"
 
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <stdlib.h>
@@ -49,7 +50,9 @@ static void h_tag(sha256_ctx *c, const char *tag) {
 }
 
 bool rx_sem_digest_eq(const RxSemDigest *a, const RxSemDigest *b) {
-    return memcmp(a->b, b->b, 32) == 0;
+    uint64_t eq = 0;
+    (void)omega2_rx_sem_digest_eq_om2(&eq, a->b, 32, b->b, 32);
+    return eq != 0;
 }
 
 void rx_sem_digest_value(uint32_t type, const uint64_t *words, uint32_t n, RxSemDigest *out) {
@@ -185,9 +188,9 @@ static uint64_t node_id(const RxSemDigest *deriv, const uint64_t *inputs, uint32
     h_u32(&c, n);
     for (uint32_t i = 0; i < n; i++) h_u64(&c, inputs[i]);
     sha256_final(&c, d);
-    uint64_t v = 0;
-    for (int i = 0; i < 7; i++) v |= (uint64_t)d[i] << (8 * i);
-    return ((uint64_t)RX_SEM_KIND_DERIVED << 56) | v;
+    uint64_t id = 0;
+    (void)omega2_rx_sem_node_id_from_hash(&id, d, 32, (uint64_t)RX_SEM_KIND_DERIVED);
+    return id;
 }
 
 int rx_sem_add_node(RxSemEngine *e, uint32_t fn, const uint64_t *inputs, uint32_t n,
@@ -217,11 +220,10 @@ int rx_sem_add_node(RxSemEngine *e, uint32_t fn, const uint64_t *inputs, uint32_
         goto out;
     }
     if (e->n_nodes >= RX_SEM_MAX_NODES) { rc = RX_SEM_ERR_FULL; goto out; }
-    /* An input listed twice is refused: one reader entry per input, and the
-     * reverse lists (at most RX_SEM_MAX_NODES each) cannot overrun. */
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = i + 1; j < n; j++)
-            if (inputs[i] == inputs[j]) { rc = RX_SEM_ERR_ARG; goto out; }
+    /* An input listed twice is refused: checked in pure OM-2. */
+    uint64_t uniq = 0;
+    (void)omega2_rx_sem_inputs_unique(&uniq, inputs, n, (uint64_t)n);
+    if (!uniq) { rc = RX_SEM_ERR_ARG; goto out; }
     uint32_t idx = e->n_nodes++;
     RxSemNode *nd = &e->nodes[idx];
     memset(nd, 0, sizeof *nd);

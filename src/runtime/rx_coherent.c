@@ -29,6 +29,7 @@
  * descriptor are unchanged. The physics m20 sources are not edited.
  */
 #include "rx_world.h"
+#include "omega_native.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -101,25 +102,10 @@ static void store_release_u32(volatile uint32_t *p, uint32_t v) {
     atomic_store_explicit((_Atomic uint32_t *)p, v, memory_order_release);
 }
 
-static uint32_t g_crc[256];
-static int g_crc_ready;
-
-static void crc_init(void) {
-    for (uint32_t i = 0; i < 256; i++) {
-        uint32_t c = i;
-        for (int k = 0; k < 8; k++)
-            c = (c & 1u) ? (0x82F63B78u ^ (c >> 1)) : (c >> 1);
-        g_crc[i] = c;
-    }
-    g_crc_ready = 1;
-}
-
 static uint32_t crc32c(const uint8_t *data, size_t len) {
-    if (!g_crc_ready) crc_init();
-    uint32_t c = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++)
-        c = g_crc[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    uint64_t r = 0;
+    (void)omega2_rx_coh_crc32c(&r, data, len, (uint64_t)len);
+    return (uint32_t)r;
 }
 
 static uint32_t desc_checksum(const OmegaSharedWorldDesc *desc) {
@@ -169,18 +155,17 @@ static uint32_t get_u32(const uint8_t *p) {
 }
 
 static int ring_msg(uint16_t t) {
-    return t == RX_RING_WAKE || t == RX_RING_CLAIM || t == RX_RING_PUBLISH ||
-           t == RX_RING_COMPLETE || t == RX_RING_FAULT || t == RX_RING_KEEPALIVE ||
-           t == RX_RING_SHUTDOWN;
+    uint64_t r = 0;
+    (void)omega2_rx_coh_ring_msg(&r, (uint64_t)t);
+    return r != 0;
 }
 
 /* A claim names the object the seat reads; the object it writes is named in
  * the payload and its write right is checked at publication. */
 static uint32_t msg_rights(uint16_t t) {
-    if (t == RX_RING_WAKE || t == RX_RING_COMPLETE || t == RX_RING_FAULT ||
-        t == RX_RING_KEEPALIVE || t == RX_RING_CLAIM)
-        return RX_RIGHT_READ;
-    return RX_RIGHT_WRITE;
+    uint64_t r = 0;
+    (void)omega2_rx_coh_msg_rights(&r, (uint64_t)t);
+    return (uint32_t)r;
 }
 
 static void raise_fault(RxWorld *w, uint32_t code, uint64_t sequence, uint32_t a, uint32_t b) {
@@ -193,19 +178,9 @@ static void raise_fault(RxWorld *w, uint32_t code, uint64_t sequence, uint32_t a
 }
 
 static int fault_err(uint32_t fault) {
-    switch (fault) {
-    case OMEGA_SW_FAULT_STALE_GEN: return RX_ERR_STALE_GEN;
-    case OMEGA_SW_FAULT_BAD_SEQUENCE: return RX_ERR_REPLAY;
-    case OMEGA_SW_FAULT_BAD_CHECKSUM:
-    case RX_FAULT_TORN_PUB: return RX_ERR_TORN;
-    case OMEGA_SW_FAULT_OOB_OBJECT:
-    case RX_FAULT_BOUNDS:
-    case RX_FAULT_OVERLAP: return RX_ERR_BOUNDS;
-    case RX_FAULT_CAP: return RX_ERR_AUTHORITY;
-    case RX_FAULT_DIVERGED: return RX_ERR_STALE_GEN;
-    case RX_FAULT_UNPLACED: return RX_ERR_UNPLACED;
-    default: return RX_ERR_BAD_DESC;
-    }
+    uint64_t r = 0;
+    (void)omega2_rx_coh_fault_err(&r, (uint64_t)fault);
+    return (int)(int64_t)r;
 }
 
 int rx_coherent_format(RxWorld *w) {

@@ -24,6 +24,7 @@
  * process, and this Linux mint is not the permanent root.
  */
 #include "rx_caproot.h"
+#include "omega_native.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -102,12 +103,12 @@ static int fill_token(uint8_t token[RX_CAP_TOKEN_LEN]) {
 }
 
 static int token_ok(const uint8_t *a, const uint8_t *b) {
-    uint8_t diff = 0;
-    for (uint32_t i = 0; i < RX_CAP_TOKEN_LEN; i++) diff |= (uint8_t)(a[i] ^ b[i]);
-    return diff == 0;
+    uint64_t eq = 0;
+    (void)omega2_cap_token_eq(&eq, a, RX_CAP_TOKEN_LEN, b, RX_CAP_TOKEN_LEN);
+    return eq != 0;
 }
 
-/* ---- root process (the only writer) ------------------------------------ */
+/* ---- root process (the only writer; logic in seed/authority/cap_table_om2.om) ---- */
 
 static void root_begin(RxCapTable *t) {
     atomic_fetch_add_explicit(&t->seq, 1, memory_order_acq_rel);
@@ -119,213 +120,161 @@ static void root_end(RxCapTable *t) {
     atomic_fetch_add_explicit(&t->seq, 1, memory_order_acq_rel);
 }
 
-static int chain_ok(const RxCapTable *t, const RxCapEntry *e) {
-    uint32_t depth = 0;
-    while (e->parent_id != UINT32_MAX) {
-        if (++depth > RX_CAP_MAX_DEPTH) return RX_CAP_ERR_CHAIN;
-        if (e->parent_id >= t->capacity) return RX_CAP_ERR_CHAIN;
-        const RxCapEntry *p = &t->entries[e->parent_id];
-        if (p->generation != e->parent_generation) return RX_CAP_ERR_CHAIN;
-        if (p->state != RX_CAP_LIVE) return RX_CAP_ERR_CHAIN;
-        e = p;
+static void table_to_om2(const RxCapTable *t, uint64_t hdr[4], uint64_t slots[RX_CAP_MAX * 13]) {
+    hdr[0] = t->capacity;
+    hdr[1] = atomic_load_explicit(&t->epoch, memory_order_relaxed);
+    hdr[2] = atomic_load_explicit(&t->clock, memory_order_relaxed);
+    hdr[3] = 0;
+    for (uint32_t i = 0; i < RX_CAP_MAX; i++) {
+        const RxCapEntry *e = &t->entries[i];
+        uint64_t *s = &slots[(size_t)i * 13];
+        s[0] = e->cap_id;
+        s[1] = e->generation;
+        s[2] = e->state;
+        s[3] = e->issuer;
+        s[4] = e->subject;
+        s[5] = e->rights;
+        s[6] = e->resource;
+        s[7] = e->epoch;
+        s[8] = e->lease_expiry;
+        s[9] = e->parent_id;
+        s[10] = e->parent_generation;
+        s[11] = e->minted_by_id;
+        s[12] = e->minted_by_generation;
     }
-    return RX_CAP_OK;
 }
 
-static uint32_t ancestor_hops(const RxCapTable *t, const RxCapEntry *e) {
-    uint32_t hops = 0;
-    while (e->parent_id != UINT32_MAX && hops <= RX_CAP_MAX_DEPTH) {
-        if (e->parent_id >= t->capacity) return RX_CAP_MAX_DEPTH + 1;
-        hops++;
-        e = &t->entries[e->parent_id];
+static void om2_to_table(RxCapTable *t, const uint64_t hdr[4], const uint64_t slots[RX_CAP_MAX * 13]) {
+    atomic_store_explicit(&t->epoch, hdr[1], memory_order_relaxed);
+    atomic_store_explicit(&t->clock, hdr[2], memory_order_relaxed);
+    for (uint32_t i = 0; i < RX_CAP_MAX; i++) {
+        RxCapEntry *e = &t->entries[i];
+        const uint64_t *s = &slots[(size_t)i * 13];
+        e->cap_id = (uint32_t)s[0];
+        e->generation = s[1];
+        e->state = (uint32_t)s[2];
+        e->issuer = (uint32_t)s[3];
+        e->subject = (uint32_t)s[4];
+        e->rights = (uint32_t)s[5];
+        e->resource = s[6];
+        e->epoch = s[7];
+        e->lease_expiry = s[8];
+        e->parent_id = (uint32_t)s[9];
+        e->parent_generation = s[10];
+        e->minted_by_id = (uint32_t)s[11];
+        e->minted_by_generation = s[12];
     }
-    return hops;
 }
 
-/* Possession is the delivered bit, not a copy of an id read from the table. */
+static void om2_unpack_entry(const uint64_t s[13], RxCapEntry *e) {
+    e->cap_id = (uint32_t)s[0];
+    e->generation = s[1];
+    e->state = (uint32_t)s[2];
+    e->issuer = (uint32_t)s[3];
+    e->subject = (uint32_t)s[4];
+    e->rights = (uint32_t)s[5];
+    e->resource = s[6];
+    e->epoch = s[7];
+    e->lease_expiry = s[8];
+    e->parent_id = (uint32_t)s[9];
+    e->parent_generation = s[10];
+    e->minted_by_id = (uint32_t)s[11];
+    e->minted_by_generation = s[12];
+}
+
 static int auth_use(RxCapTable *t, const uint8_t *delivered, RxCapRef a,
                     uint32_t need, const RxCapEntry **out) {
-    if (a.cap_id >= t->capacity) return RX_CAP_ERR_UNAUTHORIZED;
-    if (!delivered[a.cap_id]) return RX_CAP_ERR_UNAUTHORIZED;
-    const RxCapEntry *e = &t->entries[a.cap_id];
-    if (e->generation != a.generation) return RX_CAP_ERR_STALE_GEN;
-    if (e->state != RX_CAP_LIVE) return RX_CAP_ERR_REVOKED;
-    uint64_t epoch = atomic_load_explicit(&t->epoch, memory_order_relaxed);
-    uint64_t clock = atomic_load_explicit(&t->clock, memory_order_relaxed);
-    if (e->epoch != epoch) return RX_CAP_ERR_EPOCH;
-    if (e->lease_expiry && clock >= e->lease_expiry) return RX_CAP_ERR_EXPIRED;
-    if (chain_ok(t, e) != RX_CAP_OK) return RX_CAP_ERR_CHAIN;
-    if ((e->rights & need) != need) return RX_CAP_ERR_UNAUTHORIZED;
-    /* aienos#266/#272 parity: a privileged right is an authority-office right,
-     * honored only on an entry whose resource is RX_CAP_RES_AUTHORITY, as in
-     * the native auth_use at aienos.lock. */
-    if ((need & RX_RIGHT_PRIVILEGED) && e->resource != RX_CAP_RES_AUTHORITY)
-        return RX_CAP_ERR_RESOURCE;
-    if (out) *out = e;
-    return RX_CAP_OK;
-}
-
-static int lease_expiry(uint64_t clock, uint64_t ticks, uint64_t *out) {
-    if (ticks == 0) {
-        *out = 0;
-        return RX_CAP_OK;
-    }
-    return rx_cap_add_u64(clock, ticks, out);
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    table_to_om2(t, hdr, slots);
+    uint64_t args[3] = { a.cap_id, a.generation, need };
+    (void)omega2_cap_table_auth_use(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                                    args, 3);
+    int res = (int)(int64_t)rc;
+    if (res == RX_CAP_OK && out) *out = &t->entries[a.cap_id];
+    return res;
 }
 
 static int root_mint(RxCapTable *t, const uint8_t *delivered, uint8_t *delivered_mut,
                      const RxCapMint *m, RxCapRef *out) {
-    uint64_t epoch = atomic_load_explicit(&t->epoch, memory_order_relaxed);
-    uint64_t clock = atomic_load_explicit(&t->clock, memory_order_relaxed);
-    if (m->rights == 0 || (m->rights & ~RX_RIGHT_KNOWN) != 0) return RX_CAP_ERR_RIGHTS;
-    if ((m->rights & RX_RIGHT_PRIVILEGED) && (m->rights & RX_RIGHT_DELEGATE))
-        return RX_CAP_ERR_NOT_DELEGABLE;
-
-    const RxCapEntry *auth = NULL;
-    if (m->parent.cap_id == UINT32_MAX) {
-        int arc = auth_use(t, delivered, m->authority, RX_RIGHT_MINT, &auth);
-        if (arc != RX_CAP_OK) return arc;
-        if ((m->rights & RX_RIGHT_PRIVILEGED) & ~auth->rights)
-            return RX_CAP_ERR_UNAUTHORIZED;
-    } else {
-        /* Delegation presents the parent. The office's MINT right does not
-         * reach into someone else's capability. */
-        if (m->authority.cap_id != m->parent.cap_id ||
-            m->authority.generation != m->parent.generation)
-            return RX_CAP_ERR_UNAUTHORIZED;
-        int arc = auth_use(t, delivered, m->authority, 0, &auth);
-        if (arc != RX_CAP_OK) return arc;
-        if (!(auth->rights & RX_RIGHT_DELEGATE)) return RX_CAP_ERR_NOT_DELEGABLE;
-        if (m->parent.cap_id >= t->capacity) return RX_CAP_ERR_BOUNDS;
-        const RxCapEntry *p = &t->entries[m->parent.cap_id];
-        if (p != auth) return RX_CAP_ERR_UNAUTHORIZED;
-        if (p->resource != m->resource) return RX_CAP_ERR_RESOURCE;
-        if ((m->rights & ~p->rights) != 0) return RX_CAP_ERR_AMPLIFY;
-        if (m->rights & RX_RIGHT_PRIVILEGED) return RX_CAP_ERR_NOT_DELEGABLE;
-        if (ancestor_hops(t, p) >= RX_CAP_MAX_DEPTH) return RX_CAP_ERR_CHAIN;
-        if (p->lease_expiry) {
-            uint64_t child = 0;
-            int lrc = lease_expiry(clock, m->lease_ticks, &child);
-            if (lrc != RX_CAP_OK) return lrc;
-            if (child == 0 || child > p->lease_expiry) return RX_CAP_ERR_AMPLIFY;
-        }
-    }
-
-    uint64_t expiry = 0;
-    int lrc = lease_expiry(clock, m->lease_ticks, &expiry);
-    if (lrc != RX_CAP_OK) return lrc;
-
-    int saw_exhausted = 0;
-    for (uint32_t i = 0; i < t->capacity; i++) {
-        RxCapEntry *e = &t->entries[i];
-        if (e->state != RX_CAP_FREE) continue;
-        if (e->generation == UINT64_MAX) { saw_exhausted = 1; continue; }
+    (void)delivered;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], ref[2] = { 0, 0 }, rc = 0;
+    table_to_om2(t, hdr, slots);
+    uint64_t req[9] = {
+        m->issuer, m->subject, m->resource, m->rights, m->lease_ticks,
+        m->parent.cap_id, m->parent.generation, m->authority.cap_id, m->authority.generation
+    };
+    (void)omega2_cap_table_mint(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered_mut, RX_CAP_MAX,
+                                req, 9, ref, 2);
+    int res = (int)(int64_t)rc;
+    if (res == RX_CAP_OK) {
         root_begin(t);
-        e->state = RX_CAP_LIVE;
-        e->issuer = m->issuer;
-        e->subject = m->subject;
-        e->resource = m->resource;
-        e->rights = m->rights;
-        e->epoch = epoch;
-        e->lease_expiry = expiry;
-        e->parent_id = m->parent.cap_id;
-        e->parent_generation = m->parent.cap_id == UINT32_MAX ? 0 : m->parent.generation;
-        e->minted_by_id = auth->cap_id;
-        e->minted_by_generation = auth->generation;
-        delivered_mut[i] = 1;
+        om2_to_table(t, hdr, slots);
         root_end(t);
-        out->cap_id = e->cap_id;
-        out->generation = e->generation;
-        return RX_CAP_OK;
+        out->cap_id = (uint32_t)ref[0];
+        out->generation = ref[1];
     }
-    return saw_exhausted ? RX_CAP_ERR_EXHAUSTED : RX_CAP_ERR_FULL;
-}
-
-/* A revoked parent makes every descendant unusable. Mark them revoked too,
- * the way AIENOS walks a derivation tree, so inspection does not still show
- * a live child of a dead parent. */
-static void cascade_revoke(RxCapTable *t) {
-    int guard = 0;
-    int changed = 1;
-    while (changed && guard++ < (int)RX_CAP_MAX) {
-        changed = 0;
-        for (uint32_t i = 0; i < t->capacity; i++) {
-            RxCapEntry *e = &t->entries[i];
-            if (e->state != RX_CAP_LIVE || e->parent_id == UINT32_MAX) continue;
-            if (e->parent_id >= t->capacity) continue;
-            const RxCapEntry *p = &t->entries[e->parent_id];
-            if (p->generation == e->parent_generation && p->state == RX_CAP_REVOKED) {
-                e->state = RX_CAP_REVOKED;
-                changed = 1;
-            }
-        }
-    }
+    return res;
 }
 
 static int root_revoke(RxCapTable *t, const uint8_t *delivered, RxCapRef authority, RxCapRef r) {
-    const RxCapEntry *auth = NULL;
-    int arc = auth_use(t, delivered, authority, RX_RIGHT_REVOKE, &auth);
-    if (arc != RX_CAP_OK) return arc;
-    if (r.cap_id >= t->capacity) return RX_CAP_ERR_BOUNDS;
-    RxCapEntry *e = &t->entries[r.cap_id];
-    if (e->generation != r.generation) return RX_CAP_ERR_STALE_GEN;
-    if (e->state != RX_CAP_LIVE) return RX_CAP_ERR_STATE;
-    /* A narrower revoker cannot strike a capability that carries privileged
-     * rights the revoker does not itself hold. The office stays put. */
-    if ((e->rights & RX_RIGHT_PRIVILEGED) & ~auth->rights) return RX_CAP_ERR_UNAUTHORIZED;
-    root_begin(t);
-    e->state = RX_CAP_REVOKED;
-    cascade_revoke(t);
-    root_end(t);
-    return RX_CAP_OK;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rev_list[257] = { 0 }, rc = 0;
+    table_to_om2(t, hdr, slots);
+    uint64_t args[4] = { authority.cap_id, authority.generation, r.cap_id, r.generation };
+    (void)omega2_cap_table_revoke(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                                  args, 4, rev_list, 257);
+    int res = (int)(int64_t)rc;
+    if (res == RX_CAP_OK) {
+        root_begin(t);
+        om2_to_table(t, hdr, slots);
+        root_end(t);
+    }
+    return res;
 }
 
 static int root_reclaim(RxCapTable *t, const uint8_t *delivered, uint8_t *delivered_mut,
                         RxCapRef authority, uint32_t id) {
-    int arc = auth_use(t, delivered, authority, RX_RIGHT_RECLAIM, NULL);
-    if (arc != RX_CAP_OK) return arc;
-    if (id >= t->capacity) return RX_CAP_ERR_BOUNDS;
-    RxCapEntry *e = &t->entries[id];
-    if (e->state != RX_CAP_REVOKED) return RX_CAP_ERR_STATE;
-    uint64_t next = 0;
-    int grc = rx_cap_generation_advance(e->generation, &next);
-    if (grc != RX_CAP_OK) return grc;
-    root_begin(t);
-    e->generation = next;
-    e->state = RX_CAP_FREE;
-    e->rights = 0;
-    e->lease_expiry = 0;
-    e->parent_id = UINT32_MAX;
-    e->parent_generation = 0;
-    delivered_mut[id] = 0;
-    root_end(t);
-    return RX_CAP_OK;
+    (void)delivered;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    table_to_om2(t, hdr, slots);
+    uint64_t args[3] = { authority.cap_id, authority.generation, id };
+    (void)omega2_cap_table_reclaim(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered_mut, RX_CAP_MAX,
+                                   args, 3);
+    int res = (int)(int64_t)rc;
+    if (res == RX_CAP_OK) {
+        root_begin(t);
+        om2_to_table(t, hdr, slots);
+        root_end(t);
+    }
+    return res;
 }
 
 static int root_clock(RxCapTable *t, const uint8_t *delivered, RxCapRef authority, uint64_t ticks) {
-    int arc = auth_use(t, delivered, authority, RX_RIGHT_CLOCK, NULL);
-    if (arc != RX_CAP_OK) return arc;
-    uint64_t now = atomic_load_explicit(&t->clock, memory_order_relaxed);
-    uint64_t next = 0;
-    int rc = rx_cap_add_u64(now, ticks, &next);
-    if (rc != RX_CAP_OK) return rc;
-    root_begin(t);
-    atomic_store_explicit(&t->clock, next, memory_order_relaxed);
-    root_end(t);
-    return RX_CAP_OK;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    table_to_om2(t, hdr, slots);
+    uint64_t args[3] = { authority.cap_id, authority.generation, ticks };
+    (void)omega2_cap_table_clock(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                                 args, 3);
+    int res = (int)(int64_t)rc;
+    if (res == RX_CAP_OK) {
+        root_begin(t);
+        atomic_store_explicit(&t->clock, hdr[2], memory_order_relaxed);
+        root_end(t);
+    }
+    return res;
 }
 
 static int root_epoch(RxCapTable *t, const uint8_t *delivered, RxCapRef authority) {
-    int arc = auth_use(t, delivered, authority, RX_RIGHT_EPOCH, NULL);
-    if (arc != RX_CAP_OK) return arc;
-    uint64_t now = atomic_load_explicit(&t->epoch, memory_order_relaxed);
-    uint64_t next = 0;
-    int rc = rx_cap_add_u64(now, 1, &next);
-    if (rc != RX_CAP_OK) return rc;
-    root_begin(t);
-    atomic_store_explicit(&t->epoch, next, memory_order_relaxed);
-    root_end(t);
-    return RX_CAP_OK;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    table_to_om2(t, hdr, slots);
+    (void)omega2_cap_table_epoch(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                                 authority.cap_id, authority.generation);
+    int res = (int)(int64_t)rc;
+    if (res == RX_CAP_OK) {
+        root_begin(t);
+        atomic_store_explicit(&t->epoch, hdr[1], memory_order_relaxed);
+        root_end(t);
+    }
+    return res;
 }
 
 static int read_full(int fd, void *buf, size_t n) {
@@ -596,14 +545,16 @@ int rx_caproot_inspect(const RxCapRoot *root, RxCapRef ref, RxCapEntry *out) {
             if (writer_dead(root)) return RX_CAP_ERR_IO;
             continue;
         }
-        RxCapEntry e;
-        memcpy(&e, (const void *)&t->entries[ref.cap_id], sizeof(e));
+        uint64_t hdr[4], slots[RX_CAP_MAX * 13];
+        table_to_om2(t, hdr, slots);
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&t->seq, memory_order_relaxed) != s0) continue;
-        if (e.generation != ref.generation) return RX_CAP_ERR_STALE_GEN;
-        if (e.state == RX_CAP_FREE) return RX_CAP_ERR_STATE;
-        if (out) *out = e;
-        return RX_CAP_OK;
+        uint64_t ent[13] = { 0 }, rc = 0;
+        (void)omega2_cap_table_inspect(&rc, hdr, 4, slots, RX_CAP_MAX * 13,
+                                       ref.cap_id, ref.generation, ent, 13);
+        int res = (int)(int64_t)rc;
+        if (res == RX_CAP_OK && out) om2_unpack_entry(ent, out);
+        return res;
     }
 }
 
@@ -618,38 +569,16 @@ int rx_caproot_validate(const RxCapRoot *root, RxCapRef ref,
             if (writer_dead(root)) return RX_CAP_ERR_IO;
             continue;
         }
-        RxCapEntry chain[RX_CAP_MAX_DEPTH + 1];
-        uint32_t n = 0;
-        uint32_t id = ref.cap_id;
-        int rc = RX_CAP_OK;
-        while (id != UINT32_MAX) {
-            if (n > RX_CAP_MAX_DEPTH || id >= RX_CAP_MAX) { rc = RX_CAP_ERR_CHAIN; break; }
-            memcpy(&chain[n], (const void *)&t->entries[id], sizeof(RxCapEntry));
-            id = chain[n].parent_id;
-            n++;
-        }
-        uint64_t epoch = atomic_load_explicit(&t->epoch, memory_order_relaxed);
-        uint64_t clock = atomic_load_explicit(&t->clock, memory_order_relaxed);
+        uint64_t hdr[4], slots[RX_CAP_MAX * 13];
+        table_to_om2(t, hdr, slots);
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&t->seq, memory_order_relaxed) != s0) continue;
-        if (rc != RX_CAP_OK) return rc;
-
-        const RxCapEntry *e = &chain[0];
-        if (e->generation != ref.generation) return RX_CAP_ERR_STALE_GEN;
-        if (e->state != RX_CAP_LIVE) return RX_CAP_ERR_REVOKED;
-        if (e->epoch != epoch) return RX_CAP_ERR_EPOCH;
-        if (e->lease_expiry && clock >= e->lease_expiry) return RX_CAP_ERR_EXPIRED;
-        for (uint32_t i = 1; i < n; i++) {
-            if (chain[i].generation != chain[i - 1].parent_generation) return RX_CAP_ERR_CHAIN;
-            if (chain[i].state != RX_CAP_LIVE) return RX_CAP_ERR_CHAIN;
-            if (chain[i].epoch != epoch) return RX_CAP_ERR_CHAIN;
-            if (chain[i].lease_expiry && clock >= chain[i].lease_expiry) return RX_CAP_ERR_CHAIN;
-        }
-        if (e->subject != subject) return RX_CAP_ERR_SUBJECT;
-        if (e->resource != resource) return RX_CAP_ERR_RESOURCE;
-        if ((e->rights & rights) != rights) return RX_CAP_ERR_RIGHTS;
-        if (out_entry) *out_entry = *e;
-        return RX_CAP_OK;
+        uint64_t args[5] = { ref.cap_id, ref.generation, subject, resource, rights };
+        uint64_t ent[13] = { 0 }, rc = 0;
+        (void)omega2_cap_table_validate(&rc, hdr, 4, slots, RX_CAP_MAX * 13, args, 5, ent, 13);
+        int res = (int)(int64_t)rc;
+        if (res == RX_CAP_OK && out_entry) om2_unpack_entry(ent, out_entry);
+        return res;
     }
 }
 

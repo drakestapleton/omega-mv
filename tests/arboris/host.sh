@@ -76,7 +76,8 @@ compile "$out/compute-lock" "$out/signer-profile.om" gpu/nvidia/native/arboris/c
 compile "$out/capq" om/runtime/rx_capq_core.om seed/authority/capq.om tests/arboris/capq.om
 "$out/capq"
 compile "$out/caproot-check" seed/authority/caproot.om tests/arboris/caproot-check.om
-cc -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/caproot_issuer.c src/runtime/rx_caproot.c -o "$out/caproot-issuer"
+cc -O1 -c src/omega_om_units.c -o "$out/units.o"
+cc -D_GNU_SOURCE -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/caproot_issuer.c src/runtime/rx_caproot.c "$out/units.o" -o "$out/caproot-issuer"
 "$out/caproot-issuer" "$out/caproot-check"
 compile "$out/wave-qmd" om/gpu/bw_qmd.om om/blackwell_arboris_qmd.om tests/arboris/wave-qmd.om
 "$out/wave-qmd"
@@ -96,7 +97,6 @@ diff -u tests/arboris/spread-sm121.dis "$out/wave.dis"
 echo "c9c1f2a6c5c7de7f8379d85d8bba1ad49e20479c76d0dde70b1fca1becfeba5b  $out/relax.bin" | sha256sum -c -
 "$dis" -b SM121 "$out/relax.bin" > "$out/relax.dis"
 diff -u tests/arboris/relax-sm121.dis "$out/relax.dis"
-cc -O1 -c src/omega_om_units.c -o "$out/units.o"
 cc -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/scoreboard_oracle.c src/omega_bw_hazard.c "$out/units.o" -o "$out/check-wave"
 "$out/check-wave" < "$out/wave.bin"
 "$out/check-wave" < "$out/relax.bin"

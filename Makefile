@@ -474,7 +474,7 @@ AIENOS_LOCK_REPO ?= ../aienos-argus-cap
 # AIENOS_LOCK is the validated commit parsed at the top of this Makefile.
 AIENOS_R7_DEFAULT = $(OUT_DIR)/aienos-authority/$(AIENOS_LOCK)
 AIENOS_R7_DIR ?= $(AIENOS_R7_DEFAULT)
-AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/$(AIENOS_LOCK)/libaienos_capability.a
+AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/libaienos_capability_om2.a
 # $(call aienos_source,<subpaths>): materialize into the default cache, or prove the override.
 aienos_source = if [ "$(AIENOS_R7_DIR)" = "$(AIENOS_R7_DEFAULT)" ]; then \
 		AIENOS_LOCK_REPO="$(AIENOS_LOCK_REPO)" AIENOS_LOCK='$(AIENOS_LOCK)' AIENOS_R7_DIR= bash tools/aienos_lock_source.sh materialize "$(AIENOS_R7_DIR)" $(1); \
@@ -492,16 +492,13 @@ RX_R7_TEST = $(OUT_DIR)/rx_r7_native_test
 aienos-authority-capability:
 	@$(call aienos_source,native/capability)
 
-# Built out of tree from the proven source into a fresh directory on every build; the
-# library is replaced only when its bytes change (ar is deterministic), so nothing relinks
-# when nothing changed and no stale or planted object is ever reused. The inner make is
-# called by name with MAKEFLAGS cleared: the outer command line (CFLAGS=..., -n, -W)
-# never reaches the authority build, and a dry run (make -n) only prints this recipe.
-$(AIENOS_CAP_LIB): aienos-authority-capability
-	@t=$$(mktemp -d "$${TMPDIR:-/tmp}/aienos-cap.XXXXXX") && \
-	env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make -s -C $(AIENOS_R7_DIR)/native/capability OUT=$$t $$t/libaienos_capability.a >/dev/null && \
-	mkdir -p $(dir $@) && { cmp -s $$t/libaienos_capability.a $@ || cp $$t/libaienos_capability.a $@; }; \
-	rc=$$?; rm -rf $$t; exit $$rc
+# Pure seeded OM-2 capability authority (seed/authority/cap_table_om2.om via
+# src/runtime/aienos_cap_om2.c). Severs the external libaienos_capability.a / aienos.lock dependency.
+AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/libaienos_capability_om2.a
+$(AIENOS_CAP_LIB): src/runtime/aienos_cap_om2.c src/runtime/aienos_cap.h src/runtime/rx_caproot.h src/omega_native.h | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $(dir $@)/aienos_cap_om2.o src/runtime/aienos_cap_om2.c
+	$(AR) rcs $@ $(dir $@)/aienos_cap_om2.o
 
 # OMEGA_EFFECT_CAP64 (spec/effect-cap64-migration.md): effect objects carry the
 # full 64-bit Aienux capability generation. Physics-free: the Omega core, the

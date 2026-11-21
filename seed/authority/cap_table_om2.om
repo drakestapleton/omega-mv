@@ -1,0 +1,536 @@
+om2
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure seeded OM-2 256-slot capability authority table (ADR 0014 / ADR 0016).
+note Replaces the C capability table state machine in src/runtime/rx_caproot.c
+note and the external libaienos_capability.a (aienos.lock) dependency.
+note
+note Table layout:
+note   hdr[4]:   0=capacity (256), 1=epoch, 2=clock, 3=killed (0/1)
+note   slots[256 * 13 = 3328]: per slot (stride 13):
+note     0=cap_id, 1=generation, 2=state (0=FREE,1=LIVE,2=REVOKED),
+note     3=issuer, 4=subject, 5=rights, 6=resource, 7=epoch,
+note     8=lease_expiry, 9=parent_id (0xffffffff=none), 10=parent_gen,
+note     11=minted_by_id, 12=minted_by_gen
+
+const CAP_MAX ulong 256
+const CAP_MAX_DEPTH ulong 8
+const CAP_STRIDE ulong 13
+const CAP_NONE ulong 0xffffffff
+const CAP_U64_MAX ulong 0xffffffffffffffff
+
+const STATE_FREE ulong 0
+const STATE_LIVE ulong 1
+const STATE_REVOKED ulong 2
+
+const RIGHT_DELEGATE ulong 0x8
+const RIGHT_MINT ulong 0x10
+const RIGHT_REVOKE ulong 0x20
+const RIGHT_RECLAIM ulong 0x40
+const RIGHT_EPOCH ulong 0x80
+const RIGHT_CLOCK ulong 0x100
+const RIGHT_PRIVILEGED ulong 0x3f0
+const RIGHT_KNOWN ulong 0x3ff
+
+const ERR_OK long 0
+const ERR_BOUNDS long -1
+const ERR_STALE_GEN long -2
+const ERR_REVOKED long -3
+const ERR_EPOCH long -4
+const ERR_SUBJECT long -5
+const ERR_RESOURCE long -6
+const ERR_RIGHTS long -7
+const ERR_EXPIRED long -8
+const ERR_CHAIN long -9
+const ERR_AMPLIFY long -10
+const ERR_NOT_DELEGABLE long -11
+const ERR_FULL long -12
+const ERR_IO long -13
+const ERR_STATE long -14
+const ERR_UNAUTHORIZED long -15
+const ERR_OVERFLOW long -16
+const ERR_EXHAUSTED long -17
+
+note Constant-time 32-byte office token comparison. Returns 1 if equal, 0 else.
+export fn cap_token_eq a view uchar 32 b view uchar 32 to ulong
+  diff = ulong 0
+  for i ulong 32
+    x = ulong get a i
+    y = ulong get b i
+    diff = or diff xor x y
+  end
+  if eq diff 0
+    ret 1
+  end
+  ret 0
+end
+
+note Overflow-checked u64 addition. Returns 0 on ok, -16 on overflow.
+export fn cap_add_u64 a ulong b ulong dst edit ulong 1 to long
+  if gt b sub CAP_U64_MAX a
+    ret ERR_OVERFLOW
+  end
+  put dst 0 add a b
+  ret ERR_OK
+end
+
+note Generation advance; fails closed at UINT64_MAX (-17).
+export fn cap_gen_advance gen ulong dst edit ulong 1 to long
+  if eq gen CAP_U64_MAX
+    ret ERR_EXHAUSTED
+  end
+  put dst 0 add gen 1
+  ret ERR_OK
+end
+
+fn slot_off id ulong to ulong
+  ret mul id CAP_STRIDE
+end
+
+fn chain_ok hdr view ulong 4 slots view ulong 3328 start_id ulong to long
+  cap = get hdr 0
+  epoch = get hdr 1
+  clock = get hdr 2
+  cur = start_id
+  for depth ulong 9
+    base = slot_off cur
+    pid = get slots add base 9
+    if eq pid CAP_NONE
+      ret ERR_OK
+    end
+    if ge depth CAP_MAX_DEPTH
+      ret ERR_CHAIN
+    end
+    if ge pid cap
+      ret ERR_CHAIN
+    end
+    pgen = get slots add base 10
+    pbase = slot_off pid
+    if ne get slots add pbase 1 pgen
+      ret ERR_CHAIN
+    end
+    if ne get slots add pbase 2 STATE_LIVE
+      ret ERR_CHAIN
+    end
+    if ne get slots add pbase 7 epoch
+      ret ERR_CHAIN
+    end
+    pexp = get slots add pbase 8
+    if ne pexp 0
+      if ge clock pexp
+        ret ERR_CHAIN
+      end
+    end
+    cur = pid
+  end
+  ret ERR_CHAIN
+end
+
+fn ancestor_hops hdr view ulong 4 slots view ulong 3328 start_id ulong to ulong
+  cap = get hdr 0
+  cur = start_id
+  hops = ulong 0
+  for step ulong 9
+    base = slot_off cur
+    pid = get slots add base 9
+    if eq pid CAP_NONE
+      ret hops
+    end
+    if ge pid cap
+      ret add CAP_MAX_DEPTH 1
+    end
+    hops = add hops 1
+    cur = pid
+  end
+  ret add CAP_MAX_DEPTH 1
+end
+
+fn auth_check hdr view ulong 4 slots view ulong 3328 delivered view uchar 256 aid ulong agen ulong need ulong to long
+  if ne get hdr 3 0
+    ret ERR_IO
+  end
+  cap = get hdr 0
+  if ge aid cap
+    ret ERR_UNAUTHORIZED
+  end
+  if eq get delivered aid uchar 0
+    ret ERR_UNAUTHORIZED
+  end
+  base = slot_off aid
+  if ne get slots add base 1 agen
+    ret ERR_STALE_GEN
+  end
+  if ne get slots add base 2 STATE_LIVE
+    ret ERR_REVOKED
+  end
+  if ne get slots add base 7 get hdr 1
+    ret ERR_EPOCH
+  end
+  exp = get slots add base 8
+  if ne exp 0
+    if ge get hdr 2 exp
+      ret ERR_EXPIRED
+    end
+  end
+  if ne chain_ok hdr slots aid ERR_OK
+    ret ERR_CHAIN
+  end
+  rights = get slots add base 5
+  if ne and rights need need
+    ret ERR_UNAUTHORIZED
+  end
+  if ne and need RIGHT_PRIVILEGED 0
+    if ne get slots add base 6 0
+      ret ERR_RESOURCE
+    end
+  end
+  ret ERR_OK
+end
+
+note Initialize capability table and bootstrap office at slot 0.
+export fn cap_table_init hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 boot_gen ulong to long
+  if or eq boot_gen 0 eq boot_gen CAP_U64_MAX
+    ret ERR_EXHAUSTED
+  end
+  put hdr 0 CAP_MAX
+  put hdr 1 1
+  put hdr 2 0
+  put hdr 3 0
+  for i ulong 256
+    put delivered i uchar 0
+    base = slot_off i
+    put slots base i
+    put slots add base 1 boot_gen
+    put slots add base 2 STATE_FREE
+    put slots add base 3 0
+    put slots add base 4 0
+    put slots add base 5 0
+    put slots add base 6 0
+    put slots add base 7 0
+    put slots add base 8 0
+    put slots add base 9 CAP_NONE
+    put slots add base 10 0
+    put slots add base 11 0
+    put slots add base 12 0
+  end
+  put slots 2 STATE_LIVE
+  put slots 5 RIGHT_PRIVILEGED
+  put slots 7 1
+  put delivered 0 uchar 1
+  ret ERR_OK
+end
+
+note Validate cap reference against (subject, resource, rights).
+note args[5]: 0=cap_id, 1=gen, 2=subject, 3=resource, 4=rights.
+export fn cap_table_validate hdr view ulong 4 slots view ulong 3328 args view ulong 5 out_slot edit ulong 13 to long
+  if ne get hdr 3 0
+    ret ERR_IO
+  end
+  id = get args 0
+  if ge id get hdr 0
+    ret ERR_BOUNDS
+  end
+  base = slot_off id
+  if ne get slots add base 1 get args 1
+    ret ERR_STALE_GEN
+  end
+  if ne get slots add base 2 STATE_LIVE
+    ret ERR_REVOKED
+  end
+  if ne get slots add base 7 get hdr 1
+    ret ERR_EPOCH
+  end
+  exp = get slots add base 8
+  if ne exp 0
+    if ge get hdr 2 exp
+      ret ERR_EXPIRED
+    end
+  end
+  if ne chain_ok hdr slots id ERR_OK
+    ret ERR_CHAIN
+  end
+  if ne get slots add base 4 get args 2
+    ret ERR_SUBJECT
+  end
+  if ne get slots add base 6 get args 3
+    ret ERR_RESOURCE
+  end
+  need = get args 4
+  if ne and get slots add base 5 need need
+    ret ERR_RIGHTS
+  end
+  for k ulong 13
+    put out_slot k get slots add base k
+  end
+  ret ERR_OK
+end
+
+note Inspect a table entry if generation matches and slot is not FREE.
+export fn cap_table_inspect hdr view ulong 4 slots view ulong 3328 cap_id ulong gen ulong out_slot edit ulong 13 to long
+  if ne get hdr 3 0
+    ret ERR_IO
+  end
+  if ge cap_id get hdr 0
+    ret ERR_BOUNDS
+  end
+  base = slot_off cap_id
+  if ne get slots add base 1 gen
+    ret ERR_STALE_GEN
+  end
+  if eq get slots add base 2 STATE_FREE
+    ret ERR_STATE
+  end
+  for k ulong 13
+    put out_slot k get slots add base k
+  end
+  ret ERR_OK
+end
+
+note Check authority reference possession and rights (used for shutdown etc.).
+note args[3]: 0=auth_id, 1=auth_gen, 2=need_rights.
+export fn cap_table_auth_use hdr view ulong 4 slots view ulong 3328 delivered view uchar 256 args view ulong 3 to long
+  ret auth_check hdr slots delivered get args 0 get args 1 get args 2
+end
+
+fn mint_check_auth hdr view ulong 4 slots view ulong 3328 delivered view uchar 256 req view ulong 9 to long
+  rights = get req 3
+  if or eq rights 0 ne and rights xor RIGHT_KNOWN CAP_U64_MAX 0
+    ret ERR_RIGHTS
+  end
+  if and ne and rights RIGHT_PRIVILEGED 0 ne and rights RIGHT_DELEGATE 0
+    ret ERR_NOT_DELEGABLE
+  end
+  pid = get req 5
+  aid = get req 7
+  agen = get req 8
+  if eq pid CAP_NONE
+    arc = auth_check hdr slots delivered aid agen RIGHT_MINT
+    if ne arc ERR_OK
+      ret arc
+    end
+    arights = get slots add slot_off aid 5
+    if ne and and rights RIGHT_PRIVILEGED xor arights CAP_U64_MAX 0
+      ret ERR_UNAUTHORIZED
+    end
+    ret ERR_OK
+  end
+  if or ne aid pid ne agen get req 6
+    ret ERR_UNAUTHORIZED
+  end
+  arc = auth_check hdr slots delivered aid agen 0
+  if ne arc ERR_OK
+    ret arc
+  end
+  pbase = slot_off pid
+  prights = get slots add pbase 5
+  if eq and prights RIGHT_DELEGATE 0
+    ret ERR_NOT_DELEGABLE
+  end
+  if ne get slots add pbase 6 get req 2
+    ret ERR_RESOURCE
+  end
+  if ne and rights xor prights CAP_U64_MAX 0
+    ret ERR_AMPLIFY
+  end
+  if ne and rights RIGHT_PRIVILEGED 0
+    ret ERR_NOT_DELEGABLE
+  end
+  if ge ancestor_hops hdr slots pid CAP_MAX_DEPTH
+    ret ERR_CHAIN
+  end
+  pexp = get slots add pbase 8
+  if ne pexp 0
+    lticks = get req 4
+    if eq lticks 0
+      ret ERR_AMPLIFY
+    end
+    clk = get hdr 2
+    if gt lticks sub CAP_U64_MAX clk
+      ret ERR_OVERFLOW
+    end
+    if gt add clk lticks pexp
+      ret ERR_AMPLIFY
+    end
+  end
+  ret ERR_OK
+end
+
+fn mint_fill_slot slots edit ulong 3328 req view ulong 9 idx ulong epoch ulong exp ulong to void
+  base = slot_off idx
+  pid = get req 5
+  pgen = ulong 0
+  if ne pid CAP_NONE
+    pgen = get req 6
+  end
+  put slots add base 2 STATE_LIVE
+  put slots add base 3 get req 0
+  put slots add base 4 get req 1
+  put slots add base 5 get req 3
+  put slots add base 6 get req 2
+  put slots add base 7 epoch
+  put slots add base 8 exp
+  put slots add base 9 pid
+  put slots add base 10 pgen
+  put slots add base 11 get req 7
+  put slots add base 12 get req 8
+end
+
+note Mint a root-issued or delegated capability.
+note req[9]: 0=issuer, 1=subject, 2=resource, 3=rights, 4=lease_ticks,
+note         5=parent_id, 6=parent_gen, 7=auth_id, 8=auth_gen.
+export fn cap_table_mint hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 req view ulong 9 out_ref edit ulong 2 to long
+  arc = mint_check_auth hdr slots delivered req
+  if ne arc ERR_OK
+    ret arc
+  end
+  exp = ulong 0
+  if ne get req 4 0
+    if gt get req 4 sub CAP_U64_MAX get hdr 2
+      ret ERR_OVERFLOW
+    end
+    exp = add get hdr 2 get req 4
+  end
+  saw_exh = ulong 0
+  for i ulong get hdr 0 bound 256
+    base = slot_off i
+    if eq get slots add base 2 STATE_FREE
+      gen = get slots add base 1
+      if eq gen CAP_U64_MAX
+        saw_exh = ulong 1
+      else
+        mint_fill_slot slots req i get hdr 1 exp
+        put delivered i uchar 1
+        put out_ref 0 i
+        put out_ref 1 gen
+        ret ERR_OK
+      end
+    end
+  end
+  if ne saw_exh 0
+    ret ERR_EXHAUSTED
+  end
+  ret ERR_FULL
+end
+
+fn cascade_revoke_step slots edit ulong 3328 cap ulong rev_list edit ulong 257 to ulong
+  changed = ulong 0
+  for i ulong cap bound 256
+    base = slot_off i
+    if eq get slots add base 2 STATE_LIVE
+      pid = get slots add base 9
+      if ne pid CAP_NONE
+        if lt pid cap
+          pbase = slot_off pid
+          pgen = get slots add pbase 1
+          if eq pgen get slots add base 10
+            if eq get slots add pbase 2 STATE_REVOKED
+              put slots add base 2 STATE_REVOKED
+              cnt = add get rev_list 0 1
+              put rev_list 0 cnt
+              if le cnt 256
+                put rev_list cnt i
+              end
+              changed = ulong 1
+            end
+          end
+        end
+      end
+    end
+  end
+  ret changed
+end
+
+note Revoke target capability and cascade to all live descendants.
+note args[4]: 0=auth_id, 1=auth_gen, 2=target_id, 3=target_gen.
+note rev_list[257]: rev_list[0]=count, rev_list[1..count]=revoked slot ids.
+export fn cap_table_revoke hdr edit ulong 4 slots edit ulong 3328 delivered view uchar 256 args view ulong 4 rev_list edit ulong 257 to long
+  put rev_list 0 0
+  aid = get args 0
+  arc = auth_check hdr slots delivered aid get args 1 RIGHT_REVOKE
+  if ne arc ERR_OK
+    ret arc
+  end
+  tid = get args 2
+  cap = get hdr 0
+  if ge tid cap
+    ret ERR_BOUNDS
+  end
+  tbase = slot_off tid
+  if ne get slots add tbase 1 get args 3
+    ret ERR_STALE_GEN
+  end
+  if ne get slots add tbase 2 STATE_LIVE
+    ret ERR_STATE
+  end
+  tr = and get slots add tbase 5 RIGHT_PRIVILEGED
+  ar = xor get slots add slot_off aid 5 CAP_U64_MAX
+  if ne and tr ar 0
+    ret ERR_UNAUTHORIZED
+  end
+  put slots add tbase 2 STATE_REVOKED
+  put rev_list 0 1
+  put rev_list 1 tid
+  for pass ulong 256
+    if eq cascade_revoke_step slots cap rev_list 0
+      break
+    end
+  end
+  ret ERR_OK
+end
+
+note Reclaim a revoked slot back to FREE, advancing its generation.
+note args[3]: 0=auth_id, 1=auth_gen, 2=cap_id.
+export fn cap_table_reclaim hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 args view ulong 3 to long
+  arc = auth_check hdr slots delivered get args 0 get args 1 RIGHT_RECLAIM
+  if ne arc ERR_OK
+    ret arc
+  end
+  id = get args 2
+  if ge id get hdr 0
+    ret ERR_BOUNDS
+  end
+  base = slot_off id
+  if ne get slots add base 2 STATE_REVOKED
+    ret ERR_STATE
+  end
+  gen = get slots add base 1
+  if eq gen CAP_U64_MAX
+    ret ERR_EXHAUSTED
+  end
+  put slots add base 1 add gen 1
+  put slots add base 2 STATE_FREE
+  put slots add base 5 0
+  put slots add base 8 0
+  put slots add base 9 CAP_NONE
+  put slots add base 10 0
+  put delivered id uchar 0
+  ret ERR_OK
+end
+
+note Advance logical lease clock. args[3]: 0=auth_id, 1=auth_gen, 2=ticks.
+export fn cap_table_clock hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 args view ulong 3 to long
+  arc = auth_check hdr slots delivered get args 0 get args 1 RIGHT_CLOCK
+  if ne arc ERR_OK
+    ret arc
+  end
+  now = get hdr 2
+  ticks = get args 2
+  if gt ticks sub CAP_U64_MAX now
+    ret ERR_OVERFLOW
+  end
+  put hdr 2 add now ticks
+  ret ERR_OK
+end
+
+note Bump capability epoch.
+export fn cap_table_epoch hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 aid ulong agen ulong to long
+  arc = auth_check hdr slots delivered aid agen RIGHT_EPOCH
+  if ne arc ERR_OK
+    ret arc
+  end
+  now = get hdr 1
+  if eq now CAP_U64_MAX
+    ret ERR_OVERFLOW
+  end
+  put hdr 1 add now 1
+  ret ERR_OK
+end

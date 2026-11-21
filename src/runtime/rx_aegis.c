@@ -24,6 +24,7 @@
  */
 #include "rx_aegis.h"
 #include "rx_argus.h"
+#include "omega_native.h"
 
 #include <string.h>
 
@@ -42,35 +43,35 @@ static void put(RxCtx *c, RxObjRef o, uint32_t field, uint64_t v) {
     c->out[c->n_out++] = (RxMutation){ o, field, v };
 }
 
-/* ---- policy ---- */
+/* ---- policy (pure OM-2 in seed/authority/aegis_om2.om) ---- */
+
+static void pack_rules(const RxAegisPolicy *p, uint64_t out[112]) {
+    memset(out, 0, 112 * sizeof(uint64_t));
+    uint32_t n = p->n_rules < RX_AEGIS_RULES ? p->n_rules : RX_AEGIS_RULES;
+    for (uint32_t i = 0; i < n; i++) {
+        const RxAegisRule *r = &p->rules[i];
+        out[i * 7 + 0] = r->id;
+        out[i * 7 + 1] = r->subject;
+        out[i * 7 + 2] = r->res_lo;
+        out[i * 7 + 3] = r->res_hi;
+        out[i * 7 + 4] = r->rights;
+        out[i * 7 + 5] = r->max_lease;
+        out[i * 7 + 6] = r->needs_approval;
+    }
+}
 
 uint32_t rx_aegis_evaluate(const RxAegisPolicy *p, uint32_t subject, uint64_t resource,
                            uint32_t rights, uint64_t lease, uint64_t *out_lease,
                            uint32_t *rule_or_why, uint32_t *needs_approval) {
-    *out_lease = 0;
-    *needs_approval = 0;
-    if (rights == 0 || (rights & ~RX_RIGHT_KNOWN)) {
-        *rule_or_why = RX_AEGIS_WHY_BAD_REQUEST;
-        return RX_AEGIS_DENY;
-    }
-    if (rights & RX_RIGHT_PRIVILEGED) {
-        *rule_or_why = RX_AEGIS_WHY_PRIVILEGED;
-        return RX_AEGIS_DENY;
-    }
-    for (uint32_t i = 0; i < p->n_rules; i++) {
-        const RxAegisRule *r = &p->rules[i];
-        if (r->subject != subject || resource < r->res_lo || resource > r->res_hi) continue;
-        if (rights & ~r->rights) continue;
-        uint64_t l = lease;
-        if (r->max_lease && (l == 0 || l > r->max_lease)) l = r->max_lease;
-        if (!r->max_lease) l = lease;
-        *out_lease = l;
-        *rule_or_why = r->id;
-        *needs_approval = r->needs_approval;
-        return RX_AEGIS_GRANT;
-    }
-    *rule_or_why = RX_AEGIS_WHY_NO_RULE;
-    return RX_AEGIS_DENY;
+    uint64_t rules[112];
+    pack_rules(p, rules);
+    uint64_t req[4] = { subject, resource, rights, lease };
+    uint64_t res[3] = { 0, 0, 0 }, verdict = 0;
+    (void)omega2_aegis_evaluate(&verdict, rules, 112, p->n_rules, req, 4, res, 3);
+    *out_lease = res[0];
+    *rule_or_why = (uint32_t)res[1];
+    *needs_approval = (uint32_t)res[2];
+    return (uint32_t)verdict;
 }
 
 /* ---- aegis.decide.k ---- */
@@ -84,47 +85,20 @@ static int fn_decide(RxCtx *c) {
     const RxSnapshotDep *ap = in_of(c, o->approval);
     const RxSnapshotDep *dec = in_of(c, o->decision);
     if (!req || !ap || !dec) return -1;
-    uint64_t seq = req->field[0];
-    if (seq == 0) return 0;
-    if (dec->field[0] == seq) {
-        if (dec->field[1] != RX_AEGIS_ESCALATE) return 0;   /* already decided */
-        if (ap->field[0] != seq) return 0;                  /* still waiting for a human */
-    }
-    uint64_t res = req->field[1], lease = 0, op = req->field[5], slot = req->field[4];
-    uint32_t rights = (uint32_t)req->field[2], why = 0, na = 0, verdict;
-    if (slot >= RX_AEGIS_SLOTS || req->field[2] > UINT32_MAX ||
-        (op != RX_AEGIS_OP_ACQUIRE && op != RX_AEGIS_OP_RELEASE)) {
-        verdict = RX_AEGIS_DENY;
-        why = RX_AEGIS_WHY_BAD_REQUEST;
-        rights = 0;
-    } else if (op == RX_AEGIS_OP_RELEASE) {
-        verdict = RX_AEGIS_REVOKE;
-        rights = 0;
-    } else {
-        verdict = rx_aegis_evaluate(&f->policy, f->client[k].subject, res, rights,
-                                    req->field[3], &lease, &why, &na);
-        if (verdict == RX_AEGIS_GRANT && na) {
-            if (ap->field[0] != seq) verdict = RX_AEGIS_ESCALATE;
-            else if (ap->field[1] != RX_AEGIS_APPROVE) {
-                verdict = RX_AEGIS_DENY;
-                why = RX_AEGIS_WHY_HUMAN;
-            }
-        }
-        if (verdict != RX_AEGIS_GRANT && verdict != RX_AEGIS_ESCALATE) { rights = 0; lease = 0; }
-    }
-    /* ARGUS: a policy refusal. GRANT and REVOKE become real at root.install;
-     * ESCALATE has no ABI v1 kind. A repeated (invalidated) run re-emits. */
-    if (verdict == RX_AEGIS_DENY)
-        RX_ARGUS_EMIT(rx_argus_emit_cap_denied(aegis_view(f), f->client[k].subject, ARGUS_CAP_NONE, 0, res,
-                                               (uint32_t)req->field[2], (int)why));
-    put(c, o->decision, 0, seq);
-    put(c, o->decision, 1, verdict);
-    put(c, o->decision, 2, res);
-    put(c, o->decision, 3, rights);
-    put(c, o->decision, 4, lease);
-    put(c, o->decision, 5, slot);
-    put(c, o->decision, 6, why);
-    put(c, o->decision, 7, op);
+    uint64_t rules[112];
+    pack_rules(&f->policy, rules);
+    uint64_t in_f[10] = {
+        req->field[0], req->field[1], req->field[2], req->field[3], req->field[4], req->field[5],
+        ap->field[0], ap->field[1], dec->field[0], dec->field[1]
+    };
+    uint64_t out_dec[8] = { 0 }, emit = 0;
+    (void)omega2_aegis_decide(&emit, rules, 112, f->policy.n_rules, f->client[k].subject,
+                              in_f, 10, out_dec, 8);
+    if (!emit) return 0;
+    if (out_dec[1] == RX_AEGIS_DENY)
+        RX_ARGUS_EMIT(rx_argus_emit_cap_denied(aegis_view(f), f->client[k].subject, ARGUS_CAP_NONE, 0,
+                                               out_dec[2], (uint32_t)req->field[2], (int)out_dec[6]));
+    for (uint32_t i = 0; i < 8; i++) put(c, o->decision, i, out_dec[i]);
     return 0;
 }
 
@@ -191,10 +165,11 @@ static int fn_install(RxCtx *c) {
         refuse(c, o->slot[j], seq, RX_AEGIS_WHY_REQUEST_ORIGIN);
         return 0;
     }
-    if (dec->field[0] != req->field[0] || dec->field[2] != req->field[1] ||
-        dec->field[5] != req->field[4] || dec->field[7] != req->field[5] ||
-        (dec->field[3] & ~req->field[2])) {
-        refuse(c, o->slot[j], seq, RX_AEGIS_WHY_MISMATCH);
+    uint64_t client_vec[3] = { cl->domain_lo, cl->domain_hi, cl->max_rights };
+    uint64_t chk = 0;
+    (void)omega2_aegis_install_check(&chk, dec->field, 8, req->field, 6, client_vec, 3);
+    if (chk != 0) {
+        refuse(c, o->slot[j], seq, chk);
         return 0;
     }
 
@@ -213,12 +188,6 @@ static int fn_install(RxCtx *c) {
         put(c, o->slot[j], 2, RX_AEGIS_SLOT_REVOKED);
         put(c, o->slot[j], 5, seq);
         put(c, o->slot[j], 7, 0);
-        return 0;
-    }
-
-    if (res < cl->domain_lo || res > cl->domain_hi || (rights & ~cl->max_rights) ||
-        (rights & RX_RIGHT_PRIVILEGED) || rights == 0) {
-        refuse(c, o->slot[j], seq, RX_AEGIS_WHY_DOMAIN);
         return 0;
     }
 

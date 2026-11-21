@@ -410,15 +410,14 @@ int cq_compile(const CqCatalog *c, const CqNeed *need, CqPlan *plan) {
     }
     qsort(plan->ops, plan->n_ops, sizeof plan->ops[0], cmp_u32);
 
-    /* Sources: those that can realize the operation, that the caller allows,
-     * and that the locality allows. */
-    uint32_t s = domains & (need->sources ? need->sources : CQ_SRC_ALL);
+    /* Sources: computed in pure OM-2 (om/runtime/rx_capq_core.om). */
     uint32_t loc = need->locality_constraints.allowed ? need->locality_constraints.allowed
                                                        : (CQ_LOC_LOCAL | CQ_LOC_FABRIC);
-    if (!(loc & CQ_LOC_LOCAL)) s &= CQ_SRC(CQ_SRC_FABRIC);
-    if (!(loc & CQ_LOC_FABRIC)) s &= ~CQ_SRC(CQ_SRC_FABRIC);
     uint32_t pin = need->locality_constraints.machine;
-    if (pin) s &= pin == c->self_machine ? ~CQ_SRC(CQ_SRC_FABRIC) : CQ_SRC(CQ_SRC_FABRIC);
+    uint64_t s64 = 0;
+    (void)omega2_rx_cq_plan_sources(&s64, (uint64_t)domains, (uint64_t)need->sources,
+                                    (uint64_t)loc, (uint64_t)pin, (uint64_t)c->self_machine);
+    uint32_t s = (uint32_t)s64;
     plan->sources = s;
     plan->n_probes = plan->n_ops * (uint32_t)__builtin_popcount(s);
 
@@ -595,9 +594,16 @@ static int machine_live(const CqCatalog *c, uint32_t machine, uint64_t now_us) {
     return map_get(c->mach_key, c->mach_mask, machine, &s) && c->mach_lease[s] > now_us;
 }
 
+/* Weak runtime hooks so Fabric/standalone capq links never require rx_world.o or rx_graph.o. */
+extern int rx_world_validate_cap(const RxWorld *w, RxCapRef ref, uint32_t subject,
+                                 uint64_t resource, uint32_t rights, RxCapEntry *out)
+    __attribute__((weak));
+extern int rx_graph_need_authority(AgGraph *g, uint32_t node, uint64_t resource, uint32_t rights)
+    __attribute__((weak));
+
 static uint32_t held_now(const CqHeld *h, uint64_t resource, uint32_t rights) {
     if (rights == 0) return 1;
-    if (!h || !h->w || !h->caps) return 0;
+    if (!h || !h->w || !h->caps || !rx_world_validate_cap) return 0;
     for (uint32_t i = 0; i < h->caps->n; i++) {
         if (h->caps->cap[i].resource != resource || (rights & ~h->caps->cap[i].rights)) continue;
         RxCapEntry ent;
@@ -640,6 +646,12 @@ int cq_query_admit(const CqCatalog *c, const CqPlan *plan, const CqNeed *need,
     const uint32_t loc = need->locality_constraints.allowed ? need->locality_constraints.allowed
                                                              : (CQ_LOC_LOCAL | CQ_LOC_FABRIC);
     const uint32_t pin = need->locality_constraints.machine;
+    uint64_t need_vec[14] = {
+        loc, pin, need->accepted_input_types, need->required_output_types, need->effect_class,
+        need->authority_ceiling.resource_lo, need->authority_ceiling.resource_hi,
+        need->authority_ceiling.rights, need->latency_budget, need->energy_budget,
+        need->reliability_requirement, need->evidence_requirement, t->max_cost, t->min_confidence
+    };
     uint32_t nf = 0;
     for (uint32_t i = 0; i < plan->n_ops; i++)
         for (uint32_t s = 0; s < CQ_SOURCES; s++) {
@@ -654,21 +666,15 @@ int cq_query_admit(const CqCatalog *c, const CqPlan *plan, const CqNeed *need,
                 }
                 if (e->live != CQ_LIVE_AVAILABLE) { st.rejected_unavailable++; continue; }
                 int local = e->machine_id == c->self_machine;
-                if (!(loc & (local ? CQ_LOC_LOCAL : CQ_LOC_FABRIC))) continue;
-                if (pin && e->machine_id != pin) continue;
-                if (e->in_types & ~need->accepted_input_types) continue;
-                if (need->required_output_types & ~e->out_types) continue;
-                if (e->effects & ~need->effect_class) continue;
-                if (e->auth_rights & ~need->authority_ceiling.rights) continue;
-                if (e->auth_rights && (e->auth_resource < need->authority_ceiling.resource_lo ||
-                                       e->auth_resource > need->authority_ceiling.resource_hi))
-                    continue;
-                if (need->latency_budget && e->latency_us > need->latency_budget) continue;
-                if (need->energy_budget && e->energy_uj > need->energy_budget) continue;
-                if (e->reliability_ppm < need->reliability_requirement) continue;
-                if (e->evidence_level < need->evidence_requirement) continue;
-                if (t->max_cost && e->cost > t->max_cost) continue;
-                if (e->confidence_ppm < t->min_confidence) continue;
+                uint64_t ent_vec[14] = {
+                    e->machine_id, e->in_types, e->out_types, e->effects, e->auth_resource,
+                    e->auth_rights, e->latency_us, e->energy_uj, e->reliability_ppm,
+                    e->evidence_level, e->cost, e->confidence_ppm, (uint64_t)(local ? 1 : 0),
+                    e->live
+                };
+                uint64_t ok = 0;
+                (void)omega2_rx_cq_filter_entry(&ok, ent_vec, 14, need_vec, 14);
+                if (!ok) continue;
                 CqCandidate *x = &feas[nf++];
                 memset(x, 0, sizeof *x);
                 x->capability_id = e->capability_id;
@@ -720,10 +726,12 @@ int cq_bind_skill_node(AgGraph *g, uint32_t node, const CqCandidate *c) {
     if (!g || !c || node >= g->n_nodes || c->skill_id == 0) return CQ_E_ARG;
     if (g->nodes[node].kind != AG_SKILL && g->nodes[node].kind != AG_RETRY) return CQ_E_ARG;
     g->nodes[node].op = c->skill_id;
-    if (c->required_authority.rights &&
-        rx_graph_need_authority(g, node, c->required_authority.resource,
-                                c->required_authority.rights) < 0)
-        return CQ_E_ARG;
+    if (c->required_authority.rights) {
+        if (!rx_graph_need_authority ||
+            rx_graph_need_authority(g, node, c->required_authority.resource,
+                                    c->required_authority.rights) < 0)
+            return CQ_E_ARG;
+    }
     return CQ_OK;
 }
 
@@ -733,14 +741,7 @@ const char *cq_source_name(uint32_t s) {
     return s < CQ_SOURCES ? n[s] : "?";
 }
 
-/* ---- wire form (see rx_capq.h) ---- */
-
-static void w16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
-static void w32(uint8_t *p, uint32_t v) { w16(p, v); w16(p + 2, v >> 16); }
-static void w64(uint8_t *p, uint64_t v) { w32(p, (uint32_t)v); w32(p + 4, (uint32_t)(v >> 32)); }
-static uint32_t r16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
-static uint32_t r32(const uint8_t *p) { return r16(p) | r16(p + 2) << 16; }
-static uint64_t r64(const uint8_t *p) { return (uint64_t)r32(p) | (uint64_t)r32(p + 4) << 32; }
+/* ---- wire form (pure OM-2 codec in om/runtime/rx_capq_core.om) ---- */
 
 static void wire_check(const uint8_t *rec, uint8_t out[4]) {
     uint8_t d[SHA256_DIGEST_SIZE];
@@ -755,32 +756,19 @@ int cq_wire_encode(const CqCatalog *c, const CqEntry *e, uint32_t kind, uint8_t 
         return CQ_E_WIRE;
     AienMachineId m;
     if (cq_machine_identity(c, e->machine_id, &m) != CQ_OK) return CQ_E_NO_IDENTITY;
-    memset(out, 0, CQ_WIRE_BYTES);
-    memcpy(out, "ACGR", 4);
-    out[4] = CQ_WIRE_VERSION;
-    out[5] = (uint8_t)kind;
-    out[6] = e->source;
-    out[7] = e->evidence_level;
-    if (aien_mid_encode(&m, out + 8) != AIEN_MID_OK) return CQ_E_NO_IDENTITY;
-    w32(out + 52, e->capability_id);
-    w32(out + 56, e->realization_id);
-    w32(out + 60, e->skill_id);
-    w32(out + 64, e->skill_version);
-    memcpy(out + 68, e->skill_digest, 32);
-    w32(out + 100, e->op);
-    w16(out + 104, e->effects);
-    w16(out + 106, kind == CQ_WIRE_WITHDRAW ? CQ_LIVE_WITHDRAWN : e->live);
-    w64(out + 108, e->in_types);
-    w64(out + 116, e->out_types);
-    w64(out + 124, e->auth_resource);
-    w32(out + 132, e->auth_rights);
-    w32(out + 136, e->confidence_ppm);
-    w32(out + 140, e->reliability_ppm);
-    w64(out + 144, e->cost);
-    w64(out + 152, e->latency_us);
-    w64(out + 160, e->energy_uj);
-    w64(out + 168, e->evidence_ref);
-    w64(out + 176, e->generation);
+    uint8_t mid_buf[AIEN_MID_RECORD_BYTES];
+    if (aien_mid_encode(&m, mid_buf) != AIEN_MID_OK) return CQ_E_NO_IDENTITY;
+    uint64_t hdr[4] = { kind, e->source, e->evidence_level, e->live };
+    uint64_t fields[17] = {
+        e->capability_id, e->realization_id, e->skill_id, e->skill_version,
+        e->op, e->effects, e->in_types, e->out_types, e->auth_resource,
+        e->auth_rights, e->confidence_ppm, e->reliability_ppm, e->cost,
+        e->latency_us, e->energy_uj, e->evidence_ref, e->generation
+    };
+    uint64_t ok = 0;
+    (void)omega2_rx_cq_wire_encode_body(&ok, hdr, 4, fields, 17, mid_buf, AIEN_MID_RECORD_BYTES,
+                                        e->skill_digest, 32, out, CQ_WIRE_BYTES);
+    if (!ok) return CQ_E_WIRE;
     wire_check(out, out + 184);
     return CQ_OK;
 }
@@ -788,40 +776,38 @@ int cq_wire_encode(const CqCatalog *c, const CqEntry *e, uint32_t kind, uint8_t 
 int cq_wire_decode(const uint8_t *in, size_t len, uint32_t *kind, AienMachineId *machine,
                    CqEntry *out) {
     if (!in || !kind || !machine || !out) return CQ_E_ARG;
-    if (len != CQ_WIRE_BYTES || memcmp(in, "ACGR", 4) != 0 || in[4] != CQ_WIRE_VERSION)
-        return CQ_E_WIRE;
+    if (len != CQ_WIRE_BYTES) return CQ_E_WIRE;
     uint8_t chk[4];
     wire_check(in, chk);
     if (memcmp(chk, in + 184, 4) != 0) return CQ_E_WIRE;
-    uint32_t k = in[5], live = r16(in + 106);
-    if (k < CQ_WIRE_ADVERTISE || k > CQ_WIRE_WITHDRAW || in[6] >= CQ_SOURCES ||
-        in[6] == CQ_SRC_FABRIC || in[7] > CQ_EV_RECEIPT || live > CQ_LIVE_UNAVAILABLE ||
-        (k == CQ_WIRE_WITHDRAW) != (live == CQ_LIVE_WITHDRAWN))
-        return CQ_E_WIRE;
+    uint64_t hdr[4] = { 0 }, fields[17] = { 0 }, ok = 0;
+    uint8_t sdig[32] = { 0 };
+    (void)omega2_rx_cq_wire_decode_body(&ok, in, CQ_WIRE_BYTES, hdr, 4, fields, 17, sdig, 32);
+    if (!ok) return CQ_E_WIRE;
     if (aien_mid_decode(in + 8, AIEN_MID_RECORD_BYTES, machine) != AIEN_MID_OK) return CQ_E_WIRE;
     memset(out, 0, sizeof *out);
-    out->source = in[6];
-    out->evidence_level = in[7];
-    out->capability_id = r32(in + 52);
-    out->realization_id = r32(in + 56);
-    out->skill_id = r32(in + 60);
-    out->skill_version = r32(in + 64);
-    memcpy(out->skill_digest, in + 68, 32);
-    out->op = r32(in + 100);
-    out->effects = (uint16_t)r16(in + 104);
-    out->live = live;
-    out->in_types = r64(in + 108);
-    out->out_types = r64(in + 116);
-    out->auth_resource = r64(in + 124);
-    out->auth_rights = r32(in + 132);
-    out->confidence_ppm = r32(in + 136);
-    out->reliability_ppm = r32(in + 140);
-    out->cost = r64(in + 144);
-    out->latency_us = r64(in + 152);
-    out->energy_uj = r64(in + 160);
-    out->evidence_ref = r64(in + 168);
-    out->generation = r64(in + 176);
-    *kind = k;
+    out->source = (uint8_t)hdr[1];
+    out->evidence_level = (uint8_t)hdr[2];
+    out->live = (uint32_t)hdr[3];
+    out->capability_id = (uint32_t)fields[0];
+    out->realization_id = (uint32_t)fields[1];
+    out->skill_id = (uint32_t)fields[2];
+    out->skill_version = (uint32_t)fields[3];
+    memcpy(out->skill_digest, sdig, 32);
+    out->op = (uint32_t)fields[4];
+    out->effects = (uint16_t)fields[5];
+    out->in_types = fields[6];
+    out->out_types = fields[7];
+    out->auth_resource = fields[8];
+    out->auth_rights = (uint32_t)fields[9];
+    out->confidence_ppm = (uint32_t)fields[10];
+    out->reliability_ppm = (uint32_t)fields[11];
+    out->cost = fields[12];
+    out->latency_us = fields[13];
+    out->energy_uj = fields[14];
+    out->evidence_ref = fields[15];
+    out->generation = fields[16];
+    *kind = (uint32_t)hdr[0];
     return CQ_OK;
 }
 
@@ -846,9 +832,11 @@ int cq_wire_apply(CqCatalog *c, const uint8_t *in, size_t len, CqKey *key_out) {
     e.source = CQ_SRC_FABRIC;                               /* local source was provenance only */
     CqKey k = cq_key_of(&e);
     const CqEntry *old = cq_lookup(c, &k);
-    if (old && e.generation <= old->generation) return CQ_E_STALE;
-    if (!old && kind != CQ_WIRE_ADVERTISE) return CQ_E_NOT_FOUND;
-    if (kind == CQ_WIRE_AVAILABILITY && old->live == CQ_LIVE_WITHDRAWN) return CQ_E_WITHDRAWN;
+    uint64_t chk = 0;
+    (void)omega2_rx_cq_wire_apply_check(&chk, old ? 1ull : 0ull, old ? old->generation : 0ull,
+                                        old ? (uint64_t)old->live : 0ull, e.generation,
+                                        (uint64_t)kind);
+    if ((int64_t)chk != 0) return (int)(int64_t)chk;
     if (kind == CQ_WIRE_ADVERTISE) {
         rc = cq_register(c, &e, NULL, 0);
     } else {

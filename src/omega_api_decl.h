@@ -400,6 +400,16 @@ uint64_t rx_cq_dominates(const uint64_t o_a[7], const uint64_t o_b[7], const uin
 int64_t rx_cq_cmp_full(const uint64_t o_a[11], const uint64_t o_b[11], const uint8_t o_dims[7], uint64_t o_nd);
 /* export fn rx_cq_within v ulong best ulong tol_ppm ulong to ulong */
 uint64_t rx_cq_within(uint64_t o_v, uint64_t o_best, uint64_t o_tol_ppm);
+/* export fn rx_cq_plan_sources domains ulong need_src ulong loc ulong pin ulong self_mach ulong to ulong */
+uint64_t rx_cq_plan_sources(uint64_t o_domains, uint64_t o_need_src, uint64_t o_loc, uint64_t o_pin, uint64_t o_self_mach);
+/* export fn rx_cq_filter_entry ent view ulong 14 need view ulong 14 to ulong */
+uint64_t rx_cq_filter_entry(const uint64_t o_ent[14], const uint64_t o_need[14]);
+/* export fn rx_cq_wire_encode_body hdr view ulong 4 fields view ulong 17 mid view uchar 44 sdig view uchar 32 dst edit uchar 188 to ulong */
+uint64_t rx_cq_wire_encode_body(const uint64_t o_hdr[4], const uint64_t o_fields[17], const uint8_t o_mid[44], const uint8_t o_sdig[32], uint8_t o_dst[188]);
+/* export fn rx_cq_wire_decode_body src view uchar 188 hdr edit ulong 4 fields edit ulong 17 sdig edit uchar 32 to ulong */
+uint64_t rx_cq_wire_decode_body(const uint8_t o_src[188], uint64_t o_hdr[4], uint64_t o_fields[17], uint8_t o_sdig[32]);
+/* export fn rx_cq_wire_apply_check has_old ulong old_gen ulong old_live ulong new_gen ulong kind ulong to long */
+int64_t rx_cq_wire_apply_check(uint64_t o_has_old, uint64_t o_old_gen, uint64_t o_old_live, uint64_t o_new_gen, uint64_t o_kind);
 /* export fn rx_cm_fit_predict tri view ulong 36 xty_u view ulong 8 phi_u view ulong 8 meta view ulong 2 dst edit ulong 4 to ulong */
 uint64_t rx_cm_fit_predict(const uint64_t o_tri[36], const uint64_t o_xty_u[8], const uint64_t o_phi_u[8], const uint64_t o_meta[2], uint64_t o_dst[4]);
 /* export fn rx_cm_rank1_update tri edit ulong 36 xty edit ulong 8 phi view ulong 8 y_bits ulong to void */
@@ -418,6 +428,20 @@ uint64_t rx_world_state_legal(uint64_t o_from, uint64_t o_dest);
 uint64_t rx_world_res_fits(const uint64_t o_used[4], const uint64_t o_budget[6], const uint64_t o_need[5]);
 /* export fn rx_world_better_admit a view ulong 3 b view ulong 3 to ulong */
 uint64_t rx_world_better_admit(const uint64_t o_a[3], const uint64_t o_b[3]);
+/* export fn rx_coh_crc32c data view uchar * n ulong to ulong */
+uint64_t rx_coh_crc32c(const uint8_t *o_data, size_t o_data_len, uint64_t o_n);
+/* export fn rx_coh_ring_msg t ulong to ulong */
+uint64_t rx_coh_ring_msg(uint64_t o_t);
+/* export fn rx_coh_msg_rights t ulong to ulong */
+uint64_t rx_coh_msg_rights(uint64_t o_t);
+/* export fn rx_coh_fault_err fault ulong to long */
+int64_t rx_coh_fault_err(uint64_t o_fault);
+/* export fn rx_sem_digest_eq_om2 a view uchar 32 b view uchar 32 to ulong */
+uint64_t rx_sem_digest_eq_om2(const uint8_t o_a[32], const uint8_t o_b[32]);
+/* export fn rx_sem_node_id_from_hash d view uchar 32 kind ulong to ulong */
+uint64_t rx_sem_node_id_from_hash(const uint8_t o_d[32], uint64_t o_kind);
+/* export fn rx_sem_inputs_unique inputs view ulong * n ulong to ulong */
+uint64_t rx_sem_inputs_unique(const uint64_t *o_inputs, size_t o_inputs_len, uint64_t o_n);
 /* export fn rx_sr_digest_zero d view uchar 32 to ulong */
 uint64_t rx_sr_digest_zero(const uint8_t o_d[32]);
 /* export fn rx_sr_why_of counts view ulong 10 to ulong */
@@ -426,6 +450,36 @@ uint64_t rx_sr_why_of(const uint64_t o_counts[10]);
 uint64_t rx_fus_word64(const uint8_t o_d[8]);
 /* export fn rx_fus_eligible_kind k ulong to ulong */
 uint64_t rx_fus_eligible_kind(uint64_t o_k);
+/* export fn cap_token_eq a view uchar 32 b view uchar 32 to ulong */
+uint64_t cap_token_eq(const uint8_t o_a[32], const uint8_t o_b[32]);
+/* export fn cap_add_u64 a ulong b ulong dst edit ulong 1 to long */
+int64_t cap_add_u64(uint64_t o_a, uint64_t o_b, uint64_t o_dst[1]);
+/* export fn cap_gen_advance gen ulong dst edit ulong 1 to long */
+int64_t cap_gen_advance(uint64_t o_gen, uint64_t o_dst[1]);
+/* export fn cap_table_init hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 boot_gen ulong to long */
+int64_t cap_table_init(uint64_t o_hdr[4], uint64_t o_slots[3328], uint8_t o_delivered[256], uint64_t o_boot_gen);
+/* export fn cap_table_validate hdr view ulong 4 slots view ulong 3328 args view ulong 5 out_slot edit ulong 13 to long */
+int64_t cap_table_validate(const uint64_t o_hdr[4], const uint64_t o_slots[3328], const uint64_t o_args[5], uint64_t o_out_slot[13]);
+/* export fn cap_table_inspect hdr view ulong 4 slots view ulong 3328 cap_id ulong gen ulong out_slot edit ulong 13 to long */
+int64_t cap_table_inspect(const uint64_t o_hdr[4], const uint64_t o_slots[3328], uint64_t o_cap_id, uint64_t o_gen, uint64_t o_out_slot[13]);
+/* export fn cap_table_auth_use hdr view ulong 4 slots view ulong 3328 delivered view uchar 256 args view ulong 3 to long */
+int64_t cap_table_auth_use(const uint64_t o_hdr[4], const uint64_t o_slots[3328], const uint8_t o_delivered[256], const uint64_t o_args[3]);
+/* export fn cap_table_mint hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 req view ulong 9 out_ref edit ulong 2 to long */
+int64_t cap_table_mint(uint64_t o_hdr[4], uint64_t o_slots[3328], uint8_t o_delivered[256], const uint64_t o_req[9], uint64_t o_out_ref[2]);
+/* export fn cap_table_revoke hdr edit ulong 4 slots edit ulong 3328 delivered view uchar 256 args view ulong 4 rev_list edit ulong 257 to long */
+int64_t cap_table_revoke(uint64_t o_hdr[4], uint64_t o_slots[3328], const uint8_t o_delivered[256], const uint64_t o_args[4], uint64_t o_rev_list[257]);
+/* export fn cap_table_reclaim hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 args view ulong 3 to long */
+int64_t cap_table_reclaim(uint64_t o_hdr[4], uint64_t o_slots[3328], uint8_t o_delivered[256], const uint64_t o_args[3]);
+/* export fn cap_table_clock hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 args view ulong 3 to long */
+int64_t cap_table_clock(uint64_t o_hdr[4], const uint64_t o_slots[3328], const uint8_t o_delivered[256], const uint64_t o_args[3]);
+/* export fn cap_table_epoch hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 aid ulong agen ulong to long */
+int64_t cap_table_epoch(uint64_t o_hdr[4], const uint64_t o_slots[3328], const uint8_t o_delivered[256], uint64_t o_aid, uint64_t o_agen);
+/* export fn aegis_evaluate rules view ulong 112 n_rules ulong req view ulong 4 res edit ulong 3 to ulong */
+uint64_t aegis_evaluate(const uint64_t o_rules[112], uint64_t o_n_rules, const uint64_t o_req[4], uint64_t o_res[3]);
+/* export fn aegis_decide rules view ulong 112 n_rules ulong subject ulong in_f view ulong 10 out_dec edit ulong 8 to ulong */
+uint64_t aegis_decide(const uint64_t o_rules[112], uint64_t o_n_rules, uint64_t o_subject, const uint64_t o_in_f[10], uint64_t o_out_dec[8]);
+/* export fn aegis_install_check dec view ulong 8 req view ulong 6 client view ulong 3 to ulong */
+uint64_t aegis_install_check(const uint64_t o_dec[8], const uint64_t o_req[6], const uint64_t o_client[3]);
 #define OSC_LITERAL_MALFORMED 1
 #define OSC_LITERAL_OVERFLOW 2
 #define OSC_LEX_COMMENT 3
@@ -1466,6 +1520,14 @@ uint64_t osh_om_name_valid(const uint8_t *o_s, size_t o_s_len, uint64_t o_n);
 uint64_t osh_om_check_req_hdr(const uint64_t *o_rec, size_t o_rec_len, uint64_t o_nrec, uint64_t o_nout, uint64_t o_has_out);
 /* export fn osh_om_check_cmd_reserved b view ulong * na ulong ns ulong nr ulong to ulong */
 uint64_t osh_om_check_cmd_reserved(const uint64_t *o_b, size_t o_b_len, uint64_t o_na, uint64_t o_ns, uint64_t o_nr);
+/* export fn osh_om_op_right op ulong to ulong */
+uint64_t osh_om_op_right(uint64_t o_op);
+/* export fn osh_om_map_cap_rc rc long to long */
+int64_t osh_om_map_cap_rc(int64_t o_rc);
+/* export fn osh_om_path_under pref view uchar * np ulong path view uchar * npath ulong to ulong */
+uint64_t osh_om_path_under(const uint8_t *o_pref, size_t o_pref_len, uint64_t o_np, const uint8_t *o_path, size_t o_path_len, uint64_t o_npath);
+/* export fn osh_om_check_binding domain ulong pid view uchar 32 to long */
+int64_t osh_om_check_binding(uint64_t o_domain, const uint8_t o_pid[32]);
 #ifdef __cplusplus
 }
 #endif

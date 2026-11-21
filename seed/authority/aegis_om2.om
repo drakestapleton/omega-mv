@@ -1,0 +1,186 @@
+om2
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure seeded OM-2 AEGIS resident authority policy evaluator and root.install
+note verifier (ADR 0016 s.41, R8). Replaces policy & decision logic in
+note src/runtime/rx_aegis.c.
+
+const RIGHT_PRIVILEGED ulong 0x3f0
+const RIGHT_KNOWN ulong 0x3ff
+const AEGIS_SLOTS ulong 4
+const U32_MAX ulong 0xffffffff
+
+const OP_ACQUIRE ulong 1
+const OP_RELEASE ulong 2
+const APPROVE ulong 1
+
+const VERDICT_GRANT ulong 1
+const VERDICT_DENY ulong 2
+const VERDICT_ESCALATE ulong 3
+const VERDICT_REVOKE ulong 4
+
+const WHY_NO_RULE ulong 1000
+const WHY_PRIVILEGED ulong 1001
+const WHY_HUMAN ulong 1002
+const WHY_BAD_REQUEST ulong 1003
+const WHY_MISMATCH ulong 1006
+const WHY_DOMAIN ulong 1007
+
+fn rule_match rules view ulong 112 base ulong req view ulong 4 res edit ulong 3 to ulong
+  if ne get rules add base 1 get req 0
+    ret 0
+  end
+  rsrc = get req 1
+  if lt rsrc get rules add base 2
+    ret 0
+  end
+  if gt rsrc get rules add base 3
+    ret 0
+  end
+  mask = xor get rules add base 4 0xffffffffffffffff
+  if ne and get req 2 mask 0
+    ret 0
+  end
+  ml = get rules add base 5
+  gl = get req 3
+  if ne ml 0
+    if or eq gl 0 gt gl ml
+      gl = ml
+    end
+  end
+  put res 0 gl
+  put res 1 get rules base
+  put res 2 get rules add base 6
+  ret 1
+end
+
+note Evaluate AEGIS policy rules.
+note rules[112]: up to 16 rules x 7 ulongs:
+note   0=id, 1=subject, 2=res_lo, 3=res_hi, 4=rights, 5=max_lease, 6=needs_approval
+note req[4]: 0=subject, 1=resource, 2=rights, 3=lease
+note res[3]: 0=out_lease, 1=rule_or_why, 2=needs_approval
+export fn aegis_evaluate rules view ulong 112 n_rules ulong req view ulong 4 res edit ulong 3 to ulong
+  put res 0 0
+  put res 2 0
+  rights = get req 2
+  if or eq rights 0 ne and rights xor RIGHT_KNOWN 0xffffffffffffffff 0
+    put res 1 WHY_BAD_REQUEST
+    ret VERDICT_DENY
+  end
+  if ne and rights RIGHT_PRIVILEGED 0
+    put res 1 WHY_PRIVILEGED
+    ret VERDICT_DENY
+  end
+  n = n_rules
+  if gt n 16
+    n = ulong 16
+  end
+  for i ulong n bound 16
+    if ne rule_match rules mul i 7 req res 0
+      ret VERDICT_GRANT
+    end
+  end
+  put res 1 WHY_NO_RULE
+  ret VERDICT_DENY
+end
+
+note Pure aegis.decide.k state transition.
+note in_f[10]: 0..5=req[0..5], 6..7=ap[0..1], 8..9=dec[0..1]
+note out_dec[8]: decision fields to publish. Returns 1 if publish, 0 if no-op.
+export fn aegis_decide rules view ulong 112 n_rules ulong subject ulong in_f view ulong 10 out_dec edit ulong 8 to ulong
+  ev_req = new ulong 4 0
+  ev_res = new ulong 3 0
+  seq = get in_f 0
+  if eq seq 0
+    ret 0
+  end
+  if eq get in_f 8 seq
+    if ne get in_f 9 VERDICT_ESCALATE
+      ret 0
+    end
+    if ne get in_f 6 seq
+      ret 0
+    end
+  end
+  put out_dec 0 seq
+  put out_dec 1 VERDICT_DENY
+  put out_dec 2 get in_f 1
+  put out_dec 3 get in_f 2
+  put out_dec 4 0
+  put out_dec 5 get in_f 4
+  put out_dec 6 0
+  put out_dec 7 get in_f 5
+  op = get in_f 5
+  bad = ulong 0
+  if ge get in_f 4 AEGIS_SLOTS
+    bad = ulong 1
+  end
+  if gt get in_f 2 U32_MAX
+    bad = ulong 1
+  end
+  if ne op OP_ACQUIRE
+    if ne op OP_RELEASE
+      bad = ulong 1
+    end
+  end
+  if ne bad 0
+    put out_dec 1 VERDICT_DENY
+    put out_dec 3 0
+    put out_dec 6 WHY_BAD_REQUEST
+    ret 1
+  end
+  if eq op OP_RELEASE
+    put out_dec 1 VERDICT_REVOKE
+    put out_dec 3 0
+    ret 1
+  end
+  put ev_req 0 subject
+  put ev_req 1 get in_f 1
+  put ev_req 2 get in_f 2
+  put ev_req 3 get in_f 3
+  v = aegis_evaluate rules n_rules ev_req ev_res
+  put out_dec 4 get ev_res 0
+  put out_dec 6 get ev_res 1
+  if and eq v VERDICT_GRANT ne get ev_res 2 0
+    if ne get in_f 6 seq
+      v = VERDICT_ESCALATE
+    else
+      if ne get in_f 7 APPROVE
+        v = VERDICT_DENY
+        put out_dec 6 WHY_HUMAN
+      end
+    end
+  end
+  if and ne v VERDICT_GRANT ne v VERDICT_ESCALATE
+    put out_dec 3 0
+    put out_dec 4 0
+  end
+  put out_dec 1 v
+  ret 1
+end
+
+note Verify root.install.k decision/request echo and client domain bounds.
+note dec[8], req[6], client[3] = [domain_lo, domain_hi, max_rights].
+note Returns 0 if ok, else RX_AEGIS_WHY_MISMATCH (1006) or RX_AEGIS_WHY_DOMAIN (1007).
+export fn aegis_install_check dec view ulong 8 req view ulong 6 client view ulong 3 to ulong
+  if or ne get dec 0 get req 0 ne get dec 2 get req 1
+    ret WHY_MISMATCH
+  end
+  if or ne get dec 5 get req 4 ne get dec 7 get req 5
+    ret WHY_MISMATCH
+  end
+  if ne and get dec 3 xor get req 2 0xffffffffffffffff 0
+    ret WHY_MISMATCH
+  end
+  if eq get dec 1 VERDICT_REVOKE
+    ret 0
+  end
+  res = get dec 2
+  rights = get dec 3
+  if or lt res get client 0 gt res get client 1
+    ret WHY_DOMAIN
+  end
+  if or ne and rights xor get client 2 0xffffffffffffffff 0 or ne and rights RIGHT_PRIVILEGED 0 eq rights 0
+    ret WHY_DOMAIN
+  end
+  ret 0
+end
