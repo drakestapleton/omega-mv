@@ -1,0 +1,505 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure OM-2 Blackwell (GB10 / SM121) scalar spreading-activation kernel emitter & QMD packer.
+note Compose after om/encoder/bw_enc_sm121.om and om/gpu/bw_qmd.om.
+note
+note Launch geometry: 128 threads/CTA (4 warps), 0 bytes SMEM, <= 22 GPRs (R0..R21; QMD declares 24).
+note   Mode 0 (B == 1): grid.x = ceil(V / 128), grid.y = 1; 1 thread per destination node v, b = 0.
+note   Mode 1 (B > 1):  grid.x = ceil(batch_stride / 32), grid.y = ceil(V / 4);
+note                    1 warp per destination node v, lanes 0..31 spanning 32 seeds b..b+31.
+note
+note QMD constant bank (native Blackwell driver bank 0..223 + kernel args at c[0][0x380..0x3BC]):
+note   c[0][0x358] -> UR4:UR5 (global descriptor)
+note   0x380 (bank 224..225): ptr_row_off (u64)
+note   0x388 (bank 226..227): ptr_in_src (u64)
+note   0x390 (bank 228..229): ptr_in_weight (u64)
+note   0x398 (bank 230..231): ptr_state_in (u64)
+note   0x3A0 (bank 232..233): ptr_state_out (u64)
+note   0x3A8 (bank 234..235): ptr_receipt (u64)
+note   0x3B0 (bank 236):      num_nodes (u32)
+note   0x3B4 (bank 237):      batch_actual (u32)
+note   0x3B8 (bank 238):      batch_stride (u32)
+note   0x3BC (bank 239):      decay_fp32 (u32)
+note
+note Dual-scoreboard hot loop:
+note   SB0: LDG.E in_src[e] and in_weight[e]
+note   SB1: LDG.E StateIn[u, b] overlapped with FMUL (w * gamma)
+note   SB2: rbar for late-read address/data operands on LDG.E / STG.E / ATOMG
+note Epilogue:
+note   STG.E best_val -> StateOut[v, b], compare best_val > old_val,
+note   5-step warp SHFL.DOWN + IADD3 reduction across all 32 lanes,
+note   lane 0 issues one ATOMG.E.ADD.STRONG.SYS to SpreadReceipt.changed_count when warp_sum != 0.
+
+const AS_RZ ulong 255
+
+note Build SM121 control word:
+note   stall [9..12], yield=0 [13], wbar [14..16], rbar [17..19], wait [20..25].
+fn as_cw stall ulong wbar ulong rbar ulong wait_mask ulong to ulong
+  ret or or or shl stall 9 shl wbar 14 shl rbar 17 shl wait_mask 20
+end
+
+note State s[7]: 0=pc, 1=imm, 2=src3/addend, 3=guard(0=PT,1=@P0,2=@!P0), 4=cw, 5=err, 6=bar_reg.
+fn as_emit code edit uchar 16384 s edit ulong 7 op ulong dst ulong a ulong b ulong to void
+  o = new ulong 16 0
+  w = new ulong 4 0
+  put o 0 op
+  put o 1 dst
+  put o 2 a
+  put o 3 b
+  put o 4 get s 2
+  put o 5 4
+  put o 6 get s 1
+  put o 7 get s 4
+  put o 11 get s 6
+  if ne get s 3 0
+    put o 9 1
+  end
+  if eq get s 3 2
+    put o 10 1
+  end
+  if ne a AS_RZ
+    put o 12 1
+  end
+  if ne b AS_RZ
+    put o 13 1
+  end
+  if ne dst AS_RZ
+    put o 15 1
+  end
+  if or ne enc1 o w 0 ge get s 0 1024
+    put s 5 1
+    ret
+  end
+  store code get s 0 w
+  put s 0 add get s 0 1
+  put s 1 0
+  put s 2 AS_RZ
+  put s 3 0
+  put s 4 as_cw 15 7 7 0
+  put s 6 0
+end
+
+fn as_imm code edit uchar 16384 s edit ulong 7 op ulong dst ulong imm ulong to void
+  put s 1 imm
+  as_emit code s op dst AS_RZ AS_RZ
+end
+
+fn as_wide code edit uchar 16384 s edit ulong 7 dst ulong idx ulong stride ulong base ulong to void
+  put s 1 stride
+  put s 2 base
+  as_emit code s 9 dst idx AS_RZ
+end
+
+fn as_imad_imm code edit uchar 16384 s edit ulong 7 dst ulong a ulong imm ulong c ulong to void
+  put s 1 imm
+  put s 2 c
+  as_emit code s 8 dst a AS_RZ
+end
+
+fn as_imad_reg code edit uchar 16384 s edit ulong 7 dst ulong a ulong b ulong c ulong to void
+  put s 2 c
+  as_emit code s 8 dst a b
+end
+
+fn as_patch_bra code edit uchar 16384 s edit ulong 7 pos ulong target ulong guard ulong to void
+  if ge pos 1024
+    put s 5 1
+    ret
+  end
+  saved = get s 0
+  put s 0 pos
+  put s 3 guard
+  put s 4 as_cw 6 7 7 0
+  as_imm code s 46 0 and sub target pos 0xffffffff
+  put s 0 saved
+end
+
+fn as_patch_bssy code edit uchar 16384 s edit ulong 7 pos ulong target ulong bar ulong to void
+  if ge pos 1024
+    put s 5 1
+    ret
+  end
+  saved = get s 0
+  put s 0 pos
+  put s 6 bar
+  put s 4 as_cw 6 7 7 0
+  as_imm code s 54 0 sub target pos
+  put s 0 saved
+end
+
+fn as_prologue code edit uchar 16384 s edit ulong 7 mode ulong skip_out edit ulong 2 to void
+  cw_ld = as_cw 2 0 7 0
+  put s 4 cw_ld
+  as_imm code s 3 0 0x21
+  put s 4 cw_ld
+  as_imm code s 3 19 0x25
+  put s 4 cw_ld
+  as_imm code s 3 20 0x26
+  put s 4 cw_ld
+  as_imm code s 7 4 0x358
+  put s 4 cw_ld
+  as_imm code s 5 8 0x380
+  put s 4 cw_ld
+  as_imm code s 5 12 0x398
+  put s 4 cw_ld
+  as_imm code s 4 14 0x3bc
+  put s 4 cw_ld
+  as_imm code s 4 15 0x3b8
+  put s 4 cw_ld
+  as_imm code s 4 21 0x3b0
+  put s 4 as_cw 6 7 7 1
+  as_imm code s 2 18 0
+
+  note lane = R0 & 31
+  put s 1 31
+  as_emit code s 18 1 0 AS_RZ
+
+  if eq mode 0
+    note Mode 0: v = ctaid.x * 128 + tid.x; b = 0
+    as_imad_imm code s 2 19 128 0
+    as_imm code s 2 3 0
+    as_emit code s 28 0 2 21
+    put skip_out 0 get s 0
+    as_imm code s 54 0 2
+    put skip_out 1 get s 0
+    put s 3 1
+    as_imm code s 46 0 1
+  else
+    note Mode 1: warp = tid.x >> 5; v = ctaid.y * 4 + warp; b = ctaid.x * 32 + lane
+    put s 1 5
+    as_emit code s 17 2 0 AS_RZ
+    as_imad_imm code s 2 20 4 2
+    as_imad_imm code s 3 19 32 1
+    put s 4 cw_ld
+    as_imm code s 4 19 0x3b4
+    put skip_out 0 get s 0
+    as_imm code s 54 0 2
+    put s 4 as_cw 15 7 7 1
+    as_emit code s 28 0 2 21
+    put skip_out 1 get s 0
+    put s 3 1
+    as_imm code s 46 0 1
+  end
+end
+
+fn as_body code edit uchar 16384 s edit ulong 7 mode ulong skip_b edit ulong 1 to void
+  if ne mode 0
+    as_emit code s 28 0 3 19
+    put skip_b 0 get s 0
+    put s 3 1
+    as_imm code s 46 0 1
+  end
+
+  note Load row_off[v] -> R6, row_off[v+1] -> R7 (using R8:R9 = ptr_row_off)
+  put s 4 as_cw 6 7 7 4
+  as_wide code s 16 2 4 8
+  put s 4 as_cw 2 0 2 0
+  as_emit code s 11 6 16 AS_RZ
+  put s 1 4
+  put s 4 as_cw 2 0 2 0
+  as_emit code s 11 7 16 AS_RZ
+
+  note Load old_val = StateIn[v, b] -> R5
+  if eq mode 0
+    put s 4 as_cw 6 7 7 4
+    as_wide code s 16 2 4 12
+  else
+    as_imad_reg code s 19 2 15 3
+    put s 4 as_cw 6 7 7 4
+    as_wide code s 16 19 4 12
+  end
+  put s 4 as_cw 2 1 2 0
+  as_emit code s 11 5 16 AS_RZ
+
+  note Wait SB2 then load ptr_in_src -> R8:R9, ptr_in_weight -> R10:R11
+  put s 4 as_cw 2 0 7 4
+  as_imm code s 5 8 0x388
+  put s 4 as_cw 2 0 7 0
+  as_imm code s 5 10 0x390
+
+  note Wait SB0|SB1; copy best_val (R4) = old_val (R5)
+  put s 4 as_cw 6 7 7 3
+  as_emit code s 14 4 5 AS_RZ
+
+  note Hot loop (barrier B1 nested inside outer B0): while e (R6) < e_end (R7)
+  ljoin = get s 0
+  put s 6 1
+  as_imm code s 54 0 2
+  ltop = get s 0
+  as_emit code s 28 0 6 7
+  lbra = get s 0
+  put s 3 1
+  as_imm code s 46 0 1
+
+  note 1) LDG.E u = in_src[e] and w = in_weight[e] under SB0
+  put s 4 as_cw 6 7 7 4
+  as_wide code s 16 6 4 8
+  put s 4 as_cw 2 0 2 0
+  as_emit code s 11 18 16 AS_RZ
+  put s 4 as_cw 6 7 7 4
+  as_wide code s 16 6 4 10
+  put s 4 as_cw 2 0 2 0
+  as_emit code s 11 19 16 AS_RZ
+
+  note 2) Wait SB0|SB2, compute addr of StateIn[u, b], issue LDG.E act_u (R20) under SB1
+  if eq mode 0
+    put s 4 as_cw 6 7 7 5
+    as_wide code s 16 18 4 12
+  else
+    put s 4 as_cw 6 7 7 1
+    as_imad_reg code s 18 18 15 3
+    put s 4 as_cw 6 7 7 4
+    as_wide code s 16 18 4 12
+  end
+  put s 4 as_cw 2 1 2 0
+  as_emit code s 11 20 16 AS_RZ
+
+  note 3) Overlap FMUL R21 = w (R19) * gamma (R14) while StateIn[u, b] is in flight under SB1
+  as_emit code s 32 21 19 14
+
+  note 4) WAIT SB1, then FMUL R21 = wg * act_u (R20), FMNMX R4 = max(R4, R21)
+  put s 4 as_cw 6 7 7 2
+  as_emit code s 32 21 21 20
+  as_emit code s 37 4 4 21
+
+  note 5) Increment e (R6 += 1) and loop
+  as_imm code s 2 21 1
+  as_emit code s 14 6 6 21
+  as_imm code s 46 0 and sub ltop get s 0 0xffffffff
+
+  lsync = get s 0
+  put s 6 1
+  as_emit code s 55 0 AS_RZ AS_RZ
+  ldone = get s 0
+  as_patch_bra code s lbra lsync 1
+  as_patch_bssy code s ljoin ldone 1
+
+  note Active-lane epilogue: store best_val (R4) -> StateOut[v, b], set R18 = (best_val > old_val)
+  put s 4 as_cw 2 0 7 7
+  as_imm code s 5 8 0x3a0
+  if eq mode 0
+    put s 4 as_cw 6 7 7 1
+    as_wide code s 16 2 4 8
+  else
+    put s 4 as_cw 6 7 7 1
+    as_imad_reg code s 19 2 15 3
+    as_wide code s 16 19 4 8
+  end
+  put s 4 as_cw 2 7 2 0
+  as_emit code s 12 AS_RZ 16 4
+
+  note Non-negative finite FP32: best > old iff !(old >= best)
+  as_emit code s 28 0 5 4
+  as_imm code s 2 18 1
+  put s 3 1
+  as_imm code s 2 18 0
+end
+
+fn as_epilogue code edit uchar 16384 s edit ulong 7 to void
+  note 5-step warp reduction of R18 across all 32 lanes via SHFL.DOWN + IADD3
+  for step ulong 5
+    delta = shr ulong 16 step
+    put s 1 delta
+    put s 4 as_cw 2 0 7 0
+    as_emit code s 42 19 18 AS_RZ
+    put s 4 as_cw 6 7 7 1
+    as_emit code s 14 18 18 19
+  end
+
+  note Lane 0 only, and only if warp_sum (R18) >= 1: ATOMG.E.ADD.STRONG.SYS to ptr_receipt[0]
+  ajoin = get s 0
+  as_imm code s 54 0 2
+  as_imm code s 2 19 1
+  as_emit code s 28 0 1 19
+  abra1 = get s 0
+  put s 3 1
+  as_imm code s 46 0 1
+  as_emit code s 28 0 18 19
+  abra2 = get s 0
+  put s 3 2
+  as_imm code s 46 0 1
+
+  put s 4 as_cw 2 0 7 4
+  as_imm code s 5 10 0x3a8
+  put s 4 as_cw 2 0 2 1
+  as_emit code s 26 19 10 18
+
+  async = get s 0
+  put s 4 as_cw 6 7 7 7
+  as_emit code s 55 0 AS_RZ AS_RZ
+  adone = get s 0
+  as_patch_bra code s abra1 async 1
+  as_patch_bra code s abra2 async 2
+  as_patch_bssy code s ajoin adone 0
+
+  put s 4 as_cw 6 7 7 7
+  as_emit code s 23 AS_RZ AS_RZ AS_RZ
+  as_emit code s 45 AS_RZ AS_RZ AS_RZ
+  as_imm code s 46 0 0
+  while or lt get s 0 32 ne and get s 0 7 0 bound 32
+    as_emit code s 0 0 0 0
+  end
+end
+
+fn as_emit_kernel mode ulong code edit uchar 16384 to ulong
+  if gt mode 1
+    ret 0
+  end
+  s = new ulong 7 0
+  put s 2 AS_RZ
+  put s 4 as_cw 15 7 7 0
+  skip = new ulong 2 0
+  skip_b = new ulong 1 0
+
+  as_prologue code s mode skip
+  as_body code s mode skip_b
+
+  reconv = get s 0
+  put s 4 as_cw 6 7 7 7
+  as_emit code s 55 0 AS_RZ AS_RZ
+  after_reconv = get s 0
+  as_patch_bra code s get skip 1 reconv 1
+  if ne mode 0
+    as_patch_bra code s get skip_b 0 reconv 1
+  end
+  as_patch_bssy code s get skip 0 after_reconv 0
+
+  as_epilogue code s
+  if ne get s 5 0
+    ret 0
+  end
+  ret mul get s 0 16
+end
+
+fn as_bank_va bank edit uint 240 idx ulong va ulong to void
+  put bank idx u32lo va
+  put bank add idx 1 u32lo shr va 32
+end
+
+fn as_fill_cbank hdr view ulong 16 vas view ulong 10 driver view uint 224 bank edit uint 240 dims view ulong 2 to void
+  for i ulong 224
+    put bank i get driver i
+  end
+  cb = get vas 1
+  put bank 68 u32lo shr cb 32
+  put bank 69 u32lo cb
+  put bank 210 u32lo shr add cb 0x380 32
+  put bank 211 u32lo add cb 0x380
+  put bank 212 u32lo shr add cb 0x3bc 32
+  put bank 213 u32lo add cb 0x3bc
+  put bank 216 128
+  put bank 217 1
+  put bank 218 1
+  put bank 220 u32lo get dims 0
+  put bank 221 u32lo get dims 1
+  put bank 222 1
+
+  csr_va = get vas 6
+  as_bank_va bank 224 csr_va
+  as_bank_va bank 226 add csr_va get hdr 11
+  as_bank_va bank 228 add csr_va get hdr 12
+  if eq get hdr 8 0
+    as_bank_va bank 230 get vas 7
+    as_bank_va bank 232 get vas 8
+  else
+    as_bank_va bank 230 get vas 8
+    as_bank_va bank 232 get vas 7
+  end
+  as_bank_va bank 234 get vas 9
+  put bank 236 u32lo get hdr 1
+  put bank 237 u32lo get hdr 3
+  put bank 238 u32lo get hdr 4
+  put bank 239 u32lo and get hdr 6 0xffffffff
+end
+
+export fn bw_arboris_spread_emit_mode0 code edit uchar 16384 to ulong
+  ret as_emit_kernel 0 code
+end
+
+export fn bw_arboris_spread_emit_mode1 code edit uchar 16384 to ulong
+  ret as_emit_kernel 1 code
+end
+
+fn as_layout_valid hdr view ulong 16 to ulong
+  batch = get hdr 3
+  stride = get hdr 4
+  if eq batch 1
+    if or ne get hdr 7 0 ne stride 1
+      ret 2
+    end
+  else
+    if or ne get hdr 7 1 ne stride and add batch 31 0xffffffffffffffe0
+      ret 2
+    end
+    if gt get hdr 1 div 0x100000000 stride
+      ret 2
+    end
+  end
+  ret 0
+end
+
+fn as_qmd_valid hdr view ulong 16 vas view ulong 10 to ulong
+  if or ne get hdr 0 0x4152425300000001 ne get hdr 15 0
+    ret 1
+  end
+  if or eq get hdr 1 0 gt get hdr 1 0x1fffffff
+    ret 2
+  end
+  if or eq get hdr 3 0 gt get hdr 3 65535
+    ret 2
+  end
+  if or gt get hdr 7 1 gt get hdr 8 1
+    ret 2
+  end
+  if ne as_layout_valid hdr 0
+    ret 2
+  end
+  for i ulong 10
+    va = get vas i
+    if or eq va 0 ge va 0x10000000000
+      ret 3
+    end
+  end
+  if or ne and get vas 1 63 0 ne and get vas 2 63 0
+    ret 3
+  end
+  if or ne and get vas 0 255 0 or ne and get vas 4 255 0 ne and get vas 5 255 0
+    ret 3
+  end
+  ret 0
+end
+
+export fn bw_arboris_spread_pack_qmd hdr view ulong 16 vas view ulong 10 driver view uint 224 bank edit uint 240 q0 edit uint 96 q1 edit uint 96 to ulong
+  rc = as_qmd_valid hdr vas
+  if ne rc 0
+    ret rc
+  end
+  dims = new ulong 2 0
+  if eq get hdr 7 0
+    put dims 0 div add get hdr 1 127 128
+    put dims 1 1
+  else
+    put dims 0 div add get hdr 4 31 32
+    put dims 1 div add get hdr 1 3 4
+  end
+  m = new ulong 16 0
+  for i ulong 5
+    put m i get vas i
+  end
+  put m 8 128
+  put m 9 1
+  put m 10 get dims 0
+  put m 11 get dims 1
+  put m 12 24
+  put m 13 0
+  if ne bw_qmd1 m q1 0
+    ret 4
+  end
+  if ne bw_qmd_verify q1 0
+    ret 4
+  end
+  if ne bw_qmd0 q0 get vas 5 0
+    ret 4
+  end
+  as_fill_cbank hdr vas driver bank dims
+  ret 0
+end

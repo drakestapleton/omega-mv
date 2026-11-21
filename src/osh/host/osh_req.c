@@ -19,6 +19,7 @@
  * The decoder is the only way bytes reach the executor: the record path and the direct-argv path both end here.
  */
 #include "osh_host.h"
+#include "omega_native.h"
 
 #include <string.h>
 
@@ -29,10 +30,10 @@
 
 int osh_name_valid(const char *s)
 {
-    if (!s || !(*s == '_' || (*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z'))) return 0;
-    for (const char *p = s + 1; *p; p++)
-        if (!(*p == '_' || (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9'))) return 0;
-    return 1;
+    if (!s) return 0;
+    size_t n = strlen(s);
+    uint64_t valid = 0;
+    return omega2_osh_om_name_valid(&valid, (const uint8_t *)s, n, n) == OMEGA_OK && valid;
 }
 
 /* copy out[off..off+len) into the arena as a NUL terminated string; NULL on any violation */
@@ -55,14 +56,11 @@ static const char *take(OshRequest *r, const uint64_t *out, uint64_t used, uint6
 int osh_req_decode(const uint64_t *rec, size_t nrec, const uint64_t *out, size_t nout, OshRequest *r)
 {
     if (!rec || nrec < OSH_REQ_HDR_CELLS) return OSH_ABI_LENGTH;
-    if (rec[0] != OSH_REQ_MAGIC) return OSH_ABI_MAGIC;
-    if (rec[5] != OSH_REQ_VERSION) return OSH_ABI_VERSION;
-    if (rec[6] != 0 || rec[7] != 0 || (rec[3] & ~(uint64_t)OSH_REQ_FLAG_DIRECT)) return OSH_ABI_RESERVED;
+    uint64_t error = 0;
+    if (omega2_osh_om_check_req_hdr(&error, rec, OSH_REQ_HDR_CELLS, nrec, nout, out != NULL) != OMEGA_OK)
+        return OSH_REQ_FIELD;
+    if (error) return error;
     uint64_t ncmds = rec[1], conn = rec[2], used = rec[4];
-    if (ncmds < 1 || ncmds > OSH_MAX_CMDS || conn > OSH_CONN_OR) return OSH_REQ_FIELD;
-    if (nrec < OSH_REQ_HDR_CELLS + ncmds * OSH_CMD_CELLS) return OSH_ABI_LENGTH;
-    if (used > OSH_OUT_CAP) return OSH_REQ_FIELD;
-    if (used > 0 && (!out || nout < used)) return OSH_ABI_LENGTH;
 
     memset(r, 0, sizeof *r);
     r->ncmds = (int)ncmds;
@@ -74,14 +72,9 @@ int osh_req_decode(const uint64_t *rec, size_t nrec, const uint64_t *out, size_t
         uint64_t na = b[0], ns = b[1], nr = b[2], bi = b[3];
         if (na > OSH_MAX_ARGV || ns > OSH_MAX_ASSIGN || nr > OSH_MAX_REDIR || bi > OSH_B_EXIT) return OSH_REQ_FIELD;
         if (bi != 0 && (na == 0 || (r->flags & OSH_REQ_FLAG_DIRECT))) return OSH_REQ_FIELD;
-        for (uint64_t i = na; i < OSH_MAX_ARGV; i++)
-            if (b[ARGV_OFF + 2 * i] || b[ARGV_OFF + 2 * i + 1]) return OSH_ABI_RESERVED;
-        for (uint64_t i = ns; i < OSH_MAX_ASSIGN; i++)
-            for (int j = 0; j < 4; j++)
-                if (b[ASSIGN_OFF + 4 * i + j]) return OSH_ABI_RESERVED;
-        for (uint64_t i = nr; i < OSH_MAX_REDIR; i++)
-            for (int j = 0; j < 4; j++)
-                if (b[REDIR_OFF + 4 * i + j]) return OSH_ABI_RESERVED;
+        if (omega2_osh_om_check_cmd_reserved(&error, b, OSH_CMD_CELLS, na, ns, nr) != OMEGA_OK)
+            return OSH_REQ_FIELD;
+        if (error) return error;
         k->builtin_id = (int)bi;
         k->nargv = (int)na;
         k->nassign = (int)ns;

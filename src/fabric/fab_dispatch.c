@@ -16,6 +16,7 @@
 
 /* fab_dispatch.c -- Fabric dispatch of remote composition candidates (fab_dispatch.h). */
 #include "fab_dispatch.h"
+#include "omega_native.h"
 
 #include <string.h>
 
@@ -113,9 +114,11 @@ int fab_dispatch_run(void *ctx, const SrRouter *router, const SrRoute *route, ui
     if (!s || !s->fn) { rc = refuse(d, FAB_DX_NO_EXECUTOR); goto out; }
     /* The machine runs what it advertised, or nothing: an unpinned (zero)
      * advertisement is refused too, since nothing would bind the result. */
-    uint8_t any = 0;
-    for (int i = 0; i < 32; i++) any |= route->skill_digest[i];
-    if (!any || memcmp(s->identity, route->skill_digest, 32) != 0) { rc = refuse(d, FAB_DX_DIGEST); goto out; }
+    {
+        uint64_t ok = 0;
+        (void)omega2_fab_om_digest_nonzero_eq(&ok, s->identity, 32, route->skill_digest, 32);
+        if (!ok) { rc = refuse(d, FAB_DX_DIGEST); goto out; }
+    }
     uint64_t in = input;
     int failed = 0;
     uint64_t r = s->fn(&in, 1, 0, &failed);

@@ -1,0 +1,263 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure OM-2 CPU reference oracle for Arboris scalar max-over-paths spreading activation.
+note Operates on the exact 5-region arena layout:
+note   Slab 0: hdr[16]     (SpreadHeader)
+note   Slab 1: csr[*]      (IncomingCSR: in_row_off at 0, in_src at hdr[11]/4, in_weight at hdr[12]/4)
+note   Slabs 2+3: state[*] (StatePing at [0..plane_words-1], StatePong at [plane_words..2*plane_words-1])
+note   Slab 4: receipt[8]  (SpreadReceipt)
+note Evaluates best = fmaxf(best, (w * gamma) * act_u) in exact IEEE-754 FP32 order (no FMA).
+om2
+
+const CPU_MAGIC_VER ulong 0x4152425300000001
+const CPU_MAX_NODES ulong 0x1fffffff
+const CPU_MAX_BATCH ulong 65535
+const CPU_F32_INF uint 0x7f800000
+
+fn cpu_expected_stride batch ulong to ulong
+  if eq batch 1
+    ret 1
+  end
+  ret and add batch 31 0xffffffffffffffe0
+end
+
+fn cpu_validate_hdr hdr view ulong 16 to ulong
+  if ne get hdr 0 CPU_MAGIC_VER
+    ret 1
+  end
+  if ne get hdr 15 0
+    ret 2
+  end
+  v_cnt = get hdr 1
+  batch = get hdr 3
+  if or eq v_cnt 0 gt v_cnt CPU_MAX_NODES
+    ret 3
+  end
+  if or eq batch 0 gt batch CPU_MAX_BATCH
+    ret 3
+  end
+  if ne get hdr 4 cpu_expected_stride batch
+    ret 4
+  end
+  if or eq get hdr 5 0 gt get hdr 5 0xffffffff
+    ret 5
+  end
+  decay = get hdr 6
+  if or ge shr decay 32 1 ge uint and decay 0xffffffff CPU_F32_INF
+    ret 6
+  end
+  if and eq batch 1 ne get hdr 7 0
+    ret 7
+  end
+  if and gt batch 1 ne get hdr 7 1
+    ret 7
+  end
+  if gt get hdr 8 1
+    ret 8
+  end
+  if or ne and get hdr 11 127 0 ne and get hdr 12 127 0
+    ret 9
+  end
+  ret 0
+end
+
+fn cpu_validate_csr hdr view ulong 16 csr view uint * to ulong
+  v_cnt = get hdr 1
+  e_cnt = get hdr 2
+  off_src = div get hdr 11 4
+  off_w = div get hdr 12 4
+  if or lt off_src add v_cnt 1 lt off_w add off_src e_cnt
+    ret 9
+  end
+  if lt len csr add off_w e_cnt
+    ret 9
+  end
+  if ne get csr 0 0
+    ret 10
+  end
+  prev = ulong 0
+  for i ulong v_cnt bound 0x1fffffff
+    nxt = ulong get csr add i 1
+    if or lt nxt prev gt nxt e_cnt
+      ret 10
+    end
+    prev = nxt
+  end
+  if ne prev e_cnt
+    ret 10
+  end
+  for e ulong e_cnt bound 0xffffffff
+    if ge ulong get csr add off_src e v_cnt
+      ret 11
+    end
+    if ge get csr add off_w e CPU_F32_INF
+      ret 12
+    end
+  end
+  ret 0
+end
+
+fn cpu_edge_cand hdr view ulong 16 csr view uint * state view uint * ix view ulong 4 to uint
+  e = get ix 3
+  u = ulong get csr add div get hdr 11 4 e
+  u_off = add get ix 2 mul u get hdr 4
+  u_bits = get state add u_off get ix 1
+  if ge u_bits CPU_F32_INF
+    ret CPU_F32_INF
+  end
+  w = bitcast f32 get csr add div get hdr 12 4 e
+  wg = mul w bitcast f32 uint and get hdr 6 0xffffffff
+  ret bitcast uint mul wg bitcast f32 u_bits
+end
+
+fn cpu_eval_vb hdr view ulong 16 csr view uint * state view uint * ix edit ulong 4 to uint
+  v = get ix 0
+  old_bits = get state add get ix 2 add mul v get hdr 4 get ix 1
+  if ge old_bits CPU_F32_INF
+    ret CPU_F32_INF
+  end
+  best = bitcast f32 old_bits
+  e = ulong get csr v
+  e_end = ulong get csr add v 1
+  while lt e e_end bound 0xffffffff
+    put ix 3 e
+    cbits = cpu_edge_cand hdr csr state ix
+    if ge cbits CPU_F32_INF
+      ret CPU_F32_INF
+    end
+    cand = bitcast f32 cbits
+    if gt cand best
+      best = cand
+    end
+    e = add e 1
+  end
+  ret bitcast uint best
+end
+
+fn cpu_update_stats stats edit ulong 6 old_bits uint best_bits uint to void
+  if gt best_bits old_bits
+    put stats 0 add get stats 0 1
+  end
+  if gt ulong best_bits get stats 1
+    put stats 1 ulong best_bits
+  end
+  if gt best_bits 0
+    put stats 2 add get stats 2 1
+  end
+end
+
+fn cpu_step_row hdr view ulong 16 csr view uint * state edit uint * stats edit ulong 6 to ulong
+  ix = new ulong 4 0
+  put ix 0 get stats 3
+  put ix 2 get stats 4
+  row_off = mul get stats 3 get hdr 4
+  out_row = add get stats 5 row_off
+  for b ulong get hdr 3 bound 65535
+    put ix 1 b
+    old_bits = get state add get stats 4 add row_off b
+    best_bits = cpu_eval_vb hdr csr state ix
+    if ge best_bits CPU_F32_INF
+      ret 14
+    end
+    put state add out_row b best_bits
+    cpu_update_stats stats old_bits best_bits
+  end
+  pad_b = get hdr 3
+  while lt pad_b get hdr 4 bound 65536
+    put state add out_row pad_b 0
+    pad_b = add pad_b 1
+  end
+  ret 0
+end
+
+fn cpu_step_bank hdr view ulong 16 csr view uint * state edit uint * stats edit ulong 6 to ulong
+  put stats 0 0
+  put stats 1 0
+  put stats 2 0
+  plane = mul get hdr 1 get hdr 4
+  put stats 4 mul get hdr 8 plane
+  put stats 5 mul xor get hdr 8 1 plane
+  for v ulong get hdr 1 bound 0x1fffffff
+    put stats 3 v
+    err = cpu_step_row hdr csr state stats
+    if ne err 0
+      ret err
+    end
+  end
+  ret 0
+end
+
+fn cpu_validate_all hdr view ulong 16 csr view uint * state_len ulong to ulong
+  rc = cpu_validate_hdr hdr
+  if ne rc 0
+    ret rc
+  end
+  rc = cpu_validate_csr hdr csr
+  if ne rc 0
+    ret rc
+  end
+  need = mul mul get hdr 1 get hdr 4 2
+  if lt state_len need
+    ret 13
+  end
+  ret 0
+end
+
+note Execute one spreading-activation hop on the 5-region arena.
+note Flips hdr[8] (active_pingpong) and updates SpreadReceipt words [0,1,2,3,4,7].
+export fn arboris_spread_cpu_hop hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong
+  rc = cpu_validate_all hdr csr len state
+  if ne rc 0
+    put receipt 1 rc
+    put receipt 7 rc
+    ret rc
+  end
+  stats = new ulong 6 0
+  err = cpu_step_bank hdr csr state stats
+  if ne err 0
+    put receipt 1 err
+    put receipt 7 err
+    ret err
+  end
+  put hdr 8 xor get hdr 8 1
+  put receipt 0 get stats 0
+  put receipt 1 0
+  put receipt 2 add get receipt 2 1
+  put receipt 3 get stats 1
+  put receipt 4 get stats 2
+  put receipt 7 0
+  ret 0
+end
+
+note Execute up to hdr[5] (max_hops) hops, stopping early when changed_count == 0.
+export fn arboris_spread_cpu_run hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong
+  rc = cpu_validate_all hdr csr len state
+  if ne rc 0
+    put receipt 1 rc
+    put receipt 7 rc
+    ret rc
+  end
+  for k ulong 8
+    put receipt k 0
+  end
+  max_hops = get hdr 5
+  stats = new ulong 6 0
+  for hop ulong max_hops bound 0xffffffff
+    err = cpu_step_bank hdr csr state stats
+    if ne err 0
+      put receipt 1 err
+      put receipt 7 err
+      ret err
+    end
+    put hdr 8 xor get hdr 8 1
+    put receipt 0 get stats 0
+    put receipt 1 0
+    put receipt 2 add hop 1
+    put receipt 3 get stats 1
+    put receipt 4 get stats 2
+    put receipt 7 0
+    if eq get stats 0 0
+      ret 0
+    end
+  end
+  ret 0
+end

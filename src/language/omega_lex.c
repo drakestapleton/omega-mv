@@ -16,6 +16,7 @@
 
 /* omega_lex.c -- Omega surface language V0 lexer. See omega_lex.h. */
 #include "omega_lex.h"
+#include "omega_native.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -61,62 +62,31 @@ const char *omega_language_tok_text(OmegaTokKind k) {
     return "?";
 }
 
-static bool is_ident_start(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-}
-static bool is_ident_char(char c) {
-    return is_ident_start(c) || (c >= '0' && c <= '9');
-}
-static int digit_value(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return 99;
-}
-
 /* Decode an integer literal starting at s[*i]. Detects > 64-bit overflow. */
 static int lex_int(const char *s, size_t *i, uint64_t *out, uint32_t col, char *err, size_t n) {
-    unsigned base = 10;
-    size_t p = *i;
-    if (s[p] == '0' && s[p + 1] == 'x') { base = 16; p += 2; }
-    else if (s[p] == '0' && s[p + 1] == 'b') { base = 2; p += 2; }
-    size_t start = p;
-    uint64_t v = 0;
-    bool overflow = false;
-    while (s[p]) {
-        int d = digit_value(s[p]);
-        if (d >= (int)base) break;
-        if (v > (UINT64_MAX - (uint64_t)d) / base) overflow = true;
-        else v = v * base + (uint64_t)d;
-        p++;
-    }
-    if (p == start) {
-        set_err(err, n, col, base == 16 ? "'0x' needs hex digits after it"
-                                        : "'0b' needs binary digits (0 or 1) after it");
+    size_t slen = strlen(s);
+    uint64_t dst[3] = { 0, 0, 0 }, rc = 0;
+    if (omega2_lang_om_lex_int(&rc, (const uint8_t *)s, slen, slen, *i, dst, 3) != OMEGA_OK) {
+        set_err(err, n, col, "token decoding failed");
         return -1;
     }
-    if (is_ident_char(s[p])) {
-        set_err(err, n, (uint32_t)(p + 1),
+    if (rc == 1) {
+        set_err(err, n, col, dst[2] == 16 ? "'0x' needs hex digits after it"
+                                          : "'0b' needs binary digits (0 or 1) after it");
+        return -1;
+    }
+    if (rc == 2) {
+        set_err(err, n, (uint32_t)dst[2],
                 "a number runs straight into letters or digits it cannot use (V0 has no literal suffixes; write `7: u64`)");
         return -1;
     }
-    if (overflow) {
+    if (rc == 3) {
         set_err(err, n, col, "integer literal does not fit in 64 bits");
         return -2;
     }
-    *i = p;
-    *out = v;
+    *i = (size_t)dst[0];
+    *out = dst[1];
     return 0;
-}
-
-static OmegaTokKind keyword(const char *w) {
-    if (strcmp(w, "let") == 0) return OTOK_LET;
-    if (strcmp(w, "fn") == 0) return OTOK_FN;
-    if (strcmp(w, "requires") == 0) return OTOK_REQUIRES;
-    if (strcmp(w, "ensures") == 0) return OTOK_ENSURES;
-    if (strcmp(w, "true") == 0) return OTOK_TRUE;
-    if (strcmp(w, "false") == 0) return OTOK_FALSE;
-    return OTOK_IDENT;
 }
 
 int omega_language_lex(const char *src, OmegaToken *toks, size_t max, size_t *count,
@@ -156,43 +126,54 @@ int omega_language_lex(const char *src, OmegaToken *toks, size_t max, size_t *co
             k++;
             continue;
         }
-        if (is_ident_start(c)) {
-            size_t j = i;
-            while (is_ident_char(src[j])) j++;
+        uint64_t ident = 0;
+        if (omega2_lang_om_is_ident_start(&ident, (unsigned char)c) != OMEGA_OK) {
+            set_err(err, n, t->col, "identifier classification failed");
+            return -1;
+        }
+        if (ident) {
+            size_t j = i + 1;
+            for (;;) {
+                if (omega2_lang_om_is_ident_char(&ident, (unsigned char)src[j]) != OMEGA_OK) {
+                    set_err(err, n, (uint32_t)(j + 1), "identifier classification failed");
+                    return -1;
+                }
+                if (!ident) break;
+                j++;
+            }
             if (j - i >= OMEGA_LANG_IDENT_MAX) { set_err(err, n, t->col, "name is longer than 63 characters"); return -1; }
             memcpy(t->text, src + i, j - i);
             t->text[j - i] = '\0';
-            t->kind = keyword(t->text);
+            uint64_t kind = 0;
+            if (omega2_lang_om_keyword(&kind, (const uint8_t *)t->text, j - i, j - i) != OMEGA_OK) {
+                set_err(err, n, t->col, "keyword classification failed");
+                return -1;
+            }
+            t->kind = (OmegaTokKind)kind;
             i = j;
             k++;
             continue;
         }
-        char d = src[i + 1];
-        size_t adv = 1;
-        switch (c) {
-        case '(': t->kind = OTOK_LPAREN; break;
-        case ')': t->kind = OTOK_RPAREN; break;
-        case '{': t->kind = OTOK_LBRACE; break;
-        case '}': t->kind = OTOK_RBRACE; break;
-        case ':': t->kind = OTOK_COLON; break;
-        case ',': t->kind = OTOK_COMMA; break;
-        case '+': t->kind = OTOK_PLUS; break;
-        case '*': t->kind = OTOK_STAR; break;
-        case '/': t->kind = OTOK_SLASH; break;
-        case '&': t->kind = OTOK_AMP; break;
-        case '|': t->kind = OTOK_PIPE; break;
-        case '-': if (d == '>') { t->kind = OTOK_ARROW; adv = 2; } else t->kind = OTOK_MINUS; break;
-        case '=': if (d == '=') { t->kind = OTOK_EQEQ; adv = 2; } else t->kind = OTOK_ASSIGN; break;
-        case '!': if (d == '=') { t->kind = OTOK_NE; adv = 2; } else t->kind = OTOK_BANG; break;
-        case '<': if (d == '=') { t->kind = OTOK_LE; adv = 2; } else t->kind = OTOK_LT; break;
-        case '>': if (d == '=') { t->kind = OTOK_GE; adv = 2; } else t->kind = OTOK_GT; break;
-        case '"': case '\'':
-            set_err(err, n, t->col, "strings and characters are not part of Omega V0");
-            return -2;
-        case '[': case ']':
-            set_err(err, n, t->col, "lists/containers are not part of Omega V0");
-            return -2;
-        default: {
+        {
+            uint64_t pdst[2] = { 0, 1 }, prc = 0;
+            if (omega2_lang_om_punct(&prc, (unsigned char)c, (unsigned char)src[i + 1], pdst, 2) != OMEGA_OK) {
+                set_err(err, n, t->col, "token decoding failed");
+                return -1;
+            }
+            if (prc == 0) {
+                t->kind = (OmegaTokKind)pdst[0];
+                i += (size_t)pdst[1];
+                k++;
+                continue;
+            }
+            if (prc == 2) {
+                set_err(err, n, t->col, "strings and characters are not part of Omega V0");
+                return -2;
+            }
+            if (prc == 3) {
+                set_err(err, n, t->col, "lists/containers are not part of Omega V0");
+                return -2;
+            }
             char msg[64];
             if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7f)
                 snprintf(msg, sizeof msg, "unexpected character '%c'", c);
@@ -201,9 +182,6 @@ int omega_language_lex(const char *src, OmegaToken *toks, size_t max, size_t *co
             set_err(err, n, t->col, msg);
             return -1;
         }
-        }
-        i += adv;
-        k++;
     }
     memset(&toks[k], 0, sizeof(toks[k]));
     toks[k].kind = OTOK_EOF;

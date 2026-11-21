@@ -1642,8 +1642,8 @@ argus-replay: $(ARGUS_REPLAY)
 # quantization. Plain C11, no runtime or physics dependencies.
 # test-algebra-asan reruns the same suite under address+undefined sanitizers.
 .PHONY: test-algebra test-algebra-asan
-OMA_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -Isrc
-OMA_SRCS = src/algebra/oma_trit.c src/algebra/oma_z3.c src/algebra/oma_pack.c src/algebra/oma_quant.c
+OMA_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -Isrc -Wno-pedantic
+OMA_SRCS = src/algebra/oma_trit.c src/algebra/oma_z3.c src/algebra/oma_pack.c src/algebra/oma_quant.c src/omega_om_units.c
 OMA_HDRS = src/algebra/oma_trit.h src/algebra/oma_z3.h src/algebra/oma_pack.h src/algebra/oma_quant.h
 OMA_TEST = $(OUT_DIR)/tests-algebra/test_oma
 OMA_TEST_ASAN = $(OUT_DIR)/tests-algebra/test_oma_asan
@@ -1754,7 +1754,7 @@ bench-mixed-algebra: $(OMA_RZ_BENCH) $(OMA_RZ_SELECT)
 # phase-twin-receipt: from a clean committed tree only, copies the full
 #   receipt to evidence/MIXED_ALGEBRA/phase_twin_receipt.<sha256>.json.
 .PHONY: test-phase-twin phase-twin-receipt
-PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c
+PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c src/omega_om_units.c
 PT_HDRS = src/algebra/phase_twin.h src/algebra/oma_z3.h src/algebra/oma_trit.h
 PT_OUT = $(OUT_DIR)/tests-algebra
 PT_TEST = $(PT_OUT)/test_phase_twin

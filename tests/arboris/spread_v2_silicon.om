@@ -1,0 +1,615 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure OM-2 GB10 silicon differential parity & benchmark harness for Arboris 5-region spreading activation.
+note Tests BOTH Mode 0 (B=1) and Mode 1 (B=32, B=37, B=64) across:
+note   - Fixed-hop single-submit NVRM command list (zero host round-trip per hop)
+note   - Early-exit convergence loop (checking SpreadReceipt.changed_count == 0 in coherent UVM)
+note   - Isolated nodes, high-degree hubs, cycles with hop decay, early convergence before max_hops
+note   - Bit-exact differential parity (0 word mismatches) against om/arboris_spread_cpu.om
+note   - End-to-end CPU OM-2 vs GB10 latency benchmarks (~10K edges to ~100K edges, B=1..64)
+
+global sp_slabs long 5
+global sp_guards long 4
+global sp_hdr ulong 16
+global sp_offs ulong 5
+global sp_msz ulong 5
+global sp_rcpt ulong 8
+global sp_vas ulong 10
+global sp_drv uint 224
+global sp_bank uint 240
+global sp_q0 uint 96
+global sp_q1 uint 96
+global sp_code0 uchar 16384
+global sp_code1 uchar 16384
+note Static CPU buffers (zero heap): max V=16384, E=98304, max state = 4096*64*2 = 524288 u32 words (2 MiB)
+global sp_cpu_csr uint 262144
+global sp_cpu_state uint 524288
+global sp_outbuf uchar 256
+
+fn sp_putc c uchar to void
+  put sp_outbuf 0 c
+  unused = write 1 sp_outbuf 0 1
+end
+
+fn sp_putu v ulong to void
+  buf = new uchar 24 0
+  if eq v 0
+    sp_putc 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put buf n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  while gt n 0 bound 24
+    n = sub n 1
+    sp_putc get buf n
+  end
+end
+
+fn sp_puts_tag a uchar b uchar c uchar d uchar to void
+  put sp_outbuf 0 a
+  put sp_outbuf 1 b
+  put sp_outbuf 2 c
+  put sp_outbuf 3 d
+  put sp_outbuf 4 32
+  unused = write 1 sp_outbuf 0 5
+end
+
+fn sp_print_line tag0 uchar tag1 uchar tag2 uchar tag3 uchar v0 ulong v1 ulong to void
+  sp_puts_tag tag0 tag1 tag2 tag3
+  sp_putu v0
+  sp_putc 32
+  sp_putu v1
+  sp_putc 10
+end
+
+fn sp_open_gpu to bool
+  if not nvfull
+    ret false
+  end
+  if not nvchan
+    ret false
+  end
+  c0 = new uchar 16384 0
+  c1 = new uchar 16384 0
+  sz0 = bw_arboris_spread_emit_mode0 c0
+  sz1 = bw_arboris_spread_emit_mode1 c1
+  if or eq sz0 0 eq sz1 0
+    ret false
+  end
+  note gbmem[0]=cmd(64K), [1]=cbank(16K), [2]=qmd+sem+scratch(128K), [3]=mark(4K), [4]=code0(4K), [5]=code1(4K)
+  sizes = new ulong 6 0
+  put sizes 0 65536
+  put sizes 1 16384
+  put sizes 2 131072
+  put sizes 3 4096
+  put sizes 4 4096
+  put sizes 5 4096
+  for i ulong 6
+    tok = nvalloc get sizes i false
+    if le tok 0
+      ret false
+    end
+    put gbmem i tok
+  end
+  if ne mapwrite get gbmem 4 0 c0 0 sz0 long sz0
+    ret false
+  end
+  if ne mapwrite get gbmem 5 0 c1 0 sz1 long sz1
+    ret false
+  end
+  ret true
+end
+
+fn sp_free_arena to void
+  for j ulong 5
+    i = sub ulong 4 j
+    tok = get sp_slabs i
+    if gt tok 0
+      unused = nvdrop tok
+      put sp_slabs i 0
+    end
+  end
+  for j ulong 4
+    g = get sp_guards j
+    if gt g 0
+      unused = mapdrop g
+      put sp_guards j 0
+    end
+  end
+end
+
+fn sp_alloc_arena to bool
+  sp_free_arena
+  for i ulong 5
+    tok = nvalloc get sp_msz i false
+    if le tok 0
+      sp_free_arena
+      ret false
+    end
+    put sp_slabs i tok
+    if lt i 4
+      va = get nvnext 0
+      g = maphold va 4096
+      if le g 0
+        sp_free_arena
+        ret false
+      end
+      put sp_guards i g
+      put nvnext 0 add va 4096
+    end
+  end
+  for k ulong 16
+    if ne mapset get sp_slabs 0 mul k 8 8 get sp_hdr k 0
+      ret false
+    end
+  end
+  ret true
+end
+
+note Build deterministic test graph directly into sp_cpu_csr (Slab 1 format):
+note kind=0: V=256, E=768 (isolated nodes 0..7, hub node 8 with in-deg 64, cycles + forward chains)
+note kind=1: scalable graph with V nodes, 6 incoming edges per non-isolated node (for benchmarks).
+fn sp_build_graph v_cnt ulong deg ulong to ulong
+  note Plan header first to get off_in_src and off_in_weight
+  e_cnt = ulong 0
+  for v ulong v_cnt bound 65536
+    put sp_cpu_csr v uint e_cnt
+    if ge v 8
+      if and eq v 8 ge v_cnt 128
+        e_cnt = add e_cnt 64
+      else
+        e_cnt = add e_cnt deg
+      end
+    end
+  end
+  put sp_cpu_csr v_cnt uint e_cnt
+  ret e_cnt
+end
+
+fn sp_edge_weight v ulong k ulong to uint
+  sel = and add v k 3
+  if eq sel 1
+    ret 0x3f000000
+  end
+  if eq sel 2
+    ret 0x3f400000
+  end
+  if eq sel 3
+    ret 0x3f600000
+  end
+  ret 0x3e800000
+end
+
+fn sp_fill_node_edges v ulong cnt ulong e_start ulong v_cnt ulong to ulong
+  e = e_start
+  for k ulong cnt bound 64
+    t = add mul v 7 mul k 13
+    u = rem add t 3 v_cnt
+    if eq u v
+      u = rem add v 1 v_cnt
+    end
+    idx = add div get sp_hdr 11 4 e
+    put sp_cpu_csr idx uint u
+    widx = add div get sp_hdr 12 4 e
+    w = sp_edge_weight v k
+    put sp_cpu_csr widx w
+    e = add e 1
+  end
+  ret e
+end
+
+fn sp_fill_edges v_cnt ulong deg ulong to void
+  e = ulong 0
+  for v ulong v_cnt bound 65536
+    if ge v 8
+      cnt = deg
+      if and eq v 8 ge v_cnt 128
+        cnt = ulong 64
+      end
+      e = sp_fill_node_edges v cnt e v_cnt
+    end
+  end
+end
+
+fn sp_init_seeds v_cnt ulong batch ulong stride ulong to void
+  plane = mul v_cnt stride
+  for i ulong mul plane 2 bound 524288
+    put sp_cpu_state i 0
+  end
+  for b ulong batch bound 65535
+    note Distinct seed nodes per batch element (avoid isolated 0..7)
+    s0 = add 8 rem mul b 11 sub v_cnt 8
+    s1 = add 8 rem add mul b 17 5 sub v_cnt 8
+    put sp_cpu_state add mul s0 stride b 0x3f800000
+    put sp_cpu_state add mul s1 stride b 0x3f400000
+  end
+end
+
+fn sp_upload_arena to bool
+  csr_words = div add get sp_hdr 12 sub get sp_hdr 12 get sp_hdr 11 4
+  for i ulong csr_words bound 262144
+    if ne mapset get sp_slabs 1 mul i 4 4 ulong get sp_cpu_csr i 0
+      ret false
+    end
+  end
+  plane = mul get sp_hdr 1 get sp_hdr 4
+  for i ulong plane bound 262144
+    if ne mapset get sp_slabs 2 mul i 4 4 ulong get sp_cpu_state i 0
+      ret false
+    end
+    if ne mapset get sp_slabs 3 mul i 4 4 0 0
+      ret false
+    end
+  end
+  for k ulong 8
+    if ne mapset get sp_slabs 4 mul k 8 8 0 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn sp_pack_hop_local cb_va ulong to bool
+  hdr = new ulong 16 0
+  vas = new ulong 10 0
+  drv = new uint 224 0
+  bank = new uint 240 0
+  q0 = new uint 96 0
+  q1 = new uint 96 0
+  for i ulong 16
+    put hdr i get sp_hdr i
+  end
+  for i ulong 10
+    put vas i get sp_vas i
+  end
+  gbdriver cb_va
+  for i ulong 224
+    put drv i get gbcb i
+  end
+  if ne bw_arboris_spread_pack_qmd hdr vas drv bank q0 q1 0
+    ret false
+  end
+  for i ulong 240
+    put sp_bank i get bank i
+  end
+  for i ulong 96
+    put gbq0 i get q0 i
+    put gbq1 i get q1 i
+  end
+  ret true
+end
+
+fn sp_emit_one_hop hop ulong to bool
+  mode = get sp_hdr 7
+  code_slot = ulong 4
+  if ne mode 0
+    code_slot = ulong 5
+  end
+  cb_va = add mapaddr get gbmem 1 mul hop 1024
+  q_base = mapaddr get gbmem 2
+  q0_va = add q_base mul hop 512
+  q1_va = add add q_base 4096 mul hop 512
+  sem_va = add add q_base 8192 mul hop 64
+  put sp_vas 0 mapaddr get gbmem code_slot
+  put sp_vas 1 cb_va
+  put sp_vas 2 add q_base 16384
+  put sp_vas 3 sem_va
+  put sp_vas 4 q0_va
+  put sp_vas 5 q1_va
+  put sp_vas 6 mapaddr get sp_slabs 1
+  put sp_vas 7 mapaddr get sp_slabs 2
+  put sp_vas 8 mapaddr get sp_slabs 3
+  put sp_vas 9 mapaddr get sp_slabs 4
+
+  if not sp_pack_hop_local cb_va
+    ret false
+  end
+  gbdma cb_va 224
+  for i ulong 224
+    gbemit get sp_bank i
+  end
+  gbdma add cb_va 896 16
+  for i ulong 16
+    gbemit get sp_bank add 224 i
+  end
+  gbinline q0_va false
+  gbdma sem_va 1
+  gbemit 1
+  gbinline q1_va true
+  ret true
+end
+
+fn sp_submit_and_wait to bool
+  mark = get gbmem 3
+  if ne mapset mark 0 4 0 0
+    ret false
+  end
+  if ne mapset mark 16 4 0 0
+    ret false
+  end
+  bytes = get gbused 0
+  if ne mapwrite get gbmem 0 0 gbcmd 0 bytes long bytes
+    ret false
+  end
+  if not nvsend get gbmem 0 0 uint div bytes 4
+    ret false
+  end
+  if not nvwait mark 16 1179010630 5000000000
+    ret false
+  end
+  ret eq mapget mark 0 4 1145324612
+end
+
+note Path 1: Fixed-hop single-submit NVRM command list (zero host round-trip per hop).
+fn sp_gpu_run_fixed hops ulong to bool
+  put gbused 0 0
+  gbsetup
+  mark = mapaddr get gbmem 3
+  for h ulong hops bound 16
+    if not sp_emit_one_hop h
+      ret false
+    end
+    gbrel add mark 32 uint add 1 h
+    gbflush
+    next_b = xor get sp_hdr 8 1
+    put sp_hdr 8 next_b
+  end
+  gbtail
+  ret sp_submit_and_wait
+end
+
+note Path 2: Early-exit convergence loop checking SpreadReceipt.changed_count == 0 in coherent UVM.
+fn sp_gpu_run_early max_hops ulong to ulong
+  for h ulong max_hops bound 64
+    if ne mapset get sp_slabs 4 0 8 0 0
+      ret 999
+    end
+    put gbused 0 0
+    gbsetup
+    if not sp_emit_one_hop 0
+      ret 999
+    end
+    gbtail
+    if not sp_submit_and_wait
+      ret 999
+    end
+    changed = mapget get sp_slabs 4 0 8
+    next_b = xor get sp_hdr 8 1
+    put sp_hdr 8 next_b
+    if eq changed 0
+      ret add h 1
+    end
+  end
+  ret max_hops
+end
+
+fn sp_compare_bank bank ulong plane ulong to ulong
+  slab = get sp_slabs add 2 bank
+  cpu_base = mul bank plane
+  bad = ulong 0
+  for i ulong plane bound 262144
+    gv = uint mapget slab mul i 4 4
+    cv = get sp_cpu_state add cpu_base i
+    if ne gv cv
+      if lt bad 4
+        sp_print_line 77 73 83 77 i ulong gv
+        sp_print_line 67 80 85 86 i ulong cv
+      end
+      bad = add bad 1
+    end
+  end
+  ret bad
+end
+
+fn sp_plan_local to bool
+  hdr = new ulong 16 0
+  offs = new ulong 5 0
+  msz = new ulong 5 0
+  for i ulong 16
+    put hdr i get sp_hdr i
+  end
+  if ne arboris_spread_plan hdr 0x40000000 4096 offs msz 0
+    ret false
+  end
+  for i ulong 16
+    put sp_hdr i get hdr i
+  end
+  for i ulong 5
+    put sp_offs i get offs i
+    put sp_msz i get msz i
+  end
+  ret true
+end
+
+fn sp_copy_bank_out state view uint * bank ulong plane ulong to void
+  base = mul bank plane
+  for i ulong plane bound 262144
+    put sp_cpu_state add base i get state add base i
+  end
+end
+
+fn sp_cpu_run_local hops ulong early_mode ulong t_out edit ulong 1 to bool
+  hdr = new ulong 16 0
+  rcpt = new ulong 8 0
+  csr = new uint 262144 0
+  state = new uint 524288 0
+  for i ulong 16
+    put hdr i get sp_hdr i
+  end
+  csr_words = div add get hdr 12 sub get hdr 12 get hdr 11 4
+  for i ulong csr_words bound 262144
+    put csr i get sp_cpu_csr i
+  end
+  plane = mul get hdr 1 get hdr 4
+  for i ulong plane bound 262144
+    put state i get sp_cpu_state i
+  end
+  t0 = monons
+  if ne early_mode 0
+    if ne arboris_spread_cpu_run hdr csr state rcpt 0
+      ret false
+    end
+  else
+    for h ulong hops bound 64
+      if ne arboris_spread_cpu_hop hdr csr state rcpt 0
+        ret false
+      end
+    end
+  end
+  t1 = monons
+  put t_out 0 div ulong sub t1 t0 1000
+  for i ulong 16
+    put sp_hdr i get hdr i
+  end
+  for i ulong 8
+    put sp_rcpt i get rcpt i
+  end
+  sp_copy_bank_out state get hdr 8 plane
+  ret true
+end
+
+fn sp_prep_case cid ulong v_cnt ulong deg ulong batch ulong hops ulong to ulong
+  e_cnt = sp_build_graph v_cnt deg
+  for k ulong 16
+    put sp_hdr k 0
+  end
+  put sp_hdr 0 0x4152425300000001
+  put sp_hdr 1 v_cnt
+  put sp_hdr 2 e_cnt
+  put sp_hdr 3 batch
+  put sp_hdr 5 hops
+  put sp_hdr 6 0x3f000000
+  if gt batch 1
+    put sp_hdr 7 1
+  end
+  put sp_hdr 9 add 100 cid
+  put sp_hdr 10 1
+  if not sp_plan_local
+    ret 10
+  end
+  sp_fill_edges v_cnt deg
+  sp_init_seeds v_cnt batch get sp_hdr 4
+  if not sp_alloc_arena
+    ret 11
+  end
+  if not sp_upload_arena
+    ret 12
+  end
+  ret 0
+end
+
+fn sp_finish_case cid ulong gpu_hops ulong cpu_us ulong gpu_us ulong to ulong
+  sp_print_line 67 65 83 69 cid gpu_hops
+  sp_print_line 84 73 77 69 cpu_us gpu_us
+  sp_free_arena
+  ret 0
+end
+
+note Run one differential parity case.
+note early_mode: 1 = early-exit convergence, 0 = fixed-hop single-submit.
+fn sp_run_case cid ulong v_cnt ulong deg ulong batch ulong hops ulong early_mode ulong to ulong
+  cpu_t = new ulong 1 0
+  rc = sp_prep_case cid v_cnt deg batch hops
+  if ne rc 0
+    ret rc
+  end
+
+  note Run GPU
+  t0 = monons
+  gpu_hops = hops
+  if ne early_mode 0
+    gpu_hops = sp_gpu_run_early hops
+    if eq gpu_hops 999
+      ret 13
+    end
+  else
+    if not sp_gpu_run_fixed hops
+      ret 14
+    end
+  end
+  t1 = monons
+  gpu_us = div ulong sub t1 t0 1000
+  gpu_bank = get sp_hdr 8
+
+  note Run CPU OM-2 oracle from bank 0
+  put sp_hdr 8 0
+  if not sp_cpu_run_local hops early_mode cpu_t
+    ret 15
+  end
+  if ne early_mode 0
+    if ne gpu_hops get sp_rcpt 2
+      sp_print_line 68 73 70 70 gpu_hops get sp_rcpt 2
+      sp_print_line 66 65 68 87 sp_compare_bank gpu_bank mul v_cnt get sp_hdr 4 mapget get sp_slabs 4 0 8
+      sp_print_line 80 73 78 71 mapget get sp_slabs 2 32 4 mapget get sp_slabs 2 52 4
+      sp_print_line 80 79 78 71 mapget get sp_slabs 3 32 4 mapget get sp_slabs 3 52 4
+      ret 17
+    end
+  end
+  if ne gpu_bank get sp_hdr 8
+    ret 18
+  end
+  if ne sp_compare_bank gpu_bank mul v_cnt get sp_hdr 4 0
+    ret 19
+  end
+  ret sp_finish_case cid gpu_hops get cpu_t 0 gpu_us
+end
+
+fn main to int
+  if not sp_open_gpu
+    ret 1
+  end
+  note Case 2 FIRST: Mode 0 (B=1), Fixed-hop single-submit, V=256, H=4
+  rc = sp_run_case 2 256 3 1 4 0
+  if ne rc 0
+    ret int add 200 rc
+  end
+  note Case 1: Mode 0 (B=1), Early-exit convergence, V=256, hub+isolated+cycles, max_hops=12
+  rc = sp_run_case 1 256 3 1 12 1
+  if ne rc 0
+    ret int add 100 rc
+  end
+  note Case 3: Mode 1 (B=32), Early-exit convergence, V=256, max_hops=12
+  rc = sp_run_case 3 256 3 32 12 1
+  if ne rc 0
+    ret int add 300 rc
+  end
+  note Case 4: Mode 1 (B=37, non-multiple-of-32 -> stride=64), Early-exit, V=256, max_hops=12
+  rc = sp_run_case 4 256 3 37 12 1
+  if ne rc 0
+    ret int add 400 rc
+  end
+  note Case 5: Mode 1 (B=64), Fixed-hop single-submit, V=256, H=4
+  rc = sp_run_case 5 256 3 64 4 0
+  if ne rc 0
+    ret int add 500 rc
+  end
+
+  note Benchmark & routing sweep cases (6..9, all bit-exact checked too!)
+  note Case 6 (small ~10K edges): V=2048, deg=5 (~10.2K edges), B=1, H=4 fixed-hop
+  rc = sp_run_case 6 2048 5 1 4 0
+  if ne rc 0
+    ret int add 600 rc
+  end
+  note Case 7 (large ~98K edges, B=1): V=16384, deg=6 (~98.3K edges), B=1, H=4 fixed-hop
+  rc = sp_run_case 7 16384 6 1 4 0
+  if ne rc 0
+    ret int add 700 rc
+  end
+  note Case 8 (batched B=32): V=4096, deg=6 (~24.6K edges), B=32, H=4 fixed-hop
+  rc = sp_run_case 8 4096 6 32 4 0
+  if ne rc 0
+    ret int add 800 rc
+  end
+  note Case 9 (batched B=64): V=4096, deg=6 (~24.6K edges), B=64, H=4 fixed-hop
+  rc = sp_run_case 9 4096 6 64 4 0
+  if ne rc 0
+    ret int add 900 rc
+  end
+
+  unused = nvstop
+  ret 0
+end

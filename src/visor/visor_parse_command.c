@@ -16,6 +16,7 @@
 
 /* visor_parse_command.c -- Omega Visor console line parser (lane 2). No semantics. */
 #include "visor_parse_command.h"
+#include "omega_native.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -60,45 +61,30 @@ const char *visor_cmd_name(VisorCmd c) {
 }
 
 int visor_cmd_arity(VisorCmd c, size_t *min_args, size_t *max_args) {
-    for (size_t i = 0; i < K_WORDS_N; i++) {
-        if (k_words[i].cmd == c) {
-            if (min_args) *min_args = k_words[i].min_args;
-            if (max_args) *max_args = k_words[i].max_args;
-            return 0;
-        }
-    }
-    return -1;
+    uint64_t dst[2] = { 0, 0 }, ok = 0;
+    (void)omega2_visor_om_cmd_arity(&ok, (uint64_t)c, dst, 2);
+    if (!ok) return -1;
+    if (min_args) *min_args = (size_t)dst[0];
+    if (max_args) *max_args = (size_t)dst[1];
+    return 0;
 }
 
 /* Validate UTF-8 (RFC 3629: no overlongs, no surrogates, <= U+10FFFF) and
  * reject control bytes other than tab. Returns 0 ok, -1 bad (err set). */
 static int check_bytes(const unsigned char *p, size_t n, char *err, size_t errn) {
-    size_t i = 0;
-    while (i < n) {
-        unsigned char b = p[i];
-        if (b < 0x80) {
-            if ((b < 0x20 && b != '\t') || b == 0x7F) {
-                if (err && errn) snprintf(err, errn, "control character 0x%02X at byte %zu is not allowed", b, i);
-                return -1;
-            }
-            i++;
-            continue;
-        }
-        size_t len; uint32_t cp, min;
-        if ((b & 0xE0) == 0xC0) { len = 2; cp = b & 0x1F; min = 0x80; }
-        else if ((b & 0xF0) == 0xE0) { len = 3; cp = b & 0x0F; min = 0x800; }
-        else if ((b & 0xF8) == 0xF0) { len = 4; cp = b & 0x07; min = 0x10000; }
-        else goto bad;
-        if (i + len > n) goto bad;
-        for (size_t k = 1; k < len; k++) {
-            if ((p[i + k] & 0xC0) != 0x80) goto bad;
-            cp = (cp << 6) | (p[i + k] & 0x3F);
-        }
-        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) goto bad;
-        i += len;
-        continue;
-    bad:
-        if (err && errn) snprintf(err, errn, "invalid UTF-8 at byte %zu", i);
+    uint64_t dst[2] = { 0, 0 }, rc = 0;
+    if (n == 0) return 0;
+    if (omega2_visor_om_check_bytes(&rc, p, n, n, dst, 2) != OMEGA_OK) {
+        if (err && errn) snprintf(err, errn, "command validation failed");
+        return -1;
+    }
+    if (rc == 1) {
+        if (err && errn) snprintf(err, errn, "control character 0x%02X at byte %zu is not allowed",
+                                  (unsigned)dst[0], (size_t)dst[1]);
+        return -1;
+    }
+    if (rc != 0) {
+        if (err && errn) snprintf(err, errn, "invalid UTF-8 at byte %zu", (size_t)dst[1]);
         return -1;
     }
     return 0;
@@ -126,8 +112,15 @@ int visor_parse_command(const char *line, VisorCommand *out, char *err, size_t e
     if (check_bytes((const unsigned char *)line, n, err, errn) != 0) return -1;
 
     size_t a = 0, b = n;
-    while (a < b && is_blank(line[a])) a++;
-    while (b > a && is_blank(line[b - 1])) b--;
+    if (n > 0) {
+        uint64_t tr[2] = { 0, 0 }, u = 0;
+        if (omega2_visor_om_trim_blanks(&u, (const uint8_t *)line, n, n, tr, 2) != OMEGA_OK) {
+            if (err && errn) snprintf(err, errn, "command validation failed");
+            return -1;
+        }
+        a = (size_t)tr[0];
+        b = (size_t)tr[1];
+    }
     memcpy(out->line, line + a, b - a);
     out->line[b - a] = '\0';
 

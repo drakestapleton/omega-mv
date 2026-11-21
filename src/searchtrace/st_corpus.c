@@ -18,6 +18,7 @@
  * strict verifier. Format: spec/searchtrace/M23_SEARCH_TRACE_CORPUS_V1.md */
 #include "searchtrace/st_corpus.h"
 #include "searchtrace/st_hook.h"
+#include "omega_native.h"
 #include "omega_synthesis.h"
 #include "omega_realize_synth.h"
 #include "omega_machine.h"
@@ -38,8 +39,8 @@ static void set_why(char *why, size_t n, const char *fmt, ...) {
 }
 
 void st_hex(const uint8_t *b, size_t n, char *out) {
-    static const char d[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; ++i) { out[2 * i] = d[b[i] >> 4]; out[2 * i + 1] = d[b[i] & 15]; }
+    uint64_t u = 0;
+    if (n > 0) (void)omega2_st_om_hex_lower(&u, b, n, n, (uint8_t *)out, 2 * n);
     out[2 * n] = '\0';
 }
 
@@ -77,36 +78,31 @@ static void buf_printf(StBuf *b, const char *fmt, ...) {
 /* ---------------------------------------------------------------- task set */
 
 static bool name_ok(const char *s, size_t n) {
+    uint64_t ok = 0;
     if (n == 0 || n > 60) return false;
-    for (size_t i = 0; i < n; ++i) {
-        char c = s[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-              c == '_' || c == '.' || c == '-')) return false;
-    }
-    return true;
+    (void)omega2_st_om_label_ok(&ok, (const uint8_t *)s, n, n, 60);
+    return ok != 0;
 }
 
 /* Canonical unsigned decimal: no sign, no leading zero (except "0"), fits u64. */
 static bool parse_u64(const char *s, size_t n, uint64_t *out) {
-    if (n == 0 || n > 20 || (n > 1 && s[0] == '0')) return false;
-    uint64_t v = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (s[i] < '0' || s[i] > '9') return false;
-        uint64_t d = (uint64_t)(s[i] - '0');
-        if (v > (UINT64_MAX - d) / 10) return false;
-        v = v * 10 + d;
-    }
-    *out = v;
+    uint64_t dst[1] = { 0 };
+    uint64_t rc = 0;
+    if (n == 0) return false;
+    (void)omega2_st_om_parse_dec(&rc, (const uint8_t *)s, n, n, UINT64_MAX, dst, 1);
+    if (rc != 0) return false;
+    *out = dst[0];
     return true;
 }
 
 /* Canonical signed decimal (for return codes): "-" only before nonzero. */
 static bool parse_i64(const char *s, size_t n, int64_t *out) {
-    bool neg = n > 0 && s[0] == '-';
-    uint64_t v;
-    if (!parse_u64(s + neg, n - neg, &v) || v > (uint64_t)INT32_MAX + 1) return false;
-    if (neg && v == 0) return false;
-    *out = neg ? -(int64_t)v : (int64_t)v;
+    uint64_t dst[1] = { 0 };
+    uint64_t ok = 0;
+    if (n == 0) return false;
+    (void)omega2_st_om_parse_i64(&ok, (const uint8_t *)s, n, n, dst, 1);
+    if (!ok) return false;
+    *out = (int64_t)dst[0];
     return true;
 }
 

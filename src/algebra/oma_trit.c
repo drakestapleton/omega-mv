@@ -16,6 +16,7 @@
 
 /* Omega mixed algebra: trit, block, dot, integer conversion. */
 #include "algebra/oma_trit.h"
+#include "omega_native.h"
 
 const char *oma_strerror(int rc) {
     switch (rc) {
@@ -30,17 +31,6 @@ const char *oma_strerror(int rc) {
     case OMA_E_UNDERFLOW: return "quantization scale underflow";
     default: return "unknown error";
     }
-}
-
-static int popcount64(uint64_t x) {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_popcountll(x);
-#else
-    x = x - ((x >> 1) & 0x5555555555555555ull);
-    x = (x & 0x3333333333333333ull) + ((x >> 2) & 0x3333333333333333ull);
-    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0Full;
-    return (int)((x * 0x0101010101010101ull) >> 56);
-#endif
 }
 
 static int ctz64(uint64_t x) { /* x != 0 */
@@ -88,7 +78,7 @@ int oma_code_neg(int a, uint8_t *out) {
 int oma_code_add(int a, int b, uint8_t *sum, uint8_t *carry) {
     if (!sum || !carry) return OMA_E_ARG;
     if (a < 0 || a > 2 || b < 0 || b > 2) return OMA_E_INVALID_CODE;
-    oma_block A = {(uint64_t)(a & 1), (uint64_t)((a >> 1) & 1)}, B = {(uint64_t)(b & 1), (uint64_t)((b >> 1) & 1)}, S, C;
+    oma_block A = {(uint64_t)(a & 1), (uint64_t)((a >> 1) & 1)}, B = {(uint64_t)(b & 1), (uint64_t)((b >> 1) & 1)}, S = {0, 0}, C = {0, 0};
     int rc = oma_block_add(&A, &B, &S, &C);
     if (rc) return rc;
     *sum = (uint8_t)((S.pos & 1u) | ((S.neg & 1u) << 1));
@@ -99,7 +89,7 @@ int oma_code_add(int a, int b, uint8_t *sum, uint8_t *carry) {
 int oma_code_mul(int a, int b, uint8_t *out) {
     if (!out) return OMA_E_ARG;
     if (a < 0 || a > 2 || b < 0 || b > 2) return OMA_E_INVALID_CODE;
-    oma_block A = {(uint64_t)(a & 1), (uint64_t)((a >> 1) & 1)}, B = {(uint64_t)(b & 1), (uint64_t)((b >> 1) & 1)}, P;
+    oma_block A = {(uint64_t)(a & 1), (uint64_t)((a >> 1) & 1)}, B = {(uint64_t)(b & 1), (uint64_t)((b >> 1) & 1)}, P = {0, 0};
     int rc = oma_block_mul(&A, &B, &P);
     if (rc) return rc;
     *out = (uint8_t)((P.pos & 1u) | ((P.neg & 1u) << 1));
@@ -141,25 +131,20 @@ int oma_block_validate(const oma_block *b) {
 }
 
 int oma_block_encode(const int8_t in[OMA_BLOCK_TRITS], oma_block *out) {
-    uint64_t p = 0, n = 0;
+    uint64_t dst[2] = { 0, 0 }, rc = 0;
     if (!in || !out) return OMA_E_ARG;
-    for (int i = 0; i < OMA_BLOCK_TRITS; i++) {
-        if (in[i] == 1) p |= 1ull << i;
-        else if (in[i] == -1) n |= 1ull << i;
-        else if (in[i] != 0) return OMA_E_INVALID_TRIT;
-    }
-    out->pos = p;
-    out->neg = n;
+    (void)omega2_oma_om_block_encode(&rc, (const uint8_t *)in, OMA_BLOCK_TRITS, dst, 2);
+    if (rc) return -(int)rc;
+    out->pos = dst[0];
+    out->neg = dst[1];
     return OMA_OK;
 }
 
 int oma_block_decode(const oma_block *b, int8_t out[OMA_BLOCK_TRITS]) {
-    int rc;
-    if (!out) return OMA_E_ARG;
-    if ((rc = oma_block_validate(b))) return rc;
-    for (int i = 0; i < OMA_BLOCK_TRITS; i++)
-        out[i] = (int8_t)((int)((b->pos >> i) & 1u) - (int)((b->neg >> i) & 1u));
-    return OMA_OK;
+    uint64_t rc = 0;
+    if (!b || !out) return OMA_E_ARG;
+    (void)omega2_oma_om_block_decode(&rc, b->pos, b->neg, (uint8_t *)out, OMA_BLOCK_TRITS);
+    return rc ? -(int)rc : OMA_OK;
 }
 
 int oma_block_neg(const oma_block *a, oma_block *out) {
@@ -172,34 +157,36 @@ int oma_block_neg(const oma_block *a, oma_block *out) {
 }
 
 int oma_block_add(const oma_block *a, const oma_block *b, oma_block *sum, oma_block *carry) {
-    int rc;
-    if (!sum || !carry) return OMA_E_ARG;
-    if ((rc = oma_block_validate(a)) || (rc = oma_block_validate(b))) return rc;
-    uint64_t ap = a->pos, an = a->neg, bp = b->pos, bn = b->neg;
-    uint64_t az = ~(ap | an), bz = ~(bp | bn);
-    /* a+b in {-2..2}: +1 -> (1,0); +2 -> (-1,+1); -1 -> (-1,0); -2 -> (+1,-1). */
-    oma_block s = {(ap & bz) | (az & bp) | (an & bn), (an & bz) | (az & bn) | (ap & bp)};
-    oma_block c = {ap & bp, an & bn};
-    *sum = s;
-    *carry = c;
+    uint64_t av[2], bv[2], dst[4] = { 0, 0, 0, 0 }, rc = 0;
+    if (!a || !b || !sum || !carry) return OMA_E_ARG;
+    av[0] = a->pos; av[1] = a->neg;
+    bv[0] = b->pos; bv[1] = b->neg;
+    (void)omega2_oma_om_block_add(&rc, av, 2, bv, 2, dst, 4);
+    if (rc) return -(int)rc;
+    sum->pos = dst[0]; sum->neg = dst[1];
+    carry->pos = dst[2]; carry->neg = dst[3];
     return OMA_OK;
 }
 
 int oma_block_mul(const oma_block *a, const oma_block *b, oma_block *out) {
-    int rc;
-    if (!out) return OMA_E_ARG;
-    if ((rc = oma_block_validate(a)) || (rc = oma_block_validate(b))) return rc;
-    oma_block r = {(a->pos & b->pos) | (a->neg & b->neg), (a->pos & b->neg) | (a->neg & b->pos)};
-    *out = r;
+    uint64_t av[2], bv[2], dst[2] = { 0, 0 }, rc = 0;
+    if (!a || !b || !out) return OMA_E_ARG;
+    av[0] = a->pos; av[1] = a->neg;
+    bv[0] = b->pos; bv[1] = b->neg;
+    (void)omega2_oma_om_block_mul(&rc, av, 2, bv, 2, dst, 2);
+    if (rc) return -(int)rc;
+    out->pos = dst[0]; out->neg = dst[1];
     return OMA_OK;
 }
 
 int oma_block_dot(const oma_block *a, const oma_block *b, int32_t *out) {
-    oma_block p;
-    int rc;
-    if (!out) return OMA_E_ARG;
-    if ((rc = oma_block_mul(a, b, &p))) return rc;
-    *out = (int32_t)(popcount64(p.pos) - popcount64(p.neg));
+    uint64_t av[2], bv[2], dst[1] = { 0 }, rc = 0;
+    if (!a || !b || !out) return OMA_E_ARG;
+    av[0] = a->pos; av[1] = a->neg;
+    bv[0] = b->pos; bv[1] = b->neg;
+    (void)omega2_oma_om_block_dot(&rc, av, 2, bv, 2, dst, 1);
+    if (rc) return -(int)rc;
+    *out = (int32_t)(int64_t)dst[0];
     return OMA_OK;
 }
 
@@ -224,19 +211,13 @@ int oma_dot_tw_i8(const oma_block *w, const int8_t *x, size_t n, int32_t *out) {
 
 /* ---- integer <-> balanced ternary ---- */
 int oma_int_to_bt(int64_t v, int8_t *digits, size_t cap, size_t *ndigits) {
-    int8_t tmp[OMA_INT64_MAX_DIGITS];
-    size_t n = 0;
+    uint8_t tmp[41] = { 0 };
+    uint64_t n_out[1] = { 0 }, u = 0;
     if (!ndigits || (cap && !digits)) return OMA_E_ARG;
-    uint64_t u = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v; /* safe for INT64_MIN */
-    while (u) {
-        unsigned r = (unsigned)(u % 3u);
-        u /= 3u;
-        if (r == 2u) { tmp[n++] = -1; u += 1u; }
-        else tmp[n++] = (int8_t)r;
-    }
-    if (n > cap) return OMA_E_OVERFLOW;
-    for (size_t i = 0; i < n; i++) digits[i] = (int8_t)(v < 0 ? -tmp[i] : tmp[i]);
-    *ndigits = n;
+    (void)omega2_oma_om_int_to_bt(&u, (uint64_t)v, tmp, 41, n_out, 1);
+    if ((size_t)n_out[0] > cap) return OMA_E_OVERFLOW;
+    for (size_t i = 0; i < (size_t)n_out[0]; i++) digits[i] = (int8_t)tmp[i];
+    *ndigits = (size_t)n_out[0];
     return OMA_OK;
 }
 
@@ -248,25 +229,12 @@ int oma_int_to_bt_fixed(int64_t v, int8_t *digits, size_t n) {
     return OMA_OK;
 }
 
-static int add_i64(int64_t a, int64_t b, int64_t *r) {
-    if ((b > 0 && a > INT64_MAX - b) || (b < 0 && a < INT64_MIN - b)) return OMA_E_OVERFLOW;
-    *r = a + b;
-    return OMA_OK;
-}
-
 int oma_bt_to_int(const int8_t *digits, size_t n, int64_t *out) {
-    int64_t acc = 0;
+    uint64_t dst[1] = { 0 }, rc = 0;
     if (!out || (n && !digits)) return OMA_E_ARG;
-    for (size_t i = 0; i < n; i++)
-        if (digits[i] < -1 || digits[i] > 1) return OMA_E_INVALID_TRIT;
-    for (size_t i = n; i-- > 0;) {
-        /* acc*3 + d, ordered (acc+d)+acc+acc so every partial sum lies between
-         * zero and the final value: never a false overflow at INT64_MIN. */
-        int64_t t;
-        if (add_i64(acc, digits[i], &t) || add_i64(t, acc, &t) || add_i64(t, acc, &t))
-            return OMA_E_OVERFLOW;
-        acc = t;
-    }
-    *out = acc;
+    if (n == 0) { *out = 0; return OMA_OK; }
+    (void)omega2_oma_om_bt_to_int(&rc, (const uint8_t *)digits, n, n, dst, 1);
+    if (rc) return -(int)rc;
+    *out = (int64_t)dst[0];
     return OMA_OK;
 }

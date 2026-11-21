@@ -196,3 +196,200 @@ fn arboris_edge_ok profile ulong relation ulong subject ulong object_type ulong 
   return_range = and shr shr rule 32 object_type 1
   ret ne and return_domain return_range 0
 end
+
+note Finite non-negative binary32 check: sign bit 0 and exponent < 0xff (< 0x7f800000).
+fn arboris_f32_nonneg_finite bits uint to bool
+  ret lt bits 0x7f800000
+end
+
+note Validate a pull-based incoming-edge CSR in Slab 1 layout (hdr[1]=V, hdr[2]=E, hdr[11]=off_in_src, hdr[12]=off_in_weight).
+note Returns 0 on success, non-zero fail-closed error code on any invalid input.
+fn arboris_check_in_csr_impl hdr view ulong 16 csr view uint * to ulong
+  v_cnt = get hdr 1
+  e_cnt = get hdr 2
+  off_src = div get hdr 11 4
+  off_w = div get hdr 12 4
+  if or eq v_cnt 0 gt v_cnt 0x1fffffff
+    ret 1
+  end
+  if gt e_cnt 0xffffffff
+    ret 1
+  end
+  if or ne and get hdr 11 127 0 ne and get hdr 12 127 0
+    ret 2
+  end
+  if or lt off_src add v_cnt 1 or lt off_w add off_src e_cnt lt len csr add off_w e_cnt
+    ret 2
+  end
+  if ne get csr 0 0
+    ret 3
+  end
+  prev = ulong 0
+  for i ulong v_cnt bound 0x1fffffff
+    nxt = ulong get csr add i 1
+    if or lt nxt prev gt nxt e_cnt
+      ret 3
+    end
+    prev = nxt
+  end
+  if ne prev e_cnt
+    ret 3
+  end
+  for e ulong e_cnt bound 0xffffffff
+    if ge ulong get csr add off_src e v_cnt
+      ret 4
+    end
+    if not arboris_f32_nonneg_finite get csr add off_w e
+      ret 5
+    end
+  end
+  ret 0
+end
+
+fn arboris_in_edge_ok r view uint * epos ulong to ulong
+  prof = ulong get r 1
+  v_cnt = ulong get r 2
+  src = ulong get r epos
+  rel = ulong get r add epos 1
+  dst = ulong get r add epos 2
+  wbits = get r add epos 3
+  if or ge src v_cnt ge dst v_cnt
+    ret 4
+  end
+  ksrc = ulong get r add 6 mul src 3
+  kdst = ulong get r add 6 mul dst 3
+  if not arboris_edge_ok prof rel ksrc kdst
+    ret 7
+  end
+  if not arboris_f32_nonneg_finite wbits
+    ret 5
+  end
+  ret 0
+end
+
+fn arboris_in_records_valid r view uint * to ulong
+  if lt len r 6
+    ret 1
+  end
+  if ne get r 0 0x41523031
+    ret 1
+  end
+  prof = ulong get r 1
+  if or lt prof 1 gt prof 2
+    ret 1
+  end
+  v_cnt = ulong get r 2
+  e_cnt = ulong get r 3
+  if or eq v_cnt 0 gt v_cnt 0x1fffffff
+    ret 1
+  end
+  if gt e_cnt 0xffffffff
+    ret 1
+  end
+  if not arboris_f32_nonneg_finite get r 5
+    ret 5
+  end
+  if ne len r add 6 add mul v_cnt 3 mul e_cnt 4
+    ret 1
+  end
+  for i ulong v_cnt bound 0x1fffffff
+    pos = add 6 mul i 3
+    if not arboris_node_ok prof ulong get r pos get r add pos 1 get r add pos 2
+      ret 6
+    end
+  end
+  ebase = add 6 mul v_cnt 3
+  for e ulong e_cnt bound 0xffffffff
+    rc = arboris_in_edge_ok r add ebase mul e 4
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret 0
+end
+
+fn arboris_scatter_one r view uint * hdr view ulong 16 csr edit uint * epos ulong to void
+  dst = ulong get r add epos 2
+  idx = ulong get csr dst
+  put csr add div get hdr 11 4 idx get r epos
+  put csr add div get hdr 12 4 idx get r add epos 3
+  put csr dst add uint idx 1
+end
+
+fn arboris_scatter_in_csr r view uint * hdr view ulong 16 csr edit uint * to void
+  v_cnt = ulong get r 2
+  e_cnt = ulong get r 3
+  ebase = add 6 mul v_cnt 3
+  for e ulong e_cnt bound 0xffffffff
+    arboris_scatter_one r hdr csr add ebase mul e 4
+  end
+  for i ulong v_cnt bound 0x1fffffff
+    slot = sub v_cnt i
+    put csr slot get csr sub slot 1
+  end
+  put csr 0 0
+end
+
+fn arboris_csr_buf_ok hdr view ulong 16 v_cnt ulong e_cnt ulong csr_len ulong to bool
+  if or ne get hdr 1 v_cnt ne get hdr 2 e_cnt
+    ret false
+  end
+  if ne and get hdr 11 127 0
+    ret false
+  end
+  if ne and get hdr 12 127 0
+    ret false
+  end
+  off_src = div get hdr 11 4
+  off_w = div get hdr 12 4
+  if lt off_src add v_cnt 1
+    ret false
+  end
+  if lt off_w add off_src e_cnt
+    ret false
+  end
+  ret ge csr_len add off_w e_cnt
+end
+
+fn arboris_count_in_rows r view uint * csr edit uint * to void
+  v_cnt = ulong get r 2
+  e_cnt = ulong get r 3
+  for i ulong add v_cnt 1 bound 0x20000000
+    put csr i 0
+  end
+  ebase = add 6 mul v_cnt 3
+  for e ulong e_cnt bound 0xffffffff
+    dst = ulong get r add add ebase mul e 4 2
+    put csr dst add get csr dst 1
+  end
+  cur = uint 0
+  for v ulong v_cnt bound 0x1fffffff
+    cnt = get csr v
+    put csr v cur
+    cur = add cur cnt
+  end
+  put csr v_cnt cur
+end
+
+note Compile validated Arboris AR01 records into pull-based incoming-edge CSR in Slab 1 layout.
+note Fail closed before writing any output word.
+fn arboris_compile_in_csr_impl r view uint * hdr view ulong 16 csr edit uint * to ulong
+  rc = arboris_in_records_valid r
+  if ne rc 0
+    ret rc
+  end
+  if not arboris_csr_buf_ok hdr ulong get r 2 ulong get r 3 len csr
+    ret 2
+  end
+  arboris_count_in_rows r csr
+  arboris_scatter_in_csr r hdr csr
+  ret 0
+end
+
+export fn arboris_validate_in_csr hdr view ulong 16 csr view uint * to ulong
+  ret arboris_check_in_csr_impl hdr csr
+end
+
+export fn arboris_compile_in_csr r view uint * hdr view ulong 16 csr edit uint * to ulong
+  ret arboris_compile_in_csr_impl r hdr csr
+end

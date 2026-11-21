@@ -15,6 +15,7 @@
  */
 
 #include "algebra/oma_z3.h"
+#include "omega_native.h"
 
 int oma_z3_make(int v, oma_z3 *out) {
     if (!out) return OMA_E_ARG;
@@ -74,25 +75,20 @@ int oma_z3_block_validate(const oma_z3_block *b) {
 }
 
 int oma_z3_block_encode(const uint8_t in[OMA_BLOCK_TRITS], oma_z3_block *out) {
-    uint64_t o = 0, t = 0;
+    uint64_t dst[2] = { 0, 0 }, rc = 0;
     if (!in || !out) return OMA_E_ARG;
-    for (int i = 0; i < OMA_BLOCK_TRITS; i++) {
-        if (in[i] == 1) o |= 1ull << i;
-        else if (in[i] == 2) t |= 1ull << i;
-        else if (in[i] != 0) return OMA_E_INVALID_Z3;
-    }
-    out->one = o;
-    out->two = t;
+    (void)omega2_oma_om_z3_encode(&rc, in, OMA_BLOCK_TRITS, dst, 2);
+    if (rc) return -(int)rc;
+    out->one = dst[0];
+    out->two = dst[1];
     return OMA_OK;
 }
 
 int oma_z3_block_decode(const oma_z3_block *b, uint8_t out[OMA_BLOCK_TRITS]) {
-    int rc;
-    if (!out) return OMA_E_ARG;
-    if ((rc = oma_z3_block_validate(b))) return rc;
-    for (int i = 0; i < OMA_BLOCK_TRITS; i++)
-        out[i] = (uint8_t)(((b->one >> i) & 1u) | (((b->two >> i) & 1u) << 1));
-    return OMA_OK;
+    uint64_t rc = 0;
+    if (!b || !out) return OMA_E_ARG;
+    (void)omega2_oma_om_z3_decode(&rc, b->one, b->two, out, OMA_BLOCK_TRITS);
+    return rc ? -(int)rc : OMA_OK;
 }
 
 int oma_z3_block_from_trits(const oma_block *t, oma_z3_block *out) {
@@ -115,7 +111,7 @@ int oma_z3_block_add(const oma_z3_block *a, const oma_z3_block *b, oma_z3_block 
     int rc;
     if (!out) return OMA_E_ARG;
     if ((rc = oma_z3_block_validate(a)) || (rc = oma_z3_block_validate(b))) return rc;
-    oma_block ta = as_trits(a), tb = as_trits(b), s, c;
+    oma_block ta = as_trits(a), tb = as_trits(b), s = {0, 0}, c = {0, 0};
     if ((rc = oma_block_add(&ta, &tb, &s, &c))) return rc;
     *out = as_z3(&s); /* carry discarded: arithmetic mod 3 */
     return OMA_OK;

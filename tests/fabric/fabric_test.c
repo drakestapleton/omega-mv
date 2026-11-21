@@ -55,6 +55,11 @@ static int hex_eq(const uint8_t *b, const char *want) {
 
 /* ---- HMAC-SHA256 against RFC 4231 ---- */
 static void test_hmac(void) {
+    static uint8_t first[1000001], second[1000001];
+    CHECK(fab_ct_equal(first, second, sizeof first), "equal long buffers");
+    second[sizeof second - 1] = 1;
+    CHECK(!fab_ct_equal(first, second, sizeof first), "unequal long buffers");
+    CHECK(!fab_ct_equal(NULL, first, 32), "comparison refuses invalid input");
     uint8_t k1[20], t[32];
     memset(k1, 0x0b, sizeof k1);
     fab_hmac_sha256(k1, sizeof k1, (const uint8_t *)"Hi There", 8, t);
