@@ -1,12 +1,40 @@
 note SPDX-License-Identifier: Apache-2.0
-note protocol/uor-gpu/emit_kernels.om: Shared pure seeded OM-2 SM121 (SASS+QMD)
-note and SPIR-V kernel emitters, ML-BOM digest, golden CPU replay oracle, and pins.
-note Zero CUDApp. Compose after canonical.om.
+note protocol/uor-gpu/emit_kernels.om: Pure seeded OM-2 single-source GPU kernel compiler,
+note QMD v5 emitter driver, real source/ML-BOM hashing, and local trust-anchor builder.
+note Compiles SM121 payloads directly from om/gpu/bw_vecadd.om + om/gpu/bw_qmd.om and SPIR-V
+note payloads directly from gpu/spirv/emit.om using the SHA-256-verified seed/out/omc binary.
+note Zero duplicated SASS/QMD/SPIR-V fixtures. Zero CUDApp, zero C/Python/shell.
+note Compose after canonical.om, payload_vm.om, verify.om, gate.om.
 
 text ug_omc_hex "708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3"
-text ug_lean_hex "1a9ff232595d030375a5fc93cbc911eda176ff3eea9e845857ea11cfe696b1a5"
-text ug_src_tag "hologram:gpu/omega-om2@1:vecadd:v1"
-text ug_mlbom_tag "mlbom:v1:vecadd:f32:4:stateless"
+text ug_lean_hex "80eaf3c727cf34145605ce1a7c10bd0c61c28280d6fd10ce698bba9198ecf3b2"
+text ug_vecadd_sass_hex "39f3dfdfc529a75a8274a27900acf4e7382b7f280a211e0412c51609f44b62a1"
+text ug_default_omc "seed/out/omc"
+text ug_src_vecadd "om/gpu/bw_vecadd.om"
+text ug_src_qmd "om/gpu/bw_qmd.om"
+text ug_src_spirv "gpu/spirv/emit.om"
+text ug_tmp_pfx "/tmp/ug-"
+text ug_suf_om ".om"
+text ug_suf_bin ".bin"
+text ug_suf_out ".out"
+text ug_suf_err ".err"
+text ug_dev_null "/dev/null"
+text ug_line_om2 "om2\n"
+text ug_kw_export "export "
+text ug_arg_vadd "vadd"
+text ug_arg_cl "cl"
+text ug_arg_mut "mutant"
+text ug_mb_sm121 "mlbom:v2:sm121:u32:8:"
+text ug_mb_spirv "mlbom:v2:spirv:f32:8:"
+
+note Pure-Omega main driver appended to stripped om/gpu/bw_vecadd.om + om/gpu/bw_qmd.om.
+note Calls bw_encode_vecadd (512B SASS) + bw_qmd1 + bw_qmd_verify (384B QMD v5) -> 896B stdout.
+text ug_sm121_drv "fn ug_drv_put32 b edit uchar 384 o ulong v uint to void\nput b o uchar and v 255\nput b add o 1 uchar and shr v 8 255\nput b add o 2 uchar and shr v 16 255\nput b add o 3 uchar and shr v 24 255\nend\nfn main to int\ncode = new uchar 512 0\nm = new ulong 16 0\nq1 = new uint 96 0\nqb = new uchar 384 0\nn = bw_encode_vecadd code\nif ne n 512\nret 1\nend\nput m 0 0x100000000\nput m 1 0x100010000\nput m 2 0x100020000\nput m 3 0x100030000\nput m 4 0x100040000\nput m 5 256\nput m 6 256\nput m 7 1\nput m 8 256\nput m 9 1\nput m 10 1\nput m 11 1\nput m 12 16\nput m 13 0\nif ne bw_qmd1 m q1 0\nret 2\nend\nif ne bw_qmd_verify q1 0\nret 3\nend\nfor i ulong 96\nug_drv_put32 qb mul i 4 get q1 i\nend\nw1 = write 1 code 0 512\nw2 = write 1 qb 0 384\nif or ne w1 512 ne w2 384\nret 4\nend\nret 0\nend\n"
+
+const UG_O_RDONLY int 0
+const UG_O_WR_EXCL int 705
+const UG_MODE_600 int 384
+const UG_MODE_700 int 448
 
 fn ug_hex_nib c uchar to ulong
   v = ulong c
@@ -32,93 +60,515 @@ fn ug_parse_hex64 hx view uchar 128 dst edit uchar 64 to void
   end
 end
 
-fn ug_emit_w buf edit uchar 768 idx ulong w0 ulong w1 ulong w2 ulong w3 ulong to void
-  b = mul idx 16
-  uor_put_u32 buf b w0
-  uor_put_u32 buf add b 4 w1
-  uor_put_u32 buf add b 8 w2
-  uor_put_u32 buf add b 12 w3
+note Streaming SHA-256 of any file into an initialized sha256 context. Returns 1 on success, 0 on error.
+fn ug_sha256_file_into ctx edit ulong 40 path view uchar * pn ulong to ulong
+  fd = fopen path 0 pn UG_O_RDONLY 0
+  if lt fd 0
+    ret 0
+  end
+  buf = new uchar 4096 0
+  ok = ulong 1
+  while eq ok 1 bound 65536
+    k = read int fd buf 0 4096
+    if lt k 0
+      ok = ulong 0
+      break
+    end
+    if eq k 0
+      break
+    end
+    sha256_update ctx part buf 0 ulong k
+  end
+  cl = fclose int fd
+  ret ok
 end
 
-note Emit 512B Blackwell SM121 vecadd machine code + 256B canonical QMD (768B total).
-fn ug_emit_sm121_vecadd_qmd buf edit uchar 768 to void
-  for k ulong 768
-    put buf k uchar 0
+note Verify that omc_path's streaming SHA-256 matches ug_omc_hex. Returns 1 iff exact match.
+fn ug_check_omc_pin omc_path view uchar * pn ulong to ulong
+  ctx = new ulong 40 0
+  dig = new uchar 32 0
+  pin = new uchar 32 0
+  sha256_init ctx
+  if eq ug_sha256_file_into ctx omc_path pn 0
+    ret 0
   end
-  ug_emit_w buf 0 0xff017b82 0x0000df00 0x00000800 0x000fe200
-  ug_emit_w buf 1 0x00097919 0x00000000 0x00002500 0x000e2200
-  ug_emit_w buf 2 0xff0477ac 0x00006c00 0x08000800 0x000e2200
-  ug_emit_w buf 3 0x00007919 0x00000000 0x00002100 0x000e2200
-  ug_emit_w buf 4 0xff0577ac 0x00007300 0x08000800 0x000e6200
-  ug_emit_w buf 5 0x09097c24 0x00000004 0x0f8e0200 0x001fca00
-  ug_emit_w buf 6 0x09007c0c 0x00000005 0x0bf06070 0x002fda00
-  ug_emit_w buf 7 0x0000094d 0x00000000 0x03800000 0x000fea00
-  ug_emit_w buf 8 0xff027b82 0x0000e000 0x00000a00 0x000e2200
-  ug_emit_w buf 9 0xff0477ac 0x00006b00 0x08000a00 0x000e6e00
-  ug_emit_w buf 10 0xff047b82 0x0000e200 0x00000a00 0x000eb000
-  ug_emit_w buf 11 0xff067b82 0x0000e400 0x00000a00 0x000ee200
-  ug_emit_w buf 12 0x09027825 0x00000004 0x078e0002 0x001fcc00
-  ug_emit_w buf 13 0x02027981 0x00000004 0x0c1e1900 0x002f2200
-  ug_emit_w buf 14 0x09047825 0x00000004 0x078e0004 0x004fcc00
-  ug_emit_w buf 15 0x04057981 0x00000004 0x0c1e1900 0x000f2200
-  ug_emit_w buf 16 0x09067825 0x00000004 0x078e0006 0x008fe200
-  ug_emit_w buf 17 0x02097210 0x00000005 0x07ffe0ff 0x010fca00
-  ug_emit_w buf 18 0x06007986 0x00000009 0x0c101904 0x000fe200
-  ug_emit_w buf 19 0x0000794d 0x00000000 0x03800000 0x000fea00
-  ug_emit_w buf 20 0x00fc7947 0xfffffffc 0x0383ffff 0x000fc000
-  i = ulong 21
-  while lt i 32 bound 16
-    ug_emit_w buf i 0x00007918 0x00000000 0x00000000 0x000fc000
-    i = add i 1
-  end
-  note Canonical QMD v05.00 descriptor header at offset 512..767 (om/gpu/bw_qmd.om)
-  uor_put_u32 buf 512 0x00050000
-  uor_put_u32 buf 516 256
-  uor_put_u32 buf 520 1
-  uor_put_u32 buf 524 1
-  uor_put_u32 buf 528 0
-  uor_put_u32 buf 532 512
+  sha256_final ctx dig
+  ug_parse_hex32 ug_omc_hex pin
+  ret uor_eq32 dig 0 pin 0
 end
 
-note Emit canonical SPIR-V 1.0 OpenCL Kernel module (64 bytes, valid header+caps+entry).
-fn ug_emit_spirv_vadd buf edit uchar 64 to void
-  uor_put_u32 buf 0 0x07230203
-  uor_put_u32 buf 4 0x00010000
-  uor_put_u32 buf 8 0x00000000
-  uor_put_u32 buf 12 0x00000010
-  uor_put_u32 buf 16 0x00000000
-  uor_put_u32 buf 20 0x00020011
-  uor_put_u32 buf 24 0x00000006
-  uor_put_u32 buf 28 0x00020011
-  uor_put_u32 buf 32 0x00000004
-  uor_put_u32 buf 36 0x0003000e
-  uor_put_u32 buf 40 0x00000002
-  uor_put_u32 buf 44 0x00000002
-  uor_put_u32 buf 48 0x0004000f
-  uor_put_u32 buf 52 0x00000006
-  uor_put_u32 buf 56 0x00000005
-  uor_put_u32 buf 60 0x64646176
+note Copy bytes into dst[off..off+n); returns new off.
+fn ug_pcat dst edit uchar 128 off ulong src view uchar * n ulong to ulong
+  for i ulong n bound 128
+    put dst add off i get src i
+  end
+  ret add off n
 end
 
-note Pure OM-2 CPU reference oracle for vecadd golden replay vector (4 x u32).
-fn ug_replay_digest dst32 edit uchar 32 to void
-  vec = new uchar 16 0
-  for i ulong 4
-    a = add mul i 3 10
-    b = add mul i 5 20
-    uor_put_u32 vec mul i 4 add a b
+note Build unique /tmp/ug-<16hex><suf> path; returns path length.
+fn ug_mkpath base view uchar 24 suf view uchar * dst edit uchar 128 to ulong
+  o = ug_pcat dst 0 base 24
+  ret ug_pcat dst o suf len suf
+end
+
+note Generate 24-byte unique prefix "/tmp/ug-<16 random hex chars>". Returns 1 on success.
+fn ug_rand_prefix base edit uchar 24 to ulong
+  rb = new uchar 8 0
+  if ne random rb 0 8 0 8
+    ret 0
   end
-  d = sha2_digest 256 vec dst32
-  if ne d 32
-    trap 8
+  for i ulong 8
+    put base i get ug_tmp_pfx i
+  end
+  for i ulong 8
+    b = ulong get rb i
+    put base add 8 mul i 2 get uor_hex_tbl shr b 4
+    put base add 9 mul i 2 get uor_hex_tbl and b 15
+  end
+  ret 1
+end
+
+note Append one arg to packed execprog argv packet av[0..512); pos[0]=bytes, pos[1]=argc.
+fn ug_av_add av edit uchar 512 pos edit ulong 2 s view uchar * n ulong to void
+  p = get pos 0
+  put av p uchar and n 255
+  put av add p 1 uchar and shr n 8 255
+  for i ulong n bound 256
+    put av add add p 2 i get s i
+  end
+  put pos 0 add p add n 2
+  c = add get pos 1 1
+  put pos 1 c
+  put av 0 uchar and c 255
+  put av 1 uchar and shr c 8 255
+end
+
+fn ug_close_all fi int fo int fe int to void
+  if ge fi 0
+    c1 = fclose fi
+  end
+  if ge fo 0
+    c2 = fclose fo
+  end
+  if ge fe 0
+    c3 = fclose fe
   end
 end
 
-note Populate standard P3 header fields (omc_pin, src, lean_proof, replay, mlbom).
-fn ug_fill_p3_hdr hdr edit uchar 384 isa ulong plen ulong to void
+note Spawn execprog(av[0..avlen)) with stdin=in_fd, stdout=out_fd, stderr=err_fd (closes fds in parent).
+note Returns 1 iff child exited cleanly with status 0.
+fn ug_spawn av view uchar 512 avlen ulong fi int fo int fe int to ulong
+  stb = new uchar 4 0
+  if lt fi 0
+    ug_close_all fi fo fe
+    ret 0
+  end
+  if lt fo 0
+    ug_close_all fi fo fe
+    ret 0
+  end
+  if lt fe 0
+    ug_close_all fi fo fe
+    ret 0
+  end
+  pid = fork
+  if lt pid 0
+    ug_close_all fi fo fe
+    ret 0
+  end
+  if eq pid 0
+    if ne dupfd fi 0 0 0
+      exit 127
+    end
+    if ne dupfd fo 1 0 1
+      exit 127
+    end
+    if ne dupfd fe 2 0 2
+      exit 127
+    end
+    er = execprog av 0 avlen
+    exit 127
+  end
+  ug_close_all fi fo fe
+  r = waitpid int pid stb 0 4 0
+  if ne r pid
+    ret 0
+  end
+  if ne get stb 0 uchar 0
+    ret 0
+  end
+  if ne get stb 1 uchar 0
+    ret 0
+  end
+  ret 1
+end
+
+note Returns 1 iff file at path[0..pn) exists and has byte length 0.
+fn ug_file_empty path view uchar * pn ulong to ulong
+  fd = fopen path 0 pn UG_O_RDONLY 0
+  if lt fd 0
+    ret 0
+  end
+  b = new uchar 1 0
+  k = read int fd b 0 1
+  cl = fclose int fd
+  if eq k 0
+    ret 1
+  end
+  ret 0
+end
+
+note Read whole file into dst (at most len dst bytes); returns byte count or -1 on error/overflow.
+fn ug_read_all path view uchar * pn ulong dst edit uchar * to long
+  fd = fopen path 0 pn UG_O_RDONLY 0
+  if lt fd 0
+    ret -1
+  end
+  cap = len dst
+  got = ulong 0
+  while lt got cap bound 65536
+    k = read int fd dst got sub cap got
+    if lt k 0
+      cl = fclose int fd
+      ret -1
+    end
+    if eq k 0
+      break
+    end
+    got = add got ulong k
+  end
+  ex = new uchar 1 0
+  ek = read int fd ex 0 1
+  cl = fclose int fd
+  if gt ek 0
+    ret -1
+  end
+  ret long got
+end
+
+note True iff line[0..ln) is "om2" (with optional trailing LF/CR).
+fn ug_is_om2_line line view uchar 1024 ln ulong to ulong
+  n = ln
+  if gt n 0
+    if eq get line sub n 1 uchar 10
+      n = sub n 1
+    end
+  end
+  if gt n 0
+    if eq get line sub n 1 uchar 13
+      n = sub n 1
+    end
+  end
+  if ne n 3
+    ret 0
+  end
+  if ne get line 0 uchar 111
+    ret 0
+  end
+  if ne get line 1 uchar 109
+    ret 0
+  end
+  if ne get line 2 uchar 50
+    ret 0
+  end
+  ret 1
+end
+
+note True iff line[0..ln) starts with "export ".
+fn ug_starts_export line view uchar 1024 ln ulong to ulong
+  if lt ln 7
+    ret 0
+  end
+  for i ulong 7
+    if ne get line i get ug_kw_export i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+note Write one filtered line to fd (skipping bare "om2" lines and stripping leading "export ").
+fn ug_emit_line fd int line view uchar 1024 ln ulong to ulong
+  if eq ln 0
+    ret 1
+  end
+  if ne ug_is_om2_line line ln 0
+    ret 1
+  end
+  st = ulong 0
+  if ne ug_starts_export line ln 0
+    st = ulong 7
+  end
+  remn = sub ln st
+  w = write fd line st remn
+  if ne w long remn
+    ret 0
+  end
+  ret 1
+end
+
+fn ug_feed_lines buf view uchar 4096 ku ulong out_fd int line edit uchar 1024 st edit ulong 2 to void
+  for i ulong ku bound 4096
+    ch = get buf i
+    ln = get st 0
+    if ge ln 1024
+      put st 1 0
+      ret
+    end
+    put line ln ch
+    ln = add ln 1
+    if eq ch uchar 10
+      if eq ug_emit_line out_fd line ln 0
+        put st 1 0
+        ret
+      end
+      ln = ulong 0
+    end
+    put st 0 ln
+  end
+end
+
+note Stream src file: hash exact raw bytes into sha_ctx, and emit filtered OM-2 lines into out_fd.
+fn ug_stream_source src_path view uchar * out_fd int ctx edit ulong 40 to ulong
+  buf = new uchar 4096 0
+  line = new uchar 1024 0
+  nl = new uchar 1 10
+  st = new ulong 2 0
+  fd = fopen src_path 0 len src_path UG_O_RDONLY 0
+  if lt fd 0
+    ret 0
+  end
+  put st 1 1
+  while eq get st 1 1 bound 65536
+    k = read int fd buf 0 4096
+    if lt k 0
+      put st 1 0
+      break
+    end
+    if eq k 0
+      break
+    end
+    sha256_update ctx part buf 0 ulong k
+    ug_feed_lines buf ulong k out_fd line st
+  end
+  cl = fclose int fd
+  if eq get st 1 0
+    ret 0
+  end
+  if gt get st 0 0
+    if eq ug_emit_line out_fd line get st 0 0
+      ret 0
+    end
+    if ne write out_fd nl 0 1 1
+      ret 0
+    end
+  end
+  ret 1
+end
+
+note Compile composed OM-2 file in_path using verified omc_path -> executable <base>.bin (stderr <base>.err).
+fn ug_run_omc omc_path view uchar * in_path view uchar * base view uchar 24 to ulong
+  av = new uchar 512 0
+  pos = new ulong 2 0
+  pbin = new uchar 128 0
+  perr = new uchar 128 0
+  put pos 0 2
+  put pos 1 0
+  ug_av_add av pos omc_path len omc_path
+  lbin = ug_mkpath base ug_suf_bin pbin
+  lerr = ug_mkpath base ug_suf_err perr
+  fi = fopen in_path 0 len in_path UG_O_RDONLY 0
+  fo = fopen pbin 0 lbin UG_O_WR_EXCL UG_MODE_700
+  fe = fopen perr 0 lerr UG_O_WR_EXCL UG_MODE_600
+  if eq ug_spawn av get pos 0 int fi int fo int fe 0
+    ret 0
+  end
+  ret ug_file_empty perr lerr
+end
+
+note Write composed SM121 emitter source into <base>.om and compute real source SHA-256 into src_dig32.
+fn ug_write_sm121_om base view uchar 24 src_dig32 edit uchar 32 to ulong
+  pom = new uchar 128 0
+  ctx = new ulong 40 0
+  lom = ug_mkpath base ug_suf_om pom
+  fd = fopen pom 0 lom UG_O_WR_EXCL UG_MODE_600
+  if lt fd 0
+    ret 0
+  end
+  sha256_init ctx
+  ok = ulong 1
+  if ne write int fd ug_line_om2 0 len ug_line_om2 long len ug_line_om2
+    ok = ulong 0
+  end
+  if eq ok 1
+    if eq ug_stream_source ug_src_vecadd int fd ctx 0
+      ok = ulong 0
+    end
+  end
+  if eq ok 1
+    if eq ug_stream_source ug_src_qmd int fd ctx 0
+      ok = ulong 0
+    end
+  end
+  if eq ok 1
+    if ne write int fd ug_sm121_drv 0 len ug_sm121_drv long len ug_sm121_drv
+      ok = ulong 0
+    end
+  end
+  cl = fclose int fd
+  sha256_final ctx src_dig32
+  ret ok
+end
+
+note Run <base>.bin with packed argv (av[0..avlen)), capture stdout into <base>.out -> pay_out.
+note Returns byte count >= 0, or -1 on error/non-empty stderr.
+fn ug_exec_capture base view uchar 24 av view uchar 512 avlen ulong pay_out edit uchar 65536 to long
+  pout = new uchar 128 0
+  perr = new uchar 128 0
+  lout = ug_mkpath base ug_suf_out pout
+  lerr = ug_mkpath base ug_suf_err perr
+  u = unlink perr 0 lerr
+  fi = fopen ug_dev_null 0 len ug_dev_null UG_O_RDONLY 0
+  fo = fopen pout 0 lout UG_O_WR_EXCL UG_MODE_600
+  fe = fopen perr 0 lerr UG_O_WR_EXCL UG_MODE_600
+  ok = ug_spawn av avlen int fi int fo int fe
+  if eq ok 1
+    ok = ug_file_empty perr lerr
+  end
+  nb = long -1
+  if eq ok 1
+    nb = ug_read_all pout lout pay_out
+  end
+  u = unlink pout 0 lout
+  u = unlink perr 0 lerr
+  ret nb
+end
+
+fn ug_cleanup_base base view uchar 24 to void
+  p = new uchar 128 0
+  l = ug_mkpath base ug_suf_om p
+  u = unlink p 0 l
+  l = ug_mkpath base ug_suf_bin p
+  u = unlink p 0 l
+  l = ug_mkpath base ug_suf_out p
+  u = unlink p 0 l
+  l = ug_mkpath base ug_suf_err p
+  u = unlink p 0 l
+end
+
+note Compile SM121 payload directly from om/gpu/bw_vecadd.om + om/gpu/bw_qmd.om with verified omc.
+note Writes exact 896B (512B SASS || 384B full QMD v5) into pay_out and real source SHA-256 into src_dig32.
+fn ug_compile_sm121 omc_path view uchar * pay_out edit uchar 65536 out_plen edit ulong 1 src_dig32 edit uchar 32 to ulong
+  base = new uchar 24 0
+  p = new uchar 128 0
+  av = new uchar 512 0
+  pos = new ulong 2 0
+  if eq ug_check_omc_pin omc_path len omc_path 0
+    ret 0
+  end
+  if eq ug_rand_prefix base 0
+    ret 0
+  end
+  ok = ug_write_sm121_om base src_dig32
+  if eq ok 1
+    lom = ug_mkpath base ug_suf_om p
+    ok = ug_run_omc omc_path part p 0 lom base
+  end
+  if eq ok 1
+    lbin = ug_mkpath base ug_suf_bin p
+    put pos 0 2
+    put pos 1 0
+    ug_av_add av pos p lbin
+    nb = ug_exec_capture base av get pos 0 pay_out
+    if ne nb long UOR_SM121_PAYLOAD_BYTES
+      ok = ulong 0
+    else
+      put out_plen 0 UOR_SM121_PAYLOAD_BYTES
+    end
+  end
+  ug_cleanup_base base
+  ret ok
+end
+
+fn ug_hash_file path view uchar * dst32 edit uchar 32 to ulong
+  ctx = new ulong 40 0
+  sha256_init ctx
+  if eq ug_sha256_file_into ctx path len path 0
+    ret 0
+  end
+  sha256_final ctx dst32
+  ret 1
+end
+
+note Compile SPIR-V 1.0 OpenCL Kernel payload directly from gpu/spirv/emit.om with verified omc.
+note is_mutant == 0: `vadd cl` (OpFAdd); is_mutant == 1: `vadd cl mutant` (OpFSub, for negative control).
+fn ug_compile_spirv omc_path view uchar * is_mutant ulong pay_out edit uchar 65536 out_plen edit ulong 1 src_dig32 edit uchar 32 to ulong
+  base = new uchar 24 0
+  pbin = new uchar 128 0
+  av = new uchar 512 0
+  pos = new ulong 2 0
+  if eq ug_check_omc_pin omc_path len omc_path 0
+    ret 0
+  end
+  if eq ug_hash_file ug_src_spirv src_dig32 0
+    ret 0
+  end
+  if eq ug_rand_prefix base 0
+    ret 0
+  end
+  ok = ug_run_omc omc_path ug_src_spirv base
+  if eq ok 1
+    lbin = ug_mkpath base ug_suf_bin pbin
+    put pos 0 2
+    put pos 1 0
+    ug_av_add av pos pbin lbin
+    ug_av_add av pos ug_arg_vadd len ug_arg_vadd
+    ug_av_add av pos ug_arg_cl len ug_arg_cl
+    if ne is_mutant 0
+      ug_av_add av pos ug_arg_mut len ug_arg_mut
+    end
+    nb = ug_exec_capture base av get pos 0 pay_out
+    if le nb 20
+      ok = ulong 0
+    end
+    if gt nb 65536
+      ok = ulong 0
+    end
+    if eq ok 1
+      put out_plen 0 ulong nb
+    end
+  end
+  ug_cleanup_base base
+  ret ok
+end
+
+note Compute real ML-BOM digest over structured manifest tag || golden input slab A[0..8) || B[0..8).
+fn ug_mlbom_digest isa ulong dst32 edit uchar 32 to void
+  ctx = new ulong 40 0
+  slab = new uchar 64 0
+  sha256_init ctx
+  if eq isa UOR_GPU_ISA_SM121
+    sha256_update ctx ug_mb_sm121
+    for i ulong UOR_REPLAY_N
+      uor_put_u32 slab mul i 4 add mul i 3 10
+      uor_put_u32 slab add 32 mul i 4 add mul i 5 20
+    end
+  else
+    sha256_update ctx ug_mb_spirv
+    for i ulong UOR_REPLAY_N
+      uor_put_u32 slab mul i 4 ulong bitcast uint f32 add mul i 3 10
+      uor_put_u32 slab add 32 mul i 4 ulong bitcast uint f32 add mul i 5 20
+    end
+  end
+  sha256_update ctx slab
+  sha256_final ctx dst32
+end
+
+note Populate P3 header using real source SHA-256, pinned omc/Lean digests, real ML-BOM slab digest,
+note and real kernel replay executed directly over pay[0..len pay). Returns UOR_VERDICT_PASS or error.
+fn ug_fill_p3_hdr_real hdr edit uchar 384 isa ulong pay view uchar * src_dig view uchar 32 to ulong
   omc_pin = new uchar 32 0
   lean_dig = new uchar 32 0
-  src_dig = new uchar 32 0
   rep_dig = new uchar 32 0
   mb_dig = new uchar 32 0
   meta = new ulong 5 0
@@ -127,23 +577,23 @@ fn ug_fill_p3_hdr hdr edit uchar 384 isa ulong plen ulong to void
   end
   ug_parse_hex32 ug_omc_hex omc_pin
   ug_parse_hex32 ug_lean_hex lean_dig
-  sd = sha2_digest 256 ug_src_tag src_dig
-  md = sha2_digest 256 ug_mlbom_tag mb_dig
-  if or ne sd 32 ne md 32
-    trap 8
-  end
-  ug_replay_digest rep_dig
+  ug_mlbom_digest isa mb_dig
   put meta 0 isa
   put meta 1 UOR_GPU_MATH_RN
   put meta 2 UOR_LVL_P3
-  put meta 3 plen
+  put meta 3 len pay
   put meta 4 256
   uor_hdr_write_meta hdr meta
+  rc = uvm_replay_payload hdr pay rep_dig
+  if ne rc UOR_VERDICT_PASS
+    ret rc
+  end
   uor_copy32 hdr 32 omc_pin 0
   uor_copy32 hdr 64 src_dig 0
   uor_copy32 hdr 128 lean_dig 0
   uor_copy32 hdr 160 rep_dig 0
   uor_copy32 hdr 192 mb_dig 0
+  ret UOR_VERDICT_PASS
 end
 
 note Build 136-byte local trust anchors (one signer) with this build's omc and Lean proof pins:

@@ -1,15 +1,23 @@
 note SPDX-License-Identifier: Apache-2.0
 note protocol/uor-gpu/uor-gpu-gate.om: Pure seeded OM-2 self-verifying host gate for
 note hologram:gpu/omega-om2@1 (UOR-GPU-1). Zero CUDApp, zero C/Python/shell.
-note Exercises RFC 8032 Ed25519 signing and verification vectors, SM121 (SASS+QMD) and SPIR-V
-note bundles signed in Omega, local trust anchors (trusted signer list, omc and Lean proof pins,
-note separate capability authority), deterministic SHA-256+BLAKE3+Ed25519, P3 CPU reference
-note replay, authority-signed capability grants, and negative controls for each refusal.
+note Run from the omega-mv repository root with pinned seed/out/omc.
+note Exercises:
+note   - RFC 8032 Ed25519 signing and verification vectors
+note   - Single-source SM121 compilation directly from om/gpu/bw_vecadd.om + om/gpu/bw_qmd.om
+note     via SHA-256-verified seed/out/omc (512B SASS cross-checked against OMEGA_BW_VECADD_EXPECTED_SHA256
+note     + full 384B QMD v05.00 descriptor = 896B)
+note   - Single-source SPIR-V 1.0 OpenCL Kernel compilation directly from gpu/spirv/emit.om
+note   - Real P3 kernel VM replay executing the actual SM121 SASS+QMD v5 and SPIR-V binary bytes
+note     over both in-bounds (0..7) and out-of-bounds (8..11) threads/work-items
+note   - Local trust anchors, authority-signed capability grants, and 33 negative controls
+note     (including QMD v5 SKEDCHECK05 mutants, SM121 SASS arithmetic/OOB/illegal-op mutants,
+note     real SPIR-V emit.om `vadd cl mutant` OpFSub mutant, and unpinned omc refusal).
 note The seeds below are derived from public tags: TEST ONLY, never a production key.
 note Compose after si/directives/om2.om, om/tls/sha2.om, protocol/uor-gpu/b3_uor.om,
 note protocol/omnet/om/sha512/sha512.om, protocol/omnet/om/ed25519/ed25519.om,
-note protocol/uor-gpu/canonical.om, protocol/uor-gpu/verify.om, protocol/uor-gpu/gate.om,
-note protocol/uor-gpu/emit_kernels.om, protocol/uor-gpu/ed_sign.om.
+note protocol/uor-gpu/canonical.om, protocol/uor-gpu/payload_vm.om, protocol/uor-gpu/verify.om,
+note protocol/uor-gpu/gate.om, protocol/uor-gpu/emit_kernels.om, protocol/uor-gpu/ed_sign.om.
 
 text ug_pass_msg "UOR_GPU_GATE_PASS\n"
 text ug_fail_msg "UOR_GPU_GATE_FAIL\n"
@@ -23,9 +31,8 @@ text ug_ed2_sg "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da
 text ug_tag_signer "uor-gpu-gate:test-signer:v1"
 text ug_tag_auth "uor-gpu-gate:test-authority:v1"
 text ug_tag_rogue "uor-gpu-gate:test-rogue:v1"
+text ug_bad_omc "protocol/uor-gpu/README.md"
 
-note 1 iff Omega derives the RFC public key, produces the RFC signature byte for byte, verifies
-note it, and refuses a 1-bit change.
 fn ug_ed_vec seedhex view uchar 64 pkhex view uchar 64 sghex view uchar 128 m view uchar 65536 n ulong to ulong
   sd = new uchar 32 0
   pk = new uchar 32 0
@@ -66,7 +73,6 @@ fn ug_selftest_ed to ulong
   ret ug_ed_vec ug_ed2_seed ug_ed2_pk ug_ed2_sg m 1
 end
 
-note sk[0..32) signer seed, sk[32..64) authority seed, sk[64..96) rogue seed
 fn ug_seeds sk edit uchar 96 to void
   t = new uchar 32 0
   a = sha2_digest 256 ug_tag_signer t
@@ -103,14 +109,16 @@ fn ug_make_anchors anc edit uchar 136 sk view uchar 96 to void
   ug_build_anchors anc apk spk
 end
 
-fn ug_make_bundle hdr edit uchar 384 pay view uchar * seed view uchar 32 isa ulong to void
-  ug_fill_p3_hdr hdr isa len pay
+fn ug_make_bundle hdr edit uchar 384 pay view uchar * sdig view uchar 32 seed view uchar 32 isa ulong to ulong
+  rc = ug_fill_p3_hdr_real hdr isa pay sdig
+  if ne rc UOR_VERDICT_PASS
+    ret rc
+  end
   uor_hdr_seal hdr pay
   ues_sign_hdr hdr seed
+  ret UOR_VERDICT_PASS
 end
 
-note Grant: live, generation 42, epoch 1, expiry 1000, subject 7, GB10, RX_RIGHT_EFFECT;
-note request: generation 42, epoch 1, clock 100, subject 7, GB10; signed by seed.
 fn ug_make_grant g edit uchar 168 seed view uchar 32 to void
   for i ulong 168
     put g i uchar 0
@@ -130,14 +138,26 @@ fn ug_make_grant g edit uchar 168 seed view uchar 32 to void
   ues_sign_grant g seed
 end
 
-note Positive: deterministic bundle bytes (incl. Ed25519), P0/P2/P3 policy, replay, admission.
-fn ug_check_positive hdr view uchar 384 pay view uchar 768 anc view uchar * sk view uchar 96 to ulong
+note Positive: exact OMEGA_BW_VECADD_EXPECTED_SHA256 match, deterministic build, P0/P2/P3,
+note real SM121 SASS+QMD v5 replay, and authority-signed grant admission.
+fn ug_check_positive hdr view uchar 384 pay view uchar * sdig view uchar 32 anc view uchar 136 sk view uchar 96 to ulong
   h2 = new uchar 384 0
   sd = new uchar 32 0
-  rep = new uchar 32 0
   g = new uchar 168 0
+  sass_dig = new uchar 32 0
+  sass_exp = new uchar 32 0
+  d = sha2_digest 256 part pay 0 UOR_SM121_CODE_BYTES sass_dig
+  if ne d 32
+    ret 2
+  end
+  ug_parse_hex32 ug_vecadd_sass_hex sass_exp
+  if eq uor_eq32 sass_dig 0 sass_exp 0 0
+    ret 2
+  end
   ug_seed_at sk 0 sd
-  ug_make_bundle h2 pay sd UOR_GPU_ISA_SM121
+  if ne ug_make_bundle h2 pay sdig sd UOR_GPU_ISA_SM121 UOR_VERDICT_PASS
+    ret 2
+  end
   for i ulong 384
     if ne get hdr i get h2 i
       ret 2
@@ -152,8 +172,7 @@ fn ug_check_positive hdr view uchar 384 pay view uchar 768 anc view uchar * sk v
   if ne uor_verify_policy hdr pay anc UOR_LVL_P3 UOR_VERDICT_PASS
     ret 5
   end
-  ug_replay_digest rep
-  if ne uor_verify_replay hdr rep UOR_VERDICT_PASS
+  if ne uor_verify_replay_real hdr pay UOR_VERDICT_PASS
     ret 6
   end
   ug_seed_at sk 32 sd
@@ -164,28 +183,62 @@ fn ug_check_positive hdr view uchar 384 pay view uchar 768 anc view uchar * sk v
   ret 0
 end
 
+note Compile real SPIR-V 1.0 OpenCL vadd from gpu/spirv/emit.om, run P3 policy + real SPIR-V VM replay,
+note then compile the real `vadd cl mutant` (OpFSub), seal+sign it, and verify real replay catches it!
 fn ug_check_spirv anc view uchar * sk view uchar 96 to ulong
   h = new uchar 384 0
-  pay = new uchar 64 0
+  pay = new uchar 65536 0
+  plen = new ulong 1 0
+  sdig = new uchar 32 0
   sd = new uchar 32 0
   ug_seed_at sk 0 sd
-  ug_emit_spirv_vadd pay
-  ug_make_bundle h pay sd UOR_GPU_ISA_SPIRV
-  if ne uor_verify_policy h pay anc UOR_LVL_P3 UOR_VERDICT_PASS
+  if eq ug_compile_spirv ug_default_omc 0 pay plen sdig 0
     ret 7
+  end
+  n = get plen 0
+  if ne ug_make_bundle h part pay 0 n sdig sd UOR_GPU_ISA_SPIRV UOR_VERDICT_PASS
+    ret 7
+  end
+  if ne uor_verify_policy h part pay 0 n anc UOR_LVL_P3 UOR_VERDICT_PASS
+    ret 7
+  end
+  if ne uor_verify_replay_real h part pay 0 n UOR_VERDICT_PASS
+    ret 9
+  end
+  note Negative control: corrupt SPIR-V magic (resealed + re-signed) -> UOR_ERR_BAD_SPIRV
+  put pay 0 uchar 0
+  uor_hdr_seal h part pay 0 n
+  ues_sign_hdr h sd
+  if ne uor_verify_policy h part pay 0 n anc UOR_LVL_P2 UOR_ERR_BAD_SPIRV
+    ret 57
+  end
+  note Negative control: compile real `gpu/spirv/emit.om vadd cl mutant` (OpFSub instead of OpFAdd),
+  note seal + sign with trusted key -> P2 passes, real SPIR-V VM replay MUST refuse (UOR_ERR_REPLAY_MISMATCH)!
+  if eq ug_compile_spirv ug_default_omc 1 pay plen sdig 0
+    ret 58
+  end
+  n = get plen 0
+  if ne ug_make_bundle h part pay 0 n sdig sd UOR_GPU_ISA_SPIRV UOR_VERDICT_PASS
+    ret 58
+  end
+  if ne uor_verify_policy h part pay 0 n anc UOR_LVL_P2 UOR_VERDICT_PASS
+    ret 58
+  end
+  if ne uor_verify_replay_real h part pay 0 n UOR_ERR_REPLAY_MISMATCH
+    ret 59
   end
   ret 0
 end
 
 note Integrity and pin refusals.
-fn ug_neg_integrity hdr view uchar 384 pay view uchar 768 anc view uchar * to ulong
+fn ug_neg_integrity hdr view uchar 384 pay view uchar * anc view uchar * to ulong
   thdr = new uchar 384 0
-  tpay = new uchar 768 0
+  tpay = new uchar 896 0
   ac = new uchar 136 0
   for i ulong 384
     put thdr i get hdr i
   end
-  for i ulong 768
+  for i ulong UOR_SM121_PAYLOAD_BYTES
     put tpay i get pay i
   end
   for i ulong 136
@@ -231,14 +284,17 @@ fn ug_neg_integrity hdr view uchar 384 pay view uchar 768 anc view uchar * to ul
   if ne uor_verify_policy hdr pay ac UOR_LVL_P2 UOR_ERR_OMC_PIN
     ret 16
   end
+  note unpinned omc binary refused by compiler pin check
+  if ne ug_check_omc_pin ug_bad_omc len ug_bad_omc 0
+    ret 17
+  end
   ret 0
 end
 
 note Signature and level refusals ("Nothing raises a level except signing").
-fn ug_neg_sig hdr view uchar 384 pay view uchar 768 anc view uchar * sk view uchar 96 to ulong
+fn ug_neg_sig hdr view uchar 384 pay view uchar * anc view uchar * sk view uchar 96 to ulong
   thdr = new uchar 384 0
   rs = new uchar 32 0
-  rep = new uchar 32 0
   for i ulong 384
     put thdr i get hdr i
   end
@@ -283,17 +339,91 @@ fn ug_neg_sig hdr view uchar 384 pay view uchar 768 anc view uchar * sk view uch
   if ne uor_verify_policy thdr pay anc UOR_LVL_P1 UOR_ERR_LEVEL_LOW
     ret 27
   end
-  note replay digest mismatch
-  ug_replay_digest rep
-  put rep 0 xor get rep 0 uchar 1
-  if ne uor_verify_replay hdr rep UOR_ERR_REPLAY_MISMATCH
+  note replay digest mismatch (corrupted hdr.replay_sha256)
+  for i ulong 384
+    put thdr i get hdr i
+  end
+  put thdr 160 xor get thdr 160 uchar 1
+  if ne uor_verify_replay_real thdr pay UOR_ERR_REPLAY_MISMATCH
     ret 28
   end
   ret 0
 end
 
+note F5 negative controls: QMD v5 SKEDCHECK05 mutants and real SM121 SASS execution mutants
+note (each resealed and re-signed with the trusted signer key so only QMD/replay catches them!).
+fn ug_neg_sm121_f5 hdr view uchar 384 pay view uchar * anc view uchar * sk view uchar 96 to ulong
+  thdr = new uchar 384 0
+  tpay = new uchar 896 0
+  sd = new uchar 32 0
+  ug_seed_at sk 0 sd
+  for i ulong 384
+    put thdr i get hdr i
+  end
+  for i ulong UOR_SM121_PAYLOAD_BYTES
+    put tpay i get pay i
+  end
+  note 1. QMD v5 version mutant: word 14 version 5 -> 4
+  sv = uvm_qmd_w tpay 14
+  uor_put_u32 tpay 568 xor sv 0x00100000
+  uor_hdr_seal thdr tpay
+  ues_sign_hdr thdr sd
+  if ne uor_verify_policy thdr tpay anc UOR_LVL_P2 UOR_ERR_BAD_QMD
+    ret 51
+  end
+  uor_put_u32 tpay 568 sv
+  note 2. QMD v5 SKEDCHECK05 mutant: word 37 != 0
+  uor_put_u32 tpay 660 1
+  uor_hdr_seal thdr tpay
+  ues_sign_hdr thdr sd
+  if ne uor_verify_policy thdr tpay anc UOR_LVL_P2 UOR_ERR_BAD_QMD
+    ret 52
+  end
+  uor_put_u32 tpay 660 0
+  note 3. QMD v5 launch geometry mismatch: threads_x (word 34) != hdr.block_x
+  sv = uvm_qmd_w tpay 34
+  uor_put_u32 tpay 648 or and sv 0xffff0000 128
+  uor_hdr_seal thdr tpay
+  ues_sign_hdr thdr sd
+  if ne uor_verify_policy thdr tpay anc UOR_LVL_P2 UOR_ERR_BAD_QMD
+    ret 53
+  end
+  uor_put_u32 tpay 648 sv
+  note 4. SM121 SASS arithmetic mutant: IADD3 R9, R2, R5 -> IADD3 R9, R2, R2 (w1 5 -> 2)
+  note    Resealed and re-signed with trusted key: P2 passes, real SASS VM replay MUST refuse!
+  uor_put_u32 tpay 276 2
+  uor_hdr_seal thdr tpay
+  ues_sign_hdr thdr sd
+  if ne uor_verify_policy thdr tpay anc UOR_LVL_P2 UOR_VERDICT_PASS
+    ret 54
+  end
+  if ne uor_verify_replay_real thdr tpay UOR_ERR_REPLAY_MISMATCH
+    ret 54
+  end
+  uor_put_u32 tpay 276 5
+  note 5. SM121 SASS OOB guard mutant: replace `@P0 EXIT` (insn 7) with `NOP` (0x00007918)
+  note    Resealed and re-signed: OOB threads 8..11 fall through and fault on OOB LDG/STG!
+  sv = uor_get_u32 tpay 112
+  uor_put_u32 tpay 112 0x00007918
+  uor_hdr_seal thdr tpay
+  ues_sign_hdr thdr sd
+  if ne uor_verify_replay_real thdr tpay UOR_ERR_REPLAY_FAULT
+    ret 55
+  end
+  uor_put_u32 tpay 112 sv
+  note 6. SM121 SASS illegal opcode mutant: insn 17 opcode -> 0xfff
+  sv = uor_get_u32 tpay 272
+  uor_put_u32 tpay 272 or and sv 0xfffff000 0xfff
+  uor_hdr_seal thdr tpay
+  ues_sign_hdr thdr sd
+  if ne uor_verify_replay_real thdr tpay UOR_ERR_REPLAY_FAULT
+    ret 56
+  end
+  ret 0
+end
+
 note Capability grant refusals; each altered record is re-signed by the authority unless noted.
-fn ug_neg_grant hdr view uchar 384 pay view uchar 768 anc view uchar * sk view uchar 96 to ulong
+fn ug_neg_grant hdr view uchar 384 pay view uchar * anc view uchar * sk view uchar 96 to ulong
   g = new uchar 168 0
   asd = new uchar 32 0
   ssd = new uchar 32 0
@@ -337,18 +467,15 @@ fn ug_neg_grant hdr view uchar 384 pay view uchar 768 anc view uchar * sk view u
   if ne uor_gpu_admit hdr pay anc g UOR_ERR_CAP_DENIED
     ret 36
   end
-  note record altered after signing (not re-signed)
   ug_make_grant g asd
   uor_put_u64 g 24 0xffffffff
   if ne uor_gpu_admit hdr pay anc g UOR_ERR_BAD_GRANT
     ret 37
   end
-  note grant signed by the bundle signer instead of the authority
   ug_make_grant g ssd
   if ne uor_gpu_admit hdr pay anc g UOR_ERR_BAD_GRANT
     ret 38
   end
-  note anchors without an authority key: admission disabled
   ug_make_grant g asd
   for i ulong 136
     put ac i get anc i
@@ -363,7 +490,7 @@ fn ug_neg_grant hdr view uchar 384 pay view uchar 768 anc view uchar * sk view u
 end
 
 note Malformed local trust anchors.
-fn ug_neg_anchors hdr view uchar 384 pay view uchar 768 anc view uchar * to ulong
+fn ug_neg_anchors hdr view uchar 384 pay view uchar * anc view uchar * to ulong
   ac = new uchar 136 0
   for i ulong 136
     put ac i get anc i
@@ -412,7 +539,9 @@ end
 fn main to int
   sk = new uchar 96 0
   anc = new uchar 136 0
-  sm_pay = new uchar 768 0
+  sm_raw = new uchar 65536 0
+  sm_len = new ulong 1 0
+  sdig = new uchar 32 0
   hdr1 = new uchar 384 0
   sd = new uchar 32 0
   if eq ug_selftest_ed 0
@@ -420,10 +549,17 @@ fn main to int
   end
   ug_seeds sk
   ug_make_anchors anc sk
-  ug_emit_sm121_vecadd_qmd sm_pay
+  if eq ug_compile_sm121 ug_default_omc sm_raw sm_len sdig 0
+    ret ug_fail 50
+  end
+  if ne get sm_len 0 UOR_SM121_PAYLOAD_BYTES
+    ret ug_fail 50
+  end
   ug_seed_at sk 0 sd
-  ug_make_bundle hdr1 sm_pay sd UOR_GPU_ISA_SM121
-  rc = ug_check_positive hdr1 sm_pay anc sk
+  if ne ug_make_bundle hdr1 part sm_raw 0 UOR_SM121_PAYLOAD_BYTES sdig sd UOR_GPU_ISA_SM121 UOR_VERDICT_PASS
+    ret ug_fail 50
+  end
+  rc = ug_check_positive hdr1 part sm_raw 0 UOR_SM121_PAYLOAD_BYTES sdig anc sk
   if ne rc 0
     ret ug_fail rc
   end
@@ -431,19 +567,23 @@ fn main to int
   if ne rc 0
     ret ug_fail rc
   end
-  rc = ug_neg_integrity hdr1 sm_pay anc
+  rc = ug_neg_integrity hdr1 part sm_raw 0 UOR_SM121_PAYLOAD_BYTES anc
   if ne rc 0
     ret ug_fail rc
   end
-  rc = ug_neg_sig hdr1 sm_pay anc sk
+  rc = ug_neg_sig hdr1 part sm_raw 0 UOR_SM121_PAYLOAD_BYTES anc sk
   if ne rc 0
     ret ug_fail rc
   end
-  rc = ug_neg_grant hdr1 sm_pay anc sk
+  rc = ug_neg_sm121_f5 hdr1 part sm_raw 0 UOR_SM121_PAYLOAD_BYTES anc sk
   if ne rc 0
     ret ug_fail rc
   end
-  rc = ug_neg_anchors hdr1 sm_pay anc
+  rc = ug_neg_grant hdr1 part sm_raw 0 UOR_SM121_PAYLOAD_BYTES anc sk
+  if ne rc 0
+    ret ug_fail rc
+  end
+  rc = ug_neg_anchors hdr1 part sm_raw 0 UOR_SM121_PAYLOAD_BYTES anc
   if ne rc 0
     ret ug_fail rc
   end

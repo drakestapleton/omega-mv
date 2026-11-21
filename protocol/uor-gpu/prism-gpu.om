@@ -3,16 +3,16 @@ note protocol/uor-gpu/prism-gpu.om: Pure seeded OM-2 Prism CLI plugin executable
 note (PrismPM #293 compatible). Zero CUDApp, zero C/Python/Node. Compose after
 note si/directives/om2.om, om/tls/sha2.om, protocol/uor-gpu/b3_uor.om,
 note protocol/omnet/om/sha512/sha512.om, protocol/omnet/om/ed25519/ed25519.om,
-note protocol/uor-gpu/canonical.om, protocol/uor-gpu/verify.om, protocol/uor-gpu/gate.om,
-note protocol/uor-gpu/emit_kernels.om, protocol/uor-gpu/ed_sign.om.
+note protocol/uor-gpu/canonical.om, protocol/uor-gpu/payload_vm.om, protocol/uor-gpu/verify.om,
+note protocol/uor-gpu/gate.om, protocol/uor-gpu/emit_kernels.om, protocol/uor-gpu/ed_sign.om.
 note
 note   keygen out.seed                         32 random bytes, created 0600, never overwritten
 note   pubkey in.seed out.pub                  Ed25519 public key of a seed
 note   trust out.trust authority.pub signer.pub  local trust anchors (append more signer keys)
-note   bundle sm121|spirv out.holo signer.seed seal and sign a P3 bundle; prints its claims
+note   bundle sm121|spirv out.holo signer.seed compile from source with pinned omc, replay, seal & sign
 note   inspect file.holo                       print the header's claims (nothing verified)
-note   verify file.holo anchors.trust          P2 policy against local anchors
-note   replay file.holo anchors.trust          P3 policy plus CPU reference replay digest
+note   verify file.holo anchors.trust          P2 policy + QMD v5 / SPIR-V structural check
+note   replay file.holo anchors.trust          P3 policy + real kernel VM replay over payload bytes
 note   grant record64.bin authority.seed out.grant  sign a 64-byte capability record
 note   admit file.holo anchors.trust file.grant  P2 policy plus authority-signed live grant
 
@@ -21,6 +21,7 @@ text pg_err_open "prism-gpu: cannot open, read or write file, or it has the wron
 text pg_err_short "prism-gpu: bundle shorter than 384-byte UOR-GPU-1 header\n"
 text pg_err_rand "prism-gpu: random source failed\n"
 text pg_err_anch "prism-gpu: bad trust anchors (authority key equal to signer key?)\n"
+text pg_err_comp "prism-gpu: kernel compilation from source failed (run from omega-mv root with pinned seed/out/omc)\n"
 text pg_c_keygen "keygen"
 text pg_c_pubkey "pubkey"
 text pg_c_trust "trust"
@@ -251,24 +252,46 @@ fn pg_write_bundle path view uchar * pn ulong hdr view uchar 384 pay view uchar 
   ret 0
 end
 
-fn pg_bundle_sm121 path view uchar * pn ulong sd view uchar 32 to int
-  hdr = new uchar 384 0
-  pay = new uchar 768 0
-  ug_emit_sm121_vecadd_qmd pay
-  ug_fill_p3_hdr hdr UOR_GPU_ISA_SM121 768
+fn pg_bundle_seal hdr edit uchar 384 isa ulong pay view uchar * sdig view uchar 32 sd view uchar 32 to ulong
+  rc = ug_fill_p3_hdr_real hdr isa pay sdig
+  if ne rc UOR_VERDICT_PASS
+    ret rc
+  end
   uor_hdr_seal hdr pay
   ues_sign_hdr hdr sd
-  ret pg_write_bundle path pn hdr pay
+  ret UOR_VERDICT_PASS
+end
+
+fn pg_bundle_sm121 path view uchar * pn ulong sd view uchar 32 to int
+  hdr = new uchar 384 0
+  pay = new uchar 65536 0
+  plen = new ulong 1 0
+  sdig = new uchar 32 0
+  if eq ug_compile_sm121 ug_default_omc pay plen sdig 0
+    uor_write_all 2 pg_err_comp len pg_err_comp
+    ret 6
+  end
+  if ne pg_bundle_seal hdr UOR_GPU_ISA_SM121 part pay 0 get plen 0 sdig sd UOR_VERDICT_PASS
+    uor_write_all 2 pg_err_comp len pg_err_comp
+    ret 6
+  end
+  ret pg_write_bundle path pn hdr part pay 0 get plen 0
 end
 
 fn pg_bundle_spirv path view uchar * pn ulong sd view uchar 32 to int
   hdr = new uchar 384 0
-  pay = new uchar 64 0
-  ug_emit_spirv_vadd pay
-  ug_fill_p3_hdr hdr UOR_GPU_ISA_SPIRV 64
-  uor_hdr_seal hdr pay
-  ues_sign_hdr hdr sd
-  ret pg_write_bundle path pn hdr pay
+  pay = new uchar 65536 0
+  plen = new ulong 1 0
+  sdig = new uchar 32 0
+  if eq ug_compile_spirv ug_default_omc 0 pay plen sdig 0
+    uor_write_all 2 pg_err_comp len pg_err_comp
+    ret 6
+  end
+  if ne pg_bundle_seal hdr UOR_GPU_ISA_SPIRV part pay 0 get plen 0 sdig sd UOR_VERDICT_PASS
+    uor_write_all 2 pg_err_comp len pg_err_comp
+    ret 6
+  end
+  ret pg_write_bundle path pn hdr part pay 0 get plen 0
 end
 
 fn pg_cmd_bundle to int
@@ -316,13 +339,11 @@ fn pg_cmd_inspect to int
   ret 0
 end
 
-note mode P2: verify policy; mode P3: P3 policy plus CPU reference replay digest comparison
+note mode P2: verify policy; mode P3: P3 policy plus real kernel VM replay over actual payload bytes
 fn pg_check_run hdr view uchar 384 pay view uchar * anc view uchar * mode ulong to int
-  rep = new uchar 32 0
   rc = uor_verify_policy hdr pay anc mode
   if and eq rc UOR_VERDICT_PASS eq mode UOR_LVL_P3
-    ug_replay_digest rep
-    rc = uor_verify_replay hdr rep
+    rc = uor_verify_replay_real hdr pay
   end
   uor_emit_verdict hdr rc mode
   if eq rc UOR_VERDICT_PASS
