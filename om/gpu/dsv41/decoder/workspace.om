@@ -1,0 +1,354 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Scratch and I/O GPU mappings, decode LUT, static ones/gain buffers,
+note and typed QMD launch wrappers for the 28 backbone + 6 head kernels.
+global dwMaps long 6
+global dwSizes ulong 6
+note dwMaps: 0=zone1, 1=kv, 2=slabArena, 3=scratch, 4=io, 5=stage(host)
+
+const wsLut ulong 0
+const wsRopeBase ulong 4096
+const wsRopeComp ulong 528384
+const wsOnes ulong 1052672
+const wsResA ulong 1073152
+const wsResB ulong 1155072
+const wsPreMix ulong 1236992
+const wsAttnPre ulong 1237248
+const wsAttnPost ulong 1237504
+const wsAttnComb ulong 1237760
+const wsFfnPre ulong 1238016
+const wsFfnPost ulong 1238272
+const wsFfnComb ulong 1238528
+const wsRaw24 ulong 1238784
+const wsStat ulong 1239040
+const wsX ulong 1239296
+const wsXNorm ulong 1259776
+const wsSubOut ulong 1280256
+const wsPacked ulong 1300736
+const wsScales ulong 1366272
+const wsRecon ulong 1366528
+const wsQr ulong 1497600
+const wsQ ulong 1502720
+const wsKv ulong 1633792
+const wsScores ulong 1635840
+const wsAttnOut ulong 1799680
+const wsWoAOut ulong 1930752
+const wsGateLogits ulong 1963520
+const wsExpGate ulong 1965056
+const wsExpUp ulong 1974272
+const wsExpAct ulong 1983488
+const wsSharedOut ulong 1992704
+const wsRoutedOut ulong 2013184
+const wsEngramGain1 ulong 2136064
+const wsEngramGain14 ulong 2217984
+const wsEngramRows ulong 2299904
+const wsEngramKV ulong 2324480
+const wsEngramValid ulong 2426880
+const wsEngramGate ulong 2427136
+const wsPosBuf ulong 2427392
+const wsIdxBuf ulong 2427648
+const wsIdxQ ulong 2431744
+const wsIdxW ulong 2448128
+const wsIdxScores ulong 2448384
+const wsIdxLens ulong 2456576
+const wsCandKeep ulong 2456832
+const wsCandBlocks ulong 2457856
+const wsCandIds ulong 2458880
+const wsTopMask ulong 2467072
+const wsCompKv ulong 2475264
+const wsCompGate ulong 2479360
+const wsCompOut ulong 2483456
+const wsCompK ulong 2485504
+const wsKvConcat ulong 2486272
+const wsUnpack ulong 6942720
+const wsTotalBytes ulong 17563648
+
+const ioToken ulong 0
+const ioExpIds ulong 256
+const ioExpWeights ulong 512
+const ioEngramRaw ulong 768
+const ioEngramScales ulong 6912
+const ioEngramIds ulong 7168
+const ioIdxCopy ulong 7424
+const ioDump ulong 16384
+const ioLogits ulong 98304
+const ioTotalBytes ulong 655360
+
+fn dwE4m3 c uint to uint
+  e = and shr c 3 15
+  m = and c 7
+  raw = or shl add e 120 23 shl m 20
+  if eq e 0
+    raw = bitcast uint mul f32 m 0.001953125f32
+  end
+  if and eq e 15 eq m 7
+    raw = uint 0x7fc00000
+  end
+  ret or raw shl and c 128 24
+end
+
+fn dwE2m1 c uint to uint
+  e = and shr c 1 3
+  m = and c 1
+  raw = or shl add e 126 23 shl m 22
+  if eq e 0
+    raw = bitcast uint mul f32 m 0.5f32
+  end
+  ret or raw shl and c 8 28
+end
+
+fn dwInitScratch to bool
+  lut = new uchar 1088 0
+  for i ulong 272
+    v = dwE4m3 uint i
+    if ge i 256
+      v = dwE2m1 uint sub i 256
+    end
+    for j ulong 4
+      put lut add mul i 4 j uchar and shr v uint mul j 8 255
+    end
+  end
+  scr = get dwMaps 3
+  if ne mapwrite scr wsLut lut 0 1088 1088
+    ret false
+  end
+  ones = new uchar 20480 0
+  for i ulong 5120
+    put ones add mul i 4 2 128
+    put ones add mul i 4 3 63
+  end
+  if ne mapwrite scr wsOnes ones 0 20480 20480
+    ret false
+  end
+  if ne mapset scr wsEngramValid 4 1 0
+    ret false
+  end
+  if not drFillTable scr wsRopeBase 10000.0f64 false
+    ret false
+  end
+  if not drFillTable scr wsRopeComp 160000.0f64 true
+    ret false
+  end
+  ret true
+end
+
+fn dwMulBf16Pair qb view uchar 40960 kb view uchar 40960 prod edit uchar 81920 to void
+  for i ulong 20480
+    p = mul i 2
+    qu = or shl uint get qb p 16 shl uint get qb add p 1 24
+    ku = or shl uint get kb p 16 shl uint get kb add p 1 24
+    pv = bitcast uint mul bitcast f32 qu bitcast f32 ku
+    q = mul i 4
+    put prod q uchar and pv 255
+    put prod add q 1 uchar and shr pv 8 255
+    put prod add q 2 uchar and shr pv 16 255
+    put prod add q 3 uchar and shr pv 24 255
+  end
+end
+
+fn dwPrecomputeEngramGain layer ulong dest ulong to bool
+  qoff = get lmLayer add mul layer lmStride 39
+  koff = get lmLayer add mul layer lmStride 40
+  if or eq qoff lmMissing eq koff lmMissing
+    ret false
+  end
+  qb = new uchar 40960 0
+  kb = new uchar 40960 0
+  prod = new uchar 81920 0
+  if ne mapread get dwMaps 0 qoff qb 0 40960 40960
+    ret false
+  end
+  if ne mapread get dwMaps 0 koff kb 0 40960 40960
+    ret false
+  end
+  dwMulBf16Pair qb kb prod
+  ret eq mapwrite get dwMaps 3 dest prod 0 81920 81920
+end
+
+fn dwBind idx ulong off ulong span ulong to bool
+  ret dnBind get dwMaps idx get dwSizes idx off span
+end
+
+fn dwBf16Unpack srcIdx ulong srcOff ulong dstIdx ulong dstOff ulong count ulong to bool
+  if not dwBind srcIdx srcOff mul count 2
+    ret false
+  end
+  if not dwBind dstIdx dstOff mul count 4
+    ret false
+  end
+  headArg uint count
+  ret dnRecord 19 uint div add count 127 128 1 1 128
+end
+
+fn dwBf16Pack srcIdx ulong srcOff ulong dstIdx ulong dstOff ulong count ulong to bool
+  if not dwBind srcIdx srcOff mul count 4
+    ret false
+  end
+  if not dwBind dstIdx dstOff mul count 2
+    ret false
+  end
+  headArg uint count
+  ret dnRecord 18 uint div add count 127 128 1 1 128
+end
+
+fn dwQuantFp8 inOff ulong count ulong to bool
+  if not dwBind 3 inOff mul count 4
+    ret false
+  end
+  if not dwBind 3 wsLut 1088
+    ret false
+  end
+  if not dwBind 3 wsPacked count
+    ret false
+  end
+  if not dwBind 3 wsScales div count 32
+    ret false
+  end
+  if not dwBind 3 wsRecon mul count 4
+    ret false
+  end
+  ret dnRecord 8 uint div count 32 1 1 16
+end
+
+fn dwQuantFp4 inOff ulong count ulong to bool
+  if not dwBind 3 inOff mul count 4
+    ret false
+  end
+  if not dwBind 3 wsLut 1088
+    ret false
+  end
+  if not dwBind 3 wsPacked div count 2
+    ret false
+  end
+  if not dwBind 3 wsScales div count 32
+    ret false
+  end
+  if not dwBind 3 wsRecon mul count 4
+    ret false
+  end
+  ret dnRecord 9 uint div count 32 1 1 16
+end
+
+fn dwQuantKv inOff ulong count ulong to bool
+  if not dwBind 3 inOff mul count 4
+    ret false
+  end
+  if not dwBind 3 wsLut 1088
+    ret false
+  end
+  if not dwBind 3 wsPacked div count 2
+    ret false
+  end
+  if not dwBind 3 wsScales div count 16
+    ret false
+  end
+  if not dwBind 3 wsRecon mul count 4
+    ret false
+  end
+  ret dnRecord 10 uint div count 16 1 1 8
+end
+
+fn dwFp8Gemm wIdx ulong wOff ulong sOff ulong dstOff ulong k ulong n ulong to bool
+  if not dwBind 3 wsPacked k
+    ret false
+  end
+  if not dwBind wIdx wOff mul n k
+    ret false
+  end
+  if not dwBind 3 wsScales div k 32
+    ret false
+  end
+  if not dwBind wIdx sOff mul div add n 31 32 div k 32
+    ret false
+  end
+  if not dwBind 3 wsLut 1088
+    ret false
+  end
+  if not dwBind 3 dstOff mul n 4
+    ret false
+  end
+  headArg uint k
+  headArg uint n
+  ret dnRecord 4 uint div add n 127 128 1 1 128
+end
+
+fn dwFp4Gemm wOff ulong sOff ulong dstOff ulong k ulong n ulong to bool
+  if not dwBind 3 wsPacked k
+    ret false
+  end
+  if not dwBind 2 wOff mul n div k 2
+    ret false
+  end
+  if not dwBind 3 wsScales div k 32
+    ret false
+  end
+  if not dwBind 2 sOff mul n div k 32
+    ret false
+  end
+  if not dwBind 3 wsLut 1088
+    ret false
+  end
+  if not dwBind 3 dstOff mul n 4
+    ret false
+  end
+  headArg uint k
+  headArg uint n
+  ret dnRecord 5 uint div add n 127 128 1 1 128
+end
+
+fn dwDense aOff ulong wIdx ulong wOff ulong dstOff ulong k ulong n ulong to bool
+  if not dwBind 3 aOff mul k 4
+    ret false
+  end
+  if not dwBind wIdx wOff mul mul n k 4
+    ret false
+  end
+  if not dwBind 3 dstOff mul n 4
+    ret false
+  end
+  headArg uint k
+  headArg uint n
+  ret dnRecord 11 uint div add n 127 128 1 1 128
+end
+
+fn dwRmsNorm inOff ulong gainZ1Off ulong dstOff ulong d ulong to bool
+  if not dwBf16Unpack 0 gainZ1Off 3 wsUnpack d
+    ret false
+  end
+  if not dwBind 3 inOff mul d 4
+    ret false
+  end
+  if not dwBind 3 wsStat 4
+    ret false
+  end
+  headArg uint d
+  if not dnRecord 12 1 1 1 1
+    ret false
+  end
+  if not dwBind 3 inOff mul d 4
+    ret false
+  end
+  if not dwBind 3 wsUnpack mul d 4
+    ret false
+  end
+  if not dwBind 3 wsStat 4
+    ret false
+  end
+  if not dwBind 3 dstOff mul d 4
+    ret false
+  end
+  headArg uint d
+  if not dnRecord 13 uint div add d 127 128 1 1 128
+    ret false
+  end
+  if not dwBf16Pack 3 dstOff 3 wsPacked d
+    ret false
+  end
+  ret dwBf16Unpack 3 wsPacked 3 dstOff d
+end
+
+fn dwRoundBf16 bufOff ulong d ulong to bool
+  if not dwBf16Pack 3 bufOff 3 wsPacked d
+    ret false
+  end
+  ret dwBf16Unpack 3 wsPacked 3 bufOff d
+end

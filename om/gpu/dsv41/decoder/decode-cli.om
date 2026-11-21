@@ -1,0 +1,565 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Native DeepSeek-V4.1-Flash single-stream decoder CLI.
+note Modes:
+note   layer0 <tensors> <engram_map> <sidecar_dir> <ckpt_dir> <token_id> <out_bin>
+note   gen    <tensors> <engram_map> <sidecar_dir> <ckpt_dir> <trace_out> <num_gen> <tok0> [tok1...]
+
+text dcModelPre "/model-"
+text dcModelSuf "-of-00048.safetensors"
+text dcLayerPre "/layer"
+text dcLayerSuf ".bin"
+text dcModeL0 "layer0"
+text dcModeGen "gen"
+text dcEngW1 "layers.1.engram.embed.weight"
+text dcEngS1 "layers.1.engram.embed.scale"
+text dcEngW14 "layers.14.engram.embed.weight"
+text dcEngS14 "layers.14.engram.embed.scale"
+text dcStHits "STATS hits="
+text dcStMiss " misses="
+text dcStNvme " nvme_ns="
+text dcStGpu " gpu_ns="
+text dcStEng " engram_ns="
+text dcStSha " trace_sha256="
+
+fn dcStrEq a view uchar * n ulong b view uchar * to bool
+  if ne n len b
+    ret false
+  end
+  for i ulong n
+    if ne get a i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn dcParseUlong buf view uchar * n ulong to long
+  if eq n 0
+    ret -1
+  end
+  v = ulong 0
+  for i ulong n
+    c = get buf i
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    v = add mul v 10 sub ulong c 48
+  end
+  ret long v
+end
+
+fn dcAppend dst edit uchar * pos ulong src view uchar * n ulong to ulong
+  for i ulong n
+    put dst add pos i get src i
+  end
+  ret add pos n
+end
+
+fn dcAppendDec dst edit uchar * pos ulong val ulong width ulong to ulong
+  tmp = new uchar 16 0
+  d = ulong 0
+  v = val
+  while true
+    put tmp d uchar add 48 rem v 10
+    v = div v 10
+    d = add d 1
+    if eq v 0
+      break
+    end
+  end
+  p = pos
+  while lt d width
+    put dst p 48
+    p = add p 1
+    width = sub width 1
+  end
+  while gt d 0
+    d = sub d 1
+    put dst p get tmp d
+    p = add p 1
+  end
+  ret p
+end
+
+fn dcOpenPath buf view uchar * n ulong flags int to int
+  ret int fopen buf 0 n flags 0
+end
+
+fn dcOpenWrite buf view uchar * n ulong to int
+  ret int fopen buf 0 n 524865 420
+end
+
+fn dcOpenShards ckpt view uchar * ckptLen ulong to bool
+  path = new uchar 4096 0
+  for i ulong 48
+    p = dcAppend path 0 ckpt ckptLen
+    p = dcAppend path p dcModelPre len dcModelPre
+    p = dcAppendDec path p add i 1 5
+    p = dcAppend path p dcModelSuf len dcModelSuf
+    fd = dcOpenPath path p 524288
+    if lt fd 0
+      ret false
+    end
+    if ne fseek fd 0 2 long dsFileBytes add i 1
+      r = fclose fd
+      ret false
+    end
+    put dcFD i long fd
+  end
+  for l ulong 40
+    put dfShardFD l int get dcFD add l 2
+  end
+  put dfEngramShardFD 0 int get dcFD 46
+  put dfEngramShardFD 1 int get dcFD 47
+  ret true
+end
+
+fn dcOpenSidecars sdir view uchar * sdirLen ulong to bool
+  path = new uchar 4096 0
+  for l ulong 40
+    p = dcAppend path 0 sdir sdirLen
+    p = dcAppend path p dcLayerPre len dcLayerPre
+    p = dcAppendDec path p l 1
+    p = dcAppend path p dcLayerSuf len dcLayerSuf
+    fd = dcOpenPath path p 524288
+    if lt fd 0
+      ret false
+    end
+    put dfSidecarFD l fd
+  end
+  ret true
+end
+
+fn dcIndexEngram fd int to bool
+  row = new uchar 160 0
+  for i ulong 4
+    put dfEngramBase i lmMissing
+  end
+  for i ulong 96085
+    if not diRead fd row mul i 160 160
+      ret false
+    end
+    off = diGet row 8 8
+    if lmExact row 56 dcEngW1
+      put dfEngramBase 0 off
+      put dfEngramCount 0 diGet row 24 4
+    end
+    if lmExact row 56 dcEngS1
+      put dfEngramBase 1 off
+    end
+    if lmExact row 56 dcEngW14
+      put dfEngramBase 2 off
+      put dfEngramCount 1 diGet row 24 4
+    end
+    if lmExact row 56 dcEngS14
+      put dfEngramBase 3 off
+    end
+  end
+  for i ulong 4
+    if eq get dfEngramBase i lmMissing
+      ret false
+    end
+  end
+  ret true
+end
+
+fn dcPrintU64 v ulong to void
+  buf = new uchar 24 0
+  p = dcAppendDec buf 0 v 1
+  r = write 1 buf 0 p
+end
+
+fn dcPrintChar c uchar to void
+  buf = new uchar 1 0
+  put buf 0 c
+  r = write 1 buf 0 1
+end
+
+fn dcStartup h edit zonehdr ctx edit shactx nSlots ulong to bool
+  if not dnOpen
+    ret false
+  end
+  z1Size = get dcTotals 0
+  kvSize = get dkPlanInfo 2
+  slabSize = mul nSlots deBytes
+  z1 = nvalloc z1Size true
+  if le z1 0
+    ret false
+  end
+  put dwMaps 0 z1
+  put dwSizes 0 z1Size
+  kv = nvalloc kvSize true
+  if le kv 0
+    ret false
+  end
+  put dwMaps 1 kv
+  put dwSizes 1 kvSize
+  slab = nvalloc slabSize true
+  if le slab 0
+    ret false
+  end
+  put dwMaps 2 slab
+  put dwSizes 2 slabSize
+  scr = nvalloc wsTotalBytes true
+  if le scr 0
+    ret false
+  end
+  put dwMaps 3 scr
+  put dwSizes 3 wsTotalBytes
+  iom = nvalloc ioTotalBytes false
+  if le iom 0
+    ret false
+  end
+  put dwMaps 4 iom
+  put dwSizes 4 ioTotalBytes
+  stg = mapnew -1 0 deBytes 3 33
+  if le stg 0
+    ret false
+  end
+  put dwMaps 5 stg
+  put dwSizes 5 deBytes
+  if not dcPopulate z1
+    ret false
+  end
+  if not dkTouch kv
+    ret false
+  end
+  if not dwInitScratch
+    ret false
+  end
+  if not dwPrecomputeEngramGain 1 wsEngramGain1
+    ret false
+  end
+  if not dwPrecomputeEngramGain 14 wsEngramGain14
+    ret false
+  end
+  slab_init h 0 0 uint nSlots
+  dtStart ctx
+  ret true
+end
+
+fn dcWriteFile fd int buf view uchar * n ulong to bool
+  pos = ulong 0
+  while lt pos n
+    r = write fd buf pos sub n pos
+    if le r 0
+      ret false
+    end
+    pos = add pos ulong r
+  end
+  ret true
+end
+
+fn dcRunLayer0Mode h edit zonehdr ctx edit shactx tok uint outFd int to int
+  slots = new uchar 1024 0
+  res = new uchar 81920 0
+  pm = new uchar 16 0
+  ids = new uchar 24 0
+  wts = new uchar 24 0
+  if not dcStartup h ctx 16
+    ret 74
+  end
+  if not deAcquire h 1
+    ret 74
+  end
+  if not dgToken 0 tok
+    ret 74
+  end
+  if not deRelease h 1 0 false
+    ret 74
+  end
+  if not deAcquire h 2
+    ret 74
+  end
+  if not dfEmbedToken tok 0
+    ret 74
+  end
+  if not deRelease h 2 0 false
+    ret 74
+  end
+  put dfCoord 0 0
+  put dfCoord 1 0
+  put dfCoord 2 0
+  if not dfRunLayer h slots 0
+    ret 74
+  end
+  if ne mapread get dwMaps 3 get dfResIn 0 res 0 81920 81920
+    ret 74
+  end
+  if ne mapread get dwMaps 3 get dfPreMix 0 pm 0 16 16
+    ret 74
+  end
+  if ne mapread get dwMaps 4 ioExpIds ids 0 24 24
+    ret 74
+  end
+  if ne mapread get dwMaps 4 ioExpWeights wts 0 24 24
+    ret 74
+  end
+  if not dcWriteFile outFd res 81920
+    ret 74
+  end
+  if not dcWriteFile outFd pm 16
+    ret 74
+  end
+  if not dcWriteFile outFd ids 24
+    ret 74
+  end
+  if not dcWriteFile outFd wts 24
+    ret 74
+  end
+  ret 0
+end
+
+fn dcStepToken h edit zonehdr slots edit uchar * tok uint runHead bool to long
+  pos = get dfCoord 2
+  if not deAcquire h 1
+    ret -1
+  end
+  if not dgToken pos tok
+    ret -1
+  end
+  if not deRelease h 1 0 false
+    ret -1
+  end
+  if not deAcquire h 2
+    ret -1
+  end
+  if not dfEmbedToken tok pos
+    ret -1
+  end
+  if not deRelease h 2 0 false
+    ret -1
+  end
+  for l ulong 40
+    if not dfRunLayer h slots l
+      ret -1
+    end
+  end
+  if not runHead
+    ret 0
+  end
+  ret dfHeadArgmax h
+end
+
+fn dcReadTokArg idx ulong to long
+  argBuf = new uchar 64 0
+  n = argread idx argBuf 0 64
+  if le n 0
+    ret -1
+  end
+  tv = dcParseUlong argBuf ulong n
+  if or lt tv 0 ge tv 129280
+    ret -1
+  end
+  ret tv
+end
+
+fn dcPrintErrU64 v ulong to void
+  buf = new uchar 24 0
+  p = dcAppendDec buf 0 v 1
+  r = write 2 buf 0 p
+end
+
+fn dcPrintErrText s view uchar * to void
+  r = write 2 s 0 len s
+end
+
+fn dcPrintStats digest view uchar 32 to void
+  hex = new uchar 65 0
+  for i ulong 32
+    v = uint get digest i
+    put hex mul i 2 sh_hexd shr v 4
+    put hex add mul i 2 1 sh_hexd and v 15
+  end
+  put hex 64 10
+  dcPrintErrText dcStHits
+  dcPrintErrU64 get dfStats 0
+  dcPrintErrText dcStMiss
+  dcPrintErrU64 get dfStats 1
+  dcPrintErrText dcStNvme
+  dcPrintErrU64 get dfStats 2
+  dcPrintErrText dcStGpu
+  dcPrintErrU64 get dfStats 3
+  dcPrintErrText dcStEng
+  dcPrintErrU64 get dfStats 4
+  dcPrintErrText dcStSha
+  r = write 2 hex 0 65
+end
+
+fn dcRunGenMode h edit zonehdr ctx edit shactx traceFd int numGen ulong to int
+  slots = new uchar 51200 0
+  digest = new uchar 32 0
+  if not dcStartup h ctx 800
+    ret 74
+  end
+  nPrompt = ulong sub argcnt 8
+  if eq nPrompt 0
+    ret 64
+  end
+  pos = ulong 0
+  lastTok = uint 0
+  for i ulong nPrompt bound 2048
+    tv = dcReadTokArg add 8 i
+    if lt tv 0
+      ret 64
+    end
+    lastTok = uint tv
+    isLast = eq add i 1 nPrompt
+    put dfCoord 0 0
+    put dfCoord 1 pos
+    put dfCoord 2 pos
+    nxt = dcStepToken h slots lastTok isLast
+    if lt nxt 0
+      ret 74
+    end
+    pos = add pos 1
+    if isLast
+      lastTok = uint nxt
+    end
+  end
+  for g ulong numGen bound 2048
+    dcPrintU64 ulong lastTok
+    dcPrintChar 10
+    if not deAcquire h 1
+      ret 74
+    end
+    if not dtDrain traceFd ctx
+      ret 74
+    end
+    if not deRelease h 1 0 false
+      ret 74
+    end
+    if lt add g 1 numGen
+      put dfCoord 0 0
+      put dfCoord 1 pos
+      put dfCoord 2 pos
+      nxt = dcStepToken h slots lastTok true
+      if lt nxt 0
+        ret 74
+      end
+      lastTok = uint nxt
+      pos = add pos 1
+    end
+  end
+  if not deAcquire h 1
+    ret 74
+  end
+  if not dtFinish traceFd ctx digest
+    ret 74
+  end
+  if not deRelease h 1 0 false
+    ret 74
+  end
+  dcPrintStats digest
+  ret 0
+end
+
+fn dcLoadInputs slabHdr edit zonehdr to int
+  argBuf = new uchar 4096 0
+  tn = argread 2 argBuf 0 4096
+  if le tn 0
+    ret 64
+  end
+  tfd = dcOpenPath argBuf ulong tn 524288
+  if lt tfd 0
+    ret 66
+  end
+  if or not dcPlan tfd or not lmIndex tfd not dcIndexEngram tfd
+    r = fclose tfd
+    ret 65
+  end
+  r = fclose tfd
+  if not dkPlan 2048
+    ret 65
+  end
+  sn = argread 4 argBuf 0 4096
+  if or le sn 0 not dcOpenSidecars argBuf ulong sn
+    ret 66
+  end
+  cn = argread 5 argBuf 0 4096
+  if or le cn 0 not dcOpenShards argBuf ulong cn
+    ret 66
+  end
+  en = argread 3 argBuf 0 4096
+  if le en 0
+    ret 66
+  end
+  efd = dcOpenPath argBuf ulong en 524288
+  if lt efd 0
+    ret 66
+  end
+  slab_init slabHdr 0 0 16
+  if not deAcquire slabHdr 1
+    r = fclose efd
+    ret 74
+  end
+  if not dgLoad efd
+    r = fclose efd
+    ret 65
+  end
+  if not deRelease slabHdr 1 0 false
+    r = fclose efd
+    ret 74
+  end
+  r = fclose efd
+  ret 0
+end
+
+fn dcOpenOutArg idx ulong to int
+  argBuf = new uchar 4096 0
+  n = argread idx argBuf 0 4096
+  if le n 0
+    ret int -1
+  end
+  ret dcOpenWrite argBuf ulong n
+end
+
+fn main to int
+  slabHdr = new uchar 128 0
+  traceCtx = new uchar 104 0
+  modeBuf = new uchar 16 0
+  if lt argcnt 8
+    ret 64
+  end
+  mn = argread 1 modeBuf 0 16
+  if le mn 0
+    ret 64
+  end
+  isL0 = dcStrEq modeBuf ulong mn dcModeL0
+  isGen = dcStrEq modeBuf ulong mn dcModeGen
+  if and not isL0 not isGen
+    ret 64
+  end
+  rc = dcLoadInputs slabHdr
+  if ne rc 0
+    ret rc
+  end
+  if isL0
+    tv = dcReadTokArg 6
+    if lt tv 0
+      ret 64
+    end
+    ofd = dcOpenOutArg 7
+    if lt ofd 0
+      ret 73
+    end
+    rc = dcRunLayer0Mode slabHdr traceCtx uint tv ofd
+    r = fclose ofd
+  else
+    tfd2 = dcOpenOutArg 6
+    if lt tfd2 0
+      ret 73
+    end
+    gv = dcReadTokArg 7
+    if or le gv 0 gt gv 2048
+      r = fclose tfd2
+      ret 64
+    end
+    rc = dcRunGenMode slabHdr traceCtx tfd2 ulong gv
+    r = fclose tfd2
+  end
+  if not nvstop
+    rc = 74
+  end
+  ret rc
+end

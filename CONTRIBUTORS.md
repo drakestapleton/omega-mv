@@ -413,3 +413,4 @@ Update this table in the same commit as the work it credits.
 
 - Drake Stapleton and Codex — calibrated and measured DeepSeek mixed-format SM121a expert projections against the pinned checkpoint on GB10.
 - Codex, under Drake Stapleton’s direction, documented the partner researcher setup and benchmark replay.
+- Antigravity, under Drake Stapleton’s direction, implemented and silicon-verified the pure seeded OM-2 40-layer single-stream DeepSeek-V4.1-Flash decoder (`dsv41-decode`), Layer-0 real-weight parity check, and native router trace archive handoff on GB10.

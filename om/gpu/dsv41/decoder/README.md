@@ -76,3 +76,35 @@ chmod +x "$out"/check-*
 "$out/check-trace" > "$out/trace-control.bin" 2> "$out/trace-control.sha256.raw"
 "$out/check-catalog" > "$out/code.bin"
 ```
+
+## Full 40-layer native decoder
+
+`dsv41-decode` composes the seeded SM121 backbone catalog, Zone 1 resident planner, paged KV layout, `slab_arena.om` FIFO expert resolver, CPU Engram lookup, native router trace tap, and final LM head into a single static AArch64 executable with zero external libraries.
+
+```sh
+(echo om2
+ sed -n '/^layout /,/^end$/p' om/sha256/sha256-om2.om om/runtime/slab_arena.om
+ sed '/^layout /,/^end$/d;/^om2$/d;s/^export fn /fn /' om/sha256/sha256-om2.om om/runtime/slab_arena.om
+ cat seed/ng/sha256.om gpu/nvidia/native/arboris/compute-lock.om gpu/nvidia/native/nvrm/context.om \
+     gpu/nvidia/native/blackwell/vector.om gpu/nvidia/native/blackwell/launch.om gpu/nvidia/native/blackwell/batch.om \
+     om/encoder/bw_enc_sm121.om om/gpu/dsv41/emit.om om/gpu/dsv41/head/launch.om \
+     "$d/checkpoint.om" "$d/io.om" "$d/core.om" "$d/kv.om" "$d/lease.om" "$d/resolve.om" \
+     "$d/engram-layout.om" "$d/engram.om" "$d/trace.om" "$d/native.om" \
+     "$d/layer-map.om" "$d/rope.om" "$d/workspace.om" "$d/forward.om" "$d/decode-cli.om") |
+    seed/out/omc > "$out/dsv41-decode"
+chmod +x "$out/dsv41-decode"
+```
+
+Inside an authorized Spark GB10 window:
+
+```sh
+# Gate 2: Layer 0 real-weight parity
+spark-window run "$out/dsv41-decode" layer0 "$out/tensors.bin" "$d/engram-token-map.u32" \
+    "$sidecars" "$checkpoint" 1234 "$out/layer0-out.bin"
+python3 "$d/check-layer0.py" "$checkpoint" 1234 "$out/layer0-out.bin"
+
+# Gate 3: Full 40-layer deterministic greedy generation + SHA-256 router trace archive
+spark-window run "$out/dsv41-decode" gen "$out/tensors.bin" "$d/engram-token-map.u32" \
+    "$sidecars" "$checkpoint" "$out/trace.bin" 32 0 671 6102 294 8760 344
+python3 "$d/trace-to-csv.py" "$out/trace.bin" "$out/trace.csv"
+```
