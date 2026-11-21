@@ -21,15 +21,18 @@ global dfCurSlots long 6
 global dfCoord ulong 3
 global dfStats ulong 6
 global dfSlotOf long 15360
-global dfSlotKey long 3200
-global dfSlabCfg ulong 4
-global dfPhysical ulong 3200
+global dfSlotKey long 4800
+global dfSlabCfg ulong 5
+global dfPhysical ulong 4800
+global dfLruPrev long 4800
+global dfLruNext long 4800
 global dfArbEdges uint 239616
 global dfArbPrev uint 6
 global dfArbPfKey ulong 6
 global dfArbPfMeta ulong 5
+global dfArbPfDesc uchar 384
 note dfStats: 0=hits, 1=misses, 2=nvme_ns, 3=gpu_ns, 4=engram_ns, 5=tokens
-note dfSlabCfg: 0=totalSlots, 1=fifoHead, 2=recordTrace, 3=unpublished physical slot
+note dfSlabCfg: 0=totalSlots, 1=lruTail, 2=recordTrace, 3=unpublished physical slot, 4=lruHead
 note dfArbEdges: 39 * 384 * 16 packed (count<<16 | target_eid) online cross-layer sum graph
 note dfArbPfMeta: 0=inFlightCount, 1=inFlightLayer, 2=pfHits, 3=pfDispatched, 4=pfEnabled
 
@@ -966,14 +969,51 @@ fn dfInitSlabMap nSlots ulong to void
   for i ulong 15360
     put dfSlotOf i -1
   end
-  for i ulong 3200
+  for i ulong 4800
     put dfSlotKey i -1
     put dfPhysical i i
+    put dfLruPrev i -1
+    put dfLruNext i -1
+  end
+  note Link nSlots-1 (MRU head) -> ... -> 0 (LRU tail) so initial fills take 0,1,2...
+  for i ulong nSlots bound 4800
+    if gt i 0
+      put dfLruNext i sub long i 1
+    end
+    if lt add i 1 nSlots
+      put dfLruPrev i add long i 1
+    end
   end
   put dfSlabCfg 0 nSlots
   put dfSlabCfg 1 0
   put dfSlabCfg 2 1
-  put dfSlabCfg 3 3200
+  if gt nSlots 3200
+    put dfSlabCfg 3 4800
+  else
+    put dfSlabCfg 3 3200
+  end
+  put dfSlabCfg 4 sub nSlots 1
+end
+
+fn dfLruTouch slot ulong to void
+  head = get dfSlabCfg 4
+  if eq slot head
+    ret
+  end
+  prev = get dfLruPrev slot
+  nxt = get dfLruNext slot
+  if ge prev 0
+    put dfLruNext ulong prev nxt
+  end
+  if ge nxt 0
+    put dfLruPrev ulong nxt prev
+  else
+    put dfSlabCfg 1 ulong prev
+  end
+  put dfLruPrev slot -1
+  put dfLruNext slot long head
+  put dfLruPrev head long slot
+  put dfSlabCfg 4 slot
 end
 
 fn dfGateNeedsKey key long layer ulong to bool
@@ -988,6 +1028,20 @@ fn dfGateNeedsKey key long layer ulong to bool
   ret false
 end
 
+fn dfPickVictim layer ulong to ulong
+  cur = long get dfSlabCfg 1
+  for i ulong 7
+    if lt cur 0
+      ret get dfSlabCfg 1
+    end
+    if not dfGateNeedsKey get dfSlotKey ulong cur layer
+      ret ulong cur
+    end
+    cur = get dfLruPrev ulong cur
+  end
+  ret get dfSlabCfg 1
+end
+
 fn dfLoadMiss layer ulong key ulong desc view uchar 64 to long
   if or ne ulong get desc 0 add layer 3 ne ulong get desc 1 layer
     ret -1
@@ -995,13 +1049,7 @@ fn dfLoadMiss layer ulong key ulong desc view uchar 64 to long
   if ne key add mul layer 384 diGet desc 4 4
     ret -1
   end
-  slot = get dfSlabCfg 1
-  for i ulong 7
-    if not dfGateNeedsKey get dfSlotKey slot layer
-      break
-    end
-    slot = rem add slot 1 get dfSlabCfg 0
-  end
+  slot = dfPickVictim layer
   spare = get dfSlabCfg 3
   if not deVerifyAt get dfShardFD layer desc get dwSlabMaps div spare 800 mul rem spare 800 deBytes
     ret -1
@@ -1012,9 +1060,9 @@ fn dfLoadMiss layer ulong key ulong desc view uchar 64 to long
   end
   put dfSlabCfg 3 get dfPhysical slot
   put dfPhysical slot spare
-  put dfSlabCfg 1 rem add slot 1 get dfSlabCfg 0
   put dfSlotKey slot long key
   put dfSlotOf key long slot
+  dfLruTouch slot
   ret long slot
 end
 
@@ -1042,39 +1090,12 @@ fn dfResolveOne layer ulong k ulong to long
   ret 1
 end
 
-fn dfCopyExpert srcMap long srcOff ulong dstMap long dstOff ulong to bool
-  buf = new uchar 1048576 0
-  pos = ulong 0
-  while lt pos deBytes
-    n = sub deBytes pos
-    if gt n len buf
-      n = len buf
-    end
-    if ne mapread srcMap add srcOff pos buf 0 n long n
-      ret false
-    end
-    if ne mapwrite dstMap add dstOff pos buf 0 n long n
-      ret false
-    end
-    pos = add pos n
-  end
-  ret true
-end
-
-fn dfPublishFromStage layer ulong key ulong stageIdx ulong to long
-  slot = get dfSlabCfg 1
-  for i ulong 7
-    if not dfGateNeedsKey get dfSlotKey slot layer
-      break
-    end
-    slot = rem add slot 1 get dfSlabCfg 0
-  end
+fn dfPublishVerified layer ulong key ulong desc view uchar 64 to long
+  slot = dfPickVictim layer
   spare = get dfSlabCfg 3
-  sMap = get dwIoStage 0
-  sOff = mul stageIdx deBytes
   dMap = get dwSlabMaps div spare 800
   dOff = mul rem spare 800 deBytes
-  if not dfCopyExpert sMap sOff dMap dOff
+  if not deWriteVerifiedAt get dfShardFD layer desc dMap dOff
     ret -1
   end
   oldKey = get dfSlotKey slot
@@ -1083,9 +1104,9 @@ fn dfPublishFromStage layer ulong key ulong stageIdx ulong to long
   end
   put dfSlabCfg 3 get dfPhysical slot
   put dfPhysical slot spare
-  put dfSlabCfg 1 rem add slot 1 get dfSlabCfg 0
   put dfSlotKey slot long key
   put dfSlotOf key long slot
+  dfLruTouch slot
   ret long slot
 end
 
@@ -1123,14 +1144,13 @@ fn dfWorkerLoop idx ulong reqFd int repFd int to void
   req = new uchar 72 0
   desc = new uchar 64 0
   rep = new uchar 1 0
-  stageOff = mul idx deBytes
   while dfPipeRead reqFd req 72
     layer = diGet req 0 8
     for j ulong 64
       put desc j get req add 8 j
     end
     put rep 0 1
-    if and lt layer 40 deVerifyAt get dfShardFD layer desc get dwIoStage 0 stageOff
+    if and lt layer 40 deVerifyOnly get dfShardFD layer desc
       put rep 0 0
     end
     if not dfPipeWrite repFd rep 1
@@ -1153,11 +1173,16 @@ fn dfArbDrainDiscard to void
 end
 
 fn dfArbPublishOne layer ulong m ulong to long
+  desc = new uchar 64 0
   key = get dfArbPfKey m
   if or ge get dfSlotOf key 0 not dfGateNeedsKey long key layer
     ret 0
   end
-  slot = dfPublishFromStage layer key m
+  base = mul m 64
+  for j ulong 64
+    put desc j get dfArbPfDesc add base j
+  end
+  slot = dfPublishVerified layer key desc
   if lt slot 0
     ret -1
   end
@@ -1324,8 +1349,11 @@ fn dfArbSendPrefetch nextLayer ulong pfCount ulong best ulong to long
     ret 0
   end
   diPut req 0 8 nextLayer
+  base = mul pfCount 64
   for j ulong 64
-    put req add 8 j get desc j
+    b = get desc j
+    put req add 8 j b
+    put dfArbPfDesc add base j b
   end
   if not dfPipeWrite get dfWrReq pfCount req 72
     ret -1
@@ -1422,11 +1450,6 @@ fn dfStartOneWorker w ulong to bool
 end
 
 fn dfStartWorkers to bool
-  iostg = mapnew -1 0 mul 6 deBytes 3 33
-  if le iostg 0
-    ret false
-  end
-  put dwIoStage 0 iostg
   for w ulong 6
     if not dfStartOneWorker w
       dfStopWorkers
@@ -1483,6 +1506,7 @@ end
 
 fn dfResolveMissesParallel layer ulong mIdx view ulong 6 mCount ulong to bool
   descs = new uchar 384 0
+  desc = new uchar 64 0
   if not dfReadMissDescs layer mIdx mCount descs
     ret false
   end
@@ -1493,7 +1517,11 @@ fn dfResolveMissesParallel layer ulong mIdx view ulong 6 mCount ulong to bool
   for m ulong mCount bound 6
     k = get mIdx m
     key = add mul layer 384 ulong get dfCurIds k
-    slot = dfPublishFromStage layer key m
+    base = mul m 64
+    for j ulong 64
+      put desc j get descs add base j
+    end
+    slot = dfPublishVerified layer key desc
     if lt slot 0
       ret false
     end
@@ -1512,6 +1540,7 @@ fn dfResolveGate layer ulong to long
     cur = get dfSlotOf key
     if ge cur 0
       put dfCurSlots k cur
+      dfLruTouch ulong cur
       put dfStats 0 add get dfStats 0 1
     else
       put mIdx mCount k
