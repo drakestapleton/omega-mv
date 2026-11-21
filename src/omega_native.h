@@ -513,7 +513,7 @@ const char *omega2_ident_arboris_spread_cpu(void);
 uint32_t omega2_arboris_spread_cpu_hop(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint32_t *o_csr, uint64_t o_csr_len, uint32_t *o_state, uint64_t o_state_len, uint64_t *o_receipt, uint64_t o_receipt_len);
 /* export fn arboris_spread_cpu_run hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong */
 uint32_t omega2_arboris_spread_cpu_run(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint32_t *o_csr, uint64_t o_csr_len, uint32_t *o_state, uint64_t o_state_len, uint64_t *o_receipt, uint64_t o_receipt_len);
-#define OMEGA2_IDENT_bw_arboris_spread_emit "omega-ident 1 unit=bw_arboris_spread_emit abi=2 profile=OM-2 src=d4c737df23b6906d406224562afbc6cc1841e42606d28906d7e23c861a03ff3e omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
+#define OMEGA2_IDENT_bw_arboris_spread_emit "omega-ident 1 unit=bw_arboris_spread_emit abi=2 profile=OM-2 src=873d6fe0038a7afe5cac1a9a299328fbd58c14a443f2497b1ba12ab81964851f omc=b6129ed51e07dd8ef7f33e78fdff99d6c4d914e3bccdaf8b344043b95017d4f2"
 const char *omega2_ident_bw_arboris_spread_emit(void);
 /* export fn bw_arboris_spread_emit_mode0 code edit uchar 16384 to ulong */
 uint32_t omega2_bw_arboris_spread_emit_mode0(uint64_t *result, uint8_t *o_code, uint64_t o_code_len);

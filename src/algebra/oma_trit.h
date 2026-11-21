@@ -37,6 +37,7 @@ enum {
     OMA_E_INVALID_BYTE = -5,   /* dense byte >= 243 or non-zero padding */
     OMA_E_INVALID_Z3 = -6,     /* Z3 value outside {0,1,2} */
     OMA_E_ARG = -7,            /* NULL pointer, bad length, non-finite input */
+    OMA_E_NATIVE = -9,         /* native runtime or scratch allocation failed */
     OMA_E_UNDERFLOW = -8       /* quant: non-zero input whose mean |w| is below FLT_MIN */
 };
 

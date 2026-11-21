@@ -133,7 +133,7 @@ int oma_block_validate(const oma_block *b) {
 int oma_block_encode(const int8_t in[OMA_BLOCK_TRITS], oma_block *out) {
     uint64_t dst[2] = { 0, 0 }, rc = 0;
     if (!in || !out) return OMA_E_ARG;
-    (void)omega2_oma_om_block_encode(&rc, (const uint8_t *)in, OMA_BLOCK_TRITS, dst, 2);
+    if (omega2_oma_om_block_encode(&rc, (const uint8_t *)in, OMA_BLOCK_TRITS, dst, 2) != 0) return OMA_E_NATIVE;
     if (rc) return -(int)rc;
     out->pos = dst[0];
     out->neg = dst[1];
@@ -143,7 +143,7 @@ int oma_block_encode(const int8_t in[OMA_BLOCK_TRITS], oma_block *out) {
 int oma_block_decode(const oma_block *b, int8_t out[OMA_BLOCK_TRITS]) {
     uint64_t rc = 0;
     if (!b || !out) return OMA_E_ARG;
-    (void)omega2_oma_om_block_decode(&rc, b->pos, b->neg, (uint8_t *)out, OMA_BLOCK_TRITS);
+    if (omega2_oma_om_block_decode(&rc, b->pos, b->neg, (uint8_t *)out, OMA_BLOCK_TRITS) != 0) return OMA_E_NATIVE;
     return rc ? -(int)rc : OMA_OK;
 }
 
@@ -161,7 +161,7 @@ int oma_block_add(const oma_block *a, const oma_block *b, oma_block *sum, oma_bl
     if (!a || !b || !sum || !carry) return OMA_E_ARG;
     av[0] = a->pos; av[1] = a->neg;
     bv[0] = b->pos; bv[1] = b->neg;
-    (void)omega2_oma_om_block_add(&rc, av, 2, bv, 2, dst, 4);
+    if (omega2_oma_om_block_add(&rc, av, 2, bv, 2, dst, 4) != 0) return OMA_E_NATIVE;
     if (rc) return -(int)rc;
     sum->pos = dst[0]; sum->neg = dst[1];
     carry->pos = dst[2]; carry->neg = dst[3];
@@ -173,7 +173,7 @@ int oma_block_mul(const oma_block *a, const oma_block *b, oma_block *out) {
     if (!a || !b || !out) return OMA_E_ARG;
     av[0] = a->pos; av[1] = a->neg;
     bv[0] = b->pos; bv[1] = b->neg;
-    (void)omega2_oma_om_block_mul(&rc, av, 2, bv, 2, dst, 2);
+    if (omega2_oma_om_block_mul(&rc, av, 2, bv, 2, dst, 2) != 0) return OMA_E_NATIVE;
     if (rc) return -(int)rc;
     out->pos = dst[0]; out->neg = dst[1];
     return OMA_OK;
@@ -184,7 +184,7 @@ int oma_block_dot(const oma_block *a, const oma_block *b, int32_t *out) {
     if (!a || !b || !out) return OMA_E_ARG;
     av[0] = a->pos; av[1] = a->neg;
     bv[0] = b->pos; bv[1] = b->neg;
-    (void)omega2_oma_om_block_dot(&rc, av, 2, bv, 2, dst, 1);
+    if (omega2_oma_om_block_dot(&rc, av, 2, bv, 2, dst, 1) != 0) return OMA_E_NATIVE;
     if (rc) return -(int)rc;
     *out = (int32_t)(int64_t)dst[0];
     return OMA_OK;
@@ -214,7 +214,7 @@ int oma_int_to_bt(int64_t v, int8_t *digits, size_t cap, size_t *ndigits) {
     uint8_t tmp[41] = { 0 };
     uint64_t n_out[1] = { 0 }, u = 0;
     if (!ndigits || (cap && !digits)) return OMA_E_ARG;
-    (void)omega2_oma_om_int_to_bt(&u, (uint64_t)v, tmp, 41, n_out, 1);
+    if (omega2_oma_om_int_to_bt(&u, (uint64_t)v, tmp, 41, n_out, 1) != 0) return OMA_E_NATIVE;
     if ((size_t)n_out[0] > cap) return OMA_E_OVERFLOW;
     for (size_t i = 0; i < (size_t)n_out[0]; i++) digits[i] = (int8_t)tmp[i];
     *ndigits = (size_t)n_out[0];
@@ -233,7 +233,7 @@ int oma_bt_to_int(const int8_t *digits, size_t n, int64_t *out) {
     uint64_t dst[1] = { 0 }, rc = 0;
     if (!out || (n && !digits)) return OMA_E_ARG;
     if (n == 0) { *out = 0; return OMA_OK; }
-    (void)omega2_oma_om_bt_to_int(&rc, (const uint8_t *)digits, n, n, dst, 1);
+    if (omega2_oma_om_bt_to_int(&rc, (const uint8_t *)digits, n, n, dst, 1) != 0) return OMA_E_NATIVE;
     if (rc) return -(int)rc;
     *out = (int64_t)dst[0];
     return OMA_OK;
