@@ -37,12 +37,14 @@ end
 note A native channel serializes a single prepared request with its GPU maps.
 note Callers prepare before opening devices. Consume the plan once with three
 note disjoint CPU views or dispatch against the sealed GPU replicas.
+global ar_query_variant ulong 2
 global ar_query_ready ulong 1
 global ar_query_meta ulong 16
 global ar_query_request ulong 38
 
 fn ar_prepare_sparse m view ulong 16 request view ulong 38 to ulong
   put ar_query_ready 0 0
+  put ar_query_variant 1 0
   costs = new ulong 32 0
   for i ulong 32
     put costs i get request i
@@ -70,6 +72,33 @@ fn ar_prepare_sparse m view ulong 16 request view ulong 38 to ulong
   ret route
 end
 
+note Optional bounded max-product horizon or warp-per-hub suffix. The
+note supervisor binds the horizon and layout to the authenticated cost key.
+fn ar_prepare_sparse_wave m view ulong 16 request view ulong 38 leaves ulong hops ulong to ulong
+  route = ar_prepare_sparse m request
+  if eq route 2
+    ret 2
+  end
+  if or ne get m 4 1 or gt leaves get m 1 or eq hops 0 gt hops 0xffffffff
+    put ar_query_ready 0 0
+    ret 2
+  end
+  if and ne leaves get m 1 ne hops 1
+    put ar_query_ready 0 0
+    ret 2
+  end
+  put ar_query_variant 0 leaves
+  put ar_query_variant 1 hops
+  if and eq leaves get m 1 gt leaves div qmd_scratch_limit 8
+    route = ulong 0
+  end
+  if and ne leaves get m 1 gt get m 3 0xffffffdf
+    route = ulong 0
+  end
+  put ar_query_ready 0 add route 1
+  ret route
+end
+
 fn ar_host_controls state view uint * to bool
   if or ne ulong get state 0 get ar_query_meta 2 ne ulong get state 1 get ar_query_meta 6
     ret false
@@ -92,7 +121,16 @@ fn ar_host_query topo view uint * weights view uint * state edit uint * to ulong
   end
   rc = ulong 1
   if eq get ar_query_meta 4 1
-    rc = arboris_relax_step topo weights state
+    hops = get ar_query_variant 1
+    if eq hops 0
+      hops = ulong 1
+    end
+    for step ulong hops bound 0xffffffff
+      rc = arboris_relax_step topo weights state
+      if ne rc 0
+        ret 3
+      end
+    end
   else
     rc = arboris_spread_step topo weights state
   end
@@ -106,6 +144,7 @@ note Request words 32..37 are table descriptor, subject, handle ID, generation,
 note decay and threshold. A return of 1 leaves fenced output pending ar_seal_step.
 fn ar_routed_gpu to ulong
   h = new ulong 2 0
+  spec = new ulong 3 0
   put h 0 get ar_query_request 34
   put h 1 get ar_query_request 35
   m = new ulong 16 0
@@ -117,11 +156,25 @@ fn ar_routed_gpu to ulong
     ret 4
   end
   if eq get ar_code_model 0 0
-    if not ar_step_open m
+    ok = false
+    if eq get ar_query_variant 1 0
+      ok = ar_step_open m
+    else
+      ok = ar_open_query m get ar_query_variant 0 get ar_query_variant 1
+    end
+    if not ok
       ret 5
     end
   end
-  rc = ar_sparse_hop table get ar_query_request 33 h m get ar_query_request 36 get ar_query_request 37
+  rc = ulong 1
+  if eq get ar_query_variant 1 0
+    rc = ar_sparse_hop table get ar_query_request 33 h m get ar_query_request 36 get ar_query_request 37
+  else
+    put spec 0 get ar_query_variant 0
+    put spec 1 get ar_query_variant 1
+    put spec 2 get ar_query_request 36
+    rc = ar_sparse_query table get ar_query_request 33 h m spec
+  end
   if ne rc 0
     ret add 5 rc
   end
@@ -132,10 +185,25 @@ fn ar_execute_sparse topo view uint * weights view uint * state edit uint * to u
   ready = get ar_query_ready 0
   put ar_query_ready 0 0
   if eq ready 1
-    ret ar_host_query topo weights state
+    if not ar_claim_compute 1
+      ret 8
+    end
+    rc = ar_host_query topo weights state
+    ar_drop_compute
+    ret rc
   end
   if eq ready 2
-    ret ar_routed_gpu
+    if ne get ar_fenced_seq 0 0
+      ret 2
+    end
+    if not ar_claim_compute 2
+      ret 8
+    end
+    rc = ar_routed_gpu
+    if and ne rc 1 eq get nvret 0 get nvput 0
+      ar_drop_compute
+    end
+    ret rc
   end
   ret 2
 end

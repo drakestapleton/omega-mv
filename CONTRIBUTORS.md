@@ -401,6 +401,7 @@ Update this table in the same commit as the work it credits.
 | Codex (under Drake Stapleton's direction) | Bound signed step receipts to the submitting grant and spreading controls, and guarded pending output against a second dispatch. |
 | Codex (under Drake Stapleton's direction) | Bound installed GPU code to the mapped model and exercised failed-bind reservation cleanup with the seeded compiler. |
 | Codex (under Drake Stapleton's direction) | Implemented the scoped Arboris Ed25519 signer in seeded Omega and verified durable publication and retries with a dedicated Spark world identity. |
+| Codex (under Drake Stapleton's direction) | Implemented Arboris degree bucketing, cooperative hubs, persistent bounded waves, the ordered receipt DMA, CPU/GPU exclusion, experimental Q4 and cubic gates, and DeepSeek expert hint records. |
 | Codex (under Drake Stapleton's direction) | Applied the measured SM121 register headroom rule to the gated QMD following the Spark warp exception. |
 | Codex (under Drake Stapleton's direction) | Connected pre-submission policy admission to the dedicated world signer and verified the committed bank through the supervisor channel. |
 | Codex (under Drake Stapleton's direction) | Instrumented repeated resident CPU and native GPU sparse queries for paired latency and whole-board energy measurements. |

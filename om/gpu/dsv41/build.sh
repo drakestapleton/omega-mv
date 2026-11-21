@@ -30,5 +30,9 @@ for src in om/gpu/dsv41/mma/*.om; do
     "$tmp/$name" > "$tmp/$name.bin"
     "$tmp/kpack" 121-tk "$name" "$tmp/$name.bin" "$tmp/$name.cubin" 64 0 p8 p8 p8 p8 p8 4
 done
+( echo om2; cat om/gpu/dsv41/arboris/prefetch.om om/gpu/dsv41/arboris/hints-cli.om ) > "$tmp/hints-input.om"
+seed/out/omc < "$tmp/hints-input.om" > "$tmp/arboris-expert-hints"
+chmod +x "$tmp/arboris-expert-hints"
+mv "$tmp/arboris-expert-hints" "$out"
 mv "$tmp/dsv41-head" "$out"
 mv "$tmp"/*.cubin "$tmp/decode.f32le" "$out"

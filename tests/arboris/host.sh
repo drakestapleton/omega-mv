@@ -35,6 +35,13 @@ sh tests/arboris/build-sparse-probe.sh "$out/wave-chip" tests/arboris/sparse-sil
 sh tests/arboris/build-sparse-probe.sh "$out/small-chip" tests/arboris/sparse-silicon.om small
 sh tests/arboris/build-sparse-probe.sh "$out/gated-chip" tests/arboris/gated-silicon.om
 sh tests/arboris/build-sparse-probe.sh "$out/wide-chip" tests/arboris/gated-silicon.om wide
+sh tests/arboris/build-sparse-probe.sh "$out/experimental-chip" tests/arboris/gated-silicon.om experimental
+"$out/experimental-chip" reference > "$out/experimental-reference.log"
+grep -qx "output_sha256=21aa98cc216972743626af22a4614ebc7f5e5d8fe3681d8d513d5deaaecf88d6" "$out/experimental-reference.log"
+for model in persistent hubs; do
+    sh tests/arboris/build-sparse-probe.sh "$out/$model-chip" tests/arboris/sparse-silicon.om "$model"
+    "$out/$model-chip" reference > "$out/$model-reference.log"
+done
 for model in small sparse wave; do
     "$out/$model-chip" reference > "$out/$model-reference.log"
     case "$model" in
@@ -47,10 +54,16 @@ done
 "$out/gated-chip" reference > "$out/gated-reference.log"
 "$out/wide-chip" reference > "$out/wide-reference.log"
 grep -qx "output_sha256=ca8052acb8c6306df043531ab6c116c5d8dd69a7e565974338088119f8355e34" "$out/wide-reference.log"
-compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om tests/arboris_spread_test.om
+compile "$out/spread" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om om/arboris_locality.om tests/arboris/locality.om tests/arboris_spread_test.om
 "$out/spread"
 compile "$out/gated" om/arboris_arena.om gpu/nvidia/om/numeric/numeric.om om/arboris_gated.om tests/arboris_gated_test.om
 "$out/gated"
+compile "$out/precision" om/arboris_arena.om gpu/nvidia/om/numeric/numeric.om om/arboris_gated.om om/arboris_gate_cubic.om om/arboris_q4.om tests/arboris/gate-precision.om
+"$out/precision" > "$out/precision.metrics"
+compile "$out/expert-hints" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om om/gpu/dsv41/arboris/prefetch.om tests/arboris/expert-hints.om
+"$out/expert-hints" > "$out/expert-hints.bin"
+compile "$out/compute-lock" "$out/signer-profile.om" gpu/nvidia/native/arboris/compute-lock.om tests/arboris/compute-lock.om
+"$out/compute-lock"
 compile "$out/capq" om/runtime/rx_capq_core.om seed/authority/capq.om tests/arboris/capq.om
 "$out/capq"
 compile "$out/caproot-check" seed/authority/caproot.om tests/arboris/caproot-check.om
@@ -82,6 +95,20 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/arboris/scoreboard_oracle.c sr
 "$out/emit-gated" wide > "$out/wide.sass"
 echo "e1950992aaf3ba1a22562f68ddf2575d27dc39fc8e50f33e2683e0f2c6ed32af  $out/wide.sass" | sha256sum -c -
 "$out/check-wave" < "$out/wide.sass"
+for model in persistent hubs; do
+    compile "$out/emit-$model" om/arboris_arena.om om/encoder/bw_enc_sm121.om om/blackwell_arboris_emit.om om/blackwell_arboris_gated_emit.om "om/blackwell_arboris_$model.om" "tests/arboris/emit-$model.om"
+    "$out/emit-$model" > "$out/$model.bin"
+    "$dis" -b SM121 "$out/$model.bin" > "$out/$model.dis"
+    diff -u "tests/arboris/$model-sm121.dis" "$out/$model.dis"
+    "$out/check-wave" < "$out/$model.bin"
+done
+echo "51e16aadcd9e8d0274606b986d9e1b067958ce5c069e6c8962f4128b7d1385a1  $out/persistent.bin" | sha256sum -c -
+echo "62f2bd17c0c6d4f6460e2da38043642fe3a0d1023191c60ecdbcbd4cdcc435d3  $out/hubs.bin" | sha256sum -c -
+"$out/emit-gated" wide experimental > "$out/experimental.sass"
+echo "1e263bde57f3dad20c9048c3b87b6097b4b681c9f727b22ffa100bc5470b306d  $out/experimental.sass" | sha256sum -c -
+"$dis" -b SM121 "$out/experimental.sass" > "$out/experimental.dis"
+diff -u tests/arboris/experimental-sm121.dis "$out/experimental.dis"
+"$out/check-wave" < "$out/experimental.sass"
 "$out/emit" compound relax small > "$out/small.bin"
 "$out/check-wave" < "$out/small.bin"
 "$out/emit" mutant > "$out/wave-mutant.bin"

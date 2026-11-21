@@ -39,7 +39,7 @@ const char *omega2_ident_arboris_gated(void);
 uint32_t omega2_arboris_gated_tick(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint64_t *o_offsets, uint64_t o_offsets_len, uint16_t *o_arena, uint64_t o_arena_len, uint64_t o_page);
 /* export fn arboris_pack_gated m view ulong 16 offsets view ulong 6 a edit ushort * limits edit ulong 2 to ulong */
 uint32_t omega2_arboris_pack_gated(uint64_t *result, const uint64_t *o_m, uint64_t o_m_len, const uint64_t *o_offsets, uint64_t o_offsets_len, uint16_t *o_a, uint64_t o_a_len, uint64_t *o_limits, uint64_t o_limits_len);
-#define OMEGA2_IDENT_blackwell_arboris_emit "omega-ident 1 unit=blackwell_arboris_emit abi=2 profile=OM-2 src=6d890512436e571b60bc6b614a2ac258494c772427950aaec7d40ec1bf96eeb9 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_blackwell_arboris_emit "omega-ident 1 unit=blackwell_arboris_emit abi=2 profile=OM-2 src=3bd14ebaf1974cc588197ba790bbc4fa21d8ebba015a1570b5d2cb576e326a42 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_blackwell_arboris_emit(void);
 /* export fn arboris_emit_spread n ulong code edit uchar 16384 to ulong */
 uint32_t omega2_arboris_emit_spread(uint64_t *result, uint64_t o_n, uint8_t *o_code, uint64_t o_code_len);

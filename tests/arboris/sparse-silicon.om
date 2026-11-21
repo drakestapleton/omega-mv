@@ -3,11 +3,47 @@ note Native differential probe. FD3 is the issuer table. Fork before either
 note process opens RM. The producer exits after import, closing all source
 note aliases before the worker validates inputs and publishes its command.
 
+fn probe_start b ulong to ulong
+  if and eq probe_layout 1 eq b 1
+    ret sub probe_n 3
+  end
+  ret b
+end
+
 fn probe_seed i ulong to ulong
+  if ne probe_layout 0
+    if eq rem i probe_n probe_start div i probe_n
+      ret 0x3f800000
+    end
+    ret 0
+  end
   if eq rem add rem i probe_n div div i probe_n probe_planes 3 0
     ret 0x3f800000
   end
   ret 0
+end
+
+fn probe_offset row ulong to ulong
+  if eq probe_layout 1
+    ret row
+  end
+  if eq probe_layout 2
+    if lt row sub probe_n 1
+      ret 0
+    end
+    if eq row probe_n
+      ret probe_n
+    end
+    ret 64
+  end
+  ret mul div row 2 2
+end
+
+fn probe_source arc ulong to ulong
+  if and eq probe_layout 1 ne arc 0
+    ret sub arc 1
+  end
+  ret arc
 end
 
 fn probe_fill m view ulong 16 i ulong tok long to bool
@@ -26,13 +62,13 @@ fn probe_fill m view ulong 16 i ulong tok long to bool
       ret false
     end
     for j ulong add probe_n 1
-      if ne mapset tok add 12 mul j 4 4 mul div j 2 2 0
+      if ne mapset tok add 12 mul j 4 4 probe_offset j 0
         ret false
       end
     end
     off = mul add probe_n 4 4
     for j ulong probe_n
-      if ne mapset tok add off mul j 4 4 j 0
+      if ne mapset tok add off mul j 4 4 probe_source j 0
         ret false
       end
     end
@@ -42,6 +78,9 @@ fn probe_fill m view ulong 16 i ulong tok long to bool
       weight = ulong 0x3f000000
       if ne and j 1 0
         weight = ulong 0x3f400000
+      end
+      if ne probe_layout 0
+        weight = ulong 0x3f800000
       end
       if ne mapset tok mul j 4 4 weight 0
         ret false
@@ -60,7 +99,7 @@ end
 
 fn probe_match probe_scores view uint * words ulong to int
   for i ulong words
-    if ne get probe_scores add add words 4 i uint mapget get ar_maps 4 mul i 4 4
+    if ne get probe_scores add add mul ulong get probe_scores 1 words 4 i uint mapget get ar_maps 4 mul i 4 4
       ret 31
     end
   end
@@ -83,6 +122,27 @@ fn pb_sync begin bool to bool
   ret true
 end
 
+fn pb_iteration topo view uint * weights view uint * scores edit uint * to int
+  put scores 1 0
+  if gt probe_hops 1
+    for i ulong mul probe_n probe_batch
+      put scores add i 4 uint probe_seed i
+    end
+  end
+  if eq probe_planes 1
+    for hop ulong probe_hops
+      if ne arboris_relax_step topo weights scores 0
+        ret 51
+      end
+    end
+  else
+    if ne arboris_spread_step topo weights scores 0
+      ret 51
+    end
+  end
+  ret 0
+end
+
 fn pb_cpu topo view uint * weights view uint * scores edit uint * to int
   if not pb_sync true
     ret 50
@@ -91,15 +151,8 @@ fn pb_cpu topo view uint * weights view uint * scores edit uint * to int
   now = start
   queries = ulong 0
   while lt sub now start 8000000000 bound 0xffffffff
-    put scores 1 0
-    if eq probe_planes 1
-      if ne arboris_relax_step topo weights scores 0
-        ret 51
-      end
-    else
-      if ne arboris_spread_step topo weights scores 0
-        ret 51
-      end
+    if ne pb_iteration topo weights scores 0
+      ret 51
     end
     queries = add queries 1
     now = monons
@@ -141,7 +194,7 @@ fn pb_gpu table long h view ulong 2 m view ulong 16 to int
     if not pb_discard m
       ret 53
     end
-    if ne ar_sparse_hop table 42 h m 0x3f000000 0 0
+    if ne probe_execute_sparse table h m 0
       ret 54
     end
     queries = add queries 1
@@ -166,7 +219,12 @@ fn probe_expected probe_topo view uint * probe_weights view uint * to int
   start = monons
   result = ulong 1
   if eq probe_planes 1
-    result = arboris_relax_step probe_topo probe_weights part probe_scores 0 add 4 mul words 2
+    for hop ulong probe_hops
+      result = arboris_relax_step probe_topo probe_weights part probe_scores 0 add 4 mul words 2
+      if ne result 0
+        ret 30
+      end
+    end
   else
     result = arboris_spread_step probe_topo probe_weights part probe_scores 0 add 4 mul words 2
   end
@@ -196,6 +254,30 @@ fn probe_compare to int
   ret probe_expected part probe_topo 0 nt part probe_weights 0 probe_n
 end
 
+fn probe_open_sparse m view ulong 16 to bool
+  if eq probe_layout 1
+    ret ar_open_query m probe_n probe_hops
+  end
+  if eq probe_layout 2
+    ret ar_open_query m sub probe_n 2 1
+  end
+  ret ar_step_open m
+end
+
+fn probe_execute_sparse table long h view ulong 2 meta view ulong 16 to ulong
+  if eq probe_layout 0
+    ret ar_sparse_hop table 42 h meta 0x3f000000 0
+  end
+  spec = new ulong 3 0
+  put spec 0 probe_n
+  if eq probe_layout 2
+    put spec 0 sub probe_n 2
+  end
+  put spec 1 probe_hops
+  put spec 2 0x3f000000
+  ret ar_sparse_query table 42 h meta spec
+end
+
 fn probe_run table long h view ulong 2 meta edit ulong 16 to int
   offsets = new ulong 6 0
   if ne arboris_plan_sparse meta 0x10000000 4096 offsets 0
@@ -208,14 +290,14 @@ fn probe_run table long h view ulong 2 meta edit ulong 16 to int
   if ne rc 0
     ret rc
   end
-  if not ar_step_open meta
+  if not probe_open_sparse meta
     ret 22
   end
   if not probe_arm_signer table meta h 0x3f000000
     ret 47
   end
   start = monons
-  hop = ar_sparse_hop table 42 h meta 0x3f000000 0
+  hop = probe_execute_sparse table h meta
   elapsed = sub monons start
   probe_log ps_rc hop
   if ne hop 0
@@ -257,6 +339,22 @@ note Independent closed-form fixture with empty rows and two incoming arcs on
 note odd destinations. Weights and seeds are dyadic, so no floating oracle
 note shares the rounding or traversal implementation being checked.
 fn probe_golden v ulong b ulong plane ulong to ulong
+  if ne probe_layout 0
+    b = probe_start b
+    if eq v b
+      ret 0x3f800000
+    end
+    if eq probe_layout 1
+      if and gt v b le v add b probe_hops
+        ret sub 0x3f800000 shl sub v b 23
+      end
+    else
+      if eq v sub probe_n 2
+        ret 0x3f000000
+      end
+    end
+    ret 0
+  end
   raw = ulong 0
   discounted = ulong 0
   if ne and v 1 0

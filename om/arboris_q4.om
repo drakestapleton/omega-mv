@@ -1,0 +1,131 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Opt-in symmetric Q4 block for 32 finite FP16 synaptic weights.
+note Word zero holds the FP32 scale. Four words contain eight low-nibble-first
+note signed weights each. The cold packer rounds nearest, ties to even.
+fn ar_q4_nibble x f32 scale f32 to uint
+  q = div fabs x scale
+  rounded = uint q
+  tail = sub q f32 rounded
+  if or gt tail 0.5f32 and eq tail 0.5f32 ne and rounded 1 0
+    rounded = add rounded 1
+  end
+  if gt rounded 7
+    rounded = uint 7
+  end
+  if lt x f32 0
+    ret and sub uint 16 rounded 15
+  end
+  ret rounded
+end
+
+fn arboris_q4_pack src view ushort 32 block edit uint 5 to bool
+  peak = f32 0
+  for i ulong 32
+    bits = ulong get src i
+    if eq and bits 0x7c00 0x7c00
+      ret false
+    end
+    peak = fmax peak fabs f32of f16to32 bits
+  end
+  for i ulong 5
+    put block i 0
+  end
+  if eq peak f32 0
+    ret true
+  end
+  scale = div peak f32 7
+  put block 0 uint bitsof scale
+  for i ulong 32
+    word = add 1 shr i 3
+    nibble = ar_q4_nibble f32of f16to32 ulong get src i scale
+    put block word or get block word shl nibble mul 4 and i 7
+  end
+  ret true
+end
+
+fn arboris_q4_weight block view uint 5 index ulong to f32
+  nibble = and shr get block add 1 shr index 3 mul 4 and index 7 15
+  value = sub int xor nibble 8 8
+  ret mul f32 value f32of ulong get block 0
+end
+
+note Experimental ParamSlab starts with 64 cubic coefficient words, followed
+note by Q4 synapses, zero padding to 16 bytes, then original FP16 bias/gate/
+note prediction rows. The trailing ARQ4 tag makes its extent 4 mod 16.
+fn ar_q4_tail m view ulong 16 to ulong
+  weights = positive_product get m 3 get m 4 0xffffffff
+  if and ne get m 3 0 eq weights 0
+    ret 0
+  end
+  blocks = div add weights 31 32
+  ret aligned_size add 256 mul blocks 20 16 0x1000000000
+end
+
+fn arboris_q4_bytes m view ulong 16 to ulong
+  tail = ar_q4_tail m
+  if or eq tail 0 or gt get m 2 0xffffffff gt get m 1 0x1000000
+    ret 0
+  end
+  if or eq get m 4 0 or gt get m 4 24576 ne and get m 4 7 0
+    ret 0
+  end
+  rows = add get m 2 mul get m 1 2
+  ret add add tail mul rows mul get m 4 2 4
+end
+
+fn ar_q4_copy_block src view ushort * b ulong dst edit uint * to bool
+  raw = new ushort 32 0
+  block = new uint 5 0
+  for j ulong 32
+    index = add mul b 32 j
+    if lt index len src
+      put raw j get src index
+    end
+  end
+  if not arboris_q4_pack raw block
+    ret false
+  end
+  for j ulong 5
+    put dst add add 64 mul b 5 j get block j
+  end
+  ret true
+end
+
+fn ar_q4_copy_halves src view ushort * dst edit uint * tail ulong to void
+  for i ulong div len src 2 bound 0x1000000000000
+    ix = mul i 2
+    put dst add tail i or uint get src ix shl uint get src add ix 1 16
+  end
+end
+
+fn arboris_pack_q4_params m view ulong 16 src view ushort * dst edit uint * to bool
+  size = arboris_q4_bytes m
+  weights = mul get m 3 get m 4
+  tail = div ar_q4_tail m 4
+  if or eq size 0 ne len dst div size 4
+    ret false
+  end
+  if ne len src add weights mul 2 sub sub len dst tail 1
+    ret false
+  end
+  if not ag_half_span src 0 len src
+    ret false
+  end
+  coeff = new uint 64 0
+  arboris_cubic_table coeff
+  for i ulong 64
+    put dst i get coeff i
+  end
+  for b ulong div add weights 31 32 bound 0x8000000
+    if not ar_q4_copy_block part src 0 weights b dst
+      ret false
+    end
+  end
+  pad = add 64 mul div add weights 31 32 5
+  for i ulong sub tail pad bound 3
+    put dst add pad i 0
+  end
+  ar_q4_copy_halves part src weights sub len src weights dst tail
+  put dst sub len dst 1 0x34515241
+  ret true
+end
