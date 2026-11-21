@@ -18,34 +18,31 @@
  * EST-1 (est_kf.c) and is not reimplemented here. */
 #include "ans.h"
 #include "est_kf.h"
+#include "omega_api_decl.h"
 
 #include <math.h>
 #include <string.h>
 
+static uint64_t ans_dbits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+static double ans_from_bits(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
+
 ans_atom ans_component_atom(uint32_t component)
 {
-    static const ans_atom map[ANS_DIM] = {
-        ANS_ATOM_GOAL_IDENTITY, ANS_ATOM_CONSENT, ANS_ATOM_PROVENANCE, ANS_ATOM_SCOPE
-    };
-    return map[component % ANS_DIM];
+    return (ans_atom)ans_om_component_atom(component);
 }
 
 /* ---- reference ---- */
-static int pos_fin(double d) { return isfinite(d) && d > 0.0; }
-
 ans_status ans_reference_validate(const ans_reference *ref)
 {
     if (!ref) return ANS_ERR_NULL;
-    if (ref->version == 0u) return ANS_ERR_REFERENCE;
-    for (uint32_t i = 0; i < ANS_ATOMS; i++) if (!pos_fin(ref->limit[i])) return ANS_ERR_REFERENCE;
-    for (uint32_t i = 0; i < ANS_ACT_KINDS; i++) if (!pos_fin(ref->q[i])) return ANS_ERR_REFERENCE;
-    for (uint32_t i = 0; i < ANS_SENSOR_KINDS; i++) if (!pos_fin(ref->r[i])) return ANS_ERR_REFERENCE;
-    if (!(ref->r[ANS_SENSOR_FIX] < ref->r[ANS_SENSOR_REFERENCE] &&
-          ref->r[ANS_SENSOR_REFERENCE] < ref->r[ANS_SENSOR_IMU])) return ANS_ERR_REFERENCE;
-    if (!pos_fin(ref->tier_sigma[0]) || !(ref->tier_sigma[0] < ref->tier_sigma[1]) ||
-        !(ref->tier_sigma[1] < ref->tier_sigma[2]) || !isfinite(ref->tier_sigma[2])) return ANS_ERR_REFERENCE;
-    if (!pos_fin(ref->nis_limit) || !pos_fin(ref->promote_limit)) return ANS_ERR_REFERENCE;
-    return ANS_OK;
+    uint64_t vals[23];
+    for (uint32_t i = 0; i < ANS_ATOMS; i++) vals[i] = ans_dbits(ref->limit[i]);
+    for (uint32_t i = 0; i < ANS_ACT_KINDS; i++) vals[10 + i] = ans_dbits(ref->q[i]);
+    for (uint32_t i = 0; i < ANS_SENSOR_KINDS; i++) vals[15 + i] = ans_dbits(ref->r[i]);
+    for (uint32_t i = 0; i < 3; i++) vals[18 + i] = ans_dbits(ref->tier_sigma[i]);
+    vals[21] = ans_dbits(ref->nis_limit);
+    vals[22] = ans_dbits(ref->promote_limit);
+    return (ans_status)ans_om_validate_ref(ref->version, vals);
 }
 
 ans_status ans_reference_freeze(ans_reference *ref, ans_digest *out_digest)
@@ -250,14 +247,15 @@ ans_status ans_drift(const ans_state *state, double *mean_norm, double *sigma)
 {
     if (!state || !mean_norm || !sigma) return ANS_ERR_NULL;
     if (state->drift.n != ANS_DIM) return ANS_ERR_RANGE;
-    double ss = 0.0, tr = 0.0;
+    uint64_t x[4], p_diag[4], out_vals[3] = {0};
     for (uint32_t i = 0; i < ANS_DIM; i++) {
-        ss += state->drift.x[i] * state->drift.x[i];
-        tr += state->drift.P[i * ANS_DIM + i];
+        x[i] = ans_dbits(state->drift.x[i]);
+        p_diag[i] = ans_dbits(state->drift.P[i * ANS_DIM + i]);
     }
-    if (!isfinite(ss) || !isfinite(tr) || tr < 0.0) return ANS_ERR_NONFINITE;
-    *mean_norm = sqrt(ss);
-    *sigma = sqrt(tr);
+    int64_t rc = ans_om_drift(x, p_diag, out_vals);
+    if (rc != 0) return (ans_status)rc;
+    *mean_norm = ans_from_bits(out_vals[0]);
+    *sigma = ans_from_bits(out_vals[1]);
     return ANS_OK;
 }
 
@@ -277,15 +275,13 @@ ans_status ans_autonomy(const ans_reference *ref, const ans_digest *digest, cons
     st = ans_drift(state, &v.mean_norm, &v.sigma);
     if (st != ANS_OK) return st;
     v.D = ans_drift_total(v.mean_norm, v.sigma);
-    ans_tier t = ANS_TIER_FULL;
-    if (v.sigma >= ref->tier_sigma[2]) t = ANS_TIER_HALT_REQUEST_FIX;
-    else if (v.sigma >= ref->tier_sigma[1]) t = ANS_TIER_SIMULATE_ONLY;
-    else if (v.sigma >= ref->tier_sigma[0]) t = ANS_TIER_REVERSIBLE_ONLY;
-    for (uint32_t i = 0; i < ANS_DIM; i++)
-        if (fabs(state->drift.x[i]) > ref->limit[ans_component_atom(i)] && t < ANS_TIER_REVERSIBLE_ONLY)
-            t = ANS_TIER_REVERSIBLE_ONLY;
-    if (state->disagreement) t = ANS_TIER_HALT_REQUEST_FIX;
-    v.tier = t;
+    uint64_t x[4], limits[4], tsig[3];
+    for (uint32_t i = 0; i < ANS_DIM; i++) {
+        x[i] = ans_dbits(state->drift.x[i]);
+        limits[i] = ans_dbits(ref->limit[ans_component_atom(i)]);
+    }
+    for (uint32_t i = 0; i < 3; i++) tsig[i] = ans_dbits(ref->tier_sigma[i]);
+    v.tier = (ans_tier)ans_om_autonomy_tier(x, limits, tsig, ans_dbits(v.sigma), state->disagreement);
     v.since_fix = state->since_fix;
     v.disagreement = state->disagreement;
     st = ans_digest_state(state, &v.state);
@@ -318,18 +314,13 @@ ans_status ans_promotion_check(const ans_reference *ref, const ans_digest *diges
     r.tests = req->tests_now;
     st = ans_digest_state(cs, &r.state);
     if (st != ANS_OK) return st;
-    if (memcmp(req->reference_at_birth.b, digest->b, EST_DIGEST_SIZE) != 0)
-        r.result = ANS_PROMOTE_REFUSED_REFERENCE;
-    else if (memcmp(req->tests_now.b, req->tests_at_birth.b, EST_DIGEST_SIZE) != 0)
-        r.result = ANS_PROMOTE_REFUSED_TESTS;
-    else if (cs->disagreement)
-        r.result = ANS_PROMOTE_REFUSED_DISAGREEMENT;
-    else if (r.D > ref->promote_limit)
-        r.result = ANS_PROMOTE_REFUSED_DRIFT;
-    else if (cs->self_mod_unfixed > 0)
-        r.result = ANS_PROMOTE_REFUSED_SELF_MOD;
-    else
-        r.result = ANS_PROMOTE_OK;
+    const uint64_t flags[4] = {
+        memcmp(req->reference_at_birth.b, digest->b, EST_DIGEST_SIZE) == 0 ? 1u : 0u,
+        memcmp(req->tests_now.b, req->tests_at_birth.b, EST_DIGEST_SIZE) == 0 ? 1u : 0u,
+        cs->disagreement ? 1u : 0u,
+        cs->self_mod_unfixed
+    };
+    r.result = (ans_promo)ans_om_promotion_result(flags, ans_dbits(r.D), ans_dbits(ref->promote_limit));
     st = ans_digest_promotion_record(&r, &r.digest);
     if (st != ANS_OK) return st;
     *out = r;

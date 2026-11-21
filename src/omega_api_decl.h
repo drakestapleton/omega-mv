@@ -1060,6 +1060,26 @@ int64_t rxp_decode_header(const uint8_t o_in_hdr[106], uint64_t o_counts[2], uin
 void rxp_encode_step_head(uint64_t o_idx, uint64_t o_family, uint64_t o_role, uint64_t o_in_cnt, uint8_t o_out_buf[8]);
 /* export fn rxp_decode_step_head in_buf view uchar 8 expect_idx ulong fields edit ulong 3 to long */
 int64_t rxp_decode_step_head(const uint8_t o_in_buf[8], uint64_t o_expect_idx, uint64_t o_fields[3]);
+/* export fn ans_om_component_atom comp ulong to ulong */
+uint64_t ans_om_component_atom(uint64_t o_comp);
+/* export fn ans_om_validate_ref version ulong vals view ulong 23 to long */
+int64_t ans_om_validate_ref(uint64_t o_version, const uint64_t o_vals[23]);
+/* export fn ans_om_drift x view ulong 4 p_diag view ulong 4 out_vals edit ulong 3 to long */
+int64_t ans_om_drift(const uint64_t o_x[4], const uint64_t o_p_diag[4], uint64_t o_out_vals[3]);
+/* export fn ans_om_autonomy_tier x view ulong 4 limits view ulong 4 tsig view ulong 3 sigma_bits ulong disagreement ulong to ulong */
+uint64_t ans_om_autonomy_tier(const uint64_t o_x[4], const uint64_t o_limits[4], const uint64_t o_tsig[3], uint64_t o_sigma_bits, uint64_t o_disagreement);
+/* export fn ans_om_promotion_result flags view ulong 4 d_bits ulong lim_bits ulong to ulong */
+uint64_t ans_om_promotion_result(const uint64_t o_flags[4], uint64_t o_d_bits, uint64_t o_lim_bits);
+/* export fn ans_om_check_action kind ulong risk_bits ulong touches view uint 10 id view uchar 32 to long */
+int64_t ans_om_check_action(uint64_t o_kind, uint64_t o_risk_bits, const uint32_t o_touches[10], const uint8_t o_id[32]);
+/* export fn ans_om_check_meas cls ulong z view ulong 4 to long */
+int64_t ans_om_check_meas(uint64_t o_cls, const uint64_t o_z[4]);
+/* export fn ans_om_write_header kind ulong out_hdr out uchar 8 to void */
+void ans_om_write_header(uint64_t o_kind, uint8_t o_out_hdr[8]);
+/* export fn ans_om_check_header hdr view uchar 8 kind ulong to ulong */
+uint64_t ans_om_check_header(const uint8_t o_hdr[8], uint64_t o_kind);
+/* export fn ans_om_canon_f64 bits ulong to ulong */
+uint64_t ans_om_canon_f64(uint64_t o_bits);
 #ifdef __cplusplus
 }
 #endif

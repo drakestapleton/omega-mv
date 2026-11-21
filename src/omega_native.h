@@ -681,6 +681,28 @@ uint32_t omega2_rxp_decode_header(uint64_t *result, const uint8_t *o_in_hdr, uin
 uint32_t omega2_rxp_encode_step_head(uint64_t *result, uint64_t o_idx, uint64_t o_family, uint64_t o_role, uint64_t o_in_cnt, uint8_t *o_out_buf);
 /* export fn rxp_decode_step_head in_buf view uchar 8 expect_idx ulong fields edit ulong 3 to long */
 uint32_t omega2_rxp_decode_step_head(uint64_t *result, const uint8_t *o_in_buf, uint64_t o_in_buf_len, uint64_t o_expect_idx, uint64_t *o_fields, uint64_t o_fields_len);
+#define OMEGA2_IDENT_ans_core "omega-ident 1 unit=ans_core abi=2 profile=OM-2 src=1b0e9d59beb2cb33f51b80813813345232c62929fac783aca0043e8c26f6382b omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_ans_core(void);
+/* export fn ans_om_component_atom comp ulong to ulong */
+uint32_t omega2_ans_om_component_atom(uint64_t *result, uint64_t o_comp);
+/* export fn ans_om_validate_ref version ulong vals view ulong 23 to long */
+uint32_t omega2_ans_om_validate_ref(uint64_t *result, uint64_t o_version, const uint64_t *o_vals, uint64_t o_vals_len);
+/* export fn ans_om_drift x view ulong 4 p_diag view ulong 4 out_vals edit ulong 3 to long */
+uint32_t omega2_ans_om_drift(uint64_t *result, const uint64_t *o_x, uint64_t o_x_len, const uint64_t *o_p_diag, uint64_t o_p_diag_len, uint64_t *o_out_vals, uint64_t o_out_vals_len);
+/* export fn ans_om_autonomy_tier x view ulong 4 limits view ulong 4 tsig view ulong 3 sigma_bits ulong disagreement ulong to ulong */
+uint32_t omega2_ans_om_autonomy_tier(uint64_t *result, const uint64_t *o_x, uint64_t o_x_len, const uint64_t *o_limits, uint64_t o_limits_len, const uint64_t *o_tsig, uint64_t o_tsig_len, uint64_t o_sigma_bits, uint64_t o_disagreement);
+/* export fn ans_om_promotion_result flags view ulong 4 d_bits ulong lim_bits ulong to ulong */
+uint32_t omega2_ans_om_promotion_result(uint64_t *result, const uint64_t *o_flags, uint64_t o_flags_len, uint64_t o_d_bits, uint64_t o_lim_bits);
+/* export fn ans_om_check_action kind ulong risk_bits ulong touches view uint 10 id view uchar 32 to long */
+uint32_t omega2_ans_om_check_action(uint64_t *result, uint64_t o_kind, uint64_t o_risk_bits, const uint32_t *o_touches, uint64_t o_touches_len, const uint8_t *o_id, uint64_t o_id_len);
+/* export fn ans_om_check_meas cls ulong z view ulong 4 to long */
+uint32_t omega2_ans_om_check_meas(uint64_t *result, uint64_t o_cls, const uint64_t *o_z, uint64_t o_z_len);
+/* export fn ans_om_write_header kind ulong out_hdr out uchar 8 to void */
+uint32_t omega2_ans_om_write_header(uint64_t *result, uint64_t o_kind, uint8_t *o_out_hdr);
+/* export fn ans_om_check_header hdr view uchar 8 kind ulong to ulong */
+uint32_t omega2_ans_om_check_header(uint64_t *result, const uint8_t *o_hdr, uint64_t o_hdr_len, uint64_t o_kind);
+/* export fn ans_om_canon_f64 bits ulong to ulong */
+uint32_t omega2_ans_om_canon_f64(uint64_t *result, uint64_t o_bits);
 #ifdef __cplusplus
 }
 #endif

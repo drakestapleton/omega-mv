@@ -22,6 +22,7 @@
  * binary64 bit patterns (-0.0 as +0.0), digests as 32 raw bytes, and the
  * embedded EST belief as u32 length + est_encode_belief bytes. */
 #include "ans.h"
+#include "omega_api_decl.h"
 
 #include <math.h>
 #include <string.h>
@@ -81,7 +82,10 @@ static void c_u8(cd *c, uint8_t *v) { c_raw(c, v, 1); }
 static void c_f64(cd *c, double *d)
 {
     uint64_t u = 0;
-    if (!c->dec && *d != 0.0) memcpy(&u, d, 8);
+    if (!c->dec) {
+        memcpy(&u, d, 8);
+        u = ans_om_canon_f64(u);
+    }
     c_u64(c, &u);
     if (c->dec && !c->bad) memcpy(d, &u, 8);
 }
@@ -89,11 +93,10 @@ static void c_farr(cd *c, double *a, size_t n) { for (size_t i = 0; i < n; i++) 
 static void c_dig(cd *c, ans_digest *d) { c_raw(c, d->b, EST_DIGEST_SIZE); }
 static void c_hdr(cd *c, int kind)
 {
-    uint8_t h[8] = { 'O', 'A', 'N', 'S', (uint8_t)kind, (uint8_t)ANS_FORMAT_VERSION, 0, 0 };
-    uint8_t g[8];
-    memcpy(g, h, 8);
+    uint8_t g[8] = {0};
+    if (!c->dec) ans_om_write_header((uint64_t)(unsigned)kind, g);
     c_raw(c, g, 8);
-    if (c->dec && !c->bad && memcmp(g, h, 8) != 0) c->bad = 1;
+    if (c->dec && !c->bad && !ans_om_check_header(g, (uint64_t)(unsigned)kind)) c->bad = 1;
 }
 static void c_belief(cd *c, est_belief *b)
 {
@@ -194,22 +197,18 @@ static void v_promo(cd *c, ans_promotion_record *p)
 
 /* ---- semantic checks shared by encode, decode and digest ---- */
 static int fin(double d) { return isfinite(d); }
-static int zero_dig(const ans_digest *d) { return est_digest_is_zero(d); }
 
 static ans_status chk_action(const ans_action *a)
 {
-    if ((unsigned)a->kind >= ANS_ACT_KINDS) return ANS_ERR_RANGE;
-    if (!fin(a->reversibility_risk)) return ANS_ERR_NONFINITE;
-    if (a->reversibility_risk < 0.0 || a->reversibility_risk > 1.0) return ANS_ERR_RANGE;
-    for (uint32_t i = 0; i < ANS_ATOMS; i++) if (a->touches[i] > 1u) return ANS_ERR_RANGE;
-    if (zero_dig(&a->id)) return ANS_ERR_EVIDENCE;
-    return ANS_OK;
+    uint64_t rbits;
+    memcpy(&rbits, &a->reversibility_risk, 8);
+    return (ans_status)ans_om_check_action((uint64_t)(unsigned)a->kind, rbits, a->touches, a->id.b);
 }
 static ans_status chk_meas(const ans_measurement *m)
 {
-    for (uint32_t i = 0; i < ANS_DIM; i++) if (!fin(m->z[i])) return ANS_ERR_NONFINITE;
-    if ((unsigned)m->cls >= ANS_SENSOR_KINDS) return ANS_ERR_SENSOR;
-    return ANS_OK;
+    uint64_t zbits[ANS_DIM];
+    for (uint32_t i = 0; i < ANS_DIM; i++) memcpy(&zbits[i], &m->z[i], 8);
+    return (ans_status)ans_om_check_meas((uint64_t)(unsigned)m->cls, zbits);
 }
 static ans_status chk_state(const ans_state *s)
 {
