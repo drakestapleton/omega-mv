@@ -723,6 +723,44 @@ uint32_t omega2_cl_om_get_le(uint64_t *result, const uint8_t *o_in_buf, uint64_t
 uint32_t omega2_cl_om_hex(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_out_hex, uint64_t o_out_hex_len);
 /* export fn cl_om_contains hay view uchar * needle view uchar * to ulong */
 uint32_t omega2_cl_om_contains(uint64_t *result, const uint8_t *o_hay, uint64_t o_hay_len, const uint8_t *o_needle, uint64_t o_needle_len);
+#define OMEGA2_IDENT_rx_dual_core "omega-ident 1 unit=rx_dual_core abi=2 profile=OM-2 src=648b96b9693a5d6e0c4a0d061694d2b7070d101982128ae1bec47da904cf28a5 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_rx_dual_core(void);
+/* export fn rx_dual_om_digest_is_zero d view uchar 32 to ulong */
+uint32_t omega2_rx_dual_om_digest_is_zero(uint64_t *result, const uint8_t *o_d, uint64_t o_d_len);
+/* export fn rx_dual_om_digest_eq a view uchar 32 b view uchar 32 to ulong */
+uint32_t omega2_rx_dual_om_digest_eq(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len);
+/* export fn rx_dual_om_unit_valid u ulong to ulong */
+uint32_t omega2_rx_dual_om_unit_valid(uint64_t *result, uint64_t o_u);
+/* export fn rx_dual_om_ids_ascending ids view uint * n ulong to ulong */
+uint32_t omega2_rx_dual_om_ids_ascending(uint64_t *result, const uint32_t *o_ids, uint64_t o_ids_len, uint64_t o_n);
+/* export fn rx_dual_om_check_site_name name view uchar 32 to ulong */
+uint32_t omega2_rx_dual_om_check_site_name(uint64_t *result, const uint8_t *o_name, uint64_t o_name_len);
+/* export fn rx_dual_om_put_u32 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_rx_dual_om_put_u32(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn rx_dual_om_put_u64 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_rx_dual_om_put_u64(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn rx_dual_om_put_f64_canon dst edit uchar * pos ulong bits ulong to void */
+uint32_t omega2_rx_dual_om_put_f64_canon(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_bits);
+/* export fn rx_dual_om_get_u32 src view uchar * pos ulong to ulong */
+uint32_t omega2_rx_dual_om_get_u32(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn rx_dual_om_get_u64 src view uchar * pos ulong to ulong */
+uint32_t omega2_rx_dual_om_get_u64(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn rx_dual_om_consequence_check meta view ulong 2 vals view ulong 4 to ulong */
+uint32_t omega2_rx_dual_om_consequence_check(uint64_t *result, const uint64_t *o_meta, uint64_t o_meta_len, const uint64_t *o_vals, uint64_t o_vals_len);
+/* export fn rx_dual_om_consequence_error pred_b ulong sd_b ulong meas_b ulong to ulong */
+uint32_t omega2_rx_dual_om_consequence_error(uint64_t *result, uint64_t o_pred_b, uint64_t o_sd_b, uint64_t o_meas_b);
+/* export fn rx_dual_om_unit_from_est u ulong to ulong */
+uint32_t omega2_rx_dual_om_unit_from_est(uint64_t *result, uint64_t o_u);
+/* export fn rx_dual_om_classify_state flags view ulong 6 to ulong */
+uint32_t omega2_rx_dual_om_classify_state(uint64_t *result, const uint64_t *o_flags, uint64_t o_flags_len);
+/* export fn rx_dual_om_step_lambda p view ulong 9 out_b edit ulong 1 to ulong */
+uint32_t omega2_rx_dual_om_step_lambda(uint64_t *result, const uint64_t *o_p, uint64_t o_p_len, uint64_t *o_out_b, uint64_t o_out_b_len);
+/* export fn rx_dual_om_parse_udec p view uchar * n ulong out_b edit ulong 1 to ulong */
+uint32_t omega2_rx_dual_om_parse_udec(uint64_t *result, const uint8_t *o_p, uint64_t o_p_len, uint64_t o_n, uint64_t *o_out_b, uint64_t o_out_b_len);
+/* export fn rx_dual_om_reversals xbytes view uchar * lo ulong hi ulong to ulong */
+uint32_t omega2_rx_dual_om_reversals(uint64_t *result, const uint8_t *o_xbytes, uint64_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
+/* export fn rx_dual_om_peak_to_peak xbytes view uchar * lo ulong hi ulong to ulong */
+uint32_t omega2_rx_dual_om_peak_to_peak(uint64_t *result, const uint8_t *o_xbytes, uint64_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
 #ifdef __cplusplus
 }
 #endif

@@ -16,31 +16,37 @@
 
 /* DUAL-1a: reference price update. */
 #include "rx_dual_update.h"
+#include "omega_native.h"
 
 #include <math.h>
 #include <string.h>
 
+static uint64_t f64_to_u64(double d)
+{
+    uint64_t u;
+    memcpy(&u, &d, 8);
+    return u;
+}
+
 RxDualStatus rx_dual_step_lambda(double lambda, double estimate, double uncertainty, double budget,
                                  double scale, const RxDualController *ctl, double lambda_max, double *out)
 {
-    double pressure, deadband, g, next;
+    uint64_t p[9], ob[1] = { 0 }, rc = 0;
     RxDualStatus st;
     if (!ctl || !out) return RX_DUAL_ERR_NULL;
     if ((st = rx_dual_check_controller(ctl)) != RX_DUAL_OK) return st;
-    if (!isfinite(lambda) || !isfinite(estimate) || !isfinite(uncertainty) || !isfinite(budget) ||
-        !isfinite(scale) || !isfinite(lambda_max))
-        return RX_DUAL_ERR_NONFINITE;
-    if (!(scale > 0.0)) return RX_DUAL_ERR_SCALE;
-    if (lambda < 0.0 || uncertainty < 0.0 || !(lambda_max > 0.0) || lambda > lambda_max) return RX_DUAL_ERR_RANGE;
-    pressure = (estimate - budget) / scale;
-    deadband = ctl->k_sigma * uncertainty / scale;
-    if (fabs(pressure) <= deadband) g = 0.0;
-    else g = pressure - (pressure > 0.0 ? deadband : -deadband);
-    next = (1.0 - ctl->rho) * lambda + ctl->eta * g;
-    if (!isfinite(next)) return RX_DUAL_ERR_NONFINITE;
-    if (next < 0.0) next = 0.0;
-    if (next > lambda_max) next = lambda_max;
-    *out = next;
+    p[0] = f64_to_u64(lambda);
+    p[1] = f64_to_u64(estimate);
+    p[2] = f64_to_u64(uncertainty);
+    p[3] = f64_to_u64(budget);
+    p[4] = f64_to_u64(scale);
+    p[5] = f64_to_u64(ctl->k_sigma);
+    p[6] = f64_to_u64(ctl->rho);
+    p[7] = f64_to_u64(ctl->eta);
+    p[8] = f64_to_u64(lambda_max);
+    if (omega2_rx_dual_om_step_lambda(&rc, p, 9, ob, 1) != 0) return RX_DUAL_ERR_RANGE;
+    if (rc != 0) return (RxDualStatus)(-(int)rc);
+    memcpy(out, &ob[0], 8);
     return RX_DUAL_OK;
 }
 

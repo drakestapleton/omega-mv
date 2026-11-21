@@ -1096,6 +1096,42 @@ uint64_t cl_om_get_le(const uint8_t o_in_buf[8], uint64_t o_nbytes);
 void cl_om_hex(const uint8_t *o_src, size_t o_src_len, uint8_t *o_out_hex, size_t o_out_hex_len);
 /* export fn cl_om_contains hay view uchar * needle view uchar * to ulong */
 uint64_t cl_om_contains(const uint8_t *o_hay, size_t o_hay_len, const uint8_t *o_needle, size_t o_needle_len);
+/* export fn rx_dual_om_digest_is_zero d view uchar 32 to ulong */
+uint64_t rx_dual_om_digest_is_zero(const uint8_t o_d[32]);
+/* export fn rx_dual_om_digest_eq a view uchar 32 b view uchar 32 to ulong */
+uint64_t rx_dual_om_digest_eq(const uint8_t o_a[32], const uint8_t o_b[32]);
+/* export fn rx_dual_om_unit_valid u ulong to ulong */
+uint64_t rx_dual_om_unit_valid(uint64_t o_u);
+/* export fn rx_dual_om_ids_ascending ids view uint * n ulong to ulong */
+uint64_t rx_dual_om_ids_ascending(const uint32_t *o_ids, size_t o_ids_len, uint64_t o_n);
+/* export fn rx_dual_om_check_site_name name view uchar 32 to ulong */
+uint64_t rx_dual_om_check_site_name(const uint8_t o_name[32]);
+/* export fn rx_dual_om_put_u32 dst edit uchar * pos ulong v ulong to void */
+void rx_dual_om_put_u32(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn rx_dual_om_put_u64 dst edit uchar * pos ulong v ulong to void */
+void rx_dual_om_put_u64(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn rx_dual_om_put_f64_canon dst edit uchar * pos ulong bits ulong to void */
+void rx_dual_om_put_f64_canon(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_bits);
+/* export fn rx_dual_om_get_u32 src view uchar * pos ulong to ulong */
+uint64_t rx_dual_om_get_u32(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn rx_dual_om_get_u64 src view uchar * pos ulong to ulong */
+uint64_t rx_dual_om_get_u64(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn rx_dual_om_consequence_check meta view ulong 2 vals view ulong 4 to ulong */
+uint64_t rx_dual_om_consequence_check(const uint64_t o_meta[2], const uint64_t o_vals[4]);
+/* export fn rx_dual_om_consequence_error pred_b ulong sd_b ulong meas_b ulong to ulong */
+uint64_t rx_dual_om_consequence_error(uint64_t o_pred_b, uint64_t o_sd_b, uint64_t o_meas_b);
+/* export fn rx_dual_om_unit_from_est u ulong to ulong */
+uint64_t rx_dual_om_unit_from_est(uint64_t o_u);
+/* export fn rx_dual_om_classify_state flags view ulong 6 to ulong */
+uint64_t rx_dual_om_classify_state(const uint64_t o_flags[6]);
+/* export fn rx_dual_om_step_lambda p view ulong 9 out_b edit ulong 1 to ulong */
+uint64_t rx_dual_om_step_lambda(const uint64_t o_p[9], uint64_t o_out_b[1]);
+/* export fn rx_dual_om_parse_udec p view uchar * n ulong out_b edit ulong 1 to ulong */
+uint64_t rx_dual_om_parse_udec(const uint8_t *o_p, size_t o_p_len, uint64_t o_n, uint64_t o_out_b[1]);
+/* export fn rx_dual_om_reversals xbytes view uchar * lo ulong hi ulong to ulong */
+uint64_t rx_dual_om_reversals(const uint8_t *o_xbytes, size_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
+/* export fn rx_dual_om_peak_to_peak xbytes view uchar * lo ulong hi ulong to ulong */
+uint64_t rx_dual_om_peak_to_peak(const uint8_t *o_xbytes, size_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
 #ifdef __cplusplus
 }
 #endif

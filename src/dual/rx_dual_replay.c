@@ -16,6 +16,7 @@
 
 /* DUAL-1b: digest-bound traces and deterministic replay. */
 #include "rx_dual_replay.h"
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <math.h>
@@ -32,17 +33,26 @@ uint64_t rx_dual_xorshift64s(uint64_t *s)
 double rx_dual_xorshift_unit(uint64_t *s) { return (double)(rx_dual_xorshift64s(s) >> 11) / 9007199254740992.0; }
 
 /* ---- little-endian encoding (same conventions as rx_dual.c) ---- */
-static void p_u32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static void p_u64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
+static void p_u32(uint8_t *p, uint32_t v) { uint64_t u = 0; (void)omega2_rx_dual_om_put_u32(&u, p, 4, 0, v); }
+static void p_u64(uint8_t *p, uint64_t v) { uint64_t u = 0; (void)omega2_rx_dual_om_put_u64(&u, p, 8, 0, v); }
 static void p_f64(uint8_t *p, double d)
 {
-    uint64_t bits;
-    if (d == 0.0) d = 0.0; /* -0.0 -> +0.0 */
+    uint64_t bits, u = 0;
     memcpy(&bits, &d, 8);
-    p_u64(p, bits);
+    (void)omega2_rx_dual_om_put_f64_canon(&u, p, 8, 0, bits);
 }
-static uint32_t g_u32(const uint8_t *p) { uint32_t v = 0; for (int i = 3; i >= 0; i--) v = (v << 8) | p[i]; return v; }
-static uint64_t g_u64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
+static uint32_t g_u32(const uint8_t *p)
+{
+    uint64_t v = 0;
+    (void)omega2_rx_dual_om_get_u32(&v, p, 4, 0);
+    return (uint32_t)v;
+}
+static uint64_t g_u64(const uint8_t *p)
+{
+    uint64_t v = 0;
+    (void)omega2_rx_dual_om_get_u64(&v, p, 8, 0);
+    return v;
+}
 static double g_f64(const uint8_t *p) { uint64_t bits = g_u64(p); double d; memcpy(&d, &bits, 8); return d; }
 
 static RxDualStatus check_tick(const RxDualTraceTick *t)
@@ -132,13 +142,10 @@ RxDualStatus rx_dual_digest_trace(const RxDualTrace *tr, RxDualDigest *out)
 static int field_eq(const uint8_t *p, size_t n, const char *s) { return strlen(s) == n && memcmp(p, s, n) == 0; }
 static int parse_udec(const uint8_t *p, size_t n, double *out)
 {
-    double v = 0.0;
+    uint64_t ob[1] = { 0 }, ok = 0;
     if (n == 0 || n > 19) return 0;
-    for (size_t i = 0; i < n; i++) {
-        if (p[i] < '0' || p[i] > '9') return 0;
-        v = v * 10.0 + (double)(p[i] - '0');
-    }
-    *out = v;
+    if (omega2_rx_dual_om_parse_udec(&ok, p, n, n, ob, 1) != 0 || !ok) return 0;
+    memcpy(out, &ob[0], 8);
     return 1;
 }
 
@@ -250,24 +257,20 @@ RxDualStatus rx_dual_replay_run(const RxDualTrace *tr, const RxDualController *c
 /* ---- measures ---- */
 uint32_t rx_dual_reversals(const double *x, uint32_t lo, uint32_t hi)
 {
-    uint32_t r = 0;
-    int last = 0;
+    uint64_t r = 0;
     if (!x || hi <= lo) return 0;
-    for (uint32_t i = lo + 1; i < hi; i++) {
-        double d = x[i] - x[i - 1];
-        int s = (d > 0.0) ? 1 : (d < 0.0) ? -1 : 0;
-        if (s == 0) continue;
-        if (last != 0 && s != last) r++;
-        last = s;
-    }
-    return r;
+    if (omega2_rx_dual_om_reversals(&r, (const uint8_t *)x, (size_t)hi * sizeof(double), lo, hi) != 0)
+        return 0;
+    return (uint32_t)r;
 }
 
 double rx_dual_peak_to_peak(const double *x, uint32_t lo, uint32_t hi)
 {
-    double mn, mx;
+    uint64_t bits = 0;
+    double d = 0.0;
     if (!x || hi <= lo) return 0.0;
-    mn = mx = x[lo];
-    for (uint32_t i = lo + 1; i < hi; i++) { if (x[i] < mn) mn = x[i]; if (x[i] > mx) mx = x[i]; }
-    return mx - mn;
+    if (omega2_rx_dual_om_peak_to_peak(&bits, (const uint8_t *)x, (size_t)hi * sizeof(double), lo, hi) != 0)
+        return 0.0;
+    memcpy(&d, &bits, 8);
+    return d;
 }

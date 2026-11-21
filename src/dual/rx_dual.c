@@ -17,33 +17,47 @@
 /* DUAL-0a: typed records, registry, validation, canonical encoding and
  * digests (ADR 0031 section 4). See rx_dual.h for the contract. */
 #include "rx_dual.h"
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <math.h>
 #include <string.h>
 
+static uint64_t f64_to_u64(double d)
+{
+    uint64_t u;
+    memcpy(&u, &d, 8);
+    return u;
+}
+
 /* ---------------------------------------------------------------- helpers */
 int rx_dual_digest_is_zero(const RxDualDigest *d)
 {
-    uint8_t acc = 0;
+    uint64_t r = 0;
     if (!d) return 1;
-    for (size_t i = 0; i < RX_DUAL_DIGEST_SIZE; i++) acc |= d->b[i];
-    return acc == 0;
+    if (omega2_rx_dual_om_digest_is_zero(&r, d->b, RX_DUAL_DIGEST_SIZE) != 0) return 1;
+    return r != 0;
 }
 int rx_dual_digest_eq(const RxDualDigest *a, const RxDualDigest *b)
 {
+    uint64_t r = 0;
     if (!a || !b) return 0;
-    return memcmp(a->b, b->b, RX_DUAL_DIGEST_SIZE) == 0;
+    if (omega2_rx_dual_om_digest_eq(&r, a->b, RX_DUAL_DIGEST_SIZE, b->b, RX_DUAL_DIGEST_SIZE) != 0) return 0;
+    return r != 0;
 }
 int rx_dual_unit_valid(RxDualUnit u)
 {
-    return (uint32_t)u > (uint32_t)RX_DUAL_UNIT_NONE && (uint32_t)u < (uint32_t)RX_DUAL_UNIT_MAX_;
+    uint64_t r = 0;
+    if (omega2_rx_dual_om_unit_valid(&r, (uint64_t)(uint32_t)u) != 0) return 0;
+    return r != 0;
 }
 static int fin(double d) { return isfinite(d) != 0; }
 static int ids_ascending(const uint32_t *ids, uint32_t n)
 {
-    for (uint32_t i = 1; i < n; i++) if (ids[i] <= ids[i - 1]) return 0;
-    return 1;
+    uint64_t r = 0;
+    if (n <= 1) return 1;
+    if (omega2_rx_dual_om_ids_ascending(&r, ids, n, n) != 0) return 0;
+    return r != 0;
 }
 
 /* ----------------------------------------------------------------- writer */
@@ -58,20 +72,23 @@ static void w_u8(wr *w, uint8_t v) { w_raw(w, &v, 1); }
 static void w_u32(wr *w, uint32_t v)
 {
     uint8_t b[4];
-    for (int i = 0; i < 4; i++) b[i] = (uint8_t)(v >> (8 * i));
+    uint64_t unused = 0;
+    (void)omega2_rx_dual_om_put_u32(&unused, b, 4, 0, v);
     w_raw(w, b, 4);
 }
 static void w_u64(wr *w, uint64_t v)
 {
     uint8_t b[8];
-    for (int i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (8 * i));
+    uint64_t unused = 0;
+    (void)omega2_rx_dual_om_put_u64(&unused, b, 8, 0, v);
     w_raw(w, b, 8);
 }
 static void w_f64(wr *w, double d)
 {
-    uint64_t u = 0; /* +0.0 and -0.0 both encode as all-zero bits */
-    if (d != 0.0) memcpy(&u, &d, 8);
-    w_u64(w, u);
+    uint8_t b[8];
+    uint64_t unused = 0;
+    (void)omega2_rx_dual_om_put_f64_canon(&unused, b, 8, 0, f64_to_u64(d));
+    w_raw(w, b, 8);
 }
 static void w_dig(wr *w, const RxDualDigest *d) { w_raw(w, d->b, RX_DUAL_DIGEST_SIZE); }
 static void w_hdr(wr *w, RxDualKind k) { w_u8(w, (uint8_t)k); w_u8(w, (uint8_t)RX_DUAL_FORMAT_VERSION); }
@@ -92,17 +109,17 @@ static uint8_t r_u8(rd *r)
 }
 static uint32_t r_u32(rd *r)
 {
-    uint32_t v = 0;
+    uint64_t v = 0;
     if (!r_need(r, 4)) return 0;
-    for (int i = 0; i < 4; i++) v |= (uint32_t)r->p[r->pos + (size_t)i] << (8 * i);
+    (void)omega2_rx_dual_om_get_u32(&v, r->p, r->len, r->pos);
     r->pos += 4;
-    return v;
+    return (uint32_t)v;
 }
 static uint64_t r_u64(rd *r)
 {
     uint64_t v = 0;
     if (!r_need(r, 8)) return 0;
-    for (int i = 0; i < 8; i++) v |= (uint64_t)r->p[r->pos + (size_t)i] << (8 * i);
+    (void)omega2_rx_dual_om_get_u64(&v, r->p, r->len, r->pos);
     r->pos += 8;
     return v;
 }
@@ -217,13 +234,9 @@ RxDualStatus rx_dual_check_price_vector(const RxDualPriceVector *v)
 
 RxDualStatus rx_dual_check_site(const RxDualSite *s)
 {
-    size_t i, end;
+    uint64_t ok = 0;
     if (!s) return RX_DUAL_ERR_NULL;
-    if (s->name[0] == 0 || s->name[RX_DUAL_SITE_NAME_SIZE - 1] != 0) return RX_DUAL_ERR_SITE;
-    for (end = 0; end < RX_DUAL_SITE_NAME_SIZE && s->name[end] != 0; end++)
-        if (s->name[end] < 0x21 || s->name[end] > 0x7E) return RX_DUAL_ERR_SITE;
-    for (i = end; i < RX_DUAL_SITE_NAME_SIZE; i++)
-        if (s->name[i] != 0) return RX_DUAL_ERR_SITE; /* canonical NUL padding */
+    if (omega2_rx_dual_om_check_site_name(&ok, s->name, RX_DUAL_SITE_NAME_SIZE) != 0 || !ok) return RX_DUAL_ERR_SITE;
     if (rx_dual_digest_is_zero(&s->owner)) return RX_DUAL_ERR_DIGEST;
     if (s->max_alternatives == 0 || s->max_alternatives > RX_DUAL_MAX_CANDIDATES) return RX_DUAL_ERR_RANGE;
     return RX_DUAL_OK;
@@ -231,21 +244,15 @@ RxDualStatus rx_dual_check_site(const RxDualSite *s)
 
 static RxDualStatus check_consequence(const RxDualConsequence *c)
 {
-    if (!rx_dual_unit_valid(c->unit)) return RX_DUAL_ERR_UNIT;
-    if (!fin(c->predicted) || !fin(c->predicted_sd) || !fin(c->measured) || !fin(c->error))
-        return RX_DUAL_ERR_NONFINITE;
-    if (c->predicted_sd < 0.0) return RX_DUAL_ERR_RANGE;
-    if (c->has_measured > 1u) return RX_DUAL_ERR_RANGE;
-    if (c->has_measured) {
-        double e;
-        if (!(c->predicted_sd > 0.0)) return RX_DUAL_ERR_RANGE;
-        e = (c->measured - c->predicted) / c->predicted_sd;
-        if (!fin(e)) return RX_DUAL_ERR_NONFINITE;
-        if (!(e == c->error)) return RX_DUAL_ERR_RANGE; /* error must be the recomputed value */
-    } else if (c->measured != 0.0 || c->error != 0.0) {
-        return RX_DUAL_ERR_RANGE;
-    }
-    return RX_DUAL_OK;
+    uint64_t meta[2], vals[4], rc = 0;
+    meta[0] = (uint64_t)(uint32_t)c->unit;
+    meta[1] = (uint64_t)c->has_measured;
+    vals[0] = f64_to_u64(c->predicted);
+    vals[1] = f64_to_u64(c->predicted_sd);
+    vals[2] = f64_to_u64(c->measured);
+    vals[3] = f64_to_u64(c->error);
+    if (omega2_rx_dual_om_consequence_check(&rc, meta, 2, vals, 4) != 0) return RX_DUAL_ERR_RANGE;
+    return (RxDualStatus)(-(int)rc);
 }
 
 RxDualStatus rx_dual_check_recommendation(const RxDualRecommendation *r)
@@ -654,8 +661,10 @@ RxDualStatus rx_dual_consequence_set(RxDualConsequence *c, uint32_t resource_id,
     c->predicted_sd = predicted_sd;
     c->has_measured = has_measured ? 1u : 0u;
     if (c->has_measured) {
+        uint64_t eb = 0;
         c->measured = measured;
-        c->error = (fin(predicted_sd) && predicted_sd > 0.0) ? (measured - predicted) / predicted_sd : 0.0;
+        (void)omega2_rx_dual_om_consequence_error(&eb, f64_to_u64(predicted), f64_to_u64(predicted_sd), f64_to_u64(measured));
+        memcpy(&c->error, &eb, 8);
     }
     return check_consequence(c);
 }

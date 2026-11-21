@@ -16,6 +16,7 @@
 
 /* DUAL-0b: binding to ESTIMATION records and freshness classification. */
 #include "rx_dual_bind.h"
+#include "omega_native.h"
 
 #include <math.h>
 #include <string.h>
@@ -24,22 +25,14 @@ static void cp(RxDualDigest *d, const est_digest *e) { memcpy(d->b, e->b, RX_DUA
 
 RxDualStatus rx_dual_unit_from_est(est_unit u, RxDualUnit *out)
 {
+    uint64_t du = 0;
     if (!out) return RX_DUAL_ERR_NULL;
-    switch (u) {
-    case EST_UNIT_MILLI_CELSIUS:       *out = RX_DUAL_UNIT_MILLI_CELSIUS; return RX_DUAL_OK;
-    case EST_UNIT_MILLI_CELSIUS_PER_S: *out = RX_DUAL_UNIT_MILLI_CELSIUS_PER_S; return RX_DUAL_OK;
-    case EST_UNIT_WATT:                *out = RX_DUAL_UNIT_WATT; return RX_DUAL_OK;
-    case EST_UNIT_WATT_PER_S:          *out = RX_DUAL_UNIT_WATT_PER_S; return RX_DUAL_OK;
-    case EST_UNIT_NANOSECOND:          *out = RX_DUAL_UNIT_NS; return RX_DUAL_OK;
-    case EST_UNIT_BYTE:                *out = RX_DUAL_UNIT_BYTES; return RX_DUAL_OK;
-    case EST_UNIT_DIMENSIONLESS:       *out = RX_DUAL_UNIT_DIMENSIONLESS; return RX_DUAL_OK;
-    case EST_UNIT_LOG2_PICOSECOND:     *out = RX_DUAL_UNIT_LOG2_PS; return RX_DUAL_OK;
-    case EST_UNIT_NONE:
-    case EST_UNIT_MAX_:
-    default:
+    if (omega2_rx_dual_om_unit_from_est(&du, (uint64_t)(uint32_t)u) != 0 || du == 0) {
         *out = RX_DUAL_UNIT_NONE;
         return RX_DUAL_ERR_UNIT;
     }
+    *out = (RxDualUnit)du;
+    return RX_DUAL_OK;
 }
 
 static RxDualStatus sd_from_var(double var, double *sd)
@@ -153,22 +146,23 @@ RxDualStatus rx_dual_classify_input(const RxDualInput *in, const RxDualConstrain
                                     RxDualLambdaState *out)
 {
     RxDualStatus st;
+    uint64_t flags[6], state = 0;
     if (!in || !ctl || !out) return RX_DUAL_ERR_NULL;
     if ((st = rx_dual_check_controller(ctl)) != RX_DUAL_OK) return st;
     if (prev) {
         if ((st = rx_dual_check_constraint(prev)) != RX_DUAL_OK) return st;
         if (in->unit != prev->unit) return RX_DUAL_ERR_UNIT; /* structural: never converted */
     }
-    /* value problems: the input is refused for this tick */
-    if (rx_dual_check_input(in) != RX_DUAL_OK) { *out = RX_DUAL_LAMBDA_REFUSED; return RX_DUAL_OK; }
-    if (in->generation > now_generation) { *out = RX_DUAL_LAMBDA_REFUSED; return RX_DUAL_OK; } /* future generation */
-    /* staleness */
-    if (now_generation - in->generation > ctl->max_age) { *out = RX_DUAL_LAMBDA_STALE; return RX_DUAL_OK; }
-    if (prev && in->generation < prev->generation) { *out = RX_DUAL_LAMBDA_STALE; return RX_DUAL_OK; }
-    if (!in->evidence_verified) { *out = RX_DUAL_LAMBDA_STALE; return RX_DUAL_OK; }
-    if (in->regime_change) { *out = RX_DUAL_LAMBDA_FROZEN; return RX_DUAL_OK; }
-    if (rx_dual_digest_is_zero(&in->calibration_ref)) { *out = RX_DUAL_LAMBDA_UNCALIBRATED; return RX_DUAL_OK; }
-    *out = RX_DUAL_LAMBDA_FRESH;
+    flags[0] = (rx_dual_check_input(in) == RX_DUAL_OK) ? 1u : 0u;
+    flags[1] = in->generation;
+    flags[2] = now_generation;
+    flags[3] = ctl->max_age;
+    flags[4] = (prev && in->generation < prev->generation) ? 1u : 0u;
+    flags[5] = (in->evidence_verified ? 1u : 0u) |
+               (in->regime_change ? 2u : 0u) |
+               (rx_dual_digest_is_zero(&in->calibration_ref) ? 4u : 0u);
+    if (omega2_rx_dual_om_classify_state(&state, flags, 6) != 0) return RX_DUAL_ERR_RANGE;
+    *out = (RxDualLambdaState)state;
     return RX_DUAL_OK;
 }
 
