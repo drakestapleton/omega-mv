@@ -583,7 +583,7 @@ const char *omega2_ident_osc_artifact(void);
 uint32_t omega2_osc_artifact_entry(uint64_t *result, const uint8_t *o_row, const uint8_t *o_name, uint64_t o_name_len, uint8_t *o_dst, uint64_t o_dst_len);
 /* export fn osc_artifact_hex digest view uchar 32 dst edit uchar 65 to void */
 uint32_t omega2_osc_artifact_hex(uint64_t *result, const uint8_t *o_digest, uint64_t o_digest_len, uint8_t *o_dst, uint64_t o_dst_len);
-#define OMEGA2_IDENT_tensor_shape "omega-ident 1 unit=tensor_shape abi=2 profile=OM-2 src=807740a5ea367dd327b6d10663ea8c7e777f52e546f2a2b49ee5e772c2547163 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_tensor_shape "omega-ident 1 unit=tensor_shape abi=2 profile=OM-2 src=9cbb17bafb1049adc9e5cabba97c6036771ca382d85d9ce2cc69440a5d97d64a omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_tensor_shape(void);
 /* export fn tensor_shape_size dims view ulong * elems edit ulong 1 to long */
 uint32_t omega2_tensor_shape_size(uint64_t *result, const uint64_t *o_dims, uint64_t o_dims_len, uint64_t *o_elems, uint64_t o_elems_len);
@@ -599,6 +599,18 @@ uint32_t omega2_tensor_is_row_major(uint64_t *result, const uint64_t *o_dims, ui
 uint32_t omega2_tensor_canonical_word(uint64_t *result, uint64_t o_dtype, uint64_t o_word);
 /* export fn tensor_value_bytes data edit uchar * dtype ulong native_le ulong to void */
 uint32_t omega2_tensor_value_bytes(uint64_t *result, uint8_t *o_data, uint64_t o_data_len, uint64_t o_dtype, uint64_t o_native_le);
+/* export fn tstore_hex_name id view uchar 32 out_name out uchar 68 to void */
+uint32_t omega2_tstore_hex_name(uint64_t *result, const uint8_t *o_id, uint64_t o_id_len, uint8_t *o_out_name);
+/* export fn tstore_is_payload_name name view uchar * to ulong */
+uint32_t omega2_tstore_is_payload_name(uint64_t *result, const uint8_t *o_name, uint64_t o_name_len);
+/* export fn tstore_encode_header cap ulong count ulong out_hdr out uchar 24 to void */
+uint32_t omega2_tstore_encode_header(uint64_t *result, uint64_t o_cap, uint64_t o_count, uint8_t *o_out_hdr);
+/* export fn tstore_decode_header in_hdr view uchar 24 expect_cap ulong count_out edit ulong 1 to ulong */
+uint32_t omega2_tstore_decode_header(uint64_t *result, const uint8_t *o_in_hdr, uint64_t o_in_hdr_len, uint64_t o_expect_cap, uint64_t *o_count_out, uint64_t o_count_out_len);
+/* export fn tstore_encode_record meta view ulong 6 shape view ulong 8 value_id view uchar 32 payload_sha view uchar 32 out_rec out uchar 168 to void */
+uint32_t omega2_tstore_encode_record(uint64_t *result, const uint64_t *o_meta, uint64_t o_meta_len, const uint64_t *o_shape, uint64_t o_shape_len, const uint8_t *o_value_id, uint64_t o_value_id_len, const uint8_t *o_payload_sha, uint64_t o_payload_sha_len, uint8_t *o_out_rec);
+/* export fn tstore_decode_record in_rec view uchar 168 meta edit ulong 6 shape edit ulong 8 value_id out uchar 32 payload_sha out uchar 32 to ulong */
+uint32_t omega2_tstore_decode_record(uint64_t *result, const uint8_t *o_in_rec, uint64_t o_in_rec_len, uint64_t *o_meta, uint64_t o_meta_len, uint64_t *o_shape, uint64_t o_shape_len, uint8_t *o_value_id, uint8_t *o_payload_sha);
 #define OMEGA2_IDENT_sgd_update "omega-ident 1 unit=sgd_update abi=2 profile=OM-2 src=4900cd2a690ee463b79e6f1b1331b53e658423062a5b159b0ebdb6264afff17d omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_sgd_update(void);
 /* export fn tg_sgd_mode learning ulong momentum ulong to long */
@@ -607,8 +619,22 @@ uint32_t omega2_tg_sgd_mode(uint64_t *result, uint64_t o_learning, uint64_t o_mo
 uint32_t omega2_tg_update_velocity(uint64_t *result, uint32_t *o_velocity, uint64_t o_velocity_len, const uint32_t *o_gradient, uint64_t o_gradient_len, uint64_t o_bits);
 /* export fn tg_update_params params edit uint * direction view uint * bits ulong to void */
 uint32_t omega2_tg_update_params(uint64_t *result, uint32_t *o_params, uint64_t o_params_len, const uint32_t *o_direction, uint64_t o_direction_len, uint64_t o_bits);
-#define OMEGA2_IDENT_generation "omega-ident 1 unit=generation abi=2 profile=OM-2 src=5c2e5164eb4808621af27ea3173376b6f102c8185cbfab5369b5549f87061852 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_generation "omega-ident 1 unit=generation abi=2 profile=OM-2 src=1d801bf38146d7764aab5ad160eee6214a4dac5337e899d49afad0da1a707c11 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_generation(void);
+/* export fn tg_encode_hex digest view uchar 32 out_hex out uchar 64 to void */
+uint32_t omega2_tg_encode_hex(uint64_t *result, const uint8_t *o_digest, uint64_t o_digest_len, uint8_t *o_out_hex);
+/* export fn tg_encode_pointer gen ulong digest view uchar 32 out_buf out uchar 95 to void */
+uint32_t omega2_tg_encode_pointer(uint64_t *result, uint64_t o_gen, const uint8_t *o_digest, uint64_t o_digest_len, uint8_t *o_out_buf);
+/* export fn tg_decode_pointer buf view uchar 95 gen_out edit ulong 1 digest_out out uchar 32 to ulong */
+uint32_t omega2_tg_decode_pointer(uint64_t *result, const uint8_t *o_buf, uint64_t o_buf_len, uint64_t *o_gen_out, uint64_t o_gen_out_len, uint8_t *o_digest_out);
+/* export fn tg_encode_dispatch fields view ulong 6 refs view ulong 9 base_digest view uchar 32 rec out uchar 192 to void */
+uint32_t omega2_tg_encode_dispatch(uint64_t *result, const uint64_t *o_fields, uint64_t o_fields_len, const uint64_t *o_refs, uint64_t o_refs_len, const uint8_t *o_base_digest, uint64_t o_base_digest_len, uint8_t *o_rec);
+/* export fn tg_set_dispatch_seq rec edit uchar 192 seq ulong to void */
+uint32_t omega2_tg_set_dispatch_seq(uint64_t *result, uint8_t *o_rec, uint64_t o_rec_len, uint64_t o_seq);
+/* export fn tg_check_dispatch_header rec view uchar 192 expect_seq ulong to ulong */
+uint32_t omega2_tg_check_dispatch_header(uint64_t *result, const uint8_t *o_rec, uint64_t o_rec_len, uint64_t o_expect_seq);
+/* export fn tg_decode_dispatch rec view uchar 192 fields edit ulong 7 refs edit ulong 9 to ulong */
+uint32_t omega2_tg_decode_dispatch(uint64_t *result, const uint8_t *o_rec, uint64_t o_rec_len, uint64_t *o_fields, uint64_t o_fields_len, uint64_t *o_refs, uint64_t o_refs_len);
 /* export fn tg_encode_generation fields view ulong 5 dispatch view uchar 32 previous view uchar 32 header out uchar 152 to void */
 uint32_t omega2_tg_encode_generation(uint64_t *result, const uint64_t *o_fields, uint64_t o_fields_len, const uint8_t *o_dispatch, uint64_t o_dispatch_len, const uint8_t *o_previous, uint64_t o_previous_len, uint8_t *o_header);
 /* export fn tg_decode_generation header view uchar 152 size ulong expected ulong fields edit ulong 5 to ulong */

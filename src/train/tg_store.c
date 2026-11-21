@@ -94,28 +94,10 @@ const char *tg_err_name(int e)
 }
 
 /* ---- small helpers ---------------------------------------------------- */
-static void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static uint32_t get32(const uint8_t *p) { uint32_t v = 0; for (int i = 3; i >= 0; i--) v = (v << 8) | p[i]; return v; }
-static uint64_t get64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
-
 void tg_hex(const uint8_t d[TG_DIGEST], char out[2 * TG_DIGEST + 1])
 {
-    static const char hx[] = "0123456789abcdef";
-    for (int i = 0; i < TG_DIGEST; i++) { out[2 * i] = hx[d[i] >> 4]; out[2 * i + 1] = hx[d[i] & 15]; }
+    tg_encode_hex(d, (uint8_t *)out);
     out[2 * TG_DIGEST] = 0;
-}
-
-static int unhex(const char *s, uint8_t d[TG_DIGEST])
-{
-    for (int i = 0; i < 2 * TG_DIGEST; i++) {
-        char c = s[i]; int v;
-        if (c >= '0' && c <= '9') v = c - '0';
-        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
-        else return -1;
-        if (i & 1) d[i / 2] = (uint8_t)(d[i / 2] | v); else d[i / 2] = (uint8_t)(v << 4);
-    }
-    return 0;
 }
 
 static int path_of(char *out, const char *dir, const char *name)
@@ -265,18 +247,17 @@ io:
 
 static int write_pointer(const char *dir, uint64_t gen, const uint8_t d[TG_DIGEST], int with_fp)
 {
-    char tmp[PATHMAX], cur[PATHMAX], hx[2 * TG_DIGEST + 1], buf[CUR_LEN + 1];
+    char tmp[PATHMAX], cur[PATHMAX];
+    uint8_t buf[CUR_LEN];
     if (path_of(tmp, dir, "CURRENT.tmp") || path_of(cur, dir, "CURRENT")) return TG_E_ARG;
-    tg_hex(d, hx);
-    int n = snprintf(buf, sizeof buf, CUR_MAGIC " %020llu %s\n", (unsigned long long)gen, hx);
-    if (n != (int)CUR_LEN) return TG_E_ARG;
+    tg_encode_pointer(gen, d, buf);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return TG_E_IO;
     if (with_fp && g_fp == TG_FP_MID_SWITCH) {
-        if (write_all(fd, (const uint8_t *)buf, CUR_LEN / 2)) { close(fd); return TG_E_IO; }
+        if (write_all(fd, buf, CUR_LEN / 2)) { close(fd); return TG_E_IO; }
         fp_hit(TG_FP_MID_SWITCH);
-        if (write_all(fd, (const uint8_t *)buf + CUR_LEN / 2, CUR_LEN - CUR_LEN / 2)) { close(fd); return TG_E_IO; }
-    } else if (write_all(fd, (const uint8_t *)buf, CUR_LEN)) { close(fd); return TG_E_IO; }
+        if (write_all(fd, buf + CUR_LEN / 2, CUR_LEN - CUR_LEN / 2)) { close(fd); return TG_E_IO; }
+    } else if (write_all(fd, buf, CUR_LEN)) { close(fd); return TG_E_IO; }
     if (fsync(fd) || close(fd)) return TG_E_IO;
     if (with_fp) fp_hit(TG_FP_BEFORE_SWITCH_RENAME);
     if (rename(tmp, cur)) return TG_E_IO;           /* THE atomic switch */
@@ -288,23 +269,16 @@ static int write_pointer(const char *dir, uint64_t gen, const uint8_t d[TG_DIGES
 static int read_pointer(const char *dir, uint64_t *gen, uint8_t d[TG_DIGEST])
 {
     char p[PATHMAX];
-    char buf[CUR_LEN + 8];
+    uint8_t buf[CUR_LEN + 8];
     if (path_of(p, dir, "CURRENT")) return TG_E_ARG;
     int fd = open(p, O_RDONLY);
     if (fd < 0) return errno == ENOENT ? TG_E_NOSTORE : TG_E_IO;
     size_t got;
-    int r = read_full(fd, (uint8_t *)buf, sizeof buf, &got);
+    int r = read_full(fd, buf, sizeof buf, &got);
     close(fd);
     if (r < 0) return TG_E_IO;
-    if (got != CUR_LEN || memcmp(buf, CUR_MAGIC " ", 9) || buf[29] != ' ' || buf[CUR_LEN - 1] != '\n')
+    if (got != CUR_LEN || !tg_decode_pointer(buf, gen, d))
         return TG_E_FORMAT;
-    uint64_t g = 0;
-    for (int i = 9; i < 29; i++) {
-        if (buf[i] < '0' || buf[i] > '9') return TG_E_FORMAT;
-        g = g * 10 + (uint64_t)(buf[i] - '0');
-    }
-    if (unhex(buf + 30, d)) return TG_E_FORMAT;
-    *gen = g;
     return TG_OK;
 }
 
@@ -331,7 +305,7 @@ int tg_dispatch_chain(const char *dir, uint64_t len, uint8_t head[TG_DIGEST], ui
     for (uint64_t i = 0; i < len / REC_SIZE; i++) {
         size_t got;
         if (read_full(fd, rec, REC_SIZE, &got) < 0 || got != REC_SIZE) { close(fd); return TG_E_CHAIN; }
-        if (get32(rec) != REC_MAGIC || get64(rec + 8) != i) { close(fd); return TG_E_CHAIN; }
+        if (!tg_check_dispatch_header(rec, i)) { close(fd); return TG_E_CHAIN; }
         uint8_t nh[TG_DIGEST];
         chain_step(head, rec, nh);
         if (memcmp(nh, rec + REC_HASHED, TG_DIGEST)) { close(fd); return TG_E_CHAIN; }
@@ -513,22 +487,14 @@ int tg_dispatch(tg_store *st, tg_shadow *sh, uint32_t op_id, uint64_t arg0, uint
         sh->recs = n; sh->rec_cap = nc;
     }
     uint8_t *r = sh->recs + (size_t)sh->n_dispatch * REC_SIZE;
-    memset(r, 0, REC_SIZE);
-    put32(r, REC_MAGIC);
-    put32(r + 4, op_id);
-    /* r+8 seq: assigned at commit */
-    put64(r + 16, sh->base_step + 1);
-    put64(r + 24, sh->base_gen);
-    put64(r + 32, arg0);
-    put64(r + 40, arg1);
-    put32(r + 48, n_refs);
+    const uint64_t fields[6] = { op_id, sh->base_step + 1, sh->base_gen, arg0, arg1, n_refs };
+    uint64_t refs_flat[9] = {0};
     for (uint32_t i = 0; i < n_refs; i++) {
-        uint8_t *q = r + 56 + 24 * i;
-        put32(q, refs[i].buf);
-        put64(q + 8, refs[i].off);
-        put64(q + 16, refs[i].len);
+        refs_flat[3 * i + 0] = refs[i].buf;
+        refs_flat[3 * i + 1] = refs[i].off;
+        refs_flat[3 * i + 2] = refs[i].len;
     }
-    memcpy(r + 128, sh->base_digest, TG_DIGEST); /* inputs by reference to the base generation */
+    tg_encode_dispatch(fields, refs_flat, sh->base_digest, r);
     sh->n_dispatch++;
     return TG_OK;
 }
@@ -568,7 +534,7 @@ int tg_commit(tg_store *st, tg_shadow *sh, tg_validate_fn validate, void *ctx)
     /* Tier (a): append this step's dispatch records, chained, then fsync. */
     for (uint32_t i = 0; i < sh->n_dispatch; i++) {
         uint8_t *r = sh->recs + (size_t)i * REC_SIZE;
-        put64(r + 8, base_len / REC_SIZE + i);
+        tg_set_dispatch_seq(r, base_len / REC_SIZE + i);
         chain_step(head, r, r + REC_HASHED);
         memcpy(head, r + REC_HASHED, TG_DIGEST);
         st->stats.dispatch_records++;
@@ -702,19 +668,19 @@ int tg_dispatch_read(const char *dir, uint64_t seq, tg_dispatch_rec *out)
     close(fd);
     if (g != REC_SIZE) return TG_E_CHAIN;
     memset(out, 0, sizeof *out);
-    out->op_id = get32(rec + 4);
-    out->seq = get64(rec + 8);
-    out->step = get64(rec + 16);
-    out->base_gen = get64(rec + 24);
-    out->arg0 = get64(rec + 32);
-    out->arg1 = get64(rec + 40);
-    out->n_refs = get32(rec + 48);
-    if (out->n_refs > TG_MAX_REFS) return TG_E_FORMAT;
+    uint64_t fields[7] = {0}, refs_flat[9] = {0};
+    if (!tg_decode_dispatch(rec, fields, refs_flat)) return TG_E_FORMAT;
+    out->op_id = (uint32_t)fields[0];
+    out->seq = fields[1];
+    out->step = fields[2];
+    out->base_gen = fields[3];
+    out->arg0 = fields[4];
+    out->arg1 = fields[5];
+    out->n_refs = (uint32_t)fields[6];
     for (uint32_t i = 0; i < out->n_refs; i++) {
-        const uint8_t *q = rec + 56 + 24 * i;
-        out->refs[i].buf = get32(q);
-        out->refs[i].off = get64(q + 8);
-        out->refs[i].len = get64(q + 16);
+        out->refs[i].buf = (uint32_t)refs_flat[3 * i + 0];
+        out->refs[i].off = refs_flat[3 * i + 1];
+        out->refs[i].len = refs_flat[3 * i + 2];
     }
     memcpy(out->base_digest, rec + 128, TG_DIGEST);
     memcpy(out->chain, rec + REC_HASHED, TG_DIGEST);

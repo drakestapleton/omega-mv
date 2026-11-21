@@ -990,12 +990,38 @@ uint64_t tensor_is_row_major(const uint64_t *o_dims, size_t o_dims_len, const ui
 uint64_t tensor_canonical_word(uint64_t o_dtype, uint64_t o_word);
 /* export fn tensor_value_bytes data edit uchar * dtype ulong native_le ulong to void */
 void tensor_value_bytes(uint8_t *o_data, size_t o_data_len, uint64_t o_dtype, uint64_t o_native_le);
+/* export fn tstore_hex_name id view uchar 32 out_name out uchar 68 to void */
+void tstore_hex_name(const uint8_t o_id[32], uint8_t o_out_name[68]);
+/* export fn tstore_is_payload_name name view uchar * to ulong */
+uint64_t tstore_is_payload_name(const uint8_t *o_name, size_t o_name_len);
+/* export fn tstore_encode_header cap ulong count ulong out_hdr out uchar 24 to void */
+void tstore_encode_header(uint64_t o_cap, uint64_t o_count, uint8_t o_out_hdr[24]);
+/* export fn tstore_decode_header in_hdr view uchar 24 expect_cap ulong count_out edit ulong 1 to ulong */
+uint64_t tstore_decode_header(const uint8_t o_in_hdr[24], uint64_t o_expect_cap, uint64_t o_count_out[1]);
+/* export fn tstore_encode_record meta view ulong 6 shape view ulong 8 value_id view uchar 32 payload_sha view uchar 32 out_rec out uchar 168 to void */
+void tstore_encode_record(const uint64_t o_meta[6], const uint64_t o_shape[8], const uint8_t o_value_id[32], const uint8_t o_payload_sha[32], uint8_t o_out_rec[168]);
+/* export fn tstore_decode_record in_rec view uchar 168 meta edit ulong 6 shape edit ulong 8 value_id out uchar 32 payload_sha out uchar 32 to ulong */
+uint64_t tstore_decode_record(const uint8_t o_in_rec[168], uint64_t o_meta[6], uint64_t o_shape[8], uint8_t o_value_id[32], uint8_t o_payload_sha[32]);
 /* export fn tg_sgd_mode learning ulong momentum ulong to long */
 int64_t tg_sgd_mode(uint64_t o_learning, uint64_t o_momentum);
 /* export fn tg_update_velocity velocity edit uint * gradient view uint * bits ulong to void */
 void tg_update_velocity(uint32_t *o_velocity, size_t o_velocity_len, const uint32_t *o_gradient, size_t o_gradient_len, uint64_t o_bits);
 /* export fn tg_update_params params edit uint * direction view uint * bits ulong to void */
 void tg_update_params(uint32_t *o_params, size_t o_params_len, const uint32_t *o_direction, size_t o_direction_len, uint64_t o_bits);
+/* export fn tg_encode_hex digest view uchar 32 out_hex out uchar 64 to void */
+void tg_encode_hex(const uint8_t o_digest[32], uint8_t o_out_hex[64]);
+/* export fn tg_encode_pointer gen ulong digest view uchar 32 out_buf out uchar 95 to void */
+void tg_encode_pointer(uint64_t o_gen, const uint8_t o_digest[32], uint8_t o_out_buf[95]);
+/* export fn tg_decode_pointer buf view uchar 95 gen_out edit ulong 1 digest_out out uchar 32 to ulong */
+uint64_t tg_decode_pointer(const uint8_t o_buf[95], uint64_t o_gen_out[1], uint8_t o_digest_out[32]);
+/* export fn tg_encode_dispatch fields view ulong 6 refs view ulong 9 base_digest view uchar 32 rec out uchar 192 to void */
+void tg_encode_dispatch(const uint64_t o_fields[6], const uint64_t o_refs[9], const uint8_t o_base_digest[32], uint8_t o_rec[192]);
+/* export fn tg_set_dispatch_seq rec edit uchar 192 seq ulong to void */
+void tg_set_dispatch_seq(uint8_t o_rec[192], uint64_t o_seq);
+/* export fn tg_check_dispatch_header rec view uchar 192 expect_seq ulong to ulong */
+uint64_t tg_check_dispatch_header(const uint8_t o_rec[192], uint64_t o_expect_seq);
+/* export fn tg_decode_dispatch rec view uchar 192 fields edit ulong 7 refs edit ulong 9 to ulong */
+uint64_t tg_decode_dispatch(const uint8_t o_rec[192], uint64_t o_fields[7], uint64_t o_refs[9]);
 /* export fn tg_encode_generation fields view ulong 5 dispatch view uchar 32 previous view uchar 32 header out uchar 152 to void */
 void tg_encode_generation(const uint64_t o_fields[5], const uint8_t o_dispatch[32], const uint8_t o_previous[32], uint8_t o_header[152]);
 /* export fn tg_decode_generation header view uchar 152 size ulong expected ulong fields edit ulong 5 to ulong */

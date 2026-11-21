@@ -21,6 +21,7 @@
  * src/runtime/rx_generation.c; nothing from src/runtime is linked.
  */
 #include "omega_tensor_store.h"
+#include "omega_api_decl.h"
 #include "omega_native.h"
 
 #include <dirent.h>
@@ -82,21 +83,6 @@ struct OmegaTensorStore {
     OmegaTensorCtx *vctx;      /* private context used to recompute value ids */
     int            crash_step;
 };
-
-/* ---- little-endian fields --------------------------------------------- */
-
-static void put_u32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static void put_u64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static uint32_t get_u32(const uint8_t *p) {
-    uint32_t v = 0;
-    for (int i = 0; i < 4; i++) v |= (uint32_t)p[i] << (8 * i);
-    return v;
-}
-static uint64_t get_u64(const uint8_t *p) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (8 * i);
-    return v;
-}
 
 /* ---- crash points (test builds only) ---------------------------------- */
 
@@ -200,20 +186,13 @@ static int commit_file(OmegaTensorStore *st, const char *tmp_name, const char *n
 }
 
 static void hex_name(const uint8_t id[32], char out[69]) {
-    static const char hx[] = "0123456789abcdef";
-    for (int i = 0; i < 32; i++) {
-        out[2 * i] = hx[id[i] >> 4];
-        out[2 * i + 1] = hx[id[i] & 15];
-    }
-    memcpy(out + 64, ".bin", 5);
+    tstore_hex_name(id, (uint8_t *)out);
+    out[68] = '\0';
 }
 
 /* A payload file name: 64 lowercase hex digits + ".bin". */
 static bool is_payload_name(const char *s) {
-    if (strlen(s) != 68 || strcmp(s + 64, ".bin") != 0) return false;
-    for (int i = 0; i < 64; i++)
-        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
-    return true;
+    return tstore_is_payload_name((const uint8_t *)s, strlen(s)) != 0;
 }
 
 /* ---- shapes and payload bytes ----------------------------------------- */
@@ -232,21 +211,8 @@ static int shape_elems(uint32_t dtype, uint32_t rank, const uint64_t *shape,
 /* Every NaN becomes the canonical quiet NaN of its dtype (same rule as the
  * value id), so a value id names exactly one payload byte string. */
 static void canonicalize(OmegaDType dt, uint8_t *buf, uint64_t elems) {
-    for (uint64_t e = 0; e < elems; e++) {
-        if (dt == OMEGA_DT_F32) {
-            uint8_t *p = buf + e * 4;
-            uint32_t u = get_u32(p);
-            if ((u & 0x7f800000U) == 0x7f800000U && (u & 0x007fffffU)) put_u32(p, 0x7fc00000U);
-        } else {
-            uint8_t *p = buf + e * 2;
-            uint16_t h = (uint16_t)(p[0] | (p[1] << 8));
-            uint16_t c = h;
-            if (dt == OMEGA_DT_F16 && (h & 0x7c00U) == 0x7c00U && (h & 0x03ffU)) c = 0x7e00U;
-            if (dt == OMEGA_DT_BF16 && (h & 0x7f80U) == 0x7f80U && (h & 0x007fU)) c = 0x7fc0U;
-            p[0] = (uint8_t)c;
-            p[1] = (uint8_t)(c >> 8);
-        }
-    }
+    if (!elems) return;
+    tensor_value_bytes(buf, (size_t)elems * omega_dtype_size(dt), (uint64_t)dt, 1);
 }
 
 /* Value id of a row-major payload, recomputed through the tensor layer. */
@@ -300,43 +266,28 @@ static int load_payload(OmegaTensorStore *st, const StoreSlot *sl, uint8_t **out
 /* ---- journal encoding -------------------------------------------------- */
 
 static void encode_header(uint32_t cap, uint64_t count, uint8_t out[HDR_BYTES]) {
-    memset(out, 0, HDR_BYTES);
-    memcpy(out, JRN_MAGIC, 8);
-    put_u32(out + 8, JRN_VERSION);
-    put_u32(out + 12, cap);
-    put_u64(out + 16, count);
+    tstore_encode_header(cap, count, out);
     sha256_hash(out, HDR_SUM, out + HDR_SUM);
 }
 
 static void encode_record(const Record *r, uint8_t out[REC_BYTES]) {
-    memset(out, 0, REC_BYTES);
-    memcpy(out, REC_MAGIC, 8);
-    put_u32(out + 8, r->kind);
-    put_u32(out + 12, r->slot);
-    put_u64(out + 16, r->gen);
-    put_u64(out + 24, r->seq);
-    put_u32(out + 32, r->dtype);
-    put_u32(out + 36, r->rank);
-    for (uint32_t d = 0; d < OMEGA_TENSOR_MAX_RANK; d++) put_u64(out + 40 + 8 * d, r->shape[d]);
-    memcpy(out + 104, r->value_id, 32);
-    memcpy(out + 136, r->payload_sha, 32);
+    const uint64_t meta[6] = { r->kind, r->slot, r->gen, r->seq, r->dtype, r->rank };
+    tstore_encode_record(meta, r->shape, r->value_id, r->payload_sha, out);
     sha256_hash(out, REC_SUM, out + REC_SUM);
 }
 
 static int decode_record(const uint8_t in[REC_BYTES], Record *r) {
     uint8_t sum[32];
-    if (memcmp(in, REC_MAGIC, 8) != 0) return OMEGA_TSTORE_ERR_TORN;
+    uint64_t meta[6] = {0};
+    if (!tstore_decode_record(in, meta, r->shape, r->value_id, r->payload_sha)) return OMEGA_TSTORE_ERR_TORN;
     sha256_hash(in, REC_SUM, sum);
     if (memcmp(sum, in + REC_SUM, 32) != 0) return OMEGA_TSTORE_ERR_TORN; /* MUT:TSTORE_RECORD_SUM */
-    r->kind = get_u32(in + 8);
-    r->slot = get_u32(in + 12);
-    r->gen = get_u64(in + 16);
-    r->seq = get_u64(in + 24);
-    r->dtype = get_u32(in + 32);
-    r->rank = get_u32(in + 36);
-    for (uint32_t d = 0; d < OMEGA_TENSOR_MAX_RANK; d++) r->shape[d] = get_u64(in + 40 + 8 * d);
-    memcpy(r->value_id, in + 104, 32);
-    memcpy(r->payload_sha, in + 136, 32);
+    r->kind = (uint32_t)meta[0];
+    r->slot = (uint32_t)meta[1];
+    r->gen = meta[2];
+    r->seq = meta[3];
+    r->dtype = (uint32_t)meta[4];
+    r->rank = (uint32_t)meta[5];
     return OMEGA_TENSOR_OK;
 }
 
@@ -458,13 +409,14 @@ static int load_journal(OmegaTensorStore *st, const char *jpath, uint32_t capaci
     }
     close(fd);
     len = got;
-    if (len < HDR_BYTES || memcmp(st->jbuf, JRN_MAGIC, 8) != 0) return OMEGA_TSTORE_ERR_TORN;
+    if (len < HDR_BYTES) return OMEGA_TSTORE_ERR_TORN;
+    uint64_t count = 0;
+    uint64_t hdr_st = tstore_decode_header(st->jbuf, capacity, &count);
+    if (hdr_st == 0) return OMEGA_TSTORE_ERR_TORN;
     uint8_t sum[32];
     sha256_hash(st->jbuf, HDR_SUM, sum);
     if (memcmp(sum, st->jbuf + HDR_SUM, 32) != 0) return OMEGA_TSTORE_ERR_TORN; /* MUT:TSTORE_HEADER_SUM */
-    if (get_u32(st->jbuf + 8) != JRN_VERSION) return OMEGA_TSTORE_ERR_TORN;
-    if (get_u32(st->jbuf + 12) != capacity) return OMEGA_TENSOR_ERR_BAD_ARGS;
-    uint64_t count = get_u64(st->jbuf + 16);
+    if (hdr_st == 2) return OMEGA_TENSOR_ERR_BAD_ARGS;
     if (count > (len - HDR_BYTES) / REC_BYTES + 1) count = (len - HDR_BYTES) / REC_BYTES + 1;
     if (len != HDR_BYTES + count * REC_BYTES) return OMEGA_TSTORE_ERR_TORN; /* MUT:TSTORE_SHORT_RECORD */
     uint64_t i = 0;
