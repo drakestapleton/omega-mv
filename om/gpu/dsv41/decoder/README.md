@@ -42,7 +42,7 @@ Run the worker for each shard 03 through 42 and for the two Engram shards 47 and
 
 Expert records have 64 bytes. Bytes 0 and 1 hold shard and layer, bytes 4..7 the expert ID, bytes 8..15 the first eight bytes of SHA-256 in digest order, and six little-endian u64 offsets start at byte 16. The digest covers W1, W2 and W3 weights followed by W1, W2 and W3 scales. The resolver verifies these same bytes in Zone 4 before it claims a FIFO victim. It publishes the slot only after the entire copy completes. A checksum mismatch leaves the resident slot and FIFO cursor intact.
 
-The Engram sidecar starts with a 32-byte header containing shard, layer, row count, weight base and scale base. Each row contributes an eight-byte digest prefix in row order. Row i reads 256 weight bytes at weight_base + 256i and eight scale bytes at scale_base + 8i. The hash covers the two extents in that order.
+The decoder opens `engram1.bin` and `engram14.bin` in the expert sidecar directory. Generate them from shards 47 and 48 respectively. It checks each header against the pinned tensor index and verifies each row before uploading it. The Engram sidecar starts with a 32-byte header containing shard, layer, row count, weight base and scale base. Each row contributes an eight-byte digest prefix in row order. Row i reads 256 weight bytes at weight_base + 256i and eight scale bytes at scale_base + 8i. The hash covers the two extents in that order.
 
 ## Native build controls
 
