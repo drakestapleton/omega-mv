@@ -1,0 +1,1777 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-infer/infer_decode.om: Pure-Omega model binding, BPE tokenizer, and Llama forward/decode.
+note Ported from aienux crates/aienos-infer/src/{model,tokenizer,decode}.rs.
+note Compose with: si/directives/om2.om aienux/crates/aienos-infer/infer_core.om aienux/crates/aienos-infer/infer_decode.om ...
+
+note Model capacity constants
+const INF_MAX_LAYERS ulong 8
+const INF_MAX_WEIGHTS ulong 128
+const INF_MAX_NORM_ELEMS ulong 8192
+
+note Tokenizer capacity constants
+const INF_TOK_MAX_VOCAB ulong 512
+const INF_TOK_MAX_MERGES ulong 512
+const INF_TOK_MAX_WORD ulong 256
+const INF_TOK_MAX_SPECIAL ulong 64
+const INF_TOK_TYPE_CONTROL int 3
+const INF_TOK_TYPE_USER_DEF int 4
+
+note Decode state capacity constants
+const INF_DEC_MAX_KV ulong 32768
+const INF_DEC_MAX_DIM ulong 1024
+const INF_DEC_MAX_POS ulong 256
+const INF_DEC_MAX_VOCAB ulong 512
+
+note Model global tables (bound weight descriptors & f32 norm vectors)
+global inf_w_off ulong 128
+global inf_w_ty uint 128
+global inf_w_rows ulong 128
+global inf_w_cols ulong 128
+global inf_w_rbytes ulong 128
+global inf_w_cnt ulong 1
+
+note Per-layer indices into inf_w_* and inf_norms
+global inf_lyr_attn_norm ulong 8
+global inf_lyr_wq ulong 8
+global inf_lyr_wk ulong 8
+global inf_lyr_wv ulong 8
+global inf_lyr_wo ulong 8
+global inf_lyr_ffn_norm ulong 8
+global inf_lyr_wgate ulong 8
+global inf_lyr_wup ulong 8
+global inf_lyr_wdown ulong 8
+
+global inf_norms f32 8192
+global inf_norms_used ulong 1
+
+note Tokenizer global tables & output buffer
+global inf_tok_off ulong 512
+global inf_tok_len ulong 512
+global inf_tok_type int 512
+global inf_tok_has_types uint 1
+global inf_mrg_off ulong 512
+global inf_mrg_len ulong 512
+global inf_tok_meta ulong 8
+global inf_tok_ids uint 512
+global inf_tok_ids_len ulong 1
+global inf_bpe_ss ulong 256
+global inf_bpe_se ulong 256
+global inf_byte_to_cp_tbl uint 256
+global inf_byte_tbl_init uint 1
+
+note Decode state global buffers
+global inf_kv_k f32 32768
+global inf_kv_v f32 32768
+global inf_st_x f32 1024
+global inf_st_h f32 1024
+global inf_st_q f32 1024
+global inf_st_kk f32 1024
+global inf_st_vv f32 1024
+global inf_st_att f32 1024
+global inf_st_scores f32 256
+global inf_st_gate f32 1024
+global inf_st_up f32 1024
+global inf_st_tmp f32 1024
+global inf_st_rope f32 1024
+global inf_st_logits f32 512
+global inf_gen_ids uint 256
+
+note ========================================================================
+note Model weight binding & matvec (model.rs)
+note ========================================================================
+
+text inf_nm_tok_embd "token_embd.weight"
+text inf_nm_output "output.weight"
+text inf_nm_output_norm "output_norm.weight"
+text inf_nm_rope_freqs "rope_freqs.weight"
+text inf_sfx_attn_norm "attn_norm.weight"
+text inf_sfx_attn_q "attn_q.weight"
+text inf_sfx_attn_k "attn_k.weight"
+text inf_sfx_attn_v "attn_v.weight"
+text inf_sfx_attn_out "attn_output.weight"
+text inf_sfx_ffn_norm "ffn_norm.weight"
+text inf_sfx_ffn_gate "ffn_gate.weight"
+text inf_sfx_ffn_up "ffn_up.weight"
+text inf_sfx_ffn_down "ffn_down.weight"
+
+fn inf_fmt_blk_name lyr uint sfx view uchar * dst edit uchar 64 to ulong
+put dst 0 uchar 98
+put dst 1 uchar 108
+put dst 2 uchar 107
+put dst 3 uchar 46
+pos = ulong 4
+if ge lyr 10
+put dst pos uchar add 48 div lyr 10
+pos = add pos 1
+end
+put dst pos uchar add 48 rem lyr 10
+pos = add pos 1
+put dst pos uchar 46
+pos = add pos 1
+slen = len sfx
+for i ulong slen bound 48
+put dst add pos i get sfx i
+end
+ret add pos slen
+end
+
+fn inf_weight_is_supported ty uint to bool
+if eq ty INF_GGML_Q4K
+ret true
+end
+if eq ty INF_GGML_Q6K
+ret true
+end
+if eq ty INF_GGML_Q8_0
+ret true
+end
+if eq ty INF_GGML_F32
+ret true
+end
+if eq ty INF_GGML_F16
+ret true
+end
+if eq ty INF_GGML_BF16
+ret true
+end
+ret false
+end
+
+fn inf_weight_is_kquant widx ulong to bool
+ty = get inf_w_ty widx
+if eq ty INF_GGML_Q4K
+ret true
+end
+if eq ty INF_GGML_Q6K
+ret true
+end
+ret false
+end
+
+fn inf_weight_store u ulong dstart ulong rows ulong cols ulong to long
+ty = get inf_ten_ty u
+if not inf_weight_is_supported ty
+ret long INF_ERR_BAD_TENSOR
+end
+if ne rem cols inf_ggml_block_w ty 0
+ret long INF_ERR_BAD_TENSOR
+end
+rbytes = inf_gguf_tensor_row_bytes u
+if ne get inf_ten_nbytes u mul rbytes rows
+ret long INF_ERR_BAD_TENSOR
+end
+widx = get inf_w_cnt 0
+if ge widx INF_MAX_WEIGHTS
+ret long INF_ERR_CAPACITY
+end
+put inf_w_off widx add dstart get inf_ten_off u
+put inf_w_ty widx ty
+put inf_w_rows widx rows
+put inf_w_cols widx cols
+put inf_w_rbytes widx rbytes
+put inf_w_cnt 0 add widx 1
+ret long widx
+end
+
+fn inf_weight_bind g view InfGguf b view uchar * name view uchar * rc_dims view ulong 2 to long
+ti = inf_gguf_find_tensor g b name
+if lt ti 0
+ret long INF_ERR_MISSING_TENSOR
+end
+u = ulong ti
+if ne get inf_ten_ndims u 2
+ret long INF_ERR_BAD_TENSOR
+end
+if ne get inf_ten_d0 u get rc_dims 1
+ret long INF_ERR_BAD_TENSOR
+end
+if ne get inf_ten_d1 u get rc_dims 0
+ret long INF_ERR_BAD_TENSOR
+end
+ret inf_weight_store u get g data_start get rc_dims 0 get rc_dims 1
+end
+
+fn inf_load_norm_vec g view InfGguf b view uchar * name view uchar * n ulong to long
+ti = inf_gguf_find_tensor g b name
+if lt ti 0
+ret long INF_ERR_MISSING_TENSOR
+end
+u = ulong ti
+if ne get inf_ten_ndims u 1
+ret long INF_ERR_BAD_TENSOR
+end
+if ne get inf_ten_d0 u n
+ret long INF_ERR_BAD_TENSOR
+end
+if ne get inf_ten_ty u INF_GGML_F32
+ret long INF_ERR_BAD_TENSOR
+end
+base = get inf_norms_used 0
+if gt add base n INF_MAX_NORM_ELEMS
+ret long INF_ERR_CAPACITY
+end
+doff = add get g data_start get inf_ten_off u
+for i ulong n bound 8192
+put inf_norms add base i inf_rd_f32_le b add doff mul i 4
+end
+put inf_norms_used 0 add base n
+ret long base
+end
+
+fn inf_model_bind_layer g view InfGguf b view uchar * m view InfModel lyr uint to int
+nbuf = new uchar 64 0
+dims = new ulong 2 0
+n_embd = ulong get m embedding_length
+kv_dim = get m kv_dim
+n_ff = ulong get m feed_forward_length
+ul = ulong lyr
+nlen = inf_fmt_blk_name lyr inf_sfx_attn_norm nbuf
+r = inf_load_norm_vec g b part nbuf 0 nlen n_embd
+if lt r 0
+ret int r
+end
+put inf_lyr_attn_norm ul ulong r
+put dims 0 n_embd
+put dims 1 n_embd
+nlen = inf_fmt_blk_name lyr inf_sfx_attn_q nbuf
+r = inf_weight_bind g b part nbuf 0 nlen dims
+if lt r 0
+ret int r
+end
+put inf_lyr_wq ul ulong r
+put dims 0 kv_dim
+put dims 1 n_embd
+nlen = inf_fmt_blk_name lyr inf_sfx_attn_k nbuf
+r = inf_weight_bind g b part nbuf 0 nlen dims
+if lt r 0
+ret int r
+end
+put inf_lyr_wk ul ulong r
+nlen = inf_fmt_blk_name lyr inf_sfx_attn_v nbuf
+r = inf_weight_bind g b part nbuf 0 nlen dims
+if lt r 0
+ret int r
+end
+put inf_lyr_wv ul ulong r
+put dims 0 n_embd
+put dims 1 n_embd
+nlen = inf_fmt_blk_name lyr inf_sfx_attn_out nbuf
+r = inf_weight_bind g b part nbuf 0 nlen dims
+if lt r 0
+ret int r
+end
+put inf_lyr_wo ul ulong r
+nlen = inf_fmt_blk_name lyr inf_sfx_ffn_norm nbuf
+r = inf_load_norm_vec g b part nbuf 0 nlen n_embd
+if lt r 0
+ret int r
+end
+put inf_lyr_ffn_norm ul ulong r
+put dims 0 n_ff
+put dims 1 n_embd
+nlen = inf_fmt_blk_name lyr inf_sfx_ffn_gate nbuf
+r = inf_weight_bind g b part nbuf 0 nlen dims
+if lt r 0
+ret int r
+end
+put inf_lyr_wgate ul ulong r
+nlen = inf_fmt_blk_name lyr inf_sfx_ffn_up nbuf
+r = inf_weight_bind g b part nbuf 0 nlen dims
+if lt r 0
+ret int r
+end
+put inf_lyr_wup ul ulong r
+put dims 0 n_embd
+put dims 1 n_ff
+nlen = inf_fmt_blk_name lyr inf_sfx_ffn_down nbuf
+r = inf_weight_bind g b part nbuf 0 nlen dims
+if lt r 0
+ret int r
+end
+put inf_lyr_wdown ul ulong r
+ret INF_OK
+end
+
+fn inf_model_bind_weights g view InfGguf b view uchar * m edit InfModel to int
+dims = new ulong 2 0
+n_embd = ulong get m embedding_length
+put inf_w_cnt 0 ulong 0
+put inf_norms_used 0 ulong 0
+put dims 0 ulong get m vocab_size
+put dims 1 n_embd
+r = inf_weight_bind g b inf_nm_tok_embd dims
+if lt r 0
+ret int r
+end
+put m tok_embd_w ulong r
+put m output_w ulong r
+if ge inf_gguf_find_tensor g b inf_nm_output 0
+r = inf_weight_bind g b inf_nm_output dims
+if lt r 0
+ret int r
+end
+put m output_w ulong r
+end
+bc = ulong get m block_count
+for l ulong bc bound 8
+rc = inf_model_bind_layer g b m uint l
+if ne rc INF_OK
+ret rc
+end
+end
+r = inf_load_norm_vec g b inf_nm_output_norm n_embd
+if lt r 0
+ret int r
+end
+put m output_norm_off ulong r
+put m rope_fac_off ulong 0
+put m has_rope_fac uint 0
+if ge inf_gguf_find_tensor g b inf_nm_rope_freqs 0
+r = inf_load_norm_vec g b inf_nm_rope_freqs div get m head_dim 2
+if lt r 0
+ret int r
+end
+put m rope_fac_off ulong r
+put m has_rope_fac uint 1
+end
+ret INF_OK
+end
+
+fn inf_model_bind g view InfGguf b view uchar * m edit InfModel to int
+p = new InfLlamaParams 0 0 0 0 0 0 0.0f32 0.0f32 0
+rc = inf_gguf_llama_params g b p
+if ne rc INF_OK
+ret rc
+end
+n_embd = ulong get p embedding_length
+n_head = ulong get p head_count
+n_kv = ulong get p head_count_kv
+if eq n_head 0
+ret INF_ERR_BAD_PARAMS
+end
+if eq n_kv 0
+ret INF_ERR_BAD_PARAMS
+end
+if ne rem n_embd n_head 0
+ret INF_ERR_BAD_PARAMS
+end
+if ne rem n_head n_kv 0
+ret INF_ERR_BAD_PARAMS
+end
+hd = div n_embd n_head
+if ne rem hd 2 0
+ret INF_ERR_BAD_PARAMS
+end
+if gt ulong get p block_count INF_MAX_LAYERS
+ret INF_ERR_CAPACITY
+end
+put m block_count get p block_count
+put m embedding_length get p embedding_length
+put m head_count get p head_count
+put m head_count_kv get p head_count_kv
+put m feed_forward_length get p feed_forward_length
+put m context_length get p context_length
+put m rope_freq_base get p rope_freq_base
+put m rms_norm_eps get p rms_norm_eps
+put m vocab_size get p vocab_size
+put m head_dim hd
+put m kv_dim mul n_kv hd
+ret inf_model_bind_weights g b m
+end
+
+fn inf_weight_row_into widx ulong b view uchar * row ulong dst edit f32 * to int
+rows = get inf_w_rows widx
+cols = get inf_w_cols widx
+if ge row rows
+ret INF_ERR_BAD_TOKEN
+end
+if ne len dst cols
+ret INF_ERR_BAD_TOKEN
+end
+rbytes = get inf_w_rbytes widx
+roff = add get inf_w_off widx mul row rbytes
+ty = get inf_w_ty widx
+if inf_plain_to_f32 ty part b roff rbytes dst
+ret INF_OK
+end
+ret inf_dequantize ty part b roff rbytes dst
+end
+
+fn inf_dot_plain ty uint b view uchar * roff ulong x view f32 * to f32
+acc = f32 0.0f32
+c = ulong 0
+while lt c len x bound 65536
+if eq ty INF_GGML_F32
+acc = add acc mul inf_rd_f32_le b add roff mul c 4 get x c
+else
+if eq ty INF_GGML_F16
+acc = add acc mul inf_rd_f16_le b add roff mul c 2 get x c
+else
+acc = add acc mul inf_rd_bf16_le b add roff mul c 2 get x c
+end
+end
+c = add c 1
+end
+ret acc
+end
+
+fn inf_weight_matvec_row wr view ulong 2 b view uchar * x view f32 * res edit f32 1 to int
+widx = get wr 0
+ty = get inf_w_ty widx
+rbytes = get inf_w_rbytes widx
+roff = add get inf_w_off widx mul get wr 1 rbytes
+if eq ty INF_GGML_Q4K
+ret inf_dot_row ty part b roff rbytes x res
+end
+if eq ty INF_GGML_Q6K
+ret inf_dot_row ty part b roff rbytes x res
+end
+if eq ty INF_GGML_Q8_0
+ret inf_dot_row ty part b roff rbytes x res
+end
+if eq ty INF_GGML_F32
+put res 0 inf_dot_plain ty b roff x
+ret INF_OK
+end
+if eq ty INF_GGML_F16
+put res 0 inf_dot_plain ty b roff x
+ret INF_OK
+end
+if eq ty INF_GGML_BF16
+put res 0 inf_dot_plain ty b roff x
+ret INF_OK
+end
+ret INF_QUANT_UNSUPPORTED
+end
+
+fn inf_weight_matvec_q8 widx ulong b view uchar * dst edit f32 * to int
+if not inf_weight_is_kquant widx
+ret INF_ERR_BAD_PARAMS
+end
+rows = get inf_w_rows widx
+cols = get inf_w_cols widx
+if ne len dst rows
+ret INF_ERR_BAD_PARAMS
+end
+if ne mul inf_q8_blocks INF_QK_K cols
+ret INF_ERR_BAD_PARAMS
+end
+ty = get inf_w_ty widx
+rbytes = get inf_w_rbytes widx
+base = get inf_w_off widx
+res = new f32 1 0.0f32
+for r ulong rows bound 65536
+roff = add base mul r rbytes
+rc = inf_dot_row_q8 ty part b roff rbytes res
+if ne rc INF_OK
+ret rc
+end
+put dst r get res 0
+end
+ret INF_OK
+end
+
+note ========================================================================
+note Llama-3 byte-level BPE tokenizer (tokenizer.rs)
+note ========================================================================
+
+fn inf_gpt2_keep b uchar to bool
+if ge b uchar 33
+if le b uchar 126
+ret true
+end
+end
+if ge b uchar 161
+if le b uchar 172
+ret true
+end
+end
+if ge b uchar 174
+ret true
+end
+ret false
+end
+
+fn inf_byte_to_cp b uchar to uint
+if inf_gpt2_keep b
+ret uint b
+end
+n = uint 0
+for x ulong ulong b bound 256
+if not inf_gpt2_keep uchar x
+n = add n 1
+end
+end
+ret add 256 n
+end
+
+fn inf_cp_to_byte cp uint to int
+if lt cp 256
+b = uchar cp
+if inf_gpt2_keep b
+ret int b
+end
+ret -1
+end
+n = sub cp 256
+seen = uint 0
+for x ulong 256
+if not inf_gpt2_keep uchar x
+if eq seen n
+ret int x
+end
+seen = add seen 1
+end
+end
+ret -1
+end
+
+fn inf_utf8_encode cp uint dst edit uchar * pos ulong to ulong
+if lt cp 0x80
+put dst pos uchar cp
+ret 1
+end
+if lt cp 0x800
+put dst pos uchar or 0xc0 shr cp 6
+put dst add pos 1 uchar or 0x80 and cp 0x3f
+ret 2
+end
+if lt cp 0x10000
+put dst pos uchar or 0xe0 shr cp 12
+put dst add pos 1 uchar or 0x80 and shr cp 6 0x3f
+put dst add pos 2 uchar or 0x80 and cp 0x3f
+ret 3
+end
+put dst pos uchar or 0xf0 shr cp 18
+put dst add pos 1 uchar or 0x80 and shr cp 12 0x3f
+put dst add pos 2 uchar or 0x80 and shr cp 6 0x3f
+put dst add pos 3 uchar or 0x80 and cp 0x3f
+ret 4
+end
+
+fn inf_utf8_char_len b uchar to ulong
+if lt b uchar 0x80
+ret 1
+end
+if lt b uchar 0xe0
+ret 2
+end
+if lt b uchar 0xf0
+ret 3
+end
+ret 4
+end
+
+fn inf_utf8_decode s view uchar * pos ulong to uint
+b0 = uint get s pos
+if lt b0 0x80
+ret b0
+end
+if lt b0 0xe0
+b1 = uint get s add pos 1
+ret or shl and b0 0x1f 6 and b1 0x3f
+end
+if lt b0 0xf0
+b1 = uint get s add pos 1
+b2 = uint get s add pos 2
+r = shl and b0 0x0f 12
+r = or r shl and b1 0x3f 6
+ret or r and b2 0x3f
+end
+b1 = uint get s add pos 1
+b2 = uint get s add pos 2
+b3 = uint get s add pos 3
+r = shl and b0 0x07 18
+r = or r shl and b1 0x3f 12
+r = or r shl and b2 0x3f 6
+ret or r and b3 0x3f
+end
+
+fn inf_cp_is_letter cp uint to bool
+if ge cp 65
+if le cp 90
+ret true
+end
+end
+if ge cp 97
+if le cp 122
+ret true
+end
+end
+if ge cp 0xc0
+if le cp 0x24f
+if ne cp 0xd7
+if ne cp 0xf7
+ret true
+end
+end
+end
+end
+if ge cp 0x370
+if le cp 0x52f
+ret true
+end
+end
+if ge cp 0x4e00
+if le cp 0x9fff
+ret true
+end
+end
+ret false
+end
+
+fn inf_cp_is_number cp uint to bool
+if ge cp 48
+if le cp 57
+ret true
+end
+end
+ret false
+end
+
+fn inf_cp_is_nl cp uint to bool
+if eq cp 10
+ret true
+end
+if eq cp 13
+ret true
+end
+ret false
+end
+
+fn inf_cp_is_ws cp uint to bool
+if eq cp 32
+ret true
+end
+if eq cp 9
+ret true
+end
+if eq cp 10
+ret true
+end
+if eq cp 13
+ret true
+end
+if eq cp 11
+ret true
+end
+if eq cp 12
+ret true
+end
+if eq cp 0x3000
+ret true
+end
+ret false
+end
+
+fn inf_cp_is_sym cp uint to bool
+if inf_cp_is_ws cp
+ret false
+end
+if inf_cp_is_letter cp
+ret false
+end
+if inf_cp_is_number cp
+ret false
+end
+ret true
+end
+
+fn inf_ascii_lower b uchar to uchar
+if ge b uchar 65
+if le b uchar 90
+ret add b uchar 32
+end
+end
+ret b
+end
+
+fn inf_run_kind s view uchar * start ulong kind uint to ulong
+n = len s
+pos = start
+while lt pos n bound 4096
+cp = inf_utf8_decode s pos
+clen = inf_utf8_char_len get s pos
+if gt add pos clen n
+break
+end
+ok = false
+if eq kind 0
+ok = inf_cp_is_letter cp
+end
+if eq kind 1
+ok = inf_cp_is_sym cp
+end
+if eq kind 2
+ok = inf_cp_is_nl cp
+end
+if eq kind 3
+ok = inf_cp_is_ws cp
+end
+if not ok
+break
+end
+pos = add pos clen
+end
+ret sub pos start
+end
+
+fn inf_pretok_ws s view uchar * pos ulong l0 ulong to ulong
+ws = inf_run_kind s pos 3
+if eq ws 0
+ret l0
+end
+last_nl = long -1
+for k ulong ws bound 4096
+bv = get s add pos k
+if eq bv uchar 10
+last_nl = long k
+end
+if eq bv uchar 13
+last_nl = long k
+end
+end
+if ge last_nl 0
+ret add ulong last_nl 1
+end
+if eq add pos ws len s
+ret ws
+end
+n_chars = ulong 0
+last_len = ulong 0
+p = pos
+wend = add pos ws
+while lt p wend bound 4096
+cl = inf_utf8_char_len get s p
+last_len = cl
+p = add p cl
+n_chars = add n_chars 1
+end
+if gt n_chars 1
+ret sub ws last_len
+end
+ret ws
+end
+
+fn inf_pretokenize_one s view uchar * pos ulong to ulong
+n = len s
+rem_n = sub n pos
+if eq rem_n 0
+ret 0
+end
+c0 = inf_utf8_decode s pos
+l0 = inf_utf8_char_len get s pos
+note 1: contractions
+if eq c0 39
+if ge rem_n 3
+a = inf_ascii_lower get s add pos 1
+b = inf_ascii_lower get s add pos 2
+if eq a uchar 114
+if eq b uchar 101
+ret 3
+end
+end
+if eq a uchar 118
+if eq b uchar 101
+ret 3
+end
+end
+if eq a uchar 108
+if eq b uchar 108
+ret 3
+end
+end
+end
+if ge rem_n 2
+a = inf_ascii_lower get s add pos 1
+if eq a uchar 115
+ret 2
+end
+if eq a uchar 116
+ret 2
+end
+if eq a uchar 109
+ret 2
+end
+if eq a uchar 100
+ret 2
+end
+end
+end
+note 2: optional one char, then letters
+if inf_cp_is_letter c0
+ret add l0 inf_run_kind s add pos l0 0
+end
+if not inf_cp_is_nl c0
+if not inf_cp_is_number c0
+if lt add pos l0 n
+c1 = inf_utf8_decode s add pos l0
+if inf_cp_is_letter c1
+ret add l0 inf_run_kind s add pos l0 0
+end
+end
+end
+end
+note 3: 1..3 digits
+if inf_cp_is_number c0
+p = pos
+cnt = ulong 0
+while lt p n bound 4
+if eq cnt 3
+break
+end
+cp = inf_utf8_decode s p
+if not inf_cp_is_number cp
+break
+end
+p = add p inf_utf8_char_len get s p
+cnt = add cnt 1
+end
+ret sub p pos
+end
+note 4: optional space, symbols, trailing newlines
+skip = ulong 0
+if eq c0 32
+skip = 1
+end
+body = inf_run_kind s add pos skip 1
+if gt body 0
+tail = inf_run_kind s add pos add skip body 2
+ret add skip add body tail
+end
+note 5-7: whitespace handling
+ret inf_pretok_ws s pos l0
+end
+
+text inf_key_tok_type "tokenizer.ggml.token_type"
+text inf_key_tok_merges "tokenizer.ggml.merges"
+text inf_key_bos "tokenizer.ggml.bos_token_id"
+text inf_key_eos "tokenizer.ggml.eos_token_id"
+text inf_tok_eot "<|eot_id|>"
+text inf_chat_pre "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+text inf_chat_suf "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+fn inf_tok_ensure_byte_tbl to void
+if ne get inf_byte_tbl_init 0 uint 0
+ret
+end
+for b ulong 256
+put inf_byte_to_cp_tbl b inf_byte_to_cp uchar b
+end
+put inf_byte_tbl_init 0 uint 1
+end
+
+fn inf_tok_lookup b view uchar * needle view uchar * to long
+nv = get inf_tok_meta 0
+nlen = len needle
+for i ulong nv bound 512
+if eq get inf_tok_len i nlen
+toff = get inf_tok_off i
+eq_f = true
+for j ulong nlen bound 256
+if ne get b add toff j get needle j
+eq_f = false
+break
+end
+end
+if eq_f
+ret long i
+end
+end
+end
+ret long -1
+end
+
+fn inf_tok_init_merges g view InfGguf b view uchar * ts edit InfTokState to int
+nm = ulong 0
+cur = new ulong 1 0
+so = new ulong 1 0
+sl = new ulong 1 0
+midx = inf_gguf_find_kv g b inf_key_tok_merges
+if ge midx 0
+mu = ulong midx
+if eq get inf_kv_vtype mu INF_VT_ARRAY
+if eq get inf_kv_aelem mu INF_VT_STR
+nm = get inf_kv_alen mu
+if gt nm INF_TOK_MAX_MERGES
+ret INF_TOK_OVERFLOW
+end
+put cur 0 get inf_kv_voff mu
+for i ulong nm bound 512
+rc = inf_cur_str b cur so sl
+if ne rc INF_OK
+ret INF_TOK_BAD_VOCAB
+end
+put inf_mrg_off i get so 0
+put inf_mrg_len i get sl 0
+end
+end
+end
+end
+put inf_tok_meta 1 nm
+put ts n_merges nm
+ret INF_OK
+end
+
+fn inf_tok_init_extra g view InfGguf b view uchar * ts edit InfTokState to int
+nv = get ts vocab_size
+put inf_tok_has_types 0 uint 0
+ttidx = inf_gguf_find_kv g b inf_key_tok_type
+if ge ttidx 0
+ttu = ulong ttidx
+if eq get inf_kv_vtype ttu INF_VT_ARRAY
+if eq get inf_kv_aelem ttu INF_VT_I32
+if eq get inf_kv_alen ttu nv
+ttoff = get inf_kv_voff ttu
+for i ulong nv bound 512
+put inf_tok_type i bitcast int inf_rd_u32_le b add ttoff mul i 4
+end
+put inf_tok_has_types 0 uint 1
+end
+end
+end
+end
+rc = inf_tok_init_merges g b ts
+if ne rc INF_OK
+ret rc
+end
+u32_buf = new uint 1 0
+if eq inf_gguf_u32_key g b inf_key_bos u32_buf INF_OK
+put ts bos_id get u32_buf 0
+put ts has_bos uint 1
+else
+put ts bos_id uint 0
+put ts has_bos uint 0
+end
+if eq inf_gguf_u32_key g b inf_key_eos u32_buf INF_OK
+put ts eos_id get u32_buf 0
+put ts has_eos uint 1
+else
+put ts eos_id uint 0
+put ts has_eos uint 0
+end
+eot = inf_tok_lookup b inf_tok_eot
+if ge eot 0
+put ts eot_id uint eot
+put ts has_eot uint 1
+else
+put ts eot_id uint 0
+put ts has_eot uint 0
+end
+ret INF_OK
+end
+
+fn inf_tok_init g view InfGguf b view uchar * ts edit InfTokState to int
+inf_tok_ensure_byte_tbl
+tidx = inf_gguf_find_kv g b inf_key_tokens
+if lt tidx 0
+ret INF_TOK_BAD_VOCAB
+end
+tu = ulong tidx
+if ne get inf_kv_vtype tu INF_VT_ARRAY
+ret INF_TOK_BAD_VOCAB
+end
+if ne get inf_kv_aelem tu INF_VT_STR
+ret INF_TOK_BAD_VOCAB
+end
+nv = get inf_kv_alen tu
+if eq nv 0
+ret INF_TOK_BAD_VOCAB
+end
+if gt nv INF_TOK_MAX_VOCAB
+ret INF_TOK_OVERFLOW
+end
+cur = new ulong 1 get inf_kv_voff tu
+so = new ulong 1 0
+sl = new ulong 1 0
+for i ulong nv bound 512
+rc = inf_cur_str b cur so sl
+if ne rc INF_OK
+ret INF_TOK_BAD_VOCAB
+end
+put inf_tok_off i get so 0
+put inf_tok_len i get sl 0
+put inf_tok_type i int 1
+end
+put inf_tok_meta 0 nv
+put ts vocab_size nv
+ret inf_tok_init_extra g b ts
+end
+
+fn inf_tok_is_special id uint to bool
+if eq get inf_tok_has_types 0 uint 0
+ret false
+end
+t = get inf_tok_type ulong id
+if eq t INF_TOK_TYPE_CONTROL
+ret true
+end
+if eq t INF_TOK_TYPE_USER_DEF
+ret true
+end
+ret false
+end
+
+fn inf_tok_is_control id uint to bool
+if eq get inf_tok_has_types 0 uint 0
+ret false
+end
+ret eq get inf_tok_type ulong id INF_TOK_TYPE_CONTROL
+end
+
+fn inf_tok_merge_rank b view uchar * pair view uchar * to long
+nm = get inf_tok_meta 1
+plen = len pair
+for i ulong nm bound 512
+if eq get inf_mrg_len i plen
+moff = get inf_mrg_off i
+eq_f = true
+for j ulong plen bound 256
+if ne get b add moff j get pair j
+eq_f = false
+break
+end
+end
+if eq_f
+ret long i
+end
+end
+end
+ret long -1
+end
+
+fn inf_tok_emit_id tid uint to int
+dpos = get inf_tok_ids_len 0
+if ge dpos 512
+ret INF_TOK_OVERFLOW
+end
+put inf_tok_ids dpos tid
+put inf_tok_ids_len 0 add dpos 1
+ret INF_OK
+end
+
+fn inf_tok_get_id i ulong to uint
+ret get inf_tok_ids i
+end
+
+fn inf_tok_pair_rank b view uchar * word view uchar * idx ulong to long
+pbuf = new uchar 256 0
+s0 = get inf_bpe_ss idx
+l0 = sub get inf_bpe_se idx s0
+s1 = get inf_bpe_ss add idx 1
+l1 = sub get inf_bpe_se add idx 1 s1
+if gt add add l0 1 l1 256
+ret long -1
+end
+for k ulong l0 bound 256
+put pbuf k get word add s0 k
+end
+put pbuf l0 uchar 32
+for k ulong l1 bound 256
+put pbuf add add l0 1 k get word add s1 k
+end
+ret inf_tok_merge_rank b part pbuf 0 add add l0 1 l1
+end
+
+fn inf_tok_best_merge b view uchar * word view uchar * nsym ulong to long
+best_r = long -1
+best_i = long -1
+lim = sub nsym 1
+for i ulong lim bound 256
+rk = inf_tok_pair_rank b word i
+if ge rk 0
+if lt best_r 0
+best_r = rk
+best_i = long i
+else
+if lt rk best_r
+best_r = rk
+best_i = long i
+end
+end
+end
+end
+ret best_i
+end
+
+fn inf_tok_emit_syms b view uchar * word view uchar * nsym ulong to int
+for i ulong nsym bound 256
+s0 = get inf_bpe_ss i
+e0 = get inf_bpe_se i
+tid = inf_tok_lookup b part word s0 sub e0 s0
+if lt tid 0
+ret INF_TOK_MISSING_SYM
+end
+rc = inf_tok_emit_id uint tid
+if ne rc INF_OK
+ret rc
+end
+end
+ret INF_OK
+end
+
+fn inf_bpe_shift u ulong nsym ulong to void
+put inf_bpe_se u get inf_bpe_se add u 1
+k = add u 1
+while lt add k 1 nsym bound 256
+put inf_bpe_ss k get inf_bpe_ss add k 1
+put inf_bpe_se k get inf_bpe_se add k 1
+k = add k 1
+end
+end
+
+fn inf_tok_bpe_word b view uchar * word view uchar * to int
+wlen = len word
+whole = inf_tok_lookup b word
+if ge whole 0
+ret inf_tok_emit_id uint whole
+end
+nsym = ulong 0
+p = ulong 0
+while lt p wlen bound 256
+cl = inf_utf8_char_len get word p
+if gt add p cl wlen
+cl = sub wlen p
+end
+put inf_bpe_ss nsym p
+put inf_bpe_se nsym add p cl
+nsym = add nsym 1
+p = add p cl
+end
+while gt nsym 1 bound 256
+bi = inf_tok_best_merge b word nsym
+if lt bi 0
+break
+end
+inf_bpe_shift ulong bi nsym
+nsym = sub nsym 1
+end
+ret inf_tok_emit_syms b word nsym
+end
+
+fn inf_tok_encode_plain b view uchar * s view uchar * to int
+slen = len s
+pos = ulong 0
+mapped = new uchar 512 0
+while lt pos slen bound 4096
+wlen = inf_pretokenize_one s pos
+if eq wlen 0
+break
+end
+mlen = ulong 0
+for k ulong wlen bound 256
+bv = get s add pos k
+cp = get inf_byte_to_cp_tbl ulong bv
+mlen = add mlen inf_utf8_encode cp mapped mlen
+end
+rc = inf_tok_bpe_word b part mapped 0 mlen
+if ne rc INF_OK
+ret rc
+end
+pos = add pos wlen
+end
+ret INF_OK
+end
+
+fn inf_tok_match_special b view uchar * s view uchar * i ulong hit edit ulong 3 to bool
+end_lim = add i INF_TOK_MAX_SPECIAL
+if gt end_lim len s
+end_lim = len s
+end
+j = add i 2
+while lt add j 1 end_lim bound 64
+if eq get s j uchar 124
+if eq get s add j 1 uchar 62
+clen = sub add j 2 i
+tid = inf_tok_lookup b part s i clen
+if ge tid 0
+if inf_tok_is_special uint tid
+put hit 0 i
+put hit 1 clen
+put hit 2 ulong tid
+ret true
+end
+end
+ret false
+end
+end
+j = add j 1
+end
+ret false
+end
+
+fn inf_tok_find_special b view uchar * s view uchar * pos ulong hit edit ulong 3 to bool
+n = len s
+i = pos
+while lt add i 1 n bound 4096
+if eq get s i uchar 60
+if eq get s add i 1 uchar 124
+if inf_tok_match_special b s i hit
+ret true
+end
+end
+end
+i = add i 1
+end
+ret false
+end
+
+fn inf_tok_encode b view uchar * s view uchar * parse_special bool to long
+put inf_tok_ids_len 0 ulong 0
+hit = new ulong 3 0
+pos = ulong 0
+slen = len s
+while lt pos slen bound 512
+found = false
+if parse_special
+found = inf_tok_find_special b s pos hit
+end
+if found
+hat = get hit 0
+clen = get hit 1
+tid = get hit 2
+if gt hat pos
+rc = inf_tok_encode_plain b part s pos sub hat pos
+if ne rc INF_OK
+ret long rc
+end
+end
+rc = inf_tok_emit_id uint tid
+if ne rc INF_OK
+ret long rc
+end
+pos = add hat clen
+else
+rc = inf_tok_encode_plain b part s pos sub slen pos
+if ne rc INF_OK
+ret long rc
+end
+pos = slen
+end
+end
+ret long get inf_tok_ids_len 0
+end
+
+fn inf_tok_encode_chat b view uchar * user view uchar * to long
+buf = new uchar 512 0
+p = ulong 0
+pre_n = len inf_chat_pre
+suf_n = len inf_chat_suf
+un = len user
+if gt add add pre_n un suf_n 512
+ret long INF_TOK_OVERFLOW
+end
+for i ulong pre_n bound 128
+put buf p get inf_chat_pre i
+p = add p 1
+end
+for i ulong un bound 384
+put buf p get user i
+p = add p 1
+end
+for i ulong suf_n bound 128
+put buf p get inf_chat_suf i
+p = add p 1
+end
+ret inf_tok_encode b part buf 0 p true
+end
+
+fn inf_tok_copy_slice src view uchar * dst edit uchar * outp ulong to void
+n = len src
+for k ulong n bound 4
+put dst add outp k get src k
+end
+end
+
+fn inf_tok_decode_token b view uchar * id uint dst edit uchar * dpos edit ulong 1 to int
+if ge ulong id get inf_tok_meta 0
+ret INF_TOK_BAD_ID
+end
+if inf_tok_is_control id
+ret INF_OK
+end
+toff = get inf_tok_off ulong id
+tlen = get inf_tok_len ulong id
+outp = get dpos 0
+i = ulong 0
+while lt i tlen bound 256
+cl = inf_utf8_char_len get b add toff i
+if gt add i cl tlen
+cl = sub tlen i
+end
+mb = inf_cp_to_byte inf_utf8_decode b add toff i
+if ge mb 0
+if ge outp len dst
+ret INF_TOK_OVERFLOW
+end
+put dst outp uchar mb
+outp = add outp 1
+else
+if gt add outp cl len dst
+ret INF_TOK_OVERFLOW
+end
+inf_tok_copy_slice part b add toff i cl dst outp
+outp = add outp cl
+end
+i = add i cl
+end
+put dpos 0 outp
+ret INF_OK
+end
+
+fn inf_tok_decode b view uchar * ids view uint * dst edit uchar * to long
+dpos = new ulong 1 0
+n = len ids
+for i ulong n bound 512
+rc = inf_tok_decode_token b get ids i dst dpos
+if ne rc INF_OK
+ret long rc
+end
+end
+ret long get dpos 0
+end
+
+note ========================================================================
+note Forward pass, KV cache and greedy decode (decode.rs)
+note ========================================================================
+
+fn inf_decode_init m view InfModel cap ulong st edit InfDecodeState to int
+n_embd = ulong get m embedding_length
+n_ff = ulong get m feed_forward_length
+vocab = ulong get m vocab_size
+n_lyr = ulong get m block_count
+kv_dim = get m kv_dim
+if gt n_embd INF_DEC_MAX_DIM
+ret INF_ERR_CAPACITY
+end
+if gt n_ff INF_DEC_MAX_DIM
+ret INF_ERR_CAPACITY
+end
+if gt vocab INF_DEC_MAX_VOCAB
+ret INF_ERR_CAPACITY
+end
+if gt cap INF_DEC_MAX_POS
+ret INF_ERR_CAPACITY
+end
+if gt mul mul n_lyr cap kv_dim INF_DEC_MAX_KV
+ret INF_ERR_CAPACITY
+end
+put st capacity cap
+put st pos ulong 0
+put st kv_dim kv_dim
+put st emulate_q8k uint 0
+if inf_cpu_dotprod
+put st use_dotprod uint 1
+else
+put st use_dotprod uint 0
+end
+ret INF_OK
+end
+
+fn inf_decode_reset st edit InfDecodeState to void
+put st pos ulong 0
+end
+
+fn inf_dec_rms_norm_x_to_h norm_off ulong n ulong eps f32 to void
+ss = f32 0.0f32
+for i ulong n bound 1024
+v = get inf_st_x i
+ss = add ss mul v v
+end
+ss = div ss f32 n
+scale = div 1.0f32 inf_sqrt add ss eps
+for i ulong n bound 1024
+put inf_st_h i mul mul get inf_st_x i scale get inf_norms add norm_off i
+end
+end
+
+fn inf_dec_prep st view InfDecodeState which uint n ulong to int
+use_dp = ne get st use_dotprod 0
+use_em = ne get st emulate_q8k 0
+if not use_dp
+if not use_em
+ret INF_OK
+end
+end
+xtmp = new f32 1024 0.0f32
+for i ulong n bound 1024
+if eq which 0
+put xtmp i get inf_st_h i
+else
+if eq which 1
+put xtmp i get inf_st_att i
+else
+put xtmp i get inf_st_gate i
+end
+end
+end
+if use_dp
+ret inf_q8_quantize part xtmp 0 n n
+end
+inf_q8k_round part xtmp 0 n n
+for i ulong n bound 1024
+if eq which 0
+put inf_st_h i get xtmp i
+else
+if eq which 1
+put inf_st_att i get xtmp i
+else
+put inf_st_gate i get xtmp i
+end
+end
+end
+ret INF_OK
+end
+
+fn inf_dec_store_dst dst_id uint r ulong v f32 to void
+if eq dst_id 0
+put inf_st_q r v
+end
+if eq dst_id 1
+put inf_st_kk r v
+end
+if eq dst_id 2
+put inf_st_vv r v
+end
+if eq dst_id 3
+put inf_st_tmp r v
+end
+if eq dst_id 4
+put inf_st_gate r v
+end
+if eq dst_id 5
+put inf_st_up r v
+end
+if eq dst_id 6
+put inf_st_logits r v
+end
+end
+
+fn inf_dec_mv_q8 widx ulong b view uchar * dst_id uint to int
+rows = get inf_w_rows widx
+ty = get inf_w_ty widx
+rbytes = get inf_w_rbytes widx
+base = get inf_w_off widx
+res = new f32 1 0.0f32
+for r ulong rows bound 1024
+rc = inf_dot_row_q8 ty part b add base mul r rbytes rbytes res
+if ne rc INF_OK
+ret rc
+end
+inf_dec_store_dst dst_id r get res 0
+end
+ret INF_OK
+end
+
+fn inf_dec_mv_f32 widx ulong b view uchar * src_id uint dst_id uint to int
+rows = get inf_w_rows widx
+cols = get inf_w_cols widx
+res = new f32 1 0.0f32
+wr = new ulong 2 0
+xtmp = new f32 1024 0.0f32
+for c ulong cols bound 1024
+if eq src_id 0
+put xtmp c get inf_st_h c
+end
+if eq src_id 1
+put xtmp c get inf_st_att c
+end
+if eq src_id 2
+put xtmp c get inf_st_gate c
+end
+end
+put wr 0 widx
+for r ulong rows bound 1024
+put wr 1 r
+rc = inf_weight_matvec_row wr b part xtmp 0 cols res
+if ne rc INF_OK
+ret rc
+end
+inf_dec_store_dst dst_id r get res 0
+end
+ret INF_OK
+end
+
+fn inf_dec_mv st view InfDecodeState widx ulong b view uchar * src_id uint dst_id uint to int
+if ne get st use_dotprod 0
+if inf_weight_is_kquant widx
+ret inf_dec_mv_q8 widx b dst_id
+end
+end
+ret inf_dec_mv_f32 widx b src_id dst_id
+end
+
+fn inf_dec_rope_init m view InfModel pos ulong to void
+half = div get m head_dim 2
+theta_scale = inf_powf get m rope_freq_base div -2.0f32 f32 get m head_dim
+theta = f32 pos
+sc = new f32 2 0.0f32
+for i ulong half bound 512
+if ne get m has_rope_fac 0
+inf_sin_cos div theta get inf_norms add get m rope_fac_off i sc
+else
+inf_sin_cos theta sc
+end
+put inf_st_rope mul i 2 get sc 1
+put inf_st_rope add mul i 2 1 get sc 0
+theta = mul theta theta_scale
+end
+end
+
+fn inf_dec_rope_head which uint base ulong half ulong to void
+for i ulong half bound 512
+idx0 = add base mul i 2
+c = get inf_st_rope mul i 2
+s = get inf_st_rope add mul i 2 1
+if eq which 0
+a = get inf_st_q idx0
+b = get inf_st_q add idx0 1
+put inf_st_q idx0 sub mul a c mul b s
+put inf_st_q add idx0 1 add mul a s mul b c
+else
+a = get inf_st_kk idx0
+b = get inf_st_kk add idx0 1
+put inf_st_kk idx0 sub mul a c mul b s
+put inf_st_kk add idx0 1 add mul a s mul b c
+end
+end
+end
+
+fn inf_dec_rope_apply_buf which uint n ulong hd ulong to void
+n_heads = div n hd
+half = div hd 2
+for h ulong n_heads bound 512
+inf_dec_rope_head which mul h hd half
+end
+end
+
+fn inf_dec_gqa_dot qb ulong kb ulong hd ulong to f32
+dot = f32 0.0f32
+for d ulong hd bound 512
+dot = add dot mul get inf_st_q add qb d get inf_kv_k add kb d
+end
+ret dot
+end
+
+fn inf_dec_gqa_acc qb ulong vb ulong hd ulong wt f32 to void
+for d ulong hd bound 512
+cur_a = get inf_st_att add qb d
+put inf_st_att add qb d add cur_a mul wt get inf_kv_v add vb d
+end
+end
+
+fn inf_dec_gqa_softmax npos ulong to void
+mx = get inf_st_scores 0
+for t ulong npos bound 256
+sv = get inf_st_scores t
+if gt sv mx
+mx = sv
+end
+end
+sm = f32 0.0f32
+for t ulong npos bound 256
+ev = inf_exp sub get inf_st_scores t mx
+put inf_st_scores t ev
+sm = add sm ev
+end
+for t ulong npos bound 256
+put inf_st_scores t div get inf_st_scores t sm
+end
+end
+
+fn inf_dec_gqa_head base ulong npos ulong kv_dim ulong qb ulong kvh ulong hd ulong to void
+scale = div 1.0f32 inf_sqrt f32 hd
+for t ulong npos bound 256
+kb = add add base mul t kv_dim kvh
+put inf_st_scores t mul inf_dec_gqa_dot qb kb hd scale
+end
+inf_dec_gqa_softmax npos
+for d ulong hd bound 512
+put inf_st_att add qb d 0.0f32
+end
+for t ulong npos bound 256
+vb = add add base mul t kv_dim kvh
+inf_dec_gqa_acc qb vb hd get inf_st_scores t
+end
+end
+
+fn inf_dec_gqa_attn m view InfModel st view InfDecodeState lyr ulong to void
+kv_dim = get m kv_dim
+hd = get m head_dim
+n_head = ulong get m head_count
+group = div n_head ulong get m head_count_kv
+base = mul mul lyr get st capacity kv_dim
+kvo = add base mul get st pos kv_dim
+for i ulong kv_dim bound 1024
+put inf_kv_k add kvo i get inf_st_kk i
+put inf_kv_v add kvo i get inf_st_vv i
+end
+npos = add get st pos 1
+for h ulong n_head bound 512
+inf_dec_gqa_head base npos kv_dim mul h hd mul div h group hd hd
+end
+end
+
+fn inf_dec_forward_ffn m view InfModel b view uchar * st view InfDecodeState lyr ulong to int
+n_embd = ulong get m embedding_length
+n_ff = ulong get m feed_forward_length
+inf_dec_rms_norm_x_to_h get inf_lyr_ffn_norm lyr n_embd get m rms_norm_eps
+rc = inf_dec_prep st 0 n_embd
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get inf_lyr_wgate lyr b 0 4
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get inf_lyr_wup lyr b 0 5
+if ne rc INF_OK
+ret rc
+end
+for i ulong n_ff bound 1024
+gv = get inf_st_gate i
+put inf_st_gate i mul inf_silu gv get inf_st_up i
+end
+rc = inf_dec_prep st 2 n_ff
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get inf_lyr_wdown lyr b 2 3
+if ne rc INF_OK
+ret rc
+end
+for i ulong n_embd bound 1024
+put inf_st_x i add get inf_st_x i get inf_st_tmp i
+end
+ret INF_OK
+end
+
+fn inf_dec_forward_layer m view InfModel b view uchar * st view InfDecodeState lyr ulong to int
+n_embd = ulong get m embedding_length
+hd = get m head_dim
+inf_dec_rms_norm_x_to_h get inf_lyr_attn_norm lyr n_embd get m rms_norm_eps
+rc = inf_dec_prep st 0 n_embd
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get inf_lyr_wq lyr b 0 0
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get inf_lyr_wk lyr b 0 1
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get inf_lyr_wv lyr b 0 2
+if ne rc INF_OK
+ret rc
+end
+inf_dec_rope_apply_buf 0 n_embd hd
+inf_dec_rope_apply_buf 1 get m kv_dim hd
+inf_dec_gqa_attn m st lyr
+rc = inf_dec_prep st 1 n_embd
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get inf_lyr_wo lyr b 1 3
+if ne rc INF_OK
+ret rc
+end
+for i ulong n_embd bound 1024
+put inf_st_x i add get inf_st_x i get inf_st_tmp i
+end
+ret inf_dec_forward_ffn m b st lyr
+end
+
+fn inf_decode_forward m view InfModel b view uchar * st edit InfDecodeState token uint want_logits bool to int
+if ge token get m vocab_size
+ret INF_ERR_BAD_TOKEN
+end
+pos = get st pos
+if ge pos get st capacity
+ret INF_ERR_CONTEXT_FULL
+end
+n_embd = ulong get m embedding_length
+xtmp = new f32 1024 0.0f32
+rc = inf_weight_row_into get m tok_embd_w b ulong token part xtmp 0 n_embd
+if ne rc INF_OK
+ret rc
+end
+for i ulong n_embd bound 1024
+put inf_st_x i get xtmp i
+end
+inf_dec_rope_init m pos
+n_lyr = ulong get m block_count
+for l ulong n_lyr bound 8
+rc = inf_dec_forward_layer m b st l
+if ne rc INF_OK
+ret rc
+end
+end
+put st pos add pos 1
+if want_logits
+inf_dec_rms_norm_x_to_h get m output_norm_off n_embd get m rms_norm_eps
+rc = inf_dec_prep st 0 n_embd
+if ne rc INF_OK
+ret rc
+end
+rc = inf_dec_mv st get m output_w b 0 6
+if ne rc INF_OK
+ret rc
+end
+end
+ret INF_OK
+end
+
+fn inf_decode_prefill m view InfModel b view uchar * st edit InfDecodeState ids view uint * to int
+n = len ids
+for i ulong n bound 256
+wl = eq add i 1 n
+rc = inf_decode_forward m b st get ids i wl
+if ne rc INF_OK
+ret rc
+end
+end
+ret INF_OK
+end
+
+fn inf_decode_argmax m view InfModel to uint
+nv = ulong get m vocab_size
+best = ulong 0
+if eq nv 0
+ret 0
+end
+bv = get inf_st_logits 0
+for i ulong nv bound 512
+v = get inf_st_logits i
+if gt v bv
+bv = v
+best = i
+end
+end
+ret uint best
+end
+
+fn inf_gen_get_id i ulong to uint
+ret get inf_gen_ids i
+end
+
+fn inf_generate_greedy m view InfModel b view uchar * st edit InfDecodeState max_new ulong stop_id uint to long
+cnt = ulong 0
+for i ulong max_new bound 256
+t = inf_decode_argmax m
+put inf_gen_ids cnt t
+cnt = add cnt 1
+if eq t stop_id
+break
+end
+if eq add i 1 max_new
+break
+end
+rc = inf_decode_forward m b st t true
+if ne rc INF_OK
+ret long rc
+end
+end
+ret long cnt
+end

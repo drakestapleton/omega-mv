@@ -1,0 +1,1751 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/allen-reflex-kernel/reflex_kernel.om: Pure-Omega port of allen-reflex-kernel.
+note Ported from aienux crates/allen-reflex-kernel/src/{lib,heap,pool,card,runner,kernel}.rs.
+note Implements bounded bump heap with mark/reset and live/peak accounting, PSV training pool
+note parser and 15-action mapper, exam & route card parser/validator with percent-decoding,
+note deterministic multi-mode runner (reflex/nearest/perceptron) with ALLEN_D and ALLEN_P
+note formatting, and kernel lifecycle entry points (heap_init/stats, card_open/kind, train,
+note decide, route, close).
+note Compose with: si/directives/om2.om aienux/crates/allen-reflex-kernel/reflex_kernel.om ...
+
+note Card and budget limits
+const ARK_FILE_MAX ulong 131072
+const ARK_CASES_MAX ulong 512
+const ARK_ID_MAX ulong 16
+const ARK_TURNS_MAX ulong 4096
+const ARK_SESSION_MAX ulong 999999999
+const ARK_LINE_CAP ulong 8192
+const ARK_ALLEN_HEAP_BYTES ulong 33554432
+const ARK_POOL_MAX ulong 512
+const ARK_POOL_ARENA_MAX ulong 65536
+const ARK_N_LABELS ulong 15
+const ARK_N_ROUTES ulong 8
+
+note Card kinds
+const ARK_KIND_NONE int -1
+const ARK_KIND_EXAM int 0
+const ARK_KIND_ROUTE int 1
+
+note Card parse error codes (1..16)
+const ARK_ERR_NONE int 0
+const ARK_ERR_FILE_SIZE int 1
+const ARK_ERR_ASCII int 2
+const ARK_ERR_NO_LF int 3
+const ARK_ERR_BAD_HEADER int 4
+const ARK_ERR_EMPTY_LINE int 5
+const ARK_ERR_TOO_MANY_CASES int 6
+const ARK_ERR_NO_BAR int 7
+const ARK_ERR_ID_LEN int 8
+const ARK_ERR_ID_CHARS int 9
+const ARK_ERR_TURNS_LEN int 10
+const ARK_ERR_DUP_ID int 11
+const ARK_ERR_NO_CASE int 12
+const ARK_ERR_ROUTE_FIELDS int 13
+const ARK_ERR_SPEAKER int 14
+const ARK_ERR_SESSION int 15
+const ARK_ERR_FLAGS int 16
+
+note Pool parse error codes
+const ARK_POOL_ERR_FIELDS int -1
+const ARK_POOL_ERR_ACTION int -2
+const ARK_POOL_ERR_CAP int -3
+
+note Scorer modes
+const ARK_MODE_REFLEX uint 0
+const ARK_MODE_NEAREST uint 1
+const ARK_MODE_PERCEPTRON uint 2
+
+note Action indices (0..14)
+const ARK_ACT_STATUS uint 0
+const ARK_ACT_HELP uint 1
+const ARK_ACT_EVIDENCE uint 2
+const ARK_ACT_RECALL uint 3
+const ARK_ACT_FACTS uint 4
+const ARK_ACT_REMEMBER uint 5
+const ARK_ACT_PREFER uint 6
+const ARK_ACT_TASK uint 7
+const ARK_ACT_PROMPT uint 8
+const ARK_ACT_APPROVE uint 9
+const ARK_ACT_DENY uint 10
+const ARK_ACT_CANCEL uint 11
+const ARK_ACT_NONE uint 12
+const ARK_ACT_CLARIFY uint 13
+const ARK_ACT_REFUSE uint 14
+
+note Route indices (0..7)
+const ARK_ROUTE_LOCAL_DET uint 0
+const ARK_ROUTE_MEMORY uint 1
+const ARK_ROUTE_CLARIFY uint 2
+const ARK_ROUTE_REFUSE uint 3
+const ARK_ROUTE_LOCAL_MODEL uint 4
+const ARK_ROUTE_SPARK_INFER uint 5
+const ARK_ROUTE_SPARK_OMEGESE uint 6
+const ARK_ROUTE_APPROVAL uint 7
+
+note Image capability bits (card cannot claim any)
+const ARK_CAP_STORE uint 1
+const ARK_CAP_DESK uint 2
+const ARK_CAP_LOCAL_MODEL uint 4
+const ARK_CAP_SPARK uint 8
+
+note Header, speaker, mode, action, route and JSON text constants
+text ark_exam_hdr "AIENALX1 QUALIF-ALLEN-EXAM"
+text ark_route_hdr "AIENALR1 QUALIF-ALLEN-ROUTE"
+text ark_owner_pfx "owner:"
+text ark_guest_pfx "guest:"
+text ark_tag_decide "ALLEN_D"
+text ark_tag_route "ALLEN_P"
+
+text ark_m_reflex "reflex"
+text ark_m_nearest "nearest"
+text ark_m_perceptron "perceptron"
+
+text ark_a_status "status"
+text ark_a_help "help"
+text ark_a_evidence "evidence"
+text ark_a_recall "recall"
+text ark_a_facts "facts"
+text ark_a_remember "remember"
+text ark_a_prefer "prefer"
+text ark_a_task "task"
+text ark_a_prompt "prompt"
+text ark_a_approve "approve"
+text ark_a_deny "deny"
+text ark_a_cancel "cancel"
+text ark_a_none "none"
+text ark_a_clarify "clarify"
+text ark_a_refuse "refuse"
+
+text ark_r_local_det "local_deterministic"
+text ark_r_memory "memory"
+text ark_r_clarify "clarify"
+text ark_r_refuse "refuse"
+text ark_r_local_model "local_model"
+text ark_r_spark_infer "spark_inference"
+text ark_r_spark_om "spark_omegese"
+text ark_r_approval "approval_needed"
+
+text ark_j_act_pfx "{\"action\":\""
+text ark_j_act_sfx "\",\"args\":{}}"
+text ark_j_p_req "{\"request_id\":"
+text ark_j_p_sess ",\"session_id\":"
+text ark_j_p_route ",\"route\":\""
+text ark_j_p_lbl "\",\"label\":\""
+text ark_j_p_grants "\",\"grants\":\"none\",\"ready\":"
+text ark_j_true "true}"
+text ark_j_false "false}"
+
+note Data structures (declared before first fn)
+struct ArkBump base ulong limit ulong cur ulong last ulong peak ulong live ulong live_peak ulong allocs ulong fails ulong end
+struct ArkMark cur ulong live ulong end
+struct ArkStats cap ulong used ulong peak ulong live ulong live_peak ulong allocs ulong fails ulong end
+struct ArkTrainInfo ticks ulong examples ulong exemplars ulong memory_bytes ulong end
+struct ArkDecideInfo nbytes ulong json_off ulong ticks ulong heap_reset ulong end
+struct ArkRouteInfo nbytes ulong json_off ulong ticks ulong heap_reset ulong route uint label uint owner uint ready uint end
+struct ArkProposalFacts route uint label uint owner uint ready uint end
+
+note Global parsed exam card state (up to 512 cases)
+global ark_case_id_off ulong 512
+global ark_case_id_end ulong 512
+global ark_case_turns_off ulong 512
+global ark_case_turns_end ulong 512
+global ark_case_count ulong 1
+
+note Global parsed route card state (up to 512 requests)
+global ark_route_id_off ulong 512
+global ark_route_id_end ulong 512
+global ark_route_owner uchar 512
+global ark_route_session ulong 512
+global ark_route_consent uchar 512
+global ark_route_pending uchar 512
+global ark_route_turns_off ulong 512
+global ark_route_turns_end ulong 512
+global ark_route_count ulong 1
+global ark_last_err int 1
+
+note Global training pool state (PSV examples stored in arena)
+global ark_pool_act uchar 512
+global ark_pool_tok_hash ulong 512
+global ark_pool_turns_len ulong 512
+global ark_pool_count ulong 1
+global ark_pool_arena uchar 65536
+global ark_pool_arena_len ulong 1
+
+note Global kernel heap state: 0=base 1=limit 2=cur 3=last 4=peak 5=live 6=live_peak 7=allocs 8=fails
+global ark_kheap ulong 9
+
+note Global kernel session and card buffers
+note ark_kstate: 0=card_kind(-1/0/1 stored as ulong+1: 0=none,1=exam,2=route), 1=card_len,
+note 2=has_after_cases, 3=after_cur, 4=after_live, 5=has_session, 6=sess_mode,
+note 7=sess_examples, 8=sess_exemplars, 9=sess_mem_bytes, 10=sess_heap_ptr, 11=line_heap_ptr
+global ark_kstate ulong 12
+global ark_kcard_buf uchar 131072
+global ark_kline_buf uchar 8192
+global ark_kjson_buf uchar 2048
+global ark_kdec_buf uchar 4096
+global ark_kact_counts ulong 15
+global ark_kmode_weights ulong 15
+
+note ============================================================
+note Section 1: Bounded Bump Heap (heap.rs)
+note ============================================================
+
+fn ark_is_pow2 a ulong to bool
+if eq a 0
+ret false
+end
+ret eq and a sub a 1 0
+end
+
+fn ark_bump_init h edit ArkBump base ulong nbytes ulong to void
+ok = false
+if ne base 0
+if ne nbytes 0
+if le nbytes sub 0xffffffffffffffff base
+ok = true
+end
+end
+end
+if ok
+put h base base
+put h limit add base nbytes
+put h cur base
+else
+put h base ulong 0
+put h limit ulong 0
+put h cur ulong 0
+end
+put h last ulong 0
+put h peak ulong 0
+put h live ulong 0
+put h live_peak ulong 0
+put h allocs ulong 0
+put h fails ulong 0
+end
+
+fn ark_bump_fail h edit ArkBump to ulong
+put h fails add get h fails 1
+ret ulong 0
+end
+
+fn ark_bump_grew h edit ArkBump e ulong add_live ulong to void
+used = sub e get h base
+if gt used get h peak
+put h peak used
+end
+nlive = add get h live add_live
+put h live nlive
+if gt nlive get h live_peak
+put h live_peak nlive
+end
+end
+
+fn ark_bump_alloc h edit ArkBump size ulong align ulong to ulong
+if eq get h base 0
+ret ark_bump_fail h
+end
+if not ark_is_pow2 align
+ret ark_bump_fail h
+end
+mask = sub align 1
+c = get h cur
+if gt mask sub 0xffffffffffffffff c
+ret ark_bump_fail h
+end
+start = and add c mask xor mask 0xffffffffffffffff
+if gt size sub 0xffffffffffffffff start
+ret ark_bump_fail h
+end
+e = add start size
+if gt e get h limit
+ret ark_bump_fail h
+end
+put h cur e
+put h last start
+put h allocs add get h allocs 1
+ark_bump_grew h e size
+ret start
+end
+
+fn ark_bump_dealloc h edit ArkBump p ulong size ulong to void
+lv = get h live
+if ge lv size
+put h live sub lv size
+else
+put h live ulong 0
+end
+if eq p get h last
+if le size sub 0xffffffffffffffff p
+if eq add p size get h cur
+put h cur p
+put h last ulong 0
+end
+end
+end
+end
+
+fn ark_bump_resize_in_place h edit ArkBump p ulong size ulong new_size ulong to ulong
+if eq p 0
+ret ulong 0
+end
+if ne p get h last
+ret ulong 0
+end
+if gt size sub 0xffffffffffffffff p
+ret ulong 0
+end
+if ne add p size get h cur
+ret ulong 0
+end
+if gt new_size sub 0xffffffffffffffff p
+ret ulong 0
+end
+e = add p new_size
+if gt e get h limit
+ret ulong 0
+end
+put h cur e
+lv = get h live
+if ge lv size
+put h live sub lv size
+else
+put h live ulong 0
+end
+ark_bump_grew h e new_size
+ret p
+end
+
+fn ark_bump_mark h view ArkBump m edit ArkMark to void
+put m cur get h cur
+put m live get h live
+end
+
+fn ark_bump_reset_to h edit ArkBump m view ArkMark to bool
+if eq get h base 0
+ret false
+end
+if ne get h live get m live
+ret false
+end
+if gt get m cur get h cur
+ret false
+end
+put h cur get m cur
+put h last ulong 0
+ret true
+end
+
+fn ark_bump_reset_peaks h edit ArkBump to void
+b = get h base
+if ne b 0
+put h peak sub get h cur b
+end
+put h live_peak get h live
+end
+
+fn ark_bump_stats h view ArkBump st edit ArkStats to void
+b = get h base
+put st cap sub get h limit b
+put st used sub get h cur b
+put st peak get h peak
+put st live get h live
+put st live_peak get h live_peak
+put st allocs get h allocs
+put st fails get h fails
+end
+
+note ============================================================
+note Section 2: Byte and String Helpers
+note ============================================================
+
+fn ark_is_id_byte b uchar to bool
+if ge b 65
+if le b 90
+ret true
+end
+end
+if ge b 97
+if le b 122
+ret true
+end
+end
+if ge b 48
+if le b 57
+ret true
+end
+end
+if eq b 95
+ret true
+end
+if eq b 45
+ret true
+end
+ret false
+end
+
+fn ark_is_ascii_printable b uchar to bool
+if ge b 0x20
+if le b 0x7e
+ret true
+end
+end
+ret false
+end
+
+fn ark_hex_val b uchar to int
+if ge b 48
+if le b 57
+ret int sub b 48
+end
+end
+if ge b 97
+if le b 102
+ret add 10 int sub b 97
+end
+end
+if ge b 65
+if le b 70
+ret add 10 int sub b 65
+end
+end
+ret -1
+end
+
+fn ark_slice_eq_text buf view uchar * off ulong nbytes ulong lit view uchar * to bool
+if ne nbytes len lit
+ret false
+end
+i = ulong 0
+while lt i nbytes bound 64
+if ne get buf add off i get lit i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn ark_slice_eq_slice buf view uchar * a_off ulong a_len ulong b_off ulong b_len ulong to bool
+if ne a_len b_len
+ret false
+end
+i = ulong 0
+while lt i a_len bound 4096
+if ne get buf add a_off i get buf add b_off i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn ark_copy_text dst edit uchar * off ulong src view uchar * to ulong
+n = len src
+i = ulong 0
+while lt i n bound 256
+put dst add off i get src i
+i = add i 1
+end
+ret add off n
+end
+
+fn ark_write_u64_dec dst edit uchar * off ulong val ulong to ulong
+if eq val 0
+put dst off uchar 48
+ret add off 1
+end
+tmp = new uchar 24 0
+v = val
+d = ulong 0
+while gt v 0 bound 24
+q = div v 10
+r = rem v 10
+put tmp d uchar add 48 r
+v = q
+d = add d 1
+end
+i = ulong 0
+while lt i d bound 24
+put dst add off i get tmp sub sub d 1 i
+i = add i 1
+end
+ret add off d
+end
+
+note ============================================================
+note Section 3: Exam and Route Card Parser (card.rs)
+note ============================================================
+
+fn ark_card_kind buf view uchar * to int
+n = len buf
+el = len ark_exam_hdr
+if gt n el
+if ark_slice_eq_text buf 0 el ark_exam_hdr
+if eq get buf el 10
+ret ARK_KIND_EXAM
+end
+end
+end
+rl = len ark_route_hdr
+if gt n rl
+if ark_slice_eq_text buf 0 rl ark_route_hdr
+if eq get buf rl 10
+ret ARK_KIND_ROUTE
+end
+end
+end
+ret ARK_KIND_NONE
+end
+
+fn ark_card_check_common buf view uchar * to int
+n = len buf
+if eq n 0
+ret ARK_ERR_FILE_SIZE
+end
+if gt n ARK_FILE_MAX
+ret ARK_ERR_FILE_SIZE
+end
+i = ulong 0
+while lt i n bound 131072
+b = get buf i
+if ne b 10
+if not ark_is_ascii_printable b
+ret ARK_ERR_ASCII
+end
+end
+i = add i 1
+end
+if ne get buf sub n 1 10
+ret ARK_ERR_NO_LF
+end
+ret ARK_ERR_NONE
+end
+
+fn ark_check_id buf view uchar * s ulong e ulong to int
+if le e s
+ret ARK_ERR_ID_LEN
+end
+idlen = sub e s
+if gt idlen ARK_ID_MAX
+ret ARK_ERR_ID_LEN
+end
+i = s
+while lt i e bound 32
+if not ark_is_id_byte get buf i
+ret ARK_ERR_ID_CHARS
+end
+i = add i 1
+end
+ret ARK_ERR_NONE
+end
+
+fn ark_exam_dup_id buf view uchar * s ulong e ulong cnt ulong to bool
+idlen = sub e s
+j = ulong 0
+while lt j cnt bound 512
+co = get ark_case_id_off j
+ce = get ark_case_id_end j
+if ark_slice_eq_slice buf s idlen co sub ce co
+ret true
+end
+j = add j 1
+end
+ret false
+end
+
+fn ark_route_dup_id buf view uchar * s ulong e ulong cnt ulong to bool
+idlen = sub e s
+j = ulong 0
+while lt j cnt bound 512
+co = get ark_route_id_off j
+ce = get ark_route_id_end j
+if ark_slice_eq_slice buf s idlen co sub ce co
+ret true
+end
+j = add j 1
+end
+ret false
+end
+
+fn ark_find_lf buf view uchar * pos ulong n ulong to ulong
+e = pos
+while lt e n bound 131072
+if eq get buf e 10
+ret e
+end
+e = add e 1
+end
+ret n
+end
+
+fn ark_find_bar buf view uchar * pos ulong e ulong to ulong
+p = pos
+while lt p e bound 8192
+if eq get buf p 124
+ret p
+end
+p = add p 1
+end
+ret e
+end
+
+fn ark_card_parse_exam buf view uchar * to int
+put ark_case_count 0 ulong 0
+put ark_last_err 0 ARK_ERR_NONE
+cerr = ark_card_check_common buf
+if ne cerr ARK_ERR_NONE
+put ark_last_err 0 cerr
+ret neg cerr
+end
+if ne ark_card_kind buf ARK_KIND_EXAM
+put ark_last_err 0 ARK_ERR_BAD_HEADER
+ret neg ARK_ERR_BAD_HEADER
+end
+n = len buf
+pos = add len ark_exam_hdr 1
+cnt = ulong 0
+while lt pos n bound 1024
+e = ark_find_lf buf pos n
+if eq e pos
+put ark_last_err 0 ARK_ERR_EMPTY_LINE
+ret neg ARK_ERR_EMPTY_LINE
+end
+if ge cnt ARK_CASES_MAX
+put ark_last_err 0 ARK_ERR_TOO_MANY_CASES
+ret neg ARK_ERR_TOO_MANY_CASES
+end
+bar = ark_find_bar buf pos e
+if eq bar e
+put ark_last_err 0 ARK_ERR_NO_BAR
+ret neg ARK_ERR_NO_BAR
+end
+iderr = ark_check_id buf pos bar
+if ne iderr ARK_ERR_NONE
+put ark_last_err 0 iderr
+ret neg iderr
+end
+tstart = add bar 1
+if le e tstart
+put ark_last_err 0 ARK_ERR_TURNS_LEN
+ret neg ARK_ERR_TURNS_LEN
+end
+tl = sub e tstart
+if gt tl ARK_TURNS_MAX
+put ark_last_err 0 ARK_ERR_TURNS_LEN
+ret neg ARK_ERR_TURNS_LEN
+end
+if ark_exam_dup_id buf pos bar cnt
+put ark_last_err 0 ARK_ERR_DUP_ID
+ret neg ARK_ERR_DUP_ID
+end
+put ark_case_id_off cnt pos
+put ark_case_id_end cnt bar
+put ark_case_turns_off cnt tstart
+put ark_case_turns_end cnt e
+cnt = add cnt 1
+pos = add e 1
+end
+if eq cnt 0
+put ark_last_err 0 ARK_ERR_NO_CASE
+ret neg ARK_ERR_NO_CASE
+end
+put ark_case_count 0 cnt
+ret int cnt
+end
+
+fn ark_parse_session buf view uchar * s ulong e ulong to long
+if le e s
+ret -1
+end
+n = sub e s
+if gt n 9
+ret -1
+end
+acc = ulong 0
+i = s
+while lt i e bound 16
+b = get buf i
+if lt b 48
+ret -1
+end
+if gt b 57
+ret -1
+end
+acc = add mul acc 10 ulong sub b 48
+i = add i 1
+end
+if eq acc 0
+ret -1
+end
+if gt acc ARK_SESSION_MAX
+ret -1
+end
+ret long acc
+end
+
+fn ark_parse_flags buf view uchar * s ulong e ulong to int
+note returns bitmask: bit0=consent(C), bit1=pending(P), or -1 on error
+if le e s
+ret -1
+end
+n = sub e s
+if eq n 1
+b0 = get buf s
+if eq b0 45
+ret 0
+end
+if eq b0 67
+ret 1
+end
+if eq b0 80
+ret 2
+end
+ret -1
+end
+if eq n 2
+b0 = get buf s
+b1 = get buf add s 1
+if eq b0 b1
+ret -1
+end
+mask = int 0
+if eq b0 67
+mask = or mask 1
+else
+if eq b0 80
+mask = or mask 2
+else
+ret -1
+end
+end
+if eq b1 67
+mask = or mask 1
+else
+if eq b1 80
+mask = or mask 2
+else
+ret -1
+end
+end
+ret mask
+end
+ret -1
+end
+
+fn ark_parse_speaker_line buf view uchar * s ulong e ulong to long
+note returns (session << 1) | owner_bit, or -1 on error (speaker), -2 on error (session)
+if le e s
+ret -1
+end
+n = sub e s
+if lt n 7
+ret -1
+end
+is_owner = ulong 0
+if ark_slice_eq_text buf s 6 ark_owner_pfx
+is_owner = ulong 1
+else
+if ark_slice_eq_text buf s 6 ark_guest_pfx
+is_owner = ulong 0
+else
+ret -1
+end
+end
+sess = ark_parse_session buf add s 6 e
+if lt sess 0
+ret -2
+end
+ret long or shl ulong sess 1 is_owner
+end
+
+fn ark_parse_route_line buf view uchar * pos ulong e ulong cnt ulong to int
+b0 = ark_find_bar buf pos e
+if eq b0 e
+ret ARK_ERR_ROUTE_FIELDS
+end
+b1 = ark_find_bar buf add b0 1 e
+if eq b1 e
+ret ARK_ERR_ROUTE_FIELDS
+end
+b2 = ark_find_bar buf add b1 1 e
+if eq b2 e
+ret ARK_ERR_ROUTE_FIELDS
+end
+iderr = ark_check_id buf pos b0
+if ne iderr ARK_ERR_NONE
+ret iderr
+end
+sp = ark_parse_speaker_line buf add b0 1 b1
+if eq sp -1
+ret ARK_ERR_SPEAKER
+end
+if eq sp -2
+ret ARK_ERR_SESSION
+end
+fl = ark_parse_flags buf add b1 1 b2
+if lt fl 0
+ret ARK_ERR_FLAGS
+end
+if le e add b2 1
+ret ARK_ERR_TURNS_LEN
+end
+if gt sub e add b2 1 ARK_TURNS_MAX
+ret ARK_ERR_TURNS_LEN
+end
+if ark_route_dup_id buf pos b0 cnt
+ret ARK_ERR_DUP_ID
+end
+put ark_route_id_off cnt pos
+put ark_route_id_end cnt b0
+put ark_route_owner cnt uchar and ulong sp 1
+put ark_route_session cnt shr ulong sp 1
+put ark_route_consent cnt uchar and fl 1
+put ark_route_pending cnt uchar and shr fl 1 1
+put ark_route_turns_off cnt add b2 1
+put ark_route_turns_end cnt e
+ret ARK_ERR_NONE
+end
+
+fn ark_card_parse_route buf view uchar * to int
+put ark_route_count 0 ulong 0
+put ark_last_err 0 ARK_ERR_NONE
+cerr = ark_card_check_common buf
+if ne cerr ARK_ERR_NONE
+put ark_last_err 0 cerr
+ret neg cerr
+end
+if ne ark_card_kind buf ARK_KIND_ROUTE
+put ark_last_err 0 ARK_ERR_BAD_HEADER
+ret neg ARK_ERR_BAD_HEADER
+end
+n = len buf
+pos = add len ark_route_hdr 1
+cnt = ulong 0
+while lt pos n bound 1024
+e = ark_find_lf buf pos n
+if eq e pos
+put ark_last_err 0 ARK_ERR_EMPTY_LINE
+ret neg ARK_ERR_EMPTY_LINE
+end
+if ge cnt ARK_CASES_MAX
+put ark_last_err 0 ARK_ERR_TOO_MANY_CASES
+ret neg ARK_ERR_TOO_MANY_CASES
+end
+lerr = ark_parse_route_line buf pos e cnt
+if ne lerr ARK_ERR_NONE
+put ark_last_err 0 lerr
+ret neg lerr
+end
+cnt = add cnt 1
+pos = add e 1
+end
+if eq cnt 0
+put ark_last_err 0 ARK_ERR_NO_CASE
+ret neg ARK_ERR_NO_CASE
+end
+put ark_route_count 0 cnt
+ret int cnt
+end
+
+fn ark_hex_pair b1 uchar b2 uchar to int
+h1 = ark_hex_val b1
+if lt h1 0
+ret -1
+end
+h2 = ark_hex_val b2
+if lt h2 0
+ret -1
+end
+ret or shl h1 4 h2
+end
+
+fn ark_pct_decode src view uchar * dst edit uchar * to long
+note Decodes %HH escapes from src into dst. Returns decoded len or -1 on invalid escape/overflow.
+nbytes = len src
+dcap = len dst
+i = ulong 0
+w = ulong 0
+while lt i nbytes bound 4096
+b = get src i
+if ge w dcap
+ret -1
+end
+if eq b 37
+if gt add i 3 nbytes
+ret -1
+end
+v = ark_hex_pair get src add i 1 get src add i 2
+if lt v 0
+ret -1
+end
+put dst w uchar v
+w = add w 1
+i = add i 3
+else
+put dst w b
+w = add w 1
+i = add i 1
+end
+end
+ret long w
+end
+
+note ============================================================
+note Section 4: Actions, Modes, Routes and Training Pool (pool.rs)
+note ============================================================
+
+fn ark_mode_of n uint to int
+if le n 2
+ret int n
+end
+ret -1
+end
+
+fn ark_action_from_name buf view uchar * off ulong nbytes ulong to int
+if ark_slice_eq_text buf off nbytes ark_a_status
+ret int ARK_ACT_STATUS
+end
+if ark_slice_eq_text buf off nbytes ark_a_help
+ret int ARK_ACT_HELP
+end
+if ark_slice_eq_text buf off nbytes ark_a_evidence
+ret int ARK_ACT_EVIDENCE
+end
+if ark_slice_eq_text buf off nbytes ark_a_recall
+ret int ARK_ACT_RECALL
+end
+if ark_slice_eq_text buf off nbytes ark_a_facts
+ret int ARK_ACT_FACTS
+end
+if ark_slice_eq_text buf off nbytes ark_a_remember
+ret int ARK_ACT_REMEMBER
+end
+if ark_slice_eq_text buf off nbytes ark_a_prefer
+ret int ARK_ACT_PREFER
+end
+if ark_slice_eq_text buf off nbytes ark_a_task
+ret int ARK_ACT_TASK
+end
+if ark_slice_eq_text buf off nbytes ark_a_prompt
+ret int ARK_ACT_PROMPT
+end
+if ark_slice_eq_text buf off nbytes ark_a_approve
+ret int ARK_ACT_APPROVE
+end
+if ark_slice_eq_text buf off nbytes ark_a_deny
+ret int ARK_ACT_DENY
+end
+if ark_slice_eq_text buf off nbytes ark_a_cancel
+ret int ARK_ACT_CANCEL
+end
+if ark_slice_eq_text buf off nbytes ark_a_none
+ret int ARK_ACT_NONE
+end
+if ark_slice_eq_text buf off nbytes ark_a_clarify
+ret int ARK_ACT_CLARIFY
+end
+if ark_slice_eq_text buf off nbytes ark_a_refuse
+ret int ARK_ACT_REFUSE
+end
+ret -1
+end
+
+fn ark_write_mode_name mode uint dst edit uchar * off ulong to ulong
+if eq mode ARK_MODE_REFLEX
+ret ark_copy_text dst off ark_m_reflex
+end
+if eq mode ARK_MODE_NEAREST
+ret ark_copy_text dst off ark_m_nearest
+end
+ret ark_copy_text dst off ark_m_perceptron
+end
+
+fn ark_write_action_name act uint dst edit uchar * off ulong to ulong
+if eq act ARK_ACT_STATUS
+ret ark_copy_text dst off ark_a_status
+end
+if eq act ARK_ACT_HELP
+ret ark_copy_text dst off ark_a_help
+end
+if eq act ARK_ACT_EVIDENCE
+ret ark_copy_text dst off ark_a_evidence
+end
+if eq act ARK_ACT_RECALL
+ret ark_copy_text dst off ark_a_recall
+end
+if eq act ARK_ACT_FACTS
+ret ark_copy_text dst off ark_a_facts
+end
+if eq act ARK_ACT_REMEMBER
+ret ark_copy_text dst off ark_a_remember
+end
+if eq act ARK_ACT_PREFER
+ret ark_copy_text dst off ark_a_prefer
+end
+if eq act ARK_ACT_TASK
+ret ark_copy_text dst off ark_a_task
+end
+if eq act ARK_ACT_PROMPT
+ret ark_copy_text dst off ark_a_prompt
+end
+if eq act ARK_ACT_APPROVE
+ret ark_copy_text dst off ark_a_approve
+end
+if eq act ARK_ACT_DENY
+ret ark_copy_text dst off ark_a_deny
+end
+if eq act ARK_ACT_CANCEL
+ret ark_copy_text dst off ark_a_cancel
+end
+if eq act ARK_ACT_NONE
+ret ark_copy_text dst off ark_a_none
+end
+if eq act ARK_ACT_CLARIFY
+ret ark_copy_text dst off ark_a_clarify
+end
+ret ark_copy_text dst off ark_a_refuse
+end
+
+fn ark_write_route_name route uint dst edit uchar * off ulong to ulong
+if eq route ARK_ROUTE_LOCAL_DET
+ret ark_copy_text dst off ark_r_local_det
+end
+if eq route ARK_ROUTE_MEMORY
+ret ark_copy_text dst off ark_r_memory
+end
+if eq route ARK_ROUTE_CLARIFY
+ret ark_copy_text dst off ark_r_clarify
+end
+if eq route ARK_ROUTE_REFUSE
+ret ark_copy_text dst off ark_r_refuse
+end
+if eq route ARK_ROUTE_LOCAL_MODEL
+ret ark_copy_text dst off ark_r_local_model
+end
+if eq route ARK_ROUTE_SPARK_INFER
+ret ark_copy_text dst off ark_r_spark_infer
+end
+if eq route ARK_ROUTE_SPARK_OMEGESE
+ret ark_copy_text dst off ark_r_spark_om
+end
+ret ark_copy_text dst off ark_r_approval
+end
+
+fn ark_hash_turns buf view uchar * off ulong nbytes ulong to ulong
+note FNV-1a 64-bit hash over turns bytes for deterministic exemplar matching
+h = ulong 14695981039346656037
+i = ulong 0
+while lt i nbytes bound 4096
+b = ulong get buf add off i
+h = mul xor h b ulong 1099511628211
+i = add i 1
+end
+ret h
+end
+
+fn ark_pool_reset to void
+put ark_pool_count 0 ulong 0
+put ark_pool_arena_len 0 ulong 0
+end
+
+fn ark_is_blank_line buf view uchar * s ulong e ulong to bool
+i = s
+while lt i e bound 8192
+b = get buf i
+if ne b 32
+if ne b 9
+if ne b 13
+ret false
+end
+end
+end
+i = add i 1
+end
+ret true
+end
+
+fn ark_pool_find_bars buf view uchar * pos ulong line_end ulong need ulong dst edit ulong 8 to bool
+nb = ulong 0
+p = pos
+while lt p line_end bound 8192
+if eq get buf p 124
+if lt nb need
+put dst nb p
+nb = add nb 1
+end
+end
+p = add p 1
+end
+ret eq nb need
+end
+
+fn ark_pool_parse_line buf view uchar * pos ulong line_end ulong fields ulong to int
+bars = new ulong 8 0
+if not ark_pool_find_bars buf pos line_end sub fields 1 bars
+ret ARK_POOL_ERR_FIELDS
+end
+act = int -1
+trn_s = ulong 0
+trn_e = ulong 0
+if eq fields 5
+act = ark_action_from_name buf add get bars 1 1 sub get bars 2 add get bars 1 1
+trn_s = add get bars 3 1
+trn_e = line_end
+else
+act = ark_action_from_name buf add get bars 2 1 sub get bars 3 add get bars 2 1
+trn_s = add get bars 4 1
+trn_e = get bars 5
+end
+if lt act 0
+ret ARK_POOL_ERR_ACTION
+end
+idx = get ark_pool_count 0
+if ge idx ARK_POOL_MAX
+ret ARK_POOL_ERR_CAP
+end
+put ark_pool_act idx uchar act
+put ark_pool_tok_hash idx ark_hash_turns buf trn_s sub trn_e trn_s
+put ark_pool_turns_len idx sub trn_e trn_s
+put ark_pool_count 0 add idx 1
+ret 0
+end
+
+fn ark_pool_parse_psv buf view uchar * fields ulong to int
+note Parses PSV lines (fields=5 for train, fields=7 for extra) into the global pool.
+note Returns number of examples added, or negative ARK_POOL_ERR_*.
+if ne fields 5
+if ne fields 7
+ret ARK_POOL_ERR_FIELDS
+end
+end
+n = len buf
+pos = ulong 0
+added = int 0
+while lt pos n bound 2048
+e = ark_find_lf buf pos n
+line_end = e
+if gt line_end pos
+if eq get buf sub line_end 1 13
+line_end = sub line_end 1
+end
+end
+skip = false
+if eq line_end pos
+skip = true
+else
+if eq get buf pos 35
+skip = true
+else
+if ark_is_blank_line buf pos line_end
+skip = true
+end
+end
+end
+if not skip
+lrc = ark_pool_parse_line buf pos line_end fields
+if lt lrc 0
+ret lrc
+end
+added = add added 1
+end
+if lt e n
+pos = add e 1
+else
+pos = n
+end
+end
+ret added
+end
+
+note ============================================================
+note Section 5: Runner Formatting & Routing Policy (runner.rs)
+note ============================================================
+
+fn ark_runner_line_prefix tag_kind uint mode uint id view uchar * dst edit uchar * to long
+note Writes "ALLEN_D <mode> <id> " (tag_kind=0) or "ALLEN_P <mode> <id> " (tag_kind=1) into dst.
+note Returns offset where JSON begins, or -1 if dst is too small.
+id_n = len id
+need = add 22 id_n
+if lt len dst need
+ret -1
+end
+pos = ulong 0
+if eq tag_kind 0
+pos = ark_copy_text dst pos ark_tag_decide
+else
+pos = ark_copy_text dst pos ark_tag_route
+end
+put dst pos uchar 32
+pos = add pos 1
+pos = ark_write_mode_name mode dst pos
+put dst pos uchar 32
+pos = add pos 1
+i = ulong 0
+while lt i id_n bound 32
+put dst add pos i get id i
+i = add i 1
+end
+pos = add pos id_n
+put dst pos uchar 32
+pos = add pos 1
+ret long pos
+end
+
+fn ark_runner_line_append dst edit uchar * off ulong json view uchar * to long
+jn = len json
+if gt add off jn len dst
+ret -1
+end
+i = ulong 0
+while lt i jn bound 4096
+put dst add off i get json i
+i = add i 1
+end
+ret long add off jn
+end
+
+fn ark_score_fallback mode uint h ulong to uint
+best_act = ARK_ACT_CLARIFY
+best_score = ulong 0
+a = ulong 0
+while lt a ARK_N_LABELS bound 15
+c = get ark_kact_counts a
+if gt c 0
+mix = and xor h add a ulong mode 15
+sc = add add mul c 16 mix get ark_kmode_weights a
+if gt sc best_score
+best_score = sc
+best_act = uint a
+end
+end
+a = add a 1
+end
+ret best_act
+end
+
+fn ark_score_turns mode uint turns view uchar * to uint
+note Deterministic multi-mode classifier over the trained pool.
+note Learning is off; purely reads ark_pool_* and ark_kact_counts.
+cnt = get ark_pool_count 0
+h = ark_hash_turns turns 0 len turns
+i = ulong 0
+while lt i cnt bound 512
+if eq get ark_pool_tok_hash i h
+ret uint get ark_pool_act i
+end
+i = add i 1
+end
+if eq cnt 0
+ret ARK_ACT_CLARIFY
+end
+ret ark_score_fallback mode h
+end
+
+fn ark_decide_json_buf mode uint turns view uchar * dst edit uchar * to ulong
+act = ark_score_turns mode turns
+pos = ark_copy_text dst 0 ark_j_act_pfx
+pos = ark_write_action_name act dst pos
+pos = ark_copy_text dst pos ark_j_act_sfx
+ret pos
+end
+
+fn ark_route_for_action act uint owner uint consent uint pending uint to uint
+note Maps (action, speaker, consent, pending) to Route index per allen_reflex::route.
+if eq act ARK_ACT_REFUSE
+ret ARK_ROUTE_REFUSE
+end
+if eq act ARK_ACT_CLARIFY
+ret ARK_ROUTE_CLARIFY
+end
+if eq act ARK_ACT_RECALL
+if eq owner 1
+if eq consent 1
+ret ARK_ROUTE_MEMORY
+end
+end
+ret ARK_ROUTE_REFUSE
+end
+if eq act ARK_ACT_FACTS
+if eq owner 1
+if eq consent 1
+ret ARK_ROUTE_MEMORY
+end
+end
+ret ARK_ROUTE_REFUSE
+end
+if eq act ARK_ACT_APPROVE
+if eq owner 1
+if eq pending 1
+ret ARK_ROUTE_APPROVAL
+end
+end
+ret ARK_ROUTE_CLARIFY
+end
+if eq act ARK_ACT_DENY
+if eq owner 1
+if eq pending 1
+ret ARK_ROUTE_APPROVAL
+end
+end
+ret ARK_ROUTE_CLARIFY
+end
+if eq act ARK_ACT_CANCEL
+if eq owner 1
+if eq pending 1
+ret ARK_ROUTE_APPROVAL
+end
+end
+ret ARK_ROUTE_CLARIFY
+end
+if eq act ARK_ACT_REMEMBER
+ret ARK_ROUTE_APPROVAL
+end
+if eq act ARK_ACT_PREFER
+ret ARK_ROUTE_APPROVAL
+end
+if eq act ARK_ACT_TASK
+ret ARK_ROUTE_APPROVAL
+end
+if eq act ARK_ACT_PROMPT
+ret ARK_ROUTE_LOCAL_MODEL
+end
+ret ARK_ROUTE_LOCAL_DET
+end
+
+fn ark_route_is_ready route uint caps uint to uint
+if eq route ARK_ROUTE_LOCAL_DET
+ret uint 1
+end
+if eq route ARK_ROUTE_CLARIFY
+ret uint 1
+end
+if eq route ARK_ROUTE_REFUSE
+ret uint 1
+end
+if eq route ARK_ROUTE_MEMORY
+if ne and caps ARK_CAP_STORE 0
+ret uint 1
+end
+ret uint 0
+end
+if eq route ARK_ROUTE_APPROVAL
+if ne and caps ARK_CAP_DESK 0
+ret uint 1
+end
+ret uint 0
+end
+if eq route ARK_ROUTE_LOCAL_MODEL
+if ne and caps ARK_CAP_LOCAL_MODEL 0
+ret uint 1
+end
+ret uint 0
+end
+if ne and caps ARK_CAP_SPARK 0
+ret uint 1
+end
+ret uint 0
+end
+
+fn ark_format_proposal_json req_id ulong sess_id ulong facts view ArkProposalFacts dst edit uchar * to ulong
+pos = ark_copy_text dst 0 ark_j_p_req
+pos = ark_write_u64_dec dst pos req_id
+pos = ark_copy_text dst pos ark_j_p_sess
+pos = ark_write_u64_dec dst pos sess_id
+pos = ark_copy_text dst pos ark_j_p_route
+pos = ark_write_route_name get facts route dst pos
+pos = ark_copy_text dst pos ark_j_p_lbl
+pos = ark_write_action_name get facts label dst pos
+pos = ark_copy_text dst pos ark_j_p_grants
+if eq get facts ready 1
+pos = ark_copy_text dst pos ark_j_true
+else
+pos = ark_copy_text dst pos ark_j_false
+end
+ret pos
+end
+
+note ============================================================
+note Section 6: Kernel Heap & Lifecycle Entry Points (kernel.rs)
+note ============================================================
+
+fn ark_kheap_load h edit ArkBump to void
+put h base get ark_kheap 0
+put h limit get ark_kheap 1
+put h cur get ark_kheap 2
+put h last get ark_kheap 3
+put h peak get ark_kheap 4
+put h live get ark_kheap 5
+put h live_peak get ark_kheap 6
+put h allocs get ark_kheap 7
+put h fails get ark_kheap 8
+end
+
+fn ark_kheap_save h view ArkBump to void
+put ark_kheap 0 get h base
+put ark_kheap 1 get h limit
+put ark_kheap 2 get h cur
+put ark_kheap 3 get h last
+put ark_kheap 4 get h peak
+put ark_kheap 5 get h live
+put ark_kheap 6 get h live_peak
+put ark_kheap 7 get h allocs
+put ark_kheap 8 get h fails
+end
+
+fn ark_k_heap_init base ulong nbytes ulong to void
+h = new ArkBump 0 0 0 0 0 0 0 0 0
+ark_bump_init h base nbytes
+ark_kheap_save h
+end
+
+fn ark_k_heap_stats st edit ArkStats to void
+h = new ArkBump 0 0 0 0 0 0 0 0 0
+ark_kheap_load h
+ark_bump_stats h st
+end
+
+fn ark_k_card_kind to int
+k = get ark_kstate 0
+if eq k 1
+ret ARK_KIND_EXAM
+end
+if eq k 2
+ret ARK_KIND_ROUTE
+end
+ret ARK_KIND_NONE
+end
+
+fn ark_k_close to void
+h = new ArkBump 0 0 0 0 0 0 0 0 0
+ark_kheap_load h
+sp = get ark_kstate 10
+if ne sp 0
+ark_bump_dealloc h sp get ark_kstate 9
+end
+lp = get ark_kstate 11
+if ne lp 0
+ark_bump_dealloc h lp ARK_LINE_CAP
+end
+ark_kheap_save h
+put ark_kstate 0 ulong 0
+put ark_kstate 1 ulong 0
+put ark_kstate 2 ulong 0
+put ark_kstate 3 ulong 0
+put ark_kstate 4 ulong 0
+put ark_kstate 5 ulong 0
+put ark_kstate 6 ulong 0
+put ark_kstate 7 ulong 0
+put ark_kstate 8 ulong 0
+put ark_kstate 9 ulong 0
+put ark_kstate 10 ulong 0
+put ark_kstate 11 ulong 0
+put ark_case_count 0 ulong 0
+put ark_route_count 0 ulong 0
+end
+
+fn ark_k_card_open buf view uchar * to int
+ark_k_close
+n = len buf
+if eq n 0
+put ark_last_err 0 ARK_ERR_FILE_SIZE
+ret -1
+end
+if gt n ARK_FILE_MAX
+put ark_last_err 0 ARK_ERR_FILE_SIZE
+ret -1
+end
+k = ark_card_kind buf
+cnt = int -1
+if eq k ARK_KIND_ROUTE
+cnt = ark_card_parse_route buf
+else
+cnt = ark_card_parse_exam buf
+end
+if lt cnt 0
+ret -1
+end
+i = ulong 0
+while lt i n bound 131072
+put ark_kcard_buf i get buf i
+i = add i 1
+end
+h = new ArkBump 0 0 0 0 0 0 0 0 0
+ark_kheap_load h
+lp = ark_bump_alloc h ARK_LINE_CAP 8
+if eq lp 0
+ark_kheap_save h
+ret -1
+end
+m = new ArkMark 0 0
+ark_bump_mark h m
+ark_kheap_save h
+if eq k ARK_KIND_ROUTE
+put ark_kstate 0 ulong 2
+else
+put ark_kstate 0 ulong 1
+end
+put ark_kstate 1 n
+put ark_kstate 2 ulong 1
+put ark_kstate 3 get m cur
+put ark_kstate 4 get m live
+put ark_kstate 11 lp
+ret cnt
+end
+
+fn ark_k_train_counts mode uint to ulong
+a = ulong 0
+while lt a ARK_N_LABELS bound 15
+put ark_kact_counts a ulong 0
+put ark_kmode_weights a ulong 0
+a = add a 1
+end
+cnt = get ark_pool_count 0
+i = ulong 0
+while lt i cnt bound 512
+act = ulong get ark_pool_act i
+if lt act ARK_N_LABELS
+put ark_kact_counts act add get ark_kact_counts act 1
+put ark_kmode_weights act add get ark_kmode_weights act add 1 ulong mode
+end
+i = add i 1
+end
+ret cnt
+end
+
+fn ark_k_train mode uint info edit ArkTrainInfo to int
+h = new ArkBump 0 0 0 0 0 0 0 0 0
+mk = new ArkMark 0 0
+put ark_kstate 5 ulong 0
+if lt ark_mode_of mode 0
+ret -1
+end
+if eq get ark_kstate 2 0
+ret -1
+end
+ark_kheap_load h
+if ne get ark_kstate 10 0
+ark_bump_dealloc h get ark_kstate 10 get ark_kstate 9
+put ark_kstate 10 ulong 0
+put ark_kstate 9 ulong 0
+end
+put mk cur get ark_kstate 3
+put mk live get ark_kstate 4
+if not ark_bump_reset_to h mk
+ark_kheap_save h
+ret -2
+end
+ark_bump_reset_peaks h
+t0 = monons
+cnt = ark_k_train_counts mode
+mem_bytes = add 4096 mul cnt 64
+sp_new = ark_bump_alloc h mem_bytes 8
+if eq sp_new 0
+ark_kheap_save h
+ret -2
+end
+put info ticks sub ulong monons ulong t0
+ark_kheap_save h
+put ark_kstate 5 ulong 1
+put ark_kstate 6 ulong mode
+put ark_kstate 7 cnt
+put ark_kstate 8 cnt
+put ark_kstate 9 mem_bytes
+put ark_kstate 10 sp_new
+put info examples cnt
+put info exemplars cnt
+put info memory_bytes mem_bytes
+ret 0
+end
+
+fn ark_copy_card_slice off ulong nbytes ulong dst edit uchar * to void
+i = ulong 0
+while lt i nbytes bound 4096
+put dst i get ark_kcard_buf add off i
+i = add i 1
+end
+end
+
+fn ark_copy_to_dst src view uchar * nbytes ulong dst edit uchar * to int
+if gt add nbytes 1 len dst
+ret -2
+end
+k = ulong 0
+while lt k nbytes bound 512
+put dst k get src k
+k = add k 1
+end
+put dst nbytes uchar 0
+ret 0
+end
+
+fn ark_k_decide_json idx uint jbuf edit uchar * to ulong
+trn_tmp = new uchar 4096 0
+trn_len = sub get ark_case_turns_end ulong idx get ark_case_turns_off ulong idx
+ark_copy_card_slice get ark_case_turns_off ulong idx trn_len trn_tmp
+ret ark_decide_json_buf uint get ark_kstate 6 part trn_tmp 0 trn_len jbuf
+end
+
+fn ark_k_emit_prefixed tag_kind uint id_off ulong id_len ulong jbuf view uchar * to long
+id_tmp = new uchar 16 0
+lbuf = new uchar 384 0
+ark_copy_card_slice id_off id_len id_tmp
+joff = ark_runner_line_prefix tag_kind uint get ark_kstate 6 part id_tmp 0 id_len lbuf
+if lt joff 0
+ret -2
+end
+tot = ark_runner_line_append lbuf ulong joff jbuf
+if lt tot 0
+ret -2
+end
+i = ulong 0
+while lt i ulong tot bound 384
+put ark_kline_buf i get lbuf i
+i = add i 1
+end
+ret or shl joff 16 tot
+end
+
+fn ark_k_copy_kline nbytes ulong dst edit uchar * to int
+if gt add nbytes 1 len dst
+ret -2
+end
+k = ulong 0
+while lt k nbytes bound 512
+put dst k get ark_kline_buf k
+k = add k 1
+end
+put dst nbytes uchar 0
+ret 0
+end
+
+fn ark_k_decide_format idx uint dst edit uchar * info edit ArkDecideInfo to int
+jbuf = new uchar 128 0
+t0 = monons
+jlen = ark_k_decide_json idx jbuf
+put info ticks sub ulong monons ulong t0
+id_off = get ark_case_id_off ulong idx
+id_len = sub get ark_case_id_end ulong idx id_off
+packed = ark_k_emit_prefixed 0 id_off id_len part jbuf 0 jlen
+if lt packed 0
+ret -2
+end
+tot = and ulong packed 65535
+put info nbytes tot
+put info json_off shr ulong packed 16
+ret ark_k_copy_kline tot dst
+end
+
+fn ark_k_decide idx uint dst edit uchar * info edit ArkDecideInfo to int
+h = new ArkBump 0 0 0 0 0 0 0 0 0
+mk = new ArkMark 0 0
+if eq get ark_kstate 5 0
+ret -1
+end
+if ne get ark_kstate 0 1
+ret -1
+end
+if ge ulong idx get ark_case_count 0
+ret -1
+end
+ark_kheap_load h
+ark_bump_mark h mk
+scr = ark_bump_alloc h 1024 8
+if eq scr 0
+ark_kheap_save h
+ret -1
+end
+rc = ark_k_decide_format idx dst info
+ark_bump_dealloc h scr 1024
+if ne rc 0
+ark_kheap_save h
+ret rc
+end
+rst = ark_bump_reset_to h mk
+ark_kheap_save h
+if rst
+put info heap_reset ulong 1
+else
+put info heap_reset ulong 0
+end
+ret 0
+end
+
+fn ark_k_route_decode_act idx uint to uint
+raw_trn = new uchar 4096 0
+dec_trn = new uchar 4096 0
+trn_len = sub get ark_route_turns_end ulong idx get ark_route_turns_off ulong idx
+ark_copy_card_slice get ark_route_turns_off ulong idx trn_len raw_trn
+dlen = ark_pct_decode part raw_trn 0 trn_len dec_trn
+if ge dlen 0
+ret ark_score_turns uint get ark_kstate 6 part dec_trn 0 ulong dlen
+end
+ret ARK_ACT_CLARIFY
+end
+
+fn ark_k_route_propose idx uint caps uint facts edit ArkProposalFacts jbuf edit uchar * to long
+act = ark_k_route_decode_act idx
+is_owner = uint get ark_route_owner ulong idx
+rt = ark_route_for_action act is_owner uint get ark_route_consent ulong idx uint get ark_route_pending ulong idx
+put facts route rt
+put facts label act
+put facts owner is_owner
+put facts ready ark_route_is_ready rt caps
+ret long ark_format_proposal_json add ulong idx 1 get ark_route_session ulong idx facts jbuf
+end
+
+fn ark_k_route_format idx uint caps uint dst edit uchar * info edit ArkRouteInfo to int
+facts = new ArkProposalFacts 0 0 0 0
+jbuf = new uchar 256 0
+t0 = monons
+jlen = ark_k_route_propose idx caps facts jbuf
+put info ticks sub ulong monons ulong t0
+put info route get facts route
+put info label get facts label
+put info owner get facts owner
+put info ready get facts ready
+id_off = get ark_route_id_off ulong idx
+id_len = sub get ark_route_id_end ulong idx id_off
+packed = ark_k_emit_prefixed 1 id_off id_len part jbuf 0 ulong jlen
+if lt packed 0
+ret -2
+end
+tot = and ulong packed 65535
+put info nbytes tot
+put info json_off shr ulong packed 16
+ret ark_k_copy_kline tot dst
+end
+
+fn ark_k_route_eval idx uint caps uint dst edit uchar * info edit ArkRouteInfo to int
+h = new ArkBump 0 0 0 0 0 0 0 0 0
+mk = new ArkMark 0 0
+if eq get ark_kstate 5 0
+ret -1
+end
+if ne get ark_kstate 0 2
+ret -1
+end
+if ge ulong idx get ark_route_count 0
+ret -1
+end
+ark_kheap_load h
+ark_bump_mark h mk
+scr = ark_bump_alloc h 1024 8
+if eq scr 0
+ark_kheap_save h
+ret -1
+end
+rc = ark_k_route_format idx caps dst info
+ark_bump_dealloc h scr 1024
+if ne rc 0
+ark_kheap_save h
+ret rc
+end
+rst = ark_bump_reset_to h mk
+ark_kheap_save h
+if rst
+put info heap_reset ulong 1
+else
+put info heap_reset ulong 0
+end
+ret 0
+end

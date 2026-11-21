@@ -1,0 +1,964 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-kernel/sec_continuity_test.om:
+note Behavioral test suite for sec_continuity.om.
+note Returns 0 on pass, distinct non-zero exit code on every failure.
+
+text T_HI "Hi There"
+text T_JEFE "Jefe"
+text T_JEFE_MSG "what do ya want for nothing?"
+text T_RFC4231_C6 "Test Using Larger Than Block-Size Key - Hash Key First"
+text T_ENV_PT "Sovereign AIENOS M5 Encrypted State"
+text T_ENV_CONF "Confidential branch checkpoint"
+text T_WAL_E1 "boot_start"
+text T_WAL_E2 "cortex_mount"
+text T_WAL_E3 "corrupted_entry_here"
+text T_WAL_CP "checkpoint"
+text T_SAME "same"
+text T_SAME_B "same"
+text T_SAMF "samf"
+text T_SAME2 "same!"
+
+fn t_fill b edit uchar * v uchar to void
+n = len b
+for i ulong n bound 1048576
+put b i v
+end
+end
+
+fn t_hex_nibble c uchar to ulong
+v = ulong c
+if ge v 48
+if le v 57
+ret sub v 48
+end
+end
+if ge v 97
+if le v 102
+ret add 10 sub v 97
+end
+end
+trap 8
+end
+
+fn t_from_hex h view uchar * dst edit uchar * to void
+n = div len h 2
+for i ulong n bound 4096
+hi = t_hex_nibble get h mul i 2
+lo = t_hex_nibble get h add mul i 2 1
+put dst i uchar or shl hi 4 lo
+end
+end
+
+text H_HMAC1 "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+text H_HMAC2 "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+text H_HMAC6 "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+text H_HKDF1_PRK "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+text H_HKDF1_OKM "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+text H_HKDF2_PRK "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04"
+text H_HKDF2_OKM "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+text H_OPAUTH_KAT "f6162da5f879e9bd4defc7108c463b5d164f4db68ae991781bf798fc14907aaa"
+
+note 1. Test HMAC-SHA256 & constant_time_eq
+fn test_hmac to int
+k20 = new uchar 20 0x0b
+k131 = new uchar 131 0xaa
+tag = new uchar 32 0
+exp = new uchar 32 0
+ksc_hmac_sha256 k20 T_HI tag
+t_from_hex H_HMAC1 exp
+if not ksc_ct_eq tag exp
+ret 1
+end
+ksc_hmac_sha256 T_JEFE T_JEFE_MSG tag
+t_from_hex H_HMAC2 exp
+if not ksc_ct_eq tag exp
+ret 2
+end
+ksc_hmac_sha256 k131 T_RFC4231_C6 tag
+t_from_hex H_HMAC6 exp
+if not ksc_ct_eq tag exp
+ret 3
+end
+if not ksc_ct_eq T_SAME T_SAME_B
+ret 4
+end
+if ksc_ct_eq T_SAME T_SAMF
+ret 5
+end
+if ksc_ct_eq T_SAME T_SAME2
+ret 6
+end
+ret 0
+end
+
+note 2. Test HKDF-SHA256
+fn test_hkdf to int
+ikm = new uchar 22 0x0b
+salt1 = new uchar 13 0
+info1 = new uchar 10 0
+prk = new uchar 32 0
+exp_prk = new uchar 32 0
+okm = new uchar 42 0
+exp_okm = new uchar 42 0
+too_long = new uchar 8161 0
+for i ulong 13 unroll
+put salt1 i uchar and i 0xff
+end
+for i ulong 10 unroll
+put info1 i uchar and add 0xf0 i 0xff
+end
+ksc_hkdf_extract salt1 ikm prk
+t_from_hex H_HKDF1_PRK exp_prk
+if not ksc_ct_eq prk exp_prk
+ret 10
+end
+if ne ksc_hkdf_expand prk info1 okm KSC_HKDF_OK
+ret 11
+end
+t_from_hex H_HKDF1_OKM exp_okm
+if not ksc_ct_eq okm exp_okm
+ret 12
+end
+ksc_hkdf_extract part salt1 0 0 ikm prk
+t_from_hex H_HKDF2_PRK exp_prk
+if not ksc_ct_eq prk exp_prk
+ret 13
+end
+if ne ksc_hkdf_expand prk part info1 0 0 okm KSC_HKDF_OK
+ret 14
+end
+t_from_hex H_HKDF2_OKM exp_okm
+if not ksc_ct_eq okm exp_okm
+ret 15
+end
+if ne ksc_hkdf_expand prk part info1 0 0 too_long KSC_HKDF_ERR_TOO_LONG
+ret 16
+end
+ret 0
+end
+
+note 3. Test M5 Streaming Envelope (small, empty, multi-chunk, tamper, hostile headers)
+fn test_envelope to int
+params = new uchar 72 0
+dparams = new uchar 48 0
+meta = new ulong 4 0
+dmeta = new ulong 4 0
+env = new uchar 256 0
+dec = new uchar 256 0
+exp = new ulong 1 0
+t_fill part params 0 32 uchar 0x42
+t_fill part params 32 16 uchar 0x11
+t_fill part params 48 16 uchar 0x22
+t_fill part params 64 8 uchar 0x33
+ksc_copy dparams part params 0 48
+put meta 0 16
+put meta 1 1
+put meta 2 100
+put meta 3 0
+elen = ksc_env_encrypt params meta T_ENV_PT env
+if ne elen add 64 add len T_ENV_PT 16
+ret 20
+end
+put dmeta 0 16
+put dmeta 1 1
+rc = ksc_env_decrypt dparams dmeta part env 0 elen dec
+if ne rc KSC_ENV_OK
+ret 21
+end
+if ne get dmeta 2 len T_ENV_PT
+ret 22
+end
+if not ksc_ct_eq part dec 0 len T_ENV_PT T_ENV_PT
+ret 23
+end
+note Cross-store UUID mismatch
+put dparams 32 uchar 0x99
+if ne ksc_env_decrypt dparams dmeta part env 0 elen dec KSC_ENV_ERR_AUTH
+ret 24
+end
+put dparams 32 uchar 0x11
+note Mismatched object kind
+put dmeta 0 21
+if ne ksc_env_decrypt dparams dmeta part env 0 elen dec KSC_ENV_ERR_AUTH
+ret 25
+end
+put dmeta 0 16
+note Bit-flip in ciphertext
+put env 69 uchar xor ulong get env 69 1
+if ne ksc_env_decrypt dparams dmeta part env 0 elen dec KSC_ENV_ERR_AUTH
+ret 26
+end
+note Empty plaintext roundtrip
+elen0 = ksc_env_encrypt params meta part T_ENV_PT 0 0 env
+if ne elen0 80
+ret 27
+end
+if ne ksc_env_decrypt dparams dmeta part env 0 80 dec KSC_ENV_OK
+ret 28
+end
+if ne get dmeta 2 0
+ret 29
+end
+note Hostile header checks
+ksc_put_u64le env 20 0xffffffffffffffff
+if ne ksc_env_decrypt dparams dmeta part env 0 80 dec KSC_ENV_ERR_TOO_LARGE
+ret 30
+end
+ksc_put_u64le env 20 KSC_ENV_MAX_PT
+if ne ksc_env_decrypt dparams dmeta part env 0 80 dec KSC_ENV_ERR_LEN
+ret 31
+end
+note Expected length overflow checks
+if ne ksc_env_expected_len 1 0xffffffffffffffff exp KSC_ENV_ERR_OVERFLOW
+ret 32
+end
+if ne ksc_env_expected_len 0 1 exp KSC_ENV_ERR_CHUNK
+ret 33
+end
+ret 0
+end
+
+note 3b. Test multi-chunk envelope & late-chunk tamper wipe
+fn test_envelope_multichunk to int
+params = new uchar 72 0
+dparams = new uchar 48 0
+meta = new ulong 4 0
+dmeta = new ulong 4 0
+pt = new uchar 200 0
+env = new uchar 400 0
+dec = new uchar 200 0
+t_fill part params 0 32 uchar 0xaa
+t_fill part params 32 16 uchar 0xbb
+t_fill part params 48 16 uchar 0xcc
+t_fill part params 64 8 uchar 0xdd
+ksc_copy dparams part params 0 48
+for i ulong 200 bound 200
+put pt i uchar and rem i 251 0xff
+end
+note Use chunk_size = 64 => 4 chunks (64, 64, 64, 8)
+put meta 0 18
+put meta 1 1
+put meta 2 42
+put meta 3 64
+elen = ksc_env_encrypt params meta pt env
+if ne elen ulong 328
+ret 34
+end
+put dmeta 0 18
+put dmeta 1 1
+if ne ksc_env_decrypt dparams dmeta part env 0 elen dec KSC_ENV_OK
+ret 35
+end
+if not ksc_ct_eq dec pt
+ret 36
+end
+note Corrupt last chunk tag -> must reject AND wipe dec
+put env sub elen 1 uchar xor ulong get env sub elen 1 1
+if ne ksc_env_decrypt dparams dmeta part env 0 elen dec KSC_ENV_ERR_AUTH
+ret 37
+end
+if not ksc_is_zero part dec 0 192
+ret 38
+end
+ret 0
+end
+
+note 4a. Test Security Subkeys and KeySlots
+fn test_security_keys to int
+kvol = new uchar 32 0x5a
+subk = new uchar 128 0
+slot = new uchar 128 0
+kek = new uchar 32 0x88
+wkek = new uchar 32 0x99
+nonce = new uchar 12 0x33
+unw = new uchar 32 0
+ksc_derive_subkeys kvol subk
+ksc_copy unw part subk 0 32
+if ksc_ct_eq unw part subk 32 32
+ret 40
+end
+if ksc_ct_eq unw part subk 64 32
+ret 41
+end
+if ksc_ct_eq unw part subk 96 32
+ret 42
+end
+if ksc_ct_eq unw kvol
+ret 43
+end
+put slot 0 uchar 3
+ksc_put_u32le slot 4 0
+ksc_put_u64le slot 8 1
+if ne ksc_keyslot_wrap slot kek kvol nonce KSC_SEC_OK
+ret 44
+end
+if ne ksc_keyslot_desc_validate slot KSC_SEC_OK
+ret 45
+end
+if ne ksc_keyslot_unwrap slot kek unw KSC_SEC_OK
+ret 46
+end
+if not ksc_ct_eq unw kvol
+ret 47
+end
+if ne ksc_keyslot_unwrap slot wkek unw KSC_SEC_ERR_AUTH
+ret 48
+end
+ret 0
+end
+
+note 4b. Test SecurityManifest, MigrationManifest, Anti-Rollback
+fn test_security_manifests to int
+sec = new uchar 256 0
+mig = new uchar 288 0
+kauth = new uchar 32 0x44
+wkauth = new uchar 32 0x55
+d1 = new uchar 32 0xaa
+d1b = new uchar 32 0xaa
+d2 = new uchar 32 0xbb
+ksc_copy part sec 0 8 KSC_TXT_SEC_MAGIC
+ksc_put_u16le sec 8 1
+ksc_put_u64le sec 32 10
+ksc_put_u64le sec 40 1
+ksc_put_u64le sec 48 5
+ksc_sec_manifest_sign sec kauth
+if ne ksc_sec_manifest_validate sec KSC_SEC_OK
+ret 49
+end
+if not ksc_sec_manifest_verify sec kauth
+ret 50
+end
+if ksc_sec_manifest_verify sec wkauth
+ret 51
+end
+ksc_copy part mig 0 8 KSC_TXT_MIG_MAGIC
+ksc_put_u16le mig 8 1
+if ne ksc_mig_manifest_validate mig KSC_SEC_OK
+ret 52
+end
+if ne ksc_eval_anti_rollback 1 10 10 d1 d1b KSC_ARB_VALID_RESUME
+ret 53
+end
+if ne ksc_eval_anti_rollback 1 10 11 d1 d2 KSC_ARB_PREPARED_ADVANCE
+ret 54
+end
+if ne ksc_eval_anti_rollback 1 10 9 d1 d1b KSC_ARB_ROLLBACK_STALE
+ret 55
+end
+if ne ksc_eval_anti_rollback 1 10 10 d1 d2 KSC_ARB_ROLLBACK_DIGEST
+ret 56
+end
+if ne ksc_eval_anti_rollback 1 10 12 d1 d2 KSC_ARB_INCONSISTENT_EPOCH
+ret 57
+end
+if ne ksc_eval_anti_rollback 0 0 1 d1 d2 KSC_ARB_PREPARED_ADVANCE
+ret 58
+end
+ret 0
+end
+
+note 5. Test BudgetManager & Watchdog Policy
+fn test_budget to int
+mgr = new ulong 132 0
+env = new ulong 4 0
+exp = new ulong 8 0
+al = new ulong 1 0
+st = new ulong 1 0
+put env 0 100
+put env 1 4
+put env 2 32
+put env 3 10
+ksc_budget_init mgr 2
+if ne ksc_budget_admit mgr 7 env 0 0 KSC_BERR_OK
+ret 60
+end
+if ne ksc_budget_charge_cpu mgr 7 101 KSC_BERR_CPU
+ret 61
+end
+if ne ksc_budget_charge_frames mgr 7 5 KSC_BERR_FRAMES
+ret 62
+end
+if ne ksc_budget_charge_dma mgr 7 33 KSC_BERR_DMA
+ret 63
+end
+if ne ksc_budget_charge_frames mgr 7 4 KSC_BERR_OK
+ret 64
+end
+if ne ksc_budget_release_frames mgr 7 2 KSC_BERR_OK
+ret 65
+end
+if ne ksc_budget_charge_frames mgr 7 2 KSC_BERR_OK
+ret 66
+end
+if ne ksc_budget_release_frames mgr 7 5 KSC_BERR_BAD_RELEASE
+ret 67
+end
+note Watchdog pet, expiry, sticky quarantine, restore
+if ne ksc_budget_check mgr 9 exp 0
+ret 68
+end
+if ne ksc_budget_pet mgr 7 8 KSC_BERR_OK
+ret 69
+end
+if ne ksc_budget_check mgr 17 exp 0
+ret 70
+end
+if ne ksc_budget_check mgr 18 exp 1
+ret 71
+end
+if ne get exp 0 7
+ret 72
+end
+if ne ksc_budget_charge_cpu mgr 7 1 KSC_BERR_QUARANTINED
+ret 73
+end
+if ne ksc_budget_pet mgr 7 20 KSC_BERR_QUARANTINED
+ret 74
+end
+if ne ksc_budget_restore mgr 7 20 KSC_BERR_OK
+ret 75
+end
+if ne ksc_budget_state mgr 7 st KSC_BERR_OK
+ret 76
+end
+if ne get st 0 KSC_WSTATE_ACTIVE
+ret 77
+end
+note Forge policy scaling
+if ne ksc_budget_admit mgr 1 env 1 0 KSC_BERR_OK
+ret 78
+end
+if ne ksc_budget_cpu_allowance mgr 1 al KSC_BERR_OK
+ret 79
+end
+if ne get al 0 10
+ret 80
+end
+ksc_budget_set_mode mgr KSC_BMODE_IDLE
+if ne ksc_budget_cpu_allowance mgr 1 al KSC_BERR_OK
+ret 81
+end
+if ne get al 0 80
+ret 82
+end
+ksc_budget_set_mode mgr KSC_BMODE_URGENT
+if ne ksc_budget_cpu_allowance mgr 1 al KSC_BERR_OK
+ret 83
+end
+if ne get al 0 150
+ret 84
+end
+note Counter wrap regression: start = u64::MAX - 4, max_rt = 10
+ksc_budget_init mgr 4
+start = sub ulong 0xffffffffffffffff 4
+if ne ksc_budget_admit mgr 1 env 0 start KSC_BERR_OK
+ret 85
+end
+if ne ksc_budget_check mgr 0xffffffffffffffff exp 0
+ret 86
+end
+if ne ksc_budget_check mgr add start 9 exp 0
+ret 87
+end
+if ne ksc_budget_check mgr add start 10 exp 1
+ret 88
+end
+note Overflow safety at u64::MAX
+ksc_budget_init mgr 1
+put env 0 0xffffffffffffffff
+put env 1 0xffffffffffffffff
+put env 2 0xffffffffffffffff
+put env 3 0xffffffffffffffff
+if ne ksc_budget_admit mgr 1 env 0 0xfffffffffffffffe KSC_BERR_OK
+ret 89
+end
+if ne ksc_budget_charge_cpu mgr 1 0xffffffffffffffff KSC_BERR_OK
+ret 90
+end
+if ne ksc_budget_charge_cpu mgr 1 1 KSC_BERR_CPU
+ret 91
+end
+if ne ksc_budget_check mgr 0xffffffffffffffff exp 0
+ret 92
+end
+ret 0
+end
+
+note 6a. Test OperatorAuth and SlotManager
+fn test_recovery_auth to int
+key = new uchar 32 0
+ch = new uchar 32 0
+kat = new uchar 32 0
+resp = new uchar 32 0
+bad = new uchar 32 0
+sm = new ulong 5 0
+for i ulong 32 unroll
+put key i uchar and i 0xff
+put ch i uchar and add 0xa0 i 0xff
+end
+t_from_hex H_OPAUTH_KAT kat
+ksc_opauth_expected_response key ch resp
+if not ksc_ct_eq resp kat
+ret 100
+end
+if not ksc_opauth_verify key ch kat
+ret 101
+end
+ksc_copy bad kat
+put bad 17 uchar xor ulong get bad 17 4
+if ksc_opauth_verify key ch bad
+ret 102
+end
+ksc_hmac_sha256 key ch bad
+if ksc_opauth_verify key ch bad
+ret 103
+end
+ksc_zeroize bad
+if ksc_opauth_verify key ch bad
+ret 104
+end
+ksc_slotmgr_init sm
+if ksc_slotmgr_record_attempt sm
+ret 105
+end
+if ksc_slotmgr_record_attempt sm
+ret 106
+end
+if not ksc_slotmgr_record_attempt sm
+ret 107
+end
+if ne get sm 0 KSC_SLOT_B
+ret 108
+end
+if ne get sm 1 KSC_HEALTH_FAILED
+ret 109
+end
+ksc_slotmgr_mark_healthy sm
+if ne get sm 2 KSC_HEALTH_CONFIRMED
+ret 110
+end
+ret 0
+end
+
+note 6b. Test WalRecovery truncation & overflow protection
+fn test_recovery_wal to int
+wbuf = new uchar 512 0
+wres = new ulong 2 0
+n1 = ksc_wal_encode_entry T_WAL_E1 wbuf
+n2 = ksc_wal_encode_entry T_WAL_E2 part wbuf n1 sub 512 n1
+off2 = add n1 n2
+ksc_wal_recover part wbuf 0 off2 wres
+if ne get wres 0 2
+ret 111
+end
+if ne get wres 1 off2
+ret 112
+end
+n3 = ksc_wal_encode_entry T_WAL_E3 part wbuf off2 sub 512 off2
+put wbuf add off2 40 uchar xor ulong get wbuf add off2 40 0xff
+ksc_wal_recover part wbuf 0 add off2 n3 wres
+if ne get wres 0 2
+ret 113
+end
+if ne get wres 1 off2
+ret 114
+end
+ksc_put_u32be wbuf 0 0xffffffff
+ksc_wal_recover part wbuf 0 100 wres
+if ne get wres 0 0
+ret 115
+end
+ret 0
+end
+
+note 6b. Test Recovery Core applicability & challenge binding
+fn test_recovery_core to int
+key = new uchar 32 0x0f
+resp = new uchar 32 0
+suuid = new uchar 16 0x5a
+sdig1 = new uchar 32 0x33
+sdig2 = new uchar 32 0x44
+ch1 = new uchar 32 0
+ch2 = new uchar 32 0
+ch3 = new uchar 32 0
+if ne ksc_recovery_applicable KSC_MOUNT_DEGRADED KSC_REASON_DEGRADED KSC_PEER_MALFORMED 1 KSC_ACT_REPAIR_DEGRADED_PEER
+ret 116
+end
+if ne ksc_recovery_applicable KSC_MOUNT_DEGRADED KSC_REASON_DEGRADED KSC_PEER_MALFORMED 0 KSC_ACT_NONE
+ret 117
+end
+if ne ksc_recovery_applicable KSC_MOUNT_DEGRADED KSC_REASON_DEGRADED KSC_PEER_GRAPH_BAD_NEWER 1 KSC_ACT_NONE
+ret 118
+end
+if ne ksc_recovery_applicable KSC_MOUNT_VALID KSC_REASON_UNPROVISIONED KSC_PEER_ZERO 0 KSC_ACT_PROVISION_IDENTITY
+ret 119
+end
+ksc_recovery_challenge suuid 7 KSC_ACT_REPAIR_DEGRADED_PEER sdig1 ch1
+ksc_recovery_challenge suuid 7 KSC_ACT_REPAIR_DEGRADED_PEER sdig2 ch2
+ksc_recovery_challenge suuid 7 KSC_ACT_PROVISION_IDENTITY sdig1 ch3
+if ksc_ct_eq ch1 ch2
+ret 120
+end
+if ksc_ct_eq ch1 ch3
+ret 121
+end
+ksc_opauth_expected_response key ch1 resp
+if ne ksc_recovery_authorise KSC_ACT_REPAIR_DEGRADED_PEER KSC_ACT_REPAIR_DEGRADED_PEER key ch1 resp KSC_REC_OK
+ret 122
+end
+if ne ksc_recovery_authorise KSC_ACT_REPAIR_DEGRADED_PEER KSC_ACT_PROVISION_IDENTITY key ch1 resp KSC_REC_ERR_NOT_APPLICABLE
+ret 123
+end
+if ne ksc_recovery_authorise KSC_ACT_REPAIR_DEGRADED_PEER KSC_ACT_REPAIR_DEGRADED_PEER key ch2 resp KSC_REC_ERR_UNAUTHORISED
+ret 124
+end
+ret 0
+end
+
+note 7a. Test Continuity AgentRoot, Manifest, CortexWalSegment
+fn test_continuity_objs to int
+agent = new uchar 32 0x11
+uuid = new uchar 16 0x5a
+root_buf = new uchar 112 0
+rmeta = new ulong 2 0
+mani = new uchar 168 0
+mmeta = new ulong 3 0
+wseg = new uchar 96 0
+wmeta = new ulong 2 0
+if ne ksc_agent_root_encode agent uuid 2 1 root_buf 112
+ret 130
+end
+if ne ksc_agent_root_decode root_buf rmeta KSC_CERR_OK
+ret 131
+end
+if ne get rmeta 0 2
+ret 132
+end
+put root_buf 64 uchar xor ulong get root_buf 64 1
+if ne ksc_agent_root_decode root_buf rmeta KSC_CERR_ROOT_BRANCH
+ret 133
+end
+ksc_cont_write_hdr mani KSC_TXT_MAGIC_MANI 120
+put mani 16 uchar 0xa1
+ksc_put_u64le mani 80 1
+ksc_put_u64le mani 88 1
+if ne ksc_manifest_decode part mani 0 136 mmeta KSC_CERR_OK
+ret 134
+end
+put mani 48 uchar 0xd4
+if ne ksc_manifest_decode part mani 0 136 mmeta KSC_CERR_SEQ_PREV
+ret 135
+end
+ksc_put_u64le mani 80 2
+if ne ksc_manifest_decode part mani 0 136 mmeta KSC_CERR_OK
+ret 136
+end
+ksc_cont_write_hdr wseg KSC_TXT_MAGIC_CWAL 56
+ksc_put_u64le wseg 16 3
+ksc_put_u32le wseg 24 1
+put wseg 32 uchar 6
+ksc_put_u16le wseg 34 4
+put wseg 68 uchar 65
+put wseg 69 uchar 66
+put wseg 70 uchar 67
+put wseg 71 uchar 68
+if ne ksc_wal_seg_decode part wseg 0 72 wmeta KSC_CERR_OK
+ret 144
+end
+put wseg 32 uchar 7
+if ne ksc_wal_seg_decode part wseg 0 72 wmeta KSC_CERR_EPISTEMIC
+ret 145
+end
+ret 0
+end
+
+note 7b. Test Continuity AgentState branch table & hostile fork sum
+fn test_continuity_branches to int
+agent = new uchar 32 0x11
+st_buf = new uchar 512 0
+rb = new uchar 32 0
+c0 = new uchar 32 0
+c1 = new uchar 32 0
+c2 = new uchar 32 0
+slen = ksc_agent_state_genesis agent 1 st_buf
+if ne slen 144
+ret 137
+end
+if ne ksc_agent_state_validate part st_buf 0 slen KSC_CERR_OK
+ret 138
+end
+ksc_root_branch_id agent rb
+slen = ksc_agent_state_fork st_buf slen rb c0
+if ne slen 224
+ret 139
+end
+if ne ksc_agent_state_validate part st_buf 0 slen KSC_CERR_OK
+ret 140
+end
+ri = ksc_state_find_branch part st_buf 0 slen 2 rb
+ci = sub 1 ri
+roff = add add 64 mul ri 80 72
+coff = add add 64 mul ci 80 72
+ksc_put_u64le st_buf roff 0xffffffffffffffff
+ksc_put_u64le st_buf coff 2
+if ne ksc_agent_state_validate part st_buf 0 slen KSC_CERR_FORK_SUM
+ret 141
+end
+ksc_put_u64le st_buf roff 1
+ksc_put_u64le st_buf coff 0
+slen = ksc_agent_state_fork st_buf slen rb c1
+slen = ksc_agent_state_fork st_buf slen c0 c2
+if ne slen 384
+ret 142
+end
+if ne ksc_agent_state_validate part st_buf 0 slen KSC_CERR_OK
+ret 143
+end
+ret 0
+end
+
+fn test_admission_res_check to int
+lim = new ulong 9 0
+req = new ulong 9 0
+avail = new ulong 9 0
+put lim 0 1
+put lim 1 1
+put lim 2 1
+put lim 3 1
+put lim 6 10
+put lim 7 20
+put lim 8 16
+for i ulong 9 unroll
+put req i get lim i
+put avail i get lim i
+end
+if ne ksc_admission_check_resources req lim avail KSC_AERR_OK
+ret 165
+end
+put avail 2 0
+if ne ksc_admission_check_resources req lim avail KSC_AERR_RESOURCE_LIMIT
+ret 166
+end
+ret 0
+end
+
+note 8a. Test Admission Policy canonical digest
+fn test_admission to int
+lim = new ulong 9 0
+pol1 = new uchar 1088 0
+pol2 = new uchar 1088 0
+r1 = new uchar 48 0
+r2 = new uchar 48 0
+fp1 = new uchar 32 0x45
+fp2 = new uchar 32 0x99
+pd1 = new uchar 32 0
+pd2 = new uchar 32 0
+put lim 0 1
+put lim 1 1
+put lim 2 1
+put lim 3 1
+put lim 6 10
+put lim 7 20
+put lim 8 16
+if ne ksc_policy_init pol1 lim KSC_AERR_OK
+ret 150
+end
+if ne ksc_policy_init pol2 lim KSC_AERR_OK
+ret 151
+end
+ksc_put_u16le r1 0 KSC_CAP_OBJECT
+ksc_put_u32le r1 4 7
+ksc_put_u32le r1 8 KSC_RIGHT_READ
+ksc_put_u32le r1 12 1
+ksc_put_u32le r1 16 4
+ksc_put_u64le r1 24 4
+ksc_put_u64le r1 32 0
+ksc_put_u64le r1 40 4
+ksc_copy r2 r1
+ksc_put_u32le r2 4 9
+if ne ksc_policy_add_rule pol1 r1 KSC_AERR_OK
+ret 152
+end
+if ne ksc_policy_add_rule pol1 r2 KSC_AERR_OK
+ret 153
+end
+if ne ksc_policy_add_rule pol2 r2 KSC_AERR_OK
+ret 154
+end
+if ne ksc_policy_add_rule pol2 r1 KSC_AERR_OK
+ret 155
+end
+if ne ksc_policy_allow_signer pol1 fp1 KSC_AERR_OK
+ret 156
+end
+if ne ksc_policy_allow_signer pol2 fp1 KSC_AERR_OK
+ret 157
+end
+if ne ksc_policy_digest pol1 pd1 ulong 192
+ret 158
+end
+if ne ksc_policy_digest pol2 pd2 ulong 192
+ret 159
+end
+if not ksc_ct_eq pd1 pd2
+ret 160
+end
+if ne ksc_policy_allow_signer pol2 fp2 KSC_AERR_OK
+ret 161
+end
+if eq ksc_policy_digest pol2 pd2 0
+ret 162
+end
+if ksc_ct_eq pd1 pd2
+ret 162
+end
+ret test_admission_caps pol1 r1
+end
+
+fn test_admission_caps pol1 view uchar 1088 r1 view uchar 48 to int
+req_rw = new uchar 48 0
+grants = new uchar 768 0
+gdig = new uchar 32 0
+ksc_copy req_rw r1
+ksc_put_u32le req_rw 8 or KSC_RIGHT_READ KSC_RIGHT_WRITE
+if ne ksc_policy_eval_caps pol1 req_rw 1 grants gdig 1
+ret 163
+end
+if ne ksc_get_u32le grants 8 KSC_RIGHT_READ
+ret 164
+end
+if not ksc_cap_is_attenuation part grants 0 48 req_rw
+ret 165
+end
+ret test_admission_res_check
+end
+
+note 8b. Test Artifact Loader Layout, W^X Audit, Fault Classification, Receipt Flags
+fn test_loader to int
+lim = new ulong 9 0
+lens = new ulong 4 0
+lay = new ulong 12 0
+ranges = new ulong 6 0
+obs = new ulong 9 0
+put lim 0 1
+put lim 1 1
+put lim 2 1
+put lens 0 64
+put lens 1 27
+put lens 2 4096
+put lens 3 4
+if ne ksc_task_layout_init 1 lim lens lay KSC_AERR_OK
+ret 167
+end
+base = shl ulong 1 39
+if ne get lay 1 add base 4096
+ret 168
+end
+if ne get lay 7 add add base 4096 4
+ret 169
+end
+if ne get lay 9 7
+ret 170
+end
+d = or KSC_AP_EL0 KSC_DESC_TABLE
+if not ksc_page_desc_is_wx d
+ret 171
+end
+d = or or KSC_AP_EL0 KSC_AP_RO or KSC_PXN KSC_DESC_TABLE
+if ksc_page_desc_is_wx d
+ret 172
+end
+d = or or 0x40010000 KSC_AP_RO or KSC_PXN or KSC_UXN KSC_DESC_TABLE
+if not ksc_audit_code_alias d 0x40010000
+ret 173
+end
+d = xor d KSC_AP_RO
+if ksc_audit_code_alias d 0x40010000
+ret 174
+end
+put ranges 0 get lay 1
+put ranges 1 get lay 2
+put ranges 2 get lay 3
+put ranges 3 get lay 4
+put ranges 4 get lay 5
+put ranges 5 get lay 6
+d = or or shl ulong 0x24 26 shl ulong 1 6 shl ulong 3 2
+if ne ksc_classify_fault d get lay 1 ranges KSC_FAULT_CODE_WRITE
+ret 175
+end
+d = or shl ulong 0x20 26 shl ulong 3 2
+if ne ksc_classify_fault d get lay 3 ranges KSC_FAULT_EXEC_NX
+ret 176
+end
+d = or shl ulong 0x20 26 shl ulong 1 2
+if ne ksc_classify_fault d 0x1000 ranges KSC_FAULT_EXEC_UNMAPPED
+ret 177
+end
+for i ulong 9 unroll
+put obs i 1
+end
+if ne ksc_receipt_flags obs 255
+ret 178
+end
+ret 0
+end
+
+fn main to int
+r = test_hmac
+if ne r int 0
+ret r
+end
+r = test_hkdf
+if ne r int 0
+ret r
+end
+r = test_envelope
+if ne r int 0
+ret r
+end
+r = test_envelope_multichunk
+if ne r int 0
+ret r
+end
+r = test_security_keys
+if ne r int 0
+ret r
+end
+r = test_security_manifests
+if ne r int 0
+ret r
+end
+r = test_budget
+if ne r int 0
+ret r
+end
+r = test_recovery_auth
+if ne r int 0
+ret r
+end
+r = test_recovery_wal
+if ne r int 0
+ret r
+end
+r = test_recovery_core
+if ne r int 0
+ret r
+end
+r = test_continuity_objs
+if ne r int 0
+ret r
+end
+r = test_continuity_branches
+if ne r int 0
+ret r
+end
+r = test_admission
+if ne r int 0
+ret r
+end
+r = test_loader
+if ne r int 0
+ret r
+end
+ret 0
+end

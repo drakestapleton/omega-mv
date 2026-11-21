@@ -1,0 +1,3098 @@
+note aienux/crates/aienos-kernel/mm_iommu.om
+note Pure OM-2 port of aienos-kernel memory allocator, map plan, SMMUv3,
+note DMA gate, PCI enumeration/BAR, device authority, EDU DMA, block RamDisk,
+note and NVMe power-fail atomicity subsystems.
+
+note ========================================================================
+note 1. Physical Frame Allocator (mem/frame_allocator.rs)
+note ========================================================================
+
+const KMI_PAGE_SIZE ulong 4096
+const KMI_MAX_BATCH_FRAMES ulong 160
+
+fn kmi_is_page_aligned addr ulong to bool
+ret eq and addr 0xfff 0
+end
+
+fn kmi_align_up addr ulong to ulong
+ret and add addr 4095 0xfffffffffffff000
+end
+
+fn kmi_align_down addr ulong to ulong
+ret and addr 0xfffffffffffff000
+end
+
+fn kmi_frame_start base ulong idx ulong to ulong
+ret add base mul idx 4096
+end
+
+note BitmapFrameAllocator layout in st edit ulong *:
+note   st[0] = base_addr
+note   st[1] = total_frames
+note   st[2] = allocated_count
+note   st[3] = cap_words
+note   st[4..4+cap_words] = bitmap words (u64 each)
+
+fn kmi_fa_init st edit ulong * base ulong total_frames ulong cap_words ulong to int
+if ne and base 0xfff 0
+ret -1
+end
+if lt len st add 4 cap_words
+ret -2
+end
+need_words = div total_frames 64
+if ne rem total_frames 64 0
+need_words = add need_words 1
+end
+if gt need_words cap_words
+ret -2
+end
+max_frames = div sub 0xffffffffffffffff base 4096
+if gt total_frames max_frames
+ret -3
+end
+put st 0 base
+put st 1 total_frames
+put st 2 ulong 0
+put st 3 cap_words
+for wi ulong cap_words bound 4096
+put st add 4 wi ulong 0
+end
+ret 0
+end
+
+fn kmi_fa_total_frames st view ulong * to ulong
+ret get st 1
+end
+
+fn kmi_fa_allocated_count st view ulong * to ulong
+ret get st 2
+end
+
+fn kmi_fa_free_count st view ulong * to ulong
+tot = get st 1
+alc = get st 2
+if ge alc tot
+ret 0
+end
+ret sub tot alc
+end
+
+fn kmi_trailing_ones w ulong to ulong
+bit = ulong 0
+while lt bit 64 bound 64
+if eq and shr w bit 1 0
+ret bit
+end
+bit = add bit 1
+end
+ret 64
+end
+
+fn kmi_fa_alloc st edit ulong * addr_out edit ulong 1 to bool
+cap_w = get st 3
+tot = get st 1
+base = get st 0
+for wi ulong cap_w bound 4096
+w = get st add 4 wi
+if ne w 0xffffffffffffffff
+bi = kmi_trailing_ones w
+fidx = add mul wi 64 bi
+if lt fidx tot
+nw = or w shl ulong 1 bi
+put st add 4 wi nw
+put st 2 add get st 2 1
+put addr_out 0 add base mul fidx 4096
+ret true
+end
+end
+end
+ret false
+end
+
+fn kmi_fa_free st edit ulong * addr ulong to bool
+if ne and addr 0xfff 0
+ret false
+end
+base = get st 0
+if lt addr base
+ret false
+end
+fidx = div sub addr base 4096
+if ge fidx get st 1
+ret false
+end
+wi = div fidx 64
+bi = rem fidx 64
+w = get st add 4 wi
+mask = shl ulong 1 bi
+if eq and w mask 0
+ret false
+end
+put st add 4 wi and w xor mask 0xffffffffffffffff
+alc = get st 2
+if gt alc 0
+put st 2 sub alc 1
+end
+ret true
+end
+
+fn kmi_fa_mark_run st edit ulong * run_start ulong count ulong to void
+for k ulong count bound 65536
+f = add run_start k
+idx = add 4 div f 64
+cur = get st idx
+bit_v = shl ulong 1 rem f 64
+put st idx or cur bit_v
+end
+put st 2 add get st 2 count
+end
+
+fn kmi_fa_is_free st view ulong * i ulong to bool
+idx = add 4 div i 64
+cur = get st idx
+bit_v = shl ulong 1 rem i 64
+ret eq and cur bit_v 0
+end
+
+fn kmi_fa_alloc_contig st edit ulong * count ulong addr_out edit ulong 1 to bool
+if eq count 0
+ret false
+end
+if gt count kmi_fa_free_count st
+ret false
+end
+tot = get st 1
+run_start = ulong 0
+cur_run = ulong 0
+for i ulong tot bound 65536
+if kmi_fa_is_free st i
+if eq cur_run 0
+run_start = i
+end
+cur_run = add cur_run 1
+if eq cur_run count
+kmi_fa_mark_run st run_start count
+put addr_out 0 add get st 0 mul run_start 4096
+ret true
+end
+else
+cur_run = 0
+end
+end
+ret false
+end
+
+fn kmi_fa_release_batch st edit ulong * batch view ulong * count ulong to bool
+complete = true
+for i ulong count bound 160
+ok = kmi_fa_free st get batch i
+if not ok
+complete = false
+end
+end
+ret complete
+end
+
+fn kmi_fa_alloc_batch st edit ulong * count ulong batch edit ulong * to ulong
+tmp = new ulong 1 0
+if eq count 0
+ret 0
+end
+if gt count KMI_MAX_BATCH_FRAMES
+ret 0
+end
+if gt count len batch
+ret 0
+end
+if gt count kmi_fa_free_count st
+ret 0
+end
+got = ulong 0
+for i ulong count bound 160
+ok = kmi_fa_alloc st tmp
+if ok
+put batch i get tmp 0
+got = add got 1
+else
+ignore = kmi_fa_release_batch st batch got
+ret 0
+end
+end
+ret got
+end
+
+note ========================================================================
+note 2. Map Plan Builder and Validator (mem/map_plan.rs)
+note ========================================================================
+
+const KMI_EFI_MEMORY_RUNTIME ulong 0x8000000000000000
+const KMI_EFI_MEMORY_RO ulong 0x20000
+const KMI_EFI_MEMORY_XP ulong 0x4000
+
+const KMI_EFI_LOADER_CODE ulong 1
+const KMI_EFI_RUNTIME_CODE ulong 5
+const KMI_EFI_RUNTIME_DATA ulong 6
+const KMI_EFI_MMIO ulong 11
+
+const KMI_SCN_MEM_EXECUTE ulong 0x20000000
+const KMI_SCN_MEM_WRITE ulong 0x80000000
+
+const KMI_ATTR_NORMAL_WB ulong 0
+const KMI_ATTR_DEVICE_NGNRE ulong 1
+
+const KMI_FLAG_WRITABLE ulong 1
+const KMI_FLAG_EXECUTABLE ulong 2
+const KMI_FLAG_USER ulong 4
+const KMI_FLAG_SHAREABLE ulong 8
+const KMI_FLAG_GLOBAL ulong 16
+const KMI_FLAG_DEVICE ulong 256
+const KMI_FLAGS_KERNEL_DATA ulong 25
+
+const KMI_PLAN_OK int 0
+const KMI_PLAN_ERR_EMPTY_RANGE int 1
+const KMI_PLAN_ERR_OVERFLOW int 2
+const KMI_PLAN_ERR_RT_ATTRS_MISSING int 3
+const KMI_PLAN_ERR_RT_CANNOT_SPLIT int 4
+const KMI_PLAN_ERR_OVERLAP int 5
+const KMI_PLAN_ERR_SEC_OUTSIDE int 6
+const KMI_PLAN_ERR_CAPACITY int 7
+
+const KMI_RT_DECISION_NONE ulong 0
+const KMI_RT_DECISION_RX_UNSPLIT ulong 1
+
+fn kmi_mair_el1 to ulong
+ret 0x04ff
+end
+
+fn kmi_tcr_el1 parange uchar to ulong
+t = ulong 16
+t = or t shl ulong 1 8
+t = or t shl ulong 1 10
+t = or t shl ulong 3 12
+t = or t shl ulong 16 16
+t = or t shl ulong 1 23
+t = or t shl ulong 2 30
+ips = and ulong parange 7
+t = or t shl ips 32
+ret t
+end
+
+fn kmi_sctlr_el1 to ulong
+s = ulong 0x30d00800
+s = or s 1
+s = or s shl ulong 1 2
+s = or s shl ulong 1 12
+ret s
+end
+
+fn kmi_map_flags wr bool ex bool attr ulong to ulong
+f = or KMI_FLAG_SHAREABLE KMI_FLAG_GLOBAL
+if wr
+f = or f KMI_FLAG_WRITABLE
+end
+if ex
+f = or f KMI_FLAG_EXECUTABLE
+end
+if eq attr KMI_ATTR_DEVICE_NGNRE
+f = or f KMI_FLAG_DEVICE
+end
+ret f
+end
+
+fn kmi_range_end_ok start ulong rlen ulong to bool
+ret le rlen sub 0xffffffffffffffff start
+end
+
+fn kmi_range_overlap s1 ulong l1 ulong s2 ulong l2 ulong to bool
+e1 = add s1 l1
+e2 = add s2 l2
+if lt s1 e2
+if lt s2 e1
+ret true
+end
+end
+ret false
+end
+
+note plan_meta[4]: [count, decision, max_entries, reserved]
+note plan_out: 3 ulongs per entry [start, length, flags]
+
+fn kmi_plan_init meta edit ulong 4 max_entries ulong to void
+put meta 0 ulong 0
+put meta 1 KMI_RT_DECISION_NONE
+put meta 2 max_entries
+put meta 3 ulong 0
+end
+
+fn kmi_plan_push meta edit ulong 4 plan edit ulong * start ulong rlen ulong flg ulong to int
+cnt = get meta 0
+if ge cnt get meta 2
+ret KMI_PLAN_ERR_CAPACITY
+end
+off = mul cnt 3
+if gt add off 3 len plan
+ret KMI_PLAN_ERR_CAPACITY
+end
+put plan off start
+put plan add off 1 rlen
+put plan add off 2 flg
+put meta 0 add cnt 1
+ret KMI_PLAN_OK
+end
+
+note secs: 3 ulongs per section [va, size, characteristics]
+note img_reg[4]: [img_start, img_len, region_start, region_len]
+
+fn kmi_plan_sec_align va ulong sz ulong out_al edit ulong 2 to int
+if not kmi_range_end_ok va sz
+ret KMI_PLAN_ERR_OVERFLOW
+end
+s_end = add va sz
+if not kmi_range_end_ok s_end 4095
+ret KMI_PLAN_ERR_OVERFLOW
+end
+al_start = and va 0xfffffffffffff000
+al_end = and add s_end 4095 0xfffffffffffff000
+if lt al_end al_start
+ret KMI_PLAN_ERR_OVERFLOW
+end
+put out_al 0 al_start
+put out_al 1 sub al_end al_start
+ret KMI_PLAN_OK
+end
+
+fn kmi_plan_one_sec meta edit ulong 4 plan edit ulong * img_reg view ulong 4 sec view ulong 3 to int
+al = new ulong 2 0
+sz = get sec 1
+if eq sz 0
+ret KMI_PLAN_OK
+end
+rc = kmi_plan_sec_align get sec 0 sz al
+if ne rc KMI_PLAN_OK
+ret rc
+end
+if not kmi_range_overlap get al 0 get al 1 get img_reg 0 get img_reg 1
+ret KMI_PLAN_ERR_SEC_OUTSIDE
+end
+ch = get sec 2
+if ne and ch KMI_SCN_MEM_EXECUTE 0
+if ne and ch KMI_SCN_MEM_WRITE 0
+ret KMI_PLAN_ERR_OVERLAP
+end
+end
+flg = kmi_map_flags ne and ch KMI_SCN_MEM_WRITE 0 ne and ch KMI_SCN_MEM_EXECUTE 0 KMI_ATTR_NORMAL_WB
+ret kmi_plan_push meta plan get al 0 get al 1 flg
+end
+
+fn kmi_plan_add_loader meta edit ulong 4 plan edit ulong * img_reg view ulong 4 secs view ulong * to int
+sec = new ulong 3 0
+if not kmi_range_end_ok get img_reg 0 get img_reg 1
+ret KMI_PLAN_ERR_OVERFLOW
+end
+before = get meta 0
+nsecs = div len secs 3
+for i ulong nsecs bound 256
+put sec 0 get secs mul i 3
+put sec 1 get secs add mul i 3 1
+put sec 2 get secs add mul i 3 2
+rc = kmi_plan_one_sec meta plan img_reg sec
+if ne rc KMI_PLAN_OK
+ret rc
+end
+end
+if eq get meta 0 before
+ret kmi_plan_push meta plan get img_reg 2 get img_reg 3 KMI_FLAGS_KERNEL_DATA
+end
+ret KMI_PLAN_OK
+end
+
+note reg_info[3]: [start, length, has_rt_attrs (0 or 1)]
+note rt_attrs: 4 ulongs per attr [start, length, read_only(0/1), execute_protect(0/1)]
+
+fn kmi_plan_find_rt_attr rt_attrs view ulong * cursor ulong to long
+n = div len rt_attrs 4
+for i ulong n bound 256
+off = mul i 4
+as = get rt_attrs off
+al = get rt_attrs add off 1
+if le as cursor
+if kmi_range_end_ok as al
+ae = add as al
+if gt ae cursor
+ret long i
+end
+end
+end
+end
+ret -1
+end
+
+fn kmi_plan_rt_flags ro bool xp bool to ulong
+is_wr = false
+if not ro
+if xp
+is_wr = true
+end
+end
+ret kmi_map_flags is_wr not xp KMI_ATTR_NORMAL_WB
+end
+
+fn kmi_plan_rt_step meta edit ulong 4 plan edit ulong * cur_end edit ulong 2 attr view ulong 4 to int
+stop = add get attr 0 get attr 1
+if gt stop get cur_end 1
+stop = get cur_end 1
+end
+ro = ne get attr 2 0
+xp = ne get attr 3 0
+if not xp
+if not ro
+put meta 1 KMI_RT_DECISION_RX_UNSPLIT
+end
+end
+flg = kmi_plan_rt_flags ro xp
+rc = kmi_plan_push meta plan get cur_end 0 sub stop get cur_end 0 flg
+if ne rc KMI_PLAN_OK
+ret rc
+end
+put cur_end 0 stop
+ret KMI_PLAN_OK
+end
+
+fn kmi_plan_add_runtime meta edit ulong 4 plan edit ulong * reg_info view ulong 3 rt_attrs view ulong * to int
+cur_end = new ulong 2 0
+attr = new ulong 4 0
+if not kmi_range_end_ok get reg_info 0 get reg_info 1
+ret KMI_PLAN_ERR_OVERFLOW
+end
+if eq get reg_info 2 0
+flg = kmi_map_flags false true KMI_ATTR_NORMAL_WB
+rc = kmi_plan_push meta plan get reg_info 0 get reg_info 1 flg
+if ne rc KMI_PLAN_OK
+ret rc
+end
+put meta 1 KMI_RT_DECISION_RX_UNSPLIT
+ret KMI_PLAN_OK
+end
+put cur_end 0 get reg_info 0
+put cur_end 1 add get reg_info 0 get reg_info 1
+while lt get cur_end 0 get cur_end 1 bound 256
+idx = kmi_plan_find_rt_attr rt_attrs get cur_end 0
+if lt idx 0
+ret KMI_PLAN_ERR_RT_ATTRS_MISSING
+end
+aoff = mul ulong idx 4
+for k ulong 4
+put attr k get rt_attrs add aoff k
+end
+rc = kmi_plan_rt_step meta plan cur_end attr
+if ne rc KMI_PLAN_OK
+ret rc
+end
+end
+ret KMI_PLAN_OK
+end
+
+fn kmi_is_kernel_data_type mtype ulong to bool
+if eq mtype 2
+ret true
+end
+if eq mtype 3
+ret true
+end
+if eq mtype 4
+ret true
+end
+if eq mtype 7
+ret true
+end
+if eq mtype 9
+ret true
+end
+if eq mtype 10
+ret true
+end
+if eq mtype KMI_EFI_RUNTIME_DATA
+ret true
+end
+ret false
+end
+
+note Process one EFI memory descriptor: desc[4] = [mtype, phys_start, page_count, attribute]
+note img_ctx[3] = [img_start, img_len, has_rt_attrs]
+
+fn kmi_plan_add_desc_mmio_or_data meta edit ulong 4 plan edit ulong * mtype ulong rstart ulong rlen ulong to int
+if eq mtype KMI_EFI_MMIO
+flg = kmi_map_flags true false KMI_ATTR_DEVICE_NGNRE
+ret kmi_plan_push meta plan rstart rlen flg
+end
+if kmi_is_kernel_data_type mtype
+ret kmi_plan_push meta plan rstart rlen KMI_FLAGS_KERNEL_DATA
+end
+ret KMI_PLAN_OK
+end
+
+fn kmi_plan_step_desc meta edit ulong 4 plan edit ulong * desc view ulong 4 img_ctx view ulong 3 to int
+note Handles MMIO and normal data descriptors directly; returns 100 if LOADER_CODE, 101 if RUNTIME_CODE
+mtype = get desc 0
+pstart = get desc 1
+pages = get desc 2
+attr = get desc 3
+if gt pages div ulong 0xffffffffffffffff 4096
+ret KMI_PLAN_ERR_OVERFLOW
+end
+rlen = mul pages 4096
+if eq rlen 0
+ret KMI_PLAN_OK
+end
+if eq mtype KMI_EFI_LOADER_CODE
+ret 100
+end
+if eq mtype KMI_EFI_MMIO
+ret kmi_plan_add_desc_mmio_or_data meta plan mtype pstart rlen
+end
+is_rt = eq mtype KMI_EFI_RUNTIME_CODE
+if not is_rt
+if ne and attr KMI_EFI_MEMORY_RUNTIME 0
+if ne mtype KMI_EFI_RUNTIME_DATA
+is_rt = true
+end
+end
+end
+if is_rt
+ret 101
+end
+ret kmi_plan_add_desc_mmio_or_data meta plan mtype pstart rlen
+end
+
+fn kmi_plan_mmio_covered plan view ulong * desc_cnt ulong ms ulong me ulong to bool
+for i ulong desc_cnt bound 256
+off = mul i 3
+ps = get plan off
+pl = get plan add off 1
+pf = get plan add off 2
+if ne and pf KMI_FLAG_DEVICE 0
+if le ps ms
+if kmi_range_end_ok ps pl
+if ge add ps pl me
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+note mmio: 2 ulongs per range [start, length]
+
+fn kmi_plan_add_mmio meta edit ulong 4 plan edit ulong * desc_cnt ulong mmio view ulong * to int
+n = div len mmio 2
+for i ulong n bound 256
+off = mul i 2
+ms = get mmio off
+ml = get mmio add off 1
+if not kmi_range_end_ok ms ml
+ret KMI_PLAN_ERR_OVERFLOW
+end
+me = add ms ml
+cov = kmi_plan_mmio_covered plan desc_cnt ms me
+if not cov
+flg = kmi_map_flags true false KMI_ATTR_DEVICE_NGNRE
+rc = kmi_plan_push meta plan ms ml flg
+if ne rc KMI_PLAN_OK
+ret rc
+end
+end
+end
+ret KMI_PLAN_OK
+end
+
+fn kmi_plan_validate_overlaps meta view ulong 4 plan view ulong * to int
+cnt = get meta 0
+for i ulong cnt bound 256
+ioff = mul i 3
+s1 = get plan ioff
+l1 = get plan add ioff 1
+if not kmi_range_end_ok s1 l1
+ret KMI_PLAN_ERR_OVERFLOW
+end
+j = add i 1
+while lt j cnt bound 256
+joff = mul j 3
+s2 = get plan joff
+l2 = get plan add joff 1
+if not kmi_range_end_ok s2 l2
+ret KMI_PLAN_ERR_OVERFLOW
+end
+if kmi_range_overlap s1 l1 s2 l2
+ret KMI_PLAN_ERR_OVERLAP
+end
+j = add j 1
+end
+end
+ret KMI_PLAN_OK
+end
+
+note ========================================================================
+note 3. SMMUv3 Descriptors, Queues, and Register Sequencing (smmu.rs)
+note ========================================================================
+
+const KMI_STE_BYTES ulong 64
+const KMI_CD_BYTES ulong 64
+const KMI_CMD_BYTES ulong 16
+const KMI_EVENT_BYTES ulong 32
+
+const KMI_SMMU_IDR0 uint 0x00
+const KMI_SMMU_IDR1 uint 0x04
+const KMI_SMMU_CR0 uint 0x20
+const KMI_SMMU_CR0ACK uint 0x24
+const KMI_SMMU_CR1 uint 0x28
+const KMI_SMMU_GBPA uint 0x44
+const KMI_SMMU_STRTAB_BASE uint 0x80
+const KMI_SMMU_STRTAB_BASE_CFG uint 0x88
+const KMI_SMMU_CMDQ_BASE uint 0x90
+const KMI_SMMU_CMDQ_PROD uint 0x98
+const KMI_SMMU_CMDQ_CONS uint 0x9c
+const KMI_SMMU_EVENTQ_BASE uint 0xa0
+const KMI_SMMU_EVENTQ_PROD uint 0x100a8
+const KMI_SMMU_EVENTQ_CONS uint 0x100ac
+
+const KMI_IDR0_S1P uint 2
+const KMI_IDR1_SIDSIZE_MASK uint 0x3f
+const KMI_IDR1_EVENTQS_SHIFT uint 16
+const KMI_IDR1_CMDQS_SHIFT uint 21
+const KMI_IDR1_QS_MASK uint 0x1f
+
+const KMI_GBPA_ABORT uint 0x00100000
+const KMI_GBPA_UPDATE uint 0x80000000
+
+const KMI_CR0_SMMUEN uint 1
+const KMI_CR0_EVENTQEN uint 4
+const KMI_CR0_CMDQEN uint 8
+const KMI_CR0_ACK_MASK uint 0x0f
+
+const KMI_CMDQ_CONS_ERR_MASK uint 0x7f000000
+const KMI_EVENTQ_OVERFLOW uint 0x80000000
+
+const KMI_CMD_CFGI_STE uchar 0x03
+const KMI_CMD_CFGI_ALL uchar 0x04
+const KMI_CMD_TLBI_NSNH_ALL uchar 0x30
+const KMI_CMD_SYNC uchar 0x46
+
+const KMI_EVENT_F_UUT uchar 0x01
+const KMI_EVENT_C_BAD_STREAMID uchar 0x02
+const KMI_EVENT_F_STE_FETCH uchar 0x03
+const KMI_EVENT_C_BAD_STE uchar 0x04
+const KMI_EVENT_F_STREAM_DISABLED uchar 0x06
+const KMI_EVENT_F_TRANSL_FORBIDDEN uchar 0x07
+const KMI_EVENT_F_CD_FETCH uchar 0x09
+const KMI_EVENT_C_BAD_CD uchar 0x0a
+const KMI_EVENT_F_WALK_EABT uchar 0x0b
+const KMI_EVENT_F_TRANSLATION uchar 0x10
+const KMI_EVENT_F_ADDR_SIZE uchar 0x11
+const KMI_EVENT_F_ACCESS uchar 0x12
+const KMI_EVENT_F_PERMISSION uchar 0x13
+
+const KMI_SMMU_OK int 0
+const KMI_SMMU_ERR_TIMEOUT int 1
+const KMI_SMMU_ERR_CMDQ int 2
+const KMI_SMMU_ERR_INVALID_WINDOW int 3
+const KMI_SMMU_ERR_UNSUPPORTED int 4
+const KMI_SMMU_ERR_ABORT_NOT_LATCHED int 5
+
+fn kmi_u32_ctz v uint to uint
+if eq v 0
+ret 32
+end
+c = uint 0
+while lt c 32 bound 32
+if ne and shr v c 1 0
+ret c
+end
+c = add c 1
+end
+ret 32
+end
+
+fn kmi_u32_is_pow2 v uint to bool
+if eq v 0
+ret false
+end
+ret eq and v sub v 1 0
+end
+
+fn kmi_ste_abort ste edit ulong 8 to void
+put ste 0 ulong 1
+for i ulong 7
+put ste add i 1 ulong 0
+end
+end
+
+fn kmi_ste_stage1 cd_addr ulong ste edit ulong 8 to void
+w0 = or ulong 1 shl ulong 5 1
+w0 = or w0 and cd_addr 0x000fffffffffffc0
+put ste 0 w0
+for i ulong 7
+put ste add i 1 ulong 0
+end
+end
+
+fn kmi_cd_stage1 ttb0 ulong asid ushort mair ulong t0sz uchar cd edit ulong 8 to int
+if gt t0sz 39
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+if ne and ttb0 0xfff 0
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+w0 = ulong t0sz
+w0 = or w0 shl ulong 1 8
+w0 = or w0 shl ulong 1 10
+w0 = or w0 shl ulong 3 12
+w0 = or w0 shl ulong 1 30
+w0 = or w0 shl ulong 1 31
+w0 = or w0 shl ulong 5 32
+w0 = or w0 shl ulong 1 41
+w0 = or w0 shl ulong 1 45
+w0 = or w0 shl ulong 1 46
+w0 = or w0 shl ulong asid 48
+w1 = and ttb0 0x0000fffffffffff0
+w3 = and mair 0xffff
+put cd 0 w0
+put cd 1 w1
+put cd 2 ulong 0
+put cd 3 w3
+put cd 4 ulong 0
+put cd 5 ulong 0
+put cd 6 ulong 0
+put cd 7 ulong 0
+ret KMI_SMMU_OK
+end
+
+fn kmi_smmu_cmd_w0 opcode uchar sid uint to ulong
+ret or ulong opcode shl ulong sid 32
+end
+
+fn kmi_smmu_cmd_w1 opcode uchar leaf bool to ulong
+if eq opcode KMI_CMD_CFGI_ALL
+ret 31
+end
+if leaf
+ret 1
+end
+ret 0
+end
+
+fn kmi_qcursor_encode idx uint wrap bool entries uint to uint
+low = and idx sub entries 1
+if wrap
+sh = kmi_u32_ctz entries
+ret or low shl uint 1 sh
+end
+ret low
+end
+
+fn kmi_qcursor_decode_idx val uint entries uint to uint
+ret and val sub entries 1
+end
+
+fn kmi_qcursor_decode_wrap val uint entries uint to bool
+ret ne and val entries 0
+end
+
+fn kmi_qcursor_advance cur edit uint 2 entries uint to void
+idx = add get cur 0 1
+if eq idx entries
+put cur 0 uint 0
+if eq get cur 1 0
+put cur 1 uint 1
+else
+put cur 1 uint 0
+end
+else
+put cur 0 idx
+end
+end
+
+fn kmi_smmu_aligned addr ulong nbytes ulong to bool
+if eq addr 0
+ret false
+end
+al = nbytes
+if lt al 32
+al = 32
+end
+ret eq and addr sub al 1 0
+end
+
+note geom[7]: [stream_addr, stream_entries, cmd_addr, cmd_entries, ev_addr, ev_entries, cd_addr]
+
+fn kmi_smmu_tables_valid geom view ulong 7 to bool
+se = uint and get geom 1 0xffffffff
+ce = uint and get geom 3 0xffffffff
+ee = uint and get geom 5 0xffffffff
+if lt se 1
+ret false
+end
+if not kmi_u32_is_pow2 se
+ret false
+end
+if lt ce 2
+ret false
+end
+if not kmi_u32_is_pow2 ce
+ret false
+end
+if lt ee 2
+ret false
+end
+if not kmi_u32_is_pow2 ee
+ret false
+end
+if not kmi_smmu_aligned get geom 0 mul ulong se KMI_STE_BYTES
+ret false
+end
+if not kmi_smmu_aligned get geom 2 mul ulong ce KMI_CMD_BYTES
+ret false
+end
+if not kmi_smmu_aligned get geom 4 mul ulong ee KMI_EVENT_BYTES
+ret false
+end
+if not kmi_smmu_aligned get geom 6 KMI_CD_BYTES
+ret false
+end
+ret true
+end
+
+fn kmi_smmu_event_decode raw view ulong 4 decoded edit ulong 3 to void
+w0 = get raw 0
+put decoded 0 and w0 0xff
+put decoded 1 and shr w0 32 0xffffffff
+put decoded 2 get raw 2
+end
+
+note Simulated SMMUv3 register + table state in sm edit ulong 512:
+note   0: IDR0   1: IDR1   2: GBPA   3: CR0   4: CR0ACK   5: CR1
+note   6: STRTAB_BASE   7: STRTAB_BASE_CFG   8: CMDQ_BASE   9: CMDQ_PROD
+note  10: CMDQ_CONS    11: EVENTQ_BASE      12: EVENTQ_PROD 13: EVENTQ_CONS
+note  14: gbpa_stuck   15: gbpa_no_abort    16: ack_never   17: cmdq_stuck
+note  18: cmdq_error   19: stream_entries   20: cmd_entries 21: ev_entries
+note  22: stream_addr  23: cmd_addr         24: ev_addr     25: cd_addr
+note  26: seq_counter  27: first_gbpa_seq   28: first_cr0_seq 29: first_strtab_seq
+note  30: clean_stream_seq 31: clean_cd_seq 32: clean_cmd_seq 33: inv_ev_seq
+note  34: write_count  35: all_writes_abort 36: smmuen_seen 37: last_write_reg
+note  38: last_write_val 39: consumed_count 40: last_clean_addr 41: last_clean_seq
+note  42: last_prod_seq 43: last_inv_addr   44: first_write_reg 45: non_gbpa_cr0_writes
+note  46..47: reserved
+note  48..175: stream table (16 STEs * 8 ulongs = 128)
+note 176..183: context descriptor (8 ulongs)
+note 184..215: command queue (16 entries * 2 ulongs = 32)
+note 216..279: event queue (16 entries * 4 ulongs = 64)
+note 280..407: consumed command log (64 commands * 2 ulongs = 128)
+
+const KMI_SM_IDR0 ulong 0
+const KMI_SM_IDR1 ulong 1
+const KMI_SM_GBPA ulong 2
+const KMI_SM_CR0 ulong 3
+const KMI_SM_CR0ACK ulong 4
+const KMI_SM_CR1 ulong 5
+const KMI_SM_STRTAB_BASE ulong 6
+const KMI_SM_STRTAB_CFG ulong 7
+const KMI_SM_CMDQ_BASE ulong 8
+const KMI_SM_CMDQ_PROD ulong 9
+const KMI_SM_CMDQ_CONS ulong 10
+const KMI_SM_EVENTQ_BASE ulong 11
+const KMI_SM_EVENTQ_PROD ulong 12
+const KMI_SM_EVENTQ_CONS ulong 13
+const KMI_SM_GBPA_STUCK ulong 14
+const KMI_SM_GBPA_NO_ABORT ulong 15
+const KMI_SM_ACK_NEVER ulong 16
+const KMI_SM_CMDQ_STUCK ulong 17
+const KMI_SM_CMDQ_ERROR ulong 18
+const KMI_SM_STREAM_ENT ulong 19
+const KMI_SM_CMD_ENT ulong 20
+const KMI_SM_EV_ENT ulong 21
+const KMI_SM_STREAM_ADDR ulong 22
+const KMI_SM_CMD_ADDR ulong 23
+const KMI_SM_EV_ADDR ulong 24
+const KMI_SM_CD_ADDR ulong 25
+const KMI_SM_SEQ ulong 26
+const KMI_SM_FIRST_GBPA ulong 27
+const KMI_SM_FIRST_CR0 ulong 28
+const KMI_SM_FIRST_STRTAB ulong 29
+const KMI_SM_CLEAN_STREAM ulong 30
+const KMI_SM_CLEAN_CD ulong 31
+const KMI_SM_CLEAN_CMD ulong 32
+const KMI_SM_INV_EV ulong 33
+const KMI_SM_WR_CNT ulong 34
+const KMI_SM_ALL_ABORT ulong 35
+const KMI_SM_SMMUEN_SEEN ulong 36
+const KMI_SM_LAST_REG ulong 37
+const KMI_SM_LAST_VAL ulong 38
+const KMI_SM_CONS_CNT ulong 39
+const KMI_SM_LAST_CLEAN_ADDR ulong 40
+const KMI_SM_LAST_CLEAN_SEQ ulong 41
+const KMI_SM_LAST_PROD_SEQ ulong 42
+const KMI_SM_LAST_INV_ADDR ulong 43
+const KMI_SM_FIRST_WR_REG ulong 44
+const KMI_SM_OTHER_WR ulong 45
+const KMI_SM_STE_BASE ulong 48
+const KMI_SM_CD_BASE ulong 176
+const KMI_SM_CMD_BASE ulong 184
+const KMI_SM_EV_BASE ulong 216
+const KMI_SM_CONS_LOG ulong 280
+
+fn kmi_smmu_init sm edit ulong 512 to void
+for i ulong 512
+put sm i ulong 0
+end
+put sm KMI_SM_IDR0 ulong KMI_IDR0_S1P
+idr1 = or ulong 16 or shl ulong 19 16 shl ulong 19 21
+put sm KMI_SM_IDR1 idr1
+put sm KMI_SM_GBPA ulong 0x1000
+put sm KMI_SM_STREAM_ENT ulong 16
+put sm KMI_SM_CMD_ENT ulong 16
+put sm KMI_SM_EV_ENT ulong 16
+put sm KMI_SM_STREAM_ADDR ulong 0x100000
+put sm KMI_SM_CMD_ADDR ulong 0x101000
+put sm KMI_SM_EV_ADDR ulong 0x102000
+put sm KMI_SM_CD_ADDR ulong 0x103000
+put sm KMI_SM_ALL_ABORT ulong 1
+for i ulong 128
+put sm add KMI_SM_STE_BASE i ulong 0xdead
+end
+end
+
+fn kmi_smmu_reset_log sm edit ulong 512 to void
+put sm KMI_SM_SEQ ulong 0
+put sm KMI_SM_FIRST_GBPA ulong 0
+put sm KMI_SM_FIRST_CR0 ulong 0
+put sm KMI_SM_FIRST_STRTAB ulong 0
+put sm KMI_SM_CLEAN_STREAM ulong 0
+put sm KMI_SM_CLEAN_CD ulong 0
+put sm KMI_SM_CLEAN_CMD ulong 0
+put sm KMI_SM_INV_EV ulong 0
+put sm KMI_SM_WR_CNT ulong 0
+put sm KMI_SM_ALL_ABORT ulong 1
+put sm KMI_SM_SMMUEN_SEEN ulong 0
+put sm KMI_SM_LAST_REG ulong 0
+put sm KMI_SM_LAST_VAL ulong 0
+put sm KMI_SM_CONS_CNT ulong 0
+put sm KMI_SM_LAST_CLEAN_ADDR ulong 0
+put sm KMI_SM_LAST_CLEAN_SEQ ulong 0
+put sm KMI_SM_LAST_PROD_SEQ ulong 0
+put sm KMI_SM_LAST_INV_ADDR ulong 0
+put sm KMI_SM_FIRST_WR_REG ulong 0
+put sm KMI_SM_OTHER_WR ulong 0
+end
+
+fn kmi_smmu_abort_in_effect sm view ulong 512 to bool
+g = uint and get sm KMI_SM_GBPA 0xffffffff
+if ne and g KMI_GBPA_UPDATE 0
+ret false
+end
+ret ne and g KMI_GBPA_ABORT 0
+end
+
+fn kmi_qcursor_from_raw raw uint entries uint cur edit uint 2 to void
+put cur 0 kmi_qcursor_decode_idx raw entries
+if kmi_qcursor_decode_wrap raw entries
+put cur 1 uint 1
+else
+put cur 1 uint 0
+end
+end
+
+fn kmi_qcursor_eq_raw cur view uint 2 raw uint entries uint to bool
+if ne get cur 0 kmi_qcursor_decode_idx raw entries
+ret false
+end
+cw = ne get cur 1 0
+rw = kmi_qcursor_decode_wrap raw entries
+ret eq cw rw
+end
+
+fn kmi_smmu_consume_one sm edit ulong 512 sidx ulong to void
+qoff = add KMI_SM_CMD_BASE mul sidx 2
+w0 = get sm qoff
+w1 = get sm add qoff 1
+ccnt = get sm KMI_SM_CONS_CNT
+if lt ccnt 64
+loff = add KMI_SM_CONS_LOG mul ccnt 2
+put sm loff w0
+put sm add loff 1 w1
+end
+put sm KMI_SM_CONS_CNT add ccnt 1
+end
+
+fn kmi_smmu_consume_cmds sm edit ulong 512 prod_val uint to void
+cur = new uint 2 0
+entries = uint and get sm KMI_SM_CMD_ENT 0xffffffff
+kmi_qcursor_from_raw uint and get sm KMI_SM_CMDQ_CONS 0xffffffff entries cur
+while not kmi_qcursor_eq_raw cur prod_val entries bound 64
+kmi_smmu_consume_one sm ulong get cur 0
+kmi_qcursor_advance cur entries
+end
+enc = kmi_qcursor_encode get cur 0 ne get cur 1 0 entries
+put sm KMI_SM_CMDQ_CONS ulong enc
+end
+
+fn kmi_smmu_reg_write sm edit ulong 512 reg uint val uint to void
+seq = add get sm KMI_SM_SEQ 1
+put sm KMI_SM_SEQ seq
+stored = val
+if eq reg KMI_SMMU_GBPA
+if ne get sm KMI_SM_GBPA_NO_ABORT 0
+stored = and stored xor KMI_GBPA_ABORT 0xffffffff
+end
+if eq get sm KMI_SM_GBPA_STUCK 0
+stored = and stored xor KMI_GBPA_UPDATE 0xffffffff
+end
+put sm KMI_SM_GBPA ulong stored
+if eq get sm KMI_SM_FIRST_GBPA 0
+put sm KMI_SM_FIRST_GBPA seq
+end
+else
+if eq reg KMI_SMMU_CR0
+put sm KMI_SM_CR0 ulong val
+ack_n = uint and get sm KMI_SM_ACK_NEVER 0xffffffff
+put sm KMI_SM_CR0ACK ulong and val xor ack_n 0xffffffff
+if eq get sm KMI_SM_FIRST_CR0 0
+put sm KMI_SM_FIRST_CR0 seq
+end
+if ne and val KMI_CR0_SMMUEN 0
+put sm KMI_SM_SMMUEN_SEEN ulong 1
+end
+else
+if eq reg KMI_SMMU_CR1
+put sm KMI_SM_CR1 ulong val
+else
+if eq reg KMI_SMMU_STRTAB_BASE_CFG
+put sm KMI_SM_STRTAB_CFG ulong val
+else
+if eq reg KMI_SMMU_CMDQ_CONS
+put sm KMI_SM_CMDQ_CONS ulong val
+else
+if eq reg KMI_SMMU_CMDQ_PROD
+put sm KMI_SM_CMDQ_PROD ulong val
+put sm KMI_SM_LAST_PROD_SEQ seq
+cr0ack = uint and get sm KMI_SM_CR0ACK 0xffffffff
+if ne and cr0ack KMI_CR0_CMDQEN 0
+if ne get sm KMI_SM_CMDQ_ERROR 0
+put sm KMI_SM_CMDQ_CONS ulong shl uint 1 24
+else
+if eq get sm KMI_SM_CMDQ_STUCK 0
+kmi_smmu_consume_cmds sm val
+end
+end
+end
+else
+if eq reg KMI_SMMU_EVENTQ_CONS
+put sm KMI_SM_EVENTQ_CONS ulong val
+else
+if eq reg KMI_SMMU_EVENTQ_PROD
+put sm KMI_SM_EVENTQ_PROD ulong val
+end
+end
+end
+end
+end
+end
+end
+end
+if eq get sm KMI_SM_WR_CNT 0
+put sm KMI_SM_FIRST_WR_REG ulong reg
+end
+if ne reg KMI_SMMU_GBPA
+if ne reg KMI_SMMU_CR0
+put sm KMI_SM_OTHER_WR add get sm KMI_SM_OTHER_WR 1
+end
+end
+put sm KMI_SM_WR_CNT add get sm KMI_SM_WR_CNT 1
+put sm KMI_SM_LAST_REG ulong reg
+put sm KMI_SM_LAST_VAL ulong val
+if not kmi_smmu_abort_in_effect sm
+put sm KMI_SM_ALL_ABORT ulong 0
+end
+end
+
+fn kmi_smmu_reg_write64 sm edit ulong 512 reg uint val ulong to void
+seq = add get sm KMI_SM_SEQ 1
+put sm KMI_SM_SEQ seq
+if eq reg KMI_SMMU_STRTAB_BASE
+put sm KMI_SM_STRTAB_BASE val
+if eq get sm KMI_SM_FIRST_STRTAB 0
+put sm KMI_SM_FIRST_STRTAB seq
+end
+else
+if eq reg KMI_SMMU_CMDQ_BASE
+put sm KMI_SM_CMDQ_BASE val
+else
+if eq reg KMI_SMMU_EVENTQ_BASE
+put sm KMI_SM_EVENTQ_BASE val
+end
+end
+end
+put sm KMI_SM_WR_CNT add get sm KMI_SM_WR_CNT 1
+put sm KMI_SM_OTHER_WR add get sm KMI_SM_OTHER_WR 1
+put sm KMI_SM_LAST_REG ulong reg
+put sm KMI_SM_LAST_VAL and val 0xffffffff
+if not kmi_smmu_abort_in_effect sm
+put sm KMI_SM_ALL_ABORT ulong 0
+end
+end
+
+fn kmi_smmu_clean sm edit ulong 512 addr ulong nbytes ulong to void
+seq = add get sm KMI_SM_SEQ 1
+put sm KMI_SM_SEQ seq
+put sm KMI_SM_LAST_CLEAN_ADDR addr
+put sm KMI_SM_LAST_CLEAN_SEQ seq
+if eq addr get sm KMI_SM_STREAM_ADDR
+if eq nbytes mul get sm KMI_SM_STREAM_ENT KMI_STE_BYTES
+put sm KMI_SM_CLEAN_STREAM seq
+end
+end
+if eq addr get sm KMI_SM_CD_ADDR
+if eq nbytes KMI_CD_BYTES
+put sm KMI_SM_CLEAN_CD seq
+end
+end
+if eq addr get sm KMI_SM_CMD_ADDR
+if eq nbytes mul get sm KMI_SM_CMD_ENT KMI_CMD_BYTES
+put sm KMI_SM_CLEAN_CMD seq
+end
+end
+end
+
+fn kmi_smmu_inv sm edit ulong 512 addr ulong nbytes ulong to void
+seq = add get sm KMI_SM_SEQ 1
+put sm KMI_SM_SEQ seq
+put sm KMI_SM_LAST_INV_ADDR addr
+if eq addr get sm KMI_SM_EV_ADDR
+if eq nbytes mul get sm KMI_SM_EV_ENT KMI_EVENT_BYTES
+put sm KMI_SM_INV_EV seq
+end
+end
+end
+
+fn kmi_smmu_poll_gbpa sm view ulong 512 spins ulong to int
+for i ulong spins bound 1024
+g = uint and get sm KMI_SM_GBPA 0xffffffff
+if eq and g KMI_GBPA_UPDATE 0
+ret KMI_SMMU_OK
+end
+end
+ret KMI_SMMU_ERR_TIMEOUT
+end
+
+fn kmi_smmu_set_global_abort sm edit ulong 512 spins ulong to int
+rc = kmi_smmu_poll_gbpa sm spins
+if ne rc KMI_SMMU_OK
+ret rc
+end
+cur = uint and get sm KMI_SM_GBPA 0xffffffff
+nv = or and cur xor KMI_GBPA_UPDATE 0xffffffff or KMI_GBPA_ABORT KMI_GBPA_UPDATE
+kmi_smmu_reg_write sm KMI_SMMU_GBPA nv
+rc2 = kmi_smmu_poll_gbpa sm spins
+if ne rc2 KMI_SMMU_OK
+ret rc2
+end
+after = uint and get sm KMI_SM_GBPA 0xffffffff
+if eq and after KMI_GBPA_ABORT 0
+ret KMI_SMMU_ERR_ABORT_NOT_LATCHED
+end
+ret KMI_SMMU_OK
+end
+
+fn kmi_smmu_wait_cr0 sm view ulong 512 expected uint spins ulong to int
+exp_m = and expected KMI_CR0_ACK_MASK
+for i ulong spins bound 1024
+ack = uint and get sm KMI_SM_CR0ACK 0xffffffff
+if eq and ack KMI_CR0_ACK_MASK exp_m
+ret KMI_SMMU_OK
+end
+end
+ret KMI_SMMU_ERR_TIMEOUT
+end
+
+note cmds: 2 ulongs per command [w0, w1]
+
+fn kmi_smmu_wait_space sm view ulong 512 pcur view uint 2 entries uint spins ulong to int
+for s ulong spins bound 1024
+cons_raw = uint and get sm KMI_SM_CMDQ_CONS 0xffffffff
+if ne and cons_raw KMI_CMDQ_CONS_ERR_MASK 0
+ret KMI_SMMU_ERR_CMDQ
+end
+c_idx = kmi_qcursor_decode_idx cons_raw entries
+c_wrap = kmi_qcursor_decode_wrap cons_raw entries
+p_wrap = ne get pcur 1 0
+if ne c_idx get pcur 0
+ret KMI_SMMU_OK
+end
+if eq c_wrap p_wrap
+ret KMI_SMMU_OK
+end
+end
+ret KMI_SMMU_ERR_TIMEOUT
+end
+
+fn kmi_smmu_wait_drain sm view ulong 512 pcur view uint 2 entries uint spins ulong to int
+for s ulong spins bound 1024
+cons_raw = uint and get sm KMI_SM_CMDQ_CONS 0xffffffff
+if ne and cons_raw KMI_CMDQ_CONS_ERR_MASK 0
+ret KMI_SMMU_ERR_CMDQ
+end
+if kmi_qcursor_eq_raw pcur cons_raw entries
+ret KMI_SMMU_OK
+end
+end
+ret KMI_SMMU_ERR_TIMEOUT
+end
+
+fn kmi_smmu_push_cmd sm edit ulong 512 pcur edit uint 2 cmds view ulong * ci ulong to void
+entries = uint and get sm KMI_SM_CMD_ENT 0xffffffff
+sidx = ulong get pcur 0
+qoff = add KMI_SM_CMD_BASE mul sidx 2
+coff = mul ci 2
+put sm qoff get cmds coff
+put sm add qoff 1 get cmds add coff 1
+kmi_smmu_clean sm add get sm KMI_SM_CMD_ADDR mul sidx KMI_CMD_BYTES KMI_CMD_BYTES
+kmi_qcursor_advance pcur entries
+enc = kmi_qcursor_encode get pcur 0 ne get pcur 1 0 entries
+kmi_smmu_reg_write sm KMI_SMMU_CMDQ_PROD enc
+end
+
+fn kmi_smmu_submit_cmds sm edit ulong 512 cmds view ulong * ncmds ulong spins ulong to int
+pcur = new uint 2 0
+entries = uint and get sm KMI_SM_CMD_ENT 0xffffffff
+kmi_qcursor_from_raw uint and get sm KMI_SM_CMDQ_PROD 0xffffffff entries pcur
+for ci ulong ncmds bound 64
+rc = kmi_smmu_wait_space sm pcur entries spins
+if ne rc KMI_SMMU_OK
+ret rc
+end
+kmi_smmu_push_cmd sm pcur cmds ci
+end
+ret kmi_smmu_wait_drain sm pcur entries spins
+end
+
+fn kmi_smmu_inv_ste sm edit ulong 512 sid uint spins ulong to int
+cmds = new ulong 6 0
+ste_addr = add get sm KMI_SM_STREAM_ADDR mul ulong sid KMI_STE_BYTES
+kmi_smmu_clean sm ste_addr KMI_STE_BYTES
+put cmds 0 kmi_smmu_cmd_w0 KMI_CMD_CFGI_STE sid
+put cmds 1 kmi_smmu_cmd_w1 KMI_CMD_CFGI_STE true
+put cmds 2 kmi_smmu_cmd_w0 KMI_CMD_TLBI_NSNH_ALL uint 0
+put cmds 3 kmi_smmu_cmd_w1 KMI_CMD_TLBI_NSNH_ALL false
+put cmds 4 kmi_smmu_cmd_w0 KMI_CMD_SYNC uint 0
+put cmds 5 kmi_smmu_cmd_w1 KMI_CMD_SYNC false
+ret kmi_smmu_submit_cmds sm cmds 3 spins
+end
+
+fn kmi_smmu_abort_ste sm edit ulong 512 sid uint spins ulong to int
+if ge ulong sid get sm KMI_SM_STREAM_ENT
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+base = add KMI_SM_STE_BASE mul ulong sid 8
+put sm base ulong 1
+for w ulong 7
+put sm add base add w 1 ulong 0
+end
+ret kmi_smmu_inv_ste sm sid spins
+end
+
+fn kmi_smmu_install_ste sm edit ulong 512 sid uint ste view ulong 8 spins ulong to int
+if ge ulong sid get sm KMI_SM_STREAM_ENT
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+rc = kmi_smmu_abort_ste sm sid spins
+if ne rc KMI_SMMU_OK
+ret rc
+end
+base = add KMI_SM_STE_BASE mul ulong sid 8
+for w ulong 7
+put sm add base add w 1 get ste add w 1
+end
+ste_addr = add get sm KMI_SM_STREAM_ADDR mul ulong sid KMI_STE_BYTES
+kmi_smmu_clean sm ste_addr KMI_STE_BYTES
+put sm base get ste 0
+ret kmi_smmu_inv_ste sm sid spins
+end
+
+note drain_out[2]: [count, overflowed(0/1)]
+note ev_out: 3 ulongs per event [event_type, stream_id, input_address]
+
+fn kmi_smmu_read_one_ev sm edit ulong 512 sidx ulong ev_out edit ulong * cnt ulong to void
+raw = new ulong 4 0
+dec = new ulong 3 0
+kmi_smmu_inv sm add get sm KMI_SM_EV_ADDR mul sidx KMI_EVENT_BYTES KMI_EVENT_BYTES
+eoff = add KMI_SM_EV_BASE mul sidx 4
+for w ulong 4
+put raw w get sm add eoff w
+end
+kmi_smmu_event_decode raw dec
+ooff = mul cnt 3
+put ev_out ooff get dec 0
+put ev_out add ooff 1 get dec 1
+put ev_out add ooff 2 get dec 2
+end
+
+fn kmi_smmu_read_events sm edit ulong 512 ev_out edit ulong * max_ev ulong drain_out edit ulong 2 to void
+ccur = new uint 2 0
+entries = uint and get sm KMI_SM_EV_ENT 0xffffffff
+prod_raw = uint and get sm KMI_SM_EVENTQ_PROD 0xffffffff
+cons_raw = uint and get sm KMI_SM_EVENTQ_CONS 0xffffffff
+kmi_qcursor_from_raw cons_raw entries ccur
+cnt = ulong 0
+while lt cnt max_ev bound 64
+if kmi_qcursor_eq_raw ccur prod_raw entries
+break
+end
+kmi_smmu_read_one_ev sm ulong get ccur 0 ev_out cnt
+cnt = add cnt 1
+kmi_qcursor_advance ccur entries
+end
+ovf = and prod_raw KMI_EVENTQ_OVERFLOW
+ncons = or kmi_qcursor_encode get ccur 0 ne get ccur 1 0 entries ovf
+kmi_smmu_reg_write sm KMI_SMMU_EVENTQ_CONS ncons
+put drain_out 0 cnt
+if ne ovf and cons_raw KMI_EVENTQ_OVERFLOW
+put drain_out 1 ulong 1
+else
+put drain_out 1 ulong 0
+end
+end
+
+fn kmi_smmu_check_idr sm view ulong 512 stream_id uint to int
+se = uint and get sm KMI_SM_STREAM_ENT 0xffffffff
+ce = uint and get sm KMI_SM_CMD_ENT 0xffffffff
+ee = uint and get sm KMI_SM_EV_ENT 0xffffffff
+if ge stream_id se
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+idr0 = uint and get sm KMI_SM_IDR0 0xffffffff
+if eq and idr0 KMI_IDR0_S1P 0
+ret KMI_SMMU_ERR_UNSUPPORTED
+end
+idr1 = uint and get sm KMI_SM_IDR1 0xffffffff
+if lt and idr1 KMI_IDR1_SIDSIZE_MASK kmi_u32_ctz se
+ret KMI_SMMU_ERR_UNSUPPORTED
+end
+if lt and shr idr1 KMI_IDR1_CMDQS_SHIFT KMI_IDR1_QS_MASK kmi_u32_ctz ce
+ret KMI_SMMU_ERR_UNSUPPORTED
+end
+if lt and shr idr1 KMI_IDR1_EVENTQS_SHIFT KMI_IDR1_QS_MASK kmi_u32_ctz ee
+ret KMI_SMMU_ERR_UNSUPPORTED
+end
+ret KMI_SMMU_OK
+end
+
+fn kmi_smmu_write_tables sm edit ulong 512 stream_id uint cd view ulong 8 to void
+ste = new ulong 8 0
+se = get sm KMI_SM_STREAM_ENT
+ce = get sm KMI_SM_CMD_ENT
+ee = get sm KMI_SM_EV_ENT
+for s ulong se bound 64
+sb = add KMI_SM_STE_BASE mul s 8
+put sm sb ulong 1
+for w ulong 7
+put sm add sb add w 1 ulong 0
+end
+end
+for w ulong 8
+put sm add KMI_SM_CD_BASE w get cd w
+end
+for i ulong mul ce 2 bound 128
+put sm add KMI_SM_CMD_BASE i ulong 0
+end
+for i ulong mul ee 4 bound 256
+put sm add KMI_SM_EV_BASE i ulong 0
+end
+kmi_ste_stage1 get sm KMI_SM_CD_ADDR ste
+sb_live = add KMI_SM_STE_BASE mul ulong stream_id 8
+for w ulong 7
+put sm add sb_live add w 1 get ste add w 1
+end
+put sm sb_live get ste 0
+kmi_smmu_clean sm get sm KMI_SM_STREAM_ADDR mul se KMI_STE_BYTES
+kmi_smmu_clean sm get sm KMI_SM_CD_ADDR KMI_CD_BYTES
+kmi_smmu_clean sm get sm KMI_SM_CMD_ADDR mul ce KMI_CMD_BYTES
+kmi_smmu_inv sm get sm KMI_SM_EV_ADDR mul ee KMI_EVENT_BYTES
+end
+
+fn kmi_smmu_program_stream sm edit ulong 512 stream_id uint cd view ulong 8 spins ulong to int
+cmds = new ulong 6 0
+rc = kmi_smmu_check_idr sm stream_id
+if ne rc KMI_SMMU_OK
+ret rc
+end
+kmi_smmu_write_tables sm stream_id cd
+se = uint and get sm KMI_SM_STREAM_ENT 0xffffffff
+ce = uint and get sm KMI_SM_CMD_ENT 0xffffffff
+ee = uint and get sm KMI_SM_EV_ENT 0xffffffff
+kmi_smmu_reg_write sm KMI_SMMU_CR0 uint 0
+rc = kmi_smmu_wait_cr0 sm uint 0 spins
+if ne rc KMI_SMMU_OK
+ret rc
+end
+kmi_smmu_reg_write sm KMI_SMMU_CR1 uint 0x0d75
+kmi_smmu_reg_write64 sm KMI_SMMU_CMDQ_BASE or get sm KMI_SM_CMD_ADDR ulong kmi_u32_ctz ce
+kmi_smmu_reg_write sm KMI_SMMU_CMDQ_CONS uint 0
+kmi_smmu_reg_write sm KMI_SMMU_CMDQ_PROD uint 0
+kmi_smmu_reg_write64 sm KMI_SMMU_EVENTQ_BASE or get sm KMI_SM_EV_ADDR ulong kmi_u32_ctz ee
+kmi_smmu_reg_write sm KMI_SMMU_EVENTQ_CONS uint 0
+kmi_smmu_reg_write sm KMI_SMMU_EVENTQ_PROD uint 0
+kmi_smmu_reg_write sm KMI_SMMU_STRTAB_BASE_CFG kmi_u32_ctz se
+kmi_smmu_reg_write64 sm KMI_SMMU_STRTAB_BASE get sm KMI_SM_STREAM_ADDR
+qen = or KMI_CR0_CMDQEN KMI_CR0_EVENTQEN
+kmi_smmu_reg_write sm KMI_SMMU_CR0 qen
+rc = kmi_smmu_wait_cr0 sm qen spins
+if ne rc KMI_SMMU_OK
+ret rc
+end
+put cmds 0 kmi_smmu_cmd_w0 KMI_CMD_CFGI_ALL uint 0
+put cmds 1 kmi_smmu_cmd_w1 KMI_CMD_CFGI_ALL false
+put cmds 2 kmi_smmu_cmd_w0 KMI_CMD_TLBI_NSNH_ALL uint 0
+put cmds 3 kmi_smmu_cmd_w1 KMI_CMD_TLBI_NSNH_ALL false
+put cmds 4 kmi_smmu_cmd_w0 KMI_CMD_SYNC uint 0
+put cmds 5 kmi_smmu_cmd_w1 KMI_CMD_SYNC false
+rc = kmi_smmu_submit_cmds sm cmds 3 spins
+if ne rc KMI_SMMU_OK
+ret rc
+end
+en = or KMI_CR0_SMMUEN qen
+kmi_smmu_reg_write sm KMI_SMMU_CR0 en
+ret kmi_smmu_wait_cr0 sm en spins
+end
+
+fn kmi_smmu_configure_linear sm edit ulong 512 stream_id uint cd view ulong 8 spins ulong to int
+rc = kmi_smmu_set_global_abort sm spins
+if ne rc KMI_SMMU_OK
+ret rc
+end
+rc2 = kmi_smmu_program_stream sm stream_id cd spins
+if ne rc2 KMI_SMMU_OK
+kmi_smmu_reg_write sm KMI_SMMU_CR0 uint 0
+ign = kmi_smmu_wait_cr0 sm uint 0 spins
+ret rc2
+end
+ret KMI_SMMU_OK
+end
+
+note Validate identity-policy DMA windows: windows is 3 ulongs per entry [iova, pa, length]
+
+fn kmi_smmu_validate_policy_windows windows view ulong * to int
+n = div len windows 3
+for i ulong n bound 64
+off = mul i 3
+iova = get windows off
+pa = get windows add off 1
+wlen = get windows add off 2
+if ne iova pa
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+if eq wlen 0
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+if ne and iova 0xfff 0
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+if ne and wlen 0xfff 0
+ret KMI_SMMU_ERR_INVALID_WINDOW
+end
+end
+ret KMI_SMMU_OK
+end
+
+note ========================================================================
+note 4 & 5. DMA Gate (dma_gate.rs) and PCI Enumeration/BAR (pci.rs)
+note ========================================================================
+
+const KMI_PCI_REG_ID ushort 0x00
+const KMI_PCI_REG_COMMAND ushort 0x04
+const KMI_PCI_REG_CLASS_REV ushort 0x08
+const KMI_PCI_REG_HEADER ushort 0x0c
+const KMI_PCI_REG_BAR0 ushort 0x10
+
+const KMI_PCI_CMD_IO ushort 1
+const KMI_PCI_CMD_MEMORY ushort 2
+const KMI_PCI_CMD_BUS_MASTER ushort 4
+
+const KMI_PCI_VENDOR_NONE ushort 0xffff
+const KMI_PCI_HEADER_MF uchar 0x80
+const KMI_PCI_TYPE0_BARS uchar 6
+const KMI_PCI_TYPE1_BARS uchar 2
+
+const KMI_DMA_GRANT_CONFINED int 1
+const KMI_DMA_GRANT_UNSAFE_BYPASS int 2
+const KMI_DMA_DENIED_NO_SMMU int -1
+const KMI_DMA_DENIED_SMMU_NOT_READY int -2
+const KMI_SWEEP_FINDINGS ulong 8
+
+const KMI_BAR_MEM32 ulong 0
+const KMI_BAR_MEM64 ulong 1
+const KMI_BAR_IO ulong 2
+
+const KMI_BAR_OK int 0
+const KMI_BAR_ERR_NO_SUCH int 1
+const KMI_BAR_ERR_MISSING_HIGH int 2
+const KMI_BAR_ERR_RESERVED int 3
+const KMI_BAR_ERR_ABSENT int 4
+
+fn kmi_bme_enabled cmd ushort to bool
+ret ne and cmd KMI_PCI_CMD_BUS_MASTER 0
+end
+
+fn kmi_without_bme cmd ushort to ushort
+ret and cmd xor KMI_PCI_CMD_BUS_MASTER 0xffff
+end
+
+fn kmi_with_bme cmd ushort to ushort
+ret or cmd or KMI_PCI_CMD_MEMORY KMI_PCI_CMD_BUS_MASTER
+end
+
+fn kmi_dma_grant smmu_ready bool smmu_present bool unsafe_bypass bool to int
+if smmu_ready
+ret KMI_DMA_GRANT_CONFINED
+end
+if smmu_present
+ret KMI_DMA_DENIED_SMMU_NOT_READY
+end
+if unsafe_bypass
+ret KMI_DMA_GRANT_UNSAFE_BYPASS
+end
+ret KMI_DMA_DENIED_NO_SMMU
+end
+
+fn kmi_bdf_valid dev uchar func uchar to bool
+if gt dev 31
+ret false
+end
+if gt func 7
+ret false
+end
+ret true
+end
+
+fn kmi_bdf_rid bus uchar dev uchar func uchar to uint
+b = shl uint bus 8
+d = shl uint dev 3
+ret or b or d uint func
+end
+
+fn kmi_pci_bar_count htype uchar to uchar
+if eq htype 0
+ret KMI_PCI_TYPE0_BARS
+end
+if eq htype 1
+ret KMI_PCI_TYPE1_BARS
+end
+ret 0
+end
+
+note res[4]: [kind, base, prefetchable(0/1), is_64bit(0/1)]
+
+fn kmi_pci_decode_bar low uint has_high bool high uint res edit ulong 4 to int
+if ne and low 1 0
+put res 0 KMI_BAR_IO
+put res 1 ulong and low 0xfffffffc
+put res 2 ulong 0
+put res 3 ulong 0
+ret KMI_BAR_OK
+end
+pref = ulong 0
+if ne and low 8 0
+pref = 1
+end
+btype = and low 6
+if eq btype 0
+put res 0 KMI_BAR_MEM32
+put res 1 ulong and low 0xfffffff0
+put res 2 pref
+put res 3 ulong 0
+ret KMI_BAR_OK
+end
+if eq btype 4
+if not has_high
+ret KMI_BAR_ERR_MISSING_HIGH
+end
+base64 = or shl ulong high 32 ulong and low 0xfffffff0
+put res 0 KMI_BAR_MEM64
+put res 1 base64
+put res 2 pref
+put res 3 ulong 1
+ret KMI_BAR_OK
+end
+ret KMI_BAR_ERR_RESERVED
+end
+
+note PCI FakeConfig table in cfg edit uint 516:
+note   cfg[0] = count (max 16)
+note   cfg[1] = reads
+note   cfg[2] = writes
+note   cfg[3] = reserved
+note   Each slot s in 0..15 starts at 4 + s * 32:
+note     +0: occupied (1)
+note     +1: rid (bus<<8 | dev<<3 | func)
+note     +2: stuck_cmd (1 if Command writes ignored)
+note     +3: bar_mask_valid (bit i set if bar_mask[i] active)
+note     +4..+9: bar_masks[0..5]
+note     +10..+25: regs[0..15] (dwords at offsets 0x00..0x3c)
+
+const KMI_PCI_CFG_STRIDE ulong 32
+const KMI_PCI_CFG_MAX ulong 16
+
+fn kmi_pci_cfg_init cfg edit uint 516 to void
+for i ulong 516
+put cfg i uint 0
+end
+end
+
+fn kmi_pci_cfg_find cfg view uint 516 rid uint to long
+cnt = ulong get cfg 0
+for i ulong cnt bound 16
+off = add 4 mul i KMI_PCI_CFG_STRIDE
+if eq get cfg off 1
+if eq get cfg add off 1 rid
+ret long i
+end
+end
+end
+ret -1
+end
+
+fn kmi_pci_cfg_add cfg edit uint 516 rid uint vid_did uint header uchar to long
+idx = kmi_pci_cfg_find cfg rid
+if lt idx 0
+cnt = ulong get cfg 0
+if ge cnt KMI_PCI_CFG_MAX
+ret -1
+end
+idx = long cnt
+put cfg 0 uint add cnt 1
+end
+off = add 4 mul ulong idx KMI_PCI_CFG_STRIDE
+for k ulong 32
+put cfg add off k uint 0
+end
+put cfg off uint 1
+put cfg add off 1 rid
+put cfg add off 10 vid_did
+put cfg add off 13 shl uint header 16
+ret idx
+end
+
+fn kmi_pci_cfg_set_reg cfg edit uint 516 idx ulong dw ulong val uint to void
+off = add 4 mul idx KMI_PCI_CFG_STRIDE
+put cfg add off add 10 dw val
+end
+
+fn kmi_pci_cfg_get_reg cfg view uint 516 idx ulong dw ulong to uint
+off = add 4 mul idx KMI_PCI_CFG_STRIDE
+ret get cfg add off add 10 dw
+end
+
+fn kmi_pci_cfg_set_bar_mask cfg edit uint 516 idx ulong bar_i ulong mask uint to void
+off = add 4 mul idx KMI_PCI_CFG_STRIDE
+bmv = get cfg add off 3
+put cfg add off 3 or bmv shl uint 1 uint and bar_i 31
+put cfg add off add 4 bar_i mask
+end
+
+fn kmi_pci_cfg_set_stuck cfg edit uint 516 idx ulong stuck bool to void
+off = add 4 mul idx KMI_PCI_CFG_STRIDE
+if stuck
+put cfg add off 2 uint 1
+else
+put cfg add off 2 uint 0
+end
+end
+
+fn kmi_pci_cfg_read32 cfg edit uint 516 rid uint offset ushort to uint
+put cfg 1 add get cfg 1 1
+idx = kmi_pci_cfg_find cfg rid
+if lt idx 0
+ret 0xffffffff
+end
+dw = ulong div offset 4
+if ge dw 16
+ret 0
+end
+off = add 4 mul ulong idx KMI_PCI_CFG_STRIDE
+ret get cfg add off add 10 dw
+end
+
+fn kmi_pci_mask_bar_wr cfg view uint 516 off ulong offset ushort val uint cur uint to uint
+if lt offset KMI_PCI_REG_BAR0
+ret val
+end
+bi = ulong div sub offset KMI_PCI_REG_BAR0 4
+if ge bi 6
+ret val
+end
+bmv = get cfg add off 3
+bit_m = shl uint 1 uint and bi 31
+if eq and bmv bit_m 0
+ret val
+end
+mask = get cfg add off add 4 bi
+inv_m = xor mask 0xffffffff
+ret or and val mask and cur inv_m
+end
+
+fn kmi_pci_cfg_write32 cfg edit uint 516 rid uint offset ushort val uint to void
+put cfg 2 add get cfg 2 1
+idx = kmi_pci_cfg_find cfg rid
+if lt idx 0
+ret
+end
+dw = ulong div offset 4
+if ge dw 16
+ret
+end
+off = add 4 mul ulong idx KMI_PCI_CFG_STRIDE
+cur = get cfg add off add 10 dw
+nv = kmi_pci_mask_bar_wr cfg off offset val cur
+if eq offset KMI_PCI_REG_COMMAND
+if ne get cfg add off 2 0
+ret
+end
+status = and shr cur 16 xor shr nv 16 0xffffffff
+nv = or shl status 16 and nv 0xffff
+end
+put cfg add off add 10 dw nv
+end
+
+fn kmi_pci_cfg_write16 cfg edit uint 516 rid uint offset ushort val ushort to void
+put cfg 2 add get cfg 2 1
+idx = kmi_pci_cfg_find cfg rid
+if lt idx 0
+ret
+end
+off = add 4 mul ulong idx KMI_PCI_CFG_STRIDE
+if eq offset KMI_PCI_REG_COMMAND
+if ne get cfg add off 2 0
+ret
+end
+cur = get cfg add off 11
+nv = or and cur 0xffff0000 uint val
+put cfg add off 11 nv
+end
+end
+
+note fn_info[6]: [rid, vendor_id, device_id, header_type, multi_function(0/1), class_rev]
+
+fn kmi_pci_read_fn cfg edit uint 516 rid uint fn_out edit uint 6 to bool
+id = kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_ID
+vid = and id 0xffff
+if eq vid 0xffff
+ret false
+end
+if eq vid 0
+ret false
+end
+hdr = and shr kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_HEADER 16 0xff
+crev = kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_CLASS_REV
+put fn_out 0 rid
+put fn_out 1 vid
+put fn_out 2 shr id 16
+put fn_out 3 and hdr 0x7f
+if ne and hdr 0x80 0
+put fn_out 4 uint 1
+else
+put fn_out 4 uint 0
+end
+put fn_out 5 crev
+ret true
+end
+
+note Walk buses start_bus..=end_bus; writes 6 uints per found function into found_out
+
+fn kmi_pci_append_fn found_out edit uint * fi view uint 6 cnt_io edit ulong 1 to void
+max_f = div len found_out 6
+cnt = get cnt_io 0
+if lt cnt max_f
+foff = mul cnt 6
+for k ulong 6
+put found_out add foff k get fi k
+end
+end
+put cnt_io 0 add cnt 1
+end
+
+fn kmi_pci_walk_dev cfg edit uint 516 bus uchar dev uchar found_out edit uint * cnt_io edit ulong 1 to void
+fi = new uint 6 0
+mf = false
+for func ulong 8
+rid = kmi_bdf_rid bus dev uchar and func 7
+ok = kmi_pci_read_fn cfg rid fi
+if eq func 0
+if ok
+mf = ne get fi 4 0
+else
+break
+end
+end
+if ok
+kmi_pci_append_fn found_out fi cnt_io
+end
+if eq func 0
+if not mf
+break
+end
+end
+end
+end
+
+fn kmi_pci_walk cfg edit uint 516 start_bus uchar end_bus uchar found_out edit uint * to uint
+cnt_io = new ulong 1 0
+if gt start_bus end_bus
+ret 0
+end
+bus = ulong start_bus
+end_b = ulong end_bus
+while le bus end_b bound 256
+for dev ulong 32
+kmi_pci_walk_dev cfg uchar and bus 255 uchar and dev 31 found_out cnt_io
+end
+bus = add bus 1
+end
+ret uint and get cnt_io 0 0xffffffff
+end
+
+fn kmi_pci_find_dev cfg edit uint 516 bus uchar dev uchar vid_did uint fn_out edit uint 6 to bool
+fi = new uint 6 0
+mf = false
+for func ulong 8
+rid = kmi_bdf_rid bus dev uchar and func 7
+ok = kmi_pci_read_fn cfg rid fi
+if eq func 0
+if ok
+mf = ne get fi 4 0
+else
+break
+end
+end
+if ok
+if eq get fi 1 and vid_did 0xffff
+if eq get fi 2 shr vid_did 16
+for k ulong 6
+put fn_out k get fi k
+end
+ret true
+end
+end
+end
+if eq func 0
+if not mf
+break
+end
+end
+end
+ret false
+end
+
+fn kmi_pci_find_device cfg edit uint 516 start_bus uchar end_bus uchar vid_did uint fn_out edit uint 6 to bool
+if gt start_bus end_bus
+ret false
+end
+bus = ulong start_bus
+end_b = ulong end_bus
+while le bus end_b bound 256
+for dev ulong 32
+if kmi_pci_find_dev cfg uchar and bus 255 uchar and dev 31 vid_did fn_out
+ret true
+end
+end
+bus = add bus 1
+end
+ret false
+end
+
+fn kmi_pci_read_bar cfg edit uint 516 fn_info view uint 6 idx uchar res edit ulong 4 to int
+htype = uchar and get fn_info 3 0xff
+bc = kmi_pci_bar_count htype
+if ge idx bc
+ret KMI_BAR_ERR_NO_SUCH
+end
+rid = get fn_info 0
+off = add KMI_PCI_REG_BAR0 mul ushort idx 4
+low = kmi_pci_cfg_read32 cfg rid off
+if eq low 0xffffffff
+ret KMI_BAR_ERR_ABSENT
+end
+has_hi = lt add idx 1 bc
+hi = uint 0
+if has_hi
+hi = kmi_pci_cfg_read32 cfg rid add off 4
+end
+ret kmi_pci_decode_bar low has_hi hi res
+end
+
+fn kmi_pci_read_cmd cfg edit uint 516 rid uint to ushort
+ret ushort and kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_COMMAND 0xffff
+end
+
+fn kmi_pci_update_cmd cfg edit uint 516 rid uint set_b ushort clr_b ushort to ushort
+cur = kmi_pci_read_cmd cfg rid
+nv = and or cur set_b xor clr_b 0xffff
+kmi_pci_cfg_write32 cfg rid KMI_PCI_REG_COMMAND uint nv
+ret nv
+end
+
+fn kmi_u64_isolate_low1 v ulong to ulong
+if eq v 0
+ret 0
+end
+ret and v add xor v 0xffffffffffffffff 1
+end
+
+note size_out[2]: [has_size(0/1), size]
+
+fn kmi_pci_probe_dword cfg edit uint 516 rid uint off ushort mask_bits uint to uint
+orig = kmi_pci_cfg_read32 cfg rid off
+kmi_pci_cfg_write32 cfg rid off 0xffffffff
+probed = and kmi_pci_cfg_read32 cfg rid off mask_bits
+kmi_pci_cfg_write32 cfg rid off orig
+ret probed
+end
+
+fn kmi_pci_probe_bar_size cfg edit uint 516 fn_info view uint 6 idx uchar size_out edit ulong 2 to int
+bar = new ulong 4 0
+rc = kmi_pci_read_bar cfg fn_info idx bar
+if ne rc KMI_BAR_OK
+ret rc
+end
+if eq get bar 0 KMI_BAR_IO
+ret KMI_BAR_ERR_NO_SUCH
+end
+rid = get fn_info 0
+cmd = kmi_pci_read_cmd cfg rid
+dis = and cmd xor or KMI_PCI_CMD_MEMORY KMI_PCI_CMD_IO 0xffff
+kmi_pci_cfg_write32 cfg rid KMI_PCI_REG_COMMAND uint dis
+low_at = add KMI_PCI_REG_BAR0 mul ushort idx 4
+low_m = kmi_pci_probe_dword cfg rid low_at 0xfffffff0
+mask = or ulong low_m 0xffffffff00000000
+is64 = ne get bar 3 0
+if is64
+hi_m = kmi_pci_probe_dword cfg rid add low_at 4 0xffffffff
+mask = or shl ulong hi_m 32 ulong low_m
+end
+kmi_pci_cfg_write32 cfg rid KMI_PCI_REG_COMMAND uint cmd
+if eq mask 0
+put size_out 0 ulong 0
+put size_out 1 ulong 0
+ret KMI_BAR_OK
+end
+if not is64
+if eq low_m 0
+put size_out 0 ulong 0
+put size_out 1 ulong 0
+ret KMI_BAR_OK
+end
+end
+put size_out 0 ulong 1
+put size_out 1 kmi_u64_isolate_low1 mask
+ret KMI_BAR_OK
+end
+
+note sweep_out[40]:
+note   0: functions   1: bridges   2: bridges_bme   3: endpoints_bme   4: still_enabled
+note   8 + i*4: [rid, cmd_before, cmd_after, cleared(0/1)] for i in 0..7
+
+fn kmi_sweep_fn cfg edit uint 516 rid uint sweep edit ulong 40 to uchar
+id = kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_ID
+if eq and id 0xffff 0xffff
+ret 0
+end
+put sweep 0 add get sweep 0 1
+hdr = and shr kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_HEADER 16 0xff
+cmd = ushort and kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_COMMAND 0xffff
+if eq and hdr 0x7f 1
+put sweep 1 add get sweep 1 1
+if kmi_bme_enabled cmd
+put sweep 2 add get sweep 2 1
+end
+else
+if kmi_bme_enabled cmd
+kmi_pci_cfg_write16 cfg rid KMI_PCI_REG_COMMAND kmi_without_bme cmd
+after = ushort and kmi_pci_cfg_read32 cfg rid KMI_PCI_REG_COMMAND 0xffff
+ep_idx = get sweep 3
+cleared = not kmi_bme_enabled after
+if lt ep_idx KMI_SWEEP_FINDINGS
+foff = add 8 mul ep_idx 4
+put sweep foff ulong rid
+put sweep add foff 1 ulong cmd
+put sweep add foff 2 ulong after
+if cleared
+put sweep add foff 3 ulong 1
+else
+put sweep add foff 3 ulong 0
+end
+end
+put sweep 3 add ep_idx 1
+if not cleared
+put sweep 4 add get sweep 4 1
+end
+end
+end
+if ne and hdr 0x80 0
+ret 2
+end
+ret 1
+end
+
+fn kmi_sweep_dev cfg edit uint 516 bus uchar dev uchar sweep edit ulong 40 to void
+for func ulong 8
+rid = kmi_bdf_rid bus dev uchar and func 7
+st = kmi_sweep_fn cfg rid sweep
+if eq func 0
+if eq st 0
+break
+end
+if eq st 1
+break
+end
+end
+end
+end
+
+fn kmi_sweep_bus_master cfg edit uint 516 start_bus uchar end_bus uchar sweep edit ulong 40 to void
+for i ulong 40
+put sweep i ulong 0
+end
+if gt start_bus end_bus
+ret
+end
+bus = ulong start_bus
+end_b = ulong end_bus
+while le bus end_b bound 256
+for dev ulong 32
+kmi_sweep_dev cfg uchar and bus 255 uchar and dev 31 sweep
+end
+bus = add bus 1
+end
+end
+
+note ========================================================================
+note 6. Device Registry and Capability-Gated DMA Authority (device.rs)
+note ========================================================================
+
+const KMI_DMA_QUIESCED ulong 0
+const KMI_DMA_TRANSLATION_INSTALLED ulong 1
+const KMI_DMA_ACTIVE ulong 2
+const KMI_DMA_REVOKING ulong 3
+
+const KMI_HW_NONE ulong 0
+const KMI_HW_INSTALL ulong 1
+const KMI_HW_ENABLE_BME ulong 2
+const KMI_HW_DISABLE_BME ulong 3
+const KMI_HW_QUIESCE ulong 4
+const KMI_HW_ABORT_STREAM ulong 5
+const KMI_HW_INVALIDATE ulong 6
+
+const KMI_EFF_INSTALL ulong 1
+const KMI_EFF_BME_ON ulong 2
+const KMI_EFF_BME_OFF ulong 3
+const KMI_EFF_STOP_WORK ulong 4
+const KMI_EFF_QUIESCE ulong 5
+const KMI_EFF_ABORT ulong 6
+const KMI_EFF_INVALIDATE ulong 7
+
+const KMI_DEV_OK int 0
+const KMI_DEV_ERR_CAP_INVALID int 1
+const KMI_DEV_ERR_CAP_RIGHTS int 2
+const KMI_DEV_ERR_CAP_DUP_TABLE int 3
+const KMI_DEV_ERR_NOT_DEVICE int 4
+const KMI_DEV_ERR_WRONG_STATE int 5
+const KMI_DEV_ERR_NO_WINDOW int 6
+const KMI_DEV_ERR_BAD_WINDOW int 7
+const KMI_DEV_ERR_FULL int 8
+const KMI_DEV_ERR_DUPLICATE int 9
+const KMI_DEV_ERR_HARDWARE int 10
+
+const KMI_RIGHT_NONE ulong 0
+const KMI_RIGHT_READ ulong 1
+const KMI_RIGHT_WRITE ulong 2
+const KMI_RIGHT_MAP ulong 4
+const KMI_RIGHT_REVOKE ulong 8
+const KMI_RIGHT_ALL ulong 0x3f
+
+note Minimal CapTable in ct edit ulong 64:
+note   ct[0] = table_id
+note   ct[1] = cap_slots (max 4)
+note   ct[2..3] = reserved
+note   slot i in 0..3 at 4 + i*8:
+note     +0: occupied(0/1)  +1: gen  +2: resource  +3: rights
+note     +4: has_parent     +5: parent_table  +6: parent_idx  +7: parent_gen
+
+fn kmi_cap_init ct edit ulong 64 table_id ulong cap_slots ulong to void
+for i ulong 64
+put ct i ulong 0
+end
+put ct 0 table_id
+put ct 1 cap_slots
+end
+
+fn kmi_cap_pack_handle idx ulong gen ulong to ulong
+ret or shl gen 32 and idx 0xffffffff
+end
+
+fn kmi_cap_handle_idx h ulong to ulong
+ret and h 0xffffffff
+end
+
+fn kmi_cap_handle_gen h ulong to ulong
+ret shr h 32
+end
+
+fn kmi_cap_insert ct edit ulong 64 res ulong rights ulong h_out edit ulong 1 to bool
+cap_s = get ct 1
+for i ulong cap_s bound 4
+off = add 4 mul i 8
+if eq get ct off 0
+ng = add get ct add off 1 1
+put ct off ulong 1
+put ct add off 1 ng
+put ct add off 2 res
+put ct add off 3 rights
+put ct add off 4 ulong 0
+put ct add off 5 ulong 0
+put ct add off 6 ulong 0
+put ct add off 7 ulong 0
+put h_out 0 kmi_cap_pack_handle i ng
+ret true
+end
+end
+ret false
+end
+
+fn kmi_cap_lookup ct view ulong 64 handle ulong req_rights ulong res_out edit ulong 1 to int
+idx = kmi_cap_handle_idx handle
+gen = kmi_cap_handle_gen handle
+if ge idx get ct 1
+ret KMI_DEV_ERR_CAP_INVALID
+end
+off = add 4 mul idx 8
+if eq get ct off 0
+ret KMI_DEV_ERR_CAP_INVALID
+end
+if ne get ct add off 1 gen
+ret KMI_DEV_ERR_CAP_INVALID
+end
+r = get ct add off 3
+if ne and r req_rights req_rights
+ret KMI_DEV_ERR_CAP_RIGHTS
+end
+put res_out 0 get ct add off 2
+ret KMI_DEV_OK
+end
+
+fn kmi_cap_remove ct edit ulong 64 handle ulong to bool
+idx = kmi_cap_handle_idx handle
+gen = kmi_cap_handle_gen handle
+if ge idx get ct 1
+ret false
+end
+off = add 4 mul idx 8
+if eq get ct off 0
+ret false
+end
+if ne get ct add off 1 gen
+ret false
+end
+put ct off ulong 0
+ret true
+end
+
+fn kmi_cap_derive_into src view ulong 64 handle ulong dst edit ulong 64 new_rights ulong h_out edit ulong 1 to int
+res_b = new ulong 1 0
+rc = kmi_cap_lookup src handle new_rights res_b
+if ne rc KMI_DEV_OK
+ret rc
+end
+cap_s = get dst 1
+for i ulong cap_s bound 4
+off = add 4 mul i 8
+if eq get dst off 0
+ng = add get dst add off 1 1
+put dst off ulong 1
+put dst add off 1 ng
+put dst add off 2 get res_b 0
+put dst add off 3 new_rights
+put dst add off 4 ulong 1
+put dst add off 5 get src 0
+put dst add off 6 kmi_cap_handle_idx handle
+put dst add off 7 kmi_cap_handle_gen handle
+put h_out 0 kmi_cap_pack_handle i ng
+ret KMI_DEV_OK
+end
+end
+ret KMI_DEV_ERR_FULL
+end
+
+note Revoke handle in c0 and any descendants in c0 or c1 (two-table set, covers all device.rs tests)
+
+fn kmi_cap_clear_children ct edit ulong 64 ptab ulong pidx ulong pgen ulong to void
+cap_s = get ct 1
+for i ulong cap_s bound 4
+off = add 4 mul i 8
+if eq get ct off 1
+if eq get ct add off 4 1
+if eq get ct add off 5 ptab
+if eq get ct add off 6 pidx
+if eq get ct add off 7 pgen
+put ct off ulong 0
+end
+end
+end
+end
+end
+end
+end
+
+fn kmi_cap_revoke2 target_tid ulong handle ulong c0 edit ulong 64 c1 edit ulong 64 has_c1 bool to int
+found_c0 = eq get c0 0 target_tid
+found_c1 = false
+if has_c1
+found_c1 = eq get c1 0 target_tid
+end
+if found_c0
+if found_c1
+ret KMI_DEV_ERR_CAP_DUP_TABLE
+end
+end
+if not found_c0
+if not found_c1
+ret KMI_DEV_ERR_CAP_DUP_TABLE
+end
+end
+idx = kmi_cap_handle_idx handle
+gen = kmi_cap_handle_gen handle
+if found_c0
+if not kmi_cap_remove c0 handle
+ret KMI_DEV_ERR_CAP_INVALID
+end
+kmi_cap_clear_children c0 target_tid idx gen
+if has_c1
+kmi_cap_clear_children c1 target_tid idx gen
+end
+else
+if not kmi_cap_remove c1 handle
+ret KMI_DEV_ERR_CAP_INVALID
+end
+kmi_cap_clear_children c0 target_tid idx gen
+kmi_cap_clear_children c1 target_tid idx gen
+end
+ret KMI_DEV_OK
+end
+
+note DmaWindow validation
+
+fn kmi_dma_window_valid iova ulong pages uint to bool
+if eq pages 0
+ret false
+end
+if ne and iova 0xfff 0
+ret false
+end
+nbytes = mul ulong pages 4096
+ret kmi_range_end_ok iova nbytes
+end
+
+note Hardware recorder hw edit ulong 128:
+note   0: effect_count   1: fail_step   2: bme(0/1)   3: aborted(0/1)
+note   4: last_fail_step  5: last_fault
+note   8 + i*3: [effect_kind, arg1, arg2] (up to 40 effects)
+
+fn kmi_hw_init hw edit ulong 128 fail_step ulong to void
+for i ulong 128
+put hw i ulong 0
+end
+put hw 1 fail_step
+end
+
+fn kmi_hw_clear_effects hw edit ulong 128 to void
+put hw 0 ulong 0
+end
+
+fn kmi_hw_record hw edit ulong 128 kind ulong a1 ulong a2 ulong to void
+cnt = get hw 0
+if lt cnt 40
+off = add 8 mul cnt 3
+put hw off kind
+put hw add off 1 a1
+put hw add off 2 a2
+end
+put hw 0 add cnt 1
+end
+
+fn kmi_hw_step_check hw view ulong 128 step ulong to bool
+ret ne get hw 1 step
+end
+
+note DeviceTable in dtab edit ulong 128:
+note   dtab[0] = cap_slots (max 8)
+note   slot i in 0..7 at 4 + i*12:
+note     +0: occupied(0/1)  +1: resource   +2: dev_id     +3: rid
+note     +4: sid            +5: state      +6: has_win    +7: win_iova
+note     +8: win_pages      +9: has_auth  +10: auth_tab  +11: auth_handle
+
+fn kmi_dtab_init dtab edit ulong 128 cap_slots ulong to void
+for i ulong 128
+put dtab i ulong 0
+end
+put dtab 0 cap_slots
+end
+
+fn kmi_dtab_find dtab view ulong 128 res ulong to long
+cap_s = get dtab 0
+for i ulong cap_s bound 8
+off = add 4 mul i 12
+if eq get dtab off 1
+if eq get dtab add off 1 res
+ret long i
+end
+end
+end
+ret -1
+end
+
+note dev_spec[8]: [resource, dev_id, rid, sid, state, has_win, win_iova, win_pages]
+
+fn kmi_dtab_register dtab edit ulong 128 spec view ulong 8 to int
+if ne get spec 4 KMI_DMA_QUIESCED
+ret KMI_DEV_ERR_WRONG_STATE
+end
+if ne get spec 5 0
+if not kmi_dma_window_valid get spec 6 uint and get spec 7 0xffffffff
+ret KMI_DEV_ERR_BAD_WINDOW
+end
+end
+cap_s = get dtab 0
+free_i = long -1
+for i ulong cap_s bound 8
+off = add 4 mul i 12
+if eq get dtab off 1
+if eq get dtab add off 1 get spec 0
+ret KMI_DEV_ERR_DUPLICATE
+end
+if eq get dtab add off 2 get spec 1
+ret KMI_DEV_ERR_DUPLICATE
+end
+if eq get dtab add off 3 get spec 2
+ret KMI_DEV_ERR_DUPLICATE
+end
+if eq get dtab add off 4 get spec 3
+ret KMI_DEV_ERR_DUPLICATE
+end
+else
+if lt free_i 0
+free_i = long i
+end
+end
+end
+if lt free_i 0
+ret KMI_DEV_ERR_FULL
+end
+foff = add 4 mul ulong free_i 12
+put dtab foff ulong 1
+put dtab add foff 1 get spec 0
+put dtab add foff 2 get spec 1
+put dtab add foff 3 get spec 2
+put dtab add foff 4 get spec 3
+put dtab add foff 5 KMI_DMA_QUIESCED
+put dtab add foff 6 get spec 5
+put dtab add foff 7 get spec 6
+put dtab add foff 8 get spec 7
+put dtab add foff 9 ulong 0
+put dtab add foff 10 ulong 0
+put dtab add foff 11 ulong 0
+ret KMI_DEV_OK
+end
+
+fn kmi_dtab_set_window dtab edit ulong 128 res ulong iova ulong pages uint to int
+idx = kmi_dtab_find dtab res
+if lt idx 0
+ret KMI_DEV_ERR_NOT_DEVICE
+end
+off = add 4 mul ulong idx 12
+if ne get dtab add off 5 KMI_DMA_QUIESCED
+ret KMI_DEV_ERR_WRONG_STATE
+end
+if not kmi_dma_window_valid iova pages
+ret KMI_DEV_ERR_BAD_WINDOW
+end
+put dtab add off 6 ulong 1
+put dtab add off 7 iova
+put dtab add off 8 ulong pages
+ret KMI_DEV_OK
+end
+
+fn kmi_dev_teardown dtab edit ulong 128 idx ulong hw edit ulong 128 to int
+off = add 4 mul idx 12
+dev_id = get dtab add off 2
+rid = get dtab add off 3
+sid = get dtab add off 4
+put dtab add off 5 KMI_DMA_REVOKING
+put dtab add off 6 ulong 0
+put dtab add off 7 ulong 0
+put dtab add off 8 ulong 0
+put dtab add off 9 ulong 0
+put dtab add off 10 ulong 0
+put dtab add off 11 ulong 0
+first_step = ulong 0
+kmi_hw_record hw KMI_EFF_STOP_WORK dev_id ulong 0
+kmi_hw_record hw KMI_EFF_BME_OFF rid ulong 0
+if kmi_hw_step_check hw KMI_HW_DISABLE_BME
+put hw 2 ulong 0
+else
+if eq first_step 0
+first_step = KMI_HW_DISABLE_BME
+end
+end
+kmi_hw_record hw KMI_EFF_QUIESCE dev_id ulong 0
+if not kmi_hw_step_check hw KMI_HW_QUIESCE
+if eq first_step 0
+first_step = KMI_HW_QUIESCE
+end
+end
+kmi_hw_record hw KMI_EFF_ABORT sid ulong 0
+if kmi_hw_step_check hw KMI_HW_ABORT_STREAM
+put hw 3 ulong 1
+else
+if eq first_step 0
+first_step = KMI_HW_ABORT_STREAM
+end
+end
+kmi_hw_record hw KMI_EFF_INVALIDATE sid ulong 0
+if not kmi_hw_step_check hw KMI_HW_INVALIDATE
+if eq first_step 0
+first_step = KMI_HW_INVALIDATE
+end
+end
+if eq first_step 0
+put dtab add off 5 KMI_DMA_QUIESCED
+ret KMI_DEV_OK
+end
+put hw 4 first_step
+put hw 5 ulong 0xdead
+ret KMI_DEV_ERR_HARDWARE
+end
+
+fn kmi_dev_activate ct view ulong 64 handle ulong dtab edit ulong 128 hw edit ulong 128 to int
+res_b = new ulong 1 0
+rc = kmi_cap_lookup ct handle KMI_RIGHT_MAP res_b
+if ne rc KMI_DEV_OK
+ret rc
+end
+idx = kmi_dtab_find dtab get res_b 0
+if lt idx 0
+ret KMI_DEV_ERR_NOT_DEVICE
+end
+off = add 4 mul ulong idx 12
+if ne get dtab add off 5 KMI_DMA_QUIESCED
+ret KMI_DEV_ERR_WRONG_STATE
+end
+if eq get dtab add off 6 0
+ret KMI_DEV_ERR_NO_WINDOW
+end
+rid = get dtab add off 3
+sid = get dtab add off 4
+iova = get dtab add off 7
+pages = get dtab add off 8
+kmi_hw_record hw KMI_EFF_INSTALL sid or iova pages
+if not kmi_hw_step_check hw KMI_HW_INSTALL
+ign = kmi_dev_teardown dtab ulong idx hw
+put hw 4 KMI_HW_INSTALL
+put hw 5 ulong 0xdead
+ret KMI_DEV_ERR_HARDWARE
+end
+put hw 3 ulong 0
+put dtab add off 5 KMI_DMA_TRANSLATION_INSTALLED
+kmi_hw_record hw KMI_EFF_BME_ON rid ulong 1
+if not kmi_hw_step_check hw KMI_HW_ENABLE_BME
+ign2 = kmi_dev_teardown dtab ulong idx hw
+put hw 4 KMI_HW_ENABLE_BME
+put hw 5 ulong 0xdead
+ret KMI_DEV_ERR_HARDWARE
+end
+put hw 2 ulong 1
+put dtab add off 5 KMI_DMA_ACTIVE
+put dtab add off 9 ulong 1
+put dtab add off 10 get ct 0
+put dtab add off 11 handle
+ret KMI_DEV_OK
+end
+
+note req[3]: [target_tid, handle, has_c1(0/1)]
+
+fn kmi_dev_revoke req view ulong 3 c0 edit ulong 64 c1 edit ulong 64 dtab edit ulong 128 hw edit ulong 128 to int
+res_b = new ulong 1 0
+tid = get req 0
+handle = get req 1
+has_c1 = ne get req 2 0
+m0 = eq get c0 0 tid
+m1 = false
+if has_c1
+m1 = eq get c1 0 tid
+end
+if m0
+if m1
+ret KMI_DEV_ERR_CAP_DUP_TABLE
+end
+end
+if not m0
+if not m1
+ret KMI_DEV_ERR_CAP_DUP_TABLE
+end
+end
+rc = KMI_DEV_OK
+if m0
+rc = kmi_cap_lookup c0 handle KMI_RIGHT_REVOKE res_b
+else
+rc = kmi_cap_lookup c1 handle KMI_RIGHT_REVOKE res_b
+end
+if ne rc KMI_DEV_OK
+ret rc
+end
+idx = kmi_dtab_find dtab get res_b 0
+if lt idx 0
+ret KMI_DEV_ERR_NOT_DEVICE
+end
+hw_rc = kmi_dev_teardown dtab ulong idx hw
+rev_rc = kmi_cap_revoke2 tid handle c0 c1 has_c1
+if ne hw_rc KMI_DEV_OK
+ret hw_rc
+end
+ret rev_rc
+end
+
+fn kmi_dtab_force_quiesce dtab edit ulong 128 res ulong hw edit ulong 128 to int
+idx = kmi_dtab_find dtab res
+if lt idx 0
+ret KMI_DEV_ERR_NOT_DEVICE
+end
+ret kmi_dev_teardown dtab ulong idx hw
+end
+
+note ntables: 0, 1 (c0), or 2 (c0 and c1)
+
+fn kmi_dtab_auth_live dtab view ulong 128 off ulong ntables ulong c0 view ulong 64 c1 view ulong 64 to bool
+res_b = new ulong 1 0
+if eq get dtab add off 9 0
+ret false
+end
+atab = get dtab add off 10
+m0 = false
+m1 = false
+if ge ntables 1
+m0 = eq get c0 0 atab
+end
+if ge ntables 2
+m1 = eq get c1 0 atab
+end
+if m0
+if not m1
+if eq kmi_cap_lookup c0 get dtab add off 11 KMI_RIGHT_MAP res_b KMI_DEV_OK
+ret eq get res_b 0 get dtab add off 1
+end
+end
+end
+if m1
+if not m0
+if eq kmi_cap_lookup c1 get dtab add off 11 KMI_RIGHT_MAP res_b KMI_DEV_OK
+ret eq get res_b 0 get dtab add off 1
+end
+end
+end
+ret false
+end
+
+fn kmi_dtab_sweep dtab edit ulong 128 ntables ulong c0 view ulong 64 c1 view ulong 64 hw edit ulong 128 to int
+cap_s = get dtab 0
+first_rc = KMI_DEV_OK
+for i ulong cap_s bound 8
+off = add 4 mul i 12
+if eq get dtab off 1
+if ne get dtab add off 5 KMI_DMA_QUIESCED
+if not kmi_dtab_auth_live dtab off ntables c0 c1
+trc = kmi_dev_teardown dtab i hw
+if eq first_rc KMI_DEV_OK
+first_rc = trc
+end
+end
+end
+end
+end
+ret first_rc
+end
+
+note ========================================================================
+note 7. EDU DMA Device State Model (edu.rs)
+note ========================================================================
+
+const KMI_EDU_VENDOR_ID ushort 0x1234
+const KMI_EDU_DEVICE_ID ushort 0x11e8
+const KMI_EDU_BAR0_SIZE ulong 0x100000
+const KMI_EDU_DMA_BUF_ADDR ulong 0x40000
+const KMI_EDU_DMA_BUF_SIZE ulong 4096
+const KMI_EDU_DEFAULT_DMA_MASK ulong 0x0fffffff
+const KMI_EDU_ID_SIG uint 0x00ed
+const KMI_EDU_DMA_START ulong 1
+const KMI_EDU_DMA_TO_RAM ulong 2
+const KMI_EDU_DMA_IRQ ulong 4
+const KMI_EDU_IRQ_BIT uint 0x100
+
+const KMI_EDU_OK int 0
+const KMI_EDU_ERR_NOT_EDU int 1
+const KMI_EDU_ERR_LIVENESS int 2
+const KMI_EDU_ERR_EMPTY int 3
+const KMI_EDU_ERR_TOO_LONG int 4
+const KMI_EDU_ERR_IOVA_RANGE int 5
+const KMI_EDU_ERR_BUSY int 6
+const KMI_EDU_ERR_TIMEOUT int 7
+
+note edu_st[24]:
+note   0: id          1: liveness     2: irq_status   3: src
+note   4: dst         5: count        6: cmd          7: drv_dma_mask
+note   8: spin_limit  9: ram_base    10: blk_start   11: blk_end
+note  12: has_delay  13: delay       14: polls_left  15: transfers
+note  16: inv_live   17: dev_mask    18: ver_major   19: ver_minor
+
+fn kmi_edu_init st edit ulong 24 to void
+for i ulong 24
+put st i ulong 0
+end
+put st 0 ulong 0x010000ed
+put st 7 KMI_EDU_DEFAULT_DMA_MASK
+put st 8 ulong 1000
+put st 9 ulong 0x100000
+put st 12 ulong 1
+put st 13 ulong 3
+put st 16 ulong 1
+put st 17 KMI_EDU_DEFAULT_DMA_MASK
+end
+
+fn kmi_edu_probe st edit ulong 24 to int
+id = uint and get st 0 0xffffffff
+if ne and id 0xffff KMI_EDU_ID_SIG
+ret KMI_EDU_ERR_NOT_EDU
+end
+p0 = uint 0x5a5aa5a5
+inv = ne get st 16 0
+if inv
+put st 1 ulong xor p0 0xffffffff
+else
+put st 1 ulong p0
+end
+r0 = uint and get st 1 0xffffffff
+if ne r0 xor p0 0xffffffff
+ret KMI_EDU_ERR_LIVENESS
+end
+p1 = uint 0x01234567
+if inv
+put st 1 ulong xor p1 0xffffffff
+else
+put st 1 ulong p1
+end
+r1 = uint and get st 1 0xffffffff
+if ne r1 xor p1 0xffffffff
+ret KMI_EDU_ERR_LIVENESS
+end
+put st 18 ulong and shr id 24 0xff
+put st 19 ulong and shr id 16 0xff
+ret KMI_EDU_OK
+end
+
+fn kmi_edu_check st view ulong 24 iova ulong xlen ulong to int
+if eq xlen 0
+ret KMI_EDU_ERR_EMPTY
+end
+if gt xlen KMI_EDU_DMA_BUF_SIZE
+ret KMI_EDU_ERR_TOO_LONG
+end
+if not kmi_range_end_ok iova sub xlen 1
+ret KMI_EDU_ERR_IOVA_RANGE
+end
+last = add iova sub xlen 1
+not_mask = xor get st 7 0xffffffffffffffff
+if ne and iova not_mask 0
+ret KMI_EDU_ERR_IOVA_RANGE
+end
+if ne and last not_mask 0
+ret KMI_EDU_ERR_IOVA_RANGE
+end
+ret KMI_EDU_OK
+end
+
+fn kmi_edu_copy_buf dev_buf edit uchar 4096 ram_buf edit uchar 16384 off ulong ram_off ulong xlen ulong to_ram bool to void
+for i ulong xlen bound 4096
+if to_ram
+put ram_buf add ram_off i get dev_buf add off i
+else
+put dev_buf add off i get ram_buf add ram_off i
+end
+end
+end
+
+fn kmi_edu_run_dma st edit ulong 24 dev_buf edit uchar 4096 ram_buf edit uchar 16384 to void
+cmd = get st 6
+to_ram = ne and cmd KMI_EDU_DMA_TO_RAM 0
+dev_a = get st 4
+ram_a = get st 3
+if to_ram
+dev_a = get st 3
+ram_a = get st 4
+end
+blocked = false
+if ge ram_a get st 10
+if lt ram_a get st 11
+blocked = true
+end
+end
+if not blocked
+kmi_edu_copy_buf dev_buf ram_buf sub dev_a KMI_EDU_DMA_BUF_ADDR sub ram_a get st 9 get st 5 to_ram
+end
+put st 15 add get st 15 1
+put st 6 and cmd xor KMI_EDU_DMA_START 0xffffffffffffffff
+if ne and cmd KMI_EDU_DMA_IRQ 0
+put st 2 or get st 2 ulong KMI_EDU_IRQ_BIT
+end
+end
+
+fn kmi_edu_poll_cmd st edit ulong 24 dev_buf edit uchar 4096 ram_buf edit uchar 16384 to ulong
+cmd = get st 6
+if ne and cmd KMI_EDU_DMA_START 0
+if ne get st 12 0
+if ge get st 14 get st 13
+kmi_edu_run_dma st dev_buf ram_buf
+else
+put st 14 add get st 14 1
+end
+end
+end
+ret get st 6
+end
+
+fn kmi_edu_transfer st edit ulong 24 dev_buf edit uchar 4096 ram_buf edit uchar 16384 iova ulong xlen ulong to_ram bool to int
+rc = kmi_edu_check st iova xlen
+if ne rc KMI_EDU_OK
+ret rc
+end
+if ne and kmi_edu_poll_cmd st dev_buf ram_buf KMI_EDU_DMA_START 0
+ret KMI_EDU_ERR_BUSY
+end
+if to_ram
+put st 3 KMI_EDU_DMA_BUF_ADDR
+put st 4 iova
+put st 5 xlen
+put st 6 or KMI_EDU_DMA_START KMI_EDU_DMA_TO_RAM
+else
+put st 3 iova
+put st 4 KMI_EDU_DMA_BUF_ADDR
+put st 5 xlen
+put st 6 KMI_EDU_DMA_START
+end
+put st 14 ulong 0
+lim = get st 8
+for s ulong lim bound 65536
+c = kmi_edu_poll_cmd st dev_buf ram_buf
+if eq and c KMI_EDU_DMA_START 0
+ret KMI_EDU_OK
+end
+end
+ret KMI_EDU_ERR_TIMEOUT
+end
+
+fn kmi_edu_irq_ack st edit ulong 24 bits uint to void
+cur = uint and get st 2 0xffffffff
+put st 2 ulong and cur xor bits 0xffffffff
+end
+
+note ========================================================================
+note 8. Block Device Geometry and RamDisk (block.rs)
+note ========================================================================
+
+const KMI_BLK_OK int 0
+const KMI_BLK_INVALID_INPUT int 1
+const KMI_BLK_OUT_OF_RANGE int 2
+const KMI_BLK_DEVICE_ERROR int 3
+const KMI_BLK_TIMEOUT int 4
+
+note blk_st[12]:
+note   0: block_size   1: block_count   2: total_bytes   3: has_fail_after
+note   4: fail_after   5: has_fail_wr   6: fail_wr_num   7: fail_wr_bytes
+note   8: write_count  9: failed
+
+fn kmi_ramdisk_init st edit ulong 12 block_size ulong block_count ulong buf_cap ulong to int
+if lt block_size 64
+ret KMI_BLK_INVALID_INPUT
+end
+if gt block_size 0xffffffff
+ret KMI_BLK_INVALID_INPUT
+end
+if lt block_count 4
+ret KMI_BLK_INVALID_INPUT
+end
+if gt block_count div 0xffffffffffffffff block_size
+ret KMI_BLK_INVALID_INPUT
+end
+tot = mul block_size block_count
+if gt tot buf_cap
+ret KMI_BLK_INVALID_INPUT
+end
+for i ulong 12
+put st i ulong 0
+end
+put st 0 block_size
+put st 1 block_count
+put st 2 tot
+ret KMI_BLK_OK
+end
+
+fn kmi_ramdisk_fail_after st edit ulong 12 has_lim bool count ulong to void
+if has_lim
+put st 3 ulong 1
+put st 4 count
+else
+put st 3 ulong 0
+put st 4 ulong 0
+end
+put st 5 ulong 0
+put st 8 ulong 0
+put st 9 ulong 0
+end
+
+fn kmi_ramdisk_tear_write st edit ulong 12 wr_num ulong tear_bytes ulong to void
+put st 3 ulong 0
+put st 5 ulong 1
+wn = wr_num
+if lt wn 1
+wn = 1
+end
+put st 6 wn
+put st 7 tear_bytes
+put st 8 ulong 0
+put st 9 ulong 0
+end
+
+fn kmi_ramdisk_corrupt st view ulong 12 disk edit uchar * off ulong val uchar to int
+if ge off get st 2
+ret KMI_BLK_OUT_OF_RANGE
+end
+put disk off val
+ret KMI_BLK_OK
+end
+
+fn kmi_ramdisk_range st view ulong 12 lba ulong rlen ulong start_out edit ulong 1 to int
+bs = get st 0
+if ne rem rlen bs 0
+ret KMI_BLK_INVALID_INPUT
+end
+if gt lba div 0xffffffffffffffff bs
+ret KMI_BLK_OUT_OF_RANGE
+end
+s = mul lba bs
+if not kmi_range_end_ok s rlen
+ret KMI_BLK_OUT_OF_RANGE
+end
+if gt add s rlen get st 2
+ret KMI_BLK_OUT_OF_RANGE
+end
+put start_out 0 s
+ret KMI_BLK_OK
+end
+
+fn kmi_ramdisk_read st view ulong 12 disk view uchar * lba ulong dst edit uchar * to int
+sb = new ulong 1 0
+rlen = len dst
+rc = kmi_ramdisk_range st lba rlen sb
+if ne rc KMI_BLK_OK
+ret rc
+end
+s = get sb 0
+for i ulong rlen bound 65536
+put dst i get disk add s i
+end
+ret KMI_BLK_OK
+end
+
+fn kmi_disk_copy_in disk edit uchar * dst_off ulong src view uchar * n ulong to void
+for i ulong n bound 65536
+put disk add dst_off i get src i
+end
+end
+
+fn kmi_ramdisk_write st edit ulong 12 disk edit uchar * lba ulong src view uchar * to int
+sb = new ulong 1 0
+rc = kmi_ramdisk_range st lba len src sb
+if ne rc KMI_BLK_OK
+ret rc
+end
+if ne get st 9 0
+ret KMI_BLK_DEVICE_ERROR
+end
+if ne get st 3 0
+bcnt = div len src get st 0
+allow_b = get st 4
+if gt allow_b bcnt
+allow_b = bcnt
+end
+kmi_disk_copy_in disk get sb 0 src mul allow_b get st 0
+if lt get st 4 bcnt
+put st 4 ulong 0
+ret KMI_BLK_DEVICE_ERROR
+end
+put st 4 sub get st 4 bcnt
+ret KMI_BLK_OK
+end
+wc = add get st 8 1
+put st 8 wc
+if ne get st 5 0
+if eq wc get st 6
+ab = get st 7
+if gt ab len src
+ab = len src
+end
+kmi_disk_copy_in disk get sb 0 src ab
+put st 9 ulong 1
+ret KMI_BLK_DEVICE_ERROR
+end
+end
+kmi_disk_copy_in disk get sb 0 src len src
+ret KMI_BLK_OK
+end
+
+note ========================================================================
+note 9. NVMe Power-Fail Atomicity (nvme/atomicity.rs)
+note ========================================================================
+
+const KMI_NVME_ID_CTRL_AWUPF_OFF ulong 528
+const KMI_NVME_ID_NS_NAWUPF_OFF ulong 36
+const KMI_NVME_ID_NS_NABO_OFF ulong 42
+const KMI_NVME_ID_NS_NABSPF_OFF ulong 44
+const KMI_NVME_STORE_UNIT_BYTES ulong 4096
+
+const KMI_ATOM_ATOMIC int 0
+const KMI_ATOM_EMPTY int 1
+const KMI_ATOM_EXCEEDS int 2
+const KMI_ATOM_CROSSES int 3
+const KMI_ATOM_NO_GUARANTEE int 4
+const KMI_ATOM_BAD_GEOMETRY int 5
+
+fn kmi_read_u16_le bytes view uchar * off ulong val_out edit ushort 1 to bool
+if gt off sub ulong 0xffffffffffffffff 2
+ret false
+end
+if gt add off 2 len bytes
+ret false
+end
+lo = ushort get bytes off
+hi = ushort get bytes add off 1
+put val_out 0 or lo shl hi 8
+ret true
+end
+
+note af[8]: [lba_bytes, has_awupf, awupf_raw, has_nawupf, nawupf_raw, has_nabspf, nabspf_raw, nabo_blocks]
+
+fn kmi_nvme_effective_pf af view ulong 8 to ulong
+if ne get af 3 0
+if gt get af 4 0
+ret add get af 4 1
+end
+end
+if ne get af 1 0
+ret add get af 2 1
+end
+ret 0
+end
+
+fn kmi_nvme_boundary_blocks af view ulong 8 to ulong
+if ne get af 5 0
+if gt get af 6 0
+ret add get af 6 1
+end
+end
+ret 0
+end
+
+fn kmi_nvme_same_region b1 ulong b2 ulong bsize ulong nabo ulong to bool
+off = rem nabo bsize
+if lt b1 off
+ret lt b2 off
+end
+if lt b2 off
+ret false
+end
+r1 = div sub b1 off bsize
+r2 = div sub b2 off bsize
+ret eq r1 r2
+end
+
+note info[4]: [effective_or_boundary, required_or_start, guaranteed_or_count, reserved]
+
+fn kmi_nvme_write_atomic af view ulong 8 start_lba ulong lba_count ulong info edit ulong 4 to int
+for i ulong 4
+put info i ulong 0
+end
+if eq lba_count 0
+ret KMI_ATOM_EMPTY
+end
+guar = kmi_nvme_effective_pf af
+if eq guar 0
+ret KMI_ATOM_NO_GUARANTEE
+end
+if gt lba_count guar
+put info 1 lba_count
+put info 2 guar
+ret KMI_ATOM_EXCEEDS
+end
+bsize = kmi_nvme_boundary_blocks af
+if gt bsize 0
+if not kmi_range_end_ok start_lba sub lba_count 1
+put info 0 bsize
+put info 1 start_lba
+put info 2 lba_count
+ret KMI_ATOM_CROSSES
+end
+last = add start_lba sub lba_count 1
+if not kmi_nvme_same_region start_lba last bsize get af 7
+put info 0 bsize
+put info 1 start_lba
+put info 2 lba_count
+ret KMI_ATOM_CROSSES
+end
+end
+put info 0 guar
+ret KMI_ATOM_ATOMIC
+end
+
+note out_lba[2]: [start_lba, lba_count]
+
+fn kmi_nvme_store_unit_lba af view ulong 8 slot uint out_lba edit ulong 2 to bool
+bs = get af 0
+if eq bs 0
+ret false
+end
+if ne rem KMI_NVME_STORE_UNIT_BYTES bs 0
+ret false
+end
+blks = div KMI_NVME_STORE_UNIT_BYTES bs
+sl = ulong slot
+if gt sl div 0xffffffffffffffff blks
+ret false
+end
+put out_lba 0 mul sl blks
+put out_lba 1 blks
+ret true
+end
+
+fn kmi_nvme_store_root_decision af view ulong 8 slot uint info edit ulong 4 to int
+lba_pair = new ulong 2 0
+ok = kmi_nvme_store_unit_lba af slot lba_pair
+if not ok
+ret KMI_ATOM_BAD_GEOMETRY
+end
+ret kmi_nvme_write_atomic af get lba_pair 0 get lba_pair 1 info
+end

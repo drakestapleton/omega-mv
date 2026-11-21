@@ -1,0 +1,1819 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-infer/infer_core.om: Pure-Omega core inference library (half, math, quant, dotprod, gguf).
+note Ported from aienux crates/aienos-infer/src/{half,math,quant,dotprod,gguf}.rs.
+note Compose with: si/directives/om2.om aienux/crates/aienos-infer/infer_core.om aienux/crates/aienos-infer/infer_decode.om ...
+
+note Common status and error codes
+const INF_OK int 0
+
+note GGUF error codes
+const INF_GGUF_TRUNCATED int -1
+const INF_GGUF_BAD_MAGIC int -2
+const INF_GGUF_BAD_VERSION int -3
+const INF_GGUF_TOO_MANY int -4
+const INF_GGUF_BAD_UTF8 int -5
+const INF_GGUF_BAD_VTYPE int -6
+const INF_GGUF_BAD_ALIGN int -7
+const INF_GGUF_OVERFLOW int -8
+const INF_GGUF_BAD_TYPE int -9
+const INF_GGUF_BAD_DIMS int -10
+const INF_GGUF_TENSOR_OOB int -11
+const INF_GGUF_MISSING int -12
+const INF_GGUF_WRONG_TYPE int -13
+const INF_GGUF_CAPACITY int -14
+
+note Quantization error codes
+const INF_QUANT_UNSUPPORTED int -20
+const INF_QUANT_BAD_LEN int -21
+
+note Model and decode error codes
+const INF_ERR_MISSING_TENSOR int -30
+const INF_ERR_BAD_TENSOR int -31
+const INF_ERR_BAD_PARAMS int -32
+const INF_ERR_BAD_TOKEN int -33
+const INF_ERR_CONTEXT_FULL int -34
+const INF_ERR_CAPACITY int -35
+
+note Tokenizer error codes
+const INF_TOK_BAD_VOCAB int -40
+const INF_TOK_MISSING_SYM int -41
+const INF_TOK_BAD_ID int -42
+const INF_TOK_OVERFLOW int -43
+
+note GGUF metadata value types
+const INF_VT_U8 uint 0
+const INF_VT_I8 uint 1
+const INF_VT_U16 uint 2
+const INF_VT_I16 uint 3
+const INF_VT_U32 uint 4
+const INF_VT_I32 uint 5
+const INF_VT_F32 uint 6
+const INF_VT_BOOL uint 7
+const INF_VT_STR uint 8
+const INF_VT_ARRAY uint 9
+const INF_VT_U64 uint 10
+const INF_VT_I64 uint 11
+const INF_VT_F64 uint 12
+
+note GGML tensor storage types
+const INF_GGML_F32 uint 0
+const INF_GGML_F16 uint 1
+const INF_GGML_Q4_0 uint 2
+const INF_GGML_Q4_1 uint 3
+const INF_GGML_Q5_0 uint 6
+const INF_GGML_Q5_1 uint 7
+const INF_GGML_Q8_0 uint 8
+const INF_GGML_Q8_1 uint 9
+const INF_GGML_Q2K uint 10
+const INF_GGML_Q3K uint 11
+const INF_GGML_Q4K uint 12
+const INF_GGML_Q5K uint 13
+const INF_GGML_Q6K uint 14
+const INF_GGML_Q8K uint 15
+const INF_GGML_I8 uint 24
+const INF_GGML_I16 uint 25
+const INF_GGML_I32 uint 26
+const INF_GGML_I64 uint 27
+const INF_GGML_F64 uint 28
+const INF_GGML_BF16 uint 30
+
+note Quantization block sizes
+const INF_QK_K ulong 256
+const INF_Q4K_BYTES ulong 144
+const INF_Q6K_BYTES ulong 210
+const INF_Q8_0_QK ulong 32
+const INF_Q8_0_BYTES ulong 34
+
+note Capacity constants
+const INF_MAX_KV ulong 256
+const INF_MAX_TENSORS ulong 256
+const INF_Q8_MAX_BLKS ulong 64
+const INF_Q8_MAX_QS ulong 16384
+const INF_Q8_MAX_BSUMS ulong 1024
+
+note Math constants (exact IEEE-754 f32 matching math.rs)
+const INF_PI f32 3.14159265
+const INF_TAU f32 6.28318530
+const INF_FRAC_PI_2 f32 1.57079632
+const INF_LN_2 f32 0.69314718
+const INF_LOG2_E f32 1.44269504
+const INF_SQRT_2 f32 1.41421356
+const INF_LN_2_HI f32 0.693359375
+const INF_LN_2_LO_ABS f32 0.00021219444
+
+note All struct declarations (must precede the first fn in the composed unit)
+
+struct InfGguf version uint n_kv ulong n_tensors ulong alignment ulong data_start ulong file_len ulong end
+
+struct InfLlamaParams block_count uint embedding_length uint head_count uint head_count_kv uint feed_forward_length uint context_length uint rope_freq_base f32 rms_norm_eps f32 vocab_size uint end
+
+struct InfModel block_count uint embedding_length uint head_count uint head_count_kv uint feed_forward_length uint context_length uint rope_freq_base f32 rms_norm_eps f32 vocab_size uint head_dim ulong kv_dim ulong tok_embd_w ulong output_w ulong output_norm_off ulong rope_fac_off ulong has_rope_fac uint end
+
+struct InfDecodeState capacity ulong pos ulong kv_dim ulong emulate_q8k uint use_dotprod uint end
+
+struct InfTokState vocab_size ulong n_merges ulong bos_id uint has_bos uint eos_id uint has_eos uint eot_id uint has_eot uint end
+
+note Core global tables for Q8_K activations and GGUF parsed metadata/tensors
+
+global inf_cpu_dp_flag uint 1
+global inf_q8_qs byte 16384
+global inf_q8_d f32 64
+global inf_q8_bsums short 1024
+global inf_q8_nblk ulong 1
+
+note GGUF KV table (parallel arrays up to INF_MAX_KV = 256)
+global inf_kv_koff ulong 256
+global inf_kv_klen ulong 256
+global inf_kv_vtype uint 256
+global inf_kv_u64 ulong 256
+global inf_kv_f32 f32 256
+global inf_kv_voff ulong 256
+global inf_kv_vlen ulong 256
+global inf_kv_aelem uint 256
+global inf_kv_alen ulong 256
+
+note GGUF tensor table (parallel arrays up to INF_MAX_TENSORS = 256)
+global inf_ten_noff ulong 256
+global inf_ten_nlen ulong 256
+global inf_ten_ndims uint 256
+global inf_ten_d0 ulong 256
+global inf_ten_d1 ulong 256
+global inf_ten_d2 ulong 256
+global inf_ten_d3 ulong 256
+global inf_ten_ty uint 256
+global inf_ten_off ulong 256
+global inf_ten_nelem ulong 256
+global inf_ten_nbytes ulong 256
+
+note ========================================================================
+note Little-endian byte readers & IEEE-754 binary16 / bfloat16 (half.rs)
+note ========================================================================
+
+fn inf_rd_u16_le b view uchar * off ulong to ushort
+b0 = ushort get b off
+b1 = ushort get b add off 1
+ret or b0 shl b1 8
+end
+
+fn inf_rd_u32_le b view uchar * off ulong to uint
+b0 = uint get b off
+b1 = uint get b add off 1
+b2 = uint get b add off 2
+b3 = uint get b add off 3
+r = or b0 shl b1 8
+r = or r shl b2 16
+ret or r shl b3 24
+end
+
+fn inf_rd_u64_le b view uchar * off ulong to ulong
+r = ulong 0
+for i ulong 8
+v = ulong get b add off i
+r = or r shl v mul i 8
+end
+ret r
+end
+
+fn inf_rd_f32_le b view uchar * off ulong to f32
+u = inf_rd_u32_le b off
+ret bitcast f32 u
+end
+
+fn inf_i8_from_u8 v uchar to int
+if ge v uchar 128
+ret sub int v 256
+end
+ret int v
+end
+
+fn inf_f16_to_f32 h ushort to f32
+hu = uint h
+sign = shl shr hu 15 31
+exp = and shr hu 10 0x1f
+man = and hu 0x3ff
+bits = uint 0
+if eq exp 0
+if eq man 0
+bits = sign
+else
+note Subnormal: normalize man (1..1023)
+m = man
+e = uint 113
+while eq and m 0x400 0 bound 16
+m = shl m 1
+e = sub e 1
+end
+m = and m 0x3ff
+bits = or sign or shl e 23 shl m 13
+end
+else
+if eq exp 0x1f
+bits = or sign or 0x7f800000 shl man 13
+else
+e2 = add exp 112
+bits = or sign or shl e2 23 shl man 13
+end
+end
+ret bitcast f32 bits
+end
+
+fn inf_bf16_to_f32 b ushort to f32
+u = shl uint b 16
+ret bitcast f32 u
+end
+
+fn inf_f32_to_f16 v f32 to ushort
+b = bitcast uint v
+sign = ushort and shr b 16 0x8000
+if eq v 0.0f32
+ret sign
+end
+exp = sub int and shr b 23 0xff 112
+man = and b 0x7fffff
+if le exp 0
+ret sign
+end
+if ge exp 31
+ret or sign ushort 0x7c00
+end
+h = or shl uint exp 10 shr man 13
+if ne and man 0x1000 0
+h = add h 1
+end
+ret or sign ushort and h 0xffff
+end
+
+fn inf_rd_f16_le b view uchar * off ulong to f32
+ret inf_f16_to_f32 inf_rd_u16_le b off
+end
+
+fn inf_rd_bf16_le b view uchar * off ulong to f32
+ret inf_bf16_to_f32 inf_rd_u16_le b off
+end
+
+note ========================================================================
+note Scalar f32 math without libm (math.rs) + NN primitives
+note ========================================================================
+
+fn inf_sqrt x f32 to f32
+if le x 0.0f32
+ret 0.0f32
+end
+bits = bitcast uint x
+seed = add shr bits 1 0x1fc00000
+y = bitcast f32 seed
+for i ulong 5
+y = mul 0.5f32 add y div x y
+end
+ret y
+end
+
+fn inf_exp x f32 to f32
+xc = fmax -87.0f32 fmin x 88.0f32
+scaled = mul xc INF_LOG2_E
+n = int 0
+if ge scaled 0.0f32
+n = int add scaled 0.5f32
+else
+n = int sub scaled 0.5f32
+end
+nf = f32 n
+r = add sub xc mul nf INF_LN_2_HI mul nf INF_LN_2_LO_ABS
+p = add 0.0083333338f32 div r 720.0f32
+p = add 0.041666668f32 mul r p
+p = add 0.16666667f32 mul r p
+p = add 0.5f32 mul r p
+p = add 1.0f32 mul r p
+p = add 1.0f32 mul r p
+e_bits = shl uint add n 127 23
+ret mul p bitcast f32 e_bits
+end
+
+fn inf_ln x f32 to f32
+bits = bitcast uint x
+e = sub int and shr bits 23 0xff 127
+m = bitcast f32 or and bits 0x7fffff shl uint 127 23
+if gt m INF_SQRT_2
+m = mul m 0.5f32
+e = add e 1
+end
+y = div sub m 1.0f32 add m 1.0f32
+y2 = mul y y
+s = add 0.11111111f32 div y2 11.0f32
+s = add 0.14285715f32 mul y2 s
+s = add 0.2f32 mul y2 s
+s = add 0.33333334f32 mul y2 s
+s = mul y add 1.0f32 mul y2 s
+ret add mul 2.0f32 s mul f32 e INF_LN_2
+end
+
+fn inf_powf base f32 e f32 to f32
+ret inf_exp mul e inf_ln base
+end
+
+fn inf_sin_cos angle f32 dst edit f32 2 to void
+q = div add angle INF_PI INF_TAU
+kf = f32 int q
+if lt q kf
+kf = sub kf 1.0f32
+end
+r = sub add angle INF_PI mul kf INF_TAU
+if lt r 0.0f32
+r = add r INF_TAU
+end
+if ge r INF_TAU
+r = sub r INF_TAU
+end
+x = sub r INF_PI
+csign = f32 1.0f32
+if gt x INF_FRAC_PI_2
+x = sub INF_PI x
+csign = -1.0f32
+else
+if lt x neg INF_FRAC_PI_2
+x = sub neg INF_PI x
+csign = -1.0f32
+end
+end
+x2 = mul x x
+sn = add -0.0001984127f32 mul x2 0.0000027557319f32
+sn = add 0.0083333338f32 mul x2 sn
+sn = add -0.16666667f32 mul x2 sn
+sn = mul x add 1.0f32 mul x2 sn
+cn = sub 0.000024801587f32 div x2 3628800.0f32
+cn = add -0.0013888889f32 mul x2 cn
+cn = add 0.041666668f32 mul x2 cn
+cn = add -0.5f32 mul x2 cn
+cn = add 1.0f32 mul x2 cn
+put dst 0 sn
+put dst 1 mul csign cn
+end
+
+fn inf_silu x f32 to f32
+ret div x add 1.0f32 inf_exp neg x
+end
+
+fn inf_copy_f32 src view f32 * dst edit f32 * n ulong to void
+for i ulong n bound 65536
+put dst i get src i
+end
+end
+
+fn inf_rms_norm_inplace x edit f32 * w view f32 * eps f32 to void
+n = len x
+ss = f32 0.0f32
+for i ulong n bound 65536
+v = get x i
+ss = add ss mul v v
+end
+ss = div ss f32 n
+scale = div 1.0f32 inf_sqrt add ss eps
+for i ulong n bound 65536
+put x i mul mul get x i scale get w i
+end
+end
+
+fn inf_softmax x edit f32 * n ulong to void
+if eq n 0
+ret
+end
+mx = get x 0
+for i ulong n bound 65536
+v = get x i
+if gt v mx
+mx = v
+end
+end
+sm = f32 0.0f32
+for i ulong n bound 65536
+e = inf_exp sub get x i mx
+put x i e
+sm = add sm e
+end
+for i ulong n bound 65536
+put x i div get x i sm
+end
+end
+
+fn inf_rope_cache pos ulong base f32 factors view f32 * cos_sin edit f32 * to void
+theta_scale = inf_powf base div -2.0f32 f32 len cos_sin
+theta = f32 pos
+sc = new f32 2 0.0f32
+i = ulong 0
+while lt i div len cos_sin 2 bound 4096
+if lt i len factors
+inf_sin_cos div theta get factors i sc
+else
+inf_sin_cos theta sc
+end
+put cos_sin mul i 2 get sc 1
+put cos_sin add mul i 2 1 get sc 0
+theta = mul theta theta_scale
+i = add i 1
+end
+end
+
+fn inf_rope_apply_head x edit f32 * base ulong cos_sin view f32 * to void
+i = ulong 0
+while lt i div len cos_sin 2 bound 4096
+idx0 = add base mul i 2
+a = get x idx0
+b = get x add idx0 1
+c = get cos_sin mul i 2
+s = get cos_sin add mul i 2 1
+put x idx0 sub mul a c mul b s
+put x add idx0 1 add mul a s mul b c
+i = add i 1
+end
+end
+
+fn inf_rope_apply x edit f32 * head_dim ulong cos_sin view f32 * to void
+n_heads = div len x head_dim
+for h ulong n_heads bound 4096
+inf_rope_apply_head x mul h head_dim cos_sin
+end
+end
+
+fn inf_argmax logits view f32 * n ulong to uint
+best = ulong 0
+if eq n 0
+ret 0
+end
+bv = get logits 0
+for i ulong n bound 262144
+v = get logits i
+if gt v bv
+bv = v
+best = i
+end
+end
+ret uint best
+end
+
+note ========================================================================
+note GGML block math & dequantizers (quant.rs: Q4_K, Q6_K, Q8_0, F32, F16, BF16)
+note ========================================================================
+
+fn inf_ggml_block_w ty uint to ulong
+if eq ty INF_GGML_F32
+ret 1
+end
+if eq ty INF_GGML_F16
+ret 1
+end
+if eq ty INF_GGML_BF16
+ret 1
+end
+if eq ty INF_GGML_I8
+ret 1
+end
+if eq ty INF_GGML_I16
+ret 1
+end
+if eq ty INF_GGML_I32
+ret 1
+end
+if eq ty INF_GGML_I64
+ret 1
+end
+if eq ty INF_GGML_F64
+ret 1
+end
+if eq ty INF_GGML_Q4_0
+ret 32
+end
+if eq ty INF_GGML_Q4_1
+ret 32
+end
+if eq ty INF_GGML_Q5_0
+ret 32
+end
+if eq ty INF_GGML_Q5_1
+ret 32
+end
+if eq ty INF_GGML_Q8_0
+ret 32
+end
+if eq ty INF_GGML_Q8_1
+ret 32
+end
+if eq ty INF_GGML_Q2K
+ret 256
+end
+if eq ty INF_GGML_Q3K
+ret 256
+end
+if eq ty INF_GGML_Q4K
+ret 256
+end
+if eq ty INF_GGML_Q5K
+ret 256
+end
+if eq ty INF_GGML_Q6K
+ret 256
+end
+if eq ty INF_GGML_Q8K
+ret 256
+end
+ret 0
+end
+
+fn inf_ggml_block_b ty uint to ulong
+if eq ty INF_GGML_F32
+ret 4
+end
+if eq ty INF_GGML_I32
+ret 4
+end
+if eq ty INF_GGML_F16
+ret 2
+end
+if eq ty INF_GGML_BF16
+ret 2
+end
+if eq ty INF_GGML_I16
+ret 2
+end
+if eq ty INF_GGML_I8
+ret 1
+end
+if eq ty INF_GGML_I64
+ret 8
+end
+if eq ty INF_GGML_F64
+ret 8
+end
+if eq ty INF_GGML_Q4_0
+ret 18
+end
+if eq ty INF_GGML_Q4_1
+ret 20
+end
+if eq ty INF_GGML_Q5_0
+ret 22
+end
+if eq ty INF_GGML_Q5_1
+ret 24
+end
+if eq ty INF_GGML_Q8_0
+ret 34
+end
+if eq ty INF_GGML_Q8_1
+ret 36
+end
+if eq ty INF_GGML_Q2K
+ret 84
+end
+if eq ty INF_GGML_Q3K
+ret 110
+end
+if eq ty INF_GGML_Q4K
+ret 144
+end
+if eq ty INF_GGML_Q5K
+ret 176
+end
+if eq ty INF_GGML_Q6K
+ret 210
+end
+if eq ty INF_GGML_Q8K
+ret 292
+end
+ret 0
+end
+
+fn inf_scale_min_k4_sc j ulong blk view uchar * soff ulong to uchar
+if lt j 4
+ret and get blk add soff j uchar 63
+end
+lo = and get blk add soff add j 4 uchar 0x0f
+hi = shl shr get blk add soff sub j 4 6 4
+ret or lo hi
+end
+
+fn inf_scale_min_k4_mn j ulong blk view uchar * soff ulong to uchar
+if lt j 4
+ret and get blk add soff add j 4 uchar 63
+end
+lo = shr get blk add soff add j 4 4
+hi = shl shr get blk add soff j 6 4
+ret or lo hi
+end
+
+fn inf_dequant_q4k_sub blk view uchar * boff ulong dst edit f32 * sb ulong to void
+dc = mul inf_rd_f16_le blk boff f32 inf_scale_min_k4_sc sb blk add boff 4
+mc = mul inf_rd_f16_le blk add boff 2 f32 inf_scale_min_k4_mn sb blk add boff 4
+qb = add boff 16
+qb = add qb mul div sb 2 32
+for l ulong 32
+bv = get blk add qb l
+if eq rem sb 2 0
+bv = and bv uchar 0x0f
+else
+bv = shr bv 4
+end
+put dst l sub mul dc f32 bv mc
+end
+end
+
+fn inf_dequant_q4k_block blk view uchar * boff ulong dst edit f32 * doff ulong to void
+for sb ulong 8
+inf_dequant_q4k_sub blk boff part dst add doff mul sb 32 32 sb
+end
+end
+
+fn inf_q6k_qval ql uchar qh uchar qshift ulong to int
+lo = and ql uchar 0x0f
+if ge qshift 4
+lo = shr ql 4
+end
+hi = shl and shr qh qshift uchar 3 4
+ret sub int or lo hi 32
+end
+
+fn inf_q6k_qterm blk view uchar * boff ulong half ulong l ulong slot ulong to int
+is = div l 16
+ho = add add boff 128 mul half 32
+h = get blk add ho l
+qlo = add boff mul half 64
+sco = add add boff 192 mul half 8
+if eq slot 0
+q = inf_q6k_qval get blk add qlo l h 0
+ret mul q inf_i8_from_u8 get blk add sco is
+end
+if eq slot 1
+q = inf_q6k_qval get blk add qlo add l 32 h 2
+ret mul q inf_i8_from_u8 get blk add sco add is 2
+end
+if eq slot 2
+q = inf_q6k_qval get blk add qlo l h 4
+ret mul q inf_i8_from_u8 get blk add sco add is 4
+end
+q = inf_q6k_qval get blk add qlo add l 32 h 6
+ret mul q inf_i8_from_u8 get blk add sco add is 6
+end
+
+fn inf_dequant_q6k_half blk view uchar * boff ulong dst edit f32 * half ulong to void
+d = inf_rd_f16_le blk add boff 208
+for l ulong 32
+put dst l mul d f32 inf_q6k_qterm blk boff half l 0
+put dst add l 32 mul d f32 inf_q6k_qterm blk boff half l 1
+put dst add l 64 mul d f32 inf_q6k_qterm blk boff half l 2
+put dst add l 96 mul d f32 inf_q6k_qterm blk boff half l 3
+end
+end
+
+fn inf_dequant_q6k_block blk view uchar * boff ulong dst edit f32 * doff ulong to void
+inf_dequant_q6k_half blk boff part dst doff 128 0
+inf_dequant_q6k_half blk boff part dst add doff 128 128 1
+end
+
+fn inf_dequant_q8_0_block blk view uchar * boff ulong dst edit f32 * doff ulong to void
+d = inf_rd_f16_le blk boff
+qoff = add boff 2
+for l ulong 32
+q = inf_i8_from_u8 get blk add qoff l
+put dst add doff l mul d f32 q
+end
+end
+
+fn inf_dot_q4k_f32 blk view uchar * boff ulong x view f32 * xoff ulong to f32
+w = new f32 256 0.0f32
+inf_dequant_q4k_block blk boff w 0
+acc = f32 0.0f32
+for i ulong 256
+acc = add acc mul get w i get x add xoff i
+end
+ret acc
+end
+
+fn inf_dot_q6k_f32 blk view uchar * boff ulong x view f32 * xoff ulong to f32
+w = new f32 256 0.0f32
+inf_dequant_q6k_block blk boff w 0
+acc = f32 0.0f32
+for i ulong 256
+acc = add acc mul get w i get x add xoff i
+end
+ret acc
+end
+
+fn inf_dot_q8_0_f32 blk view uchar * boff ulong x view f32 * xoff ulong to f32
+w = new f32 32 0.0f32
+inf_dequant_q8_0_block blk boff w 0
+acc = f32 0.0f32
+for i ulong 32
+acc = add acc mul get w i get x add xoff i
+end
+ret acc
+end
+
+fn inf_plain_to_f32 ty uint src view uchar * dst edit f32 * to bool
+n = len dst
+if eq ty INF_GGML_F32
+if ne len src mul n 4
+ret false
+end
+for i ulong n bound 262144
+put dst i inf_rd_f32_le src mul i 4
+end
+ret true
+end
+if eq ty INF_GGML_F16
+if ne len src mul n 2
+ret false
+end
+for i ulong n bound 262144
+put dst i inf_rd_f16_le src mul i 2
+end
+ret true
+end
+if eq ty INF_GGML_BF16
+if ne len src mul n 2
+ret false
+end
+for i ulong n bound 262144
+put dst i inf_rd_bf16_le src mul i 2
+end
+ret true
+end
+ret false
+end
+
+fn inf_dequantize ty uint src view uchar * dst edit f32 * to int
+bw = inf_ggml_block_w ty
+bb = inf_ggml_block_b ty
+if eq bw 0
+ret INF_QUANT_UNSUPPORTED
+end
+n = len dst
+if ne rem n bw 0
+ret INF_QUANT_BAD_LEN
+end
+nblk = div n bw
+if ne len src mul nblk bb
+ret INF_QUANT_BAD_LEN
+end
+if eq ty INF_GGML_Q4K
+for b ulong nblk bound 65536
+inf_dequant_q4k_block src mul b INF_Q4K_BYTES dst mul b INF_QK_K
+end
+ret INF_OK
+end
+if eq ty INF_GGML_Q6K
+for b ulong nblk bound 65536
+inf_dequant_q6k_block src mul b INF_Q6K_BYTES dst mul b INF_QK_K
+end
+ret INF_OK
+end
+if eq ty INF_GGML_Q8_0
+for b ulong nblk bound 65536
+inf_dequant_q8_0_block src mul b INF_Q8_0_BYTES dst mul b INF_Q8_0_QK
+end
+ret INF_OK
+end
+if inf_plain_to_f32 ty src dst
+ret INF_OK
+end
+ret INF_QUANT_UNSUPPORTED
+end
+
+fn inf_dot_row_nblk ty uint slen ulong xlen ulong to long
+bw = inf_ggml_block_w ty
+bb = inf_ggml_block_b ty
+if eq bw 0
+ret long INF_QUANT_UNSUPPORTED
+end
+is_ok = false
+if eq ty INF_GGML_Q4K
+is_ok = true
+end
+if eq ty INF_GGML_Q6K
+is_ok = true
+end
+if eq ty INF_GGML_Q8_0
+is_ok = true
+end
+if not is_ok
+ret long INF_QUANT_UNSUPPORTED
+end
+if ne rem xlen bw 0
+ret long INF_QUANT_BAD_LEN
+end
+nblk = div xlen bw
+if ne slen mul nblk bb
+ret long INF_QUANT_BAD_LEN
+end
+ret long nblk
+end
+
+fn inf_dot_row ty uint src view uchar * x view f32 * res edit f32 1 to int
+nb = inf_dot_row_nblk ty len src len x
+if lt nb 0
+ret int nb
+end
+acc = f32 0.0f32
+b = ulong 0
+while lt b ulong nb bound 65536
+if eq ty INF_GGML_Q4K
+acc = add acc inf_dot_q4k_f32 src mul b INF_Q4K_BYTES x mul b INF_QK_K
+else
+if eq ty INF_GGML_Q6K
+acc = add acc inf_dot_q6k_f32 src mul b INF_Q6K_BYTES x mul b INF_QK_K
+else
+acc = add acc inf_dot_q8_0_f32 src mul b INF_Q8_0_BYTES x mul b INF_Q8_0_QK
+end
+end
+b = add b 1
+end
+put res 0 acc
+ret INF_OK
+end
+
+note ========================================================================
+note Q8_K activation quantization & integer dot products (dotprod.rs)
+note ========================================================================
+
+fn inf_set_cpu_dotprod on bool to void
+if on
+put inf_cpu_dp_flag 0 uint 1
+else
+put inf_cpu_dp_flag 0 uint 0
+end
+end
+
+fn inf_cpu_dotprod to bool
+ret ne get inf_cpu_dp_flag 0 uint 0
+end
+
+fn inf_q8k_round x edit f32 * n ulong to void
+nblk = div n INF_QK_K
+for b ulong nblk bound 65536
+base = mul b INF_QK_K
+amax = f32 0.0f32
+mx = f32 0.0f32
+for i ulong 256
+v = get x add base i
+av = fabs v
+if gt av amax
+amax = av
+mx = v
+end
+end
+if ne amax 0.0f32
+iscale = div -127.0f32 mx
+d = div 1.0f32 iscale
+for i ulong 256
+t = mul get x add base i iscale
+q = fmin sub add t 12582912.0f32 12582912.0f32 127.0f32
+put x add base i mul q d
+end
+end
+end
+end
+
+fn inf_q8_quantize_one x view f32 * b ulong to void
+base = mul b INF_QK_K
+bbase = mul b 16
+amax = f32 0.0f32
+mx = f32 0.0f32
+for i ulong 256
+v = get x add base i
+av = fabs v
+if gt av amax
+amax = av
+mx = v
+end
+end
+if eq amax 0.0f32
+put inf_q8_d b 0.0f32
+for i ulong 256
+put inf_q8_qs add base i byte 0
+end
+for g ulong 16
+put inf_q8_bsums add bbase g short 0
+end
+ret
+end
+iscale = div -127.0f32 mx
+for i ulong 256
+t = mul get x add base i iscale
+qf = fmin sub add t 12582912.0f32 12582912.0f32 127.0f32
+put inf_q8_qs add base i byte qf
+end
+for g ulong 16
+gs = int 0
+gbase = add base mul g 16
+for l ulong 16
+gs = add gs int get inf_q8_qs add gbase l
+end
+put inf_q8_bsums add bbase g short gs
+end
+put inf_q8_d b div 1.0f32 iscale
+end
+
+fn inf_q8_quantize x view f32 * n ulong to int
+if ne rem n INF_QK_K 0
+ret INF_QUANT_BAD_LEN
+end
+nblk = div n INF_QK_K
+if gt nblk INF_Q8_MAX_BLKS
+ret INF_QUANT_BAD_LEN
+end
+put inf_q8_nblk 0 nblk
+for b ulong nblk bound 64
+inf_q8_quantize_one x b
+end
+ret INF_OK
+end
+
+fn inf_q8_blocks to ulong
+ret get inf_q8_nblk 0
+end
+
+fn inf_q8_value i ulong to f32
+b = div i INF_QK_K
+ret mul f32 int get inf_q8_qs i get inf_q8_d b
+end
+
+fn inf_q4k_accum_pair blk view uchar * boff ulong bi ulong j ulong to int
+qb = add add boff 16 mul j 32
+yb = add mul bi INF_QK_K mul j 64
+lo = int 0
+hi = int 0
+for l ulong 32
+bv = get blk add qb l
+q0 = int get inf_q8_qs add yb l
+lo = add lo mul int and bv uchar 0x0f q0
+q1 = int get inf_q8_qs add yb add l 32
+hi = add hi mul int shr bv 4 q1
+end
+sc0 = int inf_scale_min_k4_sc mul j 2 blk add boff 4
+sc1 = int inf_scale_min_k4_sc add mul j 2 1 blk add boff 4
+ret add mul lo sc0 mul hi sc1
+end
+
+fn inf_q4k_accum blk view uchar * boff ulong bi ulong acc edit int 2 to void
+sumi = int 0
+for j ulong 4
+sumi = add sumi inf_q4k_accum_pair blk boff bi j
+end
+put acc 0 sumi
+mins = int 0
+bbase = mul bi 16
+for sb ulong 8
+mn = int inf_scale_min_k4_mn sb blk add boff 4
+k = add bbase mul sb 2
+bs = add int get inf_q8_bsums k int get inf_q8_bsums add k 1
+mins = add mins mul mn bs
+end
+put acc 1 mins
+end
+
+fn inf_dot_q4k_q8 blk view uchar * boff ulong bi ulong to f32
+acc = new int 2 0
+inf_q4k_accum blk boff bi acc
+dy = get inf_q8_d bi
+d = mul dy inf_rd_f16_le blk boff
+dmin = mul dy inf_rd_f16_le blk add boff 2
+ret sub mul d f32 get acc 0 mul dmin f32 get acc 1
+end
+
+fn inf_q6k_uterm blk view uchar * boff ulong half ulong l ulong slot ulong to int
+is = div l 16
+ho = add add boff 128 mul half 32
+h = get blk add ho l
+qlo = add boff mul half 64
+sco = add add boff 192 mul half 8
+if eq slot 0
+q = add inf_q6k_qval get blk add qlo l h 0 32
+ret mul q inf_i8_from_u8 get blk add sco is
+end
+if eq slot 1
+q = add inf_q6k_qval get blk add qlo add l 32 h 2 32
+ret mul q inf_i8_from_u8 get blk add sco add is 2
+end
+if eq slot 2
+q = add inf_q6k_qval get blk add qlo l h 4 32
+ret mul q inf_i8_from_u8 get blk add sco add is 4
+end
+q = add inf_q6k_qval get blk add qlo add l 32 h 6 32
+ret mul q inf_i8_from_u8 get blk add sco add is 6
+end
+
+fn inf_q6k_accum_half blk view uchar * boff ulong bi ulong half ulong to int
+yb = add mul bi INF_QK_K mul half 128
+isum = int 0
+for l ulong 32
+t = inf_q6k_uterm blk boff half l 0
+isum = add isum mul t int get inf_q8_qs add yb l
+t = inf_q6k_uterm blk boff half l 1
+isum = add isum mul t int get inf_q8_qs add yb add l 32
+t = inf_q6k_uterm blk boff half l 2
+isum = add isum mul t int get inf_q8_qs add yb add l 64
+t = inf_q6k_uterm blk boff half l 3
+isum = add isum mul t int get inf_q8_qs add yb add l 96
+end
+ret isum
+end
+
+fn inf_q6k_accum blk view uchar * boff ulong bi ulong acc edit int 2 to void
+h0 = inf_q6k_accum_half blk boff bi 0
+h1 = inf_q6k_accum_half blk boff bi 1
+isum = add h0 h1
+mins = int 0
+scb = add boff 192
+bbase = mul bi 16
+for g ulong 16
+s = inf_i8_from_u8 get blk add scb g
+bs = int get inf_q8_bsums add bbase g
+mins = add mins mul s bs
+end
+put acc 0 isum
+put acc 1 mins
+end
+
+fn inf_dot_q6k_q8 blk view uchar * boff ulong bi ulong to f32
+acc = new int 2 0
+inf_q6k_accum blk boff bi acc
+d = mul inf_rd_f16_le blk add boff 208 get inf_q8_d bi
+ret mul d f32 sub get acc 0 mul 32 get acc 1
+end
+
+fn inf_dot_row_q8 ty uint src view uchar * res edit f32 1 to int
+bw = inf_ggml_block_w ty
+bb = inf_ggml_block_b ty
+if eq ty INF_GGML_Q4K
+else
+if eq ty INF_GGML_Q6K
+else
+ret INF_QUANT_UNSUPPORTED
+end
+end
+if ne bw INF_QK_K
+ret INF_QUANT_BAD_LEN
+end
+slen = len src
+if ne rem slen bb 0
+ret INF_QUANT_BAD_LEN
+end
+nblk = div slen bb
+if ne nblk get inf_q8_nblk 0
+ret INF_QUANT_BAD_LEN
+end
+acc = f32 0.0f32
+for bi ulong nblk bound 64
+if eq ty INF_GGML_Q4K
+acc = add acc inf_dot_q4k_q8 src mul bi INF_Q4K_BYTES bi
+else
+acc = add acc inf_dot_q6k_q8 src mul bi INF_Q6K_BYTES bi
+end
+end
+put res 0 acc
+ret INF_OK
+end
+
+note ========================================================================
+note GGUF v2/v3 bounded reader (gguf.rs)
+note ========================================================================
+
+fn inf_utf8_valid b view uchar * off ulong n ulong to bool
+i = ulong 0
+while lt i n bound 65536
+c = get b add off i
+if lt c uchar 0x80
+i = add i 1
+else
+if ge c uchar 0xc2
+if le c uchar 0xdf
+if ge add i 1 n
+ret false
+end
+c1 = get b add off add i 1
+if ne and c1 uchar 0xc0 uchar 0x80
+ret false
+end
+i = add i 2
+else
+if le c uchar 0xef
+if ge add i 2 n
+ret false
+end
+c1 = get b add off add i 1
+c2 = get b add off add i 2
+if ne and c1 uchar 0xc0 uchar 0x80
+ret false
+end
+if ne and c2 uchar 0xc0 uchar 0x80
+ret false
+end
+if eq c uchar 0xe0
+if lt c1 uchar 0xa0
+ret false
+end
+end
+if eq c uchar 0xed
+if ge c1 uchar 0xa0
+ret false
+end
+end
+i = add i 3
+else
+if le c uchar 0xf4
+if ge add i 3 n
+ret false
+end
+c1 = get b add off add i 1
+c2 = get b add off add i 2
+c3 = get b add off add i 3
+if ne and c1 uchar 0xc0 uchar 0x80
+ret false
+end
+if ne and c2 uchar 0xc0 uchar 0x80
+ret false
+end
+if ne and c3 uchar 0xc0 uchar 0x80
+ret false
+end
+if eq c uchar 0xf0
+if lt c1 uchar 0x90
+ret false
+end
+end
+if eq c uchar 0xf4
+if ge c1 uchar 0x90
+ret false
+end
+end
+i = add i 4
+else
+ret false
+end
+end
+end
+else
+ret false
+end
+end
+end
+ret true
+end
+
+fn inf_vtype_fixed_size vt uint to ulong
+if eq vt INF_VT_U8
+ret 1
+end
+if eq vt INF_VT_I8
+ret 1
+end
+if eq vt INF_VT_BOOL
+ret 1
+end
+if eq vt INF_VT_U16
+ret 2
+end
+if eq vt INF_VT_I16
+ret 2
+end
+if eq vt INF_VT_U32
+ret 4
+end
+if eq vt INF_VT_I32
+ret 4
+end
+if eq vt INF_VT_F32
+ret 4
+end
+if eq vt INF_VT_U64
+ret 8
+end
+if eq vt INF_VT_I64
+ret 8
+end
+if eq vt INF_VT_F64
+ret 8
+end
+ret 0
+end
+
+fn inf_slice_eq_text b view uchar * off ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 65536
+if ne get b add off i get t i
+ret false
+end
+end
+ret true
+end
+
+fn inf_cur_str b view uchar * cur edit ulong 1 soff edit ulong 1 slen edit ulong 1 to int
+pos = get cur 0
+blen = len b
+if lt sub blen pos 8
+ret INF_GGUF_TRUNCATED
+end
+n = inf_rd_u64_le b pos
+pos = add pos 8
+if gt n sub blen pos
+ret INF_GGUF_TRUNCATED
+end
+if not inf_utf8_valid b pos n
+ret INF_GGUF_BAD_UTF8
+end
+put soff 0 pos
+put slen 0 n
+put cur 0 add pos n
+ret INF_OK
+end
+
+fn inf_parse_kv_val b view uchar * cur edit ulong 1 idx ulong vt uint to int
+so = new ulong 1 0
+sl = new ulong 1 0
+pos = get cur 0
+blen = len b
+rem_b = sub blen pos
+if eq vt INF_VT_U8
+if lt rem_b 1
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx ulong get b pos
+put cur 0 add pos 1
+ret INF_OK
+end
+if eq vt INF_VT_I8
+if lt rem_b 1
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx ulong get b pos
+put cur 0 add pos 1
+ret INF_OK
+end
+if eq vt INF_VT_BOOL
+if lt rem_b 1
+ret INF_GGUF_TRUNCATED
+end
+bv = get b pos
+if gt bv uchar 1
+ret INF_GGUF_BAD_VTYPE
+end
+put inf_kv_u64 idx ulong bv
+put cur 0 add pos 1
+ret INF_OK
+end
+if eq vt INF_VT_U16
+if lt rem_b 2
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx ulong inf_rd_u16_le b pos
+put cur 0 add pos 2
+ret INF_OK
+end
+if eq vt INF_VT_I16
+if lt rem_b 2
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx ulong inf_rd_u16_le b pos
+put cur 0 add pos 2
+ret INF_OK
+end
+if eq vt INF_VT_U32
+if lt rem_b 4
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx ulong inf_rd_u32_le b pos
+put cur 0 add pos 4
+ret INF_OK
+end
+if eq vt INF_VT_I32
+if lt rem_b 4
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx ulong inf_rd_u32_le b pos
+put cur 0 add pos 4
+ret INF_OK
+end
+if eq vt INF_VT_F32
+if lt rem_b 4
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_f32 idx inf_rd_f32_le b pos
+put cur 0 add pos 4
+ret INF_OK
+end
+if eq vt INF_VT_U64
+if lt rem_b 8
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx inf_rd_u64_le b pos
+put cur 0 add pos 8
+ret INF_OK
+end
+if eq vt INF_VT_I64
+if lt rem_b 8
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_u64 idx inf_rd_u64_le b pos
+put cur 0 add pos 8
+ret INF_OK
+end
+if eq vt INF_VT_F64
+if lt rem_b 8
+ret INF_GGUF_TRUNCATED
+end
+u = inf_rd_u64_le b pos
+put inf_kv_u64 idx u
+put inf_kv_f32 idx f32 bitcast f64 u
+put cur 0 add pos 8
+ret INF_OK
+end
+if eq vt INF_VT_STR
+rc = inf_cur_str b cur so sl
+if ne rc INF_OK
+ret rc
+end
+put inf_kv_voff idx get so 0
+put inf_kv_vlen idx get sl 0
+ret INF_OK
+end
+if eq vt INF_VT_ARRAY
+if lt rem_b 12
+ret INF_GGUF_TRUNCATED
+end
+ae = inf_rd_u32_le b pos
+if gt ae INF_VT_F64
+ret INF_GGUF_BAD_VTYPE
+end
+al = inf_rd_u64_le b add pos 4
+pos = add pos 12
+put cur 0 pos
+put inf_kv_aelem idx ae
+put inf_kv_alen idx al
+put inf_kv_voff idx pos
+fsz = inf_vtype_fixed_size ae
+if gt fsz 0
+if gt al div ulong 0xffffffffffffffff fsz
+ret INF_GGUF_OVERFLOW
+end
+tot = mul al fsz
+if gt tot sub blen pos
+ret INF_GGUF_TRUNCATED
+end
+put inf_kv_vlen idx tot
+put cur 0 add pos tot
+ret INF_OK
+end
+if eq ae INF_VT_STR
+if gt al div sub blen pos 8
+ret INF_GGUF_TOO_MANY
+end
+for k ulong al bound 65536
+rc = inf_cur_str b cur so sl
+if ne rc INF_OK
+ret rc
+end
+end
+put inf_kv_vlen idx sub get cur 0 pos
+ret INF_OK
+end
+ret INF_GGUF_BAD_VTYPE
+end
+ret INF_GGUF_BAD_VTYPE
+end
+
+fn inf_finish_tensor idx ulong ty uint nelem ulong to int
+bw = inf_ggml_block_w ty
+bb = inf_ggml_block_b ty
+if eq bw 0
+ret INF_GGUF_BAD_TYPE
+end
+if ne rem get inf_ten_d0 idx bw 0
+ret INF_GGUF_BAD_DIMS
+end
+nblk = div nelem bw
+if gt nblk div ulong 0xffffffffffffffff bb
+ret INF_GGUF_OVERFLOW
+end
+put inf_ten_ty idx ty
+put inf_ten_nelem idx nelem
+put inf_ten_nbytes idx mul nblk bb
+ret INF_OK
+end
+
+fn inf_parse_tensor b view uchar * cur edit ulong 1 idx ulong to int
+so = new ulong 1 0
+sl = new ulong 1 0
+rc = inf_cur_str b cur so sl
+if ne rc INF_OK
+ret rc
+end
+put inf_ten_noff idx get so 0
+put inf_ten_nlen idx get sl 0
+pos = get cur 0
+blen = len b
+if lt sub blen pos 4
+ret INF_GGUF_TRUNCATED
+end
+nd = inf_rd_u32_le b pos
+pos = add pos 4
+if eq nd 0
+ret INF_GGUF_BAD_DIMS
+end
+if gt nd 4
+ret INF_GGUF_BAD_DIMS
+end
+if lt sub blen pos add mul ulong nd 8 12
+ret INF_GGUF_TRUNCATED
+end
+put inf_ten_ndims idx nd
+put inf_ten_d0 idx ulong 1
+put inf_ten_d1 idx ulong 1
+put inf_ten_d2 idx ulong 1
+put inf_ten_d3 idx ulong 1
+nelem = ulong 1
+for d ulong ulong nd bound 4
+dv = inf_rd_u64_le b pos
+pos = add pos 8
+if eq d 0
+put inf_ten_d0 idx dv
+end
+if eq d 1
+put inf_ten_d1 idx dv
+end
+if eq d 2
+put inf_ten_d2 idx dv
+end
+if eq d 3
+put inf_ten_d3 idx dv
+end
+if gt dv 0
+if gt nelem div ulong 0xffffffffffffffff dv
+ret INF_GGUF_OVERFLOW
+end
+end
+nelem = mul nelem dv
+end
+ty = inf_rd_u32_le b pos
+put inf_ten_off idx inf_rd_u64_le b add pos 4
+put cur 0 add pos 12
+ret inf_finish_tensor idx ty nelem
+end
+
+text inf_key_alignment "general.alignment"
+text inf_key_arch "general.architecture"
+text inf_val_llama "llama"
+text inf_key_vocab "llama.vocab_size"
+text inf_key_tokens "tokenizer.ggml.tokens"
+text inf_key_blocks "llama.block_count"
+text inf_key_embd "llama.embedding_length"
+text inf_key_heads "llama.attention.head_count"
+text inf_key_kv_heads "llama.attention.head_count_kv"
+text inf_key_ffn "llama.feed_forward_length"
+text inf_key_ctx "llama.context_length"
+text inf_key_rope_base "llama.rope.freq_base"
+text inf_key_rms_eps "llama.attention.layer_norm_rms_epsilon"
+
+fn inf_gguf_parse_kvs b view uchar * cur edit ulong 1 nk ulong to int
+so = new ulong 1 0
+sl = new ulong 1 0
+blen = len b
+for i ulong nk bound 256
+rc = inf_cur_str b cur so sl
+if ne rc INF_OK
+ret rc
+end
+put inf_kv_koff i get so 0
+put inf_kv_klen i get sl 0
+pos = get cur 0
+if lt sub blen pos 4
+ret INF_GGUF_TRUNCATED
+end
+vt = inf_rd_u32_le b pos
+if gt vt INF_VT_F64
+ret INF_GGUF_BAD_VTYPE
+end
+put cur 0 add pos 4
+put inf_kv_vtype i vt
+rc = inf_parse_kv_val b cur i vt
+if ne rc INF_OK
+ret rc
+end
+end
+ret INF_OK
+end
+
+fn inf_gguf_read_align b view uchar * nk ulong to long
+align = ulong 32
+for i ulong nk bound 256
+if inf_slice_eq_text b get inf_kv_koff i get inf_kv_klen i inf_key_alignment
+if ne get inf_kv_vtype i INF_VT_U32
+ret long INF_GGUF_BAD_ALIGN
+end
+av = get inf_kv_u64 i
+if eq av 0
+ret long INF_GGUF_BAD_ALIGN
+end
+if ne and av sub av 1 0
+ret long INF_GGUF_BAD_ALIGN
+end
+align = av
+end
+end
+ret long align
+end
+
+fn inf_gguf_check_tensors nt ulong dlen ulong align ulong to int
+for i ulong nt bound 256
+toff = get inf_ten_off i
+tnb = get inf_ten_nbytes i
+if gt toff sub ulong 0xffffffffffffffff tnb
+ret INF_GGUF_OVERFLOW
+end
+if gt add toff tnb dlen
+ret INF_GGUF_TENSOR_OOB
+end
+if ne rem toff align 0
+ret INF_GGUF_TENSOR_OOB
+end
+end
+ret INF_OK
+end
+
+fn inf_gguf_finish_parse b view uchar * cur edit ulong 1 g edit InfGguf to int
+ar = inf_gguf_read_align b get g n_kv
+if lt ar 0
+ret int ar
+end
+align = ulong ar
+put g alignment align
+nt = get g n_tensors
+for i ulong nt bound 256
+rc = inf_parse_tensor b cur i
+if ne rc INF_OK
+ret rc
+end
+end
+am1 = sub align 1
+pos = get cur 0
+if gt pos sub ulong 0xffffffffffffffff am1
+ret INF_GGUF_OVERFLOW
+end
+ds = and add pos am1 not am1
+if gt ds len b
+ret INF_GGUF_TRUNCATED
+end
+rc = inf_gguf_check_tensors nt sub len b ds align
+if ne rc INF_OK
+ret rc
+end
+put g data_start ds
+ret INF_OK
+end
+
+fn inf_gguf_parse_range b view uchar * min_ver uint max_ver uint g edit InfGguf to int
+if lt len b 24
+ret INF_GGUF_TRUNCATED
+end
+if ne get b 0 uchar 71
+ret INF_GGUF_BAD_MAGIC
+end
+if ne get b 1 uchar 71
+ret INF_GGUF_BAD_MAGIC
+end
+if ne get b 2 uchar 85
+ret INF_GGUF_BAD_MAGIC
+end
+if ne get b 3 uchar 70
+ret INF_GGUF_BAD_MAGIC
+end
+ver = inf_rd_u32_le b 4
+if lt ver min_ver
+ret INF_GGUF_BAD_VERSION
+end
+if gt ver max_ver
+ret INF_GGUF_BAD_VERSION
+end
+put g version ver
+nt = inf_rd_u64_le b 8
+nk = inf_rd_u64_le b 16
+if gt nk div sub len b 24 12
+ret INF_GGUF_TOO_MANY
+end
+if gt nt div sub len b 24 32
+ret INF_GGUF_TOO_MANY
+end
+if gt nk INF_MAX_KV
+ret INF_GGUF_CAPACITY
+end
+if gt nt INF_MAX_TENSORS
+ret INF_GGUF_CAPACITY
+end
+put g n_kv nk
+put g n_tensors nt
+put g file_len len b
+cur = new ulong 1 24
+rc = inf_gguf_parse_kvs b cur nk
+if ne rc INF_OK
+ret rc
+end
+ret inf_gguf_finish_parse b cur g
+end
+
+fn inf_gguf_parse b view uchar * g edit InfGguf to int
+ret inf_gguf_parse_range b 2 3 g
+end
+
+fn inf_gguf_parse_v3 b view uchar * g edit InfGguf to int
+ret inf_gguf_parse_range b 3 3 g
+end
+
+fn inf_gguf_find_kv g view InfGguf b view uchar * key view uchar * to long
+nk = get g n_kv
+for i ulong nk bound 256
+if inf_slice_eq_text b get inf_kv_koff i get inf_kv_klen i key
+ret long i
+end
+end
+ret long -1
+end
+
+fn inf_gguf_kv_as_u64 idx ulong dst edit ulong 1 to bool
+vt = get inf_kv_vtype idx
+u = get inf_kv_u64 idx
+if eq vt INF_VT_U8
+put dst 0 u
+ret true
+end
+if eq vt INF_VT_U16
+put dst 0 u
+ret true
+end
+if eq vt INF_VT_U32
+put dst 0 u
+ret true
+end
+if eq vt INF_VT_U64
+put dst 0 u
+ret true
+end
+if eq vt INF_VT_I8
+if ge u 128
+ret false
+end
+put dst 0 u
+ret true
+end
+if eq vt INF_VT_I16
+if ge u 32768
+ret false
+end
+put dst 0 u
+ret true
+end
+if eq vt INF_VT_I32
+if ge u 2147483648
+ret false
+end
+put dst 0 u
+ret true
+end
+if eq vt INF_VT_I64
+if ge u ulong 0x8000000000000000
+ret false
+end
+put dst 0 u
+ret true
+end
+ret false
+end
+
+fn inf_gguf_u64_key g view InfGguf b view uchar * key view uchar * dst edit ulong 1 to int
+idx = inf_gguf_find_kv g b key
+if lt idx 0
+ret INF_GGUF_MISSING
+end
+if not inf_gguf_kv_as_u64 ulong idx dst
+ret INF_GGUF_WRONG_TYPE
+end
+ret INF_OK
+end
+
+fn inf_gguf_u32_key g view InfGguf b view uchar * key view uchar * dst edit uint 1 to int
+tmp = new ulong 1 0
+rc = inf_gguf_u64_key g b key tmp
+if ne rc INF_OK
+ret rc
+end
+v = get tmp 0
+if gt v ulong 0xffffffff
+ret INF_GGUF_WRONG_TYPE
+end
+put dst 0 uint v
+ret INF_OK
+end
+
+fn inf_gguf_f32_key g view InfGguf b view uchar * key view uchar * dst edit f32 1 to int
+idx = inf_gguf_find_kv g b key
+if lt idx 0
+ret INF_GGUF_MISSING
+end
+vt = get inf_kv_vtype ulong idx
+if eq vt INF_VT_F32
+put dst 0 get inf_kv_f32 ulong idx
+ret INF_OK
+end
+if eq vt INF_VT_F64
+put dst 0 get inf_kv_f32 ulong idx
+ret INF_OK
+end
+ret INF_GGUF_WRONG_TYPE
+end
+
+fn inf_gguf_find_tensor g view InfGguf b view uchar * name view uchar * to long
+nt = get g n_tensors
+for i ulong nt bound 256
+if inf_slice_eq_text b get inf_ten_noff i get inf_ten_nlen i name
+ret long i
+end
+end
+ret long -1
+end
+
+fn inf_gguf_tensor_row_bytes ti ulong to ulong
+bw = inf_ggml_block_w get inf_ten_ty ti
+bb = inf_ggml_block_b get inf_ten_ty ti
+ret mul div get inf_ten_d0 ti bw bb
+end
+
+fn inf_gguf_llama_params g view InfGguf b view uchar * p edit InfLlamaParams to int
+aidx = inf_gguf_find_kv g b inf_key_arch
+if lt aidx 0
+ret INF_GGUF_MISSING
+end
+if ne get inf_kv_vtype ulong aidx INF_VT_STR
+ret INF_GGUF_WRONG_TYPE
+end
+if not inf_slice_eq_text b get inf_kv_voff ulong aidx get inf_kv_vlen ulong aidx inf_val_llama
+ret INF_GGUF_WRONG_TYPE
+end
+u32_buf = new uint 1 0
+f32_buf = new f32 1 0.0f32
+vidx = inf_gguf_find_kv g b inf_key_vocab
+if ge vidx 0
+rc = inf_gguf_u32_key g b inf_key_vocab u32_buf
+if ne rc INF_OK
+ret rc
+end
+put p vocab_size get u32_buf 0
+else
+tidx = inf_gguf_find_kv g b inf_key_tokens
+if lt tidx 0
+ret INF_GGUF_MISSING
+end
+if ne get inf_kv_vtype ulong tidx INF_VT_ARRAY
+ret INF_GGUF_WRONG_TYPE
+end
+put p vocab_size uint get inf_kv_alen ulong tidx
+end
+rc = inf_gguf_u32_key g b inf_key_blocks u32_buf
+if ne rc INF_OK
+ret rc
+end
+put p block_count get u32_buf 0
+rc = inf_gguf_u32_key g b inf_key_embd u32_buf
+if ne rc INF_OK
+ret rc
+end
+put p embedding_length get u32_buf 0
+rc = inf_gguf_u32_key g b inf_key_heads u32_buf
+if ne rc INF_OK
+ret rc
+end
+put p head_count get u32_buf 0
+rc = inf_gguf_u32_key g b inf_key_kv_heads u32_buf
+if ne rc INF_OK
+ret rc
+end
+put p head_count_kv get u32_buf 0
+rc = inf_gguf_u32_key g b inf_key_ffn u32_buf
+if ne rc INF_OK
+ret rc
+end
+put p feed_forward_length get u32_buf 0
+rc = inf_gguf_u32_key g b inf_key_ctx u32_buf
+if ne rc INF_OK
+ret rc
+end
+put p context_length get u32_buf 0
+rc = inf_gguf_f32_key g b inf_key_rope_base f32_buf
+if ne rc INF_OK
+ret rc
+end
+put p rope_freq_base get f32_buf 0
+rc = inf_gguf_f32_key g b inf_key_rms_eps f32_buf
+if ne rc INF_OK
+ret rc
+end
+put p rms_norm_eps get f32_buf 0
+ret INF_OK
+end

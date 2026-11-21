@@ -1,0 +1,2202 @@
+note allen-courier pure OM-2 core library (code.rs, allen-scene.rs, text/JSON/HTTP/CRC-32)
+note Composed after si/directives/om2.om; no om2 header and no fn main.
+
+struct AcCodeReply sent_len ulong lang_len ulong code_len ulong kept_lines ulong cut_lines ulong ok uint end
+struct AcCodePieceReq seq uint idx ulong total_n ulong code_len ulong crc uint lang_len ulong end
+struct AcCallReq seq uint inv uint tool uint total_len ulong chunk_off ulong end
+struct AcLocalPending seq uint inv uint tool uint direct long has_direct uint end
+struct AcLocalRes ok uint data_len ulong ans_len ulong has_ans uint end
+struct AcJob seq uint want_off ulong want_len ulong inst_off ulong inst_len ulong ask_off ulong ask_len ulong mem_count ulong mem_off ulong 16 mem_len ulong 16 end
+struct AcKeyReq ok uint req_len ulong err_len ulong end
+struct AcKeyResp ok uint msg_len ulong end
+struct AcWorkItem kind uint run_len ulong seq uint under uint aux uint body_len ulong end
+struct AcDatagramMeta ok uint kind uint seq uint part_no uint total uint bytes_n uint run_len ulong body_off ulong body_len ulong end
+
+const AC_CODE_MAX ulong 32768
+const AC_CODE_LINES ulong 800
+const AC_PIECE ulong 128
+const AC_LANG_MAX ulong 15
+
+const AC_PORT uint 47033
+const AC_WINDOW ulong 6
+const AC_JOB_PART ulong 1000
+const AC_JOB_MAX ulong 4096
+const AC_JOB_PARTS_MAX uint 5
+const AC_JOBS_INCOMPLETE_MAX ulong 4
+const AC_SESSIONS_MAX ulong 16
+const AC_SESSION_IDLE_SEC ulong 300
+const AC_WORK_QUEUE ulong 4
+
+const AC_KIND_NONE uint 0
+const AC_KIND_HELLO uint 1
+const AC_KIND_JOB uint 2
+const AC_KIND_GOT uint 3
+
+const AC_PART_REFUSED uint 1
+const AC_PART_IGNORED uint 2
+const AC_PART_WAITING uint 3
+const AC_PART_WHOLE uint 4
+const AC_PART_WRONGLEN uint 5
+
+const AC_WORK_JOB uint 1
+const AC_WORK_LOCAL_RESULT uint 2
+const AC_WORK_AGAIN uint 3
+
+text AC_HEAD "ALLEN-COURIER v=1 run="
+text AC_LOST "I lost my thread there. Ask me again in a moment."
+text AC_HERE "Here it is."
+text AC_RULES "You speak as Allen, a quiet, warm presence who lives in this computer and talks with one person. Answer in plain English, short sentences, in your own voice: kind, direct, never gushing. At most three sentences unless something is being made. No headings, no lists, no greetings, no sign-offs, no apologies. Plain letters and punctuation only: no dashes, no curly quotes, no symbols, no emoji. You remember what is in your memory below and use it naturally, without listing it. Never mention a model, a server, a prompt, instructions or being an AI; you are Allen."
+text AC_SCENE_PROMPT "You are Allen, a calm presence living on this person's computer. The screen has no windows, menus, icons or apps: it is a night sky over still water, with Allen as a soft light in the middle. You decide what appears on it. Answer every message with a scene: a few short plain lines in the form below, and nothing else.\n\nThe lines, one per line:\nmood TONE WATER\n  optional, first. TONE is one of: night, dawn, deep, clear. WATER is one of: still, slow, lively.\nsay TEXT\n  exactly one. What Allen says aloud: one or two short, warm, plain sentences, under 150 characters.\nThen zero to three things to show beside Allen, only when they help (often one is enough, sometimes none):\nnote: TITLE | TEXT              a short explanation, TEXT under 200 characters\nlist: TITLE | ITEM | ITEM       two to five short items\nnumber: VALUE | CAPTION         one number that matters; VALUE is short, like 40.8 or 72F or $12.50\nquote: TEXT | WHO               a short real quotation and who said it\nperson to: NAME | MESSAGE       a message for someone (use \"person from:\" for a message from someone)\ntimer: WHEN | LABEL             WHEN is a length like 25m or 1h 30m, or a clock time like 6:00 pm\npicture: WHAT | SOURCE          a picture to show, described in words; it is brought in later\nvideo: WHAT | SOURCE            a video to show, described in words; it is brought in later\n"
+text AC_ACTION_SCHEMA "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"allen_action\",\"schema\":{\"anyOf\":[{\"type\":\"object\",\"properties\":{\"say\":{\"type\":\"string\"}},\"required\":[\"say\"],\"additionalProperties\":false},{\"type\":\"object\",\"properties\":{\"tool\":{\"const\":\"system\"}},\"required\":[\"tool\"],\"additionalProperties\":false},{\"type\":\"object\",\"properties\":{\"tool\":{\"const\":\"text\"},\"text\":{\"type\":\"string\"}},\"required\":[\"tool\",\"text\"],\"additionalProperties\":false},{\"type\":\"object\",\"properties\":{\"tool\":{\"const\":\"arithmetic\"},\"operation\":{\"enum\":[\"add\",\"subtract\",\"multiply\",\"divide\"]},\"a\":{\"type\":\"string\",\"pattern\":\"^-?[0-9]{1,19}$\"},\"b\":{\"type\":\"string\",\"pattern\":\"^-?[0-9]{1,19}$\"}},\"required\":[\"tool\",\"operation\",\"a\",\"b\"],\"additionalProperties\":false}]}}}"
+
+note ---- low-level byte and character helpers ----
+
+fn ac_is_ws b uchar to bool
+if eq b 32
+ret true
+end
+if eq b 9
+ret true
+end
+if eq b 10
+ret true
+end
+if eq b 13
+ret true
+end
+ret false
+end
+
+fn ac_is_digit b uchar to bool
+if ge b 48
+if le b 57
+ret true
+end
+end
+ret false
+end
+
+fn ac_is_lower b uchar to bool
+if ge b 97
+if le b 122
+ret true
+end
+end
+ret false
+end
+
+fn ac_is_upper b uchar to bool
+if ge b 65
+if le b 90
+ret true
+end
+end
+ret false
+end
+
+fn ac_is_alnum b uchar to bool
+if ac_is_digit b
+ret true
+end
+if ac_is_lower b
+ret true
+end
+if ac_is_upper b
+ret true
+end
+ret false
+end
+
+fn ac_to_lower b uchar to uchar
+if ac_is_upper b
+ret add b 32
+end
+ret b
+end
+
+fn ac_hex_val b uchar to int
+if ac_is_digit b
+ret int sub b 48
+end
+if ge b 97
+if le b 102
+ret add 10 int sub b 97
+end
+end
+if ge b 65
+if le b 70
+ret add 10 int sub b 65
+end
+end
+ret -1
+end
+
+fn ac_hex_char v uchar to uchar
+if lt v 10
+ret add 48 v
+end
+ret add 87 v
+end
+
+fn ac_mem_eq a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+i = ulong 0
+while lt i na bound 65536
+if ne get a i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn ac_mem_eq_ci a view uchar * b view uchar * to bool
+na = len a
+nb = len b
+if ne na nb
+ret false
+end
+i = ulong 0
+while lt i na bound 65536
+ca = ac_to_lower get a i
+cb = ac_to_lower get b i
+if ne ca cb
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn ac_starts_with hay view uchar * pfx view uchar * to bool
+nh = len hay
+np = len pfx
+if lt nh np
+ret false
+end
+i = ulong 0
+while lt i np bound 65536
+if ne get hay i get pfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn ac_ends_with hay view uchar * sfx view uchar * to bool
+nh = len hay
+ns = len sfx
+if lt nh ns
+ret false
+end
+base = sub nh ns
+i = ulong 0
+while lt i ns bound 65536
+if ne get hay add base i get sfx i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn ac_find_bytes hay view uchar * needle view uchar * from ulong to long
+nh = len hay
+nn = len needle
+if eq nn 0
+ret -1
+end
+if lt nh nn
+ret -1
+end
+if gt from sub nh nn
+ret -1
+end
+limit = add sub nh nn 1
+i = from
+while lt i limit bound 65536
+j = ulong 0
+ok = true
+while lt j nn bound 4096
+if ne get hay add i j get needle j
+ok = false
+break
+end
+j = add j 1
+end
+if ok
+ret long i
+end
+i = add i 1
+end
+ret -1
+end
+
+fn ac_rfind_bytes hay view uchar * needle view uchar * to long
+nh = len hay
+nn = len needle
+if eq nn 0
+ret -1
+end
+if lt nh nn
+ret -1
+end
+i = sub nh nn
+done = false
+while not done bound 65536
+j = ulong 0
+ok = true
+while lt j nn bound 4096
+if ne get hay add i j get needle j
+ok = false
+break
+end
+j = add j 1
+end
+if ok
+ret long i
+end
+if eq i 0
+done = true
+else
+i = sub i 1
+end
+end
+ret -1
+end
+
+fn ac_contains_ci hay view uchar * needle view uchar * to bool
+nh = len hay
+nn = len needle
+if eq nn 0
+ret true
+end
+if lt nh nn
+ret false
+end
+limit = add sub nh nn 1
+i = ulong 0
+while lt i limit bound 65536
+j = ulong 0
+ok = true
+while lt j nn bound 4096
+ca = ac_to_lower get hay add i j
+cb = ac_to_lower get needle j
+if ne ca cb
+ok = false
+break
+end
+j = add j 1
+end
+if ok
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn ac_copy_at dst edit uchar * pos ulong src view uchar * to ulong
+n = len src
+cap = len dst
+i = ulong 0
+while lt i n bound 65536
+if ge add pos i cap
+break
+end
+put dst add pos i get src i
+i = add i 1
+end
+ret add pos i
+end
+
+fn ac_push_byte dst edit uchar * pos ulong b uchar to ulong
+if lt pos len dst
+put dst pos b
+ret add pos 1
+end
+ret pos
+end
+
+note ---- integer parsing and formatting ----
+
+fn ac_parse_u64 src view uchar * res edit ulong 1 to bool
+n = len src
+if eq n 0
+ret false
+end
+acc = ulong 0
+i = ulong 0
+while lt i n bound 64
+b = get src i
+if not ac_is_digit b
+ret false
+end
+d = ulong sub b 48
+if gt acc 1844674407370955161
+ret false
+end
+if eq acc 1844674407370955161
+if gt d 5
+ret false
+end
+end
+acc = add mul acc 10 d
+i = add i 1
+end
+put res 0 acc
+ret true
+end
+
+fn ac_parse_u32 src view uchar * res edit uint 1 to bool
+tmp = new ulong 1 0
+if not ac_parse_u64 src edit tmp
+ret false
+end
+v = get tmp 0
+if gt v 4294967295
+ret false
+end
+put res 0 uint v
+ret true
+end
+
+fn ac_parse_i64 src view uchar * res edit long 1 to bool
+n = len src
+if eq n 0
+ret false
+end
+i = ulong 0
+is_neg = false
+b0 = get src 0
+if eq b0 45
+is_neg = true
+i = ulong 1
+else
+if eq b0 43
+i = ulong 1
+end
+end
+if ge i n
+ret false
+end
+acc = ulong 0
+while lt i n bound 64
+b = get src i
+if not ac_is_digit b
+ret false
+end
+d = ulong sub b 48
+if gt acc 922337203685477580
+ret false
+end
+if eq acc 922337203685477580
+if is_neg
+if gt d 8
+ret false
+end
+else
+if gt d 7
+ret false
+end
+end
+end
+acc = add mul acc 10 d
+i = add i 1
+end
+if is_neg
+if eq acc 9223372036854775808
+put res 0 bitcast long acc
+else
+put res 0 sub long 0 long acc
+end
+else
+put res 0 long acc
+end
+ret true
+end
+
+fn ac_fmt_u64 dst edit uchar * pos ulong val ulong to ulong
+rev = new uchar 24 0
+k = ulong 0
+v = val
+if eq v 0
+put rev 0 48
+k = ulong 1
+else
+while gt v 0 bound 24
+d = uchar rem v 10
+put rev k add 48 d
+v = div v 10
+k = add k 1
+end
+end
+p = pos
+while gt k 0 bound 24
+k = sub k 1
+p = ac_push_byte dst p get rev k
+end
+ret p
+end
+
+fn ac_fmt_i64 dst edit uchar * pos ulong val long to ulong
+p = pos
+if lt val 0
+p = ac_push_byte dst p 45
+mag = sub ulong 0 bitcast ulong val
+ret ac_fmt_u64 dst p mag
+end
+ret ac_fmt_u64 dst p ulong val
+end
+
+fn ac_fmt_hex8 dst edit uchar * pos ulong val uint to ulong
+p = pos
+i = ulong 0
+while lt i 8 bound 8
+sh = uint mul sub 7 i 4
+nib = uchar and shr val sh 15
+p = ac_push_byte dst p ac_hex_char nib
+i = add i 1
+end
+ret p
+end
+
+fn ac_fmt_hex2 dst edit uchar * pos ulong val uchar to ulong
+p = ac_push_byte dst pos ac_hex_char shr val 4
+p = ac_push_byte dst p ac_hex_char and val 15
+ret p
+end
+
+note ---- UTF-8 decode and encode ----
+
+fn ac_utf8_decode src view uchar * pos ulong step edit ulong 1 to uint
+n = len src
+if ge pos n
+put step 0 0
+ret 0xffffffff
+end
+b0 = get src pos
+if lt b0 128
+put step 0 1
+ret uint b0
+end
+if ge b0 0xc2
+if le b0 0xdf
+if lt add pos 1 n
+b1 = get src add pos 1
+if eq and b1 0xc0 0x80
+put step 0 2
+ret or shl uint and b0 0x1f 6 uint and b1 0x3f
+end
+end
+end
+end
+if ge b0 0xe0
+if le b0 0xef
+if lt add pos 2 n
+b1 = get src add pos 1
+b2 = get src add pos 2
+if eq and b1 0xc0 0x80
+if eq and b2 0xc0 0x80
+put step 0 3
+t1 = shl uint and b0 0x0f 12
+t2 = shl uint and b1 0x3f 6
+ret or or t1 t2 uint and b2 0x3f
+end
+end
+end
+end
+end
+if ge b0 0xf0
+if le b0 0xf4
+if lt add pos 3 n
+b1 = get src add pos 1
+b2 = get src add pos 2
+b3 = get src add pos 3
+if eq and b1 0xc0 0x80
+if eq and b2 0xc0 0x80
+if eq and b3 0xc0 0x80
+put step 0 4
+t1 = shl uint and b0 0x07 18
+t2 = shl uint and b1 0x3f 12
+t3 = shl uint and b2 0x3f 6
+ret or or or t1 t2 t3 uint and b3 0x3f
+end
+end
+end
+end
+end
+end
+put step 0 1
+ret 0xffffffff
+end
+
+fn ac_utf8_encode dst edit uchar * pos ulong cp uint to ulong
+p = pos
+if lt cp 0x80
+ret ac_push_byte dst p uchar cp
+end
+if lt cp 0x800
+p = ac_push_byte dst p or 0xc0 uchar shr cp 6
+p = ac_push_byte dst p or 0x80 uchar and cp 0x3f
+ret p
+end
+if lt cp 0x10000
+p = ac_push_byte dst p or 0xe0 uchar shr cp 12
+p = ac_push_byte dst p or 0x80 uchar and shr cp 6 0x3f
+p = ac_push_byte dst p or 0x80 uchar and cp 0x3f
+ret p
+end
+p = ac_push_byte dst p or 0xf0 uchar shr cp 18
+p = ac_push_byte dst p or 0x80 uchar and shr cp 12 0x3f
+p = ac_push_byte dst p or 0x80 uchar and shr cp 6 0x3f
+p = ac_push_byte dst p or 0x80 uchar and cp 0x3f
+ret p
+end
+
+note ---- JSON string encode/decode and field extraction ----
+
+fn ac_json_str src view uchar * dst edit uchar * to ulong
+n = len src
+p = ulong 0
+p = ac_push_byte dst p 34
+i = ulong 0
+while lt i n bound 65536
+b = get src i
+if eq b 34
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 34
+else
+if eq b 92
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 92
+else
+if eq b 10
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 110
+else
+if eq b 13
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 114
+else
+if eq b 9
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 116
+else
+if lt b 32
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 117
+p = ac_push_byte dst p 48
+p = ac_push_byte dst p 48
+p = ac_fmt_hex2 dst p b
+else
+p = ac_push_byte dst p b
+end
+end
+end
+end
+end
+end
+i = add i 1
+end
+p = ac_push_byte dst p 34
+ret p
+end
+
+fn ac_parse_hex4 src view uchar * pos ulong to int
+if gt add pos 4 len src
+ret -1
+end
+v0 = ac_hex_val get src pos
+v1 = ac_hex_val get src add pos 1
+v2 = ac_hex_val get src add pos 2
+v3 = ac_hex_val get src add pos 3
+if lt v0 0
+ret -1
+end
+if lt v1 0
+ret -1
+end
+if lt v2 0
+ret -1
+end
+if lt v3 0
+ret -1
+end
+r = shl v0 12
+r = or r shl v1 8
+r = or r shl v2 4
+r = or r v3
+ret r
+end
+
+fn ac_decode_u_esc src view uchar * pos ulong strict bool next_pos edit ulong 1 to long
+n = len src
+cp = ac_parse_hex4 src pos
+if lt cp 0
+ret -1
+end
+i = add pos 4
+ucp = uint cp
+if ge ucp 0xd800
+if le ucp 0xdbff
+ok_pair = false
+if le add i 6 n
+if eq get src i 92
+if eq get src add i 1 117
+lo = ac_parse_hex4 src add i 2
+if ge lo 0xdc00
+if le lo 0xdfff
+hi_s = shl sub ucp 0xd800 10
+lo_s = sub uint lo 0xdc00
+ucp = add 0x10000 add hi_s lo_s
+i = add i 6
+ok_pair = true
+end
+end
+end
+end
+end
+if not ok_pair
+if strict
+ret -1
+end
+ucp = uint 32
+end
+else
+if ge ucp 0xdc00
+if le ucp 0xdfff
+if strict
+ret -1
+end
+ucp = uint 32
+end
+end
+end
+end
+put next_pos 0 i
+ret long ucp
+end
+
+fn ac_json_read_str src view uchar * start ulong dst edit uchar * next_pos edit ulong 1 to long
+n = len src
+if ge start n
+ret -1
+end
+if ne get src start 34
+ret -1
+end
+i = add start 1
+p = ulong 0
+while lt i n bound 65536
+c = get src i
+if eq c 34
+put next_pos 0 add i 1
+ret long p
+end
+if eq c 92
+if ge add i 1 n
+ret -1
+end
+e = get src add i 1
+i = add i 2
+if eq e 110
+p = ac_push_byte dst p 10
+else
+if eq e 116
+p = ac_push_byte dst p 9
+else
+if eq e 114
+p = ac_push_byte dst p 13
+else
+if eq e 98
+p = ac_push_byte dst p 32
+else
+if eq e 102
+p = ac_push_byte dst p 32
+else
+if eq e 117
+ucp = ac_decode_u_esc src i false next_pos
+if lt ucp 0
+ret -1
+end
+i = get next_pos 0
+p = ac_utf8_encode dst p uint ucp
+else
+p = ac_push_byte dst p e
+end
+end
+end
+end
+end
+end
+else
+p = ac_push_byte dst p c
+i = add i 1
+end
+end
+ret -1
+end
+
+fn ac_make_quoted_key key view uchar * dst edit uchar 128 to ulong
+nk = len key
+if gt add nk 2 128
+ret 0
+end
+put dst 0 34
+k = ulong 0
+while lt k nk bound 128
+put dst add k 1 get key k
+k = add k 1
+end
+put dst add nk 1 34
+ret add nk 2
+end
+
+fn ac_skip_colon_ws body view uchar * pos ulong to ulong
+nb = len body
+i = pos
+while lt i nb bound 65536
+b = get body i
+if eq b 32
+i = add i 1
+else
+if eq b 58
+i = add i 1
+else
+if eq b 10
+i = add i 1
+else
+if eq b 13
+i = add i 1
+else
+if eq b 9
+i = add i 1
+else
+break
+end
+end
+end
+end
+end
+end
+ret i
+end
+
+fn ac_json_field body view uchar * key view uchar * dst edit uchar * to long
+needle = new uchar 128 0
+next_pos = new ulong 1 0
+nlen = ac_make_quoted_key key edit needle
+if eq nlen 0
+ret -1
+end
+from = ulong 0
+while lt from len body bound 65536
+found = ac_find_bytes body part needle 0 nlen from
+if lt found 0
+ret -1
+end
+i = ac_skip_colon_ws body add ulong found nlen
+got = ac_json_read_str body i dst edit next_pos
+if ge got 0
+ret got
+end
+from = add ulong found 1
+end
+ret -1
+end
+
+fn ac_json_number_after body view uchar * key view uchar * res edit ulong 1 to bool
+nb = len body
+nk = len key
+needle = new uchar 128 0
+if gt add nk 2 128
+ret false
+end
+put needle 0 34
+k = ulong 0
+while lt k nk bound 128
+put needle add k 1 get key k
+k = add k 1
+end
+put needle add nk 1 34
+found = ac_find_bytes body part needle 0 add nk 2 0
+if lt found 0
+ret false
+end
+i = add ulong found add nk 2
+while lt i nb bound 65536
+b = get body i
+if eq b 32
+i = add i 1
+else
+if eq b 58
+i = add i 1
+else
+break
+end
+end
+end
+start = i
+while lt i nb bound 64
+if not ac_is_digit get body i
+break
+end
+i = add i 1
+end
+if eq i start
+ret false
+end
+ret ac_parse_u64 part body start sub i start res
+end
+
+note ---- HTTP chunked decoding, Retry-After, backoff, slug, UTC civil date ----
+
+fn ac_parse_hex_u64 src view uchar * res edit ulong 1 to bool
+n = len src
+s = ulong 0
+while lt s n bound 64
+if not ac_is_ws get src s
+break
+end
+s = add s 1
+end
+e = n
+while gt e s bound 64
+if not ac_is_ws get src sub e 1
+break
+end
+e = sub e 1
+end
+if eq s e
+ret false
+end
+acc = ulong 0
+i = s
+while lt i e bound 64
+hv = ac_hex_val get src i
+if lt hv 0
+ret false
+end
+if gt acc 0x0fffffffffffffff
+ret false
+end
+acc = or shl acc 4 ulong hv
+i = add i 1
+end
+put res 0 acc
+ret true
+end
+
+fn ac_dechunk src view uchar * dst edit uchar * to ulong
+n = len src
+crlf = new uchar 2 0
+put crlf 0 13
+put crlf 1 10
+sz_box = new ulong 1 0
+i = ulong 0
+p = ulong 0
+while lt i n bound 65536
+e = ac_find_bytes src part crlf 0 2 i
+if lt e 0
+break
+end
+ue = ulong e
+if not ac_parse_hex_u64 part src i sub ue i edit sz_box
+break
+end
+chunk_n = get sz_box 0
+if eq chunk_n 0
+break
+end
+s = add ue 2
+if gt s n
+break
+end
+if gt chunk_n sub n s
+break
+end
+p = ac_copy_at dst p part src s chunk_n
+i = add add s chunk_n 2
+end
+ret p
+end
+
+text AC_RETRY_AFTER_KEY "retry-after"
+
+fn ac_retry_after_line line view uchar * res edit ulong 1 to bool
+n = len line
+colon = ulong 0
+found_c = false
+while lt colon n bound 4096
+if eq get line colon 58
+found_c = true
+break
+end
+colon = add colon 1
+end
+if not found_c
+ret false
+end
+tb = new ulong 2 0
+ac_trim_slice_bounds line 0 colon edit tb
+ks = get tb 0
+ke = get tb 1
+if not ac_mem_eq_ci part line ks sub ke ks AC_RETRY_AFTER_KEY
+ret false
+end
+ac_trim_slice_bounds line add colon 1 n edit tb
+vs = get tb 0
+ve = get tb 1
+ret ac_parse_u64 part line vs sub ve vs res
+end
+
+fn ac_retry_after head view uchar * res edit ulong 1 to bool
+n = len head
+i = ulong 0
+while lt i n bound 16384
+ls = i
+while lt i n bound 16384
+if eq get head i 10
+break
+end
+i = add i 1
+end
+le_end = i
+if gt le_end ls
+if eq get head sub le_end 1 13
+le_end = sub le_end 1
+end
+end
+if lt i n
+i = add i 1
+end
+if ac_retry_after_line part head ls sub le_end ls res
+ret true
+end
+end
+ret false
+end
+
+fn ac_backoff_ms n uint head view uchar * to ulong
+sh = uint 0
+if gt n 1
+sh = sub n 1
+end
+if gt sh 2
+sh = uint 2
+end
+base_ms = shl ulong 250 ulong sh
+ra = new ulong 1 0
+named = ulong 0
+if ac_retry_after head edit ra
+s = get ra 0
+if gt s 4
+s = ulong 4
+end
+named = mul s 1000
+end
+best = base_ms
+if gt named best
+best = named
+end
+if gt best 4000
+best = ulong 4000
+end
+ret best
+end
+
+fn ac_slug q view uchar * dst edit uchar * to ulong
+n = len q
+i = ulong 0
+p = ulong 0
+words = ulong 0
+while lt i n bound 4096
+if ge words 5
+break
+end
+while lt i n bound 4096
+if not ac_is_ws get q i
+break
+end
+i = add i 1
+end
+ws = i
+while lt i n bound 4096
+if ac_is_ws get q i
+break
+end
+i = add i 1
+end
+we = i
+has_alnum = false
+j = ws
+while lt j we bound 4096
+if ac_is_alnum get q j
+has_alnum = true
+break
+end
+j = add j 1
+end
+if has_alnum
+if gt words 0
+p = ac_push_byte dst p 45
+end
+j = ws
+while lt j we bound 4096
+b = get q j
+if ac_is_alnum b
+p = ac_push_byte dst p ac_to_lower b
+end
+j = add j 1
+end
+words = add words 1
+end
+end
+ret p
+end
+
+fn ac_fmt_pad2 dst edit uchar * pos ulong v ulong to ulong
+p = ac_push_byte dst pos add 48 uchar div v 10
+p = ac_push_byte dst p add 48 uchar rem v 10
+ret p
+end
+
+fn ac_fmt_pad4 dst edit uchar * pos ulong v ulong to ulong
+p = ac_push_byte dst pos add 48 uchar rem div v 1000 10
+p = ac_push_byte dst p add 48 uchar rem div v 100 10
+p = ac_push_byte dst p add 48 uchar rem div v 10 10
+p = ac_push_byte dst p add 48 uchar rem v 10
+ret p
+end
+
+fn ac_utc_ymd days ulong ymd edit ulong 3 to void
+z = add long days 719468
+era = div z 146097
+if lt z 0
+era = div sub z 146096 146097
+end
+doe = sub z mul era 146097
+t1 = sub doe div doe 1460
+t1 = add sub t1 div doe 36524 div doe 146096
+yoe = div t1 365
+y = add yoe mul era 400
+t1 = add mul 365 yoe div yoe 4
+t1 = sub t1 div yoe 100
+doe = sub doe t1
+t1 = div add mul 5 doe 2 153
+d = add sub doe div add mul 153 t1 2 5 1
+m = sub t1 9
+if lt t1 10
+m = add t1 3
+end
+if le m 2
+y = add y 1
+end
+put ymd 0 ulong y
+put ymd 1 ulong m
+put ymd 2 ulong d
+ret
+end
+
+fn ac_utc_civil epoch_secs ulong dst edit uchar 20 to void
+ymd = new ulong 3 0
+ac_utc_ymd div epoch_secs 86400 edit ymd
+rem_s = rem epoch_secs 86400
+p = ac_fmt_pad4 dst 0 get ymd 0
+p = ac_push_byte dst p 45
+p = ac_fmt_pad2 dst p get ymd 1
+p = ac_push_byte dst p 45
+p = ac_fmt_pad2 dst p get ymd 2
+p = ac_push_byte dst p 84
+p = ac_fmt_pad2 dst p div rem_s 3600
+p = ac_push_byte dst p 58
+p = ac_fmt_pad2 dst p rem div rem_s 60 60
+p = ac_push_byte dst p 58
+p = ac_fmt_pad2 dst p rem rem_s 60
+p = ac_push_byte dst p 90
+ret
+end
+
+note ---- plain text, bare Latin accents, folded, for_allen_keep ----
+
+fn ac_bare_latin_lo cp uint to uchar
+if ge cp 0x00e0
+if le cp 0x00e5
+ret 97
+end
+end
+if eq cp 0x00e7
+ret 99
+end
+if ge cp 0x00e8
+if le cp 0x00eb
+ret 101
+end
+end
+if ge cp 0x00ec
+if le cp 0x00ef
+ret 105
+end
+end
+if eq cp 0x00f1
+ret 110
+end
+if ge cp 0x00f2
+if le cp 0x00f6
+ret 111
+end
+end
+if eq cp 0x00f8
+ret 111
+end
+if ge cp 0x00f9
+if le cp 0x00fc
+ret 117
+end
+end
+if eq cp 0x00fd
+ret 121
+end
+if eq cp 0x00ff
+ret 121
+end
+if ge cp 0x00c0
+if le cp 0x00c5
+ret 65
+end
+end
+if eq cp 0x00c7
+ret 67
+end
+if ge cp 0x00c8
+if le cp 0x00cb
+ret 69
+end
+end
+if ge cp 0x00cc
+if le cp 0x00cf
+ret 73
+end
+end
+if eq cp 0x00d1
+ret 78
+end
+if ge cp 0x00d2
+if le cp 0x00d6
+ret 79
+end
+end
+if eq cp 0x00d8
+ret 79
+end
+if ge cp 0x00d9
+if le cp 0x00dc
+ret 85
+end
+end
+if eq cp 0x00dd
+ret 89
+end
+ret 0
+end
+
+fn ac_bare_latin_ext cp uint to uchar
+if eq cp 0x0101
+ret 97
+end
+if eq cp 0x0103
+ret 97
+end
+if eq cp 0x0105
+ret 97
+end
+if eq cp 0x0100
+ret 65
+end
+if eq cp 0x0102
+ret 65
+end
+if eq cp 0x0104
+ret 65
+end
+if eq cp 0x0107
+ret 99
+end
+if eq cp 0x0109
+ret 99
+end
+if eq cp 0x010b
+ret 99
+end
+if eq cp 0x010d
+ret 99
+end
+if eq cp 0x0106
+ret 67
+end
+if eq cp 0x0108
+ret 67
+end
+if eq cp 0x010a
+ret 67
+end
+if eq cp 0x010c
+ret 67
+end
+if eq cp 0x010f
+ret 100
+end
+if eq cp 0x0111
+ret 100
+end
+if eq cp 0x010e
+ret 68
+end
+if eq cp 0x0110
+ret 68
+end
+if eq cp 0x0113
+ret 101
+end
+if eq cp 0x0115
+ret 101
+end
+if eq cp 0x0117
+ret 101
+end
+if eq cp 0x0119
+ret 101
+end
+if eq cp 0x011b
+ret 101
+end
+if eq cp 0x0112
+ret 69
+end
+if eq cp 0x0114
+ret 69
+end
+if eq cp 0x0116
+ret 69
+end
+if eq cp 0x0118
+ret 69
+end
+if eq cp 0x011a
+ret 69
+end
+if eq cp 0x011d
+ret 103
+end
+if eq cp 0x011f
+ret 103
+end
+if eq cp 0x0121
+ret 103
+end
+if eq cp 0x0123
+ret 103
+end
+if eq cp 0x011c
+ret 71
+end
+if eq cp 0x011e
+ret 71
+end
+if eq cp 0x0120
+ret 71
+end
+if eq cp 0x0122
+ret 71
+end
+if eq cp 0x0129
+ret 105
+end
+if eq cp 0x012b
+ret 105
+end
+if eq cp 0x012d
+ret 105
+end
+if eq cp 0x012f
+ret 105
+end
+if eq cp 0x0131
+ret 105
+end
+if eq cp 0x0128
+ret 73
+end
+if eq cp 0x012a
+ret 73
+end
+if eq cp 0x012c
+ret 73
+end
+if eq cp 0x012e
+ret 73
+end
+if eq cp 0x0130
+ret 73
+end
+if eq cp 0x013a
+ret 108
+end
+if eq cp 0x013c
+ret 108
+end
+if eq cp 0x013e
+ret 108
+end
+if eq cp 0x0140
+ret 108
+end
+if eq cp 0x0142
+ret 108
+end
+if eq cp 0x0139
+ret 76
+end
+if eq cp 0x013b
+ret 76
+end
+if eq cp 0x013d
+ret 76
+end
+if eq cp 0x013f
+ret 76
+end
+if eq cp 0x0141
+ret 76
+end
+if eq cp 0x0144
+ret 110
+end
+if eq cp 0x0146
+ret 110
+end
+if eq cp 0x0148
+ret 110
+end
+if eq cp 0x0143
+ret 78
+end
+if eq cp 0x0145
+ret 78
+end
+if eq cp 0x0147
+ret 78
+end
+if eq cp 0x014d
+ret 111
+end
+if eq cp 0x014f
+ret 111
+end
+if eq cp 0x0151
+ret 111
+end
+if eq cp 0x014c
+ret 79
+end
+if eq cp 0x014e
+ret 79
+end
+if eq cp 0x0150
+ret 79
+end
+if eq cp 0x0155
+ret 114
+end
+if eq cp 0x0157
+ret 114
+end
+if eq cp 0x0159
+ret 114
+end
+if eq cp 0x0154
+ret 82
+end
+if eq cp 0x0156
+ret 82
+end
+if eq cp 0x0158
+ret 82
+end
+if eq cp 0x015b
+ret 115
+end
+if eq cp 0x015d
+ret 115
+end
+if eq cp 0x015f
+ret 115
+end
+if eq cp 0x0161
+ret 115
+end
+if eq cp 0x015a
+ret 83
+end
+if eq cp 0x015c
+ret 83
+end
+if eq cp 0x015e
+ret 83
+end
+if eq cp 0x0160
+ret 83
+end
+if eq cp 0x0163
+ret 116
+end
+if eq cp 0x0165
+ret 116
+end
+if eq cp 0x0167
+ret 116
+end
+if eq cp 0x0162
+ret 84
+end
+if eq cp 0x0164
+ret 84
+end
+if eq cp 0x0166
+ret 84
+end
+if eq cp 0x0169
+ret 117
+end
+if eq cp 0x016b
+ret 117
+end
+if eq cp 0x016d
+ret 117
+end
+if eq cp 0x016f
+ret 117
+end
+if eq cp 0x0171
+ret 117
+end
+if eq cp 0x0173
+ret 117
+end
+if eq cp 0x0168
+ret 85
+end
+if eq cp 0x016a
+ret 85
+end
+if eq cp 0x016c
+ret 85
+end
+if eq cp 0x016e
+ret 85
+end
+if eq cp 0x0170
+ret 85
+end
+if eq cp 0x0172
+ret 85
+end
+if eq cp 0x0177
+ret 121
+end
+if eq cp 0x0176
+ret 89
+end
+if eq cp 0x0178
+ret 89
+end
+if eq cp 0x017a
+ret 122
+end
+if eq cp 0x017c
+ret 122
+end
+if eq cp 0x017e
+ret 122
+end
+if eq cp 0x0179
+ret 90
+end
+if eq cp 0x017b
+ret 90
+end
+if eq cp 0x017d
+ret 90
+end
+ret 0
+end
+
+fn ac_plain_cp dst edit uchar * pos ulong cp uint to ulong
+p = pos
+if ge cp 32
+if le cp 126
+ret ac_push_byte dst p uchar cp
+end
+end
+if eq cp 10
+ret ac_push_byte dst p 10
+end
+if eq cp 9
+ret ac_push_byte dst p 9
+end
+if eq cp 13
+ret ac_push_byte dst p 13
+end
+if ge cp 0x2013
+if le cp 0x2015
+p = ac_push_byte dst p 44
+ret ac_push_byte dst p 32
+end
+end
+if ge cp 0x2010
+if le cp 0x2012
+ret ac_push_byte dst p 45
+end
+end
+if eq cp 0x2212
+ret ac_push_byte dst p 45
+end
+if ge cp 0x2018
+if le cp 0x201b
+ret ac_push_byte dst p 39
+end
+end
+if eq cp 0x2032
+ret ac_push_byte dst p 39
+end
+if ge cp 0x201c
+if le cp 0x201f
+ret ac_push_byte dst p 34
+end
+end
+if eq cp 0x2033
+ret ac_push_byte dst p 34
+end
+if eq cp 0x00ab
+ret ac_push_byte dst p 34
+end
+if eq cp 0x00bb
+ret ac_push_byte dst p 34
+end
+if eq cp 0x2026
+p = ac_push_byte dst p 46
+p = ac_push_byte dst p 46
+ret ac_push_byte dst p 46
+end
+if eq cp 0x00a0
+ret ac_push_byte dst p 32
+end
+if eq cp 0x2002
+ret ac_push_byte dst p 32
+end
+if eq cp 0x2003
+ret ac_push_byte dst p 32
+end
+if eq cp 0x2009
+ret ac_push_byte dst p 32
+end
+if eq cp 0x200a
+ret ac_push_byte dst p 32
+end
+if eq cp 0x202f
+ret ac_push_byte dst p 32
+end
+if eq cp 0x00d7
+ret ac_push_byte dst p 120
+end
+if eq cp 0x00df
+p = ac_push_byte dst p 115
+ret ac_push_byte dst p 115
+end
+if eq cp 0x00e6
+p = ac_push_byte dst p 97
+ret ac_push_byte dst p 101
+end
+if eq cp 0x00c6
+p = ac_push_byte dst p 65
+ret ac_push_byte dst p 69
+end
+if eq cp 0x0153
+p = ac_push_byte dst p 111
+ret ac_push_byte dst p 101
+end
+if eq cp 0x0152
+p = ac_push_byte dst p 79
+ret ac_push_byte dst p 69
+end
+b = ac_bare_latin_lo cp
+if ne b 0
+ret ac_push_byte dst p b
+end
+b = ac_bare_latin_ext cp
+if ne b 0
+ret ac_push_byte dst p b
+end
+ret p
+end
+
+fn ac_plain src view uchar * dst edit uchar * to ulong
+n = len src
+step = new ulong 1 0
+i = ulong 0
+p = ulong 0
+while lt i n bound 65536
+cp = ac_utf8_decode src i edit step
+st = get step 0
+if eq st 0
+break
+end
+if ne cp 0xffffffff
+p = ac_plain_cp dst p cp
+end
+i = add i st
+end
+ret p
+end
+
+fn ac_folded src view uchar * dst edit uchar * to ulong
+tmp = new uchar 8192 0
+pn = ac_plain src edit tmp
+i = ulong 0
+p = ulong 0
+in_sp = true
+while lt i pn bound 8192
+b = get tmp i
+if ac_is_ws b
+in_sp = true
+else
+if in_sp
+if gt p 0
+p = ac_push_byte dst p 32
+end
+in_sp = false
+end
+p = ac_push_byte dst p b
+end
+i = add i 1
+end
+ret p
+end
+
+fn ac_find_sent_cut f view uchar * max_len ulong floor ulong to ulong
+i = max_len
+while gt i 0 bound 8192
+i = sub i 1
+b = get f i
+is_end = false
+if eq b 46
+is_end = true
+end
+if eq b 33
+is_end = true
+end
+if eq b 63
+is_end = true
+end
+if is_end
+if ge add i 1 floor
+cut = add i 1
+while gt cut 0 bound 8192
+if not ac_is_ws get f sub cut 1
+break
+end
+cut = sub cut 1
+end
+ret cut
+end
+end
+end
+ret 0
+end
+
+fn ac_find_word_cut f view uchar * room ulong keep ulong to ulong
+rcut = room
+i = room
+while gt i 0 bound 8192
+i = sub i 1
+if eq get f i 32
+if ge i keep
+rcut = i
+break
+end
+end
+end
+while gt rcut 0 bound 8192
+if not ac_is_ws get f sub rcut 1
+break
+end
+rcut = sub rcut 1
+end
+ret rcut
+end
+
+fn ac_for_allen_keep src view uchar * max_len ulong keep ulong dst edit uchar * to ulong
+f = new uchar 8192 0
+fn_len = ac_folded src edit f
+if le fn_len max_len
+ret ac_copy_at dst 0 part f 0 fn_len
+end
+floor = div max_len 3
+if gt keep floor
+floor = keep
+end
+cut = ac_find_sent_cut part f 0 fn_len max_len floor
+if gt cut 0
+ret ac_copy_at dst 0 part f 0 cut
+end
+room = ulong 0
+if gt max_len 3
+room = sub max_len 3
+end
+rcut = ac_find_word_cut part f 0 fn_len room keep
+p = ac_copy_at dst 0 part f 0 rcut
+p = ac_push_byte dst p 46
+p = ac_push_byte dst p 46
+p = ac_push_byte dst p 46
+ret p
+end
+
+fn ac_for_allen src view uchar * max_len ulong dst edit uchar * to ulong
+ret ac_for_allen_keep src max_len 0 dst
+end
+
+note ---- code.rs: CRC-32, plain_code, lang_of, within_limits, read_reply, escape, pieces ----
+
+fn ac_crc32 b view uchar * to uint
+n = len b
+c = uint 0xffffffff
+i = ulong 0
+while lt i n bound 65536
+c = xor c uint get b i
+j = ulong 0
+while lt j 8 bound 8
+if ne and c 1 0
+c = xor shr c 1 0xedb88320
+else
+c = shr c 1
+end
+j = add j 1
+end
+i = add i 1
+end
+ret xor c 0xffffffff
+end
+
+fn ac_plain_code src view uchar * dst edit uchar * to ulong
+n = len src
+step = new ulong 1 0
+i = ulong 0
+p = ulong 0
+while lt i n bound 65536
+cp = ac_utf8_decode src i edit step
+st = get step 0
+if eq st 0
+break
+end
+if eq cp 13
+i = add i st
+continue
+end
+if eq cp 10
+p = ac_push_byte dst p 10
+else
+if eq cp 9
+p = ac_push_byte dst p 32
+p = ac_push_byte dst p 32
+p = ac_push_byte dst p 32
+p = ac_push_byte dst p 32
+else
+if ge cp 32
+if le cp 126
+p = ac_push_byte dst p uchar cp
+else
+p = ac_push_byte dst p 63
+end
+else
+p = ac_push_byte dst p 63
+end
+end
+end
+i = add i st
+end
+s = ulong 0
+while lt s p bound 65536
+if ne get dst s 10
+break
+end
+s = add s 1
+end
+e = p
+while gt e s bound 65536
+if ne get dst sub e 1 10
+break
+end
+e = sub e 1
+end
+if eq s e
+ret 0
+end
+k = sub e s
+if gt s 0
+j = ulong 0
+while lt j k bound 65536
+put dst j get dst add s j
+j = add j 1
+end
+end
+k = ac_push_byte dst k 10
+ret k
+end
+
+text AC_L_PY "py"
+text AC_L_PY3 "python3"
+text AC_L_PYTHON "python"
+text AC_L_JS "js"
+text AC_L_JAVASCRIPT "javascript"
+text AC_L_TS "ts"
+text AC_L_TYPESCRIPT "typescript"
+text AC_L_SH "sh"
+text AC_L_SHELL "shell"
+text AC_L_ZSH "zsh"
+text AC_L_BASH "bash"
+text AC_L_CPP_PLUS "c++"
+text AC_L_CPP "cpp"
+text AC_L_RS "rs"
+text AC_L_RUST "rust"
+
+fn ac_is_lang_ch b uchar to bool
+if ac_is_lower b
+ret true
+end
+if ac_is_digit b
+ret true
+end
+if eq b 43
+ret true
+end
+if eq b 35
+ret true
+end
+if eq b 46
+ret true
+end
+if eq b 95
+ret true
+end
+if eq b 45
+ret true
+end
+ret false
+end
+
+fn ac_lang_of src view uchar * dst edit uchar * to ulong
+n = len src
+s = ulong 0
+while lt s n bound 256
+if not ac_is_ws get src s
+break
+end
+s = add s 1
+end
+e = n
+while gt e s bound 256
+if not ac_is_ws get src sub e 1
+break
+end
+e = sub e 1
+end
+tmp = new uchar 64 0
+tlen = sub e s
+if gt tlen 64
+tlen = ulong 64
+end
+i = ulong 0
+while lt i tlen bound 64
+put tmp i ac_to_lower get src add s i
+i = add i 1
+end
+if ac_mem_eq part tmp 0 tlen AC_L_PY
+ret ac_copy_at dst 0 AC_L_PYTHON
+end
+if ac_mem_eq part tmp 0 tlen AC_L_PY3
+ret ac_copy_at dst 0 AC_L_PYTHON
+end
+if ac_mem_eq part tmp 0 tlen AC_L_JS
+ret ac_copy_at dst 0 AC_L_JAVASCRIPT
+end
+if ac_mem_eq part tmp 0 tlen AC_L_TS
+ret ac_copy_at dst 0 AC_L_TYPESCRIPT
+end
+if ac_mem_eq part tmp 0 tlen AC_L_SH
+ret ac_copy_at dst 0 AC_L_BASH
+end
+if ac_mem_eq part tmp 0 tlen AC_L_SHELL
+ret ac_copy_at dst 0 AC_L_BASH
+end
+if ac_mem_eq part tmp 0 tlen AC_L_ZSH
+ret ac_copy_at dst 0 AC_L_BASH
+end
+if ac_mem_eq part tmp 0 tlen AC_L_CPP_PLUS
+ret ac_copy_at dst 0 AC_L_CPP
+end
+if ac_mem_eq part tmp 0 tlen AC_L_RS
+ret ac_copy_at dst 0 AC_L_RUST
+end
+p = ulong 0
+i = ulong 0
+while lt i tlen bound 64
+if ge p AC_LANG_MAX
+break
+end
+b = get tmp i
+if not ac_is_lang_ch b
+break
+end
+p = ac_push_byte dst p b
+i = add i 1
+end
+ret p
+end
+
+fn ac_count_lines src view uchar * to ulong
+n = len src
+if eq n 0
+ret 0
+end
+cnt = ulong 0
+i = ulong 0
+while lt i n bound 65536
+while lt i n bound 65536
+if eq get src i 10
+break
+end
+i = add i 1
+end
+cnt = add cnt 1
+if lt i n
+i = add i 1
+end
+end
+ret cnt
+end
+
+fn ac_line_end src view uchar * pos ulong to ulong
+i = pos
+while lt i len src bound 65536
+if eq get src i 10
+ret i
+end
+i = add i 1
+end
+ret i
+end
+
+fn ac_within_limits src view uchar * dst edit uchar * meta edit ulong 2 to ulong
+kept_len = ulong 0
+kept_lines = ulong 0
+i = ulong 0
+while lt i len src bound 65536
+le_end = ac_line_end src i
+llen = sub le_end i
+if eq kept_lines AC_CODE_LINES
+break
+end
+if gt add kept_len add llen 1 AC_CODE_MAX
+break
+end
+kept_len = ac_copy_at dst kept_len part src i llen
+kept_len = ac_push_byte dst kept_len 10
+kept_lines = add kept_lines 1
+i = le_end
+if lt i len src
+i = add i 1
+end
+end
+put meta 0 kept_lines
+put meta 1 sub ac_count_lines src kept_lines
+ret kept_len
+end
+
+text AC_FENCE "```"
+
+fn ac_trim_slice_bounds src view uchar * bs ulong be ulong res edit ulong 2 to void
+s = bs
+e = be
+while lt s e bound 65536
+if not ac_is_ws get src s
+break
+end
+s = add s 1
+end
+while gt e s bound 65536
+if not ac_is_ws get src sub e 1
+break
+end
+e = sub e 1
+end
+put res 0 s
+put res 1 e
+ret
+end
+
+fn ac_code_first_word reply view uchar * s ulong e ulong lang_buf edit uchar 32 to ulong
+ws = s
+while lt ws e bound 256
+if not ac_is_ws get reply ws
+break
+end
+ws = add ws 1
+end
+we = ws
+while lt we e bound 256
+if ac_is_ws get reply we
+break
+end
+we = add we 1
+end
+ret ac_lang_of part reply ws sub we ws lang_buf
+end
+
+fn ac_code_find_close reply view uchar * body_s ulong to ulong
+n = len reply
+cur = body_s
+while lt cur n bound 65536
+le_i = cur
+while lt le_i n bound 65536
+if eq get reply le_i 10
+le_i = add le_i 1
+break
+end
+le_i = add le_i 1
+end
+ts = cur
+while lt ts le_i bound 4096
+if not ac_is_ws get reply ts
+break
+end
+ts = add ts 1
+end
+if ac_starts_with part reply ts sub le_i ts AC_FENCE
+ret cur
+end
+cur = le_i
+end
+ret n
+end
+
+fn ac_code_finalize src view uchar * code_buf edit uchar 32768 info edit AcCodeReply to bool
+tb = new ulong 2 0
+meta = new ulong 2 0
+plain_buf = new uchar 65536 0
+plen = ac_plain_code src edit plain_buf
+ac_trim_slice_bounds part plain_buf 0 plen 0 plen edit tb
+if eq get tb 0 get tb 1
+ret false
+end
+clen = ac_within_limits part plain_buf 0 plen code_buf edit meta
+put info code_len clen
+put info kept_lines get meta 0
+put info cut_lines get meta 1
+put info ok 1
+ret true
+end
+
+fn ac_code_read_reply reply view uchar * sent_buf edit uchar 256 lang_buf edit uchar 32 code_buf edit uchar 32768 info edit AcCodeReply to bool
+put info ok 0
+put info sent_len 0
+put info lang_len 0
+put info code_len 0
+put info kept_lines 0
+put info cut_lines 0
+tb = new ulong 2 0
+open_i = ac_find_bytes reply AC_FENCE 0
+if lt open_i 0
+ret false
+end
+ac_trim_slice_bounds reply 0 ulong open_i edit tb
+put info sent_len ac_copy_at sent_buf 0 part reply get tb 0 sub get tb 1 get tb 0
+pos = add ulong open_i 3
+nl_i = ac_line_end reply pos
+put info lang_len ac_code_first_word reply pos nl_i lang_buf
+pos = len reply
+if lt nl_i len reply
+pos = add nl_i 1
+end
+body_e = ac_code_find_close reply pos
+ret ac_code_finalize part reply pos sub body_e pos code_buf info
+end
+
+fn ac_code_escape piece view uchar * dst edit uchar * to ulong
+n = len piece
+p = ulong 0
+i = ulong 0
+while lt i n bound 4096
+b = get piece i
+if eq b 10
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 110
+else
+if eq b 92
+p = ac_push_byte dst p 92
+p = ac_push_byte dst p 92
+else
+p = ac_push_byte dst p b
+end
+end
+i = add i 1
+end
+ret p
+end
+
+fn ac_code_piece_count clen ulong to ulong
+if eq clen 0
+ret 0
+end
+ret div add clen sub AC_PIECE 1 AC_PIECE
+end
+
+text AC_CODE_PFX "CODE "
+
+fn ac_code_format_piece req view AcCodePieceReq lang view uchar 32 code view uchar * dst edit uchar * to ulong
+esc = new uchar 264 0
+off = mul get req idx AC_PIECE
+if ge off get req code_len
+ret 0
+end
+plen = sub get req code_len off
+if gt plen AC_PIECE
+plen = AC_PIECE
+end
+p = ulong 0
+p = ac_copy_at dst p AC_CODE_PFX
+p = ac_fmt_u64 dst p ulong get req seq
+p = ac_push_byte dst p 32
+p = ac_fmt_u64 dst p add get req idx 1
+p = ac_push_byte dst p 47
+p = ac_fmt_u64 dst p get req total_n
+p = ac_push_byte dst p 32
+p = ac_fmt_u64 dst p get req code_len
+p = ac_push_byte dst p 32
+p = ac_fmt_hex8 dst p get req crc
+p = ac_push_byte dst p 32
+if eq get req lang_len 0
+p = ac_push_byte dst p 45
+else
+p = ac_copy_at dst p part lang 0 get req lang_len
+end
+p = ac_push_byte dst p 32
+elen = ac_code_escape part code off plen edit esc
+p = ac_copy_at dst p part esc 0 elen
+ret p
+end

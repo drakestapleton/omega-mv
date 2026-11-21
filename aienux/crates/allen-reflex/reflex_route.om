@@ -1,0 +1,1466 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note aienux/crates/allen-reflex/reflex_route.om: ALLEN Tower & Interactive Routing in pure OM-2.
+note Library unit (no om2 header line, no fn main). Prefix: arx_.
+note Requires reflex.om before it and om/tls/sha2.om in the same concatenated unit.
+
+note =========================================================================
+note Section 13: ALLEN Tower (Scheduling Orchestrator & Mneme Digest)
+note =========================================================================
+
+const ARX_TIER_PORTABLE uchar 0
+const ARX_TIER_PI5_HOST uchar 1
+const ARX_TIER_SPARK_HOST uchar 2
+const ARX_TIER_SPARK_QEMU uchar 3
+const ARX_TIER_SPARK_GB10 uchar 4
+const ARX_TIER_SPARK_NVRM uchar 5
+
+const ARX_TW_ACT_REUSE uchar 0
+const ARX_TW_ACT_JOIN uchar 1
+const ARX_TW_ACT_PI5 uchar 2
+const ARX_TW_ACT_SPARK_HOST uchar 3
+const ARX_TW_ACT_SPARK_GPU uchar 4
+
+const ARX_TW_WHY_CACHED uchar 0
+const ARX_TW_WHY_INFLIGHT uchar 1
+const ARX_TW_WHY_PI5 uchar 2
+const ARX_TW_WHY_SPARK_HOST uchar 3
+const ARX_TW_WHY_SPARK_GPU uchar 4
+const ARX_TW_WHY_UNCACHEABLE uchar 5
+
+const ARX_TW_MAX_RCPTS ulong 64
+const ARX_TW_MAX_INF ulong 16
+const ARX_TW_GATE_STRIDE ulong 64
+
+global arx_tw_max_rcpts ulong 1
+global arx_tw_max_inf ulong 1
+global arx_tw_rcpt_n ulong 1
+global arx_tw_rcpt_gate uchar 4096
+global arx_tw_rcpt_glen ulong 64
+global arx_tw_rcpt_tier uchar 64
+global arx_tw_rcpt_din uchar 2048
+global arx_tw_rcpt_drcpt uchar 2048
+
+global arx_tw_inf_used uchar 16
+global arx_tw_inf_gate uchar 1024
+global arx_tw_inf_glen ulong 16
+global arx_tw_inf_tier uchar 16
+global arx_tw_inf_din uchar 512
+
+global arx_tw_dec_act uchar 1
+global arx_tw_dec_why uchar 1
+global arx_tw_dec_slot ulong 1
+global arx_tw_dec_rcpt uchar 32
+global arx_tw_dec_gate uchar 64
+global arx_tw_dec_glen ulong 1
+
+text arx_tw_domain "ALLEN-TOWER-INPUT-V1"
+text arx_tw_s_act0 "reuse_receipt"
+text arx_tw_s_act1 "join_inflight"
+text arx_tw_s_act2 "run_pi5_local"
+text arx_tw_s_act3 "dispatch_spark_host"
+text arx_tw_s_act4 "queue_spark_gb10"
+
+text arx_tw_s_why0 "cached_pass_receipt"
+text arx_tw_s_why1 "inflight_duplicate"
+text arx_tw_s_why2 "tier_local_pi5"
+text arx_tw_s_why3 "tier_spark_host_pool"
+text arx_tw_s_why4 "tier_spark_gpu_serial"
+text arx_tw_s_why5 "uncacheable_gate"
+
+text arx_tw_j1 "{\"tower_action\":\""
+text arx_tw_j2 "\",\"gate\":\""
+text arx_tw_j3 "\",\"why\":\""
+text arx_tw_j4 "\"}"
+text arx_hex_digits "0123456789abcdef"
+
+fn arx_combine_mneme_digest decl view uchar 32 pins view uchar 32 reads view uchar * n_reads ulong dst edit uchar 32 to void
+ctx = new ulong 40 0
+nul1 = new uchar 1 0
+cnt_le = new uchar 8 0
+sha256_init ctx
+sha256_update ctx arx_tw_domain
+sha256_update ctx nul1
+sha256_update ctx decl
+sha256_update ctx pins
+put cnt_le 0 uchar and n_reads 255
+put cnt_le 1 uchar and shr n_reads 8 255
+put cnt_le 2 uchar and shr n_reads 16 255
+put cnt_le 3 uchar and shr n_reads 24 255
+put cnt_le 4 uchar and shr n_reads 32 255
+put cnt_le 5 uchar and shr n_reads 40 255
+put cnt_le 6 uchar and shr n_reads 48 255
+put cnt_le 7 uchar and shr n_reads 56 255
+sha256_update ctx cnt_le
+i = ulong 0
+while lt i n_reads bound 64
+sha256_update ctx part reads mul i 32 32
+i = add i 1
+end
+sha256_final ctx dst
+end
+
+fn arx_tower_init max_rcpts ulong max_inf ulong to void
+mr = max_rcpts
+if gt mr ARX_TW_MAX_RCPTS
+mr = ARX_TW_MAX_RCPTS
+end
+mi = max_inf
+if gt mi ARX_TW_MAX_INF
+mi = ARX_TW_MAX_INF
+end
+put arx_tw_max_rcpts 0 mr
+put arx_tw_max_inf 0 mi
+put arx_tw_rcpt_n 0 0
+i = ulong 0
+while lt i ARX_TW_MAX_INF bound 16
+put arx_tw_inf_used i 0
+i = add i 1
+end
+end
+
+fn arx_tw_match_rcpt idx ulong gate view uchar * tier uchar din view uchar 32 to bool
+if ne get arx_tw_rcpt_tier idx tier
+ret false
+end
+gn = len gate
+if ne get arx_tw_rcpt_glen idx gn
+ret false
+end
+gb = mul idx ARX_TW_GATE_STRIDE
+i = ulong 0
+while lt i gn bound 64
+if ne get arx_tw_rcpt_gate add gb i get gate i
+ret false
+end
+i = add i 1
+end
+db = mul idx 32
+i = ulong 0
+while lt i 32 bound 32
+if ne get arx_tw_rcpt_din add db i get din i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn arx_tw_match_inf idx ulong gate view uchar * tier uchar din view uchar 32 to bool
+if eq get arx_tw_inf_used idx 0
+ret false
+end
+if ne get arx_tw_inf_tier idx tier
+ret false
+end
+gn = len gate
+if ne get arx_tw_inf_glen idx gn
+ret false
+end
+gb = mul idx ARX_TW_GATE_STRIDE
+i = ulong 0
+while lt i gn bound 64
+if ne get arx_tw_inf_gate add gb i get gate i
+ret false
+end
+i = add i 1
+end
+db = mul idx 32
+i = ulong 0
+while lt i 32 bound 32
+if ne get arx_tw_inf_din add db i get din i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn arx_tower_complete_inflight gate view uchar * tier uchar din view uchar 32 to bool
+mi = get arx_tw_max_inf 0
+i = ulong 0
+while lt i mi bound 16
+if arx_tw_match_inf i gate tier din
+put arx_tw_inf_used i 0
+ret true
+end
+i = add i 1
+end
+ret false
+end
+
+fn arx_tw_shift_rcpts to void
+rn = get arx_tw_rcpt_n 0
+if le rn 1
+put arx_tw_rcpt_n 0 0
+ret
+end
+i = ulong 1
+while lt i rn bound 64
+d = sub i 1
+put arx_tw_rcpt_tier d get arx_tw_rcpt_tier i
+gl = get arx_tw_rcpt_glen i
+put arx_tw_rcpt_glen d gl
+sb = mul i ARX_TW_GATE_STRIDE
+db = mul d ARX_TW_GATE_STRIDE
+k = ulong 0
+while lt k gl bound 64
+put arx_tw_rcpt_gate add db k get arx_tw_rcpt_gate add sb k
+k = add k 1
+end
+si = mul i 32
+di = mul d 32
+k = ulong 0
+while lt k 32 bound 32
+put arx_tw_rcpt_din add di k get arx_tw_rcpt_din add si k
+put arx_tw_rcpt_drcpt add di k get arx_tw_rcpt_drcpt add si k
+k = add k 1
+end
+i = add i 1
+end
+put arx_tw_rcpt_n 0 sub rn 1
+end
+
+fn arx_tw_store_rcpt_gate rn ulong gate view uchar * to void
+gn = len gate
+if gt gn ARX_TW_GATE_STRIDE
+gn = ARX_TW_GATE_STRIDE
+end
+put arx_tw_rcpt_glen rn gn
+gb = mul rn ARX_TW_GATE_STRIDE
+k = ulong 0
+while lt k gn bound 64
+put arx_tw_rcpt_gate add gb k get gate k
+k = add k 1
+end
+end
+
+fn arx_tw_store_rcpt_digs rn ulong din view uchar 32 drcpt view uchar 32 to void
+db = mul rn 32
+k = ulong 0
+while lt k 32 bound 32
+put arx_tw_rcpt_din add db k get din k
+put arx_tw_rcpt_drcpt add db k get drcpt k
+k = add k 1
+end
+end
+
+fn arx_tower_record_pass gate view uchar * tier uchar din view uchar 32 drcpt view uchar 32 to void
+ign_c = arx_tower_complete_inflight gate tier din
+rn = get arx_tw_rcpt_n 0
+i = ulong 0
+while lt i rn bound 64
+if arx_tw_match_rcpt i gate tier din
+arx_tw_store_rcpt_digs i din drcpt
+ret
+end
+i = add i 1
+end
+mr = get arx_tw_max_rcpts 0
+if eq mr 0
+ret
+end
+if ge rn mr
+arx_tw_shift_rcpts
+rn = get arx_tw_rcpt_n 0
+end
+put arx_tw_rcpt_tier rn tier
+arx_tw_store_rcpt_gate rn gate
+arx_tw_store_rcpt_digs rn din drcpt
+put arx_tw_rcpt_n 0 add rn 1
+end
+
+fn arx_tw_insert_inf gate view uchar * tier uchar din view uchar 32 to void
+gn = len gate
+if gt gn ARX_TW_GATE_STRIDE
+gn = ARX_TW_GATE_STRIDE
+end
+mi = get arx_tw_max_inf 0
+i = ulong 0
+while lt i mi bound 16
+if eq get arx_tw_inf_used i 0
+put arx_tw_inf_used i 1
+put arx_tw_inf_tier i tier
+put arx_tw_inf_glen i gn
+gb = mul i ARX_TW_GATE_STRIDE
+k = ulong 0
+while lt k gn bound 64
+put arx_tw_inf_gate add gb k get gate k
+k = add k 1
+end
+db = mul i 32
+k = ulong 0
+while lt k 32 bound 32
+put arx_tw_inf_din add db k get din k
+k = add k 1
+end
+ret
+end
+i = add i 1
+end
+end
+
+fn arx_tw_copy_dec_gate gate view uchar * to void
+gn = len gate
+if gt gn ARX_TW_GATE_STRIDE
+gn = ARX_TW_GATE_STRIDE
+end
+put arx_tw_dec_glen 0 gn
+k = ulong 0
+while lt k gn bound 64
+put arx_tw_dec_gate k get gate k
+k = add k 1
+end
+end
+
+fn arx_tw_copy_dec_rcpt idx ulong to void
+db = mul idx 32
+k = ulong 0
+while lt k 32 bound 32
+put arx_tw_dec_rcpt k get arx_tw_rcpt_drcpt add db k
+k = add k 1
+end
+end
+
+fn arx_tower_schedule gate view uchar * tier uchar din view uchar 32 cacheable bool to uchar
+arx_tw_copy_dec_gate gate
+act = ARX_TW_ACT_SPARK_GPU
+twhy = ARX_TW_WHY_SPARK_GPU
+if or eq tier ARX_TIER_PORTABLE eq tier ARX_TIER_PI5_HOST
+act = ARX_TW_ACT_PI5
+twhy = ARX_TW_WHY_PI5
+else
+if or eq tier ARX_TIER_SPARK_HOST eq tier ARX_TIER_SPARK_QEMU
+act = ARX_TW_ACT_SPARK_HOST
+twhy = ARX_TW_WHY_SPARK_HOST
+end
+end
+if not cacheable
+put arx_tw_dec_act 0 act
+put arx_tw_dec_why 0 ARX_TW_WHY_UNCACHEABLE
+ret act
+end
+rn = get arx_tw_rcpt_n 0
+i = ulong 0
+while lt i rn bound 64
+if arx_tw_match_rcpt i gate tier din
+arx_tw_copy_dec_rcpt i
+put arx_tw_dec_act 0 ARX_TW_ACT_REUSE
+put arx_tw_dec_why 0 ARX_TW_WHY_CACHED
+ret ARX_TW_ACT_REUSE
+end
+i = add i 1
+end
+mi = get arx_tw_max_inf 0
+i = ulong 0
+while lt i mi bound 16
+if arx_tw_match_inf i gate tier din
+put arx_tw_dec_act 0 ARX_TW_ACT_JOIN
+put arx_tw_dec_why 0 ARX_TW_WHY_INFLIGHT
+put arx_tw_dec_slot 0 i
+ret ARX_TW_ACT_JOIN
+end
+i = add i 1
+end
+arx_tw_insert_inf gate tier din
+put arx_tw_dec_act 0 act
+put arx_tw_dec_why 0 twhy
+ret act
+end
+
+fn arx_tw_push_escaped dst edit uchar * pos ulong src view uchar * to ulong
+p = pos
+n = len src
+i = ulong 0
+while lt i n bound 256
+c = get src i
+if eq c 34
+put dst p 92
+put dst add p 1 34
+p = add p 2
+else
+if eq c 92
+put dst p 92
+put dst add p 1 92
+p = add p 2
+else
+if eq c 10
+put dst p 92
+put dst add p 1 110
+p = add p 2
+else
+if eq c 13
+put dst p 92
+put dst add p 1 114
+p = add p 2
+else
+if eq c 9
+put dst p 92
+put dst add p 1 116
+p = add p 2
+else
+if lt c 0x20
+put dst p 92
+put dst add p 1 117
+put dst add p 2 48
+put dst add p 3 48
+put dst add p 4 get arx_hex_digits ulong shr c 4
+put dst add p 5 get arx_hex_digits ulong and c 15
+p = add p 6
+else
+put dst p c
+p = add p 1
+end
+end
+end
+end
+end
+end
+i = add i 1
+end
+ret p
+end
+
+fn arx_tower_decision_json dst edit uchar * to ulong
+gbuf = new uchar 64 0
+p = ulong 0
+p = arx_copy_bytes dst p arx_tw_j1
+act = get arx_tw_dec_act 0
+if eq act ARX_TW_ACT_REUSE
+p = arx_copy_bytes dst p arx_tw_s_act0
+else
+if eq act ARX_TW_ACT_JOIN
+p = arx_copy_bytes dst p arx_tw_s_act1
+else
+if eq act ARX_TW_ACT_PI5
+p = arx_copy_bytes dst p arx_tw_s_act2
+else
+if eq act ARX_TW_ACT_SPARK_HOST
+p = arx_copy_bytes dst p arx_tw_s_act3
+else
+p = arx_copy_bytes dst p arx_tw_s_act4
+end
+end
+end
+end
+p = arx_copy_bytes dst p arx_tw_j2
+gl = get arx_tw_dec_glen 0
+k = ulong 0
+while lt k gl bound 64
+put gbuf k get arx_tw_dec_gate k
+k = add k 1
+end
+p = arx_tw_push_escaped dst p part gbuf 0 gl
+p = arx_copy_bytes dst p arx_tw_j3
+w = get arx_tw_dec_why 0
+if eq w ARX_TW_WHY_CACHED
+p = arx_copy_bytes dst p arx_tw_s_why0
+else
+if eq w ARX_TW_WHY_INFLIGHT
+p = arx_copy_bytes dst p arx_tw_s_why1
+else
+if eq w ARX_TW_WHY_PI5
+p = arx_copy_bytes dst p arx_tw_s_why2
+else
+if eq w ARX_TW_WHY_SPARK_HOST
+p = arx_copy_bytes dst p arx_tw_s_why3
+else
+if eq w ARX_TW_WHY_SPARK_GPU
+p = arx_copy_bytes dst p arx_tw_s_why4
+else
+p = arx_copy_bytes dst p arx_tw_s_why5
+end
+end
+end
+end
+end
+p = arx_copy_bytes dst p arx_tw_j4
+ret p
+end
+
+note =========================================================================
+note Section 14: Interactive Routing (route.rs)
+note =========================================================================
+
+const ARX_INTERACTIVE_MAX ulong 512
+const ARX_PST1_HEADER ulong 224
+const ARX_PST1_PAYLOAD_MAX ulong 800
+
+const ARX_RT_LOCAL_DET uchar 0
+const ARX_RT_MEMORY uchar 1
+const ARX_RT_CLARIFY uchar 2
+const ARX_RT_REFUSE uchar 3
+const ARX_RT_LOCAL_MODEL uchar 4
+const ARX_RT_SPARK_INF uchar 5
+const ARX_RT_SPARK_OM uchar 6
+const ARX_RT_APPROVAL uchar 7
+const ARX_RT_NONE uchar 255
+
+const ARX_THEN_APPROVE uchar 0
+const ARX_THEN_DENY uchar 1
+const ARX_THEN_CANCEL uchar 2
+const ARX_THEN_REMEMBER uchar 3
+const ARX_THEN_PREFER uchar 4
+const ARX_THEN_NOTE_TASK uchar 5
+const ARX_THEN_SPARK_TASK uchar 6
+const ARX_THEN_NONE uchar 255
+
+const ARX_SPK_OWNER uchar 0
+const ARX_SPK_GUEST uchar 1
+
+const ARX_NR_STORE uchar 0
+const ARX_NR_NO_CONSENT uchar 1
+const ARX_NR_DESK uchar 2
+const ARX_NR_NO_MODEL uchar 3
+const ARX_NR_SPARK_DOWN uchar 4
+const ARX_NR_NONE uchar 255
+
+const ARX_RWHY_SCORED uchar 0
+const ARX_RWHY_EXACT uchar 1
+const ARX_RWHY_POLICY uchar 2
+const ARX_RWHY_NO_USER uchar 3
+const ARX_RWHY_TOO_LONG uchar 4
+const ARX_RWHY_NON_ASCII uchar 5
+const ARX_RWHY_NO_WORDS uchar 6
+const ARX_RWHY_CORE_CLARIFY uchar 7
+const ARX_RWHY_MISSING_SUBJ uchar 8
+const ARX_RWHY_UNFAMILIAR uchar 9
+const ARX_RWHY_UNSURE uchar 10
+const ARX_RWHY_NOTHING_PEND uchar 11
+const ARX_RWHY_MODEL_UNAVAIL uchar 12
+const ARX_RWHY_GUEST_SCOPE uchar 13
+const ARX_RWHY_OUT_OF_CAP uchar 14
+const ARX_RWHY_SPARK_CUE uchar 15
+
+note --- RouteCtx globals ---
+global arx_rctx_speaker uchar 1
+global arx_rctx_consent uchar 1
+global arx_rctx_pending uchar 1
+global arx_rctx_caps uint 1
+global arx_rctx_has_model uchar 1
+global arx_rctx_model uchar 64
+global arx_rctx_mlen ulong 1
+global arx_rctx_subj uchar 32
+global arx_rctx_min_sim f32 1
+global arx_rctx_min_margin f32 1
+
+note --- DecisionProposal output globals ---
+global arx_prop_req ulong 1
+global arx_prop_sess ulong 1
+global arx_prop_speaker uchar 1
+global arx_prop_obj uchar 32
+global arx_prop_route uchar 1
+global arx_prop_then uchar 1
+global arx_prop_not_ready uchar 1
+global arx_prop_fallback uchar 1
+global arx_prop_why uchar 1
+global arx_prop_refuse uchar 1
+global arx_prop_label uchar 1
+global arx_prop_has_txt uchar 1
+global arx_prop_txt uchar 64
+global arx_prop_tlen ulong 1
+global arx_prop_has_pst1 uchar 1
+global arx_prop_pst1 uchar 32
+
+text arx_rt_obj_dom "AIEN_E2E_OBJECTIVE_V1\n"
+text arx_rt_cause_dom "AIENOS_PST1_CAUSE_V1\n"
+text arx_rt_task_dom "AIENOS_PST1_TASK_V1\n"
+text arx_rt_idem_dom "AIENOS_PST1_IDEMPOTENCE_V1\n"
+
+text arx_rt_model_words "gpt chatgpt claude gemini llama tinyllama mistral qwen danube phi grok deepseek gemma copilot"
+text arx_rt_spark_verbs "run compile build benchmark train test verify execute measure compute"
+text arx_rt_w_spark "spark"
+text arx_rt_w_gb10 "gb10"
+
+fn arx_route_runs_without_owner r uchar to bool
+if eq r ARX_RT_LOCAL_DET
+ret true
+end
+if eq r ARX_RT_MEMORY
+ret true
+end
+if eq r ARX_RT_LOCAL_MODEL
+ret true
+end
+if eq r ARX_RT_SPARK_INF
+ret true
+end
+ret false
+end
+
+fn arx_cal_frozen mode uchar to void
+if eq mode ARX_MODE_REFLEX
+put arx_rctx_min_sim 0 0.20f32
+put arx_rctx_min_margin 0 -1.0e38f32
+else
+if eq mode ARX_MODE_NEAREST
+put arx_rctx_min_sim 0 0.35f32
+put arx_rctx_min_margin 0 -1.0e38f32
+else
+put arx_rctx_min_sim 0 -1.0f32
+put arx_rctx_min_margin 0 0.15f32
+end
+end
+end
+
+fn arx_cal_off to void
+put arx_rctx_min_sim 0 -1.0f32
+put arx_rctx_min_margin 0 -1.0e38f32
+end
+
+fn arx_rctx_set_model has_m bool name view uchar * to void
+if not has_m
+put arx_rctx_has_model 0 0
+put arx_rctx_mlen 0 0
+ret
+end
+n = len name
+if gt n 64
+n = 64
+end
+i = ulong 0
+while lt i n bound 64
+put arx_rctx_model i get name i
+i = add i 1
+end
+put arx_rctx_mlen 0 n
+put arx_rctx_has_model 0 1
+end
+
+fn arx_objective_id msg view uchar * dst edit uchar 32 to void
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx arx_rt_obj_dom
+sha256_update ctx msg
+sha256_final ctx dst
+end
+
+fn arx_put_be64 dst edit uchar * off ulong v ulong to void
+put dst off uchar and shr v 56 255
+put dst add off 1 uchar and shr v 48 255
+put dst add off 2 uchar and shr v 40 255
+put dst add off 3 uchar and shr v 32 255
+put dst add off 4 uchar and shr v 24 255
+put dst add off 5 uchar and shr v 16 255
+put dst add off 6 uchar and shr v 8 255
+put dst add off 7 uchar and v 255
+end
+
+fn arx_pst1_fill_hdr subj view uchar 32 dst edit uchar * to void
+ctx = new ulong 40 0
+be8 = new uchar 8 0
+cause_id = new uchar 32 0
+tmp_h = new uchar 32 0
+sha256_init ctx
+sha256_update ctx arx_rt_cause_dom
+arx_put_be64 be8 0 get arx_prop_sess 0
+sha256_update ctx be8
+arx_put_be64 be8 0 get arx_prop_req 0
+sha256_update ctx be8
+i = ulong 0
+while lt i 32 bound 32
+put tmp_h i get arx_prop_obj i
+i = add i 1
+end
+sha256_update ctx tmp_h
+sha256_final ctx cause_id
+i = ulong 0
+while lt i ARX_PST1_HEADER bound 224
+put dst i 0
+i = add i 1
+end
+put dst 0 1
+put dst 1 1
+i = ulong 0
+while lt i 32 bound 32
+put dst add 4 i get cause_id i
+put dst add 68 i get arx_prop_obj i
+put dst add 100 i get subj i
+i = add i 1
+end
+sha256_init ctx
+sha256_update ctx arx_rt_task_dom
+sha256_update ctx cause_id
+sha256_final ctx tmp_h
+i = ulong 0
+while lt i 16 bound 16
+put dst add 148 i get tmp_h i
+i = add i 1
+end
+sha256_init ctx
+sha256_update ctx arx_rt_idem_dom
+sha256_update ctx cause_id
+sha256_final ctx tmp_h
+i = ulong 0
+while lt i 16 bound 16
+put dst add 164 i get tmp_h i
+i = add i 1
+end
+put dst 184 1
+end
+
+fn arx_pst1_request route uchar payload view uchar * subj view uchar 32 dst edit uchar * to ulong
+tmp_h = new uchar 32 0
+if not or eq route ARX_RT_SPARK_INF eq route ARX_RT_SPARK_OM
+ret 0
+end
+pn = len payload
+if gt pn ARX_PST1_PAYLOAD_MAX
+ret 0
+end
+if lt len dst add ARX_PST1_HEADER pn
+ret 0
+end
+arx_pst1_fill_hdr subj dst
+put dst 188 uchar and shr pn 8 255
+put dst 189 uchar and pn 255
+ign_h = sha2_digest 256 payload tmp_h
+i = ulong 0
+while lt i 32 bound 32
+put dst add 192 i get tmp_h i
+i = add i 1
+end
+i = ulong 0
+while lt i pn bound 800
+put dst add ARX_PST1_HEADER i get payload i
+i = add i 1
+end
+ret add ARX_PST1_HEADER pn
+end
+
+fn arx_eq_ci a view uchar * b view uchar * to bool
+na = len a
+if ne na len b
+ret false
+end
+i = ulong 0
+while lt i na bound 256
+if ne arx_to_lower get a i arx_to_lower get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn arx_word_in_list_ci w view uchar * lst view uchar * to bool
+n = len lst
+i = ulong 0
+while lt i n bound 512
+if eq get lst i 32
+i = add i 1
+continue
+end
+ws = i
+while lt i n bound 512
+if eq get lst i 32
+break
+end
+i = add i 1
+end
+if arx_eq_ci w part lst ws sub i ws
+ret true
+end
+end
+ret false
+end
+
+fn arx_named_model_unavail msg view uchar * to bool
+im = new uchar 64 0
+has_im = ne get arx_rctx_has_model 0 0
+imlen = get arx_rctx_mlen 0
+if has_im
+k = ulong 0
+while lt k imlen bound 64
+put im k get arx_rctx_model k
+k = add k 1
+end
+end
+n = len msg
+i = ulong 0
+while lt i n bound 512
+if not arx_is_alnum get msg i
+i = add i 1
+continue
+end
+ws = i
+while lt i n bound 512
+if not arx_is_alnum get msg i
+break
+end
+i = add i 1
+end
+if arx_word_in_list_ci part msg ws sub i ws arx_rt_model_words
+if not has_im
+ret true
+end
+if not arx_eq_ci part msg ws sub i ws part im 0 imlen
+ret true
+end
+ret false
+end
+end
+ret false
+end
+
+fn arx_spark_cue msg view uchar * to bool
+has_sp = false
+has_vb = false
+n = len msg
+i = ulong 0
+while lt i n bound 512
+if not arx_is_alnum get msg i
+i = add i 1
+continue
+end
+ws = i
+while lt i n bound 512
+if not arx_is_alnum get msg i
+break
+end
+i = add i 1
+end
+if or arx_eq_ci part msg ws sub i ws arx_rt_w_spark arx_eq_ci part msg ws sub i ws arx_rt_w_gb10
+has_sp = true
+end
+if arx_word_in_list_ci part msg ws sub i ws arx_rt_spark_verbs
+has_vb = true
+end
+end
+ret and has_sp has_vb
+end
+
+fn arx_prop_reset req_id ulong sess_id ulong to void
+put arx_prop_req 0 req_id
+put arx_prop_sess 0 sess_id
+put arx_prop_speaker 0 get arx_rctx_speaker 0
+i = ulong 0
+while lt i 32 bound 32
+put arx_prop_obj i 0
+put arx_prop_pst1 i 0
+i = add i 1
+end
+put arx_prop_route 0 ARX_RT_CLARIFY
+put arx_prop_then 0 ARX_THEN_NONE
+put arx_prop_not_ready 0 ARX_NR_NONE
+put arx_prop_fallback 0 ARX_RT_NONE
+put arx_prop_why 0 ARX_RWHY_NO_USER
+put arx_prop_refuse 0 ARX_REFUSE_NONE
+put arx_prop_label 0 ARX_ACT_CLARIFY
+put arx_prop_has_txt 0 0
+put arx_prop_tlen 0 0
+put arx_prop_has_pst1 0 0
+end
+
+fn arx_propose_dispatch act uchar msg view uchar * to uchar
+owner = eq get arx_rctx_speaker 0 ARX_SPK_OWNER
+caps = get arx_rctx_caps 0
+has_cons = ne get arx_rctx_consent 0 0
+if or eq act ARX_ACT_STATUS or eq act ARX_ACT_HELP eq act ARX_ACT_EVIDENCE
+put arx_prop_route 0 ARX_RT_LOCAL_DET
+ret ARX_RT_LOCAL_DET
+end
+if eq act ARX_ACT_NONE
+put arx_prop_route 0 ARX_RT_LOCAL_DET
+put arx_prop_why 0 ARX_RWHY_OUT_OF_CAP
+ret ARX_RT_LOCAL_DET
+end
+if or eq act ARX_ACT_RECALL eq act ARX_ACT_FACTS
+if not owner
+put arx_prop_route 0 ARX_RT_REFUSE
+put arx_prop_why 0 ARX_RWHY_GUEST_SCOPE
+ret ARX_RT_REFUSE
+end
+put arx_prop_route 0 ARX_RT_MEMORY
+if not has_cons
+put arx_prop_not_ready 0 ARX_NR_NO_CONSENT
+else
+if eq and caps 1 0
+put arx_prop_not_ready 0 ARX_NR_STORE
+end
+end
+ret ARX_RT_MEMORY
+end
+if or eq act ARX_ACT_REMEMBER or eq act ARX_ACT_PREFER eq act ARX_ACT_TASK
+if not owner
+put arx_prop_route 0 ARX_RT_REFUSE
+put arx_prop_why 0 ARX_RWHY_GUEST_SCOPE
+ret ARX_RT_REFUSE
+end
+if and eq act ARX_ACT_TASK arx_spark_cue msg
+put arx_prop_route 0 ARX_RT_SPARK_OM
+put arx_prop_why 0 ARX_RWHY_SPARK_CUE
+put arx_prop_then 0 ARX_THEN_SPARK_TASK
+if eq and caps 2 0
+put arx_prop_not_ready 0 ARX_NR_DESK
+else
+if eq and caps 8 0
+put arx_prop_not_ready 0 ARX_NR_SPARK_DOWN
+end
+end
+ret ARX_RT_SPARK_OM
+end
+put arx_prop_route 0 ARX_RT_APPROVAL
+if eq act ARX_ACT_REMEMBER
+put arx_prop_then 0 ARX_THEN_REMEMBER
+else
+if eq act ARX_ACT_PREFER
+put arx_prop_then 0 ARX_THEN_PREFER
+else
+put arx_prop_then 0 ARX_THEN_NOTE_TASK
+end
+end
+if and ne act ARX_ACT_TASK not has_cons
+put arx_prop_not_ready 0 ARX_NR_NO_CONSENT
+else
+if eq and caps 2 0
+put arx_prop_not_ready 0 ARX_NR_DESK
+else
+if eq and caps 1 0
+put arx_prop_not_ready 0 ARX_NR_STORE
+end
+end
+end
+ret ARX_RT_APPROVAL
+end
+if eq act ARX_ACT_PROMPT
+if and owner arx_spark_cue msg
+put arx_prop_route 0 ARX_RT_SPARK_OM
+put arx_prop_why 0 ARX_RWHY_SPARK_CUE
+put arx_prop_then 0 ARX_THEN_SPARK_TASK
+if eq and caps 2 0
+put arx_prop_not_ready 0 ARX_NR_DESK
+else
+if eq and caps 8 0
+put arx_prop_not_ready 0 ARX_NR_SPARK_DOWN
+end
+end
+ret ARX_RT_SPARK_OM
+end
+if ne and caps 4 0
+put arx_prop_route 0 ARX_RT_LOCAL_MODEL
+ret ARX_RT_LOCAL_MODEL
+end
+put arx_prop_route 0 ARX_RT_SPARK_INF
+if eq and caps 8 0
+put arx_prop_not_ready 0 ARX_NR_SPARK_DOWN
+end
+ret ARX_RT_SPARK_INF
+end
+if or eq act ARX_ACT_APPROVE or eq act ARX_ACT_DENY eq act ARX_ACT_CANCEL
+if eq get arx_rctx_pending 0 0
+put arx_prop_route 0 ARX_RT_CLARIFY
+put arx_prop_why 0 ARX_RWHY_NOTHING_PEND
+ret ARX_RT_CLARIFY
+end
+if not owner
+put arx_prop_route 0 ARX_RT_REFUSE
+put arx_prop_why 0 ARX_RWHY_GUEST_SCOPE
+ret ARX_RT_REFUSE
+end
+put arx_prop_route 0 ARX_RT_APPROVAL
+if eq act ARX_ACT_APPROVE
+put arx_prop_then 0 ARX_THEN_APPROVE
+else
+if eq act ARX_ACT_DENY
+put arx_prop_then 0 ARX_THEN_DENY
+else
+put arx_prop_then 0 ARX_THEN_CANCEL
+end
+end
+if eq and caps 2 0
+put arx_prop_not_ready 0 ARX_NR_DESK
+end
+ret ARX_RT_APPROVAL
+end
+if eq act ARX_ACT_CLARIFY
+put arx_prop_route 0 ARX_RT_CLARIFY
+put arx_prop_why 0 ARX_RWHY_CORE_CLARIFY
+ret ARX_RT_CLARIFY
+end
+put arx_prop_route 0 ARX_RT_REFUSE
+ret ARX_RT_REFUSE
+end
+
+fn arx_propose_attach_pst1 rt uchar msg view uchar * to void
+subj = new uchar 32 0
+pst = new uchar 1024 0
+dig = new uchar 32 0
+if not or eq rt ARX_RT_SPARK_INF eq rt ARX_RT_SPARK_OM
+ret
+end
+i = ulong 0
+while lt i 32 bound 32
+put subj i get arx_rctx_subj i
+i = add i 1
+end
+plen = arx_pst1_request rt msg subj pst
+if gt plen 0
+ign_d = sha2_digest 256 part pst 0 plen dig
+i = ulong 0
+while lt i 32 bound 32
+put arx_prop_pst1 i get dig i
+i = add i 1
+end
+put arx_prop_has_pst1 0 1
+end
+end
+
+fn arx_propose req_id ulong sess_id ulong to uchar
+msg = new uchar 512 0
+obj = new uchar 32 0
+arx_prop_reset req_id sess_id
+tn = get arx_turn_n 0
+has_u = false
+last_u = ulong 0
+i = ulong 0
+while lt i tn bound 32
+if eq get arx_turn_role i ARX_ROLE_USER
+has_u = true
+last_u = i
+end
+i = add i 1
+end
+if not has_u
+ret ARX_RT_CLARIFY
+end
+raw_n = get arx_turn_raw_len last_u
+mlen = arx_load_turn_buf last_u msg
+arx_objective_id part msg 0 mlen obj
+i = ulong 0
+while lt i 32 bound 32
+put arx_prop_obj i get obj i
+i = add i 1
+end
+if gt raw_n ARX_INTERACTIVE_MAX
+put arx_prop_route 0 ARX_RT_REFUSE
+put arx_prop_why 0 ARX_RWHY_TOO_LONG
+ret ARX_RT_REFUSE
+end
+i = ulong 0
+while lt i mlen bound 512
+b = get msg i
+if or lt b 0x20 gt b 0x7e
+put arx_prop_route 0 ARX_RT_CLARIFY
+put arx_prop_why 0 ARX_RWHY_NON_ASCII
+ret ARX_RT_CLARIFY
+end
+i = add i 1
+end
+act = arx_decide
+put arx_prop_label 0 act
+if ne get arx_dec_has_txt 0 0
+put arx_prop_has_txt 0 1
+tl = get arx_dec_txt_len 0
+put arx_prop_tlen 0 tl
+i = ulong 0
+while lt i tl bound 64
+put arx_prop_txt i get arx_dec_txt i
+i = add i 1
+end
+end
+ew = get arx_exp_why 0
+if eq ew ARX_WHY_POLICY
+put arx_prop_route 0 ARX_RT_REFUSE
+put arx_prop_why 0 ARX_RWHY_POLICY
+put arx_prop_refuse 0 get arx_exp_refuse 0
+put arx_prop_has_txt 0 0
+ret ARX_RT_REFUSE
+end
+if eq ew ARX_WHY_NO_USER_TURN
+put arx_prop_why 0 ARX_RWHY_NO_USER
+ret ARX_RT_CLARIFY
+end
+if eq ew ARX_WHY_INPUT_TOO_LONG
+put arx_prop_route 0 ARX_RT_REFUSE
+put arx_prop_why 0 ARX_RWHY_TOO_LONG
+ret ARX_RT_REFUSE
+end
+if eq ew ARX_WHY_NO_WORDS
+put arx_prop_why 0 ARX_RWHY_NO_WORDS
+ret ARX_RT_CLARIFY
+end
+if eq ew ARX_WHY_SPAN
+put arx_prop_why 0 ARX_RWHY_MISSING_SUBJ
+ret ARX_RT_CLARIFY
+end
+if ne ew ARX_WHY_EXACT_RECALL
+if lt get arx_exp_best_sim 0 get arx_rctx_min_sim 0
+put arx_prop_route 0 ARX_RT_CLARIFY
+put arx_prop_why 0 ARX_RWHY_UNFAMILIAR
+put arx_prop_has_txt 0 0
+ret ARX_RT_CLARIFY
+end
+if lt get arx_exp_margin 0 get arx_rctx_min_margin 0
+put arx_prop_route 0 ARX_RT_CLARIFY
+put arx_prop_why 0 ARX_RWHY_UNSURE
+put arx_prop_has_txt 0 0
+ret ARX_RT_CLARIFY
+end
+end
+if eq ew ARX_WHY_EXACT_RECALL
+put arx_prop_why 0 ARX_RWHY_EXACT
+else
+put arx_prop_why 0 ARX_RWHY_SCORED
+end
+if arx_named_model_unavail part msg 0 mlen
+put arx_prop_route 0 ARX_RT_CLARIFY
+put arx_prop_why 0 ARX_RWHY_MODEL_UNAVAIL
+put arx_prop_has_txt 0 0
+ret ARX_RT_CLARIFY
+end
+rt = arx_propose_dispatch act part msg 0 mlen
+if ne get arx_prop_not_ready 0 ARX_NR_NONE
+put arx_prop_fallback 0 ARX_RT_LOCAL_DET
+end
+arx_propose_attach_pst1 rt part msg 0 mlen
+ret rt
+end
+
+text arx_p_s1 "{\"req\":"
+text arx_p_s2 ",\"session\":"
+text arx_p_s3 ",\"speaker\":\""
+text arx_p_s4 "\",\"objective\":\""
+text arx_p_s5 "\",\"route\":\""
+text arx_p_s6 "\",\"then\":\""
+text arx_p_s7 "\",\"ready\":\""
+text arx_p_s8 "\",\"fallback\":\""
+text arx_p_s9 "\",\"why\":\""
+text arx_p_s10 "\",\"label\":\""
+text arx_p_s11 "\",\"text\":\""
+text arx_p_s12 "\",\"pst1\":\""
+text arx_p_s13 "\",\"grants\":\"none\"}"
+text arx_p_owner "owner"
+text arx_p_guest "guest"
+text arx_p_yes "yes"
+text arx_p_no "no:"
+text arx_p_dash "-"
+
+text arx_rt_n0 "local_deterministic"
+text arx_rt_n1 "memory"
+text arx_rt_n2 "clarify"
+text arx_rt_n3 "refuse"
+text arx_rt_n4 "local_model"
+text arx_rt_n5 "spark_inference"
+text arx_rt_n6 "spark_omegese"
+text arx_rt_n7 "approval_needed"
+
+text arx_th_n0 "approve"
+text arx_th_n1 "deny"
+text arx_th_n2 "cancel"
+text arx_th_n3 "remember"
+text arx_th_n4 "prefer"
+text arx_th_n5 "note_task"
+text arx_th_n6 "spark_task"
+
+text arx_nr_n0 "store_absent"
+text arx_nr_n1 "no_memory_consent"
+text arx_nr_n2 "owner_desk_absent"
+text arx_nr_n3 "no_local_model"
+text arx_nr_n4 "spark_link_down"
+
+text arx_rw_n0 "scored"
+text arx_rw_n1 "exact_recall"
+text arx_rw_n2 "policy"
+text arx_rw_n3 "no_user_turn"
+text arx_rw_n4 "input_too_long"
+text arx_rw_n5 "non_ascii"
+text arx_rw_n6 "no_words"
+text arx_rw_n7 "core_clarify"
+text arx_rw_n8 "missing_subject"
+text arx_rw_n9 "unfamiliar"
+text arx_rw_n10 "unsure"
+text arx_rw_n11 "nothing_pending"
+text arx_rw_n12 "model_unavailable"
+text arx_rw_n13 "guest_scope"
+text arx_rw_n14 "out_of_capability"
+text arx_rw_n15 "spark_cue"
+
+text arx_rr_n1 ":rule-break"
+text arx_rr_n2 ":override"
+text arx_rr_n3 ":forbidden-verb"
+text arx_rr_n4 ":blanket-approval"
+text arx_rr_n5 ":data-order"
+
+fn arx_push_u64 dst edit uchar * pos ulong val ulong to ulong
+buf = new uchar 20 0
+v = val
+i = ulong 20
+while gt i 0 bound 20
+i = sub i 1
+put buf i add uchar 48 uchar rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+p = pos
+while lt i 20 bound 20
+put dst p get buf i
+p = add p 1
+i = add i 1
+end
+ret p
+end
+
+fn arx_push_hex32 dst edit uchar * pos ulong src view uchar 32 to ulong
+p = pos
+i = ulong 0
+while lt i 32 bound 32
+b = get src i
+put dst p get arx_hex_digits ulong shr b 4
+put dst add p 1 get arx_hex_digits ulong and b 15
+p = add p 2
+i = add i 1
+end
+ret p
+end
+
+fn arx_write_route_name r uchar dst edit uchar * pos ulong to ulong
+if eq r ARX_RT_LOCAL_DET
+ret arx_copy_bytes dst pos arx_rt_n0
+end
+if eq r ARX_RT_MEMORY
+ret arx_copy_bytes dst pos arx_rt_n1
+end
+if eq r ARX_RT_CLARIFY
+ret arx_copy_bytes dst pos arx_rt_n2
+end
+if eq r ARX_RT_REFUSE
+ret arx_copy_bytes dst pos arx_rt_n3
+end
+if eq r ARX_RT_LOCAL_MODEL
+ret arx_copy_bytes dst pos arx_rt_n4
+end
+if eq r ARX_RT_SPARK_INF
+ret arx_copy_bytes dst pos arx_rt_n5
+end
+if eq r ARX_RT_SPARK_OM
+ret arx_copy_bytes dst pos arx_rt_n6
+end
+if eq r ARX_RT_APPROVAL
+ret arx_copy_bytes dst pos arx_rt_n7
+end
+ret arx_copy_bytes dst pos arx_p_dash
+end
+
+fn arx_write_then_name t uchar dst edit uchar * pos ulong to ulong
+if eq t ARX_THEN_APPROVE
+ret arx_copy_bytes dst pos arx_th_n0
+end
+if eq t ARX_THEN_DENY
+ret arx_copy_bytes dst pos arx_th_n1
+end
+if eq t ARX_THEN_CANCEL
+ret arx_copy_bytes dst pos arx_th_n2
+end
+if eq t ARX_THEN_REMEMBER
+ret arx_copy_bytes dst pos arx_th_n3
+end
+if eq t ARX_THEN_PREFER
+ret arx_copy_bytes dst pos arx_th_n4
+end
+if eq t ARX_THEN_NOTE_TASK
+ret arx_copy_bytes dst pos arx_th_n5
+end
+if eq t ARX_THEN_SPARK_TASK
+ret arx_copy_bytes dst pos arx_th_n6
+end
+ret arx_copy_bytes dst pos arx_p_dash
+end
+
+fn arx_write_rwhy_name w uchar dst edit uchar * pos ulong to ulong
+if eq w ARX_RWHY_SCORED
+ret arx_copy_bytes dst pos arx_rw_n0
+end
+if eq w ARX_RWHY_EXACT
+ret arx_copy_bytes dst pos arx_rw_n1
+end
+if eq w ARX_RWHY_POLICY
+p = arx_copy_bytes dst pos arx_rw_n2
+rr = get arx_prop_refuse 0
+if eq rr ARX_REFUSE_RULE_BREAK
+ret arx_copy_bytes dst p arx_rr_n1
+end
+if eq rr ARX_REFUSE_OVERRIDE
+ret arx_copy_bytes dst p arx_rr_n2
+end
+if eq rr ARX_REFUSE_FORBIDDEN
+ret arx_copy_bytes dst p arx_rr_n3
+end
+if eq rr ARX_REFUSE_BLANKET
+ret arx_copy_bytes dst p arx_rr_n4
+end
+if eq rr ARX_REFUSE_DATA_ORDER
+ret arx_copy_bytes dst p arx_rr_n5
+end
+ret p
+end
+if eq w ARX_RWHY_NO_USER
+ret arx_copy_bytes dst pos arx_rw_n3
+end
+if eq w ARX_RWHY_TOO_LONG
+ret arx_copy_bytes dst pos arx_rw_n4
+end
+if eq w ARX_RWHY_NON_ASCII
+ret arx_copy_bytes dst pos arx_rw_n5
+end
+if eq w ARX_RWHY_NO_WORDS
+ret arx_copy_bytes dst pos arx_rw_n6
+end
+if eq w ARX_RWHY_CORE_CLARIFY
+ret arx_copy_bytes dst pos arx_rw_n7
+end
+if eq w ARX_RWHY_MISSING_SUBJ
+ret arx_copy_bytes dst pos arx_rw_n8
+end
+if eq w ARX_RWHY_UNFAMILIAR
+ret arx_copy_bytes dst pos arx_rw_n9
+end
+if eq w ARX_RWHY_UNSURE
+ret arx_copy_bytes dst pos arx_rw_n10
+end
+if eq w ARX_RWHY_NOTHING_PEND
+ret arx_copy_bytes dst pos arx_rw_n11
+end
+if eq w ARX_RWHY_MODEL_UNAVAIL
+ret arx_copy_bytes dst pos arx_rw_n12
+end
+if eq w ARX_RWHY_GUEST_SCOPE
+ret arx_copy_bytes dst pos arx_rw_n13
+end
+if eq w ARX_RWHY_OUT_OF_CAP
+ret arx_copy_bytes dst pos arx_rw_n14
+end
+ret arx_copy_bytes dst pos arx_rw_n15
+end
+
+fn arx_proposal_json dst edit uchar * to ulong
+tmp32 = new uchar 32 0
+p = ulong 0
+p = arx_copy_bytes dst p arx_p_s1
+p = arx_push_u64 dst p get arx_prop_req 0
+p = arx_copy_bytes dst p arx_p_s2
+p = arx_push_u64 dst p get arx_prop_sess 0
+p = arx_copy_bytes dst p arx_p_s3
+if eq get arx_prop_speaker 0 ARX_SPK_OWNER
+p = arx_copy_bytes dst p arx_p_owner
+else
+p = arx_copy_bytes dst p arx_p_guest
+end
+p = arx_copy_bytes dst p arx_p_s4
+i = ulong 0
+while lt i 32 bound 32
+put tmp32 i get arx_prop_obj i
+i = add i 1
+end
+p = arx_push_hex32 dst p tmp32
+p = arx_copy_bytes dst p arx_p_s5
+p = arx_write_route_name get arx_prop_route 0 dst p
+p = arx_copy_bytes dst p arx_p_s6
+p = arx_write_then_name get arx_prop_then 0 dst p
+p = arx_copy_bytes dst p arx_p_s7
+nr = get arx_prop_not_ready 0
+if eq nr ARX_NR_NONE
+p = arx_copy_bytes dst p arx_p_yes
+else
+p = arx_copy_bytes dst p arx_p_no
+if eq nr ARX_NR_STORE
+p = arx_copy_bytes dst p arx_nr_n0
+else
+if eq nr ARX_NR_NO_CONSENT
+p = arx_copy_bytes dst p arx_nr_n1
+else
+if eq nr ARX_NR_DESK
+p = arx_copy_bytes dst p arx_nr_n2
+else
+if eq nr ARX_NR_NO_MODEL
+p = arx_copy_bytes dst p arx_nr_n3
+else
+p = arx_copy_bytes dst p arx_nr_n4
+end
+end
+end
+end
+end
+p = arx_copy_bytes dst p arx_p_s8
+p = arx_write_route_name get arx_prop_fallback 0 dst p
+p = arx_copy_bytes dst p arx_p_s9
+p = arx_write_rwhy_name get arx_prop_why 0 dst p
+p = arx_copy_bytes dst p arx_p_s10
+p = arx_act_write_name get arx_prop_label 0 dst p
+p = arx_copy_bytes dst p arx_p_s11
+if ne get arx_prop_has_txt 0 0
+tl = get arx_prop_tlen 0
+i = ulong 0
+while lt i tl bound 64
+put dst add p i get arx_prop_txt i
+i = add i 1
+end
+p = add p tl
+end
+p = arx_copy_bytes dst p arx_p_s12
+if ne get arx_prop_has_pst1 0 0
+i = ulong 0
+while lt i 32 bound 32
+put tmp32 i get arx_prop_pst1 i
+i = add i 1
+end
+p = arx_push_hex32 dst p tmp32
+else
+p = arx_copy_bytes dst p arx_p_dash
+end
+p = arx_copy_bytes dst p arx_p_s13
+ret p
+end
+
+fn arx_hex_val c uchar to int
+if ge c 48
+if le c 57
+ret int sub c 48
+end
+end
+if ge c 97
+if le c 102
+ret add 10 int sub c 97
+end
+end
+if ge c 65
+if le c 70
+ret add 10 int sub c 65
+end
+end
+ret -1
+end
+
+fn arx_pct_decode src view uchar * dst edit uchar * to long
+n = len src
+cap = len dst
+i = ulong 0
+j = ulong 0
+while lt i n bound 4096
+if ge j cap
+ret -1
+end
+b = get src i
+if eq b 37
+if ge add i 2 n
+ret -1
+end
+hi = arx_hex_val get src add i 1
+lo = arx_hex_val get src add i 2
+if or lt hi 0 lt lo 0
+ret -1
+end
+put dst j uchar or shl hi 4 lo
+j = add j 1
+i = add i 3
+else
+put dst j b
+j = add j 1
+i = add i 1
+end
+end
+ret long j
+end
