@@ -1,0 +1,229 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Zero-heap 5-region GB10 UVM arena planner for Arboris scalar spreading activation.
+note Slab 0: SpreadHeader (128 B, 16 x ulong, RO during dispatch)
+note Slab 1: IncomingCSR (128 B aligned, RO after validation: in_row_off, in_src, in_weight each 128 B padded)
+note Slab 2: StatePing (4 KiB guard + 128 B aligned, RW: node-major [V, batch_stride] FP32)
+note Slab 3: StatePong (4 KiB guard + 128 B aligned, RW: identical [V, batch_stride] double buffer)
+note Slab 4: SpreadReceipt (4 KiB guard + 128 B aligned, RW: 8 x ulong = 64 B)
+om2
+
+const SP_MAGIC_VER ulong 0x4152425300000001
+const SP_MAX_NODES ulong 0x1fffffff
+const SP_MAX_EDGES ulong 0xffffffff
+const SP_MAX_BATCH ulong 65535
+const SP_F32_INF ulong 0x7f800000
+
+fn sp_add_checked a ulong b ulong limit ulong to ulong
+  if or gt a limit gt b sub limit a
+    ret 0
+  end
+  ret add a b
+end
+
+fn sp_mul_checked a ulong b ulong limit ulong to ulong
+  if or eq a 0 eq b 0
+    ret 0
+  end
+  if gt a div limit b
+    ret 0
+  end
+  ret mul a b
+end
+
+fn sp_align_checked n ulong alignment ulong limit ulong to ulong
+  if or eq n 0 gt n limit
+    ret 0
+  end
+  mask = sub alignment 1
+  pad = and sub ulong 0 n mask
+  if gt pad sub limit n
+    ret 0
+  end
+  ret add n pad
+end
+
+fn sp_expected_stride batch ulong to ulong
+  if eq batch 1
+    ret 1
+  end
+  ret and add batch 31 0xffffffffffffffe0
+end
+
+fn sp_header_inputs_ok hdr view ulong 16 to ulong
+  if ne get hdr 0 SP_MAGIC_VER
+    ret 1
+  end
+  if ne get hdr 15 0
+    ret 2
+  end
+  v_cnt = get hdr 1
+  e_cnt = get hdr 2
+  batch = get hdr 3
+  if or eq v_cnt 0 gt v_cnt SP_MAX_NODES
+    ret 3
+  end
+  if gt e_cnt SP_MAX_EDGES
+    ret 3
+  end
+  if or eq batch 0 gt batch SP_MAX_BATCH
+    ret 3
+  end
+  stride = sp_expected_stride batch
+  if and ne get hdr 4 0 ne get hdr 4 stride
+    ret 4
+  end
+  hops = get hdr 5
+  if or eq hops 0 gt hops 0xffffffff
+    ret 5
+  end
+  decay = get hdr 6
+  if or ge shr decay 32 1 ge and decay 0xffffffff SP_F32_INF
+    ret 6
+  end
+  mode = get hdr 7
+  if and eq batch 1 ne mode 0
+    ret 7
+  end
+  if and gt batch 1 ne mode 1
+    ret 7
+  end
+  if gt get hdr 8 1
+    ret 8
+  end
+  ret 0
+end
+
+note Compute Slab 1 CSR sizes into res[4]: 0=off_in_src, 1=off_in_weight, 2=csr_sz, 3=state_sz.
+fn sp_calc_sizes hdr view ulong 16 budget ulong res edit ulong 4 to ulong
+  v_cnt = get hdr 1
+  e_cnt = get hdr 2
+  stride = sp_expected_stride get hdr 3
+  row_sz = sp_align_checked sp_mul_checked add v_cnt 1 4 budget 128 budget
+  if eq row_sz 0
+    ret 11
+  end
+  e_words = e_cnt
+  if eq e_words 0
+    e_words = ulong 1
+  end
+  src_sz = sp_align_checked sp_mul_checked e_words 4 budget 128 budget
+  if eq src_sz 0
+    ret 11
+  end
+  off_w = sp_add_checked row_sz src_sz budget
+  if eq off_w 0
+    ret 11
+  end
+  csr_sz = sp_add_checked off_w src_sz budget
+  if eq csr_sz 0
+    ret 11
+  end
+  elems = sp_mul_checked v_cnt stride budget
+  state_sz = sp_align_checked sp_mul_checked elems 4 budget 128 budget
+  if eq state_sz 0
+    ret 12
+  end
+  put res 0 row_sz
+  put res 1 off_w
+  put res 2 csr_sz
+  put res 3 state_sz
+  ret 0
+end
+
+fn sp_layout_slabs payload view ulong 5 page ulong budget ulong starts edit ulong 5 mapped edit ulong 5 to ulong
+  cur = ulong 0
+  for i ulong 5
+    put starts i cur
+    ext = sp_align_checked get payload i page sub budget cur
+    if eq ext 0
+      ret 0
+    end
+    put mapped i ext
+    cur = add cur ext
+    if lt i 4
+      if gt page sub budget cur
+        ret 0
+      end
+      cur = add cur page
+    end
+  end
+  ret cur
+end
+
+note Plan the 5-region UVM arena with 4 KiB unmapped guard pages between slabs.
+note Populates hdr[4] (batch_stride), hdr[11] (off_in_src), hdr[12] (off_in_weight),
+note hdr[13] (state_plane_bytes), hdr[14] (total_arena_bytes), offsets[0..4], mapped_sizes[0..4].
+export fn arboris_spread_plan hdr edit ulong 16 budget ulong page ulong offsets edit ulong 5 mapped_sizes edit ulong 5 to ulong
+  rc = sp_header_inputs_ok hdr
+  if ne rc 0
+    ret rc
+  end
+  if or lt page 4096 ne and page sub page 1 0
+    ret 9
+  end
+  if lt budget page
+    ret 10
+  end
+  res = new ulong 4 0
+  rc = sp_calc_sizes hdr budget res
+  if ne rc 0
+    ret rc
+  end
+  payload = new ulong 5 0
+  starts = new ulong 5 0
+  msizes = new ulong 5 0
+  put payload 0 128
+  put payload 1 get res 2
+  put payload 2 get res 3
+  put payload 3 get res 3
+  put payload 4 64
+  total = sp_layout_slabs payload page budget starts msizes
+  if eq total 0
+    ret 13
+  end
+  put hdr 4 sp_expected_stride get hdr 3
+  put hdr 11 get res 0
+  put hdr 12 get res 1
+  put hdr 13 get res 3
+  put hdr 14 total
+  for i ulong 5
+    put offsets i get starts i
+    put mapped_sizes i get msizes i
+  end
+  ret 0
+end
+
+note Verify an already-planned SpreadHeader against a budget and page size.
+export fn arboris_spread_verify_header hdr view ulong 16 budget ulong page ulong to ulong
+  rc = sp_header_inputs_ok hdr
+  if ne rc 0
+    ret rc
+  end
+  if or lt page 4096 ne and page sub page 1 0
+    ret 9
+  end
+  if ne get hdr 4 sp_expected_stride get hdr 3
+    ret 4
+  end
+  res = new ulong 4 0
+  rc = sp_calc_sizes hdr budget res
+  if ne rc 0
+    ret rc
+  end
+  if or ne get hdr 11 get res 0 or ne get hdr 12 get res 1 ne get hdr 13 get res 3
+    ret 14
+  end
+  payload = new ulong 5 0
+  offs = new ulong 5 0
+  msz = new ulong 5 0
+  put payload 0 128
+  put payload 1 get res 2
+  put payload 2 get res 3
+  put payload 3 get res 3
+  put payload 4 64
+  total = sp_layout_slabs payload page budget offs msz
+  if or eq total 0 ne get hdr 14 total
+    ret 14
+  end
+  ret 0
+end

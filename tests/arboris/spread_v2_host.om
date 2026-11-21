@@ -1,0 +1,344 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Host verification suite for Arboris 5-region ontology, planner, CPU oracle, and QMD/emitter.
+note Compose after: om/arboris_ontology.om, om/arboris_spread_plan.om, om/arboris_spread_cpu.om,
+note om/encoder/bw_enc_sm121.om, om/gpu/bw_qmd.om, om/bw_arboris_spread_emit.om.
+
+fn test_ontology_and_csr to ulong
+  note Build valid infrastructure-0.1.0 graph:
+  note V=4: node 0 = Pod (kind 7, props=name|phase=5), node 1 = Node (kind 6, props=name|schedulable=3),
+  note      node 2 = Service (kind 2, props=name=1), node 3 = Cluster (kind 5, props=name=1)
+  note E=3: (0 -> 1, scheduled_on=1, w=0.5), (2 -> 0, selects=3, w=0.8), (1 -> 3, part_of=0, w=0.75)
+  rec = new uint 30 0
+  put rec 0 0x41523031
+  put rec 1 2
+  put rec 2 4
+  put rec 3 3
+  put rec 4 5
+  put rec 5 0x3f400000
+  note Nodes
+  put rec 6 7
+  put rec 7 5
+  put rec 8 1
+  put rec 9 6
+  put rec 10 3
+  put rec 11 1
+  put rec 12 2
+  put rec 13 1
+  put rec 14 1
+  put rec 15 5
+  put rec 16 1
+  put rec 17 0
+  note Edges (4 words each starting at 18)
+  put rec 18 0
+  put rec 19 1
+  put rec 20 1
+  put rec 21 0x3f000000
+  put rec 22 2
+  put rec 23 3
+  put rec 24 0
+  put rec 25 0x3f4ccccd
+  put rec 26 1
+  put rec 27 0
+  put rec 28 3
+  put rec 29 0x3f400000
+
+  hdr = new ulong 16 0
+  offs = new ulong 5 0
+  msz = new ulong 5 0
+  put hdr 0 0x4152425300000001
+  put hdr 1 4
+  put hdr 2 3
+  put hdr 3 1
+  put hdr 5 5
+  put hdr 6 0x3f400000
+  put hdr 7 0
+  if ne arboris_spread_plan hdr 0x10000000 4096 offs msz 0
+    ret 9
+  end
+  csr = new uint 96 0
+  if ne arboris_compile_in_csr rec hdr csr 0
+    ret 10
+  end
+  note Incoming counts: v0 has 1 (from 2), v1 has 1 (from 0), v2 has 0, v3 has 1 (from 1)
+  if ne get csr 0 0
+    ret 11
+  end
+  if ne get csr 1 1
+    ret 11
+  end
+  if ne get csr 2 2
+    ret 11
+  end
+  if ne get csr 3 2
+    ret 11
+  end
+  if ne get csr 4 3
+    ret 11
+  end
+  if ne get csr 32 2
+    ret 12
+  end
+  if ne get csr 33 0
+    ret 12
+  end
+  if ne get csr 34 1
+    ret 12
+  end
+  if ne arboris_validate_in_csr hdr csr 0
+    ret 13
+  end
+
+  note Negative 1: exclusive state (Running|Stopped = 3)
+  put rec 8 3
+  if eq arboris_compile_in_csr rec hdr csr 0
+    ret 14
+  end
+  put rec 8 1
+
+  note Negative 2: missing required property (Pod missing phase)
+  put rec 7 1
+  if eq arboris_compile_in_csr rec hdr csr 0
+    ret 15
+  end
+  put rec 7 5
+
+  note Negative 3: illegal ontology edge (Cluster -> Pod via scheduled_on)
+  put rec 18 3
+  if eq arboris_compile_in_csr rec hdr csr 0
+    ret 16
+  end
+  put rec 18 0
+
+  note Negative 4: negative edge weight (-0.5 = 0xbf000000)
+  put rec 21 0xbf000000
+  if eq arboris_compile_in_csr rec hdr csr 0
+    ret 17
+  end
+  note Negative 5: NaN edge weight (0x7fc00000) and +Inf (0x7f800000)
+  put rec 21 0x7fc00000
+  if eq arboris_compile_in_csr rec hdr csr 0
+    ret 18
+  end
+  put rec 21 0x7f800000
+  if eq arboris_compile_in_csr rec hdr csr 0
+    ret 19
+  end
+  put rec 21 0x3f000000
+
+  note Negative 6: out-of-range in_src >= V
+  put csr 32 4
+  if eq arboris_validate_in_csr hdr csr 0
+    ret 20
+  end
+  put csr 32 2
+  ret 0
+end
+
+fn test_arena_planner to ulong
+  hdr = new ulong 16 0
+  offs = new ulong 5 0
+  msz = new ulong 5 0
+  budget = ulong 0x40000000
+
+  note Mode 0: V=100, E=250, B=1, H=8, gamma=0.5
+  put hdr 0 0x4152425300000001
+  put hdr 1 100
+  put hdr 2 250
+  put hdr 3 1
+  put hdr 5 8
+  put hdr 6 0x3f000000
+  put hdr 7 0
+  put hdr 8 0
+  put hdr 9 42
+  put hdr 10 7
+  put hdr 15 0
+  if ne arboris_spread_plan hdr budget 4096 offs msz 0
+    ret 30
+  end
+  if or ne get hdr 4 1 ne get offs 0 0
+    ret 31
+  end
+  note Verify 4 KiB guard page between every adjacent slab
+  for i ulong 4
+    gap = sub get offs add i 1 add get offs i get msz i
+    if ne gap 4096
+      ret 32
+    end
+  end
+  if ne arboris_spread_verify_header hdr budget 4096 0
+    ret 33
+  end
+
+  note Mode 1: B=37 -> batch_stride = 64
+  put hdr 3 37
+  put hdr 4 0
+  put hdr 7 1
+  if ne arboris_spread_plan hdr budget 4096 offs msz 0
+    ret 34
+  end
+  if ne get hdr 4 64
+    ret 35
+  end
+
+  note Negative 1: non-zero reserved_zero
+  put hdr 15 1
+  if eq arboris_spread_plan hdr budget 4096 offs msz 0
+    ret 36
+  end
+  put hdr 15 0
+
+  note Negative 2: 64-bit overflow / budget exceeded
+  put hdr 1 0x1fffffff
+  put hdr 3 65535
+  put hdr 4 0
+  if eq arboris_spread_plan hdr budget 4096 offs msz 0
+    ret 37
+  end
+
+  note Negative 3: high 32b of decay non-zero
+  put hdr 1 100
+  put hdr 3 1
+  put hdr 4 0
+  put hdr 7 0
+  put hdr 6 0x100000000
+  if eq arboris_spread_plan hdr budget 4096 offs msz 0
+    ret 38
+  end
+  note Negative 4: NaN decay
+  put hdr 6 0x7fc00000
+  if eq arboris_spread_plan hdr budget 4096 offs msz 0
+    ret 39
+  end
+  ret 0
+end
+
+fn test_cpu_oracle to ulong
+  note Graph: V=5 (0->1->2->0 cycle, 3 isolated, 2->4), E=4
+  note Incoming: v0<-{2:0.5}, v1<-{0:0.5}, v2<-{1:0.5}, v3<-{}, v4<-{2:1.0}
+  note Slab 1 CSR layout: row_off at word 0, in_src at word 32 (byte 128), in_weight at word 64 (byte 256)
+  csr = new uint 96 0
+  put csr 0 0
+  put csr 1 1
+  put csr 2 2
+  put csr 3 3
+  put csr 4 3
+  put csr 5 4
+  put csr 32 2
+  put csr 33 0
+  put csr 34 1
+  put csr 35 2
+  put csr 64 0x3f000000
+  put csr 65 0x3f000000
+  put csr 66 0x3f000000
+  put csr 67 0x3f800000
+
+  hdr = new ulong 16 0
+  offs = new ulong 5 0
+  msz = new ulong 5 0
+  put hdr 0 0x4152425300000001
+  put hdr 1 5
+  put hdr 2 4
+  put hdr 3 1
+  put hdr 5 10
+  put hdr 6 0x3f000000
+  put hdr 7 0
+  put hdr 8 0
+  put hdr 15 0
+  if ne arboris_spread_plan hdr 0x10000000 4096 offs msz 0
+    ret 40
+  end
+
+  state = new uint 10 0
+  receipt = new ulong 8 0
+  note Seed node 0 = 1.0 in bank 0 (ping = state[0..4])
+  put state 0 0x3f800000
+
+  if ne arboris_spread_cpu_run hdr csr state receipt 0
+    ret 40
+  end
+  note Hop 1: v1 = 0.25 (0x3e800000), changed=1
+  note Hop 2: v2 = 0.0625 (0x3d800000), changed=1
+  note Hop 3: v4 = 0.03125 (0x3d000000), v0 stays 1.0, changed=1
+  note Hop 4: changed=0 -> early stop at hop_completed == 4!
+  if ne get receipt 2 4
+    ret 41
+  end
+  if ne get receipt 0 0
+    ret 42
+  end
+  note Active bank after 4 hops is 0 (state[0..4]): v0=1.0, v1=0.25, v2=0.0625, v3=0.0, v4=0.03125
+  if or ne get state 0 0x3f800000 ne get state 1 0x3e800000
+    ret 43
+  end
+  if or ne get state 2 0x3d800000 or ne get state 3 0 ne get state 4 0x3d000000
+    ret 44
+  end
+  ret 0
+end
+
+fn test_emit to ulong
+  code0 = new uchar 16384 0
+  code1 = new uchar 16384 0
+  sz0 = bw_arboris_spread_emit_mode0 code0
+  sz1 = bw_arboris_spread_emit_mode1 code1
+  if or eq sz0 0 eq sz1 0
+    ret 50
+  end
+  ret 0
+end
+
+fn test_qmd to ulong
+  hdr = new ulong 16 0
+  offs = new ulong 5 0
+  msz = new ulong 5 0
+  put hdr 0 0x4152425300000001
+  put hdr 1 129
+  put hdr 2 64
+  put hdr 3 37
+  put hdr 5 4
+  put hdr 6 0x3f000000
+  put hdr 7 1
+  if ne arboris_spread_plan hdr 0x10000000 4096 offs msz 0
+    ret 51
+  end
+  vas = new ulong 10 0
+  for i ulong 10
+    put vas i add 0x500000000 mul i 65536
+  end
+  drv = new uint 224 0
+  bank = new uint 240 0
+  q0 = new uint 96 0
+  q1 = new uint 96 0
+  if ne bw_arboris_spread_pack_qmd hdr vas drv bank q0 q1 0
+    ret 52
+  end
+  note Mode 1: stride=64 -> gx=2, V=129 -> gy=ceil(129/4)=33, gpr=24, smem=0
+  if or ne get q1 39 2 ne get q1 40 33
+    ret 53
+  end
+  ret 0
+end
+
+fn main to int
+  rc = test_ontology_and_csr
+  if ne rc 0
+    ret int rc
+  end
+  rc = test_arena_planner
+  if ne rc 0
+    ret int rc
+  end
+  rc = test_cpu_oracle
+  if ne rc 0
+    ret int rc
+  end
+  rc = test_emit
+  if ne rc 0
+    ret int rc
+  end
+  rc = test_qmd
+  if ne rc 0
+    ret int rc
+  end
+  ret 0
+end
