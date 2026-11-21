@@ -1,0 +1,320 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/store/store_test.om: Behavioral self-test for Store v1 format, engine, and geometry adapter.
+note Compose with: si/directives/om2.om aienux/store/store_v1.om aienux/store/store_engine.om aienux/store/store_test.om om/tls/sha2.om
+
+text st_pass "PASS "
+text st_fail "FAIL "
+text st_nl "\n"
+text st_t01 "crc32c_and_geometry_adapter"
+text st_t02 "format_open_genesis_and_unformatted"
+text st_t03 "transact_read_and_dedup"
+text st_t04 "multi_generation_reopen_and_slot_alternation"
+text st_t05 "degraded_recovery_is_read_only"
+text st_t06 "corrupt_object_padding_and_poison_reopen"
+text st_sum "STORE_TEST_PASS total=6 failed=0\n"
+text st_fsum "STORE_TEST_FAIL\n"
+text st_crc_vec "123456789"
+text st_payload1 "alpha-object-payload-v1"
+text st_payload2 "beta-second-object-payload"
+
+fn st_write_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn st_report name view uchar * ok bool to uint
+if ok
+w1 = st_write_all 1 st_pass
+w2 = st_write_all 1 name
+w3 = st_write_all 1 st_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = st_write_all 1 st_fail
+w2 = st_write_all 1 name
+w3 = st_write_all 1 st_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn make_uuid dst edit uchar 16 to void
+for i ulong 16
+put dst i add uchar 0x10 uchar i
+end
+end
+
+fn stt_01_crc_and_geometry to bool
+note Standard CRC-32C check value for "123456789" is 0xe3069283
+crc = sv1_crc32c st_crc_vec 0 9
+if ne crc 0xe3069283
+ret false
+end
+st_media_zero
+note Unsupported block size 1024 refused
+if ne st_disk_bind 1024 128 0 16 ST_E_GEOMETRY
+ret false
+end
+note Unaligned base_lba for 512-byte blocks refused
+if ne st_disk_bind 512 256 3 16 ST_E_GEOMETRY
+ret false
+end
+note Region past device end refused
+if ne st_disk_bind 4096 16 0 17 ST_E_GEOMETRY
+ret false
+end
+note Valid 512-byte geometry (aligned base_lba=8, 32 units)
+if ne st_disk_bind 512 512 8 32 SV1_OK
+ret false
+end
+ret true
+end
+
+fn stt_02_format_and_open to bool
+st_media_zero
+if ne st_disk_bind 4096 64 0 64 SV1_OK
+ret false
+end
+note Blank media mounts as ST_M_UNFORMATTED
+if ne st_open ST_M_UNFORMATTED
+ret false
+end
+uuid = new uchar 16 0
+make_uuid uuid
+if ne st_format uuid SV1_OK
+ret false
+end
+if ne st_open SV1_OK
+ret false
+end
+if or ne st_generation 1 or ne st_high_water 4 or ne st_active_slot 0 or ne st_state ST_VALID ne st_peer ST_PEER_ZERO
+ret false
+end
+ret true
+end
+
+fn stt_03_transact_read_dedup to bool
+st_media_zero
+if ne st_disk_bind 4096 64 0 64 SV1_OK
+ret false
+end
+uuid = new uchar 16 0
+make_uuid uuid
+if ne st_format uuid SV1_OK
+ret false
+end
+if ne st_open SV1_OK
+ret false
+end
+note Compute expected ObjectId for st_payload1 (kind=16, ver=1)
+id1 = new uchar 32 0
+if ne sv1_object_id 16 1 st_payload1 id1 SV1_OK
+ret false
+end
+st_tx_begin
+if ne st_tx_add 16 1 st_payload1 SV1_OK
+ret false
+end
+if ne st_tx_commit SV1_OK
+ret false
+end
+if or ne st_generation 2 or ne st_active_slot 1 ne st_catalog_count 1
+ret false
+end
+note Read back and verify exact bytes
+buf = new uchar 64 0
+rlen = new ulong 1 0
+if ne st_read_object id1 buf rlen SV1_OK
+ret false
+end
+if ne get rlen 0 len st_payload1
+ret false
+end
+if not sv1_equal part buf 0 len st_payload1 st_payload1
+ret false
+end
+note Re-submitting identical object deduplicates (catalog stays at 1)
+hw_before = st_high_water
+st_tx_begin
+if ne st_tx_add 16 1 st_payload1 SV1_OK
+ret false
+end
+if ne st_tx_commit SV1_OK
+ret false
+end
+if or ne st_generation 3 or ne st_catalog_count 1 ne st_high_water add hw_before 2
+ret false
+end
+ret true
+end
+
+fn stt_04_multi_gen_reopen to bool
+st_media_zero
+if ne st_disk_bind 512 512 0 64 SV1_OK
+ret false
+end
+uuid = new uchar 16 0
+make_uuid uuid
+if ne st_format uuid SV1_OK
+ret false
+end
+if ne st_open SV1_OK
+ret false
+end
+id1 = new uchar 32 0
+id2 = new uchar 32 0
+if ne sv1_object_id 16 1 st_payload1 id1 SV1_OK
+ret false
+end
+if ne sv1_object_id 17 1 st_payload2 id2 SV1_OK
+ret false
+end
+st_tx_begin
+if ne st_tx_add 16 1 st_payload1 SV1_OK
+ret false
+end
+if ne st_tx_commit SV1_OK
+ret false
+end
+st_tx_begin
+if ne st_tx_add 17 1 st_payload2 SV1_OK
+ret false
+end
+if ne st_tx_commit SV1_OK
+ret false
+end
+note Fresh reopen must select generation 3 (slot 0) with ST_PEER_VALID
+if ne st_open SV1_OK
+ret false
+end
+if or ne st_generation 3 or ne st_active_slot 0 or ne st_peer ST_PEER_VALID ne st_catalog_count 2
+ret false
+end
+buf = new uchar 64 0
+rlen = new ulong 1 0
+if ne st_read_object id2 buf rlen SV1_OK
+ret false
+end
+if not sv1_equal part buf 0 len st_payload2 st_payload2
+ret false
+end
+ret true
+end
+
+fn stt_05_degraded_read_only to bool
+st_media_zero
+if ne st_disk_bind 4096 64 0 64 SV1_OK
+ret false
+end
+uuid = new uchar 16 0
+make_uuid uuid
+if ne st_format uuid SV1_OK
+ret false
+end
+if ne st_open SV1_OK
+ret false
+end
+note Corrupt inactive superblock slot 1 -> mounts ST_DEGRADED_RECOVERY
+st_media_poke 1 0 0xde
+if ne st_open SV1_OK
+ret false
+end
+if or ne st_state ST_DEGRADED_RECOVERY ne st_peer ST_PEER_MALFORMED
+ret false
+end
+note Transactions refused on degraded mount
+st_tx_begin
+if ne st_tx_add 16 1 st_payload1 SV1_OK
+ret false
+end
+if ne st_tx_commit ST_E_READ_ONLY_DEGRADED
+ret false
+end
+ret true
+end
+
+fn stt_06_corrupt_padding_and_poison to bool
+st_media_zero
+if ne st_disk_bind 4096 64 0 64 SV1_OK
+ret false
+end
+uuid = new uchar 16 0
+make_uuid uuid
+if ne st_format uuid SV1_OK
+ret false
+end
+if ne st_open SV1_OK
+ret false
+end
+id1 = new uchar 32 0
+if ne sv1_object_id 16 1 st_payload1 id1 SV1_OK
+ret false
+end
+st_tx_begin
+if ne st_tx_add 16 1 st_payload1 SV1_OK
+ret false
+end
+if ne st_tx_commit SV1_OK
+ret false
+end
+note Inject I/O write fault on next transaction -> poisons store (ST_E_NEEDS_REOPEN)
+st_set_faults 1 0
+st_tx_begin
+if ne st_tx_add 17 1 st_payload2 SV1_OK
+ret false
+end
+if ne st_tx_commit ST_E_IO
+ret false
+end
+st_set_faults 0 0
+if ne st_tx_commit ST_E_NEEDS_REOPEN
+ret false
+end
+note Corrupt trailing zero padding of object at unit 4 -> read_object fails ST_E_CORRUPT and zeroes buffer
+if ne st_open SV1_OK
+ret false
+end
+st_media_poke 4 4095 0x01
+buf = new uchar 64 0xaa
+rlen = new ulong 1 0
+if ne st_read_object id1 buf rlen ST_E_CORRUPT
+ret false
+end
+if not sv1_all_zero buf 0 64
+ret false
+end
+ret true
+end
+
+fn main to int
+fails = uint 0
+fails = add fails st_report st_t01 stt_01_crc_and_geometry
+fails = add fails st_report st_t02 stt_02_format_and_open
+fails = add fails st_report st_t03 stt_03_transact_read_dedup
+fails = add fails st_report st_t04 stt_04_multi_gen_reopen
+fails = add fails st_report st_t05 stt_05_degraded_read_only
+fails = add fails st_report st_t06 stt_06_corrupt_padding_and_poison
+if eq fails 0
+w = st_write_all 1 st_sum
+if w
+ret 0
+end
+ret 1
+end
+w = st_write_all 1 st_fsum
+if w
+ret 1
+end
+ret 1
+end

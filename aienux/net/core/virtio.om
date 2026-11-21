@@ -1,0 +1,273 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/core/virtio.om: Pure-Omega Virtio 1.x PCI capability discovery and split-virtqueue net driver.
+note Converted from aienux native/net/aienos_virtio_pci.{h,c} and native/net/aienos_virtio_net.{h,c}.
+note Enforces VIRTIO_F_VERSION_1, optional/required VIRTIO_F_ACCESS_PLATFORM (IOMMU fail-closed),
+note and sticky broken state on untrusted used-ring anomalies.
+note Compose with: si/directives/om2.om aienux/net/core/virtio.om ...
+
+const VPCI_OK int 0
+const VPCI_ERR_NO_CAPS int -1
+const VPCI_ERR_MISSING int -2
+const VPCI_ERR_LOOP int -3
+
+const VPCI_CAP_VENDOR uchar 0x09
+const VPCI_CFG_COMMON uchar 1
+const VPCI_CFG_NOTIFY uchar 2
+const VPCI_CFG_ISR uchar 3
+const VPCI_CFG_DEVICE uchar 4
+
+const VNET_OK int 0
+const VNET_ERR_ARG int -1
+const VNET_ERR_FEATURE int -2
+const VNET_ERR_ACCESS_PLATFORM int -3
+const VNET_ERR_QUEUE int -4
+const VNET_ERR_BROKEN int -5
+const VNET_ERR_EMPTY int -6
+const VNET_ERR_FULL int -7
+
+const VNET_INIT_REQUIRE_ACCESS_PLATFORM uint 1
+
+const VNET_F_MAC ulong 0x20
+const VNET_F_VERSION_1 ulong 0x100000000
+const VNET_F_ACCESS_PLATFORM ulong 0x200000000
+
+const VNET_ST_ACK uchar 1
+const VNET_ST_DRIVER uchar 2
+const VNET_ST_DRIVER_OK uchar 4
+const VNET_ST_FEATURES_OK uchar 8
+const VNET_ST_FAILED uchar 128
+
+const VNET_HDR_LEN ulong 12
+const VNET_FRAME_MAX ulong 1514
+const VNET_BUF_LEN ulong 1526
+const VNET_Q_CAP ulong 32
+
+note cap_out uint 10: 0=common_bar 1=common_off 2=notify_bar 3=notify_off 4=notify_mult 5=isr_bar 6=isr_off 7=dev_bar 8=dev_off 9=seen_mask
+
+note Simulated Virtio-Net device + split-virtqueue state
+note vnet_st: 0=init, 1=broken, 2=qsize, 3=tx_avail, 4=tx_used, 5=rx_avail, 6=rx_used, 7=status, 8=iommu_en, 9=tx_notifies, 10=rx_notifies
+global vnet_st ulong 12
+global vnet_tx_out uchar 32
+global vnet_rx_out uchar 32
+global vnet_rx_buf uchar 49152
+global vnet_rx_len ulong 32
+
+fn vpci_le32 cfg view uchar * off ulong to uint
+b0 = uint get cfg off
+b1 = shl uint get cfg add off 1 8
+b2 = shl uint get cfg add off 2 16
+b3 = shl uint get cfg add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn vpci_parse_caps cfg view uchar * cap_out edit uint 10 to int
+if lt len cfg 256
+ret VPCI_ERR_NO_CAPS
+end
+for i ulong 10
+put cap_out i 0
+end
+st = uint get cfg 6
+if eq and st 0x10 0
+ret VPCI_ERR_NO_CAPS
+end
+ptr = ulong and get cfg 52 0xfc
+steps = ulong 0
+while and ne ptr 0 lt ptr 252 bound 64
+steps = add steps 1
+if gt steps 48
+ret VPCI_ERR_LOOP
+end
+cid = get cfg ptr
+nxt = ulong and get cfg add ptr 1 0xfc
+if eq cid VPCI_CAP_VENDOR
+clen = ulong get cfg add ptr 2
+if and ge clen 16 le add ptr clen 256
+ctype = get cfg add ptr 3
+bar = uint get cfg add ptr 4
+off = vpci_le32 cfg add ptr 8
+if eq ctype VPCI_CFG_COMMON
+put cap_out 0 bar
+put cap_out 1 off
+put cap_out 9 or get cap_out 9 1
+end
+if eq ctype VPCI_CFG_NOTIFY
+if ge clen 20
+put cap_out 2 bar
+put cap_out 3 off
+put cap_out 4 vpci_le32 cfg add ptr 16
+put cap_out 9 or get cap_out 9 2
+end
+end
+if eq ctype VPCI_CFG_ISR
+put cap_out 5 bar
+put cap_out 6 off
+put cap_out 9 or get cap_out 9 4
+end
+if eq ctype VPCI_CFG_DEVICE
+put cap_out 7 bar
+put cap_out 8 off
+put cap_out 9 or get cap_out 9 8
+end
+end
+end
+ptr = nxt
+end
+if ne and get cap_out 9 15 15
+ret VPCI_ERR_MISSING
+end
+ret VPCI_OK
+end
+
+note ---- Virtio-Net Split-Virtqueue Driver ----
+
+fn vnet_reset to void
+for i ulong 12
+put vnet_st i 0
+end
+for i ulong 32
+put vnet_tx_out i 0
+put vnet_rx_out i 0
+put vnet_rx_len i 0
+end
+end
+
+fn vnet_init dev_features ulong qsize ulong flags uint to int
+vnet_reset
+if or lt qsize 2 gt qsize VNET_Q_CAP
+ret VNET_ERR_QUEUE
+end
+if eq and dev_features VNET_F_VERSION_1 0
+put vnet_st 7 ulong VNET_ST_FAILED
+ret VNET_ERR_FEATURE
+end
+has_ap = ne and dev_features VNET_F_ACCESS_PLATFORM 0
+if and ne and flags VNET_INIT_REQUIRE_ACCESS_PLATFORM 0 not has_ap
+put vnet_st 7 ulong VNET_ST_FAILED
+ret VNET_ERR_ACCESS_PLATFORM
+end
+put vnet_st 0 1
+put vnet_st 1 0
+put vnet_st 2 qsize
+st = or ulong VNET_ST_ACK or ulong VNET_ST_DRIVER or ulong VNET_ST_FEATURES_OK ulong VNET_ST_DRIVER_OK
+put vnet_st 7 st
+if has_ap
+put vnet_st 8 1
+end
+ret VNET_OK
+end
+
+fn vnet_is_broken to bool
+ret ne get vnet_st 1 0
+end
+
+fn vnet_tx_submit frame view uchar * to int
+if eq get vnet_st 0 0
+ret VNET_ERR_ARG
+end
+if ne get vnet_st 1 0
+ret VNET_ERR_BROKEN
+end
+if or eq len frame 0 gt len frame VNET_FRAME_MAX
+ret VNET_ERR_ARG
+end
+qsz = get vnet_st 2
+avail = get vnet_st 3
+used = get vnet_st 4
+if ge sub avail used qsz
+ret VNET_ERR_FULL
+end
+desc_id = rem avail qsz
+if ne get vnet_tx_out desc_id 0
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+put vnet_tx_out desc_id 1
+put vnet_st 3 add avail 1
+put vnet_st 9 add get vnet_st 9 1
+ret VNET_OK
+end
+
+note Process untrusted device TX used-ring completion; marks broken (sticky) on any anomaly
+fn vnet_tx_complete desc_id ulong to int
+if ne get vnet_st 1 0
+ret VNET_ERR_BROKEN
+end
+qsz = get vnet_st 2
+avail = get vnet_st 3
+used = get vnet_st 4
+if ge used avail
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+if ge desc_id qsz
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+if eq get vnet_tx_out desc_id 0
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+put vnet_tx_out desc_id 0
+put vnet_st 4 add used 1
+ret VNET_OK
+end
+
+fn vnet_rx_post to int
+if eq get vnet_st 0 0
+ret VNET_ERR_ARG
+end
+if ne get vnet_st 1 0
+ret VNET_ERR_BROKEN
+end
+qsz = get vnet_st 2
+avail = get vnet_st 5
+used = get vnet_st 6
+if ge sub avail used qsz
+ret VNET_ERR_FULL
+end
+desc_id = rem avail qsz
+put vnet_rx_out desc_id 1
+put vnet_st 5 add avail 1
+put vnet_st 10 add get vnet_st 10 1
+ret VNET_OK
+end
+
+note Process untrusted device RX used-ring completion; validates id, outstanding flag, and length
+fn vnet_rx_complete desc_id ulong total_len ulong payload view uchar * to int
+if ne get vnet_st 1 0
+ret VNET_ERR_BROKEN
+end
+qsz = get vnet_st 2
+avail = get vnet_st 5
+used = get vnet_st 6
+if ge used avail
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+if ge desc_id qsz
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+if eq get vnet_rx_out desc_id 0
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+if or lt total_len VNET_HDR_LEN gt total_len VNET_BUF_LEN
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+flen = sub total_len VNET_HDR_LEN
+if lt len payload flen
+put vnet_st 1 1
+ret VNET_ERR_BROKEN
+end
+base = mul desc_id 1536
+for i ulong flen bound 1514
+put vnet_rx_buf add base i get payload i
+end
+put vnet_rx_len desc_id flen
+put vnet_rx_out desc_id 0
+put vnet_st 6 add used 1
+ret VNET_OK
+end

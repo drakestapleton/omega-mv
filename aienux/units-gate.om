@@ -7,19 +7,20 @@ note Run from the repository root: aienux-units-gate OMC SCRATCH
 note OMC      the compiler under test; its sha256 must equal the first word of seed/out/omc.sha256, or nothing
 note          runs (exit 69, nothing written)
 note SCRATCH  a new directory (created 0700), at most 1024 bytes of path; an existing one is refused (exit 2)
-note Units. aienux/units.tsv lists every unit, one per line: NAME then the paths of its parts, single spaces; a line
-note starting with # is a comment and an empty line is skipped. NAME is 1 to 249 of A-Z a-z 0-9 _ and appears once
-note (249 leaves room for the longest scratch suffix, ".1.err", inside a 255-byte file name).
+note Units. aienux/units.tsv lists every unit, one per line: NAME [@run|@qemu] then the paths of its parts, single
+note spaces; a line starting with # is a comment and an empty line is skipped. NAME is 1 to 240 of A-Z a-z 0-9 _ and
+note appears once (240 leaves room for scratch suffixes such as ".run.out" inside a 255-byte file name).
 note The parts are concatenated in order, each followed by a newline (the composition of aienux/units.tsv), into
 note SCRATCH/NAME.om and compiled twice by OMC: each compile exits 0 with empty stderr, and both outputs hold the same
-note bytes. A malformed or repeated row, a missing part, a failed compile, two different outputs or a table with no
-note unit is a FAIL line. The runner (aienux/README.md) also requires the exact unit count.
+note bytes. Units tagged @run are then executed directly and must exit 0 (run=PASS / run=FAIL). Units tagged @qemu are
+note booted under /usr/bin/qemu-system-aarch64 when present (qemu=PASS / qemu=FAIL), or reported qemu=NOT_RUN when QEMU
+note is absent so host-only runs stay honest. A malformed or repeated row, a missing part, a failed compile, two
+note different outputs, a failed behavioral run, or a table with no unit is a FAIL line.
 note Control, must be caught: a compiler one byte longer fails the digest check.
-note Output: one line per unit, then OMEGA-AIENUX-UNITS PASS|FAIL units=U controls=C caught=K hardware=NOT_RUN.
+note Output: one line per unit, then
+note   OMEGA-AIENUX-UNITS PASS|FAIL units=U behavior_passed=BP/BT qemu_passed=QP/QT qemu_not_run=QN controls=C caught=K hardware=NOT_RUN.
 note Exit 0 PASS, 1 FAIL, 2 bad usage or setup, 69 compiler digest refused. Every input is length-checked; a trap
 note exit (101..114) would be a defect of this gate, never a pass.
-note This gate checks that the units compile reproducibly with this repository's compiler. It does not run them:
-note their behaviour checks are still C, Python and shell in Aienux (aienux/UNITS.md lists them).
 text t_pin "seed/out/omc.sha256"
 text t_tab "aienux/units.tsv"
 text t_om ".om"
@@ -27,6 +28,38 @@ text t_b1 ".1"
 text t_b2 ".2"
 text t_e1 ".1.err"
 text t_e2 ".2.err"
+text t_rout ".run.out"
+text t_rerr ".run.err"
+text t_qout ".q.out"
+text t_qerr ".q.err"
+text t_qlog ".qlog"
+text t_null "/dev/null"
+text t_mrun "@run"
+text t_mqemu "@qemu"
+text t_badmode "units.tsv: unknown mode tag (expected @run or @qemu)"
+text t_qemu "/usr/bin/qemu-system-aarch64"
+text t_qM "-M"
+text t_qvirt "virt"
+text t_qcpu "-cpu"
+text t_qmax "max"
+text t_qm "-m"
+text t_q256 "256"
+text t_qdisp "-display"
+text t_qnone "none"
+text t_qnet "-net"
+text t_qmon "-monitor"
+text t_qnorb "-no-reboot"
+text t_qser "-serial"
+text t_qfile "file:"
+text t_qkern "-kernel"
+text t_rpass " run=PASS"
+text t_rfail " run=FAIL"
+text t_qpass " qemu=PASS"
+text t_qfail " qemu=FAIL"
+text t_qnr " qemu=NOT_RUN"
+text t_sbp " behavior_passed="
+text t_sqp " qemu_passed="
+text t_sqn " qemu_not_run="
 text t_badname "units.tsv: name outside A-Z a-z 0-9 _"
 text t_dup "units.tsv: name repeated, or more than 64 KiB of names"
 text t_empty "units.tsv names no unit"
@@ -77,7 +110,7 @@ global g_n ulong 32
 global g_seen uchar 65536
 note g_n: 0 path length, 1 omc length, 2 scratch length (with '/'), 3 argv bytes, 4 argc, 5 output length,
 note 6 buffer length, 7 table length, 8 units, 11 failures, 12 controls, 13 caught, 14 name length, 15 g_seen length,
-note 16 unit rows
+note 16 unit rows, 17 behavior total, 18 behavior passed, 19 qemu total, 20 qemu passed, 21 qemu not_run, 22 row mode
 note ---- output
 fn oc c ulong to void
 n = get g_n 5
@@ -351,9 +384,9 @@ if ne dupfd s d 0 long d
 exit 127
 end
 end
-note run the argument list with stdin, stdout, stderr fds (closed here): the exit code, 256 + the signal, 512
-note when a file could not be opened, 1000 when the child passed the 600 s deadline (killed)
-fn spawn fi int fo int fe int to ulong
+note run the argument list with stdin, stdout, stderr fds (closed here) and deadline lim ns: the exit code,
+note 256 + the signal, 512 when a file could not be opened, 1000 when the child passed lim (killed)
+fn spawn_lim fi int fo int fe int lim long to ulong
 if or lt fi 0 or lt fo 0 lt fe 0
 fclo fi
 fclo fo
@@ -387,7 +420,7 @@ end
 if lt r 0
 exit 2
 end
-if gt sub monons t0 600000000000
+if gt sub monons t0 lim
 r = killpid int pid 9
 r = waitpid int pid g_stb 0 len g_stb 0
 ret 1000
@@ -395,6 +428,61 @@ end
 q = sleepns 200000
 end
 exit 2
+end
+fn spawn fi int fo int fe int to ulong
+ret spawn_lim fi fo fe 600000000000
+end
+note execute SCRATCH/NAME.1 directly with /dev/null stdin (60 s deadline)
+fn runbin to ulong
+psn t_b1
+r = chmod g_pa 0 get g_n 0 448
+pclr
+pt t_null
+fi = frd
+aclr
+psn t_b1
+apa
+psn t_rout
+fo = fwr
+psn t_rerr
+fe = fwr
+ret spawn_lim fi fo fe 60000000000
+end
+note boot SCRATCH/NAME.1 under qemu-system-aarch64 -M virt (15 s deadline)
+fn runqemu to ulong
+pclr
+pt t_null
+fi = frd
+aclr
+atx t_qemu
+atx t_qM
+atx t_qvirt
+atx t_qcpu
+atx t_qmax
+atx t_qm
+atx t_q256
+atx t_qdisp
+atx t_qnone
+atx t_qnet
+atx t_qnone
+atx t_qmon
+atx t_qnone
+atx t_qnorb
+atx t_qser
+pclr
+pt t_qfile
+pscr
+pnm
+pt t_qlog
+apa
+atx t_qkern
+psn t_b1
+apa
+psn t_qout
+fo = fwr
+psn t_qerr
+fe = fwr
+ret spawn_lim fi fo fe 15000000000
 end
 note OMC < SCRATCH/NAME.om > SCRATCH/NAME.SUF 2> SCRATCH/NAME.ERR
 fn omc suf view uchar * err view uchar * to ulong
@@ -570,6 +658,75 @@ if not fhash
 ofail t_unit t_big
 ret false
 end
+md = get g_n 22
+if eq md 1
+put g_n 17 add get g_n 17 1
+rc = runbin
+if ne rc 0
+ot t_fail
+ot t_unit
+onm
+ot t_rfail
+ot t_exit
+onum rc
+onl
+put g_n 11 add get g_n 11 1
+ret false
+end
+put g_n 18 add get g_n 18 1
+ot t_ok
+ot t_unit
+onm
+ot t_bytes
+onum sz
+ot t_sha
+ohex
+ot t_rpass
+onl
+put g_n 8 add get g_n 8 1
+ret true
+end
+if eq md 2
+put g_n 19 add get g_n 19 1
+if ne faccess t_qemu 0 len t_qemu 1 0
+put g_n 21 add get g_n 21 1
+ot t_ok
+ot t_unit
+onm
+ot t_bytes
+onum sz
+ot t_sha
+ohex
+ot t_qnr
+onl
+put g_n 8 add get g_n 8 1
+ret true
+end
+rc = runqemu
+if ne rc 0
+ot t_fail
+ot t_unit
+onm
+ot t_qfail
+ot t_exit
+onum rc
+onl
+put g_n 11 add get g_n 11 1
+ret false
+end
+put g_n 20 add get g_n 20 1
+ot t_ok
+ot t_unit
+onm
+ot t_bytes
+onum sz
+ot t_sha
+ohex
+ot t_qpass
+onl
+put g_n 8 add get g_n 8 1
+ret true
+end
 ot t_ok
 ot t_unit
 onm
@@ -581,17 +738,39 @@ onl
 put g_n 8 add get g_n 8 1
 ret true
 end
-note one table row [s, e): NAME then parts; # starts a comment line; an empty line is skipped
+note g_u[s, e) equals text t
+fn ueq s ulong e ulong t view uchar * to bool
+if ne sub e s len t
+ret false
+end
+for j ulong len t bound 64
+if ne get g_u add s j get t j
+ret false
+end
+end
+ret true
+end
+fn parsemode s ulong e ulong to ulong
+if ueq s e t_mrun
+ret 1
+end
+if ueq s e t_mqemu
+ret 2
+end
+ret 99
+end
+note one table row [s, e): NAME [@run|@qemu] then parts; # starts a comment line; an empty line is skipped
 fn urow s ulong e ulong to void
 if or eq s e eq get g_u s 35
 ret
 end
 put g_n 14 0
+put g_n 22 0
 k = s
 while uisnt k e 32 bound 1048576
 k = add k 1
 end
-if or ge k e or eq k s gt sub k s 249
+if or ge k e or eq k s gt sub k s 240
 ofail t_unit t_row
 ret
 end
@@ -607,6 +786,33 @@ end
 if not nameadd
 ofail t_unit t_dup
 ret
+end
+while uis k e 32 bound 1048576
+k = add k 1
+end
+if ge k e
+ofail t_unit t_row
+ret
+end
+if uis k e 64
+m = k
+while uisnt m e 32 bound 1048576
+m = add m 1
+end
+md = parsemode k m
+if eq md 99
+ofail t_unit t_badmode
+ret
+end
+put g_n 22 md
+k = m
+while uis k e 32 bound 1048576
+k = add k 1
+end
+if ge k e
+ofail t_unit t_row
+ret
+end
 end
 if compose k e
 z = build
@@ -781,6 +987,16 @@ ot t_fl
 end
 ot t_su
 onum get g_n 8
+ot t_sbp
+onum get g_n 18
+oc 47
+onum get g_n 17
+ot t_sqp
+onum get g_n 20
+oc 47
+onum get g_n 19
+ot t_sqn
+onum get g_n 21
 ot t_sc
 onum get g_n 12
 ot t_sk

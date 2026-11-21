@@ -1,0 +1,348 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-store-tool/store_tool.om: Pure-Omega System Store v1
+note qualification tooling: CRC32C, Superblock v1 codec, sector tear closure,
+note deterministic fault injection, seeded garbage, and HMAC-SHA256 operator auth.
+note Converted from aienux crates/aienos-store-tool/src/main.rs.
+note Compose with: si/directives/om2.om om/tls/sha2.om aienux/crates/aienos-store-tool/store_tool.om ...
+
+const ST_UNIT_BYTES ulong 4096
+const ST_CRC_OFFSET ulong 64
+const ST_VERSION_V1 ulong 1
+
+const ST_OK int 0
+const ST_ERR_BAD_MAGIC int -1
+const ST_ERR_UNSUP_VER int -2
+const ST_ERR_WRONG_SLOT int -3
+const ST_ERR_NONZERO_RES int -4
+const ST_ERR_BAD_CRC int -5
+const ST_ERR_AMBIGUOUS int -6
+
+const ST_CASE_BAD_CRC int 1
+const ST_CASE_WRONG_MAGIC int 2
+const ST_CASE_NONZERO_RES int 3
+const ST_CASE_WRONG_SLOT int 4
+const ST_CASE_REGION_MISMATCH int 5
+const ST_CASE_UNSUP_VER int 6
+const ST_CASE_SEEDED_GARBAGE int 7
+const ST_CASE_NEW_ROOT int 8
+
+text st_magic "AIENSTR1"
+text st_bad_magic "AIENBAD1"
+
+note Superblock decode outputs: 0=generation, 1=region_units, 2=slot_id
+global st_sb_out ulong 3
+
+note Tear closure outputs: 0=as_old, 1=as_new, 2=fail_mask
+global st_tear_out ulong 3
+
+fn st_put_u16_le buf edit uchar * off ulong v ulong to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+end
+
+fn st_put_u32_le buf edit uchar * off ulong v ulong to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn st_put_u64_le buf edit uchar * off ulong v ulong to void
+for i ulong 8
+put buf add off i uchar and shr v mul i 8 0xff
+end
+end
+
+fn st_get_u16_le buf view uchar * off ulong to ulong
+ret or ulong get buf off shl ulong get buf add off 1 8
+end
+
+fn st_get_u32_le buf view uchar * off ulong to ulong
+b0 = ulong get buf off
+b1 = ulong get buf add off 1
+b2 = ulong get buf add off 2
+b3 = ulong get buf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn st_get_u64_le buf view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 8
+acc = or acc shl ulong get buf add off i mul i 8
+end
+ret acc
+end
+
+note CRC32C (Castagnoli, reflected polynomial 0x82f63b78)
+fn st_crc32c buf view uchar * to uint
+crc = uint 0xffffffff
+for i ulong len buf bound 4096
+b = uint get buf i
+crc = xor crc b
+for bit ulong 8
+if ne and crc 1 0
+crc = xor shr crc 1 0x82f63b78
+else
+crc = shr crc 1
+end
+end
+end
+ret xor crc 0xffffffff
+end
+
+fn st_rechecksum unit edit uchar * to void
+for i ulong 4
+put unit add ST_CRC_OFFSET i 0
+end
+crc = st_crc32c unit
+st_put_u32_le unit ST_CRC_OFFSET ulong crc
+end
+
+note Encode a valid System Store v1 superblock into a 4096-byte unit
+fn st_sb_encode unit edit uchar * slot ulong gen ulong region ulong to void
+for i ulong ST_UNIT_BYTES
+put unit i 0
+end
+for i ulong 8
+put unit i get st_magic i
+end
+st_put_u16_le unit 8 ST_VERSION_V1
+st_put_u64_le unit 16 gen
+st_put_u32_le unit 44 slot
+st_put_u64_le unit 48 region
+st_rechecksum unit
+end
+
+note Decode and validate a System Store v1 superblock
+fn st_sb_decode unit view uchar * expected_slot ulong to int
+if lt len unit ST_UNIT_BYTES
+ret ST_ERR_BAD_MAGIC
+end
+for i ulong 8
+if ne get unit i get st_magic i
+ret ST_ERR_BAD_MAGIC
+end
+end
+ver = st_get_u16_le unit 8
+if ne ver ST_VERSION_V1
+ret ST_ERR_UNSUP_VER
+end
+slot = st_get_u32_le unit 44
+if ne slot expected_slot
+ret ST_ERR_WRONG_SLOT
+end
+for i ulong sub ST_UNIT_BYTES 68 bound 4096
+if ne get unit add 68 i 0
+ret ST_ERR_NONZERO_RES
+end
+end
+stored = uint st_get_u32_le unit ST_CRC_OFFSET
+tmp = new uchar 4096 0
+for i ulong ST_UNIT_BYTES
+put tmp i get unit i
+end
+for i ulong 4
+put tmp add ST_CRC_OFFSET i 0
+end
+calc = st_crc32c tmp
+if ne calc stored
+ret ST_ERR_BAD_CRC
+end
+put st_sb_out 0 st_get_u64_le unit 16
+put st_sb_out 1 st_get_u64_le unit 48
+put st_sb_out 2 slot
+ret ST_OK
+end
+
+note Exact xorshift64 seeded garbage (seed 0x4149454e4f530136)
+fn st_seeded_garbage dst edit uchar * to void
+state = ulong 0x4149454e4f530136
+chunks = div ST_UNIT_BYTES 8
+for c ulong chunks bound 512
+state = xor state shl state 13
+state = xor state shr state 7
+state = xor state shl state 17
+st_put_u64_le dst mul c 8 state
+end
+end
+
+fn st_units_eq a view uchar * b view uchar * to bool
+for i ulong ST_UNIT_BYTES
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+global st_torn uchar 4096
+
+fn st_torn_eq_buf buf view uchar * to bool
+for i ulong ST_UNIT_BYTES
+if ne get st_torn i get buf i
+ret false
+end
+end
+ret true
+end
+
+fn st_copy_sector new_u view uchar * base ulong sector ulong to void
+for j ulong sector bound 4096
+idx = add base j
+put st_torn idx get new_u idx
+end
+end
+
+fn st_eval_tear old_u view uchar * new_u view uchar * sector ulong mask ulong to int
+for i ulong ST_UNIT_BYTES
+put st_torn i get old_u i
+end
+sectors = div ST_UNIT_BYTES sector
+for s ulong sectors bound 16
+if ne and mask shl ulong 1 s 0
+st_copy_sector new_u mul s sector sector
+end
+end
+if st_torn_eq_buf old_u
+ret 1
+end
+if st_torn_eq_buf new_u
+ret 2
+end
+ret 0
+end
+
+note Enumerate all sector-subset tears of new over old (sectors <= 16)
+fn st_tear_outcomes old_u view uchar * new_u view uchar * sector ulong to int
+sectors = div ST_UNIT_BYTES sector
+if or eq sectors 0 gt sectors 16
+ret -1
+end
+combos = shl ulong 1 sectors
+as_old = ulong 0
+as_new = ulong 0
+for mask ulong combos bound 65536
+res = st_eval_tear old_u new_u sector mask
+if eq res 1
+as_old = add as_old 1
+else
+if eq res 2
+as_new = add as_new 1
+else
+put st_tear_out 0 as_old
+put st_tear_out 1 as_new
+put st_tear_out 2 mask
+ret -1
+end
+end
+end
+put st_tear_out 0 as_old
+put st_tear_out 1 as_new
+put st_tear_out 2 0
+ret ST_OK
+end
+
+note Inject one deterministic fault case into a valid superblock copy
+fn st_inject_case src view uchar * dst edit uchar * slot ulong kase int to int
+if eq kase ST_CASE_SEEDED_GARBAGE
+st_seeded_garbage dst
+ret ST_ERR_BAD_MAGIC
+end
+for i ulong ST_UNIT_BYTES
+put dst i get src i
+end
+if eq kase ST_CASE_BAD_CRC
+put dst ST_CRC_OFFSET xor get dst ST_CRC_OFFSET 1
+ret ST_ERR_BAD_CRC
+end
+if eq kase ST_CASE_WRONG_MAGIC
+for i ulong 8
+put dst i get st_bad_magic i
+end
+st_rechecksum dst
+ret ST_ERR_BAD_MAGIC
+end
+if eq kase ST_CASE_NONZERO_RES
+put dst 200 0x42
+st_rechecksum dst
+ret ST_ERR_NONZERO_RES
+end
+if eq kase ST_CASE_WRONG_SLOT
+st_put_u32_le dst 44 sub 1 slot
+st_rechecksum dst
+ret ST_ERR_WRONG_SLOT
+end
+if eq kase ST_CASE_REGION_MISMATCH
+reg = st_get_u64_le dst 48
+st_put_u64_le dst 48 add reg 1
+st_rechecksum dst
+ret ST_OK
+end
+if eq kase ST_CASE_UNSUP_VER
+st_put_u16_le dst 8 2
+st_rechecksum dst
+ret ST_ERR_UNSUP_VER
+end
+if eq kase ST_CASE_NEW_ROOT
+ret ST_OK
+end
+ret ST_ERR_AMBIGUOUS
+end
+
+note Select inactive superblock slot: zero slot, else lower generation
+fn st_inactive_slot s0 view uchar * s1 view uchar * to int
+z0 = true
+for i ulong ST_UNIT_BYTES
+if ne get s0 i 0
+z0 = false
+break
+end
+end
+if z0
+ret 0
+end
+z1 = true
+for i ulong ST_UNIT_BYTES
+if ne get s1 i 0
+z1 = false
+break
+end
+end
+if z1
+ret 1
+end
+r0 = st_sb_decode s0 0
+g0 = get st_sb_out 0
+r1 = st_sb_decode s1 1
+g1 = get st_sb_out 0
+if or ne r0 ST_OK ne r1 ST_OK
+ret ST_ERR_AMBIGUOUS
+end
+if lt g0 g1
+ret 0
+end
+if lt g1 g0
+ret 1
+end
+ret ST_ERR_AMBIGUOUS
+end
+
+note Recovery Core HMAC-SHA256(key[32], challenge[32])
+fn st_operator_respond key view uchar * chal view uchar * resp edit uchar * to void
+ipad = new uchar 64 0x36
+opad = new uchar 64 0x5c
+for i ulong 32
+put ipad i xor get key i 0x36
+put opad i xor get key i 0x5c
+end
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx ipad
+sha256_update ctx chal
+inner = new uchar 32 0
+sha256_final ctx inner
+sha256_init ctx
+sha256_update ctx opad
+sha256_update ctx inner
+sha256_final ctx resp
+end

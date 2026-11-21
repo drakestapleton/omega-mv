@@ -26,8 +26,13 @@ The OS layer is moving here from Aienux (`https://interplane.io/drakestapleton/a
 | `aienux/kernel/core/` | Pure-Omega Aienux kernel core: MADT/fair work-stealing scheduler, capability-gated IPC with tree revocation, and AArch64 Stage-1 48-bit 4-level page-table builder/walker with W^X & Device-NX (converted from `crates/aienos-kernel/src/{scheduler,ipc,caps,mem/pagetable}.rs`, 4 `.om` files). |
 | `aienux/kernel/hal/` | Pure-Omega Aienux kernel HAL: ACPI/IORT SMMUv3 route parser (multi-SMMU, RMR ranges, named components), GPT/AIENOS partition discovery & single-layer NVMe write confinement, and Store key admissibility / single-transaction subject provisioning gate (converted from `native/kernel/core/acpi.{h,c}`, `native/kernel/dev/{disk_part,nvme_bind}.{h,c}`, `native/kernel/svc/{store_boot,continuity_subject_provision}.{h,c}`, 3 `.om` files). |
 | `aienux/aegis/` | Pure-Omega AIENOS AEGIS effect-broker & policy enforcement: lexical path confinement, SHA-256 capability graph with attenuated delegation & cascading subtree revocation, length-prefixed EffectIntent & OperatorGrant cryptography, J-Space CoW Worlds, and audit-logged policy broker (converted from `crates/aienos-aegis/src/{capability,effect,world,evaluator,broker}.rs`, 2 `.om` files). |
-| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit and its ordered parts (78 units). |
-| `aienux/units-gate.om` | Seeded-Omega compile-reproducibility gate (`OMEGA-AIENUX-UNITS`). |
+| `aienux/boot/` | Pure-Omega Aienux boot subsystem: CHANDOF3 handoff validator, AIENMDL1 MODEL.MAP extent validator, A/B image slot manifest/control/selection/transitions, and ANB1 netboot wire format (converted from `native/boot/`, 5 `.om` files). |
+| `aienux/store/` | Pure-Omega Store v1 format, content-addressed append-only engine, and torn-write-safe dual-slot record (converted from `native/store/`, 5 `.om` files). |
+| `aienux/net/core/` | Pure-Omega AIENOS M6-A protocol stack (RFC 1071 checksum, Eth/ARP/IPv4/UDP, ARP cache), boot-report broadcast framing, and Virtio 1.x PCI/split-virtqueue net driver with IOMMU fail-closed checks (converted from `native/net/`, 3 `.om` files). |
+| `aienux/crates/` | Pure-Omega ports of Aienux Rust crates (`aienos-anchor`, `aienos-c1-tree`, `aienos-capability-ffi`, `aienos-evidence`, `aienos-store-tool`, 10 `.om` files). |
+| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit, optional `@run`/`@qemu` mode tag, and ordered parts (93 units, 23 `@run` behavioral suites). |
+| `aienux/units-gate.om` | Seeded-Omega compile-reproducibility, behavioral (`@run`), and optional QEMU (`@qemu`) gate (`OMEGA-AIENUX-UNITS`). |
+| `aienux/CODE-TRIAGE.tsv` | Filtered triage table of actual non-Omega code from `NOT-YET-OMEGA.tsv` (925 code rows retained, 972 docs/fixtures/retired stripped), grouped by bottom-up port wave. |
 | `aienux/NOT-YET-OMEGA.tsv` | Generated inventory of every non-Omega first-party file still in Aienux awaiting rewrite or retirement. |
 | `aienux/import/` | How each slice came here: `git filter-repo` command, `paths.txt`, `commit-map` and `ref-map`. |
 

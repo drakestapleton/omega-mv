@@ -1,0 +1,590 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/boot/boot_test.om: Pure-Omega behavioral self-test suite for Aienux Boot
+note (CHANDOF3 Handoff, MODEL.MAP, A/B Native Image Slots, and ANB1 Netboot Protocol).
+note Compose with: si/directives/om2.om aienux/boot/handoff.om aienux/boot/model_map.om aienux/boot/slot.om aienux/boot/netboot.om aienux/boot/boot_test.om om/tls/sha2.om
+
+text b_pass "PASS "
+text b_fail "FAIL "
+text b_nl "\n"
+text b_t01 "handoff_valid_and_version_refusals"
+text b_t02 "handoff_model_and_fb_validation"
+text b_t03 "handoff_mmap_and_reserved_refusals"
+text b_t04 "model_map_valid_and_negative_controls"
+text b_t05 "slot_manifest_and_control_checks"
+text b_t06 "slot_select_candidate_try_and_exhaust"
+text b_t07 "slot_select_fallback_floor_and_recovery"
+text b_t08 "slot_transitions_stage_promote_abandon"
+text b_t09 "slot_boot_record_seal_verify_and_kernel_action"
+text b_t10 "slot_verify_image_sha512_roundtrip"
+text b_t11 "netboot_build_parse_all_types"
+text b_t12 "netboot_negative_controls_and_chunks"
+text b_sum "BOOT_TEST_PASS total=12 failed=0\n"
+text b_fsum "BOOT_TEST_FAIL\n"
+text b_commit "0123456789abcdef0123456789abcdef01234567"
+text b_prov "aienux-om2-test"
+text b_nb_done "verified ok"
+
+fn bwrite_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn breport name view uchar * ok bool to uint
+if ok
+w1 = bwrite_all 1 b_pass
+w2 = bwrite_all 1 name
+w3 = bwrite_all 1 b_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = bwrite_all 1 b_fail
+w2 = bwrite_all 1 name
+w3 = bwrite_all 1 b_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn mk_valid_handoff dst edit uchar * to void
+slot_zero_bytes dst HO_BYTES
+boot_wr64_le dst HO_OFF_MAGIC HO_MAGIC_V3
+boot_wr32_le dst HO_OFF_FW_EL 2
+boot_wr32_le dst HO_OFF_DESC_VER HO_DESC_VERSION
+boot_wr64_le dst HO_OFF_MAP_SIZE 480
+boot_wr64_le dst HO_OFF_DESC_SIZE 48
+end
+
+fn test_01_handoff_magic to bool
+h = new uchar 232 0
+mk_valid_handoff h
+if ne handoff_check h HO_OK
+ret false
+end
+note CHANDOF1 and CHANDOF2 must fail with HO_ERR_UNSUP_VER
+boot_wr64_le h HO_OFF_MAGIC HO_MAGIC_V1
+if ne handoff_check h HO_ERR_UNSUP_VER
+ret false
+end
+boot_wr64_le h HO_OFF_MAGIC HO_MAGIC_V2
+if ne handoff_check h HO_ERR_UNSUP_VER
+ret false
+end
+note Arbitrary garbage magic fails with HO_ERR_BAD_MAGIC
+boot_wr64_le h HO_OFF_MAGIC 0xdeadbeefcafebabe
+if ne handoff_check h HO_ERR_BAD_MAGIC
+ret false
+end
+note Short buffer refused
+short_h = new uchar 128 0
+if ne handoff_check short_h HO_ERR_SHORT
+ret false
+end
+ret true
+end
+
+fn test_02_handoff_model_fb to bool
+h = new uchar 232 0
+mk_valid_handoff h
+note Valid model present
+boot_wr32_le h HO_OFF_MODEL_FLAGS or HO_MODEL_PRESENT HO_MODEL_BLOCKIO
+boot_wr64_le h HO_OFF_MODEL_BASE 0x40000000
+boot_wr64_le h HO_OFF_MODEL_LEN 8192
+boot_wr32_le h HO_OFF_MODEL_BLK_SZ 4096
+boot_wr32_le h HO_OFF_MODEL_EXTENTS 2
+if ne handoff_check h HO_OK
+ret false
+end
+note Unaligned model base refused
+boot_wr64_le h HO_OFF_MODEL_BASE 0x40000100
+if ne handoff_check h HO_ERR_MODEL_ALIGN
+ret false
+end
+note Spurious model field without PRESENT refused
+mk_valid_handoff h
+put h HO_OFF_MODEL_SHA256 1
+if ne handoff_check h HO_ERR_MODEL_SPURIOUS
+ret false
+end
+note Valid linear GOP framebuffer
+mk_valid_handoff h
+boot_wr32_le h HO_OFF_FB_STATUS HO_FB_PRESENT
+boot_wr32_le h HO_OFF_FB_FORMAT HO_FB_BGRX
+boot_wr32_le h HO_OFF_FB_WIDTH 1920
+boot_wr32_le h HO_OFF_FB_HEIGHT 1080
+boot_wr32_le h HO_OFF_FB_PITCH 1920
+boot_wr64_le h HO_OFF_FB_BASE 0x80000000
+boot_wr64_le h HO_OFF_FB_SIZE mul mul ulong 1920 1080 4
+boot_wr32_le h HO_OFF_FB_GOP_HANDLES 1
+if ne handoff_check h HO_OK
+ret false
+end
+note FB size too small refused
+boot_wr64_le h HO_OFF_FB_SIZE 4096
+if ne handoff_check h HO_ERR_FB_SIZE
+ret false
+end
+note FB pitch < width refused
+boot_wr64_le h HO_OFF_FB_SIZE mul mul ulong 1920 1080 4
+boot_wr32_le h HO_OFF_FB_PITCH 1000
+if ne handoff_check h HO_ERR_FB_DIM
+ret false
+end
+ret true
+end
+
+fn test_03_handoff_mmap_rsvd to bool
+h = new uchar 232 0
+mk_valid_handoff h
+boot_wr32_le h HO_OFF_RESERVED0 1
+if ne handoff_check h HO_ERR_RESERVED0
+ret false
+end
+mk_valid_handoff h
+boot_wr32_le h HO_OFF_RESERVED1 1
+if ne handoff_check h HO_ERR_RESERVED1
+ret false
+end
+mk_valid_handoff h
+boot_wr64_le h HO_OFF_DESC_SIZE 32
+if ne handoff_check h HO_ERR_DESC_SIZE
+ret false
+end
+mk_valid_handoff h
+boot_wr32_le h HO_OFF_DESC_VER 2
+if ne handoff_check h HO_ERR_DESC_VER
+ret false
+end
+mk_valid_handoff h
+boot_wr64_le h HO_OFF_MAP_SIZE 500
+if ne handoff_check h HO_ERR_MAP_SIZE
+ret false
+end
+ret true
+end
+
+fn test_04_model_map to bool
+m = new uchar 4096 0
+for i ulong 8
+put m i get mmap_magic i
+end
+boot_wr32_le m MMAP_OFF_VERSION MMAP_VERSION
+boot_wr32_le m MMAP_OFF_SECTOR_SZ 4096
+boot_wr64_le m MMAP_OFF_MODEL_LEN 10000
+boot_wr32_le m MMAP_OFF_N_EXTENTS 2
+note Need ceil(10000/4096) = 3 sectors -> extent 0: lba=10, cnt=2; extent 1: lba=50, cnt=1
+boot_wr64_le m MMAP_OFF_EXTENTS 10
+boot_wr64_le m add MMAP_OFF_EXTENTS 8 2
+boot_wr64_le m add MMAP_OFF_EXTENTS 16 50
+boot_wr64_le m add MMAP_OFF_EXTENTS 24 1
+if ne model_map_check m 4096 100 MMAP_OK
+ret false
+end
+note Disk block size mismatch refused
+if ne model_map_check m 512 100 MMAP_ERR_BLK_MISMATCH
+ret false
+end
+note Extent past last_block refused
+if ne model_map_check m 4096 49 MMAP_ERR_EXT_PAST_DISK
+ret false
+end
+note Wrong sector coverage refused
+boot_wr64_le m add MMAP_OFF_EXTENTS 24 2
+if ne model_map_check m 4096 100 MMAP_ERR_COVERAGE
+ret false
+end
+note Extent inside GPT header (lba < 2) refused
+boot_wr64_le m add MMAP_OFF_EXTENTS 24 1
+boot_wr64_le m MMAP_OFF_EXTENTS 1
+if ne model_map_check m 4096 100 MMAP_ERR_EXT_BAD
+ret false
+end
+ret true
+end
+
+fn mk_valid_manifest dst edit uchar * gen ulong pgen ulong imglen ulong to void
+slot_zero_bytes dst SLOT_UNIT
+for i ulong 8
+put dst i get slot_m_magic i
+end
+boot_wr32_le dst SLOT_M_OFF_VER SLOT_M_VERSION
+boot_wr32_le dst SLOT_M_OFF_PAYLOAD SLOT_M_PAYLOAD_BOOTAA64
+boot_wr32_le dst SLOT_M_OFF_LABI SLOT_M_LOADER_ABI
+boot_wr32_le dst SLOT_M_OFF_KABI SLOT_M_KERNEL_ABI
+boot_wr64_le dst SLOT_M_OFF_GEN gen
+boot_wr64_le dst SLOT_M_OFF_PGEN pgen
+boot_wr64_le dst SLOT_M_OFF_MINRB pgen
+boot_wr64_le dst SLOT_M_OFF_IMGLEN imglen
+for i ulong 64
+put dst add SLOT_M_OFF_IMGSHA i uchar add 0x10 and i 0x3f
+put dst add SLOT_M_OFF_KSHA i uchar add 0x10 and i 0x3f
+end
+for i ulong 40
+put dst add SLOT_M_OFF_COMMIT i get b_commit i
+end
+for i ulong 15
+put dst add SLOT_M_OFF_PROV i get b_prov i
+end
+boot_wr64_le dst SLOT_M_OFF_TS 1700000000
+end
+
+fn test_05_slot_struct_checks to bool
+if ne slot_cap_units 104 50
+ret false
+end
+if ne slot_manifest_unit 1 50 54
+ret false
+end
+m = new uchar 4096 0
+mk_valid_manifest m 5 3 4096
+if ne slot_manifest_check m SLOT_OK
+ret false
+end
+note policy_generation > generation refused
+boot_wr64_le m SLOT_M_OFF_PGEN 6
+if ne slot_manifest_check m SLOT_ERR_GEN
+ret false
+end
+note kernel_sha512 != image_sha512 refused
+mk_valid_manifest m 5 3 4096
+put m SLOT_M_OFF_KSHA 0xff
+if ne slot_manifest_check m SLOT_ERR_SHA_MISMATCH
+ret false
+end
+note Non-zero pad refused
+mk_valid_manifest m 5 3 4096
+put m 4095 1
+if ne slot_manifest_check m SLOT_ERR_RSVD
+ret false
+end
+note Control check positive and negative
+c = new uchar 4096 0
+slot_control_init c 0
+if ne slot_control_check c SLOT_OK
+ret false
+end
+put c SLOT_C_OFF_CAND 0
+if ne slot_control_check c SLOT_ERR_STATE
+ret false
+end
+ret true
+end
+
+fn test_06_slot_select_cand to bool
+ctl = new uchar 4096 0
+ctl_out = new uchar 4096 0
+slot_control_init ctl 0
+if ne slot_stage_candidate ctl 1 2 SLOT_OK
+ret false
+end
+ev0 = new SlotEval 1 1 1 0
+ev1 = new SlotEval 1 2 1 0
+dec = new SlotDecision -1 0 0
+note First try boots candidate slot 1 and decrements tries 3 -> 2
+slot_select true ctl ev0 ev1 dec ctl_out
+if or ne get dec boot_slot 1 or ne get dec reason SLOT_R_CANDIDATE_TRY ne get dec loader_write 1
+ret false
+end
+if ne get ctl_out SLOT_C_OFF_TRIES 2
+ret false
+end
+note Exhausted candidate (tries=0) falls back to active slot 0 with no loader write
+put ctl SLOT_C_OFF_TRIES 0
+slot_select true ctl ev0 ev1 dec ctl_out
+if or ne get dec boot_slot 0 or ne get dec reason SLOT_R_CANDIDATE_EXHAUSTED ne get dec loader_write 0
+ret false
+end
+ret true
+end
+
+fn test_07_slot_select_fallback to bool
+ctl = new uchar 4096 0
+ctl_out = new uchar 4096 0
+slot_control_init ctl 0
+boot_wr64_le ctl SLOT_C_OFF_FLOOR 5
+ev0 = new SlotEval 1 4 4 0
+ev1 = new SlotEval 1 6 5 0
+dec = new SlotDecision -1 0 0
+note Active slot 0 is below floor 5 -> fallback to slot 1
+slot_select true ctl ev0 ev1 dec ctl_out
+if or ne get dec boot_slot 1 ne get dec reason SLOT_R_ACTIVE_INVALID_FALLBACK
+ret false
+end
+note Missing control record ALWAYS requires recovery
+slot_select false ctl ev0 ev1 dec ctl_out
+if or ne get dec boot_slot -1 ne get dec reason SLOT_R_RECOVERY_REQUIRED
+ret false
+end
+note Both slots below floor -> recovery required
+ev1_lo = new SlotEval 1 3 3 0
+slot_select true ctl ev0 ev1_lo dec ctl_out
+if or ne get dec boot_slot -1 ne get dec reason SLOT_R_RECOVERY_REQUIRED
+ret false
+end
+ret true
+end
+
+fn test_08_slot_transitions to bool
+ctl = new uchar 4096 0
+slot_control_init ctl 0
+note Stage candidate slot 1 at gen 10
+if ne slot_stage_candidate ctl 1 10 SLOT_OK
+ret false
+end
+note Cannot stage active slot 0
+if ne slot_stage_candidate ctl 0 11 SLOT_ERR_STATE
+ret false
+end
+note Promote slot 1 with policy_gen 8 -> active=1, floor=8, last_good=10
+if ne slot_promote ctl 1 10 8 SLOT_OK
+ret false
+end
+if or ne get ctl SLOT_C_OFF_ACTIVE 1 ne get ctl SLOT_C_OFF_CAND SLOT_NONE
+ret false
+end
+if or ne boot_rd64_le ctl SLOT_C_OFF_FLOOR 8 ne boot_rd64_le ctl SLOT_C_OFF_LASTGOOD 10
+ret false
+end
+note Cannot stage downgrade gen 9 <= last_good 10
+if ne slot_stage_candidate ctl 0 9 SLOT_ERR_FLOOR
+ret false
+end
+note Stage slot 0 at gen 12, then abandon -> CANDIDATE_FAILED flag set
+if ne slot_stage_candidate ctl 0 12 SLOT_OK
+ret false
+end
+if ne slot_abandon_candidate ctl SLOT_OK
+ret false
+end
+if or ne get ctl SLOT_C_OFF_CAND SLOT_NONE ne get ctl SLOT_C_OFF_FLAGS SLOT_C_FLAG_CAND_FAILED
+ret false
+end
+ret true
+end
+
+fn test_09_boot_rec_and_action to bool
+ctl = new uchar 4096 0
+ctl_out = new uchar 4096 0
+man = new uchar 4096 0
+brec = new uchar 256 0
+slot_control_init ctl 0
+if ne slot_stage_candidate ctl 1 7 SLOT_OK
+ret false
+end
+mk_valid_manifest man 7 5 4096
+for i ulong 8
+put brec i get slot_b_magic i
+end
+boot_wr32_le brec SLOT_B_OFF_VER SLOT_B_VERSION
+put brec SLOT_B_OFF_SLOT 1
+put brec SLOT_B_OFF_REASON uchar SLOT_R_CANDIDATE_TRY
+put brec SLOT_B_OFF_TRIES 2
+put brec SLOT_B_OFF_CTL_PRES 1
+boot_wr64_le brec SLOT_B_OFF_CTL_SEQ 1
+boot_wr64_le brec SLOT_B_OFF_GEN 7
+boot_wr64_le brec SLOT_B_OFF_PGEN 5
+for i ulong 64
+put brec add SLOT_B_OFF_IMGSHA i get man add SLOT_M_OFF_IMGSHA i
+end
+slot_boot_seal brec
+if ne slot_boot_check brec SLOT_OK
+ret false
+end
+note Unhealthy candidate try -> WAIT
+if ne slot_kernel_action_inner brec ctl man false ctl_out SLOT_A_WAIT
+ret false
+end
+note Healthy candidate try -> PROMOTE
+if ne slot_kernel_action_inner brec ctl man true ctl_out SLOT_A_PROMOTE
+ret false
+end
+if or ne get ctl_out SLOT_C_OFF_ACTIVE 1 ne boot_rd64_le ctl_out SLOT_C_OFF_FLOOR 5
+ret false
+end
+note Tampered boot record byte breaks SHA-256 -> REFUSE
+put brec SLOT_B_OFF_TRIES 1
+if ne slot_boot_check brec SLOT_ERR_DIGEST
+ret false
+end
+if ne slot_kernel_action_inner brec ctl man true ctl_out SLOT_A_REFUSE
+ret false
+end
+ret true
+end
+
+fn test_10_slot_sha512 to bool
+img = new uchar 64 0
+for i ulong 64
+put img i uchar add 0x41 and i 0x1f
+end
+dig = new uchar 64 0
+dlen = sha2_digest 512 img dig
+if ne dlen 64
+ret false
+end
+man = new uchar 4096 0
+mk_valid_manifest man 3 2 64
+for i ulong 64
+put man add SLOT_M_OFF_IMGSHA i get dig i
+put man add SLOT_M_OFF_KSHA i get dig i
+end
+ev = new SlotEval 0 0 0 0
+if not slot_verify_image_sha512 man img 4096 ev
+ret false
+end
+if or ne get ev valid 1 ne get ev generation 3
+ret false
+end
+note Corrupt one image byte -> verify fails
+put img 10 xor get img 10 1
+if slot_verify_image_sha512 man img 4096 ev
+ret false
+end
+if ne get ev err SLOT_ERR_SHA_MISMATCH
+ret false
+end
+ret true
+end
+
+fn nb_rt_offer_done nonce view uchar 16 mac view uchar 6 to bool
+wire = new uchar 1056 0
+m2 = new NbMsg 0 0 0 0 0 0 0
+rn = new uchar 16 0
+extra = new uchar 1024 0
+m3 = new NbMsg NB_OFFER 0 0 0 0 8192 0
+n3 = nb_build m3 nonce mac wire
+if ne n3 NB_MIN
+ret false
+end
+if ne nb_parse part wire 0 n3 m2 rn extra NB_OK
+ret false
+end
+if or ne get m2 mtype NB_OFFER ne get m2 total 8192
+ret false
+end
+m4 = new NbMsg NB_DONE 0 0 0 11 0 0
+n4 = nb_build m4 nonce b_nb_done wire
+if ne n4 add NB_MIN 11
+ret false
+end
+if ne nb_parse part wire 0 n4 m2 rn extra NB_OK
+ret false
+end
+if ne get m2 mtype NB_DONE
+ret false
+end
+if ne get m2 mlen 11
+ret false
+end
+ret boot_eq_bytes part extra 0 11 b_nb_done
+end
+
+fn test_11_netboot_roundtrip to bool
+nonce = new uchar 16 0
+for i ulong 16
+put nonce i uchar add 0xa0 i
+end
+wire = new uchar 1056 0
+mac = new uchar 6 0
+put mac 0 0x02
+put mac 5 0x77
+m1 = new NbMsg NB_HELLO 0 0 0 0 0 0
+n1 = nb_build m1 nonce mac wire
+if ne n1 NB_MIN
+ret false
+end
+m2 = new NbMsg 0 0 0 0 0 0 0
+rn = new uchar 16 0
+extra = new uchar 1024 0
+if ne nb_parse part wire 0 n1 m2 rn extra NB_OK
+ret false
+end
+if ne get m2 mtype NB_HELLO
+ret false
+end
+if or ne get extra 0 0x02 ne get extra 5 0x77
+ret false
+end
+ret nb_rt_offer_done nonce mac
+end
+
+fn test_12_netboot_negatives to bool
+if ne nb_chunks 4097 5
+ret false
+end
+if ne nb_chunks 4096 4
+ret false
+end
+nonce = new uchar 16 1
+wire = new uchar 1056 0
+buf = new uchar 16 0x41
+note OFFER below NB_OBJECT_MIN refused
+mbad = new NbMsg NB_OFFER 0 0 0 0 4096 0
+if ne nb_build mbad nonce buf wire 0
+ret false
+end
+note GET with unaligned offset refused
+mget = new NbMsg NB_GET 0 0 4 0 0 512
+if ne nb_build mget nonce buf wire 0
+ret false
+end
+note DONE with non-printable byte refused
+bad_txt = new uchar 4 0x41
+put bad_txt 2 0x01
+mdone = new NbMsg NB_DONE 0 0 0 4 0 0
+if ne nb_build mdone nonce bad_txt wire 0
+ret false
+end
+note Valid GET then corrupt reserved byte -> parse refused
+mget_ok = new NbMsg NB_GET 0 0 4 0 0 1024
+n = nb_build mget_ok nonce buf wire
+if ne n NB_MIN
+ret false
+end
+put wire 30 1
+m2 = new NbMsg 0 0 0 0 0 0 0
+rn = new uchar 16 0
+extra = new uchar 1024 0
+if ne nb_parse part wire 0 n m2 rn extra NB_ERR
+ret false
+end
+ret true
+end
+
+fn main to int
+failed = uint 0
+failed = add failed breport b_t01 test_01_handoff_magic
+failed = add failed breport b_t02 test_02_handoff_model_fb
+failed = add failed breport b_t03 test_03_handoff_mmap_rsvd
+failed = add failed breport b_t04 test_04_model_map
+failed = add failed breport b_t05 test_05_slot_struct_checks
+failed = add failed breport b_t06 test_06_slot_select_cand
+failed = add failed breport b_t07 test_07_slot_select_fallback
+failed = add failed breport b_t08 test_08_slot_transitions
+failed = add failed breport b_t09 test_09_boot_rec_and_action
+failed = add failed breport b_t10 test_10_slot_sha512
+failed = add failed breport b_t11 test_11_netboot_roundtrip
+failed = add failed breport b_t12 test_12_netboot_negatives
+if eq failed 0
+w = bwrite_all 1 b_sum
+if w
+ret 0
+end
+ret 1
+end
+w = bwrite_all 1 b_fsum
+if w
+ret 1
+end
+ret 1
+end

@@ -1,0 +1,416 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/core/net.om: Pure-Omega AIENOS M6-A network protocol layer and boot report framing.
+note Converted from aienux native/net/aienos_net.{h,c} and native/net/aienos_report.{h,c}.
+note Compose with: si/directives/om2.om aienux/net/core/net.om ...
+
+const NET_OK int 0
+const NET_ERR_TRUNCATED int 1
+const NET_ERR_INVALID int 2
+const NET_ERR_UNSUPPORTED int 3
+const NET_ERR_CAPACITY int 4
+
+const NET_ETHERTYPE_IPV4 ushort 0x0800
+const NET_ETHERTYPE_ARP ushort 0x0806
+const NET_ARP_REQUEST ushort 1
+const NET_ARP_REPLY ushort 2
+const NET_IPPROTO_ICMP uchar 1
+const NET_IPPROTO_UDP uchar 17
+
+const NET_REPORT_PORT ushort 47031
+const NET_REPORT_CHUNK ulong 1024
+const NET_REPORT_MAX ulong 65536
+
+struct NetEthHdr dst_hi ulong dst_lo ulong src_hi ulong src_lo ulong ethertype ushort pay_off ulong pay_len ulong end
+struct NetArp op ushort smac_hi ulong smac_lo ulong sip uint tmac_hi ulong tmac_lo ulong tip uint end
+struct NetIpv4 ihl uchar dscp uchar total_len ushort ident ushort flags_frag ushort ttl uchar proto uchar csum ushort src uint dst uint pay_off ulong pay_len ulong end
+struct NetUdp sport ushort dport ushort ulen ushort csum ushort pay_off ulong pay_len ulong end
+
+const NET_ARP_CAP ulong 32
+global net_arp_ip uint 32
+global net_arp_mac uchar 192
+global net_arp_exp ulong 32
+global net_arp_used uchar 32
+
+fn net_be16 buf view uchar * off ulong to ushort
+b0 = ushort get buf off
+b1 = ushort get buf add off 1
+ret or shl b0 8 b1
+end
+
+fn net_be32 buf view uchar * off ulong to uint
+b0 = shl uint get buf off 24
+b1 = shl uint get buf add off 1 16
+b2 = shl uint get buf add off 2 8
+b3 = uint get buf add off 3
+ret or or b0 b1 or b2 b3
+end
+
+fn net_put_be16 buf edit uchar * off ulong v ushort to void
+put buf off uchar and shr v 8 0xff
+put buf add off 1 uchar and v 0xff
+end
+
+fn net_put_be32 buf edit uchar * off ulong v uint to void
+put buf off uchar and shr v 24 0xff
+put buf add off 1 uchar and shr v 16 0xff
+put buf add off 2 uchar and shr v 8 0xff
+put buf add off 3 uchar and v 0xff
+end
+
+note RFC 1071 one's-complement checksum (64-bit accumulator, odd final byte as high octet)
+fn net_checksum buf view uchar * off ulong n ulong to ushort
+acc = ulong 0
+i = ulong 0
+while lt add i 1 n bound 65536
+w = ulong net_be16 buf add off i
+acc = add acc w
+i = add i 2
+end
+if lt i n
+acc = add acc shl ulong get buf add off i 8
+end
+while gt shr acc 16 0 bound 8
+acc = add and acc 0xffff shr acc 16
+end
+ret ushort xor and acc 0xffff 0xffff
+end
+
+note ---- Ethernet II ----
+
+fn net_eth_parse buf view uchar * n ulong hdr edit NetEthHdr to int
+if lt n 14
+ret NET_ERR_TRUNCATED
+end
+et = net_be16 buf 12
+if lt et 1536
+ret NET_ERR_UNSUPPORTED
+end
+dhi = ulong net_be32 buf 0
+dlo = ulong net_be16 buf 4
+shi = ulong net_be32 buf 6
+slo = ulong net_be16 buf 10
+put hdr dst_hi dhi
+put hdr dst_lo dlo
+put hdr src_hi shi
+put hdr src_lo slo
+put hdr ethertype et
+put hdr pay_off 14
+put hdr pay_len sub n 14
+ret NET_OK
+end
+
+fn net_eth_build macs view uchar 12 et ushort pay view uchar * buf edit uchar * to ulong
+need = add 14 len pay
+if gt need len buf
+ret 0
+end
+for i ulong 12
+put buf i get macs i
+end
+net_put_be16 buf 12 et
+for i ulong len pay bound 2048
+put buf add 14 i get pay i
+end
+ret need
+end
+
+note ---- ARP (Ethernet / IPv4) ----
+
+fn net_arp_parse buf view uchar * off ulong n ulong pkt edit NetArp to int
+if lt n 28
+ret NET_ERR_TRUNCATED
+end
+if ne net_be16 buf off 1
+ret NET_ERR_UNSUPPORTED
+end
+if ne net_be16 buf add off 2 NET_ETHERTYPE_IPV4
+ret NET_ERR_UNSUPPORTED
+end
+if or ne get buf add off 4 6 ne get buf add off 5 4
+ret NET_ERR_UNSUPPORTED
+end
+op = net_be16 buf add off 6
+if and ne op NET_ARP_REQUEST ne op NET_ARP_REPLY
+ret NET_ERR_UNSUPPORTED
+end
+put pkt op op
+put pkt smac_hi ulong net_be32 buf add off 8
+put pkt smac_lo ulong net_be16 buf add off 12
+put pkt sip net_be32 buf add off 14
+put pkt tmac_hi ulong net_be32 buf add off 18
+put pkt tmac_lo ulong net_be16 buf add off 22
+put pkt tip net_be32 buf add off 24
+ret NET_OK
+end
+
+fn net_arp_cache_reset to void
+for i ulong NET_ARP_CAP
+put net_arp_used i 0
+put net_arp_ip i 0
+put net_arp_exp i 0
+end
+end
+
+fn net_arp_cache_learn ip uint mac view uchar 6 now ulong ttl ulong to int
+exp = add now ttl
+slot = ulong NET_ARP_CAP
+for i ulong NET_ARP_CAP
+if and ne get net_arp_used i 0 eq get net_arp_ip i ip
+slot = i
+break
+end
+end
+if eq slot NET_ARP_CAP
+for i ulong NET_ARP_CAP
+if or eq get net_arp_used i 0 le get net_arp_exp i now
+slot = i
+break
+end
+end
+end
+if eq slot NET_ARP_CAP
+ret NET_ERR_CAPACITY
+end
+put net_arp_used slot 1
+put net_arp_ip slot ip
+put net_arp_exp slot exp
+base = mul slot 6
+for j ulong 6
+put net_arp_mac add base j get mac j
+end
+ret NET_OK
+end
+
+fn net_arp_cache_lookup ip uint now ulong mac_out edit uchar 6 to bool
+for i ulong NET_ARP_CAP
+if ne get net_arp_used i 0
+if and eq get net_arp_ip i ip gt get net_arp_exp i now
+base = mul i 6
+for j ulong 6
+put mac_out j get net_arp_mac add base j
+end
+ret true
+end
+end
+end
+ret false
+end
+
+note ---- IPv4 ----
+
+fn net_ipv4_parse buf view uchar * off ulong n ulong hdr edit NetIpv4 to int
+if lt n 20
+ret NET_ERR_TRUNCATED
+end
+vihl = get buf off
+ver = shr vihl 4
+ihl_w = and vihl 0x0f
+if ne ver 4
+ret NET_ERR_UNSUPPORTED
+end
+if lt ihl_w 5
+ret NET_ERR_INVALID
+end
+hlen = mul ulong ihl_w 4
+if gt hlen n
+ret NET_ERR_TRUNCATED
+end
+tot = ulong net_be16 buf add off 2
+if lt tot hlen
+ret NET_ERR_INVALID
+end
+if gt tot n
+ret NET_ERR_TRUNCATED
+end
+if ne net_checksum buf off hlen 0
+ret NET_ERR_INVALID
+end
+put hdr ihl uchar hlen
+put hdr dscp get buf add off 1
+put hdr total_len ushort tot
+put hdr ident net_be16 buf add off 4
+put hdr flags_frag net_be16 buf add off 6
+put hdr ttl get buf add off 8
+put hdr proto get buf add off 9
+put hdr csum net_be16 buf add off 10
+put hdr src net_be32 buf add off 12
+put hdr dst net_be32 buf add off 16
+put hdr pay_off add off hlen
+put hdr pay_len sub tot hlen
+ret NET_OK
+end
+
+note ip_meta: 0=src 1=dst 2=proto 3=ttl
+fn net_ipv4_build ip_meta view uint 4 pay view uchar * buf edit uchar * to ulong
+tot = add 20 len pay
+if gt tot len buf
+ret 0
+end
+put buf 0 0x45
+put buf 1 0
+net_put_be16 buf 2 ushort tot
+net_put_be16 buf 4 0
+net_put_be16 buf 6 0
+put buf 8 uchar get ip_meta 3
+put buf 9 uchar get ip_meta 2
+net_put_be16 buf 10 0
+net_put_be32 buf 12 get ip_meta 0
+net_put_be32 buf 16 get ip_meta 1
+cs = net_checksum buf 0 20
+net_put_be16 buf 10 cs
+for i ulong len pay bound 2048
+put buf add 20 i get pay i
+end
+ret tot
+end
+
+note ---- UDP ----
+
+fn net_udp_parse buf view uchar * off ulong n ulong hdr edit NetUdp to int
+if lt n 8
+ret NET_ERR_TRUNCATED
+end
+ul = ulong net_be16 buf add off 4
+if lt ul 8
+ret NET_ERR_INVALID
+end
+if gt ul n
+ret NET_ERR_TRUNCATED
+end
+put hdr sport net_be16 buf off
+put hdr dport net_be16 buf add off 2
+put hdr ulen ushort ul
+put hdr csum net_be16 buf add off 6
+put hdr pay_off add off 8
+put hdr pay_len sub ul 8
+ret NET_OK
+end
+
+fn net_udp_build sport ushort dport ushort pay view uchar * buf edit uchar * to ulong
+ul = add 8 len pay
+if gt ul len buf
+ret 0
+end
+net_put_be16 buf 0 sport
+net_put_be16 buf 2 dport
+net_put_be16 buf 4 ushort ul
+net_put_be16 buf 6 0
+for i ulong len pay bound 2048
+put buf add 8 i get pay i
+end
+ret ul
+end
+
+note ---- Boot Report Framing (aienos_report) ----
+
+fn net_report_parts n ulong to ulong
+if or eq n 0 gt n NET_REPORT_MAX
+ret 0
+end
+ret div sub add n NET_REPORT_CHUNK 1 NET_REPORT_CHUNK
+end
+
+fn net_report_wrap_eth mac view uchar 6 ubuf view uchar * dst edit uchar * to ulong
+ip_meta = new uint 4 0
+put ip_meta 0 0
+put ip_meta 1 0xffffffff
+put ip_meta 2 uint NET_IPPROTO_UDP
+put ip_meta 3 1
+ipbuf = new uchar 1152 0
+iplen = net_ipv4_build ip_meta ubuf ipbuf
+if eq iplen 0
+ret 0
+end
+macs = new uchar 12 0xff
+for i ulong 6
+put macs add 6 i get mac i
+end
+ret net_eth_build macs NET_ETHERTYPE_IPV4 part ipbuf 0 iplen dst
+end
+
+note rmeta: 0=run_id 1=part_idx 2=parts
+fn net_report_build_frame mac view uchar 6 rmeta view ulong 3 chunk view uchar * dst edit uchar * to ulong
+run_id = get rmeta 0
+part_idx = get rmeta 1
+parts = get rmeta 2
+if or eq parts 0 ge part_idx parts
+ret 0
+end
+if gt len chunk NET_REPORT_CHUNK
+ret 0
+end
+udp_pay = new uchar 1088 0
+note Binary/compact header: "ARPT" (4) + run_id (8) + part_idx (4) + parts (4) + chunk_len (4) = 24 bytes
+put udp_pay 0 65
+put udp_pay 1 82
+put udp_pay 2 80
+put udp_pay 3 84
+net_put_be32 udp_pay 4 uint shr run_id 32
+net_put_be32 udp_pay 8 uint and run_id 0xffffffff
+net_put_be32 udp_pay 12 uint part_idx
+net_put_be32 udp_pay 16 uint parts
+net_put_be32 udp_pay 20 uint len chunk
+for i ulong len chunk bound 1024
+put udp_pay add 24 i get chunk i
+end
+plen = add 24 len chunk
+ubuf = new uchar 1120 0
+ulen = net_udp_build NET_REPORT_PORT NET_REPORT_PORT part udp_pay 0 plen ubuf
+if eq ulen 0
+ret 0
+end
+ret net_report_wrap_eth mac part ubuf 0 ulen dst
+end
+
+fn net_report_parse_payload frame view uchar * poff ulong plen ulong meta_out edit ulong 4 to int
+if lt plen 24
+ret -7
+end
+if or ne get frame poff 65 ne get frame add poff 1 82
+ret -8
+end
+if or ne get frame add poff 2 80 ne get frame add poff 3 84
+ret -8
+end
+rhi = ulong net_be32 frame add poff 4
+rlo = ulong net_be32 frame add poff 8
+pidx = ulong net_be32 frame add poff 12
+ptot = ulong net_be32 frame add poff 16
+clen = ulong net_be32 frame add poff 20
+if or eq ptot 0 ge pidx ptot
+ret -9
+end
+if ne add 24 clen plen
+ret -9
+end
+put meta_out 0 or shl rhi 32 rlo
+put meta_out 1 pidx
+put meta_out 2 ptot
+put meta_out 3 clen
+ret 0
+end
+
+fn net_report_parse_frame frame view uchar * n ulong meta_out edit ulong 4 to int
+eh = new NetEthHdr 0 0 0 0 0 0 0
+if ne net_eth_parse frame n eh NET_OK
+ret -1
+end
+if ne get eh ethertype NET_ETHERTYPE_IPV4
+ret -2
+end
+ih = new NetIpv4 0 0 0 0 0 0 0 0 0 0 0 0
+if ne net_ipv4_parse frame get eh pay_off get eh pay_len ih NET_OK
+ret -3
+end
+if ne get ih proto NET_IPPROTO_UDP
+ret -4
+end
+uh = new NetUdp 0 0 0 0 0 0
+if ne net_udp_parse frame get ih pay_off get ih pay_len uh NET_OK
+ret -5
+end
+if or ne get uh sport NET_REPORT_PORT ne get uh dport NET_REPORT_PORT
+ret -6
+end
+ret net_report_parse_payload frame get uh pay_off get uh pay_len meta_out
+end

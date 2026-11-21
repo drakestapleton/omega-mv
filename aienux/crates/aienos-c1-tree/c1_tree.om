@@ -1,0 +1,518 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-c1-tree/c1_tree.om: Pure-Omega C1 Copy-On-Write Prefix Tree engine.
+note Converted from aienux crates/aienos-c1-tree/src/{page,pool,metrics,tree,lib}.rs.
+note Compose with: si/directives/om2.om om/tls/sha2.om aienux/crates/aienos-c1-tree/c1_tree.om ...
+
+const C1_PAGE_CAP ulong 64
+const C1_KV_ELEMS_PER_TOK ulong 128
+const C1_PAGE_KV_BYTES ulong 32768
+const C1_MAX_PAGES ulong 64
+const C1_MAX_BRANCHES ulong 16
+const C1_MAX_BPAGES ulong 16
+
+const C1_OK int 0
+const C1_ERR_NOT_FOUND int -1
+const C1_ERR_EVICTED int -2
+const C1_ERR_EXISTS int -3
+const C1_ERR_CORRUPT int -4
+const C1_ERR_QUOTA int -5
+const C1_ERR_CAPACITY int -6
+
+note Physical page pool state
+global c1_next_pid ulong 1
+global c1_p_used uchar 64
+global c1_p_id ulong 64
+global c1_p_len ulong 64
+global c1_p_ref ulong 64
+global c1_p_toks uint 4096
+global c1_p_cksum uchar 2048
+
+note Branch table state
+global c1_b_used uchar 16
+global c1_b_id ulong 16
+global c1_b_evicted uchar 16
+global c1_b_npages ulong 16
+global c1_b_ntoks ulong 16
+global c1_b_pids ulong 256
+
+note Reservation receipt output: 0=branch_id, 1=tokens_reserved, 2=pages_reserved, 3=tick
+global c1_res_out ulong 4
+
+note Metrics output: 0=phys_pages, 1=phys_bytes, 2=virt_tokens, 3=phys_token_cap
+global c1_met_out ulong 4
+
+fn c1_init to void
+put c1_next_pid 0 1
+for i ulong C1_MAX_PAGES
+put c1_p_used i 0
+put c1_p_id i 0
+put c1_p_len i 0
+put c1_p_ref i 0
+end
+for i ulong C1_MAX_BRANCHES
+put c1_b_used i 0
+put c1_b_id i 0
+put c1_b_evicted i 0
+put c1_b_npages i 0
+put c1_b_ntoks i 0
+end
+end
+
+fn c1_find_page pid ulong to long
+for i ulong C1_MAX_PAGES
+if and eq get c1_p_used i 1 eq get c1_p_id i pid
+ret long i
+end
+end
+ret -1
+end
+
+fn c1_find_branch bid ulong to long
+for i ulong C1_MAX_BRANCHES
+if and eq get c1_b_used i 1 eq get c1_b_id i bid
+ret long i
+end
+end
+ret -1
+end
+
+fn c1_page_hash slot ulong out_ck edit uchar * to void
+ctx = new ulong 40 0
+sha256_init ctx
+pid = get c1_p_id slot
+hdr = new uchar 8 0
+for i ulong 8
+sh = mul sub 7 i 8
+put hdr i uchar and shr pid sh 0xff
+end
+sha256_update ctx hdr
+plen = get c1_p_len slot
+tbase = mul slot C1_PAGE_CAP
+tbuf = new uchar 4 0
+for i ulong plen bound 64
+tok = get c1_p_toks add tbase i
+put tbuf 0 uchar and shr tok 24 0xff
+put tbuf 1 uchar and shr tok 16 0xff
+put tbuf 2 uchar and shr tok 8 0xff
+put tbuf 3 uchar and tok 0xff
+sha256_update ctx tbuf
+end
+sha256_final ctx out_ck
+end
+
+fn c1_page_recompute slot ulong to void
+ck = new uchar 32 0
+c1_page_hash slot ck
+cbase = mul slot 32
+for i ulong 32
+put c1_p_cksum add cbase i get ck i
+end
+end
+
+fn c1_page_verify slot ulong to bool
+ck = new uchar 32 0
+c1_page_hash slot ck
+cbase = mul slot 32
+for i ulong 32
+if ne get c1_p_cksum add cbase i get ck i
+ret false
+end
+end
+ret true
+end
+
+fn c1_pool_alloc to ulong
+for i ulong C1_MAX_PAGES
+if eq get c1_p_used i 0
+pid = get c1_next_pid 0
+put c1_next_pid 0 add pid 1
+put c1_p_used i 1
+put c1_p_id i pid
+put c1_p_len i 0
+put c1_p_ref i 1
+c1_page_recompute i
+ret pid
+end
+end
+ret 0
+end
+
+fn c1_pool_retain pid ulong to void
+sl = c1_find_page pid
+if ge sl 0
+u = ulong sl
+put c1_p_ref u add get c1_p_ref u 1
+end
+end
+
+fn c1_pool_release pid ulong to void
+sl = c1_find_page pid
+if ge sl 0
+u = ulong sl
+r = get c1_p_ref u
+if gt r 1
+put c1_p_ref u sub r 1
+else
+put c1_p_ref u 0
+put c1_p_used u 0
+put c1_p_id u 0
+put c1_p_len u 0
+end
+end
+end
+
+fn c1_copy_page_tokens su ulong du ulong to void
+plen = get c1_p_len su
+put c1_p_len du plen
+sbase = mul su C1_PAGE_CAP
+dbase = mul du C1_PAGE_CAP
+for i ulong plen bound 64
+put c1_p_toks add dbase i get c1_p_toks add sbase i
+end
+c1_page_recompute du
+end
+
+fn c1_pool_cow src_pid ulong to ulong
+src_sl = c1_find_page src_pid
+if lt src_sl 0
+ret 0
+end
+new_pid = c1_pool_alloc
+if eq new_pid 0
+ret 0
+end
+dst_sl = c1_find_page new_pid
+if lt dst_sl 0
+ret 0
+end
+c1_copy_page_tokens ulong src_sl ulong dst_sl
+c1_pool_release src_pid
+ret new_pid
+end
+
+fn c1_pool_active_count to ulong
+cnt = ulong 0
+for i ulong C1_MAX_PAGES
+if eq get c1_p_used i 1
+cnt = add cnt 1
+end
+end
+ret cnt
+end
+
+fn c1_pool_memory_bytes to ulong
+ret mul c1_pool_active_count C1_PAGE_KV_BYTES
+end
+
+fn c1_page_append_slot slot ulong tok uint to bool
+plen = get c1_p_len slot
+if ge plen C1_PAGE_CAP
+ret false
+end
+tbase = mul slot C1_PAGE_CAP
+put c1_p_toks add tbase plen tok
+put c1_p_len slot add plen 1
+c1_page_recompute slot
+ret true
+end
+
+fn c1_append_single bslot ulong tok uint to int
+np = get c1_b_npages bslot
+bbase = mul bslot C1_MAX_BPAGES
+if eq np 0
+pid = c1_pool_alloc
+if eq pid 0
+ret C1_ERR_CAPACITY
+end
+psl = c1_find_page pid
+if lt psl 0
+ret C1_ERR_CORRUPT
+end
+ok = c1_page_append_slot ulong psl tok
+if not ok
+ret C1_ERR_CORRUPT
+end
+put c1_b_pids bbase pid
+put c1_b_npages bslot 1
+put c1_b_ntoks bslot add get c1_b_ntoks bslot 1
+ret C1_OK
+end
+
+last_idx = sub np 1
+last_pid = get c1_b_pids add bbase last_idx
+psl = c1_find_page last_pid
+if lt psl 0
+ret C1_ERR_CORRUPT
+end
+pu = ulong psl
+if not c1_page_verify pu
+ret C1_ERR_CORRUPT
+end
+if lt get c1_p_len pu C1_PAGE_CAP
+if eq get c1_p_ref pu 1
+ok = c1_page_append_slot pu tok
+if not ok
+ret C1_ERR_CORRUPT
+end
+else
+new_pid = c1_pool_cow last_pid
+if eq new_pid 0
+ret C1_ERR_CAPACITY
+end
+nsl = c1_find_page new_pid
+if lt nsl 0
+ret C1_ERR_CORRUPT
+end
+ok = c1_page_append_slot ulong nsl tok
+if not ok
+ret C1_ERR_CORRUPT
+end
+put c1_b_pids add bbase last_idx new_pid
+end
+else
+if ge np C1_MAX_BPAGES
+ret C1_ERR_CAPACITY
+end
+new_pid = c1_pool_alloc
+if eq new_pid 0
+ret C1_ERR_CAPACITY
+end
+nsl = c1_find_page new_pid
+if lt nsl 0
+ret C1_ERR_CORRUPT
+end
+ok = c1_page_append_slot ulong nsl tok
+if not ok
+ret C1_ERR_CORRUPT
+end
+put c1_b_pids add bbase np new_pid
+put c1_b_npages bslot add np 1
+end
+put c1_b_ntoks bslot add get c1_b_ntoks bslot 1
+ret C1_OK
+end
+
+fn c1_create_root bid ulong toks view uint * to int
+if ge c1_find_branch bid 0
+ret C1_ERR_EXISTS
+end
+bslot = ulong C1_MAX_BRANCHES
+for i ulong C1_MAX_BRANCHES
+if eq get c1_b_used i 0
+bslot = i
+break
+end
+end
+if eq bslot C1_MAX_BRANCHES
+ret C1_ERR_CAPACITY
+end
+put c1_b_used bslot 1
+put c1_b_id bslot bid
+put c1_b_evicted bslot 0
+put c1_b_npages bslot 0
+put c1_b_ntoks bslot 0
+for i ulong len toks bound 1024
+rc = c1_append_single bslot get toks i
+if ne rc C1_OK
+ret rc
+end
+end
+ret C1_OK
+end
+
+fn c1_fork_branch parent_id ulong child_id ulong to int
+psl = c1_find_branch parent_id
+if lt psl 0
+ret C1_ERR_NOT_FOUND
+end
+pu = ulong psl
+if eq get c1_b_evicted pu 1
+ret C1_ERR_EVICTED
+end
+if ge c1_find_branch child_id 0
+ret C1_ERR_EXISTS
+end
+cslot = ulong C1_MAX_BRANCHES
+for i ulong C1_MAX_BRANCHES
+if eq get c1_b_used i 0
+cslot = i
+break
+end
+end
+if eq cslot C1_MAX_BRANCHES
+ret C1_ERR_CAPACITY
+end
+np = get c1_b_npages pu
+pbase = mul pu C1_MAX_BPAGES
+cbase = mul cslot C1_MAX_BPAGES
+for i ulong np bound 16
+pid = get c1_b_pids add pbase i
+c1_pool_retain pid
+put c1_b_pids add cbase i pid
+end
+put c1_b_used cslot 1
+put c1_b_id cslot child_id
+put c1_b_evicted cslot 0
+put c1_b_npages cslot np
+put c1_b_ntoks cslot get c1_b_ntoks pu
+ret C1_OK
+end
+
+fn c1_reserve_step bid ulong num_toks ulong tick ulong max_pages ulong to int
+bsl = c1_find_branch bid
+if lt bsl 0
+ret C1_ERR_NOT_FOUND
+end
+bu = ulong bsl
+if eq get c1_b_evicted bu 1
+ret C1_ERR_EVICTED
+end
+needed = ulong 0
+if gt num_toks 0
+needed = div add num_toks sub C1_PAGE_CAP 1 C1_PAGE_CAP
+end
+alloc = c1_pool_active_count
+if gt add alloc needed max_pages
+ret C1_ERR_QUOTA
+end
+put c1_res_out 0 bid
+put c1_res_out 1 num_toks
+put c1_res_out 2 needed
+put c1_res_out 3 tick
+ret C1_OK
+end
+
+fn c1_append_tokens bid ulong toks view uint * to int
+bsl = c1_find_branch bid
+if lt bsl 0
+ret C1_ERR_NOT_FOUND
+end
+bu = ulong bsl
+if eq get c1_b_evicted bu 1
+ret C1_ERR_EVICTED
+end
+for i ulong len toks bound 1024
+rc = c1_append_single bu get toks i
+if ne rc C1_OK
+ret rc
+end
+end
+ret C1_OK
+end
+
+fn c1_copy_page_out pu ulong dst edit uint * pos ulong to ulong
+plen = get c1_p_len pu
+tbase = mul pu C1_PAGE_CAP
+for j ulong plen bound 64
+put dst add pos j get c1_p_toks add tbase j
+end
+ret add pos plen
+end
+
+fn c1_get_tokens bid ulong dst edit uint * to long
+bsl = c1_find_branch bid
+if lt bsl 0
+ret long C1_ERR_NOT_FOUND
+end
+bu = ulong bsl
+if eq get c1_b_evicted bu 1
+ret long C1_ERR_EVICTED
+end
+if gt get c1_b_ntoks bu len dst
+ret long C1_ERR_CAPACITY
+end
+np = get c1_b_npages bu
+bbase = mul bu C1_MAX_BPAGES
+pos = ulong 0
+for i ulong np bound 16
+psl = c1_find_page get c1_b_pids add bbase i
+if lt psl 0
+ret long C1_ERR_CORRUPT
+end
+if not c1_page_verify ulong psl
+ret long C1_ERR_CORRUPT
+end
+pos = c1_copy_page_out ulong psl dst pos
+end
+ret long pos
+end
+
+fn c1_evict_branch bid ulong to int
+bsl = c1_find_branch bid
+if lt bsl 0
+ret C1_ERR_NOT_FOUND
+end
+bu = ulong bsl
+if eq get c1_b_evicted bu 1
+ret C1_OK
+end
+np = get c1_b_npages bu
+bbase = mul bu C1_MAX_BPAGES
+for i ulong np bound 16
+c1_pool_release get c1_b_pids add bbase i
+end
+put c1_b_npages bu 0
+put c1_b_evicted bu 1
+ret C1_OK
+end
+
+fn c1_remove_branch bid ulong to int
+bsl = c1_find_branch bid
+if lt bsl 0
+ret C1_ERR_NOT_FOUND
+end
+bu = ulong bsl
+if eq get c1_b_evicted bu 0
+np = get c1_b_npages bu
+bbase = mul bu C1_MAX_BPAGES
+for i ulong np bound 16
+c1_pool_release get c1_b_pids add bbase i
+end
+end
+put c1_b_used bu 0
+put c1_b_id bu 0
+put c1_b_npages bu 0
+put c1_b_ntoks bu 0
+put c1_b_evicted bu 0
+ret C1_OK
+end
+
+fn c1_reconstruct_branch bid ulong toks view uint * to int
+bsl = c1_find_branch bid
+if lt bsl 0
+ret C1_ERR_NOT_FOUND
+end
+bu = ulong bsl
+if eq get c1_b_evicted bu 0
+np = get c1_b_npages bu
+bbase = mul bu C1_MAX_BPAGES
+for i ulong np bound 16
+c1_pool_release get c1_b_pids add bbase i
+end
+end
+put c1_b_npages bu 0
+put c1_b_ntoks bu 0
+put c1_b_evicted bu 0
+for i ulong len toks bound 1024
+rc = c1_append_single bu get toks i
+if ne rc C1_OK
+ret rc
+end
+end
+ret C1_OK
+end
+
+fn c1_compute_metrics to void
+pp = c1_pool_active_count
+pb = mul pp C1_PAGE_KV_BYTES
+vt = ulong 0
+for i ulong C1_MAX_BRANCHES
+if eq get c1_b_used i 1
+vt = add vt get c1_b_ntoks i
+end
+end
+put c1_met_out 0 pp
+put c1_met_out 1 pb
+put c1_met_out 2 vt
+put c1_met_out 3 mul pp C1_PAGE_CAP
+end

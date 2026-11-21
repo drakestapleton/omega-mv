@@ -1,0 +1,510 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/store/torn_slot.om: Pure-Omega dual-slot torn-write-safe 4096-byte record.
+note Faithful OM-2 library (no om2 line, no fn main) converted from upstream aienux
+note native/store/torn_slot.{h,c}.
+note Compose with: si/directives/om2.om aienux/store/torn_slot.om <test.om> om/tls/sha2.om
+
+const TS_RECORD_BYTES ulong 4096
+const TS_UNITS ulong 4
+const TS_HEADER_BYTES ulong 88
+const TS_MEDIA_UNITS ulong 8
+const TS_MEDIA_BYTES ulong 32768
+const TS_U64_MAX ulong 0xffffffffffffffff
+
+note Result codes
+const TS_OK int 0
+const TS_EMPTY int 1
+const TS_CORRUPT int -1
+const TS_CONFLICT int -2
+const TS_EIO int -3
+const TS_EGEOMETRY int -4
+const TS_ESTATE int -5
+
+note Per-slot diagnosis states
+const TS_SLOT_BLANK uint 0
+const TS_SLOT_VALID uint 1
+const TS_SLOT_INVALID uint 2
+
+note Header field offsets
+const TS_OFF_VERSION ulong 8
+const TS_OFF_SLOT ulong 10
+const TS_OFF_RESERVED ulong 11
+const TS_OFF_RECBYTES ulong 12
+const TS_OFF_SEQ ulong 16
+const TS_OFF_RECDIGEST ulong 24
+const TS_OFF_HDRDIGEST ulong 56
+
+note Region metadata indices (global ts_reg ulong 12)
+const TS_R_BLKSIZE ulong 0
+const TS_R_BLKCNT ulong 1
+const TS_R_BASE_LBA ulong 2
+const TS_R_BPU ulong 3
+const TS_R_KNOWN ulong 4
+const TS_R_NEWEST_SLOT ulong 5
+const TS_R_NEWEST_SEQ ulong 6
+const TS_R_HAS_NEWEST ulong 7
+const TS_R_FAULT_WRITE ulong 8
+const TS_R_FAULT_FLUSH ulong 9
+const TS_R_TEAR_AFTER ulong 10
+const TS_R_WRITE_COUNT ulong 11
+
+text ts_magic "AIENTWS1"
+text ts_rec_dom "AIENOS-TORN-SLOT-RECORD-V1"
+text ts_hdr_dom "AIENOS-TORN-SLOT-HEADER-V1"
+
+global ts_reg ulong 12
+global ts_media uchar 32768
+global ts_scratch_cu uchar 4096
+global ts_scratch_b0 uchar 4096
+global ts_scratch_b1 uchar 4096
+
+note ---- Little-endian helpers ----
+
+fn ts_put16 buf edit uchar * off ulong v ushort to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+end
+
+fn ts_put32 buf edit uchar * off ulong v uint to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn ts_put64 buf edit uchar * off ulong v ulong to void
+for i ulong 8 unroll
+put buf add off i uchar and shr v mul i 8 0xff
+end
+end
+
+fn ts_get16 buf view uchar * off ulong to ushort
+b0 = ushort get buf off
+b1 = ushort get buf add off 1
+ret or b0 shl b1 8
+end
+
+fn ts_get32 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = uint get buf add off 1
+b2 = uint get buf add off 2
+b3 = uint get buf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn ts_get64 buf view uchar * off ulong to ulong
+v = ulong 0
+for i ulong 8 unroll
+b = ulong get buf add off i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+fn ts_all_zero buf view uchar * off ulong cnt ulong to bool
+acc = uchar 0
+i = ulong 0
+while lt i cnt bound 4096
+acc = or acc get buf add off i
+i = add i 1
+end
+ret eq acc 0
+end
+
+fn ts_digest_eq a view uchar * aoff ulong b view uchar * boff ulong to bool
+d = uchar 0
+for i ulong 32
+d = or d xor get a add aoff i get b add boff i
+end
+ret eq d 0
+end
+
+note ---- Domain-separated SHA-256 digests ----
+
+fn ts_record_digest slot uchar seq ulong rec view uchar 4096 dst edit uchar 32 to void
+ctx = new ulong 40 0
+z1 = new uchar 1 0
+sb = new uchar 9 0
+put sb 0 slot
+ts_put64 sb 1 seq
+sha256_init ctx
+sha256_update ctx ts_rec_dom
+sha256_update ctx z1
+sha256_update ctx sb
+sha256_update ctx rec
+sha256_final ctx dst
+end
+
+fn ts_header_digest hdr view uchar 4096 dst edit uchar 32 to void
+ctx = new ulong 40 0
+z1 = new uchar 1 0
+sha256_init ctx
+sha256_update ctx ts_hdr_dom
+sha256_update ctx z1
+sha256_update ctx part hdr 0 56
+sha256_final ctx dst
+end
+
+fn ts_encode_commit unit edit uchar 4096 slot uchar seq ulong rec view uchar 4096 to void
+for i ulong 4096
+put unit i 0
+end
+for i ulong 8
+put unit i get ts_magic i
+end
+ts_put16 unit TS_OFF_VERSION 1
+put unit TS_OFF_SLOT slot
+put unit TS_OFF_RESERVED 0
+ts_put32 unit TS_OFF_RECBYTES uint TS_RECORD_BYTES
+ts_put64 unit TS_OFF_SEQ seq
+rd = new uchar 32 0
+ts_record_digest slot seq rec rd
+for i ulong 32
+put unit add TS_OFF_RECDIGEST i get rd i
+end
+hd = new uchar 32 0
+ts_header_digest unit hd
+for i ulong 32
+put unit add TS_OFF_HDRDIGEST i get hd i
+end
+end
+
+note ---- Bounded media & fault-injection layer ----
+
+fn ts_media_zero to void
+for i ulong TS_MEDIA_BYTES
+put ts_media i 0
+end
+for i ulong 12
+put ts_reg i 0
+end
+end
+
+fn ts_set_faults fail_write ulong fail_flush ulong tear_after ulong to void
+put ts_reg TS_R_FAULT_WRITE fail_write
+put ts_reg TS_R_FAULT_FLUSH fail_flush
+put ts_reg TS_R_TEAR_AFTER tear_after
+put ts_reg TS_R_WRITE_COUNT 0
+end
+
+fn ts_media_read_unit unit ulong dst edit uchar 4096 to int
+bpu = get ts_reg TS_R_BPU
+bsize = get ts_reg TS_R_BLKSIZE
+lba = add get ts_reg TS_R_BASE_LBA mul unit bpu
+byte_off = mul lba bsize
+if gt add byte_off TS_RECORD_BYTES TS_MEDIA_BYTES
+ret TS_EIO
+end
+for i ulong 4096
+put dst i get ts_media add byte_off i
+end
+ret TS_OK
+end
+
+fn ts_media_write_unit unit ulong src view uchar 4096 to int
+bpu = get ts_reg TS_R_BPU
+bsize = get ts_reg TS_R_BLKSIZE
+lba = add get ts_reg TS_R_BASE_LBA mul unit bpu
+byte_off = mul lba bsize
+if gt add byte_off TS_RECORD_BYTES TS_MEDIA_BYTES
+ret TS_EIO
+end
+fw = get ts_reg TS_R_FAULT_WRITE
+wcnt = add get ts_reg TS_R_WRITE_COUNT 1
+put ts_reg TS_R_WRITE_COUNT wcnt
+if and ne fw 0 eq wcnt fw
+ret TS_EIO
+end
+tear = get ts_reg TS_R_TEAR_AFTER
+if and ne tear 0 le tear TS_RECORD_BYTES
+i = ulong 0
+while lt i tear bound 4096
+put ts_media add byte_off i get src i
+i = add i 1
+end
+ret TS_EIO
+end
+for i ulong 4096
+put ts_media add byte_off i get src i
+end
+ret TS_OK
+end
+
+fn ts_media_flush to int
+if ne get ts_reg TS_R_FAULT_FLUSH 0
+ret TS_EIO
+end
+ret TS_OK
+end
+
+fn ts_media_poke unit ulong off ulong val uchar to void
+bpu = get ts_reg TS_R_BPU
+bsize = get ts_reg TS_R_BLKSIZE
+lba = add get ts_reg TS_R_BASE_LBA mul unit bpu
+byte_off = add mul lba bsize off
+if lt byte_off TS_MEDIA_BYTES
+put ts_media byte_off val
+end
+end
+
+note ---- Public torn_slot API ----
+
+fn ts_open blk_size ulong blk_cnt ulong base_lba ulong to int
+put ts_reg TS_R_KNOWN 0
+put ts_reg TS_R_HAS_NEWEST 0
+put ts_reg TS_R_NEWEST_SLOT 0
+put ts_reg TS_R_NEWEST_SEQ 0
+put ts_reg TS_R_BPU 0
+if and ne blk_size 512 ne blk_size 4096
+ret TS_EGEOMETRY
+end
+bpu = div TS_RECORD_BYTES blk_size
+need = mul TS_UNITS bpu
+if or gt base_lba blk_cnt lt sub blk_cnt base_lba need
+ret TS_EGEOMETRY
+end
+put ts_reg TS_R_BLKSIZE blk_size
+put ts_reg TS_R_BLKCNT blk_cnt
+put ts_reg TS_R_BASE_LBA base_lba
+put ts_reg TS_R_BPU bpu
+ret TS_OK
+end
+
+fn ts_check_slot slot ulong body edit uchar 4096 seq_out edit ulong 1 st_out edit uint 1 to int
+cu = new uchar 4096 0
+d = new uchar 32 0
+e = ts_media_read_unit add mul 2 slot 1 cu
+if ne e TS_OK
+ret e
+end
+put st_out 0 TS_SLOT_INVALID
+if ts_all_zero cu 0 TS_RECORD_BYTES
+put st_out 0 TS_SLOT_BLANK
+ret TS_OK
+end
+for i ulong 8
+if ne get cu i get ts_magic i
+ret TS_OK
+end
+end
+if ne ts_get16 cu TS_OFF_VERSION 1
+ret TS_OK
+end
+if or ne get cu TS_OFF_SLOT uchar slot ne get cu TS_OFF_RESERVED 0
+ret TS_OK
+end
+if ne ts_get32 cu TS_OFF_RECBYTES uint TS_RECORD_BYTES
+ret TS_OK
+end
+if not ts_all_zero cu TS_HEADER_BYTES sub TS_RECORD_BYTES TS_HEADER_BYTES
+ret TS_OK
+end
+ts_header_digest cu d
+if not ts_digest_eq d 0 cu TS_OFF_HDRDIGEST
+ret TS_OK
+end
+s = ts_get64 cu TS_OFF_SEQ
+if eq s 0
+ret TS_OK
+end
+e = ts_media_read_unit mul 2 slot body
+if ne e TS_OK
+ret e
+end
+ts_record_digest uchar slot s body d
+if not ts_digest_eq d 0 cu TS_OFF_RECDIGEST
+ret TS_OK
+end
+put seq_out 0 s
+put st_out 0 TS_SLOT_VALID
+ret TS_OK
+end
+
+fn ts_unfinished_first_commit plaus edit uchar 1 to int
+put plaus 0 0
+cu = new uchar 4096 0
+e = ts_media_read_unit 1 cu
+if ne e TS_OK
+ret e
+end
+t = new uchar 24 0
+for i ulong 8
+put t i get ts_magic i
+end
+ts_put16 t TS_OFF_VERSION 1
+put t TS_OFF_SLOT 0
+put t TS_OFF_RESERVED 0
+ts_put32 t TS_OFF_RECBYTES uint TS_RECORD_BYTES
+ts_put64 t TS_OFF_SEQ 1
+for i ulong 24
+b = get cu i
+if and ne b 0 ne b get t i
+ret TS_OK
+end
+end
+if not ts_all_zero cu TS_HEADER_BYTES sub TS_RECORD_BYTES TS_HEADER_BYTES
+ret TS_OK
+end
+put plaus 0 1
+ret TS_OK
+end
+
+fn ts_check_lineage v0 uint v1 uint q0 ulong q1 ulong to int
+if eq v0 TS_SLOT_VALID
+if eq v1 TS_SLOT_VALID
+if eq q0 q1
+ret TS_CONFLICT
+end
+end
+if ne and q0 1 1
+ret TS_CORRUPT
+end
+end
+if eq v1 TS_SLOT_VALID
+if ne and q1 1 0
+ret TS_CORRUPT
+end
+if eq v0 TS_SLOT_BLANK
+ret TS_CORRUPT
+end
+end
+ret TS_OK
+end
+
+fn ts_pick_slot v0 uint v1 uint q0 ulong q1 ulong to int
+if and eq v0 TS_SLOT_VALID eq v1 TS_SLOT_VALID
+if gt q0 q1
+if ne sub q0 q1 1
+ret -2
+end
+ret 0
+end
+if ne sub q1 q0 1
+ret -2
+end
+ret 1
+end
+if eq v0 TS_SLOT_VALID
+ret 0
+end
+if eq v1 TS_SLOT_VALID
+ret 1
+end
+ret -1
+end
+
+fn ts_recover_empty v1 uint to int
+if ne v1 TS_SLOT_BLANK
+ret TS_CORRUPT
+end
+plaus = new uchar 1 0
+ef = ts_unfinished_first_commit plaus
+if ne ef TS_OK
+ret ef
+end
+if eq get plaus 0 0
+ret TS_CORRUPT
+end
+put ts_reg TS_R_KNOWN 1
+ret TS_EMPTY
+end
+
+fn ts_recover_finish dst edit uchar 4096 src view uchar 4096 slot ulong seq ulong seq_out edit ulong 1 to int
+for i ulong 4096
+put dst i get src i
+end
+put seq_out 0 seq
+put ts_reg TS_R_NEWEST_SLOT slot
+put ts_reg TS_R_NEWEST_SEQ seq
+put ts_reg TS_R_HAS_NEWEST 1
+put ts_reg TS_R_KNOWN 1
+ret TS_OK
+end
+
+fn ts_recover dst edit uchar 4096 seq_out edit ulong 1 slot_states edit uint 2 to int
+put ts_reg TS_R_KNOWN 0
+put ts_reg TS_R_HAS_NEWEST 0
+put ts_reg TS_R_NEWEST_SLOT 0
+put ts_reg TS_R_NEWEST_SEQ 0
+for i ulong 4096
+put dst i 0
+end
+put seq_out 0 0
+if eq get ts_reg TS_R_BPU 0
+ret TS_EGEOMETRY
+end
+b0 = new uchar 4096 0
+b1 = new uchar 4096 0
+sq = new ulong 1 0
+st = new uint 1 0
+e = ts_check_slot 0 b0 sq st
+if ne e TS_OK
+ret e
+end
+v0 = get st 0
+q0 = get sq 0
+e = ts_check_slot 1 b1 sq st
+if ne e TS_OK
+ret e
+end
+v1 = get st 0
+q1 = get sq 0
+put slot_states 0 v0
+put slot_states 1 v1
+
+e = ts_check_lineage v0 v1 q0 q1
+if ne e TS_OK
+ret e
+end
+pick = ts_pick_slot v0 v1 q0 q1
+if eq pick -2
+ret TS_CORRUPT
+end
+if lt pick 0
+ret ts_recover_empty v1
+end
+if eq pick 0
+if and eq v1 TS_SLOT_BLANK ne q0 1
+ret TS_CORRUPT
+end
+ret ts_recover_finish dst b0 0 q0 seq_out
+end
+ret ts_recover_finish dst b1 1 q1 seq_out
+end
+
+fn ts_commit rec view uchar 4096 to int
+if eq get ts_reg TS_R_KNOWN 0
+ret TS_ESTATE
+end
+cur_seq = get ts_reg TS_R_NEWEST_SEQ
+if eq cur_seq TS_U64_MAX
+ret TS_ESTATE
+end
+target = ulong 0
+if ne get ts_reg TS_R_HAS_NEWEST 0
+target = sub 1 get ts_reg TS_R_NEWEST_SLOT
+end
+nxt_seq = add cur_seq 1
+put ts_reg TS_R_KNOWN 0
+e = ts_media_write_unit mul 2 target rec
+if ne e TS_OK
+ret e
+end
+if ne ts_media_flush TS_OK
+ret TS_EIO
+end
+cu = new uchar 4096 0
+ts_encode_commit cu uchar target nxt_seq rec
+e = ts_media_write_unit add mul 2 target 1 cu
+if ne e TS_OK
+ret e
+end
+if ne ts_media_flush TS_OK
+ret TS_EIO
+end
+put ts_reg TS_R_HAS_NEWEST 1
+put ts_reg TS_R_NEWEST_SLOT target
+put ts_reg TS_R_NEWEST_SEQ nxt_seq
+put ts_reg TS_R_KNOWN 1
+ret TS_OK
+end

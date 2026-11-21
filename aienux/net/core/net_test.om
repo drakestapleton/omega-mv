@@ -1,0 +1,247 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/net/core/net_test.om: Behavioral self-test for Pure-Omega AIENOS Net Core, Boot Report, and Virtio-Net.
+note Compose with: si/directives/om2.om aienux/net/core/net.om aienux/net/core/virtio.om aienux/net/core/net_test.om
+
+text nt_pass "PASS "
+text nt_fail "FAIL "
+text nt_nl "\n"
+text nt_t1 "checksum_and_eth_arp_ipv4_udp"
+text nt_t2 "arp_cache_learn_lookup_and_expiry"
+text nt_t3 "boot_report_broadcast_roundtrip"
+text nt_t4 "virtio_pci_caps_discovery_and_loop"
+text nt_t5 "virtio_net_iommu_and_untrusted_ring_failstop"
+
+fn nt_say t view uchar * to void
+k = write 1 t 0 len t
+end
+
+fn nt_run name view uchar * ok bool to uint
+if ok
+nt_say nt_pass
+nt_say name
+nt_say nt_nl
+ret 0
+end
+nt_say nt_fail
+nt_say name
+nt_say nt_nl
+ret 1
+end
+
+fn test_01_parse frame edit uchar * fw ulong to bool
+eh = new NetEthHdr 0 0 0 0 0 0 0
+if ne net_eth_parse frame fw eh NET_OK
+ret false
+end
+if ne get eh ethertype NET_ETHERTYPE_IPV4
+ret false
+end
+ih = new NetIpv4 0 0 0 0 0 0 0 0 0 0 0 0
+if ne net_ipv4_parse frame get eh pay_off get eh pay_len ih NET_OK
+ret false
+end
+if or ne get ih src 0x0a000001 ne get ih dst 0x0a000002
+ret false
+end
+uh = new NetUdp 0 0 0 0 0 0
+if ne net_udp_parse frame get ih pay_off get ih pay_len uh NET_OK
+ret false
+end
+if or ne get uh sport 1234 ne get uh dport 5678
+ret false
+end
+if ne get uh pay_len 5
+ret false
+end
+note Corrupt IPv4 TTL byte (frame[22] = ipv4[8]) -> checksum invalid
+put frame 22 xor get frame 22 1
+if ne net_ipv4_parse frame get eh pay_off get eh pay_len ih NET_ERR_INVALID
+ret false
+end
+ret true
+end
+
+fn test_01_proto to bool
+note RFC 1071 odd-length checksum + IPv4 + UDP + Eth roundtrip
+pay = new uchar 5 0
+put pay 0 0x48
+put pay 1 0x45
+put pay 2 0x4c
+put pay 3 0x4c
+put pay 4 0x4f
+ubuf = new uchar 64 0
+ul = net_udp_build 1234 5678 pay ubuf
+if ne ul 13
+ret false
+end
+ip_meta = new uint 4 0
+put ip_meta 0 0x0a000001
+put ip_meta 1 0x0a000002
+put ip_meta 2 uint NET_IPPROTO_UDP
+put ip_meta 3 64
+ipbuf = new uchar 128 0
+ipl = net_ipv4_build ip_meta part ubuf 0 ul ipbuf
+if ne ipl 33
+ret false
+end
+macs = new uchar 12 0xff
+for i ulong 6
+put macs add 6 i 0x02
+end
+frame = new uchar 128 0
+fw = net_eth_build macs NET_ETHERTYPE_IPV4 part ipbuf 0 ipl frame
+if eq fw 0
+ret false
+end
+ret test_01_parse frame fw
+end
+
+fn test_02_arp_cache to bool
+net_arp_cache_reset
+m1 = new uchar 6 0xaa
+m2 = new uchar 6 0xbb
+outm = new uchar 6 0
+if ne net_arp_cache_learn 0x0a000001 m1 100 50 NET_OK
+ret false
+end
+if not net_arp_cache_lookup 0x0a000001 120 outm
+ret false
+end
+if ne get outm 0 0xaa
+ret false
+end
+note Expired at t=150
+if net_arp_cache_lookup 0x0a000001 150 outm
+ret false
+end
+note Reuses expired slot
+if ne net_arp_cache_learn 0x0a000002 m2 150 50 NET_OK
+ret false
+end
+if not net_arp_cache_lookup 0x0a000002 180 outm
+ret false
+end
+ret eq get outm 0 0xbb
+end
+
+fn test_03_boot_report to bool
+if ne net_report_parts 0 0
+ret false
+end
+if ne net_report_parts 1025 2
+ret false
+end
+mac = new uchar 6 0x12
+rmeta = new ulong 3 0
+put rmeta 0 0x0123456789abcdef
+put rmeta 1 1
+put rmeta 2 2
+chunk = new uchar 16 0x5a
+frame = new uchar 1280 0
+flen = net_report_build_frame mac rmeta chunk frame
+if eq flen 0
+ret false
+end
+meta = new ulong 4 0
+if ne net_report_parse_frame frame flen meta 0
+ret false
+end
+if ne get meta 0 0x0123456789abcdef
+ret false
+end
+if or ne get meta 1 1 ne get meta 2 2
+ret false
+end
+ret eq get meta 3 16
+end
+
+fn test_04_vpci_caps to bool
+cfg = new uchar 256 0
+put cfg 6 0x10
+put cfg 52 0x40
+note Cap 1 at 0x40: COMMON (len=16, bar=4, off=0x1000, next=0x50)
+put cfg 0x40 VPCI_CAP_VENDOR
+put cfg 0x41 0x50
+put cfg 0x42 16
+put cfg 0x43 VPCI_CFG_COMMON
+put cfg 0x44 4
+put cfg 0x49 0x10
+note Cap 2 at 0x50: NOTIFY (len=20, bar=4, off=0x2000, mult=4, next=0x64)
+put cfg 0x50 VPCI_CAP_VENDOR
+put cfg 0x51 0x64
+put cfg 0x52 20
+put cfg 0x53 VPCI_CFG_NOTIFY
+put cfg 0x54 4
+put cfg 0x59 0x20
+put cfg 0x60 4
+note Cap 3 at 0x64: ISR (len=16, bar=4, off=0x3000, next=0x74)
+put cfg 0x64 VPCI_CAP_VENDOR
+put cfg 0x65 0x74
+put cfg 0x66 16
+put cfg 0x67 VPCI_CFG_ISR
+put cfg 0x68 4
+put cfg 0x6d 0x30
+note Cap 4 at 0x74: DEVICE (len=16, bar=4, off=0x4000, next=0)
+put cfg 0x74 VPCI_CAP_VENDOR
+put cfg 0x75 0
+put cfg 0x76 16
+put cfg 0x77 VPCI_CFG_DEVICE
+put cfg 0x78 4
+put cfg 0x7d 0x40
+caps = new uint 10 0
+if ne vpci_parse_caps cfg caps VPCI_OK
+ret false
+end
+if or ne get caps 1 0x1000 ne get caps 4 4
+ret false
+end
+note Introduce capability cycle -> VPCI_ERR_LOOP
+put cfg 0x75 0x40
+ret eq vpci_parse_caps cfg caps VPCI_ERR_LOOP
+end
+
+fn test_05_virtio_net to bool
+note Fail closed if ACCESS_PLATFORM required but not offered
+if ne vnet_init VNET_F_VERSION_1 8 VNET_INIT_REQUIRE_ACCESS_PLATFORM VNET_ERR_ACCESS_PLATFORM
+ret false
+end
+note Succeed when both VERSION_1 and ACCESS_PLATFORM offered
+feats = or VNET_F_VERSION_1 or VNET_F_ACCESS_PLATFORM VNET_F_MAC
+if ne vnet_init feats 8 VNET_INIT_REQUIRE_ACCESS_PLATFORM VNET_OK
+ret false
+end
+pkt = new uchar 64 0x42
+if ne vnet_tx_submit pkt VNET_OK
+ret false
+end
+if ne vnet_tx_complete 0 VNET_OK
+ret false
+end
+if ne vnet_rx_post VNET_OK
+ret false
+end
+if ne vnet_rx_complete 0 add VNET_HDR_LEN 64 pkt VNET_OK
+ret false
+end
+note Untrusted device reports duplicate/unposted completion -> sticky BROKEN
+if ne vnet_rx_complete 0 add VNET_HDR_LEN 64 pkt VNET_ERR_BROKEN
+ret false
+end
+if not vnet_is_broken
+ret false
+end
+ret eq vnet_tx_submit pkt VNET_ERR_BROKEN
+end
+
+fn main to int
+failed = uint 0
+failed = add failed nt_run nt_t1 test_01_proto
+failed = add failed nt_run nt_t2 test_02_arp_cache
+failed = add failed nt_run nt_t3 test_03_boot_report
+failed = add failed nt_run nt_t4 test_04_vpci_caps
+failed = add failed nt_run nt_t5 test_05_virtio_net
+if ne failed 0
+ret 1
+end
+ret 0
+end

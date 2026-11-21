@@ -1,0 +1,189 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/mm/heap.om: Pure-Omega First-Fit Kernel Heap over a Contiguous Region.
+note Converted from upstream aienux native/kernel/mm/heap.h and native/kernel/mm/heap.c.
+note Blocks carry a 16-byte header (u64 size, u32 magic, u32 pad); payloads are 16-byte aligned
+note and zeroed on allocation; free validates by walking from offset 0 and coalesces neighbors.
+
+note Shared kernel runtime structs (declared before first fn per OM-2 rule)
+struct ProbeState insn ulong fixup ulong esr ulong far ulong armed uint end
+
+struct TimerState ticks ulong last ulong tmin ulong tmax ulong freq_hz ulong end
+
+struct LcArg off ulong alen ulong end
+
+struct PipeRet err uint val ulong val2 ulong end
+
+const KHEAP_HDR ulong 16
+const KHEAP_MIN_BLK ulong 32
+const KHEAP_MAGIC_USED uint 0xa1e05ed0
+const KHEAP_MAGIC_FREE uint 0xa1e0f4ee
+const KHEAP_NONE ulong 0xffffffffffffffff
+
+const KHEAP_OK int 0
+const KHEAP_ERR int -1
+
+fn kh_rd32 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = uint get buf add off 1
+b2 = uint get buf add off 2
+b3 = uint get buf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn kh_rd64 buf view uchar * off ulong to ulong
+lo = ulong kh_rd32 buf off
+hi = ulong kh_rd32 buf add off 4
+ret or lo shl hi 32
+end
+
+fn kh_wr32 buf edit uchar * off ulong v uint to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn kh_wr64 buf edit uchar * off ulong v ulong to void
+kh_wr32 buf off uint and v 0xffffffff
+kh_wr32 buf add off 4 uint and shr v 32 0xffffffff
+end
+
+fn kheap_init buf edit uchar * size ulong to int
+if or gt size len buf lt size KHEAP_MIN_BLK
+ret KHEAP_ERR
+end
+aligned = and size xor ulong 0xffffffffffffffff 15
+if lt aligned KHEAP_MIN_BLK
+ret KHEAP_ERR
+end
+kh_wr64 buf 0 aligned
+kh_wr32 buf 8 KHEAP_MAGIC_FREE
+kh_wr32 buf 12 0
+ret KHEAP_OK
+end
+
+note Allocates bytes from heap buf of total aligned size; returns payload offset (>0) or 0 on failure.
+fn kheap_alloc buf edit uchar * hsz ulong bytes ulong to ulong
+if or gt hsz len buf gt bytes hsz
+ret 0
+end
+aligned_b = and add bytes 15 xor ulong 0xffffffffffffffff 15
+need = add aligned_b KHEAP_HDR
+if lt need KHEAP_MIN_BLK
+need = KHEAP_MIN_BLK
+end
+off = ulong 0
+while lt off hsz bound 4096
+bsz = kh_rd64 buf off
+bmag = kh_rd32 buf add off 8
+if eq bsz 0
+ret 0
+end
+if and eq bmag KHEAP_MAGIC_FREE ge bsz need
+if ge sub bsz need KHEAP_MIN_BLK
+roff = add off need
+kh_wr64 buf roff sub bsz need
+kh_wr32 buf add roff 8 KHEAP_MAGIC_FREE
+kh_wr32 buf add roff 12 0
+bsz = need
+kh_wr64 buf off bsz
+end
+kh_wr32 buf add off 8 KHEAP_MAGIC_USED
+poff = add off KHEAP_HDR
+plen = sub bsz KHEAP_HDR
+i = ulong 0
+while lt i plen bound 65536
+put buf add poff i 0
+i = add i 1
+end
+ret poff
+end
+off = add off bsz
+end
+ret 0
+end
+
+note Frees payload offset poff by walking from offset 0 (forged/double-free/corrupt -> KHEAP_ERR).
+fn kheap_free buf edit uchar * hsz ulong poff ulong to int
+if or gt hsz len buf or lt poff KHEAP_HDR or ge poff hsz ne and poff 15 0
+ret KHEAP_ERR
+end
+prev = KHEAP_NONE
+off = ulong 0
+while lt off hsz bound 4096
+bsz = kh_rd64 buf off
+if eq bsz 0
+ret KHEAP_ERR
+end
+if eq add off KHEAP_HDR poff
+bmag = kh_rd32 buf add off 8
+if ne bmag KHEAP_MAGIC_USED
+ret KHEAP_ERR
+end
+kh_wr32 buf add off 8 KHEAP_MAGIC_FREE
+nxt = add off bsz
+if lt nxt hsz
+if eq kh_rd32 buf add nxt 8 KHEAP_MAGIC_FREE
+bsz = add bsz kh_rd64 buf nxt
+kh_wr64 buf off bsz
+end
+end
+if ne prev KHEAP_NONE
+if eq kh_rd32 buf add prev 8 KHEAP_MAGIC_FREE
+psz = add kh_rd64 buf prev bsz
+kh_wr64 buf prev psz
+end
+end
+ret KHEAP_OK
+end
+prev = off
+off = add off bsz
+end
+ret KHEAP_ERR
+end
+
+fn kheap_free_bytes buf view uchar * hsz ulong to ulong
+if gt hsz len buf
+ret 0
+end
+total = ulong 0
+off = ulong 0
+while lt off hsz bound 4096
+bsz = kh_rd64 buf off
+if eq bsz 0
+break
+end
+if eq kh_rd32 buf add off 8 KHEAP_MAGIC_FREE
+if gt bsz KHEAP_HDR
+total = add total sub bsz KHEAP_HDR
+end
+end
+off = add off bsz
+end
+ret total
+end
+
+fn kheap_check buf view uchar * hsz ulong to int
+if gt hsz len buf
+ret KHEAP_ERR
+end
+off = ulong 0
+while lt off hsz bound 4096
+bsz = kh_rd64 buf off
+bmag = kh_rd32 buf add off 8
+if or lt bsz KHEAP_MIN_BLK ne and bsz 15 0
+ret KHEAP_ERR
+end
+if and ne bmag KHEAP_MAGIC_USED ne bmag KHEAP_MAGIC_FREE
+ret KHEAP_ERR
+end
+if gt add off bsz hsz
+ret KHEAP_ERR
+end
+off = add off bsz
+end
+if eq off hsz
+ret KHEAP_OK
+end
+ret KHEAP_ERR
+end

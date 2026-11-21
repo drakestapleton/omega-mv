@@ -1,0 +1,926 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/disk_sdhci.om: Pure-Omega Freestanding Polled PIO SDHCI Driver + Software Controller Model.
+note Converted from upstream aienux native/disk/disk_sdhci.{h,c} and native/disk/qemu/{payload.c,sdhci_payload.c,start.S}.
+note Compose with: si/directives/om2.om aienux/disk/disk.om aienux/disk/disk_file.om aienux/disk/disk_sdhci.om <test.om>
+
+note SDHCI error codes matching disk_sdhci.h
+const SDHCI_OK int 0
+const SDHCI_EARG int -20
+const SDHCI_EVER int -21
+const SDHCI_ERESET int -22
+const SDHCI_ENOCARD int -23
+const SDHCI_EVOLT int -24
+const SDHCI_ECLOCK int -25
+const SDHCI_ECARD int -26
+const SDHCI_ETIMEOUT int -27
+const SDHCI_ECSD int -28
+const SDHCI_ECMD int -29
+const SDHCI_EDATA int -30
+const SDHCI_ESTATUS int -31
+const SDHCI_ESTATE int -32
+
+note SDHCI register offsets
+const SDHCI_R_BLOCK uint 0x04
+const SDHCI_R_ARG uint 0x08
+const SDHCI_R_CMD uint 0x0c
+const SDHCI_R_RESP0 uint 0x10
+const SDHCI_R_RESP1 uint 0x14
+const SDHCI_R_RESP2 uint 0x18
+const SDHCI_R_RESP3 uint 0x1c
+const SDHCI_R_BUF uint 0x20
+const SDHCI_R_PRESENT uint 0x24
+const SDHCI_R_HOST uint 0x28
+const SDHCI_R_CLOCK uint 0x2c
+const SDHCI_R_INT uint 0x30
+const SDHCI_R_INT_EN uint 0x34
+const SDHCI_R_SIG_EN uint 0x38
+const SDHCI_R_CAP uint 0x40
+const SDHCI_R_VERSION uint 0xfc
+
+note QEMU virt PCIe ECAM / MMIO constants (from qemu/sdhci_payload.c, payload.c)
+const SDHCI_QEMU_UART ulong 0x09000000
+const SDHCI_QEMU_ECAM ulong 0x3f000000
+const SDHCI_QEMU_MMIO ulong 0x10000000
+const SDHCI_PCI_CLASS_SDHCI uint 0x0805
+const SDHCI_PCI_CLASS_NVME uint 0x010802
+
+note PRESENT_STATE bits
+const SD_PS_CMD_INHIBIT uint 0x00000001
+const SD_PS_DATA_INHIBIT uint 0x00000002
+const SD_PS_CARD_PRESENT uint 0x00010000
+
+note INT_STATUS bits
+const SD_INT_CMD_DONE uint 0x00000001
+const SD_INT_XFER_DONE uint 0x00000002
+const SD_INT_BUF_WR uint 0x00000010
+const SD_INT_BUF_RD uint 0x00000020
+const SD_INT_ERROR uint 0x00008000
+const SD_INT_ERR_MASK uint 0xffff8000
+
+note COMMAND / TRANSFER_MODE bits
+const SD_CMD_RESP_NONE uint 0x00
+const SD_CMD_RESP_LONG uint 0x01
+const SD_CMD_RESP_SHORT uint 0x02
+const SD_CMD_RESP_BUSY uint 0x03
+const SD_CMD_CRC uint 0x08
+const SD_CMD_INDEX uint 0x10
+const SD_CMD_DATA uint 0x20
+
+const SD_TM_BLK_CNT_EN uint 0x02
+const SD_TM_AUTO_CMD12 uint 0x04
+const SD_TM_READ uint 0x10
+const SD_TM_MULTI uint 0x20
+
+note CLOCK / HOST bits
+const SD_CLK_INT_EN uint 0x0001
+const SD_CLK_INT_STABLE uint 0x0002
+const SD_CLK_CARD_EN uint 0x0004
+const SD_RST_ALL uint 0x01000000
+const SD_RST_CMD uint 0x02000000
+const SD_RST_DATA uint 0x04000000
+const SD_HOST_4BIT uint 0x02
+const SD_PWR_330 uint 0x0e00
+const SD_PWR_ON uint 0x0100
+
+note Response kinds
+const SD_R_NONE uint 0
+const SD_R1 uint 1
+const SD_R1B uint 2
+const SD_R2 uint 3
+const SD_R3 uint 4
+const SD_R6 uint 5
+const SD_R7 uint 6
+
+const SD_R1_ERRORS uint 0xfdf98008
+const SD_R1_READY_FOR_DATA uint 0x00000100
+const SD_STATE_TRAN uint 4
+
+note Driver state globals
+note sd_u32: 0=ready, 1=spec, 2=base_hz, 3=card_hz, 4=rca, 5=high_cap, 6=max_blocks, 7=timeout_ms, 8=bus_4bit, 9=last_int
+global sd_u32 uint 10
+note sd_i32: 0=last_cmd, 1=last_err
+global sd_i32 int 2
+global sd_blocks ulong 1
+global sd_cid uint 4
+global sd_csd uint 4
+global sd_resp uint 4
+
+note Software SDHCI controller + 64-block (32 KiB) SDHC card model for host behavioral verification
+const SD_SIM_BLOCKS ulong 64
+global ssim_regs uint 64
+global ssim_mem uchar 32768
+note ssim_st: 0=active, 1=cmd55_next, 2=acmd41_polls, 3=card_present, 4=xfer_dir (1=rd,2=wr), 5=xfer_lba, 6=xfer_rem_words, 7=xfer_word_off, 8=inject_err, 9=inject_r1_err, 10=bad_cmd8, 11=spec_ver, 12=has_3v3, 13=base_mhz, 14=csd_csize
+global ssim_st uint 15
+
+fn sdhci_sim_init num_blocks ulong to void
+for i ulong 64
+put ssim_regs i 0
+end
+for i ulong 32768
+put ssim_mem i 0
+end
+for i ulong 15
+put ssim_st i 0
+end
+put ssim_st 0 1
+put ssim_st 3 1
+put ssim_st 11 2
+put ssim_st 12 1
+put ssim_st 13 50
+csize = uint 0
+if gt num_blocks 1024
+csize = uint sub div num_blocks 1024 1
+end
+put ssim_st 14 csize
+note Version register at 0xfc: spec=2 (3.00) in bits 23:16
+put ssim_regs 63 shl uint 2 16
+note Capabilities at 0x40: bit 24 = 3.3V, bits 15:8 = base_mhz (50)
+put ssim_regs 16 or shl uint 1 24 shl uint 50 8
+note Present state at 0x24: card present
+put ssim_regs 9 SD_PS_CARD_PRESENT
+end
+
+fn sdhci_sim_set_spec spec_ver uint to void
+put ssim_st 11 spec_ver
+put ssim_regs 63 shl spec_ver 16
+end
+
+fn sdhci_sim_set_volt has_3v3 uint to void
+put ssim_st 12 has_3v3
+cap = shl get ssim_st 13 8
+if ne has_3v3 0
+cap = or cap shl uint 1 24
+end
+put ssim_regs 16 cap
+end
+
+fn sdhci_sim_set_card_present pres uint to void
+put ssim_st 3 pres
+if ne pres 0
+put ssim_regs 9 SD_PS_CARD_PRESENT
+else
+put ssim_regs 9 0
+end
+end
+
+fn sdhci_sim_inject_err err_bits uint to void
+put ssim_st 8 err_bits
+end
+
+fn sdhci_sim_inject_r1 r1_bits uint to void
+put ssim_st 9 r1_bits
+end
+
+fn sdhci_sim_set_bad_cmd8 v uint to void
+put ssim_st 10 v
+end
+
+fn ssim_exec_cmd cmd_word uint to void
+idx = and shr cmd_word 24 0x3f
+arg = get ssim_regs 2
+is_app = get ssim_st 1
+put ssim_st 1 0
+inj = get ssim_st 8
+if ne inj 0
+put ssim_st 8 0
+put ssim_regs 12 or SD_INT_ERROR inj
+ret
+end
+r1_base = or shl SD_STATE_TRAN 9 SD_R1_READY_FOR_DATA
+r1_err = get ssim_st 9
+if ne r1_err 0
+put ssim_st 9 0
+r1_base = or r1_base r1_err
+end
+put ssim_regs 4 0
+put ssim_regs 5 0
+put ssim_regs 6 0
+put ssim_regs 7 0
+if eq idx 0
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if eq idx 8
+if ne get ssim_st 10 0
+put ssim_regs 4 0x000
+else
+put ssim_regs 4 arg
+end
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if eq idx 55
+put ssim_st 1 1
+put ssim_regs 4 r1_base
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if and ne is_app 0 eq idx 41
+polls = add get ssim_st 2 1
+put ssim_st 2 polls
+if ge polls 2
+note Ready + CCS (SDHC)
+put ssim_regs 4 0xc0ff8000
+else
+put ssim_regs 4 0x00ff8000
+end
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if eq idx 2
+put ssim_regs 4 0x12345678
+put ssim_regs 5 0x9abcdef0
+put ssim_regs 6 0x11223344
+put ssim_regs 7 0x55667788
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if eq idx 3
+note RCA = 0x1234
+put ssim_regs 4 shl uint 0x1234 16
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if eq idx 9
+note CSD v2.0 (structure=1 at CSD bits 127:126 -> reg bits 119:118 -> resp[3] bits 23:22)
+note C_SIZE at CSD bits 69:48 -> reg bits 61:40 -> resp[1] bits 29:8
+put ssim_regs 7 shl uint 1 22
+put ssim_regs 5 shl and get ssim_st 14 0x3fffff 8
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if eq idx 7
+put ssim_regs 4 r1_base
+put ssim_regs 12 or SD_INT_CMD_DONE SD_INT_XFER_DONE
+ret
+end
+if and ne is_app 0 eq idx 6
+put ssim_regs 4 r1_base
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if or eq idx 13 eq idx 16
+put ssim_regs 4 r1_base
+put ssim_regs 12 SD_INT_CMD_DONE
+ret
+end
+if or eq idx 17 eq idx 18
+nblks = shr get ssim_regs 1 16
+if eq nblks 0
+nblks = uint 1
+end
+put ssim_st 4 1
+put ssim_st 5 arg
+put ssim_st 6 mul nblks 128
+put ssim_st 7 0
+put ssim_regs 4 r1_base
+put ssim_regs 12 or SD_INT_CMD_DONE SD_INT_BUF_RD
+ret
+end
+if or eq idx 24 eq idx 25
+nblks = shr get ssim_regs 1 16
+if eq nblks 0
+nblks = uint 1
+end
+put ssim_st 4 2
+put ssim_st 5 arg
+put ssim_st 6 mul nblks 128
+put ssim_st 7 0
+put ssim_regs 4 r1_base
+put ssim_regs 12 or SD_INT_CMD_DONE SD_INT_BUF_WR
+ret
+end
+put ssim_regs 4 r1_base
+put ssim_regs 12 SD_INT_CMD_DONE
+end
+
+fn sdhci_r32 off uint to uint
+if eq off SDHCI_R_BUF
+if eq get ssim_st 4 1
+lba = ulong get ssim_st 5
+woff = ulong get ssim_st 7
+boff = add mul rem lba SD_SIM_BLOCKS 512 mul woff 4
+v = uint 0
+if lt add boff 3 32768
+b0 = uint get ssim_mem boff
+b1 = shl uint get ssim_mem add boff 1 8
+b2 = shl uint get ssim_mem add boff 2 16
+b3 = shl uint get ssim_mem add boff 3 24
+v = or or b0 b1 or b2 b3
+end
+woff = add woff 1
+put ssim_st 7 uint woff
+remw = get ssim_st 6
+if gt remw 0
+remw = sub remw 1
+put ssim_st 6 remw
+end
+if eq remw 0
+put ssim_st 4 0
+put ssim_regs 12 or get ssim_regs 12 SD_INT_XFER_DONE
+else
+if eq rem woff 128 0
+put ssim_regs 12 or get ssim_regs 12 SD_INT_BUF_RD
+end
+end
+ret v
+end
+ret 0
+end
+ridx = ulong shr off 2
+if lt ridx 64
+ret get ssim_regs ridx
+end
+ret 0
+end
+
+fn sdhci_w32 off uint v uint to void
+if eq off SDHCI_R_BUF
+if eq get ssim_st 4 2
+lba = ulong get ssim_st 5
+woff = ulong get ssim_st 7
+boff = add mul rem lba SD_SIM_BLOCKS 512 mul woff 4
+if lt add boff 3 32768
+put ssim_mem boff uchar and v 0xff
+put ssim_mem add boff 1 uchar and shr v 8 0xff
+put ssim_mem add boff 2 uchar and shr v 16 0xff
+put ssim_mem add boff 3 uchar and shr v 24 0xff
+end
+woff = add woff 1
+put ssim_st 7 uint woff
+remw = get ssim_st 6
+if gt remw 0
+remw = sub remw 1
+put ssim_st 6 remw
+end
+if eq remw 0
+put ssim_st 4 0
+put ssim_regs 12 or get ssim_regs 12 SD_INT_XFER_DONE
+else
+if eq rem woff 128 0
+put ssim_regs 12 or get ssim_regs 12 SD_INT_BUF_WR
+end
+end
+end
+ret
+end
+if eq off SDHCI_R_INT
+cur = get ssim_regs 12
+put ssim_regs 12 and cur xor v 0xffffffff
+ret
+end
+if eq off SDHCI_R_CLOCK
+nv = and v xor or SD_RST_ALL or SD_RST_CMD SD_RST_DATA 0xffffffff
+if ne and nv SD_CLK_INT_EN 0
+nv = or nv SD_CLK_INT_STABLE
+end
+put ssim_regs 11 nv
+ret
+end
+if eq off SDHCI_R_CMD
+put ssim_regs 3 v
+ssim_exec_cmd v
+ret
+end
+ridx = ulong shr off 2
+if lt ridx 64
+put ssim_regs ridx v
+end
+end
+
+note ---- SDHCI Core Driver Logic (disk_sdhci.c) ----
+
+fn sd_fail cmd int err int to int
+put sd_i32 0 cmd
+put sd_i32 1 err
+ret err
+end
+
+fn sd_wait_reg off uint mask uint want uint ms uint to int
+polls = add mul ms 100 1
+i = uint 0
+while lt i polls bound 200000
+if eq and sdhci_r32 off mask want
+ret 0
+end
+i = add i 1
+end
+ret -1
+end
+
+fn sd_line_reset bits uint to void
+v = sdhci_r32 SDHCI_R_CLOCK
+all_rst = or SD_RST_ALL or SD_RST_CMD SD_RST_DATA
+if ne and v all_rst 0
+w1 = sd_wait_reg SDHCI_R_CLOCK all_rst 0 100
+end
+v = and sdhci_r32 SDHCI_R_CLOCK 0x00ffffff
+sdhci_w32 SDHCI_R_CLOCK or v bits
+w2 = sd_wait_reg SDHCI_R_CLOCK bits 0 100
+end
+
+fn sd_wait_int mask uint ms uint to int
+polls = add mul ms 100 1
+i = uint 0
+while lt i polls bound 200000
+s = sdhci_r32 SDHCI_R_INT
+put sd_u32 9 s
+if ne and s or SD_INT_ERROR SD_INT_ERR_MASK 0
+ret -1
+end
+if ne and s mask 0
+sdhci_w32 SDHCI_R_INT and s mask
+ret 0
+end
+i = add i 1
+end
+put sd_u32 9 sdhci_r32 SDHCI_R_INT
+ret -2
+end
+
+fn sd_cmd_flags kind uint to uint
+if or eq kind SD_R1 or eq kind SD_R6 eq kind SD_R7
+ret or SD_CMD_RESP_SHORT or SD_CMD_CRC SD_CMD_INDEX
+end
+if eq kind SD_R1B
+ret or SD_CMD_RESP_BUSY or SD_CMD_CRC SD_CMD_INDEX
+end
+if eq kind SD_R2
+ret or SD_CMD_RESP_LONG SD_CMD_CRC
+end
+if eq kind SD_R3
+ret SD_CMD_RESP_SHORT
+end
+ret SD_CMD_RESP_NONE
+end
+
+fn sd_command idx uint arg uint kind uint tmode uint nblocks uint to int
+ms = get sd_u32 7
+inhibit = SD_PS_CMD_INHIBIT
+if or ne nblocks 0 eq kind SD_R1B
+inhibit = or inhibit SD_PS_DATA_INHIBIT
+end
+if ne sd_wait_reg SDHCI_R_PRESENT inhibit 0 ms 0
+ret sd_fail int idx SDHCI_ETIMEOUT
+end
+sdhci_w32 SDHCI_R_INT 0xffffffff
+if ne nblocks 0
+sdhci_w32 SDHCI_R_BLOCK or 512 shl nblocks 16
+end
+sdhci_w32 SDHCI_R_ARG arg
+f = sd_cmd_flags kind
+if ne nblocks 0
+f = or f SD_CMD_DATA
+end
+sdhci_w32 SDHCI_R_CMD or shl or shl idx 8 f 16 tmode
+w = sd_wait_int SD_INT_CMD_DONE ms
+if ne w 0
+sd_line_reset or SD_RST_CMD SD_RST_DATA
+if eq w -2
+ret sd_fail int idx SDHCI_ETIMEOUT
+end
+ret sd_fail int idx SDHCI_ECMD
+end
+put sd_resp 0 sdhci_r32 SDHCI_R_RESP0
+if eq kind SD_R2
+put sd_resp 1 sdhci_r32 SDHCI_R_RESP1
+put sd_resp 2 sdhci_r32 SDHCI_R_RESP2
+put sd_resp 3 sdhci_r32 SDHCI_R_RESP3
+end
+if eq kind SD_R1B
+if ne sd_wait_int SD_INT_XFER_DONE ms 0
+sd_line_reset or SD_RST_CMD SD_RST_DATA
+ret sd_fail int idx SDHCI_ETIMEOUT
+end
+end
+if or eq kind SD_R1 eq kind SD_R1B
+if ne and get sd_resp 0 SD_R1_ERRORS 0
+ret sd_fail int idx SDHCI_ESTATUS
+end
+end
+ret SDHCI_OK
+end
+
+fn sd_app_cmd idx uint arg uint kind uint to int
+rc = sd_command 55 shl get sd_u32 4 16 SD_R1 0 0
+if ne rc SDHCI_OK
+ret rc
+end
+ret sd_command idx arg kind 0 0
+end
+
+fn sd_set_clock hz uint to int
+base = get sd_u32 2
+spec = get sd_u32 1
+divf = uint 0
+actual = uint 0
+if ge spec 2
+n = uint 0
+if gt base hz
+denom = mul 2 hz
+n = div sub add base denom 1 denom
+end
+if gt n 0x3ff
+ret SDHCI_ECLOCK
+end
+if ne n 0
+actual = div base mul 2 n
+else
+actual = base
+end
+divf = or shl and n 0xff 8 shl and shr n 8 0x3 6
+else
+dv = uint 1
+while and lt dv 256 gt div base dv hz bound 16
+dv = mul dv 2
+end
+if gt div base dv hz
+ret SDHCI_ECLOCK
+end
+actual = div base dv
+divf = shl div dv 2 8
+end
+v = and sdhci_r32 SDHCI_R_CLOCK 0xffff0000
+sdhci_w32 SDHCI_R_CLOCK v
+sdhci_w32 SDHCI_R_CLOCK or or v divf SD_CLK_INT_EN
+if ne sd_wait_reg SDHCI_R_CLOCK SD_CLK_INT_STABLE SD_CLK_INT_STABLE 100 0
+ret SDHCI_ECLOCK
+end
+sdhci_w32 SDHCI_R_CLOCK or or or v divf SD_CLK_INT_EN SD_CLK_CARD_EN
+put sd_u32 3 actual
+ret SDHCI_OK
+end
+
+fn sd_csd_bits hi uint lo uint to uint
+rhi = sub hi 8
+rlo = sub lo 8
+v = uint 0
+b = add rhi 1
+while gt b rlo bound 128
+b = sub b 1
+word = get sd_csd ulong div b 32
+bit = and shr word rem b 32 1
+v = or shl v 1 bit
+end
+ret v
+end
+
+fn sd_card_status to int
+rc = sd_command 13 shl get sd_u32 4 16 SD_R1 0 0
+ret rc
+end
+
+fn sd_wait_tran to int
+ms = get sd_u32 7
+i = uint 0
+while le i ms bound 10000
+rc = sd_card_status
+if ne rc SDHCI_OK
+ret rc
+end
+st = get sd_resp 0
+if and ne and st SD_R1_READY_FOR_DATA 0 eq and shr st 9 0xf SD_STATE_TRAN
+ret SDHCI_OK
+end
+i = add i 1
+end
+ret sd_fail 13 SDHCI_ETIMEOUT
+end
+
+fn sdhci_init_card dev edit DiskDev base_hz uint timeout_ms uint bus_4bit uint max_blocks uint to int
+for i ulong 10
+put sd_u32 i 0
+end
+put sd_i32 0 -1
+put sd_i32 1 0
+put sd_blocks 0 0
+tms = timeout_ms
+if eq tms 0
+tms = uint 1000
+end
+mb = max_blocks
+if eq mb 0
+mb = uint 128
+end
+if gt mb 65535
+ret sd_fail -1 SDHCI_EARG
+end
+put sd_u32 7 tms
+put sd_u32 6 mb
+put sd_u32 8 bus_4bit
+spec = and shr sdhci_r32 SDHCI_R_VERSION 16 0xff
+put sd_u32 1 spec
+if lt spec 1
+ret sd_fail -1 SDHCI_EVER
+end
+sdhci_w32 SDHCI_R_CLOCK or and sdhci_r32 SDHCI_R_CLOCK 0x00ffffff SD_RST_ALL
+if ne sd_wait_reg SDHCI_R_CLOCK SD_RST_ALL 0 100 0
+ret sd_fail -1 SDHCI_ERESET
+end
+cap = sdhci_r32 SDHCI_R_CAP
+if eq and cap shl uint 1 24 0
+ret sd_fail -1 SDHCI_EVOLT
+end
+bhz = base_hz
+if eq bhz 0
+cmask = uint 0x3f
+if ge spec 2
+cmask = uint 0xff
+end
+bhz = mul and shr cap 8 cmask 1000000
+end
+put sd_u32 2 bhz
+if eq bhz 0
+ret sd_fail -1 SDHCI_ECLOCK
+end
+ret sdhci_init_post dev
+end
+
+fn sdhci_setup_power_clock to int
+host = and sdhci_r32 SDHCI_R_HOST 0xffff0000
+sdhci_w32 SDHCI_R_HOST or host SD_PWR_330
+sdhci_w32 SDHCI_R_HOST or or host SD_PWR_330 SD_PWR_ON
+if ne sd_wait_reg SDHCI_R_PRESENT SD_PS_CARD_PRESENT SD_PS_CARD_PRESENT 100 0
+ret sd_fail -1 SDHCI_ENOCARD
+end
+ien = or SD_INT_ERR_MASK SD_INT_BUF_RD
+ien = or ien SD_INT_BUF_WR
+ien = or ien or SD_INT_XFER_DONE SD_INT_CMD_DONE
+sdhci_w32 SDHCI_R_INT_EN ien
+sdhci_w32 SDHCI_R_SIG_EN 0
+clk = and sdhci_r32 SDHCI_R_CLOCK 0x0000ffff
+sdhci_w32 SDHCI_R_CLOCK or clk shl uint 0x0e 16
+if ne sd_set_clock 400000 SDHCI_OK
+ret sd_fail -1 SDHCI_ECLOCK
+end
+ret SDHCI_OK
+end
+
+fn sdhci_init_post dev edit DiskDev to int
+rc = sdhci_setup_power_clock
+if ne rc SDHCI_OK
+ret rc
+end
+rc = sd_command 0 0 SD_R_NONE 0 0
+if ne rc SDHCI_OK
+ret rc
+end
+rc = sd_command 8 0x1aa SD_R7 0 0
+if or ne rc SDHCI_OK ne and get sd_resp 0 0xfff 0x1aa
+ret sd_fail 8 SDHCI_ECARD
+end
+ret sdhci_init_identify dev
+end
+
+fn sdhci_init_identify dev edit DiskDev to int
+ready_ocr = false
+i = uint 0
+while le i 100 bound 128
+rc = sd_app_cmd 41 0x40ff8000 SD_R3
+if ne rc SDHCI_OK
+ret rc
+end
+if ne and get sd_resp 0 0x80000000 0
+ready_ocr = true
+break
+end
+i = add i 1
+end
+if not ready_ocr
+ret sd_fail 41 SDHCI_ETIMEOUT
+end
+put sd_u32 5 and shr get sd_resp 0 30 1
+rc = sd_command 2 0 SD_R2 0 0
+if ne rc SDHCI_OK
+ret rc
+end
+for k ulong 4
+put sd_cid k get sd_resp k
+end
+rc = sd_command 3 0 SD_R6 0 0
+if ne rc SDHCI_OK
+ret rc
+end
+put sd_u32 4 shr get sd_resp 0 16
+rc = sd_command 9 shl get sd_u32 4 16 SD_R2 0 0
+if ne rc SDHCI_OK
+ret rc
+end
+for k ulong 4
+put sd_csd k get sd_resp k
+end
+struct_v = sd_csd_bits 127 126
+blks = ulong 0
+if eq struct_v 1
+csize = ulong sd_csd_bits 69 48
+blks = mul add csize 1 1024
+else
+if and eq struct_v 0 eq get sd_u32 5 0
+csize0 = ulong sd_csd_bits 73 62
+cmult = sd_csd_bits 49 47
+rblen = sd_csd_bits 83 80
+nbytes = shl shl add csize0 1 add cmult 2 rblen
+blks = div nbytes 512
+else
+ret sd_fail 9 SDHCI_ECSD
+end
+end
+if eq blks 0
+ret sd_fail 9 SDHCI_ECSD
+end
+put sd_blocks 0 blks
+if ne sd_set_clock 25000000 SDHCI_OK
+ret sd_fail -1 SDHCI_ECLOCK
+end
+rc = sd_command 7 shl get sd_u32 4 16 SD_R1B 0 0
+if ne rc SDHCI_OK
+ret rc
+end
+if ne get sd_u32 8 0
+rc = sd_app_cmd 6 2 SD_R1
+if ne rc SDHCI_OK
+ret rc
+end
+sdhci_w32 SDHCI_R_HOST or sdhci_r32 SDHCI_R_HOST SD_HOST_4BIT
+end
+if eq get sd_u32 5 0
+rc = sd_command 16 512 SD_R1 0 0
+if ne rc SDHCI_OK
+ret rc
+end
+end
+put dev backend DISK_BACKEND_SDHCI
+put dev block_size 512
+put dev block_count blks
+put dev max_blocks get sd_u32 6
+put sd_u32 0 1
+ret SDHCI_OK
+end
+
+fn sd_read_block buf edit uchar * base ulong to void
+i = ulong 0
+while lt i 512 bound 128
+v = sdhci_r32 SDHCI_R_BUF
+p = add base i
+put buf p uchar and v 0xff
+put buf add p 1 uchar and shr v 8 0xff
+put buf add p 2 uchar and shr v 16 0xff
+put buf add p 3 uchar and shr v 24 0xff
+i = add i 4
+end
+end
+
+fn sd_write_block buf view uchar * base ulong to void
+i = ulong 0
+while lt i 512 bound 128
+p = add base i
+b0 = uint get buf p
+b1 = shl uint get buf add p 1 8
+b2 = shl uint get buf add p 2 16
+b3 = shl uint get buf add p 3 24
+sdhci_w32 SDHCI_R_BUF or or b0 b1 or b2 b3
+i = add i 4
+end
+end
+
+fn sdhci_read lba ulong cnt uint buf edit uchar * off ulong to int
+if or eq cnt 0 gt cnt get sd_u32 6
+ret DISK_EARG
+end
+if eq get sd_u32 0 0
+ret DISK_ESTATE
+end
+blks = get sd_blocks 0
+if or ge lba blks gt ulong cnt sub blks lba
+ret DISK_ERANGE
+end
+addr = lba
+if eq get sd_u32 5 0
+addr = mul lba 512
+end
+if gt addr 0xffffffff
+ret DISK_ERANGE
+end
+idx = uint 17
+tm = SD_TM_READ
+if gt cnt 1
+idx = uint 18
+tm = or SD_TM_READ or SD_TM_BLK_CNT_EN or SD_TM_MULTI SD_TM_AUTO_CMD12
+end
+rc = sd_command idx uint addr SD_R1 tm cnt
+b = uint 0
+while and eq rc SDHCI_OK lt b cnt bound 65536
+w = sd_wait_int SD_INT_BUF_RD get sd_u32 7
+if ne w 0
+if eq w -2
+rc = sd_fail int idx SDHCI_ETIMEOUT
+else
+rc = sd_fail int idx SDHCI_EDATA
+end
+break
+end
+sd_read_block buf add off mul ulong b 512
+b = add b 1
+end
+if eq rc SDHCI_OK
+w = sd_wait_int SD_INT_XFER_DONE get sd_u32 7
+if ne w 0
+if eq w -2
+rc = sd_fail int idx SDHCI_ETIMEOUT
+else
+rc = sd_fail int idx SDHCI_EDATA
+end
+end
+end
+if ne rc SDHCI_OK
+sd_line_reset or SD_RST_CMD SD_RST_DATA
+put sd_u32 0 0
+ret DISK_EIO
+end
+ret DISK_OK
+end
+
+fn sdhci_write lba ulong cnt uint buf view uchar * off ulong to int
+if or eq cnt 0 gt cnt get sd_u32 6
+ret DISK_EARG
+end
+if eq get sd_u32 0 0
+ret DISK_ESTATE
+end
+blks = get sd_blocks 0
+if or ge lba blks gt ulong cnt sub blks lba
+ret DISK_ERANGE
+end
+addr = lba
+if eq get sd_u32 5 0
+addr = mul lba 512
+end
+if gt addr 0xffffffff
+ret DISK_ERANGE
+end
+idx = uint 24
+tm = uint 0
+if gt cnt 1
+idx = uint 25
+tm = or SD_TM_BLK_CNT_EN or SD_TM_MULTI SD_TM_AUTO_CMD12
+end
+rc = sd_command idx uint addr SD_R1 tm cnt
+b = uint 0
+while and eq rc SDHCI_OK lt b cnt bound 65536
+w = sd_wait_int SD_INT_BUF_WR get sd_u32 7
+if ne w 0
+if eq w -2
+rc = sd_fail int idx SDHCI_ETIMEOUT
+else
+rc = sd_fail int idx SDHCI_EDATA
+end
+break
+end
+sd_write_block buf add off mul ulong b 512
+b = add b 1
+end
+if eq rc SDHCI_OK
+w = sd_wait_int SD_INT_XFER_DONE get sd_u32 7
+if ne w 0
+if eq w -2
+rc = sd_fail int idx SDHCI_ETIMEOUT
+else
+rc = sd_fail int idx SDHCI_EDATA
+end
+end
+end
+if eq rc SDHCI_OK
+rc = sd_wait_tran
+end
+if ne rc SDHCI_OK
+sd_line_reset or SD_RST_CMD SD_RST_DATA
+put sd_u32 0 0
+ret DISK_EIO
+end
+ret DISK_OK
+end
+
+fn sdhci_flush to int
+if eq get sd_u32 0 0
+ret DISK_ESTATE
+end
+rc = sd_card_status
+st = get sd_resp 0
+if or ne rc SDHCI_OK or eq and st SD_R1_READY_FOR_DATA 0 ne and shr st 9 0xf SD_STATE_TRAN
+put sd_u32 0 0
+ret DISK_EIO
+end
+ret DISK_OK
+end
+
+fn sdhci_is_ready to bool
+ret ne get sd_u32 0 0
+end
+
+fn sdhci_last_err to int
+ret get sd_i32 1
+end
+
+fn sdhci_card_hz to uint
+ret get sd_u32 3
+end

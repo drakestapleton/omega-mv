@@ -1,0 +1,426 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/core/runtime_test.om: Pure-Omega behavioral self-test suite for Aienux Kernel
+note Runtime Slice 2 (First-fit Heap, AArch64 Trap/IRQ/Timer, RAM Klog, Lifecycle FSM, Byte Pipes).
+note Compose with: si/directives/om2.om aienux/kernel/mm/heap.om aienux/kernel/arch/trap_irq.om aienux/kernel/core/klog.om aienux/kernel/core/lifecycle.om aienux/kernel/core/pipe.om aienux/kernel/core/runtime_test.om
+
+text r_pass "PASS "
+text r_fail "FAIL "
+text r_nl "\n"
+text r_t01 "kheap_alloc_zero_coalesce_and_check"
+text r_t02 "kheap_double_free_forged_and_oom"
+text r_t03 "arch_exception_probe_fixup_and_fatal"
+text r_t04 "arch_irq_register_dispatch_and_spurious"
+text r_t05 "arch_timer_math_and_m1_window"
+text r_t06 "klog_head_tail_wrap_and_drop_marker"
+text r_t07 "lifecycle_decode_verbs_and_bounds"
+text r_t08 "lifecycle_transitions_lock_serve_quiesce"
+text r_t09 "pipe_create_rw_eof_broken_and_scrub"
+text r_t10 "pipe_dup_cancel_revoke_and_oshf_dispatch"
+text r_sum "KERNEL_RUNTIME_TEST_PASS total=10 failed=0\n"
+text r_fsum "KERNEL_RUNTIME_TEST_FAIL\n"
+
+text r_k1 "HEAD"
+text r_k2 "0123456789"
+text r_kexpect "HEAD\n[klog: 4 bytes dropped]\n456789"
+text r_lc_task "  task   build kernel  "
+text r_lc_prompt "prompt hello"
+text r_lc_reply "world"
+text r_lc_bad "status extra"
+text r_lc_ok_status "status"
+text r_lc_unlock "unlock"
+text r_lc_approve "approve"
+text r_lc_shutdown "shutdown"
+text r_pipe_msg "hello-pipe"
+
+fn rwrite_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn rreport name view uchar * ok bool to uint
+if ok
+w1 = rwrite_all 1 r_pass
+w2 = rwrite_all 1 name
+w3 = rwrite_all 1 r_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = rwrite_all 1 r_fail
+w2 = rwrite_all 1 name
+w3 = rwrite_all 1 r_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn test_01_kheap_basic to bool
+h = new uchar 512 0xaa
+if ne kheap_init h 512 KHEAP_OK
+ret false
+end
+if ne kheap_check h 512 KHEAP_OK
+ret false
+end
+p1 = kheap_alloc h 512 24
+p2 = kheap_alloc h 512 40
+if or eq p1 0 eq p2 0
+ret false
+end
+note Payloads must be 16-byte aligned and zeroed
+if or ne and p1 15 0 ne get h p1 0
+ret false
+end
+if ne kheap_check h 512 KHEAP_OK
+ret false
+end
+note Free both -> coalesces back to single 496-byte free payload
+if ne kheap_free h 512 p1 KHEAP_OK
+ret false
+end
+if ne kheap_free h 512 p2 KHEAP_OK
+ret false
+end
+if ne kheap_free_bytes h 512 496
+ret false
+end
+if ne kheap_check h 512 KHEAP_OK
+ret false
+end
+ret true
+end
+
+fn test_02_kheap_negatives to bool
+h = new uchar 256 0
+if ne kheap_init h 256 KHEAP_OK
+ret false
+end
+p1 = kheap_alloc h 256 32
+if eq p1 0
+ret false
+end
+note Forged pointer refused
+if ne kheap_free h 256 add p1 16 KHEAP_ERR
+ret false
+end
+note Free once succeeds, double-free refused
+if ne kheap_free h 256 p1 KHEAP_OK
+ret false
+end
+if ne kheap_free h 256 p1 KHEAP_ERR
+ret false
+end
+note Over-capacity allocation returns 0
+if ne kheap_alloc h 256 300 0
+ret false
+end
+ret true
+end
+
+fn test_03_arch_exception to bool
+ps = new ProbeState 0 0 0 0 0
+exc_probe_arm ps 0x40001000 0x40001008
+esr_dabt = shl ESR_EC_DABT_CUR 26
+note Armed probe at exact EL1 vector 4 DABT_CUR insn triggers fixup and disarms
+if ne exc_classify 1 VEC_SYNC_EL_SPX esr_dabt 0xdead0000 0x40001000 ps EXC_DISP_PROBE_FIXUP
+ret false
+end
+if or ne get ps armed 0 ne get ps far 0xdead0000
+ret false
+end
+note Second hit while disarmed is fatal
+if ne exc_classify 1 VEC_SYNC_EL_SPX esr_dabt 0xdead0000 0x40001000 ps EXC_DISP_FATAL
+ret false
+end
+note EL0 lower64 sync routes to EXC_DISP_LOWER64
+if ne exc_classify 1 VEC_SYNC_LOWER64 shl ESR_EC_SVC64 26 0 0x1000 ps EXC_DISP_LOWER64
+ret false
+end
+ret true
+end
+
+fn test_04_arch_irq to bool
+irq_table_reset
+note INTID 30 (timer) and >= 1020 refused for registration
+if ne irq_register 30 1 0 IRQ_ERR_BAD
+ret false
+end
+if ne irq_register 1020 1 0 IRQ_ERR_BAD
+ret false
+end
+note Valid registration + duplicate refusal
+if ne irq_register 42 7 0x1234 IRQ_OK
+ret false
+end
+if ne irq_register 42 8 0 IRQ_ERR_DUP
+ret false
+end
+note Dispatch timer (30), registered (42), unhandled (43), spurious (1023)
+if ne irq_dispatch 30 1
+ret false
+end
+if ne irq_dispatch 42 0
+ret false
+end
+if ne irq_dispatch 43 0
+ret false
+end
+if ne irq_dispatch 1023 0
+ret false
+end
+if or ne irq_stat_get 0 1 or ne irq_stat_get 1 1 or ne irq_stat_get 2 1 ne irq_stat_get 3 1
+ret false
+end
+if or ne irq_stat_get 4 7 ne irq_stat_get 5 0x1234
+ret false
+end
+ret true
+end
+
+fn test_05_arch_timer to bool
+note 62.5 MHz counter: 625000 ticks = 10000 us = 10 ms
+if ne timer_counter_to_us 625000 62500000 10000
+ret false
+end
+if ne timer_us_to_ticks 10000 62500000 625000
+ret false
+end
+ts = new TimerState 0 0 0 0 0
+timer_state_init ts 1000000 62500000
+i = ulong 1
+while le i 5 bound 8
+dl = timer_tick_record ts add 1000000 mul i 625000
+if ne dl add 1000000 mul add i 1 625000
+ret false
+end
+i = add i 1
+end
+if not timer_window_ok ts
+ret false
+end
+note Short storm interval (100 ticks < half period 312500) fails M1 window check
+dl2 = timer_tick_record ts add get ts last 100
+if eq dl2 0
+ret false
+end
+if timer_window_ok ts
+ret false
+end
+ret true
+end
+
+fn test_06_klog_wrap to bool
+klog_clear_caps 4 6
+klog_put r_k1
+klog_put r_k2
+if or ne klog_total 14 ne klog_dropped 4
+ret false
+end
+out_b = new uchar 64 0
+nw = klog_read out_b
+if ne nw len r_kexpect
+ret false
+end
+i = ulong 0
+while lt i nw bound 64
+if ne get out_b i get r_kexpect i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn test_07_lifecycle_decode to bool
+arg = new LcArg 0 0
+v = lc_decode r_lc_task arg
+if or ne v LC_V_TASK or ne get arg off 9 ne get arg alen 12
+ret false
+end
+note No-arg verb with trailing arg must be LC_V_INVALID
+if ne lc_decode r_lc_bad arg LC_V_INVALID
+ret false
+end
+if ne lc_decode r_lc_ok_status arg LC_V_STATUS
+ret false
+end
+ret true
+end
+
+fn test_08_lifecycle_fsm to bool
+lc_init
+lc_start false
+note LOCKED refuses task, accepts unlock
+if ne lc_apply LC_V_TASK r_lc_reply LC_R_REFUSED
+ret false
+end
+if ne lc_apply LC_V_UNLOCK r_lc_unlock LC_R_UNLOCK
+ret false
+end
+lc_unlock_done true
+if ne lc_get_cnt LC_C_STATE LC_READY
+ret false
+end
+note Prompt -> generate_done -> SERVE -> approve -> commit_done -> READY
+if ne lc_apply LC_V_PROMPT r_lc_prompt LC_R_GENERATE
+ret false
+end
+lc_generate_done LC_GEN_REPLY r_lc_reply
+if ne lc_get_cnt LC_C_STATE LC_SERVE
+ret false
+end
+if ne lc_apply LC_V_APPROVE r_lc_approve LC_R_COMMIT
+ret false
+end
+lc_commit_done 0
+if or ne lc_get_cnt LC_C_STATE LC_READY ne lc_get_cnt LC_C_APPROVED 1
+ret false
+end
+note Shutdown -> QUIESCE -> STOP refuses further verbs
+if ne lc_apply LC_V_SHUTDOWN r_lc_shutdown LC_R_STOP
+ret false
+end
+lc_stopped
+if ne lc_apply LC_V_STATUS r_lc_ok_status LC_R_REFUSED
+ret false
+end
+ret true
+end
+
+fn test_09_pipe_core to bool
+pipe_pool_init
+rd = new ulong 1 0
+wr = new ulong 1 0
+if ne pipe_create 0 rd wr OSH_E_OK
+ret false
+end
+n = new ulong 1 0
+note Empty read returns WOULD_BLOCK
+rb = new uchar 16 0
+if ne pipe_read 0 get rd 0 rb n OSH_E_WOULD_BLOCK
+ret false
+end
+note Write then read exact bytes
+if ne pipe_write 0 get wr 0 r_pipe_msg n OSH_E_OK
+ret false
+end
+if ne get n 0 10
+ret false
+end
+if ne pipe_read 0 get rd 0 rb n OSH_E_OK
+ret false
+end
+if ne get n 0 10
+ret false
+end
+for i ulong 10
+if ne get rb i get r_pipe_msg i
+ret false
+end
+end
+note Close writer -> read returns EOF (OK, n=0)
+if ne pipe_close 0 get wr 0 OSH_E_OK
+ret false
+end
+if ne pipe_read 0 get rd 0 rb n OSH_E_OK
+ret false
+end
+if ne get n 0 0
+ret false
+end
+note Close reader -> pool becomes empty
+if ne pipe_close 0 get rd 0 OSH_E_OK
+ret false
+end
+if not pipe_pool_empty
+ret false
+end
+ret true
+end
+
+fn test_10_pipe_dup_revoke_dispatch to bool
+pipe_pool_init
+rd = new ulong 1 0
+wr = new ulong 1 0
+rd2 = new ulong 1 0
+if ne pipe_create 0 rd wr OSH_E_OK
+ret false
+end
+note Dup read end to peer table 1 with attenuated READ-only right
+if ne pipe_dup 0 get rd 0 1 PIPE_R_READ rd2 OSH_E_OK
+ret false
+end
+note Cancel read end -> next read returns INTERRUPTED once
+if ne pipe_cancel 0 get rd 0 OSH_E_OK
+ret false
+end
+n = new ulong 1 0
+rb = new uchar 8 0
+if ne pipe_read 1 get rd2 0 rb n OSH_E_INTERRUPTED
+ret false
+end
+note Revoke pipe -> peer read returns REVOKED
+if ne pipe_revoke 0 get wr 0 OSH_E_OK
+ret false
+end
+if ne pipe_read 1 get rd2 0 rb n OSH_E_REVOKED
+ret false
+end
+note User-VA window bounds check (must reject kernel VA >= PIPE_USER_TOP and wrap)
+if not pipe_user_window_ok 0x1000 512 0x1000 0x4000
+ret false
+end
+if pipe_user_window_ok 0xffff000000000000 64 0x1000 0xffff000000001000
+ret false
+end
+note OSHF versioned frame validation
+f = new ulong 4 0
+put f 0 PIPE_FRAME_MAGIC
+put f 1 PIPE_ABI_VERSION
+put f 2 PIPE_OP_CREATE
+put f 3 0
+if ne pipe_dispatch_check f OSH_E_OK
+ret false
+end
+put f 1 99
+if ne pipe_dispatch_check f OSH_E_NOT_SUPPORTED
+ret false
+end
+ret true
+end
+
+fn main to int
+failed = uint 0
+failed = add failed rreport r_t01 test_01_kheap_basic
+failed = add failed rreport r_t02 test_02_kheap_negatives
+failed = add failed rreport r_t03 test_03_arch_exception
+failed = add failed rreport r_t04 test_04_arch_irq
+failed = add failed rreport r_t05 test_05_arch_timer
+failed = add failed rreport r_t06 test_06_klog_wrap
+failed = add failed rreport r_t07 test_07_lifecycle_decode
+failed = add failed rreport r_t08 test_08_lifecycle_fsm
+failed = add failed rreport r_t09 test_09_pipe_core
+failed = add failed rreport r_t10 test_10_pipe_dup_revoke_dispatch
+if eq failed 0
+w = rwrite_all 1 r_sum
+if w
+ret 0
+end
+ret 1
+end
+w = rwrite_all 1 r_fsum
+if w
+ret 1
+end
+ret 1
+end

@@ -1,0 +1,564 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-anchor/anchor.om: Pure-Omega AIENOS Anchor log.
+note Converted from aienux crates/aienos-anchor/src/lib.rs.
+note Append-only, hash-chained, authenticated log of checked facts.
+note Compose with: si/directives/om2.om om/tls/sha2.om aienux/crates/aienos-anchor/anchor.om ...
+
+const ANCHOR_MAX_KEY ulong 64
+const ANCHOR_MAX_VAL ulong 128
+const ANCHOR_MAX_SRC ulong 64
+const ANCHOR_MAX_ENTRIES ulong 16
+const ANCHOR_MAX_TRUSTED ulong 4
+const ANCHOR_MAX_WIRE ulong 512
+
+const ANCHOR_KIND_ADMIT uchar 1
+const ANCHOR_KIND_RETRACT uchar 2
+
+const ANCHOR_OK int 0
+const ANCHOR_ERR_MALFORMED int -1
+const ANCHOR_ERR_TOO_LARGE int -2
+const ANCHOR_ERR_OUT_OF_ORDER int -3
+const ANCHOR_ERR_BROKEN_CHAIN int -4
+const ANCHOR_ERR_UNTRUSTED int -5
+const ANCHOR_ERR_BAD_SIG int -6
+const ANCHOR_ERR_RETRACT_UNKNOWN int -7
+const ANCHOR_ERR_RETRACT_VALUE int -8
+const ANCHOR_ERR_CAPACITY int -9
+
+const ANCHOR_ANS_UNKNOWN int 0
+const ANCHOR_ANS_KNOWN int 1
+const ANCHOR_ANS_RETRACTED int 2
+
+text anchor_domain "AIENOS-ANCHOR-v0"
+
+global anchor_trusted uchar 128
+global anchor_trusted_cnt ulong 1
+global anchor_head uchar 32
+global anchor_cnt ulong 1
+
+global anchor_e_seq ulong 16
+global anchor_e_prev uchar 512
+global anchor_e_kind uchar 16
+global anchor_e_ts ulong 16
+global anchor_e_klen ulong 16
+global anchor_e_key uchar 1024
+global anchor_e_vlen ulong 16
+global anchor_e_val uchar 2048
+global anchor_e_slen ulong 16
+global anchor_e_src uchar 1024
+global anchor_e_signer uchar 512
+global anchor_e_sig uchar 1024
+
+note Staging slot for candidate entry construction and decoding
+global anchor_st_seq ulong 1
+global anchor_st_prev uchar 32
+global anchor_st_kind uchar 1
+global anchor_st_ts ulong 1
+global anchor_st_klen ulong 1
+global anchor_st_key uchar 64
+global anchor_st_vlen ulong 1
+global anchor_st_val uchar 128
+global anchor_st_slen ulong 1
+global anchor_st_src uchar 64
+global anchor_st_signer uchar 32
+global anchor_st_sig uchar 64
+
+note Query result metadata: 0=ans_kind, 1=entry_idx, 2=seq
+global anchor_q_res ulong 3
+
+fn anchor_put_u16_le buf edit uchar * off ulong v ulong to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+end
+
+fn anchor_put_u32_le buf edit uchar * off ulong v ulong to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn anchor_put_u64_le buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul i 8
+put buf add off i uchar and shr v sh 0xff
+end
+end
+
+fn anchor_get_u16_le buf view uchar * off ulong to ulong
+b0 = ulong get buf off
+b1 = ulong get buf add off 1
+ret or b0 shl b1 8
+end
+
+fn anchor_get_u32_le buf view uchar * off ulong to ulong
+b0 = ulong get buf off
+b1 = ulong get buf add off 1
+b2 = ulong get buf add off 2
+b3 = ulong get buf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn anchor_get_u64_le buf view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 8
+b = ulong get buf add off i
+acc = or acc shl b mul i 8
+end
+ret acc
+end
+
+fn anchor_init to void
+put anchor_trusted_cnt 0 0
+put anchor_cnt 0 0
+for i ulong 32
+put anchor_head i 0
+end
+end
+
+fn anchor_add_trusted key view uchar * to int
+if ne len key 32
+ret ANCHOR_ERR_MALFORMED
+end
+cnt = get anchor_trusted_cnt 0
+if ge cnt ANCHOR_MAX_TRUSTED
+ret ANCHOR_ERR_CAPACITY
+end
+base = mul cnt 32
+for i ulong 32
+put anchor_trusted add base i get key i
+end
+put anchor_trusted_cnt 0 add cnt 1
+ret ANCHOR_OK
+end
+
+fn anchor_is_trusted_staged to bool
+cnt = get anchor_trusted_cnt 0
+for t ulong cnt bound 4
+base = mul t 32
+same = true
+for i ulong 32
+if ne get anchor_trusted add base i get anchor_st_signer i
+same = false
+end
+end
+if same
+ret true
+end
+end
+ret false
+end
+
+fn anchor_stage_hdr seq ulong kind uchar ts ulong to void
+put anchor_st_seq 0 seq
+for i ulong 32
+put anchor_st_prev i get anchor_head i
+end
+put anchor_st_kind 0 kind
+put anchor_st_ts 0 ts
+put anchor_st_slen 0 0
+end
+
+fn anchor_stage_kv k view uchar * v view uchar * to int
+if or eq len k 0 gt len k ANCHOR_MAX_KEY
+ret ANCHOR_ERR_TOO_LARGE
+end
+if gt len v ANCHOR_MAX_VAL
+ret ANCHOR_ERR_TOO_LARGE
+end
+put anchor_st_klen 0 len k
+for i ulong len k bound 64
+put anchor_st_key i get k i
+end
+put anchor_st_vlen 0 len v
+for i ulong len v bound 128
+put anchor_st_val i get v i
+end
+ret ANCHOR_OK
+end
+
+fn anchor_stage_source src view uchar * to int
+if gt len src ANCHOR_MAX_SRC
+ret ANCHOR_ERR_TOO_LARGE
+end
+put anchor_st_slen 0 len src
+for i ulong len src bound 64
+put anchor_st_src i get src i
+end
+ret ANCHOR_OK
+end
+
+fn anchor_stage_prev prev view uchar * to void
+for i ulong 32
+put anchor_st_prev i get prev i
+end
+end
+
+fn anchor_stage_signer signer view uchar * to void
+for i ulong 32
+put anchor_st_signer i get signer i
+end
+end
+
+fn anchor_encode_staged_body buf edit uchar * to ulong
+for i ulong 16
+put buf i get anchor_domain i
+end
+anchor_put_u64_le buf 16 get anchor_st_seq 0
+for i ulong 32
+put buf add 24 i get anchor_st_prev i
+end
+put buf 56 get anchor_st_kind 0
+anchor_put_u64_le buf 57 get anchor_st_ts 0
+pos = ulong 65
+kl = get anchor_st_klen 0
+anchor_put_u16_le buf pos kl
+pos = add pos 2
+for i ulong kl bound 64
+put buf add pos i get anchor_st_key i
+end
+pos = add pos kl
+vl = get anchor_st_vlen 0
+anchor_put_u32_le buf pos vl
+pos = add pos 4
+for i ulong vl bound 128
+put buf add pos i get anchor_st_val i
+end
+pos = add pos vl
+sl = get anchor_st_slen 0
+anchor_put_u16_le buf pos sl
+pos = add pos 2
+for i ulong sl bound 64
+put buf add pos i get anchor_st_src i
+end
+pos = add pos sl
+ret pos
+end
+
+fn anchor_compute_sig_staged sig_out edit uchar * to void
+body = new uchar 512 0
+blen = anchor_encode_staged_body body
+ctx = new ulong 40 0
+sha256_init ctx
+skey = new uchar 32 0
+for i ulong 32
+put skey i get anchor_st_signer i
+end
+sha256_update ctx skey
+sha256_update ctx part body 0 blen
+d1 = new uchar 32 0
+sha256_final ctx d1
+for i ulong 32
+put sig_out i get d1 i
+end
+sha256_init ctx
+sha256_update ctx d1
+sha256_update ctx anchor_domain
+d2 = new uchar 32 0
+sha256_final ctx d2
+for i ulong 32
+put sig_out add 32 i get d2 i
+end
+end
+
+fn anchor_sign_staged signer view uchar * to void
+anchor_stage_signer signer
+sig = new uchar 64 0
+anchor_compute_sig_staged sig
+for i ulong 64
+put anchor_st_sig i get sig i
+end
+end
+
+fn anchor_query key view uchar * to int
+cnt = get anchor_cnt 0
+if eq cnt 0
+put anchor_q_res 0 ulong ANCHOR_ANS_UNKNOWN
+put anchor_q_res 1 0
+put anchor_q_res 2 0
+ret ANCHOR_ANS_UNKNOWN
+end
+idx = cnt
+while gt idx 0 bound 16
+idx = sub idx 1
+kl = get anchor_e_klen idx
+if eq kl len key
+base = mul idx ANCHOR_MAX_KEY
+same = true
+for i ulong kl bound 64
+if ne get anchor_e_key add base i get key i
+same = false
+end
+end
+if same
+knd = get anchor_e_kind idx
+put anchor_q_res 1 idx
+put anchor_q_res 2 get anchor_e_seq idx
+if eq knd ANCHOR_KIND_ADMIT
+put anchor_q_res 0 ulong ANCHOR_ANS_KNOWN
+ret ANCHOR_ANS_KNOWN
+end
+put anchor_q_res 0 ulong ANCHOR_ANS_RETRACTED
+ret ANCHOR_ANS_RETRACTED
+end
+end
+end
+put anchor_q_res 0 ulong ANCHOR_ANS_UNKNOWN
+put anchor_q_res 1 0
+put anchor_q_res 2 0
+ret ANCHOR_ANS_UNKNOWN
+end
+
+fn anchor_staged_key_is_known to bool
+kl = get anchor_st_klen 0
+kbuf = new uchar 64 0
+for i ulong kl bound 64
+put kbuf i get anchor_st_key i
+end
+ans = anchor_query part kbuf 0 kl
+ret eq ans ANCHOR_ANS_KNOWN
+end
+
+fn anchor_commit_staged cnt ulong to void
+put anchor_e_seq cnt get anchor_st_seq 0
+pbase = mul cnt 32
+for i ulong 32
+put anchor_e_prev add pbase i get anchor_st_prev i
+end
+put anchor_e_kind cnt get anchor_st_kind 0
+put anchor_e_ts cnt get anchor_st_ts 0
+kl = get anchor_st_klen 0
+put anchor_e_klen cnt kl
+kbase = mul cnt ANCHOR_MAX_KEY
+for i ulong kl bound 64
+put anchor_e_key add kbase i get anchor_st_key i
+end
+vl = get anchor_st_vlen 0
+put anchor_e_vlen cnt vl
+vbase = mul cnt ANCHOR_MAX_VAL
+for i ulong vl bound 128
+put anchor_e_val add vbase i get anchor_st_val i
+end
+sl = get anchor_st_slen 0
+put anchor_e_slen cnt sl
+sbase = mul cnt ANCHOR_MAX_SRC
+for i ulong sl bound 64
+put anchor_e_src add sbase i get anchor_st_src i
+end
+for i ulong 32
+put anchor_e_signer add pbase i get anchor_st_signer i
+end
+sigbase = mul cnt 64
+for i ulong 64
+put anchor_e_sig add sigbase i get anchor_st_sig i
+end
+put anchor_cnt 0 add cnt 1
+end
+
+fn anchor_update_head_staged to int
+wire = new uchar 512 0
+blen = anchor_encode_staged_body wire
+for i ulong 32
+put wire add blen i get anchor_st_signer i
+end
+for i ulong 64
+put wire add add blen 32 i get anchor_st_sig i
+end
+tlen = add blen 96
+dig = new uchar 32 0
+dlen = sha2_digest 256 part wire 0 tlen dig
+if ne dlen 32
+ret ANCHOR_ERR_MALFORMED
+end
+for i ulong 32
+put anchor_head i get dig i
+end
+ret ANCHOR_OK
+end
+
+fn anchor_append_staged to int
+kl = get anchor_st_klen 0
+vl = get anchor_st_vlen 0
+sl = get anchor_st_slen 0
+if or eq kl 0 gt kl ANCHOR_MAX_KEY
+ret ANCHOR_ERR_TOO_LARGE
+end
+if or gt vl ANCHOR_MAX_VAL gt sl ANCHOR_MAX_SRC
+ret ANCHOR_ERR_TOO_LARGE
+end
+knd = get anchor_st_kind 0
+if and ne knd ANCHOR_KIND_ADMIT ne knd ANCHOR_KIND_RETRACT
+ret ANCHOR_ERR_MALFORMED
+end
+if and eq knd ANCHOR_KIND_RETRACT gt vl 0
+ret ANCHOR_ERR_RETRACT_VALUE
+end
+cnt = get anchor_cnt 0
+if ge cnt ANCHOR_MAX_ENTRIES
+ret ANCHOR_ERR_CAPACITY
+end
+if ne get anchor_st_seq 0 cnt
+ret ANCHOR_ERR_OUT_OF_ORDER
+end
+for i ulong 32
+if ne get anchor_st_prev i get anchor_head i
+ret ANCHOR_ERR_BROKEN_CHAIN
+end
+end
+if not anchor_is_trusted_staged
+ret ANCHOR_ERR_UNTRUSTED
+end
+exp_sig = new uchar 64 0
+anchor_compute_sig_staged exp_sig
+for i ulong 64
+if ne get anchor_st_sig i get exp_sig i
+ret ANCHOR_ERR_BAD_SIG
+end
+end
+if eq knd ANCHOR_KIND_RETRACT
+if not anchor_staged_key_is_known
+ret ANCHOR_ERR_RETRACT_UNKNOWN
+end
+end
+rc = anchor_update_head_staged
+if ne rc ANCHOR_OK
+ret rc
+end
+anchor_commit_staged cnt
+ret ANCHOR_OK
+end
+
+fn anchor_append_auth idx ulong buf edit uchar * blen ulong to ulong
+pbase = mul idx 32
+for i ulong 32
+put buf add blen i get anchor_e_signer add pbase i
+end
+sigoff = add blen 32
+sigbase = mul idx 64
+for i ulong 64
+put buf add sigoff i get anchor_e_sig add sigbase i
+end
+ret add blen 96
+end
+
+fn anchor_export_entry idx ulong buf edit uchar * to ulong
+put anchor_st_seq 0 get anchor_e_seq idx
+pbase = mul idx 32
+for i ulong 32
+put anchor_st_prev i get anchor_e_prev add pbase i
+end
+put anchor_st_kind 0 get anchor_e_kind idx
+put anchor_st_ts 0 get anchor_e_ts idx
+kl = get anchor_e_klen idx
+put anchor_st_klen 0 kl
+kbase = mul idx ANCHOR_MAX_KEY
+for i ulong kl bound 64
+put anchor_st_key i get anchor_e_key add kbase i
+end
+vl = get anchor_e_vlen idx
+put anchor_st_vlen 0 vl
+vbase = mul idx ANCHOR_MAX_VAL
+for i ulong vl bound 128
+put anchor_st_val i get anchor_e_val add vbase i
+end
+sl = get anchor_e_slen idx
+put anchor_st_slen 0 sl
+sbase = mul idx ANCHOR_MAX_SRC
+for i ulong sl bound 64
+put anchor_st_src i get anchor_e_src add sbase i
+end
+blen = anchor_encode_staged_body buf
+ret anchor_append_auth idx buf blen
+end
+
+fn anchor_decode_to_staged buf view uchar * off ulong total ulong to long
+if lt sub total off 169
+ret long ANCHOR_ERR_MALFORMED
+end
+for i ulong 16
+if ne get buf add off i get anchor_domain i
+ret long ANCHOR_ERR_MALFORMED
+end
+end
+put anchor_st_seq 0 anchor_get_u64_le buf add off 16
+for i ulong 32
+put anchor_st_prev i get buf add add off 24 i
+end
+knd = get buf add off 56
+if and ne knd ANCHOR_KIND_ADMIT ne knd ANCHOR_KIND_RETRACT
+ret long ANCHOR_ERR_MALFORMED
+end
+put anchor_st_kind 0 knd
+put anchor_st_ts 0 anchor_get_u64_le buf add off 57
+pos = add off 65
+kl = anchor_get_u16_le buf pos
+pos = add pos 2
+if gt kl ANCHOR_MAX_KEY
+ret long ANCHOR_ERR_TOO_LARGE
+end
+if gt add pos kl total
+ret long ANCHOR_ERR_MALFORMED
+end
+put anchor_st_klen 0 kl
+for i ulong kl bound 64
+put anchor_st_key i get buf add pos i
+end
+pos = add pos kl
+if gt add pos 4 total
+ret long ANCHOR_ERR_MALFORMED
+end
+vl = anchor_get_u32_le buf pos
+pos = add pos 4
+if gt vl ANCHOR_MAX_VAL
+ret long ANCHOR_ERR_TOO_LARGE
+end
+if gt add pos vl total
+ret long ANCHOR_ERR_MALFORMED
+end
+put anchor_st_vlen 0 vl
+for i ulong vl bound 128
+put anchor_st_val i get buf add pos i
+end
+pos = add pos vl
+if gt add pos 2 total
+ret long ANCHOR_ERR_MALFORMED
+end
+sl = anchor_get_u16_le buf pos
+pos = add pos 2
+if gt sl ANCHOR_MAX_SRC
+ret long ANCHOR_ERR_TOO_LARGE
+end
+if gt add add pos sl 96 total
+ret long ANCHOR_ERR_MALFORMED
+end
+put anchor_st_slen 0 sl
+for i ulong sl bound 64
+put anchor_st_src i get buf add pos i
+end
+pos = add pos sl
+for i ulong 32
+put anchor_st_signer i get buf add pos i
+end
+pos = add pos 32
+for i ulong 64
+put anchor_st_sig i get buf add pos i
+end
+pos = add pos 64
+ret long sub pos off
+end
+
+fn anchor_replay buf view uchar * total ulong to int
+pos = ulong 0
+while lt pos total bound 16
+used = anchor_decode_to_staged buf pos total
+if lt used 0
+ret int used
+end
+rc = anchor_append_staged
+if ne rc ANCHOR_OK
+ret rc
+end
+pos = add pos ulong used
+end
+ret ANCHOR_OK
+end

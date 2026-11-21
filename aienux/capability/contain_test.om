@@ -1,0 +1,465 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/capability/contain_test.om: Behavioral self-test for AEGIS Containment Gate.
+note Covers invariants I1..I5 from native/capability/tests/contain_test.c.
+note Compose with: si/directives/om2.om aienux/capability/lib.om aienux/capability/contain.om aienux/capability/contain_test.om om/tls/sha2.om
+
+text c_pass "PASS "
+text c_fail "FAIL "
+text c_nl "\n"
+text c_t01 "create_executor_and_duplicate_refused"
+text c_t02 "canonical_request_malformed_and_replay"
+text c_t03 "auto_grant_and_execute_leaf_revoke"
+text c_t04 "non_leaf_escalates_and_protected_denied"
+text c_t05 "human_resolve_secret_and_replay"
+text c_t06 "non_revoke_unavailable_and_budget_window"
+text c_t07 "cascade_scope_exceeded_makes_gate_inert"
+text c_t08 "kill_untrusts_lineage_and_escalates"
+text c_sum "CONTAIN_TEST_PASS total=8 failed=0\n"
+text c_fsum "CONTAIN_TEST_FAIL\n"
+
+fn creport name view uchar * ok bool to uint
+if ok
+w1 = cap_write_all 1 c_pass
+w2 = cap_write_all 1 name
+w3 = cap_write_all 1 c_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = cap_write_all 1 c_fail
+w2 = cap_write_all 1 name
+w3 = cap_write_all 1 c_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn mk_req buf edit uchar 152 rid ulong ctype uchar princ uint cid uint cgen ulong to void
+for i ulong 152
+put buf i 0
+end
+con_put64 buf 0 1
+put buf 8 ctype
+put buf 9 4
+con_put16 buf 10 100
+con_put32 buf 12 princ
+con_put32 buf 16 cid
+con_put64 buf 20 cgen
+con_put64 buf 92 rid
+con_put64 buf 100 rid
+con_put16 buf 148 0
+put buf 150 CON_REQ_VERSION
+put buf 151 0
+end
+
+fn setup_gate off edit CapRef to bool
+if ne cap_start CAP_OK
+ret false
+end
+cap_obs_clear
+cap_set_observer true
+if ne cap_office off CAP_OK
+ret false
+end
+contain_policy_reset
+contain_policy_set CON_REVOKE_CAPABILITY CON_GRANT
+if ne contain_create off CON_OK
+ret false
+end
+ret true
+end
+
+fn mint_ordinary off view CapRef subj uint rgt uint dst edit CapRef to bool
+m = new CapMint 1 subj 500 rgt 0 CAP_PARENT_NONE 0 get off cap_id get off generation
+ret eq cap_mint m dst CAP_OK
+end
+
+fn mint_child par view CapRef subj uint rgt uint dst edit CapRef to bool
+m = new CapMint 2 subj 500 rgt 0 get par cap_id get par generation get par cap_id get par generation
+ret eq cap_mint m dst CAP_OK
+end
+
+fn ct_01_create_and_dup to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+ex = new CapRef 0 0
+if ne contain_executor ex CON_OK
+ret false
+end
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_inspect ex ent CAP_OK
+ret false
+end
+if or ne get ent subject CON_SUBJ ne get ent rights CAP_RIGHT_REVOKE
+ret false
+end
+note Second create on same authority instance must fail with CON_ERR_EXISTS (I5.a)
+if ne contain_create off CON_ERR_EXISTS
+ret false
+end
+if contain_inert
+ret false
+end
+ret true
+end
+
+fn ct_02_malformed_and_replay to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+c1 = new CapRef 0 0
+if not mint_ordinary off 10 CAP_RIGHT_READ c1
+ret false
+end
+rec = new ulong 16 0
+rdig = new uchar 32 0
+note Short buffer denied with WHY_BAD_REQUEST
+shortb = new uchar 16 0
+if ne contain_submit_bytes shortb rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DENY ne get rec CON_REC_WHY ulong CON_WHY_BAD_REQUEST
+ret false
+end
+note Good request succeeds, replay with same request_id is denied
+req = new uchar 152 0
+mk_req req 1 CON_REVOKE_CAPABILITY 10 get c1 cap_id get c1 generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if ne con_rec_status rec CON_GRANT
+ret false
+end
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DENY ne get rec CON_REC_WHY ulong CON_WHY_REPLAYED_REQUEST
+ret false
+end
+note Tampered digest denied with WHY_BAD_REQUEST
+mk_req req 2 CON_REVOKE_CAPABILITY 10 get c1 cap_id get c1 generation
+bad_dig = new uchar 32 0xaa
+if ne contain_submit req bad_dig rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DENY ne get rec CON_REC_WHY ulong CON_WHY_BAD_REQUEST
+ret false
+end
+ret true
+end
+
+fn ct_03_auto_grant_and_execute to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+c1 = new CapRef 0 0
+if not mint_ordinary off 10 CAP_RIGHT_READ c1
+ret false
+end
+req = new uchar 152 0
+mk_req req 1 CON_REVOKE_CAPABILITY 10 get c1 cap_id get c1 generation
+dig = new uchar 32 0
+con_req_digest req dig
+rec = new ulong 16 0
+rdig = new uchar 32 0
+if ne contain_submit req dig rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_GRANT ne get rec CON_REC_WHY ulong CON_WHY_POLICY_GRANT
+ret false
+end
+did = get rec CON_REC_DEC_ID
+if ne contain_execute did rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DONE ne get rec CON_REC_RESOURCE 1
+ret false
+end
+note Capability is now revoked
+ent = new CapEntry 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ne cap_validate c1 10 500 CAP_RIGHT_READ ent CAP_ERR_REVOKED
+ret false
+end
+note Re-executing same decision is refused
+if ne contain_execute did rec rdig CON_ERR_REFUSED
+ret false
+end
+if ne get rec CON_REC_WHY ulong CON_WHY_DECISION_REPLAY
+ret false
+end
+ret true
+end
+
+fn ct_04_non_leaf_and_protected to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+par = new CapRef 0 0
+if not mint_ordinary off 10 or CAP_RIGHT_READ CAP_RIGHT_DELEGATE par
+ret false
+end
+ch = new CapRef 0 0
+if not mint_child par 11 CAP_RIGHT_READ ch
+ret false
+end
+req = new uchar 152 0
+rec = new ulong 16 0
+rdig = new uchar 32 0
+note Non-leaf target must ESCALATE with WHY_NOT_LEAF
+mk_req req 1 CON_REVOKE_CAPABILITY 10 get par cap_id get par generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_ESCALATE ne get rec CON_REC_WHY ulong CON_WHY_NOT_LEAF
+ret false
+end
+note Office cap (protected target) must DENY with WHY_PROTECTED_TARGET
+mk_req req 2 CON_REVOKE_CAPABILITY 0 get off cap_id get off generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DENY ne get rec CON_REC_WHY ulong CON_WHY_PROTECTED_TARGET
+ret false
+end
+note AEGIS subject (41) must DENY with WHY_PROTECTED_TARGET
+mk_req req 3 CON_REVOKE_CAPABILITY CON_SUBJ_AEGIS get ch cap_id get ch generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DENY ne get rec CON_REC_WHY ulong CON_WHY_PROTECTED_TARGET
+ret false
+end
+note Subject mismatch must DENY with WHY_SUBJECT_MISMATCH
+mk_req req 4 CON_REVOKE_CAPABILITY 99 get ch cap_id get ch generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DENY ne get rec CON_REC_WHY ulong CON_WHY_SUBJECT_MISMATCH
+ret false
+end
+ret true
+end
+
+fn ct_05_human_resolve to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+contain_policy_set CON_REVOKE_CAPABILITY CON_ESCALATE
+c1 = new CapRef 0 0
+if not mint_ordinary off 10 CAP_RIGHT_READ c1
+ret false
+end
+req = new uchar 152 0
+rec = new ulong 16 0
+rdig = new uchar 32 0
+mk_req req 1 CON_REVOKE_CAPABILITY 10 get c1 cap_id get c1 generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if ne con_rec_status rec CON_ESCALATE
+ret false
+end
+did = get rec CON_REC_DEC_ID
+note Bad secret refused, decision stays escalated
+bad_sec = new uchar 32 0x55
+if ne contain_resolve did true bad_sec rec rdig CON_ERR_REFUSED
+ret false
+end
+if ne get rec CON_REC_WHY ulong CON_WHY_BAD_SECRET
+ret false
+end
+note Valid office secret approves
+good_sec = new uchar 32 0
+cap_copy_token good_sec
+if ne contain_resolve did true good_sec rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_GRANT ne get rec CON_REC_WHY ulong CON_WHY_HUMAN_GRANT
+ret false
+end
+note Second resolve on already-granted decision refused
+if ne contain_resolve did false good_sec rec rdig CON_ERR_REFUSED
+ret false
+end
+note Execute human-approved grant succeeds and carries RF_HUMAN
+if ne contain_execute did rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_DONE eq and con_rec_gate_flags rec CON_RF_HUMAN 0
+ret false
+end
+ret true
+end
+
+fn ct_06_non_revoke_and_budget to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+contain_policy_set CON_FREEZE_PRINCIPAL CON_GRANT
+req = new uchar 152 0
+rec = new ulong 16 0
+rdig = new uchar 32 0
+note Non-revoke type cannot auto-grant (escalates with WHY_NOT_AUTO_ELIGIBLE)
+mk_req req 1 CON_FREEZE_PRINCIPAL 10 CON_CAP_NONE 0
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_ESCALATE ne get rec CON_REC_WHY ulong CON_WHY_NOT_AUTO_ELIGIBLE
+ret false
+end
+did = get rec CON_REC_DEC_ID
+sec = new uchar 32 0
+cap_copy_token sec
+if ne contain_resolve did true sec rec rdig CON_OK
+ret false
+end
+note Executing non-revoke without seam returns UNAVAILABLE
+if ne contain_execute did rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_UNAVAILABLE ne get rec CON_REC_WHY ulong CON_WHY_NO_EXECUTOR
+ret false
+end
+note Exhaust auto-grant budget (8 grants per 64 decisions)
+rid = ulong 2
+c = new CapRef 0 0
+for i ulong 8
+if not mint_ordinary off 20 CAP_RIGHT_READ c
+ret false
+end
+mk_req req rid CON_REVOKE_CAPABILITY 20 get c cap_id get c generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if ne con_rec_status rec CON_GRANT
+ret false
+end
+rid = add rid 1
+end
+note 9th grant in same window must ESCALATE with WHY_BUDGET
+c9 = new CapRef 0 0
+if not mint_ordinary off 20 CAP_RIGHT_READ c9
+ret false
+end
+mk_req req rid CON_REVOKE_CAPABILITY 20 get c9 cap_id get c9 generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_ESCALATE ne get rec CON_REC_WHY ulong CON_WHY_BUDGET
+ret false
+end
+ret true
+end
+
+fn ct_07_cascade_makes_inert to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+par = new CapRef 0 0
+if not mint_ordinary off 10 or CAP_RIGHT_READ CAP_RIGHT_DELEGATE par
+ret false
+end
+req = new uchar 152 0
+rec = new ulong 16 0
+rdig = new uchar 32 0
+note Grant while par is still a leaf
+mk_req req 1 CON_REVOKE_CAPABILITY 10 get par cap_id get par generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if ne con_rec_status rec CON_GRANT
+ret false
+end
+did = get rec CON_REC_DEC_ID
+note Mint child with observer disabled so lineage shadow does not see it, forcing cascade on revoke!
+cap_set_observer false
+ch = new CapRef 0 0
+if not mint_child par 11 CAP_RIGHT_READ ch
+ret false
+end
+cap_set_observer true
+if ne contain_execute did rec rdig CON_OK
+ret false
+end
+if ne con_rec_status rec CON_FAILED_SCOPE
+ret false
+end
+if not contain_inert
+ret false
+end
+if eq and con_rec_gate_flags rec CON_RF_INERT 0
+ret false
+end
+note Subsequent revoke request must ESCALATE because gate is inert
+c2 = new CapRef 0 0
+if not mint_ordinary off 12 CAP_RIGHT_READ c2
+ret false
+end
+mk_req req 2 CON_REVOKE_CAPABILITY 12 get c2 cap_id get c2 generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_ESCALATE ne get rec CON_REC_WHY ulong CON_WHY_LINEAGE_UNTRUSTED
+ret false
+end
+ret true
+end
+
+fn ct_08_kill_untrusts_lineage to bool
+off = new CapRef 0 0
+if not setup_gate off
+ret false
+end
+c1 = new CapRef 0 0
+if not mint_ordinary off 10 CAP_RIGHT_READ c1
+ret false
+end
+if ne cap_kill CAP_OK
+ret false
+end
+req = new uchar 152 0
+rec = new ulong 16 0
+rdig = new uchar 32 0
+mk_req req 1 CON_REVOKE_CAPABILITY 10 get c1 cap_id get c1 generation
+if ne contain_submit_bytes req rec rdig CON_OK
+ret false
+end
+if or ne con_rec_status rec CON_ESCALATE ne get rec CON_REC_WHY ulong CON_WHY_LINEAGE_UNTRUSTED
+ret false
+end
+ret true
+end
+
+fn main to int
+fails = uint 0
+fails = add fails creport c_t01 ct_01_create_and_dup
+fails = add fails creport c_t02 ct_02_malformed_and_replay
+fails = add fails creport c_t03 ct_03_auto_grant_and_execute
+fails = add fails creport c_t04 ct_04_non_leaf_and_protected
+fails = add fails creport c_t05 ct_05_human_resolve
+fails = add fails creport c_t06 ct_06_non_revoke_and_budget
+fails = add fails creport c_t07 ct_07_cascade_makes_inert
+fails = add fails creport c_t08 ct_08_kill_untrusts_lineage
+if eq fails 0
+w = cap_write_all 1 c_sum
+if w
+ret 0
+end
+ret 1
+end
+w = cap_write_all 1 c_fsum
+if w
+ret 1
+end
+ret 1
+end

@@ -16,18 +16,22 @@ One additional 1-line Omega directive file, `aienux/allen/target-x86efi.om` (`ta
 
 ## The units and their gate
 
-`aienux/units.tsv` lists **78 units** (`NAME` followed by ordered `.om` parts, single spaces):
+`aienux/units.tsv` lists **93 units** (`NAME [@run|@qemu]` followed by ordered `.om` parts, single spaces; 23 behavioral self-test units are tagged `@run`):
 
 - 48 core Aienux units (`tcp_*` 4, `nvme_*` 4, `x86_*` 4, `lm1b` 1, `platform_unit` 1, `spark_image`/`imac_image`/`hwgates` 3, `allen_fw` `target x86efi` + `allen_main` + `allen_provider` + `allen_stdio_overflow` + 27 `allen_test_*` = 31)
 - 19 OS-layer sibling units from `rtl8127-omega` (`rtl8127_probe`, `rtl8127_driver`), `spark-supervisor` (`aien_supervise`, `aien_supervise_root`, `aien_watch`, `supervisor_tests_load`), and `spark-connector` (`connector_signer`, `connector_celldrv`, plus 11 standalone gate/runner units).
-- 6 converted pure-Omega OS-layer units (9 `.om` files): `atlas_main`/`atlas_test` (`aienux/atlas/`), `pi_register_main`/`pi_register_test` (`aienux/pi-register/`), and `debugger_main`/`debugger_test` (`aienux/debugger/`).
-- 5 converted pure-Omega kernel/security units: `capability_test` (`aienux/capability/`), `argus_test` (`aienux/argus/`), `kernel_core_test` (`aienux/kernel/core/`), `kernel_hal_test` (`aienux/kernel/hal/`), and `aegis_test` (`aienux/aegis/`).
+- 6 converted pure-Omega OS-layer units (9 `.om` files): `atlas_main`/`atlas_test` (`@run`, `aienux/atlas/`), `pi_register_main`/`pi_register_test` (`@run`, `aienux/pi-register/`), and `debugger_main`/`debugger_test` (`@run`, `aienux/debugger/`).
+- 20 converted pure-Omega kernel/store/boot/driver/crate units (all `@run`):
+  - Wave 1 (Capability & Store): `capability_test`, `contain_test`, `store_test`, `torn_slot_test`
+  - Wave 2 (Boot & Kernel): `boot_test`, `kernel_core_test`, `kernel_hal_test`, `kernel_runtime_test`, `kernel_arm64_host_test`, `osc_launch_test`
+  - Wave 3 (ARGUS, Disk, Net): `argus_test`, `argus_bridge_test`, `disk_test`, `net_core_test`
+  - Wave 4 (Rust Crates): `aegis_test`, `crate_anchor_test`, `crate_c1_tree_test`, `crate_cap_ffi_test`, `crate_evidence_test`, `crate_store_tool_test`
 
 Remaining non-Omega files from the three OS sibling repos (64 files) are listed in `aienux/NOT-YET-OMEGA-EXTRAS.tsv`; their import records are under `aienux/import/{rtl8127-omega,spark-supervisor,spark-connector}/`.
 
-`aienux/units-gate.om` (`OMEGA-AIENUX-UNITS`) mirrors `gpu/units-gate.om`: it refuses any compiler whose SHA-256 differs from `seed/out/omc.sha256` (exit 69), composes each row in `aienux/units.tsv`, compiles it twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Every hardware row stays `NOT_RUN`.
+`aienux/units-gate.om` (`OMEGA-AIENUX-UNITS`) mirrors `gpu/units-gate.om`: it refuses any compiler whose SHA-256 differs from `seed/out/omc.sha256` (exit 69), composes each row in `aienux/units.tsv`, compiles it twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Units tagged `@run` are executed directly (`run=PASS` / `run=FAIL`, asserting exit 0, counted in `behavior_passed=N/M`). Units tagged `@qemu` are booted under `/usr/bin/qemu-system-aarch64` when present (`qemu=PASS` / `qemu=FAIL`) or reported `qemu=NOT_RUN` when QEMU is absent so host-only runs stay honest. Every hardware row stays `hardware=NOT_RUN`.
 
-This gate verifies deterministic compilation with `seed/out/omc`. It does not run QEMU, boot firmware, or execute the behavioral oracles that still live in Aienux as C, Rust, shell, or Python.
+This gate verifies deterministic compilation with `seed/out/omc` and host behavioral self-tests for `@run` units (plus optional QEMU emulation for `@qemu` units); host and QEMU passes are never hardware qualification.
 
 ## Not here yet
 

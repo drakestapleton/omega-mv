@@ -1,0 +1,569 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/boot/slot.om: Pure-Omega AIENOS A/B Native Image Slots (manifest, control record,
+note selection state machine, transitions, boot record SHA-256 seal/check, and kernel slot action).
+note Converted from upstream aienux native/boot/slot_format.h and native/boot/slot_select.c.
+
+const SLOT_UNIT ulong 4096
+const SLOT_CONTROL_UNITS ulong 4
+const SLOT_FIRST_UNIT ulong 4
+const SLOT_COUNT ulong 2
+const SLOT_NONE uchar 0xff
+const SLOT_MAX_TRIES uchar 3
+const SLOT_MIN_CAP_UNITS ulong 2
+
+note Manifest constants (4096 bytes)
+const SLOT_M_VERSION uint 1
+const SLOT_M_PAYLOAD_BOOTAA64 uint 1
+const SLOT_M_LOADER_ABI uint 1
+const SLOT_M_KERNEL_ABI uint 3
+const SLOT_M_TBS_BYTES ulong 448
+const SLOT_M_COMMIT_CHARS ulong 40
+const SLOT_M_PROV_CHARS ulong 64
+
+const SLOT_M_OFF_MAGIC ulong 0
+const SLOT_M_OFF_VER ulong 8
+const SLOT_M_OFF_PAYLOAD ulong 12
+const SLOT_M_OFF_LABI ulong 16
+const SLOT_M_OFF_KABI ulong 20
+const SLOT_M_OFF_GEN ulong 24
+const SLOT_M_OFF_PGEN ulong 32
+const SLOT_M_OFF_MINRB ulong 40
+const SLOT_M_OFF_IMGLEN ulong 48
+const SLOT_M_OFF_IMGSHA ulong 56
+const SLOT_M_OFF_KSHA ulong 120
+const SLOT_M_OFF_SIGNER ulong 184
+const SLOT_M_OFF_COMMIT ulong 216
+const SLOT_M_OFF_PROV ulong 256
+const SLOT_M_OFF_TS ulong 320
+const SLOT_M_OFF_FLAGS ulong 328
+const SLOT_M_OFF_RSVD0 ulong 332
+const SLOT_M_OFF_RSVD1 ulong 336
+const SLOT_M_OFF_SIG ulong 448
+const SLOT_M_OFF_PAD ulong 512
+
+note Control record constants (4096 bytes)
+const SLOT_C_VERSION uint 1
+const SLOT_C_FLAG_CAND_FAILED uchar 1
+const SLOT_C_OFF_MAGIC ulong 0
+const SLOT_C_OFF_VER ulong 8
+const SLOT_C_OFF_ACTIVE ulong 12
+const SLOT_C_OFF_CAND ulong 13
+const SLOT_C_OFF_TRIES ulong 14
+const SLOT_C_OFF_FLAGS ulong 15
+const SLOT_C_OFF_FLOOR ulong 16
+const SLOT_C_OFF_LASTGOOD ulong 24
+const SLOT_C_OFF_RSVD ulong 32
+
+note Boot record constants (256 bytes, SHA-256 over [0, 224))
+const SLOT_B_VERSION uint 1
+const SLOT_B_BYTES ulong 256
+const SLOT_B_SIGNED ulong 224
+const SLOT_B_OFF_MAGIC ulong 0
+const SLOT_B_OFF_VER ulong 8
+const SLOT_B_OFF_SLOT ulong 12
+const SLOT_B_OFF_REASON ulong 13
+const SLOT_B_OFF_TRIES ulong 14
+const SLOT_B_OFF_CTL_PRES ulong 15
+const SLOT_B_OFF_CTL_SEQ ulong 16
+const SLOT_B_OFF_GEN ulong 24
+const SLOT_B_OFF_PGEN ulong 32
+const SLOT_B_OFF_IMGSHA ulong 40
+const SLOT_B_OFF_COMMIT ulong 104
+const SLOT_B_OFF_RSVD ulong 144
+const SLOT_B_OFF_DIGEST ulong 224
+
+note Decision reason codes
+const SLOT_R_NONE uint 0
+const SLOT_R_CANDIDATE_TRY uint 1
+const SLOT_R_ACTIVE uint 2
+const SLOT_R_CANDIDATE_EXHAUSTED uint 3
+const SLOT_R_CANDIDATE_INVALID uint 4
+const SLOT_R_ACTIVE_INVALID_FALLBACK uint 5
+const SLOT_R_NO_CONTROL uint 6
+const SLOT_R_RECOVERY_REQUIRED uint 7
+
+note Kernel slot action codes
+const SLOT_A_NONE uint 0
+const SLOT_A_PROMOTE uint 1
+const SLOT_A_ABANDON uint 2
+const SLOT_A_WAIT uint 3
+const SLOT_A_REFUSE uint 4
+
+note Error codes
+const SLOT_OK int 0
+const SLOT_ERR_SHORT int -1
+const SLOT_ERR_MAGIC int -2
+const SLOT_ERR_VER int -3
+const SLOT_ERR_PAYLOAD int -4
+const SLOT_ERR_ABI int -5
+const SLOT_ERR_GEN int -6
+const SLOT_ERR_IMGLEN int -7
+const SLOT_ERR_SHA_MISMATCH int -8
+const SLOT_ERR_TS int -9
+const SLOT_ERR_FLAGS int -10
+const SLOT_ERR_RSVD int -11
+const SLOT_ERR_COMMIT int -12
+const SLOT_ERR_PROV int -13
+const SLOT_ERR_RANGE int -14
+const SLOT_ERR_STATE int -15
+const SLOT_ERR_FLOOR int -16
+const SLOT_ERR_DIGEST int -17
+
+text slot_m_magic "AIENSLT1"
+text slot_c_magic "AIENSLC1"
+text slot_b_magic "AIENSLB1"
+
+fn slot_cap_units part_units ulong to ulong
+if lt part_units SLOT_FIRST_UNIT
+ret 0
+end
+ret div sub part_units SLOT_FIRST_UNIT SLOT_COUNT
+end
+
+fn slot_manifest_unit slot_idx ulong cap_units ulong to ulong
+ret add SLOT_FIRST_UNIT mul slot_idx cap_units
+end
+
+fn slot_is_lower_hex ch uchar to bool
+if and ge ch 48 le ch 57
+ret true
+end
+if and ge ch 97 le ch 102
+ret true
+end
+ret false
+end
+
+fn slot_copy_bytes dst edit uchar * src view uchar * n ulong to void
+i = ulong 0
+while lt i n bound 4096
+put dst i get src i
+i = add i 1
+end
+end
+
+fn slot_zero_bytes dst edit uchar * n ulong to void
+i = ulong 0
+while lt i n bound 4096
+put dst i 0
+i = add i 1
+end
+end
+
+fn slot_manifest_check buf view uchar * to int
+if lt len buf SLOT_UNIT
+ret SLOT_ERR_SHORT
+end
+if not boot_eq_bytes part buf SLOT_M_OFF_MAGIC 8 slot_m_magic
+ret SLOT_ERR_MAGIC
+end
+if ne boot_rd32_le buf SLOT_M_OFF_VER SLOT_M_VERSION
+ret SLOT_ERR_VER
+end
+if ne boot_rd32_le buf SLOT_M_OFF_PAYLOAD SLOT_M_PAYLOAD_BOOTAA64
+ret SLOT_ERR_PAYLOAD
+end
+if ne boot_rd32_le buf SLOT_M_OFF_LABI SLOT_M_LOADER_ABI
+ret SLOT_ERR_ABI
+end
+if ne boot_rd32_le buf SLOT_M_OFF_KABI SLOT_M_KERNEL_ABI
+ret SLOT_ERR_ABI
+end
+gen = boot_rd64_le buf SLOT_M_OFF_GEN
+pgen = boot_rd64_le buf SLOT_M_OFF_PGEN
+minrb = boot_rd64_le buf SLOT_M_OFF_MINRB
+if or eq gen 0 or gt pgen gen gt minrb gen
+ret SLOT_ERR_GEN
+end
+if eq boot_rd64_le buf SLOT_M_OFF_IMGLEN 0
+ret SLOT_ERR_IMGLEN
+end
+if not boot_eq_within buf SLOT_M_OFF_KSHA SLOT_M_OFF_IMGSHA 64
+ret SLOT_ERR_SHA_MISMATCH
+end
+if eq boot_rd64_le buf SLOT_M_OFF_TS 0
+ret SLOT_ERR_TS
+end
+if ne boot_rd32_le buf SLOT_M_OFF_FLAGS 0
+ret SLOT_ERR_FLAGS
+end
+if ne boot_rd32_le buf SLOT_M_OFF_RSVD0 0
+ret SLOT_ERR_RSVD
+end
+if not boot_all_zero buf SLOT_M_OFF_RSVD1 112
+ret SLOT_ERR_RSVD
+end
+if not boot_all_zero buf SLOT_M_OFF_PAD 3584
+ret SLOT_ERR_RSVD
+end
+i = ulong 0
+while lt i SLOT_M_COMMIT_CHARS bound 40
+if not slot_is_lower_hex get buf add SLOT_M_OFF_COMMIT i
+ret SLOT_ERR_COMMIT
+end
+i = add i 1
+end
+ended = false
+j = ulong 0
+while lt j SLOT_M_PROV_CHARS bound 64
+ch = get buf add SLOT_M_OFF_PROV j
+if eq ch 0
+ended = true
+else
+if or ended or lt ch 0x20 gt ch 0x7e
+ret SLOT_ERR_PROV
+end
+end
+j = add j 1
+end
+ret SLOT_OK
+end
+
+fn slot_control_check buf view uchar * to int
+if lt len buf SLOT_UNIT
+ret SLOT_ERR_SHORT
+end
+if not boot_eq_bytes part buf SLOT_C_OFF_MAGIC 8 slot_c_magic
+ret SLOT_ERR_MAGIC
+end
+if ne boot_rd32_le buf SLOT_C_OFF_VER SLOT_C_VERSION
+ret SLOT_ERR_VER
+end
+act = get buf SLOT_C_OFF_ACTIVE
+cand = get buf SLOT_C_OFF_CAND
+tries = get buf SLOT_C_OFF_TRIES
+flags = get buf SLOT_C_OFF_FLAGS
+if ge ulong act SLOT_COUNT
+ret SLOT_ERR_RANGE
+end
+if and ne cand SLOT_NONE ge ulong cand SLOT_COUNT
+ret SLOT_ERR_RANGE
+end
+if eq cand act
+ret SLOT_ERR_STATE
+end
+if gt tries SLOT_MAX_TRIES
+ret SLOT_ERR_RANGE
+end
+if and eq cand SLOT_NONE ne tries 0
+ret SLOT_ERR_STATE
+end
+if ne and flags xor uchar 0xff SLOT_C_FLAG_CAND_FAILED 0
+ret SLOT_ERR_FLAGS
+end
+floor = boot_rd64_le buf SLOT_C_OFF_FLOOR
+lg = boot_rd64_le buf SLOT_C_OFF_LASTGOOD
+if and ne lg 0 lt lg floor
+ret SLOT_ERR_FLOOR
+end
+if not boot_all_zero buf SLOT_C_OFF_RSVD 4064
+ret SLOT_ERR_RSVD
+end
+ret SLOT_OK
+end
+
+fn slot_control_init dst edit uchar * active_slot uchar to void
+slot_zero_bytes dst SLOT_UNIT
+for i ulong 8
+put dst i get slot_c_magic i
+end
+boot_wr32_le dst SLOT_C_OFF_VER SLOT_C_VERSION
+put dst SLOT_C_OFF_ACTIVE and active_slot 1
+put dst SLOT_C_OFF_CAND SLOT_NONE
+put dst SLOT_C_OFF_TRIES 0
+end
+
+fn slot_stage_candidate ctl edit uchar * target uchar gen ulong to int
+rc = slot_control_check ctl
+if ne rc SLOT_OK
+ret rc
+end
+if ge ulong target SLOT_COUNT
+ret SLOT_ERR_RANGE
+end
+if eq target get ctl SLOT_C_OFF_ACTIVE
+ret SLOT_ERR_STATE
+end
+floor = boot_rd64_le ctl SLOT_C_OFF_FLOOR
+if lt gen floor
+ret SLOT_ERR_FLOOR
+end
+lg = boot_rd64_le ctl SLOT_C_OFF_LASTGOOD
+if and ne lg 0 le gen lg
+ret SLOT_ERR_FLOOR
+end
+put ctl SLOT_C_OFF_CAND target
+put ctl SLOT_C_OFF_TRIES SLOT_MAX_TRIES
+fl = get ctl SLOT_C_OFF_FLAGS
+put ctl SLOT_C_OFF_FLAGS and fl xor uchar 0xff SLOT_C_FLAG_CAND_FAILED
+ret SLOT_OK
+end
+
+fn slot_promote ctl edit uchar * booted uchar gen ulong pgen ulong to int
+rc = slot_control_check ctl
+if ne rc SLOT_OK
+ret rc
+end
+if ge ulong booted SLOT_COUNT
+ret SLOT_ERR_RANGE
+end
+cand = get ctl SLOT_C_OFF_CAND
+if or eq cand SLOT_NONE ne booted cand
+ret SLOT_ERR_STATE
+end
+floor = boot_rd64_le ctl SLOT_C_OFF_FLOOR
+if lt gen floor
+ret SLOT_ERR_FLOOR
+end
+if gt pgen gen
+ret SLOT_ERR_GEN
+end
+put ctl SLOT_C_OFF_ACTIVE booted
+put ctl SLOT_C_OFF_CAND SLOT_NONE
+put ctl SLOT_C_OFF_TRIES 0
+fl = get ctl SLOT_C_OFF_FLAGS
+put ctl SLOT_C_OFF_FLAGS and fl xor uchar 0xff SLOT_C_FLAG_CAND_FAILED
+boot_wr64_le ctl SLOT_C_OFF_LASTGOOD gen
+if gt pgen floor
+boot_wr64_le ctl SLOT_C_OFF_FLOOR pgen
+end
+ret SLOT_OK
+end
+
+fn slot_abandon_candidate ctl edit uchar * to int
+rc = slot_control_check ctl
+if ne rc SLOT_OK
+ret rc
+end
+if eq get ctl SLOT_C_OFF_CAND SLOT_NONE
+ret SLOT_ERR_STATE
+end
+put ctl SLOT_C_OFF_CAND SLOT_NONE
+put ctl SLOT_C_OFF_TRIES 0
+fl = get ctl SLOT_C_OFF_FLAGS
+put ctl SLOT_C_OFF_FLAGS or fl SLOT_C_FLAG_CAND_FAILED
+ret SLOT_OK
+end
+
+fn slot_eval_usable ev view SlotEval floor ulong to bool
+if eq get ev valid 0
+ret false
+end
+ret ge get ev generation floor
+end
+
+fn slot_select_apply_ctl ctl view uchar 4096 ev0 view SlotEval ev1 view SlotEval dec edit SlotDecision ctl_dst edit uchar 4096 to void
+floor = boot_rd64_le ctl SLOT_C_OFF_FLOOR
+act = get ctl SLOT_C_OFF_ACTIVE
+cand = get ctl SLOT_C_OFF_CAND
+tries = get ctl SLOT_C_OFF_TRIES
+act_u = slot_eval_usable ev0 floor
+oth_u = slot_eval_usable ev1 floor
+if eq act 1
+act_u = slot_eval_usable ev1 floor
+oth_u = slot_eval_usable ev0 floor
+end
+if ne cand SLOT_NONE
+cand_u = slot_eval_usable ev0 floor
+if eq cand 1
+cand_u = slot_eval_usable ev1 floor
+end
+if and gt tries 0 cand_u
+put dec boot_slot int cand
+put dec reason SLOT_R_CANDIDATE_TRY
+put dec loader_write 1
+slot_copy_bytes ctl_dst ctl SLOT_UNIT
+put ctl_dst SLOT_C_OFF_TRIES sub tries 1
+ret
+end
+if act_u
+put dec boot_slot int act
+if eq tries 0
+put dec reason SLOT_R_CANDIDATE_EXHAUSTED
+else
+put dec reason SLOT_R_CANDIDATE_INVALID
+end
+ret
+end
+end
+if act_u
+put dec boot_slot int act
+put dec reason SLOT_R_ACTIVE
+ret
+end
+other = xor act 1
+if and oth_u ne cand other
+put dec boot_slot int other
+put dec reason SLOT_R_ACTIVE_INVALID_FALLBACK
+ret
+end
+end
+
+fn slot_select has_ctl bool ctl view uchar 4096 ev0 view SlotEval ev1 view SlotEval dec edit SlotDecision ctl_dst edit uchar 4096 to void
+put dec boot_slot -1
+put dec reason SLOT_R_RECOVERY_REQUIRED
+put dec loader_write 0
+slot_zero_bytes ctl_dst SLOT_UNIT
+if not has_ctl
+ret
+end
+if ne slot_control_check ctl SLOT_OK
+ret
+end
+slot_select_apply_ctl ctl ev0 ev1 dec ctl_dst
+end
+
+fn slot_boot_seal buf edit uchar * to void
+dig = new uchar 32 0
+msg = new uchar 224 0
+for i ulong 224
+put msg i get buf i
+end
+dlen = sha2_digest 256 msg dig
+if eq dlen 32
+for i ulong 32
+put buf add SLOT_B_OFF_DIGEST i get dig i
+end
+end
+end
+
+fn slot_boot_check buf view uchar * to int
+if lt len buf SLOT_B_BYTES
+ret SLOT_ERR_SHORT
+end
+if not boot_eq_bytes part buf SLOT_B_OFF_MAGIC 8 slot_b_magic
+ret SLOT_ERR_MAGIC
+end
+if ne boot_rd32_le buf SLOT_B_OFF_VER SLOT_B_VERSION
+ret SLOT_ERR_VER
+end
+msg = new uchar 224 0
+dig = new uchar 32 0
+for i ulong 224
+put msg i get buf i
+end
+dlen = sha2_digest 256 msg dig
+if ne dlen 32
+ret SLOT_ERR_DIGEST
+end
+if not boot_eq_bytes dig part buf SLOT_B_OFF_DIGEST 32
+ret SLOT_ERR_DIGEST
+end
+bslot = get buf SLOT_B_OFF_SLOT
+reason = uint get buf SLOT_B_OFF_REASON
+tries = get buf SLOT_B_OFF_TRIES
+cpres = get buf SLOT_B_OFF_CTL_PRES
+cseq = boot_rd64_le buf SLOT_B_OFF_CTL_SEQ
+gen = boot_rd64_le buf SLOT_B_OFF_GEN
+pgen = boot_rd64_le buf SLOT_B_OFF_PGEN
+if ge ulong bslot SLOT_COUNT
+ret SLOT_ERR_RANGE
+end
+if or le reason SLOT_R_NONE ge reason SLOT_R_RECOVERY_REQUIRED
+ret SLOT_ERR_RANGE
+end
+if gt cpres 1
+ret SLOT_ERR_RANGE
+end
+if gt tries SLOT_MAX_TRIES
+ret SLOT_ERR_RANGE
+end
+if or eq gen 0 gt pgen gen
+ret SLOT_ERR_GEN
+end
+if not boot_all_zero buf SLOT_B_OFF_RSVD 80
+ret SLOT_ERR_RSVD
+end
+if eq cpres 0
+if or ne reason SLOT_R_NO_CONTROL ne cseq 0
+ret SLOT_ERR_STATE
+end
+else
+if eq reason SLOT_R_NO_CONTROL
+ret SLOT_ERR_STATE
+end
+end
+ret SLOT_OK
+end
+
+fn slot_brec_matches_man brec view uchar 256 man view uchar 4096 to bool
+if ne boot_rd64_le man SLOT_M_OFF_GEN boot_rd64_le brec SLOT_B_OFF_GEN
+ret false
+end
+if ne boot_rd64_le man SLOT_M_OFF_PGEN boot_rd64_le brec SLOT_B_OFF_PGEN
+ret false
+end
+ret boot_eq_bytes part man SLOT_M_OFF_IMGSHA 64 part brec SLOT_B_OFF_IMGSHA 64
+end
+
+fn slot_kernel_action_inner brec view uchar 256 ctl view uchar 4096 man view uchar 4096 healthy bool ctl_dst edit uchar 4096 to uint
+if ne slot_boot_check brec SLOT_OK
+ret SLOT_A_REFUSE
+end
+if ne slot_control_check ctl SLOT_OK
+ret SLOT_A_REFUSE
+end
+if ne slot_manifest_check man SLOT_OK
+ret SLOT_A_REFUSE
+end
+if not slot_brec_matches_man brec man
+ret SLOT_A_REFUSE
+end
+slot_copy_bytes ctl_dst ctl SLOT_UNIT
+bslot = get brec SLOT_B_OFF_SLOT
+reason = uint get brec SLOT_B_OFF_REASON
+cand = get ctl SLOT_C_OFF_CAND
+act = get ctl SLOT_C_OFF_ACTIVE
+if eq reason SLOT_R_CANDIDATE_TRY
+if ne cand bslot
+ret SLOT_A_NONE
+end
+if not healthy
+ret SLOT_A_WAIT
+end
+if ne slot_promote ctl_dst bslot boot_rd64_le man SLOT_M_OFF_GEN boot_rd64_le man SLOT_M_OFF_PGEN SLOT_OK
+ret SLOT_A_REFUSE
+end
+ret SLOT_A_PROMOTE
+end
+if or eq reason SLOT_R_CANDIDATE_EXHAUSTED eq reason SLOT_R_CANDIDATE_INVALID
+if and ne cand SLOT_NONE eq act bslot
+if ne slot_abandon_candidate ctl_dst SLOT_OK
+ret SLOT_A_REFUSE
+end
+ret SLOT_A_ABANDON
+end
+end
+ret SLOT_A_NONE
+end
+
+fn slot_verify_image_sha512 man view uchar 4096 img view uchar * img_cap ulong ev edit SlotEval to bool
+put ev valid 0
+put ev generation 0
+put ev policy_gen 0
+rc = slot_manifest_check man
+if ne rc SLOT_OK
+put ev err rc
+ret false
+end
+ilen = boot_rd64_le man SLOT_M_OFF_IMGLEN
+if or gt ilen img_cap gt ilen len img
+put ev err SLOT_ERR_IMGLEN
+ret false
+end
+dig = new uchar 64 0
+dlen = sha2_digest 512 part img 0 ilen dig
+if ne dlen 64
+put ev err SLOT_ERR_DIGEST
+ret false
+end
+if not boot_eq_bytes dig part man SLOT_M_OFF_IMGSHA 64
+put ev err SLOT_ERR_SHA_MISMATCH
+ret false
+end
+put ev valid 1
+put ev generation boot_rd64_le man SLOT_M_OFF_GEN
+put ev policy_gen boot_rd64_le man SLOT_M_OFF_PGEN
+put ev err SLOT_OK
+ret true
+end

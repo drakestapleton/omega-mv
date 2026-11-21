@@ -1,0 +1,135 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-c1-tree/c1_tree_test.om: Behavioral self-test for aienos-c1-tree.
+note Compose with: si/directives/om2.om om/tls/sha2.om aienux/crates/aienos-c1-tree/c1_tree.om aienux/crates/aienos-c1-tree/c1_tree_test.om
+
+fn main to int
+c1_init
+
+note 1. Create root branch with 200 tokens (4 physical pages: 64+64+64+8)
+prompt = new uint 200 0
+for i ulong 200
+put prompt i uint add 1000 i
+end
+rc = c1_create_root 1 prompt
+if ne rc C1_OK
+ret 1
+end
+init_pages = c1_pool_active_count
+if ne init_pages 4
+ret 2
+end
+init_bytes = c1_pool_memory_bytes
+if ne init_bytes mul 4 C1_PAGE_KV_BYTES
+ret 3
+end
+
+note 2. Fork into 8 child branches -> ZERO memory increase
+for c ulong 8
+cid = add 10 c
+rc = c1_fork_branch 1 cid
+if ne rc C1_OK
+ret 4
+end
+end
+if ne c1_pool_active_count init_pages
+ret 5
+end
+if ne c1_pool_memory_bytes init_bytes
+ret 6
+end
+
+note 3. Divergent append on each child triggers CoW (+1 page per child)
+extra = new uint 1 0
+readback = new uint 256 0
+for c ulong 8
+cid = add 10 c
+put extra 0 uint add 9000 c
+rc = c1_append_tokens cid extra
+if ne rc C1_OK
+ret 7
+end
+got = c1_get_tokens cid readback
+if ne got 201
+ret 8
+end
+if ne get readback 200 uint add 9000 c
+ret 9
+end
+if ne get readback 0 uint 1000
+ret 10
+end
+end
+if ne c1_pool_active_count add init_pages 8
+ret 11
+end
+
+note 4. Metrics check: 200 + 8*201 = 1808 virtual tokens across 12 physical pages
+c1_compute_metrics
+if ne get c1_met_out 0 12
+ret 12
+end
+if ne get c1_met_out 2 1808
+ret 13
+end
+
+note 5. Transactional reservation pass & quota exceeded
+rc = c1_reserve_step 1 64 42 20
+if ne rc C1_OK
+ret 14
+end
+if ne get c1_res_out 2 1
+ret 15
+end
+rc = c1_reserve_step 1 1000 43 20
+if ne rc C1_ERR_QUOTA
+ret 16
+end
+
+note 6. Evict, reject read on evicted, then reconstruct with no page leak
+rc = c1_evict_branch 1
+if ne rc C1_OK
+ret 17
+end
+got = c1_get_tokens 1 readback
+if ne got long C1_ERR_EVICTED
+ret 18
+end
+rc = c1_reconstruct_branch 1 prompt
+if ne rc C1_OK
+ret 19
+end
+pages_before = c1_pool_active_count
+rc = c1_reconstruct_branch 1 prompt
+if ne rc C1_OK
+ret 20
+end
+if ne c1_pool_active_count pages_before
+ret 21
+end
+
+note 7. Corrupt checksum detection
+put c1_p_toks 0 xor get c1_p_toks 0 1
+got = c1_get_tokens 10 readback
+if ne got long C1_ERR_CORRUPT
+ret 22
+end
+note Restore checksum before cleanup
+put c1_p_toks 0 xor get c1_p_toks 0 1
+
+note 8. Remove all branches -> 0 active pages
+rc = c1_remove_branch 1
+if ne rc C1_OK
+ret 23
+end
+for c ulong 8
+rc = c1_remove_branch add 10 c
+if ne rc C1_OK
+ret 24
+end
+end
+if ne c1_pool_active_count 0
+ret 25
+end
+
+ret 0
+end

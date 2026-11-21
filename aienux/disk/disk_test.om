@@ -1,0 +1,389 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/disk_test.om: Behavioral self-test for Pure-Omega Disk Abstraction, File Backend, and SDHCI Driver.
+note Compose with: si/directives/om2.om aienux/disk/disk.om aienux/disk/disk_file.om aienux/disk/disk_sdhci.om aienux/disk/disk_test.om
+
+text s_pass "PASS "
+text s_fail "FAIL "
+text s_nl "\n"
+text s_path "/tmp/aienux_disk_test.img"
+text s_t1 "disk_file_open_rw_flush_and_reopen"
+text s_t2 "disk_file_power_cut_injection_and_disarm"
+text s_t3 "disk_bounds_geometry_and_split_transfer"
+text s_t4 "disk_queue_depth_barrier_and_failstop"
+text s_t5 "disk_sdhci_init_single_multi_rw_and_flush"
+text s_t6 "disk_sdhci_refusals_and_failclosed_on_error"
+text s_sum "DISK_TEST_PASS total=6 failed=0\n"
+text s_fsum "DISK_TEST_FAIL\n"
+
+fn dkt_write_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn dkt_report name view uchar * ok bool to uint
+if ok
+w1 = dkt_write_all 1 s_pass
+w2 = dkt_write_all 1 name
+w3 = dkt_write_all 1 s_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = dkt_write_all 1 s_fail
+w2 = dkt_write_all 1 name
+w3 = dkt_write_all 1 s_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn test_1_file_rw_reopen to bool
+dev = new DiskDev 0 0 0 0
+wbuf = new uchar 1024 0
+rbuf = new uchar 1024 0
+rc = disk_file_open dev s_path 512 16 1
+if ne rc DISK_OK
+ret false
+end
+for i ulong 1024
+put wbuf i uchar and add i 37 0xff
+end
+rc = disk_write dev 2 2 wbuf
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+rc = disk_flush dev
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+if ne disk_file_blocks_written 2
+disk_file_close
+ret false
+end
+if ne disk_file_flushes 1
+disk_file_close
+ret false
+end
+disk_file_close
+note Reopen without create (auto-detect block count via fstat)
+rc = disk_file_open dev s_path 512 0 0
+if ne rc DISK_OK
+ret false
+end
+if ne get dev block_count 16
+disk_file_close
+ret false
+end
+rc = disk_read dev 2 2 rbuf
+disk_file_close
+if ne rc DISK_OK
+ret false
+end
+for i ulong 1024
+if ne get rbuf i get wbuf i
+ret false
+end
+end
+ret true
+end
+
+fn test_2_power_cut to bool
+dev = new DiskDev 0 0 0 0
+wbuf = new uchar 1536 0
+rbuf = new uchar 1536 0
+rc = disk_file_open dev s_path 512 8 1
+if ne rc DISK_OK
+ret false
+end
+for i ulong 1536
+put wbuf i uchar and add i 11 0xff
+end
+disk_file_arm_cut 2
+rc = disk_write dev 0 3 wbuf
+if ne rc DISK_EPOWER
+disk_file_close
+ret false
+end
+if ne disk_file_blocks_written 2
+disk_file_close
+ret false
+end
+rc = disk_flush dev
+if ne rc DISK_EPOWER
+disk_file_close
+ret false
+end
+note Disarm (reboot) and verify first 2 blocks persisted, 3rd stayed zero
+disk_file_disarm
+rc = disk_read dev 0 3 rbuf
+disk_file_close
+if ne rc DISK_OK
+ret false
+end
+for i ulong 1024
+if ne get rbuf i get wbuf i
+ret false
+end
+end
+for i ulong 512
+if ne get rbuf add 1024 i 0
+ret false
+end
+end
+ret true
+end
+
+fn test_3_bounds_and_split to bool
+dev = new DiskDev 0 0 0 0
+wbuf = new uchar 2048 0
+rbuf = new uchar 2048 0
+rc = disk_file_open dev s_path 512 8 1
+if ne rc DISK_OK
+ret false
+end
+note Force small max_blocks=1 so 4-block I/O splits into 4 backend calls
+put dev max_blocks 1
+for i ulong 2048
+put wbuf i uchar and add i 73 0xff
+end
+if ne disk_read dev 0 0 rbuf DISK_EARG
+disk_file_close
+ret false
+end
+if ne disk_read dev 8 1 rbuf DISK_ERANGE
+disk_file_close
+ret false
+end
+if ne disk_write dev 6 3 wbuf DISK_ERANGE
+disk_file_close
+ret false
+end
+rc = disk_write dev 2 4 wbuf
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+rc = disk_read dev 2 4 rbuf
+disk_file_close
+if ne rc DISK_OK
+ret false
+end
+for i ulong 2048
+if ne get rbuf i get wbuf i
+ret false
+end
+end
+ret true
+end
+
+fn test_4_queue_depth_failstop to bool
+dev = new DiskDev 0 0 0 0
+qbuf = new uchar 2048 0
+rc = disk_file_open dev s_path 512 8 1
+if ne rc DISK_OK
+ret false
+end
+for i ulong 512
+put qbuf i uchar 0xa5
+end
+disk_queue_init
+rc = disk_queue_push dev DISK_OP_WRITE 1 1 0
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+rc = disk_queue_push dev DISK_OP_FLUSH 0 0 0
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+rc = disk_queue_push dev DISK_OP_READ 1 1 512
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+rc = disk_queue_drain dev qbuf
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+for i ulong 512
+if ne get qbuf add 512 i 0xa5
+disk_file_close
+ret false
+end
+end
+note Fill queue to 32 and verify 33rd returns DISK_EFULL
+i = ulong 0
+while lt i 32 bound 40
+rc = disk_queue_push dev DISK_OP_FLUSH 0 0 0
+if ne rc DISK_OK
+disk_file_close
+ret false
+end
+i = add i 1
+end
+if ne disk_queue_push dev DISK_OP_FLUSH 0 0 0 DISK_EFULL
+disk_file_close
+ret false
+end
+note Trigger power-cut during drain -> fail-closed until reset
+disk_file_arm_cut 0
+rc = disk_queue_drain dev qbuf
+if ne rc DISK_EPOWER
+disk_file_close
+ret false
+end
+if not disk_queue_failed
+disk_file_close
+ret false
+end
+if ne disk_queue_push dev DISK_OP_FLUSH 0 0 0 DISK_ESTATE
+disk_file_close
+ret false
+end
+disk_queue_reset
+disk_file_disarm
+if disk_queue_failed
+disk_file_close
+ret false
+end
+disk_file_close
+ret true
+end
+
+fn test_5_sdhci_rw_flush to bool
+dev = new DiskDev 0 0 0 0
+wbuf = new uchar 1536 0
+rbuf = new uchar 1536 0
+sdhci_sim_init 2048
+rc = sdhci_init_card dev 0 10 1 16
+if ne rc SDHCI_OK
+ret false
+end
+if not sdhci_is_ready
+ret false
+end
+if ne get dev block_size 512
+ret false
+end
+if ne get dev block_count 2048
+ret false
+end
+if gt sdhci_card_hz 25000000
+ret false
+end
+for i ulong 1536
+put wbuf i uchar and add i 91 0xff
+end
+note Single-block write/read (CMD24/CMD17)
+rc = disk_write dev 3 1 wbuf
+if ne rc DISK_OK
+ret false
+end
+rc = disk_read dev 3 1 rbuf
+if ne rc DISK_OK
+ret false
+end
+for i ulong 512
+if ne get rbuf i get wbuf i
+ret false
+end
+end
+note Multi-block write/read (CMD25/CMD18) + flush (CMD13)
+rc = disk_write dev 10 3 wbuf
+if ne rc DISK_OK
+ret false
+end
+rc = disk_flush dev
+if ne rc DISK_OK
+ret false
+end
+rc = disk_read dev 10 3 rbuf
+if ne rc DISK_OK
+ret false
+end
+for i ulong 1536
+if ne get rbuf i get wbuf i
+ret false
+end
+end
+ret true
+end
+
+fn test_6_sdhci_refusals to bool
+dev = new DiskDev 0 0 0 0
+buf = new uchar 512 0
+note Spec 1.00 refused with SDHCI_EVER
+sdhci_sim_init 1024
+sdhci_sim_set_spec 0
+if ne sdhci_init_card dev 0 10 0 16 SDHCI_EVER
+ret false
+end
+note No 3.3V refused with SDHCI_EVOLT
+sdhci_sim_init 1024
+sdhci_sim_set_volt 0
+if ne sdhci_init_card dev 0 10 0 16 SDHCI_EVOLT
+ret false
+end
+note No card refused with SDHCI_ENOCARD
+sdhci_sim_init 1024
+sdhci_sim_set_card_present 0
+if ne sdhci_init_card dev 0 10 0 16 SDHCI_ENOCARD
+ret false
+end
+note Bad CMD8 echo refused with SDHCI_ECARD
+sdhci_sim_init 1024
+sdhci_sim_set_bad_cmd8 1
+if ne sdhci_init_card dev 0 10 0 16 SDHCI_ECARD
+ret false
+end
+note Init cleanly then inject command error -> DISK_EIO and fail-closed DISK_ESTATE
+sdhci_sim_init 1024
+if ne sdhci_init_card dev 0 10 1 16 SDHCI_OK
+ret false
+end
+sdhci_sim_inject_err 0x00010000
+if ne disk_read dev 0 1 buf DISK_EIO
+ret false
+end
+if sdhci_is_ready
+ret false
+end
+if ne disk_read dev 0 1 buf DISK_ESTATE
+ret false
+end
+ret true
+end
+
+fn main to int
+fails = uint 0
+fails = add fails dkt_report s_t1 test_1_file_rw_reopen
+fails = add fails dkt_report s_t2 test_2_power_cut
+fails = add fails dkt_report s_t3 test_3_bounds_and_split
+fails = add fails dkt_report s_t4 test_4_queue_depth_failstop
+fails = add fails dkt_report s_t5 test_5_sdhci_rw_flush
+fails = add fails dkt_report s_t6 test_6_sdhci_refusals
+u = unlink s_path 0 len s_path
+if eq fails 0
+ok = dkt_write_all 1 s_sum
+if ok
+ret 0
+end
+ret 1
+end
+ok = dkt_write_all 1 s_fsum
+ret 1
+end

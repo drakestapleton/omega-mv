@@ -1,0 +1,234 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/artifact/osc_launch_test.om: Pure-Omega behavioral self-test suite for
+note Aienux Kernel OSC EL0 Launch Contract (aienux/kernel/artifact/osc_launch.om).
+note Compose with: si/directives/om2.om aienux/kernel/artifact/osc_launch.om aienux/kernel/artifact/osc_launch_test.om
+
+text o_pass "PASS "
+text o_fail "FAIL "
+text o_nl "\n"
+text o_t01 "osc_args_scalar_bounds_and_slice_aliasing"
+text o_t02 "osc_ranges_owned_and_disjoint_wrap"
+text o_t03 "osc_budget_stack_and_ws_limits"
+text o_t04 "osc_classify_svc_return_trap_and_rogue"
+text o_t05 "osc_classify_sync_brk_budget_and_lost"
+text o_sum "OSC_LAUNCH_TEST_PASS total=5 failed=0\n"
+text o_fsum "OSC_LAUNCH_TEST_FAIL\n"
+
+fn owrite_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn oreport name view uchar * ok bool to uint
+if ok
+w1 = owrite_all 1 o_pass
+w2 = owrite_all 1 name
+w3 = owrite_all 1 o_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = owrite_all 1 o_fail
+w2 = owrite_all 1 name
+w3 = owrite_all 1 o_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn test_01_args_and_alias to bool
+kinds = new uchar 6 0
+args = new ulong 6 0
+note bool(1), u8(2), i8(6), cells(12) + len
+put kinds 0 1
+put kinds 1 2
+put kinds 2 6
+put kinds 3 12
+put kinds 4 5
+put args 0 1
+put args 1 255
+put args 2 0xffffffffffffff80
+put args 3 0x20000
+put args 4 8
+if not osc_launch_args_ok kinds 5 args 5
+ret false
+end
+note Out-of-range bool(2) refused
+put args 0 2
+if osc_launch_args_ok kinds 5 args 5
+ret false
+end
+note Unaligned cells pointer refused
+put args 0 1
+put args 3 0x20004
+if osc_launch_args_ok kinds 5 args 5
+ret false
+end
+note Overlapping bytes(11) and cells(12) refused (aliasing writable workspace)
+put kinds 0 11
+put kinds 1 5
+put kinds 2 12
+put kinds 3 5
+put args 0 0x20010
+put args 1 16
+put args 2 0x20000
+put args 3 4
+if osc_launch_args_ok kinds 4 args 4
+ret false
+end
+note Disjoint bytes(11) and cells(12) accepted
+put args 0 0x10000
+if not osc_launch_args_ok kinds 4 args 4
+ret false
+end
+ret true
+end
+
+fn test_02_ranges_and_disjoint to bool
+kinds = new uchar 6 0
+args = new ulong 6 0
+put kinds 0 11
+put kinds 1 5
+put kinds 2 12
+put kinds 3 5
+put args 0 0x10000
+put args 1 64
+put args 2 0x20000
+put args 3 8
+win = new OscWindows 0x10000 4096 0x20000 4096
+if not osc_launch_ranges_owned kinds 4 args win
+ret false
+end
+note Bytes slice extending past input window refused
+put args 1 5000
+if osc_launch_ranges_owned kinds 4 args win
+ret false
+end
+note Disjoint checks including wrap-around refusal
+if not osc_launch_disjoint 0x1000 0x100 0x1100 0x100
+ret false
+end
+if osc_launch_disjoint 0x1000 0x101 0x1100 0x100
+ret false
+end
+if osc_launch_disjoint 0xffffffffffffff00 0x200 0x1000 0x10
+ret false
+end
+ret true
+end
+
+fn test_03_budgets to bool
+if ne osc_launch_budget 100 40 40
+ret false
+end
+if ne osc_launch_budget 100 200 100
+ret false
+end
+if ne osc_launch_budget 100 0 100
+ret false
+end
+if osc_launch_budget_expired 9 10
+ret false
+end
+if not osc_launch_budget_expired 10 10
+ret false
+end
+if not osc_launch_ws_pages_ok 32
+ret false
+end
+if osc_launch_ws_pages_ok 33
+ret false
+end
+if not osc_launch_stack_ok 4096 8192
+ret false
+end
+if osc_launch_stack_ok 8193 8192
+ret false
+end
+ret true
+end
+
+fn test_04_classify_svc to bool
+rt = ulong 0x400000
+r = new OscResult 0 0 0 0 0 0
+note Return stub (13): site = rt + 13*8, elr = site + 4, esr = (0x15<<26) | 13
+ev_ret = new OscEvent OSC_EV_SVC or shl ulong 0x15 26 OSC_SVC_RETURN add add rt mul OSC_SVC_RETURN 8 4 0x42 0
+osc_launch_classify ev_ret rt r
+if or ne get r cls OSC_RES_RETURNED ne get r val 0x42
+ret false
+end
+note Trap stub (2) with valid trap code 3 (BOUNDS)
+ev_tr = new OscEvent OSC_EV_SVC or shl ulong 0x15 26 OSC_SVC_TRAP add add rt mul OSC_SVC_TRAP 8 4 0 3
+osc_launch_classify ev_tr rt r
+if or ne get r cls OSC_RES_TRAPPED ne get r trap_code 3
+ret false
+end
+note Trap stub (2) with invalid trap code 99 -> UNKNOWN(TRAP_CODE_UNKNOWN)
+ev_tr_bad = new OscEvent OSC_EV_SVC or shl ulong 0x15 26 OSC_SVC_TRAP add add rt mul OSC_SVC_TRAP 8 4 0 99
+osc_launch_classify ev_tr_bad rt r
+if or ne get r cls OSC_RES_UNKNOWN ne get r unknown_reason OSC_UNK_TRAP_CODE_UNKNOWN
+ret false
+end
+note Rogue SVC outside runtime stubs -> UNKNOWN(FAULT)
+ev_rogue = new OscEvent OSC_EV_SVC or shl ulong 0x15 26 13 0x100004 0x42 0
+osc_launch_classify ev_rogue rt r
+if or ne get r cls OSC_RES_UNKNOWN ne get r unknown_reason OSC_UNK_FAULT
+ret false
+end
+ret true
+end
+
+fn test_05_classify_sync to bool
+rt = ulong 0x400000
+r = new OscResult 0 0 0 0 0 0
+note Direct brk (EC=0x3c) is UNKNOWN(FAULT), never TRAPPED
+ev_brk = new OscEvent OSC_EV_SYNC shl ulong 0x3c 26 0x10000 0 0
+osc_launch_classify ev_brk rt r
+if or ne get r cls OSC_RES_UNKNOWN ne get r unknown_reason OSC_UNK_FAULT
+ret false
+end
+note Budget overrun -> UNKNOWN(TICK_OVERRUN)
+ev_bud = new OscEvent OSC_EV_BUDGET 0 0 0 0
+osc_launch_classify ev_bud rt r
+if or ne get r cls OSC_RES_UNKNOWN ne get r unknown_reason OSC_UNK_TICK_OVERRUN
+ret false
+end
+note Launch lost -> UNKNOWN(LAUNCH_LOST)
+ev_lost = new OscEvent OSC_EV_LOST 0 0 0 0
+osc_launch_classify ev_lost rt r
+if or ne get r cls OSC_RES_UNKNOWN ne get r unknown_reason OSC_UNK_LAUNCH_LOST
+ret false
+end
+ret true
+end
+
+fn main to int
+failed = uint 0
+failed = add failed oreport o_t01 test_01_args_and_alias
+failed = add failed oreport o_t02 test_02_ranges_and_disjoint
+failed = add failed oreport o_t03 test_03_budgets
+failed = add failed oreport o_t04 test_04_classify_svc
+failed = add failed oreport o_t05 test_05_classify_sync
+if eq failed 0
+w = owrite_all 1 o_sum
+if w
+ret 0
+end
+ret 1
+end
+w = owrite_all 1 o_fsum
+if w
+ret 1
+end
+ret 1
+end

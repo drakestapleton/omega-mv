@@ -1,0 +1,542 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/core/pipe.om: Pure-Omega Capability-Gated Bounded Byte Pipes (AIENOS-NATIVE-PIPE-1).
+note Converted from upstream aienux native/kernel/core/pipe.h and native/kernel/core/pipe.c.
+note Fixed pool of 4 pipes * 64 KiB each, epoch-tagged capability handles, EOF/BROKEN_PIPE/WOULD_BLOCK,
+note revocation with buffer scrub, per-end cancel, user-VA window validation, and OSHF op-table dispatch.
+
+const PIPE_ABI_VERSION ulong 1
+const PIPE_FRAME_MAGIC ulong 0x4f534846
+const PIPE_CAPACITY ulong 65536
+const PIPE_POOL_PIPES ulong 4
+const PIPE_RES_TAG uint 0x50
+const PIPE_EPOCH_MAX uint 0xfffff
+const PIPE_USER_TOP ulong 0xffff000000000000
+const PIPE_BOUNCE ulong 1024
+
+note Pipe ends and capability rights
+const PIPE_END_READ uint 0
+const PIPE_END_WRITE uint 1
+const PIPE_R_READ uint 1
+const PIPE_R_WRITE uint 2
+const PIPE_R_DERIVE uint 4
+const PIPE_R_GRANT uint 8
+const PIPE_R_REVOKE uint 16
+const PIPE_CTL_RIGHTS uint 28
+
+note Pipe flags
+const PIPE_FLAG_LIVE uint 1
+const PIPE_FLAG_REVOKED uint 2
+const PIPE_FLAG_CANCEL_RD uint 4
+const PIPE_FLAG_CANCEL_WR uint 8
+
+note Platform op ids (OSHF)
+const PIPE_OP_CREATE ulong 1
+const PIPE_OP_READ ulong 2
+const PIPE_OP_WRITE ulong 3
+const PIPE_OP_CLOSE ulong 4
+const PIPE_OP_DUP ulong 5
+
+note OSH error codes
+const OSH_E_OK uint 0
+const OSH_E_INVALID_ARG uint 1
+const OSH_E_DENIED uint 2
+const OSH_E_STALE uint 3
+const OSH_E_REVOKED uint 4
+const OSH_E_LIMIT uint 5
+const OSH_E_WOULD_BLOCK uint 6
+const OSH_E_BROKEN_PIPE uint 7
+const OSH_E_INTERRUPTED uint 8
+const OSH_E_NOT_SUPPORTED uint 9
+
+note Pipe pool storage: 4 pipes * 65536 bytes = 262144 bytes
+global pipe_buf uchar 262144
+note Per-pipe metadata (4 pipes * 8 u32s = 32):
+note 0=head, 1=len, 2=epoch, 3=rrefs, 4=wrefs, 5=flags
+global pipe_meta uint 32
+note Pool totals: 0=live, 1=bytes_written, 2=bytes_read, 3=eof, 4=broken_pipe, 5=revocations, 6=refused
+global pipe_stats ulong 8
+
+note Capability tables: 2 principals (0=caller, 1=peer) * 16 slots = 32 slots
+const PIPE_CAP_SLOTS ulong 16
+global pcap_used uchar 32
+global pcap_gen uint 32
+global pcap_res uint 32
+global pcap_rights uint 32
+
+fn pipe_make_res idx uint end_id uint epoch uint to uint
+ret or or shl PIPE_RES_TAG 24 shl and end_id 1 23 or shl and idx 7 20 and epoch PIPE_EPOCH_MAX
+end
+
+fn pipe_make_handle slot uint gen uint to ulong
+ret or ulong slot shl ulong gen 32
+end
+
+fn pipe_pool_init to void
+for i ulong 32
+put pipe_meta i 0
+put pcap_used i 0
+put pcap_gen i 0
+put pcap_res i 0
+put pcap_rights i 0
+end
+for s ulong 8
+put pipe_stats s 0
+end
+end
+
+fn pipe_pool_empty to bool
+if ne get pipe_stats 0 0
+ret false
+end
+for i ulong 4
+if ne and get pipe_meta add mul i 8 5 PIPE_FLAG_LIVE 0
+ret false
+end
+end
+ret true
+end
+
+fn pcap_insert tbl ulong res uint rights uint h_out edit ulong 1 to bool
+base = mul tbl PIPE_CAP_SLOTS
+slot = PIPE_CAP_SLOTS
+for i ulong 16
+if eq get pcap_used add base i 0
+slot = i
+break
+end
+end
+if ge slot PIPE_CAP_SLOTS
+ret false
+end
+pos = add base slot
+gen = add get pcap_gen pos 1
+if eq gen 0
+gen = uint 1
+end
+put pcap_used pos 1
+put pcap_gen pos gen
+put pcap_res pos res
+put pcap_rights pos rights
+put h_out 0 pipe_make_handle uint slot gen
+ret true
+end
+
+fn pcap_remove tbl ulong h ulong to bool
+slot = ulong and h 0xffffffff
+gen = uint shr h 32
+if or ge slot PIPE_CAP_SLOTS eq gen 0
+ret false
+end
+pos = add mul tbl PIPE_CAP_SLOTS slot
+if or eq get pcap_used pos 0 ne get pcap_gen pos gen
+ret false
+end
+put pcap_used pos 0
+put pcap_res pos 0
+put pcap_rights pos 0
+ret true
+end
+
+fn pipe_check_live idx uint epoch uint live_ok bool to uint
+mbase = mul ulong idx 8
+flags = get pipe_meta add mbase 5
+if or eq and flags PIPE_FLAG_LIVE 0 ne get pipe_meta add mbase 2 epoch
+put pipe_stats 6 add get pipe_stats 6 1
+ret OSH_E_STALE
+end
+if and not live_ok ne and flags PIPE_FLAG_REVOKED 0
+put pipe_stats 6 add get pipe_stats 6 1
+ret OSH_E_REVOKED
+end
+ret OSH_E_OK
+end
+
+fn pcap_lookup_res tbl ulong h ulong need uint res_out edit uint 1 to uint
+slot = ulong and h 0xffffffff
+gen = uint shr h 32
+if or ge tbl 2 or ge slot PIPE_CAP_SLOTS eq gen 0
+ret OSH_E_INVALID_ARG
+end
+pos = add mul tbl PIPE_CAP_SLOTS slot
+if or eq get pcap_used pos 0 ne get pcap_gen pos gen
+put pipe_stats 6 add get pipe_stats 6 1
+ret OSH_E_STALE
+end
+if ne and get pcap_rights pos need need
+put pipe_stats 6 add get pipe_stats 6 1
+ret OSH_E_DENIED
+end
+put res_out 0 get pcap_res pos
+ret OSH_E_OK
+end
+
+note Resolve handle h in table tbl requiring rights `need` and end `want_end` (2 = either).
+note On OK writes idx to out_ie[0], end to out_ie[1].
+fn pipe_resolve tbl ulong h ulong need uint want_end uint live_ok bool out_ie edit uint 2 to uint
+rbox = new uint 1 0
+lrc = pcap_lookup_res tbl h need rbox
+if ne lrc OSH_E_OK
+ret lrc
+end
+res = get rbox 0
+if ne shr res 24 PIPE_RES_TAG
+put pipe_stats 6 add get pipe_stats 6 1
+ret OSH_E_DENIED
+end
+idx = and shr res 20 7
+end_id = and shr res 23 1
+if ge ulong idx PIPE_POOL_PIPES
+put pipe_stats 6 add get pipe_stats 6 1
+ret OSH_E_DENIED
+end
+if lt want_end 2
+if ne end_id want_end
+put pipe_stats 6 add get pipe_stats 6 1
+ret OSH_E_DENIED
+end
+end
+rc = pipe_check_live idx and res PIPE_EPOCH_MAX live_ok
+if ne rc OSH_E_OK
+ret rc
+end
+put out_ie 0 idx
+put out_ie 1 end_id
+ret OSH_E_OK
+end
+
+fn pipe_scrub idx ulong to void
+base = mul idx PIPE_CAPACITY
+for i ulong 65536
+put pipe_buf add base i 0
+end
+end
+
+fn pipe_create tbl ulong rd_out edit ulong 1 wr_out edit ulong 1 to uint
+if ge tbl 2
+ret OSH_E_INVALID_ARG
+end
+idx = PIPE_POOL_PIPES
+for i ulong 4
+mbase = mul i 8
+fl = get pipe_meta add mbase 5
+ep = get pipe_meta add mbase 2
+if and eq and fl PIPE_FLAG_LIVE 0 lt ep PIPE_EPOCH_MAX
+idx = i
+break
+end
+end
+if ge idx PIPE_POOL_PIPES
+ret OSH_E_LIMIT
+end
+mbase = mul idx 8
+epoch = add get pipe_meta add mbase 2 1
+rres = pipe_make_res uint idx PIPE_END_READ epoch
+wres = pipe_make_res uint idx PIPE_END_WRITE epoch
+if not pcap_insert tbl rres or PIPE_R_READ PIPE_CTL_RIGHTS rd_out
+ret OSH_E_LIMIT
+end
+if not pcap_insert tbl wres or PIPE_R_WRITE PIPE_CTL_RIGHTS wr_out
+ok_rm = pcap_remove tbl get rd_out 0
+if ok_rm
+ret OSH_E_LIMIT
+end
+ret OSH_E_LIMIT
+end
+put pipe_meta add mbase 0 0
+put pipe_meta add mbase 1 0
+put pipe_meta add mbase 2 epoch
+put pipe_meta add mbase 3 1
+put pipe_meta add mbase 4 1
+put pipe_meta add mbase 5 PIPE_FLAG_LIVE
+put pipe_stats 0 add get pipe_stats 0 1
+ret OSH_E_OK
+end
+
+fn pipe_ring_write idx ulong src view uchar * take ulong to void
+mbase = mul idx 8
+cur_len = ulong get pipe_meta add mbase 1
+head = ulong get pipe_meta add mbase 0
+wpos = rem add head cur_len PIPE_CAPACITY
+pbase = mul idx PIPE_CAPACITY
+i = ulong 0
+while lt i take bound 65536
+put pipe_buf add pbase wpos get src i
+wpos = rem add wpos 1 PIPE_CAPACITY
+i = add i 1
+end
+put pipe_meta add mbase 1 uint add cur_len take
+put pipe_stats 1 add get pipe_stats 1 take
+end
+
+fn pipe_write tbl ulong h ulong src view uchar * n_out edit ulong 1 to uint
+put n_out 0 0
+ie = new uint 2 0
+rc = pipe_resolve tbl h PIPE_R_WRITE PIPE_END_WRITE false ie
+if ne rc OSH_E_OK
+ret rc
+end
+idx = ulong get ie 0
+mbase = mul idx 8
+fl = get pipe_meta add mbase 5
+if ne and fl PIPE_FLAG_CANCEL_WR 0
+put pipe_meta add mbase 5 and fl xor uint 0xffffffff PIPE_FLAG_CANCEL_WR
+ret OSH_E_INTERRUPTED
+end
+if eq get pipe_meta add mbase 3 0
+put pipe_stats 4 add get pipe_stats 4 1
+ret OSH_E_BROKEN_PIPE
+end
+slen = len src
+if eq slen 0
+ret OSH_E_OK
+end
+room = sub PIPE_CAPACITY ulong get pipe_meta add mbase 1
+if eq room 0
+ret OSH_E_WOULD_BLOCK
+end
+take = slen
+if gt take room
+take = room
+end
+pipe_ring_write idx src take
+put n_out 0 take
+ret OSH_E_OK
+end
+
+fn pipe_ring_read idx ulong dst edit uchar * take ulong to void
+mbase = mul idx 8
+cur_len = ulong get pipe_meta add mbase 1
+head = ulong get pipe_meta add mbase 0
+pbase = mul idx PIPE_CAPACITY
+i = ulong 0
+while lt i take bound 65536
+put dst i get pipe_buf add pbase head
+put pipe_buf add pbase head 0
+head = rem add head 1 PIPE_CAPACITY
+i = add i 1
+end
+new_len = sub cur_len take
+if eq new_len 0
+head = ulong 0
+end
+put pipe_meta add mbase 0 uint head
+put pipe_meta add mbase 1 uint new_len
+put pipe_stats 2 add get pipe_stats 2 take
+end
+
+fn pipe_read tbl ulong h ulong dst edit uchar * n_out edit ulong 1 to uint
+put n_out 0 0
+ie = new uint 2 0
+rc = pipe_resolve tbl h PIPE_R_READ PIPE_END_READ false ie
+if ne rc OSH_E_OK
+ret rc
+end
+idx = ulong get ie 0
+mbase = mul idx 8
+fl = get pipe_meta add mbase 5
+if ne and fl PIPE_FLAG_CANCEL_RD 0
+put pipe_meta add mbase 5 and fl xor uint 0xffffffff PIPE_FLAG_CANCEL_RD
+ret OSH_E_INTERRUPTED
+end
+dlen = len dst
+if eq dlen 0
+ret OSH_E_OK
+end
+cur_len = ulong get pipe_meta add mbase 1
+if eq cur_len 0
+if eq get pipe_meta add mbase 4 0
+put pipe_stats 3 add get pipe_stats 3 1
+ret OSH_E_OK
+end
+ret OSH_E_WOULD_BLOCK
+end
+take = dlen
+if gt take cur_len
+take = cur_len
+end
+pipe_ring_read idx dst take
+put n_out 0 take
+ret OSH_E_OK
+end
+
+fn pipe_close tbl ulong h ulong to uint
+ie = new uint 2 0
+rc = pipe_resolve tbl h 0 2 true ie
+ok_rm = pcap_remove tbl h
+if ne rc OSH_E_OK
+if ok_rm
+ret rc
+end
+ret rc
+end
+idx = ulong get ie 0
+end_id = get ie 1
+mbase = mul idx 8
+if eq end_id PIPE_END_READ
+rr = get pipe_meta add mbase 3
+if gt rr 0
+put pipe_meta add mbase 3 sub rr 1
+end
+else
+wr = get pipe_meta add mbase 4
+if gt wr 0
+put pipe_meta add mbase 4 sub wr 1
+end
+end
+rr0 = get pipe_meta add mbase 3
+wr0 = get pipe_meta add mbase 4
+if and eq rr0 0 eq wr0 0
+pipe_scrub idx
+put pipe_meta add mbase 0 0
+put pipe_meta add mbase 1 0
+put pipe_meta add mbase 5 0
+if gt get pipe_stats 0 0
+put pipe_stats 0 sub get pipe_stats 0 1
+end
+end
+ret OSH_E_OK
+end
+
+fn pipe_revoke tbl ulong h ulong to uint
+ie = new uint 2 0
+rc = pipe_resolve tbl h PIPE_R_REVOKE 2 false ie
+if ne rc OSH_E_OK
+ret rc
+end
+idx = ulong get ie 0
+mbase = mul idx 8
+pipe_scrub idx
+put pipe_meta add mbase 0 0
+put pipe_meta add mbase 1 0
+put pipe_meta add mbase 5 or get pipe_meta add mbase 5 PIPE_FLAG_REVOKED
+put pipe_stats 5 add get pipe_stats 5 1
+ret OSH_E_OK
+end
+
+fn pipe_cancel tbl ulong h ulong to uint
+ie = new uint 2 0
+rc = pipe_resolve tbl h 0 2 false ie
+if ne rc OSH_E_OK
+ret rc
+end
+idx = ulong get ie 0
+end_id = get ie 1
+need = PIPE_R_WRITE
+cflag = PIPE_FLAG_CANCEL_WR
+if eq end_id PIPE_END_READ
+need = PIPE_R_READ
+cflag = PIPE_FLAG_CANCEL_RD
+end
+rc2 = pipe_resolve tbl h need end_id false ie
+if ne rc2 OSH_E_OK
+ret rc2
+end
+mbase = mul idx 8
+put pipe_meta add mbase 5 or get pipe_meta add mbase 5 cflag
+ret OSH_E_OK
+end
+
+fn pipe_dup_rights_ok src_r uint end_id uint rights uint to bool
+dright = PIPE_R_WRITE
+if eq end_id PIPE_END_READ
+dright = PIPE_R_READ
+end
+allowed = or dright PIPE_CTL_RIGHTS
+if eq and rights dright 0
+ret false
+end
+if ne and rights xor uint 0xffffffff src_r 0
+ret false
+end
+ret eq and rights xor uint 0xffffffff allowed 0
+end
+
+fn pipe_dup from_tbl ulong h ulong to_tbl ulong rights uint h_out edit ulong 1 to uint
+if ge to_tbl 2
+ret OSH_E_INVALID_ARG
+end
+need_ctl = PIPE_R_GRANT
+if eq from_tbl to_tbl
+need_ctl = PIPE_R_DERIVE
+end
+ie = new uint 2 0
+rc = pipe_resolve from_tbl h need_ctl 2 false ie
+if ne rc OSH_E_OK
+ret rc
+end
+pos = add mul from_tbl PIPE_CAP_SLOTS ulong and h 0xffffffff
+if not pipe_dup_rights_ok get pcap_rights pos get ie 1 rights
+ret OSH_E_DENIED
+end
+if not pcap_insert to_tbl get pcap_res pos rights h_out
+ret OSH_E_LIMIT
+end
+mbase = mul ulong get ie 0 8
+if eq get ie 1 PIPE_END_READ
+put pipe_meta add mbase 3 add get pipe_meta add mbase 3 1
+else
+put pipe_meta add mbase 4 add get pipe_meta add mbase 4 1
+end
+ret OSH_E_OK
+end
+
+fn pipe_user_window_ok base ulong slen ulong user_lo ulong user_hi ulong to bool
+if eq slen 0
+ret true
+end
+if or gt user_hi PIPE_USER_TOP le user_hi user_lo
+ret false
+end
+if or lt base user_lo ge base user_hi
+ret false
+end
+ret le slen sub user_hi base
+end
+
+fn pipe_dispatch_check frame view ulong * to uint
+ncells = len frame
+if lt ncells 4
+ret OSH_E_INVALID_ARG
+end
+if or ne get frame 0 PIPE_FRAME_MAGIC ne get frame 3 0
+ret OSH_E_INVALID_ARG
+end
+if ne get frame 1 PIPE_ABI_VERSION
+ret OSH_E_NOT_SUPPORTED
+end
+op = get frame 2
+if eq op PIPE_OP_CREATE
+if ne ncells 4
+ret OSH_E_INVALID_ARG
+end
+ret OSH_E_OK
+end
+if or eq op PIPE_OP_READ eq op PIPE_OP_WRITE
+if ne ncells 6
+ret OSH_E_INVALID_ARG
+end
+if or eq shr get frame 4 32 0 gt get frame 5 1
+ret OSH_E_INVALID_ARG
+end
+ret OSH_E_OK
+end
+if eq op PIPE_OP_CLOSE
+if ne ncells 5
+ret OSH_E_INVALID_ARG
+end
+if eq shr get frame 4 32 0
+ret OSH_E_INVALID_ARG
+end
+ret OSH_E_OK
+end
+if eq op PIPE_OP_DUP
+if ne ncells 7
+ret OSH_E_INVALID_ARG
+end
+if or eq shr get frame 4 32 0 gt get frame 6 1
+ret OSH_E_INVALID_ARG
+end
+ret OSH_E_OK
+end
+ret OSH_E_NOT_SUPPORTED
+end

@@ -1,0 +1,204 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/disk_file.om: Pure-Omega Hosted File-Backed Disk Backend with Power-Cut Injection.
+note Converted from upstream aienux native/disk/disk_file.{h,c}.
+note Compose with: si/directives/om2.om aienux/disk/disk.om aienux/disk/disk_file.om aienux/disk/disk_sdhci.om <test.om>
+
+note Linux AArch64 open(2) flags: O_RDWR=2, O_CREAT=64, O_TRUNC=512
+const DFILE_O_RDWR int 2
+const DFILE_O_CREATE_TRUNC int 578
+const DFILE_MODE_0600 int 384
+const DFILE_EINTR long -4
+
+note File backend state
+global df_fd int 1
+global df_bsz uint 1
+global df_bcnt ulong 1
+global df_cut_armed uchar 1
+global df_cut_rem ulong 1
+global df_written ulong 1
+global df_flushes ulong 1
+
+fn df_full_pread fd int buf edit uchar * off ulong nbytes ulong pos ulong to int
+done = ulong 0
+while lt done nbytes bound 65536
+k = pread fd buf add off done sub nbytes done long add pos done
+if eq k DFILE_EINTR
+continue
+end
+if le k 0
+ret -1
+end
+done = add done ulong k
+end
+ret 0
+end
+
+fn df_full_pwrite fd int buf view uchar * off ulong nbytes ulong pos ulong to int
+done = ulong 0
+while lt done nbytes bound 65536
+k = pwrite fd buf add off done sub nbytes done long add pos done
+if eq k DFILE_EINTR
+continue
+end
+if le k 0
+ret -1
+end
+done = add done ulong k
+end
+ret 0
+end
+
+fn df_stat_size fd int to ulong
+stbuf = new uchar 128 0
+sr = fstat fd stbuf 0 128
+if lt sr 0
+ret 0
+end
+sz = ulong 0
+for i ulong 8
+b = ulong get stbuf add 48 i
+sz = or sz shl b mul i 8
+end
+ret sz
+end
+
+fn disk_file_open dev edit DiskDev path view uchar * bsz uint bcnt ulong create uint to int
+if and ne bsz 512 ne bsz 4096
+ret DISK_EGEOMETRY
+end
+put df_fd 0 -1
+put df_bsz 0 0
+put df_bcnt 0 0
+put df_cut_armed 0 0
+put df_cut_rem 0 0
+put df_written 0 0
+put df_flushes 0 0
+flags = DFILE_O_RDWR
+if ne create 0
+flags = DFILE_O_CREATE_TRUNC
+end
+fd_r = fopen path 0 len path flags DFILE_MODE_0600
+if lt fd_r 0
+ret DISK_EIO
+end
+fd = int fd_r
+if ne create 0
+if eq bcnt 0
+cl = fclose fd
+ret DISK_EIO
+end
+total = mul bcnt ulong bsz
+tr = ftrunc fd long total
+if lt tr 0
+cl = fclose fd
+ret DISK_EIO
+end
+else
+sz = df_stat_size fd
+if or eq sz 0 ne rem sz ulong bsz 0
+cl = fclose fd
+ret DISK_EGEOMETRY
+end
+fblks = div sz ulong bsz
+if eq bcnt 0
+bcnt = fblks
+else
+if ne bcnt fblks
+cl = fclose fd
+ret DISK_EGEOMETRY
+end
+end
+end
+put df_fd 0 fd
+put df_bsz 0 bsz
+put df_bcnt 0 bcnt
+put dev backend DISK_BACKEND_FILE
+put dev block_size bsz
+put dev block_count bcnt
+put dev max_blocks 256
+ret DISK_OK
+end
+
+fn disk_file_close to void
+fd = get df_fd 0
+if ge fd 0
+cl = fclose fd
+put df_fd 0 -1
+end
+end
+
+fn disk_file_arm_cut blocks_allowed ulong to void
+put df_cut_armed 0 1
+put df_cut_rem 0 blocks_allowed
+end
+
+fn disk_file_disarm to void
+put df_cut_armed 0 0
+put df_cut_rem 0 0
+end
+
+fn disk_file_blocks_written to ulong
+ret get df_written 0
+end
+
+fn disk_file_flushes to ulong
+ret get df_flushes 0
+end
+
+fn disk_file_read lba ulong cnt uint buf edit uchar * off ulong to int
+fd = get df_fd 0
+if lt fd 0
+ret DISK_ESTATE
+end
+bsz = ulong get df_bsz 0
+nbytes = mul ulong cnt bsz
+pos = mul lba bsz
+rc = df_full_pread fd buf off nbytes pos
+if ne rc 0
+ret DISK_EIO
+end
+ret DISK_OK
+end
+
+fn disk_file_write lba ulong cnt uint buf view uchar * off ulong to int
+fd = get df_fd 0
+if lt fd 0
+ret DISK_ESTATE
+end
+bsz = ulong get df_bsz 0
+i = uint 0
+while lt i cnt bound 65536
+if ne get df_cut_armed 0 0
+rem_b = get df_cut_rem 0
+if eq rem_b 0
+ret DISK_EPOWER
+end
+put df_cut_rem 0 sub rem_b 1
+end
+boff = add off mul ulong i bsz
+pos = mul add lba ulong i bsz
+rc = df_full_pwrite fd buf boff bsz pos
+if ne rc 0
+ret DISK_EIO
+end
+put df_written 0 add get df_written 0 1
+i = add i 1
+end
+ret DISK_OK
+end
+
+fn disk_file_flush to int
+fd = get df_fd 0
+if lt fd 0
+ret DISK_ESTATE
+end
+if and ne get df_cut_armed 0 0 eq get df_cut_rem 0 0
+ret DISK_EPOWER
+end
+put df_flushes 0 add get df_flushes 0 1
+rc = fdsync fd
+if lt rc 0
+ret DISK_EIO
+end
+ret DISK_OK
+end

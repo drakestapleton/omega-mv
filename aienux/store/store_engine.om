@@ -1,0 +1,1575 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/store/store_engine.om: Pure-Omega Store v1 mount, transaction, and disk geometry engine.
+note Faithful OM-2 library (no om2 line, no fn main) converted from upstream aienux
+note native/store/store_engine.{h,c} and native/store/store_disk.c.
+note Compose after: si/directives/om2.om aienux/store/store_v1.om aienux/store/store_engine.om ... om/tls/sha2.om
+
+note MountState
+const ST_VALID int 0
+const ST_DEGRADED_RECOVERY int 1
+
+note PeerCondition
+const ST_PEER_ZERO int 0
+const ST_PEER_VALID int 1
+const ST_PEER_MALFORMED int 2
+const ST_PEER_GRAPH_BAD_NEWER int 3
+const ST_PEER_GRAPH_BAD_OLDER int 4
+
+note MountError
+const ST_M_IO int -101
+const ST_M_UNFORMATTED int -102
+const ST_M_FOREIGN int -103
+const ST_M_UNSUPPORTED_VERSION int -104
+const ST_M_CORRUPT_RECOVERY_REQUIRED int -105
+const ST_M_CONFLICTING_ROOTS int -106
+const ST_M_INCONSISTENT_HISTORY int -107
+
+note StoreError
+const ST_E_IO int -201
+const ST_E_CORRUPT int -202
+const ST_E_READ_ONLY_DEGRADED int -203
+const ST_E_DUPLICATE_OBJECT_CONFLICT int -204
+const ST_E_NO_SPACE int -205
+const ST_E_CATALOG_FULL int -206
+const ST_E_GENERATION_EXHAUSTED int -207
+const ST_E_TRANSACTION_LIMIT int -208
+const ST_E_INVALID_OBJECT int -209
+const ST_E_NEEDS_REOPEN int -210
+const ST_E_ARG int -211
+const ST_E_GEOMETRY int -212
+
+note Internal root-validation results
+const ST_RE_OK int 0
+const ST_RE_IO int 1
+const ST_RE_GRAPH int 2
+
+note Media and workspace capacities
+const ST_MEDIA_UNITS ulong 256
+const ST_MEDIA_BYTES ulong 1048576
+const ST_CAT_CAP ulong 512
+const ST_CAT_BYTES ulong 32768
+const ST_CATBUF_BYTES ulong 36864
+const ST_TX_MAX_OBJS ulong 16
+const ST_TX_BUF_BYTES ulong 262144
+
+note Engine metadata indices (global st_meta ulong 16)
+const ST_M_BLKSIZE ulong 0
+const ST_M_BLKCNT ulong 1
+const ST_M_BASE_LBA ulong 2
+const ST_M_BPU ulong 3
+const ST_M_REG_UNITS ulong 4
+const ST_M_STATE ulong 5
+const ST_M_PEER ulong 6
+const ST_M_POISONED ulong 7
+const ST_M_CAT_IDX ulong 8
+const ST_M_CAT_N ulong 9
+const ST_M_ACTIVE_SLOT ulong 10
+const ST_M_GEN ulong 11
+const ST_M_HW ulong 12
+const ST_M_FAULT_WRITE ulong 13
+const ST_M_FAULT_FLUSH ulong 14
+const ST_M_WRITE_CNT ulong 15
+
+note Global media and engine state
+global st_meta ulong 16
+global st_media uchar 1048576
+global st_root_sb uchar 4096
+global st_root_cmt uchar 200
+global st_root_cid uchar 32
+global st_root_uuid uchar 16
+
+note Two catalog tables (active + spare, up to 512 entries * 64 bytes each)
+global st_cat0 uchar 32768
+global st_cat1 uchar 32768
+global st_catbuf uchar 36864
+
+note Scratch units and root-open temporaries
+global st_raw0 uchar 4096
+global st_raw1 uchar 4096
+global st_unit uchar 4096
+global st_plan_cmt uchar 4096
+global st_plan_sb uchar 4096
+global st_open_cmt0 uchar 200
+global st_open_cmt1 uchar 200
+global st_open_cid0 uchar 32
+global st_open_cid1 uchar 32
+global st_open_n ulong 2
+
+note Extent scratch for overlap & append-transition checks
+global st_ext_f ulong 512
+global st_ext_e ulong 512
+
+note Transaction staging buffers (up to 16 objects per transaction)
+global st_tx_n ulong 1
+global st_tx_pos ulong 1
+global st_tx_buf uchar 262144
+global st_tx_off ulong 16
+global st_tx_len ulong 16
+global st_tx_kind ushort 16
+global st_tx_ver ushort 16
+global st_tx_id uchar 512
+global st_tx_units uint 16
+global st_tx_first ulong 16
+global st_tx_append uchar 16
+
+note ---- Disk geometry adapter (store_disk.c) ----
+
+fn st_media_zero to void
+for i ulong ST_MEDIA_BYTES
+put st_media i 0
+end
+for i ulong 16
+put st_meta i 0
+end
+put st_meta ST_M_POISONED 1
+end
+
+fn st_set_faults fail_write ulong fail_flush ulong to void
+put st_meta ST_M_FAULT_WRITE fail_write
+put st_meta ST_M_FAULT_FLUSH fail_flush
+put st_meta ST_M_WRITE_CNT 0
+end
+
+fn st_disk_bind blk_size ulong blk_cnt ulong base_lba ulong req_units ulong to int
+bpu = ulong 0
+if eq blk_size 512
+bpu = 8
+else
+if eq blk_size 4096
+bpu = 1
+else
+ret ST_E_GEOMETRY
+end
+end
+if ne rem base_lba bpu 0
+ret ST_E_GEOMETRY
+end
+if ge base_lba blk_cnt
+ret ST_E_GEOMETRY
+end
+max_u = div sub blk_cnt base_lba bpu
+ru = req_units
+if eq ru 0
+ru = max_u
+end
+if or gt ru max_u gt mul add div base_lba bpu ru SV1_UNIT ST_MEDIA_BYTES
+ret ST_E_GEOMETRY
+end
+put st_meta ST_M_BLKSIZE blk_size
+put st_meta ST_M_BLKCNT blk_cnt
+put st_meta ST_M_BASE_LBA base_lba
+put st_meta ST_M_BPU bpu
+put st_meta ST_M_REG_UNITS ru
+ret SV1_OK
+end
+
+fn st_dev_read unit ulong dst edit uchar 4096 to int
+if ge unit get st_meta ST_M_REG_UNITS
+ret ST_E_IO
+end
+bpu = get st_meta ST_M_BPU
+bsize = get st_meta ST_M_BLKSIZE
+lba = add get st_meta ST_M_BASE_LBA mul unit bpu
+boff = mul lba bsize
+if gt add boff SV1_UNIT ST_MEDIA_BYTES
+ret ST_E_IO
+end
+for i ulong 4096
+put dst i get st_media add boff i
+end
+ret SV1_OK
+end
+
+fn st_dev_write unit ulong src view uchar 4096 to int
+if ge unit get st_meta ST_M_REG_UNITS
+ret ST_E_IO
+end
+fw = get st_meta ST_M_FAULT_WRITE
+wcnt = add get st_meta ST_M_WRITE_CNT 1
+put st_meta ST_M_WRITE_CNT wcnt
+if and ne fw 0 eq wcnt fw
+ret ST_E_IO
+end
+bpu = get st_meta ST_M_BPU
+bsize = get st_meta ST_M_BLKSIZE
+lba = add get st_meta ST_M_BASE_LBA mul unit bpu
+boff = mul lba bsize
+if gt add boff SV1_UNIT ST_MEDIA_BYTES
+ret ST_E_IO
+end
+for i ulong 4096
+put st_media add boff i get src i
+end
+ret SV1_OK
+end
+
+fn st_dev_flush to int
+if ne get st_meta ST_M_FAULT_FLUSH 0
+ret ST_E_IO
+end
+ret SV1_OK
+end
+
+fn st_media_poke unit ulong off ulong val uchar to void
+bpu = get st_meta ST_M_BPU
+bsize = get st_meta ST_M_BLKSIZE
+lba = add get st_meta ST_M_BASE_LBA mul unit bpu
+boff = add mul lba bsize off
+if lt boff ST_MEDIA_BYTES
+put st_media boff val
+end
+end
+
+note ---- Catalog table accessors (cat_idx 0 -> st_cat0, 1 -> st_cat1) ----
+
+fn st_cat_get_entry cidx ulong idx ulong dst edit uchar 64 to void
+base = mul idx SV1_CATALOG_ENTRY
+if eq cidx 0
+for i ulong 64
+put dst i get st_cat0 add base i
+end
+else
+for i ulong 64
+put dst i get st_cat1 add base i
+end
+end
+end
+
+fn st_cat_put_entry cidx ulong idx ulong src view uchar 64 to void
+base = mul idx SV1_CATALOG_ENTRY
+if eq cidx 0
+for i ulong 64
+put st_cat0 add base i get src i
+end
+else
+for i ulong 64
+put st_cat1 add base i get src i
+end
+end
+end
+
+fn st_cat_cmp_idx cidx ulong a ulong b ulong to int
+ea = new uchar 64 0
+eb = new uchar 64 0
+st_cat_get_entry cidx a ea
+st_cat_get_entry cidx b eb
+ret sv1_cmp_id ea 0 eb 0
+end
+
+fn st_cat_swap cidx ulong a ulong b ulong to void
+ea = new uchar 64 0
+eb = new uchar 64 0
+st_cat_get_entry cidx a ea
+st_cat_get_entry cidx b eb
+st_cat_put_entry cidx a eb
+st_cat_put_entry cidx b ea
+end
+
+fn st_cat_check_order cidx ulong n ulong to int
+if lt n 2
+ret SV1_OK
+end
+ea = new uchar 64 0
+eb = new uchar 64 0
+i = ulong 0
+lim = sub n 1
+while lt i lim bound 512
+st_cat_get_entry cidx i ea
+st_cat_get_entry cidx add i 1 eb
+c = sv1_cmp_id ea 0 eb 0
+if eq c 0
+ret SV1_E_DUPLICATE_OBJECT
+end
+if gt c 0
+ret SV1_E_CATALOG_ORDER
+end
+i = add i 1
+end
+ret SV1_OK
+end
+
+fn st_cat_find cidx ulong n ulong id view uchar * to int
+lo = ulong 0
+hi = n
+ent = new uchar 64 0
+while lt lo hi bound 32
+mid = add lo div sub hi lo 2
+st_cat_get_entry cidx mid ent
+c = sv1_cmp_id ent 0 id 0
+if eq c 0
+ret int mid
+end
+if lt c 0
+lo = add mid 1
+else
+hi = mid
+end
+end
+ret -1
+end
+
+fn st_cat_sift cidx ulong start ulong n ulong to void
+root = start
+while true bound 32
+ch = add mul 2 root 1
+if ge ch n
+ret
+end
+if lt add ch 1 n
+if lt st_cat_cmp_idx cidx ch add ch 1 0
+ch = add ch 1
+end
+end
+if ge st_cat_cmp_idx cidx root ch 0
+ret
+end
+st_cat_swap cidx root ch
+root = ch
+end
+end
+
+fn st_cat_sort cidx ulong n ulong to void
+if lt n 2
+ret
+end
+i = div n 2
+while gt i 0 bound 512
+i = sub i 1
+st_cat_sift cidx i n
+end
+en = sub n 1
+while gt en 0 bound 512
+st_cat_swap cidx 0 en
+st_cat_sift cidx 0 en
+en = sub en 1
+end
+end
+
+note ---- Extent heapsort (st_ext_f / st_ext_e) ----
+
+fn st_ext_less a ulong b ulong to bool
+fa = get st_ext_f a
+fb = get st_ext_f b
+if lt fa fb
+ret true
+end
+if eq fa fb
+ret lt get st_ext_e a get st_ext_e b
+end
+ret false
+end
+
+fn st_ext_swap a ulong b ulong to void
+tf = get st_ext_f a
+te = get st_ext_e a
+put st_ext_f a get st_ext_f b
+put st_ext_e a get st_ext_e b
+put st_ext_f b tf
+put st_ext_e b te
+end
+
+fn st_ext_sift start ulong n ulong to void
+root = start
+while true bound 32
+ch = add mul 2 root 1
+if ge ch n
+ret
+end
+if lt add ch 1 n
+if st_ext_less ch add ch 1
+ch = add ch 1
+end
+end
+if not st_ext_less root ch
+ret
+end
+st_ext_swap root ch
+root = ch
+end
+end
+
+fn st_ext_sort n ulong to void
+if lt n 2
+ret
+end
+i = div n 2
+while gt i 0 bound 512
+i = sub i 1
+st_ext_sift i n
+end
+en = sub n 1
+while gt en 0 bound 512
+st_ext_swap 0 en
+st_ext_sift 0 en
+en = sub en 1
+end
+end
+
+note ---- Catalog encode / decode / validate ----
+
+fn st_cat_encode_to_buf cidx ulong n ulong out_len edit ulong 1 to int
+if gt n ST_CAT_CAP
+ret SV1_E_CATALOG_TOO_LARGE
+end
+r = st_cat_check_order cidx n
+if ne r SV1_OK
+ret r
+end
+clen = sv1_catalog_len n
+if gt clen ST_CATBUF_BYTES
+ret SV1_E_ARG
+end
+hdr = new uchar 16 0
+for i ulong 8
+put hdr i get sv1_cat_magic i
+end
+sv1_put16 hdr 8 1
+sv1_put16 hdr 10 ushort SV1_CATALOG_ENTRY
+sv1_put32 hdr 12 uint n
+for i ulong 16
+put st_catbuf i get hdr i
+end
+ent = new uchar 64 0
+i = ulong 0
+while lt i n bound 512
+st_cat_get_entry cidx i ent
+r = sv1_entry_validate_shape ent 0
+if ne r SV1_OK
+ret r
+end
+off = add SV1_CATALOG_HEADER mul i SV1_CATALOG_ENTRY
+for j ulong 64
+put st_catbuf add off j get ent j
+end
+i = add i 1
+end
+put out_len 0 clen
+ret SV1_OK
+end
+
+fn st_cat_decode_from_buf blen ulong cidx ulong n_out edit ulong 1 to int
+if lt blen SV1_CATALOG_HEADER
+ret SV1_E_INVALID_LENGTH
+end
+hdr = new uchar 16 0
+for i ulong 16
+put hdr i get st_catbuf i
+end
+if not sv1_equal part hdr 0 8 sv1_cat_magic
+ret SV1_E_BAD_CATALOG_MAGIC
+end
+if or ne sv1_get16 hdr 8 1 ne sv1_get16 hdr 10 ushort SV1_CATALOG_ENTRY
+ret SV1_E_UNSUPPORTED_VERSION
+end
+cnt = ulong sv1_get32 hdr 12
+if gt cnt SV1_MAX_CATALOG_ENTRIES
+ret SV1_E_CATALOG_TOO_LARGE
+end
+if ne blen sv1_catalog_len cnt
+ret SV1_E_INVALID_LENGTH
+end
+if gt cnt ST_CAT_CAP
+ret SV1_E_ARG
+end
+ent = new uchar 64 0
+i = ulong 0
+while lt i cnt bound 512
+off = add SV1_CATALOG_HEADER mul i SV1_CATALOG_ENTRY
+for j ulong 64
+put ent j get st_catbuf add off j
+end
+r = sv1_entry_validate_shape ent 0
+if ne r SV1_OK
+ret r
+end
+st_cat_put_entry cidx i ent
+i = add i 1
+end
+r = st_cat_check_order cidx cnt
+if ne r SV1_OK
+ret r
+end
+put n_out 0 cnt
+ret SV1_OK
+end
+
+fn st_cat_validate_extents cidx ulong n ulong reg_u ulong cat_fu ulong hw ulong to int
+if or lt reg_u 4 gt reg_u SV1_MAX_REGION_UNITS
+ret SV1_E_OUT_OF_BOUNDS
+end
+if or lt hw 4 gt hw reg_u
+ret SV1_E_OUT_OF_BOUNDS
+end
+if or lt cat_fu 2 ge cat_fu reg_u
+ret SV1_E_OUT_OF_BOUNDS
+end
+ent = new uchar 64 0
+i = ulong 0
+while lt i n bound 512
+st_cat_get_entry cidx i ent
+r = sv1_entry_validate_bounds ent 0 reg_u cat_fu hw
+if ne r SV1_OK
+ret r
+end
+fu = sv1_get64 ent 36
+uc = ulong sv1_get32 ent 52
+put st_ext_f i fu
+put st_ext_e i add fu uc
+i = add i 1
+end
+st_ext_sort n
+if ge n 2
+lim = sub n 1
+i = ulong 0
+while lt i lim bound 512
+if gt get st_ext_e i get st_ext_f add i 1
+ret SV1_E_OVERLAP
+end
+i = add i 1
+end
+end
+ret SV1_OK
+end
+
+note ---- Streamed object verification & reading ----
+
+fn st_hash_unit_step ctx edit ulong 40 ubuf view uchar 4096 start ulong blen ulong to bool
+take = ulong 0
+if gt blen start
+take = sub blen start
+end
+if gt take SV1_UNIT
+take = SV1_UNIT
+end
+sha256_update ctx part ubuf 0 take
+ret sv1_all_zero ubuf take sub SV1_UNIT take
+end
+
+fn st_verify_digest ctx edit ulong 40 ent view uchar 64 to int
+got = new uchar 32 0
+sha256_final ctx got
+if not sv1_equal got part ent 0 32
+ret ST_RE_GRAPH
+end
+ret ST_RE_OK
+end
+
+fn st_verify_app_object ent view uchar 64 to int
+kind = sv1_get16 ent 32
+ver = sv1_get16 ent 34
+fu = sv1_get64 ent 36
+blen = sv1_get64 ent 44
+ucnt = sv1_get32 ent 52
+ctx = new ulong 40 0
+graph = false
+u = new uint 1 0
+if or ne sv1_unit_count blen u SV1_OK ne get u 0 ucnt
+graph = true
+end
+if not graph
+if ne sv1_object_id_begin ctx kind ver blen SV1_OK
+graph = true
+end
+end
+ubuf = new uchar 4096 0
+i = ulong 0
+ulim = ulong ucnt
+while lt i ulim bound 256
+if ne st_dev_read add fu i ubuf SV1_OK
+ret ST_RE_IO
+end
+if not graph
+if not st_hash_unit_step ctx ubuf mul i SV1_UNIT blen
+graph = true
+end
+end
+i = add i 1
+end
+if graph
+ret ST_RE_GRAPH
+end
+ret st_verify_digest ctx ent
+end
+
+fn st_load_cat_units cat_fu ulong cat_uc ulong cat_bl ulong to int
+if gt mul cat_uc SV1_UNIT ST_CATBUF_BYTES
+ret ST_RE_GRAPH
+end
+ubuf = new uchar 4096 0
+i = ulong 0
+while lt i cat_uc bound 65
+if ne st_dev_read add cat_fu i ubuf SV1_OK
+ret ST_RE_IO
+end
+off = mul i SV1_UNIT
+for j ulong 4096
+put st_catbuf add off j get ubuf j
+end
+i = add i 1
+end
+p_start = cat_bl
+p_end = mul cat_uc SV1_UNIT
+while lt p_start p_end bound 36864
+if ne get st_catbuf p_start 0
+ret ST_RE_GRAPH
+end
+p_start = add p_start 1
+end
+ret ST_RE_OK
+end
+
+fn st_hash_catbuf cat_bl ulong digest_out edit uchar 32 to int
+ctx = new ulong 40 0
+if ne sv1_object_id_begin ctx SV1_KIND_CATALOG SV1_VERSION cat_bl SV1_OK
+ret ST_RE_GRAPH
+end
+ubuf = new uchar 4096 0
+pos = ulong 0
+while lt pos cat_bl bound 65
+take = sub cat_bl pos
+if gt take SV1_UNIT
+take = SV1_UNIT
+end
+for j ulong 4096
+if lt j take
+put ubuf j get st_catbuf add pos j
+end
+end
+sha256_update ctx part ubuf 0 take
+pos = add pos take
+end
+sha256_final ctx digest_out
+ret ST_RE_OK
+end
+
+fn st_validate_root_cat cmt_out view uchar 200 cidx ulong n_out edit ulong 1 to int
+cat_fu = sv1_get64 cmt_out 168
+cat_bl = sv1_get64 cmt_out 176
+cat_uc = ulong sv1_get32 cmt_out 184
+lr = st_load_cat_units cat_fu cat_uc cat_bl
+if ne lr ST_RE_OK
+ret lr
+end
+got_cat_id = new uchar 32 0
+hr = st_hash_catbuf cat_bl got_cat_id
+if ne hr ST_RE_OK
+ret hr
+end
+if not sv1_equal got_cat_id part cmt_out 136 32
+ret ST_RE_GRAPH
+end
+if ne st_cat_decode_from_buf cat_bl cidx n_out SV1_OK
+ret ST_RE_GRAPH
+end
+cnt = get n_out 0
+if ne cnt ulong sv1_get32 cmt_out 188
+ret ST_RE_GRAPH
+end
+if ne st_cat_validate_extents cidx cnt sv1_get64 cmt_out 48 cat_fu sv1_get64 cmt_out 192 SV1_OK
+ret ST_RE_GRAPH
+end
+ent = new uchar 64 0
+i = ulong 0
+while lt i cnt bound 512
+st_cat_get_entry cidx i ent
+r = st_verify_app_object ent
+if ne r ST_RE_OK
+ret r
+end
+i = add i 1
+end
+ret ST_RE_OK
+end
+
+fn st_validate_root sb view uchar 4096 cidx ulong cmt_out edit uchar 200 cid_out edit uchar 32 n_out edit ulong 1 to int
+if ne sv1_get64 sb 48 get st_meta ST_M_REG_UNITS
+ret ST_RE_GRAPH
+end
+ubuf = new uchar 4096 0
+if ne st_dev_read sv1_get64 sb 96 ubuf SV1_OK
+ret ST_RE_IO
+end
+if not sv1_all_zero ubuf SV1_COMMIT_BYTES sub SV1_UNIT SV1_COMMIT_BYTES
+ret ST_RE_GRAPH
+end
+if ne sv1_object_id SV1_KIND_COMMIT SV1_VERSION part ubuf 0 SV1_COMMIT_BYTES cid_out SV1_OK
+ret ST_RE_GRAPH
+end
+if not sv1_equal cid_out part sb 64 32
+ret ST_RE_GRAPH
+end
+for i ulong 200
+put cmt_out i get ubuf i
+end
+if ne sv1_commit_validate cmt_out 0 SV1_OK
+ret ST_RE_GRAPH
+end
+if ne sv1_superblock_validate_commit sb cid_out cmt_out SV1_OK
+ret ST_RE_GRAPH
+end
+ret st_validate_root_cat cmt_out cidx n_out
+end
+
+fn st_verify_append_trans old_idx ulong old_n ulong new_idx ulong new_n ulong old_hw ulong new_cat_fu ulong to int
+oe = new uchar 64 0
+ne_ent = new uchar 64 0
+i = ulong 0
+while lt i old_n bound 512
+st_cat_get_entry old_idx i oe
+j = st_cat_find new_idx new_n part oe 0 32
+if lt j 0
+ret ST_M_INCONSISTENT_HISTORY
+end
+st_cat_get_entry new_idx ulong j ne_ent
+if not sv1_equal ne_ent oe
+ret ST_M_INCONSISTENT_HISTORY
+end
+i = add i 1
+end
+k = ulong 0
+i = ulong 0
+while lt i new_n bound 512
+st_cat_get_entry new_idx i ne_ent
+j = st_cat_find old_idx old_n part ne_ent 0 32
+if ge j 0
+st_cat_get_entry old_idx ulong j oe
+if not sv1_equal oe ne_ent
+ret ST_M_INCONSISTENT_HISTORY
+end
+else
+put st_ext_f k sv1_get64 ne_ent 36
+put st_ext_e k ulong sv1_get32 ne_ent 52
+k = add k 1
+end
+i = add i 1
+end
+st_ext_sort k
+nxt = old_hw
+i = ulong 0
+while lt i k bound 512
+if ne get st_ext_f i nxt
+ret ST_M_INCONSISTENT_HISTORY
+end
+uc = get st_ext_e i
+if gt nxt sub SV1_U64_MAX uc
+ret ST_M_INCONSISTENT_HISTORY
+end
+nxt = add nxt uc
+i = add i 1
+end
+if ne nxt new_cat_fu
+ret ST_M_INCONSISTENT_HISTORY
+end
+ret SV1_OK
+end
+
+fn st_install_root slot ulong sb view uchar 4096 cmt view uchar 200 cid view uchar 32 n ulong to void
+for i ulong 4096
+put st_root_sb i get sb i
+end
+for i ulong 200
+put st_root_cmt i get cmt i
+end
+for i ulong 32
+put st_root_cid i get cid i
+end
+for i ulong 16
+put st_root_uuid i get sb add 28 i
+end
+put st_meta ST_M_CAT_IDX slot
+put st_meta ST_M_CAT_N n
+put st_meta ST_M_ACTIVE_SLOT ulong sv1_get32 sb 44
+put st_meta ST_M_GEN sv1_get64 cmt 56
+put st_meta ST_M_HW sv1_get64 cmt 192
+end
+
+fn st_is_unsup_sb sb view uchar 4096 magic bool crc_ok bool to bool
+if or not magic not crc_ok
+ret false
+end
+if or ne sv1_get16 sb 8 1 ne sv1_get16 sb 10 0
+ret true
+end
+ret not sv1_all_zero sb 12 16
+end
+
+note ---- Public Store Engine API ----
+
+fn st_format uuid view uchar 16 to int
+ru = get st_meta ST_M_REG_UNITS
+if or lt ru 4 gt ru SV1_MAX_REGION_UNITS
+ret SV1_E_MALFORMED_COMMIT
+end
+g = new uchar 16384 0
+r = sv1_genesis_units uuid ru g
+if ne r SV1_OK
+ret r
+end
+zu = new uchar 4096 0
+if or ne st_dev_write 0 zu SV1_OK or ne st_dev_write 1 zu SV1_OK ne st_dev_flush SV1_OK
+ret ST_E_IO
+end
+u2 = new uchar 4096 0
+u3 = new uchar 4096 0
+u0 = new uchar 4096 0
+for i ulong 4096
+put u0 i get g i
+put u2 i get g add 8192 i
+put u3 i get g add 12288 i
+end
+if or ne st_dev_write 2 u2 SV1_OK or ne st_dev_write 3 u3 SV1_OK ne st_dev_flush SV1_OK
+ret ST_E_IO
+end
+if or ne st_dev_write 0 u0 SV1_OK ne st_dev_flush SV1_OK
+ret ST_E_IO
+end
+ret SV1_OK
+end
+
+note Slot flags: 1=zero 2=magic 4=crc 8=unsup 16=dec 32=mal 64=cs 128=have 256=gbad
+fn st_classify_slot r view uchar 4096 slot uint ru ulong to uint
+fl = uint 0
+z = sv1_all_zero r 0 SV1_UNIT
+m = sv1_equal part r 0 8 sv1_sb_magic
+c = sv1_superblock_crc_ok r 0
+u = st_is_unsup_sb r m c
+if z
+fl = or fl 1
+end
+if m
+fl = or fl 2
+end
+if c
+fl = or fl 4
+end
+if u
+fl = or fl 8
+end
+if not z
+if or not m or not c u
+fl = or fl 32
+else
+fl = or fl 64
+if or ne sv1_superblock_decode r 0 slot SV1_OK ne sv1_get64 r 48 ru
+fl = or fl 32
+else
+fl = or fl 16
+end
+end
+end
+ret fl
+end
+
+fn st_open_both_valid r0 view uchar 4096 cmt0 view uchar 200 cid0 view uchar 32 r1 view uchar 4096 cmt1 view uchar 200 cid1 view uchar 32 to int
+n0 = ulong sv1_get32 cmt0 188
+n1 = ulong sv1_get32 cmt1 188
+g0 = sv1_get64 cmt0 56
+g1 = sv1_get64 cmt1 56
+if eq g0 g1
+if not sv1_superblock_equivalent r0 r1
+ret ST_M_CONFLICTING_ROOTS
+end
+st_install_root 0 r0 cmt0 cid0 n0
+put st_meta ST_M_STATE ulong long ST_VALID
+put st_meta ST_M_PEER ulong long ST_PEER_VALID
+ret SV1_OK
+end
+if lt g0 g1
+if or eq g0 SV1_U64_MAX ne add g0 1 g1
+ret ST_M_INCONSISTENT_HISTORY
+end
+if not sv1_commit_identifies_pred cmt1 cmt0 cid0
+ret ST_M_INCONSISTENT_HISTORY
+end
+ar = st_verify_append_trans 0 n0 1 n1 sv1_get64 cmt0 192 sv1_get64 cmt1 168
+if ne ar SV1_OK
+ret ar
+end
+st_install_root 1 r1 cmt1 cid1 n1
+else
+if or eq g1 SV1_U64_MAX ne add g1 1 g0
+ret ST_M_INCONSISTENT_HISTORY
+end
+if not sv1_commit_identifies_pred cmt0 cmt1 cid1
+ret ST_M_INCONSISTENT_HISTORY
+end
+ar = st_verify_append_trans 1 n1 0 n0 sv1_get64 cmt1 192 sv1_get64 cmt0 168
+if ne ar SV1_OK
+ret ar
+end
+st_install_root 0 r0 cmt0 cid0 n0
+end
+put st_meta ST_M_STATE ulong long ST_VALID
+put st_meta ST_M_PEER ulong long ST_PEER_VALID
+ret SV1_OK
+end
+
+fn st_open_one_peer r_good view uchar 4096 r_other view uchar 4096 fl_other uint to int
+if ne and fl_other 1 0
+put st_meta ST_M_STATE ulong long ST_VALID
+put st_meta ST_M_PEER ulong long ST_PEER_ZERO
+ret SV1_OK
+end
+if ne and fl_other 32 0
+put st_meta ST_M_STATE ulong long ST_DEGRADED_RECOVERY
+put st_meta ST_M_PEER ulong long ST_PEER_MALFORMED
+ret SV1_OK
+end
+if and ne and fl_other 256 0 ne and fl_other 64 0
+og = sv1_get64 r_other 56
+gg = sv1_get64 r_good 56
+if gt og gg
+put st_meta ST_M_STATE ulong long ST_DEGRADED_RECOVERY
+put st_meta ST_M_PEER ulong long ST_PEER_GRAPH_BAD_NEWER
+ret SV1_OK
+end
+if lt og gg
+put st_meta ST_M_STATE ulong long ST_VALID
+put st_meta ST_M_PEER ulong long ST_PEER_GRAPH_BAD_OLDER
+ret SV1_OK
+end
+end
+ret ST_M_CORRUPT_RECOVERY_REQUIRED
+end
+
+fn st_open_impl to int
+ru = get st_meta ST_M_REG_UNITS
+if or lt ru 4 gt ru SV1_MAX_REGION_UNITS
+ret ST_M_CORRUPT_RECOVERY_REQUIRED
+end
+r0 = new uchar 4096 0
+r1 = new uchar 4096 0
+if ne st_dev_read 0 r0 SV1_OK
+ret ST_M_IO
+end
+if ne st_dev_read 1 r1 SV1_OK
+ret ST_M_IO
+end
+f0 = st_classify_slot r0 0 ru
+f1 = st_classify_slot r1 1 ru
+if and ne and f0 1 0 ne and f1 1 0
+ret ST_M_UNFORMATTED
+end
+if and eq and f0 2 0 eq and f1 2 0
+ret ST_M_FOREIGN
+end
+if or eq and f0 12 12 eq and f1 12 12
+ret ST_M_UNSUPPORTED_VERSION
+end
+cmt0 = new uchar 200 0
+cid0 = new uchar 32 0
+ntmp = new ulong 1 0
+if ne and f0 16 0
+vr0 = st_validate_root r0 0 cmt0 cid0 ntmp
+if eq vr0 ST_RE_IO
+ret ST_M_IO
+end
+if eq vr0 ST_RE_GRAPH
+f0 = or f0 256
+else
+f0 = or f0 128
+end
+end
+cmt1 = new uchar 200 0
+cid1 = new uchar 32 0
+if ne and f1 16 0
+vr1 = st_validate_root r1 1 cmt1 cid1 ntmp
+if eq vr1 ST_RE_IO
+ret ST_M_IO
+end
+if eq vr1 ST_RE_GRAPH
+f1 = or f1 256
+else
+f1 = or f1 128
+end
+end
+put st_meta ST_M_POISONED 0
+if ne and and f0 f1 128 0
+ret st_open_both_valid r0 cmt0 cid0 r1 cmt1 cid1
+end
+if ne and f0 128 0
+st_install_root 0 r0 cmt0 cid0 ulong sv1_get32 cmt0 188
+ret st_open_one_peer r0 r1 f1
+end
+if ne and f1 128 0
+st_install_root 1 r1 cmt1 cid1 ulong sv1_get32 cmt1 188
+ret st_open_one_peer r1 r0 f0
+end
+ret ST_M_CORRUPT_RECOVERY_REQUIRED
+end
+
+fn st_open to int
+put st_meta ST_M_POISONED 1
+ret st_open_impl
+end
+
+fn st_generation to ulong
+ret get st_meta ST_M_GEN
+end
+
+fn st_high_water to ulong
+ret get st_meta ST_M_HW
+end
+
+fn st_active_slot to ulong
+ret get st_meta ST_M_ACTIVE_SLOT
+end
+
+fn st_state to int
+ret int long get st_meta ST_M_STATE
+end
+
+fn st_peer to int
+ret int long get st_meta ST_M_PEER
+end
+
+fn st_catalog_count to ulong
+ret get st_meta ST_M_CAT_N
+end
+
+fn st_catalog_entry idx ulong dst edit uchar 64 to bool
+if ge idx get st_meta ST_M_CAT_N
+ret false
+end
+st_cat_get_entry get st_meta ST_M_CAT_IDX idx dst
+ret true
+end
+
+fn st_get_uuid dst edit uchar 16 to void
+for i ulong 16
+put dst i get st_root_uuid i
+end
+end
+
+note ---- Transaction builder & commit ----
+
+fn st_tx_begin to void
+put st_tx_n 0 0
+put st_tx_pos 0 0
+end
+
+fn st_tx_add kind ushort ver ushort data view uchar * to int
+n = get st_tx_n 0
+if ge n ST_TX_MAX_OBJS
+ret ST_E_TRANSACTION_LIMIT
+end
+dlen = len data
+pos = get st_tx_pos 0
+if gt add pos dlen ST_TX_BUF_BYTES
+ret ST_E_ARG
+end
+put st_tx_kind n kind
+put st_tx_ver n ver
+put st_tx_off n pos
+put st_tx_len n dlen
+i = ulong 0
+while lt i dlen bound 65536
+put st_tx_buf add pos i get data i
+i = add i 1
+end
+put st_tx_pos 0 add pos dlen
+put st_tx_n 0 add n 1
+ret SV1_OK
+end
+
+fn st_write_staged_buf first ulong units ulong boff ulong blen ulong to int
+ubuf = new uchar 4096 0
+i = ulong 0
+while lt i units bound 256
+start = mul i SV1_UNIT
+take = ulong 0
+if gt blen start
+take = sub blen start
+end
+if gt take SV1_UNIT
+take = SV1_UNIT
+end
+for j ulong 4096
+if lt j take
+put ubuf j get st_tx_buf add boff add start j
+else
+put ubuf j 0
+end
+end
+if ne st_dev_write add first i ubuf SV1_OK
+ret ST_E_IO
+end
+i = add i 1
+end
+ret SV1_OK
+end
+
+fn st_write_catbuf first ulong units ulong blen ulong to int
+ubuf = new uchar 4096 0
+i = ulong 0
+while lt i units bound 65
+start = mul i SV1_UNIT
+take = ulong 0
+if gt blen start
+take = sub blen start
+end
+if gt take SV1_UNIT
+take = SV1_UNIT
+end
+for j ulong 4096
+if lt j take
+put ubuf j get st_catbuf add start j
+else
+put ubuf j 0
+end
+end
+if ne st_dev_write add first i ubuf SV1_OK
+ret ST_E_IO
+end
+i = add i 1
+end
+ret SV1_OK
+end
+
+fn st_copy_tx_chunk ubuf edit uchar 4096 src ulong take ulong to void
+for j ulong 4096
+if lt j take
+put ubuf j get st_tx_buf add src j
+end
+end
+end
+
+fn st_tx_hash_staged idx ulong id_out edit uchar 32 to int
+boff = get st_tx_off idx
+blen = get st_tx_len idx
+ctx = new ulong 40 0
+r = sv1_object_id_begin ctx get st_tx_kind idx get st_tx_ver idx blen
+if ne r SV1_OK
+ret r
+end
+ubuf = new uchar 4096 0
+pos = ulong 0
+while lt pos blen bound 65
+take = sub blen pos
+if gt take SV1_UNIT
+take = SV1_UNIT
+end
+st_copy_tx_chunk ubuf add boff pos take
+sha256_update ctx part ubuf 0 take
+pos = add pos take
+end
+sha256_final ctx id_out
+ret SV1_OK
+end
+
+fn st_tx_id_eq j ulong id view uchar 32 to bool
+base = mul j 32
+for b ulong 32
+if ne get st_tx_id add base b get id b
+ret false
+end
+end
+ret true
+end
+
+fn st_tx_find_dup k ulong i ulong id view uchar 32 to int
+j = ulong 0
+while lt j k bound 16
+if st_tx_id_eq j id
+if ne get st_tx_kind j get st_tx_kind i
+ret -1
+end
+if ne get st_tx_ver j get st_tx_ver i
+ret -1
+end
+if ne get st_tx_len j get st_tx_len i
+ret -1
+end
+ret 1
+end
+j = add j 1
+end
+ret 0
+end
+
+fn st_tx_step1_dedup n ulong k_out edit ulong 1 to int
+k = ulong 0
+id = new uchar 32 0
+u = new uint 1 0
+i = ulong 0
+while lt i n bound 16
+r = st_tx_hash_staged i id
+if ne r SV1_OK
+ret r
+end
+r = sv1_unit_count get st_tx_len i u
+if ne r SV1_OK
+ret r
+end
+d = st_tx_find_dup k i id
+if lt d 0
+ret ST_E_DUPLICATE_OBJECT_CONFLICT
+end
+if eq d 0
+base = mul k 32
+for b ulong 32
+put st_tx_id add base b get id b
+end
+put st_tx_kind k get st_tx_kind i
+put st_tx_ver k get st_tx_ver i
+put st_tx_off k get st_tx_off i
+put st_tx_len k get st_tx_len i
+put st_tx_units k get u 0
+put st_tx_first k 0
+put st_tx_append k 0
+k = add k 1
+end
+i = add i 1
+end
+put k_out 0 k
+ret SV1_OK
+end
+
+fn st_tx_check_existing old_idx ulong found ulong i ulong ent edit uchar 64 to int
+st_cat_get_entry old_idx found ent
+if or ne sv1_get16 ent 32 get st_tx_kind i ne sv1_get16 ent 34 get st_tx_ver i
+ret ST_E_DUPLICATE_OBJECT_CONFLICT
+end
+if or ne sv1_get64 ent 44 get st_tx_len i ne sv1_get32 ent 52 get st_tx_units i
+ret ST_E_DUPLICATE_OBJECT_CONFLICT
+end
+vr = st_verify_app_object ent
+if eq vr ST_RE_IO
+ret ST_E_IO
+end
+if eq vr ST_RE_GRAPH
+ret ST_E_CORRUPT
+end
+ret SV1_OK
+end
+
+fn st_tx_fill_new_ent ent edit uchar 64 id view uchar 32 i ulong nxt ulong to void
+for b ulong 64
+put ent b 0
+end
+for b ulong 32
+put ent b get id b
+end
+sv1_put16 ent 32 get st_tx_kind i
+sv1_put16 ent 34 get st_tx_ver i
+sv1_put64 ent 36 nxt
+sv1_put64 ent 44 get st_tx_len i
+sv1_put32 ent 52 get st_tx_units i
+sv1_put16 ent 56 0
+end
+
+fn st_tx_load_id i ulong id edit uchar 32 to void
+base = mul i 32
+for b ulong 32
+put id b get st_tx_id add base b
+end
+end
+
+fn st_tx_step2_build_cat k ulong spare ulong out_mn edit ulong 2 to int
+old_idx = get st_meta ST_M_CAT_IDX
+old_n = get st_meta ST_M_CAT_N
+ent = new uchar 64 0
+id = new uchar 32 0
+i = ulong 0
+while lt i old_n bound 512
+st_cat_get_entry old_idx i ent
+st_cat_put_entry spare i ent
+i = add i 1
+end
+m = old_n
+app_u = ulong 0
+nxt = get st_meta ST_M_HW
+i = ulong 0
+while lt i k bound 16
+st_tx_load_id i id
+found = st_cat_find old_idx old_n id
+if ge found 0
+r = st_tx_check_existing old_idx ulong found i ent
+if ne r SV1_OK
+ret r
+end
+else
+if ge m ST_CAT_CAP
+ret ST_E_CATALOG_FULL
+end
+uc = ulong get st_tx_units i
+if gt app_u sub SV1_U64_MAX uc
+ret ST_E_NO_SPACE
+end
+app_u = add app_u uc
+st_tx_fill_new_ent ent id i nxt
+st_cat_put_entry spare m ent
+m = add m 1
+put st_tx_first i nxt
+put st_tx_append i 1
+if gt nxt sub SV1_U64_MAX uc
+ret ST_E_NO_SPACE
+end
+nxt = add nxt uc
+end
+i = add i 1
+end
+st_cat_sort spare m
+if gt app_u SV1_MAX_TX_UNITS
+ret ST_E_TRANSACTION_LIMIT
+end
+put out_mn 0 m
+put out_mn 1 nxt
+ret SV1_OK
+end
+
+note txp: 0=ru 1=ngen 2=cur_gen 3=cat_fu 4=cat_len 5=cat_u 6=m 7=hw 8=cmt_u 9=nslot
+fn st_tx_build_commit txp view ulong 10 cat_id view uchar 32 pc edit uchar 4096 cmt_id edit uchar 32 to int
+for j ulong 8
+put pc j get sv1_cmt_magic j
+end
+sv1_put16 pc 8 1
+sv1_put16 pc 10 ushort SV1_COMMIT_BYTES
+sv1_put16 pc 12 1
+sv1_put16 pc 14 0
+for j ulong 16
+put pc add 32 j get st_root_uuid j
+end
+sv1_put64 pc 48 get txp 0
+sv1_put64 pc 56 get txp 1
+sv1_put64 pc 64 get txp 2
+for j ulong 32
+put pc add 72 j get st_root_cid j
+put pc add 104 j get st_root_cmt add 136 j
+put pc add 136 j get cat_id j
+end
+sv1_put64 pc 168 get txp 3
+sv1_put64 pc 176 get txp 4
+sv1_put32 pc 184 uint get txp 5
+sv1_put32 pc 188 uint get txp 6
+sv1_put64 pc 192 get txp 7
+r = sv1_commit_validate pc 0
+if ne r SV1_OK
+ret r
+end
+ret sv1_object_id SV1_KIND_COMMIT SV1_VERSION part pc 0 SV1_COMMIT_BYTES cmt_id
+end
+
+fn st_tx_build_sb txp view ulong 10 cat_id view uchar 32 cmt_id view uchar 32 psb edit uchar 4096 to void
+for j ulong 8
+put psb j get sv1_sb_magic j
+end
+sv1_put16 psb 8 1
+sv1_put16 psb 10 0
+for j ulong 16
+put psb add 28 j get st_root_uuid j
+end
+sv1_put32 psb 44 uint get txp 9
+sv1_put64 psb 48 get txp 0
+sv1_put64 psb 56 get txp 1
+for j ulong 32
+put psb add 64 j get cmt_id j
+put psb add 104 j get cat_id j
+end
+sv1_put64 psb 96 get txp 8
+sv1_put64 psb 136 get txp 3
+sv1_put64 psb 144 get txp 4
+sv1_put32 psb 152 uint get txp 5
+sv1_put32 psb 156 uint get txp 6
+sv1_put64 psb 160 get txp 7
+sv1_put32 psb SV1_SB_CRC_OFFSET sv1_sb_crc psb 0
+end
+
+fn st_tx_write_all k ulong txp view ulong 10 pc view uchar 4096 psb view uchar 4096 to int
+i = ulong 0
+while lt i k bound 16
+if ne get st_tx_append i 0
+if ne st_write_staged_buf get st_tx_first i ulong get st_tx_units i get st_tx_off i get st_tx_len i SV1_OK
+put st_meta ST_M_POISONED 1
+ret ST_E_IO
+end
+end
+i = add i 1
+end
+if ne st_write_catbuf get txp 3 get txp 5 get txp 4 SV1_OK
+put st_meta ST_M_POISONED 1
+ret ST_E_IO
+end
+if ne st_dev_write get txp 8 pc SV1_OK
+put st_meta ST_M_POISONED 1
+ret ST_E_IO
+end
+if ne st_dev_flush SV1_OK
+put st_meta ST_M_POISONED 1
+ret ST_E_IO
+end
+if ne st_dev_write get txp 9 psb SV1_OK
+put st_meta ST_M_POISONED 1
+ret ST_E_IO
+end
+if ne st_dev_flush SV1_OK
+put st_meta ST_M_POISONED 1
+ret ST_E_IO
+end
+ret SV1_OK
+end
+
+fn st_tx_finish spare ulong m ulong pc view uchar 4096 psb view uchar 4096 cmt_id view uchar 32 to void
+cmt200 = new uchar 200 0
+for j ulong 200
+put cmt200 j get pc j
+end
+st_install_root spare psb cmt200 cmt_id m
+put st_meta ST_M_PEER ulong long ST_PEER_VALID
+end
+
+fn st_tx_commit to int
+if ne get st_meta ST_M_POISONED 0
+ret ST_E_NEEDS_REOPEN
+end
+if eq st_state ST_DEGRADED_RECOVERY
+ret ST_E_READ_ONLY_DEGRADED
+end
+n = get st_tx_n 0
+if gt n ST_TX_MAX_OBJS
+ret ST_E_TRANSACTION_LIMIT
+end
+k_arr = new ulong 1 0
+r = st_tx_step1_dedup n k_arr
+if ne r SV1_OK
+ret r
+end
+k = get k_arr 0
+spare = sub 1 get st_meta ST_M_CAT_IDX
+mn = new ulong 2 0
+r = st_tx_step2_build_cat k spare mn
+if ne r SV1_OK
+ret r
+end
+cat_len_arr = new ulong 1 0
+r = st_cat_encode_to_buf spare get mn 0 cat_len_arr
+if ne r SV1_OK
+ret r
+end
+u = new uint 1 0
+r = sv1_unit_count get cat_len_arr 0 u
+if ne r SV1_OK
+ret r
+end
+txp = new ulong 10 0
+put txp 0 get st_meta ST_M_REG_UNITS
+if eq get st_meta ST_M_GEN SV1_U64_MAX
+ret ST_E_GENERATION_EXHAUSTED
+end
+put txp 2 get st_meta ST_M_GEN
+put txp 1 add get txp 2 1
+put txp 3 get mn 1
+put txp 4 get cat_len_arr 0
+put txp 5 ulong get u 0
+put txp 6 get mn 0
+if gt get txp 3 sub SV1_U64_MAX get txp 5
+ret ST_E_NO_SPACE
+end
+put txp 8 add get txp 3 get txp 5
+if eq get txp 8 SV1_U64_MAX
+ret ST_E_NO_SPACE
+end
+put txp 7 add get txp 8 1
+if or gt get txp 7 get txp 0 gt get txp 7 SV1_MAX_REGION_UNITS
+ret ST_E_NO_SPACE
+end
+put txp 9 sub 1 get st_meta ST_M_ACTIVE_SLOT
+cat_id = new uchar 32 0
+if ne st_hash_catbuf get txp 4 cat_id ST_RE_OK
+ret ST_E_CORRUPT
+end
+pc = new uchar 4096 0
+cmt_id = new uchar 32 0
+r = st_tx_build_commit txp cat_id pc cmt_id
+if ne r SV1_OK
+ret r
+end
+psb = new uchar 4096 0
+st_tx_build_sb txp cat_id cmt_id psb
+r = st_tx_write_all k txp pc psb
+if ne r SV1_OK
+ret r
+end
+st_tx_finish spare get txp 6 pc psb cmt_id
+ret SV1_OK
+end
+
+fn st_zero_dst dst edit uchar * to void
+for z ulong len dst bound 65536
+put dst z 0
+end
+end
+
+fn st_read_unit_step ctx edit ulong 40 ubuf view uchar 4096 dst edit uchar * start ulong blen ulong to bool
+take = ulong 0
+if gt blen start
+take = sub blen start
+end
+if gt take SV1_UNIT
+take = SV1_UNIT
+end
+sha256_update ctx part ubuf 0 take
+ok = sv1_all_zero ubuf take sub SV1_UNIT take
+k = ulong 0
+while lt k take bound 4096
+put dst add start k get ubuf k
+k = add k 1
+end
+ret ok
+end
+
+fn st_read_loop ctx edit ulong 40 ent view uchar 64 dst edit uchar * to int
+blen = sv1_get64 ent 44
+fu = sv1_get64 ent 36
+ucnt = ulong sv1_get32 ent 52
+ubuf = new uchar 4096 0
+bad = false
+i = ulong 0
+while lt i ucnt bound 256
+if ne st_dev_read add fu i ubuf SV1_OK
+st_zero_dst dst
+ret ST_E_IO
+end
+if not st_read_unit_step ctx ubuf dst mul i SV1_UNIT blen
+bad = true
+end
+i = add i 1
+end
+if bad
+ret ST_E_CORRUPT
+end
+ret SV1_OK
+end
+
+fn st_read_object id view uchar 32 dst edit uchar * out_len edit ulong 1 to int
+put out_len 0 0
+cidx = get st_meta ST_M_CAT_IDX
+j = st_cat_find cidx get st_meta ST_M_CAT_N id
+if lt j 0
+ret ST_E_INVALID_OBJECT
+end
+ent = new uchar 64 0
+st_cat_get_entry cidx ulong j ent
+blen = sv1_get64 ent 44
+if gt blen len dst
+ret ST_E_ARG
+end
+ctx = new ulong 40 0
+r = sv1_object_id_begin ctx sv1_get16 ent 32 sv1_get16 ent 34 blen
+if ne r SV1_OK
+st_zero_dst dst
+ret ST_E_CORRUPT
+end
+lr = st_read_loop ctx ent dst
+if eq lr ST_E_IO
+ret ST_E_IO
+end
+got = new uchar 32 0
+sha256_final ctx got
+if or ne lr SV1_OK not sv1_equal got id
+st_zero_dst dst
+ret ST_E_CORRUPT
+end
+put out_len 0 blen
+ret SV1_OK
+end

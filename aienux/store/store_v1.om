@@ -1,0 +1,625 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/store/store_v1.om: Pure-Omega System Store v1 format primitives (ADR 0015).
+note Faithful OM-2 library (no om2 line, no fn main) converted from upstream aienux
+note native/store/store_v1.{h,c} (byte-identical to crates/aienos-kernel/src/store/v1.rs).
+note Compose with: si/directives/om2.om aienux/store/store_v1.om ... om/tls/sha2.om
+
+const SV1_UNIT ulong 4096
+const SV1_MAX_CATALOG_ENTRIES ulong 4096
+const SV1_CATALOG_HEADER ulong 16
+const SV1_CATALOG_ENTRY ulong 64
+const SV1_MAX_OBJECT_BYTES ulong 67108864
+const SV1_MAX_OBJECT_UNITS ulong 16384
+const SV1_MAX_TX_OBJECTS ulong 256
+const SV1_MAX_TX_UNITS ulong 32768
+const SV1_MAX_REGION_UNITS ulong 4294967296
+const SV1_KIND_CATALOG ushort 1
+const SV1_KIND_COMMIT ushort 2
+const SV1_VERSION ushort 1
+const SV1_COMMIT_BYTES ulong 200
+const SV1_SB_CRC_OFFSET ulong 168
+const SV1_SB_RESERVED_OFFSET ulong 172
+const SV1_MAX_CATALOG_UNITS ulong 65
+const SV1_U64_MAX ulong 0xffffffffffffffff
+
+note FormatError codes (matching store_v1.h / v1.rs)
+const SV1_OK int 0
+const SV1_E_INVALID_LENGTH int -1
+const SV1_E_INVALID_OBJECT int -2
+const SV1_E_OBJECT_TOO_LARGE int -3
+const SV1_E_LENGTH_OVERFLOW int -4
+const SV1_E_MALFORMED_DESCRIPTOR int -5
+const SV1_E_OUT_OF_BOUNDS int -6
+const SV1_E_OVERLAP int -7
+const SV1_E_CATALOG_TOO_LARGE int -8
+const SV1_E_CATALOG_ORDER int -9
+const SV1_E_DUPLICATE_OBJECT int -10
+const SV1_E_BAD_CATALOG_MAGIC int -11
+const SV1_E_UNSUPPORTED_VERSION int -12
+const SV1_E_MALFORMED_COMMIT int -13
+const SV1_E_MALFORMED_SUPERBLOCK int -14
+const SV1_E_BAD_SUPERBLOCK_MAGIC int -15
+const SV1_E_BAD_SUPERBLOCK_CRC int -16
+const SV1_E_NONZERO_RESERVED int -17
+const SV1_E_WRONG_SUPERBLOCK_SLOT int -18
+const SV1_E_UNSUPPORTED_FEATURES int -19
+const SV1_E_INTEGRITY int -20
+const SV1_E_INVALID_GENERATION int -21
+const SV1_E_CONFLICTING_ROOTS int -22
+const SV1_E_INCONSISTENT_HISTORY int -23
+const SV1_E_ARG int -24
+
+text sv1_obj_dom "AIENOS-STORE-OBJECT-V1"
+text sv1_cat_magic "AIENCAT1"
+text sv1_cmt_magic "AIENCMT1"
+text sv1_sb_magic "AIENSTR1"
+
+note ---- Byte and comparison helpers ----
+
+fn sv1_put16 buf edit uchar * off ulong v ushort to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+end
+
+fn sv1_put32 buf edit uchar * off ulong v uint to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn sv1_put64 buf edit uchar * off ulong v ulong to void
+for i ulong 8 unroll
+put buf add off i uchar and shr v mul i 8 0xff
+end
+end
+
+fn sv1_get16 buf view uchar * off ulong to ushort
+b0 = ushort get buf off
+b1 = ushort get buf add off 1
+ret or b0 shl b1 8
+end
+
+fn sv1_get32 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = uint get buf add off 1
+b2 = uint get buf add off 2
+b3 = uint get buf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn sv1_get64 buf view uchar * off ulong to ulong
+v = ulong 0
+for i ulong 8 unroll
+b = ulong get buf add off i
+v = or v shl b mul i 8
+end
+ret v
+end
+
+fn sv1_equal a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+cnt = len a
+i = ulong 0
+while lt i cnt bound 266240
+if ne get a i get b i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn sv1_all_zero buf view uchar * off ulong cnt ulong to bool
+i = ulong 0
+while lt i cnt bound 266240
+if ne get buf add off i 0
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+fn sv1_cmp_id a view uchar * aoff ulong b view uchar * boff ulong to int
+for i ulong 32
+va = get a add aoff i
+vb = get b add boff i
+if lt va vb
+ret -1
+end
+if gt va vb
+ret 1
+end
+end
+ret 0
+end
+
+note ---- CRC-32C (Castagnoli, reflected 0x82f63b78) ----
+
+fn sv1_crc32c buf view uchar * off ulong cnt ulong to uint
+crc = uint 0xffffffff
+i = ulong 0
+while lt i cnt bound 65536
+crc = xor crc uint get buf add off i
+for k ulong 8 unroll
+bit = and crc 1
+mask = sub uint 0 bit
+crc = xor shr crc 1 and 0x82f63b78 mask
+end
+i = add i 1
+end
+ret xor crc 0xffffffff
+end
+
+fn sv1_sb_crc buf view uchar * off ulong to uint
+crc = uint 0xffffffff
+for i ulong 4096
+b = uint 0
+if or lt i SV1_SB_CRC_OFFSET ge i add SV1_SB_CRC_OFFSET 4
+b = uint get buf add off i
+end
+crc = xor crc b
+for k ulong 8 unroll
+bit = and crc 1
+mask = sub uint 0 bit
+crc = xor shr crc 1 and 0x82f63b78 mask
+end
+end
+ret xor crc 0xffffffff
+end
+
+fn sv1_superblock_crc_ok buf view uchar * off ulong to bool
+ret eq sv1_sb_crc buf off sv1_get32 buf add off SV1_SB_CRC_OFFSET
+end
+
+note ---- ObjectId and unit count ----
+
+fn sv1_unit_count byte_len ulong dst edit uint 1 to int
+if eq byte_len 0
+ret SV1_E_INVALID_OBJECT
+end
+if gt byte_len SV1_MAX_OBJECT_BYTES
+ret SV1_E_OBJECT_TOO_LARGE
+end
+u = div add byte_len sub SV1_UNIT 1 SV1_UNIT
+if gt u SV1_MAX_OBJECT_UNITS
+ret SV1_E_OBJECT_TOO_LARGE
+end
+put dst 0 uint u
+ret SV1_OK
+end
+
+fn sv1_object_id_begin ctx edit ulong 40 kind ushort ver ushort byte_len ulong to int
+if or eq kind 0 or eq ver 0 eq byte_len 0
+ret SV1_E_INVALID_OBJECT
+end
+if gt byte_len SV1_MAX_OBJECT_BYTES
+ret SV1_E_OBJECT_TOO_LARGE
+end
+z1 = new uchar 1 0
+d = new uchar 12 0
+sv1_put16 d 0 kind
+sv1_put16 d 2 ver
+sv1_put64 d 4 byte_len
+sha256_init ctx
+sha256_update ctx sv1_obj_dom
+sha256_update ctx z1
+sha256_update ctx d
+ret SV1_OK
+end
+
+fn sv1_object_id kind ushort ver ushort data view uchar * dst edit uchar 32 to int
+ctx = new ulong 40 0
+e = sv1_object_id_begin ctx kind ver len data
+if ne e SV1_OK
+ret e
+end
+sha256_update ctx data
+sha256_final ctx dst
+ret SV1_OK
+end
+
+fn sv1_validate_extent id view uchar 32 kind ushort ver ushort byte_len ulong ext view uchar * to int
+u = new uint 1 0
+e = sv1_unit_count byte_len u
+if ne e SV1_OK
+ret e
+end
+if ne len ext mul ulong get u 0 SV1_UNIT
+ret SV1_E_INVALID_LENGTH
+end
+if not sv1_all_zero ext byte_len sub len ext byte_len
+ret SV1_E_NONZERO_RESERVED
+end
+got = new uchar 32 0
+e = sv1_object_id kind ver part ext 0 byte_len got
+if ne e SV1_OK
+ret e
+end
+if not sv1_equal got id
+ret SV1_E_INTEGRITY
+end
+ret SV1_OK
+end
+
+note ---- CatalogEntry (canonical 64-byte wire record) ----
+note Layout: 0..32 object_id | 32 kind u16 | 34 version u16 | 36 first_unit u64
+note         44 byte_length u64 | 52 unit_count u32 | 56 flags u16 | 58..64 zero
+
+fn sv1_entry_validate_shape ent view uchar * off ulong to int
+kind = sv1_get16 ent add off 32
+ver = sv1_get16 ent add off 34
+blen = sv1_get64 ent add off 44
+ucnt = sv1_get32 ent add off 52
+fl = sv1_get16 ent add off 56
+if or lt kind 3 or eq ver 0 ne fl 0
+ret SV1_E_MALFORMED_DESCRIPTOR
+end
+if not sv1_all_zero ent add off 58 6
+ret SV1_E_NONZERO_RESERVED
+end
+u = new uint 1 0
+r = sv1_unit_count blen u
+if ne r SV1_OK
+ret r
+end
+if ne get u 0 ucnt
+ret SV1_E_MALFORMED_DESCRIPTOR
+end
+ret SV1_OK
+end
+
+fn sv1_entry_validate_bounds ent view uchar * off ulong reg_units ulong cat_first ulong hw ulong to int
+r = sv1_entry_validate_shape ent off
+if ne r SV1_OK
+ret r
+end
+if or lt reg_units 4 or gt reg_units SV1_MAX_REGION_UNITS or lt hw 4 gt hw reg_units
+ret SV1_E_OUT_OF_BOUNDS
+end
+fu = sv1_get64 ent add off 36
+uc = ulong sv1_get32 ent add off 52
+if gt fu sub SV1_U64_MAX uc
+ret SV1_E_LENGTH_OVERFLOW
+end
+eu = add fu uc
+if or lt fu 2 gt eu cat_first
+ret SV1_E_OUT_OF_BOUNDS
+end
+if or gt eu hw gt eu reg_units
+ret SV1_E_OUT_OF_BOUNDS
+end
+ret SV1_OK
+end
+
+note ---- Catalog helpers ----
+
+fn sv1_catalog_len n ulong to ulong
+ret add SV1_CATALOG_HEADER mul n SV1_CATALOG_ENTRY
+end
+
+fn sv1_commit_validate_gen buf view uchar * off ulong gen ulong pgen ulong to int
+if eq gen 1
+if ne pgen 0
+ret SV1_E_INVALID_GENERATION
+end
+if not sv1_all_zero buf add off 72 32
+ret SV1_E_INVALID_GENERATION
+end
+if not sv1_all_zero buf add off 104 32
+ret SV1_E_INVALID_GENERATION
+end
+ret SV1_OK
+end
+if eq pgen SV1_U64_MAX
+ret SV1_E_INVALID_GENERATION
+end
+if ne add pgen 1 gen
+ret SV1_E_INVALID_GENERATION
+end
+if sv1_all_zero buf add off 72 32
+ret SV1_E_INVALID_GENERATION
+end
+if sv1_all_zero buf add off 104 32
+ret SV1_E_INVALID_GENERATION
+end
+ret SV1_OK
+end
+
+fn sv1_commit_validate_cat buf view uchar * off ulong reg_u ulong to int
+cat_fu = sv1_get64 buf add off 168
+cat_bl = sv1_get64 buf add off 176
+cat_uc = sv1_get32 buf add off 184
+cat_ec = sv1_get32 buf add off 188
+if or gt ulong cat_ec SV1_MAX_CATALOG_ENTRIES ne cat_bl sv1_catalog_len ulong cat_ec
+ret SV1_E_MALFORMED_COMMIT
+end
+u = new uint 1 0
+r = sv1_unit_count cat_bl u
+if ne r SV1_OK
+ret r
+end
+if ne get u 0 cat_uc
+ret SV1_E_MALFORMED_COMMIT
+end
+if gt cat_fu sub SV1_U64_MAX ulong cat_uc
+ret SV1_E_LENGTH_OVERFLOW
+end
+eu = add cat_fu ulong cat_uc
+hw = sv1_get64 buf add off 192
+if or lt cat_fu 2 ge eu reg_u
+ret SV1_E_MALFORMED_COMMIT
+end
+if or ne hw add eu 1 gt hw reg_u
+ret SV1_E_MALFORMED_COMMIT
+end
+ret SV1_OK
+end
+
+fn sv1_commit_validate buf view uchar * off ulong to int
+if not sv1_equal part buf off 8 sv1_cmt_magic
+ret SV1_E_MALFORMED_COMMIT
+end
+if or ne sv1_get16 buf add off 8 1 ne sv1_get16 buf add off 10 ushort SV1_COMMIT_BYTES
+ret SV1_E_UNSUPPORTED_VERSION
+end
+if or ne sv1_get16 buf add off 12 1 ne sv1_get16 buf add off 14 0
+ret SV1_E_UNSUPPORTED_VERSION
+end
+if or ne sv1_get64 buf add off 16 0 ne sv1_get64 buf add off 24 0
+ret SV1_E_UNSUPPORTED_FEATURES
+end
+reg_u = sv1_get64 buf add off 48
+gen = sv1_get64 buf add off 56
+if or lt reg_u 4 or gt reg_u SV1_MAX_REGION_UNITS eq gen 0
+ret SV1_E_MALFORMED_COMMIT
+end
+rc = sv1_commit_validate_cat buf off reg_u
+if ne rc SV1_OK
+ret rc
+end
+pgen = sv1_get64 buf add off 64
+ret sv1_commit_validate_gen buf off gen pgen
+end
+
+fn sv1_commit_identifies_pred cur view uchar 200 prev view uchar 200 prev_id view uchar 32 to bool
+gen = sv1_get64 cur 56
+pgen = sv1_get64 prev 56
+if or eq gen 0 ne sub gen 1 pgen
+ret false
+end
+if ne sv1_get64 cur 64 pgen
+ret false
+end
+if not sv1_equal part cur 72 32 prev_id
+ret false
+end
+if not sv1_equal part cur 104 32 part prev 136 32
+ret false
+end
+if not sv1_equal part cur 32 16 part prev 32 16
+ret false
+end
+if ne sv1_get64 cur 48 sv1_get64 prev 48
+ret false
+end
+if lt sv1_get64 cur 168 sv1_get64 prev 192
+ret false
+end
+ret true
+end
+
+note ---- Superblock (4096-byte canonical wire format) ----
+
+fn sv1_sb_validate_cat buf view uchar * off ulong hw ulong to int
+cmu = sv1_get64 buf add off 96
+cat_fu = sv1_get64 buf add off 136
+cat_bl = sv1_get64 buf add off 144
+cat_uc = sv1_get32 buf add off 152
+cat_ec = sv1_get32 buf add off 156
+if gt cat_fu sub SV1_U64_MAX ulong cat_uc
+ret SV1_E_LENGTH_OVERFLOW
+end
+eu = add cat_fu ulong cat_uc
+if or gt ulong cat_ec SV1_MAX_CATALOG_ENTRIES ne cat_bl sv1_catalog_len ulong cat_ec
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+u = new uint 1 0
+r = sv1_unit_count cat_bl u
+if ne r SV1_OK
+ret r
+end
+if or ne get u 0 cat_uc lt cat_fu 2
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne eu cmu
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if eq cmu SV1_U64_MAX
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne add cmu 1 hw
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+ret SV1_OK
+end
+
+fn sv1_sb_validate_shape buf view uchar * off ulong to int
+slot = sv1_get32 buf add off 44
+reg_u = sv1_get64 buf add off 48
+gen = sv1_get64 buf add off 56
+hw = sv1_get64 buf add off 160
+if or gt slot 1 or lt reg_u 4 gt reg_u SV1_MAX_REGION_UNITS
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if or eq gen 0 or gt hw reg_u lt hw 4
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+ret sv1_sb_validate_cat buf off hw
+end
+
+fn sv1_superblock_decode buf view uchar * off ulong exp_slot uint to int
+if not sv1_equal part buf off 8 sv1_sb_magic
+ret SV1_E_BAD_SUPERBLOCK_MAGIC
+end
+if not sv1_superblock_crc_ok buf off
+ret SV1_E_BAD_SUPERBLOCK_CRC
+end
+if not sv1_all_zero buf add off SV1_SB_RESERVED_OFFSET sub SV1_UNIT SV1_SB_RESERVED_OFFSET
+ret SV1_E_NONZERO_RESERVED
+end
+if or ne sv1_get16 buf add off 8 1 ne sv1_get16 buf add off 10 0
+ret SV1_E_UNSUPPORTED_VERSION
+end
+if or ne sv1_get64 buf add off 12 0 ne sv1_get64 buf add off 20 0
+ret SV1_E_UNSUPPORTED_FEATURES
+end
+slot = sv1_get32 buf add off 44
+if or ne slot exp_slot gt slot 1
+ret SV1_E_WRONG_SUPERBLOCK_SLOT
+end
+ret sv1_sb_validate_shape buf off
+end
+
+fn sv1_superblock_validate_commit sb view uchar 4096 cid view uchar 32 cmt view uchar 200 to int
+if not sv1_equal part sb 64 32 cid
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if not sv1_equal part sb 28 16 part cmt 32 16
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne sv1_get64 sb 48 sv1_get64 cmt 48
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne sv1_get64 sb 56 sv1_get64 cmt 56
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if not sv1_equal part sb 104 32 part cmt 136 32
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne sv1_get64 sb 136 sv1_get64 cmt 168
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne sv1_get64 sb 144 sv1_get64 cmt 176
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne sv1_get32 sb 152 sv1_get32 cmt 184
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if ne sv1_get32 sb 156 sv1_get32 cmt 188
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+hw = sv1_get64 sb 160
+if ne hw sv1_get64 cmt 192
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+cmu = sv1_get64 sb 96
+cat_fu = sv1_get64 sb 136
+cat_uc = ulong sv1_get32 sb 152
+if or eq cmu SV1_U64_MAX ne add cmu 1 hw
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+if or gt cat_fu sub SV1_U64_MAX cat_uc ne add cat_fu cat_uc cmu
+ret SV1_E_MALFORMED_SUPERBLOCK
+end
+ret SV1_OK
+end
+
+fn sv1_superblock_equivalent a view uchar 4096 b view uchar 4096 to bool
+if not sv1_equal part a 28 16 part b 28 16
+ret false
+end
+if ne sv1_get64 a 48 sv1_get64 b 48
+ret false
+end
+if ne sv1_get64 a 56 sv1_get64 b 56
+ret false
+end
+ret sv1_equal part a 64 32 part b 64 32
+end
+
+note ---- Genesis units 0..3 (16384 bytes) ----
+
+fn sv1_genesis_units uuid view uchar 16 reg_units ulong dst edit uchar 16384 to int
+if or lt reg_units 4 gt reg_units SV1_MAX_REGION_UNITS
+ret SV1_E_MALFORMED_COMMIT
+end
+for i ulong 16384
+put dst i 0
+end
+note Unit 2: empty catalog (16 bytes)
+u2 = ulong 8192
+for i ulong 8
+put dst add u2 i get sv1_cat_magic i
+end
+sv1_put16 dst add u2 8 1
+sv1_put16 dst add u2 10 ushort SV1_CATALOG_ENTRY
+sv1_put32 dst add u2 12 0
+cat_id = new uchar 32 0
+r = sv1_object_id SV1_KIND_CATALOG SV1_VERSION part dst u2 16 cat_id
+if ne r SV1_OK
+ret r
+end
+note Unit 3: genesis commit record (200 bytes)
+u3 = ulong 12288
+for i ulong 8
+put dst add u3 i get sv1_cmt_magic i
+end
+sv1_put16 dst add u3 8 1
+sv1_put16 dst add u3 10 ushort SV1_COMMIT_BYTES
+sv1_put16 dst add u3 12 1
+sv1_put16 dst add u3 14 0
+for i ulong 16
+put dst add u3 add 32 i get uuid i
+end
+sv1_put64 dst add u3 48 reg_units
+sv1_put64 dst add u3 56 1
+sv1_put64 dst add u3 64 0
+for i ulong 32
+put dst add u3 add 136 i get cat_id i
+end
+sv1_put64 dst add u3 168 2
+sv1_put64 dst add u3 176 16
+sv1_put32 dst add u3 184 1
+sv1_put32 dst add u3 188 0
+sv1_put64 dst add u3 192 4
+r = sv1_commit_validate dst u3
+if ne r SV1_OK
+ret r
+end
+cmt_id = new uchar 32 0
+r = sv1_object_id SV1_KIND_COMMIT SV1_VERSION part dst u3 SV1_COMMIT_BYTES cmt_id
+if ne r SV1_OK
+ret r
+end
+note Unit 0: superblock A (slot 0)
+for i ulong 8
+put dst i get sv1_sb_magic i
+end
+sv1_put16 dst 8 1
+sv1_put16 dst 10 0
+for i ulong 16
+put dst add 28 i get uuid i
+end
+sv1_put32 dst 44 0
+sv1_put64 dst 48 reg_units
+sv1_put64 dst 56 1
+for i ulong 32
+put dst add 64 i get cmt_id i
+end
+sv1_put64 dst 96 3
+for i ulong 32
+put dst add 104 i get cat_id i
+end
+sv1_put64 dst 136 2
+sv1_put64 dst 144 16
+sv1_put32 dst 152 1
+sv1_put32 dst 156 0
+sv1_put64 dst 160 4
+crc = sv1_sb_crc dst 0
+sv1_put32 dst SV1_SB_CRC_OFFSET crc
+ret sv1_superblock_decode dst 0 0
+end

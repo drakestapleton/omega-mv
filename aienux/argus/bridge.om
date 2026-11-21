@@ -1,0 +1,561 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/argus/bridge.om: Pure-Omega ARGUS-AEGIS Bridge.
+note Converted from upstream aienux native/argus/bridge/argus_aegis_bridge.{h,c}.
+note Compose with: si/directives/om2.om aienux/argus/event.om aienux/argus/contain.om aienux/argus/bridge.om <test.om> om/tls/sha2.om
+
+const BRIDGE_REQUESTS ulong 32
+const BRIDGE_FINDINGS ulong 128
+const ARGUS_FLAG_STREAM_SHIFT ushort 2
+const ARGUS_STREAM_BRIDGE ushort 16383
+const BRIDGE_STREAM_FLAGS ushort 0xfffc
+
+const BRIDGE_OBS_MINT uint 1
+const BRIDGE_OBS_REVOKE uint 2
+const BRIDGE_CAP_OK int 0
+
+const BRIDGE_SUBJ_AEGIS uint 41
+const BRIDGE_SUBJ_AEGIS_ROOT uint 42
+const BRIDGE_SUBJ_CONTAIN uint 43
+
+const BRIDGE_GATE_BUDGET ulong 8
+const BRIDGE_GATE_WINDOW ulong 64
+
+const BRIDGE_WHY_POLICY_GRANT ushort 1100
+const BRIDGE_WHY_POLICY_DENY ushort 1101
+const BRIDGE_WHY_POLICY_ESCALATE ushort 1102
+const BRIDGE_WHY_PROTECTED ushort 1103
+const BRIDGE_WHY_NOT_LIVE ushort 1104
+const BRIDGE_WHY_SUBJECT_MISMATCH ushort 1105
+const BRIDGE_WHY_BUDGET ushort 1107
+const BRIDGE_WHY_BAD_REQUEST ushort 1108
+const BRIDGE_WHY_NO_EXECUTOR ushort 1109
+const BRIDGE_WHY_NOT_AUTO_ELIGIBLE ushort 1116
+
+note Bridge state globals
+global br_init uchar 1
+global br_attached uchar 1
+global br_mach uchar 32
+global br_seq ulong 1
+global br_err int 1
+global br_clock ulong 1
+
+note Saved BridgeRequest slots (32 entries, indexed by request_id % 32)
+global br_req_id ulong 32
+global br_req_mach uchar 1024
+global br_req_dig uchar 1024
+
+note Queued ArgusFinding ring (128 entries)
+global br_find_cnt ulong 1
+global br_f_code ushort 128
+global br_f_sev uchar 128
+global br_f_conf uchar 128
+global br_f_sync uchar 128
+global br_f_cont uchar 128
+global br_f_det ushort 128
+global br_f_seq ulong 128
+global br_f_pseq ulong 128
+global br_f_princ uint 128
+global br_f_cid uint 128
+global br_f_cgen ulong 128
+
+note AEGIS containment gate state (coupled to bridge)
+global br_gate_seq ulong 1
+global br_gate_dec_id ulong 1
+global br_gate_inert uchar 1
+global br_gate_grants ulong 1
+global br_gate_decs ulong 1
+global br_gate_pol uchar 11
+global br_gate_last_st uchar 1
+global br_gate_last_why ushort 1
+global br_gate_last_est uchar 1
+global br_gate_last_erc int 1
+global br_gate_last_rev uint 1
+
+note Receipt staging buffer for receipt_sink (avoids >6 params)
+global br_rcp_kind ushort 1
+global br_rcp_st uchar 1
+global br_rcp_typ uchar 1
+global br_rcp_fcode ushort 1
+global br_rcp_rid ulong 1
+global br_rcp_princ uint 1
+global br_rcp_cid uint 1
+global br_rcp_cgen ulong 1
+global br_rcp_res ulong 1
+global br_rcp_why ushort 1
+global br_rcp_rc int 1
+global br_rcp_flags ushort 1
+global br_rcp_dig uchar 32
+
+fn br_zero_digest d view uchar 32 to bool
+v = uchar 0
+for i ulong 32
+v = or v get d i
+end
+ret eq v 0
+end
+
+fn argus_bridge_init mach view uchar 32 to int
+for i ulong 32
+put br_mach i get mach i
+put br_req_id i 0
+end
+for i ulong 1024
+put br_req_mach i 0
+put br_req_dig i 0
+end
+for i ulong 128
+put br_f_code i 0
+put br_f_sev i 0
+put br_f_conf i 0
+put br_f_sync i 0
+put br_f_cont i 0
+put br_f_det i 0
+put br_f_seq i 0
+put br_f_pseq i 0
+put br_f_princ i 0
+put br_f_cid i 0
+put br_f_cgen i 0
+end
+for i ulong 11
+put br_gate_pol i ARGUS_CSTATUS_ESCALATE
+end
+put br_gate_pol 1 ARGUS_CSTATUS_GRANT
+put br_seq 0 1
+put br_err 0 ARGUS_OK
+put br_attached 0 0
+put br_clock 0 0
+put br_find_cnt 0 0
+put br_gate_seq 0 1
+put br_gate_dec_id 0 1
+put br_gate_inert 0 0
+put br_gate_grants 0 0
+put br_gate_decs 0 0
+put br_gate_last_st 0 0
+put br_gate_last_why 0 0
+put br_gate_last_est 0 0
+put br_gate_last_erc 0 0
+put br_gate_last_rev 0 0
+put br_init 0 1
+ret ARGUS_OK
+end
+
+fn argus_bridge_destroy to void
+put br_init 0 0
+put br_attached 0 0
+end
+
+fn argus_bridge_attach_gate to int
+if eq get br_init 0 0
+ret ARGUS_ERR_ARG
+end
+put br_attached 0 1
+ret ARGUS_OK
+end
+
+fn argus_bridge_set_clock tick ulong to void
+put br_clock 0 tick
+end
+
+fn argus_bridge_set_policy ctype uchar verdict uchar to void
+if and ge ctype 1 le ctype ARGUS_CONTAIN_MAX
+put br_gate_pol ulong ctype verdict
+end
+end
+
+fn argus_bridge_set_inert v uchar to void
+put br_gate_inert 0 v
+end
+
+fn argus_bridge_error to int
+if eq get br_init 0 0
+ret ARGUS_ERR_ARG
+end
+ret get br_err 0
+end
+
+fn argus_bridge_finding_count to ulong
+ret get br_find_cnt 0
+end
+
+fn argus_bridge_append_finding f view ArgusFinding to int
+cnt = get br_find_cnt 0
+if ge cnt BRIDGE_FINDINGS
+ret ARGUS_ERR_OVERFLOW
+end
+put br_f_code cnt get f code
+put br_f_sev cnt get f severity
+put br_f_conf cnt get f confidence
+put br_f_sync cnt get f sync_allowed
+put br_f_cont cnt get f containment
+put br_f_det cnt get f detector
+put br_f_seq cnt get f sequence
+put br_f_pseq cnt get f prior_sequence
+put br_f_princ cnt get f principal
+put br_f_cid cnt get f cap_id
+put br_f_cgen cnt get f cap_generation
+put br_find_cnt 0 add cnt 1
+ret ARGUS_OK
+end
+
+fn argus_bridge_take_finding dst edit ArgusFinding to bool
+cnt = get br_find_cnt 0
+if eq cnt 0
+ret false
+end
+put dst code get br_f_code 0
+put dst severity get br_f_sev 0
+put dst confidence get br_f_conf 0
+put dst sync_allowed get br_f_sync 0
+put dst containment get br_f_cont 0
+put dst detector get br_f_det 0
+put dst sequence get br_f_seq 0
+put dst prior_sequence get br_f_pseq 0
+put dst principal get br_f_princ 0
+put dst cap_id get br_f_cid 0
+put dst cap_generation get br_f_cgen 0
+rem_cnt = sub cnt 1
+i = ulong 0
+while lt i rem_cnt bound 128
+nxt = add i 1
+put br_f_code i get br_f_code nxt
+put br_f_sev i get br_f_sev nxt
+put br_f_conf i get br_f_conf nxt
+put br_f_sync i get br_f_sync nxt
+put br_f_cont i get br_f_cont nxt
+put br_f_det i get br_f_det nxt
+put br_f_seq i get br_f_seq nxt
+put br_f_pseq i get br_f_pseq nxt
+put br_f_princ i get br_f_princ nxt
+put br_f_cid i get br_f_cid nxt
+put br_f_cgen i get br_f_cgen nxt
+i = nxt
+end
+put br_find_cnt 0 rem_cnt
+ret true
+end
+
+fn br_find_req_slot rid ulong to int
+for i ulong 32
+if eq get br_req_id i rid
+ret int i
+end
+end
+ret -1
+end
+
+fn argus_bridge_ingest ev view ArgusEvent mach view uchar 32 evdig view uchar 32 to int
+fcore = new ArgusFinding 0 0 0 0 0 0 0 0 0 0 0
+fcont = new ArgusFinding 0 0 0 0 0 0 0 0 0 0 0
+if eq get br_init 0 0
+ret ARGUS_ERR_ARG
+end
+fc = argus_core_ingest ev mach evdig fcore
+rc = ARGUS_OK
+if ne fc ARGUS_F_NONE
+rc = argus_bridge_append_finding fcore
+if ne rc ARGUS_OK
+put br_err 0 rc
+ret rc
+end
+end
+cc = argus_contain_observe ev evdig
+if ne cc ARGUS_F_NONE
+put fcont code cc
+put fcont severity ARGUS_SEV_CRITICAL
+put fcont confidence ARGUS_CONF_DETERMINISTIC
+put fcont sync_allowed 0
+put fcont containment ARGUS_CONTAIN_NONE
+put fcont detector cc
+put fcont sequence get ev sequence
+put fcont prior_sequence 0
+put fcont principal get ev principal
+put fcont cap_id get ev cap_id
+put fcont cap_generation get ev cap_generation
+rc = argus_bridge_append_finding fcont
+if ne rc ARGUS_OK
+put br_err 0 rc
+ret rc
+end
+end
+ret ARGUS_OK
+end
+
+fn br_receipt_outcome st uchar rcode int to uchar
+if or eq st ARGUS_CSTATUS_GRANT or eq st ARGUS_CSTATUS_DONE eq st ARGUS_CSTATUS_PARTIAL
+ret ARGUS_OUTCOME_OK
+end
+if eq st ARGUS_CSTATUS_DENY
+ret ARGUS_OUTCOME_DENIED
+end
+if and eq st ARGUS_CSTATUS_FAILED lt rcode 0
+ret ARGUS_OUTCOME_DENIED
+end
+ret ARGUS_OUTCOME_ERROR
+end
+
+fn br_receipt_sink to void
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mach = new uchar 32 0
+evdig = new uchar 32 0
+if eq get br_init 0 0
+ret
+end
+seq = get br_seq 0
+if or eq seq 0 eq seq ARGUS_U64_MAX
+put br_err 0 ARGUS_ERR_FULL
+ret
+end
+rid = get br_rcp_rid 0
+slot = br_find_req_slot rid
+if lt slot 0
+put br_err 0 ARGUS_ERR_STATE
+ret
+end
+put br_seq 0 add seq 1
+st = get br_rcp_st 0
+kd = get br_rcp_kind 0
+ev_code = get br_rcp_rc 0
+if eq kd ARGUS_EV_CONTAINMENT_DECIDED
+ev_code = int get br_rcp_why 0
+end
+ev_flags = BRIDGE_STREAM_FLAGS
+if ne and get br_rcp_flags 0 ARGUS_CREQ_SYNTHETIC 0
+ev_flags = or ev_flags ARGUS_FLAG_SYNTHETIC
+end
+put ev version ARGUS_ABI_VERSION
+put ev class_ ARGUS_CLASS_CRITICAL
+put ev kind kd
+put ev effect_class ARGUS_EFFECT_NONE
+put ev outcome br_receipt_outcome st get br_rcp_rc 0
+put ev flags ev_flags
+put ev sequence seq
+put ev tick get br_clock 0
+put ev principal get br_rcp_princ 0
+put ev code ev_code
+put ev cap_id get br_rcp_cid 0
+put ev object_id argus_contain_pack get br_rcp_typ 0 st get br_rcp_fcode 0
+put ev cap_generation get br_rcp_cgen 0
+put ev world_generation rid
+put ev resource get br_rcp_res 0
+base = mul ulong slot 32
+for i ulong 32
+put mach i get br_req_mach add base i
+put evdig i get br_rcp_dig i
+end
+irc = argus_bridge_ingest ev mach evdig
+if and ne irc ARGUS_OK ne irc ARGUS_ERR_FULL
+put br_err 0 irc
+end
+end
+
+fn br_ingest_rec ev view ArgusEvent mach view uchar 32 evdig view uchar 32 to void
+irc = argus_bridge_ingest ev mach evdig
+if and ne irc ARGUS_OK ne irc ARGUS_ERR_FULL
+put br_err 0 irc
+end
+end
+
+fn argus_bridge_observer op uint cap_id uint cap_gen ulong subj uint rights uint res ulong to void
+ev = new ArgusEvent 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+mach = new uchar 32 0
+evdig = new uchar 32 0
+if eq get br_init 0 0
+ret
+end
+if and ne op BRIDGE_OBS_MINT ne op BRIDGE_OBS_REVOKE
+ret
+end
+seq = get br_seq 0
+if or eq seq 0 eq seq ARGUS_U64_MAX
+put br_err 0 ARGUS_ERR_FULL
+ret
+end
+put br_seq 0 add seq 1
+put ev version ARGUS_ABI_VERSION
+if eq op BRIDGE_OBS_MINT
+put ev class_ ARGUS_CLASS_SECURITY
+put ev kind ARGUS_EV_CAPABILITY_GRANTED
+else
+put ev class_ ARGUS_CLASS_CRITICAL
+put ev kind ARGUS_EV_CAPABILITY_REVOKED
+end
+put ev effect_class ARGUS_EFFECT_NONE
+put ev outcome ARGUS_OUTCOME_OK
+put ev flags BRIDGE_STREAM_FLAGS
+put ev sequence seq
+put ev tick get br_clock 0
+put ev principal subj
+put ev code 0
+put ev cap_id cap_id
+put ev object_id rights
+put ev cap_generation cap_gen
+put ev world_generation 0
+put ev resource res
+for i ulong 32
+put mach i get br_mach i
+end
+br_ingest_rec ev mach evdig
+end
+
+fn br_gate_is_protected subj uint to bool
+if or eq subj BRIDGE_SUBJ_AEGIS or eq subj BRIDGE_SUBJ_AEGIS_ROOT eq subj BRIDGE_SUBJ_CONTAIN
+ret true
+end
+ret false
+end
+
+fn br_gate_decide req view ArgusContainReq to void
+decs = get br_gate_decs 0
+if ge decs BRIDGE_GATE_WINDOW
+put br_gate_decs 0 0
+put br_gate_grants 0 0
+end
+put br_gate_decs 0 add get br_gate_decs 0 1
+ct = get req containment
+if or lt ct 1 gt ct ARGUS_CONTAIN_MAX
+put br_gate_last_st 0 ARGUS_CSTATUS_DENY
+put br_gate_last_why 0 BRIDGE_WHY_BAD_REQUEST
+ret
+end
+if ne get br_gate_inert 0 0
+put br_gate_last_st 0 ARGUS_CSTATUS_ESCALATE
+put br_gate_last_why 0 BRIDGE_WHY_POLICY_ESCALATE
+ret
+end
+if br_gate_is_protected get req principal
+put br_gate_last_st 0 ARGUS_CSTATUS_DENY
+put br_gate_last_why 0 BRIDGE_WHY_PROTECTED
+ret
+end
+pol = get br_gate_pol ulong ct
+if eq pol ARGUS_CSTATUS_DENY
+put br_gate_last_st 0 ARGUS_CSTATUS_DENY
+put br_gate_last_why 0 BRIDGE_WHY_POLICY_DENY
+ret
+end
+if ne ct ARGUS_CONTAIN_REVOKE_CAPABILITY
+put br_gate_last_st 0 ARGUS_CSTATUS_ESCALATE
+put br_gate_last_why 0 BRIDGE_WHY_NO_EXECUTOR
+ret
+end
+if ne and get req flags ARGUS_CREQ_KNOWN 0
+put br_gate_last_st 0 ARGUS_CSTATUS_ESCALATE
+put br_gate_last_why 0 BRIDGE_WHY_NOT_AUTO_ELIGIBLE
+ret
+end
+cid = get req target_cap_id
+if ge cid ARGUS_CAP_MAX
+put br_gate_last_st 0 ARGUS_CSTATUS_DENY
+put br_gate_last_why 0 BRIDGE_WHY_NOT_LIVE
+ret
+end
+idx = ulong cid
+if ne get argus_sh_state idx ARGUS_SH_LIVE
+put br_gate_last_st 0 ARGUS_CSTATUS_DENY
+put br_gate_last_why 0 BRIDGE_WHY_NOT_LIVE
+ret
+end
+if ne get argus_sh_gen idx get req target_cap_gen
+put br_gate_last_st 0 ARGUS_CSTATUS_DENY
+put br_gate_last_why 0 BRIDGE_WHY_NOT_LIVE
+ret
+end
+if ne get argus_sh_subj idx get req principal
+put br_gate_last_st 0 ARGUS_CSTATUS_DENY
+put br_gate_last_why 0 BRIDGE_WHY_SUBJECT_MISMATCH
+ret
+end
+if ge get br_gate_grants 0 BRIDGE_GATE_BUDGET
+put br_gate_last_st 0 ARGUS_CSTATUS_ESCALATE
+put br_gate_last_why 0 BRIDGE_WHY_BUDGET
+ret
+end
+if ne pol ARGUS_CSTATUS_GRANT
+put br_gate_last_st 0 ARGUS_CSTATUS_ESCALATE
+put br_gate_last_why 0 BRIDGE_WHY_POLICY_ESCALATE
+ret
+end
+put br_gate_grants 0 add get br_gate_grants 0 1
+put br_gate_last_st 0 ARGUS_CSTATUS_GRANT
+put br_gate_last_why 0 BRIDGE_WHY_POLICY_GRANT
+end
+
+fn br_stage_receipt kd ushort st uchar req view ArgusContainReq dig view uchar 32 res ulong to void
+put br_rcp_kind 0 kd
+put br_rcp_st 0 st
+put br_rcp_typ 0 get req containment
+put br_rcp_fcode 0 get req finding_code
+put br_rcp_rid 0 get req request_id
+put br_rcp_princ 0 get req principal
+put br_rcp_cid 0 get req target_cap_id
+put br_rcp_cgen 0 get req target_cap_gen
+put br_rcp_res 0 res
+put br_rcp_flags 0 get req flags
+for i ulong 32
+put br_rcp_dig i get dig i
+end
+end
+
+fn br_save_req rid ulong mach view uchar 32 tdig view uchar 32 dig view uchar 32 to void
+slot = rem rid BRIDGE_REQUESTS
+put br_req_id slot rid
+base = mul slot 32
+use_tdig = br_zero_digest mach
+for i ulong 32
+if use_tdig
+put br_req_mach add base i get tdig i
+else
+put br_req_mach add base i get mach i
+end
+put br_req_dig add base i get dig i
+end
+end
+
+fn br_execute_grant req view ArgusContainReq dig view uchar 32 to void
+argus_bridge_observer BRIDGE_OBS_REVOKE get req target_cap_id get req target_cap_gen get req principal 0 0
+put br_gate_seq 0 add get br_gate_seq 0 1
+put br_gate_last_est 0 ARGUS_CSTATUS_DONE
+put br_gate_last_erc 0 0
+put br_gate_last_rev 0 1
+put br_rcp_why 0 0
+put br_rcp_rc 0 0
+br_stage_receipt ARGUS_EV_CONTAINMENT_EXECUTED ARGUS_CSTATUS_DONE req dig 1
+br_receipt_sink
+end
+
+fn argus_bridge_submit req view ArgusContainReq mach view uchar 32 fdig view uchar 32 tdig view uchar 32 to int
+dig = new uchar 32 0
+if or eq get br_init 0 0 eq get br_attached 0 0
+ret ARGUS_ERR_ARG
+end
+argus_creq_digest req mach fdig tdig dig
+br_save_req get req request_id mach tdig dig
+br_gate_decide req
+did = get br_gate_dec_id 0
+put br_gate_dec_id 0 add did 1
+put br_gate_seq 0 add get br_gate_seq 0 1
+dst = get br_gate_last_st 0
+put br_rcp_why 0 get br_gate_last_why 0
+put br_rcp_rc 0 0
+br_stage_receipt ARGUS_EV_CONTAINMENT_DECIDED dst req dig did
+br_receipt_sink
+put br_gate_last_est 0 0
+put br_gate_last_erc 0 0
+put br_gate_last_rev 0 0
+if eq dst ARGUS_CSTATUS_GRANT
+br_execute_grant req dig
+end
+ret argus_bridge_error
+end
+
+fn argus_bridge_last_decision to uchar
+ret get br_gate_last_st 0
+end
+
+fn argus_bridge_last_why to ushort
+ret get br_gate_last_why 0
+end
+
+fn argus_bridge_last_exec_status to uchar
+ret get br_gate_last_est 0
+end

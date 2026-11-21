@@ -1,0 +1,305 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/store/torn_slot_test.om: Behavioral self-test for dual-slot torn-write-safe record.
+note Compose with: si/directives/om2.om aienux/store/torn_slot.om aienux/store/torn_slot_test.om om/tls/sha2.om
+
+text ts_pass "PASS "
+text ts_fail "FAIL "
+text ts_nl "\n"
+text ts_t01 "geometry_open_and_empty_recover"
+text ts_t02 "commit_alternates_slots_and_recovers"
+text ts_t03 "torn_first_commit_recovers_empty_not_corrupt"
+text ts_t04 "torn_second_commit_preserves_slot_a"
+text ts_t05 "lineage_guards_parity_adjacent_conflict_b_needs_a"
+text ts_t06 "commit_without_recover_fails_estate"
+text ts_sum "TORN_SLOT_TEST_PASS total=6 failed=0\n"
+text ts_fsum "TORN_SLOT_TEST_FAIL\n"
+
+fn ts_write_all fd int buf view uchar * to bool
+total = len buf
+off = ulong 0
+while lt off total bound 4096
+n = write fd buf off sub total off
+if le n 0
+ret false
+end
+off = add off ulong n
+end
+ret true
+end
+
+fn ts_report name view uchar * ok bool to uint
+if ok
+w1 = ts_write_all 1 ts_pass
+w2 = ts_write_all 1 name
+w3 = ts_write_all 1 ts_nl
+if and w1 and w2 w3
+ret 0
+end
+ret 1
+end
+w1 = ts_write_all 1 ts_fail
+w2 = ts_write_all 1 name
+w3 = ts_write_all 1 ts_nl
+if and w1 and w2 w3
+ret 1
+end
+ret 1
+end
+
+fn fill_rec dst edit uchar 4096 tag uchar to void
+for i ulong 4096
+put dst i xor tag uchar and i 0xff
+end
+end
+
+fn rec_matches buf view uchar 4096 tag uchar to bool
+for i ulong 4096
+if ne get buf i xor tag uchar and i 0xff
+ret false
+end
+end
+ret true
+end
+
+fn tt_01_geometry_and_empty to bool
+ts_media_zero
+note Unsupported block size 1024 refused
+if ne ts_open 1024 64 0 TS_EGEOMETRY
+ret false
+end
+note Too few blocks refused
+if ne ts_open 512 31 0 TS_EGEOMETRY
+ret false
+end
+note Valid 512-byte geometry (32 blocks = 4 units)
+if ne ts_open 512 32 0 TS_OK
+ret false
+end
+out_rec = new uchar 4096 0
+seq = new ulong 1 0
+st = new uint 2 0
+if ne ts_recover out_rec seq st TS_EMPTY
+ret false
+end
+if or ne get st 0 TS_SLOT_BLANK ne get st 1 TS_SLOT_BLANK
+ret false
+end
+ret true
+end
+
+fn tt_02_commit_alternates to bool
+ts_media_zero
+if ne ts_open 4096 8 0 TS_OK
+ret false
+end
+rec = new uchar 4096 0
+got = new uchar 4096 0
+seq = new ulong 1 0
+st = new uint 2 0
+if ne ts_recover got seq st TS_EMPTY
+ret false
+end
+note Commit 1 -> slot A (seq 1), Commit 2 -> slot B (seq 2), Commit 3 -> slot A (seq 3)
+fill_rec rec 0x11
+if ne ts_commit rec TS_OK
+ret false
+end
+fill_rec rec 0x22
+if ne ts_commit rec TS_OK
+ret false
+end
+fill_rec rec 0x33
+if ne ts_commit rec TS_OK
+ret false
+end
+if ne ts_recover got seq st TS_OK
+ret false
+end
+if or ne get seq 0 3 not rec_matches got 0x33
+ret false
+end
+if or ne get st 0 TS_SLOT_VALID ne get st 1 TS_SLOT_VALID
+ret false
+end
+ret true
+end
+
+fn tt_03_torn_first_commit to bool
+ts_media_zero
+if ne ts_open 512 64 0 TS_OK
+ret false
+end
+rec = new uchar 4096 0
+got = new uchar 4096 0
+seq = new ulong 1 0
+st = new uint 2 0
+if ne ts_recover got seq st TS_EMPTY
+ret false
+end
+note Simulate partial write of commit unit A (only first 12 bytes written)
+fill_rec rec 0x44
+cu = new uchar 4096 0
+ts_encode_commit cu 0 1 rec
+for i ulong 12
+ts_media_poke 1 i get cu i
+end
+if ne ts_recover got seq st TS_EMPTY
+ret false
+end
+note Corrupt byte in slot A commit header past magic -> TS_CORRUPT (first-remnant guard)
+ts_media_poke 1 10 0x7f
+if ne ts_recover got seq st TS_CORRUPT
+ret false
+end
+ret true
+end
+
+fn tt_04_torn_second_preserves_a to bool
+ts_media_zero
+if ne ts_open 512 64 0 TS_OK
+ret false
+end
+rec = new uchar 4096 0
+got = new uchar 4096 0
+seq = new ulong 1 0
+st = new uint 2 0
+if ne ts_recover got seq st TS_EMPTY
+ret false
+end
+fill_rec rec 0x55
+if ne ts_commit rec TS_OK
+ret false
+end
+note Tear during second commit (slot B body write fails halfway)
+ts_set_faults 0 0 512
+fill_rec rec 0x66
+if ne ts_commit rec TS_EIO
+ret false
+end
+ts_set_faults 0 0 0
+note Recovery must cleanly return slot A (seq 1, 0x55)
+if ne ts_recover got seq st TS_OK
+ret false
+end
+if or ne get seq 0 1 not rec_matches got 0x55
+ret false
+end
+ret true
+end
+
+fn tt_05_lineage_guards to bool
+ts_media_zero
+if ne ts_open 4096 8 0 TS_OK
+ret false
+end
+rec = new uchar 4096 0
+cu = new uchar 4096 0
+got = new uchar 4096 0
+seq = new ulong 1 0
+st = new uint 2 0
+fill_rec rec 0x77
+note Guard parity-a: slot 0 with even seq 2 -> TS_CORRUPT
+ts_encode_commit cu 0 2 rec
+if ne ts_media_write_unit 0 rec TS_OK
+ret false
+end
+if ne ts_media_write_unit 1 cu TS_OK
+ret false
+end
+if ne ts_recover got seq st TS_CORRUPT
+ret false
+end
+note Guard b-needs-a: slot 0 blank, slot 1 valid seq 2 -> TS_CORRUPT
+ts_media_zero
+if ne ts_open 4096 8 0 TS_OK
+ret false
+end
+ts_encode_commit cu 1 2 rec
+if ne ts_media_write_unit 2 rec TS_OK
+ret false
+end
+if ne ts_media_write_unit 3 cu TS_OK
+ret false
+end
+if ne ts_recover got seq st TS_CORRUPT
+ret false
+end
+note Guard adjacent: slot 0 valid seq 1, slot 1 valid seq 4 -> TS_CORRUPT
+ts_encode_commit cu 0 1 rec
+if ne ts_media_write_unit 0 rec TS_OK
+ret false
+end
+if ne ts_media_write_unit 1 cu TS_OK
+ret false
+end
+ts_encode_commit cu 1 4 rec
+if ne ts_media_write_unit 3 cu TS_OK
+ret false
+end
+if ne ts_recover got seq st TS_CORRUPT
+ret false
+end
+note Guard conflict: slot 0 valid seq 2, slot 1 valid seq 2 -> TS_CONFLICT
+ts_encode_commit cu 0 2 rec
+if ne ts_media_write_unit 1 cu TS_OK
+ret false
+end
+ts_encode_commit cu 1 2 rec
+if ne ts_media_write_unit 3 cu TS_OK
+ret false
+end
+if ne ts_recover got seq st TS_CONFLICT
+ret false
+end
+note Guard a-alone-seq1: slot 0 valid seq 3, slot 1 blank -> TS_CORRUPT
+ts_media_zero
+if ne ts_open 4096 8 0 TS_OK
+ret false
+end
+ts_encode_commit cu 0 3 rec
+if ne ts_media_write_unit 0 rec TS_OK
+ret false
+end
+if ne ts_media_write_unit 1 cu TS_OK
+ret false
+end
+if ne ts_recover got seq st TS_CORRUPT
+ret false
+end
+ret true
+end
+
+fn tt_06_commit_requires_recover to bool
+ts_media_zero
+if ne ts_open 4096 8 0 TS_OK
+ret false
+end
+rec = new uchar 4096 0
+fill_rec rec 0x88
+if ne ts_commit rec TS_ESTATE
+ret false
+end
+ret true
+end
+
+fn main to int
+fails = uint 0
+fails = add fails ts_report ts_t01 tt_01_geometry_and_empty
+fails = add fails ts_report ts_t02 tt_02_commit_alternates
+fails = add fails ts_report ts_t03 tt_03_torn_first_commit
+fails = add fails ts_report ts_t04 tt_04_torn_second_preserves_a
+fails = add fails ts_report ts_t05 tt_05_lineage_guards
+fails = add fails ts_report ts_t06 tt_06_commit_requires_recover
+if eq fails 0
+w = ts_write_all 1 ts_sum
+if w
+ret 0
+end
+ret 1
+end
+w = ts_write_all 1 ts_fsum
+if w
+ret 1
+end
+ret 1
+end

@@ -1,0 +1,275 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/disk/disk.om: Pure-Omega AIENOS Block-Device Interface and Bounded Request Queue.
+note Converted from upstream aienux native/disk/disk.{h,c}.
+note Compose with: si/directives/om2.om aienux/disk/disk.om aienux/disk/disk_file.om aienux/disk/disk_sdhci.om <test.om>
+
+struct DiskDev backend uint block_size uint block_count ulong max_blocks uint end
+
+const DISK_SECTOR_BYTES uint 512
+const DISK_QUEUE_DEPTH ulong 32
+
+const DISK_OK int 0
+const DISK_EIO int -1
+const DISK_ERANGE int -2
+const DISK_EARG int -3
+const DISK_EGEOMETRY int -4
+const DISK_EFULL int -5
+const DISK_EPOWER int -6
+const DISK_ESTATE int -7
+
+const DISK_OP_READ uint 1
+const DISK_OP_WRITE uint 2
+const DISK_OP_FLUSH uint 3
+
+const DISK_BACKEND_NONE uint 0
+const DISK_BACKEND_FILE uint 1
+const DISK_BACKEND_SDHCI uint 2
+
+note Bounded request queue state (depth 32)
+global dq_op uint 32
+global dq_lba ulong 32
+global dq_cnt uint 32
+global dq_off ulong 32
+global dq_status int 32
+note dq_meta: 0=head, 1=len, 2=failed, 3=dev_set
+global dq_meta ulong 4
+
+fn disk_check d view DiskDev to int
+bk = get d backend
+if and ne bk DISK_BACKEND_FILE ne bk DISK_BACKEND_SDHCI
+ret DISK_EARG
+end
+bsz = get d block_size
+if and ne bsz 512 ne bsz 4096
+ret DISK_EGEOMETRY
+end
+if or eq get d block_count 0 eq get d max_blocks 0
+ret DISK_EGEOMETRY
+end
+ret DISK_OK
+end
+
+fn disk_range_ok d view DiskDev lba ulong cnt uint to int
+if eq cnt 0
+ret DISK_EARG
+end
+bcnt = get d block_count
+if ge lba bcnt
+ret DISK_ERANGE
+end
+if gt ulong cnt sub bcnt lba
+ret DISK_ERANGE
+end
+ret DISK_OK
+end
+
+fn disk_backend_rc brc int to int
+if or eq brc DISK_EPOWER eq brc DISK_ESTATE
+ret brc
+end
+ret DISK_EIO
+end
+
+fn disk_dispatch_read bk uint lba ulong n uint buf edit uchar * off ulong to int
+if eq bk DISK_BACKEND_FILE
+ret disk_file_read lba n buf off
+end
+if eq bk DISK_BACKEND_SDHCI
+ret sdhci_read lba n buf off
+end
+ret DISK_EARG
+end
+
+fn disk_dispatch_write bk uint lba ulong n uint buf view uchar * off ulong to int
+if eq bk DISK_BACKEND_FILE
+ret disk_file_write lba n buf off
+end
+if eq bk DISK_BACKEND_SDHCI
+ret sdhci_write lba n buf off
+end
+ret DISK_EARG
+end
+
+fn disk_dispatch_flush bk uint to int
+if eq bk DISK_BACKEND_FILE
+ret disk_file_flush
+end
+if eq bk DISK_BACKEND_SDHCI
+ret sdhci_flush
+end
+ret DISK_EARG
+end
+
+fn disk_read_at d view DiskDev lba ulong cnt uint buf edit uchar * off ulong to int
+rc = disk_check d
+if ne rc DISK_OK
+ret rc
+end
+rc = disk_range_ok d lba cnt
+if ne rc DISK_OK
+ret rc
+end
+if gt add off mul ulong cnt ulong get d block_size len buf
+ret DISK_EARG
+end
+cur_lba = lba
+rem_cnt = cnt
+cur_off = off
+while gt rem_cnt 0 bound 65536
+n = rem_cnt
+if gt n get d max_blocks
+n = get d max_blocks
+end
+brc = disk_dispatch_read get d backend cur_lba n buf cur_off
+if ne brc DISK_OK
+ret disk_backend_rc brc
+end
+cur_lba = add cur_lba ulong n
+rem_cnt = sub rem_cnt n
+cur_off = add cur_off mul ulong n ulong get d block_size
+end
+ret DISK_OK
+end
+
+fn disk_write_at d view DiskDev lba ulong cnt uint buf view uchar * off ulong to int
+rc = disk_check d
+if ne rc DISK_OK
+ret rc
+end
+rc = disk_range_ok d lba cnt
+if ne rc DISK_OK
+ret rc
+end
+if gt add off mul ulong cnt ulong get d block_size len buf
+ret DISK_EARG
+end
+cur_lba = lba
+rem_cnt = cnt
+cur_off = off
+while gt rem_cnt 0 bound 65536
+n = rem_cnt
+if gt n get d max_blocks
+n = get d max_blocks
+end
+brc = disk_dispatch_write get d backend cur_lba n buf cur_off
+if ne brc DISK_OK
+ret disk_backend_rc brc
+end
+cur_lba = add cur_lba ulong n
+rem_cnt = sub rem_cnt n
+cur_off = add cur_off mul ulong n ulong get d block_size
+end
+ret DISK_OK
+end
+
+fn disk_read d view DiskDev lba ulong cnt uint buf edit uchar * to int
+ret disk_read_at d lba cnt buf 0
+end
+
+fn disk_write d view DiskDev lba ulong cnt uint buf view uchar * to int
+ret disk_write_at d lba cnt buf 0
+end
+
+fn disk_flush d view DiskDev to int
+rc = disk_check d
+if ne rc DISK_OK
+ret rc
+end
+brc = disk_dispatch_flush get d backend
+if ne brc DISK_OK
+ret disk_backend_rc brc
+end
+ret DISK_OK
+end
+
+fn disk_queue_init to void
+for i ulong 32
+put dq_op i 0
+put dq_lba i 0
+put dq_cnt i 0
+put dq_off i 0
+put dq_status i 0
+end
+put dq_meta 0 0
+put dq_meta 1 0
+put dq_meta 2 0
+put dq_meta 3 1
+end
+
+fn disk_queue_reset to void
+put dq_meta 0 0
+put dq_meta 1 0
+put dq_meta 2 0
+end
+
+fn disk_queue_len to ulong
+ret get dq_meta 1
+end
+
+fn disk_queue_failed to bool
+ret ne get dq_meta 2 0
+end
+
+fn disk_queue_push d view DiskDev op uint lba ulong cnt uint buf_off ulong to int
+if eq get dq_meta 3 0
+ret DISK_EARG
+end
+if ne get dq_meta 2 0
+ret DISK_ESTATE
+end
+if and ne op DISK_OP_READ and ne op DISK_OP_WRITE ne op DISK_OP_FLUSH
+ret DISK_EARG
+end
+qlen = get dq_meta 1
+if ge qlen DISK_QUEUE_DEPTH
+ret DISK_EFULL
+end
+if ne op DISK_OP_FLUSH
+rc = disk_range_ok d lba cnt
+if ne rc DISK_OK
+ret rc
+end
+end
+slot = rem add get dq_meta 0 qlen DISK_QUEUE_DEPTH
+put dq_op slot op
+put dq_lba slot lba
+put dq_cnt slot cnt
+put dq_off slot buf_off
+put dq_status slot 1
+put dq_meta 1 add qlen 1
+ret DISK_OK
+end
+
+fn disk_queue_drain d view DiskDev buf edit uchar * to int
+if eq get dq_meta 3 0
+ret DISK_EARG
+end
+if ne get dq_meta 2 0
+ret DISK_ESTATE
+end
+while gt get dq_meta 1 0 bound 64
+hd = get dq_meta 0
+op = get dq_op hd
+lba = get dq_lba hd
+cnt = get dq_cnt hd
+boff = get dq_off hd
+rc = DISK_OK
+if eq op DISK_OP_READ
+rc = disk_read_at d lba cnt buf boff
+else
+if eq op DISK_OP_WRITE
+rc = disk_write_at d lba cnt buf boff
+else
+rc = disk_flush d
+end
+end
+put dq_status hd rc
+put dq_meta 0 rem add hd 1 DISK_QUEUE_DEPTH
+put dq_meta 1 sub get dq_meta 1 1
+if ne rc DISK_OK
+put dq_meta 2 1
+ret rc
+end
+end
+ret DISK_OK
+end

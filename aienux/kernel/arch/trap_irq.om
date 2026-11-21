@@ -1,0 +1,175 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/kernel/arch/trap_irq.om: Pure-Omega AArch64 Exception Vector / Probe Fixup,
+note IRQ Registration & Dispatcher, and CNTP Physical Generic Timer Model.
+note Converted from upstream aienux native/kernel/arch/exception.c and native/kernel/arch/timer.c.
+
+note AArch64 vector indices (0..15)
+const VEC_SYNC_EL_SP0 ulong 0
+const VEC_SYNC_EL_SPX ulong 4
+const VEC_SYNC_LOWER64 ulong 8
+const VEC_COUNT ulong 16
+
+note ESR_EL1 exception classes
+const ESR_EC_SVC64 ulong 0x15
+const ESR_EC_DABT_CUR ulong 0x25
+const ESR_EC_IABT_LOW ulong 0x20
+const ESR_EC_DABT_LOW ulong 0x24
+
+note Exception handling disposition codes
+const EXC_DISP_FATAL int 0
+const EXC_DISP_LOWER64 int 1
+const EXC_DISP_PROBE_FIXUP int 2
+
+note IRQ registration table (INTID 0..1019, INTID 30 reserved for CNTP EL1 physical timer)
+const IRQ_MAX uint 1020
+const IRQ_TIMER_PPI uint 30
+const IRQ_OK int 0
+const IRQ_ERR_BAD int -1
+const IRQ_ERR_DUP int -2
+
+note Global IRQ handler table (handler_id 0 = unregistered, >0 = registered handler token)
+global irq_handlers uint 1020
+global irq_args ulong 1020
+note irq_stats: 0=spurious, 1=unhandled, 2=timer_irqs, 3=dispatched, 4=last_handler, 5=last_arg
+global irq_stats ulong 6
+
+fn exc_esr_ec esr ulong to ulong
+ret and shr esr 26 0x3f
+end
+
+fn exc_probe_arm ps edit ProbeState insn ulong fixup ulong to void
+put ps insn insn
+put ps fixup fixup
+put ps esr 0
+put ps far 0
+put ps armed 1
+end
+
+note Classify an EL1 exception: returns EXC_DISP_LOWER64 (vector 8 with hook),
+note EXC_DISP_PROBE_FIXUP (EL1 vector 4 DABT_CUR at armed probe insn), or EXC_DISP_FATAL.
+fn exc_classify el uint vector ulong esr ulong far ulong elr ulong ps edit ProbeState to int
+if eq vector VEC_SYNC_LOWER64
+ret EXC_DISP_LOWER64
+end
+ec = exc_esr_ec esr
+if and eq el 1 and eq vector VEC_SYNC_EL_SPX eq ec ESR_EC_DABT_CUR
+if and ne get ps armed 0 eq elr get ps insn
+put ps esr esr
+put ps far far
+put ps armed 0
+ret EXC_DISP_PROBE_FIXUP
+end
+end
+ret EXC_DISP_FATAL
+end
+
+fn irq_table_reset to void
+for i ulong 1020
+put irq_handlers i 0
+put irq_args i 0
+end
+for s ulong 6
+put irq_stats s 0
+end
+end
+
+fn irq_register intid uint handler_id uint arg ulong to int
+if or ge intid IRQ_MAX or eq intid IRQ_TIMER_PPI eq handler_id 0
+ret IRQ_ERR_BAD
+end
+if ne get irq_handlers ulong intid 0
+ret IRQ_ERR_DUP
+end
+put irq_handlers ulong intid handler_id
+put irq_args ulong intid arg
+ret IRQ_OK
+end
+
+note Dispatch one acknowledged GIC INTID. Returns 1 if timer preempt check should run, 0 otherwise.
+fn irq_dispatch intid uint to uint
+if ge intid IRQ_MAX
+put irq_stats 0 add get irq_stats 0 1
+ret 0
+end
+if eq intid IRQ_TIMER_PPI
+put irq_stats 2 add get irq_stats 2 1
+ret 1
+end
+hid = get irq_handlers ulong intid
+if ne hid 0
+put irq_stats 3 add get irq_stats 3 1
+put irq_stats 4 ulong hid
+put irq_stats 5 get irq_args ulong intid
+ret 0
+end
+put irq_stats 1 add get irq_stats 1 1
+ret 0
+end
+
+fn irq_stat_get idx ulong to ulong
+if ge idx 6
+ret 0
+end
+ret get irq_stats idx
+end
+
+note ---- CNTP Timer math & tick window (overflow-safe without 128-bit division) ----
+
+fn timer_counter_to_us cnt ulong freq_hz ulong to ulong
+if eq freq_hz 0
+ret 0
+end
+sec = div cnt freq_hz
+rem_c = rem cnt freq_hz
+if gt rem_c 18446744073709
+ret add mul sec 1000000 div rem_c div freq_hz 1000000
+end
+ret add mul sec 1000000 div mul rem_c 1000000 freq_hz
+end
+
+fn timer_us_to_ticks us ulong freq_hz ulong to ulong
+q = div freq_hz 1000000
+r = rem freq_hz 1000000
+ret add mul us q div mul us r 1000000
+end
+
+fn timer_state_init ts edit TimerState start_cnt ulong freq_hz ulong to void
+put ts ticks 0
+put ts last start_cnt
+put ts tmin 0xffffffffffffffff
+put ts tmax 0
+put ts freq_hz freq_hz
+end
+
+note Record one timer IRQ at counter value now; returns next CNTP_CVAL deadline (now + 10ms).
+fn timer_tick_record ts edit TimerState now ulong to ulong
+hz = get ts freq_hz
+period = ulong 625000
+if ne hz 0
+period = div hz 100
+end
+deadline = add now period
+interval = sub now get ts last
+put ts last now
+put ts ticks add get ts ticks 1
+if lt interval get ts tmin
+put ts tmin interval
+end
+if gt interval get ts tmax
+put ts tmax interval
+end
+ret deadline
+end
+
+note M1 invariant check: at least 5 ticks and no interval shorter than half a 10ms period.
+fn timer_window_ok ts view TimerState to bool
+if lt get ts ticks 5
+ret false
+end
+hz = get ts freq_hz
+if eq hz 0
+ret false
+end
+half_period = div hz 200
+ret ge get ts tmin half_period
+end
