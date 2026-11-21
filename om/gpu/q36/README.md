@@ -33,10 +33,20 @@ Online adaptive sum-over-paths co-activation prefetcher (`39` cross-layer transi
 
 *(Measurements use checkpoint-exact synthetic weights across 4 cold weight banks > 110× L2; real-checkpoint end-to-end greedy-parity measurements on `~/models/qwen3.6-35b-a3b-fp8-95a723d0` are recorded in `2026-11-21-q36-35b-verified-kit.json`: `50.43 tok/s` `N=1`, `105.31 tok/s` `N=4`, `119.39 tok/s` `N=8`.)*
 
+## Real-Weight W4 Two-Pass Exact `lm_head` (`om/gpu/q36/head/` -> `q36-head`)
+
+`q36-head` (`162 KB` static AArch64 ELF, zero CUDA/libc) loads the real `lm_head.weight` (`BF16 [248320, 2048]`, `1.017 GB`) and `model.language_model.norm.weight` directly from `outside.safetensors`, quantizes it on-GPU to **block-32 symmetric INT4 (`0.286 GB`, `3.56×` smaller)** in **`10.16 ms`**, screens all `248,320` vocabulary rows with straight-line unrolled 2-block `LDG.E.128` (`dot(q, x) - 8*sum(x)`), and rescores the top-64 candidates in exact BF16.
+
+- Receipt: `/home/drakestapleton/yardsticks/receipts/2026-11-21-q36-head-w4-top64.json` (window `20261121T184921Z-bdb379`, `exit: 0`, `nvrm_errors_delta: 0`).
+- **Real-weight parity:** **`8/8` (`100%`) BIT-EXACT `argmax` parity** against Full BF16 across real embedding probes.
+- **Full BF16 `lm_head` (`1.017 GB`):** `4.453 ms` (`228.4 GB/s`, `96.4%` of `236.9 GB/s` ceiling).
+- **W4 Two-Pass Exact `lm_head` (`0.286 GB` + Top-64 BF16 rescore):** **`1.258 ms`** (`227.6 GB/s`, `96.1%` of ceiling) — **`3.54×` faster than Full BF16** (`-3.195 ms/tok` saved per token) and **`1.96×` faster than FP8 screen** (`2.47 ms`).
+
 ## Build and Run
 
 ```sh
 sh seed/omega-from-seed.sh
 sh om/gpu/q36/build.sh build/q36
 spark-window run build/q36/q36-native
+spark-window run build/q36/q36-head ~/models/qwen3.6-35b-a3b-fp8-95a723d0/outside.safetensors
 ```

@@ -1,0 +1,751 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Qwen 3.6 35B-A3B FP8 high-speed SM121 lm_head kernel suite:
+note   a (0): bf16_gemv_fast        -- 224 GB/s full BF16 lm_head [248320, 2048]
+note   b (1): bf16_to_w4_quant      -- on-GPU block-32 symmetric INT4 quantizer + exact L2 row_err bound
+note   c (2): w4_lmhead_screen_fast -- 0.286 GB W4 block-32 streaming GEMV (LDG.E.128, 3.56x less DRAM)
+note   d (3): bf16_rescore_cands    -- exact BF16 dot product on surviving two-pass candidates
+note Compose after om/encoder/bw_enc_sm121.om.
+const HQZ ulong 255
+global qhPc ulong 1
+global qhGuard ulong 1
+global qhBuf ulong 16384
+
+fn qhcw st ulong wb ulong rbar ulong wt ulong yld ulong to ulong
+a = or shl st 9 shl yld 13
+b = or shl wb 14 shl rbar 17
+ret or or a b shl wt 20
+end
+
+fn qhAlu1 to ulong
+ret qhcw 2 7 7 0 0
+end
+fn qhAlu4 to ulong
+ret qhcw 6 7 7 0 0
+end
+fn qhCmp to ulong
+ret qhcw 14 7 7 0 0
+end
+fn qhLd to ulong
+ret qhcw 2 0 1 0 1
+end
+fn qhLdW1 to ulong
+ret qhcw 2 0 1 2 1
+end
+fn qhSt to ulong
+ret qhcw 4 7 1 0 1
+end
+fn qhW0 to ulong
+ret qhcw 6 7 7 1 0
+end
+fn qhW1 to ulong
+ret qhcw 6 7 7 2 0
+end
+fn qhWall to ulong
+ret qhcw 6 7 7 7 0
+end
+fn qhShfl to ulong
+ret qhcw 4 0 7 0 1
+end
+fn qhMufu to ulong
+ret qhcw 4 0 7 0 1
+end
+fn qhSafe to ulong
+ret qhcw 6 7 7 7 0
+end
+
+fn qhEmitRaw o edit ulong 16 atPc ulong to void
+w = new ulong 4 0
+op = get o 0
+native = op
+if or eq op 65 eq op 66
+native = ulong 61
+end
+if or eq op 67 eq op 68
+native = ulong 12
+end
+if or eq op 69 eq op 70
+native = ulong 40
+end
+put o 0 native
+if ne get qhGuard 0 0
+put o 9 1
+end
+if eq get qhGuard 0 2
+put o 10 1
+end
+put qhGuard 0 0
+if ne get o 2 HQZ
+put o 12 1
+end
+if ne get o 3 HQZ
+put o 13 1
+end
+if ne enc1 o w 0
+exit 3
+end
+if eq op 65
+put w 2 0x048070ff
+end
+if eq op 66
+put w 2 0x042070ff
+end
+if eq op 67
+put w 2 sub get w 2 0x800
+end
+if eq op 68
+put w 2 sub get w 2 0x400
+end
+if eq op 69
+put w 2 0xc00
+end
+if eq op 70
+put w 2 0x2000
+end
+base = mul atPc 4
+for i ulong 4
+put qhBuf add base i get w i
+end
+end
+
+fn qhic op ulong dst ulong a ulong b ulong imm ulong ctrl ulong to void
+o = new ulong 16 0
+put o 0 op
+put o 1 dst
+put o 2 a
+put o 3 b
+put o 4 HQZ
+put o 5 4
+put o 6 and imm 0xffffffff
+put o 7 ctrl
+pc = get qhPc 0
+qhEmitRaw o pc
+put qhPc 0 add pc 1
+end
+
+fn qhic4 op ulong dst ulong a ulong b ulong c ulong ctrl ulong to void
+o = new ulong 16 0
+put o 0 op
+put o 1 dst
+put o 2 a
+put o 3 b
+put o 4 c
+put o 5 4
+put o 6 0
+put o 7 ctrl
+pc = get qhPc 0
+qhEmitRaw o pc
+put qhPc 0 add pc 1
+end
+
+fn qhicImm op ulong dst ulong a ulong c ulong imm ulong ctrl ulong to void
+o = new ulong 16 0
+put o 0 op
+put o 1 dst
+put o 2 a
+put o 3 HQZ
+put o 4 c
+put o 5 4
+put o 6 and imm 0xffffffff
+put o 7 ctrl
+pc = get qhPc 0
+qhEmitRaw o pc
+put qhPc 0 add pc 1
+end
+
+fn qhBraFwd gd ulong to ulong
+pos = get qhPc 0
+put qhGuard 0 gd
+qhic 46 HQZ HQZ HQZ 0 qhAlu4
+ret pos
+end
+
+fn qhPatch pos ulong gd ulong to void
+o = new ulong 16 0
+put o 0 46
+put o 1 HQZ
+put o 2 HQZ
+put o 3 HQZ
+put o 4 HQZ
+put o 5 4
+put o 6 and sub get qhPc 0 pos 0xffffffff
+put o 7 qhAlu4
+put qhGuard 0 gd
+qhEmitRaw o pos
+end
+
+fn qhLit d ulong x ulong to void
+qhic 2 d HQZ HQZ x qhAlu4
+end
+
+fn qhNum d ulong x f32 to void
+qhLit d ulong bitcast uint x
+end
+
+fn qhMad d ulong a ulong s ulong c ulong to void
+qhicImm 8 d a c s qhAlu4
+end
+
+fn qhMadReg d ulong a ulong b ulong c ulong to void
+qhic4 8 d a b c qhAlu4
+end
+
+fn qhIadd d ulong a ulong b ulong to void
+qhic 14 d a b 0 qhAlu4
+end
+
+fn qhParam d ulong off ulong to void
+qhic 4 d HQZ HQZ add 896 off qhcw 4 0 7 0 1
+qhic 0 HQZ HQZ HQZ 0 qhW0
+end
+
+fn qhStart ptrs ulong to void
+qhic 7 4 HQZ HQZ 856 qhcw 4 2 7 0 1
+for i ulong ptrs
+qhic 5 mul i 2 HQZ HQZ add 896 mul i 8 qhcw 4 0 7 0 1
+end
+qhic 3 14 HQZ HQZ 33 qhcw 4 0 7 0 1
+qhic 3 15 HQZ HQZ 37 qhcw 4 0 7 0 1
+qhic 3 18 HQZ HQZ 38 qhcw 4 0 7 0 1
+qhic 3 19 HQZ HQZ 39 qhcw 4 0 7 0 1
+qhic 0 HQZ HQZ HQZ 0 qhWall
+end
+
+fn qhBar to void
+qhic 0 HQZ HQZ HQZ 0 qhWall
+qhic 48 HQZ HQZ HQZ 0 qhSafe
+end
+
+fn qhWarpRedSum acc ulong tmp ulong startDelta ulong to void
+d = startDelta
+while ge d 1 bound 5
+qhic 42 tmp acc HQZ d qhShfl
+qhic 30 acc acc tmp 0 qhW0
+d = shr d 1
+end
+end
+
+fn qhDone to void
+qhic 0 HQZ HQZ HQZ 0 qhWall
+qhic 45 HQZ HQZ HQZ 0 qhSafe
+while or lt get qhPc 0 32 ne rem get qhPc 0 8 0 bound 2048
+qhic 0 HQZ HQZ HQZ 0 qhSafe
+end
+w = new ulong 4 0
+cnt = get qhPc 0
+for i ulong cnt bound 2048
+base = mul i 4
+for j ulong 4
+put w j get qhBuf add base j
+end
+qhWrite w
+end
+end
+
+note =========================================================================
+note a (0): bf16_gemv_fast -- packed BF16 streaming GEMV (224 GB/s on GB10)
+note Args: W_bf16[N,K] (R0:1), x[K] (R2:3), y[N] (R4:5), K (24), N (28).
+note Grid: (ceil(N/32), 1, 1), Block: 256, SMEM: 8192 (K=2048).
+note =========================================================================
+fn qhBf16MacWord wBase ulong xLo ulong xHi ulong to void
+for r ulong 4
+qhicImm 8 add 52 r add wBase mul r 4 HQZ 65536 qhAlu1
+end
+qhic 0 HQZ HQZ HQZ 0 qhAlu1
+for r ulong 4
+qhic4 33 add 48 r add 52 r xLo add 48 r qhAlu1
+end
+for r ulong 4
+qhic 18 add 52 r add wBase mul r 4 HQZ 0xffff0000 qhAlu1
+end
+qhic 0 HQZ HQZ HQZ 0 qhAlu1
+for r ulong 4
+qhic4 33 add 48 r add 52 r xHi add 48 r qhAlu1
+end
+end
+
+fn qhBf16GemvFast to void
+qhStart 3
+qhParam 6 24
+qhParam 7 28
+qhLit 56 0
+qhLit 57 256
+mStage = get qhPc 0
+qhIadd 52 56 14
+qhicImm 9 16 52 2 4 qhW1
+qhic 11 53 16 HQZ 0 qhLd
+qhMad 54 52 4 HQZ
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhic 50 HQZ 54 53 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+qhIadd 56 56 57
+qhic 28 HQZ 56 6 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mStage get qhPc 0 qhAlu4
+qhBar
+qhic 17 10 14 HQZ 5 qhAlu4
+qhic 18 11 14 HQZ 31 qhAlu4
+qhMad 8 15 32 HQZ
+qhMad 8 10 4 8
+qhMad 9 6 2 HQZ
+qhLit 59 0xffffffff
+qhIadd 59 7 59
+qhMad 55 11 16 HQZ
+for r ulong 4
+qhLit 52 r
+qhIadd 52 8 52
+qhic 28 HQZ 52 7 0 qhCmp
+put qhGuard 0 1
+qhMad 52 59 1 HQZ
+qhMadReg 53 52 9 55
+qhicImm 9 add 16 mul r 2 53 0 1 qhAlu4
+end
+qhMad 12 11 32 HQZ
+qhic 17 13 6 HQZ 8 qhAlu4
+for r ulong 4
+qhNum add 48 r 0.0f32
+end
+qhLit 56 0
+qhLit 57 1
+qhLit 58 1024
+mLoop = get qhPc 0
+qhic 57 24 16 HQZ 0 qhLdW1
+qhic 57 28 18 HQZ 0 qhLd
+qhic 57 32 20 HQZ 0 qhLd
+qhic 57 36 22 HQZ 0 qhLd
+qhic 58 40 12 HQZ 0 qhLd
+qhic 58 44 12 HQZ 16 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhBf16MacWord 24 40 41
+qhBf16MacWord 25 42 43
+qhBf16MacWord 26 44 45
+qhBf16MacWord 27 46 47
+qhic 0 HQZ HQZ HQZ 0 qhW1
+for r ulong 4
+qhicImm 9 add 16 mul r 2 57 add 16 mul r 2 512 qhAlu1
+end
+qhic 14 12 12 58 0 qhAlu1
+qhic 14 56 56 57 0 qhAlu4
+qhic 28 HQZ 56 13 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mLoop get qhPc 0 qhAlu4
+for r ulong 4
+qhWarpRedSum add 48 r 52 16
+end
+qhLit 57 1
+qhic 28 HQZ 11 57 0 qhCmp
+put qhGuard 0 1
+qhic 45 HQZ HQZ HQZ 0 qhSafe
+for r ulong 4
+qhLit 52 r
+qhIadd 52 8 52
+qhic 28 HQZ 52 7 0 qhCmp
+sk = qhBraFwd 1
+qhicImm 9 16 52 4 4 qhAlu4
+qhic 12 HQZ 16 add 48 r 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+qhPatch sk 1
+end
+end
+
+note =========================================================================
+note b (1): bf16_to_w4_quant -- On-GPU block-32 symmetric INT4 quantizer + exact L2 row_err
+note Args: W_bf16[N,2048] (R0:1), W_w4[N,256] u32 (R2:3), S_w4[N,32] u32 packed BF16 (R4:5),
+note       row_err[N] f32 (R6:7), N (32).
+note Grid: (ceil(N/4), 1, 1), Block: 128 (4 warps/CTA, 1 warp/row, 32 lanes/row).
+note Lane L (0..31) quantizes 2 blocks of 32 weights:
+note   block 0: k = L*32 .. L*32+31       -> W_w4[row, L*4 .. L*4+3],       S_w4[row, L].lo16
+note   block 1: k = 1024 + L*32 .. +31    -> W_w4[row, 128 + L*4 .. +3],   S_w4[row, L].hi16
+note =========================================================================
+fn qhQuantOneBlock wBaseReg ulong outOff ulong scReg ulong errReg ulong to void
+note Find amax over 16 u32 BF16 pairs (32 weights) at [wBaseReg + i*4] -> R30
+qhNum 30 0.0f32
+qhLit 31 0
+qhLit 32 16
+qhLit 33 1
+qhLit 34 0x7fffffff
+mAmax = get qhPc 0
+qhicImm 9 16 31 wBaseReg 4 qhAlu4
+qhic 11 35 16 HQZ 0 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhicImm 8 36 35 HQZ 65536 qhAlu4
+qhic 18 37 35 HQZ 0xffff0000 qhAlu4
+qhic 18 36 36 HQZ 0x7fffffff qhAlu4
+qhic 18 37 37 HQZ 0x7fffffff qhAlu4
+qhic 37 30 30 36 0 qhAlu4
+qhic 37 30 30 37 0 qhAlu4
+qhIadd 31 31 33
+qhic 28 HQZ 31 32 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mAmax get qhPc 0 qhAlu4
+note scale = amax / 7.0, rounded to BF16 (top 16 bits); inv = (scale > 0) ? 1/scale : 0
+qhNum 38 0.142857142857f32
+qhic 32 scReg 30 38 0 qhAlu4
+note Round scale to BF16 (truncate low 16 bits so dequant uses EXACT stored scale!)
+qhic 18 scReg scReg HQZ 0xffff0000 qhAlu4
+qhNum 39 0.0f32
+qhic 34 0 scReg 39 0x03f04000 qhCmp
+qhNum 40 0.0f32
+skZ = qhBraFwd 2
+qhic 40 40 scReg HQZ 0 qhMufu
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhPatch skZ 2
+note Quantize 4 groups of 8 weights (4 u32 BF16 pairs -> 1 u32 packed 8 nibbles)
+qhNum 41 7.0f32
+qhNum 42 -7.0f32
+qhNum 43 8.5f32
+qhLit 44 0
+qhLit 45 4
+mGrp = get qhPc 0
+qhLit 46 0
+qhLit 47 0
+qhLit 48 4
+mPair = get qhPc 0
+qhMad 49 44 4 47
+qhicImm 9 16 49 wBaseReg 4 qhAlu4
+qhic 11 35 16 HQZ 0 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+note Low BF16 weight -> R36
+qhicImm 8 36 35 HQZ 65536 qhAlu4
+qhic 32 50 36 40 0 qhAlu4
+qhic 36 50 50 41 0 qhAlu4
+qhic 37 50 50 42 0 qhAlu4
+qhic 30 51 50 43 0 qhAlu4
+qhic 39 52 51 HQZ 0 qhMufu
+qhic 0 HQZ HQZ HQZ 0 qhW0
+note Reconstruct w_hat = (float(q) - 8.0) * scale, accumulate err^2
+qhic 38 53 52 HQZ 0 qhMufu
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhNum 54 -8.0f32
+qhic 30 53 53 54 0 qhAlu4
+qhic 32 53 53 scReg 0 qhAlu4
+qhic 31 53 36 53 0 qhAlu4
+qhic4 33 errReg 53 53 errReg qhAlu4
+note Pack low nibble at shift = pair*8
+qhMad 55 47 8 HQZ
+qhic 52 52 52 55 0 qhAlu4
+qhIadd 46 46 52
+note High BF16 weight -> R37
+qhic 18 37 35 HQZ 0xffff0000 qhAlu4
+qhic 32 50 37 40 0 qhAlu4
+qhic 36 50 50 41 0 qhAlu4
+qhic 37 50 50 42 0 qhAlu4
+qhic 30 51 50 43 0 qhAlu4
+qhic 39 52 51 HQZ 0 qhMufu
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhic 38 53 52 HQZ 0 qhMufu
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhNum 54 -8.0f32
+qhic 30 53 53 54 0 qhAlu4
+qhic 32 53 53 scReg 0 qhAlu4
+qhic 31 53 37 53 0 qhAlu4
+qhic4 33 errReg 53 53 errReg qhAlu4
+note Pack high nibble at shift = pair*8 + 4
+qhLit 54 4
+qhIadd 55 55 54
+qhic 52 52 52 55 0 qhAlu4
+qhIadd 46 46 52
+qhIadd 47 47 33
+qhic 28 HQZ 47 48 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mPair get qhPc 0 qhAlu4
+note Store packed u32 to W_w4[row*256 + outOff + L*4 + grp]
+qhMad 49 20 256 HQZ
+qhLit 54 outOff
+qhIadd 49 49 54
+qhMad 49 21 4 49
+qhIadd 49 49 44
+qhicImm 9 16 49 2 4 qhAlu4
+qhic 12 HQZ 16 46 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+qhIadd 44 44 33
+qhic 28 HQZ 44 45 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mGrp get qhPc 0 qhAlu4
+end
+
+fn qhBf16ToW4Quant to void
+qhStart 4
+qhParam 10 32
+note warp = tid >> 5 (0..3), lane = tid & 31 (R21), row = blockIdx.x * 4 + warp (R20)
+qhic 17 11 14 HQZ 5 qhAlu4
+qhic 18 21 14 HQZ 31 qhAlu4
+qhMad 20 15 4 11
+qhic 28 HQZ 20 10 0 qhCmp
+put qhGuard 0 1
+qhic 45 HQZ HQZ HQZ 0 qhSafe
+note Block 0 W_bf16 base: row*1024 + L*16 (u32 words) -> R22:23
+qhMad 26 20 1024 HQZ
+qhMad 26 21 16 26
+qhicImm 9 22 26 0 4 qhAlu4
+note Block 1 W_bf16 base: row*1024 + 512 + L*16 (u32 words) -> R24:25
+qhLit 27 512
+qhIadd 26 26 27
+qhicImm 9 24 26 0 4 qhAlu4
+qhNum 28 0.0f32
+qhQuantOneBlock 22 0 58 28
+qhQuantOneBlock 24 128 59 28
+note Pack (R58_bf16 >> 16) + (R59_bf16 & 0xffff0000) into S_w4[row*32 + L]
+qhic 17 50 58 HQZ 16 qhAlu4
+qhic 18 51 59 HQZ 0xffff0000 qhAlu4
+qhIadd 50 50 51
+qhMad 49 20 32 21
+qhicImm 9 16 49 4 4 qhAlu4
+qhic 12 HQZ 16 50 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+note Warp reduce err^2 (R28), lane 0 stores sqrt(err^2) -> row_err[row]
+qhWarpRedSum 28 52 16
+qhLit 57 1
+qhic 28 HQZ 21 57 0 qhCmp
+put qhGuard 0 1
+qhic 45 HQZ HQZ HQZ 0 qhSafe
+qhic 41 29 28 HQZ 0 qhMufu
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhNum 39 0.0f32
+qhic 34 0 28 39 0x03f04000 qhCmp
+qhNum 30 0.0f32
+put qhGuard 0 1
+qhic 32 30 28 29 0 qhAlu4
+qhicImm 9 16 20 6 4 qhAlu4
+qhic 12 HQZ 16 30 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+end
+
+note =========================================================================
+note c (2): w4_lmhead_screen_fast -- Straight-line 2-block W4 block-32 streaming GEMV
+note Args: W_w4[N,256] u32 (R0:1), S_w4[N,32] u32 (R2:3), x[2048] (R4:5), y[N] (R6:7), N (32).
+note Grid: (ceil(N/32), 1, 1), Block: 256 (8 warps x 4 rows = 32 rows/CTA), SMEM: 8192.
+note Each lane L (0..31) owns 2 blocks of 32 weights -> ONLY 2 LDG.E.128 per row!
+note Algebraic shortcut: dot(q - 8, x) = dot(q, x) - 8 * sum(x) (zero per-weight subtract!).
+note =========================================================================
+fn qhW4Unpack4 wReg ulong x0 ulong x1 ulong x2 ulong x3 ulong baccReg ulong to void
+note Unpack low 4 nibbles of wReg (bits 0..15) and FMA with x0..x3 into baccReg
+qhic 18 52 wReg HQZ 15 qhAlu1
+qhic 17 53 wReg HQZ 4 qhAlu1
+qhic 17 54 wReg HQZ 8 qhAlu1
+qhic 17 55 wReg HQZ 12 qhAlu4
+qhic 18 53 53 HQZ 15 qhAlu1
+qhic 18 54 54 HQZ 15 qhAlu1
+qhic 18 55 55 HQZ 15 qhAlu4
+qhic 38 52 52 HQZ 0 qhMufu
+qhic 38 53 53 HQZ 0 qhMufu
+qhic 38 54 54 HQZ 0 qhMufu
+qhic 38 55 55 HQZ 0 qhMufu
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhic4 33 baccReg 52 x0 baccReg qhAlu4
+qhic4 33 baccReg 53 x1 baccReg qhAlu4
+qhic4 33 baccReg 54 x2 baccReg qhAlu4
+qhic4 33 baccReg 55 x3 baccReg qhAlu4
+end
+
+fn qhW4MacBlock smOffReg ulong sc0 ulong sc1 ulong sc2 ulong sc3 ulong to void
+note Process 4 rows whose 4 packed u32s are in R24..27 (r0), R28..31 (r1), R32..35 (r2), R36..39 (r3)
+note Accumulate block sum into R56..R59 and sum_x into R60; then acc[r] += (bacc[r] - 8*sum_x) * sc[r]
+qhNum 56 0.0f32
+qhNum 57 0.0f32
+qhNum 58 0.0f32
+qhNum 59 0.0f32
+qhNum 60 0.0f32
+for w ulong 4
+note Load 8 floats of x from SMEM[smOffReg + w*32 .. +31] via 2x LDS.128 -> R40..47
+qhic 58 40 smOffReg HQZ mul w 32 qhLd
+qhic 58 44 smOffReg HQZ add mul w 32 16 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+for xi ulong 8
+qhic 30 60 60 add 40 xi 0 qhAlu4
+end
+for r ulong 4
+wr = add add 24 mul r 4 w
+qhW4Unpack4 wr 40 41 42 43 add 56 r
+qhic 17 61 wr HQZ 16 qhAlu4
+qhW4Unpack4 61 44 45 46 47 add 56 r
+end
+end
+qhNum 61 -8.0f32
+qhic 32 60 60 61 0 qhAlu4
+qhic 30 56 56 60 0 qhAlu1
+qhic 30 57 57 60 0 qhAlu1
+qhic 30 58 58 60 0 qhAlu1
+qhic 30 59 59 60 0 qhAlu4
+qhic4 33 48 56 sc0 48 qhAlu1
+qhic4 33 49 57 sc1 49 qhAlu1
+qhic4 33 50 58 sc2 50 qhAlu1
+qhic4 33 51 59 sc3 51 qhAlu4
+end
+
+fn qhW4LmheadScreenFast to void
+qhStart 4
+qhParam 9 32
+note Stage x[2048] into SMEM[0..8191]
+qhLit 56 0
+qhLit 57 256
+qhLit 58 2048
+mSx = get qhPc 0
+qhIadd 52 56 14
+qhicImm 9 16 52 4 4 qhW1
+qhic 11 53 16 HQZ 0 qhLd
+qhMad 54 52 4 HQZ
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhic 50 HQZ 54 53 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+qhIadd 56 56 57
+qhic 28 HQZ 56 58 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mSx get qhPc 0 qhAlu4
+qhBar
+note warp = tid >> 5 (R10), lane = tid & 31 (R11), base_row = blockIdx.x * 32 + warp * 4 (R8)
+qhic 17 10 14 HQZ 5 qhAlu4
+qhic 18 11 14 HQZ 31 qhAlu4
+qhMad 8 15 32 HQZ
+qhMad 8 10 4 8
+qhLit 59 0xffffffff
+qhIadd 59 9 59
+note Load 4 packed BF16 scales from S_w4[row*32 + lane] into R24..R27, then move to R2..R5 (S_w4/x ptrs no longer needed!)
+for r ulong 4
+qhLit 52 r
+qhIadd 52 8 52
+qhic 28 HQZ 52 9 0 qhCmp
+put qhGuard 0 1
+qhMad 52 59 1 HQZ
+qhMad 53 52 32 11
+qhicImm 9 16 53 2 4 qhAlu4
+qhic 11 add 24 r 16 HQZ 0 qhLd
+end
+qhic 0 HQZ HQZ HQZ 0 qhW0
+for r ulong 4
+qhicImm 8 add 2 r add 24 r HQZ 1 qhAlu1
+end
+note Compute 4 row pointers for W_w4 block 0: row*256 + lane*4 (u32 words) -> R16:17, R18:19, R20:21, R22:23
+qhMad 55 11 4 HQZ
+for r ulong 4
+qhLit 52 r
+qhIadd 52 8 52
+qhic 28 HQZ 52 9 0 qhCmp
+put qhGuard 0 1
+qhMad 52 59 1 HQZ
+qhMad 53 52 256 55
+qhicImm 9 add 16 mul r 2 53 0 4 qhAlu4
+end
+note Initialize accumulators R48..R51 = 0
+for r ulong 4
+qhNum add 48 r 0.0f32
+end
+note === BLOCK 0 (k = lane*32 .. lane*32+31): 4x LDG.E.128 ===
+qhic 57 24 16 HQZ 0 qhLdW1
+qhic 57 28 18 HQZ 0 qhLd
+qhic 57 32 20 HQZ 0 qhLd
+qhic 57 36 22 HQZ 0 qhLd
+note Unpack block-0 scales (lo16 << 16) from R2..R5 into R12..R15 while LDG.E.128 is in flight!
+for r ulong 4
+qhicImm 8 add 12 r add 2 r HQZ 65536 qhAlu1
+end
+qhMad 10 11 128 HQZ
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhW4MacBlock 10 12 13 14 15
+note === BLOCK 1 (k = 1024 + lane*32 .. +31): advance ptrs by +512 bytes (128 u32) ===
+qhLit 57 1
+for r ulong 4
+qhicImm 9 add 16 mul r 2 57 add 16 mul r 2 512 qhAlu4
+end
+qhic 57 24 16 HQZ 0 qhLdW1
+qhic 57 28 18 HQZ 0 qhLd
+qhic 57 32 20 HQZ 0 qhLd
+qhic 57 36 22 HQZ 0 qhLd
+note Unpack block-1 scales (hi16 & 0xffff0000) from R2..R5 into R12..R15!
+for r ulong 4
+qhic 18 add 12 r add 2 r HQZ 0xffff0000 qhAlu1
+end
+qhLit 58 4096
+qhIadd 10 10 58
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhW4MacBlock 10 12 13 14 15
+note Warp sum R48..R51 and store to y[R6:7]
+for r ulong 4
+qhWarpRedSum add 48 r 52 16
+end
+qhLit 57 1
+qhic 28 HQZ 11 57 0 qhCmp
+put qhGuard 0 1
+qhic 45 HQZ HQZ HQZ 0 qhSafe
+for r ulong 4
+qhLit 52 r
+qhIadd 52 8 52
+qhic 28 HQZ 52 9 0 qhCmp
+sk = qhBraFwd 1
+qhicImm 9 16 52 6 4 qhAlu4
+qhic 12 HQZ 16 add 48 r 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+qhPatch sk 1
+end
+end
+
+note =========================================================================
+note d (3): bf16_rescore_cands -- Exact BF16 dot product on surviving two-pass candidates
+note Args: W_bf16[V,2048] (R0:1), x[2048] (R2:3), cand_ids[M] (R4:5), out_logits[M] (R6:7), M (32).
+note Grid: (M, 1, 1), Block: 32 (1 warp per candidate, 64 weights/lane = 8x LDG.E.128), SMEM: 0.
+note =========================================================================
+fn qhBf16RescoreCands to void
+qhStart 4
+qhParam 10 32
+qhic 28 HQZ 15 10 0 qhCmp
+put qhGuard 0 1
+qhic 45 HQZ HQZ HQZ 0 qhSafe
+note Load cand_id = cand_ids[blockIdx.x] -> R11
+qhicImm 9 16 15 4 4 qhAlu4
+qhic 11 11 16 HQZ 0 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+note W row base: (cand_id * 1024 + lane * 4) u32 words -> R20:21 (stride 128 u32 = 512 B per iter)
+qhMad 12 11 1024 HQZ
+qhMad 12 14 4 12
+qhicImm 9 20 12 0 4 qhAlu4
+note x base: lane * 8 floats -> R22:23 (stride 256 floats = 1024 B per iter)
+qhMad 13 14 8 HQZ
+qhicImm 9 22 13 2 4 qhAlu4
+qhNum 48 0.0f32
+qhLit 56 0
+qhLit 57 8
+qhLit 58 1
+mRes = get qhPc 0
+qhic 57 24 20 HQZ 0 qhLdW1
+qhic 57 28 22 HQZ 0 qhLd
+qhic 57 32 22 HQZ 16 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+for j ulong 4
+qhicImm 8 52 add 24 j HQZ 65536 qhAlu4
+qhic 18 53 add 24 j HQZ 0xffff0000 qhAlu4
+qhic4 33 48 52 add 28 mul j 2 48 qhAlu4
+qhic4 33 48 53 add 29 mul j 2 48 qhAlu4
+end
+qhicImm 9 20 58 20 512 qhAlu4
+qhicImm 9 22 58 22 1024 qhAlu4
+qhIadd 56 56 58
+qhic 28 HQZ 56 57 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mRes get qhPc 0 qhAlu4
+qhWarpRedSum 48 52 16
+qhic 28 HQZ 14 58 0 qhCmp
+put qhGuard 0 1
+qhic 45 HQZ HQZ HQZ 0 qhSafe
+qhicImm 9 16 15 6 4 qhAlu4
+qhic 12 HQZ 16 48 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+end
+
+fn qhKernel mode uchar to bool
+if eq mode 97
+qhBf16GemvFast
+ret true
+end
+if eq mode 98
+qhBf16ToW4Quant
+ret true
+end
+if eq mode 99
+qhW4LmheadScreenFast
+ret true
+end
+if eq mode 100
+qhBf16RescoreCands
+ret true
+end
+ret false
+end
