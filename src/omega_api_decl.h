@@ -1080,6 +1080,22 @@ void ans_om_write_header(uint64_t o_kind, uint8_t o_out_hdr[8]);
 uint64_t ans_om_check_header(const uint8_t o_hdr[8], uint64_t o_kind);
 /* export fn ans_om_canon_f64 bits ulong to ulong */
 uint64_t ans_om_canon_f64(uint64_t o_bits);
+/* export fn res_om_fit_normal x view ulong * y view ulong * ws edit ulong 67334 meta view ulong 4 to long */
+int64_t res_om_fit_normal(const uint64_t *o_x, size_t o_x_len, const uint64_t *o_y, size_t o_y_len, uint64_t o_ws[67334], const uint64_t o_meta[4]);
+/* export fn res_om_fit_solve ws edit ulong 67334 nf ulong no ulong to long */
+int64_t res_om_fit_solve(uint64_t o_ws[67334], uint64_t o_nf, uint64_t o_no);
+/* export fn res_om_readout_apply w view ulong 1028 x view ulong * y_out edit ulong * meta view ulong 2 to long */
+int64_t res_om_readout_apply(const uint64_t o_w[1028], const uint64_t *o_x, size_t o_x_len, uint64_t *o_y_out, size_t o_y_out_len, const uint64_t o_meta[2]);
+/* export fn res_om_nrmse ref view ulong * pred view ulong * out_bits edit ulong 1 to long */
+int64_t res_om_nrmse(const uint64_t *o_ref, size_t o_ref_len, const uint64_t *o_pred, size_t o_pred_len, uint64_t o_out_bits[1]);
+/* export fn cl_om_put_le val ulong nbytes ulong out_buf out uchar 8 to void */
+void cl_om_put_le(uint64_t o_val, uint64_t o_nbytes, uint8_t o_out_buf[8]);
+/* export fn cl_om_get_le in_buf view uchar 8 nbytes ulong to ulong */
+uint64_t cl_om_get_le(const uint8_t o_in_buf[8], uint64_t o_nbytes);
+/* export fn cl_om_hex src view uchar * out_hex edit uchar * to void */
+void cl_om_hex(const uint8_t *o_src, size_t o_src_len, uint8_t *o_out_hex, size_t o_out_hex_len);
+/* export fn cl_om_contains hay view uchar * needle view uchar * to ulong */
+uint64_t cl_om_contains(const uint8_t *o_hay, size_t o_hay_len, const uint8_t *o_needle, size_t o_needle_len);
 #ifdef __cplusplus
 }
 #endif

@@ -703,6 +703,26 @@ uint32_t omega2_ans_om_write_header(uint64_t *result, uint64_t o_kind, uint8_t *
 uint32_t omega2_ans_om_check_header(uint64_t *result, const uint8_t *o_hdr, uint64_t o_hdr_len, uint64_t o_kind);
 /* export fn ans_om_canon_f64 bits ulong to ulong */
 uint32_t omega2_ans_om_canon_f64(uint64_t *result, uint64_t o_bits);
+#define OMEGA2_IDENT_reservoir_readout "omega-ident 1 unit=reservoir_readout abi=2 profile=OM-2 src=751118826a3c2d25452e972ca91f3fef47872798a017edc44d43e38e9d7d8175 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_reservoir_readout(void);
+/* export fn res_om_fit_normal x view ulong * y view ulong * ws edit ulong 67334 meta view ulong 4 to long */
+uint32_t omega2_res_om_fit_normal(uint64_t *result, const uint64_t *o_x, uint64_t o_x_len, const uint64_t *o_y, uint64_t o_y_len, uint64_t *o_ws, uint64_t o_ws_len, const uint64_t *o_meta, uint64_t o_meta_len);
+/* export fn res_om_fit_solve ws edit ulong 67334 nf ulong no ulong to long */
+uint32_t omega2_res_om_fit_solve(uint64_t *result, uint64_t *o_ws, uint64_t o_ws_len, uint64_t o_nf, uint64_t o_no);
+/* export fn res_om_readout_apply w view ulong 1028 x view ulong * y_out edit ulong * meta view ulong 2 to long */
+uint32_t omega2_res_om_readout_apply(uint64_t *result, const uint64_t *o_w, uint64_t o_w_len, const uint64_t *o_x, uint64_t o_x_len, uint64_t *o_y_out, uint64_t o_y_out_len, const uint64_t *o_meta, uint64_t o_meta_len);
+/* export fn res_om_nrmse ref view ulong * pred view ulong * out_bits edit ulong 1 to long */
+uint32_t omega2_res_om_nrmse(uint64_t *result, const uint64_t *o_ref, uint64_t o_ref_len, const uint64_t *o_pred, uint64_t o_pred_len, uint64_t *o_out_bits, uint64_t o_out_bits_len);
+#define OMEGA2_IDENT_cl_core "omega-ident 1 unit=cl_core abi=2 profile=OM-2 src=ce0062b9410c71f598029a88fa66aaa8a82a806a92b34b55831bfc4c0076e5ab omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_cl_core(void);
+/* export fn cl_om_put_le val ulong nbytes ulong out_buf out uchar 8 to void */
+uint32_t omega2_cl_om_put_le(uint64_t *result, uint64_t o_val, uint64_t o_nbytes, uint8_t *o_out_buf);
+/* export fn cl_om_get_le in_buf view uchar 8 nbytes ulong to ulong */
+uint32_t omega2_cl_om_get_le(uint64_t *result, const uint8_t *o_in_buf, uint64_t o_in_buf_len, uint64_t o_nbytes);
+/* export fn cl_om_hex src view uchar * out_hex edit uchar * to void */
+uint32_t omega2_cl_om_hex(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_out_hex, uint64_t o_out_hex_len);
+/* export fn cl_om_contains hay view uchar * needle view uchar * to ulong */
+uint32_t omega2_cl_om_contains(uint64_t *result, const uint8_t *o_hay, uint64_t o_hay_len, const uint8_t *o_needle, uint64_t o_needle_len);
 #ifdef __cplusplus
 }
 #endif

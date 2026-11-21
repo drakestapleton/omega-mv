@@ -1,0 +1,279 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 binary64 ridge readout (Phi^T Phi + lambda I, L D L^T
+note factorization, forward/back solve, apply) and NRMSE backing
+note src/reservoir/omega_reservoir_readout.c.
+om2
+
+const res_dim ulong 257
+const res_max_out ulong 4
+const res_d_off ulong 66049
+const res_r_off ulong 66306
+
+fn res_fin64 bits ulong to bool
+  ret lt and bits 0x7ff0000000000000 0x7ff0000000000000
+end
+
+fn res_design_val x view ulong * t ulong nf ulong col ulong to f64
+  if eq col 0
+    ret bitcast f64 ulong 0x3ff0000000000000
+  end
+  ret bitcast f64 get x add mul t nf sub col 1
+end
+
+fn res_dot_xx x view ulong * meta view ulong 4 i ulong j ulong to f64
+  s = bitcast f64 ulong 0
+  for t ulong get meta 0
+    xi = res_design_val x t get meta 1 i
+    xj = res_design_val x t get meta 1 j
+    s = add s mul xi xj
+  end
+  ret s
+end
+
+fn res_dot_xy x view ulong * y view ulong * meta view ulong 4 io ulong to f64
+  s = bitcast f64 ulong 0
+  for t ulong get meta 0
+    xi = res_design_val x t get meta 1 div io 4
+    idx = mul t get meta 2
+    idx = add idx rem io 4
+    yo = bitcast f64 get y idx
+    s = add s mul xi yo
+  end
+  ret s
+end
+
+fn res_check_fit_args x view ulong * y view ulong * meta view ulong 4 to long
+  ns = get meta 0
+  nf = get meta 1
+  no = get meta 2
+  lam_b = get meta 3
+  if or lt nf 1 gt nf 256
+    ret -3
+  end
+  if or lt no 1 gt no 4
+    ret -3
+  end
+  if or lt ns 1 not res_fin64 lam_b
+    ret -3
+  end
+  if lt bitcast f64 lam_b bitcast f64 ulong 0
+    ret -3
+  end
+  for i ulong mul ns nf
+    if not res_fin64 get x i
+      ret -4
+    end
+  end
+  for i ulong mul ns no
+    if not res_fin64 get y i
+      ret -4
+    end
+  end
+  ret 0
+end
+
+fn res_fill_g x view ulong * ws edit ulong 67334 meta view ulong 4 to void
+  for i ulong add get meta 1 1
+    for j ulong add i 1
+      s = res_dot_xx x meta i j
+      if and ne i 0 eq j i
+        s = add s bitcast f64 get meta 3
+      end
+      put ws add mul i res_dim j bitcast ulong s
+    end
+  end
+end
+
+fn res_fill_r x view ulong * y view ulong * ws edit ulong 67334 meta view ulong 4 to void
+  for io ulong mul add get meta 1 1 4
+    if lt rem io 4 get meta 2
+      s = res_dot_xy x y meta io
+      put ws add res_r_off io bitcast ulong s
+    end
+  end
+end
+
+export fn res_om_fit_normal x view ulong * y view ulong * ws edit ulong 67334 meta view ulong 4 to long
+  rc = res_check_fit_args x y meta
+  if ne rc 0
+    ret rc
+  end
+  res_fill_g x ws meta
+  res_fill_r x y ws meta
+  ret 0
+end
+
+fn res_ldlt_pivot ws edit ulong 67334 j ulong to long
+  gjj = bitcast f64 get ws add mul j res_dim j
+  dj = gjj
+  for k ulong j
+    ljk = bitcast f64 get ws add mul j res_dim k
+    dk = bitcast f64 get ws add res_d_off k
+    dj = sub dj mul mul ljk ljk dk
+  end
+  dj_b = bitcast ulong dj
+  tol = mul bitcast f64 ulong 0x3d3c25c268497682 gjj
+  if or not res_fin64 dj_b le dj tol
+    ret -10
+  end
+  put ws add res_d_off j dj_b
+  ret 0
+end
+
+fn res_ldlt_entry ws edit ulong 67334 row ulong j ulong to void
+  dj = bitcast f64 get ws add res_d_off j
+  s = bitcast f64 get ws add mul row res_dim j
+  for k ulong j
+    lik = bitcast f64 get ws add mul row res_dim k
+    ljk = bitcast f64 get ws add mul j res_dim k
+    dk = bitcast f64 get ws add res_d_off k
+    s = sub s mul mul lik ljk dk
+  end
+  put ws add mul row res_dim j bitcast ulong div s dj
+end
+
+fn res_ldlt_col ws edit ulong 67334 p ulong j ulong to void
+  for i ulong sub p add j 1
+    res_ldlt_entry ws add add j 1 i j
+  end
+end
+
+fn res_solve_fwd_row ws edit ulong 67334 i ulong o ulong to void
+  s = bitcast f64 get ws add res_r_off add mul i res_max_out o
+  for k ulong i
+    lik = bitcast f64 get ws add mul i res_dim k
+    rk = bitcast f64 get ws add res_r_off add mul k res_max_out o
+    s = sub s mul lik rk
+  end
+  put ws add res_r_off add mul i res_max_out o bitcast ulong s
+end
+
+fn res_solve_fwd ws edit ulong 67334 p ulong o ulong to void
+  for i ulong p
+    res_solve_fwd_row ws i o
+  end
+  for i ulong p
+    ri = bitcast f64 get ws add res_r_off add mul i res_max_out o
+    di = bitcast f64 get ws add res_d_off i
+    put ws add res_r_off add mul i res_max_out o bitcast ulong div ri di
+  end
+end
+
+fn res_solve_bwd_row ws edit ulong 67334 p ulong ii ulong o ulong to long
+  s = bitcast f64 get ws add res_r_off add mul ii res_max_out o
+  k = add ii 1
+  while lt k p
+    lki = bitcast f64 get ws add mul k res_dim ii
+    rk = bitcast f64 get ws add res_r_off add mul k res_max_out o
+    s = sub s mul lki rk
+    k = add k 1
+  end
+  sb = bitcast ulong s
+  if not res_fin64 sb
+    ret -4
+  end
+  put ws add res_r_off add mul ii res_max_out o sb
+  ret 0
+end
+
+fn res_solve_output ws edit ulong 67334 p ulong o ulong to long
+  res_solve_fwd ws p o
+  for step ulong p
+    rc = res_solve_bwd_row ws p sub sub p 1 step o
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret 0
+end
+
+export fn res_om_fit_solve ws edit ulong 67334 nf ulong no ulong to long
+  p = add nf 1
+  for j ulong p
+    rc = res_ldlt_pivot ws j
+    if ne rc 0
+      ret rc
+    end
+    res_ldlt_col ws p j
+  end
+  for o ulong no
+    rc = res_solve_output ws p o
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret 0
+end
+
+fn res_apply_one w view ulong 1028 x view ulong * nf ulong o ulong to ulong
+  s = bitcast f64 get w o
+  for f ulong nf
+    xf = bitcast f64 get x f
+    wf = bitcast f64 get w add mul add 1 f res_max_out o
+    s = add s mul xf wf
+  end
+  ret bitcast ulong s
+end
+
+export fn res_om_readout_apply w view ulong 1028 x view ulong * y_out edit ulong * meta view ulong 2 to long
+  if or lt get meta 0 1 gt get meta 0 256
+    ret -3
+  end
+  if or lt get meta 1 1 gt get meta 1 4
+    ret -3
+  end
+  for f ulong get meta 0
+    if not res_fin64 get x f
+      ret -4
+    end
+  end
+  for o ulong get meta 1
+    sb = res_apply_one w x get meta 0 o
+    if not res_fin64 sb
+      ret -4
+    end
+    put y_out o sb
+  end
+  ret 0
+end
+
+fn res_nrmse_mean ref view ulong * pred view ulong * out_mean edit ulong 1 to long
+  sum = bitcast f64 ulong 0
+  for i ulong len ref
+    rb = get ref i
+    pb = get pred i
+    if or not res_fin64 rb not res_fin64 pb
+      ret -4
+    end
+    sum = add sum bitcast f64 rb
+  end
+  put out_mean 0 bitcast ulong div sum f64 len ref
+  ret 0
+end
+
+export fn res_om_nrmse ref view ulong * pred view ulong * out_bits edit ulong 1 to long
+  if or lt len ref 2 ne len pred len ref
+    ret -3
+  end
+  rc = res_nrmse_mean ref pred out_bits
+  if ne rc 0
+    ret rc
+  end
+  mean = bitcast f64 get out_bits 0
+  num = bitcast f64 ulong 0
+  den = bitcast f64 ulong 0
+  for i ulong len ref
+    e = sub bitcast f64 get ref i bitcast f64 get pred i
+    c = sub bitcast f64 get ref i mean
+    num = add num mul e e
+    den = add den mul c c
+  end
+  if or not res_fin64 bitcast ulong num not res_fin64 bitcast ulong den
+    ret -10
+  end
+  if le den bitcast f64 ulong 0
+    ret -10
+  end
+  put out_bits 0 bitcast ulong fsqrt div num den
+  ret 0
+end

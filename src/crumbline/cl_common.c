@@ -15,6 +15,7 @@
  */
 
 #include "cl_common.h"
+#include "omega_api_decl.h"
 #include "sha256.h"
 
 #include <string.h>
@@ -37,7 +38,7 @@ void cl_w_bytes(ClWriter *w, const void *p, size_t n) {
 
 void cl_w_uN(ClWriter *w, uint64_t v, uint8_t nbytes) {
     uint8_t b[8];
-    for (uint8_t i = 0; i < nbytes && i < 8; ++i) b[i] = (uint8_t)(v >> (8u * i));
+    cl_om_put_le(v, nbytes, b);
     cl_w_bytes(w, b, nbytes);
 }
 
@@ -70,9 +71,7 @@ uint64_t cl_r_uN(ClReader *r, uint8_t nbytes) {
         r->error = true;
         return 0;
     }
-    uint64_t v = 0;
-    for (uint8_t i = 0; i < nbytes; ++i) v |= (uint64_t)b[i] << (8u * i);
-    return v;
+    return cl_om_get_le(b, nbytes);
 }
 
 uint8_t cl_r_u8(ClReader *r) { return (uint8_t)cl_r_uN(r, 1); }
@@ -137,15 +136,11 @@ void cl_digest(const char *domain, const uint8_t *data, size_t len, uint8_t out[
 }
 
 void cl_hex(const uint8_t *bytes, size_t n, char *out) {
-    static const char hx[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; ++i) {
-        out[2 * i] = hx[bytes[i] >> 4];
-        out[2 * i + 1] = hx[bytes[i] & 15];
-    }
+    if (n) cl_om_hex(bytes, n, (uint8_t *)out, 2 * n);
     out[2 * n] = 0;
 }
 
 bool cl_contains(const uint8_t *hay, size_t hay_len, const void *needle, size_t needle_len) {
     if (needle_len == 0 || needle_len > hay_len) return false;
-    return memmem(hay, hay_len, needle, needle_len) != NULL;
+    return cl_om_contains(hay, hay_len, (const uint8_t *)needle, needle_len) != 0;
 }
