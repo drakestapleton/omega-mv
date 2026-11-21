@@ -1,0 +1,126 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note The scheduler holds the exclusive CPU lease from miss through publish.
+note maps[0] is Zone 4 staging, maps[1] the Zone 2/3 GPU-visible slab arena.
+const deBytes ulong 18800640
+fn deStagePlane fd int off ulong stage long dest ulong size ulong ctx edit shactx to bool
+  buf = new uchar 262144 0
+  pos = ulong 0
+  while lt pos size
+    chunk = sub size pos
+    if gt chunk len buf
+      chunk = len buf
+    end
+    if not diRead fd buf add off pos chunk
+      ret false
+    end
+    if ne mapwrite stage add dest pos buf 0 chunk long chunk
+      ret false
+    end
+    sha256_update ctx part buf 0 chunk
+    pos = add pos chunk
+  end
+  ret true
+end
+
+fn deVerifyStage fd int descriptor view uchar 64 stage long to bool
+  ctx = new uchar 104 0
+  digest = new uchar 32 0
+  sha256_init ctx
+  pos = ulong 0
+  for plane ulong 6
+    size = ulong 5898240
+    if ge plane 3
+      size = 368640
+    end
+    off = diGet descriptor add 16 mul plane 8 8
+    if not deStagePlane fd off stage pos size ctx
+      ret false
+    end
+    pos = add pos size
+  end
+  sha256_final ctx digest
+  for i ulong 8
+    if ne get digest i get descriptor add 8 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn deCopy stage long arena long dest ulong to bool
+  buf = new uchar 262144 0
+  pos = ulong 0
+  while lt pos deBytes
+    chunk = sub deBytes pos
+    if gt chunk len buf
+      chunk = len buf
+    end
+    if ne mapread stage pos buf 0 chunk long chunk
+      ret false
+    end
+    if ne mapwrite arena add dest pos buf 0 chunk long chunk
+      ret false
+    end
+    pos = add pos chunk
+  end
+  ret true
+end
+
+fn deFind slots view uchar * descriptor view uchar 64 to long
+  for i ulong div len slots 64
+    pos = mul i 64
+    if eq get slots add pos 5 2
+      if eq diGet slots pos 2 ulong get descriptor 1
+        if eq diGet slots add pos 2 2 diGet descriptor 4 4
+          if ne diGet slots add pos 32 8 diGet descriptor 8 8
+            ret -2
+          end
+          ret long i
+        end
+      end
+    end
+  end
+  ret -1
+end
+
+fn deResolve h edit zonehdr slots edit uchar * descriptor view uchar 64 maps view long 2 fd int to long
+  if or ne get h owner 1 not arena_shape h slots
+    ret -2
+  end
+  if or ge get descriptor 1 40 ne ulong get descriptor 0 add 3 ulong get descriptor 1
+    ret -2
+  end
+  if ge diGet descriptor 4 4 384
+    ret -2
+  end
+  hit = deFind slots descriptor
+  if ne hit -1
+    ret hit
+  end
+  if not deVerifyStage fd descriptor get maps 0
+    ret -2
+  end
+  slot = z3_claim_fifo_slot h slots
+  if lt slot 0
+    ret -1
+  end
+  base = mul ulong slot 64
+  dest = mul ulong slot deBytes
+  put slots add base 5 1
+  if not deCopy get maps 0 get maps 1 dest
+    put slots add base 5 0
+    ret -2
+  end
+  for j ulong 64
+    put slots add base j 0
+  end
+  diPut slots base 2 ulong get descriptor 1
+  diPut slots add base 2 2 diGet descriptor 4 4
+  note Lane 1 encodes the FIFO zone as 2 and full-width planes as 3.
+  put slots add base 4 2
+  put slots add base 6 3
+  diPut slots add base 16 8 dest
+  diPut slots add base 32 8 diGet descriptor 8 8
+  put slots add base 5 2
+  ret slot
+end

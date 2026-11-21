@@ -1,0 +1,314 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Per checkpoint shard, build one fixed record per routed expert or
+note Engram row. Only run against the digest-verified tensor directory
+note and its immutable verified source shards. Weights precede scales.
+global dxExpert ulong 2304
+global dxEngram ulong 3
+text dxRouted ".ffn.experts."
+text dxEmbedding ".engram.embed."
+text dxWeight "weight"
+text dxScale "scale"
+text dxTensorPin "aeffef21b0840b05d82f525da3f72546b8ffbb5ee876b926518b486f0198cb9f"
+
+fn dxAt row view uchar 160 p ulong name view uchar * to bool
+  if gt add p len name 160
+    ret false
+  end
+  for i ulong len name
+    if ne get row add p i get name i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn dxSuffix row view uchar 160 p ulong to ulong
+  if dxAt row p dxWeight
+    if eq get row add p 6 0
+      ret 0
+    end
+  end
+  if dxAt row p dxScale
+    if eq get row add p 5 0
+      ret 1
+    end
+  end
+  ret 2
+end
+
+fn dxExpertSize plane ulong to ulong
+  if lt plane 3
+    ret 5898240
+  end
+  ret 368640
+end
+
+fn dxExpertKey row view uchar 160 pos ulong to ulong
+  id = ulong 0
+  while ge get row pos 48
+    c = get row pos
+    if gt c 57
+      break
+    end
+    id = add mul id 10 ulong sub c 48
+    pos = add pos 1
+  end
+  if or ge id 384 ne get row pos 46
+    ret 2304
+  end
+  if or ne get row add pos 1 119 ne get row add pos 3 46
+    ret 2304
+  end
+  projection = ulong get row add pos 2
+  if or lt projection 49 gt projection 51
+    ret 2304
+  end
+  kind = dxSuffix row add pos 4
+  if ge kind 2
+    ret 2304
+  end
+  ret add mul id 6 add mul kind 3 sub projection 49
+end
+
+fn dxCollect row view uchar 160 shard ulong to bool
+  if ne ulong get row 0 shard
+    ret true
+  end
+  pos = ulong 63
+  while and ge get row pos 48 le get row pos 57
+    pos = add pos 1
+  end
+  if dxAt row pos dxRouted
+    key = dxExpertKey row add pos len dxRouted
+    if ge key 2304
+      ret false
+    end
+    if ne diGet row 16 8 dxExpertSize rem key 6
+      ret false
+    end
+    if ne get dxExpert key 0
+      ret false
+    end
+    put dxExpert key diGet row 8 8
+  end
+  if dxAt row pos dxEmbedding
+    kind = dxSuffix row add pos len dxEmbedding
+    if ge kind 2
+      ret false
+    end
+    put dxEngram kind diGet row 8 8
+    put dxEngram 2 diGet row 24 4
+  end
+  ret true
+end
+
+fn dxDirectory fd int shard ulong to bool
+  size = fseek fd 0 2
+  if ne size 15373600
+    ret false
+  end
+  row = new uchar 160 0
+  ctx = new uchar 104 0
+  digest = new uchar 32 0
+  sha256_init ctx
+  for i ulong 96085
+    if not diRead fd row mul i 160 160
+      ret false
+    end
+    sha256_update ctx row
+    if not dxCollect row shard
+      ret false
+    end
+  end
+  sha256_final ctx digest
+  for i ulong 32
+    v = uint get digest i
+    if ne sh_hexd shr v 4 get dxTensorPin mul i 2
+      ret false
+    end
+    if ne sh_hexd and v 15 get dxTensorPin add mul i 2 1
+      ret false
+    end
+  end
+  ret true
+end
+
+fn dxHashExtent fd int ctx edit shactx start ulong size ulong to bool
+  buf = new uchar 262144 0
+  off = ulong 0
+  while lt off size
+    chunk = sub size off
+    if gt chunk len buf
+      chunk = len buf
+    end
+    if not diRead fd buf add start off chunk
+      ret false
+    end
+    sha256_update ctx part buf 0 chunk
+    off = add off chunk
+  end
+  ret true
+end
+
+fn dxWrite data view uchar * to bool
+  off = ulong 0
+  while lt off len data
+    n = write 1 data off sub len data off
+    if eq n -4
+      continue
+    end
+    if le n 0
+      ret false
+    end
+    off = add off ulong n
+  end
+  ret true
+end
+
+fn dxExpertRecord fd int shard ulong expert ulong to bool
+  record = new uchar 64 0
+  ctx = new uchar 104 0
+  digest = new uchar 32 0
+  put record 0 uchar shard
+  put record 1 uchar sub shard 3
+  diPut record 4 4 expert
+  sha256_init ctx
+  for plane ulong 6
+    off = get dxExpert add mul expert 6 plane
+    if eq off 0
+      ret false
+    end
+    diPut record add 16 mul plane 8 8 off
+    if not dxHashExtent fd ctx off dxExpertSize plane
+      ret false
+    end
+  end
+  sha256_final ctx digest
+  for i ulong 8
+    put record add 8 i get digest i
+  end
+  ret dxWrite record
+end
+
+fn dxHashRow weights view uchar 262144 scales view uchar 8192 outbuf edit uchar 8192 i ulong to void
+  row = new uchar 264 0
+  digest = new uchar 32 0
+  for j ulong 256
+    put row j get weights add mul i 256 j
+  end
+  for j ulong 8
+    put row add 256 j get scales add mul i 8 j
+  end
+  sha256_hash row digest
+  for j ulong 8
+    put outbuf add mul i 8 j get digest j
+  end
+end
+
+fn dxEngramBlock fd int base ulong count ulong to bool
+  weights = new uchar 262144 0
+  scales = new uchar 8192 0
+  hashes = new uchar 8192 0
+  if not diRead fd weights add get dxEngram 0 mul base 256 mul count 256
+    ret false
+  end
+  if not diRead fd scales add get dxEngram 1 mul base 8 mul count 8
+    ret false
+  end
+  for i ulong count bound 1024
+    dxHashRow weights scales hashes i
+  end
+  ret dxWrite part hashes 0 mul count 8
+end
+
+fn dxEmit fd int shard ulong to bool
+  if and ge shard 3 le shard 42
+    for id ulong 384
+      if not dxExpertRecord fd shard id
+        ret false
+      end
+    end
+    ret true
+  end
+  if or lt shard 47 gt shard 48
+    ret false
+  end
+  if or eq get dxEngram 0 0 eq get dxEngram 1 0
+    ret false
+  end
+  count = get dxEngram 2
+  header = new uchar 32 0
+  put header 0 uchar shard
+  put header 1 1
+  if eq shard 48
+    put header 1 14
+  end
+  diPut header 8 8 count
+  diPut header 16 8 get dxEngram 0
+  diPut header 24 8 get dxEngram 1
+  if not dxWrite header
+    ret false
+  end
+  pos = ulong 0
+  while lt pos count
+    chunk = sub count pos
+    if gt chunk 1024
+      chunk = 1024
+    end
+    if not dxEngramBlock fd pos chunk
+      ret false
+    end
+    pos = add pos chunk
+  end
+  ret true
+end
+
+fn dxOpen arg ulong to int
+  path = new uchar 4096 0
+  n = argread arg path 0 4096
+  if le n 0
+    ret int -1
+  end
+  ret int fopen path 0 ulong n 524288 0
+end
+
+fn main to int
+  if ne argcnt 4
+    ret 64
+  end
+  digits = new uchar 2 0
+  if ne argread 2 digits 0 2 2
+    ret 64
+  end
+  for i ulong 2
+    if or lt get digits i 48 gt get digits i 57
+      ret 64
+    end
+  end
+  shard = add mul sub ulong get digits 0 48 10 sub ulong get digits 1 48
+  fd = dxOpen 1
+  if lt fd 0
+    ret 66
+  end
+  ok = dxDirectory fd shard
+  if ne fclose fd 0
+    ret 74
+  end
+  if not ok
+    ret 65
+  end
+  fd = dxOpen 3
+  if lt fd 0
+    ret 66
+  end
+  rc = int 65
+  if eq fseek fd 0 2 long dsFileBytes shard
+    if dxEmit fd shard
+      rc = 0
+    end
+  end
+  if ne fclose fd 0
+    ret 74
+  end
+  ret rc
+end
