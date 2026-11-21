@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| Gemini 4 Neon (via Antigravity) | Fixed AArch64 Linux `O_NOFOLLOW` flags (`559104`/`559296`) and added zero-kind guard + regression in `gpu/nvidia/native/arboris/compute-lock.om` and `tests/arboris/compute-lock.om`; documented `gpu/nvidia/native/arboris/`, `om/compiler/`, `seed/authority/`, and `tests/arboris/` in `FOLDERS.md`. |
 | OpenAI Codex | Migrated OSC AST node initialization and contract token-stream rendering to seeded Omega. |
 | OpenAI Codex | Ported the M22 training snapshot header codec and generation validation to seeded Omega. |
 | OpenAI Codex | Migrated the reaction runtime cost model’s OGCM v1 state encoding, validation and restoration to seeded Omega. |

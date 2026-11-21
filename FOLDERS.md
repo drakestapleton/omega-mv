@@ -555,3 +555,19 @@ Boolean struct-field execution regressions, exact expected outcomes, scalar cont
 ## `om/gpu/dsv41/`
 
 Seeded Omega SM121 kernel emitters, their byte-level ABI, the native final-head executor, and single-Spark numerical checks for the original DeepSeek-V4.1-Flash text checkpoint.
+
+## `gpu/nvidia/native/arboris/`
+
+Native Blackwell Arboris arena importer, compute lock, sparse/gated QMD step executors, signed receipt commitment, and query router in seeded Omega.
+
+## `om/compiler/`
+
+Seeded Omega implementations of OSC lexer, parser, semantic/ownership checker, control-flow/IR layout, AArch64 encoding, and artifact emission, bound via `om/units.sh`.
+
+## `seed/authority/`
+
+Seeded Omega capability root, queue, and durable Ed25519 world signer (`arboris-signer.om`) for Arboris step commitments.
+
+## `tests/arboris/`
+
+Host and GB10 silicon qualification probes, SM121 disassembly golden files, compute-lock/capability/signer regressions, and `host.sh` driver for Arboris.
