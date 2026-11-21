@@ -19,6 +19,7 @@
  * Depends only on src/sha256.h, the vendored src/searchtrace/sig (Ed25519)
  * and libc (POSIX for the CLI file helpers). */
 #include "searchtrace/st_holdout.h"
+#include "omega_native.h"
 #include "sha256.h"
 #include "searchtrace/sig/aienos_sig.h"
 
@@ -45,50 +46,37 @@ static void set_why(char *why, size_t why_len, const char *msg)
 
 static void hex_lower(const uint8_t *in, size_t n, char *out)
 {
-    static const char d[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; i++) {
-        out[2 * i] = d[in[i] >> 4];
-        out[2 * i + 1] = d[in[i] & 15];
-    }
+    uint64_t u = 0;
+    if (n > 0)
+        (void)omega2_st_om_hex_lower(&u, in, n, n, (uint8_t *)out, 2 * n);
     out[2 * n] = '\0';
 }
 
 static int ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
 {
-    uint8_t acc = 0;
-    for (size_t i = 0; i < n; i++)
-        acc |= (uint8_t)(a[i] ^ b[i]);
-    return acc == 0;
+    uint64_t ok = 1;
+    if (n == 0)
+        return 1;
+    (void)omega2_st_om_ct_equal(&ok, a, n, b, n, n);
+    return (int)ok;
 }
 
 static int label_ok(const char *s, size_t n)
 {
+    uint64_t ok = 0;
     if (n < 1 || n > ST_HOLDOUT_ID_MAX)
         return 0;
-    for (size_t i = 0; i < n; i++) {
-        char c = s[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
-            return 0;
-    }
-    return 1;
+    (void)omega2_st_om_label_ok(&ok, (const uint8_t *)s, n, n, ST_HOLDOUT_ID_MAX);
+    return (int)ok;
 }
 
 uint32_t st_holdout_count_tasks(const uint8_t *t, size_t len)
 {
-    uint32_t n = 0;
-    size_t i = 0;
-    if (!t)
+    uint64_t n = 0;
+    if (!t || len == 0)
         return 0;
-    while (i < len) {
-        if (len - i >= 5 && memcmp(t + i, ST_HOLDOUT_TASK_PREFIX, 5) == 0 &&
-            n < UINT32_MAX)
-            n++;
-        while (i < len && t[i] != '\n')
-            i++;
-        i++; /* skip LF (or step past end) */
-    }
-    return n;
+    (void)omega2_st_om_count_tasks(&n, t, len, len);
+    return (uint32_t)n;
 }
 
 static void salt_digest(const uint8_t salt[32], uint8_t out[32])
@@ -105,11 +93,8 @@ static void commitment(const uint8_t salt[32], const uint8_t *t, size_t len,
                        uint32_t count, uint8_t out[32])
 {
     uint8_t be[12];
-    uint64_t l = (uint64_t)len;
-    for (int i = 0; i < 8; i++)
-        be[i] = (uint8_t)(l >> (56 - 8 * i));
-    for (int i = 0; i < 4; i++)
-        be[8 + i] = (uint8_t)(count >> (24 - 8 * i));
+    uint64_t u = 0;
+    (void)omega2_st_om_put_be64_be32(&u, be, 12, (uint64_t)len, count);
     sha256_ctx c;
     sha256_init(&c);
     sha256_update(&c, (const uint8_t *)ST_HOLDOUT_DOMAIN,
@@ -207,28 +192,19 @@ static int next_field(Cur *c, const char *key, const char **val, size_t *vlen,
 static int parse_hex32(const char *v, size_t n, uint8_t out[32], char *why,
                        size_t wl)
 {
+    uint64_t rc = 0;
     if (n != 64) {
         set_why(why, wl, "hex field is not 64 characters");
         return ST_HOLDOUT_EFORMAT;
     }
-    for (size_t i = 0; i < 64; i++) {
-        char ch = v[i];
-        int x;
-        if (ch >= '0' && ch <= '9')
-            x = ch - '0';
-        else if (ch >= 'a' && ch <= 'f')
-            x = ch - 'a' + 10;
-        else if (ch >= 'A' && ch <= 'F') {
-            set_why(why, wl, "uppercase hex refused");
-            return ST_HOLDOUT_EFORMAT;
-        } else {
-            set_why(why, wl, "bad hex character");
-            return ST_HOLDOUT_EFORMAT;
-        }
-        if (i & 1)
-            out[i / 2] = (uint8_t)(out[i / 2] | x);
-        else
-            out[i / 2] = (uint8_t)(x << 4);
+    (void)omega2_st_om_parse_hex32(&rc, (const uint8_t *)v, n, n, out, 32);
+    if (rc == 2) {
+        set_why(why, wl, "uppercase hex refused");
+        return ST_HOLDOUT_EFORMAT;
+    }
+    if (rc != 0) {
+        set_why(why, wl, "bad hex character");
+        return ST_HOLDOUT_EFORMAT;
     }
     return 0;
 }
@@ -236,24 +212,26 @@ static int parse_hex32(const char *v, size_t n, uint8_t out[32], char *why,
 static int parse_dec(const char *v, size_t n, uint64_t max, uint64_t *out,
                      char *why, size_t wl)
 {
-    uint64_t x = 0;
-    if (n == 0 || n > 20 || (n > 1 && v[0] == '0')) {
+    uint64_t dst[1] = { 0 };
+    uint64_t rc = 0;
+    if (n == 0) {
         set_why(why, wl, "bad decimal (empty, too long or leading zero)");
         return ST_HOLDOUT_EFORMAT;
     }
-    for (size_t i = 0; i < n; i++) {
-        if (v[i] < '0' || v[i] > '9') {
-            set_why(why, wl, "bad decimal digit");
-            return ST_HOLDOUT_EFORMAT;
-        }
-        uint64_t d = (uint64_t)(v[i] - '0');
-        if (x > (max - d) / 10) {
-            set_why(why, wl, "decimal out of range");
-            return ST_HOLDOUT_EFORMAT;
-        }
-        x = x * 10 + d;
+    (void)omega2_st_om_parse_dec(&rc, (const uint8_t *)v, n, n, max, dst, 1);
+    if (rc == 1) {
+        set_why(why, wl, "bad decimal (empty, too long or leading zero)");
+        return ST_HOLDOUT_EFORMAT;
     }
-    *out = x;
+    if (rc == 2) {
+        set_why(why, wl, "bad decimal digit");
+        return ST_HOLDOUT_EFORMAT;
+    }
+    if (rc != 0) {
+        set_why(why, wl, "decimal out of range");
+        return ST_HOLDOUT_EFORMAT;
+    }
+    *out = dst[0];
     return 0;
 }
 
@@ -270,17 +248,22 @@ int st_holdout_parse(const char *rec, size_t len, StHoldoutCommitment *out,
         set_why(why, wl, "null argument");
         return ST_HOLDOUT_EARG;
     }
-    if (len > ST_REC_MAX) {
-        set_why(why, wl, "record too long");
-        return ST_HOLDOUT_EFORMAT;
-    }
-    if (memchr(rec, '\0', len)) {
-        set_why(why, wl, "NUL byte in record");
-        return ST_HOLDOUT_EFORMAT;
-    }
-    if (memchr(rec, '\r', len)) {
-        set_why(why, wl, "CR character in record (LF only)");
-        return ST_HOLDOUT_EFORMAT;
+    {
+        uint64_t brc = 0;
+        if (len > ST_REC_MAX) {
+            set_why(why, wl, "record too long");
+            return ST_HOLDOUT_EFORMAT;
+        }
+        if (len > 0)
+            (void)omega2_st_om_check_rec_bytes(&brc, (const uint8_t *)rec, len, len);
+        if (brc == 2) {
+            set_why(why, wl, "NUL byte in record");
+            return ST_HOLDOUT_EFORMAT;
+        }
+        if (brc == 3) {
+            set_why(why, wl, "CR character in record (LF only)");
+            return ST_HOLDOUT_EFORMAT;
+        }
     }
     memset(&c, 0, sizeof c);
     Cur cur = {rec, len, 0};

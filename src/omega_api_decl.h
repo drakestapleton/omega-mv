@@ -1194,6 +1194,24 @@ int64_t est_om_check_hdr(const uint8_t *o_src, size_t o_src_len, uint64_t o_slen
 int64_t est_om_mix_check(const uint64_t o_w[3], const uint64_t o_v[3], uint64_t o_k, uint64_t o_tol_bits);
 /* export fn est_om_mix_total_var w view ulong 3 v view ulong 3 k ulong to ulong */
 uint64_t est_om_mix_total_var(const uint64_t o_w[3], const uint64_t o_v[3], uint64_t o_k);
+/* export fn st_om_hex_lower src view uchar * n ulong dst edit uchar * to void */
+void st_om_hex_lower(const uint8_t *o_src, size_t o_src_len, uint64_t o_n, uint8_t *o_dst, size_t o_dst_len);
+/* export fn st_om_ct_equal a view uchar * b view uchar * n ulong to ulong */
+uint64_t st_om_ct_equal(const uint8_t *o_a, size_t o_a_len, const uint8_t *o_b, size_t o_b_len, uint64_t o_n);
+/* export fn st_om_label_ok s view uchar * n ulong lim ulong to ulong */
+uint64_t st_om_label_ok(const uint8_t *o_s, size_t o_s_len, uint64_t o_n, uint64_t o_lim);
+/* export fn st_om_count_tasks t view uchar * slen ulong to ulong */
+uint64_t st_om_count_tasks(const uint8_t *o_t, size_t o_t_len, uint64_t o_slen);
+/* export fn st_om_put_be64_be32 dst edit uchar 12 l ulong count ulong to void */
+void st_om_put_be64_be32(uint8_t o_dst[12], uint64_t o_l, uint64_t o_count);
+/* export fn st_om_parse_hex32 v view uchar * n ulong dst edit uchar 32 to long */
+int64_t st_om_parse_hex32(const uint8_t *o_v, size_t o_v_len, uint64_t o_n, uint8_t o_dst[32]);
+/* export fn st_om_parse_dec v view uchar * n ulong max_v ulong dst edit ulong 1 to long */
+int64_t st_om_parse_dec(const uint8_t *o_v, size_t o_v_len, uint64_t o_n, uint64_t o_max_v, uint64_t o_dst[1]);
+/* export fn st_om_parse_i64 s view uchar * n ulong dst edit ulong 1 to ulong */
+uint64_t st_om_parse_i64(const uint8_t *o_s, size_t o_s_len, uint64_t o_n, uint64_t o_dst[1]);
+/* export fn st_om_check_rec_bytes rec view uchar * slen ulong to long */
+int64_t st_om_check_rec_bytes(const uint8_t *o_rec, size_t o_rec_len, uint64_t o_slen);
 #ifdef __cplusplus
 }
 #endif
