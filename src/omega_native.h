@@ -891,6 +891,34 @@ uint32_t omega2_fab_om_get_u64(uint64_t *result, const uint8_t *o_src, uint64_t 
 uint32_t omega2_fab_om_body_size(uint64_t *result, uint64_t o_kind);
 /* export fn fab_om_digest_nonzero_eq a view uchar 32 b view uchar 32 to ulong */
 uint32_t omega2_fab_om_digest_nonzero_eq(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len);
+#define OMEGA2_IDENT_oma_core "omega-ident 1 unit=oma_core abi=2 profile=OM-2 src=55d38ec177ae7f2276a6bf264c52e9958d896bba31ed614c03c1e1d4c55ade2e omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_oma_core(void);
+/* export fn oma_om_block_encode src view uchar 64 dst edit ulong 2 to ulong */
+uint32_t omega2_oma_om_block_encode(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_block_decode pos ulong neg_p ulong dst edit uchar 64 to ulong */
+uint32_t omega2_oma_om_block_decode(uint64_t *result, uint64_t o_pos, uint64_t o_neg_p, uint8_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_block_add a view ulong 2 b view ulong 2 dst edit ulong 4 to ulong */
+uint32_t omega2_oma_om_block_add(uint64_t *result, const uint64_t *o_a, uint64_t o_a_len, const uint64_t *o_b, uint64_t o_b_len, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_block_mul a view ulong 2 b view ulong 2 dst edit ulong 2 to ulong */
+uint32_t omega2_oma_om_block_mul(uint64_t *result, const uint64_t *o_a, uint64_t o_a_len, const uint64_t *o_b, uint64_t o_b_len, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_block_dot a view ulong 2 b view ulong 2 dst edit ulong 1 to ulong */
+uint32_t omega2_oma_om_block_dot(uint64_t *result, const uint64_t *o_a, uint64_t o_a_len, const uint64_t *o_b, uint64_t o_b_len, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_z3_encode src view uchar 64 dst edit ulong 2 to ulong */
+uint32_t omega2_oma_om_z3_encode(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_z3_decode one ulong two ulong dst edit uchar 64 to ulong */
+uint32_t omega2_oma_om_z3_decode(uint64_t *result, uint64_t o_one, uint64_t o_two, uint8_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_block_serialize pos ulong neg_p ulong dst edit uchar 16 to ulong */
+uint32_t omega2_oma_om_block_serialize(uint64_t *result, uint64_t o_pos, uint64_t o_neg_p, uint8_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_block_deserialize src view uchar 16 dst edit ulong 2 to ulong */
+uint32_t omega2_oma_om_block_deserialize(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_dense_byte_decode bv ulong dst edit uchar 5 to ulong */
+uint32_t omega2_oma_om_dense_byte_decode(uint64_t *result, uint64_t o_bv, uint8_t *o_dst, uint64_t o_dst_len);
+/* export fn oma_om_pack_dense_byte src view uchar * start ulong n ulong to ulong */
+uint32_t omega2_oma_om_pack_dense_byte(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_start, uint64_t o_n);
+/* export fn oma_om_int_to_bt v_bits ulong dst edit uchar 41 n_out edit ulong 1 to void */
+uint32_t omega2_oma_om_int_to_bt(uint64_t *result, uint64_t o_v_bits, uint8_t *o_dst, uint64_t o_dst_len, uint64_t *o_n_out, uint64_t o_n_out_len);
+/* export fn oma_om_bt_to_int digits view uchar * n ulong dst edit ulong 1 to ulong */
+uint32_t omega2_oma_om_bt_to_int(uint64_t *result, const uint8_t *o_digits, uint64_t o_digits_len, uint64_t o_n, uint64_t *o_dst, uint64_t o_dst_len);
 #ifdef __cplusplus
 }
 #endif

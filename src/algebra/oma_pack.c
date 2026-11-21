@@ -15,6 +15,7 @@
  */
 
 #include "algebra/oma_pack.h"
+#include "omega_native.h"
 
 /* Every function here validates its whole input before writing any output,
  * so on error the output buffers are left untouched (spec: return codes). */
@@ -62,26 +63,19 @@ int oma_unpack_bitplane(const oma_block *in, size_t in_blocks, size_t n, int8_t 
 }
 
 int oma_block_serialize(const oma_block *b, uint8_t out[OMA_BLOCK_BYTES]) {
-    int rc;
-    if (!out) return OMA_E_ARG;
-    if ((rc = oma_block_validate(b))) return rc;
-    for (int i = 0; i < 8; i++) {
-        out[i] = (uint8_t)(b->pos >> (8 * i));
-        out[8 + i] = (uint8_t)(b->neg >> (8 * i));
-    }
-    return OMA_OK;
+    uint64_t rc = 0;
+    if (!b || !out) return OMA_E_ARG;
+    (void)omega2_oma_om_block_serialize(&rc, b->pos, b->neg, out, OMA_BLOCK_BYTES);
+    return rc ? -(int)rc : OMA_OK;
 }
 
 int oma_block_deserialize(const uint8_t in[OMA_BLOCK_BYTES], oma_block *out) {
+    uint64_t dst[2] = { 0, 0 }, rc = 0;
     if (!in || !out) return OMA_E_ARG;
-    oma_block b = {0, 0};
-    for (int i = 0; i < 8; i++) {
-        b.pos |= (uint64_t)in[i] << (8 * i);
-        b.neg |= (uint64_t)in[8 + i] << (8 * i);
-    }
-    int rc = oma_block_validate(&b);
-    if (rc) return rc;
-    *out = b;
+    (void)omega2_oma_om_block_deserialize(&rc, in, OMA_BLOCK_BYTES, dst, 2);
+    if (rc) return -(int)rc;
+    out->pos = dst[0];
+    out->neg = dst[1];
     return OMA_OK;
 }
 
@@ -92,13 +86,8 @@ int oma_pack_dense(const int8_t *t, size_t n, uint8_t *out, size_t out_cap, size
     for (size_t i = 0; i < n; i++)
         if (t[i] < -1 || t[i] > 1) return OMA_E_INVALID_TRIT;
     for (size_t k = 0; k < nbytes; k++) {
-        unsigned v = 0, p = 1;
-        for (size_t j = 0; j < 5; j++) {
-            size_t idx = k * 5 + j;
-            int d = idx < n ? t[idx] : 0;
-            v += (unsigned)(d + 1) * p;
-            p *= 3u;
-        }
+        uint64_t v = 0;
+        (void)omega2_oma_om_pack_dense_byte(&v, (const uint8_t *)t, n, k * 5, n);
         out[k] = (uint8_t)v;
     }
     *out_len = nbytes;
@@ -106,14 +95,11 @@ int oma_pack_dense(const int8_t *t, size_t n, uint8_t *out, size_t out_cap, size
 }
 
 int oma_dense_byte_decode(int byte, int8_t out[OMA_DENSE_TRITS_PER_BYTE]) {
+    uint64_t rc = 0;
     if (!out) return OMA_E_ARG;
     if (byte < 0 || byte >= OMA_DENSE_BYTE_LIMIT) return OMA_E_INVALID_BYTE;
-    unsigned v = (unsigned)byte;
-    for (int j = 0; j < 5; j++) {
-        out[j] = (int8_t)((int)(v % 3u) - 1);
-        v /= 3u;
-    }
-    return OMA_OK;
+    (void)omega2_oma_om_dense_byte_decode(&rc, (uint64_t)byte, (uint8_t *)out, OMA_DENSE_TRITS_PER_BYTE);
+    return rc ? -(int)rc : OMA_OK;
 }
 
 int oma_unpack_dense(const uint8_t *in, size_t in_len, size_t n, int8_t *out) {
