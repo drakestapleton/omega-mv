@@ -62,17 +62,6 @@ const char *omega_language_tok_text(OmegaTokKind k) {
     return "?";
 }
 
-static bool is_ident_start(char c) {
-    uint64_t ok = 0;
-    (void)omega2_lang_om_is_ident_start(&ok, (unsigned char)c);
-    return ok != 0;
-}
-static bool is_ident_char(char c) {
-    uint64_t ok = 0;
-    (void)omega2_lang_om_is_ident_char(&ok, (unsigned char)c);
-    return ok != 0;
-}
-
 /* Decode an integer literal starting at s[*i]. Detects > 64-bit overflow. */
 static int lex_int(const char *s, size_t *i, uint64_t *out, uint32_t col, char *err, size_t n) {
     size_t slen = strlen(s);
@@ -98,13 +87,6 @@ static int lex_int(const char *s, size_t *i, uint64_t *out, uint32_t col, char *
     *i = (size_t)dst[0];
     *out = dst[1];
     return 0;
-}
-
-static OmegaTokKind keyword(const char *w) {
-    size_t n = strlen(w);
-    uint64_t kind = OTOK_IDENT;
-    if (n > 0) (void)omega2_lang_om_keyword(&kind, (const uint8_t *)w, n, n);
-    return (OmegaTokKind)kind;
 }
 
 int omega_language_lex(const char *src, OmegaToken *toks, size_t max, size_t *count,
@@ -144,13 +126,30 @@ int omega_language_lex(const char *src, OmegaToken *toks, size_t max, size_t *co
             k++;
             continue;
         }
-        if (is_ident_start(c)) {
-            size_t j = i;
-            while (is_ident_char(src[j])) j++;
+        uint64_t ident = 0;
+        if (omega2_lang_om_is_ident_start(&ident, (unsigned char)c) != OMEGA_OK) {
+            set_err(err, n, t->col, "identifier classification failed");
+            return -1;
+        }
+        if (ident) {
+            size_t j = i + 1;
+            for (;;) {
+                if (omega2_lang_om_is_ident_char(&ident, (unsigned char)src[j]) != OMEGA_OK) {
+                    set_err(err, n, (uint32_t)(j + 1), "identifier classification failed");
+                    return -1;
+                }
+                if (!ident) break;
+                j++;
+            }
             if (j - i >= OMEGA_LANG_IDENT_MAX) { set_err(err, n, t->col, "name is longer than 63 characters"); return -1; }
             memcpy(t->text, src + i, j - i);
             t->text[j - i] = '\0';
-            t->kind = keyword(t->text);
+            uint64_t kind = 0;
+            if (omega2_lang_om_keyword(&kind, (const uint8_t *)t->text, j - i, j - i) != OMEGA_OK) {
+                set_err(err, n, t->col, "keyword classification failed");
+                return -1;
+            }
+            t->kind = (OmegaTokKind)kind;
             i = j;
             k++;
             continue;
