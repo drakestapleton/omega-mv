@@ -1,0 +1,220 @@
+note SPDX-License-Identifier: Apache-2.0
+note Single scheduler serializes these transitions for both lease clients.
+om2
+
+note ZoneHeader. OM-2 layout and field identifiers are limited to eight bytes.
+layout zonehdr 128
+  field epoch ulong at 0 little
+  field active uint at 8 little
+  field cand uint at 12 little
+  field streak uint at 16 little
+  field z2count uint at 20 little
+  field z3count uint at 24 little
+  field fifo uint at 28 little
+  field owner uint at 32 little
+  field flags uint at 36 little
+  field detours ulong at 40 little
+  field accepted uint at 48 little
+  field rejected uint at 52 little
+  field reserved uchar 72 at 56 little
+end
+
+note SlabSlot
+layout slabslot 64
+  field layer_id ushort at 0 little
+  field expert ushort at 2 little
+  field zone_id uchar at 4 little
+  field state uchar at 5 little
+  field planes uchar at 6 little
+  field pad uchar at 7 little
+  field lba ulong at 8 little
+  field dest ulong at 16 little
+  field touch ulong at 24 little
+  field hash64 ulong at 32 little
+  field hits uint at 40 little
+  field reserved uchar 20 at 44 little
+end
+
+note PrefetchHint
+layout prefhint 32
+  field epoch ulong at 0 little
+  field layer_id ushort at 8 little
+  field expert ushort at 10 little
+  field zone uchar at 12 little
+  field planes uchar at 13 little
+  field score ushort at 14 little
+  field status uchar at 16 little
+  field reserved uchar 15 at 17 little
+end
+
+fn put_word bytes edit uchar * pos ulong width ulong value ulong to void
+  for i ulong width
+    put bytes add pos i uchar and shr value mul i 8 255
+  end
+end
+
+fn get_word bytes view uchar * pos ulong width ulong to ulong
+  value = ulong 0
+  for i ulong width
+    value = or value shl ulong get bytes add pos i mul i 8
+  end
+  ret value
+end
+
+export fn slab_init header out uchar 128 domain uint protected_count uint fifo_count uint to void
+  for i ulong 128
+    put header i 0
+  end
+  put_word header 8 4 ulong domain
+  put_word header 12 4 ulong domain
+  put_word header 20 4 ulong protected_count
+  put_word header 24 4 ulong fifo_count
+  put header 36 1
+end
+
+export fn slab_acquire_lease h edit zonehdr owner uint to bool
+  if or lt owner 1 gt owner 2
+    ret false
+  end
+  if ne get h owner 0
+    ret false
+  end
+  put h owner owner
+  ret true
+end
+
+export fn slab_release_lease h edit zonehdr owner uint to bool
+  if or lt owner 1 gt owner 2
+    ret false
+  end
+  if ne get h owner owner
+    ret false
+  end
+  put h owner 0
+  ret true
+end
+
+note A true return authorizes the scheduler to replace the protected pack.
+export fn z2_check_promotion h edit zonehdr turn ulong domain uint to bool
+  if ne get h owner 1
+    ret false
+  end
+  previous = get h epoch
+  if le turn previous
+    ret false
+  end
+  put h epoch turn
+  if or eq domain get h active eq domain 4294967295
+    put h cand get h active
+    put h streak 0
+    ret false
+  end
+  if or ne domain get h cand gt sub turn previous 1
+    put h streak 0
+  end
+  put h cand domain
+  if lt get h streak 2
+    put h streak add get h streak 1
+    ret false
+  end
+  put h active domain
+  put h streak 0
+  ret true
+end
+
+fn arena_shape h view zonehdr slots view uchar * to bool
+  count = add ulong get h z2count ulong get h z3count
+  ret eq len slots mul count 64
+end
+
+note Return the absolute slot index. A busy FIFO head stalls without advancing.
+export fn z3_claim_fifo_slot h edit zonehdr slots view uchar * to long
+  if or ne get h owner 1 not arena_shape h slots
+    ret -1
+  end
+  head = get h fifo
+  count = get h z3count
+  if ge head count
+    ret -1
+  end
+  index = add ulong get h z2count ulong head
+  state = get slots add mul index 64 5
+  if and ne state 0 ne state 2
+    ret -1
+  end
+  put h fifo rem add head 1 count
+  ret long index
+end
+
+fn reject_hint h edit zonehdr hint edit prefhint to uchar
+  put hint status 3
+  put h rejected add get h rejected 1
+  ret 3
+end
+
+fn contains_expert slots view uchar * hint view prefhint to bool
+  for i ulong div len slots 64
+    base = mul i 64
+    state = get slots add base 5
+    if and gt state 0 le state 3
+      if eq get_word slots base 2 ulong get hint layer_id
+        if eq get_word slots add base 2 2 ulong get hint expert
+          ret true
+        end
+      end
+    end
+  end
+  ret false
+end
+
+note Terminal statuses replay idempotently. A busy FIFO leaves a valid hint pending.
+note Caller supplies a fixed array of contiguous 64-byte records in zone order.
+export fn slab_admit_hint h edit zonehdr slots edit uchar * hint edit prefhint to uchar
+  status = get hint status
+  if and gt status 0 le status 3
+    ret status
+  end
+  if ne get h owner 1
+    ret reject_hint h hint
+  end
+  if ne status 0
+    ret reject_hint h hint
+  end
+  if or ne get hint layer_id 0 ge get hint expert 384
+    ret reject_hint h hint
+  end
+  if or ne get hint zone 2 ne get hint epoch get h epoch
+    ret reject_hint h hint
+  end
+  planes = get hint planes
+  flags = get h flags
+  if or and ne planes 3 ne planes 1 and eq planes 1 ne flags 2
+    ret reject_hint h hint
+  end
+  if or not arena_shape h slots ge get h fifo get h z3count
+    ret reject_hint h hint
+  end
+  if contains_expert slots hint
+    put hint status 1
+    ret 1
+  end
+  victim = z3_claim_fifo_slot h slots
+  if lt victim 0
+    ret 0
+  end
+  offset = mul ulong victim 64
+  dest = get_word slots add offset 16 8
+  for j ulong 64
+    put slots add offset j 0
+  end
+  put_word slots offset 2 ulong get hint layer_id
+  put_word slots add offset 2 2 ulong get hint expert
+  put slots add offset 4 2
+  put slots add offset 5 1
+  put slots add offset 6 planes
+  put_word slots add offset 16 8 dest
+  put_word slots add offset 24 8 get h epoch
+  put hint status 2
+  put h accepted add get h accepted 1
+  ret 2
+end

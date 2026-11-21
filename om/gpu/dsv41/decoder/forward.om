@@ -1,0 +1,1302 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Native 40-layer DeepSeek-V4.1-Flash forward pass in pure seeded OM-2.
+note Executes attention, hyper-connections, Engram, router, shared expert,
+note offloaded routed experts through slab_arena.om, and final LM head.
+
+global dfSidecarFD int 40
+global dfShardFD int 40
+global dfEngramShardFD int 2
+global dfEngramSideFD int 2
+global dfEngramBase ulong 4
+global dfEngramCount ulong 2
+global dfResIn ulong 1
+global dfResOut ulong 1
+global dfPreMix ulong 1
+global dfCompLen ulong 1
+global dfActiveKvLayer ulong 1
+global dfActiveTopK ulong 1
+global dfCurIds uint 6
+global dfCurWeights uint 6
+global dfCurSlots long 6
+global dfCoord ulong 3
+global dfStats ulong 6
+global dfSlotOf long 15360
+global dfSlotKey long 3200
+global dfSlabCfg ulong 4
+global dfPhysical ulong 3200
+note dfStats: 0=hits, 1=misses, 2=nvme_ns, 3=gpu_ns, 4=engram_ns, 5=tokens
+note dfSlabCfg: 0=totalSlots, 1=fifoHead, 2=recordTrace, 3=unpublished physical slot
+
+fn dfMonoNs to ulong
+  ret ulong monons
+end
+
+fn dfSlot layer ulong slot ulong to ulong
+  ret get lmLayer add mul layer lmStride slot
+end
+
+fn dfRatio layer ulong to ulong
+  if or lt layer 2 ge layer 37
+    ret 0
+  end
+  if lt layer 20
+    ret 2
+  end
+  ret 1
+end
+
+fn dfIsKvSource layer ulong to bool
+  ret or or eq layer 2 eq layer 8 or eq layer 14 eq layer 20
+end
+
+fn dfIsIndexSource layer ulong to bool
+  if dfIsKvSource layer
+    ret true
+  end
+  ret or or eq layer 24 eq layer 28 or eq layer 32 eq layer 36
+end
+
+fn dfSubmit to bool
+  t0 = dfMonoNs
+  ok = gbbsubmit 30000000000
+  t1 = dfMonoNs
+  put dfStats 3 add get dfStats 3 sub t1 t0
+  ret ok
+end
+
+fn dfHcMix resOff ulong layer ulong isFfn bool to bool
+  fnOff = dfSlot layer 3
+  scaleOff = dfSlot layer 4
+  baseOff = dfSlot layer 2
+  preOff = wsAttnPre
+  postOff = wsAttnPost
+  combOff = wsAttnComb
+  if isFfn
+    fnOff = dfSlot layer 6
+    scaleOff = dfSlot layer 7
+    baseOff = dfSlot layer 5
+    preOff = wsFfnPre
+    postOff = wsFfnPost
+    combOff = wsFfnComb
+  end
+  if not dwBind 3 resOff 81920
+    ret false
+  end
+  if not dwBind 3 wsStat 4
+    ret false
+  end
+  headArg 20480
+  if not dnRecord 12 1 1 1 1
+    ret false
+  end
+  if not dwDense resOff 0 fnOff wsRaw24 20480 24
+    ret false
+  end
+  if not dwBind 3 wsRaw24 96
+    ret false
+  end
+  if not dwBind 3 wsOnes 96
+    ret false
+  end
+  if not dwBind 3 wsStat 4
+    ret false
+  end
+  if not dwBind 3 wsRaw24 96
+    ret false
+  end
+  headArg 24
+  if not dnRecord 13 1 1 1 128
+    ret false
+  end
+  if not dwBind 3 wsRaw24 96
+    ret false
+  end
+  if not dwBind 0 scaleOff 12
+    ret false
+  end
+  if not dwBind 0 baseOff 96
+    ret false
+  end
+  if not dwBind 3 preOff 16
+    ret false
+  end
+  if not dwBind 3 postOff 16
+    ret false
+  end
+  if not dwBind 3 combOff 64
+    ret false
+  end
+  ret dnRecord 2 1 1 1 1
+end
+
+fn dfHcPre resOff ulong preOff ulong dstOff ulong to bool
+  if not dwBind 3 resOff 81920
+    ret false
+  end
+  if not dwBind 3 preOff 16
+    ret false
+  end
+  if not dwBind 3 dstOff 20480
+    ret false
+  end
+  if not dnRecord 0 40 1 1 128
+    ret false
+  end
+  ret dwRoundBf16 dstOff 5120
+end
+
+fn dfHcPost subOff ulong resOff ulong postOff ulong combOff ulong dstOff ulong to bool
+  if not dwBind 3 subOff 20480
+    ret false
+  end
+  if not dwBind 3 resOff 81920
+    ret false
+  end
+  if not dwBind 3 postOff 16
+    ret false
+  end
+  if not dwBind 3 combOff 64
+    ret false
+  end
+  if not dwBind 3 dstOff 81920
+    ret false
+  end
+  if not dnRecord 1 40 1 1 128
+    ret false
+  end
+  ret dwRoundBf16 dstOff 20480
+end
+
+fn dfRotary bufOff ulong ropeOff ulong d ulong h ulong signBits uint to bool
+  if not dwBind 3 bufOff mul mul h d 4
+    ret false
+  end
+  if not dwBind 3 ropeOff 256
+    ret false
+  end
+  headArg uint d
+  headArg uint h
+  headArg signBits
+  ret dnRecord 14 uint h 1 1 32
+end
+
+fn dfEmbedToken token uint pos ulong to bool
+  scr = get dwMaps 3
+  iom = get dwMaps 4
+  if ne mapset iom ioToken 4 ulong token 0
+    ret false
+  end
+  if ne mapset scr wsPosBuf 4 pos 0
+    ret false
+  end
+  pm = new uchar 16 0
+  put pm 2 128
+  put pm 3 63
+  if ne mapwrite scr wsPreMix pm 0 16 16
+    ret false
+  end
+  put dfResIn 0 wsResA
+  put dfResOut 0 wsResB
+  put dfPreMix 0 wsPreMix
+  put frameDirty 0 1
+  if not gbbegin 1
+    ret false
+  end
+  if not dwBind 4 ioToken 4
+    ret false
+  end
+  if not dwBind 0 get lmGlobal 0 1323827200
+    ret false
+  end
+  if not dwBind 3 wsResA 81920
+    ret false
+  end
+  headArg 0
+  headArg 129280
+  if not dnRecord 25 40 1 1 128
+    ret false
+  end
+  ret dfSubmit
+end
+
+fn dfEngramReadOne which ulong rid ulong raw edit uchar 6144 scs edit uchar 192 idx ulong to bool
+  if ge rid get dfEngramCount which
+    ret false
+  end
+  row = new uchar 264 0
+  header = new uchar 32 0
+  diPut header 8 8 get dfEngramCount which
+  diPut header 16 8 get dfEngramBase mul which 2
+  diPut header 24 8 get dfEngramBase add mul which 2 1
+  if not dgReadRow get dfEngramShardFD which get dfEngramSideFD which header uint rid row
+    ret false
+  end
+  for i ulong 256
+    put raw add mul idx 256 i get row i
+  end
+  for i ulong 8
+    put scs add mul idx 8 i get row add 256 i
+  end
+  ret true
+end
+
+fn dfEngramCpu layer ulong to bool
+  t0 = dfMonoNs
+  ids = new uint 24 0
+  if not dgRows layer ids
+    ret false
+  end
+  which = ulong 0
+  if eq layer 14
+    which = 1
+  end
+  raw = new uchar 6144 0
+  scs = new uchar 192 0
+  lids = new uchar 96 0
+  for i ulong 24
+    if not dfEngramReadOne which ulong get ids i raw scs i
+      ret false
+    end
+    diPut lids mul i 4 4 i
+  end
+  if ne mapwrite get dwMaps 4 ioEngramRaw raw 0 6144 6144
+    ret false
+  end
+  if ne mapwrite get dwMaps 4 ioEngramScales scs 0 192 192
+    ret false
+  end
+  if ne mapwrite get dwMaps 4 ioEngramIds lids 0 96 96
+    ret false
+  end
+  t1 = dfMonoNs
+  put dfStats 4 add get dfStats 4 sub t1 t0
+  ret true
+end
+
+fn dfEngramGpu layer ulong to bool
+  gainOff = wsEngramGain1
+  if eq layer 14
+    gainOff = wsEngramGain14
+  end
+  res = get dfResIn 0
+  put frameDirty 0 1
+  if not gbbegin 7
+    ret false
+  end
+  if not dwBind 4 ioEngramIds 96
+    ret false
+  end
+  if not dwBind 4 ioEngramRaw 6144
+    ret false
+  end
+  if not dwBind 4 ioEngramScales 192
+    ret false
+  end
+  if not dwBind 3 wsLut 1088
+    ret false
+  end
+  if not dwBind 3 wsEngramRows 24576
+    ret false
+  end
+  headArg 0
+  headArg 24
+  if not dnRecord 17 24 1 1 256
+    ret false
+  end
+  if not dwRoundBf16 wsEngramRows 6144
+    ret false
+  end
+  if not dwQuantFp8 wsEngramRows 6144
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 37 dfSlot layer 38 wsEngramKV 6144 25600
+    ret false
+  end
+  if not dwBind 3 res 81920
+    ret false
+  end
+  if not dwBind 3 wsEngramKV 81920
+    ret false
+  end
+  if not dwBind 3 gainOff 81920
+    ret false
+  end
+  if not dwBind 3 wsEngramValid 4
+    ret false
+  end
+  if not dwBind 3 wsEngramGate 16
+    ret false
+  end
+  if not dnRecord 23 4 1 1 1
+    ret false
+  end
+  if not dwBind 3 res 81920
+    ret false
+  end
+  if not dwBind 3 add wsEngramKV 81920 20480
+    ret false
+  end
+  if not dwBind 3 wsEngramGate 16
+    ret false
+  end
+  if not dwBind 3 res 81920
+    ret false
+  end
+  if not dnRecord 24 40 4 1 128
+    ret false
+  end
+  ret dfSubmit
+end
+
+fn dfAttnPre layer ulong pos ulong to bool
+  res = get dfResIn 0
+  ropeBase = wsRopeBase
+  if ne dfRatio layer 0
+    ropeBase = wsRopeComp
+  end
+  ropeOff = add ropeBase mul pos 256
+  if not gbbegin 40
+    ret false
+  end
+  if not dfHcMix res layer false
+    ret false
+  end
+  if not dfHcPre res get dfPreMix 0 wsX
+    ret false
+  end
+  if not dwRmsNorm wsX dfSlot layer 0 wsXNorm 5120
+    ret false
+  end
+  if not dwQuantFp8 wsXNorm 5120
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 11 dfSlot layer 12 wsQr 5120 1280
+    ret false
+  end
+  if not dwRoundBf16 wsQr 1280
+    ret false
+  end
+  if not dwRmsNorm wsQr dfSlot layer 9 wsQr 1280
+    ret false
+  end
+  if not dwQuantFp8 wsQr 1280
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 13 dfSlot layer 14 wsQ 1280 32768
+    ret false
+  end
+  if not dwRoundBf16 wsQ 32768
+    ret false
+  end
+  if not dfRotary wsQ ropeOff 512 64 0x3f800000
+    ret false
+  end
+  if not dwRoundBf16 wsQ 32768
+    ret false
+  end
+  if not dwQuantFp8 wsXNorm 5120
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 15 dfSlot layer 16 wsKv 5120 512
+    ret false
+  end
+  if not dwRoundBf16 wsKv 512
+    ret false
+  end
+  if not dwRmsNorm wsKv dfSlot layer 10 wsKv 512
+    ret false
+  end
+  if not dfRotary wsKv ropeOff 512 1 0x3f800000
+    ret false
+  end
+  if not dwQuantFp8 wsKv 512
+    ret false
+  end
+  if not dwBind 3 wsRecon 2048
+    ret false
+  end
+  if not dwBind 3 wsPosBuf 4
+    ret false
+  end
+  if not dwBind 1 get dkWindow layer 262144
+    ret false
+  end
+  if not dwBind 3 wsIdxBuf 512
+    ret false
+  end
+  if not dnRecord 27 4 1 1 128
+    ret false
+  end
+  ret dfSubmit
+end
+
+fn dfCompressKvSource layer ulong pos ulong to bool
+  ratio = dfRatio layer
+  if eq ratio 1
+    if not gbbegin 7
+      ret false
+    end
+    if not dwBf16Unpack 0 dfSlot layer 30 3 wsUnpack 2621440
+      ret false
+    end
+    if not dwDense wsXNorm 3 wsUnpack wsCompOut 5120 512
+      ret false
+    end
+    if not dwRmsNorm wsCompOut dfSlot layer 29 wsCompOut 512
+      ret false
+    end
+    ret dfSubmit
+  end
+  slot = rem pos 2
+  stOff = get dkState layer
+  kvSlotOff = add stOff mul slot 2048
+  scSlotOff = add add stOff 4096 mul slot 2048
+  if not gbbegin 4
+    ret false
+  end
+  if not dwBf16Unpack 0 dfSlot layer 30 3 wsUnpack 2621440
+    ret false
+  end
+  if not dwDense wsXNorm 3 wsUnpack wsCompOut 5120 512
+    ret false
+  end
+  if not dwBf16Unpack 0 dfSlot layer 31 3 wsUnpack 2621440
+    ret false
+  end
+  if not dwDense wsXNorm 3 wsUnpack wsKv 5120 512
+    ret false
+  end
+  if not dfSubmit
+    ret false
+  end
+  tmp = new uchar 2048 0
+  if ne mapread get dwMaps 3 wsCompOut tmp 0 2048 2048
+    ret false
+  end
+  if ne mapwrite get dwMaps 1 kvSlotOff tmp 0 2048 2048
+    ret false
+  end
+  if ne mapread get dwMaps 3 wsKv tmp 0 2048 2048
+    ret false
+  end
+  if ne mapwrite get dwMaps 1 scSlotOff tmp 0 2048 2048
+    ret false
+  end
+  if ne rem add pos 1 2 0
+    ret true
+  end
+  put frameDirty 0 1
+  if not gbbegin 8
+    ret false
+  end
+  if not dwBind 1 stOff 4096
+    ret false
+  end
+  if not dwBind 1 add stOff 4096 4096
+    ret false
+  end
+  if not dwBind 3 wsCompOut 2048
+    ret false
+  end
+  if not dnRecord 15 4 1 1 128
+    ret false
+  end
+  if not dwRoundBf16 wsCompOut 512
+    ret false
+  end
+  if not dwRmsNorm wsCompOut dfSlot layer 29 wsCompOut 512
+    ret false
+  end
+  ret dfSubmit
+end
+
+fn dfUpdateIndexK layer ulong pos ulong to bool
+  kbuf = new uchar 512 0
+  ratio = dfRatio layer
+  gpos = sub add pos 1 ratio
+  gslot = div pos ratio
+  if not gbbegin 9
+    ret false
+  end
+  if not dwBf16Unpack 0 dfSlot layer 35 3 wsUnpack 65536
+    ret false
+  end
+  if not dwDense wsCompOut 3 wsUnpack wsCompK 512 128
+    ret false
+  end
+  if not dwRmsNorm wsCompK dfSlot layer 36 wsCompK 128
+    ret false
+  end
+  if not dfRotary wsCompK add wsRopeComp mul gpos 256 128 1 0x3f800000
+    ret false
+  end
+  if not dwQuantFp4 wsCompK 128
+    ret false
+  end
+  if not dfSubmit
+    ret false
+  end
+  if ne mapread get dwMaps 3 wsRecon kbuf 0 512 512
+    ret false
+  end
+  dest = add get dkIndex layer mul gslot 512
+  ret eq mapwrite get dwMaps 1 dest kbuf 0 512 512
+end
+
+fn dfCandidateBlocks clen ulong nblocks ulong to bool
+  if not gbbegin 2
+    ret false
+  end
+  if not dwBind 3 wsIdxScores mul clen 4
+    ret false
+  end
+  if not dwBind 3 wsIdxLens 4
+    ret false
+  end
+  if not dwBind 3 wsCandBlocks mul nblocks 4
+    ret false
+  end
+  headArg uint clen
+  if not dnRecord 21 uint nblocks 1 1 1
+    ret false
+  end
+  cbK = nblocks
+  if gt cbK 2048
+    cbK = 2048
+  end
+  if not dwBind 3 wsCandBlocks mul nblocks 4
+    ret false
+  end
+  if not dwBind 3 wsCandIds mul cbK 4
+    ret false
+  end
+  if not dwBind 3 wsCandKeep mul nblocks 4
+    ret false
+  end
+  headArg uint nblocks
+  headArg uint cbK
+  headArg 0
+  if not dnRecord 22 1 1 1 1
+    ret false
+  end
+  ret dfSubmit
+end
+
+fn dfRunIndexer layer ulong pos ulong clen ulong latentReady bool to bool
+  ones = new uchar 10240 0
+  if and dfIsKvSource layer latentReady
+    if not dfUpdateIndexK layer pos
+      ret false
+    end
+  end
+  if ne mapset get dwMaps 3 wsIdxLens 4 clen 0
+    ret false
+  end
+  nblocks = div add clen 7 8
+  if le layer 20
+    for b ulong nblocks
+      diPut ones mul b 4 4 1
+    end
+    if ne mapwrite get dwMaps 3 wsCandKeep ones 0 mul nblocks 4 long mul nblocks 4
+      ret false
+    end
+  end
+  topk = clen
+  if gt topk 512
+    topk = 512
+  end
+  put dfActiveTopK 0 topk
+  if ne mapset get dwMaps 3 wsStat 4 ulong bitcast uint 0.015625f32 0
+    ret false
+  end
+  put frameDirty 0 1
+  if not gbbegin 11
+    ret false
+  end
+  if not dwQuantFp8 wsQr 1280
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 32 dfSlot layer 33 wsIdxQ 1280 4096
+    ret false
+  end
+  if not dfRotary wsIdxQ add wsRopeComp mul pos 256 128 32 0x3f800000
+    ret false
+  end
+  if not dwQuantFp4 wsIdxQ 4096
+    ret false
+  end
+  if not dwBf16Unpack 0 dfSlot layer 34 3 wsUnpack 163840
+    ret false
+  end
+  if not dwDense wsXNorm 3 wsUnpack wsIdxW 5120 32
+    ret false
+  end
+  if not dwBind 3 wsIdxW 128
+    ret false
+  end
+  if not dwBind 3 wsOnes 128
+    ret false
+  end
+  if not dwBind 3 wsStat 4
+    ret false
+  end
+  if not dwBind 3 wsIdxW 128
+    ret false
+  end
+  headArg 32
+  if not dnRecord 13 1 1 1 128
+    ret false
+  end
+  if not dwRoundBf16 wsIdxW 32
+    ret false
+  end
+  if not dwBind 3 wsRecon 16384
+    ret false
+  end
+  if not dwBind 1 get dkIndex get dfActiveKvLayer 0 mul clen 512
+    ret false
+  end
+  if not dwBind 3 wsIdxW 128
+    ret false
+  end
+  if not dwBind 3 wsIdxLens 4
+    ret false
+  end
+  if not dwBind 3 wsCandKeep mul nblocks 4
+    ret false
+  end
+  if not dwBind 3 wsIdxScores mul clen 4
+    ret false
+  end
+  headArg 32
+  headArg uint clen
+  if not dnRecord 20 uint div add clen 127 128 1 1 128
+    ret false
+  end
+  if not dwBind 3 wsIdxScores mul clen 4
+    ret false
+  end
+  if not dwBind 3 add wsIdxBuf 512 mul topk 4
+    ret false
+  end
+  if not dwBind 3 wsTopMask mul clen 4
+    ret false
+  end
+  headArg uint clen
+  headArg uint topk
+  headArg 128
+  if not dnRecord 22 1 1 1 1
+    ret false
+  end
+  if not dfSubmit
+    ret false
+  end
+  if eq layer 20
+    ret dfCandidateBlocks clen nblocks
+  end
+  ret true
+end
+
+fn dfStoreCompressedKv layer ulong pos ulong to bool
+  ratio = dfRatio layer
+  gpos = sub add pos 1 ratio
+  gslot = div pos ratio
+  if not gbbegin 2
+    ret false
+  end
+  if not dfRotary wsCompOut add wsRopeComp mul gpos 256 512 1 0x3f800000
+    ret false
+  end
+  if not dwQuantKv wsCompOut 512
+    ret false
+  end
+  if not dfSubmit
+    ret false
+  end
+  vbuf = new uchar 2048 0
+  if ne mapread get dwMaps 3 wsRecon vbuf 0 2048 2048
+    ret false
+  end
+  ret eq mapwrite get dwMaps 1 add get dkLatent layer mul gslot 2048 vbuf 0 2048 2048
+end
+
+fn dfCopyRegion srcMap long srcOff ulong dstMap long dstOff ulong bytes ulong to bool
+  buf = new uchar 65536 0
+  pos = ulong 0
+  while lt pos bytes
+    n = sub bytes pos
+    if gt n len buf
+      n = len buf
+    end
+    if ne mapread srcMap add srcOff pos buf 0 n long n
+      ret false
+    end
+    if ne mapwrite dstMap add dstOff pos buf 0 n long n
+      ret false
+    end
+    pos = add pos n
+  end
+  ret true
+end
+
+fn dfPrepareCompressedKv layer ulong pos ulong to long
+  ratio = dfRatio layer
+  clen = div add pos 1 ratio
+  latentReady = false
+  if dfIsKvSource layer
+    put dfActiveKvLayer 0 layer
+    if not dfCompressKvSource layer pos
+      ret -1
+    end
+    latentReady = eq rem add pos 1 ratio 0
+  end
+  if and dfIsIndexSource layer gt clen 0
+    if not dfRunIndexer layer pos clen latentReady
+      ret -1
+    end
+  end
+  if eq clen 0
+    put dfActiveTopK 0 0
+  end
+  if and dfIsKvSource layer latentReady
+    if not dfStoreCompressedKv layer pos
+      ret -1
+    end
+  end
+  if gt clen 0
+    if not dfCopyRegion get dwMaps 1 get dkWindow layer get dwMaps 3 wsKvConcat 262144
+      ret -1
+    end
+    latOff = get dkLatent get dfActiveKvLayer 0
+    if not dfCopyRegion get dwMaps 1 latOff get dwMaps 3 add wsKvConcat 262144 mul clen 2048
+      ret -1
+    end
+    put frameDirty 0 1
+  end
+  ret long clen
+end
+
+fn dfAttnOutProj layer ulong to bool
+  woaW = dfSlot layer 17
+  woaS = dfSlot layer 18
+  for g ulong 8
+    if not dwQuantFp8 add wsAttnOut mul g 16384 4096
+      ret false
+    end
+    wOff = add woaW mul g 4194304
+    sOff = add woaS mul g 4096
+    dOff = add wsWoAOut mul g 4096
+    if not dwFp8Gemm 0 wOff sOff dOff 4096 1024
+      ret false
+    end
+    if not dwRoundBf16 dOff 1024
+      ret false
+    end
+  end
+  if not dwQuantFp8 wsWoAOut 8192
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 19 dfSlot layer 20 wsSubOut 8192 5120
+    ret false
+  end
+  if not dwRoundBf16 wsSubOut 5120
+    ret false
+  end
+  ret dfHcPost wsSubOut get dfResIn 0 wsAttnPost wsAttnComb get dfResOut 0
+end
+
+fn dfAttnPost layer ulong pos ulong to bool
+  ratio = dfRatio layer
+  kvIdx = ulong 1
+  kvOff = get dkWindow layer
+  tLen = ulong 128
+  sLen = ulong 128
+  if ne ratio 0
+    clen = dfPrepareCompressedKv layer pos
+    if lt clen 0
+      ret false
+    end
+    if gt clen 0
+      kvIdx = 3
+      kvOff = wsKvConcat
+      tLen = add 128 ulong clen
+      sLen = add 128 get dfActiveTopK 0
+    end
+  end
+  ropeBase = wsRopeBase
+  if ne ratio 0
+    ropeBase = wsRopeComp
+  end
+  ropeOff = add ropeBase mul pos 256
+  if not gbbegin 44
+    ret false
+  end
+  if not dwBind 3 wsQ 131072
+    ret false
+  end
+  if not dwBind kvIdx kvOff mul tLen 2048
+    ret false
+  end
+  if not dwBind 3 wsIdxBuf mul sLen 4
+    ret false
+  end
+  if not dwBind 3 wsScores mul mul 64 sLen 4
+    ret false
+  end
+  headArg 64
+  headArg uint tLen
+  headArg uint sLen
+  if not dnRecord 6 uint sLen 64 1 1
+    ret false
+  end
+  if not dwBind 3 wsScores mul mul 64 sLen 4
+    ret false
+  end
+  if not dwBind kvIdx kvOff mul tLen 2048
+    ret false
+  end
+  if not dwBind 3 wsIdxBuf mul sLen 4
+    ret false
+  end
+  if not dwBind 0 dfSlot layer 8 256
+    ret false
+  end
+  if not dwBind 3 wsAttnOut 131072
+    ret false
+  end
+  headArg 64
+  headArg uint tLen
+  headArg uint sLen
+  if not dnRecord 7 4 64 1 128
+    ret false
+  end
+  if not dfRotary wsAttnOut ropeOff 512 64 0xbf800000
+    ret false
+  end
+  if not dwRoundBf16 wsAttnOut 32768
+    ret false
+  end
+  if not dfAttnOutProj layer
+    ret false
+  end
+  ret dfSubmit
+end
+
+fn dfFfnPreRoute layer ulong to bool
+  res = get dfResOut 0
+  if not gbbegin 25
+    ret false
+  end
+  if not dfHcMix res layer true
+    ret false
+  end
+  if not dfHcPre res wsAttnPre wsX
+    ret false
+  end
+  if not dwRmsNorm wsX dfSlot layer 1 wsXNorm 5120
+    ret false
+  end
+  if not dwBf16Unpack 0 dfSlot layer 21 3 wsUnpack 1966080
+    ret false
+  end
+  if not dwDense wsXNorm 3 wsUnpack wsGateLogits 5120 384
+    ret false
+  end
+  if not dwBind 3 wsGateLogits 1536
+    ret false
+  end
+  if not dwBind 0 dfSlot layer 22 1536
+    ret false
+  end
+  if not dwBind 4 ioExpIds 24
+    ret false
+  end
+  if not dwBind 4 ioExpWeights 24
+    ret false
+  end
+  if not dnRecord 16 1 1 1 1
+    ret false
+  end
+  if not dwQuantFp8 wsXNorm 5120
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 23 dfSlot layer 24 wsExpGate 5120 2304
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 27 dfSlot layer 28 wsExpUp 5120 2304
+    ret false
+  end
+  if not dwBind 3 wsExpGate 9216
+    ret false
+  end
+  if not dwBind 3 wsExpUp 9216
+    ret false
+  end
+  if not dwBind 3 wsOnes 4
+    ret false
+  end
+  if not dwBind 3 wsExpAct 9216
+    ret false
+  end
+  if not dnRecord 3 18 1 1 128
+    ret false
+  end
+  if not dwRoundBf16 wsExpAct 2304
+    ret false
+  end
+  if not dwQuantFp8 wsExpAct 2304
+    ret false
+  end
+  if not dwFp8Gemm 0 dfSlot layer 25 dfSlot layer 26 wsSharedOut 2304 5120
+    ret false
+  end
+  if not dwRoundBf16 wsSharedOut 5120
+    ret false
+  end
+  ret dfSubmit
+end
+
+fn dfInitSlabMap nSlots ulong to void
+  for i ulong 15360
+    put dfSlotOf i -1
+  end
+  for i ulong 3200
+    put dfSlotKey i -1
+    put dfPhysical i i
+  end
+  put dfSlabCfg 0 nSlots
+  put dfSlabCfg 1 0
+  put dfSlabCfg 2 1
+  put dfSlabCfg 3 3200
+end
+
+fn dfGateNeedsKey key long layer ulong to bool
+  if lt key 0
+    ret false
+  end
+  for k ulong 6
+    if eq ulong key add mul layer 384 ulong get dfCurIds k
+      ret true
+    end
+  end
+  ret false
+end
+
+fn dfLoadMiss layer ulong key ulong desc view uchar 64 to long
+  if or ne ulong get desc 0 add layer 3 ne ulong get desc 1 layer
+    ret -1
+  end
+  if ne key add mul layer 384 diGet desc 4 4
+    ret -1
+  end
+  slot = get dfSlabCfg 1
+  for i ulong 7
+    if not dfGateNeedsKey get dfSlotKey slot layer
+      break
+    end
+    slot = rem add slot 1 get dfSlabCfg 0
+  end
+  spare = get dfSlabCfg 3
+  if not deVerifyAt get dfShardFD layer desc get dwSlabMaps div spare 800 mul rem spare 800 deBytes
+    ret -1
+  end
+  oldKey = get dfSlotKey slot
+  if ge oldKey 0
+    put dfSlotOf ulong oldKey -1
+  end
+  put dfSlabCfg 3 get dfPhysical slot
+  put dfPhysical slot spare
+  put dfSlabCfg 1 rem add slot 1 get dfSlabCfg 0
+  put dfSlotKey slot long key
+  put dfSlotOf key long slot
+  ret long slot
+end
+
+fn dfResolveOne layer ulong k ulong to long
+  desc = new uchar 64 0
+  eid = ulong get dfCurIds k
+  key = add mul layer 384 eid
+  cur = get dfSlotOf key
+  if ge cur 0
+    put dfCurSlots k cur
+    put dfStats 0 add get dfStats 0 1
+    ret 0
+  end
+  if not diRead get dfSidecarFD layer desc mul eid 64 64
+    ret -1
+  end
+  tN0 = dfMonoNs
+  slot = dfLoadMiss layer key desc
+  if lt slot 0
+    ret -1
+  end
+  put dfStats 2 add get dfStats 2 sub dfMonoNs tN0
+  put dfCurSlots k slot
+  put dfStats 1 add get dfStats 1 1
+  ret 1
+end
+
+fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
+  rawIds = new uchar 24 0
+  rawW = new uchar 24 0
+  lIds = new uint 6 0
+  lWts = new uint 6 0
+  coord = new uint 3 0
+  times = new ulong 2 0
+  if ne mapread get dwMaps 4 ioExpIds rawIds 0 24 24
+    ret false
+  end
+  if ne mapread get dwMaps 4 ioExpWeights rawW 0 24 24
+    ret false
+  end
+  for k ulong 6
+    eid = uint diGet rawIds mul k 4 4
+    ewt = uint diGet rawW mul k 4 4
+    put dfCurIds k eid
+    put dfCurWeights k ewt
+    put lIds k eid
+    put lWts k ewt
+  end
+  put times 0 dfMonoNs
+  hadMiss = false
+  for k ulong 6
+    r = dfResolveOne layer k
+    if lt r 0
+      ret false
+    end
+    if eq r 1
+      hadMiss = true
+    end
+  end
+  put times 1 dfMonoNs
+  if ne get dfSlabCfg 2 0
+    put coord 0 uint get dfCoord 0
+    put coord 1 uint get dfCoord 1
+    put coord 2 uint layer
+    if not dtAppend coord lIds lWts times
+      ret false
+    end
+  end
+  if hadMiss
+    put frameDirty 0 1
+  end
+  ret true
+end
+
+fn dfFfnRouted to bool
+  if not gbbegin 64
+    ret false
+  end
+  for k ulong 6
+    slot = get dfPhysical ulong get dfCurSlots k
+    chunk = div slot 800
+    base = mul rem slot 800 deBytes
+    if not dwQuantFp8 wsXNorm 5120
+      ret false
+    end
+    if not dwFp4GemmChunk chunk base add base 17694720 wsExpGate 5120 2304
+      ret false
+    end
+    if not dwFp4GemmChunk chunk add base 11796480 add base 18432000 wsExpUp 5120 2304
+      ret false
+    end
+    if not dwBind 3 wsExpGate 9216
+      ret false
+    end
+    if not dwBind 3 wsExpUp 9216
+      ret false
+    end
+    if not dwBind 4 add ioExpWeights mul k 4 4
+      ret false
+    end
+    if not dwBind 3 wsExpAct 9216
+      ret false
+    end
+    if not dnRecord 3 18 1 1 128
+      ret false
+    end
+    if not dwRoundBf16 wsExpAct 2304
+      ret false
+    end
+    if not dwQuantFp8 wsExpAct 2304
+      ret false
+    end
+    if not dwFp4GemmChunk chunk add base 5898240 add base 18063360 add wsRoutedOut mul k 20480 2304 5120
+      ret false
+    end
+    if not dwRoundBf16 add wsRoutedOut mul k 20480 5120
+      ret false
+    end
+  end
+  if not dwBind 3 wsRoutedOut 122880
+    ret false
+  end
+  if not dwBind 3 wsSharedOut 20480
+    ret false
+  end
+  if not dwBind 3 wsSubOut 20480
+    ret false
+  end
+  if not dnRecord 26 40 1 1 128
+    ret false
+  end
+  if not dfHcPost wsSubOut get dfResOut 0 wsFfnPost wsFfnComb get dfResIn 0
+    ret false
+  end
+  put dfPreMix 0 wsFfnPre
+  ret dfSubmit
+end
+
+fn dfRunLayer h edit zonehdr slots edit uchar * layer ulong to bool
+  pos = get dfCoord 2
+  if or eq layer 1 eq layer 14
+    if not deAcquire h 1
+      ret false
+    end
+    if not dfEngramCpu layer
+      ok = deRelease h 1 0 false
+      ret false
+    end
+    if not deRelease h 1 0 false
+      ret false
+    end
+    if not deAcquire h 2
+      ret false
+    end
+    if not dfEngramGpu layer
+      ok = deRelease h 2 0 true
+      ret false
+    end
+    if not deRelease h 2 0 false
+      ret false
+    end
+  end
+  if not deAcquire h 2
+    ret false
+  end
+  if not dfAttnPre layer pos
+    ok = deRelease h 2 0 true
+    ret false
+  end
+  if not dfAttnPost layer pos
+    ok = deRelease h 2 0 true
+    ret false
+  end
+  if not dfFfnPreRoute layer
+    ok = deRelease h 2 0 true
+    ret false
+  end
+  if not deRelease h 2 0 false
+    ret false
+  end
+  if not deAcquire h 1
+    ret false
+  end
+  if not dfResolveExperts h slots layer
+    ok = deRelease h 1 0 false
+    ret false
+  end
+  if not deRelease h 1 0 false
+    ret false
+  end
+  if not deAcquire h 2
+    ret false
+  end
+  if not dfFfnRouted
+    ok = deRelease h 2 0 true
+    ret false
+  end
+  ret deRelease h 2 0 false
+end
+
+fn dfHeadArgmax h edit zonehdr to long
+  if not deAcquire h 2
+    ret -1
+  end
+  if not gbbegin 8
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dfHcPre get dfResIn 0 get dfPreMix 0 wsX
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 3 wsX 20480
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 3 wsStat 4
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not recordHeadKernel 3 1 32
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBf16Unpack 0 get lmGlobal 1 3 wsUnpack 5120
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 3 wsX 20480
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 3 wsUnpack 20480
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 3 wsStat 4
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 3 wsXNorm 20480
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  headArg 5120
+  if not recordHeadKernel 4 40 128
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBf16Pack 3 wsXNorm 3 wsPacked 5120
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 3 wsPacked 10240
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 0 get lmGlobal 2 1323827200
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dwBind 4 ioLogits 517120
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not recordHeadKernel 5 129280 32
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not dfSubmit
+    ok = deRelease h 2 0 true
+    ret -1
+  end
+  if not deRelease h 2 0 false
+    ret -1
+  end
+  buf = new uchar 517120 0
+  if ne mapread get dwMaps 4 ioLogits buf 0 517120 517120
+    ret -1
+  end
+  best = ulong 0
+  bestV = bitcast f32 uint diGet buf 0 4
+  for i ulong 129280
+    v = bitcast f32 uint diGet buf mul i 4 4
+    if gt v bestV
+      bestV = v
+      best = i
+    end
+  end
+  ret long best
+end
