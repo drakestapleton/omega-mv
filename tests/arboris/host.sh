@@ -37,8 +37,8 @@ sh tests/arboris/build-sparse-probe.sh "$out/gated-chip" tests/arboris/gated-sil
 sh tests/arboris/build-sparse-probe.sh "$out/wide-chip" tests/arboris/gated-silicon.om wide
 sh tests/arboris/build-sparse-probe.sh "$out/experimental-chip" tests/arboris/gated-silicon.om experimental
 "$out/experimental-chip" reference > "$out/experimental-reference.log"
-grep -qx "output_sha256=21aa98cc216972743626af22a4614ebc7f5e5d8fe3681d8d513d5deaaecf88d6" "$out/experimental-reference.log"
-for model in persistent hubs; do
+grep -qx "output_sha256=c2437a10406d7aa8902c0a46eeca1b00413461689a8345cb0f62927d6b742fe5" "$out/experimental-reference.log"
+for model in persistent hubs even; do
     sh tests/arboris/build-sparse-probe.sh "$out/$model-chip" tests/arboris/sparse-silicon.om "$model"
     "$out/$model-chip" reference > "$out/$model-reference.log"
 done
@@ -62,6 +62,15 @@ compile "$out/precision" om/arboris_arena.om gpu/nvidia/om/numeric/numeric.om om
 "$out/precision" > "$out/precision.metrics"
 compile "$out/expert-hints" om/arboris_ontology.om om/tls/sha2.om om/arboris_records.om om/arboris_spread.om om/gpu/dsv41/arboris/prefetch.om tests/arboris/expert-hints.om
 "$out/expert-hints" > "$out/expert-hints.bin"
+compile "$out/hints-cli" "$out/signer-profile.om" om/gpu/dsv41/arboris/prefetch.om om/gpu/dsv41/arboris/hints-cli.om
+# ARH1 frame with two votes for expert 12. Only one OP3 may be emitted.
+printf 'ARH1\002\000\000\000\002\000\000\000\014\000\000\000\000\000\200\077\014\000\000\000\000\000\000\077' > "$out/frame"
+printf '\003\000\000\000\014\000\000\000' > "$out/one-hint"
+"$out/hints-cli" < "$out/frame" > "$out/frame-result"
+cmp "$out/one-hint" "$out/frame-result"
+printf 'x' >> "$out/frame"
+if "$out/hints-cli" < "$out/frame" > "$out/frame-result"; then exit 1; fi
+test ! -s "$out/frame-result"
 compile "$out/compute-lock" "$out/signer-profile.om" gpu/nvidia/native/arboris/compute-lock.om tests/arboris/compute-lock.om
 "$out/compute-lock"
 compile "$out/capq" om/runtime/rx_capq_core.om seed/authority/capq.om tests/arboris/capq.om
@@ -102,7 +111,10 @@ for model in persistent hubs; do
     diff -u "tests/arboris/$model-sm121.dis" "$out/$model.dis"
     "$out/check-wave" < "$out/$model.bin"
 done
-echo "51e16aadcd9e8d0274606b986d9e1b067958ce5c069e6c8962f4128b7d1385a1  $out/persistent.bin" | sha256sum -c -
+"$out/emit-persistent" even > "$out/even.bin"
+"$out/check-wave" < "$out/even.bin"
+grep -qx 'output_sha256=48a04a4fc0bb0f8e14dca0855e21a1d239faec514a9e1d5c6696f273a798842d' "$out/even-reference.log"
+echo "7b8e36a4edf2069a357419de0a61531387539c1a580d2726525568f073dcc489  $out/persistent.bin" | sha256sum -c -
 echo "62f2bd17c0c6d4f6460e2da38043642fe3a0d1023191c60ecdbcbd4cdcc435d3  $out/hubs.bin" | sha256sum -c -
 "$out/emit-gated" wide experimental > "$out/experimental.sass"
 echo "1e263bde57f3dad20c9048c3b87b6097b4b681c9f727b22ffa100bc5470b306d  $out/experimental.sass" | sha256sum -c -

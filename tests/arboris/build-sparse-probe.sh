@@ -12,6 +12,7 @@ case "${3:-compound}" in
     compound) dims="100000 2 1 8" ;;
     wave)     dims="100000 2 2 8" ;;
     small)    dims="4096 1 1 8" ;;
+    even) dims="12288 2 1 8"; hops=2; layout=4 ;;
     persistent) dims="129 2 1 8"; hops=3; layout=1 ;;
     hubs) dims="129 2 1 8"; layout=2 ;;
     experimental) dims="129 2 1 264"; layout=3 ;;
