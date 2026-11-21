@@ -919,6 +919,30 @@ uint32_t omega2_oma_om_pack_dense_byte(uint64_t *result, const uint8_t *o_src, u
 uint32_t omega2_oma_om_int_to_bt(uint64_t *result, uint64_t o_v_bits, uint8_t *o_dst, uint64_t o_dst_len, uint64_t *o_n_out, uint64_t o_n_out_len);
 /* export fn oma_om_bt_to_int digits view uchar * n ulong dst edit ulong 1 to ulong */
 uint32_t omega2_oma_om_bt_to_int(uint64_t *result, const uint8_t *o_digits, uint64_t o_digits_len, uint64_t o_n, uint64_t *o_dst, uint64_t o_dst_len);
+#define OMEGA2_IDENT_pd0_core "omega-ident 1 unit=pd0_core abi=2 profile=OM-2 src=b4702594e637ec6cdcb151317e79ae7fe720f176d4ec72dfb55e16c96aeca350 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_pd0_core(void);
+/* export fn pd0_om_fnv1a64 tag view uchar * n ulong to ulong */
+uint32_t omega2_pd0_om_fnv1a64(uint64_t *result, const uint8_t *o_tag, uint64_t o_tag_len, uint64_t o_n);
+/* export fn pd0_om_splitmix64 st edit ulong 1 to ulong */
+uint32_t omega2_pd0_om_splitmix64(uint64_t *result, uint64_t *o_st, uint64_t o_st_len);
+/* export fn pd0_om_uniform st edit ulong 1 to ulong */
+uint32_t omega2_pd0_om_uniform(uint64_t *result, uint64_t *o_st, uint64_t o_st_len);
+/* export fn pd0_om_put_u16 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_pd0_om_put_u16(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn pd0_om_put_u32 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_pd0_om_put_u32(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn pd0_om_put_u64 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_pd0_om_put_u64(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn pd0_om_get_u16 src view uchar * pos ulong to ulong */
+uint32_t omega2_pd0_om_get_u16(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn pd0_om_get_u32 src view uchar * pos ulong to ulong */
+uint32_t omega2_pd0_om_get_u32(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn pd0_om_get_u64 src view uchar * pos ulong to ulong */
+uint32_t omega2_pd0_om_get_u64(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn pd0_om_check_desc_magic src view uchar * slen ulong to ulong */
+uint32_t omega2_pd0_om_check_desc_magic(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_slen);
+/* export fn pd0_om_check_rec_magic src view uchar * slen ulong to ulong */
+uint32_t omega2_pd0_om_check_rec_magic(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_slen);
 #ifdef __cplusplus
 }
 #endif

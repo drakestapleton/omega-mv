@@ -1276,6 +1276,28 @@ uint64_t oma_om_pack_dense_byte(const uint8_t *o_src, size_t o_src_len, uint64_t
 void oma_om_int_to_bt(uint64_t o_v_bits, uint8_t o_dst[41], uint64_t o_n_out[1]);
 /* export fn oma_om_bt_to_int digits view uchar * n ulong dst edit ulong 1 to ulong */
 uint64_t oma_om_bt_to_int(const uint8_t *o_digits, size_t o_digits_len, uint64_t o_n, uint64_t o_dst[1]);
+/* export fn pd0_om_fnv1a64 tag view uchar * n ulong to ulong */
+uint64_t pd0_om_fnv1a64(const uint8_t *o_tag, size_t o_tag_len, uint64_t o_n);
+/* export fn pd0_om_splitmix64 st edit ulong 1 to ulong */
+uint64_t pd0_om_splitmix64(uint64_t o_st[1]);
+/* export fn pd0_om_uniform st edit ulong 1 to ulong */
+uint64_t pd0_om_uniform(uint64_t o_st[1]);
+/* export fn pd0_om_put_u16 dst edit uchar * pos ulong v ulong to void */
+void pd0_om_put_u16(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn pd0_om_put_u32 dst edit uchar * pos ulong v ulong to void */
+void pd0_om_put_u32(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn pd0_om_put_u64 dst edit uchar * pos ulong v ulong to void */
+void pd0_om_put_u64(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn pd0_om_get_u16 src view uchar * pos ulong to ulong */
+uint64_t pd0_om_get_u16(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn pd0_om_get_u32 src view uchar * pos ulong to ulong */
+uint64_t pd0_om_get_u32(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn pd0_om_get_u64 src view uchar * pos ulong to ulong */
+uint64_t pd0_om_get_u64(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn pd0_om_check_desc_magic src view uchar * slen ulong to ulong */
+uint64_t pd0_om_check_desc_magic(const uint8_t *o_src, size_t o_src_len, uint64_t o_slen);
+/* export fn pd0_om_check_rec_magic src view uchar * slen ulong to ulong */
+uint64_t pd0_om_check_rec_magic(const uint8_t *o_src, size_t o_src_len, uint64_t o_slen);
 #ifdef __cplusplus
 }
 #endif

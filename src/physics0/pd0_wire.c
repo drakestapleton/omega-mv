@@ -15,28 +15,20 @@
  */
 
 #include "physics0/pd0_wire.h"
+#include "omega_native.h"
 
 #include <string.h>
 
 #include "sha256.h"
 
-void pd0_put_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
-void pd0_put_u32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-void pd0_put_u64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-uint16_t pd0_get_u16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-uint32_t pd0_get_u32(const uint8_t *p) {
-    uint32_t v = 0;
-    for (int i = 3; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
-uint64_t pd0_get_u64(const uint8_t *p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
+void pd0_put_u16(uint8_t *p, uint16_t v) { uint64_t u = 0; (void)omega2_pd0_om_put_u16(&u, p, 2, 0, v); }
+void pd0_put_u32(uint8_t *p, uint32_t v) { uint64_t u = 0; (void)omega2_pd0_om_put_u32(&u, p, 4, 0, v); }
+void pd0_put_u64(uint8_t *p, uint64_t v) { uint64_t u = 0; (void)omega2_pd0_om_put_u64(&u, p, 8, 0, v); }
+uint16_t pd0_get_u16(const uint8_t *p) { uint64_t v = 0; (void)omega2_pd0_om_get_u16(&v, p, 2, 0); return (uint16_t)v; }
+uint32_t pd0_get_u32(const uint8_t *p) { uint64_t v = 0; (void)omega2_pd0_om_get_u32(&v, p, 4, 0); return (uint32_t)v; }
+uint64_t pd0_get_u64(const uint8_t *p) { uint64_t v = 0; (void)omega2_pd0_om_get_u64(&v, p, 8, 0); return v; }
 
 static const uint8_t DESC_MAGIC[8] = {'P', 'D', '0', 'D', 'E', 'S', 'C', '2'};
-static const uint8_t DESC_MAGIC_V1[8] = {'P', 'D', '0', 'D', 'E', 'S', 'C', '1'}; /* refused */
 static const uint8_t REC_MAGIC[8] = {'P', 'D', '0', 'R', 'E', 'C', '1', 0};
 
 size_t pd0_desc_encode(const pd0_desc *d, uint8_t *out, size_t cap) {
@@ -58,8 +50,10 @@ size_t pd0_desc_encode(const pd0_desc *d, uint8_t *out, size_t cap) {
 }
 
 int pd0_desc_decode(const uint8_t *in, size_t len, pd0_desc *d) {
-    if (len >= 8 && memcmp(in, DESC_MAGIC_V1, 8) == 0) return PD0_DESC_REFUSED_V1;
-    if (len < 10 || memcmp(in, DESC_MAGIC, 8) != 0) return -1;
+    uint64_t mrc = 2;
+    if (len > 0) (void)omega2_pd0_om_check_desc_magic(&mrc, in, len, len);
+    if (mrc == 1) return PD0_DESC_REFUSED_V1;
+    if (mrc != 0) return -1;
     memset(d, 0, sizeof *d);
     d->n_obs = in[8]; d->n_channels = in[9];
     if (d->n_obs < 1 || d->n_obs > PD0_MAX_OBS || d->n_channels < 1 || d->n_channels > PD0_MAX_CH) return -1;
@@ -106,8 +100,9 @@ size_t pd0_rec_encode(pd0_rec *r, uint8_t *out, size_t cap) {
 }
 
 int pd0_rec_decode(const uint8_t *in, size_t len, pd0_rec *r) {
-    if (len < 12 || memcmp(in, REC_MAGIC, 8) != 0) return -1;
-    if (pd0_get_u16(in + 8) != 1) return -1; /* unknown version refused */
+    uint64_t mrc = 1;
+    if (len > 0) (void)omega2_pd0_om_check_rec_magic(&mrc, in, len, len);
+    if (mrc != 0) return -1;
     memset(r, 0, sizeof *r);
     r->n_obs = in[10];
     if (r->n_obs < 1 || r->n_obs > PD0_MAX_OBS || len != PD0_REC_SIZE(r->n_obs)) return -1;
