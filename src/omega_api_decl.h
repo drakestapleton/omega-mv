@@ -1212,6 +1212,24 @@ int64_t st_om_parse_dec(const uint8_t *o_v, size_t o_v_len, uint64_t o_n, uint64
 uint64_t st_om_parse_i64(const uint8_t *o_s, size_t o_s_len, uint64_t o_n, uint64_t o_dst[1]);
 /* export fn st_om_check_rec_bytes rec view uchar * slen ulong to long */
 int64_t st_om_check_rec_bytes(const uint8_t *o_rec, size_t o_rec_len, uint64_t o_slen);
+/* export fn lang_om_is_ident_start c ulong to ulong */
+uint64_t lang_om_is_ident_start(uint64_t o_c);
+/* export fn lang_om_is_ident_char c ulong to ulong */
+uint64_t lang_om_is_ident_char(uint64_t o_c);
+/* export fn lang_om_digit_value c ulong to ulong */
+uint64_t lang_om_digit_value(uint64_t o_c);
+/* export fn lang_om_lex_int src view uchar * slen ulong pos ulong dst edit ulong 3 to ulong */
+uint64_t lang_om_lex_int(const uint8_t *o_src, size_t o_src_len, uint64_t o_slen, uint64_t o_pos, uint64_t o_dst[3]);
+/* export fn lang_om_keyword w view uchar * n ulong to ulong */
+uint64_t lang_om_keyword(const uint8_t *o_w, size_t o_w_len, uint64_t o_n);
+/* export fn lang_om_punct c ulong d ulong dst edit ulong 2 to ulong */
+uint64_t lang_om_punct(uint64_t o_c, uint64_t o_d, uint64_t o_dst[2]);
+/* export fn visor_om_check_bytes p view uchar * n ulong dst edit ulong 2 to ulong */
+uint64_t visor_om_check_bytes(const uint8_t *o_p, size_t o_p_len, uint64_t o_n, uint64_t o_dst[2]);
+/* export fn visor_om_trim_blanks p view uchar * n ulong dst edit ulong 2 to void */
+void visor_om_trim_blanks(const uint8_t *o_p, size_t o_p_len, uint64_t o_n, uint64_t o_dst[2]);
+/* export fn visor_om_cmd_arity cmd ulong dst edit ulong 2 to ulong */
+uint64_t visor_om_cmd_arity(uint64_t o_cmd, uint64_t o_dst[2]);
 #ifdef __cplusplus
 }
 #endif

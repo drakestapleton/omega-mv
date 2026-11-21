@@ -847,6 +847,28 @@ uint32_t omega2_st_om_parse_dec(uint64_t *result, const uint8_t *o_v, uint64_t o
 uint32_t omega2_st_om_parse_i64(uint64_t *result, const uint8_t *o_s, uint64_t o_s_len, uint64_t o_n, uint64_t *o_dst, uint64_t o_dst_len);
 /* export fn st_om_check_rec_bytes rec view uchar * slen ulong to long */
 uint32_t omega2_st_om_check_rec_bytes(uint64_t *result, const uint8_t *o_rec, uint64_t o_rec_len, uint64_t o_slen);
+#define OMEGA2_IDENT_lang_core "omega-ident 1 unit=lang_core abi=2 profile=OM-2 src=bcffb2de39ca154801325a605c4422da581c219019fd6db54a2e6e64f42bb46c omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_lang_core(void);
+/* export fn lang_om_is_ident_start c ulong to ulong */
+uint32_t omega2_lang_om_is_ident_start(uint64_t *result, uint64_t o_c);
+/* export fn lang_om_is_ident_char c ulong to ulong */
+uint32_t omega2_lang_om_is_ident_char(uint64_t *result, uint64_t o_c);
+/* export fn lang_om_digit_value c ulong to ulong */
+uint32_t omega2_lang_om_digit_value(uint64_t *result, uint64_t o_c);
+/* export fn lang_om_lex_int src view uchar * slen ulong pos ulong dst edit ulong 3 to ulong */
+uint32_t omega2_lang_om_lex_int(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_slen, uint64_t o_pos, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn lang_om_keyword w view uchar * n ulong to ulong */
+uint32_t omega2_lang_om_keyword(uint64_t *result, const uint8_t *o_w, uint64_t o_w_len, uint64_t o_n);
+/* export fn lang_om_punct c ulong d ulong dst edit ulong 2 to ulong */
+uint32_t omega2_lang_om_punct(uint64_t *result, uint64_t o_c, uint64_t o_d, uint64_t *o_dst, uint64_t o_dst_len);
+#define OMEGA2_IDENT_visor_core "omega-ident 1 unit=visor_core abi=2 profile=OM-2 src=2de97951046b83e096410d1e2faef3df1f0354e72cf3f999813b887f260020e6 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_visor_core(void);
+/* export fn visor_om_check_bytes p view uchar * n ulong dst edit ulong 2 to ulong */
+uint32_t omega2_visor_om_check_bytes(uint64_t *result, const uint8_t *o_p, uint64_t o_p_len, uint64_t o_n, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn visor_om_trim_blanks p view uchar * n ulong dst edit ulong 2 to void */
+uint32_t omega2_visor_om_trim_blanks(uint64_t *result, const uint8_t *o_p, uint64_t o_p_len, uint64_t o_n, uint64_t *o_dst, uint64_t o_dst_len);
+/* export fn visor_om_cmd_arity cmd ulong dst edit ulong 2 to ulong */
+uint32_t omega2_visor_om_cmd_arity(uint64_t *result, uint64_t o_cmd, uint64_t *o_dst, uint64_t o_dst_len);
 #ifdef __cplusplus
 }
 #endif
