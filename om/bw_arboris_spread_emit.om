@@ -153,8 +153,9 @@ fn as_prologue code edit uchar 16384 s edit ulong 7 mode ulong skip_out edit ulo
   put s 1 31
   as_emit code s 18 1 0 AS_RZ
 
-  if eq mode 0
-    note Mode 0: v = ctaid.x * 128 + tid.x; b = 0
+  batched = and mode 1
+  if eq batched 0
+    note Mode 0/2: v = ctaid.x * 128 + tid.x; b = 0
     as_imad_imm code s 2 19 128 0
     as_imm code s 2 3 0
     as_emit code s 28 0 2 21
@@ -182,7 +183,9 @@ fn as_prologue code edit uchar 16384 s edit ulong 7 mode ulong skip_out edit ulo
 end
 
 fn as_body code edit uchar 16384 s edit ulong 7 mode ulong skip_b edit ulong 1 to void
-  if ne mode 0
+  batched = and mode 1
+  is_sum = shr mode 1
+  if ne batched 0
     as_emit code s 28 0 3 19
     put skip_b 0 get s 0
     put s 3 1
@@ -199,7 +202,7 @@ fn as_body code edit uchar 16384 s edit ulong 7 mode ulong skip_b edit ulong 1 t
   as_emit code s 11 7 16 AS_RZ
 
   note Load old_val = StateIn[v, b] -> R5
-  if eq mode 0
+  if eq batched 0
     put s 4 as_cw 6 7 7 4
     as_wide code s 16 2 4 12
   else
@@ -241,7 +244,7 @@ fn as_body code edit uchar 16384 s edit ulong 7 mode ulong skip_b edit ulong 1 t
   as_emit code s 11 19 16 AS_RZ
 
   note 2) Wait SB0|SB2, compute addr of StateIn[u, b], issue LDG.E act_u (R20) under SB1
-  if eq mode 0
+  if eq batched 0
     put s 4 as_cw 6 7 7 5
     as_wide code s 16 18 4 12
   else
@@ -256,10 +259,14 @@ fn as_body code edit uchar 16384 s edit ulong 7 mode ulong skip_b edit ulong 1 t
   note 3) Overlap FMUL R21 = w (R19) * gamma (R14) while StateIn[u, b] is in flight under SB1
   as_emit code s 32 21 19 14
 
-  note 4) WAIT SB1, then FMUL R21 = wg * act_u (R20), FMNMX R4 = max(R4, R21)
+  note 4) WAIT SB1, then FMUL R21 = wg * act_u (R20), FMNMX (max) or FADD (sum) into R4
   put s 4 as_cw 6 7 7 2
   as_emit code s 32 21 21 20
-  as_emit code s 37 4 4 21
+  if eq is_sum 0
+    as_emit code s 37 4 4 21
+  else
+    as_emit code s 30 4 4 21
+  end
 
   note 5) Increment e (R6 += 1) and loop
   as_imm code s 2 21 1
@@ -276,7 +283,7 @@ fn as_body code edit uchar 16384 s edit ulong 7 mode ulong skip_b edit ulong 1 t
   note Active-lane epilogue: store best_val (R4) -> StateOut[v, b], set R18 = (best_val > old_val)
   put s 4 as_cw 2 0 7 7
   as_imm code s 5 8 0x3a0
-  if eq mode 0
+  if eq batched 0
     put s 4 as_cw 6 7 7 1
     as_wide code s 16 2 4 8
   else
@@ -341,7 +348,7 @@ fn as_epilogue code edit uchar 16384 s edit ulong 7 to void
 end
 
 fn as_emit_kernel mode ulong code edit uchar 16384 to ulong
-  if gt mode 1
+  if gt mode 3
     ret 0
   end
   s = new ulong 7 0
@@ -358,7 +365,7 @@ fn as_emit_kernel mode ulong code edit uchar 16384 to ulong
   as_emit code s 55 0 AS_RZ AS_RZ
   after_reconv = get s 0
   as_patch_bra code s get skip 1 reconv 1
-  if ne mode 0
+  if ne and mode 1 0
     as_patch_bra code s get skip_b 0 reconv 1
   end
   as_patch_bssy code s get skip 0 after_reconv 0
@@ -419,15 +426,27 @@ export fn bw_arboris_spread_emit_mode1 code edit uchar 16384 to ulong
   ret as_emit_kernel 1 code
 end
 
+export fn bw_arboris_spread_emit_mode2 code edit uchar 16384 to ulong
+  ret as_emit_kernel 2 code
+end
+
+export fn bw_arboris_spread_emit_mode3 code edit uchar 16384 to ulong
+  ret as_emit_kernel 3 code
+end
+
 fn as_layout_valid hdr view ulong 16 to ulong
   batch = get hdr 3
   stride = get hdr 4
+  mode = get hdr 7
+  if gt mode 3
+    ret 2
+  end
   if eq batch 1
-    if or ne get hdr 7 0 ne stride 1
+    if or ne and mode 1 0 ne stride 1
       ret 2
     end
   else
-    if or ne get hdr 7 1 ne stride and add batch 31 0xffffffffffffffe0
+    if or ne and mode 1 1 ne stride and add batch 31 0xffffffffffffffe0
       ret 2
     end
     if gt get hdr 1 div 0x100000000 stride
@@ -470,7 +489,7 @@ fn as_qmd_valid hdr view ulong 16 vas view ulong 10 to ulong
   if or eq get hdr 3 0 gt get hdr 3 65535
     ret 2
   end
-  if or gt get hdr 7 1 gt get hdr 8 1
+  if or gt get hdr 7 3 gt get hdr 8 1
     ret 2
   end
   if ne as_layout_valid hdr 0
@@ -500,7 +519,7 @@ export fn bw_arboris_spread_pack_qmd hdr view ulong 16 vas view ulong 10 driver 
     ret rc
   end
   dims = new ulong 2 0
-  if eq get hdr 7 0
+  if eq and get hdr 7 1 0
     put dims 0 div add get hdr 1 127 128
     put dims 1 1
   else

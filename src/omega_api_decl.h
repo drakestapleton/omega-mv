@@ -43,6 +43,10 @@ uint64_t arboris_spread_cpu_run(uint64_t o_hdr[16], const uint32_t *o_csr, size_
 uint64_t bw_arboris_spread_emit_mode0(uint8_t o_code[16384]);
 /* export fn bw_arboris_spread_emit_mode1 code edit uchar 16384 to ulong */
 uint64_t bw_arboris_spread_emit_mode1(uint8_t o_code[16384]);
+/* export fn bw_arboris_spread_emit_mode2 code edit uchar 16384 to ulong */
+uint64_t bw_arboris_spread_emit_mode2(uint8_t o_code[16384]);
+/* export fn bw_arboris_spread_emit_mode3 code edit uchar 16384 to ulong */
+uint64_t bw_arboris_spread_emit_mode3(uint8_t o_code[16384]);
 /* export fn bw_arboris_spread_pack_qmd hdr view ulong 16 vas view ulong 10 driver view uint 224 bank edit uint 240 q0 edit uint 96 q1 edit uint 96 to ulong */
 uint64_t bw_arboris_spread_pack_qmd(const uint64_t o_hdr[16], const uint64_t o_vas[10], const uint32_t o_driver[224], uint32_t o_bank[240], uint32_t o_q0[96], uint32_t o_q1[96]);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */

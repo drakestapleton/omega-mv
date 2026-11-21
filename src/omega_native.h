@@ -37,24 +37,28 @@ uint32_t omega2_arboris_topology_digest(uint64_t *result, const uint32_t *o_topo
 uint32_t omega2_arboris_spread_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
 /* export fn arboris_relax_step topo view uint * weights view uint * state edit uint * to ulong */
 uint32_t omega2_arboris_relax_step(uint64_t *result, const uint32_t *o_topo, uint64_t o_topo_len, const uint32_t *o_weights, uint64_t o_weights_len, uint32_t *o_state, uint64_t o_state_len);
-#define OMEGA2_IDENT_arboris_spread_plan "omega-ident 1 unit=arboris_spread_plan abi=2 profile=OM-2 src=e97f67d97989ca15ff5fb124de88a489a0d205598963b09bda4346e04106beee omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_arboris_spread_plan "omega-ident 1 unit=arboris_spread_plan abi=2 profile=OM-2 src=6dc0852b72be694100becc124caee227b220130450ad6f7707314a7b311ca597 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_spread_plan(void);
 /* export fn arboris_spread_plan hdr edit ulong 16 budget ulong page ulong offsets edit ulong 5 mapped_sizes edit ulong 5 to ulong */
 uint32_t omega2_arboris_spread_plan(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, uint64_t o_budget, uint64_t o_page, uint64_t *o_offsets, uint64_t o_offsets_len, uint64_t *o_mapped_sizes, uint64_t o_mapped_sizes_len);
 /* export fn arboris_spread_verify_header hdr view ulong 16 budget ulong page ulong to ulong */
 uint32_t omega2_arboris_spread_verify_header(uint64_t *result, const uint64_t *o_hdr, uint64_t o_hdr_len, uint64_t o_budget, uint64_t o_page);
-#define OMEGA2_IDENT_arboris_spread_cpu "omega-ident 1 unit=arboris_spread_cpu abi=2 profile=OM-2 src=756f09e10979030eb7e2363fdda24c7dfa8c4d40dbbe930b18c7cf78c09065a9 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_arboris_spread_cpu "omega-ident 1 unit=arboris_spread_cpu abi=2 profile=OM-2 src=1f5c904cb2743072769d4cb5dae04618b2a6f1ed00284d29875259025c680bba omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_arboris_spread_cpu(void);
 /* export fn arboris_spread_cpu_hop hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong */
 uint32_t omega2_arboris_spread_cpu_hop(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint32_t *o_csr, uint64_t o_csr_len, uint32_t *o_state, uint64_t o_state_len, uint64_t *o_receipt, uint64_t o_receipt_len);
 /* export fn arboris_spread_cpu_run hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong */
 uint32_t omega2_arboris_spread_cpu_run(uint64_t *result, uint64_t *o_hdr, uint64_t o_hdr_len, const uint32_t *o_csr, uint64_t o_csr_len, uint32_t *o_state, uint64_t o_state_len, uint64_t *o_receipt, uint64_t o_receipt_len);
-#define OMEGA2_IDENT_bw_arboris_spread_emit "omega-ident 1 unit=bw_arboris_spread_emit abi=2 profile=OM-2 src=9504260b79ee31f0751d87f8cc24ca93d35b21bd6e82d0ad268538639f486b8f omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_bw_arboris_spread_emit "omega-ident 1 unit=bw_arboris_spread_emit abi=2 profile=OM-2 src=cb07cb95db1083867fbfca2360927dfa2232f7140b3f7097a7f914ef0fa03343 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_bw_arboris_spread_emit(void);
 /* export fn bw_arboris_spread_emit_mode0 code edit uchar 16384 to ulong */
 uint32_t omega2_bw_arboris_spread_emit_mode0(uint64_t *result, uint8_t *o_code, uint64_t o_code_len);
 /* export fn bw_arboris_spread_emit_mode1 code edit uchar 16384 to ulong */
 uint32_t omega2_bw_arboris_spread_emit_mode1(uint64_t *result, uint8_t *o_code, uint64_t o_code_len);
+/* export fn bw_arboris_spread_emit_mode2 code edit uchar 16384 to ulong */
+uint32_t omega2_bw_arboris_spread_emit_mode2(uint64_t *result, uint8_t *o_code, uint64_t o_code_len);
+/* export fn bw_arboris_spread_emit_mode3 code edit uchar 16384 to ulong */
+uint32_t omega2_bw_arboris_spread_emit_mode3(uint64_t *result, uint8_t *o_code, uint64_t o_code_len);
 /* export fn bw_arboris_spread_pack_qmd hdr view ulong 16 vas view ulong 10 driver view uint 224 bank edit uint 240 q0 edit uint 96 q1 edit uint 96 to ulong */
 uint32_t omega2_bw_arboris_spread_pack_qmd(uint64_t *result, const uint64_t *o_hdr, uint64_t o_hdr_len, const uint64_t *o_vas, uint64_t o_vas_len, const uint32_t *o_driver, uint64_t o_driver_len, uint32_t *o_bank, uint64_t o_bank_len, uint32_t *o_q0, uint64_t o_q0_len, uint32_t *o_q1, uint64_t o_q1_len);
 #define OMEGA2_IDENT_arboris_gated "omega-ident 1 unit=arboris_gated abi=2 profile=OM-2 src=7c4410e5586fb8afc5f4d963ae7280ccc71d57b602659e41da36d3982177a300 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
