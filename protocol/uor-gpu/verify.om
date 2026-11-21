@@ -8,7 +8,7 @@ text uor_hex_tbl "0123456789abcdef"
 text uor_v_pre "{\"schema\":\"prism/verdict/1\",\"world\":\"hologram:gpu/omega-om2@1\",\"verdict\":\""
 text uor_v_pass "PASS"
 text uor_v_fail "FAIL"
-text uor_v_lvl "\",\"level\":\"P"
+text uor_v_lvl "\",\"policy_level\":\"P"
 text uor_v_rsn "\",\"reason_code\":"
 text uor_v_uor ",\"uor_sha256\":\"sha256:"
 text uor_v_b3 "\",\"holo_blake3\":\"blake3:"
@@ -17,11 +17,71 @@ text uor_v_end "\"}\n"
 text uor_i_pre "{\"schema\":\"prism/inspect/1\",\"world\":\"hologram:gpu/omega-om2@1\",\"isa\":\""
 text uor_i_sm121 "SM121"
 text uor_i_spirv "SPIRV"
-text uor_i_lvl "\",\"level\":\"P"
-text uor_i_sig "\",\"signed\":"
+text uor_i_lvl "\",\"claimed_level\":\"P"
+text uor_i_sig "\",\"has_signature\":"
 text uor_i_true "true"
 text uor_i_false "false"
-text uor_i_lean ",\"lean_proof_sha256\":\"sha256:"
+text uor_i_pk ",\"signer_pubkey\":\""
+text uor_i_lean "\",\"lean_proof_sha256\":\"sha256:"
+
+note Local trust anchors (the verifier's own offline policy file, no central authority):
+note   [0..8)     magic "UORTRST1"
+note   [8..40)    omc_sha256 pin (seed/out/omc digest the verifier accepts)
+note   [40..72)   lean_proof_sha256 pin (UorGpuWorld.lean digest the verifier accepts)
+note   [72..104)  capability authority Ed25519 key (all-zero = admission disabled)
+note   [104..)    1..16 trusted bundle signer Ed25519 keys, 32 bytes each, non-zero, none equal to
+note              the authority key (a bundle signer can never grant itself a capability)
+const UOR_ANCH_OMC ulong 8
+const UOR_ANCH_LEAN ulong 40
+const UOR_ANCH_AUTH ulong 72
+const UOR_ANCH_KEYS ulong 104
+const UOR_ANCH_MAX ulong 616
+text uor_anch_magic "UORTRST1"
+
+note Returns the number of trusted signer keys (1..16) if the anchors are well formed, else 0.
+fn uor_anchors_nkeys anchors view uchar * to ulong
+  n = len anchors
+  if or lt n add UOR_ANCH_KEYS 32 gt n UOR_ANCH_MAX
+    ret 0
+  end
+  if ne rem sub n UOR_ANCH_KEYS 32 0
+    ret 0
+  end
+  for i ulong 8
+    if ne get anchors i get uor_anch_magic i
+      ret 0
+    end
+  end
+  if or ne uor_is_zero32 anchors UOR_ANCH_OMC 0 ne uor_is_zero32 anchors UOR_ANCH_LEAN 0
+    ret 0
+  end
+  nk = div sub n UOR_ANCH_KEYS 32
+  auth = new uchar 32 0
+  for i ulong 32
+    put auth i get anchors add UOR_ANCH_AUTH i
+  end
+  for k ulong nk bound 16
+    off = add UOR_ANCH_KEYS mul k 32
+    if ne uor_is_zero32 anchors off 0
+      ret 0
+    end
+    if ne uor_eq32 anchors off auth 0 0
+      ret 0
+    end
+  end
+  ret nk
+end
+
+note 1 iff signer_pubkey hdr[288..320) is one of the nk trusted signer keys.
+fn uor_signer_trusted hdr view uchar 384 anchors view uchar * nk ulong to ulong
+  hit = ulong 0
+  for k ulong nk bound 16
+    if ne uor_eq32 hdr 288 anchors add UOR_ANCH_KEYS mul k 32 0
+      hit = ulong 1
+    end
+  end
+  ret hit
+end
 text uor_i_mlbom "\",\"mlbom_sha256\":\"sha256:"
 text uor_i_uor "\",\"uor_sha256\":\"sha256:"
 text uor_i_b3 "\",\"holo_blake3\":\"blake3:"
@@ -46,27 +106,15 @@ fn uor_verify_ed25519_strict hdr view uchar 384 to ulong
   ret edverify pk msg 64 sig 0
 end
 
-note Verify UOR-GPU-1 bundle against omc_pin, minimum Prism level, and Ed25519 signature.
-note UOR Founding Doctrine: "Nothing raises a level except signing."
-note   P0: digest-verified only (unsigned requires zero pubkey AND zero sig; signed must verify)
-note   P1+: MUST carry a valid RFC 8032 Ed25519 signature
-note   P2+ (default): MUST also carry a non-zero Lean 4 proof digest
-note   P3: MUST also carry a non-zero golden replay digest
-fn uor_verify_policy hdr view uchar 384 pay view uchar * omc_pin view uchar 32 min_level ulong to ulong
-  rc = uor_hdr_check hdr pay
-  if ne rc UOR_VERDICT_PASS
-    ret rc
-  end
-  if eq uor_eq32 hdr 32 omc_pin 0 0
-    ret UOR_ERR_OMC_PIN
-  end
-  lvl = uor_get_u32 hdr 20
-  if lt lvl min_level
-    ret UOR_ERR_LEVEL_LOW
-  end
+note Evidence rules: P2+ needs the Lean 4 proof digest to equal the verifier's pinned digest;
+note P3 needs a non-zero replay digest (the replay command also compares it to the oracle).
+fn uor_policy_evidence hdr view uchar 384 anchors view uchar * min_level ulong to ulong
   if ge min_level UOR_LVL_P2
     if ne uor_is_zero32 hdr 128 0
       ret UOR_ERR_NO_LEAN_PROOF
+    end
+    if eq uor_eq32 hdr 128 anchors UOR_ANCH_LEAN 0
+      ret UOR_ERR_LEAN_UNPINNED
     end
   end
   if ge min_level UOR_LVL_P3
@@ -74,22 +122,60 @@ fn uor_verify_policy hdr view uchar 384 pay view uchar * omc_pin view uchar 32 m
       ret UOR_ERR_NO_REPLAY
     end
   end
-  if ge min_level UOR_LVL_P1
-    if eq uor_verify_ed25519_strict hdr 0
+  ret UOR_VERDICT_PASS
+end
+
+note Signature rules ("Nothing raises a level except signing"):
+note   unsigned (zero signer_pubkey): only min_level P0, only a header that claims P0, and the
+note   signature slot must be all-zero;
+note   signed: signer_pubkey must be a locally trusted key AND the RFC 8032 signature must verify.
+fn uor_policy_sig hdr view uchar 384 anchors view uchar * nk ulong min_level ulong to ulong
+  if ne uor_is_zero32 hdr 288 0
+    if ge min_level UOR_LVL_P1
       ret UOR_ERR_BAD_SIG
     end
-  else
-    if ne uor_is_zero32 hdr 288 0
-      if or eq uor_is_zero32 hdr 320 0 eq uor_is_zero32 hdr 352 0
-        ret UOR_ERR_BAD_SIG
-      end
-    else
-      if eq uor_verify_ed25519_strict hdr 0
-        ret UOR_ERR_BAD_SIG
-      end
+    if ne uor_get_u32 hdr 20 UOR_LVL_P0
+      ret UOR_ERR_UNSIGNED_LEVEL
     end
+    if or eq uor_is_zero32 hdr 320 0 eq uor_is_zero32 hdr 352 0
+      ret UOR_ERR_BAD_SIG
+    end
+    ret UOR_VERDICT_PASS
+  end
+  if eq uor_signer_trusted hdr anchors nk 0
+    ret UOR_ERR_UNTRUSTED_SIGNER
+  end
+  if eq uor_verify_ed25519_strict hdr 0
+    ret UOR_ERR_BAD_SIG
   end
   ret UOR_VERDICT_PASS
+end
+
+note Verify a UOR-GPU-1 bundle against the verifier's local trust anchors at a minimum level.
+note   P0: digests intact; unsigned allowed only as a P0 claim with an all-zero signature slot
+note   P1+: signed by a locally trusted key with a valid RFC 8032 Ed25519 signature
+note   P2+ (default): also the pinned Lean 4 proof digest
+note   P3: also a non-zero golden replay digest
+fn uor_verify_policy hdr view uchar 384 pay view uchar * anchors view uchar * min_level ulong to ulong
+  nk = uor_anchors_nkeys anchors
+  if eq nk 0
+    ret UOR_ERR_BAD_ANCHORS
+  end
+  rc = uor_hdr_check hdr pay
+  if ne rc UOR_VERDICT_PASS
+    ret rc
+  end
+  if eq uor_eq32 hdr 32 anchors UOR_ANCH_OMC 0
+    ret UOR_ERR_OMC_PIN
+  end
+  if lt uor_get_u32 hdr 20 min_level
+    ret UOR_ERR_LEVEL_LOW
+  end
+  rc = uor_policy_evidence hdr anchors min_level
+  if ne rc UOR_VERDICT_PASS
+    ret rc
+  end
+  ret uor_policy_sig hdr anchors nk min_level
 end
 
 note Verify bundle's replay_sha256 matches expected oracle replay digest.
@@ -141,9 +227,10 @@ fn uor_write_digit fd int d ulong to void
   end
 end
 
-note Emit canonical prism/verdict/1 JSON line to stdout (fd 1).
-fn uor_emit_verdict hdr view uchar 384 code ulong to void
-  lvl = uor_get_u32 hdr 20
+note Emit canonical prism/verdict/1 JSON line to stdout (fd 1). policy_level is the level the
+note verifier checked (plvl), never the level the header claims.
+fn uor_emit_verdict hdr view uchar 384 code ulong plvl ulong to void
+  lvl = plvl
   if gt lvl UOR_LVL_P3
     lvl = ulong 0
   end
@@ -164,7 +251,8 @@ fn uor_emit_verdict hdr view uchar 384 code ulong to void
   uor_write_all 1 uor_v_end len uor_v_end
 end
 
-note Emit prism/inspect/1 JSON summary to stdout (fd 1). Returns 1 on valid magic/ISA, 0 on corrupt header.
+note Emit prism/inspect/1 JSON summary to stdout (fd 1): the header's CLAIMS, nothing verified
+note (no digest, trust or signature check). Returns 1 on valid magic/ISA/level, 0 on corrupt header.
 fn uor_emit_inspect hdr view uchar 384 to ulong
   if or ne get hdr 0 uchar 85 ne get hdr 1 uchar 79
     ret 0
@@ -200,6 +288,8 @@ fn uor_emit_inspect hdr view uchar 384 to ulong
   else
     uor_write_all 1 uor_i_false len uor_i_false
   end
+  uor_write_all 1 uor_i_pk len uor_i_pk
+  uor_write_hex32 1 hdr 288
   uor_write_all 1 uor_i_lean len uor_i_lean
   uor_write_hex32 1 hdr 128
   uor_write_all 1 uor_i_mlbom len uor_i_mlbom

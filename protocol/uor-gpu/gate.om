@@ -1,8 +1,15 @@
 note SPDX-License-Identifier: Apache-2.0
 note protocol/uor-gpu/gate.om: Pure seeded OM-2 pre-dispatch GPU admission gate.
-note Requires BOTH:
-note   1. uor_verify_policy(..., min_level >= P2) == PASS (mandatory Lean 4 proof + Ed25519 + digests)
-note   2. Valid live RX_RIGHT_EFFECT (4) capability for target GPU resource (matching seed/authority/caproot.om)
+note Requires ALL of:
+note   1. uor_verify_policy(..., min_level P2) == PASS (pinned Lean 4 proof, trusted Ed25519 signer,
+note      intact digests) against the verifier's local trust anchors;
+note   2. a capability grant record signed (RFC 8032 Ed25519) by the anchors' authority key, which
+note      can never equal a bundle signer key (checked in uor_anchors_nkeys);
+note   3. the grant is live, has a non-zero generation equal to the expected one, the current
+note      epoch, a non-zero lease expiry later than the current clock, the subject and GPU
+note      resource of the request, and RX_RIGHT_EFFECT (4), matching seed/authority/caproot.om.
+note Offline limit: generation-based revocation needs the live caproot table; an offline caller
+note supplies the expected generation, so offline revocation rests on the signed lease expiry.
 note Compose after verify.om.
 
 const UOR_CAP_LIVE ulong 1
@@ -39,13 +46,49 @@ fn uor_cap_admit cap_entry view ulong 8 cap_req view ulong 5 to ulong
   ret 1
 end
 
-note Fail-closed GPU dispatch admission: verifies UOR-GPU-1 bundle + capability grant.
-fn uor_gpu_admit hdr view uchar 384 pay view uchar * omc_pin view uchar 32 cap_entry view ulong 8 cap_req view ulong 5 to ulong
-  rc = uor_verify_policy hdr pay omc_pin UOR_LVL_P2
+note 1 iff gctx[64..128) is a valid RFC 8032 Ed25519 signature of gctx[0..64) by the anchors'
+note non-zero authority key.
+fn uor_grant_sig_ok gctx view uchar 168 anchors view uchar * to ulong
+  if ne uor_is_zero32 anchors UOR_ANCH_AUTH 0
+    ret 0
+  end
+  pk = new uchar 32 0
+  sg = new uchar 64 0
+  msg = new uchar 65536 0
+  for i ulong 32
+    put pk i get anchors add UOR_ANCH_AUTH i
+  end
+  for i ulong 64
+    put sg i get gctx add 64 i
+    put msg i get gctx i
+  end
+  ret edverify pk msg 64 sg 0
+end
+
+note gctx[168]: 0..63    grant record, 8 x u64 LE in cap_entry order
+note            64..127  Ed25519 signature of gctx[0..64) by the anchors' authority key
+note            128..167 request, 5 x u64 LE in cap_req order
+note Fail-closed GPU dispatch admission: verified bundle AND authority-signed live grant.
+fn uor_gpu_admit hdr view uchar 384 pay view uchar * anchors view uchar * gctx view uchar 168 to ulong
+  rc = uor_verify_policy hdr pay anchors UOR_LVL_P2
   if ne rc UOR_VERDICT_PASS
     ret rc
   end
-  if eq uor_cap_admit cap_entry cap_req 0
+  if eq uor_grant_sig_ok gctx anchors 0
+    ret UOR_ERR_BAD_GRANT
+  end
+  ent = new ulong 8 0
+  req = new ulong 5 0
+  for i ulong 8
+    put ent i uor_get_u64 gctx mul i 8
+  end
+  for i ulong 5
+    put req i uor_get_u64 gctx add 128 mul i 8
+  end
+  if eq get ent 3 0
+    ret UOR_ERR_CAP_DENIED
+  end
+  if eq uor_cap_admit ent req 0
     ret UOR_ERR_CAP_DENIED
   end
   ret UOR_VERDICT_PASS

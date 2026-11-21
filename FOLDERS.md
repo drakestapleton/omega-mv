@@ -30,7 +30,7 @@ Runtime, memory, recursive self-improvement, mission orchestration and agent cor
 
 ## `protocol/`
 
-Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp` moved with full Git history under `protocol/import/`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity`, and `synapse` under `protocol/synapse/core/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 28 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
+Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp` moved with full Git history under `protocol/import/`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity`, and `synapse` under `protocol/synapse/core/`, and the pure-Omega UOR/Prism GPU bundle verifier and CLI under `protocol/uor-gpu/` with its Lean 4 policy model in `protocol/uor-gpu/proofs/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 32 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
 
 ## `si/`
 

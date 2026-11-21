@@ -1,0 +1,144 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/uor-gpu/ed_sign.om: Pure seeded OM-2 RFC 8032 section 5.1.5/5.1.6 Ed25519 key
+note derivation and signing for the UOR-GPU-1 producer side (bundle and grant signing). Reuses the
+note field, point and scalar code of protocol/omnet/om/ed25519/ed25519.om and the SHA-512 of
+note protocol/omnet/om/sha512/sha512.om. Variable time, NOT constant-time-audited: run it only on a
+note host that owns the seed. The verifier path (verify.om, gate.om) never calls it.
+note Compose after protocol/uor-gpu/emit_kernels.om.
+
+note o = x64[0..64) mod L as 32 little-endian bytes
+fn ues_red x64 view uchar 64 o edit uchar 32 to void
+  x = new long 64 0
+  for i ulong 64
+    put x i long get x64 i
+  end
+  edmodl x
+  for i ulong 32
+    put o i uchar get x i
+  end
+end
+
+note RFC 8032 5.1.5: h = SHA-512(seed); ar = clamp(h[0..32)) mod L; pfx[0..32) = h[32..64).
+note Reducing the clamped scalar mod L leaves [a]B unchanged (B has order L) and keeps it below L
+note as edsmul requires.
+fn ues_expand seed view uchar 32 ar edit uchar 32 pfx edit uchar 64 to void
+  m = new uchar 65536 0
+  hd = new uchar 64 0
+  t = new uchar 64 0
+  for i ulong 32
+    put m i get seed i
+  end
+  s512hash m 32 hd
+  for i ulong 32
+    put t i get hd i
+    put pfx i get hd add i 32
+  end
+  put t 0 and get t 0 uchar 248
+  put t 31 and get t 31 uchar 127
+  put t 31 or get t 31 uchar 64
+  ues_red t ar
+end
+
+note o = encode([s]B) for a scalar s below L (edsmul with k = 0)
+fn ues_basemul s view uchar 32 o edit uchar 32 to void
+  w = new ulong 1024 0
+  z = new uchar 32 0
+  edinit w
+  edsmul w s z
+  edpenc w edq o
+end
+
+note pk = public key A of the 32-byte seed
+fn ues_pubkey seed view uchar 32 pk edit uchar 32 to void
+  ar = new uchar 32 0
+  pfx = new uchar 64 0
+  ues_expand seed ar pfx
+  ues_basemul ar pk
+end
+
+note sg[32..64) = (r + k * a) mod L (TweetNaCl schoolbook product, then edmodl)
+fn ues_muladd r view uchar 32 k view uchar 32 a view uchar 32 sg edit uchar 64 to void
+  x = new long 64 0
+  for i ulong 32
+    put x i long get r i
+  end
+  for i ulong 32
+    ki = long get k i
+    for j ulong 32
+      p = add i j
+      put x p add get x p mul ki long get a j
+    end
+  end
+  edmodl x
+  for i ulong 32
+    put sg add 32 i uchar get x i
+  end
+end
+
+note hd = SHA-512(pfx[0..32) || m[0..n)), n <= 65504 (else trap 3)
+fn ues_hprefix pfx view uchar 64 m view uchar 65536 n ulong hd edit uchar 64 to void
+  if gt n 65504
+    trap 3
+  end
+  pm = new uchar 65536 0
+  for i ulong 32
+    put pm i get pfx i
+  end
+  for i ulong n bound 65504
+    put pm add 32 i get m i
+  end
+  s512hash pm add n 32 hd
+end
+
+note RFC 8032 5.1.6: sg = R || S, the Ed25519 signature of m[0..n) under the 32-byte seed
+fn ues_sign seed view uchar 32 m view uchar 65536 n ulong sg edit uchar 64 to void
+  ar = new uchar 32 0
+  pfx = new uchar 64 0
+  pk = new uchar 32 0
+  hd = new uchar 64 0
+  r = new uchar 32 0
+  rb = new uchar 32 0
+  k = new uchar 32 0
+  ues_expand seed ar pfx
+  ues_basemul ar pk
+  ues_hprefix pfx m n hd
+  ues_red hd r
+  ues_basemul r rb
+  for i ulong 32
+    put sg i get rb i
+  end
+  edhram sg pk m n k
+  ues_muladd r k ar sg
+end
+
+note Sign a sealed UOR-GPU-1 header: hdr[288..320) = public key of seed,
+note hdr[320..384) = Ed25519(seed, hdr[224..288)) over uor_id_sha256 || holo_blake3.
+fn ues_sign_hdr hdr edit uchar 384 seed view uchar 32 to void
+  pk = new uchar 32 0
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  ues_pubkey seed pk
+  for i ulong 64
+    put m i get hdr add 224 i
+  end
+  ues_sign seed m 64 sg
+  for i ulong 32
+    put hdr add 288 i get pk i
+  end
+  for i ulong 64
+    put hdr add 320 i get sg i
+  end
+end
+
+note Sign a 64-byte capability grant record: g[64..128) = Ed25519(seed, g[0..64))
+fn ues_sign_grant g edit uchar 168 seed view uchar 32 to void
+  m = new uchar 65536 0
+  sg = new uchar 64 0
+  for i ulong 64
+    put m i get g i
+  end
+  ues_sign seed m 64 sg
+  for i ulong 64
+    put g add 64 i get sg i
+  end
+end
