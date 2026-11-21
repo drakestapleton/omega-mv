@@ -1664,8 +1664,15 @@ $(OMA_TEST_ASAN): tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND_AS
 	$(CC) $(OMA_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
 		-o $@ tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_BIND_ASAN) -lm
 
-test-algebra: $(OMA_TEST)
+OMA_FAILURE_TEST = $(OUT_DIR)/tests-algebra/test_oma_native_failure
+$(OMA_FAILURE_TEST): tests/algebra/test_oma_native_failure.c $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
+	@mkdir -p $(dir $@)
+	$(CC) $(OMA_CFLAGS) -o $@ $< $(OMA_SRCS) $(OMA_BIND) -lm \
+		-Wl,--wrap=omega2_oma_om_block_deserialize -Wl,--wrap=omega2_oma_om_pack_dense_byte
+
+test-algebra: $(OMA_TEST) $(OMA_FAILURE_TEST)
 	./$(OMA_TEST)
+	./$(OMA_FAILURE_TEST)
 
 test-algebra-asan: $(OMA_TEST_ASAN)
 	./$(OMA_TEST_ASAN)
