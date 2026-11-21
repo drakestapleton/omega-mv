@@ -1,0 +1,689 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure seeded OM-2 safetensors reader & single-arena UVM weight loader for Inkling-2-Mini.
+note Parses the 148 KB JSON header directly and streams all 24 physical text layers + embed/unembed
+note into one 256-byte-aligned UVM arena (~18.3 GB) with ZERO C, ZERO Python, ZERO libcuda.so.1.
+
+const IK_ARENA_SZ ulong 5368709120
+global ikStHdr uchar 262144
+global ikStHdrLen ulong 1
+global ikStDataBase ulong 1
+global ikStIoBuf uchar 1048576
+global ikStF32Buf uchar 1048576
+global ikStArena long 4
+global ikStArenaVa ulong 4
+global ikStArenaCur ulong 1
+global ikStArenaPos ulong 4
+global ikStCurOff ulong 1
+global ikStCurAr ulong 1
+global ikStNameBuf uchar 256
+
+note Global non-layer weight offsets in ikStArena:
+note 0:embed(bf16) 1:embed_norm(f32) 2:norm(f32) 3:unembed(bf16)
+note 4:output_query(f32) 5:cross_q(f32) 6:cross_kv_q(f32)
+global ikGW ulong 16
+note attn_res.attn_queries[0..22] (23 entries) and mlp_queries[0..23] (24 entries)
+global ikAttnQOff ulong 24
+global ikMlpQOff ulong 24
+
+note Per-layer weight offsets (24 physical layers x 40 slots = 960):
+note 0:wq 1:wk 2:wv 3:wr 4:wo 5:gate_attn 6:sink_proj 7:rel_proj
+note 8:q_clip_s(f32) 9:rel_clip_s(f32) 10:k_sconv_w(f32) 11:v_sconv_w(f32)
+note 12:k_sconv_proj(bf16) 13:v_sconv_proj(bf16) 14:attn_sconv(f32) 15:mlp_sconv(f32)
+note 16:attn_norm(f32) 17:k_norm(f32) 18:v_norm(f32) 19:mlp_norm(f32)
+note 20:gate_w(bf16) 21:gate_b(f32) 22:w13_w 23:w13_s 24:w13_alpha(f32)
+note 25:w2_w 26:w2_s 27:w2_alpha(f32)
+note 28..39: controllers.{attn,k,v,mlp}.{down,forget,gain} (3 x 4 = 12 bf16 mats, layers 6..17)
+global ikLW ulong 960
+
+fn ikStAlign256 v ulong to ulong
+ret and add v 255 0xffffffffffffff00
+end
+
+fn ikStPreadHdr fd int off ulong n ulong to bool
+done = ulong 0
+while lt done n bound 65536
+r = pread fd ikStHdr done sub n done long add off done
+if eq r -4
+continue
+end
+if le r 0
+ret false
+end
+done = add done ulong r
+end
+ret true
+end
+
+fn ikStPreadIo fd int off ulong n ulong to bool
+done = ulong 0
+while lt done n bound 65536
+r = pread fd ikStIoBuf done sub n done long add off done
+if eq r -4
+continue
+end
+if le r 0
+ret false
+end
+done = add done ulong r
+end
+ret true
+end
+
+fn ikStOpen path view uchar * plen ulong to int
+fd = fopen path 0 plen 0 0
+if lt fd 0
+ret -1
+end
+if not ikStPreadIo int fd 0 8
+rc = fclose int fd
+ret -1
+end
+hlen = ulong 0
+for i ulong 8
+hlen = or hlen shl ulong get ikStIoBuf i mul i 8
+end
+if or eq hlen 0 gt hlen 262144
+rc = fclose int fd
+ret -1
+end
+if not ikStPreadHdr int fd 8 hlen
+rc = fclose int fd
+ret -1
+end
+put ikStHdrLen 0 hlen
+put ikStDataBase 0 add hlen 8
+ret int fd
+end
+
+fn ikStParseU64 pos ulong lim ulong dst edit ulong 2 to ulong
+v = ulong 0
+p = pos
+while lt p lim bound 32
+c = get ikStHdr p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+end
+put dst 0 v
+put dst 1 p
+ret p
+end
+
+fn ikStSkipToBr s ulong qlim ulong to ulong
+p = s
+while lt p qlim bound 32
+if eq get ikStHdr p 91
+ret p
+end
+p = add p 1
+end
+ret qlim
+end
+
+fn ikStSkipSep s ulong qlim ulong to ulong
+p = s
+while lt p qlim bound 16
+c = get ikStHdr p
+if and ne c 44 ne c 32
+ret p
+end
+p = add p 1
+end
+ret qlim
+end
+
+fn ikStParseOffsets qStart ulong dst edit ulong 2 to bool
+tmp = new ulong 2 0
+qlim = add qStart 200
+if gt qlim get ikStHdrLen 0
+qlim = get ikStHdrLen 0
+end
+q = qStart
+while lt q qlim bound 256
+if eq get ikStHdr q 100
+if eq get ikStHdr add q 1 97
+if eq get ikStHdr add q 2 116
+if eq get ikStHdr add q 3 97
+if eq get ikStHdr add q 12 34
+s = ikStSkipToBr add q 13 qlim
+if lt s qlim
+s = ikStParseU64 add s 1 qlim tmp
+lo = get tmp 0
+s = ikStSkipSep s qlim
+s = ikStParseU64 s qlim tmp
+hi = get tmp 0
+put dst 0 lo
+put dst 1 hi
+ret gt hi lo
+end
+end
+end
+end
+end
+end
+q = add q 1
+end
+ret false
+end
+
+note Find exact tensor key in ikStNameBuf[0..nlen-1] inside ikStHdr, extract data_offsets [lo, hi] into dst[0..1].
+fn ikStFindBuf nlen ulong dst edit ulong 2 to bool
+hlen = get ikStHdrLen 0
+if lt hlen add nlen 16
+ret false
+end
+p = ulong 0
+lim = sub hlen add nlen 4
+while lt p lim bound 300000
+if eq get ikStHdr p 34
+if eq get ikStHdr add add p 1 nlen 34
+if eq get ikStHdr add add p 2 nlen 58
+ok = true
+for j ulong nlen bound 256
+if ne get ikStHdr add add p 1 j get ikStNameBuf j
+ok = false
+break
+end
+end
+if ok
+ret ikStParseOffsets add add p 3 nlen dst
+end
+end
+end
+end
+p = add p 1
+end
+ret false
+end
+
+fn ikStCopyName name view uchar * nlen ulong to ulong
+for i ulong nlen bound 256
+put ikStNameBuf i get name i
+end
+ret nlen
+end
+
+fn ikStAlloc nbytes ulong to bool
+a = get ikStArenaCur 0
+off = ikStAlign256 get ikStArenaPos a
+if gt add off nbytes IK_ARENA_SZ
+a = add a 1
+if ge a 4
+ret false
+end
+put ikStArenaCur 0 a
+off = ulong 0
+end
+put ikStArenaPos a add off nbytes
+put ikStCurAr 0 a
+put ikStCurOff 0 off
+ret true
+end
+
+fn ikStWriteIo done ulong chunk ulong to bool
+ar = get ikStArena get ikStCurAr 0
+off = add get ikStCurOff 0 done
+r = mapwrite ar off ikStIoBuf 0 chunk
+ret eq r long chunk
+end
+
+fn ikStWriteF32 done ulong chunk ulong to bool
+ar = get ikStArena get ikStCurAr 0
+off = add get ikStCurOff 0 mul done 4
+n = mul chunk 4
+r = mapwrite ar off ikStF32Buf 0 n
+ret eq r long n
+end
+
+fn ikStLoadRawBuf fd int nlen ulong to ulong
+ext = new ulong 2 0
+if not ikStFindBuf nlen ext
+ret 18446744073709551615
+end
+nbytes = sub get ext 1 get ext 0
+if not ikStAlloc nbytes
+ret 18446744073709551615
+end
+base = add get ikStDataBase 0 get ext 0
+done = ulong 0
+while lt done nbytes bound 65536
+chunk = sub nbytes done
+if gt chunk 1048576
+chunk = ulong 1048576
+end
+if not ikStPreadIo fd add base done chunk
+ret 18446744073709551615
+end
+if not ikStWriteIo done chunk
+ret 18446744073709551615
+end
+done = add done chunk
+end
+ret add get ikStArenaVa get ikStCurAr 0 get ikStCurOff 0
+end
+
+fn ikStLoadRaw fd int name view uchar * nlen ulong to ulong
+nl = ikStCopyName name nlen
+ret ikStLoadRawBuf fd nl
+end
+
+fn ikStWidenChunk chunk ulong to void
+for i ulong chunk bound 262144
+loB = get ikStIoBuf mul i 2
+hiB = get ikStIoBuf add mul i 2 1
+put ikStF32Buf mul i 4 0
+put ikStF32Buf add mul i 4 1 0
+put ikStF32Buf add mul i 4 2 loB
+put ikStF32Buf add mul i 4 3 hiB
+end
+end
+
+fn ikStLoadBf16Buf fd int nlen ulong to ulong
+ext = new ulong 2 0
+if not ikStFindBuf nlen ext
+ret 18446744073709551615
+end
+nelems = div sub get ext 1 get ext 0 2
+if not ikStAlloc mul nelems 4
+ret 18446744073709551615
+end
+base = add get ikStDataBase 0 get ext 0
+done = ulong 0
+while lt done nelems bound 65536
+chunk = sub nelems done
+if gt chunk 262144
+chunk = ulong 262144
+end
+if not ikStPreadIo fd add base mul done 2 mul chunk 2
+ret 18446744073709551615
+end
+ikStWidenChunk chunk
+if not ikStWriteF32 done chunk
+ret 18446744073709551615
+end
+done = add done chunk
+end
+ret add get ikStArenaVa get ikStCurAr 0 get ikStCurOff 0
+end
+
+fn ikStLoadBf16AsF32 fd int name view uchar * nlen ulong to ulong
+nl = ikStCopyName name nlen
+ret ikStLoadBf16Buf fd nl
+end
+
+fn ikStBuildName pfx view uchar * num ulong sfx view uchar * to ulong
+pos = ulong 0
+for i ulong len pfx bound 128
+put ikStNameBuf pos get pfx i
+pos = add pos 1
+end
+if lt num 100
+if ge num 10
+put ikStNameBuf pos uchar add 48 div num 10
+pos = add pos 1
+end
+put ikStNameBuf pos uchar add 48 rem num 10
+pos = add pos 1
+end
+for i ulong len sfx bound 128
+put ikStNameBuf pos get sfx i
+pos = add pos 1
+end
+ret pos
+end
+
+text ikNmEmbed "model.llm.embed.weight"
+text ikNmEmbedN "model.llm.embed_norm.weight"
+text ikNmNorm "model.llm.norm.weight"
+text ikNmUnemb "model.llm.unembed.weight"
+text ikNmOutQ "model.llm.attn_res.output_query"
+text ikNmCrossQ "model.llm.middle_cycle_cross_pass_queries"
+text ikNmCrossKV "model.llm.middle_cycle_cross_pass_kv_queries"
+text ikNmAQPfx "model.llm.attn_res.attn_queries."
+text ikNmMQPfx "model.llm.attn_res.mlp_queries."
+text ikNmEmpty ""
+text ikNmLPfx "model.llm.layers."
+text ikSfxWq ".attn.wq_du.weight"
+text ikSfxWk ".attn.wk_dv.weight"
+text ikSfxWv ".attn.wv_dv.weight"
+text ikSfxWr ".attn.wr_du.weight"
+text ikSfxWo ".attn.wo_ud.weight"
+text ikSfxGateA ".attn.gate_attn.weight"
+text ikSfxSink ".attn.attn_sink_proj.weight"
+text ikSfxRelP ".attn.rel_logits_proj.proj"
+text ikSfxQClip ".attn.q_l2_clip.scale"
+text ikSfxRClip ".attn.rel_l2_clip.scale"
+text ikSfxKS ".attn.k_sconv.weight"
+text ikSfxVS ".attn.v_sconv.weight"
+text ikSfxKSD ".attn.k_sconv.static_w"
+text ikSfxVSD ".attn.v_sconv.static_w"
+text ikSfxKSP ".attn.k_sconv.weight_proj"
+text ikSfxVSP ".attn.v_sconv.weight_proj"
+text ikSfxAS ".attn_sconv.weight"
+text ikSfxMS ".mlp_sconv.weight"
+text ikSfxAN ".attn_norm.weight"
+text ikSfxQN ".q_input_norm.weight"
+text ikSfxKN ".k_input_norm.weight"
+text ikSfxVN ".v_input_norm.weight"
+text ikSfxMN ".mlp_norm.weight"
+text ikSfxGW ".mlp.gate.weight"
+text ikSfxGB ".mlp.gate.bias"
+text ikSfxW13 ".mlp.experts.w13_weight"
+text ikSfxW13S ".mlp.experts.w13_weight_scale"
+text ikSfxW13A ".mlp.experts.w13_weight_amax"
+text ikSfxW13D ".mlp.experts.w13_weight_outer_scale_denominator"
+text ikSfxW2 ".mlp.experts.w2_weight"
+text ikSfxW2S ".mlp.experts.w2_weight_scale"
+text ikSfxW2A ".mlp.experts.w2_weight_amax"
+text ikSfxW2D ".mlp.experts.w2_weight_outer_scale_denominator"
+text ikSfxCAD ".controllers.attn.down_weight"
+text ikSfxCAF ".controllers.attn.forget_weight"
+text ikSfxCAG ".controllers.attn.gain_weight"
+text ikSfxCKD ".controllers.k.down_weight"
+text ikSfxCKF ".controllers.k.forget_weight"
+text ikSfxCKG ".controllers.k.gain_weight"
+text ikSfxCVD ".controllers.v.down_weight"
+text ikSfxCVF ".controllers.v.forget_weight"
+text ikSfxCVG ".controllers.v.gain_weight"
+text ikSfxCMD ".controllers.mlp.down_weight"
+text ikSfxCMF ".controllers.mlp.forget_weight"
+text ikSfxCMG ".controllers.mlp.gain_weight"
+
+fn ikStLoadLayerRaw fd int l ulong slot ulong sfx view uchar * to bool
+nl = ikStBuildName ikNmLPfx l sfx
+o = ikStLoadRawBuf fd nl
+if eq o 18446744073709551615
+ret false
+end
+put ikLW add mul l 40 slot o
+ret true
+end
+
+fn ikStLoadLayerF32 fd int l ulong slot ulong sfx view uchar * to bool
+nl = ikStBuildName ikNmLPfx l sfx
+o = ikStLoadBf16Buf fd nl
+if eq o 18446744073709551615
+ret false
+end
+put ikLW add mul l 40 slot o
+ret true
+end
+
+fn ikStLoadLayerAttn fd int l ulong isFull bool to bool
+if not ikStLoadLayerRaw fd l 0 ikSfxWq
+ret false
+end
+if not ikStLoadLayerRaw fd l 1 ikSfxWk
+ret false
+end
+if not ikStLoadLayerRaw fd l 2 ikSfxWv
+ret false
+end
+if not ikStLoadLayerRaw fd l 3 ikSfxWr
+ret false
+end
+if not ikStLoadLayerRaw fd l 4 ikSfxWo
+ret false
+end
+if not ikStLoadLayerRaw fd l 5 ikSfxGateA
+ret false
+end
+if not ikStLoadLayerRaw fd l 6 ikSfxSink
+ret false
+end
+if not ikStLoadLayerF32 fd l 8 ikSfxQClip
+ret false
+end
+if not ikStLoadLayerF32 fd l 9 ikSfxRClip
+ret false
+end
+if isFull
+if not ikStLoadLayerF32 fd l 10 ikSfxKSD
+ret false
+end
+if not ikStLoadLayerF32 fd l 11 ikSfxVSD
+ret false
+end
+if not ikStLoadLayerRaw fd l 12 ikSfxKSP
+ret false
+end
+if not ikStLoadLayerRaw fd l 13 ikSfxVSP
+ret false
+end
+if not ikStLoadLayerF32 fd l 16 ikSfxQN
+ret false
+end
+if not ikStLoadLayerF32 fd l 17 ikSfxKN
+ret false
+end
+if not ikStLoadLayerF32 fd l 18 ikSfxVN
+ret false
+end
+else
+if not ikStLoadLayerF32 fd l 10 ikSfxKS
+ret false
+end
+if not ikStLoadLayerF32 fd l 11 ikSfxVS
+ret false
+end
+if not ikStLoadLayerF32 fd l 16 ikSfxAN
+ret false
+end
+end
+if not ikStLoadLayerF32 fd l 14 ikSfxAS
+ret false
+end
+if not ikStLoadLayerF32 fd l 15 ikSfxMS
+ret false
+end
+ret ikStLoadLayerF32 fd l 19 ikSfxMN
+end
+
+fn ikStReadU32Io o ulong to uint
+b0 = uint get ikStIoBuf o
+b1 = shl uint get ikStIoBuf add o 1 8
+b2 = shl uint get ikStIoBuf add o 2 16
+b3 = shl uint get ikStIoBuf add o 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn ikStWriteAlphas denom f32 to void
+ar = get ikStArena get ikStCurAr 0
+dst = get ikStCurOff 0
+for e ulong 128
+o = mul e 4
+al = div bitcast f32 ikStReadU32Io o denom
+r = mapset ar add dst o 4 ulong bitcast uint al
+end
+end
+
+fn ikStLoadAlpha fd int l ulong isW2 bool to ulong
+extA = new ulong 2 0
+extD = new ulong 2 0
+l1 = ulong 0
+if isW2
+l1 = ikStBuildName ikNmLPfx l ikSfxW2A
+else
+l1 = ikStBuildName ikNmLPfx l ikSfxW13A
+end
+if not ikStFindBuf l1 extA
+ret 18446744073709551615
+end
+l2 = ulong 0
+if isW2
+l2 = ikStBuildName ikNmLPfx l ikSfxW2D
+else
+l2 = ikStBuildName ikNmLPfx l ikSfxW13D
+end
+if not ikStFindBuf l2 extD
+ret 18446744073709551615
+end
+if not ikStPreadIo fd add get ikStDataBase 0 get extD 0 4
+ret 18446744073709551615
+end
+denom = bitcast f32 ikStReadU32Io 0
+if not ikStPreadIo fd add get ikStDataBase 0 get extA 0 512
+ret 18446744073709551615
+end
+if not ikStAlloc 512
+ret 18446744073709551615
+end
+ikStWriteAlphas denom
+ret add get ikStArenaVa get ikStCurAr 0 get ikStCurOff 0
+end
+
+fn ikStLoadLayerMlp fd int l ulong to bool
+if not ikStLoadLayerRaw fd l 20 ikSfxGW
+ret false
+end
+if not ikStLoadLayerRaw fd l 21 ikSfxGB
+ret false
+end
+if not ikStLoadLayerRaw fd l 22 ikSfxW13
+ret false
+end
+if not ikStLoadLayerRaw fd l 23 ikSfxW13S
+ret false
+end
+if not ikStLoadLayerRaw fd l 25 ikSfxW2
+ret false
+end
+if not ikStLoadLayerRaw fd l 26 ikSfxW2S
+ret false
+end
+if lt l 20
+o1 = ikStLoadAlpha fd l false
+if eq o1 18446744073709551615
+ret false
+end
+put ikLW add mul l 40 24 o1
+o2 = ikStLoadAlpha fd l true
+if eq o2 18446744073709551615
+ret false
+end
+put ikLW add mul l 40 27 o2
+end
+ret true
+end
+
+fn ikStLoadLayerCtrl fd int l ulong to bool
+if or lt l 6 ge l 18
+ret true
+end
+if not ikStLoadLayerRaw fd l 28 ikSfxCAD
+ret false
+end
+if not ikStLoadLayerRaw fd l 29 ikSfxCAF
+ret false
+end
+if not ikStLoadLayerRaw fd l 30 ikSfxCAG
+ret false
+end
+if not ikStLoadLayerRaw fd l 31 ikSfxCKD
+ret false
+end
+if not ikStLoadLayerRaw fd l 32 ikSfxCKF
+ret false
+end
+if not ikStLoadLayerRaw fd l 33 ikSfxCKG
+ret false
+end
+if not ikStLoadLayerRaw fd l 34 ikSfxCVD
+ret false
+end
+if not ikStLoadLayerRaw fd l 35 ikSfxCVF
+ret false
+end
+if not ikStLoadLayerRaw fd l 36 ikSfxCVG
+ret false
+end
+if not ikStLoadLayerRaw fd l 37 ikSfxCMD
+ret false
+end
+if not ikStLoadLayerRaw fd l 38 ikSfxCMF
+ret false
+end
+ret ikStLoadLayerRaw fd l 39 ikSfxCMG
+end
+
+fn ikStLoadAll path view uchar * plen ulong to bool
+fd = ikStOpen path plen
+if lt fd 0
+ret false
+end
+for a ulong 4
+ar = nvalloc IK_ARENA_SZ true
+if le ar 0
+rc = fclose fd
+ret false
+end
+put ikStArena a ar
+put ikStArenaVa a mapaddr ar
+put ikStArenaPos a 0
+end
+put ikStArenaCur 0 0
+put ikGW 0 ikStLoadRaw fd ikNmEmbed len ikNmEmbed
+put ikGW 1 ikStLoadBf16AsF32 fd ikNmEmbedN len ikNmEmbedN
+put ikGW 2 ikStLoadBf16AsF32 fd ikNmNorm len ikNmNorm
+put ikGW 3 ikStLoadRaw fd ikNmUnemb len ikNmUnemb
+put ikGW 4 ikStLoadRaw fd ikNmOutQ len ikNmOutQ
+put ikGW 5 ikStLoadRaw fd ikNmCrossQ len ikNmCrossQ
+put ikGW 6 ikStLoadRaw fd ikNmCrossKV len ikNmCrossKV
+for i ulong 7
+if eq get ikGW i 18446744073709551615
+rc = fclose fd
+ret false
+end
+end
+for i ulong 23
+nl = ikStBuildName ikNmAQPfx i ikNmEmpty
+o = ikStLoadRawBuf fd nl
+if eq o 18446744073709551615
+rc = fclose fd
+ret false
+end
+put ikAttnQOff i o
+end
+for i ulong 24
+nl = ikStBuildName ikNmMQPfx i ikNmEmpty
+o = ikStLoadRawBuf fd nl
+if eq o 18446744073709551615
+rc = fclose fd
+ret false
+end
+put ikMlpQOff i o
+end
+for l ulong 24
+if not ikStLoadLayerRaw fd l 7 ikSfxRelP
+rc = fclose fd
+ret false
+end
+end
+for l ulong 24
+isFull = or or eq l 5 eq l 11 or eq l 17 eq l 23
+if not ikStLoadLayerAttn fd l isFull
+rc = fclose fd
+ret false
+end
+if not ikStLoadLayerMlp fd l
+rc = fclose fd
+ret false
+end
+if not ikStLoadLayerCtrl fd l
+rc = fclose fd
+ret false
+end
+end
+rc = fclose fd
+ret true
+end
+
+fn ikLva l ulong slot ulong to ulong
+ret get ikLW add mul l 40 slot
+end
+
+fn ikGva slot ulong to ulong
+ret get ikGW slot
+end

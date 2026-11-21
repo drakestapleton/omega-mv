@@ -1,0 +1,340 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure seeded OM-2 ByteLevel BPE tokenizer for Inkling-2-Mini (reads tokenizer.json directly).
+note Decodes any token ID 0..200057 to exact UTF-8 bytes and encodes prompts via longest-match
+note over vocab + added_tokens (ZERO Python, ZERO libc).
+
+const IK_VOCAB_MAX ulong 201024
+const IK_STR_POOL ulong 8388608
+const IK_TOK_HALF ulong 16777216
+
+global ikTokOff uint 201024
+global ikTokLen ushort 201024
+global ikTokPool uchar 8388608
+global ikTokPoolPos ulong 1
+global ikTokRev uchar 512
+global ikTokF0 uchar 16777216
+global ikTokF1 uchar 16777216
+global ikTokFileLen ulong 1
+
+fn ikTokB p ulong to uchar
+if lt p IK_TOK_HALF
+ret get ikTokF0 p
+end
+ret get ikTokF1 sub p IK_TOK_HALF
+end
+
+fn ikTokInitRev to void
+for i ulong 512
+put ikTokRev i 0
+end
+for b ulong 256
+if or or and ge b 33 le b 126 and ge b 161 le b 172 and ge b 174 le b 255
+put ikTokRev b uchar b
+end
+end
+n = ulong 0
+for b ulong 256
+if not or or and ge b 33 le b 126 and ge b 161 le b 172 and ge b 174 le b 255
+put ikTokRev add 256 n uchar b
+n = add n 1
+end
+end
+end
+
+fn ikTokHex c uchar to ulong
+if and ge c 48 le c 57
+ret ulong sub c 48
+end
+if and ge c 97 le c 102
+ret add 10 ulong sub c 97
+end
+if and ge c 65 le c 70
+ret add 10 ulong sub c 65
+end
+ret 0
+end
+
+fn ikTokUtf3 c uchar p ulong to ulong
+a = shl ulong and c 15 12
+b = shl ulong and ikTokB p 63 6
+d = ulong and ikTokB add p 1 63
+ret or or a b d
+end
+
+fn ikTokHex4 p ulong to ulong
+a = shl ikTokHex ikTokB p 12
+b = shl ikTokHex ikTokB add p 1 8
+c = shl ikTokHex ikTokB add p 2 4
+d = ikTokHex ikTokB add p 3
+ret or or a b or c d
+end
+
+note Parse JSON string starting after opening quote at pos, decode GPT-2 ByteLevel into ikTokPool,
+note return index after closing quote. If rawMode=true, keep raw UTF-8 bytes (for added_tokens).
+fn ikTokReadStr pos ulong lim ulong rawMode bool outStart edit ulong 2 to ulong
+st = get ikTokPoolPos 0
+put outStart 0 st
+p = pos
+while lt p lim bound 4096
+c = ikTokB p
+if eq c 34
+put outStart 1 sub get ikTokPoolPos 0 st
+ret add p 1
+end
+cp = ulong c
+p = add p 1
+if eq c 92
+if ge p lim
+break
+end
+e = ikTokB p
+p = add p 1
+if eq e 110
+cp = ulong 10
+else
+if eq e 114
+cp = ulong 13
+else
+if eq e 116
+cp = ulong 9
+else
+if eq e 34
+cp = ulong 34
+else
+if eq e 92
+cp = ulong 92
+else
+if eq e 117
+if le add p 4 lim
+cp = ikTokHex4 p
+p = add p 4
+end
+else
+cp = ulong e
+end
+end
+end
+end
+end
+end
+else
+if ge c 192
+if and lt c 224 lt p lim
+c2 = ikTokB p
+p = add p 1
+cp = or shl ulong and c 31 6 ulong and c2 63
+else
+if and lt c 240 le add p 2 lim
+cp = ikTokUtf3 c p
+p = add p 2
+end
+end
+end
+end
+if rawMode
+if lt get ikTokPoolPos 0 IK_STR_POOL
+put ikTokPool get ikTokPoolPos 0 uchar and cp 255
+put ikTokPoolPos 0 add get ikTokPoolPos 0 1
+end
+else
+if and lt cp 512 lt get ikTokPoolPos 0 IK_STR_POOL
+put ikTokPool get ikTokPoolPos 0 get ikTokRev cp
+put ikTokPoolPos 0 add get ikTokPoolPos 0 1
+end
+end
+end
+put outStart 1 sub get ikTokPoolPos 0 st
+ret p
+end
+
+fn ikTokParseU64 pos ulong lim ulong dst edit ulong 2 to ulong
+v = ulong 0
+p = pos
+while lt p lim bound 64
+c = ikTokB p
+if and ne c 32 and ne c 58 and ne c 10 ne c 9
+break
+end
+p = add p 1
+end
+while lt p lim bound 32
+c = ikTokB p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+end
+put dst 0 v
+put dst 1 p
+ret p
+end
+
+fn ikTokReadFile path view uchar * plen ulong to bool
+fd = fopen path 0 plen 0 0
+if lt fd 0
+ret false
+end
+sz = fseek int fd 0 2
+if or le sz 0 gt ulong sz 33554432
+rc = fclose int fd
+ret false
+end
+fpos = fseek int fd 0 0
+done = ulong 0
+r = long 0
+while lt done ulong sz bound 65536
+if lt done IK_TOK_HALF
+want = sub IK_TOK_HALF done
+if gt want sub ulong sz done
+want = sub ulong sz done
+end
+r = read int fd ikTokF0 done want
+else
+off1 = sub done IK_TOK_HALF
+r = read int fd ikTokF1 off1 sub ulong sz done
+end
+if eq r -4
+continue
+end
+if le r 0
+rc = fclose int fd
+ret false
+end
+done = add done ulong r
+end
+rc = fclose int fd
+put ikTokFileLen 0 done
+ret true
+end
+
+fn ikTokFindVocab done ulong to ulong
+p = ulong 0
+lim = sub done 12
+while lt p lim bound 33554432
+if eq ikTokB p 34
+if eq ikTokB add p 1 118
+if eq ikTokB add p 2 111
+if eq ikTokB add p 3 99
+if eq ikTokB add p 4 97
+if eq ikTokB add p 5 98
+if eq ikTokB add p 6 34
+p = add p 7
+while and lt p done ne ikTokB p 123 bound 64
+p = add p 1
+end
+ret add p 1
+end
+end
+end
+end
+end
+end
+end
+p = add p 1
+end
+ret done
+end
+
+fn ikTokLoad path view uchar * plen ulong to bool
+ikTokInitRev
+for i ulong IK_VOCAB_MAX
+put ikTokLen i 0
+put ikTokOff i 0
+end
+put ikTokPoolPos 0 0
+if not ikTokReadFile path plen
+ret false
+end
+done = get ikTokFileLen 0
+p = ikTokFindVocab done
+if ge p done
+ret false
+end
+sp = new ulong 2 0
+num = new ulong 2 0
+while lt p done bound 33554432
+c = ikTokB p
+if eq c 125
+break
+end
+if eq c 34
+p = ikTokReadStr add p 1 done false sp
+p = ikTokParseU64 p done num
+tid = get num 0
+if lt tid IK_VOCAB_MAX
+put ikTokOff tid uint get sp 0
+put ikTokLen tid ushort get sp 1
+end
+else
+p = add p 1
+end
+end
+ret true
+end
+
+fn ikTokPrint tid ulong to void
+if ge tid IK_VOCAB_MAX
+ret
+end
+l = ulong get ikTokLen tid
+if eq l 0
+ret
+end
+off = ulong get ikTokOff tid
+w = write 1 ikTokPool off l
+end
+
+fn ikTokMatchAt txt view uchar * pos ulong o ulong tl ulong to bool
+for j ulong tl bound 24
+if ne get ikTokPool add o j get txt add pos j
+ret false
+end
+end
+ret true
+end
+
+fn ikTokBestAt txt view uchar * pos ulong maxTry ulong res edit ulong 2 to void
+bestId = ulong 0
+bestLen = ulong 0
+c0 = get txt pos
+for tid ulong 199998
+tl = ulong get ikTokLen tid
+if and gt tl bestLen le tl maxTry
+o = ulong get ikTokOff tid
+if eq get ikTokPool o c0
+if ikTokMatchAt txt pos o tl
+bestId = tid
+bestLen = tl
+if eq bestLen maxTry
+break
+end
+end
+end
+end
+end
+put res 0 bestId
+put res 1 bestLen
+end
+
+note Greedy longest-match encoder over loaded ByteLevel vocab (works for any ASCII/UTF-8 prompt).
+fn ikTokEncode txt view uchar * tlen ulong outIds edit uint 1024 to ulong
+res = new ulong 2 0
+cnt = ulong 0
+pos = ulong 0
+while and lt pos tlen lt cnt 1024 bound 4096
+maxTry = sub tlen pos
+if gt maxTry 24
+maxTry = ulong 24
+end
+ikTokBestAt txt pos maxTry res
+bestLen = get res 1
+if eq bestLen 0
+bestLen = ulong 1
+end
+put outIds cnt uint get res 0
+cnt = add cnt 1
+pos = add pos bestLen
+end
+ret cnt
+end

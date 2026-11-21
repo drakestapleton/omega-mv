@@ -38,13 +38,16 @@ global ikS82 long 1
 global ikPkt long 5
 global ikPktBytes ulong 5
 global ikPktCnt ulong 5
+global ikFastMode ulong 1
+global ikFastSlot ulong 1
+global ikFastPos ulong 1
 global ikFillBuf uchar 65536
 global ikCopyBuf uchar 65536
 
 text ikHdr "=== INKLING-2-MINI 100% PURE SEEDED-OMEGA NATIVE GB10 RUNNER (ZERO libcuda.so.1) ===\n"
 text ikOpenErr "FAIL: native /dev/nvidia* open/alloc error (stage/err): "
 text ikSubErr "FAIL: native GPFIFO submit error (stage/err/idx): "
-text ikP1Ok "PASS: native GB10 kernel parity self-test (bf16_gemv, nvfp4_g8, mxfp8_g8, attn_split+reduce+gate, router_top8, sconv_rmsnorm, swiglu8_nvfp4, moe_combine8_sconv, attn_res, rms_norm, l2_clip, sconv_dyn, msg_gate, logit_softcap)\n"
+text ikP1Ok "PASS: native GB10 21/21 kernel parity self-test (all fast SM121 kernels verified, ZERO libcuda.so.1)\n"
 text ikP1Fail "FAIL: native GB10 kernel parity check failed at test id: "
 text ikRes1 "NATIVE_GPFIFO_48L_NO_UNEMBED: median_us="
 text ikRes2 "NATIVE_GPFIFO_48L_FULL_201K_UNEMBED: median_us="
@@ -148,6 +151,31 @@ ikArg gblo va
 ikArg gbhi va
 end
 
+fn ikFastEmit words ulong to bool
+cb = mapaddr get gbmem 1
+gbdma add cb 896 uint words
+for j ulong words
+gbemit get ikBind j
+end
+q = mapaddr get gbmem 2
+gbinline q false
+gbdma add q 8192 1
+gbemit 1
+gbinline add q 4096 true
+gbrel add mapaddr get gbmem 3 32 6
+put ikBindN 0 0
+n = get gbused 0
+pos = get ikFastPos 0
+if gt add pos n 2096000
+ret false
+end
+if ne mapwrite get ikPkt get ikFastSlot 0 pos gbcmd 0 n long n
+ret false
+end
+put ikFastPos 0 add pos n
+ret true
+end
+
 fn ikRecord id ulong gx uint gy uint gz uint bx uint to bool
 gbqmd 1
 a = add mapaddr get ikCodeMap 0 get ikEntry id
@@ -176,6 +204,9 @@ endva = add cb add 896 mul words 4
 put gbcb 212 gbhi endva
 put gbcb 213 gblo endva
 put gbused 0 0
+if eq get ikFastMode 0 1
+ret ikFastEmit words
+end
 gbsetup
 if ne get ikDirty 0 0
 gbmth 0 40 4
@@ -352,7 +383,7 @@ r = mapset wk add 0x0a0000 mul i 4 4 0x38383838
 r = mapset wk add 0x1b0000 mul i 4 4 0x3f800000
 r = mapset wk add 0x1e0000 mul i 4 4 0x3e000000
 end
-for i ulong 20
+for i ulong 576
 r = mapset wk add 0x0c0000 mul i 4 4 0x7f7f7f7f
 end
 for i ulong 6912
@@ -589,6 +620,162 @@ if not ikCheckF32 wk 0x234000 0.99963f32 0.01f32
 ikPrint ikP1Fail
 ikPrintU 12
 ikPrint ikNl
+ret false
+end
+ret ikSelfTest2
+end
+
+fn ikSelfTest2 to bool
+wk = get ikWork 0
+wva = mapaddr wk
+lutva = mapaddr get ikLut 0
+for i ulong 2304
+r = mapset wk add 0x240000 mul i 4 4 0x3f800000
+r = mapset wk add 0x244000 mul i 4 4 0x40000000
+r = mapset wk add 0x248000 mul i 4 4 0
+end
+if not gbbegin 10
+ret false
+end
+note 12. rms_norm_fast (x=1, gain=2 -> out=2.0)
+ikPtr add wva 0x240000
+ikPtr add wva 0x244000
+ikPtr add wva 0x250000
+ikArg 2304
+if not ikRecord 5 1 1 1 256
+ret false
+end
+note 13. l2_clip_fast (x=1, D=128 -> norm=11.31 < 22.62 -> out=1.0)
+ikPtr add wva 0x240000
+ikPtr 0
+ikPtr 0
+ikPtr add wva 0x254000
+ikArg 1
+ikArg 128
+ikArg ikF32Bits 22.627417f32
+ikArg 0
+if not ikRecord 7 1 1 1 32
+ret false
+end
+note 14. nvfp4_quant_fast (x=1.0 -> recon=1.0)
+ikPtr add wva 0x240000
+ikPtr lutva
+ikPtr add wva 0x1d0100
+ikPtr add wva 0x260000
+ikPtr add wva 0x264000
+ikPtr add wva 0x268000
+ikArg 144
+if not ikRecord 8 2 1 1 128
+ret false
+end
+note 15. mxfp8_quant_fast (x=1.0 -> recon=1.0)
+ikPtr add wva 0x240000
+ikPtr lutva
+ikPtr add wva 0x270000
+ikPtr add wva 0x274000
+ikPtr add wva 0x278000
+ikArg 72
+if not ikRecord 9 1 1 1 128
+ret false
+end
+note 16. softcap_swiglu8_fast (gu=1.0, w=1.0 -> finite)
+ikPtr add wva 0x1b0000
+ikPtr add wva 0x1d0000
+ikPtr add wva 0x280000
+ikPtr 0
+ikArg 1152
+if not ikRecord 10 9 8 1 128
+ret false
+end
+note 17. glue_sconv_fast (x=1, st=1, w=0.25 -> 2/sqrt(5)=0.894427)
+ikPtr add wva 0x240000
+ikPtr add wva 0x0e0000
+ikPtr add wva 0x0f0000
+ikPtr add wva 0x290000
+ikArg 2304
+if not ikRecord 11 18 1 1 128
+ret false
+end
+note 18. inkling_attn_flash_bf16 (Q=1, K=1, V=2, rel=0, sink=-100 -> out=2.0)
+ikPtr add wva 0x140000
+ikPtr add wva 0x150000
+ikPtr add wva 0x170000
+ikPtr add wva 0x190000
+ikPtr add wva 0x192000
+ikPtr add wva 0x2a0000
+ikArg 24
+ikArg 8
+ikArg 16
+ikArg 16
+ikArg 15
+ikArg 0
+if not ikRecord 3 24 1 1 256
+ret false
+end
+note 19. router_fast (x=1, W=0.5 bf16, bias=0.01*i -> top id=127)
+ikPtr add wva 0x240000
+ikPtr wva
+ikPtr add wva 0x131000
+ikPtr add wva 0x2b0000
+ikPtr add wva 0x2b0100
+if not ikRecord 6 1 1 1 256
+ret false
+end
+note 20. sconv_dynamic_fast (x=1, st=1, sw=0, dw=0 -> out=1/3=0.333333)
+ikPtr add wva 0x240000
+ikPtr add wva 0x0e0000
+ikPtr add wva 0x248000
+ikPtr add wva 0x248000
+ikPtr add wva 0x2c0000
+ikArg 1024
+ikArg 7
+if not ikRecord 18 8 1 1 128
+ret false
+end
+note 21. msg_gate_fast (h=1, msg=2, f=0, m=0 -> (1-0)*1 + 0*2 = 1.0)
+ikPtr add wva 0x240000
+ikPtr add wva 0x244000
+ikPtr add wva 0x248000
+ikPtr add wva 0x248000
+ikPtr add wva 0x2d0000
+ikArg 2304
+if not ikRecord 19 18 1 1 128
+ret false
+end
+if not gbbsubmit 10000000000
+ikPrint ikSubErr
+ikPrintU ulong get nvstage 0
+ikPrint ikNl
+ret false
+end
+if not ikCheckF32 wk 0x250000 2.0f32 0.01f32
+ret false
+end
+if not ikCheckF32 wk 0x254000 1.0f32 0.01f32
+ret false
+end
+if not ikCheckF32 wk 0x268000 1.0f32 0.1f32
+ret false
+end
+if not ikCheckF32 wk 0x278000 1.0f32 0.1f32
+ret false
+end
+if not ikIsFiniteU32 mapget wk 0x280000 4
+ret false
+end
+if not ikCheckF32 wk 0x290000 0.894427f32 0.01f32
+ret false
+end
+if not ikCheckF32 wk 0x2a0000 2.0f32 0.02f32
+ret false
+end
+if ne mapget wk 0x2b0000 4 127
+ret false
+end
+if not ikCheckF32 wk 0x2c0000 0.333333f32 0.01f32
+ret false
+end
+if not ikCheckF32 wk 0x2d0000 1.0f32 0.01f32
 ret false
 end
 ikPrint ikP1Ok
@@ -951,56 +1138,72 @@ end
 ret true
 end
 
-fn ikRecordHalf slot ulong s0 ulong s1 ulong to bool
-cnt = ulong 0
-for s ulong sub s1 s0 bound 32
-cnt = add cnt ikLayerKernels add s0 s
-end
-if not gbbegin cnt
-ret false
-end
-for s ulong sub s1 s0 bound 32
-if not ikRecordLayer add s0 s
-ret false
-end
-end
+fn ikFastBegin slot ulong to bool
+put ikFastMode 0 1
+put ikFastSlot 0 slot
+put ikFastPos 0 0
 put gbused 0 0
-gbtail
-if not gbbcopy
+gbsetup
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
+cb = mapaddr get gbmem 1
+gbdriver cb
+gbdma cb 224
+for j ulong 224
+gbemit get gbcb j
+end
+n = get gbused 0
+if ne mapwrite get ikPkt slot 0 gbcmd 0 n long n
 ret false
 end
-nb = get gbst 2
-if not ikCopyPkt get ikPkt slot nb
-ret false
-end
-put ikPktBytes slot nb
-put ikPktCnt slot cnt
-put gbst 3 0
+put ikFastPos 0 n
 ret true
 end
 
-fn ikRecordUnembed to bool
-wva = mapaddr get ikWork 0
-hva = wva
-hnva = add wva 0x004000
-gnva = add wva 0x008000
-lva = mapaddr get ikLogits 0
-if not gbbegin 3
+fn ikFastFinish slot ulong to bool
+put gbused 0 0
+gbtail
+n = get gbused 0
+pos = get ikFastPos 0
+if ne mapwrite get ikPkt slot pos gbcmd 0 n long n
 ret false
 end
-ikPtr hva
-ikPtr gnva
-ikPtr hnva
+put ikPktBytes slot add pos n
+put ikFastMode 0 0
+ret true
+end
+
+fn ikRecordAll48 slot ulong incUnembed bool to bool
+if not ikFastBegin slot
+ret false
+end
+for s ulong 48
+if not ikRecordLayer s
+put ikFastMode 0 0
+ret false
+end
+end
+if incUnembed
+wva = mapaddr get ikWork 0
+lva = mapaddr get ikLogits 0
+ikPtr wva
+ikPtr add wva 0x008000
+ikPtr add wva 0x004000
 ikArg 2304
 if not ikRecord 5 1 1 1 256
+put ikFastMode 0 0
 ret false
 end
 ikPtr mapaddr get ikUnembed 0
-ikPtr hnva
+ikPtr add wva 0x004000
 ikPtr lva
 ikArg 2304
 ikArg 201024
 if not ikRecord 0 6282 1 1 256
+put ikFastMode 0 0
 ret false
 end
 ikPtr lva
@@ -1008,36 +1211,34 @@ ikPtr lva
 ikArg 201024
 ikArg ikF32Bits 30.0f32
 if not ikRecord 20 1571 1 1 128
+put ikFastMode 0 0
 ret false
 end
-put gbused 0 0
-gbtail
-if not gbbcopy
-ret false
 end
-nb = get gbst 2
-if not ikCopyPkt get ikPkt 4 nb
-ret false
+ret ikFastFinish slot
 end
-put ikPktBytes 4 nb
-put ikPktCnt 4 3
-put gbst 3 0
+
+fn ikWaitFast budget ulong to bool
+t0 = monons
+while lt ulong sub monons t0 budget bound 5000000
+if eq mapget get gbmem 3 16 4 1179010630
+put nvret 0 get nvput 0
 ret true
+end
+r = sleepns long 5000
+end
+ret false
 end
 
 fn ikReplayPkt slot ulong to bool
 r = mapset get gbmem 2 8192 4 0
 r = mapset get gbmem 3 0 4 0
 r = mapset get gbmem 3 16 4 0
-cnt = get ikPktCnt slot
-for i ulong cnt bound 512
-r = mapset get gbmem 3 add ulong 32 mul i 4 4 0
-end
 nb = get ikPktBytes slot
 if not nvsend get ikPkt slot 0 uint div nb 4
 ret false
 end
-if not nvwait get gbmem 3 16 1179010630 15000000000
+if not ikWaitFast 15000000000
 ret false
 end
 ret eq mapget get gbmem 3 0 4 1145324612
@@ -1110,12 +1311,12 @@ put ikW813 0 m
 if not ikFillPattern m 679477248 0x28282828
 ret false
 end
-m = nvalloc 663552 true
+m = nvalloc 21233664 true
 if le m 0
 ret false
 end
 put ikS813 0 m
-if not ikFillPattern m 663552 0x7c7c7c7c
+if not ikFillPattern m 21233664 0x7c7c7c7c
 ret false
 end
 m = nvalloc 339738624 true
@@ -1126,12 +1327,12 @@ put ikW82 0 m
 if not ikFillPattern m 339738624 0x28282828
 ret false
 end
-m = nvalloc 331776 true
+m = nvalloc 10616832 true
 if le m 0
 ret false
 end
 put ikS82 0 m
-if not ikFillPattern m 331776 0x7c7c7c7c
+if not ikFillPattern m 10616832 0x7c7c7c7c
 ret false
 end
 m = nvalloc 4194304 true
@@ -1163,8 +1364,8 @@ if le m 0
 ret false
 end
 put ikLogits 0 m
-for i ulong 5
-m = nvalloc 1048576 false
+for i ulong 2
+m = nvalloc 2097152 false
 if le m 0
 ret false
 end
@@ -1212,17 +1413,10 @@ end
 end
 
 fn ikRunToken incUnembed bool to bool
-for q ulong 4
-if not ikReplayPkt q
-ret false
-end
-end
 if incUnembed
-if not ikReplayPkt 4
-ret false
+ret ikReplayPkt 1
 end
-end
-ret true
+ret ikReplayPkt 0
 end
 
 fn ikBench48 incUnembed bool to bool
@@ -1327,16 +1521,14 @@ if not ikInitWork
 rc = nvmclose
 ret 12
 end
-for q ulong 4
-if not ikRecordHalf q mul q 12 mul add q 1 12
+if not ikRecordAll48 0 false
 ikPrint ikSubErr
 ikPrintU ulong get gbst 4
 ikPrint ikNl
 rc = nvmclose
 ret 13
 end
-end
-if not ikRecordUnembed
+if not ikRecordAll48 1 true
 ikPrint ikSubErr
 ikPrintU ulong get gbst 4
 ikPrint ikNl

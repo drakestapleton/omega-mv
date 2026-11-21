@@ -35,6 +35,19 @@ seed/out/omc < "$tmp/check-arboris-input.om" > "$tmp/check-arboris"
     om/gpu/inkling2/native_run.om
 ) > "$tmp/native-input.om"
 seed/out/omc < "$tmp/native-input.om" > "$tmp/inkling2-native"
-chmod +x "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native"
-mv "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$out"
+( echo om2
+  cat gpu/nvidia/native/nvrm/context.om \
+    gpu/nvidia/native/blackwell/vector.om \
+    gpu/nvidia/native/blackwell/launch.om \
+    gpu/nvidia/native/blackwell/batch.om \
+    om/encoder/bw_enc_sm121.om \
+    om/gpu/inkling2/emit_fast.om \
+    om/gpu/inkling2/arboris/prefetch.om \
+    om/gpu/inkling2/decoder/safetensors.om \
+    om/gpu/inkling2/decoder/tokenizer.om \
+    om/gpu/inkling2/decoder/decode.om
+) > "$tmp/decode-input.om"
+seed/out/omc < "$tmp/decode-input.om" > "$tmp/inkling2-decode"
+chmod +x "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$tmp/inkling2-decode"
+mv "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$tmp/inkling2-decode" "$out"
 mv "$tmp"/*.cubin "$tmp/decode.f32le" "$out"
