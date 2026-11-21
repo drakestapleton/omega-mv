@@ -14,95 +14,86 @@
  * limitations under the License.
  */
 
+/* Canonical object encoding and SemanticId operations backed by pure seeded OM-2
+ * (om/visor/canonical_om2.om and om/sha256/sha256-om2.om). */
 #include "omega_canonical.h"
+#include "omega_native.h"
 #include "sha256.h"
 #include <string.h>
-#include <stdio.h>
 #include <stdlib.h>
 
-static void write_u16_be(uint8_t *p, uint16_t v) {
-    p[0] = (uint8_t)((v >> 8) & 0xff);
-    p[1] = (uint8_t)(v & 0xff);
-}
-
-static void write_u32_be(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)((v >> 24) & 0xff);
-    p[1] = (uint8_t)((v >> 16) & 0xff);
-    p[2] = (uint8_t)((v >> 8) & 0xff);
-    p[3] = (uint8_t)(v & 0xff);
-}
-
 int omega_compare_semantic_id(const SemanticId *a, const SemanticId *b) {
-    return memcmp(a->bytes, b->bytes, OMEGA_ID_BYTES);
+    uint64_t r = 0;
+    if (omega2_om_canon_cmp_id(&r, a->bytes, OMEGA_ID_BYTES, b->bytes, OMEGA_ID_BYTES) != OMEGA_OK) abort();
+    return (int)(int64_t)r;
 }
 
 void omega_hex_semantic_id(const SemanticId *id, char out_hex[65]) {
-    static const char hex[] = "0123456789abcdef";
-    for (int i = 0; i < OMEGA_ID_BYTES; ++i) {
-        out_hex[i * 2]     = hex[(id->bytes[i] >> 4) & 0x0f];
-        out_hex[i * 2 + 1] = hex[id->bytes[i] & 0x0f];
-    }
-    out_hex[64] = '\0';
+    uint64_t unused = 0;
+    if (omega2_om_canon_hex_id(&unused, id->bytes, OMEGA_ID_BYTES, (uint8_t *)out_hex, 65) != OMEGA_OK) abort();
 }
 
 int omega_parse_hex_semantic_id(const char *hex, SemanticId *out_id) {
-    if (!hex || strlen(hex) != 64) return -1;
-    for (int i = 0; i < 32; ++i) {
-        char buf[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
-        char *end = NULL;
-        long val = strtol(buf, &end, 16);
-        if (end != buf + 2) return -1;
-        out_id->bytes[i] = (uint8_t)val;
-    }
-    return 0;
+    if (!hex || !out_id) return -1;
+    size_t n = strlen(hex);
+    if (n != 64) return -1;
+    uint64_t r = 0;
+    if (omega2_om_canon_parse_hex(&r, (const uint8_t *)hex, n, n, out_id->bytes, OMEGA_ID_BYTES) != OMEGA_OK) abort();
+    return (int)(int64_t)r;
 }
 
 uint8_t omega_canonical_object_version(uint8_t kind) {
-    return kind == KIND_EFFECT ? OMEGA_EFFECT_VERSION : OMEGA_VERSION;
+    uint64_t r = 0;
+    if (omega2_om_canon_obj_ver(&r, (uint64_t)kind) != OMEGA_OK) abort();
+    return (uint8_t)r;
 }
 
 int omega_canonical_check_header(uint8_t version, uint8_t kind) {
-    if (kind == KIND_EFFECT && version == OMEGA_VERSION) return OMEGA_CANON_ERR_EFFECT_V1;
-    if (version != omega_canonical_object_version(kind)) return OMEGA_CANON_ERR_VERSION;
-    return OMEGA_CANON_OK;
+    uint64_t r = 0;
+    if (omega2_om_canon_chk_hdr(&r, (uint64_t)version, (uint64_t)kind) != OMEGA_OK) abort();
+    return (int)(int64_t)r;
+}
+
+static int put_u16_be(uint8_t *buf, size_t *pos, size_t max_len, uint16_t v) {
+    uint64_t r = 0;
+    if (omega2_om_canon_write_u16be(&r, (uint64_t)v, buf, max_len, *pos, max_len) != OMEGA_OK) abort();
+    int64_t np = (int64_t)r;
+    if (np < 0) return -1;
+    *pos = (size_t)np;
+    return 0;
+}
+
+static int put_u32_be(uint8_t *buf, size_t *pos, size_t max_len, uint32_t v) {
+    uint64_t r = 0;
+    if (omega2_om_canon_write_u32be(&r, (uint64_t)v, buf, max_len, *pos, max_len) != OMEGA_OK) abort();
+    int64_t np = (int64_t)r;
+    if (np < 0) return -1;
+    *pos = (size_t)np;
+    return 0;
 }
 
 int omega_canonical_encode(const OmegaObject *obj, uint8_t *out_buf, size_t max_len, size_t *out_len) {
-    if (!obj || !out_buf || !out_len) return -1;
+    if (!obj || !out_buf || !out_len || max_len == 0) return -1;
 
-    size_t pos = 0;
+    uint64_t r = 0;
+    if (omega2_om_canon_write_hdr(&r, (uint64_t)obj->kind, out_buf, max_len, max_len) != OMEGA_OK) abort();
+    if ((int64_t)r < 0) return -1;
+    size_t pos = (size_t)r;
 
-    /* 1. Header: magic "OMG0" (0x4F, 0x4D, 0x47, 0x30), object encoding
-     *    version of the kind (0x02 effect, 0x01 otherwise), kind */
-    if (pos + 6 > max_len) return -1;
-    out_buf[pos++] = 0x4F;
-    out_buf[pos++] = 0x4D;
-    out_buf[pos++] = 0x47;
-    out_buf[pos++] = 0x30;
-    out_buf[pos++] = omega_canonical_object_version((uint8_t)obj->kind);
-    out_buf[pos++] = (uint8_t)obj->kind;
-
-    /* 2. Attributes (sorted by key ascending) */
-    uint16_t attr_indices[OMEGA_MAX_ATTRIBUTES];
+    /* 2. Attributes (canonical sort in OM-2) */
     uint16_t n_attrs = obj->attr_count;
     if (n_attrs > OMEGA_MAX_ATTRIBUTES) return -1;
-    for (uint16_t i = 0; i < n_attrs; ++i) attr_indices[i] = i;
-
-    /* Insertion sort for stable canonical attribute order */
-    for (uint16_t i = 1; i < n_attrs; ++i) {
-        uint16_t key_idx = attr_indices[i];
-        int j = i - 1;
-        while (j >= 0 && strcmp(obj->attributes[attr_indices[j]].key, obj->attributes[key_idx].key) > 0) {
-            attr_indices[j + 1] = attr_indices[j];
-            j--;
+    uint16_t attr_indices[OMEGA_MAX_ATTRIBUTES] = {0};
+    if (n_attrs > 0) {
+        uint8_t keys[OMEGA_MAX_ATTRIBUTES * OMEGA_MAX_KEY_LEN];
+        memset(keys, 0, sizeof(keys));
+        for (uint16_t i = 0; i < n_attrs; ++i) {
+            memcpy(&keys[i * OMEGA_MAX_KEY_LEN], obj->attributes[i].key, OMEGA_MAX_KEY_LEN);
         }
-        attr_indices[j + 1] = key_idx;
+        if (omega2_om_canon_sort_attr(&r, keys, sizeof(keys), n_attrs, attr_indices, OMEGA_MAX_ATTRIBUTES) != OMEGA_OK) abort();
+        if ((int64_t)r != 0) return -1;
     }
-
-    if (pos + 2 > max_len) return -1;
-    write_u16_be(&out_buf[pos], n_attrs);
-    pos += 2;
-
+    if (put_u16_be(out_buf, &pos, max_len, n_attrs) != 0) return -1;
     for (uint16_t i = 0; i < n_attrs; ++i) {
         const OmegaAttribute *attr = &obj->attributes[attr_indices[i]];
         size_t klen = strlen(attr->key);
@@ -111,88 +102,60 @@ int omega_canonical_encode(const OmegaObject *obj, uint8_t *out_buf, size_t max_
         out_buf[pos++] = (uint8_t)klen;
         memcpy(&out_buf[pos], attr->key, klen);
         pos += klen;
-        write_u16_be(&out_buf[pos], attr->val_len);
-        pos += 2;
+        if (put_u16_be(out_buf, &pos, max_len, attr->val_len) != 0) return -1;
         if (attr->val_len > 0) {
             memcpy(&out_buf[pos], attr->value, attr->val_len);
             pos += attr->val_len;
         }
     }
 
-    /* 3. Relations (sorted primarily by kind, secondarily by target_id) */
-    uint16_t rel_indices[OMEGA_MAX_RELATIONS];
+    /* 3. Relations (canonical sort in OM-2) */
     uint16_t n_rels = obj->rel_count;
     if (n_rels > OMEGA_MAX_RELATIONS) return -1;
-    for (uint16_t i = 0; i < n_rels; ++i) rel_indices[i] = i;
-
-    for (uint16_t i = 1; i < n_rels; ++i) {
-        uint16_t cur = rel_indices[i];
-        int j = i - 1;
-        while (j >= 0) {
-            const OmegaRelation *ra = &obj->relations[rel_indices[j]];
-            const OmegaRelation *rb = &obj->relations[cur];
-            int cmp = (int)ra->kind - (int)rb->kind;
-            if (cmp == 0) {
-                cmp = memcmp(ra->target_id.bytes, rb->target_id.bytes, OMEGA_ID_BYTES);
-            }
-            if (cmp <= 0) break;
-            rel_indices[j + 1] = rel_indices[j];
-            j--;
+    uint16_t rel_indices[OMEGA_MAX_RELATIONS] = {0};
+    if (n_rels > 0) {
+        uint16_t rkinds[OMEGA_MAX_RELATIONS] = {0};
+        uint8_t rtgts[OMEGA_MAX_RELATIONS * OMEGA_ID_BYTES];
+        memset(rtgts, 0, sizeof(rtgts));
+        for (uint16_t i = 0; i < n_rels; ++i) {
+            rkinds[i] = obj->relations[i].kind;
+            memcpy(&rtgts[i * OMEGA_ID_BYTES], obj->relations[i].target_id.bytes, OMEGA_ID_BYTES);
         }
-        rel_indices[j + 1] = cur;
+        if (omega2_om_canon_sort_rel(&r, rkinds, OMEGA_MAX_RELATIONS, rtgts, sizeof(rtgts), n_rels, rel_indices, OMEGA_MAX_RELATIONS) != OMEGA_OK) abort();
+        if ((int64_t)r != 0) return -1;
     }
-
-    if (pos + 2 > max_len) return -1;
-    write_u16_be(&out_buf[pos], n_rels);
-    pos += 2;
-
+    if (put_u16_be(out_buf, &pos, max_len, n_rels) != 0) return -1;
     for (uint16_t i = 0; i < n_rels; ++i) {
         const OmegaRelation *rel = &obj->relations[rel_indices[i]];
         if (pos + 2 + OMEGA_ID_BYTES > max_len) return -1;
-        write_u16_be(&out_buf[pos], rel->kind);
-        pos += 2;
+        if (put_u16_be(out_buf, &pos, max_len, rel->kind) != 0) return -1;
         memcpy(&out_buf[pos], rel->target_id.bytes, OMEGA_ID_BYTES);
         pos += OMEGA_ID_BYTES;
     }
 
-    /* 4. Constraints (sorted primarily by kind, secondarily by payload) */
-    uint16_t const_indices[OMEGA_MAX_CONSTRAINTS];
+    /* 4. Constraints (canonical sort in OM-2) */
     uint16_t n_consts = obj->const_count;
     if (n_consts > OMEGA_MAX_CONSTRAINTS) return -1;
-    for (uint16_t i = 0; i < n_consts; ++i) const_indices[i] = i;
-
-    for (uint16_t i = 1; i < n_consts; ++i) {
-        uint16_t cur = const_indices[i];
-        int j = i - 1;
-        while (j >= 0) {
-            const OmegaConstraint *ca = &obj->constraints[const_indices[j]];
-            const OmegaConstraint *cb = &obj->constraints[cur];
-            int cmp = (int)ca->kind - (int)cb->kind;
-            if (cmp == 0) {
-                uint16_t min_len = ca->payload_len < cb->payload_len ? ca->payload_len : cb->payload_len;
-                cmp = memcmp(ca->payload, cb->payload, min_len);
-                if (cmp == 0) {
-                    cmp = (int)ca->payload_len - (int)cb->payload_len;
-                }
-            }
-            if (cmp <= 0) break;
-            const_indices[j + 1] = const_indices[j];
-            j--;
+    uint16_t const_indices[OMEGA_MAX_CONSTRAINTS] = {0};
+    if (n_consts > 0) {
+        uint16_t cmeta[OMEGA_MAX_CONSTRAINTS * 2] = {0};
+        uint8_t cpays[OMEGA_MAX_CONSTRAINTS * 128];
+        memset(cpays, 0, sizeof(cpays));
+        for (uint16_t i = 0; i < n_consts; ++i) {
+            cmeta[i * 2] = obj->constraints[i].kind;
+            cmeta[i * 2 + 1] = obj->constraints[i].payload_len;
+            uint16_t cl = obj->constraints[i].payload_len <= 128 ? obj->constraints[i].payload_len : 128;
+            if (cl > 0) memcpy(&cpays[i * 128], obj->constraints[i].payload, cl);
         }
-        const_indices[j + 1] = cur;
+        if (omega2_om_canon_sort_const(&r, cmeta, OMEGA_MAX_CONSTRAINTS * 2, cpays, sizeof(cpays), n_consts, const_indices, OMEGA_MAX_CONSTRAINTS) != OMEGA_OK) abort();
+        if ((int64_t)r != 0) return -1;
     }
-
-    if (pos + 2 > max_len) return -1;
-    write_u16_be(&out_buf[pos], n_consts);
-    pos += 2;
-
+    if (put_u16_be(out_buf, &pos, max_len, n_consts) != 0) return -1;
     for (uint16_t i = 0; i < n_consts; ++i) {
         const OmegaConstraint *c = &obj->constraints[const_indices[i]];
-        if (pos + 2 + 2 + c->payload_len > max_len) return -1;
-        write_u16_be(&out_buf[pos], c->kind);
-        pos += 2;
-        write_u16_be(&out_buf[pos], c->payload_len);
-        pos += 2;
+        if (pos + 4 + c->payload_len > max_len) return -1;
+        if (put_u16_be(out_buf, &pos, max_len, c->kind) != 0) return -1;
+        if (put_u16_be(out_buf, &pos, max_len, c->payload_len) != 0) return -1;
         if (c->payload_len > 0) {
             memcpy(&out_buf[pos], c->payload, c->payload_len);
             pos += c->payload_len;
@@ -201,8 +164,7 @@ int omega_canonical_encode(const OmegaObject *obj, uint8_t *out_buf, size_t max_
 
     /* 5. Payload */
     if (pos + 4 + obj->payload_len > max_len) return -1;
-    write_u32_be(&out_buf[pos], obj->payload_len);
-    pos += 4;
+    if (put_u32_be(out_buf, &pos, max_len, obj->payload_len) != 0) return -1;
     if (obj->payload_len > 0) {
         memcpy(&out_buf[pos], obj->payload, obj->payload_len);
         pos += obj->payload_len;

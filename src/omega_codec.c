@@ -14,49 +14,35 @@
  * limitations under the License.
  */
 
+/* Binary graph codec backed by pure seeded OM-2 (om/visor/codec_om2.om & canonical_om2.om). */
 #include "omega_codec.h"
 #include "omega_canonical.h"
 #include "omega_core.h"
 #include "omega_validate.h"
+#include "omega_native.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 
-static void write_u16_be(uint8_t *p, uint16_t v) {
-    p[0] = (uint8_t)((v >> 8) & 0xff);
-    p[1] = (uint8_t)(v & 0xff);
+static uint16_t rd_u16_be(const uint8_t *buf, size_t buf_len, size_t pos) {
+    uint64_t r = 0;
+    if (omega2_om_codec_u16_rd(&r, buf, buf_len, pos) != OMEGA_OK) abort();
+    return (uint16_t)r;
 }
 
-static uint16_t read_u16_be(const uint8_t *p) {
-    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
-}
-
-static void write_u32_be(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)((v >> 24) & 0xff);
-    p[1] = (uint8_t)((v >> 16) & 0xff);
-    p[2] = (uint8_t)((v >> 8) & 0xff);
-    p[3] = (uint8_t)(v & 0xff);
-}
-
-static uint32_t read_u32_be(const uint8_t *p) {
-    return ((uint32_t)p[0] << 24) |
-           ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8)  |
-           ((uint32_t)p[3]);
+static uint32_t rd_u32_be(const uint8_t *buf, size_t buf_len, size_t pos) {
+    uint64_t r = 0;
+    if (omega2_om_codec_u32_rd(&r, buf, buf_len, pos) != OMEGA_OK) abort();
+    return (uint32_t)r;
 }
 
 int omega_graph_serialize_binary(const OmegaGraph *graph, uint8_t *out_buf, size_t max_len, size_t *out_len) {
-    if (!graph || !out_buf || !out_len) return -1;
-    size_t pos = 0;
-
-    if (pos + 6 > max_len) return -1;
-    out_buf[pos++] = 0x4F; /* 'O' */
-    out_buf[pos++] = 0x4D; /* 'M' */
-    out_buf[pos++] = 0x47; /* 'G' */
-    out_buf[pos++] = 0x47; /* 'G' for Graph */
-    write_u16_be(&out_buf[pos], graph->object_count);
-    pos += 2;
+    if (!graph || !out_buf || !out_len || max_len == 0) return -1;
+    uint64_t r = 0;
+    if (omega2_om_codec_hdr_enc(&r, graph->object_count, out_buf, max_len, max_len) != OMEGA_OK) abort();
+    if ((int64_t)r < 0) return -1;
+    size_t pos = (size_t)r;
 
     for (uint16_t i = 0; i < graph->object_count; ++i) {
         uint8_t cbuf[4096];
@@ -65,8 +51,9 @@ int omega_graph_serialize_binary(const OmegaGraph *graph, uint8_t *out_buf, size
             return -1;
         }
         if (pos + 4 + clen > max_len) return -1;
-        write_u32_be(&out_buf[pos], (uint32_t)clen);
-        pos += 4;
+        if (omega2_om_canon_write_u32be(&r, (uint64_t)clen, out_buf, max_len, pos, max_len) != OMEGA_OK) abort();
+        if ((int64_t)r < 0) return -1;
+        pos = (size_t)r;
         memcpy(&out_buf[pos], cbuf, clen);
         pos += clen;
     }
@@ -77,39 +64,30 @@ int omega_graph_serialize_binary(const OmegaGraph *graph, uint8_t *out_buf, size
 
 int omega_graph_deserialize_binary(const uint8_t *in_buf, size_t in_len, OmegaGraph *out_graph) {
     if (!in_buf || !out_graph || in_len < 6) return -1;
-    size_t pos = 0;
-
-    if (in_buf[0] != 0x4F || in_buf[1] != 0x4D || in_buf[2] != 0x47 || in_buf[3] != 0x47) {
-        return -1;
-    }
-    pos += 4;
-    uint16_t count = read_u16_be(&in_buf[pos]);
-    pos += 2;
-    if (count > OMEGA_MAX_GRAPH_OBJECTS) return -1;
+    uint64_t r = 0;
+    if (omega2_om_codec_hdr_dec(&r, in_buf, in_len, in_len, OMEGA_MAX_GRAPH_OBJECTS) != OMEGA_OK) abort();
+    if ((int64_t)r < 0) return -1;
+    uint16_t count = (uint16_t)r;
+    size_t pos = 6;
 
     memset(out_graph, 0, sizeof(OmegaGraph));
 
     for (uint16_t i = 0; i < count; ++i) {
         if (pos + 4 > in_len) return -1;
-        uint32_t clen = read_u32_be(&in_buf[pos]);
+        uint32_t clen = rd_u32_be(in_buf, in_len, pos);
         pos += 4;
         if (pos + clen > in_len || clen < 6) return -1;
 
-        const uint8_t *cbuf = &in_buf[pos];
-        if (cbuf[0] != 0x4F || cbuf[1] != 0x4D || cbuf[2] != 0x47 || cbuf[3] != 0x30) {
-            return -1;
-        }
-        /* Per-kind object version: a v1 effect (32-bit generation) is refused,
-         * never reinterpreted; a v2 non-effect is refused (spec/effect-cap64-migration.md). */
-        if (omega_canonical_check_header(cbuf[4], cbuf[5]) != OMEGA_CANON_OK) return -1;
+        if (omega2_om_codec_obj_hdr_chk(&r, in_buf, in_len, pos, clen) != OMEGA_OK) abort();
+        if ((int64_t)r < 0) return -1;
 
+        const uint8_t *cbuf = &in_buf[pos];
         OmegaObject *obj = &out_graph->objects[out_graph->object_count++];
-        obj->kind = (SemanticKind)cbuf[5];
+        obj->kind = (SemanticKind)r;
         size_t cpos = 6;
 
-        /* Attributes */
         if (cpos + 2 > clen) return -1;
-        obj->attr_count = read_u16_be(&cbuf[cpos]);
+        obj->attr_count = rd_u16_be(cbuf, clen, cpos);
         cpos += 2;
         if (obj->attr_count > OMEGA_MAX_ATTRIBUTES) return -1;
         for (uint16_t a = 0; a < obj->attr_count; ++a) {
@@ -120,7 +98,7 @@ int omega_graph_deserialize_binary(const uint8_t *in_buf, size_t in_len, OmegaGr
             memcpy(obj->attributes[a].key, &cbuf[cpos], klen);
             obj->attributes[a].key[klen] = '\0';
             cpos += klen;
-            obj->attributes[a].val_len = read_u16_be(&cbuf[cpos]);
+            obj->attributes[a].val_len = rd_u16_be(cbuf, clen, cpos);
             cpos += 2;
             if (obj->attributes[a].val_len > OMEGA_MAX_VAL_LEN) return -1;
             if (cpos + obj->attributes[a].val_len > clen) return -1;
@@ -128,29 +106,27 @@ int omega_graph_deserialize_binary(const uint8_t *in_buf, size_t in_len, OmegaGr
             cpos += obj->attributes[a].val_len;
         }
 
-        /* Relations */
         if (cpos + 2 > clen) return -1;
-        obj->rel_count = read_u16_be(&cbuf[cpos]);
+        obj->rel_count = rd_u16_be(cbuf, clen, cpos);
         cpos += 2;
         if (obj->rel_count > OMEGA_MAX_RELATIONS) return -1;
-        for (uint16_t r = 0; r < obj->rel_count; ++r) {
+        for (uint16_t ri = 0; ri < obj->rel_count; ++ri) {
             if (cpos + 2 + OMEGA_ID_BYTES > clen) return -1;
-            obj->relations[r].kind = read_u16_be(&cbuf[cpos]);
+            obj->relations[ri].kind = rd_u16_be(cbuf, clen, cpos);
             cpos += 2;
-            memcpy(obj->relations[r].target_id.bytes, &cbuf[cpos], OMEGA_ID_BYTES);
+            memcpy(obj->relations[ri].target_id.bytes, &cbuf[cpos], OMEGA_ID_BYTES);
             cpos += OMEGA_ID_BYTES;
         }
 
-        /* Constraints */
         if (cpos + 2 > clen) return -1;
-        obj->const_count = read_u16_be(&cbuf[cpos]);
+        obj->const_count = rd_u16_be(cbuf, clen, cpos);
         cpos += 2;
         if (obj->const_count > OMEGA_MAX_CONSTRAINTS) return -1;
         for (uint16_t c = 0; c < obj->const_count; ++c) {
             if (cpos + 4 > clen) return -1;
-            obj->constraints[c].kind = read_u16_be(&cbuf[cpos]);
+            obj->constraints[c].kind = rd_u16_be(cbuf, clen, cpos);
             cpos += 2;
-            obj->constraints[c].payload_len = read_u16_be(&cbuf[cpos]);
+            obj->constraints[c].payload_len = rd_u16_be(cbuf, clen, cpos);
             cpos += 2;
             if (obj->constraints[c].payload_len > sizeof obj->constraints[c].payload) return -1;
             if (cpos + obj->constraints[c].payload_len > clen) return -1;
@@ -158,9 +134,8 @@ int omega_graph_deserialize_binary(const uint8_t *in_buf, size_t in_len, OmegaGr
             cpos += obj->constraints[c].payload_len;
         }
 
-        /* Payload */
         if (cpos + 4 > clen) return -1;
-        obj->payload_len = read_u32_be(&cbuf[cpos]);
+        obj->payload_len = rd_u32_be(cbuf, clen, cpos);
         cpos += 4;
         if (obj->payload_len > OMEGA_MAX_PAYLOAD_LEN) return -1;
         if (cpos + obj->payload_len > clen) return -1;
@@ -240,7 +215,6 @@ int omega_graph_parse_text(const char *in_str, OmegaGraph *out_graph, char *err_
     }
     memset(out_graph, 0, sizeof(OmegaGraph));
 
-    /* Simple robust parser for human text declarations */
     const char *p = in_str;
     OmegaObject *u32_type = NULL;
     OmegaObject *val_a = NULL;
@@ -262,7 +236,6 @@ int omega_graph_parse_text(const char *in_str, OmegaGraph *out_graph, char *err_
             }
             while (*p && *p != '\n') p++;
         } else if (strncmp(p, "val", 3) == 0) {
-            /* Parse integer value */
             const char *eq = strchr(p, '=');
             if (eq && u32_type) {
                 unsigned long v = strtoul(eq + 1, NULL, 0);

@@ -14,11 +14,14 @@
  * limitations under the License.
  */
 
+/* Semantic object and graph validator backed by pure seeded OM-2 (om/visor/validate_om2.om). */
 #include "omega_validate.h"
 #include "omega_core.h"
 #include "omega_canonical.h"
+#include "omega_native.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static const OmegaObject* find_object_by_id(const OmegaGraph *graph, const SemanticId *id) {
     if (!graph || !id) return NULL;
@@ -30,63 +33,18 @@ static const OmegaObject* find_object_by_id(const OmegaGraph *graph, const Seman
     return NULL;
 }
 
-static int check_cycle_dfs(const OmegaGraph *graph, int idx, uint8_t *visited, uint8_t *in_stack, char *err_msg, size_t err_msg_len) {
-    visited[idx] = 1;
-    in_stack[idx] = 1;
-
-    const OmegaObject *obj = &graph->objects[idx];
-
-    /* Check relation targets */
-    for (uint16_t r = 0; r < obj->rel_count; ++r) {
-        const OmegaRelation *rel = &obj->relations[r];
-        for (uint16_t j = 0; j < graph->object_count; ++j) {
-            if (graph->objects[j].has_id && omega_compare_semantic_id(&graph->objects[j].id, &rel->target_id) == 0) {
-                if (!visited[j]) {
-                    if (check_cycle_dfs(graph, j, visited, in_stack, err_msg, err_msg_len) != 0) {
-                        return -1;
-                    }
-                } else if (in_stack[j]) {
-                    snprintf(err_msg, err_msg_len, "Structural cycle detected involving relation target at object index %u", j);
-                    return -1;
-                }
-            }
-        }
-    }
-
-    /* Check apply operand targets if apply */
-    if (obj->kind == KIND_OPERATION && obj->payload_len >= sizeof(ApplyPayload)) {
-        const ApplyPayload *app = (const ApplyPayload*)obj->payload;
-        for (uint8_t op_idx = 0; op_idx < app->operand_count; ++op_idx) {
-            for (uint16_t j = 0; j < graph->object_count; ++j) {
-                if (graph->objects[j].has_id && omega_compare_semantic_id(&graph->objects[j].id, &app->operands[op_idx]) == 0) {
-                    if (!visited[j]) {
-                        if (check_cycle_dfs(graph, j, visited, in_stack, err_msg, err_msg_len) != 0) {
-                            return -1;
-                        }
-                    } else if (in_stack[j]) {
-                        snprintf(err_msg, err_msg_len, "Structural cycle detected involving operand target at object index %u", j);
-                        return -1;
-                    }
-                }
-            }
-        }
-    }
-
-    in_stack[idx] = 0;
-    return 0;
-}
-
 int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char *err_msg, size_t err_msg_len) {
+    uint64_t r = 0;
     if (!obj) {
         snprintf(err_msg, err_msg_len, "Null object pointer");
         return -1;
     }
-    if (obj->kind == KIND_INVALID || obj->kind > KIND_PROOF) {
+    if (omega2_om_val_kind(&r, (uint64_t)obj->kind) != OMEGA_OK) abort();
+    if ((int64_t)r != 0) {
         snprintf(err_msg, err_msg_len, "Invalid semantic kind tag 0x%02x", obj->kind);
         return -1;
     }
 
-    /* Attribute keys must be non-empty and bounded */
     for (uint16_t i = 0; i < obj->attr_count; ++i) {
         if (strlen(obj->attributes[i].key) == 0) {
             snprintf(err_msg, err_msg_len, "Empty attribute key at index %u", i);
@@ -94,9 +52,9 @@ int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char 
         }
     }
 
-    /* Check relation kinds and targets */
     for (uint16_t i = 0; i < obj->rel_count; ++i) {
-        if (obj->relations[i].kind == REL_INVALID || obj->relations[i].kind > REL_EQUIVALENT_TO) {
+        if (omega2_om_val_rel_kind(&r, (uint64_t)obj->relations[i].kind) != OMEGA_OK) abort();
+        if ((int64_t)r != 0) {
             snprintf(err_msg, err_msg_len, "Invalid relation kind 0x%04x at index %u", obj->relations[i].kind, i);
             return -1;
         }
@@ -111,15 +69,14 @@ int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char 
         }
     }
 
-    /* Check constraint kinds */
     for (uint16_t i = 0; i < obj->const_count; ++i) {
-        if (obj->constraints[i].kind == CONST_INVALID || obj->constraints[i].kind > CONST_INVARIANT) {
+        if (omega2_om_val_const_kind(&r, (uint64_t)obj->constraints[i].kind) != OMEGA_OK) abort();
+        if ((int64_t)r != 0) {
             snprintf(err_msg, err_msg_len, "Invalid constraint kind 0x%04x at index %u", obj->constraints[i].kind, i);
             return -1;
         }
     }
 
-    /* Kind-specific validation */
     switch (obj->kind) {
         case KIND_TYPE: {
             if (obj->payload_len < sizeof(TypePayload)) {
@@ -127,41 +84,22 @@ int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char 
                 return -1;
             }
             const TypePayload *tp = (const TypePayload*)obj->payload;
-            if (tp->tag == TYPE_INVALID || tp->tag > TYPE_FP32) {
-                snprintf(err_msg, err_msg_len, "Invalid type tag 0x%02x", tp->tag);
-                return -1;
+            if (omega2_om_val_type_fields(&r, (uint64_t)tp->tag, (uint64_t)tp->width, (uint64_t)tp->length) != OMEGA_OK) abort();
+            switch ((int64_t)r) {
+                case 0: break;
+                case 1: snprintf(err_msg, err_msg_len, "Invalid type tag 0x%02x", tp->tag); return -1;
+                case 2: snprintf(err_msg, err_msg_len, "Unsigned integer width %u out of bounds [1..256]", tp->width); return -1;
+                case 3: snprintf(err_msg, err_msg_len, "Signed integer width %u out of bounds [2..256]", tp->width); return -1;
+                case 4: snprintf(err_msg, err_msg_len, "FP32 width %u is not 32", tp->width); return -1;
+                case 5: snprintf(err_msg, err_msg_len, "Bitvector width %u out of bounds [1..256]", tp->width); return -1;
+                case 6: snprintf(err_msg, err_msg_len, "Sequence length %u exceeds 65535", tp->length); return -1;
+                default: return -1;
             }
-            if (tp->tag == TYPE_UNSIGNED_INT) {
-                if (tp->width < 1 || tp->width > 256) {
-                    snprintf(err_msg, err_msg_len, "Unsigned integer width %u out of bounds [1..256]", tp->width);
+            if (tp->tag == TYPE_SEQUENCE && graph) {
+                const OmegaObject *elem_tp = find_object_by_id(graph, &tp->elem_type);
+                if (!elem_tp || elem_tp->kind != KIND_TYPE) {
+                    snprintf(err_msg, err_msg_len, "Sequence element type unresolved or not KIND_TYPE");
                     return -1;
-                }
-            } else if (tp->tag == TYPE_SIGNED_INT) {
-                if (tp->width < 2 || tp->width > 256) {
-                    snprintf(err_msg, err_msg_len, "Signed integer width %u out of bounds [2..256]", tp->width);
-                    return -1;
-                }
-            } else if (tp->tag == TYPE_FP32) {
-                if (tp->width != 32) {
-                    snprintf(err_msg, err_msg_len, "FP32 width %u is not 32", tp->width);
-                    return -1;
-                }
-            } else if (tp->tag == TYPE_BITVECTOR) {
-                if (tp->width < 1 || tp->width > 256) {
-                    snprintf(err_msg, err_msg_len, "Bitvector width %u out of bounds [1..256]", tp->width);
-                    return -1;
-                }
-            } else if (tp->tag == TYPE_SEQUENCE) {
-                if (tp->length > 65535) {
-                    snprintf(err_msg, err_msg_len, "Sequence length %u exceeds 65535", tp->length);
-                    return -1;
-                }
-                if (graph) {
-                    const OmegaObject *elem_tp = find_object_by_id(graph, &tp->elem_type);
-                    if (!elem_tp || elem_tp->kind != KIND_TYPE) {
-                        snprintf(err_msg, err_msg_len, "Sequence element type unresolved or not KIND_TYPE");
-                        return -1;
-                    }
                 }
             }
             break;
@@ -179,13 +117,11 @@ int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char 
                     return -1;
                 }
                 const TypePayload *tp = (const TypePayload*)tp_obj->payload;
-                if (tp->tag == TYPE_UNSIGNED_INT || tp->tag == TYPE_SIGNED_INT || tp->tag == TYPE_BITVECTOR) {
-                    uint16_t expected_bytes = (tp->width + 7) / 8;
-                    if (vp->byte_len != expected_bytes) {
-                        snprintf(err_msg, err_msg_len, "Value byte length %u does not match declared type width %u (expected %u bytes)",
-                                 vp->byte_len, tp->width, expected_bytes);
-                        return -1;
-                    }
+                if (omega2_om_val_val_bytes(&r, (uint64_t)tp->tag, (uint64_t)tp->width, (uint64_t)vp->byte_len) != OMEGA_OK) abort();
+                if ((int64_t)r > 0) {
+                    snprintf(err_msg, err_msg_len, "Value byte length %u does not match declared type width %u (expected %u bytes)",
+                             vp->byte_len, tp->width, (unsigned)r);
+                    return -1;
                 }
             }
             break;
@@ -193,11 +129,12 @@ int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char 
         case KIND_OPERATION: {
             if (obj->payload_len >= sizeof(OperationPayload)) {
                 const OperationPayload *op = (const OperationPayload*)obj->payload;
-                if (op->opcode == OP_INVALID || op->opcode > OP_CONVERT) {
+                if (omega2_om_val_op_fields(&r, (uint64_t)op->opcode, (uint64_t)op->overflow) != OMEGA_OK) abort();
+                if ((int64_t)r == 1) {
                     snprintf(err_msg, err_msg_len, "Invalid opcode 0x%02x", op->opcode);
                     return -1;
                 }
-                if (op->overflow == OVERFLOW_DEFAULT || op->overflow > OVERFLOW_FAIL_CLOSED) {
+                if ((int64_t)r == 2) {
                     snprintf(err_msg, err_msg_len, "Operation overflow policy not explicitly declared");
                     return -1;
                 }
@@ -221,9 +158,6 @@ int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char 
             break;
         }
         case KIND_EFFECT: {
-            /* Strict v2 decode (spec/effect-cap64-migration.md): exact 178-byte
-             * big-endian layout, 64-bit generation, resource != 0, param_len <= 128,
-             * zero padding. A 176-byte v1 host-struct payload is refused. */
             EffectPayload eff;
             int erc = omega_effect_read(obj, &eff);
             if (erc != OMEGA_EFFECT_OK) {
@@ -241,37 +175,64 @@ int omega_validate_object(const OmegaGraph *graph, const OmegaObject *obj, char 
 }
 
 int omega_validate_graph(const OmegaGraph *graph, char *err_msg, size_t err_msg_len) {
+    uint64_t r = 0;
     if (!graph) {
         snprintf(err_msg, err_msg_len, "Null graph pointer");
         return -1;
     }
-    if (graph->object_count == 0) {
+    if (omega2_om_val_graph_count(&r, (uint64_t)graph->object_count, OMEGA_MAX_GRAPH_OBJECTS) != OMEGA_OK) abort();
+    if ((int64_t)r == 1) {
         snprintf(err_msg, err_msg_len, "Empty graph (0 objects)");
         return -1;
     }
-    if (graph->object_count > OMEGA_MAX_GRAPH_OBJECTS) {
+    if ((int64_t)r == 2) {
         snprintf(err_msg, err_msg_len, "Graph object count %u exceeds maximum %d",
                  graph->object_count, OMEGA_MAX_GRAPH_OBJECTS);
         return -1;
     }
 
-    /* 1. Validate each object individually */
     for (uint16_t i = 0; i < graph->object_count; ++i) {
         if (omega_validate_object(graph, &graph->objects[i], err_msg, err_msg_len) != 0) {
             return -1;
         }
     }
 
-    /* 2. Check for structural cycles across the graph */
-    uint8_t visited[OMEGA_MAX_GRAPH_OBJECTS] = {0};
-    uint8_t in_stack[OMEGA_MAX_GRAPH_OBJECTS] = {0};
-
+    /* Build adjacency list and run iterative 3-color DFS cycle detection in OM-2 */
+    static uint16_t edges[OMEGA_MAX_GRAPH_OBJECTS * 128];
+    uint16_t deg[OMEGA_MAX_GRAPH_OBJECTS];
+    memset(deg, 0, sizeof(deg));
     for (uint16_t i = 0; i < graph->object_count; ++i) {
-        if (!visited[i]) {
-            if (check_cycle_dfs(graph, i, visited, in_stack, err_msg, err_msg_len) != 0) {
-                return -1;
+        const OmegaObject *obj = &graph->objects[i];
+        uint16_t d = 0;
+        for (uint16_t ri = 0; ri < obj->rel_count && d < 128; ++ri) {
+            for (uint16_t j = 0; j < graph->object_count && d < 128; ++j) {
+                if (graph->objects[j].has_id && omega_compare_semantic_id(&graph->objects[j].id, &obj->relations[ri].target_id) == 0) {
+                    edges[i * 128 + d++] = j;
+                }
             }
         }
+        if (obj->kind == KIND_OPERATION && obj->payload_len >= sizeof(ApplyPayload)) {
+            const ApplyPayload *app = (const ApplyPayload*)obj->payload;
+            for (uint8_t oi = 0; oi < app->operand_count && d < 128; ++oi) {
+                for (uint16_t j = 0; j < graph->object_count && d < 128; ++j) {
+                    if (graph->objects[j].has_id && omega_compare_semantic_id(&graph->objects[j].id, &app->operands[oi]) == 0) {
+                        edges[i * 128 + d++] = (uint16_t)((1U << 9) | j);
+                    }
+                }
+            }
+        }
+        deg[i] = d;
+    }
+
+    uint64_t info[2] = {0, 0};
+    if (omega2_om_val_find_cycle(&r, edges, OMEGA_MAX_GRAPH_OBJECTS * 128, deg, OMEGA_MAX_GRAPH_OBJECTS, graph->object_count, info, 2) != OMEGA_OK) abort();
+    if ((int64_t)r != 0) {
+        if (info[1] == 0) {
+            snprintf(err_msg, err_msg_len, "Structural cycle detected involving relation target at object index %u", (unsigned)info[0]);
+        } else {
+            snprintf(err_msg, err_msg_len, "Structural cycle detected involving operand target at object index %u", (unsigned)info[0]);
+        }
+        return -1;
     }
 
     return 0;

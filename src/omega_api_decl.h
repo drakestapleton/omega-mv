@@ -84,6 +84,120 @@ void sha256_update(sha256_ctx *o_c, const uint8_t *o_d, size_t o_d_len);
 void sha256_final(sha256_ctx *o_c, uint8_t o_o[32]);
 /* export fn sha256_hash d view uchar * o out uchar 32 to void */
 void sha256_hash(const uint8_t *o_d, size_t o_d_len, uint8_t o_o[32]);
+/* export fn a64addreg sf ulong rd ulong rn ulong rm ulong to long */
+int64_t a64addreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_rm);
+/* export fn a64subreg sf ulong rd ulong rn ulong rm ulong to long */
+int64_t a64subreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_rm);
+/* export fn a64mulreg sf ulong rd ulong rn ulong rm ulong to long */
+int64_t a64mulreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_rm);
+/* export fn a64andreg sf ulong rd ulong rn ulong rm ulong to long */
+int64_t a64andreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_rm);
+/* export fn a64orrreg sf ulong rd ulong rn ulong rm ulong to long */
+int64_t a64orrreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_rm);
+/* export fn a64eorreg sf ulong rd ulong rn ulong rm ulong to long */
+int64_t a64eorreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_rm);
+/* export fn a64movreg sf ulong rd ulong rm ulong to long */
+int64_t a64movreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rm);
+/* export fn a64movz sf ulong rd ulong imm ulong sh ulong to long */
+int64_t a64movz(uint64_t o_sf, uint64_t o_rd, uint64_t o_imm, uint64_t o_sh);
+/* export fn a64movk sf ulong rd ulong imm ulong sh ulong to long */
+int64_t a64movk(uint64_t o_sf, uint64_t o_rd, uint64_t o_imm, uint64_t o_sh);
+/* export fn a64ret to long */
+int64_t a64ret(void);
+/* export fn a64b imm long to long */
+int64_t a64b(int64_t o_imm);
+/* export fn a64bcond cond long imm long to long */
+int64_t a64bcond(int64_t o_cond, int64_t o_imm);
+/* export fn a64cbz sf ulong rt ulong imm long to long */
+int64_t a64cbz(uint64_t o_sf, uint64_t o_rt, int64_t o_imm);
+/* export fn a64cbnz sf ulong rt ulong imm long to long */
+int64_t a64cbnz(uint64_t o_sf, uint64_t o_rt, int64_t o_imm);
+/* export fn a64adr rd ulong imm long to long */
+int64_t a64adr(uint64_t o_rd, int64_t o_imm);
+/* export fn a64ldruoff sf ulong rt ulong rn ulong uo ulong to long */
+int64_t a64ldruoff(uint64_t o_sf, uint64_t o_rt, uint64_t o_rn, uint64_t o_uo);
+/* export fn a64struoff sf ulong rt ulong rn ulong uo ulong to long */
+int64_t a64struoff(uint64_t o_sf, uint64_t o_rt, uint64_t o_rn, uint64_t o_uo);
+/* export fn a64ldrbuoff rt ulong rn ulong uo ulong to long */
+int64_t a64ldrbuoff(uint64_t o_rt, uint64_t o_rn, uint64_t o_uo);
+/* export fn a64strbuoff rt ulong rn ulong uo ulong to long */
+int64_t a64strbuoff(uint64_t o_rt, uint64_t o_rn, uint64_t o_uo);
+/* export fn a64ldrpost rt ulong rn ulong imm long to long */
+int64_t a64ldrpost(uint64_t o_rt, uint64_t o_rn, int64_t o_imm);
+/* export fn a64strpost rt ulong rn ulong imm long to long */
+int64_t a64strpost(uint64_t o_rt, uint64_t o_rn, int64_t o_imm);
+/* export fn a64ldrxpost rt ulong rn ulong imm long to long */
+int64_t a64ldrxpost(uint64_t o_rt, uint64_t o_rn, int64_t o_imm);
+/* export fn a64strxpost rt ulong rn ulong imm long to long */
+int64_t a64strxpost(uint64_t o_rt, uint64_t o_rn, int64_t o_imm);
+/* export fn a64subsimm sf ulong rd ulong rn ulong imm ulong to long */
+int64_t a64subsimm(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_imm);
+/* export fn a64subsreg sf ulong rd ulong rn ulong rm ulong to long */
+int64_t a64subsreg(uint64_t o_sf, uint64_t o_rd, uint64_t o_rn, uint64_t o_rm);
+/* export fn a64put b edit uchar * st edit ulong 2 w long to long */
+int64_t a64put(uint8_t *o_b, size_t o_b_len, uint64_t o_st[2], int64_t o_w);
+/* export fn a64decode insn ulong dst edit ulong 9 to long */
+int64_t a64decode(uint64_t o_insn, uint64_t o_dst[9]);
+/* export fn a64validate code view uchar * n ulong msg edit uchar * ml ulong to long */
+int64_t a64validate(const uint8_t *o_code, size_t o_code_len, uint64_t o_n, uint8_t *o_msg, size_t o_msg_len, uint64_t o_ml);
+/* export fn om_canon_obj_ver kind ulong to ulong */
+uint64_t om_canon_obj_ver(uint64_t o_kind);
+/* export fn om_canon_chk_hdr ver ulong kind ulong to long */
+int64_t om_canon_chk_hdr(uint64_t o_ver, uint64_t o_kind);
+/* export fn om_canon_cmp_id a view uchar 32 b view uchar 32 to long */
+int64_t om_canon_cmp_id(const uint8_t o_a[32], const uint8_t o_b[32]);
+/* export fn om_canon_hex_id id view uchar 32 dst edit uchar 65 to void */
+void om_canon_hex_id(const uint8_t o_id[32], uint8_t o_dst[65]);
+/* export fn om_canon_parse_hex hx view uchar * n ulong dst edit uchar 32 to long */
+int64_t om_canon_parse_hex(const uint8_t *o_hx, size_t o_hx_len, uint64_t o_n, uint8_t o_dst[32]);
+/* export fn om_canon_write_hdr kind ulong dst edit uchar * mlen ulong to long */
+int64_t om_canon_write_hdr(uint64_t o_kind, uint8_t *o_dst, size_t o_dst_len, uint64_t o_mlen);
+/* export fn om_canon_write_u16be v ulong dst edit uchar * pos ulong mlen ulong to long */
+int64_t om_canon_write_u16be(uint64_t o_v, uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_mlen);
+/* export fn om_canon_write_u32be v ulong dst edit uchar * pos ulong mlen ulong to long */
+int64_t om_canon_write_u32be(uint64_t o_v, uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_mlen);
+/* export fn om_canon_sort_attr keys view uchar 2048 n ulong order edit ushort 32 to long */
+int64_t om_canon_sort_attr(const uint8_t o_keys[2048], uint64_t o_n, uint16_t o_order[32]);
+/* export fn om_canon_sort_rel kinds view ushort 64 targets view uchar 2048 n ulong order edit ushort 64 to long */
+int64_t om_canon_sort_rel(const uint16_t o_kinds[64], const uint8_t o_targets[2048], uint64_t o_n, uint16_t o_order[64]);
+/* export fn om_canon_sort_const meta view ushort 64 payloads view uchar 4096 n ulong order edit ushort 32 to long */
+int64_t om_canon_sort_const(const uint16_t o_meta[64], const uint8_t o_payloads[4096], uint64_t o_n, uint16_t o_order[32]);
+/* export fn om_val_kind kind ulong to long */
+int64_t om_val_kind(uint64_t o_kind);
+/* export fn om_val_rel_kind kind ulong to long */
+int64_t om_val_rel_kind(uint64_t o_kind);
+/* export fn om_val_const_kind kind ulong to long */
+int64_t om_val_const_kind(uint64_t o_kind);
+/* export fn om_val_type_fields tag ulong width ulong slen ulong to long */
+int64_t om_val_type_fields(uint64_t o_tag, uint64_t o_width, uint64_t o_slen);
+/* export fn om_val_val_bytes tag ulong width ulong blen ulong to long */
+int64_t om_val_val_bytes(uint64_t o_tag, uint64_t o_width, uint64_t o_blen);
+/* export fn om_val_op_fields opcode ulong overflow ulong to long */
+int64_t om_val_op_fields(uint64_t o_opcode, uint64_t o_overflow);
+/* export fn om_val_graph_count cnt ulong mcnt ulong to long */
+int64_t om_val_graph_count(uint64_t o_cnt, uint64_t o_mcnt);
+/* export fn om_val_find_cycle edges view ushort 32768 deg view ushort 256 n ulong info edit ulong 2 to long */
+int64_t om_val_find_cycle(const uint16_t o_edges[32768], const uint16_t o_deg[256], uint64_t o_n, uint64_t o_info[2]);
+/* export fn om_codec_hdr_enc cnt ulong dst edit uchar * mlen ulong to long */
+int64_t om_codec_hdr_enc(uint64_t o_cnt, uint8_t *o_dst, size_t o_dst_len, uint64_t o_mlen);
+/* export fn om_codec_hdr_dec buf view uchar * n ulong mobj ulong to long */
+int64_t om_codec_hdr_dec(const uint8_t *o_buf, size_t o_buf_len, uint64_t o_n, uint64_t o_mobj);
+/* export fn om_codec_u16_rd buf view uchar * pos ulong to ulong */
+uint64_t om_codec_u16_rd(const uint8_t *o_buf, size_t o_buf_len, uint64_t o_pos);
+/* export fn om_codec_u32_rd buf view uchar * pos ulong to ulong */
+uint64_t om_codec_u32_rd(const uint8_t *o_buf, size_t o_buf_len, uint64_t o_pos);
+/* export fn om_codec_obj_hdr_chk buf view uchar * pos ulong clen ulong to long */
+int64_t om_codec_obj_hdr_chk(const uint8_t *o_buf, size_t o_buf_len, uint64_t o_pos, uint64_t o_clen);
+/* export fn om_ver_v0_real prof ulong clen ulong mcode ulong hasid ulong to long */
+int64_t om_ver_v0_real(uint64_t o_prof, uint64_t o_clen, uint64_t o_mcode, uint64_t o_hasid);
+/* export fn om_ver_v1_ref a ulong b ulong c ulong to ulong */
+uint64_t om_ver_v1_ref(uint64_t o_a, uint64_t o_b, uint64_t o_c);
+/* export fn om_ver_v1_defvec idx ulong dst edit ulong 3 to long */
+int64_t om_ver_v1_defvec(uint64_t o_idx, uint64_t o_dst[3]);
+/* export fn om_ver_v2_eval op ulong width ulong a ulong b ulong to ulong */
+uint64_t om_ver_v2_eval(uint64_t o_op, uint64_t o_width, uint64_t o_a, uint64_t o_b);
+/* export fn om_ver_v2_props info edit ulong 4 to long */
+int64_t om_ver_v2_props(uint64_t o_info[4]);
 /* export fn bw_qmd0 q edit uint 96 qmd1_va ulong to ulong */
 uint64_t bw_qmd0(uint32_t o_q[96], uint64_t o_qmd1_va);
 /* export fn bw_qmd1 m view ulong 16 q edit uint 96 to ulong */

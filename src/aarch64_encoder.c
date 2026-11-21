@@ -1,6 +1,4 @@
 /* SPDX-License-Identifier: Apache-2.0
- * ORACLE for seed rung 0/1/2 only: retained first-party C implementation, active in other targets.
- * These seed gates use seed/check/a64check.om, not this C file.
  * Copyright 2026 Drake Stapleton (AIEN / aien-dev)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,26 +14,12 @@
  * limitations under the License.
  */
 
-/* Legacy AArch64 instruction writer (OSC-2 item 4, docs/osc/OSC-2-DESIGN.md section 4).
- *
- * Every emitter validates every field against its exact architectural range BEFORE
- * encoding. An in-range call produces the same word as the pre-OSC-2 writer (the
- * encoding formulas below are unchanged; their masks are now no-ops). An out-of-range
- * field is REFUSED, never trimmed: the emitter writes nothing, prints
- *     A64_LEGACY_FIELD_OUT_OF_RANGE <emitter> <field>=<value>
- * on stderr and aborts the process (SIGABRT). Abort is deliberate: several existing
- * callers ignore the int result, so a soft error would silently drop an instruction.
- * The -1 result remains only for "buffer full" (unchanged).
- * Ranges: registers 0..31 (31 = XZR/SP where the instruction allows it); sf is a C bool;
- * imm16 is uint16_t (0..65535); movz/movk shift in {0,16,32,48} (sf=1) or {0,16} (sf=0);
- * b imm26 in [-2^25, 2^25); b.cond/cbz/cbnz imm19 in [-2^18, 2^18); cond 0..15;
- * adr imm21 in [-2^20, 2^20); ldr/str (unsigned offset) uoff a multiple of 8 (sf=1) or
- * 4 (sf=0) with uoff/size <= 4095; ldrb/strb uoff 0..4095; post-index simm9 in [-256, 255];
- * subs imm12 0..4095.
- * New code must not use this writer: the set of files that include this header or call
- * aarch64_emit_* is frozen (tests/compiler/legacy_a64_allowlist.txt, checked by
- * `make test-compiler`). New code uses the validating encoder src/compiler/osc_a64.c. */
+/* AArch64 legacy instruction encoder backed by pure seeded OM-2 (om/aarch64/aarch64_om2.om).
+ * All architectural range checks, instruction word formulas, and little-endian buffer writes
+ * execute in Omega via omega2_a64* / omega2_a64put. This C file only translates negative
+ * field-refusal codes to the legacy abort contract. */
 #include "aarch64_encoder.h"
+#include "omega_native.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -46,206 +30,180 @@ static void refuse(const char *emitter, const char *field, long long value) {
     abort();
 }
 
-#define CHECK_REG(r) do { if ((unsigned)(r) > 31u) refuse(__func__, #r, (long long)(r)); } while (0)
-#define CHECK_SIGNED(v, bits) \
-    do { if ((long long)(v) < -(1LL << ((bits) - 1)) || (long long)(v) >= (1LL << ((bits) - 1))) \
-             refuse(__func__, #v, (long long)(v)); } while (0)
-#define CHECK_UMAX(v, max) do { if ((unsigned long long)(v) > (unsigned long long)(max)) refuse(__func__, #v, (long long)(v)); } while (0)
-#define CHECK_COND(c) do { if ((int)(c) < 0 || (int)(c) > 15) refuse(__func__, #c, (long long)(int)(c)); } while (0)
-#define CHECK_HW_SHIFT(sf, shift) \
-    do { if ((shift) % 16u != 0 || (shift) > ((sf) ? 48u : 16u)) refuse(__func__, #shift, (long long)(shift)); } while (0)
-#define CHECK_SCALED(sf, uoff) \
-    do { unsigned sz_ = (sf) ? 8u : 4u; \
-         if ((uoff) % sz_ != 0 || (uoff) / sz_ > 0xFFFu) refuse(__func__, #uoff, (long long)(uoff)); } while (0)
-#define CHECK3(rd, rn, rm) do { CHECK_REG(rd); CHECK_REG(rn); CHECK_REG(rm); } while (0)
-
-static int emit_u32_le(uint8_t *buf, size_t *pos, size_t max_len, uint32_t insn) {
-    if (*pos + 4 > max_len) return -1;
-    buf[*pos + 0] = (uint8_t)(insn & 0xff);
-    buf[*pos + 1] = (uint8_t)((insn >> 8) & 0xff);
-    buf[*pos + 2] = (uint8_t)((insn >> 16) & 0xff);
-    buf[*pos + 3] = (uint8_t)((insn >> 24) & 0xff);
-    *pos += 4;
-    return 0;
+static int finish_emit(uint8_t *buf, size_t *pos, size_t max_len,
+                       const char *emitter, const char *const *fields, const long long *vals,
+                       uint32_t st, uint64_t raw) {
+    if (st != OMEGA_OK) abort();
+    int64_t w = (int64_t)raw;
+    if (w <= -2) {
+        int idx = (int)(-w - 2);
+        refuse(emitter, fields[idx], vals[idx]);
+    }
+    uint8_t dummy[4] = {0};
+    uint8_t *target = (buf && max_len > 0) ? buf : dummy;
+    uint64_t target_len = (buf && max_len > 0) ? (uint64_t)max_len : 4ULL;
+    uint64_t state[2] = { (uint64_t)*pos, (uint64_t)max_len };
+    uint64_t rc = 0;
+    if (omega2_a64put(&rc, target, target_len, state, 2, (uint64_t)w) != OMEGA_OK) abort();
+    *pos = (size_t)state[0];
+    return (int)(int64_t)rc;
 }
 
-int aarch64_emit_add_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) {
-    CHECK3(rd, rn, rm);
-    uint32_t insn = ((uint32_t)sf << 31) | (0x0B << 24) |
-                    ((uint32_t)(rm & 0x1f) << 16) |
-                    ((uint32_t)(rn & 0x1f) << 5) |
-                    (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
+#define EMIT_RRR(fn, omfn) \
+int fn(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) { \
+    const char *f[] = { "sf", "rd", "rn", "rm" }; \
+    const long long v[] = { (long long)sf, (long long)rd, (long long)rn, (long long)rm }; \
+    uint64_t r = 0; \
+    uint32_t st = omfn(&r, (uint64_t)sf, (uint64_t)rd, (uint64_t)rn, (uint64_t)rm); \
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r); \
 }
 
-int aarch64_emit_sub_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) {
-    CHECK3(rd, rn, rm);
-    uint32_t insn = ((uint32_t)sf << 31) | (1U << 30) | (0x0B << 24) |
-                    ((uint32_t)(rm & 0x1f) << 16) |
-                    ((uint32_t)(rn & 0x1f) << 5) |
-                    (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_mul_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) {
-    CHECK3(rd, rn, rm);
-    /* MADD Xd, Xn, Xm, XZR */
-    uint32_t insn = ((uint32_t)sf << 31) | (0x1B << 24) |
-                    ((uint32_t)(rm & 0x1f) << 16) |
-                    (0x1f << 10) |
-                    ((uint32_t)(rn & 0x1f) << 5) |
-                    (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_and_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) {
-    CHECK3(rd, rn, rm);
-    uint32_t insn = ((uint32_t)sf << 31) | (0x0A << 24) |
-                    ((uint32_t)(rm & 0x1f) << 16) |
-                    ((uint32_t)(rn & 0x1f) << 5) |
-                    (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_orr_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) {
-    CHECK3(rd, rn, rm);
-    uint32_t insn = ((uint32_t)sf << 31) | (0x2A << 24) |
-                    ((uint32_t)(rm & 0x1f) << 16) |
-                    ((uint32_t)(rn & 0x1f) << 5) |
-                    (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_eor_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) {
-    CHECK3(rd, rn, rm);
-    uint32_t insn = ((uint32_t)sf << 31) | (0x4A << 24) |
-                    ((uint32_t)(rm & 0x1f) << 16) |
-                    ((uint32_t)(rn & 0x1f) << 5) |
-                    (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
+EMIT_RRR(aarch64_emit_add_reg, omega2_a64addreg)
+EMIT_RRR(aarch64_emit_sub_reg, omega2_a64subreg)
+EMIT_RRR(aarch64_emit_mul_reg, omega2_a64mulreg)
+EMIT_RRR(aarch64_emit_and_reg, omega2_a64andreg)
+EMIT_RRR(aarch64_emit_orr_reg, omega2_a64orrreg)
+EMIT_RRR(aarch64_emit_eor_reg, omega2_a64eorreg)
+EMIT_RRR(aarch64_emit_subs_reg, omega2_a64subsreg)
 
 int aarch64_emit_mov_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rm) {
-    CHECK_REG(rd); CHECK_REG(rm);
-    return aarch64_emit_orr_reg(buf, pos, max_len, sf, rd, REG_XZR, rm);
+    const char *f[] = { "sf", "rd", "rm" };
+    const long long v[] = { (long long)sf, (long long)rd, (long long)rm };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64movreg(&r, (uint64_t)sf, (uint64_t)rd, (uint64_t)rm);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_movz(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint16_t imm16, uint8_t shift) {
-    CHECK_REG(rd); CHECK_HW_SHIFT(sf, shift);
-    uint32_t hw = (shift / 16) & 3;
-    uint32_t insn = ((uint32_t)sf << 31) | (0x52800000) | (hw << 21) |
-                    ((uint32_t)imm16 << 5) | (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_ret(uint8_t *buf, size_t *pos, size_t max_len) {
-    return emit_u32_le(buf, pos, max_len, 0xD65F03C0);
-}
-
-int aarch64_emit_b(uint8_t *buf, size_t *pos, size_t max_len, int32_t imm26) {
-    CHECK_SIGNED(imm26, 26);
-    uint32_t insn = 0x14000000 | ((uint32_t)imm26 & 0x03FFFFFF);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_b_cond(uint8_t *buf, size_t *pos, size_t max_len, Aarch64Cond cond, int32_t imm19) {
-    CHECK_COND(cond); CHECK_SIGNED(imm19, 19);
-    uint32_t insn = 0x54000000 | (((uint32_t)imm19 & 0x7FFFF) << 5) | ((uint32_t)cond & 0x0F);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_cbz(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rt, int32_t imm19) {
-    CHECK_REG(rt); CHECK_SIGNED(imm19, 19);
-    uint32_t insn = ((uint32_t)sf << 31) | 0x34000000 | (((uint32_t)imm19 & 0x7FFFF) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_cbnz(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rt, int32_t imm19) {
-    CHECK_REG(rt); CHECK_SIGNED(imm19, 19);
-    uint32_t insn = ((uint32_t)sf << 31) | 0x35000000 | (((uint32_t)imm19 & 0x7FFFF) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "sf", "rd", "imm16", "shift" };
+    const long long v[] = { (long long)sf, (long long)rd, (long long)imm16, (long long)shift };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64movz(&r, (uint64_t)sf, (uint64_t)rd, (uint64_t)imm16, (uint64_t)shift);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_movk(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint16_t imm16, uint8_t shift) {
-    CHECK_REG(rd); CHECK_HW_SHIFT(sf, shift);
-    uint32_t hw = (shift / 16) & 3;
-    uint32_t insn = ((uint32_t)sf << 31) | 0x72800000 | (hw << 21) |
-                    ((uint32_t)imm16 << 5) | (rd & 0x1f);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "sf", "rd", "imm16", "shift" };
+    const long long v[] = { (long long)sf, (long long)rd, (long long)imm16, (long long)shift };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64movk(&r, (uint64_t)sf, (uint64_t)rd, (uint64_t)imm16, (uint64_t)shift);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
+}
+
+int aarch64_emit_ret(uint8_t *buf, size_t *pos, size_t max_len) {
+    uint64_t r = 0;
+    uint32_t st = omega2_a64ret(&r);
+    return finish_emit(buf, pos, max_len, __func__, NULL, NULL, st, r);
+}
+
+int aarch64_emit_b(uint8_t *buf, size_t *pos, size_t max_len, int32_t imm26) {
+    const char *f[] = { "imm26" };
+    const long long v[] = { (long long)imm26 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64b(&r, (uint64_t)(int64_t)imm26);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
+}
+
+int aarch64_emit_b_cond(uint8_t *buf, size_t *pos, size_t max_len, Aarch64Cond cond, int32_t imm19) {
+    const char *f[] = { "cond", "imm19" };
+    const long long v[] = { (long long)(int)cond, (long long)imm19 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64bcond(&r, (uint64_t)(int64_t)(int)cond, (uint64_t)(int64_t)imm19);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
+}
+
+int aarch64_emit_cbz(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rt, int32_t imm19) {
+    const char *f[] = { "sf", "rt", "imm19" };
+    const long long v[] = { (long long)sf, (long long)rt, (long long)imm19 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64cbz(&r, (uint64_t)sf, (uint64_t)rt, (uint64_t)(int64_t)imm19);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
+}
+
+int aarch64_emit_cbnz(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rt, int32_t imm19) {
+    const char *f[] = { "sf", "rt", "imm19" };
+    const long long v[] = { (long long)sf, (long long)rt, (long long)imm19 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64cbnz(&r, (uint64_t)sf, (uint64_t)rt, (uint64_t)(int64_t)imm19);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_adr(uint8_t *buf, size_t *pos, size_t max_len, uint8_t rd, int32_t imm21) {
-    CHECK_REG(rd); CHECK_SIGNED(imm21, 21);
-    uint32_t immlo = ((uint32_t)imm21 & 3) << 29;
-    uint32_t immhi = (((uint32_t)imm21 >> 2) & 0x7FFFF) << 5;
-    uint32_t insn = 0x10000000 | immlo | immhi | (rd & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "rd", "imm21" };
+    const long long v[] = { (long long)rd, (long long)imm21 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64adr(&r, (uint64_t)rd, (uint64_t)(int64_t)imm21);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_ldr_uoff(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rt, uint8_t rn, uint16_t uoff) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_SCALED(sf, uoff);
-    uint32_t scale = sf ? 3 : 2;
-    uint32_t imm12 = ((uint32_t)uoff >> scale) & 0xFFF;
-    uint32_t base = sf ? 0xF9400000 : 0xB9400000;
-    uint32_t insn = base | (imm12 << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "sf", "rt", "rn", "uoff" };
+    const long long v[] = { (long long)sf, (long long)rt, (long long)rn, (long long)uoff };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64ldruoff(&r, (uint64_t)sf, (uint64_t)rt, (uint64_t)rn, (uint64_t)uoff);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_str_uoff(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rt, uint8_t rn, uint16_t uoff) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_SCALED(sf, uoff);
-    uint32_t scale = sf ? 3 : 2;
-    uint32_t imm12 = ((uint32_t)uoff >> scale) & 0xFFF;
-    uint32_t base = sf ? 0xF9000000 : 0xB9000000;
-    uint32_t insn = base | (imm12 << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "sf", "rt", "rn", "uoff" };
+    const long long v[] = { (long long)sf, (long long)rt, (long long)rn, (long long)uoff };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64struoff(&r, (uint64_t)sf, (uint64_t)rt, (uint64_t)rn, (uint64_t)uoff);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_ldrb_uoff(uint8_t *buf, size_t *pos, size_t max_len, uint8_t rt, uint8_t rn, uint16_t uoff) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_UMAX(uoff, 0xFFF);
-    uint32_t insn = 0x39400000 | (((uint32_t)uoff & 0xFFF) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "rt", "rn", "uoff" };
+    const long long v[] = { (long long)rt, (long long)rn, (long long)uoff };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64ldrbuoff(&r, (uint64_t)rt, (uint64_t)rn, (uint64_t)uoff);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_strb_uoff(uint8_t *buf, size_t *pos, size_t max_len, uint8_t rt, uint8_t rn, uint16_t uoff) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_UMAX(uoff, 0xFFF);
-    uint32_t insn = 0x39000000 | (((uint32_t)uoff & 0xFFF) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "rt", "rn", "uoff" };
+    const long long v[] = { (long long)rt, (long long)rn, (long long)uoff };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64strbuoff(&r, (uint64_t)rt, (uint64_t)rn, (uint64_t)uoff);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_ldr_post(uint8_t *buf, size_t *pos, size_t max_len, uint8_t rt, uint8_t rn, int16_t simm9) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_SIGNED(simm9, 9);
-    uint32_t insn = 0xB8400400 | (((uint32_t)simm9 & 0x1FF) << 12) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "rt", "rn", "simm9" };
+    const long long v[] = { (long long)rt, (long long)rn, (long long)simm9 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64ldrpost(&r, (uint64_t)rt, (uint64_t)rn, (uint64_t)(int64_t)simm9);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_str_post(uint8_t *buf, size_t *pos, size_t max_len, uint8_t rt, uint8_t rn, int16_t simm9) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_SIGNED(simm9, 9);
-    uint32_t insn = 0xB8000400 | (((uint32_t)simm9 & 0x1FF) << 12) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "rt", "rn", "simm9" };
+    const long long v[] = { (long long)rt, (long long)rn, (long long)simm9 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64strpost(&r, (uint64_t)rt, (uint64_t)rn, (uint64_t)(int64_t)simm9);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_ldr_x_post(uint8_t *buf, size_t *pos, size_t max_len, uint8_t rt, uint8_t rn, int16_t simm9) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_SIGNED(simm9, 9);
-    uint32_t insn = 0xF8400400 | (((uint32_t)simm9 & 0x1FF) << 12) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "rt", "rn", "simm9" };
+    const long long v[] = { (long long)rt, (long long)rn, (long long)simm9 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64ldrxpost(&r, (uint64_t)rt, (uint64_t)rn, (uint64_t)(int64_t)simm9);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_str_x_post(uint8_t *buf, size_t *pos, size_t max_len, uint8_t rt, uint8_t rn, int16_t simm9) {
-    CHECK_REG(rt); CHECK_REG(rn); CHECK_SIGNED(simm9, 9);
-    uint32_t insn = 0xF8000400 | (((uint32_t)simm9 & 0x1FF) << 12) | ((uint32_t)(rn & 0x1F) << 5) | (rt & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "rt", "rn", "simm9" };
+    const long long v[] = { (long long)rt, (long long)rn, (long long)simm9 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64strxpost(&r, (uint64_t)rt, (uint64_t)rn, (uint64_t)(int64_t)simm9);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
 
 int aarch64_emit_subs_imm(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint16_t imm12) {
-    CHECK_REG(rd); CHECK_REG(rn); CHECK_UMAX(imm12, 0xFFF);
-    uint32_t base = sf ? 0xF1000000 : 0x71000000;
-    uint32_t insn = base | (((uint32_t)imm12 & 0xFFF) << 10) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
-}
-
-int aarch64_emit_subs_reg(uint8_t *buf, size_t *pos, size_t max_len, bool sf, uint8_t rd, uint8_t rn, uint8_t rm) {
-    CHECK3(rd, rn, rm);
-    uint32_t base = sf ? 0xEB000000 : 0x6B000000;
-    uint32_t insn = base | ((uint32_t)(rm & 0x1F) << 16) | ((uint32_t)(rn & 0x1F) << 5) | (rd & 0x1F);
-    return emit_u32_le(buf, pos, max_len, insn);
+    const char *f[] = { "sf", "rd", "rn", "imm12" };
+    const long long v[] = { (long long)sf, (long long)rd, (long long)rn, (long long)imm12 };
+    uint64_t r = 0;
+    uint32_t st = omega2_a64subsimm(&r, (uint64_t)sf, (uint64_t)rd, (uint64_t)rn, (uint64_t)imm12);
+    return finish_emit(buf, pos, max_len, __func__, f, v, st, r);
 }
