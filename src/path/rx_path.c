@@ -17,10 +17,9 @@
 /* BOOTSTRAP / REFERENCE: PATH-1. Byte laws and classification in rx_path.h.
  * No heap, no threads, no system calls, no runtime headers. */
 #include "rx_path.h"
+#include "omega_api_decl.h"
 #include "sha256.h"
 #include <string.h>
-
-static const uint8_t path_magic[4] = {0x4F, 0x4D, 0x47, 0x30}; /* "OMG0" */
 
 static void put_u16(uint8_t *b, uint16_t v) {
     b[0] = (uint8_t)(v >> 8);
@@ -58,42 +57,23 @@ static void emit_u16(Emit *e, uint16_t v) { uint8_t b[2]; put_u16(b, v); emit(e,
 static void emit_u32(Emit *e, uint32_t v) { uint8_t b[4]; put_u32(b, v); emit(e, b, 4); }
 static void emit_id(Emit *e, const SemanticId *id) { emit(e, id->bytes, 32); }
 
-/* Roles per family (spec 4.1): the high byte of a role is its family. */
-static const uint8_t roles_in_family[6] = {0, 4, 4, 7, 7, 6};
-
-static int valid_role(uint16_t family, uint16_t role) {
-    if (family < STEP_FAM_RELATION || family > STEP_FAM_DISCOVERY) return 0;
-    if ((role >> 8) != family) return 0;
-    return (role & 0xFFu) >= 1u && (role & 0xFFu) <= roles_in_family[family];
-}
-
 static int check_step(const RxPathStep *s) {
-    if (!valid_role(s->step_family, s->step_role)) return RX_PATH_ERR_MALFORMED;
-    if (s->input_count > RX_PATH_MAX_INPUTS_PER_STEP) return RX_PATH_ERR_INPUT_LIMIT;
-    if (s->output_count > RX_PATH_MAX_OUTPUTS_PER_STEP) return RX_PATH_ERR_OUTPUT_LIMIT;
-    if (s->param_len > RX_PATH_MAX_PARAM_LEN) return RX_PATH_ERR_PARAM_LIMIT;
-    return RX_PATH_OK;
+    return (int)rxp_check_step(s->step_family, s->step_role, s->input_count,
+                               s->output_count, s->param_len);
 }
 
 /* Callers pass only steps that passed check_step, so no term can wrap. */
 static size_t step_size(const RxPathStep *s) {
-    return (size_t)8u + (size_t)32u * s->input_count + 32u + 2u +
-           (size_t)32u * s->output_count + 4u + (size_t)s->param_len;
+    return (size_t)rxp_step_size(s->input_count, s->output_count, s->param_len);
 }
 
 static int key_cmp(const char *a, const char *b) {
-    size_t la = strlen(a), lb = strlen(b), n = la < lb ? la : lb;
-    int c = memcmp(a, b, n);
-    if (c) return c;
-    return la < lb ? -1 : (la > lb ? 1 : 0);
+    return (int)rxp_bytes_cmp((const uint8_t *)a, strlen(a), (const uint8_t *)b, strlen(b));
 }
 
 static int constraint_cmp(const OmegaConstraint *a, const OmegaConstraint *b) {
     if (a->kind != b->kind) return a->kind < b->kind ? -1 : 1;
-    uint16_t n = a->payload_len < b->payload_len ? a->payload_len : b->payload_len;
-    int c = memcmp(a->payload, b->payload, n);
-    if (c) return c;
-    return a->payload_len < b->payload_len ? -1 : (a->payload_len > b->payload_len ? 1 : 0);
+    return (int)rxp_bytes_cmp(a->payload, a->payload_len, b->payload, b->payload_len);
 }
 
 /* Logical step i. Iterative walk; each hop moves to a strictly shorter prefix
@@ -282,14 +262,12 @@ static int emit_path(const RxPath *p, Emit *e) {
     uint32_t steps_len = 0;
     for (uint32_t i = 0; i < count; i++) steps_len += (uint32_t)step_size(resolve(p, i));
 
-    emit(e, path_magic, 4);
-    emit_u8(e, RX_PATH_VERSION);
-    emit_u8(e, RX_PATH_KIND);
-    emit_u16(e, (uint16_t)count);
-    emit_id(e, &p->start_anchor_id);
-    emit_id(e, &p->end_anchor_id);
-    emit_id(e, &p->context_id);
-    emit_u16(e, p->attr_count);
+    uint8_t hdr_ids[96], hdr[RX_PATH_HEADER_BYTES];
+    memcpy(hdr_ids, p->start_anchor_id.bytes, 32);
+    memcpy(hdr_ids + 32, p->end_anchor_id.bytes, 32);
+    memcpy(hdr_ids + 64, p->context_id.bytes, 32);
+    rxp_encode_header(count, p->attr_count, hdr_ids, hdr);
+    emit(e, hdr, sizeof(hdr));
     for (uint16_t i = 0; i < p->attr_count; i++) {
         const OmegaAttribute *a = &p->attributes[i];
         size_t klen = strlen(a->key);
@@ -308,10 +286,9 @@ static int emit_path(const RxPath *p, Emit *e) {
     emit_u32(e, steps_len);
     for (uint32_t i = 0; i < count; i++) {
         const RxPathStep *s = resolve(p, i);
-        emit_u16(e, (uint16_t)i);
-        emit_u16(e, s->step_family);
-        emit_u16(e, s->step_role);
-        emit_u16(e, s->input_count);
+        uint8_t sh[8];
+        rxp_encode_step_head(i, s->step_family, s->step_role, s->input_count, sh);
+        emit(e, sh, 8);
         for (uint16_t k = 0; k < s->input_count; k++) emit_id(e, &s->input_ids[k]);
         emit_id(e, &s->operator_id);
         emit_u16(e, s->output_count);
@@ -500,20 +477,17 @@ static int take_id(Reader *r, SemanticId *id) {
 
 static int decode_body(RxPath *p, Reader *r) {
     RxPathStepArena *arena = p->arena;
-    const uint8_t *q = take(r, 4);
-    if (!q || memcmp(q, path_magic, 4) != 0) return RX_PATH_ERR_MALFORMED;
-    q = take(r, 2);
-    if (!q || q[0] != RX_PATH_VERSION || q[1] != RX_PATH_KIND) return RX_PATH_ERR_MALFORMED;
-    uint16_t count;
-    if (!take_u16(r, &count)) return RX_PATH_ERR_MALFORMED;
-    if (count > RX_PATH_MAX_STEPS) return RX_PATH_ERR_STEP_LIMIT;
-    if (!take_id(r, &p->start_anchor_id) || !take_id(r, &p->end_anchor_id) ||
-        !take_id(r, &p->context_id))
-        return RX_PATH_ERR_MALFORMED;
-
-    uint16_t n;
-    if (!take_u16(r, &n)) return RX_PATH_ERR_MALFORMED;
-    if (n > RX_PATH_MAX_ATTR_COUNT) return RX_PATH_ERR_ATTR_LIMIT;
+    const uint8_t *q = take(r, RX_PATH_HEADER_BYTES);
+    if (!q) return RX_PATH_ERR_MALFORMED;
+    uint64_t counts[2] = {0};
+    uint8_t hdr_ids[96];
+    int hrc = (int)rxp_decode_header(q, counts, hdr_ids);
+    if (hrc) return hrc;
+    uint16_t count = (uint16_t)counts[0];
+    uint16_t n = (uint16_t)counts[1];
+    memcpy(p->start_anchor_id.bytes, hdr_ids, 32);
+    memcpy(p->end_anchor_id.bytes, hdr_ids + 32, 32);
+    memcpy(p->context_id.bytes, hdr_ids + 64, 32);
     for (uint16_t i = 0; i < n; i++) {
         OmegaAttribute *a = &p->attributes[i];
         q = take(r, 1);
@@ -552,13 +526,14 @@ static int decode_body(RxPath *p, Reader *r) {
         if (arena->used >= RX_PATH_ARENA_STEPS) return RX_PATH_ERR_CAPACITY;
         RxPathStep *s = &arena->steps[arena->used];
         memset(s, 0, sizeof(*s));
-        uint16_t index;
-        if (!take_u16(r, &index) || index != i) return RX_PATH_ERR_MALFORMED;
-        if (!take_u16(r, &s->step_family) || !take_u16(r, &s->step_role))
-            return RX_PATH_ERR_MALFORMED;
-        if (!valid_role(s->step_family, s->step_role)) return RX_PATH_ERR_MALFORMED;
-        if (!take_u16(r, &s->input_count)) return RX_PATH_ERR_MALFORMED;
-        if (s->input_count > RX_PATH_MAX_INPUTS_PER_STEP) return RX_PATH_ERR_INPUT_LIMIT;
+        q = take(r, 8);
+        if (!q) return RX_PATH_ERR_MALFORMED;
+        uint64_t sf[3] = {0};
+        int src_rc = (int)rxp_decode_step_head(q, i, sf);
+        if (src_rc) return src_rc;
+        s->step_family = (uint16_t)sf[0];
+        s->step_role = (uint16_t)sf[1];
+        s->input_count = (uint16_t)sf[2];
         for (uint16_t k = 0; k < s->input_count; k++)
             if (!take_id(r, &s->input_ids[k])) return RX_PATH_ERR_MALFORMED;
         if (!take_id(r, &s->operator_id) || !take_u16(r, &s->output_count))

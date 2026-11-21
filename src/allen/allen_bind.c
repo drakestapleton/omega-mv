@@ -17,6 +17,7 @@
 /* allen_bind.c -- see allen_bind.h. Pure functions over the subject object,
  * a Cortex store and World references. No I/O except reading the object file. */
 #include "allen/allen_bind.h"
+#include "omega_api_decl.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -60,16 +61,17 @@ int allen_lineage(const CxStore *cx, uint8_t out[32])
 int allen_check_memory(const struct cs_subject *s, const CxStore *cx, const char **why)
 {
     uint8_t ref[32];
-    static const uint8_t zero[32] = {0};
-    if (memcmp(s->cortex, zero, 32) == 0) {
+    int has_gen = (allen_lineage(cx, ref) == 0);
+    int64_t r = allen_check_lineage(s->cortex, ref, has_gen ? 1 : 0);
+    if (r == -1) {
         if (why) *why = "subject has no Cortex lineage binding";
         return -1;
     }
-    if (allen_lineage(cx, ref) != 0) {
+    if (r == -2) {
         if (why) *why = "Cortex journal holds no genesis record";
         return -1;
     }
-    if (memcmp(ref, s->cortex, 32) != 0) {
+    if (r == -3) {
         if (why) *why = "Cortex lineage mismatch: this journal is not the subject's memory";
         return -1;
     }
@@ -89,9 +91,8 @@ void allen_bind_identity(const RxWorld *w, const struct cs_subject *s, const uin
 uint32_t allen_goal_mutations(const struct cs_intent *a, RxObjRef goal, uint64_t seq,
                               RxMutation out[4])
 {
-    uint64_t id_lo = 0;
     if (!a || a->state != CS_ACTIVE || a->kind != CS_INTENT_GOAL_LATENCY) return 0;
-    for (int i = 7; i >= 0; i--) id_lo = (id_lo << 8) | a->id[i];
+    uint64_t id_lo = allen_le64(a->id);
     out[0] = (RxMutation){goal, 0, seq};
     out[1] = (RxMutation){goal, 1, a->payload[0]};
     out[2] = (RxMutation){goal, 2, a->payload[1]};
@@ -101,21 +102,13 @@ uint32_t allen_goal_mutations(const struct cs_intent *a, RxObjRef goal, uint64_t
 
 void allen_hex(const uint8_t *b, size_t n, char *out)
 {
-    static const char *h = "0123456789abcdef";
-    for (size_t i = 0; i < n; i++) {
-        out[2 * i] = h[b[i] >> 4];
-        out[2 * i + 1] = h[b[i] & 15];
-    }
+    if (n) allen_encode_hex(b, n, (uint8_t *)out, 2 * n);
     out[2 * n] = 0;
 }
 
 int allen_unhex(const char *s, uint8_t *out, size_t n)
 {
     if (!s || strlen(s) != 2 * n) return -1;
-    for (size_t i = 0; i < n; i++) {
-        unsigned v;
-        if (sscanf(s + 2 * i, "%2x", &v) != 1) return -1;
-        out[i] = (uint8_t)v;
-    }
-    return 0;
+    if (!n) return 0;
+    return allen_decode_hex((const uint8_t *)s, 2 * n, out, n) ? 0 : -1;
 }

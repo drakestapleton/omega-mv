@@ -1036,6 +1036,30 @@ int64_t ad_unbroadcast_steps(const uint64_t *o_source, size_t o_source_len, cons
 uint64_t ad_same_shape(const uint64_t *o_lhs, size_t o_lhs_len, const uint64_t *o_rhs, size_t o_rhs_len);
 /* export fn ad_restore_axis shape view ulong * axis ulong restored edit ulong * to void */
 void ad_restore_axis(const uint64_t *o_shape, size_t o_shape_len, uint64_t o_axis, uint64_t *o_restored, size_t o_restored_len);
+/* export fn allen_encode_hex src view uchar * out_hex edit uchar * to void */
+void allen_encode_hex(const uint8_t *o_src, size_t o_src_len, uint8_t *o_out_hex, size_t o_out_hex_len);
+/* export fn allen_decode_hex in_hex view uchar * out_bytes edit uchar * to ulong */
+uint64_t allen_decode_hex(const uint8_t *o_in_hex, size_t o_in_hex_len, uint8_t *o_out_bytes, size_t o_out_bytes_len);
+/* export fn allen_check_lineage cortex view uchar 32 genesis view uchar 32 has_genesis ulong to long */
+int64_t allen_check_lineage(const uint8_t o_cortex[32], const uint8_t o_genesis[32], uint64_t o_has_genesis);
+/* export fn allen_le64 id view uchar 8 to ulong */
+uint64_t allen_le64(const uint8_t o_id[8]);
+/* export fn rxp_valid_role family ulong role ulong to ulong */
+uint64_t rxp_valid_role(uint64_t o_family, uint64_t o_role);
+/* export fn rxp_check_step family ulong role ulong n_in ulong n_out ulong plen ulong to long */
+int64_t rxp_check_step(uint64_t o_family, uint64_t o_role, uint64_t o_n_in, uint64_t o_n_out, uint64_t o_plen);
+/* export fn rxp_step_size n_in ulong n_out ulong plen ulong to ulong */
+uint64_t rxp_step_size(uint64_t o_n_in, uint64_t o_n_out, uint64_t o_plen);
+/* export fn rxp_bytes_cmp a view uchar * b view uchar * to long */
+int64_t rxp_bytes_cmp(const uint8_t *o_a, size_t o_a_len, const uint8_t *o_b, size_t o_b_len);
+/* export fn rxp_encode_header count ulong attr_count ulong ids view uchar 96 out_hdr out uchar 106 to void */
+void rxp_encode_header(uint64_t o_count, uint64_t o_attr_count, const uint8_t o_ids[96], uint8_t o_out_hdr[106]);
+/* export fn rxp_decode_header in_hdr view uchar 106 counts edit ulong 2 ids out uchar 96 to long */
+int64_t rxp_decode_header(const uint8_t o_in_hdr[106], uint64_t o_counts[2], uint8_t o_ids[96]);
+/* export fn rxp_encode_step_head idx ulong family ulong role ulong in_cnt ulong out_buf out uchar 8 to void */
+void rxp_encode_step_head(uint64_t o_idx, uint64_t o_family, uint64_t o_role, uint64_t o_in_cnt, uint8_t o_out_buf[8]);
+/* export fn rxp_decode_step_head in_buf view uchar 8 expect_idx ulong fields edit ulong 3 to long */
+int64_t rxp_decode_step_head(const uint8_t o_in_buf[8], uint64_t o_expect_idx, uint64_t o_fields[3]);
 #ifdef __cplusplus
 }
 #endif

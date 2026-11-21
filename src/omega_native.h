@@ -653,6 +653,34 @@ uint32_t omega2_ad_unbroadcast_steps(uint64_t *result, const uint64_t *o_source,
 uint32_t omega2_ad_same_shape(uint64_t *result, const uint64_t *o_lhs, uint64_t o_lhs_len, const uint64_t *o_rhs, uint64_t o_rhs_len);
 /* export fn ad_restore_axis shape view ulong * axis ulong restored edit ulong * to void */
 uint32_t omega2_ad_restore_axis(uint64_t *result, const uint64_t *o_shape, uint64_t o_shape_len, uint64_t o_axis, uint64_t *o_restored, uint64_t o_restored_len);
+#define OMEGA2_IDENT_allen_core "omega-ident 1 unit=allen_core abi=2 profile=OM-2 src=58d1640ab7498063353b5cd35c151819b940fe5a6caf31cda033ce2af5a9dc39 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_allen_core(void);
+/* export fn allen_encode_hex src view uchar * out_hex edit uchar * to void */
+uint32_t omega2_allen_encode_hex(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_out_hex, uint64_t o_out_hex_len);
+/* export fn allen_decode_hex in_hex view uchar * out_bytes edit uchar * to ulong */
+uint32_t omega2_allen_decode_hex(uint64_t *result, const uint8_t *o_in_hex, uint64_t o_in_hex_len, uint8_t *o_out_bytes, uint64_t o_out_bytes_len);
+/* export fn allen_check_lineage cortex view uchar 32 genesis view uchar 32 has_genesis ulong to long */
+uint32_t omega2_allen_check_lineage(uint64_t *result, const uint8_t *o_cortex, uint64_t o_cortex_len, const uint8_t *o_genesis, uint64_t o_genesis_len, uint64_t o_has_genesis);
+/* export fn allen_le64 id view uchar 8 to ulong */
+uint32_t omega2_allen_le64(uint64_t *result, const uint8_t *o_id, uint64_t o_id_len);
+#define OMEGA2_IDENT_rx_path_core "omega-ident 1 unit=rx_path_core abi=2 profile=OM-2 src=b92f0f3da9e2f1cd39d279267e57b4ba1ae307397b5565e254dab0b7f95766aa omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_rx_path_core(void);
+/* export fn rxp_valid_role family ulong role ulong to ulong */
+uint32_t omega2_rxp_valid_role(uint64_t *result, uint64_t o_family, uint64_t o_role);
+/* export fn rxp_check_step family ulong role ulong n_in ulong n_out ulong plen ulong to long */
+uint32_t omega2_rxp_check_step(uint64_t *result, uint64_t o_family, uint64_t o_role, uint64_t o_n_in, uint64_t o_n_out, uint64_t o_plen);
+/* export fn rxp_step_size n_in ulong n_out ulong plen ulong to ulong */
+uint32_t omega2_rxp_step_size(uint64_t *result, uint64_t o_n_in, uint64_t o_n_out, uint64_t o_plen);
+/* export fn rxp_bytes_cmp a view uchar * b view uchar * to long */
+uint32_t omega2_rxp_bytes_cmp(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len);
+/* export fn rxp_encode_header count ulong attr_count ulong ids view uchar 96 out_hdr out uchar 106 to void */
+uint32_t omega2_rxp_encode_header(uint64_t *result, uint64_t o_count, uint64_t o_attr_count, const uint8_t *o_ids, uint64_t o_ids_len, uint8_t *o_out_hdr);
+/* export fn rxp_decode_header in_hdr view uchar 106 counts edit ulong 2 ids out uchar 96 to long */
+uint32_t omega2_rxp_decode_header(uint64_t *result, const uint8_t *o_in_hdr, uint64_t o_in_hdr_len, uint64_t *o_counts, uint64_t o_counts_len, uint8_t *o_ids);
+/* export fn rxp_encode_step_head idx ulong family ulong role ulong in_cnt ulong out_buf out uchar 8 to void */
+uint32_t omega2_rxp_encode_step_head(uint64_t *result, uint64_t o_idx, uint64_t o_family, uint64_t o_role, uint64_t o_in_cnt, uint8_t *o_out_buf);
+/* export fn rxp_decode_step_head in_buf view uchar 8 expect_idx ulong fields edit ulong 3 to long */
+uint32_t omega2_rxp_decode_step_head(uint64_t *result, const uint8_t *o_in_buf, uint64_t o_in_buf_len, uint64_t o_expect_idx, uint64_t *o_fields, uint64_t o_fields_len);
 #ifdef __cplusplus
 }
 #endif
