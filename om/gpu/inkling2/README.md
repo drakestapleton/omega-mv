@@ -1,8 +1,30 @@
 # Inkling-2-Mini Seeded Omega SM121 Kernels for GB10
 
-These 22 SM121 cubins implement the complete operator set for Thinking Machines Lab's **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, architecture `Inkling2LoopForConditionalGeneration`) in pure seeded Omega (`.om`) with no C and no CUDA toolkit on the build path.
+These **40 SM121 cubins** (`22` baseline reference kernels in `emit.om` + `18` high-speed pipelined/fused kernels in `emit_fast.om`) implement the complete operator set for Thinking Machines Lab's **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, architecture `Inkling2LoopForConditionalGeneration`) in pure seeded Omega (`.om`) with no C and no CUDA toolkit on the build path.
 
-The seeded compiler (`seed/out/omc`) compiles `emit.om` with the repository's SM121 encoder (`om/encoder/bw_enc_sm121.om`), and `seed/kflow/kpack.om` packs each SASS image into an SM121 `.cubin`. `lookup.om` generates the shared 272-entry FP32 decode table (`256` E4M3FN + `16` E2M1).
+The seeded compiler (`seed/out/omc`) compiles `emit.om` and `emit_fast.om` with the repository's SM121 encoder (`om/encoder/bw_enc_sm121.om`), and `seed/kflow/kpack.om` packs each SASS image into an SM121 `.cubin`. `lookup.om` generates the shared 272-entry FP32 decode table (`256` E4M3FN + `16` E2M1).
+
+## High-speed SM121 suite (`emit_fast.om`, `kernels_fast.list`, `check_fast.py`)
+
+`emit_fast.om` targets GB10's LPDDR5X memory bandwidth ceiling (`236.9 GB/s` measured STREAM / `273 GB/s` nominal) with pipelined SM121 scoreboards, `BSSY`/`BSYNC` reconvergence, `LDG.E.128`/`LDG.E.64`, SMEM activation & LUT staging, warp `SHFL.DOWN`/`SHFL.BFLY`, Split-K `bar0`/`bar2` overlapped Flash-Decoding, and single-submit CUDA Graph capture:
+
+- **Packed BF16 streaming GEMV:** `bf16_gemv_fast` (`LDG.E.128`, SMEM `x`, 8 warps × 4 rows = 32 rows/CTA; hits `239.8–249.1 GB/s` on cold 926 MB `unembed [201024, 2304]`).
+- **Grouped 8-expert NVFP4 & MXFP8 GEMV:** `nvfp4_gemv_grouped8_fast` (`LDG.E.64` 128B full-cacheline coalescing, 16 weights = 1 scale block per lane, batched 8-`LDS` LUT lookup, 1-launch all 8 experts) and `mxfp8_gemv_grouped8_fast` (`LDG.E.64`, batched 8-`LDS` LUT lookup, register `UE8M0` decode; `239.3 GB/s` on `8×2304×2304`).
+- **Split-K Flash-Decoding + fused `attn_gate`:** `inkling_attn_flash_bf16` (1-launch BF16 KV), `inkling_attn_flash_split_bf16` (Split-K `Grid=(H,S,B)` with `bar 0` K + `bar 2` V async overlap; `271.5 GB/s` at `T=8192, S=8`), and `inkling_attn_reduce_bf16` (1-warp log-sum-exp combine + learned sink + optional fused `attn_gate`).
+- **Parallel routing & fused glue:** `router_top8_fast` (pair with 4-CTA `bf16_gemv_fast` for `0.0125 ms` total vs `0.313 ms` baseline), `router_fast` (1-launch BF16 router), `attn_res_fast` (`LDG.E.128` 256-thread warp-parallel, `0.0104 ms` vs `1.784 ms` baseline), `rms_norm_fast`, `l2_clip_fast` (1-warp/head), `nvfp4_quant_fast`, `mxfp8_quant_fast`, `softcap_swiglu8_fast`, `glue_sconv_fast`, `moe_combine8_sconv_fast` (fused 8-expert sum + static `sconv` + state), `sconv_rmsnorm_fast` (fused static `sconv` + state + register-resident `D=2304` RMSNorm), and `swiglu8_nvfp4_quant_fast` (fused 8-expert softcapped SwiGLU + SMEM-staged `fouroversix_mae` NVFP4 quantizer).
+
+### Verified GB10 silicon performance (synthetic checkpoint-shaped weights, 3.3 GB across 4 banks > 135× L2, all 128 routed experts)
+
+Receipt: `/home/drakestapleton/yardsticks/receipts/2026-11-21-inkling2-fast-final.json` (exclusive quiet Spark window `20261121T144332Z-3ba45b`, `nvrm_errors_delta: 0`, 40/40 cubins `nvdisasm` clean, 22/22 `check.py` PASS, 18/18 `check_fast.py` PASS, `check-arboris` PASS):
+
+| Configuration (48 logical layers, `T_swa=1024`, `T_full=4096`) | Median latency | Throughput | Effective DRAM BW | Speedup vs baseline |
+|---|---:|---:|---:|---:|
+| Baseline seeded Omega (`bench_stress.py`, `2026-11-21-inkling2-speed-stress.json`) | `384.55 ms/tok` | `2.60 tok/s` | `12.3 GB/s` | `1.0×` |
+| Fast suite — Eager (48L, no unembed, `4.72 GB/tok`) | `26.59 ms/tok` | `37.61 tok/s` | `177.5 GB/s` (`74.9%` of `236.9`) | `14.5×` |
+| Fast suite — Single-Submit CUDA Graph (48L, no unembed, `4.72 GB/tok`) | **`24.30 ms/tok`** (`p95 25.34 ms`) | **`41.16 tok/s`** | **`194.2 GB/s`** (`82.0%` of `236.9`) | **`15.8×`** |
+| Fast suite — Single-Submit CUDA Graph (48L + full 201k BF16 `unembed`, `5.65 GB/tok`) | **`28.21 ms/tok`** (`p95 28.73 ms`) | **`35.45 tok/s`** | **`200.3 GB/s`** (`84.5%` of `236.9`) | — |
+
+*(Physical zero-overhead GB10 DRAM roofline at `236.9 GB/s`: `19.92 ms/tok` / `50.2 tok/s` without unembed, `23.85 ms/tok` / `41.9 tok/s` with full 201k BF16 unembed. Measurements used synthetic checkpoint-shaped weights; real `Inkling-2-Mini` weights were not present on Spark.)*
 
 ## Architecture coverage
 
@@ -30,6 +52,7 @@ Inside an authorized Spark GB10 window:
 
 ```sh
 spark-window run python3 om/gpu/inkling2/check.py build/inkling2
+spark-window run python3 om/gpu/inkling2/check_fast.py build/inkling2
 ```
 
 ## Launch contract
