@@ -1,0 +1,427 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 core logic backing src/estimation/ (est_types.c, est_kf.c,
+note est_mix.c): digest/finite/unit/covariance/PD validation, canonical LE and
+note header codecs, dense matrix multiply (mm/mmt), symmetrize, Cholesky
+note factorization, triangular solves (fwd/bwd), and mixture checks.
+om2
+
+fn est_fin64 bits ulong to bool
+  ret lt and bits 0x7ff0000000000000 0x7ff0000000000000
+end
+
+export fn est_om_digest_is_zero d view uchar 32 to ulong
+  acc = ulong 0
+  for i ulong 32
+    acc = or acc ulong get d i
+  end
+  if eq acc 0
+    ret 1
+  end
+  ret 0
+end
+
+export fn est_om_check_finite a view ulong * cnt ulong to long
+  for i ulong cnt
+    if not est_fin64 get a i
+      ret -3
+    end
+  end
+  ret 0
+end
+
+export fn est_om_check_units u view uint * cnt ulong to long
+  for i ulong cnt
+    v = ulong get u i
+    if or lt v 1 ge v 9
+      ret -7
+    end
+  end
+  ret 0
+end
+
+fn est_cov_maxabs a view ulong * n ulong to ulong
+  z0 = bitcast f64 ulong 0
+  maxabs = z0
+  for i ulong n
+    for j ulong n
+      v = fabs bitcast f64 get a add mul i n j
+      if gt v maxabs
+        maxabs = v
+      end
+    end
+  end
+  ret bitcast ulong maxabs
+end
+
+fn est_cov_sym a view ulong * n ulong tols view ulong 4 to long
+  z0 = bitcast f64 ulong 0
+  for i ulong n
+    if lt bitcast f64 get a add mul i n i z0
+      ret -5
+    end
+  end
+  stol = mul bitcast f64 get tols 0 bitcast f64 est_cov_maxabs a n
+  floor = bitcast f64 get tols 1
+  if lt stol floor
+    stol = floor
+  end
+  for i ulong n
+    for j ulong i
+      aij = bitcast f64 get a add mul i n j
+      aji = bitcast f64 get a add mul j n i
+      if gt fabs sub aij aji stol
+        ret -4
+      end
+    end
+  end
+  ret 0
+end
+
+fn est_cov_sds a view ulong * n ulong work edit ulong 72 to void
+  for i ulong n
+    sd = fsqrt bitcast f64 get a add mul i n i
+    put work i bitcast ulong sd
+  end
+end
+
+fn est_cov_scale_row a view ulong * work edit ulong 72 rmax f64 base ulong i ulong to long
+  si = bitcast f64 get work i
+  for j ulong i
+    idx = add base j
+    c = bitcast f64 get a idx
+    sj = bitcast f64 get work j
+    if or eq bitcast ulong si 0 eq bitcast ulong sj 0
+      if ne c bitcast f64 ulong 0
+        ret -5
+      end
+      put work add 8 idx 0
+    else
+      r = div div c si sj
+      if gt fabs r rmax
+        ret -5
+      end
+      put work add 8 idx bitcast ulong r
+    end
+  end
+  ret 0
+end
+
+fn est_cov_scale a view ulong * n ulong work edit ulong 72 tols view ulong 4 to long
+  est_cov_sds a n work
+  z0 = bitcast f64 ulong 0
+  one = bitcast f64 ulong 0x3ff0000000000000
+  for i ulong n
+    off = add 8 add mul i n i
+    if gt bitcast f64 get work i z0
+      put work off bitcast ulong one
+    else
+      put work off 0
+    end
+  end
+  rmax = bitcast f64 get tols 2
+  for i ulong n
+    rc = est_cov_scale_row a work rmax mul i n i
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret 0
+end
+
+fn est_cov_ldlt_null n ulong k ulong work edit ulong 72 tol f64 to long
+  i = add k 1
+  while lt i n
+    c = bitcast f64 get work add 8 add mul i n k
+    if gt mul c c tol
+      ret -5
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn est_cov_ldlt_elim n ulong k ulong work edit ulong 72 d f64 to void
+  i = add k 1
+  while lt i n
+    wik = bitcast f64 get work add 8 add mul i n k
+    j = add k 1
+    while le j i
+      wjk = bitcast f64 get work add 8 add mul j n k
+      off = add 8 add mul i n j
+      cur = bitcast f64 get work off
+      put work off bitcast ulong sub cur div mul wik wjk d
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+fn est_cov_ldlt n ulong work edit ulong 72 tol f64 to long
+  ntol = neg tol
+  for k ulong n
+    d = bitcast f64 get work add 8 add mul k n k
+    if lt d ntol
+      ret -5
+    end
+    if le d tol
+      rc = est_cov_ldlt_null n k work tol
+      if ne rc 0
+        ret rc
+      end
+    else
+      est_cov_ldlt_elim n k work d
+    end
+  end
+  ret 0
+end
+
+export fn est_om_check_covariance a view ulong * n ulong work edit ulong 72 tols view ulong 4 to long
+  if or lt n 1 gt n 8
+    ret -2
+  end
+  for i ulong mul n n
+    if not est_fin64 get a i
+      ret -3
+    end
+  end
+  rc = est_cov_sym a n tols
+  if ne rc 0
+    ret rc
+  end
+  rc = est_cov_scale a n work tols
+  if ne rc 0
+    ret rc
+  end
+  ret est_cov_ldlt n work bitcast f64 get tols 3
+end
+
+fn est_chol_dot l view ulong 64 n ulong i ulong j ulong to f64
+  acc = bitcast f64 ulong 0
+  for k ulong j
+    lik = bitcast f64 get l add mul i n k
+    ljk = bitcast f64 get l add mul j n k
+    acc = add acc mul lik ljk
+  end
+  ret acc
+end
+
+export fn est_om_chol s view ulong * l edit ulong 64 n ulong to ulong
+  for i ulong 64
+    put l i 0
+  end
+  z0 = bitcast f64 ulong 0
+  for i ulong n
+    for j ulong add i 1
+      acc = sub bitcast f64 get s add mul i n j est_chol_dot l n i j
+      if eq i j
+        if or not gt acc z0 not est_fin64 bitcast ulong acc
+          ret 0
+        end
+        put l add mul i n i bitcast ulong fsqrt acc
+      else
+        ljj = bitcast f64 get l add mul j n j
+        put l add mul i n j bitcast ulong div acc ljj
+      end
+    end
+  end
+  ret 1
+end
+
+export fn est_om_fwd l view ulong 64 b view ulong 8 y edit ulong 8 n ulong to void
+  for i ulong n
+    acc = bitcast f64 get b i
+    for k ulong i
+      lik = bitcast f64 get l add mul i n k
+      yk = bitcast f64 get y k
+      acc = sub acc mul lik yk
+    end
+    lii = bitcast f64 get l add mul i n i
+    put y i bitcast ulong div acc lii
+  end
+end
+
+export fn est_om_bwd l view ulong 64 y view ulong 8 x edit ulong 8 n ulong to void
+  ii = n
+  while gt ii 0
+    i = sub ii 1
+    acc = bitcast f64 get y i
+    k = add i 1
+    while lt k n
+      lki = bitcast f64 get l add mul k n i
+      xk = bitcast f64 get x k
+      acc = sub acc mul lki xk
+      k = add k 1
+    end
+    lii = bitcast f64 get l add mul i n i
+    put x i bitcast ulong div acc lii
+    ii = sub ii 1
+  end
+end
+
+fn est_mm_dot a view ulong 64 b view ulong 64 dims view ulong 3 ij ulong to ulong
+  k = get dims 1
+  cols = get dims 2
+  i = div ij 8
+  j = rem ij 8
+  s = bitcast f64 ulong 0
+  for t ulong k
+    av = bitcast f64 get a add mul i k t
+    bv = bitcast f64 get b add mul t cols j
+    s = add s mul av bv
+  end
+  ret bitcast ulong s
+end
+
+fn est_mmt_dot a view ulong 64 b view ulong 64 dims view ulong 3 ij ulong to ulong
+  k = get dims 1
+  i = div ij 8
+  j = rem ij 8
+  s = bitcast f64 ulong 0
+  for t ulong k
+    av = bitcast f64 get a add mul i k t
+    bv = bitcast f64 get b add mul j k t
+    s = add s mul av bv
+  end
+  ret bitcast ulong s
+end
+
+export fn est_om_mm a view ulong 64 b view ulong 64 c edit ulong 64 dims view ulong 3 to void
+  r = get dims 0
+  cols = get dims 2
+  for i ulong r
+    for j ulong cols
+      put c add mul i cols j est_mm_dot a b dims add mul i 8 j
+    end
+  end
+end
+
+export fn est_om_mmt a view ulong 64 b view ulong 64 c edit ulong 64 dims view ulong 3 to void
+  r = get dims 0
+  cols = get dims 2
+  for i ulong r
+    for j ulong cols
+      put c add mul i cols j est_mmt_dot a b dims add mul i 8 j
+    end
+  end
+end
+
+export fn est_om_symmetrize a edit ulong * n ulong to void
+  half = bitcast f64 ulong 0x3fe0000000000000
+  for i ulong n
+    for j ulong i
+      p1 = add mul i n j
+      p2 = add mul j n i
+      v = mul half add bitcast f64 get a p1 bitcast f64 get a p2
+      vb = bitcast ulong v
+      put a p1 vb
+      put a p2 vb
+    end
+  end
+end
+
+export fn est_om_put_u32 dst edit uchar * pos ulong v ulong to void
+  for i ulong 4
+    put dst add pos i uchar and shr v mul i 8 255
+  end
+end
+
+export fn est_om_put_u64 dst edit uchar * pos ulong v ulong to void
+  for i ulong 8
+    put dst add pos i uchar and shr v mul i 8 255
+  end
+end
+
+export fn est_om_put_f64_canon dst edit uchar * pos ulong bits ulong to void
+  u = bits
+  if eq and bits 0x7fffffffffffffff 0
+    u = 0
+  end
+  for i ulong 8
+    put dst add pos i uchar and shr u mul i 8 255
+  end
+end
+
+export fn est_om_get_u32 src view uchar * pos ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    b = ulong get src add pos i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+export fn est_om_get_u64 src view uchar * pos ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    b = ulong get src add pos i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+export fn est_om_write_hdr dst edit uchar * kind ulong to void
+  put dst 0 uchar 79
+  put dst 1 uchar 69
+  put dst 2 uchar 83
+  put dst 3 uchar 84
+  put dst 4 uchar and kind 255
+  put dst 5 uchar 1
+  put dst 6 uchar 0
+  put dst 7 uchar 0
+end
+
+export fn est_om_check_hdr src view uchar * slen ulong want ulong to long
+  if lt slen 8
+    ret -11
+  end
+  if or ne ulong get src 0 79 ne ulong get src 1 69
+    ret -11
+  end
+  if or ne ulong get src 2 83 ne ulong get src 3 84
+    ret -11
+  end
+  if ne ulong get src 4 want
+    ret -10
+  end
+  if or ne ulong get src 5 1 or ne ulong get src 6 0 ne ulong get src 7 0
+    ret -11
+  end
+  ret 0
+end
+
+export fn est_om_mix_check w view ulong 3 v view ulong 3 k ulong tol_bits ulong to long
+  if or lt k 1 gt k 3
+    ret -2
+  end
+  z0 = bitcast f64 ulong 0
+  one = bitcast f64 ulong 0x3ff0000000000000
+  s = z0
+  for j ulong k
+    wb = get w j
+    vb = get v j
+    if or not est_fin64 wb not est_fin64 vb
+      ret -3
+    end
+    wf = bitcast f64 wb
+    vf = bitcast f64 vb
+    if lt wf z0
+      ret -5
+    end
+    if not gt vf z0
+      ret -6
+    end
+    s = add s wf
+  end
+  if le fabs sub s one bitcast f64 tol_bits
+    ret 0
+  end
+  ret -11
+end
+
+export fn est_om_mix_total_var w view ulong 3 v view ulong 3 k ulong to ulong
+  s = bitcast f64 ulong 0
+  for j ulong k
+    s = add s mul bitcast f64 get w j bitcast f64 get v j
+  end
+  ret bitcast ulong s
+end

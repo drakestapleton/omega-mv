@@ -20,6 +20,7 @@
  * to the caller only on success, so a refusal never leaves a half-written
  * record. Inputs are const and never modified. */
 #include "est_kf.h"
+#include "omega_native.h"
 
 #include <math.h>
 #include <string.h>
@@ -30,72 +31,44 @@
 /* C(r x c) = A(r x k) * B(k x c) */
 static void mm(const double *A, const double *B, double *C, uint32_t r, uint32_t k, uint32_t c)
 {
-    for (uint32_t i = 0; i < r; i++)
-        for (uint32_t j = 0; j < c; j++) {
-            double s = 0.0;
-            for (uint32_t t = 0; t < k; t++) s += A[i * k + t] * B[t * c + j];
-            C[i * c + j] = s;
-        }
+    uint64_t dims[3] = { r, k, c }, u = 0;
+    (void)omega2_est_om_mm(&u, (const uint64_t *)A, MAT, (const uint64_t *)B, MAT, (uint64_t *)C, MAT, dims, 3);
 }
 
 /* C(r x c) = A(r x k) * B^T where B is (c x k) */
 static void mmt(const double *A, const double *B, double *C, uint32_t r, uint32_t k, uint32_t c)
 {
-    for (uint32_t i = 0; i < r; i++)
-        for (uint32_t j = 0; j < c; j++) {
-            double s = 0.0;
-            for (uint32_t t = 0; t < k; t++) s += A[i * k + t] * B[j * k + t];
-            C[i * c + j] = s;
-        }
+    uint64_t dims[3] = { r, k, c }, u = 0;
+    (void)omega2_est_om_mmt(&u, (const uint64_t *)A, MAT, (const uint64_t *)B, MAT, (uint64_t *)C, MAT, dims, 3);
 }
 
 static void symmetrize(double *A, uint32_t n)
 {
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = 0; j < i; j++) {
-            double v = 0.5 * (A[i * n + j] + A[j * n + i]);
-            A[i * n + j] = v;
-            A[j * n + i] = v;
-        }
+    uint64_t u = 0;
+    (void)omega2_est_om_symmetrize(&u, (uint64_t *)A, (size_t)n * n, n);
 }
 
 /* Cholesky S = L L^T (lower). Refuses a pivot that is not strictly positive
  * or not finite. */
 static int chol(const double *S, double *L, uint32_t n)
 {
-    memset(L, 0, sizeof(double) * MAT);
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = 0; j <= i; j++) {
-            double s = S[i * n + j];
-            for (uint32_t k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
-            if (i == j) {
-                if (!(s > 0.0) || !isfinite(s)) return 0;
-                L[i * n + i] = sqrt(s);
-            } else {
-                L[i * n + j] = s / L[j * n + j];
-            }
-        }
-    return 1;
+    uint64_t ok = 0;
+    if (omega2_est_om_chol(&ok, (const uint64_t *)S, (size_t)n * n, (uint64_t *)L, MAT, n) != 0)
+        return 0;
+    return (int)ok;
 }
 
 /* Solve L y = b (forward). */
 static void fwd(const double *L, const double *b, double *y, uint32_t n)
 {
-    for (uint32_t i = 0; i < n; i++) {
-        double s = b[i];
-        for (uint32_t k = 0; k < i; k++) s -= L[i * n + k] * y[k];
-        y[i] = s / L[i * n + i];
-    }
+    uint64_t u = 0;
+    (void)omega2_est_om_fwd(&u, (const uint64_t *)L, MAT, (const uint64_t *)b, D, (uint64_t *)y, D, n);
 }
 /* Solve L^T x = y (backward). */
 static void bwd(const double *L, const double *y, double *x, uint32_t n)
 {
-    for (uint32_t ii = n; ii > 0; ii--) {
-        uint32_t i = ii - 1;
-        double s = y[i];
-        for (uint32_t k = i + 1; k < n; k++) s -= L[k * n + i] * x[k];
-        x[i] = s / L[i * n + i];
-    }
+    uint64_t u = 0;
+    (void)omega2_est_om_bwd(&u, (const uint64_t *)L, MAT, (const uint64_t *)y, D, (uint64_t *)x, D, n);
 }
 
 static est_status model_digest_matches(const est_model *mdl, const est_digest *want)

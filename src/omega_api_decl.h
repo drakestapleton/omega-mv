@@ -1156,6 +1156,44 @@ void applic_om_error_finalize(const uint64_t o_se[4], uint64_t o_scored, uint64_
 void applic_om_sort_desc(const uint8_t *o_items, size_t o_items_len, uint32_t *o_idx, size_t o_idx_len, uint64_t o_n);
 /* export fn applic_om_pearson xbytes view uchar * ybytes view uchar * n ulong out_r edit ulong 2 to void */
 void applic_om_pearson(const uint8_t *o_xbytes, size_t o_xbytes_len, const uint8_t *o_ybytes, size_t o_ybytes_len, uint64_t o_n, uint64_t o_out_r[2]);
+/* export fn est_om_digest_is_zero d view uchar 32 to ulong */
+uint64_t est_om_digest_is_zero(const uint8_t o_d[32]);
+/* export fn est_om_check_finite a view ulong * cnt ulong to long */
+int64_t est_om_check_finite(const uint64_t *o_a, size_t o_a_len, uint64_t o_cnt);
+/* export fn est_om_check_units u view uint * cnt ulong to long */
+int64_t est_om_check_units(const uint32_t *o_u, size_t o_u_len, uint64_t o_cnt);
+/* export fn est_om_check_covariance a view ulong * n ulong work edit ulong 72 tols view ulong 4 to long */
+int64_t est_om_check_covariance(const uint64_t *o_a, size_t o_a_len, uint64_t o_n, uint64_t o_work[72], const uint64_t o_tols[4]);
+/* export fn est_om_chol s view ulong * l edit ulong 64 n ulong to ulong */
+uint64_t est_om_chol(const uint64_t *o_s, size_t o_s_len, uint64_t o_l[64], uint64_t o_n);
+/* export fn est_om_fwd l view ulong 64 b view ulong 8 y edit ulong 8 n ulong to void */
+void est_om_fwd(const uint64_t o_l[64], const uint64_t o_b[8], uint64_t o_y[8], uint64_t o_n);
+/* export fn est_om_bwd l view ulong 64 y view ulong 8 x edit ulong 8 n ulong to void */
+void est_om_bwd(const uint64_t o_l[64], const uint64_t o_y[8], uint64_t o_x[8], uint64_t o_n);
+/* export fn est_om_mm a view ulong 64 b view ulong 64 c edit ulong 64 dims view ulong 3 to void */
+void est_om_mm(const uint64_t o_a[64], const uint64_t o_b[64], uint64_t o_c[64], const uint64_t o_dims[3]);
+/* export fn est_om_mmt a view ulong 64 b view ulong 64 c edit ulong 64 dims view ulong 3 to void */
+void est_om_mmt(const uint64_t o_a[64], const uint64_t o_b[64], uint64_t o_c[64], const uint64_t o_dims[3]);
+/* export fn est_om_symmetrize a edit ulong * n ulong to void */
+void est_om_symmetrize(uint64_t *o_a, size_t o_a_len, uint64_t o_n);
+/* export fn est_om_put_u32 dst edit uchar * pos ulong v ulong to void */
+void est_om_put_u32(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn est_om_put_u64 dst edit uchar * pos ulong v ulong to void */
+void est_om_put_u64(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn est_om_put_f64_canon dst edit uchar * pos ulong bits ulong to void */
+void est_om_put_f64_canon(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_bits);
+/* export fn est_om_get_u32 src view uchar * pos ulong to ulong */
+uint64_t est_om_get_u32(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn est_om_get_u64 src view uchar * pos ulong to ulong */
+uint64_t est_om_get_u64(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn est_om_write_hdr dst edit uchar * kind ulong to void */
+void est_om_write_hdr(uint8_t *o_dst, size_t o_dst_len, uint64_t o_kind);
+/* export fn est_om_check_hdr src view uchar * slen ulong want ulong to long */
+int64_t est_om_check_hdr(const uint8_t *o_src, size_t o_src_len, uint64_t o_slen, uint64_t o_want);
+/* export fn est_om_mix_check w view ulong 3 v view ulong 3 k ulong tol_bits ulong to long */
+int64_t est_om_mix_check(const uint64_t o_w[3], const uint64_t o_v[3], uint64_t o_k, uint64_t o_tol_bits);
+/* export fn est_om_mix_total_var w view ulong 3 v view ulong 3 k ulong to ulong */
+uint64_t est_om_mix_total_var(const uint64_t o_w[3], const uint64_t o_v[3], uint64_t o_k);
 #ifdef __cplusplus
 }
 #endif

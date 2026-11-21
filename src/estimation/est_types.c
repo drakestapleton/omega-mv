@@ -33,6 +33,7 @@
  *     equal-but-different double bit patterns once NaN is excluded.
  *   - Digest = SHA-256(domain string bytes || 0x00 || encoding). */
 #include "est_types.h"
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <math.h>
@@ -47,101 +48,54 @@ static int in_dim(uint32_t d) { return d >= 1u && d <= EST_MAX_DIM; }
 
 static est_status check_finite(const double *a, size_t cnt)
 {
-    for (size_t i = 0; i < cnt; i++)
-        if (!isfinite(a[i])) return EST_ERR_NONFINITE;
-    return EST_OK;
+    int64_t rc = 0;
+    if (cnt == 0) return EST_OK;
+    if (omega2_est_om_check_finite(&rc, (const uint64_t *)a, cnt, cnt) != 0)
+        return EST_ERR_NONFINITE;
+    return (est_status)rc;
 }
 
 static est_status check_units(const est_unit *u, uint32_t cnt)
 {
-    for (uint32_t i = 0; i < cnt; i++)
-        if ((uint32_t)u[i] < 1u || (uint32_t)u[i] >= (uint32_t)EST_UNIT_MAX_) return EST_ERR_UNIT;
-    return EST_OK;
+    int64_t rc = 0;
+    uint32_t tmp[EST_MAX_DIM];
+    if (cnt == 0) return EST_OK;
+    if (cnt > EST_MAX_DIM) return EST_ERR_DIM;
+    for (uint32_t i = 0; i < cnt; i++) tmp[i] = (uint32_t)u[i];
+    if (omega2_est_om_check_units(&rc, tmp, cnt, cnt) != 0)
+        return EST_ERR_UNIT;
+    return (est_status)rc;
 }
 
 est_status est_check_covariance(const double *A, uint32_t n)
 {
+    uint64_t work[72] = { 0 }, tols[4];
+    int64_t rc = 0;
+    double d_tols[4] = { 1e-9, 1e-300, 1.0 + 1e-9, 1e-12 };
     if (!A) return EST_ERR_NULL;
     if (!in_dim(n)) return EST_ERR_DIM;
-    est_status st = check_finite(A, (size_t)n * n);
-    if (st != EST_OK) return st;
-
-    double maxabs = 0.0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (A[i * n + i] < 0.0) return EST_ERR_NOT_PSD; /* any negative variance */
-        for (uint32_t j = 0; j < n; j++) {
-            double a = fabs(A[i * n + j]);
-            if (a > maxabs) maxabs = a;
-        }
-    }
-    double stol = 1e-9 * maxabs;
-    if (stol < 1e-300) stol = 1e-300;
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = 0; j < i; j++)
-            if (fabs(A[i * n + j] - A[j * n + i]) > stol) return EST_ERR_ASYMMETRIC;
-
-    /* Scale to unit diagonal so each variance is judged against itself, then
-     * LDL^T on the lower triangle. A zero variance needs a null row/column.
-     * Off-diagonals above the geometric mean of the two sds are refused.
-     * A pivot below -1e-12 is a materially negative direction; a pivot within
-     * +-1e-12 is a null direction whose column must be null too. */
-    double s[EST_MAX_DIM], w[EST_MAX_DIM * EST_MAX_DIM];
-    for (uint32_t i = 0; i < n; i++) s[i] = sqrt(A[i * n + i]);
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = 0; j <= i; j++) {
-            double c = A[i * n + j];
-            if (i == j) { w[i * n + j] = s[i] > 0.0 ? 1.0 : 0.0; continue; }
-            if (s[i] == 0.0 || s[j] == 0.0) {
-                if (c != 0.0) return EST_ERR_NOT_PSD;
-                w[i * n + j] = 0.0;
-                continue;
-            }
-            double r = (c / s[i]) / s[j];
-            if (fabs(r) > 1.0 + 1e-9) return EST_ERR_NOT_PSD;
-            w[i * n + j] = r;
-        }
-    const double tol = 1e-12;
-    for (uint32_t k = 0; k < n; k++) {
-        double d = w[k * n + k];
-        if (d < -tol) return EST_ERR_NOT_PSD;
-        if (d <= tol) {
-            for (uint32_t i = k + 1; i < n; i++) {
-                double c = w[i * n + k];
-                if (c * c > tol) return EST_ERR_NOT_PSD;
-            }
-            continue;
-        }
-        for (uint32_t i = k + 1; i < n; i++)
-            for (uint32_t j = k + 1; j <= i; j++)
-                w[i * n + j] -= w[i * n + k] * w[j * n + k] / d;
-    }
-    return EST_OK;
+    memcpy(tols, d_tols, sizeof tols);
+    if (omega2_est_om_check_covariance(&rc, (const uint64_t *)A, (size_t)n * n, n, work, 72, tols, 4) != 0)
+        return EST_ERR_NOT_PSD;
+    return (est_status)rc;
 }
 
 int est_digest_is_zero(const est_digest *d)
 {
+    uint64_t out = 1;
     if (!d) return 1;
-    uint8_t acc = 0;
-    for (size_t i = 0; i < EST_DIGEST_SIZE; i++) acc |= d->b[i];
-    return acc == 0;
+    (void)omega2_est_om_digest_is_zero(&out, d->b, EST_DIGEST_SIZE);
+    return (int)out;
 }
 
 /* Strict Cholesky: true if the symmetric n*n matrix is positive definite. */
 static int is_pd(const double *A, uint32_t n)
 {
-    double L[EST_MAX_DIM * EST_MAX_DIM];
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = 0; j <= i; j++) {
-            double s = A[i * n + j];
-            for (uint32_t k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
-            if (i == j) {
-                if (!(s > 0.0) || !isfinite(s)) return 0;
-                L[i * n + i] = sqrt(s);
-            } else {
-                L[i * n + j] = s / L[j * n + j];
-            }
-        }
-    return 1;
+    uint64_t L[EST_MAX_DIM * EST_MAX_DIM];
+    uint64_t ok = 0;
+    if (omega2_est_om_chol(&ok, (const uint64_t *)A, (size_t)n * n, L, EST_MAX_DIM * EST_MAX_DIM, n) != 0)
+        return 0;
+    return (int)ok;
 }
 
 est_status est_check_model(const est_model *mdl)
@@ -247,29 +201,33 @@ static void w_raw(wr *w, const void *s, size_t n)
 static void w_u32(wr *w, uint32_t v)
 {
     uint8_t t[4];
-    for (int i = 0; i < 4; i++) t[i] = (uint8_t)(v >> (8 * i));
+    uint64_t u = 0;
+    (void)omega2_est_om_put_u32(&u, t, 4, 0, v);
     w_raw(w, t, 4);
 }
 static void w_u64(wr *w, uint64_t v)
 {
     uint8_t t[8];
-    for (int i = 0; i < 8; i++) t[i] = (uint8_t)(v >> (8 * i));
+    uint64_t u = 0;
+    (void)omega2_est_om_put_u64(&u, t, 8, 0, v);
     w_raw(w, t, 8);
 }
 static void w_i64(wr *w, int64_t v) { w_u64(w, (uint64_t)v); }
 static void w_f64(wr *w, double d)
 {
-    uint64_t u = 0; /* +0.0 and -0.0 both encode as all-zero bits */
-    if (d != 0.0) memcpy(&u, &d, 8);
-    w_u64(w, u);
+    uint8_t t[8];
+    uint64_t bits = 0, u = 0;
+    memcpy(&bits, &d, 8);
+    (void)omega2_est_om_put_f64_canon(&u, t, 8, 0, bits);
+    w_raw(w, t, 8);
 }
 static void w_dig(wr *w, const est_digest *d) { w_raw(w, d->b, EST_DIGEST_SIZE); }
 static void w_hdr(wr *w, est_kind k)
 {
-    static const uint8_t magic[4] = { 'O', 'E', 'S', 'T' };
-    w_raw(w, magic, 4);
-    uint8_t t[4] = { (uint8_t)k, (uint8_t)EST_FORMAT_VERSION, 0, 0 };
-    w_raw(w, t, 4);
+    uint8_t t[8];
+    uint64_t u = 0;
+    (void)omega2_est_om_write_hdr(&u, t, 8, (uint64_t)k);
+    w_raw(w, t, 8);
 }
 static void w_farr(wr *w, const double *a, size_t n) { for (size_t i = 0; i < n; i++) w_f64(w, a[i]); }
 static void w_uarr(wr *w, const est_unit *u, uint32_t n) { for (uint32_t i = 0; i < n; i++) w_u32(w, (uint32_t)u[i]); }
@@ -285,17 +243,17 @@ static int r_need(rd *r, size_t n)
 }
 static uint32_t r_u32(rd *r)
 {
+    uint64_t v = 0;
     if (!r_need(r, 4)) return 0;
-    uint32_t v = 0;
-    for (int i = 0; i < 4; i++) v |= (uint32_t)r->p[r->pos + (size_t)i] << (8 * i);
+    (void)omega2_est_om_get_u32(&v, r->p + r->pos, 4, 0);
     r->pos += 4;
-    return v;
+    return (uint32_t)v;
 }
 static uint64_t r_u64(rd *r)
 {
-    if (!r_need(r, 8)) return 0;
     uint64_t v = 0;
-    for (int i = 0; i < 8; i++) v |= (uint64_t)r->p[r->pos + (size_t)i] << (8 * i);
+    if (!r_need(r, 8)) return 0;
+    (void)omega2_est_om_get_u64(&v, r->p + r->pos, 8, 0);
     r->pos += 8;
     return v;
 }
@@ -331,10 +289,11 @@ static uint32_t r_dim(rd *r)
 /* Header check. Wrong magic, version: ENCODING. Wrong kind: KIND. */
 static est_status r_hdr(rd *r, est_kind want)
 {
+    int64_t rc = 0;
     if (r->len < EST_HDR) return EST_ERR_ENCODING;
-    if (memcmp(r->p, "OEST", 4) != 0) return EST_ERR_ENCODING;
-    if (r->p[4] != (uint8_t)want) return EST_ERR_KIND;
-    if (r->p[5] != (uint8_t)EST_FORMAT_VERSION || r->p[6] != 0 || r->p[7] != 0) return EST_ERR_ENCODING;
+    if (omega2_est_om_check_hdr(&rc, r->p, r->len, r->len, (uint64_t)want) != 0)
+        return EST_ERR_ENCODING;
+    if (rc != EST_OK) return (est_status)rc;
     r->pos = EST_HDR;
     return EST_OK;
 }

@@ -15,30 +15,35 @@
  */
 
 #include "est_mix.h"
+#include "omega_native.h"
 
 #include <math.h>
+#include <string.h>
 
 #define LOG_2PI 1.8378770664093453
 
 est_status est_mix_check(const est_mix *mx)
 {
+    double tol = 1e-12;
+    uint64_t tol_b = 0;
+    int64_t rc = 0;
     if (!mx) return EST_ERR_NULL;
     if (mx->k < 1 || mx->k > EST_MIX_MAX) return EST_ERR_DIM;
-    double s = 0;
-    for (uint32_t j = 0; j < mx->k; j++) {
-        if (!isfinite(mx->w[j]) || !isfinite(mx->v[j])) return EST_ERR_NONFINITE;
-        if (mx->w[j] < 0.0) return EST_ERR_NOT_PSD;
-        if (!(mx->v[j] > 0.0)) return EST_ERR_NOT_PD;
-        s += mx->w[j];
-    }
-    return fabs(s - 1.0) <= 1e-12 ? EST_OK : EST_ERR_ENCODING;
+    memcpy(&tol_b, &tol, 8);
+    if (omega2_est_om_mix_check(&rc, (const uint64_t *)mx->w, EST_MIX_MAX,
+                                (const uint64_t *)mx->v, EST_MIX_MAX, mx->k, tol_b) != 0)
+        return EST_ERR_ENCODING;
+    return (est_status)rc;
 }
 
 double est_mix_total_var(const est_mix *mx)
 {
-    double s = 0;
-    for (uint32_t j = 0; j < mx->k; j++) s += mx->w[j] * mx->v[j];
-    return s;
+    uint64_t bits = 0;
+    double d = 0.0;
+    (void)omega2_est_om_mix_total_var(&bits, (const uint64_t *)mx->w, EST_MIX_MAX,
+                                      (const uint64_t *)mx->v, EST_MIX_MAX, mx->k);
+    memcpy(&d, &bits, 8);
+    return d;
 }
 
 /* Visit every count vector a[0..k-1] with sum h and positive probability:
