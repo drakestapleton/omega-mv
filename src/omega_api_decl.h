@@ -1348,6 +1348,20 @@ uint64_t osh_om_name_valid(const uint8_t *o_s, size_t o_s_len, uint64_t o_n);
 uint64_t osh_om_check_req_hdr(const uint64_t *o_rec, size_t o_rec_len, uint64_t o_nrec, uint64_t o_nout, uint64_t o_has_out);
 /* export fn osh_om_check_cmd_reserved b view ulong * na ulong ns ulong nr ulong to ulong */
 uint64_t osh_om_check_cmd_reserved(const uint64_t *o_b, size_t o_b_len, uint64_t o_na, uint64_t o_ns, uint64_t o_nr);
+/* export fn c2_om_put16 dst edit uchar * pos ulong v ulong to void */
+void c2_om_put16(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn c2_om_put64 dst edit uchar * pos ulong v ulong to void */
+void c2_om_put64(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn c2_om_get16 src view uchar * pos ulong to ulong */
+uint64_t c2_om_get16(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn c2_om_get64 src view uchar * pos ulong to ulong */
+uint64_t c2_om_get64(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn c2_om_deps_ascending ids view uchar * n ulong to ulong */
+uint64_t c2_om_deps_ascending(const uint8_t *o_ids, size_t o_ids_len, uint64_t o_n);
+/* export fn c2_om_lrat_skip_ws p view uchar * n ulong pos ulong nl_out edit ulong 1 to ulong */
+uint64_t c2_om_lrat_skip_ws(const uint8_t *o_p, size_t o_p_len, uint64_t o_n, uint64_t o_pos, uint64_t o_nl_out[1]);
+/* export fn c2_om_lrat_rd_int p view uchar * n ulong pos ulong dst edit ulong 3 to ulong */
+uint64_t c2_om_lrat_rd_int(const uint8_t *o_p, size_t o_p_len, uint64_t o_n, uint64_t o_pos, uint64_t o_dst[3]);
 #ifdef __cplusplus
 }
 #endif

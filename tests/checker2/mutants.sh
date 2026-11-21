@@ -83,8 +83,8 @@ run_family() {
 run_family src/checker2/c2_receipt.c tests/checker2/test_c2_receipt.c "src/omega_om_units.c $SIG" tests/checker2/fixtures
 run_family src/checker2/c2_ir.c tests/checker2/test_c2_ir.c src/checker2/c2_check.c "$IRDIR"
 run_family src/checker2/c2_check.c tests/checker2/test_c2_ir.c src/checker2/c2_ir.c "$IRDIR"
-run_family src/checker2/c2_lrat.c tests/checker2/test_c2_lrat.c "" ""
-run_family src/checker2/c2_blast.c tests/checker2/test_c2_blast.c "src/checker2/c2_ir.c src/checker2/c2_check.c src/checker2/c2_lrat.c" "$IRDIR $LRATDIR"
+run_family src/checker2/c2_lrat.c tests/checker2/test_c2_lrat.c "src/omega_om_units.c" ""
+run_family src/checker2/c2_blast.c tests/checker2/test_c2_blast.c "src/checker2/c2_ir.c src/checker2/c2_check.c src/checker2/c2_lrat.c src/omega_om_units.c" "$IRDIR $LRATDIR"
 
 echo "checker2 mutants: $killed of $total killed"
 # every GUARD tag in the checker2 sources is covered by a family above (none silently skipped)

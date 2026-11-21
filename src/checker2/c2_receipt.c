@@ -19,6 +19,7 @@
  * Signature code: the vendored in-house Ed25519 (src/searchtrace/sig, aienos native/sig @ 913b962,
  * PROVENANCE.txt there). SHA-256: src/sha256.c. No other dependency. */
 #include "c2_receipt.h"
+#include "omega_api_decl.h"
 
 #include <string.h>
 
@@ -76,18 +77,10 @@ const char *c2r_reason(int code)
     }
 }
 
-static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
-static void put64(uint8_t *p, uint64_t v)
-{
-    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
-}
-static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint64_t get64(const uint8_t *p)
-{
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
+static void put16(uint8_t *p, uint16_t v) { c2_om_put16(p, 2, 0, v); }
+static void put64(uint8_t *p, uint64_t v) { c2_om_put64(p, 8, 0, v); }
+static uint16_t get16(const uint8_t *p) { return (uint16_t)c2_om_get16(p, 2, 0); }
+static uint64_t get64(const uint8_t *p) { return c2_om_get64(p, 8, 0); }
 
 void c2r_target_id(const char *name, uint8_t out[32])
 {
@@ -102,8 +95,7 @@ void c2r_target_id(const char *name, uint8_t out[32])
 int c2r_deps_digest(const uint8_t (*ids)[32], unsigned n, uint8_t out[32])
 {
     static const char tag[] = "OMEGA-RECEIPT-DEPS-V1";
-    for (unsigned i = 1; i < n; i++)
-        if (memcmp(ids[i - 1], ids[i], 32) >= 0) return -1;
+    if (n > 1 && !c2_om_deps_ascending((const uint8_t *)ids, (size_t)n * 32, n)) return -1;
     uint8_t cnt[4] = {(uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24)};
     sha256_ctx c;
     sha256_init(&c);

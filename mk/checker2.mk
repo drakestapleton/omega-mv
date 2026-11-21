@@ -22,7 +22,7 @@ C2_CORE = src/checker2/c2_ir.c src/checker2/c2_check.c src/checker2/c2_lrat.c sr
 # checker identity input (spec section 5): SHA-256 over the checker2 sources in a fixed order
 C2_ID_SRCS = src/checker2/c2_ir.h src/checker2/c2_ir.c src/checker2/c2_check.c src/checker2/c2_receipt.h \
 	src/checker2/c2_receipt.c src/checker2/c2_lrat.h src/checker2/c2_lrat.c src/checker2/c2_blast.h src/checker2/c2_blast.c \
-	src/checker2/checker2_main.c
+	src/checker2/checker2_main.c src/checker2/c2_core.om
 C2_SOURCES_SHA256 = $(shell cat $(C2_ID_SRCS) | sha256sum | cut -c1-64)
 C2_IRDIR = $(C2_DIR)/differential/ir
 
@@ -38,13 +38,13 @@ $(C2_DIR)/checker2_other: src/checker2/checker2_main.c $(C2_CORE) $(C2_RECEIPT) 
 	@mkdir -p $(C2_DIR)
 	$(CC) $(C2_CFLAGS) -DC2_SOURCES_SHA256='"other-checker-build-for-tests"' -o $@ src/checker2/checker2_main.c $(C2_CORE) $(C2_RECEIPT)
 
-$(C2_DIR)/test_c2_ir: tests/checker2/test_c2_ir.c $(C2_CORE) $(C2_HDRS)
+$(C2_DIR)/test_c2_ir: tests/checker2/test_c2_ir.c $(C2_CORE) src/omega_om_units.c $(C2_HDRS)
 	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_ir.c $(C2_CORE)
+	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_ir.c $(C2_CORE) src/omega_om_units.c
 
-$(C2_DIR)/test_c2_ir_asan: tests/checker2/test_c2_ir.c $(C2_CORE) $(C2_HDRS)
+$(C2_DIR)/test_c2_ir_asan: tests/checker2/test_c2_ir.c $(C2_CORE) src/omega_om_units.c $(C2_HDRS)
 	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) $(C2_ASAN) -o $@ tests/checker2/test_c2_ir.c $(C2_CORE)
+	$(CC) $(C2_CFLAGS) $(C2_ASAN) -o $@ tests/checker2/test_c2_ir.c $(C2_CORE) src/omega_om_units.c
 
 # producer side, used only by the differential (links the producer library, never checker2)
 # (own variables: mk/compiler.mk is included after this file, so its variables are empty here)
@@ -69,17 +69,17 @@ $(C2_DIR)/c2sat: src/checker2/untrusted/c2sat.c
 	@mkdir -p $(C2_DIR)
 	$(CC) $(C2_CFLAGS) -o $@ src/checker2/untrusted/c2sat.c
 
-$(C2_DIR)/test_c2_lrat: tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c $(C2_HDRS)
+$(C2_DIR)/test_c2_lrat: tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c src/omega_om_units.c $(C2_HDRS)
 	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c
+	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c src/omega_om_units.c
 
-$(C2_DIR)/test_c2_lrat_asan: tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c $(C2_HDRS)
+$(C2_DIR)/test_c2_lrat_asan: tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c src/omega_om_units.c $(C2_HDRS)
 	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) $(C2_ASAN) -o $@ tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c
+	$(CC) $(C2_CFLAGS) $(C2_ASAN) -o $@ tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c src/omega_om_units.c
 
-$(C2_DIR)/test_c2_blast: tests/checker2/test_c2_blast.c $(C2_CORE) $(C2_HDRS)
+$(C2_DIR)/test_c2_blast: tests/checker2/test_c2_blast.c $(C2_CORE) src/omega_om_units.c $(C2_HDRS)
 	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_blast.c $(C2_CORE)
+	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_blast.c $(C2_CORE) src/omega_om_units.c
 
 # 20 bounded programs proved by bit-blasting + c2sat + checker2 LRAT replay, plus negative controls
 test-checker2-lrat: $(C2_DIR)/osc_emit_ir $(C2_DIR)/checker2 $(C2_DIR)/checker2_other $(C2_DIR)/c2sat $(C2_DIR)/test_c2_lrat $(C2_DIR)/test_c2_lrat_asan $(C2_DIR)/test_c2_blast test-checker2-differential
@@ -90,9 +90,9 @@ test-checker2-lrat: $(C2_DIR)/osc_emit_ir $(C2_DIR)/checker2 $(C2_DIR)/checker2_
 
 # blaster semantics against oscc's compiled AArch64 code, run as a black box (no ASan build:
 # the harness jumps into mapped machine code and leaves traps with siglongjmp)
-$(C2_DIR)/test_c2_blast_native: tests/checker2/test_c2_blast_native.c $(C2_CORE) $(C2_HDRS)
+$(C2_DIR)/test_c2_blast_native: tests/checker2/test_c2_blast_native.c $(C2_CORE) src/omega_om_units.c $(C2_HDRS)
 	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_blast_native.c $(C2_CORE)
+	$(CC) $(C2_CFLAGS) -o $@ tests/checker2/test_c2_blast_native.c $(C2_CORE) src/omega_om_units.c
 
 test-checker2-blast-native: $(OUT_DIR)/compiler/oscc $(C2_DIR)/test_c2_blast_native
 	sh tests/checker2/blast_native.sh $(OUT_DIR)/compiler/oscc $(C2_DIR)/test_c2_blast_native $(C2_DIR)/blast_native
