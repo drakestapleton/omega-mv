@@ -39,10 +39,14 @@ const QDW_AOUT ulong 81920
 const QDW_K ulong 90112
 const QDW_V ulong 98304
 const QDW_ROUT ulong 106496
+const QDW_AB ulong 110592
+const QDW_DB ulong 111616
+const QDW_WTS ulong 112640
 const QDW_EMID ulong 114688
 const QDW_EOUT ulong 163840
-const QDW_SHMID ulong 262144
-const QDW_SHOUT ulong 270336
+const QDW_SHMID ulong 147456
+const QDW_SHOUT ulong 229376
+const QDW_ESW ulong 286720
 const QDW_LOGW4 ulong 1048576
 const QDW_LOGBF ulong 2097152
 const QDW_CIDS ulong 3145728
@@ -100,8 +104,8 @@ const FA_PAYLOAD ulong 836878976
 global qdCodeMap long 1
 global qdCodePos ulong 1
 global qdCodeFail uint 1
-global qdEntry ulong 8
-global qdSmem ulong 8
+global qdEntry ulong 12
+global qdSmem ulong 12
 global qdLut long 1
 global qdWork long 1
 global qdWorkVa ulong 1
@@ -110,6 +114,10 @@ global qdLmW4 long 1
 global qdLmW4Va ulong 1
 global qdScaleMap long 1
 global qdScaleVa ulong 1
+global qdGdnStateMap long 1
+global qdGdnStateVa ulong 1
+global qdGdnTailMap long 1
+global qdGdnTailVa ulong 1
 global qdSlabMap long 10
 global qdSlabVa ulong 10
 global qdBind uint 32
@@ -136,7 +144,7 @@ global qdK f32 512
 global qdV f32 512
 global qdRout f32 256
 global qdIds ulong 8
-global qdWts f32 8
+global qdWts f32 9
 global qdEmid f32 8192
 global qdEout f32 16384
 global qdShMid f32 1024
@@ -147,8 +155,17 @@ global qdCandIds uint 64
 global qdCandLog f32 64
 global qdTmpVec f32 4096
 
-note Recurrent GDN state: 30 layers x 32 heads x 128 x 128 f32 = 15,728,640 f32 (60 MB)
-global qdGdnState f32 15728640
+note GPU-resident GDN state (60 MB UVM) + CPU-cached tiny norms/conv/scalars (0 mapread in decode!)
+global qdInNormC f32 81920
+global qdPostNormC f32 81920
+global qdShGateC f32 81920
+global qdConvC f32 983040
+global qdAlogC f32 960
+global qdDtC f32 960
+global qdQnC f32 2560
+global qdKnC f32 2560
+global qdAbTmp f32 64
+global qdDbTmp f32 64
 note GDN conv1d tail: 30 layers x 8192 x 3 f32 = 737,280 f32 (2.8 MB)
 global qdGdnTail f32 737280
 note Full-Attn KV cache: 10 layers x 128 pos x 2 kv x 256 f32 = 655,360 f32 each (5 MB total)
@@ -300,11 +317,71 @@ if not ok
 exit 4
 end
 qhDone
+note 5: gdn_step_real_f32
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry 5 p
+put qdCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36Kernel uchar 110
+if not ok
+exit 4
+end
+q36Done
+note 6: swiglu9_q36_fast
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry 6 p
+put qdCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36Kernel uchar 111
+if not ok
+exit 4
+end
+q36Done
+note 7: vocab_chunk_top64
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry 7 p
+put qdCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36Kernel uchar 112
+if not ok
+exit 4
+end
+q36Done
+note 8: moe_combine9_add
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry 8 p
+put qdCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36Kernel uchar 113
+if not ok
+exit 4
+end
+q36Done
+note 9: gdn_conv_l2_fast
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry 9 p
+put qdCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36Kernel uchar 114
+if not ok
+exit 4
+end
+q36Done
 put qdSmem 0 8192
 put qdSmem 1 17472
 put qdSmem 2 0
 put qdSmem 3 8192
 put qdSmem 4 0
+put qdSmem 5 1088
+put qdSmem 6 0
+put qdSmem 7 2048
+put qdSmem 8 0
+put qdSmem 9 64
 end
 
 note =========================================================================
@@ -595,6 +672,12 @@ ret qdPktEmitBx kid gx 256
 end
 
 fn qdWaitFast timeout ulong to bool
+for sp ulong 50000
+if eq mapget get gbmem 3 16 4 1179010630
+put nvret 0 get nvput 0
+ret true
+end
+end
 t0 = monons
 while lt ulong sub monons t0 timeout bound 5000000
 if eq mapget get gbmem 3 16 4 1179010630
@@ -689,6 +772,14 @@ if eq dstSel 12
 put qdCandLog idx f
 ret
 end
+if eq dstSel 14
+put qdAbTmp idx f
+ret
+end
+if eq dstSel 15
+put qdX idx f
+ret
+end
 put qdTmpVec idx f
 end
 
@@ -731,6 +822,18 @@ ret get qdY idx
 end
 if eq srcSel 2
 ret get qdEmid idx
+end
+if eq srcSel 4
+ret get qdQkv idx
+end
+if eq srcSel 5
+ret get qdDbTmp idx
+end
+if eq srcSel 6
+ret get qdX idx
+end
+if eq srcSel 7
+ret get qdWts idx
 end
 ret get qdShMid idx
 end
@@ -914,6 +1017,84 @@ end
 ret true
 end
 
+fn qdCacheLayerFa L ulong to bool
+faIdx = div L 4
+b256 = mul faIdx 256
+if not qdReadF32 get qdScaleMap 0 qdLayerSOff L FA_QNORM 13 256
+ret false
+end
+for d ulong 256
+put qdQnC add b256 d add 1.0f32 get qdTmpVec d
+end
+if not qdReadF32 get qdScaleMap 0 qdLayerSOff L FA_KNORM 13 256
+ret false
+end
+for d ulong 256
+put qdKnC add b256 d add 1.0f32 get qdTmpVec d
+end
+ret true
+end
+
+fn qdCacheLayerGdn L ulong to bool
+gdnIdx = sub L div L 4
+b32 = mul gdnIdx 32
+if not qdReadF32 get qdScaleMap 0 qdLayerSOff L GDN_ALOG 13 32
+ret false
+end
+for h ulong 32
+put qdAlogC add b32 h neg qdExp get qdTmpVec h
+end
+if not qdReadF32 get qdScaleMap 0 qdLayerSOff L GDN_DTBIAS 13 32
+ret false
+end
+for h ulong 32
+put qdDtC add b32 h get qdTmpVec h
+end
+cBase = mul gdnIdx 32768
+for blk ulong 8
+if not qdReadF32 get qdScaleMap 0 add qdLayerSOff L GDN_CONV mul blk 16384 13 4096
+ret false
+end
+bo = add cBase mul blk 4096
+for i ulong 4096
+put qdConvC add bo i get qdTmpVec i
+end
+end
+ret true
+end
+
+fn qdCacheLayerCpu L ulong isFa bool to bool
+b2048 = mul L QD_H
+if not qdReadF32 get qdScaleMap 0 qdLayerSOff L 0 13 QD_H
+ret false
+end
+for d ulong QD_H
+put qdInNormC add b2048 d add 1.0f32 get qdTmpVec d
+end
+pnOff = GDN_POST_NORM
+sgOff = GDN_SH_GATE
+if isFa
+pnOff = FA_POST_NORM
+sgOff = FA_SH_GATE
+end
+if not qdReadF32 get qdScaleMap 0 qdLayerSOff L pnOff 13 QD_H
+ret false
+end
+for d ulong QD_H
+put qdPostNormC add b2048 d add 1.0f32 get qdTmpVec d
+end
+if not qdReadF32 get qdScaleMap 0 qdLayerSOff L sgOff 13 QD_H
+ret false
+end
+for d ulong QD_H
+put qdShGateC add b2048 d get qdTmpVec d
+end
+if isFa
+ret qdCacheLayerFa L
+end
+ret qdCacheLayerGdn L
+end
+
 fn qdLoadLayer L ulong to bool
 n = qdBuildPath qdSufLay long L
 fd = int fopen qdPathBuf 0 n 0 0
@@ -946,7 +1127,10 @@ ret false
 end
 ok = qdWidenLayerScales fd dataOff L bf16Top
 r = fclose fd
-ret ok
+if not ok
+ret false
+end
+ret qdCacheLayerCpu L isFa
 end
 
 fn qdLayerWVa L ulong to ulong
@@ -1015,34 +1199,37 @@ end
 ret true
 end
 
-fn qdRmsNormLayer L ulong bf16NormOff ulong to bool
-if not qdReadF32 get qdScaleMap 0 qdLayerSOff L bf16NormOff 13 QD_H
-ret false
-end
+fn qdRmsNormLayer L ulong isPost bool to bool
+b2048 = mul L QD_H
 ss = f32 0.0f32
 for i ulong QD_H
 v = get qdX i
 ss = add ss mul v v
 end
 inv = div 1.0f32 qdSqrt add div ss 2048.0f32 0.000001f32
+if isPost
 for i ulong QD_H
-w = add 1.0f32 get qdTmpVec i
-put qdXn i mul mul get qdX i inv w
+put qdXn i mul mul get qdX i inv get qdPostNormC add b2048 i
+end
+else
+for i ulong QD_H
+put qdXn i mul mul get qdX i inv get qdInNormC add b2048 i
+end
 end
 ret qdWriteF32 get qdWork 0 QDW_XN 0 QD_H
 end
 
-fn qdGdnConvCh tBase ulong c ulong ch ulong to void
+fn qdGdnConvCh tBase ulong cBase ulong c ulong to void
 tb = add tBase mul c 3
 x0 = get qdGdnTail tb
 x1 = get qdGdnTail add tb 1
 x2 = get qdGdnTail add tb 2
 x3 = get qdQkv c
-wb = mul ch 4
-s = mul x0 get qdTmpVec wb
-s = add s mul x1 get qdTmpVec add wb 1
-s = add s mul x2 get qdTmpVec add wb 2
-s = add s mul x3 get qdTmpVec add wb 3
+wb = add cBase mul c 4
+s = mul x0 get qdConvC wb
+s = add s mul x1 get qdConvC add wb 1
+s = add s mul x2 get qdConvC add wb 2
+s = add s mul x3 get qdConvC add wb 3
 put qdGdnTail tb x1
 put qdGdnTail add tb 1 x2
 put qdGdnTail add tb 2 x3
@@ -1070,130 +1257,13 @@ qdL2Norm128 add 2048 qb 1.0f32
 end
 end
 
-fn qdGdnConvNorm L ulong gdnIdx ulong to bool
+fn qdGdnConvNorm gdnIdx ulong to bool
 tBase = mul gdnIdx 24576
-for blk ulong 8
-if not qdReadF32 get qdScaleMap 0 add qdLayerSOff L GDN_CONV mul blk 16384 13 4096
-ret false
-end
-for ch ulong 1024
-qdGdnConvCh tBase add mul blk 1024 ch ch
-end
+cBase = mul gdnIdx 32768
+for c ulong 8192
+qdGdnConvCh tBase cBase c
 end
 qdGdnL2Norm
-ret true
-end
-
-global qdGdnKv f32 128
-global qdGdnO f32 128
-global qdLinNorm f32 128
-
-fn qdGdnDecayKv stBase ulong kb ulong decay f32 to void
-for c ulong 128
-put qdGdnKv c 0.0f32
-end
-for r ulong 128
-kr = get qdQkv add kb r
-rowBase = add stBase mul r 128
-for c ulong 128
-si = add rowBase c
-sv = mul get qdGdnState si decay
-put qdGdnState si sv
-put qdGdnKv c add get qdGdnKv c mul sv kr
-end
-end
-end
-
-fn qdGdnUpdateO stBase ulong kb ulong qb ulong to void
-for c ulong 128
-put qdGdnO c 0.0f32
-end
-for r ulong 128
-kr = get qdQkv add kb r
-qr = get qdQkv add qb r
-rowBase = add stBase mul r 128
-for c ulong 128
-si = add rowBase c
-sv = add get qdGdnState si mul kr get qdGdnKv c
-put qdGdnState si sv
-put qdGdnO c add get qdGdnO c mul sv qr
-end
-end
-end
-
-fn qdGdnGatedNorm zb ulong to void
-ss = f32 0.0f32
-for c ulong 128
-ov = get qdGdnO c
-ss = add ss mul ov ov
-end
-inv = div 1.0f32 qdSqrt add div ss 128.0f32 0.000001f32
-for c ulong 128
-o1 = mul get qdGdnO c inv
-g1 = mul get qdLinNorm c qdSilu get qdZ add zb c
-put qdY add zb c mul o1 g1
-end
-end
-
-fn qdGdnDelta vb ulong beta f32 to void
-for c ulong 128
-dv = sub get qdQkv add vb c get qdGdnKv c
-put qdGdnKv c mul dv beta
-end
-end
-
-fn qdGdnHeadStep stLayer ulong h ulong beta f32 decay f32 to void
-qb = mul div h 2 128
-kb = add 2048 qb
-stBase = add stLayer mul h 16384
-qdGdnDecayKv stBase kb decay
-qdGdnDelta add 4096 mul h 128 beta
-qdGdnUpdateO stBase kb qb
-qdGdnGatedNorm mul h 128
-end
-
-global qdGdnA f32 32
-global qdGdnB f32 32
-global qdGdnAlog f32 32
-global qdGdnDt f32 32
-
-fn qdGdnLoadAB L ulong to bool
-for h ulong 32
-if not qdReadF32 get qdScaleMap 0 add qdLayerSOff L GDN_IN_A mul h 8192 13 2048
-ret false
-end
-sa = f32 0.0f32
-for d ulong 2048
-sa = add sa mul get qdTmpVec d get qdXn d
-end
-put qdGdnA h sa
-if not qdReadF32 get qdScaleMap 0 add qdLayerSOff L GDN_IN_B mul h 8192 13 2048
-ret false
-end
-sb = f32 0.0f32
-for d ulong 2048
-sb = add sb mul get qdTmpVec d get qdXn d
-end
-put qdGdnB h sb
-end
-if not qdReadF32 get qdScaleMap 0 qdLayerSOff L GDN_ALOG 13 32
-ret false
-end
-for h ulong 32
-put qdGdnAlog h get qdTmpVec h
-end
-if not qdReadF32 get qdScaleMap 0 qdLayerSOff L GDN_DTBIAS 13 32
-ret false
-end
-for h ulong 32
-put qdGdnDt h get qdTmpVec h
-end
-if not qdReadF32 get qdScaleMap 0 qdLayerSOff L GDN_LIN_NORM 13 128
-ret false
-end
-for d ulong 128
-put qdLinNorm d get qdTmpVec d
-end
 ret true
 end
 
@@ -1215,46 +1285,69 @@ end
 ret qdReadF32 get qdWork 0 QDW_AOUT 2 2048
 end
 
-fn qdGdnRunHeads gdnIdx ulong to void
-stLayer = mul gdnIdx 524288
-for h ulong 32
-beta = qdSigmoid get qdGdnB h
-g = mul neg qdExp get qdGdnAlog h qdSoftplus add get qdGdnA h get qdGdnDt h
-decay = qdExp g
-qdGdnHeadStep stLayer h beta decay
+fn qdGdnEmitGpuStep L ulong gdnIdx ulong to bool
+wbase = qdLayerWVa L
+sbase = qdLayerSVa L
+wva = get qdWorkVa 0
+qdPktStart
+qdPtr add wva QDW_QKV
+qdPtr add wva QDW_Z
+qdPtr add wva QDW_DB
+qdPtr add get qdGdnStateVa 0 mul gdnIdx 2097152
+qdPtr add sbase mul GDN_LIN_NORM 2
+qdPtr add wva QDW_Y
+if not qdPktEmitBx 5 32 128
+ret false
 end
+if not qdEmitFp8 add wva QDW_Y add wbase GDN_OUT_W add sbase mul GDN_OUT_S 2 add wva QDW_AOUT 4096 2048
+ret false
+end
+ret qdPktRun
 end
 
 fn qdStepGdn L ulong gdnIdx ulong to bool
 wbase = qdLayerWVa L
 sbase = qdLayerSVa L
-xnVa = add get qdWorkVa 0 QDW_XN
-qkvVa = add get qdWorkVa 0 QDW_QKV
-zVa = add get qdWorkVa 0 QDW_Z
+wva = get qdWorkVa 0
+xnVa = add wva QDW_XN
+note 1. GPU packet 1: in_proj_qkv + in_proj_z + in_proj_a|b + GPU conv1d+SiLU+L2-norm (4 QMDs!)
 qdPktStart
-if not qdEmitFp8 xnVa add wbase GDN_QKV_W add sbase mul GDN_QKV_S 2 qkvVa 2048 8192
+if not qdEmitFp8 xnVa add wbase GDN_QKV_W add sbase mul GDN_QKV_S 2 add wva QDW_QKV 2048 8192
 ret false
 end
-if not qdEmitFp8 xnVa add wbase GDN_Z_W add sbase mul GDN_Z_S 2 zVa 2048 4096
+if not qdEmitFp8 xnVa add wbase GDN_Z_W add sbase mul GDN_Z_S 2 add wva QDW_Z 2048 4096
+ret false
+end
+if not qdEmitBf16 xnVa add wbase GDN_IN_A add wva QDW_AB 2048 64
+ret false
+end
+qdPtr add wva QDW_QKV
+qdPtr add sbase mul GDN_CONV 2
+qdPtr add get qdGdnTailVa 0 mul gdnIdx 98304
+if not qdPktEmitBx 9 64 128
 ret false
 end
 if not qdPktRun
 ret false
 end
-if not qdReadF32 get qdWork 0 QDW_QKV 0 8192
+note 2. Tiny 64-float decay/beta on CPU (256 bytes read, 256 bytes written!)
+if not qdReadF32 get qdWork 0 QDW_AB 14 64
 ret false
 end
-if not qdReadF32 get qdWork 0 QDW_Z 1 4096
+b32 = mul gdnIdx 32
+for h ulong 32
+sp = qdSoftplus add get qdAbTmp h get qdDtC add b32 h
+put qdDbTmp h qdExp mul get qdAlogC add b32 h sp
+put qdDbTmp add 32 h qdSigmoid get qdAbTmp add 32 h
+end
+if not qdWriteF32 get qdWork 0 QDW_DB 5 64
 ret false
 end
-if not qdGdnConvNorm L gdnIdx
+note 3. GPU packet 2: exact FP32 gdn_step_real_f32 + out_proj (2 QMDs in ONE submit!)
+if not qdGdnEmitGpuStep L gdnIdx
 ret false
 end
-if not qdGdnLoadAB L
-ret false
-end
-qdGdnRunHeads gdnIdx
-ret qdRunOutProj L GDN_OUT_W GDN_OUT_S
+ret qdReadF32 get qdWork 0 QDW_AOUT 2 2048
 end
 
 global qdFaQn f32 256
@@ -1411,17 +1504,10 @@ end
 if not qdReadF32 get qdWork 0 QDW_V 4 512
 ret false
 end
-if not qdReadF32 get qdScaleMap 0 qdLayerSOff L FA_QNORM 13 256
-ret false
-end
+b256 = mul faIdx 256
 for d ulong 256
-put qdFaQn d add 1.0f32 get qdTmpVec d
-end
-if not qdReadF32 get qdScaleMap 0 qdLayerSOff L FA_KNORM 13 256
-ret false
-end
-for d ulong 256
-put qdFaKn d add 1.0f32 get qdTmpVec d
+put qdFaQn d get qdQnC add b256 d
+put qdFaKn d get qdKnC add b256 d
 end
 pf = f32 pos
 for j ulong 32
@@ -1544,28 +1630,6 @@ eo = add get qdWorkVa 0 add QDW_EMID mul k 4096
 ret qdEmitFp8 add get qdWorkVa 0 QDW_XN ew es eo 2048 1024
 end
 
-fn qdMoeRunGu L ulong isFa bool to bool
-shGuW = GDN_SH_GU_W
-shGuS = GDN_SH_GU_S
-if isFa
-shGuW = FA_SH_GU_W
-shGuS = FA_SH_GU_S
-end
-qdPktStart
-for k ulong 8
-if not qdMoeEmitExpGu L isFa k
-ret false
-end
-end
-ew = add qdLayerWVa L shGuW
-es = add qdLayerSVa L mul shGuS 2
-eo = add get qdWorkVa 0 QDW_SHMID
-if not qdEmitFp8 add get qdWorkVa 0 QDW_XN ew es eo 2048 1024
-ret false
-end
-ret qdPktRun
-end
-
 fn qdMoeEmitExpDn L ulong isFa bool k ulong to bool
 expW0 = GDN_EXP_W0
 expS0 = GDN_EXP_S0
@@ -1576,29 +1640,65 @@ end
 rk = get qdLexRank get qdIds k
 ew = add qdLayerWVa L add expW0 mul rk QD_EXP_WSTRIDE
 es = add qdLayerSVa L add mul expS0 2 mul rk QD_EXP_SSTRIDE
-ei = add get qdWorkVa 0 add QDW_EMID mul k 2048
+ei = add get qdWorkVa 0 add QDW_ESW mul k 2048
 eo = add get qdWorkVa 0 add QDW_EOUT mul k 8192
 ret qdEmitFp8 ei ew es eo 512 2048
 end
 
-fn qdMoeRunDn L ulong isFa bool to bool
+fn qdMoeEmitShGu L ulong isFa bool to bool
+shGuW = GDN_SH_GU_W
+shGuS = GDN_SH_GU_S
+if isFa
+shGuW = FA_SH_GU_W
+shGuS = FA_SH_GU_S
+end
+ew = add qdLayerWVa L shGuW
+es = add qdLayerSVa L mul shGuS 2
+eo = add get qdWorkVa 0 QDW_SHMID
+ret qdEmitFp8 add get qdWorkVa 0 QDW_XN ew es eo 2048 1024
+end
+
+fn qdMoeEmitShDn L ulong isFa bool to bool
 shDnW = GDN_SH_DN_W
 shDnS = GDN_SH_DN_S
 if isFa
 shDnW = FA_SH_DN_W
 shDnS = FA_SH_DN_S
 end
+ew = add qdLayerWVa L shDnW
+es = add qdLayerSVa L mul shDnS 2
+ei = add get qdWorkVa 0 add QDW_ESW 16384
+eo = add get qdWorkVa 0 QDW_SHOUT
+ret qdEmitFp8 ei ew es eo 512 2048
+end
+
+fn qdMoeRunAll L ulong isFa bool to bool
 qdPktStart
+for k ulong 8
+if not qdMoeEmitExpGu L isFa k
+ret false
+end
+end
+if not qdMoeEmitShGu L isFa
+ret false
+end
+qdPtr add get qdWorkVa 0 QDW_EMID
+qdPtr add get qdWorkVa 0 QDW_ESW
+if not qdPktEmitBx 6 18 256
+ret false
+end
 for k ulong 8
 if not qdMoeEmitExpDn L isFa k
 ret false
 end
 end
-ew = add qdLayerWVa L shDnW
-es = add qdLayerSVa L mul shDnS 2
-ei = add get qdWorkVa 0 QDW_SHMID
-eo = add get qdWorkVa 0 QDW_SHOUT
-if not qdEmitFp8 ei ew es eo 512 2048
+if not qdMoeEmitShDn L isFa
+ret false
+end
+qdPtr add get qdWorkVa 0 QDW_X
+qdPtr add get qdWorkVa 0 QDW_EOUT
+qdPtr add get qdWorkVa 0 QDW_WTS
+if not qdPktEmitBx 8 8 256
 ret false
 end
 ret qdPktRun
@@ -1634,31 +1734,23 @@ if not qdReadF32 get qdWork 0 QDW_ROUT 5 256
 ret false
 end
 qdRouterTop8 L
-if not qdReadF32 get qdScaleMap 0 qdLayerSOff L shGate 13 2048
-ret false
-end
+b2048 = mul L QD_H
 shDot = f32 0.0f32
 for d ulong 2048
-shDot = add shDot mul get qdTmpVec d get qdXn d
+shDot = add shDot mul get qdShGateC add b2048 d get qdXn d
 end
 shScale = qdSigmoid shDot
-if not qdMoeRunGu L isFa
+put qdWts 8 shScale
+if not qdWriteF32 get qdWork 0 QDW_X 6 QD_H
 ret false
 end
-if not qdMoeSwiglu
+if not qdWriteF32 get qdWork 0 QDW_WTS 7 9
 ret false
 end
-if not qdMoeRunDn L isFa
+if not qdMoeRunAll L isFa
 ret false
 end
-if not qdReadF32 get qdWork 0 QDW_EOUT 7 16384
-ret false
-end
-if not qdReadF32 get qdWork 0 QDW_SHOUT 9 2048
-ret false
-end
-qdMoeCombine shScale
-ret true
+ret qdReadF32 get qdWork 0 QDW_X 15 QD_H
 end
 
 fn qdLmPickTop64 to bool
@@ -1726,6 +1818,21 @@ end
 ret true
 end
 
+fn qdReadCandIds to bool
+if ne mapread get qdWork 0 QDW_CIDS qdIoBuf 0 256 256
+ret false
+end
+for j ulong 64
+p = mul j 4
+b0 = uint get qdIoBuf p
+b1 = shl uint get qdIoBuf add p 1 8
+b2 = shl uint get qdIoBuf add p 2 16
+b3 = shl uint get qdIoBuf add p 3 24
+put qdCandIds j or or b0 b1 or b2 b3
+end
+ret true
+end
+
 fn qdRunLmHead checkParity bool to ulong
 ss = f32 0.0f32
 for i ulong QD_H
@@ -1739,6 +1846,7 @@ end
 if not qdWriteF32 get qdWork 0 QDW_XN 0 QD_H
 ret 999999
 end
+note Single-submit 3-kernel W4 Two-Pass Exact lm_head: screen -> GPU chunk top-64 -> BF16 rescore!
 qdPktStart
 qdPtr get qdLmW4Va 0
 qdPtr add get qdLmW4Va 0 254279680
@@ -1748,16 +1856,11 @@ qdArg uint QD_VOCAB
 if not qdPktEmitBx 3 7760 256
 ret 999999
 end
-if not qdPktRun
+qdPtr add get qdWorkVa 0 QDW_LOGW4
+qdPtr add get qdWorkVa 0 QDW_CIDS
+if not qdPktEmitBx 7 64 256
 ret 999999
 end
-if not qdReadF32 get qdWork 0 QDW_LOGW4 10 QD_VOCAB
-ret 999999
-end
-if not qdLmPickTop64
-ret 999999
-end
-qdPktStart
 qdPtr mapaddr get qdLmBf16 0
 qdPtr add get qdWorkVa 0 QDW_XN
 qdPtr add get qdWorkVa 0 QDW_CIDS
@@ -1767,6 +1870,9 @@ if not qdPktEmitBx 4 64 32
 ret 999999
 end
 if not qdPktRun
+ret 999999
+end
+if not qdReadCandIds
 ret 999999
 end
 if not qdReadF32 get qdWork 0 QDW_CLOG 12 64
@@ -1798,7 +1904,7 @@ gdnIdx = ulong 0
 faIdx = ulong 0
 for L ulong QD_LAYERS
 isFa = eq rem L 4 3
-if not qdRmsNormLayer L 0
+if not qdRmsNormLayer L false
 ret 999999
 end
 if isFa
@@ -1815,11 +1921,7 @@ end
 for d ulong QD_H
 put qdX d add get qdX d get qdAout d
 end
-pnorm = GDN_POST_NORM
-if isFa
-pnorm = FA_POST_NORM
-end
-if not qdRmsNormLayer L pnorm
+if not qdRmsNormLayer L true
 ret 999999
 end
 if not qdStepMoe L isFa
@@ -1874,6 +1976,25 @@ if le get qdScaleMap 0 0
 ret 10
 end
 put qdScaleVa 0 mapaddr get qdScaleMap 0
+put qdGdnStateMap 0 nvalloc 62914560 true
+if le get qdGdnStateMap 0 0
+ret 10
+end
+put qdGdnStateVa 0 mapaddr get qdGdnStateMap 0
+for i ulong 65536
+put qdIoBuf i 0
+end
+for z ulong 960
+r = mapwrite get qdGdnStateMap 0 mul z 65536 qdIoBuf 0 65536
+end
+put qdGdnTailMap 0 nvalloc 2949120 true
+if le get qdGdnTailMap 0 0
+ret 10
+end
+put qdGdnTailVa 0 mapaddr get qdGdnTailMap 0
+for z ulong 45
+r = mapwrite get qdGdnTailMap 0 mul z 65536 qdIoBuf 0 65536
+end
 for s ulong 10
 m = nvalloc QD_SLAB_BYTES true
 if le m 0
@@ -1994,35 +2115,10 @@ end
 
 fn qdRunDbg to void
 r0 = qdLoadEmbed 248045
-r1 = qdRmsNormLayer 0 0
+r1 = qdRmsNormLayer 0 false
 r2 = qdStepGdn 0 0
-qdPrint qdDbgY
-qdPrintHex bitcast uint get qdY 0
-qdPrint qdMsgSp
-qdPrintHex bitcast uint get qdZ 0
 qdPrint qdDbgAout
 qdPrintHex bitcast uint get qdAout 0
-qdPrint qdMsgNl
-mxY = f32 0.0f32
-mxIdx = ulong 0
-for i ulong 4096
-v = get qdY i
-if lt v 0.0f32
-v = neg v
-end
-if gt v mxY
-mxY = v
-mxIdx = i
-end
-end
-qdPrint qdDbgX0
-qdPrintU mxIdx
-qdPrint qdMsgSp
-qdPrintHex bitcast uint get qdY mxIdx
-qdPrint qdMsgSp
-qdPrintHex bitcast uint get qdZ mxIdx
-qdPrint qdMsgSp
-qdPrintHex bitcast uint get qdLinNorm rem mxIdx 128
 qdPrint qdMsgNl
 end
 

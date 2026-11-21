@@ -50,14 +50,14 @@ Online adaptive sum-over-paths co-activation prefetcher (`39` cross-layer transi
 
 ## Real-Weight End-to-End 35B Decoder (`om/gpu/q36/decode/` -> `q36-decode`)
 
-`q36-decode` (`310 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) loads **all 40 real layers** (`layers-0..39.safetensors`, `~33.6 GB`) + `outside.safetensors` (`1.017 GB` BF16 `lm_head` + `embed_tokens` + `norm.weight`) directly from `~/models/qwen3.6-35b-a3b-fp8-95a723d0` into GB10 UVM across 10 contiguous slabs, quantizes `lm_head` on-GPU to W4 block-32 (`1.26 ms` two-pass exact), and runs full 40-layer Gated DeltaNet + Full-Attention (`hd=256`, partial RoPE `dim=64`) + 256-expert Top-8 MoE + Shared Expert + live Arboris online prefill and greedy decode on live GB10 silicon.
+`q36-decode` (`339 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) loads **all 40 real layers** (`layers-0..39.safetensors`, `~33.6 GB`) + `outside.safetensors` (`1.017 GB` BF16 `lm_head` + `embed_tokens` + `norm.weight`) directly from `~/models/qwen3.6-35b-a3b-fp8-95a723d0` into GB10 UVM across 10 contiguous slabs (`11.5 s` warm load), quantizes `lm_head` on-GPU to W4 block-32 (`1.26 ms` two-pass exact), and runs full 40-layer GPU Gated DeltaNet (`qGdnConvL2Fast` + exact FP32 `qGdnStepRealF32`) + Full-Attention (`hd=256`, partial RoPE `dim=64`) + 20-QMD single-submit 256-expert Top-8 MoE (`qSwiglu9Fast` + `qMoeCombine9Add`) + 3-QMD single-submit W4 `lm_head` (`qVocabChunkTop64` + `bf16_rescore_cands`) + live Arboris online tracking on live GB10 silicon.
 
-- Verified on live Spark GB10 silicon (exclusive quiet window `20261121T220035Z-0f6897`, `exit: 0`, quiet machine):
+- Verified on live Spark GB10 silicon (exclusive quiet window `20261121T221800Z-5dd1ee`, `exit: 0`, quiet machine):
   - Prompt: `<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think></think>` (`17` tokens).
   - **W4 Two-Pass Exact `lm_head` parity on real 40L hidden state:** **`PARITY=EXACT` vs Full BF16 (`tok=271`)**.
-  - **Generated output:** `271 760 6511 314 9338 369 2972 57590 159034 248046` → **`"\n\nThe capital of France is **Paris**.<|im_end|>"`**.
-  - **Live Arboris online hit rate (cold start, real 35B routing traces):** **`42%`** (`13.5×` above `3.1%` random top-8/256).
-  - **Speed (hybrid GPU GEMV/MoE/lm_head + exact FP32 CPU GDN/Attn glue):** `122 ms/tok` (`8.2 tok/s`); moving GDN/Attn onto the verified `emit_fast.om` GPU kernels is the next step toward the `48.9–65.75 tok/s` native GPFIFO envelope.
+  - **Generated output (exact through `<|im_end|>`):** `271 760 6511 314 9338 369 2972 57590 159034 248046` → **`"\n\nThe capital of France is **Paris**.<|im_end|>"`**.
+  - **Live Arboris online hit rate (cold start, real 35B routing traces):** **`40–42%`** (`13×` above `3.1%` random top-8/256).
+  - **Real-weight 35B zero-CUDA decode progression:** `122 ms/tok` (`8.2 tok/s`, initial hybrid) → `64 ms/tok` (`15.6 tok/s`, GPU FP32 GDN + GPU `in_proj_ab`) → `57 ms/tok` (`17.5 tok/s`, fused MoE + GPU Top-64 `lm_head`) → `45 ms/tok` (`22.2 tok/s`, spin-poll) → **`34 ms/tok` (`29.4 tok/s`, **`3.59×`** speedup with GPU `conv1d+SiLU+L2` + 20-QMD GPU MoE combine)**.
 
 ## Build and Run
 
