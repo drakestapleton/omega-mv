@@ -98,32 +98,39 @@ The windows held the chip lock shared and no quiet lock, so every time above is 
 
 ## Looped against unlooped on Omega source
 
-Trained on the GB10 with `gtrainf` (f32) on 2026-11-21, with the binary of the checks above, in nine windows opened `--gb10 shared --quiet none`. The data, the arms and what would be claimed were written down before the first window. One seed.
+Trained on the GB10 with `gtrainf` (f32) on 2026-11-21, with the binary of the checks above, in windows opened `--gb10 shared --quiet none`: nine for base and loop, seven for deep, one for the final checks. The data, the arms and what would be claimed were written down before the first window; the deep arm was added to that record when only the first base result was known. One seed.
 
-**Data.** Every tracked `.om` file of this repository at `f1f782afe`, except `train/omega-llm/tools/bench/`, with exact duplicate files dropped: 5,539 files. One file in twenty (by a checksum of its path) is held out. The training text is the other 5,262 files plus the 1,440 instruction-and-function records of `tools/contrast/contrast.om`: 29,808,159 bytes, 12,149,245 tokens under a 4096-token tokenizer fitted on it. The held-out text is 277 files, 633,611 tokens, 2,475 windows of 256. Near-duplicate files (vendored copies, test corpora) were not removed, so the held-out loss is optimistic for both arms alike.
+**Data.** Every tracked `.om` file of this repository at `f1f782afe`, except `train/omega-llm/tools/bench/`, with exact duplicate files dropped: 5,539 files. One file in twenty (by a checksum of its path) is held out. The training text is the other 5,262 files plus the 1,440 instruction-and-function records of `tools/contrast/contrast.om`: 29,808,159 bytes, 12,149,245 tokens under a 4096-token tokenizer fitted on it. The held-out text is 277 files, 633,611 tokens, 2,475 windows of 256. Near-duplicate files (vendored copies, test corpora) were not removed, so the held-out loss is optimistic for every arm alike.
 
-**Arms.** V 4096, T 256, D 384, H 12, F 1536, B 64, seed 1, learning rate 0.003, 6,000 steps (8.09 passes over the training tokens), 15,833,472 parameters each:
+**Arms.** V 4096, T 256, D 384, H 12, F 1536, B 64, seed 1, learning rate 0.003, 6,000 steps (8.09 passes over the training tokens):
 
-| Arm | `init` tail | Layers | Applications |
-| --- | --- | ---: | ---: |
-| base | `8 64 1 6000 3000 16` | 8 | 8 |
-| loop | `8 64 1 6000 3000 16 2 4 3` | 8 | 16 |
+| Arm | `init` tail | Layers | Applications | Parameters |
+| --- | --- | ---: | ---: | ---: |
+| base | `8 64 1 6000 3000 16` | 8 | 8 | 15,833,472 |
+| loop | `8 64 1 6000 3000 16 2 4 3` | 8 | 16 | 15,833,472 |
+| deep | `16 64 1 6000 3000 16` | 16 | 16 | 29,995,392 |
+
+Loop against base is the comparison at equal parameters; loop against deep is the comparison at equal compute.
 
 **Held-out loss** (chip `geval`, nats per token, all 2,475 windows):
 
-| Step | base | loop |
-| ---: | ---: | ---: |
-| 250 | 3.934575 | 4.066976 |
-| 1000 | 2.880189 | 2.892167 |
-| 2000 | 2.356329 | 2.309174 |
-| 3000 | 2.233483 | 2.193294 |
-| 4000 | 2.138132 | 2.123075 |
-| 5000 | 2.126762 | 2.125378 |
-| 6000 | 2.152378 | 2.144233 |
+| Step | base | loop | deep |
+| ---: | ---: | ---: | ---: |
+| 250 | 3.934575 | 4.066976 | 4.043863 |
+| 1000 | 2.880189 | 2.892167 | 3.001488 |
+| 2000 | 2.356329 | 2.309174 | 2.372067 |
+| 3000 | 2.233483 | 2.193294 | 2.207980 |
+| 4000 | 2.138132 | 2.123075 | 2.170525 |
+| 5000 | 2.126762 | 2.125378 | 2.154437 |
+| 6000 | 2.152378 | 2.144233 | 2.209630 |
 
-At step 6000 the looped model is 0.38% below the model without a loop. The rule written beforehand calls a gap under 1% no measured difference, and one seed cannot tell it from noise. Both arms stop improving between steps 4000 and 5000 and then get worse: the batch loss at step 6000 is about 1.18 in both, so both are fitting the training text. The looped model was ahead by 2.0% at step 2000 and 1.8% at step 3000, before that set in.
+Against base: at step 6000 the looped model is 0.38% below it. The rule written beforehand calls a gap under 1% no measured difference, and one seed cannot tell it from noise. The looped model was ahead by 2.0% at step 2000 and 1.8% at step 3000.
 
-The loop cost 1.84 times the wall time: 0.452 s per step against 0.246 s (36,300 against 66,600 tokens per second), on a shared machine.
+Against deep: the looped model is 2.96% below it at step 6000, and 1.46% below it when each arm is taken at its best stop (2.123075 at step 4000 against 2.154437 at step 5000). The rule written beforehand was that sharing weights cost nothing if the looped model ended no more than 1% above the 16-layer one; it ended below it.
+
+No arm improves after step 5000 and every arm is worse at step 6000, the largest model most: the batch loss at step 6000 is about 1.18 for base and loop and 1.08 for deep, against 2.14 to 2.21 held out. The corpus is too small for these models, and the 16-layer model loses because it fits the training text hardest. That is a result about this corpus, not evidence that shared weights match real depth when data is plentiful.
+
+Wall time per step on a shared machine: base 0.246 s, loop 0.452 s, deep 0.466 s (66,600, 36,300 and 35,200 tokens per second). The loop costs 1.84 times base and about the same as deep.
 
 **Coding benchmark** (`tools/bench/`, step-6000 checkpoints, CPU `sample`, one answer per task at temperature 0, training text given as the corpus):
 
@@ -131,18 +138,23 @@ The loop cost 1.84 times the wall time: 0.452 s per step against 0.246 s (36,300
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | base | 0 of 159 | 119 | 5 | 33 | 2 | 6 |
 | loop | 0 of 159 | 123 | 36 | 0 | 0 | 6 |
+| deep | 0 of 159 | 134 | 15 | 10 | 0 | 6 |
 
-Neither model solves a task it has not seen. Most answers are well-formed Omega that ends its own function and computes something else: asked for the argument squared plus one, the base model returns the argument plus one. The loop does not change that. Six tasks have their reference function somewhere in the repository's source, so they are set apart and not scored.
+No model solves a task it has not seen. Most answers are well-formed Omega that ends its own function and computes something else: asked for the argument squared plus one, the base model returns the argument plus one. Neither the loop nor real depth changes that. Six tasks have their reference function somewhere in the repository's source, so they are set apart and not scored.
+
+The looped model's answers were also sampled on the chip (`gsample`) in the final window: all 165 answer files are byte-identical to the CPU sampler's.
+
+**CPU against chip on the trained checkpoints.** `eval` and `geval` on the first 64 held-out windows print the same line for base (`E 6000 64 2409293 1579672`) and for loop (`E 6000 64 2354518 1543758`).
 
 What this run does not show:
 
-- Whether the loop helps. The answer here is no measured difference in held-out loss at equal parameters, at 1.84 times the cost, on a corpus small enough that both models overfit it.
-- Anything about a 16-layer model at equal compute (29,995,392 parameters). That arm is prepared and waits for the chip behind other work; it was not run when this was written.
-- CPU `eval` against chip `geval` on the trained checkpoints. The CPU side is done (first 64 held-out windows: base 2.409293, loop 2.354518); the chip side waits in the same queue. The same comparison held exactly in the checks above.
+- That a loop helps. At equal parameters there is no measured difference in held-out loss, at 1.84 times the cost.
+- That shared weights are as good as real depth in general. They were here, on a corpus all three models overfit.
+- Anything about coding ability: 0 of 159 for every arm.
 
-The receipt of the checks and of this run, with every hash, window and result line, is `evidence/omega-llm-gb10-loop.9cc64757bce18e0f1525a45110f492de1861cab5ebeab7bafb33bc5f8d772150.json` (source commit `688d278e`). The pre-registrations, logs and checkpoints are on the Spark under `~/work/ollm-loop-20261121/` (`gate/`, `run/`); the checkpoints are not in this repository.
+Two receipts hold every hash, window and result line: `evidence/omega-llm-gb10-loop.9cc64757bce18e0f1525a45110f492de1861cab5ebeab7bafb33bc5f8d772150.json` (the checks, base and loop) and `evidence/omega-llm-gb10-loop-deep.0aaa7af54916a38ea763418db90c2dd1f25907347df564198dbcaeecb3f3c258.json` (deep and the final window); both name source commit `688d278e`. The pre-registrations, logs and checkpoints are on the Spark under `~/work/ollm-loop-20261121/` (`gate/`, `run/`); the checkpoints are not in this repository.
 
 ## What is not done
 
 - Per-token exit from the loop and messages between passes are not built.
-- More seeds, a larger or cleaner Omega corpus, and BF16 training of a looped model.
+- More seeds, a corpus large enough that the arms do not overfit, and BF16 training of a looped model.

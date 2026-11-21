@@ -39,7 +39,7 @@ The [learned coding controller](tools/controller/README.md) trains routing and s
 
 ## Coding benchmark
 
-The [Omega coding benchmark](tools/bench/README.md) scores a checkpoint on 165 functions it has not seen, one behaviour each, with no help from the harness. Use it, not the panels above, to decide whether a change made the model better at writing Omega. The two models scored so far, trained from scratch on this repository's Omega source, pass 0 of 159.
+The [Omega coding benchmark](tools/bench/README.md) scores a checkpoint on 165 functions it has not seen, one behaviour each, with no help from the harness. Use it, not the panels above, to decide whether a change made the model better at writing Omega. The three models scored so far, trained from scratch on this repository's Omega source, pass 0 of 159.
 
 ## Looped core
 
