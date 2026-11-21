@@ -12,10 +12,13 @@ The exact gated entry points use FP16 parameters and the v1 sigmoid. For the exp
 
 `om/gpu/dsv41/build.sh` produces `arboris-expert-hints`. Its input starts with ASCII ARH1 followed by little-endian uint32 node count and hint budget (0 through 384). Each node contributes a uint32 layer-zero expert ID and a uint32 containing its settled FP32 score in [0,1]. Use 0xffffffff for an unmapped node. The program combines duplicate IDs by maximum, drops zero scores and breaks ties by ascending expert ID. For an in-process OM caller use `arboris_expert_hints` on the logical score plane and then `arboris_send_hints` on the cache event stream.
 
-The cache replay on `codex/dsv41-cache-layout` accepts these eight-byte speculative read records on its regular event input. Send hints while earlier work is in flight, then send authoritative demand events on the same ordered stream. For an offline replay with prepared score and demand files:
+The cache replay at `codex/dsv41-cache-layout@89e206d01` accepts these eight-byte speculative read records on its regular event input. Send hints while earlier work is in flight, then send authoritative demand events on the same ordered stream. For an offline replay with prepared score and demand files:
 
 ```sh
-( build/dsv41/arboris-expert-hints < scores.arh && cat demands.bin ) |
+hints=$(mktemp) || exit 1
+trap 'rm -f "$hints"' EXIT
+build/dsv41/arboris-expert-hints < scores.arh > "$hints" || : > "$hints"
+cat "$hints" demands.bin |
   build/dsv41-cache/replay layer0.pack > delivered.bin
 ```
 

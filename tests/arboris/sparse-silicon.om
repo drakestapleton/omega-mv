@@ -3,7 +3,24 @@ note Native differential probe. FD3 is the issuer table. Fork before either
 note process opens RM. The producer exits after import, closing all source
 note aliases before the worker validates inputs and publishes its command.
 
+fn probe_bank to ulong
+  if eq probe_layout 4
+    ret 1
+  end
+  ret 0
+end
+
+fn probe_decay to ulong
+  if eq probe_layout 4
+    ret 0x3f4ccccd
+  end
+  ret 0x3f000000
+end
+
 fn probe_start b ulong to ulong
+  if and eq probe_layout 4 eq b 1
+    ret 126
+  end
   if and eq probe_layout 1 eq b 1
     ret sub probe_n 3
   end
@@ -13,6 +30,9 @@ end
 fn probe_seed i ulong to ulong
   if ne probe_layout 0
     if eq rem i probe_n probe_start div i probe_n
+      if eq probe_layout 4
+        ret 0x3f19999a
+      end
       ret 0x3f800000
     end
     ret 0
@@ -24,6 +44,12 @@ fn probe_seed i ulong to ulong
 end
 
 fn probe_offset row ulong to ulong
+  if eq probe_layout 4
+    if eq row 1
+      ret 0
+    end
+    ret row
+  end
   if eq probe_layout 1
     ret row
   end
@@ -40,7 +66,7 @@ fn probe_offset row ulong to ulong
 end
 
 fn probe_source arc ulong to ulong
-  if and eq probe_layout 1 ne arc 0
+  if and or eq probe_layout 1 eq probe_layout 4 ne arc 0
     ret sub arc 1
   end
   ret arc
@@ -82,12 +108,15 @@ fn probe_fill m view ulong 16 i ulong tok long to bool
       if ne probe_layout 0
         weight = ulong 0x3f800000
       end
+      if eq probe_layout 4
+        weight = ulong 0x3f333333
+      end
       if ne mapset tok mul j 4 4 weight 0
         ret false
       end
     end
   end
-  if eq i 3
+  if eq i add 3 probe_bank
     for j ulong mul mul probe_n probe_batch probe_planes
       if ne mapset tok mul j 4 4 probe_seed j 0
         ret false
@@ -98,8 +127,10 @@ fn probe_fill m view ulong 16 i ulong tok long to bool
 end
 
 fn probe_match probe_scores view uint * words ulong to int
+  tok = get ar_maps sub ulong 4 probe_bank
+  base = add 4 mul words ulong get probe_scores 1
   for i ulong words
-    if ne get probe_scores add add mul ulong get probe_scores 1 words 4 i uint mapget get ar_maps 4 mul i 4 4
+    if ne get probe_scores add base i uint mapget tok mul i 4 4
       ret 31
     end
   end
@@ -180,7 +211,29 @@ fn pb_discard m view ulong 16 to bool
     ret false
   end
   put ar_fenced_seq 0 0
+  ar_drop_compute
   ret true
+end
+
+text pb_seq "submitted_seq="
+text pb_retired "retired_seq="
+text pb_receipt_seq "receipt_seq="
+text pb_receipt_status "receipt_status="
+text pb_wfi "wfi_marker="
+text pb_flushed "flush_marker="
+text pb_final "completion_marker="
+text pb_qmd "qmd_semaphore="
+fn pb_failure reason ulong queries ulong to void
+  probe_log ps_rc reason
+  probe_log pb_queries queries
+  probe_log pb_seq get nvput 0
+  probe_log pb_retired get nvret 0
+  probe_log pb_receipt_seq mapget get ar_maps 5 48 8
+  probe_log pb_receipt_status mapget get ar_maps 5 56 8
+  probe_log pb_wfi mapget get gbmem 3 0 4
+  probe_log pb_flushed mapget get gbmem 3 16 4
+  probe_log pb_final mapget get gbmem 3 32 4
+  probe_log pb_qmd mapget get gbmem 2 8192 4
 end
 
 fn pb_gpu table long h view ulong 2 m view ulong 16 to int
@@ -194,7 +247,9 @@ fn pb_gpu table long h view ulong 2 m view ulong 16 to int
     if not pb_discard m
       ret 53
     end
-    if ne probe_execute_sparse table h m 0
+    reason = probe_execute_sparse table h m
+    if ne reason 0
+      pb_failure reason queries
       ret 54
     end
     queries = add queries 1
@@ -208,14 +263,21 @@ fn pb_gpu table long h view ulong 2 m view ulong 16 to int
   ret 0
 end
 
+fn probe_copy_seeds scores edit uint * words ulong to void
+  tok = get ar_maps add 3 probe_bank
+  base = add 4 mul words probe_bank
+  for i ulong words
+    put scores add base i uint mapget tok mul i 4 4
+  end
+end
+
 fn probe_expected probe_topo view uint * probe_weights view uint * to int
   probe_scores = new uint 800004 0
   put probe_scores 0 uint probe_batch
-  put probe_scores 2 0x3f000000
+  put probe_scores 1 uint probe_bank
+  put probe_scores 2 uint probe_decay
   words = mul mul probe_n probe_batch probe_planes
-  for i ulong words
-    put probe_scores add i 4 uint mapget get ar_maps 3 mul i 4 4
-  end
+  probe_copy_seeds probe_scores words
   start = monons
   result = ulong 1
   if eq probe_planes 1
@@ -255,6 +317,14 @@ fn probe_compare to int
 end
 
 fn probe_open_sparse m view ulong 16 to bool
+  if eq probe_layout 4
+    if not ar_open_query m probe_n 3
+      ret false
+    end
+    put ar_query_variant 0 probe_n
+    put ar_query_variant 1 probe_hops
+    ret ar_bind_sparse_code m
+  end
   if eq probe_layout 1
     ret ar_open_query m probe_n probe_hops
   end
@@ -274,7 +344,7 @@ fn probe_execute_sparse table long h view ulong 2 meta view ulong 16 to ulong
     put spec 0 sub probe_n 2
   end
   put spec 1 probe_hops
-  put spec 2 0x3f000000
+  put spec 2 probe_decay
   ret ar_sparse_query table 42 h meta spec
 end
 
@@ -293,7 +363,7 @@ fn probe_run table long h view ulong 2 meta edit ulong 16 to int
   if not probe_open_sparse meta
     ret 22
   end
-  if not probe_arm_signer table meta h 0x3f000000
+  if not probe_arm_signer table meta h probe_decay
     ret 47
   end
   start = monons
@@ -333,12 +403,25 @@ fn probe_model_meta m edit ulong 16 to void
   put m 2 probe_batch
   put m 3 probe_n
   put m 4 probe_planes
+  put m 6 probe_bank
 end
 
 note Independent closed-form fixture with empty rows and two incoming arcs on
 note odd destinations. Weights and seeds are dyadic, so no floating oracle
 note shares the rounding or traversal implementation being checked.
 fn probe_golden v ulong b ulong plane ulong to ulong
+  if eq probe_layout 4
+    first = probe_start b
+    if or lt v first gt v add first probe_hops
+      ret 0
+    end
+    score = f32of 0x3f19999a
+    factor = mul f32of 0x3f333333 f32of probe_decay
+    for distance ulong sub v first bound 2
+      score = mul score factor
+    end
+    ret bitsof score
+  end
   if ne probe_layout 0
     b = probe_start b
     if eq v b
@@ -394,7 +477,7 @@ fn probe_reference to int
       ret 42
     end
   end
-  dest = get ar_maps 4
+  dest = get ar_maps sub ulong 4 probe_bank
   cells = div get m 11 4
   for i ulong cells
     row = div i probe_n

@@ -655,7 +655,7 @@ case "$step" in
       cat "$log"
       case "$model" in
         gated) halves=40; output=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089 ;;
-        experimental) halves=1320; output=21aa98cc216972743626af22a4614ebc7f5e5d8fe3681d8d513d5deaaecf88d6 ;;
+        experimental) halves=1320; output=c2437a10406d7aa8902c0a46eeca1b00413461689a8345cb0f62927d6b742fe5 ;;
         wide) halves=1320; output=ca8052acb8c6306df043531ab6c116c5d8dd69a7e565974338088119f8355e34 ;;
       esac
       grep -Eq '^step_message=4152425354503032[0-9a-f]{352}$' "$log"
@@ -667,7 +667,7 @@ case "$step" in
   arboris-sparse-silicon)
     sh seed/omega-from-seed.sh
     OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
-    for model in sparse small wave persistent hubs; do
+    for model in sparse small wave persistent hubs even; do
       log="$OUT_DIR/arboris-$model.log"
       "$OUT_DIR/caproot-issuer" "$OUT_DIR/$model-chip" --arboris-silicon > "$log" || {
         cat "$log"
@@ -675,6 +675,7 @@ case "$step" in
       }
       cat "$log"
       case "$model" in
+        even) words=24576; code=even.bin; output=48a04a4fc0bb0f8e14dca0855e21a1d239faec514a9e1d5c6696f273a798842d ;;
         persistent) words=258; code=persistent.bin; output=125cb0ac528c34014d14a0b99ac75afcf8e21cbd6b3a4845070bd9d5ab638ba4 ;;
         hubs) words=258; code=hubs.bin; output=d1a4e4639301e305a4f7768d14e642153ff5d4b2743bb011009ca9a5358a299b ;;
         sparse) words=200000; code=relax.bin; output=8ded4456ffe03d54cad43b7b7b8d07ff1997919c103dd1b49b61c6782d6e3d19 ;;

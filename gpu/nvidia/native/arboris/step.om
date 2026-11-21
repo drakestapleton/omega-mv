@@ -64,7 +64,7 @@ fn ar_sparse_data m view ulong 16 to bool
   ret true
 end
 
-fn ar_step_close to bool
+fn ar_retire_code to bool
   if ne get nvret 0 get nvput 0
     ret false
   end
@@ -91,6 +91,13 @@ fn ar_step_close to bool
   put ar_wave_spec 1 0
   put ar_code_nodes 0 0
   put ar_code_planes 0 0
+  ret true
+end
+
+fn ar_step_close to bool
+  if not ar_retire_code
+    ret false
+  end
   ar_drop_compute
   ret true
 end
@@ -308,7 +315,13 @@ note Slab 4 words 6 and 7 are the channel sequence and device completion.
 note The work QMD has already passed the post-flush WFI point. Publish the
 note 16-byte sequence/status record with inline DMA, then flush and release
 note the private completion marker. The host must observe both before sealing.
-const ar_receipt_complete uint 1095914034
+fn ar_completion_word seq ulong to uint
+  ret uint add 1 rem seq 0xffffffff
+end
+
+fn ar_channel_idle to bool
+  ret and eq get nvfault 0 0 eq get nvret 0 get nvput 0
+end
 fn ar_release_receipt va ulong seq ulong marker ulong to void
   gbdma add va 48 4
   gbemit gblo seq
@@ -316,7 +329,7 @@ fn ar_release_receipt va ulong seq ulong marker ulong to void
   gbemit 6
   gbemit 0
   gbflush
-  gbrel add marker 32 ar_receipt_complete
+  gbrel add marker 32 ar_completion_word seq
 end
 
 fn ar_device_receipt tok long seq ulong to bool
@@ -329,7 +342,42 @@ fn ar_device_receipt tok long seq ulong to bool
   ret and eq mapget tok 48 8 seq eq mapget tok 0 8 0
 end
 
+note The private WFI semaphore and imported receipt occupy different mappings.
+note Retire logical work only once all writes for this exact sequence are visible.
+fn ar_work_visible tok long mark long q long seq ulong to bool
+  if not ar_device_receipt tok seq
+    ret false
+  end
+  if ne mapget mark 16 4 1179010630
+    ret false
+  end
+  ret and eq mapget mark 0 4 1145324612 eq mapget q 8192 4 6
+end
+
+fn ar_wait_visible tok long mark long q long seq ulong to bool
+  start = monons
+  while true
+    if ar_work_visible tok mark q seq
+      ret true
+    end
+    if ne mapget tok 0 8 0
+      ret false
+    end
+    now = monons
+    if or lt now start ge sub now start 5000000000
+      ret false
+    end
+    if ne sleepns 100000 0
+      ret false
+    end
+  end
+  ret false
+end
+
 fn ar_step_send to bool
+  if or not ar_channel_idle ne get ar_fenced_seq 0 0
+    ret false
+  end
   q = get gbmem 2
   mark = get gbmem 3
   if ne mapset q 8192 4 0 0
@@ -363,14 +411,10 @@ fn ar_step_send to bool
   if not nvsend get gbmem 0 0 uint div bytes 4
     ret false
   end
-  if not nvwait mark 32 ar_receipt_complete 5000000000
+  if not nvwait mark 32 ar_completion_word seq 5000000000
     ret false
   end
-  if or not ar_device_receipt tok seq ne mapget mark 16 4 1179010630
-    put nvfault 0 1
-    ret false
-  end
-  if or ne mapget mark 0 4 1145324612 ne mapget q 8192 4 6
+  if not ar_wait_visible tok mark q seq
     put nvfault 0 1
     ret false
   end
@@ -419,11 +463,11 @@ fn ar_sparse_dispatch table long subject ulong h view ulong 2 m view ulong 16 de
   if ne get ar_fenced_seq 0 0
     ret 7
   end
-  if not ar_claim_compute 2
+  if or not ar_channel_idle not ar_claim_compute 2
     ret 8
   end
   rc = ar_sparse_locked table subject h m decay threshold
-  if and ne rc 0 eq get nvret 0 get nvput 0
+  if and ne rc 0 ar_channel_idle
     ar_drop_compute
   end
   ret rc
