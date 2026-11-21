@@ -103,8 +103,6 @@ static int unbroadcast(OmegaAdTape *t, OmegaTensor full, const OmegaTensorInfo *
         rel(t, cur);
         if (rc) return rc;
         cur = next;
-        rc = omega_tensor_info(t->ctx, cur, &ci);
-        if (rc) { rel(t, cur); return rc; }
     }
     *out = cur;
     return OMEGA_AD_OK;

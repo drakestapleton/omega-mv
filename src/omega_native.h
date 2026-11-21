@@ -503,7 +503,7 @@ uint32_t omega2_osc_join_snapshot(uint64_t *result, const uint32_t *o_saved, uin
 uint32_t omega2_osc_snapshot_moves(uint64_t *result, const uint32_t *o_saved, uint64_t o_saved_len, const uint32_t *o_owners, uint64_t o_owners_len, int32_t *o_ids, uint64_t o_ids_len);
 /* export fn osc_join_branch_owners saved view uint * owners edit uint 1280 symbols view uint 19200 nodes edit uchar * to void */
 uint32_t omega2_osc_join_branch_owners(uint64_t *result, const uint32_t *o_saved, uint64_t o_saved_len, uint32_t *o_owners, uint64_t o_owners_len, const uint32_t *o_symbols, uint64_t o_symbols_len, uint8_t *o_nodes, uint64_t o_nodes_len);
-#define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=9f471816bc623421c8440cb5f457add54f37134ac34ff0819e46347552c1804f omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_osc_scope "omega-ident 1 unit=osc_scope abi=2 profile=OM-2 src=3ea7728a06f805778e2d0b4ea915ba8d395d004feab00a719a38f4e42fe997d8 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_osc_scope(void);
 /* export fn osc_scope_reset table edit scopetab to void */
 uint32_t omega2_osc_scope_reset(uint64_t *result, uint8_t *o_table);
@@ -583,7 +583,7 @@ const char *omega2_ident_osc_artifact(void);
 uint32_t omega2_osc_artifact_entry(uint64_t *result, const uint8_t *o_row, const uint8_t *o_name, uint64_t o_name_len, uint8_t *o_dst, uint64_t o_dst_len);
 /* export fn osc_artifact_hex digest view uchar 32 dst edit uchar 65 to void */
 uint32_t omega2_osc_artifact_hex(uint64_t *result, const uint8_t *o_digest, uint64_t o_digest_len, uint8_t *o_dst, uint64_t o_dst_len);
-#define OMEGA2_IDENT_tensor_shape "omega-ident 1 unit=tensor_shape abi=2 profile=OM-2 src=9cbb17bafb1049adc9e5cabba97c6036771ca382d85d9ce2cc69440a5d97d64a omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+#define OMEGA2_IDENT_tensor_shape "omega-ident 1 unit=tensor_shape abi=2 profile=OM-2 src=d720b5574598aa924ac4c75960b5256bd495fffa466c8a3ff7d915e692fb6039 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_tensor_shape(void);
 /* export fn tensor_shape_size dims view ulong * elems edit ulong 1 to long */
 uint32_t omega2_tensor_shape_size(uint64_t *result, const uint64_t *o_dims, uint64_t o_dims_len, uint64_t *o_elems, uint64_t o_elems_len);
