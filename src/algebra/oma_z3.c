@@ -77,7 +77,7 @@ int oma_z3_block_validate(const oma_z3_block *b) {
 int oma_z3_block_encode(const uint8_t in[OMA_BLOCK_TRITS], oma_z3_block *out) {
     uint64_t dst[2] = { 0, 0 }, rc = 0;
     if (!in || !out) return OMA_E_ARG;
-    (void)omega2_oma_om_z3_encode(&rc, in, OMA_BLOCK_TRITS, dst, 2);
+    if (omega2_oma_om_z3_encode(&rc, in, OMA_BLOCK_TRITS, dst, 2) != 0) return OMA_E_NATIVE;
     if (rc) return -(int)rc;
     out->one = dst[0];
     out->two = dst[1];
@@ -87,7 +87,7 @@ int oma_z3_block_encode(const uint8_t in[OMA_BLOCK_TRITS], oma_z3_block *out) {
 int oma_z3_block_decode(const oma_z3_block *b, uint8_t out[OMA_BLOCK_TRITS]) {
     uint64_t rc = 0;
     if (!b || !out) return OMA_E_ARG;
-    (void)omega2_oma_om_z3_decode(&rc, b->one, b->two, out, OMA_BLOCK_TRITS);
+    if (omega2_oma_om_z3_decode(&rc, b->one, b->two, out, OMA_BLOCK_TRITS) != 0) return OMA_E_NATIVE;
     return rc ? -(int)rc : OMA_OK;
 }
 

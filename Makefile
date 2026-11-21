@@ -1642,20 +1642,27 @@ argus-replay: $(ARGUS_REPLAY)
 # quantization. Plain C11, no runtime or physics dependencies.
 # test-algebra-asan reruns the same suite under address+undefined sanitizers.
 .PHONY: test-algebra test-algebra-asan
-OMA_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -Isrc -Wno-pedantic
-OMA_SRCS = src/algebra/oma_trit.c src/algebra/oma_z3.c src/algebra/oma_pack.c src/algebra/oma_quant.c src/omega_om_units.c
+OMA_BIND = $(OUT_DIR)/tests-algebra/native.o
+OMA_BIND_ASAN = $(OUT_DIR)/tests-algebra/native_asan.o
+$(OMA_BIND) $(OMA_BIND_ASAN): src/omega_om_units.c src/omega_native.h src/omega_api_decl.h
+	@mkdir -p $(dir $@)
+	$(CC) $(OMA_CFLAGS) -Wno-pedantic $(OMA_BIND_FLAGS) -c $< -o $@
+$(OMA_BIND_ASAN): OMA_BIND_FLAGS = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
+
+OMA_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -Isrc
+OMA_SRCS = src/algebra/oma_trit.c src/algebra/oma_z3.c src/algebra/oma_pack.c src/algebra/oma_quant.c
 OMA_HDRS = src/algebra/oma_trit.h src/algebra/oma_z3.h src/algebra/oma_pack.h src/algebra/oma_quant.h
 OMA_TEST = $(OUT_DIR)/tests-algebra/test_oma
 OMA_TEST_ASAN = $(OUT_DIR)/tests-algebra/test_oma_asan
 
-$(OMA_TEST): tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_HDRS)
+$(OMA_TEST): tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_oma.c $(OMA_SRCS) -lm
+	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_BIND) -lm
 
-$(OMA_TEST_ASAN): tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_HDRS)
+$(OMA_TEST_ASAN): tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND_ASAN)
 	@mkdir -p $(dir $@)
 	$(CC) $(OMA_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_oma.c $(OMA_SRCS) -lm
+		-o $@ tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_BIND_ASAN) -lm
 
 test-algebra: $(OMA_TEST)
 	./$(OMA_TEST)
@@ -1685,7 +1692,7 @@ OMA_RZ_SRCS = src/algebra/realize_common.c src/algebra/realize_binary.c \
 	src/algebra/realize_bitplane.c src/algebra/realize_sparse.c \
 	src/algebra/realize_rns.c src/algebra/realize_dense.c
 OMA_RZ_HDRS = src/algebra/realize_common.h
-OMA_SEL_SRCS = src/algebra/oma_select.c src/omega_om_units.c
+OMA_SEL_SRCS = src/algebra/oma_select.c
 OMA_SEL_HDRS = src/algebra/oma_select.h
 OMA_RZ_TEST = $(OUT_DIR)/tests-algebra/test_realize
 OMA_RZ_TEST_ASAN = $(OUT_DIR)/tests-algebra/test_realize_asan
@@ -1696,22 +1703,22 @@ MA2_RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
 MA2_RUN_ID := $(MA2_RUN_ID)
 MA2_RUN_DIR = $(MA2_EVIDENCE)/runs/$(MA2_RUN_ID)
 
-$(OMA_RZ_TEST): tests/algebra/test_realize.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) src/algebra/oma_select.c $(OMA_SEL_HDRS) $(OMA_SRCS) $(OMA_HDRS)
+$(OMA_RZ_TEST): tests/algebra/test_realize.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) src/algebra/oma_select.c $(OMA_SEL_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/test_realize.c $(OMA_RZ_SRCS) src/algebra/oma_select.c $(OMA_SRCS) -lm
+	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/test_realize.c $(OMA_RZ_SRCS) src/algebra/oma_select.c $(OMA_SRCS) $(OMA_BIND) -lm
 
-$(OMA_RZ_TEST_ASAN): tests/algebra/test_realize.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) src/algebra/oma_select.c $(OMA_SEL_HDRS) $(OMA_SRCS) $(OMA_HDRS)
+$(OMA_RZ_TEST_ASAN): tests/algebra/test_realize.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) src/algebra/oma_select.c $(OMA_SEL_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND_ASAN)
 	@mkdir -p $(dir $@)
 	$(CC) $(OMA_RZ_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_realize.c $(OMA_RZ_SRCS) src/algebra/oma_select.c $(OMA_SRCS) -lm
+		-o $@ tests/algebra/test_realize.c $(OMA_RZ_SRCS) src/algebra/oma_select.c $(OMA_SRCS) $(OMA_BIND_ASAN) -lm
 
 $(OMA_RZ_BENCH): tests/algebra/bench_mixed_algebra.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/bench_mixed_algebra.c $(OMA_RZ_SRCS) -lm
 
-$(OMA_RZ_SELECT): tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_SEL_HDRS) $(OMA_RZ_SRCS) $(OMA_RZ_HDRS)
+$(OMA_RZ_SELECT): tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_SEL_HDRS) $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_BIND)
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_RZ_SRCS) -lm
+	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_RZ_SRCS) $(OMA_BIND) -lm
 
 test-realize: $(OMA_RZ_TEST) $(OMA_RZ_TEST_ASAN)
 	./$(OMA_RZ_TEST)
@@ -1754,7 +1761,7 @@ bench-mixed-algebra: $(OMA_RZ_BENCH) $(OMA_RZ_SELECT)
 # phase-twin-receipt: from a clean committed tree only, copies the full
 #   receipt to evidence/MIXED_ALGEBRA/phase_twin_receipt.<sha256>.json.
 .PHONY: test-phase-twin phase-twin-receipt
-PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c src/omega_om_units.c
+PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c
 PT_HDRS = src/algebra/phase_twin.h src/algebra/oma_z3.h src/algebra/oma_trit.h
 PT_OUT = $(OUT_DIR)/tests-algebra
 PT_TEST = $(PT_OUT)/test_phase_twin
@@ -1764,14 +1771,14 @@ PT_ENV = PT_COMMIT=$$(git rev-parse HEAD) \
 	PT_TOOLCHAIN="$$($(CC) --version | head -1)"
 PT_VOLATILE = '"(git_commit|tree_dirty|run_id|toolchain)"'
 
-$(PT_TEST): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS)
+$(PT_TEST): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS) $(OMA_BIND)
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) -lm
+	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) $(OMA_BIND) -lm
 
-$(PT_TEST_ASAN): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS)
+$(PT_TEST_ASAN): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS) $(OMA_BIND_ASAN)
 	@mkdir -p $(dir $@)
 	$(CC) $(OMA_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) -lm
+		-o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) $(OMA_BIND_ASAN) -lm
 
 test-phase-twin: $(PT_TEST) $(PT_TEST_ASAN)
 	$(PT_ENV) ./$(PT_TEST) $(PT_OUT)/phase_twin_receipt.json
@@ -1857,14 +1864,14 @@ DV1_BOTTOM_ASAN = $(OUT_DIR)/tests-algebra/test_ma_digital_bottom_asan
 DV1_GATE_BIN = $(OUT_DIR)/tests-algebra/ma_digital_v1_gate
 DV1_GATE_BIN_ASAN = $(OUT_DIR)/tests-algebra/ma_digital_v1_gate_asan
 
-$(DV1_BOTTOM): tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_SRCS) $(OMA_HDRS)
+$(DV1_BOTTOM): tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_SRCS) -lm
+	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_SRCS) $(OMA_BIND) -lm
 
-$(DV1_BOTTOM_ASAN): tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_SRCS) $(OMA_HDRS)
+$(DV1_BOTTOM_ASAN): tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND_ASAN)
 	@mkdir -p $(dir $@)
 	$(CC) $(OMA_RZ_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_SRCS) -lm
+		-o $@ tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_SRCS) $(OMA_BIND_ASAN) -lm
 
 $(DV1_GATE_BIN): tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) $(TURING_HDRS)
 	@mkdir -p $(dir $@)
