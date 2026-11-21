@@ -31,7 +31,7 @@ Build the shard worker and the real-weight resolver control on the same head.
 (echo om2
  sed -n '/^layout /,/^end$/p' om/sha256/sha256-om2.om om/runtime/slab_arena.om
  sed '/^layout /,/^end$/d;/^om2$/d;s/^export fn /fn /' om/sha256/sha256-om2.om om/runtime/slab_arena.om
- cat "$d/io.om" "$d/resolve.om" "$d/check-resolve.om") |
+ cat gpu/nvidia/native/arboris/compute-lock.om "$d/io.om" "$d/lease.om" "$d/resolve.om" "$d/check-resolve.om") |
     seed/out/omc > "$out/check-resolve"
 chmod +x "$out/payload-index" "$out/check-resolve"
 "$out/payload-index" "$out/tensors.bin" 03 "$checkpoint/model-00003-of-00048.safetensors" > "$out/layer0.bin"
@@ -43,3 +43,36 @@ Run the worker for each shard 03 through 42 and for the two Engram shards 47 and
 Expert records have 64 bytes. Bytes 0 and 1 hold shard and layer, bytes 4..7 the expert ID, bytes 8..15 the first eight bytes of SHA-256 in digest order, and six little-endian u64 offsets start at byte 16. The digest covers W1, W2 and W3 weights followed by W1, W2 and W3 scales. The resolver verifies these same bytes in Zone 4 before it claims a FIFO victim. It publishes the slot only after the entire copy completes. A checksum mismatch leaves the resident slot and FIFO cursor intact.
 
 The Engram sidecar starts with a 32-byte header containing shard, layer, row count, weight base and scale base. Each row contributes an eight-byte digest prefix in row order. Row i reads 256 weight bytes at weight_base + 256i and eight scale bytes at scale_base + 8i. The hash covers the two extents in that order.
+
+## Native build controls
+
+The backbone catalog uses the same 28 emitter functions as the checkpoint operator export. Its QMD recorder supports three grid dimensions and keeps the six native head entries. The host catalog control emits the aligned instruction image without opening the driver.
+
+The CPU Engram path uses the original tokenizer's fixed remap data in `engram-token-map.u32`. The table and the constants in `engram-layout.om` were exported from the pinned reference's `build_compressed_token_map`, `compute_hash_multipliers` and `EngramLayout.from_args`. The native loader verifies the remap SHA-256 before accepting a token. A verified 264-byte row comprises its original FP8 weight plane and E8M0 scales.
+
+The trace writer takes the six IDs and original FP32 weight bits after the native gate, without issuing another GPU kernel. Each 80-byte record has u32 turn, turn-local token, layer and reserved words, six u32 IDs, six u32 weight bit patterns, and u64 gate-ready and consumer-need timestamps. The static ring retains one context page of 2,048 tokens. Drain committed entries on the CPU lease before reusing their storage, and finalize the stream SHA-256 after a complete token.
+
+The resident checkpoint planner packs the original embedding, head, norms, routers, shared experts, attention and Engram auxiliary tensors on 256-byte boundaries. Its host control accepts the tensor directory alone to serialize the planned allocation, original payload bytes and tensor count as three u64 words. Supply the 48 verified shard paths as further arguments to populate the whole mapping and measure process RSS. KV and execution workspace allocations are separate.
+
+```sh
+(echo om2
+ sed '/^om2$/d;s/^export fn /fn /' om/sha256/sha256-om2.om
+ cat seed/ng/sha256.om "$d/checkpoint.om" "$d/io.om" "$d/core.om" "$d/check-core.om") |
+    seed/out/omc > "$out/check-core"
+(echo om2
+ sed '/^om2$/d;s/^export fn /fn /' om/sha256/sha256-om2.om
+ cat seed/ng/sha256.om gpu/nvidia/native/arboris/compute-lock.om "$d/io.om" "$d/engram-layout.om" "$d/engram.om" "$d/check-engram.om") |
+    seed/out/omc > "$out/check-engram"
+(echo om2
+ sed '/^om2$/d;s/^export fn /fn /' om/sha256/sha256-om2.om
+ cat gpu/nvidia/native/arboris/compute-lock.om "$d/io.om" "$d/trace.om" "$d/check-trace.om") |
+    seed/out/omc > "$out/check-trace"
+(echo om2
+ cat gpu/nvidia/native/nvrm/context.om gpu/nvidia/native/blackwell/vector.om gpu/nvidia/native/blackwell/launch.om gpu/nvidia/native/blackwell/batch.om om/encoder/bw_enc_sm121.om om/gpu/dsv41/emit.om om/gpu/dsv41/head/launch.om "$d/native.om" "$d/check-catalog.om") |
+    seed/out/omc > "$out/check-catalog"
+chmod +x "$out"/check-*
+"$out/check-core" "$out/tensors.bin" "$checkpoint"/model-?????-of-00048.safetensors > "$out/core.bin"
+"$out/check-engram" "$d/engram-token-map.u32" > "$out/engram-control.ids"
+"$out/check-trace" > "$out/trace-control.bin" 2> "$out/trace-control.sha256.raw"
+"$out/check-catalog" > "$out/code.bin"
+```

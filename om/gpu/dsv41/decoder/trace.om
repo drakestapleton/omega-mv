@@ -1,0 +1,129 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Capture the already-resolved gate outputs after the channel fence.
+note No trace kernel, second device read, sampling, float conversion or sort.
+note Ring capacity is one 2048-token page across all 40 layers. Drain to the
+note archive on a CPU lease before reusing a slot. The incremental full
+note SHA-256 covers every emitted byte in insertion order.
+const dtCapacity ulong 81920
+global dtRing uint 1638400
+global dtCount ulong 2
+global dtLast ulong 5
+
+fn dtStart ctx edit shactx to void
+  for i ulong 2
+    put dtCount i 0
+  end
+  for i ulong 5
+    put dtLast i 0
+  end
+  sha256_init ctx
+end
+
+fn dtNext turn uint token uint layer uint to bool
+  if eq get dtCount 0 0
+    ret and eq token 0 eq layer 0
+  end
+  if lt get dtLast 2 39
+    ret and eq ulong turn get dtLast 0 and eq ulong token get dtLast 1 eq ulong layer add get dtLast 2 1
+  end
+  if ne layer 0
+    ret false
+  end
+  if eq ulong turn get dtLast 0
+    ret eq ulong token add get dtLast 1 1
+  end
+  ret and eq ulong turn add get dtLast 0 1 eq token 0
+end
+
+fn dtRoute okids view uint 6 weights view uint 6 to bool
+  for i ulong 6
+    if or ge get okids i 384 gt get weights i 0x3fc00000
+      ret false
+    end
+    for j ulong i bound 6
+      if eq get okids i get okids j
+        ret false
+      end
+    end
+  end
+  ret true
+end
+
+fn dtAppend coord view uint 3 ids view uint 6 weights view uint 6 times view ulong 2 to bool
+  if or ne get ar_compute_kind 0 1 ne get ar_compute_pid 0 long getpid
+    ret false
+  end
+  if or ne get dtLast 4 0 ge sub get dtCount 0 get dtCount 1 dtCapacity
+    ret false
+  end
+  if not dtNext get coord 0 get coord 1 get coord 2
+    ret false
+  end
+  if or lt get times 0 get dtLast 3 lt get times 1 get times 0
+    ret false
+  end
+  if not dtRoute ids weights
+    ret false
+  end
+  base = mul rem get dtCount 0 dtCapacity 20
+  for i ulong 3
+    put dtRing add base i get coord i
+    put dtLast i ulong get coord i
+  end
+  put dtRing add base 3 0
+  for i ulong 6
+    put dtRing add add base 4 i get ids i
+    put dtRing add add base 10 i get weights i
+  end
+  for i ulong 2
+    off = add add base 16 mul i 2
+    put dtRing off uint and get times i 0xffffffff
+    put dtRing add off 1 uint shr get times i 32
+  end
+  put dtLast 3 get times 1
+  put dtCount 0 add get dtCount 0 1
+  ret true
+end
+
+fn dtDrain fd int ctx edit shactx to bool
+  if or ne get ar_compute_kind 0 1 ne get ar_compute_pid 0 long getpid
+    ret false
+  end
+  if ne get dtLast 4 0
+    ret false
+  end
+  buf = new uchar 80 0
+  while lt get dtCount 1 get dtCount 0
+    base = mul rem get dtCount 1 dtCapacity 20
+    for i ulong 20
+      diPut buf mul i 4 4 ulong get dtRing add base i
+    end
+    used = ulong 0
+    while lt used 80
+      n = write fd buf used sub 80 used
+      if eq n -4
+        continue
+      end
+      if le n 0
+        put dtLast 4 1
+        ret false
+      end
+      used = add used ulong n
+    end
+    sha256_update ctx buf
+    put dtCount 1 add get dtCount 1 1
+  end
+  ret true
+end
+
+fn dtFinish fd int ctx edit shactx digest out uchar 32 to bool
+  if or eq get dtCount 0 0 ne get dtLast 2 39
+    ret false
+  end
+  if not dtDrain fd ctx
+    ret false
+  end
+  sha256_final ctx digest
+  put dtLast 4 2
+  ret true
+end
