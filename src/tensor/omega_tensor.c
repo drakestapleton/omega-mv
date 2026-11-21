@@ -265,18 +265,12 @@ static int broadcast_info(const OmegaTensorInfo *in, uint32_t rank, const uint64
 /* Copy every element in logical row-major order into dst (element size es). */
 static void gather(const StorageSlot *s, const OmegaTensorInfo *in, void *dst) {
     size_t es = omega_dtype_size(in->dtype);
-    uint64_t idx[OMEGA_TENSOR_MAX_RANK] = {0};
-    uint64_t pos = in->offset;
-    const uint8_t *src = s->data;
-    uint8_t *d = dst;
-    for (uint64_t e = 0; e < in->elements; e++) {
-        memcpy(d + e * es, src + pos * es, es);
-        for (uint32_t ax = in->rank; ax-- > 0;) {
-            if (++idx[ax] < in->shape[ax]) { pos += in->strides[ax]; break; }
-            pos -= (in->shape[ax] - 1) * in->strides[ax];
-            idx[ax] = 0;
-        }
-    }
+    uint64_t desc[21] = {0};
+    memcpy(desc, in->shape, sizeof(in->shape));
+    memcpy(desc + 8, in->strides, sizeof(in->strides));
+    desc[16] = in->rank; desc[17] = in->offset; desc[18] = es; desc[19] = in->elements; desc[20] = 0;
+    tensor_copy_op((const uint8_t *)s->data, (size_t)s->elems * es,
+                   (uint8_t *)dst, (size_t)in->elements * es, desc);
 }
 
 /* New tensor owning fresh dense storage. *data receives the storage buffer
@@ -503,10 +497,11 @@ int omega_tensor_transpose(OmegaTensorCtx *ctx, OmegaTensor t, OmegaTensor *out)
     if (rc) return rc;
     uint32_t r = x->info.rank;
     if (r < 2) return OMEGA_TENSOR_ERR_RANK;
+    uint64_t zeros[8] = {0}, out_buf[24] = {0};
+    const uint64_t meta[4] = { r, 0, 0, 0 };
+    tensor_plan_op(zeros, zeros, out_buf, meta);
     uint32_t perm[OMEGA_TENSOR_MAX_RANK];
-    for (uint32_t d = 0; d < r; d++) perm[d] = d;
-    perm[r - 2] = r - 1;
-    perm[r - 1] = r - 2;
+    for (uint32_t d = 0; d < r; d++) perm[d] = (uint32_t)out_buf[d];
     return omega_tensor_permute(ctx, t, perm, out);
 }
 
@@ -628,7 +623,9 @@ int omega_tensor_cast(OmegaTensorCtx *ctx, OmegaTensor t, OmegaDType to, OmegaTe
         uint16_t *h = malloc(n * sizeof(uint16_t));
         if (!h) { free(src); free(dst); return OMEGA_TENSOR_ERR_CAPACITY; }
         gather(s, &in, h);
-        for (size_t i = 0; i < n; i++) src[i] = omega_bits_to_float(h[i]);
+        uint64_t cdesc[21] = {0};
+        cdesc[19] = n; cdesc[20] = 2;
+        tensor_copy_op((const uint8_t *)h, n * 2, (uint8_t *)src, n * 4, cdesc);
         free(h);
         op = in.dtype == OMEGA_DT_F16 ? OMEGA_NOP_F16_TO_F32 : OMEGA_NOP_BF16_TO_F32;
     }
@@ -640,8 +637,9 @@ int omega_tensor_cast(OmegaTensorCtx *ctx, OmegaTensor t, OmegaDType to, OmegaTe
     if (to == OMEGA_DT_F32) {
         memcpy(buf, dst, n * sizeof(float));
     } else {
-        uint16_t *o = buf;
-        for (size_t i = 0; i < n; i++) o[i] = (uint16_t)(omega_float_to_bits(dst[i]) & 0xffffU);
+        uint64_t cdesc[21] = {0};
+        cdesc[19] = n; cdesc[20] = 3;
+        tensor_copy_op((const uint8_t *)dst, n * 4, (uint8_t *)buf, n * 2, cdesc);
     }
     free(src);
     free(dst);
@@ -842,9 +840,11 @@ int omega_tensor_full(OmegaTensorCtx *ctx, uint32_t rank, const uint64_t *shape,
     int rc = new_dense(ctx, OMEGA_DT_F32, rank, shape, out, &buf);
     if (rc) return rc;
     uint32_t u = omega_float_to_bits(value); /* MUT:FULL_CANON */
-    uint32_t *p = buf;
     size_t n = (size_t)ctx->ts[out->slot].info.elements;
-    for (size_t i = 0; i < n; i++) p[i] = u;
+    uint64_t fdesc[21] = {0};
+    uint8_t dummy = 0;
+    fdesc[17] = u; fdesc[19] = n; fdesc[20] = 4;
+    tensor_copy_op(&dummy, 1, (uint8_t *)buf, n * 4, fdesc);
     return OMEGA_TENSOR_OK;
 }
 
@@ -915,22 +915,15 @@ int omega_tensor_reduce(OmegaTensorCtx *ctx, OmegaTensorReduceOp op, OmegaTensor
     if (axis >= in.rank) return OMEGA_TENSOR_ERR_AXIS;
     /* Move the axis last (descriptor only), gather rows densely. */
     OmegaTensorInfo moved = in;
-    uint32_t k = 0;
-    for (uint32_t d = 0; d < in.rank; d++) {
-        if (d == axis) continue;
-        moved.shape[k] = in.shape[d];
-        moved.strides[k] = in.strides[d];
-        k++;
-    }
-    moved.shape[k] = in.shape[axis];
-    moved.strides[k] = in.strides[axis];
     size_t n = (size_t)in.shape[axis], rows = (size_t)(in.elements / in.shape[axis]);
     uint32_t orank = keepdims ? in.rank : in.rank - 1;
-    uint64_t oshape[OMEGA_TENSOR_MAX_RANK];
-    for (uint32_t d = 0, j = 0; d < in.rank; d++) {
-        if (d == axis) { if (keepdims) oshape[j++] = 1; continue; }
-        oshape[j++] = in.shape[d];
-    }
+    uint64_t oshape[OMEGA_TENSOR_MAX_RANK] = {0};
+    uint64_t out_desc[24] = {0};
+    const uint64_t rmeta[4] = { in.rank, axis, keepdims ? 1 : 0, 1 };
+    tensor_plan_op(in.shape, in.strides, out_desc, rmeta);
+    memcpy(moved.shape, out_desc, sizeof(moved.shape));
+    memcpy(moved.strides, out_desc + 8, sizeof(moved.strides));
+    memcpy(oshape, out_desc + 16, sizeof(oshape));
     float *dense = malloc((size_t)in.elements * sizeof(float));
     if (!dense) return OMEGA_TENSOR_ERR_CAPACITY;
     gather(s, &moved, dense);
@@ -1010,11 +1003,13 @@ int omega_tensor_matmul(OmegaTensorCtx *ctx, OmegaTensor a, OmegaTensor b, Omega
         float *o = buf;
         for (uint64_t o0 = 0; o0 < outs && !rc; o0 += blk) {
             uint64_t cnt = outs - o0 < blk ? outs - o0 : blk;
-            for (uint64_t q = 0; q < cnt; q++) {
-                uint64_t e = o0 + q, j = e % N, i = (e / N) % M, bt = e / (N * M);
-                memcpy(pa + q * K, A + (bt * M + i) * K, (size_t)K * sizeof(float));
-                memcpy(pb + q * K, BT + (bt * N + j) * K, (size_t)K * sizeof(float));
-            }
+            uint64_t desc_a[21] = { M, N, K, o0, cnt, 0 };
+            uint64_t desc_b[21] = { M, N, K, o0, cnt, 1 };
+            desc_a[20] = 5; desc_b[20] = 5;
+            tensor_copy_op((const uint8_t *)A, (size_t)va.elements * 4,
+                           (uint8_t *)pa, (size_t)(cnt * K) * 4, desc_a);
+            tensor_copy_op((const uint8_t *)BT, (size_t)vb.elements * 4,
+                           (uint8_t *)pb, (size_t)(cnt * K) * 4, desc_b);
             int nrc = ctx->real->elementwise(OMEGA_NOP_FMUL, pa, pb, NULL, prod, (size_t)(cnt * K));
             if (!nrc && ctx->real->reduce_rows)
                 nrc = ctx->real->reduce_rows(OMEGA_TR_SUM, prod, (size_t)cnt, (size_t)K, o + o0);
@@ -1047,18 +1042,12 @@ void omega_tensor_live_counts(const OmegaTensorCtx *ctx, uint32_t *tensors, uint
  * the descriptor `in` gives for logical index e. */
 static void scatter(StorageSlot *s, const OmegaTensorInfo *in, const void *src) {
     size_t es = omega_dtype_size(in->dtype);
-    uint64_t idx[OMEGA_TENSOR_MAX_RANK] = {0};
-    uint64_t pos = in->offset;
-    uint8_t *dst = s->data;
-    const uint8_t *sp = src;
-    for (uint64_t e = 0; e < in->elements; e++) {
-        memcpy(dst + pos * es, sp + e * es, es);
-        for (uint32_t ax = in->rank; ax-- > 0;) {
-            if (++idx[ax] < in->shape[ax]) { pos += in->strides[ax]; break; }
-            pos -= (in->shape[ax] - 1) * in->strides[ax];
-            idx[ax] = 0;
-        }
-    }
+    uint64_t desc[21] = {0};
+    memcpy(desc, in->shape, sizeof(in->shape));
+    memcpy(desc + 8, in->strides, sizeof(in->strides));
+    desc[16] = in->rank; desc[17] = in->offset; desc[18] = es; desc[19] = in->elements; desc[20] = 1;
+    tensor_copy_op((const uint8_t *)src, (size_t)in->elements * es,
+                   (uint8_t *)s->data, (size_t)s->elems * es, desc);
 }
 
 /* Gather part (s, in) and scatter it through dst_desc into out's storage. */

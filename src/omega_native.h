@@ -611,6 +611,12 @@ uint32_t omega2_tstore_decode_header(uint64_t *result, const uint8_t *o_in_hdr, 
 uint32_t omega2_tstore_encode_record(uint64_t *result, const uint64_t *o_meta, uint64_t o_meta_len, const uint64_t *o_shape, uint64_t o_shape_len, const uint8_t *o_value_id, uint64_t o_value_id_len, const uint8_t *o_payload_sha, uint64_t o_payload_sha_len, uint8_t *o_out_rec);
 /* export fn tstore_decode_record in_rec view uchar 168 meta edit ulong 6 shape edit ulong 8 value_id out uchar 32 payload_sha out uchar 32 to ulong */
 uint32_t omega2_tstore_decode_record(uint64_t *result, const uint8_t *o_in_rec, uint64_t o_in_rec_len, uint64_t *o_meta, uint64_t o_meta_len, uint64_t *o_shape, uint64_t o_shape_len, uint8_t *o_value_id, uint8_t *o_payload_sha);
+#define OMEGA2_IDENT_tensor_ops "omega-ident 1 unit=tensor_ops abi=2 profile=OM-2 src=05251d939ba3c0c015962f53ce9e3dba6cb73a87b69ba054402d083da7d7f453 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_tensor_ops(void);
+/* export fn tensor_copy_op src view uchar * dst edit uchar * desc view ulong 21 to void */
+uint32_t omega2_tensor_copy_op(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint8_t *o_dst, uint64_t o_dst_len, const uint64_t *o_desc, uint64_t o_desc_len);
+/* export fn tensor_plan_op in_a view ulong 8 in_b view ulong 8 out_buf edit ulong 24 meta view ulong 4 to void */
+uint32_t omega2_tensor_plan_op(uint64_t *result, const uint64_t *o_in_a, uint64_t o_in_a_len, const uint64_t *o_in_b, uint64_t o_in_b_len, uint64_t *o_out_buf, uint64_t o_out_buf_len, const uint64_t *o_meta, uint64_t o_meta_len);
 #define OMEGA2_IDENT_sgd_update "omega-ident 1 unit=sgd_update abi=2 profile=OM-2 src=4900cd2a690ee463b79e6f1b1331b53e658423062a5b159b0ebdb6264afff17d omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
 const char *omega2_ident_sgd_update(void);
 /* export fn tg_sgd_mode learning ulong momentum ulong to long */

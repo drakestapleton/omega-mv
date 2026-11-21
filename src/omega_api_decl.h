@@ -1002,6 +1002,10 @@ uint64_t tstore_decode_header(const uint8_t o_in_hdr[24], uint64_t o_expect_cap,
 void tstore_encode_record(const uint64_t o_meta[6], const uint64_t o_shape[8], const uint8_t o_value_id[32], const uint8_t o_payload_sha[32], uint8_t o_out_rec[168]);
 /* export fn tstore_decode_record in_rec view uchar 168 meta edit ulong 6 shape edit ulong 8 value_id out uchar 32 payload_sha out uchar 32 to ulong */
 uint64_t tstore_decode_record(const uint8_t o_in_rec[168], uint64_t o_meta[6], uint64_t o_shape[8], uint8_t o_value_id[32], uint8_t o_payload_sha[32]);
+/* export fn tensor_copy_op src view uchar * dst edit uchar * desc view ulong 21 to void */
+void tensor_copy_op(const uint8_t *o_src, size_t o_src_len, uint8_t *o_dst, size_t o_dst_len, const uint64_t o_desc[21]);
+/* export fn tensor_plan_op in_a view ulong 8 in_b view ulong 8 out_buf edit ulong 24 meta view ulong 4 to void */
+void tensor_plan_op(const uint64_t o_in_a[8], const uint64_t o_in_b[8], uint64_t o_out_buf[24], const uint64_t o_meta[4]);
 /* export fn tg_sgd_mode learning ulong momentum ulong to long */
 int64_t tg_sgd_mode(uint64_t o_learning, uint64_t o_momentum);
 /* export fn tg_update_velocity velocity edit uint * gradient view uint * bits ulong to void */

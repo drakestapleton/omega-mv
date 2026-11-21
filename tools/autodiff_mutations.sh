@@ -74,7 +74,7 @@ BUILD="$REGEN
 gcc $FLAGS -Isrc -Isrc/tensor -Isrc/autodiff -o t tests/test_omega_autodiff.c src/autodiff/omega_autodiff.c \
 $TENSOR $DEPS"
 printf '%s\n' "$MUTATIONS" | sed 's#^\([A-Z_]*\)|#\1|src/autodiff/#' > "$SCRATCH/rows"
-tools/mutation_runner.sh -k marker -m "$SCRATCH/rows" -d . -c "src om tests/test_omega_autodiff.c" \
+tools/mutation_runner.sh -k marker -m "$SCRATCH/rows" -d . -c "src om gpu tests/test_omega_autodiff.c" \
     -b "$BUILD" -t ./t -f FAIL -B > "$SCRATCH/runner.out" 2> "$SCRATCH/runner.err"
 if grep -q 'unmutated baseline' "$SCRATCH/runner.out"; then
     cat "$SCRATCH/runner.err"
