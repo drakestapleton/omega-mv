@@ -1,0 +1,482 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Inkling-2-Mini Multi-Stream Small-Batch SM121 SASS Emitters (M = 1..8, Deduplicated MoE).
+note Compose after: om/encoder/bw_enc_sm121.om + om/gpu/inkling2/emit_fast.om.
+note Kernels:
+note   A (65): bf16_gemm_batch_fast    -- W_bf16[N,K] loaded ONCE for B<=8 streams (K-tiled 8KB SMEM)
+note   B (66): nvfp4_gemm_dedup_fast   -- Deduplicated U<=64 unique NVFP4 experts x up to 8 streams/expert
+note   C (67): mxfp8_gemm_dedup_fast   -- Deduplicated U<=64 unique MXFP8 experts x up to 8 streams/expert
+
+note Helper: accumulate 8 FP32 weights in R52..R59 against SMEM X[b] at smBase (R31 + b*1024) into accReg.
+note Uses only R48..R51 and R60 (max register R60 < 62, zero base==dst clobber).
+fn bBf16AccStream bIdx ulong accReg ulong to void
+fLit 60 mul bIdx 1024
+fIadd 60 31 60
+ic 58 48 60 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+ic4 33 accReg 52 48 accReg cwAlu4
+ic4 33 accReg 53 49 accReg cwAlu4
+ic4 33 accReg 54 50 accReg cwAlu4
+ic4 33 accReg 55 51 accReg cwAlu4
+ic 58 48 60 Z 16 cwLd
+ic 0 Z Z Z 0 cwW0
+ic4 33 accReg 56 48 accReg cwAlu4
+ic4 33 accReg 57 49 accReg cwAlu4
+ic4 33 accReg 58 50 accReg cwAlu4
+ic4 33 accReg 59 51 accReg cwAlu4
+end
+
+note =========================================================================
+note A: bf16_gemm_batch_fast -- 1 weight stream shared across B<=8 streams (K-tiled 8KB SMEM)
+note Args: W_bf16[N,K](R0:1), X[B,K](R2:3), Y[B,N](R4:5), K(24), N(28), B(32).
+note Grid: (ceil(N/8), 1, 1), Block: 256 (8 warps = 8 rows/CTA), SMEM: 8192. K % 256 == 0, B in 1..8.
+note =========================================================================
+fn bf16GemmBatchFast to void
+fStart 3
+fParam 20 24
+fParam 21 28
+fParam 22 32
+ic 17 23 14 Z 5 cwAlu4
+ic 18 24 14 Z 31 cwAlu4
+fMad 25 15 8 23
+fLit 29 0xffffffff
+fIadd 29 21 29
+fMad 30 25 1 Z
+ic 28 Z 30 21 0 cwCmp
+put ikfGuard 0 1
+fMad 30 29 1 Z
+fMadReg 30 30 20 Z
+fMad 30 30 2 Z
+fMad 31 24 16 Z
+fIadd 30 30 31
+icImm 9 26 30 0 1 cwAlu4
+fMad 31 24 32 Z
+for b ulong 8
+fNum add 40 b 0.0f32
+end
+fLit 28 0
+fLit 29 256
+mK = get ikfPc 0
+fLit 30 0
+mLoadX = get ikfPc 0
+fMadReg 52 30 20 28
+fIadd 52 52 14
+icImm 9 16 52 2 4 cwW1
+ic 11 53 16 Z 0 cwLd
+fMad 54 30 1024 Z
+fMad 54 14 4 54
+ic 0 Z Z Z 0 cwW0
+ic 50 Z 54 53 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fLit 55 1
+fIadd 30 30 55
+ic 28 Z 30 22 0 cwCmp
+put ikfGuard 0 2
+ic 46 Z Z Z sub mLoadX get ikfPc 0 cwAlu4
+fBar
+ic 57 32 26 Z 0 cwLdW1
+ic 0 Z Z Z 0 cwW0
+for widx ulong 4
+icImm 8 add 52 mul widx 2 add 32 widx Z 65536 cwAlu1
+ic 18 add 53 mul widx 2 add 32 widx Z 0xffff0000 cwAlu4
+end
+for b ulong 8
+fLit 30 b
+ic 28 Z 30 22 0 cwCmp
+skB = fBraFwd 1
+bBf16AccStream b add 40 b
+fPatch skB 1
+end
+fLit 55 1
+icImm 9 26 55 26 512 cwAlu1
+fIadd 28 28 29
+fBar
+ic 28 Z 28 20 0 cwCmp
+put ikfGuard 0 2
+ic 46 Z Z Z sub mK get ikfPc 0 cwAlu4
+for b ulong 8
+fWarpRedSum add 40 b 52 16
+end
+fLit 55 1
+ic 28 Z 24 55 0 cwCmp
+put ikfGuard 0 1
+ic 45 Z Z Z 0 cwSafe
+ic 28 Z 25 21 0 cwCmp
+put ikfGuard 0 1
+ic 45 Z Z Z 0 cwSafe
+for b ulong 8
+fLit 30 b
+ic 28 Z 30 22 0 cwCmp
+skS = fBraFwd 1
+fMadReg 52 30 21 25
+icImm 9 16 52 4 4 cwW1
+ic 12 Z 16 add 40 b 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fPatch skS 1
+end
+end
+
+note =========================================================================
+note B: nvfp4_gemm_dedup_fast -- Deduplicated U<=64 unique NVFP4 experts x up to 8 streams/expert
+note Args: X_rec[B*8, K](R0:1), W_u8[E,N,K/2](R2:3), sw[E,N,K/16](R4:5),
+note       uniq_eids[U](R6:7), uniq_cnt[U](R8:9), slot_map[U,8](R10:11),
+note       alpha[E](R12:13), lut[272](48:52), C[B*8,N](56:60), K(64), N(68).
+note Note: To stay within 6 pointer slots in fStart, pack meta into 1 struct buffer:
+note   meta[0..63]   = uniq_eids[64] (u32)
+note   meta[64..127] = uniq_cnt[64]  (u32, 1..8)
+note   meta[128..639]= slot_map[64*8](u32, flat slot = stream*8 + topk, or 0xffffffff)
+note   meta[640..767]= alpha[128]    (f32)
+note Args (6 ptrs + 2 scalars):
+note   X_rec(R0:1), W_u8(R2:3), sw(R4:5), meta(R6:7), lut(R8:9), C(R10:11), K(48), N(52).
+note Grid: (ceil(N/8), U, 1), Block: 256 (8 warps = 8 rows/CTA, 32 lanes x 8 weights = 256/step),
+note SMEM: 9280 bytes (0..1087 = LUT[272], 1088..9279 = X_rec[8, 256]). K % 256 == 0.
+note =========================================================================
+fn bNvfp4Decode8 wReg ulong scReg ulong outBase ulong to void
+ic 18 52 wReg Z 15 cwAlu1
+ic 17 53 wReg Z 4 cwAlu1
+ic 17 54 wReg Z 8 cwAlu1
+ic 17 55 wReg Z 12 cwAlu1
+ic 17 56 wReg Z 16 cwAlu1
+ic 17 57 wReg Z 20 cwAlu1
+ic 17 58 wReg Z 24 cwAlu1
+ic 17 59 wReg Z 28 cwAlu4
+for j ulong 7
+ic 18 add 53 j add 53 j Z 15 cwAlu1
+end
+fLit 60 1024
+for j ulong 8
+icImm 8 add 52 j add 52 j 60 4 cwAlu1
+end
+for j ulong 8
+ic 49 add 52 j add 52 j Z 0 cwLd
+end
+ic 0 Z Z Z 0 cwW0
+for j ulong 8
+ic 32 add outBase j add 52 j scReg 0 cwAlu4
+end
+end
+
+fn nvfp4GemmDedupFast to void
+fStart 6
+fParam 20 48
+fParam 21 52
+note Stage LUT[256..271] and LUT[0..255] into SMEM[0..1087]
+icImm 9 16 14 8 4 cwW1
+ic 11 52 16 Z 0 cwLd
+fMad 53 14 4 Z
+ic 0 Z Z Z 0 cwW0
+ic 50 Z 53 52 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fLit 54 16
+bL16 = fBssy
+ic 28 Z 14 54 0 cwCmp
+skL = fBraFwd 1
+fLit 55 256
+fIadd 55 14 55
+icImm 9 16 55 8 4 cwW1
+ic 11 52 16 Z 0 cwLd
+fMad 53 55 4 Z
+ic 0 Z Z Z 0 cwW0
+ic 50 Z 53 52 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fPatch skL 1
+fBsync bL16
+fBar
+note Load eid = meta[u], cnt = meta[64 + u], alpha = meta[640 + eid]
+icImm 9 16 18 6 4 cwW1
+ic 11 23 16 Z 0 cwLd
+fLit 52 64
+fIadd 52 18 52
+icImm 9 16 52 6 4 cwW1
+ic 11 22 16 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+fLit 52 640
+fIadd 52 23 52
+icImm 9 16 52 6 4 cwW1
+ic 11 38 16 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+note warp = R36 = tid>>5, lane = R39 = tid&31, row = R12 = ctaid.x*8 + warp
+ic 17 36 14 Z 5 cwAlu4
+ic 18 39 14 Z 31 cwAlu4
+fMad 12 15 8 36
+fLit 59 0xffffffff
+fIadd 59 21 59
+fMad 52 12 1 Z
+ic 28 Z 52 21 0 cwCmp
+put ikfGuard 0 1
+fMad 52 59 1 Z
+fMadReg 53 23 21 52
+ic 17 54 20 Z 1 cwAlu4
+fMadReg 55 53 54 Z
+fMad 56 39 4 Z
+fIadd 55 55 56
+icImm 9 24 55 2 1 cwAlu4
+ic 17 54 20 Z 4 cwAlu4
+fMadReg 55 53 54 Z
+ic 17 56 39 Z 3 cwAlu4
+fMad 56 56 4 Z
+fIadd 55 55 56
+icImm 9 26 55 4 1 cwAlu4
+ic 17 37 39 Z 1 cwAlu4
+ic 18 37 37 Z 3 cwAlu4
+fMad 37 37 8 Z
+fLit 55 24
+fLit 56 0xffffffff
+ic4 8 37 37 56 55 cwAlu4
+fLit 31 1088
+fMad 31 39 32 31
+for b ulong 8
+fNum add 40 b 0.0f32
+end
+fLit 28 0
+fLit 29 256
+mK = get ikfPc 0
+fLit 30 0
+mLoadX = get ikfPc 0
+fMad 52 18 8 30
+fLit 53 128
+fIadd 52 52 53
+icImm 9 16 52 6 4 cwW1
+ic 11 53 16 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+fMadReg 52 53 20 28
+fIadd 52 52 14
+icImm 9 16 52 0 4 cwW1
+ic 11 53 16 Z 0 cwLd
+fLit 54 1088
+fMad 54 30 1024 54
+fMad 54 14 4 54
+ic 0 Z Z Z 0 cwW0
+ic 50 Z 54 53 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fLit 55 1
+fIadd 30 30 55
+ic 28 Z 30 22 0 cwCmp
+put ikfGuard 0 2
+ic 46 Z Z Z sub mLoadX get ikfPc 0 cwAlu4
+fBar
+ic 11 32 24 Z 0 cwLd
+ic 11 33 26 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+ic4 52 33 33 37 Z cwAlu4
+ic 17 33 33 Z 24 cwAlu4
+fMad 33 33 4 Z
+ic 49 34 33 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+bNvfp4Decode8 32 34 52
+for b ulong 8
+fLit 30 b
+ic 28 Z 30 22 0 cwCmp
+skB = fBraFwd 1
+bBf16AccStream b add 40 b
+fPatch skB 1
+end
+fLit 55 1
+icImm 9 24 55 24 128 cwAlu1
+icImm 9 26 55 26 16 cwAlu1
+fIadd 28 28 29
+fBar
+ic 28 Z 28 20 0 cwCmp
+put ikfGuard 0 2
+ic 46 Z Z Z sub mK get ikfPc 0 cwAlu4
+for b ulong 8
+fWarpRedSum add 40 b 52 16
+ic 32 add 40 b add 40 b 38 0 cwAlu4
+end
+fLit 55 1
+ic 28 Z 39 55 0 cwCmp
+put ikfGuard 0 1
+ic 45 Z Z Z 0 cwSafe
+ic 28 Z 12 21 0 cwCmp
+put ikfGuard 0 1
+ic 45 Z Z Z 0 cwSafe
+for b ulong 8
+fLit 30 b
+ic 28 Z 30 22 0 cwCmp
+skS = fBraFwd 1
+fMad 52 18 8 30
+fLit 53 128
+fIadd 52 52 53
+icImm 9 16 52 6 4 cwW1
+ic 11 53 16 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+fMadReg 52 53 21 12
+icImm 9 16 52 10 4 cwW1
+ic 12 Z 16 add 40 b 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fPatch skS 1
+end
+end
+
+note =========================================================================
+note C: mxfp8_gemm_dedup_fast -- Deduplicated U<=64 unique MXFP8 experts x up to 8 streams/expert
+note Args (6 ptrs + 2 scalars):
+note   X_rec(R0:1), W_fp8(R2:3), sw[E,N,K/32](R4:5), meta(R6:7), lut(R8:9), C(R10:11), K(48), N(52).
+note Grid: (ceil(N/8), U, 1), Block: 256 (8 warps = 8 rows/CTA, 32 lanes x 8 weights = 256/step),
+note SMEM: 9280 bytes (0..1087 = LUT[272], 1088..9279 = X_rec[8, 256]). K % 256 == 0.
+note =========================================================================
+fn bMxfp8Decode8 wLo ulong wHi ulong scReg ulong outBase ulong to void
+ic 18 52 wLo Z 255 cwAlu1
+ic 17 53 wLo Z 8 cwAlu1
+ic 17 54 wLo Z 16 cwAlu1
+ic 17 55 wLo Z 24 cwAlu1
+ic 18 56 wHi Z 255 cwAlu1
+ic 17 57 wHi Z 8 cwAlu1
+ic 17 58 wHi Z 16 cwAlu1
+ic 17 59 wHi Z 24 cwAlu4
+for j ulong 3
+ic 18 add 53 j add 53 j Z 255 cwAlu1
+ic 18 add 57 j add 57 j Z 255 cwAlu1
+end
+for j ulong 8
+icImm 8 add 52 j add 52 j Z 4 cwAlu1
+end
+for j ulong 8
+ic 49 add 52 j add 52 j Z 0 cwLd
+end
+ic 0 Z Z Z 0 cwW0
+for j ulong 8
+ic 32 add outBase j add 52 j scReg 0 cwAlu4
+end
+end
+
+fn mxfp8GemmDedupFast to void
+fStart 6
+fParam 20 48
+fParam 21 52
+icImm 9 16 14 8 4 cwW1
+ic 11 52 16 Z 0 cwLd
+fMad 53 14 4 Z
+ic 0 Z Z Z 0 cwW0
+ic 50 Z 53 52 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fBar
+icImm 9 16 18 6 4 cwW1
+ic 11 23 16 Z 0 cwLd
+fLit 52 64
+fIadd 52 18 52
+icImm 9 16 52 6 4 cwW1
+ic 11 22 16 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+ic 17 36 14 Z 5 cwAlu4
+ic 18 39 14 Z 31 cwAlu4
+fMad 12 15 8 36
+fLit 59 0xffffffff
+fIadd 59 21 59
+fMad 52 12 1 Z
+ic 28 Z 52 21 0 cwCmp
+put ikfGuard 0 1
+fMad 52 59 1 Z
+fMadReg 53 23 21 52
+fMadReg 55 53 20 Z
+fMad 56 39 8 Z
+fIadd 55 55 56
+icImm 9 24 55 2 1 cwAlu4
+ic 17 54 20 Z 5 cwAlu4
+fMadReg 55 53 54 Z
+ic 17 56 39 Z 4 cwAlu4
+fMad 56 56 4 Z
+fIadd 55 55 56
+icImm 9 26 55 4 1 cwAlu4
+ic 17 37 39 Z 2 cwAlu4
+ic 18 37 37 Z 3 cwAlu4
+fMad 37 37 8 Z
+fLit 55 24
+fLit 56 0xffffffff
+ic4 8 37 37 56 55 cwAlu4
+fLit 31 1088
+fMad 31 39 32 31
+for b ulong 8
+fNum add 40 b 0.0f32
+end
+fLit 28 0
+fLit 29 256
+mK = get ikfPc 0
+fLit 30 0
+mLoadX = get ikfPc 0
+fMad 52 18 8 30
+fLit 53 128
+fIadd 52 52 53
+icImm 9 16 52 6 4 cwW1
+ic 11 53 16 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+fMadReg 52 53 20 28
+fIadd 52 52 14
+icImm 9 16 52 0 4 cwW1
+ic 11 53 16 Z 0 cwLd
+fLit 54 1088
+fMad 54 30 1024 54
+fMad 54 14 4 54
+ic 0 Z Z Z 0 cwW0
+ic 50 Z 54 53 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fLit 55 1
+fIadd 30 30 55
+ic 28 Z 30 22 0 cwCmp
+put ikfGuard 0 2
+ic 46 Z Z Z sub mLoadX get ikfPc 0 cwAlu4
+fBar
+ic 56 32 24 Z 0 cwLd
+ic 11 34 26 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+ic4 52 34 34 37 Z cwAlu4
+ic 17 34 34 Z 24 cwAlu4
+decodeE8Fast 35 34 55
+bMxfp8Decode8 32 33 35 52
+for b ulong 8
+fLit 30 b
+ic 28 Z 30 22 0 cwCmp
+skB = fBraFwd 1
+bBf16AccStream b add 40 b
+fPatch skB 1
+end
+fLit 55 1
+icImm 9 24 55 24 256 cwAlu1
+icImm 9 26 55 26 8 cwAlu1
+fIadd 28 28 29
+fBar
+ic 28 Z 28 20 0 cwCmp
+put ikfGuard 0 2
+ic 46 Z Z Z sub mK get ikfPc 0 cwAlu4
+for b ulong 8
+fWarpRedSum add 40 b 52 16
+end
+fLit 55 1
+ic 28 Z 39 55 0 cwCmp
+put ikfGuard 0 1
+ic 45 Z Z Z 0 cwSafe
+ic 28 Z 12 21 0 cwCmp
+put ikfGuard 0 1
+ic 45 Z Z Z 0 cwSafe
+for b ulong 8
+fLit 30 b
+ic 28 Z 30 22 0 cwCmp
+skS = fBraFwd 1
+fMad 52 18 8 30
+fLit 53 128
+fIadd 52 52 53
+icImm 9 16 52 6 4 cwW1
+ic 11 53 16 Z 0 cwLd
+ic 0 Z Z Z 0 cwW0
+fMadReg 52 53 21 12
+icImm 9 16 52 10 4 cwW1
+ic 12 Z 16 add 40 b 0 cwSt
+ic 0 Z Z Z 0 cwW1
+fPatch skS 1
+end
+end
+
+fn ikbKernel kind uchar to bool
+if eq kind 65
+bf16GemmBatchFast
+ret true
+end
+if eq kind 66
+nvfp4GemmDedupFast
+ret true
+end
+if eq kind 67
+mxfp8GemmDedupFast
+ret true
+end
+ret false
+end

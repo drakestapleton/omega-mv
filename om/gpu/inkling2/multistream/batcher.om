@@ -1,0 +1,170 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Static N-Slot Paged-KV Table + Continuous Batcher + MoE Expert Deduplicator (ZERO HEAP).
+note Deterministic memory ceiling: N_MAX = 8 concurrent streams.
+note Admission returns slot 0..7 or -1 (HTTP 503 server_busy) only when all 8 static KV slots are occupied.
+
+const MS_MAX_STREAMS ulong 8
+const MS_KV_PAGES_PER_STREAM ulong 16
+const MS_PAGE_TOKENS ulong 64
+
+note Static N-slot stream descriptor table (ZERO heap):
+global msActive ulong 8
+global msPosQ ulong 8
+global msGenCnt ulong 8
+global msMaxGen ulong 8
+global msClientFd int 8
+global msLastTok uint 8
+global msActiveCnt ulong 1
+note Static paged-KV table: page IDs [8 streams x 16 pages] -> flat page index 0..127 (0xffffffff = free)
+global msPageOwner ulong 128
+global msStreamPages ulong 128
+global msStreamPageCnt ulong 8
+
+note Deduplicated MoE batch metadata (matches nvfp4_gemm_dedup_fast / mxfp8_gemm_dedup_fast ABI):
+note   msUniqEids[0..63], msUniqCnt[0..63], msSlotMap[64 * 8]
+global msUniqEids uint 64
+global msUniqCnt uint 64
+global msSlotMap uint 512
+global msUniqNum ulong 1
+
+fn msInit to void
+put msActiveCnt 0 0
+for s ulong MS_MAX_STREAMS
+put msActive s 0
+put msPosQ s 0
+put msGenCnt s 0
+put msMaxGen s 0
+put msClientFd s -1
+put msLastTok s 0
+put msStreamPageCnt s 0
+end
+for p ulong 128
+put msPageOwner p 18446744073709551615
+put msStreamPages p 18446744073709551615
+end
+end
+
+fn msAllocPage s ulong to ulong
+for p ulong 128
+if eq get msPageOwner p 18446744073709551615
+put msPageOwner p s
+pc = get msStreamPageCnt s
+if ge pc MS_KV_PAGES_PER_STREAM
+put msPageOwner p 18446744073709551615
+ret 18446744073709551615
+end
+put msStreamPages add mul s MS_KV_PAGES_PER_STREAM pc p
+put msStreamPageCnt s add pc 1
+ret p
+end
+end
+ret 18446744073709551615
+end
+
+fn msFreeStreamPages s ulong to void
+for p ulong 128
+if eq get msPageOwner p s
+put msPageOwner p 18446744073709551615
+end
+end
+for k ulong MS_KV_PAGES_PER_STREAM
+put msStreamPages add mul s MS_KV_PAGES_PER_STREAM k 18446744073709551615
+end
+put msStreamPageCnt s 0
+end
+
+note Admit a new stream into the static N-slot table.
+note Returns slot 0..7 on success, or -1 (caller returns HTTP 503 server_busy) when all 8 slots are full.
+fn msAdmit fd int maxGen ulong initTok uint to long
+for s ulong MS_MAX_STREAMS
+if eq get msActive s 0
+pg = msAllocPage s
+if eq pg 18446744073709551615
+ret -1
+end
+put msActive s 1
+put msPosQ s 0
+put msGenCnt s 0
+put msMaxGen s maxGen
+put msClientFd s fd
+put msLastTok s initTok
+put msActiveCnt 0 add get msActiveCnt 0 1
+ret long s
+end
+end
+ret -1
+end
+
+note Advance a stream by 1 token, allocating a new 64-token KV page when crossing a page boundary.
+fn msAdvance s ulong nextTok uint to bool
+if or ge s MS_MAX_STREAMS eq get msActive s 0
+ret false
+end
+pos = add get msPosQ s 1
+put msPosQ s pos
+put msGenCnt s add get msGenCnt s 1
+put msLastTok s nextTok
+needPages = add div pos MS_PAGE_TOKENS 1
+if gt needPages get msStreamPageCnt s
+pg = msAllocPage s
+if eq pg 18446744073709551615
+ret false
+end
+end
+ret true
+end
+
+note Retire a finished/disconnected stream and release its static KV pages immediately.
+fn msRetire s ulong to void
+if or ge s MS_MAX_STREAMS eq get msActive s 0
+ret
+end
+msFreeStreamPages s
+put msActive s 0
+put msClientFd s -1
+if gt get msActiveCnt 0 0
+put msActiveCnt 0 sub get msActiveCnt 0 1
+end
+end
+
+note Deduplicate routed expert IDs across B active streams (B * 8 slots -> U <= 64 unique experts).
+note Each unique expert u records all flat slots (s*8 + k) that routed to it in msSlotMap[u*8 .. u*8 + cnt - 1].
+fn msDedupExperts routedIds view uint 64 nStreams ulong to ulong
+put msUniqNum 0 0
+for u ulong 64
+put msUniqEids u 0xffffffff
+put msUniqCnt u 0
+for j ulong 8
+put msSlotMap add mul u 8 j 0xffffffff
+end
+end
+totSlots = mul nStreams 8
+for slot ulong totSlots bound 64
+eid = get routedIds slot
+if lt eid 128
+uCnt = get msUniqNum 0
+found = ulong 64
+for u ulong uCnt bound 64
+if eq get msUniqEids u eid
+found = u
+break
+end
+end
+if eq found 64
+if lt uCnt 64
+put msUniqEids uCnt eid
+put msUniqCnt uCnt 1
+put msSlotMap mul uCnt 8 uint slot
+put msUniqNum 0 add uCnt 1
+end
+else
+c = ulong get msUniqCnt found
+if lt c 8
+put msSlotMap add mul found 8 c uint slot
+put msUniqCnt found uint add c 1
+end
+end
+end
+end
+ret get msUniqNum 0
+end
