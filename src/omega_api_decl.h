@@ -13,6 +13,36 @@ extern "C" {
 #else
 #define OMBR_ASSERT _Static_assert
 #endif
+/* export fn arboris_plan_arena m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong */
+uint64_t arboris_plan_arena(uint64_t o_m[16], uint64_t o_budget, uint64_t o_page, uint64_t o_offsets[6]);
+/* export fn arboris_check_csr m view ulong 16 data view uint * to ulong */
+uint64_t arboris_check_csr(const uint64_t o_m[16], const uint32_t *o_data, size_t o_data_len);
+/* export fn arboris_plan_sparse m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong */
+uint64_t arboris_plan_sparse(uint64_t o_m[16], uint64_t o_budget, uint64_t o_page, uint64_t o_offsets[6]);
+/* export fn arboris_load_records r view uint * topo edit uint * weights edit uint * to ulong */
+uint64_t arboris_load_records(const uint32_t *o_r, size_t o_r_len, uint32_t *o_topo, size_t o_topo_len, uint32_t *o_weights, size_t o_weights_len);
+/* export fn arboris_topology_digest topo view uint * weights view uint * digest edit uchar 32 to ulong */
+uint64_t arboris_topology_digest(const uint32_t *o_topo, size_t o_topo_len, const uint32_t *o_weights, size_t o_weights_len, uint8_t o_digest[32]);
+/* export fn arboris_spread_step topo view uint * weights view uint * state edit uint * to ulong */
+uint64_t arboris_spread_step(const uint32_t *o_topo, size_t o_topo_len, const uint32_t *o_weights, size_t o_weights_len, uint32_t *o_state, size_t o_state_len);
+/* export fn arboris_relax_step topo view uint * weights view uint * state edit uint * to ulong */
+uint64_t arboris_relax_step(const uint32_t *o_topo, size_t o_topo_len, const uint32_t *o_weights, size_t o_weights_len, uint32_t *o_state, size_t o_state_len);
+/* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
+uint64_t arboris_gated_tick(const uint64_t o_m[16], const uint64_t o_offsets[6], uint16_t *o_arena, size_t o_arena_len, uint64_t o_page);
+/* export fn arboris_pack_gated m view ulong 16 offsets view ulong 6 a edit ushort * limits edit ulong 2 to ulong */
+uint64_t arboris_pack_gated(const uint64_t o_m[16], const uint64_t o_offsets[6], uint16_t *o_a, size_t o_a_len, uint64_t o_limits[2]);
+/* export fn arboris_emit_spread n ulong code edit uchar 16384 to ulong */
+uint64_t arboris_emit_spread(uint64_t o_n, uint8_t o_code[16384]);
+/* export fn arboris_emit_relax n ulong code edit uchar 16384 to ulong */
+uint64_t arboris_emit_relax(uint64_t o_n, uint8_t o_code[16384]);
+/* export fn arboris_emit_gated n ulong d ulong standard ulong code edit uchar 16384 to ulong */
+uint64_t arboris_emit_gated(uint64_t o_n, uint64_t o_d, uint64_t o_standard, uint8_t o_code[16384]);
+/* export fn arboris_wave_qmd shape view ulong 7 slots view ulong 20 driver view uint 224 bank edit uint 236 q0 edit uint 96 q1 edit uint 96 to ulong */
+uint64_t arboris_wave_qmd(const uint64_t o_shape[7], const uint64_t o_slots[20], const uint32_t o_driver[224], uint32_t o_bank[236], uint32_t o_q0[96], uint32_t o_q1[96]);
+/* export fn arboris_relax_qmd shape view ulong 7 slots view ulong 20 driver view uint 224 bank edit uint 236 q0 edit uint 96 q1 edit uint 96 to ulong */
+uint64_t arboris_relax_qmd(const uint64_t o_shape[7], const uint64_t o_slots[20], const uint32_t o_driver[224], uint32_t o_bank[236], uint32_t o_q0[96], uint32_t o_q1[96]);
+/* export fn hz_chk c view uchar 32768 lc ulong m edit ulong 3203584 to long */
+int64_t hz_chk(const uint8_t o_c[32768], uint64_t o_lc, uint64_t o_m[3203584]);
 #define SHA256_DIGEST_SIZE 32
 #define SHA256_BLOCK_SIZE 64
 typedef struct {

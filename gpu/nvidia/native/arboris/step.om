@@ -1,0 +1,338 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Native SM121 sparse hop over six owned arena maps. Enter on the serialized
+note dispatcher after the producer drops its writable aliases. The supervisor
+note owns the capability-table mapping, authenticated subject and fencing.
+note Return zero only after both the QMD release and the post-flush WFI marker.
+global ar_code_nodes ulong 1
+global ar_code_planes ulong 1
+global ar_code_bytes ulong 1
+global ar_fenced_seq ulong 1
+note Captured by the serialized submitter only after successful retirement.
+note Subject, handle id, generation, model, epoch, input bank and wave controls.
+global ar_fenced_claim ulong 7
+
+fn ar_record_fence subject ulong h view ulong 2 m view ulong 16 controls ulong to void
+  put ar_fenced_claim 0 subject
+  put ar_fenced_claim 1 get h 0
+  put ar_fenced_claim 2 get h 1
+  put ar_fenced_claim 3 get m 0
+  put ar_fenced_claim 4 get m 7
+  put ar_fenced_claim 5 get m 6
+  put ar_fenced_claim 6 controls
+  put ar_fenced_seq 0 get nvret 0
+end
+
+fn ar_sparse_data m view ulong 16 to bool
+  n = get m 1
+  arcs = get m 3
+  t = get ar_maps 1
+  w = get ar_maps 2
+  if or ne mapget t 0 4 0x41525431 ne mapget t 4 4 n
+    ret false
+  end
+  if or ne mapget t 8 4 arcs ne mapget t 12 4 0
+    ret false
+  end
+  prev = ulong 0
+  for i ulong n bound 0x1fffffff
+    next = mapget t add 16 mul i 4 4
+    if or lt next prev gt next arcs
+      ret false
+    end
+    prev = next
+  end
+  if ne prev arcs
+    ret false
+  end
+  start = mul add n 4 4
+  for k ulong arcs bound 0xffffffff
+    if ge mapget t add start mul k 4 4 n
+      ret false
+    end
+    if gt mapget w mul k 4 4 0x3f800000
+      ret false
+    end
+  end
+  x = get ar_maps add 3 get m 6
+  for i ulong div get m 11 4 bound 0x4000000000
+    if gt mapget x mul i 4 4 0x3f800000
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_step_close to bool
+  if ne get nvret 0 get nvput 0
+    ret false
+  end
+  for j ulong 5
+    i = sub ulong 4 j
+    tok = get gbmem i
+    if gt tok 0
+      if eq get nvstate 0 1
+        if not nvdrop tok
+          ret false
+        end
+      else
+        if ne get nvstate 0 0
+          ret false
+        end
+      end
+      put gbmem i 0
+    end
+  end
+  put ar_fenced_seq 0 0
+  put ar_code_model 0 0
+  put ar_code_bytes 0 0
+  put ar_code_nodes 0 0
+  put ar_code_planes 0 0
+  ret true
+end
+
+fn ar_install_code m view ulong 16 code view uchar 16384 size ulong to bool
+  if or eq get nvsched 0 0 ne get ar_code_nodes 0 0
+    ret false
+  end
+  for i ulong 5
+    if ne get gbmem i 0
+      ret false
+    end
+  end
+  if eq size 0
+    ret false
+  end
+  for i ulong 5
+    bytes = ulong 4096
+    if eq i 4
+      bytes = aligned_size size 4096 16384
+    end
+    if eq i 2
+      note QMD0, QMD1, semaphore and full 64 KiB scratch are disjoint.
+      bytes = ulong 81920
+    end
+    tok = nvalloc bytes false
+    if le tok 0
+      ret false
+    end
+    put gbmem i tok
+  end
+  if ne mapwrite get gbmem 4 0 code 0 size long size
+    ret false
+  end
+  put ar_code_model 0 get m 0
+  put ar_code_bytes 0 size
+  put ar_code_nodes 0 get m 1
+  put ar_code_planes 0 get m 4
+  ret true
+end
+
+fn ar_step_open m view ulong 16 to bool
+  if ne get m 0 arboris_sparse_magic
+    ret false
+  end
+  if not ar_snapshot_matches m
+    ret false
+  end
+  code = new uchar 16384 0
+  n = get m 1
+  size = ulong 0
+  if eq get m 4 1
+    size = arboris_emit_relax n code
+  else
+    if eq get m 4 2
+      size = arboris_emit_spread n code
+    end
+  end
+  ret ar_install_code m code size
+end
+
+fn ar_step_slots s edit ulong 20 to void
+  put s 0 mapaddr get gbmem 4
+  put s 1 get nvmlen nvfind get gbmem 4
+  put s 2 mapaddr get gbmem 1
+  put s 3 4096
+  q = mapaddr get gbmem 2
+  put s 4 add q 16384
+  put s 5 65536
+  put s 6 add q 8192
+  put s 7 16
+  put s 8 q
+  put s 9 384
+  put s 10 add q 4096
+  put s 11 384
+  for i ulong 4
+    tok = get ar_maps add i 1
+    j = add 12 mul i 2
+    put s j mapaddr tok
+    put s add j 1 get nvmlen nvfind tok
+  end
+end
+
+fn ar_native_packet slots view ulong 20 b view uint * q0 view uint 96 q1 view uint 96 to bool
+  if or le len b 224 gt len b 256
+    ret false
+  end
+  for i ulong 96
+    put gbq0 i get q0 i
+    put gbq1 i get q1 i
+  end
+  put gbused 0 0
+  gbsetup
+  gbdma get slots 2 224
+  for i ulong 224
+    gbemit get b i
+  end
+  gbdma add get slots 2 896 uint sub len b 224
+  for i ulong sub len b 224 bound 32
+    gbemit get b add i 224
+  end
+  gbinline get slots 8 false
+  gbdma get slots 6 1
+  gbemit 1
+  gbinline get slots 10 true
+  gbtail
+  ret true
+end
+
+fn ar_step_pack shape view ulong 7 slots view ulong 20 planes ulong to bool
+  d = new uint 224 0
+  b = new uint 236 0
+  q0 = new uint 96 0
+  q1 = new uint 96 0
+  gbdriver get slots 2
+  for i ulong 224
+    put d i get gbcb i
+  end
+  rc = ulong 1
+  if eq planes 1
+    rc = arboris_relax_qmd shape slots d b q0 q1
+  else
+    rc = arboris_wave_qmd shape slots d b q0 q1
+  end
+  if ne rc 0
+    ret false
+  end
+  ret ar_native_packet slots b q0 q1
+end
+
+fn ar_sparse_header m view ulong 16 to bool
+  if or ne get m 0 arboris_sparse_magic ne get ar_code_model 0 arboris_sparse_magic
+    ret false
+  end
+  if or ne get m 1 get ar_code_nodes 0 ne get m 4 get ar_code_planes 0
+    ret false
+  end
+  for i ulong 6
+    if le get ar_maps i 0
+      ret false
+    end
+    if eq nvfind get ar_maps i 96
+      ret false
+    end
+  end
+  if not ar_snapshot_matches m
+    ret false
+  end
+  ret true
+end
+
+note Slab 4 words 6 and 7 are the channel sequence and device completion.
+note Emit the two halves of sequence before publishing status, after gbtail's
+note L2 flush. No CTA can declare completion on behalf of the other CTAs.
+fn ar_release_receipt va ulong seq ulong to void
+  gbrel add va 48 gblo seq
+  gbrel add va 52 gbhi seq
+  gbrel add va 56 6
+end
+
+fn ar_device_receipt tok long seq ulong to bool
+  if or le tok 0 eq seq 0
+    ret false
+  end
+  if ne mapget tok 56 8 6
+    ret false
+  end
+  ret and eq mapget tok 48 8 seq eq mapget tok 0 8 0
+end
+
+fn ar_step_send to bool
+  q = get gbmem 2
+  mark = get gbmem 3
+  if ne mapset q 8192 4 0 0
+    ret false
+  end
+  if ne mapset mark 0 4 0 0
+    ret false
+  end
+  if ne mapset mark 16 4 0 0
+    ret false
+  end
+  tok = get ar_maps 5
+  if or le tok 0 eq get nvput 0 0xffffffffffffffff
+    ret false
+  end
+  if ne mapget tok 0 8 0
+    ret false
+  end
+  if ne mapset tok 56 8 0 0
+    ret false
+  end
+  seq = add get nvput 0 1
+  ar_release_receipt mapaddr tok seq
+  bytes = get gbused 0
+  if ne mapwrite get gbmem 0 0 gbcmd 0 bytes long bytes
+    ret false
+  end
+  if not nvsend get gbmem 0 0 uint div bytes 4
+    ret false
+  end
+  if not nvwait tok 56 6 5000000000
+    ret false
+  end
+  if or not ar_device_receipt tok seq ne mapget mark 16 4 1179010630
+    put nvfault 0 1
+    ret false
+  end
+  if or ne mapget mark 0 4 1145324612 ne mapget q 8192 4 6
+    put nvfault 0 1
+    ret false
+  end
+  ret true
+end
+
+fn ar_sparse_hop table long subject ulong h view ulong 2 m view ulong 16 decay ulong threshold ulong to ulong
+  if not caproot_validate table subject h m
+    ret 1
+  end
+  if ne get ar_fenced_seq 0 0
+    ret 7
+  end
+  if not ar_sparse_header m
+    ret 2
+  end
+  if not ar_sparse_data m
+    ret 3
+  end
+  shape = new ulong 7 0
+  put shape 0 get ar_code_nodes 0
+  put shape 1 get m 1
+  put shape 2 get m 3
+  put shape 3 get m 2
+  put shape 4 get m 6
+  put shape 5 decay
+  put shape 6 threshold
+  slots = new ulong 20 0
+  ar_step_slots slots
+  if not ar_step_pack shape slots get m 4
+    ret 4
+  end
+  if not caproot_validate table subject h m
+    ret 1
+  end
+  if not ar_step_send
+    ret 5
+  end
+  ar_record_fence subject h m or decay shl threshold 32
+  ret 0
+end

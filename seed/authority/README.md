@@ -304,3 +304,16 @@ Replay on 2026-10-31 with the current seed compiler `7a8b84fc` after merging
 of that replay, including the error 12 for the pre-`cbadcase` gate; see
 `../qualification/security673/repairs/replay-7a8b84fc.json`. Host execution
 only; hardware security qualification remains NOT_RUN.
+
+### Arboris world-step signing
+
+The Spark host gate builds `world-signer` from `arboris-signer.om`, the seeded SHA-256/SHA-512 units and the Ed25519 verifier. Launch one instance per retired step in the world’s private receipt directory. The trusted supervisor holds the world writer lock and supplies the following descriptors.
+
+| FD | Owner and content |
+| --- | --- |
+| 0 and 1 | Private request and reply pipes to the worker. The request is the 184-byte `ARBSTP02` claim and the reply is the 64-byte Ed25519 signature. |
+| 3 | Supervisor policy for the admitted dispatch. Supply claim bytes 0–127 followed by bytes 176–183. Derive these 136 bytes from the admitted grant, immutable inputs, installed kernel and dispatch controls. |
+| 4 | The world’s pinned 32-byte Ed25519 public key. |
+| 5 | A connected socket to the dedicated OpenSSH signing agent holding the world identity. |
+
+The signer verifies the agent response and records the 248-byte claim and signature under their lowercase SHA-256 before replying. It syncs the file and directory. A retry verifies any existing record byte for byte. The worker independently verifies the signature and its current grant before the epoch store. The optional `--arboris-signed-silicon` probe takes the public-key descriptor on FD9 and private request and reply descriptors on FD10 and FD11 respectively. FD12 carries the signing policy from the trusted pre-submission path to the signer’s FD3.

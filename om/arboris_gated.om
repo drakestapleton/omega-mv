@@ -1,0 +1,367 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Compose after arboris_arena.om and gpu/nvidia/om/numeric/numeric.om.
+note CPU oracle for the Omega gated vector v1 model. Offsets in the working
+note descriptor are in ushort elements of the reservation. The immutable
+note GraphMeta input is the same snapshot a QMD constant bank would receive.
+note W_syn[K,D], bias[B,D], W_gate[N,D], W_pred[N,D] are elementwise FP16.
+note Per branch: ReLU(bias + ordered synapse FMAs + ordered child potentials).
+note Per soma: g = sigmoid(W_gate*previous), y = ReLU(W_pred*sum(roots)).
+note Store roundToFP16(g*y + (1-g)*previous). No header flip in this oracle.
+fn ag_layout m view ulong 16 offsets view ulong 6 cells ulong page ulong desc edit ulong 16 to bool
+  check = new ulong 16 0
+  expected = new ulong 6 0
+  for i ulong 16
+    put check i get m i
+  end
+  if gt cells div ulong 0xffffffffffffffff 2
+    ret false
+  end
+  if ne arboris_plan_arena check mul cells 2 page expected 0
+    ret false
+  end
+  for i ulong 6
+    if ne get expected i get offsets i
+      ret false
+    end
+  end
+  for i ulong 5
+    if ne get m add 9 i get check add 9 i
+      ret false
+    end
+  end
+  n = get m 1
+  if gt n 0x1000000
+    ret false
+  end
+  rows = add add get m 2 get m 3 mul n 2
+  bytes = positive_product rows mul get m 4 2 get m 10
+  if or eq bytes 0 ne bytes get m 10
+    ret false
+  end
+  for i ulong 5
+    put desc i get m add i 1
+  end
+  note CSR bases, expressed as ushort indices.
+  put desc 5 div get offsets 1 2
+  put desc 6 add get desc 5 mul add n 1 2
+  put desc 7 add get desc 6 mul add get desc 1 1 2
+  put desc 8 add get desc 7 mul get desc 2 2
+  note Parameter bases and active/inactive bank bases.
+  put desc 9 div get offsets 2 2
+  put desc 10 add get desc 9 mul get desc 2 get desc 3
+  put desc 11 add get desc 10 mul get desc 1 get desc 3
+  put desc 12 add get desc 11 mul n get desc 3
+  put desc 13 div get offsets add 3 get m 6 2
+  put desc 14 div get offsets sub ulong 4 get m 6 2
+  ret true
+end
+
+fn ag_u32 arena view ushort * base ulong i ulong to ulong
+  pos = add base mul i 2
+  ret or ulong get arena pos shl ulong get arena add pos 1 16
+end
+
+fn ag_csr arena view ushort * base ulong count ulong last ulong fan ulong to bool
+  prev = ulong 0
+  if ne ag_u32 arena base 0 0
+    ret false
+  end
+  for i ulong count bound handle_limit
+    next = ag_u32 arena base add i 1
+    if or lt next prev gt next last
+      ret false
+    end
+    if gt sub next prev fan
+      ret false
+    end
+    prev = next
+  end
+  ret eq prev last
+end
+
+fn ag_tree arena view ushort * desc view ulong 16 soma ulong to bool
+  first = ag_u32 arena get desc 5 soma
+  stop = ag_u32 arena get desc 5 add soma 1
+  allowed = ulong 0
+  while lt first stop bound handle_limit
+    word = ag_u32 arena get desc 8 first
+    note Low 24 bits owner, next 7 depth, top bit 0 selects ReLU.
+    if or ne and word 0xffffff soma ne shr word 31 0
+      ret false
+    end
+    depth = shr word 24
+    if gt depth allowed
+      ret false
+    end
+    allowed = add depth 1
+    first = add first 1
+  end
+  ret true
+end
+
+fn ag_half_span arena view ushort * start ulong count ulong to bool
+  for i ulong count bound 0x7fffffffffffffff
+    if eq and get arena add start i 0x7c00 0x7c00
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ag_input_ok arena view ushort * d view ulong 16 to bool
+  if not ag_csr arena get d 5 get d 0 get d 1 get d 4
+    ret false
+  end
+  if not ag_csr arena get d 6 get d 1 get d 2 get d 2
+    ret false
+  end
+  for k ulong get d 2 bound handle_limit
+    if ge ag_u32 arena get d 7 k get d 0
+      ret false
+    end
+  end
+  for i ulong get d 0 bound handle_limit
+    if not ag_tree arena d i
+      ret false
+    end
+  end
+  state_cells = mul get d 0 get d 3
+  params = add sub get d 12 get d 9 state_cells
+  if not ag_half_span arena get d 9 params
+    ret false
+  end
+  ret ag_half_span arena get d 13 state_cells
+end
+
+fn ag_load arena view ushort * desc view ulong 16 base ulong row ulong dim ulong to f32
+  index = add dim mul row get desc 3
+  ret f32of f16to32 ulong get arena add get desc base index
+end
+
+fn ag_synapses arena view ushort * d view ulong 16 b ulong dim ulong to f32
+  start = ag_u32 arena get d 6 b
+  stop = ag_u32 arena get d 6 add b 1
+  acc = ag_load arena d 10 b dim
+  k = start
+  while lt k stop bound handle_limit
+    src = ag_u32 arena get d 7 k
+    x = ag_load arena d 13 src dim
+    w = ag_load arena d 9 k dim
+    acc = fma x w acc
+    k = add k 1
+  end
+  ret acc
+end
+
+fn ag_close stack edit f32 129 used ulong keep ulong to void
+  level = used
+  while gt level keep bound 128
+    parent = sub level 1
+    activation = fmax f32 0 get stack level
+    put stack parent add get stack parent activation
+    level = parent
+  end
+end
+
+fn ag_sum arena view ushort * d view ulong 16 soma ulong dim ulong to f32
+  stack = new f32 129 0.0f32
+  used = ulong 0
+  b = ag_u32 arena get d 5 soma
+  stop = ag_u32 arena get d 5 add soma 1
+  while lt b stop bound handle_limit
+    depth = shr ag_u32 arena get d 8 b 24
+    ag_close stack used depth
+    used = add depth 1
+    put stack used ag_synapses arena d b dim
+    b = add b 1
+  end
+  ag_close stack used 0
+  ret get stack 0
+end
+
+fn ag_sigmoid x f32 to f32
+  z = f32of mexp bitsof neg fabs x
+  denom = add f32 1 z
+  if lt x f32 0
+    ret div z denom
+  end
+  ret div f32 1 denom
+end
+
+fn ag_coordinate arena view ushort * d view ulong 16 soma ulong dim ulong to ulong
+  prev = ag_load arena d 13 soma dim
+  g = ag_sigmoid mul prev ag_load arena d 11 soma dim
+  candidate = fmax f32 0 mul ag_sum arena d soma dim ag_load arena d 12 soma dim
+  y = fma g candidate mul sub f32 1 g prev
+  ret narrow bitsof y 10 15 31
+end
+
+note A failure after computation begins leaves the inactive bank disposable.
+note No reader may select it until the controller commits a complete tick.
+export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong
+  desc = new ulong 16 0
+  if not ag_layout m offsets len arena page desc
+    ret 1
+  end
+  if not ag_input_ok arena desc
+    ret 2
+  end
+  dim = get desc 3
+  count = mul get desc 0 dim
+  for i ulong count bound 0x7fffffffffffffff
+    v = ag_coordinate arena desc div i dim rem i dim
+    if eq and v 0x7c00 0x7c00
+      ret 3
+    end
+    put arena add get desc 14 i ushort v
+  end
+  ret 0
+end
+
+
+note Cold loader workspace is two equal arena images followed by 2*N uint
+note remap entries. Input image is first, output second. Only logical slab
+note bytes are copied. Each half is bound by the same checked plan. The map
+note is new-to-old followed by old-to-new. d[15] holds image length in ushorts.
+fn ag_fan a view ushort * d view ulong 16 i ulong to ulong
+  ret sub ag_u32 a get d 5 add i 1 ag_u32 a get d 5 i
+end
+fn ag_word a edit ushort * base ulong i ulong value ulong to void
+  p = add base mul i 2
+  put a p ushort and value 65535
+  put a add p 1 ushort and shr value 16 65535
+end
+fn ag_order a edit ushort * d view ulong 16 threshold ulong count ulong to void
+  first = ulong 0
+  hub = count
+  ids = mul get d 15 2
+  n = get d 0
+  for i ulong n bound 0x1000000
+    index = first
+    if le ag_fan a d i threshold
+      first = add first 1
+    else
+      index = hub
+      hub = add hub 1
+    end
+    ag_word a ids index i
+    ag_word a ids add n i index
+  end
+end
+fn ag_copy_row a edit ushort * d view ulong 16 base_slot ulong old ulong destination ulong to void
+  old = add get d base_slot mul old get d 3
+  destination = add add get d 15 get d base_slot mul destination get d 3
+  for i ulong get d 3 bound 24576
+    put a add destination i get a add old i
+  end
+end
+
+fn ag_copy_syn a edit ushort * d view ulong 16 k ulong new_k ulong to void
+  old = ag_u32 a get d 7 k
+  id = ag_u32 a mul get d 15 2 add get d 0 old
+  ag_word a add get d 15 get d 7 new_k id
+  ag_copy_row a d 9 k new_k
+end
+
+note Cursor is new soma, old branch, new branch, new synapse.
+fn ag_copy_branch a edit ushort * d view ulong 16 cursor edit ulong 4 to void
+  b = get cursor 1
+  new_b = get cursor 2
+  meta = ag_u32 a get d 8 b
+  ag_word a add get d 15 get d 8 new_b or and meta 0xff000000 get cursor 0
+  ag_copy_row a d 10 b new_b
+  k = ag_u32 a get d 6 b
+  stop = ag_u32 a get d 6 add b 1
+  new_k = get cursor 3
+  ag_word a add get d 15 get d 6 new_b new_k
+  while lt k stop bound handle_limit
+    ag_copy_syn a d k new_k
+    new_k = add new_k 1
+    k = add k 1
+  end
+  put cursor 3 new_k
+  put cursor 2 add new_b 1
+end
+fn ag_copy_graph a edit ushort * d view ulong 16 to void
+  cursor = new ulong 4 0
+  for i ulong get d 0 bound 0x1000000
+    old = ag_u32 a mul get d 15 2 i
+    put cursor 0 i
+    ag_word a add get d 15 get d 5 i get cursor 2
+    b = ag_u32 a get d 5 old
+    stop = ag_u32 a get d 5 add old 1
+    while lt b stop bound handle_limit
+      put cursor 1 b
+      ag_copy_branch a d cursor
+      b = add b 1
+    end
+    for j ulong 4
+      ag_copy_row a d add 11 j old i
+    end
+  end
+  ag_word a add get d 15 get d 5 get d 0 get d 1
+  ag_word a add get d 15 get d 6 get d 1 get d 2
+end
+fn ag_partition a edit ushort * d view ulong 16 smem ulong limits edit ulong 2 to bool
+  tile = get d 3
+  if gt tile 256
+    tile = ulong 256
+  end
+  hub = div smem mul tile 4
+  threshold = div hub 4
+  if and ne get limits 0 0 lt get limits 0 threshold
+    threshold = get limits 0
+  end
+  count = ulong 0
+  for i ulong get d 0 bound 0x1000000
+    fan = ag_fan a d i
+    if gt fan hub
+      ret false
+    end
+    if le fan threshold
+      count = add count 1
+    end
+  end
+  ag_order a d threshold count
+  put limits 1 count
+  ret true
+end
+fn ag_image_header m view ulong 16 a edit ushort * cells ulong to void
+  for i ulong 16
+    ag_word a cells mul i 2 get m i
+    ag_word a cells add mul i 2 1 shr get m i 32
+  end
+end
+
+note limits[0] optionally lowers the standard branch cap. limits[1] receives
+note the prefix boundary. Run before plan lock, when the arena digest is zero.
+export fn arboris_pack_gated m view ulong 16 offsets view ulong 6 a edit ushort * limits edit ulong 2 to ulong
+  d = new ulong 16 0
+  cells = div get m 12 2
+  if or ne get m 15 0 gt get m 12 len a
+    ret 1
+  end
+  if not ag_layout m offsets cells 4096 d
+    ret 1
+  end
+  if gt get d 3 24576
+    ret 2
+  end
+  if ne sub len a get m 12 mul get d 0 4
+    ret 2
+  end
+  if not ag_input_ok a d
+    ret 3
+  end
+  put d 15 cells
+  if not ag_partition a d get m 13 limits
+    ret 4
+  end
+  ag_image_header m a cells
+  ag_copy_graph a d
+  receipt = add cells div get offsets 5 2
+  for i ulong 32
+    put a add receipt i 0
+  end
+  ret 0
+end

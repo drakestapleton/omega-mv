@@ -1,0 +1,244 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Gated vector worker. Caproot's trusted owner serializes this call and
+note owns the bank selector. Every interval and active FP16 operand is checked
+note before submission. Inactive output containing infinity/NaN fails the hop.
+global ar_gated_standard ulong 1
+
+fn ar_gv_tree t long info view ulong 6 soma ulong first ulong stop ulong to bool
+  allowed = ulong 0
+  while lt first stop bound 0xffffffff
+    word = mapget t add get info 3 mul first 4 4
+    if or ne and word 0xffffff soma ne shr word 31 0
+      ret false
+    end
+    depth = shr word 24
+    if gt depth allowed
+      ret false
+    end
+    allowed = add depth 1
+    first = add first 1
+  end
+  ret true
+end
+
+fn ar_gv_somas t long info view ulong 6 m view ulong 16 to bool
+  first = ulong 0
+  for soma ulong get m 1 bound 0x1000000
+    stop = mapget t mul add soma 1 4 4
+    if or lt stop first gt stop get m 2
+      ret false
+    end
+    count = sub stop first
+    if gt count get m 5
+      ret false
+    end
+    scratch = mul mul count get info 4 4
+    if lt soma get info 5
+      scratch = mul scratch 4
+    end
+    if gt scratch get m 13
+      ret false
+    end
+    if not ar_gv_tree t info soma first stop
+      ret false
+    end
+    first = stop
+  end
+  ret eq first get m 2
+end
+
+fn ar_gv_rows m view ulong 16 standard ulong to bool
+  t = get ar_maps 1
+  info = new ulong 6 0
+  put info 1 mul add get m 1 1 4
+  put info 2 add get info 1 mul add get m 2 1 4
+  put info 3 add get info 2 mul get m 3 4
+  put info 4 get m 4
+  if gt get info 4 256
+    put info 4 256
+  end
+  put info 5 standard
+  if or ne mapget t 0 4 0 ne mapget t get info 1 4 0
+    ret false
+  end
+  if not ar_gv_somas t info m
+    ret false
+  end
+  prev = ulong 0
+  for b ulong get m 2 bound 0xffffffff
+    next = mapget t add get info 1 mul add b 1 4 4
+    if or lt next prev gt next get m 3
+      ret false
+    end
+    prev = next
+  end
+  if ne prev get m 3
+    ret false
+  end
+  for k ulong get m 3 bound 0xffffffff
+    if ge mapget t add get info 2 mul k 4 4 get m 1
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_finite_halves tok long bytes ulong to bool
+  for i ulong div bytes 4 bound 0x4000000000
+    w = mapget tok mul i 4 4
+    if or eq and w 0x7c00 0x7c00 eq and w 0x7c000000 0x7c000000
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_gv_header m view ulong 16 standard ulong to bool
+  if or ne get m 0 arboris_magic gt standard get m 1
+    ret false
+  end
+  for i ulong 6
+    tok = get ar_maps i
+    if or le tok 0 eq nvfind tok 96
+      ret false
+    end
+  end
+  if not ar_snapshot_matches m
+    ret false
+  end
+  rows = add add get m 3 get m 2 mul get m 1 2
+  stride = mul get m 4 2
+  params = positive_product rows stride get m 10
+  if or eq params 0 ne params get m 10
+    ret false
+  end
+  ret ar_gv_rows m standard
+end
+
+fn ar_gated_open m view ulong 16 standard ulong to bool
+  if not ar_gv_header m standard
+    ret false
+  end
+  code = new uchar 16384 0
+  size = arboris_emit_gated get m 1 get m 4 standard code
+  if not ar_install_code m code size
+    ret false
+  end
+  put ar_gated_standard 0 standard
+  ret true
+end
+
+fn ar_gv_args m view ulong 16 slots view ulong 20 args edit ulong 10 to void
+  put args 0 get slots 12
+  put args 1 add get args 0 mul add get m 1 1 4
+  put args 2 add get args 1 mul add get m 2 1 4
+  put args 3 add get args 2 mul get m 3 4
+  stride = mul get m 4 2
+  put args 4 get slots 14
+  put args 5 add get args 4 mul get m 3 stride
+  put args 6 add get args 5 mul get m 2 stride
+  put args 7 add get args 6 mul get m 1 stride
+  put args 8 get slots add 16 mul get m 6 2
+  put args 9 get slots sub ulong 18 mul get m 6 2
+end
+
+fn ar_gv_packet m view ulong 16 slots view ulong 20 standard ulong to bool
+  qm = new ulong 16 0
+  for i ulong 5
+    put qm i get slots mul i 2
+  end
+  gx = add div add standard 3 4 sub get m 1 standard
+  gy = div add get m 4 255 256
+  put qm 8 128
+  put qm 9 1
+  put qm 10 gx
+  put qm 11 gy
+  put qm 12 arboris_gated_qmd_regs
+  put qm 13 get m 13
+  q0 = new uint 96 0
+  q1 = new uint 96 0
+  if ne bw_qmd1 qm q1 0
+    ret false
+  end
+  if ne bw_qmd_verify q1 0
+    ret false
+  end
+  if ne bw_qmd0 q0 get slots 10 0
+    ret false
+  end
+  bank = new uint 244 0
+  gbdriver get slots 2
+  for i ulong 224
+    put bank i get gbcb i
+  end
+  put bank 216 128
+  put bank 220 uint gx
+  put bank 221 uint gy
+  args = new ulong 10 0
+  ar_gv_args m slots args
+  for i ulong 10
+    ix = add 224 mul i 2
+    put bank ix gblo get args i
+    put bank add ix 1 gbhi get args i
+  end
+  ret ar_native_packet slots bank q0 q1
+end
+
+fn ar_gv_ranges m view ulong 16 slots view ulong 20 to bool
+  req = new ulong 10 0
+  put req 0 get ar_code_bytes 0
+  put req 1 1024
+  put req 2 65536
+  put req 3 16
+  put req 4 384
+  put req 5 384
+  put req 6 get m 9
+  put req 7 get m 10
+  put req 8 get m 11
+  put req 9 get m 11
+  ret wave_mapped slots req
+end
+
+fn ar_gated_hop table long subject ulong h view ulong 2 m view ulong 16 to ulong
+  if not caproot_validate table subject h m
+    ret 1
+  end
+  if ne get ar_fenced_seq 0 0
+    ret 7
+  end
+  if ne get ar_code_model 0 arboris_magic
+    ret 2
+  end
+  if or ne get m 1 get ar_code_nodes 0 ne get m 4 get ar_code_planes 0
+    ret 2
+  end
+  if not ar_gv_header m get ar_gated_standard 0
+    ret 2
+  end
+  bytes = mul mul get m 1 get m 4 2
+  if not ar_finite_halves get ar_maps 2 get m 10
+    ret 3
+  end
+  if not ar_finite_halves get ar_maps add 3 get m 6 bytes
+    ret 3
+  end
+  slots = new ulong 20 0
+  ar_step_slots slots
+  if not ar_gv_ranges m slots
+    ret 4
+  end
+  if not ar_gv_packet m slots get ar_gated_standard 0
+    ret 4
+  end
+  if not caproot_validate table subject h m
+    ret 1
+  end
+  if not ar_step_send
+    ret 5
+  end
+  if not ar_finite_halves get ar_maps sub ulong 4 get m 6 bytes
+    ret 6
+  end
+  ar_record_fence subject h m 0
+  ret 0
+end

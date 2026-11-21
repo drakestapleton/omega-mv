@@ -660,6 +660,48 @@ case "$step" in
   runtime-api)        # omega-mv#594: the Runtime API manifest against the C headers, plus its negative controls.
                       # Host only (gcc for -aux-info), no GPU, no physics checkout.
     make $NOPHYS test-runtime-api ;;
+  arboris-gated-silicon)
+    sh seed/omega-from-seed.sh
+    OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
+    for model in gated wide; do
+      log="$OUT_DIR/$model-device.log"
+      "$OUT_DIR/caproot-issuer" "$OUT_DIR/$model-chip" --arboris-silicon > "$log" || { cat "$log"; exit 1; }
+      cat "$log"
+      case "$model" in
+        gated) halves=40; output=ad8a70b5e2935b7fca819ce4823afea8bef95c56135b6d86e7cf4ada6f16a089 ;;
+        wide) halves=1320; output=ca8052acb8c6306df043531ab6c116c5d8dd69a7e565974338088119f8355e34 ;;
+      esac
+      grep -Eq '^step_message=4152425354503032[0-9a-f]{352}$' "$log"
+      grep -qx "matching_fp16_elements=$halves" "$log"
+      grep -qx "kernel_sha256=$(sha256sum "$OUT_DIR/$model.sass" | cut -d' ' -f1)" "$log"
+      grep -qx "output_sha256=$output" "$log"
+    done
+    ;;
+  arboris-sparse-silicon)
+    sh seed/omega-from-seed.sh
+    OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
+    for model in sparse small wave; do
+      log="$OUT_DIR/arboris-$model.log"
+      "$OUT_DIR/caproot-issuer" "$OUT_DIR/$model-chip" --arboris-silicon > "$log" || {
+        cat "$log"
+        exit 1
+      }
+      cat "$log"
+      case "$model" in
+        sparse) words=200000; code=relax.bin; output=8ded4456ffe03d54cad43b7b7b8d07ff1997919c103dd1b49b61c6782d6e3d19 ;;
+        small) words=4096; code=small.bin; output=33dfc6bc867a2bfbe09192038538c209c9b8bc89e16b6cedcaf0e7cf32b1a8f6 ;;
+        wave) words=400000; code=wave.bin; output=b2d9f9458d97db2f5415078fbc43ad0256229175bbc28127eeaad941a708dc7a ;;
+      esac
+      grep -Eq '^step_message=4152425354503032[0-9a-f]{352}$' "$log"
+      grep -qx "matching_fp32_words=$words" "$log"
+      grep -qx "kernel_sha256=$(sha256sum "$OUT_DIR/$code" | cut -d' ' -f1)" "$log"
+      grep -qx "output_sha256=$output" "$log"
+    done
+    ;;
+  arboris)
+    sh seed/omega-from-seed.sh > "$OUT_DIR/seed.log" 2>&1
+    OMC="$ROOT/seed/out/omc" sh tests/arboris/host.sh "$OUT_DIR"
+    ;;
   om-units)           # The C entry points whose algorithm is Omega (om/units.sh): omc born from the seed here,
                       # the generator pinned by om/omega-bridge.lock; regenerated binding, SHA-256 and BLAKE3
                       # byte parity against the C they replaced, and the BLAKE3 mutants. NOT_RUN (3) without tools.

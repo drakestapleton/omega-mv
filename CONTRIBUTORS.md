@@ -392,3 +392,22 @@ Update this table in the same commit as the work it credits.
 
 - Drake Stapleton and Codex — calibrated and measured DeepSeek mixed-format SM121a expert projections against the pinned checkpoint on GB10.
 - Codex, under Drake Stapleton’s direction, documented the partner researcher setup and benchmark replay.
+| Codex (under Drake Stapleton's direction) | Implemented the checked five-slab Arboris arena plan and bounded CSR topology validation in seeded Omega. |
+| Codex (under Drake Stapleton's direction) | Ported the Arboris v0.1.0 ontology rules into a static graph loader and implemented a batched binary32 CPU spreading-activation oracle. |
+| Codex (under Drake Stapleton's direction) | Implemented the gated-vector v1 CPU oracle over the planned Arboris slabs, including depth-first compartment reduction and ping-pong state updates. |
+| Codex (under Drake Stapleton's direction) | Emitted the batched Arboris sparse wave with the SM121 Omega encoder and checked its instruction listing and scoreboard dependencies. |
+| Codex (under Drake Stapleton's direction) | Implemented receipt-based sparse backend selection, sized CTA scratch for FP32 branch potentials, composed the guarded native arena importer, validated Arboris effect grants against the sealed Linux capability root, implemented batched max-product relaxation in OM-2 on CPU and SM121, packed sparse-wave QMDs, and checked the emitted code against the Omega and C scoreboards. |
+| Codex (under Drake Stapleton's direction) | Connected the Arboris sparse arena and capability check to native Blackwell QMD submission, fence retirement, SHA-256 witnesses over mapped bytes and differential testing. |
+| Codex (under Drake Stapleton's direction) | Implemented the fused SM121 gated-vector emitter, its native QMD worker and standard-soma and hub differential fixtures. |
+| Codex (under Drake Stapleton's direction) | Selected 4 KiB system-memory pages for guarded Arboris allocations and exercised RM extent checks on duplicate objects. |
+| Codex (under Drake Stapleton's direction) | Connected the device completion word to the Arboris receipt, verified Ed25519 step signatures, and published the epoch and bank through a single ordered cursor store. |
+| Codex (under Drake Stapleton's direction) | Vectorized the fused Arboris tick to process eight FP16 coordinates per lane with aligned 128-bit global loads and stores. |
+| Codex (under Drake Stapleton's direction) | Checked the batched sparse CPU fixtures against closed-form outputs at both routing sizes. |
+| Codex (under Drake Stapleton's direction) | Packed hub somas into a stable suffix, remapped handles and both banks, and checked the reordered gated tick against the CPU oracle. |
+| Codex (under Drake Stapleton's direction) | Bound signed step receipts to the submitting grant and spreading controls, and guarded pending output against a second dispatch. |
+| Codex (under Drake Stapleton's direction) | Bound installed GPU code to the mapped model and exercised failed-bind reservation cleanup with the seeded compiler. |
+| Codex (under Drake Stapleton's direction) | Implemented the scoped Arboris Ed25519 signer in seeded Omega and verified durable publication and retries with a dedicated Spark world identity. |
+| Codex (under Drake Stapleton's direction) | Applied the measured SM121 register headroom rule to the gated QMD following the Spark warp exception. |
+| Codex (under Drake Stapleton's direction) | Connected pre-submission policy admission to the dedicated world signer and verified the committed bank through the supervisor channel. |
+| Codex (under Drake Stapleton's direction) | Instrumented repeated resident CPU and native GPU sparse queries for paired latency and whole-board energy measurements. |
+| Codex (under Drake Stapleton's direction) | Extended gated differential verification to all warp lanes, a partial second dimension tile, and 1,320 FP16 coordinates. |

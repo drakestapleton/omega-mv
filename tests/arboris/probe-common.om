@@ -1,0 +1,291 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+fn probe_log label view uchar * v ulong to void
+  digits = new uchar 21 0
+  p = ulong 20
+  put digits p 10
+  while true bound 20
+    p = sub p 1
+    put digits p uchar add 48 rem v 10
+    v = div v 10
+    if eq v 0
+      break
+    end
+  end
+  ignored = write 1 label 0 len label
+  ignored = write 1 digits p sub 21 p
+end
+text ps_stage "nvrm_stage="
+text ps_errno "linux_errno="
+text ps_status "rm_status="
+text ps_index "import_index="
+text ps_probe "probe_status="
+text ps_cpu "cpu_validated_hop_ns="
+text ps_gpu "gpu_validated_hop_ns="
+text ps_words "matching_fp32_words="
+text ps_rc "hop_status="
+text ps_input "arena_sha256="
+text ps_code "kernel_sha256="
+text ps_output "output_sha256="
+text ps_hex "0123456789abcdef"
+fn probe_digest label view uchar * hash view uchar * to void
+  line = new uchar 65 10
+  for i ulong 32
+    v = ulong get hash i
+    put line mul i 2 get ps_hex shr v 4
+    put line add mul i 2 1 get ps_hex and v 15
+  end
+  ignored = write 1 label 0 len label
+  ignored = write 1 line 0 65
+end
+
+global ps_signed ulong 1
+text ps_benchmark "benchmark"
+text ps_reference "reference"
+text ps_signed_hash "signed_step_sha256="
+text ps_epoch "committed_world_epoch="
+text ps_message "step_message="
+
+note Optional live signer probe. The supervisor installs the raw public key
+note on FD9, the private request pipe on FD10 and the reply pipe on FD11.
+fn probe_arm_signer table long m view ulong 16 h view ulong 2 controls ulong to bool
+  if ne get ps_signed 0 2
+    ret true
+  end
+  policy = new uchar 136 0
+  if not ar_signing_policy table 42 h m controls policy
+    ret false
+  end
+  ret eq write 12 policy 0 136 136
+end
+
+fn probe_seal table long m view ulong 16 h view ulong 2 to bool
+  pk = new uchar 32 0
+  if ne read 9 pk 0 32 32
+    ret false
+  end
+  grant = new ulong 3 0
+  put grant 0 42
+  put grant 1 get h 0
+  put grant 2 get h 1
+  channel = new int 2 10
+  put channel 1 11
+  receipt = new uchar 248 0
+  if not ar_seal_step table grant m channel pk receipt
+    ret false
+  end
+  epoch = mapget get ar_maps 5 32 8
+  if ne epoch add get m 7 1
+    ret false
+  end
+  ctx = new ulong 40 0
+  digest = new uchar 32 0
+  sha256_init ctx
+  sha256_update ctx receipt
+  sha256_final ctx digest
+  probe_digest ps_signed_hash digest
+  probe_log ps_epoch epoch
+  ret true
+end
+
+fn probe_witness table long m view ulong 16 handle view ulong 2 to bool
+  body = new uchar 65536 0
+  metrics = new ulong 3 0
+  if not ar_step_message m 42 handle body metrics
+    ret false
+  end
+  line = new uchar 369 10
+  for i ulong 184
+    v = ulong get body i
+    put line mul i 2 get ps_hex shr v 4
+    put line add mul i 2 1 get ps_hex and v 15
+  end
+  if ne write 1 ps_message 0 len ps_message long len ps_message
+    ret false
+  end
+  if ne write 1 line 0 369 369
+    ret false
+  end
+  if eq get ps_signed 0 2
+    ret probe_seal table m handle
+  end
+  ret true
+end
+
+fn probe_le bytes view uchar * i ulong width ulong to ulong
+  v = ulong 0
+  for j ulong width bound 8
+    v = or v shl ulong get bytes add i j mul j 8
+  end
+  ret v
+end
+
+fn probe_produce m view ulong 16 offsets view ulong 6 sendfd int ackfd int to int
+  if not nvfull
+    ret 10
+  end
+  rec = new uchar 144 0
+  for i ulong 6
+    tok = nvallocgranule ar_region_bytes m offsets i true true
+    if le tok 0
+      ret 11
+    end
+    if not probe_fill m i tok
+      ret 12
+    end
+    if not nvexport tok
+      ret 13
+    end
+    for j ulong 24
+      put rec add mul i 24 j get nvshrec j
+    end
+  end
+  cpufence
+  if ne write sendfd rec 0 144 144
+    ret 14
+  end
+  if ne read ackfd rec 0 1 1
+    ret 15
+  end
+  ret 0
+end
+
+fn probe_import m view ulong 16 offsets view ulong 6 to int
+  fds = new uchar 16 0
+  if ne pipefds fds 0 8 0 0
+    ret 16
+  end
+  if ne pipefds fds 8 8 0 0
+    ret 16
+  end
+  pid = fork
+  if lt pid 0
+    ret 17
+  end
+  if eq pid 0
+    ignored = fclose int probe_le fds 0 4
+    ignored = fclose int probe_le fds 12 4
+    rc = probe_produce m offsets int probe_le fds 4 4 int probe_le fds 8 4
+    if ne rc 0
+      probe_log ps_probe ulong rc
+      probe_log ps_stage ulong get nvstage 0
+      err = get nverr 0
+      if lt err 0
+        probe_log ps_errno ulong neg err
+      else
+        probe_log ps_status ulong err
+      end
+    end
+    if not nvstop
+      rc = int 18
+    end
+    exit rc
+  end
+  ignored = fclose int probe_le fds 4 4
+  ignored = fclose int probe_le fds 8 4
+  records = new uchar 144 0
+  ok = eq read int probe_le fds 0 4 records 0 144 144
+  if ok
+    ok = nvfull
+  end
+  if ok
+    ok = nvchan
+  end
+  if ok
+    ok = ar_map_arena records m get m 12
+  end
+  if ok
+    ok = eq write int probe_le fds 12 4 records 0 1 1
+  end
+  ignored = fclose int probe_le fds 12 4
+  ignored = fclose int probe_le fds 0 4
+  if ne waitpid int pid fds 0 8 0 pid
+    ret 19
+  end
+  if ne probe_le fds 0 4 0
+    ret 20
+  end
+  if not ok
+    ret 21
+  end
+  ret 0
+end
+
+fn probe_host_mode to int
+  modebuf = new uchar 16 0
+  count = argread 1 modebuf 0 16
+  if eq count 9
+    benchmark = true
+    reference = true
+    for i ulong 9
+      if ne get modebuf i get ps_benchmark i
+        benchmark = false
+      end
+      if ne get modebuf i get ps_reference i
+        reference = false
+      end
+    end
+    if benchmark
+      put ps_signed 0 4
+      ret probe_reference
+    end
+    if reference
+      ret probe_reference
+    end
+  end
+  ret 49
+end
+
+fn main to int
+  if eq argcnt 2
+    ret probe_host_mode
+  end
+  bytes = new uchar 48 0
+  if ne read 0 bytes 0 48 48
+    ret 3
+  end
+  if ne probe_le bytes 0 8 42
+    ret 4
+  end
+  h = new ulong 2 0
+  put h 0 probe_le bytes 8 8
+  put h 1 probe_le bytes 16 8
+  m = new ulong 16 0
+  probe_model_meta m
+  put m 7 probe_le bytes 24 8
+  put m 8 probe_le bytes 32 8
+  table = mapnew int 3 0 22560 1 1
+  if le table 0
+    ret 5
+  end
+  put ps_signed 0 probe_le bytes 40 8
+  rc = probe_run table h m
+  if ne rc 0
+    probe_log ps_stage ulong get nvstage 0
+    note RM statuses are positive and Linux errors negative.
+    probe_log ps_probe ulong rc
+    probe_log ps_index get ar_import_index 0
+    err = get nverr 0
+    if lt err 0
+      probe_log ps_errno ulong neg err
+    else
+      probe_log ps_status ulong err
+    end
+  end
+  if not ar_step_close
+    if eq rc 0
+      rc = int 34
+    end
+  end
+  if not ar_unmap
+    if eq rc 0
+      rc = int 32
+    end
+  end
+  if not nvstop
+    if eq rc 0
+      rc = int 33
+    end
+  end
+  ignored = mapdrop table
+  ret rc
+end

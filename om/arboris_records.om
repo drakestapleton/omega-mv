@@ -1,0 +1,204 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Compose after arboris_ontology.om. This is a compute projection of StateGraph.
+note Dense node and edge identities are their row ordinals. The source graph
+note retains string identity, arbitrary attributes, timestamps and provenance.
+note Header (uint words): AR01, profile, nodes, edges, max_hops (0 unbounded),
+note exponential rate bits (finite FP32 in [0,1]). Each node has three words:
+note type, presence bits for required properties, Running/Stopped flags (bits 0,1).
+note Each edge has four words: subject, relation, object, conductance FP32 bits.
+const ar_u32_max ulong 0xffffffff
+const ar_one uint 0x3f800000
+const ar_record_v1 uint 0x41523031
+const ar_topo_v1 uint 0x41525431
+
+fn ar_records_shape records view uint * to bool
+  if lt len records 6
+    ret false
+  end
+  if ne get records 0 ar_record_v1
+    ret false
+  end
+  profile = get records 1
+  if or lt profile 1 gt profile 2
+    ret false
+  end
+  n = ulong get records 2
+  e = ulong get records 3
+  if or eq n 0 gt e div ar_u32_max 2
+    ret false
+  end
+  if gt get records 5 ar_one
+    ret false
+  end
+  ret eq len records add 6 add mul n 3 mul e 4
+end
+
+fn ar_nodes_ok r view uint * to bool
+  for i ulong ulong get r 2 bound ar_u32_max
+    pos = add 6 mul i 3
+    if not arboris_node_ok ulong get r 1 ulong get r pos get r add pos 1 get r add pos 2
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_edge_record_ok r view uint * pos ulong to bool
+  n = ulong get r 2
+  src = ulong get r pos
+  dst = ulong get r add pos 2
+  if or ge src n ge dst n
+    ret false
+  end
+  kind_src = ulong get r add 6 mul src 3
+  kind_dst = ulong get r add 6 mul dst 3
+  if not arboris_edge_ok ulong get r 1 ulong get r add pos 1 kind_src kind_dst
+    ret false
+  end
+  bits = get r add pos 3
+  if gt bits ar_one
+    ret false
+  end
+  note Incident-edge traversal permits a two-hop return along every edge.
+  if eq get r 4 0
+    if and eq bits ar_one eq get r 5 ar_one
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_insert topo edit uint * weights edit uint * endpoints ulong w uint to void
+  slot = add 3 shr endpoints 32
+  ix = get topo slot
+  first = add 4 ulong get topo 1
+  put topo add first ulong ix uint and endpoints ar_u32_max
+  put weights ulong ix w
+  put topo slot add ix 1
+end
+
+fn ar_row_starts r view uint * topo edit uint * to void
+  n = ulong get r 2
+  e = ulong get r 3
+  edges = add 6 mul n 3
+  put topo 0 ar_topo_v1
+  put topo 1 uint n
+  put topo 2 uint mul e 2
+  put topo add 3 n uint mul e 2
+  for i ulong n bound ar_u32_max
+    put topo add 3 i 0
+  end
+  for i ulong e bound ar_u32_max
+    pos = add edges mul i 4
+    src_slot = add 3 ulong get r pos
+    dst_slot = add 3 ulong get r add pos 2
+    put topo src_slot add get topo src_slot 1
+    put topo dst_slot add get topo dst_slot 1
+  end
+  cursor = uint 0
+  for v ulong n bound ar_u32_max
+    slot = add 3 v
+    count = get topo slot
+    put topo slot cursor
+    cursor = add cursor count
+  end
+end
+
+fn ar_scatter r view uint * topo edit uint * weights edit uint * to void
+  pos = add 6 mul ulong get r 2 3
+  while lt pos len r bound ar_u32_max
+    pair = or shl ulong get r pos 32 ulong get r add pos 2
+    w = get r add pos 3
+    ar_insert topo weights pair w
+    ar_insert topo weights rotl pair 32 w
+    pos = add pos 4
+  end
+end
+
+fn ar_validate_records r view uint * topology_len ulong param_len ulong to ulong
+  if not ar_records_shape r
+    ret 1
+  end
+  n = ulong get r 2
+  e = ulong get r 3
+  if or ne topology_len add add n 4 mul e 2 ne param_len mul e 2
+    ret 2
+  end
+  if not ar_nodes_ok r
+    ret 3
+  end
+  edges = add 6 mul n 3
+  for i ulong e bound ar_u32_max
+    if not ar_edge_record_ok r add edges mul i 4
+      ret 4
+    end
+  end
+  ret 0
+end
+
+fn ar_restore_rows topo edit uint * to void
+  n = ulong get topo 1
+  note The cursors now point to each row end. Restore row starts, in reverse.
+  for i ulong n bound ar_u32_max
+    slot = add 3 sub n i
+    put topo slot get topo sub slot 1
+  end
+  put topo 3 0
+end
+
+note Output TopologyCSR words: ART1, node count, arc count, N+1 offsets,
+note then arc source handles. ParamSlab holds one conductance word per arc.
+note Verify all input and output extents before the first write.
+export fn arboris_load_records r view uint * topo edit uint * weights edit uint * to ulong
+  reason = ar_validate_records r len topo len weights
+  if ne reason 0
+    ret reason
+  end
+  ar_row_starts r topo
+  ar_scatter r topo weights
+  ar_restore_rows topo
+  ret 0
+end
+
+note Digest the versioned CSR and parallel conductances in little-endian wire
+note order. ART1 and the N/A counts frame the two arrays unambiguously.
+fn ar_hash_words ctx edit ulong 40 data view uint * to void
+  block = new uchar 64 0
+  used = ulong 0
+  for i ulong len data bound 0x7fffffffffffffff
+    word = get data i
+    put block used uchar and word 255
+    put block add used 1 uchar and shr word 8 255
+    put block add used 2 uchar and shr word 16 255
+    put block add used 3 uchar shr word 24
+    used = add used 4
+    if eq used 64
+      sha256_update ctx block
+      used = ulong 0
+    end
+  end
+  if ne used 0
+    sha256_update ctx part block 0 used
+  end
+end
+
+export fn arboris_topology_digest topo view uint * weights view uint * digest edit uchar 32 to ulong
+  if lt len topo 4
+    ret 1
+  end
+  if ne get topo 0 ar_topo_v1
+    ret 1
+  end
+  if ne len weights ulong get topo 2
+    ret 1
+  end
+  if ne len topo add 4 add ulong get topo 1 len weights
+    ret 1
+  end
+  ctx = new ulong 40 0
+  sha256_init ctx
+  ar_hash_words ctx topo
+  ar_hash_words ctx weights
+  sha256_final ctx digest
+  ret 0
+end

@@ -1,0 +1,257 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note FP32 scalar oracle for the incident-edge spreading implementation in
+note Arboris abd34338c8b10bb8c6a43784dfb782879d78ffd6. A bank stores
+note [batch, raw frontier then highest decayed scores], two N-word planes.
+note State header is batch, active bank, decay(hop) bits, threshold bits.
+note Initially raw and highest scores both hold the seeds. The caller supplies
+note the selected decay each hop. A zero decay stops upstream traversal.
+fn ar_spread_shape topo view uint * weight_count ulong to bool
+  if lt len topo 4
+    ret false
+  end
+  if ne get topo 0 ar_topo_v1
+    ret false
+  end
+  n = ulong get topo 1
+  if or eq n 0 ne weight_count ulong get topo 2
+    ret false
+  end
+  if ne len topo add add n 4 weight_count
+    ret false
+  end
+  ret true
+end
+
+fn ar_state_shape state view uint * n ulong to bool
+  if lt len state 4
+    ret false
+  end
+  batch = ulong get state 0
+  if or eq batch 0 gt get state 1 1
+    ret false
+  end
+  if or gt get state 2 ar_one gt get state 3 ar_one
+    ret false
+  end
+  rows = sub len state 4
+  stride = mul n 4
+  ret and eq mul div rows stride stride rows eq div rows stride batch
+end
+
+fn ar_spread_topology topo view uint * weights view uint * to bool
+  n = ulong get topo 1
+  if or ne get topo 3 0 ne ulong get topo add 3 n len weights
+    ret false
+  end
+  for i ulong n bound ar_u32_max
+    if gt get topo add 3 i get topo add 4 i
+      ret false
+    end
+  end
+  first = add n 4
+  for j ulong len weights bound ar_u32_max
+    if or ge ulong get topo add first j n gt get weights j ar_one
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_spread_bank state view uint * bank ulong to ulong
+  size = div sub len state 4 2
+  ret add 4 mul bank size
+end
+
+fn ar_spread_inputs state view uint * to bool
+  size = div sub len state 4 2
+  start = ar_spread_bank state ulong get state 1
+  for i ulong size bound 0x7fffffffffffffff
+    if gt get state add start i ar_one
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ar_source topo view uint * ix view ulong 6 to ulong
+  start = add get ix 3 4
+  ret ulong get topo add start get ix 4
+end
+
+note Nonnegative binary32 in [0,1], round to nearest even with gradual
+note underflow. The freestanding bridge admits integer instructions only.
+fn ar_significand bits uint to ulong
+  fraction = ulong and bits 0x7fffff
+  if ge bits 0x800000
+    ret or fraction 0x800000
+  end
+  ret fraction
+end
+
+fn ar_exponent bits uint to ulong
+  e = ulong shr bits 23
+  if eq e 0
+    ret 1
+  end
+  ret e
+end
+
+fn ar_product a uint b uint to uint
+  product = mul ar_significand a ar_significand b
+  exponents = add ar_exponent a ar_exponent b
+  shift = ulong 23
+  if ge product 0x800000000000
+    shift = ulong 24
+  end
+  if lt add exponents shift 151
+    shift = sub ulong 151 exponents
+  end
+  if gt shift 48
+    ret 0
+  end
+  sig = shr product shift
+  tail = sub product shl sig shift
+  halfway = shl ulong 1 sub shift 1
+  if or gt tail halfway and eq tail halfway ne and sig 1 0
+    sig = add sig 1
+  end
+  if lt sig 0x800000
+    ret uint sig
+  end
+  exponent = sub add exponents shift 150
+  if eq sig 0x1000000
+    exponent = add exponent 1
+    sig = shr sig 1
+  end
+  ret uint or shl exponent 23 and sig 0x7fffff
+end
+
+fn ar_weighted state view uint * ix view ulong 6 src ulong w uint to uint
+  ret ar_product get state add get ix 0 src w
+end
+
+note Work indices: input row, output row, destination, N, arc cursor and row end.
+fn ar_advance state edit uint * ix view ulong 6 peak uint to void
+  score = ar_product peak get state 2
+  raw = peak
+  if lt score get state 3
+    score = uint 0
+    raw = uint 0
+  end
+  v = get ix 2
+  prev = get state add add get ix 0 get ix 3 v
+  dest = add get ix 1 v
+  put state dest raw
+  if lt score prev
+    score = prev
+  end
+  put state add dest get ix 3 score
+end
+
+export fn arboris_spread_step topo view uint * weights view uint * state edit uint * to ulong
+  if not ar_spread_shape topo len weights
+    ret 1
+  end
+  if not ar_state_shape state ulong get topo 1
+    ret 1
+  end
+  if not ar_spread_topology topo weights
+    ret 2
+  end
+  if not ar_spread_inputs state
+    ret 3
+  end
+  if eq get state 2 0
+    ret 0
+  end
+  ix = new ulong 6 0
+  put ix 0 ar_spread_bank state ulong get state 1
+  put ix 1 ar_spread_bank state xor ulong get state 1 1
+  put ix 3 ulong get topo 1
+  todo = div sub len state 4 4
+  while ne todo 0 bound 0x7fffffffffffffff
+    put ix 4 ulong get topo add 3 get ix 2
+    put ix 5 ulong get topo add 4 get ix 2
+    peak = uint 0
+    while lt get ix 4 get ix 5 bound ar_u32_max
+      src = ar_source topo ix
+      weight = get weights get ix 4
+      candidate = ar_weighted state ix src weight
+      if gt candidate peak
+        peak = candidate
+      end
+      put ix 4 add get ix 4 1
+    end
+    ar_advance state ix peak
+    put ix 2 add get ix 2 1
+    if eq get ix 2 get ix 3
+      put ix 2 0
+      put ix 0 add get ix 0 mul get ix 3 2
+      put ix 1 add get ix 1 mul get ix 3 2
+    end
+    todo = sub todo 1
+  end
+  put state 1 xor get state 1 1
+  ret 0
+end
+
+note Monotone max-product step. State header: batch, active bank, gamma bits,
+note reserved zero. One N-word score vector per query in each bank. Incoming
+note edges are exactly the ordered arcs recorded in CSR. Round gamma*weight to
+note binary32, then multiply by the source score and round again.
+fn ar_factor state view uint * weights view uint * ix view ulong 6 to uint
+  ret ar_product get state 2 get weights get ix 4
+end
+
+export fn arboris_relax_step topo view uint * weights view uint * state edit uint * to ulong
+  if not ar_spread_shape topo len weights
+    ret 1
+  end
+  if lt len state 4
+    ret 1
+  end
+  if or eq get state 0 0 gt get state 1 1
+    ret 1
+  end
+  if or gt get state 2 ar_one ne get state 3 0
+    ret 1
+  end
+  size = mul ulong get topo 1 ulong get state 0
+  if or gt size 0x7ffffffffffffffd ne len state add 4 mul size 2
+    ret 1
+  end
+  if not ar_spread_topology topo weights
+    ret 2
+  end
+  if not ar_spread_inputs state
+    ret 3
+  end
+  ix = new ulong 6 0
+  put ix 0 ar_spread_bank state ulong get state 1
+  put ix 1 ar_spread_bank state xor ulong get state 1 1
+  put ix 3 ulong get topo 1
+  while ne size 0 bound 0x7ffffffffffffffd
+    put ix 4 ulong get topo add 3 get ix 2
+    put ix 5 ulong get topo add 4 get ix 2
+    best = get state add get ix 0 get ix 2
+    while lt get ix 4 get ix 5 bound ar_u32_max
+      src = ar_source topo ix
+      factor = ar_factor state weights ix
+      score = ar_weighted state ix src factor
+      if gt score best
+        best = score
+      end
+      put ix 4 add get ix 4 1
+    end
+    put state add get ix 1 get ix 2 best
+    put ix 2 add get ix 2 1
+    size = sub size 1
+    if eq get ix 2 get ix 3
+      put ix 2 0
+      put ix 0 add get ix 0 get ix 3
+      put ix 1 add get ix 1 get ix 3
+    end
+  end
+  put state 1 xor get state 1 1
+  ret 0
+end

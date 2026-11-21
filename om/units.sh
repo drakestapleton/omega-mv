@@ -28,7 +28,7 @@ NATIVE_PIN=2c1bf63798336e899704217d98f909b31e567289650751a55d83255c7eb8f27d
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # One generated library for all units: the bindings share one ABI runtime (ombr_enter).
 # om/encoder/bw_enc_sm121.om: the sm_121 instruction encoder, twin of aien-dev/CUDApp's (mk/om-encoder.mk).
-UNITS="${OMEGA_UNITS:-om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_enc_sm121.om om/gpu/bw_qmd.om om/gpu/bw_sched.om om/gpu/q38_plan.om om/gpu/cg_pf.om om/gpu/cg_bf16.om om/gpu/cg_gemm.om om/gpu/cg_moe2.om om/gpu/cg_moe.om om/gpu/cg_qmma.om om/gpu/cg_pfhost.om om/gpu/cg_gpu_attn.om om/runtime/rx_regulate.om om/runtime/rx_mid.om om/runtime/rx_cortex_rec.om om/runtime/rx_plan_core.om om/runtime/rx_projection.om om/runtime/rx_capq_core.om om/runtime/rx_costmodel_core.om om/runtime/rx_route_core.om om/runtime/rx_world_core.om om/runtime/rx_skillroute_core.om om/runtime/rx_fusion_core.om om/compiler/osc_literal.om om/compiler/osc_type.om om/compiler/osc_expr.om om/compiler/osc_scalar.om om/compiler/osc_a64_fields.om om/compiler/osc_statement.om om/compiler/osc_ownership.om om/compiler/osc_scope.om om/compiler/osc_pool.om om/compiler/osc_trace.om om/compiler/osc_lifetimes.om om/compiler/osc_flow.om om/compiler/osc_artifact.om src/tensor/tensor_shape.om src/train/sgd_update.om src/train/generation.om src/autodiff/gradient_shape.om}"
+UNITS="${OMEGA_UNITS:-om/arboris_arena.om om/arboris_spread.om om/arboris_gated.om om/blackwell_arboris_emit.om om/blackwell_arboris_qmd.om gpu/nvidia/om/codegen/bw_hazard.om om/sha256/sha256-om2.om om/blake3/b3unit.om om/encoder/bw_enc_sm121.om om/gpu/bw_qmd.om om/gpu/bw_sched.om om/gpu/q38_plan.om om/gpu/cg_pf.om om/gpu/cg_bf16.om om/gpu/cg_gemm.om om/gpu/cg_moe2.om om/gpu/cg_moe.om om/gpu/cg_qmma.om om/gpu/cg_pfhost.om om/gpu/cg_gpu_attn.om om/runtime/rx_regulate.om om/runtime/rx_mid.om om/runtime/rx_cortex_rec.om om/runtime/rx_plan_core.om om/runtime/rx_projection.om om/runtime/rx_capq_core.om om/runtime/rx_costmodel_core.om om/runtime/rx_route_core.om om/runtime/rx_world_core.om om/runtime/rx_skillroute_core.om om/runtime/rx_fusion_core.om om/compiler/osc_literal.om om/compiler/osc_type.om om/compiler/osc_expr.om om/compiler/osc_scalar.om om/compiler/osc_a64_fields.om om/compiler/osc_statement.om om/compiler/osc_ownership.om om/compiler/osc_scope.om om/compiler/osc_pool.om om/compiler/osc_trace.om om/compiler/osc_lifetimes.om om/compiler/osc_flow.om om/compiler/osc_artifact.om src/tensor/tensor_shape.om src/train/sgd_update.om src/train/generation.om src/autodiff/gradient_shape.om}"
 # The units the freestanding GPU link needs (the encoder, codegen, matmul and realize files hash with sha256_*; qmd packs QMDs).
 FS_UNITS="om/sha256/sha256-om2.om om/gpu/bw_qmd.om om/gpu/cg_gpu_attn.om"
 DEST="${OMEGA_UNITS_DEST:-$ROOT/src}"
@@ -41,6 +41,32 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 : > "$T/units.in"; : > "$T/host.in"; : > "$T/leaf.in"; : > "$T/fs.in"; : > "$T/omega_om_units.ident"
 for u in $UNITS; do
   case "$u" in /*) src=$u ;; *) src=$ROOT/$u ;; esac
+  # One callable unit for the ontology, loader and CPU step. Its identity
+  # covers the exact ordered source bytes the compiler and generator consume.
+  if [ "$src" -ef "$ROOT/om/arboris_spread.om" ]; then
+    cat "$ROOT/om/arboris_ontology.om" "$ROOT/om/tls/sha2.om" "$ROOT/om/arboris_records.om" "$src" > "$T/arboris_spread.om"
+    src="$T/arboris_spread.om"
+  fi
+  if [ "$src" -ef "$ROOT/om/arboris_gated.om" ]; then
+    # The vector oracle reuses the arena planner and E1 floating-point
+    # reference. Only the tick is exported by this combined unit.
+    sed 's/^export fn /fn /' "$ROOT/om/arboris_arena.om" > "$T/arboris_gated.om"
+    cat "$ROOT/gpu/nvidia/om/numeric/numeric.om" "$src" >> "$T/arboris_gated.om"
+    src="$T/arboris_gated.om"
+  fi
+  if [ "$src" -ef "$ROOT/om/blackwell_arboris_emit.om" ]; then
+    { echo om2; cat "$ROOT/om/encoder/bw_enc_sm121.om" "$src" "$ROOT/om/blackwell_arboris_gated_emit.om"; } > "$T/blackwell_arboris_emit.om"
+    src="$T/blackwell_arboris_emit.om"
+  fi
+  if [ "$src" -ef "$ROOT/om/blackwell_arboris_qmd.om" ]; then
+    sed 's/^export fn /fn /' "$ROOT/om/gpu/bw_qmd.om" > "$T/blackwell_arboris_qmd.om"
+    cat "$src" >> "$T/blackwell_arboris_qmd.om"
+    src="$T/blackwell_arboris_qmd.om"
+  fi
+  if [ "$src" -ef "$ROOT/gpu/nvidia/om/codegen/bw_hazard.om" ]; then
+    { echo om2; sed 's/^fn hz_chk /export fn hz_chk /' "$src"; } > "$T/bw_hazard.om"
+    src="$T/bw_hazard.om"
+  fi
   name=$(basename "$u" .om | tr -c 'A-Za-z0-9_\n' '_')
   "$OMEGA_OMC" < "$src" > "$T/u.bin"
   # The profile: OM-2 iff the first line that is neither a note nor blank is exactly om2 (erratum E10).
@@ -48,7 +74,7 @@ for u in $UNITS; do
   { cat "$src"; printf '\0'; printf '%08d' "$(wc -c < "$T/u.bin")"; cat "$T/u.bin"
     [ $abi = 1 ] || printf 'omega-unit %s %s\n' "$name" "$OMC_PIN"; } > "$T/u.in"
   cat "$T/u.in" >> "$T/units.in"
-  if [ "$src" -ef "$ROOT/src/tensor/tensor_shape.om" ] || [ "$src" -ef "$ROOT/om/compiler/osc_flow.om" ] ||
+  if [ "$src" = "$T/blackwell_arboris_emit.om" ] || [ "$src" = "$T/blackwell_arboris_qmd.om" ] || [ "$src" = "$T/arboris_spread.om" ] || [ "$src" -ef "$ROOT/om/arboris_arena.om" ] || [ "$src" -ef "$ROOT/src/tensor/tensor_shape.om" ] || [ "$src" -ef "$ROOT/om/compiler/osc_flow.om" ] ||
      [ "$src" -ef "$ROOT/src/train/generation.om" ] || [ "$src" -ef "$ROOT/om/compiler/osc_statement.om" ] ||
      [ "$src" -ef "$ROOT/om/compiler/osc_artifact.om" ] || [ "$src" -ef "$ROOT/src/autodiff/gradient_shape.om" ]; then
     cat "$T/u.in" >> "$T/leaf.in"

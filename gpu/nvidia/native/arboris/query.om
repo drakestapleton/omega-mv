@@ -1,0 +1,141 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note The supervisor owns the request identity and authenticates paired observations.
+note Use the same decision before importing GPU objects. Missing or stale costs
+note take the host path. Return 2 for an invalid request, 0 for CPU, 1 for GPU.
+fn ar_sparse_route m view ulong 16 costs view ulong 32 to ulong
+  if or ne get m 0 arboris_sparse_magic or eq get m 1 0 gt get m 1 0x1fffffff
+    ret 2
+  end
+  if or eq get m 2 0 or gt get m 2 65535 gt get m 3 0xffffffff
+    ret 2
+  end
+  if or eq get m 4 0 or gt get m 4 2 gt get m 6 1
+    ret 2
+  end
+  if or ne get m 5 0 ne get m 14 0
+    ret 2
+  end
+  if or ne get costs 4 get m 1 ne get costs 5 get m 3
+    ret 0
+  end
+  if or ne get costs 6 get m 2 ne get costs 7 sub get m 4 1
+    ret 0
+  end
+  key = new ulong 8 0
+  cpu = new ulong 12 0
+  gpu = new ulong 12 0
+  for i ulong 8
+    put key i get costs i
+  end
+  for i ulong 12
+    put cpu i get costs add 8 i
+    put gpu i get costs add 20 i
+  end
+  ret arboris_capq key cpu gpu
+end
+
+note A native channel serializes a single prepared request with its GPU maps.
+note Callers prepare before opening devices. Consume the plan once with three
+note disjoint CPU views or dispatch against the sealed GPU replicas.
+global ar_query_ready ulong 1
+global ar_query_meta ulong 16
+global ar_query_request ulong 38
+
+fn ar_prepare_sparse m view ulong 16 request view ulong 38 to ulong
+  put ar_query_ready 0 0
+  costs = new ulong 32 0
+  for i ulong 32
+    put costs i get request i
+  end
+  route = ar_sparse_route m costs
+  if eq route 2
+    ret 2
+  end
+  if or gt get request 36 ulong ar_one gt get request 37 ulong ar_one
+    ret 2
+  end
+  if and eq get m 4 1 ne get request 37 0
+    ret 2
+  end
+  if eq get request 36 0
+    route = ulong 0
+  end
+  for i ulong 16
+    put ar_query_meta i get m i
+  end
+  for i ulong 38
+    put ar_query_request i get request i
+  end
+  put ar_query_ready 0 add route 1
+  ret route
+end
+
+fn ar_host_controls state view uint * to bool
+  if or ne ulong get state 0 get ar_query_meta 2 ne ulong get state 1 get ar_query_meta 6
+    ret false
+  end
+  if or ne ulong get state 2 get ar_query_request 36 ne ulong get state 3 get ar_query_request 37
+    ret false
+  end
+  ret true
+end
+
+fn ar_host_query topo view uint * weights view uint * state edit uint * to ulong
+  if or lt len topo 4 lt len state 4
+    ret 3
+  end
+  if or ne ulong get topo 1 get ar_query_meta 1 ne len weights get ar_query_meta 3
+    ret 3
+  end
+  if not ar_host_controls state
+    ret 3
+  end
+  rc = ulong 1
+  if eq get ar_query_meta 4 1
+    rc = arboris_relax_step topo weights state
+  else
+    rc = arboris_spread_step topo weights state
+  end
+  if ne rc 0
+    ret 3
+  end
+  ret 0
+end
+
+note Request words 32..37 are table descriptor, subject, handle ID, generation,
+note decay and threshold. A return of 1 leaves fenced output pending ar_seal_step.
+fn ar_routed_gpu to ulong
+  h = new ulong 2 0
+  put h 0 get ar_query_request 34
+  put h 1 get ar_query_request 35
+  m = new ulong 16 0
+  for i ulong 16
+    put m i get ar_query_meta i
+  end
+  table = long get ar_query_request 32
+  if not caproot_validate table get ar_query_request 33 h m
+    ret 4
+  end
+  if eq get ar_code_model 0 0
+    if not ar_step_open m
+      ret 5
+    end
+  end
+  rc = ar_sparse_hop table get ar_query_request 33 h m get ar_query_request 36 get ar_query_request 37
+  if ne rc 0
+    ret add 5 rc
+  end
+  ret 1
+end
+
+fn ar_execute_sparse topo view uint * weights view uint * state edit uint * to ulong
+  ready = get ar_query_ready 0
+  put ar_query_ready 0 0
+  if eq ready 1
+    ret ar_host_query topo weights state
+  end
+  if eq ready 2
+    ret ar_routed_gpu
+  end
+  ret 2
+end

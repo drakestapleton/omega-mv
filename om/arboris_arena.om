@@ -1,0 +1,238 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note ARBR v1 GraphMeta is 16 little-endian ulong words. Inputs are magic,
+note soma/branch/synapse counts, padded FP16 dimension, max branches, active
+note bank, epoch, generation, and parameter payload bytes (word 10).
+note Outputs are topology bytes (9), single-bank bytes (11), reserved VA
+note span (12), and conservative CTA scratch bytes (13). Word 14 must be zero.
+note Word 15 is owned by the sealing layer. Planning neither seals nor maps.
+om2
+const arboris_magic ulong 0x4152425200000001
+const handle_limit ulong 0xffffffff
+note Matches the QMD builder in om/gpu/bw_qmd.om.
+const qmd_scratch_limit ulong 98304
+
+fn aligned_size n ulong alignment ulong limit ulong to ulong
+  if or eq n 0 gt n limit
+    ret 0
+  end
+  padding = and sub ulong 0 n sub alignment 1
+  if gt padding sub limit n
+    ret 0
+  end
+  ret add n padding
+end
+
+fn positive_product a ulong b ulong limit ulong to ulong
+  if eq b 0
+    ret 0
+  end
+  if gt a div limit b
+    ret 0
+  end
+  ret mul a b
+end
+
+fn valid_counts m view ulong 16 to bool
+  somas = get m 1
+  branches = get m 2
+  if or eq somas 0 gt somas handle_limit
+    ret false
+  end
+  if or eq branches 0 gt branches handle_limit
+    ret false
+  end
+  if gt get m 3 handle_limit
+    ret false
+  end
+  maxbr = get m 5
+  ret and ne maxbr 0 le maxbr branches
+end
+
+fn topology_words m view ulong 16 to ulong
+  note Each count is checked against the 32-bit wire field before this sum.
+  ret add add get m 1 2 add mul get m 2 2 get m 3
+end
+
+fn cta_scratch m view ulong 16 to ulong
+  note State is FP16, but one stored branch potential has four bytes per coordinate.
+  note Each CTA owns at most 256 coordinates. Grid Y covers the other tiles.
+  tile = get m 4
+  if gt tile 256
+    tile = ulong 256
+  end
+  accum_row = mul tile 4
+  per_soma = positive_product get m 5 accum_row qmd_scratch_limit
+  if le per_soma div qmd_scratch_limit 4
+    ret mul per_soma 4
+  end
+  ret qmd_scratch_limit
+end
+
+fn page_layout payload view ulong 6 page ulong budget ulong starts edit ulong 6 to ulong
+  cursor = ulong 0
+  for i ulong 6
+    put starts i cursor
+    extent = aligned_size get payload i page sub budget cursor
+    if eq extent 0
+      ret 0
+    end
+    cursor = add cursor extent
+    if lt i 5
+      if gt page sub budget cursor
+        ret 0
+      end
+      cursor = add cursor page
+    end
+  end
+  ret cursor
+end
+
+note Offsets are relative to a page-aligned reservation. Indices 0..5 name
+note GraphMeta, topology, parameters, ping, pong and receipt. One unmapped
+note page follows each mapped range except the receipt. Page padding is mapped.
+note budget bounds the reservation including holes. Every refusal leaves both
+note outputs unchanged. page must be a supported mapping granule from the mapper.
+export fn arboris_plan_arena m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong
+  if ne get m 0 arboris_magic
+    ret 1
+  end
+  if or ne get m 14 0 gt get m 6 1
+    ret 2
+  end
+  if not valid_counts m
+    ret 3
+  end
+  dim = get m 4
+  if or eq dim 0 ne and dim 7 0
+    ret 4
+  end
+  if or lt page 4096 ne and page sub page 1 0
+    ret 5
+  end
+  payload = new ulong 6 0
+  starts = new ulong 6 0
+  put payload 0 128
+  put payload 1 aligned_size positive_product topology_words m 4 budget 128 budget
+  put payload 2 get m 10
+  row = positive_product dim 2 budget
+  bank = aligned_size positive_product get m 1 row budget 128 budget
+  put payload 3 bank
+  put payload 4 bank
+  put payload 5 64
+  shared = cta_scratch m
+  if eq shared 0
+    ret 7
+  end
+  cursor = page_layout payload page budget starts
+  if eq cursor 0
+    ret 8
+  end
+  put m 9 get payload 1
+  put m 11 bank
+  put m 12 cursor
+  put m 13 shared
+  for i ulong 6
+    put offsets i get starts i
+  end
+  ret 0
+end
+
+fn csr_valid data view uint * start ulong count ulong terminal ulong max_fanout ulong to bool
+  if ne get data start 0
+    ret false
+  end
+  prev = ulong 0
+  for i ulong count bound handle_limit
+    next = ulong get data add start add i 1
+    if or lt next prev gt next terminal
+      ret false
+    end
+    if gt sub next prev max_fanout
+      ret false
+    end
+    prev = next
+  end
+  ret eq prev terminal
+end
+
+note data spans the logical topology payload, excluding alignment padding.
+note Branch metadata interpretation belongs to the model format.
+export fn arboris_check_csr m view ulong 16 data view uint * to ulong
+  if or ne get m 0 arboris_magic not valid_counts m
+    ret 1
+  end
+  if ne len data topology_words m
+    ret 2
+  end
+  somas = get m 1
+  branches = get m 2
+  synapses = get m 3
+  if not csr_valid data 0 somas branches get m 5
+    ret 3
+  end
+  if not csr_valid data add somas 1 branches synapses synapses
+    ret 4
+  end
+  first = add add somas branches 2
+  for k ulong synapses bound handle_limit
+    if ge ulong get data add first k somas
+      ret 5
+    end
+  end
+  ret 0
+end
+
+note ARBS v1 sparse header. Words 1..5 are nodes, batch, directed arcs,
+note planes per bank (1 compounded, 2 upstream), reserved zero. Epoch,
+note generation, bank selector and offsets follow the ARBR contract.
+const arboris_sparse_magic ulong 0x4152425300000001
+export fn arboris_plan_sparse m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong
+  if or ne get m 0 arboris_sparse_magic ne get m 14 0
+    ret 1
+  end
+  if or gt get m 6 1 ne get m 5 0
+    ret 1
+  end
+  n = get m 1
+  batch = get m 2
+  arcs = get m 3
+  planes = get m 4
+  if or eq n 0 gt n 0x1fffffff
+    ret 2
+  end
+  if or eq batch 0 gt batch 65535
+    ret 2
+  end
+  if or gt arcs 0xffffffff or eq planes 0 gt planes 2
+    ret 2
+  end
+  if or lt page 4096 ne and page sub page 1 0
+    ret 3
+  end
+  extents = new ulong 6 0
+  starts = new ulong 6 0
+  put extents 0 128
+  put extents 1 mul add add n arcs 4 4
+  params = mul arcs 4
+  put extents 2 params
+  if eq params 0
+    put extents 2 4
+  end
+  state = positive_product mul mul n 4 planes batch budget
+  put extents 3 state
+  put extents 4 state
+  put extents 5 64
+  total = page_layout extents page budget starts
+  if eq total 0
+    ret 4
+  end
+  put m 9 get extents 1
+  put m 10 params
+  put m 11 state
+  put m 12 total
+  put m 13 0
+  for i ulong 6
+    put offsets i get starts i
+  end
+  ret 0
+end
