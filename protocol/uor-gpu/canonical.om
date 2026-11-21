@@ -1,9 +1,9 @@
 note SPDX-License-Identifier: Apache-2.0
-note protocol/uor-gpu/canonical.om: Pure seeded OM-2 UOR-GPU-1 canonical codec,
-note SHA-256 (uor-addr) and BLAKE3 (.holo) sealer and fail-closed verifier.
-note Compose after si/directives/om2.om, om/tls/sha2.om, om/blake3/b3unit.om.
+note protocol/uor-gpu/canonical.om: Pure seeded OM-2 UOR-GPU-1 canonical codec (384B header),
+note SHA-256 (uor-addr), BLAKE3 (.holo), ML-BOM binding, and Ed25519 attestation layout.
+note Compose after si/directives/om2.om, om/tls/sha2.om, protocol/uor-gpu/b3_uor.om.
 
-const UOR_GPU_HDR_BYTES ulong 256
+const UOR_GPU_HDR_BYTES ulong 384
 const UOR_GPU_VERSION ulong 1
 const UOR_GPU_ISA_SM121 ulong 1
 const UOR_GPU_ISA_SPIRV ulong 2
@@ -26,6 +26,8 @@ const UOR_ERR_LEVEL_LOW ulong 7
 const UOR_ERR_NO_LEAN_PROOF ulong 8
 const UOR_ERR_NO_REPLAY ulong 9
 const UOR_ERR_CAP_DENIED ulong 10
+const UOR_ERR_BAD_SIG ulong 11
+const UOR_ERR_REPLAY_MISMATCH ulong 12
 
 fn uor_put_u32 dst edit uchar * off ulong v ulong to void
   put dst off uchar and v 255
@@ -74,22 +76,22 @@ fn uor_is_zero32 a view uchar * off ulong to ulong
   ret 0
 end
 
-fn uor_fill_b3_blk hdr view uchar 256 pay view uchar * blk edit uchar 1024 pos ulong take ulong to void
+fn uor_fill_b3_blk hdr view uchar 384 pay view uchar * blk edit uchar 1024 pos ulong take ulong to void
   for i ulong take bound 1024
     g = add pos i
-    if lt g 224
+    if lt g 256
       put blk i get hdr g
     else
-      put blk i get pay sub g 224
+      put blk i get pay sub g 256
     end
   end
 end
 
-note Compute BLAKE3 over header[0..223] || payload[0..len pay) into dst32.
-fn uor_holo_blake3 hdr view uchar 256 pay view uchar * dst32 edit uchar 32 to void
+note Compute BLAKE3 over header[0..255] || payload[0..len pay) into dst32.
+fn uor_holo_blake3 hdr view uchar 384 pay view uchar * dst32 edit uchar 32 to void
   st = new ulong 448 0
   blk = new uchar 1024 0
-  total = add 224 len pay
+  total = add 256 len pay
   pos = ulong 0
   while lt pos total bound 65536
     take = sub total pos
@@ -109,7 +111,7 @@ end
 
 note Write canonical UOR-GPU-1 magic and scalar fields into hdr[0..31].
 note meta[5]: 0=isa (1=SM121,2=SPIRV), 1=math (1=RN,2=FTZ), 2=level (0..3), 3=plen, 4=block_x
-fn uor_hdr_write_meta hdr edit uchar 256 meta view ulong 5 to void
+fn uor_hdr_write_meta hdr edit uchar 384 meta view ulong 5 to void
   put hdr 0 uchar 85
   put hdr 1 uchar 79
   put hdr 2 uchar 82
@@ -126,28 +128,29 @@ fn uor_hdr_write_meta hdr edit uchar 256 meta view ulong 5 to void
   uor_put_u32 hdr 28 get meta 4
 end
 
-note Seal a 256-byte UOR-GPU-1 header over payload.
-fn uor_hdr_seal hdr edit uchar 256 pay view uchar * to void
+note Seal a 384-byte UOR-GPU-1 header over payload.
+note Caller populates hdr[0..95] (meta+omc+src) and hdr[128..223] (lean+replay+mlbom).
+note Computes payload_sha256 -> [96..127], uor_id_sha256 -> [224..255], holo_blake3 -> [256..287].
+fn uor_hdr_seal hdr edit uchar 384 pay view uchar * to void
   tmp = new uchar 32 0
-  h192 = new uchar 192 0
+  h224 = new uchar 224 0
   pdig = sha2_digest 256 pay tmp
   if eq pdig 32
     uor_copy32 hdr 96 tmp 0
   end
-  for i ulong 192
-    put h192 i get hdr i
+  for i ulong 224
+    put h224 i get hdr i
   end
-  udig = sha2_digest 256 h192 tmp
+  udig = sha2_digest 256 h224 tmp
   if eq udig 32
-    uor_copy32 hdr 192 tmp 0
+    uor_copy32 hdr 224 tmp 0
   end
   uor_holo_blake3 hdr pay tmp
-  uor_copy32 hdr 224 tmp 0
+  uor_copy32 hdr 256 tmp 0
 end
 
 note Validate magic, version, target ISA, math contract, level, and all 3 digests.
-note Returns UOR_VERDICT_PASS (0) or UOR_ERR_* on any mismatch.
-fn uor_hdr_check hdr view uchar 256 pay view uchar * to ulong
+fn uor_hdr_check hdr view uchar 384 pay view uchar * to ulong
   if or ne get hdr 0 uchar 85 ne get hdr 1 uchar 79
     ret UOR_ERR_BAD_MAGIC
   end
@@ -179,20 +182,20 @@ fn uor_hdr_check hdr view uchar 256 pay view uchar * to ulong
     ret UOR_ERR_PAYLOAD_TAMPER
   end
   tmp = new uchar 32 0
-  h192 = new uchar 192 0
+  h224 = new uchar 224 0
   pdig = sha2_digest 256 pay tmp
   if or ne pdig 32 eq uor_eq32 hdr 96 tmp 0 0
     ret UOR_ERR_PAYLOAD_TAMPER
   end
-  for i ulong 192
-    put h192 i get hdr i
+  for i ulong 224
+    put h224 i get hdr i
   end
-  udig = sha2_digest 256 h192 tmp
-  if or ne udig 32 eq uor_eq32 hdr 192 tmp 0 0
+  udig = sha2_digest 256 h224 tmp
+  if or ne udig 32 eq uor_eq32 hdr 224 tmp 0 0
     ret UOR_ERR_UOR_ID_TAMPER
   end
   uor_holo_blake3 hdr pay tmp
-  if eq uor_eq32 hdr 224 tmp 0 0
+  if eq uor_eq32 hdr 256 tmp 0 0
     ret UOR_ERR_HOLO_TAMPER
   end
   ret UOR_VERDICT_PASS

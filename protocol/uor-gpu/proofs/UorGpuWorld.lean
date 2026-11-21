@@ -57,6 +57,9 @@ structure BundleVerdict where
   level : Nat           -- 0=P0, 1=P1, 2=P2, 3=P3
   hasLeanProof : Bool   -- mandatory for P2/P3
   hasReplay : Bool      -- mandatory for P3
+  replayMatch : Bool    -- golden CPU/silicon oracle matches replay_sha256
+  hasSig : Bool         -- Ed25519 attestation present
+  sigValid : Bool       -- RFC 8032 Ed25519 verification result
   deriving DecidableEq
 
 structure CapGrant where
@@ -72,7 +75,8 @@ def verifyPolicy (minLevel : Nat) (v : BundleVerdict) : Bool :=
   v.payloadOk && v.uorIdOk && v.holoBlake3Ok && v.omcPinOk &&
   decide (minLevel ≤ v.level) &&
   (if minLevel ≥ 2 then v.hasLeanProof else true) &&
-  (if minLevel ≥ 3 then v.hasReplay else true)
+  (if minLevel ≥ 3 then v.hasReplay && v.replayMatch else true) &&
+  (if v.hasSig then v.sigValid else true)
 
 def capAdmit (g : CapGrant) : Bool :=
   g.live && g.epochMatch && g.notExpired && g.subjectMatch && g.resourceMatch && g.hasEffectRight
@@ -104,6 +108,21 @@ theorem admit_requires_live_effect_cap (v : BundleVerdict) (g : CapGrant)
     simp [hl, he, hr] at h
   exact ⟨rfl, rfl, rfl⟩
 
+theorem admit_requires_valid_sig_when_signed (v : BundleVerdict) (g : CapGrant)
+    (h : gpuAdmitDefault v g = true) (hs : v.hasSig = true) : v.sigValid = true := by
+  unfold gpuAdmitDefault verifyPolicy at h
+  cases hv : v.sigValid
+  · simp [hs, hv] at h
+  · rfl
+
+theorem bad_sig_refused (v : BundleVerdict) (g : CapGrant)
+    (hs : v.hasSig = true) (hb : v.sigValid = false) : gpuAdmitDefault v g = false := by
+  simp [gpuAdmitDefault, verifyPolicy, hs, hb]
+
+theorem p3_replay_mismatch_refused (v : BundleVerdict)
+    (hrm : v.replayMatch = false) : verifyPolicy 3 v = false := by
+  simp [verifyPolicy, hrm]
+
 theorem missing_lean_proof_refused (v : BundleVerdict) (g : CapGrant)
     (hno : v.hasLeanProof = false) : gpuAdmitDefault v g = false := by
   simp [gpuAdmitDefault, verifyPolicy, hno]
@@ -124,6 +143,9 @@ theorem revoked_cap_refused (v : BundleVerdict) (g : CapGrant)
 #print axioms admit_requires_lean_proof
 #print axioms admit_requires_intact_digests
 #print axioms admit_requires_live_effect_cap
+#print axioms admit_requires_valid_sig_when_signed
+#print axioms bad_sig_refused
+#print axioms p3_replay_mismatch_refused
 #print axioms missing_lean_proof_refused
 #print axioms tampered_payload_refused
 #print axioms revoked_cap_refused

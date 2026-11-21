@@ -1,7 +1,8 @@
 note SPDX-License-Identifier: Apache-2.0
-note protocol/uor-gpu/verify.om: Pure seeded OM-2 Prism policy verifier and
-note prism/verdict/1 emitter. Enforces mandatory Lean 4 proof under default P2 policy.
-note Compose after canonical.om.
+note protocol/uor-gpu/verify.om: Pure seeded OM-2 Prism policy verifier, RFC 8032
+note Ed25519 attestation checker, replay checker, and prism/verdict/1 emitter.
+note Compose after protocol/omnet/om/sha512/sha512.om, protocol/omnet/om/ed25519/ed25519.om,
+note and protocol/uor-gpu/canonical.om.
 
 text uor_hex_tbl "0123456789abcdef"
 text uor_v_pre "{\"schema\":\"prism/verdict/1\",\"world\":\"hologram:gpu/omega-om2@1\",\"verdict\":\""
@@ -13,10 +14,41 @@ text uor_v_uor ",\"uor_sha256\":\"sha256:"
 text uor_v_b3 "\",\"holo_blake3\":\"blake3:"
 text uor_v_end "\"}\n"
 
-note Verify UOR-GPU-1 bundle against expected omc_pin and minimum Prism level.
+text uor_i_pre "{\"schema\":\"prism/inspect/1\",\"world\":\"hologram:gpu/omega-om2@1\",\"isa\":\""
+text uor_i_sm121 "SM121"
+text uor_i_spirv "SPIRV"
+text uor_i_lvl "\",\"level\":\"P"
+text uor_i_sig "\",\"signed\":"
+text uor_i_true "true"
+text uor_i_false "false"
+text uor_i_lean ",\"lean_proof_sha256\":\"sha256:"
+text uor_i_mlbom "\",\"mlbom_sha256\":\"sha256:"
+text uor_i_uor "\",\"uor_sha256\":\"sha256:"
+text uor_i_b3 "\",\"holo_blake3\":\"blake3:"
+text uor_i_end "\"}\n"
+
+note Verify Ed25519 signature over hdr[224..287] (uor_id_sha256 || holo_blake3).
+note Unsigned (signer_pubkey == 0) returns 1; signed verifies strict RFC 8032.
+fn uor_verify_ed25519 hdr view uchar 384 to ulong
+  if ne uor_is_zero32 hdr 288 0
+    ret 1
+  end
+  pk = new uchar 32 0
+  sig = new uchar 64 0
+  msg = new uchar 65536 0
+  for i ulong 32
+    put pk i get hdr add 288 i
+  end
+  for i ulong 64
+    put sig i get hdr add 320 i
+    put msg i get hdr add 224 i
+  end
+  ret edverify pk msg 64 sig 0
+end
+
+note Verify UOR-GPU-1 bundle against omc_pin, minimum Prism level, and Ed25519 signature.
 note Default Prism policy uses min_level = 2 (P2: mandatory Lean 4 proof).
-note Returns UOR_VERDICT_PASS (0) or UOR_ERR_*.
-fn uor_verify_policy hdr view uchar 256 pay view uchar * omc_pin view uchar 32 min_level ulong to ulong
+fn uor_verify_policy hdr view uchar 384 pay view uchar * omc_pin view uchar 32 min_level ulong to ulong
   rc = uor_hdr_check hdr pay
   if ne rc UOR_VERDICT_PASS
     ret rc
@@ -37,6 +69,20 @@ fn uor_verify_policy hdr view uchar 256 pay view uchar * omc_pin view uchar 32 m
     if ne uor_is_zero32 hdr 160 0
       ret UOR_ERR_NO_REPLAY
     end
+  end
+  if eq uor_verify_ed25519 hdr 0
+    ret UOR_ERR_BAD_SIG
+  end
+  ret UOR_VERDICT_PASS
+end
+
+note Verify bundle's replay_sha256 matches expected oracle replay digest.
+fn uor_verify_replay hdr view uchar 384 expected view uchar 32 to ulong
+  if ne uor_is_zero32 hdr 160 0
+    ret UOR_ERR_NO_REPLAY
+  end
+  if eq uor_eq32 hdr 160 expected 0 0
+    ret UOR_ERR_REPLAY_MISMATCH
   end
   ret UOR_VERDICT_PASS
 end
@@ -76,7 +122,7 @@ fn uor_write_digit fd int d ulong to void
 end
 
 note Emit canonical prism/verdict/1 JSON line to stdout (fd 1).
-fn uor_emit_verdict hdr view uchar * code ulong to void
+fn uor_emit_verdict hdr view uchar 384 code ulong to void
   lvl = uor_get_u32 hdr 20
   uor_write_all 1 uor_v_pre len uor_v_pre
   if eq code UOR_VERDICT_PASS
@@ -89,8 +135,37 @@ fn uor_emit_verdict hdr view uchar * code ulong to void
   uor_write_all 1 uor_v_rsn len uor_v_rsn
   uor_write_digit 1 code
   uor_write_all 1 uor_v_uor len uor_v_uor
-  uor_write_hex32 1 hdr 192
-  uor_write_all 1 uor_v_b3 len uor_v_b3
   uor_write_hex32 1 hdr 224
+  uor_write_all 1 uor_v_b3 len uor_v_b3
+  uor_write_hex32 1 hdr 256
   uor_write_all 1 uor_v_end len uor_v_end
+end
+
+note Emit prism/inspect/1 JSON summary to stdout (fd 1).
+fn uor_emit_inspect hdr view uchar 384 to void
+  isa = uor_get_u32 hdr 12
+  lvl = uor_get_u32 hdr 20
+  uor_write_all 1 uor_i_pre len uor_i_pre
+  if eq isa UOR_GPU_ISA_SM121
+    uor_write_all 1 uor_i_sm121 len uor_i_sm121
+  else
+    uor_write_all 1 uor_i_spirv len uor_i_spirv
+  end
+  uor_write_all 1 uor_i_lvl len uor_i_lvl
+  uor_write_digit 1 lvl
+  uor_write_all 1 uor_i_sig len uor_i_sig
+  if eq uor_is_zero32 hdr 288 0
+    uor_write_all 1 uor_i_true len uor_i_true
+  else
+    uor_write_all 1 uor_i_false len uor_i_false
+  end
+  uor_write_all 1 uor_i_lean len uor_i_lean
+  uor_write_hex32 1 hdr 128
+  uor_write_all 1 uor_i_mlbom len uor_i_mlbom
+  uor_write_hex32 1 hdr 192
+  uor_write_all 1 uor_i_uor len uor_i_uor
+  uor_write_hex32 1 hdr 224
+  uor_write_all 1 uor_i_b3 len uor_i_b3
+  uor_write_hex32 1 hdr 256
+  uor_write_all 1 uor_i_end len uor_i_end
 end
