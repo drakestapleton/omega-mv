@@ -52,12 +52,12 @@ The CPU Engram path uses the original tokenizer's fixed remap data in `engram-to
 
 The trace writer takes the six IDs and original FP32 weight bits after the native gate, without issuing another GPU kernel. Each 80-byte record has u32 turn, turn-local token, layer and reserved words, six u32 IDs, six u32 weight bit patterns, and u64 gate-ready and consumer-need timestamps. The static ring retains one context page of 2,048 tokens. Drain committed entries on the CPU lease before reusing their storage, and finalize the stream SHA-256 after a complete token.
 
-The resident checkpoint planner packs the original embedding, head, norms, routers, shared experts, attention and Engram auxiliary tensors on 256-byte boundaries. Its host control accepts the tensor directory alone to serialize the planned allocation, original payload bytes and tensor count as three u64 words. Supply the 48 verified shard paths as further arguments to populate the whole mapping and measure process RSS. KV and execution workspace allocations are separate.
+The resident checkpoint planner packs the original embedding, head, norms, routers, shared experts, attention and Engram auxiliary tensors on 256-byte boundaries. Its host control accepts the tensor directory alone to serialize the planned allocation, original payload bytes and tensor count and context-2048 KV reservation as four u64 words. Supply the 48 verified shard paths as further arguments to populate the whole mapping and measure process RSS. KV and execution workspace allocations are separate.
 
 ```sh
 (echo om2
  sed '/^om2$/d;s/^export fn /fn /' om/sha256/sha256-om2.om
- cat seed/ng/sha256.om "$d/checkpoint.om" "$d/io.om" "$d/core.om" "$d/check-core.om") |
+ cat seed/ng/sha256.om "$d/checkpoint.om" "$d/io.om" "$d/core.om" "$d/kv.om" "$d/check-core.om") |
     seed/out/omc > "$out/check-core"
 (echo om2
  sed '/^om2$/d;s/^export fn /fn /' om/sha256/sha256-om2.om
