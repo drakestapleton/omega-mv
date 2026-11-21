@@ -22,20 +22,34 @@
  *     arrived == completed + queued + running + rejected
  * is checked after every step. No I/O, no allocation, no globals. */
 #include "applic.h"
+#include "omega_native.h"
 
 #include <math.h>
 #include <string.h>
 
 uint64_t ap_rng_next(ap_rng *r)
 {
-    r->s ^= r->s >> 12; r->s ^= r->s << 25; r->s ^= r->s >> 27;
-    return r->s * 0x2545F4914F6CDD1Dull;
+    uint64_t st[1] = { r->s }, out = 0;
+    (void)omega2_applic_om_rng_next(&out, st, 1);
+    r->s = st[0];
+    return out;
 }
-double ap_rng_unit(ap_rng *r) { return (double)(ap_rng_next(r) >> 11) / 9007199254740992.0; }
+double ap_rng_unit(ap_rng *r)
+{
+    uint64_t st[1] = { r->s }, bits = 0;
+    double d = 0.0;
+    (void)omega2_applic_om_rng_unit(&bits, st, 1);
+    r->s = st[0];
+    memcpy(&d, &bits, 8);
+    return d;
+}
 
 static uint32_t rng_range(ap_rng *r, uint32_t lo, uint32_t hi)   /* inclusive */
 {
-    return lo + (uint32_t)(ap_rng_next(r) % (uint64_t)(hi - lo + 1u));
+    uint64_t st[1] = { r->s }, out = 0;
+    (void)omega2_applic_om_rng_range(&out, st, 1, lo, hi);
+    r->s = st[0];
+    return (uint32_t)out;
 }
 /* Standard normal by Box-Muller; the pair's second value is discarded so the
  * draw count per item is fixed. */
@@ -81,9 +95,9 @@ static void gen_heterogeneous(ap_rng *r, ap_item *it, double sigma)
 /* ---- workload regime: arrivals this step, item family, capacity ---- */
 static int family_is_heterogeneous(ap_workload wl, uint32_t step)
 {
-    if (wl == AP_WL_HETEROGENEOUS || wl == AP_WL_HETERO_SWEEP) return 1;
-    if (wl == AP_WL_REGIME_CHANGE) return step >= AP_SWITCH_STEP;
-    return 0;
+    uint64_t out = 0;
+    (void)omega2_applic_om_family_is_het(&out, (uint64_t)wl, step);
+    return (int)out;
 }
 static uint32_t arrivals_this_step(ap_rng *r, ap_workload wl, uint32_t step, double sweep_rate)
 {
@@ -103,14 +117,16 @@ static uint32_t arrivals_this_step(ap_rng *r, ap_workload wl, uint32_t step, dou
 }
 static uint32_t capacity_this_step(ap_workload wl, uint32_t step)
 {
-    if (wl == AP_WL_CAPACITY_DROP && step >= AP_SWITCH_STEP) return AP_CAP_DROP_SLOTS;
-    return AP_SLOTS;
+    uint64_t out = 0;
+    (void)omega2_applic_om_capacity_this_step(&out, (uint64_t)wl, step);
+    return (uint32_t)out;
 }
 
 uint64_t ap_seed(ap_workload wl, uint32_t seed_index)
 {
-    uint64_t s = AP_SEED_BASE ^ ((uint64_t)wl * 0x9E3779B97F4A7C15ull) ^ (((uint64_t)seed_index + 1u) * 0xD1B54A32D192ED03ull);
-    return s ? s : 1u;
+    uint64_t out = 0;
+    (void)omega2_applic_om_seed(&out, (uint64_t)wl, seed_index);
+    return out;
 }
 
 void ap_sim_init(ap_sim *s, ap_workload wl, uint64_t seed)
@@ -125,8 +141,11 @@ void ap_sim_init(ap_sim *s, ap_workload wl, uint64_t seed)
 
 double ap_sweep_sigma(uint32_t seed_index)
 {
-    double f = AP_SEEDS > 1u ? (double)seed_index / (double)(AP_SEEDS - 1u) : 0.0;
-    return AP_SWEEP_SIGMA_MIN + (AP_SWEEP_SIGMA_MAX - AP_SWEEP_SIGMA_MIN) * f;
+    uint64_t bits = 0;
+    double d = 0.0;
+    (void)omega2_applic_om_sweep_sigma(&bits, seed_index);
+    memcpy(&d, &bits, 8);
+    return d;
 }
 
 void ap_sim_init_indexed(ap_sim *s, ap_workload wl, uint64_t seed, uint32_t seed_index)
@@ -142,7 +161,10 @@ void ap_sim_init_indexed(ap_sim *s, ap_workload wl, uint64_t seed, uint32_t seed
 
 int ap_sim_ledger_ok(const ap_sim *s)
 {
-    return s->arrived == s->completed + (uint64_t)s->queue_len + (uint64_t)s->running_len + s->rejected;
+    uint64_t counts[5] = { s->arrived, s->completed, s->queue_len, s->running_len, s->rejected };
+    uint64_t out = 0;
+    (void)omega2_applic_om_ledger_ok(&out, counts, 5);
+    return (int)out;
 }
 
 static void close_window(ap_sim *s)

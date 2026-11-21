@@ -33,32 +33,27 @@
  * as newly offered work and always predicted full capacity; it was replaced
  * before any result was recorded, and no v1 number is reported anywhere. */
 #include "applic.h"
+#include "omega_native.h"
 
 #include <math.h>
-
-static double clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
+#include <string.h>
 
 static ap_prediction predict_with_arrivals(const ap_window *w, double A)
 {
     ap_prediction p;
-    double W = (double)AP_WINDOW;
-    double mean_d = w->mean_demand > 0.0 ? w->mean_demand : AP_PRIOR_DEMAND;
-    double mean_s = w->mean_slots > 0.0 ? w->mean_slots : AP_PRIOR_SLOTS;
-    double mean_m = w->mean_mem > 0.0 ? w->mean_mem : AP_PRIOR_MEM;
-    double by_slots = (double)w->slots_capacity / mean_s;
-    double by_mem = (double)AP_MEMORY / mean_m;
-    double resident_cap = by_slots < by_mem ? by_slots : by_mem;
-    double cap_W = resident_cap * W / mean_d;
-    double frac = W / mean_d < 1.0 ? W / mean_d : 1.0;
-    double late = (W - mean_d) > 0.0 ? (W - mean_d) / W : 0.0;
-    double flow = (double)w->running * frac + (double)w->queue_len * frac + A * late;
-    double in_next, occ;
-    p.completions = flow < cap_W ? flow : cap_W;
-    in_next = (double)w->in_system + A - p.completions;
-    if (in_next < 0.0) in_next = 0.0;
-    p.queue_density = clamp01((in_next - resident_cap) / (double)AP_MAX_QUEUE);
-    occ = resident_cap > 0.0 ? in_next / resident_cap : 1.0;
-    p.blocked = clamp01((occ - AP_BLOCKED_RAMP_START) / (1.0 - AP_BLOCKED_RAMP_START));
+    uint64_t inp[8], out_p[3] = { 0, 0, 0 }, u = 0;
+    inp[0] = w->slots_capacity;
+    inp[1] = w->running;
+    inp[2] = w->queue_len;
+    inp[3] = w->in_system;
+    memcpy(&inp[4], &w->mean_demand, 8);
+    memcpy(&inp[5], &w->mean_slots, 8);
+    memcpy(&inp[6], &w->mean_mem, 8);
+    memcpy(&inp[7], &A, 8);
+    (void)omega2_applic_om_predict_with_arrivals(&u, inp, 8, out_p, 3);
+    memcpy(&p.completions, &out_p[0], 8);
+    memcpy(&p.queue_density, &out_p[1], 8);
+    memcpy(&p.blocked, &out_p[2], 8);
     return p;
 }
 
@@ -89,11 +84,16 @@ static ap_error score(const ap_sim *s, int mode, uint32_t offset)
         sum_actual_c += ac;
     }
     {
-        double n = (double)scored, mean_c = sum_actual_c / n;
-        e.completions_nrmse = mean_c > 0.0 ? sqrt(se_c / n) / mean_c : sqrt(se_c / n);
-        e.queue_rmse = sqrt(se_q / n);
-        e.blocked_rmse = sqrt(se_b / n);
-        e.composite = (e.completions_nrmse + e.queue_rmse + e.blocked_rmse) / 3.0;
+        uint64_t se[4], out_e[4] = { 0, 0, 0, 0 }, u = 0;
+        memcpy(&se[0], &se_c, 8);
+        memcpy(&se[1], &se_q, 8);
+        memcpy(&se[2], &se_b, 8);
+        memcpy(&se[3], &sum_actual_c, 8);
+        (void)omega2_applic_om_error_finalize(&u, se, 4, scored, out_e, 4);
+        memcpy(&e.completions_nrmse, &out_e[0], 8);
+        memcpy(&e.queue_rmse, &out_e[1], 8);
+        memcpy(&e.blocked_rmse, &out_e[2], 8);
+        memcpy(&e.composite, &out_e[3], 8);
     }
     return e;
 }

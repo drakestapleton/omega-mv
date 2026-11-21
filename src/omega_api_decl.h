@@ -1132,6 +1132,30 @@ uint64_t rx_dual_om_parse_udec(const uint8_t *o_p, size_t o_p_len, uint64_t o_n,
 uint64_t rx_dual_om_reversals(const uint8_t *o_xbytes, size_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
 /* export fn rx_dual_om_peak_to_peak xbytes view uchar * lo ulong hi ulong to ulong */
 uint64_t rx_dual_om_peak_to_peak(const uint8_t *o_xbytes, size_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
+/* export fn applic_om_rng_next st edit ulong 1 to ulong */
+uint64_t applic_om_rng_next(uint64_t o_st[1]);
+/* export fn applic_om_rng_unit st edit ulong 1 to ulong */
+uint64_t applic_om_rng_unit(uint64_t o_st[1]);
+/* export fn applic_om_rng_range st edit ulong 1 lo ulong hi ulong to ulong */
+uint64_t applic_om_rng_range(uint64_t o_st[1], uint64_t o_lo, uint64_t o_hi);
+/* export fn applic_om_seed wl ulong seed_index ulong to ulong */
+uint64_t applic_om_seed(uint64_t o_wl, uint64_t o_seed_index);
+/* export fn applic_om_sweep_sigma seed_index ulong to ulong */
+uint64_t applic_om_sweep_sigma(uint64_t o_seed_index);
+/* export fn applic_om_family_is_het wl ulong step ulong to ulong */
+uint64_t applic_om_family_is_het(uint64_t o_wl, uint64_t o_step);
+/* export fn applic_om_capacity_this_step wl ulong step ulong to ulong */
+uint64_t applic_om_capacity_this_step(uint64_t o_wl, uint64_t o_step);
+/* export fn applic_om_ledger_ok counts view ulong 5 to ulong */
+uint64_t applic_om_ledger_ok(const uint64_t o_counts[5]);
+/* export fn applic_om_predict_with_arrivals inp view ulong 8 out_p edit ulong 3 to void */
+void applic_om_predict_with_arrivals(const uint64_t o_inp[8], uint64_t o_out_p[3]);
+/* export fn applic_om_error_finalize se view ulong 4 scored ulong out_e edit ulong 4 to void */
+void applic_om_error_finalize(const uint64_t o_se[4], uint64_t o_scored, uint64_t o_out_e[4]);
+/* export fn applic_om_sort_desc items view uchar * idx edit uint * n ulong to void */
+void applic_om_sort_desc(const uint8_t *o_items, size_t o_items_len, uint32_t *o_idx, size_t o_idx_len, uint64_t o_n);
+/* export fn applic_om_pearson xbytes view uchar * ybytes view uchar * n ulong out_r edit ulong 2 to void */
+void applic_om_pearson(const uint8_t *o_xbytes, size_t o_xbytes_len, const uint8_t *o_ybytes, size_t o_ybytes_len, uint64_t o_n, uint64_t o_out_r[2]);
 #ifdef __cplusplus
 }
 #endif

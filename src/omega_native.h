@@ -761,6 +761,32 @@ uint32_t omega2_rx_dual_om_parse_udec(uint64_t *result, const uint8_t *o_p, uint
 uint32_t omega2_rx_dual_om_reversals(uint64_t *result, const uint8_t *o_xbytes, uint64_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
 /* export fn rx_dual_om_peak_to_peak xbytes view uchar * lo ulong hi ulong to ulong */
 uint32_t omega2_rx_dual_om_peak_to_peak(uint64_t *result, const uint8_t *o_xbytes, uint64_t o_xbytes_len, uint64_t o_lo, uint64_t o_hi);
+#define OMEGA2_IDENT_applic_core "omega-ident 1 unit=applic_core abi=2 profile=OM-2 src=cad1df549437c1751e02309547b021ee880e68db9fc65e66193fff08a4713bda omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_applic_core(void);
+/* export fn applic_om_rng_next st edit ulong 1 to ulong */
+uint32_t omega2_applic_om_rng_next(uint64_t *result, uint64_t *o_st, uint64_t o_st_len);
+/* export fn applic_om_rng_unit st edit ulong 1 to ulong */
+uint32_t omega2_applic_om_rng_unit(uint64_t *result, uint64_t *o_st, uint64_t o_st_len);
+/* export fn applic_om_rng_range st edit ulong 1 lo ulong hi ulong to ulong */
+uint32_t omega2_applic_om_rng_range(uint64_t *result, uint64_t *o_st, uint64_t o_st_len, uint64_t o_lo, uint64_t o_hi);
+/* export fn applic_om_seed wl ulong seed_index ulong to ulong */
+uint32_t omega2_applic_om_seed(uint64_t *result, uint64_t o_wl, uint64_t o_seed_index);
+/* export fn applic_om_sweep_sigma seed_index ulong to ulong */
+uint32_t omega2_applic_om_sweep_sigma(uint64_t *result, uint64_t o_seed_index);
+/* export fn applic_om_family_is_het wl ulong step ulong to ulong */
+uint32_t omega2_applic_om_family_is_het(uint64_t *result, uint64_t o_wl, uint64_t o_step);
+/* export fn applic_om_capacity_this_step wl ulong step ulong to ulong */
+uint32_t omega2_applic_om_capacity_this_step(uint64_t *result, uint64_t o_wl, uint64_t o_step);
+/* export fn applic_om_ledger_ok counts view ulong 5 to ulong */
+uint32_t omega2_applic_om_ledger_ok(uint64_t *result, const uint64_t *o_counts, uint64_t o_counts_len);
+/* export fn applic_om_predict_with_arrivals inp view ulong 8 out_p edit ulong 3 to void */
+uint32_t omega2_applic_om_predict_with_arrivals(uint64_t *result, const uint64_t *o_inp, uint64_t o_inp_len, uint64_t *o_out_p, uint64_t o_out_p_len);
+/* export fn applic_om_error_finalize se view ulong 4 scored ulong out_e edit ulong 4 to void */
+uint32_t omega2_applic_om_error_finalize(uint64_t *result, const uint64_t *o_se, uint64_t o_se_len, uint64_t o_scored, uint64_t *o_out_e, uint64_t o_out_e_len);
+/* export fn applic_om_sort_desc items view uchar * idx edit uint * n ulong to void */
+uint32_t omega2_applic_om_sort_desc(uint64_t *result, const uint8_t *o_items, uint64_t o_items_len, uint32_t *o_idx, uint64_t o_idx_len, uint64_t o_n);
+/* export fn applic_om_pearson xbytes view uchar * ybytes view uchar * n ulong out_r edit ulong 2 to void */
+uint32_t omega2_applic_om_pearson(uint64_t *result, const uint8_t *o_xbytes, uint64_t o_xbytes_len, const uint8_t *o_ybytes, uint64_t o_ybytes_len, uint64_t o_n, uint64_t *o_out_r, uint64_t o_out_r_len);
 #ifdef __cplusplus
 }
 #endif

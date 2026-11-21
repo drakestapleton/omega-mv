@@ -17,41 +17,25 @@
 /* Heterogeneity measurements, campaign driver, canonical row text, digests
  * and Pearson correlation for the DUAL applicability experiment. */
 #include "applic.h"
+#include "omega_native.h"
 #include "sha256.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+
+_Static_assert(sizeof(ap_item) == 16 && offsetof(ap_item, demand0) == 4 && offsetof(ap_item, slots) == 14,
+               "ap_item layout must match applic_core.om");
 
 /* load of one item in slot-steps */
 static double item_load(const ap_item *it) { return (double)it->demand0 * (double)it->slots; }
 
-/* Deterministic in-place heapsort of item indexes by load, descending; ties
- * broken by index so the order never depends on the sort algorithm. */
-static int load_before(const ap_sim *s, uint32_t a, uint32_t b)
-{
-    double la = item_load(&s->items[a]), lb = item_load(&s->items[b]);
-    if (la != lb) return la > lb;
-    return a < b;
-}
-static void sift(const ap_sim *s, uint32_t *idx, uint32_t root, uint32_t n)
-{
-    /* max-heap on "smaller load first" so that popping yields descending order */
-    for (;;) {
-        uint32_t child = 2u * root + 1u, pick = root, tmp;
-        if (child >= n) return;
-        if (!load_before(s, idx[child], idx[pick])) pick = child;
-        if (child + 1u < n && !load_before(s, idx[child + 1u], idx[pick])) pick = child + 1u;
-        if (pick == root) return;
-        tmp = idx[root]; idx[root] = idx[pick]; idx[pick] = tmp; root = pick;
-    }
-}
 static void sort_desc(const ap_sim *s, uint32_t *idx, uint32_t n)
 {
-    uint32_t i;
+    uint64_t u = 0;
     if (n < 2) return;
-    for (i = n / 2u; i-- > 0;) sift(s, idx, i, n);
-    for (i = n - 1u; i > 0; i--) { uint32_t t = idx[0]; idx[0] = idx[i]; idx[i] = t; sift(s, idx, 0, i); }
+    (void)omega2_applic_om_sort_desc(&u, (const uint8_t *)s->items, (size_t)n * sizeof(ap_item), idx, n, n);
 }
 
 ap_hetero ap_measure(const ap_sim *s, uint32_t *idx, ap_rng *noise)
@@ -211,17 +195,14 @@ void ap_params_digest(uint8_t out[32])
 
 double ap_pearson(const double *x, const double *y, size_t n, double *cov_out)
 {
-    double mx = 0.0, my = 0.0, sxx = 0.0, syy = 0.0, sxy = 0.0;
-    size_t i;
+    uint64_t out_r[2] = { 0, 0 }, u = 0;
+    double r = 0.0, cov = 0.0;
     if (cov_out) *cov_out = 0.0;
     if (n < 2) return 0.0;
-    for (i = 0; i < n; i++) { mx += x[i]; my += y[i]; }
-    mx /= (double)n; my /= (double)n;
-    for (i = 0; i < n; i++) {
-        double dx = x[i] - mx, dy = y[i] - my;
-        sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
-    }
-    if (cov_out) *cov_out = sxy / (double)(n - 1);
-    if (sxx <= 0.0 || syy <= 0.0) return 0.0;
-    return sxy / sqrt(sxx * syy);
+    (void)omega2_applic_om_pearson(&u, (const uint8_t *)x, n * sizeof(double),
+                                   (const uint8_t *)y, n * sizeof(double), n, out_r, 2);
+    memcpy(&r, &out_r[0], 8);
+    memcpy(&cov, &out_r[1], 8);
+    if (cov_out) *cov_out = cov;
+    return r;
 }

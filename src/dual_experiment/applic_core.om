@@ -1,0 +1,317 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 core logic backing src/dual_experiment/
+note (applic_sim.c, applic_predict.c, applic_metrics.c): xorshift64* RNG,
+note seed/sweep/regime/ledger helpers, flow-balance-v2 aggregate predictor,
+note error finalization, deterministic load heapsort, and Pearson correlation.
+om2
+
+fn ap_rng_step st edit ulong 1 to ulong
+  s = get st 0
+  s = xor s shr s 12
+  s = xor s shl s 25
+  s = xor s shr s 27
+  put st 0 s
+  ret mul s 0x2545f4914f6cdd1d
+end
+
+fn ap_clamp01 x f64 to f64
+  z0 = bitcast f64 ulong 0
+  one = bitcast f64 ulong 0x3ff0000000000000
+  if lt x z0
+    ret z0
+  end
+  if gt x one
+    ret one
+  end
+  ret x
+end
+
+fn ap_get_u64 src view uchar * pos ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    b = ulong get src add pos i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn ap_get_u32 src view uchar * pos ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    b = ulong get src add pos i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn ap_item_load items view uchar * idx ulong to ulong
+  base = mul idx 16
+  d = ap_get_u32 items add base 4
+  s = ulong get items add base 14
+  ret mul d s
+end
+
+fn ap_load_before items view uchar * a ulong b ulong to bool
+  la = ap_item_load items a
+  lb = ap_item_load items b
+  if ne la lb
+    ret gt la lb
+  end
+  ret lt a b
+end
+
+fn ap_sift items view uchar * idx edit uint * root ulong n ulong to void
+  r = root
+  while true
+    child = add mul r 2 1
+    if ge child n
+      ret
+    end
+    pick = r
+    ci = ulong get idx child
+    pi = ulong get idx pick
+    if not ap_load_before items ci pi
+      pick = child
+      pi = ci
+    end
+    c2 = add child 1
+    if lt c2 n
+      c2i = ulong get idx c2
+      if not ap_load_before items c2i pi
+        pick = c2
+      end
+    end
+    if eq pick r
+      ret
+    end
+    tmp = get idx r
+    put idx r get idx pick
+    put idx pick tmp
+    r = pick
+  end
+end
+
+export fn applic_om_rng_next st edit ulong 1 to ulong
+  ret ap_rng_step st
+end
+
+export fn applic_om_rng_unit st edit ulong 1 to ulong
+  v = ap_rng_step st
+  q = shr v 11
+  scale = bitcast f64 ulong 0x4340000000000000
+  ret bitcast ulong div f64 q scale
+end
+
+export fn applic_om_rng_range st edit ulong 1 lo ulong hi ulong to ulong
+  v = ap_rng_step st
+  span = add sub hi lo 1
+  ret add lo rem v span
+end
+
+export fn applic_om_seed wl ulong seed_index ulong to ulong
+  base = ulong 0x4455414c2d415031
+  a = mul wl 0x9e3779b97f4a7c15
+  b = mul add seed_index 1 0xd1b54a32d192ed03
+  s = xor xor base a b
+  if eq s 0
+    ret 1
+  end
+  ret s
+end
+
+export fn applic_om_sweep_sigma seed_index ulong to ulong
+  f = div f64 seed_index f64 ulong 23
+  smax = bitcast f64 ulong 0x3ff8000000000000
+  ret bitcast ulong mul smax f
+end
+
+export fn applic_om_family_is_het wl ulong step ulong to ulong
+  if or eq wl 1 eq wl 7
+    ret 1
+  end
+  if and eq wl 6 ge step 1000
+    ret 1
+  end
+  ret 0
+end
+
+export fn applic_om_capacity_this_step wl ulong step ulong to ulong
+  if and eq wl 5 ge step 1000
+    ret 20
+  end
+  ret 32
+end
+
+export fn applic_om_ledger_ok counts view ulong 5 to ulong
+  sum = add add add get counts 1 get counts 2 get counts 3 get counts 4
+  if eq get counts 0 sum
+    ret 1
+  end
+  ret 0
+end
+
+fn ap_pred_flow inp view ulong 8 mean_d f64 to f64
+  w = bitcast f64 ulong 0x4034000000000000
+  one = bitcast f64 ulong 0x3ff0000000000000
+  z0 = bitcast f64 ulong 0
+  frac = div w mean_d
+  if gt frac one
+    frac = one
+  end
+  late = z0
+  if gt sub w mean_d z0
+    late = div sub w mean_d w
+  end
+  arr = bitcast f64 get inp 7
+  r_term = mul f64 get inp 1 frac
+  q_term = mul f64 get inp 2 frac
+  ret add add r_term q_term mul arr late
+end
+
+fn ap_pred_rcap inp view ulong 8 to f64
+  z0 = bitcast f64 ulong 0
+  one = bitcast f64 ulong 0x3ff0000000000000
+  w = bitcast f64 ulong 0x4034000000000000
+  mem = bitcast f64 ulong 0x4090000000000000
+  mean_s = bitcast f64 get inp 5
+  if le mean_s z0
+    mean_s = one
+  end
+  mean_m = bitcast f64 get inp 6
+  if le mean_m z0
+    mean_m = w
+  end
+  by_slots = div f64 get inp 0 mean_s
+  by_mem = div mem mean_m
+  if lt by_mem by_slots
+    ret by_mem
+  end
+  ret by_slots
+end
+
+fn ap_pred_finish in_next f64 rcap f64 comp f64 out_p edit ulong 3 to void
+  z0 = bitcast f64 ulong 0
+  one = bitcast f64 ulong 0x3ff0000000000000
+  maxq = bitcast f64 ulong 0x4070000000000000
+  qdens = ap_clamp01 div sub in_next rcap maxq
+  occ = one
+  if gt rcap z0
+    occ = div in_next rcap
+  end
+  ramp = bitcast f64 ulong 0x3fe8000000000000
+  rspan = bitcast f64 ulong 0x3fd0000000000000
+  blk = ap_clamp01 div sub occ ramp rspan
+  put out_p 0 bitcast ulong comp
+  put out_p 1 bitcast ulong qdens
+  put out_p 2 bitcast ulong blk
+end
+
+export fn applic_om_predict_with_arrivals inp view ulong 8 out_p edit ulong 3 to void
+  z0 = bitcast f64 ulong 0
+  w = bitcast f64 ulong 0x4034000000000000
+  mean_d = bitcast f64 get inp 4
+  if le mean_d z0
+    mean_d = bitcast f64 ulong 0x4028000000000000
+  end
+  rcap = ap_pred_rcap inp
+  cap_w = div mul rcap w mean_d
+  comp = ap_pred_flow inp mean_d
+  if lt cap_w comp
+    comp = cap_w
+  end
+  in_next = sub add f64 get inp 3 bitcast f64 get inp 7 comp
+  if lt in_next z0
+    in_next = z0
+  end
+  ap_pred_finish in_next rcap comp out_p
+end
+
+export fn applic_om_error_finalize se view ulong 4 scored ulong out_e edit ulong 4 to void
+  z0 = bitcast f64 ulong 0
+  if eq scored 0
+    for i ulong 4
+      put out_e i 0
+    end
+    ret
+  end
+  n = f64 scored
+  mean_c = div bitcast f64 get se 3 n
+  rc = fsqrt div bitcast f64 get se 0 n
+  if gt mean_c z0
+    rc = div rc mean_c
+  end
+  rq = fsqrt div bitcast f64 get se 1 n
+  rb = fsqrt div bitcast f64 get se 2 n
+  three = bitcast f64 ulong 0x4008000000000000
+  comp = div add add rc rq rb three
+  put out_e 0 bitcast ulong rc
+  put out_e 1 bitcast ulong rq
+  put out_e 2 bitcast ulong rb
+  put out_e 3 bitcast ulong comp
+end
+
+export fn applic_om_sort_desc items view uchar * idx edit uint * n ulong to void
+  if lt n 2
+    ret
+  end
+  i = div n 2
+  while gt i 0
+    i = sub i 1
+    ap_sift items idx i n
+  end
+  i = sub n 1
+  while gt i 0
+    t = get idx 0
+    put idx 0 get idx i
+    put idx i t
+    ap_sift items idx 0 i
+    i = sub i 1
+  end
+end
+
+fn ap_mean_f64 bytes view uchar * n ulong to f64
+  s = bitcast f64 ulong 0
+  for i ulong n
+    s = add s bitcast f64 ap_get_u64 bytes mul i 8
+  end
+  ret div s f64 n
+end
+
+fn ap_sum_sq_dev bytes view uchar * n ulong m f64 to f64
+  s = bitcast f64 ulong 0
+  for i ulong n
+    d = sub bitcast f64 ap_get_u64 bytes mul i 8 m
+    s = add s mul d d
+  end
+  ret s
+end
+
+fn ap_sum_xy_dev xbytes view uchar * ybytes view uchar * mx f64 my f64 to f64
+  n = div len xbytes 8
+  s = bitcast f64 ulong 0
+  for i ulong n
+    dx = sub bitcast f64 ap_get_u64 xbytes mul i 8 mx
+    dy = sub bitcast f64 ap_get_u64 ybytes mul i 8 my
+    s = add s mul dx dy
+  end
+  ret s
+end
+
+export fn applic_om_pearson xbytes view uchar * ybytes view uchar * n ulong out_r edit ulong 2 to void
+  z0 = bitcast f64 ulong 0
+  put out_r 0 0
+  put out_r 1 0
+  if lt n 2
+    ret
+  end
+  mx = ap_mean_f64 xbytes n
+  my = ap_mean_f64 ybytes n
+  sxx = ap_sum_sq_dev xbytes n mx
+  syy = ap_sum_sq_dev ybytes n my
+  sxy = ap_sum_xy_dev xbytes ybytes mx my
+  put out_r 1 bitcast ulong div sxy f64 sub n 1
+  if or le sxx z0 le syy z0
+    ret
+  end
+  put out_r 0 bitcast ulong div sxy fsqrt mul sxx syy
+end
