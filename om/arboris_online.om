@@ -1,0 +1,489 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Shared Arboris online co-activation prefetcher core (zero globals, zero heap).
+note Caller supplies all state buffers; fits any layer/expert/top-k/loop geometry.
+note
+note Config layout (`cfg view ulong 6`):
+note   0: n_trans   transition tables (0..n_trans-2 for L->L+1; n_trans-1 for loop wrap)
+note   1: n_exp     experts per layer (1..65535; packed into 16-bit edge target field)
+note   2: top_k     active experts per layer per stream (1..n_exp)
+note   3: n_slots   Space-Saving slots per source expert row (>= 1)
+note   4: loop_from source layer for looped wrap transition, or AO_NONE if non-looped
+note   5: loop_to   target layer for looped wrap transition, or AO_NONE if non-looped
+note
+note Edge packing: `(count << 16) | target_eid` in `uint`, decayed by halving at AO_DECAY_AT.
+note Single-stream `prev_state` (`len >= 2 * top_k + 1`):
+note   [0 .. top_k - 1]          prev_ids
+note   [top_k]                   prev_layer (n_trans = token-reset sentinel)
+note   [top_k + 1 .. 2 * top_k]  cur_ids scratch staged by ao_stage_cur
+
+const AO_NONE ulong 0xffffffff
+const AO_DECAY_AT ulong 60000
+
+fn ao_cfg_valid cfg view ulong 6 to bool
+  n_tr = get cfg 0
+  n_ex = get cfg 1
+  t_k = get cfg 2
+  n_sl = get cfg 3
+  l_f = get cfg 4
+  l_t = get cfg 5
+  if or eq n_tr 0 or eq n_ex 0 gt n_ex 65535
+    ret false
+  end
+  if or eq t_k 0 gt t_k n_ex
+    ret false
+  end
+  if or eq n_sl 0 gt n_tr div 0x7fffffff n_ex
+    ret false
+  end
+  if eq l_f AO_NONE
+    ret eq l_t AO_NONE
+  end
+  if or lt n_tr 2 or ge l_f n_tr ge l_t n_tr
+    ret false
+  end
+  ret true
+end
+
+fn ao_table_words cfg view ulong 6 to ulong
+  if not ao_cfg_valid cfg
+    ret 0
+  end
+  prod = mul get cfg 0 get cfg 1
+  ret mul prod get cfg 3
+end
+
+fn ao_pack cnt ulong tgt ulong to uint
+  ret or shl uint cnt 16 uint tgt
+end
+
+fn ao_resolve_step n_tr ulong l_f ulong l_t ulong prev_l ulong layer ulong to ulong
+  if ge layer n_tr
+    ret n_tr
+  end
+  if and gt layer 0 eq add prev_l 1 layer
+    ret prev_l
+  end
+  if ne l_f AO_NONE
+    if and eq prev_l l_f eq layer l_t
+      ret sub n_tr 1
+    end
+  end
+  ret n_tr
+end
+
+fn ao_resolve_trans cfg view ulong 6 prev_l ulong layer ulong to ulong
+  if not ao_cfg_valid cfg
+    ret AO_NONE
+  end
+  ret ao_resolve_step get cfg 0 get cfg 4 get cfg 5 prev_l layer
+end
+
+fn ao_reset_token cfg view ulong 6 prev_state edit uint * to bool
+  if not ao_cfg_valid cfg
+    ret false
+  end
+  n_tr = get cfg 0
+  t_k = get cfg 2
+  need = add mul 2 t_k 1
+  if lt len prev_state need
+    ret false
+  end
+  for i ulong mul 2 t_k bound 131072
+    put prev_state i uint AO_NONE
+  end
+  put prev_state t_k uint n_tr
+  ret true
+end
+
+fn ao_reset_all cfg view ulong 6 edges edit uint * prev_state edit uint * to bool
+  words = ao_table_words cfg
+  if or eq words 0 lt len edges words
+    ret false
+  end
+  if not ao_reset_token cfg prev_state
+    ret false
+  end
+  for i ulong words bound 16777216
+    put edges i 0
+  end
+  ret true
+end
+
+fn ao_halve_row_span edges edit uint * row_base ulong n_slots ulong to void
+  for h ulong n_slots bound 65536
+    idx = add row_base h
+    e2 = get edges idx
+    c2 = ulong shr e2 16
+    if gt c2 1
+      put edges idx ao_pack shr c2 1 ulong and e2 65535
+    else
+      put edges idx 0
+    end
+  end
+end
+
+fn ao_find_or_bump edges edit uint * row_base ulong n_slots ulong tgt ulong to bool
+  for j ulong n_slots bound 65536
+    idx = add row_base j
+    ent = get edges idx
+    c = ulong shr ent 16
+    if and gt c 0 eq ulong and ent 65535 tgt
+      nc = add c 1
+      if ge nc AO_DECAY_AT
+        ao_halve_row_span edges row_base n_slots
+        nc = shr AO_DECAY_AT 1
+      end
+      put edges idx ao_pack nc tgt
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ao_bump_miss edges edit uint * row_base ulong n_slots ulong tgt ulong to void
+  empty_slot = n_slots
+  min_slot = ulong 0
+  min_cnt = ulong 65536
+  for j ulong n_slots bound 65536
+    ent = get edges add row_base j
+    c = ulong shr ent 16
+    if eq c 0
+      if eq empty_slot n_slots
+        empty_slot = j
+      end
+    else
+      if lt c min_cnt
+        min_cnt = c
+        min_slot = j
+      end
+    end
+  end
+  if lt empty_slot n_slots
+    put edges add row_base empty_slot ao_pack 1 tgt
+    ret
+  end
+  if le min_cnt 1
+    put edges add row_base min_slot ao_pack 1 tgt
+  else
+    old_tgt = ulong and get edges add row_base min_slot 65535
+    put edges add row_base min_slot ao_pack sub min_cnt 1 old_tgt
+  end
+end
+
+fn ao_bump_row edges edit uint * row_base ulong n_slots ulong tgt ulong to void
+  if not ao_find_or_bump edges row_base n_slots tgt
+    ao_bump_miss edges row_base n_slots tgt
+  end
+end
+
+fn ao_bump_edge cfg view ulong 6 edges edit uint * trans ulong src ulong tgt ulong to void
+  if not ao_cfg_valid cfg
+    ret
+  end
+  n_tr = get cfg 0
+  n_ex = get cfg 1
+  if or ge trans n_tr or ge src n_ex ge tgt n_ex
+    ret
+  end
+  n_sl = get cfg 3
+  row_base = mul add mul trans n_ex src n_sl
+  if gt add row_base n_sl len edges
+    ret
+  end
+  ao_bump_row edges row_base n_sl tgt
+end
+
+fn ao_stage_cur cfg view ulong 6 prev_state edit uint * cur_ids view uint * to bool
+  if not ao_cfg_valid cfg
+    ret false
+  end
+  t_k = get cfg 2
+  need = add mul 2 t_k 1
+  if or lt len cur_ids t_k lt len prev_state need
+    ret false
+  end
+  cur_off = add t_k 1
+  for d ulong t_k bound 65536
+    put prev_state add cur_off d get cur_ids d
+  end
+  ret true
+end
+
+fn ao_bump_from_row cfg view ulong 6 edges edit uint * prev_state edit uint * meta view ulong 2 to void
+  n_ex = get cfg 1
+  t_k = get cfg 2
+  cur_off = add t_k 1
+  trans = get meta 0
+  src = get meta 1
+  for d ulong t_k bound 65536
+    tgt = ulong get prev_state add cur_off d
+    if lt tgt n_ex
+      ao_bump_edge cfg edges trans src tgt
+    end
+  end
+end
+
+fn ao_observe cfg view ulong 6 edges edit uint * prev_state edit uint * layer ulong to bool
+  if not ao_cfg_valid cfg
+    ret false
+  end
+  t_k = get cfg 2
+  if or ge layer get cfg 0 lt len prev_state add mul 2 t_k 1
+    ret false
+  end
+  if lt len edges ao_table_words cfg
+    ret false
+  end
+  trans = ao_resolve_trans cfg ulong get prev_state t_k layer
+  rm = new ulong 2 0
+  put rm 0 trans
+  if lt trans get cfg 0
+    for s ulong t_k bound 65536
+      src = ulong get prev_state s
+      if lt src get cfg 1
+        put rm 1 src
+        ao_bump_from_row cfg edges prev_state rm
+      end
+    end
+  end
+  for k ulong t_k bound 65536
+    put prev_state k get prev_state add add t_k 1 k
+  end
+  put prev_state t_k uint layer
+  ret true
+end
+
+fn ao_scores_zero cfg view ulong 6 scores edit ulong * to bool
+  if not ao_cfg_valid cfg
+    ret false
+  end
+  n_ex = get cfg 1
+  if lt len scores n_ex
+    ret false
+  end
+  for i ulong n_ex bound 65536
+    put scores i 0
+  end
+  ret true
+end
+
+note Add counts from one edge row (`meta = [row_base, n_slots, n_exp, weight]`) into `scores`.
+fn ao_score_add edges view uint * meta view ulong 4 scores edit ulong * to void
+  if or gt add get meta 0 get meta 1 len edges lt len scores get meta 2
+    ret
+  end
+  for j ulong get meta 1 bound 65536
+    ent = get edges add get meta 0 j
+    c = ulong shr ent 16
+    if gt c 0
+      tgt = ulong and ent 65535
+      if lt tgt get meta 2
+        delta = mul c get meta 3
+        put scores tgt add get scores tgt delta
+      end
+    end
+  end
+end
+
+fn ao_score_src cfg view ulong 6 edges view uint * meta view ulong 3 scores edit ulong * to bool
+  if not ao_cfg_valid cfg
+    ret false
+  end
+  n_ex = get cfg 1
+  trans = get meta 0
+  src = get meta 1
+  if or ge trans get cfg 0 or ge src n_ex lt len scores n_ex
+    ret false
+  end
+  if gt add mul add mul trans n_ex src get cfg 3 get cfg 3 len edges
+    ret false
+  end
+  rm = new ulong 4 0
+  put rm 0 mul add mul trans n_ex src get cfg 3
+  put rm 1 get cfg 3
+  put rm 2 n_ex
+  put rm 3 get meta 2
+  ao_score_add edges rm scores
+  ret true
+end
+
+fn ao_score_work_valid edges view uint * scores_work edit ulong * to bool
+  if lt len scores_work 7
+    ret false
+  end
+  cfg = new ulong 6 0
+  for k ulong 6
+    put cfg k get scores_work k
+  end
+  if not ao_cfg_valid cfg
+    ret false
+  end
+  if or ge get scores_work 6 get cfg 0 lt len scores_work add 7 get cfg 1
+    ret false
+  end
+  if lt len edges ao_table_words cfg
+    ret false
+  end
+  ret true
+end
+
+fn ao_score_batch_step edges view uint * rm edit ulong 4 scores_work edit ulong * src ulong to void
+  n_ex = get scores_work 1
+  pos = mul get scores_work 6 n_ex
+  pos = add pos src
+  put rm 0 mul pos get scores_work 3
+  ao_score_add edges rm part scores_work 7 n_ex
+end
+
+note Single-call sum-over-paths scoring for a slice of unique or per-stream source IDs.
+note `scores_work` layout (`len >= 7 + n_exp`): `[0..5]=cfg, [6]=trans, [7..7+n_exp-1]=scores`.
+fn ao_score_batch edges view uint * src_ids view uint * scores_work edit ulong * to bool
+  if not ao_score_work_valid edges scores_work
+    ret false
+  end
+  n_ex = get scores_work 1
+  for e ulong n_ex bound 65536
+    put scores_work add 7 e 0
+  end
+  rm = new ulong 4 0
+  put rm 1 get scores_work 3
+  put rm 2 n_ex
+  put rm 3 1
+  for i ulong len src_ids bound 1048576
+    src = ulong get src_ids i
+    if ne src AO_NONE
+      if ge src n_ex
+        ret false
+      end
+      ao_score_batch_step edges rm scores_work src
+    end
+  end
+  ret true
+end
+
+note Linear probe insert for small cross-batch expert set (`dedup_out[0..n_unique-1]`).
+fn ao_dedup_insert dedup_out edit uint * n_unique ulong eid ulong to ulong
+  for u ulong n_unique bound 1048576
+    if eq ulong get dedup_out u eid
+      ret u
+    end
+  end
+  put dedup_out n_unique uint eid
+  ret n_unique
+end
+
+fn ao_dedup_validate meta view ulong 4 batch_ids view uint * dedup_cap ulong to long
+  n_ex = get meta 0
+  n_st = get meta 1
+  t_k = get meta 2
+  if or eq n_ex 0 or gt n_ex 65535 or eq n_st 0 eq t_k 0
+    ret long -1
+  end
+  if gt n_st div 349525 t_k
+    ret long -1
+  end
+  n_items = mul n_st t_k
+  if or lt len batch_ids n_items lt dedup_cap mul 3 n_items
+    ret long -1
+  end
+  for i ulong n_items bound 1048576
+    eid = ulong get batch_ids i
+    if and ne eid AO_NONE ge eid n_ex
+      ret long -1
+    end
+  end
+  ret long n_items
+end
+
+fn ao_inc_u32 arr edit uint * pos ulong to void
+  put arr pos add get arr pos 1
+end
+
+note Deduplicate routed experts across a multi-stream batch.
+note `meta = [n_exp, n_streams, top_k, unused]`; `n_items = n_streams * top_k`.
+note `dedup_out` (`len >= 3 * n_items`) receives:
+note   [0 .. n_items - 1]           unique expert IDs (prefix [0 .. n_unique - 1] valid)
+note   [n_items .. 2*n_items - 1]   batch multiplicity count per unique expert
+note   [2*n_items .. 3*n_items - 1] inverse slot map (batch index -> unique slot, or AO_NONE)
+fn ao_dedup_batch meta view ulong 4 batch_ids view uint * dedup_out edit uint * to long
+  if lt ao_dedup_validate meta batch_ids len dedup_out 0
+    ret long -1
+  end
+  n_items = mul get meta 1 get meta 2
+  n_uniq = ulong 0
+  for i ulong n_items bound 1048576
+    eid = ulong get batch_ids i
+    if eq eid AO_NONE
+      put dedup_out add mul 2 n_items i uint AO_NONE
+    else
+      idx = ao_dedup_insert dedup_out n_uniq eid
+      if eq idx n_uniq
+        put dedup_out add n_items idx 1
+        n_uniq = add n_uniq 1
+      else
+        ao_inc_u32 dedup_out add n_items idx
+      end
+      put dedup_out add mul 2 n_items i uint idx
+    end
+  end
+  ret long n_uniq
+end
+
+fn ao_mask_resident cfg view ulong 6 next_layer ulong resident view long * scores edit ulong * to long
+  if not ao_cfg_valid cfg
+    ret long -1
+  end
+  n_tr = get cfg 0
+  n_ex = get cfg 1
+  if or ge next_layer n_tr lt len scores n_ex
+    ret long -1
+  end
+  if eq len resident 0
+    ret long 0
+  end
+  base = mul next_layer n_ex
+  if lt len resident add base n_ex
+    ret long -1
+  end
+  for eid ulong n_ex bound 65536
+    if ge get resident add base eid 0
+      put scores eid 0
+    end
+  end
+  ret long 0
+end
+
+fn ao_pick_best n_ex ulong scores view ulong * to ulong
+  best = n_ex
+  best_sc = ulong 0
+  for eid ulong n_ex bound 65536
+    sc = get scores eid
+    if gt sc best_sc
+      best_sc = sc
+      best = eid
+    end
+  end
+  ret best
+end
+
+fn ao_pick_op3 cfg view ulong 6 scores edit ulong * out_buf edit uint * to long
+  if not ao_cfg_valid cfg
+    ret long -1
+  end
+  n_ex = get cfg 1
+  if or lt len scores n_ex ne and len out_buf 1 0
+    ret long -1
+  end
+  budget = div len out_buf 2
+  for slot ulong budget bound 65536
+    best = ao_pick_best n_ex scores
+    if eq best n_ex
+      ret long slot
+    end
+    pos = mul slot 2
+    put out_buf pos 3
+    put out_buf add pos 1 uint best
+    put scores best 0
+  end
+  ret long budget
+end

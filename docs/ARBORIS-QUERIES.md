@@ -23,3 +23,16 @@ cat "$hints" demands.bin |
 ```
 
 A demand returns the expert and payload regardless of whether the prefetch completed. Measure readiness and payload hashes separately. The replay accepts original layer-zero expert slabs. Predictive quality needs held-out conversational routing traces.
+
+## Shared Online Co-Activation Core (`om/arboris_online.om`)
+
+`om/arboris_online.om` provides the model-independent, zero-global, zero-heap OM-2 core extracted from `om/gpu/inkling2/arboris/prefetch.om` for caller-backed buffers (`cfg view ulong 6 = [n_trans, n_exp, top_k, n_slots, loop_from, loop_to]`):
+
+- **Looped-core isolated transition resolution (`ao_resolve_step`, `ao_resolve_trans`)**: resolves adjacent `L -> L + 1` onto transitions `0 .. n_trans - 2` and looped wraps `loop_from -> loop_to` onto isolated transition `n_trans - 1` (`AO_NONE` disables wrap transitions), ignoring repeated or skipped layers and guarding cross-token boundaries via `ao_reset_token`.
+- **Space-Saving edge tables (`ao_halve_row_span`, `ao_bump_row`, `ao_bump_edge`, `ao_stage_cur`, `ao_observe`)**: caller-owned `uint` co-activation tables packed as `(count << 16) | target_eid` with automatic row halving at `AO_DECAY_AT` (60000).
+- **Multi-stream cross-batch deduplication & sum-over-paths ranking (`ao_dedup_batch`, `ao_score_src`, `ao_score_batch`, `ao_mask_resident`, `ao_pick_op3`)**: deduplicates active expert IDs across multi-stream batches, tracks batch multiplicity and inverse `slot_map`, scores next-layer candidates by sum-over-paths, skips resident experts (`resident >= 0`, or passes an empty `resident` slice), and emits deterministic `OP3` prefetch hints (`[3, eid]`) with lowest-expert-ID tie breaking.
+
+Consumers and gates:
+
+- `om/gpu/inkling2/arboris/prefetch.om` delegates packing, Space-Saving row updates/halving, looped-core transition resolution, score zeroing/accumulation, residency masking, and `OP3` emission to `om/arboris_online.om` while preserving its global single-stream ABI.
+- `tests/arboris/online-core.om` (executed by `tests/arboris/host.sh`) exercises single-stream + looped-core isolation, multi-stream batch deduplication and ranking, and negative controls.

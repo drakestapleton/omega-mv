@@ -71,6 +71,8 @@ cmp "$out/one-hint" "$out/frame-result"
 printf 'x' >> "$out/frame"
 if "$out/hints-cli" < "$out/frame" > "$out/frame-result"; then exit 1; fi
 test ! -s "$out/frame-result"
+compile "$out/online-core" "$out/signer-profile.om" om/arboris_online.om tests/arboris/online-core.om
+"$out/online-core"
 compile "$out/compute-lock" "$out/signer-profile.om" gpu/nvidia/native/arboris/compute-lock.om tests/arboris/compute-lock.om
 "$out/compute-lock"
 compile "$out/capq" om/runtime/rx_capq_core.om seed/authority/capq.om tests/arboris/capq.om

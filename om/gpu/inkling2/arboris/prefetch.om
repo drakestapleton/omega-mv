@@ -115,18 +115,17 @@ fn ikArbResetAll to void
 end
 
 fn ikArbPack cnt ulong tgt ulong to uint
-  ret or shl uint cnt 16 uint tgt
+  ret ao_pack cnt tgt
 end
 
 fn ikArbHalveRow rowBase ulong to void
+  row = new uint 16 0
   for h ulong 16
-    e2 = get ikArbEdges add rowBase h
-    c2 = ulong shr e2 16
-    if gt c2 1
-      put ikArbEdges add rowBase h ikArbPack shr c2 1 ulong and e2 65535
-    else
-      put ikArbEdges add rowBase h 0
-    end
+    put row h get ikArbEdges add rowBase h
+  end
+  ao_halve_row_span row 0 16
+  for h ulong 16
+    put ikArbEdges add rowBase h get row h
   end
 end
 
@@ -134,42 +133,14 @@ fn ikArbBumpEdge trans ulong src ulong tgt ulong to void
   if or ge trans 24 or ge src 128 ge tgt 128
     ret
   end
+  row = new uint 16 0
   rowBase = mul add mul trans 128 src 16
-  emptySlot = ulong 16
-  minSlot = ulong 0
-  minCnt = ulong 65536
   for j ulong 16
-    ent = get ikArbEdges add rowBase j
-    c = ulong shr ent 16
-    if eq c 0
-      if eq emptySlot 16
-        emptySlot = j
-      end
-    else
-      if eq ulong and ent 65535 tgt
-        nc = add c 1
-        if ge nc 60000
-          ikArbHalveRow rowBase
-          nc = ulong 30000
-        end
-        put ikArbEdges add rowBase j ikArbPack nc tgt
-        ret
-      end
-      if lt c minCnt
-        minCnt = c
-        minSlot = j
-      end
-    end
+    put row j get ikArbEdges add rowBase j
   end
-  if lt emptySlot 16
-    put ikArbEdges add rowBase emptySlot ikArbPack 1 tgt
-    ret
-  end
-  if le minCnt 1
-    put ikArbEdges add rowBase minSlot ikArbPack 1 tgt
-  else
-    oldTgt = ulong and get ikArbEdges add rowBase minSlot 65535
-    put ikArbEdges add rowBase minSlot ikArbPack sub minCnt 1 oldTgt
+  ao_bump_row row 0 16 tgt
+  for j ulong 16
+    put ikArbEdges add rowBase j get row j
   end
 end
 
@@ -184,13 +155,7 @@ fn ikArbUpdate layer ulong curIds view uint 8 to void
     ret
   end
   prevL = get ikArbPrevLayer 0
-  trans = ulong 24
-  if and gt layer 0 eq add prevL 1 layer
-    trans = prevL
-  end
-  if and eq layer 6 eq prevL 17
-    trans = ulong 23
-  end
+  trans = ao_resolve_step 24 17 6 prevL layer
   if lt trans 24
     for s ulong 8
       src = ulong get ikArbPrev s
@@ -210,71 +175,59 @@ fn ikArbUpdate layer ulong curIds view uint 8 to void
   put ikArbPrevLayer 0 layer
 end
 
+fn ikArbInitCfg cfg edit ulong 6 to void
+  put cfg 0 24
+  put cfg 1 128
+  put cfg 2 8
+  put cfg 3 16
+  put cfg 4 17
+  put cfg 5 6
+end
+
 note Sum-over-paths scoring for transition `trans` (0..22 for L -> L+1, including
 note 17 for L17 -> L18 on final loop pass 2; 23 for looped core wrap L17 -> L6 on
 note loop passes 0 and 1).
 fn ikArbScoreNext trans ulong curIds view uint 8 scores edit ulong 128 to void
-  for i ulong 128
-    put scores i 0
+  cfg = new ulong 6 0
+  row = new uint 16 0
+  meta = new ulong 4 0
+  ikArbInitCfg cfg
+  if not ao_scores_zero cfg scores
+    ret
   end
   if ge trans 24
     ret
   end
+  put meta 0 0
+  put meta 1 16
+  put meta 2 128
+  put meta 3 1
   for s ulong 8
     src = ulong get curIds s
     if lt src 128
       rowBase = mul add mul trans 128 src 16
       for j ulong 16
-        ent = get ikArbEdges add rowBase j
-        c = ulong shr ent 16
-        if gt c 0
-          tgt = ulong and ent 65535
-          if lt tgt 128
-            put scores tgt add get scores tgt c
-          end
-        end
+        put row j get ikArbEdges add rowBase j
       end
+      ao_score_add row meta scores
     end
   end
-end
-
-fn ikArbPickOne nextLayer ulong scores view ulong 128 resident view long 3072 to ulong
-  base = mul nextLayer 128
-  best = ulong 128
-  bestScore = ulong 0
-  for eid ulong 128
-    sc = get scores eid
-    if gt sc bestScore
-      idx = add base eid
-      if lt get resident idx 0
-        bestScore = sc
-        best = eid
-      end
-    end
-  end
-  ret best
 end
 
 note Pick up to len(outbuf)/2 highest-scoring non-resident experts for nextLayer (0..23).
 note resident[nextLayer * 128 + eid] >= 0 marks an already-resident expert to skip.
 note Emits 2-word OP3 records [3, eid] into outbuf and zeros consumed scores.
 fn ikArbPickTopK nextLayer ulong scores edit ulong 128 resident view long 3072 outbuf edit uint * to long
+  cfg = new ulong 6 0
   if or ge nextLayer 24 ne and len outbuf 1 0
     ret long -1
   end
   if gt len outbuf 256
     ret long -1
   end
-  lim = div len outbuf 2
-  for slot ulong lim bound 128
-    best = ikArbPickOne nextLayer scores resident
-    if eq best 128
-      ret long slot
-    end
-    pos = mul slot 2
-    put outbuf pos 3
-    put outbuf add pos 1 uint best
-    put scores best 0
+  ikArbInitCfg cfg
+  if ne ao_mask_resident cfg nextLayer resident scores 0
+    ret long -1
   end
-  ret long lim
+  ret ao_pick_op3 cfg scores outbuf
 end
