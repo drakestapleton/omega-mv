@@ -73,10 +73,10 @@ text qArbOk "PASS: Arboris online adaptive sum-over-paths prefetcher (40L x 256E
 text qArbFail "FAIL: Arboris self-test failed\n"
 text qP1Ok "PASS: native GB10 9-kernel numerical parity self-test (bf16_gemv, fp8_b128_gemv, fp8_b128_grouped8, router_top8_256, swiglu8_q36, moe_combine_rms, gdn_step_bf16, attn_hd256_split+reduce_gate)\n"
 text qP1Fail "FAIL: native GB10 kernel parity check failed at test id: "
-text qRes0 "NATIVE_GPFIFO_40L_FP8_BACKBONE_2.57GB: median_us="
-text qRes1 "NATIVE_GPFIFO_40L_FP8_W4HEAD_2.86GB: median_us="
-text qRes2 "NATIVE_GPFIFO_40L_W4MOE_BACKBONE_1.85GB: median_us="
-text qRes3 "NATIVE_GPFIFO_40L_W4MOE_W4HEAD_2.13GB: median_us="
+text qRes0 "NATIVE_GPFIFO_40L_FP8_W4HEAD_2.86GB: median_us="
+text qRes1 "NATIVE_GPFIFO_40L_W4MOE_W4HEAD_2.13GB: median_us="
+text qRes2 "NATIVE_GPFIFO_40L_FULLW4_BACKBONE_0.79GB: median_us="
+text qRes3 "NATIVE_GPFIFO_40L_FULLW4_W4HEAD_1.07GB: median_us="
 text qArbRes "ARBORIS_40L_ONLINE_OVERHEAD: us_per_tok="
 text qArbHit " hit_rate_pct="
 text qTokS " tok_s_x100="
@@ -126,7 +126,7 @@ end
 
 fn qEmitAll to void
 put qCodePos 0 0
-for i ulong 12
+for i ulong 13
 p = mul div add get qCodePos 0 255 256 256
 put qEntry i p
 put qCodePos 0 p
@@ -150,6 +150,7 @@ put qSmem 8 0
 put qSmem 9 8192
 put qSmem 10 0
 put qSmem 11 8192
+put qSmem 12 16384
 end
 
 fn qArg u uint to void
@@ -522,6 +523,26 @@ if not qRunOne 11 4 8 1 256 10
 ret false
 end
 
+note 11. w4_b32_gemv_fast (128x4096, W=0x99999999 -> q-8=1.0, S=0x3e803e80 -> 0.25, x=1.0 -> C=1024.0)
+for i ulong 4096
+r = mapset wk add 0x700000 mul i 4 4 0x3f800000
+end
+for i ulong 65536
+r = mapset wk add 0x710000 mul i 4 4 0x99999999
+end
+for i ulong 8192
+r = mapset wk add 0x760000 mul i 4 4 0x3e803e80
+end
+qPtr add wva 0x700000
+qPtr add wva 0x710000
+qPtr add wva 0x760000
+qPtr add wva 0x770000
+qArg 4096
+qArg 128
+if not qRunOne 12 4 1 1 256 11
+ret false
+end
+
 if not qCheckF32 wk 0x050000 1024.0f32 0.5f32
 qPrint qP1Fail
 qPrintU 1
@@ -582,6 +603,12 @@ qPrintU 10
 qPrint qNl
 ret false
 end
+if not qCheckF32 wk 0x770000 1024.0f32 0.5f32
+qPrint qP1Fail
+qPrintU 11
+qPrint qNl
+ret false
+end
 qPrint qP1Ok
 ret true
 end
@@ -617,11 +644,22 @@ end
 ret eq mapget get gbmem 3 0 4 1145324612
 end
 
-fn qRecordLayer l ulong bk ulong useW4Moe bool to bool
+fn qRecordLayer l ulong bk ulong useW4Moe bool useW4Trunk bool to bool
 lutva = mapaddr get qLut 0
 isAttn = eq rem l 4 3
 if isAttn
-note Full-Attn layer: qkvg[9216,2048] FP8 -> Split-K HD256 (T=1024, S=8) -> reduce+gate -> o_proj[2048,4096] FP8
+note Full-Attn layer: qkvg[9216,2048] (W4 or FP8) -> Split-K HD256 (T=1024, S=8) -> reduce+gate
+if useW4Trunk
+qPtr qW 0x004000
+qPtr mapaddr get qWAttnQkvg bk
+qPtr add mapaddr get qWAttnQkvg bk 9437184
+qPtr qW 0x010000
+qArg 2048
+qArg 9216
+if not qRecord 12 288 1 1 256
+ret false
+end
+else
 qPtr qW 0x004000
 qPtr mapaddr get qWAttnQkvg bk
 qPtr mapaddr get qWAttnQkvgS bk
@@ -631,6 +669,7 @@ qArg 2048
 qArg 9216
 if not qRecord 1 288 1 1 256
 ret false
+end
 end
 qPtr qW 0x010000
 qPtr mapaddr get qKvK 0
@@ -651,7 +690,18 @@ if not qRecord 8 16 1 1 256
 ret false
 end
 else
-note GDN layer: fused in_proj_qkvz[12288,2048] FP8 + in_proj_ab[64,2048] BF16 -> coalesced gdn_step_bf16
+note GDN layer: fused in_proj_qkvz[12288,2048] (W4 or FP8) + in_proj_ab[64,2048] BF16 -> coalesced gdn_step_bf16
+if useW4Trunk
+qPtr qW 0x004000
+qPtr mapaddr get qWGdnQkv bk
+qPtr add mapaddr get qWGdnQkv bk 12582912
+qPtr qW 0x010000
+qArg 2048
+qArg 12288
+if not qRecord 12 384 1 1 256
+ret false
+end
+else
 qPtr qW 0x004000
 qPtr mapaddr get qWGdnQkv bk
 qPtr mapaddr get qWGdnQkvS bk
@@ -661,6 +711,7 @@ qArg 2048
 qArg 12288
 if not qRecord 1 384 1 1 256
 ret false
+end
 end
 qPtr mapaddr get qWGdnAb bk
 qPtr qW 0x004000
@@ -681,7 +732,18 @@ if not qRecord 6 32 1 1 128
 ret false
 end
 end
-note Mixer out_proj[2048,4096] FP8
+note Mixer out_proj[2048,4096] (W4 or FP8)
+if useW4Trunk
+qPtr qW 0x020000
+qPtr mapaddr get qWOut bk
+qPtr add mapaddr get qWOut bk 4194304
+qPtr qW 0x024000
+qArg 4096
+qArg 2048
+if not qRecord 12 64 1 1 256
+ret false
+end
+else
 qPtr qW 0x020000
 qPtr mapaddr get qWOut bk
 qPtr mapaddr get qWOutS bk
@@ -691,6 +753,7 @@ qArg 4096
 qArg 2048
 if not qRecord 1 64 1 1 256
 ret false
+end
 end
 note Router: bf16_gemv_fast [256, 2048] + router_top8_256_fast
 qPtr mapaddr get qWRouter bk
@@ -771,7 +834,27 @@ if not qRecord 2 64 8 1 256
 ret false
 end
 end
-note Shared expert: gate_up[1024, 2048] FP8 + down[2048, 512] FP8
+note Shared expert: gu[1024, 2048] + down[2048, 512] (W4 or FP8)
+if useW4Trunk
+qPtr qW 0x004000
+qPtr mapaddr get qWShGu bk
+qPtr add mapaddr get qWShGu bk 1048576
+qPtr qW 0x0b0000
+qArg 2048
+qArg 1024
+if not qRecord 12 32 1 1 256
+ret false
+end
+qPtr qW 0x0b0000
+qPtr mapaddr get qWShDn bk
+qPtr add mapaddr get qWShDn bk 524288
+qPtr qW 0x0b2000
+qArg 512
+qArg 2048
+if not qRecord 12 64 1 1 256
+ret false
+end
+else
 qPtr qW 0x004000
 qPtr mapaddr get qWShGu bk
 qPtr mapaddr get qWShGuS bk
@@ -791,6 +874,7 @@ qArg 512
 qArg 2048
 if not qRecord 1 64 1 1 256
 ret false
+end
 end
 note Fused MoE combine + shared + residual + next-layer RMSNorm (D=2048)
 qPtr qW 0x0a0000
@@ -827,16 +911,17 @@ if ne mapwrite get qPkt slot 0 gbcmd 0 n long n
 ret false
 end
 put qFastPos 0 n
-useW4 = ge headMode 2
+useW4Moe = ge headMode 1
+useW4Trunk = ge headMode 2
 for l ulong 40
 bk = rem l 4
-if not qRecordLayer l bk useW4
+if not qRecordLayer l bk useW4Moe useW4Trunk
 put qFastMode 0 0
 ret false
 end
 end
 lutva = mapaddr get qLut 0
-if or eq headMode 1 eq headMode 3
+if ne headMode 2
 note W4 block-32 two-pass exact lm_head: 0.286 GB W4 screen + Top-64 exact BF16 rescore!
 qPtr mapaddr get qLmW4 0
 qPtr mapaddr get qLmW4S 0
