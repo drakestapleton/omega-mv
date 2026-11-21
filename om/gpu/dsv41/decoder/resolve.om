@@ -2,7 +2,51 @@ note SPDX-License-Identifier: AGPL-3.0-only
 note The scheduler holds the exclusive CPU lease from miss through publish.
 note maps[0] is Zone 4 staging, maps[1] the Zone 2/3 GPU-visible slab arena.
 const deBytes ulong 18800640
-fn deStagePlane fd int off ulong stage long dest ulong size ulong ctx edit shactx to bool
+note Linux AF_ALG is an optional host accelerator for the same SHA-256 bytes.
+note Failure to open the algorithm selects the seeded software implementation.
+text deHashType "hash"
+text deHashName "sha256"
+fn deHashOpen to int
+  addr = new uchar 88 0
+  put addr 0 38
+  for i ulong 4
+    put addr add i 2 get deHashType i
+  end
+  for i ulong 6
+    put addr add i 24 get deHashName i
+  end
+  sock = socknew 38 5 0
+  if lt sock 0
+    ret -1
+  end
+  op = int -1
+  if eq bind int sock addr 0 88 0
+    op = int accept int sock 0
+  end
+  unused = fclose int sock
+  ret op
+end
+
+fn deHashChunk fd int buf view uchar * n ulong ctx edit shactx to bool
+  if lt fd 0
+    sha256_update ctx part buf 0 n
+    ret true
+  end
+  wrote = send fd buf 0 n 32768
+  ret eq wrote long n
+end
+
+fn deHashFinish fd int ctx edit shactx digest edit uchar 32 to bool
+  if lt fd 0
+    sha256_final ctx digest
+    ret true
+  end
+  got = read fd digest 0 32
+  unused = fclose fd
+  ret eq got 32
+end
+
+fn deStagePlane fds view int 2 off ulong stage long dest ulong size ulong ctx edit shactx to bool
   buf = new uchar 262144 0
   pos = ulong 0
   while lt pos size
@@ -10,13 +54,15 @@ fn deStagePlane fd int off ulong stage long dest ulong size ulong ctx edit shact
     if gt chunk len buf
       chunk = len buf
     end
-    if not diRead fd buf add off pos chunk
+    if not diRead get fds 0 buf add off pos chunk
       ret false
     end
     if ne mapwrite stage add dest pos buf 0 chunk long chunk
       ret false
     end
-    sha256_update ctx part buf 0 chunk
+    if not deHashChunk get fds 1 buf chunk ctx
+      ret false
+    end
     pos = add pos chunk
   end
   ret true
@@ -26,6 +72,9 @@ fn deVerifyStage fd int descriptor view uchar 64 stage long to bool
   ctx = new uchar 104 0
   digest = new uchar 32 0
   sha256_init ctx
+  fds = new int 2 0
+  put fds 0 fd
+  put fds 1 deHashOpen
   pos = ulong 0
   for plane ulong 6
     size = ulong 5898240
@@ -33,12 +82,17 @@ fn deVerifyStage fd int descriptor view uchar 64 stage long to bool
       size = 368640
     end
     off = diGet descriptor add 16 mul plane 8 8
-    if not deStagePlane fd off stage pos size ctx
+    if not deStagePlane fds off stage pos size ctx
+      if ge get fds 1 0
+        unused = fclose get fds 1
+      end
       ret false
     end
     pos = add pos size
   end
-  sha256_final ctx digest
+  if not deHashFinish get fds 1 ctx digest
+    ret false
+  end
   for i ulong 8
     if ne get digest i get descriptor add 8 i
       ret false

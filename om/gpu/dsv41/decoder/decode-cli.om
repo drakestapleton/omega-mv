@@ -10,6 +10,7 @@ text dcLayerPre "/layer"
 text dcLayerSuf ".bin"
 text dcModeL0 "layer0"
 text dcModeGen "gen"
+text dcModeChat "chat"
 text dcEngW1 "layers.1.engram.embed.weight"
 text dcEngS1 "layers.1.engram.embed.scale"
 text dcEngW14 "layers.14.engram.embed.weight"
@@ -181,7 +182,6 @@ fn dcStartup h edit zonehdr ctx edit shactx nSlots ulong to bool
   end
   z1Size = get dcTotals 0
   kvSize = get dkPlanInfo 2
-  slabSize = mul nSlots deBytes
   z1 = nvalloc z1Size true
   if le z1 0
     ret false
@@ -194,12 +194,27 @@ fn dcStartup h edit zonehdr ctx edit shactx nSlots ulong to bool
   end
   put dwMaps 1 kv
   put dwSizes 1 kvSize
-  slab = nvalloc slabSize true
-  if le slab 0
-    ret false
+  remSlots = nSlots
+  for c ulong 4
+    if gt remSlots 0
+      take = remSlots
+      if gt take 800
+        take = 800
+      end
+      cSize = mul take deBytes
+      cm = nvalloc cSize true
+      if le cm 0
+        ret false
+      end
+      put dwSlabMaps c cm
+      put dwSlabSizes c cSize
+      if eq c 0
+        put dwMaps 2 cm
+        put dwSizes 2 cSize
+      end
+      remSlots = sub remSlots take
+    end
   end
-  put dwMaps 2 slab
-  put dwSizes 2 slabSize
   scr = nvalloc wsTotalBytes true
   if le scr 0
     ret false
@@ -233,7 +248,8 @@ fn dcStartup h edit zonehdr ctx edit shactx nSlots ulong to bool
   if not dwPrecomputeEngramGain 14 wsEngramGain14
     ret false
   end
-  slab_init h 0 0 uint nSlots
+  slab_init h 0 0 16
+  dfInitSlabMap nSlots
   dtStart ctx
   ret true
 end
@@ -312,6 +328,9 @@ end
 
 fn dcStepToken h edit zonehdr slots edit uchar * tok uint runHead bool to long
   pos = get dfCoord 2
+  if ge pos get dkPlanInfo 0
+    ret -1
+  end
   if not deAcquire h 1
     ret -1
   end
@@ -386,10 +405,167 @@ fn dcPrintStats digest view uchar 32 to void
   r = write 2 hex 0 65
 end
 
-fn dcRunGenMode h edit zonehdr ctx edit shactx traceFd int numGen ulong to int
-  slots = new uchar 51200 0
+fn dcReadU32 fd int outVal edit uint 1 to bool
+  b = new uchar 4 0
+  pos = ulong 0
+  while lt pos 4 bound 4
+    r = read fd b pos sub 4 pos
+    if le r 0
+      ret false
+    end
+    pos = add pos ulong r
+  end
+  put outVal 0 uint diGet b 0 4
+  ret true
+end
+
+fn dcWriteTokPair fd int turnId uint tokId uint to bool
+  b = new uchar 8 0
+  diPut b 0 4 ulong turnId
+  diPut b 4 4 ulong tokId
+  ret dcWriteFile fd b 8
+end
+
+global dcChatState ulong 5
+note dcChatState: 0=turnId, 1=maxGen, 2=nPrompt, 3=pos, 4=next turn follows
+
+fn dcChatPrefill h edit zonehdr inFd int to long
+  slots = new uchar 1024 0
+  u = new uint 1 0
+  nPrompt = get dcChatState 2
+  lastTok = long 0
+  for i ulong nPrompt bound 4096
+    if not dcReadU32 inFd u
+      ret -1
+    end
+    isLast = eq add i 1 nPrompt
+    put dfSlabCfg 2 0
+    if isLast
+      put dfSlabCfg 2 1
+    end
+    put dfCoord 0 get dcChatState 0
+    put dfCoord 1 0
+    put dfCoord 2 get dcChatState 3
+    nxt = dcStepToken h slots get u 0 isLast
+    if lt nxt 0
+      ret -1
+    end
+    put dcChatState 3 add get dcChatState 3 1
+    if isLast
+      lastTok = nxt
+    end
+  end
+  ret lastTok
+end
+
+fn dcChatGen h edit zonehdr ctx edit shactx fds view int 3 firstTok uint to bool
+  slots = new uchar 1024 0
+  maxGen = get dcChatState 1
+  turnId = uint get dcChatState 0
+  lastTok = firstTok
+  put dfSlabCfg 2 1
+  for g ulong maxGen bound 4096
+    if not dcWriteTokPair get fds 2 turnId lastTok
+      ret false
+    end
+    if not deAcquire h 1
+      ret false
+    end
+    if not dtDrain get fds 1 ctx
+      ret false
+    end
+    if not deRelease h 1 0 false
+      ret false
+    end
+    if or eq lastTok 1 ge add g 1 maxGen
+      if ne get dcChatState 4 0
+        put dfSlabCfg 2 0
+        put dfCoord 2 get dcChatState 3
+        if lt dcStepToken h slots lastTok false 0
+          ret false
+        end
+        put dcChatState 3 add get dcChatState 3 1
+      end
+      break
+    end
+    put dfCoord 0 ulong turnId
+    put dfCoord 1 add g 1
+    put dfCoord 2 get dcChatState 3
+    nxt = dcStepToken h slots lastTok true
+    if lt nxt 0
+      ret false
+    end
+    lastTok = uint nxt
+    put dcChatState 3 add get dcChatState 3 1
+  end
+  ret true
+end
+
+fn dcRunChatTurn h edit zonehdr ctx edit shactx fds view int 3 to bool
+  u = new uint 1 0
+  if not dcReadU32 get fds 0 u
+    ret false
+  end
+  put dcChatState 0 ulong get u 0
+  if not dcReadU32 get fds 0 u
+    ret false
+  end
+  if or eq get u 0 0 gt get u 0 4096
+    ret false
+  end
+  put dcChatState 1 ulong get u 0
+  if not dcReadU32 get fds 0 u
+    ret false
+  end
+  nPrompt = ulong get u 0
+  if or eq nPrompt 0 gt nPrompt 4096
+    ret false
+  end
+  put dcChatState 2 nPrompt
+  firstTok = dcChatPrefill h get fds 0
+  if lt firstTok 0
+    ret false
+  end
+  ret dcChatGen h ctx fds uint firstTok
+end
+
+fn dcRunChatMode h edit zonehdr ctx edit shactx fds view int 3 to int
   digest = new uchar 32 0
-  if not dcStartup h ctx 800
+  u = new uint 1 0
+  if not dcStartup h ctx 3200
+    ret 74
+  end
+  put dcChatState 3 0
+  if not dcReadU32 get fds 0 u
+    ret 65
+  end
+  nTurns = ulong get u 0
+  if or eq nTurns 0 gt nTurns 64
+    ret 65
+  end
+  for t ulong nTurns bound 64
+    put dcChatState 4 sub nTurns add t 1
+    if not dcRunChatTurn h ctx fds
+      ret 74
+    end
+  end
+  if not deAcquire h 1
+    ret 74
+  end
+  if not dtFinish get fds 1 ctx digest
+    ret 74
+  end
+  if not deRelease h 1 0 false
+    ret 74
+  end
+  dcPrintStats digest
+  ret 0
+end
+
+fn dcRunGenMode h edit zonehdr ctx edit shactx traceFd int numGen ulong to int
+  slots = new uchar 1024 0
+  digest = new uchar 32 0
+  if not dcStartup h ctx 3200
     ret 74
   end
   nPrompt = ulong sub argcnt 8
@@ -469,7 +645,7 @@ fn dcLoadInputs slabHdr edit zonehdr to int
     ret 65
   end
   r = fclose tfd
-  if not dkPlan 2048
+  if not dkPlan 20480
     ret 65
   end
   sn = argread 4 argBuf 0 4096
@@ -514,6 +690,33 @@ fn dcOpenOutArg idx ulong to int
   ret dcOpenWrite argBuf ulong n
 end
 
+fn dcOpenInArg idx ulong to int
+  argBuf = new uchar 4096 0
+  n = argread idx argBuf 0 4096
+  if le n 0
+    ret int -1
+  end
+  ret dcOpenPath argBuf ulong n 524288
+end
+
+fn dcDispatchChat slabHdr edit zonehdr traceCtx edit shactx to int
+  fds = new int 3 0
+  if ne argcnt 9
+    ret 64
+  end
+  put fds 1 dcOpenOutArg 6
+  put fds 0 dcOpenInArg 7
+  put fds 2 dcOpenOutArg 8
+  if or lt get fds 0 0 or lt get fds 1 0 lt get fds 2 0
+    ret 73
+  end
+  rc = dcRunChatMode slabHdr traceCtx fds
+  r = fclose get fds 0
+  r = fclose get fds 1
+  r = fclose get fds 2
+  ret rc
+end
+
 fn main to int
   slabHdr = new uchar 128 0
   traceCtx = new uchar 104 0
@@ -527,7 +730,8 @@ fn main to int
   end
   isL0 = dcStrEq modeBuf ulong mn dcModeL0
   isGen = dcStrEq modeBuf ulong mn dcModeGen
-  if and not isL0 not isGen
+  isChat = dcStrEq modeBuf ulong mn dcModeChat
+  if and not isL0 and not isGen not isChat
     ret 64
   end
   rc = dcLoadInputs slabHdr
@@ -546,17 +750,21 @@ fn main to int
     rc = dcRunLayer0Mode slabHdr traceCtx uint tv ofd
     r = fclose ofd
   else
-    tfd2 = dcOpenOutArg 6
-    if lt tfd2 0
-      ret 73
-    end
-    gv = dcReadTokArg 7
-    if or le gv 0 gt gv 2048
+    if isChat
+      rc = dcDispatchChat slabHdr traceCtx
+    else
+      tfd2 = dcOpenOutArg 6
+      if lt tfd2 0
+        ret 73
+      end
+      gv = dcReadTokArg 7
+      if or le gv 0 gt gv 2048
+        r = fclose tfd2
+        ret 64
+      end
+      rc = dcRunGenMode slabHdr traceCtx tfd2 ulong gv
       r = fclose tfd2
-      ret 64
     end
-    rc = dcRunGenMode slabHdr traceCtx tfd2 ulong gv
-    r = fclose tfd2
   end
   if not nvstop
     rc = 74

@@ -20,7 +20,11 @@ global dfCurWeights uint 6
 global dfCurSlots long 6
 global dfCoord ulong 3
 global dfStats ulong 6
+global dfSlotOf long 15360
+global dfSlotKey long 3200
+global dfSlabCfg ulong 3
 note dfStats: 0=hits, 1=misses, 2=nvme_ns, 3=gpu_ns, 4=engram_ns, 5=tokens
+note dfSlabCfg: 0=totalSlots, 1=fifoHead, 2=recordTrace
 
 fn dfMonoNs to ulong
   ret ulong monons
@@ -570,7 +574,7 @@ fn dfCandidateBlocks clen ulong nblocks ulong to bool
 end
 
 fn dfRunIndexer layer ulong pos ulong clen ulong latentReady bool to bool
-  ones = new uchar 1024 0
+  ones = new uchar 10240 0
   if and dfIsKvSource layer latentReady
     if not dfUpdateIndexK layer pos
       ret false
@@ -943,22 +947,54 @@ fn dfFfnPreRoute layer ulong to bool
   ret dfSubmit
 end
 
-fn dfResolveOne h edit zonehdr slots edit uchar * layer ulong k ulong to long
-  rmaps = new long 2 0
-  desc = new uchar 64 0
-  put rmaps 0 get dwMaps 5
-  put rmaps 1 get dwMaps 2
-  if not diRead get dfSidecarFD layer desc mul ulong get dfCurIds k 64 64
+fn dfInitSlabMap nSlots ulong to void
+  for i ulong 15360
+    put dfSlotOf i -1
+  end
+  for i ulong 3200
+    put dfSlotKey i -1
+  end
+  put dfSlabCfg 0 nSlots
+  put dfSlabCfg 1 0
+  put dfSlabCfg 2 1
+end
+
+fn dfPublishMiss key ulong to long
+  slot = get dfSlabCfg 1
+  put dfSlabCfg 1 rem add slot 1 get dfSlabCfg 0
+  oldKey = get dfSlotKey slot
+  if ge oldKey 0
+    put dfSlotOf ulong oldKey -1
+  end
+  chunk = div slot 800
+  dest = mul rem slot 800 deBytes
+  if not deCopy get dwMaps 5 get dwSlabMaps chunk dest
+    put dfSlotKey slot -1
     ret -1
   end
-  preHit = deFind slots desc
-  if ge preHit 0
-    put dfCurSlots k preHit
+  put dfSlotKey slot long key
+  put dfSlotOf key long slot
+  ret long slot
+end
+
+fn dfResolveOne layer ulong k ulong to long
+  desc = new uchar 64 0
+  eid = ulong get dfCurIds k
+  key = add mul layer 384 eid
+  cur = get dfSlotOf key
+  if ge cur 0
+    put dfCurSlots k cur
     put dfStats 0 add get dfStats 0 1
     ret 0
   end
+  if not diRead get dfSidecarFD layer desc mul eid 64 64
+    ret -1
+  end
   tN0 = dfMonoNs
-  slot = deResolve h slots desc rmaps get dfShardFD layer
+  if not deVerifyStage get dfShardFD layer desc get dwMaps 5
+    ret -1
+  end
+  slot = dfPublishMiss key
   if lt slot 0
     ret -1
   end
@@ -992,7 +1028,7 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
   put times 0 dfMonoNs
   hadMiss = false
   for k ulong 6
-    r = dfResolveOne h slots layer k
+    r = dfResolveOne layer k
     if lt r 0
       ret false
     end
@@ -1001,11 +1037,13 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
     end
   end
   put times 1 dfMonoNs
-  put coord 0 uint get dfCoord 0
-  put coord 1 uint get dfCoord 1
-  put coord 2 uint layer
-  if not dtAppend coord lIds lWts times
-    ret false
+  if ne get dfSlabCfg 2 0
+    put coord 0 uint get dfCoord 0
+    put coord 1 uint get dfCoord 1
+    put coord 2 uint layer
+    if not dtAppend coord lIds lWts times
+      ret false
+    end
   end
   if hadMiss
     put frameDirty 0 1
@@ -1018,14 +1056,16 @@ fn dfFfnRouted to bool
     ret false
   end
   for k ulong 6
-    base = mul ulong get dfCurSlots k deBytes
+    slot = ulong get dfCurSlots k
+    chunk = div slot 800
+    base = mul rem slot 800 deBytes
     if not dwQuantFp8 wsXNorm 5120
       ret false
     end
-    if not dwFp4Gemm base add base 17694720 wsExpGate 5120 2304
+    if not dwFp4GemmChunk chunk base add base 17694720 wsExpGate 5120 2304
       ret false
     end
-    if not dwFp4Gemm add base 11796480 add base 18432000 wsExpUp 5120 2304
+    if not dwFp4GemmChunk chunk add base 11796480 add base 18432000 wsExpUp 5120 2304
       ret false
     end
     if not dwBind 3 wsExpGate 9216
@@ -1049,7 +1089,7 @@ fn dfFfnRouted to bool
     if not dwQuantFp8 wsExpAct 2304
       ret false
     end
-    if not dwFp4Gemm add base 5898240 add base 18063360 add wsRoutedOut mul k 20480 2304 5120
+    if not dwFp4GemmChunk chunk add base 5898240 add base 18063360 add wsRoutedOut mul k 20480 2304 5120
       ret false
     end
     if not dwRoundBf16 add wsRoutedOut mul k 20480 5120

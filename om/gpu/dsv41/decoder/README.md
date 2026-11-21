@@ -108,3 +108,5 @@ spark-window run "$out/dsv41-decode" gen "$out/tensors.bin" "$d/engram-token-map
     "$sidecars" "$checkpoint" "$out/trace.bin" 32 0 671 6102 294 8760 344
 python3 "$d/trace-to-csv.py" "$out/trace.bin" "$out/trace.csv"
 ```
+
+Conversational capture accepts little-endian u32 words. The first word gives the turn count. Each turn contains its ID, maximum generated tokens, prompt token count and prompt IDs. The decoder retains the generated conversation between turns. The payload resolver hashes all six planes before publishing a slot. On Linux it can stream them through AF_ALG SHA-256. When the algorithm is unavailable at open, it uses seeded Omega SHA-256. A read, hash or digest error rejects the miss.
