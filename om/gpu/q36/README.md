@@ -50,14 +50,27 @@ Online adaptive sum-over-paths co-activation prefetcher (`39` cross-layer transi
 
 ## Real-Weight End-to-End 35B Decoder (`om/gpu/q36/decode/` -> `q36-decode`)
 
-`q36-decode` (`339 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) loads **all 40 real layers** (`layers-0..39.safetensors`, `~33.6 GB`) + `outside.safetensors` (`1.017 GB` BF16 `lm_head` + `embed_tokens` + `norm.weight`) directly from `~/models/qwen3.6-35b-a3b-fp8-95a723d0` into GB10 UVM across 10 contiguous slabs (`11.5 s` warm load), quantizes `lm_head` on-GPU to W4 block-32 (`1.26 ms` two-pass exact), and runs full 40-layer GPU Gated DeltaNet (`qGdnConvL2Fast` + exact FP32 `qGdnStepRealF32`) + Full-Attention (`hd=256`, partial RoPE `dim=64`) + 20-QMD single-submit 256-expert Top-8 MoE (`qSwiglu9Fast` + `qMoeCombine9Add`) + 3-QMD single-submit W4 `lm_head` (`qVocabChunkTop64` + `bf16_rescore_cands`) + live Arboris online tracking on live GB10 silicon.
+`q36-decode` (`460 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Rust / zero Python) loads **all 40 real layers** (`layers-0..39.safetensors`, `~33.6 GB`) + `outside.safetensors` (`1.017 GB` BF16 `lm_head` + `embed_tokens` + `norm.weight`) directly from `~/models/qwen3.6-35b-a3b-fp8-95a723d0` into GB10 UVM, quantizes `lm_head` on-GPU to W4 block-32 (`1.26 ms` two-pass exact), and replays **ONE single pre-recorded native GPFIFO submit for all 40 real layers + `lm_head`** (100% GPU-resident `QDW_X`, zero CPU hops between layers).
 
-- Verified on live Spark GB10 silicon (exclusive quiet window `20261121T221800Z-5dd1ee`, `exit: 0`, quiet machine):
-  - Prompt: `<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think></think>` (`17` tokens).
-  - **W4 Two-Pass Exact `lm_head` parity on real 40L hidden state:** **`PARITY=EXACT` vs Full BF16 (`tok=271`)**.
-  - **Generated output (exact through `<|im_end|>`):** `271 760 6511 314 9338 369 2972 57590 159034 248046` → **`"\n\nThe capital of France is **Paris**.<|im_end|>"`**.
-  - **Live Arboris online hit rate (cold start, real 35B routing traces):** **`40–42%`** (`13×` above `3.1%` random top-8/256).
-  - **Real-weight 35B zero-CUDA decode progression:** `122 ms/tok` (`8.2 tok/s`, initial hybrid) → `64 ms/tok` (`15.6 tok/s`, GPU FP32 GDN + GPU `in_proj_ab`) → `57 ms/tok` (`17.5 tok/s`, fused MoE + GPU Top-64 `lm_head`) → `45 ms/tok` (`22.2 tok/s`, spin-poll) → **`34 ms/tok` (`29.4 tok/s`, **`3.59×`** speedup with GPU `conv1d+SiLU+L2` + 20-QMD GPU MoE combine)**.
+Supports two verified real-weight execution modes in the same static binary:
+- **Exact FP8 mode** (`q36-decode <dir> 24`): `10` UVM slabs (`~34.7 GB`), fused `in_proj_qkvz [12288, 2048]`, 1-launch strided 8-expert FP8 MoE (`qFp8B128Grouped8Strided`), GPU router (`qRouterTop8Lex`), GPU Full-Attention (`qFaPrepKvGpu` + `qFaAttendGpu`), and Top-2/chunk W4 Two-Pass Exact `lm_head` (`128` BF16 rescores).
+- **Full-W4 mode** (`q36-decode <dir> 24 w4`): on-GPU FP8→W4 block-32 quantization (`qFp8ToW4B32Quant`) during load (`13.3 s` total load+quantize, `~19.5 GB` VRAM resident), 4-row-per-warp zero-stall `4× LDG.E.128` W4 kernels with interleaved 4-row `qW4MacBlock` (`qW4B32Gemv4R`, `qW4B32Grouped94R`), fused SwiGLU zero-loop 4-row/half-warp 9-expert `down_proj` (`qW4B32Grouped9Dn4R`, folding `shared_expert` into slot `256`), fused `FA Q|K|V [9216, 2048]`, fused high-occupancy 33-CTA `router+sh_gate [257, 2048]` (`qBf16Gemv1R`), 2×-unrolled exact FP32 GDN state with fused `decay/beta`, and fused inter-layer `qMoeCombine9RmsFast` (`-40` RMSNorm launches).
+
+Verified on live Spark GB10 silicon (exclusive quiet window `20261121T232155Z-317143`, `exit: 0`, quiet machine; note: still uses NVIDIA open kernel modules 580.173.02 + signed GSP firmware):
+- Prompt: `<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think></think>` (`17` tokens).
+- **W4 Two-Pass Exact `lm_head` parity on real 40L hidden state:** **`PARITY=EXACT` vs Full BF16 (`tok=271`)** in both Exact FP8 and Full-W4 modes.
+- **Generated output (bit-for-bit identical 10-token answer in both Exact FP8 and Full-W4):** `271 760 6511 314 9338 369 2972 57590 159034 248046` → **`"\n\nThe capital of France is **Paris**.<|im_end|>"`**.
+
+| Real-Weight 35B-A3B Zero-CUDA Milestone | Latency | Throughput | Speedup | Parity & Output |
+|---|---:|---:|---:|---|
+| Initial hybrid real-weight decoder (`20261121T220035Z-0f6897`) | `122.0 ms/tok` | `8.20 tok/s` | `1.00×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
+| GPU FP32 GDN + conv1d + 20-QMD MoE + spin-poll (`20261121T221800Z-5dd1ee`) | `34.0 ms/tok` | `29.41 tok/s` | `3.59×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
+| Wave 1: 100% GPU-resident `QDW_X` (`qRmsNormAddFast` + `qGdnDecayBetaFast`) | `31.0 ms/tok` | `32.26 tok/s` | `3.94×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
+| Wave 2: 1-launch strided FP8 MoE + GPU `qRouterTop8Lex` | `26.0 ms/tok` | `38.46 tok/s` | `4.69×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
+| **Wave 3–4: 1-Submit 40L Exact FP8** (`20261121T232155Z-317143`) | **`20.827 ms/tok`** | **`48.01 tok/s`** | **`5.86×`** | **`PARITY=EXACT` (`tok=271`), `**Paris**.`** |
+| Wave 4 (fixed): On-GPU Full-W4 (`19.5 GB` VRAM, 1-submit) | `17.952 ms/tok` | `55.70 tok/s` | `6.80×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
+| Wave 5: 4-row/warp W4 + 9-expert MoE + fused FA `Q\|K\|V` + fused router | `16.179 ms/tok` | `61.80 tok/s` | `7.54×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
+| **Wave 6–11: Full-W4 Final** (`20261121T232155Z-317143`, fused SwiGLU + `qMoeCombine9RmsFast` + 33-CTA `qBf16Gemv1R` + `LDG.E.128` SMEM + interleaved `qW4MacBlock`) | **`14.756 ms/tok`** | **`67.76 tok/s`** | **`8.27×`** | **`PARITY=EXACT` (`tok=271`), `**Paris**.`** |
 
 ## Build and Run
 
@@ -66,5 +79,6 @@ sh seed/omega-from-seed.sh
 sh om/gpu/q36/build.sh build/q36
 spark-window run build/q36/q36-native
 spark-window run build/q36/q36-head ~/models/qwen3.6-35b-a3b-fp8-95a723d0/outside.safetensors
-spark-window run build/q36/q36-decode ~/models/qwen3.6-35b-a3b-fp8-95a723d0 24
+spark-window run build/q36/q36-decode ~/models/qwen3.6-35b-a3b-fp8-95a723d0 24      # Exact FP8 (48.01 tok/s)
+spark-window run build/q36/q36-decode ~/models/qwen3.6-35b-a3b-fp8-95a723d0 24 w4   # Full-W4 (67.76 tok/s)
 ```
