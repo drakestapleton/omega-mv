@@ -62,6 +62,8 @@ void sha256_update(sha256_ctx *o_c, const uint8_t *o_d, size_t o_d_len);
 void sha256_final(sha256_ctx *o_c, uint8_t o_o[32]);
 /* export fn sha256_hash d view uchar * o out uchar 32 to void */
 void sha256_hash(const uint8_t *o_d, size_t o_d_len, uint8_t o_o[32]);
+/* export fn omega_blake3_hash input view uchar * digest out uchar 32 to void */
+void omega_blake3_hash(const uint8_t *o_input, size_t o_input_len, uint8_t o_digest[32]);
 /* export fn bw_qmd0 q edit uint 96 qmd1_va ulong to ulong */
 uint64_t bw_qmd0(uint32_t o_q[96], uint64_t o_qmd1_va);
 /* export fn bw_qmd1 m view ulong 16 q edit uint 96 to ulong */

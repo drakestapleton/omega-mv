@@ -40,7 +40,13 @@ PIN=ab66c171fd5b553d3910b47c3ecf9fecde117fd8
 old=tools/tensor_mutations_legacy.$$.sh
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/tensor-equiv.XXXXXX") || exit 2
 trap 'rm -rf "$tmp" "$root/$old"' EXIT INT TERM
-git show "$PIN:tools/tensor_mutations.sh" > "$old" || { echo "FAIL cannot extract $PIN:tools/tensor_mutations.sh"; exit 2; }
+git show "$PIN:tools/tensor_mutations.sh" > "$tmp/pinned.sh" || { echo "FAIL cannot extract $PIN:tools/tensor_mutations.sh"; exit 2; }
+# The pinned runner linked SHA-256 from the retired C implementation. Use
+# the generated Omega binding in this tree for that one compilation input.
+# Keep the historical runner, its mutation tables and its output intact.
+[ "$(grep -Fc ' src/sha256.c"' "$tmp/pinned.sh")" = 1 ] || { echo "FAIL pinned SHA-256 input changed"; exit 2; }
+sed 's| src/sha256\.c"$| src/omega_om_units.c"|' "$tmp/pinned.sh" > "$old" || exit 2
+cmp -s "$tmp/pinned.sh" "$old" && { echo "FAIL pinned SHA-256 input was not updated"; exit 2; }
 chmod +x "$old"
 fails=0
 ok() { if [ "$2" = 0 ]; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }

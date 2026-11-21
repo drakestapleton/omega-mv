@@ -1775,20 +1775,21 @@ static bool test_m19_gate15_zero_libcuda(void) {
 }
 
 
-/* Start one program directly, with an optional working directory, one extra
- * environment value, and stdout+stderr sent to log_path. No shell is involved,
+/* Start one program directly, with an optional working directory, resolved
+ * pin paths, and stdout+stderr sent to log_path. No shell is involved,
  * so a path, a commit id or a directory name passed here stays an argument and
  * can never become command text. Returns the exit status, or -1 if it did not run. */
 static int m19_run(char *const argv[], const char *dir, const char *log_path,
-                   const char *e1_name, const char *e1_value,
-                   const char *e2_name, const char *e2_value) {
+                   const char *const pins[3], bool nested) {
     if (!argv || !argv[0]) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         if (dir && chdir(dir) != 0) _exit(127);
-        if (e1_name && e1_value && setenv(e1_name, e1_value, 1) != 0) _exit(127);
-        if (e2_name && e2_value && setenv(e2_name, e2_value, 1) != 0) _exit(127);
+        if (pins && (setenv("PHYSICS_DIR", pins[0], 1) != 0 ||
+                     setenv("AIENOS_R7_DIR", pins[1], 1) != 0 ||
+                     setenv("ARGUS_REPO", pins[2], 1) != 0)) _exit(127);
+        if (nested && setenv("OMEGA_IN_CLEAN_CLONE", "1", 1) != 0) _exit(127);
         if (log_path) {
             int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
             if (fd < 0) _exit(127);
@@ -1873,6 +1874,17 @@ static bool test_m19_gate16_clean_clone(void) {
         return false;
     }
 
+    char aienos_dir[PATH_MAX], argus_dir[PATH_MAX];
+    const char *aienos = getenv("AIENOS_R7_DIR"), *argus = getenv("ARGUS_REPO");
+    if (!realpath(aienos && *aienos ? aienos : "../aienos", aienos_dir) ||
+        !realpath(argus && *argus ? argus : "../aienos-argus", argus_dir) ||
+        !omega_cc_path_is_plain(physics_dir_resolved) ||
+        !omega_cc_path_is_plain(aienos_dir) || !omega_cc_path_is_plain(argus_dir)) {
+        fprintf(stderr, "M19 clean clone: could not resolve plain offline dependency paths\n");
+        return false;
+    }
+    const char *const pins[] = {physics_dir_resolved, aienos_dir, argus_dir};
+
     /* OUT_DIR=build on the clone's make: tests/gates/run.sh exports a per-step OUT_DIR
      * (omega#511), which the clone would inherit and build into, while the line below runs
      * ./build/omegatool. The clone is its own directory, so its default build/ is private. */
@@ -1884,20 +1896,23 @@ static bool test_m19_gate16_clean_clone(void) {
 
     char *clone_argv[] = { (char *)"git", (char *)"clone", (char *)"--quiet",
                            (char *)"--no-hardlinks", (char *)".", checkout, NULL };
-    char *clean_argv[] = { (char *)"make", (char *)"OUT_DIR=build", (char *)"clean", NULL };
-    char *build_argv[] = { (char *)"make", (char *)"-j", (char *)"OUT_DIR=build", NULL };
+    /* MAKEFLAGS can carry relative command-line assignments from the caller.
+     * Give the child make explicit absolute assignments with the same priority. */
+    char physics_arg[PATH_MAX + sizeof("PHYSICS_DIR=")], aienos_arg[PATH_MAX + sizeof("AIENOS_R7_DIR=")];
+    char argus_arg[PATH_MAX + sizeof("ARGUS_REPO=")];
+    snprintf(physics_arg, sizeof physics_arg, "PHYSICS_DIR=%s", pins[0]);
+    snprintf(aienos_arg, sizeof aienos_arg, "AIENOS_R7_DIR=%s", pins[1]);
+    snprintf(argus_arg, sizeof argus_arg, "ARGUS_REPO=%s", pins[2]);
+    char *clean_argv[] = {"make", "OUT_DIR=build", physics_arg, aienos_arg, argus_arg, "clean", NULL};
+    char *build_argv[] = {"make", "-j", "OUT_DIR=build", physics_arg, aienos_arg, argus_arg, NULL};
     char *gates_argv[] = { (char *)"./build/omegatool", (char *)"--run-m19-gates", NULL };
 
-    /* No value read from a file goes on a command line. The clone carries the source's own
-     * head, so the commit id is never passed as an argument; the check further down still
-     * refuses a clone whose head is not src_sha. The physics path travels in the environment,
-     * which the Makefile's `PHYSICS_DIR ?= ../physics` picks up. */
-    bool nested_ok = m19_run(clone_argv, ".", "/dev/null", NULL, NULL, NULL, NULL) == 0 &&
-                     m19_run(clean_argv, checkout, "/dev/null", NULL, NULL, NULL, NULL) == 0 &&
-                     m19_run(build_argv, checkout, "/dev/null",
-                             "PHYSICS_DIR", physics_dir_resolved, NULL, NULL) == 0 &&
-                     m19_run(gates_argv, checkout, log_path,
-                             "OMEGA_IN_CLEAN_CLONE", "1", NULL, NULL) == 0;
+    /* Resolve paths in the caller before the children change directories.
+     * Both the build and the gate executable consume these same inputs. */
+    bool nested_ok = m19_run(clone_argv, ".", "/dev/null", NULL, false) == 0 &&
+                     m19_run(clean_argv, checkout, "/dev/null", NULL, false) == 0 &&
+                     m19_run(build_argv, checkout, "/dev/null", pins, false) == 0 &&
+                     m19_run(gates_argv, checkout, log_path, pins, true) == 0;
     if (!nested_ok) {
         /* The nested clone builds and runs into qualification.log. A failure here used to report
          * only "[FAIL]" with no reason while the log stayed inside the runner's temp directory.
