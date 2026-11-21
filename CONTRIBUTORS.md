@@ -436,3 +436,4 @@ Update this table in the same commit as the work it credits.
 - Antigravity implemented conversational DeepSeek capture. Codex restored checked expert loading, used the Linux SHA-256 service with a seeded fallback, and carried the final generated token into the following turn.
 - Codex implemented checked expert-slot exchange under the CPU lease and validated corruption refusal, active-gate residency, and physical route parity on GB10.
 - Codex wired verified Engram rows into the decoder and checked expert record identity before eviction.
+- Antigravity, under Drake Stapleton's direction, wired SM121a Tensor Core QMMA (`mmaFp4`, 32x32 block-scaled `mmaFp8Block`), warp-parallel `rmsStatWarp`/`denseWarp`, and 1 MiB persistent `AF_ALG` staging into `dsv41-decode` (4.0x GPU speedup on GB10 with Layer 0 `cos=0.99999034` and 5/5 Gate 3 token parity).
