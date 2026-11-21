@@ -5,7 +5,7 @@ note Compose after om/encoder/bw_enc_sm121.om.
 const QZ ulong 255
 global q36Pc ulong 1
 global q36Guard ulong 1
-global q36Buf ulong 8192
+global q36Buf ulong 16384
 
 fn qcw st ulong wb ulong rbar ulong wt ulong yld ulong to ulong
 a = or shl st 9 shl yld 13
@@ -1064,114 +1064,113 @@ qic 0 QZ QZ QZ 0 qW1
 end
 
 note =========================================================================
-note h (7): attn_hd256_split_fast -- Split-K Flash-Decoding for 16Q/2KV, hd=256, BF16 KV
+note h (7): attn_hd256_split_fast -- Warp-only Split-K Flash-Decoding (Block=32, SMEM=0, ZERO BAR.SYNC!)
 note Args: Q[16,256] (R0:1), K_bf16[2,T,256] (R2:3), V_bf16[2,T,256] (R4:5),
 note       O_part[16,S,256] (R6:7), ml_part[16,S,2] (R8:9), T (40), S (44).
-note Grid: (16, S, 1), Block: 256 (1 lane per head dim), SMEM: 64.
+note Grid: (16, S, 1), Block: 32 (1 warp per head/split, 8 dims/lane -> 1x LDG.E.128 per K & V!), SMEM: 0.
 note =========================================================================
 fn qAttnHd256SplitFast to void
 qStart 5
-qParam 20 40
-qParam 21 44
-note h = blockIdx.x (R15: 0..15), s = blockIdx.y (R18: 0..S-1), d = tid (R14: 0..255)
-note kv_h = h >> 3 (0..1)
-qic 17 22 15 QZ 3 qAlu4
-note Load q[h*256 + d] * (1/sqrt(256) = 0.0625) -> R23
-qMad 24 15 256 14
-qicImm 9 16 24 0 4 qW1
-qic 11 23 16 QZ 0 qLd
+qParam 10 40
+qParam 11 44
+note h = blockIdx.x (R15: 0..15), s = blockIdx.y (R18: 0..S-1), lane = tid (R14: 0..31)
+note kv_h = h >> 3 (R12)
+qic 17 12 15 QZ 3 qAlu4
+note Load Q[h*256 + lane*8 .. +7] via 2x LDG.E.128 -> R20..R27, scale by 1/sqrt(256) = 0.0625
+qMad 52 15 256 QZ
+qMad 52 14 8 52
+qicImm 9 16 52 0 4 qAlu4
+qic 57 20 16 QZ 0 qLdW1
+qic 57 24 16 QZ 16 qLd
 qic 0 QZ QZ QZ 0 qW0
 qNum 52 0.0625f32
-qic 32 23 23 52 0 qAlu4
-note Split range: for S=8 use chunk = T >> 3 (R25); if S < 2 use chunk = T
-qic 17 25 20 QZ 3 qAlu4
-qLit 54 2
-qic 28 QZ 21 54 0 qCmp
-put q36Guard 0 2
-qicImm 8 25 20 QZ 1 qAlu4
-qMadReg 26 18 25 QZ
-qIadd 27 26 25
-note Online softmax state: m = -1e9 (R34), l = 0 (R35), acc = 0 (R36)
-qNum 34 -1000000000.0f32
-qNum 35 0.0f32
-qNum 36 0.0f32
-qNum 37 1.4426950408889634f32
-qic 17 38 14 QZ 5 qAlu4
-qic 18 39 14 QZ 31 qAlu4
-qLit 40 0
-qLit 41 1
-mTok = get q36Pc 0
-note Load K_bf16[t, d] and V_bf16[t, d] in parallel via u32 word (kv_h*T + t0 + tok)*128 + (d>>1)
-qic 17 52 14 QZ 1 qAlu4
-qic 18 53 14 QZ 1 qAlu4
-qMadReg 54 22 20 26
-qIadd 54 54 40
-qMad 54 54 128 52
-qicImm 9 16 54 2 4 qAlu4
-qic 11 42 16 QZ 0 qLd
-qicImm 9 56 54 4 4 qAlu4
-qic 11 43 56 QZ 0 qLd
-qic 0 QZ QZ QZ 0 qW0
-note Extract low or high BF16 of K (R42 -> R44)
-qicImm 8 44 42 QZ 65536 qAlu1
-qic 18 45 42 QZ 0xffff0000 qAlu1
-qic 28 QZ 53 41 0 qCmp
-put q36Guard 0 1
-qicImm 8 44 45 QZ 1 qAlu4
-note Partial dot = q * k -> warp sum -> predicated @!P0 STS into SMEM[warp*4] (zero BSSY/divergence!) -> block sum (R46)
-qic 32 46 23 44 0 qAlu4
-qWarpBflySum 46 52
-qMad 55 38 4 QZ
-qic 28 QZ 39 41 0 qCmp
-put q36Guard 0 2
-qic 50 QZ 55 46 0 qSt
-qBar
-qNum 46 0.0f32
-for w ulong 8
-qLit 55 mul w 4
-qic 49 52 55 QZ 0 qLd
-qic 0 QZ QZ QZ 0 qW0
-qic 30 46 46 52 0 qAlu4
+for j ulong 8
+qic 32 add 20 j add 20 j 52 0 qAlu4
 end
-qBar
-note Online softmax update: m_new = max(m, score), alpha = exp(m - m_new), p = exp(score - m_new)
-qic 37 47 34 46 0 qAlu4
-qic 31 48 34 47 0 qAlu4
-qExp 48 48 37
-qic 31 49 46 47 0 qAlu4
-qExp 49 49 37
-qic 32 35 35 48 0 qAlu1
-qic 30 35 35 49 0 qAlu4
-qic 32 36 36 48 0 qAlu4
-qicImm 8 34 47 QZ 1 qAlu4
-note Unpack BF16 V (already loaded in R43), acc += p * v
-qicImm 8 44 43 QZ 65536 qAlu1
-qic 18 45 43 QZ 0xffff0000 qAlu1
-qic 28 QZ 53 41 0 qCmp
-put q36Guard 0 1
-qicImm 8 44 45 QZ 1 qAlu4
-qic4 33 36 49 44 36 qAlu4
-qIadd 40 40 41
-qic 28 QZ 40 25 0 qCmp
+note Split range: for S=8 use chunk = T >> 3 (R13); if S < 2 use chunk = T
+qic 17 13 10 QZ 3 qAlu4
+qLit 54 2
+qic 28 QZ 11 54 0 qCmp
+put q36Guard 0 2
+qicImm 8 13 10 QZ 1 qAlu4
+note t0 = s * chunk (R53); K/V base = ((kv_h * T + t0) * 128 + lane * 4) u32 words -> R48:49 (K), R50:51 (V)
+qMadReg 53 18 13 QZ
+qMadReg 54 12 10 53
+qMad 54 54 128 QZ
+qMad 54 14 4 54
+qicImm 9 48 54 2 4 qAlu4
+qicImm 9 50 54 4 4 qAlu4
+note Init acc[0..7] in R28..R35 = 0, m = -1e9 (R36), l = 0 (R37), log2(e) (R38), tok = 0 (R0), one = 1 (R1)
+for j ulong 8
+qNum add 28 j 0.0f32
+end
+qNum 36 -1000000000.0f32
+qNum 37 0.0f32
+qNum 38 1.4426950408889634f32
+qLit 0 0
+qLit 1 1
+mTok = get q36Pc 0
+note 1x LDG.E.128 for K (R40..43) + 1x LDG.E.128 for V (R44..47) in parallel!
+qic 57 40 48 QZ 0 qLdW1
+qic 57 44 50 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+note Dot product over 8 dims -> R52
+qNum 52 0.0f32
+for j ulong 4
+qicImm 8 53 add 40 j QZ 65536 qAlu1
+qic 18 54 add 40 j QZ 0xffff0000 qAlu4
+qic4 33 52 53 add 20 mul j 2 52 qAlu4
+qic4 33 52 54 add 21 mul j 2 52 qAlu4
+end
+note Warp-only SHFL.BFLY sum across all 32 lanes (ZERO BAR.SYNC, ZERO SMEM!)
+qWarpBflySum 52 53
+note Online softmax: m_new = max(m, score) (R53), alpha = exp(m - m_new) (R54), p = exp(score - m_new) (R55)
+qic 37 53 36 52 0 qAlu4
+qic 31 54 36 53 0 qAlu4
+qExp 54 54 38
+qic 31 55 52 53 0 qAlu4
+qExp 55 55 38
+qic 32 37 37 54 0 qAlu4
+qic 30 37 37 55 0 qAlu4
+qicImm 8 36 53 QZ 1 qAlu4
+note Rescale acc[0..7] by alpha and accumulate p * V[0..7]
+for j ulong 4
+qic 32 add 28 mul j 2 add 28 mul j 2 54 0 qAlu1
+qic 32 add 29 mul j 2 add 29 mul j 2 54 0 qAlu1
+qicImm 8 56 add 44 j QZ 65536 qAlu1
+qic 18 57 add 44 j QZ 0xffff0000 qAlu4
+qic4 33 add 28 mul j 2 55 56 add 28 mul j 2 qAlu1
+qic4 33 add 29 mul j 2 55 57 add 29 mul j 2 qAlu4
+end
+note Advance K/V pointers by +512 bytes (1 token = 256 BF16 = 512 B)
+qicImm 9 48 1 48 512 qAlu1
+qicImm 9 50 1 50 512 qAlu1
+qIadd 0 0 1
+qic 28 QZ 0 13 0 qCmp
 put q36Guard 0 2
 qic 46 QZ QZ QZ sub mTok get q36Pc 0 qAlu4
-note Store O_part[(h*S + s)*256 + d] = acc
-qMadReg 52 15 21 18
-qMad 53 52 256 14
-qicImm 9 16 53 6 4 qAlu4
-qic 12 QZ 16 36 0 qSt
+note Store O_part[(h*S + s)*256 + lane*8 .. +7] = acc[0..7]
+qMadReg 52 15 11 18
+qMad 53 52 256 QZ
+qMad 53 14 8 53
+for j ulong 8
+qLit 54 j
+qIadd 54 53 54
+qicImm 9 16 54 6 4 qAlu4
+qic 12 QZ 16 add 28 j 0 qSt
 qic 0 QZ QZ QZ 0 qW1
-note Thread 0 stores m and l into ml_part[(h*S + s)*2 + 0/1]
-qic 28 QZ 14 41 0 qCmp
+end
+note Lane 0 stores m (R36) and l (R37) into ml_part[(h*S + s)*2 + 0/1]
+qic 28 QZ 14 1 0 qCmp
 put q36Guard 0 1
 qic 45 QZ QZ QZ 0 qSafe
 qMad 53 52 2 QZ
 qicImm 9 16 53 8 4 qAlu4
-qic 12 QZ 16 34 0 qSt
+qic 12 QZ 16 36 0 qSt
 qic 0 QZ QZ QZ 0 qW1
-qIadd 53 53 41
+qIadd 53 53 1
 qicImm 9 16 53 8 4 qAlu4
-qic 12 QZ 16 35 0 qSt
+qic 12 QZ 16 37 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
 
@@ -1241,6 +1240,207 @@ qic 12 QZ 16 26 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
 
+note =========================================================================
+note j (9): w4_lmhead_screen_fast -- 1.26 ms W4 block-32 lm_head screen (227.6 GB/s = 96.1% GB10 ceiling!)
+note Args: W_w4[N,256] u32 (R0:1), S_w4[N,32] u32 (R2:3), x[2048] (R4:5), y[N] (R6:7), N (32).
+note Grid: (ceil(N/32), 1, 1), Block: 256, SMEM: 8192.
+note =========================================================================
+fn qW4Unpack4 wReg ulong x0 ulong x1 ulong x2 ulong x3 ulong baccReg ulong to void
+qic 18 52 wReg QZ 15 qAlu1
+qic 17 53 wReg QZ 4 qAlu1
+qic 17 54 wReg QZ 8 qAlu1
+qic 17 55 wReg QZ 12 qAlu4
+qic 18 53 53 QZ 15 qAlu1
+qic 18 54 54 QZ 15 qAlu1
+qic 18 55 55 QZ 15 qAlu4
+qic 38 52 52 QZ 0 qMufu
+qic 38 53 53 QZ 0 qMufu
+qic 38 54 54 QZ 0 qMufu
+qic 38 55 55 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic4 33 baccReg 52 x0 baccReg qAlu4
+qic4 33 baccReg 53 x1 baccReg qAlu4
+qic4 33 baccReg 54 x2 baccReg qAlu4
+qic4 33 baccReg 55 x3 baccReg qAlu4
+end
+
+fn qW4MacBlock smOffReg ulong sc0 ulong sc1 ulong sc2 ulong sc3 ulong to void
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 58 0.0f32
+qNum 59 0.0f32
+qNum 60 0.0f32
+for w ulong 4
+qic 58 40 smOffReg QZ mul w 32 qLd
+qic 58 44 smOffReg QZ add mul w 32 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+for xi ulong 8
+qic 30 60 60 add 40 xi 0 qAlu4
+end
+for r ulong 4
+wr = add add 24 mul r 4 w
+qW4Unpack4 wr 40 41 42 43 add 56 r
+qic 17 61 wr QZ 16 qAlu4
+qW4Unpack4 61 44 45 46 47 add 56 r
+end
+end
+qNum 61 -8.0f32
+qic 32 60 60 61 0 qAlu4
+qic 30 56 56 60 0 qAlu1
+qic 30 57 57 60 0 qAlu1
+qic 30 58 58 60 0 qAlu1
+qic 30 59 59 60 0 qAlu4
+qic4 33 48 56 sc0 48 qAlu1
+qic4 33 49 57 sc1 49 qAlu1
+qic4 33 50 58 sc2 50 qAlu1
+qic4 33 51 59 sc3 51 qAlu4
+end
+
+fn qW4LmheadScreenFast to void
+qStart 4
+qParam 9 32
+qLit 56 0
+qLit 57 256
+qLit 58 2048
+mSx = get q36Pc 0
+qIadd 52 56 14
+qicImm 9 16 52 4 4 qW1
+qic 11 53 16 QZ 0 qLd
+qMad 54 52 4 QZ
+qic 0 QZ QZ QZ 0 qW0
+qic 50 QZ 54 53 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 56 56 57
+qic 28 QZ 56 58 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mSx get q36Pc 0 qAlu4
+qBar
+qic 17 10 14 QZ 5 qAlu4
+qic 18 11 14 QZ 31 qAlu4
+qMad 8 15 32 QZ
+qMad 8 10 4 8
+qLit 59 0xffffffff
+qIadd 59 9 59
+for r ulong 4
+qLit 52 r
+qIadd 52 8 52
+qic 28 QZ 52 9 0 qCmp
+put q36Guard 0 1
+qMad 52 59 1 QZ
+qMad 53 52 32 11
+qicImm 9 16 53 2 4 qAlu4
+qic 11 add 24 r 16 QZ 0 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+for r ulong 4
+qicImm 8 add 2 r add 24 r QZ 1 qAlu1
+end
+qMad 55 11 4 QZ
+for r ulong 4
+qLit 52 r
+qIadd 52 8 52
+qic 28 QZ 52 9 0 qCmp
+put q36Guard 0 1
+qMad 52 59 1 QZ
+qMad 53 52 256 55
+qicImm 9 add 16 mul r 2 53 0 4 qAlu4
+end
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+qic 57 24 16 QZ 0 qLdW1
+qic 57 28 18 QZ 0 qLd
+qic 57 32 20 QZ 0 qLd
+qic 57 36 22 QZ 0 qLd
+for r ulong 4
+qicImm 8 add 12 r add 2 r QZ 65536 qAlu1
+end
+qMad 10 11 128 QZ
+qic 0 QZ QZ QZ 0 qW0
+qW4MacBlock 10 12 13 14 15
+qLit 57 1
+for r ulong 4
+qicImm 9 add 16 mul r 2 57 add 16 mul r 2 512 qAlu4
+end
+qic 57 24 16 QZ 0 qLdW1
+qic 57 28 18 QZ 0 qLd
+qic 57 32 20 QZ 0 qLd
+qic 57 36 22 QZ 0 qLd
+for r ulong 4
+qic 18 add 12 r add 2 r QZ 0xffff0000 qAlu1
+end
+qLit 58 4096
+qIadd 10 10 58
+qic 0 QZ QZ QZ 0 qW0
+qW4MacBlock 10 12 13 14 15
+for r ulong 4
+qWarpRedSum add 48 r 52 16
+end
+qLit 57 1
+qic 28 QZ 11 57 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for r ulong 4
+qLit 52 r
+qIadd 52 8 52
+qic 28 QZ 52 9 0 qCmp
+sk = qBraFwd 1
+qicImm 9 16 52 6 4 qAlu4
+qic 12 QZ 16 add 48 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch sk 1
+end
+end
+
+note =========================================================================
+note k (10): bf16_rescore_cands -- Exact BF16 rescore of Top-64 candidates (1 warp/cand)
+note Args: W_bf16[V,2048] (R0:1), x[2048] (R2:3), cand_ids[M] (R4:5), out_logits[M] (R6:7), M (32).
+note Grid: (M, 1, 1), Block: 32, SMEM: 0.
+note =========================================================================
+fn qBf16RescoreCands to void
+qStart 4
+qParam 10 32
+qic 28 QZ 15 10 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 16 15 4 4 qAlu4
+qic 11 11 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 12 11 1024 QZ
+qMad 12 14 4 12
+qicImm 9 20 12 0 4 qAlu4
+qMad 13 14 8 QZ
+qicImm 9 22 13 2 4 qAlu4
+qNum 48 0.0f32
+qLit 56 0
+qLit 57 8
+qLit 58 1
+mRes = get q36Pc 0
+qic 57 24 20 QZ 0 qLdW1
+qic 57 28 22 QZ 0 qLd
+qic 57 32 22 QZ 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+for j ulong 4
+qicImm 8 52 add 24 j QZ 65536 qAlu4
+qic 18 53 add 24 j QZ 0xffff0000 qAlu4
+qic4 33 48 52 add 28 mul j 2 48 qAlu4
+qic4 33 48 53 add 29 mul j 2 48 qAlu4
+end
+qicImm 9 20 58 20 512 qAlu4
+qicImm 9 22 58 22 1024 qAlu4
+qIadd 56 56 58
+qic 28 QZ 56 57 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mRes get q36Pc 0 qAlu4
+qWarpRedSum 48 52 16
+qic 28 QZ 14 58 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 16 15 6 4 qAlu4
+qic 12 QZ 16 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
 fn q36Kernel mode uchar to bool
 if eq mode 97
 qBf16GemvFast
@@ -1276,6 +1476,14 @@ ret true
 end
 if eq mode 105
 qAttnHd256ReduceGateFast
+ret true
+end
+if eq mode 106
+qW4LmheadScreenFast
+ret true
+end
+if eq mode 107
+qBf16RescoreCands
 ret true
 end
 ret false

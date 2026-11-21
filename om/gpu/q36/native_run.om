@@ -31,6 +31,10 @@ global qGdnState long 1
 global qLmBf16 long 1
 global qLmFp8 long 1
 global qLmFp8S long 1
+global qLmW4 long 1
+global qLmW4S long 1
+global qCandIds long 1
+global qCandLog long 1
 global qLogits long 1
 
 note 4 cold weight banks (> 110x GB10 24 MiB L2)
@@ -66,8 +70,9 @@ text qArbFail "FAIL: Arboris self-test failed\n"
 text qP1Ok "PASS: native GB10 9-kernel numerical parity self-test (bf16_gemv, fp8_b128_gemv, fp8_b128_grouped8, router_top8_256, swiglu8_q36, moe_combine_rms, gdn_step_bf16, attn_hd256_split+reduce_gate)\n"
 text qP1Fail "FAIL: native GB10 kernel parity check failed at test id: "
 text qRes0 "NATIVE_GPFIFO_40L_BACKBONE_2.57GB: median_us="
-text qRes1 "NATIVE_GPFIFO_40L_FP8_EXACT_HEAD_3.08GB: median_us="
-text qRes2 "NATIVE_GPFIFO_40L_FULL_248K_BF16_HEAD_3.59GB: median_us="
+text qRes1 "NATIVE_GPFIFO_40L_W4_EXACT_HEAD_2.86GB: median_us="
+text qRes2 "NATIVE_GPFIFO_40L_FP8_EXACT_HEAD_3.08GB: median_us="
+text qRes3 "NATIVE_GPFIFO_40L_FULL_248K_BF16_HEAD_3.59GB: median_us="
 text qArbRes "ARBORIS_40L_ONLINE_OVERHEAD: us_per_tok="
 text qArbHit " hit_rate_pct="
 text qTokS " tok_s_x100="
@@ -117,7 +122,7 @@ end
 
 fn qEmitAll to void
 put qCodePos 0 0
-for i ulong 9
+for i ulong 11
 p = mul div add get qCodePos 0 255 256 256
 put qEntry i p
 put qCodePos 0 p
@@ -136,8 +141,10 @@ put qSmem 3 2048
 put qSmem 4 0
 put qSmem 5 64
 put qSmem 6 1024
-put qSmem 7 64
+put qSmem 7 0
 put qSmem 8 0
+put qSmem 9 8192
+put qSmem 10 0
 end
 
 fn qArg u uint to void
@@ -478,7 +485,7 @@ qPtr add wva 0x530000
 qPtr add wva 0x550000
 qArg 16
 qArg 8
-if not qRunOne 7 16 8 1 256 8
+if not qRunOne 7 16 8 1 32 8
 ret false
 end
 qPtr add wva 0x530000
@@ -601,7 +608,7 @@ qPtr qW 0x040000
 qPtr qW 0x060000
 qArg 1024
 qArg 8
-if not qRecord 7 16 8 1 256
+if not qRecord 7 16 8 1 32
 ret false
 end
 qPtr qW 0x040000
@@ -766,6 +773,27 @@ end
 end
 lutva = mapaddr get qLut 0
 if eq headMode 1
+note W4 block-32 two-pass exact lm_head: 0.286 GB W4 screen + Top-64 exact BF16 rescore!
+qPtr mapaddr get qLmW4 0
+qPtr mapaddr get qLmW4S 0
+qPtr qW 0x004000
+qPtr mapaddr get qLogits 0
+qArg 248320
+if not qRecord 9 7760 1 1 256
+put qFastMode 0 0
+ret false
+end
+qPtr mapaddr get qLmBf16 0
+qPtr qW 0x004000
+qPtr mapaddr get qCandIds 0
+qPtr mapaddr get qCandLog 0
+qArg 64
+if not qRecord 10 64 1 1 32
+put qFastMode 0 0
+ret false
+end
+end
+if eq headMode 2
 note FP8 two-pass screen lm_head: [248320, 2048] FP8 block-128x128
 qPtr qW 0x004000
 qPtr mapaddr get qLmFp8 0
@@ -779,7 +807,7 @@ put qFastMode 0 0
 ret false
 end
 end
-if eq headMode 2
+if eq headMode 3
 note Full 248k BF16 lm_head: [248320, 2048] BF16
 qPtr mapaddr get qLmBf16 0
 qPtr qW 0x004000
@@ -1001,8 +1029,38 @@ if le m 0
 ret false
 end
 put qLogits 0 m
-note 3 GPFIFO command packet buffers (2 MiB each)
-for s ulong 3
+note W4 block-32 lm_head [248320, 256] u32 = 254,279,680 B + scales [248320, 32] u32 = 31,784,960 B
+m = nvalloc 254279680 true
+if le m 0
+ret false
+end
+put qLmW4 0 m
+if not qFillPattern m 254279680 0x99999999
+ret false
+end
+m = nvalloc 31784960 true
+if le m 0
+ret false
+end
+put qLmW4S 0 m
+if not qFillPattern m 31784960 0x3c003c00
+ret false
+end
+m = nvalloc 4096 true
+if le m 0
+ret false
+end
+put qCandIds 0 m
+for ci ulong 64
+r = mapset m mul ci 4 4 mul ci 17
+end
+m = nvalloc 4096 true
+if le m 0
+ret false
+end
+put qCandLog 0 m
+note 4 GPFIFO command packet buffers (2 MiB each)
+for s ulong 4
 m = nvalloc 2097152 true
 if le m 0
 ret false
@@ -1060,6 +1118,9 @@ qPrint qRes1
 end
 if eq labelMode 2
 qPrint qRes2
+end
+if eq labelMode 3
+qPrint qRes3
 end
 qPrintU medUs
 qPrint qTokS
@@ -1187,7 +1248,7 @@ if not qInitWork
 rc = nvmclose
 ret 12
 end
-for slot ulong 3
+for slot ulong 4
 if not qRecordAll40 slot slot
 qPrint qSubErr
 qPrintU ulong get gbst 4
@@ -1196,7 +1257,7 @@ rc = nvmclose
 ret 13
 end
 end
-for slot ulong 3
+for slot ulong 4
 if not qBenchConfig slot slot
 rc = nvmclose
 ret 14
