@@ -8,7 +8,10 @@ const IK_TMAX ulong 512
 const IK_KV_LAYER_BYTES ulong 2097152
 const IK_KV_HALF_BYTES ulong 1048576
 const IK_SCONV_LAYER_BYTES ulong 79872
+const IK_KV_SLOT_BYTES ulong 100663296
+const IK_SCONV_SLOT_BYTES ulong 3833856
 
+global ikDSlot ulong 1
 global ikDKCode long 1
 global ikDKCodePos ulong 1
 global ikDKCodeFail uint 1
@@ -55,7 +58,7 @@ text ikDMsgNl "\n"
 text ikDDefDir "/home/drakestapleton/models/inkling-2-mini-ed40e7da"
 text ikDSufSt "/model-00001-of-00001.safetensors"
 text ikDSufTok "/tokenizer.json"
-text ikDDefPrompt "The capital of France is"
+text ikDDefPrompt "What is the capital of France? Answer in one sentence."
 
 fn ikDPrint s view uchar * to void
 w = write 1 s 0 len s
@@ -83,6 +86,18 @@ end
 
 fn ikDW off ulong to ulong
 ret add get ikDWorkVa 0 off
+end
+
+fn ikDKvVaStep step ulong to ulong
+sOff = mul get ikDSlot 0 IK_KV_SLOT_BYTES
+lOff = mul step IK_KV_LAYER_BYTES
+ret add get ikDKvVa 0 add sOff lOff
+end
+
+fn ikDScBaseStep step ulong to ulong
+sOff = mul get ikDSlot 0 IK_SCONV_SLOT_BYTES
+lOff = mul step IK_SCONV_LAYER_BYTES
+ret add 0x500000 add sOff lOff
 end
 
 fn ikDF32Bits f f32 to uint
@@ -602,7 +617,7 @@ end
 fn ikDAppendKvHead step ulong posQ ulong h ulong to void
 ikDPackKvHead h
 kv = get ikDKv 0
-kBase = mul step IK_KV_LAYER_BYTES
+kBase = add mul get ikDSlot 0 IK_KV_SLOT_BYTES mul step IK_KV_LAYER_BYTES
 hOff = add mul h mul IK_TMAX 256 mul posQ 256
 r = mapwrite kv add kBase hOff ikDOutBuf 0 256
 r = mapwrite kv add add kBase IK_KV_HALF_BYTES hOff ikDOutBuf 256 256
@@ -846,7 +861,7 @@ ikDArgU 24
 if not ikDBatchAdd 0 1 1 1 256
 ret false
 end
-scBase = add 0x500000 mul step IK_SCONV_LAYER_BYTES
+scBase = ikDScBaseStep step
 if isFull
 ikDPtr ikLva l 12
 ikDPtr ikDW 0x008000
@@ -955,7 +970,7 @@ ret false
 end
 ikDComputeRelBias l posQ
 ikDAppendKv step posQ
-kva = add get ikDKvVa 0 mul step IK_KV_LAYER_BYTES
+kva = ikDKvVaStep step
 if not ikDBatchStart
 ret false
 end
@@ -1157,7 +1172,7 @@ if not ikDBatchAdd 2 72 8 1 256
 ret false
 end
 end
-scBase = add 0x500000 mul step IK_SCONV_LAYER_BYTES
+scBase = ikDScBaseStep step
 ikDPtr ikDW 0x090000
 ikDPtr ikDW add scBase 52224
 ikDPtr ikLva l 15
@@ -1299,22 +1314,24 @@ end
 ret p
 end
 
-fn ikDInitAll to int
-dir = new uchar 256 0
-pSt = new uchar 512 0
-pTok = new uchar 512 0
-dlen = len ikDDefDir
-for i ulong dlen bound 256
-put dir i get ikDDefDir i
+fn ikDResetSlot slot ulong to void
+wk = get ikDWork 0
+for i ulong 65536
+put ikDOutBuf i 0
 end
-if ge argcnt 2
-n = argread 1 dir 0 256
-if gt n 0
-dlen = ulong n
+base = add 0x500000 mul slot IK_SCONV_SLOT_BYTES
+done = ulong 0
+while lt done IK_SCONV_SLOT_BYTES bound 128
+chunk = sub IK_SCONV_SLOT_BYTES done
+if gt chunk 65536
+chunk = ulong 65536
+end
+r = mapwrite wk add base done ikDOutBuf 0 chunk
+done = add done chunk
 end
 end
-lSt = ikDJoinPath dir dlen ikDSufSt pSt
-lTok = ikDJoinPath dir dlen ikDSufTok pTok
+
+fn ikDInitGpu nSlots ulong to int
 if not gbopen 1
 ret 10
 end
@@ -1332,16 +1349,46 @@ end
 if not ikDInitKernels
 ret 14
 end
-wk = nvalloc 16777216 true
-kv = nvalloc 100663296 true
+wk = nvalloc add 5242880 mul nSlots IK_SCONV_SLOT_BYTES true
+kv = nvalloc mul nSlots IK_KV_SLOT_BYTES true
 if or le wk 0 le kv 0
 ret 15
 end
 put ikDWork 0 wk
 put ikDWorkVa 0 mapaddr wk
-ikDWriteF32 wk 0x059000 0.002f32
+ikDWriteF32 wk 0x059000 0.05f32
 put ikDKv 0 kv
 put ikDKvVa 0 mapaddr kv
+put ikDSlot 0 0
+ret 0
+end
+
+fn ikDInitModel nSlots ulong to int
+dir = new uchar 256 0
+arg1 = new uchar 256 0
+pSt = new uchar 512 0
+pTok = new uchar 512 0
+dlen = len ikDDefDir
+for i ulong dlen bound 256
+put dir i get ikDDefDir i
+end
+if ge argcnt 2
+n = argread 1 arg1 0 256
+if gt n 0
+if ne get arg1 0 45
+dlen = ulong n
+for i ulong dlen bound 256
+put dir i get arg1 i
+end
+end
+end
+end
+lSt = ikDJoinPath dir dlen ikDSufSt pSt
+lTok = ikDJoinPath dir dlen ikDSufTok pTok
+rc = ikDInitGpu nSlots
+if ne rc 0
+ret rc
+end
 if not ikStLoadAll pSt lSt
 ret 16
 end
@@ -1349,6 +1396,15 @@ if not ikTokLoad pTok lTok
 ret 17
 end
 ret 0
+end
+
+fn ikDInitAll to int
+ret ikDInitModel 1
+end
+
+fn ikDForwardSlot slot ulong tok ulong posQ ulong needLogits bool to long
+put ikDSlot 0 slot
+ret ikDForwardToken tok posQ needLogits
 end
 
 fn ikDRunPrompt to int
@@ -1364,7 +1420,7 @@ if gt n 0
 pLen = ulong n
 end
 end
-nTok = ikTokEncode pBuf pLen pIds
+nTok = ikTokEncodeChat pBuf pLen pIds
 put ikDPromptLen 0 nTok
 ikDPrint ikDMsgPrompt
 ikDPrintU nTok
@@ -1386,8 +1442,8 @@ ikDPrint ikDMsgGen
 ikTokPrint ulong nextTok
 tGen0 = monons
 genCnt = ulong 1
-for g ulong 15 bound 64
-if eq nextTok 200006
+for g ulong 31 bound 64
+if or eq nextTok 200006 eq nextTok 200010
 break
 end
 nextTok = ikDForwardToken ulong nextTok posQ true
@@ -1411,38 +1467,4 @@ else
 ikDPrintU 0
 end
 ret 0
-end
-
-fn main to int
-ikDPrint ikDMsgBanner
-ikDPrint ikDMsgLoad
-t0 = monons
-rc0 = ikDInitAll
-if ne rc0 0
-ikDPrint ikDMsgFail
-ikDPrintU ulong rc0
-ikDPrint ikDMsgNl
-ret rc0
-end
-t1 = monons
-ikDPrint ikDMsgLoaded
-ikDPrintU ulong div sub t1 t0 1000000
-ikDPrint ikDMsgNl
-ikArbResetAll
-for i ulong 3072
-put ikDArbRes i -1
-end
-for i ulong 4
-put ikDArbStats i 0
-end
-rc1 = ikDRunPrompt
-ikDPrint ikDMsgArb
-ikDPrintU get ikDArbStats 0
-ikDPrint ikDMsgHit8
-ikDPrintU get ikDArbStats 1
-ikDPrint ikDMsgHit16
-ikDPrintU get ikDArbStats 2
-ikDPrint ikDMsgNl
-rc = nvmclose
-ret rc1
 end

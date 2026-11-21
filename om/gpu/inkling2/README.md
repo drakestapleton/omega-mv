@@ -4,8 +4,8 @@ This directory is **100% pure seeded Omega (`.om`)** — zero Python, zero C, ze
 
 - **43 SM121 cubins** (`22` baseline reference kernels in `emit.om` + `21` high-speed pipelined/fused kernels in `emit_fast.om`) plus **3 small-batch / deduplicated-MoE SM121 kernels** (`emit_batch.om`: `bf16_gemm_batch_fast`, `nvfp4_gemm_dedup_fast`, `mxfp8_gemm_dedup_fast`) implementing the complete single-stream and multi-stream (`M = 1..8`) operator set for Thinking Machines Lab's **Inkling-2-Mini** (`thinkingmachines/Inkling-2-Mini`, architecture `Inkling2LoopForConditionalGeneration`).
 - **`inkling2-native` (`native_run.om`)**: 384 KB statically linked AArch64 ELF (`ldd`: `not a dynamic executable`) that runs a **21/21** live-silicon kernel parity self-test and a **single-submit 48-logical-layer native GPFIFO** benchmark directly over `/dev/nvidia*`.
-- **`inkling2-decode` (`decoder/{safetensors,tokenizer,decode}.om`)**: 421 KB statically linked AArch64 ELF (`ldd`: `not a dynamic executable`) that loads the real 19.5 GB `model-00001-of-00001.safetensors` checkpoint (~18.3 GB text weights across 4 UVM arenas) and `tokenizer.json`, executes all 48 logical layers end-to-end on GB10 silicon, and runs **live online Arboris co-activation tracking** (`arboris/prefetch.om`) on real router outputs across all 24 transitions (including `L17 -> L6`).
-- **`inkling2-multistream` & `check-ms-server` (`emit_batch.om`, `multistream/{batcher,ms_run,serve_ms}.om`)**: statically linked AArch64 ELFs (`ldd`: `not a dynamic executable`) implementing a **zero-heap static `N = 8` paged-KV table** (`128` 64-token pages), **deduplicated cross-stream MoE expert grouping** (`B * 8 <= 64` routed slots → `U <= 64` unique experts loaded once), a **fixed-slot `N = 8` HTTP continuous batcher** (`503 server_busy` + `Retry-After: 1` only when all 8 static slots are full), and a **single-submit 48-layer multi-stream GPFIFO** benchmark (`B = 1 / 4 / 8`).
+- **`inkling2-decode` (`decoder/{safetensors,tokenizer,decode,decode-cli}.om`)**: statically linked AArch64 ELF (`ldd`: `not a dynamic executable`) that loads the real 19.5 GB `model-00001-of-00001.safetensors` checkpoint (~18.3 GB text weights across 4 UVM arenas, deinterleaving `w13` `dim=1` per HuggingFace `conversion_mapping.py`) and `tokenizer.json` (with `chat_template.jinja` special-token framing), executes all 48 logical layers end-to-end on GB10 silicon producing coherent English (`"The capital of France is Paris."`), and runs **live online Arboris co-activation tracking** (`arboris/prefetch.om`) on real router outputs across all 24 transitions (including `L17 -> L6`).
+- **`inkling2-serve`, `inkling2-multistream`, & `check-ms-server` (`emit_batch.om`, `multistream/{batcher,ms_run,serve_ms,serve_live}.om`)**: statically linked AArch64 ELFs (`ldd`: `not a dynamic executable`) implementing a **zero-heap static `N = 8` paged-KV table** (`128` 64-token pages + 8 static KV/sconv slabs), **deduplicated cross-stream MoE expert grouping** (`B * 8 <= 64` routed slots → `U <= 64` unique experts loaded once), a **live real-weight `N = 8` HTTP continuous-batching server** (`inkling2-serve`, returning `503 server_busy` + `Retry-After: 1` only when all 8 static slots are full), and a **single-submit 48-layer multi-stream GPFIFO** benchmark (`B = 1 / 4 / 8`).
 
 The seeded compiler (`seed/out/omc`) compiles `emit.om`, `emit_fast.om`, `native_run.om`, and `decoder/*.om` with the repository's SM121 encoder (`om/encoder/bw_enc_sm121.om`) and native NVRM/UVM/GPFIFO/QMD units (`gpu/nvidia/native/`). `seed/kflow/kpack.om` packs each SASS image into an SM121 `.cubin`. `lookup.om` generates the shared 272-entry FP32 decode table (`256` E4M3FN + `16` E2M1).
 
@@ -18,7 +18,8 @@ The seeded compiler (`seed/out/omc`) compiles `emit.om`, `emit_fast.om`, `native
 - **`decoder/safetensors.om`**: Pure OM-2 safetensors header parser & 4 × 5 GiB UVM arena loader (streams all 24 physical layers: `0..19` NVFP4 experts with precomputed `w_amax / outer_scale_denominator`, `20..23` per-row MXFP8 experts, BF16 attention/embed/unembed, FP32 `attn_res`, `middle_cycle_cross_pass_*`, and `controllers.{attn,k,v,mlp}`).
 - **`decoder/tokenizer.om`**: Pure OM-2 ByteLevel BPE tokenizer reading `tokenizer.json` directly (vocab decode + greedy longest-match prompt encode).
 - **`decoder/decode.om`**: Full 48-logical-layer looped forward pass (`0..5`, `3 × (6..17)` with cross-pass `Inkling2LoopMessageGate`, `18..23`, `unembed`, `logit_softcap`) with live `arboris/prefetch.om` online co-activation tracking on every layer's real routed top-8 experts.
-- **Verified on GB10 silicon** (receipt `/home/drakestapleton/yardsticks/receipts/2026-11-21-inkling2-decode-real-weights-v7.json`, quiet window `20261121T165700Z-4dcfc6`, `exit: 0`, `nvrm_errors_delta: 0`): loaded 18.3 GB checkpoint in `36.6 s`, ran 5 prompt + 15 generated tokens (`225 ms/tok` eager per-layer submit), live Arboris achieved **`43.9%` top-8 (`3302/7520`)** and **`59.2%` top-16 (`4449/7520`)** online hit rate across `940` real routing transitions. *(Note: end-to-end execution and `nvrm_errors_delta: 0` are verified; Layer-0 tensor parity against PyTorch `modeling_inkling2_loop.py` and chat-template special-token framing are the next verification step for coherent text quality.)*
+- **Verified coherent real-weight generation on GB10 silicon** (receipt `/home/drakestapleton/yardsticks/receipts/2026-11-21-inkling2-decode-coherent-v9.json`, quiet window `20261121T213420Z-50fd7d`, `exit: 0`, `nvrm_errors_delta: 0`): loaded 18.3 GB checkpoint with `w13` `dim=1` deinterleaving in `28.0 s`, answered `"What is the capital of France? Answer in one sentence."` → **`"The capital of France is Paris."`** (stopped cleanly on `<|end_message|>` at 8 tokens, `226 ms/tok` eager per-layer submit), live Arboris achieved **`43.7%` top-8 (`5587/12784`)** and **`61.8%` top-16 (`7903/12784`)** online hit rate across `1598` real routing transitions.
+- **Verified live real-weight `N = 8` multi-stream server (`inkling2-serve --self-test`)** (receipt `/home/drakestapleton/yardsticks/receipts/2026-11-21-inkling2-serve-live-multistream-v2.json`, quiet window `20261121T214320Z-54f71a`, `exit: 0`, `nvrm_errors_delta: 0`, `ldd: not a dynamic executable`): interleaved 2 real concurrent streams across static `N = 8` KV/sconv slabs (`Stream 0`: **`"The capital of France is Paris."`**, `Stream 1`: **`"2 + 2 equals 4."`**) with zero cross-talk, verified 9th concurrent admission → `503 server_busy`, and retire+reuse PASS.
 
 ## High-speed SM121 suite (`emit_fast.om`, `kernels_fast.list`)
 
@@ -45,18 +46,18 @@ Single-submit native zero-CUDA receipt: `/home/drakestapleton/yardsticks/receipt
 
 ### Multi-stream GB10 silicon throughput (`inkling2-multistream`, `M = 1 → 4 → 8`, ZERO CUDA)
 
-Multi-stream receipt: `/home/drakestapleton/yardsticks/receipts/2026-11-21-inkling2-multistream-b1-b4-b8-final.json` (exclusive quiet Spark window `20261121T183420Z-0ad544`, `exit: 0`, `nvrm_errors_delta: 4`, static AArch64 ELFs `ldd: not a dynamic executable`, static 8-slot paged-KV + `check-ms-server` PASS, `bf16_gemm_batch_fast` / `nvfp4_gemm_dedup_fast` / `mxfp8_gemm_dedup_fast` `B=8` live-silicon parity PASS, disjoint 64 MB K + 64 MB V slabs).
+Multi-stream receipt: `/home/drakestapleton/yardsticks/receipts/2026-11-21-inkling2-multistream-clean-tail.json` (exclusive quiet Spark window `20261121T212035Z-782324`, `exit: 0`, **`nvrm_errors_delta: 0`**, static AArch64 ELFs `ldd: not a dynamic executable`, static 8-slot paged-KV + `check-ms-server` PASS, `bf16_gemm_batch_fast` / `nvfp4_gemm_dedup_fast` / `mxfp8_gemm_dedup_fast` `B=8` live-silicon parity PASS with `K=1152` tail guards, disjoint 64 MB K + 64 MB V slabs).
 
 | Configuration (48 logical layers, single-submit native GPFIFO, `T_swa=1024`, `T_full=4096`) | Median step | Aggregate throughput | Per-stream | Scaling vs `B=1` |
 |---|---:|---:|---:|---:|
-| `B = 1` (`U = 8` unique experts, no unembed) | `32.93 ms` | `30.36 tok/s` | `30.36 tok/s` | `1.00×` |
-| **`B = 4` (`U = 16` unique experts, no unembed)** | **`56.03 ms`** | **`71.39 tok/s`** | `17.85 tok/s` | **`2.35×`** |
-| **`B = 8` (`U = 24` unique experts, no unembed)** | **`87.66 ms`** | **`91.26 tok/s`** | `11.41 tok/s` | **`3.01×`** |
-| `B = 1` (`U = 8` unique experts + full 201k BF16 `unembed`) | `37.65 ms` | `26.55 tok/s` | `26.55 tok/s` | `1.00×` |
-| **`B = 4` (`U = 16` unique experts + full 201k BF16 `unembed`)** | **`59.94 ms`** | **`66.73 tok/s`** | `16.68 tok/s` | **`2.51×`** |
-| **`B = 8` (`U = 24` unique experts + full 201k BF16 `unembed`)** | **`91.86 ms`** | **`87.08 tok/s`** | `10.89 tok/s` | **`3.28×`** |
+| `B = 1` (`U = 8` unique experts, no unembed) | `33.32 ms` | `30.01 tok/s` | `30.01 tok/s` | `1.00×` |
+| **`B = 4` (`U = 16` unique experts, no unembed)** | **`57.54 ms`** | **`69.51 tok/s`** | `17.38 tok/s` | **`2.32×`** |
+| **`B = 8` (`U = 24` unique experts, no unembed)** | **`90.35 ms`** | **`88.54 tok/s`** | `11.07 tok/s` | **`2.95×`** |
+| `B = 1` (`U = 8` unique experts + full 201k BF16 `unembed`) | `37.95 ms` | `26.35 tok/s` | `26.35 tok/s` | `1.00×` |
+| **`B = 4` (`U = 16` unique experts + full 201k BF16 `unembed`)** | **`61.62 ms`** | **`64.91 tok/s`** | `16.23 tok/s` | **`2.46×`** |
+| **`B = 8` (`U = 24` unique experts + full 201k BF16 `unembed`)** | **`95.02 ms`** | **`84.19 tok/s`** | `10.52 tok/s` | **`3.20×`** |
 
-Notice that sharing the 926 MB `unembed [201024, 2304]` weight matrix across all 8 streams adds only **`4.20 ms`** total (`87.66 ms -> 91.86 ms` = **`0.53 ms/stream`**).
+Notice that sharing the 926 MB `unembed [201024, 2304]` weight matrix across all 8 streams adds only **`4.67 ms`** total (`90.35 ms -> 95.02 ms` = **`0.58 ms/stream`**).
 
 ## Architecture coverage
 
@@ -85,7 +86,8 @@ Inside an authorized Spark GB10 window:
 
 ```sh
 spark-window run build/inkling2/inkling2-native                                               # 21/21 kernel parity + single-submit 48L GPFIFO (zero CUDA)
-spark-window run build/inkling2/inkling2-decode ~/models/inkling-2-mini-ed40e7da "Hello"      # real-weight 48L decoder + live Arboris (zero CUDA)
+spark-window run build/inkling2/inkling2-decode ~/models/inkling-2-mini-ed40e7da "What is the capital of France? Answer in one sentence."
+spark-window run build/inkling2/inkling2-serve --self-test                                    # live real-weight N=8 multi-stream continuous batcher (zero CUDA)
 spark-window run build/inkling2/inkling2-multistream                                          # N=8 paged-KV + dedup MoE parity + B=1/4/8 GPFIFO (zero CUDA)
 ```
 
