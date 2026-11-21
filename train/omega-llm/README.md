@@ -37,6 +37,8 @@ The [contrast-training experiment and example-checked coding chain](tools/contra
 
 The [learned coding controller](tools/controller/README.md) trains routing and second-example policies and replays the two Spark evaluations.
 
+The [instruction-and-function generator](tools/instruct/README.md) writes training records in the benchmark's prompt form, composed from parts, and leaves out every record that computes a benchmark behaviour.
+
 ## Coding benchmark
 
 The [Omega coding benchmark](tools/bench/README.md) scores a checkpoint on 165 functions it has not seen, one behaviour each, with no help from the harness. Use it, not the panels above, to decide whether a change made the model better at writing Omega. The three models scored so far, trained from scratch on this repository's Omega source, pass 0 of 159.

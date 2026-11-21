@@ -38,11 +38,15 @@ Sovereign Intelligence front-door tools, architecture/benchmark/receipt checkers
 
 ## `train/`
 
-Training, neural-network primitives and accelerator kernel labs of Sovereign Intelligence (`aien-train`, with Omega LLM (`ollm`) in `train/omega-llm/` across `aarch64`/`gb10`/`x86linux`/`x86efi`/`a64efi`/`darwin`, `omega-dnn`, `omega-blas`, `openaccel-lab`, `omega-kernel-template`), mirroring `gpu/`: pure-Omega `.om` units only, moved with full Git history (`train/import/`), gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`, 81 units). Remaining non-Omega files stay upstream (`train/NOT-YET-OMEGA.tsv`). Omega LLM is developed here since 2026-11-19, so `train/omega-llm/` also holds Omega written in this repository.
+Training, neural-network primitives and accelerator kernel labs of Sovereign Intelligence (`aien-train`, with Omega LLM (`ollm`) in `train/omega-llm/` across `aarch64`/`gb10`/`x86linux`/`x86efi`/`a64efi`/`darwin`, `omega-dnn`, `omega-blas`, `openaccel-lab`, `omega-kernel-template`), mirroring `gpu/`: pure-Omega `.om` units only, moved with full Git history (`train/import/`), gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`, 82 units). Remaining non-Omega files stay upstream (`train/NOT-YET-OMEGA.tsv`). Omega LLM is developed here since 2026-11-19, so `train/omega-llm/` also holds Omega written in this repository.
 
 ## `train/omega-llm/tools/bench/`
 
 The Omega coding benchmark of Omega LLM: `bench.om` (the tool), `tasks.om` (165 tasks, one behaviour each, with their shared inputs) and `expect.txt` (the frozen results of the references). The task set is frozen: a change to `tasks.om` or `expect.txt` makes earlier scores incomparable, and `bench check` must pass after any change. Written here, not imported.
+
+## `train/omega-llm/tools/instruct/`
+
+The instruction-and-function generator of Omega LLM: `instruct.om` writes training records (an instruction composed from parts and a function that does what it says, in the benchmark's five shapes) and, with the benchmark's `bench table`, drops every record that computes a benchmark behaviour. Written here, not imported. A change to its parts changes the records a seed gives; say so where a corpus built from it is described.
 
 ## `bench/inference_cost/`
 

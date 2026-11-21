@@ -1,10 +1,10 @@
-# train/: Pure-Omega units (81 verified units)
+# train/: Pure-Omega units (82 verified units)
 
 This layer integrates **195 pure-Omega (`.om`) files** from **5 canonical Interplane repositories** with full Git history preserved under `train/import/<repo>/`.
 
 ## Unit table and gate
 
-[`train/units.tsv`](units.tsv) lists **81 units** (`NAME` followed by ordered `.om` parts, single spaces). [`train/units-gate.om`](units-gate.om) (`OMEGA-TRAIN-UNITS`, mirroring `gpu/units-gate.om`) checks `seed/out/omc.sha256`, compiles every unit twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Every hardware row stays `NOT_RUN`. Two of the units were written in this repository rather than imported: the Omega coding benchmark tool and its task file (`train/omega-llm/tools/bench/`).
+[`train/units.tsv`](units.tsv) lists **82 units** (`NAME` followed by ordered `.om` parts, single spaces). [`train/units-gate.om`](units-gate.om) (`OMEGA-TRAIN-UNITS`, mirroring `gpu/units-gate.om`) checks `seed/out/omc.sha256`, compiles every unit twice, and requires exit 0, empty stderr and identical output bytes, plus catches the `omc-plus-one` negative control. Every hardware row stays `NOT_RUN`. Three of the units were written in this repository rather than imported: the Omega coding benchmark tool and its task file (`train/omega-llm/tools/bench/`) and the instruction-and-function generator (`train/omega-llm/tools/instruct/`).
 
 `ollm_gb10` is `ollm_aarch64` with `native/gpu/` (`context vector launch batch gk gr gb gg`) in place of `nogpu.om`: the GB10 build of Omega LLM. Upstream `build.sh` made it by renaming the CPU `main` with `sed`; here `cli.om`'s `ocmd` offers each command word to `ogcmd` first (`gpu/gg.om` on gb10, `nogpu.om` elsewhere), so the row is a plain concatenation. The gate compiles it and opens no GPU.
 

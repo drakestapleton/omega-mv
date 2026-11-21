@@ -154,7 +154,25 @@ What this run does not show:
 
 Two receipts hold every hash, window and result line: `evidence/omega-llm-gb10-loop.9cc64757bce18e0f1525a45110f492de1861cab5ebeab7bafb33bc5f8d772150.json` (the checks, base and loop) and `evidence/omega-llm-gb10-loop-deep.0aaa7af54916a38ea763418db90c2dd1f25907347df564198dbcaeecb3f3c258.json` (deep and the final window); both name source commit `688d278e`. The pre-registrations, logs and checkpoints are on the Spark under `~/work/ollm-loop-20261121/` (`gate/`, `run/`); the checkpoints are not in this repository.
 
+## A second run on a bigger corpus: prepared, not started
+
+The first run's corpus was too small, and it held almost no instruction-to-function pairs. A second corpus and run were prepared on 2026-11-21 and are held until Drake starts them. Nothing in this section has run on the chip.
+
+| Part | What it is | Size |
+| --- | --- | ---: |
+| Hand-written | Every `.om` file ever committed to any of the 121 repositories on the Spark, at most three versions of a file (newest, oldest, middle), identical files once, the benchmark folder left out: 9,498 files | 82,580,287 bytes |
+| Generated | 281,838 instruction-and-function records from [`tools/instruct`](../tools/instruct/README.md) (seeds 1 to 150), after dropping the 18,162 that compute a benchmark behaviour | 46,720,375 bytes |
+| Training text | Both parts: 48,969,891 tokens under a new 4096-token tokenizer, 30.7% of them from the records | 129,300,662 bytes |
+
+That is 4.34 times the first run's text. The hand-written part cannot grow much further: all repositories together hold 41 MB of distinct current Omega, and history adds old versions of the same files rather than new code.
+
+Two held-out sets, scored after every stop: 362 hand-written files held out by a checksum of their file name, with every version of them kept out of training (1,265,820 tokens), and 1,850 generated records from other seeds whose instruction does not occur in the training records (117,992 tokens).
+
+The arms are the first run's (base, loop, deep; one seed) for 12,000 steps, which is 4.01 passes over the training tokens against 8.09 before. At the first run's rates that is about 49, 90 and 93 minutes of chip time. The record of what will be claimed (`run/prereg.txt`, sha256 `53c43685…`) asks the same two questions as before, at step 12000 on the held-out hand-written text, and reports the benchmark for each arm. 51 of the benchmark's behaviours lie inside what the generator can say and were removed from the training records; the other 108 use loops, digits or rearrangement it cannot say.
+
+Everything is on the Spark under `~/work/ollm-corpus2-20261121/`. A `run/STOP` file keeps the driver from starting; the command to start is the last lines of `run/prereg.txt`. Each window is taken only after the chip has been idle with nobody in line for 10 minutes.
+
 ## What is not done
 
 - Per-token exit from the loop and messages between passes are not built.
-- More seeds, a corpus large enough that the arms do not overfit, and BF16 training of a looped model.
+- The second run above, more seeds, and BF16 training of a looped model.
