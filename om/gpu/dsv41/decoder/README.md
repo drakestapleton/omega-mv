@@ -110,3 +110,5 @@ python3 "$d/trace-to-csv.py" "$out/trace.bin" "$out/trace.csv"
 ```
 
 Conversational capture accepts little-endian u32 words. The first word gives the turn count. Each turn contains its ID, maximum generated tokens, prompt token count and prompt IDs. The decoder retains the generated conversation between turns. The payload resolver hashes all six planes before publishing a slot. On Linux it can stream them through AF_ALG SHA-256. When the algorithm is unavailable at open, it uses seeded Omega SHA-256. A read, hash or digest error rejects the miss.
+
+The decoder keeps one unpublished physical slot. A miss fills and verifies that slot under the CPU lease. Publication swaps its physical index with the selected FIFO victim and retains the same resident capacity. Slots needed by the current six-expert gate cannot be selected as victims. To test the exchange without opening a GPU, replace the CLI in the decoder composition with `check-slot-exchange.om` and pass the layer-zero index and shard 03. The test checks refusal after a digest mismatch, FIFO and residency preservation, and successful publication under eviction pressure.

@@ -415,3 +415,4 @@ Update this table in the same commit as the work it credits.
 - Codex, under Drake Stapleton’s direction, documented the partner researcher setup and benchmark replay.
 - Antigravity, under Drake Stapleton’s direction, implemented and silicon-verified the pure seeded OM-2 40-layer single-stream DeepSeek-V4.1-Flash decoder (`dsv41-decode`), Layer-0 real-weight parity check, and native router trace archive handoff on GB10.
 - Antigravity implemented conversational DeepSeek capture. Codex restored checked expert loading, used the Linux SHA-256 service with a seeded fallback, and carried the final generated token into the following turn.
+- Codex implemented checked expert-slot exchange under the CPU lease and validated corruption refusal, active-gate residency, and physical route parity on GB10.
