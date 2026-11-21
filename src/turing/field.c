@@ -17,6 +17,7 @@
 /* TURING Field V0 records: canonical bytes, digests, store, adapters, verify.
  * See field.h. Plain C11. */
 #include "turing/field.h"
+#include "omega_native.h"
 
 #include "algebra/realize_common.h"
 #include "omega_canonical.h"
@@ -42,11 +43,8 @@ const char *turing_reason_name(turing_reason r) {
 /* ---------------------------------------------------------------- digests */
 
 void turing_hex(const turing_digest *d, char out[65]) {
-    static const char hx[] = "0123456789abcdef";
-    for (int i = 0; i < TURING_DIGEST_BYTES; ++i) {
-        out[2 * i] = hx[d->b[i] >> 4];
-        out[2 * i + 1] = hx[d->b[i] & 15];
-    }
+    uint64_t u = 0;
+    (void)omega2_turing_om_hex(&u, d->b, TURING_DIGEST_BYTES, (uint8_t *)out, 64);
     out[64] = 0;
 }
 
@@ -58,7 +56,9 @@ void turing_hex_short(const turing_digest *d, char out[13]) {
 }
 
 int turing_digest_eq(const turing_digest *a, const turing_digest *b) {
-    return memcmp(a->b, b->b, TURING_DIGEST_BYTES) == 0;
+    uint64_t eq = 0;
+    (void)omega2_turing_om_digest_eq(&eq, a->b, TURING_DIGEST_BYTES, b->b, TURING_DIGEST_BYTES);
+    return (int)eq;
 }
 
 int turing_file_digest(const char *path, turing_digest *out) {

@@ -30,6 +30,7 @@
  * core. No filters beyond can_execute, no noise band, no receipts cited.
  */
 #include "turing/select.h"
+#include "omega_native.h"
 
 #include <inttypes.h>
 #include <math.h>
@@ -37,10 +38,10 @@
 #include <string.h>
 
 uint64_t turing_splitmix64(uint64_t *s) {
-    uint64_t z = (*s += 0x9E3779B97F4A7C15ull);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
+    uint64_t st[1] = { *s }, out = 0;
+    (void)omega2_turing_om_splitmix64(&out, st, 1);
+    *s = st[0];
+    return out;
 }
 
 /* ------------------------------------------------------------ ranking core */
@@ -54,15 +55,23 @@ void turing_bucket_reset(turing_hist_bucket *b, uint64_t n, uint64_t m, int pack
 }
 
 void turing_bucket_observe(turing_hist_bucket *b, size_t k, uint64_t cost_ps) {
-    b->count[k] += 1;
-    b->mean_ps[k] += ((double)cost_ps - b->mean_ps[k]) / (double)b->count[k];
+    uint32_t cnt[1] = { b->count[k] };
+    uint64_t mb[1] = { 0 }, u = 0;
+    memcpy(&mb[0], &b->mean_ps[k], 8);
+    (void)omega2_turing_om_bucket_observe(&u, cnt, 1, mb, 1, cost_ps);
+    b->count[k] = cnt[0];
+    memcpy(&b->mean_ps[k], &mb[0], 8);
 }
 
 int turing_rank_min_cost(const turing_hist_bucket *b, const int *allowed, size_t nspec) {
-    int best = -1;
-    for (size_t k = 0; k < nspec && k < TURING_MAX_SPECS; ++k)
-        if (allowed[k] && b->count[k] && (best < 0 || b->mean_ps[k] < b->mean_ps[best])) best = (int)k;
-    return best;
+    uint32_t alw[TURING_MAX_SPECS] = { 0 };
+    uint64_t best = UINT64_MAX;
+    size_t lim = nspec < TURING_MAX_SPECS ? nspec : TURING_MAX_SPECS;
+    for (size_t k = 0; k < lim; ++k) alw[k] = allowed[k] ? 1u : 0u;
+    (void)omega2_turing_om_rank_min_cost(&best, b->count, TURING_MAX_SPECS,
+                                         (const uint64_t *)b->mean_ps, TURING_MAX_SPECS,
+                                         alw, TURING_MAX_SPECS, nspec);
+    return best == UINT64_MAX ? -1 : (int)best;
 }
 
 /* ------------------------------------------------------------- control arm */
@@ -80,12 +89,8 @@ static turing_hist_bucket *bucket_get(turing_history *h, const turing_store *st,
     turing_bucket_reset(b, n, m, pack);
     /* Seeded Fisher-Yates over spec indices, one stream per bucket. */
     uint64_t s = h->seed ^ (n * 0x100000001B3ull) ^ (m << 20) ^ (uint64_t)pack;
-    for (size_t k = st->nspec; k > 1; --k) {
-        size_t j = (size_t)(turing_splitmix64(&s) % k);
-        uint32_t t = b->order[k - 1];
-        b->order[k - 1] = b->order[j];
-        b->order[j] = t;
-    }
+    uint64_t u = 0;
+    (void)omega2_turing_om_fisher_yates(&u, b->order, TURING_MAX_SPECS, st->nspec, s);
     return b;
 }
 
