@@ -1036,6 +1036,274 @@ fn dfResolveOne layer ulong k ulong to long
   ret 1
 end
 
+fn dfCopyExpert srcMap long srcOff ulong dstMap long dstOff ulong to bool
+  buf = new uchar 1048576 0
+  pos = ulong 0
+  while lt pos deBytes
+    n = sub deBytes pos
+    if gt n len buf
+      n = len buf
+    end
+    if ne mapread srcMap add srcOff pos buf 0 n long n
+      ret false
+    end
+    if ne mapwrite dstMap add dstOff pos buf 0 n long n
+      ret false
+    end
+    pos = add pos n
+  end
+  ret true
+end
+
+fn dfPublishFromStage layer ulong key ulong stageIdx ulong to long
+  slot = get dfSlabCfg 1
+  for i ulong 7
+    if not dfGateNeedsKey get dfSlotKey slot layer
+      break
+    end
+    slot = rem add slot 1 get dfSlabCfg 0
+  end
+  spare = get dfSlabCfg 3
+  sMap = get dwIoStage 0
+  sOff = mul stageIdx deBytes
+  dMap = get dwSlabMaps div spare 800
+  dOff = mul rem spare 800 deBytes
+  if not dfCopyExpert sMap sOff dMap dOff
+    ret -1
+  end
+  oldKey = get dfSlotKey slot
+  if ge oldKey 0
+    put dfSlotOf ulong oldKey -1
+  end
+  put dfSlabCfg 3 get dfPhysical slot
+  put dfPhysical slot spare
+  put dfSlabCfg 1 rem add slot 1 get dfSlabCfg 0
+  put dfSlotKey slot long key
+  put dfSlotOf key long slot
+  ret long slot
+end
+
+fn dfPipeRead fd int buf edit uchar * n ulong to bool
+  pos = ulong 0
+  while lt pos n
+    r = read fd buf pos sub n pos
+    if eq r -4
+      continue
+    end
+    if le r 0
+      ret false
+    end
+    pos = add pos ulong r
+  end
+  ret true
+end
+
+fn dfPipeWrite fd int buf view uchar * n ulong to bool
+  pos = ulong 0
+  while lt pos n
+    r = write fd buf pos sub n pos
+    if eq r -4
+      continue
+    end
+    if le r 0
+      ret false
+    end
+    pos = add pos ulong r
+  end
+  ret true
+end
+
+fn dfWorkerLoop idx ulong reqFd int repFd int to void
+  req = new uchar 72 0
+  desc = new uchar 64 0
+  rep = new uchar 1 0
+  stageOff = mul idx deBytes
+  while dfPipeRead reqFd req 72
+    layer = diGet req 0 8
+    for j ulong 64
+      put desc j get req add 8 j
+    end
+    put rep 0 1
+    if and lt layer 40 deVerifyAt get dfShardFD layer desc get dwIoStage 0 stageOff
+      put rep 0 0
+    end
+    if not dfPipeWrite repFd rep 1
+      exit 1
+    end
+  end
+  exit 0
+end
+
+fn dfStopWorkers to void
+  wbuf = new uchar 4 0
+  n = get dfWrActive 0
+  put dfWrActive 0 0
+  for i ulong n bound 6
+    u1 = fclose get dfWrReq i
+    u2 = fclose get dfWrRep i
+    u3 = waitpid int get dfWrPid i wbuf 0 4 0
+  end
+end
+
+fn dfClosePrevWorkers w ulong to void
+  for prev ulong w bound 6
+    u3 = fclose get dfWrReq prev
+    u4 = fclose get dfWrRep prev
+  end
+end
+
+fn dfStartOneWorker w ulong to bool
+  p1 = new uchar 8 0
+  p2 = new uchar 8 0
+  if ne pipefds p1 0 8 0 0
+    ret false
+  end
+  if ne pipefds p2 0 8 0 0
+    u1 = fclose int diGet p1 0 4
+    u2 = fclose int diGet p1 4 4
+    ret false
+  end
+  r1 = int diGet p1 0 4
+  w1 = int diGet p1 4 4
+  r2 = int diGet p2 0 4
+  w2 = int diGet p2 4 4
+  p = fork
+  if lt p 0
+    u1 = fclose r1
+    u2 = fclose w1
+    u3 = fclose r2
+    u4 = fclose w2
+    ret false
+  end
+  if eq p 0
+    u1 = fclose w1
+    u2 = fclose r2
+    dfClosePrevWorkers w
+    dfWorkerLoop w r1 w2
+  end
+  u1 = fclose r1
+  u2 = fclose w2
+  put dfWrReq w w1
+  put dfWrRep w r2
+  put dfWrPid w p
+  put dfWrActive 0 add w 1
+  ret true
+end
+
+fn dfStartWorkers to bool
+  iostg = mapnew -1 0 mul 6 deBytes 3 33
+  if le iostg 0
+    ret false
+  end
+  put dwIoStage 0 iostg
+  for w ulong 6
+    if not dfStartOneWorker w
+      dfStopWorkers
+      ret false
+    end
+  end
+  ret true
+end
+
+fn dfReadMissDescs layer ulong mIdx view ulong 6 mCount ulong descs edit uchar 384 to bool
+  desc = new uchar 64 0
+  for m ulong mCount bound 6
+    k = get mIdx m
+    eid = ulong get dfCurIds k
+    key = add mul layer 384 eid
+    if not diRead get dfSidecarFD layer desc mul eid 64 64
+      ret false
+    end
+    if or ne ulong get desc 0 add layer 3 ne ulong get desc 1 layer
+      ret false
+    end
+    if ne key add mul layer 384 diGet desc 4 4
+      ret false
+    end
+    for j ulong 64
+      put descs add mul m 64 j get desc j
+    end
+  end
+  ret true
+end
+
+fn dfDispatchWorkers layer ulong mCount ulong descs view uchar 384 to bool
+  req = new uchar 72 0
+  rep = new uchar 1 0
+  for m ulong mCount bound 6
+    diPut req 0 8 layer
+    base = mul m 64
+    for j ulong 64
+      put req add 8 j get descs add base j
+    end
+    if not dfPipeWrite get dfWrReq m req 72
+      ret false
+    end
+  end
+  allOk = true
+  for m ulong mCount bound 6
+    if or not dfPipeRead get dfWrRep m rep 1 ne get rep 0 0
+      allOk = false
+    end
+  end
+  ret allOk
+end
+
+fn dfResolveMissesParallel layer ulong mIdx view ulong 6 mCount ulong to bool
+  descs = new uchar 384 0
+  if not dfReadMissDescs layer mIdx mCount descs
+    ret false
+  end
+  tN0 = dfMonoNs
+  if not dfDispatchWorkers layer mCount descs
+    ret false
+  end
+  for m ulong mCount bound 6
+    k = get mIdx m
+    key = add mul layer 384 ulong get dfCurIds k
+    slot = dfPublishFromStage layer key m
+    if lt slot 0
+      ret false
+    end
+    put dfCurSlots k slot
+    put dfStats 1 add get dfStats 1 1
+  end
+  put dfStats 2 add get dfStats 2 sub dfMonoNs tN0
+  ret true
+end
+
+fn dfResolveGate layer ulong to long
+  mIdx = new ulong 6 0
+  mCount = ulong 0
+  for k ulong 6
+    key = add mul layer 384 ulong get dfCurIds k
+    cur = get dfSlotOf key
+    if ge cur 0
+      put dfCurSlots k cur
+      put dfStats 0 add get dfStats 0 1
+    else
+      put mIdx mCount k
+      mCount = add mCount 1
+    end
+  end
+  if eq mCount 0
+    ret 0
+  end
+  if and ge mCount 2 eq get dfWrActive 0 6
+    if not dfResolveMissesParallel layer mIdx mCount
+      ret -1
+    end
+    ret 1
+  end
+  for m ulong mCount bound 6
+    r = dfResolveOne layer get mIdx m
+    if lt r 0
+      ret -1
+    end
+  end
+  ret 1
+end
+
 fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
   rawIds = new uchar 24 0
   rawW = new uchar 24 0
@@ -1058,15 +1326,9 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
     put lWts k ewt
   end
   put times 0 dfMonoNs
-  hadMiss = false
-  for k ulong 6
-    r = dfResolveOne layer k
-    if lt r 0
-      ret false
-    end
-    if eq r 1
-      hadMiss = true
-    end
+  gr = dfResolveGate layer
+  if lt gr 0
+    ret false
   end
   put times 1 dfMonoNs
   if ne get dfSlabCfg 2 0
@@ -1077,7 +1339,7 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
       ret false
     end
   end
-  if hadMiss
+  if eq gr 1
     put frameDirty 0 1
   end
   ret true
