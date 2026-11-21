@@ -1,0 +1,120 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/interplane/v03/crossveil.om: pure-Omega port of interplane-crossveil (v0.3.0).
+note Runtime decision pipeline, RequestLedger replay/duplicate detection, exposure & session limits,
+note and negative-control fault-injection variants (V2, V4, V6) matching interplane-conformance.
+note Compose after si/directives/om2.om.
+
+const CV_DEC_AUTHORIZED ulong 0
+const CV_DEC_REQUIRES_APPROVAL ulong 1
+const CV_DEC_DENIED ulong 2
+
+const CV_EXP_TRUSTED ulong 0
+const CV_EXP_MIXED ulong 1
+const CV_EXP_UNTRUSTED ulong 2
+
+const CV_CTL_NONE ulong 0
+const CV_CTL_V2_CLAIMED_APPROVAL ulong 2
+const CV_CTL_V4_EFFECT_BYPASS ulong 4
+const CV_CTL_V6_NO_REPLAY_CHECK ulong 6
+
+const CV_ERR_OK ulong 0
+const CV_ERR_DUPLICATE_REQ ulong 1
+const CV_ERR_SESSION_LIMIT ulong 2
+const CV_ERR_UNTRUSTED_EFFECT ulong 3
+const CV_ERR_DENIED_BY_AUTHORITY ulong 4
+
+const CV_MAX_LEDGER ulong 32
+
+note RequestLedger: tracks seen request_ids in ledger[32], count in lcnt[1].
+fn cv_ledger_has ledger view ulong 32 lcnt ulong req_id ulong to bool
+if gt lcnt CV_MAX_LEDGER
+ret true
+end
+i = ulong 0
+while lt i lcnt bound 32
+if eq get ledger i req_id
+ret true
+end
+i = add i ulong 1
+end
+ret false
+end
+
+fn cv_ledger_record ledger edit ulong 32 lcnt edit ulong 1 req_id ulong to ulong
+n = get lcnt 0
+if cv_ledger_has ledger n req_id
+ret CV_ERR_DUPLICATE_REQ
+end
+if ge n CV_MAX_LEDGER
+ret CV_ERR_SESSION_LIMIT
+end
+put ledger n req_id
+put lcnt 0 add n ulong 1
+ret CV_ERR_OK
+end
+
+note Negative-control before_step hook (V6 resets ledger so replay slips through).
+fn cv_before_step ctl ulong lcnt edit ulong 1 to void
+if eq ctl CV_CTL_V6_NO_REPLAY_CHECK
+put lcnt 0 ulong 0
+end
+end
+
+note Pipeline decision step:
+note   req_id: unique request identifier
+note   is_effect: 1 if capability mutates world/spawns process, 0 if read-only
+note   exposure: CV_EXP_TRUSTED / MIXED / UNTRUSTED
+note   claims_approval: 1 if untrusted input claims pre-approval (MUST be ignored!)
+note   auth_decision: authoritative runtime decision (CV_DEC_*)
+note   ctl: negative-control variant (CV_CTL_NONE in production)
+note   Returns decision in res[0] (CV_DEC_*), reason in res[1] (CV_ERR_*).
+fn cv_pipeline_step ledger edit ulong 32 lcnt edit ulong 1 ctx view ulong 6 res edit ulong 2 to void
+req_id = get ctx 0
+is_effect = get ctx 1
+exposure = get ctx 2
+claims_app = get ctx 3
+auth_dec = get ctx 4
+ctl = get ctx 5
+
+cv_before_step ctl lcnt
+
+rc = cv_ledger_record ledger lcnt req_id
+if ne rc CV_ERR_OK
+put res 0 CV_DEC_DENIED
+put res 1 rc
+ret
+end
+
+dec = auth_dec
+rsn = CV_ERR_OK
+if eq dec CV_DEC_DENIED
+rsn = CV_ERR_DENIED_BY_AUTHORITY
+end
+
+note Exposure gate: untrusted exposure with effect capability cannot be auto-authorized
+if and eq is_effect ulong 1 eq exposure CV_EXP_UNTRUSTED
+if eq dec CV_DEC_AUTHORIZED
+dec = CV_DEC_REQUIRES_APPROVAL
+rsn = CV_ERR_UNTRUSTED_EFFECT
+end
+end
+
+note Negative-control fault injection (only active when ctl != CV_CTL_NONE):
+note V2: mistakenly honors untrusted claims_approval
+if and eq ctl CV_CTL_V2_CLAIMED_APPROVAL eq claims_app ulong 1
+if ne dec CV_DEC_AUTHORIZED
+dec = CV_DEC_AUTHORIZED
+rsn = CV_ERR_OK
+end
+end
+note V4: mistakenly auto-authorizes effect capabilities
+if and eq ctl CV_CTL_V4_EFFECT_BYPASS eq is_effect ulong 1
+if ne dec CV_DEC_AUTHORIZED
+dec = CV_DEC_AUTHORIZED
+rsn = CV_ERR_OK
+end
+end
+
+put res 0 dec
+put res 1 rsn
+end

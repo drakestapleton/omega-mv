@@ -1,0 +1,187 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/interplane/v03/aien_adapter.om: pure-Omega port of interplane-mv adapters/aien.
+note Composes AIEN's existing gates and mints nothing:
+note   - SPECS enrollment: read_file (READ_FS), list_dir (READ_FS), write_file (WORLD_MUT), bash_eval (SPAWN|WORLD_MUT)
+note   - Fail-closed decide() when aegis gate is absent
+note   - HMAC-SHA256 ApprovalBinding under DeskKey (RFC 2104 / RFC 4231)
+note   - Two-phase approval spend (reserve / commit / release) with single-use grant replay refusal
+note   - Provenance bundle digest commitment
+note Compose after si/directives/om2.om, om/tls/sha2.om, and protocol/interplane/v03/crossveil.om.
+
+const AIEN_CAP_READ_FILE ulong 1
+const AIEN_CAP_LIST_DIR ulong 2
+const AIEN_CAP_WRITE_FILE ulong 3
+const AIEN_CAP_BASH_EVAL ulong 4
+
+const AIEN_EFF_READ_FS ulong 1
+const AIEN_EFF_WORLD_MUT ulong 2
+const AIEN_EFF_SPAWN_PROC ulong 4
+
+const GRANT_UNUSED ulong 0
+const GRANT_RESERVED ulong 1
+const GRANT_SPENT ulong 2
+const GRANT_REVOKED ulong 3
+
+const AIEN_OK ulong 0
+const AIEN_ERR_UNKNOWN_CAP ulong 1
+const AIEN_ERR_GATE_UNAVAIL ulong 2
+const AIEN_ERR_BAD_MAC ulong 3
+const AIEN_ERR_GRANT_STATE ulong 4
+const AIEN_ERR_GRANT_REPLAY ulong 5
+const AIEN_ERR_GRANT_REVOKED ulong 6
+
+text aien_runtime_id "aien"
+text aien_engine_effect "aien-mcp.EffectClassAuthority"
+text aien_bind_ver "approval-binding/v1"
+
+note Capability enrollment (SPECS from adapters/aien/src/lib.rs)
+fn aien_cap_effects cap_id ulong to ulong
+if eq cap_id AIEN_CAP_READ_FILE
+ret AIEN_EFF_READ_FS
+end
+if eq cap_id AIEN_CAP_LIST_DIR
+ret AIEN_EFF_READ_FS
+end
+if eq cap_id AIEN_CAP_WRITE_FILE
+ret AIEN_EFF_WORLD_MUT
+end
+if eq cap_id AIEN_CAP_BASH_EVAL
+ret or AIEN_EFF_SPAWN_PROC AIEN_EFF_WORLD_MUT
+end
+ret ulong 0
+end
+
+note Fail-closed decide():
+note   gate_linked: 0 -> always DENIED (UNAVAILABLE); 1 -> translates AIEN gate answer.
+note   gate_allow: 1 -> AUTHORIZED (for pure read_fs) or REQUIRES_APPROVAL (for world_mut/spawn unless approved_grant=1).
+fn aien_decide cap_id ulong gate_linked ulong gate_allow ulong approved_grant ulong to ulong
+eff = aien_cap_effects cap_id
+if eq eff ulong 0
+ret CV_DEC_DENIED
+end
+if eq gate_linked ulong 0
+ret CV_DEC_DENIED
+end
+if eq gate_allow ulong 0
+ret CV_DEC_DENIED
+end
+note Pure read-only filesystem capability: AIEN gate Ok -> AUTHORIZED
+if eq eff AIEN_EFF_READ_FS
+ret CV_DEC_AUTHORIZED
+end
+note World mutation / process spawn requires an explicit AIEN-minted approval grant
+if eq approved_grant ulong 1
+ret CV_DEC_AUTHORIZED
+end
+ret CV_DEC_REQUIRES_APPROVAL
+end
+
+note --- RFC 2104 HMAC-SHA256 (for ApprovalBinding with DeskKey) ---
+fn aien_hmac_prep_key key view uchar * kblk edit uchar 64 to void
+kctx = new ulong 40 0
+kdig = new uchar 32 0
+klen = len key
+if gt klen ulong 64
+sha256_init kctx
+sha256_update kctx key
+sha256_final kctx kdig
+for i ulong 32
+put kblk i get kdig i
+end
+else
+i = ulong 0
+while lt i klen bound 64
+put kblk i get key i
+i = add i ulong 1
+end
+end
+end
+
+fn aien_hmac_inner kblk view uchar 64 msg view uchar * inner edit uchar 32 to void
+ipad = new uchar 64 0
+ictx = new ulong 40 0
+for j ulong 64
+put ipad j xor get kblk j uchar 0x36
+end
+sha256_init ictx
+sha256_update ictx ipad
+sha256_update ictx msg
+sha256_final ictx inner
+end
+
+fn aien_hmac_outer kblk view uchar 64 inner view uchar 32 mac edit uchar 32 to void
+opad = new uchar 64 0
+octx = new ulong 40 0
+for j ulong 64
+put opad j xor get kblk j uchar 0x5c
+end
+sha256_init octx
+sha256_update octx opad
+sha256_update octx inner
+sha256_final octx mac
+end
+
+fn aien_hmac_sha256 key view uchar * msg view uchar * mac edit uchar 32 to void
+kblk = new uchar 64 0
+inner = new uchar 32 0
+aien_hmac_prep_key key kblk
+aien_hmac_inner kblk msg inner
+aien_hmac_outer kblk inner mac
+end
+
+fn aien_mac_eq a view uchar 32 b view uchar 32 to bool
+diff = uchar 0
+for i ulong 32
+diff = or diff xor get a i get b i
+end
+ret eq diff uchar 0
+end
+
+note Two-phase single-use approval grant state machine (sovereign-core #260 / adapters/aien):
+note   UNUSED -> RESERVED (reserve) -> SPENT (commit)
+note   RESERVED -> UNUSED (release on aborted compose)
+note   UNUSED -> REVOKED (revoke before spend; spent grants cannot be un-spent)
+fn aien_grant_reserve st edit ulong 1 to ulong
+cur = get st 0
+if eq cur GRANT_SPENT
+ret AIEN_ERR_GRANT_REPLAY
+end
+if eq cur GRANT_REVOKED
+ret AIEN_ERR_GRANT_REVOKED
+end
+if ne cur GRANT_UNUSED
+ret AIEN_ERR_GRANT_STATE
+end
+put st 0 GRANT_RESERVED
+ret AIEN_OK
+end
+
+fn aien_grant_commit st edit ulong 1 to ulong
+cur = get st 0
+if eq cur GRANT_SPENT
+ret AIEN_ERR_GRANT_REPLAY
+end
+if ne cur GRANT_RESERVED
+ret AIEN_ERR_GRANT_STATE
+end
+put st 0 GRANT_SPENT
+ret AIEN_OK
+end
+
+fn aien_grant_release st edit ulong 1 to ulong
+cur = get st 0
+if ne cur GRANT_RESERVED
+ret AIEN_ERR_GRANT_STATE
+end
+put st 0 GRANT_UNUSED
+ret AIEN_OK
+end
+
+fn aien_grant_revoke st edit ulong 1 to ulong
+cur = get st 0
+if eq cur GRANT_SPENT
+ret AIEN_ERR_GRANT_REPLAY
+end
+put st 0 GRANT_REVOKED
+ret AIEN_OK
+end

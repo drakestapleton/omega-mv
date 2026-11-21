@@ -1,0 +1,253 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/crumb-spec/ledger.om: pure-Omega port of crumb-spec (src/ledger.rs)
+note Cryptographic BLAKE3 hash-chained ledger for archived/legacy crumb schema verification.
+note Standing rule (DRA-97 / 2026-11-08): active workflow .crumb files remain retired;
+note no .crumb files are created or read in active workflows. This unit locks the pure-Omega
+note wire/hash contract for historical/archived crumb ledger verification.
+note Compose after si/directives/om2.om and om/blake3/b3unit.om.
+
+const CRUMB_OK ulong 0
+const CRUMB_ERR_HASH_MISMATCH ulong 1
+const CRUMB_ERR_PARENT_MISMATCH ulong 2
+const CRUMB_ERR_CHRONO ulong 3
+const CRUMB_ERR_INVALID_INDEX ulong 4
+const CRUMB_ERR_MISSING_PARENT ulong 5
+const CRUMB_ERR_INVALID_GENESIS ulong 6
+const CRUMB_ERR_FULL ulong 7
+const CRUMB_ERR_OVERFLOW ulong 8
+
+const CRUMB_ACT_CREATE ulong 0
+const CRUMB_ACT_MODIFY ulong 1
+const CRUMB_ACT_DELETE ulong 2
+const CRUMB_ACT_AUDIT ulong 3
+const CRUMB_ACT_TEST ulong 4
+const CRUMB_ACT_BUILD ulong 5
+
+const CRUMB_MAX_EVENTS ulong 32
+
+text cr_domain "CRUMB_LEDGER_EVENT_V1"
+text cr_act_create "create"
+text cr_act_modify "modify"
+text cr_act_delete "delete"
+text cr_act_audit "audit"
+text cr_act_test "test"
+text cr_act_build "build"
+
+fn cr_put_u32_be dst edit uchar * pos ulong v uint to ulong
+if gt add pos ulong 4 len dst
+ret ulong 99999
+end
+put dst pos uchar and shr v uint 24 uint 255
+put dst add pos ulong 1 uchar and shr v uint 16 uint 255
+put dst add pos ulong 2 uchar and shr v uint 8 uint 255
+put dst add pos ulong 3 uchar and v uint 255
+ret add pos ulong 4
+end
+
+fn cr_put_u64_be dst edit uchar * pos ulong v ulong to ulong
+if gt add pos ulong 8 len dst
+ret ulong 99999
+end
+for i ulong 8
+sh = mul sub ulong 7 i ulong 8
+put dst add pos i uchar and shr v sh ulong 255
+end
+ret add pos ulong 8
+end
+
+fn cr_copy_bytes dst edit uchar * pos ulong src view uchar * to ulong
+n = len src
+if gt add pos n len dst
+ret ulong 99999
+end
+if gt n ulong 1024
+ret ulong 99999
+end
+i = ulong 0
+while lt i n bound 1024
+put dst add pos i get src i
+i = add i ulong 1
+end
+ret add pos n
+end
+
+fn cr_put_lp_str dst edit uchar * pos ulong src view uchar * to ulong
+p = cr_put_u32_be dst pos uint len src
+if eq p ulong 99999
+ret ulong 99999
+end
+ret cr_copy_bytes dst p src
+end
+
+fn cr_put_action dst edit uchar * pos ulong act ulong to ulong
+if eq act CRUMB_ACT_CREATE
+ret cr_put_lp_str dst pos cr_act_create
+end
+if eq act CRUMB_ACT_MODIFY
+ret cr_put_lp_str dst pos cr_act_modify
+end
+if eq act CRUMB_ACT_DELETE
+ret cr_put_lp_str dst pos cr_act_delete
+end
+if eq act CRUMB_ACT_AUDIT
+ret cr_put_lp_str dst pos cr_act_audit
+end
+if eq act CRUMB_ACT_TEST
+ret cr_put_lp_str dst pos cr_act_test
+end
+if eq act CRUMB_ACT_BUILD
+ret cr_put_lp_str dst pos cr_act_build
+end
+ret ulong 99999
+end
+
+fn cr_hash_eq a view uchar 32 b view uchar 32 to bool
+for i ulong 32
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn cr_is_zero_hash h view uchar 32 to bool
+for i ulong 32
+if ne get h i uchar 0
+ret false
+end
+end
+ret true
+end
+
+note Single-shot BLAKE3-256 over up to 1024 bytes using om/blake3/b3unit.om
+fn cr_blake3_buf data view uchar * digest edit uchar 32 to ulong
+n = len data
+if gt n ulong 1024
+ret CRUMB_ERR_OVERFLOW
+end
+st = new ulong 448 0
+blk = new uchar 1024 0
+i = ulong 0
+while lt i n bound 1024
+put blk i get data i
+i = add i ulong 1
+end
+omb3 st blk n ulong 1 digest
+ret CRUMB_OK
+end
+
+note Encode canonical LedgerEvent preimage matching crumb-spec src/ledger.rs:
+note   "CRUMB_LEDGER_EVENT_V1" || be64(index) || be64(timestamp) ||
+note   be32(len(agent)) || agent || be32(len(action)) || action ||
+note   be32(len(target)) || target || be32(len(intent)) || intent ||
+note   payload_hash[32] || parent_hash[32]
+note Split into two helpers to respect 6-parameter-slot limit.
+fn cr_event_preimage_head buf edit uchar 1024 idx ulong ts ulong act ulong agent view uchar * to ulong
+p = cr_copy_bytes buf ulong 0 cr_domain
+if eq p ulong 99999
+ret ulong 99999
+end
+p = cr_put_u64_be buf p idx
+if eq p ulong 99999
+ret ulong 99999
+end
+p = cr_put_u64_be buf p ts
+if eq p ulong 99999
+ret ulong 99999
+end
+p = cr_put_lp_str buf p agent
+if eq p ulong 99999
+ret ulong 99999
+end
+ret cr_put_action buf p act
+end
+
+fn cr_event_preimage_tail buf edit uchar 1024 pos ulong target view uchar * intent view uchar * to ulong
+p = cr_put_lp_str buf pos target
+if eq p ulong 99999
+ret ulong 99999
+end
+ret cr_put_lp_str buf p intent
+end
+
+fn cr_event_finalize buf edit uchar 1024 pos ulong ph view uchar 32 par view uchar 32 dig edit uchar 32 to ulong
+p = cr_copy_bytes buf pos ph
+if eq p ulong 99999
+ret CRUMB_ERR_OVERFLOW
+end
+p = cr_copy_bytes buf p par
+if eq p ulong 99999
+ret CRUMB_ERR_OVERFLOW
+end
+st = new ulong 448 0
+omb3 st buf p ulong 1 dig
+ret CRUMB_OK
+end
+
+note Verify an event chain stored in parallel arrays:
+note   indices[n], timestamps[n], hashes[n*32], parents[n*32], recomputed[n*32]
+note   Each slot i has 32 bytes at offset i*32.
+fn cr_copy_slot32 flat view uchar 1024 idx ulong dst edit uchar 32 to void
+base = mul idx ulong 32
+for i ulong 32
+put dst i get flat add base i
+end
+end
+
+fn cr_put_slot32 flat edit uchar 1024 idx ulong src view uchar 32 to void
+base = mul idx ulong 32
+for i ulong 32
+put flat add base i get src i
+end
+end
+
+fn cr_verify_chain_meta count ulong indices view ulong 32 timestamps view ulong 32 hashes view uchar 1024 parents view uchar 1024 to ulong
+if gt count CRUMB_MAX_EVENTS
+ret CRUMB_ERR_FULL
+end
+hcur = new uchar 32 0
+hprev = new uchar 32 0
+pcur = new uchar 32 0
+i = ulong 0
+while lt i count bound 32
+if ne get indices i i
+ret CRUMB_ERR_INVALID_INDEX
+end
+cr_copy_slot32 parents i pcur
+if eq i ulong 0
+if not cr_is_zero_hash pcur
+ret CRUMB_ERR_INVALID_GENESIS
+end
+else
+prev_i = sub i ulong 1
+cr_copy_slot32 hashes prev_i hprev
+if not cr_hash_eq pcur hprev
+ret CRUMB_ERR_PARENT_MISMATCH
+end
+if lt get timestamps i get timestamps prev_i
+ret CRUMB_ERR_CHRONO
+end
+end
+i = add i ulong 1
+end
+ret CRUMB_OK
+end
+
+fn cr_verify_parent count ulong ev_idx ulong ev_parent view uchar 32 hashes view uchar 1024 to ulong
+if eq ev_idx ulong 0
+if not cr_is_zero_hash ev_parent
+ret CRUMB_ERR_INVALID_GENESIS
+end
+ret CRUMB_OK
+end
+par_i = sub ev_idx ulong 1
+if ge par_i count
+ret CRUMB_ERR_MISSING_PARENT
+end
+exp = new uchar 32 0
+cr_copy_slot32 hashes par_i exp
+if not cr_hash_eq ev_parent exp
+ret CRUMB_ERR_PARENT_MISMATCH
+end
+ret CRUMB_OK
+end
