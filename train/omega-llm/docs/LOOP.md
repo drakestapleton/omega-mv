@@ -140,7 +140,7 @@ What this run does not show:
 - Anything about a 16-layer model at equal compute (29,995,392 parameters). That arm is prepared and waits for the chip behind other work; it was not run when this was written.
 - CPU `eval` against chip `geval` on the trained checkpoints. The CPU side is done (first 64 held-out windows: base 2.409293, loop 2.354518); the chip side waits in the same queue. The same comparison held exactly in the checks above.
 
-The pre-registrations, logs and checkpoints are on the Spark under `~/work/ollm-loop-20261121/` (`gate/`, `run/`); the checkpoints are not in this repository.
+The receipt of the checks and of this run, with every hash, window and result line, is `evidence/omega-llm-gb10-loop.9cc64757bce18e0f1525a45110f492de1861cab5ebeab7bafb33bc5f8d772150.json` (source commit `688d278e`). The pre-registrations, logs and checkpoints are on the Spark under `~/work/ollm-loop-20261121/` (`gate/`, `run/`); the checkpoints are not in this repository.
 
 ## What is not done
 
