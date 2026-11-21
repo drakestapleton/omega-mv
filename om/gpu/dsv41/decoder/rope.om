@@ -1,0 +1,192 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Precompute interleaved FP32 (cos, sin) RoPE tables for context 20480.
+note Base table: theta=10000, no YaRN (layers 0, 1, 37, 38, 39).
+note Compressed table: theta=160000, YaRN factor=16, beta_fast=32, beta_slow=1,
+note original_max_position_embeddings=65536 (layers 2..36).
+fn drPi to f64
+  ret bitcast f64 ulong 0x400921fb54442d18
+end
+fn drTwoPi to f64
+  ret bitcast f64 ulong 0x401921fb54442d18
+end
+fn drHalfPi to f64
+  ret bitcast f64 ulong 0x3ff921fb54442d18
+end
+fn drLn2 to f64
+  ret bitcast f64 ulong 0x3fe62e42fefa39ef
+end
+
+fn drExp x f64 to f64
+  k = long 0
+  r = x
+  while gt r drLn2 bound 2000
+    r = sub r drLn2
+    k = add k 1
+  end
+  while lt r neg drLn2 bound 2000
+    r = add r drLn2
+    k = sub k 1
+  end
+  term = f64 1.0f64
+  acc = f64 1.0f64
+  for i ulong 20
+    term = div mul term r f64 add i 1
+    acc = add acc term
+  end
+  while gt k 0 bound 2000
+    acc = mul acc 2.0f64
+    k = sub k 1
+  end
+  while lt k 0 bound 2000
+    acc = mul acc 0.5f64
+    k = add k 1
+  end
+  ret acc
+end
+
+fn drLn x f64 to f64
+  v = x
+  k = long 0
+  while ge v 2.0f64 bound 2000
+    v = mul v 0.5f64
+    k = add k 1
+  end
+  while lt v 1.0f64 bound 2000
+    v = mul v 2.0f64
+    k = sub k 1
+  end
+  y = div sub v 1.0f64 add v 1.0f64
+  y2 = mul y y
+  p = y
+  acc = f64 0.0f64
+  for i ulong 24
+    denom = f64 add mul i 2 1
+    acc = add acc div p denom
+    p = mul p y2
+  end
+  ret add mul 2.0f64 acc mul f64 k drLn2
+end
+
+fn drCosR r f64 to f64
+  r2 = mul r r
+  term = f64 1.0f64
+  acc = f64 1.0f64
+  for i ulong 10
+    d1 = f64 mul add i 1 2
+    d0 = sub d1 1.0f64
+    term = div mul neg term r2 mul d0 d1
+    acc = add acc term
+  end
+  ret acc
+end
+
+fn drSinR r f64 to f64
+  r2 = mul r r
+  term = r
+  acc = r
+  for i ulong 10
+    d1 = f64 mul add i 1 2
+    d2 = add d1 1.0f64
+    term = div mul neg term r2 mul d1 d2
+    acc = add acc term
+  end
+  ret acc
+end
+
+fn drCosSin angle f64 pair edit f64 2 to void
+  q = long div angle drTwoPi
+  r = sub angle mul f64 q drTwoPi
+  if gt r drPi
+    r = sub r drTwoPi
+  end
+  if lt r neg drPi
+    r = add r drTwoPi
+  end
+  signC = f64 1.0f64
+  if gt r drHalfPi
+    r = sub drPi r
+    signC = neg 1.0f64
+  end
+  if lt r neg drHalfPi
+    r = sub neg drPi r
+    signC = neg 1.0f64
+  end
+  put pair 0 mul signC drCosR r
+  put pair 1 drSinR r
+end
+
+fn drPutF32 buf edit uchar * off ulong v f32 to void
+  u = bitcast uint v
+  for j ulong 4
+    put buf add off j uchar and shr u uint mul j 8 255
+  end
+end
+
+fn drYarnBounds theta f64 bounds edit f64 2 to void
+  lnTheta = drLn theta
+  lowV = div mul 64.0f64 drLn div 65536.0f64 mul 32.0f64 drTwoPi mul 2.0f64 lnTheta
+  highV = div mul 64.0f64 drLn div 65536.0f64 drTwoPi mul 2.0f64 lnTheta
+  lowI = long lowV
+  if lt lowV f64 lowI
+    lowI = sub lowI 1
+  end
+  if lt lowI 0
+    lowI = 0
+  end
+  highI = long highV
+  if gt highV f64 highI
+    highI = add highI 1
+  end
+  if gt highI 63
+    highI = 63
+  end
+  put bounds 0 f64 lowI
+  put bounds 1 f64 highI
+end
+
+fn drComputeFreqs freqs edit f64 32 theta f64 yarn bool to void
+  bounds = new f64 2 0.0f64
+  lnTheta = drLn theta
+  if yarn
+    drYarnBounds theta bounds
+  end
+  low = get bounds 0
+  span = sub get bounds 1 low
+  if lt span 0.001f64
+    span = 0.001f64
+  end
+  for j ulong 32
+    baseF = drExp div mul neg f64 mul j 2 lnTheta 64.0f64
+    if yarn
+      ramp = div sub f64 j low span
+      if lt ramp 0.0f64
+        ramp = 0.0f64
+      end
+      if gt ramp 1.0f64
+        ramp = 1.0f64
+      end
+      smooth = sub 1.0f64 ramp
+      baseF = add mul div baseF 16.0f64 sub 1.0f64 smooth mul baseF smooth
+    end
+    put freqs j baseF
+  end
+end
+
+fn drFillTable mem long dest ulong theta f64 yarn bool to bool
+  freqs = new f64 32 0.0f64
+  pair = new f64 2 0.0f64
+  row = new uchar 256 0
+  drComputeFreqs freqs theta yarn
+  for pos ulong 20480
+    for j ulong 32
+      ang = mul f64 pos get freqs j
+      drCosSin ang pair
+      drPutF32 row mul j 8 f32 get pair 0
+      drPutF32 row add mul j 8 4 f32 get pair 1
+    end
+    if ne mapwrite mem add dest mul pos 256 row 0 256 256
+      ret false
+    end
+  end
+  ret true
+end

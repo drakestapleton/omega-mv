@@ -1,0 +1,212 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Offline tensor index. Each 160-byte record names a shard, a dtype,
+note dimensions and an absolute file extent. Source header pinning precedes
+note every descriptor. No lookup treats a file offset as a virtual address.
+text dsOffsets "data_offsets"
+text dsShape "shape"
+text dsType "dtype"
+
+fn diString src view uchar 261440 tape view uint 200000 key ulong outrec edit uchar 160 off ulong to bool
+  limit = ulong 15
+  if eq off 56
+    limit = 103
+  end
+  width = js_span tape key
+  if or lt width 3 gt sub width 2 limit
+    ret false
+  end
+  ret diCopy src add 1 js_off tape key sub width 2 outrec off
+end
+
+fn diCopy src view uchar 261440 pos ulong width ulong outrec edit uchar 160 off ulong to bool
+  for i ulong width
+    c = get src add pos i
+    if or lt c 32 or gt c 126 eq c 92
+      ret false
+    end
+    put outrec add off i c
+  end
+  ret true
+end
+
+fn diField src view uchar 261440 tape view uint 200000 obj ulong name view uchar * to ulong
+  k = js_first tape obj
+  while ne k jsnone
+    if js_streq src js_off tape k name
+      ret add k 1
+    end
+    k = js_mnext tape k
+  end
+  ret jsnone
+end
+
+fn diValue src view uchar 261440 tape view uint 200000 t ulong to ulong
+  if ne js_type tape t jsnum
+    ret 18446744073709551615
+  end
+  off = js_off tape t
+  if not js_isu src off
+    ret 18446744073709551615
+  end
+  ret js_imag src off
+end
+
+fn diShape src view uchar 261440 tape view uint 200000 obj ulong outrec edit uchar 160 to bool
+  t = diField src tape obj dsShape
+  if ne js_type tape t jsarr
+    ret false
+  end
+  rank = js_nkids tape t
+  if gt rank 4
+    ret false
+  end
+  put outrec 2 uchar rank
+  item = js_first tape t
+  for i ulong rank bound 4
+    v = diValue src tape item
+    if gt v 0xffffffff
+      ret false
+    end
+    diPut outrec add 24 mul i 4 4 v
+    item = js_enext tape item
+  end
+  t = diField src tape obj dsType
+  if ne js_type tape t jsstr
+    ret false
+  end
+  ret diString src tape t outrec 40
+end
+
+fn diExtent src view uchar 261440 tape view uint 200000 obj ulong bounds view ulong 3 outrec edit uchar 160 to bool
+  t = diField src tape obj dsOffsets
+  if or ne js_type tape t jsarr ne js_nkids tape t 2
+    ret false
+  end
+  item = js_first tape t
+  lo = diValue src tape item
+  hi = diValue src tape js_enext tape item
+  if or gt lo hi gt hi sub get bounds 1 get bounds 0
+    ret false
+  end
+  diPut outrec 8 8 add get bounds 0 lo
+  diPut outrec 16 8 sub hi lo
+  ret true
+end
+
+fn diEmit src view uchar 261440 tape view uint 200000 key ulong bounds view ulong 3 to bool
+  outrec = new uchar 160 0
+  put outrec 0 uchar get bounds 2
+  if not diString src tape key outrec 56
+    ret false
+  end
+  obj = add key 1
+  if ne js_type tape obj jsobj
+    ret false
+  end
+  if not diShape src tape obj outrec
+    ret false
+  end
+  if not diExtent src tape obj bounds outrec
+    ret false
+  end
+  used = ulong 0
+  while lt used 160
+    n = write 1 outrec used sub 160 used
+    if eq n -4
+      continue
+    end
+    if le n 0
+      ret false
+    end
+    used = add used ulong n
+  end
+  ret true
+end
+
+fn diCheckHeader src view uchar * shard ulong count ulong to bool
+  for i ulong count
+    put sh_dat i get src i
+  end
+  sh_all count
+  pos = mul sub shard 1 64
+  for i ulong 32
+    v = uint get sh_dig i
+    if ne get dsHeaderPins add pos mul i 2 sh_hexd shr v 4
+      ret false
+    end
+    if ne get dsHeaderPins add pos add mul i 2 1 sh_hexd and v 15
+      ret false
+    end
+  end
+  ret true
+end
+
+fn diShard fd int shard ulong to bool
+  size = fseek fd 0 2
+  if ne size long dsFileBytes shard
+    ret false
+  end
+  prefix = new uchar 8 0
+  if not diRead fd prefix 0 8
+    ret false
+  end
+  count = ulong 0
+  for i ulong 8
+    count = or count shl ulong get prefix i mul i 8
+  end
+  src = new uchar 261440 0
+  tape = new uint 200000 0
+  if or eq count 0 gt count len src
+    ret false
+  end
+  if not diRead fd src 8 count
+    ret false
+  end
+  if not diCheckHeader src shard count
+    ret false
+  end
+  if ne js_init tape count 64 0
+    ret false
+  end
+  if lt js_parse src tape count 0
+    ret false
+  end
+  bounds = new ulong 3 0
+  put bounds 0 add count 8
+  put bounds 1 ulong size
+  put bounds 2 shard
+  key = js_first tape 0
+  while ne key jsnone
+    if not diEmit src tape key bounds
+      ret false
+    end
+    key = js_mnext tape key
+  end
+  ret true
+end
+
+fn main to int
+  if ne argcnt 49
+    ret 64
+  end
+  path = new uchar 4096 0
+  for i ulong 48
+    shard = add i 1
+    n = argread shard path 0 4096
+    if le n 0
+      ret 64
+    end
+    fd = fopen path 0 ulong n 524288 0
+    if lt fd 0
+      ret 66
+    end
+    ok = diShard int fd shard
+    if ne fclose int fd 0
+      ret 74
+    end
+    if not ok
+      ret 65
+    end
+  end
+  ret 0
+end
