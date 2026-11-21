@@ -3,6 +3,8 @@ note Native SM121 sparse hop over six owned arena maps. Enter on the serialized
 note dispatcher after the producer drops its writable aliases. The supervisor
 note owns the capability-table mapping, authenticated subject and fencing.
 note Return zero only after both the QMD release and the post-flush WFI marker.
+note Query specialization (prefix size, hop count). Zero hops means the v1 kernel.
+global ar_wave_spec ulong 2
 global ar_code_nodes ulong 1
 global ar_code_planes ulong 1
 global ar_code_bytes ulong 1
@@ -85,8 +87,11 @@ fn ar_step_close to bool
   put ar_fenced_seq 0 0
   put ar_code_model 0 0
   put ar_code_bytes 0 0
+  put ar_wave_spec 0 0
+  put ar_wave_spec 1 0
   put ar_code_nodes 0 0
   put ar_code_planes 0 0
+  ar_drop_compute
   ret true
 end
 
@@ -145,6 +150,63 @@ fn ar_step_open m view ulong 16 to bool
     end
   end
   ret ar_install_code m code size
+end
+
+note Multi-hop calls compute a single explicitly bounded query result. Its
+note specialized binary digest binds the hop count in the signed claim.
+fn ar_open_query m view ulong 16 leaves ulong hops ulong to bool
+  if or ne get m 0 arboris_sparse_magic ne get m 4 1
+    ret false
+  end
+  if or not ar_snapshot_matches m or eq hops 0 gt leaves get m 1
+    ret false
+  end
+  if ne get m 3 0
+    if gt hops div 0xffffffffffffffff mul get m 3 get m 2
+      ret false
+    end
+  end
+  code = new uchar 16384 0
+  size = ulong 0
+  if eq leaves get m 1
+    size = arboris_emit_persistent leaves hops code
+  else
+    note The maximum row cursor after its final 32-wide stride fits a uint.
+    if or ne hops 1 gt get m 3 0xffffffdf
+      ret false
+    end
+    size = arboris_emit_hubs get m 1 leaves code
+  end
+  if not ar_install_code m code size
+    ret false
+  end
+  put ar_wave_spec 0 leaves
+  put ar_wave_spec 1 hops
+  ret true
+end
+
+fn ar_query_geometry shape view ulong 7 slots view ulong 20 b edit uint 236 q1 edit uint 96 to bool
+  m = new ulong 16 0
+  for i ulong 5
+    put m i get slots mul i 2
+  end
+  n = get shape 1
+  leaves = get ar_wave_spec 0
+  put m 8 128
+  put m 9 1
+  put m 11 get shape 3
+  put m 12 40
+  if eq n leaves
+    put m 10 1
+    put m 13 mul n 8
+  else
+    put m 10 add div add leaves 127 128 div add sub n leaves 3 4
+  end
+  if ne bw_qmd1 m q1 0
+    ret false
+  end
+  put b 220 u32lo get m 10
+  ret eq bw_qmd_verify q1 0
 end
 
 fn ar_step_slots s edit ulong 20 to void
@@ -213,6 +275,11 @@ fn ar_step_pack shape view ulong 7 slots view ulong 20 planes ulong to bool
   if ne rc 0
     ret false
   end
+  if ne get ar_wave_spec 1 0
+    if not ar_query_geometry shape slots b q1
+      ret false
+    end
+  end
   ret ar_native_packet slots b q0 q1
 end
 
@@ -238,12 +305,18 @@ fn ar_sparse_header m view ulong 16 to bool
 end
 
 note Slab 4 words 6 and 7 are the channel sequence and device completion.
-note Emit the two halves of sequence before publishing status, after gbtail's
-note L2 flush. No CTA can declare completion on behalf of the other CTAs.
-fn ar_release_receipt va ulong seq ulong to void
-  gbrel add va 48 gblo seq
-  gbrel add va 52 gbhi seq
-  gbrel add va 56 6
+note The work QMD has already passed the post-flush WFI point. Publish the
+note 16-byte sequence/status record with inline DMA, then flush and release
+note the private completion marker. The host must observe both before sealing.
+const ar_receipt_complete uint 1095914034
+fn ar_release_receipt va ulong seq ulong marker ulong to void
+  gbdma add va 48 4
+  gbemit gblo seq
+  gbemit gbhi seq
+  gbemit 6
+  gbemit 0
+  gbflush
+  gbrel add marker 32 ar_receipt_complete
 end
 
 fn ar_device_receipt tok long seq ulong to bool
@@ -265,6 +338,9 @@ fn ar_step_send to bool
   if ne mapset mark 0 4 0 0
     ret false
   end
+  if ne mapset mark 32 4 0 0
+    ret false
+  end
   if ne mapset mark 16 4 0 0
     ret false
   end
@@ -279,7 +355,7 @@ fn ar_step_send to bool
     ret false
   end
   seq = add get nvput 0 1
-  ar_release_receipt mapaddr tok seq
+  ar_release_receipt mapaddr tok seq mapaddr mark
   bytes = get gbused 0
   if ne mapwrite get gbmem 0 0 gbcmd 0 bytes long bytes
     ret false
@@ -287,7 +363,7 @@ fn ar_step_send to bool
   if not nvsend get gbmem 0 0 uint div bytes 4
     ret false
   end
-  if not nvwait tok 56 6 5000000000
+  if not nvwait mark 32 ar_receipt_complete 5000000000
     ret false
   end
   if or not ar_device_receipt tok seq ne mapget mark 16 4 1179010630
@@ -301,7 +377,7 @@ fn ar_step_send to bool
   ret true
 end
 
-fn ar_sparse_hop table long subject ulong h view ulong 2 m view ulong 16 decay ulong threshold ulong to ulong
+fn ar_sparse_locked table long subject ulong h view ulong 2 m view ulong 16 decay ulong threshold ulong to ulong
   if not caproot_validate table subject h m
     ret 1
   end
@@ -335,4 +411,41 @@ fn ar_sparse_hop table long subject ulong h view ulong 2 m view ulong 16 decay u
   end
   ar_record_fence subject h m or decay shl threshold 32
   ret 0
+end
+
+note Acquire before CSR validation. If the queue may still own resources,
+note only retirement and settlement or teardown can release this lease.
+fn ar_sparse_dispatch table long subject ulong h view ulong 2 m view ulong 16 decay ulong threshold ulong to ulong
+  if ne get ar_fenced_seq 0 0
+    ret 7
+  end
+  if not ar_claim_compute 2
+    ret 8
+  end
+  rc = ar_sparse_locked table subject h m decay threshold
+  if and ne rc 0 eq get nvret 0 get nvput 0
+    ar_drop_compute
+  end
+  ret rc
+end
+
+fn ar_sparse_hop table long subject ulong h view ulong 2 m view ulong 16 decay ulong threshold ulong to ulong
+  if ne get ar_wave_spec 1 0
+    ret 2
+  end
+  ret ar_sparse_dispatch table subject h m decay threshold
+end
+
+note spec words are requested leaves, hops and the FP32 decay bits.
+fn ar_sparse_query table long subject ulong h view ulong 2 m view ulong 16 spec view ulong 3 to ulong
+  if eq get spec 1 0
+    ret 2
+  end
+  if ne get spec 1 get ar_wave_spec 1
+    ret 2
+  end
+  if ne get spec 0 get ar_wave_spec 0
+    ret 2
+  end
+  ret ar_sparse_dispatch table subject h m get spec 2 0
 end

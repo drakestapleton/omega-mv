@@ -13,6 +13,9 @@ fn probe_model_meta m edit ulong 16 to void
   put m 4 probe_dim
   put m 5 4
   put m 10 mul 56 probe_dim
+  if eq probe_layout 3
+    put m 10 arboris_q4_bytes m
+  end
 end
 
 fn gated_topology words edit uint 34 to void
@@ -46,6 +49,28 @@ fn gv_test_half i ulong slab ulong to ulong
     ret 0x3800
   end
   row = div i probe_dim
+  if eq probe_layout 3
+    if lt row 9
+      if eq and i 3 0
+        ret 0x3b00
+      end
+      if eq and i 3 1
+        ret 0xb500
+      end
+      ret 0x3700
+    end
+    if and ge row 18 lt row 23
+      if eq rem i 5 0
+        ret 0x5140
+      end
+      if eq rem i 5 1
+        ret 0x4f80
+      end
+      if eq rem i 5 2
+        ret 0x4780
+      end
+    end
+  end
   if lt row 9
     ret 0x3800
   end
@@ -56,6 +81,24 @@ fn gv_test_half i ulong slab ulong to ulong
     ret 0x3800
   end
   ret 0x3c00
+end
+
+fn gv_fill_packed m view ulong 16 tok long to bool
+  src = new ushort 7392 0
+  packed = new uint 3700 0
+  for j ulong mul 28 probe_dim
+    put src j ushort gv_test_half j 2
+  end
+  words = div get m 10 4
+  if not arboris_pack_q4_params m part src 0 mul 28 probe_dim part packed 0 words
+    ret false
+  end
+  for j ulong words
+    if ne mapset tok mul j 4 4 ulong get packed j 0
+      ret false
+    end
+  end
+  ret true
 end
 
 fn probe_fill m view ulong 16 i ulong tok long to bool
@@ -74,6 +117,9 @@ fn probe_fill m view ulong 16 i ulong tok long to bool
         ret false
       end
     end
+  end
+  if and eq probe_layout 3 eq i 2
+    ret gv_fill_packed m tok
   end
   if or eq i 2 eq i 3
     pairs = mul 14 probe_dim
@@ -119,7 +165,106 @@ fn gv_expected m view ulong 16 offsets view ulong 6 expected edit ushort 1320 to
   ret 0
 end
 
+note Independent fixture: block peak 7/8 makes quantization step 1/8.
+note Both ties (-2.5, 3.5) round to even. Rebuild the canonical input
+note separately, then compare each output with exact and experimental math.
+fn gv_exact_fixture storage edit ushort * desc view ulong 16 exact edit ushort 1320 to void
+  for i ulong mul 28 probe_dim
+    put storage add get desc 9 i ushort gv_test_half i 2
+  end
+  for i ulong mul 5 probe_dim
+    put storage add get desc 13 i ushort gv_test_half i 3
+  end
+  for i ulong mul 5 probe_dim
+    put exact i ushort ag_coordinate storage desc div i probe_dim rem i probe_dim
+  end
+end
+
+fn gv_quant_coordinate storage view ushort * desc view ulong 16 i ulong coeff view uint 64 to ushort
+  soma = div i probe_dim
+  dim = rem i probe_dim
+  prev = ag_load storage desc 13 soma dim
+  g = arboris_cubic_gate mul prev ag_load storage desc 11 soma dim coeff
+  val = fmax f32 0 mul ag_sum storage desc soma dim ag_load storage desc 12 soma dim
+  ret ushort narrow bitsof fma g val mul sub f32 1 g prev 10 15 31
+end
+
+fn gv_quant_fixture storage edit ushort * desc view ulong 16 approx edit ushort 1320 to void
+  coeff = new uint 64 0
+  arboris_cubic_table coeff
+  for i ulong mul 9 probe_dim
+    k = and i 3
+    if ne k 0
+      bits = ushort 0x3800
+      if eq k 1
+        bits = ushort 0xb400
+      end
+      put storage add get desc 9 i bits
+    end
+  end
+  for i ulong mul 5 probe_dim
+    put approx i gv_quant_coordinate storage desc i coeff
+  end
+end
+
+fn gv_profile_reference m view ulong 16 exact edit ushort 1320 approx edit ushort 1320 to bool
+  fp = new ulong 16 0
+  off = new ulong 6 0
+  desc = new ulong 16 0
+  storage = new ushort 28672 0
+  for i ulong 16
+    put fp i get m i
+  end
+  put fp 10 mul 56 probe_dim
+  if ne arboris_plan_arena fp 1048576 4096 off 0
+    ret false
+  end
+  if not ag_layout fp off div get fp 12 2 4096 desc
+    ret false
+  end
+  gv_copy_extent storage get ar_maps 1 div get off 1 2 34
+  gv_exact_fixture storage desc exact
+  gv_quant_fixture storage desc approx
+  ret true
+end
+
+text gv_changed "changed_fp16_elements="
+text gv_error "max_abs_error_fp32_bits="
+fn gv_result_half i ulong to ulong
+  word = mapget get ar_maps 4 mul div i 2 4 4
+  ret and shr word mul and i 1 16 65535
+end
+fn gv_check_profile m view ulong 16 to int
+  exact = new ushort 1320 0
+  approx = new ushort 1320 0
+  if not gv_profile_reference m exact approx
+    ret 36
+  end
+  changed = ulong 0
+  worst = f32 0
+  for i ulong mul 5 probe_dim
+    half = gv_result_half i
+    if ne half ulong get approx i
+      probe_log ps_mismatch i
+      probe_log ps_expected ulong get approx i
+      probe_log ps_actual half
+      ret 38
+    end
+    if ne half ulong get exact i
+      changed = add changed 1
+      worst = fmax worst fabs sub f32of f16to32 half f32of f16to32 ulong get exact i
+    end
+  end
+  probe_log ps_halves mul 5 probe_dim
+  probe_log gv_changed changed
+  probe_log gv_error bitsof worst
+  ret 0
+end
+
 fn gv_check_output m view ulong 16 offsets view ulong 6 to int
+  if eq probe_layout 3
+    ret gv_check_profile m
+  end
   ref = new ushort 1320 0
   rc = gv_expected m offsets ref
   if ne rc 0
@@ -152,13 +297,13 @@ fn probe_run table long h view ulong 2 m edit ulong 16 to int
   if ne rc 0
     ret rc
   end
-  if not ar_gated_open m 4
+  if not ar_gated_open_profile m 4 eq probe_layout 3
     ret 22
   end
   if not probe_arm_signer table m h 0
     ret 47
   end
-  hop = ar_gated_hop table 42 h m
+  hop = ar_gated_profile_hop table 42 h m eq probe_layout 3
   probe_log ps_rc hop
   if ne hop 0
     ret 23
@@ -228,7 +373,15 @@ fn probe_reference to int
   end
   changed = mapset get ar_maps 1 104 4 0x1000000
   ref = new ushort 1320 0
-  rc = gv_expected m offsets ref
+  exact = new ushort 1320 0
+  rc = int 0
+  if eq probe_layout 3
+    if not gv_profile_reference m exact ref
+      ret 36
+    end
+  else
+    rc = gv_expected m offsets ref
+  end
   if ne rc 0
     ret rc
   end

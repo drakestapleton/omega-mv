@@ -1,0 +1,86 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Adapter for the layer-zero pack replay ABI. Scores are the settled
+note logical FP32 score plane; a node maps to one expert or 0xffffffff.
+note Aggregate duplicate mappings by maximum score. Zero scores never issue
+note I/O. Lower expert ID breaks exact ties. A caller controls its I/O budget
+note via the number of 2-word records in outbuf. -1 rejects invalid input.
+fn ar_select_experts peak edit uint 384 outbuf edit uint * to long
+  for slot ulong div len outbuf 2 bound 384
+    best = ulong 0
+    for id ulong 384
+      if gt get peak id get peak best
+        best = id
+      end
+    end
+    if eq get peak best 0
+      ret long slot
+    end
+    put outbuf mul slot 2 3
+    put outbuf add 1 mul slot 2 uint best
+    put peak best 0
+  end
+  ret long div len outbuf 2
+end
+
+fn ar_vote_expert peak edit uint 384 id uint score uint to bool
+  if gt score 0x3f800000
+    ret false
+  end
+  if ne id 0xffffffff
+    if ge id 384
+      ret false
+    end
+    if gt score get peak ulong id
+      put peak ulong id score
+    end
+  end
+  ret true
+end
+
+fn arboris_expert_hints scores view uint * experts view uint * outbuf edit uint * to long
+  if or ne len scores len experts ne and len outbuf 1 0
+    ret long -1
+  end
+  if or gt len scores 0xffffffff gt len outbuf 768
+    ret long -1
+  end
+  peak = new uint 384 0
+  for i ulong len scores bound 0xffffffff
+    id = get experts i
+    score = get scores i
+    if not ar_vote_expert peak id score
+      ret long -1
+    end
+  end
+  ret ar_select_experts peak outbuf
+end
+
+note Send advisory records to the existing read-ring consumer. The demand
+note path retains its authority over the actual experts used for inference.
+fn arboris_send_hints fd int records view uint * count ulong to bool
+  if or gt count 384 gt count div len records 2
+    ret false
+  end
+  b = new uchar 8 0
+  for i ulong count bound 384
+    pos = mul i 2
+    if or ne get records pos 3 ge get records add pos 1 384
+      ret false
+    end
+  end
+  for i ulong count bound 384
+    expert = get records add 1 mul i 2
+    put b 0 3
+    put b 4 uchar and expert 255
+    put b 5 uchar shr expert 8
+    sent = ulong 0
+    while lt sent 8 bound 8
+      n = write fd b sent sub 8 sent
+      if le n 0
+        ret false
+      end
+      sent = add sent ulong n
+    end
+  end
+  ret true
+end
