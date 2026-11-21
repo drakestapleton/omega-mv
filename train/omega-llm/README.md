@@ -37,6 +37,14 @@ The [contrast-training experiment and example-checked coding chain](tools/contra
 
 The [learned coding controller](tools/controller/README.md) trains routing and second-example policies and replays the two Spark evaluations.
 
+## Coding benchmark
+
+The [Omega coding benchmark](tools/bench/README.md) scores a checkpoint on 165 functions it has not seen, one behaviour each, with no help from the harness. Use it, not the panels above, to decide whether a change made the model better at writing Omega. No model has been scored on it yet.
+
+## Looped core
+
+`ollm init` can make some layers a core that runs several times with the same weights. See [the loop and its checks](docs/LOOP.md). It runs on the CPU only, and no looped model has been trained on real data.
+
 ## Units
 
 Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`); `build.sh` has no Darwin target, so the `ollm_darwin` row follows upstream `tests/omegallm/ollm_metrics_bench.py` (`darwin-arm64`):

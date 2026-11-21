@@ -26,7 +26,18 @@ note  stride) 33 GF 34 SB (first virtual index of bank B) 35 LA (first layer in 
 note  in ow 37 gf in ow 38 LAA (first layer in the activation windows) 39 AW (activation window
 note  base) 48 the layer staged in the parameter window (L: none)
 note  40 seed S 41 step 42 TOTAL 43 lr bits 44 G (gradient blocks) 45 K (workers)
-note  46 checkpoint magic of the run (1 OLLMCK01, 2 OLLMCK02)
+note  46 checkpoint magic of the run (1 OLLMCK01, 2 OLLMCK02, 3 OLLMCK03)
+note  56 LV (layer applications) 57 LP 58 LC 59 NP (the loop, below) 60 set by a command that runs
+note  looped checkpoints, before it loads one (ckpt.om refuses a looped one otherwise, exit 17)
+note The loop (docs/LOOP.md): L stays the number of parameter layers. With NP > 1 the LC layers from
+note layer LP (the core) are applied NP times in a row with the same weights, between the LP
+note layers before them (the prelude) and the L - LP - LC after them (the coda), so a sequence
+note passes LV = L + LC (NP - 1) layer applications. Application l runs parameter layer olp l.
+note Activations, attention probabilities, the decode's row cache and the two activation banks are
+note per application (oahin, opar, oaflip, okvkv take l); parameters and their gradients are per
+note parameter layer (opg1 .. opw2 take the parameter layer, ovg1 .. ovw2 take l). Every gradient
+note write adds, so a core weight's gradient is the sum over its NP applications. NP 0 or 1 is no
+note loop: LV = L, olp l = l, and every result has the bits it had before the loop existed.
 note Per layer activations (T rows of width D unless noted): HIN, A, Q, K, U, O, HMID, BN, S1[T],
 note S2[T], FP[T][F] (pre-relu), RL[T][F]. Every sum runs over its index ascending.
 note Sizes at the CONTRACT-V2 maxima (V 4096, T 256, D 384, H 16, F 1536, L 8), Wolfram:
@@ -248,6 +259,9 @@ put og 11 0
 put og 12 u
 put og 13 0
 put og 29 mul mul get og 3 t t
+if not oglv
+ret false
+end
 u = mul t d
 put og 14 oastr u
 if not ogwb
@@ -263,7 +277,45 @@ end
 if gt mul 3 p ocsinit
 ret false
 end
-ret le mul get og 5 get og 29 OPAN
+ret le mul get og 56 get og 29 OPAN
+end
+
+note the layer applications og[56] from L and the loop og[57 .. 59]; false when the core is empty,
+note does not fit in the L layers, or runs more passes than the attention pool has rows for
+fn oglv to bool
+ll = get og 5
+np = get og 59
+if le np 1
+put og 56 ll
+ret true
+end
+lc = get og 58
+if or eq lc 0 gt np OPAN
+ret false
+end
+if gt add get og 57 lc ll
+ret false
+end
+put og 56 add ll mul lc sub np 1
+ret true
+end
+
+note the parameter layer that layer application l runs
+fn olp l ulong to ulong
+np = get og 59
+if le np 1
+ret l
+end
+lp = get og 57
+if lt l lp
+ret l
+end
+lc = get og 58
+j = sub l lp
+if lt j mul lc np
+ret add lp rem j lc
+end
+ret sub l mul lc sub np 1
 end
 
 note parameter banks: v2 layout when P <= OWC, else LA layers in bank A, the window and gf after
@@ -299,7 +351,7 @@ end
 note activation banks: v2 layout when END <= OAC, else LAA layers, two windows, then HF and the
 note backward temporaries
 fn ogab td ulong to bool
-ll = get og 5
+ll = get og 56
 st = get og 14
 put og 38 ll
 put og 39 mul ll st
@@ -405,6 +457,32 @@ fn opw2 l ulong to ulong
 ret add opw1 l mul get og 2 get og 4
 end
 
+note parameter offsets of layer application l
+fn ovg1 l ulong to ulong
+ret opg1 olp l
+end
+fn ovwq l ulong to ulong
+ret opwq olp l
+end
+fn ovwk l ulong to ulong
+ret opwk olp l
+end
+fn ovwv l ulong to ulong
+ret opwv olp l
+end
+fn ovwo l ulong to ulong
+ret opwo olp l
+end
+fn ovg2 l ulong to ulong
+ret opg2 olp l
+end
+fn ovw1 l ulong to ulong
+ret opw1 olp l
+end
+fn ovw2 l ulong to ulong
+ret opw2 olp l
+end
+
 note activation offsets of layer l (layers from LAA in the two windows at AW)
 fn oahin l ulong to ulong
 if lt l get og 38
@@ -448,9 +526,9 @@ end
 fn oarl l ulong to ulong
 ret add oafp l mul get og 1 get og 4
 end
-note output rows of layer l: the next layer's HIN, or HF after the last layer
+note output rows of layer application l: the next one's HIN, or HF after the last
 fn oaout l ulong to ulong
-if lt add l 1 get og 5
+if lt add l 1 get og 56
 ret oahin add l 1
 end
 ret get og 15
@@ -877,7 +955,7 @@ end
 end
 
 fn olayf l ulong to void
-ostw l
+ostw olp l
 for t ulong get og 9
 olayf1 l t
 end
@@ -898,10 +976,10 @@ fn olayf1 l ulong t ulong to void
 d = get og 2
 r = mul t d
 a = add oaa l r
-frms add oahin l r opg1 l a add oas1 l t
-kvm a opwq l add oaq l r d d
-kvm a opwk l add oak l r d d
-kvm a opwv l add oau l r d d
+frms add oahin l r ovg1 l a add oas1 l t
+kvm a ovwq l add oaq l r d d
+kvm a ovwk l add oak l r d d
+kvm a ovwv l add oau l r d d
 end
 
 note row t: h += o.wo; b = rms(h, g2); out = h + relu(b.w1).w2
@@ -910,15 +988,15 @@ d = get og 2
 f = get og 4
 r = mul t d
 hm = add oahm l r
-kvm add oao l r opwo l hm d d
+kvm add oao l r ovwo l hm d d
 kadd3 hm add oahin l r hm d
-frms hm opg2 l add oabn l r add oas2 l t
+frms hm ovg2 l add oabn l r add oas2 l t
 fp = add oafp l mul t f
-kvm add oabn l r opw1 l fp d f
+kvm add oabn l r ovw1 l fp d f
 rl = add oarl l mul t f
 krelu rl fp f
 ou = add oaout l r
-kvm rl opw2 l ou f d
+kvm rl ovw2 l ou f d
 kadd3 ou hm ou d
 end
 
@@ -1003,7 +1081,7 @@ fn ofwd b ulong to f64
 put okv 0 0
 put ogkm 1 b
 oemb b
-for l ulong get og 5
+for l ulong get og 56
 olayf l
 end
 ret ohead b
@@ -1041,7 +1119,7 @@ put ogkm 1 0
 ct = get og 9
 nr = sub ct t0
 okvemb t0 nr
-for l ulong get og 5
+for l ulong get og 56
 okvlay l t0 nr
 end
 okvend ct
@@ -1076,7 +1154,7 @@ end
 
 note olayf l for rows t0 .. t0 + nr - 1
 fn okvlay l ulong t0 ulong nr ulong to void
-ostw l
+ostw olp l
 okvkv l 0 t0 false
 for i ulong nr
 olayf1 l add t0 i
@@ -1142,20 +1220,27 @@ dh = add get og 19 r
 brms hf get og 33 add get og 16 t dz dh
 end
 
+note Mutant l (the w2 gradient of a layer application that repeats an earlier parameter layer is
+note dropped, so a core w2 gets only the gradient of its first pass): 1 in the product, 0 in the
+note mutant, which gcheck on a looped checkpoint must catch. Without a loop the two are the same.
+const OMUTL ulong 1
+
 note FFN backward of row t of layer l; DH[t] holds d(out) and gains the rms2 path
 fn offb l ulong t ulong to void
 f = get og 4
 dh = add get og 19 mul t get og 2
 df = add get og 26 mul t f
 ozero df f
-kvta dh opw2 l df f get og 2
+kvta dh ovw2 l df f get og 2
 if eq get ogkm 0 0
 kdrelu df add oafp l mul t f f
 else
 ogmask df l t
 end
-g2 = add get og 10 opw2 l
+g2 = add get og 10 ovw2 l
+if or eq OMUTL 1 eq olp l l
 kger add oarl l mul t f dh g2 f get og 2
+end
 offb2 l t df
 end
 
@@ -1171,14 +1256,14 @@ end
 fn offb2 l ulong t ulong df ulong to void
 d = get og 2
 r = mul t d
-g1 = add get og 10 opw1 l
+g1 = add get og 10 ovw1 l
 kger add oabn l r df g1 d get og 4
 da = add get og 20 r
 ozero da d
-kvta df opw1 l da d get og 4
+kvta df ovw1 l da d get og 4
 hm = add oahm l r
 dh = add get og 19 r
-brms hm opg2 l add oas2 l t da dh
+brms hm ovg2 l add oas2 l t da dh
 end
 
 note dp[j] = dO[t].u[j] (head n) into TMP; returns sum_j p[j] dp[j]
@@ -1267,7 +1352,7 @@ ret div mul pj u fsqrt f64 get og 7
 end
 
 fn olayb l ulong to void
-ostw l
+ostw olp l
 oaflip l false
 ct = get og 9
 for t ulong ct
@@ -1298,8 +1383,8 @@ r = mul t d
 dor = add get og 24 r
 dh = add get og 19 r
 ozero dor d
-kvta dh opwo l dor d d
-kger add oao l r dh add get og 10 opwo l d d
+kvta dh ovwo l dor d d
+kger add oao l r dh add get og 10 ovwo l d d
 end
 
 note da = dq.wq^T + dk.wk^T + du.wv^T; weight gradients; DH[t] gains the rms1 path
@@ -1308,9 +1393,9 @@ d = get og 2
 r = mul t d
 da = add get og 20 r
 ozero da d
-kvta add get og 21 r opwq l da d d
-kvta add get og 22 r opwk l da d d
-kvta add get og 23 r opwv l da d d
+kvta add get og 21 r ovwq l da d d
+kvta add get og 22 r ovwk l da d d
+kvta add get og 23 r ovwv l da d d
 olayb3 l t
 end
 
@@ -1319,12 +1404,12 @@ d = get og 2
 r = mul t d
 a = add oaa l r
 g0 = get og 10
-kger a add get og 21 r add g0 opwq l d d
-kger a add get og 22 r add g0 opwk l d d
-kger a add get og 23 r add g0 opwv l d d
+kger a add get og 21 r add g0 ovwq l d d
+kger a add get og 22 r add g0 ovwk l d d
+kger a add get og 23 r add g0 ovwv l d d
 hi = add oahin l r
 dh = add get og 19 r
-brms hi opg1 l add oas1 l t add get og 20 r dh
+brms hi ovg1 l add oas1 l t add get og 20 r dh
 end
 
 note backward pass of sequence b after ofwd b; sc = 1/(T B) scales dl so the gradient is that of
@@ -1335,7 +1420,7 @@ ozero get og 19 mul ct get og 2
 for t ulong ct
 ohbwd b t sc
 end
-ll = get og 5
+ll = get og 56
 fl = get ofzlay 0
 for i ulong sub ll fl
 olayb sub sub ll 1 i

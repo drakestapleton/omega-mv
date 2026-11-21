@@ -4,8 +4,9 @@ note [test=1]`, an OpenAI-compatible HTTP/1.1 server for a v1 BPE checkpoint (V 
 note 127.0.0.1:PORT only. aarch64 only: build.sh composes it under one `om2` line after the
 note omega-mv e5b32567 units net/http.om, net/json.om and net/jsonw.om (vendored unmodified); the
 note other targets take noserve.om. It prints `PORT n`, then serves one request at a time, one
-note request per connection (Connection: close), until MAXCONN connections (default 1000000) have
-note been served. A connection is served once its first bytes arrive; a silent one waits in one
+note request per connection (Connection: close), with no connection limit; MAXCONN (1 or more,
+note for tests) makes it leave after that many connections.
+note A connection is served once its first bytes arrive; a silent one waits in one
 note of 8 pending slots and is closed unanswered 10 s after its accept (svwait). tplmax=N
 note (256 .. 983040, default 65536) caps the chat template in bytes; test=1 enables the test-only
 note members ollm_test_output and ollm_test_delay_ms (refused otherwise).
@@ -20,13 +21,18 @@ note Request: messages (non-empty array of objects with a string role of at most
 note content that is a string, null, or an array of {"type":"text","text":string} parts joined
 note with no separator; other part types are 400; content may be absent beside tool_calls),
 note optional max_tokens or max_completion_tokens (1 .. 999999), temperature (0 .. 2 without
-note exponent, used to 0.001; default 1), seed (unsigned, default 1), top_k (integer -1 ..
+note exponent, used to 0.001; default 1), seed (unsigned; absent or null: a fresh seed for each
+note request, svseed), top_k (integer -1 ..
 note 999999; -1, 0 and K >= V are off), top_p (0 <= p <= 1 without exponent, used to 0.000001;
 note 0 keeps only the most probable token, 1 is off), stop (null, a string or an array of at most
 note 8 strings of 1 .. 128 bytes), tools (array of at most 128
-note {"type":"function","function":{"name":1 .. 64 bytes, ...}}), tool_choice ("none", "auto",
-note "required" or a {"type":"function"} object), stream,
-note stream_options.include_usage and n (only 1). Other members (model, ...) are ignored.
+note {"type":"function","function":{"name":1 .. 64 bytes, ...}}), tool_choice ("none" or "auto";
+note "required" and a {"type":"function"} object are 400: nothing here can force a call), stream,
+note stream_options.include_usage and n (only 1). Members that would change the output and are
+note not implemented are 400 unless they carry their default (svscal3): response_format other
+note than {"type":"text"}, a non-empty logit_bias, logprobs true, top_logprobs, frequency_penalty
+note or presence_penalty other than 0, parallel_tool_calls false, functions and function_call.
+note Other members (model, user, ...) are ignored.
 note Interim chat template (until DRA-123 fixes one shared template): when tools is non-empty,
 note `tools: ` and the request's tools JSON text as sent, then `\n`; then `role: content\n` for
 note each message in order, an assistant's tool_calls appended to its content as
@@ -156,7 +162,15 @@ text sktout "ollm_test_output"
 text sktdel "ollm_test_delay_ms"
 text sknone "none"
 text svauto "auto"
-text svreq "required"
+text skrfmt "response_format"
+text sklbias "logit_bias"
+text sklogp "logprobs"
+text sktlogp "top_logprobs"
+text skfpen "frequency_penalty"
+text skppen "presence_penalty"
+text skptc "parallel_tool_calls"
+text skfuncs "functions"
+text skfcall "function_call"
 text svollm "ollm"
 text svasst "assistant"
 text svcc "chat.completion"
@@ -209,13 +223,14 @@ text sem18 "stop must be null, a string or an array of at most 8 strings of 1 to
 text sem19 "top_k must be an integer from -1 to 999999 (-1 and 0 turn it off)"
 text sem20 "top_p must be a number from 0 to 1 without exponent (resolution 0.000001; 0 keeps only the most probable token)"
 text sem21 "tools must be an array of at most 128 {\"type\":\"function\",\"function\":{\"name\":string of 1 to 64 bytes}} objects"
-text sem22 "tool_choice must be \"none\", \"auto\", \"required\" or a {\"type\":\"function\"} object"
+text sem22 "tool_choice must be null, \"none\" or \"auto\"; \"required\" and a {\"type\":\"function\"} object are refused because this server cannot force a tool call"
 text sem23 "tool_calls must be an array of {\"function\":{\"name\":string,\"arguments\":string or object}} objects"
 text sem24 "ollm_test_output (a string of at most 16384 bytes) and ollm_test_delay_ms (0 to 10000) need a server started with test=1"
 text sem25 "the request body has over 65532 JSON tokens (values, keys and closers), the JSON parser's limit"
 text sem26 "prompt must be a non-empty string"
 text sem27 "stream is not supported on /v1/completions: send stream false or leave it out"
 text sem28 "messages, tools and tool_choice belong to /v1/chat/completions; /v1/completions takes prompt"
+text sem29 "not supported here: response_format other than text, logit_bias, logprobs, top_logprobs, frequency_penalty, presence_penalty, parallel_tool_calls false, functions, function_call; leave them out or send their defaults"
 text sem11a "prompt is "
 text sem11b " tokens including the start token; the context window is "
 text sem11c " tokens, so no room is left for output"
@@ -591,6 +606,9 @@ end
 if eq e 28
 ret svmcat wb p z sem28
 end
+if eq e 29
+ret svmcat wb p z sem29
+end
 ret p
 end
 
@@ -743,7 +761,10 @@ hl = ulong 112
 if eq get og 46 2
 hl = 120
 end
-hn = oprd 3 0 0 120
+if eq get og 46 3
+hl = 144
+end
+hn = oprd 3 0 0 144
 if lt hn hl
 exit 10
 end
@@ -1595,7 +1616,9 @@ end
 ret 19
 end
 
-note svtchoi: the tool_choice value v; "none" turns tool-call detection off
+note svtchoi: the tool_choice value v; "none" turns tool-call detection off, "auto" keeps it.
+note "required" and the {"type":"function"} object would have to force a call, which this server
+note cannot do, so they are refused (22) rather than answered with free text.
 fn svtchoi bd edit uchar 983040 tp edit uint 262144 v ulong sv edit ulong 64 to ulong
 ty = js_type tp v
 if eq ty 10
@@ -1607,22 +1630,103 @@ if js_streq bd o sknone
 put sv 31 0
 ret 0
 end
-if or js_streq bd o svauto js_streq bd o svreq
+if js_streq bd o svauto
 ret 0
+end
 end
 ret 22
 end
-if eq ty 1
+
+note svnzero: whether the number lexeme bd[o, o + n) is zero (every digit before an exponent is 0)
+fn svnzero bd edit uchar 983040 o ulong n ulong to bool
+for i ulong n
+c = ulong get bd add o i
+if or eq c 101 eq c 69
+ret true
+end
+if and ge c 49 le c 57
+ret false
+end
+end
+ret true
+end
+
+note svnoop: whether value v of an unimplemented member asks for nothing. null always does; md 1
+note false; 2 true; 3 a number equal to 0; 4 an empty object; 5 an object whose "type" is "text"
+fn svnoop bd edit uchar 983040 tp edit uint 262144 v ulong md ulong to bool
+ty = js_type tp v
+if eq ty 10
+ret true
+end
+if eq md 1
+ret eq ty 9
+end
+if eq md 2
+ret eq ty 8
+end
+if eq md 3
+if ne ty 7
+ret false
+end
+ret svnzero bd js_off tp v js_span tp v
+end
+if ne ty 1
+ret false
+end
+if eq md 4
+ret eq js_nkids tp v 0
+end
+if ne md 5
+ret false
+end
 t = svmem bd tp v sktype
-if ne t jsnone
-if eq js_type tp t 6
-if js_streq bd js_off tp t skfunc
+if eq t jsnone
+ret false
+end
+if ne js_type tp t 6
+ret false
+end
+ret js_streq bd js_off tp t sktext
+end
+
+note svunsm: the svnoop mode of the unimplemented member whose key is at bd[o ..): 0 it is not
+note one; 1 .. 5 as svnoop; 6 only null is accepted
+fn svunsm bd edit uchar 983040 o ulong to ulong
+if js_streq bd o sklogp
+ret 1
+end
+if js_streq bd o skptc
+ret 2
+end
+if or js_streq bd o skfpen js_streq bd o skppen
+ret 3
+end
+if js_streq bd o sktlogp
+ret 3
+end
+if js_streq bd o sklbias
+ret 4
+end
+if js_streq bd o skrfmt
+ret 5
+end
+if or js_streq bd o skfuncs js_streq bd o skfcall
+ret 6
+end
 ret 0
 end
+
+note svscal3: a member that would change the output and is not implemented is refused (29)
+note unless it carries its default, so a client never gets an answer that ignored its request
+fn svscal3 bd edit uchar 983040 tp edit uint 262144 k ulong to ulong
+md = svunsm bd js_off tp k
+if eq md 0
+ret 0
 end
+if svnoop bd tp add k 1 md
+ret 0
 end
-end
-ret 22
+ret 29
 end
 
 note svtest: a test-only member (key k), refused unless the server runs with test=1
@@ -1696,12 +1800,20 @@ end
 ret 0
 end
 
+note svseed: the seed state of a request that names none: the wall clock mixed with the request
+note count, so two requests with the same body draw differently. A request's own seed replaces it
+note (svscal), and only that is reproducible.
+fn svseed sv edit ulong 64 to ulong
+t = bitcast ulong realns
+ret smx xor t mul add get sv 9 1 11400714819323198485
+end
+
 note svreset: a request's options to their defaults
 fn svreset sv edit ulong 64 to void
 put sv 0 0
 put sv 1 999999
 put sv 2 1000
-put sv 3 1
+put sv 3 svseed sv
 put sv 4 0
 put sv 5 0
 for i ulong 12
@@ -1739,6 +1851,9 @@ end
 e = svscal bd tp k sv
 if eq e 0
 e = svscal2 bd tp k wb sv
+end
+if eq e 0
+e = svscal3 bd tp k
 end
 if ne e 0
 ret e
@@ -2394,15 +2509,17 @@ ret and lt r 0 and ne r -11 ne r -4
 end
 
 note svside: serve the connections svwait yields (the first wait up to tmo ns, then without waiting;
-note at most 9 per call) with svside2
+note at most 9 per call) with svside2. Each pass takes a connection and serves it, so none is ever
+note taken from svwait and left unserved.
 fn svside bd edit uchar 983040 sv edit ulong 64 tmo long to void
-c = svwait sv tmo
+t = tmo
 for k ulong 9
+c = svwait sv t
 if lt c 0
 ret
 end
 svside2 c bd sv
-c = svwait sv 0
+t = long 0
 end
 end
 
@@ -2706,9 +2823,10 @@ end
 ret v
 end
 
-note svcli: the options after MERGES: [MAXCONN] (first only), tplmax=N, test=1; MAXCONN
+note svcli: the options after MERGES: [MAXCONN] (first only), tplmax=N, test=1; MAXCONN, or
+note 2^64 - 1 when none was given: the width of the connection count, not a limit anyone reaches
 fn svcli sv edit ulong 64 na ulong to ulong
-mx = ulong 1000000
+mx = ulong 18446744073709551615
 for j ulong sub na 5
 i = add j 5
 n = oargp i
@@ -2748,7 +2866,7 @@ end
 sv = new ulong 64 0
 put sv 23 65536
 mx = svcli sv na
-ockload 3
+ockloop 3
 v = get og 0
 obload 4 v
 ochipup
@@ -2773,15 +2891,13 @@ end
 oputu port
 oputc 10
 oflush
+note nc counts served connections; it reaches mx only when MAXCONN was given
 nc = ulong 0
-for j ulong 999999999
+while lt nc mx bound 9223372036854775807
 c = svwait sv 60000000000
 if ge c 0
 svconn c cs io bd wb sv
 nc = add nc 1
-if ge nc mx
-break
-end
 end
 end
 y = fclose int lf

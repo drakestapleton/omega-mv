@@ -6,18 +6,23 @@ note ock, hashes each chunk (FNV-1a 64) and writes it at its file position throu
 note unit (ocwopen, ocwput, ocwend; lio.om writes PATH.tmp, fsync, rename; eio.om the file in
 note place), then writes the header at position 0. A load reads the header and then the payload in
 note chunks through oprd into opw, hashing and decoding into the pools in one pass.
-note CK01 header 112 bytes (FNV at 104); CK02 120 bytes (G at 104, FNV at 112); GR01 112 bytes, step
-note field = B, one payload. Largest file at the v3 maxima: 120 + 24 P with P = 29995392 (Wolfram:
-note 120+24*29995392 -> 719889528); a file over OCKCAP = 719889529 bytes is refused with 15 before its
-note header is read, as v0 refused a file over its image (exactly OCKCAP bytes goes to the header
-note checks, then 15).
+note CK01 header 112 bytes (FNV at 104); CK02 120 bytes (G at 104, FNV at 112); CK03 144 bytes (G at
+note 104, the loop LP, LC, NP at 112, 120, 128, FNV at 136; docs/LOOP.md); GR01 112 bytes, step
+note field = B, one payload. A model with a loop (NP > 1) is always CK03 and a CK03 file always
+note has NP > 1, so a model without a loop keeps its CK01 or CK02 bytes. Largest file at the v3
+note maxima: 144 + 24 P with P = 29995392 (Wolfram: 144+24*29995392 -> 719889552); a file over
+note OCKCAP = 719889553 bytes is refused with 15 before its header is read, as v0 refused a file
+note over its image (exactly OCKCAP bytes goes to the header checks, then 15).
 note Magic as a little-endian u64 (Wolfram FromDigits[Reverse[ToCharacterCode["OLLMCK01"]],256]
-note -> 3544415659172318287; "OLLMGR01" -> 3544423372933581903; "OLLMCK02" -> 3616473253210246223).
+note -> 3544415659172318287; "OLLMGR01" -> 3544423372933581903; "OLLMCK02" -> 3616473253210246223;
+note "OLLMCK03" -> 3688530847248174159).
 note Load refusals (exit codes): 10 file shorter than its header or than header + 24 P, 11 bad magic,
-note 12 a shape zero or over the maximum, V < 256, D mod H != 0, TOTAL > 999999, or (CK02) G = 0,
-note G > B or B mod G != 0, 13 P disagrees with the shapes, 14 FNV-1a mismatch, 15 file longer than
-note header + 24 P; 70 I/O.
-const OCKCAP ulong 719889529
+note 12 a shape zero or over the maximum, V < 256, D mod H != 0, TOTAL > 999999, (CK02, CK03) G = 0,
+note G > B or B mod G != 0, or (CK03) NP < 2, LC = 0, LP + LC > L or a loop the pools cannot hold,
+note 13 P disagrees with the shapes, 14 FNV-1a mismatch, 15 file longer than header + 24 P, 17 a
+note CK03 file given to a command that does not run loops (it loads with ockload, not ockloop);
+note 70 I/O.
+const OCKCAP ulong 719889553
 const OCKC ulong 65536
 global ock uchar 524288
 
@@ -143,21 +148,34 @@ end
 ret h
 end
 
-note write checkpoint (params, m, v) to argv[ai] with the loaded or initialised magic (og 46)
+note write checkpoint (params, m, v) to argv[ai]: OLLMCK03 when the model has a loop (og 59 > 1),
+note else with the loaded or initialised magic (og 46)
 fn ocksave ai ulong to void
 ocwopen ai
 hl = ulong 112
 if eq get og 46 2
 hl = 120
 end
+if gt get og 59 1
+hl = 144
+end
 h = ocbody 0 3 hl
+if eq hl 112
+ochead 3544415659172318287 get og 41
+ocput8 104 h
+end
 if eq hl 120
 ochead 3616473253210246223 get og 41
 ocput8 104 get og 44
 ocput8 112 h
-else
-ochead 3544415659172318287 get og 41
-ocput8 104 h
+end
+if eq hl 144
+ochead 3688530847248174159 get og 41
+ocput8 104 get og 44
+ocput8 112 get og 57
+ocput8 120 get og 58
+ocput8 128 get og 59
+ocput8 136 h
 end
 ocwput 0 hl
 ocwend ai
@@ -173,32 +191,60 @@ ocwput 0 112
 ocwend ai
 end
 
+note load the checkpoint named by argv[ai] for a command that runs loops (train, eval, sample,
+note grad, gcheck, tune, kvcmp, serve on the CPU)
+fn ockloop ai ulong to void
+put og 60 1
+ockload ai
+end
+
+note the magic mg of a checkpoint header: its length (112, 120 or 144) and og 46; exit 11 otherwise
+fn ockmag mg ulong to ulong
+if eq mg 3544415659172318287
+put og 46 1
+ret 112
+end
+if eq mg 3616473253210246223
+put og 46 2
+ret 120
+end
+if ne mg 3688530847248174159
+exit 11
+end
+put og 46 3
+ret 144
+end
+
 note load the checkpoint named by argv[ai] into og, ow (params) and omv (m, v)
 fn ockload ai ulong to void
 n = ofsz ai
 if gt n OCKCAP
 exit 15
 end
-hn = oprd ai 0 0 120
+hn = oprd ai 0 0 144
 if lt n 112
 exit 10
 end
-mg = opw8 0
-hl = ulong 112
-if eq mg 3616473253210246223
-hl = 120
-put og 46 2
-else
-if ne mg 3544415659172318287
-exit 11
-end
-put og 46 1
-end
+hl = ockmag opw8 0
 if lt n hl
 exit 10
 end
 for i ulong 7
 put og i opw8 add 8 mul i 8
+end
+put og 57 0
+put og 58 0
+put og 59 0
+if eq hl 144
+if eq get og 60 0
+exit 17
+end
+put og 57 opw8 112
+put og 58 opw8 120
+put og 59 opw8 128
+if lt get og 59 2
+exit 12
+end
 end
 if not ogeom
 exit 12
@@ -211,7 +257,7 @@ if gt get og 42 999999
 exit 12
 end
 g = ulong 1
-if eq hl 120
+if ge hl 120
 g = opw8 104
 end
 if not ogok2 g

@@ -21,7 +21,7 @@ byte-identical results for every valid K, and the `OLLMCK02` checkpoint. The spe
 ollm bpefit TEXT MERGES V [MAXBYTES]   # fit merges: M V types chunks fitbytes
 ollm bpeenc MERGES V TEXT TOKS         # encode to u16 tokens: K bytes tokens
 ollm bpedec MERGES TOKS OUT            # decode: D tokens bytes
-ollm init CK V T D H F L B SEED TOTAL LRMICRO [G]
+ollm init CK V T D H F L B SEED TOTAL LRMICRO [G [LP LC NP]]   # LP LC NP: a looped core, see LOOP.md
 ollm train CK TOKS UNTIL EVERY [K]     # K worker processes, G mod K = 0 (Linux only)
 ollm eval CK HELD W MERGES             # MERGES required when V > 256
 ollm sample CK SEED N TEMPMILLI PROMPT MERGES
@@ -42,6 +42,12 @@ nearly all of it, so the two are not measured on the same positions.
 `ollm grow INPUT OUTPUT LAYERS TOTAL LRMICRO` adds trainable layers while
 keeping learned tensors. See [growth behavior and verification](GROW.md).
 Growth increases capacity; it is not a measured quality improvement.
+
+## Looped core
+
+`ollm init ... G LP LC NP` makes the LC layers from layer LP a core that runs NP times with the
+same weights, so depth no longer costs parameters. See [the loop and its checks](LOOP.md).
+A looped model is not a measured quality improvement; no looped model has been trained on real data.
 
 ## Status
 
@@ -160,6 +166,9 @@ ollm-gb10 gserve PORT CK MERGES [MAXCONN] [tplmax=N] [test=1]   # the same serve
 ollm-gb10 gserveb PORT CK MERGES [MAXCONN] [tplmax=N] [test=1]  # mixed BF16, see CONTRACT-BF16.md
 ```
 
+The server has no connection limit. MAXCONN, when given, makes it leave after that many
+connections; the checks use it to end a server.
+
 `serve.om` (aarch64 and gb10 builds; the x86 targets get `noserve.om`, which exits 2) answers
 OpenAI-style chat requests on 127.0.0.1:PORT with omega-mv's `seed/net/http.om` and
 `seed/json/{json,jsonw}.om`, vendored byte for byte from omega-mv `e5b32567` into
@@ -195,11 +204,17 @@ connections before each token); without it they are 400.
 - `POST /v1/chat/completions`: `messages` (content a string, null, or an array of
   `{"type":"text","text":...}` parts joined with no separator; other part types are 400),
   `max_tokens` or `max_completion_tokens` (1 to 999999), `temperature` (0 to 2, no exponent; 0 is
-  argmax), `seed`, `top_k` (-1 to 999999; -1, 0 and K ≥ V are off), `top_p` (0 to 1, no
+  argmax), `seed` (when absent or null each request draws from a fresh seed, so repeating a request
+  gives a different answer; only a request with its own `seed` is reproducible), `top_k` (-1 to
+  999999; -1, 0 and K ≥ V are off), `top_p` (0 to 1, no
   exponent, resolution 0.000001; 0 keeps only the most probable token, 1 is off), `stop` (a
-  string or an array of at most 8 strings of 1 to 128 bytes), `tools`, `tool_choice` (`none`,
-  `auto`, `required` or an object), `stream`,
-  `stream_options.include_usage`, `n` = 1; other members are ignored (`model`). JSON or SSE
+  string or an array of at most 8 strings of 1 to 128 bytes), `tools`, `tool_choice` (`none` or
+  `auto`; `required` and an object are 400, because the server cannot force a call), `stream`,
+  `stream_options.include_usage`, `n` = 1. Members that would change the answer and are not
+  implemented are 400 unless they carry their default: `response_format` other than
+  `{"type":"text"}`, a non-empty `logit_bias`, `logprobs` true, `top_logprobs`,
+  `frequency_penalty` or `presence_penalty` other than 0, `parallel_tool_calls` false, `functions`
+  and `function_call`. Other members are ignored (`model`, `user`). JSON or SSE
   (`data:` chunks: role, content, tool calls, finish, optional usage, `[DONE]`).
 - Interim template, until DRA-123 fixes a shared one: when `tools` is non-empty, `tools: ` and
   the tools JSON exactly as sent, then `\n`; then `role: content\n` per message, an assistant's
