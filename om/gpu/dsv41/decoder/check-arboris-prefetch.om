@@ -1,0 +1,186 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure OM-2 CPU host gate for dsv41-decode online adaptive Arboris sum-over-paths prefetcher.
+note Compose in place of decode-cli.om. Tests:
+note   1. Online cross-layer co-activation learning (dfArbUpdate / dfArbBumpEdge)
+note   2. Sum-over-paths multi-source accumulation (dfArbScoreNext)
+note   3. Resident-skipping selection (dfArbPickBest)
+note   4. Domain-shift replacement in the 16-slot Space-Saving row
+note   5. End-to-end 6-worker async prefetch + publish-hits-only + zero cache pollution on real layer1 sidecar/shard
+
+fn apOpen arg ulong to int
+  path = new uchar 4096 0
+  n = argread arg path 0 4096
+  if le n 0
+    ret -1
+  end
+  ret int fopen path 0 ulong n 524288 0
+end
+
+fn apCheckScoring to int
+  note Train transition L0 -> L1:
+  note   Token A: L0={10, 20, 30, 40, 50, 60} -> L1={1, 2, 3, 4, 5, 6}
+  note   Token B: L0={10, 20, 70, 80, 90, 100} -> L1={1, 2, 7, 8, 9, 10}
+  note Expected sum-over-paths scores for query L0={10, 20, 30, 40, 50, 60}:
+  note   tgt 1: from 10 (2) + 20 (2) + 30 (1) + 40 (1) + 50 (1) + 60 (1) = 8
+  note   tgt 7: from 10 (1) + 20 (1) = 2
+  put dfCurIds 0 10
+  put dfCurIds 1 20
+  put dfCurIds 2 30
+  put dfCurIds 3 40
+  put dfCurIds 4 50
+  put dfCurIds 5 60
+  dfArbUpdate 0
+  put dfCurIds 0 1
+  put dfCurIds 1 2
+  put dfCurIds 2 3
+  put dfCurIds 3 4
+  put dfCurIds 4 5
+  put dfCurIds 5 6
+  dfArbUpdate 1
+
+  put dfCurIds 0 10
+  put dfCurIds 1 20
+  put dfCurIds 2 70
+  put dfCurIds 3 80
+  put dfCurIds 4 90
+  put dfCurIds 5 100
+  dfArbUpdate 0
+  put dfCurIds 0 1
+  put dfCurIds 1 2
+  put dfCurIds 2 7
+  put dfCurIds 3 8
+  put dfCurIds 4 9
+  put dfCurIds 5 10
+  dfArbUpdate 1
+
+  put dfCurIds 0 10
+  put dfCurIds 1 20
+  put dfCurIds 2 30
+  put dfCurIds 3 40
+  put dfCurIds 4 50
+  put dfCurIds 5 60
+  scores = new ulong 384 0
+  dfArbScoreNext 0 scores
+  if ne get scores 1 8
+    ret 11
+  end
+  if ne get scores 2 8
+    ret 12
+  end
+  if ne get scores 3 6
+    ret 13
+  end
+  if ne get scores 7 2
+    ret 14
+  end
+  note Mark expert 1 of layer 1 as already resident -> dfArbPickBest must skip 1 and pick 2
+  put dfSlotOf add ulong 384 1 0
+  best = dfArbPickBest 1 scores
+  if ne best 2
+    ret 15
+  end
+  put dfSlotOf add ulong 384 1 -1
+  ret 0
+end
+
+fn apCheckDomainShift to int
+  note Fill all 16 slots of (layer 2, src 5) with targets 100..115 (count=1 each),
+  note then observe new target 200 twice -> must replace a stale entry and score > 0.
+  for i ulong 16
+    dfArbBumpEdge 2 5 add 100 i
+  end
+  dfArbBumpEdge 2 5 200
+  dfArbBumpEdge 2 5 200
+  put dfCurIds 0 5
+  for k ulong 5
+    put dfCurIds add k 1 383
+  end
+  scores = new ulong 384 0
+  dfArbScoreNext 2 scores
+  if eq get scores 200 0
+    ret 21
+  end
+  ret 0
+end
+
+fn apCheckAsyncWorkers sidecar1 int shard4 int to int
+  put dfSidecarFD 1 sidecar1
+  put dfShardFD 1 shard4
+  if not dfStartWorkers
+    ret 31
+  end
+  note Query L0={10,20,30,40,50,60} -> dispatches L1 experts {1,2,3,4,5,6} asynchronously to 6 workers
+  put dfCurIds 0 10
+  put dfCurIds 1 20
+  put dfCurIds 2 30
+  put dfCurIds 3 40
+  put dfCurIds 4 50
+  put dfCurIds 5 60
+  dfArbDispatchPrefetch 0
+  if ne get dfArbPfMeta 0 6
+    dfStopWorkers
+    ret 32
+  end
+  if ne get dfArbPfMeta 3 6
+    dfStopWorkers
+    ret 33
+  end
+  note Now simulate authoritative L1 router picking {1, 2, 11, 12, 13, 14}:
+  note Only 2 hits (1 and 2) should publish; 3, 4, 5, 6 must NOT pollute dfSlotOf!
+  put dfCurIds 0 1
+  put dfCurIds 1 2
+  put dfCurIds 2 11
+  put dfCurIds 3 12
+  put dfCurIds 4 13
+  put dfCurIds 5 14
+  pfr = dfArbDrainAndPublish 1
+  if ne pfr 1
+    dfStopWorkers
+    ret 34
+  end
+  if ne get dfArbPfMeta 2 2
+    dfStopWorkers
+    ret 35
+  end
+  if or lt get dfSlotOf add ulong 384 1 0 lt get dfSlotOf add ulong 384 2 0
+    dfStopWorkers
+    ret 36
+  end
+  if or ge get dfSlotOf add ulong 384 3 0 ge get dfSlotOf add ulong 384 4 0
+    dfStopWorkers
+    ret 37
+  end
+  dfStopWorkers
+  ret 0
+end
+
+fn main to int
+  if ne argcnt 3
+    ret 64
+  end
+  sidecar1 = apOpen 1
+  shard4 = apOpen 2
+  if or lt sidecar1 0 lt shard4 0
+    ret 66
+  end
+  dfInitSlabMap 7
+  put dwSlabMaps 0 mapnew -1 0 mul 7 deBytes 3 33
+  put dwSlabMaps 4 mapnew -1 0 deBytes 3 33
+  if or le get dwSlabMaps 0 0 le get dwSlabMaps 4 0
+    ret 70
+  end
+  rc = apCheckScoring
+  if ne rc 0
+    ret rc
+  end
+  rc = apCheckDomainShift
+  if ne rc 0
+    ret rc
+  end
+  rc = apCheckAsyncWorkers sidecar1 shard4
+  u1 = mapdrop get dwSlabMaps 0
+  u2 = mapdrop get dwSlabMaps 4
+  u3 = fclose sidecar1
+  u4 = fclose shard4
+  ret rc
+end

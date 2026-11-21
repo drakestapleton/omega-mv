@@ -24,8 +24,14 @@ global dfSlotOf long 15360
 global dfSlotKey long 3200
 global dfSlabCfg ulong 4
 global dfPhysical ulong 3200
+global dfArbEdges uint 239616
+global dfArbPrev uint 6
+global dfArbPfKey ulong 6
+global dfArbPfMeta ulong 5
 note dfStats: 0=hits, 1=misses, 2=nvme_ns, 3=gpu_ns, 4=engram_ns, 5=tokens
 note dfSlabCfg: 0=totalSlots, 1=fifoHead, 2=recordTrace, 3=unpublished physical slot
+note dfArbEdges: 39 * 384 * 16 packed (count<<16 | target_eid) online cross-layer sum graph
+note dfArbPfMeta: 0=inFlightCount, 1=inFlightLayer, 2=pfHits, 3=pfDispatched, 4=pfEnabled
 
 fn dfMonoNs to ulong
   ret ulong monons
@@ -1134,7 +1140,232 @@ fn dfWorkerLoop idx ulong reqFd int repFd int to void
   exit 0
 end
 
+fn dfArbDrainDiscard to void
+  cnt = get dfArbPfMeta 0
+  if eq cnt 0
+    ret
+  end
+  rep = new uchar 1 0
+  for m ulong cnt bound 6
+    u = dfPipeRead get dfWrRep m rep 1
+  end
+  put dfArbPfMeta 0 0
+end
+
+fn dfArbPublishOne layer ulong m ulong to long
+  key = get dfArbPfKey m
+  if or ge get dfSlotOf key 0 not dfGateNeedsKey long key layer
+    ret 0
+  end
+  slot = dfPublishFromStage layer key m
+  if lt slot 0
+    ret -1
+  end
+  put dfArbPfMeta 2 add get dfArbPfMeta 2 1
+  ret 1
+end
+
+fn dfArbDrainAndPublish layer ulong to long
+  cnt = get dfArbPfMeta 0
+  if eq cnt 0
+    ret 0
+  end
+  pfLayer = get dfArbPfMeta 1
+  rep = new uchar 1 0
+  okMask = new uchar 6 0
+  tN0 = dfMonoNs
+  for m ulong cnt bound 6
+    if and dfPipeRead get dfWrRep m rep 1 eq get rep 0 0
+      put okMask m 1
+    end
+  end
+  put dfArbPfMeta 0 0
+  published = long 0
+  if eq pfLayer layer
+    for m ulong cnt bound 6
+      if eq get okMask m 1
+        r = dfArbPublishOne layer m
+        if lt r 0
+          published = long -1
+          break
+        end
+        if eq r 1
+          published = long 1
+        end
+      end
+    end
+  end
+  tN1 = dfMonoNs
+  put dfStats 2 add get dfStats 2 sub tN1 tN0
+  ret published
+end
+
+fn dfArbPack cnt ulong tgt ulong to uint
+  ret or shl uint cnt 16 uint tgt
+end
+
+fn dfArbHalveRow rowBase ulong to void
+  for h ulong 16
+    e2 = get dfArbEdges add rowBase h
+    c2 = ulong shr e2 16
+    if gt c2 1
+      put dfArbEdges add rowBase h dfArbPack shr c2 1 ulong and e2 65535
+    else
+      put dfArbEdges add rowBase h 0
+    end
+  end
+end
+
+fn dfArbBumpEdge prevLayer ulong src ulong tgt ulong to void
+  rowBase = mul add mul prevLayer 384 src 16
+  emptySlot = ulong 16
+  minSlot = ulong 0
+  minCnt = ulong 65536
+  for j ulong 16
+    ent = get dfArbEdges add rowBase j
+    c = ulong shr ent 16
+    if eq c 0
+      if eq emptySlot 16
+        emptySlot = j
+      end
+    else
+      if eq ulong and ent 65535 tgt
+        nc = add c 1
+        if ge nc 60000
+          dfArbHalveRow rowBase
+          nc = ulong 30000
+        end
+        put dfArbEdges add rowBase j dfArbPack nc tgt
+        ret
+      end
+      if lt c minCnt
+        minCnt = c
+        minSlot = j
+      end
+    end
+  end
+  if lt emptySlot 16
+    put dfArbEdges add rowBase emptySlot dfArbPack 1 tgt
+    ret
+  end
+  if le minCnt 1
+    put dfArbEdges add rowBase minSlot dfArbPack 1 tgt
+  else
+    oldTgt = ulong and get dfArbEdges add rowBase minSlot 65535
+    put dfArbEdges add rowBase minSlot dfArbPack sub minCnt 1 oldTgt
+  end
+end
+
+fn dfArbUpdate layer ulong to void
+  if and gt layer 0 lt layer 40
+    prevLayer = sub layer 1
+    for s ulong 6
+      src = ulong get dfArbPrev s
+      if lt src 384
+        for d ulong 6
+          tgt = ulong get dfCurIds d
+          if lt tgt 384
+            dfArbBumpEdge prevLayer src tgt
+          end
+        end
+      end
+    end
+  end
+  for k ulong 6
+    put dfArbPrev k get dfCurIds k
+  end
+end
+
+fn dfArbScoreNext layer ulong scores edit ulong 384 to void
+  for s ulong 6
+    src = ulong get dfCurIds s
+    if lt src 384
+      rowBase = mul add mul layer 384 src 16
+      for j ulong 16
+        ent = get dfArbEdges add rowBase j
+        c = ulong shr ent 16
+        if gt c 0
+          tgt = ulong and ent 65535
+          if lt tgt 384
+            put scores tgt add get scores tgt c
+          end
+        end
+      end
+    end
+  end
+end
+
+fn dfArbPickBest nextLayer ulong scores view ulong 384 to ulong
+  best = ulong 384
+  bestScore = ulong 0
+  for e ulong 384
+    sc = get scores e
+    if gt sc bestScore
+      key = add mul nextLayer 384 e
+      if lt get dfSlotOf key 0
+        bestScore = sc
+        best = e
+      end
+    end
+  end
+  ret best
+end
+
+fn dfArbSendPrefetch nextLayer ulong pfCount ulong best ulong to long
+  desc = new uchar 64 0
+  req = new uchar 72 0
+  if not diRead get dfSidecarFD nextLayer desc mul best 64 64
+    ret -1
+  end
+  if or ne ulong get desc 0 add nextLayer 3 ne ulong get desc 1 nextLayer
+    ret 0
+  end
+  if ne best diGet desc 4 4
+    ret 0
+  end
+  diPut req 0 8 nextLayer
+  for j ulong 64
+    put req add 8 j get desc j
+  end
+  if not dfPipeWrite get dfWrReq pfCount req 72
+    ret -1
+  end
+  put dfArbPfKey pfCount add mul nextLayer 384 best
+  ret 1
+end
+
+fn dfArbDispatchPrefetch layer ulong to void
+  if or eq get dfArbPfMeta 4 0 ne get dfWrActive 0 6
+    ret
+  end
+  if ge layer 39
+    ret
+  end
+  nextLayer = add layer 1
+  scores = new ulong 384 0
+  dfArbScoreNext layer scores
+  pfCount = ulong 0
+  for pick ulong 6
+    best = dfArbPickBest nextLayer scores
+    if eq best 384
+      break
+    end
+    put scores best 0
+    sr = dfArbSendPrefetch nextLayer pfCount best
+    if lt sr 0
+      break
+    end
+    if eq sr 1
+      pfCount = add pfCount 1
+    end
+  end
+  put dfArbPfMeta 0 pfCount
+  put dfArbPfMeta 1 nextLayer
+  put dfArbPfMeta 3 add get dfArbPfMeta 3 pfCount
+end
+
 fn dfStopWorkers to void
+  dfArbDrainDiscard
   wbuf = new uchar 4 0
   n = get dfWrActive 0
   put dfWrActive 0 0
@@ -1202,6 +1433,7 @@ fn dfStartWorkers to bool
       ret false
     end
   end
+  put dfArbPfMeta 4 1
   ret true
 end
 
@@ -1326,11 +1558,17 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
     put lWts k ewt
   end
   put times 0 dfMonoNs
+  pfr = dfArbDrainAndPublish layer
+  if lt pfr 0
+    ret false
+  end
   gr = dfResolveGate layer
   if lt gr 0
     ret false
   end
   put times 1 dfMonoNs
+  dfArbUpdate layer
+  dfArbDispatchPrefetch layer
   if ne get dfSlabCfg 2 0
     put coord 0 uint get dfCoord 0
     put coord 1 uint get dfCoord 1
@@ -1339,7 +1577,7 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
       ret false
     end
   end
-  if eq gr 1
+  if or eq gr 1 eq pfr 1
     put frameDirty 0 1
   end
   ret true
