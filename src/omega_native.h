@@ -869,6 +869,28 @@ uint32_t omega2_visor_om_check_bytes(uint64_t *result, const uint8_t *o_p, uint6
 uint32_t omega2_visor_om_trim_blanks(uint64_t *result, const uint8_t *o_p, uint64_t o_p_len, uint64_t o_n, uint64_t *o_dst, uint64_t o_dst_len);
 /* export fn visor_om_cmd_arity cmd ulong dst edit ulong 2 to ulong */
 uint32_t omega2_visor_om_cmd_arity(uint64_t *result, uint64_t o_cmd, uint64_t *o_dst, uint64_t o_dst_len);
+#define OMEGA2_IDENT_fab_core "omega-ident 1 unit=fab_core abi=2 profile=OM-2 src=17128614e2a0dff17fff58b57676b7549c79dd8d9a091570f0980d58a2ddadb7 omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_fab_core(void);
+/* export fn fab_om_ct_equal a view uchar * b view uchar * n ulong to ulong */
+uint32_t omega2_fab_om_ct_equal(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len, uint64_t o_n);
+/* export fn fab_om_hmac_xor_pad k view uchar 64 pad edit uchar 64 xbyte ulong to void */
+uint32_t omega2_fab_om_hmac_xor_pad(uint64_t *result, const uint8_t *o_k, uint64_t o_k_len, uint8_t *o_pad, uint64_t o_pad_len, uint64_t o_xbyte);
+/* export fn fab_om_put_u16 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_fab_om_put_u16(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn fab_om_put_u32 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_fab_om_put_u32(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn fab_om_put_u64 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_fab_om_put_u64(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn fab_om_get_u16 src view uchar * pos ulong to ulong */
+uint32_t omega2_fab_om_get_u16(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn fab_om_get_u32 src view uchar * pos ulong to ulong */
+uint32_t omega2_fab_om_get_u32(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn fab_om_get_u64 src view uchar * pos ulong to ulong */
+uint32_t omega2_fab_om_get_u64(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn fab_om_body_size kind ulong to ulong */
+uint32_t omega2_fab_om_body_size(uint64_t *result, uint64_t o_kind);
+/* export fn fab_om_digest_nonzero_eq a view uchar 32 b view uchar 32 to ulong */
+uint32_t omega2_fab_om_digest_nonzero_eq(uint64_t *result, const uint8_t *o_a, uint64_t o_a_len, const uint8_t *o_b, uint64_t o_b_len);
 #ifdef __cplusplus
 }
 #endif

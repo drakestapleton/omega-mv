@@ -16,6 +16,7 @@
 
 /* fab_hmac.c -- HMAC-SHA256. See fab_hmac.h. */
 #include "fab_hmac.h"
+#include "omega_native.h"
 
 #include "sha256.h"
 
@@ -33,12 +34,13 @@ void fab_hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *msg, siz
     if (key_len > SHA256_BLOCK_SIZE) sha256_hash(key, key_len, k);
     else if (key_len) memcpy(k, key, key_len);
     sha256_ctx h;
-    for (unsigned i = 0; i < SHA256_BLOCK_SIZE; i++) pad[i] = k[i] ^ 0x36;
+    uint64_t u = 0;
+    (void)omega2_fab_om_hmac_xor_pad(&u, k, SHA256_BLOCK_SIZE, pad, SHA256_BLOCK_SIZE, 0x36);
     sha256_init(&h);
     sha256_update(&h, pad, sizeof pad);
     if (msg_len) sha256_update(&h, msg, msg_len);
     sha256_final(&h, inner);
-    for (unsigned i = 0; i < SHA256_BLOCK_SIZE; i++) pad[i] = k[i] ^ 0x5c;
+    (void)omega2_fab_om_hmac_xor_pad(&u, k, SHA256_BLOCK_SIZE, pad, SHA256_BLOCK_SIZE, 0x5c);
     sha256_init(&h);
     sha256_update(&h, pad, sizeof pad);
     sha256_update(&h, inner, sizeof inner);
@@ -48,9 +50,10 @@ void fab_hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *msg, siz
 }
 
 int fab_ct_equal(const uint8_t *a, const uint8_t *b, size_t n) {
-    uint8_t acc = 0;
-    for (size_t i = 0; i < n; i++) acc |= (uint8_t)(a[i] ^ b[i]);
-    return acc == 0;
+    uint64_t ok = 1;
+    if (n == 0) return 1;
+    (void)omega2_fab_om_ct_equal(&ok, a, n, b, n, n);
+    return (int)ok;
 }
 
 void fab_hmac_sig64(const uint8_t key[32], const uint8_t *msg, size_t msg_len, uint8_t out[64]) {

@@ -16,27 +16,20 @@
 
 /* fabric.c -- AIEN Fabric interface F5-0. See fabric.h. */
 #include "fabric.h"
+#include "omega_native.h"
 
 #include <string.h>
 
-static void w16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
-static void w32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static void w64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
-static uint16_t r16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
-static uint64_t r64(const uint8_t *p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = v << 8 | p[i];
-    return v;
-}
+static void w16(uint8_t *p, uint16_t v) { uint64_t u = 0; (void)omega2_fab_om_put_u16(&u, p, 2, 0, v); }
+static void w32(uint8_t *p, uint32_t v) { uint64_t u = 0; (void)omega2_fab_om_put_u32(&u, p, 4, 0, v); }
+static void w64(uint8_t *p, uint64_t v) { uint64_t u = 0; (void)omega2_fab_om_put_u64(&u, p, 8, 0, v); }
+static uint16_t r16(const uint8_t *p) { uint64_t v = 0; (void)omega2_fab_om_get_u16(&v, p, 2, 0); return (uint16_t)v; }
+static uint64_t r64(const uint8_t *p) { uint64_t v = 0; (void)omega2_fab_om_get_u64(&v, p, 8, 0); return v; }
 
 static size_t body_size(uint32_t kind) {
-    switch (kind) {
-    case FAB_MSG_JOIN: return FAB_JOIN_BODY;
-    case FAB_MSG_RENEW: return FAB_RENEW_BODY;
-    case FAB_MSG_ADVERTISE: return FAB_ADVERTISE_BODY;
-    case FAB_MSG_LEAVE: return 0;
-    default: return (size_t)-1;
-    }
+    uint64_t sz = 0;
+    (void)omega2_fab_om_body_size(&sz, kind);
+    return (size_t)sz;
 }
 
 static int on_roster(const FabRoster *r, const AienMachineId *m) {
@@ -87,7 +80,9 @@ static void withdraw_all(FabNode *n, FabMember *m) {
 /* ---- replay window store (see fabric.h, Restart) ---- */
 
 static uint32_t r32(const uint8_t *p) {
-    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+    uint64_t v = 0;
+    (void)omega2_fab_om_get_u32(&v, p, 4, 0);
+    return (uint32_t)v;
 }
 
 /* Save the window as it will be once `who` holds (gen, seq): every member as
