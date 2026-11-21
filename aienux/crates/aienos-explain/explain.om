@@ -1,0 +1,4977 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-explain/explain.om: Pure-Omega AIENOS Explanation Bridge.
+note Contract validation, bounded causal backtracking, cycle cutting, Kahn linearization,
+note canonical SHA-256 bundle digests, Cortex/branch adapters, deterministic rendering,
+note and clarification sessions.
+note Ported from aienux crates/aienos-explain/src/{contract,bundle,build,adapters,render,session,main,lib}.rs.
+note Compose with: si/directives/om2.om om/tls/sha2.om aienux/crates/aienos-explain/explain.om ...
+
+note ============================================================================
+note Section 1: Contract Constants, Error Codes, Enums, and Limits
+note ============================================================================
+
+const EXP_VERSION ulong 1
+const EXP_MAX_GRAPH_NODES ulong 65536
+const EXP_MAX_PARENTS_PER_NODE ulong 1024
+
+const EXP_HARD_MAX_DEPTH ulong 256
+const EXP_HARD_MAX_NODES ulong 4096
+const EXP_DEFAULT_MAX_DEPTH ulong 32
+const EXP_DEFAULT_MAX_NODES ulong 256
+
+note Stable contract error codes (1..10; 0 = ok)
+const EXP_OK int 0
+const EXP_ERR_BAD_FORMAT int 1
+const EXP_ERR_UNSUPPORTED_VERSION int 2
+const EXP_ERR_UNKNOWN_CODE int 3
+const EXP_ERR_DUPLICATE_NODE_ID int 4
+const EXP_ERR_TARGET_NOT_FOUND int 5
+const EXP_ERR_GRAPH_TOO_LARGE int 6
+const EXP_ERR_STEP_OUT_OF_RANGE int 7
+const EXP_ERR_NOT_IN_BRANCH_SCOPE int 8
+const EXP_ERR_JOURNAL int 9
+const EXP_ERR_INVALID_LIMITS int 10
+
+note Epistemic status codes (0..6)
+const EXP_ST_UNCLASSIFIED ulong 0
+const EXP_ST_DIRECT_OBS ulong 1
+const EXP_ST_VERIFIED_FACT ulong 2
+const EXP_ST_INFERENCE ulong 3
+const EXP_ST_HYPOTHESIS ulong 4
+const EXP_ST_CONTRADICTION ulong 5
+const EXP_ST_OPERATOR_DECISION ulong 6
+
+note NodeKind codes (1..13)
+const EXP_KD_CORTEX_RECORD ulong 1
+const EXP_KD_CAP_METRIC ulong 2
+const EXP_KD_CAP_ANALYSIS ulong 3
+const EXP_KD_DIAGNOSTIC ulong 4
+const EXP_KD_HYPOTHESIS ulong 5
+const EXP_KD_PREDICTION ulong 6
+const EXP_KD_FALSIFICATION ulong 7
+const EXP_KD_EVAL_RECEIPT ulong 8
+const EXP_KD_PROMOTION_STATE ulong 9
+const EXP_KD_OPERATOR_DECISION ulong 10
+const EXP_KD_AGENT_BRANCH ulong 11
+const EXP_KD_CONCLUSION ulong 12
+const EXP_KD_ALTERNATIVE ulong 13
+
+note Relation codes (1..6)
+const EXP_REL_SUPPORTED_BY ulong 1
+const EXP_REL_EVALUATES ulong 2
+const EXP_REL_PART_OF ulong 3
+const EXP_REL_CONTRADICTS ulong 4
+const EXP_REL_ALTERNATIVE_TO ulong 5
+const EXP_REL_REFERENCES ulong 6
+
+note Narrative Role codes (0..7, matching causal order)
+const EXP_ROLE_OBSERVED ulong 0
+const EXP_ROLE_ANALYSIS ulong 1
+const EXP_ROLE_HYPOTHESIS ulong 2
+const EXP_ROLE_PREDICTION ulong 3
+const EXP_ROLE_FALSIFICATION ulong 4
+const EXP_ROLE_EVALUATION ulong 5
+const EXP_ROLE_DECISION ulong 6
+const EXP_ROLE_CONCLUSION ulong 7
+
+note UncertaintyKind codes (1..10)
+const EXP_UK_CYCLE ulong 1
+const EXP_UK_CONFLICT ulong 2
+const EXP_UK_MISSING_PARENT ulong 3
+const EXP_UK_MISSING_LINK ulong 4
+const EXP_UK_UNSUPPORTED ulong 5
+const EXP_UK_HYPO_NOT_FALSIFIED ulong 6
+const EXP_UK_INFERRED ulong 7
+const EXP_UK_UNKNOWN ulong 8
+const EXP_UK_TRUNCATED ulong 9
+const EXP_UK_PRODUCER_NOTE ulong 10
+
+note Presentation Mode and Audience codes
+const EXP_MODE_SUMMARY ulong 0
+const EXP_MODE_STEP_BY_STEP ulong 1
+const EXP_MODE_TECHNICAL ulong 2
+const EXP_MODE_ANALOGY ulong 3
+
+const EXP_AUD_GENERAL ulong 0
+const EXP_AUD_OPERATOR ulong 1
+const EXP_AUD_DEVELOPER ulong 2
+const EXP_AUD_SYSTEMS_ENG ulong 3
+const EXP_AUD_RESEARCHER ulong 4
+const EXP_AUD_INVALID ulong 255
+
+const EXP_MAX_LEVEL ulong 4
+const EXP_LEVEL_DEFAULT ulong 255
+
+note Internal table capacities
+const EXP_STR_CAP ulong 131072
+const EXP_OUT_CAP ulong 32768
+const EXP_CAP_NODES ulong 320
+const EXP_CAP_EDGES ulong 1024
+const EXP_CAP_MEAS ulong 256
+const EXP_CAP_MISS ulong 128
+const EXP_CAP_NOTES ulong 128
+const EXP_CAP_TRUNC ulong 128
+const EXP_CAP_SCOPE ulong 128
+const EXP_CAP_UNCS ulong 512
+const EXP_CAP_CONTRAS ulong 128
+const EXP_CAP_CON_INV ulong 256
+const EXP_CAP_ALTS ulong 128
+const EXP_CX_CAP ulong 64
+const EXP_CX_PAR_CAP ulong 256
+const EXP_BR_CAP ulong 16
+const EXP_BR_REF_CAP ulong 64
+const EXP_BR_TOK_CAP ulong 128
+const EXP_NONE ulong 999999
+
+note ============================================================================
+note Section 2: Constant Texts and Global State Tables
+note ============================================================================
+
+text exp_txt_format "aien.explain.evidence-graph"
+text exp_txt_builder "aienos-explain/1"
+text exp_txt_hex "0123456789abcdef"
+text exp_txt_cx_prod "aienos-explain/cortex-adapter"
+text exp_txt_br_prod "aienos-explain/branch-adapter"
+text exp_txt_cx_sys "aienos-cortex"
+text exp_txt_cx_art "EpistemicRecord"
+text exp_txt_cx_cbas "Cortex record confidence"
+text exp_txt_cx_pfx "cortex:"
+text exp_txt_br_sys "aienos-agent-state"
+text exp_txt_br_art "LogicalBranch"
+text exp_txt_br_pfx "branch:"
+text exp_txt_vby_pfx "verified by "
+text exp_txt_jmagic "ACXJ"
+
+note Status technical names
+text exp_sn_0 "Unclassified"
+text exp_sn_1 "DirectObservation"
+text exp_sn_2 "VerifiedFact"
+text exp_sn_3 "Inference"
+text exp_sn_4 "Hypothesis"
+text exp_sn_5 "Contradiction"
+text exp_sn_6 "OperatorDecision"
+
+note Status plain words (render.rs status_words)
+text exp_sw_0 "status unknown"
+text exp_sw_1 "observed"
+text exp_sw_2 "checked fact"
+text exp_sw_3 "inferred, not checked"
+text exp_sw_4 "hypothesis, not yet established"
+text exp_sw_5 "conflict between records"
+text exp_sw_6 "operator decision"
+
+note NodeKind technical names
+text exp_kn_1 "CortexRecord"
+text exp_kn_2 "CapabilityMetric"
+text exp_kn_3 "CapabilityAnalysis"
+text exp_kn_4 "Diagnostic"
+text exp_kn_5 "Hypothesis"
+text exp_kn_6 "Prediction"
+text exp_kn_7 "Falsification"
+text exp_kn_8 "EvaluationReceipt"
+text exp_kn_9 "PromotionState"
+text exp_kn_10 "OperatorDecision"
+text exp_kn_11 "AgentBranch"
+text exp_kn_12 "Conclusion"
+text exp_kn_13 "Alternative"
+
+note Relation technical names
+text exp_rn_1 "SupportedBy"
+text exp_rn_2 "Evaluates"
+text exp_rn_3 "PartOf"
+text exp_rn_4 "Contradicts"
+text exp_rn_5 "AlternativeTo"
+text exp_rn_6 "References"
+
+note Role headings
+text exp_rh_0 "Observed"
+text exp_rh_1 "System analysis"
+text exp_rh_2 "Hypothesis"
+text exp_rh_3 "Prediction"
+text exp_rh_4 "Falsification"
+text exp_rh_5 "Evaluation"
+text exp_rh_6 "Decision"
+text exp_rh_7 "Conclusion"
+
+note Role debug names (technical mode)
+text exp_rd_0 "Observed"
+text exp_rd_1 "Analysis"
+text exp_rd_2 "Hypothesis"
+text exp_rd_3 "Prediction"
+text exp_rd_4 "Falsification"
+text exp_rd_5 "Evaluation"
+text exp_rd_6 "Decision"
+text exp_rd_7 "Conclusion"
+
+note Uncertainty labels
+text exp_ul_1 "circular support"
+text exp_ul_2 "conflicting evidence"
+text exp_ul_3 "missing evidence"
+text exp_ul_4 "missing link"
+text exp_ul_5 "unsupported claim"
+text exp_ul_6 "hypothesis not yet tested"
+text exp_ul_7 "inferred step"
+text exp_ul_8 "unknown status"
+text exp_ul_9 "explanation cut short"
+text exp_ul_10 "caveat"
+
+note Uncertainty technical names
+text exp_un_1 "Cycle"
+text exp_un_2 "ConflictingEvidence"
+text exp_un_3 "MissingParent"
+text exp_un_4 "MissingLink"
+text exp_un_5 "Unsupported"
+text exp_un_6 "HypothesisNotFalsified"
+text exp_un_7 "Inferred"
+text exp_un_8 "Unknown"
+text exp_un_9 "Truncated"
+text exp_un_10 "ProducerNote"
+
+note Audience names
+text exp_an_0 "general"
+text exp_an_1 "operator"
+text exp_an_2 "developer"
+text exp_an_3 "systems-engineer"
+text exp_an_4 "researcher"
+
+note Presentation-only analogy catalog (never stored in bundle)
+text exp_ana_cap "The flagged part acts like a toll booth on a busy road: every request has to pass through it, so when it slows down, everything behind it queues up."
+text exp_ana_hyp "A hypothesis is like a mechanic's first guess about a noise in the engine: useful for deciding what to check, but not a finding until the check is done."
+text exp_ana_fal "A falsification test is like agreeing in advance which gauge reading would prove the repair did not work."
+text exp_ana_evl "The evaluation receipt is like an inspection sheet signed after a test drive: it records what was measured, not what was hoped."
+text exp_ana_brn "A branch is like one line of investigation in a case file: it lists the documents it actually relied on, not every document in the archive."
+text exp_ana_con "A contradiction is like two witnesses whose accounts do not match: the system keeps both and flags the conflict instead of picking one quietly."
+
+note Reusable rendering strings
+text exp_s_concl "Conclusion: "
+text exp_s_mreason "Main reason: "
+text exp_s_no_reason "Main reason: none recorded. The system has no evidence supporting this conclusion.\n"
+text exp_s_sev "Strongest evidence: "
+text exp_s_no_ev "Strongest evidence: no observed or checked evidence on this path.\n"
+text exp_s_munc "Main uncertainty: "
+text exp_s_no_munc "Main uncertainty: none recorded on this path.\n"
+text exp_s_therefore ". Therefore: "
+text exp_s_rests " (rests on step "
+text exp_s_refers " (refers to step "
+text exp_s_weak "; a weak link, not a recorded one)"
+text exp_s_from " [from "
+text exp_s_br_ref " (referenced by the branch)"
+text exp_s_meas "   measurements: "
+text exp_s_meas_ni "measurements: "
+text exp_s_src "   source: "
+text exp_s_dig " digest "
+text exp_s_unc_hdr "Uncertainty:\n"
+text exp_s_no_gaps "- no gaps recorded on this path (inferred steps are marked as such)\n"
+text exp_s_conf_hdr "Conflicts:\n"
+text exp_s_inv_a " (involves "
+text exp_s_inv_b " step(s))\n"
+text exp_s_alt_hdr "Other explanations the system recorded:\n"
+text exp_s_ana_hdr "Analogy (illustration only, not evidence; about step "
+text exp_s_ana_none "Analogy: none available for this explanation.\n"
+text exp_s_ev_itself "\nThe evidence itself:\n"
+text exp_s_step_hdr "Step "
+text exp_s_start_pt "It is a starting point: recorded directly, not derived.\n"
+text exp_s_no_sup "Nothing earlier on the path supports it.\n"
+text exp_s_it_rests "It rests on step "
+text exp_s_it_refs "It refers to (weak link, not a recorded one) step "
+text exp_s_rests_on_it " rests on it.\n"
+text exp_s_caveat "Caveat: "
+text exp_s_comes " comes from "
+text exp_s_ref_lbl "), reference "
+text exp_s_dig_c ", digest "
+text exp_s_node_sc "; node "
+text exp_s_st_sc "; status "
+text exp_s_no_ev_att "No digests, receipts or measurements are attached to this path.\n"
+text exp_s_no_unc_rec "No uncertainty is recorded on this path.\n"
+text exp_s_no_alt_rec "No alternative explanations are recorded in the evidence.\n"
+text exp_s_conflict_pfx "- conflict: "
+text exp_s_t_expl "explanation target="
+text exp_s_t_prod " producer="
+text exp_s_t_bldr " builder="
+text exp_s_t_cont " contract="
+text exp_s_t_concl "conclusion step="
+text exp_s_t_step "step "
+text exp_s_t_id " id="
+text exp_s_t_kind " kind="
+text exp_s_t_status " status="
+text exp_s_t_role " role="
+text exp_s_t_depth " depth="
+text exp_s_t_gnd " grounding="
+text exp_s_t_sup " supported_by=["
+text exp_s_t_stmt "  statement: "
+text exp_s_t_conf "  confidence_permille="
+text exp_s_t_basis " basis="
+text exp_s_t_unspec "unspecified"
+text exp_s_t_src "  source system="
+text exp_s_t_art " artifact="
+text exp_s_t_ref " reference="
+text exp_s_t_dig " digest="
+text exp_s_t_rec "  recorded_at_utc="
+text exp_s_t_rec_n " (informational, not used for order)\n"
+text exp_s_t_note "  note: "
+text exp_s_t_unc "uncertainty code="
+text exp_s_t_node " node="
+text exp_s_t_rel " related="
+text exp_s_t_det " detail="
+text exp_s_t_contra "contradiction id="
+text exp_s_t_invs " involves=["
+text exp_s_t_stmteq "] statement="
+text exp_s_t_alt "alternative id="
+text exp_s_t_to " to="
+text exp_s_t_stmts " statement="
+text exp_s_t_idig "input_digest="
+text exp_s_t_bdig " bundle_digest="
+text exp_s_t_vis " visited="
+text exp_s_t_lim " limits=depth:"
+text exp_s_t_nod ",nodes:"
+text exp_s_true "true"
+text exp_s_false "false"
+text exp_s_miss_a " lists "
+text exp_s_miss_b " as support, but no such artifact is available; the system has no evidence for that link"
+text exp_s_trunc_a "support of "
+text exp_s_trunc_b " was not followed further (depth limit "
+text exp_s_trunc_c ", node limit "
+text exp_s_ptrunc_a "the producer of this graph stopped collecting evidence around "
+text exp_s_ptrunc_b " at its own limits; more support or contradictions may exist"
+text exp_s_cyc_a " rests on "
+text exp_s_cyc_b ", which already rests on "
+text exp_s_cyc_c "; the loop was cut and this support is circular, not grounding"
+text exp_s_mlink_a "no evidence for: "
+text exp_s_unk_a "the epistemic status of step "
+text exp_s_unk_b " is not known; it is neither observed nor verified"
+text exp_s_unsup_a "step "
+text exp_s_unsup_b " is a "
+text exp_s_unsup_c " with no recorded support"
+text exp_s_inf_a " is inferred from earlier steps, not observed directly"
+text exp_s_hyp_a "hypothesis at step "
+text exp_s_hyp_b " has no evaluation that tests it directly; it remains a hypothesis"
+text exp_s_contra_a " contradicts "
+text exp_s_contra_b " is involved in a recorded contradiction: "
+text exp_s_br_a "Agent branch "
+text exp_s_br_b " (lineage depth "
+text exp_s_br_c ", parent "
+text exp_s_br_d ") depends on "
+text exp_s_br_e " referenced Cortex record(s)"
+text exp_s_br_root "none (root branch)"
+text exp_s_json_fmt "\"format\""
+text exp_s_json_ver "\"version\""
+
+note String arena
+global exp_str uchar 131072
+global exp_str_len ulong 1
+
+note Output buffer for rendering and session responses
+global exp_out uchar 32768
+global exp_out_len ulong 1
+
+note EvidenceGraph header
+global exp_g_fmt_off ulong 1
+global exp_g_fmt_len ulong 1
+global exp_g_ver ulong 1
+global exp_g_prod_off ulong 1
+global exp_g_prod_len ulong 1
+global exp_g_ncnt ulong 1
+global exp_g_decl_ncnt ulong 1
+global exp_g_ecnt ulong 1
+global exp_g_mcnt ulong 1
+global exp_g_xcnt ulong 1
+global exp_g_notecnt ulong 1
+global exp_g_tcnt ulong 1
+global exp_g_has_scope ulong 1
+global exp_g_sbr_off ulong 1
+global exp_g_sbr_len ulong 1
+global exp_g_scnt ulong 1
+
+note EvidenceGraph nodes (0..EXP_CAP_NODES-1)
+global exp_gn_id_off ulong 320
+global exp_gn_id_len ulong 320
+global exp_gn_kind ulong 320
+global exp_gn_status ulong 320
+global exp_gn_stmt_off ulong 320
+global exp_gn_stmt_len ulong 320
+global exp_gn_sys_off ulong 320
+global exp_gn_sys_len ulong 320
+global exp_gn_art_off ulong 320
+global exp_gn_art_len ulong 320
+global exp_gn_ref_off ulong 320
+global exp_gn_ref_len ulong 320
+global exp_gn_has_dig ulong 320
+global exp_gn_dig_off ulong 320
+global exp_gn_dig_len ulong 320
+global exp_gn_has_conf ulong 320
+global exp_gn_conf ulong 320
+global exp_gn_has_cbas ulong 320
+global exp_gn_cbas_off ulong 320
+global exp_gn_cbas_len ulong 320
+global exp_gn_has_ts ulong 320
+global exp_gn_ts ulong 320
+global exp_gn_decl_par ulong 320
+
+note EvidenceGraph raw edges (owner node idx -> target id string, relation)
+global exp_ge_owner ulong 1024
+global exp_ge_to_off ulong 1024
+global exp_ge_to_len ulong 1024
+global exp_ge_rel ulong 1024
+
+note EvidenceGraph measurements
+global exp_gm_owner ulong 256
+global exp_gm_name_off ulong 256
+global exp_gm_name_len ulong 256
+global exp_gm_val_off ulong 256
+global exp_gm_val_len ulong 256
+global exp_gm_unit_off ulong 256
+global exp_gm_unit_len ulong 256
+
+note EvidenceGraph missing links
+global exp_gx_owner ulong 128
+global exp_gx_exp_off ulong 128
+global exp_gx_exp_len ulong 128
+global exp_gx_rsn_off ulong 128
+global exp_gx_rsn_len ulong 128
+
+note EvidenceGraph notes
+global exp_go_owner ulong 128
+global exp_go_off ulong 128
+global exp_go_len ulong 128
+
+note EvidenceGraph truncated_at and scope.referenced
+global exp_gt_off ulong 128
+global exp_gt_len ulong 128
+global exp_gs_off ulong 128
+global exp_gs_len ulong 128
+
+note Builder scratch arrays
+global exp_w_sup_off ulong 320
+global exp_w_sup_cnt ulong 320
+global exp_w_sup_rel ulong 1024
+global exp_w_sup_to_off ulong 1024
+global exp_w_sup_to_len ulong 1024
+global exp_w_sup_total ulong 1
+global exp_w_depth ulong 320
+global exp_w_vis ulong 320
+global exp_w_trunc ulong 320
+global exp_w_queue ulong 320
+global exp_w_color ulong 320
+global exp_w_ve_off ulong 320
+global exp_w_ve_cnt ulong 320
+global exp_w_ve_to ulong 1024
+global exp_w_ve_rel ulong 1024
+global exp_w_ve_cut ulong 1024
+global exp_w_ve_total ulong 1
+global exp_w_stk_n ulong 640
+global exp_w_stk_i ulong 640
+global exp_w_rem ulong 320
+global exp_w_placed ulong 320
+global exp_w_pos ulong 320
+global exp_w_sorted_n ulong 320
+global exp_w_tmp_off ulong 128
+global exp_w_tmp_len ulong 128
+global exp_w_inv_off ulong 128
+global exp_w_inv_len ulong 128
+global exp_w_bfs_st ulong 2
+
+note Built ExplanationBundle
+global exp_b_scnt ulong 1
+global exp_b_concl_step ulong 1
+global exp_bs_nid ulong 320
+global exp_bs_role ulong 320
+global exp_bs_depth ulong 320
+global exp_bs_gnd ulong 320
+global exp_bs_bref ulong 320
+global exp_bs_sup_off ulong 320
+global exp_bs_sup_cnt ulong 320
+global exp_bs_sup_step ulong 1024
+global exp_bs_sup_rel ulong 1024
+global exp_bs_sup_total ulong 1
+
+global exp_be_cnt ulong 1
+global exp_be_step ulong 320
+
+global exp_bu_cnt ulong 1
+global exp_bu_kind ulong 512
+global exp_bu_nid_off ulong 512
+global exp_bu_nid_len ulong 512
+global exp_bu_has_rel ulong 512
+global exp_bu_rel_off ulong 512
+global exp_bu_rel_len ulong 512
+global exp_bu_det_off ulong 512
+global exp_bu_det_len ulong 512
+
+global exp_bc_cnt ulong 1
+global exp_bc_nid ulong 128
+global exp_bc_stmt_off ulong 128
+global exp_bc_stmt_len ulong 128
+global exp_bc_inv_off ulong 128
+global exp_bc_inv_cnt ulong 128
+global exp_bc_inv_total ulong 1
+global exp_bc_inv_id_off ulong 256
+global exp_bc_inv_id_len ulong 256
+
+global exp_ba_cnt ulong 1
+global exp_ba_nid ulong 128
+global exp_ba_to_off ulong 128
+global exp_ba_to_len ulong 128
+
+global exp_bp_tgt_off ulong 1
+global exp_bp_tgt_len ulong 1
+global exp_bp_max_d ulong 1
+global exp_bp_max_n ulong 1
+global exp_bp_vis ulong 1
+global exp_bp_gnodes ulong 1
+global exp_bp_in_dig uchar 32
+global exp_bp_bun_dig uchar 32
+
+note Cortex adapter store
+global exp_cx_str uchar 16384
+global exp_cx_str_len ulong 1
+global exp_cx_cnt ulong 1
+global exp_cx_seq ulong 1
+global exp_cx_id uchar 1024
+global exp_cx_status ulong 64
+global exp_cx_stmt_off ulong 64
+global exp_cx_stmt_len ulong 64
+global exp_cx_prov_off ulong 64
+global exp_cx_prov_len ulong 64
+global exp_cx_evhash uchar 2048
+global exp_cx_ts ulong 64
+global exp_cx_has_conf ulong 64
+global exp_cx_conf ulong 64
+global exp_cx_has_vby ulong 64
+global exp_cx_vby_off ulong 64
+global exp_cx_vby_len ulong 64
+global exp_cx_pcnt ulong 1
+global exp_cx_p_own ulong 256
+global exp_cx_p_id uchar 4096
+
+note Cortex adapter scratch
+global exp_cxw_depth ulong 64
+global exp_cxw_vis ulong 64
+global exp_cxw_trunc ulong 64
+global exp_cxw_isroot ulong 64
+global exp_cxw_q ulong 64
+global exp_cxw_ord ulong 64
+global exp_cxw_emit ulong 64
+global exp_cxw_con ulong 64
+
+note Agent branch adapter store
+global exp_br_cnt ulong 1
+global exp_br_id uchar 256
+global exp_br_has_par ulong 16
+global exp_br_par_id uchar 256
+global exp_br_depth ulong 16
+global exp_br_ts ulong 16
+global exp_br_rcnt ulong 1
+global exp_br_r_own ulong 64
+global exp_br_r_id uchar 1024
+global exp_br_tcnt ulong 1
+global exp_br_t_own ulong 128
+global exp_br_t_val ulong 128
+
+note ExplanationSession state (0=level, 1=audience)
+global exp_sess ulong 2
+
+note ============================================================================
+note Section 3: Contract Predicates and Enum Helpers
+note ============================================================================
+
+fn exp_status_valid code ulong to bool
+ret le code EXP_ST_OPERATOR_DECISION
+end
+
+fn exp_status_is_grounding code ulong to bool
+if eq code EXP_ST_DIRECT_OBS
+ret true
+end
+if eq code EXP_ST_VERIFIED_FACT
+ret true
+end
+if eq code EXP_ST_OPERATOR_DECISION
+ret true
+end
+ret false
+end
+
+fn exp_kind_valid code ulong to bool
+if lt code EXP_KD_CORTEX_RECORD
+ret false
+end
+if gt code EXP_KD_ALTERNATIVE
+ret false
+end
+ret true
+end
+
+fn exp_rel_valid code ulong to bool
+if lt code EXP_REL_SUPPORTED_BY
+ret false
+end
+if gt code EXP_REL_REFERENCES
+ret false
+end
+ret true
+end
+
+fn exp_rel_is_support code ulong to bool
+if eq code EXP_REL_SUPPORTED_BY
+ret true
+end
+if eq code EXP_REL_EVALUATES
+ret true
+end
+if eq code EXP_REL_PART_OF
+ret true
+end
+if eq code EXP_REL_REFERENCES
+ret true
+end
+ret false
+end
+
+fn exp_role_of kd ulong st ulong to ulong
+if eq kd EXP_KD_CAP_METRIC
+ret EXP_ROLE_OBSERVED
+end
+if eq kd EXP_KD_CAP_ANALYSIS
+ret EXP_ROLE_ANALYSIS
+end
+if eq kd EXP_KD_DIAGNOSTIC
+ret EXP_ROLE_ANALYSIS
+end
+if eq kd EXP_KD_HYPOTHESIS
+ret EXP_ROLE_HYPOTHESIS
+end
+if eq kd EXP_KD_PREDICTION
+ret EXP_ROLE_PREDICTION
+end
+if eq kd EXP_KD_FALSIFICATION
+ret EXP_ROLE_FALSIFICATION
+end
+if eq kd EXP_KD_EVAL_RECEIPT
+ret EXP_ROLE_EVALUATION
+end
+if eq kd EXP_KD_PROMOTION_STATE
+ret EXP_ROLE_DECISION
+end
+if eq kd EXP_KD_OPERATOR_DECISION
+ret EXP_ROLE_DECISION
+end
+if eq kd EXP_KD_CONCLUSION
+ret EXP_ROLE_CONCLUSION
+end
+if eq kd EXP_KD_AGENT_BRANCH
+ret EXP_ROLE_CONCLUSION
+end
+if eq kd EXP_KD_ALTERNATIVE
+ret EXP_ROLE_ANALYSIS
+end
+note CortexRecord maps by epistemic status
+if eq st EXP_ST_DIRECT_OBS
+ret EXP_ROLE_OBSERVED
+end
+if eq st EXP_ST_VERIFIED_FACT
+ret EXP_ROLE_OBSERVED
+end
+if eq st EXP_ST_OPERATOR_DECISION
+ret EXP_ROLE_DECISION
+end
+if eq st EXP_ST_HYPOTHESIS
+ret EXP_ROLE_HYPOTHESIS
+end
+ret EXP_ROLE_ANALYSIS
+end
+
+fn exp_uk_severity uk ulong to ulong
+if eq uk EXP_UK_CYCLE
+ret 0
+end
+if eq uk EXP_UK_CONFLICT
+ret 1
+end
+if eq uk EXP_UK_MISSING_PARENT
+ret 2
+end
+if eq uk EXP_UK_MISSING_LINK
+ret 3
+end
+if eq uk EXP_UK_UNSUPPORTED
+ret 4
+end
+if eq uk EXP_UK_HYPO_NOT_FALSIFIED
+ret 5
+end
+if eq uk EXP_UK_UNKNOWN
+ret 6
+end
+if eq uk EXP_UK_TRUNCATED
+ret 7
+end
+if eq uk EXP_UK_PRODUCER_NOTE
+ret 8
+end
+ret 9
+end
+
+fn exp_check_limits max_d ulong max_n ulong to int
+if eq max_d 0
+ret EXP_ERR_INVALID_LIMITS
+end
+if eq max_n 0
+ret EXP_ERR_INVALID_LIMITS
+end
+if gt max_d EXP_HARD_MAX_DEPTH
+ret EXP_ERR_INVALID_LIMITS
+end
+if gt max_n EXP_HARD_MAX_NODES
+ret EXP_ERR_INVALID_LIMITS
+end
+ret EXP_OK
+end
+
+note ============================================================================
+note Section 4: String Arena, Output Buffer, Hex & Decimal Helpers
+note ============================================================================
+
+fn exp_str_reset to void
+put exp_str_len 0 0
+end
+
+fn exp_str_mark to ulong
+ret get exp_str_len 0
+end
+
+fn exp_str_put_b b uchar to void
+p = get exp_str_len 0
+if lt p EXP_STR_CAP
+put exp_str p b
+put exp_str_len 0 add p 1
+end
+end
+
+fn exp_str_add_view s view uchar * to ulong
+start = get exp_str_len 0
+n = len s
+for i ulong n bound 1024
+exp_str_put_b get s i
+end
+ret start
+end
+
+fn exp_str_add_arena off ulong ln ulong to ulong
+start = get exp_str_len 0
+for i ulong ln bound 1024
+exp_str_put_b get exp_str add off i
+end
+ret start
+end
+
+fn exp_str_add_u64 v ulong to void
+buf = new uchar 24 0
+if eq v 0
+exp_str_put_b uchar 48
+ret
+end
+k = ulong 0
+cur = v
+while gt cur 0 bound 24
+put buf k uchar add 48 rem cur 10
+cur = div cur 10
+k = add k 1
+end
+for i ulong k bound 24
+exp_str_put_b get buf sub sub k 1 i
+end
+end
+
+fn exp_str_add_hex16 src_base ulong is_cx ulong to void
+for i ulong 16
+b = ulong 0
+if eq is_cx 1
+b = ulong get exp_cx_id add src_base i
+else
+if eq is_cx 2
+b = ulong get exp_br_id add src_base i
+else
+b = ulong get exp_br_par_id add src_base i
+end
+end
+exp_str_put_b get exp_txt_hex shr b 4
+exp_str_put_b get exp_txt_hex and b 15
+end
+end
+
+fn exp_str_add_hex16_view id view uchar * to void
+for i ulong 16
+b = ulong get id i
+exp_str_put_b get exp_txt_hex shr b 4
+exp_str_put_b get exp_txt_hex and b 15
+end
+end
+
+fn exp_str_add_hex32_cx base ulong to void
+for i ulong 32
+b = ulong get exp_cx_evhash add base i
+exp_str_put_b get exp_txt_hex shr b 4
+exp_str_put_b get exp_txt_hex and b 15
+end
+end
+
+fn exp_str_cmp a_off ulong a_ln ulong b_off ulong b_ln ulong to int
+ml = a_ln
+if lt b_ln ml
+ml = b_ln
+end
+for i ulong ml bound 1024
+ca = get exp_str add a_off i
+cb = get exp_str add b_off i
+if lt ca cb
+ret -1
+end
+if gt ca cb
+ret 1
+end
+end
+if lt a_ln b_ln
+ret -1
+end
+if gt a_ln b_ln
+ret 1
+end
+ret 0
+end
+
+fn exp_str_eq a_off ulong a_ln ulong b_off ulong b_ln ulong to bool
+if ne a_ln b_ln
+ret false
+end
+for i ulong a_ln bound 1024
+if ne get exp_str add a_off i get exp_str add b_off i
+ret false
+end
+end
+ret true
+end
+
+fn exp_str_eq_view a_off ulong a_ln ulong s view uchar * to bool
+if ne a_ln len s
+ret false
+end
+for i ulong a_ln bound 1024
+if ne get exp_str add a_off i get s i
+ret false
+end
+end
+ret true
+end
+
+fn exp_view_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+for i ulong len a bound 1024
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn exp_out_reset to void
+put exp_out_len 0 0
+end
+
+fn exp_out_b b uchar to void
+p = get exp_out_len 0
+if lt p EXP_OUT_CAP
+put exp_out p b
+put exp_out_len 0 add p 1
+end
+end
+
+fn exp_out_view s view uchar * to void
+n = len s
+for i ulong n bound 1024
+exp_out_b get s i
+end
+end
+
+fn exp_out_arena off ulong ln ulong to void
+for i ulong ln bound 1024
+exp_out_b get exp_str add off i
+end
+end
+
+fn exp_out_u64 v ulong to void
+buf = new uchar 24 0
+if eq v 0
+exp_out_b uchar 48
+ret
+end
+k = ulong 0
+cur = v
+while gt cur 0 bound 24
+put buf k uchar add 48 rem cur 10
+cur = div cur 10
+k = add k 1
+end
+for i ulong k bound 24
+exp_out_b get buf sub sub k 1 i
+end
+end
+
+fn exp_out_dig32 is_bun ulong to void
+for i ulong 32
+b = ulong 0
+if eq is_bun 1
+b = ulong get exp_bp_bun_dig i
+else
+b = ulong get exp_bp_in_dig i
+end
+exp_out_b get exp_txt_hex shr b 4
+exp_out_b get exp_txt_hex and b 15
+end
+end
+
+fn exp_out_copy dst edit uchar * to ulong
+n = get exp_out_len 0
+if gt n len dst
+n = len dst
+end
+for i ulong n bound 32768
+put dst i get exp_out i
+end
+ret n
+end
+
+fn exp_out_match_at pos ulong needle view uchar * to bool
+nlen = len needle
+for j ulong nlen bound 256
+if ne get exp_out add pos j get needle j
+ret false
+end
+end
+ret true
+end
+
+fn exp_out_contains needle view uchar * to bool
+nlen = len needle
+olen = get exp_out_len 0
+if eq nlen 0
+ret true
+end
+if gt nlen olen
+ret false
+end
+lim = add sub olen nlen 1
+for i ulong lim bound 32768
+if exp_out_match_at i needle
+ret true
+end
+end
+ret false
+end
+
+fn exp_slice_contains_out start ulong endp ulong needle view uchar * to bool
+nlen = len needle
+slen = sub endp start
+if eq nlen 0
+ret true
+end
+if gt nlen slen
+ret false
+end
+lim = add sub slen nlen 1
+for i ulong lim bound 2048
+if exp_out_match_at add start i needle
+ret true
+end
+end
+ret false
+end
+
+fn exp_out_any_line_has_both a view uchar * b view uchar * to bool
+olen = get exp_out_len 0
+pos = ulong 0
+while lt pos olen bound 4096
+st = pos
+while lt pos olen bound 2048
+if eq get exp_out pos 10
+break
+end
+pos = add pos 1
+end
+if exp_slice_contains_out st pos a
+if exp_slice_contains_out st pos b
+ret true
+end
+end
+if lt pos olen
+pos = add pos 1
+end
+end
+ret false
+end
+
+note ============================================================================
+note Section 5: Streaming SHA-256 Helpers for Canonical Digests
+note ============================================================================
+
+fn exp_sha_u64 ctx edit ulong * v ulong to void
+buf = new uchar 8 0
+for i ulong 8
+sh = mul sub 7 i 8
+put buf i uchar and shr v sh 0xff
+end
+sha256_update ctx buf
+end
+
+fn exp_sha_arena ctx edit ulong * off ulong ln ulong to void
+exp_sha_u64 ctx ln
+buf = new uchar 64 0
+pos = ulong 0
+while lt pos ln bound 2048
+k = sub ln pos
+if gt k 64
+k = 64
+end
+for i ulong k bound 64
+put buf i get exp_str add add off pos i
+end
+sha256_update ctx part buf 0 k
+pos = add pos k
+end
+end
+
+fn exp_sha_tag ctx edit ulong * tag ulong to void
+buf = new uchar 1 0
+put buf 0 uchar and tag 0xff
+sha256_update ctx buf
+end
+
+note ============================================================================
+note Section 6: EvidenceGraph Construction & Contract Validation (contract.rs)
+note ============================================================================
+
+fn exp_g_reset_prod prod view uchar * to void
+exp_str_reset
+fo = exp_str_add_view exp_txt_format
+put exp_g_fmt_off 0 fo
+put exp_g_fmt_len 0 len exp_txt_format
+put exp_g_ver 0 EXP_VERSION
+po = exp_str_add_view prod
+put exp_g_prod_off 0 po
+put exp_g_prod_len 0 len prod
+put exp_g_ncnt 0 0
+put exp_g_decl_ncnt 0 0
+put exp_g_ecnt 0 0
+put exp_g_mcnt 0 0
+put exp_g_xcnt 0 0
+put exp_g_notecnt 0 0
+put exp_g_tcnt 0 0
+put exp_g_has_scope 0 0
+put exp_g_sbr_off 0 0
+put exp_g_sbr_len 0 0
+put exp_g_scnt 0 0
+end
+
+fn exp_g_set_format fmt view uchar * to void
+fo = exp_str_add_view fmt
+put exp_g_fmt_off 0 fo
+put exp_g_fmt_len 0 len fmt
+end
+
+fn exp_g_set_version ver ulong to void
+put exp_g_ver 0 ver
+end
+
+fn exp_g_set_producer prod view uchar * to void
+po = exp_str_add_view prod
+put exp_g_prod_off 0 po
+put exp_g_prod_len 0 len prod
+end
+
+fn exp_g_add_node_raw id_o ulong id_l ulong kd ulong st ulong to ulong
+idx = get exp_g_ncnt 0
+if ge idx EXP_CAP_NODES
+ret EXP_NONE
+end
+put exp_gn_id_off idx id_o
+put exp_gn_id_len idx id_l
+put exp_gn_kind idx kd
+put exp_gn_status idx st
+put exp_gn_stmt_off idx 0
+put exp_gn_stmt_len idx 0
+put exp_gn_sys_off idx 0
+put exp_gn_sys_len idx 0
+put exp_gn_art_off idx 0
+put exp_gn_art_len idx 0
+put exp_gn_ref_off idx 0
+put exp_gn_ref_len idx 0
+put exp_gn_has_dig idx 0
+put exp_gn_dig_off idx 0
+put exp_gn_dig_len idx 0
+put exp_gn_has_conf idx 0
+put exp_gn_conf idx 0
+put exp_gn_has_cbas idx 0
+put exp_gn_cbas_off idx 0
+put exp_gn_cbas_len idx 0
+put exp_gn_has_ts idx 0
+put exp_gn_ts idx 0
+put exp_gn_decl_par idx 0
+put exp_g_ncnt 0 add idx 1
+put exp_g_decl_ncnt 0 add idx 1
+ret idx
+end
+
+fn exp_g_add_node id view uchar * kd ulong st ulong stmt view uchar * to ulong
+id_o = exp_str_add_view id
+nid = exp_g_add_node_raw id_o len id kd st
+if eq nid EXP_NONE
+ret EXP_NONE
+end
+st_o = exp_str_add_view stmt
+put exp_gn_stmt_off nid st_o
+put exp_gn_stmt_len nid len stmt
+ret nid
+end
+
+fn exp_g_set_source_sa nid ulong sys view uchar * art view uchar * to void
+if ge nid get exp_g_ncnt 0
+ret
+end
+so = exp_str_add_view sys
+ao = exp_str_add_view art
+put exp_gn_sys_off nid so
+put exp_gn_sys_len nid len sys
+put exp_gn_art_off nid ao
+put exp_gn_art_len nid len art
+end
+
+fn exp_g_set_source_ref nid ulong rf view uchar * to void
+if ge nid get exp_g_ncnt 0
+ret
+end
+ro = exp_str_add_view rf
+put exp_gn_ref_off nid ro
+put exp_gn_ref_len nid len rf
+end
+
+fn exp_g_set_digest nid ulong dig view uchar * to void
+if ge nid get exp_g_ncnt 0
+ret
+end
+dig_o = exp_str_add_view dig
+put exp_gn_has_dig nid 1
+put exp_gn_dig_off nid dig_o
+put exp_gn_dig_len nid len dig
+end
+
+fn exp_g_set_conf nid ulong pm ulong bas view uchar * to void
+if ge nid get exp_g_ncnt 0
+ret
+end
+put exp_gn_has_conf nid 1
+put exp_gn_conf nid pm
+bo = exp_str_add_view bas
+put exp_gn_has_cbas nid 1
+put exp_gn_cbas_off nid bo
+put exp_gn_cbas_len nid len bas
+end
+
+fn exp_g_set_ts nid ulong ts ulong to void
+if ge nid get exp_g_ncnt 0
+ret
+end
+put exp_gn_has_ts nid 1
+put exp_gn_ts nid ts
+end
+
+fn exp_g_add_edge_raw nid ulong to_o ulong to_l ulong rl ulong to void
+ec = get exp_g_ecnt 0
+if ge ec EXP_CAP_EDGES
+ret
+end
+put exp_ge_owner ec nid
+put exp_ge_to_off ec to_o
+put exp_ge_to_len ec to_l
+put exp_ge_rel ec rl
+put exp_g_ecnt 0 add ec 1
+end
+
+fn exp_g_add_edge nid ulong target view uchar * rl ulong to void
+to_o = exp_str_add_view target
+exp_g_add_edge_raw nid to_o len target rl
+end
+
+fn exp_g_add_meas nid ulong nm view uchar * vl view uchar * to ulong
+mc = get exp_g_mcnt 0
+if ge mc EXP_CAP_MEAS
+ret EXP_NONE
+end
+put exp_gm_owner mc nid
+no = exp_str_add_view nm
+vo = exp_str_add_view vl
+put exp_gm_name_off mc no
+put exp_gm_name_len mc len nm
+put exp_gm_val_off mc vo
+put exp_gm_val_len mc len vl
+put exp_gm_unit_off mc 0
+put exp_gm_unit_len mc 0
+put exp_g_mcnt 0 add mc 1
+ret mc
+end
+
+fn exp_g_meas_set_unit mid ulong un view uchar * to void
+if ge mid get exp_g_mcnt 0
+ret
+end
+uo = exp_str_add_view un
+put exp_gm_unit_off mid uo
+put exp_gm_unit_len mid len un
+end
+
+fn exp_g_add_missing nid ulong ex view uchar * rsn view uchar * to void
+xc = get exp_g_xcnt 0
+if ge xc EXP_CAP_MISS
+ret
+end
+put exp_gx_owner xc nid
+eo = exp_str_add_view ex
+ro = exp_str_add_view rsn
+put exp_gx_exp_off xc eo
+put exp_gx_exp_len xc len ex
+put exp_gx_rsn_off xc ro
+put exp_gx_rsn_len xc len rsn
+put exp_g_xcnt 0 add xc 1
+end
+
+fn exp_g_add_note nid ulong nt view uchar * to void
+nc = get exp_g_notecnt 0
+if ge nc EXP_CAP_NOTES
+ret
+end
+put exp_go_owner nc nid
+no = exp_str_add_view nt
+put exp_go_off nc no
+put exp_go_len nc len nt
+put exp_g_notecnt 0 add nc 1
+end
+
+fn exp_g_add_truncated_raw id_o ulong id_l ulong to void
+tc = get exp_g_tcnt 0
+if ge tc EXP_CAP_TRUNC
+ret
+end
+put exp_gt_off tc id_o
+put exp_gt_len tc id_l
+put exp_g_tcnt 0 add tc 1
+end
+
+fn exp_g_add_truncated id view uchar * to void
+io = exp_str_add_view id
+exp_g_add_truncated_raw io len id
+end
+
+fn exp_g_set_scope_branch br_o ulong br_l ulong to void
+put exp_g_has_scope 0 1
+put exp_g_sbr_off 0 br_o
+put exp_g_sbr_len 0 br_l
+end
+
+fn exp_g_add_scope_ref_raw id_o ulong id_l ulong to void
+sc = get exp_g_scnt 0
+if ge sc EXP_CAP_SCOPE
+ret
+end
+put exp_gs_off sc id_o
+put exp_gs_len sc id_l
+put exp_g_scnt 0 add sc 1
+end
+
+fn exp_g_find_node id_o ulong id_l ulong to ulong
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+if exp_str_eq get exp_gn_id_off i get exp_gn_id_len i id_o id_l
+ret i
+end
+end
+ret EXP_NONE
+end
+
+fn exp_g_find_node_view id view uchar * to ulong
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+if exp_str_eq_view get exp_gn_id_off i get exp_gn_id_len i id
+ret i
+end
+end
+ret EXP_NONE
+end
+
+fn exp_g_is_prod_truncated id_o ulong id_l ulong to bool
+tc = get exp_g_tcnt 0
+for i ulong tc bound 128
+if exp_str_eq get exp_gt_off i get exp_gt_len i id_o id_l
+ret true
+end
+end
+ret false
+end
+
+fn exp_g_is_scope_ref id_o ulong id_l ulong to bool
+sc = get exp_g_scnt 0
+for i ulong sc bound 128
+if exp_str_eq get exp_gs_off i get exp_gs_len i id_o id_l
+ret true
+end
+end
+ret false
+end
+
+fn exp_g_validate to int
+if not exp_str_eq_view get exp_g_fmt_off 0 get exp_g_fmt_len 0 exp_txt_format
+ret EXP_ERR_UNSUPPORTED_VERSION
+end
+if ne get exp_g_ver 0 EXP_VERSION
+ret EXP_ERR_UNSUPPORTED_VERSION
+end
+if gt get exp_g_decl_ncnt 0 EXP_MAX_GRAPH_NODES
+ret EXP_ERR_GRAPH_TOO_LARGE
+end
+nc = get exp_g_ncnt 0
+if gt nc EXP_MAX_GRAPH_NODES
+ret EXP_ERR_GRAPH_TOO_LARGE
+end
+for i ulong nc bound 320
+if not exp_kind_valid get exp_gn_kind i
+ret EXP_ERR_UNKNOWN_CODE
+end
+if not exp_status_valid get exp_gn_status i
+ret EXP_ERR_UNKNOWN_CODE
+end
+if ne get exp_gn_has_conf i 0
+if gt get exp_gn_conf i 1000
+ret EXP_ERR_UNKNOWN_CODE
+end
+end
+if gt get exp_gn_decl_par i EXP_MAX_PARENTS_PER_NODE
+ret EXP_ERR_GRAPH_TOO_LARGE
+end
+for j ulong i bound 320
+if exp_str_eq get exp_gn_id_off i get exp_gn_id_len i get exp_gn_id_off j get exp_gn_id_len j
+ret EXP_ERR_DUPLICATE_NODE_ID
+end
+end
+end
+ec = get exp_g_ecnt 0
+for i ulong ec bound 1024
+if not exp_rel_valid get exp_ge_rel i
+ret EXP_ERR_UNKNOWN_CODE
+end
+end
+for i ulong nc bound 320
+pc = ulong 0
+for e ulong ec bound 1024
+if eq get exp_ge_owner e i
+pc = add pc 1
+end
+end
+if gt pc EXP_MAX_PARENTS_PER_NODE
+ret EXP_ERR_GRAPH_TOO_LARGE
+end
+end
+ret EXP_OK
+end
+
+note Structural JSON envelope check (rejects malformed JSON with E1)
+fn exp_json_check raw view uchar * to int
+n = len raw
+if lt n 2
+ret EXP_ERR_BAD_FORMAT
+end
+if ne get raw 0 123
+ret EXP_ERR_BAD_FORMAT
+end
+if ne get raw sub n 1 125
+ret EXP_ERR_BAD_FORMAT
+end
+depth = ulong 0
+in_str = false
+esc = false
+for i ulong n bound 8192
+ch = get raw i
+if in_str
+if esc
+esc = false
+else
+if eq ch 92
+esc = true
+else
+if eq ch 34
+in_str = false
+end
+end
+end
+else
+if eq ch 34
+in_str = true
+else
+if or eq ch 123 eq ch 91
+depth = add depth 1
+else
+if or eq ch 125 eq ch 93
+if eq depth 0
+ret EXP_ERR_BAD_FORMAT
+end
+depth = sub depth 1
+end
+end
+end
+end
+end
+if in_str
+ret EXP_ERR_BAD_FORMAT
+end
+if ne depth 0
+ret EXP_ERR_BAD_FORMAT
+end
+has_colon = false
+for i ulong n bound 8192
+if eq get raw i 58
+has_colon = true
+break
+end
+end
+if not has_colon
+ret EXP_ERR_BAD_FORMAT
+end
+ret EXP_OK
+end
+
+note ============================================================================
+note Section 7: Canonical Input & Bundle SHA-256 Digests (bundle.rs)
+note ============================================================================
+
+fn exp_hash_graph_node ctx edit ulong * nid ulong to void
+exp_sha_tag ctx 1
+exp_sha_arena ctx get exp_gn_id_off nid get exp_gn_id_len nid
+exp_sha_u64 ctx get exp_gn_kind nid
+exp_sha_u64 ctx get exp_gn_status nid
+exp_sha_arena ctx get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+exp_sha_arena ctx get exp_gn_sys_off nid get exp_gn_sys_len nid
+exp_sha_arena ctx get exp_gn_art_off nid get exp_gn_art_len nid
+exp_sha_arena ctx get exp_gn_ref_off nid get exp_gn_ref_len nid
+exp_sha_u64 ctx get exp_gn_has_dig nid
+if ne get exp_gn_has_dig nid 0
+exp_sha_arena ctx get exp_gn_dig_off nid get exp_gn_dig_len nid
+end
+exp_sha_u64 ctx get exp_gn_has_conf nid
+if ne get exp_gn_has_conf nid 0
+exp_sha_u64 ctx get exp_gn_conf nid
+end
+exp_sha_u64 ctx get exp_gn_has_cbas nid
+if ne get exp_gn_has_cbas nid 0
+exp_sha_arena ctx get exp_gn_cbas_off nid get exp_gn_cbas_len nid
+end
+exp_sha_u64 ctx get exp_gn_has_ts nid
+if ne get exp_gn_has_ts nid 0
+exp_sha_u64 ctx get exp_gn_ts nid
+end
+end
+
+fn exp_hash_graph_node_lists ctx edit ulong * nid ulong to void
+ec = get exp_g_ecnt 0
+for e ulong ec bound 1024
+if eq get exp_ge_owner e nid
+exp_sha_tag ctx 2
+exp_sha_arena ctx get exp_ge_to_off e get exp_ge_to_len e
+exp_sha_u64 ctx get exp_ge_rel e
+end
+end
+mc = get exp_g_mcnt 0
+for m ulong mc bound 256
+if eq get exp_gm_owner m nid
+exp_sha_tag ctx 3
+exp_sha_arena ctx get exp_gm_name_off m get exp_gm_name_len m
+exp_sha_arena ctx get exp_gm_val_off m get exp_gm_val_len m
+exp_sha_arena ctx get exp_gm_unit_off m get exp_gm_unit_len m
+end
+end
+xc = get exp_g_xcnt 0
+for x ulong xc bound 128
+if eq get exp_gx_owner x nid
+exp_sha_tag ctx 4
+exp_sha_arena ctx get exp_gx_exp_off x get exp_gx_exp_len x
+exp_sha_arena ctx get exp_gx_rsn_off x get exp_gx_rsn_len x
+end
+end
+noc = get exp_g_notecnt 0
+for o ulong noc bound 128
+if eq get exp_go_owner o nid
+exp_sha_tag ctx 5
+exp_sha_arena ctx get exp_go_off o get exp_go_len o
+end
+end
+end
+
+fn exp_compute_input_digest dst edit uchar * to void
+ctx = new ulong 40 0
+sha256_init ctx
+exp_sha_arena ctx get exp_g_fmt_off 0 get exp_g_fmt_len 0
+exp_sha_u64 ctx get exp_g_ver 0
+exp_sha_arena ctx get exp_g_prod_off 0 get exp_g_prod_len 0
+nc = get exp_g_ncnt 0
+exp_sha_u64 ctx nc
+for i ulong nc bound 320
+exp_hash_graph_node ctx i
+exp_hash_graph_node_lists ctx i
+end
+tc = get exp_g_tcnt 0
+exp_sha_u64 ctx tc
+for i ulong tc bound 128
+exp_sha_arena ctx get exp_gt_off i get exp_gt_len i
+end
+exp_sha_u64 ctx get exp_g_has_scope 0
+if ne get exp_g_has_scope 0 0
+exp_sha_arena ctx get exp_g_sbr_off 0 get exp_g_sbr_len 0
+sc = get exp_g_scnt 0
+exp_sha_u64 ctx sc
+for i ulong sc bound 128
+exp_sha_arena ctx get exp_gs_off i get exp_gs_len i
+end
+end
+sha256_final ctx dst
+end
+
+fn exp_hash_bundle_steps ctx edit ulong * to void
+sc = get exp_b_scnt 0
+exp_sha_u64 ctx sc
+for i ulong sc bound 320
+nid = get exp_bs_nid i
+exp_sha_tag ctx 10
+exp_sha_u64 ctx add i 1
+exp_hash_graph_node ctx nid
+exp_sha_u64 ctx get exp_bs_role i
+exp_sha_u64 ctx get exp_bs_depth i
+exp_sha_u64 ctx get exp_bs_gnd i
+exp_sha_u64 ctx get exp_bs_bref i
+soff = get exp_bs_sup_off i
+scnt = get exp_bs_sup_cnt i
+exp_sha_u64 ctx scnt
+for j ulong scnt bound 1024
+exp_sha_u64 ctx get exp_bs_sup_step add soff j
+exp_sha_u64 ctx get exp_bs_sup_rel add soff j
+end
+end
+end
+
+fn exp_hash_bundle_ev_unc ctx edit ulong * to void
+evc = get exp_be_cnt 0
+exp_sha_u64 ctx evc
+for i ulong evc bound 320
+exp_sha_tag ctx 11
+exp_sha_u64 ctx get exp_be_step i
+end
+uc = get exp_bu_cnt 0
+exp_sha_u64 ctx uc
+for i ulong uc bound 512
+exp_sha_tag ctx 12
+exp_sha_u64 ctx get exp_bu_kind i
+exp_sha_arena ctx get exp_bu_nid_off i get exp_bu_nid_len i
+exp_sha_u64 ctx get exp_bu_has_rel i
+if ne get exp_bu_has_rel i 0
+exp_sha_arena ctx get exp_bu_rel_off i get exp_bu_rel_len i
+end
+exp_sha_arena ctx get exp_bu_det_off i get exp_bu_det_len i
+end
+end
+
+fn exp_hash_contra_one ctx edit ulong * i ulong to void
+exp_sha_tag ctx 13
+nid = get exp_bc_nid i
+exp_sha_arena ctx get exp_gn_id_off nid get exp_gn_id_len nid
+exp_sha_arena ctx get exp_bc_stmt_off i get exp_bc_stmt_len i
+io = get exp_bc_inv_off i
+ic = get exp_bc_inv_cnt i
+exp_sha_u64 ctx ic
+for j ulong ic bound 256
+exp_sha_arena ctx get exp_bc_inv_id_off add io j get exp_bc_inv_id_len add io j
+end
+end
+
+fn exp_hash_bundle_extras ctx edit ulong * to void
+exp_hash_bundle_ev_unc ctx
+cc = get exp_bc_cnt 0
+exp_sha_u64 ctx cc
+for i ulong cc bound 128
+exp_hash_contra_one ctx i
+end
+ac = get exp_ba_cnt 0
+exp_sha_u64 ctx ac
+for i ulong ac bound 128
+exp_sha_tag ctx 14
+nid = get exp_ba_nid i
+exp_sha_arena ctx get exp_gn_id_off nid get exp_gn_id_len nid
+exp_sha_arena ctx get exp_ba_to_off i get exp_ba_to_len i
+end
+end
+
+fn exp_compute_bundle_digest dst edit uchar * to void
+ctx = new ulong 40 0
+sha256_init ctx
+exp_sha_u64 ctx get exp_b_concl_step 0
+exp_hash_bundle_steps ctx
+exp_hash_bundle_extras ctx
+exp_sha_tag ctx 15
+exp_sha_arena ctx get exp_g_fmt_off 0 get exp_g_fmt_len 0
+exp_sha_u64 ctx get exp_g_ver 0
+exp_sha_arena ctx get exp_g_prod_off 0 get exp_g_prod_len 0
+exp_sha_arena ctx get exp_bp_tgt_off 0 get exp_bp_tgt_len 0
+exp_sha_u64 ctx get exp_bp_max_d 0
+exp_sha_u64 ctx get exp_bp_max_n 0
+exp_sha_u64 ctx get exp_bp_vis 0
+exp_sha_u64 ctx get exp_bp_gnodes 0
+indig = new uchar 32 0
+for i ulong 32
+put indig i get exp_bp_in_dig i
+end
+sha256_update ctx indig
+sha256_final ctx dst
+end
+
+fn exp_bundle_verify_digest to bool
+dig = new uchar 32 0
+exp_compute_bundle_digest dig
+for i ulong 32
+if ne get dig i get exp_bp_bun_dig i
+ret false
+end
+end
+ret true
+end
+
+fn exp_bundle_get_digest dst edit uchar * to void
+for i ulong 32
+put dst i get exp_bp_bun_dig i
+end
+end
+
+fn exp_bundle_get_input_digest dst edit uchar * to void
+for i ulong 32
+put dst i get exp_bp_in_dig i
+end
+end
+
+note ============================================================================
+note Section 8: Bounded Backtracking, Cycle Cutting & Kahn Linearization (build.rs)
+note ============================================================================
+
+fn exp_add_unc uk ulong no ulong nl ulong det_o ulong det_l ulong to ulong
+uc = get exp_bu_cnt 0
+if ge uc EXP_CAP_UNCS
+ret EXP_NONE
+end
+put exp_bu_kind uc uk
+put exp_bu_nid_off uc no
+put exp_bu_nid_len uc nl
+put exp_bu_has_rel uc 0
+put exp_bu_rel_off uc 0
+put exp_bu_rel_len uc 0
+put exp_bu_det_off uc det_o
+put exp_bu_det_len uc det_l
+put exp_bu_cnt 0 add uc 1
+ret uc
+end
+
+fn exp_unc_set_rel idx ulong ro ulong rl ulong to void
+if eq idx EXP_NONE
+ret
+end
+put exp_bu_has_rel idx 1
+put exp_bu_rel_off idx ro
+put exp_bu_rel_len idx rl
+end
+
+fn exp_sup_gt p1 ulong p2 ulong to bool
+r1 = get exp_w_sup_rel p1
+r2 = get exp_w_sup_rel p2
+if gt r1 r2
+ret true
+end
+if eq r1 r2
+ret gt exp_str_cmp get exp_w_sup_to_off p1 get exp_w_sup_to_len p1 get exp_w_sup_to_off p2 get exp_w_sup_to_len p2 0
+end
+ret false
+end
+
+fn exp_sup_swap p1 ulong p2 ulong to void
+t = get exp_w_sup_rel p1
+put exp_w_sup_rel p1 get exp_w_sup_rel p2
+put exp_w_sup_rel p2 t
+t = get exp_w_sup_to_off p1
+put exp_w_sup_to_off p1 get exp_w_sup_to_off p2
+put exp_w_sup_to_off p2 t
+t = get exp_w_sup_to_len p1
+put exp_w_sup_to_len p1 get exp_w_sup_to_len p2
+put exp_w_sup_to_len p2 t
+end
+
+fn exp_sup_sort base ulong cnt ulong to void
+for a ulong cnt bound 1024
+j = a
+while gt j 0 bound 1024
+p1 = add base sub j 1
+p2 = add base j
+if exp_sup_gt p1 p2
+exp_sup_swap p1 p2
+j = sub j 1
+else
+break
+end
+end
+end
+end
+
+fn exp_sup_dedup base ulong cnt ulong to ulong
+ucnt = ulong 0
+for a ulong cnt bound 1024
+cur = add base a
+dup = false
+if gt ucnt 0
+prv = add base sub ucnt 1
+if eq get exp_w_sup_rel prv get exp_w_sup_rel cur
+if exp_str_eq get exp_w_sup_to_off prv get exp_w_sup_to_len prv get exp_w_sup_to_off cur get exp_w_sup_to_len cur
+dup = true
+end
+end
+end
+if not dup
+dst = add base ucnt
+put exp_w_sup_rel dst get exp_w_sup_rel cur
+put exp_w_sup_to_off dst get exp_w_sup_to_off cur
+put exp_w_sup_to_len dst get exp_w_sup_to_len cur
+ucnt = add ucnt 1
+end
+end
+ret ucnt
+end
+
+fn exp_build_support_one nid ulong to void
+base = get exp_w_sup_total 0
+cnt = ulong 0
+ec = get exp_g_ecnt 0
+for e ulong ec bound 1024
+if eq get exp_ge_owner e nid
+rl = get exp_ge_rel e
+if exp_rel_is_support rl
+pos = add base cnt
+if lt pos EXP_CAP_EDGES
+put exp_w_sup_rel pos rl
+put exp_w_sup_to_off pos get exp_ge_to_off e
+put exp_w_sup_to_len pos get exp_ge_to_len e
+cnt = add cnt 1
+end
+end
+end
+end
+exp_sup_sort base cnt
+ucnt = exp_sup_dedup base cnt
+put exp_w_sup_off nid base
+put exp_w_sup_cnt nid ucnt
+put exp_w_sup_total 0 add base ucnt
+end
+
+note Build sorted, deduplicated support edge list for each graph node
+fn exp_build_support_index to void
+put exp_w_sup_total 0 0
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+exp_build_support_one i
+end
+end
+
+fn exp_emit_missing_parent nid ulong po ulong pl ulong to void
+no = get exp_gn_id_off nid
+nl = get exp_gn_id_len nid
+st = exp_str_mark
+t = exp_str_add_arena no nl
+t = exp_str_add_view exp_s_miss_a
+t = exp_str_add_arena po pl
+t = exp_str_add_view exp_s_miss_b
+ui = exp_add_unc EXP_UK_MISSING_PARENT no nl st sub exp_str_mark st
+exp_unc_set_rel ui po pl
+end
+
+fn exp_emit_trunc_builder nid ulong max_d ulong max_n ulong to void
+no = get exp_gn_id_off nid
+nl = get exp_gn_id_len nid
+st = exp_str_mark
+t = exp_str_add_view exp_s_trunc_a
+t = exp_str_add_arena no nl
+t = exp_str_add_view exp_s_trunc_b
+exp_str_add_u64 max_d
+t = exp_str_add_view exp_s_trunc_c
+exp_str_add_u64 max_n
+exp_str_put_b uchar 41
+ui = exp_add_unc EXP_UK_TRUNCATED no nl st sub exp_str_mark st
+end
+
+fn exp_emit_trunc_prod nid ulong to void
+no = get exp_gn_id_off nid
+nl = get exp_gn_id_len nid
+st = exp_str_mark
+t = exp_str_add_view exp_s_ptrunc_a
+t = exp_str_add_arena no nl
+t = exp_str_add_view exp_s_ptrunc_b
+ui = exp_add_unc EXP_UK_TRUNCATED no nl st sub exp_str_mark st
+end
+
+fn exp_bfs_expand u ulong max_d ulong max_n ulong to void
+d = get exp_w_depth u
+so = get exp_w_sup_off u
+sc = get exp_w_sup_cnt u
+for k ulong sc bound 1024
+po = get exp_w_sup_to_off add so k
+pl = get exp_w_sup_to_len add so k
+pid = exp_g_find_node po pl
+if eq pid EXP_NONE
+if not exp_g_is_prod_truncated get exp_gn_id_off u get exp_gn_id_len u
+exp_emit_missing_parent u po pl
+end
+else
+if eq get exp_w_vis pid 0
+vcnt = get exp_w_bfs_st 1
+if or gt add d 1 max_d ge vcnt max_n
+put exp_w_trunc u 1
+else
+qt = get exp_w_bfs_st 0
+put exp_w_vis pid 1
+put exp_w_depth pid add d 1
+put exp_w_queue qt pid
+put exp_w_bfs_st 0 add qt 1
+put exp_w_bfs_st 1 add vcnt 1
+end
+end
+end
+end
+end
+
+fn exp_build_bfs tgt ulong max_d ulong max_n ulong to ulong
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+put exp_w_vis i 0
+put exp_w_depth i EXP_NONE
+put exp_w_trunc i 0
+end
+put exp_w_vis tgt 1
+put exp_w_depth tgt 0
+put exp_w_queue 0 tgt
+put exp_w_bfs_st 0 1
+put exp_w_bfs_st 1 1
+qh = ulong 0
+while lt qh get exp_w_bfs_st 0 bound 320
+u = get exp_w_queue qh
+qh = add qh 1
+skip = false
+if ne u tgt
+if exp_status_is_grounding get exp_gn_status u
+skip = true
+end
+end
+if not skip
+exp_bfs_expand u max_d max_n
+end
+end
+for i ulong nc bound 320
+if ne get exp_w_trunc i 0
+exp_emit_trunc_builder i max_d max_n
+else
+if ne get exp_w_vis i 0
+if exp_g_is_prod_truncated get exp_gn_id_off i get exp_gn_id_len i
+exp_emit_trunc_prod i
+end
+end
+end
+end
+ret get exp_w_bfs_st 1
+end
+
+fn exp_build_vis_edges_one nid ulong tgt ulong to void
+put exp_w_color nid 0
+put exp_w_ve_off nid 0
+put exp_w_ve_cnt nid 0
+if eq get exp_w_vis nid 0
+ret
+end
+base = get exp_w_ve_total 0
+cnt = ulong 0
+skip = false
+if ne nid tgt
+if exp_status_is_grounding get exp_gn_status nid
+skip = true
+end
+end
+if not skip
+so = get exp_w_sup_off nid
+sc = get exp_w_sup_cnt nid
+for k ulong sc bound 1024
+pid = exp_g_find_node get exp_w_sup_to_off add so k get exp_w_sup_to_len add so k
+if ne pid EXP_NONE
+if ne get exp_w_vis pid 0
+pos = add base cnt
+put exp_w_ve_to pos pid
+put exp_w_ve_rel pos get exp_w_sup_rel add so k
+put exp_w_ve_cut pos 0
+cnt = add cnt 1
+end
+end
+end
+end
+put exp_w_ve_off nid base
+put exp_w_ve_cnt nid cnt
+put exp_w_ve_total 0 add base cnt
+end
+
+fn exp_emit_cycle_edge from_n ulong to_n ulong to void
+fo = get exp_gn_id_off from_n
+fl = get exp_gn_id_len from_n
+t_o = get exp_gn_id_off to_n
+t_l = get exp_gn_id_len to_n
+st = exp_str_mark
+t = exp_str_add_arena fo fl
+t = exp_str_add_view exp_s_cyc_a
+t = exp_str_add_arena t_o t_l
+t = exp_str_add_view exp_s_cyc_b
+t = exp_str_add_arena fo fl
+t = exp_str_add_view exp_s_cyc_c
+ui = exp_add_unc EXP_UK_CYCLE fo fl st sub exp_str_mark st
+exp_unc_set_rel ui t_o t_l
+end
+
+fn exp_dfs_cut tgt ulong to void
+sp = ulong 1
+put exp_w_stk_n 0 tgt
+put exp_w_stk_i 0 0
+put exp_w_color tgt 1
+while gt sp 0 bound 4096
+sp = sub sp 1
+u = get exp_w_stk_n sp
+ei = get exp_w_stk_i sp
+vc = get exp_w_ve_cnt u
+if lt ei vc
+put exp_w_stk_n sp u
+put exp_w_stk_i sp add ei 1
+sp = add sp 1
+epos = add get exp_w_ve_off u ei
+p = get exp_w_ve_to epos
+col = get exp_w_color p
+if eq col 0
+put exp_w_color p 1
+put exp_w_stk_n sp p
+put exp_w_stk_i sp 0
+sp = add sp 1
+else
+if eq col 1
+put exp_w_ve_cut epos 1
+end
+end
+else
+put exp_w_color u 2
+end
+end
+end
+
+note Build visited-only support edges and run 3-color iterative DFS to cut back edges
+fn exp_build_dag_cut_cycles tgt ulong to void
+nc = get exp_g_ncnt 0
+put exp_w_ve_total 0 0
+for i ulong nc bound 320
+exp_build_vis_edges_one i tgt
+end
+exp_dfs_cut tgt
+for i ulong nc bound 320
+if ne get exp_w_vis i 0
+vo = get exp_w_ve_off i
+vc = get exp_w_ve_cnt i
+for k ulong vc bound 1024
+epos = add vo k
+if ne get exp_w_ve_cut epos 0
+exp_emit_cycle_edge i get exp_w_ve_to epos
+end
+end
+end
+end
+end
+
+fn exp_node_less a ulong b ulong to bool
+ra = exp_role_of get exp_gn_kind a get exp_gn_status a
+rb = exp_role_of get exp_gn_kind b get exp_gn_status b
+if lt ra rb
+ret true
+end
+if gt ra rb
+ret false
+end
+ret lt exp_str_cmp get exp_gn_id_off a get exp_gn_id_len a get exp_gn_id_off b get exp_gn_id_len b 0
+end
+
+fn exp_kahn_init to void
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+put exp_w_placed i 0
+put exp_w_pos i 0
+rc = ulong 0
+if ne get exp_w_vis i 0
+vo = get exp_w_ve_off i
+vc = get exp_w_ve_cnt i
+for k ulong vc bound 1024
+if eq get exp_w_ve_cut add vo k 0
+rc = add rc 1
+end
+end
+end
+put exp_w_rem i rc
+end
+end
+
+fn exp_kahn_pick_ready tgt ulong to ulong
+nc = get exp_g_ncnt 0
+best = EXP_NONE
+for i ulong nc bound 320
+if ne get exp_w_vis i 0
+if eq get exp_w_placed i 0
+if ne i tgt
+if eq get exp_w_rem i 0
+if eq best EXP_NONE
+best = i
+else
+if exp_node_less i best
+best = i
+end
+end
+end
+end
+end
+end
+end
+ret best
+end
+
+fn exp_kahn_release best ulong to void
+nc = get exp_g_ncnt 0
+for c ulong nc bound 320
+if ne get exp_w_vis c 0
+if eq get exp_w_placed c 0
+vo = get exp_w_ve_off c
+vc = get exp_w_ve_cnt c
+for k ulong vc bound 1024
+if eq get exp_w_ve_cut add vo k 0
+if eq get exp_w_ve_to add vo k best
+put exp_w_rem c sub get exp_w_rem c 1
+end
+end
+end
+end
+end
+end
+end
+
+note Kahn topological sort: tie-break by (Role, node_id), target always last
+fn exp_build_kahn tgt ulong vcnt ulong to void
+exp_kahn_init
+ocnt = ulong 0
+need = sub vcnt 1
+for iter ulong need bound 320
+best = exp_kahn_pick_ready tgt
+if eq best EXP_NONE
+break
+end
+put exp_w_placed best 1
+put exp_bs_nid ocnt best
+put exp_w_pos best add ocnt 1
+ocnt = add ocnt 1
+exp_kahn_release best
+end
+put exp_bs_nid ocnt tgt
+put exp_w_pos tgt add ocnt 1
+ocnt = add ocnt 1
+put exp_b_scnt 0 ocnt
+put exp_b_concl_step 0 ocnt
+end
+
+fn exp_step_sup_gt p1 ulong p2 ulong to bool
+s1 = get exp_bs_sup_step p1
+s2 = get exp_bs_sup_step p2
+if gt s1 s2
+ret true
+end
+if eq s1 s2
+ret gt get exp_bs_sup_rel p1 get exp_bs_sup_rel p2
+end
+ret false
+end
+
+fn exp_sort_step_sups base ulong cnt ulong to void
+for a ulong cnt bound 1024
+j = a
+while gt j 0 bound 1024
+p1 = add base sub j 1
+p2 = add base j
+if exp_step_sup_gt p1 p2
+t = get exp_bs_sup_step p1
+put exp_bs_sup_step p1 get exp_bs_sup_step p2
+put exp_bs_sup_step p2 t
+t = get exp_bs_sup_rel p1
+put exp_bs_sup_rel p1 get exp_bs_sup_rel p2
+put exp_bs_sup_rel p2 t
+j = sub j 1
+else
+break
+end
+end
+end
+end
+
+fn exp_build_step_one si ulong to void
+nid = get exp_bs_nid si
+put exp_bs_role si exp_role_of get exp_gn_kind nid get exp_gn_status nid
+put exp_bs_depth si get exp_w_depth nid
+if exp_status_is_grounding get exp_gn_status nid
+put exp_bs_gnd si 1
+else
+put exp_bs_gnd si 0
+end
+if exp_g_is_scope_ref get exp_gn_id_off nid get exp_gn_id_len nid
+put exp_bs_bref si 1
+else
+put exp_bs_bref si 0
+end
+base = get exp_bs_sup_total 0
+cnt = ulong 0
+vo = get exp_w_ve_off nid
+vc = get exp_w_ve_cnt nid
+for k ulong vc bound 1024
+if eq get exp_w_ve_cut add vo k 0
+p = get exp_w_ve_to add vo k
+pos = add base cnt
+put exp_bs_sup_step pos get exp_w_pos p
+put exp_bs_sup_rel pos get exp_w_ve_rel add vo k
+cnt = add cnt 1
+end
+end
+exp_sort_step_sups base cnt
+put exp_bs_sup_off si base
+put exp_bs_sup_cnt si cnt
+put exp_bs_sup_total 0 add base cnt
+end
+
+fn exp_build_steps to void
+sc = get exp_b_scnt 0
+put exp_bs_sup_total 0 0
+for i ulong sc bound 320
+exp_build_step_one i
+end
+end
+
+fn exp_str_add_status_name st ulong to void
+if eq st EXP_ST_UNCLASSIFIED
+t = exp_str_add_view exp_sn_0
+ret
+end
+if eq st EXP_ST_DIRECT_OBS
+t = exp_str_add_view exp_sn_1
+ret
+end
+if eq st EXP_ST_VERIFIED_FACT
+t = exp_str_add_view exp_sn_2
+ret
+end
+if eq st EXP_ST_INFERENCE
+t = exp_str_add_view exp_sn_3
+ret
+end
+if eq st EXP_ST_HYPOTHESIS
+t = exp_str_add_view exp_sn_4
+ret
+end
+if eq st EXP_ST_CONTRADICTION
+t = exp_str_add_view exp_sn_5
+ret
+end
+t = exp_str_add_view exp_sn_6
+end
+
+fn exp_step_tests_hypo onid ulong ho ulong hl ulong to bool
+okd = get exp_gn_kind onid
+ost = get exp_gn_status onid
+so = get exp_w_sup_off onid
+scnt = get exp_w_sup_cnt onid
+if eq okd EXP_KD_EVAL_RECEIPT
+for k ulong scnt bound 1024
+if eq get exp_w_sup_rel add so k EXP_REL_EVALUATES
+if exp_str_eq get exp_w_sup_to_off add so k get exp_w_sup_to_len add so k ho hl
+ret true
+end
+end
+end
+end
+if eq okd EXP_KD_CORTEX_RECORD
+if eq ost EXP_ST_VERIFIED_FACT
+for k ulong scnt bound 1024
+if exp_str_eq get exp_w_sup_to_off add so k get exp_w_sup_to_len add so k ho hl
+ret true
+end
+end
+end
+end
+ret false
+end
+
+fn exp_step_has_hypo_test h_nid ulong to bool
+ho = get exp_gn_id_off h_nid
+hl = get exp_gn_id_len h_nid
+sc = get exp_b_scnt 0
+for j ulong sc bound 320
+if exp_step_tests_hypo get exp_bs_nid j ho hl
+ret true
+end
+end
+ret false
+end
+
+fn exp_step_emit_mn nid ulong to bool
+no = get exp_gn_id_off nid
+nl = get exp_gn_id_len nid
+has_miss = false
+xc = get exp_g_xcnt 0
+for x ulong xc bound 128
+if eq get exp_gx_owner x nid
+has_miss = true
+eo = get exp_gx_exp_off x
+el = get exp_gx_exp_len x
+st = exp_str_mark
+t = exp_str_add_view exp_s_mlink_a
+t = exp_str_add_arena eo el
+exp_str_put_b uchar 32
+exp_str_put_b uchar 40
+t = exp_str_add_arena get exp_gx_rsn_off x get exp_gx_rsn_len x
+exp_str_put_b uchar 41
+ui = exp_add_unc EXP_UK_MISSING_LINK no nl st sub exp_str_mark st
+exp_unc_set_rel ui eo el
+end
+end
+noc = get exp_g_notecnt 0
+for o ulong noc bound 128
+if eq get exp_go_owner o nid
+ui = exp_add_unc EXP_UK_PRODUCER_NOTE no nl get exp_go_off o get exp_go_len o
+end
+end
+ret has_miss
+end
+
+fn exp_step_emit_st sidx ulong nid ulong has_sup bool to void
+no = get exp_gn_id_off nid
+nl = get exp_gn_id_len nid
+kd = get exp_gn_kind nid
+if eq kd EXP_KD_AGENT_BRANCH
+ret
+end
+sts = get exp_gn_status nid
+if eq sts EXP_ST_UNCLASSIFIED
+st = exp_str_mark
+t = exp_str_add_view exp_s_unk_a
+exp_str_add_u64 sidx
+t = exp_str_add_view exp_s_unk_b
+ui = exp_add_unc EXP_UK_UNKNOWN no nl st sub exp_str_mark st
+else
+if or eq sts EXP_ST_INFERENCE eq sts EXP_ST_HYPOTHESIS
+if not has_sup
+st = exp_str_mark
+t = exp_str_add_view exp_s_unsup_a
+exp_str_add_u64 sidx
+t = exp_str_add_view exp_s_unsup_b
+exp_str_add_status_name sts
+t = exp_str_add_view exp_s_unsup_c
+ui = exp_add_unc EXP_UK_UNSUPPORTED no nl st sub exp_str_mark st
+else
+if eq sts EXP_ST_INFERENCE
+st = exp_str_mark
+t = exp_str_add_view exp_s_unsup_a
+exp_str_add_u64 sidx
+t = exp_str_add_view exp_s_inf_a
+ui = exp_add_unc EXP_UK_INFERRED no nl st sub exp_str_mark st
+end
+end
+end
+end
+is_hyp = false
+if eq kd EXP_KD_HYPOTHESIS
+is_hyp = true
+else
+if eq kd EXP_KD_CORTEX_RECORD
+if eq sts EXP_ST_HYPOTHESIS
+is_hyp = true
+end
+end
+end
+if is_hyp
+if not exp_step_has_hypo_test nid
+st = exp_str_mark
+t = exp_str_add_view exp_s_hyp_a
+exp_str_add_u64 sidx
+t = exp_str_add_view exp_s_hyp_b
+ui = exp_add_unc EXP_UK_HYPO_NOT_FALSIFIED no nl st sub exp_str_mark st
+end
+end
+end
+
+fn exp_build_step_uncs to void
+sc = get exp_b_scnt 0
+for i ulong sc bound 320
+nid = get exp_bs_nid i
+has_sup = exp_step_emit_mn nid
+if gt get exp_w_sup_cnt nid 0
+has_sup = true
+end
+exp_step_emit_st add i 1 nid has_sup
+end
+end
+
+fn exp_sort_dedup_tmp cnt ulong to ulong
+for a ulong cnt bound 128
+j = a
+while gt j 0 bound 128
+p1 = sub j 1
+if gt exp_str_cmp get exp_w_tmp_off p1 get exp_w_tmp_len p1 get exp_w_tmp_off j get exp_w_tmp_len j 0
+o1 = get exp_w_tmp_off p1
+l1 = get exp_w_tmp_len p1
+put exp_w_tmp_off p1 get exp_w_tmp_off j
+put exp_w_tmp_len p1 get exp_w_tmp_len j
+put exp_w_tmp_off j o1
+put exp_w_tmp_len j l1
+j = sub j 1
+else
+break
+end
+end
+end
+ucnt = ulong 0
+for a ulong cnt bound 128
+dup = false
+if gt ucnt 0
+prv = sub ucnt 1
+if exp_str_eq get exp_w_tmp_off prv get exp_w_tmp_len prv get exp_w_tmp_off a get exp_w_tmp_len a
+dup = true
+end
+end
+if not dup
+put exp_w_tmp_off ucnt get exp_w_tmp_off a
+put exp_w_tmp_len ucnt get exp_w_tmp_len a
+ucnt = add ucnt 1
+end
+end
+ret ucnt
+end
+
+fn exp_sort_dedup_inv cnt ulong to ulong
+for a ulong cnt bound 128
+j = a
+while gt j 0 bound 128
+p1 = sub j 1
+if gt exp_str_cmp get exp_w_inv_off p1 get exp_w_inv_len p1 get exp_w_inv_off j get exp_w_inv_len j 0
+o1 = get exp_w_inv_off p1
+l1 = get exp_w_inv_len p1
+put exp_w_inv_off p1 get exp_w_inv_off j
+put exp_w_inv_len p1 get exp_w_inv_len j
+put exp_w_inv_off j o1
+put exp_w_inv_len j l1
+j = sub j 1
+else
+break
+end
+end
+end
+ucnt = ulong 0
+for a ulong cnt bound 128
+dup = false
+if gt ucnt 0
+prv = sub ucnt 1
+if exp_str_eq get exp_w_inv_off prv get exp_w_inv_len prv get exp_w_inv_off a get exp_w_inv_len a
+dup = true
+end
+end
+if not dup
+put exp_w_inv_off ucnt get exp_w_inv_off a
+put exp_w_inv_len ucnt get exp_w_inv_len a
+ucnt = add ucnt 1
+end
+end
+ret ucnt
+end
+
+fn exp_sort_nodes_by_id to void
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+put exp_w_sorted_n i i
+end
+for a ulong nc bound 320
+j = a
+while gt j 0 bound 320
+n1 = get exp_w_sorted_n sub j 1
+n2 = get exp_w_sorted_n j
+if gt exp_str_cmp get exp_gn_id_off n1 get exp_gn_id_len n1 get exp_gn_id_off n2 get exp_gn_id_len n2 0
+put exp_w_sorted_n sub j 1 n2
+put exp_w_sorted_n j n1
+j = sub j 1
+else
+break
+end
+end
+end
+end
+
+fn exp_contra_emit nid ulong tcnt ulong icnt ulong to void
+stmt_o = get exp_gn_stmt_off nid
+stmt_l = get exp_gn_stmt_len nid
+if ne get exp_gn_status nid EXP_ST_CONTRADICTION
+st = exp_str_mark
+t = exp_str_add_arena get exp_gn_id_off nid get exp_gn_id_len nid
+t = exp_str_add_view exp_s_contra_a
+for k ulong tcnt bound 128
+if gt k 0
+exp_str_put_b uchar 44
+exp_str_put_b uchar 32
+end
+t = exp_str_add_arena get exp_w_tmp_off k get exp_w_tmp_len k
+end
+exp_str_put_b uchar 58
+exp_str_put_b uchar 32
+t = exp_str_add_arena stmt_o stmt_l
+stmt_o = st
+stmt_l = sub exp_str_mark st
+end
+for k ulong icnt bound 128
+io = get exp_w_inv_off k
+il = get exp_w_inv_len k
+oo = get exp_gn_id_off nid
+ol = get exp_gn_id_len nid
+if exp_str_eq io il oo ol
+oo = get exp_w_tmp_off 0
+ol = get exp_w_tmp_len 0
+end
+st = exp_str_mark
+t = exp_str_add_arena io il
+t = exp_str_add_view exp_s_contra_b
+t = exp_str_add_arena stmt_o stmt_l
+ui = exp_add_unc EXP_UK_CONFLICT io il st sub exp_str_mark st
+exp_unc_set_rel ui oo ol
+end
+cc = get exp_bc_cnt 0
+if lt cc EXP_CAP_CONTRAS
+base = get exp_bc_inv_total 0
+put exp_bc_nid cc nid
+put exp_bc_stmt_off cc stmt_o
+put exp_bc_stmt_len cc stmt_l
+put exp_bc_inv_off cc base
+put exp_bc_inv_cnt cc icnt
+for k ulong icnt bound 128
+if lt add base k EXP_CAP_CON_INV
+put exp_bc_inv_id_off add base k get exp_w_inv_off k
+put exp_bc_inv_id_len add base k get exp_w_inv_len k
+end
+end
+put exp_bc_inv_total 0 add base icnt
+put exp_bc_cnt 0 add cc 1
+end
+end
+
+fn exp_build_contra_node nid ulong to void
+ec = get exp_g_ecnt 0
+tcnt = ulong 0
+has_alt = false
+alt_o = ulong 0
+alt_l = ulong 0
+for e ulong ec bound 1024
+if eq get exp_ge_owner e nid
+rl = get exp_ge_rel e
+eo = get exp_ge_to_off e
+el = get exp_ge_to_len e
+if eq rl EXP_REL_CONTRADICTS
+if lt tcnt 128
+put exp_w_tmp_off tcnt eo
+put exp_w_tmp_len tcnt el
+tcnt = add tcnt 1
+end
+else
+if eq rl EXP_REL_ALTERNATIVE_TO
+if not has_alt
+tnid = exp_g_find_node eo el
+if ne tnid EXP_NONE
+if ne get exp_w_vis tnid 0
+has_alt = true
+alt_o = eo
+alt_l = el
+end
+end
+end
+end
+end
+end
+end
+icnt = ulong 0
+for k ulong tcnt bound 128
+tnid = exp_g_find_node get exp_w_tmp_off k get exp_w_tmp_len k
+if ne tnid EXP_NONE
+if ne get exp_w_vis tnid 0
+put exp_w_inv_off icnt get exp_w_tmp_off k
+put exp_w_inv_len icnt get exp_w_tmp_len k
+icnt = add icnt 1
+end
+end
+end
+if gt tcnt 0
+if ne get exp_w_vis nid 0
+put exp_w_inv_off icnt get exp_gn_id_off nid
+put exp_w_inv_len icnt get exp_gn_id_len nid
+icnt = add icnt 1
+end
+end
+icnt = exp_sort_dedup_inv icnt
+if gt icnt 0
+tcnt = exp_sort_dedup_tmp tcnt
+exp_contra_emit nid tcnt icnt
+end
+if has_alt
+if eq get exp_gn_kind nid EXP_KD_ALTERNATIVE
+ac = get exp_ba_cnt 0
+if lt ac EXP_CAP_ALTS
+put exp_ba_nid ac nid
+put exp_ba_to_off ac alt_o
+put exp_ba_to_len ac alt_l
+put exp_ba_cnt 0 add ac 1
+end
+end
+end
+end
+
+fn exp_build_contras_and_alts to void
+put exp_bc_cnt 0 0
+put exp_bc_inv_total 0 0
+put exp_ba_cnt 0 0
+exp_sort_nodes_by_id
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+nid = get exp_w_sorted_n i
+exp_build_contra_node nid
+end
+end
+
+fn exp_unc_cmp a ulong b ulong to int
+ka = get exp_bu_kind a
+kb = get exp_bu_kind b
+if lt ka kb
+ret -1
+end
+if gt ka kb
+ret 1
+end
+c1 = exp_str_cmp get exp_bu_nid_off a get exp_bu_nid_len a get exp_bu_nid_off b get exp_bu_nid_len b
+if ne c1 0
+ret c1
+end
+ha = get exp_bu_has_rel a
+hb = get exp_bu_has_rel b
+if lt ha hb
+ret -1
+end
+if gt ha hb
+ret 1
+end
+if ne ha 0
+c2 = exp_str_cmp get exp_bu_rel_off a get exp_bu_rel_len a get exp_bu_rel_off b get exp_bu_rel_len b
+if ne c2 0
+ret c2
+end
+end
+ret exp_str_cmp get exp_bu_det_off a get exp_bu_det_len a get exp_bu_det_off b get exp_bu_det_len b
+end
+
+fn exp_unc_swap a ulong b ulong to void
+t0 = get exp_bu_kind a
+put exp_bu_kind a get exp_bu_kind b
+put exp_bu_kind b t0
+t0 = get exp_bu_nid_off a
+put exp_bu_nid_off a get exp_bu_nid_off b
+put exp_bu_nid_off b t0
+t0 = get exp_bu_nid_len a
+put exp_bu_nid_len a get exp_bu_nid_len b
+put exp_bu_nid_len b t0
+t0 = get exp_bu_has_rel a
+put exp_bu_has_rel a get exp_bu_has_rel b
+put exp_bu_has_rel b t0
+t0 = get exp_bu_rel_off a
+put exp_bu_rel_off a get exp_bu_rel_off b
+put exp_bu_rel_off b t0
+t0 = get exp_bu_rel_len a
+put exp_bu_rel_len a get exp_bu_rel_len b
+put exp_bu_rel_len b t0
+t0 = get exp_bu_det_off a
+put exp_bu_det_off a get exp_bu_det_off b
+put exp_bu_det_off b t0
+t0 = get exp_bu_det_len a
+put exp_bu_det_len a get exp_bu_det_len b
+put exp_bu_det_len b t0
+end
+
+fn exp_unc_copy dst ulong src ulong to void
+put exp_bu_kind dst get exp_bu_kind src
+put exp_bu_nid_off dst get exp_bu_nid_off src
+put exp_bu_nid_len dst get exp_bu_nid_len src
+put exp_bu_has_rel dst get exp_bu_has_rel src
+put exp_bu_rel_off dst get exp_bu_rel_off src
+put exp_bu_rel_len dst get exp_bu_rel_len src
+put exp_bu_det_off dst get exp_bu_det_off src
+put exp_bu_det_len dst get exp_bu_det_len src
+end
+
+fn exp_sort_dedup_uncs to void
+uc = get exp_bu_cnt 0
+for a ulong uc bound 512
+j = a
+while gt j 0 bound 512
+p1 = sub j 1
+if gt exp_unc_cmp p1 j 0
+exp_unc_swap p1 j
+j = sub j 1
+else
+break
+end
+end
+end
+outc = ulong 0
+for a ulong uc bound 512
+dup = false
+if gt outc 0
+if eq exp_unc_cmp sub outc 1 a 0
+dup = true
+end
+end
+if not dup
+if ne outc a
+exp_unc_copy outc a
+end
+outc = add outc 1
+end
+end
+put exp_bu_cnt 0 outc
+end
+
+fn exp_node_has_meas nid ulong to bool
+mc = get exp_g_mcnt 0
+for m ulong mc bound 256
+if eq get exp_gm_owner m nid
+ret true
+end
+end
+ret false
+end
+
+fn exp_build_evidence to void
+put exp_be_cnt 0 0
+sc = get exp_b_scnt 0
+for i ulong sc bound 320
+nid = get exp_bs_nid i
+keep = false
+if ne get exp_gn_has_dig nid 0
+keep = true
+else
+if exp_node_has_meas nid
+keep = true
+end
+end
+if keep
+ec = get exp_be_cnt 0
+put exp_be_step ec add i 1
+put exp_be_cnt 0 add ec 1
+end
+end
+end
+
+fn exp_build_bundle_raw tgt_o ulong tgt_l ulong max_d ulong max_n ulong to int
+rc = exp_check_limits max_d max_n
+if ne rc EXP_OK
+ret rc
+end
+rc = exp_g_validate
+if ne rc EXP_OK
+ret rc
+end
+tgt = exp_g_find_node tgt_o tgt_l
+if eq tgt EXP_NONE
+ret EXP_ERR_TARGET_NOT_FOUND
+end
+put exp_bu_cnt 0 0
+exp_build_support_index
+vcnt = exp_build_bfs tgt max_d max_n
+exp_build_dag_cut_cycles tgt
+exp_build_kahn tgt vcnt
+exp_build_steps
+exp_build_step_uncs
+exp_build_contras_and_alts
+exp_build_evidence
+exp_sort_dedup_uncs
+put exp_bp_tgt_off 0 tgt_o
+put exp_bp_tgt_len 0 tgt_l
+put exp_bp_max_d 0 max_d
+put exp_bp_max_n 0 max_n
+put exp_bp_vis 0 vcnt
+put exp_bp_gnodes 0 get exp_g_ncnt 0
+idig = new uchar 32 0
+exp_compute_input_digest idig
+for i ulong 32
+put exp_bp_in_dig i get idig i
+end
+bdig = new uchar 32 0
+exp_compute_bundle_digest bdig
+for i ulong 32
+put exp_bp_bun_dig i get bdig i
+end
+ret EXP_OK
+end
+
+fn exp_build_bundle target view uchar * max_d ulong max_n ulong to int
+tgt_o = exp_str_add_view target
+ret exp_build_bundle_raw tgt_o len target max_d max_n
+end
+
+note Bundle query helpers
+fn exp_bundle_has_unc uk ulong to bool
+uc = get exp_bu_cnt 0
+for i ulong uc bound 512
+if eq get exp_bu_kind i uk
+ret true
+end
+end
+ret false
+end
+
+fn exp_bundle_step_eq idx1 ulong want view uchar * to bool
+if eq idx1 0
+ret false
+end
+if gt idx1 get exp_b_scnt 0
+ret false
+end
+nid = get exp_bs_nid sub idx1 1
+ret exp_str_eq_view get exp_gn_id_off nid get exp_gn_id_len nid want
+end
+
+fn exp_bundle_find_step id view uchar * to ulong
+sc = get exp_b_scnt 0
+for i ulong sc bound 320
+nid = get exp_bs_nid i
+if exp_str_eq_view get exp_gn_id_off nid get exp_gn_id_len nid id
+ret add i 1
+end
+end
+ret 0
+end
+
+note ============================================================================
+note Section 9: Cortex Store, Sealed Journal & Agent Branch Adapters (adapters.rs)
+note ============================================================================
+
+fn exp_cx_reset to void
+put exp_cx_str_len 0 0
+put exp_cx_cnt 0 0
+put exp_cx_seq 0 1
+put exp_cx_pcnt 0 0
+end
+
+fn exp_cx_str_add_view s view uchar * to ulong
+start = get exp_cx_str_len 0
+n = len s
+for i ulong n bound 1024
+p = get exp_cx_str_len 0
+if lt p 16384
+put exp_cx_str p get s i
+put exp_cx_str_len 0 add p 1
+end
+end
+ret start
+end
+
+fn exp_str_add_cx_arena off ulong ln ulong to ulong
+start = get exp_str_len 0
+for i ulong ln bound 1024
+exp_str_put_b get exp_cx_str add off i
+end
+ret start
+end
+
+fn exp_cx_id_eq a_base ulong b_base ulong to bool
+for i ulong 16
+if ne get exp_cx_id add a_base i get exp_cx_id add b_base i
+ret false
+end
+end
+ret true
+end
+
+fn exp_cx_id_eq_view base ulong v view uchar * to bool
+for i ulong 16
+if ne get exp_cx_id add base i get v i
+ret false
+end
+end
+ret true
+end
+
+fn exp_cx_id_cmp_view a view uchar * b view uchar * to int
+for i ulong 16
+ca = get a i
+cb = get b i
+if lt ca cb
+ret -1
+end
+if gt ca cb
+ret 1
+end
+end
+ret 0
+end
+
+fn exp_cx_find id view uchar * to ulong
+cnt = get exp_cx_cnt 0
+for i ulong cnt bound 64
+if exp_cx_id_eq_view mul i 16 id
+ret i
+end
+end
+ret EXP_NONE
+end
+
+fn exp_cx_make_id seq ulong stmt view uchar * dst edit uchar * to void
+ctx = new ulong 40 0
+dig = new uchar 32 0
+sha256_init ctx
+exp_sha_u64 ctx seq
+sha256_update ctx stmt
+sha256_final ctx dig
+for i ulong 16
+put dst i get dig i
+end
+end
+
+fn exp_cx_add_rec status ulong stmt view uchar * prov view uchar * to ulong
+idx = get exp_cx_cnt 0
+if ge idx EXP_CX_CAP
+ret EXP_NONE
+end
+seq = get exp_cx_seq 0
+put exp_cx_seq 0 add seq 1
+id = new uchar 16 0
+exp_cx_make_id seq stmt id
+base16 = mul idx 16
+for i ulong 16
+put exp_cx_id add base16 i get id i
+end
+base32 = mul idx 32
+for i ulong 32
+put exp_cx_evhash add base32 i 0
+end
+put exp_cx_status idx status
+so = exp_cx_str_add_view stmt
+po = exp_cx_str_add_view prov
+put exp_cx_stmt_off idx so
+put exp_cx_stmt_len idx len stmt
+put exp_cx_prov_off idx po
+put exp_cx_prov_len idx len prov
+put exp_cx_ts idx seq
+put exp_cx_has_conf idx 0
+put exp_cx_conf idx 0
+put exp_cx_has_vby idx 0
+put exp_cx_vby_off idx 0
+put exp_cx_vby_len idx 0
+put exp_cx_cnt 0 add idx 1
+ret idx
+end
+
+fn exp_cx_set_ev idx ulong ev view uchar * to void
+if ge idx get exp_cx_cnt 0
+ret
+end
+evh = new uchar 32 0
+dl = sha2_digest 256 ev evh
+base32 = mul idx 32
+for i ulong 32
+put exp_cx_evhash add base32 i get evh i
+end
+end
+
+fn exp_cx_set_id idx ulong id view uchar * to void
+if ge idx get exp_cx_cnt 0
+ret
+end
+base16 = mul idx 16
+for i ulong 16
+put exp_cx_id add base16 i get id i
+end
+end
+
+fn exp_cx_get_id idx ulong dst edit uchar * to void
+base16 = mul idx 16
+for i ulong 16
+put dst i get exp_cx_id add base16 i
+end
+end
+
+fn exp_cx_set_meta idx ulong ts ulong has_c ulong conf ulong to void
+if ge idx get exp_cx_cnt 0
+ret
+end
+put exp_cx_ts idx ts
+put exp_cx_has_conf idx has_c
+put exp_cx_conf idx conf
+end
+
+fn exp_cx_set_verified_by idx ulong vby view uchar * to void
+if ge idx get exp_cx_cnt 0
+ret
+end
+vo = exp_cx_str_add_view vby
+put exp_cx_has_vby idx 1
+put exp_cx_vby_off idx vo
+put exp_cx_vby_len idx len vby
+end
+
+fn exp_cx_add_parent idx ulong pid view uchar * to void
+pc = get exp_cx_pcnt 0
+if ge pc EXP_CX_PAR_CAP
+ret
+end
+put exp_cx_p_own pc idx
+base = mul pc 16
+for i ulong 16
+put exp_cx_p_id add base i get pid i
+end
+put exp_cx_pcnt 0 add pc 1
+end
+
+fn exp_cx_node_id_str id view uchar * to ulong
+st = exp_str_mark
+t0 = exp_str_add_view exp_txt_cx_pfx
+exp_str_add_hex16_view id
+ret st
+end
+
+fn exp_cx_emit_edges ridx ulong nid ulong sts ulong to void
+rel = EXP_REL_SUPPORTED_BY
+if eq sts EXP_ST_CONTRADICTION
+rel = EXP_REL_CONTRADICTS
+end
+pc = get exp_cx_pcnt 0
+pid = new uchar 16 0
+for p ulong pc bound 256
+if eq get exp_cx_p_own p ridx
+base = mul p 16
+for k ulong 16
+put pid k get exp_cx_p_id add base k
+end
+po = exp_cx_node_id_str pid
+exp_g_add_edge_raw nid po 39 rel
+end
+end
+end
+
+fn exp_cx_emit_node ridx ulong to ulong
+id = new uchar 16 0
+exp_cx_get_id ridx id
+id_o = exp_cx_node_id_str id
+sts = get exp_cx_status ridx
+nid = exp_g_add_node_raw id_o 39 EXP_KD_CORTEX_RECORD sts
+if eq nid EXP_NONE
+ret EXP_NONE
+end
+t = exp_str_add_cx_arena get exp_cx_stmt_off ridx get exp_cx_stmt_len ridx
+put exp_gn_stmt_off nid t
+put exp_gn_stmt_len nid get exp_cx_stmt_len ridx
+t = exp_str_add_view exp_txt_cx_sys
+put exp_gn_sys_off nid t
+put exp_gn_sys_len nid len exp_txt_cx_sys
+t = exp_str_add_view exp_txt_cx_art
+put exp_gn_art_off nid t
+put exp_gn_art_len nid len exp_txt_cx_art
+t = exp_str_add_cx_arena get exp_cx_prov_off ridx get exp_cx_prov_len ridx
+put exp_gn_ref_off nid t
+put exp_gn_ref_len nid get exp_cx_prov_len ridx
+t = exp_str_mark
+exp_str_add_hex32_cx mul ridx 32
+put exp_gn_has_dig nid 1
+put exp_gn_dig_off nid t
+put exp_gn_dig_len nid 64
+if ne get exp_cx_has_conf ridx 0
+put exp_gn_has_conf nid 1
+put exp_gn_conf nid get exp_cx_conf ridx
+t = exp_str_add_view exp_txt_cx_cbas
+put exp_gn_has_cbas nid 1
+put exp_gn_cbas_off nid t
+put exp_gn_cbas_len nid len exp_txt_cx_cbas
+end
+put exp_gn_has_ts nid 1
+put exp_gn_ts nid get exp_cx_ts ridx
+if ne get exp_cx_has_vby ridx 0
+ns = exp_str_mark
+t = exp_str_add_view exp_txt_vby_pfx
+t = exp_str_add_cx_arena get exp_cx_vby_off ridx get exp_cx_vby_len ridx
+nc = get exp_g_notecnt 0
+if lt nc EXP_CAP_NOTES
+put exp_go_owner nc nid
+put exp_go_off nc ns
+put exp_go_len nc sub exp_str_mark ns
+put exp_g_notecnt 0 add nc 1
+end
+end
+exp_cx_emit_edges ridx nid sts
+ret nid
+end
+
+fn exp_cx_contra_touches ci ulong to bool
+pc = get exp_cx_pcnt 0
+pid = new uchar 16 0
+for p ulong pc bound 256
+if eq get exp_cx_p_own p ci
+base = mul p 16
+for j ulong 16
+put pid j get exp_cx_p_id add base j
+end
+pi = exp_cx_find pid
+if ne pi EXP_NONE
+if ne get exp_cxw_vis pi 0
+ret true
+end
+end
+end
+end
+ret false
+end
+
+fn exp_cx_mark_contra_trunc ci ulong to void
+pc = get exp_cx_pcnt 0
+pid = new uchar 16 0
+for p ulong pc bound 256
+if eq get exp_cx_p_own p ci
+base = mul p 16
+for j ulong 16
+put pid j get exp_cx_p_id add base j
+end
+pi = exp_cx_find pid
+if ne pi EXP_NONE
+if ne get exp_cxw_vis pi 0
+put exp_cxw_trunc pi 1
+end
+end
+end
+end
+end
+
+fn exp_cx_bfs_disclose mn ulong to void
+cnt = get exp_cx_cnt 0
+extra = ulong 0
+for ci ulong cnt bound 64
+if eq get exp_cx_status ci EXP_ST_CONTRADICTION
+if eq get exp_cxw_emit ci 0
+if exp_cx_contra_touches ci
+if ge extra mn
+exp_cx_mark_contra_trunc ci
+else
+extra = add extra 1
+put exp_cxw_emit ci 1
+dn = exp_cx_emit_node ci
+end
+end
+end
+end
+end
+end
+
+fn exp_cx_seed_roots roots view ulong * mn ulong to void
+cnt = get exp_cx_cnt 0
+rcnt = len roots
+for k ulong rcnt bound 64
+ri = get roots k
+if lt ri cnt
+put exp_cxw_isroot ri 1
+if eq get exp_cxw_vis ri 0
+vcnt = get exp_w_bfs_st 1
+if ge vcnt mn
+for m ulong cnt bound 64
+if ne get exp_cxw_vis m 0
+put exp_cxw_trunc m 1
+end
+end
+break
+end
+qt = get exp_w_bfs_st 0
+put exp_cxw_vis ri 1
+put exp_cxw_depth ri 0
+put exp_cxw_q qt ri
+put exp_w_bfs_st 0 add qt 1
+put exp_w_bfs_st 1 add vcnt 1
+end
+end
+end
+end
+
+fn exp_cx_bfs_expand u ulong md ulong mn ulong to void
+d = get exp_cxw_depth u
+pc = get exp_cx_pcnt 0
+pid = new uchar 16 0
+for p ulong pc bound 256
+if eq get exp_cx_p_own p u
+base = mul p 16
+for j ulong 16
+put pid j get exp_cx_p_id add base j
+end
+pi = exp_cx_find pid
+if ne pi EXP_NONE
+if eq get exp_cxw_vis pi 0
+vcnt = get exp_w_bfs_st 1
+if or gt add d 1 md ge vcnt mn
+put exp_cxw_trunc u 1
+else
+qt = get exp_w_bfs_st 0
+put exp_cxw_vis pi 1
+put exp_cxw_depth pi add d 1
+put exp_cxw_q qt pi
+put exp_w_bfs_st 0 add qt 1
+put exp_w_bfs_st 1 add vcnt 1
+end
+end
+end
+end
+end
+end
+
+fn exp_cx_graph_from_roots roots view ulong * max_d ulong max_n ulong to void
+exp_g_reset_prod exp_txt_cx_prod
+cnt = get exp_cx_cnt 0
+for i ulong cnt bound 64
+put exp_cxw_vis i 0
+put exp_cxw_depth i EXP_NONE
+put exp_cxw_trunc i 0
+put exp_cxw_isroot i 0
+put exp_cxw_emit i 0
+end
+md = add max_d 1
+mn = add max_n 1
+put exp_w_bfs_st 0 0
+put exp_w_bfs_st 1 0
+exp_cx_seed_roots roots mn
+ocnt = ulong 0
+qh = ulong 0
+while lt qh get exp_w_bfs_st 0 bound 64
+u = get exp_cxw_q qh
+qh = add qh 1
+put exp_cxw_ord ocnt u
+ocnt = add ocnt 1
+st = get exp_cx_status u
+skip = false
+if eq st EXP_ST_CONTRADICTION
+skip = true
+else
+if exp_status_is_grounding st
+if eq get exp_cxw_isroot u 0
+skip = true
+end
+end
+end
+if not skip
+exp_cx_bfs_expand u md mn
+end
+end
+for k ulong ocnt bound 64
+ri = get exp_cxw_ord k
+if eq get exp_cxw_emit ri 0
+put exp_cxw_emit ri 1
+dn = exp_cx_emit_node ri
+end
+end
+exp_cx_bfs_disclose mn
+pid = new uchar 16 0
+for i ulong cnt bound 64
+if ne get exp_cxw_trunc i 0
+exp_cx_get_id i pid
+po = exp_cx_node_id_str pid
+exp_g_add_truncated_raw po 39
+end
+end
+end
+
+fn exp_cx_graph_for_record id view uchar * max_d ulong max_n ulong to int
+ri = exp_cx_find id
+if eq ri EXP_NONE
+ret EXP_ERR_TARGET_NOT_FOUND
+end
+roots = new ulong 1 0
+put roots 0 ri
+exp_cx_graph_from_roots roots max_d max_n
+ret EXP_OK
+end
+
+note Sealed Cortex journal export and tamper-detecting import
+fn exp_j_put_u64 dst edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul sub 7 i 8
+put dst add off i uchar and shr v sh 0xff
+end
+end
+
+fn exp_j_get_u64 src view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 8
+acc = or shl acc 8 ulong get src add off i
+end
+ret acc
+end
+
+fn exp_j_put_cx_str dst edit uchar * pos ulong off ulong ln ulong to ulong
+exp_j_put_u64 dst pos ln
+pos = add pos 8
+for k ulong ln bound 512
+put dst add pos k get exp_cx_str add off k
+end
+ret add pos ln
+end
+
+fn exp_j_get_cx_str src view uchar * pos ulong ln ulong to ulong
+so = get exp_cx_str_len 0
+for k ulong ln bound 512
+p = get exp_cx_str_len 0
+if lt p 16384
+put exp_cx_str p get src add pos k
+put exp_cx_str_len 0 add p 1
+end
+end
+ret so
+end
+
+fn exp_cx_export_rec dst edit uchar * pos ulong i ulong to ulong
+if gt add pos add add 136 get exp_cx_stmt_len i get exp_cx_prov_len i len dst
+ret 0
+end
+base = mul i 16
+for k ulong 16
+put dst add pos k get exp_cx_id add base k
+end
+pos = add pos 16
+base = mul i 32
+for k ulong 32
+put dst add pos k get exp_cx_evhash add base k
+end
+pos = add pos 32
+exp_j_put_u64 dst pos get exp_cx_status i
+pos = add pos 8
+exp_j_put_u64 dst pos get exp_cx_ts i
+pos = add pos 8
+exp_j_put_u64 dst pos get exp_cx_has_conf i
+pos = add pos 8
+exp_j_put_u64 dst pos get exp_cx_conf i
+pos = add pos 8
+pos = exp_j_put_cx_str dst pos get exp_cx_stmt_off i get exp_cx_stmt_len i
+ret exp_j_put_cx_str dst pos get exp_cx_prov_off i get exp_cx_prov_len i
+end
+
+fn exp_cx_export_journal dst edit uchar * to ulong
+cap = len dst
+if lt cap 64
+ret 0
+end
+for i ulong 4
+put dst i get exp_txt_jmagic i
+end
+exp_j_put_u64 dst 4 1
+cnt = get exp_cx_cnt 0
+pc = get exp_cx_pcnt 0
+exp_j_put_u64 dst 12 cnt
+exp_j_put_u64 dst 20 pc
+pos = ulong 28
+for i ulong cnt bound 64
+pos = exp_cx_export_rec dst pos i
+if eq pos 0
+ret 0
+end
+end
+for p ulong pc bound 256
+if gt add add pos 24 32 cap
+ret 0
+end
+exp_j_put_u64 dst pos get exp_cx_p_own p
+pos = add pos 8
+base = mul p 16
+for k ulong 16
+put dst add pos k get exp_cx_p_id add base k
+end
+pos = add pos 16
+end
+seal_dig = new uchar 32 0
+dl = sha2_digest 256 part dst 0 pos seal_dig
+for k ulong 32
+put dst add pos k get seal_dig k
+end
+ret add pos 32
+end
+
+fn exp_cx_import_rec src view uchar * pos ulong body_len ulong i ulong to ulong
+if gt add pos 96 body_len
+ret 0
+end
+base = mul i 16
+for k ulong 16
+put exp_cx_id add base k get src add pos k
+end
+pos = add pos 16
+base = mul i 32
+for k ulong 32
+put exp_cx_evhash add base k get src add pos k
+end
+pos = add pos 32
+put exp_cx_status i exp_j_get_u64 src pos
+pos = add pos 8
+put exp_cx_ts i exp_j_get_u64 src pos
+pos = add pos 8
+put exp_cx_has_conf i exp_j_get_u64 src pos
+pos = add pos 8
+put exp_cx_conf i exp_j_get_u64 src pos
+pos = add pos 8
+ln = exp_j_get_u64 src pos
+pos = add pos 8
+if gt add pos ln body_len
+ret 0
+end
+put exp_cx_stmt_off i exp_j_get_cx_str src pos ln
+put exp_cx_stmt_len i ln
+pos = add pos ln
+if gt add pos 8 body_len
+ret 0
+end
+ln = exp_j_get_u64 src pos
+pos = add pos 8
+if gt add pos ln body_len
+ret 0
+end
+put exp_cx_prov_off i exp_j_get_cx_str src pos ln
+put exp_cx_prov_len i ln
+put exp_cx_has_vby i 0
+ret add pos ln
+end
+
+fn exp_cx_import_par src view uchar * pos ulong body_len ulong p ulong to ulong
+if gt add pos 24 body_len
+ret 0
+end
+put exp_cx_p_own p exp_j_get_u64 src pos
+pos = add pos 8
+base = mul p 16
+for k ulong 16
+put exp_cx_p_id add base k get src add pos k
+end
+ret add pos 16
+end
+
+fn exp_cx_journal_seal_ok src view uchar * to bool
+n = len src
+if lt n 60
+ret false
+end
+for i ulong 4
+if ne get src i get exp_txt_jmagic i
+ret false
+end
+end
+if ne exp_j_get_u64 src 4 1
+ret false
+end
+body_len = sub n 32
+chk = new uchar 32 0
+dl = sha2_digest 256 part src 0 body_len chk
+for i ulong 32
+if ne get chk i get src add body_len i
+ret false
+end
+end
+ret true
+end
+
+fn exp_cx_import_journal src view uchar * to int
+if not exp_cx_journal_seal_ok src
+ret EXP_ERR_JOURNAL
+end
+body_len = sub len src 32
+cnt = exp_j_get_u64 src 12
+pc = exp_j_get_u64 src 20
+if or gt cnt EXP_CX_CAP gt pc EXP_CX_PAR_CAP
+ret EXP_ERR_JOURNAL
+end
+exp_cx_reset
+pos = ulong 28
+for i ulong cnt bound 64
+pos = exp_cx_import_rec src pos body_len i
+if eq pos 0
+ret EXP_ERR_JOURNAL
+end
+end
+for p ulong pc bound 256
+pos = exp_cx_import_par src pos body_len p
+if eq pos 0
+ret EXP_ERR_JOURNAL
+end
+end
+put exp_cx_cnt 0 cnt
+put exp_cx_pcnt 0 pc
+ret EXP_OK
+end
+
+note Agent branch adapter
+fn exp_br_reset to void
+put exp_br_cnt 0 0
+put exp_br_rcnt 0 0
+put exp_br_tcnt 0 0
+end
+
+fn exp_br_create id view uchar * depth ulong ts ulong to ulong
+idx = get exp_br_cnt 0
+if ge idx EXP_BR_CAP
+ret EXP_NONE
+end
+base = mul idx 16
+for i ulong 16
+put exp_br_id add base i get id i
+end
+put exp_br_has_par idx 0
+put exp_br_depth idx depth
+put exp_br_ts idx ts
+put exp_br_cnt 0 add idx 1
+ret idx
+end
+
+fn exp_br_set_parent bidx ulong pid view uchar * to void
+if ge bidx get exp_br_cnt 0
+ret
+end
+base = mul bidx 16
+for i ulong 16
+put exp_br_par_id add base i get pid i
+end
+put exp_br_has_par bidx 1
+end
+
+fn exp_br_add_ref bidx ulong rec_id view uchar * to void
+rc = get exp_br_rcnt 0
+if ge rc EXP_BR_REF_CAP
+ret
+end
+put exp_br_r_own rc bidx
+base = mul rc 16
+for i ulong 16
+put exp_br_r_id add base i get rec_id i
+end
+put exp_br_rcnt 0 add rc 1
+end
+
+fn exp_br_append_token bidx ulong tok ulong to void
+tc = get exp_br_tcnt 0
+if ge tc EXP_BR_TOK_CAP
+ret
+end
+put exp_br_t_own tc bidx
+put exp_br_t_val tc tok
+put exp_br_tcnt 0 add tc 1
+end
+
+fn exp_br_node_id_str bidx ulong to ulong
+st = exp_str_mark
+t0 = exp_str_add_view exp_txt_br_pfx
+exp_str_add_hex16 mul bidx 16 2
+ret st
+end
+
+fn exp_br_emit_refs bidx ulong bnid ulong to void
+tot = get exp_br_rcnt 0
+rid = new uchar 16 0
+for i ulong tot bound 64
+if eq get exp_br_r_own i bidx
+rbase = mul i 16
+for k ulong 16
+put rid k get exp_br_r_id add rbase k
+end
+co = exp_cx_node_id_str rid
+exp_g_add_edge_raw bnid co 39 EXP_REL_REFERENCES
+exp_g_add_scope_ref_raw co 39
+end
+end
+end
+
+fn exp_br_emit_node bidx ulong to ulong
+bo = exp_br_node_id_str bidx
+bnid = exp_g_add_node_raw bo 39 EXP_KD_AGENT_BRANCH EXP_ST_UNCLASSIFIED
+st = exp_str_mark
+t = exp_str_add_view exp_s_br_a
+base = mul bidx 16
+for i ulong 8
+b = ulong get exp_br_id add base i
+exp_str_put_b get exp_txt_hex shr b 4
+exp_str_put_b get exp_txt_hex and b 15
+end
+t = exp_str_add_view exp_s_br_b
+exp_str_add_u64 get exp_br_depth bidx
+t = exp_str_add_view exp_s_br_c
+if ne get exp_br_has_par bidx 0
+for i ulong 8
+b = ulong get exp_br_par_id add base i
+exp_str_put_b get exp_txt_hex shr b 4
+exp_str_put_b get exp_txt_hex and b 15
+end
+else
+t = exp_str_add_view exp_s_br_root
+end
+t = exp_str_add_view exp_s_br_d
+ref_total = ulong 0
+tot = get exp_br_rcnt 0
+for i ulong tot bound 64
+if eq get exp_br_r_own i bidx
+ref_total = add ref_total 1
+end
+end
+exp_str_add_u64 ref_total
+t = exp_str_add_view exp_s_br_e
+put exp_gn_stmt_off bnid st
+put exp_gn_stmt_len bnid sub exp_str_mark st
+t = exp_str_add_view exp_txt_br_sys
+put exp_gn_sys_off bnid t
+put exp_gn_sys_len bnid len exp_txt_br_sys
+t = exp_str_add_view exp_txt_br_art
+put exp_gn_art_off bnid t
+put exp_gn_art_len bnid len exp_txt_br_art
+t = exp_str_mark
+exp_str_add_hex16 mul bidx 16 2
+put exp_gn_ref_off bnid t
+put exp_gn_ref_len bnid 32
+put exp_gn_has_ts bnid 1
+put exp_gn_ts bnid get exp_br_ts bidx
+exp_g_set_scope_branch bo 39
+exp_br_emit_refs bidx bnid
+ret bnid
+end
+
+fn exp_br_build_graph bidx ulong max_d ulong max_n ulong to ulong
+roots = new ulong 64 0
+rcnt = ulong 0
+tot = get exp_br_rcnt 0
+rid = new uchar 16 0
+for i ulong tot bound 64
+if eq get exp_br_r_own i bidx
+base = mul i 16
+for k ulong 16
+put rid k get exp_br_r_id add base k
+end
+ri = exp_cx_find rid
+if ne ri EXP_NONE
+put roots rcnt ri
+rcnt = add rcnt 1
+end
+end
+end
+exp_cx_graph_from_roots part roots 0 rcnt max_d max_n
+exp_g_set_producer exp_txt_br_prod
+ret exp_br_emit_node bidx
+end
+
+fn exp_br_scope_expand u ulong to void
+ec = get exp_g_ecnt 0
+for e ulong ec bound 1024
+if eq get exp_ge_owner e u
+if exp_rel_is_support get exp_ge_rel e
+pi = exp_g_find_node get exp_ge_to_off e get exp_ge_to_len e
+if ne pi EXP_NONE
+if eq get exp_w_vis pi 0
+qt = get exp_w_bfs_st 0
+put exp_w_vis pi 1
+put exp_w_queue qt pi
+put exp_w_bfs_st 0 add qt 1
+end
+end
+end
+end
+end
+end
+
+fn exp_br_scope_bfs to void
+nc = get exp_g_ncnt 0
+for i ulong nc bound 320
+put exp_w_vis i 0
+end
+put exp_w_bfs_st 0 0
+sc = get exp_g_scnt 0
+for i ulong sc bound 128
+ni = exp_g_find_node get exp_gs_off i get exp_gs_len i
+if ne ni EXP_NONE
+if eq get exp_w_vis ni 0
+qt = get exp_w_bfs_st 0
+put exp_w_vis ni 1
+put exp_w_queue qt ni
+put exp_w_bfs_st 0 add qt 1
+end
+end
+end
+qh = ulong 0
+while lt qh get exp_w_bfs_st 0 bound 320
+u = get exp_w_queue qh
+qh = add qh 1
+exp_br_scope_expand u
+end
+end
+
+fn exp_br_graph_for_record bidx ulong rec_id view uchar * max_d ulong max_n ulong to int
+bnid = exp_br_build_graph bidx max_d max_n
+wo = exp_cx_node_id_str rec_id
+wnid = exp_g_find_node wo 39
+if eq wnid EXP_NONE
+ret EXP_ERR_NOT_IN_BRANCH_SCOPE
+end
+exp_br_scope_bfs
+if eq get exp_w_vis wnid 0
+ret EXP_ERR_NOT_IN_BRANCH_SCOPE
+end
+ret EXP_OK
+end
+
+note ============================================================================
+note Section 10: Deterministic Renderer & Analogy Catalog (render.rs)
+note ============================================================================
+
+fn exp_out_status_words st ulong to void
+if eq st EXP_ST_DIRECT_OBS
+exp_out_view exp_sw_1
+ret
+end
+if eq st EXP_ST_VERIFIED_FACT
+exp_out_view exp_sw_2
+ret
+end
+if eq st EXP_ST_INFERENCE
+exp_out_view exp_sw_3
+ret
+end
+if eq st EXP_ST_HYPOTHESIS
+exp_out_view exp_sw_4
+ret
+end
+if eq st EXP_ST_CONTRADICTION
+exp_out_view exp_sw_5
+ret
+end
+if eq st EXP_ST_OPERATOR_DECISION
+exp_out_view exp_sw_6
+ret
+end
+exp_out_view exp_sw_0
+end
+
+fn exp_out_status_name st ulong to void
+if eq st EXP_ST_DIRECT_OBS
+exp_out_view exp_sn_1
+ret
+end
+if eq st EXP_ST_VERIFIED_FACT
+exp_out_view exp_sn_2
+ret
+end
+if eq st EXP_ST_INFERENCE
+exp_out_view exp_sn_3
+ret
+end
+if eq st EXP_ST_HYPOTHESIS
+exp_out_view exp_sn_4
+ret
+end
+if eq st EXP_ST_CONTRADICTION
+exp_out_view exp_sn_5
+ret
+end
+if eq st EXP_ST_OPERATOR_DECISION
+exp_out_view exp_sn_6
+ret
+end
+exp_out_view exp_sn_0
+end
+
+fn exp_out_kind_name kd ulong to void
+if eq kd 1
+exp_out_view exp_kn_1
+ret
+end
+if eq kd 2
+exp_out_view exp_kn_2
+ret
+end
+if eq kd 3
+exp_out_view exp_kn_3
+ret
+end
+if eq kd 4
+exp_out_view exp_kn_4
+ret
+end
+if eq kd 5
+exp_out_view exp_kn_5
+ret
+end
+if eq kd 6
+exp_out_view exp_kn_6
+ret
+end
+if eq kd 7
+exp_out_view exp_kn_7
+ret
+end
+if eq kd 8
+exp_out_view exp_kn_8
+ret
+end
+if eq kd 9
+exp_out_view exp_kn_9
+ret
+end
+if eq kd 10
+exp_out_view exp_kn_10
+ret
+end
+if eq kd 11
+exp_out_view exp_kn_11
+ret
+end
+if eq kd 12
+exp_out_view exp_kn_12
+ret
+end
+exp_out_view exp_kn_13
+end
+
+fn exp_out_rel_name rl ulong to void
+if eq rl 1
+exp_out_view exp_rn_1
+ret
+end
+if eq rl 2
+exp_out_view exp_rn_2
+ret
+end
+if eq rl 3
+exp_out_view exp_rn_3
+ret
+end
+if eq rl 4
+exp_out_view exp_rn_4
+ret
+end
+if eq rl 5
+exp_out_view exp_rn_5
+ret
+end
+exp_out_view exp_rn_6
+end
+
+fn exp_out_role_heading rl ulong to void
+if eq rl 0
+exp_out_view exp_rh_0
+ret
+end
+if eq rl 1
+exp_out_view exp_rh_1
+ret
+end
+if eq rl 2
+exp_out_view exp_rh_2
+ret
+end
+if eq rl 3
+exp_out_view exp_rh_3
+ret
+end
+if eq rl 4
+exp_out_view exp_rh_4
+ret
+end
+if eq rl 5
+exp_out_view exp_rh_5
+ret
+end
+if eq rl 6
+exp_out_view exp_rh_6
+ret
+end
+exp_out_view exp_rh_7
+end
+
+fn exp_out_role_debug rl ulong to void
+if eq rl 0
+exp_out_view exp_rd_0
+ret
+end
+if eq rl 1
+exp_out_view exp_rd_1
+ret
+end
+if eq rl 2
+exp_out_view exp_rd_2
+ret
+end
+if eq rl 3
+exp_out_view exp_rd_3
+ret
+end
+if eq rl 4
+exp_out_view exp_rd_4
+ret
+end
+if eq rl 5
+exp_out_view exp_rd_5
+ret
+end
+if eq rl 6
+exp_out_view exp_rd_6
+ret
+end
+exp_out_view exp_rd_7
+end
+
+fn exp_out_uk_label uk ulong to void
+if eq uk 1
+exp_out_view exp_ul_1
+ret
+end
+if eq uk 2
+exp_out_view exp_ul_2
+ret
+end
+if eq uk 3
+exp_out_view exp_ul_3
+ret
+end
+if eq uk 4
+exp_out_view exp_ul_4
+ret
+end
+if eq uk 5
+exp_out_view exp_ul_5
+ret
+end
+if eq uk 6
+exp_out_view exp_ul_6
+ret
+end
+if eq uk 7
+exp_out_view exp_ul_7
+ret
+end
+if eq uk 8
+exp_out_view exp_ul_8
+ret
+end
+if eq uk 9
+exp_out_view exp_ul_9
+ret
+end
+exp_out_view exp_ul_10
+end
+
+fn exp_out_uk_name uk ulong to void
+if eq uk 1
+exp_out_view exp_un_1
+ret
+end
+if eq uk 2
+exp_out_view exp_un_2
+ret
+end
+if eq uk 3
+exp_out_view exp_un_3
+ret
+end
+if eq uk 4
+exp_out_view exp_un_4
+ret
+end
+if eq uk 5
+exp_out_view exp_un_5
+ret
+end
+if eq uk 6
+exp_out_view exp_un_6
+ret
+end
+if eq uk 7
+exp_out_view exp_un_7
+ret
+end
+if eq uk 8
+exp_out_view exp_un_8
+ret
+end
+if eq uk 9
+exp_out_view exp_un_9
+ret
+end
+exp_out_view exp_un_10
+end
+
+fn exp_effective_level md ulong lv ulong to ulong
+eff = lv
+if eq eff EXP_LEVEL_DEFAULT
+if eq md EXP_MODE_SUMMARY
+eff = 1
+else
+if eq md EXP_MODE_TECHNICAL
+eff = 4
+else
+eff = 2
+end
+end
+end
+if gt eff EXP_MAX_LEVEL
+eff = EXP_MAX_LEVEL
+end
+ret eff
+end
+
+fn exp_aud_shows_ids aud ulong to bool
+ret ne aud EXP_AUD_GENERAL
+end
+
+fn exp_out_short_id off ulong ln ulong to void
+colon = EXP_NONE
+for i ulong ln bound 256
+if eq get exp_str add off i 58
+colon = i
+break
+end
+end
+if ne colon EXP_NONE
+rest = sub ln add colon 1
+if gt rest 12
+exp_out_arena off add colon 13
+ret
+end
+end
+exp_out_arena off ln
+end
+
+fn exp_out_header aud ulong to void
+ci = sub get exp_b_concl_step 0 1
+nid = get exp_bs_nid ci
+exp_out_view exp_s_concl
+exp_out_arena get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+exp_out_b uchar 32
+exp_out_b uchar 91
+exp_out_status_words get exp_gn_status nid
+exp_out_b uchar 93
+if exp_aud_shows_ids aud
+exp_out_b uchar 32
+exp_out_b uchar 40
+exp_out_short_id get exp_gn_id_off nid get exp_gn_id_len nid
+exp_out_b uchar 41
+end
+exp_out_b uchar 10
+end
+
+fn exp_out_meas_line nid ulong indent ulong to bool
+mc = get exp_g_mcnt 0
+found = ulong 0
+for m ulong mc bound 256
+if eq get exp_gm_owner m nid
+if eq found 0
+if ne indent 0
+exp_out_view exp_s_meas
+else
+exp_out_view exp_s_meas_ni
+end
+else
+exp_out_b uchar 44
+exp_out_b uchar 32
+end
+exp_out_arena get exp_gm_name_off m get exp_gm_name_len m
+exp_out_b uchar 61
+exp_out_arena get exp_gm_val_off m get exp_gm_val_len m
+if gt get exp_gm_unit_len m 0
+exp_out_b uchar 32
+exp_out_arena get exp_gm_unit_off m get exp_gm_unit_len m
+end
+found = add found 1
+end
+end
+if gt found 0
+exp_out_b uchar 10
+ret true
+end
+ret false
+end
+
+fn exp_out_step_line si ulong lv ulong aud ulong to void
+nid = get exp_bs_nid si
+exp_out_u64 add si 1
+exp_out_b uchar 46
+exp_out_b uchar 32
+exp_out_b uchar 91
+exp_out_status_words get exp_gn_status nid
+exp_out_b uchar 93
+exp_out_b uchar 32
+exp_out_arena get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+if ge lv 2
+soff = get exp_bs_sup_off si
+scnt = get exp_bs_sup_cnt si
+sc = ulong 0
+for k ulong scnt bound 1024
+if ne get exp_bs_sup_rel add soff k EXP_REL_REFERENCES
+if eq sc 0
+exp_out_view exp_s_rests
+else
+exp_out_b uchar 44
+exp_out_b uchar 32
+end
+exp_out_u64 get exp_bs_sup_step add soff k
+sc = add sc 1
+end
+end
+if gt sc 0
+exp_out_b uchar 41
+end
+wc = ulong 0
+for k ulong scnt bound 1024
+if eq get exp_bs_sup_rel add soff k EXP_REL_REFERENCES
+if eq wc 0
+exp_out_view exp_s_refers
+else
+exp_out_b uchar 44
+exp_out_b uchar 32
+end
+exp_out_u64 get exp_bs_sup_step add soff k
+wc = add wc 1
+end
+end
+if gt wc 0
+exp_out_view exp_s_weak
+end
+end
+if exp_aud_shows_ids aud
+exp_out_b uchar 32
+exp_out_b uchar 91
+exp_out_arena get exp_gn_sys_off nid get exp_gn_sys_len nid
+exp_out_b uchar 32
+exp_out_short_id get exp_gn_id_off nid get exp_gn_id_len nid
+exp_out_b uchar 93
+else
+exp_out_view exp_s_from
+exp_out_arena get exp_gn_sys_off nid get exp_gn_sys_len nid
+exp_out_b uchar 93
+end
+if ne get exp_bs_bref si 0
+exp_out_view exp_s_br_ref
+end
+exp_out_b uchar 10
+end
+
+fn exp_reason_better si ulong best ulong to bool
+bg = get exp_bs_gnd best
+sg = get exp_bs_gnd si
+if gt sg bg
+ret true
+end
+if lt sg bg
+ret false
+end
+bnid = get exp_bs_nid best
+snid = get exp_bs_nid si
+bnh = ulong 1
+if eq get exp_gn_status bnid EXP_ST_HYPOTHESIS
+bnh = 0
+end
+snh = ulong 1
+if eq get exp_gn_status snid EXP_ST_HYPOTHESIS
+snh = 0
+end
+if gt snh bnh
+ret true
+end
+if lt snh bnh
+ret false
+end
+bc = ulong 0
+if ne get exp_gn_has_conf bnid 0
+bc = get exp_gn_conf bnid
+end
+sc = ulong 0
+if ne get exp_gn_has_conf snid 0
+sc = get exp_gn_conf snid
+end
+if gt sc bc
+ret true
+end
+if lt sc bc
+ret false
+end
+ret gt si best
+end
+
+fn exp_strongest_reason to ulong
+ci = sub get exp_b_concl_step 0 1
+soff = get exp_bs_sup_off ci
+scnt = get exp_bs_sup_cnt ci
+best = EXP_NONE
+for k ulong scnt bound 1024
+if ne get exp_bs_sup_rel add soff k EXP_REL_REFERENCES
+si = sub get exp_bs_sup_step add soff k 1
+if eq best EXP_NONE
+best = si
+else
+if exp_reason_better si best
+best = si
+end
+end
+end
+end
+ret best
+end
+
+fn exp_strongest_evidence to ulong
+evc = get exp_be_cnt 0
+best = EXP_NONE
+for i ulong evc bound 320
+si = sub get exp_be_step i 1
+if ne get exp_bs_gnd si 0
+if eq best EXP_NONE
+best = si
+else
+db = get exp_bs_depth best
+ds = get exp_bs_depth si
+if lt ds db
+best = si
+else
+if eq ds db
+if lt si best
+best = si
+end
+end
+end
+end
+end
+end
+ret best
+end
+
+fn exp_material_unc to ulong
+uc = get exp_bu_cnt 0
+best = EXP_NONE
+for i ulong uc bound 512
+if eq best EXP_NONE
+best = i
+else
+sb = exp_uk_severity get exp_bu_kind best
+si = exp_uk_severity get exp_bu_kind i
+if lt si sb
+best = i
+else
+if eq si sb
+c1 = exp_str_cmp get exp_bu_nid_off i get exp_bu_nid_len i get exp_bu_nid_off best get exp_bu_nid_len best
+if lt c1 0
+best = i
+else
+if eq c1 0
+if lt exp_str_cmp get exp_bu_det_off i get exp_bu_det_len i get exp_bu_det_off best get exp_bu_det_len best 0
+best = i
+end
+end
+end
+end
+end
+end
+end
+ret best
+end
+
+fn exp_render_step_body si ulong lv ulong aud ulong to void
+nid = get exp_bs_nid si
+if eq add si 1 get exp_b_concl_step 0
+exp_out_u64 add si 1
+exp_out_view exp_s_therefore
+exp_out_arena get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+exp_out_b uchar 32
+exp_out_b uchar 91
+exp_out_status_words get exp_gn_status nid
+exp_out_b uchar 93
+exp_out_b uchar 10
+else
+exp_out_step_line si lv aud
+end
+if ge lv 3
+dm = exp_out_meas_line nid 1
+end
+if ge lv 4
+exp_out_view exp_s_src
+exp_out_arena get exp_gn_sys_off nid get exp_gn_sys_len nid
+exp_out_b uchar 32
+exp_out_arena get exp_gn_art_off nid get exp_gn_art_len nid
+exp_out_b uchar 32
+exp_out_arena get exp_gn_ref_off nid get exp_gn_ref_len nid
+if ne get exp_gn_has_dig nid 0
+exp_out_view exp_s_dig
+exp_out_arena get exp_gn_dig_off nid get exp_gn_dig_len nid
+end
+exp_out_b uchar 10
+end
+end
+
+fn exp_render_steps_footer lv ulong to void
+exp_out_view exp_s_unc_hdr
+uc = get exp_bu_cnt 0
+shown_u = ulong 0
+for i ulong uc bound 512
+uk = get exp_bu_kind i
+show = true
+if lt lv 3
+if eq uk EXP_UK_INFERRED
+show = false
+end
+end
+if show
+exp_out_b uchar 45
+exp_out_b uchar 32
+exp_out_uk_label uk
+exp_out_b uchar 58
+exp_out_b uchar 32
+exp_out_arena get exp_bu_det_off i get exp_bu_det_len i
+exp_out_b uchar 10
+shown_u = add shown_u 1
+end
+end
+if eq shown_u 0
+exp_out_view exp_s_no_gaps
+end
+cc = get exp_bc_cnt 0
+if gt cc 0
+exp_out_view exp_s_conf_hdr
+for i ulong cc bound 128
+exp_out_b uchar 45
+exp_out_b uchar 32
+exp_out_arena get exp_bc_stmt_off i get exp_bc_stmt_len i
+exp_out_view exp_s_inv_a
+exp_out_u64 get exp_bc_inv_cnt i
+exp_out_view exp_s_inv_b
+end
+end
+if ge lv 2
+ac = get exp_ba_cnt 0
+if gt ac 0
+exp_out_view exp_s_alt_hdr
+for i ulong ac bound 128
+anid = get exp_ba_nid i
+exp_out_b uchar 45
+exp_out_b uchar 32
+exp_out_arena get exp_gn_stmt_off anid get exp_gn_stmt_len anid
+exp_out_b uchar 10
+end
+end
+end
+end
+
+fn exp_render_steps lv ulong aud ulong to void
+if eq lv 0
+exp_out_header aud
+ret
+end
+last_role = EXP_NONE
+if eq lv 1
+ci = sub get exp_b_concl_step 0 1
+soff = get exp_bs_sup_off ci
+scnt = get exp_bs_sup_cnt ci
+for k ulong scnt bound 1024
+si = sub get exp_bs_sup_step add soff k 1
+rl = get exp_bs_role si
+if ne rl last_role
+exp_out_role_heading rl
+exp_out_b uchar 58
+exp_out_b uchar 10
+last_role = rl
+end
+exp_render_step_body si lv aud
+end
+rl = get exp_bs_role ci
+if ne rl last_role
+exp_out_role_heading rl
+exp_out_b uchar 58
+exp_out_b uchar 10
+end
+exp_render_step_body ci lv aud
+else
+sc = get exp_b_scnt 0
+for si ulong sc bound 320
+rl = get exp_bs_role si
+if ne rl last_role
+exp_out_role_heading rl
+exp_out_b uchar 58
+exp_out_b uchar 10
+last_role = rl
+end
+exp_render_step_body si lv aud
+end
+end
+exp_render_steps_footer lv
+end
+
+fn exp_render_summary lv ulong aud ulong to void
+exp_out_header aud
+if eq lv 0
+ret
+end
+sr = exp_strongest_reason
+if ne sr EXP_NONE
+rnid = get exp_bs_nid sr
+exp_out_view exp_s_mreason
+exp_out_arena get exp_gn_stmt_off rnid get exp_gn_stmt_len rnid
+exp_out_b uchar 32
+exp_out_b uchar 91
+exp_out_status_words get exp_gn_status rnid
+exp_out_b uchar 93
+exp_out_b uchar 10
+else
+exp_out_view exp_s_no_reason
+end
+se = exp_strongest_evidence
+if ne se EXP_NONE
+enid = get exp_bs_nid se
+exp_out_view exp_s_sev
+exp_out_arena get exp_gn_stmt_off enid get exp_gn_stmt_len enid
+exp_out_b uchar 32
+exp_out_b uchar 91
+exp_out_status_words get exp_gn_status enid
+exp_out_b uchar 93
+exp_out_b uchar 10
+dm = exp_out_meas_line enid 0
+else
+exp_out_view exp_s_no_ev
+end
+mu = exp_material_unc
+if ne mu EXP_NONE
+exp_out_view exp_s_munc
+exp_out_arena get exp_bu_det_off mu get exp_bu_det_len mu
+exp_out_b uchar 10
+else
+exp_out_view exp_s_no_munc
+end
+if ge lv 2
+exp_out_b uchar 10
+exp_render_steps lv aud
+end
+end
+
+fn exp_render_tech_step si ulong lv ulong to void
+nid = get exp_bs_nid si
+exp_out_view exp_s_t_step
+exp_out_u64 add si 1
+exp_out_view exp_s_t_id
+exp_out_arena get exp_gn_id_off nid get exp_gn_id_len nid
+exp_out_view exp_s_t_kind
+exp_out_kind_name get exp_gn_kind nid
+exp_out_view exp_s_t_status
+exp_out_status_name get exp_gn_status nid
+exp_out_view exp_s_t_role
+exp_out_role_debug get exp_bs_role si
+exp_out_view exp_s_t_depth
+exp_out_u64 get exp_bs_depth si
+exp_out_view exp_s_t_gnd
+if ne get exp_bs_gnd si 0
+exp_out_view exp_s_true
+else
+exp_out_view exp_s_false
+end
+exp_out_view exp_s_t_sup
+soff = get exp_bs_sup_off si
+scnt = get exp_bs_sup_cnt si
+for k ulong scnt bound 1024
+if gt k 0
+exp_out_b uchar 44
+end
+exp_out_rel_name get exp_bs_sup_rel add soff k
+exp_out_b uchar 58
+exp_out_u64 get exp_bs_sup_step add soff k
+end
+exp_out_b uchar 93
+exp_out_b uchar 10
+exp_out_view exp_s_t_stmt
+exp_out_arena get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+exp_out_b uchar 10
+if ne get exp_gn_has_conf nid 0
+exp_out_view exp_s_t_conf
+exp_out_u64 get exp_gn_conf nid
+exp_out_view exp_s_t_basis
+if ne get exp_gn_has_cbas nid 0
+exp_out_arena get exp_gn_cbas_off nid get exp_gn_cbas_len nid
+else
+exp_out_view exp_s_t_unspec
+end
+exp_out_b uchar 10
+end
+if ge lv 3
+dm = exp_out_meas_line nid 1
+end
+if ge lv 4
+exp_out_view exp_s_t_src
+exp_out_arena get exp_gn_sys_off nid get exp_gn_sys_len nid
+exp_out_view exp_s_t_art
+exp_out_arena get exp_gn_art_off nid get exp_gn_art_len nid
+exp_out_view exp_s_t_ref
+exp_out_arena get exp_gn_ref_off nid get exp_gn_ref_len nid
+exp_out_view exp_s_t_dig
+if ne get exp_gn_has_dig nid 0
+exp_out_arena get exp_gn_dig_off nid get exp_gn_dig_len nid
+else
+exp_out_b uchar 45
+end
+exp_out_b uchar 10
+if ne get exp_gn_has_ts nid 0
+exp_out_view exp_s_t_rec
+exp_out_u64 get exp_gn_ts nid
+exp_out_view exp_s_t_rec_n
+end
+end
+noc = get exp_g_notecnt 0
+for o ulong noc bound 128
+if eq get exp_go_owner o nid
+exp_out_view exp_s_t_note
+exp_out_arena get exp_go_off o get exp_go_len o
+exp_out_b uchar 10
+end
+end
+end
+
+fn exp_render_tech_contra i ulong to void
+nid = get exp_bc_nid i
+exp_out_view exp_s_t_contra
+exp_out_arena get exp_gn_id_off nid get exp_gn_id_len nid
+exp_out_view exp_s_t_invs
+io = get exp_bc_inv_off i
+ic = get exp_bc_inv_cnt i
+for j ulong ic bound 128
+if gt j 0
+exp_out_b uchar 44
+end
+exp_out_arena get exp_bc_inv_id_off add io j get exp_bc_inv_id_len add io j
+end
+exp_out_view exp_s_t_stmteq
+exp_out_arena get exp_bc_stmt_off i get exp_bc_stmt_len i
+exp_out_b uchar 10
+end
+
+fn exp_render_tech_footer lv ulong to void
+uc = get exp_bu_cnt 0
+for i ulong uc bound 512
+uk = get exp_bu_kind i
+exp_out_view exp_s_t_unc
+exp_out_u64 uk
+exp_out_view exp_s_t_kind
+exp_out_uk_name uk
+exp_out_view exp_s_t_node
+exp_out_arena get exp_bu_nid_off i get exp_bu_nid_len i
+exp_out_view exp_s_t_rel
+if ne get exp_bu_has_rel i 0
+exp_out_arena get exp_bu_rel_off i get exp_bu_rel_len i
+else
+exp_out_b uchar 45
+end
+exp_out_view exp_s_t_det
+exp_out_arena get exp_bu_det_off i get exp_bu_det_len i
+exp_out_b uchar 10
+end
+cc = get exp_bc_cnt 0
+for i ulong cc bound 128
+exp_render_tech_contra i
+end
+ac = get exp_ba_cnt 0
+for i ulong ac bound 128
+nid = get exp_ba_nid i
+exp_out_view exp_s_t_alt
+exp_out_arena get exp_gn_id_off nid get exp_gn_id_len nid
+exp_out_view exp_s_t_to
+exp_out_arena get exp_ba_to_off i get exp_ba_to_len i
+exp_out_view exp_s_t_stmts
+exp_out_arena get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+exp_out_b uchar 10
+end
+if ge lv 4
+exp_out_view exp_s_t_idig
+exp_out_dig32 0
+exp_out_view exp_s_t_bdig
+exp_out_dig32 1
+exp_out_view exp_s_t_vis
+exp_out_u64 get exp_bp_vis 0
+exp_out_b uchar 47
+exp_out_u64 get exp_bp_gnodes 0
+exp_out_view exp_s_t_lim
+exp_out_u64 get exp_bp_max_d 0
+exp_out_view exp_s_t_nod
+exp_out_u64 get exp_bp_max_n 0
+exp_out_b uchar 10
+end
+end
+
+fn exp_render_technical lv ulong to void
+ci = sub get exp_b_concl_step 0 1
+cnid = get exp_bs_nid ci
+exp_out_view exp_s_t_expl
+exp_out_arena get exp_bp_tgt_off 0 get exp_bp_tgt_len 0
+exp_out_view exp_s_t_prod
+exp_out_arena get exp_g_prod_off 0 get exp_g_prod_len 0
+exp_out_view exp_s_t_bldr
+exp_out_view exp_txt_builder
+exp_out_view exp_s_t_cont
+exp_out_arena get exp_g_fmt_off 0 get exp_g_fmt_len 0
+exp_out_b uchar 32
+exp_out_b uchar 118
+exp_out_u64 get exp_g_ver 0
+exp_out_b uchar 10
+exp_out_view exp_s_t_concl
+exp_out_u64 add ci 1
+exp_out_view exp_s_t_id
+exp_out_arena get exp_gn_id_off cnid get exp_gn_id_len cnid
+exp_out_view exp_s_t_status
+exp_out_status_name get exp_gn_status cnid
+exp_out_view exp_s_t_kind
+exp_out_kind_name get exp_gn_kind cnid
+exp_out_b uchar 10
+if eq lv 0
+ret
+end
+sc = get exp_b_scnt 0
+for si ulong sc bound 320
+exp_render_tech_step si lv
+end
+exp_render_tech_footer lv
+end
+
+fn exp_analogy_kind kd ulong st ulong to ulong
+if eq kd EXP_KD_CAP_ANALYSIS
+ret 1
+end
+if eq kd EXP_KD_HYPOTHESIS
+ret 2
+end
+if eq kd EXP_KD_CORTEX_RECORD
+if eq st EXP_ST_HYPOTHESIS
+ret 2
+end
+end
+if eq kd EXP_KD_FALSIFICATION
+ret 3
+end
+if eq kd EXP_KD_EVAL_RECEIPT
+ret 4
+end
+if eq kd EXP_KD_AGENT_BRANCH
+ret 5
+end
+if eq st EXP_ST_CONTRADICTION
+ret 6
+end
+ret 0
+end
+
+fn exp_out_analogy_text ak ulong to void
+if eq ak 1
+exp_out_view exp_ana_cap
+ret
+end
+if eq ak 2
+exp_out_view exp_ana_hyp
+ret
+end
+if eq ak 3
+exp_out_view exp_ana_fal
+ret
+end
+if eq ak 4
+exp_out_view exp_ana_evl
+ret
+end
+if eq ak 5
+exp_out_view exp_ana_brn
+ret
+end
+exp_out_view exp_ana_con
+end
+
+fn exp_render_analogy lv ulong aud ulong to void
+sc = get exp_b_scnt 0
+pick_step = ulong 0
+pick_ak = ulong 0
+for k ulong sc bound 320
+si = sub sub sc 1 k
+nid = get exp_bs_nid si
+ak = exp_analogy_kind get exp_gn_kind nid get exp_gn_status nid
+if ne ak 0
+pick_step = add si 1
+pick_ak = ak
+break
+end
+end
+if ne pick_ak 0
+exp_out_view exp_s_ana_hdr
+exp_out_u64 pick_step
+exp_out_b uchar 41
+exp_out_b uchar 58
+exp_out_b uchar 10
+exp_out_b uchar 32
+exp_out_b uchar 32
+exp_out_analogy_text pick_ak
+exp_out_b uchar 10
+else
+exp_out_view exp_s_ana_none
+end
+exp_out_view exp_s_ev_itself
+rlv = lv
+if lt rlv 1
+rlv = 1
+end
+exp_render_steps rlv aud
+end
+
+fn exp_render md ulong lv ulong aud ulong to ulong
+exp_out_reset
+eff = exp_effective_level md lv
+if eq md EXP_MODE_SUMMARY
+exp_render_summary eff aud
+else
+if eq md EXP_MODE_STEP_BY_STEP
+exp_out_header aud
+if gt eff 0
+exp_out_b uchar 10
+exp_render_steps eff aud
+end
+else
+if eq md EXP_MODE_TECHNICAL
+exp_render_technical eff
+else
+exp_render_analogy eff aud
+end
+end
+end
+ret get exp_out_len 0
+end
+
+note ============================================================================
+note Section 11: Clarification Session & CLI Helpers (session.rs, main.rs)
+note ============================================================================
+
+fn exp_sess_init aud ulong to void
+put exp_sess 0 0
+put exp_sess 1 aud
+end
+
+fn exp_sess_level to ulong
+ret get exp_sess 0
+end
+
+fn exp_sess_explain to ulong
+put exp_sess 0 0
+ret exp_render EXP_MODE_STEP_BY_STEP 0 get exp_sess 1
+end
+
+fn exp_sess_deeper to ulong
+lv = add get exp_sess 0 1
+if gt lv EXP_MAX_LEVEL
+lv = EXP_MAX_LEVEL
+end
+put exp_sess 0 lv
+ret exp_render EXP_MODE_STEP_BY_STEP lv get exp_sess 1
+end
+
+fn exp_sess_shallower to ulong
+lv = get exp_sess 0
+if gt lv 0
+lv = sub lv 1
+end
+put exp_sess 0 lv
+ret exp_render EXP_MODE_STEP_BY_STEP lv get exp_sess 1
+end
+
+fn exp_sess_step_deps si ulong to void
+soff = get exp_bs_sup_off si
+scnt = get exp_bs_sup_cnt si
+if eq scnt 0
+if ne get exp_bs_gnd si 0
+exp_out_view exp_s_start_pt
+else
+exp_out_view exp_s_no_sup
+end
+ret
+end
+for k ulong scnt bound 1024
+pstep = get exp_bs_sup_step add soff k
+prel = get exp_bs_sup_rel add soff k
+pnid = get exp_bs_nid sub pstep 1
+if eq prel EXP_REL_REFERENCES
+exp_out_view exp_s_it_refs
+else
+exp_out_view exp_s_it_rests
+end
+exp_out_u64 pstep
+exp_out_b uchar 32
+exp_out_b uchar 40
+exp_out_rel_name prel
+exp_out_b uchar 41
+exp_out_b uchar 58
+exp_out_b uchar 32
+exp_out_arena get exp_gn_stmt_off pnid get exp_gn_stmt_len pnid
+exp_out_b uchar 10
+end
+end
+
+fn exp_sess_step_later n ulong nid ulong to void
+sc = get exp_b_scnt 0
+for j ulong sc bound 320
+lso = get exp_bs_sup_off j
+lsc = get exp_bs_sup_cnt j
+for k ulong lsc bound 1024
+if eq get exp_bs_sup_step add lso k n
+exp_out_view exp_s_step_hdr
+exp_out_u64 add j 1
+exp_out_view exp_s_rests_on_it
+break
+end
+end
+end
+uc = get exp_bu_cnt 0
+no = get exp_gn_id_off nid
+nl = get exp_gn_id_len nid
+for i ulong uc bound 512
+if exp_str_eq get exp_bu_nid_off i get exp_bu_nid_len i no nl
+exp_out_view exp_s_caveat
+exp_out_arena get exp_bu_det_off i get exp_bu_det_len i
+exp_out_b uchar 10
+end
+end
+end
+
+fn exp_sess_step n ulong to int
+if eq n 0
+ret EXP_ERR_STEP_OUT_OF_RANGE
+end
+if gt n get exp_b_scnt 0
+ret EXP_ERR_STEP_OUT_OF_RANGE
+end
+exp_out_reset
+si = sub n 1
+nid = get exp_bs_nid si
+exp_out_view exp_s_step_hdr
+exp_out_u64 n
+exp_out_b uchar 58
+exp_out_b uchar 32
+exp_out_arena get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+exp_out_b uchar 32
+exp_out_b uchar 91
+exp_out_status_words get exp_gn_status nid
+exp_out_b uchar 93
+exp_out_b uchar 10
+exp_sess_step_deps si
+exp_sess_step_later n nid
+ret EXP_OK
+end
+
+fn exp_sess_source n ulong to int
+if eq n 0
+ret EXP_ERR_STEP_OUT_OF_RANGE
+end
+if gt n get exp_b_scnt 0
+ret EXP_ERR_STEP_OUT_OF_RANGE
+end
+exp_out_reset
+si = sub n 1
+nid = get exp_bs_nid si
+exp_out_view exp_s_step_hdr
+exp_out_u64 n
+exp_out_view exp_s_comes
+exp_out_arena get exp_gn_sys_off nid get exp_gn_sys_len nid
+exp_out_b uchar 32
+exp_out_b uchar 40
+exp_out_arena get exp_gn_art_off nid get exp_gn_art_len nid
+exp_out_view exp_s_ref_lbl
+exp_out_arena get exp_gn_ref_off nid get exp_gn_ref_len nid
+if ne get exp_gn_has_dig nid 0
+exp_out_view exp_s_dig_c
+exp_out_arena get exp_gn_dig_off nid get exp_gn_dig_len nid
+end
+exp_out_view exp_s_node_sc
+exp_out_arena get exp_gn_id_off nid get exp_gn_id_len nid
+exp_out_view exp_s_st_sc
+exp_out_status_name get exp_gn_status nid
+exp_out_b uchar 46
+exp_out_b uchar 10
+ret EXP_OK
+end
+
+fn exp_sess_evidence to ulong
+exp_out_reset
+evc = get exp_be_cnt 0
+if eq evc 0
+exp_out_view exp_s_no_ev_att
+ret get exp_out_len 0
+end
+mc = get exp_g_mcnt 0
+for i ulong evc bound 320
+step = get exp_be_step i
+nid = get exp_bs_nid sub step 1
+exp_out_view exp_s_step_hdr
+exp_out_u64 step
+exp_out_b uchar 58
+exp_out_b uchar 32
+exp_out_arena get exp_gn_sys_off nid get exp_gn_sys_len nid
+exp_out_b uchar 32
+exp_out_arena get exp_gn_art_off nid get exp_gn_art_len nid
+exp_out_b uchar 32
+exp_out_arena get exp_gn_ref_off nid get exp_gn_ref_len nid
+if ne get exp_gn_has_dig nid 0
+exp_out_view exp_s_dig
+exp_out_arena get exp_gn_dig_off nid get exp_gn_dig_len nid
+end
+exp_out_b uchar 10
+for m ulong mc bound 256
+if eq get exp_gm_owner m nid
+exp_out_b uchar 32
+exp_out_b uchar 32
+exp_out_arena get exp_gm_name_off m get exp_gm_name_len m
+exp_out_b uchar 32
+exp_out_b uchar 61
+exp_out_b uchar 32
+exp_out_arena get exp_gm_val_off m get exp_gm_val_len m
+exp_out_b uchar 32
+exp_out_arena get exp_gm_unit_off m get exp_gm_unit_len m
+exp_out_b uchar 10
+end
+end
+end
+ret get exp_out_len 0
+end
+
+fn exp_sess_technical to ulong
+ret exp_render EXP_MODE_TECHNICAL EXP_MAX_LEVEL get exp_sess 1
+end
+
+fn exp_sess_simple to ulong
+ret exp_render EXP_MODE_SUMMARY 1 EXP_AUD_GENERAL
+end
+
+fn exp_sess_analogy to ulong
+ret exp_render EXP_MODE_ANALOGY 2 get exp_sess 1
+end
+
+fn exp_sess_uncertainties to ulong
+exp_out_reset
+uc = get exp_bu_cnt 0
+cc = get exp_bc_cnt 0
+if and eq uc 0 eq cc 0
+exp_out_view exp_s_no_unc_rec
+ret get exp_out_len 0
+end
+for i ulong uc bound 512
+exp_out_b uchar 45
+exp_out_b uchar 32
+exp_out_uk_label get exp_bu_kind i
+exp_out_b uchar 58
+exp_out_b uchar 32
+exp_out_arena get exp_bu_det_off i get exp_bu_det_len i
+exp_out_b uchar 10
+end
+for i ulong cc bound 128
+exp_out_view exp_s_conflict_pfx
+exp_out_arena get exp_bc_stmt_off i get exp_bc_stmt_len i
+exp_out_b uchar 10
+end
+ret get exp_out_len 0
+end
+
+fn exp_sess_alternatives to ulong
+exp_out_reset
+ac = get exp_ba_cnt 0
+if eq ac 0
+exp_out_view exp_s_no_alt_rec
+ret get exp_out_len 0
+end
+for i ulong ac bound 128
+nid = get exp_ba_nid i
+exp_out_b uchar 45
+exp_out_b uchar 32
+exp_out_arena get exp_gn_stmt_off nid get exp_gn_stmt_len nid
+exp_out_b uchar 10
+end
+ret get exp_out_len 0
+end
+
+note CLI helpers (main.rs)
+fn exp_cli_exit_code err int to int
+if eq err EXP_OK
+ret 0
+end
+ret add 10 err
+end
+
+fn exp_parse_audience s view uchar * to ulong
+if exp_view_eq s exp_an_0
+ret EXP_AUD_GENERAL
+end
+if exp_view_eq s exp_an_1
+ret EXP_AUD_OPERATOR
+end
+if exp_view_eq s exp_an_2
+ret EXP_AUD_DEVELOPER
+end
+if exp_view_eq s exp_an_3
+ret EXP_AUD_SYSTEMS_ENG
+end
+if exp_view_eq s exp_an_4
+ret EXP_AUD_RESEARCHER
+end
+ret EXP_AUD_INVALID
+end
+
+fn exp_hex_nib b uchar to int
+if and ge b 48 le b 57
+ret int sub b 48
+end
+if and ge b 97 le b 102
+ret int add 10 sub b 97
+end
+if and ge b 65 le b 70
+ret int add 10 sub b 65
+end
+ret -1
+end
+
+fn exp_parse_cortex_id s view uchar * dst edit uchar * to int
+n = len s
+off = ulong 0
+if ge n 7
+if exp_view_eq part s 0 7 exp_txt_cx_pfx
+off = 7
+end
+end
+if ne sub n off 32
+ret EXP_ERR_TARGET_NOT_FOUND
+end
+for k ulong 16
+hi = exp_hex_nib get s add off mul k 2
+lo = exp_hex_nib get s add add off mul k 2 1
+if or lt hi 0 lt lo 0
+ret EXP_ERR_TARGET_NOT_FOUND
+end
+put dst k uchar or shl ulong hi 4 ulong lo
+end
+ret EXP_OK
+end

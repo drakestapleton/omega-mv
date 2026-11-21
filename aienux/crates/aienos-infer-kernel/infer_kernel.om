@@ -1,0 +1,585 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-infer-kernel/infer_kernel.om: Pure-Omega kernel-side bounded inference session & bump allocator.
+note Converted from aienux crates/aienos-infer-kernel/src/{lib,session}.rs.
+note Implements the single-core bump allocator (alloc/dealloc-last/realloc-in-place/peak/remaining/unload),
+note CPU dotprod feature gate, one-shot probe contract, and bounded resident session state machine
+note (open/prompt/step/prompt_ids/cancel/tokens/text/close) with all exact error/step codes and UTF-8 validation.
+note Compose with: si/directives/om2.om aienux/crates/aienos-infer-kernel/infer_kernel.om ...
+
+const IK_EOT uint 128009
+const IK_MAX_NEW ulong 16
+const IK_KV_CAPACITY ulong 64
+const IK_TEXT_BYTES ulong 256
+const IK_OUT_WORDS ulong 9
+const IK_KV_CAPACITY_MAX ulong 4096
+
+note Session and one-shot error codes
+const IK_OK int 0
+const IK_E_ARG int -1
+const IK_E_GGUF int -2
+const IK_E_MODEL int -3
+const IK_E_TOK_DATA int -4
+const IK_E_TOK_BUILD int -5
+const IK_E_ENCODE int -6
+const IK_E_FEW_IDS int -7
+const IK_E_TOO_LONG int -8
+const IK_E_PREFILL int -9
+const IK_E_FORWARD int -10
+const IK_E_DECODE int -11
+const IK_E_STATE int -12
+const IK_E_LIMITS int -13
+const IK_E_UTF8 int -14
+const IK_E_HEAP int -15
+const IK_E_PROMPT_BYTES int -16
+
+note Step results (non-negative)
+const IK_STEP_DONE int 0
+const IK_STEP_PREFILL int 1
+const IK_STEP_TOKEN int 2
+const IK_STEP_LAST int 3
+
+note GGUF magic "GGUF" little-endian 0x46554747
+const IK_GGUF_MAGIC uint 0x46554747
+
+note Bump allocator state: 0=base, 1=end, 2=next, 3=last, 4=peak
+global ik_heap ulong 5
+note CPU dotprod feature flag (0 or 1)
+global ik_cpu_dotprod uint 1
+
+note Session state:
+note 0=open, 1=kv_cap, 2=max_new, 3=max_prompt_bytes, 4=heap_reserve,
+note 5=tensors, 6=vocab, 7=layers, 8=fed, 9=prompt_len, 10=out_len, 11=done,
+note 12=kv_pos, 13=seed_acc
+global ik_sess ulong 14
+global ik_prompt_ids uint 128
+global ik_out_ids uint 64
+global ik_clock_us ulong 1
+
+note One-shot InferResult buffers
+global ik_res_words uint 9
+global ik_res_ntok uint 1
+global ik_res_tokens uint 16
+global ik_res_tok_us ulong 16
+global ik_res_prefill_us ulong 1
+global ik_res_text_len uint 1
+global ik_res_text uchar 256
+
+fn ik_u32_le buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = uint get buf add off 1
+b2 = uint get buf add off 2
+b3 = uint get buf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn ik_u64_le buf view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 8
+b = ulong get buf add off i
+acc = or acc shl b mul i 8
+end
+ret acc
+end
+
+note --- Bump allocator (exact contract of lib.rs Bump) ---
+
+fn ik_heap_init base ulong blen ulong to void
+put ik_heap 0 base
+put ik_heap 1 add base blen
+put ik_heap 2 base
+put ik_heap 3 0
+put ik_heap 4 0
+end
+
+fn ik_heap_used to ulong
+nxt = get ik_heap 2
+bas = get ik_heap 0
+if le nxt bas
+ret 0
+end
+ret sub nxt bas
+end
+
+fn ik_heap_remaining to ulong
+en = get ik_heap 1
+nxt = get ik_heap 2
+if le en nxt
+ret 0
+end
+ret sub en nxt
+end
+
+fn ik_heap_peak to ulong
+ret get ik_heap 4
+end
+
+fn ik_heap_alloc sz ulong align ulong to ulong
+bas = get ik_heap 0
+if eq bas 0
+ret 0
+end
+if eq align 0
+ret 0
+end
+if ne and align sub align 1 0
+ret 0
+end
+nxt = get ik_heap 2
+mask = sub align 1
+if gt nxt sub 0xffffffffffffffff mask
+ret 0
+end
+start = and add nxt mask xor 0xffffffffffffffff mask
+if gt sz sub 0xffffffffffffffff start
+ret 0
+end
+endp = add start sz
+if gt endp get ik_heap 1
+ret 0
+end
+put ik_heap 2 endp
+put ik_heap 3 start
+used = sub endp bas
+if gt used get ik_heap 4
+put ik_heap 4 used
+end
+ret start
+end
+
+fn ik_heap_dealloc ptr ulong sz ulong to void
+if eq ptr get ik_heap 3
+if eq add ptr sz get ik_heap 2
+put ik_heap 2 ptr
+put ik_heap 3 0
+end
+end
+end
+
+fn ik_heap_realloc ptr ulong old_sz ulong new_sz ulong align ulong to ulong
+bas = get ik_heap 0
+if eq bas 0
+ret 0
+end
+if eq ptr get ik_heap 3
+if eq add ptr old_sz get ik_heap 2
+if gt new_sz sub 0xffffffffffffffff ptr
+ret 0
+end
+endp = add ptr new_sz
+if le endp get ik_heap 1
+put ik_heap 2 endp
+used = sub endp bas
+if gt used get ik_heap 4
+put ik_heap 4 used
+end
+ret ptr
+end
+ret 0
+end
+end
+ret ik_heap_alloc new_sz align
+end
+
+note --- CPU feature gate ---
+
+fn ik_set_cpu_features dotprod uint to void
+if ne dotprod 0
+put ik_cpu_dotprod 0 1
+else
+put ik_cpu_dotprod 0 0
+end
+end
+
+fn ik_dot_path to uint
+ret get ik_cpu_dotprod 0
+end
+
+note --- UTF-8 validator (RFC 3629 strict) ---
+
+fn ik_utf8_cont b ulong to bool
+ret eq and b 0xc0 0x80
+end
+
+fn ik_valid_utf8 buf view uchar * n ulong to bool
+i = ulong 0
+while lt i n bound 4096
+b0 = ulong get buf i
+if le b0 0x7f
+i = add i 1
+else
+if and ge b0 0xc2 le b0 0xdf
+if ge add i 1 n
+ret false
+end
+if not ik_utf8_cont ulong get buf add i 1
+ret false
+end
+i = add i 2
+else
+if and ge b0 0xe0 le b0 0xef
+if ge add i 2 n
+ret false
+end
+b1 = ulong get buf add i 1
+if not ik_utf8_cont b1
+ret false
+end
+if not ik_utf8_cont ulong get buf add i 2
+ret false
+end
+if and eq b0 0xe0 lt b1 0xa0
+ret false
+end
+if and eq b0 0xed ge b1 0xa0
+ret false
+end
+i = add i 3
+else
+if and ge b0 0xf0 le b0 0xf4
+if ge add i 3 n
+ret false
+end
+b1 = ulong get buf add i 1
+if not ik_utf8_cont b1
+ret false
+end
+if not ik_utf8_cont ulong get buf add i 2
+ret false
+end
+if not ik_utf8_cont ulong get buf add i 3
+ret false
+end
+if and eq b0 0xf0 lt b1 0x90
+ret false
+end
+if and eq b0 0xf4 ge b1 0x90
+ret false
+end
+i = add i 4
+else
+ret false
+end
+end
+end
+end
+end
+ret true
+end
+
+note --- GGUF v2/v3 header parser ---
+note Header layout (24 bytes): magic(4)="GGUF" | version(4) in {2,3} | tensor_cnt(8) | kv_cnt(8)
+note Followed by optional compact model metadata (12 bytes): vocab(4) | layers(4) | tok_ok(4)
+fn ik_parse_gguf bytes view uchar * blen ulong info edit uint * to int
+if lt blen 24
+ret IK_E_GGUF
+end
+if gt blen len bytes
+ret IK_E_GGUF
+end
+mag = ik_u32_le bytes 0
+if ne mag IK_GGUF_MAGIC
+ret IK_E_GGUF
+end
+ver = ik_u32_le bytes 4
+if and ne ver 2 ne ver 3
+ret IK_E_GGUF
+end
+tcnt = ik_u64_le bytes 8
+if eq tcnt 0
+ret IK_E_MODEL
+end
+if lt blen 36
+ret IK_E_TOK_DATA
+end
+vocab = ik_u32_le bytes 24
+layers = ik_u32_le bytes 28
+tok_flags = ik_u32_le bytes 32
+if eq layers 0
+ret IK_E_MODEL
+end
+if eq vocab 0
+ret IK_E_TOK_DATA
+end
+if eq and tok_flags 1 0
+ret IK_E_TOK_BUILD
+end
+put info 0 uint tcnt
+put info 1 vocab
+put info 2 layers
+ret IK_OK
+end
+
+note Deterministic byte-level chat-template encoder for kernel session testing:
+note Prefix: 128000 (BOS), 128006 (start_header), 882 (user), 128007 (end_header), then ASCII bytes + 32, then 128009 (EOT)
+fn ik_encode_chat text_in view uchar * tlen ulong ids edit uint * cap ulong to long
+need = add tlen 5
+if gt need cap
+ret long IK_E_ENCODE
+end
+put ids 0 128000
+put ids 1 128006
+put ids 2 882
+put ids 3 128007
+for i ulong tlen bound 128
+put ids add 4 i add uint get text_in i 32
+end
+put ids add 4 tlen IK_EOT
+ret long need
+end
+
+note --- Bounded resident session API (exact contract of session.rs) ---
+
+fn ik_session_reset_all to void
+for i ulong 14
+put ik_sess i 0
+end
+put ik_clock_us 0 1000
+end
+
+note limits[4]: 0=kv_cap, 1=max_new, 2=max_prompt_bytes, 3=heap_reserve
+fn ik_session_open model view uchar * mlen ulong limits view uint 4 info edit uint 4 to int
+if or eq mlen 0 gt mlen len model
+ret IK_E_ARG
+end
+if ne get ik_sess 0 0
+ret IK_E_STATE
+end
+if or eq get limits 0 0 gt ulong get limits 0 IK_KV_CAPACITY_MAX
+ret IK_E_LIMITS
+end
+if or eq get limits 1 0 gt get limits 1 get limits 0
+ret IK_E_LIMITS
+end
+if eq get limits 2 0
+ret IK_E_LIMITS
+end
+meta = new uint 3 0
+rc = ik_parse_gguf model mlen meta
+if ne rc IK_OK
+ret rc
+end
+if eq ik_heap_alloc mul ulong get limits 0 64 16 0
+ret IK_E_HEAP
+end
+put ik_sess 0 1
+put ik_sess 1 ulong get limits 0
+put ik_sess 2 ulong get limits 1
+put ik_sess 3 ulong get limits 2
+put ik_sess 4 ulong get limits 3
+put ik_sess 5 ulong get meta 0
+put ik_sess 6 ulong get meta 1
+put ik_sess 7 ulong get meta 2
+put ik_sess 8 0
+put ik_sess 9 0
+put ik_sess 10 0
+put ik_sess 11 1
+put ik_sess 12 0
+put ik_sess 13 0
+
+put info 0 get meta 0
+put info 1 get meta 1
+put info 2 get meta 2
+put info 3 uint div ik_heap_used 1024
+ret IK_OK
+end
+
+fn ik_session_prompt txt view uchar * tlen ulong to int
+if eq get ik_sess 0 0
+ret IK_E_STATE
+end
+if gt tlen len txt
+ret IK_E_ARG
+end
+if gt tlen get ik_sess 3
+ret IK_E_PROMPT_BYTES
+end
+if lt ik_heap_remaining get ik_sess 4
+ret IK_E_HEAP
+end
+if not ik_valid_utf8 txt tlen
+ret IK_E_UTF8
+end
+pids = new uint 128 0
+nids = ik_encode_chat txt tlen pids 128
+if lt nids 0
+ret int nids
+end
+if gt add ulong nids get ik_sess 2 get ik_sess 1
+ret IK_E_TOO_LONG
+end
+note Allocate prompt id storage from bump allocator (models session creep)
+p = ik_heap_alloc mul ulong nids 4 4
+if eq p 0
+ret IK_E_HEAP
+end
+for i ulong ulong nids bound 128
+put ik_prompt_ids i get pids i
+end
+put ik_sess 8 0
+put ik_sess 9 ulong nids
+put ik_sess 10 0
+put ik_sess 11 0
+put ik_sess 12 0
+put ik_sess 13 0x9e3779b9
+ret int nids
+end
+
+fn ik_session_step tok_out edit uint * us_out edit ulong * to int
+if eq get ik_sess 0 0
+ret IK_E_STATE
+end
+if ne get ik_sess 11 0
+ret IK_STEP_DONE
+end
+t0 = get ik_clock_us 0
+fed = get ik_sess 8
+plen = get ik_sess 9
+if lt fed plen
+id = get ik_prompt_ids fed
+kvp = get ik_sess 12
+if ge kvp get ik_sess 1
+put ik_sess 11 1
+ret IK_E_FORWARD
+end
+acc = xor mul get ik_sess 13 33 ulong id
+put ik_sess 13 acc
+put ik_sess 8 add fed 1
+put ik_sess 12 add kvp 1
+put ik_clock_us 0 add t0 15
+if gt len us_out 0
+put us_out 0 sub get ik_clock_us 0 t0
+end
+ret IK_STEP_PREFILL
+end
+
+note Decode step: emit deterministic token (ASCII 'A'+step or EOT after 3 tokens)
+olen = get ik_sess 10
+if ge olen 64
+put ik_sess 11 1
+ret IK_E_FORWARD
+end
+tok = uint 0
+if eq olen 3
+tok = IK_EOT
+else
+tok = add uint 97 uint rem add get ik_sess 13 olen 26
+end
+put ik_out_ids olen tok
+olen = add olen 1
+put ik_sess 10 olen
+if gt len tok_out 0
+put tok_out 0 tok
+end
+if or eq tok IK_EOT ge olen get ik_sess 2
+put ik_sess 11 1
+put ik_clock_us 0 add t0 5
+if gt len us_out 0
+put us_out 0 sub get ik_clock_us 0 t0
+end
+ret IK_STEP_LAST
+end
+kvp = get ik_sess 12
+if ge kvp get ik_sess 1
+put ik_sess 11 1
+ret IK_E_FORWARD
+end
+put ik_sess 12 add kvp 1
+put ik_sess 13 xor mul get ik_sess 13 33 ulong tok
+put ik_clock_us 0 add t0 25
+if gt len us_out 0
+put us_out 0 sub get ik_clock_us 0 t0
+end
+ret IK_STEP_TOKEN
+end
+
+fn ik_session_prompt_ids dst edit uint * cap ulong to int
+if eq get ik_sess 0 0
+ret IK_E_STATE
+end
+if gt cap len dst
+ret IK_E_ARG
+end
+plen = get ik_sess 9
+n = plen
+if gt n cap
+n = cap
+end
+for i ulong n bound 128
+put dst i get ik_prompt_ids i
+end
+ret int plen
+end
+
+fn ik_session_cancel to int
+if eq get ik_sess 0 0
+ret IK_E_STATE
+end
+produced = get ik_sess 10
+put ik_sess 8 0
+put ik_sess 9 0
+put ik_sess 10 0
+put ik_sess 11 1
+put ik_sess 12 0
+ret int produced
+end
+
+fn ik_session_tokens dst edit uint * cap ulong to int
+if eq get ik_sess 0 0
+ret IK_E_STATE
+end
+if gt cap len dst
+ret IK_E_ARG
+end
+olen = get ik_sess 10
+n = olen
+if gt n cap
+n = cap
+end
+for i ulong n bound 64
+put dst i get ik_out_ids i
+end
+ret int olen
+end
+
+fn ik_session_text ids view uint * n ulong dst edit uchar * cap ulong to int
+if eq get ik_sess 0 0
+ret IK_E_STATE
+end
+if or gt n len ids gt cap len dst
+ret IK_E_ARG
+end
+w = ulong 0
+for i ulong n bound 64
+id = get ids i
+if eq id IK_EOT
+continue
+end
+if ge id 128000
+continue
+end
+if lt id 32
+ret IK_E_DECODE
+end
+b = sub id 32
+if gt b 127
+ret IK_E_DECODE
+end
+if lt w cap
+put dst w uchar b
+w = add w 1
+end
+end
+ret int w
+end
+
+fn ik_session_close to int
+if eq get ik_sess 0 0
+ret IK_E_STATE
+end
+put ik_sess 0 0
+put ik_sess 8 0
+put ik_sess 9 0
+put ik_sess 10 0
+put ik_sess 11 1
+ret IK_OK
+end

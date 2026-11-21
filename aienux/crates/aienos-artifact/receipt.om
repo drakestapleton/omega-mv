@@ -1,0 +1,585 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-artifact/receipt.om: Pure-Omega Admission Receipt v0 (ADR 0014 s7)
+note 512-byte canonical encoder, strict fail-closed decoder, semantic validator,
+note nonce/identity builders, and Ed25519 signing/verification.
+note Converted from aienux crates/aienos-artifact/src/receipt.rs.
+note Compose after: si/directives/om2.om om/tls/sha2.om protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om aienux/crates/aienos-artifact/artifact.om
+
+const RCP_VERSION ulong 0
+const RCP_HEADER_SIZE ulong 96
+const RCP_SIZE ulong 512
+const RCP_SIG_OFFSET ulong 400
+const RCP_SIG_MSG_SIZE ulong 70
+
+note Presence flags (offset 16)
+const RCP_FLAG_MACHINE_ID ulong 1
+const RCP_FLAG_CONTEXT_ID ulong 2
+const RCP_FLAG_TIMESTAMP ulong 4
+const RCP_VALID_FLAGS ulong 7
+
+note Result flags (offset 72)
+const RCP_RES_READ_OK ulong 1
+const RCP_RES_WRITE_DENIED ulong 2
+const RCP_RES_RECLAIMED ulong 4
+const RCP_RES_CANARY_PASSED ulong 8
+const RCP_RES_FORGED_DENIED ulong 16
+const RCP_RES_MAPPED_BYTES_MATCH ulong 32
+const RCP_RES_EXECUTED_BYTES_MATCH ulong 64
+const RCP_RES_WX_SEALED ulong 128
+const RCP_VALID_RES_FLAGS ulong 255
+
+note ReceiptDecision enum values
+const RCP_DEC_ADMITTED ulong 1
+const RCP_DEC_REJECTED ulong 2
+const RCP_DEC_CANARY_FAILED ulong 3
+const RCP_DEC_DESTROYED ulong 4
+
+note QualificationTier enum values
+const RCP_TIER_QEMU ulong 1
+const RCP_TIER_MACHINE1 ulong 2
+const RCP_TIER_PI5 ulong 3
+
+note ExecutionStatusCode enum values
+const RCP_EXEC_NOT_RUN ulong 0
+const RCP_EXEC_EXITED ulong 1
+const RCP_EXEC_TIMEOUT ulong 2
+const RCP_EXEC_FAULT ulong 3
+const RCP_EXEC_BAD_SYSCALL ulong 4
+const RCP_EXEC_RESOURCE_OVERRUN ulong 5
+const RCP_EXEC_CANARY_FAILED ulong 6
+
+note Stage and loader reason bounds
+const RCP_MAX_REJECTION_STAGE ulong 9
+const RCP_LOADER_REASON_FIRST ulong 0x101
+const RCP_LOADER_REASON_LAST ulong 0x10a
+const RCP_MAX_ANCHORS ulong 8
+
+note Domain and label strings (domains get trailing NUL byte when hashed/framed)
+text rcp_magic_pfx "AIENRCP"
+text rcp_sig_dom_pfx "AIENOS-ADMISSION-RECEIPT-SIGNATURE-V1"
+text rcp_dig_dom_pfx "AIENOS-ADMISSION-RECEIPT-V1"
+text rcp_nonce_dom_pfx "AIENOS-ADMISSION-RECEIPT-NONCE-V1"
+text rcp_lbl_qemu "SEED-0B-QEMU"
+text rcp_lbl_machine1 "SEED-0B-MACHINE1"
+text rcp_lbl_pi5 "SEED-0B-PI5"
+
+note Working receipt record in globals
+note rcp_scalars slots:
+note   0=flags, 1=decision, 2=tier, 3=sequence, 4=observed_time_ns,
+note   5=execution_status, 6=result_flags, 7=rejection_stage, 8=rejection_reason,
+note   9=syscalls, 10=object_reads_ok, 11=denials, 12=frames_reserved,
+note   13=generation, 14=context_id
+global rcp_scalars ulong 15
+global rcp_exit_status int 1
+global rcp_nonce_buf uchar 16
+note 9 digests * 32 bytes = 288 bytes:
+note   0: artifact_id (offset 96)
+note   1: payload_digest (offset 128)
+note   2: artifact_signer_fingerprint (offset 160)
+note   3: policy_digest (offset 192)
+note   4: requested_capability_digest (offset 224)
+note   5: granted_capability_digest (offset 256)
+note   6: resource_envelope_digest (offset 288)
+note   7: verifier_identity (offset 320)
+note   8: machine_id_digest (offset 352)
+global rcp_digests uchar 288
+
+note Receipt trust anchor table (distinct from artifact anchors)
+global rcp_anchor_cnt ulong 1
+global rcp_anchor_pks uchar 256
+
+fn rcp_clear to void
+for i ulong 15
+put rcp_scalars i 0
+end
+put rcp_exit_status 0 0
+for i ulong 16
+put rcp_nonce_buf i 0
+end
+for i ulong 288
+put rcp_digests i 0
+end
+end
+
+fn rcp_set_digest idx ulong src view uchar * to void
+base = mul idx 32
+for i ulong 32
+put rcp_digests add base i get src i
+end
+end
+
+fn rcp_get_digest idx ulong dst edit uchar * to void
+base = mul idx 32
+for i ulong 32
+put dst i get rcp_digests add base i
+end
+end
+
+fn rcp_put_i32_le buf edit uchar * off ulong v int to void
+u = ulong 0
+if ge v 0
+u = ulong v
+else
+u = ulong add long v 4294967296
+end
+art_put_u32_le buf off u
+end
+
+fn rcp_get_i32_le buf view uchar * off ulong to int
+u = art_get_u32_le buf off
+if ge u 2147483648
+ret int sub long u 4294967296
+end
+ret int u
+end
+
+note Canonical 512-byte encoding with all-zero signature block (receipt::encode)
+fn rcp_encode dst edit uchar * to int
+if lt len dst RCP_SIZE
+ret ART_ERR_TRUNCATED
+end
+for i ulong 512
+put dst i 0
+end
+for i ulong 7
+put dst i get rcp_magic_pfx i
+end
+put dst 7 0
+art_put_u16_le dst 8 RCP_VERSION
+art_put_u16_le dst 10 RCP_HEADER_SIZE
+art_put_u32_le dst 12 RCP_SIZE
+art_put_u32_le dst 16 get rcp_scalars 0
+art_put_u16_le dst 20 get rcp_scalars 1
+art_put_u16_le dst 22 get rcp_scalars 2
+art_put_u64_le dst 24 get rcp_scalars 3
+for i ulong 16
+put dst add 32 i get rcp_nonce_buf i
+end
+art_put_u64_le dst 48 get rcp_scalars 4
+art_put_u32_le dst 64 get rcp_scalars 5
+rcp_put_i32_le dst 68 get rcp_exit_status 0
+art_put_u32_le dst 72 get rcp_scalars 6
+art_put_u16_le dst 76 get rcp_scalars 7
+art_put_u16_le dst 78 get rcp_scalars 8
+art_put_u32_le dst 80 get rcp_scalars 9
+art_put_u32_le dst 84 get rcp_scalars 10
+art_put_u32_le dst 88 get rcp_scalars 11
+art_put_u32_le dst 92 get rcp_scalars 12
+for i ulong 288
+put dst add 96 i get rcp_digests i
+end
+art_put_u64_le dst 384 get rcp_scalars 13
+art_put_u64_le dst 392 get rcp_scalars 14
+ret ART_OK
+end
+
+note SHA256("AIENOS-ADMISSION-RECEIPT-V1\0" || bytes[0..400])
+fn rcp_digest bytes view uchar * dst edit uchar * to void
+art_sha256_dom rcp_dig_dom_pfx part bytes 0 RCP_SIG_OFFSET dst
+end
+
+note Deterministic per-context nonce: first 16 bytes of SHA256(NONCE_DOMAIN || verifier_id || seq_le)
+fn rcp_nonce verifier_id view uchar * seq ulong dst edit uchar * to void
+ctx = new ulong 40 0
+nul = new uchar 1 0
+seqb = new uchar 8 0
+art_put_u64_le seqb 0 seq
+sha256_init ctx
+sha256_update ctx rcp_nonce_dom_pfx
+sha256_update ctx nul
+sha256_update ctx part verifier_id 0 32
+sha256_update ctx seqb
+dig = new uchar 32 0
+sha256_final ctx dig
+for i ulong 16
+put dst i get dig i
+end
+end
+
+note Canonical 45-byte verifier build identity (returns 45 on valid 40-char lowercase hex commit, else -1)
+fn rcp_verifier_identity_bytes commit view uchar * target ulong abi ulong feat uchar dst edit uchar 45 to int
+if ne len commit 40
+ret -1
+end
+for i ulong 40
+c = get commit i
+is_dig = and ge c 48 le c 57
+is_af = and ge c 97 le c 102
+if not or is_dig is_af
+ret -1
+end
+put dst i c
+end
+art_put_u16_le dst 40 target
+art_put_u16_le dst 42 abi
+put dst 44 feat
+ret 45
+end
+
+fn rcp_tier_label_copy tier ulong dst edit uchar * to ulong
+if eq tier RCP_TIER_QEMU
+n = len rcp_lbl_qemu
+for i ulong n bound 32
+put dst i get rcp_lbl_qemu i
+end
+ret n
+end
+if eq tier RCP_TIER_MACHINE1
+n = len rcp_lbl_machine1
+for i ulong n bound 32
+put dst i get rcp_lbl_machine1 i
+end
+ret n
+end
+if eq tier RCP_TIER_PI5
+n = len rcp_lbl_pi5
+for i ulong n bound 32
+put dst i get rcp_lbl_pi5 i
+end
+ret n
+end
+ret 0
+end
+
+fn rcp_valid_reason code ulong to bool
+if and ge code 1 le code 19
+ret true
+end
+if and ge code RCP_LOADER_REASON_FIRST le code RCP_LOADER_REASON_LAST
+ret true
+end
+ret false
+end
+
+fn rcp_machine_id_is_zero to bool
+for i ulong 32
+if ne get rcp_digests add 256 i 0
+ret false
+end
+end
+ret true
+end
+
+note s7.1 / s7.3 semantic validation of working receipt
+fn rcp_validate to int
+if eq and get rcp_scalars 0 RCP_FLAG_MACHINE_ID 0
+if not rcp_machine_id_is_zero
+ret ART_ERR_MALFORMED_RECEIPT
+end
+end
+if eq and get rcp_scalars 0 RCP_FLAG_CONTEXT_ID 0
+if or ne get rcp_scalars 13 0 ne get rcp_scalars 14 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+end
+if eq and get rcp_scalars 0 RCP_FLAG_TIMESTAMP 0
+if ne get rcp_scalars 4 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+end
+rst = get rcp_scalars 7
+rrs = get rcp_scalars 8
+if gt rst RCP_MAX_REJECTION_STAGE
+ret ART_ERR_MALFORMED_RECEIPT
+end
+if ne rrs 0
+if not rcp_valid_reason rrs
+ret ART_ERR_MALFORMED_RECEIPT
+end
+end
+dec = get rcp_scalars 1
+es = get rcp_scalars 5
+ex = get rcp_exit_status 0
+rf = get rcp_scalars 6
+if eq dec RCP_DEC_REJECTED
+if or eq rst 0 eq rrs 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+if or ne es RCP_EXEC_NOT_RUN ne ex 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+if or ne get rcp_scalars 9 0 ne get rcp_scalars 10 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+if ne get rcp_scalars 11 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+if ne and rf not RCP_RES_RECLAIMED 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+else
+if or ne rst 0 ne rrs 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+end
+if ne eq dec RCP_DEC_CANARY_FAILED eq es RCP_EXEC_CANARY_FAILED
+ret ART_ERR_MALFORMED_RECEIPT
+end
+if ne and rf RCP_RES_CANARY_PASSED 0
+if or ne es RCP_EXEC_EXITED ne ex 0
+ret ART_ERR_MALFORMED_RECEIPT
+end
+end
+vid = new uchar 32 0
+rcp_get_digest 7 vid
+exp_n = new uchar 16 0
+rcp_nonce vid get rcp_scalars 3 exp_n
+for i ulong 16
+if ne get rcp_nonce_buf i get exp_n i
+ret ART_ERR_MALFORMED_RECEIPT
+end
+end
+ret ART_OK
+end
+
+note Strict fail-closed decode of 512-byte receipt record (receipt::decode)
+fn rcp_decode_header bytes view uchar * to int
+n = len bytes
+if lt n RCP_SIZE
+ret ART_ERR_TRUNCATED
+end
+if gt n RCP_SIZE
+ret ART_ERR_WRONG_LENGTH
+end
+for i ulong 7
+if ne get bytes i get rcp_magic_pfx i
+ret ART_ERR_BAD_MAGIC
+end
+end
+if ne get bytes 7 0
+ret ART_ERR_BAD_MAGIC
+end
+if or ne art_get_u16_le bytes 8 RCP_VERSION ne art_get_u16_le bytes 10 RCP_HEADER_SIZE
+ret ART_ERR_UNSUPPORTED_VERSION
+end
+if ne art_get_u32_le bytes 12 RCP_SIZE
+ret ART_ERR_UNSUPPORTED_VERSION
+end
+fl = art_get_u32_le bytes 16
+rf = art_get_u32_le bytes 72
+if or ne and fl not RCP_VALID_FLAGS 0 ne and rf not RCP_VALID_RES_FLAGS 0
+ret ART_ERR_UNSUPPORTED_FLAGS
+end
+if or not art_all_zero bytes 56 8 not art_all_zero bytes 500 12
+ret ART_ERR_RESERVED_NON_ZERO
+end
+if not art_all_zero bytes 400 100
+if ne art_get_u16_le bytes 400 ART_SIG_ALG_ED25519
+ret ART_ERR_BAD_SIGNATURE_FORMAT
+end
+if not art_all_zero bytes 402 2
+ret ART_ERR_RESERVED_NON_ZERO
+end
+end
+ret ART_OK
+end
+
+fn rcp_decode bytes view uchar * to int
+rc = rcp_decode_header bytes
+if ne rc ART_OK
+ret rc
+end
+dec = art_get_u16_le bytes 20
+if or lt dec 1 gt dec 4
+ret ART_ERR_MALFORMED_RECEIPT
+end
+tier = art_get_u16_le bytes 22
+if or lt tier 1 gt tier 3
+ret ART_ERR_MALFORMED_RECEIPT
+end
+es = art_get_u32_le bytes 64
+if gt es 6
+ret ART_ERR_MALFORMED_RECEIPT
+end
+put rcp_scalars 0 art_get_u32_le bytes 16
+put rcp_scalars 1 dec
+put rcp_scalars 2 tier
+put rcp_scalars 3 art_get_u64_le bytes 24
+for i ulong 16
+put rcp_nonce_buf i get bytes add 32 i
+end
+put rcp_scalars 4 art_get_u64_le bytes 48
+put rcp_scalars 5 es
+put rcp_exit_status 0 rcp_get_i32_le bytes 68
+put rcp_scalars 6 art_get_u32_le bytes 72
+put rcp_scalars 7 art_get_u16_le bytes 76
+put rcp_scalars 8 art_get_u16_le bytes 78
+put rcp_scalars 9 art_get_u32_le bytes 80
+put rcp_scalars 10 art_get_u32_le bytes 84
+put rcp_scalars 11 art_get_u32_le bytes 88
+put rcp_scalars 12 art_get_u32_le bytes 92
+for i ulong 288
+put rcp_digests i get bytes add 96 i
+end
+put rcp_scalars 13 art_get_u64_le bytes 384
+put rcp_scalars 14 art_get_u64_le bytes 392
+ret rcp_validate
+end
+
+fn rcp_is_unsigned bytes view uchar * to bool
+ret art_all_zero bytes RCP_SIG_OFFSET 112
+end
+
+note Build 70-byte receipt signature message: "AIENOS-ADMISSION-RECEIPT-SIGNATURE-V1\0" || digest
+fn rcp_signature_message dig view uchar * msg_out edit uchar * to void
+for i ulong 37
+put msg_out i get rcp_sig_dom_pfx i
+end
+put msg_out 37 0
+for i ulong 32
+put msg_out add 38 i get dig i
+end
+end
+
+note Sign a valid unsigned 512-byte receipt in place using 32-byte Ed25519 seed
+fn rcp_sign bytes edit uchar * seed view uchar * to int
+if ne len bytes RCP_SIZE
+ret ART_ERR_WRONG_LENGTH
+end
+if not rcp_is_unsigned bytes
+ret ART_ERR_BAD_SIGNATURE_FORMAT
+end
+rc = rcp_decode bytes
+if ne rc ART_OK
+ret rc
+end
+dig = new uchar 32 0
+rcp_digest bytes dig
+msg = new uchar 70 0
+rcp_signature_message dig msg
+pk = new uchar 32 0
+art_ed25519_pubkey seed pk
+fp = new uchar 32 0
+art_signer_fingerprint pk fp
+sg = new uchar 64 0
+art_ed25519_sign seed msg sg
+art_put_u16_le bytes 400 ART_SIG_ALG_ED25519
+put bytes 402 0
+put bytes 403 0
+for i ulong 32
+put bytes add 404 i get fp i
+end
+for i ulong 64
+put bytes add 436 i get sg i
+end
+ret ART_OK
+end
+
+note Receipt trust anchor set (distinct from artifact trust anchors)
+fn rcp_anchors_clear to void
+put rcp_anchor_cnt 0 0
+end
+
+fn rcp_anchors_add pk view uchar * to int
+if ne len pk 32
+ret ART_ERR_BAD_SIGNATURE_FORMAT
+end
+cnt = get rcp_anchor_cnt 0
+if ge cnt RCP_MAX_ANCHORS
+ret ART_ERR_RESOURCE_LIMIT
+end
+base = mul cnt 32
+for i ulong 32
+put rcp_anchor_pks add base i get pk i
+end
+put rcp_anchor_cnt 0 add cnt 1
+ret ART_OK
+end
+
+note Populate RFC 8032 TEST 2 public key (Seed0bTestReceiptAnchorSet, TEST ONLY)
+fn rcp_seed0b_test_pubkey dst edit uchar * to void
+put dst 0 0x3d
+put dst 1 0x40
+put dst 2 0x17
+put dst 3 0xc3
+put dst 4 0xe8
+put dst 5 0x43
+put dst 6 0x89
+put dst 7 0x5a
+put dst 8 0x92
+put dst 9 0xb7
+put dst 10 0x0a
+put dst 11 0xa7
+put dst 12 0x4d
+put dst 13 0x1b
+put dst 14 0x7e
+put dst 15 0xbc
+put dst 16 0x9c
+put dst 17 0x98
+put dst 18 0x2c
+put dst 19 0xcf
+put dst 20 0x2e
+put dst 21 0xc4
+put dst 22 0x96
+put dst 23 0x8c
+put dst 24 0xc0
+put dst 25 0xcd
+put dst 26 0x55
+put dst 27 0xf1
+put dst 28 0x2a
+put dst 29 0xf4
+put dst 30 0x66
+put dst 31 0x0c
+end
+
+fn rcp_anchors_add_seed0b_test to int
+pk = new uchar 32 0
+rcp_seed0b_test_pubkey pk
+ret rcp_anchors_add pk
+end
+
+fn rcp_anchors_find fp view uchar * pk_out edit uchar * to bool
+cnt = get rcp_anchor_cnt 0
+cand = new uchar 32 0
+cfp = new uchar 32 0
+for idx ulong cnt bound 8
+base = mul idx 32
+for i ulong 32
+put cand i get rcp_anchor_pks add base i
+end
+art_signer_fingerprint cand cfp
+if art_bytes_eq fp cfp
+for i ulong 32
+put pk_out i get cand i
+end
+ret true
+end
+end
+ret false
+end
+
+note Decode and authenticate a signed 512-byte receipt record (receipt::verify)
+fn rcp_verify bytes view uchar * to int
+rc = rcp_decode bytes
+if ne rc ART_OK
+ret rc
+end
+if rcp_is_unsigned bytes
+ret ART_ERR_BAD_SIGNATURE_FORMAT
+end
+fp = new uchar 32 0
+for i ulong 32
+put fp i get bytes add 404 i
+end
+pk = new uchar 32 0
+if not rcp_anchors_find fp pk
+ret ART_ERR_UNTRUSTED_SIGNER
+end
+chk_fp = new uchar 32 0
+art_signer_fingerprint pk chk_fp
+if not art_bytes_eq chk_fp fp
+ret ART_ERR_UNTRUSTED_SIGNER
+end
+sg = new uchar 64 0
+for i ulong 64
+put sg i get bytes add 436 i
+end
+dig = new uchar 32 0
+rcp_digest bytes dig
+msg = new uchar 70 0
+rcp_signature_message dig msg
+if not art_ed25519_verify pk msg sg
+ret ART_ERR_BAD_SIGNATURE
+end
+ret ART_OK
+end

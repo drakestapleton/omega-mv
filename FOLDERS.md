@@ -7,7 +7,7 @@ Two crumb files already under evidence/ stay, because existing evidence is never
 
 ## `aienux/`
 
-Aienux, the OS layer of Sovereign Intelligence (SI), mirroring `gpu/`: pure-Omega units moved here from canonical Aienux (`rad:z2Q6ob2gL6Qo5oUMpyehukayVF7mN`, `1f12818d`) plus its OS-layer siblings `rtl8127-omega`, `spark-supervisor`, and `spark-connector` with full Git history, and pure-Omega conversions of `atlas` (`aienux/atlas/`), `pi-register` (`aienux/pi-register/`), `spark-debugger` (`aienux/debugger/`), `capability`, `argus`, `kernel/core`, `kernel/hal`, and `aegis`. `aienux/README.md` gives the layout and `aienux/UNITS.md` lists the 78 verified units.
+Aienux, the OS layer of Sovereign Intelligence (SI), mirroring `gpu/`: pure-Omega units moved here from canonical Aienux (`rad:z2Q6ob2gL6Qo5oUMpyehukayVF7mN`, `1f12818d`) plus its OS-layer siblings `rtl8127-omega`, `spark-supervisor`, and `spark-connector` with full Git history, and pure-Omega conversions of `atlas` (`aienux/atlas/`), `pi-register` (`aienux/pi-register/`), `spark-debugger` (`aienux/debugger/`), `capability`, `store`, `boot`, `argus`, `disk`, `net/core`, `kernel/core`, `kernel/hal`, `kernel/mm`, `kernel/arch`, `kernel/artifact`, `aegis`, and 15 Wave 4 Rust crates (`aienux/crates/`). `aienux/README.md` gives the layout and `aienux/UNITS.md` lists the 103 verified units (33 `@run` behavioral suites).
 
 Rules:
 

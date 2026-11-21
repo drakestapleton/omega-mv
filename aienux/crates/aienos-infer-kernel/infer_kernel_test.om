@@ -1,0 +1,284 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-infer-kernel/infer_kernel_test.om: Behavioral self-test for aienos-infer-kernel.
+note Compose with: si/directives/om2.om aienux/crates/aienos-infer-kernel/infer_kernel.om aienux/crates/aienos-infer-kernel/infer_kernel_test.om
+
+text ikt_prompt "What is the capital of France?"
+text ikt_hi "Hi"
+
+fn ikt_put_u32_le buf edit uchar * off ulong v uint to void
+put buf off uchar and v 0xff
+put buf add off 1 uchar and shr v 8 0xff
+put buf add off 2 uchar and shr v 16 0xff
+put buf add off 3 uchar and shr v 24 0xff
+end
+
+fn ikt_put_u64_le buf edit uchar * off ulong v ulong to void
+for i ulong 8
+put buf add off i uchar and shr v mul i 8 0xff
+end
+end
+
+fn ikt_make_gguf buf edit uchar * tensors ulong vocab uint layers uint tok_flags uint to void
+ikt_put_u32_le buf 0 IK_GGUF_MAGIC
+ikt_put_u32_le buf 4 3
+ikt_put_u64_le buf 8 tensors
+ikt_put_u64_le buf 16 4
+ikt_put_u32_le buf 24 vocab
+ikt_put_u32_le buf 28 layers
+ikt_put_u32_le buf 32 tok_flags
+end
+
+fn ikt_test_bump to int
+note 1. Unloaded heap refuses allocations
+ik_heap_init 0 0
+if ne ik_heap_alloc 16 8 0
+ret 1
+end
+
+note 2. Aligned alloc, peak, dealloc-last, realloc-in-place, exhaustion
+ik_heap_init 0x10000 1024
+p1 = ik_heap_alloc 10 8
+if ne p1 0x10000
+ret 2
+end
+p2 = ik_heap_alloc 20 16
+if ne p2 0x10010
+ret 3
+end
+note Realloc newest block in place
+p2b = ik_heap_realloc p2 20 40 16
+if ne p2b p2
+ret 4
+end
+if ne ik_heap_used 56
+ret 5
+end
+note Dealloc newest block reclaims cursor, preserves peak
+ik_heap_dealloc p2b 40
+if ne ik_heap_used 16
+ret 6
+end
+if ne ik_heap_peak 56
+ret 7
+end
+note Non-newest dealloc is no-op
+ik_heap_dealloc p1 10
+if ne ik_heap_used 16
+ret 8
+end
+note Exhaustion returns 0
+if ne ik_heap_alloc 2048 16 0
+ret 9
+end
+
+note 3. CPU dotprod feature flag
+ik_set_cpu_features 0
+if ne ik_dot_path 0
+ret 10
+end
+ik_set_cpu_features 1
+if ne ik_dot_path 1
+ret 11
+end
+ret 0
+end
+
+fn ikt_test_session_steps to int
+tok_o = new uint 1 0
+us_o = new ulong 1 0
+note Prefill 35 steps, then decode until STEP_LAST, then STEP_DONE
+for i ulong 35
+if ne ik_session_step tok_o us_o IK_STEP_PREFILL
+ret 34
+end
+end
+for i ulong 3
+if ne ik_session_step tok_o us_o IK_STEP_TOKEN
+ret 35
+end
+end
+if ne ik_session_step tok_o us_o IK_STEP_LAST
+ret 36
+end
+if ne get tok_o 0 IK_EOT
+ret 37
+end
+if ne ik_session_step tok_o us_o IK_STEP_DONE
+ret 38
+end
+
+note Read back produced tokens (4) and decode to text (3 ASCII bytes, EOT omitted)
+out_toks = new uint 8 0
+if ne ik_session_tokens out_toks 8 4
+ret 39
+end
+txt_out = new uchar 16 0
+tlen = ik_session_text view out_toks 4 txt_out 16
+if ne tlen 3
+ret 40
+end
+
+note Cancel mid-generation returns count produced before cancel and resets to STEP_DONE
+if ne ik_session_prompt ikt_hi len ikt_hi 7
+ret 41
+end
+for i ulong 7
+if ne ik_session_step tok_o us_o IK_STEP_PREFILL
+ret 42
+end
+end
+if ne ik_session_step tok_o us_o IK_STEP_TOKEN
+ret 43
+end
+if ne ik_session_cancel 1
+ret 44
+end
+if ne ik_session_step tok_o us_o IK_STEP_DONE
+ret 45
+end
+ret 0
+end
+
+fn ikt_test_session_heap_reserve to int
+gg = new uchar 36 0
+ikt_make_gguf gg 147 128256 16 1
+info = new uint 4 0
+lim = new uint 4 0
+rc_c = ik_session_close
+ik_heap_init 0x20000 5000
+put lim 0 64
+put lim 1 16
+put lim 2 64
+put lim 3 2000
+if ne ik_session_open view gg 36 view lim info IK_OK
+ret 46
+end
+if ne ik_session_prompt ikt_hi len ikt_hi IK_E_HEAP
+ret 47
+end
+if ne ik_session_close IK_OK
+ret 48
+end
+ret 0
+end
+
+fn ikt_test_session to int
+ik_session_reset_all
+ik_heap_init 0x20000 16384
+
+note Operations without open session return E_STATE
+if ne ik_session_close IK_E_STATE
+ret 20
+end
+if ne ik_session_cancel IK_E_STATE
+ret 21
+end
+tok_o = new uint 1 0
+us_o = new ulong 1 0
+if ne ik_session_step tok_o us_o IK_E_STATE
+ret 22
+end
+
+note Bad GGUF rejected
+bad = new uchar 36 0
+info = new uint 4 0
+lim = new uint 4 0
+put lim 0 64
+put lim 1 16
+put lim 2 128
+put lim 3 256
+if ne ik_session_open view bad 36 view lim info IK_E_GGUF
+ret 23
+end
+
+note Valid GGUF with bad limits rejected
+gg = new uchar 36 0
+ikt_make_gguf gg 147 128256 16 1
+put lim 0 0
+if ne ik_session_open view gg 36 view lim info IK_E_LIMITS
+ret 24
+end
+put lim 0 64
+put lim 1 65
+if ne ik_session_open view gg 36 view lim info IK_E_LIMITS
+ret 25
+end
+
+note Open succeeds and reports metadata
+put lim 0 64
+put lim 1 16
+put lim 2 64
+put lim 3 256
+if ne ik_session_open view gg 36 view lim info IK_OK
+ret 26
+end
+if ne get info 0 147
+ret 27
+end
+if ne get info 1 128256
+ret 27
+end
+if ne get info 2 16
+ret 27
+end
+
+note Double open rejected with E_STATE
+if ne ik_session_open view gg 36 view lim info IK_E_STATE
+ret 28
+end
+
+note Invalid UTF-8 prompt rejected with E_UTF8
+bad_u8 = new uchar 3 0
+put bad_u8 0 0xed
+put bad_u8 1 0xa0
+put bad_u8 2 0x80
+if ne ik_session_prompt view bad_u8 3 IK_E_UTF8
+ret 29
+end
+
+note Oversized prompt rejected with E_PROMPT_BYTES
+bigbuf = new uchar 80 65
+if ne ik_session_prompt view bigbuf 80 IK_E_PROMPT_BYTES
+ret 30
+end
+
+note Valid prompt returns token count (5 + len("What is the capital of France?") = 35)
+nids = ik_session_prompt ikt_prompt len ikt_prompt
+if ne nids 35
+ret 31
+end
+first4 = new uint 4 0
+if ne ik_session_prompt_ids first4 4 35
+ret 32
+end
+if ne get first4 0 128000
+ret 33
+end
+if ne get first4 1 128006
+ret 33
+end
+if ne get first4 2 882
+ret 33
+end
+if ne get first4 3 128007
+ret 33
+end
+
+rc = ikt_test_session_steps
+if ne rc 0
+ret rc
+end
+ret ikt_test_session_heap_reserve
+end
+
+fn main to int
+rc = ikt_test_bump
+if ne rc 0
+ret rc
+end
+rc = ikt_test_session
+if ne rc 0
+ret rc
+end
+ret 0
+end

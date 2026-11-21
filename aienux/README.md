@@ -29,8 +29,8 @@ The OS layer is moving here from Aienux (`https://interplane.io/drakestapleton/a
 | `aienux/boot/` | Pure-Omega Aienux boot subsystem: CHANDOF3 handoff validator, AIENMDL1 MODEL.MAP extent validator, A/B image slot manifest/control/selection/transitions, and ANB1 netboot wire format (converted from `native/boot/`, 5 `.om` files). |
 | `aienux/store/` | Pure-Omega Store v1 format, content-addressed append-only engine, and torn-write-safe dual-slot record (converted from `native/store/`, 5 `.om` files). |
 | `aienux/net/core/` | Pure-Omega AIENOS M6-A protocol stack (RFC 1071 checksum, Eth/ARP/IPv4/UDP, ARP cache), boot-report broadcast framing, and Virtio 1.x PCI/split-virtqueue net driver with IOMMU fail-closed checks (converted from `native/net/`, 3 `.om` files). |
-| `aienux/crates/` | Pure-Omega ports of Aienux Rust crates (`aienos-anchor`, `aienos-c1-tree`, `aienos-capability-ffi`, `aienos-evidence`, `aienos-store-tool`, 10 `.om` files). |
-| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit, optional `@run`/`@qemu` mode tag, and ordered parts (93 units, 23 `@run` behavioral suites). |
+| `aienux/crates/` | Pure-Omega ports of 15 Aienux Rust crates (`aienos-anchor`, `aienos-c1-tree`, `aienos-capability-ffi`, `aienos-evidence`, `aienos-store-tool`, `aienos-accel`, `aienos-agent-state`, `aienos-artifact`, `aienos-artifact-tool`, `aienos-cortex`, `aienos-crypto`, `aienos-explain`, `aienos-fpu-probe`, `aienos-infer-kernel`, `allen-design-tokens`, 31 `.om` files). |
+| `aienux/units.tsv` | Unit table listing every composable pure-Omega unit, optional `@run`/`@qemu` mode tag, and ordered parts (103 units, 33 `@run` behavioral suites). |
 | `aienux/units-gate.om` | Seeded-Omega compile-reproducibility, behavioral (`@run`), and optional QEMU (`@qemu`) gate (`OMEGA-AIENUX-UNITS`). |
 | `aienux/CODE-TRIAGE.tsv` | Filtered triage table of actual non-Omega code from `NOT-YET-OMEGA.tsv` (925 code rows retained, 972 docs/fixtures/retired stripped), grouped by bottom-up port wave. |
 | `aienux/NOT-YET-OMEGA.tsv` | Generated inventory of every non-Omega first-party file still in Aienux awaiting rewrite or retirement. |

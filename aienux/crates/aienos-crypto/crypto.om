@@ -1,0 +1,261 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-crypto/crypto.om: Pure-Omega AIENOS Cryptographic Primitives.
+note Converted from aienux crates/aienos-crypto/src/{lib,aes,polyval,aes_gcm_siv,sha256}.rs.
+note Constant-time GF(2^8) AES S-box, FIPS 197 AES-256 block cipher, RFC 8452 POLYVAL,
+note RFC 8452 AES-256-GCM-SIV AEAD, FIPS 180-4 SHA-256, and RFC 4231 HMAC-SHA256.
+note Compose with: si/directives/om2.om om/tls/sha2.om om/tls/aesgcm.om om/tls/gcmsiv.om aienux/crates/aienos-crypto/crypto.om ...
+
+const CR_OK int 0
+const CR_ERR_AUTH int -1
+const CR_ERR_PARAM int -2
+
+const CR_KEY_LEN ulong 32
+const CR_NONCE_LEN ulong 12
+const CR_TAG_LEN ulong 16
+const CR_BLOCK_LEN ulong 16
+
+note Wipe a byte buffer to zero
+fn cr_wipe buf edit uchar * to void
+n = len buf
+for i ulong n bound 65536
+put buf i 0
+end
+end
+
+note Constant-time equality for two byte slices of equal length
+fn cr_ct_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+diff = uchar 0
+n = len a
+for i ulong n bound 65536
+diff = or diff xor get a i get b i
+end
+ret eq diff 0
+end
+
+note --- Constant-time GF(2^8) AES S-box (matches aes.rs sub_bytes_ct) ---
+
+fn cr_xtime x uchar to uchar
+hi = shr x 7
+mask = sub uchar 0 hi
+ret xor shl x 1 and uchar 0x1b mask
+end
+
+fn cr_gf_mul a uchar b uchar to uchar
+acc = uchar 0
+cur = a
+for i ulong 8 unroll
+bit = and shr b uchar i 1
+mask = sub uchar 0 bit
+acc = xor acc and cur mask
+cur = cr_xtime cur
+end
+ret acc
+end
+
+fn cr_rotl8 x uchar k uchar to uchar
+rk = sub uchar 8 k
+ret or shl x k shr x rk
+end
+
+note S(b) = Affine(b^254) in GF(2^8), branch-free and table-free
+fn cr_sbox_ct x uchar to uchar
+x2 = cr_gf_mul x x
+x3 = cr_gf_mul x2 x
+t = cr_gf_mul x3 x3
+x12 = cr_gf_mul t t
+t = cr_gf_mul x12 x3
+t = cr_gf_mul t t
+t = cr_gf_mul t t
+t = cr_gf_mul t t
+t = cr_gf_mul t t
+t = cr_gf_mul t x12
+inv = cr_gf_mul t x2
+acc = xor inv cr_rotl8 inv 1
+acc = xor acc cr_rotl8 inv 2
+acc = xor acc cr_rotl8 inv 3
+acc = xor acc cr_rotl8 inv 4
+ret xor acc uchar 0x63
+end
+
+note Single-block FIPS 197 AES-256 encryption via om/tls/aesgcm.om bitsliced AES
+fn cr_aes256_encrypt_block key view uchar * blk edit uchar * to int
+if or ne len key 32 ne len blk 16
+ret CR_ERR_PARAM
+end
+k = new ulong AGKN 0
+s = new ulong AGSN 0
+aes_setkey k s key
+hi = siv_be64 view blk 0
+lo = siv_be64 view blk 8
+put s 150 hi
+put s 151 lo
+put s 152 0
+put s 153 0
+put s 154 0
+put s 155 0
+put s 156 0
+put s 157 0
+aes_enc4 k s
+siv_put8 blk 0 get s 150
+siv_put8 blk 8 get s 151
+gcm_clear k s
+ret CR_OK
+end
+
+note --- Constant-time POLYVAL (RFC 8452 Section 3, exact port of polyval.rs) ---
+
+fn cr_polyval_div_x v edit uchar 16 to void
+lsb = and get v 0 1
+carry = uchar 0
+for idx ulong 16 unroll
+i = sub 15 idx
+cur = get v i
+next_carry = and cur 1
+put v i or shr cur 1 shl carry 7
+carry = next_carry
+end
+mask = sub uchar 0 lsb
+put v 15 xor get v 15 and uchar 0xe1 mask
+end
+
+fn cr_polyval_xor_masked v edit uchar 16 b view uchar 16 mask uchar to void
+for j ulong 16 unroll
+put v j xor get v j and get b j mask
+end
+end
+
+note dot(a, b) = a * b * x^-128 mod (x^128 + x^127 + x^126 + x^121 + 1)
+fn cr_polyval_dot a view uchar 16 b view uchar 16 dst edit uchar 16 to int
+v = new uchar 16 0
+for i ulong 128 bound 128
+ab = get a div i 8
+sh = uchar rem i 8
+bit = and shr ab sh 1
+mask = sub uchar 0 bit
+cr_polyval_xor_masked v b mask
+cr_polyval_div_x v
+end
+for j ulong 16 unroll
+put dst j get v j
+put v j 0
+end
+ret CR_OK
+end
+
+fn cr_polyval_update_block h view uchar 16 acc edit uchar 16 blk view uchar 16 to int
+tmp = new uchar 16 0
+for i ulong 16 unroll
+put tmp i xor get acc i get blk i
+end
+rc = cr_polyval_dot view tmp h acc
+for i ulong 16 unroll
+put tmp i 0
+end
+ret rc
+end
+
+note --- AES-256-GCM-SIV (RFC 8452, wrapping om/tls/gcmsiv.om) ---
+
+fn cr_gcmsiv_derive_keys key view uchar 32 nonce view uchar 12 auth_out edit uchar 16 enc_out edit uchar 32 to int
+kn = new uchar 44 0
+for i ulong 32
+put kn i get key i
+end
+for i ulong 12
+put kn add 32 i get nonce i
+end
+k = new ulong AGKN 0
+s = new ulong AGSN 0
+ek = new uchar 32 0
+siv_derive k s view kn 32 ek
+siv_put8 auth_out 0 get k 131
+siv_put8 auth_out 8 get k 132
+for i ulong 32
+put enc_out i get ek i
+put ek i 0
+end
+for i ulong 44
+put kn i 0
+end
+gcm_clear k s
+ret CR_OK
+end
+
+note Pack key(32) || nonce(12) into kn(44)
+fn cr_gcmsiv_pack_kn key view uchar 32 nonce view uchar 12 kn edit uchar 44 to void
+for i ulong 32
+put kn i get key i
+end
+for i ulong 12
+put kn add 32 i get nonce i
+end
+end
+
+note Encrypt in-place buf = pt || 16B room using kn = key(32) || nonce(12)
+fn cr_gcmsiv_seal_kn kn view uchar 44 aad view uchar * buf edit uchar * to int
+if lt len buf 16
+ret CR_ERR_PARAM
+end
+rc = aes_gcmsiv_seal kn aad buf
+if ne rc 0
+ret CR_ERR_PARAM
+end
+ret CR_OK
+end
+
+note Decrypt in-place buf = ct || tag using kn = key(32) || nonce(12); zeroes buf on auth failure
+fn cr_gcmsiv_open_kn kn view uchar 44 aad view uchar * buf edit uchar * to int
+if lt len buf 16
+cr_wipe buf
+ret CR_ERR_AUTH
+end
+rc = aes_gcmsiv_open kn aad buf
+if ne rc 0
+cr_wipe buf
+ret CR_ERR_AUTH
+end
+ret CR_OK
+end
+
+note --- SHA-256 and HMAC-SHA256 (wrapping om/tls/sha2.om) ---
+
+fn cr_sha256 msg view uchar * digest edit uchar 32 to int
+dl = sha2_digest 256 msg digest
+if ne dl 32
+ret CR_ERR_PARAM
+end
+ret CR_OK
+end
+
+note Two-part HMAC-SHA256 for 32-byte key (matches sha256.rs hmac_sha256)
+fn cr_hmac_sha256_2 key view uchar 32 part1 view uchar * part2 view uchar * digest edit uchar 32 to int
+ipad = new uchar 64 0x36
+opad = new uchar 64 0x5c
+for i ulong 32
+kb = get key i
+put ipad i xor get ipad i kb
+put opad i xor get opad i kb
+end
+ctx = new ulong 40 0
+sha256_init ctx
+sha256_update ctx view ipad
+sha256_update ctx part1
+sha256_update ctx part2
+inner = new uchar 32 0
+sha256_final ctx inner
+sha256_init ctx
+sha256_update ctx view opad
+sha256_update ctx view inner
+sha256_final ctx digest
+for i ulong 64
+put ipad i 0
+put opad i 0
+end
+for i ulong 32
+put inner i 0
+end
+ret CR_OK
+end

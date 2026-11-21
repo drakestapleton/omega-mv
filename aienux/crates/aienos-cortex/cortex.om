@@ -1,0 +1,881 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/aienos-cortex/cortex.om: Pure-Omega AIENOS Cortex Epistemic Store.
+note Converted from aienux crates/aienos-cortex/src/{status,record,verification,store,lib}.rs.
+note Preserves durable epistemic memory with verifiable SHA-256 provenance and rejects
+note ungrounded hallucinations, missing parents, and circular assertions.
+note Compose with: si/directives/om2.om om/tls/sha2.om aienux/crates/aienos-cortex/cortex.om ...
+
+const CORTEX_DIRECT_OBSERVATION uchar 1
+const CORTEX_VERIFIED_FACT uchar 2
+const CORTEX_INFERENCE uchar 3
+const CORTEX_HYPOTHESIS uchar 4
+const CORTEX_CONTRADICTION uchar 5
+const CORTEX_OPERATOR_DECISION uchar 6
+
+const CORTEX_OK int 0
+const CORTEX_ERR_UNGROUNDED int -1
+const CORTEX_ERR_CIRCULAR int -2
+const CORTEX_ERR_NOT_FOUND int -3
+const CORTEX_ERR_CONTRADICTION int -4
+const CORTEX_ERR_CORRUPT_JOURNAL int -5
+const CORTEX_ERR_CHECKSUM int -6
+const CORTEX_ERR_CAPACITY int -7
+
+const CORTEX_MAX_RECS ulong 32
+const CORTEX_MAX_STMT ulong 96
+const CORTEX_MAX_PROV ulong 64
+const CORTEX_MAX_VERIF ulong 48
+const CORTEX_MAX_PARENTS ulong 4
+const CORTEX_ID_LEN ulong 16
+const CORTEX_HASH_LEN ulong 32
+
+note Epistemic store arrays (up to 32 records)
+global cx_cnt ulong 1
+global cx_id uchar 512
+global cx_status uchar 32
+global cx_stmt uchar 3072
+global cx_stmt_len ulong 32
+global cx_prov uchar 2048
+global cx_prov_len ulong 32
+global cx_ev_hash uchar 1024
+global cx_ts ulong 32
+global cx_conf f32 32
+global cx_verif uchar 1536
+global cx_verif_len ulong 32
+global cx_has_verif uchar 32
+global cx_pcnt ulong 32
+global cx_parents uchar 2048
+
+note Staging slot for record construction and grounding check
+global cx_st_id uchar 16
+global cx_st_status uchar 1
+global cx_st_stmt uchar 96
+global cx_st_stmt_len ulong 1
+global cx_st_prov uchar 64
+global cx_st_prov_len ulong 1
+global cx_st_payload uchar 256
+global cx_st_pay_len ulong 1
+global cx_st_ev_hash uchar 32
+global cx_st_ts ulong 1
+global cx_st_conf f32 1
+global cx_st_verif uchar 48
+global cx_st_verif_len ulong 1
+global cx_st_has_verif uchar 1
+global cx_st_pcnt ulong 1
+global cx_st_parents uchar 64
+
+note Scratch buffers for DFS grounding check and journal sort
+global cx_grounded uchar 32
+global cx_on_path uchar 32
+global cx_order ulong 32
+
+text cx_op_prefix "operator:"
+text cx_sentinel "cortex_sentinel"
+text cx_contra_prefix "Contradiction detected: "
+text cx_jmagic "CXJ1"
+
+fn cx_is_ground_truth st uchar to bool
+if eq st CORTEX_DIRECT_OBSERVATION
+ret true
+end
+if eq st CORTEX_VERIFIED_FACT
+ret true
+end
+if eq st CORTEX_OPERATOR_DECISION
+ret true
+end
+ret false
+end
+
+fn cx_requires_grounding st uchar to bool
+if eq st CORTEX_INFERENCE
+ret true
+end
+if eq st CORTEX_HYPOTHESIS
+ret true
+end
+ret false
+end
+
+fn cx_clamp01 v f32 to f32
+if lt v 0.0f32
+ret 0.0f32
+end
+if gt v 1.0f32
+ret 1.0f32
+end
+ret v
+end
+
+fn cx_put_u16_be buf edit uchar * off ulong v ulong to void
+put buf off uchar and shr v 8 0xff
+put buf add off 1 uchar and v 0xff
+end
+
+fn cx_put_u32_be buf edit uchar * off ulong v ulong to void
+put buf off uchar and shr v 24 0xff
+put buf add off 1 uchar and shr v 16 0xff
+put buf add off 2 uchar and shr v 8 0xff
+put buf add off 3 uchar and v 0xff
+end
+
+fn cx_put_u64_be buf edit uchar * off ulong v ulong to void
+for i ulong 8
+sh = mul sub 7 i 8
+put buf add off i uchar and shr v sh 0xff
+end
+end
+
+fn cx_get_u16_be buf view uchar * off ulong to ulong
+b0 = ulong get buf off
+b1 = ulong get buf add off 1
+ret or shl b0 8 b1
+end
+
+fn cx_get_u32_be buf view uchar * off ulong to ulong
+b0 = ulong get buf off
+b1 = ulong get buf add off 1
+b2 = ulong get buf add off 2
+b3 = ulong get buf add off 3
+ret or or shl b0 24 shl b1 16 or shl b2 8 b3
+end
+
+fn cx_get_u64_be buf view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 8
+b = ulong get buf add off i
+acc = or shl acc 8 b
+end
+ret acc
+end
+
+fn cx_init to void
+put cx_cnt 0 0
+put cx_st_pcnt 0 0
+put cx_st_has_verif 0 0
+put cx_st_verif_len 0 0
+put cx_st_pay_len 0 0
+end
+
+fn cx_id_eq_slot idx ulong id view uchar 16 to bool
+base = mul idx CORTEX_ID_LEN
+for i ulong 16
+if ne get cx_id add base i get id i
+ret false
+end
+end
+ret true
+end
+
+fn cx_find_by_id id view uchar 16 to long
+n = get cx_cnt 0
+for i ulong n bound 32
+if cx_id_eq_slot i id
+ret long i
+end
+end
+ret -1
+end
+
+fn cx_count_by_status st uchar to ulong
+n = get cx_cnt 0
+c = ulong 0
+for i ulong n bound 32
+if eq get cx_status i st
+c = add c 1
+end
+end
+ret c
+end
+
+fn cx_stage_reset to void
+put cx_st_status 0 0
+put cx_st_stmt_len 0 0
+put cx_st_prov_len 0 0
+put cx_st_pay_len 0 0
+put cx_st_ts 0 0
+put cx_st_conf 0 1.0f32
+put cx_st_verif_len 0 0
+put cx_st_has_verif 0 0
+put cx_st_pcnt 0 0
+end
+
+fn cx_stage_add_parent pid view uchar 16 to int
+pc = get cx_st_pcnt 0
+if ge pc CORTEX_MAX_PARENTS
+ret CORTEX_ERR_CAPACITY
+end
+base = mul pc CORTEX_ID_LEN
+for i ulong 16
+put cx_st_parents add base i get pid i
+end
+put cx_st_pcnt 0 add pc 1
+ret CORTEX_OK
+end
+
+fn cx_stage_set_verifier v view uchar * to int
+if gt len v CORTEX_MAX_VERIF
+ret CORTEX_ERR_CAPACITY
+end
+for i ulong len v bound 48
+put cx_st_verif i get v i
+end
+put cx_st_verif_len 0 len v
+put cx_st_has_verif 0 1
+ret CORTEX_OK
+end
+
+fn cx_stage_set_payload payload view uchar * to int
+if gt len payload 256
+ret CORTEX_ERR_CAPACITY
+end
+for i ulong len payload bound 256
+put cx_st_payload i get payload i
+end
+put cx_st_pay_len 0 len payload
+ret CORTEX_OK
+end
+
+fn cx_stage_set_conf conf f32 to void
+put cx_st_conf 0 cx_clamp01 conf
+end
+
+note Compute evidence_hash and id from staged globals
+fn cx_stage_compute_hashes to void
+hbuf = new uchar 512 0
+pos = ulong 0
+put hbuf 0 get cx_st_status 0
+pos = 1
+sl = get cx_st_stmt_len 0
+for i ulong sl bound 96
+put hbuf add pos i get cx_st_stmt i
+end
+pos = add pos sl
+pl = get cx_st_prov_len 0
+for i ulong pl bound 64
+put hbuf add pos i get cx_st_prov i
+end
+pos = add pos pl
+payl = get cx_st_pay_len 0
+for i ulong payl bound 256
+put hbuf add pos i get cx_st_payload i
+end
+pos = add pos payl
+pc = get cx_st_pcnt 0
+for i ulong mul pc 16 bound 64
+put hbuf add pos i get cx_st_parents i
+end
+pos = add pos mul pc 16
+
+dig = new uchar 32 0
+dl = sha2_digest 256 part hbuf 0 pos dig
+for i ulong 32
+put cx_st_ev_hash i get dig i
+end
+
+id_in = new uchar 40 0
+for i ulong 32
+put id_in i get dig i
+end
+cx_put_u64_be id_in 32 get cx_st_ts 0
+dl = sha2_digest 256 id_in dig
+for i ulong 16
+put cx_st_id i get dig i
+end
+end
+
+fn cx_stage_build st uchar stmt view uchar * prov view uchar * ts ulong to int
+if or gt len stmt CORTEX_MAX_STMT gt len prov CORTEX_MAX_PROV
+ret CORTEX_ERR_CAPACITY
+end
+pc = get cx_st_pcnt 0
+payl = get cx_st_pay_len 0
+need = add add add 1 len stmt len prov add payl mul pc 16
+if gt need 512
+ret CORTEX_ERR_CAPACITY
+end
+put cx_st_status 0 st
+put cx_st_stmt_len 0 len stmt
+for i ulong len stmt bound 96
+put cx_st_stmt i get stmt i
+end
+put cx_st_prov_len 0 len prov
+for i ulong len prov bound 64
+put cx_st_prov i get prov i
+end
+put cx_st_ts 0 ts
+cx_stage_compute_hashes
+ret CORTEX_OK
+end
+
+fn cx_copy_staged_to_slot slot ulong to void
+base = mul slot CORTEX_ID_LEN
+for i ulong 16
+put cx_id add base i get cx_st_id i
+end
+put cx_status slot get cx_st_status 0
+nlen = get cx_st_stmt_len 0
+put cx_stmt_len slot nlen
+base = mul slot CORTEX_MAX_STMT
+for i ulong nlen bound 96
+put cx_stmt add base i get cx_st_stmt i
+end
+nlen = get cx_st_prov_len 0
+put cx_prov_len slot nlen
+base = mul slot CORTEX_MAX_PROV
+for i ulong nlen bound 64
+put cx_prov add base i get cx_st_prov i
+end
+base = mul slot CORTEX_HASH_LEN
+for i ulong 32
+put cx_ev_hash add base i get cx_st_ev_hash i
+end
+put cx_ts slot get cx_st_ts 0
+put cx_conf slot get cx_st_conf 0
+nlen = get cx_st_verif_len 0
+put cx_verif_len slot nlen
+put cx_has_verif slot get cx_st_has_verif 0
+base = mul slot CORTEX_MAX_VERIF
+for i ulong nlen bound 48
+put cx_verif add base i get cx_st_verif i
+end
+nlen = get cx_st_pcnt 0
+put cx_pcnt slot nlen
+base = mul slot mul CORTEX_MAX_PARENTS CORTEX_ID_LEN
+for i ulong mul nlen 16 bound 64
+put cx_parents add base i get cx_st_parents i
+end
+end
+
+note Copy staged record into store slot idx (or overwrite if ID already exists)
+fn cx_insert_staged to long
+st_id = new uchar 16 0
+for i ulong 16
+put st_id i get cx_st_id i
+end
+existing = cx_find_by_id view st_id
+slot = ulong 0
+if ge existing 0
+slot = ulong existing
+else
+n = get cx_cnt 0
+if ge n CORTEX_MAX_RECS
+ret long CORTEX_ERR_CAPACITY
+end
+slot = n
+put cx_cnt 0 add n 1
+end
+cx_copy_staged_to_slot slot
+ret long slot
+end
+
+fn cx_check_node_slot idx ulong depth ulong to int
+if ge depth CORTEX_MAX_RECS
+ret CORTEX_ERR_CIRCULAR
+end
+if eq get cx_on_path idx 1
+ret CORTEX_ERR_CIRCULAR
+end
+if eq get cx_grounded idx 1
+ret CORTEX_OK
+end
+st = get cx_status idx
+if cx_is_ground_truth st
+put cx_grounded idx 1
+ret CORTEX_OK
+end
+pc = get cx_pcnt idx
+if eq pc 0
+ret CORTEX_ERR_UNGROUNDED
+end
+put cx_on_path idx 1
+par_base = mul idx mul CORTEX_MAX_PARENTS CORTEX_ID_LEN
+pid = new uchar 16 0
+for p ulong pc bound 4
+off = add par_base mul p 16
+for j ulong 16
+put pid j get cx_parents add off j
+end
+pidx = cx_find_by_id view pid
+if lt pidx 0
+put cx_on_path idx 0
+ret CORTEX_ERR_NOT_FOUND
+end
+rc = cx_check_node_slot ulong pidx add depth 1
+if ne rc CORTEX_OK
+put cx_on_path idx 0
+ret rc
+end
+end
+put cx_on_path idx 0
+put cx_grounded idx 1
+ret CORTEX_OK
+end
+
+fn cx_clear_dfs to void
+for i ulong 32
+put cx_grounded i 0
+put cx_on_path i 0
+end
+end
+
+fn cx_verify_slot idx ulong to int
+if ge idx get cx_cnt 0
+ret CORTEX_ERR_NOT_FOUND
+end
+st = get cx_status idx
+if cx_is_ground_truth st
+ret CORTEX_OK
+end
+if eq get cx_pcnt idx 0
+ret CORTEX_ERR_UNGROUNDED
+end
+cx_clear_dfs
+ret cx_check_node_slot idx 0
+end
+
+fn cx_verify_staged to int
+st = get cx_st_status 0
+if cx_is_ground_truth st
+ret CORTEX_OK
+end
+pc = get cx_st_pcnt 0
+if eq pc 0
+ret CORTEX_ERR_UNGROUNDED
+end
+cx_clear_dfs
+st_id = new uchar 16 0
+for i ulong 16
+put st_id i get cx_st_id i
+end
+existing = cx_find_by_id view st_id
+if ge existing 0
+put cx_on_path ulong existing 1
+end
+pid = new uchar 16 0
+for p ulong pc bound 4
+off = mul p 16
+for j ulong 16
+put pid j get cx_st_parents add off j
+end
+same = true
+for j ulong 16
+if ne get pid j get st_id j
+same = false
+end
+end
+if same
+ret CORTEX_ERR_CIRCULAR
+end
+pidx = cx_find_by_id view pid
+if lt pidx 0
+ret CORTEX_ERR_NOT_FOUND
+end
+rc = cx_check_node_slot ulong pidx 1
+if ne rc CORTEX_OK
+ret rc
+end
+end
+ret CORTEX_OK
+end
+
+note High-level APIs mirroring CortexStore methods (all <= 6 parameter slots)
+
+fn cx_record_observation stmt view uchar * prov view uchar * ts ulong id_out edit uchar 16 to int
+rc = cx_stage_build CORTEX_DIRECT_OBSERVATION stmt prov ts
+if ne rc CORTEX_OK
+ret rc
+end
+slot = cx_insert_staged
+if lt slot 0
+ret int slot
+end
+for i ulong 16
+put id_out i get cx_st_id i
+end
+ret CORTEX_OK
+end
+
+fn cx_record_verified_fact stmt view uchar * prov view uchar * ts ulong id_out edit uchar 16 to int
+rc = cx_stage_build CORTEX_VERIFIED_FACT stmt prov ts
+if ne rc CORTEX_OK
+ret rc
+end
+slot = cx_insert_staged
+if lt slot 0
+ret int slot
+end
+for i ulong 16
+put id_out i get cx_st_id i
+end
+ret CORTEX_OK
+end
+
+fn cx_record_operator_decision stmt view uchar * sig view uchar * ts ulong id_out edit uchar 16 to int
+cx_stage_reset
+plen = add len cx_op_prefix len sig
+if gt plen CORTEX_MAX_PROV
+ret CORTEX_ERR_CAPACITY
+end
+prov = new uchar 64 0
+for i ulong len cx_op_prefix bound 16
+put prov i get cx_op_prefix i
+end
+for i ulong len sig bound 48
+put prov add len cx_op_prefix i get sig i
+end
+rc = cx_stage_set_verifier sig
+if ne rc CORTEX_OK
+ret rc
+end
+rc = cx_stage_set_payload sig
+if ne rc CORTEX_OK
+ret rc
+end
+rc = cx_stage_build CORTEX_OPERATOR_DECISION stmt part prov 0 plen ts
+if ne rc CORTEX_OK
+ret rc
+end
+slot = cx_insert_staged
+if lt slot 0
+ret int slot
+end
+for i ulong 16
+put id_out i get cx_st_id i
+end
+ret CORTEX_OK
+end
+
+fn cx_record_inference stmt view uchar * model view uchar * ts ulong id_out edit uchar 16 to int
+put cx_st_pay_len 0 0
+rc = cx_stage_build CORTEX_INFERENCE stmt model ts
+if ne rc CORTEX_OK
+ret rc
+end
+rc = cx_verify_staged
+if ne rc CORTEX_OK
+ret rc
+end
+slot = cx_insert_staged
+if lt slot 0
+ret int slot
+end
+for i ulong 16
+put id_out i get cx_st_id i
+end
+ret CORTEX_OK
+end
+
+fn cx_record_hypothesis stmt view uchar * agent view uchar * ts ulong id_out edit uchar 16 to int
+put cx_st_pay_len 0 0
+put cx_st_conf 0 0.5f32
+rc = cx_stage_build CORTEX_HYPOTHESIS stmt agent ts
+if ne rc CORTEX_OK
+ret rc
+end
+rc = cx_verify_staged
+if ne rc CORTEX_OK
+ret rc
+end
+slot = cx_insert_staged
+if lt slot 0
+ret int slot
+end
+for i ulong 16
+put id_out i get cx_st_id i
+end
+ret CORTEX_OK
+end
+
+fn cx_flag_contradiction id_a view uchar 16 id_b view uchar 16 reason view uchar * ts ulong id_out edit uchar 16 to int
+if lt cx_find_by_id id_a 0
+ret CORTEX_ERR_NOT_FOUND
+end
+if lt cx_find_by_id id_b 0
+ret CORTEX_ERR_NOT_FOUND
+end
+slen = add len cx_contra_prefix len reason
+if gt slen CORTEX_MAX_STMT
+ret CORTEX_ERR_CAPACITY
+end
+sbuf = new uchar 96 0
+for i ulong len cx_contra_prefix bound 32
+put sbuf i get cx_contra_prefix i
+end
+for i ulong len reason bound 64
+put sbuf add len cx_contra_prefix i get reason i
+end
+cx_stage_reset
+rc = cx_stage_add_parent id_a
+if ne rc CORTEX_OK
+ret rc
+end
+rc = cx_stage_add_parent id_b
+if ne rc CORTEX_OK
+ret rc
+end
+rc = cx_stage_set_payload reason
+if ne rc CORTEX_OK
+ret rc
+end
+rc = cx_stage_build CORTEX_CONTRADICTION part sbuf 0 slen cx_sentinel ts
+if ne rc CORTEX_OK
+ret rc
+end
+slot = cx_insert_staged
+if lt slot 0
+ret int slot
+end
+for i ulong 16
+put id_out i get cx_st_id i
+end
+ret CORTEX_OK
+end
+
+fn cx_slot_gt a ulong b ulong to bool
+ta = get cx_ts a
+tb = get cx_ts b
+if gt ta tb
+ret true
+end
+if lt ta tb
+ret false
+end
+ba = mul a 16
+bb = mul b 16
+for i ulong 16
+va = get cx_id add ba i
+vb = get cx_id add bb i
+if gt va vb
+ret true
+end
+if lt va vb
+ret false
+end
+end
+ret false
+end
+
+fn cx_export_one_rec idx ulong dst edit uchar * pos ulong to long
+nlen = get cx_stmt_len idx
+nlen = add nlen get cx_prov_len idx
+nlen = add nlen get cx_verif_len idx
+nlen = add nlen mul get cx_pcnt idx 16
+if gt add add pos add 69 nlen 32 len dst
+ret long CORTEX_ERR_CAPACITY
+end
+p = pos
+base = mul idx 16
+for i ulong 16
+put dst add p i get cx_id add base i
+end
+p = add p 16
+put dst p get cx_status idx
+p = add p 1
+cx_put_u64_be dst p get cx_ts idx
+p = add p 8
+cx_put_u32_be dst p ulong bitcast uint get cx_conf idx
+p = add p 4
+base = mul idx 32
+for i ulong 32
+put dst add p i get cx_ev_hash add base i
+end
+p = add p 32
+put dst p get cx_has_verif idx
+p = add p 1
+nlen = get cx_stmt_len idx
+cx_put_u16_be dst p nlen
+p = add p 2
+base = mul idx CORTEX_MAX_STMT
+for i ulong nlen bound 96
+put dst add p i get cx_stmt add base i
+end
+p = add p nlen
+nlen = get cx_prov_len idx
+cx_put_u16_be dst p nlen
+p = add p 2
+base = mul idx CORTEX_MAX_PROV
+for i ulong nlen bound 64
+put dst add p i get cx_prov add base i
+end
+p = add p nlen
+nlen = get cx_verif_len idx
+cx_put_u16_be dst p nlen
+p = add p 2
+base = mul idx CORTEX_MAX_VERIF
+for i ulong nlen bound 48
+put dst add p i get cx_verif add base i
+end
+p = add p nlen
+nlen = get cx_pcnt idx
+put dst p uchar nlen
+p = add p 1
+base = mul idx mul CORTEX_MAX_PARENTS CORTEX_ID_LEN
+for i ulong mul nlen 16 bound 64
+put dst add p i get cx_parents add base i
+end
+ret long add p mul nlen 16
+end
+
+fn cx_export_journal dst edit uchar * to long
+n = get cx_cnt 0
+for i ulong n bound 32
+put cx_order i i
+end
+if gt n 1
+for i ulong sub n 1 bound 32
+key_idx = get cx_order add i 1
+j = add i 1
+while gt j 0 bound 32
+prev = get cx_order sub j 1
+if cx_slot_gt prev key_idx
+put cx_order j prev
+j = sub j 1
+else
+break
+end
+end
+put cx_order j key_idx
+end
+end
+
+if lt len dst 38
+ret long CORTEX_ERR_CAPACITY
+end
+for i ulong 4
+put dst i get cx_jmagic i
+end
+cx_put_u16_be dst 4 n
+pos = ulong 6
+
+for k ulong n bound 32
+idx = get cx_order k
+nxt = cx_export_one_rec idx dst pos
+if lt nxt 0
+ret nxt
+end
+pos = ulong nxt
+end
+
+jsum = new uchar 32 0
+dl = sha2_digest 256 part dst 0 pos jsum
+for i ulong 32
+put dst add pos i get jsum i
+end
+ret long add pos 32
+end
+
+fn cx_import_one_rec src view uchar * pos ulong body_end ulong to long
+if gt add pos 69 body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+cx_stage_reset
+p = pos
+for i ulong 16
+put cx_st_id i get src add p i
+end
+p = add p 16
+put cx_st_status 0 get src p
+p = add p 1
+put cx_st_ts 0 cx_get_u64_be src p
+p = add p 8
+put cx_st_conf 0 bitcast f32 uint cx_get_u32_be src p
+p = add p 4
+for i ulong 32
+put cx_st_ev_hash i get src add p i
+end
+p = add p 32
+put cx_st_has_verif 0 get src p
+p = add p 1
+nlen = cx_get_u16_be src p
+p = add p 2
+if or gt nlen CORTEX_MAX_STMT gt add p nlen body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+put cx_st_stmt_len 0 nlen
+for i ulong nlen bound 96
+put cx_st_stmt i get src add p i
+end
+p = add p nlen
+if gt add p 2 body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+nlen = cx_get_u16_be src p
+p = add p 2
+if or gt nlen CORTEX_MAX_PROV gt add p nlen body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+put cx_st_prov_len 0 nlen
+for i ulong nlen bound 64
+put cx_st_prov i get src add p i
+end
+p = add p nlen
+if gt add p 2 body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+nlen = cx_get_u16_be src p
+p = add p 2
+if or gt nlen CORTEX_MAX_VERIF gt add p nlen body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+put cx_st_verif_len 0 nlen
+for i ulong nlen bound 48
+put cx_st_verif i get src add p i
+end
+p = add p nlen
+if gt add p 1 body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+nlen = ulong get src p
+p = add p 1
+if or gt nlen CORTEX_MAX_PARENTS gt add p mul nlen 16 body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+put cx_st_pcnt 0 nlen
+for i ulong mul nlen 16 bound 64
+put cx_st_parents i get src add p i
+end
+p = add p mul nlen 16
+if lt cx_insert_staged 0
+ret long CORTEX_ERR_CAPACITY
+end
+ret long p
+end
+
+fn cx_import_journal src view uchar * slen_in ulong to long
+if lt slen_in 38
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+if gt slen_in len src
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+for i ulong 4
+if ne get src i get cx_jmagic i
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+end
+body_end = sub slen_in 32
+computed = new uchar 32 0
+dl = sha2_digest 256 part src 0 body_end computed
+for i ulong 32
+if ne get computed i get src add body_end i
+ret long CORTEX_ERR_CHECKSUM
+end
+end
+cnt = cx_get_u16_be src 4
+if gt cnt CORTEX_MAX_RECS
+ret long CORTEX_ERR_CAPACITY
+end
+pos = ulong 6
+for k ulong cnt bound 32
+nxt = cx_import_one_rec src pos body_end
+if lt nxt 0
+ret nxt
+end
+pos = ulong nxt
+end
+if ne pos body_end
+ret long CORTEX_ERR_CORRUPT_JOURNAL
+end
+ret long cnt
+end

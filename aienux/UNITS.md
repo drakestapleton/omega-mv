@@ -16,16 +16,16 @@ One additional 1-line Omega directive file, `aienux/allen/target-x86efi.om` (`ta
 
 ## The units and their gate
 
-`aienux/units.tsv` lists **93 units** (`NAME [@run|@qemu]` followed by ordered `.om` parts, single spaces; 23 behavioral self-test units are tagged `@run`):
+`aienux/units.tsv` lists **103 units** (`NAME [@run|@qemu]` followed by ordered `.om` parts, single spaces; 33 behavioral self-test units are tagged `@run`):
 
 - 48 core Aienux units (`tcp_*` 4, `nvme_*` 4, `x86_*` 4, `lm1b` 1, `platform_unit` 1, `spark_image`/`imac_image`/`hwgates` 3, `allen_fw` `target x86efi` + `allen_main` + `allen_provider` + `allen_stdio_overflow` + 27 `allen_test_*` = 31)
 - 19 OS-layer sibling units from `rtl8127-omega` (`rtl8127_probe`, `rtl8127_driver`), `spark-supervisor` (`aien_supervise`, `aien_supervise_root`, `aien_watch`, `supervisor_tests_load`), and `spark-connector` (`connector_signer`, `connector_celldrv`, plus 11 standalone gate/runner units).
 - 6 converted pure-Omega OS-layer units (9 `.om` files): `atlas_main`/`atlas_test` (`@run`, `aienux/atlas/`), `pi_register_main`/`pi_register_test` (`@run`, `aienux/pi-register/`), and `debugger_main`/`debugger_test` (`@run`, `aienux/debugger/`).
-- 20 converted pure-Omega kernel/store/boot/driver/crate units (all `@run`):
+- 30 converted pure-Omega kernel/store/boot/driver/crate units (all `@run`):
   - Wave 1 (Capability & Store): `capability_test`, `contain_test`, `store_test`, `torn_slot_test`
   - Wave 2 (Boot & Kernel): `boot_test`, `kernel_core_test`, `kernel_hal_test`, `kernel_runtime_test`, `kernel_arm64_host_test`, `osc_launch_test`
   - Wave 3 (ARGUS, Disk, Net): `argus_test`, `argus_bridge_test`, `disk_test`, `net_core_test`
-  - Wave 4 (Rust Crates): `aegis_test`, `crate_anchor_test`, `crate_c1_tree_test`, `crate_cap_ffi_test`, `crate_evidence_test`, `crate_store_tool_test`
+  - Wave 4 (Rust Crates): `aegis_test`, `crate_anchor_test`, `crate_c1_tree_test`, `crate_cap_ffi_test`, `crate_evidence_test`, `crate_store_tool_test`, `crate_accel_test`, `crate_agent_state_test`, `crate_artifact_test`, `crate_artifact_tool_test`, `crate_cortex_test`, `crate_crypto_test`, `crate_explain_test`, `crate_fpu_probe_test`, `crate_infer_kernel_test`, `crate_design_tokens_test`
 
 Remaining non-Omega files from the three OS sibling repos (64 files) are listed in `aienux/NOT-YET-OMEGA-EXTRAS.tsv`; their import records are under `aienux/import/{rtl8127-omega,spark-supervisor,spark-connector}/`.
 

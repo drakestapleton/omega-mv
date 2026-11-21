@@ -1,0 +1,1164 @@
+note SPDX-License-Identifier: Apache-2.0
+note aienux/crates/allen-design-tokens/design_tokens.om: Pure-Omega Allen DESIGN.md token parser,
+note reference resolver, WCAG 2.2 luminance/contrast checker, and integer-only C header emitter.
+note Converted from aienux crates/allen-design-tokens/src/{lib,main}.rs and tests/exports.rs.
+note Compose with: si/directives/om2.om aienux/crates/allen-design-tokens/design_tokens.om ...
+
+const ADT_OK int 0
+const ADT_ERR_NO_FRONT int -1
+const ADT_ERR_UNCLOSED_FRONT int -2
+const ADT_ERR_UNCLOSED_BLOCK int -3
+const ADT_ERR_BAD_INDENT int -4
+const ADT_ERR_BAD_LINE int -5
+const ADT_ERR_BAD_KEY int -6
+const ADT_ERR_UNCLOSED_QUOTE int -7
+const ADT_ERR_DUPLICATE int -8
+const ADT_ERR_REF_LOOP int -9
+const ADT_ERR_REF_MISSING int -10
+const ADT_ERR_CONTRAST_FMT int -11
+const ADT_ERR_CONTRAST_COLOR int -12
+const ADT_ERR_CONTRAST_ALPHA int -13
+const ADT_ERR_CAPACITY int -14
+
+const ADT_VAL_COLOR uchar 1
+const ADT_VAL_DIM uchar 2
+const ADT_VAL_RATIO uchar 3
+const ADT_VAL_BEZIER uchar 4
+const ADT_VAL_TEXT uchar 5
+
+const ADT_MAX_TOKENS ulong 64
+const ADT_MAX_PATH ulong 64
+const ADT_MAX_RAW ulong 64
+const ADT_MAX_DEPTH ulong 6
+
+note Token table
+global adt_cnt ulong 1
+global adt_path uchar 4096
+global adt_path_len ulong 64
+global adt_raw uchar 4096
+global adt_raw_len ulong 64
+
+note YAML indent stack (up to 6 levels, 24 bytes per key)
+global adt_stk_cnt ulong 1
+global adt_stk_ind ulong 6
+global adt_stk_key uchar 144
+global adt_stk_klen ulong 6
+
+note Typed value output buffer:
+note 0=kind; Color: 1=r,2=g,3=b; Dim: adt_vf[0]=num, adt_vunit/len; Ratio: adt_vf[0]=num; Bezier: adt_vf[0..4]
+global adt_vkind uchar 1
+global adt_vrgb uchar 3
+global adt_vf f64 4
+global adt_vunit uchar 16
+global adt_vunit_len ulong 1
+
+note Contrast results table (up to 16 pairs):
+note 0=ratio, 1=floor, 2=alpha (in adt_cr_f), adt_cr_gated, adt_cr_pass
+global adt_cr_cnt ulong 1
+global adt_cr_ratio f64 16
+global adt_cr_floor f64 16
+global adt_cr_alpha f64 16
+global adt_cr_gated uchar 16
+global adt_cr_pass uchar 16
+
+text adt_fence_open "```allen-tokens"
+text adt_fence_close "```"
+text adt_bez_pfx "cubic-bezier("
+text adt_col_pfx "colors."
+text adt_da_pfx "drawn-alpha."
+text adt_kta_pfx "kernel-today-alpha."
+text adt_con_pfx "contrast."
+text adt_on_sep "-on-"
+text adt_def_pfx "#define ALLEN_"
+
+fn adt_init to void
+put adt_cnt 0 0
+put adt_stk_cnt 0 0
+put adt_cr_cnt 0 0
+end
+
+fn adt_slice_eq a view uchar * b view uchar * to bool
+if ne len a len b
+ret false
+end
+for i ulong len a bound 128
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn adt_find_token path view uchar * plen ulong to long
+n = get adt_cnt 0
+for i ulong n bound 64
+if eq get adt_path_len i plen
+base = mul i ADT_MAX_PATH
+ok = true
+for j ulong plen bound 64
+if ne get adt_path add base j get path j
+ok = false
+break
+end
+end
+if ok
+ret long i
+end
+end
+end
+ret -1
+end
+
+fn adt_has_group_prefix grp view uchar * glen ulong to bool
+n = get adt_cnt 0
+for i ulong n bound 64
+pl = get adt_path_len i
+if gt pl add glen 1
+base = mul i ADT_MAX_PATH
+if eq get adt_path add base glen 46
+ok = true
+for j ulong glen bound 64
+if ne get adt_path add base j get grp j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+end
+end
+ret false
+end
+
+fn adt_is_space c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 9
+ret true
+end
+if eq c 13
+ret true
+end
+ret false
+end
+
+fn adt_hex_val c uchar to int
+if and ge c 48 le c 57
+ret int sub c 48
+end
+if and ge c 97 le c 102
+ret int add sub c 97 10
+end
+if and ge c 65 le c 70
+ret int add sub c 65 10
+end
+ret -1
+end
+
+note Parse decimal f64 from buf[off..off+n); sets out_val[0], returns true if valid
+fn adt_parse_f64 buf view uchar * off ulong n ulong out_val edit f64 * to bool
+if eq n 0
+ret false
+end
+i = ulong 0
+negf = false
+if eq get buf off 45
+negf = true
+i = 1
+if eq n 1
+ret false
+end
+end
+val = f64 0.0
+fdiv = f64 0.0
+seen_dig = false
+while lt i n bound 64
+c = get buf add off i
+if and ge c 48 le c 57
+seen_dig = true
+d = f64 sub c 48
+if gt fdiv 0.0f64
+fdiv = mul fdiv 10.0f64
+val = add val div d fdiv
+else
+val = add mul val 10.0f64 d
+end
+else
+if eq c 46
+if gt fdiv 0.0f64
+ret false
+end
+fdiv = 1.0f64
+else
+ret false
+end
+end
+i = add i 1
+end
+if not seen_dig
+ret false
+end
+if negf
+val = neg val
+end
+put out_val 0 val
+ret true
+end
+
+fn adt_try_color raw view uchar * rlen ulong to bool
+if ne rlen 7
+ret false
+end
+if ne get raw 0 35
+ret false
+end
+for k ulong 3
+hi = adt_hex_val get raw add 1 mul k 2
+lo = adt_hex_val get raw add 2 mul k 2
+if or lt hi 0 lt lo 0
+ret false
+end
+put adt_vrgb k uchar or shl hi 4 lo
+end
+put adt_vkind 0 ADT_VAL_COLOR
+ret true
+end
+
+fn adt_try_bezier raw view uchar * rlen ulong to bool
+if le rlen 14
+ret false
+end
+if ne get raw sub rlen 1 41
+ret false
+end
+if not adt_slice_eq part raw 0 13 adt_bez_pfx
+ret false
+end
+pos = ulong 13
+endp = sub rlen 1
+fv = new f64 1 0.0f64
+for k ulong 4
+while lt pos endp bound 64
+if adt_is_space get raw pos
+pos = add pos 1
+else
+break
+end
+end
+start = pos
+while lt pos endp bound 64
+if eq get raw pos 44
+break
+end
+pos = add pos 1
+end
+tok_end = pos
+while gt tok_end start bound 64
+if adt_is_space get raw sub tok_end 1
+tok_end = sub tok_end 1
+else
+break
+end
+end
+if not adt_parse_f64 raw start sub tok_end start fv
+ret false
+end
+put adt_vf k get fv 0
+if lt k 3
+if ge pos endp
+ret false
+end
+if ne get raw pos 44
+ret false
+end
+pos = add pos 1
+end
+end
+if ne pos endp
+ret false
+end
+put adt_vkind 0 ADT_VAL_BEZIER
+ret true
+end
+
+fn adt_try_dim raw view uchar * rlen ulong to bool
+sp = ulong 0
+while lt sp rlen bound 64
+c = get raw sp
+is_d = and ge c 48 le c 57
+is_m = or eq c 46 eq c 45
+if not or is_d is_m
+break
+end
+sp = add sp 1
+end
+if or eq sp 0 ge sp rlen
+ret false
+end
+fv = new f64 1 0.0f64
+if not adt_parse_f64 raw 0 sp fv
+ret false
+end
+ulen = sub rlen sp
+if gt ulen 16
+ret false
+end
+for j ulong ulen bound 16
+uc = get raw add sp j
+is_u = and ge uc 65 le uc 90
+is_l = and ge uc 97 le uc 122
+if not or is_u is_l
+ret false
+end
+end
+put adt_vf 0 get fv 0
+put adt_vunit_len 0 ulen
+for j ulong ulen bound 16
+put adt_vunit j get raw add sp j
+end
+put adt_vkind 0 ADT_VAL_DIM
+ret true
+end
+
+note Classify a raw value into Color / Bezier / Ratio / Dim / Text (matches lib.rs value())
+fn adt_classify raw view uchar * rlen ulong to uchar
+put adt_vunit_len 0 0
+if adt_try_color raw rlen
+ret ADT_VAL_COLOR
+end
+if adt_try_bezier raw rlen
+ret ADT_VAL_BEZIER
+end
+fv = new f64 1 0.0f64
+if adt_parse_f64 raw 0 rlen fv
+put adt_vf 0 get fv 0
+put adt_vkind 0 ADT_VAL_RATIO
+ret ADT_VAL_RATIO
+end
+if adt_try_dim raw rlen
+ret ADT_VAL_DIM
+end
+put adt_vkind 0 ADT_VAL_TEXT
+ret ADT_VAL_TEXT
+end
+
+note Scratch buffer for building dotted path
+global adt_pbuf uchar 64
+global adt_pbuf_len ulong 1
+
+fn adt_build_stack_prefix to long
+sc = get adt_stk_cnt 0
+ppos = ulong 0
+for lvl ulong sc bound 6
+lk = get adt_stk_klen lvl
+if gt add add ppos lk 1 ADT_MAX_PATH
+ret long ADT_ERR_CAPACITY
+end
+sbase = mul lvl 24
+for j ulong lk bound 24
+put adt_pbuf add ppos j get adt_stk_key add sbase j
+end
+ppos = add ppos lk
+put adt_pbuf ppos 46
+ppos = add ppos 1
+end
+ret long ppos
+end
+
+fn adt_build_path src view uchar * kstart ulong klen ulong to int
+r = adt_build_stack_prefix
+if lt r 0
+ret int r
+end
+ppos = ulong r
+if gt add ppos klen ADT_MAX_PATH
+ret ADT_ERR_CAPACITY
+end
+for j ulong klen bound 24
+put adt_pbuf add ppos j get src add kstart j
+end
+put adt_pbuf_len 0 add ppos klen
+ret ADT_OK
+end
+
+note Insert a single key/value into token table using current indent stack
+fn adt_store_kv src view uchar * kstart ulong klen ulong vstart ulong vlen ulong to int
+rc = adt_build_path src kstart klen
+if ne rc ADT_OK
+ret rc
+end
+ppos = get adt_pbuf_len 0
+pbuf = new uchar 64 0
+for j ulong ppos bound 64
+put pbuf j get adt_pbuf j
+end
+if ge adt_find_token view pbuf ppos 0
+ret ADT_ERR_DUPLICATE
+end
+idx = get adt_cnt 0
+if ge idx ADT_MAX_TOKENS
+ret ADT_ERR_CAPACITY
+end
+base = mul idx ADT_MAX_PATH
+for j ulong ppos bound 64
+put adt_path add base j get pbuf j
+end
+put adt_path_len idx ppos
+base = mul idx ADT_MAX_RAW
+for j ulong vlen bound 64
+put adt_raw add base j get src add vstart j
+end
+put adt_raw_len idx vlen
+put adt_cnt 0 add idx 1
+ret ADT_OK
+end
+
+fn adt_push_stack src view uchar * ind ulong kstart ulong klen ulong to int
+sc = get adt_stk_cnt 0
+if ge sc ADT_MAX_DEPTH
+ret ADT_ERR_CAPACITY
+end
+put adt_stk_ind sc ind
+put adt_stk_klen sc klen
+sbase = mul sc 24
+for j ulong klen bound 24
+put adt_stk_key add sbase j get src add kstart j
+end
+put adt_stk_cnt 0 add sc 1
+ret ADT_OK
+end
+
+fn adt_parse_yaml_val src view uchar * kstart ulong klen ulong vstart ulong endp ulong to int
+vs = vstart
+while lt vs endp bound 256
+if adt_is_space get src vs
+vs = add vs 1
+else
+break
+end
+end
+vlen = sub endp vs
+if eq get src vs 34
+if lt vlen 2
+ret ADT_ERR_UNCLOSED_QUOTE
+end
+if ne get src sub endp 1 34
+ret ADT_ERR_UNCLOSED_QUOTE
+end
+vs = add vs 1
+vlen = sub vlen 2
+end
+if gt vlen ADT_MAX_RAW
+ret ADT_ERR_CAPACITY
+end
+ret adt_store_kv src kstart klen vs vlen
+end
+
+fn adt_parse_yaml_line src view uchar * lstart ulong llen ulong to int
+endp = add lstart llen
+while gt endp lstart bound 256
+if adt_is_space get src sub endp 1
+endp = sub endp 1
+else
+break
+end
+end
+if eq endp lstart
+ret ADT_OK
+end
+ind = ulong 0
+while lt add lstart ind endp bound 256
+if eq get src add lstart ind 32
+ind = add ind 1
+else
+break
+end
+end
+if eq add lstart ind endp
+ret ADT_OK
+end
+if eq get src add lstart ind 35
+ret ADT_OK
+end
+if ne rem ind 2 0
+ret ADT_ERR_BAD_INDENT
+end
+
+cpos = add lstart ind
+while lt cpos endp bound 256
+if eq get src cpos 58
+break
+end
+cpos = add cpos 1
+end
+if eq cpos endp
+ret ADT_ERR_BAD_LINE
+end
+kstart = add lstart ind
+kend = cpos
+while gt kend kstart bound 256
+if adt_is_space get src sub kend 1
+kend = sub kend 1
+else
+break
+end
+end
+if or eq kend kstart gt sub kend kstart 24
+ret ADT_ERR_BAD_KEY
+end
+for j ulong sub kend kstart bound 24
+if eq get src add kstart j 32
+ret ADT_ERR_BAD_KEY
+end
+end
+
+sc = get adt_stk_cnt 0
+while gt sc 0 bound 8
+if ge get adt_stk_ind sub sc 1 ind
+sc = sub sc 1
+else
+break
+end
+end
+put adt_stk_cnt 0 sc
+if ne mul sc 2 ind
+ret ADT_ERR_BAD_INDENT
+end
+
+vstart = add cpos 1
+while lt vstart endp bound 256
+if adt_is_space get src vstart
+vstart = add vstart 1
+else
+break
+end
+end
+if eq vstart endp
+ret adt_push_stack src ind kstart sub kend kstart
+end
+ret adt_parse_yaml_val src kstart sub kend kstart vstart endp
+end
+
+note Resolve {group.name} references up to 8 hops
+fn adt_resolve_all to int
+n = get adt_cnt 0
+cur = new uchar 64 0
+tbuf = new uchar 64 0
+for i ulong n bound 64
+clen = get adt_raw_len i
+rbase = mul i ADT_MAX_RAW
+for j ulong clen bound 64
+put cur j get adt_raw add rbase j
+end
+hops = ulong 0
+while ge clen 2 bound 10
+if not and eq get cur 0 123 eq get cur sub clen 1 125
+break
+end
+hops = add hops 1
+if gt hops 8
+ret ADT_ERR_REF_LOOP
+end
+tlen = sub clen 2
+for j ulong tlen bound 64
+put tbuf j get cur add j 1
+end
+tidx = adt_find_token view tbuf tlen
+if ge tidx 0
+clen = get adt_raw_len ulong tidx
+tb = mul ulong tidx ADT_MAX_RAW
+for j ulong clen bound 64
+put cur j get adt_raw add tb j
+end
+else
+if adt_has_group_prefix view tbuf tlen
+break
+else
+ret ADT_ERR_REF_MISSING
+end
+end
+end
+put adt_raw_len i clen
+for j ulong clen bound 64
+put adt_raw add rbase j get cur j
+end
+end
+ret ADT_OK
+end
+
+fn adt_is_dashes src view uchar * off ulong llen ulong to bool
+e = add off llen
+while gt e off bound 64
+if adt_is_space get src sub e 1
+e = sub e 1
+else
+break
+end
+end
+if ne sub e off 3
+ret false
+end
+if ne get src off 45
+ret false
+end
+if ne get src add off 1 45
+ret false
+end
+if ne get src add off 2 45
+ret false
+end
+ret true
+end
+
+note Parse a complete DESIGN.md document: front matter + ```allen-tokens blocks + resolve
+fn adt_parse doc view uchar * dlen ulong to int
+adt_init
+if lt dlen 4
+ret ADT_ERR_NO_FRONT
+end
+if ne get doc 0 45
+ret ADT_ERR_NO_FRONT
+end
+if ne get doc 1 45
+ret ADT_ERR_NO_FRONT
+end
+if ne get doc 2 45
+ret ADT_ERR_NO_FRONT
+end
+if ne get doc 3 10
+ret ADT_ERR_NO_FRONT
+end
+pos = ulong 4
+in_front = true
+in_block = false
+put adt_stk_cnt 0 0
+
+while lt pos dlen bound 4096
+lstart = pos
+while lt pos dlen bound 256
+if eq get doc pos 10
+break
+end
+pos = add pos 1
+end
+llen = sub pos lstart
+if lt pos dlen
+pos = add pos 1
+end
+
+if in_front
+if adt_is_dashes doc lstart llen
+in_front = false
+put adt_stk_cnt 0 0
+else
+rc = adt_parse_yaml_line doc lstart llen
+if ne rc ADT_OK
+ret rc
+end
+end
+else
+if in_block
+e = add lstart llen
+while and gt e lstart adt_is_space get doc sub e 1 bound 64
+e = sub e 1
+end
+if adt_slice_eq part doc lstart sub e lstart adt_fence_close
+in_block = false
+put adt_stk_cnt 0 0
+else
+rc = adt_parse_yaml_line doc lstart llen
+if ne rc ADT_OK
+ret rc
+end
+end
+else
+e = add lstart llen
+while and gt e lstart adt_is_space get doc sub e 1 bound 64
+e = sub e 1
+end
+if adt_slice_eq part doc lstart sub e lstart adt_fence_open
+in_block = true
+put adt_stk_cnt 0 0
+end
+end
+end
+end
+
+if in_front
+ret ADT_ERR_UNCLOSED_FRONT
+end
+if in_block
+ret ADT_ERR_UNCLOSED_BLOCK
+end
+ret adt_resolve_all
+end
+
+note --- WCAG 2.2 relative luminance & contrast ratio ---
+
+note ln(x) for x in (0, 2] via range reduction + atanh series (9 terms -> < 1e-12 error)
+fn adt_ln_f64 x f64 to f64
+v = x
+k = int 0
+while lt v 0.7071067811865475f64 bound 32
+v = mul v 2.0f64
+k = sub k 1
+end
+while gt v 1.4142135623730951f64 bound 32
+v = mul v 0.5f64
+k = add k 1
+end
+y = div sub v 1.0f64 add v 1.0f64
+y2 = mul y y
+term = y
+acc = y
+for m ulong 9
+term = mul term y2
+denom = f64 add mul add m 1 2 1
+acc = add acc div term denom
+end
+ret add mul 2.0f64 acc mul f64 k 0.6931471805599453f64
+end
+
+note exp(x) via x/ln2 = n + f and 10-term Taylor
+fn adt_exp_f64 x f64 to f64
+t = mul x 1.4426950408889634f64
+n = long t
+if gt f64 n t
+n = sub n 1
+end
+f = mul sub t f64 n 0.6931471805599453f64
+sum = f64 1.0
+term = f64 1.0
+for k ulong 12
+term = div mul term f f64 add k 1
+sum = add sum term
+end
+ebits = shl ulong add n 1023 52
+scale = bitcast f64 ebits
+ret mul sum scale
+end
+
+fn adt_srgb_lin c uchar to f64
+v = div f64 c 255.0f64
+if le v 0.04045f64
+ret div v 12.92f64
+end
+base = div add v 0.055f64 1.055f64
+ret adt_exp_f64 mul 2.4f64 adt_ln_f64 base
+end
+
+fn adt_luminance r uchar g uchar b uchar to f64
+lr = adt_srgb_lin r
+lg = adt_srgb_lin g
+lb = adt_srgb_lin b
+ret add add mul 0.2126f64 lr mul 0.7152f64 lg mul 0.0722f64 lb
+end
+
+fn adt_contrast r1 uchar g1 uchar b1 uchar r2 uchar g2 uchar b2 uchar to f64
+la = adt_luminance r1 g1 b1
+lb = adt_luminance r2 g2 b2
+hi = la
+lo = lb
+if gt lb la
+hi = lb
+lo = la
+end
+ret div add hi 0.05f64 add lo 0.05f64
+end
+
+fn adt_round_i64 v f64 to long
+if ge v 0.0f64
+ret long add v 0.5f64
+end
+ret long sub v 0.5f64
+end
+
+fn adt_blend_ch fg uchar bg uchar alpha f64 to uchar
+f = f64 fg
+b = f64 bg
+v = add b mul sub f b alpha
+r = adt_round_i64 v
+if lt r 0
+ret 0
+end
+if gt r 255
+ret 255
+end
+ret uchar r
+end
+
+fn adt_q_fixed v f64 scale f64 to long
+ret adt_round_i64 mul v scale
+end
+
+note Lookup colors.<name> into rgb_out[3]
+fn adt_color_of name view uchar * nlen ulong rgb_out edit uchar 3 to int
+key = new uchar 64 0
+if gt add 7 nlen 64
+ret ADT_ERR_CONTRAST_COLOR
+end
+for i ulong 7
+put key i get adt_col_pfx i
+end
+for i ulong nlen bound 48
+put key add 7 i get name i
+end
+idx = adt_find_token view key add 7 nlen
+if lt idx 0
+ret ADT_ERR_CONTRAST_COLOR
+end
+rl = get adt_raw_len ulong idx
+rb = mul ulong idx ADT_MAX_RAW
+raw = new uchar 64 0
+for i ulong rl bound 64
+put raw i get adt_raw add rb i
+end
+kind = adt_classify view raw rl
+if ne kind ADT_VAL_COLOR
+ret ADT_ERR_CONTRAST_COLOR
+end
+put rgb_out 0 get adt_vrgb 0
+put rgb_out 1 get adt_vrgb 1
+put rgb_out 2 get adt_vrgb 2
+ret ADT_OK
+end
+
+fn adt_lookup_drawn_alpha fg view uchar * flen ulong out_a edit f64 1 to int
+put out_a 0 1.0f64
+if gt add 12 flen 64
+ret ADT_OK
+end
+da_key = new uchar 64 0
+for j ulong 12
+put da_key j get adt_da_pfx j
+end
+for j ulong flen bound 48
+put da_key add 12 j get fg j
+end
+da_idx = adt_find_token view da_key add 12 flen
+if lt da_idx 0
+ret ADT_OK
+end
+drl = get adt_raw_len ulong da_idx
+drb = mul ulong da_idx ADT_MAX_RAW
+rbuf = new uchar 64 0
+for j ulong drl bound 64
+put rbuf j get adt_raw add drb j
+end
+if ne adt_classify view rbuf drl ADT_VAL_RATIO
+ret ADT_ERR_CONTRAST_ALPHA
+end
+a = get adt_vf 0
+if or lt a 0.0f64 gt a 1.0f64
+ret ADT_ERR_CONTRAST_ALPHA
+end
+put out_a 0 a
+ret ADT_OK
+end
+
+global adt_fg_tmp uchar 64
+global adt_fg_len ulong 1
+global adt_bg_tmp uchar 64
+global adt_bg_len ulong 1
+
+fn adt_blend_contrast fg_rgb view uchar 3 bg_rgb view uchar 3 alpha f64 to f64
+br = adt_blend_ch get fg_rgb 0 get bg_rgb 0 alpha
+bg_c = adt_blend_ch get fg_rgb 1 get bg_rgb 1 alpha
+bb = adt_blend_ch get fg_rgb 2 get bg_rgb 2 alpha
+ret adt_contrast br bg_c bb get bg_rgb 0 get bg_rgb 1 get bg_rgb 2
+end
+
+fn adt_eval_contrast_pair flr f64 to int
+fg_buf = new uchar 64 0
+flen = get adt_fg_len 0
+for j ulong flen bound 48
+put fg_buf j get adt_fg_tmp j
+end
+bg_buf = new uchar 64 0
+blen = get adt_bg_len 0
+for j ulong blen bound 48
+put bg_buf j get adt_bg_tmp j
+end
+fg_rgb = new uchar 3 0
+bg_rgb = new uchar 3 0
+rc = adt_color_of view fg_buf flen fg_rgb
+if ne rc ADT_OK
+ret rc
+end
+rc = adt_color_of view bg_buf blen bg_rgb
+if ne rc ADT_OK
+ret rc
+end
+aval = new f64 1 1.0f64
+rc = adt_lookup_drawn_alpha view fg_buf flen aval
+if ne rc ADT_OK
+ret rc
+end
+ratio = adt_blend_contrast view fg_rgb view bg_rgb get aval 0
+ci = get adt_cr_cnt 0
+if ge ci 16
+ret ADT_ERR_CAPACITY
+end
+put adt_cr_ratio ci ratio
+put adt_cr_floor ci flr
+put adt_cr_alpha ci get aval 0
+put adt_cr_gated ci 1
+if ge ratio flr
+put adt_cr_pass ci 1
+else
+put adt_cr_pass ci 0
+end
+put adt_cr_cnt 0 add ci 1
+ret ADT_OK
+end
+
+fn adt_check_one_contrast i ulong to int
+pl = get adt_path_len i
+if le pl 9
+ret ADT_OK
+end
+pbase = mul i ADT_MAX_PATH
+for j ulong 9
+if ne get adt_path add pbase j get adt_con_pfx j
+ret ADT_OK
+end
+end
+pair_len = sub pl 9
+sep_at = ulong 999
+if ge pair_len 6
+for k ulong sub pair_len 3 bound 64
+off = add pbase add 9 k
+if eq get adt_path off 45
+if eq get adt_path add off 1 111
+if eq get adt_path add off 2 110
+if eq get adt_path add off 3 45
+sep_at = k
+break
+end
+end
+end
+end
+end
+end
+if eq sep_at 999
+ret ADT_ERR_CONTRAST_FMT
+end
+put adt_fg_len 0 sep_at
+for j ulong sep_at bound 48
+put adt_fg_tmp j get adt_path add pbase add 9 j
+end
+bg_len = sub sub pair_len sep_at 4
+put adt_bg_len 0 bg_len
+for j ulong bg_len bound 48
+put adt_bg_tmp j get adt_path add pbase add add 13 sep_at j
+end
+rl = get adt_raw_len i
+rb = mul i ADT_MAX_RAW
+rbuf = new uchar 64 0
+for j ulong rl bound 64
+put rbuf j get adt_raw add rb j
+end
+if ne adt_classify view rbuf rl ADT_VAL_RATIO
+ret ADT_ERR_CONTRAST_FMT
+end
+ret adt_eval_contrast_pair get adt_vf 0
+end
+
+note Check every contrast.<fg>-on-<bg> pair against its floor
+fn adt_check_contrast to int
+put adt_cr_cnt 0 0
+n = get adt_cnt 0
+for i ulong n bound 64
+rc = adt_check_one_contrast i
+if ne rc ADT_OK
+ret rc
+end
+end
+ret ADT_OK
+end
+
+note --- Integer-only C header line emitter (CK_RGB / Q8 / Q15 / Q16) ---
+
+fn adt_to_ident_char c uchar to uchar
+if and ge c 97 le c 122
+ret sub c 32
+end
+if and ge c 65 le c 90
+ret c
+end
+if and ge c 48 le c 57
+ret c
+end
+ret 95
+end
+
+fn adt_write_hex2 dst edit uchar * pos ulong v uchar to ulong
+hi = shr v 4
+lo = and v 0xf
+if lt hi 10
+put dst pos add 48 hi
+else
+put dst pos add 55 hi
+end
+if lt lo 10
+put dst add pos 1 add 48 lo
+else
+put dst add pos 1 add 55 lo
+end
+ret add pos 2
+end
+
+fn adt_write_i64 dst edit uchar * pos ulong v long to ulong
+p = pos
+u = ulong 0
+if lt v 0
+put dst p 45
+p = add p 1
+u = ulong neg v
+else
+u = ulong v
+end
+if eq u 0
+put dst p 48
+ret add p 1
+end
+tmp = new uchar 24 0
+k = ulong 0
+while gt u 0 bound 24
+put tmp k uchar add 48 rem u 10
+u = div u 10
+k = add k 1
+end
+for i ulong k bound 24
+put dst add p i get tmp sub sub k 1 i
+end
+ret add p k
+end
+
+fn adt_emit_c_dim dst edit uchar * pos ulong to long
+p = pos
+put dst p 95
+p = add p 1
+ul = get adt_vunit_len 0
+for j ulong ul bound 16
+put dst add p j adt_to_ident_char get adt_vunit j
+end
+p = add p ul
+v = get adt_vf 0
+iv = long v
+if ge v 0.0f64
+if eq f64 iv v
+put dst p 32
+p = adt_write_i64 dst add p 1 iv
+put dst p 117
+put dst add p 1 10
+ret long add p 2
+end
+end
+put dst p 95
+put dst add p 1 88
+put dst add p 2 49
+put dst add p 3 48
+put dst add p 4 48
+put dst add p 5 48
+put dst add p 6 32
+p = adt_write_i64 dst add p 7 adt_q_fixed v 1000.0f64
+put dst p 10
+ret long add p 1
+end
+
+fn adt_emit_c_ratio dst edit uchar * pos ulong to long
+p = pos
+v = get adt_vf 0
+iv = long v
+if ge fabs v 2.0f64
+if eq f64 iv v
+put dst p 32
+p = adt_write_i64 dst add p 1 iv
+put dst p 10
+ret long add p 1
+end
+end
+put dst p 95
+put dst add p 1 81
+put dst add p 2 49
+put dst add p 3 54
+put dst add p 4 32
+p = adt_write_i64 dst add p 5 adt_q_fixed v 65536.0f64
+put dst p 10
+ret long add p 1
+end
+
+fn adt_emit_c_prefix idx ulong dst edit uchar * to long
+if ge idx get adt_cnt 0
+ret -1
+end
+if lt len dst 128
+ret -1
+end
+pl = get adt_path_len idx
+pbase = mul idx ADT_MAX_PATH
+for j ulong 14
+put dst j get adt_def_pfx j
+end
+for j ulong pl bound 64
+put dst add 14 j adt_to_ident_char get adt_path add pbase j
+end
+ret long add 14 pl
+end
+
+note Emit integer-only C #define for token idx into dst; returns bytes written
+fn adt_emit_c_token idx ulong dst edit uchar * to long
+p0 = adt_emit_c_prefix idx dst
+if lt p0 0
+ret -1
+end
+p = ulong p0
+rl = get adt_raw_len idx
+rbase = mul idx ADT_MAX_RAW
+raw = new uchar 64 0
+for j ulong rl bound 64
+put raw j get adt_raw add rbase j
+end
+kind = adt_classify view raw rl
+
+if eq kind ADT_VAL_COLOR
+put dst p 32
+put dst add p 1 48
+put dst add p 2 120
+p = add p 3
+p = adt_write_hex2 dst p get adt_vrgb 0
+p = adt_write_hex2 dst p get adt_vrgb 1
+p = adt_write_hex2 dst p get adt_vrgb 2
+put dst p 117
+put dst add p 1 10
+ret long add p 2
+end
+
+if eq kind ADT_VAL_DIM
+ret adt_emit_c_dim dst p
+end
+
+if eq kind ADT_VAL_RATIO
+ret adt_emit_c_ratio dst p
+end
+
+if eq kind ADT_VAL_BEZIER
+put dst p 95
+put dst add p 1 88
+put dst add p 2 49
+put dst add p 3 95
+put dst add p 4 81
+put dst add p 5 49
+put dst add p 6 54
+put dst add p 7 32
+p = adt_write_i64 dst add p 8 adt_q_fixed get adt_vf 0 65536.0f64
+put dst p 10
+ret long add p 1
+end
+
+ret 0
+end
