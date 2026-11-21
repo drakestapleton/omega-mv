@@ -33,3 +33,18 @@ mv "$tmp/q36-native" "$out/q36-native"
 seed/out/omc < "$tmp/q36-head-input.om" > "$tmp/q36-head"
 chmod +x "$tmp/q36-head"
 mv "$tmp/q36-head" "$out/q36-head"
+
+( echo om2
+  cat gpu/nvidia/native/nvrm/context.om \
+    gpu/nvidia/native/blackwell/vector.om \
+    gpu/nvidia/native/blackwell/launch.om \
+    gpu/nvidia/native/blackwell/batch.om \
+    om/encoder/bw_enc_sm121.om \
+    om/gpu/q36/emit_fast.om \
+    om/gpu/q36/head/emit_head.om \
+    om/gpu/q36/arboris/prefetch.om \
+    om/gpu/q36/decode/decode_run.om
+) > "$tmp/q36-decode-input.om"
+seed/out/omc < "$tmp/q36-decode-input.om" > "$tmp/q36-decode"
+chmod +x "$tmp/q36-decode"
+mv "$tmp/q36-decode" "$out/q36-decode"

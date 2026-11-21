@@ -48,6 +48,17 @@ Online adaptive sum-over-paths co-activation prefetcher (`39` cross-layer transi
 - **Full BF16 `lm_head` (`1.017 GB`):** `4.453 ms` (`228.4 GB/s`, `96.4%` of `236.9 GB/s` ceiling).
 - **W4 Two-Pass Exact `lm_head` (`0.286 GB` + Top-64 BF16 rescore):** **`1.258 ms`** (`227.6 GB/s`, `96.1%` of ceiling) — **`3.54×` faster than Full BF16** (`-3.195 ms/tok` saved per token) and **`1.96×` faster than FP8 screen** (`2.47 ms`).
 
+## Real-Weight End-to-End 35B Decoder (`om/gpu/q36/decode/` -> `q36-decode`)
+
+`q36-decode` (`310 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) loads **all 40 real layers** (`layers-0..39.safetensors`, `~33.6 GB`) + `outside.safetensors` (`1.017 GB` BF16 `lm_head` + `embed_tokens` + `norm.weight`) directly from `~/models/qwen3.6-35b-a3b-fp8-95a723d0` into GB10 UVM across 10 contiguous slabs, quantizes `lm_head` on-GPU to W4 block-32 (`1.26 ms` two-pass exact), and runs full 40-layer Gated DeltaNet + Full-Attention (`hd=256`, partial RoPE `dim=64`) + 256-expert Top-8 MoE + Shared Expert + live Arboris online prefill and greedy decode on live GB10 silicon.
+
+- Verified on live Spark GB10 silicon (exclusive quiet window `20261121T220035Z-0f6897`, `exit: 0`, quiet machine):
+  - Prompt: `<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think></think>` (`17` tokens).
+  - **W4 Two-Pass Exact `lm_head` parity on real 40L hidden state:** **`PARITY=EXACT` vs Full BF16 (`tok=271`)**.
+  - **Generated output:** `271 760 6511 314 9338 369 2972 57590 159034 248046` → **`"\n\nThe capital of France is **Paris**.<|im_end|>"`**.
+  - **Live Arboris online hit rate (cold start, real 35B routing traces):** **`42%`** (`13.5×` above `3.1%` random top-8/256).
+  - **Speed (hybrid GPU GEMV/MoE/lm_head + exact FP32 CPU GDN/Attn glue):** `122 ms/tok` (`8.2 tok/s`); moving GDN/Attn onto the verified `emit_fast.om` GPU kernels is the next step toward the `48.9–65.75 tok/s` native GPFIFO envelope.
+
 ## Build and Run
 
 ```sh
@@ -55,4 +66,5 @@ sh seed/omega-from-seed.sh
 sh om/gpu/q36/build.sh build/q36
 spark-window run build/q36/q36-native
 spark-window run build/q36/q36-head ~/models/qwen3.6-35b-a3b-fp8-95a723d0/outside.safetensors
+spark-window run build/q36/q36-decode ~/models/qwen3.6-35b-a3b-fp8-95a723d0 24
 ```
