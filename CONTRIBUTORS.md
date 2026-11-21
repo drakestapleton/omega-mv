@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Implemented the pinned DeepSeek checkpoint tensor index and exact text ingress for single-stream native decode. Integrated Lane 1's slab arena source from c1b8e5569. |
 | OpenAI Codex | Migrated OSC AST node initialization and contract token-stream rendering to seeded Omega. |
 | OpenAI Codex | Ported the M22 training snapshot header codec and generation validation to seeded Omega. |
 | OpenAI Codex | Migrated the reaction runtime cost model’s OGCM v1 state encoding, validation and restoration to seeded Omega. |
