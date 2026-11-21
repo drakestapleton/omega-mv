@@ -25,6 +25,16 @@ done < om/gpu/inkling2/kernels_fast.list
 seed/out/omc < "$tmp/hints-input.om" > "$tmp/arboris-expert-hints"
 ( echo om2; cat om/gpu/inkling2/arboris/prefetch.om om/gpu/inkling2/arboris/check-arboris.om ) > "$tmp/check-arboris-input.om"
 seed/out/omc < "$tmp/check-arboris-input.om" > "$tmp/check-arboris"
-chmod +x "$tmp/arboris-expert-hints" "$tmp/check-arboris"
-mv "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$out"
+( echo om2
+  cat gpu/nvidia/native/nvrm/context.om \
+    gpu/nvidia/native/blackwell/vector.om \
+    gpu/nvidia/native/blackwell/launch.om \
+    gpu/nvidia/native/blackwell/batch.om \
+    om/encoder/bw_enc_sm121.om \
+    om/gpu/inkling2/emit_fast.om \
+    om/gpu/inkling2/native_run.om
+) > "$tmp/native-input.om"
+seed/out/omc < "$tmp/native-input.om" > "$tmp/inkling2-native"
+chmod +x "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native"
+mv "$tmp/arboris-expert-hints" "$tmp/check-arboris" "$tmp/inkling2-native" "$out"
 mv "$tmp"/*.cubin "$tmp/decode.f32le" "$out"
