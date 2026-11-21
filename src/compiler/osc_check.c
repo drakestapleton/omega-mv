@@ -383,7 +383,9 @@ static int lookup(C *c, const char *name)
 _Static_assert(sizeof(Sym) == 160 && offsetof(Sym, line) == 64 && offsetof(Sym, kind) == 68 &&
                offsetof(Sym, mut) == 69 && offsetof(Sym, ty) == 72 && sizeof(OscType) == 16 &&
                offsetof(Sym, loop_depth) == 88 && offsetof(Sym, obj) == 92 && offsetof(Sym, bor) == 96 &&
-               offsetof(Sym, decl) == 152, "OSC scoped declaration layout");
+               offsetof(Sym, decl) == 152 && offsetof(OscNode, dflag) == 74 && sizeof(OscNode) == 104 &&
+               offsetof(Sym, cap) == 104 && offsetof(Sym, used) == 106 && offsetof(Sym, cond_depth) == 108,
+               "OSC scoped declaration and arena layouts");
 
 static int redefined(C *c, const OscNode *n, const char *name, int prev)
 {
@@ -1382,16 +1384,12 @@ static int arena_alloc_site(C *c, const OscNode *n, OscNode *an)
     }
     an->sym = as;
     unsigned len = n->ty.len;
-    if (c->loop_depth == y->loop_depth && c->cond_depth == y->cond_depth) {
-        /* definite allocation: runs exactly once per arena lifetime */
-        if ((unsigned)y->used + len > y->cap) {
-            osc_diag_set(c->d, OSC_DIAG_ARENA_CAPACITY, n->line, n->col, oname, y->line, y->name,
-                         "arena capacity exceeded",
-                         "'%s' needs %u cell(s) but arena '%s' (bound %u) has %u left", oname, len, y->name,
-                         (unsigned)y->cap, (unsigned)(y->cap - y->used));
-            return -1;
-        }
-        y->used = (uint16_t)(y->used + len);
+    if (!osc_reserve_arena((uint8_t *)y, (uint32_t)c->loop_depth, (uint32_t)c->cond_depth, n->ty.len)) {
+        osc_diag_set(c->d, OSC_DIAG_ARENA_CAPACITY, n->line, n->col, oname, y->line, y->name,
+                     "arena capacity exceeded",
+                     "'%s' needs %u cell(s) but arena '%s' (bound %u) has %u left", oname, len, y->name,
+                     (unsigned)y->cap, (unsigned)(y->cap - y->used));
+        return -1;
     }
     return as;
 }
@@ -1500,13 +1498,9 @@ static int chk_if(C *c, int i)
          * every move, tested by its scope-end release. Both paths moved:
          * definitely moved (no flag). Neither: unchanged. Pre-existing
          * objects are never OM_GONE on a path that falls through. */
-        int32_t changed[OSC_CHECK_MAX_OBJS];
-        size_t nchanged = osc_join_snapshot(s1->words, (size_t)nobj0 * OSC_SNAP_OWNER_WORDS,
-                                            (uint32_t *)c->obj, changed, (size_t)nobj0);
-        for (size_t j = 0; j < nchanged; j++) {
-            int sym = c->obj[changed[j]].sym;
-            if (sym >= 0) NODE(c->sym[sym].decl)->dflag = 1;
-        }
+        osc_join_branch_owners(s1->words, (size_t)nobj0 * OSC_SNAP_OWNER_WORDS,
+                               (uint32_t *)c->obj, (const uint32_t *)c->sym,
+                               (uint8_t *)c->ast->nodes, c->ast->nnodes * sizeof(OscNode));
     }
     /* re-emit moves that hold after the if */
     if (c->tr && nobj0) {
