@@ -74,6 +74,7 @@ structure CapGrant where
 def verifyPolicy (minLevel : Nat) (v : BundleVerdict) : Bool :=
   v.payloadOk && v.uorIdOk && v.holoBlake3Ok && v.omcPinOk &&
   decide (minLevel ≤ v.level) &&
+  (if minLevel ≥ 1 then v.hasSig && v.sigValid else true) &&
   (if minLevel ≥ 2 then v.hasLeanProof else true) &&
   (if minLevel ≥ 3 then v.hasReplay && v.replayMatch else true) &&
   (if v.hasSig then v.sigValid else true)
@@ -108,12 +109,15 @@ theorem admit_requires_live_effect_cap (v : BundleVerdict) (g : CapGrant)
     simp [hl, he, hr] at h
   exact ⟨rfl, rfl, rfl⟩
 
-theorem admit_requires_valid_sig_when_signed (v : BundleVerdict) (g : CapGrant)
-    (h : gpuAdmitDefault v g = true) (hs : v.hasSig = true) : v.sigValid = true := by
+theorem admit_requires_valid_sig (v : BundleVerdict) (g : CapGrant)
+    (h : gpuAdmitDefault v g = true) : v.hasSig = true ∧ v.sigValid = true := by
   unfold gpuAdmitDefault verifyPolicy at h
-  cases hv : v.sigValid
-  · simp [hs, hv] at h
-  · rfl
+  cases hs : v.hasSig <;> cases hv : v.sigValid <;> simp [hs, hv] at h
+  exact ⟨rfl, rfl⟩
+
+theorem unsigned_p2_refused (v : BundleVerdict) (g : CapGrant)
+    (hu : v.hasSig = false) : gpuAdmitDefault v g = false := by
+  simp [gpuAdmitDefault, verifyPolicy, hu]
 
 theorem bad_sig_refused (v : BundleVerdict) (g : CapGrant)
     (hs : v.hasSig = true) (hb : v.sigValid = false) : gpuAdmitDefault v g = false := by
@@ -143,7 +147,8 @@ theorem revoked_cap_refused (v : BundleVerdict) (g : CapGrant)
 #print axioms admit_requires_lean_proof
 #print axioms admit_requires_intact_digests
 #print axioms admit_requires_live_effect_cap
-#print axioms admit_requires_valid_sig_when_signed
+#print axioms admit_requires_valid_sig
+#print axioms unsigned_p2_refused
 #print axioms bad_sig_refused
 #print axioms p3_replay_mismatch_refused
 #print axioms missing_lean_proof_refused

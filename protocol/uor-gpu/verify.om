@@ -28,10 +28,10 @@ text uor_i_b3 "\",\"holo_blake3\":\"blake3:"
 text uor_i_end "\"}\n"
 
 note Verify Ed25519 signature over hdr[224..287] (uor_id_sha256 || holo_blake3).
-note Unsigned (signer_pubkey == 0) returns 1; signed verifies strict RFC 8032.
-fn uor_verify_ed25519 hdr view uchar 384 to ulong
+note Returns 1 iff signed AND strict RFC 8032 Ed25519 signature is valid; 0 otherwise.
+fn uor_verify_ed25519_strict hdr view uchar 384 to ulong
   if ne uor_is_zero32 hdr 288 0
-    ret 1
+    ret 0
   end
   pk = new uchar 32 0
   sig = new uchar 64 0
@@ -47,7 +47,11 @@ fn uor_verify_ed25519 hdr view uchar 384 to ulong
 end
 
 note Verify UOR-GPU-1 bundle against omc_pin, minimum Prism level, and Ed25519 signature.
-note Default Prism policy uses min_level = 2 (P2: mandatory Lean 4 proof).
+note UOR Founding Doctrine: "Nothing raises a level except signing."
+note   P0: digest-verified only (if signed, signature must still be valid)
+note   P1+: MUST carry a valid RFC 8032 Ed25519 signature
+note   P2+ (default): MUST also carry a non-zero Lean 4 proof digest
+note   P3: MUST also carry a non-zero golden replay digest
 fn uor_verify_policy hdr view uchar 384 pay view uchar * omc_pin view uchar 32 min_level ulong to ulong
   rc = uor_hdr_check hdr pay
   if ne rc UOR_VERDICT_PASS
@@ -60,6 +64,17 @@ fn uor_verify_policy hdr view uchar 384 pay view uchar * omc_pin view uchar 32 m
   if lt lvl min_level
     ret UOR_ERR_LEVEL_LOW
   end
+  if ge min_level UOR_LVL_P1
+    if eq uor_verify_ed25519_strict hdr 0
+      ret UOR_ERR_BAD_SIG
+    end
+  else
+    if eq uor_is_zero32 hdr 288 0
+      if eq uor_verify_ed25519_strict hdr 0
+        ret UOR_ERR_BAD_SIG
+      end
+    end
+  end
   if ge min_level UOR_LVL_P2
     if ne uor_is_zero32 hdr 128 0
       ret UOR_ERR_NO_LEAN_PROOF
@@ -69,9 +84,6 @@ fn uor_verify_policy hdr view uchar 384 pay view uchar * omc_pin view uchar 32 m
     if ne uor_is_zero32 hdr 160 0
       ret UOR_ERR_NO_REPLAY
     end
-  end
-  if eq uor_verify_ed25519 hdr 0
-    ret UOR_ERR_BAD_SIG
   end
   ret UOR_VERDICT_PASS
 end
@@ -110,13 +122,17 @@ end
 
 fn uor_write_digit fd int d ulong to void
   ch = new uchar 1 0
-  if lt d 10
-    put ch 0 uchar add 48 d
+  v = d
+  if gt v 99
+    v = ulong 99
+  end
+  if lt v 10
+    put ch 0 uchar add 48 v
     uor_write_all fd ch 1
   else
-    put ch 0 uchar 49
+    put ch 0 uchar add 48 div v 10
     uor_write_all fd ch 1
-    put ch 0 uchar add 48 sub d 10
+    put ch 0 uchar add 48 rem v 10
     uor_write_all fd ch 1
   end
 end
@@ -124,6 +140,9 @@ end
 note Emit canonical prism/verdict/1 JSON line to stdout (fd 1).
 fn uor_emit_verdict hdr view uchar 384 code ulong to void
   lvl = uor_get_u32 hdr 20
+  if gt lvl UOR_LVL_P3
+    lvl = ulong 0
+  end
   uor_write_all 1 uor_v_pre len uor_v_pre
   if eq code UOR_VERDICT_PASS
     uor_write_all 1 uor_v_pass len uor_v_pass
@@ -141,10 +160,28 @@ fn uor_emit_verdict hdr view uchar 384 code ulong to void
   uor_write_all 1 uor_v_end len uor_v_end
 end
 
-note Emit prism/inspect/1 JSON summary to stdout (fd 1).
-fn uor_emit_inspect hdr view uchar 384 to void
+note Emit prism/inspect/1 JSON summary to stdout (fd 1). Returns 1 on valid magic/ISA, 0 on corrupt header.
+fn uor_emit_inspect hdr view uchar 384 to ulong
+  if or ne get hdr 0 uchar 85 ne get hdr 1 uchar 79
+    ret 0
+  end
+  if or ne get hdr 2 uchar 82 ne get hdr 3 uchar 71
+    ret 0
+  end
+  if or ne get hdr 4 uchar 80 ne get hdr 5 uchar 85
+    ret 0
+  end
+  if or ne get hdr 6 uchar 49 ne get hdr 7 uchar 0
+    ret 0
+  end
   isa = uor_get_u32 hdr 12
+  if and ne isa UOR_GPU_ISA_SM121 ne isa UOR_GPU_ISA_SPIRV
+    ret 0
+  end
   lvl = uor_get_u32 hdr 20
+  if gt lvl UOR_LVL_P3
+    ret 0
+  end
   uor_write_all 1 uor_i_pre len uor_i_pre
   if eq isa UOR_GPU_ISA_SM121
     uor_write_all 1 uor_i_sm121 len uor_i_sm121
@@ -168,4 +205,5 @@ fn uor_emit_inspect hdr view uchar 384 to void
   uor_write_all 1 uor_i_b3 len uor_i_b3
   uor_write_hex32 1 hdr 256
   uor_write_all 1 uor_i_end len uor_i_end
+  ret 1
 end
