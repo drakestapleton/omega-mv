@@ -179,6 +179,11 @@ int main(void)
           st_holdout_count_tasks((const uint8_t *)"task a\n\ntask\n task b\n"
                                  "task c", sizeof("task a\n\ntask\n task b\ntask c") - 1) == 2);
 
+    static uint8_t long_line[1000012];
+    memset(long_line, 'x', sizeof long_line);
+    memcpy(long_line + sizeof long_line - 7, "\ntask x", 7);
+    check("task after a million-byte line", st_holdout_count_tasks(long_line, sizeof long_line) == 1);
+
     /* --- parse --- */
     r = st_holdout_parse(rec, rl, &c, why, sizeof why);
     char h[65];

@@ -44,21 +44,20 @@ static void set_why(char *why, size_t why_len, const char *msg)
     }
 }
 
-static void hex_lower(const uint8_t *in, size_t n, char *out)
+static int hex_lower(const uint8_t *in, size_t n, char *out)
 {
     uint64_t u = 0;
-    if (n > 0)
-        (void)omega2_st_om_hex_lower(&u, in, n, n, (uint8_t *)out, 2 * n);
+    if (n && omega2_st_om_hex_lower(&u, in, n, n, (uint8_t *)out, 2 * n) != OMEGA_OK) return -1;
     out[2 * n] = '\0';
+    return 0;
 }
 
 static int ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
 {
-    uint64_t ok = 1;
+    uint64_t ok = 0;
     if (n == 0)
         return 1;
-    (void)omega2_st_om_ct_equal(&ok, a, n, b, n, n);
-    return (int)ok;
+    return omega2_st_om_ct_equal(&ok, a, n, b, n, n) == OMEGA_OK && ok;
 }
 
 static int label_ok(const char *s, size_t n)
@@ -70,13 +69,20 @@ static int label_ok(const char *s, size_t n)
     return (int)ok;
 }
 
-uint32_t st_holdout_count_tasks(const uint8_t *t, size_t len)
+static int count_tasks(const uint8_t *t, size_t len, uint32_t *count)
 {
     uint64_t n = 0;
-    if (!t || len == 0)
-        return 0;
-    (void)omega2_st_om_count_tasks(&n, t, len, len);
-    return (uint32_t)n;
+    if (len && omega2_st_om_count_tasks(&n, t, len, len) != OMEGA_OK)
+        return ST_HOLDOUT_ECOUNT;
+    *count = (uint32_t)n;
+    return 0;
+}
+
+uint32_t st_holdout_count_tasks(const uint8_t *t, size_t len)
+{
+    uint32_t count = 0;
+    if (t) (void)count_tasks(t, len, &count);
+    return count;
 }
 
 static void salt_digest(const uint8_t salt[32], uint8_t out[32])
@@ -89,12 +95,12 @@ static void salt_digest(const uint8_t salt[32], uint8_t out[32])
     sha256_final(&c, out);
 }
 
-static void commitment(const uint8_t salt[32], const uint8_t *t, size_t len,
+static int commitment(const uint8_t salt[32], const uint8_t *t, size_t len,
                        uint32_t count, uint8_t out[32])
 {
     uint8_t be[12];
     uint64_t u = 0;
-    (void)omega2_st_om_put_be64_be32(&u, be, 12, (uint64_t)len, count);
+    if (omega2_st_om_put_be64_be32(&u, be, 12, (uint64_t)len, count) != OMEGA_OK) return -1;
     sha256_ctx c;
     sha256_init(&c);
     sha256_update(&c, (const uint8_t *)ST_HOLDOUT_DOMAIN,
@@ -104,6 +110,7 @@ static void commitment(const uint8_t salt[32], const uint8_t *t, size_t len,
     if (len)
         sha256_update(&c, t, len);
     sha256_final(&c, out);
+    return 0;
 }
 
 int st_holdout_commit(const char *holdout_id, const uint8_t *taskset,
@@ -114,16 +121,17 @@ int st_holdout_commit(const char *holdout_id, const uint8_t *taskset,
         return ST_HOLDOUT_EARG;
     if (!label_ok(holdout_id, strnlen(holdout_id, ST_HOLDOUT_ID_MAX + 1)))
         return ST_HOLDOUT_ELABEL;
-    uint32_t count = st_holdout_count_tasks(taskset, len);
+    uint32_t count;
+    if (count_tasks(taskset, len, &count)) return ST_HOLDOUT_ECOUNT;
     if (count == 0)
         return ST_HOLDOUT_ENOTASKS;
 
     uint8_t sd[32], cm[32], end[32];
     char sdh[65], cmh[65], endh[65];
     salt_digest(salt, sd);
-    commitment(salt, taskset, len, count, cm);
-    hex_lower(sd, 32, sdh);
-    hex_lower(cm, 32, cmh);
+    if (commitment(salt, taskset, len, count, cm)) return ST_HOLDOUT_ECOMMIT;
+    if (hex_lower(sd, 32, sdh)) return ST_HOLDOUT_EFORMAT;
+    if (hex_lower(cm, 32, cmh)) return ST_HOLDOUT_EFORMAT;
 
     char body[ST_REC_MAX];
     int n = snprintf(body, sizeof body,
@@ -139,7 +147,7 @@ int st_holdout_commit(const char *holdout_id, const uint8_t *taskset,
     if (n < 0 || (size_t)n >= sizeof body)
         return ST_HOLDOUT_EFORMAT;
     sha256_hash((const uint8_t *)body, (size_t)n, end);
-    hex_lower(end, 32, endh);
+    if (hex_lower(end, 32, endh)) return ST_HOLDOUT_EFORMAT;
     size_t total = (size_t)n + 4 + 64 + 1;
     if (cap < total)
         return ST_HOLDOUT_ECAP;
@@ -197,7 +205,10 @@ static int parse_hex32(const char *v, size_t n, uint8_t out[32], char *why,
         set_why(why, wl, "hex field is not 64 characters");
         return ST_HOLDOUT_EFORMAT;
     }
-    (void)omega2_st_om_parse_hex32(&rc, (const uint8_t *)v, n, n, out, 32);
+    if (omega2_st_om_parse_hex32(&rc, (const uint8_t *)v, n, n, out, 32) != OMEGA_OK) {
+        set_why(why, wl, "field validation failed");
+        return ST_HOLDOUT_EFORMAT;
+    }
     if (rc == 2) {
         set_why(why, wl, "uppercase hex refused");
         return ST_HOLDOUT_EFORMAT;
@@ -218,7 +229,10 @@ static int parse_dec(const char *v, size_t n, uint64_t max, uint64_t *out,
         set_why(why, wl, "bad decimal (empty, too long or leading zero)");
         return ST_HOLDOUT_EFORMAT;
     }
-    (void)omega2_st_om_parse_dec(&rc, (const uint8_t *)v, n, n, max, dst, 1);
+    if (omega2_st_om_parse_dec(&rc, (const uint8_t *)v, n, n, max, dst, 1) != OMEGA_OK) {
+        set_why(why, wl, "field validation failed");
+        return ST_HOLDOUT_EFORMAT;
+    }
     if (rc == 1) {
         set_why(why, wl, "bad decimal (empty, too long or leading zero)");
         return ST_HOLDOUT_EFORMAT;
@@ -254,8 +268,10 @@ int st_holdout_parse(const char *rec, size_t len, StHoldoutCommitment *out,
             set_why(why, wl, "record too long");
             return ST_HOLDOUT_EFORMAT;
         }
-        if (len > 0)
-            (void)omega2_st_om_check_rec_bytes(&brc, (const uint8_t *)rec, len, len);
+        if (len && omega2_st_om_check_rec_bytes(&brc, (const uint8_t *)rec, len, len) != OMEGA_OK) {
+            set_why(why, wl, "record validation failed");
+            return ST_HOLDOUT_EFORMAT;
+        }
         if (brc == 2) {
             set_why(why, wl, "NUL byte in record");
             return ST_HOLDOUT_EFORMAT;
@@ -359,12 +375,13 @@ int st_holdout_reveal(const StHoldoutCommitment *c, const uint8_t *taskset,
         set_why(why, wl, "taskset_len mismatch");
         return ST_HOLDOUT_ELEN;
     }
-    uint32_t n = st_holdout_count_tasks(taskset, len);
+    uint32_t n;
+    if (count_tasks(taskset, len, &n)) return ST_HOLDOUT_ECOUNT;
     if (n != c->task_count) {
         set_why(why, wl, "task_count mismatch");
         return ST_HOLDOUT_ECOUNT;
     }
-    commitment(salt, taskset, len, n, d);
+    if (commitment(salt, taskset, len, n, d)) return ST_HOLDOUT_ECOMMIT;
     if (!ct_equal(d, c->commitment, 32)) {
         set_why(why, wl, "commitment mismatch");
         return ST_HOLDOUT_ECOMMIT;
@@ -389,8 +406,8 @@ int st_holdout_reveal_receipt(const StHoldoutCommitment *c,
         return ST_HOLDOUT_ELABEL;
     char cmh[65], rdh[65], endh[65];
     uint8_t end[32];
-    hex_lower(c->commitment, 32, cmh);
-    hex_lower(c->record_digest, 32, rdh);
+    if (hex_lower(c->commitment, 32, cmh)) return ST_HOLDOUT_EFORMAT;
+    if (hex_lower(c->record_digest, 32, rdh)) return ST_HOLDOUT_EFORMAT;
     char body[ST_REC_MAX];
     int n = snprintf(body, sizeof body,
                      ST_HOLDOUT_REVEAL_MAGIC "\n"
@@ -407,7 +424,7 @@ int st_holdout_reveal_receipt(const StHoldoutCommitment *c,
     if (n < 0 || (size_t)n >= sizeof body)
         return ST_HOLDOUT_EFORMAT;
     sha256_hash((const uint8_t *)body, (size_t)n, end);
-    hex_lower(end, 32, endh);
+    if (hex_lower(end, 32, endh)) return ST_HOLDOUT_EFORMAT;
     size_t total = (size_t)n + 4 + 64 + 1;
     if (cap < total)
         return ST_HOLDOUT_ECAP;
@@ -472,9 +489,9 @@ int st_holdout_sign(const char *rec, size_t rec_len, const uint8_t sk[32],
         set_why(why, wl, "signature self-check failed");
         return ST_HOLDOUT_ESIG;
     }
-    hex_lower(c.record_digest, 32, rdh);
-    hex_lower(kid, 32, kidh);
-    hex_lower(sig, 64, sigh);
+    if (hex_lower(c.record_digest, 32, rdh)) return ST_HOLDOUT_EFORMAT;
+    if (hex_lower(kid, 32, kidh)) return ST_HOLDOUT_EFORMAT;
+    if (hex_lower(sig, 64, sigh)) return ST_HOLDOUT_EFORMAT;
     int n = snprintf(body, sizeof body,
                      ST_HOLDOUT_SIG_MAGIC "\n"
                      "domain " ST_HOLDOUT_SIG_DOMAIN "\n"
@@ -488,7 +505,7 @@ int st_holdout_sign(const char *rec, size_t rec_len, const uint8_t sk[32],
         return ST_HOLDOUT_EFORMAT;
     }
     sha256_hash((const uint8_t *)body, (size_t)n, end);
-    hex_lower(end, 32, endh);
+    if (hex_lower(end, 32, endh)) return ST_HOLDOUT_EFORMAT;
     size_t total = (size_t)n + 4 + 64 + 1;
     if (cap < total) {
         set_why(why, wl, "output buffer too small");
@@ -713,7 +730,7 @@ static int cli_commit(char **argv)
         return 2;
     }
     sha256_hash((const uint8_t *)rec, rl, d);
-    hex_lower(d, 32, dh);
+    if (hex_lower(d, 32, dh)) return 2;
     if (snprintf(path, sizeof path, "%s/g3-commit-%s.txt", argv[4], dh) >=
         (int)sizeof path)
         return 2;
@@ -771,7 +788,7 @@ static int cli_reveal(char **argv)
         return 2;
     }
     sha256_hash((const uint8_t *)out, ol, d);
-    hex_lower(d, 32, dh);
+    if (hex_lower(d, 32, dh)) return 2;
     if (snprintf(path, sizeof path, "%s/g3-reveal-%s.txt", argv[4], dh) >=
         (int)sizeof path)
         return 2;
@@ -801,7 +818,7 @@ static int cli_verify(char **argv)
         fprintf(stderr, "st_holdout: record refused: %s\n", why);
         return 2;
     }
-    hex_lower(c.record_digest, 32, dh);
+    if (hex_lower(c.record_digest, 32, dh)) return 2;
     printf("OK holdout_id %s task_count %lu record_digest %s\n", c.holdout_id,
            (unsigned long)c.task_count, dh);
     return 0;
@@ -938,7 +955,7 @@ static int cli_sign(char **argv)
         fprintf(stderr, "st_holdout: sign refused (%d): %s\n", r, why);
         return 2;
     }
-    hex_lower(c.record_digest, 32, dh);
+    if (hex_lower(c.record_digest, 32, dh)) return 2;
     if (snprintf(path, sizeof path, "%s/g3-sig-%s.txt", argv[3], dh) >=
         (int)sizeof path)
         return 2;
@@ -972,7 +989,10 @@ static int cli_verify_strict(int argc, char **argv)
         sigp = argv[4];
     } else {
         sha256_hash(rb, rbl, d);
-        hex_lower(d, 32, dh);
+        if (hex_lower(d, 32, dh)) {
+            free(rb);
+            return 2;
+        }
         const char *slash = strrchr(argv[3], '/');
         int dl = slash ? (int)(slash - argv[3]) : 1;
         if (snprintf(sp, sizeof sp, "%.*s/g3-sig-%s.txt", dl,
@@ -1000,9 +1020,9 @@ static int cli_verify_strict(int argc, char **argv)
                 why);
         return 2;
     }
-    hex_lower(c.record_digest, 32, dh);
+    if (hex_lower(c.record_digest, 32, dh)) return 2;
     sha256_hash(pk, 32, d);
-    hex_lower(d, 32, kh);
+    if (hex_lower(d, 32, kh)) return 2;
     printf("OK SIGNED holdout_id %s task_count %lu record_digest %s key_id "
            "%s\n", c.holdout_id, (unsigned long)c.task_count, dh, kh);
     return 0;

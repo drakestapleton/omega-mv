@@ -110,8 +110,7 @@ void fab_loop_transcript(const FabLoop *l, uint8_t out[32]) {
 
 static int hmac_sign(void *ctx, const uint8_t *msg, size_t len, uint8_t sig[FAB_SIG_BYTES]) {
     const FabHmacAuth *a = ctx;
-    fab_hmac_sig64(a->self_key, msg, len, sig);
-    return 0;
+    return fab_hmac_sig64(a->self_key, msg, len, sig);
 }
 
 static int hmac_verify(void *ctx, const AienMachineId *claimed, const uint8_t *msg, size_t len,
@@ -120,7 +119,7 @@ static int hmac_verify(void *ctx, const AienMachineId *claimed, const uint8_t *m
     for (uint32_t i = 0; i < a->n; i++) {
         if (!aien_mid_equal(&a->ids[i], claimed)) continue;
         uint8_t t[FAB_SIG_BYTES];
-        fab_hmac_sig64(a->keys[i], msg, len, t);
+        if (fab_hmac_sig64(a->keys[i], msg, len, t)) return -1;
         return fab_ct_equal(t, sig, FAB_SIG_BYTES) ? 0 : -1;
     }
     return -1;

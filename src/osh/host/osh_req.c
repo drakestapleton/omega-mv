@@ -19,7 +19,7 @@
  * The decoder is the only way bytes reach the executor: the record path and the direct-argv path both end here.
  */
 #include "osh_host.h"
-#include "omega_api_decl.h"
+#include "omega_native.h"
 
 #include <string.h>
 
@@ -32,7 +32,8 @@ int osh_name_valid(const char *s)
 {
     if (!s) return 0;
     size_t n = strlen(s);
-    return (int)osh_om_name_valid((const uint8_t *)s, n, n);
+    uint64_t valid = 0;
+    return omega2_osh_om_name_valid(&valid, (const uint8_t *)s, n, n) == OMEGA_OK && valid;
 }
 
 /* copy out[off..off+len) into the arena as a NUL terminated string; NULL on any violation */
@@ -55,7 +56,9 @@ static const char *take(OshRequest *r, const uint64_t *out, uint64_t used, uint6
 int osh_req_decode(const uint64_t *rec, size_t nrec, const uint64_t *out, size_t nout, OshRequest *r)
 {
     if (!rec || nrec < OSH_REQ_HDR_CELLS) return OSH_ABI_LENGTH;
-    int error = (int)osh_om_check_req_hdr(rec, OSH_REQ_HDR_CELLS, nrec, nout, out != NULL);
+    uint64_t error = 0;
+    if (omega2_osh_om_check_req_hdr(&error, rec, OSH_REQ_HDR_CELLS, nrec, nout, out != NULL) != OMEGA_OK)
+        return OSH_REQ_FIELD;
     if (error) return error;
     uint64_t ncmds = rec[1], conn = rec[2], used = rec[4];
 
@@ -69,7 +72,8 @@ int osh_req_decode(const uint64_t *rec, size_t nrec, const uint64_t *out, size_t
         uint64_t na = b[0], ns = b[1], nr = b[2], bi = b[3];
         if (na > OSH_MAX_ARGV || ns > OSH_MAX_ASSIGN || nr > OSH_MAX_REDIR || bi > OSH_B_EXIT) return OSH_REQ_FIELD;
         if (bi != 0 && (na == 0 || (r->flags & OSH_REQ_FLAG_DIRECT))) return OSH_REQ_FIELD;
-        error = (int)osh_om_check_cmd_reserved(b, OSH_CMD_CELLS, na, ns, nr);
+        if (omega2_osh_om_check_cmd_reserved(&error, b, OSH_CMD_CELLS, na, ns, nr) != OMEGA_OK)
+            return OSH_REQ_FIELD;
         if (error) return error;
         k->builtin_id = (int)bi;
         k->nargv = (int)na;

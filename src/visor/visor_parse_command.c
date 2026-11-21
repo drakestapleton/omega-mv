@@ -74,7 +74,10 @@ int visor_cmd_arity(VisorCmd c, size_t *min_args, size_t *max_args) {
 static int check_bytes(const unsigned char *p, size_t n, char *err, size_t errn) {
     uint64_t dst[2] = { 0, 0 }, rc = 0;
     if (n == 0) return 0;
-    (void)omega2_visor_om_check_bytes(&rc, p, n, n, dst, 2);
+    if (omega2_visor_om_check_bytes(&rc, p, n, n, dst, 2) != OMEGA_OK) {
+        if (err && errn) snprintf(err, errn, "command validation failed");
+        return -1;
+    }
     if (rc == 1) {
         if (err && errn) snprintf(err, errn, "control character 0x%02X at byte %zu is not allowed",
                                   (unsigned)dst[0], (size_t)dst[1]);
@@ -111,7 +114,10 @@ int visor_parse_command(const char *line, VisorCommand *out, char *err, size_t e
     size_t a = 0, b = n;
     if (n > 0) {
         uint64_t tr[2] = { 0, 0 }, u = 0;
-        (void)omega2_visor_om_trim_blanks(&u, (const uint8_t *)line, n, n, tr, 2);
+        if (omega2_visor_om_trim_blanks(&u, (const uint8_t *)line, n, n, tr, 2) != OMEGA_OK) {
+            if (err && errn) snprintf(err, errn, "command validation failed");
+            return -1;
+        }
         a = (size_t)tr[0];
         b = (size_t)tr[1];
     }

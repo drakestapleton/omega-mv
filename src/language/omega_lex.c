@@ -77,7 +77,10 @@ static bool is_ident_char(char c) {
 static int lex_int(const char *s, size_t *i, uint64_t *out, uint32_t col, char *err, size_t n) {
     size_t slen = strlen(s);
     uint64_t dst[3] = { 0, 0, 0 }, rc = 0;
-    (void)omega2_lang_om_lex_int(&rc, (const uint8_t *)s, slen, slen, *i, dst, 3);
+    if (omega2_lang_om_lex_int(&rc, (const uint8_t *)s, slen, slen, *i, dst, 3) != OMEGA_OK) {
+        set_err(err, n, col, "token decoding failed");
+        return -1;
+    }
     if (rc == 1) {
         set_err(err, n, col, dst[2] == 16 ? "'0x' needs hex digits after it"
                                           : "'0b' needs binary digits (0 or 1) after it");
@@ -154,7 +157,10 @@ int omega_language_lex(const char *src, OmegaToken *toks, size_t max, size_t *co
         }
         {
             uint64_t pdst[2] = { 0, 1 }, prc = 0;
-            (void)omega2_lang_om_punct(&prc, (unsigned char)c, (unsigned char)src[i + 1], pdst, 2);
+            if (omega2_lang_om_punct(&prc, (unsigned char)c, (unsigned char)src[i + 1], pdst, 2) != OMEGA_OK) {
+                set_err(err, n, t->col, "token decoding failed");
+                return -1;
+            }
             if (prc == 0) {
                 t->kind = (OmegaTokKind)pdst[0];
                 i += (size_t)pdst[1];
