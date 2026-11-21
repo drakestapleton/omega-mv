@@ -7,6 +7,7 @@ The current development method is [Human-Directed Agentic Engineering (HDAE)](RE
 
 | Model | What it did |
 |---|---|
+| OpenAI Codex | Built the causal ST-MoE replay, demand-LRU control, native trace projection and sequential slab timing probe for the DeepSeek lookahead experiment. |
 | OpenAI Codex | Migrated OSC AST node initialization and contract token-stream rendering to seeded Omega. |
 | OpenAI Codex | Ported the M22 training snapshot header codec and generation validation to seeded Omega. |
 | OpenAI Codex | Migrated the reaction runtime cost model’s OGCM v1 state encoding, validation and restoration to seeded Omega. |
