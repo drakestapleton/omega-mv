@@ -39,19 +39,20 @@ The [learned coding controller](tools/controller/README.md) trains routing and s
 
 ## Coding benchmark
 
-The [Omega coding benchmark](tools/bench/README.md) scores a checkpoint on 165 functions it has not seen, one behaviour each, with no help from the harness. Use it, not the panels above, to decide whether a change made the model better at writing Omega. No model has been scored on it yet.
+The [Omega coding benchmark](tools/bench/README.md) scores a checkpoint on 165 functions it has not seen, one behaviour each, with no help from the harness. Use it, not the panels above, to decide whether a change made the model better at writing Omega. The two models scored so far, trained from scratch on this repository's Omega source, pass 0 of 159.
 
 ## Looped core
 
-`ollm init` can make some layers a core that runs several times with the same weights. See [the loop and its checks](docs/LOOP.md). It runs on the CPU only, and no looped model has been trained on real data.
+`ollm init` can make some layers a core that runs several times with the same weights. It trains and runs on the CPU and on the GB10. See [the loop, its checks and the first trained comparison](docs/LOOP.md): at equal parameters a looped model matched the unlooped one in held-out loss (within 0.4%) at 1.84 times the step time, and neither solved a benchmark task.
 
 ## Units
 
-Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`); `build.sh` has no Darwin target, so the `ollm_darwin` row follows upstream `tests/omegallm/ollm_metrics_bench.py` (`darwin-arm64`):
+Built by `seed/out/omc` and gated by `train/units-gate.om` (`OMEGA-TRAIN-UNITS`), rows in `train/units.tsv`, composed as upstream `tests/omegallm/build.sh` does (`math data <pool> model adam ckpt bpe spec cli <plat> <post>`); `build.sh` has no Darwin target, so the `ollm_darwin` row follows upstream `tests/omegallm/ollm_metrics_bench.py` (`darwin-arm64`). `ollm_gb10` is `ollm_aarch64` with `native/gpu/` in place of `nogpu.om`:
 
 | Unit | Target line | Platform unit |
 | --- | --- | --- |
 | `ollm_aarch64` | `om2` | `lio.om` + `serve.om` |
+| `ollm_gb10` | `om2` | `lio.om` + `serve.om` + `gpu/` |
 | `ollm_x86linux` | `target x86linux` | `lio.om` + `noserve.om` |
 | `ollm_x86efi` | `target x86efi` | `eio.om` + `noserve.om` |
 | `ollm_a64efi` | `target a64efi` + `seed/a64efi/efirt.om` | `eio.om` + `noserve.om` |

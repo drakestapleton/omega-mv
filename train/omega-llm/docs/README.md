@@ -46,8 +46,9 @@ Growth increases capacity; it is not a measured quality improvement.
 ## Looped core
 
 `ollm init ... G LP LC NP` makes the LC layers from layer LP a core that runs NP times with the
-same weights, so depth no longer costs parameters. See [the loop and its checks](LOOP.md).
-A looped model is not a measured quality improvement; no looped model has been trained on real data.
+same weights, so depth no longer costs parameters. It trains and runs on the CPU and on the GB10.
+See [the loop, its checks and the first trained comparison](LOOP.md): at equal parameters the looped
+model's held-out loss was within 0.4% of the unlooped model's, at 1.84 times the step time.
 
 ## Status
 
@@ -528,8 +529,11 @@ Every query is WolframLanguageEvaluator, 2026-11-01.
 
 ## GB10 GPU training (rung 4)
 
-`TARGET=gb10` builds `ollm-gb10`: the aarch64 `ollm` with its `fn main` renamed `ocpumain` and
-`native/omegallm/gpu/` appended. `gk.om` (f32 GEMMs: 32×32 tiles as ids 0-7 plus the fused-epilogue
+`ollm-gb10` is the `ollm_gb10` row of `train/units.tsv`: the aarch64 `ollm` with `native/gpu/` in
+place of `nogpu.om`. `cli.om`'s `ocmd` offers each command word to `ogcmd` first (`gpu/gg.om` on
+gb10, `nogpu.om` on the CPU targets), so no `main` is renamed. (Upstream `TARGET=gb10` renamed the
+CPU `fn main` to `ocpumain` with `sed`; that composition no longer applies to these sources.)
+`gk.om` (f32 GEMMs: 32×32 tiles as ids 0-7 plus the fused-epilogue
 ids 25/26; 64×64 tiles as the even ids 40-54 plus the fused-epilogue ids 56/58, two slots each) and
 `gr.om` (slots 9-24, with 12, 17 and 18 empty: embedding, RMS norm, column sums, causal softmax,
 copy/zero, CE, the embedding-gradient CSR gather, the SQN sum of squares and ADAM) emit

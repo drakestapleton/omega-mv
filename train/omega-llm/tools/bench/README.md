@@ -74,7 +74,16 @@ Checked on AArch64 Linux in a virtual machine, with `seed/out/omc` `708fdc0f…`
 - Scoring every reference as its own answer gives 165 of 165. Giving every task the answer of the next task of its shape gives 0 of 165.
 - No task is seen in the 1,440-record contrast training corpus (`tools/contrast/contrast.om`).
 
-No model has been scored on it yet.
+## Scores
+
+Scores of this task set (165 tasks; `tasks.om` and `expect.txt` as committed on 2026-11-21):
+
+| Date | Model | Corpus given to `score` | Pass | Seen, set apart |
+| --- | --- | --- | ---: | ---: |
+| 2026-11-21 | 8 layers, 15.8M parameters, 6,000 steps on this repository's Omega source | that training text | 0 of 159 | 6 |
+| 2026-11-21 | the same with a looped core (16 layer applications) | that training text | 0 of 159 | 6 |
+
+Both were sampled with CPU `sample`. The run is described in [the looped-core notes](../../docs/LOOP.md). Six tasks have their reference function somewhere in this repository's Omega source (`u-007`, `u-009`, `u-030`, `p-004`, `p-006`, `t-003`), so a model trained on that source is scored on the other 159.
 
 ## Changing the tasks
 
