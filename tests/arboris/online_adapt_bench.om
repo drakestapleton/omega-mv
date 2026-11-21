@@ -1,0 +1,393 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure OM-2 online-adaptation & domain-shift qualification harness for Arboris cross-layer prefetch.
+note Implements the exact same 16-slot Space-Saving / EMA sum-over-paths graph as dsv41-decode,
+note parameterized for both Qwen3.6-35B (40 layers, 256 experts, top-8) and DeepSeek-V4.1 (40 layers, 384 experts, top-6).
+note
+note Stdin binary stream ("ART1"):
+note   u32 magic   = 0x31545241 ("ART1")
+note   u32 layers  (2..40)
+note   u32 experts (1..384)
+note   u32 topk    (1..16)
+note   u32 tokens  (1..65536)
+note   u32 budget  (1..64)
+note   u32 bucket  (tokens per summary row, e.g. 128)
+note   u32 cacheCap (per-layer FIFO cache capacity, e.g. 64; 0 disables cache sim)
+note   Followed by tokens * layers * topk little-endian u32 expert IDs (token-major, layer-major).
+note
+note Stdout: one CSV line per bucket + TOTAL line:
+note   tok_end,static_hits,arb_hits,total_picks,plain_cache_hits,arb_cache_hits,pf_hits
+
+global oaEdges uint 239616
+global oaFreq ulong 15360
+global oaPrev uint 16
+global oaCur uint 16
+global oaScores ulong 384
+global oaPick uint 64
+global oaPlainRes uchar 15360
+global oaPlainRing uint 15360
+global oaPlainHead ulong 40
+global oaArbRes uchar 15360
+global oaArbRing uint 15360
+global oaArbHead ulong 40
+global oaIoBuf uchar 4096
+global oaCfg ulong 8
+global oaStats ulong 12
+note oaCfg: 0=layers, 1=experts, 2=topk, 3=tokens, 4=budget, 5=bucket, 6=cacheCap
+note oaStats: 0=bStat, 1=bArb, 2=bTot, 3=bPlainC, 4=bArbC, 5=bPfHits,
+note          6=tStat, 7=tArb, 8=tTot, 9=tPlainC, 10=tArbC, 11=tPfHits
+
+fn oaReadExact n ulong to bool
+  pos = ulong 0
+  while lt pos n bound 4096
+    r = read 0 oaIoBuf pos sub n pos
+    if le r 0
+      ret false
+    end
+    pos = add pos ulong r
+  end
+  ret true
+end
+
+fn oaU32At off ulong to uint
+  v = uint 0
+  for i ulong 4
+    v = or v shl uint get oaIoBuf add off i mul i 8
+  end
+  ret v
+end
+
+fn oaReadU32 to long
+  if not oaReadExact 4
+    ret -1
+  end
+  ret long oaU32At 0
+end
+
+fn oaPutc c uchar to void
+  put oaIoBuf 0 c
+  u = write 1 oaIoBuf 0 1
+end
+
+fn oaPutU64 v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    oaPutc 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  while gt n 0 bound 24
+    n = sub n 1
+    oaPutc get tmp n
+  end
+end
+
+fn oaPrintRow tokEnd ulong off ulong to void
+  oaPutU64 tokEnd
+  for i ulong 6
+    oaPutc 44
+    oaPutU64 get oaStats add off i
+  end
+  oaPutc 10
+end
+
+fn oaPack cnt ulong tgt ulong to uint
+  ret or shl uint cnt 16 uint tgt
+end
+
+fn oaHalveRow rowBase ulong to void
+  for h ulong 16
+    e2 = get oaEdges add rowBase h
+    c2 = ulong shr e2 16
+    if gt c2 1
+      put oaEdges add rowBase h oaPack shr c2 1 ulong and e2 65535
+    else
+      put oaEdges add rowBase h 0
+    end
+  end
+end
+
+fn oaBumpEdge prevLayer ulong src ulong tgt ulong to void
+  rowBase = mul add mul prevLayer 384 src 16
+  emptySlot = ulong 16
+  minSlot = ulong 0
+  minCnt = ulong 65536
+  for j ulong 16
+    ent = get oaEdges add rowBase j
+    c = ulong shr ent 16
+    if eq c 0
+      if eq emptySlot 16
+        emptySlot = j
+      end
+    else
+      if eq ulong and ent 65535 tgt
+        nc = add c 1
+        if ge nc 60000
+          oaHalveRow rowBase
+          nc = ulong 30000
+        end
+        put oaEdges add rowBase j oaPack nc tgt
+        ret
+      end
+      if lt c minCnt
+        minCnt = c
+        minSlot = j
+      end
+    end
+  end
+  if lt emptySlot 16
+    put oaEdges add rowBase emptySlot oaPack 1 tgt
+    ret
+  end
+  if le minCnt 1
+    put oaEdges add rowBase minSlot oaPack 1 tgt
+  else
+    oldTgt = ulong and get oaEdges add rowBase minSlot 65535
+    put oaEdges add rowBase minSlot oaPack sub minCnt 1 oldTgt
+  end
+end
+
+fn oaScoreNext prevLayer ulong topk ulong numExp ulong to void
+  for e ulong numExp bound 384
+    put oaScores e 0
+  end
+  for s ulong topk bound 16
+    src = ulong get oaPrev s
+    if lt src numExp
+      rowBase = mul add mul prevLayer 384 src 16
+      for j ulong 16
+        ent = get oaEdges add rowBase j
+        c = ulong shr ent 16
+        if gt c 0
+          tgt = ulong and ent 65535
+          if lt tgt numExp
+            put oaScores tgt add get oaScores tgt c
+          end
+        end
+      end
+    end
+  end
+end
+
+fn oaInPick eid ulong picked ulong to bool
+  for q ulong picked bound 64
+    if eq ulong get oaPick q eid
+      ret true
+    end
+  end
+  ret false
+end
+
+fn oaBestOne numExp ulong picked ulong useFreq bool base ulong to ulong
+  best = numExp
+  bestSc = ulong 0
+  for e ulong numExp bound 384
+    sc = get oaScores e
+    if useFreq
+      sc = get oaFreq add base e
+    end
+    if gt sc bestSc
+      if not oaInPick e picked
+        bestSc = sc
+        best = e
+      end
+    end
+  end
+  ret best
+end
+
+fn oaPickTopB numExp ulong budget ulong useFreq bool layer ulong to ulong
+  picked = ulong 0
+  base = mul layer 384
+  for p ulong budget bound 64
+    best = oaBestOne numExp picked useFreq base
+    if eq best numExp
+      break
+    end
+    put oaPick picked uint best
+    picked = add picked 1
+  end
+  ret picked
+end
+
+fn oaInCur eid ulong topk ulong to bool
+  for k ulong topk bound 16
+    if eq ulong get oaCur k eid
+      ret true
+    end
+  end
+  ret false
+end
+
+fn oaCacheTouchPlain layer ulong eid ulong cap ulong to bool
+  key = add mul layer 384 eid
+  if ne get oaPlainRes key 0
+    ret true
+  end
+  hd = get oaPlainHead layer
+  rIdx = add mul layer 384 hd
+  old = ulong get oaPlainRing rIdx
+  if gt old 0
+    put oaPlainRes add mul layer 384 sub old 1 0
+  end
+  put oaPlainRing rIdx uint add eid 1
+  put oaPlainRes key 1
+  put oaPlainHead layer rem add hd 1 cap
+  ret false
+end
+
+fn oaCacheTouchArb layer ulong eid ulong cap ulong to bool
+  key = add mul layer 384 eid
+  if ne get oaArbRes key 0
+    ret true
+  end
+  hd = get oaArbHead layer
+  rIdx = add mul layer 384 hd
+  old = ulong get oaArbRing rIdx
+  if gt old 0
+    put oaArbRes add mul layer 384 sub old 1 0
+  end
+  put oaArbRing rIdx uint add eid 1
+  put oaArbRes key 1
+  put oaArbHead layer rem add hd 1 cap
+  ret false
+end
+
+fn oaEvalCache layer ulong nArb ulong topk ulong cap ulong to void
+  for q ulong nArb bound 64
+    pe = ulong get oaPick q
+    key = add mul layer 384 pe
+    if eq get oaArbRes key 0
+      if oaInCur pe topk
+        u = oaCacheTouchArb layer pe cap
+        put oaStats 5 add get oaStats 5 1
+        put oaStats 11 add get oaStats 11 1
+      end
+    end
+  end
+  for k ulong topk bound 16
+    eid = ulong get oaCur k
+    if oaCacheTouchPlain layer eid cap
+      put oaStats 3 add get oaStats 3 1
+      put oaStats 9 add get oaStats 9 1
+    end
+    if oaCacheTouchArb layer eid cap
+      put oaStats 4 add get oaStats 4 1
+      put oaStats 10 add get oaStats 10 1
+    end
+  end
+end
+
+fn oaUpdateEdges prevLayer ulong topk ulong numExp ulong to void
+  for s ulong topk bound 16
+    src = ulong get oaPrev s
+    if lt src numExp
+      for d ulong topk bound 16
+        tgt = ulong get oaCur d
+        if lt tgt numExp
+          oaBumpEdge prevLayer src tgt
+        end
+      end
+    end
+  end
+end
+
+fn oaEvalLayer layer ulong to void
+  numExp = get oaCfg 1
+  topk = get oaCfg 2
+  budget = get oaCfg 4
+  cap = get oaCfg 6
+  if gt layer 0
+    prevLayer = sub layer 1
+    nStat = oaPickTopB numExp budget true layer
+    for k ulong topk bound 16
+      if oaInPick ulong get oaCur k nStat
+        put oaStats 0 add get oaStats 0 1
+        put oaStats 6 add get oaStats 6 1
+      end
+    end
+    oaScoreNext prevLayer topk numExp
+    nArb = oaPickTopB numExp budget false layer
+    for k ulong topk bound 16
+      if oaInPick ulong get oaCur k nArb
+        put oaStats 1 add get oaStats 1 1
+        put oaStats 7 add get oaStats 7 1
+      end
+    end
+    put oaStats 2 add get oaStats 2 topk
+    put oaStats 8 add get oaStats 8 topk
+    if gt cap 0
+      oaEvalCache layer nArb topk cap
+    end
+    oaUpdateEdges prevLayer topk numExp
+  end
+  base = mul layer 384
+  for k ulong topk bound 16
+    eid = ulong get oaCur k
+    if lt eid numExp
+      put oaFreq add base eid add get oaFreq add base eid 1
+    end
+    put oaPrev k get oaCur k
+  end
+end
+
+fn main to int
+  magic = oaReadU32
+  if ne magic 0x31545241
+    ret 65
+  end
+  for i ulong 7
+    v = oaReadU32
+    if lt v 0
+      ret 65
+    end
+    put oaCfg i ulong v
+  end
+  layers = get oaCfg 0
+  numExp = get oaCfg 1
+  topk = get oaCfg 2
+  tokens = get oaCfg 3
+  budget = get oaCfg 4
+  bucket = get oaCfg 5
+  cap = get oaCfg 6
+  if or lt layers 2 gt layers 40
+    ret 66
+  end
+  if or eq numExp 0 gt numExp 384
+    ret 66
+  end
+  if or eq topk 0 gt topk 16
+    ret 66
+  end
+  if or eq budget 0 gt budget 64
+    ret 66
+  end
+  if or eq bucket 0 gt cap numExp
+    ret 66
+  end
+  for t ulong tokens bound 65536
+    for l ulong layers bound 40
+      if not oaReadExact mul topk 4
+        ret 67
+      end
+      for k ulong topk bound 16
+        put oaCur k oaU32At mul k 4
+      end
+      oaEvalLayer l
+    end
+    t1 = add t 1
+    if or eq rem t1 bucket 0 eq t1 tokens
+      oaPrintRow t1 0
+      for s ulong 6
+        put oaStats s 0
+      end
+    end
+  end
+  oaPrintRow tokens 6
+  ret 0
+end
