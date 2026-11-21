@@ -1005,6 +1005,22 @@ uint32_t omega2_osh_om_name_valid(uint64_t *result, const uint8_t *o_s, uint64_t
 uint32_t omega2_osh_om_check_req_hdr(uint64_t *result, const uint64_t *o_rec, uint64_t o_rec_len, uint64_t o_nrec, uint64_t o_nout, uint64_t o_has_out);
 /* export fn osh_om_check_cmd_reserved b view ulong * na ulong ns ulong nr ulong to ulong */
 uint32_t omega2_osh_om_check_cmd_reserved(uint64_t *result, const uint64_t *o_b, uint64_t o_b_len, uint64_t o_na, uint64_t o_ns, uint64_t o_nr);
+#define OMEGA2_IDENT_c2_core "omega-ident 1 unit=c2_core abi=2 profile=OM-2 src=b4f1d0874019114f293304b556a1e3616a6da934df221d3dfee563e41a73100c omc=210c52566e782cf15ece6e478d45bfb67f1ad338f29e41546dad9b6c4f85b54c"
+const char *omega2_ident_c2_core(void);
+/* export fn c2_om_put16 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_c2_om_put16(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn c2_om_put64 dst edit uchar * pos ulong v ulong to void */
+uint32_t omega2_c2_om_put64(uint64_t *result, uint8_t *o_dst, uint64_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn c2_om_get16 src view uchar * pos ulong to ulong */
+uint32_t omega2_c2_om_get16(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn c2_om_get64 src view uchar * pos ulong to ulong */
+uint32_t omega2_c2_om_get64(uint64_t *result, const uint8_t *o_src, uint64_t o_src_len, uint64_t o_pos);
+/* export fn c2_om_deps_ascending ids view uchar * n ulong to ulong */
+uint32_t omega2_c2_om_deps_ascending(uint64_t *result, const uint8_t *o_ids, uint64_t o_ids_len, uint64_t o_n);
+/* export fn c2_om_lrat_skip_ws p view uchar * n ulong pos ulong nl_out edit ulong 1 to ulong */
+uint32_t omega2_c2_om_lrat_skip_ws(uint64_t *result, const uint8_t *o_p, uint64_t o_p_len, uint64_t o_n, uint64_t o_pos, uint64_t *o_nl_out, uint64_t o_nl_out_len);
+/* export fn c2_om_lrat_rd_int p view uchar * n ulong pos ulong dst edit ulong 3 to ulong */
+uint32_t omega2_c2_om_lrat_rd_int(uint64_t *result, const uint8_t *o_p, uint64_t o_p_len, uint64_t o_n, uint64_t o_pos, uint64_t *o_dst, uint64_t o_dst_len);
 #ifdef __cplusplus
 }
 #endif

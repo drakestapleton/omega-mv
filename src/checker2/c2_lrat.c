@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "c2_lrat.h"
+#include "omega_api_decl.h"
 
 #define C2_LRAT_MAX_VARS 4000000
 #define C2_LRAT_MAX_ID 100000000L
@@ -34,36 +35,20 @@ typedef struct {
 
 static void skip_ws(Lx *x)
 {
-    for (;;) {
-        while (x->i < x->n && (x->p[x->i] == ' ' || x->p[x->i] == '\t' || x->p[x->i] == '\r' || x->p[x->i] == '\n')) {
-            if (x->p[x->i] == '\n') x->line++;
-            x->i++;
-        }
-        if (x->i < x->n && x->p[x->i] == 'c') { /* comment to end of line */
-            while (x->i < x->n && x->p[x->i] != '\n') x->i++;
-            continue;
-        }
-        return;
-    }
+    uint64_t newlines[1];
+    x->i = c2_om_lrat_skip_ws((const uint8_t *)x->p, x->n, x->n, x->i, newlines);
+    x->line += (long)newlines[0];
 }
 
 /* signed decimal integer; -1 on malformed/overflow, 1 at end of input, 0 ok */
 static int rd_int(Lx *x, long *out)
 {
-    skip_ws(x);
-    if (x->i >= x->n) return 1;
-    int neg = 0;
-    if (x->p[x->i] == '-') { neg = 1; x->i++; }
-    if (x->i >= x->n || x->p[x->i] < '0' || x->p[x->i] > '9') return -1;
-    long v = 0;
-    while (x->i < x->n && x->p[x->i] >= '0' && x->p[x->i] <= '9') {
-        v = v * 10 + (x->p[x->i] - '0');
-        if (v > C2_LRAT_MAX_ID) return -1;
-        x->i++;
-    }
-    if (x->i < x->n && !(x->p[x->i] == ' ' || x->p[x->i] == '\t' || x->p[x->i] == '\n' || x->p[x->i] == '\r')) return -1;
-    *out = neg ? -v : v;
-    return 0;
+    uint64_t fields[3];
+    uint64_t result = c2_om_lrat_rd_int((const uint8_t *)x->p, x->n, x->n, x->i, fields);
+    x->i = fields[0];
+    x->line += (long)fields[2];
+    if (result == 0) *out = (long)fields[1];
+    return result == 2 ? -1 : (int)result;
 }
 
 /* ------------------------------------------------------------------ CNF */

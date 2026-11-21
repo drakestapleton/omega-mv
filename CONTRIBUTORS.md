@@ -431,3 +431,4 @@ Update this table in the same commit as the work it credits.
 - Antigravity, under Drake Stapleton's direction, wrote the Arboris spreading activation units and the Turing, Polyglot, and OSH migration drafts. Codex completed host integration and verified the generated bindings.
 - Codex, under Drake Stapleton's direction, corrected ABI failure handling in Fabric, SearchTrace, the lexer and OSH, and validated Arboris state indexing before QMD packing.
 - Codex, under Drake Stapleton’s direction, propagated native algebra failures, isolated generated compiler flags, and checked Arboris CSR sections before publishing launch descriptors.
+- Antigravity drafted the Checker2 Omega core. Codex completed its source-identity binding and full-length DIMACS and LRAT scans.
