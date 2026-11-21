@@ -428,3 +428,4 @@ Update this table in the same commit as the work it credits.
 
 - Drake Stapleton and Codex — calibrated and measured DeepSeek mixed-format SM121a expert projections against the pinned checkpoint on GB10.
 - Codex, under Drake Stapleton’s direction, documented the partner researcher setup and benchmark replay.
+- Antigravity drafted the Arboris, Turing, Polyglot, OSH and Checker2 Omega units. Codex completed their host bindings and evaluated the Checker2 source-identity change under Drake Stapleton's direction.

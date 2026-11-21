@@ -17,6 +17,7 @@
 /* POLYGLOT-0 lane F shared helpers. See omx_bench.h. */
 #define _GNU_SOURCE
 #include "polyglot/omx_bench.h"
+#include "omega_native.h"
 
 #include "sha256.h"
 
@@ -28,20 +29,24 @@
 #include <time.h>
 
 uint64_t omx_rng_next(omx_rng *r) {
-    uint64_t z = (r->s += 0x9e3779b97f4a7c15ULL);
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
+    uint64_t st[1] = { r->s }, out = 0;
+    (void)omega2_omx_om_rng_next(&out, st, 1);
+    r->s = st[0];
+    return out;
 }
 
-double omx_rng_01(omx_rng *r) { return (double)(omx_rng_next(r) >> 11) * (1.0 / 9007199254740992.0); }
+double omx_rng_01(omx_rng *r) {
+    uint64_t st[1] = { r->s }, bits = 0;
+    double d = 0.0;
+    (void)omega2_omx_om_rng_01(&bits, st, 1);
+    r->s = st[0];
+    memcpy(&d, &bits, 8);
+    return d;
+}
 
 void omx_hex(const uint8_t *d, size_t n, char *out) {
-    static const char k[] = "0123456789abcdef";
-    for (size_t i = 0; i < n; i++) {
-        out[2 * i] = k[d[i] >> 4];
-        out[2 * i + 1] = k[d[i] & 15];
-    }
+    uint64_t u = 0;
+    if (n > 0) (void)omega2_omx_om_hex(&u, d, n, n, (uint8_t *)out, 2 * n);
     out[2 * n] = 0;
 }
 
@@ -249,8 +254,10 @@ double omx_now_ns(void) {
 
 /* ---- ELF ---- */
 static int elf_ok(const unsigned char *b, size_t len) {
-    return len >= sizeof(Elf64_Ehdr) && memcmp(b, ELFMAG, SELFMAG) == 0 && b[EI_CLASS] == ELFCLASS64 &&
-           b[EI_DATA] == ELFDATA2LSB;
+    uint64_t ok = 0;
+    if (len < sizeof(Elf64_Ehdr)) return 0;
+    (void)omega2_omx_om_elf64_le_ok(&ok, b, len, len);
+    return (int)ok;
 }
 
 static const Elf64_Shdr *elf_shdrs(const unsigned char *b, size_t len, size_t *count) {
@@ -330,23 +337,28 @@ void omx_json_str(FILE *f, const char *s) {
 }
 
 /* ---- statistics ---- */
-static int cmp_d(const void *a, const void *b) {
-    double x = *(const double *)a, y = *(const double *)b;
-    return (x > y) - (x < y);
+void omx_sort_d(double *v, size_t n) {
+    uint64_t u = 0;
+    if (n < 2) return;
+    (void)omega2_omx_om_sort_d(&u, (uint64_t *)v, n, n);
 }
 
-void omx_sort_d(double *v, size_t n) { qsort(v, n, sizeof *v, cmp_d); }
-
 double omx_median_sorted(const double *v, size_t n) {
+    uint64_t bits = 0;
+    double d = 0.0;
     if (n == 0) return 0;
-    return n & 1 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+    (void)omega2_omx_om_median_sorted(&bits, (const uint64_t *)v, n, n);
+    memcpy(&d, &bits, 8);
+    return d;
 }
 
 double omx_mad(const double *v, size_t n, double med) {
+    uint64_t med_b = 0, u = 0;
     if (n == 0) return 0;
     double *d = malloc(n * sizeof *d);
     if (!d) return -1;
-    for (size_t i = 0; i < n; i++) d[i] = v[i] > med ? v[i] - med : med - v[i];
+    memcpy(&med_b, &med, 8);
+    (void)omega2_omx_om_abs_dev(&u, (const uint64_t *)v, n, n, med_b, (uint64_t *)d, n);
     omx_sort_d(d, n);
     double r = omx_median_sorted(d, n);
     free(d);

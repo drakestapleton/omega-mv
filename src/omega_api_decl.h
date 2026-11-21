@@ -19,6 +19,10 @@ uint64_t arboris_plan_arena(uint64_t o_m[16], uint64_t o_budget, uint64_t o_page
 uint64_t arboris_check_csr(const uint64_t o_m[16], const uint32_t *o_data, size_t o_data_len);
 /* export fn arboris_plan_sparse m edit ulong 16 budget ulong page ulong offsets edit ulong 6 to ulong */
 uint64_t arboris_plan_sparse(uint64_t o_m[16], uint64_t o_budget, uint64_t o_page, uint64_t o_offsets[6]);
+/* export fn arboris_validate_in_csr hdr view ulong 16 csr view uint * to ulong */
+uint64_t arboris_validate_in_csr(const uint64_t o_hdr[16], const uint32_t *o_csr, size_t o_csr_len);
+/* export fn arboris_compile_in_csr r view uint * hdr view ulong 16 csr edit uint * to ulong */
+uint64_t arboris_compile_in_csr(const uint32_t *o_r, size_t o_r_len, const uint64_t o_hdr[16], uint32_t *o_csr, size_t o_csr_len);
 /* export fn arboris_load_records r view uint * topo edit uint * weights edit uint * to ulong */
 uint64_t arboris_load_records(const uint32_t *o_r, size_t o_r_len, uint32_t *o_topo, size_t o_topo_len, uint32_t *o_weights, size_t o_weights_len);
 /* export fn arboris_topology_digest topo view uint * weights view uint * digest edit uchar 32 to ulong */
@@ -27,6 +31,20 @@ uint64_t arboris_topology_digest(const uint32_t *o_topo, size_t o_topo_len, cons
 uint64_t arboris_spread_step(const uint32_t *o_topo, size_t o_topo_len, const uint32_t *o_weights, size_t o_weights_len, uint32_t *o_state, size_t o_state_len);
 /* export fn arboris_relax_step topo view uint * weights view uint * state edit uint * to ulong */
 uint64_t arboris_relax_step(const uint32_t *o_topo, size_t o_topo_len, const uint32_t *o_weights, size_t o_weights_len, uint32_t *o_state, size_t o_state_len);
+/* export fn arboris_spread_plan hdr edit ulong 16 budget ulong page ulong offsets edit ulong 5 mapped_sizes edit ulong 5 to ulong */
+uint64_t arboris_spread_plan(uint64_t o_hdr[16], uint64_t o_budget, uint64_t o_page, uint64_t o_offsets[5], uint64_t o_mapped_sizes[5]);
+/* export fn arboris_spread_verify_header hdr view ulong 16 budget ulong page ulong to ulong */
+uint64_t arboris_spread_verify_header(const uint64_t o_hdr[16], uint64_t o_budget, uint64_t o_page);
+/* export fn arboris_spread_cpu_hop hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong */
+uint64_t arboris_spread_cpu_hop(uint64_t o_hdr[16], const uint32_t *o_csr, size_t o_csr_len, uint32_t *o_state, size_t o_state_len, uint64_t o_receipt[8]);
+/* export fn arboris_spread_cpu_run hdr edit ulong 16 csr view uint * state edit uint * receipt edit ulong 8 to ulong */
+uint64_t arboris_spread_cpu_run(uint64_t o_hdr[16], const uint32_t *o_csr, size_t o_csr_len, uint32_t *o_state, size_t o_state_len, uint64_t o_receipt[8]);
+/* export fn bw_arboris_spread_emit_mode0 code edit uchar 16384 to ulong */
+uint64_t bw_arboris_spread_emit_mode0(uint8_t o_code[16384]);
+/* export fn bw_arboris_spread_emit_mode1 code edit uchar 16384 to ulong */
+uint64_t bw_arboris_spread_emit_mode1(uint8_t o_code[16384]);
+/* export fn bw_arboris_spread_pack_qmd hdr view ulong 16 vas view ulong 10 driver view uint 224 bank edit uint 240 q0 edit uint 96 q1 edit uint 96 to ulong */
+uint64_t bw_arboris_spread_pack_qmd(const uint64_t o_hdr[16], const uint64_t o_vas[10], const uint32_t o_driver[224], uint32_t o_bank[240], uint32_t o_q0[96], uint32_t o_q1[96]);
 /* export fn arboris_gated_tick m view ulong 16 offsets view ulong 6 arena edit ushort * page ulong to ulong */
 uint64_t arboris_gated_tick(const uint64_t o_m[16], const uint64_t o_offsets[6], uint16_t *o_arena, size_t o_arena_len, uint64_t o_page);
 /* export fn arboris_pack_gated m view ulong 16 offsets view ulong 6 a edit ushort * limits edit ulong 2 to ulong */
@@ -1298,6 +1316,52 @@ uint64_t pd0_om_get_u64(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
 uint64_t pd0_om_check_desc_magic(const uint8_t *o_src, size_t o_src_len, uint64_t o_slen);
 /* export fn pd0_om_check_rec_magic src view uchar * slen ulong to ulong */
 uint64_t pd0_om_check_rec_magic(const uint8_t *o_src, size_t o_src_len, uint64_t o_slen);
+/* export fn turing_om_hex d view uchar 32 dst edit uchar 64 to void */
+void turing_om_hex(const uint8_t o_d[32], uint8_t o_dst[64]);
+/* export fn turing_om_digest_eq a view uchar 32 b view uchar 32 to ulong */
+uint64_t turing_om_digest_eq(const uint8_t o_a[32], const uint8_t o_b[32]);
+/* export fn turing_om_splitmix64 st edit ulong 1 to ulong */
+uint64_t turing_om_splitmix64(uint64_t o_st[1]);
+/* export fn turing_om_bucket_observe cnt edit uint 1 mean_b edit ulong 1 cost_ps ulong to void */
+void turing_om_bucket_observe(uint32_t o_cnt[1], uint64_t o_mean_b[1], uint64_t o_cost_ps);
+/* export fn turing_om_rank_min_cost cnt view uint 32 means view ulong 32 allowed view uint 32 nspec ulong to ulong */
+uint64_t turing_om_rank_min_cost(const uint32_t o_cnt[32], const uint64_t o_means[32], const uint32_t o_allowed[32], uint64_t o_nspec);
+/* export fn turing_om_fisher_yates ord edit uint 32 nspec ulong seed ulong to void */
+void turing_om_fisher_yates(uint32_t o_ord[32], uint64_t o_nspec, uint64_t o_seed);
+/* export fn omx_om_rng_next st edit ulong 1 to ulong */
+uint64_t omx_om_rng_next(uint64_t o_st[1]);
+/* export fn omx_om_rng_01 st edit ulong 1 to ulong */
+uint64_t omx_om_rng_01(uint64_t o_st[1]);
+/* export fn omx_om_hex d view uchar * n ulong dst edit uchar * to void */
+void omx_om_hex(const uint8_t *o_d, size_t o_d_len, uint64_t o_n, uint8_t *o_dst, size_t o_dst_len);
+/* export fn omx_om_elf64_le_ok b view uchar * slen ulong to ulong */
+uint64_t omx_om_elf64_le_ok(const uint8_t *o_b, size_t o_b_len, uint64_t o_slen);
+/* export fn omx_om_sort_d v edit ulong * n ulong to void */
+void omx_om_sort_d(uint64_t *o_v, size_t o_v_len, uint64_t o_n);
+/* export fn omx_om_median_sorted v view ulong * n ulong to ulong */
+uint64_t omx_om_median_sorted(const uint64_t *o_v, size_t o_v_len, uint64_t o_n);
+/* export fn omx_om_abs_dev v view ulong * n ulong med_b ulong dst edit ulong * to void */
+void omx_om_abs_dev(const uint64_t *o_v, size_t o_v_len, uint64_t o_n, uint64_t o_med_b, uint64_t *o_dst, size_t o_dst_len);
+/* export fn c2_om_put16 dst edit uchar * pos ulong v ulong to void */
+void c2_om_put16(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn c2_om_put64 dst edit uchar * pos ulong v ulong to void */
+void c2_om_put64(uint8_t *o_dst, size_t o_dst_len, uint64_t o_pos, uint64_t o_v);
+/* export fn c2_om_get16 src view uchar * pos ulong to ulong */
+uint64_t c2_om_get16(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn c2_om_get64 src view uchar * pos ulong to ulong */
+uint64_t c2_om_get64(const uint8_t *o_src, size_t o_src_len, uint64_t o_pos);
+/* export fn c2_om_deps_ascending ids view uchar * n ulong to ulong */
+uint64_t c2_om_deps_ascending(const uint8_t *o_ids, size_t o_ids_len, uint64_t o_n);
+/* export fn c2_om_lrat_skip_ws p view uchar * n ulong pos ulong nl_out edit ulong 1 to ulong */
+uint64_t c2_om_lrat_skip_ws(const uint8_t *o_p, size_t o_p_len, uint64_t o_n, uint64_t o_pos, uint64_t o_nl_out[1]);
+/* export fn c2_om_lrat_rd_int p view uchar * n ulong pos ulong dst edit ulong 3 to ulong */
+uint64_t c2_om_lrat_rd_int(const uint8_t *o_p, size_t o_p_len, uint64_t o_n, uint64_t o_pos, uint64_t o_dst[3]);
+/* export fn osh_om_name_valid s view uchar * n ulong to ulong */
+uint64_t osh_om_name_valid(const uint8_t *o_s, size_t o_s_len, uint64_t o_n);
+/* export fn osh_om_check_req_hdr rec view ulong * nrec ulong nout ulong has_out ulong to ulong */
+uint64_t osh_om_check_req_hdr(const uint64_t *o_rec, size_t o_rec_len, uint64_t o_nrec, uint64_t o_nout, uint64_t o_has_out);
+/* export fn osh_om_check_cmd_reserved b view ulong * na ulong ns ulong nr ulong to ulong */
+uint64_t osh_om_check_cmd_reserved(const uint64_t *o_b, size_t o_b_len, uint64_t o_na, uint64_t o_ns, uint64_t o_nr);
 #ifdef __cplusplus
 }
 #endif
