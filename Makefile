@@ -1768,14 +1768,7 @@ bench-mixed-algebra: $(OMA_RZ_BENCH) $(OMA_RZ_SELECT)
 # phase-twin-receipt: from a clean committed tree only, copies the full
 #   receipt to evidence/MIXED_ALGEBRA/phase_twin_receipt.<sha256>.json.
 .PHONY: test-phase-twin phase-twin-receipt
-test-phase-twin: full run -> $(OUT_DIR) receipt (never into evidence/);
-#   quick run plain and under ASan+UBSan, receipts must be byte-identical;
-#   if a committed receipt exists, the full run must reproduce it (all fields
-#   except git_commit / tree_dirty / run_id / toolchain).
-# phase-twin-receipt: from a clean committed tree only, copies the full
-#   receipt to evidence/MIXED_ALGEBRA/phase_twin_receipt.<sha256>.json.
-.PHONY: test-phase-twin phase-twin-receipt
-PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c src/omega_om_units.c
+PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c
 PT_HDRS = src/algebra/phase_twin.h src/algebra/oma_z3.h src/algebra/oma_trit.h
 PT_OUT = $(OUT_DIR)/tests-algebra
 PT_TEST = $(PT_OUT)/test_phase_twin
@@ -1785,14 +1778,14 @@ PT_ENV = PT_COMMIT=$$(git rev-parse HEAD) \
 	PT_TOOLCHAIN="$$($(CC) --version | head -1)"
 PT_VOLATILE = '"(git_commit|tree_dirty|run_id|toolchain)"'
 
-$(PT_TEST): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS)
+$(PT_TEST): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS) $(OMA_BIND)
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) -lm
+	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) $(OMA_BIND) -lm
 
-$(PT_TEST_ASAN): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS)
+$(PT_TEST_ASAN): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS) $(OMA_BIND_ASAN)
 	@mkdir -p $(dir $@)
 	$(CC) $(OMA_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) -lm
+		-o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) $(OMA_BIND_ASAN) -lm
 
 test-phase-twin: $(PT_TEST) $(PT_TEST_ASAN)
 	$(PT_ENV) ./$(PT_TEST) $(PT_OUT)/phase_twin_receipt.json
