@@ -1,16 +1,20 @@
 # Omega
 
-**Serve your model. Straight to the metal.**
+![Omega logo: braided strands forming the Omega symbol above the word OMEGA](docs/img/omega-logo.png)
+
+**No more out-of-memory. A 35B model up in about a minute. Straight to the metal.**
 
 Omega is a programming language, and a compiler for it that is written in Omega itself. It compiles a model
 server into one small static file that drives the GPU directly. This is why you would want it:
 
 | What you get | What was measured | Record |
 | --- | --- | --- |
-| **No out-of-memory growth** | The server takes its memory once, at startup. The Inkling-2-Mini server holds a fixed table of 8 stream slots and no heap. In its live self-test on one NVIDIA GB10 the 9th concurrent request was answered with HTTP `503 server_busy`, and a retired slot was reused. | [om/gpu/inkling2/README.md](om/gpu/inkling2/README.md) |
+| **No more out-of-memory** | The server takes its memory once, at startup. The Inkling-2-Mini server holds a fixed table of 8 stream slots and no heap. In its live self-test on one NVIDIA GB10 the 9th concurrent request was answered with HTTP `503 server_busy`, and a retired slot was reused. | [om/gpu/inkling2/README.md](om/gpu/inkling2/README.md) |
 | **A 35B model up in about a minute** | The 34.7 GB Qwen 3.6 35B-A3B model loaded cold in 43 to 72 seconds, in three recorded windows on one GB10. | [evidence/OLLM-HELIX-CLOSED-LOOP-20261121](evidence/OLLM-HELIX-CLOSED-LOOP-20261121/README.md) |
 | **Speed on real weights** | The same 35B model decoded at 67.71 tokens per second with real weights (a 24-token run; five kernel variants produced the same 24 tokens). | [evidence/HELIX-BRAID4-RSI-JIT-20261121](evidence/HELIX-BRAID4-RSI-JIT-20261121/README.md) |
 | **One small file** | The 35B runner is one 281 KB statically linked AArch64 ELF. `ldd` reports `not a dynamic executable`. | [om/gpu/q36/README.md](om/gpu/q36/README.md) |
+
+![Four coloured strands wound into one rope](docs/img/omega-strands.svg)
 
 ## What you do not need
 
@@ -27,6 +31,8 @@ script prepared the dispatch plan beforehand on the CPU
 
 Omega does not ask you to trust one compiler binary. It grows four compilers, each from its own hand-written
 seed of about 400 bytes of machine code. The four strands must arrive at the same compiler, bit for bit.
+
+![Four seeds, the Monk, the Predator, the Trickster and the Ascetic, wind into one helix and close on one compiler, omc](docs/img/omega-four-strands.svg)
 
 | Strand | Seed | What it is for |
 | --- | --- | --- |
