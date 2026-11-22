@@ -1,0 +1,997 @@
+note SPDX-License-Identifier: Apache-2.0
+note omega_autodiff.om -- Pure seeded OM-2 M21 reverse-mode autodiff tape over M20 OMEGA_TENSOR.
+note Composed with gradient_shape.om, tensor_shape.om, tensor_ops.om, tg_sha256.om,
+note omega_tensor_cpu.om, and omega_tensor.om.
+
+const AD_NONE ulong 0xffffffff
+const AD_MAX_NODES ulong 256
+const AD_SCRATCH_MAX ulong 12288
+
+const AD_OK long 0
+const AD_ERR_BAD_ARGS long -101
+const AD_ERR_TAPE_FULL long -102
+const AD_ERR_SHAPE long -103
+const AD_ERR_STATE long -104
+const AD_ERR_NO_GRAD long -105
+const AD_ERR_SCRATCH long -106
+const AD_ERR_COUNT long -107
+
+const AD_LEAF ulong 0
+const AD_ADD ulong 1
+const AD_SUB ulong 2
+const AD_MUL ulong 3
+const AD_DIV ulong 4
+const AD_MAX ulong 5
+const AD_SQRT ulong 6
+const AD_MATMUL ulong 7
+const AD_TRANSPOSE ulong 8
+const AD_BROADCAST ulong 9
+const AD_SUM ulong 10
+const AD_MEAN ulong 11
+const AD_OP_COUNT ulong 12
+
+global ad_tape_meta ulong 6
+note ad_tape_meta: 0=cap, 1=count, 2=scratch_cap, 3=backward_done, 4=failed
+global ad_nodes ulong 3072
+note per node (stride 12):
+note   0=op, 1=in0, 2=in1, 3=axis, 4=keepdims, 5=req_grad,
+note   6=owns_val, 7=has_grad, 8=val_s, 9=val_g, 10=grad_s, 11=grad_g
+global ad_scratch f32 12288
+
+fn ad_tape_init cap ulong scratch_cap ulong to long
+  if or eq cap 0 or gt cap AD_MAX_NODES gt scratch_cap AD_SCRATCH_MAX
+    ret AD_ERR_BAD_ARGS
+  end
+  put ad_tape_meta 0 cap
+  put ad_tape_meta 1 0
+  put ad_tape_meta 2 scratch_cap
+  put ad_tape_meta 3 0
+  put ad_tape_meta 4 0
+  ret AD_OK
+end
+
+fn ad_tape_release to void
+  cnt = get ad_tape_meta 1
+  for k ulong cnt
+    i = sub sub cnt 1 k
+    nb = mul i 12
+    if ne get ad_nodes add nb 7 0
+      r1 = ot_release get ad_nodes add nb 10 get ad_nodes add nb 11
+      put ad_nodes add nb 7 0
+    end
+    if ne get ad_nodes add nb 6 0
+      r2 = ot_release get ad_nodes add nb 8 get ad_nodes add nb 9
+      put ad_nodes add nb 6 0
+    end
+  end
+  put ad_tape_meta 1 0
+  put ad_tape_meta 3 0
+  put ad_tape_meta 4 0
+end
+
+fn ad_can_record to long
+  if eq get ad_tape_meta 0 0
+    ret AD_ERR_BAD_ARGS
+  end
+  if or ne get ad_tape_meta 3 0 ne get ad_tape_meta 4 0
+    ret AD_ERR_STATE
+  end
+  if ge get ad_tape_meta 1 get ad_tape_meta 0
+    ret AD_ERR_TAPE_FULL
+  end
+  ret AD_OK
+end
+
+fn ad_push op ulong in0 ulong in1 ulong axis_kp ulong flags ulong val_h view ulong 2 to ulong
+  id = get ad_tape_meta 1
+  nb = mul id 12
+  put ad_nodes nb op
+  put ad_nodes add nb 1 in0
+  put ad_nodes add nb 2 in1
+  put ad_nodes add nb 3 div axis_kp 2
+  put ad_nodes add nb 4 rem axis_kp 2
+  put ad_nodes add nb 5 rem flags 2
+  put ad_nodes add nb 6 div flags 2
+  put ad_nodes add nb 7 0
+  put ad_nodes add nb 8 get val_h 0
+  put ad_nodes add nb 9 get val_h 1
+  put ad_nodes add nb 10 0
+  put ad_nodes add nb 11 0
+  put ad_tape_meta 1 add id 1
+  ret id
+end
+
+fn ad_leaf val_s ulong val_g ulong req_grad ulong id_out edit ulong 1 to long
+  rc = ad_can_record
+  if ne rc AD_OK
+    ret rc
+  end
+  rc = ot_ts_check val_s val_g
+  if ne rc OT_OK
+    ret rc
+  end
+  if ne get ot_ts_meta add mul val_s 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  vh = new ulong 2 0
+  put vh 0 val_s
+  put vh 1 val_g
+  rg = ulong 0
+  if ne req_grad 0
+    rg = 1
+  end
+  put id_out 0 ad_push AD_LEAF AD_NONE AD_NONE 0 rg vh
+  ret AD_OK
+end
+
+fn ad_record_op op ulong a ulong b ulong axis_kp ulong vh view ulong 2 id_out edit ulong 1 to long
+  rg = get ad_nodes add mul a 12 5
+  if ne b AD_NONE
+    if ne get ad_nodes add mul b 12 5 0
+      rg = 1
+    end
+  end
+  put id_out 0 ad_push op a b axis_kp add 2 rg vh
+  ret AD_OK
+end
+
+fn ad_call_ot_binary bop ulong a ulong b ulong vh edit ulong 2 to long
+  nba = mul a 12
+  nbb = mul b 12
+  sa = get ad_nodes add nba 8
+  ga = get ad_nodes add nba 9
+  sb = get ad_nodes add nbb 8
+  gb = get ad_nodes add nbb 9
+  ret ot_binary bop sa ga sb gb vh
+end
+
+fn ad_binary op ulong a ulong b ulong id_out edit ulong 1 to long
+  rc = ad_can_record
+  if ne rc AD_OK
+    ret rc
+  end
+  cnt = get ad_tape_meta 1
+  if or ge a cnt ge b cnt
+    ret AD_ERR_BAD_ARGS
+  end
+  bop = ulong 0
+  if eq op AD_ADD
+    bop = OT_TB_ADD
+  else
+    if eq op AD_SUB
+      bop = OT_TB_SUB
+    else
+      if eq op AD_MUL
+        bop = OT_TB_MUL
+      else
+        if eq op AD_DIV
+          bop = OT_TB_DIV
+        else
+          if eq op AD_MAX
+            bop = OT_TB_MAX
+          else
+            ret AD_ERR_BAD_ARGS
+          end
+        end
+      end
+    end
+  end
+  vh = new ulong 2 0
+  rc = ad_call_ot_binary bop a b vh
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_record_op op a b 0 vh id_out
+end
+
+fn ad_sqrt a ulong id_out edit ulong 1 to long
+  rc = ad_can_record
+  if ne rc AD_OK
+    ret rc
+  end
+  if ge a get ad_tape_meta 1
+    ret AD_ERR_BAD_ARGS
+  end
+  vh = new ulong 2 0
+  nba = mul a 12
+  rc = ot_unary OT_TU_SQRT get ad_nodes add nba 8 get ad_nodes add nba 9 vh
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_record_op AD_SQRT a AD_NONE 0 vh id_out
+end
+
+fn ad_call_ot_matmul a ulong b ulong vh edit ulong 2 to long
+  nba = mul a 12
+  nbb = mul b 12
+  sa = get ad_nodes add nba 8
+  ga = get ad_nodes add nba 9
+  sb = get ad_nodes add nbb 8
+  gb = get ad_nodes add nbb 9
+  ret ot_matmul sa ga sb gb vh
+end
+
+fn ad_matmul a ulong b ulong id_out edit ulong 1 to long
+  rc = ad_can_record
+  if ne rc AD_OK
+    ret rc
+  end
+  cnt = get ad_tape_meta 1
+  if or ge a cnt ge b cnt
+    ret AD_ERR_BAD_ARGS
+  end
+  vh = new ulong 2 0
+  rc = ad_call_ot_matmul a b vh
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_record_op AD_MATMUL a b 0 vh id_out
+end
+
+fn ad_transpose a ulong id_out edit ulong 1 to long
+  rc = ad_can_record
+  if ne rc AD_OK
+    ret rc
+  end
+  if ge a get ad_tape_meta 1
+    ret AD_ERR_BAD_ARGS
+  end
+  v = new ulong 2 0
+  y = new ulong 2 0
+  nba = mul a 12
+  rc = ot_transpose get ad_nodes add nba 8 get ad_nodes add nba 9 v
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_contiguous get v 0 get v 1 y
+  rr = ot_release get v 0 get v 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_record_op AD_TRANSPOSE a AD_NONE 0 y id_out
+end
+
+fn ad_broadcast a ulong rank ulong shape view ulong 8 id_out edit ulong 1 to long
+  rc = ad_can_record
+  if ne rc AD_OK
+    ret rc
+  end
+  if ge a get ad_tape_meta 1
+    ret AD_ERR_BAD_ARGS
+  end
+  v = new ulong 2 0
+  y = new ulong 2 0
+  nba = mul a 12
+  rc = ot_broadcast_to get ad_nodes add nba 8 get ad_nodes add nba 9 rank shape v
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_contiguous get v 0 get v 1 y
+  rr = ot_release get v 0 get v 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_record_op AD_BROADCAST a AD_NONE 0 y id_out
+end
+
+fn ad_reduce op ulong a ulong axis ulong keepdims ulong id_out edit ulong 1 to long
+  rc = ad_can_record
+  if ne rc AD_OK
+    ret rc
+  end
+  if ge a get ad_tape_meta 1
+    ret AD_ERR_BAD_ARGS
+  end
+  rop = ulong 0
+  if eq op AD_SUM
+    rop = OT_TR_SUM
+  else
+    if eq op AD_MEAN
+      rop = OT_TR_MEAN
+    else
+      ret AD_ERR_BAD_ARGS
+    end
+  end
+  y = new ulong 2 0
+  nba = mul a 12
+  rc = ot_reduce rop get ad_nodes add nba 8 get ad_nodes add nba 9 axis keepdims y
+  if ne rc OT_OK
+    ret rc
+  end
+  kp = ulong 0
+  if ne keepdims 0
+    kp = 1
+  end
+  ret ad_record_op op a AD_NONE add mul axis 2 kp y id_out
+end
+
+fn ad_scalar val f32 out_h edit ulong 2 to long
+  sh = new ulong 8 1
+  d = new f32 1 0.0f32
+  put d 0 val
+  ret ot_from_f32 0 sh d out_h
+end
+
+fn ad_scale s ulong g ulong k f32 out_h edit ulong 2 to long
+  c = new ulong 2 0
+  rc = ad_scalar k c
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_binary OT_TB_MUL s g get c 0 get c 1 out_h
+  rr = ot_release get c 0 get c 1
+  ret rc
+end
+
+fn ad_same_ts_shape sa ulong sb ulong to ulong
+  ra = get ot_ts_meta add mul sa 10 4
+  rb = get ot_ts_meta add mul sb 10 4
+  sha = new ulong 8 0
+  shb = new ulong 8 0
+  for d ulong ra
+    put sha d get ot_ts_shape add mul sa 8 d
+  end
+  for d ulong rb
+    put shb d get ot_ts_shape add mul sb 8 d
+  end
+  ret ad_same_shape part sha 0 ra part shb 0 rb
+end
+
+fn ad_unbroadcast_plan fs ulong target_s ulong steps edit uchar 8 to long
+  cr = get ot_ts_meta add mul fs 10 4
+  tr = get ot_ts_meta add mul target_s 10 4
+  csh = new ulong 8 0
+  tsh = new ulong 8 0
+  for d ulong cr
+    put csh d get ot_ts_shape add mul fs 8 d
+  end
+  for d ulong tr
+    put tsh d get ot_ts_shape add mul target_s 8 d
+  end
+  ret ad_unbroadcast_steps part csh 0 cr part tsh 0 tr steps
+end
+
+fn ad_unbroadcast_step cs ulong cg ulong st ulong nh edit ulong 2 to long
+  rc = ot_reduce OT_TR_SUM cs cg div st 2 rem st 2 nh
+  rr = ot_release cs cg
+  ret rc
+end
+
+fn ad_unbroadcast_run fs ulong fg ulong cnt ulong steps view uchar 8 out_h edit ulong 2 to long
+  cs = fs
+  cg = fg
+  nh = new ulong 2 0
+  for i ulong cnt
+    rc = ad_unbroadcast_step cs cg ulong get steps i nh
+    if ne rc OT_OK
+      ret rc
+    end
+    cs = get nh 0
+    cg = get nh 1
+  end
+  put out_h 0 cs
+  put out_h 1 cg
+  ret AD_OK
+end
+
+fn ad_unbroadcast fs ulong fg ulong target_s ulong out_h edit ulong 2 to long
+  rc = ot_ts_check fs fg
+  if ne rc OT_OK
+    rr = ot_release fs fg
+    ret rc
+  end
+  steps = new uchar 8 0
+  cnt = ad_unbroadcast_plan fs target_s steps
+  if lt cnt 0
+    rr = ot_release fs fg
+    ret AD_ERR_SHAPE
+  end
+  ret ad_unbroadcast_run fs fg ulong cnt steps out_h
+end
+
+fn ad_accumulate idx ulong cs ulong cg ulong to long
+  nb = mul idx 12
+  vs = get ad_nodes add nb 8
+  if eq ad_same_ts_shape vs cs 0
+    rr = ot_release cs cg
+    ret AD_ERR_SHAPE
+  end
+  if eq get ad_nodes add nb 7 0
+    put ad_nodes add nb 10 cs
+    put ad_nodes add nb 11 cg
+    put ad_nodes add nb 7 1
+    ret AD_OK
+  end
+  sum_h = new ulong 2 0
+  rc = ot_binary OT_TB_ADD get ad_nodes add nb 10 get ad_nodes add nb 11 cs cg sum_h
+  rr = ot_release cs cg
+  if ne rc OT_OK
+    ret rc
+  end
+  rr = ot_release get ad_nodes add nb 10 get ad_nodes add nb 11
+  put ad_nodes add nb 10 get sum_h 0
+  put ad_nodes add nb 11 get sum_h 1
+  ret AD_OK
+end
+
+fn ad_contribute idx ulong fs ulong fg ulong to long
+  nb = mul idx 12
+  if eq get ad_nodes add nb 5 0
+    rr = ot_release fs fg
+    ret AD_OK
+  end
+  u = new ulong 2 0
+  rc = ad_unbroadcast fs fg get ad_nodes add nb 8 u
+  if ne rc AD_OK
+    ret rc
+  end
+  ret ad_accumulate idx get u 0 get u 1
+end
+
+fn ad_wants idx ulong to bool
+  if eq idx AD_NONE
+    ret false
+  end
+  ret ne get ad_nodes add mul idx 12 5 0
+end
+
+fn ad_max_routes_a a f32 b f32 to bool
+  if ot_is_nan bitcast uint a
+    ret false
+  end
+  if ot_is_nan bitcast uint b
+    ret true
+  end
+  ret gt a b
+end
+
+fn ad_scratch_store dst_off ulong m ulong tmp view f32 4096 to void
+  for i ulong m bound 4097
+    put ad_scratch add dst_off i get tmp i
+  end
+end
+
+fn ad_bwd_max_load in_id ulong yr ulong ysh view ulong 8 dst_off ulong m ulong to long
+  v = new ulong 2 0
+  nb = mul in_id 12
+  rc = ot_broadcast_to get ad_nodes add nb 8 get ad_nodes add nb 9 yr ysh v
+  if ne rc OT_OK
+    ret rc
+  end
+  tmp = new f32 4096 0.0f32
+  rc = ot_read_f32 get v 0 get v 1 part tmp 0 m
+  rr = ot_release get v 0 get v 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ad_scratch_store dst_off m tmp
+  ret AD_OK
+end
+
+fn ad_bwd_max_emit in_id ulong yr ulong ysh view ulong 8 src_off ulong m ulong to long
+  if not ad_wants in_id
+    ret AD_OK
+  end
+  tmp = new f32 4096 0.0f32
+  for i ulong m bound 4097
+    put tmp i get ad_scratch add src_off i
+  end
+  fh = new ulong 2 0
+  rc = ot_from_f32 yr ysh part tmp 0 m fh
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_contribute in_id get fh 0 get fh 1
+end
+
+fn ad_bwd_max_route nb ulong m ulong to long
+  tmp = new f32 4096 0.0f32
+  rc = ot_read_f32 get ad_nodes add nb 10 get ad_nodes add nb 11 part tmp 0 m
+  if ne rc OT_OK
+    ret rc
+  end
+  for i ulong m bound 4097
+    to_a = ad_max_routes_a get ad_scratch i get ad_scratch add m i
+    g = get tmp i
+    if to_a
+      put ad_scratch i g
+      put ad_scratch add m i 0.0f32
+    else
+      put ad_scratch i 0.0f32
+      put ad_scratch add m i g
+    end
+  end
+  ret AD_OK
+end
+
+fn ad_bwd_max idx ulong to long
+  nb = mul idx 12
+  ys = get ad_nodes add nb 8
+  yr = get ot_ts_meta add mul ys 10 4
+  m = get ot_ts_meta add mul ys 10 6
+  if gt mul m 3 get ad_tape_meta 2
+    ret AD_ERR_SCRATCH
+  end
+  ysh = new ulong 8 0
+  for d ulong yr
+    put ysh d get ot_ts_shape add mul ys 8 d
+  end
+  rc = ad_bwd_max_load get ad_nodes add nb 1 yr ysh 0 m
+  if ne rc AD_OK
+    ret rc
+  end
+  rc = ad_bwd_max_load get ad_nodes add nb 2 yr ysh m m
+  if ne rc AD_OK
+    ret rc
+  end
+  rc = ad_bwd_max_route nb m
+  if ne rc AD_OK
+    ret rc
+  end
+  rc = ad_bwd_max_emit get ad_nodes add nb 1 yr ysh 0 m
+  if ne rc AD_OK
+    ret rc
+  end
+  ret ad_bwd_max_emit get ad_nodes add nb 2 yr ysh m m
+end
+
+fn ad_bwd_reduce_div in0 ulong c2 view ulong 2 axlen ulong to long
+  nt = new ulong 2 0
+  rc = ad_scalar f32 axlen nt
+  if ne rc OT_OK
+    rr = ot_release get c2 0 get c2 1
+    ret rc
+  end
+  c = new ulong 2 0
+  rc = ot_binary OT_TB_DIV get c2 0 get c2 1 get nt 0 get nt 1 c
+  rr = ot_release get nt 0 get nt 1
+  rr = ot_release get c2 0 get c2 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_contribute in0 get c 0 get c 1
+end
+
+fn ad_bwd_reduce_expand nb ulong ar ulong ash view ulong 8 ksh view ulong 8 c2 edit ulong 2 to long
+  r = new ulong 2 0
+  b = new ulong 2 0
+  rc = ot_reshape get ad_nodes add nb 10 get ad_nodes add nb 11 ar ksh r
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_broadcast_to get r 0 get r 1 ar ash b
+  if ne rc OT_OK
+    rr = ot_release get r 0 get r 1
+    ret rc
+  end
+  rc = ot_contiguous get b 0 get b 1 c2
+  rr = ot_release get b 0 get b 1
+  rr = ot_release get r 0 get r 1
+  ret rc
+end
+
+fn ad_bwd_reduce idx ulong to long
+  nb = mul idx 12
+  in0 = get ad_nodes add nb 1
+  if not ad_wants in0
+    ret AD_OK
+  end
+  as = get ad_nodes add mul in0 12 8
+  ar = get ot_ts_meta add mul as 10 4
+  ash = new ulong 8 0
+  ksh = new ulong 8 0
+  for d ulong ar
+    put ash d get ot_ts_shape add mul as 8 d
+  end
+  ax = get ad_nodes add nb 3
+  ad_restore_axis part ash 0 ar ax part ksh 0 ar
+  c2 = new ulong 2 0
+  rc = ad_bwd_reduce_expand nb ar ash ksh c2
+  if ne rc OT_OK
+    ret rc
+  end
+  if eq get ad_nodes nb AD_SUM
+    ret ad_contribute in0 get c2 0 get c2 1
+  end
+  ret ad_bwd_reduce_div in0 c2 get ash ax
+end
+
+fn ad_bwd_div_rhs nb ulong in1 ulong gs ulong gg ulong bs ulong bg ulong to long
+  tmp = new ulong 2 0
+  c2 = new ulong 2 0
+  c = new ulong 2 0
+  ys = get ad_nodes add nb 8
+  yg = get ad_nodes add nb 9
+  rc = ot_binary OT_TB_DIV ys yg bs bg tmp
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_binary OT_TB_MUL gs gg get tmp 0 get tmp 1 c2
+  rr = ot_release get tmp 0 get tmp 1
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ad_scale get c2 0 get c2 1 -1.0f32 c
+  rr = ot_release get c2 0 get c2 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_contribute in1 get c 0 get c 1
+end
+
+fn ad_bwd_div idx ulong to long
+  nb = mul idx 12
+  gs = get ad_nodes add nb 10
+  gg = get ad_nodes add nb 11
+  in0 = get ad_nodes add nb 1
+  in1 = get ad_nodes add nb 2
+  nbb = mul in1 12
+  bs = get ad_nodes add nbb 8
+  bg = get ad_nodes add nbb 9
+  c = new ulong 2 0
+  if ad_wants in0
+    rc = ot_binary OT_TB_DIV gs gg bs bg c
+    if ne rc OT_OK
+      ret rc
+    end
+    rc = ad_contribute in0 get c 0 get c 1
+    if ne rc AD_OK
+      ret rc
+    end
+  end
+  if ad_wants in1
+    ret ad_bwd_div_rhs nb in1 gs gg bs bg
+  end
+  ret AD_OK
+end
+
+fn ad_bwd_matmul idx ulong to long
+  nb = mul idx 12
+  gs = get ad_nodes add nb 10
+  gg = get ad_nodes add nb 11
+  in0 = get ad_nodes add nb 1
+  in1 = get ad_nodes add nb 2
+  tmp = new ulong 2 0
+  c = new ulong 2 0
+  if ad_wants in0
+    nbb = mul in1 12
+    rc = ot_transpose get ad_nodes add nbb 8 get ad_nodes add nbb 9 tmp
+    if ne rc OT_OK
+      ret rc
+    end
+    rc = ot_matmul gs gg get tmp 0 get tmp 1 c
+    rr = ot_release get tmp 0 get tmp 1
+    if ne rc OT_OK
+      ret rc
+    end
+    rc = ad_contribute in0 get c 0 get c 1
+    if ne rc AD_OK
+      ret rc
+    end
+  end
+  if ad_wants in1
+    nba = mul in0 12
+    rc = ot_transpose get ad_nodes add nba 8 get ad_nodes add nba 9 tmp
+    if ne rc OT_OK
+      ret rc
+    end
+    rc = ot_matmul get tmp 0 get tmp 1 gs gg c
+    rr = ot_release get tmp 0 get tmp 1
+    if ne rc OT_OK
+      ret rc
+    end
+    ret ad_contribute in1 get c 0 get c 1
+  end
+  ret AD_OK
+end
+
+fn ad_bwd_mul_side target ulong other ulong gs ulong gg ulong to long
+  if not ad_wants target
+    ret AD_OK
+  end
+  nbo = mul other 12
+  os = get ad_nodes add nbo 8
+  og = get ad_nodes add nbo 9
+  c = new ulong 2 0
+  rc = ot_binary OT_TB_MUL gs gg os og c
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_contribute target get c 0 get c 1
+end
+
+fn ad_bwd_sqrt nb ulong in0 ulong gs ulong gg ulong to long
+  if not ad_wants in0
+    ret AD_OK
+  end
+  tmp = new ulong 2 0
+  c = new ulong 2 0
+  vs = get ad_nodes add nb 8
+  vg = get ad_nodes add nb 9
+  rc = ot_binary OT_TB_ADD vs vg vs vg tmp
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_binary OT_TB_DIV gs gg get tmp 0 get tmp 1 c
+  rr = ot_release get tmp 0 get tmp 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_contribute in0 get c 0 get c 1
+end
+
+fn ad_bwd_node idx ulong to long
+  nb = mul idx 12
+  op = get ad_nodes nb
+  if eq op AD_LEAF
+    ret AD_OK
+  end
+  gs = get ad_nodes add nb 10
+  gg = get ad_nodes add nb 11
+  in0 = get ad_nodes add nb 1
+  in1 = get ad_nodes add nb 2
+  c = new ulong 2 0
+  tmp = new ulong 2 0
+  if or eq op AD_ADD eq op AD_SUB
+    if ad_wants in0
+      rc = ot_contiguous gs gg c
+      if ne rc OT_OK
+        ret rc
+      end
+      rc = ad_contribute in0 get c 0 get c 1
+      if ne rc AD_OK
+        ret rc
+      end
+    end
+    if ad_wants in1
+      rc = OT_OK
+      if eq op AD_ADD
+        rc = ot_contiguous gs gg c
+      else
+        rc = ad_scale gs gg -1.0f32 c
+      end
+      if ne rc OT_OK
+        ret rc
+      end
+      ret ad_contribute in1 get c 0 get c 1
+    end
+    ret AD_OK
+  end
+  if eq op AD_MUL
+    rc = ad_bwd_mul_side in0 in1 gs gg
+    if ne rc AD_OK
+      ret rc
+    end
+    ret ad_bwd_mul_side in1 in0 gs gg
+  end
+  if eq op AD_DIV
+    ret ad_bwd_div idx
+  end
+  if eq op AD_MAX
+    ret ad_bwd_max idx
+  end
+  if eq op AD_SQRT
+    ret ad_bwd_sqrt nb in0 gs gg
+  end
+  if eq op AD_MATMUL
+    ret ad_bwd_matmul idx
+  end
+  if eq op AD_TRANSPOSE
+    if not ad_wants in0
+      ret AD_OK
+    end
+    rc = ot_transpose gs gg tmp
+    if ne rc OT_OK
+      ret rc
+    end
+    rc = ot_contiguous get tmp 0 get tmp 1 c
+    rr = ot_release get tmp 0 get tmp 1
+    if ne rc OT_OK
+      ret rc
+    end
+    ret ad_contribute in0 get c 0 get c 1
+  end
+  if eq op AD_BROADCAST
+    if not ad_wants in0
+      ret AD_OK
+    end
+    rc = ot_contiguous gs gg c
+    if ne rc OT_OK
+      ret rc
+    end
+    ret ad_contribute in0 get c 0 get c 1
+  end
+  if or eq op AD_SUM eq op AD_MEAN
+    ret ad_bwd_reduce idx
+  end
+  ret AD_ERR_BAD_ARGS
+end
+
+fn ad_scratch_need to ulong
+  cnt = get ad_tape_meta 1
+  need = ulong 0
+  for i ulong cnt
+    nb = mul i 12
+    if eq get ad_nodes nb AD_MAX
+      ys = get ad_nodes add nb 8
+      m = mul get ot_ts_meta add mul ys 10 6 3
+      if gt m need
+        need = m
+      end
+    end
+  end
+  ret need
+end
+
+fn ad_begin_backward root ulong to long
+  if eq get ad_tape_meta 0 0
+    ret AD_ERR_BAD_ARGS
+  end
+  if or ne get ad_tape_meta 3 0 ne get ad_tape_meta 4 0
+    ret AD_ERR_STATE
+  end
+  if ge root get ad_tape_meta 1
+    ret AD_ERR_BAD_ARGS
+  end
+  if eq get ad_nodes add mul root 12 5 0
+    ret AD_ERR_NO_GRAD
+  end
+  if gt ad_scratch_need get ad_tape_meta 2
+    ret AD_ERR_SCRATCH
+  end
+  ret AD_OK
+end
+
+fn ad_bwd_visit i ulong to long
+  nib = mul i 12
+  if eq get ad_nodes add nib 7 0
+    ret AD_OK
+  end
+  if eq get ad_nodes nib AD_LEAF
+    ret AD_OK
+  end
+  ret ad_bwd_node i
+end
+
+fn ad_finish_backward root ulong ss ulong sg ulong to long
+  nb = mul root 12
+  put ad_nodes add nb 10 ss
+  put ad_nodes add nb 11 sg
+  put ad_nodes add nb 7 1
+  put ad_tape_meta 3 1
+  for k ulong add root 1
+    rc = ad_bwd_visit sub root k
+    if ne rc AD_OK
+      put ad_tape_meta 4 1
+      ret rc
+    end
+  end
+  ret AD_OK
+end
+
+fn ad_backward root ulong to long
+  rc = ad_begin_backward root
+  if ne rc AD_OK
+    ret rc
+  end
+  rs = get ad_nodes add mul root 12 8
+  if ne get ot_ts_meta add mul rs 10 6 1
+    ret AD_ERR_SHAPE
+  end
+  rr = get ot_ts_meta add mul rs 10 4
+  rsh = new ulong 8 0
+  for d ulong rr
+    put rsh d get ot_ts_shape add mul rs 8 d
+  end
+  one = new f32 1 1.0f32
+  sh = new ulong 2 0
+  rc = ot_from_f32 rr rsh one sh
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_finish_backward root get sh 0 get sh 1
+end
+
+fn ad_backward_seed root ulong seed_s ulong seed_g ulong to long
+  rc = ad_begin_backward root
+  if ne rc AD_OK
+    ret rc
+  end
+  rc = ot_ts_check seed_s seed_g
+  if ne rc OT_OK
+    ret rc
+  end
+  if ne get ot_ts_meta add mul seed_s 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  rs = get ad_nodes add mul root 12 8
+  if eq ad_same_ts_shape rs seed_s 0
+    ret AD_ERR_SHAPE
+  end
+  sh = new ulong 2 0
+  rc = ot_contiguous seed_s seed_g sh
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_finish_backward root get sh 0 get sh 1
+end
+
+fn ad_grad id ulong out_h edit ulong 2 to long
+  if ge id get ad_tape_meta 1
+    ret AD_ERR_BAD_ARGS
+  end
+  if ne get ad_tape_meta 4 0
+    ret AD_ERR_STATE
+  end
+  nb = mul id 12
+  if eq get ad_nodes add nb 7 0
+    ret AD_ERR_NO_GRAD
+  end
+  put out_h 0 get ad_nodes add nb 10
+  put out_h 1 get ad_nodes add nb 11
+  ret AD_OK
+end
+
+fn ad_grad_read_f32 id ulong dst edit f32 * to long
+  gh = new ulong 2 0
+  rc = ad_grad id gh
+  if ne rc AD_OK
+    ret rc
+  end
+  el = get ot_ts_meta add mul get gh 0 10 6
+  if ne el len dst
+    ret AD_ERR_COUNT
+  end
+  ret ot_read_f32 get gh 0 get gh 1 dst
+end
+
+fn ad_grads_total ids view ulong * to long
+  n = len ids
+  gh = new ulong 2 0
+  total = ulong 0
+  for k ulong n
+    rc = ad_grad get ids k gh
+    if ne rc AD_OK
+      ret rc
+    end
+    total = add total get ot_ts_meta add mul get gh 0 10 6
+  end
+  ret long total
+end
+
+fn ad_grad_copy_at id ulong dst edit f32 * off ulong to long
+  gh = new ulong 2 0
+  rc = ad_grad id gh
+  if ne rc AD_OK
+    ret rc
+  end
+  el = get ot_ts_meta add mul get gh 0 10 6
+  rc = ot_read_f32 get gh 0 get gh 1 part dst off el
+  if ne rc OT_OK
+    ret rc
+  end
+  ret long el
+end
+
+fn ad_grads_flatten ids view ulong * dst edit f32 * to long
+  n = len ids
+  if eq n 0
+    ret AD_ERR_BAD_ARGS
+  end
+  tot = ad_grads_total ids
+  if lt tot 0
+    ret tot
+  end
+  if ne ulong tot len dst
+    ret AD_ERR_COUNT
+  end
+  off = ulong 0
+  for k ulong n
+    el = ad_grad_copy_at get ids k dst off
+    if lt el 0
+      ret el
+    end
+    off = add off ulong el
+  end
+  ret AD_OK
+end

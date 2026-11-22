@@ -37,19 +37,18 @@ TENSOR_HOOK_SYMS = omega_tensor_test_set_storage_generation omega_tensor_store_t
 TENSOR_STORE_SRCS = src/tensor/omega_tensor_store.c
 TENSOR_STORE_HDRS = src/tensor/omega_tensor_store.h
 
-$(OUT_DIR)/test_omega_tensor: tests/test_omega_tensor.c $(TENSOR_SRCS) $(TENSOR_DEPS) $(TENSOR_HDRS)
-	@mkdir -p $(OUT_DIR)
-	gcc $(TENSOR_CFLAGS) $(TENSOR_TEST_FLAGS) -O2 -o $@ tests/test_omega_tensor.c $(TENSOR_SRCS) $(TENSOR_DEPS)
+TENSOR_OMC ?= seed/out/omc
+TENSOR_OM_CORE = src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train/tg_sha256.om \
+	src/tensor/omega_tensor_cpu.om src/tensor/omega_tensor_gb10.om src/tensor/omega_tensor.om
+TENSOR_STORE_OM_SRCS = src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train/tg_sha256.om \
+	src/tensor/omega_tensor_cpu.om src/tensor/omega_tensor.om src/tensor/omega_tensor_store.om
 
-$(OUT_DIR)/test_omega_tensor_asan: tests/test_omega_tensor.c $(TENSOR_SRCS) $(TENSOR_DEPS) $(TENSOR_HDRS)
+$(OUT_DIR)/test_omega_tensor: src/tensor/test_tensor.om $(TENSOR_OM_CORE) $(TENSOR_OMC)
 	@mkdir -p $(OUT_DIR)
-	gcc $(TENSOR_CFLAGS) $(TENSOR_TEST_FLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/test_omega_tensor.c $(TENSOR_SRCS) $(TENSOR_DEPS)
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TENSOR_OM_CORE) src/tensor/test_tensor.om) | $(TENSOR_OMC) > $@ && chmod +x $@
 
-test-tensor: $(OUT_DIR)/test_omega_tensor $(OUT_DIR)/test_omega_tensor_asan
+test-tensor: $(OUT_DIR)/test_omega_tensor
 	./$(OUT_DIR)/test_omega_tensor
-	./$(OUT_DIR)/test_omega_tensor_asan
-	$(MAKE) --no-print-directory test-tensor-no-hooks
 
 # Default (library) build of the tensor sources: no OMEGA_TENSOR_TEST_HOOKS.
 # Fails if any test-only hook symbol is defined or referenced in the objects.
@@ -84,22 +83,13 @@ test-m20-receipt:
 # crafted journals. Plain and ASan/UBSan, then test-tensor-no-hooks. Writes
 # only under $TMPDIR (default /tmp). Its mutants run in test-tensor-mutations.
 
-$(OUT_DIR)/test_omega_tensor_store: tests/test_omega_tensor_store.c $(TENSOR_STORE_SRCS) $(TENSOR_SRCS) $(TENSOR_DEPS) \
-		$(TENSOR_HDRS) $(TENSOR_STORE_HDRS)
+$(OUT_DIR)/test_omega_tensor_store: src/tensor/test_tensor_store.om $(TENSOR_STORE_OM_SRCS) $(TENSOR_OMC)
 	@mkdir -p $(OUT_DIR)
-	gcc $(TENSOR_CFLAGS) $(TENSOR_TEST_FLAGS) -O2 -o $@ tests/test_omega_tensor_store.c $(TENSOR_STORE_SRCS) \
-		$(TENSOR_SRCS) $(TENSOR_DEPS)
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TENSOR_STORE_OM_SRCS) src/tensor/test_tensor_store.om) | $(TENSOR_OMC) > $@ && chmod +x $@
 
-$(OUT_DIR)/test_omega_tensor_store_asan: tests/test_omega_tensor_store.c $(TENSOR_STORE_SRCS) $(TENSOR_SRCS) \
-		$(TENSOR_DEPS) $(TENSOR_HDRS) $(TENSOR_STORE_HDRS)
-	@mkdir -p $(OUT_DIR)
-	gcc $(TENSOR_CFLAGS) $(TENSOR_TEST_FLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/test_omega_tensor_store.c $(TENSOR_STORE_SRCS) $(TENSOR_SRCS) $(TENSOR_DEPS)
-
-test-tensor-store: $(OUT_DIR)/test_omega_tensor_store $(OUT_DIR)/test_omega_tensor_store_asan
-	./$(OUT_DIR)/test_omega_tensor_store
-	./$(OUT_DIR)/test_omega_tensor_store_asan
-	$(MAKE) --no-print-directory test-tensor-no-hooks
+test-tensor-store: $(OUT_DIR)/test_omega_tensor_store
+	@rm -rf $(OUT_DIR)/tensor_store_scratch && mkdir -p $(OUT_DIR)/tensor_store_scratch
+	./$(OUT_DIR)/test_omega_tensor_store $(OUT_DIR)/tensor_store_scratch
 
 # ---- GB10 realization table (M20 cut gb10) ---------------------------------
 # test-tensor-gb10-host  PHYSICS_DIR=<physics checkout at physics.lock>:

@@ -1,0 +1,152 @@
+note SPDX-License-Identifier: Apache-2.0
+note tg_sgd.om -- Pure seeded OM-2 float32 SGD over a tg_store shadow.
+note Composed with sgd_update.om and tg_store.om.
+
+const TG_OP_SGD ulong 0x00444753
+
+global tg_sgd_grad uint 1048576
+
+fn tg_load_u32_sh slot ulong is_opt ulong idx ulong to uint
+  p = mul idx 4
+  u = uint 0
+  if eq slot 0
+    if eq is_opt 0
+      u = uint get tg_sh0_params p
+      u = or u shl uint get tg_sh0_params add p 1 8
+      u = or u shl uint get tg_sh0_params add p 2 16
+      u = or u shl uint get tg_sh0_params add p 3 24
+      ret u
+    end
+    u = uint get tg_sh0_opt p
+    u = or u shl uint get tg_sh0_opt add p 1 8
+    u = or u shl uint get tg_sh0_opt add p 2 16
+    u = or u shl uint get tg_sh0_opt add p 3 24
+    ret u
+  end
+  if eq is_opt 0
+    u = uint get tg_sh1_params p
+    u = or u shl uint get tg_sh1_params add p 1 8
+    u = or u shl uint get tg_sh1_params add p 2 16
+    u = or u shl uint get tg_sh1_params add p 3 24
+    ret u
+  end
+  u = uint get tg_sh1_opt p
+  u = or u shl uint get tg_sh1_opt add p 1 8
+  u = or u shl uint get tg_sh1_opt add p 2 16
+  u = or u shl uint get tg_sh1_opt add p 3 24
+  ret u
+end
+
+fn tg_store_u32_sh slot ulong is_opt ulong idx ulong v uint to void
+  p = mul idx 4
+  if eq slot 0
+    if eq is_opt 0
+      put tg_sh0_params p uchar and v 255
+      put tg_sh0_params add p 1 uchar and shr v 8 255
+      put tg_sh0_params add p 2 uchar and shr v 16 255
+      put tg_sh0_params add p 3 uchar and shr v 24 255
+      ret
+    end
+    put tg_sh0_opt p uchar and v 255
+    put tg_sh0_opt add p 1 uchar and shr v 8 255
+    put tg_sh0_opt add p 2 uchar and shr v 16 255
+    put tg_sh0_opt add p 3 uchar and shr v 24 255
+    ret
+  end
+  if eq is_opt 0
+    put tg_sh1_params p uchar and v 255
+    put tg_sh1_params add p 1 uchar and shr v 8 255
+    put tg_sh1_params add p 2 uchar and shr v 16 255
+    put tg_sh1_params add p 3 uchar and shr v 24 255
+    ret
+  end
+  put tg_sh1_opt p uchar and v 255
+  put tg_sh1_opt add p 1 uchar and shr v 8 255
+  put tg_sh1_opt add p 2 uchar and shr v 16 255
+  put tg_sh1_opt add p 3 uchar and shr v 24 255
+end
+
+global tg_sgd_cfg ulong 4
+
+fn tg_sgd_chunk first ulong cnt ulong to void
+  slot = get tg_sgd_cfg 0
+  pc = new uint 2048 0
+  vc = new uint 2048 0
+  gc = new uint 2048 0
+  for i ulong cnt
+    idx = add first i
+    put pc i tg_load_u32_sh slot 0 idx
+    put gc i get tg_sgd_grad idx
+  end
+  if ne get tg_sgd_cfg 3 0
+    for i ulong cnt
+      put vc i tg_load_u32_sh slot 1 add first i
+    end
+    tg_update_velocity part vc 0 cnt part gc 0 cnt get tg_sgd_cfg 2
+    tg_update_params part pc 0 cnt part vc 0 cnt get tg_sgd_cfg 1
+    for i ulong cnt
+      tg_store_u32_sh slot 1 add first i get vc i
+    end
+  else
+    tg_update_params part pc 0 cnt part gc 0 cnt get tg_sgd_cfg 1
+  end
+  for i ulong cnt
+    tg_store_u32_sh slot 0 add first i get pc i
+  end
+end
+
+fn tg_sgd_apply slot ulong n ulong lr_bits ulong mom_bits ulong use_v ulong to void
+  put tg_sgd_cfg 0 slot
+  put tg_sgd_cfg 1 lr_bits
+  put tg_sgd_cfg 2 mom_bits
+  put tg_sgd_cfg 3 use_v
+  first = ulong 0
+  while lt first n bound 1024
+    cnt = sub n first
+    if gt cnt 2048
+      cnt = 2048
+    end
+    tg_sgd_chunk first cnt
+    first = add first cnt
+  end
+end
+
+fn tg_sgd_step slot ulong n ulong lr_bits ulong mom_bits ulong grad_ref ulong to long
+  if or eq get tg_st_meta 0 0 or gt slot 1 or eq n 0 gt n 1048576
+    ret TG_E_ARG
+  end
+  mode = tg_sgd_mode lr_bits mom_bits
+  if lt mode 0
+    ret TG_E_ARG
+  end
+  base = mul slot 8
+  bytes = mul n 4
+  if ne get tg_sh_meta add base 1 bytes
+    ret TG_E_ARG
+  end
+  if ne mode 0
+    if ne get tg_sh_meta add base 2 bytes
+      ret TG_E_ARG
+    end
+  end
+  refs = new ulong 9 0
+  nr = ulong 1
+  put refs 0 TG_BUF_PARAMS
+  put refs 1 0
+  put refs 2 bytes
+  if ne mode 0
+    put refs 3 TG_BUF_OPT
+    put refs 4 0
+    put refs 5 bytes
+    nr = 2
+  end
+  put refs mul nr 3 TG_BUF_EXTERNAL
+  put refs add mul nr 3 1 grad_ref
+  put refs add mul nr 3 2 bytes
+  r = tg_dispatch slot TG_OP_SGD or lr_bits shl mom_bits 32 grad_ref refs add nr 1
+  if ne r TG_OK
+    ret r
+  end
+  tg_sgd_apply slot n lr_bits mom_bits ulong mode
+  ret TG_OK
+end

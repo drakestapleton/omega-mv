@@ -1,0 +1,904 @@
+note SPDX-License-Identifier: Apache-2.0
+note omega_tensor_store.om -- Pure seeded OM-2 M20 crash-safe tensor storage lifetime.
+note Composed with tensor_shape.om, tg_sha256.om, omega_tensor_cpu.om, and omega_tensor.om.
+
+const OTS_ERR_IO long -20
+const OTS_ERR_TORN long -21
+const OTS_ERR_CORRUPT long -22
+const OTS_ERR_BUSY long -23
+
+const OTS_HDR_BYTES ulong 56
+const OTS_HDR_SUM ulong 24
+const OTS_REC_BYTES ulong 200
+const OTS_REC_SUM ulong 168
+const OTS_REC_PUT ulong 1
+const OTS_REC_RELEASE ulong 2
+const OTS_MAX_CAP ulong 64
+const OTS_JBUF_MAX ulong 65536
+
+const OTS_CRASH_NONE ulong 0
+const OTS_CRASH_PAYLOAD_PARTIAL ulong 1
+const OTS_CRASH_PAYLOAD_WRITTEN ulong 2
+const OTS_CRASH_PAYLOAD_RENAMED ulong 3
+const OTS_CRASH_PAYLOAD_SYNCED ulong 4
+const OTS_CRASH_JOURNAL_PARTIAL ulong 5
+const OTS_CRASH_JOURNAL_WRITTEN ulong 6
+const OTS_CRASH_JOURNAL_RENAMED ulong 7
+const OTS_CRASH_JOURNAL_SYNCED ulong 8
+const OTS_CRASH_COUNT ulong 9
+const OTS_CRASH_EXIT int 86
+
+const OTS_O_RDONLY int 0
+const OTS_O_WRONLY int 1
+const OTS_O_CREAT int 64
+const OTS_O_TRUNC int 512
+const OTS_O_DIRECTORY int 16384
+const OTS_LOCK_EX_NB int 6
+
+global ots_dir uchar 512
+global ots_meta ulong 8
+note ots_meta: 0=open, 1=dlen, 2=lock_fd+1, 3=cap, 4=jlen, 5=count, 6=crash_step
+global ots_sl_meta ulong 256
+note per slot (stride 4): 0=live, 1=gen, 2=dtype, 3=rank
+global ots_sl_shape ulong 512
+note per slot (stride 8)
+global ots_sl_vid uchar 2048
+note per slot (stride 32)
+global ots_sl_psha uchar 2048
+note per slot (stride 32)
+
+global ots_jbuf uchar 65536
+global ots_pbuf uchar 16384
+global ots_pa uchar 600
+global ots_pb uchar 600
+global ots_plen ulong 2
+global ots_dents uchar 16384
+
+text ots_txt_ptmp "payload.tmp"
+text ots_txt_jtmp "journal.tmp"
+text ots_txt_jrn "journal"
+
+fn ots_set_crash_step step ulong to long
+  if ge step OTS_CRASH_COUNT
+    ret OT_ERR_BAD_ARGS
+  end
+  put ots_meta 6 step
+  ret OT_OK
+end
+
+fn ots_crash_hit step ulong to void
+  if eq get ots_meta 6 step
+    exit OTS_CRASH_EXIT
+  end
+end
+
+fn ots_mk_path slot ulong name view uchar * to ulong
+  dl = get ots_meta 1
+  nl = len name
+  if ge add add dl 1 nl 600
+    put ots_plen slot 0
+    ret 0
+  end
+  if eq slot 0
+    for i ulong dl
+      put ots_pa i get ots_dir i
+    end
+    put ots_pa dl 47
+    for i ulong nl
+      put ots_pa add add dl 1 i get name i
+    end
+  else
+    for i ulong dl
+      put ots_pb i get ots_dir i
+    end
+    put ots_pb dl 47
+    for i ulong nl
+      put ots_pb add add dl 1 i get name i
+    end
+  end
+  tot = add add dl 1 nl
+  put ots_plen slot tot
+  ret tot
+end
+
+fn ots_rename_pa_to_pb to long
+  ol = get ots_plen 0
+  nl = get ots_plen 1
+  pkt = new uchar 1216 0
+  put pkt 0 2
+  put pkt 1 0
+  put pkt 2 uchar and ol 255
+  put pkt 3 uchar and shr ol 8 255
+  for i ulong ol
+    put pkt add 4 i get ots_pa i
+  end
+  o2 = add 4 ol
+  put pkt o2 uchar and nl 255
+  put pkt add o2 1 uchar and shr nl 8 255
+  for i ulong nl
+    put pkt add add o2 2 i get ots_pb i
+  end
+  ret renames pkt 0 add add o2 2 nl 0
+end
+
+fn ots_fsync_dir to long
+  fd = fopen ots_dir 0 get ots_meta 1 or OTS_O_RDONLY OTS_O_DIRECTORY 0
+  if lt fd 0
+    ret -1
+  end
+  r = fsync int fd
+  c = fclose int fd
+  if ne r 0
+    ret -1
+  end
+  ret c
+end
+
+fn ots_write_global fd int is_jbuf ulong n ulong to long
+  off = ulong 0
+  while lt off n bound 10000
+    w = long 0
+    if ne is_jbuf 0
+      w = write fd ots_jbuf off sub n off
+    else
+      w = write fd ots_pbuf off sub n off
+    end
+    if lt w 0
+      if eq w -4
+        continue
+      end
+      ret -1
+    end
+    off = add off ulong w
+  end
+  ret 0
+end
+
+fn ots_commit_pa_pb is_jbuf ulong n ulong step0 ulong to long
+  fd = fopen ots_pa 0 get ots_plen 0 or or OTS_O_WRONLY OTS_O_CREAT OTS_O_TRUNC 420
+  if lt fd 0
+    ret OTS_ERR_IO
+  end
+  if eq get ots_meta 6 step0
+    half = div n 2
+    if and eq half 0 gt n 0
+      half = 1
+    end
+    if eq ots_write_global int fd is_jbuf half 0
+      fs = fsync int fd
+    end
+    cc = fclose int fd
+    exit OTS_CRASH_EXIT
+  end
+  if ne ots_write_global int fd is_jbuf n 0
+    cc = fclose int fd
+    ret OTS_ERR_IO
+  end
+  if ne fsync int fd 0
+    cc = fclose int fd
+    ret OTS_ERR_IO
+  end
+  if ne fclose int fd 0
+    ret OTS_ERR_IO
+  end
+  ots_crash_hit add step0 1
+  if ne ots_rename_pa_to_pb 0
+    ret OTS_ERR_IO
+  end
+  ots_crash_hit add step0 2
+  if ne ots_fsync_dir 0
+    ret OTS_ERR_IO
+  end
+  ots_crash_hit add step0 3
+  ret OT_OK
+end
+
+fn ots_encode_hdr cap ulong count ulong to void
+  h24 = new uchar 24 0
+  tstore_encode_header cap count h24
+  dig = new uchar 32 0
+  tg_sha_hash h24 24 dig
+  for i ulong 24
+    put ots_jbuf i get h24 i
+  end
+  for i ulong 32
+    put ots_jbuf add 24 i get dig i
+  end
+end
+
+fn ots_encode_rec_at off ulong meta view ulong 6 sh view ulong 8 vid view uchar 32 psha view uchar 32 to void
+  r168 = new uchar 168 0
+  tstore_encode_record meta sh vid psha r168
+  dig = new uchar 32 0
+  tg_sha_hash r168 168 dig
+  for i ulong 168
+    put ots_jbuf add off i get r168 i
+  end
+  for i ulong 32
+    put ots_jbuf add add off 168 i get dig i
+  end
+end
+
+fn ots_check_put_shape rk ulong sh view ulong 8 to long
+  el = new ulong 1 0
+  if ne ot_shape_check rk sh el OT_OK
+    ret OTS_ERR_TORN
+  end
+  for d ulong sub OT_MAX_RANK rk
+    if ne get sh add rk d 0
+      ret OTS_ERR_TORN
+    end
+  end
+  ret OT_OK
+end
+
+fn ots_store_put_slot sl ulong dt ulong rk ulong sh view ulong 8 vid view uchar 32 psha view uchar 32 to void
+  sb = mul sl 4
+  put ots_sl_meta sb 1
+  put ots_sl_meta add sb 2 dt
+  put ots_sl_meta add sb 3 rk
+  for d ulong 8
+    put ots_sl_shape add mul sl 8 d get sh d
+  end
+  for i ulong 32
+    put ots_sl_vid add mul sl 32 i get vid i
+    put ots_sl_psha add mul sl 32 i get psha i
+  end
+end
+
+fn ots_apply_put sl ulong gen ulong meta view ulong 6 sh view ulong 8 vid view uchar 32 psha view uchar 32 to long
+  sb = mul sl 4
+  if ne get ots_sl_meta sb 0
+    ret OTS_ERR_TORN
+  end
+  cur_g = get ots_sl_meta add sb 1
+  if or eq cur_g OT_U64_MAX ne gen cur_g
+    ret OTS_ERR_TORN
+  end
+  dt = get meta 4
+  rk = get meta 5
+  if or eq ot_dtype_size dt 0 gt rk OT_MAX_RANK
+    ret OTS_ERR_TORN
+  end
+  if ne ots_check_put_shape rk sh OT_OK
+    ret OTS_ERR_TORN
+  end
+  ots_store_put_slot sl dt rk sh vid psha
+  ret OT_OK
+end
+
+fn ots_apply_release sl ulong gen ulong to long
+  sb = mul sl 4
+  if eq get ots_sl_meta sb 0
+    ret OTS_ERR_TORN
+  end
+  if ne gen get ots_sl_meta add sb 1
+    ret OTS_ERR_TORN
+  end
+  put ots_sl_meta sb 0
+  put ots_sl_meta add sb 1 add gen 1
+  ret OT_OK
+end
+
+fn ots_apply_record meta view ulong 6 sh view ulong 8 vid view uchar 32 psha view uchar 32 expect_seq ulong to long
+  kind = get meta 0
+  sl = get meta 1
+  gen = get meta 2
+  if or ne get meta 3 expect_seq ge sl get ots_meta 3
+    ret OTS_ERR_TORN
+  end
+  if eq kind OTS_REC_PUT
+    ret ots_apply_put sl gen meta sh vid psha
+  end
+  if eq kind OTS_REC_RELEASE
+    ret ots_apply_release sl gen
+  end
+  ret OTS_ERR_TORN
+end
+
+fn ots_replay_one i ulong to long
+  off = add OTS_HDR_BYTES mul i OTS_REC_BYTES
+  r168 = new uchar 168 0
+  for k ulong 168
+    put r168 k get ots_jbuf add off k
+  end
+  meta = new ulong 6 0
+  sh = new ulong 8 0
+  vid = new uchar 32 0
+  psha = new uchar 32 0
+  if eq tstore_decode_record r168 meta sh vid psha 0
+    ret OTS_ERR_TORN
+  end
+  sum = new uchar 32 0
+  tg_sha_hash r168 168 sum
+  for k ulong 32
+    if ne get sum k get ots_jbuf add add off 168 k
+      ret OTS_ERR_TORN
+    end
+  end
+  ret ots_apply_record meta sh vid psha i
+end
+
+fn ots_read_payload_fd fd int expect ulong to long
+  n = ulong 0
+  extra = new uchar 1 0
+  longer = ulong 0
+  while true bound 1000
+    if lt n expect
+      r = read fd ots_pbuf n sub expect n
+      if lt r 0
+        if eq r -4
+          continue
+        end
+        ret OTS_ERR_IO
+      end
+      if eq r 0
+        break
+      end
+      n = add n ulong r
+    else
+      r = read fd extra 0 1
+      if lt r 0
+        if eq r -4
+          continue
+        end
+        ret OTS_ERR_IO
+      end
+      if gt r 0
+        longer = 1
+      end
+      break
+    end
+  end
+  if or ne longer 0 ne n expect
+    ret OTS_ERR_CORRUPT
+  end
+  ret OT_OK
+end
+
+fn ots_load_payload sl ulong to long
+  sb = mul sl 4
+  dt = get ots_sl_meta add sb 2
+  rk = get ots_sl_meta add sb 3
+  sh = new ulong 8 0
+  for d ulong 8
+    put sh d get ots_sl_shape add mul sl 8 d
+  end
+  el = new ulong 1 0
+  if ne ot_shape_check rk sh el OT_OK
+    ret OTS_ERR_CORRUPT
+  end
+  expect = mul get el 0 ot_dtype_size dt
+  if gt expect 16384
+    ret OT_ERR_CAPACITY
+  end
+  vid = new uchar 32 0
+  for i ulong 32
+    put vid i get ots_sl_vid add mul sl 32 i
+  end
+  nm = new uchar 68 0
+  tstore_hex_name vid nm
+  if eq ots_mk_path 0 nm 0
+    ret OTS_ERR_IO
+  end
+  fd = fopen ots_pa 0 get ots_plen 0 OTS_O_RDONLY 0
+  if lt fd 0
+    if eq fd -2
+      ret OTS_ERR_CORRUPT
+    end
+    ret OTS_ERR_IO
+  end
+  rc = ots_read_payload_fd int fd expect
+  cc = fclose int fd
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ots_verify_payload sl expect
+end
+
+fn ots_verify_payload sl ulong expect ulong to long
+  loc = new uchar 16384 0
+  for i ulong expect bound 16385
+    put loc i get ots_pbuf i
+  end
+  dig = new uchar 32 0
+  tg_sha_hash part loc 0 expect expect dig
+  for i ulong 32
+    if ne get dig i get ots_sl_psha add mul sl 32 i
+      ret OTS_ERR_CORRUPT
+    end
+  end
+  ret OT_OK
+end
+
+fn ots_payload_ref nm view uchar 68 to ulong
+  cap = get ots_meta 3
+  vid = new uchar 32 0
+  cand = new uchar 68 0
+  for i ulong cap
+    if eq get ots_sl_meta mul i 4 0
+      continue
+    end
+    for k ulong 32
+      put vid k get ots_sl_vid add mul i 32 k
+    end
+    tstore_hex_name vid cand
+    same = ulong 1
+    for k ulong 68
+      if ne get cand k get nm k
+        same = 0
+      end
+    end
+    if eq same 1
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ots_name_eq nm view uchar 256 nlen ulong txt view uchar * to ulong
+  if ne nlen len txt
+    ret 0
+  end
+  for i ulong nlen
+    if ne get nm i get txt i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn ots_sweep_one pos ulong nru ulong only_chk ulong any_out edit ulong 1 to ulong
+  nm = new uchar 256 0
+  p68 = new uchar 68 0
+  nl = ulong 0
+  noff = add pos 19
+  while lt nl 255 bound 256
+    if ge add noff nl nru
+      break
+    end
+    ch = get ots_dents add noff nl
+    if eq ch 0
+      break
+    end
+    put nm nl ch
+    nl = add nl 1
+  end
+  is_tmp = or ne ots_name_eq nm nl ots_txt_ptmp 0 ne ots_name_eq nm nl ots_txt_jtmp 0
+  is_pay = ne tstore_is_payload_name part nm 0 nl 0
+  if is_pay
+    put any_out 0 1
+  end
+  if ne only_chk 0
+    ret 0
+  end
+  do_rm = is_tmp
+  if is_pay
+    for k ulong 68
+      put p68 k get nm k
+    end
+    if eq ots_payload_ref p68 0
+      do_rm = true
+    end
+  end
+  if do_rm
+    pl = ots_mk_path 0 part nm 0 nl
+    if gt pl 0
+      if eq unlink ots_pa 0 pl 0
+        ret 1
+      end
+    end
+  end
+  ret 0
+end
+
+fn ots_sweep_dir only_chk ulong any_out edit ulong 1 to long
+  put any_out 0 0
+  dfd = fopen ots_dir 0 get ots_meta 1 or OTS_O_RDONLY OTS_O_DIRECTORY 0
+  if lt dfd 0
+    ret OTS_ERR_IO
+  end
+  rm = ulong 0
+  while true bound 512
+    nr = getdnts int dfd ots_dents 0 16384
+    if lt nr 0
+      cc = fclose int dfd
+      ret OTS_ERR_IO
+    end
+    if eq nr 0
+      break
+    end
+    pos = ulong 0
+    nru = ulong nr
+    while lt pos nru bound 4096
+      lo = ulong get ots_dents add pos 16
+      hi = shl ulong get ots_dents add pos 17 8
+      rl = or lo hi
+      if eq rl 0
+        break
+      end
+      if ne ots_sweep_one pos nru only_chk any_out 0
+        rm = 1
+      end
+      pos = add pos rl
+    end
+  end
+  cc = fclose int dfd
+  if ne rm 0
+    if ne ots_fsync_dir 0
+      ret OTS_ERR_IO
+    end
+  end
+  ret OT_OK
+end
+
+fn ots_load_journal cap ulong to long
+  if eq ots_mk_path 0 ots_txt_jrn 0
+    ret OTS_ERR_IO
+  end
+  fd = fopen ots_pa 0 get ots_plen 0 OTS_O_RDONLY 0
+  if lt fd 0
+    ret OTS_ERR_IO
+  end
+  sb = new uchar 128 0
+  if lt fstat int fd sb 0 128 0
+    cc = fclose int fd
+    ret OTS_ERR_IO
+  end
+  fl = ulong 0
+  for i ulong 8
+    fl = or fl shl ulong get sb add 48 i mul i 8
+  end
+  if gt fl OTS_JBUF_MAX
+    cc = fclose int fd
+    ret OT_ERR_CAPACITY
+  end
+  got = ulong 0
+  while lt got fl bound 1000
+    r = read int fd ots_jbuf got sub fl got
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      break
+    end
+    if eq r 0
+      break
+    end
+    got = add got ulong r
+  end
+  cc = fclose int fd
+  if lt got OTS_HDR_BYTES
+    ret OTS_ERR_TORN
+  end
+  ret ots_verify_journal cap got
+end
+
+fn ots_verify_journal cap ulong jlen ulong to long
+  h24 = new uchar 24 0
+  for i ulong 24
+    put h24 i get ots_jbuf i
+  end
+  cnt_a = new ulong 1 0
+  hst = tstore_decode_header h24 cap cnt_a
+  if eq hst 0
+    ret OTS_ERR_TORN
+  end
+  sum = new uchar 32 0
+  tg_sha_hash h24 24 sum
+  for i ulong 32
+    if ne get sum i get ots_jbuf add 24 i
+      ret OTS_ERR_TORN
+    end
+  end
+  if eq hst 2
+    ret OT_ERR_BAD_ARGS
+  end
+  cnt = get cnt_a 0
+  if ne jlen add OTS_HDR_BYTES mul cnt OTS_REC_BYTES
+    ret OTS_ERR_TORN
+  end
+  for i ulong cnt bound 512
+    rc = ots_replay_one i
+    if ne rc OT_OK
+      ret rc
+    end
+  end
+  put ots_meta 5 cnt
+  put ots_meta 4 jlen
+  ret OT_OK
+end
+
+fn ots_close to void
+  if eq get ots_meta 0 0
+    ret
+  end
+  if gt get ots_meta 2 0
+    cc = fclose int sub get ots_meta 2 1
+    put ots_meta 2 0
+  end
+  put ots_meta 0 0
+end
+
+fn ots_open dir view uchar * dlen ulong cap ulong to long
+  if or eq dlen 0 or ge dlen 450 or eq cap 0 gt cap OTS_MAX_CAP
+    ret OT_ERR_BAD_ARGS
+  end
+  for i ulong 8
+    put ots_meta i 0
+  end
+  for i ulong dlen
+    put ots_dir i get dir i
+  end
+  put ots_meta 1 dlen
+  put ots_meta 3 cap
+  mr = makedir ots_dir 0 dlen 493
+  if and lt mr 0 ne mr -17
+    ret OTS_ERR_IO
+  end
+  for i ulong cap
+    put ots_sl_meta mul i 4 0
+    put ots_sl_meta add mul i 4 1 1
+  end
+  lfd = fopen ots_dir 0 dlen or OTS_O_RDONLY OTS_O_DIRECTORY 0
+  if lt lfd 0
+    ret OTS_ERR_IO
+  end
+  put ots_meta 0 1
+  put ots_meta 2 add ulong lfd 1
+  fl = flock int lfd OTS_LOCK_EX_NB
+  if ne fl 0
+    ots_close
+    if eq fl -11
+      ret OTS_ERR_BUSY
+    end
+    ret OTS_ERR_IO
+  end
+  if eq ots_mk_path 0 ots_txt_jrn 0
+    ots_close
+    ret OTS_ERR_IO
+  end
+  rc = OT_OK
+  any = new ulong 1 0
+  if ne faccess ots_pa 0 get ots_plen 0 0 0
+    rc = ots_sweep_dir 1 any
+    if and eq rc OT_OK ne get any 0 0
+      rc = OTS_ERR_TORN
+    end
+    if eq rc OT_OK
+      ots_encode_hdr cap 0
+      put ots_meta 4 OTS_HDR_BYTES
+      p1 = ots_mk_path 0 ots_txt_jtmp
+      p2 = ots_mk_path 1 ots_txt_jrn
+      rc = ots_commit_pa_pb 1 OTS_HDR_BYTES OTS_CRASH_COUNT
+    end
+  else
+    rc = ots_load_journal cap
+    if eq rc OT_OK
+      for i ulong cap
+        if ne get ots_sl_meta mul i 4 0
+          rc = ots_load_payload i
+          if ne rc OT_OK
+            break
+          end
+        end
+      end
+    end
+  end
+  if eq rc OT_OK
+    rc = ots_sweep_dir 0 any
+  end
+  if ne rc OT_OK
+    ots_close
+    ret rc
+  end
+  ret OT_OK
+end
+
+fn ots_valid sl ulong gen ulong to bool
+  if or eq get ots_meta 0 0 ge sl get ots_meta 3
+    ret false
+  end
+  sb = mul sl 4
+  if eq get ots_sl_meta sb 0
+    ret false
+  end
+  ret eq get ots_sl_meta add sb 1 gen
+end
+
+fn ots_live_count to ulong
+  if eq get ots_meta 0 0
+    ret 0
+  end
+  n = ulong 0
+  cap = get ots_meta 3
+  for i ulong cap
+    if ne get ots_sl_meta mul i 4 0
+      n = add n 1
+    end
+  end
+  ret n
+end
+
+fn ots_find_free_slot to ulong
+  cap = get ots_meta 3
+  for i ulong cap
+    sb = mul i 4
+    if and eq get ots_sl_meta sb 0 ne get ots_sl_meta add sb 1 OT_U64_MAX
+      ret i
+    end
+  end
+  ret cap
+end
+
+fn ots_put_payload ts_s ulong ts_g ulong vid edit uchar 32 psha edit uchar 32 to long
+  tb = mul ts_s 10
+  dt = get ot_ts_meta add tb 3
+  elems = get ot_ts_meta add tb 6
+  bytes = mul elems ot_dtype_size dt
+  ot_gather_slot ts_s 0
+  loc = new uchar 16384 0
+  for i ulong bytes bound 16385
+    put loc i get ot_buf_a i
+  end
+  tensor_value_bytes part loc 0 bytes dt 1
+  for i ulong bytes bound 16385
+    put ots_pbuf i get loc i
+  end
+  rc = ot_value_id ts_s ts_g vid
+  if ne rc OT_OK
+    ret rc
+  end
+  tg_sha_hash part loc 0 bytes bytes psha
+  nm = new uchar 68 0
+  tstore_hex_name vid nm
+  p1 = ots_mk_path 0 ots_txt_ptmp
+  p2 = ots_mk_path 1 nm
+  ret ots_commit_pa_pb 0 bytes OTS_CRASH_PAYLOAD_PARTIAL
+end
+
+fn ots_put ts_s ulong ts_g ulong out_h edit ulong 2 to long
+  if eq get ots_meta 0 0
+    ret OT_ERR_BAD_ARGS
+  end
+  rc = ot_ts_check ts_s ts_g
+  if ne rc OT_OK
+    ret rc
+  end
+  sl = ots_find_free_slot
+  if eq sl get ots_meta 3
+    ret OT_ERR_CAPACITY
+  end
+  vid = new uchar 32 0
+  psha = new uchar 32 0
+  rc = ots_put_payload ts_s ts_g vid psha
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ots_put_journal sl ts_s vid psha out_h
+end
+
+fn ots_fill_put_meta sl ulong ts_s ulong meta edit ulong 6 sh edit ulong 8 to void
+  tb = mul ts_s 10
+  put meta 0 OTS_REC_PUT
+  put meta 1 sl
+  put meta 2 get ots_sl_meta add mul sl 4 1
+  put meta 3 get ots_meta 5
+  put meta 4 get ot_ts_meta add tb 3
+  rk = get ot_ts_meta add tb 4
+  put meta 5 rk
+  for d ulong rk
+    put sh d get ot_ts_shape add mul ts_s 8 d
+  end
+end
+
+fn ots_put_journal sl ulong ts_s ulong vid view uchar 32 psha view uchar 32 out_h edit ulong 2 to long
+  meta = new ulong 6 0
+  sh = new ulong 8 0
+  ots_fill_put_meta sl ts_s meta sh
+  seq = get meta 3
+  rc = ots_apply_record meta sh vid psha seq
+  if ne rc OT_OK
+    ret rc
+  end
+  jlen = get ots_meta 4
+  if gt add jlen OTS_REC_BYTES OTS_JBUF_MAX
+    ret OT_ERR_CAPACITY
+  end
+  ots_encode_rec_at jlen meta sh vid psha
+  ots_encode_hdr get ots_meta 3 add seq 1
+  p1 = ots_mk_path 0 ots_txt_jtmp
+  p2 = ots_mk_path 1 ots_txt_jrn
+  rc = ots_commit_pa_pb 1 add jlen OTS_REC_BYTES OTS_CRASH_JOURNAL_PARTIAL
+  if ne rc OT_OK
+    ots_encode_hdr get ots_meta 3 seq
+    put ots_sl_meta mul sl 4 0
+    ret rc
+  end
+  put ots_meta 4 add jlen OTS_REC_BYTES
+  put ots_meta 5 add seq 1
+  put out_h 0 sl
+  put out_h 1 get meta 2
+  ret OT_OK
+end
+
+fn ots_copy_pbuf_to_slot slot ulong nb ulong to void
+  dbase = ot_slot_dbase slot
+  for i ulong nb bound 16385
+    put ot_arena add dbase i get ots_pbuf i
+  end
+end
+
+fn ots_get sl ulong gen ulong out_h edit ulong 2 to long
+  if not ots_valid sl gen
+    ret OT_ERR_STALE
+  end
+  rc = ots_load_payload sl
+  if ne rc OT_OK
+    ret rc
+  end
+  sb = mul sl 4
+  dt = get ots_sl_meta add sb 2
+  rk = get ots_sl_meta add sb 3
+  sh = new ulong 8 0
+  for d ulong rk
+    put sh d get ots_sl_shape add mul sl 8 d
+  end
+  rc = ot_new_dense dt rk sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  nb = mul get ot_ts_meta add mul get out_h 0 10 6 ot_dtype_size dt
+  ots_copy_pbuf_to_slot get out_h 0 nb
+  ret OT_OK
+end
+
+fn ots_gc_payload vid view uchar 32 to void
+  nm = new uchar 68 0
+  tstore_hex_name vid nm
+  if eq ots_payload_ref nm 0
+    pl = ots_mk_path 0 nm
+    if gt pl 0
+      u = unlink ots_pa 0 pl
+    end
+  end
+end
+
+fn ots_release sl ulong gen ulong to long
+  if not ots_valid sl gen
+    ret OT_ERR_STALE
+  end
+  vid = new uchar 32 0
+  for i ulong 32
+    put vid i get ots_sl_vid add mul sl 32 i
+  end
+  meta = new ulong 6 0
+  seq = get ots_meta 5
+  put meta 0 OTS_REC_RELEASE
+  put meta 1 sl
+  put meta 2 gen
+  put meta 3 seq
+  sh = new ulong 8 0
+  zero1 = new uchar 32 0
+  zero2 = new uchar 32 0
+  rc = ots_apply_record meta sh zero1 zero2 seq
+  if ne rc OT_OK
+    ret rc
+  end
+  jlen = get ots_meta 4
+  ots_encode_rec_at jlen meta sh zero1 zero2
+  ots_encode_hdr get ots_meta 3 add seq 1
+  p1 = ots_mk_path 0 ots_txt_jtmp
+  p2 = ots_mk_path 1 ots_txt_jrn
+  rc = ots_commit_pa_pb 1 add jlen OTS_REC_BYTES OTS_CRASH_JOURNAL_PARTIAL
+  if ne rc OT_OK
+    ots_encode_hdr get ots_meta 3 seq
+    put ots_sl_meta mul sl 4 1
+    put ots_sl_meta add mul sl 4 1 gen
+    ret rc
+  end
+  put ots_meta 4 add jlen OTS_REC_BYTES
+  put ots_meta 5 add seq 1
+  ots_gc_payload vid
+  ret OT_OK
+end

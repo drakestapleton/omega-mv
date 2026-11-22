@@ -1,0 +1,1525 @@
+note SPDX-License-Identifier: Apache-2.0
+note tg_store.om -- Pure seeded OM-2 M22 transactional parameter-state substrate.
+note Uses native OM-2 syscalls (fopen, fclose, read, write, pread, pwrite, fsync,
+note ftrunc, truncate, unlink, makedir, fstat, stat, getdnts, renames, flock, faccess).
+note Composed with generation.om and tg_sha256.om.
+
+const TG_DIGEST ulong 32
+const TG_MAX_REFS ulong 3
+const TG_GEN_HDR ulong 152
+const TG_GEN_HASHED_HDR ulong 120
+const TG_CUR_LEN ulong 95
+const TG_REC_SIZE ulong 192
+const TG_REC_HASHED ulong 160
+const TG_PATHMAX ulong 1024
+const TG_MAX_BUF ulong 4194304
+const TG_MAX_RECS ulong 256
+
+const TG_OK long 0
+const TG_E_ARG long -1
+const TG_E_IO long -2
+const TG_E_NOSTORE long -3
+const TG_E_FORMAT long -4
+const TG_E_TRUNC long -5
+const TG_E_DIGEST long -6
+const TG_E_CHAIN long -7
+const TG_E_REJECT long -8
+const TG_E_STATE long -9
+const TG_E_STALE long -10
+const TG_E_SHADOW long -11
+const TG_E_LOCKED long -12
+const TG_E_EXISTS long -13
+const TG_E_NOMEM long -14
+
+const TG_FP_NONE ulong 0
+const TG_FP_BEFORE_SHADOW_WRITE ulong 1
+const TG_FP_MID_SHADOW_WRITE ulong 2
+const TG_FP_AFTER_SHADOW_WRITE ulong 3
+const TG_FP_AFTER_GEN_RENAME ulong 4
+const TG_FP_MID_SWITCH ulong 5
+const TG_FP_BEFORE_SWITCH_RENAME ulong 6
+const TG_FP_AFTER_SWITCH_BEFORE_FSYNC ulong 7
+const TG_FP_AFTER_SWITCH ulong 8
+const TG_FP_COUNT ulong 9
+
+const TG_FPMODE_EXIT ulong 1
+const TG_FPMODE_CORRUPT ulong 2
+const TG_FP_EXIT_CODE int 77
+
+const TG_BUF_PARAMS ulong 1
+const TG_BUF_OPT ulong 2
+const TG_BUF_EXTERNAL ulong 3
+
+const TG_SH_OPEN ulong 1
+const TG_SH_COMMITTED ulong 2
+const TG_SH_DISCARDED ulong 3
+
+const TG_O_RDONLY int 0
+const TG_O_WRONLY int 1
+const TG_O_RDWR int 2
+const TG_O_CREAT int 64
+const TG_O_TRUNC int 512
+const TG_O_APPEND int 1024
+const TG_O_DIRECTORY int 16384
+const TG_LOCK_EX_NB int 6
+
+global tg_fp_state ulong 2
+
+global tg_st_dir uchar 1024
+global tg_st_meta ulong 12
+note tg_st_meta: 0=open, 1=dir_len, 2=lock_fd+1, 3=log_fd+1, 4=poisoned,
+note   5=cur_gen, 6=cur_step, 7=cur_pb, 8=cur_ob, 9=cur_dlen
+global tg_st_digest uchar 32
+global tg_st_prev uchar 32
+global tg_st_dhead uchar 32
+global tg_st_params uchar 4194304
+global tg_st_opt uchar 4194304
+global tg_st_stats ulong 4
+note tg_st_stats: 0=dispatch_records, 1=dispatch_hashed_bytes, 2=commit_hashed_bytes, 3=refusals
+
+global tg_sh_meta ulong 16
+note per slot (stride 8): 0=state, 1=pb, 2=ob, 3=base_gen, 4=base_step, 5=n_dispatch
+global tg_sh_base_dig uchar 64
+global tg_sh0_params uchar 4194304
+global tg_sh0_opt uchar 4194304
+global tg_sh0_recs uchar 49152
+global tg_sh1_params uchar 4194304
+global tg_sh1_opt uchar 4194304
+global tg_sh1_recs uchar 49152
+
+global tg_snap_meta ulong 6
+note tg_snap_meta: 0=gen, 1=step, 2=pb, 3=ob, 4=dlen
+global tg_snap_digest uchar 32
+global tg_snap_prev uchar 32
+global tg_snap_dhead uchar 32
+global tg_snap_params uchar 4194304
+global tg_snap_opt uchar 4194304
+
+global tg_io_buf uchar 4096
+global tg_dents_buf uchar 16384
+global tg_rec_meta ulong 8
+note tg_rec_meta: 0=removed_tmp, 1=removed_orphan_gen, 2=dispatch_truncated
+
+note Shared scratch for low-register-pressure internal helpers
+global tg_dir_arg uchar 1024
+global tg_dir_len ulong 1
+global tg_pa uchar 1024
+global tg_pb uchar 1024
+global tg_plen ulong 2
+global tg_hdr_tmp uchar 152
+global tg_dig_tmp uchar 32
+global tg_dig_exp uchar 32
+global tg_head_tmp uchar 32
+global tg_rec_tmp uchar 192
+global tg_sha_ctx uchar 104
+global tg_fields_tmp ulong 8
+
+text tg_txt_cur "CURRENT"
+text tg_txt_cur_tmp "CURRENT.tmp"
+text tg_txt_dlog "dispatch.log"
+text tg_txt_lock "LOCK"
+text tg_txt_reflog "refusals.log"
+text tg_txt_gen_pfx "gen-"
+text tg_txt_sh_pfx "shadow-"
+text tg_txt_bin_sfx ".bin"
+text tg_txt_tmp_sfx ".tmp"
+text tg_txt_refuse_pfx "REFUSE "
+
+fn tg_failpoint_arm fp ulong mode ulong to void
+  put tg_fp_state 0 fp
+  put tg_fp_state 1 mode
+end
+
+fn tg_failpoint_disarm to void
+  put tg_fp_state 0 TG_FP_NONE
+end
+
+fn tg_fp_hit fp ulong to void
+  if eq get tg_fp_state 0 fp
+    if eq get tg_fp_state 1 TG_FPMODE_EXIT
+      exit TG_FP_EXIT_CODE
+    end
+  end
+end
+
+fn tg_set_dir_from_st to void
+  dl = get tg_st_meta 1
+  for i ulong dl
+    put tg_dir_arg i get tg_st_dir i
+  end
+  put tg_dir_len 0 dl
+end
+
+fn tg_set_dir dir view uchar * dlen ulong to void
+  for i ulong dlen
+    put tg_dir_arg i get dir i
+  end
+  put tg_dir_len 0 dlen
+end
+
+fn tg_mk_path slot ulong name view uchar * to ulong
+  dl = get tg_dir_len 0
+  nl = len name
+  if ge add add dl 1 nl TG_PATHMAX
+    put tg_plen slot 0
+    ret 0
+  end
+  if eq slot 0
+    for i ulong dl
+      put tg_pa i get tg_dir_arg i
+    end
+    put tg_pa dl 47
+    for i ulong nl
+      put tg_pa add add dl 1 i get name i
+    end
+  else
+    for i ulong dl
+      put tg_pb i get tg_dir_arg i
+    end
+    put tg_pb dl 47
+    for i ulong nl
+      put tg_pb add add dl 1 i get name i
+    end
+  end
+  tot = add add dl 1 nl
+  put tg_plen slot tot
+  ret tot
+end
+
+fn tg_mk_gen_path slot ulong is_sh ulong g ulong to ulong
+  dl = get tg_dir_len 0
+  if ge add dl 35 TG_PATHMAX
+    put tg_plen slot 0
+    ret 0
+  end
+  buf = new uchar 36 0
+  p = ulong 0
+  if ne is_sh 0
+    for i ulong 7
+      put buf i get tg_txt_sh_pfx i
+    end
+    p = 7
+  else
+    for i ulong 4
+      put buf i get tg_txt_gen_pfx i
+    end
+    p = 4
+  end
+  rg = g
+  for i ulong 20
+    pos = add p sub 19 i
+    put buf pos uchar add 48 rem rg 10
+    rg = div rg 10
+  end
+  p = add p 20
+  for i ulong 4
+    if ne is_sh 0
+      put buf add p i get tg_txt_tmp_sfx i
+    else
+      put buf add p i get tg_txt_bin_sfx i
+    end
+  end
+  p = add p 4
+  ret tg_mk_path slot part buf 0 p
+end
+
+fn tg_rename_pa_to_pb to long
+  ol = get tg_plen 0
+  nl = get tg_plen 1
+  pkt = new uchar 2060 0
+  put pkt 0 2
+  put pkt 1 0
+  put pkt 2 uchar and ol 255
+  put pkt 3 uchar and shr ol 8 255
+  for i ulong ol
+    put pkt add 4 i get tg_pa i
+  end
+  o2 = add 4 ol
+  put pkt o2 uchar and nl 255
+  put pkt add o2 1 uchar and shr nl 8 255
+  for i ulong nl
+    put pkt add add o2 2 i get tg_pb i
+  end
+  ret renames pkt 0 add add o2 2 nl 0
+end
+
+fn tg_write_all_local fd int buf view uchar * n ulong to long
+  off = ulong 0
+  while lt off n bound 1000000
+    w = write fd buf off sub n off
+    if lt w 0
+      if eq w -4
+        continue
+      end
+      ret -1
+    end
+    off = add off ulong w
+  end
+  ret 0
+end
+
+fn tg_read_full_local fd int buf edit uchar * n ulong got edit ulong 1 to long
+  t = ulong 0
+  while lt t n bound 1000000
+    r = read fd buf t sub n t
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    t = add t ulong r
+  end
+  put got 0 t
+  ret 0
+end
+
+fn tg_fsync_dir_arg to long
+  dl = get tg_dir_len 0
+  fd = fopen tg_dir_arg 0 dl or TG_O_RDONLY TG_O_DIRECTORY 0
+  if lt fd 0
+    ret -1
+  end
+  r = fsync int fd
+  c = fclose int fd
+  if ne r 0
+    ret -1
+  end
+  ret c
+end
+
+fn tg_stat_size fd int to long
+  sb = new uchar 128 0
+  r = fstat fd sb 0 128
+  if lt r 0
+    ret -1
+  end
+  sz = ulong 0
+  for i ulong 8
+    sz = or sz shl ulong get sb add 48 i mul i 8
+  end
+  ret long sz
+end
+
+fn tg_record_refusal_arg err long gen ulong to void
+  pl = tg_mk_path 0 tg_txt_reflog
+  if eq pl 0
+    ret
+  end
+  fd = fopen tg_pa 0 pl or or TG_O_WRONLY TG_O_CREAT TG_O_APPEND 420
+  if lt fd 0
+    ret
+  end
+  line = new uchar 64 0
+  for i ulong 7
+    put line i get tg_txt_refuse_pfx i
+  end
+  put line 7 uchar add 65 rem ulong sub 0 err 26
+  put line 8 32
+  put line 9 uchar add 48 rem gen 10
+  put line 10 10
+  w = write int fd line 0 11
+  c = fclose int fd
+end
+
+fn tg_copy_to_io src_kind ulong is_opt ulong base ulong take ulong to void
+  for i ulong take
+    idx = add base i
+    v = uchar 0
+    if eq src_kind 0
+      if eq is_opt 0
+        v = get tg_snap_params idx
+      else
+        v = get tg_snap_opt idx
+      end
+    else
+      if eq src_kind 1
+        if eq is_opt 0
+          v = get tg_sh0_params idx
+        else
+          v = get tg_sh0_opt idx
+        end
+      else
+        if eq src_kind 2
+          if eq is_opt 0
+            v = get tg_sh1_params idx
+          else
+            v = get tg_sh1_opt idx
+          end
+        else
+          if eq is_opt 0
+            v = get tg_st_params idx
+          else
+            v = get tg_st_opt idx
+          end
+        end
+      end
+    end
+    put tg_io_buf i v
+  end
+end
+
+fn tg_sha_update_io ctx edit uchar 104 take ulong to void
+  loc = new uchar 4096 0
+  for i ulong take
+    put loc i get tg_io_buf i
+  end
+  tg_sha_update ctx loc take
+end
+
+fn tg_sha_update_global ctx edit uchar 104 src_kind ulong is_opt ulong n ulong to void
+  pos = ulong 0
+  while lt pos n bound 2048
+    take = sub n pos
+    if gt take 4096
+      take = 4096
+    end
+    tg_copy_to_io src_kind is_opt pos take
+    tg_sha_update_io ctx take
+    pos = add pos take
+  end
+end
+
+fn tg_gen_digest_tmp src_kind ulong pb ulong ob ulong to void
+  ctx = new uchar 104 0
+  tg_sha_init ctx
+  hb = new uchar 120 0
+  for i ulong 120
+    put hb i get tg_hdr_tmp i
+  end
+  tg_sha_update ctx hb 120
+  if gt pb 0
+    tg_sha_update_global ctx src_kind 0 pb
+  end
+  if gt ob 0
+    tg_sha_update_global ctx src_kind 1 ob
+  end
+  dig = new uchar 32 0
+  tg_sha_final ctx dig
+  for i ulong 32
+    put tg_dig_tmp i get dig i
+  end
+end
+
+fn tg_write_global_fd fd int src_kind ulong is_opt ulong off ulong n ulong to long
+  pos = ulong 0
+  while lt pos n bound 2048
+    take = sub n pos
+    if gt take 4096
+      take = 4096
+    end
+    tg_copy_to_io src_kind is_opt add off pos take
+    w = write fd tg_io_buf 0 take
+    if lt w 0
+      if eq w -4
+        continue
+      end
+      ret -1
+    end
+    pos = add pos ulong w
+  end
+  ret 0
+end
+
+fn tg_copy_io_to_snap is_opt ulong pos ulong n ulong to void
+  for i ulong n
+    v = get tg_io_buf i
+    if eq is_opt 0
+      put tg_snap_params add pos i v
+    else
+      put tg_snap_opt add pos i v
+    end
+  end
+end
+
+fn tg_read_to_snap fd int is_opt ulong n ulong to long
+  pos = ulong 0
+  while lt pos n bound 2048
+    take = sub n pos
+    if gt take 4096
+      take = 4096
+    end
+    r = read fd tg_io_buf 0 take
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    tg_copy_io_to_snap is_opt pos ulong r
+    pos = add pos ulong r
+  end
+  ret long pos
+end
+
+fn tg_load_gen_pa expect_gen ulong check_dig ulong to long
+  fd = fopen tg_pa 0 get tg_plen 0 TG_O_RDONLY 0
+  if lt fd 0
+    if eq fd -2
+      ret TG_E_NOSTORE
+    end
+    ret TG_E_IO
+  end
+  sz = tg_stat_size int fd
+  if lt sz 0
+    c = fclose int fd
+    ret TG_E_IO
+  end
+  h = new uchar 152 0
+  got = new ulong 1 0
+  if lt tg_read_full_local int fd h TG_GEN_HDR got 0
+    c = fclose int fd
+    ret TG_E_IO
+  end
+  if lt get got 0 TG_GEN_HDR
+    c = fclose int fd
+    ret TG_E_TRUNC
+  end
+  fields = new ulong 5 0
+  st = tg_decode_generation h ulong sz expect_gen fields
+  if ne st 1
+    c = fclose int fd
+    if eq st 2
+      ret TG_E_TRUNC
+    end
+    ret TG_E_FORMAT
+  end
+  for i ulong 152
+    put tg_hdr_tmp i get h i
+  end
+  for i ulong 5
+    put tg_fields_tmp i get fields i
+  end
+  ret tg_load_gen_body int fd expect_gen check_dig
+end
+
+fn tg_load_gen_body fd int expect_gen ulong check_dig ulong to long
+  pb = get tg_fields_tmp 2
+  ob = get tg_fields_tmp 3
+  if or gt pb TG_MAX_BUF gt ob TG_MAX_BUF
+    c = fclose fd
+    ret TG_E_NOMEM
+  end
+  g1 = tg_read_to_snap fd 0 pb
+  if lt g1 0
+    c = fclose fd
+    ret TG_E_IO
+  end
+  g2 = tg_read_to_snap fd 1 ob
+  c = fclose fd
+  if lt g2 0
+    ret TG_E_IO
+  end
+  if or ne ulong g1 pb ne ulong g2 ob
+    ret TG_E_TRUNC
+  end
+  tg_gen_digest_tmp 0 pb ob
+  for i ulong 32
+    if ne get tg_dig_tmp i get tg_hdr_tmp add 120 i
+      ret TG_E_DIGEST
+    end
+    if ne check_dig 0
+      if ne get tg_dig_tmp i get tg_dig_exp i
+        ret TG_E_DIGEST
+      end
+    end
+  end
+  put tg_snap_meta 0 expect_gen
+  put tg_snap_meta 1 get tg_fields_tmp 1
+  put tg_snap_meta 2 pb
+  put tg_snap_meta 3 ob
+  put tg_snap_meta 4 get tg_fields_tmp 4
+  for i ulong 32
+    put tg_snap_dhead i get tg_hdr_tmp add 56 i
+    put tg_snap_prev i get tg_hdr_tmp add 88 i
+    put tg_snap_digest i get tg_dig_tmp i
+  end
+  ret TG_OK
+end
+
+fn tg_write_gen_pa src_kind ulong pb ulong ob ulong with_fp ulong to long
+  fd = fopen tg_pa 0 get tg_plen 0 or or TG_O_WRONLY TG_O_CREAT TG_O_TRUNC 420
+  if lt fd 0
+    ret TG_E_IO
+  end
+  w0 = write int fd tg_hdr_tmp 0 TG_GEN_HDR
+  if ne w0 long TG_GEN_HDR
+    c = fclose int fd
+    ret TG_E_IO
+  end
+  if and ne with_fp 0 eq get tg_fp_state 0 TG_FP_MID_SHADOW_WRITE
+    half = div pb 2
+    if lt tg_write_global_fd int fd src_kind 0 0 half 0
+      c = fclose int fd
+      ret TG_E_IO
+    end
+    tg_fp_hit TG_FP_MID_SHADOW_WRITE
+    if lt tg_write_global_fd int fd src_kind 0 half sub pb half 0
+      c = fclose int fd
+      ret TG_E_IO
+    end
+  else
+    if gt pb 0
+      if lt tg_write_global_fd int fd src_kind 0 0 pb 0
+        c = fclose int fd
+        ret TG_E_IO
+      end
+    end
+  end
+  if gt ob 0
+    if lt tg_write_global_fd int fd src_kind 1 0 ob 0
+      c = fclose int fd
+      ret TG_E_IO
+    end
+  end
+  if ne fsync int fd 0
+    c = fclose int fd
+    ret TG_E_IO
+  end
+  if ne fclose int fd 0
+    ret TG_E_IO
+  end
+  ret TG_OK
+end
+
+fn tg_write_pointer_arg gen ulong with_fp ulong to long
+  if or eq tg_mk_path 0 tg_txt_cur_tmp 0 eq tg_mk_path 1 tg_txt_cur 0
+    ret TG_E_ARG
+  end
+  dig = new uchar 32 0
+  for i ulong 32
+    put dig i get tg_dig_tmp i
+  end
+  buf = new uchar 95 0
+  tg_encode_pointer gen dig buf
+  fd = fopen tg_pa 0 get tg_plen 0 or or TG_O_WRONLY TG_O_CREAT TG_O_TRUNC 420
+  if lt fd 0
+    ret TG_E_IO
+  end
+  if and ne with_fp 0 eq get tg_fp_state 0 TG_FP_MID_SWITCH
+    half = div TG_CUR_LEN 2
+    if lt tg_write_all_local int fd part buf 0 half half 0
+      c = fclose int fd
+      ret TG_E_IO
+    end
+    tg_fp_hit TG_FP_MID_SWITCH
+    if lt tg_write_all_local int fd part buf half sub TG_CUR_LEN half sub TG_CUR_LEN half 0
+      c = fclose int fd
+      ret TG_E_IO
+    end
+  else
+    if lt tg_write_all_local int fd buf TG_CUR_LEN 0
+      c = fclose int fd
+      ret TG_E_IO
+    end
+  end
+  if ne fsync int fd 0
+    c = fclose int fd
+    ret TG_E_IO
+  end
+  if ne fclose int fd 0
+    ret TG_E_IO
+  end
+  if ne with_fp 0
+    tg_fp_hit TG_FP_BEFORE_SWITCH_RENAME
+  end
+  if ne tg_rename_pa_to_pb 0
+    ret TG_E_IO
+  end
+  if ne with_fp 0
+    tg_fp_hit TG_FP_AFTER_SWITCH_BEFORE_FSYNC
+  end
+  if ne tg_fsync_dir_arg 0
+    ret 1
+  end
+  ret TG_OK
+end
+
+fn tg_read_pointer_arg gen_out edit ulong 1 to long
+  if eq tg_mk_path 0 tg_txt_cur 0
+    ret TG_E_ARG
+  end
+  fd = fopen tg_pa 0 get tg_plen 0 TG_O_RDONLY 0
+  if lt fd 0
+    if eq fd -2
+      ret TG_E_NOSTORE
+    end
+    ret TG_E_IO
+  end
+  buf = new uchar 103 0
+  got = new ulong 1 0
+  r = tg_read_full_local int fd buf 103 got
+  c = fclose int fd
+  if lt r 0
+    ret TG_E_IO
+  end
+  if ne get got 0 TG_CUR_LEN
+    ret TG_E_FORMAT
+  end
+  b95 = new uchar 95 0
+  for i ulong 95
+    put b95 i get buf i
+  end
+  dig = new uchar 32 0
+  if eq tg_decode_pointer b95 gen_out dig 0
+    ret TG_E_FORMAT
+  end
+  for i ulong 32
+    put tg_dig_exp i get dig i
+  end
+  ret TG_OK
+end
+
+fn tg_chain_step prev view uchar 32 rec view uchar 192 dst edit uchar 32 to void
+  ctx = new uchar 104 0
+  tg_sha_init ctx
+  tg_sha_update ctx prev TG_DIGEST
+  tg_sha_update ctx part rec 0 TG_REC_HASHED TG_REC_HASHED
+  tg_sha_final ctx dst
+end
+
+fn tg_dispatch_chain_arg clen ulong to long
+  if ne rem clen TG_REC_SIZE 0
+    ret TG_E_CHAIN
+  end
+  if eq tg_mk_path 0 tg_txt_dlog 0
+    ret TG_E_ARG
+  end
+  for i ulong 32
+    put tg_head_tmp i 0
+  end
+  fd = fopen tg_pa 0 get tg_plen 0 TG_O_RDONLY 0
+  if lt fd 0
+    if eq clen 0
+      ret TG_OK
+    end
+    ret TG_E_CHAIN
+  end
+  cnt = div clen TG_REC_SIZE
+  rec = new uchar 192 0
+  head = new uchar 32 0
+  nh = new uchar 32 0
+  got = new ulong 1 0
+  for i ulong cnt bound 100000
+    if lt tg_read_full_local int fd rec TG_REC_SIZE got 0
+      c = fclose int fd
+      ret TG_E_CHAIN
+    end
+    if ne get got 0 TG_REC_SIZE
+      c = fclose int fd
+      ret TG_E_CHAIN
+    end
+    if eq tg_check_dispatch_header rec i 0
+      c = fclose int fd
+      ret TG_E_CHAIN
+    end
+    tg_chain_step head rec nh
+    for j ulong 32
+      if ne get nh j get rec add TG_REC_HASHED j
+        c = fclose int fd
+        ret TG_E_CHAIN
+      end
+      put head j get nh j
+    end
+  end
+  c = fclose int fd
+  for i ulong 32
+    put tg_head_tmp i get head i
+  end
+  ret TG_OK
+end
+
+fn tg_take_lock_arg fd_out edit long 1 to long
+  if eq tg_mk_path 0 tg_txt_lock 0
+    ret TG_E_ARG
+  end
+  fd = fopen tg_pa 0 get tg_plen 0 or TG_O_RDWR TG_O_CREAT 420
+  if lt fd 0
+    ret TG_E_IO
+  end
+  if ne flock int fd TG_LOCK_EX_NB 0
+    c = fclose int fd
+    ret TG_E_LOCKED
+  end
+  put fd_out 0 fd
+  ret TG_OK
+end
+
+fn tg_build_gen0_hdr pb ulong ob ulong to void
+  zero1 = new uchar 32 0
+  zero2 = new uchar 32 0
+  fields = new ulong 5 0
+  put fields 0 0
+  put fields 1 0
+  put fields 2 pb
+  put fields 3 ob
+  put fields 4 0
+  h = new uchar 152 0
+  tg_encode_generation fields zero1 zero2 h
+  for i ulong 152
+    put tg_hdr_tmp i get h i
+  end
+  tg_gen_digest_tmp 0 pb ob
+  for i ulong 32
+    put tg_hdr_tmp add 120 i get tg_dig_tmp i
+  end
+end
+
+fn tg_create dir view uchar * dlen ulong pb ulong ob ulong to long
+  if or eq dlen 0 or gt pb TG_MAX_BUF gt ob TG_MAX_BUF
+    ret TG_E_ARG
+  end
+  tg_set_dir dir dlen
+  mr = makedir tg_dir_arg 0 dlen 493
+  if and lt mr 0 ne mr -17
+    ret TG_E_IO
+  end
+  g0 = new ulong 1 0
+  if ne tg_read_pointer_arg g0 TG_E_NOSTORE
+    ret TG_E_EXISTS
+  end
+  lk = new long 1 -1
+  r = tg_take_lock_arg lk
+  if ne r TG_OK
+    ret r
+  end
+  r = tg_create_locked pb ob
+  c = fclose int get lk 0
+  ret r
+end
+
+fn tg_create_locked pb ulong ob ulong to long
+  if eq tg_mk_path 0 tg_txt_dlog 0
+    ret TG_E_ARG
+  end
+  lf = fopen tg_pa 0 get tg_plen 0 or or TG_O_WRONLY TG_O_CREAT TG_O_TRUNC 420
+  if lt lf 0
+    ret TG_E_IO
+  end
+  if ne fsync int lf 0
+    c = fclose int lf
+    ret TG_E_IO
+  end
+  c = fclose int lf
+  tg_build_gen0_hdr pb ob
+  if or eq tg_mk_gen_path 0 1 0 0 eq tg_mk_gen_path 1 0 0 0
+    ret TG_E_ARG
+  end
+  r = tg_write_gen_pa 0 pb ob 0
+  if ne r TG_OK
+    ret r
+  end
+  if ne tg_rename_pa_to_pb 0
+    ret TG_E_IO
+  end
+  if ne tg_fsync_dir_arg 0
+    ret TG_E_IO
+  end
+  ret tg_write_pointer_arg 0 0
+end
+
+fn tg_parse_gen_name name view uchar 256 nlen ulong gen_out edit ulong 1 to ulong
+  if ne nlen 28
+    ret 0
+  end
+  for i ulong 4
+    if ne get name i get tg_txt_gen_pfx i
+      ret 0
+    end
+    if ne get name add 24 i get tg_txt_bin_sfx i
+      ret 0
+    end
+  end
+  g = ulong 0
+  for i ulong 20
+    c = ulong get name add 4 i
+    if or lt c 48 gt c 57
+      ret 0
+    end
+    g = add mul g 10 sub c 48
+  end
+  put gen_out 0 g
+  ret 1
+end
+
+fn tg_ends_tmp name view uchar 256 nlen ulong to ulong
+  if le nlen 4
+    ret 0
+  end
+  for i ulong 4
+    if ne get name add sub nlen 4 i get tg_txt_tmp_sfx i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn tg_sweep_entry pos ulong nru ulong cur_gen ulong to ulong
+  nm = new uchar 256 0
+  nlen = ulong 0
+  noff = add pos 19
+  while lt nlen 255 bound 256
+    if ge add noff nlen nru
+      break
+    end
+    ch = get tg_dents_buf add noff nlen
+    if eq ch 0
+      break
+    end
+    put nm nlen ch
+    nlen = add nlen 1
+  end
+  if eq tg_ends_tmp nm nlen 1
+    pl = tg_mk_path 0 part nm 0 nlen
+    if gt pl 0
+      if eq unlink tg_pa 0 pl 0
+        put tg_rec_meta 0 add get tg_rec_meta 0 1
+        ret 1
+      end
+    end
+    ret 0
+  end
+  gout = new ulong 1 0
+  if eq tg_parse_gen_name nm nlen gout 1
+    if gt get gout 0 cur_gen
+      pl = tg_mk_path 0 part nm 0 nlen
+      if gt pl 0
+        if eq unlink tg_pa 0 pl 0
+          put tg_rec_meta 1 add get tg_rec_meta 1 1
+          ret 1
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn tg_sweep_chunk nru ulong cur_gen ulong to ulong
+  changed = ulong 0
+  pos = ulong 0
+  while lt pos nru bound 4096
+    lo = ulong get tg_dents_buf add pos 16
+    hi = shl ulong get tg_dents_buf add pos 17 8
+    reclen = or lo hi
+    if eq reclen 0
+      break
+    end
+    if ne tg_sweep_entry pos nru cur_gen 0
+      changed = 1
+    end
+    pos = add pos reclen
+  end
+  ret changed
+end
+
+fn tg_sweep_arg cur_gen ulong to long
+  dfd = fopen tg_dir_arg 0 get tg_dir_len 0 or TG_O_RDONLY TG_O_DIRECTORY 0
+  if lt dfd 0
+    ret TG_E_IO
+  end
+  changed = ulong 0
+  while true bound 1024
+    nr = getdnts int dfd tg_dents_buf 0 16384
+    if lt nr 0
+      c = fclose int dfd
+      ret TG_E_IO
+    end
+    if eq nr 0
+      break
+    end
+    if ne tg_sweep_chunk ulong nr cur_gen 0
+      changed = 1
+    end
+  end
+  c = fclose int dfd
+  if ne changed 0
+    if ne tg_fsync_dir_arg 0
+      ret TG_E_IO
+    end
+  end
+  ret TG_OK
+end
+
+fn tg_close to void
+  if eq get tg_st_meta 0 0
+    ret
+  end
+  if gt get tg_st_meta 3 0
+    c = fclose int sub get tg_st_meta 3 1
+    put tg_st_meta 3 0
+  end
+  if gt get tg_st_meta 2 0
+    c = fclose int sub get tg_st_meta 2 1
+    put tg_st_meta 2 0
+  end
+  put tg_st_meta 0 0
+  put tg_st_meta 4 0
+end
+
+fn tg_adopt_snap_to_cur to void
+  pb = get tg_snap_meta 2
+  ob = get tg_snap_meta 3
+  put tg_st_meta 5 get tg_snap_meta 0
+  put tg_st_meta 6 get tg_snap_meta 1
+  put tg_st_meta 7 pb
+  put tg_st_meta 8 ob
+  put tg_st_meta 9 get tg_snap_meta 4
+  for i ulong 32
+    put tg_st_digest i get tg_snap_digest i
+    put tg_st_prev i get tg_snap_prev i
+    put tg_st_dhead i get tg_snap_dhead i
+  end
+  for i ulong pb bound 4194305
+    put tg_st_params i get tg_snap_params i
+  end
+  for i ulong ob bound 4194305
+    put tg_st_opt i get tg_snap_opt i
+  end
+end
+
+fn tg_open_verify_log gen ulong to long
+  if eq tg_mk_path 0 tg_txt_dlog 0
+    ret TG_E_ARG
+  end
+  lfd = fopen tg_pa 0 get tg_plen 0 TG_O_RDWR 0
+  if lt lfd 0
+    ret TG_E_IO
+  end
+  put tg_st_meta 3 add ulong lfd 1
+  lsz = tg_stat_size int lfd
+  if lt lsz 0
+    ret TG_E_IO
+  end
+  dc = get tg_st_meta 9
+  if lt ulong lsz dc
+    tg_record_refusal_arg TG_E_CHAIN gen
+    ret TG_E_CHAIN
+  end
+  r = tg_dispatch_chain_arg dc
+  if eq r TG_OK
+    for i ulong 32
+      if ne get tg_head_tmp i get tg_st_dhead i
+        r = TG_E_CHAIN
+      end
+    end
+  end
+  if ne r TG_OK
+    tg_record_refusal_arg r gen
+    ret r
+  end
+  if gt ulong lsz dc
+    put tg_rec_meta 2 sub ulong lsz dc
+    if ne ftrunc int lfd long dc 0
+      ret TG_E_IO
+    end
+    if ne fsync int lfd 0
+      ret TG_E_IO
+    end
+  end
+  ret tg_sweep_arg gen
+end
+
+fn tg_open dir view uchar * dlen ulong to long
+  if or eq dlen 0 ge dlen TG_PATHMAX
+    ret TG_E_ARG
+  end
+  tg_set_dir dir dlen
+  for i ulong 3
+    put tg_rec_meta i 0
+  end
+  for i ulong 4
+    put tg_st_stats i 0
+  end
+  for i ulong 12
+    put tg_st_meta i 0
+  end
+  for i ulong dlen
+    put tg_st_dir i get dir i
+  end
+  put tg_st_meta 1 dlen
+  lk = new long 1 -1
+  r = tg_take_lock_arg lk
+  if ne r TG_OK
+    ret r
+  end
+  put tg_st_meta 0 1
+  put tg_st_meta 2 add ulong get lk 0 1
+  ga = new ulong 1 0
+  r = tg_read_pointer_arg ga
+  if eq r TG_OK
+    if eq tg_mk_gen_path 0 0 get ga 0 0
+      r = TG_E_ARG
+    else
+      r = tg_load_gen_pa get ga 0 1
+    end
+  end
+  if ne r TG_OK
+    tg_record_refusal_arg r get ga 0
+    tg_close
+    ret r
+  end
+  tg_adopt_snap_to_cur
+  r = tg_open_verify_log get ga 0
+  if ne r TG_OK
+    tg_close
+    ret r
+  end
+  ret TG_OK
+end
+
+fn tg_shadow_begin slot ulong to long
+  if or eq get tg_st_meta 0 0 gt slot 1
+    ret TG_E_ARG
+  end
+  base = mul slot 8
+  pb = get tg_st_meta 7
+  ob = get tg_st_meta 8
+  put tg_sh_meta base TG_SH_OPEN
+  put tg_sh_meta add base 1 pb
+  put tg_sh_meta add base 2 ob
+  put tg_sh_meta add base 3 get tg_st_meta 5
+  put tg_sh_meta add base 4 get tg_st_meta 6
+  put tg_sh_meta add base 5 0
+  dbase = mul slot 32
+  for i ulong 32
+    put tg_sh_base_dig add dbase i get tg_st_digest i
+  end
+  if eq slot 0
+    for i ulong pb bound 4194305
+      put tg_sh0_params i get tg_st_params i
+    end
+    for i ulong ob bound 4194305
+      put tg_sh0_opt i get tg_st_opt i
+    end
+  else
+    for i ulong pb bound 4194305
+      put tg_sh1_params i get tg_st_params i
+    end
+    for i ulong ob bound 4194305
+      put tg_sh1_opt i get tg_st_opt i
+    end
+  end
+  ret TG_OK
+end
+
+fn tg_shadow_discard slot ulong to void
+  if gt slot 1
+    ret
+  end
+  base = mul slot 8
+  put tg_sh_meta add base 5 0
+  if eq get tg_sh_meta base TG_SH_OPEN
+    put tg_sh_meta base TG_SH_DISCARDED
+  end
+end
+
+fn tg_dispatch_store slot ulong nd ulong fields view ulong 6 refs view ulong 9 to void
+  bdig = new uchar 32 0
+  for i ulong 32
+    put bdig i get tg_sh_base_dig add mul slot 32 i
+  end
+  rec = new uchar 192 0
+  tg_encode_dispatch fields refs bdig rec
+  roff = mul nd TG_REC_SIZE
+  for i ulong TG_REC_SIZE
+    v = get rec i
+    if eq slot 0
+      put tg_sh0_recs add roff i v
+    else
+      put tg_sh1_recs add roff i v
+    end
+  end
+end
+
+fn tg_dispatch slot ulong op_id ulong arg0 ulong arg1 ulong refs view ulong 9 n_refs ulong to long
+  if or eq get tg_st_meta 0 0 or gt slot 1 gt n_refs TG_MAX_REFS
+    ret TG_E_ARG
+  end
+  base = mul slot 8
+  if ne get tg_sh_meta base TG_SH_OPEN
+    ret TG_E_STATE
+  end
+  nd = get tg_sh_meta add base 5
+  if ge nd TG_MAX_RECS
+    ret TG_E_NOMEM
+  end
+  fields = new ulong 6 0
+  put fields 0 op_id
+  put fields 1 add get tg_sh_meta add base 4 1
+  put fields 2 get tg_sh_meta add base 3
+  put fields 3 arg0
+  put fields 4 arg1
+  put fields 5 n_refs
+  tg_dispatch_store slot nd fields refs
+  put tg_sh_meta add base 5 add nd 1
+  ret TG_OK
+end
+
+fn tg_refuse slot ulong err long to long
+  put tg_st_stats 3 add get tg_st_stats 3 1
+  tg_set_dir_from_st
+  tg_record_refusal_arg err get tg_st_meta 5
+  if le slot 1
+    if eq get tg_sh_meta mul slot 8 TG_SH_OPEN
+      tg_shadow_discard slot
+    end
+  end
+  ret err
+end
+
+fn tg_validate_finite slot ulong to long
+  pb = get tg_sh_meta add mul slot 8 1
+  nf = div pb 4
+  for i ulong nf bound 1048577
+    p = mul i 4
+    u = uint 0
+    if eq slot 0
+      u = uint get tg_sh0_params p
+      u = or u shl uint get tg_sh0_params add p 1 8
+      u = or u shl uint get tg_sh0_params add p 2 16
+      u = or u shl uint get tg_sh0_params add p 3 24
+    else
+      u = uint get tg_sh1_params p
+      u = or u shl uint get tg_sh1_params add p 1 8
+      u = or u shl uint get tg_sh1_params add p 2 16
+      u = or u shl uint get tg_sh1_params add p 3 24
+    end
+    if ge and u uint 0x7fffffff uint 0x7f800000
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn tg_commit slot ulong validate_mode ulong to long
+  if or eq get tg_st_meta 0 0 gt slot 1
+    ret TG_E_ARG
+  end
+  if ne get tg_st_meta 4 0
+    ret tg_refuse slot TG_E_STATE
+  end
+  base = mul slot 8
+  if ne get tg_sh_meta base TG_SH_OPEN
+    put tg_st_stats 3 add get tg_st_stats 3 1
+    tg_set_dir_from_st
+    tg_record_refusal_arg TG_E_STATE get tg_st_meta 5
+    ret TG_E_STATE
+  end
+  stale = ulong 0
+  if ne get tg_sh_meta add base 3 get tg_st_meta 5
+    stale = 1
+  end
+  for i ulong 32
+    if ne get tg_sh_base_dig add mul slot 32 i get tg_st_digest i
+      stale = 1
+    end
+  end
+  if ne stale 0
+    ret tg_refuse slot TG_E_STALE
+  end
+  if ne get tg_sh_meta add base 1 get tg_st_meta 7
+    ret tg_refuse slot TG_E_ARG
+  end
+  if ne get tg_sh_meta add base 2 get tg_st_meta 8
+    ret tg_refuse slot TG_E_ARG
+  end
+  if eq validate_mode 2
+    ret tg_refuse slot TG_E_REJECT
+  end
+  if eq validate_mode 1
+    if ne tg_validate_finite slot 0
+      ret tg_refuse slot TG_E_REJECT
+    end
+  end
+  ret tg_commit_write slot
+end
+
+fn tg_commit_write slot ulong to long
+  nd = get tg_sh_meta add mul slot 8 5
+  base_len = get tg_st_meta 9
+  head = new uchar 32 0
+  for i ulong 32
+    put head i get tg_st_dhead i
+  end
+  rec = new uchar 192 0
+  nh = new uchar 32 0
+  lfd = int sub get tg_st_meta 3 1
+  for i ulong nd bound 256
+    roff = mul i TG_REC_SIZE
+    for j ulong TG_REC_SIZE
+      if eq slot 0
+        put rec j get tg_sh0_recs add roff j
+      else
+        put rec j get tg_sh1_recs add roff j
+      end
+    end
+    tg_set_dispatch_seq rec add div base_len TG_REC_SIZE i
+    tg_chain_step head rec nh
+    for j ulong 32
+      put rec add TG_REC_HASHED j get nh j
+      put head j get nh j
+    end
+    if ne pwrite lfd rec 0 TG_REC_SIZE long add base_len roff long TG_REC_SIZE
+      ft = ftrunc lfd long base_len
+      ret tg_refuse slot TG_E_IO
+    end
+    put tg_st_stats 0 add get tg_st_stats 0 1
+    put tg_st_stats 1 add get tg_st_stats 1 add TG_DIGEST TG_REC_HASHED
+  end
+  for i ulong 32
+    put tg_head_tmp i get head i
+  end
+  if gt nd 0
+    if ne fsync lfd 0
+      ft = ftrunc lfd long base_len
+      ret tg_refuse slot TG_E_IO
+    end
+  end
+  ret tg_commit_publish slot add base_len mul nd TG_REC_SIZE
+end
+
+fn tg_commit_hdr slot ulong new_len ulong to void
+  base = mul slot 8
+  pb = get tg_sh_meta add base 1
+  ob = get tg_sh_meta add base 2
+  fields = new ulong 5 0
+  put fields 0 add get tg_st_meta 5 1
+  put fields 1 add get tg_st_meta 6 1
+  put fields 2 pb
+  put fields 3 ob
+  put fields 4 new_len
+  head = new uchar 32 0
+  prev = new uchar 32 0
+  for i ulong 32
+    put head i get tg_head_tmp i
+    put prev i get tg_st_digest i
+  end
+  h = new uchar 152 0
+  tg_encode_generation fields head prev h
+  for i ulong 152
+    put tg_hdr_tmp i get h i
+  end
+  tg_gen_digest_tmp add slot 1 pb ob
+  for i ulong 32
+    put tg_hdr_tmp add 120 i get tg_dig_tmp i
+    put tg_dig_exp i get tg_dig_tmp i
+  end
+  put tg_st_stats 2 add get tg_st_stats 2 add TG_GEN_HASHED_HDR add pb ob
+end
+
+fn tg_corrupt_shadow_pa pb ulong to void
+  cfd = fopen tg_pa 0 get tg_plen 0 TG_O_RDWR 0
+  if lt cfd 0
+    ret
+  end
+  cb = new uchar 1 0
+  cpos = add TG_GEN_HDR div pb 3
+  if eq pread int cfd cb 0 1 long cpos 1
+    put cb 0 xor get cb 0 90
+    pw = pwrite int cfd cb 0 1 long cpos
+  end
+  cc = fclose int cfd
+end
+
+fn tg_commit_undo slot ulong unlink_pb ulong to long
+  if eq unlink_pb 0
+    u = unlink tg_pa 0 get tg_plen 0
+  else
+    u = unlink tg_pb 0 get tg_plen 1
+  end
+  lfd = int sub get tg_st_meta 3 1
+  ft = ftrunc lfd long get tg_st_meta 9
+  ret tg_refuse slot TG_E_IO
+end
+
+fn tg_commit_publish slot ulong new_len ulong to long
+  base = mul slot 8
+  pb = get tg_sh_meta add base 1
+  ob = get tg_sh_meta add base 2
+  ng = add get tg_st_meta 5 1
+  tg_set_dir_from_st
+  tg_commit_hdr slot new_len
+  if or eq tg_mk_gen_path 0 1 ng 0 eq tg_mk_gen_path 1 0 ng 0
+    ret tg_refuse slot TG_E_ARG
+  end
+  tg_fp_hit TG_FP_BEFORE_SHADOW_WRITE
+  if ne tg_write_gen_pa add slot 1 pb ob 1 TG_OK
+    ret tg_commit_undo slot 0
+  end
+  if and eq get tg_fp_state 0 TG_FP_AFTER_SHADOW_WRITE eq get tg_fp_state 1 TG_FPMODE_CORRUPT
+    tg_corrupt_shadow_pa pb
+  end
+  if ne tg_load_gen_pa ng 1 TG_OK
+    u = unlink tg_pa 0 get tg_plen 0
+    lfd = int sub get tg_st_meta 3 1
+    ft = ftrunc lfd long get tg_st_meta 9
+    fs = fsync lfd
+    ret tg_refuse slot TG_E_SHADOW
+  end
+  tg_fp_hit TG_FP_AFTER_SHADOW_WRITE
+  if ne tg_rename_pa_to_pb 0
+    ret tg_commit_undo slot 0
+  end
+  if ne tg_fsync_dir_arg 0
+    ret tg_commit_undo slot 1
+  end
+  tg_fp_hit TG_FP_AFTER_GEN_RENAME
+  wp = tg_write_pointer_arg ng 1
+  if lt wp 0
+    ret tg_commit_undo slot 1
+  end
+  if eq wp 0
+    tg_fp_hit TG_FP_AFTER_SWITCH
+  end
+  tg_commit_adopt slot ng add get tg_st_meta 6 1 new_len
+  if gt wp 0
+    put tg_st_meta 4 1
+    put tg_st_stats 3 add get tg_st_stats 3 1
+    tg_record_refusal_arg TG_E_IO ng
+    ret TG_E_IO
+  end
+  ret TG_OK
+end
+
+fn tg_commit_adopt slot ulong ng ulong nstep ulong new_len ulong to void
+  base = mul slot 8
+  pb = get tg_sh_meta add base 1
+  ob = get tg_sh_meta add base 2
+  put tg_st_meta 5 ng
+  put tg_st_meta 6 nstep
+  put tg_st_meta 7 pb
+  put tg_st_meta 8 ob
+  put tg_st_meta 9 new_len
+  for i ulong 32
+    put tg_st_prev i get tg_sh_base_dig add mul slot 32 i
+    put tg_st_digest i get tg_dig_tmp i
+    put tg_st_dhead i get tg_head_tmp i
+  end
+  if eq slot 0
+    for i ulong pb bound 4194305
+      put tg_st_params i get tg_sh0_params i
+    end
+    for i ulong ob bound 4194305
+      put tg_st_opt i get tg_sh0_opt i
+    end
+  else
+    for i ulong pb bound 4194305
+      put tg_st_params i get tg_sh1_params i
+    end
+    for i ulong ob bound 4194305
+      put tg_st_opt i get tg_sh1_opt i
+    end
+  end
+  put tg_sh_meta base TG_SH_COMMITTED
+end
+
+fn tg_read_current dir view uchar * dlen ulong to long
+  if eq dlen 0
+    ret TG_E_ARG
+  end
+  tg_set_dir dir dlen
+  ga = new ulong 1 0
+  r = tg_read_pointer_arg ga
+  if ne r TG_OK
+    ret r
+  end
+  if eq tg_mk_gen_path 0 0 get ga 0 0
+    ret TG_E_ARG
+  end
+  ret tg_load_gen_pa get ga 0 1
+end
+
+fn tg_read_gen dir view uchar * dlen ulong gen ulong check_dig ulong expect_dig view uchar 32 to long
+  if eq dlen 0
+    ret TG_E_ARG
+  end
+  tg_set_dir dir dlen
+  for i ulong 32
+    put tg_dig_exp i get expect_dig i
+  end
+  if eq tg_mk_gen_path 0 0 gen 0
+    ret TG_E_ARG
+  end
+  ret tg_load_gen_pa gen check_dig
+end
+
+fn tg_verify_history dir view uchar * dlen ulong n_out edit ulong 1 to long
+  put n_out 0 0
+  tg_set_dir dir dlen
+  ga = new ulong 1 0
+  r = tg_read_pointer_arg ga
+  if ne r TG_OK
+    ret r
+  end
+  gen = get ga 0
+  later_len = ulong 0xffffffffffffffff
+  nv = ulong 0
+  while true bound 100000
+    if eq tg_mk_gen_path 0 0 gen 0
+      ret TG_E_ARG
+    end
+    r = tg_load_gen_pa gen 1
+    if ne r TG_OK
+      ret r
+    end
+    if gt get tg_snap_meta 4 later_len
+      ret TG_E_CHAIN
+    end
+    if eq gen 0
+      if ne get tg_snap_meta 1 0
+        ret TG_E_CHAIN
+      end
+      for i ulong 32
+        if ne get tg_snap_prev i 0
+          ret TG_E_CHAIN
+        end
+      end
+    end
+    later_len = get tg_snap_meta 4
+    for i ulong 32
+      put tg_dig_exp i get tg_snap_prev i
+    end
+    nv = add nv 1
+    if eq gen 0
+      put n_out 0 nv
+      ret TG_OK
+    end
+    gen = sub gen 1
+  end
+  ret TG_E_CHAIN
+end
+
+fn tg_dispatch_read dir view uchar * dlen ulong seq ulong fields edit ulong 7 bdig edit uchar 32 to long
+  tg_set_dir dir dlen
+  r = tg_dispatch_chain_arg mul add seq 1 TG_REC_SIZE
+  if ne r TG_OK
+    ret r
+  end
+  if eq tg_mk_path 0 tg_txt_dlog 0
+    ret TG_E_ARG
+  end
+  fd = fopen tg_pa 0 get tg_plen 0 TG_O_RDONLY 0
+  if lt fd 0
+    ret TG_E_IO
+  end
+  rec = new uchar 192 0
+  g = pread int fd rec 0 TG_REC_SIZE long mul seq TG_REC_SIZE
+  c = fclose int fd
+  if ne g long TG_REC_SIZE
+    ret TG_E_CHAIN
+  end
+  refs = new ulong 9 0
+  if eq tg_decode_dispatch rec fields refs 0
+    ret TG_E_FORMAT
+  end
+  for i ulong 32
+    put bdig i get rec add 128 i
+  end
+  ret TG_OK
+end

@@ -1,0 +1,184 @@
+note SPDX-License-Identifier: Apache-2.0
+note test_tensor_store.om -- Pure seeded OM-2 M20 crash-safe tensor store test suite.
+
+global tss_c ulong 2
+global tss_base uchar 256
+global tss_blen ulong 1
+global tss_dn ulong 1
+
+text tss_pass "M20_TENSOR_STORE_TESTS_PASS\n"
+text tss_fail "M20_TENSOR_STORE_TESTS_FAIL\n"
+text tss_usage "usage: test_tensor_store <scratch-dir>\n"
+text tss_t_rt "rt"
+text tss_t_cr "cr"
+text tss_t_ng "ng"
+
+fn ts_chk cond bool to void
+  put tss_c 0 add get tss_c 0 1
+  if not cond
+    put tss_c 1 add get tss_c 1 1
+  end
+end
+
+fn ts_newdir dst edit uchar 512 tag view uchar * to ulong
+  bl = get tss_blen 0
+  dn = get tss_dn 0
+  put tss_dn 0 add dn 1
+  for i ulong bl
+    put dst i get tss_base i
+  end
+  put dst bl 47
+  p = add bl 1
+  put dst p uchar add 48 rem div dn 10 10
+  put dst add p 1 uchar add 48 rem dn 10
+  put dst add p 2 45
+  p = add p 3
+  tl = len tag
+  for i ulong tl
+    put dst add p i get tag i
+  end
+  ret add p tl
+end
+
+fn test_roundtrip_and_lock to void
+  d = new uchar 512 0
+  dl = ts_newdir d tss_t_rt
+  ts_chk eq ot_ctx_init 32 OT_OK
+  ts_chk eq ots_open part d 0 dl dl 8 OT_OK
+  sh = new ulong 8 0
+  put sh 0 4
+  dat = new f32 4 0.0f32
+  put dat 0 1.5f32
+  put dat 1 -0.0f32
+  put dat 2 3.25f32
+  put dat 3 42.0f32
+  ht = new ulong 2 0
+  ts_chk eq ot_from_f32 1 sh dat ht OT_OK
+  hs = new ulong 2 0
+  ts_chk eq ots_put get ht 0 get ht 1 hs OT_OK
+  ts_chk eq ots_live_count 1
+  note Busy lock check via child process
+  pid = fork
+  if eq pid 0
+    if eq ots_open part d 0 dl dl 8 OTS_ERR_BUSY
+      exit 0
+    end
+    exit 1
+  end
+  sb = new uchar 4 0
+  wp = waitpid int pid sb 0 4 0
+  ws = or uint get sb 0 shl uint get sb 1 8
+  ts_chk eq and shr ws 8 255 0
+  ots_close
+  note Reopen and verify data + release generation stays stale
+  ts_chk eq ots_open part d 0 dl dl 8 OT_OK
+  ts_chk eq ots_live_count 1
+  hg = new ulong 2 0
+  ts_chk eq ots_get get hs 0 get hs 1 hg OT_OK
+  obuf = new f32 4 0.0f32
+  ts_chk eq ot_read_f32 get hg 0 get hg 1 obuf OT_OK
+  ts_chk eq get obuf 0 1.5f32
+  ts_chk eq bitcast uint get obuf 1 OT_NEG0_BITS
+  ts_chk eq get obuf 3 42.0f32
+  ts_chk eq ots_release get hs 0 get hs 1 OT_OK
+  ts_chk eq ots_release get hs 0 get hs 1 OT_ERR_STALE
+  ots_close
+  ts_chk eq ots_open part d 0 dl dl 8 OT_OK
+  ts_chk eq ots_live_count 0
+  ts_chk not ots_valid get hs 0 get hs 1
+  ots_close
+end
+
+fn test_crash_child step ulong d view uchar 512 dl ulong sh view ulong 8 dat view f32 4 to void
+  ht = new ulong 2 0
+  hs = new ulong 2 0
+  if ne ots_open part d 0 dl dl 4 OT_OK
+    exit 2
+  end
+  rc = ot_from_f32 1 sh dat ht
+  rc = ots_set_crash_step step
+  rc = ots_put get ht 0 get ht 1 hs
+  exit 3
+end
+
+fn test_crash_one step ulong sh view ulong 8 dat view f32 4 to void
+  d = new uchar 512 0
+  sb = new uchar 4 0
+  dl = ts_newdir d tss_t_cr
+  ts_chk eq ot_ctx_init 32 OT_OK
+  ts_chk eq ots_open part d 0 dl dl 4 OT_OK
+  ots_close
+  pid = fork
+  if eq pid 0
+    test_crash_child step d dl sh dat
+  end
+  wp = waitpid int pid sb 0 4 0
+  ws = or uint get sb 0 shl uint get sb 1 8
+  ts_chk eq and shr ws 8 255 uint OTS_CRASH_EXIT
+  ts_chk eq ots_open part d 0 dl dl 4 OT_OK
+  if ge step OTS_CRASH_JOURNAL_RENAMED
+    ts_chk eq ots_live_count 1
+  else
+    ts_chk eq ots_live_count 0
+  end
+  ots_close
+end
+
+fn test_crash_matrix to void
+  sh = new ulong 8 0
+  put sh 0 4
+  dat = new f32 4 0.0f32
+  put dat 0 7.0f32
+  put dat 1 8.0f32
+  put dat 2 9.0f32
+  put dat 3 10.0f32
+  for si ulong 8
+    test_crash_one add si 1 sh dat
+  end
+end
+
+fn test_corrupt_and_torn to void
+  d = new uchar 512 0
+  dl = ts_newdir d tss_t_ng
+  ts_chk eq ot_ctx_init 32 OT_OK
+  ts_chk eq ots_open part d 0 dl dl 4 OT_OK
+  sh = new ulong 8 0
+  put sh 0 2
+  dat = new f32 2 1.0f32
+  ht = new ulong 2 0
+  hs = new ulong 2 0
+  ts_chk eq ot_from_f32 1 sh dat ht OT_OK
+  ts_chk eq ots_put get ht 0 get ht 1 hs OT_OK
+  ots_close
+  note Wrong capacity refused
+  ts_chk eq ots_open part d 0 dl dl 8 OT_ERR_BAD_ARGS
+  note Torn journal refused
+  pl = ots_mk_path 0 ots_txt_jrn
+  tr = truncate ots_pa 0 pl 40
+  ts_chk eq ots_open part d 0 dl dl 4 OTS_ERR_TORN
+end
+
+fn main to int
+  if ne argcnt 2
+    w = write 2 tss_usage 0 len tss_usage
+    ret 2
+  end
+  bl = argread 1 tss_base 0 256
+  if le bl 0
+    ret 2
+  end
+  put tss_blen 0 ulong bl
+  mr = makedir tss_base 0 ulong bl 493
+  if and lt mr 0 ne mr -17
+    ret 2
+  end
+  test_roundtrip_and_lock
+  test_crash_matrix
+  test_corrupt_and_torn
+  if ne get tss_c 1 0
+    w = write 1 tss_fail 0 len tss_fail
+    ret 1
+  end
+  w = write 1 tss_pass 0 len tss_pass
+  ret 0
+end

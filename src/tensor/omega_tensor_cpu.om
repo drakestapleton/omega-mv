@@ -1,0 +1,637 @@
+note SPDX-License-Identifier: Apache-2.0
+note omega_tensor_cpu.om -- Pure seeded OM-2 CPU realization and E1 reduction seam for M20 OMEGA_TENSOR.
+
+const OT_OK long 0
+const OT_ERR_BAD_ARGS long -1
+const OT_ERR_RANK long -2
+const OT_ERR_SHAPE long -3
+const OT_ERR_DTYPE long -4
+const OT_ERR_STALE long -5
+const OT_ERR_BOUNDS long -6
+const OT_ERR_NOT_CONTIGUOUS long -7
+const OT_ERR_CAPACITY long -8
+const OT_ERR_AXIS long -9
+const OT_ERR_NUMERIC long -10
+const OT_ERR_REALIZATION long -11
+const OT_ERR_MASK long -12
+
+const OT_DT_F32 ulong 1
+const OT_DT_F16 ulong 2
+const OT_DT_BF16 ulong 3
+
+const OT_TU_SQRT ulong 0
+const OT_TU_EXP2 ulong 1
+const OT_TU_LOG2 ulong 2
+const OT_TU_SIGMOID ulong 3
+const OT_TU_TANH ulong 4
+const OT_TU_EXP ulong 5
+const OT_TU_LOG ulong 6
+const OT_TU_RELU ulong 7
+const OT_TU_RSQRT ulong 8
+const OT_TU_ERF ulong 9
+const OT_TU_GELU ulong 10
+const OT_TU_SIN ulong 11
+const OT_TU_COS ulong 12
+const OT_TU_NEG ulong 13
+const OT_TU_COUNT ulong 14
+
+const OT_TB_ADD ulong 0
+const OT_TB_SUB ulong 1
+const OT_TB_MUL ulong 2
+const OT_TB_DIV ulong 3
+const OT_TB_MIN ulong 4
+const OT_TB_MAX ulong 5
+const OT_TB_SEL_GE ulong 6
+const OT_TB_SEL_LT ulong 7
+const OT_TB_SEL_LE ulong 8
+const OT_TB_SEL_GT ulong 9
+const OT_TB_SEL_EQ ulong 10
+const OT_TB_SEL_NE ulong 11
+const OT_TB_SEL_NUM ulong 12
+const OT_TB_SEL_NAN ulong 13
+const OT_TB_SEL_LTU ulong 14
+const OT_TB_SEL_LEU ulong 15
+const OT_TB_SEL_GTU ulong 16
+const OT_TB_SEL_GEU ulong 17
+const OT_TB_SEL_EQU ulong 18
+const OT_TB_SEL_NEU ulong 19
+const OT_TB_CMP_EQ ulong 20
+const OT_TB_CMP_NE ulong 21
+const OT_TB_CMP_LT ulong 22
+const OT_TB_CMP_LE ulong 23
+const OT_TB_CMP_GT ulong 24
+const OT_TB_CMP_GE ulong 25
+const OT_TB_COUNT ulong 26
+
+const OT_TR_SUM ulong 0
+const OT_TR_MAX ulong 1
+const OT_TR_MIN ulong 2
+const OT_TR_MEAN ulong 3
+const OT_TR_COUNT ulong 4
+
+const OT_QNAN_BITS uint 0x7fc00000
+const OT_PINF_BITS uint 0x7f800000
+const OT_NINF_BITS uint 0xff800000
+const OT_NEG0_BITS uint 0x80000000
+const OT_ONE_BITS uint 0x3f800000
+
+fn ot_is_nan u uint to bool
+  ret gt and u uint 0x7fffffff OT_PINF_BITS
+end
+
+fn ot_relu_bits u uint to uint
+  if gt and u uint 0x7fffffff OT_PINF_BITS
+    ret OT_QNAN_BITS
+  end
+  if ne shr u 31 0
+    ret uint 0
+  end
+  ret u
+end
+
+fn ot_neg_bits u uint to uint
+  if gt and u uint 0x7fffffff OT_PINF_BITS
+    ret OT_QNAN_BITS
+  end
+  ret xor u OT_NEG0_BITS
+end
+
+fn ot_fmnmx_min a f32 b f32 to f32
+  ua = bitcast uint a
+  ub = bitcast uint b
+  if ot_is_nan ua
+    if ot_is_nan ub
+      ret bitcast f32 OT_QNAN_BITS
+    end
+    ret b
+  end
+  if ot_is_nan ub
+    ret a
+  end
+  if eq a b
+    if eq ua OT_NEG0_BITS
+      ret a
+    end
+    ret b
+  end
+  if lt a b
+    ret a
+  end
+  ret b
+end
+
+fn ot_fmnmx_max a f32 b f32 to f32
+  ua = bitcast uint a
+  ub = bitcast uint b
+  if ot_is_nan ua
+    if ot_is_nan ub
+      ret bitcast f32 OT_QNAN_BITS
+    end
+    ret b
+  end
+  if ot_is_nan ub
+    ret a
+  end
+  if eq a b
+    if eq ua uint 0
+      ret a
+    end
+    ret b
+  end
+  if gt a b
+    ret a
+  end
+  ret b
+end
+
+fn ot_cmp_pred op ulong a f32 b f32 to bool
+  unord = or ot_is_nan bitcast uint a ot_is_nan bitcast uint b
+  if or eq op OT_TB_SEL_GE eq op OT_TB_CMP_GE
+    if unord
+      ret false
+    end
+    ret ge a b
+  end
+  if or eq op OT_TB_SEL_LT eq op OT_TB_CMP_LT
+    if unord
+      ret false
+    end
+    ret lt a b
+  end
+  if or eq op OT_TB_SEL_LE eq op OT_TB_CMP_LE
+    if unord
+      ret false
+    end
+    ret le a b
+  end
+  if or eq op OT_TB_SEL_GT eq op OT_TB_CMP_GT
+    if unord
+      ret false
+    end
+    ret gt a b
+  end
+  if or eq op OT_TB_SEL_EQ eq op OT_TB_CMP_EQ
+    if unord
+      ret false
+    end
+    ret eq a b
+  end
+  if or eq op OT_TB_SEL_NE eq op OT_TB_CMP_NE
+    if unord
+      ret false
+    end
+    ret ne a b
+  end
+  if eq op OT_TB_SEL_NUM
+    ret not unord
+  end
+  if eq op OT_TB_SEL_NAN
+    ret unord
+  end
+  if eq op OT_TB_SEL_LTU
+    if unord
+      ret true
+    end
+    ret lt a b
+  end
+  if eq op OT_TB_SEL_LEU
+    if unord
+      ret true
+    end
+    ret le a b
+  end
+  if eq op OT_TB_SEL_GTU
+    if unord
+      ret true
+    end
+    ret gt a b
+  end
+  if eq op OT_TB_SEL_GEU
+    if unord
+      ret true
+    end
+    ret ge a b
+  end
+  if eq op OT_TB_SEL_EQU
+    if unord
+      ret true
+    end
+    ret eq a b
+  end
+  if unord
+    ret true
+  end
+  ret ne a b
+end
+
+fn ot_binary_scalar op ulong a f32 b f32 to f32
+  if eq op OT_TB_ADD
+    ret add a b
+  end
+  if eq op OT_TB_SUB
+    ret sub a b
+  end
+  if eq op OT_TB_MUL
+    ret mul a b
+  end
+  if eq op OT_TB_DIV
+    ret div a b
+  end
+  if eq op OT_TB_MIN
+    ret ot_fmnmx_min a b
+  end
+  if eq op OT_TB_MAX
+    ret ot_fmnmx_max a b
+  end
+  p = ot_cmp_pred op a b
+  if ge op OT_TB_CMP_EQ
+    if p
+      ret 1.0f32
+    end
+    ret 0.0f32
+  end
+  if p
+    ret a
+  end
+  ret b
+end
+
+note IEEE binary32 <-> bfloat16 (RNE) and binary32 <-> binary16 (RNE)
+fn ot_f32_to_bf16 u uint to uint
+  if gt and u uint 0x7fffffff OT_PINF_BITS
+    ret or uint 0x7fc0 and shr u 16 uint 0x8000
+  end
+  lsb = and shr u 16 uint 1
+  rb = add uint 0x7fff lsb
+  ret and shr add u rb 16 uint 0xffff
+end
+
+fn ot_bf16_to_f32 h uint to uint
+  ret shl h 16
+end
+
+fn ot_f32_to_f16 u uint to uint
+  sign = and shr u 16 uint 0x8000
+  exp = int and shr u 23 uint 0xff
+  mant = and u uint 0x7fffff
+  if eq exp 255
+    if ne mant 0
+      ret or sign uint 0x7e00
+    end
+    ret or sign uint 0x7c00
+  end
+  e = sub exp 112
+  if ge e 31
+    ret or sign uint 0x7c00
+  end
+  if le e 0
+    if lt e -10
+      ret sign
+    end
+    m = or mant uint 0x800000
+    sh = uint sub 14 e
+    half = shr m sh
+    rem_m = and m sub shl uint 1 sh uint 1
+    mid = shl uint 1 sub sh uint 1
+    if gt rem_m mid
+      half = add half uint 1
+    else
+      if eq rem_m mid
+        if ne and half uint 1 uint 0
+          half = add half uint 1
+        end
+      end
+    end
+    ret or sign half
+  end
+  h = or shl uint e 10 shr mant 13
+  rem_m = and mant uint 0x1fff
+  if gt rem_m uint 0x1000
+    h = add h uint 1
+  else
+    if eq rem_m uint 0x1000
+      if ne and h uint 1 uint 0
+        h = add h uint 1
+      end
+    end
+  end
+  ret or sign h
+end
+
+fn ot_f16_to_f32 h uint to uint
+  sign = shl and h uint 0x8000 16
+  exp = and shr h 10 uint 0x1f
+  mant = and h uint 0x3ff
+  if eq exp 31
+    if ne mant 0
+      ret OT_QNAN_BITS
+    end
+    ret or sign OT_PINF_BITS
+  end
+  if eq exp 0
+    if eq mant 0
+      ret sign
+    end
+    e = uint 113
+    m = mant
+    while eq and m uint 0x400 uint 0 bound 12
+      m = shl m 1
+      e = sub e uint 1
+    end
+    m = and m uint 0x3ff
+    ret or sign or shl e 23 shl m 13
+  end
+  ret or sign or shl add exp uint 112 23 shl mant 13
+end
+
+note Pure OM-2 F32 transcendentals (Cody-Waite + Horner FMA)
+fn ot_pow2i k int to f32
+  ret bitcast f32 shl uint add k 127 23
+end
+
+fn ot_scale2 m f32 k int to f32
+  if gt k 127
+    ret mul mul m ot_pow2i 127 ot_pow2i sub k 127
+  end
+  if lt k -126
+    ret mul mul m ot_pow2i add k 126 ot_pow2i -126
+  end
+  ret mul m ot_pow2i k
+end
+
+fn ot_math_exp x f32 to f32
+  if ot_is_nan bitcast uint x
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  if gt x 88.722839f32
+    ret bitcast f32 OT_PINF_BITS
+  end
+  if lt x -103.97208f32
+    ret 0.0f32
+  end
+  magic = bitcast f32 uint 0x4b400000
+  t = add mul x 1.44269504f32 magic
+  kf = sub t magic
+  k = sub int bitcast uint t int 0x4b400000
+  r = fma sub 0.0f32 kf 0.69314575f32 x
+  r = fma sub 0.0f32 kf 0.0000014286068f32 r
+  p = f32 0.0001984127f32
+  p = fma p r 0.0013888889f32
+  p = fma p r 0.0083333338f32
+  p = fma p r 0.041666668f32
+  p = fma p r 0.16666667f32
+  p = fma p r 0.5f32
+  p = fma p r 1.0f32
+  m = fma p r 1.0f32
+  ret ot_scale2 m k
+end
+
+fn ot_math_exp2 x f32 to f32
+  if ot_is_nan bitcast uint x
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  if ge x 128.0f32
+    ret bitcast f32 OT_PINF_BITS
+  end
+  if lt x -150.0f32
+    ret 0.0f32
+  end
+  ret ot_math_exp mul x 0.69314718f32
+end
+
+fn ot_math_log x f32 to f32
+  u = bitcast uint x
+  if ot_is_nan u
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  if eq and u uint 0x7fffffff uint 0
+    ret bitcast f32 OT_NINF_BITS
+  end
+  if ne shr u 31 0
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  if eq u OT_PINF_BITS
+    ret x
+  end
+  e = sub int shr u 23 127
+  m = bitcast f32 or and u uint 0x007fffff uint 0x3f800000
+  if gt m 1.41421356f32
+    m = mul m 0.5f32
+    e = add e 1
+  end
+  z = div sub m 1.0f32 add m 1.0f32
+  z2 = mul z z
+  p = f32 0.14285715f32
+  p = fma p z2 0.2f32
+  p = fma p z2 0.33333334f32
+  p = fma p z2 1.0f32
+  lnm = mul 2.0f32 mul z p
+  ret fma f32 e 0.69314718f32 lnm
+end
+
+fn ot_math_log2 x f32 to f32
+  ret mul ot_math_log x 1.44269504f32
+end
+
+fn ot_math_sigmoid x f32 to f32
+  if ot_is_nan bitcast uint x
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  if ge x 0.0f32
+    em = ot_math_exp sub 0.0f32 x
+    ret div 1.0f32 add 1.0f32 em
+  end
+  ep = ot_math_exp x
+  ret div ep add 1.0f32 ep
+end
+
+fn ot_math_tanh x f32 to f32
+  if ot_is_nan bitcast uint x
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  ax = fabs x
+  if gt ax 10.0f32
+    if lt x 0.0f32
+      ret -1.0f32
+    end
+    ret 1.0f32
+  end
+  e2 = ot_math_exp mul 2.0f32 ax
+  t = div sub e2 1.0f32 add e2 1.0f32
+  if lt x 0.0f32
+    ret sub 0.0f32 t
+  end
+  ret t
+end
+
+fn ot_math_erf x f32 to f32
+  if ot_is_nan bitcast uint x
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  ax = fabs x
+  if ge ax 4.0f32
+    if lt x 0.0f32
+      ret -1.0f32
+    end
+    ret 1.0f32
+  end
+  t = div 1.0f32 fma 0.3275911f32 ax 1.0f32
+  p = f32 1.0614054f32
+  p = fma p t -1.4531520f32
+  p = fma p t 1.4214137f32
+  p = fma p t -0.28449674f32
+  p = fma p t 0.25482959f32
+  y = sub 1.0f32 mul mul p t ot_math_exp sub 0.0f32 mul ax ax
+  if lt x 0.0f32
+    ret sub 0.0f32 y
+  end
+  ret y
+end
+
+fn ot_math_sin x f32 to f32
+  if ot_is_nan bitcast uint x
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  if gt fabs x 4194304.0f32
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  magic = bitcast f32 uint 0x4b400000
+  t = add mul x 0.63661977f32 magic
+  kf = sub t magic
+  q = and sub int bitcast uint t int 0x4b400000 3
+  r = fma sub 0.0f32 kf 1.5707964f32 x
+  r2 = mul r r
+  res = f32 0.0f32
+  if eq and q 1 0
+    p = f32 -0.0001984127f32
+    p = fma p r2 0.0083333338f32
+    p = fma p r2 -0.16666667f32
+    res = fma mul p r2 r r
+  else
+    p = f32 0.00002480159f32
+    p = fma p r2 -0.0013888889f32
+    p = fma p r2 0.041666668f32
+    p = fma p r2 -0.5f32
+    res = fma p r2 1.0f32
+  end
+  if ge q 2
+    ret sub 0.0f32 res
+  end
+  ret res
+end
+
+fn ot_math_cos x f32 to f32
+  if ot_is_nan bitcast uint x
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  if gt fabs x 4194304.0f32
+    ret bitcast f32 OT_QNAN_BITS
+  end
+  ret ot_math_sin add x 1.5707964f32
+end
+
+fn ot_unary_scalar op ulong x f32 to f32
+  if eq op OT_TU_SQRT
+    ret fsqrt x
+  end
+  if eq op OT_TU_RELU
+    ret bitcast f32 ot_relu_bits bitcast uint x
+  end
+  if eq op OT_TU_NEG
+    ret bitcast f32 ot_neg_bits bitcast uint x
+  end
+  if eq op OT_TU_EXP2
+    ret ot_math_exp2 x
+  end
+  if eq op OT_TU_LOG2
+    ret ot_math_log2 x
+  end
+  if eq op OT_TU_SIGMOID
+    ret ot_math_sigmoid x
+  end
+  if eq op OT_TU_TANH
+    ret ot_math_tanh x
+  end
+  if eq op OT_TU_EXP
+    ret ot_math_exp x
+  end
+  if eq op OT_TU_LOG
+    ret ot_math_log x
+  end
+  if eq op OT_TU_RSQRT
+    ret div 1.0f32 fsqrt x
+  end
+  if eq op OT_TU_ERF
+    ret ot_math_erf x
+  end
+  if eq op OT_TU_GELU
+    ret mul 0.5f32 mul x add 1.0f32 ot_math_erf mul x 0.70710678f32
+  end
+  if eq op OT_TU_SIN
+    ret ot_math_sin x
+  end
+  ret ot_math_cos x
+end
+
+note E1 reduction seam: RECURSIVE_TILE32_PAIRWISE_TREE_LANE_DELTA_16_8_4_2_1_PAD_IDENTITY_MIN_ONE_LEVEL
+global ot_red_a f32 16384
+global ot_red_b f32 16384
+
+fn ot_red_combine op ulong a f32 b f32 to f32
+  if eq op OT_TR_MAX
+    ret ot_fmnmx_max a b
+  end
+  if eq op OT_TR_MIN
+    ret ot_fmnmx_min a b
+  end
+  ret add a b
+end
+
+fn ot_red_tile32 op ulong tile edit f32 32 to f32
+  d = ulong 16
+  for s ulong 5
+    lim = sub 32 d
+    for i ulong lim
+      put tile i ot_red_combine op get tile i get tile add i d
+    end
+    d = shr d 1
+  end
+  ret get tile 0
+end
+
+note Caller populates ot_red_a[0..n) before calling ot_reduce_cpu.
+fn ot_reduce_cpu op ulong n ulong to f32
+  pad = bitcast f32 OT_NEG0_BITS
+  if or eq op OT_TR_MAX eq op OT_TR_MIN
+    pad = bitcast f32 OT_QNAN_BITS
+  end
+  len_c = n
+  tile = new f32 32 0.0f32
+  while true bound 16
+    nlen = div add len_c 31 32
+    for j ulong nlen bound 1024
+      base = mul j 32
+      for k ulong 32
+        idx = add base k
+        if lt idx len_c
+          put tile k get ot_red_a idx
+        else
+          put tile k pad
+        end
+      end
+      put ot_red_b j ot_red_tile32 op tile
+    end
+    for j ulong nlen bound 1024
+      put ot_red_a j get ot_red_b j
+    end
+    len_c = nlen
+    if le len_c 1
+      break
+    end
+  end
+  res = get ot_red_a 0
+  if eq op OT_TR_MEAN
+    ret div res f32 n
+  end
+  ret res
+end

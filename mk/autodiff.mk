@@ -27,21 +27,17 @@ AUTODIFF_DEPS = src/omega_numeric.c src/omega_numeric_provenance.c src/omega_bla
 AUTODIFF_HDRS = src/autodiff/omega_autodiff.h src/tensor/omega_tensor.h src/tensor/omega_tensor_reduce_seam.h \
 	src/omega_numeric_reduce.h src/omega_numeric.h src/sha256.h src/omega_numeric_transc.h
 
-$(OUT_DIR)/test_omega_autodiff: tests/test_omega_autodiff.c $(AUTODIFF_SRCS) $(AUTODIFF_TENSOR_SRCS) \
-		$(AUTODIFF_DEPS) $(AUTODIFF_HDRS)
-	@mkdir -p $(OUT_DIR)
-	gcc $(AUTODIFF_CFLAGS) -O2 -o $@ tests/test_omega_autodiff.c $(AUTODIFF_SRCS) $(AUTODIFF_TENSOR_SRCS) \
-		$(AUTODIFF_DEPS)
+AUTODIFF_OMC ?= seed/out/omc
+AUTODIFF_OM_SRCS = src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train/tg_sha256.om \
+	src/tensor/omega_tensor_cpu.om src/tensor/omega_tensor.om \
+	src/autodiff/gradient_shape.om src/autodiff/omega_autodiff.om
 
-$(OUT_DIR)/test_omega_autodiff_asan: tests/test_omega_autodiff.c $(AUTODIFF_SRCS) $(AUTODIFF_TENSOR_SRCS) \
-		$(AUTODIFF_DEPS) $(AUTODIFF_HDRS)
+$(OUT_DIR)/test_omega_autodiff: src/autodiff/test_autodiff.om $(AUTODIFF_OM_SRCS) $(AUTODIFF_OMC)
 	@mkdir -p $(OUT_DIR)
-	gcc $(AUTODIFF_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/test_omega_autodiff.c $(AUTODIFF_SRCS) $(AUTODIFF_TENSOR_SRCS) $(AUTODIFF_DEPS)
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(AUTODIFF_OM_SRCS) src/autodiff/test_autodiff.om) | $(AUTODIFF_OMC) > $@ && chmod +x $@
 
-test-autodiff: $(OUT_DIR)/test_omega_autodiff $(OUT_DIR)/test_omega_autodiff_asan
+test-autodiff: $(OUT_DIR)/test_omega_autodiff
 	./$(OUT_DIR)/test_omega_autodiff
-	./$(OUT_DIR)/test_omega_autodiff_asan
 
 $(OUT_DIR)/test_omega_ad_fixture: tests/test_omega_ad_fixture.c $(AUTODIFF_SRCS) $(AUTODIFF_TENSOR_SRCS) \
 		$(AUTODIFF_DEPS) $(AUTODIFF_HDRS)

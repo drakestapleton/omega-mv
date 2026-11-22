@@ -1,0 +1,1760 @@
+note SPDX-License-Identifier: Apache-2.0
+note omega_tensor.om -- Pure seeded OM-2 M20 semantic tensor layer.
+note Immutable tensors, generation-checked storage and descriptor slots,
+note views (permute, transpose, slice, reshape, broadcast_to), value/view IDs,
+note elementwise, compare, where, reduce, reduce_axes, sum_to_shape, matmul,
+note embed, concat, cast. Composed with tensor_shape.om, tensor_ops.om,
+note tg_sha256.om, and omega_tensor_cpu.om.
+
+const OT_MAX_SLOTS ulong 256
+const OT_SLOT_BYTES ulong 16384
+const OT_MAX_ELEMS ulong 1073741824
+const OT_MAX_RANK ulong 8
+const OT_U64_MAX ulong 0xffffffffffffffff
+
+global ot_ctx_cap ulong 1
+global ot_arena uchar 4194304
+global ot_st_gen ulong 256
+global ot_st_meta ulong 1024
+note ot_st_meta (stride 4): 0=live, 1=retired, 2=dtype, 3=elems
+
+global ot_ts_gen ulong 256
+global ot_ts_meta ulong 2560
+note ot_ts_meta (stride 10): 0=live, 1=retired, 2=owns, 3=dtype, 4=rank,
+note   5=offset, 6=elems, 7=st_slot, 8=st_gen, 9=is_view
+global ot_ts_parent ulong 512
+global ot_ts_shape ulong 2048
+global ot_ts_strides ulong 2048
+
+note Dense gather/compute scratch buffers (16384 bytes = 4096 f32s each)
+global ot_buf_a uchar 16384
+global ot_buf_b uchar 16384
+global ot_buf_c uchar 16384
+global ot_buf_o uchar 16384
+global ot_mm_a uchar 16384
+global ot_mm_bt uchar 16384
+global ot_tmp_sh ulong 8
+global ot_tmp_st ulong 8
+global ot_tmp_sh2 ulong 8
+global ot_tmp_st2 ulong 8
+global ot_tmp_h ulong 4
+
+text ot_dom_val "OMEGA_TENSOR_VALUE_ID_V1"
+text ot_dom_view "OMEGA_TENSOR_VIEW_ID_V1"
+
+fn ot_dtype_size dt ulong to ulong
+  if eq dt OT_DT_F32
+    ret 4
+  end
+  if or eq dt OT_DT_F16 eq dt OT_DT_BF16
+    ret 2
+  end
+  ret 0
+end
+
+fn ot_ctx_init cap ulong to long
+  if or eq cap 0 gt cap OT_MAX_SLOTS
+    ret OT_ERR_BAD_ARGS
+  end
+  put ot_ctx_cap 0 cap
+  for i ulong cap
+    put ot_st_gen i 1
+    put ot_ts_gen i 1
+    sb = mul i 4
+    for j ulong 4
+      put ot_st_meta add sb j 0
+    end
+    tb = mul i 10
+    for j ulong 10
+      put ot_ts_meta add tb j 0
+    end
+  end
+  ret OT_OK
+end
+
+fn ot_st_valid s ulong g ulong to bool
+  if ge s get ot_ctx_cap 0
+    ret false
+  end
+  if eq get ot_st_meta mul s 4 0
+    ret false
+  end
+  ret eq get ot_st_gen s g
+end
+
+fn ot_ts_check s ulong g ulong to long
+  if ge s get ot_ctx_cap 0
+    ret OT_ERR_STALE
+  end
+  tb = mul s 10
+  if eq get ot_ts_meta tb 0
+    ret OT_ERR_STALE
+  end
+  if ne get ot_ts_gen s g
+    ret OT_ERR_STALE
+  end
+  if not ot_st_valid get ot_ts_meta add tb 7 get ot_ts_meta add tb 8
+    ret OT_ERR_STALE
+  end
+  ret OT_OK
+end
+
+fn ot_st_alloc dt ulong elems ulong out_h edit ulong 2 to long
+  es = ot_dtype_size dt
+  if or eq es 0 or eq elems 0 gt mul elems es OT_SLOT_BYTES
+    ret OT_ERR_CAPACITY
+  end
+  cap = get ot_ctx_cap 0
+  for i ulong cap
+    sb = mul i 4
+    if and eq get ot_st_meta sb 0 eq get ot_st_meta add sb 1 0
+      put ot_st_meta sb 1
+      put ot_st_meta add sb 2 dt
+      put ot_st_meta add sb 3 elems
+      base = mul i OT_SLOT_BYTES
+      nb = mul elems es
+      for k ulong nb bound 16385
+        put ot_arena add base k 0
+      end
+      put out_h 0 i
+      put out_h 1 get ot_st_gen i
+      ret OT_OK
+    end
+  end
+  ret OT_ERR_CAPACITY
+end
+
+fn ot_st_release s ulong g ulong to void
+  if not ot_st_valid s g
+    ret
+  end
+  sb = mul s 4
+  put ot_st_meta sb 0
+  cur = get ot_st_gen s
+  if eq cur OT_U64_MAX
+    put ot_st_meta add sb 1 1
+  else
+    put ot_st_gen s add cur 1
+  end
+end
+
+fn ot_ts_alloc owns ulong dt ulong rank ulong elems ulong st_s ulong st_g ulong to long
+  cap = get ot_ctx_cap 0
+  for i ulong cap
+    tb = mul i 10
+    if eq get ot_ts_meta tb 0
+      if eq get ot_ts_meta add tb 1 0
+        put ot_ts_meta tb 1
+        put ot_ts_meta add tb 2 owns
+        put ot_ts_meta add tb 3 dt
+        put ot_ts_meta add tb 4 rank
+        put ot_ts_meta add tb 5 0
+        put ot_ts_meta add tb 6 elems
+        put ot_ts_meta add tb 7 st_s
+        put ot_ts_meta add tb 8 st_g
+        put ot_ts_meta add tb 9 0
+        put ot_ts_parent mul i 2 i
+        put ot_ts_parent add mul i 2 1 get ot_ts_gen i
+        put ot_tmp_h 0 i
+        put ot_tmp_h 1 get ot_ts_gen i
+        ret OT_OK
+      end
+    end
+  end
+  ret OT_ERR_CAPACITY
+end
+
+fn ot_release s ulong g ulong to long
+  if ge s get ot_ctx_cap 0
+    ret OT_ERR_STALE
+  end
+  tb = mul s 10
+  if or eq get ot_ts_meta tb 0 ne get ot_ts_gen s g
+    ret OT_ERR_STALE
+  end
+  if ne get ot_ts_meta add tb 2 0
+    ot_st_release get ot_ts_meta add tb 7 get ot_ts_meta add tb 8
+  end
+  put ot_ts_meta tb 0
+  cur = get ot_ts_gen s
+  if eq cur OT_U64_MAX
+    put ot_ts_meta add tb 1 1
+  else
+    put ot_ts_gen s add cur 1
+  end
+  ret OT_OK
+end
+
+fn ot_live_counts out_c edit ulong 2 to void
+  cap = get ot_ctx_cap 0
+  tc = ulong 0
+  sc = ulong 0
+  for i ulong cap
+    if ne get ot_ts_meta mul i 10 0
+      tc = add tc 1
+    end
+    if ne get ot_st_meta mul i 4 0
+      sc = add sc 1
+    end
+  end
+  put out_c 0 tc
+  put out_c 1 sc
+end
+
+fn ot_set_st_gen_test s ulong gen ulong to long
+  if or ge s get ot_ctx_cap 0 eq gen 0
+    ret OT_ERR_BAD_ARGS
+  end
+  sb = mul s 4
+  if or ne get ot_st_meta sb 0 ne get ot_st_meta add sb 1 0
+    ret OT_ERR_BAD_ARGS
+  end
+  if le gen get ot_st_gen s
+    ret OT_ERR_BAD_ARGS
+  end
+  put ot_st_gen s gen
+  ret OT_OK
+end
+
+fn ot_shape_check rank ulong shape view ulong 8 elems edit ulong 1 to long
+  if gt rank OT_MAX_RANK
+    ret OT_ERR_RANK
+  end
+  if eq rank 0
+    put elems 0 1
+    ret OT_OK
+  end
+  ret tensor_shape_size part shape 0 rank elems
+end
+
+fn ot_new_dense dt ulong rank ulong shape view ulong 8 out_h edit ulong 2 to long
+  elems = new ulong 1 0
+  rc = ot_shape_check rank shape elems
+  if ne rc OT_OK
+    ret rc
+  end
+  sh = new ulong 2 0
+  rc = ot_st_alloc dt get elems 0 sh
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_ts_alloc 1 dt rank get elems 0 get sh 0 get sh 1
+  if ne rc OT_OK
+    ot_st_release get sh 0 get sh 1
+    ret rc
+  end
+  slot = get ot_tmp_h 0
+  sbase = mul slot 8
+  ds = new ulong 8 0
+  for d ulong 8
+    put ot_ts_shape add sbase d 0
+    put ot_ts_strides add sbase d 0
+  end
+  if gt rank 0
+    tensor_dense_strides part shape 0 rank part ds 0 rank
+    for d ulong rank
+      put ot_ts_shape add sbase d get shape d
+      put ot_ts_strides add sbase d get ds d
+    end
+  end
+  put out_h 0 slot
+  put out_h 1 get ot_tmp_h 1
+  ret OT_OK
+end
+
+fn ot_copy_to_slot slot ulong es ulong data view uchar * to long
+  tb = mul slot 10
+  need = mul get ot_ts_meta add tb 6 es
+  if lt len data need
+    ret OT_ERR_CAPACITY
+  end
+  base = mul get ot_ts_meta add tb 7 OT_SLOT_BYTES
+  for i ulong need bound 16385
+    put ot_arena add base i get data i
+  end
+  ret OT_OK
+end
+
+fn ot_from_bytes dt ulong rank ulong shape view ulong 8 data view uchar * out_h edit ulong 2 to long
+  es = ot_dtype_size dt
+  if eq es 0
+    ret OT_ERR_DTYPE
+  end
+  rc = ot_new_dense dt rank shape out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_copy_to_slot get out_h 0 es data
+  if ne rc OT_OK
+    rr = ot_release get out_h 0 get out_h 1
+  end
+  ret rc
+end
+
+fn ot_copy_f32_to_slot slot ulong data view f32 * to long
+  tb = mul slot 10
+  elems = get ot_ts_meta add tb 6
+  if lt len data elems
+    ret OT_ERR_CAPACITY
+  end
+  base = mul get ot_ts_meta add tb 7 OT_SLOT_BYTES
+  for i ulong elems bound 4097
+    ot_arena_put_f32 base i get data i
+  end
+  ret OT_OK
+end
+
+fn ot_from_f32 rank ulong shape view ulong 8 data view f32 * out_h edit ulong 2 to long
+  rc = ot_new_dense OT_DT_F32 rank shape out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_copy_f32_to_slot get out_h 0 data
+  if ne rc OT_OK
+    rr = ot_release get out_h 0 get out_h 1
+  end
+  ret rc
+end
+
+fn ot_step_odo idx edit ulong 8 rank ulong pos ulong to ulong
+  p = pos
+  for k ulong rank
+    ax = sub sub rank 1 k
+    ni = add get idx ax 1
+    if lt ni get ot_tmp_sh ax
+      put idx ax ni
+      ret add p get ot_tmp_st ax
+    end
+    p = sub p mul sub get ot_tmp_sh ax 1 get ot_tmp_st ax
+    put idx ax 0
+  end
+  ret p
+end
+
+fn ot_put_dst dst_id ulong idx ulong v uchar to void
+  if eq dst_id 0
+    put ot_buf_a idx v
+    ret
+  end
+  if eq dst_id 1
+    put ot_buf_b idx v
+    ret
+  end
+  if eq dst_id 2
+    put ot_buf_c idx v
+    ret
+  end
+  if eq dst_id 3
+    put ot_buf_o idx v
+    ret
+  end
+  if eq dst_id 4
+    put ot_mm_a idx v
+    ret
+  end
+  put ot_mm_bt idx v
+end
+
+fn ot_copy_elem_dst dst_id ulong sb ulong db ulong es ulong to void
+  for b ulong es
+    ot_put_dst dst_id add db b get ot_arena add sb b
+  end
+end
+
+fn ot_gather_desc st_s ulong rank ulong off ulong es ulong elems ulong dst_id ulong to void
+  idx = new ulong 8 0
+  pos = off
+  sbase = mul st_s OT_SLOT_BYTES
+  for e ulong elems bound 4097
+    ot_copy_elem_dst dst_id add sbase mul pos es mul e es es
+    pos = ot_step_odo idx rank pos
+  end
+end
+
+fn ot_load_ts_desc slot ulong to void
+  sbase = mul slot 8
+  for d ulong 8
+    put ot_tmp_sh d get ot_ts_shape add sbase d
+    put ot_tmp_st d get ot_ts_strides add sbase d
+  end
+end
+
+fn ot_gather_slot slot ulong dst_id ulong to void
+  tb = mul slot 10
+  ot_load_ts_desc slot
+  ot_gather_desc get ot_ts_meta add tb 7 get ot_ts_meta add tb 4 get ot_ts_meta add tb 5 ot_dtype_size get ot_ts_meta add tb 3 get ot_ts_meta add tb 6 dst_id
+end
+
+fn ot_copy_elem_arena sb ulong db ulong es ulong to void
+  for b ulong es
+    put ot_arena add db b get ot_buf_a add sb b
+  end
+end
+
+fn ot_scatter_buf_a st_s ulong rank ulong off ulong es ulong elems ulong to void
+  idx = new ulong 8 0
+  pos = off
+  dbase = mul st_s OT_SLOT_BYTES
+  for e ulong elems bound 4097
+    ot_copy_elem_arena mul e es add dbase mul pos es es
+    pos = ot_step_odo idx rank pos
+  end
+end
+
+fn ot_read_f32 slot ulong gen ulong dst edit f32 * to long
+  rc = ot_ts_check slot gen
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul slot 10
+  if ne get ot_ts_meta add tb 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  elems = get ot_ts_meta add tb 6
+  if lt len dst elems
+    ret OT_ERR_CAPACITY
+  end
+  ot_gather_slot slot 0
+  for i ulong elems bound 4097
+    p = mul i 4
+    u = uint get ot_buf_a p
+    u = or u shl uint get ot_buf_a add p 1 8
+    u = or u shl uint get ot_buf_a add p 2 16
+    u = or u shl uint get ot_buf_a add p 3 24
+    put dst i bitcast f32 u
+  end
+  ret OT_OK
+end
+
+fn ot_sha_put_u64 ctx edit uchar 104 v ulong to void
+  b = new uchar 8 0
+  for i ulong 8
+    put b i uchar and shr v mul i 8 255
+  end
+  tg_sha_update ctx b 8
+end
+
+fn ot_value_id_payload ctx edit uchar 104 dt ulong nb ulong to void
+  loc = new uchar 16384 0
+  for i ulong nb bound 16385
+    put loc i get ot_buf_a i
+  end
+  tensor_value_bytes part loc 0 nb dt 1
+  tg_sha_update ctx part loc 0 nb nb
+end
+
+fn ot_value_id slot ulong gen ulong dig edit uchar 32 to long
+  rc = ot_ts_check slot gen
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul slot 10
+  dt = get ot_ts_meta add tb 3
+  rank = get ot_ts_meta add tb 4
+  ot_gather_slot slot 0
+  ctx = new uchar 104 0
+  tg_sha_init ctx
+  dom = new uchar 25 0
+  for i ulong 24
+    put dom i get ot_dom_val i
+  end
+  put dom 24 0
+  tg_sha_update ctx dom 25
+  ot_sha_put_u64 ctx dt
+  ot_sha_put_u64 ctx rank
+  for d ulong rank
+    ot_sha_put_u64 ctx get ot_ts_shape add mul slot 8 d
+  end
+  ot_value_id_payload ctx dt mul get ot_ts_meta add tb 6 ot_dtype_size dt
+  tg_sha_final ctx dig
+  ret OT_OK
+end
+
+fn ot_view_id slot ulong gen ulong dig edit uchar 32 to long
+  rc = ot_ts_check slot gen
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul slot 10
+  ctx = new uchar 104 0
+  tg_sha_init ctx
+  dom = new uchar 24 0
+  for i ulong 23
+    put dom i get ot_dom_view i
+  end
+  put dom 23 0
+  tg_sha_update ctx dom 24
+  ot_sha_put_u64 ctx get ot_ts_meta add tb 7
+  ot_sha_put_u64 ctx get ot_ts_meta add tb 8
+  ot_sha_put_u64 ctx get ot_ts_parent mul slot 2
+  ot_sha_put_u64 ctx get ot_ts_parent add mul slot 2 1
+  ot_sha_put_u64 ctx get ot_ts_meta add tb 3
+  ot_sha_put_u64 ctx get ot_ts_meta add tb 5
+  rank = get ot_ts_meta add tb 4
+  ot_sha_put_u64 ctx rank
+  for d ulong rank
+    ot_sha_put_u64 ctx get ot_ts_shape add mul slot 8 d
+    ot_sha_put_u64 ctx get ot_ts_strides add mul slot 8 d
+  end
+  tg_sha_final ctx dig
+  ret OT_OK
+end
+
+fn ot_value_equal s1 ulong g1 ulong s2 ulong g2 ulong eq_out edit ulong 1 to long
+  d1 = new uchar 32 0
+  d2 = new uchar 32 0
+  rc = ot_value_id s1 g1 d1
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_value_id s2 g2 d2
+  if ne rc OT_OK
+    ret rc
+  end
+  same = ulong 1
+  for i ulong 32
+    if ne get d1 i get d2 i
+      same = 0
+    end
+  end
+  put eq_out 0 same
+  ret OT_OK
+end
+
+fn ot_finish_view ns ulong ps ulong pg ulong rank ulong off ulong to void
+  ntb = mul ns 10
+  put ot_ts_meta add ntb 5 off
+  put ot_ts_meta add ntb 9 1
+  put ot_ts_parent mul ns 2 ps
+  put ot_ts_parent add mul ns 2 1 pg
+  for d ulong 8
+    put ot_ts_shape add mul ns 8 d 0
+    put ot_ts_strides add mul ns 8 d 0
+  end
+  for d ulong rank
+    put ot_ts_shape add mul ns 8 d get ot_tmp_sh d
+    put ot_ts_strides add mul ns 8 d get ot_tmp_st d
+  end
+end
+
+fn ot_check_tmp_bounds rank ulong off ulong se ulong to long
+  sh = new ulong 8 0
+  st = new ulong 8 0
+  for d ulong rank
+    put sh d get ot_tmp_sh d
+    put st d get ot_tmp_st d
+  end
+  ret tensor_view_bounds part sh 0 rank part st 0 rank off se
+end
+
+fn ot_ts_alloc_view ps ulong rank ulong elems ulong to long
+  ptb = mul ps 10
+  dt = get ot_ts_meta add ptb 3
+  sts = get ot_ts_meta add ptb 7
+  stg = get ot_ts_meta add ptb 8
+  ret ot_ts_alloc 0 dt rank elems sts stg
+end
+
+fn ot_register_view ps ulong pg ulong rank ulong out_h edit ulong 2 to long
+  off = get ot_tmp_h 2
+  elems = get ot_tmp_h 3
+  sts = get ot_ts_meta add mul ps 10 7
+  rc = ot_check_tmp_bounds rank off get ot_st_meta add mul sts 4 3
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_ts_alloc_view ps rank elems
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_finish_view get ot_tmp_h 0 ps pg rank off
+  put out_h 0 get ot_tmp_h 0
+  put out_h 1 get ot_tmp_h 1
+  ret OT_OK
+end
+
+fn ot_permute_plan s ulong rank ulong perm view ulong 8 to long
+  seen = new ulong 8 0
+  s8 = mul s 8
+  for d ulong rank
+    p = get perm d
+    if ge p rank
+      ret OT_ERR_AXIS
+    end
+    if ne get seen p 0
+      ret OT_ERR_AXIS
+    end
+    put seen p 1
+    idx = add s8 p
+    put ot_tmp_sh d get ot_ts_shape idx
+    put ot_tmp_st d get ot_ts_strides idx
+  end
+  ret OT_OK
+end
+
+fn ot_permute s ulong g ulong perm view ulong 8 out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  rank = get ot_ts_meta add tb 4
+  rc = ot_permute_plan s rank perm
+  if ne rc OT_OK
+    ret rc
+  end
+  put ot_tmp_h 2 get ot_ts_meta add tb 5
+  put ot_tmp_h 3 get ot_ts_meta add tb 6
+  ret ot_register_view s g rank out_h
+end
+
+fn ot_transpose s ulong g ulong out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  rank = get ot_ts_meta add mul s 10 4
+  if lt rank 2
+    ret OT_ERR_RANK
+  end
+  perm = new ulong 8 0
+  for d ulong rank
+    put perm d d
+  end
+  put perm sub rank 2 sub rank 1
+  put perm sub rank 1 sub rank 2
+  ret ot_permute s g perm out_h
+end
+
+fn ot_is_slot_row_major s ulong to ulong
+  ir = get ot_ts_meta add mul s 10 4
+  ish = new ulong 8 0
+  ist = new ulong 8 0
+  for d ulong ir
+    put ish d get ot_ts_shape add mul s 8 d
+    put ist d get ot_ts_strides add mul s 8 d
+  end
+  ret tensor_is_row_major part ish 0 ir part ist 0 ir
+end
+
+fn ot_reshape s ulong g ulong rank ulong shape view ulong 8 out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  elems = new ulong 1 0
+  rc = ot_shape_check rank shape elems
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  if ne get elems 0 get ot_ts_meta add tb 6
+    ret OT_ERR_SHAPE
+  end
+  if eq ot_is_slot_row_major s 0
+    ret OT_ERR_NOT_CONTIGUOUS
+  end
+  ds = new ulong 8 0
+  if gt rank 0
+    tensor_dense_strides part shape 0 rank part ds 0 rank
+  end
+  for d ulong rank
+    put ot_tmp_sh d get shape d
+    put ot_tmp_st d get ds d
+  end
+  put ot_tmp_h 2 get ot_ts_meta add tb 5
+  put ot_tmp_h 3 get elems 0
+  ret ot_register_view s g rank out_h
+end
+
+fn ot_broadcast_plan s ulong rank ulong shape view ulong 8 elems_out edit ulong 1 to long
+  ir = get ot_ts_meta add mul s 10 4
+  if lt rank ir
+    ret OT_ERR_SHAPE
+  end
+  rc = ot_shape_check rank shape elems_out
+  if ne rc OT_OK
+    ret rc
+  end
+  sbase = mul s 8
+  for i ulong rank
+    d = sub sub rank 1 i
+    put ot_tmp_sh d get shape d
+    if lt i ir
+      idx = add sbase sub sub ir 1 i
+      idim = get ot_ts_shape idx
+      if eq idim get shape d
+        put ot_tmp_st d get ot_ts_strides idx
+      else
+        if eq idim 1
+          put ot_tmp_st d 0
+        else
+          ret OT_ERR_SHAPE
+        end
+      end
+    else
+      put ot_tmp_st d 0
+    end
+  end
+  ret OT_OK
+end
+
+fn ot_broadcast_to s ulong g ulong rank ulong shape view ulong 8 out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  elems = new ulong 1 0
+  rc = ot_broadcast_plan s rank shape elems
+  if ne rc OT_OK
+    ret rc
+  end
+  put ot_tmp_h 2 get ot_ts_meta add mul s 10 5
+  put ot_tmp_h 3 get elems 0
+  ret ot_register_view s g rank out_h
+end
+
+fn ot_slice_dim s ulong d ulong a ulong b ulong st ulong res edit ulong 2 to long
+  if eq st 0
+    ret OT_ERR_BAD_ARGS
+  end
+  idx = add mul s 8 d
+  if gt b get ot_ts_shape idx
+    ret OT_ERR_BOUNDS
+  end
+  if ge a b
+    ret OT_ERR_SHAPE
+  end
+  span = sub sub b a 1
+  odim = add div span st 1
+  put ot_tmp_sh d odim
+  istr = get ot_ts_strides idx
+  put res 0 add get res 0 mul a istr
+  if eq odim 1
+    put ot_tmp_st d 0
+  else
+    put ot_tmp_st d mul istr st
+  end
+  put res 1 mul get res 1 odim
+  ret OT_OK
+end
+
+fn ot_slice_plan s ulong start view ulong 8 stop view ulong 8 step view ulong 8 res edit ulong 2 to long
+  tb = mul s 10
+  rank = get ot_ts_meta add tb 4
+  if eq rank 0
+    ret OT_ERR_RANK
+  end
+  put res 0 get ot_ts_meta add tb 5
+  put res 1 1
+  for d ulong rank
+    rc = ot_slice_dim s d get start d get stop d get step d res
+    if ne rc OT_OK
+      ret rc
+    end
+  end
+  ret OT_OK
+end
+
+fn ot_slice s ulong g ulong start view ulong 8 stop view ulong 8 step view ulong 8 out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  res = new ulong 2 0
+  rc = ot_slice_plan s start stop step res
+  if ne rc OT_OK
+    ret rc
+  end
+  rank = get ot_ts_meta add mul s 10 4
+  put ot_tmp_h 2 get res 0
+  put ot_tmp_h 3 get res 1
+  ret ot_register_view s g rank out_h
+end
+
+fn ot_slot_dbase slot ulong to ulong
+  ret mul get ot_ts_meta add mul slot 10 7 OT_SLOT_BYTES
+end
+
+fn ot_copy_buf_a_to_slot slot ulong nb ulong to void
+  dbase = ot_slot_dbase slot
+  for i ulong nb bound 16385
+    put ot_arena add dbase i get ot_buf_a i
+  end
+end
+
+fn ot_contiguous s ulong g ulong out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  dt = get ot_ts_meta add tb 3
+  rank = get ot_ts_meta add tb 4
+  elems = get ot_ts_meta add tb 6
+  sh = new ulong 8 0
+  for d ulong rank
+    put sh d get ot_ts_shape add mul s 8 d
+  end
+  ot_gather_slot s 0
+  rc = ot_new_dense dt rank sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_copy_buf_a_to_slot get out_h 0 mul elems ot_dtype_size dt
+  ret OT_OK
+end
+
+fn ot_fill_f32 dbase ulong elems ulong val f32 to void
+  for i ulong elems bound 4097
+    ot_arena_put_f32 dbase i val
+  end
+end
+
+fn ot_full rank ulong shape view ulong 8 val f32 out_h edit ulong 2 to long
+  rc = ot_new_dense OT_DT_F32 rank shape out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  slot = get out_h 0
+  ot_fill_f32 ot_slot_dbase slot get ot_ts_meta add mul slot 10 6 val
+  ret OT_OK
+end
+
+fn ot_zeros rank ulong shape view ulong 8 out_h edit ulong 2 to long
+  ret ot_full rank shape 0.0f32 out_h
+end
+
+fn ot_ones rank ulong shape view ulong 8 out_h edit ulong 2 to long
+  ret ot_full rank shape 1.0f32 out_h
+end
+
+fn ot_buf_get_f32 bid ulong idx ulong to f32
+  p = mul idx 4
+  u = uint 0
+  if eq bid 0
+    u = uint get ot_buf_a p
+    u = or u shl uint get ot_buf_a add p 1 8
+    u = or u shl uint get ot_buf_a add p 2 16
+    u = or u shl uint get ot_buf_a add p 3 24
+  else
+    if eq bid 1
+      u = uint get ot_buf_b p
+      u = or u shl uint get ot_buf_b add p 1 8
+      u = or u shl uint get ot_buf_b add p 2 16
+      u = or u shl uint get ot_buf_b add p 3 24
+    else
+      u = uint get ot_buf_c p
+      u = or u shl uint get ot_buf_c add p 1 8
+      u = or u shl uint get ot_buf_c add p 2 16
+      u = or u shl uint get ot_buf_c add p 3 24
+    end
+  end
+  ret bitcast f32 u
+end
+
+fn ot_arena_put_f32 dbase ulong idx ulong v f32 to void
+  u = bitcast uint v
+  p = add dbase mul idx 4
+  put ot_arena p uchar and u 255
+  put ot_arena add p 1 uchar and shr u 8 255
+  put ot_arena add p 2 uchar and shr u 16 255
+  put ot_arena add p 3 uchar and shr u 24 255
+end
+
+fn ot_cast_loop dt ulong to_dt ulong elems ulong dbase ulong to void
+  for i ulong elems bound 4097
+    if eq dt OT_DT_F32
+      u = bitcast uint ot_buf_get_f32 0 i
+      h = uint 0
+      if eq to_dt OT_DT_F16
+        h = ot_f32_to_f16 u
+      else
+        h = ot_f32_to_bf16 u
+      end
+      p = add dbase mul i 2
+      put ot_arena p uchar and h 255
+      put ot_arena add p 1 uchar and shr h 8 255
+    else
+      p = mul i 2
+      h = or uint get ot_buf_a p shl uint get ot_buf_a add p 1 8
+      u = uint 0
+      if eq dt OT_DT_F16
+        u = ot_f16_to_f32 h
+      else
+        u = ot_bf16_to_f32 h
+      end
+      ot_arena_put_f32 dbase i bitcast f32 u
+    end
+  end
+end
+
+fn ot_cast s ulong g ulong to_dt ulong out_h edit ulong 2 to long
+  if eq ot_dtype_size to_dt 0
+    ret OT_ERR_DTYPE
+  end
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  dt = get ot_ts_meta add tb 3
+  if eq dt to_dt
+    ret ot_contiguous s g out_h
+  end
+  if and ne dt OT_DT_F32 ne to_dt OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  rank = get ot_ts_meta add tb 4
+  sh = new ulong 8 0
+  for d ulong rank
+    put sh d get ot_ts_shape add mul s 8 d
+  end
+  ot_gather_slot s 0
+  rc = ot_new_dense to_dt rank sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_cast_loop dt to_dt get ot_ts_meta add tb 6 ot_slot_dbase get out_h 0
+  ret OT_OK
+end
+
+fn ot_unary_exec op ulong elems ulong dbase ulong to void
+  for i ulong elems bound 4097
+    ot_arena_put_f32 dbase i ot_unary_scalar op ot_buf_get_f32 0 i
+  end
+end
+
+fn ot_unary op ulong s ulong g ulong out_h edit ulong 2 to long
+  if ge op OT_TU_COUNT
+    ret OT_ERR_BAD_ARGS
+  end
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  if ne get ot_ts_meta add tb 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  rank = get ot_ts_meta add tb 4
+  elems = get ot_ts_meta add tb 6
+  sh = new ulong 8 0
+  for d ulong rank
+    put sh d get ot_ts_shape add mul s 8 d
+  end
+  ot_gather_slot s 0
+  rc = ot_new_dense OT_DT_F32 rank sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_unary_exec op elems ot_slot_dbase get out_h 0
+  ret OT_OK
+end
+
+fn ot_bcast_dims_3 sha view ulong 8 shb view ulong 8 sout edit ulong 8 dims view ulong 3 to long
+  ret tensor_broadcast_dims part sha 0 get dims 0 part shb 0 get dims 1 part sout 0 get dims 2
+end
+
+fn ot_bcast_two_shapes sa ulong sb ulong rout edit ulong 1 sout edit ulong 8 to long
+  ra = get ot_ts_meta add mul sa 10 4
+  rb = get ot_ts_meta add mul sb 10 4
+  r = ra
+  if gt rb r
+    r = rb
+  end
+  put rout 0 r
+  if eq r 0
+    ret OT_OK
+  end
+  sha = new ulong 8 0
+  shb = new ulong 8 0
+  for d ulong ra
+    put sha d get ot_ts_shape add mul sa 8 d
+  end
+  for d ulong rb
+    put shb d get ot_ts_shape add mul sb 8 d
+  end
+  dims = new ulong 3 0
+  put dims 0 ra
+  put dims 1 rb
+  put dims 2 r
+  ret ot_bcast_dims_3 sha shb sout dims
+end
+
+fn ot_gather_bcast s ulong rank ulong sh view ulong 8 dst_id ulong to long
+  elems = new ulong 1 0
+  rc = ot_broadcast_plan s rank sh elems
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  ot_gather_desc get ot_ts_meta add tb 7 rank get ot_ts_meta add tb 5 4 get elems 0 dst_id
+  ret OT_OK
+end
+
+fn ot_binary_exec op ulong os ulong to void
+  elems = get ot_ts_meta add mul os 10 6
+  dbase = ot_slot_dbase os
+  for i ulong elems bound 4097
+    ot_arena_put_f32 dbase i ot_binary_scalar op ot_buf_get_f32 0 i ot_buf_get_f32 1 i
+  end
+end
+
+fn ot_binary op ulong sa ulong ga ulong sb ulong gb ulong out_h edit ulong 2 to long
+  if ge op OT_TB_COUNT
+    ret OT_ERR_BAD_ARGS
+  end
+  rc = ot_ts_check sa ga
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_ts_check sb gb
+  if ne rc OT_OK
+    ret rc
+  end
+  if ne get ot_ts_meta add mul sa 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  if ne get ot_ts_meta add mul sb 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  ro = new ulong 1 0
+  sh = new ulong 8 0
+  rc = ot_bcast_two_shapes sa sb ro sh
+  if ne rc OT_OK
+    ret rc
+  end
+  r = get ro 0
+  rc = ot_gather_bcast sa r sh 0
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_gather_bcast sb r sh 1
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_new_dense OT_DT_F32 r sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_binary_exec op get out_h 0
+  ret OT_OK
+end
+
+fn ot_check_f32_h h view ulong 2 to long
+  s = get h 0
+  rc = ot_ts_check s get h 1
+  if ne rc OT_OK
+    ret rc
+  end
+  if ne get ot_ts_meta add mul s 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  ret OT_OK
+end
+
+fn ot_bcast_merge_third sc ulong ro edit ulong 1 sh edit ulong 8 to long
+  rc2 = get ot_ts_meta add mul sc 10 4
+  r = get ro 0
+  r3 = r
+  if gt rc2 r3
+    r3 = rc2
+  end
+  shc = new ulong 8 0
+  for d ulong rc2
+    put shc d get ot_ts_shape add mul sc 8 d
+  end
+  sh3 = new ulong 8 0
+  dims = new ulong 3 0
+  if gt r3 0
+    put dims 0 r
+    put dims 1 rc2
+    put dims 2 r3
+    rc = ot_bcast_dims_3 sh shc sh3 dims
+    if ne rc OT_OK
+      ret rc
+    end
+    for d ulong r3
+      put sh d get sh3 d
+    end
+  end
+  put ro 0 r3
+  ret OT_OK
+end
+
+fn ot_bcast_three ha view ulong 2 hb view ulong 2 hc view ulong 2 ro edit ulong 1 sh edit ulong 8 to long
+  rc = ot_check_f32_h ha
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_check_f32_h hb
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_check_f32_h hc
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_bcast_two_shapes get ha 0 get hb 0 ro sh
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_bcast_merge_third get hc 0 ro sh
+  if ne rc OT_OK
+    ret rc
+  end
+  r3 = get ro 0
+  rc = ot_gather_bcast get ha 0 r3 sh 0
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_gather_bcast get hb 0 r3 sh 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ot_gather_bcast get hc 0 r3 sh 2
+end
+
+fn ot_fma_exec os ulong to void
+  elems = get ot_ts_meta add mul os 10 6
+  dbase = ot_slot_dbase os
+  for i ulong elems bound 4097
+    ot_arena_put_f32 dbase i fma ot_buf_get_f32 0 i ot_buf_get_f32 1 i ot_buf_get_f32 2 i
+  end
+end
+
+fn ot_fma ha view ulong 2 hb view ulong 2 hc view ulong 2 out_h edit ulong 2 to long
+  ro = new ulong 1 0
+  sh = new ulong 8 0
+  rc = ot_bcast_three ha hb hc ro sh
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_new_dense OT_DT_F32 get ro 0 sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_fma_exec get out_h 0
+  ret OT_OK
+end
+
+fn ot_where_exec os ulong n ulong to void
+  dbase = ot_slot_dbase os
+  for i ulong n bound 4097
+    u = bitcast uint ot_buf_get_f32 0 i
+    if eq u OT_ONE_BITS
+      ot_arena_put_f32 dbase i ot_buf_get_f32 1 i
+    else
+      ot_arena_put_f32 dbase i ot_buf_get_f32 2 i
+    end
+  end
+end
+
+fn ot_where hc view ulong 2 ha view ulong 2 hb view ulong 2 out_h edit ulong 2 to long
+  ro = new ulong 1 0
+  sh = new ulong 8 0
+  rc = ot_bcast_three hc ha hb ro sh
+  if ne rc OT_OK
+    ret rc
+  end
+  elems = new ulong 1 0
+  rc = ot_shape_check get ro 0 sh elems
+  if ne rc OT_OK
+    ret rc
+  end
+  n = get elems 0
+  for i ulong n bound 4097
+    u = bitcast uint ot_buf_get_f32 0 i
+    if and ne u OT_ONE_BITS ne u uint 0
+      ret OT_ERR_MASK
+    end
+  end
+  rc = ot_new_dense OT_DT_F32 get ro 0 sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_where_exec get out_h 0 n
+  ret OT_OK
+end
+
+fn ot_reduce_exec op ulong rows ulong n ulong dbase ulong to void
+  for r ulong rows bound 4097
+    for k ulong n bound 4097
+      put ot_red_a k ot_buf_get_f32 0 add mul r n k
+    end
+    ot_arena_put_f32 dbase r ot_reduce_cpu op n
+  end
+end
+
+fn ot_gather_f32 s ulong rank ulong elems ulong dst_id ulong to void
+  tb = mul s 10
+  ot_gather_desc get ot_ts_meta add tb 7 rank get ot_ts_meta add tb 5 4 elems dst_id
+end
+
+fn ot_reduce_plan s ulong rank ulong axis ulong keepdims ulong osh edit ulong 8 to ulong
+  ish = new ulong 8 0
+  ist = new ulong 8 0
+  sbase = mul s 8
+  for d ulong rank
+    put ish d get ot_ts_shape add sbase d
+    put ist d get ot_ts_strides add sbase d
+  end
+  od = new ulong 24 0
+  meta = new ulong 4 0
+  put meta 0 rank
+  put meta 1 axis
+  put meta 2 keepdims
+  put meta 3 1
+  tensor_plan_op ish ist od meta
+  for d ulong rank
+    put ot_tmp_sh d get od d
+    put ot_tmp_st d get od add 8 d
+  end
+  orank = sub rank 1
+  if ne keepdims 0
+    orank = rank
+  end
+  for d ulong orank
+    put osh d get od add 16 d
+  end
+  ret get ish axis
+end
+
+fn ot_reduce op ulong s ulong g ulong axis ulong keepdims ulong out_h edit ulong 2 to long
+  if ge op OT_TR_COUNT
+    ret OT_ERR_BAD_ARGS
+  end
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  if ne get ot_ts_meta add tb 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  rank = get ot_ts_meta add tb 4
+  if eq rank 0
+    ret OT_ERR_RANK
+  end
+  if ge axis rank
+    ret OT_ERR_AXIS
+  end
+  osh = new ulong 8 0
+  n = ot_reduce_plan s rank axis keepdims osh
+  orank = sub rank 1
+  if ne keepdims 0
+    orank = rank
+  end
+  elems = get ot_ts_meta add tb 6
+  ot_gather_f32 s rank elems 0
+  rc = ot_new_dense OT_DT_F32 orank osh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_reduce_exec op div elems n n ot_slot_dbase get out_h 0
+  ret OT_OK
+end
+
+fn ot_reduce_axes_run op ulong s ulong g ulong seen view ulong 8 keep_and_out edit ulong 3 to long
+  rank = get ot_ts_meta add mul s 10 4
+  keepdims = get keep_and_out 2
+  cs = s
+  cg = g
+  step = ulong 0
+  nh = new ulong 2 0
+  for di ulong rank
+    d = sub sub rank 1 di
+    if eq get seen d 0
+      continue
+    end
+    rc = ot_reduce op cs cg d keepdims nh
+    if gt step 0
+      rr = ot_release cs cg
+    end
+    if ne rc OT_OK
+      ret rc
+    end
+    cs = get nh 0
+    cg = get nh 1
+    step = add step 1
+  end
+  put keep_and_out 0 cs
+  put keep_and_out 1 cg
+  ret OT_OK
+end
+
+fn ot_reduce_axes_mark naxes ulong axes view ulong 8 rank ulong seen edit ulong 8 to long
+  for i ulong naxes
+    ax = get axes i
+    if ge ax rank
+      ret OT_ERR_AXIS
+    end
+    if ne get seen ax 0
+      ret OT_ERR_AXIS
+    end
+    put seen ax 1
+  end
+  ret OT_OK
+end
+
+fn ot_reduce_axes op ulong s ulong g ulong naxes ulong axes view ulong 8 keep_and_out edit ulong 3 to long
+  if ge op OT_TR_COUNT
+    ret OT_ERR_BAD_ARGS
+  end
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  if ne get ot_ts_meta add tb 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  rank = get ot_ts_meta add tb 4
+  if eq rank 0
+    ret OT_ERR_RANK
+  end
+  if gt naxes rank
+    ret OT_ERR_AXIS
+  end
+  if and eq op OT_TR_MEAN gt naxes 1
+    ret OT_ERR_BAD_ARGS
+  end
+  seen = new ulong 8 0
+  out_h = new ulong 2 0
+  rc = ot_reduce_axes_mark naxes axes rank seen
+  if ne rc OT_OK
+    ret rc
+  end
+  if eq naxes 0
+    rc = ot_contiguous s g out_h
+    put keep_and_out 0 get out_h 0
+    put keep_and_out 1 get out_h 1
+    ret rc
+  end
+  ret ot_reduce_axes_run op s g seen keep_and_out
+end
+
+fn ot_sum_to_shape_exec s ulong g ulong n ulong ax view ulong 8 kp view ulong 8 out_h edit ulong 2 to long
+  cs = s
+  cg = g
+  nh = new ulong 2 0
+  for i ulong n
+    rc = ot_reduce OT_TR_SUM cs cg get ax i get kp i nh
+    if gt i 0
+      rr = ot_release cs cg
+    end
+    if ne rc OT_OK
+      ret rc
+    end
+    cs = get nh 0
+    cg = get nh 1
+  end
+  put out_h 0 cs
+  put out_h 1 cg
+  ret OT_OK
+end
+
+fn ot_sum_to_shape_plan s ulong rank ulong shape view ulong 8 ax edit ulong 8 kp edit ulong 8 to long
+  ir = get ot_ts_meta add mul s 10 4
+  if gt rank ir
+    ret OT_ERR_SHAPE
+  end
+  lead = sub ir rank
+  n = ulong 0
+  sbase = mul s 8
+  for di ulong ir
+    d = sub sub ir 1 di
+    idim = get ot_ts_shape add sbase d
+    if lt d lead
+      if gt idim 1
+        put ax n d
+        put kp n 0
+        n = add n 1
+      end
+    else
+      want = get shape sub d lead
+      if ne want idim
+        if ne want 1
+          ret OT_ERR_SHAPE
+        end
+        put ax n d
+        put kp n 1
+        n = add n 1
+      end
+    end
+  end
+  ret long n
+end
+
+fn ot_sum_to_shape s ulong g ulong rank ulong shape view ulong 8 out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  elems = new ulong 1 0
+  rc = ot_shape_check rank shape elems
+  if ne rc OT_OK
+    ret rc
+  end
+  if ne get ot_ts_meta add mul s 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  ax = new ulong 8 0
+  kp = new ulong 8 0
+  nr = ot_sum_to_shape_plan s rank shape ax kp
+  if lt nr 0
+    ret nr
+  end
+  n = ulong nr
+  rh = new ulong 2 0
+  rc = ot_sum_to_shape_exec s g n ax kp rh
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_gather_slot get rh 0 0
+  rc = ot_new_dense OT_DT_F32 rank shape out_h
+  if gt n 0
+    rr = ot_release get rh 0 get rh 1
+  end
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_copy_buf_a_to_slot get out_h 0 mul get elems 0 4
+  ret OT_OK
+end
+
+fn ot_mm_get_f32 is_bt ulong idx ulong to f32
+  p = mul idx 4
+  u = uint 0
+  if eq is_bt 0
+    u = uint get ot_mm_a p
+    u = or u shl uint get ot_mm_a add p 1 8
+    u = or u shl uint get ot_mm_a add p 2 16
+    u = or u shl uint get ot_mm_a add p 3 24
+  else
+    u = uint get ot_mm_bt p
+    u = or u shl uint get ot_mm_bt add p 1 8
+    u = or u shl uint get ot_mm_bt add p 2 16
+    u = or u shl uint get ot_mm_bt add p 3 24
+  end
+  ret bitcast f32 u
+end
+
+fn ot_matmul_dot ab ulong bb ulong k ulong to f32
+  for t ulong k bound 4096
+    va = ot_mm_get_f32 0 add ab t
+    vb = ot_mm_get_f32 1 add bb t
+    put ot_red_a t mul va vb
+  end
+  ret ot_reduce_cpu OT_TR_SUM k
+end
+
+fn ot_matmul_row ab ulong bbase ulong n ulong k ulong obase ulong dbase ulong to void
+  for j ulong n bound 256
+    bb = mul add bbase j k
+    ot_arena_put_f32 dbase add obase j ot_matmul_dot ab bb k
+  end
+end
+
+fn ot_matmul_exec batches ulong m ulong n ulong k ulong dbase ulong to void
+  for b ulong batches bound 256
+    bbase = mul b n
+    for i ulong m bound 256
+      row = add mul b m i
+      ot_matmul_row mul row k bbase n k mul row n dbase
+    end
+  end
+end
+
+fn ot_matmul_bcast_batch sa ulong sb ulong bra ulong brb ulong br ulong bsh edit ulong 8 to long
+  if eq br 0
+    ret OT_OK
+  end
+  sha0 = new ulong 8 0
+  shb0 = new ulong 8 0
+  for d ulong bra
+    put sha0 d get ot_ts_shape add mul sa 8 d
+  end
+  for d ulong brb
+    put shb0 d get ot_ts_shape add mul sb 8 d
+  end
+  dims = new ulong 3 0
+  put dims 0 bra
+  put dims 1 brb
+  put dims 2 br
+  ret ot_bcast_dims_3 sha0 shb0 bsh dims
+end
+
+fn ot_matmul_plan sa ulong sb ulong dims edit ulong 4 bsh edit ulong 8 to long
+  ra = get ot_ts_meta add mul sa 10 4
+  rb = get ot_ts_meta add mul sb 10 4
+  if or lt ra 2 lt rb 2
+    ret OT_ERR_RANK
+  end
+  k = get ot_ts_shape add mul sa 8 sub ra 1
+  if ne k get ot_ts_shape add mul sb 8 sub rb 2
+    ret OT_ERR_SHAPE
+  end
+  br = sub ra 2
+  if gt sub rb 2 br
+    br = sub rb 2
+  end
+  if gt add br 2 OT_MAX_RANK
+    ret OT_ERR_RANK
+  end
+  put dims 0 br
+  put dims 1 get ot_ts_shape add mul sa 8 sub ra 2
+  put dims 2 get ot_ts_shape add mul sb 8 sub rb 1
+  put dims 3 k
+  ret ot_matmul_bcast_batch sa sb sub ra 2 sub rb 2 br bsh
+end
+
+fn ot_matmul sa ulong ga ulong sb ulong gb ulong out_h edit ulong 2 to long
+  rc = ot_ts_check sa ga
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_ts_check sb gb
+  if ne rc OT_OK
+    ret rc
+  end
+  if ne get ot_ts_meta add mul sa 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  if ne get ot_ts_meta add mul sb 10 3 OT_DT_F32
+    ret OT_ERR_DTYPE
+  end
+  bsh = new ulong 8 0
+  dims = new ulong 4 0
+  rc = ot_matmul_plan sa sb dims bsh
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ot_matmul_run sa sb dims bsh out_h
+end
+
+fn ot_matmul_pack_b sb ulong br ulong shb view ulong 8 to long
+  r2 = add br 2
+  eb = new ulong 1 0
+  rc = ot_broadcast_plan sb r2 shb eb
+  if ne rc OT_OK
+    ret rc
+  end
+  t0 = get ot_tmp_sh br
+  t1 = get ot_tmp_st br
+  put ot_tmp_sh br get ot_tmp_sh add br 1
+  put ot_tmp_st br get ot_tmp_st add br 1
+  put ot_tmp_sh add br 1 t0
+  put ot_tmp_st add br 1 t1
+  ot_gather_f32 sb r2 get eb 0 5
+  ret OT_OK
+end
+
+fn ot_matmul_dispatch ea_n ulong dims view ulong 4 out_slot ulong to void
+  m = get dims 1
+  n = get dims 2
+  k = get dims 3
+  batches = div ea_n mul m k
+  ot_matmul_exec batches m n k ot_slot_dbase out_slot
+end
+
+fn ot_matmul_run sa ulong sb ulong dims view ulong 4 bsh view ulong 8 out_h edit ulong 2 to long
+  br = get dims 0
+  sha = new ulong 8 0
+  shb = new ulong 8 0
+  sho = new ulong 8 0
+  for d ulong br
+    put sha d get bsh d
+    put shb d get bsh d
+    put sho d get bsh d
+  end
+  put sha br get dims 1
+  put sha add br 1 get dims 3
+  put shb br get dims 3
+  put shb add br 1 get dims 2
+  put sho br get dims 1
+  put sho add br 1 get dims 2
+  r2 = add br 2
+  ea = new ulong 1 0
+  rc = ot_broadcast_plan sa r2 sha ea
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_gather_f32 sa r2 get ea 0 4
+  rc = ot_matmul_pack_b sb br shb
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_new_dense OT_DT_F32 r2 sho out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_matmul_dispatch get ea 0 dims get out_h 0
+  ret OT_OK
+end
+
+fn ot_embed_dim s ulong d ulong osh_d ulong a ulong st ulong ds_d ulong to long
+  if eq st 0
+    ret OT_ERR_BAD_ARGS
+  end
+  idim = get ot_ts_shape add mul s 8 d
+  last = add a mul sub idim 1 st
+  if ge last osh_d
+    ret OT_ERR_BOUNDS
+  end
+  put ot_tmp_sh d idim
+  if eq idim 1
+    put ot_tmp_st d 0
+  else
+    put ot_tmp_st d mul ds_d st
+  end
+  ret long mul a ds_d
+end
+
+fn ot_embed_plan s ulong out_sh view ulong 8 start view ulong 8 step view ulong 8 off_out edit ulong 1 to long
+  rank = get ot_ts_meta add mul s 10 4
+  if eq rank 0
+    ret OT_ERR_RANK
+  end
+  oe = new ulong 1 0
+  rc = ot_shape_check rank out_sh oe
+  if ne rc OT_OK
+    ret rc
+  end
+  ds = new ulong 8 0
+  tensor_dense_strides part out_sh 0 rank part ds 0 rank
+  off = ulong 0
+  for d ulong rank
+    rc = ot_embed_dim s d get out_sh d get start d get step d get ds d
+    if lt rc 0
+      ret rc
+    end
+    off = add off ulong rc
+  end
+  put off_out 0 off
+  ret OT_OK
+end
+
+fn ot_scatter_from_slot s ulong dst_slot ulong off ulong to void
+  tb = mul s 10
+  dst_st = get ot_ts_meta add mul dst_slot 10 7
+  ot_scatter_buf_a dst_st get ot_ts_meta add tb 4 off ot_dtype_size get ot_ts_meta add tb 3 get ot_ts_meta add tb 6
+end
+
+fn ot_embed s ulong g ulong out_sh view ulong 8 start view ulong 8 step view ulong 8 out_h edit ulong 2 to long
+  rc = ot_ts_check s g
+  if ne rc OT_OK
+    ret rc
+  end
+  off_a = new ulong 1 0
+  rc = ot_embed_plan s out_sh start step off_a
+  if ne rc OT_OK
+    ret rc
+  end
+  tb = mul s 10
+  dt = get ot_ts_meta add tb 3
+  rank = get ot_ts_meta add tb 4
+  ot_gather_slot s 0
+  rc = ot_new_dense dt rank out_sh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_scatter_from_slot s get out_h 0 get off_a 0
+  ret OT_OK
+end
+
+fn ot_concat_copy_one sk ulong rank ulong ds view ulong 8 dst_slot ulong off ulong to void
+  ot_gather_slot sk 0
+  sbase = mul sk 8
+  for d ulong rank
+    put ot_tmp_sh d get ot_ts_shape add sbase d
+    put ot_tmp_st d get ds d
+  end
+  ot_scatter_from_slot sk dst_slot off
+end
+
+fn ot_concat_copy n ulong slots view ulong 16 osh view ulong 8 axis ulong dst_slot ulong to void
+  rank = get ot_ts_meta add mul dst_slot 10 4
+  ds = new ulong 8 0
+  tensor_dense_strides part osh 0 rank part ds 0 rank
+  aoff = ulong 0
+  for k ulong n
+    sk = get slots k
+    ot_concat_copy_one sk rank ds dst_slot mul aoff get ds axis
+    aoff = add aoff get ot_ts_shape add mul sk 8 axis
+  end
+end
+
+fn ot_concat_check_one sk ulong gk ulong dt ulong rank ulong axis ulong osh edit ulong 8 to long
+  rc = ot_ts_check sk gk
+  if ne rc OT_OK
+    ret rc
+  end
+  tbk = mul sk 10
+  if ne get ot_ts_meta add tbk 3 dt
+    ret OT_ERR_DTYPE
+  end
+  if ne get ot_ts_meta add tbk 4 rank
+    ret OT_ERR_RANK
+  end
+  sbase = mul sk 8
+  for d ulong rank
+    if ne d axis
+      if ne get ot_ts_shape add sbase d get osh d
+        ret OT_ERR_SHAPE
+      end
+    end
+  end
+  put osh axis add get osh axis get ot_ts_shape add sbase axis
+  ret OT_OK
+end
+
+fn ot_concat_plan n ulong slots view ulong 16 gens view ulong 16 axis ulong osh edit ulong 8 to long
+  s0 = get slots 0
+  tb0 = mul s0 10
+  dt = get ot_ts_meta add tb0 3
+  rank = get ot_ts_meta add tb0 4
+  for d ulong rank
+    put osh d get ot_ts_shape add mul s0 8 d
+  end
+  put osh axis 0
+  for k ulong n
+    rc = ot_concat_check_one get slots k get gens k dt rank axis osh
+    if ne rc OT_OK
+      ret rc
+    end
+  end
+  ret OT_OK
+end
+
+fn ot_concat n ulong slots view ulong 16 gens view ulong 16 axis ulong out_h edit ulong 2 to long
+  if or eq n 0 gt n 16
+    ret OT_ERR_BAD_ARGS
+  end
+  s0 = get slots 0
+  rc = ot_ts_check s0 get gens 0
+  if ne rc OT_OK
+    ret rc
+  end
+  tb0 = mul s0 10
+  dt = get ot_ts_meta add tb0 3
+  rank = get ot_ts_meta add tb0 4
+  if eq rank 0
+    ret OT_ERR_RANK
+  end
+  if ge axis rank
+    ret OT_ERR_AXIS
+  end
+  osh = new ulong 8 0
+  rc = ot_concat_plan n slots gens axis osh
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_new_dense dt rank osh out_h
+  if ne rc OT_OK
+    ret rc
+  end
+  ot_concat_copy n slots osh axis get out_h 0
+  ret OT_OK
+end

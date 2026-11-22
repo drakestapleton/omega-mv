@@ -1,0 +1,818 @@
+note SPDX-License-Identifier: Apache-2.0
+note test_train.om -- Pure seeded OM-2 M22 substrate exit tests.
+
+const TT_N_SMALL ulong 1024
+const TT_LR_BITS ulong 0x3d4ccccd
+const TT_MOM_BITS ulong 0x3f666666
+const TT_HALF_BITS ulong 0x3f000000
+
+global tt_base uchar 512
+global tt_meta ulong 4
+note tt_meta: 0=base_len, 1=dirn, 2=checks, 3=fail
+global tt_target f32 262144
+global tt_lcg uint 1
+global tt_dold uchar 32
+global tt_dnew uchar 32
+global tt_da uchar 32
+global tt_db uchar 32
+global tt_ha uchar 32
+global tt_hb uchar 32
+global tt_gk_p uchar 4096
+global tt_gk_o uchar 4096
+global tt_rep_dir uchar 1024
+global tt_rep_dlen ulong 1
+
+text tt_msg_pass "M22_SUBSTRATE_TESTS_PASS\n"
+text tt_msg_fail "M22_SUBSTRATE_TESTS_FAIL\n"
+text tt_msg_rdig "replay_digest "
+text tt_msg_rhead "replay_dispatch_head "
+text tt_msg_nl "\n"
+text tt_msg_usage "usage: test_train <scratch-dir>\n"
+text tt_msg_basic "basic"
+text tt_msg_sgdp "sgd-plain"
+text tt_msg_sgdm "sgd-momentum"
+text tt_msg_cref "crash-ref"
+text tt_msg_crash "crash"
+text tt_msg_race "race"
+text tt_msg_negsh "neg-shadow"
+text tt_msg_negtr "neg-trunc"
+text tt_msg_negdg "neg-digest"
+text tt_msg_negch "neg-chain"
+text tt_msg_negar "neg-args"
+text tt_msg_cost "cost"
+text tt_msg_repa "replay-a"
+text tt_msg_repb "replay-b"
+text tt_msg_reps "replay-s"
+
+fn tt_check cond bool to void
+  put tt_meta 2 add get tt_meta 2 1
+  if not cond
+    put tt_meta 3 add get tt_meta 3 1
+  end
+end
+
+fn tt_lcg_next to uint
+  s = add mul get tt_lcg 0 uint 1664525 uint 1013904223
+  put tt_lcg 0 s
+  ret s
+end
+
+fn tt_urand to f32
+  r = shr tt_lcg_next 8
+  ret sub div f32 r 16777216.0f32 0.5f32
+end
+
+fn tt_init_target n ulong to void
+  put tt_lcg 0 uint 0x00c0ffee
+  for i ulong n bound 300000
+    put tt_target i tt_urand
+  end
+end
+
+fn tt_put_f32_snap is_opt ulong idx ulong v f32 to void
+  u = bitcast uint v
+  p = mul idx 4
+  if eq is_opt 0
+    put tg_snap_params p uchar and u 255
+    put tg_snap_params add p 1 uchar and shr u 8 255
+    put tg_snap_params add p 2 uchar and shr u 16 255
+    put tg_snap_params add p 3 uchar and shr u 24 255
+  else
+    put tg_snap_opt p uchar and u 255
+    put tg_snap_opt add p 1 uchar and shr u 8 255
+    put tg_snap_opt add p 2 uchar and shr u 16 255
+    put tg_snap_opt add p 3 uchar and shr u 24 255
+  end
+end
+
+fn tt_get_f32_cur idx ulong to f32
+  p = mul idx 4
+  u = uint get tg_st_params p
+  u = or u shl uint get tg_st_params add p 1 8
+  u = or u shl uint get tg_st_params add p 2 16
+  u = or u shl uint get tg_st_params add p 3 24
+  ret bitcast f32 u
+end
+
+fn tt_get_f32_snap idx ulong to f32
+  p = mul idx 4
+  u = uint get tg_snap_params p
+  u = or u shl uint get tg_snap_params add p 1 8
+  u = or u shl uint get tg_snap_params add p 2 16
+  u = or u shl uint get tg_snap_params add p 3 24
+  ret bitcast f32 u
+end
+
+fn tt_loss_cur n ulong to f64
+  l = f64 0.0f64
+  for i ulong n bound 300000
+    d = sub f64 tt_get_f32_cur i f64 get tt_target i
+    l = add l mul 0.5f64 mul d d
+  end
+  ret l
+end
+
+fn tt_grad_from_cur n ulong to void
+  for i ulong n bound 300000
+    g = sub tt_get_f32_cur i get tt_target i
+    put tg_sgd_grad i bitcast uint g
+  end
+end
+
+fn tt_grad_from_snap n ulong to void
+  for i ulong n bound 300000
+    g = sub tt_get_f32_snap i get tt_target i
+    put tg_sgd_grad i bitcast uint g
+  end
+end
+
+fn tt_newdir dst edit uchar 1024 tag view uchar * to ulong
+  blen = get tt_meta 0
+  dn = get tt_meta 1
+  put tt_meta 1 add dn 1
+  for i ulong blen
+    put dst i get tt_base i
+  end
+  put dst blen 47
+  p = add blen 1
+  put dst p uchar add 48 rem div dn 10 10
+  put dst add p 1 uchar add 48 rem dn 10
+  put dst add p 2 45
+  p = add p 3
+  tlen = len tag
+  for i ulong tlen
+    put dst add p i get tag i
+  end
+  ret add p tlen
+end
+
+fn tt_make_store dir view uchar 1024 dlen ulong n ulong mom ulong to long
+  put tt_lcg 0 uint 12345
+  for i ulong n bound 300000
+    tt_put_f32_snap 0 i mul 4.0f32 tt_urand
+    if ne mom 0
+      tt_put_f32_snap 1 i 0.0f32
+    end
+  end
+  ob = ulong 0
+  if ne mom 0
+    ob = mul n 4
+  end
+  ret tg_create part dir 0 dlen dlen mul n 4 ob
+end
+
+fn tt_sgd_commit n ulong mom_bits ulong ref_id ulong to long
+  r = tg_shadow_begin 0
+  if ne r TG_OK
+    ret r
+  end
+  tt_grad_from_cur n
+  r = tg_sgd_step 0 n TT_LR_BITS mom_bits ref_id
+  if ne r TG_OK
+    tg_shadow_discard 0
+    ret r
+  end
+  ret tg_commit 0 1
+end
+
+fn tt_file_exists dir view uchar 1024 dlen ulong name view uchar * to bool
+  tg_set_dir part dir 0 dlen dlen
+  pl = tg_mk_path 0 name
+  if eq pl 0
+    ret false
+  end
+  ret eq faccess tg_pa 0 pl 0 0
+end
+
+fn tt_file_size dir view uchar 1024 dlen ulong name view uchar * to long
+  tg_set_dir part dir 0 dlen dlen
+  pl = tg_mk_path 0 name
+  if eq pl 0
+    ret -1
+  end
+  sb = new uchar 128 0
+  if lt stat tg_pa 0 pl sb 0 128 0
+    ret -1
+  end
+  sz = ulong 0
+  for i ulong 8
+    sz = or sz shl ulong get sb add 48 i mul i 8
+  end
+  ret long sz
+end
+
+fn tt_flip_pa fpos ulong to void
+  fd = fopen tg_pa 0 get tg_plen 0 TG_O_RDWR 0
+  if lt fd 0
+    ret
+  end
+  b = new uchar 1 0
+  if eq pread int fd b 0 1 long fpos 1
+    put b 0 xor get b 0 1
+    pw = pwrite int fd b 0 1 long fpos
+  end
+  c = fclose int fd
+end
+
+fn tt_t_basic to void
+  d = new uchar 1024 0
+  dl = tt_newdir d tt_msg_basic
+  tt_check eq tt_make_store d dl TT_N_SMALL 1 TG_OK
+  tt_check eq tg_open part d 0 dl dl TG_OK
+  tt_check and eq get tg_st_meta 5 0 eq get tg_st_meta 6 0
+  d0 = new uchar 32 0
+  for i ulong 32
+    put d0 i get tg_st_digest i
+  end
+  tt_check eq tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1 TG_OK
+  tt_check and eq get tg_st_meta 5 1 eq get tg_st_meta 6 1
+  for i ulong 32
+    tt_check eq get tg_st_prev i get d0 i
+  end
+  tt_check eq tg_read_current part d 0 dl dl TG_OK
+  tt_check eq get tg_snap_meta 0 1
+  for i ulong 32
+    tt_check eq get tg_snap_digest i get tg_st_digest i
+  end
+  tg_close
+  nv = new ulong 1 0
+  tt_check eq tg_verify_history part d 0 dl dl nv TG_OK
+  tt_check eq get nv 0 2
+  tt_check not tt_file_exists d dl tg_txt_cur_tmp
+end
+
+fn tt_t_training to void
+  d = new uchar 1024 0
+  nv = new ulong 1 0
+  for m ulong 2
+    dl = ulong 0
+    mom = ulong 0
+    if eq m 0
+      dl = tt_newdir d tt_msg_sgdp
+    else
+      dl = tt_newdir d tt_msg_sgdm
+      mom = TT_MOM_BITS
+    end
+    tt_check eq tt_make_store d dl TT_N_SMALL m TG_OK
+    tt_check eq tg_open part d 0 dl dl TG_OK
+    l0 = tt_loss_cur TT_N_SMALL
+    for k ulong 40
+      tt_check eq tt_sgd_commit TT_N_SMALL mom add 100 k TG_OK
+    end
+    l1 = tt_loss_cur TT_N_SMALL
+    tt_check lt l1 mul l0 0.1f64
+    tt_check eq get tg_st_meta 5 40
+    tg_close
+    tt_check eq tg_verify_history part d 0 dl dl nv TG_OK
+    tt_check eq get nv 0 41
+  end
+end
+
+fn tt_crash_torn d view uchar 1024 dl ulong fp ulong to void
+  tg_set_dir part d 0 dl dl
+  pl = ulong 0
+  if eq fp TG_FP_AFTER_SHADOW_WRITE
+    pl = tg_mk_gen_path 0 1 2
+  else
+    if eq fp TG_FP_AFTER_GEN_RENAME
+      pl = tg_mk_gen_path 0 0 2
+    else
+      pl = tg_mk_path 0 tg_txt_cur_tmp
+    end
+  end
+  sb = new uchar 128 0
+  tt_check eq stat tg_pa 0 pl sb 0 128 0
+  sz = ulong 0
+  for i ulong 8
+    sz = or sz shl ulong get sb add 48 i mul i 8
+  end
+  tt_check eq truncate tg_pa 0 pl long div sz 2 0
+end
+
+fn tt_crash_one torn ulong fp ulong to void
+  d = new uchar 1024 0
+  st_buf = new uchar 4 0
+  dl = tt_newdir d tt_msg_crash
+  r0 = tt_make_store d dl TT_N_SMALL 1
+  tt_check eq tg_open part d 0 dl dl TG_OK
+  r0 = tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1
+  tg_close
+  pid = fork
+  if eq pid 0
+    if ne tg_open part d 0 dl dl TG_OK
+      exit 2
+    end
+    tg_failpoint_arm fp TG_FPMODE_EXIT
+    rc_c = tt_sgd_commit TT_N_SMALL TT_MOM_BITS 2
+    exit 3
+  end
+  wp = waitpid int pid st_buf 0 4 0
+  wstat = or uint get st_buf 0 shl uint get st_buf 1 8
+  tt_check eq and shr wstat 8 255 uint TG_FP_EXIT_CODE
+  if ne torn 0
+    tt_crash_torn d dl fp
+  end
+  tt_crash_verify d dl fp
+end
+
+fn tt_crash_verify d view uchar 1024 dl ulong fp ulong to void
+  expect_new = ge fp TG_FP_AFTER_SWITCH_BEFORE_FSYNC
+  tt_check eq tg_read_current part d 0 dl dl TG_OK
+  if expect_new
+    tt_check eq get tg_snap_meta 0 2
+    for i ulong 32
+      tt_check eq get tg_snap_digest i get tt_dnew i
+    end
+  else
+    tt_check eq get tg_snap_meta 0 1
+    for i ulong 32
+      tt_check eq get tg_snap_digest i get tt_dold i
+    end
+  end
+  tt_check eq tg_open part d 0 dl dl TG_OK
+  if expect_new
+    tt_check eq get tg_st_meta 5 2
+  else
+    tt_check eq get tg_st_meta 5 1
+    tt_check eq get tg_rec_meta 2 192
+    tt_check eq tt_sgd_commit TT_N_SMALL TT_MOM_BITS 2 TG_OK
+    for i ulong 32
+      tt_check eq get tg_st_digest i get tt_dnew i
+    end
+  end
+  tt_check not tt_file_exists d dl tg_txt_cur_tmp
+  tg_close
+  nv = new ulong 1 0
+  tt_check eq tg_verify_history part d 0 dl dl nv TG_OK
+  tt_check eq get nv 0 3
+end
+
+fn tt_t_crash to void
+  refd = new uchar 1024 0
+  rdl = tt_newdir refd tt_msg_cref
+  tt_check eq tt_make_store refd rdl TT_N_SMALL 1 TG_OK
+  tt_check eq tg_open part refd 0 rdl rdl TG_OK
+  tt_check eq tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1 TG_OK
+  for i ulong 32
+    put tt_dold i get tg_st_digest i
+  end
+  tt_check eq tt_sgd_commit TT_N_SMALL TT_MOM_BITS 2 TG_OK
+  for i ulong 32
+    put tt_dnew i get tg_st_digest i
+  end
+  tg_close
+  for torn ulong 2
+    for fpi ulong 8
+      fp = add fpi 1
+      if ne torn 0
+        if and ne fp TG_FP_AFTER_SHADOW_WRITE and ne fp TG_FP_AFTER_GEN_RENAME ne fp TG_FP_BEFORE_SWITCH_RENAME
+          continue
+        end
+      end
+      tt_crash_one torn fp
+    end
+  end
+end
+
+fn tt_race_send rfd1 int reads ulong bad ulong backwards ulong last ulong to void
+  obuf = new uchar 32 0
+  for i ulong 8
+    sh = mul i 8
+    put obuf i uchar and shr reads sh 255
+    put obuf add 8 i uchar and shr bad sh 255
+    put obuf add 16 i uchar and shr backwards sh 255
+    put obuf add 24 i uchar and shr last sh 255
+  end
+  wr = write rfd1 obuf 0 32
+  exit 0
+end
+
+fn tt_race_child d view uchar 1024 dl ulong s0 int rfd1 int to void
+  reads = ulong 0
+  bad = ulong 0
+  backwards = ulong 0
+  last = long -1
+  cbuf = new uchar 1 0
+  while true bound 50000
+    ev = waitio s0 1 0
+    if ne tg_read_current part d 0 dl dl TG_OK
+      bad = add bad 1
+    else
+      g = long get tg_snap_meta 0
+      if lt g last
+        backwards = add backwards 1
+      end
+      last = g
+    end
+    reads = add reads 1
+    if gt ev 0
+      if eq read s0 cbuf 0 1 0
+        break
+      end
+    end
+  end
+  tt_race_send rfd1 reads bad backwards ulong last
+end
+
+fn tt_race_parent d view uchar 1024 dl ulong s1 int r0f int pid long to void
+  tt_check eq tg_open part d 0 dl dl TG_OK
+  for k ulong 30
+    tt_check eq tt_sgd_commit TT_N_SMALL TT_MOM_BITS k TG_OK
+    if eq rem k 5 0
+      sl = sleepns 200000
+    end
+  end
+  tg_close
+  rc = fclose s1
+  ibuf = new uchar 32 0
+  got = new ulong 1 0
+  rc = tg_read_full_local r0f ibuf 32 got
+  rc = fclose r0f
+  st_buf = new uchar 4 0
+  rc = waitpid int pid st_buf 0 4 0
+  tt_check eq get got 0 32
+  tt_race_check ibuf
+end
+
+fn tt_t_reader_race to void
+  d = new uchar 1024 0
+  dl = tt_newdir d tt_msg_race
+  r0 = tt_make_store d dl TT_N_SMALL 1
+  pstop = new uchar 8 0
+  pres = new uchar 8 0
+  tt_check eq pipefds pstop 0 8 0 0
+  tt_check eq pipefds pres 0 8 0 0
+  s0 = int or uint get pstop 0 shl uint get pstop 1 8
+  s1 = int or uint get pstop 4 shl uint get pstop 5 8
+  r0f = int or uint get pres 0 shl uint get pres 1 8
+  r1f = int or uint get pres 4 shl uint get pres 5 8
+  pid = fork
+  if eq pid 0
+    c1 = fclose s1
+    c2 = fclose r0f
+    tt_race_child d dl s0 r1f
+  end
+  c1 = fclose s0
+  c2 = fclose r1f
+  tt_race_parent d dl s1 r0f pid
+end
+
+fn tt_race_check ibuf view uchar 32 to void
+  reads = ulong 0
+  bad = ulong 0
+  backwards = ulong 0
+  last = ulong 0
+  for i ulong 8
+    reads = or reads shl ulong get ibuf i mul i 8
+    bad = or bad shl ulong get ibuf add 8 i mul i 8
+    backwards = or backwards shl ulong get ibuf add 16 i mul i 8
+    last = or last shl ulong get ibuf add 24 i mul i 8
+  end
+  tt_check gt reads 0
+  tt_check eq bad 0
+  tt_check eq backwards 0
+  tt_check eq last 30
+end
+
+fn tt_neg_shadow_and_state to void
+  d = new uchar 1024 0
+  dl = tt_newdir d tt_msg_negsh
+  r0 = tt_make_store d dl TT_N_SMALL 1
+  tt_check eq tg_open part d 0 dl dl TG_OK
+  log0 = tt_file_size d dl tg_txt_dlog
+  tg_failpoint_arm TG_FP_AFTER_SHADOW_WRITE TG_FPMODE_CORRUPT
+  r = tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1
+  tg_failpoint_disarm
+  tt_check eq r TG_E_SHADOW
+  tt_check eq get tg_st_meta 5 0
+  tt_check eq tt_file_size d dl tg_txt_dlog log0
+  tt_check eq tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1 TG_OK
+  r = tg_shadow_begin 0
+  tt_grad_from_cur TT_N_SMALL
+  r = tg_sgd_step 0 TT_N_SMALL TT_LR_BITS TT_MOM_BITS 9
+  tt_check eq tg_commit 0 2 TG_E_REJECT
+  tt_check eq get tg_st_meta 5 1
+  tt_check eq tg_commit 0 0 TG_E_STATE
+  r = tg_shadow_begin 0
+  r = tg_sgd_step 0 TT_N_SMALL TT_LR_BITS TT_MOM_BITS 10
+  tt_check eq tg_commit 0 0 TG_OK
+  tt_check eq get tg_st_meta 5 2
+  tt_check eq tg_commit 0 0 TG_E_STATE
+  r = tg_shadow_begin 0
+  r = tg_shadow_begin 1
+  tt_check eq tg_commit 0 0 TG_OK
+  tt_check eq tg_commit 1 0 TG_E_STALE
+  tt_check eq get tg_st_meta 5 3
+  pid = fork
+  if eq pid 0
+    if eq tg_open part d 0 dl dl TG_E_LOCKED
+      exit 0
+    end
+    exit 1
+  end
+  st_buf = new uchar 4 0
+  wp = waitpid int pid st_buf 0 4 0
+  wstat = or uint get st_buf 0 shl uint get st_buf 1 8
+  tt_check eq and shr wstat 8 255 0
+  tg_close
+  tt_check eq tt_make_store d dl TT_N_SMALL 1 TG_E_EXISTS
+  nv = new ulong 1 0
+  tt_check eq tg_verify_history part d 0 dl dl nv TG_OK
+  tt_check eq get nv 0 4
+end
+
+fn tt_neg_corrupt_files to void
+  d = new uchar 1024 0
+  dl = tt_newdir d tt_msg_negtr
+  r0 = tt_make_store d dl TT_N_SMALL 1
+  r0 = tg_open part d 0 dl dl
+  r0 = tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1
+  tg_close
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_gen_path 0 0 1
+  sb = new uchar 128 0
+  sr = stat tg_pa 0 pl sb 0 128
+  sz = ulong 0
+  for i ulong 8
+    sz = or sz shl ulong get sb add 48 i mul i 8
+  end
+  tr = truncate tg_pa 0 pl long sub sz 10
+  tt_check eq tg_read_current part d 0 dl dl TG_E_TRUNC
+  tt_check eq tg_open part d 0 dl dl TG_E_TRUNC
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_gen_path 0 0 1
+  tr = truncate tg_pa 0 pl 100
+  tt_check eq tg_open part d 0 dl dl TG_E_TRUNC
+
+  dl = tt_newdir d tt_msg_negdg
+  r0 = tt_make_store d dl TT_N_SMALL 1
+  r0 = tg_open part d 0 dl dl
+  r0 = tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1
+  tg_close
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_gen_path 0 0 1
+  tt_flip_pa 929
+  tt_check eq tg_read_current part d 0 dl dl TG_E_DIGEST
+  tt_check eq tg_open part d 0 dl dl TG_E_DIGEST
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_gen_path 0 0 1
+  tt_flip_pa 929
+  tt_check eq tg_open part d 0 dl dl TG_OK
+  tg_close
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_path 0 tg_txt_cur
+  tt_flip_pa 40
+  tt_check eq tg_open part d 0 dl dl TG_E_DIGEST
+end
+
+fn tt_neg_chain_and_args to void
+  d = new uchar 1024 0
+  dl = tt_newdir d tt_msg_negch
+  r0 = tt_make_store d dl TT_N_SMALL 1
+  r0 = tg_open part d 0 dl dl
+  r0 = tt_sgd_commit TT_N_SMALL TT_MOM_BITS 1
+  r0 = tt_sgd_commit TT_N_SMALL TT_MOM_BITS 2
+  tg_close
+  clen = tt_file_size d dl tg_txt_dlog
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_path 0 tg_txt_dlog
+  afd = fopen tg_pa 0 pl or TG_O_WRONLY TG_O_APPEND 0
+  junk = new uchar 192 171
+  aw = write int afd junk 0 192
+  ac = fclose int afd
+  tt_flip_pa 225
+  tt_check eq tg_open part d 0 dl dl TG_E_CHAIN
+  tt_check eq tt_file_size d dl tg_txt_dlog add clen 192
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_path 0 tg_txt_dlog
+  tt_flip_pa 225
+  tt_check eq tg_open part d 0 dl dl TG_OK
+  tt_check eq tt_file_size d dl tg_txt_dlog clen
+  tg_close
+  tg_set_dir part d 0 dl dl
+  pl = tg_mk_path 0 tg_txt_dlog
+  tr = truncate tg_pa 0 pl 192
+  tt_check eq tg_open part d 0 dl dl TG_E_CHAIN
+
+  dl = tt_newdir d tt_msg_negar
+  r0 = tt_make_store d dl TT_N_SMALL 0
+  r0 = tg_open part d 0 dl dl
+  r0 = tg_shadow_begin 0
+  tt_check eq tg_sgd_step 0 TT_N_SMALL TT_LR_BITS TT_MOM_BITS 1 TG_E_ARG
+  tt_check eq tg_sgd_step 0 sub TT_N_SMALL 1 TT_LR_BITS 0 1 TG_E_ARG
+  tt_check eq tg_sgd_step 0 TT_N_SMALL 0x7fc00000 0 1 TG_E_ARG
+  tg_shadow_discard 0
+  tt_check eq tg_commit 0 0 TG_E_STATE
+  tg_close
+end
+
+fn tt_t_cost to void
+  d = new uchar 1024 0
+  sizes = new ulong 2 0
+  put sizes 0 1024
+  put sizes 1 262144
+  for k ulong 2
+    n = get sizes k
+    tt_init_target n
+    dl = tt_newdir d tt_msg_cost
+    tt_check eq tt_make_store d dl n 1 TG_OK
+    tt_check eq tg_open part d 0 dl dl TG_OK
+    for i ulong 3
+      tt_check eq tt_sgd_commit n TT_MOM_BITS i TG_OK
+    end
+    drec = get tg_st_stats 0
+    tt_check eq drec 3
+    tt_check eq div get tg_st_stats 1 drec 192
+    exp_chb = mul 3 add 120 mul 2 mul n 4
+    tt_check eq get tg_st_stats 2 exp_chb
+    tg_close
+  end
+  tt_init_target TT_N_SMALL
+end
+
+fn tt_run_seq dir view uchar 1024 dl ulong steps ulong which ulong to void
+  r0 = tt_make_store dir dl TT_N_SMALL 1
+  tt_check eq tg_open part dir 0 dl dl TG_OK
+  for k ulong steps
+    mom = TT_MOM_BITS
+    if ge k div steps 2
+      mom = TT_HALF_BITS
+    end
+    tt_check eq tt_sgd_commit TT_N_SMALL mom add 1000 k TG_OK
+  end
+  for i ulong 32
+    if eq which 0
+      put tt_da i get tg_st_digest i
+      put tt_ha i get tg_st_dhead i
+    else
+      put tt_db i get tg_st_digest i
+      put tt_hb i get tg_st_dhead i
+    end
+  end
+  tg_close
+end
+
+fn tt_replay_step k ulong to ulong
+  dal = get tt_rep_dlen 0
+  da = new uchar 1024 0
+  for i ulong dal
+    put da i get tt_rep_dir i
+  end
+  zero = new uchar 32 0
+  if ne tg_read_gen part da 0 dal dal k 0 zero TG_OK
+    ret 0
+  end
+  prev_dig = new uchar 32 0
+  for i ulong 32
+    put prev_dig i get tg_snap_prev i
+  end
+  for i ulong 4096
+    put tt_gk_p i get tg_snap_params i
+    put tt_gk_o i get tg_snap_opt i
+  end
+  if ne tg_read_gen part da 0 dal dal sub k 1 1 prev_dig TG_OK
+    ret 0
+  end
+  fields = new ulong 7 0
+  bdig = new uchar 32 0
+  if ne tg_dispatch_read part da 0 dal dal sub k 1 fields bdig TG_OK
+    ret 0
+  end
+  if ne get fields 0 TG_OP_SGD
+    ret 0
+  end
+  if ne get fields 2 k
+    ret 0
+  end
+  if ne get fields 3 sub k 1
+    ret 0
+  end
+  for i ulong 32
+    if ne get bdig i get tg_snap_digest i
+      ret 0
+    end
+  end
+  ret tt_replay_exec get fields 4 get fields 5
+end
+
+fn tt_replay_exec arg0 ulong arg1 ulong to ulong
+  ds = new uchar 1024 0
+  dsl = tt_newdir ds tt_msg_reps
+  if ne tg_create part ds 0 dsl dsl 4096 4096 TG_OK
+    ret 0
+  end
+  if ne tg_open part ds 0 dsl dsl TG_OK
+    ret 0
+  end
+  r1 = tg_shadow_begin 0
+  tt_grad_from_snap TT_N_SMALL
+  ok = ulong 0
+  if eq tg_sgd_step 0 TT_N_SMALL and arg0 0xffffffff shr arg0 32 arg1 TG_OK
+    if eq tg_commit 0 0 TG_OK
+      ok = 1
+      for i ulong 4096
+        if ne get tg_st_params i get tt_gk_p i
+          ok = 0
+        end
+        if ne get tg_st_opt i get tt_gk_o i
+          ok = 0
+        end
+      end
+    end
+  end
+  tg_close
+  ret ok
+end
+
+fn tt_print_replay_hex to void
+  da = new uchar 32 0
+  ha = new uchar 32 0
+  for i ulong 32
+    put da i get tt_da i
+    put ha i get tt_ha i
+  end
+  hx = new uchar 64 0
+  hh = new uchar 64 0
+  tg_encode_hex da hx
+  tg_encode_hex ha hh
+  w1 = write 1 tt_msg_rdig 0 len tt_msg_rdig
+  w2 = write 1 hx 0 64
+  w3 = write 1 tt_msg_nl 0 1
+  w4 = write 1 tt_msg_rhead 0 len tt_msg_rhead
+  w5 = write 1 hh 0 64
+  w6 = write 1 tt_msg_nl 0 1
+end
+
+fn tt_t_replay to void
+  da_dir = new uchar 1024 0
+  db_dir = new uchar 1024 0
+  dal = tt_newdir da_dir tt_msg_repa
+  dbl = tt_newdir db_dir tt_msg_repb
+  for i ulong dal
+    put tt_rep_dir i get da_dir i
+  end
+  put tt_rep_dlen 0 dal
+  tt_run_seq da_dir dal 25 0
+  tt_run_seq db_dir dbl 25 1
+  for i ulong 32
+    tt_check eq get tt_da i get tt_db i
+    tt_check eq get tt_ha i get tt_hb i
+  end
+  tt_print_replay_hex
+  ok = ulong 0
+  for ki ulong 25
+    ok = add ok tt_replay_step add ki 1
+  end
+  tt_check eq ok 25
+end
+
+fn tt_report_sec id ulong to void
+  b = new uchar 4 0
+  if ne get tt_meta 3 0
+    put b 0 70
+    put b 1 uchar add 48 id
+    put b 2 10
+    w = write 2 b 0 3
+  end
+end
+
+fn main to int
+  if ne argcnt 2
+    w = write 2 tt_msg_usage 0 len tt_msg_usage
+    ret 2
+  end
+  blen = argread 1 tt_base 0 512
+  if le blen 0
+    ret 2
+  end
+  put tt_meta 0 ulong blen
+  mr = makedir tt_base 0 ulong blen 493
+  if and lt mr 0 ne mr -17
+    ret 2
+  end
+  tt_init_target TT_N_SMALL
+  tt_t_basic
+  tt_report_sec 1
+  tt_t_training
+  tt_report_sec 2
+  tt_t_crash
+  tt_report_sec 3
+  tt_t_reader_race
+  tt_report_sec 4
+  tt_neg_shadow_and_state
+  tt_report_sec 5
+  tt_neg_corrupt_files
+  tt_report_sec 6
+  tt_neg_chain_and_args
+  tt_report_sec 7
+  tt_t_cost
+  tt_report_sec 8
+  tt_t_replay
+  tt_report_sec 9
+  if ne get tt_meta 3 0
+    w = write 1 tt_msg_fail 0 len tt_msg_fail
+    ret 1
+  end
+  w = write 1 tt_msg_pass 0 len tt_msg_pass
+  ret 0
+end

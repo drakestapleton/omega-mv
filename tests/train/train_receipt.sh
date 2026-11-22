@@ -74,7 +74,7 @@ reasons=""
 verdict=PASS; [ -z "$reasons" ] || verdict=FAIL
 
 log_sha=$(cat "$W/run1.log" "$W/run2.log" | sha256sum | awk '{print $1}')
-src_sha=$(cat src/train/*.c src/train/*.h tests/train/test_train.c mk/train.mk | sha256sum | awk '{print $1}')
+src_sha=$(cat src/train/*.om tests/train/test_train.om mk/train.mk | sha256sum | awk '{print $1}')
 mkdir -p "$OUTDIR"
 cat > "$W/receipt.json" <<JSON
 {

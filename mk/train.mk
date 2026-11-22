@@ -1,49 +1,42 @@
-# M22 OMEGA_OPTIMIZER substrate + E5 training provenance (Lane 21, 2026-10-01).
-# Transactional generation store over plain byte buffers (src/train/tg_store.*),
-# SGD as the first updater (src/train/tg_sgd.*). No tensor/autodiff dependency
-# (M20/M21 integration waits). New files only: src/train/, tests/train/,
-# docs/train/, evidence/M22/. Picked up by `-include mk/*.mk`; not part of
-# `all` or `test`. Host only, single core, no GPU, no quiet flag.
+# M22 OMEGA_OPTIMIZER substrate + E5 training provenance (Lane 21, pure seeded OM-2).
+# Transactional generation store over plain byte buffers (src/train/tg_store.om),
+# SGD as the first updater (src/train/tg_sgd.om). No tensor/autodiff dependency.
+# Picked up by `-include mk/*.mk`; not part of `all` or `test`. Host only,
+# single core, no GPU, no quiet flag.
 #
-# test-train      purity check, then the exit tests plain and with ASan/UBSan;
-#                 both builds must print the same replay digest
-# train-purity    src/train includes only libc, sha256.h and src/train headers
+# test-train      purity check, then the pure OM-2 exit tests run twice;
+#                 both runs must print the same replay digest
+# train-purity    src/train contains only pure .om sources (0 C/H files)
 # train-receipt   digest-named receipt under evidence/M22/receipts (clean tree only)
 #
 # The receipt says M22 NOT QUALIFIED: this is the substrate + SGD path only.
 ifndef TRAIN_MK
 TRAIN_MK := 1
 .PHONY: test-train train-purity train-receipt
+TRAIN_OMC ?= seed/out/omc
 TRAIN_DIR = $(OUT_DIR)/train
-TRAIN_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -ffp-contract=off -Isrc
-TRAIN_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-TRAIN_SRCS = src/train/tg_store.c src/train/tg_sgd.c src/omega_om_units.c
-TRAIN_HDRS = src/train/tg_store.h src/train/tg_sgd.h src/sha256.h src/omega_api_decl.h
+TRAIN_OM_SRCS = src/train/generation.om src/train/sgd_update.om src/train/tg_sha256.om \
+	src/train/tg_store.om src/train/tg_sgd.om
 
-$(TRAIN_DIR)/test_train: tests/train/test_train.c $(TRAIN_SRCS) $(TRAIN_HDRS)
+$(TRAIN_DIR)/test_train: tests/train/test_train.om $(TRAIN_OM_SRCS) $(TRAIN_OMC)
 	@mkdir -p $(TRAIN_DIR)
-	$(CC) $(TRAIN_CFLAGS) -o $@ tests/train/test_train.c $(TRAIN_SRCS) -lm
-
-$(TRAIN_DIR)/test_train_asan: tests/train/test_train.c $(TRAIN_SRCS) $(TRAIN_HDRS)
-	@mkdir -p $(TRAIN_DIR)
-	$(CC) $(TRAIN_CFLAGS) $(TRAIN_ASAN) -o $@ tests/train/test_train.c $(TRAIN_SRCS) -lm
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TRAIN_OM_SRCS) tests/train/test_train.om) | $(TRAIN_OMC) > $@ && chmod +x $@
 
 train-purity:
-	@bad=$$(grep -HE '^[[:space:]]*#[[:space:]]*include' src/train/*.c src/train/*.h | \
-		grep -vE '^src/train/tg_(sgd|store)\.c:#[[:space:]]*include[[:space:]]+"omega_api_decl\.h"$$' | \
-		grep -vE '#[[:space:]]*include[[:space:]]+(<[a-z/]+\.h>|"sha256\.h"|"train/tg_[a-z]+\.h")' || true); \
-	if [ -n "$$bad" ]; then echo "train-purity: FAIL, unexpected includes:"; echo "$$bad"; exit 1; fi; \
-	echo "train-purity: src/train depends only on libc, sha256, the seeded SGD and generation bindings and itself"
+	@bad=$$(find src/train -maxdepth 1 \( -name '*.c' -o -name '*.h' \) 2>/dev/null); \
+	if [ -n "$$bad" ]; then echo "train-purity: FAIL, unexpected C/H files:"; echo "$$bad"; exit 1; fi; \
+	echo "train-purity: src/train is 100% pure seeded OM-2 (0 C/H files)"
 
-test-train: train-purity $(TRAIN_DIR)/test_train $(TRAIN_DIR)/test_train_asan
-	./$(TRAIN_DIR)/test_train $(TRAIN_DIR)/scratch > $(TRAIN_DIR)/plain.log 2>&1; rc=$$?; \
-		grep -vE '^crash |^cost |^sgd_' $(TRAIN_DIR)/plain.log; [ $$rc -eq 0 ]
-	./$(TRAIN_DIR)/test_train_asan $(TRAIN_DIR)/scratch-asan > $(TRAIN_DIR)/asan.log 2>&1; rc=$$?; \
-		grep -vE '^crash |^cost |^sgd_' $(TRAIN_DIR)/asan.log; [ $$rc -eq 0 ]
-	@a=$$(awk '$$1=="replay_digest"{print $$2}' $(TRAIN_DIR)/plain.log); \
-	 b=$$(awk '$$1=="replay_digest"{print $$2}' $(TRAIN_DIR)/asan.log); \
-	 if [ -z "$$a" ] || [ "$$a" != "$$b" ]; then echo "test-train: replay digest differs between builds"; exit 1; fi; \
-	 echo "test-train: plain and ASan/UBSan PASS, replay digest equal across builds"
+test-train: train-purity $(TRAIN_DIR)/test_train
+	@rm -rf $(TRAIN_DIR)/scratch $(TRAIN_DIR)/scratch-2
+	./$(TRAIN_DIR)/test_train $(TRAIN_DIR)/scratch > $(TRAIN_DIR)/run1.log 2>&1; rc=$$?; \
+		cat $(TRAIN_DIR)/run1.log; [ $$rc -eq 0 ]
+	./$(TRAIN_DIR)/test_train $(TRAIN_DIR)/scratch-2 > $(TRAIN_DIR)/run2.log 2>&1; rc=$$?; \
+		cat $(TRAIN_DIR)/run2.log; [ $$rc -eq 0 ]
+	@a=$$(awk '$$1=="replay_digest"{print $$2}' $(TRAIN_DIR)/run1.log); \
+	 b=$$(awk '$$1=="replay_digest"{print $$2}' $(TRAIN_DIR)/run2.log); \
+	 if [ -z "$$a" ] || [ "$$a" != "$$b" ]; then echo "test-train: replay digest differs between runs"; exit 1; fi; \
+	 echo "test-train: pure OM-2 PASS, replay digest equal across runs ($$a)"
 
 train-receipt:
 	bash tests/train/train_receipt.sh
