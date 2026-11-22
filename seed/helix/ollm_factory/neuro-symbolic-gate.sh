@@ -19,7 +19,7 @@ OMC=seed/out/omc
 [ -x "$OMC" ] || bad "seed/out/omc missing (run sh seed/omega-from-seed.sh)"
 
 printf '=== [1/5] COMPILE PURE SEEDED OM-2 MODULES WITH seed/out/omc ===\n'
-for name in om_synth om_synth_sm121 om_retriever om_formalize; do
+for name in om_synth om_synth_sm121 om_sketch om_retriever om_formalize; do
   src="seed/helix/ollm_factory/${name}.om"
   "$OMC" < "$src" > "$B/bin/$name" || bad "omc failed on $src"
   chmod +x "$B/bin/$name"
@@ -32,6 +32,7 @@ printf '\n=== [2/5] MODULE SELF-CHECKS ===\n'
 "$B/bin/om_synth" selfcheck || bad "om_synth selfcheck failed"
 "$B/bin/om_synth_sm121" layout || bad "om_synth_sm121 layout failed"
 "$B/bin/om_synth_sm121" selfcheck || bad "om_synth_sm121 selfcheck failed"
+"$B/bin/om_sketch" selfcheck || bad "om_sketch selfcheck failed"
 "$B/bin/om_retriever" selfcheck || bad "om_retriever selfcheck failed"
 "$B/bin/om_formalize" selfcheck || bad "om_formalize selfcheck failed"
 
@@ -55,4 +56,4 @@ printf 'note return the argument rounded down to a multiple of 14\nfn solve a ul
 chmod +x "$B/work/p_syn_bin"
 "$B/work/p_syn_bin" || bad "synthesized binary failed execution check"
 
-printf '\nNEURO_SYM_GATE PASS modules=4/4 sm121_invariants=3/3 mined_seen=0 e2e_exec=1\n'
+printf '\nNEURO_SYM_GATE PASS modules=5/5 sm121_invariants=3/3 mined_seen=0 e2e_exec=1\n'

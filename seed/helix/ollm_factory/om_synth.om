@@ -52,12 +52,17 @@ global syLvlE ulong 16
 global sySt ulong 32
 global syTmpV ulong 8
 
-note Decision-list branch storage (up to 4 guards + default)
+note Decision-list branch storage (up to 4 guards + default, plus compound or/and 1-guard)
 global syBrPredOp ulong 8
 global syBrPredL ulong 8
 global syBrPredR ulong 8
 global syBrExpr ulong 8
 global syBrDef ulong 1
+global syBrMode ulong 1
+global syAPOp ulong 128
+global syAPL ulong 128
+global syAPR ulong 128
+global syAPMask ulong 128
 
 note Wake-sleep mined verified OM-2 library buffer (general AST combinator store)
 global syLibBuf uchar 65536
@@ -484,10 +489,14 @@ put syLvlE d get sySt 3
 ret false
 end
 
+text tUlong "ulong "
+
 note Emit OM-2 prefix expression for AST node nid (max depth 4, iterative-safe recursion)
+note Always types constants explicitly (`ulong N`) so every emitted AST compiles 100% under omc
 fn syEmitExpr nid ulong to void
 op = ulong get syOp nid
 if eq op 0
+oTxt tUlong
 oNum get syL nid
 ret
 end
@@ -699,7 +708,92 @@ end
 ret ne get sySt 26 0
 end
 
-note Decision-List branch solver (checks 1-guard exact partition first, then up to 4 guards)
+note Collect distinct non-trivial atomic predicates (predLim x d0E) into syAP*
+fn syCollectAtoms remMask ulong lLim ulong rLim ulong to ulong
+cnt = ulong 0
+for cop ulong 6 bound 6
+for li ulong lLim bound 256
+for ri ulong rLim bound 64
+if ne li ri
+pm = and syEvalPred cop li ri remMask
+if and ne pm 0 ne pm remMask
+dup = false
+for k ulong cnt bound 128
+if eq get syAPMask k pm
+dup = true
+break
+end
+end
+if and not dup lt cnt 128
+put syAPOp cnt cop
+put syAPL cnt li
+put syAPR cnt ri
+put syAPMask cnt pm
+cnt = add cnt 1
+end
+end
+end
+end
+end
+end
+ret cnt
+end
+
+note Check compound 1-guard (if or P1 P2 -> e1 else e2, or if and P1 P2 -> e1 else e2)
+fn syTryCompoundPair remMask ulong i ulong j ulong isAnd bool to bool
+pm = ulong 0
+if isAnd
+pm = and get syAPMask i get syAPMask j
+else
+pm = or get syAPMask i get syAPMask j
+end
+pm = and pm remMask
+if or eq pm 0 eq pm remMask
+ret false
+end
+qm = and remMask xor 255 pm
+e1 = syFindFullCover pm get sySt 28
+if eq e1 999999
+ret false
+end
+e2 = syFindFullCover qm get sySt 28
+if eq e2 999999
+ret false
+end
+put syBrPredOp 0 get syAPOp i
+put syBrPredL 0 get syAPL i
+put syBrPredR 0 get syAPR i
+put syBrPredOp 1 get syAPOp j
+put syBrPredL 1 get syAPL j
+put syBrPredR 1 get syAPR j
+put syBrExpr 0 e1
+put syBrDef 0 e2
+if isAnd
+put syBrMode 0 2
+else
+put syBrMode 0 1
+end
+ret true
+end
+
+fn syFindCompoundGuard remMask ulong lLim ulong rLim ulong to bool
+cnt = syCollectAtoms remMask lLim rLim
+for i ulong cnt bound 128
+j = add i 1
+while lt j cnt bound 128
+if syTryCompoundPair remMask i j false
+ret true
+end
+if syTryCompoundPair remMask i j true
+ret true
+end
+j = add j 1
+end
+end
+ret false
+end
+
+note Decision-List branch solver (checks 1-guard exact, compound and/or 1-guard, then up to 4 guards)
 fn sySolveBranch to bool
 remM = get sySt 7
 exprLim = get sySt 3
@@ -709,13 +803,19 @@ predLim = 256
 end
 put sySt 28 exprLim
 put sySt 10 0
+put syBrMode 0 0
 d0E = get syLvlE 0
-note Fast path: exact 1-guard partition (if P -> e1 else e2)
+note Fast path 1: exact 1-guard partition (if P -> e1 else e2)
 if syFindOneGuardIn remM d0E d0E
 put sySt 10 1
 ret true
 end
 if syFindOneGuardIn remM predLim d0E
+put sySt 10 1
+ret true
+end
+note Fast path 2: compound 1-guard (if or/and P1 P2 -> e1 else e2)
+if syFindCompoundGuard remM predLim d0E
 put sySt 10 1
 ret true
 end
@@ -790,6 +890,34 @@ syEmitFnHdr get sySt 1
 if not isBranch
 oTxt tRet
 syEmitExpr get sySt 8
+oCh 10
+oTxt tEnd
+ret
+end
+bm = get syBrMode 0
+if ne bm 0
+oTxt tIf
+if eq bm 1
+oTxt opOr
+else
+oTxt opAnd
+end
+syEmitCmp get syBrPredOp 0
+syEmitExpr get syBrPredL 0
+oCh 32
+syEmitExpr get syBrPredR 0
+oCh 32
+syEmitCmp get syBrPredOp 1
+syEmitExpr get syBrPredL 1
+oCh 32
+syEmitExpr get syBrPredR 1
+oCh 10
+oTxt tRet
+syEmitExpr get syBrExpr 0
+oCh 10
+oTxt tEnd
+oTxt tRet
+syEmitExpr get syBrDef 0
 oCh 10
 oTxt tEnd
 ret
