@@ -26,18 +26,18 @@ $(OME_DIR)/typediff: tools/omega_emit/typediff.c $(OME_OSC_LIB) $(wildcard src/c
 	@mkdir -p $(OME_DIR)
 	$(CC) $(OME_CFLAGS) -o $@ tools/omega_emit/typediff.c $(OME_OSC_LIB)
 
-$(OME_DIR)/fake445: tools/exp445/fake445.c
+$(OME_DIR)/fake445: tools/exp445/fake445.om seed/out/omc
 	@mkdir -p $(OME_DIR)
-	$(CC) $(OME_CFLAGS) -o $@ tools/exp445/fake445.c
+	seed/out/omc < tools/exp445/fake445.om > $@ && chmod +x $@
 
 omega-emit: $(OME_DIR)/omega_emit $(OME_DIR)/x445 $(OME_DIR)/fake445 $(OME_DIR)/typediff
 
 test-omega-emit: omega-emit $(OUT_DIR)/compiler/oscc
 	bash tools/omega_emit/test_omega_emit.sh $(abspath $(OME_DIR)) $(abspath $(OUT_DIR)/compiler/oscc)
 
-$(OME_DIR)/examples_expected: tools/exp445/examples_expected.c
+$(OME_DIR)/examples_expected: tools/exp445/examples_expected.om seed/out/omc
 	@mkdir -p $(OME_DIR)
-	$(CC) -std=gnu11 -Wall -Wextra -Werror -O2 -o $@ tools/exp445/examples_expected.c
+	seed/out/omc < tools/exp445/examples_expected.om > $@ && chmod +x $@
 
 test-exp445: omega-emit omegese $(OME_DIR)/examples_expected one-layer-acceptance-tools $(OUT_DIR)/compiler/oscc
 	bash tools/exp445/test_exp445.sh $(abspath $(OME_DIR)) $(abspath $(OUT_DIR)/compiler/oscc) $(abspath $(OUT_DIR)/omegese/omegese)

@@ -1,0 +1,1170 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/ty_energy_wall.om -- pure seeded OM-2 TY-4/TY-5 wall amendment reducer.
+note Replaces tools/ty_energy_wall.c.
+om2
+
+text t_pfx "ty_energy_wall: "
+text t_nl "\n"
+text t_usage "usage: ty_energy_wall OUTDIR SENSOR_CSV"
+text t_oom "oom"
+text t_ecsv "sensor csv"
+text t_eoff "offsets.txt"
+text t_nan "nan"
+text t_raw "/raw/"
+text t_offs "/offsets.txt"
+text t_uptime "/proc/uptime"
+text t_k_cfg "config"
+text t_k_lvl "level"
+text t_k_rnd "round"
+text t_k_go "go_ns"
+text t_k_pln "planned_ns"
+text t_k_spk "spawn_ok"
+text t_k_par "participants"
+text t_k_ok "{\"ok\":"
+text t_k_res "\"result\":"
+text t_k_tag "tag"
+text t_k_ook "oracle_ok"
+text t_k_pin "pinned"
+text t_k_cal "calls"
+text t_s6 "S6"
+text t_s2 "S2"
+text t_s6n "S6\n"
+text t_s2n "S2\n"
+text t_idle "IDLE"
+text t_a "A"
+text t_b "B"
+text t_ab "AB"
+text t_hdr1 "TYW (TY-4/TY-5 wall amendment). BOOTTIME - MONOTONIC now = "
+text t_hdr2 " s (0 = no suspend; offsets valid)\n"
+text t_hdr3 "package energy: UNAVAILABLE (no aien_spbm hwmon). wall = UPS output, 10 W steps, ~2 s rows\n\n"
+text t_r1 "  round "
+text t_r2 ": E0 "
+text t_r3 "  EA "
+text t_r4 "  EB "
+text t_r5 "  EAB "
+text t_r6 " J (rows "
+text t_r7 ", load "
+text t_ref "  REFUSED\n"
+text t_i1 "  I "
+text t_i2 " J  slowdown A "
+text t_i3 " B "
+text t_few "  fewer than 2 valid rounds: no interval\n\n"
+text t_m1 "  mean I "
+text t_m2 " J, sd "
+text t_m3 " J, 95% t-interval ["
+text t_m4 ", "
+text t_m5 "] J (half-width "
+text t_m6 " J = "
+text t_m7 "% of mean E_AB "
+text t_m8 " J)\n"
+text t_d1 "  I distinguishable from zero: "
+text t_yesn "yes\n"
+text t_non "no\n"
+text t_c1 "  CHECK (a) wall form: "
+text t_pass "PASS"
+text t_fail "FAIL"
+text t_c2 " (valid rounds "
+text t_c3 " of 3; half-width <= 2% of E_AB: "
+text t_yesp "yes)\n\n"
+text t_nop "no)\n\n"
+text t_chkb "CHECK (b): NOT RUN (amendment 2: waits for the package meter)\n"
+
+global g_outdir uchar 1024
+global g_csv uchar 1024
+global g_fbuf uchar *
+global g_wbuf uchar *
+global g_pbuf uchar 2048
+global g_out uchar *
+
+global g_rt long *
+global g_rw f64 *
+global g_rl f64 *
+
+note g_sz: [0]=outdlen [1]=csvlen [2]=flen [3]=wlen [4]=plen [5]=nrows [6]=outlen
+global g_sz ulong 8
+
+note W[c * 68 + r * 4 + k]: 136 slots
+global g_wok long 136
+global g_we f64 136
+global g_wca f64 136
+global g_wcb f64 136
+global g_wld f64 136
+global g_wnr long 136
+global g_wval long 136
+
+global g_t0 uchar 64
+global g_t1 uchar 64
+global g_ia f64 17
+global g_eab f64 17
+
+fn out_push c uchar to void
+  n = get g_sz 6
+  if ge n len g_out
+    nc = mul n 2
+    if lt nc 4096
+      nc = 4096
+    end
+    r = enlarge g_out nc
+    if lt r 0
+      exit 2
+    end
+  end
+  put g_out n c
+  put g_sz 6 add n 1
+end
+
+fn out_str s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    out_push get s i
+    i = add i 1
+  end
+end
+
+fn out_u64 v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    out_push 48
+    ret
+  end
+  k = ulong 0
+  while gt v 0
+    put tmp k uchar add 48 rem v 10
+    v = div v 10
+    k = add k 1
+  end
+  while gt k 0
+    k = sub k 1
+    out_push get tmp k
+  end
+end
+
+fn out_i64 v long to void
+  if lt v 0
+    out_push 45
+    if eq v sub neg long 9223372036854775807 1
+      out_u64 9223372036854775808
+    else
+      out_u64 ulong neg v
+    end
+    ret
+  end
+  out_u64 ulong v
+end
+
+fn round_even v f64 scale f64 to ulong
+  scaled = mul v scale
+  fl = ulong scaled
+  frac = sub scaled f64 fl
+  if gt frac f64 0.5
+    ret add fl 1
+  end
+  if and eq frac f64 0.5 eq and fl 1 1
+    ret add fl 1
+  end
+  ret fl
+end
+
+fn out_fixed v f64 prec ulong is_nan bool to void
+  if is_nan
+    out_str t_nan
+    ret
+  end
+  if lt v f64 0.0
+    out_push 45
+    v = neg v
+  end
+  scale = f64 1.0
+  sdiv = ulong 1
+  i = ulong 0
+  while lt i prec
+    scale = mul scale f64 10.0
+    sdiv = mul sdiv 10
+    i = add i 1
+  end
+  sv = round_even v scale
+  ip = div sv sdiv
+  fp = rem sv sdiv
+  out_u64 ip
+  if gt prec 0
+    out_push 46
+    d = div sdiv 10
+    j = ulong 0
+    while lt j prec
+      dig = div fp d
+      out_push uchar add 48 dig
+      fp = rem fp d
+      if gt d 1
+        d = div d 10
+      end
+      j = add j 1
+    end
+  end
+end
+
+fn out_flush to void
+  n = get g_sz 6
+  off = ulong 0
+  while lt off n
+    w = write 1 g_out off sub n off
+    if le w 0
+      exit 2
+    end
+    off = add off ulong w
+  end
+  put g_sz 6 0
+end
+
+fn die m view uchar * to void
+  e1 = write 2 t_pfx 0 len t_pfx
+  e2 = write 2 m 0 len m
+  e3 = write 2 t_nl 0 1
+  if or lt e1 0 or lt e2 0 lt e3 0
+    exit 2
+  end
+  exit 2
+end
+
+fn slurp_into is_w bool use_csv bool plen ulong to bool
+  fd = long 0
+  if use_csv
+    fd = fopen g_csv 0 plen 0 0
+  else
+    fd = fopen g_pbuf 0 plen 0 0
+  end
+  if lt fd 0
+    ret false
+  end
+  if is_w
+    if lt len g_wbuf 4096
+      r = enlarge g_wbuf 4096
+      if lt r 0
+        die t_oom
+      end
+    end
+    n = ulong 0
+    while true
+      cap = len g_wbuf
+      if eq n cap
+        r2 = enlarge g_wbuf mul cap 2
+        if lt r2 0
+          die t_oom
+        end
+        cap = len g_wbuf
+      end
+      got = read int fd g_wbuf n sub cap n
+      if le got 0
+        break
+      end
+      n = add n ulong got
+    end
+    put g_sz 3 n
+  else
+    if lt len g_fbuf 4096
+      r = enlarge g_fbuf 4096
+      if lt r 0
+        die t_oom
+      end
+    end
+    n = ulong 0
+    while true
+      cap = len g_fbuf
+      if eq n cap
+        r2 = enlarge g_fbuf mul cap 2
+        if lt r2 0
+          die t_oom
+        end
+        cap = len g_fbuf
+      end
+      got = read int fd g_fbuf n sub cap n
+      if le got 0
+        break
+      end
+      n = add n ulong got
+    end
+    put g_sz 2 n
+  end
+  cr = fclose int fd
+  if lt cr 0
+    ret true
+  end
+  ret true
+end
+
+fn parse_i64_fbuf p ulong lend ulong to long
+  neg_ = false
+  if lt p lend
+    if eq get g_fbuf p 45
+      neg_ = true
+      p = add p 1
+    end
+  end
+  v = long 0
+  while lt p lend
+    c = get g_fbuf p
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 long sub c 48
+    p = add p 1
+  end
+  if neg_
+    ret neg v
+  end
+  ret v
+end
+
+fn skip_i64_fbuf p ulong lend ulong to ulong
+  if lt p lend
+    if eq get g_fbuf p 45
+      p = add p 1
+    end
+  end
+  while lt p lend
+    c = get g_fbuf p
+    if or lt c 48 gt c 57
+      break
+    end
+    p = add p 1
+  end
+  ret p
+end
+
+fn get_bch is_w bool p ulong to uchar
+  if is_w
+    ret get g_wbuf p
+  end
+  ret get g_fbuf p
+end
+
+fn parse_f64_exp is_w bool p ulong lend ulong v f64 to f64
+  eneg = false
+  if lt p lend
+    cs = get_bch is_w p
+    if eq cs 45
+      eneg = true
+      p = add p 1
+    else
+      if eq cs 43
+        p = add p 1
+      end
+    end
+  end
+  ev = ulong 0
+  while lt p lend
+    cd = get_bch is_w p
+    if or lt cd 48 gt cd 57
+      break
+    end
+    ev = add mul ev 10 ulong sub cd 48
+    p = add p 1
+  end
+  i = ulong 0
+  while lt i ev
+    if eneg
+      v = div v f64 10.0
+    else
+      v = mul v f64 10.0
+    end
+    i = add i 1
+  end
+  ret v
+end
+
+fn parse_f64_buf is_w bool p ulong lend ulong to f64
+  neg_ = false
+  if lt p lend
+    if eq get_bch is_w p 45
+      neg_ = true
+      p = add p 1
+    end
+  end
+  v = f64 0.0
+  while lt p lend
+    c = get_bch is_w p
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v f64 10.0 f64 ulong sub c 48
+    p = add p 1
+  end
+  if lt p lend
+    if eq get_bch is_w p 46
+      p = add p 1
+      sc = f64 0.1
+      while lt p lend
+        c2 = get_bch is_w p
+        if or lt c2 48 gt c2 57
+          break
+        end
+        v = add v mul f64 ulong sub c2 48 sc
+        sc = mul sc f64 0.1
+        p = add p 1
+      end
+    end
+  end
+  if lt p lend
+    ce = get_bch is_w p
+    if or eq ce 101 eq ce 69
+      v = parse_f64_exp is_w add p 1 lend v
+    end
+  end
+  if neg_
+    ret neg v
+  end
+  ret v
+end
+
+fn skip_f64_fbuf p ulong lend ulong to ulong
+  if lt p lend
+    if eq get g_fbuf p 45
+      p = add p 1
+    end
+  end
+  while lt p lend
+    c = get g_fbuf p
+    if or lt c 48 gt c 57
+      break
+    end
+    p = add p 1
+  end
+  if lt p lend
+    if eq get g_fbuf p 46
+      p = add p 1
+      while lt p lend
+        c2 = get g_fbuf p
+        if or lt c2 48 gt c2 57
+          break
+        end
+        p = add p 1
+      end
+    end
+  end
+  ret p
+end
+
+fn row_push t long w f64 ld f64 to void
+  n = get g_sz 5
+  if ge n len g_rt
+    nc = mul n 2
+    if lt nc 4096
+      nc = 4096
+    end
+    r1 = enlarge g_rt nc
+    r2 = enlarge g_rw nc
+    r3 = enlarge g_rl nc
+    if or lt r1 0 or lt r2 0 lt r3 0
+      die t_oom
+    end
+  end
+  put g_rt n t
+  put g_rw n w
+  put g_rl n ld
+  put g_sz 5 add n 1
+end
+
+fn parse_csv_line p ulong lend ulong to void
+  if ge p lend
+    ret
+  end
+  c0 = get g_fbuf p
+  if and ne c0 45 or lt c0 48 gt c0 57
+    ret
+  end
+  t = parse_i64_fbuf p lend
+  p = skip_i64_fbuf p lend
+  if or ge p lend ne get g_fbuf p 44
+    ret
+  end
+  p = add p 1
+  iso_n = ulong 0
+  while lt p lend
+    if eq get g_fbuf p 44
+      break
+    end
+    p = add p 1
+    iso_n = add iso_n 1
+  end
+  if or eq iso_n 0 or ge p lend ne get g_fbuf p 44
+    ret
+  end
+  p = add p 1
+  q = skip_f64_fbuf p lend
+  if or eq q p or ge q lend ne get g_fbuf q 44
+    ret
+  end
+  w = parse_f64_buf false p lend
+  p = add q 1
+  q = skip_f64_fbuf p lend
+  if or eq q p or ge q lend ne get g_fbuf q 44
+    ret
+  end
+  p = add q 1
+  q = skip_f64_fbuf p lend
+  if or eq q p or ge q lend ne get g_fbuf q 44
+    ret
+  end
+  p = add q 1
+  q = skip_f64_fbuf p lend
+  if eq q p
+    ret
+  end
+  ld = parse_f64_buf false p lend
+  row_push t w ld
+end
+
+fn load_csv to void
+  if not slurp_into false true get g_sz 1
+    die t_ecsv
+  end
+  pos = ulong 0
+  n = get g_sz 2
+  while lt pos n
+    lend = pos
+    while lt lend n
+      if eq get g_fbuf lend 10
+        break
+      end
+      lend = add lend 1
+    end
+    parse_csv_line pos lend
+    if lt lend n
+      pos = add lend 1
+    else
+      pos = lend
+    end
+  end
+end
+
+fn find_wbuf start ulong pat view uchar * to long
+  n = get g_sz 3
+  plen = len pat
+  if or eq plen 0 lt sub n start plen
+    ret neg long 1
+  end
+  lim = sub n plen
+  i = start
+  while le i lim
+    j = ulong 0
+    ok = true
+    while lt j plen
+      if ne get g_wbuf add i j get pat j
+        ok = false
+        break
+      end
+      j = add j 1
+    end
+    if ok
+      ret long i
+    end
+    i = add i 1
+  end
+  ret neg long 1
+end
+
+fn match_key_at i ulong key view uchar * to bool
+  klen = len key
+  j = ulong 0
+  while lt j klen
+    if ne get g_wbuf add add i 1 j get key j
+      ret false
+    end
+    j = add j 1
+  end
+  if ne get g_wbuf add add i 1 klen 34
+    ret false
+  end
+  ret eq get g_wbuf add add i 2 klen 58
+end
+
+fn field_wbuf start ulong key view uchar * to long
+  n = get g_sz 3
+  klen = len key
+  need = add klen 3
+  if lt sub n start need
+    ret neg long 1
+  end
+  lim = sub n need
+  i = start
+  while le i lim
+    if eq get g_wbuf i 34
+      if match_key_at i key
+        ret long add add i 3 klen
+      end
+    end
+    i = add i 1
+  end
+  ret neg long 1
+end
+
+fn str_wbuf start ulong key view uchar * which ulong to long
+  p = field_wbuf start key
+  if lt p 0
+    ret neg long 1
+  end
+  up = ulong p
+  n = get g_sz 3
+  if or ge up n ne get g_wbuf up 34
+    ret neg long 1
+  end
+  up = add up 1
+  k = ulong 0
+  while and lt up n lt k 63
+    c = get g_wbuf up
+    if eq c 34
+      break
+    end
+    if eq which 0
+      put g_t0 k c
+    else
+      put g_t1 k c
+    end
+    k = add k 1
+    up = add up 1
+  end
+  ret long k
+end
+
+fn tmp_eq which ulong n ulong s view uchar * to bool
+  if ne n len s
+    ret false
+  end
+  i = ulong 0
+  while lt i n
+    c = uchar 0
+    if eq which 0
+      c = get g_t0 i
+    else
+      c = get g_t1 i
+    end
+    if ne c get s i
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn build_raw_path name_off ulong name_len ulong to ulong
+  p = ulong 0
+  i = ulong 0
+  dn = get g_sz 0
+  while lt i dn
+    put g_pbuf p get g_outdir i
+    p = add p 1
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i len t_raw
+    put g_pbuf p get t_raw i
+    p = add p 1
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i name_len
+    put g_pbuf p get g_fbuf add name_off i
+    p = add p 1
+    i = add i 1
+  end
+  put g_sz 4 p
+  ret p
+end
+
+fn parse_one_participant slot ulong uq ulong wlen ulong to void
+  pok = eq parse_f64_buf true add uq 6 wlen f64 1.0
+  res = find_wbuf uq t_k_res
+  if lt res 0
+    put g_wok slot 0
+    ret
+  end
+  ures = ulong res
+  tlen = str_wbuf ures t_k_tag 1
+  ook = field_wbuf ures t_k_ook
+  pin = field_wbuf ures t_k_pin
+  bad = false
+  if or lt tlen 0 not pok
+    bad = true
+  end
+  if or lt ook 0 lt pin 0
+    bad = true
+  end
+  if not bad
+    if ne parse_f64_buf true ulong ook wlen f64 1.0
+      bad = true
+    end
+    if ne parse_f64_buf true ulong pin wlen f64 1.0
+      bad = true
+    end
+  end
+  if bad
+    put g_wok slot 0
+  end
+  if ge tlen 0
+    cf = field_wbuf ures t_k_cal
+    if ge cf 0
+      cv = parse_f64_buf true ulong cf wlen
+      if tmp_eq 1 ulong tlen t_a
+        put g_wca slot cv
+      end
+      if tmp_eq 1 ulong tlen t_b
+        put g_wcb slot cv
+      end
+    end
+  end
+end
+
+fn parse_participants slot ulong to long
+  p = field_wbuf 0 t_k_par
+  if lt p 0
+    ret 0
+  end
+  cur = ulong p
+  nparts = long 0
+  wlen = get g_sz 3
+  while true
+    q = find_wbuf cur t_k_ok
+    if lt q 0
+      break
+    end
+    uq = ulong q
+    parse_one_participant slot uq wlen
+    nparts = add nparts 1
+    cur = add uq 6
+  end
+  ret nparts
+end
+
+fn accum_loop slot ulong t0 f64 t1 f64 planned f64 to void
+  s = f64 0.0
+  l = f64 0.0
+  m = long 0
+  nr = get g_sz 5
+  i = ulong 0
+  while lt i nr
+    rt = f64 get g_rt i
+    if and ge rt t0 le rt t1
+      s = add s get g_rw i
+      l = add l get g_rl i
+      m = add m 1
+    end
+    i = add i 1
+  end
+  put g_wnr slot m
+  if lt m 10
+    put g_wok slot 0
+  end
+  if gt m 0
+    put g_we slot div mul div s f64 m planned f64 1000000000.0
+    put g_wld slot div l f64 m
+    put g_wval slot 1
+  else
+    put g_wval slot 0
+  end
+end
+
+fn accumulate_rows slot ulong go f64 planned f64 ep_ns long up_s f64 to void
+  off_s = sub div f64 ep_ns f64 1000000000.0 up_s
+  t0 = add div go f64 1000000000.0 off_s
+  t1 = add t0 div planned f64 1000000000.0
+  accum_loop slot t0 t1 planned
+end
+
+fn process_window_slot slot ulong k long ep_ns long up_s f64 to void
+  wlen = get g_sz 3
+  gof = field_wbuf 0 t_k_go
+  plf = field_wbuf 0 t_k_pln
+  spf = field_wbuf 0 t_k_spk
+  ok = long 1
+  go = f64 0.0
+  planned = f64 0.0
+  if or lt gof 0 or lt plf 0 lt spf 0
+    ok = 0
+  else
+    go = parse_f64_buf true ulong gof wlen
+    planned = parse_f64_buf true ulong plf wlen
+    if or le planned f64 0.0 ne parse_f64_buf true ulong spf wlen f64 1.0
+      ok = 0
+    end
+  end
+  put g_wok slot ok
+  nparts = parse_participants slot
+  want = long 1
+  if eq k 0
+    want = 0
+  end
+  if eq k 3
+    want = 2
+  end
+  if ne nparts want
+    put g_wok slot 0
+  end
+  accumulate_rows slot go planned ep_ns up_s
+end
+
+fn parse_cfg_id to long
+  clen = str_wbuf 0 t_k_cfg 0
+  if lt clen 0
+    ret neg long 1
+  end
+  if tmp_eq 0 ulong clen t_s6
+    ret 0
+  end
+  if tmp_eq 0 ulong clen t_s2
+    ret 1
+  end
+  ret neg long 1
+end
+
+fn parse_cond_id to long
+  llen = str_wbuf 0 t_k_lvl 1
+  if lt llen 0
+    ret neg long 1
+  end
+  if tmp_eq 1 ulong llen t_idle
+    ret 0
+  end
+  if tmp_eq 1 ulong llen t_a
+    ret 1
+  end
+  if tmp_eq 1 ulong llen t_b
+    ret 2
+  end
+  if tmp_eq 1 ulong llen t_ab
+    ret 3
+  end
+  ret neg long 1
+end
+
+fn process_window name_off ulong name_len ulong ep_ns long up_s f64 to void
+  plen = build_raw_path name_off name_len
+  if not slurp_into true false plen
+    ret
+  end
+  c = parse_cfg_id
+  k = parse_cond_id
+  rf = field_wbuf 0 t_k_rnd
+  if or lt c 0 or lt k 0 lt rf 0
+    ret
+  end
+  r = add long parse_f64_buf true ulong rf get g_sz 3 1
+  if or lt r 1 gt r 16
+    ret
+  end
+  sc = mul ulong c 68
+  sr = mul ulong r 4
+  slot = add add sc sr ulong k
+  process_window_slot slot k ep_ns up_s
+end
+
+fn is_ws c uchar to bool
+  ret or or eq c 32 eq c 9 or eq c 10 eq c 13
+end
+
+fn load_offsets to void
+  p = ulong 0
+  i = ulong 0
+  dn = get g_sz 0
+  while lt i dn
+    put g_pbuf p get g_outdir i
+    p = add p 1
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i len t_offs
+    put g_pbuf p get t_offs i
+    p = add p 1
+    i = add i 1
+  end
+  put g_sz 4 p
+  if not slurp_into false false p
+    die t_eoff
+  end
+  pos = ulong 0
+  n = get g_sz 2
+  while lt pos n
+    while lt pos n
+      if not is_ws get g_fbuf pos
+        break
+      end
+      pos = add pos 1
+    end
+    if ge pos n
+      break
+    end
+    noff = pos
+    while lt pos n
+      if is_ws get g_fbuf pos
+        break
+      end
+      pos = add pos 1
+    end
+    nlen = sub pos noff
+    while lt pos n
+      if not is_ws get g_fbuf pos
+        break
+      end
+      pos = add pos 1
+    end
+    if ge pos n
+      break
+    end
+    ep = parse_i64_fbuf pos n
+    pos = skip_i64_fbuf pos n
+    while lt pos n
+      if not is_ws get g_fbuf pos
+        break
+      end
+      pos = add pos 1
+    end
+    if ge pos n
+      break
+    end
+    up = parse_f64_buf false pos n
+    pos = skip_f64_fbuf pos n
+    process_window noff nlen ep up
+  end
+end
+
+fn tq df long to f64
+  if eq df 1
+    ret f64 12.706
+  end
+  if eq df 2
+    ret f64 4.303
+  end
+  if eq df 3
+    ret f64 3.182
+  end
+  if eq df 4
+    ret f64 2.776
+  end
+  if eq df 5
+    ret f64 2.571
+  end
+  if eq df 6
+    ret f64 2.447
+  end
+  if eq df 7
+    ret f64 2.365
+  end
+  if eq df 8
+    ret f64 2.306
+  end
+  if eq df 9
+    ret f64 2.262
+  end
+  if eq df 10
+    ret f64 2.228
+  end
+  ret f64 1.96
+end
+
+fn boottime_minus_mono to f64
+  i = ulong 0
+  while lt i len t_uptime
+    put g_pbuf i get t_uptime i
+    i = add i 1
+  end
+  mns = monons
+  if not slurp_into false false len t_uptime
+    ret f64 0.0
+  end
+  up = parse_f64_buf false 0 get g_sz 2
+  ms = div f64 mns f64 1000000000.0
+  diff = sub up ms
+  if lt fabs diff f64 0.05
+    ret f64 0.0
+  end
+  ret diff
+end
+
+fn print_round_prefix r ulong base ulong to void
+  out_str t_r1
+  out_u64 sub r 1
+  out_str t_r2
+  out_fixed get g_we base 1 eq get g_wval base 0
+  out_str t_r3
+  out_fixed get g_we add base 1 1 eq get g_wval add base 1 0
+  out_str t_r4
+  out_fixed get g_we add base 2 1 eq get g_wval add base 2 0
+  out_str t_r5
+  out_fixed get g_we add base 3 1 eq get g_wval add base 3 0
+  out_str t_r6
+  out_i64 get g_wnr base
+  out_push 47
+  out_i64 get g_wnr add base 1
+  out_push 47
+  out_i64 get g_wnr add base 2
+  out_push 47
+  out_i64 get g_wnr add base 3
+  out_str t_r7
+  out_fixed get g_wld base 1 eq get g_wval base 0
+  out_push 47
+  out_fixed get g_wld add base 1 1 eq get g_wval add base 1 0
+  out_push 47
+  out_fixed get g_wld add base 2 1 eq get g_wval add base 2 0
+  out_push 47
+  out_fixed get g_wld add base 3 1 eq get g_wval add base 3 0
+  out_push 41
+end
+
+fn round_empty base ulong to bool
+  if ne get g_wnr base 0
+    ret false
+  end
+  if ne get g_wnr add base 1 0
+    ret false
+  end
+  if ne get g_wnr add base 2 0
+    ret false
+  end
+  ret eq get g_wnr add base 3 0
+end
+
+fn round_ok base ulong to bool
+  if ne get g_wok base 1
+    ret false
+  end
+  if ne get g_wok add base 1 1
+    ret false
+  end
+  if ne get g_wok add base 2 1
+    ret false
+  end
+  ret eq get g_wok add base 3 1
+end
+
+fn report_round_ok base ulong n ulong to void
+  e0 = get g_we base
+  ea = get g_we add base 1
+  eb = get g_we add base 2
+  eabv = get g_we add base 3
+  ir = add sub sub eabv ea eb e0
+  sa = sub f64 1.0 div get g_wca add base 3 get g_wca add base 1
+  sb = sub f64 1.0 div get g_wcb add base 3 get g_wcb add base 2
+  out_str t_i1
+  out_fixed ir 1 false
+  out_str t_i2
+  out_fixed sa 4 false
+  out_str t_i3
+  out_fixed sb 4 false
+  out_push 10
+  put g_ia n ir
+  put g_eab n eabv
+end
+
+fn report_summary n ulong to void
+  if lt n 2
+    out_str t_few
+    ret
+  end
+  mi = f64 0.0
+  me = f64 0.0
+  sd = f64 0.0
+  k = ulong 0
+  while lt k n
+    mi = add mi div get g_ia k f64 n
+    me = add me div get g_eab k f64 n
+    k = add k 1
+  end
+  k = ulong 0
+  while lt k n
+    d = sub get g_ia k mi
+    sd = add sd mul d d
+    k = add k 1
+  end
+  sd = fsqrt div sd f64 sub n 1
+  hw = div mul tq sub long n 1 sd fsqrt f64 n
+  out_str t_m1
+  out_fixed mi 1 false
+  out_str t_m2
+  out_fixed sd 1 false
+  out_str t_m3
+  out_fixed sub mi hw 1 false
+  out_str t_m4
+  out_fixed add mi hw 1 false
+  out_str t_m5
+  out_fixed hw 1 false
+  out_str t_m6
+  out_fixed div mul f64 100.0 hw me 2 false
+  out_str t_m7
+  out_fixed me 1 false
+  out_str t_m8
+  out_str t_d1
+  if or gt sub mi hw f64 0.0 lt add mi hw f64 0.0
+    out_str t_yesn
+  else
+    out_str t_non
+  end
+  hw_ok = le hw mul f64 0.02 me
+  out_str t_c1
+  if and ge n 3 hw_ok
+    out_str t_pass
+  else
+    out_str t_fail
+  end
+  out_str t_c2
+  out_u64 n
+  out_str t_c3
+  if hw_ok
+    out_str t_yesp
+  else
+    out_str t_nop
+  end
+end
+
+fn report_cfg c ulong to void
+  n = ulong 0
+  if eq c 0
+    out_str t_s6n
+  else
+    out_str t_s2n
+  end
+  r = ulong 1
+  while le r 16
+    base = add mul c 68 mul r 4
+    if round_empty base
+      r = add r 1
+      continue
+    end
+    ok = round_ok base
+    print_round_prefix r base
+    if not ok
+      out_str t_ref
+      r = add r 1
+      continue
+    end
+    report_round_ok base n
+    n = add n 1
+    r = add r 1
+  end
+  report_summary n
+end
+
+fn main to int
+  if ne argcnt 3
+    die t_usage
+  end
+  dl = argread 1 g_outdir 0 1023
+  cl = argread 2 g_csv 0 1023
+  if or lt dl 0 lt cl 0
+    die t_usage
+  end
+  put g_sz 0 ulong dl
+  put g_sz 1 ulong cl
+  load_csv
+  load_offsets
+  bmd = boottime_minus_mono
+  out_str t_hdr1
+  out_fixed bmd 3 false
+  out_str t_hdr2
+  out_str t_hdr3
+  report_cfg 0
+  report_cfg 1
+  out_str t_chkb
+  out_flush
+  ret 0
+end
