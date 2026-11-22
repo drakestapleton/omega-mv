@@ -1,0 +1,750 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note rx_operator.om: operator client for a running production world
+note (docs/r16-operator-control.md). Pure seeded OM-2 replacement for tools/rx_operator.c.
+om2
+
+text t_usage "usage: rx_operator (--control <dir> | --cred <file>) (status|stop [reason]|resume|revoke-cap|revoke|shutdown | --raw <line>)\n"
+text t_f_ctrl "--control"
+text t_f_cred "--cred"
+text t_f_raw "--raw"
+text t_cred_suf "/operator.cred"
+text t_sock_suf "/operator.sock"
+text t_cred_hdr "aien-operator-credential v1\n"
+text t_k_sock "socket "
+text t_k_subj "subject "
+text t_k_cred "cred "
+text t_k_cap "cap "
+text t_at_dl "@deadline@"
+text t_req_pfx "aien-operator v1 "
+text t_req_subj " subject="
+text t_req_gen " gen="
+text t_req_sec " secret="
+text t_req_cap " cap="
+text t_req_dl " deadline="
+text t_req_rsn " reason="
+text t_rep_ok "aien-operator v1 OK "
+text t_rep_snd "aien-operator v1 STOPPED_NOT_DURABLE "
+text t_e_nocred "rx_operator: no credential at "
+text t_e_notcred "rx_operator: not an operator credential file: "
+text t_e_incomp "rx_operator: incomplete credential: "
+text t_e_long "rx_operator: socket path too long\n"
+text t_e_noworld "rx_operator: no world is serving "
+text t_e_send "rx_operator: send failed (reading any reply)\n"
+text t_e_norep "rx_operator: no reply\n"
+text t_nl "\n"
+
+global g_ctrl uchar 512
+global g_cred uchar 512
+global g_raw uchar 1024
+global g_cmd uchar 256
+global g_rsn uchar 512
+global g_tmp uchar 1024
+global g_lens ulong 6
+
+global g_path uchar 512
+global g_fbuf uchar 4096
+global g_sock uchar 256
+global g_sec uchar 80
+global g_meta ulong 8
+global g_req uchar 1024
+global g_addr uchar 110
+global g_rep uchar 2048
+
+fn wr_txt fd int s view uchar * to void
+  off = ulong 0
+  n = len s
+  while lt off n bound 4096
+    k = write fd s off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn wnl fd int to void
+  wr_txt fd t_nl
+end
+
+fn wr_gpath fd int n ulong to void
+  off = ulong 0
+  while lt off n bound 512
+    k = write fd g_path off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn wr_gsock fd int n ulong to void
+  off = ulong 0
+  while lt off n bound 256
+    k = write fd g_sock off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn wr_grep fd int n ulong to void
+  off = ulong 0
+  while lt off n bound 2048
+    k = write fd g_rep off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn usage_ret to int
+  wr_txt 2 t_usage
+  ret 2
+end
+
+fn eq_tmp s view uchar * n ulong to bool
+  if ne n len s
+    ret false
+  end
+  for i ulong len s bound 1024
+    if ne get g_tmp i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn parse_args to int
+  ac = argcnt
+  for j ulong 6
+    put g_lens j 0
+  end
+  i = ulong 1
+  while lt i ulong ac bound 64
+    n = argread i g_tmp 0 1023
+    if lt n 0
+      ret usage_ret
+    end
+    un = ulong n
+    if eq_tmp t_f_ctrl un
+      i = add i 1
+      if ge i ulong ac
+        ret usage_ret
+      end
+      n2 = argread i g_ctrl 0 511
+      if le n2 0
+        ret usage_ret
+      end
+      put g_lens 0 ulong n2
+    else
+      if eq_tmp t_f_cred un
+        i = add i 1
+        if ge i ulong ac
+          ret usage_ret
+        end
+        n2 = argread i g_cred 0 511
+        if le n2 0
+          ret usage_ret
+        end
+        put g_lens 1 ulong n2
+      else
+        if eq_tmp t_f_raw un
+          i = add i 1
+          if ge i ulong ac
+            ret usage_ret
+          end
+          n2 = argread i g_raw 0 1023
+          if lt n2 0
+            ret usage_ret
+          end
+          put g_lens 2 add ulong n2 1
+        else
+          if eq get g_lens 3 0
+            if or eq un 0 ge un 256
+              ret usage_ret
+            end
+            for k ulong un bound 256
+              put g_cmd k get g_tmp k
+            end
+            put g_lens 3 un
+          else
+            if eq get g_lens 4 0
+              if or eq un 0 ge un 512
+                ret usage_ret
+              end
+              for k ulong un bound 512
+                put g_rsn k get g_tmp k
+              end
+              put g_lens 4 un
+            else
+              ret usage_ret
+            end
+          end
+        end
+      end
+    end
+    i = add i 1
+  end
+  has_ctrl = ne get g_lens 0 0
+  has_cred = ne get g_lens 1 0
+  has_raw = ne get g_lens 2 0
+  has_cmd = ne get g_lens 3 0
+  if and not has_ctrl not has_cred
+    ret usage_ret
+  end
+  if and not has_raw not has_cmd
+    ret usage_ret
+  end
+  if and has_raw has_cmd
+    ret usage_ret
+  end
+  ret 0
+end
+
+fn is_sp c uchar to bool
+  ret or eq c 32 eq c 9
+end
+
+fn line_starts off ulong ln ulong pfx view uchar * to bool
+  if lt ln len pfx
+    ret false
+  end
+  for i ulong len pfx bound 64
+    if ne get g_fbuf add off i get pfx i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn parse_u64_span off ulong endp ulong out_idx ulong to long
+  p = off
+  while lt p endp bound 256
+    if not is_sp get g_fbuf p
+      break
+    end
+    p = add p 1
+  end
+  if ge p endp
+    ret neg long 1
+  end
+  c0 = get g_fbuf p
+  if or lt c0 48 gt c0 57
+    ret neg long 1
+  end
+  v = ulong 0
+  while lt p endp bound 256
+    c = get g_fbuf p
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 ulong sub c 48
+    p = add p 1
+  end
+  put g_meta out_idx v
+  ret long p
+end
+
+fn copy_tok_sock off ulong endp ulong to long
+  p = off
+  while lt p endp bound 256
+    if not is_sp get g_fbuf p
+      break
+    end
+    p = add p 1
+  end
+  n = ulong 0
+  while lt p endp bound 256
+    c = get g_fbuf p
+    if or is_sp c or eq c 10 eq c 13
+      break
+    end
+    if lt add n 1 256
+      put g_sock n c
+      n = add n 1
+    end
+    p = add p 1
+  end
+  if eq n 0
+    ret neg long 1
+  end
+  put g_sock n 0
+  ret long n
+end
+
+fn copy_tok_sec off ulong endp ulong to long
+  p = off
+  while lt p endp bound 256
+    if not is_sp get g_fbuf p
+      break
+    end
+    p = add p 1
+  end
+  n = ulong 0
+  while lt p endp bound 256
+    c = get g_fbuf p
+    if or is_sp c or eq c 10 eq c 13
+      break
+    end
+    if lt add n 1 80
+      put g_sec n c
+      n = add n 1
+    end
+    p = add p 1
+  end
+  if eq n 0
+    ret neg long 1
+  end
+  put g_sec n 0
+  ret long n
+end
+
+fn load_cred to int
+  plen = ulong 0
+  if ne get g_lens 1 0
+    clen = get g_lens 1
+    for i ulong clen bound 512
+      put g_path i get g_cred i
+    end
+    plen = clen
+  else
+    clen = get g_lens 0
+    if gt add clen len t_cred_suf 511
+      ret usage_ret
+    end
+    for i ulong clen bound 512
+      put g_path i get g_ctrl i
+    end
+    for i ulong len t_cred_suf
+      put g_path add clen i get t_cred_suf i
+    end
+    plen = add clen len t_cred_suf
+  end
+  fd = fopen g_path 0 plen 0 0
+  if lt fd 0
+    wr_txt 2 t_e_nocred
+    wr_gpath 2 plen
+    wnl 2
+    ret 2
+  end
+  tot = ulong 0
+  while lt tot 4095 bound 128
+    k = read int fd g_fbuf tot sub 4095 tot
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  cl = fclose int fd
+  if lt tot len t_cred_hdr
+    wr_txt 2 t_e_notcred
+    wr_gpath 2 plen
+    wnl 2
+    ret 2
+  end
+  if not line_starts 0 tot t_cred_hdr
+    wr_txt 2 t_e_notcred
+    wr_gpath 2 plen
+    wnl 2
+    ret 2
+  end
+  for j ulong 8
+    put g_meta j 0
+  end
+  have = ulong 0
+  pos = len t_cred_hdr
+  while lt pos tot bound 256
+    endp = pos
+    while lt endp tot bound 4096
+      if eq get g_fbuf endp 10
+        break
+      end
+      endp = add endp 1
+    end
+    ln = sub endp pos
+    if line_starts pos ln t_k_sock
+      sn = copy_tok_sock add pos len t_k_sock endp
+      if gt sn 0
+        put g_meta 4 ulong sn
+        have = or have 1
+      end
+    else
+      if line_starts pos ln t_k_subj
+        np = parse_u64_span add pos len t_k_subj endp 0
+        if ge np 0
+          have = or have 2
+        end
+      else
+        if line_starts pos ln t_k_cred
+          np = parse_u64_span add pos len t_k_cred endp 1
+          if ge np 0
+            sn = copy_tok_sec ulong np endp
+            if gt sn 0
+              put g_meta 5 ulong sn
+              have = or have 4
+            end
+          end
+        else
+          if line_starts pos ln t_k_cap
+            np = parse_u64_span add pos len t_k_cap endp 2
+            if ge np 0
+              np2 = parse_u64_span ulong np endp 3
+              if ge np2 0
+                have = or have 8
+              end
+            end
+          end
+        end
+      end
+    end
+    pos = add endp 1
+  end
+  if ne have 15
+    wr_txt 2 t_e_incomp
+    wr_gpath 2 plen
+    wnl 2
+    ret 2
+  end
+  if ne get g_lens 0 0
+    clen = get g_lens 0
+    if gt add clen len t_sock_suf 255
+      wr_txt 2 t_e_long
+      ret 2
+    end
+    for i ulong clen bound 256
+      put g_sock i get g_ctrl i
+    end
+    for i ulong len t_sock_suf
+      put g_sock add clen i get t_sock_suf i
+    end
+    put g_meta 4 add clen len t_sock_suf
+  end
+  ret 0
+end
+
+fn req_add_txt pos ulong s view uchar * to long
+  n = len s
+  if gt add pos n 1023
+    ret neg long 1
+  end
+  for i ulong n bound 64
+    put g_req add pos i get s i
+  end
+  ret long add pos n
+end
+
+fn req_add_u64 pos ulong v ulong to long
+  d = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while true bound 24
+    put d nd uchar add 48 rem x 10
+    nd = add nd 1
+    x = div x 10
+    if eq x 0
+      break
+    end
+  end
+  if gt add pos nd 1023
+    ret neg long 1
+  end
+  p = pos
+  for i ulong nd bound 24
+    put g_req p get d sub sub nd 1 i
+    p = add p 1
+  end
+  ret long p
+end
+
+fn req_add_raw pos ulong off ulong n ulong to long
+  if gt add pos n 1023
+    ret neg long 1
+  end
+  for i ulong n bound 1024
+    put g_req add pos i get g_raw add off i
+  end
+  ret long add pos n
+end
+
+fn find_at_dl rlen ulong to long
+  ml = len t_at_dl
+  if lt rlen ml
+    ret neg long 1
+  end
+  lim = add sub rlen ml 1
+  for i ulong lim bound 1024
+    ok = true
+    for j ulong ml
+      if ne get g_raw add i j get t_at_dl j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret long i
+    end
+  end
+  ret neg long 1
+end
+
+fn build_req dl ulong to long
+  if ne get g_lens 2 0
+    rlen = sub get g_lens 2 1
+    hit = find_at_dl rlen
+    p = long 0
+    if ge hit 0
+      uhit = ulong hit
+      p = req_add_raw 0 0 uhit
+      if lt p 0
+        ret neg long 1
+      end
+      p = req_add_u64 ulong p dl
+      if lt p 0
+        ret neg long 1
+      end
+      rest = add uhit len t_at_dl
+      p = req_add_raw ulong p rest sub rlen rest
+      if lt p 0
+        ret neg long 1
+      end
+    else
+      p = req_add_raw 0 0 rlen
+      if lt p 0
+        ret neg long 1
+      end
+    end
+    put g_req ulong p 10
+    ret add p 1
+  end
+  p = req_add_txt 0 t_req_pfx
+  if lt p 0
+    ret neg long 1
+  end
+  cl = get g_lens 3
+  if gt add ulong p cl 1023
+    ret neg long 1
+  end
+  for i ulong cl bound 256
+    put g_req add ulong p i get g_cmd i
+  end
+  p = add p long cl
+  p = req_add_txt ulong p t_req_subj
+  if lt p 0
+    ret neg long 1
+  end
+  p = req_add_u64 ulong p get g_meta 0
+  if lt p 0
+    ret neg long 1
+  end
+  p = req_add_txt ulong p t_req_gen
+  if lt p 0
+    ret neg long 1
+  end
+  p = req_add_u64 ulong p get g_meta 1
+  if lt p 0
+    ret neg long 1
+  end
+  p = req_add_txt ulong p t_req_sec
+  if lt p 0
+    ret neg long 1
+  end
+  sl = get g_meta 5
+  if gt add ulong p sl 1023
+    ret neg long 1
+  end
+  for i ulong sl bound 80
+    put g_req add ulong p i get g_sec i
+  end
+  p = add p long sl
+  p = req_add_txt ulong p t_req_cap
+  if lt p 0
+    ret neg long 1
+  end
+  p = req_add_u64 ulong p get g_meta 2
+  if lt p 0
+    ret neg long 1
+  end
+  if ge ulong p 1023
+    ret neg long 1
+  end
+  put g_req ulong p 58
+  p = add p 1
+  p = req_add_u64 ulong p get g_meta 3
+  if lt p 0
+    ret neg long 1
+  end
+  p = req_add_txt ulong p t_req_dl
+  if lt p 0
+    ret neg long 1
+  end
+  p = req_add_u64 ulong p dl
+  if lt p 0
+    ret neg long 1
+  end
+  if ne get g_lens 4 0
+    p = req_add_txt ulong p t_req_rsn
+    if lt p 0
+      ret neg long 1
+    end
+    rl = get g_lens 4
+    if gt add ulong p rl 1023
+      ret neg long 1
+    end
+    for i ulong rl bound 512
+      put g_req add ulong p i get g_rsn i
+    end
+    p = add p long rl
+  end
+  put g_req ulong p 10
+  ret add p 1
+end
+
+fn zero_secrets to void
+  for i ulong 80
+    put g_sec i 0
+  end
+  for i ulong 1024
+    put g_req i 0
+  end
+end
+
+fn rep_starts got ulong pfx view uchar * to bool
+  if lt got len pfx
+    ret false
+  end
+  for i ulong len pfx bound 64
+    if ne get g_rep i get pfx i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn send_and_recv fd int urlen ulong to ulong
+  off = ulong 0
+  while lt off urlen bound 1024
+    w = send fd g_req off sub urlen off 16384
+    if eq w neg long 4
+      continue
+    end
+    if le w 0
+      wr_txt 2 t_e_send
+      break
+    end
+    off = add off ulong w
+  end
+  zero_secrets
+  sh = shutdown fd 1
+  got = ulong 0
+  tend = add ulong monons 60000000000
+  while lt got 2047 bound 4096
+    cur = ulong monons
+    if ge cur tend
+      break
+    end
+    remns = sub tend cur
+    wi = waitio fd 1 long remns
+    if eq wi neg long 4
+      continue
+    end
+    if le wi 0
+      break
+    end
+    r = read fd g_rep got sub 2047 got
+    if eq r neg long 4
+      continue
+    end
+    if le r 0
+      break
+    end
+    got = add got ulong r
+  end
+  ret got
+end
+
+fn main to int
+  rc = parse_args
+  if ne rc 0
+    ret rc
+  end
+  rc = load_cred
+  if ne rc 0
+    ret rc
+  end
+  now = ulong monons
+  dl = add now 55000000000
+  rlen = build_req dl
+  for i ulong 80
+    put g_sec i 0
+  end
+  if le rlen 0
+    zero_secrets
+    ret usage_ret
+  end
+  slen = get g_meta 4
+  if ge slen 108
+    zero_secrets
+    wr_txt 2 t_e_long
+    ret 2
+  end
+  for i ulong 110
+    put g_addr i 0
+  end
+  put g_addr 0 1
+  put g_addr 1 0
+  for i ulong slen bound 108
+    put g_addr add 2 i get g_sock i
+  end
+  fd = socknew 1 524289 0
+  if lt fd 0
+    zero_secrets
+    wr_txt 2 t_e_noworld
+    wr_gsock 2 slen
+    wnl 2
+    ret 2
+  end
+  if ne connect int fd g_addr 0 add 2 add slen 1 0
+    zero_secrets
+    cl = fclose int fd
+    wr_txt 2 t_e_noworld
+    wr_gsock 2 slen
+    wnl 2
+    ret 2
+  end
+  got = send_and_recv int fd ulong rlen
+  cl = fclose int fd
+  if eq got 0
+    wr_txt 2 t_e_norep
+    ret 2
+  end
+  wr_grep 1 got
+  if ne get g_rep sub got 1 10
+    wnl 1
+  end
+  if rep_starts got t_rep_ok
+    ret 0
+  end
+  if rep_starts got t_rep_snd
+    ret 3
+  end
+  ret 1
+end

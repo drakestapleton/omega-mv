@@ -1,0 +1,2267 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/json_canon.om -- strict JSON check and Python-compatible canonical JSON.
+note Pure seeded OM-2 replacement for tools/json_canon.c.
+note
+note   json_canon --check               exit 0 if stdin is one valid JSON document, 1 otherwise
+note   json_canon --check-lines         print 1-based line numbers of invalid JSON lines
+note   json_canon                       compact sorted UTF-8 JSON (Python json.dumps)
+note   json_canon --sha256              SHA-256 hex of that compact form
+note   json_canon --pretty              indent=2 sorted ASCII-escaped JSON with trailing newline
+note   json_canon --write-exclusive P   write stdin to P (O_WRONLY|O_CREAT|O_EXCL, 0444, fsync)
+om2
+
+text k_sha_tbl "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+text t_hex "0123456789abcdef"
+text t_usage "usage: json_canon [--check | --pretty | --sha256 | --write-exclusive PATH] < json\n"
+text t_f_check "--check"
+text t_f_lines "--check-lines"
+text t_f_pretty "--pretty"
+text t_f_sha "--sha256"
+text t_f_wex "--write-exclusive"
+text t_null "null"
+text t_true "true"
+text t_false "false"
+text t_nan "NaN"
+text t_inf "Infinity"
+text t_ninf "-Infinity"
+text t_pzero "0.0"
+text t_nzero "-0.0"
+text t_epfx "json_canon: "
+text t_ebyt " at byte "
+text t_eoom "json_canon: out of memory\n"
+text t_eread "json_canon: read error\n"
+text t_ewrite "json_canon: write error\n"
+text t_esurr "json_canon: lone surrogate cannot be encoded as UTF-8\n"
+text t_eexist "json_canon: [Errno 17] File exists: '"
+text t_eerrno1 "json_canon: [Errno "
+text t_eerrno2 "] open failed: '"
+text t_eend "'\n"
+text t_efsync "json_canon: fsync error\n"
+text t_eclose "json_canon: close error\n"
+text t_eutf8 "invalid UTF-8"
+text t_etutf8 "truncated UTF-8"
+text t_euesc "truncated \\u escape"
+text t_ebuesc "bad \\u escape"
+text t_eunterm "unterminated string"
+text t_ectrl "control character in string"
+text t_eeesc "unterminated escape"
+text t_ebesc "bad escape"
+text t_enum "bad number"
+text t_edeep "nesting too deep"
+text t_eval "expecting value"
+text t_eprop "expecting property name"
+text t_ecolon "expecting ':'"
+text t_eobj "expecting ',' or '}'"
+text t_earr "expecting ',' or ']'"
+text t_eextra "extra data"
+text t_nl "\n"
+
+note Dynamic pools (no hard caps)
+global g_in uchar *
+global g_out uchar *
+global g_str uchar *
+global g_nt uchar *
+global g_na ulong *
+global g_nb ulong *
+global g_ekoff ulong *
+global g_eklen ulong *
+global g_eval ulong *
+global g_enext ulong *
+global g_ord ulong *
+
+note Pool sizes and capacities:
+note [0]=in_len [1]=in_cap [2]=out_len [3]=out_cap [4]=str_len [5]=str_cap
+note [6]=n_len [7]=n_cap [8]=e_len [9]=e_cap [10]=o_len [11]=o_cap
+global g_p ulong 16
+
+note Parser state: [0]=src_base [1]=src_end [2]=pos [3]=lone_surr [4]=soft [5]=err
+global g_st ulong 8
+global g_arg1 uchar 4096
+global g_arg2 uchar 4096
+global g_errbuf uchar 256
+
+note SHA-256 state
+global g_sk uint 72
+global g_sw uint 64
+global g_sv uint 8
+global g_sh uint 8
+global g_spad uchar 128
+global g_sdig uchar 32
+global g_sinit ulong 1
+
+note BigInt registers (128 x 32-bit limbs = 4096 bits each) for exact strtod + Dragon4
+note 0=A 1=B 2=C 3=D 4=E 5=T (each 128 uint limbs, len in g_blen[0..5])
+global g_bi uint 768
+global g_blen ulong 6
+global g_fdig uchar 1024
+global g_fmeta ulong 8
+
+fn wr_fd_txt fd int s view uchar * to void
+  off = ulong 0
+  n = len s
+  while lt off n bound 4096
+    k = write fd s off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn wr_fd_u64 fd int v ulong to void
+  b = new uchar 24 0
+  n = ulong 0
+  x = v
+  while true bound 24
+    put b n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+    if eq x 0
+      break
+    end
+  end
+  r = new uchar 24 0
+  for i ulong n bound 24
+    put r i get b sub sub n 1 i
+  end
+  off = ulong 0
+  while lt off n bound 24
+    k = write fd r off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn oom_die to void
+  wr_fd_txt 2 t_eoom
+  exit 1
+end
+
+fn fail_msg s view uchar * to void
+  put g_st 5 1
+  if ne get g_st 4 0
+    ret
+  end
+  wr_fd_txt 2 t_epfx
+  wr_fd_txt 2 s
+  wr_fd_txt 2 t_ebyt
+  wr_fd_u64 2 sub get g_st 2 get g_st 0
+  wr_fd_txt 2 t_nl
+  exit 1
+end
+
+fn ensure_out need ulong to void
+  cur = get g_p 2
+  cap = get g_p 3
+  if le add cur need cap
+    ret
+  end
+  ncap = cap
+  if eq ncap 0
+    ncap = 4096
+  end
+  while lt ncap add cur need bound 64
+    ncap = mul ncap 2
+  end
+  r = enlarge g_out ncap
+  if lt r 0
+    oom_die
+  end
+  put g_p 3 ncap
+end
+
+fn out_c c uchar to void
+  ensure_out 1
+  p = get g_p 2
+  put g_out p c
+  put g_p 2 add p 1
+end
+
+fn out_txt s view uchar * to void
+  n = len s
+  ensure_out n
+  p = get g_p 2
+  for i ulong n bound 256
+    put g_out add p i get s i
+  end
+  put g_p 2 add p n
+end
+
+fn out_str_slice off ulong n ulong to void
+  ensure_out n
+  p = get g_p 2
+  for i ulong n bound 16777216
+    put g_out add p i get g_str add off i
+  end
+  put g_p 2 add p n
+end
+
+fn ensure_str need ulong to void
+  cur = get g_p 4
+  cap = get g_p 5
+  if le add cur need cap
+    ret
+  end
+  ncap = cap
+  if eq ncap 0
+    ncap = 4096
+  end
+  while lt ncap add cur need bound 64
+    ncap = mul ncap 2
+  end
+  r = enlarge g_str ncap
+  if lt r 0
+    oom_die
+  end
+  put g_p 5 ncap
+end
+
+fn str_push c uchar to void
+  ensure_str 1
+  p = get g_p 4
+  put g_str p c
+  put g_p 4 add p 1
+end
+
+fn alloc_node ty uchar to ulong
+  cur = get g_p 6
+  cap = get g_p 7
+  if ge cur cap
+    ncap = cap
+    if eq ncap 0
+      ncap = 1024
+    else
+      ncap = mul ncap 2
+    end
+    r = enlarge g_nt ncap
+    if lt r 0
+      oom_die
+    end
+    r = enlarge g_na ncap
+    if lt r 0
+      oom_die
+    end
+    r = enlarge g_nb ncap
+    if lt r 0
+      oom_die
+    end
+    put g_p 7 ncap
+  end
+  put g_nt cur ty
+  put g_na cur 0
+  put g_nb cur 0
+  put g_p 6 add cur 1
+  ret cur
+end
+
+fn alloc_entry ko ulong kl ulong val ulong to ulong
+  cur = get g_p 8
+  cap = get g_p 9
+  if ge cur cap
+    ncap = cap
+    if eq ncap 0
+      ncap = 1024
+    else
+      ncap = mul ncap 2
+    end
+    r = enlarge g_ekoff ncap
+    if lt r 0
+      oom_die
+    end
+    r = enlarge g_eklen ncap
+    if lt r 0
+      oom_die
+    end
+    r = enlarge g_eval ncap
+    if lt r 0
+      oom_die
+    end
+    r = enlarge g_enext ncap
+    if lt r 0
+      oom_die
+    end
+    put g_p 9 ncap
+  end
+  put g_ekoff cur ko
+  put g_eklen cur kl
+  put g_eval cur val
+  put g_enext cur 18446744073709551615
+  put g_p 8 add cur 1
+  ret cur
+end
+
+fn reserve_ord n ulong to ulong
+  cur = get g_p 10
+  cap = get g_p 11
+  if gt add cur n cap
+    ncap = cap
+    if eq ncap 0
+      ncap = 1024
+    end
+    while lt ncap add cur n bound 64
+      ncap = mul ncap 2
+    end
+    r = enlarge g_ord ncap
+    if lt r 0
+      oom_die
+    end
+    put g_p 11 ncap
+  end
+  put g_p 10 add cur n
+  ret cur
+end
+
+note ========= BigInt (base 2^32, 128 limbs per reg) =========
+fn bi_zero id ulong to void
+  put g_blen id 0
+end
+
+fn bi_set_u64 id ulong v ulong to void
+  base = mul id 128
+  if eq v 0
+    put g_blen id 0
+    ret
+  end
+  put g_bi base uint and v 4294967295
+  hi = shr v 32
+  if eq hi 0
+    put g_blen id 1
+  else
+    put g_bi add base 1 uint hi
+    put g_blen id 2
+  end
+end
+
+fn bi_copy dst ulong src ulong to void
+  n = get g_blen src
+  db = mul dst 128
+  sb = mul src 128
+  for i ulong n bound 128
+    put g_bi add db i get g_bi add sb i
+  end
+  put g_blen dst n
+end
+
+fn bi_norm id ulong to void
+  n = get g_blen id
+  base = mul id 128
+  while gt n 0 bound 128
+    if ne get g_bi add base sub n 1 0
+      break
+    end
+    n = sub n 1
+  end
+  put g_blen id n
+end
+
+fn bi_cmp a ulong b ulong to long
+  na = get g_blen a
+  nb = get g_blen b
+  if lt na nb
+    ret neg long 1
+  end
+  if gt na nb
+    ret 1
+  end
+  ab = mul a 128
+  bb = mul b 128
+  i = na
+  while gt i 0 bound 128
+    i = sub i 1
+    va = get g_bi add ab i
+    vb = get g_bi add bb i
+    if lt va vb
+      ret neg long 1
+    end
+    if gt va vb
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn bi_mul_add id ulong m ulong a ulong to void
+  n = get g_blen id
+  base = mul id 128
+  carry = a
+  for i ulong n bound 128
+    prod = add mul ulong get g_bi add base i m carry
+    put g_bi add base i uint and prod 4294967295
+    carry = shr prod 32
+  end
+  if ne carry 0
+    if lt n 128
+      put g_bi add base n uint carry
+      put g_blen id add n 1
+    end
+  end
+end
+
+fn bi_get id ulong i ulong to ulong
+  if ge i get g_blen id
+    ret 0
+  end
+  ret ulong get g_bi add mul id 128 i
+end
+
+fn bi_put id ulong i ulong v ulong to void
+  put g_bi add mul id 128 i uint and v 4294967295
+end
+
+fn bi_add_to dst ulong src ulong to void
+  n = get g_blen dst
+  ns = get g_blen src
+  if gt ns n
+    n = ns
+  end
+  carry = ulong 0
+  for i ulong n bound 128
+    s = add add bi_get dst i bi_get src i carry
+    bi_put dst i s
+    carry = shr s 32
+  end
+  if ne carry 0
+    if lt n 128
+      bi_put dst n carry
+      n = add n 1
+    end
+  end
+  put g_blen dst n
+end
+
+fn bi_sub_from dst ulong src ulong to void
+  nd = get g_blen dst
+  borrow = ulong 0
+  for i ulong nd bound 128
+    va = bi_get dst i
+    subv = add bi_get src i borrow
+    if ge va subv
+      bi_put dst i sub va subv
+      borrow = 0
+    else
+      bi_put dst i sub add va 4294967296 subv
+      borrow = 1
+    end
+  end
+  bi_norm dst
+end
+
+fn bi_shl id ulong bits ulong to void
+  n = get g_blen id
+  if or eq n 0 eq bits 0
+    ret
+  end
+  ws = div bits 32
+  bs = rem bits 32
+  base = mul id 128
+  if gt bs 0
+    carry = ulong 0
+    for i ulong n bound 128
+      v = ulong get g_bi add base i
+      nv = or shl v bs carry
+      put g_bi add base i uint and nv 4294967295
+      carry = shr nv 32
+    end
+    if ne carry 0
+      if lt n 128
+        put g_bi add base n uint carry
+        n = add n 1
+      end
+    end
+  end
+  if gt ws 0
+    nn = add n ws
+    if gt nn 128
+      nn = 128
+    end
+    i = n
+    while gt i 0 bound 128
+      i = sub i 1
+      dsti = add i ws
+      if lt dsti 128
+        put g_bi add base dsti get g_bi add base i
+      end
+    end
+    for j ulong ws bound 128
+      put g_bi add base j 0
+    end
+    n = nn
+  end
+  put g_blen id n
+end
+
+fn bi_mul_pow10 id ulong p ulong to void
+  remp = p
+  while ge remp 9 bound 256
+    bi_mul_add id 1000000000 0
+    remp = sub remp 9
+  end
+  while gt remp 0 bound 16
+    bi_mul_add id 10 0
+    remp = sub remp 1
+  end
+end
+
+fn bi_bitlen id ulong to ulong
+  n = get g_blen id
+  if eq n 0
+    ret 0
+  end
+  top = ulong get g_bi add mul id 128 sub n 1
+  bl = mul sub n 1 32
+  while gt top 0 bound 33
+    bl = add bl 1
+    top = shr top 1
+  end
+  ret bl
+end
+
+fn dec_build_ab nd ulong exp10 long to void
+  bi_zero 0
+  use_nd = nd
+  eff_e10 = exp10
+  if gt use_nd 768
+    eff_e10 = add eff_e10 long sub use_nd 768
+    use_nd = 768
+  end
+  for i ulong use_nd bound 768
+    bi_mul_add 0 10 ulong get g_fdig i
+  end
+  if gt nd 768
+    has_nz = false
+    for i ulong sub nd 768 bound 1024
+      if ne get g_fdig add 768 i 0
+        has_nz = true
+        break
+      end
+    end
+    if has_nz
+      bi_mul_add 0 10 1
+      eff_e10 = sub eff_e10 1
+    end
+  end
+  bi_set_u64 1 1
+  if ge eff_e10 0
+    bi_mul_pow10 0 ulong eff_e10
+  else
+    bi_mul_pow10 1 ulong neg eff_e10
+  end
+end
+
+fn dec_find_e2 to long
+  bna = bi_bitlen 0
+  bnb = bi_bitlen 1
+  e2 = sub long bna long bnb
+  bi_copy 2 0
+  bi_copy 3 1
+  if ge e2 0
+    bi_shl 3 ulong e2
+  else
+    bi_shl 2 ulong neg e2
+  end
+  if lt bi_cmp 2 3 0
+    e2 = sub e2 1
+  end
+  ret e2
+end
+
+fn dec_div_round e2 long signb ulong to ulong
+  sh = long 0
+  if ge e2 neg long 1022
+    sh = sub e2 52
+  else
+    sh = neg long 1074
+  end
+  if ge sh 0
+    bi_shl 1 ulong sh
+  else
+    bi_shl 0 ulong neg sh
+  end
+  q = ulong 0
+  bi_copy 2 1
+  bi_shl 2 53
+  for bit ulong 54
+    q = shl q 1
+    if ge bi_cmp 0 2 0
+      bi_sub_from 0 2
+      q = or q 1
+    end
+    if lt bit 53
+      bi_shl 0 1
+    end
+  end
+  bi_shl 0 1
+  cmp2 = bi_cmp 0 2
+  round_up = false
+  if gt cmp2 0
+    round_up = true
+  else
+    if eq cmp2 0
+      if eq and q 1 1
+        round_up = true
+      end
+    end
+  end
+  if round_up
+    q = add q 1
+  end
+  if ge e2 neg long 1022
+    e2v = e2
+    if ge q 9007199254740992
+      q = shr q 1
+      e2v = add e2v 1
+    end
+    if gt e2v 1023
+      ret or signb 0x7ff0000000000000
+    end
+    bexp = ulong add e2v 1023
+    ret or signb or shl bexp 52 and q 4503599627370495
+  end
+  if ge q 4503599627370496
+    ret or signb or shl ulong 1 52 and q 4503599627370495
+  end
+  ret or signb and q 4503599627370495
+end
+
+fn dec_to_f64_bits nd ulong exp10 long negf ulong to ulong
+  signb = shl negf 63
+  if eq nd 0
+    ret signb
+  end
+  top10 = add exp10 long nd
+  if gt top10 310
+    ret or signb 0x7ff0000000000000
+  end
+  if lt top10 neg long 325
+    ret signb
+  end
+  dec_build_ab nd exp10
+  e2 = dec_find_e2
+  if gt e2 1023
+    ret or signb 0x7ff0000000000000
+  end
+  if lt e2 neg long 1075
+    ret signb
+  end
+  ret dec_div_round e2 signb
+end
+
+note Dragon4 shortest round-trip decimal digits for finite positive f64 bits.
+note Writes digits (0..9) into g_fdig[0..nd), stores nd in g_fmeta[0], exp10 in g_fmeta[1] (as bits of long).
+fn dragon4_step is_even bool to ulong
+  note reg0=r, reg1=s, reg2=m+, reg3=m-
+  bi_mul_add 0 10 0
+  bi_mul_add 2 10 0
+  bi_mul_add 3 10 0
+  d = ulong 0
+  while ge bi_cmp 0 1 0 bound 12
+    bi_sub_from 0 1
+    d = add d 1
+  end
+  low = false
+  c_lo = bi_cmp 0 3
+  if is_even
+    low = le c_lo 0
+  else
+    low = lt c_lo 0
+  end
+  bi_copy 4 0
+  bi_add_to 4 2
+  c_hi = bi_cmp 4 1
+  high = false
+  if is_even
+    high = ge c_hi 0
+  else
+    high = gt c_hi 0
+  end
+  if and not low not high
+    ret d
+  end
+  if and low not high
+    ret add 16 d
+  end
+  if and not low high
+    ret add 16 add d 1
+  end
+  note Both low and high: compare 2*r vs s
+  bi_copy 4 0
+  bi_shl 4 1
+  cm = bi_cmp 4 1
+  if lt cm 0
+    ret add 16 d
+  end
+  if gt cm 0
+    ret add 16 add d 1
+  end
+  if eq and d 1 0
+    ret add 16 d
+  end
+  ret add 16 add d 1
+end
+
+fn dragon4_init bits ulong to long
+  raw_e = and shr bits 52 2047
+  frac = and bits 4503599627370495
+  f = ulong 0
+  e = long 0
+  low_half = false
+  if eq raw_e 0
+    f = frac
+    e = neg long 1074
+  else
+    f = or frac 4503599627370496
+    e = sub long raw_e 1075
+    if and eq frac 0 gt raw_e 1
+      low_half = true
+    end
+  end
+  note reg0=r, reg1=s, reg2=m+, reg3=m-
+  bi_set_u64 0 f
+  bi_set_u64 1 1
+  bi_set_u64 2 1
+  bi_set_u64 3 1
+  if ge e 0
+    bi_shl 0 ulong e
+    bi_shl 2 ulong e
+    bi_shl 3 ulong e
+  else
+    bi_shl 1 ulong neg e
+  end
+  if low_half
+    bi_shl 0 2
+    bi_shl 1 2
+    bi_shl 2 2
+    bi_shl 3 1
+  else
+    bi_shl 0 1
+    bi_shl 1 1
+  end
+  note Estimate k = ceil(log10(v)) using bitlen(f)+e: log10(2) ~ 78913 / 262144
+  bi_copy 4 0
+  bi_add_to 4 2
+  b_hi = long bi_bitlen 4
+  b_s = long bi_bitlen 1
+  e2 = sub b_hi b_s
+  k = div mul e2 78913 262144
+  if gt k 0
+    bi_mul_pow10 1 ulong k
+  else
+    if lt k 0
+      p10 = ulong neg k
+      bi_mul_pow10 0 p10
+      bi_mul_pow10 2 p10
+      bi_mul_pow10 3 p10
+    end
+  end
+  is_even = eq and f 1 0
+  while true bound 8
+    bi_copy 4 0
+    bi_add_to 4 2
+    c = bi_cmp 4 1
+    need_up = false
+    if is_even
+      need_up = ge c 0
+    else
+      need_up = gt c 0
+    end
+    if not need_up
+      break
+    end
+    bi_mul_add 1 10 0
+    k = add k 1
+  end
+  while true bound 8
+    bi_copy 4 0
+    bi_add_to 4 2
+    bi_mul_add 4 10 0
+    c = bi_cmp 4 1
+    can_dn = false
+    if is_even
+      can_dn = lt c 0
+    else
+      can_dn = le c 0
+    end
+    if not can_dn
+      break
+    end
+    bi_mul_add 0 10 0
+    bi_mul_add 2 10 0
+    bi_mul_add 3 10 0
+    k = sub k 1
+  end
+  ret k
+end
+
+fn out_exp10 exp10 long to void
+  b = new uchar 8 0
+  out_c 101
+  ae = ulong 0
+  if lt exp10 0
+    out_c 45
+    ae = ulong neg exp10
+  else
+    out_c 43
+    ae = ulong exp10
+  end
+  if lt ae 10
+    out_c 48
+  end
+  nb = ulong 0
+  x = ae
+  while true bound 8
+    put b nb uchar add 48 rem x 10
+    nb = add nb 1
+    x = div x 10
+    if eq x 0
+      break
+    end
+  end
+  for i ulong nb bound 8
+    out_c get b sub sub nb 1 i
+  end
+end
+
+fn out_f64_fmt nd ulong k long negf ulong to void
+  exp10 = sub k 1
+  if ne negf 0
+    out_c 45
+  end
+  if or le k neg long 4 gt k 16
+    out_c add 48 get g_fdig 0
+    if gt nd 1
+      out_c 46
+      for i ulong sub nd 1 bound 32
+        out_c add 48 get g_fdig add i 1
+      end
+    end
+    out_exp10 exp10
+    ret
+  end
+  if le k 0
+    out_c 48
+    out_c 46
+    nz = ulong neg k
+    for i ulong nz bound 8
+      out_c 48
+    end
+    for i ulong nd bound 32
+      out_c add 48 get g_fdig i
+    end
+    ret
+  end
+  uk = ulong k
+  if ge uk nd
+    for i ulong nd bound 32
+      out_c add 48 get g_fdig i
+    end
+    nz = sub uk nd
+    for i ulong nz bound 32
+      out_c 48
+    end
+    out_c 46
+    out_c 48
+    ret
+  end
+  for i ulong uk bound 32
+    out_c add 48 get g_fdig i
+  end
+  out_c 46
+  for i ulong sub nd uk bound 32
+    out_c add 48 get g_fdig add uk i
+  end
+end
+
+fn out_f64_bits bits ulong to void
+  negf = and shr bits 63 1
+  raw_e = and shr bits 52 2047
+  frac = and bits 4503599627370495
+  if eq raw_e 2047
+    if ne frac 0
+      out_txt t_nan
+    else
+      if ne negf 0
+        out_txt t_ninf
+      else
+        out_txt t_inf
+      end
+    end
+    ret
+  end
+  if and eq raw_e 0 eq frac 0
+    if ne negf 0
+      out_txt t_nzero
+    else
+      out_txt t_pzero
+    end
+    ret
+  end
+  is_even = eq and frac 1 0
+  k = dragon4_init bits
+  nd = ulong 0
+  while lt nd 24 bound 32
+    st = dragon4_step is_even
+    put g_fdig nd uchar and st 15
+    nd = add nd 1
+    if ge st 16
+      break
+    end
+  end
+  while gt nd 1 bound 32
+    if ne get g_fdig sub nd 1 0
+      break
+    end
+    nd = sub nd 1
+  end
+  out_f64_fmt nd k negf
+end
+
+note ========= SHA-256 over g_out[0..n) =========
+fn sha_init_tbl to void
+  if ne get g_sinit 0 0
+    ret
+  end
+  put g_sinit 0 1
+  p = ulong 0
+  for i ulong 72
+    v = ulong 0
+    while lt get k_sha_tbl p 48 bound 4
+      p = add p 1
+    end
+    while ge get k_sha_tbl p 48 bound 11
+      v = add mul v 10 ulong sub get k_sha_tbl p 48
+      p = add p 1
+      if ge p len k_sha_tbl
+        put g_sk i uint v
+        ret
+      end
+    end
+    put g_sk i uint v
+  end
+end
+
+fn sha_s0 a uint to uint
+  ret xor xor rotr a 2 rotr a 13 rotr a 22
+end
+
+fn sha_s1 e uint to uint
+  ret xor xor rotr e 6 rotr e 11 rotr e 25
+end
+
+fn sha_g0 x uint to uint
+  ret xor xor rotr x 7 rotr x 18 shr x 3
+end
+
+fn sha_g1 x uint to uint
+  ret xor xor rotr x 17 rotr x 19 shr x 10
+end
+
+fn sha_maj a uint b uint c uint to uint
+  ret xor xor and a b and a c and b c
+end
+
+fn sha_be src ulong o ulong to uint
+  v = uint 0
+  for j ulong 4
+    b = uint 0
+    if eq src 0
+      b = uint get g_out add o j
+    else
+      b = uint get g_spad add o j
+    end
+    v = or shl v 8 b
+  end
+  ret v
+end
+
+fn sha_rnd i ulong to void
+  e = get g_sv 4
+  t1 = add get g_sv 7 sha_s1 e
+  t1 = add t1 xor and e get g_sv 5 and not e get g_sv 6
+  t1 = add t1 add get g_sk i get g_sw i
+  a = get g_sv 0
+  t2 = add sha_s0 a sha_maj a get g_sv 1 get g_sv 2
+  put g_sv 7 get g_sv 6
+  put g_sv 6 get g_sv 5
+  put g_sv 5 e
+  put g_sv 4 add get g_sv 3 t1
+  put g_sv 3 get g_sv 2
+  put g_sv 2 get g_sv 1
+  put g_sv 1 a
+  put g_sv 0 add t1 t2
+end
+
+fn sha_blk src ulong o ulong to void
+  for t ulong 16
+    put g_sw t sha_be src add o mul t 4
+  end
+  for t ulong 48
+    u = add t 16
+    x = add sha_g1 get g_sw sub u 2 get g_sw sub u 7
+    put g_sw u add x add sha_g0 get g_sw sub u 15 get g_sw sub u 16
+  end
+  for j ulong 8
+    put g_sv j get g_sh j
+  end
+  for i ulong 64
+    sha_rnd i
+  end
+  for j ulong 8
+    put g_sh j add get g_sh j get g_sv j
+  end
+end
+
+fn sha256_out n ulong to void
+  sha_init_tbl
+  for j ulong 8
+    put g_sh j get g_sk add j 64
+  end
+  nb = div n 64
+  for b ulong nb bound 16777216
+    sha_blk 0 mul b 64
+  end
+  r = rem n 64
+  o = mul nb 64
+  for j ulong 128
+    put g_spad j 0
+  end
+  for j ulong r bound 64
+    put g_spad j get g_out add o j
+  end
+  put g_spad r 0x80
+  tot = ulong 64
+  if ge add r 1 57
+    tot = 128
+  end
+  bits = mul n 8
+  for k ulong 8
+    put g_spad sub sub tot 1 k uchar and shr bits mul k 8 255
+  end
+  sha_blk 1 0
+  if eq tot 128
+    sha_blk 1 64
+  end
+  for j ulong 8
+    w = get g_sh j
+    put g_sdig mul j 4 uchar and shr w 24 255
+    put g_sdig add mul j 4 1 uchar and shr w 16 255
+    put g_sdig add mul j 4 2 uchar and shr w 8 255
+    put g_sdig add mul j 4 3 uchar and w 255
+  end
+end
+
+note ========= UTF-8 & JSON Parser =========
+fn skip_ws to void
+  pos = get g_st 2
+  endp = get g_st 1
+  while lt pos endp bound 16777216
+    c = get g_in pos
+    if or eq c 32 or eq c 9 or eq c 10 eq c 13
+      pos = add pos 1
+    else
+      break
+    end
+  end
+  put g_st 2 pos
+end
+
+fn match_lit s view uchar * to bool
+  pos = get g_st 2
+  endp = get g_st 1
+  n = len s
+  if gt add pos n endp
+    ret false
+  end
+  for i ulong n bound 16
+    if ne get g_in add pos i get s i
+      ret false
+    end
+  end
+  put g_st 2 add pos n
+  ret true
+end
+
+fn put_utf8_str cp ulong to void
+  if lt cp 128
+    str_push uchar cp
+    ret
+  end
+  if lt cp 2048
+    str_push uchar or 192 shr cp 6
+    str_push uchar or 128 and cp 63
+    ret
+  end
+  if lt cp 65536
+    str_push uchar or 224 shr cp 12
+    str_push uchar or 128 and shr cp 6 63
+    str_push uchar or 128 and cp 63
+    ret
+  end
+  str_push uchar or 240 shr cp 18
+  str_push uchar or 128 and shr cp 12 63
+  str_push uchar or 128 and shr cp 6 63
+  str_push uchar or 128 and cp 63
+end
+
+fn decode_utf8_in to long
+  pos = get g_st 2
+  endp = get g_st 1
+  c = ulong get g_in pos
+  if lt c 128
+    put g_st 2 add pos 1
+    ret long c
+  end
+  cp = ulong 0
+  k = ulong 0
+  if eq and c 224 192
+    cp = and c 31
+    k = 1
+  else
+    if eq and c 240 224
+      cp = and c 15
+      k = 2
+    else
+      if eq and c 248 240
+        cp = and c 7
+        k = 3
+      else
+        fail_msg t_eutf8
+        ret neg long 1
+      end
+    end
+  end
+  if ge add pos k endp
+    fail_msg t_etutf8
+    ret neg long 1
+  end
+  for j ulong k bound 4
+    b = ulong get g_in add pos add j 1
+    if ne and b 192 128
+      fail_msg t_eutf8
+      ret neg long 1
+    end
+    cp = or shl cp 6 and b 63
+  end
+  bad = false
+  if and eq k 1 lt cp 128
+    bad = true
+  end
+  if and eq k 2 lt cp 2048
+    bad = true
+  end
+  if and eq k 3 lt cp 65536
+    bad = true
+  end
+  if gt cp 1114111
+    bad = true
+  end
+  if and ge cp 55296 le cp 57343
+    bad = true
+  end
+  if bad
+    fail_msg t_eutf8
+    ret neg long 1
+  end
+  put g_st 2 add pos add k 1
+  ret long cp
+end
+
+fn parse_hex4 to long
+  pos = get g_st 2
+  endp = get g_st 1
+  if gt add pos 4 endp
+    fail_msg t_euesc
+    ret neg long 1
+  end
+  v = ulong 0
+  for i ulong 4
+    c = get g_in add pos i
+    d = ulong 0
+    if and ge c 48 le c 57
+      d = ulong sub c 48
+    else
+      if and ge c 97 le c 102
+        d = add 10 ulong sub c 97
+      else
+        if and ge c 65 le c 70
+          d = add 10 ulong sub c 65
+        else
+          put g_st 2 add pos i
+          fail_msg t_ebuesc
+          ret neg long 1
+        end
+      end
+    end
+    v = or shl v 4 d
+  end
+  put g_st 2 add pos 4
+  ret long v
+end
+
+fn parse_escape to bool
+  pos = get g_st 2
+  endp = get g_st 1
+  if ge pos endp
+    fail_msg t_eeesc
+    ret false
+  end
+  e = get g_in pos
+  put g_st 2 add pos 1
+  if eq e 34
+    str_push 34
+    ret true
+  end
+  if eq e 92
+    str_push 92
+    ret true
+  end
+  if eq e 47
+    str_push 47
+    ret true
+  end
+  if eq e 98
+    str_push 8
+    ret true
+  end
+  if eq e 102
+    str_push 12
+    ret true
+  end
+  if eq e 110
+    str_push 10
+    ret true
+  end
+  if eq e 114
+    str_push 13
+    ret true
+  end
+  if eq e 116
+    str_push 9
+    ret true
+  end
+  if eq e 117
+    cp1 = parse_hex4
+    if lt cp1 0
+      ret false
+    end
+    cp = ulong cp1
+    if and ge cp 55296 le cp 56319
+      p2 = get g_st 2
+      if lt add p2 1 endp
+        if and eq get g_in p2 92 eq get g_in add p2 1 117
+          put g_st 2 add p2 2
+          lo1 = parse_hex4
+          if lt lo1 0
+            ret false
+          end
+          lo = ulong lo1
+          if and ge lo 56320 le lo 57343
+            cp = add 65536 add shl sub cp 55296 10 sub lo 56320
+          else
+            put g_st 2 p2
+          end
+        end
+      end
+    end
+    if and ge cp 55296 le cp 57343
+      put g_st 3 1
+    end
+    put_utf8_str cp
+    ret true
+  end
+  fail_msg t_ebesc
+  ret false
+end
+
+note Parses JSON string starting at '"', returns start offset in g_str (length in g_fmeta[7]), or -1 on error.
+fn parse_string to long
+  start_str = get g_p 4
+  put g_st 2 add get g_st 2 1
+  endp = get g_st 1
+  while true bound 16777216
+    pos = get g_st 2
+    if ge pos endp
+      fail_msg t_eunterm
+      ret neg long 1
+    end
+    c = get g_in pos
+    if eq c 34
+      put g_st 2 add pos 1
+      break
+    end
+    if lt c 32
+      fail_msg t_ectrl
+      ret neg long 1
+    end
+    if ne c 92
+      p0 = pos
+      cp = decode_utf8_in
+      if lt cp 0
+        ret neg long 1
+      end
+      p1 = get g_st 2
+      for i ulong sub p1 p0 bound 8
+        str_push get g_in add p0 i
+      end
+    else
+      put g_st 2 add pos 1
+      if not parse_escape
+        ret neg long 1
+      end
+    end
+  end
+  put g_fmeta 7 sub get g_p 4 start_str
+  ret long start_str
+end
+
+fn is_dig c uchar to bool
+  ret and ge c 48 le c 57
+end
+
+fn parse_exp_part p_in ulong pos ulong to long
+  p = p_in
+  eneg = false
+  if eq get g_in p 45
+    eneg = true
+    p = add p 1
+  else
+    if eq get g_in p 43
+      p = add p 1
+    end
+  end
+  ev = long 0
+  while lt p pos bound 1024
+    if lt ev 1000000
+      ev = add mul ev 10 long sub get g_in p 48
+    end
+    p = add p 1
+  end
+  if eneg
+    ret neg ev
+  end
+  ret ev
+end
+
+fn parse_float_span start ulong pos ulong negf ulong to long
+  p = start
+  if eq negf 1
+    p = add p 1
+  end
+  nd = ulong 0
+  seen_nz = false
+  exp10 = long 0
+  in_frac = false
+  while lt p pos bound 16777216
+    c = get g_in p
+    if or eq c 101 eq c 69
+      p = add p 1
+      break
+    end
+    if eq c 46
+      in_frac = true
+      p = add p 1
+      continue
+    end
+    d = sub c 48
+    if or seen_nz ne d 0
+      seen_nz = true
+      if lt nd 1020
+        put g_fdig nd d
+        nd = add nd 1
+        if in_frac
+          exp10 = sub exp10 1
+        end
+      else
+        if not in_frac
+          exp10 = add exp10 1
+        end
+        if ne d 0
+          put g_fdig 1019 1
+        end
+      end
+    else
+      if in_frac
+        exp10 = sub exp10 1
+      end
+    end
+    p = add p 1
+  end
+  if lt p pos
+    exp10 = add exp10 parse_exp_part p pos
+  end
+  while gt nd 0 bound 1024
+    if ne get g_fdig sub nd 1 0
+      break
+    end
+    nd = sub nd 1
+    exp10 = add exp10 1
+  end
+  fbits = dec_to_f64_bits nd exp10 negf
+  nd_id = alloc_node 4
+  put g_na nd_id fbits
+  ret long nd_id
+end
+
+fn make_int_node start ulong pos ulong to long
+  soff = get g_p 4
+  n = sub pos start
+  is_neg0 = false
+  if eq n 2
+    if eq get g_in start 45
+      if eq get g_in add start 1 48
+        is_neg0 = true
+      end
+    end
+  end
+  if is_neg0
+    str_push 48
+    n = 1
+  else
+    for i ulong n bound 16777216
+      str_push get g_in add start i
+    end
+  end
+  nd_id = alloc_node 3
+  put g_na nd_id soff
+  put g_nb nd_id n
+  ret long nd_id
+end
+
+fn parse_number to long
+  pos = get g_st 2
+  endp = get g_st 1
+  start = pos
+  negf = ulong 0
+  if eq get g_in pos 45
+    negf = 1
+    pos = add pos 1
+    put g_st 2 pos
+  end
+  if lt pos endp
+    if eq get g_in pos 73
+      if not match_lit t_inf
+        fail_msg t_enum
+        ret neg long 1
+      end
+      nd_id = alloc_node 4
+      put g_na nd_id 0xfff0000000000000
+      ret long nd_id
+    end
+  end
+  if ge pos endp
+    fail_msg t_enum
+    ret neg long 1
+  end
+  if not is_dig get g_in pos
+    fail_msg t_enum
+    ret neg long 1
+  end
+  is_fl = false
+  if eq get g_in pos 48
+    pos = add pos 1
+  else
+    while lt pos endp bound 16777216
+      if not is_dig get g_in pos
+        break
+      end
+      pos = add pos 1
+    end
+  end
+  if lt add pos 1 endp
+    if and eq get g_in pos 46 is_dig get g_in add pos 1
+      is_fl = true
+      pos = add pos 1
+      while lt pos endp bound 16777216
+        if not is_dig get g_in pos
+          break
+        end
+        pos = add pos 1
+      end
+    end
+  end
+  if lt pos endp
+    ce = get g_in pos
+    if or eq ce 101 eq ce 69
+      p = add pos 1
+      if lt p endp
+        cs = get g_in p
+        if or eq cs 43 eq cs 45
+          p = add p 1
+        end
+      end
+      if lt p endp
+        if is_dig get g_in p
+          is_fl = true
+          pos = p
+          while lt pos endp bound 16777216
+            if not is_dig get g_in pos
+              break
+            end
+            pos = add pos 1
+          end
+        end
+      end
+    end
+  end
+  put g_st 2 pos
+  if not is_fl
+    ret make_int_node start pos
+  end
+  ret parse_float_span start pos negf
+end
+
+fn cmp_entry_keys ea ulong eb ulong to long
+  oa = get g_ekoff ea
+  la = get g_eklen ea
+  ob = get g_ekoff eb
+  lb = get g_eklen eb
+  m = la
+  if lt lb m
+    m = lb
+  end
+  for i ulong m bound 16777216
+    ca = get g_str add oa i
+    cb = get g_str add ob i
+    if lt ca cb
+      ret neg long 1
+    end
+    if gt ca cb
+      ret 1
+    end
+  end
+  if lt la lb
+    ret neg long 1
+  end
+  if gt la lb
+    ret 1
+  end
+  ret 0
+end
+
+fn sort_dedup_obj nd_id ulong head ulong cnt ulong to void
+  if eq cnt 0
+    put g_na nd_id 0
+    put g_nb nd_id 0
+    ret
+  end
+  base = reserve_ord cnt
+  cur = head
+  for i ulong cnt bound 16777216
+    put g_ord add base i cur
+    cur = get g_enext cur
+  end
+  note Stable insertion sort by key
+  for i ulong cnt bound 16777216
+    key_e = get g_ord add base i
+    j = i
+    while gt j 0 bound 16777216
+      prev_e = get g_ord add base sub j 1
+      if le cmp_entry_keys prev_e key_e 0
+        break
+      end
+      put g_ord add base j prev_e
+      j = sub j 1
+    end
+    put g_ord add base j key_e
+  end
+  note Deduplicate equal keys (keep last)
+  nout = ulong 0
+  for i ulong cnt bound 16777216
+    e = get g_ord add base i
+    skip = false
+    if lt add i 1 cnt
+      en = get g_ord add base add i 1
+      if eq cmp_entry_keys e en 0
+        skip = true
+      end
+    end
+    if not skip
+      put g_ord add base nout e
+      nout = add nout 1
+    end
+  end
+  put g_na nd_id base
+  put g_nb nd_id nout
+end
+
+fn flatten_arr nd_id ulong head ulong cnt ulong to void
+  if eq cnt 0
+    put g_na nd_id 0
+    put g_nb nd_id 0
+    ret
+  end
+  base = reserve_ord cnt
+  cur = head
+  for i ulong cnt bound 16777216
+    put g_ord add base i cur
+    cur = get g_enext cur
+  end
+  put g_na nd_id base
+  put g_nb nd_id cnt
+end
+
+fn parse_obj depth ulong to long
+  put g_st 2 add get g_st 2 1
+  skip_ws
+  pos = get g_st 2
+  endp = get g_st 1
+  nd_id = alloc_node 7
+  if lt pos endp
+    if eq get g_in pos 125
+      put g_st 2 add pos 1
+      ret long nd_id
+    end
+  end
+  head = ulong 18446744073709551615
+  tail = ulong 18446744073709551615
+  cnt = ulong 0
+  while true bound 16777216
+    skip_ws
+    pos = get g_st 2
+    if ge pos endp
+      fail_msg t_eprop
+      ret neg long 1
+    end
+    if ne get g_in pos 34
+      fail_msg t_eprop
+      ret neg long 1
+    end
+    ko = parse_string
+    if lt ko 0
+      ret neg long 1
+    end
+    kl = get g_fmeta 7
+    skip_ws
+    pos = get g_st 2
+    if ge pos endp
+      fail_msg t_ecolon
+      ret neg long 1
+    end
+    if ne get g_in pos 58
+      fail_msg t_ecolon
+      ret neg long 1
+    end
+    put g_st 2 add pos 1
+    val = parse_value add depth 1
+    if lt val 0
+      ret neg long 1
+    end
+    e = alloc_entry ulong ko kl ulong val
+    if eq cnt 0
+      head = e
+    else
+      put g_enext tail e
+    end
+    tail = e
+    cnt = add cnt 1
+    skip_ws
+    pos = get g_st 2
+    if ge pos endp
+      fail_msg t_eobj
+      ret neg long 1
+    end
+    c = get g_in pos
+    if eq c 44
+      put g_st 2 add pos 1
+      continue
+    end
+    if eq c 125
+      put g_st 2 add pos 1
+      break
+    end
+    fail_msg t_eobj
+    ret neg long 1
+  end
+  sort_dedup_obj nd_id head cnt
+  ret long nd_id
+end
+
+fn parse_arr depth ulong to long
+  put g_st 2 add get g_st 2 1
+  skip_ws
+  pos = get g_st 2
+  endp = get g_st 1
+  nd_id = alloc_node 6
+  if lt pos endp
+    if eq get g_in pos 93
+      put g_st 2 add pos 1
+      ret long nd_id
+    end
+  end
+  head = ulong 18446744073709551615
+  tail = ulong 18446744073709551615
+  cnt = ulong 0
+  while true bound 16777216
+    val = parse_value add depth 1
+    if lt val 0
+      ret neg long 1
+    end
+    e = alloc_entry 0 0 ulong val
+    if eq cnt 0
+      head = e
+    else
+      put g_enext tail e
+    end
+    tail = e
+    cnt = add cnt 1
+    skip_ws
+    pos = get g_st 2
+    if ge pos endp
+      fail_msg t_earr
+      ret neg long 1
+    end
+    c = get g_in pos
+    if eq c 44
+      put g_st 2 add pos 1
+      continue
+    end
+    if eq c 93
+      put g_st 2 add pos 1
+      break
+    end
+    fail_msg t_earr
+    ret neg long 1
+  end
+  flatten_arr nd_id head cnt
+  ret long nd_id
+end
+
+fn parse_value depth ulong to long
+  if gt depth 512
+    fail_msg t_edeep
+    ret neg long 1
+  end
+  skip_ws
+  pos = get g_st 2
+  endp = get g_st 1
+  if ge pos endp
+    fail_msg t_eval
+    ret neg long 1
+  end
+  c = get g_in pos
+  if eq c 123
+    ret parse_obj depth
+  end
+  if eq c 91
+    ret parse_arr depth
+  end
+  if eq c 34
+    so = parse_string
+    if lt so 0
+      ret neg long 1
+    end
+    nd_id = alloc_node 5
+    put g_na nd_id ulong so
+    put g_nb nd_id get g_fmeta 7
+    ret long nd_id
+  end
+  if match_lit t_null
+    ret long alloc_node 0
+  end
+  if match_lit t_true
+    ret long alloc_node 1
+  end
+  if match_lit t_false
+    ret long alloc_node 2
+  end
+  if match_lit t_nan
+    nd_id = alloc_node 4
+    put g_na nd_id 0x7ff8000000000000
+    ret long nd_id
+  end
+  if match_lit t_inf
+    nd_id = alloc_node 4
+    put g_na nd_id 0x7ff0000000000000
+    ret long nd_id
+  end
+  if or eq c 45 is_dig c
+    ret parse_number
+  end
+  fail_msg t_eval
+  ret neg long 1
+end
+
+note ========= Emitter =========
+fn out_u4hex u ulong to void
+  out_c 92
+  out_c 117
+  out_c get t_hex and shr u 12 15
+  out_c get t_hex and shr u 8 15
+  out_c get t_hex and shr u 4 15
+  out_c get t_hex and u 15
+end
+
+fn emit_wtf8 off ulong i ulong to ulong
+  cu = ulong get g_str add off i
+  cp = ulong 0
+  step = ulong 1
+  if lt cu 128
+    cp = cu
+  else
+    if eq and cu 224 192
+      cp = or shl and cu 31 6 and ulong get g_str add off add i 1 63
+      step = 2
+    else
+      if eq and cu 240 224
+        b1 = and ulong get g_str add off add i 1 63
+        b2 = and ulong get g_str add off add i 2 63
+        cp = or shl and cu 15 12 or shl b1 6 b2
+        step = 3
+      else
+        b1 = and ulong get g_str add off add i 1 63
+        b2 = and ulong get g_str add off add i 2 63
+        b3 = and ulong get g_str add off add i 3 63
+        cp = or shl and cu 7 18 or shl b1 12 or shl b2 6 b3
+        step = 4
+      end
+    end
+  end
+  if ge cp 65536
+    u = sub cp 65536
+    out_u4hex or 55296 shr u 10
+    out_u4hex or 56320 and u 1023
+  else
+    out_u4hex cp
+  end
+  ret add i step
+end
+
+fn emit_str off ulong n ulong ascii ulong to void
+  out_c 34
+  i = ulong 0
+  while lt i n bound 16777216
+    c = get g_str add off i
+    if eq c 34
+      out_c 92
+      out_c 34
+      i = add i 1
+      continue
+    end
+    if eq c 92
+      out_c 92
+      out_c 92
+      i = add i 1
+      continue
+    end
+    if eq c 10
+      out_c 92
+      out_c 110
+      i = add i 1
+      continue
+    end
+    if eq c 13
+      out_c 92
+      out_c 114
+      i = add i 1
+      continue
+    end
+    if eq c 9
+      out_c 92
+      out_c 116
+      i = add i 1
+      continue
+    end
+    if eq c 8
+      out_c 92
+      out_c 98
+      i = add i 1
+      continue
+    end
+    if eq c 12
+      out_c 92
+      out_c 102
+      i = add i 1
+      continue
+    end
+    if lt c 32
+      out_u4hex ulong c
+      i = add i 1
+      continue
+    end
+    if or lt c 127 eq ascii 0
+      out_c c
+      i = add i 1
+      continue
+    end
+    i = emit_wtf8 off i
+  end
+  out_c 34
+end
+
+fn emit_nl indent ulong level ulong to void
+  out_c 10
+  sp = mul indent level
+  for i ulong sp bound 4096
+    out_c 32
+  end
+end
+
+fn emit_node nd_id ulong indent ulong ascii ulong level ulong to void
+  ty = get g_nt nd_id
+  if eq ty 0
+    out_txt t_null
+    ret
+  end
+  if eq ty 1
+    out_txt t_true
+    ret
+  end
+  if eq ty 2
+    out_txt t_false
+    ret
+  end
+  if eq ty 3
+    out_str_slice get g_na nd_id get g_nb nd_id
+    ret
+  end
+  if eq ty 4
+    out_f64_bits get g_na nd_id
+    ret
+  end
+  if eq ty 5
+    emit_str get g_na nd_id get g_nb nd_id ascii
+    ret
+  end
+  if eq ty 6
+    n = get g_nb nd_id
+    if eq n 0
+      out_c 91
+      out_c 93
+      ret
+    end
+    base = get g_na nd_id
+    out_c 91
+    for i ulong n bound 16777216
+      if gt i 0
+        out_c 44
+      end
+      if gt indent 0
+        emit_nl indent add level 1
+      end
+      e = get g_ord add base i
+      emit_node get g_eval e indent ascii add level 1
+    end
+    if gt indent 0
+      emit_nl indent level
+    end
+    out_c 93
+    ret
+  end
+  n = get g_nb nd_id
+  if eq n 0
+    out_c 123
+    out_c 125
+    ret
+  end
+  base = get g_na nd_id
+  out_c 123
+  for i ulong n bound 16777216
+    if gt i 0
+      out_c 44
+    end
+    if gt indent 0
+      emit_nl indent add level 1
+    end
+    e = get g_ord add base i
+    emit_str get g_ekoff e get g_eklen e ascii
+    out_c 58
+    if gt indent 0
+      out_c 32
+    end
+    emit_node get g_eval e indent ascii add level 1
+  end
+  if gt indent 0
+    emit_nl indent level
+  end
+  out_c 125
+end
+
+note ========= I/O & CLI =========
+fn read_all_stdin to void
+  cap = ulong 65536
+  r = enlarge g_in cap
+  if lt r 0
+    oom_die
+  end
+  tot = ulong 0
+  while true bound 16777216
+    if eq tot cap
+      ncap = mul cap 2
+      r2 = enlarge g_in ncap
+      if lt r2 0
+        oom_die
+      end
+      cap = ncap
+    end
+    k = read 0 g_in tot sub cap tot
+    if eq k neg long 4
+      continue
+    end
+    if lt k 0
+      wr_fd_txt 2 t_eread
+      exit 1
+    end
+    if eq k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  put g_p 0 tot
+  put g_p 1 cap
+end
+
+fn write_gout_all fd int n ulong to bool
+  off = ulong 0
+  while lt off n bound 16777216
+    k = write fd g_out off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret false
+    end
+    off = add off ulong k
+  end
+  ret true
+end
+
+fn write_gin_all fd int n ulong to bool
+  off = ulong 0
+  while lt off n bound 16777216
+    k = write fd g_in off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret false
+    end
+    off = add off ulong k
+  end
+  ret true
+end
+
+fn wr_arg2_err n ulong to void
+  off = ulong 0
+  while lt off n bound 4096
+    k = write 2 g_arg2 off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn do_write_exclusive plen ulong to int
+  read_all_stdin
+  note O_WRONLY|O_CREAT|O_EXCL = 193, mode 0444 = 292
+  fd = fopen g_arg2 0 plen 193 292
+  if lt fd 0
+    eno = ulong neg fd
+    if eq eno 17
+      wr_fd_txt 2 t_eexist
+    else
+      wr_fd_txt 2 t_eerrno1
+      wr_fd_u64 2 eno
+      wr_fd_txt 2 t_eerrno2
+    end
+    wr_arg2_err plen
+    wr_fd_txt 2 t_eend
+    ret 1
+  end
+  if not write_gin_all int fd get g_p 0
+    cl = fclose int fd
+    wr_fd_txt 2 t_ewrite
+    ret 1
+  end
+  if ne fsync int fd 0
+    cl = fclose int fd
+    wr_fd_txt 2 t_efsync
+    ret 1
+  end
+  if ne fclose int fd 0
+    wr_fd_txt 2 t_eclose
+    ret 1
+  end
+  ret 0
+end
+
+fn valid_doc start ulong endp ulong to bool
+  put g_p 4 0
+  put g_p 6 0
+  put g_p 8 0
+  put g_p 10 0
+  put g_st 0 start
+  put g_st 1 endp
+  put g_st 2 start
+  put g_st 3 0
+  put g_st 4 1
+  put g_st 5 0
+  v = parse_value 0
+  if or lt v 0 ne get g_st 5 0
+    ret false
+  end
+  skip_ws
+  ret eq get g_st 2 endp
+end
+
+fn do_check_lines to int
+  read_all_stdin
+  n = get g_p 0
+  start = ulong 0
+  line = ulong 0
+  bad = int 0
+  while lt start n bound 16777216
+    endp = start
+    while lt endp n bound 16777216
+      if eq get g_in endp 10
+        break
+      end
+      endp = add endp 1
+    end
+    line = add line 1
+    doc_end = endp
+    if lt endp n
+      doc_end = add endp 1
+    end
+    if not valid_doc start doc_end
+      wr_fd_u64 1 line
+      wr_fd_txt 1 t_nl
+      bad = 1
+    end
+    start = add endp 1
+  end
+  ret bad
+end
+
+fn eq_arg1 s view uchar * n ulong to bool
+  if ne n len s
+    ret false
+  end
+  for i ulong len s bound 64
+    if ne get g_arg1 i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn emit_sha256_stdout to int
+  sha256_out get g_p 2
+  hb = new uchar 65 0
+  for i ulong 32
+    b = ulong get g_sdig i
+    put hb mul i 2 get t_hex shr b 4
+    put hb add mul i 2 1 get t_hex and b 15
+  end
+  put hb 64 10
+  off = ulong 0
+  while lt off 65 bound 65
+    k = write 1 hb off sub 65 off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      wr_fd_txt 2 t_ewrite
+      ret 1
+    end
+    off = add off ulong k
+  end
+  ret 0
+end
+
+fn main to int
+  ac = argcnt
+  mode = ulong 0
+  if eq ac 3
+    n1 = argread 1 g_arg1 0 4095
+    n2 = argread 2 g_arg2 0 4095
+    if and ge n1 0 gt n2 0
+      if eq_arg1 t_f_wex ulong n1
+        ret do_write_exclusive ulong n2
+      end
+    end
+    wr_fd_txt 2 t_usage
+    ret 2
+  end
+  if eq ac 2
+    n1 = argread 1 g_arg1 0 4095
+    if lt n1 0
+      wr_fd_txt 2 t_usage
+      ret 2
+    end
+    un1 = ulong n1
+    if eq_arg1 t_f_check un1
+      mode = 1
+    else
+      if eq_arg1 t_f_pretty un1
+        mode = 2
+      else
+        if eq_arg1 t_f_sha un1
+          mode = 3
+        else
+          if eq_arg1 t_f_lines un1
+            ret do_check_lines
+          else
+            wr_fd_txt 2 t_usage
+            ret 2
+          end
+        end
+      end
+    end
+  else
+    if ne ac 1
+      wr_fd_txt 2 t_usage
+      ret 2
+    end
+  end
+  read_all_stdin
+  n = get g_p 0
+  put g_st 0 0
+  put g_st 1 n
+  put g_st 2 0
+  put g_st 3 0
+  put g_st 4 0
+  put g_st 5 0
+  root = parse_value 0
+  if lt root 0
+    ret 1
+  end
+  skip_ws
+  if ne get g_st 2 n
+    fail_msg t_eextra
+  end
+  if eq mode 1
+    ret 0
+  end
+  if and ne mode 2 ne get g_st 3 0
+    wr_fd_txt 2 t_esurr
+    ret 1
+  end
+  put g_p 2 0
+  if eq mode 2
+    emit_node ulong root 2 1 0
+    out_c 10
+  else
+    emit_node ulong root 0 0 0
+  end
+  if eq mode 3
+    ret emit_sha256_stdout
+  end
+  if not write_gout_all 1 get g_p 2
+    wr_fd_txt 2 t_ewrite
+    ret 1
+  end
+  ret 0
+end

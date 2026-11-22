@@ -46,10 +46,10 @@ if [ ! -x "$OMEGA" ]; then
     exit 1
 fi
 
-# Strict JSON line checker (tools/json_canon.c: Python json.loads rules, strict
-# UTF-8) for the --json scriptability checks; C + jq, no Python.
+# Strict JSON line checker (tools/json_canon.om: pure OM-2, Python json.loads rules, strict
+# UTF-8) for the --json scriptability checks; Omega + jq, no Python.
 JSONC=$WORK/json_canon
-if ! ${CC:-gcc} -std=gnu11 -O2 -Wall -Wextra -Werror -Isrc -o "$JSONC" tools/json_canon.c src/omega_om_units.c -lm; then
+if ! { seed/out/omc < tools/json_canon.om > "$JSONC" && chmod +x "$JSONC"; }; then
     echo "QUAL setup json_canon FAIL build"
     exit 1
 fi

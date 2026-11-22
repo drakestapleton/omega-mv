@@ -41,7 +41,7 @@ of these checks runs `nvdisasm`.
 
 | File | Job |
 |---|---|
-| `sm121dis.c` | command line: a listing, `-b SM121` (called like nvdisasm), `--pairs` (for the comparison), `--version` |
+| `sm121dis.om` | command line (pure Omega, composed with `gpu/nvidia/om/disasm/sm121_dis.om`): a listing, `-b SM121` (called like nvdisasm), `--pairs` (for the comparison), `--version` |
 | `corpus.sh` | runs every GPU test with `OMEGA_KERNEL_DUMP_DIR` set, so each kernel the library encodes is saved |
 | `check.sh` | compares its text with nvdisasm's for every saved kernel, `SM121DIS_JOBS` at a time (default: every CPU the process may use); PASS only when every word agrees |
 | `oracle_pairs.sh` | turns nvdisasm's listing into the same one-line-per-word form |

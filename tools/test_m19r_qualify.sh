@@ -22,7 +22,7 @@ set -u
 HERE=$(cd -P "$(dirname "$0")/.." && pwd)
 # shellcheck source=tools/m19r_qualify.sh
 . "$HERE/tools/m19r_qualify.sh"
-m19r_build_canon || { echo "FAIL: cannot build tools/json_canon.c"; exit 1; }
+m19r_build_canon || { echo "FAIL: cannot build tools/json_canon.om"; exit 1; }
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP" "$M19R_TMP"' EXIT
 fails=0 passes=0
@@ -124,8 +124,8 @@ echo "evidence retention across runs (stubbed qualification, no hardware)"
 check "make clean removes only the build directory" '[ "$(make --no-print-directory -C "$HERE" -n clean | tr -d "\n")" = "rm -rf ${OUT_DIR:-build}" ]'
 fake=$TMP/fakeomega
 mkdir -p "$fake/tools" "$fake/build"
-ln -s "$HERE/src" "$fake/src"; cp "$HERE/tools/json_canon.c" "$fake/tools/"
-printf "/qual-runs/\nsrc\n" > "$fake/.gitignore"
+ln -s "$HERE/seed" "$fake/seed"; cp "$HERE/tools/json_canon.om" "$fake/tools/"
+printf "/qual-runs/\nseed\n" > "$fake/.gitignore"
 printf 'clean:\n\trm -rf build\n' > "$fake/Makefile"
 git init -q "$fake"
 fake_run() { # fake_run EXTRA_ARGS... ; runs m19r_main with a stubbed qualify

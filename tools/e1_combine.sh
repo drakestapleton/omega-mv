@@ -71,8 +71,7 @@ e1_refuse() { E1_ERR=$1; return 1; }
 e1_build_canon() {
     E1_TMP=$(mktemp -d "${TMPDIR:-/tmp}/e1combine.XXXXXX") || return 1
     JSON_CANON=$E1_TMP/json_canon
-    gcc -std=gnu11 -O2 -Wall -Wextra -Werror -I"$E1_OMEGA/src" -o "$JSON_CANON" \
-        "$E1_OMEGA/tools/json_canon.c" "$E1_OMEGA/src/omega_om_units.c" -lm
+    "$E1_OMEGA/seed/out/omc" < "$E1_OMEGA/tools/json_canon.om" > "$JSON_CANON" && chmod +x "$JSON_CANON"
 }
 
 e1_sha() { sha256sum -- "$1" | cut -c1-64; }

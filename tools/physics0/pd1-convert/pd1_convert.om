@@ -1,0 +1,704 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note pd1_convert.om: turn a label-free TSV of retrospective machine runs into the
+note PD1REC1 fixed-width record stream (112 bytes LE) with a SHA-256 chain.
+note Pure seeded OM-2 replacement for tools/physics0/pd1-convert/pd1_convert.c.
+om2
+
+text k_sha_tbl "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+text t_hex "0123456789abcdef"
+text t_magic "PD1REC1"
+text t_vflag "--verify"
+text t_usage "usage: pd1_convert OUTFILE < records.tsv | pd1_convert --verify FILE\n"
+text t_hdr "seq\tsrc\tq0\tq1\tq2\tq3\tq4\tq5\tr0\tr1\tcov\n"
+text t_vopen "verify: cannot open "
+text t_vmagic "verify: bad magic at "
+text t_vver "verify: unknown version at "
+text t_vseq "verify: seq gap at "
+text t_vchain "verify: chain broken at "
+text t_vhash "verify: hash mismatch at "
+text t_vok1 "verify: ok records="
+text t_vok2 " root="
+text t_ccreate1 "pd1_convert: cannot create "
+text t_ccreate2 " (exists?)\n"
+text t_cbad "pd1_convert: bad line "
+text t_crange "pd1_convert: range error at line "
+text t_crecs "records="
+text t_colon ": "
+text t_nl "\n"
+
+global g_sk uint 72
+global g_sw uint 64
+global g_sv uint 8
+global g_sh uint 8
+global g_spad uchar 128
+global g_sdig uchar 32
+global g_sinit ulong 1
+
+global g_rec uchar 112
+global g_prev uchar 32
+global g_path uchar 4096
+global g_arg uchar 4096
+global g_inbuf uchar 65536
+global g_inpos ulong 2
+global g_line uchar 4096
+global g_outbuf uchar 4096
+global g_fvals ulong 10
+global g_ppos ulong 1
+
+fn write_all fd int buf view uchar * n ulong to bool
+  off = ulong 0
+  while lt off n bound 1048576
+    k = write fd buf off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret false
+    end
+    off = add off ulong k
+  end
+  ret true
+end
+
+fn wtxt fd int s view uchar * to void
+  ok = write_all fd s len s
+end
+
+fn wnl fd int to void
+  ok = write_all fd t_nl 1
+end
+
+fn wr_gpath fd int n ulong to void
+  off = ulong 0
+  while lt off n bound 4096
+    k = write fd g_path off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn wr_gline fd int n ulong to void
+  off = ulong 0
+  while lt off n bound 4096
+    k = write fd g_line off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn wr_grec fd int to bool
+  off = ulong 0
+  while lt off 112 bound 1024
+    k = write fd g_rec off sub 112 off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret false
+    end
+    off = add off ulong k
+  end
+  ret true
+end
+
+fn wr_gout fd int n ulong to void
+  off = ulong 0
+  while lt off n bound 4096
+    k = write fd g_outbuf off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn gout_u64 pos ulong v ulong to ulong
+  tmp = new uchar 24 0
+  n = ulong 0
+  x = v
+  while true bound 24
+    put tmp n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+    if eq x 0
+      break
+    end
+  end
+  p = pos
+  for i ulong n bound 24
+    idx = sub sub n 1 i
+    put g_outbuf p get tmp idx
+    p = add p 1
+  end
+  ret p
+end
+
+fn gout_i64_bits pos ulong bits ulong to ulong
+  p = pos
+  if ne and shr bits 63 1 0
+    put g_outbuf p uchar 45
+    p = add p 1
+    mag = sub ulong 0 bits
+    ret gout_u64 p mag
+  end
+  ret gout_u64 p bits
+end
+
+fn wu64 fd int v ulong to void
+  n = gout_u64 0 v
+  wr_gout fd n
+end
+
+fn wprev_hex fd int to void
+  b = new uchar 64 0
+  for i ulong 32
+    v = ulong get g_prev i
+    put b mul i 2 get t_hex shr v 4
+    put b add mul i 2 1 get t_hex and v 15
+  end
+  ok = write_all fd view b 64
+end
+
+fn sha_init_tbl to void
+  if ne get g_sinit 0 0
+    ret
+  end
+  put g_sinit 0 1
+  p = ulong 0
+  for i ulong 72
+    v = ulong 0
+    while lt get k_sha_tbl p 48 bound 4
+      p = add p 1
+    end
+    while ge get k_sha_tbl p 48 bound 11
+      v = add mul v 10 ulong sub get k_sha_tbl p 48
+      p = add p 1
+      if ge p len k_sha_tbl
+        put g_sk i uint v
+        ret
+      end
+    end
+    put g_sk i uint v
+  end
+end
+
+fn sha_s0 a uint to uint
+  ret xor xor rotr a 2 rotr a 13 rotr a 22
+end
+
+fn sha_s1 e uint to uint
+  ret xor xor rotr e 6 rotr e 11 rotr e 25
+end
+
+fn sha_g0 x uint to uint
+  ret xor xor rotr x 7 rotr x 18 shr x 3
+end
+
+fn sha_g1 x uint to uint
+  ret xor xor rotr x 17 rotr x 19 shr x 10
+end
+
+fn sha_maj a uint b uint c uint to uint
+  ret xor xor and a b and a c and b c
+end
+
+fn sha_be_pad o ulong to uint
+  v = uint 0
+  for j ulong 4
+    v = or shl v 8 uint get g_spad add o j
+  end
+  ret v
+end
+
+fn sha_rnd i ulong to void
+  e = get g_sv 4
+  t1 = add get g_sv 7 sha_s1 e
+  t1 = add t1 xor and e get g_sv 5 and not e get g_sv 6
+  t1 = add t1 add get g_sk i get g_sw i
+  a = get g_sv 0
+  t2 = add sha_s0 a sha_maj a get g_sv 1 get g_sv 2
+  put g_sv 7 get g_sv 6
+  put g_sv 6 get g_sv 5
+  put g_sv 5 e
+  put g_sv 4 add get g_sv 3 t1
+  put g_sv 3 get g_sv 2
+  put g_sv 2 get g_sv 1
+  put g_sv 1 a
+  put g_sv 0 add t1 t2
+end
+
+fn sha_blk_pad o ulong to void
+  for t ulong 16
+    put g_sw t sha_be_pad add o mul t 4
+  end
+  for t ulong 48
+    u = add t 16
+    x = add sha_g1 get g_sw sub u 2 get g_sw sub u 7
+    put g_sw u add x add sha_g0 get g_sw sub u 15 get g_sw sub u 16
+  end
+  for j ulong 8
+    put g_sv j get g_sh j
+  end
+  for i ulong 64
+    sha_rnd i
+  end
+  for j ulong 8
+    put g_sh j add get g_sh j get g_sv j
+  end
+end
+
+fn sha256_rec80 to void
+  sha_init_tbl
+  for j ulong 8
+    put g_sh j get g_sk add j 64
+  end
+  for j ulong 128
+    put g_spad j 0
+  end
+  for j ulong 80
+    put g_spad j get g_rec j
+  end
+  put g_spad 80 0x80
+  put g_spad 126 0x02
+  put g_spad 127 0x80
+  sha_blk_pad 0
+  sha_blk_pad 64
+  for j ulong 8
+    w = get g_sh j
+    put g_sdig mul j 4 uchar and shr w 24 255
+    put g_sdig add mul j 4 1 uchar and shr w 16 255
+    put g_sdig add mul j 4 2 uchar and shr w 8 255
+    put g_sdig add mul j 4 3 uchar and w 255
+  end
+end
+
+fn put_le16 o ulong v ulong to void
+  put g_rec o uchar and v 255
+  put g_rec add o 1 uchar and shr v 8 255
+end
+
+fn put_le32 o ulong v ulong to void
+  for i ulong 4
+    put g_rec add o i uchar and shr v mul i 8 255
+  end
+end
+
+fn put_le64 o ulong v ulong to void
+  for i ulong 8
+    put g_rec add o i uchar and shr v mul i 8 255
+  end
+end
+
+fn get_le64 o ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get g_rec add o i mul i 8
+  end
+  ret v
+end
+
+fn read_exact fd int n ulong to long
+  got = ulong 0
+  while lt got n bound 1024
+    k = read fd g_rec got sub n got
+    if eq k neg long 4
+      continue
+    end
+    if lt k 0
+      ret k
+    end
+    if eq k 0
+      ret long got
+    end
+    got = add got ulong k
+  end
+  ret long got
+end
+
+fn do_verify plen ulong to int
+  fd = fopen g_path 0 plen 0 0
+  if lt fd 0
+    wtxt 2 t_vopen
+    wr_gpath 2 plen
+    wnl 2
+    ret 3
+  end
+  for i ulong 32
+    put g_prev i 0
+  end
+  seq = ulong 0
+  while true bound 100000000
+    got = read_exact int fd 112
+    if ne got 112
+      break
+    end
+    badm = false
+    for i ulong 7
+      if ne get g_rec i get t_magic i
+        badm = true
+      end
+    end
+    if ne get g_rec 7 0
+      badm = true
+    end
+    if badm
+      cl = fclose int fd
+      wtxt 2 t_vmagic
+      wu64 2 seq
+      wnl 2
+      ret 10
+    end
+    if or ne get g_rec 8 1 ne get g_rec 9 0
+      cl = fclose int fd
+      wtxt 2 t_vver
+      wu64 2 seq
+      wnl 2
+      ret 11
+    end
+    s = get_le64 16
+    if ne s seq
+      cl = fclose int fd
+      wtxt 2 t_vseq
+      wu64 2 seq
+      wnl 2
+      ret 12
+    end
+    badc = false
+    for i ulong 32
+      if ne get g_rec add 48 i get g_prev i
+        badc = true
+      end
+    end
+    if badc
+      cl = fclose int fd
+      wtxt 2 t_vchain
+      wu64 2 seq
+      wnl 2
+      ret 13
+    end
+    sha256_rec80
+    badh = false
+    for i ulong 32
+      if ne get g_sdig i get g_rec add 80 i
+        badh = true
+      end
+    end
+    if badh
+      cl = fclose int fd
+      wtxt 2 t_vhash
+      wu64 2 seq
+      wnl 2
+      ret 14
+    end
+    for i ulong 32
+      put g_prev i get g_rec add 80 i
+    end
+    seq = add seq 1
+  end
+  cl = fclose int fd
+  wtxt 1 t_vok1
+  wu64 1 seq
+  wtxt 1 t_vok2
+  wprev_hex 1
+  wnl 1
+  ret 0
+end
+
+fn is_ws c uchar to bool
+  if or eq c 32 eq c 9
+    ret true
+  end
+  if or eq c 10 eq c 13
+    ret true
+  end
+  ret false
+end
+
+fn read_line to long
+  ln = ulong 0
+  while true bound 4096
+    pos = get g_inpos 0
+    endp = get g_inpos 1
+    if ge pos endp
+      k = read 0 g_inbuf 0 65536
+      if eq k neg long 4
+        continue
+      end
+      if le k 0
+        if eq ln 0
+          ret neg long 1
+        end
+        ret long ln
+      end
+      put g_inpos 0 0
+      put g_inpos 1 ulong k
+      pos = ulong 0
+      endp = ulong k
+    end
+    c = get g_inbuf pos
+    put g_inpos 0 add pos 1
+    if lt ln 4095
+      put g_line ln c
+      ln = add ln 1
+    end
+    if eq c 10
+      ret long ln
+    end
+  end
+  ret long ln
+end
+
+fn parse_one_field ln ulong f ulong to int
+  p = get g_ppos 0
+  while lt p ln bound 4096
+    if not is_ws get g_line p
+      break
+    end
+    p = add p 1
+  end
+  if ge p ln
+    ret 1
+  end
+  negf = ulong 0
+  c0 = get g_line p
+  if eq c0 45
+    if and ne f 6 ne f 7
+      ret 1
+    end
+    negf = 1
+    p = add p 1
+  else
+    if eq c0 43
+      p = add p 1
+    end
+  end
+  if ge p ln
+    ret 1
+  end
+  cd = get g_line p
+  if or lt cd 48 gt cd 57
+    ret 1
+  end
+  v = ulong 0
+  ov = false
+  while lt p ln bound 4096
+    ch = get g_line p
+    if or lt ch 48 gt ch 57
+      break
+    end
+    d = ulong sub ch 48
+    if gt v 1844674407370955161
+      ov = true
+    else
+      if and eq v 1844674407370955161 gt d 5
+        ov = true
+      else
+        v = add mul v 10 d
+      end
+    end
+    p = add p 1
+  end
+  put g_ppos 0 p
+  if ov
+    ret 2
+  end
+  if or eq f 6 eq f 7
+    if eq negf 1
+      if gt v 9223372036854775808
+        ret 2
+      end
+      put g_fvals f sub ulong 0 v
+    else
+      if gt v 9223372036854775807
+        ret 2
+      end
+      put g_fvals f v
+    end
+  else
+    put g_fvals f v
+  end
+  ret 0
+end
+
+fn parse_row ln ulong to int
+  put g_ppos 0 0
+  for f ulong 10
+    rc = parse_one_field ln f
+    if ne rc 0
+      ret rc
+    end
+  end
+  if or gt get g_fvals 0 255 gt get g_fvals 1 255
+    ret 2
+  end
+  if or gt get g_fvals 2 255 gt get g_fvals 3 255
+    ret 2
+  end
+  if or gt get g_fvals 4 255 gt get g_fvals 8 255
+    ret 2
+  end
+  if or gt get g_fvals 5 4294967295 gt get g_fvals 9 4294967295
+    ret 2
+  end
+  ret 0
+end
+
+fn emit_tsv_row seq ulong to void
+  p = gout_u64 0 seq
+  for f ulong 10
+    put g_outbuf p uchar 9
+    p = add p 1
+    if or eq f 6 eq f 7
+      p = gout_i64_bits p get g_fvals f
+    else
+      p = gout_u64 p get g_fvals f
+    end
+  end
+  put g_outbuf p uchar 10
+  p = add p 1
+  wr_gout 1 p
+end
+
+fn do_convert plen ulong to int
+  fd = fopen g_path 0 plen 193 420
+  if lt fd 0
+    wtxt 2 t_ccreate1
+    wr_gpath 2 plen
+    wtxt 2 t_ccreate2
+    ret 3
+  end
+  for i ulong 32
+    put g_prev i 0
+  end
+  put g_inpos 0 0
+  put g_inpos 1 0
+  wtxt 1 t_hdr
+  seq = ulong 0
+  while true bound 100000000
+    r = read_line
+    if lt r 0
+      break
+    end
+    ln = ulong r
+    if eq ln 0
+      continue
+    end
+    c0 = get g_line 0
+    if or eq c0 35 eq c0 10
+      continue
+    end
+    pr = parse_row ln
+    if eq pr 1
+      cl = fclose int fd
+      wtxt 2 t_cbad
+      wu64 2 seq
+      wtxt 2 t_colon
+      wr_gline 2 ln
+      ret 4
+    end
+    if eq pr 2
+      cl = fclose int fd
+      wtxt 2 t_crange
+      wu64 2 seq
+      wnl 2
+      ret 4
+    end
+    for i ulong 112
+      put g_rec i 0
+    end
+    for i ulong 7
+      put g_rec i get t_magic i
+    end
+    put g_rec 7 0
+    put_le16 8 1
+    put g_rec 10 uchar get g_fvals 0
+    put g_rec 11 uchar get g_fvals 8
+    put g_rec 12 uchar get g_fvals 1
+    put g_rec 13 uchar get g_fvals 2
+    put g_rec 14 uchar get g_fvals 3
+    put g_rec 15 uchar get g_fvals 4
+    put_le64 16 seq
+    put_le32 24 get g_fvals 5
+    put_le32 28 get g_fvals 9
+    put_le64 32 get g_fvals 6
+    put_le64 40 get g_fvals 7
+    for i ulong 32
+      put g_rec add 48 i get g_prev i
+    end
+    sha256_rec80
+    for i ulong 32
+      b = get g_sdig i
+      put g_rec add 80 i b
+      put g_prev i b
+    end
+    if not wr_grec int fd
+      cl = fclose int fd
+      ret 5
+    end
+    emit_tsv_row seq
+    seq = add seq 1
+  end
+  cl = fclose int fd
+  wtxt 2 t_crecs
+  wu64 2 seq
+  wtxt 2 t_vok2
+  wprev_hex 2
+  wnl 2
+  ret 0
+end
+
+fn eq_arg_vflag alen ulong to bool
+  if ne alen len t_vflag
+    ret false
+  end
+  for i ulong len t_vflag
+    if ne get g_arg i get t_vflag i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn main to int
+  ac = argcnt
+  if eq ac 3
+    n1 = argread 1 g_arg 0 4095
+    if lt n1 0
+      wtxt 2 t_usage
+      ret 2
+    end
+    if eq_arg_vflag ulong n1
+      n2 = argread 2 g_path 0 4095
+      if le n2 0
+        wtxt 2 t_usage
+        ret 2
+      end
+      ret do_verify ulong n2
+    end
+  end
+  if ne ac 2
+    wtxt 2 t_usage
+    ret 2
+  end
+  n1 = argread 1 g_path 0 4095
+  if le n1 0
+    wtxt 2 t_usage
+    ret 2
+  end
+  ret do_convert ulong n1
+end

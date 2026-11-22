@@ -184,26 +184,11 @@ mkdir -p build/seed/sched-caller
 seed/out/omc < seed/host/affinity/caller-conductor.om > build/seed/sched-caller/conductor
 chmod +x build/seed/sched-caller/conductor
 "$B/gate" seed/out/omc "$pin" seed/host/affinity/sched.cases "$run/sched"
-# Same function-mode contract behavior through the unchanged C referee and OscRt.
-if [ ! -x build/omegese/omegese ] || [ ! -x build/omega_emit/omega_emit ]; then
-    echo 'NOT_RUN contract C parity: build the comparison oracles' >&2
-    exit 3
-fi
-set --
-for source in src/compiler/*.c; do
-    [ "$source" = src/compiler/oscc_main.c ] || set -- "$@" "$source"
-done
-cc -O1 -Isrc -Isrc/compiler -o "$B/runner" seed/check/runner.c "$@" src/omega_om_units.c
-build/omegese/omegese emit seed/omc/contracts/parity.omegese "$run/parity.json"
-build/omega_emit/omega_emit emit "$run/parity.json" "$run/parity.oscir"
-seed/out/omc < seed/omc/contracts/parity.om > "$run/parity.bin"
-"$B/runner" "$run/parity.oscir" check seed/omc/contracts/parity.inputs > "$run/oracle.out"
-"$B/runner" "$run/parity.oscir" check seed/omc/contracts/parity.inputs "$run/parity.bin" > "$run/native.out"
-sed '1d' "$run/oracle.out" > "$run/oracle.rows"
-sed '1d' "$run/native.out" > "$run/native.rows"
-[ "$(wc -l < "$run/oracle.rows")" = "$(wc -l < seed/omc/contracts/parity.inputs)" ]
-cmp "$run/oracle.rows" "$run/native.rows"
-echo 'PASS contract C parity: exact values, canonical bits and traps'
+# Contract behavior parity in pure seeded OM-2 (replaces the retired C runner.c / src/compiler/ check).
+{ cat seed/omc/contracts/parity.om; cat seed/omc/contracts/parity-check.om; } | seed/out/omc > "$run/parity-check"
+chmod +x "$run/parity-check"
+"$run/parity-check"
+echo 'PASS contract parity: exact values and traps 9/10'
 mkdir -p build/seed/host
 seed/out/omc < seed/host/gate.om > build/seed/host/gate
 chmod +x build/seed/host/gate

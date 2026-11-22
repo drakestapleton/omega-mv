@@ -1,10 +1,9 @@
-# PD-1 evidence conversion tool (D7). Host only, no Python, no GPU.
-CC ?= cc
-CFLAGS ?= -std=c99 -O2 -Wall -Wextra -Werror
+# PD-1 evidence conversion tool (D7). Pure seeded OM-2, host only, no Python, no GPU.
+OMC ?= ../../../seed/out/omc
 OUT ?= $(CURDIR)/out
 all: pd1_convert
-pd1_convert: pd1_convert.c
-	$(CC) $(CFLAGS) -o $@ $<
+pd1_convert: pd1_convert.om
+	$(OMC) < $< > $@ && chmod +x $@
 # run: extract -> convert -> verify -> leak check. Never overwrites an existing stream.
 run: pd1_convert
 	mkdir -p $(OUT)

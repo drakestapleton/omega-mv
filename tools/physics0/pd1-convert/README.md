@@ -7,7 +7,7 @@ which is the PD-1 answer key for knob `q0`.
 
 - `extract.sh` reads the preserved evidence under `~/workspace/evidence-out` read-only and prints a TSV.
   No row is synthesised; unrecorded fields carry sentinels (255, 4294967295, INT64_MIN, -1).
-- `pd1_convert.c` writes the fixed-width `PD1REC1` stream (112 bytes per record, little-endian, SHA-256
+- `pd1_convert.om` writes the fixed-width `PD1REC1` stream (112 bytes per record, little-endian, SHA-256
   chain, refuses to overwrite) and a projection TSV with opaque column names; `--verify` recomputes the chain.
 - `leakcheck.sh` fails if the projection carries any forbidden token from the label-stripping checklist.
 - `make run` does extract -> convert -> verify -> leak check and prints per-source row counts.

@@ -1562,8 +1562,8 @@ test-prod-refuses-test-pieces: $(ARGUS_STAMP) $(AIENOS_CAP_LIB) $(RX_R13_HOST)
 # killed (no SIGKILL phase). The mutants rebuild the production host program
 # from mutated copies; the test must fail against each.
 RX_OPERATOR_CLI = $(OUT_DIR)/rx_operator
-$(RX_OPERATOR_CLI): tools/rx_operator.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) -o $@ tools/rx_operator.c
+$(RX_OPERATOR_CLI): tools/rx_operator.om seed/out/omc | $(OUT_DIR)
+	seed/out/omc < tools/rx_operator.om > $@ && chmod +x $@
 
 .PHONY: test-r16-operator-host test-r16-operator-silicon test-r16-operator-mutants
 test-r16-operator-host: $(RX_R13_HOST) $(RX_OPERATOR_CLI)

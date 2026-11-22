@@ -1,0 +1,356 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/sm121dis/sm121dis.om -- Omega's sm_121 disassembler on the command line (C6 of docs/OMEGA.md).
+note Composed after gpu/nvidia/om/disasm/sm121_dis.om (OM-1, no fn main in decoder).
+note Pure seeded-Omega replacement for tools/sm121dis/sm121dis.c.
+note
+note   sm121dis <code.bin>            a listing in nvdisasm's layout: the address in a comment, then TEXT ;
+note   sm121dis -b SM121 <code.bin>   the same, called the way the checks used to call nvdisasm
+note   sm121dis --pairs <code.bin>    one line per word: <addr> <lo hex> <hi hex> <text> ;
+note   sm121dis --version             names the tool, for the check logs
+note
+note Exit 0 when every word was a known form, 1 when some were not (printed "?? ..."), 2 for usage/file error.
+
+text cli_t_usage "usage: sm121dis [--pairs | -b SM121] <code.bin> | --version\n"
+text cli_t_verflag "--version"
+text cli_t_verout "sm121dis: Omega's own sm_121 disassembler (gpu/nvidia/om/disasm/sm121_dis.om)\n"
+text cli_t_pairs "--pairs"
+text cli_t_b "-b"
+text cli_t_sm121 "SM121"
+text cli_t_only "sm121dis: only -b SM121\n"
+text cli_t_open ": cannot open file\n"
+text cli_t_oom "sm121dis: out of memory\n"
+text cli_t_mod16 " is not a whole number of 16-byte words\n"
+text cli_t_pfx "sm121dis: "
+text cli_t_long "sm121dis: text too long\n"
+text cli_t_pad8 "        /*"
+text cli_t_cend "*/ "
+text cli_t_hex "0123456789abcdef"
+
+global cli_a1 uchar 4096
+global cli_a2 uchar 4096
+global cli_path uchar 4096
+global cli_code uchar *
+global cli_line uchar 512
+global cli_out uchar 65536
+global cli_olen ulong 1
+
+fn cli_wr_all fd int n ulong to bool
+  off = ulong 0
+  while lt off n bound 65536
+    k = write fd cli_out off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret false
+    end
+    off = add off ulong k
+  end
+  ret true
+end
+
+fn cli_flush to void
+  n = get cli_olen 0
+  if gt n 0
+    ok = cli_wr_all 1 n
+    put cli_olen 0 0
+  end
+end
+
+fn cli_oc c uchar to void
+  n = get cli_olen 0
+  if ge n 65536
+    cli_flush
+    n = ulong 0
+  end
+  put cli_out n c
+  put cli_olen 0 add n 1
+end
+
+fn cli_werr_a1 n ulong to void
+  off = ulong 0
+  while lt off n bound 4096
+    k = write 2 cli_path off sub n off
+    if eq k neg long 4
+      continue
+    end
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn cli_eq_a1_ver n ulong to bool
+  if ne n len cli_t_verflag
+    ret false
+  end
+  for i ulong len cli_t_verflag
+    if ne get cli_a1 i get cli_t_verflag i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn cli_eq_a1_pairs n ulong to bool
+  if ne n len cli_t_pairs
+    ret false
+  end
+  for i ulong len cli_t_pairs
+    if ne get cli_a1 i get cli_t_pairs i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn cli_eq_a1_b n ulong to bool
+  if ne n len cli_t_b
+    ret false
+  end
+  for i ulong len cli_t_b
+    if ne get cli_a1 i get cli_t_b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn cli_eq_a2_sm121 n ulong to bool
+  if ne n len cli_t_sm121
+    ret false
+  end
+  for i ulong len cli_t_sm121
+    if ne get cli_a2 i get cli_t_sm121 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn cli_ohex4 v ulong to void
+  if gt v 65535
+    n = ulong 5
+    for k ulong 11
+      if eq shr v mul n 4 0
+        break
+      end
+      n = add n 1
+    end
+    for k ulong n bound 16
+      sh = mul sub sub n 1 k 4
+      cli_oc get cli_t_hex and shr v sh 15
+    end
+    ret
+  end
+  for k ulong 4
+    sh = mul sub 3 k 4
+    cli_oc get cli_t_hex and shr v sh 15
+  end
+end
+
+fn cli_ohex16 v ulong to void
+  for k ulong 16
+    sh = mul sub 15 k 4
+    cli_oc get cli_t_hex and shr v sh 15
+  end
+end
+
+fn cli_word64 off ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    b = ulong get cli_code add off sub 7 i
+    v = or shl v 8 b
+  end
+  ret v
+end
+
+fn cli_pad_start clen ulong to ulong
+  endp = ulong 0
+  at = ulong 0
+  while le add at 16 clen bound 16777216
+    lo = cli_word64 at
+    if eq and lo 4095 2381
+      endp = add at 16
+    end
+    at = add at 16
+  end
+  ret endp
+end
+
+fn cli_read_file plen ulong to long
+  fd = fopen cli_path 0 plen 0 0
+  if lt fd 0
+    cli_werr_a1 plen
+    k = write 2 cli_t_open 0 len cli_t_open
+    ret neg long 1
+  end
+  cap = ulong 65536
+  eg = enlarge cli_code cap
+  if lt eg 0
+    cl = fclose int fd
+    k = write 2 cli_t_oom 0 len cli_t_oom
+    ret neg long 1
+  end
+  tot = ulong 0
+  while true bound 1048576
+    if eq tot cap
+      ncap = mul cap 2
+      eg2 = enlarge cli_code ncap
+      if lt eg2 0
+        cl = fclose int fd
+        k = write 2 cli_t_oom 0 len cli_t_oom
+        ret neg long 1
+      end
+      cap = ncap
+    end
+    k = read int fd cli_code tot sub cap tot
+    if eq k neg long 4
+      continue
+    end
+    if lt k 0
+      cl = fclose int fd
+      ret neg long 1
+    end
+    if eq k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  cl = fclose int fd
+  ret long tot
+end
+
+fn cli_emit_word off ulong pad ulong pairs ulong to int
+  tbuf = new uchar 256 0
+  lo = cli_word64 off
+  hi = cli_word64 add off 8
+  r = sm121_dis lo hi off edit tbuf
+  tn = and r 65535
+  ovf = and shr r 18 1
+  if or ne ovf 0 ge tn 256
+    ret neg int 1
+  end
+  isunk = and shr r 16 1
+  if eq pairs 1
+    cli_ohex4 off
+    cli_oc 32
+    cli_ohex16 lo
+    cli_oc 32
+    cli_ohex16 hi
+    cli_oc 32
+  else
+    for i ulong len cli_t_pad8
+      cli_oc get cli_t_pad8 i
+    end
+    cli_ohex4 off
+    for i ulong len cli_t_cend
+      cli_oc get cli_t_cend i
+    end
+  end
+  for i ulong tn bound 256
+    cli_oc get tbuf i
+  end
+  ispad = false
+  if ne pad 0
+    if ge off pad
+      ispad = true
+    end
+  end
+  if not ispad
+    cli_oc 32
+  end
+  cli_oc 59
+  cli_oc 10
+  if ne isunk 0
+    ret 1
+  end
+  ret 0
+end
+
+fn cli_emit_all clen ulong pairs ulong to int
+  pad = cli_pad_start clen
+  unk = ulong 0
+  put cli_olen 0 0
+  off = ulong 0
+  while lt off clen bound 16777216
+    rc = cli_emit_word off pad pairs
+    if lt rc 0
+      cli_flush
+      k = write 2 cli_t_long 0 len cli_t_long
+      ret 2
+    end
+    if gt rc 0
+      unk = add unk 1
+    end
+    off = add off 16
+  end
+  cli_flush
+  if ne unk 0
+    ret 1
+  end
+  ret 0
+end
+
+fn main to int
+  ac = argcnt
+  if eq ac 2
+    n1 = argread 1 cli_a1 0 4095
+    if lt n1 0
+      k = write 2 cli_t_usage 0 len cli_t_usage
+      ret 2
+    end
+    if cli_eq_a1_ver ulong n1
+      k = write 1 cli_t_verout 0 len cli_t_verout
+      ret 0
+    end
+  end
+  pairs = ulong 0
+  arch = ulong 0
+  if eq ac 3
+    n1 = argread 1 cli_a1 0 4095
+    if ge n1 0
+      if cli_eq_a1_pairs ulong n1
+        pairs = 1
+      end
+    end
+  end
+  if eq ac 4
+    n1 = argread 1 cli_a1 0 4095
+    n2 = argread 2 cli_a2 0 4095
+    if and ge n1 0 ge n2 0
+      if cli_eq_a1_b ulong n1
+        if not cli_eq_a2_sm121 ulong n2
+          k = write 2 cli_t_only 0 len cli_t_only
+          ret 2
+        end
+        arch = 1
+      end
+    end
+  end
+  want = add 2 add pairs mul 2 arch
+  if ne ulong ac want
+    k = write 2 cli_t_usage 0 len cli_t_usage
+    ret 2
+  end
+  plen = argread sub ulong ac 1 cli_path 0 4095
+  if le plen 0
+    k = write 2 cli_t_usage 0 len cli_t_usage
+    ret 2
+  end
+  flen = cli_read_file ulong plen
+  if lt flen 0
+    ret 2
+  end
+  clen = ulong flen
+  if ne rem clen 16 0
+    k = write 2 cli_t_pfx 0 len cli_t_pfx
+    cli_werr_a1 ulong plen
+    k = write 2 cli_t_mod16 0 len cli_t_mod16
+    ret 2
+  end
+  ret cli_emit_all clen pairs
+end

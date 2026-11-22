@@ -62,13 +62,12 @@ m19r_fail() {
     return 1
 }
 
-# Build tools/json_canon.c into a private directory (not build/, which the
+# Build tools/json_canon.om into a private directory (not build/, which the
 # qualification's `make clean` removes). Sets JSON_CANON.
 m19r_build_canon() {
     M19R_TMP=$(mktemp -d "${TMPDIR:-/tmp}/m19r-qualify.XXXXXX") || return 1
     JSON_CANON=$M19R_TMP/json_canon
-    gcc -std=gnu11 -O2 -Wall -Wextra -Werror -I"$M19R_OMEGA/src" -o "$JSON_CANON" \
-        "$M19R_OMEGA/tools/json_canon.c" "$M19R_OMEGA/src/omega_om_units.c" -lm
+    "$M19R_OMEGA/seed/out/omc" < "$M19R_OMEGA/tools/json_canon.om" > "$JSON_CANON" && chmod +x "$JSON_CANON"
 }
 
 # JSON string literal for arbitrary text.

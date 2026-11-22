@@ -1,4 +1,4 @@
-# C6 of docs/OMEGA.md: Omega's own sm_121 disassembler (src/omega_sm121_disasm.c, tools/sm121dis/).
+# C6 of docs/OMEGA.md: Omega's own sm_121 disassembler (gpu/nvidia/om/disasm/sm121_dis.om, tools/sm121dis/sm121dis.om).
 #   make test-sm121dis   collect every kernel the library builds (no GPU), compare our text with nvdisasm's, word by word;
 #                        then the red check: a decoder built with one deliberate fault must FAIL the same comparison.
 # Picked up by the `-include mk/*.mk` line of the Makefile. The test binaries are named as files, not through the
@@ -7,12 +7,12 @@ SM121DIS = $(OUT_DIR)/sm121dis
 SM121DIS_RED = $(OUT_DIR)/sm121dis_red
 SM121DIS_K = $(OUT_DIR)/sm121dis-kernels
 
-$(SM121DIS): tools/sm121dis/sm121dis.c src/omega_sm121_disasm.c src/omega_sm121_disasm.h
+$(SM121DIS): gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om seed/out/omc
 	@mkdir -p $(OUT_DIR)
-	$(CC) -std=gnu11 -Wall -Wextra -Werror -O2 -Isrc -o $@ tools/sm121dis/sm121dis.c src/omega_sm121_disasm.c
-$(SM121DIS_RED): tools/sm121dis/sm121dis.c src/omega_sm121_disasm.c src/omega_sm121_disasm.h
+	cat gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om | seed/out/omc > $@ && chmod +x $@
+$(SM121DIS_RED): gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om seed/out/omc
 	@mkdir -p $(OUT_DIR)
-	$(CC) -std=gnu11 -Wall -Wextra -Werror -O2 -DSM121DIS_MUTANT=1 -Isrc -o $@ tools/sm121dis/sm121dis.c src/omega_sm121_disasm.c
+	{ cat gpu/nvidia/om/disasm/sm121_dis.om; sed 's/cli_oc get tbuf i/cli_oc xor get tbuf i 1/' tools/sm121dis/sm121dis.om; } | seed/out/omc > $@ && chmod +x $@
 
 sm121dis-corpus-bins: $(addprefix $(OUT_DIR)/,gpu_matmul_api_test gpu_elementwise_test gpu_reconv_test gpu_attention_test \
 	gpu_moe_window_test gpu_fp8_api_test gpu_decode_attn_test gpu_router_test gpu_bf16_gemv_test gpu_tern_test gpu_fp8gemm_test \
@@ -40,9 +40,9 @@ test-sm121dis: $(SM121DIS) $(SM121DIS_RED) sm121dis-corpus-bins test-sm121dis-co
 # The provenance checks (tools/divsqrt_nvdisasm_check.sh, tools/ldst_nvdisasm_check.sh, test-numeric-reduce-nvdisasm)
 # call build/sm121dis by that name, whatever OUT_DIR is.
 ifneq ($(OUT_DIR),build)
-build/sm121dis: tools/sm121dis/sm121dis.c src/omega_sm121_disasm.c src/omega_sm121_disasm.h
+build/sm121dis: gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om seed/out/omc
 	@mkdir -p build
-	$(CC) -std=gnu11 -Wall -Wextra -Werror -O2 -Isrc -o $@ tools/sm121dis/sm121dis.c src/omega_sm121_disasm.c
+	cat gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om | seed/out/omc > $@ && chmod +x $@
 endif
 
 # ZERO-NVDISASM (bar C6, second half: nothing calls nvdisasm). tools/sm121dis/zero_nvdisasm.sh runs every listing and
