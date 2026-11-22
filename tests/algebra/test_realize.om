@@ -1,0 +1,588 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 MA-2 correctness gate (all 10 realizations + selector tie rule).
+note Replaces tests/algebra/test_realize.c.
+note Concatenated after src/algebra/oma_lib.om + src/algebra/realize.om.
+
+global r_chk ulong 2
+global r_rng ulong 1
+
+note Selector test table (up to 32 rows; rz ids are 0..9, 0=R1_plain, 1=R1_sdot, 3=R1_smmla, 6=R2c_crumb, 8=R4_rns)
+global st_nruns int 1
+global st_nrows ulong 1
+global st_run int 32
+global st_rz ulong 32
+global st_ver int 32
+global st_med f64 32
+global st_noise f64 32
+
+note Decision outputs
+global sd_chosen ulong 1
+global sd_cheapest ulong 1
+global sd_runner ulong 1
+global sd_chosen_ns f64 1
+global sd_tie int 1
+global sd_res int 1
+global sd_ntie ulong 1
+global sd_tset ulong 16
+global sc_elig int 10
+global sc_cost f64 10
+global sc_wn f64 10
+global sc_cn f64 10
+
+const SEL_RES_NONE int 0
+const SEL_RES_INCUMBENT int 1
+const SEL_RES_REFERENCE int 2
+const SEL_RES_CHEAPEST int 3
+const SEL_NO_INC ulong 99
+
+text r_hdr_p "MA2 test-realize PASS: "
+text r_hdr_f "MA2 test-realize FAIL: "
+text r_chk_s " checks, "
+text r_rz_s " failures, 10 realizations\n"
+
+fn rchk ok bool to void
+  put r_chk 0 add get r_chk 0 1
+  if not ok
+    put r_chk 1 add get r_chk 1 1
+  end
+end
+
+fn rrnd to ulong
+  s = add get r_rng 0 0x9e3779b97f4a7c15
+  put r_rng 0 s
+  z = mul xor s shr s 30 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+fn rrnd01 to f64
+  ret mul f64 shr rrnd 11 div 1.0f64 9007199254740992.0f64
+end
+
+fn r_fill_w cnt ulong wk int sp f64 to void
+  for i ulong cnt bound 262144
+    if eq wk 1
+      put rz_w i byte 0
+    else
+      if eq wk 2
+        put rz_w i byte 1
+      else
+        if eq wk 3
+          put rz_w i byte -1
+        else
+          if lt rrnd01 sp
+            put rz_w i byte 0
+          else
+            if eq and rrnd 1 1
+              put rz_w i byte 1
+            else
+              put rz_w i byte -1
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+fn r_fill_x n ulong xk int to void
+  for j ulong n bound 131072
+    if eq xk 1
+      put rz_x j byte -128
+    else
+      if eq xk 2
+        put rz_x j byte 127
+      else
+        if eq xk 3
+          if eq and j 1 1
+            put rz_x j byte 127
+          else
+            put rz_x j byte -128
+          end
+        else
+          if eq xk 4
+            put rz_x j byte 0
+          else
+            rb = and rrnd 255
+            if ge rb 128
+              put rz_x j byte sub int rb 256
+            else
+              put rz_x j byte rb
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+fn check_oracle_lib_row i ulong n ulong xloc view byte * to void
+  row = new byte 4099 0
+  blk = new ulong 130 0
+  d = new int 1 0
+  nb = oma_bitplane_blocks n
+  base = mul i n
+  for j ulong n bound 5000
+    put row j get rz_w add base j
+  end
+  rchk eq oma_pack_bitplane row n blk nb OMA_OK
+  rc = oma_dot_tw_i8 blk xloc n d
+  rchk and eq rc OMA_OK eq get d 0 get rz_yref i
+end
+
+fn check_oracle_vs_lib m ulong n ulong to void
+  if gt n 4099
+    ret
+  end
+  xloc = new byte 4099 0
+  for j ulong n bound 5000
+    put xloc j get rz_x j
+  end
+  for i ulong m bound 128
+    check_oracle_lib_row i n xloc
+  end
+end
+
+fn check_d5_lane row_off ulong bv int col0 ulong n ulong to ulong
+  t5 = new byte 5 0
+  if ne oma_dense_byte_decode bv t5 OMA_OK
+    ret 1
+  end
+  bad = ulong 0
+  for k ulong 5
+    col = add col0 mul 16 k
+    want = int 0
+    if lt col n
+      want = int get rz_w add row_off col
+    end
+    if ne int get t5 k want
+      bad = add bad 1
+    end
+  end
+  ret bad
+end
+
+fn check_d5_chunk i ulong c ulong n ulong rb ulong to ulong
+  row_off = mul i n
+  base_c = add mul i rb mul c 16
+  cbase = mul c 80
+  bad = ulong 0
+  for j ulong 16
+    bv = int get rz_mem add base_c j
+    bad = add bad check_d5_lane row_off bv add cbase j n
+  end
+  ret bad
+end
+
+fn check_dense5_decode m ulong n ulong to void
+  chunks = div add n 79 80
+  rb = mul chunks 16
+  bad = ulong 0
+  for i ulong m bound 128
+    for c ulong chunks bound 2048
+      bad = add bad check_d5_chunk i c n rb
+    end
+  end
+  rchk eq bad 0
+end
+
+fn run_one_rz rid ulong m ulong n ulong to void
+  rc = oma_rz_pack_g rid m n
+  if gt n oma_rz_max_n rid
+    rchk eq rc OMA_RZ_E_ARG
+    ret
+  end
+  rchk eq rc OMA_RZ_OK
+  if ne rc OMA_RZ_OK
+    ret
+  end
+  for i ulong m bound 1024
+    put rz_y i 0x5a5a5a5a
+  end
+  for rep ulong 2
+    rchk eq oma_rz_run_g OMA_RZ_OK
+    bad = ulong 0
+    for i ulong m bound 1024
+      if ne get rz_y i get rz_yref i
+        bad = add bad 1
+      end
+    end
+    rchk eq bad 0
+  end
+  wb = get rz_plan 2
+  fp = get rz_plan 3
+  rchk and gt wb 0 ge fp wb
+  if eq rid RZ_R5_DENSE5
+    check_dense5_decode m n
+  end
+end
+
+fn run_case m ulong n ulong wk int sp f64 xk int lib_chk int to void
+  r_fill_w mul m n wk sp
+  r_fill_x n xk
+  rchk eq oma_rz_oracle_g m n OMA_RZ_OK
+  if ne lib_chk 0
+    check_oracle_vs_lib m n
+  end
+  for rid ulong OMA_RZ_COUNT
+    run_one_rz rid m n
+  end
+end
+
+fn test_rejections to void
+  put rz_w 0 byte 1
+  put rz_w 1 byte 0
+  put rz_w 2 byte -1
+  put rz_w 3 byte 2
+  put rz_w 4 byte 0
+  put rz_w 5 byte 1
+  for rid ulong OMA_RZ_COUNT
+    put rz_w 3 byte 2
+    rchk eq oma_rz_pack_g rid 2 3 OMA_RZ_E_TRIT
+    put rz_w 3 byte -2
+    rchk eq oma_rz_pack_g rid 2 3 OMA_RZ_E_TRIT
+    put rz_w 3 byte -128
+    rchk eq oma_rz_pack_g rid 2 3 OMA_RZ_E_TRIT
+    put rz_w 3 byte 2
+    rchk eq oma_rz_pack_g rid 0 3 OMA_RZ_E_ARG
+    rchk eq oma_rz_pack_g rid 2 0 OMA_RZ_E_ARG
+    rchk eq oma_rz_pack_g rid 1 add OMA_RZ_MAX_N 1 OMA_RZ_E_ARG
+    rchk le oma_rz_max_n rid OMA_RZ_MAX_N
+    put rz_plan 5 0
+    rchk eq oma_rz_run_g OMA_RZ_E_ARG
+  end
+  rchk le mul long 128 long OMA_RZ_MAX_N long 2147483647
+  rchk gt mul long 128 add long OMA_RZ_MAX_N 1 long 2147483647
+end
+
+note ---- selector tie rule (ADR 0019 section 9.1) ----
+
+fn sel_reset nruns int to void
+  put st_nruns 0 nruns
+  put st_nrows 0 ulong 0
+end
+
+fn sel_row run int rz ulong med f64 noise f64 to void
+  idx = get st_nrows 0
+  put st_run idx run
+  put st_rz idx rz
+  put st_ver idx 1
+  put st_med idx med
+  put st_noise idx noise
+  put st_nrows 0 add idx 1
+end
+
+fn sel_in_tset rz ulong to bool
+  nt = get sd_ntie 0
+  for i ulong nt bound 16
+    if eq get sd_tset i rz
+      ret true
+    end
+  end
+  ret false
+end
+
+fn sel_eval_cand k ulong to void
+  nr = get st_nrows 0
+  seen = int 0
+  bad = int 0
+  sumc = 0.0f64
+  lo = 1000000000.0f64
+  hi = 0.0f64
+  wn = 0.0f64
+  for i ulong nr bound 64
+    if eq get st_rz i k
+      if eq get st_ver i 0
+        bad = 1
+      else
+        c = get st_med i
+        sumc = add sumc c
+        if lt c lo
+          lo = c
+        end
+        if gt c hi
+          hi = c
+        end
+        nz = get st_noise i
+        if gt nz wn
+          wn = nz
+        end
+        seen = add seen 1
+      end
+    end
+  end
+  if or ne bad 0 eq seen 0
+    put sc_elig k 0
+    ret
+  end
+  mean = div sumc f64 seen
+  put sc_elig k 1
+  put sc_cost k mean
+  put sc_wn k wn
+  if gt seen 1
+    put sc_cn k div sub hi lo mean
+  else
+    put sc_cn k 0.0f64
+  end
+end
+
+fn sel_find_top dst edit ulong 2 to void
+  w = int -1
+  u = int -1
+  for k ulong OMA_RZ_COUNT
+    if ne get sc_elig k 0
+      ck = get sc_cost k
+      if lt w 0
+        w = int k
+      else
+        if lt ck get sc_cost ulong w
+          u = w
+          w = int k
+        else
+          if lt u 0
+            u = int k
+          else
+            if lt ck get sc_cost ulong u
+              u = int k
+            end
+          end
+        end
+      end
+    end
+  end
+  put dst 0 ulong w
+  put dst 1 ulong u
+end
+
+fn sel_decide inc ulong to void
+  for k ulong OMA_RZ_COUNT
+    sel_eval_cand k
+  end
+  top2 = new ulong 2 0
+  sel_find_top top2
+  wu = get top2 0
+  uu = get top2 1
+  put sd_chosen 0 wu
+  put sd_cheapest 0 wu
+  put sd_runner 0 uu
+  put sd_chosen_ns 0 get sc_cost wu
+  put sd_res 0 SEL_RES_NONE
+  band = get sc_wn wu
+  if gt get sc_wn uu band
+    band = get sc_wn uu
+  end
+  if gt get sc_cn wu band
+    band = get sc_cn wu
+  end
+  if gt get sc_cn uu band
+    band = get sc_cn uu
+  end
+  cw = get sc_cost wu
+  put sd_tset 0 wu
+  nt = ulong 1
+  for k ulong OMA_RZ_COUNT
+    if and ne get sc_elig k 0 ne k wu
+      if le div sub get sc_cost k cw cw band
+        put sd_tset nt k
+        nt = add nt 1
+      end
+    end
+  end
+  put sd_ntie 0 nt
+  if le nt 1
+    put sd_tie 0 0
+    ret
+  end
+  put sd_tie 0 1
+  if and ne inc SEL_NO_INC sel_in_tset inc
+    put sd_chosen 0 inc
+    put sd_chosen_ns 0 get sc_cost inc
+    put sd_res 0 SEL_RES_INCUMBENT
+  else
+    if sel_in_tset RZ_R1_PLAIN
+      put sd_chosen 0 RZ_R1_PLAIN
+      put sd_chosen_ns 0 get sc_cost RZ_R1_PLAIN
+      put sd_res 0 SEL_RES_REFERENCE
+    else
+      put sd_res 0 SEL_RES_CHEAPEST
+    end
+  end
+end
+
+fn sel_expect tie int chosen ulong res int to void
+  rchk and eq get sd_tie 0 tie and eq get sd_chosen 0 chosen eq get sd_res 0 res
+  rchk sel_in_tset get sd_chosen 0
+  if gt get sd_ntie 0 1
+    rchk eq get sd_tie 0 1
+  else
+    rchk eq get sd_tie 0 0
+  end
+end
+
+fn test_selector_tie_rule to void
+  sel_reset 1
+  sel_row 0 RZ_R1_SDOT 100.0f64 0.05f64
+  sel_row 0 RZ_R1_SMMLA 101.0f64 0.05f64
+  sel_row 0 RZ_R1_PLAIN 300.0f64 0.05f64
+  sel_decide SEL_NO_INC
+  rchk and eq get sd_cheapest 0 RZ_R1_SDOT eq get sd_runner 0 RZ_R1_SMMLA
+  sel_expect 1 RZ_R1_SDOT SEL_RES_CHEAPEST
+  rchk and eq get sd_ntie 0 2 and sel_in_tset RZ_R1_SDOT and sel_in_tset RZ_R1_SMMLA not sel_in_tset RZ_R1_PLAIN
+  rchk eq get sd_chosen_ns 0 100.0f64
+  sel_decide RZ_R1_SMMLA
+  sel_expect 1 RZ_R1_SMMLA SEL_RES_INCUMBENT
+  rchk eq get sd_chosen_ns 0 101.0f64
+  sel_decide RZ_R1_SDOT
+  sel_expect 1 RZ_R1_SDOT SEL_RES_INCUMBENT
+  sel_decide RZ_R1_PLAIN
+  sel_expect 1 RZ_R1_SDOT SEL_RES_CHEAPEST
+  sel_decide RZ_R4_RNS
+  sel_expect 1 RZ_R1_SDOT SEL_RES_CHEAPEST
+
+  sel_reset 1
+  sel_row 0 RZ_R1_SDOT 100.0f64 0.05f64
+  sel_row 0 RZ_R1_SMMLA 101.0f64 0.05f64
+  sel_row 0 RZ_R1_PLAIN 103.0f64 0.05f64
+  sel_row 0 RZ_R2C_CRUMB 200.0f64 0.05f64
+  sel_decide SEL_NO_INC
+  sel_expect 1 RZ_R1_PLAIN SEL_RES_REFERENCE
+  rchk and eq get sd_ntie 0 3 not sel_in_tset RZ_R2C_CRUMB
+  rchk eq get sd_chosen_ns 0 103.0f64
+  sel_decide RZ_R1_SMMLA
+  sel_expect 1 RZ_R1_SMMLA SEL_RES_INCUMBENT
+  sel_decide RZ_R2C_CRUMB
+  sel_expect 1 RZ_R1_PLAIN SEL_RES_REFERENCE
+
+  sel_reset 1
+  sel_row 0 RZ_R1_SDOT 100.0f64 0.01f64
+  sel_row 0 RZ_R1_SMMLA 150.0f64 0.01f64
+  sel_row 0 RZ_R1_PLAIN 300.0f64 0.01f64
+  sel_decide RZ_R1_PLAIN
+  sel_expect 0 RZ_R1_SDOT SEL_RES_NONE
+  rchk and eq get sd_ntie 0 1 and sel_in_tset RZ_R1_SDOT not sel_in_tset RZ_R1_SMMLA
+
+  sel_reset 1
+  sel_row 0 RZ_R1_SDOT 100.0f64 0.05f64
+  sel_row 0 RZ_R1_SMMLA 101.0f64 0.05f64
+  sel_decide SEL_NO_INC
+  sel_expect 1 RZ_R1_SDOT SEL_RES_CHEAPEST
+
+  sel_reset 2
+  sel_row 0 RZ_R1_SDOT 100.0f64 0.05f64
+  sel_row 0 RZ_R1_SMMLA 101.0f64 0.05f64
+  sel_row 0 RZ_R1_PLAIN 102.0f64 0.05f64
+  sel_row 1 RZ_R1_SDOT 100.0f64 0.05f64
+  sel_row 1 RZ_R1_SMMLA 101.0f64 0.05f64
+  sel_row 1 RZ_R1_PLAIN 102.0f64 0.05f64
+  put st_ver 5 0
+  sel_decide SEL_NO_INC
+  sel_expect 1 RZ_R1_SDOT SEL_RES_CHEAPEST
+  rchk not sel_in_tset RZ_R1_PLAIN
+
+  sel_reset 2
+  sel_row 0 RZ_R1_SDOT 100.0f64 0.001f64
+  sel_row 0 RZ_R1_SMMLA 104.0f64 0.001f64
+  sel_row 0 RZ_R1_PLAIN 300.0f64 0.001f64
+  sel_row 1 RZ_R1_SDOT 104.0f64 0.001f64
+  sel_row 1 RZ_R1_SMMLA 100.0f64 0.001f64
+  sel_row 1 RZ_R1_PLAIN 300.0f64 0.001f64
+  sel_decide SEL_NO_INC
+  rchk and eq get sd_tie 0 1 eq get sd_ntie 0 2
+  rchk and ne get sd_chosen 0 RZ_R1_PLAIN eq get sd_res 0 SEL_RES_CHEAPEST
+  rchk sel_in_tset get sd_chosen 0
+end
+
+fn run_structured_grid to void
+  ns = new ulong 23 0
+  put ns 0 1
+  put ns 1 2
+  put ns 2 3
+  put ns 3 4
+  put ns 4 5
+  put ns 5 7
+  put ns 6 15
+  put ns 7 16
+  put ns 8 17
+  put ns 9 31
+  put ns 10 32
+  put ns 11 33
+  put ns 12 63
+  put ns 13 64
+  put ns 14 65
+  put ns 15 79
+  put ns 16 80
+  put ns 17 81
+  put ns 18 127
+  put ns 19 128
+  put ns 20 129
+  put ns 21 255
+  put ns 22 257
+  ms = new ulong 8 0
+  put ms 0 1
+  put ms 1 2
+  put ms 2 3
+  put ms 3 4
+  put ms 4 7
+  put ms 5 15
+  put ms 6 16
+  put ms 7 17
+  sps = new f64 5 0.0f64
+  put sps 0 0.0f64
+  put sps 1 0.3f64
+  put sps 2 0.6f64
+  put sps 3 0.9f64
+  put sps 4 1.0f64
+  for a ulong 23
+    for b ulong 8
+      mv = get ms b
+      nv = get ns a
+      run_case mv nv 1 0.0f64 0 0
+      run_case mv nv 2 0.0f64 1 0
+      run_case mv nv 2 0.0f64 2 0
+      run_case mv nv 3 0.0f64 1 0
+      run_case mv nv 3 0.0f64 2 0
+      run_case mv nv 0 get sps rem add a b 5 3 1
+      run_case mv nv 0 get sps rem add mul a 3 b 5 0 1
+    end
+  end
+end
+
+fn main to int
+  put r_rng 0 ulong 0x4d41332d7265616c
+  test_rejections
+  run_structured_grid
+  for it ulong 100
+    n = add 1 rem rrnd 1200
+    m = add 1 rem rrnd 40
+    xk = int rem rrnd 5
+    lc = int 0
+    if eq rem it 4 0
+      lc = 1
+    end
+    run_case m n 0 rrnd01 xk lc
+  end
+  run_case 5 16384 3 0.0f64 1 0
+  run_case 5 16384 2 0.0f64 1 0
+  run_case 3 64512 3 0.0f64 1 0
+  run_case 3 64512 2 0.0f64 1 0
+  run_case 2 64513 3 0.0f64 1 0
+  run_case 2 65536 0 0.5f64 0 0
+  run_case 2 65537 3 0.0f64 1 0
+  run_case 1 100003 3 0.0f64 1 0
+  run_case 17 4099 0 0.97f64 0 1
+  test_selector_tie_rule
+
+  if eq get r_chk 1 0
+    oma_put_str r_hdr_p
+  else
+    oma_put_str r_hdr_f
+  end
+  oma_put_u64 1 get r_chk 0
+  oma_put_str r_chk_s
+  oma_put_u64 1 get r_chk 1
+  oma_put_str r_rz_s
+  if eq get r_chk 1 0
+    ret 0
+  end
+  ret 1
+end
