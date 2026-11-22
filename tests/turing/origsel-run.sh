@@ -87,9 +87,9 @@ build origsel "$N/origsel.om" "$N/origselmain.om" || fail "compile origsel"
 build origsel-test "$N/origsel.om" "$ROOT/tests/turing/origsel-test.om" || fail "compile origsel-test"
 E=$BUILD/origsel.elf
 note "origsel_elf_sha256=$(sha256sum "$E" | cut -c1-64) origsel_om_sha256=$(sha256sum "$N/origsel.om" | cut -c1-64)"
-make -s -C "$ROOT/tools/turing_origsel_indep" CC="${CC:-cc}" origsel_indep > "$OUT/indep.build" 2>&1 || fail "build recomputer"
+make -s -C "$ROOT/tools/turing_origsel_indep" OMC="$OMC" origsel_indep > "$OUT/indep.build" 2>&1 || fail "build recomputer"
 IND=$ROOT/tools/turing_origsel_indep/origsel_indep
-note "indep_sha256=$(sha256sum "$IND" | cut -c1-64) indep_src_sha256=$(sha256sum "$ROOT/tools/turing_origsel_indep/origsel_indep.c" | cut -c1-64)"
+note "indep_sha256=$(sha256sum "$IND" | cut -c1-64) indep_src_sha256=$(sha256sum "$ROOT/tools/turing_origsel_indep/origsel_indep.om" | cut -c1-64)"
 TCC=$(awk '$1 == "tool" && $2 == "turing-coder" {print $3}' "$PIN")
 mkdir -p "$BUILD/tc" && git -C "$ROOT" archive "$TCC" src | tar -x -C "$BUILD/tc" || fail "export turing-coder $TCC"
 (cd "$BUILD/tc" && ${CC:-cc} -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -o turing-coder \
@@ -325,7 +325,7 @@ if [ "$MODE" = measure ]; then
   QS=$ROOT/evidence/TURING-ORIGSEL/qualify/summary.txt
   [ "$(tail -n 1 "$QS" 2> /dev/null)" = ORIGSEL_QUALIFY_PASS ] || blocked "qualification receipt not PASS"
   grep -q "origsel_om_sha256=$(sha256sum "$N/origsel.om" | cut -c1-64)" "$QS" || blocked "evaluator differs from the qualified one"
-  grep -q "indep_src_sha256=$(sha256sum "$ROOT/tools/turing_origsel_indep/origsel_indep.c" | cut -c1-64)" "$QS" || blocked "recomputer differs from the qualified one"
+  grep -q "indep_src_sha256=$(sha256sum "$ROOT/tools/turing_origsel_indep/origsel_indep.om" | cut -c1-64)" "$QS" || blocked "recomputer differs from the qualified one"
   grep -q "origsel_elf_sha256=$(sha256sum "$E" | cut -c1-64)" "$QS" || blocked "evaluator binary differs from the qualified one"
   # V1 = exactly the two pinned v1 files, in order (profile burned_exclusion).
   set -- ${V1:-}
