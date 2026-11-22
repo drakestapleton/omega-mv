@@ -1,0 +1,1023 @@
+note SPDX-License-Identifier: Apache-2.0
+note Lane D independent scorer for EXP-001: core formats and arithmetic in pure seeded OM-2.
+
+global g_ub_q16 long 65537
+global g_io64k uchar 65536
+
+note TYM0 model storage (pack 4 ushorts per ulong in rows0..rows3 -> supports K <= 16)
+global g_m_meta ulong 16
+global g_m_def ushort 16
+global g_m_fsha uchar 32
+global g_m_mdig uchar 32
+global g_m_keys ulong *
+global g_m_rows0 ulong *
+global g_m_rows1 ulong *
+global g_m_rows2 ulong *
+global g_m_rows3 ulong *
+global g_m_msg uchar 256
+global g_m_msglen ulong 1
+global g_br_st ulong 4
+
+note CTR1 events flat storage across up to 16 files
+global g_ev_sym uchar *
+global g_ev_op uchar *
+global g_ev_depth uchar *
+global g_ev_first uchar *
+global g_ev_evidx uint *
+global g_ev_total ulong 1
+global g_f_evoff ulong 16
+global g_f_evn ulong 16
+global g_f_crumbs ulong 16
+global g_f_gaps ulong 16
+global g_f_bytes ulong 16
+global g_f_sha uchar 512
+
+note Coded artifact buffers and decoder state
+global g_tcr uchar *
+global g_tca uchar *
+global g_rdec ulong 5
+global g_adec ulong 4
+
+note RNG state
+global g_rng_st ulong 1
+
+note Environment scratch
+global g_env_buf uchar 256
+
+text t_ymodel_tag "turing.ymodel.v0"
+text t_exp_prefix "EXP_ID="
+text t_exp001 "EXP-001"
+text t_exp001r "EXP-001R"
+text t_nl "\n"
+
+note ================= I/O & formatting helpers =================
+
+fn wr_all fd int buf view uchar * off ulong n ulong to long
+  p = ulong 0
+  while lt p n bound 100000000
+    k = write fd buf add off p sub n p
+    if le k long 0
+      ret long -1
+    end
+    p = add p ulong k
+  end
+  ret long n
+end
+
+fn wr_str fd int s view uchar * to void
+  _w = wr_all fd s ulong 0 len s
+end
+
+fn wr_u64 fd int v ulong to void
+  buf = new uchar 32 0
+  if eq v ulong 0
+    put buf 0 uchar 48
+    _w = wr_all fd buf ulong 0 ulong 1
+    ret
+  end
+  n = ulong 0
+  cur = v
+  while gt cur ulong 0 bound 32
+    d = rem cur ulong 10
+    put buf n uchar add ulong 48 d
+    cur = div cur ulong 10
+    n = add n 1
+  end
+  dst = new uchar 32 0
+  i = ulong 0
+  while lt i n bound 32
+    put dst i get buf sub sub n 1 i
+    i = add i 1
+  end
+  _w = wr_all fd dst ulong 0 n
+end
+
+fn wr_i64 fd int v long to void
+  dash = new uchar 1 45
+  if lt v long 0
+    _w = wr_all fd dash ulong 0 ulong 1
+    note handle INT64_MIN safely
+    uv = sub ulong 0 bitcast ulong v
+    wr_u64 fd uv
+  else
+    wr_u64 fd ulong v
+  end
+end
+
+fn buf_eq a view uchar * b view uchar * n ulong to bool
+  i = ulong 0
+  while lt i n bound 1000000
+    if ne get a i get b i
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+note ================= 128-bit squaring & ideal length =================
+
+fn mul64_hi a ulong b ulong to ulong
+  al = and a ulong 0xffffffff
+  ah = shr a 32
+  bl = and b ulong 0xffffffff
+  bh = shr b 32
+  p1 = mul al bh
+  p2 = mul ah bl
+  mid = add add shr mul al bl 32 and p1 ulong 0xffffffff and p2 ulong 0xffffffff
+  ret add add mul ah bh shr p1 32 add shr p2 32 shr mid 32
+end
+
+fn sq_shr62 m ulong to ulong
+  hi = mul64_hi m m
+  lo = mul m m
+  ret or shl hi 2 shr lo 62
+end
+
+fn clz32_pos q uint to ulong
+  ip = ulong 0
+  v = q
+  while gt v uint 1 bound 32
+    v = shr v 1
+    ip = add ip 1
+  end
+  ret ip
+end
+
+fn is_log2_q32 q uint to ulong
+  ip = clz32_pos q
+  m = shl ulong q sub ulong 62 ip
+  frac = ulong 0
+  msb = shl ulong 1 63
+  i = ulong 1
+  while le i 32 bound 32
+    m = sq_shr62 m
+    if ge m msb
+      frac = or frac shl ulong 1 sub ulong 32 i
+      m = shr m 1
+    end
+    i = add i 1
+  end
+  ret or shl ip 32 frac
+end
+
+fn is_ub_table_init to void
+  put g_ub_q16 0 long -1
+  q = uint 1
+  while le q uint 65536 bound 65537
+    x = sub shl ulong 16 32 is_log2_q32 q
+    v = shr add mul x ulong 1000000 shl ulong 1 31 32
+    put g_ub_q16 ulong q long v
+    q = add q 1
+  end
+end
+
+note ================= TYM0 streaming bit reader & loader =================
+
+fn feat_bit j ulong to ulong
+  if eq j 0
+    ret ulong 1
+  end
+  if eq j 1
+    ret ulong 2
+  end
+  if eq j 2
+    ret ulong 4
+  end
+  if eq j 3
+    ret ulong 8
+  end
+  if eq j 4
+    ret ulong 16
+  end
+  if eq j 5
+    ret ulong 64
+  end
+  if eq j 6
+    ret ulong 128
+  end
+  ret ulong 32
+end
+
+fn feat_radix j ulong k ulong to ulong
+  if eq j 0
+    ret ulong 16
+  end
+  if eq j 1
+    ret ulong 8
+  end
+  if eq j 7
+    ret shl ulong 1 36
+  end
+  ret add k 1
+end
+
+fn br_refill fd int to long
+  r = read fd g_io64k ulong 0 ulong 65536
+  if le r long 0
+    ret r
+  end
+  ur = ulong r
+  i = ulong 0
+  while lt i ur bound 65536
+    b = get g_io64k i
+    sha_upd_byte ulong 0 b
+    sha_upd_byte ulong 1 b
+    i = add i 1
+  end
+  put g_br_st 0 ulong 0
+  put g_br_st 1 mul ur 8
+  put g_br_st 2 add get g_br_st 2 ur
+  ret r
+end
+
+fn br_getbits fd int w ulong to ulong
+  v = ulong 0
+  i = ulong 0
+  while lt i w bound 64
+    bpos = get g_br_st 0
+    blen = get g_br_st 1
+    if ge bpos blen
+      r = br_refill fd
+      if le r long 0
+        put g_br_st 3 ulong 1
+        ret ulong 0
+      end
+      bpos = ulong 0
+    end
+    by = get g_io64k shr bpos 3
+    bit = and ulong shr by sub ulong 7 and bpos 7 ulong 1
+    v = or shl v 1 bit
+    put g_br_st 0 add bpos 1
+    i = add i 1
+  end
+  ret v
+end
+
+fn br_drain fd int to void
+  done = false
+  while not done bound 100000000
+    r = br_refill fd
+    if le r long 0
+      done = true
+    end
+  end
+end
+
+fn set_m_msg s view uchar * to void
+  n = len s
+  if gt n 255
+    n = ulong 255
+  end
+  i = ulong 0
+  while lt i n bound 256
+    put g_m_msg i get s i
+    i = add i 1
+  end
+  put g_m_msglen 0 n
+end
+
+fn m_row_put ridx ulong j ulong val ushort to void
+  slot = div j 4
+  sh = mul rem j 4 16
+  u = shl ulong val sh
+  if eq slot 0
+    put g_m_rows0 ridx or get g_m_rows0 ridx u
+  else
+    if eq slot 1
+      put g_m_rows1 ridx or get g_m_rows1 ridx u
+    else
+      if eq slot 2
+        put g_m_rows2 ridx or get g_m_rows2 ridx u
+      else
+        put g_m_rows3 ridx or get g_m_rows3 ridx u
+      end
+    end
+  end
+end
+
+fn is_model_row_q ridx ulong j ulong to ushort
+  nrows = get g_m_meta 4
+  if ge ridx nrows
+    ret get g_m_def j
+  end
+  slot = div j 4
+  sh = mul rem j 4 16
+  w = ulong 0
+  if eq slot 0
+    w = get g_m_rows0 ridx
+  else
+    if eq slot 1
+      w = get g_m_rows1 ridx
+    else
+      if eq slot 2
+        w = get g_m_rows2 ridx
+      else
+        w = get g_m_rows3 ridx
+      end
+    end
+  end
+  ret ushort and shr w sh ulong 65535
+end
+
+fn is_model_row_idx key ulong to ulong
+  nrows = get g_m_meta 4
+  lo = ulong 0
+  hi = nrows
+  while lt lo hi bound 64
+    mid = add lo div sub hi lo 2
+    if lt get g_m_keys mid key
+      lo = add mid 1
+    else
+      hi = mid
+    end
+  end
+  if lt lo nrows
+    if eq get g_m_keys lo key
+      ret lo
+    end
+  end
+  ret nrows
+end
+
+fn m_load_rows fd int k ulong kb ulong nrows ulong s_lim ulong to int
+  if gt nrows ulong 0
+    _e = enlarge g_m_keys nrows
+    _e = enlarge g_m_rows0 nrows
+    _e = enlarge g_m_rows1 nrows
+    _e = enlarge g_m_rows2 nrows
+    _e = enlarge g_m_rows3 nrows
+  end
+  i = ulong 0
+  while lt i nrows bound 10000000
+    put g_m_rows0 i ulong 0
+    put g_m_rows1 i ulong 0
+    put g_m_rows2 i ulong 0
+    put g_m_rows3 i ulong 0
+    key = ulong 0
+    if gt kb 0
+      key = br_getbits fd kb
+    end
+    if ne get g_br_st 3 0
+      ret int -5
+    end
+    if ge key s_lim
+      ret int -7
+    end
+    if gt i 0
+      if le key get g_m_keys sub i 1
+        ret int -7
+      end
+    end
+    put g_m_keys i key
+    sm = uint 0
+    j = ulong 0
+    km1 = sub k 1
+    while lt j km1 bound 16
+      v = br_getbits fd ulong 16
+      if ne get g_br_st 3 0
+        ret int -5
+      end
+      if eq v 0
+        ret int -6
+      end
+      m_row_put i j ushort v
+      sm = add sm uint v
+      j = add j 1
+    end
+    if ge sm uint 65536
+      ret int -6
+    end
+    m_row_put i km1 ushort sub uint 65536 sm
+    i = add i 1
+  end
+  ret int 0
+end
+
+fn m_load_hdr fd int ufsize ulong to int
+  if lt mul ufsize 8 ulong 104
+    ret int -1
+  end
+  if ne br_getbits fd ulong 32 ulong 0x54594d30
+    ret int -1
+  end
+  if ne br_getbits fd ulong 8 0
+    ret int -2
+  end
+  k = br_getbits fd ulong 8
+  mask = br_getbits fd ulong 8
+  qbits = br_getbits fd ulong 8
+  kb = br_getbits fd ulong 8
+  nrows = br_getbits fd ulong 32
+  put g_m_meta 0 k
+  put g_m_meta 1 mask
+  put g_m_meta 2 qbits
+  put g_m_meta 3 kb
+  put g_m_meta 4 nrows
+  if ne qbits 16
+    ret int -3
+  end
+  if or lt k 2 gt k 16
+    ret int -4
+  end
+  ret int 0
+end
+
+fn m_check_len ufsize ulong to int
+  km1 = sub get g_m_meta 0 1
+  rb = add get g_m_meta 3 mul ulong 16 km1
+  lb = add ulong 104 mul ulong 16 km1
+  lb = add lb mul get g_m_meta 4 rb
+  if ne div add lb 7 8 ufsize
+    ret int -5
+  end
+  put g_m_meta 6 lb
+  ret int 0
+end
+
+fn m_check_s ufsize ulong to int
+  k = get g_m_meta 0
+  mask = get g_m_meta 1
+  s_val = ulong 1
+  smax = shl ulong 1 62
+  j = ulong 0
+  while lt j 8 bound 8
+    if ne and mask feat_bit j 0
+      rd = feat_radix j k
+      if gt s_val add div smax rd 1
+        ret int -4
+      end
+      s_val = mul s_val rd
+      if gt s_val smax
+        ret int -4
+      end
+    end
+    j = add j 1
+  end
+  put g_m_meta 5 s_val
+  j = ulong 0
+  if gt s_val 1
+    tv = sub s_val 1
+    while gt tv 0 bound 64
+      j = add j 1
+      tv = shr tv 1
+    end
+  end
+  if ne get g_m_meta 3 j
+    ret int -4
+  end
+  ret m_check_len ufsize
+end
+
+fn m_load_def fd int to int
+  km1 = sub get g_m_meta 0 1
+  dsm = uint 0
+  j = ulong 0
+  while lt j km1 bound 16
+    v = br_getbits fd ulong 16
+    if eq v 0
+      ret int -6
+    end
+    put g_m_def j ushort v
+    dsm = add dsm uint v
+    j = add j 1
+  end
+  if ge dsm uint 65536
+    ret int -6
+  end
+  put g_m_def km1 ushort sub uint 65536 dsm
+  ret int 0
+end
+
+fn m_finish_sha fd int to void
+  br_drain fd
+  fsha = new uchar 32 0
+  mdig = new uchar 32 0
+  sha_final ulong 0 fsha
+  sha_final ulong 1 mdig
+  for zi ulong 32
+    put g_m_fsha zi get fsha zi
+    put g_m_mdig zi get mdig zi
+  end
+end
+
+fn is_model_load path view uchar * plen ulong to int
+  for z ulong 16
+    put g_m_meta z ulong 0
+    put g_m_def z ushort 0
+  end
+  put g_m_msglen 0 ulong 0
+  fd = fopen path ulong 0 plen int 0 int 0
+  if lt fd long 0
+    ret int -100
+  end
+  fsize = fseek int fd long 0 int 2
+  if lt fsize long 0
+    _fc = fclose int fd
+    ret int -100
+  end
+  _sk = fseek int fd long 0 int 0
+  ufsize = ulong fsize
+  put g_m_meta 7 ufsize
+  sha_init ulong 0
+  sha_domain_init ulong 1 t_ymodel_tag
+  for z ulong 4
+    put g_br_st z ulong 0
+  end
+  rr = m_load_hdr int fd ufsize
+  if ne rr int 0
+    _fc = fclose int fd
+    ret rr
+  end
+  rr = m_check_s ufsize
+  if ne rr int 0
+    _fc = fclose int fd
+    ret rr
+  end
+  rr = m_load_def int fd
+  if ne rr int 0
+    _fc = fclose int fd
+    ret rr
+  end
+  rr = m_load_rows int fd get g_m_meta 0 get g_m_meta 3 get g_m_meta 4 get g_m_meta 5
+  if ne rr int 0
+    _fc = fclose int fd
+    ret rr
+  end
+  padbits = sub mul ufsize 8 get g_m_meta 6
+  pi = ulong 0
+  while lt pi padbits bound 8
+    if ne br_getbits int fd ulong 1 0
+      _fc = fclose int fd
+      ret int -8
+    end
+    pi = add pi 1
+  end
+  m_finish_sha int fd
+  _fc = fclose int fd
+  ret int 0
+end
+
+note ================= CTR1 loader =================
+
+fn ctr1_parse_rec off ulong to int
+  if ne get g_io64k off uchar 67
+    ret int -1
+  end
+  if ne get g_io64k add off 1 uchar 84
+    ret int -1
+  end
+  if ne get g_io64k add off 2 uchar 82
+    ret int -1
+  end
+  if ne get g_io64k add off 3 uchar 49
+    ret int -1
+  end
+  if ne get g_io64k add off 4 uchar 1
+    ret int -1
+  end
+  if ne get g_io64k add off 5 uchar 0
+    ret int -1
+  end
+  if gt get g_io64k add off 24 uchar 4
+    ret int -1
+  end
+  if gt get g_io64k add off 25 uchar 2
+    ret int -1
+  end
+  kind = ulong get g_io64k add off 6
+  rc = ulong get g_io64k add off 7
+  prune = ulong get g_io64k add off 23
+  op = ulong get g_io64k add off 20
+  if gt prune 4
+    ret int -1
+  end
+  if eq kind 1
+    if ge op 15
+      ret int -1
+    end
+    if ne prune 0
+      if ne rc 1
+        ret int -1
+      end
+      ret int add mul op 16 sub prune 1
+    end
+    if or lt rc 2 gt rc 4
+      ret int -1
+    end
+    ret int add mul op 16 add rc 2
+  end
+  if ne kind 2
+    ret int -1
+  end
+  if ne prune 0
+    ret int -1
+  end
+  if or lt rc 5 gt rc 7
+    ret int -1
+  end
+  if eq rc 5
+    ret int add mul ulong 15 16 ulong 7
+  end
+  ret int add mul ulong 15 16 ulong 8
+end
+
+global g_ctr1_st ulong 4
+
+fn ctr1_proc_one fi ulong base ulong k ulong to int
+  os = ctr1_parse_rec k
+  if lt os int 0
+    ret int -1
+  end
+  ev = or uint get g_io64k add k 8 shl uint get g_io64k add k 9 8
+  ev = or ev shl uint get g_io64k add k 10 16
+  ev = or ev shl uint get g_io64k add k 11 24
+  t = get g_ctr1_st 0
+  if gt t 0
+    if ne ev uint 0
+      prev = uint get g_ctr1_st 1
+      if lt ev prev
+        ret int -1
+      end
+      if ne ev add prev uint 1
+        put g_f_gaps fi add get g_f_gaps fi 1
+      end
+    end
+  end
+  idx = add base t
+  put g_ev_sym idx uchar and ulong os 15
+  put g_ev_op idx uchar shr ulong os 4
+  dp = get g_io64k add k 29
+  if gt dp uchar 7
+    dp = uchar 7
+  end
+  put g_ev_depth idx dp
+  if or eq t 0 eq ev uint 0
+    put g_ev_first idx uchar 1
+    put g_f_crumbs fi add get g_f_crumbs fi 1
+  else
+    put g_ev_first idx uchar 0
+  end
+  put g_ev_evidx idx ev
+  put g_ctr1_st 0 add t 1
+  put g_ctr1_st 1 ulong ev
+  ret int 0
+end
+
+fn ctr1_proc_chunk fi ulong base ulong ugot ulong to int
+  k = ulong 0
+  while lt k ugot bound 65536
+    sha_upd_byte ulong 0 get g_io64k k
+    k = add k 1
+  end
+  k = ulong 0
+  while lt k ugot bound 256
+    if ne ctr1_proc_one fi base k int 0
+      ret int -1
+    end
+    k = add k 247
+  end
+  ret int 0
+end
+
+fn ctr1_finish fi ulong base ulong ufsize ulong cap ulong to int
+  d = new uchar 32 0
+  t = get g_ctr1_st 0
+  put g_f_evn fi t
+  put g_f_bytes fi ufsize
+  put g_ev_total 0 add base t
+  sha_final ulong 0 d
+  so = mul fi 32
+  for zi ulong 32
+    put g_f_sha add so zi get d zi
+  end
+  if ne t cap
+    ret int -1
+  end
+  ret int 0
+end
+
+fn ctr1_read_loop fd int fi ulong base ulong to int
+  done = false
+  while not done bound 10000000
+    got = read fd g_io64k ulong 0 ulong 63232
+    if lt got long 0
+      ret int -1
+    end
+    if eq got long 0
+      done = true
+    else
+      if ne rem ulong got ulong 247 ulong 0
+        ret int -1
+      end
+      if ne ctr1_proc_chunk fi base ulong got int 0
+        ret int -1
+      end
+    end
+  end
+  ret int 0
+end
+
+fn is_ctr1_load fi ulong path view uchar * plen ulong to int
+  fd = fopen path ulong 0 plen int 0 int 0
+  if lt fd long 0
+    ret int -100
+  end
+  fsize = fseek int fd long 0 int 2
+  if lt fsize long 0
+    _fc = fclose int fd
+    ret int -100
+  end
+  _fc = fseek int fd long 0 int 0
+  ufsize = ulong fsize
+  if ne rem ufsize ulong 247 ulong 0
+    _fc = fclose int fd
+    ret int -1
+  end
+  cap = div ufsize ulong 247
+  base = get g_ev_total 0
+  _e = enlarge g_ev_sym add base add cap 1
+  _e = enlarge g_ev_op add base add cap 1
+  _e = enlarge g_ev_depth add base add cap 1
+  _e = enlarge g_ev_first add base add cap 1
+  _e = enlarge g_ev_evidx add base add cap 1
+  put g_f_evoff fi base
+  put g_f_crumbs fi ulong 0
+  put g_f_gaps fi ulong 0
+  put g_ctr1_st 0 ulong 0
+  put g_ctr1_st 1 ulong 0
+  sha_init ulong 0
+  rr = ctr1_read_loop int fd fi base
+  _fc = fclose int fd
+  if ne rr int 0
+    ret int -1
+  end
+  ret ctr1_finish fi base ufsize cap
+end
+
+note ================= key walk =================
+
+fn is_key idx ulong wp view ulong 5 crumb ulong to ulong
+  mask = get g_m_meta 1
+  k = get g_m_meta 0
+  key = ulong 0
+  mult = ulong 1
+  j = ulong 0
+  while lt j 8 bound 8
+    if ne and mask feat_bit j 0
+      d = ulong 0
+      if eq j 0
+        d = ulong get g_ev_op idx
+      else
+        if eq j 1
+          d = ulong get g_ev_depth idx
+        else
+          if eq j 7
+            cr = crumb
+            if gt cr 65535
+              cr = ulong 65535
+            end
+            ev = ulong get g_ev_evidx idx
+            if gt ev ulong 0xfffff
+              ev = ulong 0xfffff
+            end
+            d = or shl cr 20 ev
+          else
+            d = get wp sub j 2
+          end
+        end
+      end
+      key = add key mul d mult
+      mult = mul mult feat_radix j k
+    end
+    j = add j 1
+  end
+  ret key
+end
+
+note ================= range decoder (CODER_SPEC 5) =================
+
+fn is_rdec_init off ulong plen ulong to int
+  put g_rdec 0 off
+  put g_rdec 1 add off plen
+  put g_rdec 2 ulong 0
+  put g_rdec 3 ulong 0
+  put g_rdec 4 ulong 0
+  if lt plen 4
+    put g_rdec 4 ulong 113
+    ret int -113
+  end
+  c0 = shl uint get g_tcr off 24
+  c1 = shl uint get g_tcr add off 1 16
+  c2 = shl uint get g_tcr add off 2 8
+  c3 = uint get g_tcr add off 3
+  put g_rdec 0 add off 4
+  put g_rdec 2 ulong or or c0 c1 or c2 c3
+  put g_rdec 3 ulong 0xffffffff
+  ret int 0
+end
+
+fn is_rdec_step ridx ulong k ulong to int
+  if ne get g_rdec 4 0
+    ret neg int get g_rdec 4
+  end
+  code = uint get g_rdec 2
+  rng = uint get g_rdec 3
+  if ge code rng
+    put g_rdec 4 ulong 115
+    ret int -115
+  end
+  r = shr rng 16
+  cum = uint 0
+  s = ulong 0
+  km1 = sub k 1
+  while lt s km1 bound 16
+    qs = uint is_model_row_q ridx s
+    if lt code mul r add cum qs
+      break
+    end
+    cum = add cum qs
+    s = add s 1
+  end
+  code = sub code mul r cum
+  if eq s km1
+    rng = sub rng mul r cum
+  else
+    rng = mul r uint is_model_row_q ridx s
+  end
+  top = shl uint 1 24
+  pos = get g_rdec 0
+  lim = get g_rdec 1
+  while lt rng top bound 8
+    if eq pos lim
+      put g_rdec 4 ulong 113
+      ret int -113
+    end
+    code = or shl code 8 uint get g_tcr pos
+    pos = add pos 1
+    rng = shl rng 8
+  end
+  put g_rdec 0 pos
+  put g_rdec 2 ulong code
+  put g_rdec 3 ulong rng
+  ret int s
+end
+
+fn is_rdec_finish to int
+  if ne get g_rdec 4 0
+    ret neg int get g_rdec 4
+  end
+  if ne get g_rdec 2 0
+    ret int -115
+  end
+  if ne get g_rdec 0 get g_rdec 1
+    ret int -114
+  end
+  ret int 0
+end
+
+note ================= rANS decoder (CODER_SPEC 6) =================
+
+fn is_adec_init off ulong plen ulong to int
+  put g_adec 0 off
+  put g_adec 1 add off plen
+  put g_adec 2 ulong 0
+  put g_adec 3 ulong 0
+  if lt plen 4
+    put g_adec 3 ulong 113
+    ret int -113
+  end
+  x0 = uint get g_tca off
+  x1 = shl uint get g_tca add off 1 8
+  x2 = shl uint get g_tca add off 2 16
+  x3 = shl uint get g_tca add off 3 24
+  xv = or or x0 x1 or x2 x3
+  put g_adec 0 add off 4
+  put g_adec 2 ulong xv
+  if or lt xv shl uint 1 23 ge xv shl uint 1 31
+    put g_adec 3 ulong 115
+    ret int -115
+  end
+  ret int 0
+end
+
+fn is_adec_step ridx ulong k ulong to int
+  if ne get g_adec 3 0
+    ret neg int get g_adec 3
+  end
+  xv = uint get g_adec 2
+  m = and xv uint 0xffff
+  cum = uint 0
+  s = ulong 0
+  while lt s k bound 16
+    qs = uint is_model_row_q ridx s
+    if lt m add cum qs
+      break
+    end
+    cum = add cum qs
+    s = add s 1
+  end
+  if eq s k
+    put g_adec 3 ulong 115
+    ret int -115
+  end
+  qs = uint is_model_row_q ridx s
+  xv = sub add mul qs shr xv 16 m cum
+  rl = shl uint 1 23
+  pos = get g_adec 0
+  lim = get g_adec 1
+  while lt xv rl bound 8
+    if eq pos lim
+      put g_adec 3 ulong 113
+      ret int -113
+    end
+    xv = or shl xv 8 uint get g_tca pos
+    pos = add pos 1
+  end
+  put g_adec 0 pos
+  put g_adec 2 ulong xv
+  ret int s
+end
+
+fn is_adec_finish to int
+  if ne get g_adec 3 0
+    ret neg int get g_adec 3
+  end
+  if ne get g_adec 2 ulong shl uint 1 23
+    ret int -115
+  end
+  if ne get g_adec 0 get g_adec 1
+    ret int -114
+  end
+  ret int 0
+end
+
+note ================= RNG (UNCERTAINTY_PROTOCOL 4) =================
+
+fn is_splitmix64 to ulong
+  c1 = or shl ulong 0x9e3779b9 32 ulong 0x7f4a7c15
+  c2 = or shl ulong 0xbf58476d 32 ulong 0x1ce4e5b9
+  c3 = or shl ulong 0x94d049bb 32 ulong 0x133111eb
+  z = add get g_rng_st 0 c1
+  put g_rng_st 0 z
+  z = mul xor z shr z 30 c2
+  z = mul xor z shr z 27 c3
+  ret xor z shr z 31
+end
+
+fn is_draw c ulong to ulong
+  umax = or shl ulong 0xffffffff 32 ulong 0xffffffff
+  lim = sub umax rem add rem umax c 1 c
+  r = is_splitmix64
+  while gt r lim bound 1000000
+    r = is_splitmix64
+  end
+  ret rem r c
+end
+
+note ================= profile version (EXP_ID) =================
+
+fn env_eq_at off ulong pat view uchar * to bool
+  j = ulong 0
+  pn = len pat
+  while lt j pn bound 32
+    if ne get g_env_buf add off j get pat j
+      ret false
+    end
+    j = add j 1
+  end
+  ret true
+end
+
+fn is_profile_version to int
+  ec = envcnt
+  if le ec long 0
+    ret int 0
+  end
+  i = ulong 0
+  uec = ulong ec
+  while lt i uec bound 4096
+    n = envread i g_env_buf ulong 0 ulong 256
+    if ge n long 7
+      if env_eq_at ulong 0 t_exp_prefix
+        vlen = sub ulong n 7
+        if eq vlen 0
+          ret int 0
+        end
+        if eq vlen 7
+          if env_eq_at ulong 7 t_exp001
+            ret int 0
+          end
+        end
+        if eq vlen 8
+          if env_eq_at ulong 7 t_exp001r
+            ret int 1
+          end
+        end
+        ret int -1
+      end
+    end
+    i = add i 1
+  end
+  ret int 0
+end

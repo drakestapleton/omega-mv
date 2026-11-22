@@ -13,15 +13,15 @@ TVI_SRC = tools/turing_verify_indep/src
 TVI_DIR = $(OUT_DIR)/turing-verify-indep
 TVI_BIN = $(TVI_DIR)/indep-scorer
 TVI_SELF = $(TVI_DIR)/indep-selftest
-TVI_CFLAGS = -std=c11 -O2 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L -Wno-error=pedantic -Wno-format-truncation
-TVI_HDRS = $(TVI_SRC)/core.h $(TVI_SRC)/sha256.h
+TVI_OMC ?= seed/out/omc
+TVI_BASE = $(TVI_SRC)/sha256.om $(TVI_SRC)/core.om
 
-$(TVI_BIN): $(TVI_SRC)/main.c $(TVI_SRC)/core.c $(TVI_SRC)/sha256.c $(TVI_HDRS)
+$(TVI_BIN): $(TVI_BASE) $(TVI_SRC)/main.om $(TVI_OMC)
 	@mkdir -p $(TVI_DIR)
-	$(CC) $(TVI_CFLAGS) -o $@ $(TVI_SRC)/main.c $(TVI_SRC)/core.c $(TVI_SRC)/sha256.c
-$(TVI_SELF): $(TVI_SRC)/selftest.c $(TVI_SRC)/core.c $(TVI_SRC)/sha256.c $(TVI_HDRS)
+	cat $(TVI_BASE) $(TVI_SRC)/main.om | $(TVI_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+$(TVI_SELF): $(TVI_BASE) $(TVI_SRC)/selftest.om $(TVI_OMC)
 	@mkdir -p $(TVI_DIR)
-	$(CC) $(TVI_CFLAGS) -o $@ $(TVI_SRC)/selftest.c $(TVI_SRC)/core.c $(TVI_SRC)/sha256.c -lm
+	cat $(TVI_BASE) $(TVI_SRC)/selftest.om | $(TVI_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 turing-verify-indep: $(TVI_BIN) $(TVI_SELF)
 

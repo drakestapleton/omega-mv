@@ -1,6 +1,5 @@
-# Lane D independent scorer (EXP-001). C only, no dependency outside libc (+libm for the selftest audit only).
-CC ?= gcc
-CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror -pedantic -D_POSIX_C_SOURCE=200809L -Wno-error=pedantic -Wno-format-truncation
+# Lane D independent scorer (EXP-001). Pure seeded OM-2, no dependency outside seed/out/omc.
+OMC ?= ../../seed/out/omc
 BUILD := build
 
 all: $(BUILD)/indep-scorer $(BUILD)/indep-selftest
@@ -8,11 +7,11 @@ all: $(BUILD)/indep-scorer $(BUILD)/indep-selftest
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/indep-scorer: src/main.c src/core.c src/sha256.c src/core.h src/sha256.h | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/main.c src/core.c src/sha256.c
+$(BUILD)/indep-scorer: src/sha256.om src/core.om src/main.om | $(BUILD)
+	cat src/sha256.om src/core.om src/main.om | $(OMC) > $@ && chmod +x $@
 
-$(BUILD)/indep-selftest: src/selftest.c src/core.c src/sha256.c src/core.h src/sha256.h | $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/selftest.c src/core.c src/sha256.c -lm
+$(BUILD)/indep-selftest: src/sha256.om src/core.om src/selftest.om | $(BUILD)
+	cat src/sha256.om src/core.om src/selftest.om | $(OMC) > $@ && chmod +x $@
 
 test: $(BUILD)/indep-selftest
 	cd $(BUILD) && ./indep-selftest ../../docs-only-v2 $(HOME)/aien-data/turing-cal/candidates
