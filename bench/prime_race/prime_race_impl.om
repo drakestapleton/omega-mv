@@ -1,0 +1,847 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note AIEN Prime Drag Race: pure seeded OM-2 implementation-side protocol.
+note Contract: canonical bitmap, bit k (u64 word k/64, bit k%64) set iff 2k+1 is prime,
+note 0 <= k < (limit+1)/2, tail bits zero; prime 2 is implicit when limit >= 2.
+om2
+
+struct PrArgs limit ulong min_sec f64 audit_passes ulong has_bm int has_rep int end
+struct PrReport threads ulong limit ulong min_sec f64 audit int passes ulong elapsed_s f64 failed int end
+
+const PR_MAX_LIMIT ulong 1099511627776
+
+note Global buffers for CLI arguments, paths, error messages, and formatting.
+global pr_argv uchar 8192
+global pr_arglen ulong 32
+global pr_argc ulong 1
+global pr_bm_path uchar 512
+global pr_bm_plen ulong 1
+global pr_rep_path uchar 512
+global pr_rep_plen ulong 1
+global pr_err_buf uchar 256
+global pr_err_len ulong 1
+global pr_exec_err uchar 256
+global pr_exec_elen ulong 1
+global pr_io_buf uchar 65536
+
+text pr_t_opt_limit "--limit"
+text pr_t_opt_minsec "--min-seconds"
+text pr_t_opt_bmout "--bitmap-out"
+text pr_t_opt_repout "--report-out"
+text pr_t_opt_audit "--audit-passes"
+text pr_t_hex "0123456789abcdef"
+text pr_t_err_miss "missing value"
+text pr_t_err_lim "invalid --limit"
+text pr_t_err_lim_max "--limit exceeds 2^40"
+text pr_t_err_sec "invalid --min-seconds"
+text pr_t_err_aud "invalid --audit-passes (need integer >= 1)"
+text pr_t_err_empty "empty path option"
+text pr_t_err_unk "unknown argument"
+text pr_t_err_aud_bm "--audit-passes requires --bitmap-out"
+text pr_t_usage1 "usage error: "
+text pr_t_usage2 "\nusage: cpu_base [--limit N=1000000] [--min-seconds S=5] [--bitmap-out PATH] [--report-out PATH] [--audit-passes K]\n"
+text pr_t_exec_pfx "EXEC_FAILED: "
+text pr_t_nl "\n"
+text pr_t_line_pfx "aien-cpu-c-base;"
+text pr_t_line_sfx ";algorithm=base,faithful=yes,bits=1"
+text pr_t_j_head "{\n  \"schema\": \"aien-prime-race/impl-report/v1\",\n  \"impl\": \"cpu-c-base\",\n  \"label\": \"aien-cpu-c-base\",\n  \"algorithm\": \"base\",\n  \"faithful\": \"yes\",\n  \"bits\": 1,\n  \"threads\": "
+text pr_t_j_env ",\n  \"environment\": \"linux-host-cpu\",\n  \"limit\": "
+text pr_t_j_minsec ",\n  \"min_seconds\": "
+text pr_t_j_mode ",\n  \"mode\": "
+text pr_t_j_passes ",\n  \"passes\": "
+text pr_t_j_elap ",\n  \"elapsed_s\": "
+text pr_t_j_stat ",\n  \"status\": "
+text pr_t_j_err ",\n  \"error\": "
+text pr_t_j_null "null"
+text pr_t_j_build ",\n  \"build\": {\"source_commit\": \"unknown\", \"cc\": \"seed/out/omc\", \"cflags\": \"om2\"},\n  \"detail\": {}\n}\n"
+text pr_t_mode_timed "timed"
+text pr_t_mode_audit "audit"
+text pr_t_st_ok "COMPLETE"
+text pr_t_st_fail "EXEC_FAILED"
+text pr_t_e_setup "setup failed"
+text pr_t_e_open_bm "cannot open bitmap-out"
+text pr_t_e_pass "pass failed"
+text pr_t_e_export "export failed"
+text pr_t_e_write_bm "bitmap write failed"
+text pr_t_e_close_bm "bitmap close failed"
+text pr_t_e_clock "clock failure"
+text pr_t_e_timed "timed run did not satisfy passes>0 and elapsed>=min_seconds"
+text pr_t_e_audcnt "audit pass count mismatch"
+text pr_t_e_rep "report write failed"
+text pr_t_e_line "line too long"
+
+fn pr_odd_count limit ulong to ulong
+  ret shr add limit 1 1
+end
+
+fn pr_words64 limit ulong to ulong
+  ret shr add pr_odd_count limit 63 6
+end
+
+fn pr_write_all fd int buf view uchar * n ulong to int
+  pos = ulong 0
+  while lt pos n bound 9223372036854775807
+    k = write fd buf pos sub n pos
+    if le k 0
+      ret -1
+    end
+    pos = add pos ulong k
+  end
+  ret 0
+end
+
+fn pr_write_iobuf fd int n ulong to int
+  tmp = new uchar 4096 0
+  pos = ulong 0
+  while lt pos n bound 9223372036854775807
+    remn = sub n pos
+    chunk = remn
+    if gt chunk 4096
+      chunk = 4096
+    end
+    for i ulong chunk
+      put tmp i get pr_io_buf add pos i
+    end
+    if ne pr_write_all fd view tmp chunk 0
+      ret -1
+    end
+    pos = add pos chunk
+  end
+  ret 0
+end
+
+fn pr_set_err s view uchar * to void
+  n = len s
+  if gt n 255
+    n = 255
+  end
+  for i ulong n
+    put pr_err_buf i get s i
+  end
+  put pr_err_len 0 n
+end
+
+fn pr_set_exec_err s view uchar * to void
+  n = len s
+  if gt n 255
+    n = 255
+  end
+  for i ulong n
+    put pr_exec_err i get s i
+  end
+  put pr_exec_elen 0 n
+end
+
+fn pr_arg_eq idx ulong target view uchar * to int
+  n = get pr_arglen idx
+  if ne n len target
+    ret 0
+  end
+  base = mul idx 256
+  for i ulong n
+    if ne get pr_argv add base i get target i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn pr_parse_u64_arg idx ulong dst edit ulong 1 to int
+  n = get pr_arglen idx
+  if eq n 0
+    ret -1
+  end
+  base = mul idx 256
+  v = ulong 0
+  for i ulong n
+    c = get pr_argv add base i
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    d = ulong sub c 48
+    if gt v div sub 0xffffffffffffffff d 10
+      ret -1
+    end
+    v = add mul v 10 d
+  end
+  put dst 0 v
+  ret 0
+end
+
+fn pr_parse_sec_arg idx ulong dst edit f64 1 to int
+  n = get pr_arglen idx
+  if eq n 0
+    ret -1
+  end
+  base = mul idx 256
+  v = 0.0f64
+  scale = 1.0f64
+  seen_dot = int 0
+  seen_dig = int 0
+  for i ulong n
+    c = get pr_argv add base i
+    if eq c 46
+      if ne seen_dot 0
+        ret -1
+      end
+      seen_dot = 1
+    else
+      if or lt c 48 gt c 57
+        ret -1
+      end
+      seen_dig = 1
+      v = add mul v 10.0f64 f64 sub c 48
+      if ne seen_dot 0
+        scale = mul scale 10.0f64
+      end
+    end
+  end
+  if eq seen_dig 0
+    ret -1
+  end
+  res = div v scale
+  if ne sub res res 0.0f64
+    ret -1
+  end
+  if lt res 0.0f64
+    ret -1
+  end
+  put dst 0 res
+  ret 0
+end
+
+fn pr_copy_arg_to_bm idx ulong to int
+  n = get pr_arglen idx
+  if or eq n 0 gt n 511
+    ret -1
+  end
+  base = mul idx 256
+  for i ulong n
+    put pr_bm_path i get pr_argv add base i
+  end
+  put pr_bm_plen 0 n
+  ret 0
+end
+
+fn pr_copy_arg_to_rep idx ulong to int
+  n = get pr_arglen idx
+  if or eq n 0 gt n 511
+    ret -1
+  end
+  base = mul idx 256
+  for i ulong n
+    put pr_rep_path i get pr_argv add base i
+  end
+  put pr_rep_plen 0 n
+  ret 0
+end
+
+fn pr_opt_kind idx ulong to int
+  if ne pr_arg_eq idx view pr_t_opt_limit 0
+    ret 1
+  end
+  if ne pr_arg_eq idx view pr_t_opt_minsec 0
+    ret 2
+  end
+  if ne pr_arg_eq idx view pr_t_opt_audit 0
+    ret 3
+  end
+  if ne pr_arg_eq idx view pr_t_opt_bmout 0
+    ret 4
+  end
+  if ne pr_arg_eq idx view pr_t_opt_repout 0
+    ret 5
+  end
+  ret 0
+end
+
+fn pr_apply_opt kind int vidx ulong a edit PrArgs to int
+  u_tmp = new ulong 1 0
+  f_tmp = new f64 1 0.0f64
+  if eq kind 1
+    if ne pr_parse_u64_arg vidx edit u_tmp 0
+      pr_set_err view pr_t_err_lim
+      ret -1
+    end
+    lv = get u_tmp 0
+    if gt lv PR_MAX_LIMIT
+      pr_set_err view pr_t_err_lim_max
+      ret -1
+    end
+    put a limit lv
+    ret 0
+  end
+  if eq kind 2
+    if ne pr_parse_sec_arg vidx edit f_tmp 0
+      pr_set_err view pr_t_err_sec
+      ret -1
+    end
+    put a min_sec get f_tmp 0
+    ret 0
+  end
+  if eq kind 3
+    if ne pr_parse_u64_arg vidx edit u_tmp 0
+      pr_set_err view pr_t_err_aud
+      ret -1
+    end
+    av = get u_tmp 0
+    if eq av 0
+      pr_set_err view pr_t_err_aud
+      ret -1
+    end
+    put a audit_passes av
+    ret 1
+  end
+  if eq kind 4
+    if ne pr_copy_arg_to_bm vidx 0
+      pr_set_err view pr_t_err_empty
+      ret -1
+    end
+    put a has_bm 1
+    ret 0
+  end
+  if ne pr_copy_arg_to_rep vidx 0
+    pr_set_err view pr_t_err_empty
+    ret -1
+  end
+  put a has_rep 1
+  ret 0
+end
+
+fn pr_parse_args a edit PrArgs to int
+  put a limit 1000000
+  put a min_sec 5.0f64
+  put a audit_passes 0
+  put a has_bm 0
+  put a has_rep 0
+  put pr_bm_plen 0 0
+  put pr_rep_plen 0 0
+  put pr_err_len 0 0
+  audit_given = int 0
+  argc = get pr_argc 0
+  i = ulong 1
+  while lt i argc bound 64
+    kind = pr_opt_kind i
+    if eq kind 0
+      pr_set_err view pr_t_err_unk
+      ret -1
+    end
+    if ge add i 1 argc
+      pr_set_err view pr_t_err_miss
+      ret -1
+    end
+    i = add i 1
+    rc = pr_apply_opt kind i a
+    if lt rc 0
+      ret -1
+    end
+    if eq rc 1
+      audit_given = 1
+    end
+    i = add i 1
+  end
+  if and ne audit_given 0 eq get a has_bm 0
+    pr_set_err view pr_t_err_aud_bm
+    ret -1
+  end
+  ret 0
+end
+
+fn pr_load_host_args to void
+  cnt = argcnt
+  if lt cnt 0
+    cnt = 0
+  end
+  u = ulong cnt
+  if gt u 32
+    u = 32
+  end
+  put pr_argc 0 u
+  tmp = new uchar 256 0
+  for i ulong u
+    k = argread i tmp 0 256
+    if lt k 0
+      put pr_arglen i 0
+    else
+      kl = ulong k
+      if gt kl 255
+        kl = 255
+      end
+      base = mul i 256
+      for j ulong kl
+        put pr_argv add base j get tmp j
+      end
+      put pr_arglen i kl
+    end
+  end
+end
+
+fn pr_buf_put_byte dst edit uchar * pos ulong cap ulong b uchar to ulong
+  if ge pos cap
+    ret 0xffffffffffffffff
+  end
+  put dst pos b
+  ret add pos 1
+end
+
+fn pr_buf_put_str dst edit uchar * pos ulong cap ulong s view uchar * to ulong
+  n = len s
+  if or eq pos 0xffffffffffffffff gt n sub cap pos
+    ret 0xffffffffffffffff
+  end
+  for i ulong n
+    put dst add pos i get s i
+  end
+  ret add pos n
+end
+
+fn pr_buf_put_u64 dst edit uchar * pos ulong cap ulong v ulong to ulong
+  if eq pos 0xffffffffffffffff
+    ret 0xffffffffffffffff
+  end
+  digs = new uchar 24 0
+  nd = ulong 0
+  if eq v 0
+    put digs 0 48
+    nd = 1
+  else
+    x = v
+    while gt x 0 bound 24
+      put digs nd uchar add 48 rem x 10
+      x = div x 10
+      nd = add nd 1
+    end
+  end
+  if gt nd sub cap pos
+    ret 0xffffffffffffffff
+  end
+  for i ulong nd
+    put dst add pos i get digs sub sub nd 1 i
+  end
+  ret add pos nd
+end
+
+fn pr_buf_put_frac6 dst edit uchar * p ulong frac ulong to ulong
+  fdigs = new uchar 6 48
+  x = frac
+  for i ulong 6
+    d = uchar add 48 rem x 10
+    put fdigs sub 5 i d
+    x = div x 10
+  end
+  for i ulong 6
+    put dst add p i get fdigs i
+  end
+  ret add p 6
+end
+
+fn pr_buf_put_f64_6 dst edit uchar * pos ulong cap ulong v f64 to ulong
+  if eq pos 0xffffffffffffffff
+    ret 0xffffffffffffffff
+  end
+  scaled = ulong add mul v 1000000.0f64 0.5f64
+  whole = div scaled 1000000
+  frac = rem scaled 1000000
+  p = pr_buf_put_u64 dst pos cap whole
+  p = pr_buf_put_byte dst p cap 46
+  if eq p 0xffffffffffffffff
+    ret 0xffffffffffffffff
+  end
+  if gt 6 sub cap p
+    ret 0xffffffffffffffff
+  end
+  ret pr_buf_put_frac6 dst p frac
+end
+
+fn pr_format_line dst edit uchar * cap ulong passes ulong elapsed_s f64 threads ulong to long
+  p = ulong 0
+  p = pr_buf_put_str dst p cap view pr_t_line_pfx
+  p = pr_buf_put_u64 dst p cap passes
+  p = pr_buf_put_byte dst p cap 59
+  p = pr_buf_put_f64_6 dst p cap elapsed_s
+  p = pr_buf_put_byte dst p cap 59
+  p = pr_buf_put_u64 dst p cap threads
+  p = pr_buf_put_str dst p cap view pr_t_line_sfx
+  if eq p 0xffffffffffffffff
+    ret -1
+  end
+  ret long p
+end
+
+fn pr_line_allowed failed int passes ulong elapsed_s f64 min_seconds f64 to int
+  if ne failed 0
+    ret 0
+  end
+  if eq passes 0
+    ret 0
+  end
+  if ne sub elapsed_s elapsed_s 0.0f64
+    ret 0
+  end
+  if lt elapsed_s min_seconds
+    ret 0
+  end
+  ret 1
+end
+
+fn pr_json_string dst edit uchar * pos ulong cap ulong s view uchar * to ulong
+  p = pr_buf_put_byte dst pos cap 34
+  n = len s
+  for i ulong n
+    if eq p 0xffffffffffffffff
+      ret 0xffffffffffffffff
+    end
+    c = get s i
+    if eq c 34
+      p = pr_buf_put_byte dst p cap 92
+      p = pr_buf_put_byte dst p cap 34
+    else
+      if eq c 92
+        p = pr_buf_put_byte dst p cap 92
+        p = pr_buf_put_byte dst p cap 92
+      else
+        if eq c 10
+          p = pr_buf_put_byte dst p cap 92
+          p = pr_buf_put_byte dst p cap 110
+        else
+          if eq c 13
+            p = pr_buf_put_byte dst p cap 92
+            p = pr_buf_put_byte dst p cap 114
+          else
+            if eq c 9
+              p = pr_buf_put_byte dst p cap 92
+              p = pr_buf_put_byte dst p cap 116
+            else
+              if lt c 32
+                p = pr_buf_put_byte dst p cap 92
+                p = pr_buf_put_byte dst p cap 117
+                p = pr_buf_put_byte dst p cap 48
+                p = pr_buf_put_byte dst p cap 48
+                p = pr_buf_put_byte dst p cap get pr_t_hex ulong shr c 4
+                p = pr_buf_put_byte dst p cap get pr_t_hex ulong and c 15
+              else
+                p = pr_buf_put_byte dst p cap c
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  p = pr_buf_put_byte dst p cap 34
+  ret p
+end
+
+fn pr_build_report dst edit uchar * cap ulong r view PrReport err_s view uchar * to long
+  p = ulong 0
+  p = pr_buf_put_str dst p cap view pr_t_j_head
+  p = pr_buf_put_u64 dst p cap get r threads
+  p = pr_buf_put_str dst p cap view pr_t_j_env
+  p = pr_buf_put_u64 dst p cap get r limit
+  p = pr_buf_put_str dst p cap view pr_t_j_minsec
+  p = pr_buf_put_f64_6 dst p cap get r min_sec
+  p = pr_buf_put_str dst p cap view pr_t_j_mode
+  if ne get r audit 0
+    p = pr_json_string dst p cap view pr_t_mode_audit
+  else
+    p = pr_json_string dst p cap view pr_t_mode_timed
+  end
+  p = pr_buf_put_str dst p cap view pr_t_j_passes
+  p = pr_buf_put_u64 dst p cap get r passes
+  p = pr_buf_put_str dst p cap view pr_t_j_elap
+  p = pr_buf_put_f64_6 dst p cap get r elapsed_s
+  p = pr_buf_put_str dst p cap view pr_t_j_stat
+  if ne get r failed 0
+    p = pr_json_string dst p cap view pr_t_st_fail
+  else
+    p = pr_json_string dst p cap view pr_t_st_ok
+  end
+  p = pr_buf_put_str dst p cap view pr_t_j_err
+  if ne get r failed 0
+    p = pr_json_string dst p cap err_s
+  else
+    p = pr_buf_put_str dst p cap view pr_t_j_null
+  end
+  p = pr_buf_put_str dst p cap view pr_t_j_build
+  if eq p 0xffffffffffffffff
+    ret -1
+  end
+  ret long p
+end
+
+fn pr_open_bm_out to int
+  plen = get pr_bm_plen 0
+  pbuf = new uchar 512 0
+  for i ulong plen
+    put pbuf i get pr_bm_path i
+  end
+  fd = fopen pbuf 0 plen 577 420
+  ret int fd
+end
+
+fn pr_open_rep_out to int
+  plen = get pr_rep_plen 0
+  pbuf = new uchar 512 0
+  for i ulong plen
+    put pbuf i get pr_rep_path i
+  end
+  fd = fopen pbuf 0 plen 577 420
+  ret int fd
+end
+
+fn pr_put_le64 dst edit uchar * off ulong val ulong to void
+  for b ulong 8
+    sh = mul b 8
+    bv = uchar and shr val sh 255
+    put dst add off b bv
+  end
+end
+
+fn pr_write_export_words fd int nw ulong to int
+  chunk_buf = new uchar 4096 0
+  w = ulong 0
+  while lt w nw bound 9223372036854775807
+    remw = sub nw w
+    cw = remw
+    if gt cw 512
+      cw = 512
+    end
+    for i ulong cw
+      val = cpu_get_export_word add w i
+      pr_put_le64 edit chunk_buf shl i 3 val
+    end
+    if ne pr_write_all fd view chunk_buf shl cw 3 0
+      ret -1
+    end
+    w = add w cw
+  end
+  ret 0
+end
+
+fn pr_print_usage_err to void
+  ebuf = new uchar 256 0
+  elen = get pr_err_len 0
+  for i ulong elen
+    put ebuf i get pr_err_buf i
+  end
+  ign1 = pr_write_all 2 view pr_t_usage1 len pr_t_usage1
+  ign2 = pr_write_all 2 part ebuf 0 elen elen
+  ign3 = pr_write_all 2 view pr_t_usage2 len pr_t_usage2
+end
+
+fn pr_print_exec_err to void
+  ebuf = new uchar 256 0
+  elen = get pr_exec_elen 0
+  for i ulong elen
+    put ebuf i get pr_exec_err i
+  end
+  ign1 = pr_write_all 2 view pr_t_exec_pfx len pr_t_exec_pfx
+  ign2 = pr_write_all 2 part ebuf 0 elen elen
+  ign3 = pr_write_all 2 view pr_t_nl len pr_t_nl
+end
+
+fn pr_write_report_file r view PrReport to int
+  rf = pr_open_rep_out
+  if lt rf 0
+    ret -1
+  end
+  err_local = new uchar 256 0
+  elen = get pr_exec_elen 0
+  for i ulong elen
+    put err_local i get pr_exec_err i
+  end
+  rbuf = new uchar 2048 0
+  rlen = pr_build_report edit rbuf 2048 r part err_local 0 elen
+  ok = int 0
+  if lt rlen 0
+    ok = -1
+  else
+    if ne pr_write_all rf view rbuf ulong rlen 0
+      ok = -1
+    end
+  end
+  if ne fclose rf 0
+    ok = -1
+  end
+  ret ok
+end
+
+fn pr_emit_stdout_line passes ulong elapsed f64 threads ulong to int
+  lbuf = new uchar 512 0
+  llen = pr_format_line edit lbuf 511 passes elapsed threads
+  if lt llen 0
+    ign1 = pr_write_all 2 view pr_t_exec_pfx len pr_t_exec_pfx
+    ign2 = pr_write_all 2 view pr_t_e_line len pr_t_e_line
+    ign3 = pr_write_all 2 view pr_t_nl len pr_t_nl
+    ret -1
+  end
+  put lbuf ulong llen 10
+  ign4 = pr_write_all 1 view lbuf add ulong llen 1
+  ret 0
+end
+
+fn pr_run_audit lim ulong aud_p ulong has_bm int rep edit PrReport to int
+  nw = pr_words64 lim
+  bf = int -1
+  if ne has_bm 0
+    bf = pr_open_bm_out
+    if lt bf 0
+      pr_set_exec_err view pr_t_e_open_bm
+      ret 1
+    end
+  end
+  failed = int 0
+  passes = ulong 0
+  for k ulong aud_p bound 9223372036854775807
+    if ne cpu_pass lim 0
+      failed = 1
+      pr_set_exec_err view pr_t_e_pass
+      break
+    end
+    passes = add passes 1
+    if ne cpu_export lim 0
+      failed = 1
+      pr_set_exec_err view pr_t_e_export
+      break
+    end
+    if ge bf 0
+      if ne pr_write_export_words bf nw 0
+        failed = 1
+        pr_set_exec_err view pr_t_e_write_bm
+        break
+      end
+    end
+  end
+  if ge bf 0
+    if and ne fclose bf 0 eq failed 0
+      failed = 1
+      pr_set_exec_err view pr_t_e_close_bm
+    end
+  end
+  if and eq failed 0 ne passes aud_p
+    failed = 1
+    pr_set_exec_err view pr_t_e_audcnt
+  end
+  put rep passes passes
+  put rep elapsed_s 0.0f64
+  ret failed
+end
+
+fn pr_run_timed lim ulong min_s f64 has_bm int rep edit PrReport to int
+  t0 = monons
+  if lt t0 0
+    pr_set_exec_err view pr_t_e_clock
+    ret 1
+  end
+  failed = int 0
+  passes = ulong 0
+  elapsed = 0.0f64
+  while true bound 9223372036854775807
+    if ne cpu_pass lim 0
+      failed = 1
+      pr_set_exec_err view pr_t_e_pass
+      break
+    end
+    passes = add passes 1
+    t1 = monons
+    if lt t1 0
+      failed = 1
+      pr_set_exec_err view pr_t_e_clock
+      break
+    end
+    elapsed = div f64 sub t1 t0 1000000000.0f64
+    if ge elapsed min_s
+      break
+    end
+  end
+  if and eq failed 0 ne has_bm 0
+    of = pr_open_bm_out
+    if lt of 0
+      failed = 1
+      pr_set_exec_err view pr_t_e_open_bm
+    else
+      if ne cpu_export lim 0
+        failed = 1
+        pr_set_exec_err view pr_t_e_export
+      else
+        if ne pr_write_export_words of pr_words64 lim 0
+          failed = 1
+          pr_set_exec_err view pr_t_e_write_bm
+        end
+      end
+      if and ne fclose of 0 eq failed 0
+        failed = 1
+        pr_set_exec_err view pr_t_e_close_bm
+      end
+    end
+  end
+  if and eq failed 0 eq pr_line_allowed 0 passes elapsed min_s 0
+    failed = 1
+    pr_set_exec_err view pr_t_e_timed
+  end
+  put rep passes passes
+  put rep elapsed_s elapsed
+  ret failed
+end
+
+fn pr_main to int
+  pr_load_host_args
+  a = new PrArgs 0 0.0f64 0 0 0
+  rep = new PrReport 0 0 0.0f64 0 0 0.0f64 0
+  if ne pr_parse_args edit a 0
+    pr_print_usage_err
+    ret 64
+  end
+
+  lim = get a limit
+  min_s = get a min_sec
+  aud_p = get a audit_passes
+  audit = int 0
+  if gt aud_p 0
+    audit = 1
+  end
+
+  failed = int 0
+  put pr_exec_elen 0 0
+  put rep threads cpu_threads
+  put rep limit lim
+  put rep min_sec min_s
+  put rep audit audit
+  put rep passes 0
+  put rep elapsed_s 0.0f64
+
+  if ne cpu_setup lim 0
+    failed = 1
+    pr_set_exec_err view pr_t_e_setup
+  end
+
+  if eq failed 0
+    if ne audit 0
+      failed = pr_run_audit lim aud_p get a has_bm edit rep
+    else
+      failed = pr_run_timed lim min_s get a has_bm edit rep
+    end
+  end
+
+  put rep failed failed
+  if ne get a has_rep 0
+    if ne pr_write_report_file view rep 0
+      if eq failed 0
+        failed = 1
+        pr_set_exec_err view pr_t_e_rep
+      end
+    end
+  end
+
+  if ne failed 0
+    pr_print_exec_err
+    ret 2
+  end
+
+  if eq audit 0
+    if ne pr_emit_stdout_line get rep passes get rep elapsed_s get rep threads 0
+      ret 2
+    end
+  end
+  ret 0
+end

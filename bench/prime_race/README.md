@@ -6,12 +6,15 @@ answer before any speed is believed.
 
 What is here:
 
-- `prime_race_impl.h` and `prime_race_impl.c`: the shared protocol. It reads the command line, runs the
-  timed loop, writes the report file and the one-line result. Every entry uses this one copy.
-- `cpu_base.c`: the plain, conventional CPU sieve (one thread, one bit per odd number, built the way the
-  upstream "base" rules describe). It is the yardstick the faster entries are compared to.
-- `tests/prime_race_host_test.c`: checks cpu_base against a slow, independent trial-division oracle for
-  every limit from 0 to 3000, the design limit list up to 2,000,000, and known prime counts.
+- `prime_race_impl.om`: the pure seeded OM-2 shared protocol. It reads the command line, runs the
+  timed loop, writes the report file and the one-line result. (`prime_race_impl.h` and `prime_race_impl.c`
+  remain for the legacy GB10 C targets in `mk/prime_race_gb10.mk`.)
+- `cpu_base.om` and `cpu_base_main.om`: the plain, conventional CPU sieve in pure seeded OM-2 (one thread,
+  one bit per odd number, built the way the upstream "base" rules describe). It is the yardstick the faster
+  entries are compared to.
+- `tests/prime_race_host_test.om`: pure seeded OM-2 host test checking `cpu_base` against a slow,
+  independent trial-division oracle for every limit from 0 to 3000, the design limit list up to 2,000,000,
+  and known prime counts.
 
 ## Build and run
 
