@@ -43,14 +43,16 @@ regrown from its seed. When fewer than three of the four agree, the build stops.
 ## Serve a model yourself
 
 `q36-35b` is an OpenAI-compatible HTTP server for Qwen 3.6 35B-A3B. You need an NVIDIA GB10 (a DGX Spark)
-running 64-bit Arm Linux, and the model weights.
+running 64-bit Arm Linux, and the model weights. Run these from the root of this repository, with
+`Q36_MODEL_DIR` set to the folder that holds your copy of the weights:
 
 ```sh
+export Q36_MODEL_DIR="$HOME/models/qwen3.6-35b-a3b-fp8"
 sh seed/omega-from-seed.sh
 sh om/gpu/q36/build.sh build/q36
 sh om/gpu/q36/install-spark.sh .
-q36-35b --self-test
-q36-35b --port 18091
+"$HOME/.local/bin/q36-35b" --self-test
+"$HOME/.local/bin/q36-35b" --port 18091
 ```
 
 [om/gpu/q36/README.md](om/gpu/q36/README.md) has what each step does and what was verified.
