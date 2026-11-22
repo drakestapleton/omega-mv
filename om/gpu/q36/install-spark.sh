@@ -24,6 +24,7 @@ cat > "$opt_dir/manifest.json" <<EOF
 {
   "package": "q36-35b-omega-arboris",
   "model": "qwen3.6-35b-a3b-fp8",
+  "context_window": 131072,
   "default_precision": "w4",
   "arboris_enabled": true,
   "zero_cuda": true,

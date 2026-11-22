@@ -74,11 +74,12 @@ Verified on live Spark GB10 silicon (exclusive quiet window `20261121T232155Z-31
 
 ## Installed 35B Package + OpenAI HTTP Server (`om/gpu/q36/serve/` -> `q36-serve`, `q36-35b`)
 
-`q36-serve` (`507 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) wraps the 40-layer Full-W4 (`67.88 tok/s`, `~19.5 GB` VRAM, default) / Exact FP8 (`48.09 tok/s`, `--fp8`) engine + **live Arboris online co-activation prefetcher** + **pure OM-2 ByteLevel BPE tokenizer** (`tokenizer.om`, `248,044` vocab) in an OpenAI-compatible HTTP server (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `512`-token KV cache).
+`q36-serve` (`508 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) wraps the 40-layer Full-W4 (`~66.3–67.9 tok/s`, `~19.5 GB` weights + `5.37 GB` 128K KV cache + `32 MB` 128K RoPE, default) / Exact FP8 (`48.09 tok/s`, `--fp8`) engine + **live Arboris online co-activation prefetcher** + **pure OM-2 ByteLevel BPE tokenizer** (`tokenizer.om`, `248,044` vocab) in an OpenAI-compatible HTTP server (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, **`131,072`-token (`128K`) context window**).
 
-Verified on live Spark GB10 silicon (exclusive quiet window `20261122T002657Z-c1ec5b`, `exit: 0`, quiet machine):
-- `q36-35b --self-test`: `Prompt 0: "\n\nThe capital of France is **Paris**."`, `Prompt 1: "\n\n2 + 2 = 4"`, **`Live Arboris: hits=7131 / tot=15848 (44%)`**, `PASS`.
-- Live HTTP E2E (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`): returns `qwen3.6-35b-a3b-fp8`, exact completion `"\n\nThe capital of France is **Paris**."`, and live Arboris telemetry (`"arboris":{"hits":3323,"total":7736,"hit_pct":42}`).
+Verified on live Spark GB10 silicon (exclusive quiet window `20261122T010926Z-02fb35`, `exit: 0`, quiet machine, `NVRM: Xid` delta `0`; note: still uses NVIDIA open kernel modules 580.173.02 + signed GSP firmware):
+- `q36-35b --self-test` (128K context + `pos = 131,071` boundary pass + Live Arboris): `Prompt 0: "\n\nThe capital of France is **Paris**."`, `Prompt 1: "\n2 + 2 = 4"`, **`Live Arboris: hits=7120 / tot=15840 (44%)`**, `PASS`.
+- Live HTTP E2E (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`): reports `"context_window":131072`, `"arboris_enabled":true`, `"precision":"w4"`, returns exact completion `"\n\nThe capital of France is **Paris**."` and live Arboris telemetry (`"arboris":{"hits":3341,"total":7728,"hit_pct":43}`).
+- `q36-decode` 24-token real-weight parity & speed at 128K context: `PARITY=EXACT vs Full BF16 (tok=271)`, **`15.092 ms/tok` (`66.26 tok/s`)**, `arboris_real_hit_pct=42`.
 - Sustained load soak (window `20261121T233252Z-375404`, `NVRM: Xid` delta `0`): Full-W4 `20/20` bit-exact turns (`1,000` gen toks) at `67.59 tok/s` (`46–49 °C`, `32 W`, `2548 MHz`); Exact FP8 `10/10` bit-exact turns (`500` gen toks) at `48.09 tok/s`; Full-W4 under concurrent 8-core CPU + 512 MB RAM burn `10/10` bit-exact turns at `64.51 tok/s`.
 
 ## Build, Install, and Run

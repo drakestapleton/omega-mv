@@ -17,7 +17,7 @@ note   om/gpu/q36/arboris/prefetch.om
 const QD_H ulong 2048
 const QD_VOCAB ulong 248320
 const QD_LAYERS ulong 40
-const QD_MAX_T ulong 512
+const QD_MAX_T ulong 131072
 const QD_OUT_DATA_OFF ulong 38080
 const QD_LM_BYTES ulong 1017118720
 const QD_EMB_OFF ulong 1017156800
@@ -136,8 +136,10 @@ global qdGdnStateMap long 1
 global qdGdnStateVa ulong 1
 global qdGdnTailMap long 1
 global qdGdnTailVa ulong 1
-global qdKvMap long 1
-global qdKvVa ulong 1
+global qdKvMap long 10
+global qdKvVa ulong 10
+global qdRopeMap long 1
+global qdRopeVa ulong 1
 global qdSlabMap long 10
 global qdSlabVa ulong 10
 global qdBind uint 32
@@ -1988,12 +1990,12 @@ note Fused FA Q[8192] | K[512] | V[512] in ONE 4-row/warp W4 launch!
 if not qdEmitW4Gemv4R xnVa d4 add d4 9437184 add wva QDW_QKV 2048 9216
 ret false
 end
-kBase = add get qdKvVa 0 mul faIdx 10485760
-vBase = add kBase 5242880
+kBase = get qdKvVa faIdx
+vBase = add kBase 268435456
 qdPtr add wva add QDW_QKV 32768
 qdPtr add wva add QDW_QKV 34816
 qdPtr add sbase mul FA_KNORM 2
-qdPtr add wva QDW_ROPE
+qdPtr get qdRopeVa 0
 qdPtr kBase
 qdPtr vBase
 qdPtr add wva QDW_POS
@@ -2002,7 +2004,7 @@ ret false
 end
 qdPtr add wva QDW_QKV
 qdPtr add sbase mul FA_QNORM 2
-qdPtr add wva QDW_ROPE
+qdPtr get qdRopeVa 0
 qdPtr kBase
 qdPtr vBase
 qdPtr add wva QDW_Y
@@ -2099,13 +2101,13 @@ ret false
 end
 sbase = qdLayerSVa L
 wva = get qdWorkVa 0
-kBase = add get qdKvVa 0 mul faIdx 10485760
-vBase = add kBase 5242880
+kBase = get qdKvVa faIdx
+vBase = add kBase 268435456
 note GPU k_norm + partial RoPE + KV cache append
 qdPtr add wva QDW_K
 qdPtr add wva QDW_V
 qdPtr add sbase mul FA_KNORM 2
-qdPtr add wva QDW_ROPE
+qdPtr get qdRopeVa 0
 qdPtr kBase
 qdPtr vBase
 qdPtr add wva QDW_POS
@@ -2115,7 +2117,7 @@ end
 note GPU q_norm + partial RoPE + GQA + sigmoid(gate) -> QDW_Y
 qdPtr add wva QDW_QKV
 qdPtr add sbase mul FA_QNORM 2
-qdPtr add wva QDW_ROPE
+qdPtr get qdRopeVa 0
 qdPtr kBase
 qdPtr vBase
 qdPtr add wva QDW_Y
@@ -2273,6 +2275,65 @@ end
 ret bestId
 end
 
+fn qdInitRopeRow subP ulong curC edit f32 32 curS edit f32 32 stepC view f32 32 stepS view f32 32 to void
+base = mul subP 256
+for j ulong 32
+c = get curC j
+s = get curS j
+qdPutF32Io add base mul j 4 c
+qdPutF32Io add base add 128 mul j 4 s
+dc = get stepC j
+ds = get stepS j
+put curC j sub mul c dc mul s ds
+put curS j add mul s dc mul c ds
+end
+end
+
+fn qdInitRopeBlk mr long blk ulong stepC view f32 32 stepS view f32 32 to void
+curC = new f32 32 0.0f32
+curS = new f32 32 0.0f32
+p0 = f32 mul blk 256
+for j ulong 32
+th = mul p0 get qdRopeFreq j
+put curC j qdSinCos th true
+put curS j qdSinCos th false
+end
+for subP ulong 256
+qdInitRopeRow subP curC curS stepC stepS
+end
+r = mapwrite mr mul blk 65536 qdIoBuf 0 65536
+end
+
+fn qdInitKvRope128k to bool
+note Allocate 128K GPU KV cache (10 layers x 131072 pos x 2 kv x 256 f32 x 2 = 5.37 GB in 10 x 512 MB slabs)
+for fk ulong 10
+mk = nvalloc 536870912 true
+if le mk 0
+ret false
+end
+put qdKvMap fk mk
+put qdKvVa fk mapaddr mk
+end
+note Allocate and precompute 128K RoPE cos/sin table [131072, 64] = 32 MB UVM (<150 ms via recurrence!)
+mr = nvalloc 33554432 true
+if le mr 0
+ret false
+end
+put qdRopeMap 0 mr
+put qdRopeVa 0 mapaddr mr
+stepC = new f32 32 0.0f32
+stepS = new f32 32 0.0f32
+for j ulong 32
+f = get qdRopeFreq j
+put stepC j qdSinCos f true
+put stepS j qdSinCos f false
+end
+for blk ulong 512
+qdInitRopeBlk mr blk stepC stepS
+end
+ret true
+end
+
 fn qdGpuInit to int
 if not gbopen 1
 ret 2
@@ -2344,22 +2405,9 @@ put qdIoBuf add p 2 uchar and shr w 16 255
 put qdIoBuf add p 3 uchar and shr w 24 255
 end
 r = mapwrite get qdWork 0 QDW_LEXMAP qdIoBuf 0 1024
-note Allocate GPU KV cache (10 layers x 512 pos x 2 kv x 256 f32 x 2 = 100 MB)
-put qdKvMap 0 nvalloc 104857600 true
-if le get qdKvMap 0 0
+if not qdInitKvRope128k
 ret 10
 end
-put qdKvVa 0 mapaddr get qdKvMap 0
-note Precompute RoPE cos/sin table [512, 64] into QDW_ROPE (128 KB)
-for pos ulong 512
-pf = f32 pos
-for j ulong 32
-th = mul pf get qdRopeFreq j
-qdPutF32Io mul add mul pos 64 j 4 qdSinCos th true
-qdPutF32Io mul add mul pos 64 add 32 j 4 qdSinCos th false
-end
-end
-r = mapwrite get qdWork 0 QDW_ROPE qdIoBuf 0 131072
 if eq get qdUseW4 0 1
 m0 = nvalloc QD_LAYER_STRIDE true
 if le m0 0
