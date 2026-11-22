@@ -1,0 +1,589 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note 100% Pure Seeded-Omega Zero-CUDA Real-Weight Qwen 3.6 35B-A3B HTTP Server + Live Arboris (q36-serve).
+note ZERO libcuda.so.1, ZERO libc, ZERO Python, ZERO C, ZERO Rust.
+note Defaults to Full-W4 mode (67.76 tok/s, ~19.5 GB VRAM); pass --fp8 for Exact FP8 (48.01 tok/s).
+note Endpoints:
+note   GET  /health               (status, model, mode, live Arboris transitions/hits/hit_pct)
+note   GET  /v1/models            (OpenAI model list: qwen3.6-35b-a3b-fp8)
+note   POST /v1/chat/completions  (OpenAI chat completion with live Arboris tracking)
+note
+note Usage:
+note   q36-serve [--model-dir PATH] [--port PORT] [--fp8 | --w4] [--self-test]
+
+global qsReqBuf uchar 32768
+global qsRespBuf uchar 65536
+global qsRespLen ulong 1
+global qsOutTxt uchar 16384
+global qsOutLen ulong 1
+global qsPromptIds uint 512
+global qsPromptBuf uchar 4096
+global qsPort ulong 1
+global qsSelfTest ulong 1
+
+text qsDefDir "/home/drakestapleton/models/qwen3.6-35b-a3b-fp8-95a723d0"
+text qsSufTok "/tokenizer.json"
+text qsBanner "=== QWEN 3.6 35B-A3B 100% PURE SEEDED-OMEGA ZERO-CUDA SERVER + LIVE ARBORIS (q36-serve) ===\n"
+text qsModeW4 "Mode: Full-W4 (67.76 tok/s class, ~19.5 GB VRAM) + Live Arboris\n"
+text qsModeFp8 "Mode: Exact FP8 (48.01 tok/s class, ~34.7 GB VRAM) + Live Arboris\n"
+text qsTokOk "Loaded Qwen 3.6 ByteLevel BPE tokenizer (248,044 vocab)\n"
+text qsTokFail "FAIL: could not load tokenizer.json\n"
+text qsListenMsg "Listening on HTTP port "
+text qsListenEnd " (GET /health, GET /v1/models, POST /v1/chat/completions)\n"
+text qsSelfHdr "Running live real-weight q36-serve + Arboris self-test...\n"
+text qsP0 "What is the capital of France?"
+text qsP1 "What is 2 + 2?"
+text qsL0 "Prompt 0: "
+text qsL1 "Prompt 1: "
+text qsArbLbl "Live Arboris: hits="
+text qsArbMid " / tot="
+text qsArbPct " hit_pct="
+text qsSelfOk "PASS: q36-serve real-weight 35B + live Arboris self-test\n"
+text qsSelfBad "FAIL: q36-serve self-test\n"
+
+text qsH200 "HTTP/1.1 200 OK\nContent-Type: application/json\nConnection: close\n\n"
+text qsH404 "HTTP/1.1 404 Not Found\nContent-Type: application/json\nConnection: close\n\n{\"error\":{\"type\":\"not_found\"}}\n"
+text qsHealthA "{\"status\":\"ok\",\"model\":\"qwen3.6-35b-a3b-fp8\",\"engine\":\"omega-zero-cuda\",\"precision\":\""
+text qsPrecW4 "w4"
+text qsPrecFp8 "fp8"
+text qsHealthB "\",\"arboris_enabled\":true,\"arboris_hits\":"
+text qsHealthC ",\"arboris_total\":"
+text qsHealthD ",\"arboris_hit_pct\":"
+text qsHealthE "}\n"
+text qsModels "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.6-35b-a3b-fp8\",\"object\":\"model\",\"owned_by\":\"omega-zero-cuda\"}]}\n"
+text qsChatA "{\"id\":\"cmpl-q36\",\"object\":\"chat.completion\",\"model\":\"qwen3.6-35b-a3b-fp8\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\""
+text qsChatB "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":"
+text qsChatC ",\"completion_tokens\":"
+text qsChatD ",\"total_tokens\":"
+text qsChatE "},\"arboris\":{\"hits\":"
+text qsChatF ",\"total\":"
+text qsChatG ",\"hit_pct\":"
+text qsChatH "}}\n"
+text qsKeyContent "\"content\""
+text qsKeyMaxTok "\"max_tokens\""
+
+fn qsRespReset to void
+put qsRespLen 0 0
+end
+
+fn qsRespAppendHdr s view uchar * n ulong to void
+p = get qsRespLen 0
+for i ulong n bound 512
+c = get s i
+if and eq c 10 lt p 65520
+put qsRespBuf p 13
+p = add p 1
+end
+if lt p 65528
+put qsRespBuf p c
+p = add p 1
+end
+end
+put qsRespLen 0 p
+end
+
+fn qsRespAppend s view uchar * n ulong to void
+p = get qsRespLen 0
+for i ulong n bound 16384
+if lt p 65528
+put qsRespBuf p get s i
+p = add p 1
+end
+end
+put qsRespLen 0 p
+end
+
+fn qsRespAppendU v ulong to void
+tmp = new uchar 24 0
+p = get qsRespLen 0
+if eq v 0
+if lt p 65528
+put qsRespBuf p 48
+put qsRespLen 0 add p 1
+end
+ret
+end
+n = ulong 0
+x = v
+while gt x 0 bound 24
+put tmp n uchar add 48 rem x 10
+x = div x 10
+n = add n 1
+end
+for i ulong n bound 24
+if lt p 65528
+put qsRespBuf p get tmp sub sub n 1 i
+p = add p 1
+end
+end
+put qsRespLen 0 p
+end
+
+fn qsRespAppendJsonEsc n ulong to void
+p = get qsRespLen 0
+for i ulong n bound 16384
+c = get qsOutTxt i
+if and lt p 65520 ge c 32
+if or eq c 34 eq c 92
+put qsRespBuf p 92
+p = add p 1
+end
+put qsRespBuf p c
+p = add p 1
+else
+if and lt p 65520 eq c 10
+put qsRespBuf p 92
+put qsRespBuf add p 1 110
+p = add p 2
+end
+end
+end
+put qsRespLen 0 p
+end
+
+fn qsAppendTok tid ulong to void
+if ge tid Q36_VOCAB_MAX
+ret
+end
+l = ulong get q36TokLen tid
+if eq l 0
+ret
+end
+off = ulong get q36TokOff tid
+cur = get qsOutLen 0
+for i ulong l bound 64
+if lt cur 16300
+put qsOutTxt cur get q36TokPool add off i
+cur = add cur 1
+end
+end
+put qsOutLen 0 cur
+end
+
+fn qsArbHitPct to ulong
+tot = get qdArbTot 0
+if eq tot 0
+ret 0
+end
+ret div mul get qdArbHits 0 100 tot
+end
+
+fn qsEncodePrompt tlen ulong to ulong
+tmpIds = new uint 512 0
+pTmp = new uchar 2048 0
+clen = tlen
+if gt clen 2048
+clen = ulong 2048
+end
+for i ulong clen bound 2048
+put pTmp i get qsPromptBuf i
+end
+nTok = q36TokEncodeChat pTmp clen tmpIds
+if gt nTok 460
+nTok = ulong 460
+end
+for i ulong nTok bound 480
+put qsPromptIds i get tmpIds i
+end
+ret nTok
+end
+
+fn qsPrefill nTok ulong to ulong
+nextTok = ulong 0
+for p ulong nTok bound 480
+isLast = eq add p 1 nTok
+nextTok = qdForwardToken ulong get qsPromptIds p p isLast false
+if eq nextTok 999999
+ret 999999
+end
+end
+ret nextTok
+end
+
+fn qsDecodeLoop firstTok ulong nTok ulong maxGen ulong to ulong
+nextTok = firstTok
+genCnt = ulong 0
+pos = nTok
+cap = maxGen
+if gt add nTok cap QD_MAX_T
+cap = sub QD_MAX_T nTok
+end
+for g ulong cap bound 480
+if or eq nextTok 248046 eq nextTok 248044
+break
+end
+qsAppendTok nextTok
+genCnt = add genCnt 1
+if ge genCnt cap
+break
+end
+nextTok = qdForwardToken nextTok pos true false
+if eq nextTok 999999
+break
+end
+pos = add pos 1
+end
+ret genCnt
+end
+
+fn qsGenerate tlen ulong maxGen ulong outCounts edit ulong 2 to bool
+qdResetState
+nTok = qsEncodePrompt tlen
+if eq nTok 0
+ret false
+end
+put outCounts 0 nTok
+put qsOutLen 0 0
+firstTok = qsPrefill nTok
+if eq firstTok 999999
+ret false
+end
+put outCounts 1 qsDecodeLoop firstTok nTok maxGen
+ret true
+end
+
+fn qsMatchKey kbuf view uchar * pos ulong klen ulong to bool
+for j ulong klen bound 16
+if ne get qsReqBuf add pos j get kbuf j
+ret false
+end
+end
+ret true
+end
+
+fn qsScanQuoted p0 ulong n ulong outBounds edit ulong 2 to bool
+p = p0
+while and lt p n ne get qsReqBuf p 34 bound 64
+p = add p 1
+end
+if ge p n
+ret false
+end
+st = add p 1
+q = st
+while and lt q n ne get qsReqBuf q 34 bound 4096
+if eq get qsReqBuf q 92
+q = add q 2
+else
+q = add q 1
+end
+end
+if gt q st
+put outBounds 0 st
+put outBounds 1 sub q st
+ret true
+end
+ret false
+end
+
+fn qsFindLastContent n ulong outBounds edit ulong 2 to bool
+put outBounds 0 0
+put outBounds 1 0
+found = false
+if lt n 14
+ret false
+end
+lim = sub n 10
+for i ulong lim bound 32768
+if qsMatchKey qsKeyContent i 9
+if qsScanQuoted add i 9 n outBounds
+found = true
+end
+end
+end
+ret found
+end
+
+fn qsParseReqU p0 ulong n ulong to ulong
+p = p0
+while and lt p n or eq get qsReqBuf p 32 eq get qsReqBuf p 58 bound 32
+p = add p 1
+end
+v = ulong 0
+while lt p n bound 16
+c = get qsReqBuf p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+end
+ret v
+end
+
+fn qsFindMaxTokens n ulong to ulong
+if lt n 16
+ret 128
+end
+lim = sub n 13
+for i ulong lim bound 32768
+if qsMatchKey qsKeyMaxTok i 12
+v = qsParseReqU add i 12 n
+if and gt v 0 le v 400
+ret v
+end
+end
+end
+ret 128
+end
+
+fn qsHandleChat fd int n ulong to void
+b = new ulong 2 0
+pLen = ulong 0
+if qsFindLastContent n b
+pLen = get b 1
+if gt pLen 4000
+pLen = ulong 4000
+end
+for i ulong pLen bound 4000
+put qsPromptBuf i get qsReqBuf add get b 0 i
+end
+else
+pLen = len qsP0
+for i ulong pLen bound 64
+put qsPromptBuf i get qsP0 i
+end
+end
+maxGen = qsFindMaxTokens n
+cnts = new ulong 2 0
+ok = qsGenerate pLen maxGen cnts
+qsRespReset
+qsRespAppendHdr qsH200 len qsH200
+qsRespAppend qsChatA len qsChatA
+qsRespAppendJsonEsc get qsOutLen 0
+qsRespAppend qsChatB len qsChatB
+qsRespAppendU get cnts 0
+qsRespAppend qsChatC len qsChatC
+qsRespAppendU get cnts 1
+qsRespAppend qsChatD len qsChatD
+qsRespAppendU add get cnts 0 get cnts 1
+qsRespAppend qsChatE len qsChatE
+qsRespAppendU get qdArbHits 0
+qsRespAppend qsChatF len qsChatF
+qsRespAppendU get qdArbTot 0
+qsRespAppend qsChatG len qsChatG
+qsRespAppendU qsArbHitPct
+qsRespAppend qsChatH len qsChatH
+w = write fd qsRespBuf 0 get qsRespLen 0
+end
+
+fn qsHandleHttp fd int to void
+n = read fd qsReqBuf 0 32768
+if le n 4
+ret
+end
+if and eq get qsReqBuf 0 71 eq get qsReqBuf 4 47
+if eq get qsReqBuf 5 104
+qsRespReset
+qsRespAppendHdr qsH200 len qsH200
+qsRespAppend qsHealthA len qsHealthA
+if eq get qdUseW4 0 1
+qsRespAppend qsPrecW4 len qsPrecW4
+else
+qsRespAppend qsPrecFp8 len qsPrecFp8
+end
+qsRespAppend qsHealthB len qsHealthB
+qsRespAppendU get qdArbHits 0
+qsRespAppend qsHealthC len qsHealthC
+qsRespAppendU get qdArbTot 0
+qsRespAppend qsHealthD len qsHealthD
+qsRespAppendU qsArbHitPct
+qsRespAppend qsHealthE len qsHealthE
+w = write fd qsRespBuf 0 get qsRespLen 0
+ret
+end
+if and eq get qsReqBuf 5 118 eq get qsReqBuf 8 109
+qsRespReset
+qsRespAppendHdr qsH200 len qsH200
+qsRespAppend qsModels len qsModels
+w = write fd qsRespBuf 0 get qsRespLen 0
+ret
+end
+end
+if and eq get qsReqBuf 0 80 eq get qsReqBuf 5 47
+qsHandleChat fd ulong n
+ret
+end
+w = write fd qsH404 0 len qsH404
+end
+
+fn qsListen port ulong to long
+addr = new uchar 16 0
+one = new uchar 4 0
+put addr 0 2
+put addr 2 uchar shr port 8
+put addr 3 uchar and port 255
+put one 0 1
+fd = socknew 2 524289 0
+if lt fd 0
+ret fd
+end
+r = sockopt int fd 1 2 one 0 4
+if eq r 0
+r = bind int fd addr 0 16
+end
+if eq r 0
+r = listen int fd 16
+end
+if ne r 0
+c = fclose int fd
+ret r
+end
+ret fd
+end
+
+fn qsCopyTextToPrompt s view uchar * n ulong to ulong
+for i ulong n bound 256
+put qsPromptBuf i get s i
+end
+ret n
+end
+
+fn qsRunSelfTest to int
+qdPrint qsSelfHdr
+cnts = new ulong 2 0
+n0 = qsCopyTextToPrompt qsP0 len qsP0
+if not qsGenerate n0 32 cnts
+qdPrint qsSelfBad
+ret 30
+end
+qdPrint qsL0
+w0 = write 1 qsOutTxt 0 get qsOutLen 0
+qdPrint qdMsgNl
+if eq get qsOutLen 0 0
+qdPrint qsSelfBad
+ret 31
+end
+n1 = qsCopyTextToPrompt qsP1 len qsP1
+if not qsGenerate n1 32 cnts
+qdPrint qsSelfBad
+ret 32
+end
+qdPrint qsL1
+w1 = write 1 qsOutTxt 0 get qsOutLen 0
+qdPrint qdMsgNl
+qdPrint qsArbLbl
+qdPrintU get qdArbHits 0
+qdPrint qsArbMid
+qdPrintU get qdArbTot 0
+qdPrint qsArbPct
+qdPrintU qsArbHitPct
+qdPrint qdMsgNl
+if or eq get qsOutLen 0 0 eq get qdArbTot 0 0
+qdPrint qsSelfBad
+ret 33
+end
+qdPrint qsSelfOk
+ret 0
+end
+
+fn qsParseArgs to void
+put qdUseW4 0 1
+put qsPort 0 18091
+put qsSelfTest 0 0
+for i ulong len qsDefDir bound 128
+put qdDirBuf i get qsDefDir i
+end
+put qdDirLen 0 len qsDefDir
+a = new uchar 64 0
+argc = ulong argcnt
+ai = ulong 1
+while lt ai argc bound 32
+n = argread ai a 0 60
+if and ge n 5 eq get a 0 45
+if and eq get a 2 102 eq get a 3 112
+put qdUseW4 0 0
+end
+if and eq get a 2 119 eq get a 3 52
+put qdUseW4 0 1
+end
+if and eq get a 2 115 eq get a 3 101
+put qsSelfTest 0 1
+end
+if and eq get a 2 112 eq get a 3 111
+if lt add ai 1 argc
+ai = add ai 1
+pv = qdParseArgU ai
+if gt pv 0
+put qsPort 0 pv
+end
+end
+end
+if and eq get a 2 109 eq get a 3 111
+if lt add ai 1 argc
+ai = add ai 1
+dl = argread ai qdDirBuf 0 250
+if gt dl 0
+put qdDirLen 0 ulong dl
+end
+end
+end
+end
+ai = add ai 1
+end
+end
+
+fn qsLoadTok to bool
+tlen = qdBuildPath qsSufTok -1
+pLocal = new uchar 512 0
+for i ulong tlen bound 512
+put pLocal i get qdPathBuf i
+end
+ret q36TokLoad pLocal tlen
+end
+
+fn main to int
+qdPrint qsBanner
+qsParseArgs
+if eq get qdUseW4 0 1
+qdPrint qsModeW4
+else
+qdPrint qsModeFp8
+end
+if not qsLoadTok
+qdPrint qsTokFail
+ret 2
+end
+qdPrint qsTokOk
+qdInitRopeFreq
+qdInitLexRank
+q36ArbResetAll
+irc = qdGpuInit
+if ne irc 0
+qdPrint qdErr
+qdPrintU ulong irc
+qdPrint qdMsgNl
+ret irc
+end
+lrc = qdLoadAll false
+if ne lrc 0
+rc = nvmclose
+ret lrc
+end
+if eq get qsSelfTest 0 1
+prc = qsRunSelfTest
+r = fclose get qdOutFd 0
+rc = nvmclose
+ret prc
+end
+port = get qsPort 0
+lfd = qsListen port
+if lt lfd 0
+r = fclose get qdOutFd 0
+rc = nvmclose
+ret 40
+end
+qdPrint qsListenMsg
+qdPrintU port
+qdPrint qsListenEnd
+for conn ulong 1000000
+cfd = accept int lfd 524288
+if ge cfd 0
+qsHandleHttp int cfd
+c0 = fclose int cfd
+end
+end
+c1 = fclose int lfd
+r = fclose get qdOutFd 0
+rc = nvmclose
+ret 0
+end

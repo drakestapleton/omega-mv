@@ -17,7 +17,7 @@ note   om/gpu/q36/arboris/prefetch.om
 const QD_H ulong 2048
 const QD_VOCAB ulong 248320
 const QD_LAYERS ulong 40
-const QD_MAX_T ulong 128
+const QD_MAX_T ulong 512
 const QD_OUT_DATA_OFF ulong 38080
 const QD_LM_BYTES ulong 1017118720
 const QD_EMB_OFF ulong 1017156800
@@ -59,8 +59,9 @@ const QDW_ESW ulong 286720
 const QDW_ALOG ulong 327680
 const QDW_FNORM ulong 344064
 const QDW_LEXMAP ulong 352256
-const QDW_ROPE ulong 360448
 const QDW_POS ulong 393216
+const QDW_TRACE ulong 401408
+const QDW_ROPE ulong 524288
 const QDW_LOGW4 ulong 1048576
 const QDW_LOGBF ulong 2097152
 const QDW_CIDS ulong 3145728
@@ -1707,92 +1708,6 @@ qdArg doAdd
 ret qdPktEmitBx 10 1 256
 end
 
-fn qdRmsNormLayer L ulong isPost bool to bool
-b2048 = mul L QD_H
-ss = f32 0.0f32
-for i ulong QD_H
-v = get qdX i
-ss = add ss mul v v
-end
-inv = div 1.0f32 qdSqrt add div ss 2048.0f32 0.000001f32
-if isPost
-for i ulong QD_H
-put qdXn i mul mul get qdX i inv get qdPostNormC add b2048 i
-end
-else
-for i ulong QD_H
-put qdXn i mul mul get qdX i inv get qdInNormC add b2048 i
-end
-end
-ret qdWriteF32 get qdWork 0 QDW_XN 0 QD_H
-end
-
-fn qdGdnConvCh tBase ulong cBase ulong c ulong to void
-tb = add tBase mul c 3
-x0 = get qdGdnTail tb
-x1 = get qdGdnTail add tb 1
-x2 = get qdGdnTail add tb 2
-x3 = get qdQkv c
-wb = add cBase mul c 4
-s = mul x0 get qdConvC wb
-s = add s mul x1 get qdConvC add wb 1
-s = add s mul x2 get qdConvC add wb 2
-s = add s mul x3 get qdConvC add wb 3
-put qdGdnTail tb x1
-put qdGdnTail add tb 1 x2
-put qdGdnTail add tb 2 x3
-put qdQkv c qdSilu s
-end
-
-fn qdL2Norm128 base ulong scale f32 to void
-sq = f32 0.000001f32
-for d ulong 128
-v = get qdQkv add base d
-sq = add sq mul v v
-end
-inv = mul div 1.0f32 qdSqrt sq scale
-for d ulong 128
-idx = add base d
-put qdQkv idx mul get qdQkv idx inv
-end
-end
-
-fn qdGdnL2Norm to void
-for hk ulong 16
-qb = mul hk 128
-qdL2Norm128 qb 0.08838835f32
-qdL2Norm128 add 2048 qb 1.0f32
-end
-end
-
-fn qdGdnConvNorm gdnIdx ulong to bool
-tBase = mul gdnIdx 24576
-cBase = mul gdnIdx 32768
-for c ulong 8192
-qdGdnConvCh tBase cBase c
-end
-qdGdnL2Norm
-ret true
-end
-
-fn qdRunOutProj L ulong wOff ulong sOff ulong to bool
-if not qdWriteF32 get qdWork 0 QDW_Y 1 4096
-ret false
-end
-wbase = qdLayerWVa L
-sbase = qdLayerSVa L
-yVa = add get qdWorkVa 0 QDW_Y
-oVa = add get qdWorkVa 0 QDW_AOUT
-qdPktStart
-if not qdEmitFp8 yVa add wbase wOff add sbase mul sOff 2 oVa 4096 2048
-ret false
-end
-if not qdPktRun
-ret false
-end
-ret qdReadF32 get qdWork 0 QDW_AOUT 2 2048
-end
-
 fn qdEmitGdnTail L ulong gdnIdx ulong to bool
 wbase = qdLayerWVa L
 sbase = qdLayerSVa L
@@ -1826,360 +1741,6 @@ end
 ret qdEmitBf16 xnVa add wbase GDN_SH_GATE add wva QDW_SHG 2048 1
 end
 
-fn qdStepGdnToRouter L ulong gdnIdx ulong to bool
-wbase = qdLayerWVa L
-sbase = qdLayerSVa L
-wva = get qdWorkVa 0
-xnVa = add wva QDW_XN
-note 11-QMD SINGLE-SUBMIT GDN LAYER: in_norm -> qkv/z/ab -> conv+L2 -> decay/beta -> GDN_f32 -> out -> res+post_norm -> router + sh_gate!
-qdPktStart
-if not qdEmitRmsNormAdd sbase 0
-ret false
-end
-if not qdEmitFp8 xnVa add wbase GDN_QKV_W add sbase mul GDN_QKV_S 2 add wva QDW_QKV 2048 8192
-ret false
-end
-if not qdEmitFp8 xnVa add wbase GDN_Z_W add sbase mul GDN_Z_S 2 add wva QDW_Z 2048 4096
-ret false
-end
-if not qdEmitBf16 xnVa add wbase GDN_IN_A add wva QDW_AB 2048 64
-ret false
-end
-qdPtr add wva QDW_QKV
-qdPtr add sbase mul GDN_CONV 2
-qdPtr add get qdGdnTailVa 0 mul gdnIdx 98304
-if not qdPktEmitBx 9 64 128
-ret false
-end
-if not qdEmitGdnTail L gdnIdx
-ret false
-end
-ret qdPktRun
-end
-
-global qdFaQn f32 256
-global qdFaKn f32 256
-global qdFaCs f32 32
-global qdFaSn f32 32
-
-fn qdRopePairQ qb ulong j ulong to void
-i0 = add qb j
-i1 = add i0 32
-x0 = get qdQkv i0
-x1 = get qdQkv i1
-c = get qdFaCs j
-s = get qdFaSn j
-put qdQkv i0 sub mul x0 c mul x1 s
-put qdQkv i1 add mul x1 c mul x0 s
-end
-
-fn qdFaNormRopeQ qb ulong to void
-ss = f32 0.0f32
-for d ulong 256
-v = get qdQkv add qb d
-ss = add ss mul v v
-end
-inv = div 1.0f32 qdSqrt add div ss 256.0f32 0.000001f32
-for d ulong 256
-idx = add qb d
-put qdQkv idx mul mul get qdQkv idx inv get qdFaQn d
-end
-for j ulong 32
-qdRopePairQ qb j
-end
-end
-
-fn qdDotQK qb ulong cb ulong to f32
-dot = f32 0.0f32
-for d ulong 256
-dot = add dot mul get qdQkv add qb d get qdKCache add cb d
-end
-ret dot
-end
-
-fn qdFaScores kvLayer ulong kh ulong qb ulong tLen ulong to f32
-mx = f32 neg 1000000.0f32
-for t ulong tLen bound 128
-cb = add kvLayer add mul t 512 mul kh 256
-sc = mul qdDotQK qb cb 0.0625f32
-put qdScores t sc
-if gt sc mx
-mx = sc
-end
-end
-sm = f32 0.0f32
-for t ulong tLen bound 128
-e = qdExp sub get qdScores t mx
-put qdScores t e
-sm = add sm e
-end
-ret div 1.0f32 sm
-end
-
-fn qdValAcc kvLayer ulong kh ulong tLen ulong d ulong to f32
-acc = f32 0.0f32
-for t ulong tLen bound 128
-cb = add kvLayer add mul t 512 mul kh 256
-acc = add acc mul get qdScores t get qdVCache add cb d
-end
-ret acc
-end
-
-fn qdFaWriteY kvLayer ulong kh ulong tLen ulong h ulong invSm f32 to void
-yb = mul h 256
-gb = add mul h 512 256
-for d ulong 256
-acc = mul qdValAcc kvLayer kh tLen d invSm
-gv = qdSigmoid get qdQkv add gb d
-put qdY add yb d mul acc gv
-end
-end
-
-fn qdFaHeadAttend faIdx ulong pos ulong h ulong to void
-kvLayer = mul faIdx 65536
-tLen = add pos 1
-qb = mul h 512
-qdFaNormRopeQ qb
-kh = div h 8
-invSm = qdFaScores kvLayer kh qb tLen
-qdFaWriteY kvLayer kh tLen h invSm
-end
-
-fn qdRopePairK kb ulong j ulong to void
-i0 = add kb j
-i1 = add i0 32
-x0 = get qdK i0
-x1 = get qdK i1
-c = get qdFaCs j
-s = get qdFaSn j
-put qdK i0 sub mul x0 c mul x1 s
-put qdK i1 add mul x1 c mul x0 s
-end
-
-fn qdFaNormKHead kb ulong to void
-ss = f32 0.0f32
-for d ulong 256
-v = get qdK add kb d
-ss = add ss mul v v
-end
-inv = div 1.0f32 qdSqrt add div ss 256.0f32 0.000001f32
-for d ulong 256
-idx = add kb d
-put qdK idx mul mul get qdK idx inv get qdFaKn d
-end
-for j ulong 32
-qdRopePairK kb j
-end
-end
-
-fn qdFaNormRopeStoreK faIdx ulong pos ulong to void
-kvLayer = mul faIdx 65536
-for kh ulong 2
-kb = mul kh 256
-qdFaNormKHead kb
-cb = add kvLayer add mul pos 512 kb
-for d ulong 256
-put qdKCache add cb d get qdK add kb d
-put qdVCache add cb d get qdV add kb d
-end
-end
-end
-
-fn qdEmitFaTail L ulong to bool
-wbase = qdLayerWVa L
-sbase = qdLayerSVa L
-wva = get qdWorkVa 0
-xnVa = add wva QDW_XN
-qdPktStart
-if not qdEmitFp8 add wva QDW_Y add wbase FA_O_W add sbase mul FA_O_S 2 add wva QDW_AOUT 4096 2048
-ret false
-end
-if not qdEmitRmsNormAdd add sbase mul FA_POST_NORM 2 1
-ret false
-end
-if not qdEmitBf16 xnVa add wbase FA_GATE add wva QDW_ROUT 2048 256
-ret false
-end
-if not qdEmitBf16 xnVa add wbase FA_SH_GATE add wva QDW_SHG 2048 1
-ret false
-end
-ret qdPktRun
-end
-
-fn qdStepFullAttnToRouter L ulong faIdx ulong pos ulong to bool
-wbase = qdLayerWVa L
-sbase = qdLayerSVa L
-wva = get qdWorkVa 0
-xnVa = add wva QDW_XN
-qdPktStart
-if not qdEmitRmsNormAdd sbase 0
-ret false
-end
-if not qdEmitFp8 xnVa add wbase FA_Q_W add sbase mul FA_Q_S 2 add wva QDW_QKV 2048 8192
-ret false
-end
-if not qdEmitFp8 xnVa add wbase FA_K_W add sbase mul FA_K_S 2 add wva QDW_K 2048 512
-ret false
-end
-if not qdEmitFp8 xnVa add wbase FA_V_W add sbase mul FA_V_S 2 add wva QDW_V 2048 512
-ret false
-end
-if not qdPktRun
-ret false
-end
-if not qdReadF32 get qdWork 0 QDW_QKV 0 8192
-ret false
-end
-if not qdReadF32 get qdWork 0 QDW_K 3 512
-ret false
-end
-if not qdReadF32 get qdWork 0 QDW_V 4 512
-ret false
-end
-b256 = mul faIdx 256
-for d ulong 256
-put qdFaQn d get qdQnC add b256 d
-put qdFaKn d get qdKnC add b256 d
-end
-pf = f32 pos
-for j ulong 32
-th = mul pf get qdRopeFreq j
-put qdFaCs j qdSinCos th true
-put qdFaSn j qdSinCos th false
-end
-qdFaNormRopeStoreK faIdx pos
-for h ulong 16
-qdFaHeadAttend faIdx pos h
-end
-if not qdWriteF32 get qdWork 0 QDW_Y 1 4096
-ret false
-end
-ret qdEmitFaTail L
-end
-
-fn qdArbStep L ulong to void
-if and gt L 0 eq get qdArbHasPred 0 1
-for k ulong 8
-id = uint get qdIds k
-for p ulong 8
-if eq get qdArbPred p id
-put qdArbHits 0 add get qdArbHits 0 1
-break
-end
-end
-end
-put qdArbTot 0 add get qdArbTot 0 8
-end
-idsLocal = new uint 8 0
-for j ulong 8
-put idsLocal j uint get qdIds j
-end
-q36ArbObserve L idsLocal
-prLocal = new uint 8 0
-if lt L 39
-np = q36ArbPredict L idsLocal 8 prLocal
-for q ulong 8
-put qdArbPred q get prLocal q
-end
-put qdArbHasPred 0 1
-else
-put qdArbHasPred 0 0
-end
-end
-
-fn qdRouterTop8 L ulong to void
-mx = get qdRout 0
-for e ulong 256
-if gt get qdRout e mx
-mx = get qdRout e
-end
-end
-sm = f32 0.0f32
-for e ulong 256
-v = qdExp sub get qdRout e mx
-put qdRout e v
-sm = add sm v
-end
-used = new uchar 256 0
-wsum = f32 0.0f32
-for k ulong 8
-bestE = ulong 0
-bestV = f32 neg 1.0f32
-for e ulong 256
-if eq get used e 0
-v = get qdRout e
-if gt v bestV
-bestV = v
-bestE = e
-end
-end
-end
-put used bestE 1
-put qdIds k bestE
-put qdWts k div bestV sm
-wsum = add wsum get qdWts k
-end
-for k ulong 8
-put qdWts k div get qdWts k wsum
-end
-qdArbStep L
-end
-
-fn qdMoeSwiglu to bool
-if not qdReadF32 get qdWork 0 QDW_EMID 6 8192
-ret false
-end
-if not qdReadF32 get qdWork 0 QDW_SHMID 8 1024
-ret false
-end
-for k ulong 8
-base = mul k 1024
-for d ulong 512
-g = get qdEmid add base d
-u = get qdEmid add base add d 512
-put qdEmid add mul k 512 d mul qdSilu g u
-end
-end
-for d ulong 512
-g = get qdShMid d
-u = get qdShMid add d 512
-put qdShMid d mul qdSilu g u
-end
-if not qdWriteF32 get qdWork 0 QDW_EMID 2 4096
-ret false
-end
-ret qdWriteF32 get qdWork 0 QDW_SHMID 3 512
-end
-
-fn qdMoeEmitExpGu L ulong isFa bool k ulong to bool
-expW0 = GDN_EXP_W0
-expS0 = GDN_EXP_S0
-if isFa
-expW0 = FA_EXP_W0
-expS0 = FA_EXP_S0
-end
-rk = get qdLexRank get qdIds k
-ew = add qdLayerWVa L add expW0 add mul rk QD_EXP_WSTRIDE 1048576
-es = add qdLayerSVa L add mul expS0 2 add mul rk QD_EXP_SSTRIDE 256
-eo = add get qdWorkVa 0 add QDW_EMID mul k 4096
-ret qdEmitFp8 add get qdWorkVa 0 QDW_XN ew es eo 2048 1024
-end
-
-fn qdMoeEmitExpDn L ulong isFa bool k ulong to bool
-expW0 = GDN_EXP_W0
-expS0 = GDN_EXP_S0
-if isFa
-expW0 = FA_EXP_W0
-expS0 = FA_EXP_S0
-end
-rk = get qdLexRank get qdIds k
-ew = add qdLayerWVa L add expW0 mul rk QD_EXP_WSTRIDE
-es = add qdLayerSVa L add mul expS0 2 mul rk QD_EXP_SSTRIDE
-ei = add get qdWorkVa 0 add QDW_ESW mul k 2048
-eo = add get qdWorkVa 0 add QDW_EOUT mul k 8192
-ret qdEmitFp8 ei ew es eo 512 2048
-end
-
 fn qdMoeEmitShGu L ulong isFa bool to bool
 shGuW = GDN_SH_GU_W
 shGuS = GDN_SH_GU_S
@@ -2205,95 +1766,6 @@ es = add qdLayerSVa L mul shDnS 2
 ei = add get qdWorkVa 0 add QDW_ESW 16384
 eo = add get qdWorkVa 0 QDW_SHOUT
 ret qdEmitFp8 ei ew es eo 512 2048
-end
-
-fn qdMoeRunAll L ulong isFa bool to bool
-qdPktStart
-for k ulong 8
-if not qdMoeEmitExpGu L isFa k
-ret false
-end
-end
-if not qdMoeEmitShGu L isFa
-ret false
-end
-qdPtr add get qdWorkVa 0 QDW_EMID
-qdPtr add get qdWorkVa 0 QDW_ESW
-if not qdPktEmitBx 6 18 256
-ret false
-end
-for k ulong 8
-if not qdMoeEmitExpDn L isFa k
-ret false
-end
-end
-if not qdMoeEmitShDn L isFa
-ret false
-end
-qdPtr add get qdWorkVa 0 QDW_X
-qdPtr add get qdWorkVa 0 QDW_EOUT
-qdPtr add get qdWorkVa 0 QDW_WTS
-if not qdPktEmitBx 8 8 256
-ret false
-end
-ret qdPktRun
-end
-
-fn qdMoeCombine shScale f32 to void
-for d ulong 2048
-acc = mul shScale get qdShOut d
-for k ulong 8
-acc = add acc mul get qdWts k get qdEout add mul k 2048 d
-end
-put qdX d add get qdX d acc
-end
-end
-
-fn qdStepMoe L ulong isFa bool to bool
-if not qdReadF32 get qdWork 0 QDW_ROUT 5 256
-ret false
-end
-if not qdReadF32 get qdWork 0 QDW_SHG 13 1
-ret false
-end
-qdRouterTop8 L
-put qdWts 8 qdSigmoid get qdTmpVec 0
-if not qdWriteF32 get qdWork 0 QDW_WTS 7 9
-ret false
-end
-ret qdMoeRunAll L isFa
-end
-
-fn qdLmPickTop64 to bool
-topV = new f32 64 neg 1000000000.0f32
-topI = new uint 64 0
-minIdx = ulong 0
-minVal = f32 neg 1000000000.0f32
-for v ulong QD_VOCAB
-s = get qdLogW4 v
-if gt s minVal
-put topV minIdx s
-put topI minIdx uint v
-minIdx = ulong 0
-minVal = get topV 0
-for j ulong 64
-if lt get topV j minVal
-minVal = get topV j
-minIdx = j
-end
-end
-end
-end
-for j ulong 64
-w = get topI j
-put qdCandIds j w
-p = mul j 4
-put qdIoBuf p uchar and w 255
-put qdIoBuf add p 1 uchar and shr w 8 255
-put qdIoBuf add p 2 uchar and shr w 16 255
-put qdIoBuf add p 3 uchar and shr w 24 255
-end
-ret eq mapwrite get qdWork 0 QDW_CIDS qdIoBuf 0 256 256
 end
 
 fn qdLmCheckParity bestId ulong to bool
@@ -2344,58 +1816,6 @@ end
 ret true
 end
 
-fn qdRunLmHead checkParity bool to ulong
-note Single-submit 4-kernel final_norm + W4 Two-Pass Exact lm_head!
-qdPktStart
-if not qdEmitRmsNormAdd add get qdWorkVa 0 QDW_FNORM 0
-ret 999999
-end
-qdPtr get qdLmW4Va 0
-qdPtr add get qdLmW4Va 0 254279680
-qdPtr add get qdWorkVa 0 QDW_XN
-qdPtr add get qdWorkVa 0 QDW_LOGW4
-qdArg uint QD_VOCAB
-if not qdPktEmitBx 3 7760 256
-ret 999999
-end
-qdPtr add get qdWorkVa 0 QDW_LOGW4
-qdPtr add get qdWorkVa 0 QDW_CIDS
-if not qdPktEmitBx 7 64 256
-ret 999999
-end
-qdPtr mapaddr get qdLmBf16 0
-qdPtr add get qdWorkVa 0 QDW_XN
-qdPtr add get qdWorkVa 0 QDW_CIDS
-qdPtr add get qdWorkVa 0 QDW_CLOG
-qdArg 64
-if not qdPktEmitBx 4 64 32
-ret 999999
-end
-if not qdPktRun
-ret 999999
-end
-if not qdReadCandIds
-ret 999999
-end
-if not qdReadF32 get qdWork 0 QDW_CLOG 12 64
-ret 999999
-end
-bestId = ulong get qdCandIds 0
-bestLog = get qdCandLog 0
-for j ulong 64
-if gt get qdCandLog j bestLog
-bestLog = get qdCandLog j
-bestId = ulong get qdCandIds j
-end
-end
-if checkParity
-if not qdLmCheckParity bestId
-ret 999999
-end
-end
-ret bestId
-end
-
 fn qdEmitGpuMoe L ulong isFa bool to bool
 wbase = qdLayerWVa L
 sbase = qdLayerSVa L
@@ -2406,9 +1826,10 @@ if isFa
 expW0 = FA_EXP_W0
 expS0 = FA_EXP_S0
 end
-note 1. GPU router_top8_lex: softmax + top-8 + lexRank + sigmoid(sh_gate) -> QDW_IDS, QDW_WTS[9]
+note 1. GPU router_top8_lex: writes per-layer QDW_TRACE[L] for live Arboris + QDW_WTS[9]
+idsVa = add wva add QDW_TRACE mul L 64
 qdPtr add wva QDW_ROUT
-qdPtr add wva QDW_IDS
+qdPtr idsVa
 qdPtr add wva QDW_WTS
 qdPtr add wva QDW_SHG
 qdPtr add wva QDW_LEXMAP
@@ -2419,7 +1840,7 @@ note 2. 1-launch 8-expert FP8 grouped gate_up (Grid=(32,8,1) = 256 CTAs!)
 qdPtr add wva QDW_XN
 qdPtr add wbase add expW0 1048576
 qdPtr add sbase add mul expS0 2 256
-qdPtr add wva QDW_IDS
+qdPtr idsVa
 qdPtr mapaddr get qdLut 0
 qdPtr add wva QDW_EMID
 qdArg 2048
@@ -2441,7 +1862,7 @@ note 4. 1-launch 8-expert FP8 grouped down (Grid=(64,8,1) = 512 CTAs!)
 qdPtr add wva QDW_ESW
 qdPtr add wbase expW0
 qdPtr add sbase mul expS0 2
-qdPtr add wva QDW_IDS
+qdPtr idsVa
 qdPtr mapaddr get qdLut 0
 qdPtr add wva QDW_EOUT
 qdArg 512
@@ -2463,8 +1884,9 @@ end
 fn qdEmitGpuMoeW4 L ulong isFa bool to bool
 w4 = qdLayerW4Va L
 wva = get qdWorkVa 0
+idsVa = add wva add QDW_TRACE mul L 64
 qdPtr add wva QDW_ROUT
-qdPtr add wva QDW_IDS
+qdPtr idsVa
 qdPtr add wva QDW_WTS
 qdPtr add wva add QDW_ROUT 1024
 qdPtr add wva QDW_LEXMAP
@@ -2475,7 +1897,7 @@ note 1-launch 9-expert 4-row/warp W4 gate_up (8 routed + slot 256 shared in para
 qdPtr add wva QDW_XN
 qdPtr add w4 W4_GU_W
 qdPtr add w4 W4_GU_S
-qdPtr add wva QDW_IDS
+qdPtr idsVa
 qdPtr add wva QDW_EMID
 qdArg 2048
 qdArg 1024
@@ -2487,7 +1909,7 @@ note FUSED SwiGLU + zero-loop 4-row/half-warp W4 down_proj (-40 swiglu9 launches
 qdPtr add wva QDW_EMID
 qdPtr add w4 W4_DN_W
 qdPtr add w4 W4_DN_S
-qdPtr add wva QDW_IDS
+qdPtr idsVa
 qdPtr add wva QDW_EOUT
 if not qdPktEmitGy 22 32 9 256
 ret false
@@ -2566,8 +1988,8 @@ note Fused FA Q[8192] | K[512] | V[512] in ONE 4-row/warp W4 launch!
 if not qdEmitW4Gemv4R xnVa d4 add d4 9437184 add wva QDW_QKV 2048 9216
 ret false
 end
-kBase = add get qdKvVa 0 mul faIdx 2621440
-vBase = add kBase 1310720
+kBase = add get qdKvVa 0 mul faIdx 10485760
+vBase = add kBase 5242880
 qdPtr add wva add QDW_QKV 32768
 qdPtr add wva add QDW_QKV 34816
 qdPtr add sbase mul FA_KNORM 2
@@ -2677,8 +2099,8 @@ ret false
 end
 sbase = qdLayerSVa L
 wva = get qdWorkVa 0
-kBase = add get qdKvVa 0 mul faIdx 2621440
-vBase = add kBase 1310720
+kBase = add get qdKvVa 0 mul faIdx 10485760
+vBase = add kBase 5242880
 note GPU k_norm + partial RoPE + KV cache append
 qdPtr add wva QDW_K
 qdPtr add wva QDW_V
@@ -2771,6 +2193,41 @@ end
 ret qdPktFinish 1
 end
 
+fn qdUpdateArboris to void
+if ne mapread get qdWork 0 QDW_TRACE qdIoBuf 0 2560 2560
+ret
+end
+q36ArbResetToken
+idsLocal = new uint 8 0
+prLocal = new uint 8 0
+hasPred = ulong 0
+np = ulong 0
+for L ulong QD_LAYERS
+base = mul L 64
+for k ulong 8
+p = add base mul k 4
+b0 = uint get qdIoBuf p
+b1 = shl uint get qdIoBuf add p 1 8
+b2 = shl uint get qdIoBuf add p 2 16
+b3 = shl uint get qdIoBuf add p 3 24
+put idsLocal k or or b0 b1 or b2 b3
+end
+if eq hasPred 1
+h = q36ArbScorePred prLocal np idsLocal
+put qdArbHits 0 add get qdArbHits 0 h
+put qdArbTot 0 add get qdArbTot 0 8
+end
+q36ArbObserve L idsLocal
+if lt add L 1 QD_LAYERS
+np = q36ArbPredict L idsLocal 8 prLocal
+hasPred = ulong 1
+if eq np 0
+hasPred = ulong 0
+end
+end
+end
+end
+
 fn qdForwardToken tid ulong pos ulong runHead bool checkParity bool to ulong
 if not qdLoadEmbed tid
 ret 999999
@@ -2787,11 +2244,13 @@ if not runHead
 if not qdReplayPre 1
 ret 999999
 end
+qdUpdateArboris
 ret 0
 end
 if not qdReplayPre 0
 ret 999999
 end
+qdUpdateArboris
 if not qdReadCandIds
 ret 999999
 end
@@ -2885,14 +2344,14 @@ put qdIoBuf add p 2 uchar and shr w 16 255
 put qdIoBuf add p 3 uchar and shr w 24 255
 end
 r = mapwrite get qdWork 0 QDW_LEXMAP qdIoBuf 0 1024
-note Allocate GPU KV cache (10 layers x 128 pos x 2 kv x 256 f32 x 2 = 25 MB)
-put qdKvMap 0 nvalloc 26214400 true
+note Allocate GPU KV cache (10 layers x 512 pos x 2 kv x 256 f32 x 2 = 100 MB)
+put qdKvMap 0 nvalloc 104857600 true
 if le get qdKvMap 0 0
 ret 10
 end
 put qdKvVa 0 mapaddr get qdKvMap 0
-note Precompute RoPE cos/sin table [128, 64] into QDW_ROPE
-for pos ulong 128
+note Precompute RoPE cos/sin table [512, 64] into QDW_ROPE (128 KB)
+for pos ulong 512
 pf = f32 pos
 for j ulong 32
 th = mul pf get qdRopeFreq j
@@ -2900,7 +2359,7 @@ qdPutF32Io mul add mul pos 64 j 4 qdSinCos th true
 qdPutF32Io mul add mul pos 64 add 32 j 4 qdSinCos th false
 end
 end
-r = mapwrite get qdWork 0 QDW_ROPE qdIoBuf 0 32768
+r = mapwrite get qdWork 0 QDW_ROPE qdIoBuf 0 131072
 if eq get qdUseW4 0 1
 m0 = nvalloc QD_LAYER_STRIDE true
 if le m0 0

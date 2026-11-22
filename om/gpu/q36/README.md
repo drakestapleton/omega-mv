@@ -70,15 +70,24 @@ Verified on live Spark GB10 silicon (exclusive quiet window `20261121T232155Z-31
 | **Wave 3–4: 1-Submit 40L Exact FP8** (`20261121T232155Z-317143`) | **`20.827 ms/tok`** | **`48.01 tok/s`** | **`5.86×`** | **`PARITY=EXACT` (`tok=271`), `**Paris**.`** |
 | Wave 4 (fixed): On-GPU Full-W4 (`19.5 GB` VRAM, 1-submit) | `17.952 ms/tok` | `55.70 tok/s` | `6.80×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
 | Wave 5: 4-row/warp W4 + 9-expert MoE + fused FA `Q\|K\|V` + fused router | `16.179 ms/tok` | `61.80 tok/s` | `7.54×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
-| **Wave 6–11: Full-W4 Final** (`20261121T232155Z-317143`, fused SwiGLU + `qMoeCombine9RmsFast` + 33-CTA `qBf16Gemv1R` + `LDG.E.128` SMEM + interleaved `qW4MacBlock`) | **`14.756 ms/tok`** | **`67.76 tok/s`** | **`8.27×`** | **`PARITY=EXACT` (`tok=271`), `**Paris**.`** |
+| **Wave 6–11: Full-W4 Final + Live Arboris** (`20261122T002657Z-c1ec5b`, fused SwiGLU + `qMoeCombine9RmsFast` + 33-CTA `qBf16Gemv1R` + `LDG.E.128` SMEM + interleaved `qW4MacBlock` + `QDW_TRACE` live Arboris) | **`14.731 ms/tok`** | **`67.88 tok/s`** | **`8.28×`** | **`PARITY=EXACT` (`tok=271`), `**Paris**.`, Arboris `42–44%`** |
 
-## Build and Run
+## Installed 35B Package + OpenAI HTTP Server (`om/gpu/q36/serve/` -> `q36-serve`, `q36-35b`)
+
+`q36-serve` (`507 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) wraps the 40-layer Full-W4 (`67.88 tok/s`, `~19.5 GB` VRAM, default) / Exact FP8 (`48.09 tok/s`, `--fp8`) engine + **live Arboris online co-activation prefetcher** + **pure OM-2 ByteLevel BPE tokenizer** (`tokenizer.om`, `248,044` vocab) in an OpenAI-compatible HTTP server (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `512`-token KV cache).
+
+Verified on live Spark GB10 silicon (exclusive quiet window `20261122T002657Z-c1ec5b`, `exit: 0`, quiet machine):
+- `q36-35b --self-test`: `Prompt 0: "\n\nThe capital of France is **Paris**."`, `Prompt 1: "\n\n2 + 2 = 4"`, **`Live Arboris: hits=7131 / tot=15848 (44%)`**, `PASS`.
+- Live HTTP E2E (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`): returns `qwen3.6-35b-a3b-fp8`, exact completion `"\n\nThe capital of France is **Paris**."`, and live Arboris telemetry (`"arboris":{"hits":3323,"total":7736,"hit_pct":42}`).
+- Sustained load soak (window `20261121T233252Z-375404`, `NVRM: Xid` delta `0`): Full-W4 `20/20` bit-exact turns (`1,000` gen toks) at `67.59 tok/s` (`46–49 °C`, `32 W`, `2548 MHz`); Exact FP8 `10/10` bit-exact turns (`500` gen toks) at `48.09 tok/s`; Full-W4 under concurrent 8-core CPU + 512 MB RAM burn `10/10` bit-exact turns at `64.51 tok/s`.
+
+## Build, Install, and Run
 
 ```sh
 sh seed/omega-from-seed.sh
 sh om/gpu/q36/build.sh build/q36
-spark-window run build/q36/q36-native
-spark-window run build/q36/q36-head ~/models/qwen3.6-35b-a3b-fp8-95a723d0/outside.safetensors
-spark-window run build/q36/q36-decode ~/models/qwen3.6-35b-a3b-fp8-95a723d0 24      # Exact FP8 (48.01 tok/s)
-spark-window run build/q36/q36-decode ~/models/qwen3.6-35b-a3b-fp8-95a723d0 24 w4   # Full-W4 (67.76 tok/s)
+sh om/gpu/q36/install-spark.sh .   # installs ~/.local/opt/q36/, ~/.local/bin/q36-35b, motor-revival.service (:18091)
+q36-35b --self-test                # Full-W4 default + Live Arboris self-test
+q36-35b --port 18091               # Start OpenAI HTTP server (Full-W4 + Live Arboris; pass --fp8 for Exact FP8)
+systemctl --user start motor-revival
 ```
