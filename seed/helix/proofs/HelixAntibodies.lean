@@ -179,6 +179,58 @@ theorem antibody_valid_rung_admitted : monkAccept validSwapCert := by
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, ?_, rfl, rfl, rfl, rfl⟩
   decide
 
+-- ==================== PHASE 2 UOR-GPU AUTHORITY & LAUNCH-GATE ANTIBODIES ====================
+-- Formalizes the manual uor-gpu pass-1/pass-2 audit checks into permanent Lean 4 antibodies
+-- mirrored in `seed/helix/dual_checker.om` and attacked by `seed/helix/immune.om`.
+
+structure LaunchGateEnvelope where
+  sigCanonical  : Bool  -- RFC 8032 canonical S < L and P0 non-smuggled signature check
+  declaredLen   : Nat   -- declared bundle/envelope byte length
+  actualLen     : Nat   -- actual observed byte length (catches trailing-byte smuggling)
+  qmdAddr       : Nat   -- Blackwell QMD v05.00 GPU VA (must be 256-byte aligned)
+  qmdBytes      : Nat   -- QMD v05.00 descriptor size (must be 384 bytes)
+  capGeneration : Nat   -- capability handle generation (must be > 0; zero-gen caps forbidden)
+
+def launchGateAccept (e : LaunchGateEnvelope) : Prop :=
+  e.sigCanonical = true ∧
+  e.actualLen = e.declaredLen ∧
+  e.qmdAddr % 256 = 0 ∧
+  e.qmdBytes = 384 ∧
+  e.capGeneration > 0
+
+/-- Antibody 8: Smuggled P0 / non-canonical signature bytes are always rejected. -/
+theorem antibody_p0_sig_smuggle (e : LaunchGateEnvelope) (h : e.sigCanonical = false) :
+    ¬ launchGateAccept e := by
+  intro ha; rw [ha.1] at h; cases h
+
+/-- Antibody 9: Trailing-byte payloads past declared envelope length are always rejected. -/
+theorem antibody_trailing_bytes (e : LaunchGateEnvelope) (h : e.actualLen > e.declaredLen) :
+    ¬ launchGateAccept e := by
+  intro ha; have := ha.2.1; omega
+
+/-- Antibody 10: Misaligned Blackwell QMD v05.00 (addr % 256 ≠ 0 or size ≠ 384) is always rejected. -/
+theorem antibody_misaligned_qmd (e : LaunchGateEnvelope)
+    (h : e.qmdAddr % 256 ≠ 0 ∨ e.qmdBytes ≠ 384) :
+    ¬ launchGateAccept e := by
+  intro ha
+  rcases h with h1 | h2
+  · exact h1 ha.2.2.1
+  · exact h2 ha.2.2.2.1
+
+/-- Antibody 11: Zero-generation capability tokens (`gen = 0`) are always rejected. -/
+theorem antibody_zero_gen_cap (e : LaunchGateEnvelope) (h : e.capGeneration = 0) :
+    ¬ launchGateAccept e := by
+  intro ha; have := ha.2.2.2.2; omega
+
+/-- Positive non-vacuity witness for `launchGateAccept`. -/
+def validLaunchEnv : LaunchGateEnvelope :=
+  { sigCanonical := true, declaredLen := 512, actualLen := 512,
+    qmdAddr := 4096, qmdBytes := 384, capGeneration := 1 }
+
+theorem antibody_valid_launch_admitted : launchGateAccept validLaunchEnv := by
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  decide
+
 #print axioms antibody_digest_spoof
 #print axioms antibody_non_bijection
 #print axioms antibody_opcode_smuggle
@@ -187,5 +239,10 @@ theorem antibody_valid_rung_admitted : monkAccept validSwapCert := by
 #print axioms antibody_hazard_smuggle
 #print axioms antibody_length_mismatch
 #print axioms antibody_valid_rung_admitted
+#print axioms antibody_p0_sig_smuggle
+#print axioms antibody_trailing_bytes
+#print axioms antibody_misaligned_qmd
+#print axioms antibody_zero_gen_cap
+#print axioms antibody_valid_launch_admitted
 
 end HelixAntibodies
