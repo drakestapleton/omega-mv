@@ -1,0 +1,610 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/brownian/test_brw_tps.om -- Pure seeded OM-2 test suite for the
+note TPS1 binariser (lane T, phases 1-2). Mirrors tests/brownian/test_brw_tps.c
+note 100%, including streams A..I, phase 2 range+rANS coders, hostile #27
+note tamper gates, frequency rows, and hostile input refusals.
+
+global g_rs ulong 4
+global g_fails ulong 1
+global g_worst_ex f64 1
+global g_env_lo f64 1
+global g_env_hi f64 1
+global g_quant_lo f64 1
+global g_quant_hi f64 1
+global g_files_dn ulong 1
+global g_recs_dn ulong 1
+global g_ext_low ulong 1
+global g_out_buf uchar 1024
+global g_out_len ulong 1
+
+text t_pass "test_brw_tps: PASS\n"
+text t_fail "test_brw_tps: FAIL\n"
+text t_chkf "FAIL check #"
+text t_nl "\n"
+text t_sp " "
+text t_rc " rc="
+text t_rec " records="
+text t_byt " bytes="
+text t_h27 "hostile #27 mode="
+text t_bad " bad_index="
+text t_p2 "phase 2: files="
+text t_ext " heavy-tails low="
+text t_sA "A mixed scales"
+text t_sB "B centre and small offsets"
+text t_sC "C far tails"
+text t_sD "D sd at sd_min"
+text t_sE "E huge sd"
+text t_sF "F fractional bin position"
+text t_sG "G sd_min offsets in bins"
+text t_sH "H sd_min, z_c in sd units"
+text t_sI "I y_prev predictor, N(0,1) steps"
+text t_c1 "small"
+text t_c2 "mixed scales"
+text t_c3 "sharp near sd_min"
+text t_c4 "heavy tails"
+text t_c5 "large"
+text t_rng " range"
+text t_rns " rANS"
+
+fn out_flush to void
+  n = get g_out_len 0
+  if gt n 0
+    k = write 1 g_out_buf 0 n
+    put g_out_len 0 0
+  end
+end
+
+fn out_ch c uchar to void
+  n = get g_out_len 0
+  if ge n 1020
+    out_flush
+    n = 0
+  end
+  put g_out_buf n c
+  put g_out_len 0 add n 1
+end
+
+fn out_txt s view uchar * to void
+  for i ulong len s bound 1024
+    out_ch get s i
+  end
+end
+
+fn out_u64 v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    out_ch 48
+    ret
+  end
+  k = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  while gt k 0 bound 24
+    k = sub k 1
+    out_ch get tmp k
+  end
+end
+
+fn out_i64 v long to void
+  if lt v 0
+    out_ch 45
+    out_u64 ulong sub 0 v
+    ret
+  end
+  out_u64 ulong v
+end
+
+fn chk cond bool id ulong to void
+  if not cond
+    put g_fails 0 add get g_fails 0 1
+    out_txt t_chkf
+    out_u64 id
+    out_txt t_nl
+    out_flush
+  end
+end
+
+note ---- xoshiro256** seeded via splitmix64 (bit-identical to C) ----
+fn sm_next x ulong to ulong
+  z = add x 0x9e3779b97f4a7c15
+  z = mul xor z shr z 30 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+fn rseed s ulong to void
+  x = s
+  for i ulong 4
+    x = add x 0x9e3779b97f4a7c15
+    z = mul xor x shr x 30 0xbf58476d1ce4e5b9
+    z = mul xor z shr z 27 0x94d049bb133111eb
+    put g_rs i xor z shr z 31
+  end
+end
+
+fn rnext to ulong
+  s0 = get g_rs 0
+  s1 = get g_rs 1
+  s2 = get g_rs 2
+  s3 = get g_rs 3
+  r = mul rotl mul s1 5 7 9
+  t = shl s1 17
+  s2 = xor s2 s0
+  s3 = xor s3 s1
+  s1 = xor s1 s2
+  s0 = xor s0 s3
+  s2 = xor s2 t
+  s3 = rotl s3 45
+  put g_rs 0 s0
+  put g_rs 1 s1
+  put g_rs 2 s2
+  put g_rs 3 s3
+  ret r
+end
+
+fn runif to f64
+  p53 = bitcast f64 shl ulong 0x3ca00000 32
+  ret mul f64 shr rnext 11 p53
+end
+
+fn rnorm to f64
+  u = runif
+  v = runif
+  minu = bitcast f64 or shl ulong 0x01c81f62 32 ulong 0x06410c2a
+  if lt u minu
+    u = minu
+  end
+  tp = bitcast f64 or shl ulong 0x401921fb 32 ulong 0x54442d18
+  ret mul fsqrt mul f64 -2.0 q_ln u q_cos mul tp v
+end
+
+fn fill_obs i ulong m f64 s f64 z f64 to void
+  put g_in_mu i m
+  put g_in_sd i s
+  put g_in_b i long q_floor mul add m mul z s f64 1048576.0
+end
+
+fn run_stream label view uchar * n ulong id ulong to void
+  rc = brw_tps_check_stream n
+  me = get g_tps_res 2
+  if gt me get g_worst_ex 0
+    put g_worst_ex 0 me
+  end
+  out_txt label
+  out_txt t_rc
+  out_i64 rc
+  out_txt t_nl
+  out_flush
+  chk eq rc 0 id
+end
+
+fn chk_decoded_eq to bool
+  pn = get g_ps_n 0
+  for t ulong pn bound 4194304
+    if ne get g_ps_dec t get g_ps_sym t
+      ret false
+    end
+  end
+  ret true
+end
+
+fn code_check_env extreme ulong c ulong id_base ulong ideal f64 to void
+  pn = get g_ps_n 0
+  clen = get g_coded_len 0
+  dev = sub sub mul f64 8.0 f64 clen ideal f64 448.0
+  lim = add f64 64.0 mul f64 0.001 f64 pn
+  if ne extreme 0
+    chk le dev lim add id_base add 13 mul c 4
+    if lt dev sub f64 0.0 lim
+      put g_ext_low 0 add get g_ext_low 0 1
+    end
+  else
+    chk le q_fabs dev lim add id_base add 13 mul c 4
+    if lt dev get g_env_lo 0
+      put g_env_lo 0 dev
+    end
+    if gt dev get g_env_hi 0
+      put g_env_hi 0 dev
+    end
+  end
+end
+
+fn code_one_coder label view uchar * extreme ulong c ulong id_base ulong ideal f64 to void
+  rc = long 0
+  if eq c 0
+    rc = tc_range_encode
+  else
+    rc = tc_rans_encode
+  end
+  chk eq rc TC_OK add id_base add 10 mul c 4
+  if ne rc TC_OK
+    ret
+  end
+  if eq c 0
+    rc = tc_range_decode
+  else
+    rc = tc_rans_decode
+  end
+  chk eq rc TC_OK add id_base add 11 mul c 4
+  if eq rc TC_OK
+    chk chk_decoded_eq add id_base add 12 mul c 4
+  end
+  code_check_env extreme c id_base ideal
+  out_txt label
+  if eq c 0
+    out_txt t_rng
+  else
+    out_txt t_rns
+  end
+  out_txt t_rec
+  out_u64 get g_ps_n 0
+  out_txt t_byt
+  out_u64 get g_coded_len 0
+  out_txt t_nl
+  out_flush
+end
+
+fn code_file label view uchar * nobs ulong extreme ulong id_base ulong to void
+  rc = brw_tps_build nobs -1 0 f64 0.0
+  chk eq rc 0 id_base
+  if ne rc 0
+    ret
+  end
+  chk eq tc_ps_check_rows TC_OK add id_base 1
+  chk eq tc_ps_serialize_hash TC_OK add id_base 2
+  chk eq tc_sy_serialize_hash TC_OK add id_base 3
+  chk eq tc_pair_check TC_OK add id_base 4
+  chk eq tc_ideal_ub TC_OK add id_base 5
+  pn = get g_ps_n 0
+  ideal = div f64 get g_ub_out 0 f64 1000000.0
+  exact = f64 0.0
+  for i ulong nobs bound 100000
+    r2 = tps_bin_idx i
+    chk eq r2 0 add id_base 6
+    exact = add exact get g_tps_be 0
+  end
+  qd = div sub ideal exact f64 pn
+  if ne extreme 0
+    chk lt qd f64 0.0 add id_base 7
+  else
+    chk lt q_fabs qd f64 0.0001 add id_base 7
+  end
+  if lt qd get g_quant_lo 0
+    put g_quant_lo 0 qd
+  end
+  if gt qd get g_quant_hi 0
+    put g_quant_hi 0 qd
+  end
+  code_one_coder label extreme 0 id_base ideal
+  code_one_coder label extreme 1 id_base ideal
+  put g_files_dn 0 add get g_files_dn 0 1
+  put g_recs_dn 0 add get g_recs_dn 0 pn
+end
+
+fn hostile_gate to void
+  nobs = ulong 200
+  for i ulong nobs
+    fill_obs i mul f64 5.0 sub runif f64 0.5 add f64 0.05 mul f64 2.0 runif rnorm
+  end
+  chk eq brw_tps_build nobs -1 0 f64 0.0 0 800
+  chk le get g_tps_res 0 tps_exact_tol 801
+  rels = new f64 3 0.0
+  put rels 0 f64 0.001
+  put rels 1 f64 0.00001
+  put rels 2 f64 0.0000001
+  for mode ulong 2
+    for r ulong 3
+      rv = get rels r
+      rc = brw_tps_build nobs long mode 37 rv
+      out_txt t_h27
+      out_u64 mode
+      out_txt t_rc
+      out_i64 rc
+      out_txt t_bad
+      out_u64 get g_tps_bad 0
+      out_txt t_nl
+      out_flush
+      base = add 810 add mul mode 12 mul r 3
+      chk eq rc BRW_TPS_E_PROOF base
+      chk eq get g_tps_bad 0 37 add base 1
+      chk eq get g_ps_alloc 0 0 add base 2
+    end
+  end
+  chk eq brw_tps_check_stream nobs 0 850
+end
+
+fn coder_tests to void
+  rseed 0xfeedfacecafebeef
+  for i ulong 40
+    fill_obs i mul f64 3.0 sub runif f64 0.5 add f64 0.1 runif rnorm
+  end
+  code_file t_c1 40 0 500
+  for i ulong 3000
+    fill_obs i mul f64 200.0 sub runif f64 0.5 mul f64 0.05 q_exp mul f64 6.0 runif rnorm
+  end
+  code_file t_c2 3000 0 520
+  for i ulong 3000
+    fill_obs i mul f64 2.0 sub runif f64 0.5 mul q_sd_min add f64 1.0 mul f64 3.0 runif rnorm
+  end
+  code_file t_c3 3000 0 540
+  for i ulong 3000
+    sgn = f64 -1.0
+    if ne and i 1 0
+      sgn = f64 1.0
+    end
+    fill_obs i mul f64 10.0 sub runif f64 0.5 add f64 0.1 runif mul add f64 5.0 mul f64 25.0 runif sgn
+  end
+  code_file t_c4 3000 1 560
+  for i ulong 60000
+    fill_obs i mul f64 200.0 sub runif f64 0.5 mul f64 0.05 q_exp mul f64 6.0 runif rnorm
+  end
+  code_file t_c5 60000 0 580
+  out_txt t_p2
+  out_u64 get g_files_dn 0
+  out_txt t_rec
+  out_u64 get g_recs_dn 0
+  out_txt t_ext
+  out_u64 get g_ext_low 0
+  out_txt t_nl
+  out_flush
+  chk eq get g_files_dn 0 5 600
+  hostile_gate
+end
+
+fn test_streams_a_to_d to void
+  for i ulong 40000
+    s = mul f64 0.05 q_exp mul f64 6.0 runif
+    fill_obs i mul f64 200.0 sub runif f64 0.5 s rnorm
+  end
+  run_stream t_sA 40000 10
+
+  d20 = q_delta
+  for i ulong 20000
+    s = add f64 0.02 runif
+    m = mul f64 long mul sub runif f64 0.5 f64 200000.0 d20
+    if ne and i 1 0
+      m = add m mul f64 0.5 d20
+    end
+    put g_in_mu i m
+    put g_in_sd i s
+    c = long q_floor mul m f64 1048576.0
+    put g_in_b i sub add c long rem rnext 9 4
+  end
+  run_stream t_sB 20000 20
+
+  for i ulong 10000
+    sgn = f64 -1.0
+    if ne and i 1 0
+      sgn = f64 1.0
+    end
+    z = mul add f64 20.0 mul f64 20.0 runif sgn
+    fill_obs i mul f64 10.0 sub runif f64 0.5 add f64 0.1 mul f64 3.0 runif z
+  end
+  put g_in_mu 0 f64 0.0
+  put g_in_sd 0 f64 1.0
+  put g_in_b 0 long mul f64 40.0 f64 1048576.0
+  run_stream t_sC 10000 30
+
+  for i ulong 10000
+    r3 = rem i 3
+    s = q_sd_min
+    if eq r3 1
+      s = mul q_sd_min f64 0.25
+    else
+      if eq r3 2
+        s = mul q_sd_min add f64 1.0 runif
+      end
+    end
+    fill_obs i mul f64 4.0 sub runif f64 0.5 s mul f64 2.0 rnorm
+  end
+  run_stream t_sD 10000 40
+  chk eq brw_tps_check_stream 10000 0 41
+  chk gt get g_tps_res 1 tps_exact_tol 42
+end
+
+fn fill_g_row n0 ulong sg long off long frv f64 to ulong
+  n = n0
+  for m ulong 4
+    rv = sub long rem rnext 2000001 1000000
+    mm = add mul add f64 rv frv q_delta mul f64 m f64 0.37
+    put g_in_mu n mm
+    put g_in_sd n q_sd_min
+    put g_in_b n add long q_floor mul mm f64 1048576.0 mul sg off
+    n = add n 1
+  end
+  ret n
+end
+
+fn test_stream_g to void
+  offs = new long 7 0
+  put offs 0 0
+  put offs 1 1
+  put offs 2 5
+  put offs 3 30
+  put offs 4 1448
+  put offs 5 2048
+  put offs 6 4096
+  fr = new f64 5 0.0
+  put fr 0 f64 0.0
+  put fr 1 f64 0.25
+  put fr 2 f64 0.5
+  put fr 3 f64 0.75
+  put fr 4 f64 0.999
+  n = ulong 0
+  for o ulong 7
+    ov = get offs o
+    for fi ulong 5
+      fv = get fr fi
+      n = fill_g_row n -1 ov fv
+      n = fill_g_row n 1 ov fv
+    end
+  end
+  run_stream t_sG n 50
+end
+
+fn fill_h_row n0 ulong sg long zv f64 frv f64 to ulong
+  n = n0
+  off = mul sg long mul zv f64 1024.0
+  for m ulong 5
+    rv = sub long rem rnext 200001 100000
+    mm = add mul f64 rv q_sd_min mul frv q_delta
+    put g_in_mu n mm
+    put g_in_sd n q_sd_min
+    b0 = long q_floor mul mm f64 1048576.0
+    put g_in_b n add add b0 off long m
+    n = add n 1
+  end
+  ret n
+end
+
+fn test_stream_h to void
+  zs = new f64 7 0.0
+  put zs 0 f64 0.0
+  put zs 1 f64 1.0
+  put zs 2 f64 5.0
+  put zs 3 f64 30.0
+  put zs 4 f64 1448.0
+  put zs 5 f64 2048.0
+  put zs 6 f64 4096.0
+  frh = new f64 4 0.0
+  put frh 0 f64 0.0
+  put frh 1 f64 0.3
+  put frh 2 f64 0.5
+  put frh 3 f64 0.9
+  n = ulong 0
+  for o ulong 7
+    zv = get zs o
+    for fi ulong 4
+      fv = get frh fi
+      n = fill_h_row n -1 zv fv
+      n = fill_h_row n 1 zv fv
+    end
+  end
+  run_stream t_sH n 60
+end
+
+fn test_stream_i to void
+  y = f64 0.0
+  for i ulong 3000
+    y2 = add y rnorm
+    put g_in_mu i y
+    put g_in_sd i q_sd_min
+    put g_in_b i long q_floor mul y2 f64 1048576.0
+    y = y2
+  end
+  run_stream t_sI 3000 70
+end
+
+fn test_streams_g_h_i to void
+  test_stream_g
+  test_stream_h
+  test_stream_i
+end
+
+fn test_limits_e_f_hostile to void
+  lim = sub shl long 1 51 1
+  chk eq brw_tps_binarise f64 0.0 q_sd_min lim BRW_TPS_MAX_STEPS 0 100
+  chk eq brw_tps_binarise f64 0.0 q_sd_min sub 0 lim BRW_TPS_MAX_STEPS 0 101
+  chk lt brw_tps_binarise f64 0.0 q_sd_min add lim 1 BRW_TPS_MAX_STEPS 0 102
+  chk eq brw_tps_binarise f64 2147483647.0 q_sd_min sub 0 lim BRW_TPS_MAX_STEPS 0 103
+  chk eq brw_tps_binarise f64 -2147483647.0 q_sd_min lim BRW_TPS_MAX_STEPS 0 104
+
+  for i ulong 10000
+    s = mul f64 1000000000.0 add f64 1.0 runif
+    if ne and i 1 0
+      s = f64 1000000.0
+    end
+    fill_obs i mul f64 10000.0 sub runif f64 0.5 s rnorm
+    if ge q_fabs add get g_in_mu i mul f64 5.0 s f64 1073741824.0
+      fill_obs i get g_in_mu i s mul f64 0.2 rnorm
+    end
+    if gt get g_in_b i lim
+      put g_in_b i lim
+    end
+    if lt get g_in_b i sub 0 lim
+      put g_in_b i sub 0 lim
+    end
+  end
+  run_stream t_sE 10000 110
+
+  for i ulong 10000
+    s = add f64 0.01 mul f64 5.0 runif
+    frac = div f64 rem rnext 1000 f64 1000.0
+    m = mul add f64 long mul sub runif f64 0.5 f64 1000000.0 frac q_delta
+    put g_in_mu i m
+    put g_in_sd i s
+    put g_in_b i add long q_floor mul m f64 1048576.0 long mul mul rnorm s f64 1048576.0
+  end
+  run_stream t_sF 10000 120
+
+  ps = new f64 6 0.0
+  put ps 0 f64 0.0
+  put ps 1 bitcast f64 or shl ulong 0x01c81f62 32 ulong 0x06410c2a
+  put ps 2 f64 0.000005
+  put ps 3 f64 0.5
+  put ps 4 sub f64 1.0 f64 0.000000001
+  put ps 5 f64 1.0
+  for i ulong 6
+    chk eq brw_tps_p1_to_freq get ps i 0 add 130 mul i 2
+    f0 = ulong get g_tps_fq 0
+    f1 = ulong get g_tps_fq 1
+    chk and ge f0 1 and ge f1 1 eq add f0 f1 65536 add 131 mul i 2
+  end
+  chk lt brw_tps_p1_to_freq q_nan 0 150
+
+  bigv = shl long 1 51
+  i64_max = bitcast long or shl ulong 0x7fffffff 32 ulong 0xffffffff
+  i64_min = bitcast long shl ulong 0x80000000 32
+  e300 = bitcast f64 or shl ulong 0x7e37e43c 32 ulong 0x8800759c
+  chk lt brw_tps_binarise q_nan f64 1.0 0 BRW_TPS_MAX_STEPS 0 200
+  chk lt brw_tps_binarise f64 0.0 q_nan 0 BRW_TPS_MAX_STEPS 0 201
+  chk lt brw_tps_binarise f64 0.0 f64 0.0 0 BRW_TPS_MAX_STEPS 0 202
+  chk lt brw_tps_binarise f64 0.0 f64 -1.0 0 BRW_TPS_MAX_STEPS 0 203
+  chk lt brw_tps_binarise f64 0.0 q_inf 0 BRW_TPS_MAX_STEPS 0 204
+  chk lt brw_tps_binarise q_inf f64 1.0 0 BRW_TPS_MAX_STEPS 0 205
+  chk lt brw_tps_binarise e300 f64 1.0 0 BRW_TPS_MAX_STEPS 0 206
+  chk lt brw_tps_binarise f64 0.0 f64 1.0 bigv BRW_TPS_MAX_STEPS 0 207
+  chk lt brw_tps_binarise f64 0.0 f64 1.0 sub 0 bigv BRW_TPS_MAX_STEPS 0 208
+  chk lt brw_tps_binarise f64 0.0 f64 1.0 i64_min BRW_TPS_MAX_STEPS 0 209
+  chk lt brw_tps_binarise f64 0.0 f64 1.0 i64_max BRW_TPS_MAX_STEPS 0 210
+  chk lt brw_tps_binarise f64 0.0 f64 1.0 5000 2 0 211
+  put g_in_mu 0 q_nan
+  put g_in_sd 0 f64 1.0
+  put g_in_b 0 0
+  chk lt brw_tps_check_stream 1 0 212
+end
+
+fn main to int
+  put g_fails 0 0
+  put g_worst_ex 0 tps_big_neg
+  put g_env_lo 0 sub f64 0.0 tps_big_neg
+  put g_env_hi 0 tps_big_neg
+  put g_quant_lo 0 sub f64 0.0 tps_big_neg
+  put g_quant_hi 0 tps_big_neg
+  put g_files_dn 0 0
+  put g_recs_dn 0 0
+  put g_ext_low 0 0
+  rseed 0x0123456789abcdef
+
+  test_streams_a_to_d
+  test_streams_g_h_i
+  test_limits_e_f_hostile
+  coder_tests
+
+  chk le get g_worst_ex 0 tps_exact_tol 900
+
+  if ne get g_fails 0 0
+    out_txt t_fail
+    out_flush
+    ret 1
+  end
+  out_txt t_pass
+  out_flush
+  ret 0
+end

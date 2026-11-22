@@ -1,27 +1,20 @@
-# Lane T phases 1-2: TPS1 binariser with qint.v1 proof, hooked to the frozen EXP-001 coders.
-# New files only: tools/brownian/brw_tps_adapter.*, tests/brownian/test_brw_tps.c.
-# Picked up by `-include mk/*.mk`. Frozen coder sources are linked, never edited.
+# Lane T phases 1-2: TPS1 binariser with qint.v1 proof, hooked to the EXP-001 coders.
+# Pure seeded OM-2: tools/brownian/brw_tps_adapter.om, tests/brownian/test_brw_tps.om.
+# Picked up by `-include mk/*.mk`.
 #
-# test-brownian-tps: builds the test plain and with ASan/UBSan and runs both.
+# test-brownian-tps: builds the pure OM-2 test via seed/out/omc and runs it.
 ifndef BROWNIAN_TPS_MK
 BROWNIAN_TPS_MK := 1
 .PHONY: test-brownian-tps
-BRWT_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -O2 -ffp-contract=off -D_POSIX_C_SOURCE=200809L -Isrc -Itools
-BRWT_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-BRWT_SRCS = tools/brownian/brw_tps_adapter.c src/turing/ty_qcont.c src/turing/ty_math.c src/turing/tc_pstream.c src/turing/tc_range.c src/turing/tc_rans.c src/omega_om_units.c
-BRWT_HDRS = tools/brownian/brw_tps_adapter.h src/turing/ty_qcont.h src/turing/ty_math.h src/turing/tc_pstream.h src/turing/tc_range.h src/turing/tc_rans.h src/sha256.h
+SEED_OMC ?= seed/out/omc
+BRWT_OM_DEPS = src/turing/ty_qcont_lib.om seed/ng/sha256.om tools/brownian/brw_tps_adapter.om
 BRWT_DIR = $(OUT_DIR)/tests-brownian-tps
 
-$(BRWT_DIR)/test_brw_tps: tests/brownian/test_brw_tps.c $(BRWT_SRCS) $(BRWT_HDRS)
+$(BRWT_DIR)/test_brw_tps: $(BRWT_OM_DEPS) tests/brownian/test_brw_tps.om $(SEED_OMC)
 	@mkdir -p $(BRWT_DIR)
-	$(CC) $(BRWT_CFLAGS) -o $@ tests/brownian/test_brw_tps.c $(BRWT_SRCS) -lm
+	cat $(BRWT_OM_DEPS) tests/brownian/test_brw_tps.om | $(SEED_OMC) > $@ && chmod +x $@
 
-$(BRWT_DIR)/test_brw_tps_asan: tests/brownian/test_brw_tps.c $(BRWT_SRCS) $(BRWT_HDRS)
-	@mkdir -p $(BRWT_DIR)
-	$(CC) $(BRWT_CFLAGS) $(BRWT_ASAN) -o $@ tests/brownian/test_brw_tps.c $(BRWT_SRCS) -lm
-
-test-brownian-tps: $(BRWT_DIR)/test_brw_tps $(BRWT_DIR)/test_brw_tps_asan
+test-brownian-tps: $(BRWT_DIR)/test_brw_tps
 	./$(BRWT_DIR)/test_brw_tps
-	./$(BRWT_DIR)/test_brw_tps_asan
-	@echo "test-brownian-tps: TPS1 binariser proofs and refusals pass in plain and ASan/UBSan builds"
+	@echo "test-brownian-tps: pure OM-2 TPS1 binariser proofs, EXP-001 coders, and refusals pass"
 endif

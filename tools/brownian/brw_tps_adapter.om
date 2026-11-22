@@ -1,0 +1,1734 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/brownian/brw_tps_adapter.om -- Pure seeded OM-2 TPS1 binariser
+note (lane T, phases 1-2) with double-double (106-bit) log-mass arithmetic,
+note qint.v1 proof gate, TPS1/TSY1 SHA-256 serialization, and EXP-001 range
+note and rANS coders.
+note Composed after src/turing/ty_qcont_lib.om and seed/ng/sha256.om.
+
+const BRW_TPS_OK long 0
+const BRW_TPS_E_ARG long -201
+const BRW_TPS_E_RANGE long -202
+const BRW_TPS_E_CAP long -203
+const BRW_TPS_E_PROOF long -204
+const BRW_TPS_E_NUM long -205
+const BRW_TPS_E_CODER long -206
+
+const BRW_TPS_MAX_STEPS ulong 112
+const BRW_TOPCLS ulong 51
+
+const TC_OK long 0
+const TC_E_ARG long -101
+const TC_E_IO long -102
+const TC_E_FORMAT long -103
+const TC_E_DIGEST long -104
+const TC_E_NORM long -105
+const TC_E_ZERO long -106
+const TC_E_COUNT long -110
+const TC_E_HEADER long -111
+const TC_E_BINDING long -112
+const TC_E_TRUNC long -113
+const TC_E_TRAIL long -114
+const TC_E_CORRUPT long -115
+const TC_E_SYMBOL long -116
+
+const TC_QONE ulong 65536
+const TC_CODED_HDR ulong 56
+const TC_RC_TOP ulong 16777216
+const TC_RANS_L ulong 8388608
+
+const TPS_MAX_OBS ulong 100000
+const TPS_MAX_REC ulong 3145728
+
+text t_tps_dom "turing.tc.pstream.v1"
+text t_tsy_dom "turing.tc.symbols.v1"
+text t_tps_mag "TPS1"
+text t_tsy_mag "TSY1"
+text t_tcr_mag "TCR1"
+text t_trn_mag "TRN1"
+
+note ---- Double-double scratch and return registers ----
+global g_dd_r f64 2
+global g_dd_a f64 2
+global g_dd_b f64 2
+global g_dd_c f64 2
+global g_dd_s f64 2
+global g_dd_t f64 2
+global g_dd_u f64 2
+global g_dd_v f64 2
+global g_dd_w f64 2
+global g_dd_x f64 2
+global g_bin_lc f64 2
+global g_bin_lp f64 2
+global g_bin_ln f64 2
+global g_bin_lnz f64 2
+global g_bin_lpar f64 2
+global g_bin_c1 f64 2
+global g_bin_c2 f64 2
+global g_cf_z2 f64 2
+global g_lm_a f64 2
+global g_lm_b f64 2
+global g_lm_t f64 2
+global g_chk_q1 f64 2
+global g_hk_mode long 1
+global g_hk_at ulong 1
+global g_hk_rel f64 1
+
+note ---- TPS context and step buffer ----
+global g_tctx_loc f64 2
+global g_tctx_s f64 2
+global g_tctx_c long 1
+
+global g_tps_p1 f64 112
+global g_tps_bit ulong 112
+global g_tps_l2t_h f64 112
+global g_tps_l2t_l f64 112
+global g_tps_l2o_h f64 112
+global g_tps_l2o_l f64 112
+global g_tps_nsteps ulong 1
+global g_tps_bs f64 2
+global g_tps_be f64 2
+global g_tps_fq ushort 2
+global g_tps_gate f64 4
+global g_tps_bad ulong 1
+global g_tps_res f64 4
+
+note ---- Input observation stream (up to 100000 obs) ----
+global g_in_mu f64 100000
+global g_in_sd f64 100000
+global g_in_b long 100000
+
+note ---- Phase 2: TPS1 / TSY1 / coded buffers (up to 3M records) ----
+global g_ps_alloc ulong 1
+global g_ps_n ulong 1
+global g_ps_q ushort 6291456
+global g_ps_key ulong 3145728
+global g_ps_sym uchar 3145728
+global g_ps_dec uchar 3145728
+global g_ps_dig uchar 32
+global g_sy_dig uchar 32
+global g_coded uchar 6291456
+global g_coded_len ulong 1
+
+note ---- Streaming SHA-256 and ideal micro-bit table ----
+global g_sh_pos ulong 1
+global g_sh_tot ulong 1
+global g_ub_tbl long 65537
+global g_ub_rdy ulong 1
+global g_ub_out long 1
+
+note ---- 106-bit double-double constants ----
+fn dd_ln2_h to f64
+  ret bitcast f64 or shl ulong 0x3fe62e42 32 ulong 0xfefa39ef
+end
+
+fn dd_ln2_l to f64
+  ret bitcast f64 or shl ulong 0x3c7abc9e 32 ulong 0x3b39803f
+end
+
+fn dd_sq12_h to f64
+  ret bitcast f64 or shl ulong 0x3fe6a09e 32 ulong 0x667f3bcd
+end
+
+fn dd_sq12_l to f64
+  ret bitcast f64 or shl ulong 0xbc8bdd34 32 ulong 0x13b26456
+end
+
+fn dd_hln2pi_h to f64
+  ret bitcast f64 or shl ulong 0x3fed67f1 32 ulong 0xc864beb5
+end
+
+fn dd_hln2pi_l to f64
+  ret bitcast f64 or shl ulong 0xbc865b5a 32 ulong 0x1b7ff5df
+end
+
+fn dd_2spi_h to f64
+  ret bitcast f64 or shl ulong 0x3ff20dd7 32 ulong 0x50429b6d
+end
+
+fn dd_2spi_l to f64
+  ret bitcast f64 or shl ulong 0x3c71ae3a 32 ulong 0x914fed80
+end
+
+fn tps_exact_tol to f64
+  ret f64 0.000000001
+end
+
+fn tps_mu_limit to f64
+  ret f64 2147483648.0
+end
+
+fn tps_big_neg to f64
+  ret bitcast f64 or shl ulong 0xfe37e43c 32 ulong 0x8800759c
+end
+
+note ---- Double-double core arithmetic (result in g_dd_r[0..1]) ----
+fn dd_add ah f64 al f64 bh f64 bl f64 to void
+  s1 = add ah bh
+  v1 = sub s1 ah
+  s2 = add sub ah sub s1 v1 sub bh v1
+  t1 = add al bl
+  v2 = sub t1 al
+  t2 = add sub al sub t1 v2 sub bl v2
+  s2 = add s2 t1
+  q1 = add s1 s2
+  q2 = add sub s2 sub q1 s1 t2
+  r0 = add q1 q2
+  r1 = sub q2 sub r0 q1
+  put g_dd_r 0 r0
+  put g_dd_r 1 r1
+end
+
+fn dd_sub ah f64 al f64 bh f64 bl f64 to void
+  dd_add ah al sub f64 0.0 bh sub f64 0.0 bl
+end
+
+fn dd_mul ah f64 al f64 bh f64 bl f64 to void
+  p1 = mul ah bh
+  p2 = fma ah bh sub f64 0.0 p1
+  p2 = add p2 add mul ah bl mul al bh
+  r0 = add p1 p2
+  r1 = sub p2 sub r0 p1
+  put g_dd_r 0 r0
+  put g_dd_r 1 r1
+end
+
+fn dd_div ah f64 al f64 bh f64 bl f64 to void
+  q1 = div ah bh
+  dd_mul q1 f64 0.0 bh bl
+  dd_sub ah al get g_dd_r 0 get g_dd_r 1
+  rh = get g_dd_r 0
+  rl = get g_dd_r 1
+  q2 = div rh bh
+  dd_mul q2 f64 0.0 bh bl
+  dd_sub rh rl get g_dd_r 0 get g_dd_r 1
+  q3 = div get g_dd_r 0 bh
+  s1 = add q1 q2
+  s2 = sub q2 sub s1 q1
+  dd_add s1 s2 q3 f64 0.0
+end
+
+fn dd_from_i64 k long to void
+  hi = f64 k
+  lo = f64 sub k long hi
+  put g_dd_r 0 hi
+  put g_dd_r 1 lo
+end
+
+fn dd_scale_pow2 ah f64 al f64 k long to void
+  if gt k 512
+    p1 = q_pow2i 512
+    p2 = q_pow2i sub k 512
+    put g_dd_r 0 mul mul ah p1 p2
+    put g_dd_r 1 mul mul al p1 p2
+    ret
+  end
+  if lt k -512
+    p1 = q_pow2i -512
+    p2 = q_pow2i add k 512
+    put g_dd_r 0 mul mul ah p1 p2
+    put g_dd_r 1 mul mul al p1 p2
+    ret
+  end
+  p = q_pow2i k
+  put g_dd_r 0 mul ah p
+  put g_dd_r 1 mul al p
+end
+
+note dd_exp(xh, xl) -> g_dd_r[0..1]
+fn dd_exp xh f64 xl f64 to void
+  if q_isnan xh
+    put g_dd_r 0 q_nan
+    put g_dd_r 1 f64 0.0
+    ret
+  end
+  if gt xh f64 709.782712893384
+    put g_dd_r 0 q_inf
+    put g_dd_r 1 f64 0.0
+    ret
+  end
+  if lt xh f64 -745.1332191019412
+    put g_dd_r 0 f64 0.0
+    put g_dd_r 1 f64 0.0
+    ret
+  end
+  kf = q_floor add div xh dd_ln2_h f64 0.5
+  k = long kf
+  dd_mul kf f64 0.0 dd_ln2_h dd_ln2_l
+  dd_sub xh xl get g_dd_r 0 get g_dd_r 1
+  put g_dd_u 0 mul get g_dd_r 0 f64 0.25
+  put g_dd_u 1 mul get g_dd_r 1 f64 0.25
+  put g_dd_v 0 f64 1.0
+  put g_dd_v 1 f64 0.0
+  put g_dd_w 0 f64 1.0
+  put g_dd_w 1 f64 0.0
+  for i ulong 20
+    dd_mul get g_dd_w 0 get g_dd_w 1 get g_dd_u 0 get g_dd_u 1
+    dv = f64 add i 1
+    dd_div get g_dd_r 0 get g_dd_r 1 dv f64 0.0
+    put g_dd_w 0 get g_dd_r 0
+    put g_dd_w 1 get g_dd_r 1
+    dd_add get g_dd_v 0 get g_dd_v 1 get g_dd_w 0 get g_dd_w 1
+    put g_dd_v 0 get g_dd_r 0
+    put g_dd_v 1 get g_dd_r 1
+  end
+  dd_mul get g_dd_v 0 get g_dd_v 1 get g_dd_v 0 get g_dd_v 1
+  put g_dd_v 0 get g_dd_r 0
+  put g_dd_v 1 get g_dd_r 1
+  dd_mul get g_dd_v 0 get g_dd_v 1 get g_dd_v 0 get g_dd_v 1
+  dd_scale_pow2 get g_dd_r 0 get g_dd_r 1 k
+end
+
+note dd_expm1(xh, xl) -> g_dd_r[0..1]
+fn dd_expm1 xh f64 xl f64 to void
+  if ge q_fabs xh f64 0.25
+    dd_exp xh xl
+    dd_sub get g_dd_r 0 get g_dd_r 1 f64 1.0 f64 0.0
+    ret
+  end
+  put g_dd_v 0 xh
+  put g_dd_v 1 xl
+  put g_dd_w 0 xh
+  put g_dd_w 1 xl
+  for i ulong 22
+    dd_mul get g_dd_w 0 get g_dd_w 1 xh xl
+    dv = f64 add i 2
+    dd_div get g_dd_r 0 get g_dd_r 1 dv f64 0.0
+    put g_dd_w 0 get g_dd_r 0
+    put g_dd_w 1 get g_dd_r 1
+    dd_add get g_dd_v 0 get g_dd_v 1 get g_dd_w 0 get g_dd_w 1
+    put g_dd_v 0 get g_dd_r 0
+    put g_dd_v 1 get g_dd_r 1
+  end
+  put g_dd_r 0 get g_dd_v 0
+  put g_dd_r 1 get g_dd_v 1
+end
+
+note dd_ln(xh, xl) for x > 0 -> g_dd_r[0..1]
+fn dd_ln xh f64 xl f64 to void
+  if or q_isnan xh lt xh f64 0.0
+    put g_dd_r 0 q_nan
+    put g_dd_r 1 f64 0.0
+    ret
+  end
+  if eq xh f64 0.0
+    put g_dd_r 0 sub f64 0.0 q_inf
+    put g_dd_r 1 f64 0.0
+    ret
+  end
+  if not q_isfinite xh
+    put g_dd_r 0 q_inf
+    put g_dd_r 1 f64 0.0
+    ret
+  end
+  u = bitcast ulong xh
+  ex = sub long shr u 52 1023
+  put g_dd_x 0 xh
+  put g_dd_x 1 xl
+  if eq shr u 52 0
+    dd_scale_pow2 xh xl 54
+    put g_dd_x 0 get g_dd_r 0
+    put g_dd_x 1 get g_dd_r 1
+    u = bitcast ulong get g_dd_x 0
+    ex = sub sub long shr u 52 1023 54
+  end
+  dd_scale_pow2 get g_dd_x 0 get g_dd_x 1 sub 0 ex
+  put g_dd_x 0 get g_dd_r 0
+  put g_dd_x 1 get g_dd_r 1
+  if gt get g_dd_x 0 bitcast f64 or shl ulong 0x3ff6a09e 32 ulong 0x667f3bcd
+    put g_dd_x 0 mul get g_dd_x 0 f64 0.5
+    put g_dd_x 1 mul get g_dd_x 1 f64 0.5
+    ex = add ex 1
+  end
+  put g_dd_t 0 q_ln get g_dd_x 0
+  put g_dd_t 1 f64 0.0
+  for it ulong 2
+    dd_exp sub f64 0.0 get g_dd_t 0 sub f64 0.0 get g_dd_t 1
+    dd_mul get g_dd_x 0 get g_dd_x 1 get g_dd_r 0 get g_dd_r 1
+    dd_sub get g_dd_r 0 get g_dd_r 1 f64 1.0 f64 0.0
+    dd_add get g_dd_t 0 get g_dd_t 1 get g_dd_r 0 get g_dd_r 1
+    put g_dd_t 0 get g_dd_r 0
+    put g_dd_t 1 get g_dd_r 1
+  end
+  dd_mul f64 ex f64 0.0 dd_ln2_h dd_ln2_l
+  dd_add get g_dd_t 0 get g_dd_t 1 get g_dd_r 0 get g_dd_r 1
+end
+
+note dd_log1p(xh, xl) -> g_dd_r[0..1]
+fn dd_log1p xh f64 xl f64 to void
+  if ge q_fabs xh f64 0.125
+    dd_add f64 1.0 f64 0.0 xh xl
+    dd_ln get g_dd_r 0 get g_dd_r 1
+    ret
+  end
+  dd_add f64 2.0 f64 0.0 xh xl
+  dd_div xh xl get g_dd_r 0 get g_dd_r 1
+  put g_dd_a 0 get g_dd_r 0
+  put g_dd_a 1 get g_dd_r 1
+  dd_mul get g_dd_a 0 get g_dd_a 1 get g_dd_a 0 get g_dd_a 1
+  put g_dd_b 0 get g_dd_r 0
+  put g_dd_b 1 get g_dd_r 1
+  put g_dd_v 0 f64 1.0
+  put g_dd_v 1 f64 0.0
+  put g_dd_w 0 f64 1.0
+  put g_dd_w 1 f64 0.0
+  for k ulong 15
+    dd_mul get g_dd_w 0 get g_dd_w 1 get g_dd_b 0 get g_dd_b 1
+    put g_dd_w 0 get g_dd_r 0
+    put g_dd_w 1 get g_dd_r 1
+    dv = f64 add mul 2 add k 1 1
+    dd_div get g_dd_w 0 get g_dd_w 1 dv f64 0.0
+    dd_add get g_dd_v 0 get g_dd_v 1 get g_dd_r 0 get g_dd_r 1
+    put g_dd_v 0 get g_dd_r 0
+    put g_dd_v 1 get g_dd_r 1
+  end
+  dd_mul get g_dd_v 0 get g_dd_v 1 get g_dd_a 0 get g_dd_a 1
+  put g_dd_r 0 mul f64 2.0 get g_dd_r 0
+  put g_dd_r 1 mul f64 2.0 get g_dd_r 1
+end
+
+fn dd_exp2 xh f64 xl f64 to void
+  dd_mul xh xl dd_ln2_h dd_ln2_l
+  dd_exp get g_dd_r 0 get g_dd_r 1
+end
+
+note ---- Exact 106-bit log Phi(z) for z <= 0 (or -inf) ----
+note Positive-term erf series for 0 <= x < 3.6 (zero cancellation).
+fn dd_lphi_small zh f64 zl f64 to void
+  dd_mul sub f64 0.0 zh sub f64 0.0 zl dd_sq12_h dd_sq12_l
+  put g_dd_v 0 get g_dd_r 0
+  put g_dd_v 1 get g_dd_r 1
+  put g_dd_w 0 get g_dd_r 0
+  put g_dd_w 1 get g_dd_r 1
+  dd_mul get g_dd_v 0 get g_dd_v 1 get g_dd_v 0 get g_dd_v 1
+  put g_dd_a 0 get g_dd_r 0
+  put g_dd_a 1 get g_dd_r 1
+  put g_dd_b 0 mul f64 2.0 get g_dd_a 0
+  put g_dd_b 1 mul f64 2.0 get g_dd_a 1
+  for k ulong 72
+    dd_mul get g_dd_w 0 get g_dd_w 1 get g_dd_b 0 get g_dd_b 1
+    dv = f64 add mul 2 add k 1 1
+    dd_div get g_dd_r 0 get g_dd_r 1 dv f64 0.0
+    put g_dd_w 0 get g_dd_r 0
+    put g_dd_w 1 get g_dd_r 1
+    dd_add get g_dd_v 0 get g_dd_v 1 get g_dd_w 0 get g_dd_w 1
+    put g_dd_v 0 get g_dd_r 0
+    put g_dd_v 1 get g_dd_r 1
+    if lt q_fabs get g_dd_w 0 f64 0.0000000000000000000000000000000001
+      break
+    end
+  end
+  put g_dd_c 0 get g_dd_v 0
+  put g_dd_c 1 get g_dd_v 1
+  dd_exp sub f64 0.0 get g_dd_a 0 sub f64 0.0 get g_dd_a 1
+  dd_mul get g_dd_r 0 get g_dd_r 1 dd_2spi_h dd_2spi_l
+  dd_mul get g_dd_r 0 get g_dd_r 1 get g_dd_c 0 get g_dd_c 1
+  dd_sub f64 1.0 f64 0.0 get g_dd_r 0 get g_dd_r 1
+  eh = mul f64 0.5 get g_dd_r 0
+  el = mul f64 0.5 get g_dd_r 1
+  dd_ln eh el
+end
+
+note Laplace continued fraction in log space for -35 < z <= -5.
+fn dd_lphi_cf zh f64 zl f64 to void
+  dd_mul zh zl zh zl
+  put g_cf_z2 0 get g_dd_r 0
+  put g_cf_z2 1 get g_dd_r 1
+  dd_div f64 1.0 f64 0.0 get g_cf_z2 0 get g_cf_z2 1
+  put g_dd_a 0 get g_dd_r 0
+  put g_dd_a 1 get g_dd_r 1
+  k = ulong 64
+  if gt zh f64 -7.5
+    k = 128
+  end
+  put g_dd_b 0 f64 1.0
+  put g_dd_b 1 f64 0.0
+  while gt k 0 bound 128
+    dd_mul f64 k f64 0.0 get g_dd_a 0 get g_dd_a 1
+    dd_div get g_dd_r 0 get g_dd_r 1 get g_dd_b 0 get g_dd_b 1
+    dd_add f64 1.0 f64 0.0 get g_dd_r 0 get g_dd_r 1
+    put g_dd_b 0 get g_dd_r 0
+    put g_dd_b 1 get g_dd_r 1
+    k = sub k 1
+  end
+  dd_ln sub f64 0.0 zh sub f64 0.0 zl
+  dd_add get g_dd_r 0 get g_dd_r 1 dd_hln2pi_h dd_hln2pi_l
+  put g_dd_c 0 get g_dd_r 0
+  put g_dd_c 1 get g_dd_r 1
+  dd_ln get g_dd_b 0 get g_dd_b 1
+  dd_add get g_dd_c 0 get g_dd_c 1 get g_dd_r 0 get g_dd_r 1
+  dd_sub mul f64 -0.5 get g_cf_z2 0 mul f64 -0.5 get g_cf_z2 1 get g_dd_r 0 get g_dd_r 1
+end
+
+note Asymptotic series for z <= -35.
+fn dd_lphi_asym zh f64 zl f64 to void
+  dd_mul zh zl zh zl
+  put g_dd_a 0 get g_dd_r 0
+  put g_dd_a 1 get g_dd_r 1
+  put g_dd_b 0 f64 1.0
+  put g_dd_b 1 f64 0.0
+  put g_dd_c 0 f64 1.0
+  put g_dd_c 1 f64 0.0
+  prev = f64 1.0
+  for n ulong 60
+    nm = f64 sub mul 2 add n 1 1
+    dd_mul get g_dd_c 0 get g_dd_c 1 sub f64 0.0 nm f64 0.0
+    dd_div get g_dd_r 0 get g_dd_r 1 get g_dd_a 0 get g_dd_a 1
+    put g_dd_c 0 get g_dd_r 0
+    put g_dd_c 1 get g_dd_r 1
+    av = q_fabs get g_dd_c 0
+    if gt av prev
+      break
+    end
+    dd_add get g_dd_b 0 get g_dd_b 1 get g_dd_c 0 get g_dd_c 1
+    put g_dd_b 0 get g_dd_r 0
+    put g_dd_b 1 get g_dd_r 1
+    prev = av
+    if lt prev f64 0.0000000000000000000000000000000001
+      break
+    end
+  end
+  dd_ln sub f64 0.0 zh sub f64 0.0 zl
+  dd_add get g_dd_r 0 get g_dd_r 1 dd_hln2pi_h dd_hln2pi_l
+  dd_sub mul f64 -0.5 get g_dd_a 0 mul f64 -0.5 get g_dd_a 1 get g_dd_r 0 get g_dd_r 1
+  put g_dd_c 0 get g_dd_r 0
+  put g_dd_c 1 get g_dd_r 1
+  dd_ln get g_dd_b 0 get g_dd_b 1
+  dd_add get g_dd_c 0 get g_dd_c 1 get g_dd_r 0 get g_dd_r 1
+end
+
+fn dd_lphi zh f64 zl f64 to void
+  if not q_isfinite zh
+    put g_dd_r 0 sub f64 0.0 q_inf
+    put g_dd_r 1 f64 0.0
+    ret
+  end
+  if gt zh f64 -5.0
+    dd_lphi_small zh zl
+    ret
+  end
+  if gt zh f64 -35.0
+    dd_lphi_cf zh zl
+    ret
+  end
+  dd_lphi_asym zh zl
+end
+
+note Natural-log mass of standard Normal on (lo, hi); infinities allowed.
+note Result in g_dd_r[0..1].
+fn tps_lmass loh f64 lol f64 hih f64 hil f64 to long
+  if gt loh hih
+    ret BRW_TPS_E_NUM
+  end
+  if eq loh hih
+    if not lt lol hil
+      ret BRW_TPS_E_NUM
+    end
+  end
+  if q_isnan loh
+    ret BRW_TPS_E_NUM
+  end
+  if q_isnan hih
+    ret BRW_TPS_E_NUM
+  end
+  if ge loh f64 0.0
+    put g_lm_a 0 sub f64 0.0 hih
+    put g_lm_a 1 sub f64 0.0 hil
+    put g_lm_b 0 sub f64 0.0 loh
+    put g_lm_b 1 sub f64 0.0 lol
+  else
+    put g_lm_a 0 loh
+    put g_lm_a 1 lol
+    put g_lm_b 0 hih
+    put g_lm_b 1 hil
+  end
+  if gt get g_lm_b 0 f64 0.0
+    dd_lphi get g_lm_a 0 get g_lm_a 1
+    dd_exp get g_dd_r 0 get g_dd_r 1
+    put g_lm_t 0 get g_dd_r 0
+    put g_lm_t 1 get g_dd_r 1
+    dd_lphi sub f64 0.0 get g_lm_b 0 sub f64 0.0 get g_lm_b 1
+    dd_exp get g_dd_r 0 get g_dd_r 1
+    dd_add get g_lm_t 0 get g_lm_t 1 get g_dd_r 0 get g_dd_r 1
+    dd_log1p sub f64 0.0 get g_dd_r 0 sub f64 0.0 get g_dd_r 1
+  else
+    dd_lphi get g_lm_b 0 get g_lm_b 1
+    put g_lm_t 0 get g_dd_r 0
+    put g_lm_t 1 get g_dd_r 1
+    dd_lphi get g_lm_a 0 get g_lm_a 1
+    if not q_isfinite get g_dd_r 0
+      put g_dd_r 0 get g_lm_t 0
+      put g_dd_r 1 get g_lm_t 1
+    else
+      dd_sub get g_lm_t 0 get g_lm_t 1 get g_dd_r 0 get g_dd_r 1
+      dd_expm1 sub f64 0.0 get g_dd_r 0 sub f64 0.0 get g_dd_r 1
+      dd_ln sub f64 0.0 get g_dd_r 0 sub f64 0.0 get g_dd_r 1
+      dd_add get g_lm_t 0 get g_lm_t 1 get g_dd_r 0 get g_dd_r 1
+    end
+  end
+  oh = get g_dd_r 0
+  if q_isnan oh
+    ret BRW_TPS_E_NUM
+  end
+  if not gt oh tps_big_neg
+    ret BRW_TPS_E_NUM
+  end
+  ret BRW_TPS_OK
+end
+
+fn tps_edge idx long to void
+  dd_from_i64 idx
+  d = q_delta
+  eh = mul get g_dd_r 0 d
+  el = mul get g_dd_r 1 d
+  dd_sub eh el get g_tctx_loc 0 get g_tctx_loc 1
+  dd_div get g_dd_r 0 get g_dd_r 1 get g_tctx_s 0 get g_tctx_s 1
+end
+
+fn tps_side_mass side long a long b long to long
+  c = get g_tctx_c 0
+  loh = f64 0.0
+  lol = f64 0.0
+  hih = f64 0.0
+  hil = f64 0.0
+  if gt side 0
+    tps_edge add c a
+    loh = get g_dd_r 0
+    lol = get g_dd_r 1
+    if lt b 0
+      hih = q_inf
+      hil = f64 0.0
+    else
+      tps_edge add c b
+      hih = get g_dd_r 0
+      hil = get g_dd_r 1
+    end
+  else
+    if lt b 0
+      loh = sub f64 0.0 q_inf
+      lol = f64 0.0
+    else
+      tps_edge add sub c b 1
+      loh = get g_dd_r 0
+      lol = get g_dd_r 1
+    end
+    tps_edge add sub c a 1
+    hih = get g_dd_r 0
+    hil = get g_dd_r 1
+  end
+  ret tps_lmass loh lol hih hil
+end
+
+fn dd_logaddexp ah f64 al f64 bh f64 bl f64 to void
+  if not q_isfinite ah
+    if lt ah f64 0.0
+      put g_dd_r 0 bh
+      put g_dd_r 1 bl
+      ret
+    end
+  end
+  if not q_isfinite bh
+    if lt bh f64 0.0
+      put g_dd_r 0 ah
+      put g_dd_r 1 al
+      ret
+    end
+  end
+  mh = ah
+  ml = al
+  nh = bh
+  nl = bl
+  if gt bh ah
+    mh = bh
+    ml = bl
+    nh = ah
+    nl = al
+  end
+  dd_sub mh ml nh nl
+  dd_exp sub f64 0.0 get g_dd_r 0 sub f64 0.0 get g_dd_r 1
+  dd_log1p get g_dd_r 0 get g_dd_r 1
+  dd_add mh ml get g_dd_r 0 get g_dd_r 1
+end
+
+fn tps_push cap ulong bit ulong l1h f64 l1l f64 l0h f64 l0l f64 to long
+  n = get g_tps_nsteps 0
+  if ge n cap
+    ret BRW_TPS_E_CAP
+  end
+  lth = l0h
+  ltl = l0l
+  loh = l1h
+  lol = l1l
+  if ne bit 0
+    lth = l1h
+    ltl = l1l
+    loh = l0h
+    lol = l0l
+  end
+  dd_exp l1h l1l
+  put g_tps_p1 n get g_dd_r 0
+  put g_tps_bit n bit
+  dd_div lth ltl dd_ln2_h dd_ln2_l
+  put g_tps_l2t_h n get g_dd_r 0
+  put g_tps_l2t_l n get g_dd_r 1
+  dd_div loh lol dd_ln2_h dd_ln2_l
+  put g_tps_l2o_h n get g_dd_r 0
+  put g_tps_l2o_l n get g_dd_r 1
+  put g_tps_nsteps 0 add n 1
+  ret BRW_TPS_OK
+end
+
+note ---- brw_tps_binarise (split for <=16 regs per fn) ----
+fn tps_bin_classes cap ulong side long cls ulong to long
+  for j ulong BRW_TOPCLS
+    av = shl long 1 j
+    rc = tps_side_mass side av shl av 1
+    if ne rc 0
+      ret rc
+    end
+    put g_bin_c1 0 get g_dd_r 0
+    put g_bin_c1 1 get g_dd_r 1
+    rc = tps_side_mass side shl av 1 -1
+    if ne rc 0
+      ret rc
+    end
+    put g_bin_c2 0 get g_dd_r 0
+    put g_bin_c2 1 get g_dd_r 1
+    stopb = ulong 0
+    if eq j cls
+      stopb = 1
+    end
+    dd_sub get g_bin_c1 0 get g_bin_c1 1 get g_bin_lpar 0 get g_bin_lpar 1
+    put g_dd_s 0 get g_dd_r 0
+    put g_dd_s 1 get g_dd_r 1
+    dd_sub get g_bin_c2 0 get g_bin_c2 1 get g_bin_lpar 0 get g_bin_lpar 1
+    rc = tps_push cap stopb get g_dd_s 0 get g_dd_s 1 get g_dd_r 0 get g_dd_r 1
+    if ne rc 0
+      ret rc
+    end
+    if ne stopb 0
+      put g_bin_lpar 0 get g_bin_c1 0
+      put g_bin_lpar 1 get g_bin_c1 1
+      break
+    end
+    put g_bin_lpar 0 get g_bin_c2 0
+    put g_bin_lpar 1 get g_bin_c2 1
+  end
+  ret BRW_TPS_OK
+end
+
+fn tps_bin_push_c12 cap ulong bit ulong to long
+  dd_sub get g_bin_c1 0 get g_bin_c1 1 get g_bin_lpar 0 get g_bin_lpar 1
+  put g_dd_s 0 get g_dd_r 0
+  put g_dd_s 1 get g_dd_r 1
+  dd_sub get g_bin_c2 0 get g_bin_c2 1 get g_bin_lpar 0 get g_bin_lpar 1
+  ret tps_push cap bit get g_dd_s 0 get g_dd_s 1 get g_dd_r 0 get g_dd_r 1
+end
+
+fn tps_bin_refine cap ulong side long ad long cls ulong to long
+  lo = shl long 1 cls
+  is_inf = ulong 0
+  if eq cls BRW_TOPCLS
+    is_inf = 1
+  end
+  bi = cls
+  while gt bi 0 bound 64
+    bi = sub bi 1
+    mid = add lo shl long 1 bi
+    hi = long -1
+    if eq is_inf 0
+      hi = add lo shl long 1 add bi 1
+    end
+    rc = tps_side_mass side mid hi
+    if ne rc 0
+      ret rc
+    end
+    put g_bin_c1 0 get g_dd_r 0
+    put g_bin_c1 1 get g_dd_r 1
+    rc = tps_side_mass side lo mid
+    if ne rc 0
+      ret rc
+    end
+    put g_bin_c2 0 get g_dd_r 0
+    put g_bin_c2 1 get g_dd_r 1
+    upb = ulong 0
+    if ge ad mid
+      upb = 1
+    end
+    rc = tps_bin_push_c12 cap upb
+    if ne rc 0
+      ret rc
+    end
+    if ne upb 0
+      put g_bin_lpar 0 get g_bin_c1 0
+      put g_bin_lpar 1 get g_bin_c1 1
+      lo = mid
+    else
+      put g_bin_lpar 0 get g_bin_c2 0
+      put g_bin_lpar 1 get g_bin_c2 1
+      is_inf = 0
+    end
+  end
+  ret BRW_TPS_OK
+end
+
+fn tps_bin_finish d long side long ad long to long
+  n = get g_tps_nsteps 0
+  put g_dd_s 0 f64 0.0
+  put g_dd_s 1 f64 0.0
+  for i ulong n bound 128
+    dd_sub get g_dd_s 0 get g_dd_s 1 get g_tps_l2t_h i get g_tps_l2t_l i
+    put g_dd_s 0 get g_dd_r 0
+    put g_dd_s 1 get g_dd_r 1
+  end
+  put g_tps_bs 0 get g_dd_s 0
+  put g_tps_bs 1 get g_dd_s 1
+  if eq d 0
+    dd_div sub f64 0.0 get g_bin_lc 0 sub f64 0.0 get g_bin_lc 1 dd_ln2_h dd_ln2_l
+    put g_tps_be 0 get g_dd_r 0
+    put g_tps_be 1 get g_dd_r 1
+  else
+    rc = tps_side_mass side ad add ad 1
+    if ne rc 0
+      ret rc
+    end
+    dd_div sub f64 0.0 get g_dd_r 0 sub f64 0.0 get g_dd_r 1 dd_ln2_h dd_ln2_l
+    put g_tps_be 0 get g_dd_r 0
+    put g_tps_be 1 get g_dd_r 1
+  end
+  ret BRW_TPS_OK
+end
+
+fn tps_bin_setup c long cap ulong nzb ulong to long
+  tps_edge c
+  put g_bin_c1 0 get g_dd_r 0
+  put g_bin_c1 1 get g_dd_r 1
+  tps_edge add c 1
+  rc = tps_lmass get g_bin_c1 0 get g_bin_c1 1 get g_dd_r 0 get g_dd_r 1
+  if ne rc 0
+    ret rc
+  end
+  put g_bin_lc 0 get g_dd_r 0
+  put g_bin_lc 1 get g_dd_r 1
+  rc = tps_side_mass 1 1 -1
+  if ne rc 0
+    ret rc
+  end
+  put g_bin_lp 0 get g_dd_r 0
+  put g_bin_lp 1 get g_dd_r 1
+  rc = tps_side_mass -1 1 -1
+  if ne rc 0
+    ret rc
+  end
+  put g_bin_ln 0 get g_dd_r 0
+  put g_bin_ln 1 get g_dd_r 1
+  dd_logaddexp get g_bin_lp 0 get g_bin_lp 1 get g_bin_ln 0 get g_bin_ln 1
+  put g_bin_lnz 0 get g_dd_r 0
+  put g_bin_lnz 1 get g_dd_r 1
+  ret tps_push cap nzb get g_bin_lnz 0 get g_bin_lnz 1 get g_bin_lc 0 get g_bin_lc 1
+end
+
+fn tps_bin_nz cap ulong side long ad long to long
+  sb = ulong 0
+  if gt side 0
+    put g_bin_lpar 0 get g_bin_lp 0
+    put g_bin_lpar 1 get g_bin_lp 1
+    sb = 1
+  else
+    put g_bin_lpar 0 get g_bin_ln 0
+    put g_bin_lpar 1 get g_bin_ln 1
+  end
+  dd_sub get g_bin_lp 0 get g_bin_lp 1 get g_bin_lnz 0 get g_bin_lnz 1
+  put g_dd_s 0 get g_dd_r 0
+  put g_dd_s 1 get g_dd_r 1
+  dd_sub get g_bin_ln 0 get g_bin_ln 1 get g_bin_lnz 0 get g_bin_lnz 1
+  rc = tps_push cap sb get g_dd_s 0 get g_dd_s 1 get g_dd_r 0 get g_dd_r 1
+  if ne rc 0
+    ret rc
+  end
+  cls = ulong 0
+  while lt cls BRW_TOPCLS bound 64
+    if gt shl long 1 add cls 1 ad
+      break
+    end
+    cls = add cls 1
+  end
+  rc = tps_bin_classes cap side cls
+  if ne rc 0
+    ret rc
+  end
+  ret tps_bin_refine cap side ad cls
+end
+
+fn brw_tps_binarise mu f64 sd f64 b long cap ulong to long
+  put g_tps_nsteps 0 0
+  if or not q_isfinite mu not q_isfinite sd
+    ret BRW_TPS_E_RANGE
+  end
+  if or not gt sd f64 0.0 ge q_fabs mu tps_mu_limit
+    ret BRW_TPS_E_RANGE
+  end
+  put g_qp_fam 0 TYQ_FAM_GAUSS
+  put g_qp_loc 0 mu
+  put g_qp_sc 0 sd
+  if ne ty_qcont_bits 0 b TYQ_OK
+    ret BRW_TPS_E_RANGE
+  end
+  put g_tctx_loc 0 mu
+  put g_tctx_loc 1 f64 0.0
+  s = sd
+  if lt s q_sd_min
+    s = q_sd_min
+  end
+  put g_tctx_s 0 s
+  put g_tctx_s 1 f64 0.0
+  c = long q_floor mul mu f64 1048576.0
+  put g_tctx_c 0 c
+  d = sub b c
+  ad = d
+  side = long 1
+  if lt d 0
+    ad = sub 0 d
+    side = -1
+  end
+  nzb = ulong 0
+  if ne d 0
+    nzb = 1
+  end
+  rc = tps_bin_setup c cap nzb
+  if ne rc 0
+    ret rc
+  end
+  if ne d 0
+    rc = tps_bin_nz cap side ad
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret tps_bin_finish d side ad
+end
+
+note ---- brw_tps_check_steps ----
+fn brw_tps_check_steps n ulong to long
+  tol12 = f64 0.000000000001
+  tol15 = f64 0.000000000000001
+  for i ulong n bound 128
+    if ne get g_tps_bit i 0
+      dd_exp2 get g_tps_l2t_h i get g_tps_l2t_l i
+      put g_chk_q1 0 get g_dd_r 0
+      put g_chk_q1 1 get g_dd_r 1
+      dd_exp2 get g_tps_l2o_h i get g_tps_l2o_l i
+    else
+      dd_exp2 get g_tps_l2o_h i get g_tps_l2o_l i
+      put g_chk_q1 0 get g_dd_r 0
+      put g_chk_q1 1 get g_dd_r 1
+      dd_exp2 get g_tps_l2t_h i get g_tps_l2t_l i
+    end
+    dd_add get g_chk_q1 0 get g_chk_q1 1 get g_dd_r 0 get g_dd_r 1
+    dd_sub get g_dd_r 0 get g_dd_r 1 f64 1.0 f64 0.0
+    if not le q_fabs get g_dd_r 0 tol12
+      ret BRW_TPS_E_PROOF
+    end
+    dd_sub get g_tps_p1 i f64 0.0 get g_chk_q1 0 get g_chk_q1 1
+    lim = add tol15 mul tol12 get g_chk_q1 0
+    if not le q_fabs get g_dd_r 0 lim
+      ret BRW_TPS_E_PROOF
+    end
+  end
+  ret BRW_TPS_OK
+end
+
+note ---- tps_gate_one ----
+fn tps_gate_one mu f64 sd f64 b long ns ulong to long
+  put g_qp_fam 0 TYQ_FAM_GAUSS
+  put g_qp_loc 0 mu
+  put g_qp_sc 0 sd
+  if ne ty_qcont_bits 0 b TYQ_OK
+    ret BRW_TPS_E_RANGE
+  end
+  bq = get g_qret_f 0
+  if ne brw_tps_check_steps ns BRW_TPS_OK
+    ret BRW_TPS_E_PROOF
+  end
+  bsh = f64 0.0
+  bsl = f64 0.0
+  for k ulong ns bound 128
+    dd_sub bsh bsl get g_tps_l2t_h k get g_tps_l2t_l k
+    bsh = get g_dd_r 0
+    bsl = get g_dd_r 1
+  end
+  dd_sub bsh bsl get g_tps_be 0 get g_tps_be 1
+  dx = q_fabs get g_dd_r 0
+  dd_sub bsh bsl bq f64 0.0
+  dq = q_fabs get g_dd_r 0
+  if not le dx tps_exact_tol
+    ret BRW_TPS_E_PROOF
+  end
+  s = sd
+  if lt s q_sd_min
+    s = q_sd_min
+  end
+  r = div q_delta s
+  bnd = sub f64 0.0 q_log2 sub f64 1.0 div mul r r f64 8.0
+  if not le dq add bnd tps_exact_tol
+    ret BRW_TPS_E_PROOF
+  end
+  put g_tps_gate 0 dx
+  put g_tps_gate 1 dq
+  put g_tps_gate 2 bnd
+  ret BRW_TPS_OK
+end
+
+note ---- brw_tps_check_stream ----
+fn brw_tps_check_stream n ulong to long
+  mx = f64 0.0
+  mq = f64 0.0
+  me = tps_big_neg
+  for i ulong n bound 100000
+    put g_tps_bad 0 i
+    mu = get g_in_mu i
+    sd = get g_in_sd i
+    bv = get g_in_b i
+    rc = brw_tps_binarise mu sd bv BRW_TPS_MAX_STEPS
+    if ne rc BRW_TPS_OK
+      ret rc
+    end
+    ns = get g_tps_nsteps 0
+    rc = tps_gate_one mu sd bv ns
+    if ne rc BRW_TPS_OK
+      ret rc
+    end
+    dx = get g_tps_gate 0
+    dq = get g_tps_gate 1
+    bnd = get g_tps_gate 2
+    if gt dx mx
+      mx = dx
+    end
+    if gt dq mq
+      mq = dq
+    end
+    ex = sub dq bnd
+    if gt ex me
+      me = ex
+    end
+  end
+  put g_tps_res 0 mx
+  put g_tps_res 1 mq
+  put g_tps_res 2 me
+  ret BRW_TPS_OK
+end
+
+note ---- brw_tps_p1_to_freq ----
+fn brw_tps_p1_to_freq p1 f64 to long
+  if q_isnan p1
+    ret BRW_TPS_E_ARG
+  end
+  f = mul p1 f64 65536.0
+  f1 = long 1
+  if ge f f64 65535.0
+    f1 = 65535
+  else
+    if le f f64 1.0
+      f1 = 1
+    else
+      f1 = q_llrint f
+    end
+  end
+  if lt f1 1
+    f1 = 1
+  end
+  if gt f1 65535
+    f1 = 65535
+  end
+  put g_tps_fq 1 ushort f1
+  put g_tps_fq 0 ushort sub 65536 f1
+  ret BRW_TPS_OK
+end
+
+note ---- Tamper hook for hostile #27 tests ----
+fn tps_apply_hook obs ulong ns ulong to void
+  hmode = get g_hk_mode 0
+  if lt hmode 0
+    ret
+  end
+  if ne obs get g_hk_at 0
+    ret
+  end
+  if eq ns 0
+    ret
+  end
+  hrel = get g_hk_rel 0
+  if eq hmode 0
+    dd_sub f64 1.0 f64 0.0 hrel f64 0.0
+    put g_dd_s 0 get g_dd_r 0
+    put g_dd_s 1 get g_dd_r 1
+    dd_exp2 get g_tps_l2t_h 0 get g_tps_l2t_l 0
+    dd_mul get g_dd_r 0 get g_dd_r 1 get g_dd_s 0 get g_dd_s 1
+    put g_dd_t 0 get g_dd_r 0
+    put g_dd_t 1 get g_dd_r 1
+    dd_ln get g_dd_t 0 get g_dd_t 1
+    dd_div get g_dd_r 0 get g_dd_r 1 dd_ln2_h dd_ln2_l
+    put g_tps_l2t_h 0 get g_dd_r 0
+    put g_tps_l2t_l 0 get g_dd_r 1
+    dd_sub f64 1.0 f64 0.0 get g_dd_t 0 get g_dd_t 1
+    put g_dd_s 0 get g_dd_r 0
+    put g_dd_s 1 get g_dd_r 1
+    dd_ln get g_dd_s 0 get g_dd_s 1
+    dd_div get g_dd_r 0 get g_dd_r 1 dd_ln2_h dd_ln2_l
+    put g_tps_l2o_h 0 get g_dd_r 0
+    put g_tps_l2o_l 0 get g_dd_r 1
+    if ne get g_tps_bit 0 0
+      put g_tps_p1 0 get g_dd_t 0
+    else
+      put g_tps_p1 0 get g_dd_s 0
+    end
+  else
+    put g_tps_p1 0 mul get g_tps_p1 0 sub f64 1.0 hrel
+  end
+end
+
+note ---- brw_tps_build (two-pass, identical to C) ----
+fn tps_fill_steps obs ulong rec ulong ns ulong to long
+  if gt add rec ns TPS_MAX_REC
+    ret BRW_TPS_E_NUM
+  end
+  r = rec
+  for k ulong ns bound 128
+    if ne brw_tps_p1_to_freq get g_tps_p1 k BRW_TPS_OK
+      ret BRW_TPS_E_NUM
+    end
+    put g_ps_q mul r 2 get g_tps_fq 0
+    put g_ps_q add mul r 2 1 get g_tps_fq 1
+    put g_ps_key r obs
+    put g_ps_sym r uchar get g_tps_bit k
+    r = add r 1
+  end
+  ret BRW_TPS_OK
+end
+
+fn tps_bin_idx i ulong to long
+  mu = get g_in_mu i
+  sd = get g_in_sd i
+  bv = get g_in_b i
+  ret brw_tps_binarise mu sd bv BRW_TPS_MAX_STEPS
+end
+
+fn tps_gate_idx i ulong ns ulong to long
+  mu = get g_in_mu i
+  sd = get g_in_sd i
+  bv = get g_in_b i
+  ret tps_gate_one mu sd bv ns
+end
+
+fn tps_pass n ulong fill ulong to long
+  rec = ulong 0
+  mx = f64 0.0
+  for i ulong n bound 100000
+    put g_tps_bad 0 i
+    rc = tps_bin_idx i
+    if ne rc BRW_TPS_OK
+      ret rc
+    end
+    ns = get g_tps_nsteps 0
+    tps_apply_hook i ns
+    rc = tps_gate_idx i ns
+    if ne rc BRW_TPS_OK
+      ret rc
+    end
+    if gt get g_tps_gate 0 mx
+      mx = get g_tps_gate 0
+    end
+    if ne fill 0
+      rc = tps_fill_steps i rec ns
+      if ne rc BRW_TPS_OK
+        ret rc
+      end
+    end
+    rec = add rec ns
+  end
+  put g_ps_n 0 rec
+  put g_tps_res 0 mx
+  ret BRW_TPS_OK
+end
+
+fn brw_tps_build n ulong hmode long hat ulong hrel f64 to long
+  put g_hk_mode 0 hmode
+  put g_hk_at 0 hat
+  put g_hk_rel 0 hrel
+  put g_ps_alloc 0 0
+  put g_ps_n 0 0
+  rc = tps_pass n 0
+  if ne rc BRW_TPS_OK
+    ret rc
+  end
+  tot = get g_ps_n 0
+  if gt tot TPS_MAX_REC
+    ret BRW_TPS_E_NUM
+  end
+  rc = tps_pass n 1
+  if ne rc BRW_TPS_OK
+    put g_ps_alloc 0 0
+    put g_ps_n 0 0
+    ret rc
+  end
+  if ne get g_ps_n 0 tot
+    put g_ps_alloc 0 0
+    put g_ps_n 0 0
+    ret BRW_TPS_E_NUM
+  end
+  put g_ps_alloc 0 1
+  ret BRW_TPS_OK
+end
+
+note ---- Streaming SHA-256 over sh_pad using seed/ng/sha256.om ----
+fn tsh_begin to void
+  sh_init
+  for j ulong 8
+    put sh_h j get sh_k add j 64
+  end
+  put g_sh_pos 0 0
+  put g_sh_tot 0 0
+end
+
+fn tsh_byte v uchar to void
+  p = get g_sh_pos 0
+  put sh_pad p v
+  p = add p 1
+  put g_sh_tot 0 add get g_sh_tot 0 1
+  if eq p 64
+    sh_blk 1 0
+    p = 0
+  end
+  put g_sh_pos 0 p
+end
+
+fn tsh_u16 v ulong to void
+  tsh_byte uchar and v 255
+  tsh_byte uchar and shr v 8 255
+end
+
+fn tsh_u32 v ulong to void
+  tsh_byte uchar and v 255
+  tsh_byte uchar and shr v 8 255
+  tsh_byte uchar and shr v 16 255
+  tsh_byte uchar and shr v 24 255
+end
+
+fn tsh_u64 v ulong to void
+  tsh_u32 and v 0xffffffff
+  tsh_u32 shr v 32
+end
+
+fn tsh_zeros cnt ulong to void
+  for i ulong cnt bound 128
+    tsh_byte 0
+  end
+end
+
+fn tsh_end to void
+  r = get g_sh_pos 0
+  n = get g_sh_tot 0
+  for j ulong 128
+    if ge j r
+      put sh_pad j 0
+    end
+  end
+  put sh_pad r 128
+  e = ulong 64
+  if ge r 56
+    e = 128
+  end
+  bits = mul n 8
+  for j ulong 8
+    put sh_pad sub sub e 1 j uchar and shr bits mul j 8 255
+  end
+  sh_blk 1 0
+  if eq e 128
+    sh_blk 1 64
+  end
+  sh_out
+end
+
+note ---- TPS1 / TSY1 validation, serialization digest, and ideal_ub ----
+fn tc_ps_check_rows to long
+  n = get g_ps_n 0
+  for t ulong n bound 4194304
+    q0 = ulong get g_ps_q mul t 2
+    q1 = ulong get g_ps_q add mul t 2 1
+    if or eq q0 0 eq q1 0
+      ret TC_E_ZERO
+    end
+    if ne add q0 q1 TC_QONE
+      ret TC_E_NORM
+    end
+  end
+  ret TC_OK
+end
+
+fn tc_ps_serialize_hash to long
+  rc = tc_ps_check_rows
+  if ne rc TC_OK
+    ret rc
+  end
+  n = get g_ps_n 0
+  tsh_begin
+  for i ulong len t_tps_dom
+    tsh_byte get t_tps_dom i
+  end
+  tsh_byte 0
+  for i ulong 4
+    tsh_byte get t_tps_mag i
+  end
+  tsh_u16 1
+  tsh_byte 2
+  tsh_byte 16
+  tsh_u32 0
+  tsh_u64 n
+  tsh_u32 28
+  tsh_u32 0
+  tsh_zeros 100
+  for t ulong n bound 4194304
+    tsh_u64 t
+    tsh_u64 get g_ps_key t
+    tsh_u32 0
+    tsh_u32 TC_QONE
+    tsh_u16 ulong get g_ps_q mul t 2
+    tsh_u16 ulong get g_ps_q add mul t 2 1
+  end
+  tsh_end
+  for i ulong 32
+    put g_ps_dig i get sh_dig i
+  end
+  ret TC_OK
+end
+
+fn tc_sy_serialize_hash to long
+  n = get g_ps_n 0
+  tsh_begin
+  for i ulong len t_tsy_dom
+    tsh_byte get t_tsy_dom i
+  end
+  tsh_byte 0
+  for i ulong 4
+    tsh_byte get t_tsy_mag i
+  end
+  tsh_u16 1
+  tsh_byte 2
+  tsh_byte 0
+  tsh_u64 n
+  tsh_u64 0
+  tsh_zeros 32
+  for t ulong n bound 4194304
+    tsh_byte get g_ps_sym t
+  end
+  tsh_end
+  for i ulong 32
+    put g_sy_dig i get sh_dig i
+  end
+  ret TC_OK
+end
+
+fn tc_pair_check to long
+  n = get g_ps_n 0
+  for t ulong n bound 4194304
+    if ge get g_ps_sym t 2
+      ret TC_E_SYMBOL
+    end
+  end
+  ret TC_OK
+end
+
+note Exact ty_log2_q32 matching src/turing/ty_math.c
+fn ty_log2_q32 x ulong to ulong
+  if eq x 0
+    ret 0
+  end
+  e = ulong 0
+  tmp = x
+  while gt tmp 1 bound 64
+    tmp = shr tmp 1
+    e = add e 1
+  end
+  m = shl x sub 62 e
+  frac = ulong 0
+  two = shl ulong 1 63
+  for i ulong 32
+    hi = shr m 32
+    lo = and m 0xffffffff
+    p0 = mul lo lo
+    p1 = mul hi lo
+    p2 = mul hi hi
+    mid = add shl p1 1 shr p0 32
+    m = add shl p2 2 shr mid 30
+    frac = shl frac 1
+    if ge m two
+      m = shr m 1
+      frac = or frac 1
+    end
+  end
+  ret or shl e 32 frac
+end
+
+fn ty_ub_init to void
+  if ne get g_ub_rdy 0 0
+    ret
+  end
+  put g_ub_tbl 0 -7
+  base = shl ulong 16 32
+  for q ulong 65536
+    qv = add q 1
+    v = sub base ty_log2_q32 qv
+    t = add mul v 1000000 shl ulong 1 31
+    put g_ub_tbl qv long shr t 32
+  end
+  put g_ub_rdy 0 1
+end
+
+fn tc_ideal_ub to long
+  ty_ub_init
+  n = get g_ps_n 0
+  tot = long 0
+  for t ulong n bound 4194304
+    sv = ulong get g_ps_sym t
+    if ge sv 2
+      ret TC_E_SYMBOL
+    end
+    qv = ulong get g_ps_q add mul t 2 sv
+    if or eq qv 0 gt qv TC_QONE
+      ret TC_E_ZERO
+    end
+    tot = add tot get g_ub_tbl qv
+  end
+  put g_ub_out 0 tot
+  ret TC_OK
+end
+
+note ---- Coded-file 56-byte header write / check ----
+fn tc_hdr_put_u64 off ulong v ulong to void
+  for i ulong 8
+    put g_coded add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn tc_hdr_get_u64 off ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get g_coded add off i mul i 8
+  end
+  ret v
+end
+
+fn tc_hdr_write cid ulong cnt ulong pay ulong to void
+  for i ulong TC_CODED_HDR
+    put g_coded i 0
+  end
+  if eq cid 1
+    for i ulong 4
+      put g_coded i get t_tcr_mag i
+    end
+  else
+    for i ulong 4
+      put g_coded i get t_trn_mag i
+    end
+  end
+  put g_coded 4 1
+  put g_coded 5 uchar cid
+  tc_hdr_put_u64 8 cnt
+  for i ulong 32
+    put g_coded add 16 i get g_ps_dig i
+  end
+  tc_hdr_put_u64 48 pay
+end
+
+fn tc_hdr_check cid ulong to long
+  clen = get g_coded_len 0
+  if lt clen TC_CODED_HDR
+    ret TC_E_HEADER
+  end
+  if eq cid 1
+    for i ulong 4
+      if ne get g_coded i get t_tcr_mag i
+        ret TC_E_HEADER
+      end
+    end
+  else
+    for i ulong 4
+      if ne get g_coded i get t_trn_mag i
+        ret TC_E_HEADER
+      end
+    end
+  end
+  if or ne get g_coded 4 1 ne get g_coded 5 uchar cid
+    ret TC_E_HEADER
+  end
+  if or ne get g_coded 6 0 ne get g_coded 7 0
+    ret TC_E_HEADER
+  end
+  for i ulong 32
+    if ne get g_coded add 16 i get g_ps_dig i
+      ret TC_E_BINDING
+    end
+  end
+  if ne tc_hdr_get_u64 8 get g_ps_n 0
+    ret TC_E_COUNT
+  end
+  pl = tc_hdr_get_u64 48
+  rem_b = sub clen TC_CODED_HDR
+  if gt pl rem_b
+    ret TC_E_TRUNC
+  end
+  if lt pl rem_b
+    ret TC_E_TRAIL
+  end
+  ret TC_OK
+end
+
+note ---- Reference coder A: range coder (K = 2, byte-exact to tc_range.c) ----
+global g_rc_low ulong 1
+global g_rc_rng ulong 1
+global g_rc_cac ulong 1
+global g_rc_hvc ulong 1
+global g_rc_pnd ulong 1
+global g_rc_pos ulong 1
+global g_rc_err ulong 1
+
+fn rc_emit b ulong to void
+  p = get g_rc_pos 0
+  if ge p 6291456
+    put g_rc_err 0 1
+    ret
+  end
+  put g_coded p uchar and b 255
+  put g_rc_pos 0 add p 1
+end
+
+fn rc_shift_low to void
+  low = get g_rc_low 0
+  low32 = and low 0xffffffff
+  carry = shr low 32
+  if or lt low32 0xff000000 ne carry 0
+    if ne carry 0
+      if eq get g_rc_hvc 0 0
+        put g_rc_err 0 2
+      end
+    end
+    if ne get g_rc_hvc 0 0
+      rc_emit and add get g_rc_cac 0 carry 255
+    end
+    pnd = get g_rc_pnd 0
+    while gt pnd 0 bound 6291456
+      rc_emit and add 255 carry 255
+      pnd = sub pnd 1
+    end
+    put g_rc_pnd 0 0
+    put g_rc_cac 0 and shr low 24 255
+    put g_rc_hvc 0 1
+  else
+    put g_rc_pnd 0 add get g_rc_pnd 0 1
+  end
+  put g_rc_low 0 shl and low 0x00ffffff 8
+end
+
+fn tc_range_encode to long
+  rc = tc_pair_check
+  if ne rc TC_OK
+    ret rc
+  end
+  rc = tc_ps_check_rows
+  if ne rc TC_OK
+    ret rc
+  end
+  n = get g_ps_n 0
+  put g_rc_low 0 0
+  put g_rc_rng 0 0xffffffff
+  put g_rc_cac 0 0
+  put g_rc_hvc 0 0
+  put g_rc_pnd 0 0
+  put g_rc_pos 0 TC_CODED_HDR
+  put g_rc_err 0 0
+  for t ulong n bound 4194304
+    q0 = ulong get g_ps_q mul t 2
+    s = ulong get g_ps_sym t
+    rng = get g_rc_rng 0
+    r = shr rng 16
+    if eq s 0
+      rng = mul r q0
+    else
+      put g_rc_low 0 add get g_rc_low 0 mul r q0
+      rng = sub rng mul r q0
+    end
+    while lt rng TC_RC_TOP bound 8
+      rng = shl rng 8
+      rc_shift_low
+    end
+    put g_rc_rng 0 rng
+  end
+  for i ulong 5
+    rc_shift_low
+  end
+  if ne get g_rc_err 0 0
+    if eq get g_rc_err 0 2
+      ret TC_E_CORRUPT
+    end
+    ret TC_E_IO
+  end
+  tot = get g_rc_pos 0
+  pay = sub tot TC_CODED_HDR
+  tc_hdr_write 1 n pay
+  put g_coded_len 0 tot
+  ret TC_OK
+end
+
+fn tc_range_decode to long
+  rc = tc_hdr_check 1
+  if ne rc TC_OK
+    ret rc
+  end
+  rc = tc_ps_check_rows
+  if ne rc TC_OK
+    ret rc
+  end
+  clen = get g_coded_len 0
+  pos = ulong TC_CODED_HDR
+  if lt sub clen pos 4
+    ret TC_E_TRUNC
+  end
+  code = ulong 0
+  for i ulong 4
+    code = or shl code 8 ulong get g_coded pos
+    pos = add pos 1
+  end
+  rng = ulong 0xffffffff
+  n = get g_ps_n 0
+  for t ulong n bound 4194304
+    if ge code rng
+      ret TC_E_CORRUPT
+    end
+    rq0 = mul shr rng 16 ulong get g_ps_q mul t 2
+    if lt code rq0
+      put g_ps_dec t 0
+      rng = rq0
+    else
+      put g_ps_dec t 1
+      code = sub code rq0
+      rng = sub rng rq0
+    end
+    while lt rng TC_RC_TOP bound 8
+      if ge pos clen
+        ret TC_E_TRUNC
+      end
+      code = or shl code 8 ulong get g_coded pos
+      pos = add pos 1
+      rng = shl rng 8
+    end
+  end
+  if ne code 0
+    ret TC_E_CORRUPT
+  end
+  if ne pos clen
+    ret TC_E_TRAIL
+  end
+  ret TC_OK
+end
+
+note ---- Reference coder B: rANS (K = 2, byte-exact to tc_rans.c) ----
+fn tc_rans_encode to long
+  rc = tc_pair_check
+  if ne rc TC_OK
+    ret rc
+  end
+  rc = tc_ps_check_rows
+  if ne rc TC_OK
+    ret rc
+  end
+  n = get g_ps_n 0
+  p = ulong 6291456
+  x = ulong TC_RANS_L
+  i = n
+  while gt i 0 bound 4194304
+    i = sub i 1
+    q0 = ulong get g_ps_q mul i 2
+    f = q0
+    c = ulong 0
+    if ne get g_ps_sym i 0
+      f = ulong get g_ps_q add mul i 2 1
+      c = q0
+    end
+    xmax = mul 32768 f
+    while ge x xmax bound 8
+      p = sub p 1
+      put g_coded p uchar and x 255
+      x = shr x 8
+    end
+    x = add add shl div x f 16 rem x f c
+  end
+  p = sub p 4
+  put g_coded p uchar and x 255
+  put g_coded add p 1 uchar and shr x 8 255
+  put g_coded add p 2 uchar and shr x 16 255
+  put g_coded add p 3 uchar and shr x 24 255
+  nb = sub 6291456 p
+  if gt add TC_CODED_HDR nb 6291456
+    ret TC_E_IO
+  end
+  for j ulong nb bound 6291456
+    put g_coded add TC_CODED_HDR j get g_coded add p j
+  end
+  tc_hdr_write 2 n nb
+  put g_coded_len 0 add TC_CODED_HDR nb
+  ret TC_OK
+end
+
+fn tc_rans_decode to long
+  rc = tc_hdr_check 2
+  if ne rc TC_OK
+    ret rc
+  end
+  clen = get g_coded_len 0
+  pos = ulong TC_CODED_HDR
+  if lt sub clen pos 4
+    ret TC_E_TRUNC
+  end
+  x = ulong get g_coded pos
+  x = or x shl ulong get g_coded add pos 1 8
+  x = or x shl ulong get g_coded add pos 2 16
+  x = or x shl ulong get g_coded add pos 3 24
+  pos = add pos 4
+  if or lt x TC_RANS_L ge x 2147483648
+    ret TC_E_CORRUPT
+  end
+  n = get g_ps_n 0
+  for t ulong n bound 4194304
+    q0 = ulong get g_ps_q mul t 2
+    q1 = ulong get g_ps_q add mul t 2 1
+    if or eq q0 0 eq q1 0
+      ret TC_E_ZERO
+    end
+    if ne add q0 q1 TC_QONE
+      ret TC_E_NORM
+    end
+    m = and x 65535
+    if lt m q0
+      put g_ps_dec t 0
+      x = add mul q0 shr x 16 m
+    else
+      put g_ps_dec t 1
+      x = sub add mul q1 shr x 16 m q0
+    end
+    while lt x TC_RANS_L bound 8
+      if ge pos clen
+        ret TC_E_TRUNC
+      end
+      x = or shl x 8 ulong get g_coded pos
+      pos = add pos 1
+    end
+  end
+  if ne x TC_RANS_L
+    ret TC_E_CORRUPT
+  end
+  if ne pos clen
+    ret TC_E_TRAIL
+  end
+  ret TC_OK
+end
