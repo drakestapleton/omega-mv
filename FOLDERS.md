@@ -579,3 +579,7 @@ Seeded Omega capability root, queue, and durable Ed25519 world signer (`arboris-
 ## `tests/arboris/`
 
 Host and GB10 silicon qualification probes, SM121 disassembly golden files, compute-lock/capability/signer regressions, and `host.sh` driver for Arboris.
+
+## `seed/helix/`
+
+Proof-Carrying Evolutionary Helix: independent second tiny W^X seed ladder (`rung0/seedB0.b0` 396 B → `rung1/hexB1` → `rung2/omB2` pure stack-machine compiler) for strict Diverse Double Compilation against Strand A (`seed0.hex` 408 B) and Strand B (`seed/ng`), pure seeded OM-2 Monk proof verifier (`monk_check.om`), Arboris nervous-system + SM121 Predator (`arboris_predator.om`), 7-antibody adversarial Immune System (`immune.om`), Lean 4 soundness & antibody proofs (`proofs/`), and dual-seed bootstrap script (`helix-from-seeds.sh`).
