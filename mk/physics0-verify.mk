@@ -16,8 +16,13 @@ P0V_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
 P0V_SRCS = src/physics0/ladder/pd0_fmt.c src/physics0/ladder/pd0_codes.c src/physics0/ladder/pd0_ladder.c src/physics0/score/pd0_score.c src/physics0/controls/pd0_controls.c src/physics0/controls/pd0_receipt.c src/omega_om_units.c
 P0V_HDRS = src/physics0/ladder/pd0_fmt.h src/physics0/ladder/pd0_codes.h src/physics0/ladder/pd0_rng.h src/physics0/ladder/pd0_ladder.h src/physics0/score/pd0_score.h src/physics0/controls/pd0_controls.h src/physics0/controls/pd0_receipt.h tests/physics0/verify/truth.h tests/physics0/verify/bundle.h
 P0V_DIR = $(OUT_DIR)/tests-physics0-verify
+P0V_OMC ?= seed/out/omc
+P0V_OM_FMT = src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_wire.om src/physics0/ladder/pd0_codes.om src/physics0/ladder/pd0_fmt.om src/physics0/controls/pd0_receipt.om tests/physics0/verify/test_pd0_fmt.om
 # the verifier must not contain generator knowledge: no symbol or string from the test truth header
 P0V_FORBIDDEN = 'truth_|oracle_rel|rx_|aienos_|argus_|forge_|mmap|fork|exec|socket'
+$(P0V_DIR)/test_pd0_fmt: $(P0V_OM_FMT) $(P0V_OMC)
+	@mkdir -p $(P0V_DIR)/receipts
+	{ echo "om2"; cat $(P0V_OM_FMT); } | $(P0V_OMC) > $@ && chmod +x $@
 $(P0V_DIR)/%: tests/physics0/verify/%.c $(P0V_SRCS) $(P0V_HDRS)
 	@mkdir -p $(P0V_DIR)/receipts
 	$(CC) $(P0V_CFLAGS) -o $@ $< $(P0V_SRCS) -lm
@@ -29,12 +34,11 @@ p0v-purity:
 	@for f in $(filter-out src/omega_om_units.c,$(P0V_SRCS)); do $(CC) $(P0V_CFLAGS) -c -o $(P0V_DIR)/purity/$$(basename $$f .c).o $$f || exit 1; done
 	@if nm $(P0V_DIR)/purity/*.o | grep -E $(P0V_FORBIDDEN); then echo "verifier object references generator or authority symbols"; exit 1; fi
 	@echo "p0v-purity: verifier objects carry no generator or authority symbol"
-test-physics0-verify: p0v-purity $(P0V_DIR)/test_pd0_fmt $(P0V_DIR)/test_pd0_fmt_asan $(P0V_DIR)/test_pd0_ladder $(P0V_DIR)/test_pd0_ladder_asan $(P0V_DIR)/test_pd0_score $(P0V_DIR)/test_pd0_score_asan
+test-physics0-verify: p0v-purity $(P0V_DIR)/test_pd0_fmt $(P0V_DIR)/test_pd0_ladder $(P0V_DIR)/test_pd0_ladder_asan $(P0V_DIR)/test_pd0_score $(P0V_DIR)/test_pd0_score_asan
 	./$(P0V_DIR)/test_pd0_fmt
-	./$(P0V_DIR)/test_pd0_fmt_asan
 	./$(P0V_DIR)/test_pd0_ladder
 	./$(P0V_DIR)/test_pd0_ladder_asan
 	./$(P0V_DIR)/test_pd0_score
 	./$(P0V_DIR)/test_pd0_score_asan
-	@echo "test-physics0-verify: PD-0 verifier formats, ladder, scorer and negative controls pass (plain + ASan/UBSan); receipts in $(P0V_DIR)/receipts"
+	@echo "test-physics0-verify: PD-0 verifier formats (pure OM-2), ladder, scorer and negative controls pass; receipts in $(P0V_DIR)/receipts"
 endif

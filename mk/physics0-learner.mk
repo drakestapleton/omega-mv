@@ -56,9 +56,11 @@ $(P0L_DIR)/pd0-truth: tests/physics0/learner/pd0_truth_main.c $(P0L_TRUTH_SRCS) 
 	@mkdir -p $(P0L_DIR)
 	$(CC) -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -o $@ $< $(P0L_TRUTH_SRCS) -lm -Wno-pedantic
 
-$(P0L_DIR)/test_pd0_protocol_v2: tests/physics0/learner/test_pd0_protocol_v2.c $(P0L_TRUTH_SRCS) $(wildcard src/physics0/*.h)
+P0L_OMC ?= seed/out/omc
+P0L_OM_WORLD = src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_chan.om src/physics0/pd0_wire.om src/physics0/pd0_relation.om src/physics0/pd0_world.om
+$(P0L_DIR)/test_pd0_protocol_v2: $(P0L_OM_WORLD) tests/physics0/learner/test_pd0_protocol_v2.om $(P0L_OMC)
 	@mkdir -p $(P0L_DIR)
-	$(CC) -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -o $@ $< $(P0L_TRUTH_SRCS) -lm -Wno-pedantic
+	{ echo "om2"; cat $(P0L_OM_WORLD) tests/physics0/learner/test_pd0_protocol_v2.om; } | $(P0L_OMC) > $@ && chmod +x $@
 
 test-physics0-learner: p0l-isolation $(P0L_DIR)/test_pd0_learner $(P0L_DIR)/test_pd0_learner_asan $(P0L_DIR)/pd0-learner $(P0L_DIR)/test_pd0_protocol_v2
 	./$(P0L_DIR)/test_pd0_learner

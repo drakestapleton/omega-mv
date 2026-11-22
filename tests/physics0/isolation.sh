@@ -23,16 +23,31 @@
 fail=0
 for o in "$@"; do
     [ -f "$o" ] || { echo "missing $o"; fail=1; continue; }
-    syms=$(nm "$o" | awk '{print $NF}')
-    for bad in pd0_gen_ pd0_world_ fopen open openat fdopen; do
-        if echo "$syms" | grep -q "^_\{0,1\}${bad}"; then
-            echo "FAIL: $o references $bad"; fail=1
-        fi
-    done
+    case "$o" in
+        *.om)
+            code=$(grep -v '^[[:space:]]*note\([[:space:]]\|$\)' "$o")
+            for bad in pd0_gen_ pd0_world_ p0w_ fopen openat fdopen; do
+                if printf '%s\n' "$code" | grep -q "\b${bad}\|${bad}"; then
+                    echo "FAIL: $o references $bad"; fail=1
+                fi
+            done
+            ;;
+        *)
+            syms=$(nm "$o" | awk '{print $NF}')
+            for bad in pd0_gen_ pd0_world_ fopen open openat fdopen; do
+                if echo "$syms" | grep -q "^_\{0,1\}${bad}"; then
+                    echo "FAIL: $o references $bad"; fail=1
+                fi
+            done
+            ;;
+    esac
 done
-# and the generator objects really do carry the generators (so the check bites)
+# and the generator objects/sources really do carry the generators (so the check bites)
 if [ -n "$PD0_GEN_OBJ" ]; then
     nm "$PD0_GEN_OBJ" | grep -q " T pd0_gen_step" || { echo "FAIL: $PD0_GEN_OBJ has no pd0_gen_step"; fail=1; }
 fi
-if [ $fail = 0 ]; then echo "PHYSICS0_ISOLATION: PASS ($# learner-side objects clean)"; else echo "PHYSICS0_ISOLATION: FAIL"; fi
+if [ -n "$PD0_GEN_OM" ]; then
+    grep -q "^fn pd0_gen_" "$PD0_GEN_OM" || { echo "FAIL: $PD0_GEN_OM has no fn pd0_gen_*"; fail=1; }
+fi
+if [ $fail = 0 ]; then echo "PHYSICS0_ISOLATION: PASS ($# learner-side units clean)"; else echo "PHYSICS0_ISOLATION: FAIL"; fi
 exit $fail
