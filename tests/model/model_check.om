@@ -1,0 +1,1236 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/model/model_check.om -- exhaustive check of the World lifecycle model (lane LG).
+note Pure seeded OM-2 port of tests/model/{world_model,world_explore,model_check}.c.
+
+const MC_CAP ulong 65536
+const MC_TSZ ulong 131072
+const MC_TMASK ulong 131071
+
+note Compact WmState layout (64 bytes per state):
+note   0..3   st[0..3]
+note   4..7   rearm[0..3]
+note   8..11  stale[0..3]
+note  12..15  parked[0..3]
+note  16..19  yield[0..3]
+note  20..23  surfaced[0..3]
+note  24..27  act_committed[0..3]
+note  28      ext
+note  29      tick
+note  30      used_slots
+note  31      in_flight
+note  32..35  used_mem (u32 LE)
+note  36..51  wait_seq[0..3] (4 x u32 LE)
+note  52..55  seq (u32 LE)
+
+global g_states  uchar 4194304
+global g_keys    uchar 2621440
+global g_parent  uint  65536
+global g_op_kind uchar 65536
+global g_op_r    uchar 65536
+global g_table   uint  131072
+
+global g_cur     uchar 64
+global g_keybuf  uchar 40
+global g_ops_k   uchar 16
+global g_ops_r   uchar 16
+
+global g_res_u64 ulong 2
+global g_res_u32 uint  2
+global g_tlen    int   5
+global g_tk      uchar 320
+global g_tr      uchar 320
+global g_rev_k   uchar 64
+global g_rev_r   uchar 64
+global g_prof    int   4
+
+global g_obuf    uchar 65536
+global g_olen    ulong 1
+global g_bad     int   1
+global g_tmpd    uchar 24
+global g_kids    uchar 4
+
+text t_star "[*] "
+text t_lp " ("
+text t_rp_c "): "
+text t_st " states, "
+text t_tr " transitions"
+text t_trunc " TRUNCATED (not exhaustive)"
+text t_res "RESULT model."
+text t_dot_st ".states="
+text t_dot_tr ".transitions="
+text t_dot_ex ".exhaustive="
+text t_yes "YES\n"
+text t_no "NO\n"
+text t_eq_fail "=FAIL\n"
+text t_eq_pass "=PASS\n"
+text t_eq_killed "=KILLED\n"
+text t_eq_kf "=KNOWN_FAIL\n"
+text t_eq_surv "=SURVIVED\n"
+text t_eq_upass "=UNEXPECTED_PASS\n"
+text t_eq_viol "=violated\n"
+text t_eq_held "=held\n"
+text t_b0 "I1_no_budget_leak"
+text t_b1 "I2_cancel_reaches_children"
+text t_b2 "I3_no_double_commit"
+text t_b3 "I4_deadline_overrun_surfaced"
+text t_b4 "I2b_cancel_reaches_target"
+text t_sp2 "  "
+text t_ce1 " counterexample ("
+text t_ce2 " steps): "
+text t_arr " -> "
+text t_unexp "UNEXPECTED"
+text t_kby "killed by"
+text t_find "FINDING"
+text t_ext "EXT"
+text t_tick "TICK"
+text t_fin "FIN("
+text t_fail "FAIL("
+text t_can "CANCEL("
+text t_p "P"
+text t_c1 "C1"
+text t_c2 "C2"
+text t_g "G"
+text t_p_spec "SPEC"
+text t_p_ab "AS_BUILT"
+text t_p_leak "MUT_LEAK_ON_FAIL"
+text t_p_noprop "MUT_CANCEL_NO_PROPAGATE"
+text t_p_dbl "MUT_COMMIT_KEEPS_ACTIVATION"
+text t_p_dl "MUT_DEADLINE_ADMIT_ONLY"
+text t_r_spec "spec"
+text t_r_ab "as-built"
+text t_r_mut "mutant"
+text t_verd "RESULT model.verdict="
+text t_pass_nl "PASS\n"
+text t_fail_nl "FAIL\n"
+text t_mc_p "MODEL CHECK: PASS ("
+text t_mc_f "MODEL CHECK: FAIL ("
+text t_mc_e " unexpected)\n"
+
+fn out_flush to void
+  n = get g_olen 0
+  if gt n 0
+    ign = write 1 g_obuf 0 n
+    put g_olen 0 0
+  end
+end
+
+fn out_c c uchar to void
+  n = get g_olen 0
+  if ge n 65535
+    out_flush
+    n = ulong 0
+  end
+  put g_obuf n c
+  put g_olen 0 add n 1
+end
+
+fn out_t s view uchar * n ulong to void
+  for i ulong n
+    out_c get s i
+  end
+end
+
+fn out_u64 v ulong to void
+  if eq v 0
+    out_c uchar 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0
+    d = rem x 10
+    put g_tmpd n uchar add 48 d
+    n = add n 1
+    x = div x 10
+  end
+  while gt n 0
+    n = sub n 1
+    out_c get g_tmpd n
+  end
+end
+
+fn out_int v int to void
+  if lt v 0
+    out_c uchar 45
+    out_u64 ulong sub 0 v
+  else
+    out_u64 ulong v
+  end
+end
+
+fn ld_u32_cur off ulong to uint
+  b0 = uint get g_cur off
+  b1 = uint get g_cur add off 1
+  b2 = uint get g_cur add off 2
+  b3 = uint get g_cur add off 3
+  r0 = or b0 shl b1 8
+  r1 = or shl b2 16 shl b3 24
+  ret or r0 r1
+end
+
+fn st_u32_cur off ulong v uint to void
+  put g_cur off uchar and v 255
+  put g_cur add off 1 uchar and shr v 8 255
+  put g_cur add off 2 uchar and shr v 16 255
+  put g_cur add off 3 uchar and shr v 24 255
+end
+
+fn wm_parent r uint to int
+  if eq r 0
+    ret -1
+  end
+  if eq r 1
+    ret 0
+  end
+  if eq r 2
+    ret 0
+  end
+  ret 1
+end
+
+fn wm_mem r uint to uint
+  if eq r 0
+    ret 4
+  end
+  if eq r 1
+    ret 4
+  end
+  ret 2
+end
+
+fn wm_deadline r uint to uint
+  if eq r 0
+    ret 1
+  end
+  if eq r 1
+    ret 2
+  end
+  if eq r 2
+    ret 0
+  end
+  ret 1
+end
+
+fn wm_is_desc d uint r uint to int
+  a = wm_parent d
+  while ge a 0
+    if eq uint a r
+      ret 1
+    end
+    a = wm_parent uint a
+  end
+  ret 0
+end
+
+fn cur_zero to void
+  for i ulong 64
+    put g_cur i uchar 0
+  end
+end
+
+fn copy_node_to_cur idx ulong to void
+  base = shl idx 6
+  for i ulong 64
+    put g_cur i get g_states add base i
+  end
+end
+
+fn copy_cur_to_node idx ulong to void
+  base = shl idx 6
+  for i ulong 64
+    put g_states add base i get g_cur i
+  end
+end
+
+fn cur_fits r uint to int
+  us = uint get g_cur 30
+  if ge us 2
+    ret 0
+  end
+  um = ld_u32_cur 32
+  if gt um 8
+    ret 0
+  end
+  need = wm_mem r
+  if gt need sub 8 um
+    ret 0
+  end
+  ret 1
+end
+
+fn cur_admit r uint to void
+  ru = ulong r
+  put g_cur ru uchar 2
+  put g_cur 30 uchar add uint get g_cur 30 1
+  um = ld_u32_cur 32
+  st_u32_cur 32 add um wm_mem r
+  put g_cur 31 uchar add uint get g_cur 31 1
+  put g_cur add 8 ru uchar 0
+  put g_cur add 24 ru uchar 0
+  put g_cur add 20 ru uchar 0
+  dl = wm_deadline r
+  tk = uint get g_cur 29
+  if ne dl 0
+    if gt tk dl
+      put g_cur add 20 ru uchar 1
+    end
+  end
+end
+
+fn cur_try_admit to void
+  cont = int 1
+  while ne cont 0
+    best = sub int 0 1
+    best_seq = uint 0
+    r = uint 0
+    while lt r 4
+      st = uint get g_cur ulong r
+      if eq st 1
+        f = cur_fits r
+        if ne f 0
+          ws = ld_u32_cur add 36 shl ulong r 2
+          if lt best 0
+            best = int r
+            best_seq = ws
+          else
+            if lt ws best_seq
+              best = int r
+              best_seq = ws
+            end
+          end
+        end
+      end
+      r = add r 1
+    end
+    if lt best 0
+      cont = int 0
+    else
+      cur_admit uint best
+    end
+  end
+end
+
+fn cur_demand r uint external int to void
+  ru = ulong r
+  if ne external 0
+    put g_cur add 16 ru uchar 0
+  end
+  put g_cur add 12 ru uchar 0
+  st = uint get g_cur ru
+  if eq st 0
+    put g_cur ru uchar 1
+    sq = add ld_u32_cur 52 1
+    st_u32_cur 52 sq
+    st_u32_cur add 36 shl ru 2 sq
+    cur_try_admit
+  else
+    if ne st 1
+      put g_cur add 4 ru uchar 1
+    end
+  end
+end
+
+fn cur_others_busy self_r uint to int
+  i = uint 0
+  while lt i 4
+    if ne i self_r
+      st = uint get g_cur ulong i
+      if eq st 1
+        ret 1
+      end
+      if eq st 2
+        ret 1
+      end
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn cur_release_parked to void
+  i = uint 0
+  while lt i 4
+    iu = ulong i
+    if ne uint get g_cur add 12 iu 0
+      yd = uint get g_cur add 16 iu
+      skip = int 0
+      if ne yd 0
+        if ne cur_others_busy i 0
+          skip = int 1
+        end
+      end
+      if eq skip 0
+        put g_cur add 12 iu uchar 0
+        put g_cur add 16 iu uchar 0
+        ext = int 0
+        if eq i 0
+          ext = int 1
+        end
+        cur_demand i ext
+      end
+    end
+    i = add i 1
+  end
+end
+
+fn wm_backoff y uint to uint
+  n = uint 1
+  if ne y 0
+    n = shl y 1
+  end
+  if gt n 8
+    n = uint 8
+  end
+  ret n
+end
+
+fn cur_uncharge r uint to void
+  us = uint get g_cur 30
+  if ne us 0
+    put g_cur 30 uchar sub us 1
+  end
+  um = ld_u32_cur 32
+  need = wm_mem r
+  if ge um need
+    st_u32_cur 32 sub um need
+  else
+    st_u32_cur 32 0
+  end
+end
+
+fn cur_end_act r uint failed int to void
+  i = uint 0
+  while lt i 4
+    iu = ulong i
+    if ne uint get g_cur add 12 iu 0
+      yd = uint get g_cur add 16 iu
+      if ne yd 0
+        put g_cur add 16 iu uchar sub yd 1
+      end
+    end
+    i = add i 1
+  end
+  cur_release_parked
+  do_u = int 1
+  if ne failed 0
+    if ne get g_prof 2 0
+      do_u = int 0
+    end
+  end
+  if ne do_u 0
+    cur_uncharge r
+  end
+  ru = ulong r
+  put g_cur ru uchar 0
+  inf = uint get g_cur 31
+  if ne inf 0
+    put g_cur 31 uchar sub inf 1
+  end
+  ra = uint get g_cur add 4 ru
+  yd2 = uint get g_cur add 16 ru
+  if ne ra 0
+    ob = int 0
+    if ne yd2 0
+      ob = cur_others_busy r
+    end
+    if ne ob 0
+      put g_cur add 16 ru uchar sub yd2 1
+      put g_cur add 12 ru uchar 1
+      put g_cur add 4 ru uchar 0
+      cur_try_admit
+    else
+      put g_cur add 4 ru uchar 0
+      ext = int 0
+      if eq r 0
+        ext = int 1
+      end
+      cur_demand r ext
+    end
+  else
+    cur_try_admit
+  end
+  if eq uint get g_cur 31 0
+    cur_release_parked
+  end
+end
+
+fn cur_write_wake writer int to void
+  nk = ulong 0
+  c = uint 0
+  while lt c 4
+    if eq wm_parent c writer
+      put g_kids nk uchar c
+      nk = add nk 1
+    end
+    c = add c 1
+  end
+  i = ulong 0
+  while lt i nk
+    k = ulong get g_kids i
+    if eq uint get g_cur k 2
+      put g_cur add 8 k uchar 1
+    end
+    i = add i 1
+  end
+  ext = int 0
+  if lt writer 0
+    ext = int 1
+  end
+  i = ulong 0
+  while lt i nk
+    k2 = uint get g_kids i
+    cur_demand k2 ext
+    i = add i 1
+  end
+end
+
+fn cur_cancel r uint to void
+  cm = get g_prof 0
+  if eq cm 0
+    ret
+  end
+  x = uint 0
+  while lt x 4
+    hit = int 0
+    if eq x r
+      hit = int 1
+    else
+      if eq cm 1
+        if ne wm_is_desc x r 0
+          hit = int 1
+        end
+      end
+    end
+    if ne hit 0
+      xu = ulong x
+      if eq uint get g_cur xu 2
+        cur_uncharge x
+        inf = uint get g_cur 31
+        if ne inf 0
+          put g_cur 31 uchar sub inf 1
+        end
+      end
+      put g_cur xu uchar 0
+      put g_cur add 4 xu uchar 0
+      put g_cur add 12 xu uchar 0
+      put g_cur add 16 xu uchar 0
+      put g_cur add 8 xu uchar 0
+    end
+    x = add x 1
+  end
+  cur_try_admit
+  if eq uint get g_cur 31 0
+    cur_release_parked
+  end
+end
+
+fn node_enabled idx ulong kind uint r uint to int
+  base = shl idx 6
+  if eq kind 0
+    if lt uint get g_states add base 28 3
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind 1
+    if lt r 4
+      if eq uint get g_states add base ulong r 2
+        ret 1
+      end
+    end
+    ret 0
+  end
+  if eq kind 2
+    if lt r 4
+      if eq uint get g_states add base ulong r 2
+        ret 1
+      end
+    end
+    ret 0
+  end
+  if eq kind 3
+    if lt uint get g_states add base 29 3
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind 4
+    if eq r 0
+      ret 1
+    end
+    if eq r 1
+      ret 1
+    end
+    ret 0
+  end
+  ret 0
+end
+
+fn cur_check to uint
+  v = uint 0
+  n_run = uint 0
+  mem = uint 0
+  r = uint 0
+  while lt r 4
+    if eq uint get g_cur ulong r 2
+      n_run = add n_run 1
+      mem = add mem wm_mem r
+    end
+    r = add r 1
+  end
+  us = uint get g_cur 30
+  um = ld_u32_cur 32
+  leak = int 0
+  if ne us n_run
+    leak = int 1
+  end
+  if ne um mem
+    leak = int 1
+  end
+  if gt us 2
+    leak = int 1
+  end
+  if gt um 8
+    leak = int 1
+  end
+  if ne leak 0
+    v = or v 1
+  end
+  tk = uint get g_cur 29
+  r = uint 0
+  while lt r 4
+    ru = ulong r
+    if eq uint get g_cur ru 2
+      dl = wm_deadline r
+      if ne dl 0
+        if gt tk dl
+          if eq uint get g_cur add 20 ru 0
+            v = or v 8
+          end
+        end
+      end
+    end
+    r = add r 1
+  end
+  ret v
+end
+
+fn cur_step_fin r uint to uint
+  v = uint 0
+  ru = ulong r
+  dl = wm_deadline r
+  tk = uint get g_cur 29
+  if ne dl 0
+    if gt tk dl
+      put g_cur ru uchar 3
+      cur_end_act r 0
+      ret v
+    end
+  end
+  if ne uint get g_cur add 8 ru 0
+    yd = uint get g_cur add 16 ru
+    put g_cur add 16 ru uchar wm_backoff yd
+    put g_cur add 4 ru uchar 1
+    put g_cur ru uchar 3
+    cur_end_act r 0
+    ret v
+  end
+  if ne uint get g_cur add 24 ru 0
+    v = or v 4
+  end
+  put g_cur add 24 ru uchar 1
+  put g_cur add 16 ru uchar 0
+  put g_cur ru uchar 3
+  cur_write_wake int r
+  if ne get g_prof 3 0
+    if eq uint get g_cur add 4 ru 0
+      put g_cur ru uchar 2
+      ret v
+    end
+  end
+  cur_end_act r 0
+  ret v
+end
+
+fn cur_step_cancel r uint to uint
+  v = uint 0
+  cur_cancel r
+  ru = ulong r
+  if ne uint get g_cur ru 0
+    v = or v 16
+  end
+  if ne uint get g_cur add 4 ru 0
+    v = or v 16
+  end
+  if ne uint get g_cur add 12 ru 0
+    v = or v 16
+  end
+  x = uint 0
+  while lt x 4
+    if ne wm_is_desc x r 0
+      xu = ulong x
+      badc = int 0
+      if ne uint get g_cur xu 0
+        badc = int 1
+      end
+      if ne uint get g_cur add 4 xu 0
+        badc = int 1
+      end
+      if ne uint get g_cur add 12 xu 0
+        badc = int 1
+      end
+      if ne badc 0
+        v = or v 2
+      end
+    end
+    x = add x 1
+  end
+  ret v
+end
+
+fn cur_step_tick to void
+  tk = add uint get g_cur 29 1
+  put g_cur 29 uchar tk
+  if ne get g_prof 1 0
+    i = uint 0
+    while lt i 4
+      iu = ulong i
+      if eq uint get g_cur iu 2
+        dl = wm_deadline i
+        if ne dl 0
+          if gt tk dl
+            if eq uint get g_cur add 20 iu 0
+              put g_cur add 20 iu uchar 1
+            end
+          end
+        end
+      end
+      i = add i 1
+    end
+  end
+  cur_try_admit
+end
+
+fn cur_step kind uint r uint to uint
+  v = uint 0
+  if eq kind 0
+    put g_cur 28 uchar add uint get g_cur 28 1
+    cur_write_wake -1
+  else
+    if eq kind 3
+      cur_step_tick
+    else
+      if eq kind 2
+        put g_cur ulong r uchar 3
+        cur_end_act r 1
+      else
+        if eq kind 1
+          v = cur_step_fin r
+        else
+          if eq kind 4
+            v = cur_step_cancel r
+          end
+        end
+      end
+    end
+  end
+  cv = cur_check
+  ret or v cv
+end
+
+fn cur_make_key to void
+  n = ulong 0
+  r = uint 0
+  while lt r 4
+    ru = ulong r
+    rank = uint 0
+    st = uint get g_cur ru
+    if eq st 1
+      wr = ld_u32_cur add 36 shl ru 2
+      q = uint 0
+      while lt q 4
+        qu = ulong q
+        if eq uint get g_cur qu 1
+          wq = ld_u32_cur add 36 shl qu 2
+          if le wq wr
+            rank = add rank 1
+          end
+        end
+        q = add q 1
+      end
+    end
+    put g_keybuf n uchar st
+    put g_keybuf add n 1 get g_cur add 4 ru
+    put g_keybuf add n 2 get g_cur add 8 ru
+    put g_keybuf add n 3 get g_cur add 12 ru
+    put g_keybuf add n 4 get g_cur add 16 ru
+    put g_keybuf add n 5 get g_cur add 20 ru
+    put g_keybuf add n 6 get g_cur add 24 ru
+    put g_keybuf add n 7 uchar rank
+    n = add n 8
+    r = add r 1
+  end
+  put g_keybuf 32 get g_cur 28
+  put g_keybuf 33 get g_cur 29
+  put g_keybuf 34 get g_cur 30
+  um = ld_u32_cur 32
+  put g_keybuf 35 uchar and um 255
+  put g_keybuf 36 get g_cur 31
+end
+
+fn fnv_keybuf to ulong
+  h = ulong 1469598103934665603
+  for i ulong 37
+    b = ulong get g_keybuf i
+    h = xor h b
+    h = mul h 1099511628211
+  end
+  ret h
+end
+
+fn key_eq_node idx ulong to int
+  base = mul idx 40
+  for i ulong 37
+    if ne get g_keys add base i get g_keybuf i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn copy_keybuf_to_node idx ulong to void
+  base = mul idx 40
+  for i ulong 37
+    put g_keys add base i get g_keybuf i
+  end
+end
+
+fn init_ops to int
+  put g_ops_k 0 uchar 0
+  put g_ops_r 0 uchar 0
+  put g_ops_k 1 uchar 3
+  put g_ops_r 1 uchar 0
+  n = int 2
+  r = uint 0
+  while lt r 4
+    put g_ops_k ulong n uchar 1
+    put g_ops_r ulong n uchar r
+    n = add n 1
+    r = add r 1
+  end
+  r = uint 0
+  while lt r 4
+    put g_ops_k ulong n uchar 2
+    put g_ops_r ulong n uchar r
+    n = add n 1
+    r = add r 1
+  end
+  put g_ops_k ulong n uchar 4
+  put g_ops_r ulong n uchar 0
+  n = add n 1
+  put g_ops_k ulong n uchar 4
+  put g_ops_r ulong n uchar 1
+  n = add n 1
+  ret n
+end
+
+fn record_trace bit int head ulong opk uchar opr uchar to void
+  rn = int 0
+  idx = head
+  while ne idx 0
+    if lt rn 64
+      put g_rev_k ulong rn get g_op_kind idx
+      put g_rev_r ulong rn get g_op_r idx
+      rn = add rn 1
+      idx = ulong get g_parent idx
+    else
+      idx = ulong 0
+    end
+  end
+  tbase = mul ulong bit 64
+  i = int 0
+  while lt i rn
+    src = ulong sub sub rn 1 i
+    put g_tk add tbase ulong i get g_rev_k src
+    put g_tr add tbase ulong i get g_rev_r src
+    i = add i 1
+  end
+  if lt rn 64
+    put g_tk add tbase ulong rn opk
+    put g_tr add tbase ulong rn opr
+    rn = add rn 1
+  end
+  put g_tlen ulong bit rn
+end
+
+fn record_viols v uint head ulong opk uchar opr uchar to void
+  vs = get g_res_u32 0
+  put g_res_u32 0 or vs v
+  b = int 0
+  while lt b 5
+    mask = shl uint 1 uint b
+    if ne and v mask 0
+      tl = get g_tlen ulong b
+      if lt tl 0
+        record_trace b head opk opr
+      end
+    end
+    b = add b 1
+  end
+end
+
+fn table_clear to void
+  for i ulong MC_TSZ
+    put g_table i uint 0xffffffff
+  end
+end
+
+fn table_probe to ulong
+  h = fnv_keybuf
+  slot = and h MC_TMASK
+  cont = int 1
+  while ne cont 0
+    ent = get g_table slot
+    if eq ent 0xffffffff
+      ret slot
+    end
+    if ne key_eq_node ulong ent 0
+      ret 0xffffffff
+    end
+    slot = and add slot 1 MC_TMASK
+  end
+  ret 0xffffffff
+end
+
+fn wx_explore to void
+  put g_res_u64 0 0
+  put g_res_u64 1 0
+  put g_res_u32 0 0
+  put g_res_u32 1 0
+  for i ulong 5
+    put g_tlen i -1
+  end
+  table_clear
+  cur_zero
+  copy_cur_to_node 0
+  cur_make_key
+  copy_keybuf_to_node 0
+  h0 = fnv_keybuf
+  put g_table and h0 MC_TMASK uint 0
+  n = ulong 1
+  nops = init_ops
+  head = ulong 0
+  while lt head n
+    o = int 0
+    while lt o nops
+      opk = get g_ops_k ulong o
+      opr = get g_ops_r ulong o
+      if ne node_enabled head uint opk uint opr 0
+        copy_node_to_cur head
+        v = cur_step uint opk uint opr
+        put g_res_u64 1 add get g_res_u64 1 1
+        cur_make_key
+        slot = table_probe
+        do_rec = int 1
+        if ne slot 0xffffffff
+          if ge n MC_CAP
+            put g_res_u32 1 1
+            do_rec = int 0
+          else
+            ni = n
+            n = add n 1
+            copy_cur_to_node ni
+            put g_parent ni uint head
+            put g_op_kind ni opk
+            put g_op_r ni opr
+            copy_keybuf_to_node ni
+            put g_table slot uint ni
+          end
+        end
+        if ne v 0
+          if ne do_rec 0
+            record_viols v head opk opr
+          end
+        end
+      end
+      o = add o 1
+    end
+    head = add head 1
+  end
+  put g_res_u64 0 n
+end
+
+fn print_rname r uint to void
+  if eq r 0
+    out_t t_p 1
+    ret
+  end
+  if eq r 1
+    out_t t_c1 2
+    ret
+  end
+  if eq r 2
+    out_t t_c2 2
+    ret
+  end
+  out_t t_g 1
+end
+
+fn print_op opk uint opr uint to void
+  if eq opk 0
+    out_t t_ext 3
+    ret
+  end
+  if eq opk 3
+    out_t t_tick 4
+    ret
+  end
+  if eq opk 1
+    out_t t_fin 4
+  else
+    if eq opk 2
+      out_t t_fail 5
+    else
+      out_t t_can 7
+    end
+  end
+  print_rname opr
+  out_c uchar 41
+end
+
+fn print_bit_name b int to void
+  if eq b 0
+    out_t t_b0 17
+    ret
+  end
+  if eq b 1
+    out_t t_b1 26
+    ret
+  end
+  if eq b 2
+    out_t t_b2 19
+    ret
+  end
+  if eq b 3
+    out_t t_b3 28
+    ret
+  end
+  out_t t_b4 25
+end
+
+fn show_ce tag_kind int b int to void
+  tl = get g_tlen ulong b
+  out_t t_sp2 2
+  if eq tag_kind 0
+    out_t t_unexp 10
+  else
+    if eq tag_kind 1
+      out_t t_kby 9
+    else
+      out_t t_find 7
+    end
+  end
+  out_c uchar 32
+  print_bit_name b
+  out_t t_ce1 17
+  out_int tl
+  out_t t_ce2 9
+  tbase = mul ulong b 64
+  i = int 0
+  while lt i tl
+    if ne i 0
+      out_t t_arr 4
+    end
+    k = uint get g_tk add tbase ulong i
+    r = uint get g_tr add tbase ulong i
+    print_op k r
+    i = add i 1
+  end
+  out_c uchar 10
+end
+
+fn print_pname pid int to void
+  if eq pid 0
+    out_t t_p_spec 4
+    ret
+  end
+  if eq pid 1
+    out_t t_p_ab 8
+    ret
+  end
+  if eq pid 2
+    out_t t_p_leak 16
+    ret
+  end
+  if eq pid 3
+    out_t t_p_noprop 23
+    ret
+  end
+  if eq pid 4
+    out_t t_p_dbl 27
+    ret
+  end
+  out_t t_p_dl 23
+end
+
+fn print_role rkind int to void
+  if eq rkind 0
+    out_t t_r_spec 4
+    ret
+  end
+  if eq rkind 1
+    out_t t_r_ab 8
+    ret
+  end
+  out_t t_r_mut 6
+end
+
+fn report_bit pid int rkind int b int must_hold uint must_fail uint to void
+  bit = shl uint 1 uint b
+  vs = get g_res_u32 0
+  seen = int 0
+  if ne and vs bit 0
+    seen = int 1
+  end
+  if ne and must_hold bit 0
+    if ne seen 0
+      put g_bad 0 add get g_bad 0 1
+      show_ce 0 b
+    end
+    out_t t_res 13
+    print_pname pid
+    out_c uchar 46
+    print_bit_name b
+    if ne seen 0
+      out_t t_eq_fail 6
+    else
+      out_t t_eq_pass 6
+    end
+    ret
+  end
+  if ne and must_fail bit 0
+    if eq seen 0
+      put g_bad 0 add get g_bad 0 1
+    else
+      if eq rkind 2
+        show_ce 1 b
+      else
+        show_ce 2 b
+      end
+    end
+    out_t t_res 13
+    print_pname pid
+    out_c uchar 46
+    print_bit_name b
+    if ne seen 0
+      if eq rkind 2
+        out_t t_eq_killed 8
+      else
+        out_t t_eq_kf 12
+      end
+    else
+      if eq rkind 2
+        out_t t_eq_surv 10
+      else
+        out_t t_eq_upass 17
+      end
+    end
+    ret
+  end
+  out_t t_res 13
+  print_pname pid
+  out_c uchar 46
+  print_bit_name b
+  if ne seen 0
+    out_t t_eq_viol 10
+  else
+    out_t t_eq_held 6
+  end
+end
+
+fn set_prof cm int dl int ml int mk int to void
+  put g_prof 0 cm
+  put g_prof 1 dl
+  put g_prof 2 ml
+  put g_prof 3 mk
+end
+
+fn run_prof pid int rkind int mh uint mf uint to void
+  wx_explore
+  st = get g_res_u64 0
+  tr = get g_res_u64 1
+  trunc = get g_res_u32 1
+  out_t t_star 4
+  print_pname pid
+  out_t t_lp 2
+  print_role rkind
+  out_t t_rp_c 3
+  out_u64 st
+  out_t t_st 9
+  out_u64 tr
+  out_t t_tr 12
+  if ne trunc 0
+    out_t t_trunc 27
+  end
+  out_c uchar 10
+  out_t t_res 13
+  print_pname pid
+  out_t t_dot_st 8
+  out_u64 st
+  out_c uchar 10
+  out_t t_res 13
+  print_pname pid
+  out_t t_dot_tr 13
+  out_u64 tr
+  out_c uchar 10
+  out_t t_res 13
+  print_pname pid
+  out_t t_dot_ex 12
+  if ne trunc 0
+    out_t t_no 3
+    put g_bad 0 add get g_bad 0 1
+  else
+    out_t t_yes 4
+  end
+  b = int 0
+  while lt b 5
+    report_bit pid rkind b mh mf
+    b = add b 1
+  end
+end
+
+fn main to int
+  put g_olen 0 0
+  put g_bad 0 0
+  set_prof 1 1 0 0
+  run_prof 0 0 31 0
+  set_prof 0 0 0 0
+  run_prof 1 1 5 26
+  set_prof 1 1 1 0
+  run_prof 2 2 0 1
+  set_prof 2 1 0 0
+  run_prof 3 2 16 2
+  set_prof 1 1 0 1
+  run_prof 4 2 0 4
+  set_prof 1 0 0 0
+  run_prof 5 2 0 8
+  bad = get g_bad 0
+  out_t t_verd 21
+  if ne bad 0
+    out_t t_fail_nl 5
+    out_t t_mc_f 19
+  else
+    out_t t_pass_nl 5
+    out_t t_mc_p 19
+  end
+  out_int bad
+  out_t t_mc_e 13
+  out_flush
+  if ne bad 0
+    ret 1
+  end
+  ret 0
+end

@@ -33,8 +33,8 @@ endef
 $(PROOF_OUT):
 	mkdir -p $@
 
-$(PROOF_MODEL_BIN): tests/model/model_check.c $(PROOF_MODEL_SRCS) $(PROOF_MODEL_HDRS) | $(PROOF_OUT)
-	$(CC) $(PROOF_CFLAGS) -O2 -o $@ tests/model/model_check.c $(PROOF_MODEL_SRCS)
+$(PROOF_MODEL_BIN): tests/model/model_check.om seed/out/omc | $(PROOF_OUT)
+	./seed/out/omc < tests/model/model_check.om > $@ && chmod +x $@
 
 $(PROOF_DIFF_BIN): tests/model/world_diff.c $(PROOF_MODEL_SRCS) $(PROOF_MODEL_HDRS) \
 		$(PROOF_RX_SRCS) $(PROOF_RX_HDRS) | $(PROOF_OUT)
