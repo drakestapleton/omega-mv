@@ -1,5 +1,63 @@
 # Omega
 
+**Serve your model. Straight to the metal.**
+
+Omega is a programming language, and a compiler for it that is written in Omega itself. It compiles a model
+server into one small static file that drives the GPU directly. This is why you would want it:
+
+| What you get | What was measured | Record |
+| --- | --- | --- |
+| **No out-of-memory growth** | The server takes its memory once, at startup. The Inkling-2-Mini server holds a fixed table of 8 stream slots and no heap. In its live self-test on one NVIDIA GB10 the 9th concurrent request was answered with HTTP `503 server_busy`, and a retired slot was reused. | [om/gpu/inkling2/README.md](om/gpu/inkling2/README.md) |
+| **A 35B model up in about a minute** | The 34.7 GB Qwen 3.6 35B-A3B model loaded cold in 43 to 72 seconds, in three recorded windows on one GB10. | [evidence/OLLM-HELIX-CLOSED-LOOP-20261121](evidence/OLLM-HELIX-CLOSED-LOOP-20261121/README.md) |
+| **Speed on real weights** | The same 35B model decoded at 67.71 tokens per second with real weights (a 24-token run; five kernel variants produced the same 24 tokens). | [evidence/HELIX-BRAID4-RSI-JIT-20261121](evidence/HELIX-BRAID4-RSI-JIT-20261121/README.md) |
+| **One small file** | The 35B runner is one 281 KB statically linked AArch64 ELF. `ldd` reports `not a dynamic executable`. | [om/gpu/q36/README.md](om/gpu/q36/README.md) |
+
+## What you do not need
+
+No CUDA. No HIP or ROCr. No Vulkan. No OpenCL. No PyTorch. No Python. No libc.
+
+The GPU programs load no shared library, so none of those is in the process. On NVIDIA GB10 the program
+opens `/dev/nvidiactl`, `/dev/nvidia0` and `/dev/nvidia-uvm` itself. What stays in place below it is NVIDIA's
+open kernel modules and signed GSP firmware ([om/gpu/q36/README.md](om/gpu/q36/README.md)). On one AMD
+Instinct MI300X an Omega launcher ran a 27B model with no HIP, no ROCr and no PyTorch in its process; a Python
+script prepared the dispatch plan beforehand on the CPU
+([the run record](https://interplane.io/drakestapleton/CUDApp/blob/main/evidence/amd-qwen38-native-refusal-20261113/README.md)).
+
+## Why it is different: four strands
+
+Omega does not ask you to trust one compiler binary. It grows four compilers, each from its own hand-written
+seed of about 400 bytes of machine code. The four strands must arrive at the same compiler, bit for bit.
+
+| Strand | Seed | What it is for |
+| --- | --- | --- |
+| The Monk | 408 B, `seed/rung0/seed0.hex` | The skeleton: the reference compiler and the proof verifier. It refuses on one wrong bit. |
+| The Predator | 396 B, `seedB0.b0` | The muscle: an optimizing compiler that hunts for faster GPU kernels. |
+| The Trickster | 404 B, `seedC0.c0` | The immune system: it attacks the proof gate, and each attack that worked once became a permanent check (15 so far). |
+| The Ascetic | 404 B, `seedD0.d0` | The discipline: the smallest footprint and the coolest schedule. |
+
+The four converge on `seed/out/omc` (952,784 bytes, SHA-256
+`708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3`). One faulty strand is quarantined and
+regrown from its seed. Two strands that disagree stop the build. The commands and the records are in
+[seed/helix/README.md](seed/helix/README.md).
+
+## What these numbers are, and are not
+
+They were measured on one NVIDIA GB10 (a DGX Spark), each in the run its record names. The compiler in this
+repository makes programs for 64-bit Arm Linux. The website has the prebuilt compiler and a curl install:
+[interplane.io/omega](https://interplane.io/omega/).
+
+## What Omega is
+
+Omega is the language of Sovereign Intelligence (SI), my name for the whole stack: the language, the runtime,
+the GPU layer and the models that run on them.
+
+The aim is one path a person can inspect from start to finish. A hand-written seed of a few hundred bytes grows,
+one small step at a time, into the compiler. That compiler is meant to build everything else, with no step
+left as a black box.
+
+This project is unfinished: part of it is still older C code. This page says what works, what is old and what
+has not been run yet.
+
 ## UXL one command
 
 ```sh
@@ -9,19 +67,6 @@ git clone https://interplane.io/drakestapleton/omega-mv.git && cd omega-mv && ./
 On Windows, the same clone, then `.\uxl-run.ps1`. If WSL2 is installed, that script runs `./uxl-run.sh` inside it. If not, it runs the same checks here.
 
 `./uxl-run.sh` detects the OS, the CPU, and which backends are present, prints that at the top of the log, and adapts. x86 Linux uses qemu-aarch64 when binfmt is registered. arm64 Linux runs `omc` natively. macOS runs the checks that do not need `omc` and marks the rest NOT_RUN. Native Windows without WSL does the same, and the hint is `wsl --install -d Ubuntu`. When a toolchain package is missing, the log prints one install command for that distro and does not run sudo. `./uxl-run.sh --install-deps` is the switch that runs it. SPIR-V validation, execution (`cl` and `vk`), and conformance checking all run directly in pure seeded Omega (`gpu/spirv/emit.om`, `val.om`, `run.om`, `conform.om`) with no `spirv-tools`, OpenCL ICD, Level Zero, Vulkan, or lavapipe dependency. The process exits 0 when nothing FAILed. NOT_RUN is not a failure. What the run checks is in [docs/UXL.md](docs/UXL.md).
-
-
-
-Omega is a programming language, and a compiler for it that is written in Omega itself. It is the language of
-Sovereign Intelligence (SI), my name for the whole stack: the language, the runtime, the GPU layer and the
-models that run on them.
-
-The aim is one path a person can inspect from start to finish. A hand-written seed of a few hundred bytes grows,
-one small step at a time, into the compiler. That compiler is meant to build everything else, with no step
-left as a black box.
-
-This project is unfinished: part of it is still older C code. This page says what works, what is old and what
-has not been run yet.
 
 ## Where it stands
 
