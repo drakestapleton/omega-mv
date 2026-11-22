@@ -1,8 +1,9 @@
 note SPDX-License-Identifier: Apache-2.0
 note seed/helix/egraph_opt.om: Phase 2 Verified Equality-Saturation E-Graph Optimizer (pure OM-2).
-note Models HelixKernelIR.lean (opcodes 1..12, rules 1..12) with union-find e-classes,
-note equality saturation, GB10 SM121 cost-model extraction, and explicit equivalence proof
-note certificate emission (verified independently by Strand A's seed/helix/dual_checker.om).
+note Models HelixKernelIR.lean (opcodes 1..10, rules 1..12) with union-find e-classes,
+note equality saturation, GB10 SM121 cost-model extraction, and FULL structural EGP2 proof
+note certificate emission (node table + roots + step-by-step witness trace), verified
+note independently from scratch by Strand A's seed/helix/dual_checker.om.
 note
 note Node opcodes (mirroring HelixKernelIR.lean):
 note   1=KCONST 2=KREG 3=KADD 4=KSUB 5=KMUL 6=KFMA 7=KSHL 8=KSHR 9=KBAND 10=KBOR
@@ -16,6 +17,18 @@ note   6=rw_mul_zero (mul(x,0)->0)
 note   11=rw_and_self (band(x,x)->x)
 note   12=rw_fma_zero_add (fma(a,b,0)->mul(a,b))
 note
+note EGP2 binary format:
+note   [0..3]  magic "EGP2" (69, 71, 80, 50)
+note   [4..7]  u32 LE kernel_count (3)
+note   Per kernel:
+note     [+0..+3]   u32 kind
+note     [+4..+7]   u32 node_count (N)
+note     [+8..+11]  u32 root_before
+note     [+12..+15] u32 root_after
+note     [+16..+19] u32 trace_count (T)
+note     N * 20 bytes: (op, a, b, c, val) u32 LE per node
+note     T * 12 bytes: (rule_id, lhs_node, rhs_node) u32 LE per proof step
+note
 note Usage: egraph_opt CERT_OUT
 
 global egPar ulong 512
@@ -27,21 +40,20 @@ global egVal ulong 512
 global egCnt ulong 1
 global egCost ulong 512
 global egBest ulong 512
-note Proof trace records: 4 ulongs per step (rule_id, lhs_node, rhs_node, eclass)
 global egTr ulong 2048
 global egTrN ulong 1
-global egBuf uchar 4096
+global egBuf uchar 16384
 global egPath uchar 1024
 
 text egUse "usage: egraph_opt CERT_OUT\n"
-text egHdr "=== PHASE 2: VERIFIED EQUALITY-SATURATION E-GRAPH OPTIMIZER (GB10 COST MODEL) ===\n"
+text egHdr "=== PHASE 2: VERIFIED EQUALITY-SATURATION E-GRAPH OPTIMIZER (GB10 COST MODEL, EGP2) ===\n"
 text egK0 "  kernel=q36_bf16_gemv_mac  cost_before="
 text egK1 "  kernel=q36_w4_unpack_mac  cost_before="
 text egK2 "  kernel=q36_swiglu_gate    cost_before="
 text egMid " cost_after="
 text egStp " proof_steps="
 text egNl "\n"
-text egDone "EGRAPH PASS kernels=3 all_cost_reduced=1 proof_cert_written=1\n"
+text egDone "EGRAPH PASS kernels=3 all_cost_reduced=1 egp2_structural_cert=1\n"
 
 fn egWrt s view uchar * to void
 r = write 1 s 0 len s
@@ -159,21 +171,18 @@ op = get egOp i
 if eq op 3
 a = get egA i
 b = get egB i
-note Rule 3: add(x, 0) -> x
 if egIsConst b 0
 if ne egFind i egFind a
 egUnion i a 3
 changed = true
 end
 end
-note Rule 4: add(0, x) -> x
 if egIsConst a 0
 if ne egFind i egFind b
 egUnion i b 4
 changed = true
 end
 end
-note Rule 1: add(mul(x,y), z) -> fma(x,y,z)
 ca = egFind a
 for j ulong n bound 512
 if and eq egFind j ca eq get egOp j 5
@@ -183,7 +192,6 @@ changed = true
 break
 end
 end
-note Rule 2: add(z, mul(x,y)) -> fma(x,y,z)
 cb = egFind b
 for j ulong n bound 512
 if and eq egFind j cb eq get egOp j 5
@@ -197,14 +205,12 @@ end
 if eq op 5
 a = get egA i
 b = get egB i
-note Rule 5: mul(x, 1) -> x
 if egIsConst b 1
 if ne egFind i egFind a
 egUnion i a 5
 changed = true
 end
 end
-note Rule 6: mul(x, 0) -> 0
 if egIsConst b 0
 if ne egFind i egFind b
 egUnion i b 6
@@ -213,7 +219,6 @@ end
 end
 end
 if eq op 9
-note Rule 11: band(x, x) -> x
 if eq egFind get egA i egFind get egB i
 if ne egFind i egFind get egA i
 egUnion i get egA i 11
@@ -273,22 +278,29 @@ az = egAddNode 3 c0 r2 0 0
 ret egAddNode 3 m2 az 0 0
 end
 
-fn egSerKernel kind ulong cbef ulong caft ulong outOff ulong to ulong
+fn egSerKernel kind ulong rootB ulong rootA ulong outOff ulong to ulong
+nc = get egCnt 0
 nt = get egTrN 0
 p = outOff
 egPutU32 p kind
-egPutU32 add p 4 cbef
-egPutU32 add p 8 caft
-egPutU32 add p 12 nt
-p = add p 16
-for i ulong nt bound 64
+egPutU32 add p 4 nc
+egPutU32 add p 8 rootB
+egPutU32 add p 12 rootA
+egPutU32 add p 16 nt
+p = add p 20
+for i ulong nc bound 512
+egPutU32 p get egOp i
+egPutU32 add p 4 get egA i
+egPutU32 add p 8 get egB i
+egPutU32 add p 12 get egC i
+egPutU32 add p 16 get egVal i
+p = add p 20
+end
+for i ulong nt bound 512
 b = mul i 4
-ru = get egTr b
-lu = get egTr add b 1
-rv = get egTr add b 2
-egPutU32 p ru
-egPutU32 add p 4 get egOp lu
-egPutU32 add p 8 get egOp rv
+egPutU32 p get egTr b
+egPutU32 add p 4 get egTr add b 1
+egPutU32 add p 8 get egTr add b 2
 p = add p 12
 end
 ret p
@@ -306,6 +318,7 @@ end
 end
 egComputeCosts
 caft = get egCost egFind root
+bestR = get egBest egFind root
 nt = get egTrN 0
 if eq kind 0
 egWrt egK0
@@ -322,7 +335,7 @@ egNum caft
 egWrt egStp
 egNum nt
 egWrt egNl
-ret egSerKernel kind cbef caft outOff
+ret egSerKernel kind root bestR outOff
 end
 
 fn main to int
@@ -331,11 +344,11 @@ egWrt egUse
 ret 90
 end
 egWrt egHdr
-note Certificate magic EGP1 + count=3
+note Certificate magic EGP2 + count=3
 put egBuf 0 69
 put egBuf 1 71
 put egBuf 2 80
-put egBuf 3 49
+put egBuf 3 50
 egPutU32 4 3
 pos = ulong 8
 pos = egRunKernel 0 pos

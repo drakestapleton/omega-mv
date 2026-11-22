@@ -18,11 +18,12 @@
        RAW-violating swap actually changes final state on a concrete input.
 
   Model-to-system link:
-    The dependency predicate `conflicts a b` mirrors `mk_conflicts` in
+    The dependency predicate `conflicts a b` mirrors `mkHasDep` + `mkIsAnchor` in
     `seed/helix/monk_check.om` (RAW: a.w ∈ b.r, WAR: b.w ∈ a.r, WAW: a.w == b.w,
-    or either instruction is a barrier/control/memory-ordering anchor).
-    This file proves soundness of the model; hardware scoreboard timing hazards
-    are additionally checked by `gpu/nvidia/om/codegen/bw_hazard.om` (`hz_chk`).
+    or either instruction is a barrier/control/reconvergence/predicate-writer/memory anchor).
+    This file proves soundness of the model; CFG fixed-point SM121 scoreboard timing hazards
+    and fixed-latency ALU RAW stall bounds are additionally enforced by `mkCheckHazards` and
+    `mkCheckRawStalls` in `seed/helix/monk_check.om` (using `bw_hazard.om` `hz_dec1`).
 -/
 
 namespace HelixSoundness

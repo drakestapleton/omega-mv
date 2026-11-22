@@ -46,13 +46,13 @@ printf 'HELIX-DDC-V2\nseedA=%s\nseedB=%s\nomc_stage2=%s\nng_B=%s\nA_fast=%s\n' \
 "$B/sign_ddc_A" selftest "$B/ddc-canonical.txt" "$B/ddc.pk" "$B/ddc.sig"
 "$B/sign_ddc_A" verify "$B/ddc-canonical.txt" "$B/ddc.pk" "$B/ddc.sig"
 
-printf '\n=== [2/7] PHASE 2: E-GRAPH OPTIMIZER + STRAND A DUAL-CHECKER + 11-ANTIBODY IMMUNE ===\n'
+printf '\n=== [2/7] PHASE 2: EGP2 STRUCTURAL E-GRAPH + STRAND A DUAL-CHECKER + 12-ANTIBODY IMMUNE ===\n'
 { printf 'om2\n'; cat seed/helix/egraph_opt.om; } | "$B/omc_B_fast" > "$B/egraph_opt"
 chmod +x "$B/egraph_opt"
 { printf 'om2\n'; cat seed/helix/dual_checker.om; } | "$B/omc_A" > "$B/dual_checker"
 chmod +x "$B/dual_checker"
-"$B/egraph_opt" "$B/egraph.egp1"
-"$B/dual_checker" "$B/egraph.egp1"
+"$B/egraph_opt" "$B/egraph.egp2"
+"$B/dual_checker" "$B/egraph.egp2"
 
 printf '\n=== [3/7] PHASE 2: THREE PRODUCTION q36 SM121 KERNELS THROUGH PREDATOR -> MONK -> IMMUNE ===\n'
 { printf 'om2\n'; cat om/encoder/bw_enc_sm121.om om/gpu/q36/emit_fast.om seed/helix/extract_q36_kernels.om; } | "$B/omc_A" > "$B/extract_q36"
@@ -65,7 +65,7 @@ for pair in "a:bf16_gemv_fast" "b:fp8_b128_gemv_fast" "m:w4_b32_gemv_fast"; do
   "$B/monk_check" "$B/q36_kernels/${kname}.ref.bin" "$B/q36_kernels/${kname}.cand.bin" "$B/q36_kernels/${kname}.cert"
   "$B/immune" "$B/monk_check" "$B/q36_kernels/${kname}.ref.bin" "$B/q36_kernels/${kname}.cand.bin" "$B/q36_kernels/${kname}.cert" "$B/q36_kernels/im_${kname}"
 done
-printf 'PASS all 3 production q36 SM121 kernels verified by Predator -> Monk -> 7+4=11 Antibodies!\n'
+printf 'PASS all 3 production q36 SM121 kernels verified by Predator -> Monk (CFG+RAW-safe) -> 8+4=12 Antibodies!\n'
 
 printf '\n=== [4/7] PHASE 3: ARBORIS NERVOUS SYSTEM BENCHMARKS (TRACKS 3A / 3B / 3C) ===\n'
 { printf 'om2\n'; cat seed/helix/arboris_nervous_bench.om; } | "$B/omc_B_fast" > "$B/arboris_bench"
@@ -135,4 +135,4 @@ else
   printf 'INFO pass --lean (with Lean 4 on PATH) to re-check all 3 Lean 4 proof files\n'
 fi
 
-printf '\nCOLD_REGROWTH PASS dual_seeds=804B zero_c=1 zero_python=1 zero_cuda=1 q36_kernels=3 antibodies=11/11 gens=3\n'
+printf '\nCOLD_REGROWTH PASS dual_seeds=804B zero_prebuilt=1 zero_c=1 zero_python=1 zero_cuda=1 q36_kernels=3 antibodies=12/12 gens=3\n'

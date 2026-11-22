@@ -16,9 +16,9 @@
     2. `antibody_non_bijection`: any permutation map that drops or duplicates an
        instruction index is rejected.
     3. `antibody_opcode_smuggle`: any candidate that alters a functional SM121
-       instruction word (outside the 23-bit scheduling control word) is rejected.
-    4. `antibody_anchor_escape`: any mutation that moves a barrier/control-flow
-       anchor (`BAR.SYNC`, `MEMBAR`, `BRA`, `EXIT`) is rejected.
+       instruction word (outside the 17-bit scheduling control word w3[9..25]) is rejected.
+    4. `antibody_anchor_escape`: any mutation that moves a barrier/control-flow/reconvergence/
+       predicate-writer anchor (`BAR.SYNC`, `MEMBAR`, `BSSY`, `BSYNC`, `BRA`, `EXIT`, `ISETP`, `FSETP`) is rejected.
     5. `antibody_dep_inversion`: any mutation that inverts a RAW, WAR, or WAW
        dependency edge `(u < v)` is rejected.
     6. `antibody_hazard_smuggle`: any candidate with nonzero Blackwell SM121
@@ -38,10 +38,10 @@ structure Cert where
   refHashOk  : Bool
   candHashOk : Bool
   perm       : List Nat          -- cand pc i -> ref pc perm[i]
-  funcEq     : Nat → Nat → Bool  -- functional 128-bit mask equality (excluding 23-bit ctrl)
-  isAnchor   : Nat → Bool        -- ref pc is branch / exit / BAR.SYNC / MEMBAR
+  funcEq     : Nat → Nat → Bool  -- functional 128-bit mask equality (excluding 17-bit w3[9..25] ctrl)
+  isAnchor   : Nat → Bool        -- ref pc is BRA/EXIT/BAR/MEMBAR/BSSY/BSYNC/ISETP/FSETP/mem/pred
   depends    : Nat → Nat → Bool  -- true if ref pc u < v share RAW/WAR/WAW or memory edge
-  hzCount    : Nat               -- output of bw_hazard.om hz_chk on candidate
+  hzCount    : Nat               -- CFG scoreboard & fixed-latency RAW hazard count in monk_check.om
 
 def allInRange (n : Nat) (l : List Nat) : Bool :=
   l.all (fun x => decide (x < n))

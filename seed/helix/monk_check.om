@@ -14,15 +14,15 @@ note   [8..39]  expected SHA-256 of REF_SASS (32 bytes)
 note   [40..71] expected SHA-256 of CAND_SASS (32 bytes)
 note   [72..72+4*N-1] perm[0..N-1] u32 LE (cand pc i -> ref pc perm[i])
 note
-note Mechanically enforces all 7 Lean 4 antibodies (seed/helix/proofs/HelixAntibodies.lean):
-note   exit 0: MONK PASS (all 7 antibodies satisfied, 0 SM121 hazards)
+note Mechanically enforces all SM121 Antibodies (seed/helix/proofs/HelixAntibodies.lean):
+note   exit 0: MONK PASS (all antibodies satisfied, 0 CFG scoreboard hazards, fixed-latency RAW preserved)
 note   exit 11: Antibody 7 -- length / format / OOB perm mismatch
 note   exit 12: Antibody 1 -- SHA-256 digest spoof (REF or CAND mismatch)
 note   exit 13: Antibody 2 -- non-bijection (duplicate or missing perm entry)
-note   exit 14: Antibody 3 -- functional SM121 opcode/operand smuggling (outside 17-bit ctrl word)
-note   exit 15: Antibody 4 -- anchor escape (branch/exit/barrier/memory-ordering anchor moved)
-note   exit 16: Antibody 5 -- RAW/WAR/WAW register or memory dependency inversion
-note   exit 17: Antibody 6 -- SM121 Blackwell scoreboard hazard violation (bw_hazard)
+note   exit 14: Antibody 3 -- functional SM121 opcode/operand smuggling (outside 17-bit ctrl word w3[9..25])
+note   exit 15: Antibody 4 -- anchor escape (BRA/EXIT/BAR/MEMBAR/BSSY/BSYNC/ISETP/FSETP/mem/pred moved)
+note   exit 16: Antibody 5 -- RAW/WAR/WAW register dependency inversion
+note   exit 17: Antibody 6 -- SM121 CFG scoreboard hazard OR fixed-latency RAW stall underflow
 note   exit 90: usage / file I/O error
 
 global mkRef uchar 32768
@@ -34,8 +34,14 @@ global mkInv ulong 2048
 global mkSeen ulong 2048
 global mkRefRec ulong 49152
 global mkCndRec ulong 49152
-global mkWbar ulong 512
-global mkRbar ulong 512
+global mkWbar uchar 512
+global mkRbar uchar 512
+note Full CFG fixed-point dataflow scoreboard state (2048 PCs x 512 regs x 6-bit barrier mask = 1 MB each)
+global mkHzInW uchar 1048576
+global mkHzInR uchar 1048576
+global mkHzSeen ulong 2048
+global mkHzQu ulong 2048
+global mkHzWk ulong 2048
 global mkRefSha uchar 32
 global mkCndSha uchar 32
 global mkOut uchar 256
@@ -233,23 +239,21 @@ ret true
 end
 
 note Anchor predicate: control flow (flow != 0), predicated guard (guard != 7),
-note memory/barrier ops (name_id >= 33 or op == BAR/MEMBAR/EXIT/BRA), or NOP padding.
+note barriers/sync/NOP/reconvergence (nm <= 8: unknown, NOP, BAR.SYNC, MEMBAR, SYNCS, EXIT, BRA, BSSY, BSYNC),
+note predicate writers (nm == 16 ISETP, nm == 25 FSETP), or memory ops (nm >= 33: LDG/STG/ATOMG/LDS/STS).
 fn mkIsAnchor pc ulong to bool
 db = mul pc 24
-fl = get mkRefRec add db 17
-if ne fl 0
+if ne get mkRefRec add db 17 0
 ret true
 end
-gd = get mkRefRec add db 1
-if ne gd 7
+if ne get mkRefRec add db 1 7
 ret true
 end
 nm = get mkRefRec add db 19
-if or ge nm 33 eq nm 0
+if or le nm 8 ge nm 33
 ret true
 end
-op = get mkRefRec db
-if or eq op 2381 eq op 2375
+if or eq nm 16 eq nm 25
 ret true
 end
 ret false
@@ -277,6 +281,21 @@ end
 ret true
 end
 
+fn mkHasRaw u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if eq get mkRefRec add du 10 0
+ret false
+end
+wu = get mkRefRec add du 16
+for j ulong get mkRefRec add dv 9 bound 5
+if mkRegOverlap wu get mkRefRec add add dv 11 j
+ret true
+end
+end
+ret false
+end
+
 fn mkHasDep u ulong v ulong to bool
 du = mul u 24
 dv = mul v 24
@@ -285,13 +304,8 @@ if mkRegOverlap get mkRefRec add du 16 get mkRefRec add dv 16
 ret true
 end
 end
-if ne get mkRefRec add du 10 0
-wu = get mkRefRec add du 16
-for j ulong get mkRefRec add dv 9 bound 5
-if mkRegOverlap wu get mkRefRec add add dv 11 j
+if mkHasRaw u v
 ret true
-end
-end
 end
 if ne get mkRefRec add dv 10 0
 wv = get mkRefRec add dv 16
@@ -332,40 +346,44 @@ reg = and opnd 255
 cnt = and shr opnd 8 255
 uni = and shr opnd 16 1
 base = add mul uni 256 reg
+b8 = uchar bit
 for k ulong cnt bound 4
 idx = add base k
 if lt idx 512
 if isR
-put mkRbar idx or get mkRbar idx bit
+put mkRbar idx or get mkRbar idx b8
 else
-put mkWbar idx or get mkWbar idx bit
+put mkWbar idx or get mkWbar idx b8
 end
 end
 end
 end
 
-fn mkStepHazard pc ulong to bool
+fn mkStepHazard pc ulong check bool to bool
 db = mul pc 24
 wt = get mkCndRec add db 6
 if ne wt 0
-clear = not wt
+clear = uchar and not wt 255
+w8 = uchar and wt 255
 for i ulong 512
 put mkWbar i and get mkWbar i clear
-if ne and get mkRbar i wt 0
+if ne and get mkRbar i w8 0
 put mkRbar i 0
 end
 end
 end
 nr = get mkCndRec add db 9
+nw = get mkCndRec add db 10
+if check
 for j ulong nr bound 5
 if not mkChkOpnd get mkCndRec add add db 11 j false
 ret false
 end
 end
-nw = get mkCndRec add db 10
 if ne nw 0
 if not mkChkOpnd get mkCndRec add db 16 true
 ret false
+end
 end
 end
 if and ne get mkCndRec add db 7 0 ne nw 0
@@ -390,24 +408,182 @@ mkMarkOpnd get mkCndRec add add db 11 j lmask true
 end
 end
 end
-if and eq get mkCndRec add db 17 1 eq get mkCndRec add db 1 7
+ret true
+end
+
+note CFG helpers for full fixed-point dataflow scoreboard check (matching bw_hazard.om hz_fix)
+fn mkHzLoadIn pc ulong to void
+off = mul pc 512
 for i ulong 512
-put mkWbar i 0
-put mkRbar i 0
+put mkWbar i get mkHzInW add off i
+put mkRbar i get mkHzInR add off i
+end
+end
+
+fn mkHzJoinTo tgt ulong to bool
+off = mul tgt 512
+ch = false
+for i ulong 512
+ow = get mkHzInW add off i
+nw = or ow get mkWbar i
+if ne nw ow
+put mkHzInW add off i nw
+ch = true
+end
+orv = get mkHzInR add off i
+nrv = or orv get mkRbar i
+if ne nrv orv
+put mkHzInR add off i nrv
+ch = true
+end
+end
+ret ch
+end
+
+fn mkHzReachPush n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+if eq get mkHzSeen u 0
+put mkHzSeen u 1
+put mkHzWk top u
+ret add top 1
+end
+ret top
+end
+
+fn mkHzEdge n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+ch = mkHzJoinTo u
+sv = get mkHzSeen u
+qv = get mkHzQu u
+if and or ch eq sv 1 eq qv 0
+put mkHzQu u 1
+put mkHzWk top u
+ret add top 1
+end
+ret top
+end
+
+fn mkHzZeroAll n ulong to void
+for i ulong n bound 2048
+put mkHzSeen i 0
+put mkHzQu i 0
+off = mul i 512
+for r ulong 512
+put mkHzInW add off r 0
+put mkHzInR add off r 0
+end
+end
+end
+
+fn mkHzDoReach n ulong to void
+put mkHzSeen 0 1
+put mkHzWk 0 0
+top = ulong 1
+while gt top 0 bound 4096
+top = sub top 1
+pc = get mkHzWk top
+db = mul pc 24
+fl = get mkCndRec add db 17
+gd = get mkCndRec add db 1
+if or eq fl 0 ne gd 7
+top = mkHzReachPush n add long pc 1 top
+end
+if eq fl 2
+tg = hz_u2l get mkCndRec add db 18
+top = mkHzReachPush n add long pc tg top
+end
+end
+end
+
+note Verify Blackwell SM121 CFG scoreboard hazards across all reachable paths (0 hazards required).
+fn mkCheckHazards n ulong to bool
+mkHzZeroAll n
+mkHzDoReach n
+put mkHzWk 0 0
+put mkHzQu 0 1
+top = ulong 1
+while gt top 0 bound 65536
+top = sub top 1
+pc = get mkHzWk top
+put mkHzQu pc 0
+put mkHzSeen pc 2
+mkHzLoadIn pc
+z = mkStepHazard pc false
+db = mul pc 24
+fl = get mkCndRec add db 17
+gd = get mkCndRec add db 1
+if or eq fl 0 ne gd 7
+top = mkHzEdge n add long pc 1 top
+end
+if eq fl 2
+tg = hz_u2l get mkCndRec add db 18
+top = mkHzEdge n add long pc tg top
+end
+end
+for pc ulong n bound 2048
+if ne get mkHzSeen pc 0
+mkHzLoadIn pc
+if not mkStepHazard pc true
+ret false
+end
 end
 end
 ret true
 end
 
-note Verify Blackwell SM121 scoreboard hazards across mkCndRec[0..n) (0 hazards required).
-fn mkCheckHazards n ulong to bool
-for i ulong 512
-put mkWbar i 0
-put mkRbar i 0
+note Fixed-latency ALU RAW stall preservation:
+note For any fixed-latency RAW pair (u, v) in ref within the same basic block (no anchor between u..v,
+note distance <= 8), cand must keep cumulative stall cycles between inv[u]..inv[v] >= min(ref_cycles, 4).
+fn mkSumRange src ulong lo ulong hi ulong to ulong
+tot = ulong 0
+k = lo
+while lt k hi bound 2048
+if eq src 0
+tot = add tot get mkRefRec add mul k 24 2
+else
+tot = add tot get mkCndRec add mul k 24 2
 end
-for pc ulong n bound 2048
-if not mkStepHazard pc
+k = add k 1
+end
+ret tot
+end
+
+fn mkCheckRawPair u ulong v ulong to bool
+rcyc = mkSumRange 0 u v
+req = rcyc
+if gt req 4
+req = ulong 4
+end
+ret ge mkSumRange 1 get mkInv u get mkInv v req
+end
+
+fn mkCheckRawStalls n ulong to bool
+for u ulong n bound 2048
+du = mul u 24
+if and ne get mkRefRec add du 10 0 eq get mkRefRec add du 7 0
+lim = add u 8
+if gt lim n
+lim = n
+end
+v = add u 1
+while lt v lim bound 8
+if mkHasRaw u v
+if not mkCheckRawPair u v
 ret false
+end
+break
+end
+if mkIsAnchor v
+break
+end
+v = add v 1
+end
 end
 end
 ret true
@@ -579,6 +755,9 @@ if not mkCheckDeps n
 ret mkReject 16 16
 end
 if not mkCheckHazards n
+ret mkReject 17 17
+end
+if not mkCheckRawStalls n
 ret mkReject 17 17
 end
 mkWrt mkPassA

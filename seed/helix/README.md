@@ -25,14 +25,14 @@ All **7 independent build routes** across **3 OS/ISA combinations** converge bit
 
 Negative control (poisoned NOP in `matconst` via `omB2`): `14e9fac0... != 708fdc0f...` (**CAUGHT**). Canonical DDC manifest signed and verified with pure-Omega RFC 8032 Ed25519 (`seed/helix/sign_ddc.om`, compiled identically by Strand A & Strand B, 1-bit tamper rejected).
 
-## Phase 2: Verified E-Graph, Dual-Checker & Production `q36` SM121 Kernels
+## Phase 2: Verified EGP2 Structural E-Graph, Dual-Checker & Production `q36` SM121 Kernels
 
 - **Lean 4.36.0** (`HelixSoundness.lean`, `HelixAntibodies.lean`, `HelixKernelIR.lean`): 23 machine-checked declarations, 0 warnings, 0 `sorry`, standard axioms only.
-- **E-Graph + Strand A Dual-Checker**: `egraph_opt.om` reduces GB10 cost on `q36_bf16_gemv_mac` (`7→2`), `q36_w4_unpack_mac` (`9→2`), and `q36_swiglu_gate` (`10→2`) across 23 proof steps; standalone `dual_checker.om` independently verifies all 23 steps, kills injected unsound rule `add→mul`, and kills all 4 `uor-gpu` launch-gate attacks (`11/11` total antibodies).
-- **3 Production `q36` SM121 Kernels** extracted from `om/gpu/q36/emit_fast.om` and verified through `arboris_predator` → `monk_check` → `immune`:
-  - `bf16_gemv_fast` (227 insns): 102 swapped, stalls `1044 → 981` (**-63**), `hazards=0`, `11/11` antibodies PASS
-  - `fp8_b128_gemv_fast` (207 insns): 102 swapped, stalls `895 → 825` (**-70**), `hazards=0`, `11/11` antibodies PASS
-  - `w4_b32_gemv_fast` (437 insns): 170 swapped, stalls `2118 → 1921` (**-197**), `hazards=0`, `11/11` antibodies PASS
+- **EGP2 Structural Proof Kernel + Strand A Dual-Checker**: `egraph_opt.om` reduces GB10 cost on `q36_bf16_gemv_mac` (`7→2`), `q36_w4_unpack_mac` (`9→2`), and `q36_swiglu_gate` (`10→2`) across 23 proof steps and serializes full e-graph node tables (`EGP2`); standalone `dual_checker.om` replays union-find structurally verifying every rule's exact operands/e-classes/constants, proves `find(root_before) == find(root_after)`, independently recomputes GB10 cost, checks concrete semantic equivalence (`eval_checks=12`), kills BOTH unsound rule `99 (add→mul)` and structural spoof `rule 3 on add(x,1)→x` (`neg_controls=2/2`), and kills all 4 `uor-gpu` launch-gate attacks (`12/12` total antibodies).
+- **3 Production `q36` SM121 Kernels** extracted from `om/gpu/q36/emit_fast.om` and verified through `arboris_predator` (parsing live 35B LLM `compact=`/`swap=` proposals) → `monk_check` (full CFG fixed-point scoreboard dataflow + fixed-latency ALU RAW stall preservation + full barrier/reconvergence/predicate-writer anchoring) → `immune` (8 SM121 attacks + 4 `uor-gpu` = `12/12` antibodies):
+  - `bf16_gemv_fast` (227 insns): 94 moved, stalls `1044 → 923` (**-121**), `hazards=0`, `12/12` antibodies PASS
+  - `fp8_b128_gemv_fast` (207 insns): 102 moved, stalls `895 → 781` (**-114**), `hazards=0`, `12/12` antibodies PASS
+  - `w4_b32_gemv_fast` (437 insns): 152 moved, stalls `2118 → 1841` (**-277**), `hazards=0`, `12/12` antibodies PASS
 
 ## Phase 4: Single-Command Clean-Room Cold Regrowth
 
@@ -47,3 +47,4 @@ Regrows both strands from 804 B of seeds, verifies DDC + Ed25519 signature, runs
 Immutable evidence receipts:
 - Dual-seed DDC + Live GB10 silicon run (`71.51 tok/s` backbone, `65.89 tok/s` full-token, `11/11` parity, `nvrm_errors_delta: 0`): [`evidence/HELIX-DDC-20261121/`](../../evidence/HELIX-DDC-20261121/)
 - Complete Phases 1–4 verification receipt: [`evidence/HELIX-PHASES-1-4-20261121/`](../../evidence/HELIX-PHASES-1-4-20261121/)
+- Fine-tooth comb audit & hardening receipt (zero-prebuilt Strand A, full CFG dataflow + fixed-latency RAW stall floor, `EGP2` structural proof kernel, live LLM response parsing, 12/12 antibodies): [`evidence/HELIX-AUDIT-HARDENING-20261121/`](../../evidence/HELIX-AUDIT-HARDENING-20261121/)

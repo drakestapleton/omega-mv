@@ -27,7 +27,7 @@ mkdir -p "$B"
 bad() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 
-printf '=== 1. STRAND A (THE MONK): 408-byte seed0.hex -> hex1 -> asm2 -> om4 -> omc ===\n'
+printf '=== 1. STRAND A (THE MONK): 408-byte seed0.hex -> hex1 -> asm2 -> om4 -> omc (ZERO prebuilt binaries) ===\n'
 sh seed/rung0/load0.sh seed/rung0/seed0.hex "$B/seed0.bin"
 chmod +x "$B/seed0.bin"
 "$B/seed0.bin" < seed/rung0/seed0.hex > "$B/seed0.self"
@@ -36,17 +36,23 @@ cmp -s "$B/seed0.bin" "$B/seed0.self" || bad "seed0 self-rebuild failed"
 chmod +x "$B/hex1.bin"
 "$B/hex1.bin" < seed/rung2/asm2.hex1 > "$B/asm2.bin"
 chmod +x "$B/asm2.bin"
-OM4=seed/rung4/om4.bin
-"$OM4" < seed/omc/omc.om > "$B/A_stage1"
+cat seed/rung2/table.s2 seed/rung3/table3.s2 seed/rung4/table4.s2 seed/rung4/om4.s | "$B/asm2.bin" > "$B/om4.bin"
+chmod +x "$B/om4.bin"
+"$B/om4.bin" < seed/omc/omc.om > "$B/A_stage1"
 chmod +x "$B/A_stage1"
 "$B/A_stage1" < seed/omc/omc.om > "$B/A_stage2"
 chmod +x "$B/A_stage2"
+# Wheeler DDC step 0: confirm Strand A self-regeneration c(s_A, A) == A before cross-strand Stage 1/2
+"$B/A_stage2" < seed/omc/omc.om > "$B/A_self"
 sA1=$(sha "$B/A_stage1")
 sA2=$(sha "$B/A_stage2")
+sAself=$(sha "$B/A_self")
 sCommit=$(sha seed/out/omc)
-[ "$sA1" = "$sA2" ] || bad "Strand A fixpoint failed"
+[ "$sA1" = "$sA2" ] || bad "Strand A stage1->stage2 fixpoint failed"
+[ "$sA2" = "$sAself" ] || bad "Strand A self-regeneration c(s_A, A) == A failed"
 [ "$sA2" = "$sCommit" ] || bad "Strand A != committed seed/out/omc"
-printf 'PASS Strand A seed0=%sB omc=%s (%s bytes)\n' "$(wc -c < "$B/seed0.bin")" "$sA2" "$(wc -c < "$B/A_stage2")"
+printf 'PASS Strand A seed0=%sB -> hex1 -> asm2 -> om4(%sB) -> omc=%s (%s bytes, self-regen verified!)\n' \
+  "$(wc -c < "$B/seed0.bin")" "$(wc -c < "$B/om4.bin")" "$sA2" "$(wc -c < "$B/A_stage2")"
 
 printf '\n=== 2. STRAND B (THE PREDATOR): 396-byte W^X seedB0.b0 -> hexB1 -> omB2 (ZERO Strand A bytes!) ===\n'
 sh seed/helix/rung0/loadB0.sh seed/helix/rung0/seedB0.b0 "$B/seedB0.bin"
@@ -127,7 +133,7 @@ sPois=$(sha "$B/omc_poison_s2")
 [ "$sPois" != "$sCommit" ] || bad "CONTROL SURVIVED: poisoned stage1 matched seed/out/omc"
 printf 'PASS Control 1 (poisoned stage1 backdoor): CAUGHT (%s != %s)\n' "$sPois" "$sCommit"
 
-printf '\n=== 6. FOUR-ORGAN PROOF-CARRYING HELIX (MONK + ARBORIS/PREDATOR + 7-ANTIBODY IMMUNE) ===\n'
+printf '\n=== 6. FOUR-ORGAN PROOF-CARRYING HELIX (MONK + ARBORIS/PREDATOR + 8-ATTACK IMMUNE) ===\n'
 { printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/monk_check.om; } | "$B/A_stage2" > "$B/monk_check"
 chmod +x "$B/monk_check"
 { printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/arboris_predator.om; } | "$B/A_fast" > "$B/arboris_predator"
@@ -139,4 +145,4 @@ chmod +x "$B/immune"
 "$B/monk_check" seed/sm121/vecadd.bin "$B/vecadd_cand.bin" "$B/vecadd.cert"
 "$B/immune" "$B/monk_check" seed/sm121/vecadd.bin "$B/vecadd_cand.bin" "$B/vecadd.cert" "$B/im_scr"
 
-printf '\nHELIX PASS dual_seeds=804B(408B+396B) omc=%s ng=%s A_fast=%s antibodies=7/7\n' "$sCommit" "$sNgB" "$sAfast"
+printf '\nHELIX PASS dual_seeds=804B(408B+396B) zero_prebuilt=1 omc=%s ng=%s A_fast=%s antibodies=8/8\n' "$sCommit" "$sNgB" "$sAfast"
