@@ -26,6 +26,7 @@ global ikDArg uint 32
 global ikDArgC ulong 1
 global ikDPkt long 1
 global ikDPktPos ulong 1
+global ikDSetupDone ulong 1
 global ikDOutBuf uchar 65536
 global ikDProjTmp f32 16384
 global ikDRLatTmp f32 384
@@ -188,7 +189,7 @@ end
 put ikDKCode 0 cm
 put ikDKCodePos 0 0
 put ikDKCodeFail 0 0
-sm = new uint 21 0
+sm = new uint 22 0
 put sm 0 18432
 put sm 1 12288
 put sm 2 12288
@@ -210,7 +211,8 @@ put sm 17 9280
 put sm 18 0
 put sm 19 0
 put sm 20 0
-for k ulong 21
+put sm 21 256
+for k ulong 22
 p = mul div add get ikDKCodePos 0 255 256 256
 put ikDKOff k p
 put ikDKCodePos 0 p
@@ -266,8 +268,12 @@ put gbq1 41 gz
 put gbq1 59 gblo shr code 8
 end
 
-note Fast single-batch GPFIFO builder: uploads driver cb template ONCE per batch, not per kernel.
+note Fast single-batch GPFIFO builder: uploads driver cb template ONCE per session, not per batch.
 fn ikDBatchStart to bool
+if eq get ikDSetupDone 0 1
+put ikDPktPos 0 0
+ret true
+end
 put gbused 0 0
 gbsetup
 gbmth 0 40 4
@@ -287,6 +293,7 @@ if ne r long n
 ret false
 end
 put ikDPktPos 0 n
+put ikDSetupDone 0 1
 ret true
 end
 
@@ -467,12 +474,9 @@ end
 end
 end
 
-note Run Inkling2LoopMessageGate: (1 - tanh(f))*h + tanh(m)*msg using layer l controller ctrlIdx (0:attn,1:k,2:v,3:mlp).
-fn ikDMsgGate l ulong ctrlIdx ulong hOff ulong msgOff ulong outOff ulong to bool
+note Append Inkling2LoopMessageGate into an open GPFIFO batch (100% GPU via bf16_gemv_k64_fast + msg_gate_fast).
+fn ikDBatchMsgGate l ulong ctrlIdx ulong hOff ulong msgOff ulong outOff ulong to bool
 slotBase = add 28 mul ctrlIdx 3
-if not ikDBatchStart
-ret false
-end
 ikDArgReset
 ikDPtr ikDW hOff
 ikDPtr 0
@@ -496,22 +500,35 @@ ikDArgU 64
 if not ikDBatchAdd 0 2 1 1 256
 ret false
 end
-if not ikDBatchRun
+ikDPtr ikLva l add slotBase 1
+ikDPtr ikDW 0x1d5000
+ikDPtr ikDW 0x1d6000
+ikDArgU 2304
+if not ikDBatchAdd 21 72 1 1 256
 ret false
 end
-ikDMgUpProj ikLva l add slotBase 1 0x1d6000
-ikDMgUpProj ikLva l add slotBase 2 0x1d9000
-if not ikDBatchStart
+ikDPtr ikLva l add slotBase 2
+ikDPtr ikDW 0x1d5000
+ikDPtr ikDW 0x1d9000
+ikDArgU 2304
+if not ikDBatchAdd 21 72 1 1 256
 ret false
 end
-ikDArgReset
 ikDPtr ikDW hOff
 ikDPtr ikDW msgOff
 ikDPtr ikDW 0x1d6000
 ikDPtr ikDW 0x1d9000
 ikDPtr ikDW outOff
 ikDArgU 2304
-if not ikDBatchAdd 19 18 1 1 128
+ret ikDBatchAdd 19 18 1 1 128
+end
+
+note Run Inkling2LoopMessageGate standalone if needed.
+fn ikDMsgGate l ulong ctrlIdx ulong hOff ulong msgOff ulong outOff ulong to bool
+if not ikDBatchStart
+ret false
+end
+if not ikDBatchMsgGate l ctrlIdx hOff msgOff outOff
 ret false
 end
 ret ikDBatchRun
@@ -600,33 +617,66 @@ ikDRelDot h dMax
 end
 end
 
-fn ikDPackKvHead h ulong to void
+fn ikDBufF32 off ulong to f32
+b0 = uint get ikDOutBuf off
+b1 = shl uint get ikDOutBuf add off 1 8
+b2 = shl uint get ikDOutBuf add off 2 16
+b3 = shl uint get ikDOutBuf add off 3 24
+ret bitcast f32 or or b0 b1 or b2 b3
+end
+
+fn ikDBufPutF32 off ulong v f32 to void
+u = bitcast uint v
+put ikDOutBuf off uchar and u 255
+put ikDOutBuf add off 1 uchar and shr u 8 255
+put ikDOutBuf add off 2 uchar and shr u 16 255
+put ikDOutBuf add off 3 uchar and shr u 24 255
+end
+
+note Bulk vector add of 2304 FP32s inside ikDWork: dst = a + b (2 mapread + 1 mapwrite vs 6912 mapget/mapset).
+fn ikDVecAdd2304 dstOff ulong aOff ulong bOff ulong to void
 wk = get ikDWork 0
+r0 = mapread wk aOff ikDOutBuf 0 9216
+r1 = mapread wk bOff ikDOutBuf 9216 9216
+for i ulong 2304
+o = mul i 4
+v = add ikDBufF32 o ikDBufF32 add 9216 o
+ikDBufPutF32 o v
+end
+r2 = mapwrite wk dstOff ikDOutBuf 0 9216
+end
+
+fn ikDPackKvHeadFast h ulong to void
+hBase = mul h 512
 for d ulong 128
-idx = mul add mul h 128 d 4
-kb = mapget wk add 0x014000 idx 4
-vb = mapget wk add 0x016000 idx 4
-o = mul d 2
-put ikDOutBuf o uchar and shr kb 16 255
-put ikDOutBuf add o 1 uchar and shr kb 24 255
-put ikDOutBuf add 256 o uchar and shr vb 16 255
-put ikDOutBuf add 257 o uchar and shr vb 24 255
+srcK = add hBase mul d 4
+srcV = add 4096 srcK
+o = add 8192 mul d 2
+put ikDOutBuf o get ikDOutBuf add srcK 2
+put ikDOutBuf add o 1 get ikDOutBuf add srcK 3
+put ikDOutBuf add o 256 get ikDOutBuf add srcV 2
+put ikDOutBuf add o 257 get ikDOutBuf add srcV 3
 end
 end
 
-fn ikDAppendKvHead step ulong posQ ulong h ulong to void
-ikDPackKvHead h
+fn ikDWriteKvHead kv long kBase ulong posQ ulong h ulong to void
+ikDPackKvHeadFast h
+hOff = add mul h mul IK_TMAX 256 mul posQ 256
+kOff = add kBase hOff
+vOff = add kOff IK_KV_HALF_BYTES
+r = mapwrite kv kOff ikDOutBuf 8192 256
+r = mapwrite kv vOff ikDOutBuf 8448 256
+end
+
+note Bulk KV cache pack & append for all 8 heads (2 mapread + 16 mapwrite vs 2048 mapget).
+fn ikDAppendKv step ulong posQ ulong to void
+wk = get ikDWork 0
+r = mapread wk 0x014000 ikDOutBuf 0 4096
+r = mapread wk 0x016000 ikDOutBuf 4096 4096
 kv = get ikDKv 0
 kBase = add mul get ikDSlot 0 IK_KV_SLOT_BYTES mul step IK_KV_LAYER_BYTES
-hOff = add mul h mul IK_TMAX 256 mul posQ 256
-r = mapwrite kv add kBase hOff ikDOutBuf 0 256
-r = mapwrite kv add add kBase IK_KV_HALF_BYTES hOff ikDOutBuf 256 256
-end
-
-note Write current token K[8, 128] and V[8, 128] (FP32) into KV cache BF16 slot posQ for logical layer step.
-fn ikDAppendKv step ulong posQ ulong to void
 for h ulong 8
-ikDAppendKvHead step posQ h
+ikDWriteKvHead kv kBase posQ h
 end
 end
 
@@ -740,26 +790,9 @@ end
 else
 ikDCopy2304 0x0b0000 0x000000
 end
-if hasMsgs
-if not ikDMsgGate l 0 0x0b0000 0x1c0000 0x000000
-ret false
-end
-if isFull
-if not ikDMsgGate l 1 0x0b2400 0x1c2400 0x008000
-ret false
-end
-if not ikDMsgGate l 2 0x0b4800 0x1c4800 0x00c000
-ret false
-end
-else
-if not ikDMsgGate l 1 0x0b0000 0x1c2400 0x008000
-ret false
-end
-if not ikDMsgGate l 2 0x0b0000 0x1c4800 0x00c000
-ret false
-end
-end
-else
+tau = f32 1.0f32
+ikDWriteF32 wk 0x1e0000 tau
+if not hasMsgs
 ikDCopy2304 0x000000 0x0b0000
 if isFull
 ikDCopy2304 0x008000 0x0b2400
@@ -769,10 +802,28 @@ ikDCopy2304 0x008000 0x0b0000
 ikDCopy2304 0x00c000 0x0b0000
 end
 end
-tau = f32 1.0f32
-ikDWriteF32 wk 0x1e0000 tau
 if not ikDBatchStart
 ret false
+end
+if hasMsgs
+if not ikDBatchMsgGate l 0 0x0b0000 0x1c0000 0x000000
+ret false
+end
+if isFull
+if not ikDBatchMsgGate l 1 0x0b2400 0x1c2400 0x008000
+ret false
+end
+if not ikDBatchMsgGate l 2 0x0b4800 0x1c4800 0x00c000
+ret false
+end
+else
+if not ikDBatchMsgGate l 1 0x0b0000 0x1c2400 0x008000
+ret false
+end
+if not ikDBatchMsgGate l 2 0x0b0000 0x1c4800 0x00c000
+ret false
+end
+end
 end
 ikDArgReset
 ikDPtr ikDW 0x000000
@@ -971,6 +1022,10 @@ end
 ikDComputeRelBias l posQ
 ikDAppendKv step posQ
 kva = ikDKvVaStep step
+splitS = uint 1
+if ge posQ 64
+splitS = uint 4
+end
 if not ikDBatchStart
 ret false
 end
@@ -979,8 +1034,8 @@ ikDPtr ikDW 0x010000
 ikDPtr kva
 ikDPtr add kva IK_KV_HALF_BYTES
 ikDPtr ikDW 0x020000
-ikDPtr ikDW 0x01d000
-ikDPtr ikDW 0x040000
+ikDPtr ikDW 0x1e2000
+ikDPtr ikDW 0x1e4000
 ikDArgU 24
 ikDArgU 8
 ikDArgU uint IK_TMAX
@@ -991,17 +1046,20 @@ ikDArgU 0
 else
 ikDArgU 1024
 end
-if not ikDBatchAdd 3 24 1 1 256
+ikDArgU splitS
+if not ikDBatchAdd 13 24 splitS 1 256
 ret false
 end
-if not ikDBatchRun
+ikDPtr ikDW 0x1e2000
+ikDPtr ikDW 0x1e4000
+ikDPtr ikDW 0x01d000
+ikDPtr ikDW 0x018000
+ikDPtr ikDW 0x040000
+ikDArgU 24
+ikDArgU splitS
+if not ikDBatchAdd 14 24 1 1 32
 ret false
 end
-ikDApplyGate
-if not ikDBatchStart
-ret false
-end
-ikDArgReset
 ikDPtr ikLva l 4
 ikDPtr ikDW 0x040000
 ikDPtr ikDW 0x044000
@@ -1030,24 +1088,20 @@ ikDCopy2304 add 0x0c0000 mul bc 9216 0x04c000
 put ikDBlockCnt 0 add bc 1
 ikDCopy2304 0x04c000 0x048000
 else
-for i ulong 2304
-v1 = ikDReadF32 wk add 0x04c000 mul i 4
-v2 = ikDReadF32 wk add 0x048000 mul i 4
-ikDWriteF32 wk add 0x04c000 mul i 4 add v1 v2
-end
+ikDVecAdd2304 0x04c000 0x04c000 0x048000
 end
 mqVa = get ikMlpQOff l
 if not ikDAttnRes 0x0c0000 get ikDBlockCnt 0 0x04c000 mqVa 1 0x050000
 ret false
 end
-if hasMsgs
-if not ikDMsgGate l 3 0x050000 0x1c6c00 0x050000
-ret false
-end
-end
 lutva = mapaddr get ikDKLut 0
 if not ikDBatchStart
 ret false
+end
+if hasMsgs
+if not ikDBatchMsgGate l 3 0x050000 0x1c6c00 0x050000
+ret false
+end
 end
 ikDArgReset
 ikDPtr ikDW 0x050000
@@ -1185,12 +1239,32 @@ if not ikDBatchRun
 ret false
 end
 ikDArbStep step l
-for i ulong 2304
-v1 = ikDReadF32 wk add 0x04c000 mul i 4
-v2 = ikDReadF32 wk add 0x0a4000 mul i 4
-ikDWriteF32 wk mul i 4 add v1 v2
-end
+ikDVecAdd2304 0x000000 0x04c000 0x0a4000
 ret true
+end
+
+fn ikDArgmax200k to long
+wk = get ikDWork 0
+bestId = ulong 0
+bestVal = f32 -1e30f32
+vBase = ulong 0
+while lt vBase 200058 bound 16
+cnt = sub 200058 vBase
+if gt cnt 16384
+cnt = ulong 16384
+end
+off = add 0x300000 mul vBase 4
+r = mapread wk off ikDOutBuf 0 mul cnt 4
+for i ulong cnt bound 16384
+val = ikDBufF32 mul i 4
+if gt val bestVal
+bestVal = val
+bestId = add vBase i
+end
+end
+vBase = add vBase cnt
+end
+ret long bestId
 end
 
 note Run all 48 logical layers + final attn_res + norm + 201k unembed + softcap + greedy argmax.
@@ -1288,17 +1362,7 @@ end
 if not ikDBatchRun
 ret -14
 end
-wk = get ikDWork 0
-bestId = ulong 0
-bestVal = f32 -1e30f32
-for v ulong 200058
-val = ikDReadF32 wk add 0x300000 mul v 4
-if gt val bestVal
-bestVal = val
-bestId = v
-end
-end
-ret long bestId
+ret ikDArgmax200k
 end
 
 fn ikDJoinPath dir view uchar * dlen ulong suf view uchar * dst edit uchar 512 to ulong
@@ -1343,6 +1407,7 @@ if le pkt 0
 ret 12
 end
 put ikDPkt 0 pkt
+put ikDSetupDone 0 0
 if not ikDBuildLut
 ret 13
 end
