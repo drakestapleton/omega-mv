@@ -25,3 +25,8 @@ Pure seeded-Omega implementation of the **4-Strand Architect–Builder RLVR Plan
 ```sh
 sh seed/helix/ollm_factory/architect-builder-gate.sh
 ```
+
+## Campaign results
+
+- Rounds 1 to 3 and Cycle 1: `evidence/OLLM-HELIX-CLOSED-LOOP-20261121/`.
+- Cycle 2 harvest and rounds 4 to 7: `evidence/OLLM-AB4-ROUNDS-4-7-20261122/`. Diminishing returns reached: the frozen benchmark stays at round 3's 6 / 159, nothing was promoted, and the held-out loss gain came from widening the rehearsal draw. GPU training of frozen-core strands and Architect Cycle 3 are NOT_RUN.
