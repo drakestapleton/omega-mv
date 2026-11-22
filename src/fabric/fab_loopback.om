@@ -1,0 +1,362 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/fabric/fab_loopback.om -- in-process loopback transport and HMAC
+note stand-in authenticator for Fabric F5-0 (test and simulation only).
+note Composed after seed/ng/sha256.om, src/runtime/aien_machine_id.om, and
+note src/fabric/fab_hmac.om.
+
+const FAB_LOOP_NODES     ulong 8
+const FAB_LOOP_DEPTH     ulong 64
+const FAB_MSG_MAX        ulong 372
+const FAB_HMAC_MAX_PEERS ulong 64
+
+const FAB_OK              int 0
+const FAB_E_ARG           int -1
+const FAB_E_FORMAT        int -2
+const FAB_E_MISMATCH      int -3
+const FAB_E_NOT_ENROLLED  int -4
+const FAB_E_AUTH          int -5
+const FAB_E_STALE_GEN     int -6
+const FAB_E_REPLAY        int -7
+const FAB_E_LEASE_EXPIRED int -8
+const FAB_E_NOT_MEMBER    int -9
+const FAB_E_ONTOLOGY      int -10
+const FAB_E_CAPQ          int -11
+const FAB_E_FULL          int -12
+const FAB_E_TRANSPORT     int -13
+const FAB_E_GENERATION    int -14
+const FAB_E_STATE         int -15
+
+note Loopback bus state
+global g_fl_n          ulong 1
+global g_fl_box_id     uchar 264
+global g_fl_box_silent int   8
+global g_fl_box_head   ulong 8
+global g_fl_box_count  ulong 8
+global g_fl_q_len      ulong 512
+global g_fl_q_buf      uchar 190464
+global g_fl_tr_buf     uchar 65536
+global g_fl_tr_len     ulong 1
+global g_fl_sent       ulong 1
+global g_fl_dropped    ulong 1
+global g_fl_last_len   ulong 1
+global g_fl_last_buf   uchar 372
+
+note HMAC authenticator tables (up to 8 nodes, up to 64 peers each)
+global g_fa_self      uchar 264
+global g_fa_self_key  uchar 256
+global g_fa_n         ulong 8
+global g_fa_peer_ids  uchar 16896
+global g_fa_peer_keys uchar 16384
+
+fn fl_box_find mid view uchar 33 to int
+  n = get g_fl_n 0
+  for i ulong n bound 8
+    base = mul i 33
+    same = int 1
+    for j ulong 32
+      if ne get g_fl_box_id add add base 1 j get mid add 1 j
+        same = int 0
+      end
+    end
+    if ne same 0
+      ret int i
+    end
+  end
+  ret int -1
+end
+
+fn fl_box_push bidx ulong msg view uchar * to int
+  cnt = get g_fl_box_count bidx
+  mlen = len msg
+  if or ge cnt 64 gt mlen 372
+    ret FAB_E_TRANSPORT
+  end
+  hd = get g_fl_box_head bidx
+  slot = rem add hd cnt 64
+  qidx = add mul bidx 64 slot
+  put g_fl_q_len qidx mlen
+  base = mul qidx 372
+  for i ulong mlen bound 372
+    put g_fl_q_buf add base i get msg i
+  end
+  put g_fl_box_count bidx add cnt 1
+  ret FAB_OK
+end
+
+fn fl_tr_append_hdr from_id view uchar 33 to_id view uchar 33 mlen ulong to void
+  pos = get g_fl_tr_len 0
+  if gt add pos 68 65536
+    ret
+  end
+  for i ulong 32
+    put g_fl_tr_buf add pos i get from_id add 1 i
+  end
+  for i ulong 32
+    put g_fl_tr_buf add add pos 32 i get to_id add 1 i
+  end
+  for i ulong 4
+    put g_fl_tr_buf add add pos 64 i uchar and shr mlen mul i 8 255
+  end
+  put g_fl_tr_len 0 add pos 68
+end
+
+fn fl_tr_append_msg msg view uchar * to void
+  pos = get g_fl_tr_len 0
+  mlen = len msg
+  if gt add pos mlen 65536
+    ret
+  end
+  for i ulong mlen bound 372
+    put g_fl_tr_buf add pos i get msg i
+  end
+  put g_fl_tr_len 0 add pos mlen
+end
+
+fn fab_loop_init to void
+  put g_fl_n 0 0
+  put g_fl_tr_len 0 0
+  put g_fl_sent 0 0
+  put g_fl_dropped 0 0
+  put g_fl_last_len 0 0
+  for i ulong 8
+    put g_fl_box_silent i 0
+    put g_fl_box_head i 0
+    put g_fl_box_count i 0
+  end
+  for i ulong 264
+    put g_fl_box_id i uchar 0
+  end
+end
+
+fn fab_loop_add mid view uchar 33 to int
+  if ge fl_box_find view mid 0
+    ret FAB_E_ARG
+  end
+  n = get g_fl_n 0
+  if ge n 8
+    ret FAB_E_FULL
+  end
+  base = mul n 33
+  for i ulong 33
+    put g_fl_box_id add base i get mid i
+  end
+  put g_fl_n 0 add n 1
+  ret FAB_OK
+end
+
+fn fab_loop_silence mid view uchar 33 silent int to void
+  idx = fl_box_find view mid
+  if ge idx 0
+    put g_fl_box_silent ulong idx silent
+  end
+end
+
+fn fab_loop_inject to_id view uchar 33 msg view uchar * to int
+  idx = fl_box_find view to_id
+  if lt idx 0
+    ret FAB_E_TRANSPORT
+  end
+  ret fl_box_push ulong idx view msg
+end
+
+fn fab_loop_send from_id view uchar 33 to_id view uchar 33 msg view uchar * to int
+  sidx = fl_box_find view from_id
+  didx = fl_box_find view to_id
+  mlen = len msg
+  if or lt sidx 0 lt didx 0
+    ret FAB_E_TRANSPORT
+  end
+  if gt mlen 372
+    ret FAB_E_TRANSPORT
+  end
+  put g_fl_last_len 0 mlen
+  for i ulong mlen bound 372
+    put g_fl_last_buf i get msg i
+  end
+  if ne get g_fl_box_silent ulong sidx 0
+    put g_fl_dropped 0 add get g_fl_dropped 0 1
+    ret FAB_OK
+  end
+  fl_tr_append_hdr view from_id view to_id mlen
+  fl_tr_append_msg view msg
+  put g_fl_sent 0 add get g_fl_sent 0 1
+  ret fl_box_push ulong didx view msg
+end
+
+fn fab_loop_recv self_id view uchar 33 buf edit uchar * to int
+  idx = fl_box_find view self_id
+  if lt idx 0
+    ret FAB_E_TRANSPORT
+  end
+  bidx = ulong idx
+  cnt = get g_fl_box_count bidx
+  if eq cnt 0
+    ret 0
+  end
+  hd = get g_fl_box_head bidx
+  qidx = add mul bidx 64 hd
+  mlen = get g_fl_q_len qidx
+  if gt mlen len buf
+    ret FAB_E_TRANSPORT
+  end
+  base = mul qidx 372
+  for i ulong mlen bound 372
+    put buf i get g_fl_q_buf add base i
+  end
+  put g_fl_box_head bidx rem add hd 1 64
+  put g_fl_box_count bidx sub cnt 1
+  ret int mlen
+end
+
+fn fab_loop_pending to ulong
+  p = ulong 0
+  n = get g_fl_n 0
+  for i ulong n bound 8
+    p = add p get g_fl_box_count i
+  end
+  ret p
+end
+
+fn fab_loop_transcript dst edit uchar 32 to void
+  tlen = get g_fl_tr_len 0
+  for i ulong tlen bound 65536
+    put sh_dat i get g_fl_tr_buf i
+  end
+  sh_all tlen
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn fl_q_match_rec qidx ulong kind ulong rec view uchar 44 to int
+  base = mul qidx 372
+  if ne ulong get g_fl_q_buf add base 5 kind
+    ret 0
+  end
+  for j ulong 44
+    if ne get g_fl_q_buf add add base 8 j get rec j
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fl_q_copy qidx ulong dst edit uchar 372 to ulong
+  mlen = get g_fl_q_len qidx
+  base = mul qidx 372
+  for j ulong mlen bound 372
+    put dst j get g_fl_q_buf add base j
+  end
+  ret mlen
+end
+
+fn fab_loop_peek bidx ulong from_id view uchar 33 kind ulong dst edit uchar 372 to ulong
+  rec = new uchar 44 0
+  if ne aien_mid_encode view from_id edit rec 0
+    ret 0
+  end
+  for k ulong get g_fl_box_count bidx bound 64
+    slot = add get g_fl_box_head bidx k
+    slot = rem slot 64
+    qidx = add mul bidx 64 slot
+    if ne fl_q_match_rec qidx kind view rec 0
+      ret fl_q_copy qidx edit dst
+    end
+  end
+  ret 0
+end
+
+fn fab_hmac_auth_init aid ulong self_id view uchar 33 skey view uchar 32 n ulong to int
+  if ge aid 8
+    ret FAB_E_ARG
+  end
+  put g_fa_n aid 0
+  if or eq n 0 gt n 64
+    ret FAB_E_ARG
+  end
+  sbase = mul aid 33
+  for i ulong 33
+    put g_fa_self add sbase i get self_id i
+  end
+  kbase = mul aid 32
+  for i ulong 32
+    put g_fa_self_key add kbase i get skey i
+  end
+  put g_fa_n aid n
+  ret FAB_OK
+end
+
+fn fab_hmac_auth_set_peer aid ulong pidx ulong pid view uchar 33 pkey view uchar 32 to void
+  if or ge aid 8 ge pidx 64
+    ret
+  end
+  slot = add mul aid 64 pidx
+  ibase = mul slot 33
+  for i ulong 33
+    put g_fa_peer_ids add ibase i get pid i
+  end
+  kbase = mul slot 32
+  for i ulong 32
+    put g_fa_peer_keys add kbase i get pkey i
+  end
+end
+
+fn fab_hmac_sign aid ulong msg view uchar * sig edit uchar 64 to int
+  if ge aid 8
+    ret sub int 0 1
+  end
+  skey = new uchar 32 0
+  kbase = mul aid 32
+  for i ulong 32
+    put skey i get g_fa_self_key add kbase i
+  end
+  ret fab_hmac_sig64 view skey view msg edit sig
+end
+
+fn fa_peer_eq slot ulong claimed view uchar 33 to int
+  ibase = add mul slot 33 1
+  for j ulong 32
+    b1 = get g_fa_peer_ids add ibase j
+    b2 = get claimed add 1 j
+    if ne b1 b2
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fa_find_peer aid ulong claimed view uchar 33 to int
+  n = get g_fa_n aid
+  for i ulong n bound 64
+    slot = add mul aid 64 i
+    if ne fa_peer_eq slot view claimed 0
+      ret int slot
+    end
+  end
+  ret int -1
+end
+
+fn fab_hmac_verify aid ulong claimed view uchar 33 msg view uchar * sig view uchar 64 to int
+  if ge aid 8
+    ret sub int 0 1
+  end
+  slot = fa_find_peer aid view claimed
+  if lt slot 0
+    ret sub int 0 1
+  end
+  pkey = new uchar 32 0
+  t = new uchar 64 0
+  kbase = mul ulong slot 32
+  for j ulong 32
+    put pkey j get g_fa_peer_keys add kbase j
+  end
+  if ne fab_hmac_sig64 view pkey view msg edit t 0
+    ret sub int 0 1
+  end
+  if ne fab_ct_equal64 view t view sig 0
+    ret 0
+  end
+  ret sub int 0 1
+end

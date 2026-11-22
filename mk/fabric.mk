@@ -47,15 +47,16 @@ fabric-purity: $(FAB_DIR)/fabric.o $(FAB_DIR)/fab_hmac.o $(FAB_DIR)/fab_loopback
 		echo "fabric object references an operation the Fabric must not have"; exit 1; fi
 	@echo "fabric-purity: fabric.o, fab_hmac.o, fab_loopback.o and fab_dispatch.o reference no forbidden symbol"
 
-test-fabric: fabric-purity
-	@$(MAKE) --no-print-directory $(RX_CAPQ_OBJ)
-	$(CC) $(CFLAGS) $(FAB_CFLAGS) -pthread -o $(FAB_DIR)/fabric_test tests/fabric/fabric_test.c \
-		$(FAB_SRCS) $(FAB_LINK_SRCS) $(RX_CAPQ_OBJ) -lm
-	$(CC) $(CFLAGS) $(FAB_CFLAGS) $(FAB_ASAN) -pthread -o $(FAB_DIR)/fabric_test_asan \
-		tests/fabric/fabric_test.c $(FAB_SRCS) $(FAB_LINK_SRCS) $(RX_CAPQ_OBJ) -lm
+FAB_OMC ?= seed/out/omc
+FAB_OM_SRCS = seed/ng/sha256.om src/runtime/aien_machine_id.om \
+	src/fabric/fab_hmac.om src/fabric/fab_loopback.om src/fabric/fabric.om
+
+$(FAB_DIR)/fabric_test: tests/fabric/fabric_test.om $(FAB_OM_SRCS) $(FAB_OMC)
+	@mkdir -p $(FAB_DIR)
+	(printf 'om2\n'; sed '/^om2$$/d' $(FAB_OM_SRCS) tests/fabric/fabric_test.om) | $(FAB_OMC) > $@ && chmod +x $@
+
+test-fabric: $(FAB_DIR)/fabric_test
 	$(abspath $(FAB_DIR)/fabric_test)
-	$(abspath $(FAB_DIR)/fabric_test_asan) > $(FAB_DIR)/asan.out
-	@grep -q '^F5_0_FABRIC_LOOPBACK_PASS$$' $(FAB_DIR)/asan.out && echo "test-fabric: ASan/UBSan run PASS"
 
 test-fabric-living: fabric-purity
 	@$(MAKE) --no-print-directory $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) $(RX_SKILLROUTE_OBJ) $(OUT_DIR)/rx_cortex.o $(AIENOS_CAP_LIB)

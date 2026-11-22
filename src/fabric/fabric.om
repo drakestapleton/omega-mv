@@ -1,0 +1,1753 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/fabric/fabric.om -- AIEN Fabric interface F5-0: membership, capability
+note advertisement, leases, loss detection, and replay-window persistence keyed
+note by AienMachineId, plus minimal canonical Capability Graph (cq_*) wire codec.
+note Composed after seed/ng/sha256.om, src/runtime/aien_machine_id.om,
+note src/fabric/fab_hmac.om, and src/fabric/fab_loopback.om.
+
+const FAB_VERSION        ulong 2
+const FAB_HDR_BYTES      ulong 120
+const FAB_JOIN_BODY      ulong 40
+const FAB_RENEW_BODY     ulong 8
+const FAB_ADVERTISE_BODY ulong 188
+const FAB_MAX_MEMBERS    ulong 16
+const FAB_MAX_KEYS       ulong 64
+const FAB_GEN_MAX        ulong 4294967295
+const FAB_STATE_VERSION  ulong 1
+const FAB_STATE_ENTRY    ulong 60
+const FAB_STATE_MAX      ulong 1048
+
+const FAB_MSG_JOIN       ulong 1
+const FAB_MSG_RENEW      ulong 2
+const FAB_MSG_ADVERTISE  ulong 3
+const FAB_MSG_LEAVE      ulong 4
+
+const FAB_ST_NONE        ulong 0
+const FAB_ST_JOINED      ulong 1
+const FAB_ST_LOST        ulong 2
+const FAB_ST_LEFT        ulong 3
+
+const FAB_EV_JOINED      ulong 1
+const FAB_EV_RENEWED     ulong 2
+const FAB_EV_ADVERTISED  ulong 3
+const FAB_EV_LOST        ulong 4
+const FAB_EV_LEFT        ulong 5
+const FAB_EV_REFUSED     ulong 6
+
+const JS_HOME_LOCAL        ulong 0
+const JS_HOME_REMOTE_OWNED ulong 1
+
+const CQ_OK              int 0
+const CQ_E_ARG           int -1
+const CQ_E_NO_OP         int -3
+const CQ_E_NOT_FOUND     int -7
+const CQ_E_WITHDRAWN     int -8
+const CQ_E_NO_IDENTITY   int -9
+const CQ_E_WIRE          int -10
+const CQ_E_STALE         int -11
+
+const CQ_SRC_GRAPH       ulong 0
+const CQ_SRC_FABRIC      ulong 4
+const CQ_LIVE_WITHDRAWN  ulong 0
+const CQ_LIVE_AVAILABLE  ulong 1
+const CQ_LIVE_UNAVAILABLE ulong 2
+const CQ_WIRE_ADVERTISE  ulong 1
+const CQ_WIRE_AVAILABILITY ulong 2
+const CQ_WIRE_WITHDRAW   ulong 3
+
+text t_cq_ont_dom "OMEGA-CAPQ-ONTOLOGY-1"
+text t_fab_st_dom "AFAB-STATE-V1"
+
+note ---- Per-node Canonical Capability Graph (4 nodes: 0..3) ----
+global g_cq_self_m   ulong 4
+global g_cq_m_n      ulong 4
+global g_cq_m_id     uchar 1056
+global g_cq_m_lease  ulong 32
+global g_cq_op_n     ulong 4
+global g_cq_op_par   ulong 32
+global g_cq_op_dom   ulong 32
+global g_cq_e_n      ulong 4
+global g_cq_e_u64    ulong 5632
+global g_cq_e_sdig   uchar 8192
+
+note ---- Replay-window store (MemStore) ----
+global g_st_rec       uchar 1112
+global g_st_len       ulong 1
+global g_st_has       int   1
+global g_st_fail_save int   1
+global g_st_fail_load int   1
+global g_st_saves     ulong 1
+
+note ---- FabNode state (4 nodes: 0..3) ----
+global g_fn_self      uchar 132
+global g_fn_roster_n  ulong 4
+global g_fn_roster_id uchar 2112
+global g_fn_auth_id   ulong 4
+global g_fn_max_lease ulong 4
+global g_fn_gen       ulong 4
+global g_fn_seq       ulong 4
+global g_fn_use_store ulong 4
+global g_fn_st_fresh  ulong 4
+global g_fn_n_members ulong 4
+
+note Members: 4 nodes * 16 members = 64 slots
+global g_fm_mid       uchar 2112
+global g_fm_state     ulong 64
+global g_fm_index     ulong 64
+global g_fm_gen       ulong 64
+global g_fm_last_seq  ulong 64
+global g_fm_lease     ulong 64
+global g_fm_n_keys    ulong 64
+note Keys: 64 member slots * 64 keys * 4 u64 = 16384 u64
+global g_fm_keys      ulong 16384
+
+note Events & refusal counts: 4 nodes
+global g_fn_n_events  ulong 4
+global g_fn_ev_buf    uchar 131072
+global g_fn_ev_len    ulong 4
+global g_fn_counts    ulong 64
+
+note Last FabVerdict (returned by fab_receive / fab_poll)
+global g_fv_code      int   1
+global g_fv_capq      int   1
+global g_fv_msg_kind  ulong 1
+global g_fv_sender    uchar 33
+
+note ---- Helpers ----
+
+fn fab_i32_to_u32 v int to ulong
+  if lt v 0
+    ret sub 4294967296 ulong sub 0 v
+  end
+  ret ulong v
+end
+
+fn fab_body_size kind ulong to ulong
+  if eq kind 1
+    ret 40
+  end
+  if eq kind 2
+    ret 8
+  end
+  if eq kind 3
+    ret 188
+  end
+  if eq kind 4
+    ret 0
+  end
+  ret 0xffffffffffffffff
+end
+
+fn fab_mid_decode_off src view uchar * off ulong dst edit uchar 33 to int
+  tmp = new uchar 48 0
+  for i ulong 44
+    put tmp i get src add off i
+  end
+  ret aien_mid_decode view tmp 44 edit dst
+end
+
+note ---- Canonical Capability Graph (cq_*) ----
+
+fn cq_m_slot_eq slot ulong mid view uchar 33 to int
+  base = add mul slot 33 1
+  for j ulong 32
+    b1 = get g_cq_m_id add base j
+    b2 = get mid add 1 j
+    if ne b1 b2
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn cq_m_find nid ulong mid view uchar 33 to ulong
+  cnt = get g_cq_m_n nid
+  for i ulong cnt bound 8
+    slot = add mul nid 8 i
+    if ne cq_m_slot_eq slot view mid 0
+      ret add i 1
+    end
+  end
+  ret 0
+end
+
+fn cq_m_bind nid ulong mid view uchar 33 to ulong
+  ex = cq_m_find nid view mid
+  if ne ex 0
+    ret ex
+  end
+  cnt = get g_cq_m_n nid
+  if ge cnt 8
+    ret 0
+  end
+  slot = add mul nid 8 cnt
+  base = mul slot 33
+  for j ulong 33
+    put g_cq_m_id add base j get mid j
+  end
+  put g_cq_m_lease slot 0
+  put g_cq_m_n nid add cnt 1
+  ret add cnt 1
+end
+
+fn cq_catalog_init nid ulong self_mid view uchar 33 to int
+  if ge nid 4
+    ret CQ_E_ARG
+  end
+  put g_cq_m_n nid 0
+  put g_cq_op_n nid 0
+  put g_cq_e_n nid 0
+  for i ulong 8
+    put g_cq_m_lease add mul nid 8 i 0
+    put g_cq_op_par add mul nid 8 i 0
+    put g_cq_op_dom add mul nid 8 i 0
+  end
+  for i ulong 64
+    ebase = mul add mul nid 64 i 22
+    put g_cq_e_u64 add ebase 21 0
+  end
+  idx = cq_m_bind nid view self_mid
+  if eq idx 0
+    ret CQ_E_NO_IDENTITY
+  end
+  put g_cq_self_m nid idx
+  ret CQ_OK
+end
+
+fn cq_op_define nid ulong op ulong par ulong dom ulong to int
+  n = get g_cq_op_n nid
+  if or ne op add n 1 ge par op
+    ret CQ_E_ARG
+  end
+  if gt op 8
+    ret CQ_E_ARG
+  end
+  slot = add mul nid 8 sub op 1
+  put g_cq_op_par slot par
+  put g_cq_op_dom slot dom
+  put g_cq_op_n nid op
+  ret CQ_OK
+end
+
+fn fab_sd_u32 pos ulong v ulong to ulong
+  for i ulong 4
+    put sh_dat add pos i uchar and shr v mul i 8 255
+  end
+  ret add pos 4
+end
+
+fn fab_sd_u64 pos ulong v ulong to ulong
+  for i ulong 8
+    put sh_dat add pos i uchar and shr v mul i 8 255
+  end
+  ret add pos 8
+end
+
+fn cq_ontology_digest nid ulong dst edit uchar 32 to void
+  for i ulong 21
+    put sh_dat i get t_cq_ont_dom i
+  end
+  pos = ulong 21
+  nops = get g_cq_op_n nid
+  pos = fab_sd_u32 pos nops
+  for i ulong nops bound 8
+    slot = add mul nid 8 i
+    pos = fab_sd_u32 pos get g_cq_op_par slot
+    pos = fab_sd_u32 pos get g_cq_op_dom slot
+  end
+  pos = fab_sd_u32 pos 0
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn cq_machine_identity nid ulong idx ulong dst edit uchar 33 to int
+  cnt = get g_cq_m_n nid
+  if or eq idx 0 gt idx cnt
+    ret CQ_E_NO_IDENTITY
+  end
+  slot = add mul nid 8 sub idx 1
+  base = mul slot 33
+  for i ulong 33
+    put dst i get g_cq_m_id add base i
+  end
+  ret CQ_OK
+end
+
+fn cq_machine_advertise_id nid ulong mid view uchar 33 lease_until ulong to ulong
+  idx = cq_m_bind nid view mid
+  if eq idx 0
+    ret 0
+  end
+  if eq idx get g_cq_self_m nid
+    ret 0
+  end
+  slot = add mul nid 8 sub idx 1
+  put g_cq_m_lease slot lease_until
+  ret idx
+end
+
+fn cq_lookup nid ulong cap_id ulong real_id ulong mach_id ulong skill_id ulong to int
+  for i ulong get g_cq_e_n nid bound 64
+    ebase = mul add mul nid 64 i 22
+    if ne get g_cq_e_u64 add ebase 21 0
+      if eq get g_cq_e_u64 ebase cap_id
+        if eq get g_cq_e_u64 add ebase 1 real_id
+          if eq get g_cq_e_u64 add ebase 2 mach_id
+            if eq get g_cq_e_u64 add ebase 3 skill_id
+              ret int i
+            end
+          end
+        end
+      end
+    end
+  end
+  ret int -1
+end
+
+fn cq_withdraw nid ulong cap_id ulong real_id ulong mach_id ulong skill_id ulong to int
+  es = cq_lookup nid cap_id real_id mach_id skill_id
+  if lt es 0
+    ret CQ_E_NOT_FOUND
+  end
+  ebase = mul add mul nid 64 ulong es 22
+  put g_cq_e_u64 add ebase 9 CQ_LIVE_WITHDRAWN
+  ret CQ_OK
+end
+
+fn cq_reg_check nid ulong f view ulong 21 to int
+  op = get f 5
+  src = get f 6
+  mach = get f 2
+  live = get f 9
+  if or eq op 0 gt op get g_cq_op_n nid
+    ret CQ_E_ARG
+  end
+  if or ge src 5 or eq mach 0 gt live 2
+    ret CQ_E_ARG
+  end
+  dom = get g_cq_op_dom add mul nid 8 sub op 1
+  if eq and dom shl ulong 1 src 0
+    ret CQ_E_ARG
+  end
+  is_fab = eq src CQ_SRC_FABRIC
+  is_rem = ne mach get g_cq_self_m nid
+  if ne is_fab is_rem
+    ret CQ_E_ARG
+  end
+  ret CQ_OK
+end
+
+fn cq_reg_store gslot ulong f view ulong 21 sdig view uchar 32 to void
+  ebase = mul gslot 22
+  for i ulong 21
+    put g_cq_e_u64 add ebase i get f i
+  end
+  put g_cq_e_u64 add ebase 21 1
+  dbase = mul gslot 32
+  for i ulong 32
+    put g_cq_e_sdig add dbase i get sdig i
+  end
+end
+
+fn cq_register_arr nid ulong f view ulong 21 sdig view uchar 32 to int
+  if ne cq_reg_check nid view f CQ_OK
+    ret CQ_E_ARG
+  end
+  es = cq_lookup nid get f 0 get f 1 get f 2 get f 3
+  slot = ulong 0
+  if ge es 0
+    slot = ulong es
+  else
+    cnt = get g_cq_e_n nid
+    if ge cnt 64
+      ret CQ_E_ARG
+    end
+    slot = cnt
+    put g_cq_e_n nid add cnt 1
+  end
+  cq_reg_store add mul nid 64 slot view f view sdig
+  ret CQ_OK
+end
+
+fn cq_we_pack gslot ulong wkind ulong mrec view uchar 44 dst edit uchar 188 to void
+  ebase = mul gslot 22
+  for i ulong 188
+    put dst i uchar 0
+  end
+  put dst 0 uchar 65
+  put dst 1 uchar 67
+  put dst 2 uchar 71
+  put dst 3 uchar 82
+  put dst 4 uchar 1
+  put dst 5 uchar and wkind 255
+  put dst 6 uchar and get g_cq_e_u64 add ebase 6 255
+  put dst 7 uchar and get g_cq_e_u64 add ebase 7 255
+  for i ulong 44
+    put dst add 8 i get mrec i
+  end
+  fab_put_u32 part dst 0 188 52 get g_cq_e_u64 ebase
+  fab_put_u32 part dst 0 188 56 get g_cq_e_u64 add ebase 1
+  fab_put_u32 part dst 0 188 60 get g_cq_e_u64 add ebase 3
+  fab_put_u32 part dst 0 188 64 get g_cq_e_u64 add ebase 4
+  dbase = mul gslot 32
+  for i ulong 32
+    put dst add 68 i get g_cq_e_sdig add dbase i
+  end
+  fab_put_u32 part dst 0 188 100 get g_cq_e_u64 add ebase 5
+  fab_put_u16 part dst 0 188 104 get g_cq_e_u64 add ebase 8
+  wlive = get g_cq_e_u64 add ebase 9
+  if eq wkind 3
+    wlive = ulong 0
+  end
+  fab_put_u16 part dst 0 188 106 wlive
+  fab_put_u64 part dst 0 188 108 get g_cq_e_u64 add ebase 10
+  fab_put_u64 part dst 0 188 116 get g_cq_e_u64 add ebase 11
+  fab_put_u64 part dst 0 188 124 get g_cq_e_u64 add ebase 12
+  fab_put_u32 part dst 0 188 132 get g_cq_e_u64 add ebase 13
+  fab_put_u32 part dst 0 188 136 get g_cq_e_u64 add ebase 14
+  fab_put_u32 part dst 0 188 140 get g_cq_e_u64 add ebase 15
+  fab_put_u64 part dst 0 188 144 get g_cq_e_u64 add ebase 16
+  fab_put_u64 part dst 0 188 152 get g_cq_e_u64 add ebase 17
+  fab_put_u64 part dst 0 188 160 get g_cq_e_u64 add ebase 18
+  fab_put_u64 part dst 0 188 168 get g_cq_e_u64 add ebase 19
+  fab_put_u64 part dst 0 188 176 get g_cq_e_u64 add ebase 20
+  for i ulong 184
+    put sh_dat i get dst i
+  end
+  sh_all 184
+  for i ulong 4
+    put dst add 184 i get sh_dig i
+  end
+end
+
+fn cq_wire_encode nid ulong eslot ulong wkind ulong dst edit uchar 188 to int
+  if or lt wkind 1 gt wkind 3
+    ret CQ_E_ARG
+  end
+  gslot = add mul nid 64 eslot
+  ebase = mul gslot 22
+  mach = get g_cq_e_u64 add ebase 2
+  src = get g_cq_e_u64 add ebase 6
+  live = get g_cq_e_u64 add ebase 9
+  if or ne mach get g_cq_self_m nid or eq src CQ_SRC_FABRIC gt live 2
+    ret CQ_E_WIRE
+  end
+  mid = new uchar 33 0
+  if ne cq_machine_identity nid mach edit mid 0
+    ret CQ_E_NO_IDENTITY
+  end
+  mrec = new uchar 44 0
+  if ne aien_mid_encode view mid edit mrec 0
+    ret CQ_E_NO_IDENTITY
+  end
+  cq_we_pack gslot wkind view mrec edit dst
+  ret CQ_OK
+end
+
+fn cq_wd_check src view uchar 188 to int
+  for i ulong 184
+    put sh_dat i get src i
+  end
+  sh_all 184
+  for i ulong 4
+    if ne get src add 184 i get sh_dig i
+      ret CQ_E_WIRE
+    end
+  end
+  if or ne get src 0 uchar 65 ne get src 1 uchar 67
+    ret CQ_E_WIRE
+  end
+  if or ne get src 2 uchar 71 ne get src 3 uchar 82
+    ret CQ_E_WIRE
+  end
+  if ne get src 4 uchar 1
+    ret CQ_E_WIRE
+  end
+  wkind = ulong get src 5
+  wsrc = ulong get src 6
+  ev = ulong get src 7
+  live = fab_get_u16 part src 0 188 106
+  if or lt wkind 1 gt wkind 3
+    ret CQ_E_WIRE
+  end
+  if or ge wsrc 5 eq wsrc 4
+    ret CQ_E_WIRE
+  end
+  if or gt ev 3 gt live 2
+    ret CQ_E_WIRE
+  end
+  is_w = eq wkind 3
+  is_lw = eq live 0
+  if ne is_w is_lw
+    ret CQ_E_WIRE
+  end
+  ret CQ_OK
+end
+
+fn cq_wire_decode src view uchar 188 mid edit uchar 33 f edit ulong 22 sdig edit uchar 32 to int
+  if ne cq_wd_check view src CQ_OK
+    ret CQ_E_WIRE
+  end
+  if ne fab_mid_decode_off part src 0 188 8 edit mid 0
+    ret CQ_E_WIRE
+  end
+  put f 0 fab_get_u32 part src 0 188 52
+  put f 1 fab_get_u32 part src 0 188 56
+  put f 2 0
+  put f 3 fab_get_u32 part src 0 188 60
+  put f 4 fab_get_u32 part src 0 188 64
+  put f 5 fab_get_u32 part src 0 188 100
+  put f 6 ulong get src 6
+  put f 7 ulong get src 7
+  put f 8 fab_get_u16 part src 0 188 104
+  put f 9 fab_get_u16 part src 0 188 106
+  put f 10 fab_get_u64 part src 0 188 108
+  put f 11 fab_get_u64 part src 0 188 116
+  put f 12 fab_get_u64 part src 0 188 124
+  put f 13 fab_get_u32 part src 0 188 132
+  put f 14 fab_get_u32 part src 0 188 136
+  put f 15 fab_get_u32 part src 0 188 140
+  put f 16 fab_get_u64 part src 0 188 144
+  put f 17 fab_get_u64 part src 0 188 152
+  put f 18 fab_get_u64 part src 0 188 160
+  put f 19 fab_get_u64 part src 0 188 168
+  put f 20 fab_get_u64 part src 0 188 176
+  put f 21 ulong get src 5
+  for i ulong 32
+    put sdig i get src add 68 i
+  end
+  ret CQ_OK
+end
+
+fn cq_wa_commit nid ulong f view ulong 22 sdig view uchar 32 key_out edit ulong 4 to int
+  wkind = get f 21
+  idx = get f 2
+  es = cq_lookup nid get f 0 get f 1 idx get f 3
+  if ge es 0
+    ebase = mul add mul nid 64 ulong es 22
+    if le get f 20 get g_cq_e_u64 add ebase 20
+      ret CQ_E_STALE
+    end
+    if and eq wkind 2 eq get g_cq_e_u64 add ebase 9 0
+      ret CQ_E_WITHDRAWN
+    end
+    if ne wkind 1
+      put g_cq_e_u64 add ebase 9 get f 9
+      put g_cq_e_u64 add ebase 20 get f 20
+      put key_out 0 get f 0
+      put key_out 1 get f 1
+      put key_out 2 idx
+      put key_out 3 get f 3
+      ret CQ_OK
+    end
+  else
+    if ne wkind 1
+      ret CQ_E_NOT_FOUND
+    end
+  end
+  f21 = new ulong 21 0
+  for i ulong 21
+    put f21 i get f i
+  end
+  rc = cq_register_arr nid view f21 view sdig
+  if eq rc CQ_OK
+    put key_out 0 get f 0
+    put key_out 1 get f 1
+    put key_out 2 idx
+    put key_out 3 get f 3
+  end
+  ret rc
+end
+
+fn cq_wire_apply nid ulong src view uchar 188 key_out edit ulong 4 to int
+  mid = new uchar 33 0
+  f = new ulong 22 0
+  sdig = new uchar 32 0
+  rc = cq_wire_decode view src edit mid edit f edit sdig
+  if ne rc CQ_OK
+    ret rc
+  end
+  idx = cq_m_find nid view mid
+  if eq idx get g_cq_self_m nid
+    ret CQ_E_WIRE
+  end
+  if eq idx 0
+    idx = cq_m_bind nid view mid
+    if eq idx 0
+      ret CQ_E_NO_IDENTITY
+    end
+  end
+  op = get f 5
+  if or eq op 0 gt op get g_cq_op_n nid
+    ret CQ_E_NO_OP
+  end
+  put f 2 idx
+  put f 6 CQ_SRC_FABRIC
+  ret cq_wa_commit nid view f view sdig edit key_out
+end
+
+note ---- Replay-window store (MemStore) ----
+
+fn fab_store_reset to void
+  put g_st_len 0 0
+  put g_st_has 0 0
+  put g_st_fail_save 0 0
+  put g_st_fail_load 0 0
+  put g_st_saves 0 0
+  for i ulong 1112
+    put g_st_rec i uchar 0
+  end
+end
+
+fn fab_store_save rec view uchar * to int
+  rlen = len rec
+  if or ne get g_st_fail_save 0 0 gt rlen 1112
+    ret sub int 0 1
+  end
+  for i ulong rlen bound 1112
+    put g_st_rec i get rec i
+  end
+  put g_st_len 0 rlen
+  put g_st_has 0 1
+  put g_st_saves 0 add get g_st_saves 0 1
+  ret 0
+end
+
+fn fab_store_load dst edit uchar 1048 to int
+  if ne get g_st_fail_load 0 0
+    ret sub int 0 1
+  end
+  if eq get g_st_has 0 0
+    ret 0
+  end
+  rlen = get g_st_len 0
+  if gt rlen 1048
+    ret sub int 0 1
+  end
+  for i ulong rlen bound 1048
+    put dst i get g_st_rec i
+  end
+  ret int rlen
+end
+
+note ---- FabNode internals ----
+
+fn fab_node_self nid ulong dst edit uchar 33 to void
+  base = mul nid 33
+  for i ulong 33
+    put dst i get g_fn_self add base i
+  end
+end
+
+fn fab_roster_eq slot ulong mid view uchar 33 to int
+  base = add mul slot 33 1
+  for j ulong 32
+    b1 = get g_fn_roster_id add base j
+    b2 = get mid add 1 j
+    if ne b1 b2
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fab_on_roster nid ulong mid view uchar 33 to int
+  rn = get g_fn_roster_n nid
+  for i ulong rn bound 16
+    slot = add mul nid 16 i
+    if ne fab_roster_eq slot view mid 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn fab_member_eq slot ulong mid view uchar 33 to int
+  base = add mul slot 33 1
+  for j ulong 32
+    b1 = get g_fm_mid add base j
+    b2 = get mid add 1 j
+    if ne b1 b2
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fab_member_find nid ulong mid view uchar 33 to int
+  nm = get g_fn_n_members nid
+  for i ulong nm bound 16
+    slot = add mul nid 16 i
+    if ne fab_member_eq slot view mid 0
+      ret int i
+    end
+  end
+  ret int -1
+end
+
+fn fab_ev_push_bytes nid ulong b view uchar 73 to void
+  pos = get g_fn_ev_len nid
+  if gt add pos 73 32768
+    ret
+  end
+  base = add mul nid 32768 pos
+  for i ulong 73
+    put g_fn_ev_buf add base i get b i
+  end
+  put g_fn_ev_len nid add pos 73
+end
+
+fn fab_emit_ev_bytes nid ulong hdr view ulong 4 mid view uchar 33 meta view ulong 3 to void
+  b = new uchar 73 0
+  fab_put_u32 part b 0 73 0 get hdr 0
+  fab_put_u32 part b 0 73 4 get hdr 1
+  fab_put_u32 part b 0 73 8 get hdr 2
+  fab_put_u32 part b 0 73 12 get hdr 3
+  put b 16 get mid 0
+  for i ulong 32
+    put b add 17 i get mid add 1 i
+  end
+  fab_put_u64 part b 0 73 49 get meta 0
+  fab_put_u64 part b 0 73 57 get meta 1
+  fab_put_u64 part b 0 73 65 get meta 2
+  fab_ev_push_bytes nid view b
+end
+
+fn fab_log_full nid ulong ev_h view ulong 4 mid view uchar 33 ev_t view ulong 3 to void
+  code_u = get ev_h 1
+  put g_fn_n_events nid add get g_fn_n_events nid 1
+  if ge code_u 4294967280
+    negc = sub 4294967296 code_u
+    if and gt negc 0 lt negc 16
+      cidx = add mul nid 16 negc
+      put g_fn_counts cidx add get g_fn_counts cidx 1
+    end
+  end
+  fab_emit_ev_bytes nid view ev_h view mid view ev_t
+end
+
+fn fab_withdraw_all nid ulong mslot ulong to void
+  nk = get g_fm_n_keys mslot
+  for i ulong nk bound 64
+    kbase = mul add mul mslot 64 i 4
+    c = get g_fm_keys kbase
+    r = get g_fm_keys add kbase 1
+    m = get g_fm_keys add kbase 2
+    s = get g_fm_keys add kbase 3
+    ign = cq_withdraw nid c r m s
+  end
+end
+
+fn fab_ws_write_entry rec edit uchar 1048 pos ulong mid view uchar 33 g ulong s ulong to int
+  mrec = new uchar 44 0
+  if ne aien_mid_encode view mid edit mrec 0
+    ret FAB_E_STATE
+  end
+  for j ulong 44
+    put rec add pos j get mrec j
+  end
+  fab_put_u64 part rec 0 1048 add pos 44 g
+  fab_put_u64 part rec 0 1048 add pos 52 s
+  ret FAB_OK
+end
+
+fn fab_ws_finish nid ulong rec edit uchar 1048 cnt ulong pos ulong to int
+  put rec 0 uchar 65
+  put rec 1 uchar 70
+  put rec 2 uchar 83
+  put rec 3 uchar 84
+  fab_put_u32 part rec 0 1048 4 FAB_STATE_VERSION
+  smid = new uchar 33 0
+  mrec = new uchar 44 0
+  fab_node_self nid edit smid
+  if ne aien_mid_encode view smid edit mrec 0
+    ret FAB_E_STATE
+  end
+  for j ulong 44
+    put rec add 8 j get mrec j
+  end
+  fab_put_u32 part rec 0 1048 52 cnt
+  for i ulong pos bound 1016
+    put sh_dat i get rec i
+  end
+  sh_all pos
+  for i ulong 32
+    put rec add pos i get sh_dig i
+  end
+  if eq fab_store_save part rec 0 add pos 32 0
+    ret FAB_OK
+  end
+  ret FAB_E_STATE
+end
+
+fn fab_ws_one rec edit uchar 1048 st edit ulong 3 mslot ulong who view uchar 33 gs view ulong 2 to int
+  if eq get g_fm_state mslot FAB_ST_NONE
+    ret FAB_OK
+  end
+  mmid = new uchar 33 0
+  mbase = mul mslot 33
+  for j ulong 33
+    put mmid j get g_fm_mid add mbase j
+  end
+  g = get g_fm_gen mslot
+  s = get g_fm_last_seq mslot
+  if ne get gs 0 0
+    if ne aien_mid_equal view mmid view who 0
+      g = get gs 0
+      s = get gs 1
+      put st 2 1
+    end
+  end
+  cnt = get st 1
+  if ge cnt 16
+    ret FAB_E_STATE
+  end
+  pos = get st 0
+  if ne fab_ws_write_entry edit rec pos view mmid g s FAB_OK
+    ret FAB_E_STATE
+  end
+  put st 0 add pos 60
+  put st 1 add cnt 1
+  ret FAB_OK
+end
+
+fn fab_window_save nid ulong has_who ulong who view uchar 33 gen ulong seq ulong to int
+  if eq get g_fn_use_store nid 0
+    ret FAB_OK
+  end
+  rec = new uchar 1048 0
+  st = new ulong 3 0
+  gs = new ulong 2 0
+  put st 0 56
+  if ne has_who 0
+    put gs 0 gen
+    put gs 1 seq
+  end
+  for i ulong get g_fn_n_members nid bound 16
+    mslot = add mul nid 16 i
+    if ne fab_ws_one edit rec edit st mslot view who view gs FAB_OK
+      ret FAB_E_STATE
+    end
+  end
+  if and ne has_who 0 eq get st 2 0
+    if ge get st 1 16
+      ret FAB_E_STATE
+    end
+    if ne fab_ws_write_entry edit rec get st 0 view who gen seq FAB_OK
+      ret FAB_E_STATE
+    end
+    put st 0 add get st 0 60
+    put st 1 add get st 1 1
+  end
+  ret fab_ws_finish nid edit rec get st 1 get st 0
+end
+
+fn fab_wr_check_hdr nid ulong rec view uchar 1048 rlen ulong to int
+  if or lt rlen 88 gt rlen 1048
+    ret int -1
+  end
+  if or ne get rec 0 uchar 65 ne get rec 1 uchar 70
+    ret int -1
+  end
+  if or ne get rec 2 uchar 83 ne get rec 3 uchar 84
+    ret int -1
+  end
+  if ne fab_get_u32 part rec 0 1048 4 FAB_STATE_VERSION
+    ret int -1
+  end
+  cnt = fab_get_u32 part rec 0 1048 52
+  if or gt cnt 16 ne rlen add add 56 mul cnt 60 32
+    ret int -1
+  end
+  blen = sub rlen 32
+  for i ulong blen bound 1016
+    put sh_dat i get rec i
+  end
+  sh_all blen
+  for i ulong 32
+    if ne get sh_dig i get rec add blen i
+      ret int -1
+    end
+  end
+  sdec = new uchar 33 0
+  sexp = new uchar 33 0
+  fab_node_self nid edit sexp
+  if ne fab_mid_decode_off part rec 0 1048 8 edit sdec 0
+    ret int -1
+  end
+  if eq aien_mid_equal view sdec view sexp 0
+    ret int -1
+  end
+  ret int cnt
+end
+
+fn fab_wr_has_dup got_mid view uchar 528 cnt ulong mm view uchar 33 to int
+  other = new uchar 33 0
+  for j ulong cnt bound 16
+    for k ulong 33
+      put other k get got_mid add mul j 33 k
+    end
+    if ne aien_mid_equal view other view mm 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn fab_wr_commit nid ulong cnt ulong got_mid view uchar 528 got_gen view ulong 16 got_seq view ulong 16 to void
+  for i ulong cnt bound 16
+    mslot = add mul nid 16 i
+    mbase = mul mslot 33
+    for k ulong 33
+      put g_fm_mid add mbase k get got_mid add mul i 33 k
+    end
+    put g_fm_state mslot FAB_ST_LOST
+    put g_fm_index mslot 0
+    put g_fm_gen mslot get got_gen i
+    put g_fm_last_seq mslot get got_seq i
+    put g_fm_lease mslot 0
+    put g_fm_n_keys mslot 0
+  end
+  put g_fn_n_members nid cnt
+end
+
+fn fab_wr_parse_one nid ulong rec view uchar 1048 idx ulong got_mid edit uchar 528 gs edit ulong 2 to int
+  sexp = new uchar 33 0
+  mm = new uchar 33 0
+  fab_node_self nid edit sexp
+  off = add 56 mul idx 60
+  if ne fab_mid_decode_off part rec 0 1048 off edit mm 0
+    ret FAB_E_STATE
+  end
+  if ne aien_mid_equal view mm view sexp 0
+    ret FAB_E_STATE
+  end
+  if ne fab_wr_has_dup view got_mid idx view mm 0
+    ret FAB_E_STATE
+  end
+  g = fab_get_u64 part rec 0 1048 add off 44
+  s = fab_get_u64 part rec 0 1048 add off 52
+  if or eq g 0 gt g FAB_GEN_MAX
+    ret FAB_E_STATE
+  end
+  base = mul idx 33
+  for k ulong 33
+    put got_mid add base k get mm k
+  end
+  put gs 0 g
+  put gs 1 s
+  ret FAB_OK
+end
+
+fn fab_window_restore nid ulong rec view uchar 1048 rlen ulong to int
+  cnt_i = fab_wr_check_hdr nid view rec rlen
+  if lt cnt_i 0
+    ret FAB_E_STATE
+  end
+  cnt = ulong cnt_i
+  got_mid = new uchar 528 0
+  got_gen = new ulong 16 0
+  got_seq = new ulong 16 0
+  gs = new ulong 2 0
+  for i ulong cnt bound 16
+    if ne fab_wr_parse_one nid view rec i edit got_mid edit gs FAB_OK
+      ret FAB_E_STATE
+    end
+    put got_gen i get gs 0
+    put got_seq i get gs 1
+  end
+  fab_wr_commit nid cnt view got_mid view got_gen view got_seq
+  ret FAB_OK
+end
+
+fn fab_window_open nid ulong to int
+  if eq get g_fn_use_store nid 0
+    ret FAB_OK
+  end
+  rec = new uchar 1048 0
+  zmid = new uchar 33 0
+  got = fab_store_load edit rec
+  stf = get g_fn_st_fresh nid
+  if eq got 0
+    if ne stf 0
+      ret fab_window_save nid 0 view zmid 0 0
+    end
+    ret FAB_E_STATE
+  end
+  if or lt got 0 ne stf 0
+    ret FAB_E_STATE
+  end
+  ret fab_window_restore nid view rec ulong got
+end
+
+fn fab_node_clear nid ulong to void
+  put g_fn_roster_n nid 0
+  put g_fn_auth_id nid 0
+  put g_fn_max_lease nid 0
+  put g_fn_gen nid 0
+  put g_fn_seq nid 0
+  put g_fn_use_store nid 0
+  put g_fn_st_fresh nid 0
+  put g_fn_n_members nid 0
+  put g_fn_n_events nid 0
+  put g_fn_ev_len nid 0
+  for i ulong 16
+    put g_fn_counts add mul nid 16 i 0
+    mslot = add mul nid 16 i
+    put g_fm_state mslot FAB_ST_NONE
+    put g_fm_index mslot 0
+    put g_fm_gen mslot 0
+    put g_fm_last_seq mslot 0
+    put g_fm_lease mslot 0
+    put g_fm_n_keys mslot 0
+  end
+end
+
+fn fab_node_set_roster nid ulong idx ulong mid view uchar 33 to void
+  slot = add mul nid 16 idx
+  base = mul slot 33
+  for i ulong 33
+    put g_fn_roster_id add base i get mid i
+  end
+end
+
+fn fab_node_init nid ulong self_mid view uchar 33 cfg view ulong 6 to int
+  note cfg: 0=roster_n, 1=auth_id, 2=max_lease_us, 3=generation, 4=store_mode (0=none,1=ok,2=bad), 5=store_fresh
+  if ge nid 4
+    ret FAB_E_ARG
+  end
+  rn = get cfg 0
+  aid = get cfg 1
+  maxl = get cfg 2
+  gen = get cfg 3
+  smode = get cfg 4
+  sfresh = get cfg 5
+  if or eq gen 0 eq maxl 0
+    ret FAB_E_ARG
+  end
+  if eq smode 2
+    ret FAB_E_ARG
+  end
+  if eq smode 0
+    if ne sfresh 0
+      ret FAB_E_ARG
+    end
+  else
+    if gt sfresh 1
+      ret FAB_E_ARG
+    end
+  end
+  if gt gen FAB_GEN_MAX
+    ret FAB_E_GENERATION
+  end
+  sid = new uchar 32 0
+  for i ulong 32
+    put sid i get self_mid add 1 i
+  end
+  if ne mid_is_zero view sid 0
+    ret FAB_E_ARG
+  end
+  if ne cq_m_find nid view self_mid get g_cq_self_m nid
+    ret FAB_E_ARG
+  end
+  fab_node_clear nid
+  sbase = mul nid 33
+  for i ulong 33
+    put g_fn_self add sbase i get self_mid i
+  end
+  put g_fn_roster_n nid rn
+  put g_fn_auth_id nid aid
+  put g_fn_max_lease nid maxl
+  put g_fn_gen nid gen
+  put g_fn_use_store nid smode
+  put g_fn_st_fresh nid sfresh
+  rc = fab_window_open nid
+  if ne rc FAB_OK
+    fab_node_clear nid
+  end
+  ret rc
+end
+
+fn fab_node_set_generation nid ulong gen ulong to int
+  if gt gen FAB_GEN_MAX
+    ret FAB_E_GENERATION
+  end
+  if le gen get g_fn_gen nid
+    ret FAB_E_STALE_GEN
+  end
+  put g_fn_gen nid gen
+  put g_fn_seq nid 0
+  ret FAB_OK
+end
+
+fn fab_entry_generation nid ulong rev ulong to ulong
+  ret or shl get g_fn_gen nid 32 and rev 0xffffffff
+end
+
+fn fab_seal_mids nid ulong dest view uchar 33 dst edit uchar 372 to int
+  smid = new uchar 33 0
+  srec = new uchar 44 0
+  drec = new uchar 44 0
+  fab_node_self nid edit smid
+  if ne aien_mid_encode view smid edit srec 0
+    ret FAB_E_ARG
+  end
+  if ne aien_mid_encode view dest edit drec 0
+    ret FAB_E_ARG
+  end
+  for i ulong 44
+    put dst add 8 i get srec i
+    put dst add 52 i get drec i
+  end
+  ret FAB_OK
+end
+
+fn fab_seal_hdr nk ulong dest view uchar 33 blen ulong now_us ulong dst edit uchar 372 to int
+  nid = div nk 16
+  if ne fab_seal_mids nid view dest edit dst FAB_OK
+    ret FAB_E_ARG
+  end
+  put dst 0 uchar 65
+  put dst 1 uchar 70
+  put dst 2 uchar 65
+  put dst 3 uchar 66
+  put dst 4 uchar 2
+  put dst 5 uchar and rem nk 16 255
+  fab_put_u16 part dst 0 372 6 blen
+  seq = add get g_fn_seq nid 1
+  put g_fn_seq nid seq
+  fab_put_u64 part dst 0 372 96 get g_fn_gen nid
+  fab_put_u64 part dst 0 372 104 seq
+  fab_put_u64 part dst 0 372 112 now_us
+  ret FAB_OK
+end
+
+fn fab_seal_sign nid ulong sglen ulong dst edit uchar 372 to int
+  sig = new uchar 64 0
+  if ne fab_hmac_sign get g_fn_auth_id nid part dst 0 sglen edit sig 0
+    ret FAB_E_AUTH
+  end
+  for i ulong 64
+    put dst add sglen i get sig i
+  end
+  ret int add sglen 64
+end
+
+fn fab_seal nk ulong dest view uchar 33 body view uchar * now_us ulong dst edit uchar 372 to int
+  nid = div nk 16
+  blen = len body
+  if ne fab_body_size rem nk 16 blen
+    ret FAB_E_ARG
+  end
+  gen = get g_fn_gen nid
+  if or eq gen 0 gt gen FAB_GEN_MAX
+    ret FAB_E_GENERATION
+  end
+  if ne fab_seal_hdr nk view dest blen now_us edit dst FAB_OK
+    ret FAB_E_ARG
+  end
+  for i ulong blen bound 188
+    put dst add 120 i get body i
+  end
+  ret fab_seal_sign nid add 120 blen edit dst
+end
+
+fn fab_bcast_one nk ulong idx ulong body view uchar * now_us ulong to int
+  nid = div nk 16
+  smid = new uchar 33 0
+  tmid = new uchar 33 0
+  fab_node_self nid edit smid
+  base = mul add mul nid 16 idx 33
+  for j ulong 33
+    put tmid j get g_fn_roster_id add base j
+  end
+  if ne aien_mid_equal view tmid view smid 0
+    ret FAB_OK
+  end
+  msg = new uchar 372 0
+  mlen = fab_seal nk view tmid view body now_us edit msg
+  if lt mlen 0
+    ret mlen
+  end
+  if ne fab_loop_send view smid view tmid part msg 0 ulong mlen 0
+    ret FAB_E_TRANSPORT
+  end
+  ret FAB_OK
+end
+
+fn fab_broadcast nid ulong kind ulong body view uchar * now_us ulong to int
+  rn = get g_fn_roster_n nid
+  first = FAB_OK
+  nk = add mul nid 16 kind
+  for i ulong rn bound 16
+    rc = fab_bcast_one nk i view body now_us
+    if and ne rc FAB_OK eq first FAB_OK
+      first = rc
+    end
+  end
+  ret first
+end
+
+fn fab_join nid ulong lease_us ulong now_us ulong to int
+  if eq lease_us 0
+    ret FAB_E_ARG
+  end
+  b = new uchar 40 0
+  dg = new uchar 32 0
+  cq_ontology_digest nid edit dg
+  for i ulong 32
+    put b i get dg i
+  end
+  fab_put_u64 part b 0 40 32 lease_us
+  ret fab_broadcast nid FAB_MSG_JOIN part b 0 40 now_us
+end
+
+fn fab_renew nid ulong lease_us ulong now_us ulong to int
+  if eq lease_us 0
+    ret FAB_E_ARG
+  end
+  b = new uchar 8 0
+  fab_put_u64 part b 0 8 0 lease_us
+  ret fab_broadcast nid FAB_MSG_RENEW part b 0 8 now_us
+end
+
+fn fab_leave nid ulong now_us ulong to int
+  b = new uchar 1 0
+  ret fab_broadcast nid FAB_MSG_LEAVE part b 0 0 now_us
+end
+
+fn fab_advertise nid ulong eslot ulong wkind ulong now_us ulong to int
+  rec = new uchar 188 0
+  if ne cq_wire_encode nid eslot wkind edit rec CQ_OK
+    ret FAB_E_CAPQ
+  end
+  ret fab_broadcast nid FAB_MSG_ADVERTISE part rec 0 188 now_us
+end
+
+fn fab_tick nid ulong now_us ulong to int
+  lost = int 0
+  nm = get g_fn_n_members nid
+  mm = new uchar 33 0
+  ev_h = new ulong 4 0
+  ev_t = new ulong 3 0
+  for i ulong nm bound 16
+    mslot = add mul nid 16 i
+    st = get g_fm_state mslot
+    if eq st FAB_ST_JOINED
+      if le get g_fm_lease mslot now_us
+        fab_withdraw_all nid mslot
+        put g_fm_state mslot FAB_ST_LOST
+        mbase = mul mslot 33
+        for j ulong 33
+          put mm j get g_fm_mid add mbase j
+        end
+        put ev_h 0 FAB_EV_LOST
+        put ev_h 1 0
+        put ev_h 2 0
+        put ev_h 3 0
+        put ev_t 0 get g_fm_gen mslot
+        put ev_t 1 get g_fm_last_seq mslot
+        put ev_t 2 now_us
+        fab_log_full nid view ev_h view mm view ev_t
+        lost = add lost 1
+      end
+    end
+  end
+  ret lost
+end
+
+fn fab_lease_for nid ulong req ulong now_us ulong to ulong
+  maxl = get g_fn_max_lease nid
+  lease = req
+  if gt lease maxl
+    lease = maxl
+  end
+  if gt lease sub 0xffffffffffffffff now_us
+    ret 0
+  end
+  ret lease
+end
+
+fn fab_grant nid ulong mslot ulong req ulong now_us ulong to int
+  lease = fab_lease_for nid req now_us
+  if eq lease 0
+    ret FAB_E_FORMAT
+  end
+  mm = new uchar 33 0
+  mbase = mul mslot 33
+  for j ulong 33
+    put mm j get g_fm_mid add mbase j
+  end
+  idx = cq_machine_advertise_id nid view mm add now_us lease
+  if eq idx 0
+    ret FAB_E_FULL
+  end
+  put g_fm_lease mslot add now_us lease
+  put g_fm_index mslot idx
+  ret FAB_OK
+end
+
+fn fab_refuse nid ulong code int capq int mid view uchar 33 ev_t view ulong 3 to int
+  put g_fv_code 0 code
+  put g_fv_capq 0 capq
+  ev_h = new ulong 4 0
+  put ev_h 0 FAB_EV_REFUSED
+  put ev_h 1 fab_i32_to_u32 code
+  put ev_h 2 fab_i32_to_u32 capq
+  put ev_h 3 get g_fv_msg_kind 0
+  fab_log_full nid view ev_h view mid view ev_t
+  ret code
+end
+
+fn fab_rj_check nid ulong msg view uchar * sender view uchar 33 meta view ulong 3 to int
+  midx = fab_member_find nid view sender
+  if ge midx 0
+    mslot = add mul nid 16 ulong midx
+    if ne get g_fm_state mslot FAB_ST_NONE
+      if le get meta 0 get g_fm_gen mslot
+        ret FAB_E_STALE_GEN
+      end
+    end
+  end
+  dg = new uchar 32 0
+  cq_ontology_digest nid edit dg
+  for i ulong 32
+    if ne get dg i get msg add 120 i
+      ret FAB_E_ONTOLOGY
+    end
+  end
+  req = fab_get_u64 view msg 152
+  if eq fab_lease_for nid req get meta 2 0
+    ret FAB_E_FORMAT
+  end
+  if lt midx 0
+    if ge get g_fn_n_members nid 16
+      ret FAB_E_FULL
+    end
+  end
+  if ne fab_window_save nid 1 view sender get meta 0 get meta 1 FAB_OK
+    ret FAB_E_STATE
+  end
+  ret FAB_OK
+end
+
+fn fab_rj_alloc nid ulong sender view uchar 33 to ulong
+  midx = fab_member_find nid view sender
+  if ge midx 0
+    ret add mul nid 16 ulong midx
+  end
+  slot_i = get g_fn_n_members nid
+  put g_fn_n_members nid add slot_i 1
+  mslot = add mul nid 16 slot_i
+  mbase = mul mslot 33
+  for i ulong 33
+    put g_fm_mid add mbase i get sender i
+  end
+  put g_fm_state mslot FAB_ST_NONE
+  put g_fm_index mslot 0
+  put g_fm_gen mslot 0
+  put g_fm_last_seq mslot 0
+  put g_fm_lease mslot 0
+  put g_fm_n_keys mslot 0
+  ret mslot
+end
+
+fn fab_recv_join nid ulong msg view uchar * sender view uchar 33 meta view ulong 3 to int
+  crc = fab_rj_check nid view msg view sender view meta
+  if ne crc FAB_OK
+    ret fab_refuse nid crc 0 view sender view meta
+  end
+  was_new = lt fab_member_find nid view sender 0
+  mslot = fab_rj_alloc nid view sender
+  req = fab_get_u64 view msg 152
+  rc = fab_grant nid mslot req get meta 2
+  if ne rc FAB_OK
+    if was_new
+      put g_fn_n_members nid sub get g_fn_n_members nid 1
+    end
+    ret fab_refuse nid rc 0 view sender view meta
+  end
+  fab_withdraw_all nid mslot
+  put g_fm_n_keys mslot 0
+  put g_fm_state mslot FAB_ST_JOINED
+  put g_fm_gen mslot get meta 0
+  put g_fm_last_seq mslot get meta 1
+  ev_h = new ulong 4 0
+  put ev_h 0 FAB_EV_JOINED
+  put ev_h 1 0
+  put ev_h 2 0
+  put ev_h 3 FAB_MSG_JOIN
+  fab_log_full nid view ev_h view sender view meta
+  put g_fv_code 0 FAB_OK
+  ret FAB_OK
+end
+
+fn fab_member_has_key mslot ulong k view ulong 4 to int
+  for i ulong get g_fm_n_keys mslot bound 64
+    kbase = mul add mul mslot 64 i 4
+    if eq get g_fm_keys kbase get k 0
+      if eq get g_fm_keys add kbase 1 get k 1
+        if eq get g_fm_keys add kbase 2 get k 2
+          if eq get g_fm_keys add kbase 3 get k 3
+            ret 1
+          end
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn fab_ra_precheck mslot ulong body view uchar 188 sender view uchar 33 cq_out edit int 1 to int
+  named = new uchar 33 0
+  f = new ulong 22 0
+  sdig = new uchar 32 0
+  cq = cq_wire_decode view body edit named edit f edit sdig
+  if ne cq CQ_OK
+    put cq_out 0 cq
+    ret FAB_E_CAPQ
+  end
+  if eq aien_mid_equal view named view sender 0
+    ret FAB_E_MISMATCH
+  end
+  k = new ulong 4 0
+  put k 0 get f 0
+  put k 1 get f 1
+  put k 2 get g_fm_index mslot
+  put k 3 get f 3
+  if eq fab_member_has_key mslot view k 0
+    if ge get g_fm_n_keys mslot 64
+      ret FAB_E_FULL
+    end
+  end
+  ret FAB_OK
+end
+
+fn fab_ra_track nid ulong mslot ulong got view ulong 4 to int
+  if ne fab_member_has_key mslot view got 0
+    ret FAB_OK
+  end
+  nk = get g_fm_n_keys mslot
+  if ge nk 64
+    ign = cq_withdraw nid get got 0 get got 1 get got 2 get got 3
+    ret FAB_E_FULL
+  end
+  kbase = mul add mul mslot 64 nk 4
+  for j ulong 4
+    put g_fm_keys add kbase j get got j
+  end
+  put g_fm_n_keys mslot add nk 1
+  ret FAB_OK
+end
+
+fn fab_recv_adv nid ulong mslot ulong msg view uchar * sender view uchar 33 meta view ulong 3 to int
+  body = new uchar 188 0
+  for i ulong 188
+    put body i get msg add 120 i
+  end
+  cq_out = new int 1 0
+  prc = fab_ra_precheck mslot view body view sender edit cq_out
+  if ne prc FAB_OK
+    ret fab_refuse nid prc get cq_out 0 view sender view meta
+  end
+  got = new ulong 4 0
+  cq = cq_wire_apply nid view body edit got
+  if ne cq CQ_OK
+    ret fab_refuse nid FAB_E_CAPQ cq view sender view meta
+  end
+  if ne fab_ra_track nid mslot view got FAB_OK
+    ret fab_refuse nid FAB_E_FULL 0 view sender view meta
+  end
+  put g_fm_last_seq mslot get meta 1
+  ev_h = new ulong 4 0
+  put ev_h 0 FAB_EV_ADVERTISED
+  put ev_h 1 0
+  put ev_h 2 0
+  put ev_h 3 FAB_MSG_ADVERTISE
+  fab_log_full nid view ev_h view sender view meta
+  put g_fv_code 0 FAB_OK
+  ret FAB_OK
+end
+
+fn fab_recv_member nid ulong mslot ulong msg view uchar * sender view uchar 33 meta view ulong 3 to int
+  kind = ulong get msg 5
+  seq = get meta 1
+  now_us = get meta 2
+  ev_h = new ulong 4 0
+  if eq kind FAB_MSG_RENEW
+    req = fab_get_u64 view msg 120
+    if eq fab_lease_for nid req now_us 0
+      ret fab_refuse nid FAB_E_FORMAT 0 view sender view meta
+    end
+    rc = fab_grant nid mslot req now_us
+    if ne rc FAB_OK
+      ret fab_refuse nid rc 0 view sender view meta
+    end
+    put g_fm_last_seq mslot seq
+    put ev_h 0 FAB_EV_RENEWED
+    put ev_h 1 0
+    put ev_h 2 0
+    put ev_h 3 FAB_MSG_RENEW
+    fab_log_full nid view ev_h view sender view meta
+    put g_fv_code 0 FAB_OK
+    ret FAB_OK
+  end
+  if eq kind FAB_MSG_ADVERTISE
+    ret fab_recv_adv nid mslot view msg view sender view meta
+  end
+  if eq kind FAB_MSG_LEAVE
+    fab_withdraw_all nid mslot
+    put g_fm_state mslot FAB_ST_LEFT
+    put g_fm_lease mslot 0
+    ign = cq_machine_advertise_id nid view sender 0
+    put g_fm_last_seq mslot seq
+    put ev_h 0 FAB_EV_LEFT
+    put ev_h 1 0
+    put ev_h 2 0
+    put ev_h 3 FAB_MSG_LEAVE
+    fab_log_full nid view ev_h view sender view meta
+    put g_fv_code 0 FAB_OK
+    ret FAB_OK
+  end
+  ret fab_refuse nid FAB_E_FORMAT 0 view sender view meta
+end
+
+fn fab_recv_check_form msg view uchar * sender edit uchar 33 dest edit uchar 33 to int
+  mlen = len msg
+  if lt mlen 184
+    ret FAB_E_FORMAT
+  end
+  if or ne get msg 0 uchar 65 ne get msg 1 uchar 70
+    ret FAB_E_FORMAT
+  end
+  if or ne get msg 2 uchar 65 ne get msg 3 uchar 66
+    ret FAB_E_FORMAT
+  end
+  if ne get msg 4 uchar 2
+    ret FAB_E_FORMAT
+  end
+  kind = ulong get msg 5
+  blen = fab_get_u16 view msg 6
+  put g_fv_msg_kind 0 kind
+  if or ne fab_body_size kind blen ne mlen add add 120 blen 64
+    ret FAB_E_FORMAT
+  end
+  if or ne fab_mid_decode_off view msg 8 edit sender 0 ne fab_mid_decode_off view msg 52 edit dest 0
+    ret FAB_E_FORMAT
+  end
+  for i ulong 33
+    put g_fv_sender i get sender i
+  end
+  ret FAB_OK
+end
+
+fn fab_recv_verify nid ulong msg view uchar * sender view uchar 33 dest view uchar 33 to int
+  smid = new uchar 33 0
+  fab_node_self nid edit smid
+  if or eq aien_mid_equal view dest view smid 0 ne aien_mid_equal view sender view smid 0
+    ret FAB_E_MISMATCH
+  end
+  if eq fab_on_roster nid view sender 0
+    ret FAB_E_NOT_ENROLLED
+  end
+  sig = new uchar 64 0
+  sglen = sub len msg 64
+  for i ulong 64
+    put sig i get msg add sglen i
+  end
+  if ne fab_hmac_verify get g_fn_auth_id nid view sender part msg 0 sglen view sig 0
+    ret FAB_E_AUTH
+  end
+  ret FAB_OK
+end
+
+fn fab_recv_fresh nid ulong mslot ulong sender view uchar 33 meta view ulong 3 to int
+  if eq get g_fm_state mslot FAB_ST_NONE
+    ret FAB_OK
+  end
+  gen = get meta 0
+  seq = get meta 1
+  mgen = get g_fm_gen mslot
+  if lt gen mgen
+    ret FAB_E_STALE_GEN
+  end
+  if eq gen mgen
+    if le seq get g_fm_last_seq mslot
+      ret FAB_E_REPLAY
+    end
+    if ne fab_window_save nid 1 view sender gen seq FAB_OK
+      ret FAB_E_STATE
+    end
+    put g_fm_last_seq mslot seq
+  end
+  ret FAB_OK
+end
+
+fn fab_recv_dispatch nid ulong msg view uchar * sender view uchar 33 meta view ulong 3 to int
+  midx = fab_member_find nid view sender
+  if ge midx 0
+    mslot = add mul nid 16 ulong midx
+    frc = fab_recv_fresh nid mslot view sender view meta
+    if ne frc FAB_OK
+      ret fab_refuse nid frc 0 view sender view meta
+    end
+  end
+  if eq ulong get msg 5 FAB_MSG_JOIN
+    ret fab_recv_join nid view msg view sender view meta
+  end
+  if lt midx 0
+    ret fab_refuse nid FAB_E_NOT_MEMBER 0 view sender view meta
+  end
+  mslot = add mul nid 16 ulong midx
+  st = get g_fm_state mslot
+  if eq st FAB_ST_NONE
+    ret fab_refuse nid FAB_E_NOT_MEMBER 0 view sender view meta
+  end
+  if eq st FAB_ST_LEFT
+    ret fab_refuse nid FAB_E_NOT_MEMBER 0 view sender view meta
+  end
+  if ne get meta 0 get g_fm_gen mslot
+    ret fab_refuse nid FAB_E_NOT_MEMBER 0 view sender view meta
+  end
+  if eq st FAB_ST_LOST
+    ret fab_refuse nid FAB_E_LEASE_EXPIRED 0 view sender view meta
+  end
+  if le get g_fm_lease mslot get meta 2
+    ret fab_refuse nid FAB_E_LEASE_EXPIRED 0 view sender view meta
+  end
+  ret fab_recv_member nid mslot view msg view sender view meta
+end
+
+fn fab_receive nid ulong msg view uchar * now_us ulong to int
+  put g_fv_code 0 0
+  put g_fv_capq 0 0
+  put g_fv_msg_kind 0 0
+  for i ulong 33
+    put g_fv_sender i uchar 0
+  end
+  ign = fab_tick nid now_us
+  zmid = new uchar 33 0
+  meta = new ulong 3 0
+  put meta 2 now_us
+  sender = new uchar 33 0
+  dest = new uchar 33 0
+  if ne fab_recv_check_form view msg edit sender edit dest FAB_OK
+    ret fab_refuse nid FAB_E_FORMAT 0 view zmid view meta
+  end
+  gen = fab_get_u64 view msg 96
+  seq = fab_get_u64 view msg 104
+  put meta 0 gen
+  put meta 1 seq
+  if or eq gen 0 eq seq 0
+    ret fab_refuse nid FAB_E_FORMAT 0 view sender view meta
+  end
+  if gt gen FAB_GEN_MAX
+    ret fab_refuse nid FAB_E_GENERATION 0 view sender view meta
+  end
+  vrc = fab_recv_verify nid view msg view sender view dest
+  if ne vrc FAB_OK
+    ret fab_refuse nid vrc 0 view sender view meta
+  end
+  ret fab_recv_dispatch nid view msg view sender view meta
+end
+
+fn fab_poll nid ulong now_us ulong to int
+  buf = new uchar 436 0
+  smid = new uchar 33 0
+  fab_node_self nid edit smid
+  got = fab_loop_recv view smid part buf 0 436
+  if lt got 0
+    ret FAB_E_TRANSPORT
+  end
+  if eq got 0
+    ret 0
+  end
+  ign = fab_receive nid part buf 0 ulong got now_us
+  ret 1
+end
+
+fn fab_member_live nid ulong mid view uchar 33 now_us ulong to int
+  midx = fab_member_find nid view mid
+  if lt midx 0
+    ret 0
+  end
+  mslot = add mul nid 16 ulong midx
+  if eq get g_fm_state mslot FAB_ST_JOINED
+    if gt get g_fm_lease mslot now_us
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn fab_home nid ulong mid view uchar 33 now_us ulong loc_out edit ulong 1 mach_out edit uchar 32 to int
+  smid = new uchar 33 0
+  fab_node_self nid edit smid
+  if ne aien_mid_equal view mid view smid 0
+    put loc_out 0 JS_HOME_LOCAL
+  else
+    if ne fab_member_live nid view mid now_us 0
+      put loc_out 0 JS_HOME_REMOTE_OWNED
+    else
+      ret FAB_E_NOT_MEMBER
+    end
+  end
+  aien_mid_to_slot view mid edit mach_out
+  ret FAB_OK
+end
+
+fn fab_sd_member pos ulong mslot ulong to ulong
+  p = pos
+  mbase = mul mslot 33
+  for j ulong 33
+    put sh_dat add p j get g_fm_mid add mbase j
+  end
+  p = add p 33
+  p = fab_sd_u32 p get g_fm_state mslot
+  p = fab_sd_u64 p get g_fm_gen mslot
+  p = fab_sd_u64 p get g_fm_last_seq mslot
+  p = fab_sd_u64 p get g_fm_lease mslot
+  nk = get g_fm_n_keys mslot
+  p = fab_sd_u32 p nk
+  for k ulong nk bound 64
+    kbase = mul add mul mslot 64 k 4
+    p = fab_sd_u32 p get g_fm_keys kbase
+    p = fab_sd_u32 p get g_fm_keys add kbase 1
+    p = fab_sd_u32 p get g_fm_keys add kbase 3
+  end
+  ret p
+end
+
+fn fab_state_digest nid ulong dst edit uchar 32 to void
+  evd = new uchar 32 0
+  elen = get g_fn_ev_len nid
+  ebase = mul nid 32768
+  for i ulong elen bound 32768
+    put sh_dat i get g_fn_ev_buf add ebase i
+  end
+  sh_all elen
+  for i ulong 32
+    put evd i get sh_dig i
+  end
+  for i ulong 13
+    put sh_dat i get t_fab_st_dom i
+  end
+  pos = ulong 13
+  pos = fab_sd_u64 pos get g_fn_n_events nid
+  for i ulong 32
+    put sh_dat add pos i get evd i
+  end
+  pos = add pos 32
+  nm = get g_fn_n_members nid
+  for i ulong nm bound 16
+    pos = fab_sd_member pos add mul nid 16 i
+  end
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end

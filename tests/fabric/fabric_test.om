@@ -1,0 +1,1059 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/fabric/fabric_test.om -- F5-0 exit gate over the loopback transport.
+note Pure seeded OM-2 port of tests/fabric/fabric_test.c.
+note Composed after seed/ng/sha256.om, src/runtime/aien_machine_id.om,
+note src/fabric/fab_hmac.om, src/fabric/fab_loopback.om, and src/fabric/fabric.om.
+
+const FT_MS    ulong 1000
+const FT_LEASE ulong 1000000
+
+text t_rfc_k2  "Jefe"
+text t_rfc_m1  "Hi There"
+text t_rfc_m2  "what do ya want for nothing?"
+text t_rfc_m6  "Test Using Larger Than Block-Size Key - Hash Key First"
+text t_rfc_e1  "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+text t_rfc_e2  "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+text t_rfc_e6  "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+text t_mach_p  "machine-"
+text t_key_p   "fab-key-"
+text t_abc     "abc"
+text t_abd     "abd"
+text t_fail_p  "FAIL check "
+text t_chk_1   "checks "
+text t_chk_2   " (scenario "
+text t_chk_3   " per run), failures "
+text t_tr_p    "transcript "
+text t_st_p    "state_"
+text t_rd_p    "replay_digest "
+text t_pass    "F5_0_FABRIC_LOOPBACK_PASS\n"
+text t_fail    "F5_0_FABRIC_LOOPBACK_FAIL\n"
+
+global g_ft_checks   ulong 1
+global g_ft_failures ulong 1
+global g_ft_out      uchar 512
+global g_ft_olen     ulong 1
+global g_ft_tmpd     uchar 24
+
+note Long buffers for fab_ct_equal test
+global g_ft_long1    uchar 1000001
+global g_ft_long2    uchar 1000001
+
+note House state: 4 machines (A=0, B=1, C=2, D=3)
+global g_h_id        uchar 132
+global g_h_key       uchar 128
+global g_h_own_eslot ulong 6
+
+note Saved store snapshot for test_restart_replay
+global g_keep_rec    uchar 1112
+global g_keep_len    ulong 1
+global g_keep_has    int   1
+global g_keep_saves  ulong 1
+
+note ---- Output & check helpers ----
+
+fn ft_out_c c uchar to void
+  n = get g_ft_olen 0
+  if lt n 512
+    put g_ft_out n c
+    put g_ft_olen 0 add n 1
+  end
+end
+
+fn ft_out_flush fd int to void
+  n = get g_ft_olen 0
+  if gt n 0
+    ign = write fd g_ft_out 0 n
+    put g_ft_olen 0 0
+  end
+end
+
+fn ft_out_u v ulong to void
+  if eq v 0
+    ft_out_c uchar 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put g_ft_tmpd n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+  end
+  while gt n 0 bound 24
+    n = sub n 1
+    ft_out_c get g_ft_tmpd n
+  end
+end
+
+fn ft_out_hex32 b view uchar 32 to void
+  for i ulong 32
+    v = uint get b i
+    ft_out_c get t_mid_hex ulong shr v 4
+    ft_out_c get t_mid_hex ulong and v 15
+  end
+end
+
+fn ft_chk cond bool cid ulong to void
+  put g_ft_checks 0 add get g_ft_checks 0 1
+  if not cond
+    put g_ft_failures 0 add get g_ft_failures 0 1
+    put g_ft_olen 0 0
+    for i ulong 11
+      ft_out_c get t_fail_p i
+    end
+    ft_out_u cid
+    ft_out_c uchar 10
+    ft_out_flush 2
+  end
+end
+
+fn ft_hex_eq b view uchar 32 want view uchar 64 to int
+  for i ulong 32
+    v = uint get b i
+    hi = get t_mid_hex ulong shr v 4
+    lo = get t_mid_hex ulong and v 15
+    if or ne hi get want mul i 2 ne lo get want add mul i 2 1
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn ft_eq32 a view uchar 32 b view uchar 32 to int
+  for i ulong 32
+    if ne get a i get b i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+note ---- House helpers ----
+
+fn ft_get_id idx ulong dst edit uchar 33 to void
+  base = mul idx 33
+  for i ulong 33
+    put dst i get g_h_id add base i
+  end
+end
+
+fn ft_get_key idx ulong dst edit uchar 32 to void
+  base = mul idx 32
+  for i ulong 32
+    put dst i get g_h_key add base i
+  end
+end
+
+fn ft_house_init to void
+  root = new uchar 4096 0
+  mid = new uchar 33 0
+  key = new uchar 32 0
+  pmid = new uchar 33 0
+  pkey = new uchar 32 0
+  cfg = new ulong 6 0
+  for i ulong 4
+    for j ulong 8
+      put root j get t_mach_p j
+    end
+    put root 8 uchar add 65 i
+    rc = aien_mid_derive 1 view root 9 edit mid
+    ft_chk eq rc 0 100
+    base = mul i 33
+    for j ulong 33
+      put g_h_id add base j get mid j
+    end
+    for j ulong 8
+      put sh_dat j get t_key_p j
+    end
+    put sh_dat 8 uchar add 65 i
+    sh_all 9
+    kbase = mul i 32
+    for j ulong 32
+      put g_h_key add kbase j get sh_dig j
+    end
+  end
+  fab_loop_init
+  for i ulong 4
+    ft_get_id i edit mid
+    ft_chk eq fab_loop_add view mid FAB_OK 101
+  end
+  for i ulong 3
+    ft_get_id i edit mid
+    ft_get_key i edit key
+    ft_chk eq cq_catalog_init i view mid CQ_OK 102
+    dom = ulong 17
+    ft_chk and eq cq_op_define i 1 0 dom CQ_OK eq cq_op_define i 2 1 dom CQ_OK 103
+    ft_chk eq fab_hmac_auth_init i view mid view key 65 FAB_E_ARG 104
+    ft_chk eq fab_hmac_auth_init i view mid view key 3 FAB_OK 105
+    for p ulong 3
+      ft_get_id p edit pmid
+      ft_get_key p edit pkey
+      fab_hmac_auth_set_peer i p view pmid view pkey
+      fab_node_set_roster i p view pmid
+    end
+    put cfg 0 3
+    put cfg 1 i
+    put cfg 2 FT_LEASE
+    put cfg 3 1
+    put cfg 4 0
+    put cfg 5 0
+    ft_chk eq fab_node_init i view mid view cfg FAB_OK 106
+  end
+end
+
+fn ft_pump now_us ulong to ulong
+  refused = ulong 0
+  for r ulong 64
+    if eq fab_loop_pending 0
+      break
+    end
+    for i ulong 3
+      cont = int 1
+      while ne cont 0 bound 256
+        got = fab_poll i now_us
+        if eq got 1
+          if ne get g_fv_code 0 FAB_OK
+            refused = add refused 1
+          end
+        else
+          cont = int 0
+        end
+      end
+    end
+  end
+  ret refused
+end
+
+fn ft_deliver nid ulong msg view uchar * now_us ulong to int
+  mid = new uchar 33 0
+  ft_get_id nid edit mid
+  ft_chk eq fab_loop_inject view mid view msg FAB_OK 110
+  ft_chk eq fab_poll nid now_us 1 111
+  ret get g_fv_code 0
+end
+
+fn ft_register_own nid ulong slot ulong cap ulong rev ulong to void
+  f = new ulong 21 0
+  sdig = new uchar 32 0
+  put f 0 cap
+  put f 1 1
+  put f 2 get g_cq_self_m nid
+  put f 3 0
+  put f 4 0
+  put f 5 2
+  put f 6 CQ_SRC_GRAPH
+  put f 7 1
+  put f 8 1
+  put f 9 CQ_LIVE_AVAILABLE
+  put f 10 0
+  put f 11 0
+  put f 12 add 20480 cap
+  put f 13 1
+  put f 14 900000
+  put f 15 900000
+  put f 16 add 10 cap
+  put f 17 100
+  put f 18 50
+  put f 19 0
+  put f 20 fab_entry_generation nid rev
+  ft_chk eq cq_register_arr nid view f view sdig CQ_OK 120
+  es = cq_lookup nid cap 1 get g_cq_self_m nid 0
+  ft_chk ge es 0 121
+  put g_h_own_eslot add mul nid 2 slot ulong es
+end
+
+fn ft_query_one nid ulong eidx ulong now_us ulong q edit ulong 7 to void
+  ebase = mul add mul nid 64 eidx 22
+  if eq get g_cq_e_u64 add ebase 21 0
+    ret
+  end
+  if ne get g_cq_e_u64 add ebase 5 2
+    ret
+  end
+  if ne get g_cq_e_u64 add ebase 9 CQ_LIVE_AVAILABLE
+    ret
+  end
+  self_m = get g_cq_self_m nid
+  mach = get g_cq_e_u64 add ebase 2
+  if ne mach self_m
+    mslot = add mul nid 8 sub mach 1
+    if le get g_cq_m_lease mslot now_us
+      ret
+    end
+  end
+  put q 0 add get q 0 1
+  if eq mach self_m
+    put q 1 add get q 1 1
+  end
+  if eq get g_cq_e_u64 add ebase 6 CQ_SRC_FABRIC
+    put q 2 add get q 2 1
+  end
+  cmid = new uchar 33 0
+  hmid = new uchar 33 0
+  if eq cq_machine_identity nid mach edit cmid CQ_OK
+    for j ulong 3
+      ft_get_id j edit hmid
+      if ne aien_mid_equal view cmid view hmid 0
+        put q add 4 j add get q add 4 j 1
+      end
+    end
+  end
+end
+
+fn ft_query nid ulong now_us ulong req_held ulong q edit ulong 7 to void
+  note q: 0=n, 1=local, 2=fabric, 3=held, 4=fromA, 5=fromB, 6=fromC
+  for i ulong 7
+    put q i 0
+  end
+  if ne req_held 0
+    ret
+  end
+  for i ulong get g_cq_e_n nid bound 64
+    ft_query_one nid i now_us edit q
+  end
+end
+
+fn ft_reseal msg edit uchar 372 mlen ulong kidx ulong to void
+  key = new uchar 32 0
+  sig = new uchar 64 0
+  ft_get_key kidx edit key
+  sglen = sub mlen 64
+  ign = fab_hmac_sig64 view key part msg 0 sglen edit sig
+  for i ulong 64
+    put msg add sglen i get sig i
+  end
+end
+
+note ---- Test 1: HMAC-SHA256 against RFC 4231 ----
+
+fn ft_test_hmac to void
+  for i ulong 1000001 bound 1000002
+    put g_ft_long1 i uchar 0
+    put g_ft_long2 i uchar 0
+  end
+  acc1 = ulong 0
+  for i ulong 1000001 bound 1000002
+    acc1 = or acc1 xor ulong get g_ft_long1 i ulong get g_ft_long2 i
+  end
+  ft_chk eq acc1 0 1
+  put g_ft_long2 1000000 uchar 1
+  acc2 = ulong 0
+  for i ulong 1000001 bound 1000002
+    acc2 = or acc2 xor ulong get g_ft_long1 i ulong get g_ft_long2 i
+  end
+  ft_chk ne acc2 0 2
+  ft_test_hmac_vecs
+end
+
+fn ft_test_hmac_v1 to void
+  k1 = new uchar 20 11
+  m1 = new uchar 8 0
+  t = new uchar 32 0
+  e1 = new uchar 64 0
+  for i ulong 8
+    put m1 i get t_rfc_m1 i
+  end
+  for i ulong 64
+    put e1 i get t_rfc_e1 i
+  end
+  ign = fab_hmac_sha256 part k1 0 20 part m1 0 8 edit t
+  ft_chk ne ft_hex_eq view t view e1 0 3
+end
+
+fn ft_test_hmac_v2 to void
+  k2 = new uchar 4 0
+  m2 = new uchar 28 0
+  t = new uchar 32 0
+  e2 = new uchar 64 0
+  for i ulong 4
+    put k2 i get t_rfc_k2 i
+  end
+  for i ulong 28
+    put m2 i get t_rfc_m2 i
+  end
+  for i ulong 64
+    put e2 i get t_rfc_e2 i
+  end
+  ign = fab_hmac_sha256 part k2 0 4 part m2 0 28 edit t
+  ft_chk ne ft_hex_eq view t view e2 0 4
+end
+
+fn ft_test_hmac_v6 to void
+  k6 = new uchar 131 170
+  m6 = new uchar 54 0
+  t = new uchar 32 0
+  e6 = new uchar 64 0
+  for i ulong 54
+    put m6 i get t_rfc_m6 i
+  end
+  for i ulong 64
+    put e6 i get t_rfc_e6 i
+  end
+  ign = fab_hmac_sha256 part k6 0 131 part m6 0 54 edit t
+  ft_chk ne ft_hex_eq view t view e6 0 5
+end
+
+fn ft_test_hmac_vecs to void
+  ft_test_hmac_v1
+  ft_test_hmac_v2
+  ft_test_hmac_v6
+end
+
+note ---- Test 2: 64-byte signature field (Lane 19) ----
+
+fn ft_test_sig64_halves to void
+  ka = new uchar 32 0
+  kb = new uchar 32 0
+  ft_get_key 0 edit ka
+  ft_get_key 1 edit kb
+  abc = new uchar 3 0
+  for i ulong 3
+    put abc i get t_abc i
+  end
+  s = new uchar 64 0
+  s2 = new uchar 64 0
+  hm = new uchar 32 0
+  ign = fab_hmac_sig64 view ka part abc 0 3 edit s
+  ign = fab_hmac_sha256 part ka 0 32 part abc 0 3 edit hm
+  ft_chk ne fab_ct_equal part s 0 32 part hm 0 32 32 0 20
+  for i ulong 32
+    put hm i get s add 32 i
+  end
+  ft_chk eq fab_ct_equal part s 0 32 part hm 0 32 32 0 21
+  ign = fab_hmac_sig64 view kb part abc 0 3 edit s2
+  ft_chk eq fab_ct_equal part s 32 32 part s2 32 32 32 0 22
+  put abc 2 uchar 100
+  ign = fab_hmac_sig64 view ka part abc 0 3 edit s2
+  ft_chk eq fab_ct_equal part s 32 32 part s2 32 32 32 0 23
+end
+
+fn ft_seal_join_b0 dst edit uchar 372 to int
+  jb = new uchar 40 0
+  dg = new uchar 32 0
+  midb = new uchar 33 0
+  cq_ontology_digest 0 edit dg
+  for i ulong 32
+    put jb i get dg i
+  end
+  fab_put_u64 part jb 0 40 32 FT_LEASE
+  ft_get_id 1 edit midb
+  ret fab_seal FAB_MSG_JOIN view midb part jb 0 40 0 edit dst
+end
+
+fn ft_test_sig64 to void
+  ft_house_init
+  ft_test_sig64_halves
+  ka = new uchar 32 0
+  ft_get_key 0 edit ka
+  hm = new uchar 32 0
+  mida = new uchar 33 0
+  ft_get_id 0 edit mida
+  m = new uchar 372 0
+  tmp = new uchar 372 0
+  ml = ft_seal_join_b0 edit m
+  ft_chk eq ml 224 24
+  auth_cnt = ulong 0
+  for i ulong 64
+    for j ulong 224
+      put tmp j get m j
+    end
+    pos = add 160 i
+    put tmp pos uchar xor ulong get tmp pos 1
+    if eq ft_deliver 1 part tmp 0 224 0 FAB_E_AUTH
+      auth_cnt = add auth_cnt 1
+    end
+  end
+  ft_chk eq auth_cnt 64 25
+  ft_chk eq ft_deliver 1 part m 0 192 0 FAB_E_FORMAT 26
+  for j ulong 160
+    put tmp j get m j
+  end
+  put tmp 4 uchar 1
+  ign = fab_hmac_sha256 part ka 0 32 part tmp 0 160 edit hm
+  for j ulong 32
+    put tmp add 160 j get hm j
+  end
+  ft_chk eq ft_deliver 1 part tmp 0 192 0 FAB_E_FORMAT 27
+  for j ulong 224
+    put tmp j get m j
+  end
+  put tmp 4 uchar 1
+  ft_reseal edit tmp 224 0
+  ft_chk eq ft_deliver 1 part tmp 0 224 0 FAB_E_FORMAT 28
+  ft_chk eq ft_deliver 1 part m 0 224 0 FAB_OK 29
+  ft_chk ne fab_member_live 1 view mida 0 0 30
+end
+
+note ---- Test 3: generation width (Lane 32) ----
+
+fn ft_test_gen_width_wire to void
+  midc = new uchar 33 0
+  ft_get_id 2 edit midc
+  wide = new ulong 2 0
+  put wide 0 4294967296
+  put wide 1 4294967297
+  for i ulong 3
+    ft_chk eq fab_join i FT_LEASE 0 FAB_OK 45
+  end
+  m = new uchar 372 0
+  ml = fab_loop_peek 0 view midc FAB_MSG_JOIN edit m
+  ft_chk eq ml 224 46
+  ft_chk eq ft_pump 0 0 47
+  for w ulong 2
+    wv = get wide w
+    fab_put_u64 part m 0 372 96 wv
+    fab_put_u64 part m 0 372 104 add 100 w
+    ft_reseal edit m ml 2
+    ft_chk eq ft_deliver 0 part m 0 ml FT_MS FAB_E_GENERATION 48
+    cidx = fab_member_find 0 view midc
+    ft_chk ge cidx 0 49
+    mslot = ulong cidx
+    ft_chk and eq get g_fm_gen mslot 1 eq get g_fm_state mslot FAB_ST_JOINED 50
+  end
+  ft_chk eq fab_node_set_generation 0 FAB_GEN_MAX FAB_OK 51
+  ft_chk eq fab_entry_generation 0 7 or shl FAB_GEN_MAX 32 7 52
+end
+
+fn ft_test_gen_width to void
+  ft_house_init
+  mida = new uchar 33 0
+  ft_get_id 0 edit mida
+  cfg = new ulong 6 0
+  wide = new ulong 2 0
+  put wide 0 4294967296
+  put wide 1 4294967297
+  for w ulong 2
+    wv = get wide w
+    ft_chk eq fab_node_set_generation 0 wv FAB_E_GENERATION 40
+    ft_chk eq get g_fn_gen 0 1 41
+    ft_chk eq cq_catalog_init 3 view mida CQ_OK 42
+    put cfg 0 3
+    put cfg 1 0
+    put cfg 2 FT_LEASE
+    put cfg 3 wv
+    put cfg 4 0
+    put cfg 5 0
+    ft_chk eq fab_node_init 3 view mida view cfg FAB_E_GENERATION 43
+  end
+  ft_chk eq fab_entry_generation 0 7 4294967303 44
+  ft_test_gen_width_wire
+end
+
+note ---- Test 4: replay window survives restart (Lane 32) ----
+
+fn ft_restart nid ulong smode ulong sfresh ulong to int
+  mid = new uchar 33 0
+  pmid = new uchar 33 0
+  ft_get_id nid edit mid
+  ft_chk eq cq_catalog_init nid view mid CQ_OK 60
+  dom = ulong 17
+  ft_chk and eq cq_op_define nid 1 0 dom CQ_OK eq cq_op_define nid 2 1 dom CQ_OK 61
+  for p ulong 3
+    ft_get_id p edit pmid
+    fab_node_set_roster nid p view pmid
+  end
+  cfg = new ulong 6 0
+  put cfg 0 3
+  put cfg 1 nid
+  put cfg 2 FT_LEASE
+  put cfg 3 1
+  put cfg 4 smode
+  put cfg 5 sfresh
+  ret fab_node_init nid view mid view cfg
+end
+
+fn ft_seq_of nid ulong peer ulong to ulong
+  pmid = new uchar 33 0
+  ft_get_id peer edit pmid
+  idx = fab_member_find nid view pmid
+  if lt idx 0
+    ret 0xffffffffffffffff
+  end
+  ret get g_fm_last_seq add mul nid 16 ulong idx
+end
+
+fn ft_store_snap to void
+  put g_keep_len 0 get g_st_len 0
+  put g_keep_has 0 get g_st_has 0
+  put g_keep_saves 0 get g_st_saves 0
+  for i ulong 1112
+    put g_keep_rec i get g_st_rec i
+  end
+end
+
+fn ft_store_restore to void
+  put g_st_len 0 get g_keep_len 0
+  put g_st_has 0 get g_keep_has 0
+  put g_st_saves 0 get g_keep_saves 0
+  put g_st_fail_save 0 0
+  put g_st_fail_load 0 0
+  for i ulong 1112
+    put g_st_rec i get g_keep_rec i
+  end
+end
+
+fn ft_test_restart_fail_closed to void
+  mida = new uchar 33 0
+  midb = new uchar 33 0
+  ft_get_id 0 edit mida
+  ft_get_id 1 edit midb
+  ft_store_snap
+  klen = get g_keep_len 0
+  ft_chk eq cq_catalog_init 3 view mida CQ_OK 80
+  cfg = new ulong 6 0
+  put cfg 0 3
+  put cfg 1 0
+  put cfg 2 FT_LEASE
+  put cfg 3 3
+  put cfg 4 1
+  put cfg 5 0
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_OK 81
+  put cfg 5 1
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_E_STATE 82
+  put cfg 5 0
+  put g_st_has 0 0
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_E_STATE 83
+  ft_store_restore
+  put g_st_fail_load 0 1
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_E_STATE 84
+  ft_store_restore
+  pos = ulong 0
+  while lt pos klen bound 1200
+    orig = get g_st_rec pos
+    put g_st_rec pos uchar xor ulong orig 1
+    ft_chk eq fab_node_init 3 view mida view cfg FAB_E_STATE 85
+    put g_st_rec pos orig
+    pos = add pos 13
+  end
+  put g_st_len 0 sub klen 1
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_E_STATE 86
+  put g_st_len 0 add klen 1
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_E_STATE 87
+  ft_store_restore
+  ft_chk eq cq_catalog_init 3 view midb CQ_OK 88
+  put cfg 1 1
+  ft_chk eq fab_node_init 3 view midb view cfg FAB_E_STATE 89
+  ft_chk eq cq_catalog_init 3 view mida CQ_OK 90
+  put cfg 1 0
+  put cfg 4 2
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_E_ARG 91
+  put cfg 4 0
+  put cfg 5 1
+  ft_chk eq fab_node_init 3 view mida view cfg FAB_E_ARG 92
+  same = int 1
+  if ne get g_st_len 0 klen
+    same = int 0
+  else
+    for i ulong klen bound 1112
+      if ne get g_st_rec i get g_keep_rec i
+        same = int 0
+      end
+    end
+  end
+  ft_chk ne same 0 93
+end
+
+fn ft_test_restart_part2 join_c view uchar 372 jlen ulong to void
+  renew_c2 = new uchar 372 0
+  midc = new uchar 33 0
+  ft_get_id 2 edit midc
+  ft_chk eq fab_node_set_generation 2 2 FAB_OK 78
+  ft_chk eq fab_join 2 FT_LEASE mul 300 FT_MS FAB_OK 79
+  ft_chk eq ft_pump mul 300 FT_MS 0 790
+  cidx = fab_member_find 0 view midc
+  ft_chk ge cidx 0 791
+  ft_chk eq get g_fm_state ulong cidx FAB_ST_JOINED 791
+  ft_chk eq get g_fm_gen ulong cidx 2 791
+  ft_chk ne fab_member_live 0 view midc mul 300 FT_MS 0 792
+  ft_chk eq ft_deliver 0 part join_c 0 jlen mul 300 FT_MS FAB_E_STALE_GEN 793
+  ft_chk eq fab_renew 2 FT_LEASE mul 400 FT_MS FAB_OK 794
+  r2len = fab_loop_peek 0 view midc FAB_MSG_RENEW edit renew_c2
+  ft_chk gt r2len 0 795
+  before = ft_seq_of 0 2
+  put g_st_fail_save 0 1
+  ft_chk eq ft_pump mul 400 FT_MS 1 796
+  ft_chk eq ft_seq_of 0 2 before 797
+  put g_st_fail_save 0 0
+  ft_chk eq ft_deliver 0 part renew_c2 0 r2len mul 400 FT_MS FAB_OK 798
+  ft_chk eq ft_deliver 0 part renew_c2 0 r2len mul 400 FT_MS FAB_E_REPLAY 799
+  ft_chk eq ft_restart 0 1 0 FAB_OK 800
+  cidx = fab_member_find 0 view midc
+  ft_chk ge cidx 0 801
+  ft_chk eq get g_fm_gen ulong cidx 2 801
+  ft_chk eq get g_fm_state ulong cidx FAB_ST_LOST 801
+  ft_chk eq ft_deliver 0 part renew_c2 0 r2len mul 500 FT_MS FAB_E_REPLAY 802
+  ft_test_restart_fail_closed
+end
+
+fn ft_test_restart_replay to void
+  fab_store_reset
+  ft_house_init
+  ft_chk eq ft_restart 0 1 1 FAB_OK 62
+  ft_chk ne get g_st_has 0 0 63
+  join_c = new uchar 372 0
+  renew_c = new uchar 372 0
+  midc = new uchar 33 0
+  ft_get_id 2 edit midc
+  for i ulong 3
+    ft_chk eq fab_join i FT_LEASE 0 FAB_OK 64
+  end
+  jlen = fab_loop_peek 0 view midc FAB_MSG_JOIN edit join_c
+  ft_chk eq ft_pump 0 0 65
+  ft_chk eq fab_renew 2 FT_LEASE mul 100 FT_MS FAB_OK 66
+  rlen = fab_loop_peek 0 view midc FAB_MSG_RENEW edit renew_c
+  ft_chk and gt jlen 0 gt rlen 0 67
+  ft_chk eq ft_pump mul 100 FT_MS 0 68
+  cidx = fab_member_find 0 view midc
+  ft_chk ge cidx 0 69
+  cseq = get g_fm_last_seq ulong cidx
+  ft_chk eq get g_fm_state ulong cidx FAB_ST_JOINED 70
+  ft_chk eq get g_fm_gen ulong cidx 1 70
+  ft_chk ge cseq 2 70
+  ft_chk eq ft_restart 0 1 0 FAB_OK 71
+  ft_chk eq fab_node_set_generation 0 2 FAB_OK 72
+  cidx = fab_member_find 0 view midc
+  ft_chk ge cidx 0 73
+  ft_chk eq get g_fm_state ulong cidx FAB_ST_LOST 74
+  ft_chk eq get g_fm_gen ulong cidx 1 74
+  ft_chk eq get g_fm_last_seq ulong cidx cseq 74
+  ft_chk eq ft_deliver 0 part join_c 0 jlen mul 200 FT_MS FAB_E_REPLAY 75
+  ft_chk eq ft_deliver 0 part renew_c 0 rlen mul 200 FT_MS FAB_E_REPLAY 76
+  ft_chk eq fab_member_live 0 view midc mul 200 FT_MS 0 77
+  ft_test_restart_part2 view join_c jlen
+end
+
+note ---- Test 5: Main deterministic scenario ----
+
+fn ft_scen_neg_mismatch t1 ulong to void
+  m = new uchar 372 0
+  mida = new uchar 33 0
+  ft_get_id 0 edit mida
+  crec = new uchar 188 0
+  ft_chk eq cq_wire_encode 2 get g_h_own_eslot 4 CQ_WIRE_ADVERTISE edit crec CQ_OK 254
+  ml = fab_seal add 16 FAB_MSG_ADVERTISE view mida part crec 0 188 t1 edit m
+  ft_chk gt ml 0 255
+  ft_chk eq ft_deliver 0 part m 0 ulong ml t1 FAB_E_MISMATCH 256
+  rb = new uchar 8 0
+  fab_put_u64 part rb 0 8 0 FT_LEASE
+  ml = fab_seal add 16 FAB_MSG_RENEW view mida part rb 0 8 t1 edit m
+  ft_chk gt ml 0 257
+  ft_chk eq ft_deliver 2 part m 0 ulong ml t1 FAB_E_MISMATCH 258
+  ft_chk eq ft_deliver 0 part m 0 ulong ml t1 FAB_OK 259
+end
+
+fn ft_scen_negatives adv_b view uchar 372 adv_b_len ulong t1 ulong to void
+  m = new uchar 372 0
+  midd = new uchar 33 0
+  ft_get_id 3 edit midd
+  ft_chk eq ft_deliver 0 part adv_b 0 adv_b_len t1 FAB_E_REPLAY 250
+  for i ulong adv_b_len bound 372
+    put m i get adv_b i
+  end
+  fab_put_u64 part m 0 372 104 1000000
+  ft_reseal edit m adv_b_len 2
+  ft_chk eq ft_deliver 0 part m 0 adv_b_len t1 FAB_E_AUTH 251
+  for i ulong adv_b_len bound 372
+    put m i get adv_b i
+  end
+  fab_put_u64 part m 0 372 104 1000000
+  ft_reseal edit m adv_b_len 1
+  put m 260 uchar xor ulong get m 260 1
+  ft_chk eq ft_deliver 0 part m 0 adv_b_len t1 FAB_E_AUTH 252
+  for i ulong adv_b_len bound 372
+    put m i get adv_b i
+  end
+  drec = new uchar 44 0
+  ign = aien_mid_encode view midd edit drec
+  for i ulong 44
+    put m add 8 i get drec i
+  end
+  ft_reseal edit m adv_b_len 3
+  ft_chk eq ft_deliver 0 part m 0 adv_b_len t1 FAB_E_NOT_ENROLLED 253
+  ft_scen_neg_mismatch t1
+end
+
+fn ft_scen_tail_max to void
+  mida = new uchar 33 0
+  midc = new uchar 33 0
+  ft_get_id 0 edit mida
+  ft_get_id 2 edit midc
+  tmax = sub ulong 0xffffffffffffffff 10
+  ft_chk eq fab_node_set_generation 2 3 FAB_OK 276
+  rm = new uchar 372 0
+  jb = new uchar 40 0
+  ft_chk eq fab_seal add 32 FAB_MSG_JOIN view mida part jb 0 0 tmax edit rm FAB_E_ARG 277
+  dg = new uchar 32 0
+  cq_ontology_digest 2 edit dg
+  for i ulong 32
+    put jb i get dg i
+  end
+  fab_put_u64 part jb 0 40 32 FT_LEASE
+  rl = fab_seal add 32 FAB_MSG_JOIN view mida part jb 0 40 tmax edit rm
+  ft_chk gt rl 0 278
+  cidx = fab_member_find 0 view midc
+  ft_chk eq ft_deliver 0 part rm 0 ulong rl tmax FAB_E_FORMAT 279
+  ft_chk eq get g_fm_gen ulong cidx 2 279
+end
+
+fn ft_scen_tail t1 ulong to void
+  mida = new uchar 33 0
+  midb = new uchar 33 0
+  ft_get_id 0 edit mida
+  ft_get_id 1 edit midb
+  q = new ulong 7 0
+  ft_query 0 t1 0 edit q
+  ft_chk and eq get q 0 4 and eq get q 5 2 and eq get q 6 1 eq get q 3 0 260
+  ft_register_own 1 1 202 2
+  ft_chk eq fab_advertise 1 get g_h_own_eslot 3 CQ_WIRE_WITHDRAW t1 FAB_OK 261
+  ft_chk eq ft_pump t1 0 262
+  ft_query 0 t1 0 edit q
+  ft_chk eq get q 5 1 263
+  zb = new uchar 8 0
+  rm = new uchar 372 0
+  rl = fab_seal add 16 FAB_MSG_RENEW view mida part zb 0 8 t1 edit rm
+  ft_chk gt rl 0 264
+  ft_chk eq ft_deliver 0 part rm 0 ulong rl t1 FAB_E_FORMAT 265
+  ft_chk eq ft_deliver 0 part rm 0 ulong rl t1 FAB_E_REPLAY 266
+  ft_chk eq fab_leave 1 add t1 FT_MS FAB_OK 267
+  ft_chk eq ft_pump add t1 FT_MS 0 268
+  bidx = fab_member_find 0 view midb
+  ft_chk and ge bidx 0 eq get g_fm_state ulong bidx FAB_ST_LEFT 269
+  ft_query 0 add t1 FT_MS 0 edit q
+  ft_chk eq get q 5 0 270
+  ft_chk eq fab_renew 1 FT_LEASE add t1 mul 2 FT_MS FAB_OK 271
+  ign = ft_pump add t1 mul 2 FT_MS
+  ft_chk eq get g_fn_counts 9 1 272
+  stale0 = get g_fn_counts 6
+  ft_chk eq fab_join 1 FT_LEASE add t1 mul 3 FT_MS FAB_OK 273
+  ign = ft_pump add t1 mul 3 FT_MS
+  ft_chk eq get g_fn_counts 6 add stale0 1 274
+  ft_chk eq get g_fm_state ulong bidx FAB_ST_LEFT 275
+  ft_scen_tail_max
+end
+
+fn ft_scen_rejoin_c join_c1 view uchar 372 join_c1_len ulong t1 ulong cidx int to void
+  midc = new uchar 33 0
+  ft_get_id 2 edit midc
+  q = new ulong 7 0
+  fab_loop_silence view midc 0
+  ft_chk eq fab_renew 2 FT_LEASE t1 FAB_OK 228
+  tmp = new uchar 372 0
+  ft_chk gt fab_loop_peek 0 view midc FAB_MSG_RENEW edit tmp 0 229
+  ign = ft_pump t1
+  ft_chk and eq get g_fn_counts 8 1 eq get g_fn_counts 24 1 230
+  ft_chk eq fab_advertise 2 get g_h_own_eslot 4 CQ_WIRE_ADVERTISE t1 FAB_OK 231
+  ign = ft_pump t1
+  ft_chk eq get g_fn_counts 8 2 232
+  ft_query 0 t1 0 edit q
+  ft_chk eq get q 6 0 233
+  ft_chk eq fab_node_set_generation 2 1 FAB_E_STALE_GEN 234
+  ft_chk eq fab_node_set_generation 2 2 FAB_OK 235
+  ft_chk eq fab_join 2 FT_LEASE t1 FAB_OK 236
+  ft_chk eq ft_pump t1 0 237
+  ft_chk ne fab_member_live 0 view midc t1 0 238
+  ft_chk eq ft_deliver 0 part join_c1 0 join_c1_len t1 FAB_E_STALE_GEN 239
+  ft_chk eq get g_fm_gen ulong cidx 2 240
+  ft_register_own 2 0 301 1
+  ft_chk eq fab_advertise 2 get g_h_own_eslot 4 CQ_WIRE_ADVERTISE t1 FAB_OK 241
+  ft_chk eq ft_pump t1 0 242
+  ft_query 0 t1 0 edit q
+  ft_chk eq get q 6 1 243
+end
+
+fn ft_scen_check_homes t1 ulong to void
+  mid = new uchar 33 0
+  loc = new ulong 1 0
+  hmach = new uchar 32 0
+  ft_get_id 2 edit mid
+  ft_chk eq fab_home 0 view mid t1 edit loc edit hmach FAB_E_NOT_MEMBER 223
+  ft_get_id 1 edit mid
+  ft_chk eq fab_home 0 view mid t1 edit loc edit hmach FAB_OK 224
+  ft_chk eq get loc 0 JS_HOME_REMOTE_OWNED 224
+  ft_chk ne fab_ct_equal part hmach 0 32 part mid 1 32 32 0 225
+  ft_get_id 0 edit mid
+  ft_chk eq fab_home 0 view mid t1 edit loc edit hmach FAB_OK 226
+  ft_chk eq get loc 0 JS_HOME_LOCAL 226
+end
+
+fn ft_scen_loss_rejoin join_c1 view uchar 372 join_c1_len ulong t1 ulong to void
+  mid = new uchar 33 0
+  q = new ulong 7 0
+  ft_chk and eq fab_tick 0 t1 1 eq fab_tick 1 t1 1 218
+  ft_get_id 2 edit mid
+  cidx = fab_member_find 0 view mid
+  ft_chk ge cidx 0 219
+  ft_chk eq get g_fm_state ulong cidx FAB_ST_LOST 219
+  cm_a = cq_m_find 0 view mid
+  es_c = cq_lookup 0 301 1 cm_a 0
+  ft_chk ge es_c 0 221
+  eidx = add mul ulong es_c 22 9
+  ft_chk eq get g_cq_e_u64 eidx CQ_LIVE_WITHDRAWN 221
+  ft_get_id 1 edit mid
+  ft_chk ne fab_member_live 0 view mid t1 0 220
+  ft_query 0 t1 0 edit q
+  ft_chk eq get q 0 3 222
+  ft_chk eq get q 6 0 222
+  ft_chk eq get q 5 2 222
+  ft_scen_check_homes t1
+  ft_query 2 t1 0 edit q
+  ft_chk eq get q 1 1 227
+  ft_scen_rejoin_c view join_c1 join_c1_len t1 cidx
+end
+
+fn ft_scenario_digests out_d edit uchar 128 to void
+  d = new uchar 32 0
+  fab_loop_transcript edit d
+  for i ulong 32
+    put out_d i get d i
+  end
+  for i ulong 3
+    fab_state_digest i edit d
+    base = mul add 1 i 32
+    for j ulong 32
+      put out_d add base j get d j
+    end
+  end
+end
+
+fn ft_scenario out_d edit uchar 128 to void
+  ft_house_init
+  join_c1 = new uchar 372 0
+  adv_b = new uchar 372 0
+  midb = new uchar 33 0
+  midc = new uchar 33 0
+  p = new uchar 33 0
+  ft_get_id 1 edit midb
+  ft_get_id 2 edit midc
+  for i ulong 3
+    ft_chk eq fab_join i FT_LEASE 0 FAB_OK 200
+  end
+  join_c1_len = fab_loop_peek 0 view midc FAB_MSG_JOIN edit join_c1
+  ft_chk eq join_c1_len 224 201
+  ft_chk eq ft_pump 0 0 202
+  for i ulong 3
+    for j ulong 3
+      if ne i j
+        ft_get_id j edit p
+        ft_chk ne fab_member_live i view p 0 0 203
+      end
+    end
+  end
+  ft_register_own 0 0 101 1
+  ft_register_own 1 0 201 1
+  ft_register_own 1 1 202 1
+  ft_register_own 2 0 301 1
+  t10 = mul 10 FT_MS
+  ft_chk eq fab_advertise 0 get g_h_own_eslot 0 CQ_WIRE_ADVERTISE t10 FAB_OK 204
+  ft_chk eq fab_advertise 1 get g_h_own_eslot 2 CQ_WIRE_ADVERTISE t10 FAB_OK 205
+  adv_b_len = fab_loop_peek 0 view midb FAB_MSG_ADVERTISE edit adv_b
+  ft_chk eq adv_b_len 372 206
+  ft_chk eq fab_advertise 1 get g_h_own_eslot 3 CQ_WIRE_ADVERTISE t10 FAB_OK 207
+  ft_chk eq fab_advertise 2 get g_h_own_eslot 4 CQ_WIRE_ADVERTISE t10 FAB_OK 208
+  ft_chk eq ft_pump t10 0 209
+  q = new ulong 7 0
+  ft_query 0 t10 0 edit q
+  ft_chk eq get q 0 4 210
+  ft_chk eq get q 1 1 210
+  ft_chk eq get q 2 3 210
+  ft_chk eq get q 5 2 210
+  ft_chk eq get q 6 1 210
+  ft_chk eq get q 3 0 211
+  ft_query 0 t10 1 edit q
+  ft_chk eq get q 0 0 212
+  ft_query 2 t10 0 edit q
+  ft_chk eq get q 0 4 213
+  ft_chk eq get q 4 1 213
+  ft_chk eq get q 5 2 213
+  fab_loop_silence view midc 1
+  t500 = mul 500 FT_MS
+  ft_chk eq fab_renew 0 FT_LEASE t500 FAB_OK 214
+  ft_chk eq fab_renew 1 FT_LEASE t500 FAB_OK 215
+  ft_chk eq fab_renew 2 FT_LEASE t500 FAB_OK 216
+  ft_chk eq ft_pump t500 0 217
+  t1 = mul 1200 FT_MS
+  ft_scen_loss_rejoin view join_c1 join_c1_len t1
+  ft_scen_negatives view adv_b adv_b_len t1
+  ft_scen_tail t1
+  ft_scenario_digests edit out_d
+end
+
+fn ft_print_summary first_checks ulong r1 view uchar 128 all view uchar 32 to void
+  put g_ft_olen 0 0
+  for i ulong 7
+    ft_out_c get t_chk_1 i
+  end
+  ft_out_u get g_ft_checks 0
+  for i ulong 11
+    ft_out_c get t_chk_2 i
+  end
+  ft_out_u first_checks
+  for i ulong 20
+    ft_out_c get t_chk_3 i
+  end
+  ft_out_u get g_ft_failures 0
+  ft_out_c uchar 10
+  ft_out_flush 1
+  d = new uchar 32 0
+  for i ulong 32
+    put d i get r1 i
+  end
+  for i ulong 11
+    ft_out_c get t_tr_p i
+  end
+  ft_out_hex32 view d
+  ft_out_c uchar 10
+  ft_out_flush 1
+  for k ulong 3
+    base = mul add 1 k 32
+    for i ulong 32
+      put d i get r1 add base i
+    end
+    for i ulong 6
+      ft_out_c get t_st_p i
+    end
+    ft_out_c uchar add 65 k
+    ft_out_c uchar 32
+    ft_out_hex32 view d
+    ft_out_c uchar 10
+    ft_out_flush 1
+  end
+  for i ulong 14
+    ft_out_c get t_rd_p i
+  end
+  ft_out_hex32 view all
+  ft_out_c uchar 10
+  ft_out_flush 1
+  if eq get g_ft_failures 0 0
+    ign = write 1 t_pass 0 len t_pass
+  else
+    ign = write 1 t_fail 0 len t_fail
+  end
+end
+
+fn main to int
+  ft_test_hmac
+  ft_test_sig64
+  ft_test_gen_width
+  ft_test_restart_replay
+  r1 = new uchar 128 0
+  r2 = new uchar 128 0
+  ft_scenario edit r1
+  first_checks = get g_ft_checks 0
+  ft_scenario edit r2
+  ft_chk ne fab_ct_equal part r1 0 128 part r2 0 128 128 0 300
+  for i ulong 128
+    put sh_dat i get r1 i
+  end
+  sh_all 128
+  all = new uchar 32 0
+  for i ulong 32
+    put all i get sh_dig i
+  end
+  ft_print_summary first_checks view r1 view all
+  if ne get g_ft_failures 0 0
+    ret 1
+  end
+  ret 0
+end
