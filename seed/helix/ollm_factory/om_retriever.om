@@ -1,0 +1,767 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/ollm_factory/om_retriever.om:
+note Zero-Weight In-Context Verified Idiom Retriever (Pure Seeded OM-2).
+note Indexes NUL-delimited verified zero-leakage OM-2 corpora by structural
+note signature shape (1..5), algorithmic primitive tags, word overlap, and
+note character trigrams. Prepends top-K structurally closest verified idioms
+note within a byte budget before the query prompt in sub-millisecond time.
+note
+note Usage:
+note   om_retriever retrieve CORPUS_OM PROMPT_FILE TOP_K MAX_BYTES OUT_PROMPT
+note   om_retriever selfcheck
+
+global rCorp uchar *
+global rPrm uchar *
+global rOut uchar 16384
+global rPath uchar 4096
+global rQTok ulong 64
+global rQTri ulong 256
+global rTopOff ulong 8
+global rTopLen ulong 8
+global rTopSc ulong 8
+global rSt ulong 16
+
+text tModeRet "retrieve"
+text tModeSelf "selfcheck"
+text tUsage "usage: om_retriever retrieve CORPUS PROMPT TOP_K MAX_BYTES OUT | selfcheck\n"
+text tErrIo "om_retriever: I/O error\n"
+text tRetA "RETRIEVE top_k="
+text tRetB " corpus_records="
+text tRetC " kept="
+text tRetD " best_score="
+text tRetE " bytes="
+text tSelfOk "OM_RETRIEVER SELFCHECK PASS records=4 top1_matched=1 exact_excluded=1 budget_ok=1\n"
+text tSelfFail "OM_RETRIEVER SELFCHECK FAIL\n"
+text tNl "\n"
+
+text tSelfCorp "note return sum of squares of a and b\nfn s1 a ulong b ulong to ulong\nret add mul a a mul b b\nend\n|note return bit population count of a\nfn s2 a ulong to ulong\nc = ulong 0\nx = a\nwhile gt x 0 bound 64\nc = add c and x 1\nx = shr x 1\nend\nret c\nend\n|note count set bits in unsigned integer a\nfn s3 a ulong to ulong\nc = ulong 0\nx = a\nwhile gt x 0 bound 64\nc = add c and x 1\nx = shr x 1\nend\nret c\nend\n|note reverse array a of length n in place\nfn s4 a edit ulong 8 n ulong to void\ni = ulong 0\nwhile lt mul i 2 n bound 8\nj = sub sub n 1 i\nt = get a i\nput a i get a j\nput a j t\ni = add i 1\nend\nend\n|"
+text tSelfQry "note count set bits in unsigned integer a\nfn solve a ulong to ulong\n"
+
+text kwView "view"
+text kwEdit "edit"
+text kwVoid "void"
+text kwB " b ulong"
+text kwC " c ulong"
+text tgBit "bit"
+text tgMask "mask"
+text tgXor "xor"
+text tgShift "shift"
+text tgPop "pop"
+text tgDig "digit"
+text tgDec "decimal"
+text tgBase "base"
+text tgSum "sum"
+text tgProd "prod"
+text tgCnt "count"
+text tgMax "max"
+text tgMin "min"
+text tgClamp "clamp"
+text tgAbs "abs"
+text tgDiff "diff"
+text tgRev "reverse"
+text tgSort "sort"
+text tgSwap "swap"
+text tgArr "array"
+text tgGcd "gcd"
+text tgPrime "prime"
+text tgDiv "div"
+text tgMod "mod"
+text tgRem "rem"
+text tgFib "fib"
+text tgSqrt "sqrt"
+text tgPow "pow"
+text tgEven "even"
+text tgOdd "odd"
+
+fn rWrt fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn rNum fd int v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write fd b p sub 24 p
+end
+
+fn rEqTxt a view uchar * al ulong b view uchar * to bool
+if ne al len b
+ret false
+end
+for i ulong al bound 64
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn rParseU s view uchar * n ulong to ulong
+v = ulong 0
+for i ulong n bound 32
+c = get s i
+if and ge c 48 le c 57
+v = add mul v 10 ulong sub c 48
+end
+end
+ret v
+end
+
+fn rLower c ulong to ulong
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+fn rIsAlnum c ulong to bool
+if and ge c 48 le c 57
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 97 le c 122
+ret true
+end
+ret false
+end
+
+note Direct substring checks against rCorp and rPrm (avoid passing globals as view *)
+fn rHasSubCorp boff ulong blen ulong sub_s view uchar * to bool
+sl = len sub_s
+if or eq sl 0 gt sl blen
+ret false
+end
+lim = add sub blen sl 1
+for i ulong lim bound 4096
+ok = true
+for j ulong sl bound 64
+if ne rLower ulong get rCorp add boff add i j ulong get sub_s j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn rHasSubPrm boff ulong blen ulong sub_s view uchar * to bool
+sl = len sub_s
+if or eq sl 0 gt sl blen
+ret false
+end
+lim = add sub blen sl 1
+for i ulong lim bound 4096
+ok = true
+for j ulong sl bound 64
+if ne rLower ulong get rPrm add boff add i j ulong get sub_s j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn rShapeCorp off ulong n ulong to ulong
+if rHasSubCorp off n kwEdit
+ret 5
+end
+if rHasSubCorp off n kwView
+ret 4
+end
+if rHasSubCorp off n kwC
+ret 3
+end
+if rHasSubCorp off n kwB
+ret 2
+end
+if rHasSubCorp off n kwVoid
+ret 5
+end
+ret 1
+end
+
+fn rShapePrm off ulong n ulong to ulong
+if rHasSubPrm off n kwEdit
+ret 5
+end
+if rHasSubPrm off n kwView
+ret 4
+end
+if rHasSubPrm off n kwC
+ret 3
+end
+if rHasSubPrm off n kwB
+ret 2
+end
+if rHasSubPrm off n kwVoid
+ret 5
+end
+ret 1
+end
+
+fn rTagsCorp off ulong n ulong to ulong
+m = ulong 0
+if or rHasSubCorp off n tgBit or rHasSubCorp off n tgMask or rHasSubCorp off n tgXor or rHasSubCorp off n tgShift rHasSubCorp off n tgPop
+m = or m 1
+end
+if or rHasSubCorp off n tgDig or rHasSubCorp off n tgDec rHasSubCorp off n tgBase
+m = or m 2
+end
+if or rHasSubCorp off n tgSum or rHasSubCorp off n tgProd rHasSubCorp off n tgCnt
+m = or m 4
+end
+if or rHasSubCorp off n tgMax or rHasSubCorp off n tgMin or rHasSubCorp off n tgClamp or rHasSubCorp off n tgAbs rHasSubCorp off n tgDiff
+m = or m 8
+end
+if or rHasSubCorp off n tgRev or rHasSubCorp off n tgSort or rHasSubCorp off n tgSwap rHasSubCorp off n tgArr
+m = or m 16
+end
+if or rHasSubCorp off n tgGcd or rHasSubCorp off n tgPrime or rHasSubCorp off n tgDiv or rHasSubCorp off n tgMod rHasSubCorp off n tgRem
+m = or m 32
+end
+if or rHasSubCorp off n tgFib or rHasSubCorp off n tgSqrt rHasSubCorp off n tgPow
+m = or m 64
+end
+if or rHasSubCorp off n tgEven rHasSubCorp off n tgOdd
+m = or m 128
+end
+ret m
+end
+
+fn rTagsPrm off ulong n ulong to ulong
+m = ulong 0
+if or rHasSubPrm off n tgBit or rHasSubPrm off n tgMask or rHasSubPrm off n tgXor or rHasSubPrm off n tgShift rHasSubPrm off n tgPop
+m = or m 1
+end
+if or rHasSubPrm off n tgDig or rHasSubPrm off n tgDec rHasSubPrm off n tgBase
+m = or m 2
+end
+if or rHasSubPrm off n tgSum or rHasSubPrm off n tgProd rHasSubPrm off n tgCnt
+m = or m 4
+end
+if or rHasSubPrm off n tgMax or rHasSubPrm off n tgMin or rHasSubPrm off n tgClamp or rHasSubPrm off n tgAbs rHasSubPrm off n tgDiff
+m = or m 8
+end
+if or rHasSubPrm off n tgRev or rHasSubPrm off n tgSort or rHasSubPrm off n tgSwap rHasSubPrm off n tgArr
+m = or m 16
+end
+if or rHasSubPrm off n tgGcd or rHasSubPrm off n tgPrime or rHasSubPrm off n tgDiv or rHasSubPrm off n tgMod rHasSubPrm off n tgRem
+m = or m 32
+end
+if or rHasSubPrm off n tgFib or rHasSubPrm off n tgSqrt rHasSubPrm off n tgPow
+m = or m 64
+end
+if or rHasSubPrm off n tgEven rHasSubPrm off n tgOdd
+m = or m 128
+end
+ret m
+end
+
+fn rIndexTrigrams l1e ulong to void
+trc = ulong 0
+if ge l1e 3
+lim = sub l1e 2
+for j ulong lim bound 4096
+if ge trc 256
+break
+end
+c0 = rLower ulong get rPrm j
+c1 = rLower ulong get rPrm add j 1
+c2 = rLower ulong get rPrm add j 2
+g = or shl c0 16 or shl c1 8 c2
+put rQTri trc g
+trc = add trc 1
+end
+end
+put rSt 5 trc
+end
+
+fn rIndexQuery qlen ulong to void
+l1e = ulong 0
+while lt l1e qlen bound 16384
+if eq get rPrm l1e 10
+break
+end
+l1e = add l1e 1
+end
+l2s = l1e
+if lt l2s qlen
+l2s = add l2s 1
+end
+l2e = l2s
+while lt l2e qlen bound 16384
+if eq get rPrm l2e 10
+break
+end
+l2e = add l2e 1
+end
+put rSt 0 0
+put rSt 1 l1e
+put rSt 2 rShapePrm l2s sub l2e l2s
+put rSt 3 rTagsPrm 0 l1e
+
+tc = ulong 0
+i = ulong 0
+while lt i l1e bound 4096
+while lt i l1e bound 4096
+if rIsAlnum ulong get rPrm i
+break
+end
+i = add i 1
+end
+ws = i
+h = ulong 2166136261
+while lt i l1e bound 4096
+c = ulong get rPrm i
+if not rIsAlnum c
+break
+end
+h = mul xor h rLower c 16777619
+i = add i 1
+end
+wl = sub i ws
+if and ge wl 2 lt tc 64
+dup = false
+for k ulong tc bound 64
+if eq get rQTok k h
+dup = true
+break
+end
+end
+if not dup
+put rQTok tc h
+tc = add tc 1
+end
+end
+end
+put rSt 4 tc
+rIndexTrigrams l1e
+end
+
+fn rSameNote coff ulong clen ulong to bool
+qlen = get rSt 1
+if ne clen qlen
+ret false
+end
+for i ulong clen bound 4096
+if ne rLower ulong get rCorp add coff i rLower ulong get rPrm i
+ret false
+end
+end
+ret true
+end
+
+fn rScoreWords off ulong l1e ulong to ulong
+sc = ulong 0
+tc = get rSt 4
+i = ulong 0
+while lt i l1e bound 4096
+while lt i l1e bound 4096
+if rIsAlnum ulong get rCorp add off i
+break
+end
+i = add i 1
+end
+ws = i
+h = ulong 2166136261
+while lt i l1e bound 4096
+c = ulong get rCorp add off i
+if not rIsAlnum c
+break
+end
+h = mul xor h rLower c 16777619
+i = add i 1
+end
+wl = sub i ws
+if ge wl 2
+for k ulong tc bound 64
+if eq get rQTok k h
+sc = add sc 120
+break
+end
+end
+end
+end
+ret sc
+end
+
+fn rScoreTrigrams off ulong l1e ulong to ulong
+trc = get rSt 5
+if or lt l1e 3 eq trc 0
+ret 0
+end
+lim = sub l1e 2
+if gt lim 128
+lim = 128
+end
+hits = ulong 0
+for j ulong lim bound 128
+c0 = rLower ulong get rCorp add off j
+c1 = rLower ulong get rCorp add off add j 1
+c2 = rLower ulong get rCorp add off add j 2
+g = or shl c0 16 or shl c1 8 c2
+for k ulong trc bound 256
+if eq get rQTri k g
+hits = add hits 1
+break
+end
+end
+end
+ret mul hits 15
+end
+
+fn rTagBonus qt ulong rt ulong to ulong
+both = and qt rt
+sc = ulong 0
+for b ulong 8 bound 8
+if ne and shr both b 1 0
+sc = add sc 80
+end
+end
+ret sc
+end
+
+fn rScoreRec off ulong rlen ulong to ulong
+if lt rlen 16
+ret 0
+end
+l1e = ulong 0
+while lt l1e rlen bound 4096
+if eq get rCorp add off l1e 10
+break
+end
+l1e = add l1e 1
+end
+if lt l1e 6
+ret 0
+end
+if rSameNote off l1e
+ret 0
+end
+l2s = l1e
+if lt l2s rlen
+l2s = add l2s 1
+end
+l2e = l2s
+while lt l2e rlen bound 4096
+if eq get rCorp add off l2e 10
+break
+end
+l2e = add l2e 1
+end
+sc = ulong 1
+if eq rShapeCorp add off l2s sub l2e l2s get rSt 2
+sc = add sc 400
+end
+sc = add sc rTagBonus get rSt 3 rTagsCorp off l1e
+sc = add sc rScoreWords off l1e
+sc = add sc rScoreTrigrams off l1e
+if le rlen 280
+sc = add sc 30
+end
+ret sc
+end
+
+fn rInsertTop off ulong rlen ulong sc ulong topk ulong to void
+if or eq sc 0 eq topk 0
+ret
+end
+idx = topk
+for i ulong topk bound 8
+if gt sc get rTopSc i
+idx = i
+break
+end
+end
+if ge idx topk
+ret
+end
+j = sub topk 1
+while gt j idx bound 8
+put rTopOff j get rTopOff sub j 1
+put rTopLen j get rTopLen sub j 1
+put rTopSc j get rTopSc sub j 1
+j = sub j 1
+end
+put rTopOff idx off
+put rTopLen idx rlen
+put rTopSc idx sc
+end
+
+fn rAppendCorp so ulong sl ulong opos ulong to ulong
+p = opos
+for j ulong sl bound 4096
+if lt p 16384
+put rOut p get rCorp add so j
+p = add p 1
+end
+end
+ret p
+end
+
+fn rAppendPrm qlen ulong opos ulong to ulong
+p = opos
+for j ulong qlen bound 16384
+if lt p 16384
+put rOut p get rPrm j
+p = add p 1
+end
+end
+ret p
+end
+
+fn rAssembleOut qlen ulong to ulong
+put rSt 12 0
+put rSt 9 0
+for i ulong get rSt 10 bound 8
+sl = get rTopLen i
+if and gt sl 0 gt get rTopSc i 0
+if le add get rSt 12 add sl 1 get rSt 11
+p = rAppendCorp get rTopOff i sl get rSt 12
+if and gt p 0 ne get rOut sub p 1 10
+if lt p 16384
+put rOut p 10
+p = add p 1
+end
+end
+put rSt 12 p
+put rSt 9 add get rSt 9 1
+end
+end
+end
+p2 = rAppendPrm qlen get rSt 12
+put rSt 12 p2
+ret p2
+end
+
+fn rRunRetrieve clen ulong qlen ulong to ulong
+topk = get rSt 10
+rIndexQuery qlen
+for i ulong 8 bound 8
+put rTopOff i 0
+put rTopLen i 0
+put rTopSc i 0
+end
+recs = ulong 0
+pos = ulong 0
+while lt pos clen bound 100000000
+s = pos
+while lt pos clen bound 100000000
+if eq get rCorp pos 0
+break
+end
+pos = add pos 1
+end
+rlen = sub pos s
+if gt rlen 0
+recs = add recs 1
+sc = rScoreRec s rlen
+rInsertTop s rlen sc topk
+end
+if lt pos clen
+pos = add pos 1
+end
+end
+put rSt 8 recs
+ret rAssembleOut qlen
+end
+
+fn rLoadPath argi ulong to ulong
+n = argread argi rPath 0 4095
+if le n 0
+ret 0
+end
+ret ulong n
+end
+
+fn rSelfcheck to int
+sl = len tSelfCorp
+er = enlarge rCorp add sl 1
+ql = len tSelfQry
+er2 = enlarge rPrm add ql 1
+for i ulong sl bound 1024
+c = get tSelfCorp i
+if eq c 124
+put rCorp i 0
+else
+put rCorp i c
+end
+end
+for i ulong ql bound 1024
+put rPrm i get tSelfQry i
+end
+put rSt 10 2
+put rSt 11 500
+olen = rRunRetrieve sl ql
+recs = get rSt 8
+kept = get rSt 9
+best = get rTopSc 0
+if or ne recs 4 or lt kept 1 or lt best 500 eq olen 0
+rWrt 2 tSelfFail
+ret 1
+end
+t0 = get rTopOff 0
+if or lt t0 50 gt t0 150
+rWrt 2 tSelfFail
+ret 1
+end
+rWrt 1 tSelfOk
+ret 0
+end
+
+fn rLoadCorp argi ulong to ulong
+pl = rLoadPath argi
+fd = fopen rPath 0 pl 0 0
+if lt fd 0
+ret 0
+end
+sz = fseek int fd 0 2
+if lt sz 0
+z = fclose int fd
+ret 0
+end
+z = fseek int fd 0 0
+clen = ulong sz
+er = enlarge rCorp add clen 1
+if lt er 0
+z = fclose int fd
+ret 0
+end
+rd = ulong 0
+while lt rd clen bound 100000000
+k = read int fd rCorp rd sub clen rd
+if le k 0
+break
+end
+rd = add rd ulong k
+end
+z = fclose int fd
+ret rd
+end
+
+fn rLoadPrm argi ulong to ulong
+pl = rLoadPath argi
+fd = fopen rPath 0 pl 0 0
+if lt fd 0
+ret 0
+end
+er = enlarge rPrm 16384
+if lt er 0
+z = fclose int fd
+ret 0
+end
+kn = read int fd rPrm 0 16383
+z = fclose int fd
+if le kn 0
+ret 0
+end
+ret ulong kn
+end
+
+fn rSaveOut argi ulong olen ulong to bool
+pl = rLoadPath argi
+fd = fopen rPath 0 pl 577 420
+if lt fd 0
+ret false
+end
+wr = ulong 0
+while lt wr olen bound 16384
+k = write int fd rOut wr sub olen wr
+if le k 0
+break
+end
+wr = add wr ulong k
+end
+z = fclose int fd
+ret true
+end
+
+fn rParseArgU argi ulong defv ulong to ulong
+tb = new uchar 32 0
+tl = argread argi tb 0 32
+if le tl 0
+ret defv
+end
+v = rParseU tb ulong tl
+if eq v 0
+ret defv
+end
+ret v
+end
+
+fn main to int
+ac = argcnt
+if lt ac 2
+rWrt 2 tUsage
+ret 2
+end
+m = new uchar 64 0
+ml = argread 1 m 0 64
+if le ml 0
+rWrt 2 tUsage
+ret 2
+end
+if rEqTxt m ulong ml tModeSelf
+ret rSelfcheck
+end
+if not rEqTxt m ulong ml tModeRet
+rWrt 2 tUsage
+ret 2
+end
+if lt ac 7
+rWrt 2 tUsage
+ret 2
+end
+rd = rLoadCorp 2
+if eq rd 0
+rWrt 2 tErrIo
+ret 1
+end
+qlen = rLoadPrm 3
+if eq qlen 0
+rWrt 2 tErrIo
+ret 1
+end
+topk = rParseArgU 4 2
+if gt topk 8
+topk = 2
+end
+maxb = rParseArgU 5 700
+put rSt 10 topk
+put rSt 11 maxb
+olen = rRunRetrieve rd qlen
+if not rSaveOut 6 olen
+rWrt 2 tErrIo
+ret 1
+end
+rWrt 1 tRetA
+rNum 1 topk
+rWrt 1 tRetB
+rNum 1 get rSt 8
+rWrt 1 tRetC
+rNum 1 get rSt 9
+rWrt 1 tRetD
+rNum 1 get rTopSc 0
+rWrt 1 tRetE
+rNum 1 olen
+rWrt 1 tNl
+ret 0
+end

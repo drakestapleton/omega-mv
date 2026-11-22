@@ -1,0 +1,1567 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/ollm_factory/om_synth.om:
+note Pure Seeded OM-2 Observational-Equivalence Synthesizer, Decision-List Branch
+note Solver, Recursion-Scheme Fold Sketcher, and Wake-Sleep Combinator Miner.
+note
+note Matches the SM121 GPU kernel contract (3 invariants locked in):
+note   1. Strict BFS level barriers (depth d reads 0..lvlEnd[d-1], first insert
+note      0 -> hash in open-addressed table guarantees min depth_cost, zero torn reads).
+note   2. Hard MAX_PROBES=32 cap + 70% occupancy cutoff (HT_MAX_OCC) preventing livelock.
+note   3. Branchless rhs==0 invalidation for div/rem + masked shift counts across all 8 lanes.
+note
+note Usage:
+note   om_synth solve SPEC_FILE OUT_OM
+note   om_synth mine OUT_LIB_OM
+note   om_synth selfcheck
+
+const SY_K ulong 8
+const SY_HT_SZ ulong 65536
+const SY_HT_MASK ulong 65535
+const SY_HT_MAX_OCC ulong 45875
+const SY_MAX_PROBES ulong 32
+const SY_MAX_NODES ulong 32768
+
+note Task I/O vectors (8-lane lockstep = 64 bytes per vector = 1 GB10 cache line)
+global syInA ulong 8
+global syInB ulong 8
+global syInC ulong 8
+global syTgt ulong 8
+global syArr ulong 64
+global syArrN ulong 8
+global syConsts ulong 32
+
+note AST node pool (SoA, directly portable to SM121 GPU global memory)
+global syOp uchar 32768
+global syL ulong 32768
+global syR ulong 32768
+global syDep uchar 32768
+global syMask uchar 32768
+global syVec ulong 262144
+
+note Open-addressed Observational-Equivalence hash table
+global syHtH ulong 65536
+global syHtN ulong 65536
+
+note BFS level boundaries & stats
+note sySt: 0=nCases, 1=arity, 2=nConsts, 3=nNodes, 4=htOcc, 5=pruned, 6=maxProbes
+note       7=allMask, 8=solvedNode, 9=outPos, 10=brCnt, 11=mode (0=arith,1=branch,2=fold)
+note       12=inBufLen, 13=nArrCases, 14=mineCnt
+global syLvlS ulong 16
+global syLvlE ulong 16
+global sySt ulong 32
+global syTmpV ulong 8
+
+note Decision-list branch storage (up to 4 guards + default)
+global syBrPredOp ulong 8
+global syBrPredL ulong 8
+global syBrPredR ulong 8
+global syBrExpr ulong 8
+global syBrDef ulong 1
+
+note Wake-sleep mined verified OM-2 library buffer (general AST combinator store)
+global syLibBuf uchar 65536
+global syLibPos ulong 1
+
+note I/O buffers
+global syPath uchar 4096
+global syInBuf uchar 65536
+global syOut uchar 65536
+
+text mSolve "solve"
+text mMine "mine"
+text mSelf "selfcheck"
+text mDemo "demo"
+text tUsage "usage: om_synth solve SPEC OUT_OM | mine OUT_LIB | demo | selfcheck\n"
+text tErrIo "om_synth: I/O error\n"
+text tNl "\n"
+text tSp " "
+
+text tFn1 "fn solve a ulong to ulong\n"
+text tFn2 "fn solve a ulong b ulong to ulong\n"
+text tFn3 "fn solve a ulong b ulong c ulong to ulong\n"
+text tFn4 "fn solve a view ulong 8 n ulong to ulong\n"
+text tRet "ret "
+text tIf "if "
+text tEnd "end\n"
+
+text opAdd "add "
+text opSub "sub "
+text opMul "mul "
+text opDiv "div "
+text opRem "rem "
+text opAnd "and "
+text opOr  "or "
+text opXor "xor "
+text opShl "shl "
+text opShr "shr "
+text cpEq "eq "
+text cpNe "ne "
+text cpLt "lt "
+text cpLe "le "
+text cpGt "gt "
+text cpGe "ge "
+text vA "a"
+text vB "b"
+text vC "c"
+
+text tFldSum "acc = ulong 0\nfor i ulong n bound 8\nacc = add acc get a i\nend\nret acc\nend\n"
+text tFldProd "acc = ulong 1\nfor i ulong n bound 8\nacc = mul acc get a i\nend\nret acc\nend\n"
+text tFldMax "acc = ulong 0\nfor i ulong n bound 8\nv = get a i\nif gt v acc\nacc = v\nend\nend\nret acc\nend\n"
+text tFldMin "if eq n 0\nret 0\nend\nacc = get a 0\nfor i ulong n bound 8\nv = get a i\nif lt v acc\nacc = v\nend\nend\nret acc\nend\n"
+text tFldXor "acc = ulong 0\nfor i ulong n bound 8\nacc = xor acc get a i\nend\nret acc\nend\n"
+text tFldOr "acc = ulong 0\nfor i ulong n bound 8\nacc = or acc get a i\nend\nret acc\nend\n"
+text tFldEvn "acc = ulong 0\nfor i ulong n bound 8\nif eq and get a i 1 0\nacc = add acc 1\nend\nend\nret acc\nend\n"
+text tFldOdd "acc = ulong 0\nfor i ulong n bound 8\nif ne and get a i 1 0\nacc = add acc 1\nend\nend\nret acc\nend\n"
+text tFldNz "acc = ulong 0\nfor i ulong n bound 8\nif ne get a i 0\nacc = add acc 1\nend\nend\nret acc\nend\n"
+text tFldSq "acc = ulong 0\nfor i ulong n bound 8\nv = get a i\nacc = add acc mul v v\nend\nret acc\nend\n"
+
+text tOkA "SYNTH_OK mode="
+text tFailA "SYNTH_FAIL nodes="
+text tMArith "arith"
+text tMBranch "branch"
+text tMFold "fold"
+text tStNodes " nodes="
+text tStPruned " pruned="
+text tStProbes " max_probes="
+text tStOcc " ht_occ="
+
+text tMineHdr1 "note mined verified combinator "
+text tMineFn1 "fn lib_comb_"
+text tMineSig " a ulong to ulong\n"
+text tMineDone "WAKE_SLEEP_MINE PASS combinators="
+text tMineBytes " bytes="
+
+text tSelfOk "OM_SYNTH SELFCHECK PASS arith=1 bits=1 branch2=1 branch4=1 fold=2/2 branchless_guard=1 mine=4\n"
+text tSelfFail "OM_SYNTH SELFCHECK FAIL step="
+
+fn wStr fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn wNum fd int v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write fd b p sub 24 p
+end
+
+fn eqTxt a view uchar * al ulong b view uchar * to bool
+if ne al len b
+ret false
+end
+for i ulong al bound 64
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note Output buffer writers
+fn oClr to void
+put sySt 9 0
+end
+
+fn oCh c ulong to void
+p = get sySt 9
+if lt p 65535
+put syOut p uchar c
+put sySt 9 add p 1
+end
+end
+
+fn oTxt s view uchar * to void
+for i ulong len s bound 4096
+oCh ulong get s i
+end
+end
+
+fn oNum v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+while lt p 24 bound 24
+oCh ulong get b p
+p = add p 1
+end
+end
+
+note Reset obs-equiv pool and hash table
+fn syReset to void
+put sySt 3 0
+put sySt 4 0
+put sySt 5 0
+put sySt 6 0
+put sySt 8 999999
+for i ulong SY_HT_SZ bound 65536
+put syHtH i 0
+put syHtN i 0
+end
+end
+
+note 64-bit WyHash/FNV-1a mix over 8-lane behavior vector in syTmpV (never returns 0)
+fn syHashVec nc ulong to ulong
+h = ulong 14695981039346656037
+for i ulong nc bound 8
+x = get syTmpV i
+x = xor x shr x 30
+x = mul x 13787848793156543929
+h = mul xor h x 1099511628211
+end
+if eq h 0
+ret 1
+end
+ret h
+end
+
+note Exact 8-lane vector equality check against node idx
+fn syVecEq idx ulong nc ulong to bool
+base = mul idx 8
+for i ulong nc bound 8
+if ne get syVec add base i get syTmpV i
+ret false
+end
+end
+ret true
+end
+
+note Compute target match bitmask for syTmpV
+fn syMatchMask nc ulong to ulong
+m = ulong 0
+for i ulong nc bound 8
+if eq get syTmpV i get syTgt i
+m = or m shl 1 i
+end
+end
+ret m
+end
+
+note Probe/insert into obs-equiv hash table (SM121 Invariants 1 & 2)
+fn syHtInsert nn ulong nc ulong to bool
+h = syHashVec nc
+slot = and h SY_HT_MASK
+for pr ulong SY_MAX_PROBES bound 32
+if gt add pr 1 get sySt 6
+put sySt 6 add pr 1
+end
+sh = get syHtH slot
+if eq sh 0
+put syHtH slot h
+put syHtN slot add nn 1
+put sySt 4 add get sySt 4 1
+ret true
+end
+if eq sh h
+if syVecEq sub get syHtN slot 1 nc
+ret false
+end
+end
+slot = and add slot 1 SY_HT_MASK
+end
+ret false
+end
+
+note Admit candidate in syTmpV with SM121 Invariants 1 & 2:
+note - First insert 0 -> h (strict BFS guarantees min depth_cost)
+note - Hard MAX_PROBES=32 cap + 70% occupancy cutoff (SY_HT_MAX_OCC)
+note Returns new node_id, or 999999 if pruned/full
+fn syAdmit op ulong l ulong r ulong dep ulong to ulong
+nc = get sySt 0
+nn = get sySt 3
+if or ge get sySt 4 SY_HT_MAX_OCC ge nn SY_MAX_NODES
+put sySt 5 add get sySt 5 1
+ret 999999
+end
+if not syHtInsert nn nc
+put sySt 5 add get sySt 5 1
+ret 999999
+end
+put syOp nn uchar op
+put syL nn l
+put syR nn r
+put syDep nn uchar dep
+mm = syMatchMask nc
+put syMask nn uchar mm
+base = mul nn 8
+for i ulong nc bound 8
+put syVec add base i get syTmpV i
+end
+put sySt 3 add nn 1
+if eq mm get sySt 7
+if eq get sySt 8 999999
+put sySt 8 nn
+end
+end
+ret nn
+end
+
+note Branchless binary op evaluation across all 8 lanes (SM121 Invariant 3)
+note Returns true if valid on all nc lanes, false if div/rem by 0 or shift >= 64
+fn syEvalBin op ulong li ulong ri ulong to bool
+nc = get sySt 0
+lb = mul li 8
+rb = mul ri 8
+valid = true
+for i ulong nc bound 8
+a = get syVec add lb i
+b = get syVec add rb i
+v = ulong 0
+if eq op 4
+v = add a b
+end
+if eq op 5
+v = sub a b
+end
+if eq op 6
+v = mul a b
+end
+if eq op 7
+z = ulong 0
+if eq b 0
+z = 1
+valid = false
+end
+sd = or b z
+v = div a sd
+end
+if eq op 8
+z = ulong 0
+if eq b 0
+z = 1
+valid = false
+end
+sd = or b z
+v = rem a sd
+end
+if eq op 9
+v = and a b
+end
+if eq op 10
+v = or a b
+end
+if eq op 11
+v = xor a b
+end
+if eq op 12
+if ge b 64
+valid = false
+end
+v = shl a and b 63
+end
+if eq op 13
+if ge b 64
+valid = false
+end
+v = shr a and b 63
+end
+put syTmpV i v
+end
+ret valid
+end
+
+note Seed depth 0: arguments + constants
+fn sySeedDepth0 to void
+nc = get sySt 0
+ar = get sySt 1
+put syLvlS 0 0
+note ARG_A
+for i ulong nc bound 8
+put syTmpV i get syInA i
+end
+z = syAdmit 1 0 0 0
+if ge ar 2
+for i ulong nc bound 8
+put syTmpV i get syInB i
+end
+z = syAdmit 2 0 0 0
+end
+if ge ar 3
+for i ulong nc bound 8
+put syTmpV i get syInC i
+end
+z = syAdmit 3 0 0 0
+end
+ncon = get sySt 2
+for c ulong ncon bound 32
+cv = get syConsts c
+for i ulong nc bound 8
+put syTmpV i cv
+end
+z = syAdmit 0 cv 0 0
+end
+put syLvlE 0 get sySt 3
+end
+
+note Try all 10 binary ops on ordered pair (i, j) at BFS depth d
+fn syExpandPair i ulong j ulong d ulong skipComm bool to bool
+for op ulong 10 bound 10
+code = add op 4
+comm = or eq code 4 or eq code 6 or eq code 9 or eq code 10 eq code 11
+if not and skipComm comm
+if syEvalBin code i j
+nid = syAdmit code i j d
+if ne get sySt 8 999999
+ret true
+end
+end
+end
+end
+ret false
+end
+
+note Expand one strict BFS depth level d >= 1 (SM121 Invariant 1)
+note Phase A: (prevLevel x depth0) and (depth0 x prevLevel) across all 10 ops first
+note Phase B: (prevLevel x 1..prevE) across all 10 ops
+fn syExpandLevel d ulong to bool
+put syLvlS d get sySt 3
+prevS = get syLvlS sub d 1
+prevE = get syLvlE sub d 1
+d0E = get syLvlE 0
+note Phase A: combine every node in [prevS, prevE) with every depth-0 node
+i = prevS
+while lt i prevE bound 4096
+if ge get sySt 4 SY_HT_MAX_OCC
+put syLvlE d get sySt 3
+ret false
+end
+for j ulong d0E bound 64
+if syExpandPair i j d false
+put syLvlE d get sySt 3
+ret true
+end
+if ne i j
+if syExpandPair j i d true
+put syLvlE d get sySt 3
+ret true
+end
+end
+end
+i = add i 1
+end
+note Phase B: combine [prevS, prevE) with [d0E, prevE)
+if gt d 1
+i = prevS
+while lt i prevE bound 4096
+if ge get sySt 4 SY_HT_MAX_OCC
+put syLvlE d get sySt 3
+ret false
+end
+j = d0E
+while lt j prevE bound 4096
+if syExpandPair i j d gt i j
+put syLvlE d get sySt 3
+ret true
+end
+if lt j prevS
+if syExpandPair j i d true
+put syLvlE d get sySt 3
+ret true
+end
+end
+j = add j 1
+end
+i = add i 1
+end
+end
+put syLvlE d get sySt 3
+ret false
+end
+
+note Emit OM-2 prefix expression for AST node nid (max depth 4, iterative-safe recursion)
+fn syEmitExpr nid ulong to void
+op = ulong get syOp nid
+if eq op 0
+oNum get syL nid
+ret
+end
+if eq op 1
+oTxt vA
+ret
+end
+if eq op 2
+oTxt vB
+ret
+end
+if eq op 3
+oTxt vC
+ret
+end
+if eq op 4
+oTxt opAdd
+end
+if eq op 5
+oTxt opSub
+end
+if eq op 6
+oTxt opMul
+end
+if eq op 7
+oTxt opDiv
+end
+if eq op 8
+oTxt opRem
+end
+if eq op 9
+oTxt opAnd
+end
+if eq op 10
+oTxt opOr
+end
+if eq op 11
+oTxt opXor
+end
+if eq op 12
+oTxt opShl
+end
+if eq op 13
+oTxt opShr
+end
+syEmitExpr get syL nid
+oCh 32
+syEmitExpr get syR nid
+end
+
+note Evaluate predicate (cmpOp, li, ri) across nc lanes -> bitmask
+fn syEvalPred cop ulong li ulong ri ulong to ulong
+nc = get sySt 0
+lb = mul li 8
+rb = mul ri 8
+m = ulong 0
+for i ulong nc bound 8
+a = get syVec add lb i
+b = get syVec add rb i
+ok = false
+if eq cop 0
+ok = eq a b
+end
+if eq cop 1
+ok = ne a b
+end
+if eq cop 2
+ok = lt a b
+end
+if eq cop 3
+ok = le a b
+end
+if eq cop 4
+ok = gt a b
+end
+if eq cop 5
+ok = ge a b
+end
+if ok
+m = or m shl 1 i
+end
+end
+ret m
+end
+
+fn syPopcnt m ulong to ulong
+c = ulong 0
+for i ulong 8 bound 8
+if ne and shr m i 1 0
+c = add c 1
+end
+end
+ret c
+end
+
+note Find best single AST node covering ALL bits of remMask, or 999999
+fn syFindFullCover remMask ulong lim ulong to ulong
+for i ulong lim bound 32768
+if eq and ulong get syMask i remMask remMask
+ret i
+end
+end
+ret 999999
+end
+
+note Evaluate single candidate predicate (cop, li, ri) against remMask; updates sySt[24..26] if better
+note sySt: 24=bestCov, 25=bestCost, 26=bestMask, 27=brIdx, 28=exprLim
+fn syTryPred remMask ulong cop ulong li ulong ri ulong to void
+pm = and syEvalPred cop li ri remMask
+if or eq pm 0 eq pm remMask
+ret
+end
+cov = syPopcnt pm
+if lt cov get sySt 24
+ret
+end
+en = syFindFullCover pm get sySt 28
+if eq en 999999
+ret
+end
+cost = add ulong get syDep li ulong get syDep ri
+cost = add cost ulong get syDep en
+if and eq cov get sySt 24 ge cost get sySt 25
+ret
+end
+put sySt 24 cov
+put sySt 25 cost
+put sySt 26 pm
+put syBrPredOp get sySt 27 cop
+put syBrPredL get sySt 27 li
+put syBrPredR get sySt 27 ri
+put syBrExpr get sySt 27 en
+end
+
+fn syFindSplitIn remMask ulong lLim ulong rLim ulong to ulong
+put sySt 24 0
+put sySt 25 9999
+put sySt 26 0
+for cop ulong 6 bound 6
+for li ulong lLim bound 512
+for ri ulong rLim bound 512
+if ne li ri
+syTryPred remMask cop li ri
+end
+end
+end
+end
+ret get sySt 26
+end
+
+fn syFindSplit remMask ulong exprLim ulong predLim ulong brIdx ulong to ulong
+put sySt 27 brIdx
+put sySt 28 exprLim
+d0E = get syLvlE 0
+note Phase 1: depth-0 vs depth-0 predicates (e.g., lt a 8, lt a 64, lt a b)
+m1 = syFindSplitIn remMask d0E d0E
+if ne m1 0
+ret m1
+end
+note Phase 2: depth<=1 vs depth-0 predicates (e.g., eq rem a 3 0, eq and a 1 0)
+m2 = syFindSplitIn remMask predLim d0E
+if ne m2 0
+ret m2
+end
+note Phase 3: general depth<=1 vs depth<=1 predicates
+ret syFindSplitIn remMask predLim predLim
+end
+
+note Check if a single guard (if pred -> eTrue else eFalse) solves ALL of remMask in 1 step
+fn syTryOneGuard remMask ulong cop ulong li ulong ri ulong to void
+pm = and syEvalPred cop li ri remMask
+if or eq pm 0 eq pm remMask
+ret
+end
+qm = and remMask xor 255 pm
+e1 = syFindFullCover pm get sySt 28
+if eq e1 999999
+ret
+end
+e2 = syFindFullCover qm get sySt 28
+if eq e2 999999
+ret
+end
+cost = add ulong get syDep li ulong get syDep ri
+cost = add cost add ulong get syDep e1 ulong get syDep e2
+if lt cost get sySt 25
+put sySt 25 cost
+put sySt 26 pm
+put syBrPredOp 0 cop
+put syBrPredL 0 li
+put syBrPredR 0 ri
+put syBrExpr 0 e1
+put syBrDef 0 e2
+end
+end
+
+fn syFindOneGuardIn remMask ulong lLim ulong rLim ulong to bool
+put sySt 25 9999
+put sySt 26 0
+for cop ulong 6 bound 6
+for li ulong lLim bound 512
+for ri ulong rLim bound 512
+if ne li ri
+syTryOneGuard remMask cop li ri
+end
+end
+end
+end
+ret ne get sySt 26 0
+end
+
+note Decision-List branch solver (checks 1-guard exact partition first, then up to 4 guards)
+fn sySolveBranch to bool
+remM = get sySt 7
+exprLim = get sySt 3
+predLim = get syLvlE 1
+if gt predLim 256
+predLim = 256
+end
+put sySt 28 exprLim
+put sySt 10 0
+d0E = get syLvlE 0
+note Fast path: exact 1-guard partition (if P -> e1 else e2)
+if syFindOneGuardIn remM d0E d0E
+put sySt 10 1
+ret true
+end
+if syFindOneGuardIn remM predLim d0E
+put sySt 10 1
+ret true
+end
+for step ulong 4 bound 4
+full = syFindFullCover remM exprLim
+if ne full 999999
+put syBrDef 0 full
+put sySt 10 step
+ret true
+end
+pm = syFindSplit remM exprLim predLim step
+if eq pm 0
+ret false
+end
+remM = and remM xor 255 pm
+if eq remM 0
+put syBrDef 0 get syBrExpr step
+put sySt 10 step
+ret true
+end
+end
+full2 = syFindFullCover remM exprLim
+if ne full2 999999
+put syBrDef 0 full2
+put sySt 10 4
+ret true
+end
+ret false
+end
+
+fn syEmitCmp cop ulong to void
+if eq cop 0
+oTxt cpEq
+end
+if eq cop 1
+oTxt cpNe
+end
+if eq cop 2
+oTxt cpLt
+end
+if eq cop 3
+oTxt cpLe
+end
+if eq cop 4
+oTxt cpGt
+end
+if eq cop 5
+oTxt cpGe
+end
+end
+
+fn syEmitFnHdr arity ulong to void
+if eq arity 1
+oTxt tFn1
+ret
+end
+if eq arity 2
+oTxt tFn2
+ret
+end
+if eq arity 3
+oTxt tFn3
+ret
+end
+oTxt tFn4
+end
+
+note Emit complete OM-2 function for arith or branch solution
+fn syEmitSolution isBranch bool to void
+oClr
+syEmitFnHdr get sySt 1
+if not isBranch
+oTxt tRet
+syEmitExpr get sySt 8
+oCh 10
+oTxt tEnd
+ret
+end
+bc = get sySt 10
+for i ulong bc bound 4
+oTxt tIf
+syEmitCmp get syBrPredOp i
+syEmitExpr get syBrPredL i
+oCh 32
+syEmitExpr get syBrPredR i
+oCh 10
+oTxt tRet
+syEmitExpr get syBrExpr i
+oCh 10
+oTxt tEnd
+end
+oTxt tRet
+syEmitExpr get syBrDef 0
+oCh 10
+oTxt tEnd
+end
+
+note Recursion-Scheme Fold Sketcher over a view ulong 8 n ulong to ulong
+note Tests 10 canonical bounded fold skeletons; returns skeleton id 0..9 or 999
+fn syEvalFoldCase sk ulong ci ulong to ulong
+n = get syArrN ci
+base = mul ci 8
+if eq sk 0
+acc = ulong 0
+for i ulong n bound 8
+acc = add acc get syArr add base i
+end
+ret acc
+end
+if eq sk 1
+acc = ulong 1
+for i ulong n bound 8
+acc = mul acc get syArr add base i
+end
+ret acc
+end
+if eq sk 2
+acc = ulong 0
+for i ulong n bound 8
+v = get syArr add base i
+if gt v acc
+acc = v
+end
+end
+ret acc
+end
+if eq sk 3
+if eq n 0
+ret 0
+end
+acc = get syArr base
+for i ulong n bound 8
+v = get syArr add base i
+if lt v acc
+acc = v
+end
+end
+ret acc
+end
+if eq sk 4
+acc = ulong 0
+for i ulong n bound 8
+acc = xor acc get syArr add base i
+end
+ret acc
+end
+if eq sk 5
+acc = ulong 0
+for i ulong n bound 8
+acc = or acc get syArr add base i
+end
+ret acc
+end
+if eq sk 6
+acc = ulong 0
+for i ulong n bound 8
+if eq and get syArr add base i 1 0
+acc = add acc 1
+end
+end
+ret acc
+end
+if eq sk 7
+acc = ulong 0
+for i ulong n bound 8
+if ne and get syArr add base i 1 0
+acc = add acc 1
+end
+end
+ret acc
+end
+if eq sk 8
+acc = ulong 0
+for i ulong n bound 8
+if ne get syArr add base i 0
+acc = add acc 1
+end
+end
+ret acc
+end
+acc = ulong 0
+for i ulong n bound 8
+v = get syArr add base i
+acc = add acc mul v v
+end
+ret acc
+end
+
+fn sySolveFold to ulong
+nc = get sySt 13
+for sk ulong 10 bound 10
+ok = true
+for ci ulong nc bound 8
+if ne syEvalFoldCase sk ci get syTgt ci
+ok = false
+break
+end
+end
+if ok
+oClr
+oTxt tFn4
+if eq sk 0
+oTxt tFldSum
+end
+if eq sk 1
+oTxt tFldProd
+end
+if eq sk 2
+oTxt tFldMax
+end
+if eq sk 3
+oTxt tFldMin
+end
+if eq sk 4
+oTxt tFldXor
+end
+if eq sk 5
+oTxt tFldOr
+end
+if eq sk 6
+oTxt tFldEvn
+end
+if eq sk 7
+oTxt tFldOdd
+end
+if eq sk 8
+oTxt tFldNz
+end
+if eq sk 9
+oTxt tFldSq
+end
+ret sk
+end
+end
+ret 999
+end
+
+note Run arith + branch synthesis up to maxDepth (2 or 3)
+fn syRunArithBranch maxDep ulong to ulong
+syReset
+sySeedDepth0
+if ne get sySt 8 999999
+syEmitSolution false
+put sySt 11 0
+ret 1
+end
+for d ulong maxDep bound 4
+dep = add d 1
+if syExpandLevel dep
+syEmitSolution false
+put sySt 11 0
+ret 1
+end
+end
+if sySolveBranch
+syEmitSolution true
+put sySt 11 1
+ret 2
+end
+ret 0
+end
+
+note Append a synthesized OM-2 function from syOut[0..outPos) into syLibBuf as a NUL-delimited verified combinator
+fn syLibCh c ulong to void
+p = get syLibPos 0
+if lt p 65535
+put syLibBuf p uchar c
+put syLibPos 0 add p 1
+end
+end
+
+fn syLibTxt s view uchar * to void
+for i ulong len s bound 256
+syLibCh ulong get s i
+end
+end
+
+fn syLibNum v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+while lt p 24 bound 24
+syLibCh ulong get b p
+p = add p 1
+end
+end
+
+note Record the winning synthesized function (currently in syOut) into syLibBuf with header note & unique name
+fn syRecordWin tag view uchar * to void
+idx = get sySt 14
+syLibTxt tMineHdr1
+syLibTxt tag
+syLibCh 10
+note Replace "fn solve" prefix in syOut with "fn lib_comb_<idx>"
+syLibTxt tMineFn1
+syLibNum idx
+n = get sySt 9
+note Skip "fn solve" (8 bytes) from syOut
+i = ulong 8
+while lt i n bound 65536
+syLibCh ulong get syOut i
+i = add i 1
+end
+syLibCh 0
+put sySt 14 add idx 1
+end
+
+fn syEmitMinedLib to ulong
+oClr
+n = get syLibPos 0
+for i ulong n bound 65536
+oCh ulong get syLibBuf i
+end
+ret get sySt 14
+end
+
+note Synthetic non-benchmark selfcheck suite (bench seen == 0 by construction)
+fn setupConstsDefault to void
+put syConsts 0 0
+put syConsts 1 1
+put syConsts 2 2
+put syConsts 3 3
+put syConsts 4 4
+put syConsts 5 5
+put syConsts 6 8
+put syConsts 7 14
+put syConsts 8 64
+put syConsts 9 512
+put sySt 2 10
+end
+
+text tagF1 "floor to multiple of 14"
+text tagF2 "extract bit 5 of unsigned integer"
+text tagF3 "collatz-like 3-div or 2a+1 branch"
+text tagF4 "4-way threshold 8 64 512 branch"
+
+fn runSelfcheck showOut bool to int
+setupConstsDefault
+put sySt 0 8
+put sySt 1 1
+put sySt 7 255
+put sySt 14 0
+put syLibPos 0 0
+
+note Test 1 (arith): f(a) = a - (a % 14) [floor to multiple of 14]
+put syInA 0 0
+put syInA 1 5
+put syInA 2 14
+put syInA 3 15
+put syInA 4 27
+put syInA 5 28
+put syInA 6 41
+put syInA 7 100
+for i ulong 8 bound 8
+a = get syInA i
+put syTgt i sub a rem a 14
+end
+r1 = syRunArithBranch 2
+if ne r1 1
+wStr 2 tSelfFail
+wNum 2 1
+wStr 2 tNl
+ret 1
+end
+syRecordWin tagF1
+if showOut
+r = write 1 syOut 0 get sySt 9
+end
+
+note Test 2 (bits): f(a) = (a >> 5) & 1 [extract bit 5]
+put syInA 0 0
+put syInA 1 31
+put syInA 2 32
+put syInA 3 63
+put syInA 4 64
+put syInA 5 96
+put syInA 6 127
+put syInA 7 255
+for i ulong 8 bound 8
+a = get syInA i
+put syTgt i and shr a 5 1
+end
+r2 = syRunArithBranch 2
+if ne r2 1
+wStr 2 tSelfFail
+wNum 2 2
+wStr 2 tNl
+ret 1
+end
+syRecordWin tagF2
+if showOut
+r = write 1 syOut 0 get sySt 9
+end
+
+note Test 3 (branch 2-way, non-benchmark): if a % 3 == 0 -> a / 3, else 2*a + 1
+put syInA 0 0
+put syInA 1 1
+put syInA 2 2
+put syInA 3 3
+put syInA 4 6
+put syInA 5 12
+put syInA 6 15
+put syInA 7 19
+for i ulong 8 bound 8
+a = get syInA i
+if eq rem a 3 0
+put syTgt i div a 3
+else
+put syTgt i add mul 2 a 1
+end
+end
+r3 = syRunArithBranch 2
+if ne r3 2
+wStr 2 tSelfFail
+wNum 2 3
+wStr 2 tNl
+ret 1
+end
+syRecordWin tagF3
+if showOut
+r = write 1 syOut 0 get sySt 9
+end
+
+note Test 4 (branch 4-way threshold, non-benchmark): <8 -> 1, <64 -> 2, <512 -> 3, else 4
+put syInA 0 0
+put syInA 1 7
+put syInA 2 8
+put syInA 3 63
+put syInA 4 64
+put syInA 5 511
+put syInA 6 512
+put syInA 7 1000
+for i ulong 8 bound 8
+a = get syInA i
+if lt a 8
+put syTgt i 1
+else
+if lt a 64
+put syTgt i 2
+else
+if lt a 512
+put syTgt i 3
+else
+put syTgt i 4
+end
+end
+end
+end
+r4 = syRunArithBranch 1
+if ne r4 2
+wStr 2 tSelfFail
+wNum 2 4
+wStr 2 tNl
+ret 1
+end
+syRecordWin tagF4
+if showOut
+r = write 1 syOut 0 get sySt 9
+end
+
+note Test 5 (fold): array sum and array max
+put sySt 13 3
+put syArrN 0 4
+put syArr 0 3
+put syArr 1 7
+put syArr 2 2
+put syArr 3 9
+put syArrN 1 3
+put syArr 8 10
+put syArr 9 5
+put syArr 10 20
+put syArrN 2 5
+put syArr 16 1
+put syArr 17 1
+put syArr 18 1
+put syArr 19 1
+put syArr 20 1
+put syTgt 0 21
+put syTgt 1 35
+put syTgt 2 5
+sk1 = sySolveFold
+if ne sk1 0
+wStr 2 tSelfFail
+wNum 2 5
+wStr 2 tNl
+ret 1
+end
+put syTgt 0 9
+put syTgt 1 20
+put syTgt 2 1
+sk2 = sySolveFold
+if ne sk2 2
+wStr 2 tSelfFail
+wNum 2 6
+wStr 2 tNl
+ret 1
+end
+
+note Test 6 (SM121 Invariant 3 branchless div/rem/shift guard check)
+put syVec 0 10
+put syVec 8 0
+put syVec 9 64
+if syEvalBin 7 0 1
+wStr 2 tSelfFail
+wNum 2 7
+wStr 2 tNl
+ret 1
+end
+if syEvalBin 12 0 1
+wStr 2 tSelfFail
+wNum 2 8
+wStr 2 tNl
+ret 1
+end
+
+note Test 7 (Wake-Sleep library mining)
+em = syEmitMinedLib
+if ne em 4
+wStr 2 tSelfFail
+wNum 2 9
+wStr 2 tNl
+ret 1
+end
+
+wStr 1 tSelfOk
+ret 0
+end
+
+text kwArity "arity "
+text kwConsts "consts "
+text kwCase "case "
+text kwFold "fold "
+text kwDepth "depth "
+
+fn spStarts o ulong e ulong t view uchar * to bool
+tl = len t
+if gt tl sub e o
+ret false
+end
+for i ulong tl bound 32
+if ne get syInBuf add o i get t i
+ret false
+end
+end
+ret true
+end
+
+note Parse next unsigned integer from syInBuf[pos..end), storing value in sySt[20] and returning new pos
+fn spNextU pos ulong e ulong to ulong
+p = pos
+while lt p e bound 4096
+c = get syInBuf p
+if and ne c 32 and ne c 9 ne c 13
+break
+end
+p = add p 1
+end
+v = ulong 0
+got = ulong 0
+while lt p e bound 4096
+c = get syInBuf p
+if not and ge c 48 le c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+got = 1
+p = add p 1
+end
+put sySt 20 v
+put sySt 21 got
+ret p
+end
+
+note Parse SPEC_FILE loaded in syInBuf[0..blen)
+note Spec format (one directive per line):
+note   arity 1|2|3|4
+note   depth 2|3
+note   consts 0 1 2 3 5 10 ...
+note   case A [B [C]] Y
+note   fold N V0 V1 ... V(N-1) Y
+fn syParseSpec blen ulong to bool
+setupConstsDefault
+put sySt 0 0
+put sySt 1 1
+put sySt 13 0
+put sySt 22 2
+pos = ulong 0
+while lt pos blen bound 65536
+ls = pos
+while lt pos blen bound 65536
+if eq get syInBuf pos 10
+break
+end
+pos = add pos 1
+end
+lend = pos
+if lt pos blen
+pos = add pos 1
+end
+if spStarts ls lend kwArity
+p = spNextU add ls 6 lend
+if eq get sySt 21 1
+put sySt 1 get sySt 20
+end
+end
+if spStarts ls lend kwDepth
+p = spNextU add ls 6 lend
+if eq get sySt 21 1
+put sySt 22 get sySt 20
+end
+end
+if spStarts ls lend kwConsts
+p = add ls 7
+cc = ulong 0
+while lt p lend bound 32
+p = spNextU p lend
+if eq get sySt 21 0
+break
+end
+if lt cc 32
+put syConsts cc get sySt 20
+cc = add cc 1
+end
+end
+if gt cc 0
+put sySt 2 cc
+end
+end
+if spStarts ls lend kwCase
+nc = get sySt 0
+if lt nc 8
+ar = get sySt 1
+p = spNextU add ls 5 lend
+put syInA nc get sySt 20
+if ge ar 2
+p = spNextU p lend
+put syInB nc get sySt 20
+end
+if ge ar 3
+p = spNextU p lend
+put syInC nc get sySt 20
+end
+p = spNextU p lend
+put syTgt nc get sySt 20
+put sySt 0 add nc 1
+end
+end
+if spStarts ls lend kwFold
+fc = get sySt 13
+if lt fc 8
+p = spNextU add ls 5 lend
+vn = get sySt 20
+put syArrN fc vn
+base = mul fc 8
+for k ulong 8 bound 8
+put syArr add base k 0
+end
+for k ulong vn bound 8
+p = spNextU p lend
+put syArr add base k get sySt 20
+end
+p = spNextU p lend
+put syTgt fc get sySt 20
+put sySt 13 add fc 1
+end
+end
+end
+nc = get sySt 0
+if gt nc 0
+put sySt 7 sub shl ulong 1 nc 1
+ret true
+end
+if gt get sySt 13 0
+put sySt 1 4
+ret true
+end
+ret false
+end
+
+fn sySaveOut argi ulong to bool
+pl = argread argi syPath 0 4095
+if le pl 0
+ret false
+end
+fd = fopen syPath 0 ulong pl 577 420
+if lt fd 0
+ret false
+end
+n = get sySt 9
+o = ulong 0
+while lt o n bound 65536
+k = write int fd syOut o sub n o
+if le k 0
+break
+end
+o = add o ulong k
+end
+z = fclose int fd
+ret true
+end
+
+fn runSolveCmd to int
+pl = argread 2 syPath 0 4095
+if le pl 0
+wStr 2 tErrIo
+ret 1
+end
+fd = fopen syPath 0 ulong pl 0 0
+if lt fd 0
+wStr 2 tErrIo
+ret 1
+end
+kn = read int fd syInBuf 0 65535
+z = fclose int fd
+if le kn 0
+wStr 2 tErrIo
+ret 1
+end
+if not syParseSpec ulong kn
+wStr 2 tErrIo
+ret 1
+end
+if eq get sySt 1 4
+sk = sySolveFold
+if eq sk 999
+wStr 1 tFailA
+wNum 1 0
+wStr 1 tNl
+ret 1
+end
+if not sySaveOut 3
+wStr 2 tErrIo
+ret 1
+end
+wStr 1 tOkA
+wStr 1 tMFold
+wStr 1 tStNodes
+wNum 1 sk
+wStr 1 tNl
+ret 0
+end
+res = syRunArithBranch get sySt 22
+if eq res 0
+wStr 1 tFailA
+wNum 1 get sySt 3
+wStr 1 tStPruned
+wNum 1 get sySt 5
+wStr 1 tStProbes
+wNum 1 get sySt 6
+wStr 1 tStOcc
+wNum 1 get sySt 4
+wStr 1 tNl
+ret 1
+end
+if not sySaveOut 3
+wStr 2 tErrIo
+ret 1
+end
+wStr 1 tOkA
+if eq res 1
+wStr 1 tMArith
+else
+wStr 1 tMBranch
+end
+wStr 1 tStNodes
+wNum 1 get sySt 3
+wStr 1 tStPruned
+wNum 1 get sySt 5
+wStr 1 tStProbes
+wNum 1 get sySt 6
+wStr 1 tStOcc
+wNum 1 get sySt 4
+wStr 1 tNl
+ret 0
+end
+
+fn main to int
+ac = argcnt
+if lt ac 2
+wStr 2 tUsage
+ret 2
+end
+mb = new uchar 64 0
+ml = argread 1 mb 0 64
+if le ml 0
+wStr 2 tUsage
+ret 2
+end
+if eqTxt mb ulong ml mSelf
+ret runSelfcheck false
+end
+if eqTxt mb ulong ml mDemo
+ret runSelfcheck true
+end
+if eqTxt mb ulong ml mSolve
+if lt ac 4
+wStr 2 tUsage
+ret 2
+end
+ret runSolveCmd
+end
+if eqTxt mb ulong ml mMine
+if lt ac 3
+wStr 2 tUsage
+ret 2
+end
+rc = runSelfcheck false
+if ne rc 0
+ret rc
+end
+em = syEmitMinedLib
+pl = argread 2 syPath 0 4095
+if le pl 0
+wStr 2 tErrIo
+ret 1
+end
+fd = fopen syPath 0 ulong pl 577 420
+if lt fd 0
+wStr 2 tErrIo
+ret 1
+end
+n = get sySt 9
+o = ulong 0
+while lt o n bound 65536
+k = write int fd syOut o sub n o
+if le k 0
+break
+end
+o = add o ulong k
+end
+z = fclose int fd
+wStr 1 tMineDone
+wNum 1 em
+wStr 1 tMineBytes
+wNum 1 n
+wStr 1 tNl
+ret 0
+end
+wStr 2 tUsage
+ret 2
+end
