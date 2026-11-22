@@ -2,7 +2,7 @@
 # TY-4/TY-5 wall amendment (docs/turing/TURING_YIELD_ENERGY_PROTOCOL_V0.md,
 # amendment 2): stage 2 only, S6 then S2, 3 rounds each, 30 s windows, with
 # the unchanged window tool and workload. Before each window it records the
-# epoch/boottime offset so tools/ty_energy_wall.c can place the window's
+# epoch/boottime offset so tools/ty_energy_wall.om can place the window's
 # monotonic GO time on the sensor log. Creates no quiet flag (run it under
 # quiet-measure). usage: tools/ty_energy_wall_run.sh OUTDIR [ROUNDS]
 set -u

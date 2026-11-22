@@ -1,0 +1,1175 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/exp445/fake445.om -- pure seeded OM-2 local HTTP stand-in for exp445 dry-run tests.
+note Replaces tools/exp445/fake445.c.
+om2
+
+text t_usage "usage: fake445 <port_file> <answers_dir>\n"
+text t_esock "fake445: socket failed\n"
+text t_ebind "fake445: bind/listen/sockname failed\n"
+text t_eport "fake445: cannot write port file\n"
+text t_dot_tmp ".tmp"
+text t_slash_models "/models.json"
+text t_slash_samp "/sampling.json"
+text t_slash_rlog "/requests.log"
+text t_slash_seen "/seen."
+text t_dot_repair ".repair"
+text t_dot_seed ".seed"
+text t_dot_again ".again"
+text t_empty_models "{\"object\":\"list\",\"data\":[]}"
+text t_fallback "I cannot do this."
+text t_h200_1 "HTTP/1.1 200 OK"
+text t_h200_2 "Content-Type: application/json"
+text t_h200_3 "Content-Length: "
+text t_h200_4 "Connection: close"
+text t_h500_1 "HTTP/1.1 500 Internal Server Error"
+text t_h500_3 "Content-Length: 27"
+text t_h500_b "{\"error\":\"fake 500 error\"}\n"
+text t_clen_ci "content-length:"
+text t_rep "REPRESENTATION: "
+text t_nentry "\\nentry "
+text t_maxt "\"max_tokens\":"
+text t_seed "\"seed\":"
+text t_temp "\"temperature\":"
+text t_prep "\"p_repeat\":"
+text t_role1 "\"role\":\"assistant\""
+text t_role2 "\"role\": \"assistant\""
+text t_vary "\"vary_untasked\": true"
+text t_fg "\"force_greedy\": true"
+text t_isd "\"ignore_seed\": true"
+text t_nl "\n"
+text t_u00 "\\u00"
+text t_j1 "{\"id\":\"fake\",\"object\":\"chat.completion\",\"model\":\"fake\",\"choices\":[{\"index\":0,\"finish_reason\":\""
+text t_len "length"
+text t_stop "stop"
+text t_j2 "\",\"message\":{\"role\":\"assistant\",\"content\":\""
+text t_j3 "\"}}],\"usage\":{\"prompt_tokens\":"
+text t_j4 ",\"completion_tokens\":"
+text t_j5 ",\"total_tokens\":"
+text t_j6 ",\"aien_sampling\":{\"mode\":\""
+text t_greedy "greedy"
+text t_sampled "sampled"
+text t_j7 "\",\"seed\":"
+text t_j8 ",\"p_repeat\":"
+text t_j9 ",\"kept\":[1,2],\"sampled_tokens\":"
+text t_j10 "}}}\n"
+
+global g_portfile uchar 4096
+global g_ansdir uchar 4096
+global g_req uchar *
+global g_ans uchar *
+global g_sj uchar *
+global g_resp uchar *
+global g_p1 uchar 4200
+global g_p2 uchar 4200
+global g_arm uchar 32
+global g_ent uchar 80
+global g_mt uchar 32
+global g_seed uchar 32
+global g_stat uchar 128
+global g_sa uchar 16
+global g_one uchar 4
+global g_pack uchar 4096
+global g_tx uchar 4096
+
+note g_sz: [0]=portflen [1]=ansdlen [2]=reqlen [3]=anslen [4]=sjlen [5]=resplen
+note [6]=p1len [7]=p2len [8]=armlen [9]=entlen [10]=mtlen [11]=seedlen [12]=untasked
+global g_sz ulong 16
+
+fn err_str s view uchar * to void
+  w = write 2 s 0 len s
+  if lt w 0
+    ret
+  end
+end
+
+fn send_all_buf fd int is_ans bool n ulong to void
+  off = ulong 0
+  while lt off n
+    chunk = sub n off
+    if gt chunk 4096
+      chunk = 4096
+    end
+    i = ulong 0
+    while lt i chunk
+      if is_ans
+        put g_tx i get g_ans add off i
+      else
+        put g_tx i get g_resp add off i
+      end
+      i = add i 1
+    end
+    sent = ulong 0
+    while lt sent chunk
+      w = send fd g_tx sent sub chunk sent 0
+      if le w 0
+        ret
+      end
+      sent = add sent ulong w
+    end
+    off = add off chunk
+  end
+end
+
+fn send_all_lit fd int s view uchar * to void
+  n = len s
+  off = ulong 0
+  while lt off n
+    w = send fd s off sub n off 16384
+    if le w 0
+      ret
+    end
+    off = add off ulong w
+  end
+end
+
+fn resp_push c uchar to void
+  n = get g_sz 5
+  if ge n len g_resp
+    nc = mul n 2
+    if lt nc 4096
+      nc = 4096
+    end
+    r = enlarge g_resp nc
+    if lt r 0
+      exit 1
+    end
+  end
+  put g_resp n c
+  put g_sz 5 add n 1
+end
+
+fn resp_crlf to void
+  resp_push 13
+  resp_push 10
+end
+
+fn resp_200_hdr clen ulong to void
+  put g_sz 5 0
+  resp_str t_h200_1
+  resp_crlf
+  resp_str t_h200_2
+  resp_crlf
+  resp_str t_h200_3
+  resp_u64 clen
+  resp_crlf
+  resp_str t_h200_4
+  resp_crlf
+  resp_crlf
+end
+
+fn resp_500 to void
+  put g_sz 5 0
+  resp_str t_h500_1
+  resp_crlf
+  resp_str t_h200_2
+  resp_crlf
+  resp_str t_h500_3
+  resp_crlf
+  resp_str t_h200_4
+  resp_crlf
+  resp_crlf
+  resp_str t_h500_b
+end
+
+fn find_crlf2 rlen ulong to long
+  if lt rlen 4
+    ret neg long 1
+  end
+  lim = sub rlen 4
+  i = ulong 0
+  while le i lim
+    if eq get g_req i 13
+      if eq get g_req add i 1 10
+        if eq get g_req add i 2 13
+          if eq get g_req add i 3 10
+            ret long i
+          end
+        end
+      end
+    end
+    i = add i 1
+  end
+  ret neg long 1
+end
+
+fn resp_str s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    resp_push get s i
+    i = add i 1
+  end
+end
+
+fn resp_u64 v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    resp_push 48
+    ret
+  end
+  k = ulong 0
+  while gt v 0
+    put tmp k uchar add 48 rem v 10
+    v = div v 10
+    k = add k 1
+  end
+  while gt k 0
+    k = sub k 1
+    resp_push get tmp k
+  end
+end
+
+fn resp_i64 v long to void
+  if lt v 0
+    resp_push 45
+    if eq v sub neg long 9223372036854775807 1
+      resp_u64 9223372036854775808
+    else
+      resp_u64 ulong neg v
+    end
+    ret
+  end
+  resp_u64 ulong v
+end
+
+fn resp_f64_g v f64 to void
+  if lt v f64 0.0
+    resp_push 45
+    v = neg v
+  end
+  if eq v f64 0.0
+    resp_push 48
+    ret
+  end
+  scaled = ulong add mul v f64 1000000.0 f64 0.5
+  ip = div scaled 1000000
+  fp = rem scaled 1000000
+  resp_u64 ip
+  if eq fp 0
+    ret
+  end
+  resp_push 46
+  divv = ulong 100000
+  while gt fp 0
+    d = div fp divv
+    resp_push uchar add 48 d
+    fp = rem fp divv
+    if eq divv 1
+      break
+    end
+    divv = div divv 10
+  end
+end
+
+fn p1_push c uchar to void
+  n = get g_sz 6
+  if lt n 4199
+    put g_p1 n c
+    put g_sz 6 add n 1
+  end
+end
+
+fn p1_str s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    p1_push get s i
+    i = add i 1
+  end
+end
+
+fn p1_ansdir to void
+  i = ulong 0
+  n = get g_sz 1
+  while lt i n
+    p1_push get g_ansdir i
+    i = add i 1
+  end
+end
+
+fn p2_push c uchar to void
+  n = get g_sz 7
+  if lt n 4199
+    put g_p2 n c
+    put g_sz 7 add n 1
+  end
+end
+
+fn p2_str s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    p2_push get s i
+    i = add i 1
+  end
+end
+
+fn p2_copy_p1 to void
+  put g_sz 7 0
+  i = ulong 0
+  n = get g_sz 6
+  while lt i n
+    p2_push get g_p1 i
+    i = add i 1
+  end
+end
+
+fn p2_seed to void
+  i = ulong 0
+  n = get g_sz 11
+  while lt i n
+    p2_push get g_seed i
+    i = add i 1
+  end
+end
+
+fn is_reg_stat to bool
+  b0 = ulong get g_stat 16
+  b1 = ulong get g_stat 17
+  b2 = ulong get g_stat 18
+  b3 = ulong get g_stat 19
+  mode = or or b0 shl b1 8 or shl b2 16 shl b3 24
+  ret eq and mode 61440 32768
+end
+
+fn slurp_to_ans use_p2 bool to bool
+  sr = long 0
+  if use_p2
+    sr = stat g_p2 0 get g_sz 7 g_stat 0 128
+  else
+    sr = stat g_p1 0 get g_sz 6 g_stat 0 128
+  end
+  if ne sr 0
+    ret false
+  end
+  if not is_reg_stat
+    ret false
+  end
+  fd = long 0
+  if use_p2
+    fd = fopen g_p2 0 get g_sz 7 0 0
+  else
+    fd = fopen g_p1 0 get g_sz 6 0 0
+  end
+  if lt fd 0
+    ret false
+  end
+  if lt len g_ans 4096
+    r = enlarge g_ans 4096
+    if lt r 0
+      cr = fclose int fd
+      if lt cr 0
+        exit 1
+      end
+      exit 1
+    end
+  end
+  n = ulong 0
+  while true
+    cap = len g_ans
+    if eq n cap
+      r2 = enlarge g_ans mul cap 2
+      if lt r2 0
+        cr = fclose int fd
+        if lt cr 0
+          exit 1
+        end
+        exit 1
+      end
+      cap = len g_ans
+    end
+    got = read int fd g_ans n sub cap n
+    if le got 0
+      break
+    end
+    n = add n ulong got
+  end
+  cr = fclose int fd
+  put g_sz 3 n
+  if lt cr 0
+    ret true
+  end
+  ret true
+end
+
+fn slurp_sampling to bool
+  put g_sz 7 0
+  i = ulong 0
+  n = get g_sz 1
+  while lt i n
+    p2_push get g_ansdir i
+    i = add i 1
+  end
+  p2_str t_slash_samp
+  sr = stat g_p2 0 get g_sz 7 g_stat 0 128
+  if ne sr 0
+    put g_sz 4 0
+    ret false
+  end
+  if not is_reg_stat
+    put g_sz 4 0
+    ret false
+  end
+  fd = fopen g_p2 0 get g_sz 7 0 0
+  if lt fd 0
+    put g_sz 4 0
+    ret false
+  end
+  if lt len g_sj 1024
+    r = enlarge g_sj 1024
+    if lt r 0
+      exit 1
+    end
+  end
+  m = ulong 0
+  while true
+    cap = len g_sj
+    if eq m cap
+      r2 = enlarge g_sj mul cap 2
+      if lt r2 0
+        exit 1
+      end
+      cap = len g_sj
+    end
+    got = read int fd g_sj m sub cap m
+    if le got 0
+      break
+    end
+    m = add m ulong got
+  end
+  cr = fclose int fd
+  put g_sz 4 m
+  if lt cr 0
+    ret true
+  end
+  ret true
+end
+
+fn find_in_req start ulong endp ulong pat view uchar * to long
+  plen = len pat
+  if eq plen 0
+    ret long start
+  end
+  if lt sub endp start plen
+    ret neg long 1
+  end
+  lim = sub endp plen
+  i = start
+  while le i lim
+    j = ulong 0
+    ok = true
+    while lt j plen
+      if ne get g_req add i j get pat j
+        ok = false
+        break
+      end
+      j = add j 1
+    end
+    if ok
+      ret long i
+    end
+    i = add i 1
+  end
+  ret neg long 1
+end
+
+fn find_in_sj pat view uchar * to long
+  endp = get g_sz 4
+  plen = len pat
+  if or eq plen 0 lt endp plen
+    ret neg long 1
+  end
+  lim = sub endp plen
+  i = ulong 0
+  while le i lim
+    j = ulong 0
+    ok = true
+    while lt j plen
+      if ne get g_sj add i j get pat j
+        ok = false
+        break
+      end
+      j = add j 1
+    end
+    if ok
+      ret long i
+    end
+    i = add i 1
+  end
+  ret neg long 1
+end
+
+fn to_lower c uchar to uchar
+  if and ge c 65 le c 90
+    ret add c 32
+  end
+  ret c
+end
+
+fn find_clen_ci hend ulong to long
+  plen = len t_clen_ci
+  if lt hend plen
+    ret 0
+  end
+  lim = sub hend plen
+  i = ulong 0
+  while le i lim
+    j = ulong 0
+    ok = true
+    while lt j plen
+      if ne to_lower get g_req add i j get t_clen_ci j
+        ok = false
+        break
+      end
+      j = add j 1
+    end
+    if ok
+      p = add i plen
+      while lt p hend
+        c = get g_req p
+        if and ne c 32 ne c 9
+          break
+        end
+        p = add p 1
+      end
+      val = long 0
+      while lt p hend
+        c = get g_req p
+        if or lt c 48 gt c 57
+          break
+        end
+        val = add mul val 10 long sub c 48
+        p = add p 1
+      end
+      ret val
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn is_word_ch c uchar to bool
+  if and ge c 97 le c 122
+    ret true
+  end
+  if and ge c 65 le c 90
+    ret true
+  end
+  if and ge c 48 le c 57
+    ret true
+  end
+  ret eq c 95
+end
+
+fn word_after_req start ulong endp ulong pat view uchar * which ulong to void
+  pos = find_in_req start endp pat
+  put g_sz add 8 which 0
+  if lt pos 0
+    ret
+  end
+  p = add ulong pos len pat
+  k = ulong 0
+  lim = ulong 31
+  if eq which 1
+    lim = 79
+  end
+  while and lt p endp lt k lim
+    c = get g_req p
+    if not is_word_ch c
+      break
+    end
+    if eq which 0
+      put g_arm k c
+    end
+    if eq which 1
+      put g_ent k c
+    end
+    if eq which 2
+      put g_mt k c
+    end
+    if eq which 3
+      put g_seed k c
+    end
+    k = add k 1
+    p = add p 1
+  end
+  put g_sz add 8 which k
+end
+
+fn get_ch is_sj bool p ulong to uchar
+  if is_sj
+    ret get g_sj p
+  end
+  ret get g_req p
+end
+
+fn parse_f64_buf is_sj bool p ulong endp ulong dflt f64 to f64
+  while lt p endp
+    if ne get_ch is_sj p 32
+      break
+    end
+    p = add p 1
+  end
+  if ge p endp
+    ret dflt
+  end
+  neg_ = false
+  if eq get_ch is_sj p 45
+    neg_ = true
+    p = add p 1
+  end
+  ndig = ulong 0
+  val = f64 0.0
+  while lt p endp
+    c = get_ch is_sj p
+    if or lt c 48 gt c 57
+      break
+    end
+    val = add mul val f64 10.0 f64 ulong sub c 48
+    ndig = add ndig 1
+    p = add p 1
+  end
+  if lt p endp
+    if eq get_ch is_sj p 46
+      p = add p 1
+      sc = f64 0.1
+      while lt p endp
+        c2 = get_ch is_sj p
+        if or lt c2 48 gt c2 57
+          break
+        end
+        val = add val mul f64 ulong sub c2 48 sc
+        sc = mul sc f64 0.1
+        ndig = add ndig 1
+        p = add p 1
+      end
+    end
+  end
+  if eq ndig 0
+    ret dflt
+  end
+  if neg_
+    ret neg val
+  end
+  ret val
+end
+
+fn num_after_req start ulong endp ulong pat view uchar * dflt f64 to f64
+  pos = find_in_req start endp pat
+  if lt pos 0
+    ret dflt
+  end
+  ret parse_f64_buf false add ulong pos len pat endp dflt
+end
+
+fn num_after_sj pat view uchar * dflt f64 to f64
+  pos = find_in_sj pat
+  if lt pos 0
+    ret dflt
+  end
+  ret parse_f64_buf true add ulong pos len pat get g_sz 4 dflt
+end
+
+fn parse_mt to long
+  n = get g_sz 10
+  if eq n 0
+    ret 1073741824
+  end
+  v = long 0
+  i = ulong 0
+  while lt i n
+    c = get g_mt i
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 long sub c 48
+    i = add i 1
+  end
+  ret v
+end
+
+fn do_rename_port to bool
+  l1 = get g_sz 6
+  l2 = get g_sz 0
+  if gt add add 6 l1 l2 4096
+    ret false
+  end
+  put g_pack 0 2
+  put g_pack 1 0
+  put g_pack 2 uchar and l1 255
+  put g_pack 3 uchar and shr l1 8 255
+  off = ulong 4
+  j = ulong 0
+  while lt j l1
+    put g_pack off get g_p1 j
+    off = add off 1
+    j = add j 1
+  end
+  put g_pack off uchar and l2 255
+  put g_pack add off 1 uchar and shr l2 8 255
+  off = add off 2
+  j = ulong 0
+  while lt j l2
+    put g_pack off get g_portfile j
+    off = add off 1
+    j = add j 1
+  end
+  rr = renames g_pack 0 off 0
+  ret eq rr 0
+end
+
+fn write_port_file port ulong to bool
+  put g_sz 6 0
+  i = ulong 0
+  n = get g_sz 0
+  while lt i n
+    p1_push get g_portfile i
+    i = add i 1
+  end
+  p1_str t_dot_tmp
+  fd = fopen g_p1 0 get g_sz 6 577 420
+  if lt fd 0
+    ret false
+  end
+  put g_sz 5 0
+  resp_u64 port
+  resp_push 10
+  w = write int fd g_resp 0 get g_sz 5
+  cr = fclose int fd
+  if or lt w 0 lt cr 0
+    ret false
+  end
+  ret do_rename_port
+end
+
+fn log_request body_off ulong clen ulong to void
+  put g_sz 6 0
+  p1_ansdir
+  p1_str t_slash_rlog
+  fd = fopen g_p1 0 get g_sz 6 1089 420
+  if lt fd 0
+    ret
+  end
+  off = ulong 0
+  while lt off clen
+    w = write int fd g_req add body_off off sub clen off
+    if le w 0
+      break
+    end
+    off = add off ulong w
+  end
+  w2 = write int fd t_nl 0 1
+  cr = fclose int fd
+  if or lt w2 0 lt cr 0
+    ret
+  end
+end
+
+fn handle_get c int to void
+  put g_sz 6 0
+  p1_ansdir
+  p1_str t_slash_models
+  if not slurp_to_ans false
+    dn = len t_empty_models
+    if lt len g_ans dn
+      r = enlarge g_ans dn
+      if lt r 0
+        exit 1
+      end
+    end
+    i = ulong 0
+    while lt i dn
+      put g_ans i get t_empty_models i
+      i = add i 1
+    end
+    put g_sz 3 dn
+  end
+  resp_200_hdr get g_sz 3
+  send_all_buf c false get g_sz 5
+  send_all_buf c true get g_sz 3
+end
+
+fn append_untasked_num to void
+  u = add get g_sz 12 1
+  put g_sz 12 u
+  an = get g_sz 3
+  need = add an 32
+  if gt need len g_ans
+    r = enlarge g_ans need
+    if lt r 0
+      exit 1
+    end
+  end
+  put g_ans an 32
+  put g_ans add an 1 35
+  an = add an 2
+  tmp = new uchar 24 0
+  k = ulong 0
+  v = u
+  while gt v 0
+    put tmp k uchar add 48 rem v 10
+    v = div v 10
+    k = add k 1
+  end
+  while gt k 0
+    k = sub k 1
+    put g_ans an get tmp k
+    an = add an 1
+  end
+  put g_sz 3 an
+end
+
+fn hex_ch v ulong to uchar
+  if lt v 10
+    ret uchar add 48 v
+  end
+  ret uchar add 87 v
+end
+
+fn resp_escaped_ans an ulong to void
+  i = ulong 0
+  while lt i an
+    ch = get g_ans i
+    if or eq ch 34 eq ch 92
+      resp_push 92
+      resp_push ch
+    else
+      if eq ch 10
+        resp_push 92
+        resp_push 110
+      else
+        if lt ch 32
+          resp_str t_u00
+          resp_push hex_ch shr ulong ch 4
+          resp_push hex_ch and ulong ch 15
+        else
+          resp_push ch
+        end
+      end
+    end
+    i = add i 1
+  end
+end
+
+fn ans_is_500 to bool
+  if lt get g_sz 3 5
+    ret false
+  end
+  if ne get g_ans 0 64
+    ret false
+  end
+  if ne get g_ans 1 64
+    ret false
+  end
+  if ne get g_ans 2 53
+    ret false
+  end
+  if ne get g_ans 3 48
+    ret false
+  end
+  ret eq get g_ans 4 48
+end
+
+fn lookup_answer repair bool to void
+  put g_sz 6 0
+  p1_ansdir
+  p1_push 47
+  i = ulong 0
+  n = get g_sz 8
+  while lt i n
+    p1_push get g_arm i
+    i = add i 1
+  end
+  p1_push 47
+  i = ulong 0
+  n = get g_sz 9
+  while lt i n
+    p1_push get g_ent i
+    i = add i 1
+  end
+  if repair
+    p1_str t_dot_repair
+  end
+  got = false
+  if and not repair gt get g_sz 11 0
+    put g_sz 7 0
+    i = ulong 0
+    n = get g_sz 1
+    while lt i n
+      p2_push get g_ansdir i
+      i = add i 1
+    end
+    p2_str t_slash_seen
+    i = ulong 0
+    n = get g_sz 8
+    while lt i n
+      p2_push get g_arm i
+      i = add i 1
+    end
+    p2_push 46
+    i = ulong 0
+    n = get g_sz 9
+    while lt i n
+      p2_push get g_ent i
+      i = add i 1
+    end
+    p2_push 46
+    p2_seed
+    seen = eq stat g_p2 0 get g_sz 7 g_stat 0 128 0
+    mf = fopen g_p2 0 get g_sz 7 577 420
+    if ge mf 0
+      cr = fclose int mf
+      if lt cr 0
+        cr = 0
+      end
+    end
+    if seen
+      p2_copy_p1
+      p2_str t_dot_seed
+      p2_seed
+      p2_str t_dot_again
+      got = slurp_to_ans true
+    end
+    if not got
+      p2_copy_p1
+      p2_str t_dot_seed
+      p2_seed
+      got = slurp_to_ans true
+    end
+  end
+  if not got
+    got = slurp_to_ans false
+  end
+  if not got
+    fn_ = len t_fallback
+    if lt len g_ans fn_
+      r = enlarge g_ans fn_
+      if lt r 0
+        exit 1
+      end
+    end
+    i = ulong 0
+    while lt i fn_
+      put g_ans i get t_fallback i
+      i = add i 1
+    end
+    put g_sz 3 fn_
+  end
+end
+
+fn send_resp_as_200 c int to void
+  blen = get g_sz 5
+  if lt len g_ans blen
+    r = enlarge g_ans blen
+    if lt r 0
+      exit 1
+    end
+  end
+  i = ulong 0
+  while lt i blen
+    put g_ans i get g_resp i
+    i = add i 1
+  end
+  resp_200_hdr blen
+  send_all_buf c false get g_sz 5
+  send_all_buf c true blen
+end
+
+fn emit_post_response c int body_off ulong bend ulong clen ulong maxt long have_sj bool to void
+  an = get g_sz 3
+  trunc = false
+  if gt long an mul maxt 4
+    an = ulong mul maxt 4
+    trunc = true
+  end
+  put g_sz 5 0
+  resp_str t_j1
+  if trunc
+    resp_str t_len
+  else
+    resp_str t_stop
+  end
+  resp_str t_j2
+  resp_escaped_ans an
+  temp = num_after_req body_off bend t_temp f64 1.0
+  prep = num_after_sj t_prep f64 0.5
+  greedy = eq temp f64 0.0
+  if and have_sj ge find_in_sj t_fg 0
+    greedy = true
+  end
+  sd = long 0
+  if not and have_sj ge find_in_sj t_isd 0
+    sd = long num_after_req body_off bend t_seed f64 0.0
+  end
+  ptok = div clen 4
+  ctok = add div an 4 1
+  resp_str t_j3
+  resp_u64 ptok
+  resp_str t_j4
+  resp_u64 ctok
+  resp_str t_j5
+  resp_u64 add ptok ctok
+  resp_str t_j6
+  if greedy
+    resp_str t_greedy
+  else
+    resp_str t_sampled
+  end
+  resp_str t_j7
+  resp_i64 sd
+  resp_str t_j8
+  resp_f64_g prep
+  resp_str t_j9
+  resp_u64 ctok
+  resp_str t_j10
+  send_resp_as_200 c
+end
+
+fn handle_post c int body_off ulong clen ulong to void
+  log_request body_off clen
+  bend = add body_off clen
+  word_after_req body_off bend t_rep 0
+  last = neg long 1
+  p = body_off
+  while true
+    q = find_in_req p bend t_nentry
+    if lt q 0
+      break
+    end
+    last = q
+    p = add ulong q 1
+  end
+  put g_sz 9 0
+  if ge last 0
+    word_after_req ulong last bend t_nentry 1
+  end
+  word_after_req body_off bend t_maxt 2
+  word_after_req body_off bend t_seed 3
+  maxt = parse_mt
+  r1 = find_in_req body_off bend t_role1
+  r2 = find_in_req body_off bend t_role2
+  repair = or ge r1 0 ge r2 0
+  lookup_answer repair
+  have_sj = slurp_sampling
+  if eq get g_sz 9 0
+    if and have_sj ge find_in_sj t_vary 0
+      append_untasked_num
+    end
+  end
+  if ans_is_500
+    resp_500
+    send_all_buf c false get g_sz 5
+    ret
+  end
+  emit_post_response c body_off bend clen maxt have_sj
+end
+
+fn handle_conn c int to void
+  cap = ulong 1048576
+  if lt len g_req cap
+    r = enlarge g_req cap
+    if lt r 0
+      exit 1
+    end
+  end
+  rlen = ulong 0
+  clen = neg long 1
+  body_off = neg long 1
+  while lt rlen cap
+    got = read c g_req rlen sub cap rlen
+    if le got 0
+      break
+    end
+    rlen = add rlen ulong got
+    if lt body_off 0
+      h = find_crlf2 rlen
+      if ge h 0
+        clen = find_clen_ci ulong h
+        body_off = add h 4
+      end
+    end
+    if ge body_off 0
+      if ge sub long rlen body_off clen
+        break
+      end
+    end
+  end
+  if or or lt body_off 0 lt clen 0 gt add ulong body_off ulong clen rlen
+    ret
+  end
+  if ge rlen 4
+    if eq get g_req 0 71
+      if eq get g_req 1 69
+        if eq get g_req 2 84
+          if eq get g_req 3 32
+            handle_get c
+            ret
+          end
+        end
+      end
+    end
+  end
+  handle_post c ulong body_off ulong clen
+end
+
+fn main to int
+  if ne argcnt 3
+    err_str t_usage
+    ret 2
+  end
+  pl = argread 1 g_portfile 0 4095
+  al = argread 2 g_ansdir 0 4095
+  if or lt pl 0 lt al 0
+    err_str t_usage
+    ret 2
+  end
+  put g_sz 0 ulong pl
+  put g_sz 1 ulong al
+  ls = socknew 2 1 0
+  if lt ls 0
+    err_str t_esock
+    ret 1
+  end
+  put g_one 0 1
+  put g_one 1 0
+  put g_one 2 0
+  put g_one 3 0
+  so = sockopt int ls 1 2 g_one 0 4
+  if lt so 0
+    so = 0
+  end
+  i = ulong 0
+  while lt i 16
+    put g_sa i 0
+    i = add i 1
+  end
+  put g_sa 0 2
+  put g_sa 4 127
+  put g_sa 7 1
+  br = bind int ls g_sa 0 16
+  lr = listen int ls 8
+  sn = sockname int ls g_sa 0 16
+  if or or lt br 0 lt lr 0 lt sn 0
+    err_str t_ebind
+    ret 1
+  end
+  port = or shl ulong get g_sa 2 8 ulong get g_sa 3
+  if not write_port_file port
+    err_str t_eport
+    ret 1
+  end
+  while true
+    c = accept int ls 0
+    if lt c 0
+      continue
+    end
+    handle_conn int c
+    cr = fclose int c
+    if lt cr 0
+      cr = 0
+    end
+  end
+  ret 0
+end
