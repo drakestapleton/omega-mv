@@ -1,0 +1,893 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/turing/ty_qcont_lib.om -- Pure seeded OM-2 implementation of TURING
+note quantized continuous scoring (qint.v1), PRD1, and PRD2 mixture scoring.
+
+const TY_OK long 0
+const TY_E_OVERFLOW long -8
+
+const TYQ_OK long 0
+const TYQ_FAIL_PROTOCOL long -101
+const TYQ_FAIL_FLOOR long -102
+const TYQ_FAIL_LEAK long -103
+const TYQ_FAIL_DIGEST long -104
+const TYQ_FAIL_PROFILE long -105
+const TYQ_FAIL_BASELINE long -106
+const TYQ_E_ARG long -107
+const TYQ_E_IO long -108
+
+const TYQ_FAM_GAUSS ulong 0
+const TYQ_FAM_STUDENT ulong 1
+const TYQ_FAM_MIX ulong 2
+const TYQ_KMAX ulong 8
+const TYQ_K_LIMIT long 2251799813685248
+
+const PRD2_R_NONE ulong 0
+const PRD2_R_MAGIC ulong 1
+const PRD2_R_VERSION ulong 2
+const PRD2_R_SIZE ulong 3
+const PRD2_R_COUNT ulong 4
+const PRD2_R_INDEX ulong 5
+const PRD2_R_FAMILY ulong 6
+const PRD2_R_K ulong 7
+const PRD2_R_RESERVED ulong 8
+const PRD2_R_WEIGHT_NONFINITE ulong 9
+const PRD2_R_WEIGHT_RANGE ulong 10
+const PRD2_R_WEIGHT_SUM ulong 11
+const PRD2_R_GAUSS_WEIGHT ulong 12
+const PRD2_R_LOC ulong 13
+const PRD2_R_SCALE ulong 14
+
+const PRD_HDR ulong 8
+const PRD_REC ulong 24
+const P2_HDR ulong 16
+const P2_REC ulong 16
+const P2_CMP ulong 24
+
+text t_qst_ok "OK"
+text t_qst_fp "FAIL_PROTOCOL"
+text t_qst_ff "FAIL_FLOOR"
+text t_qst_fl "FAIL_LEAK"
+text t_qst_fd "FAIL_DIGEST"
+text t_qst_fpr "FAIL_PROFILE"
+text t_qst_fb "FAIL_BASELINE"
+text t_qst_ea "E_ARG"
+text t_qst_ei "E_IO"
+text t_qst_un "UNKNOWN"
+
+text t_p1_mag "PRD1"
+text t_p2_mag "PRD2"
+
+note ---- Pools for predictions (up to 8192 preds, 8192*8 = 65536 comps) ----
+global g_qp_idx ulong 8192
+global g_qp_fam ulong 8192
+global g_qp_k ulong 8192
+global g_qp_loc f64 8192
+global g_qp_sc f64 8192
+global g_qc_pi f64 65536
+global g_qc_loc f64 65536
+global g_qc_sc f64 65536
+global g_qk_arr long 8192
+
+note ---- Wire I/O & return scratch ----
+global g_qwire uchar 262144
+global g_qwire2 uchar 262144
+global g_qret_f f64 16
+global g_qret_i long 16
+global g_qret_u ulong 16
+global g_qmix_b f64 8
+
+note ---- Exact IEEE-754 double helpers ----
+fn q_ln2 to f64
+  ret bitcast f64 or shl ulong 0x3fe62e42 32 ulong 0xfefa39ef
+end
+
+fn q_ln2_hi to f64
+  ret bitcast f64 or shl ulong 0x3fe62e42 32 ulong 0xfee00000
+end
+
+fn q_ln2_lo to f64
+  ret bitcast f64 or shl ulong 0x3dea39ef 32 ulong 0x35793c76
+end
+
+fn q_hln2pi to f64
+  ret bitcast f64 or shl ulong 0x3fed67f1 32 ulong 0xc864beb4
+end
+
+fn q_delta to f64
+  ret bitcast f64 shl ulong 0x3eb00000 32
+end
+
+fn q_sd_min to f64
+  ret bitcast f64 shl ulong 0x3f500000 32
+end
+
+fn q_norm_tol to f64
+  ret f64 0.000000001
+end
+
+fn q_nan to f64
+  ret div f64 0.0 f64 0.0
+end
+
+fn q_inf to f64
+  ret div f64 1.0 f64 0.0
+end
+
+fn q_isnan x f64 to bool
+  ret ne x x
+end
+
+fn q_isfinite x f64 to bool
+  if ne x x
+    ret false
+  end
+  ret eq sub x x f64 0.0
+end
+
+fn q_fabs x f64 to f64
+  u = and bitcast ulong x or shl ulong 0x7fffffff 32 ulong 0xffffffff
+  ret bitcast f64 u
+end
+
+fn q_floor x f64 to f64
+  if not q_isfinite x
+    ret x
+  end
+  ax = q_fabs x
+  if ge ax f64 4503599627370496.0
+    ret x
+  end
+  iv = long x
+  fv = f64 iv
+  if gt fv x
+    ret sub fv f64 1.0
+  end
+  ret fv
+end
+
+fn q_llrint x f64 to long
+  fl = q_floor x
+  fr = sub x fl
+  if lt fr f64 0.5
+    ret long fl
+  end
+  if gt fr f64 0.5
+    ret add long fl 1
+  end
+  iv = long fl
+  if eq and bitcast ulong iv 1 0
+    ret iv
+  end
+  ret add iv 1
+end
+
+fn q_pow2i k long to f64
+  if lt k -1022
+    if lt k -1074
+      ret f64 0.0
+    end
+    sh = ulong sub k -1074
+    ret bitcast f64 shl ulong 1 sh
+  end
+  if gt k 1023
+    ret q_inf
+  end
+  be = ulong add k 1023
+  ret bitcast f64 shl be 52
+end
+
+fn q_ln x f64 to f64
+  if or q_isnan x lt x f64 0.0
+    ret q_nan
+  end
+  if eq x f64 0.0
+    ret sub f64 0.0 q_inf
+  end
+  if not q_isfinite x
+    ret q_inf
+  end
+  u = bitcast ulong x
+  exp = sub long shr u 52 1023
+  if eq shr u 52 0
+    x2 = mul x q_pow2i 54
+    u = bitcast ulong x2
+    exp = sub sub long shr u 52 1023 54
+  end
+  mu = or and u or shl ulong 0x000fffff 32 ulong 0xffffffff shl ulong 0x3ff00000 32
+  m = bitcast f64 mu
+  if gt m bitcast f64 or shl ulong 0x3ff6a09e 32 ulong 0x667f3bcd
+    m = mul m f64 0.5
+    exp = add exp 1
+  end
+  t = div sub m f64 1.0 add m f64 1.0
+  t2 = mul t t
+  s = div f64 1.0 f64 19.0
+  s = add div f64 1.0 f64 17.0 mul t2 s
+  s = add div f64 1.0 f64 15.0 mul t2 s
+  s = add div f64 1.0 f64 13.0 mul t2 s
+  s = add div f64 1.0 f64 11.0 mul t2 s
+  s = add div f64 1.0 f64 9.0 mul t2 s
+  s = add div f64 1.0 f64 7.0 mul t2 s
+  s = add div f64 1.0 f64 5.0 mul t2 s
+  s = add div f64 1.0 f64 3.0 mul t2 s
+  s = add f64 1.0 mul t2 s
+  lm = mul mul f64 2.0 t s
+  ef = f64 exp
+  ret add mul ef q_ln2_hi add mul ef q_ln2_lo lm
+end
+
+fn q_log2 x f64 to f64
+  ret div q_ln x q_ln2
+end
+
+fn q_log1p x f64 to f64
+  if q_isnan x
+    ret q_nan
+  end
+  if lt q_fabs x f64 0.25
+    t = div x add f64 2.0 x
+    t2 = mul t t
+    s = div f64 1.0 f64 17.0
+    s = add div f64 1.0 f64 15.0 mul t2 s
+    s = add div f64 1.0 f64 13.0 mul t2 s
+    s = add div f64 1.0 f64 11.0 mul t2 s
+    s = add div f64 1.0 f64 9.0 mul t2 s
+    s = add div f64 1.0 f64 7.0 mul t2 s
+    s = add div f64 1.0 f64 5.0 mul t2 s
+    s = add div f64 1.0 f64 3.0 mul t2 s
+    s = add f64 1.0 mul t2 s
+    ret mul mul f64 2.0 t s
+  end
+  ret q_ln add f64 1.0 x
+end
+
+fn q_exp x f64 to f64
+  if q_isnan x
+    ret q_nan
+  end
+  if gt x f64 709.782712893384
+    ret q_inf
+  end
+  if lt x f64 -745.1332191019412
+    ret f64 0.0
+  end
+  kf = q_floor add div x q_ln2 f64 0.5
+  k = long kf
+  r = sub sub x mul kf q_ln2_hi mul kf q_ln2_lo
+  p = div f64 1.0 f64 14.0
+  p = add f64 1.0 mul r div p f64 13.0
+  p = add f64 1.0 mul r div p f64 12.0
+  p = add f64 1.0 mul r div p f64 11.0
+  p = add f64 1.0 mul r div p f64 10.0
+  p = add f64 1.0 mul r div p f64 9.0
+  p = add f64 1.0 mul r div p f64 8.0
+  p = add f64 1.0 mul r div p f64 7.0
+  p = add f64 1.0 mul r div p f64 6.0
+  p = add f64 1.0 mul r div p f64 5.0
+  p = add f64 1.0 mul r div p f64 4.0
+  p = add f64 1.0 mul r div p f64 3.0
+  p = add f64 1.0 mul r div p f64 2.0
+  p = add f64 1.0 mul r p
+  if gt k 512
+    ret mul mul p q_pow2i 512 q_pow2i sub k 512
+  end
+  if lt k -512
+    ret mul mul p q_pow2i -512 q_pow2i add k 512
+  end
+  ret mul p q_pow2i k
+end
+
+fn q_exp2 x f64 to f64
+  ret q_exp mul x q_ln2
+end
+
+fn q_sinh x f64 to f64
+  ax = q_fabs x
+  if lt ax f64 0.1
+    x2 = mul x x
+    s = div f64 1.0 f64 39916800.0
+    s = add div f64 1.0 f64 362880.0 mul x2 s
+    s = add div f64 1.0 f64 5040.0 mul x2 s
+    s = add div f64 1.0 f64 120.0 mul x2 s
+    s = add div f64 1.0 f64 6.0 mul x2 s
+    ret mul x add f64 1.0 mul x2 s
+  end
+  ep = q_exp x
+  em = q_exp sub f64 0.0 x
+  ret mul f64 0.5 sub ep em
+end
+
+fn q_cos x f64 to f64
+  tp = bitcast f64 or shl ulong 0x401921fb 32 ulong 0x54442d18
+  pi = bitcast f64 or shl ulong 0x400921fb 32 ulong 0x54442d18
+  hp = bitcast f64 or shl ulong 0x3ff921fb 32 ulong 0x54442d18
+  r = q_fabs x
+  n = q_floor div r tp
+  r = sub r mul n tp
+  if gt r pi
+    r = sub tp r
+  end
+  sgn = f64 1.0
+  if gt r hp
+    r = sub pi r
+    sgn = f64 -1.0
+  end
+  r2 = mul r r
+  c = div f64 1.0 f64 87178291200.0
+  c = sub div f64 1.0 f64 479001600.0 mul r2 c
+  c = sub div f64 1.0 f64 3628800.0 mul r2 c
+  c = sub div f64 1.0 f64 40320.0 mul r2 c
+  c = sub div f64 1.0 f64 720.0 mul r2 c
+  c = sub div f64 1.0 f64 24.0 mul r2 c
+  c = sub f64 0.5 mul r2 c
+  c = sub f64 1.0 mul r2 c
+  ret mul sgn c
+end
+
+note ---- Checked i64 add (result in g_qret_i[0]) ----
+fn ty_add_chk a long b long to long
+  im = bitcast long or shl ulong 0x7fffffff 32 ulong 0xffffffff
+  inm = bitcast long shl ulong 0x80000000 32
+  if gt b 0
+    if gt a sub im b
+      ret TY_E_OVERFLOW
+    end
+  end
+  if lt b 0
+    if lt a sub inm b
+      ret TY_E_OVERFLOW
+    end
+  end
+  put g_qret_i 0 add a b
+  ret TY_OK
+end
+
+note ---- qint.v1 Gaussian scorer ----
+fn tyq_lnsinhc a f64 to f64
+  if lt a f64 0.0001
+    ret div mul a a f64 6.0
+  end
+  if lt a f64 1.0
+    ret q_ln div q_sinh a a
+  end
+  ret add sub a q_ln mul f64 2.0 a q_log1p sub f64 0.0 q_exp mul f64 -2.0 a
+end
+
+note ty_qcont_bits: slot p in g_qp_*, k. Writes bits -> g_qret_f[0], hit -> g_qret_u[0].
+fn ty_qcont_bits p ulong k long to long
+  if ne get g_qp_fam p TYQ_FAM_GAUSS
+    ret TYQ_FAIL_PROTOCOL
+  end
+  lc = get g_qp_loc p
+  sc = get g_qp_sc p
+  if or not q_isfinite lc or not q_isfinite sc not gt sc f64 0.0
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if or ge k TYQ_K_LIMIT le k sub 0 TYQ_K_LIMIT
+    ret TYQ_FAIL_PROTOCOL
+  end
+  s = sc
+  hit = ulong 0
+  if lt s q_sd_min
+    s = q_sd_min
+    hit = 1
+  end
+  zc = div sub mul add f64 k f64 0.5 q_delta lc s
+  b = div q_delta s
+  if or not q_isfinite zc or not q_isfinite b not gt b f64 0.0
+    ret TYQ_FAIL_PROTOCOL
+  end
+  a = mul mul q_fabs zc b f64 0.5
+  t1 = add mul mul zc zc f64 0.5 q_hln2pi
+  t2 = add q_ln b tyq_lnsinhc a
+  v = div sub t1 t2 q_ln2
+  if not q_isfinite v
+    ret TYQ_FAIL_PROTOCOL
+  end
+  put g_qret_f 0 v
+  put g_qret_u 0 hit
+  ret TYQ_OK
+end
+
+note ty_qcont_point_ub: writes ub -> g_qret_i[0], hit -> g_qret_u[0].
+fn ty_qcont_point_ub p ulong k long to long
+  rc = ty_qcont_bits p k
+  if ne rc TYQ_OK
+    ret rc
+  end
+  sc = mul f64 1000000.0 get g_qret_f 0
+  if not q_isfinite sc
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if gt q_fabs sc bitcast f64 or shl ulong 0x43df399b 32 ulong 0x1438a100
+    ret TYQ_FAIL_PROTOCOL
+  end
+  put g_qret_i 0 q_llrint sc
+  ret TYQ_OK
+end
+
+note ty_qcont_sum_ub: slots base..base+n-1, k in g_qk_arr[kbase..]. Writes ld_ub -> g_qret_i[1], hits -> g_qret_u[1].
+fn ty_qcont_sum_ub base ulong kbase ulong n ulong to long
+  sum = long 0
+  hits = ulong 0
+  for i ulong n
+    rc = ty_qcont_point_ub add base i get g_qk_arr add kbase i
+    if ne rc TYQ_OK
+      ret rc
+    end
+    ub = get g_qret_i 0
+    hit = get g_qret_u 0
+    if ne ty_add_chk sum ub TY_OK
+      ret TYQ_FAIL_PROTOCOL
+    end
+    sum = get g_qret_i 0
+    hits = add hits hit
+  end
+  put g_qret_i 1 sum
+  put g_qret_u 1 hits
+  ret TYQ_OK
+end
+
+fn ty_qcont_bytes_ub pb ulong to long
+  put g_qret_i 0 mul long 8000000 long pb
+  ret TYQ_OK
+end
+
+fn ty_qcont_rider_ub kp ulong npi ulong to long
+  if eq kp 0
+    put g_qret_i 0 0
+    ret TYQ_OK
+  end
+  if eq npi 0
+    ret TYQ_FAIL_PROTOCOL
+  end
+  v = mul f64 1000000.0 mul mul f64 kp f64 0.5 q_log2 f64 npi
+  if or not q_isfinite v gt v bitcast f64 or shl ulong 0x43df399b 32 ulong 0x1438a100
+    ret TYQ_FAIL_PROTOCOL
+  end
+  put g_qret_i 0 q_llrint v
+  ret TYQ_OK
+end
+
+fn ty_qcont_floor_check fh ulong sp ulong to long
+  if gt fh 18446744073709551
+    ret TYQ_FAIL_FLOOR
+  end
+  if gt mul fh 1000 sp
+    ret TYQ_FAIL_FLOOR
+  end
+  ret TYQ_OK
+end
+
+note ---- Wire little-endian helpers on g_qwire / g_qwire2 ----
+fn qw_rd32 which ulong off ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    b = ulong 0
+    if eq which 0
+      b = ulong get g_qwire add off i
+    else
+      b = ulong get g_qwire2 add off i
+    end
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn qw_rdf which ulong off ulong to f64
+  v = ulong 0
+  for i ulong 8
+    b = ulong 0
+    if eq which 0
+      b = ulong get g_qwire add off i
+    else
+      b = ulong get g_qwire2 add off i
+    end
+    v = or v shl b mul i 8
+  end
+  ret bitcast f64 v
+end
+
+fn qw_wr32 which ulong off ulong v ulong to void
+  for i ulong 4
+    b = uchar and shr v mul i 8 255
+    if eq which 0
+      put g_qwire add off i b
+    else
+      put g_qwire2 add off i b
+    end
+  end
+end
+
+fn qw_wrf which ulong off ulong d f64 to void
+  u = bitcast ulong d
+  for i ulong 8
+    b = uchar and shr u mul i 8 255
+    if eq which 0
+      put g_qwire add off i b
+    else
+      put g_qwire2 add off i b
+    end
+  end
+end
+
+note ---- PRD1 ----
+fn ty_prd_validate p ulong to long
+  if ne get g_qp_fam p TYQ_FAM_GAUSS
+    ret TYQ_FAIL_PROTOCOL
+  end
+  lc = get g_qp_loc p
+  sc = get g_qp_sc p
+  if or not q_isfinite lc or not q_isfinite sc not gt sc f64 0.0
+    ret TYQ_FAIL_PROTOCOL
+  end
+  ret TYQ_OK
+end
+
+fn ty_prd_parse_one which ulong off ulong p ulong exp_idx ulong to bool
+  idx = qw_rd32 which off
+  put g_qp_idx p idx
+  put g_qp_fam p qw_rd32 which add off 4
+  put g_qp_k p 0
+  put g_qp_loc p qw_rdf which add off 8
+  put g_qp_sc p qw_rdf which add off 16
+  if ne idx exp_idx
+    ret false
+  end
+  ret eq ty_prd_validate p TYQ_OK
+end
+
+note Parse PRD1 from g_qwire[0..blen-1] into g_qp_*[dst..dst+cnt-1]
+fn ty_prd_parse which ulong blen ulong first ulong cnt ulong dst ulong to long
+  if eq cnt 0
+    ret TYQ_E_ARG
+  end
+  if gt add first cnt 4294967295
+    ret TYQ_E_ARG
+  end
+  if lt blen PRD_HDR
+    ret TYQ_FAIL_PROTOCOL
+  end
+  for i ulong 4
+    b = uchar 0
+    if eq which 0
+      b = get g_qwire i
+    else
+      b = get g_qwire2 i
+    end
+    if ne b get t_p1_mag i
+      ret TYQ_FAIL_PROTOCOL
+    end
+  end
+  if ne qw_rd32 which 4 1
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if ne sub blen PRD_HDR mul cnt PRD_REC
+    ret TYQ_FAIL_PROTOCOL
+  end
+  for i ulong cnt
+    if not ty_prd_parse_one which add PRD_HDR mul i PRD_REC add dst i add first i
+      ret TYQ_FAIL_PROTOCOL
+    end
+  end
+  ret TYQ_OK
+end
+
+note Encode PRD1 from g_qp_*[src..src+cnt-1] into g_qwire2[0..]; len -> g_qret_u[0]
+fn ty_prd_encode src ulong first ulong cnt ulong to long
+  for i ulong cnt
+    p = add src i
+    if or ne ty_prd_validate p TYQ_OK ne get g_qp_idx p add first i
+      ret TYQ_FAIL_PROTOCOL
+    end
+  end
+  for i ulong 4
+    put g_qwire2 i get t_p1_mag i
+  end
+  qw_wr32 1 4 1
+  for i ulong cnt
+    off = add PRD_HDR mul i PRD_REC
+    p = add src i
+    qw_wr32 1 off get g_qp_idx p
+    qw_wr32 1 add off 4 get g_qp_fam p
+    qw_wrf 1 add off 8 get g_qp_loc p
+    qw_wrf 1 add off 16 get g_qp_sc p
+  end
+  put g_qret_u 0 add PRD_HDR mul cnt PRD_REC
+  ret TYQ_OK
+end
+
+note ---- PRD2 ----
+note Validates g_qp_*[p]; reason -> g_qret_u[2]
+fn ty_prd2_validate p ulong to long
+  put g_qret_u 2 PRD2_R_NONE
+  fam = get g_qp_fam p
+  kv = get g_qp_k p
+  if and ne fam TYQ_FAM_GAUSS ne fam TYQ_FAM_MIX
+    put g_qret_u 2 PRD2_R_FAMILY
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if and eq fam TYQ_FAM_GAUSS ne kv 1
+    put g_qret_u 2 PRD2_R_K
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if and eq fam TYQ_FAM_MIX or lt kv 1 gt kv TYQ_KMAX
+    put g_qret_u 2 PRD2_R_K
+    ret TYQ_FAIL_PROTOCOL
+  end
+  sum = f64 0.0
+  bo = mul p 8
+  for j ulong kv
+    pi = get g_qc_pi add bo j
+    lc = get g_qc_loc add bo j
+    sc = get g_qc_sc add bo j
+    if not q_isfinite pi
+      put g_qret_u 2 PRD2_R_WEIGHT_NONFINITE
+      ret TYQ_FAIL_PROTOCOL
+    end
+    if or not gt pi f64 0.0 gt pi f64 1.0
+      put g_qret_u 2 PRD2_R_WEIGHT_RANGE
+      ret TYQ_FAIL_PROTOCOL
+    end
+    if not q_isfinite lc
+      put g_qret_u 2 PRD2_R_LOC
+      ret TYQ_FAIL_PROTOCOL
+    end
+    if or not q_isfinite sc not gt sc f64 0.0
+      put g_qret_u 2 PRD2_R_SCALE
+      ret TYQ_FAIL_PROTOCOL
+    end
+    sum = add sum pi
+  end
+  if eq fam TYQ_FAM_GAUSS
+    if ne get g_qc_pi bo f64 1.0
+      put g_qret_u 2 PRD2_R_GAUSS_WEIGHT
+      ret TYQ_FAIL_PROTOCOL
+    end
+    if ne get g_qp_loc p get g_qc_loc bo
+      put g_qret_u 2 PRD2_R_LOC
+      ret TYQ_FAIL_PROTOCOL
+    end
+    if ne get g_qp_sc p get g_qc_sc bo
+      put g_qret_u 2 PRD2_R_LOC
+      ret TYQ_FAIL_PROTOCOL
+    end
+  else
+    if gt q_fabs sub sum f64 1.0 q_norm_tol
+      put g_qret_u 2 PRD2_R_WEIGHT_SUM
+      ret TYQ_FAIL_PROTOCOL
+    end
+  end
+  ret TYQ_OK
+end
+
+fn ty_prd2_read_cmps which ulong off2 ulong p ulong kv ulong to void
+  bo = mul p 8
+  for j ulong kv
+    co = add off2 mul j P2_CMP
+    put g_qc_pi add bo j qw_rdf which co
+    put g_qc_loc add bo j qw_rdf which add co 8
+    put g_qc_sc add bo j qw_rdf which add co 16
+  end
+  if eq get g_qp_fam p TYQ_FAM_GAUSS
+    put g_qp_loc p get g_qc_loc bo
+    put g_qp_sc p get g_qc_sc bo
+  end
+end
+
+fn ty_prd2_parse_one which ulong blen ulong off ulong p ulong exp_idx ulong to long
+  if lt sub blen off P2_REC
+    put g_qret_u 2 PRD2_R_SIZE
+    ret -1
+  end
+  idx = qw_rd32 which off
+  fam = qw_rd32 which add off 4
+  kv = qw_rd32 which add off 8
+  rsv = qw_rd32 which add off 12
+  off2 = add off P2_REC
+  put g_qp_idx p idx
+  put g_qp_fam p fam
+  put g_qp_k p kv
+  if ne idx exp_idx
+    put g_qret_u 2 PRD2_R_INDEX
+    ret -1
+  end
+  if ne rsv 0
+    put g_qret_u 2 PRD2_R_RESERVED
+    ret -1
+  end
+  if or lt kv 1 gt kv TYQ_KMAX
+    put g_qret_u 2 PRD2_R_K
+    ret -1
+  end
+  if lt sub blen off2 mul kv P2_CMP
+    put g_qret_u 2 PRD2_R_SIZE
+    ret -1
+  end
+  ty_prd2_read_cmps which off2 p kv
+  if ne ty_prd2_validate p TYQ_OK
+    ret -1
+  end
+  ret long add off2 mul kv P2_CMP
+end
+
+fn ty_prd2_parse which ulong blen ulong first ulong cnt ulong dst ulong to long
+  put g_qret_u 2 PRD2_R_NONE
+  if eq cnt 0
+    ret TYQ_E_ARG
+  end
+  if gt add first cnt 4294967295
+    ret TYQ_E_ARG
+  end
+  if lt blen P2_HDR
+    put g_qret_u 2 PRD2_R_SIZE
+    ret TYQ_FAIL_PROTOCOL
+  end
+  for i ulong 4
+    b = uchar 0
+    if eq which 0
+      b = get g_qwire i
+    else
+      b = get g_qwire2 i
+    end
+    if ne b get t_p2_mag i
+      put g_qret_u 2 PRD2_R_MAGIC
+      ret TYQ_FAIL_PROTOCOL
+    end
+  end
+  if ne qw_rd32 which 4 2
+    put g_qret_u 2 PRD2_R_VERSION
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if or ne qw_rd32 which 8 cnt ne qw_rd32 which 12 first
+    put g_qret_u 2 PRD2_R_COUNT
+    ret TYQ_FAIL_PROTOCOL
+  end
+  off = P2_HDR
+  for i ulong cnt
+    noff = ty_prd2_parse_one which blen off add dst i add first i
+    if lt noff 0
+      ret TYQ_FAIL_PROTOCOL
+    end
+    off = ulong noff
+  end
+  if ne off blen
+    put g_qret_u 2 PRD2_R_SIZE
+    ret TYQ_FAIL_PROTOCOL
+  end
+  ret TYQ_OK
+end
+
+fn ty_prd2_enc_one which ulong off ulong p ulong to ulong
+  kv = get g_qp_k p
+  qw_wr32 which off get g_qp_idx p
+  qw_wr32 which add off 4 get g_qp_fam p
+  qw_wr32 which add off 8 kv
+  qw_wr32 which add off 12 0
+  o = add off P2_REC
+  bo = mul p 8
+  for j ulong kv
+    qw_wrf which o get g_qc_pi add bo j
+    qw_wrf which add o 8 get g_qc_loc add bo j
+    qw_wrf which add o 16 get g_qc_sc add bo j
+    o = add o P2_CMP
+  end
+  ret o
+end
+
+note Encode PRD2 from g_qp_*[src..src+cnt-1] into g_qwire[0..]; len -> g_qret_u[0]
+fn ty_prd2_encode which ulong src ulong first ulong cnt ulong to long
+  for i ulong cnt
+    p = add src i
+    if or ne ty_prd2_validate p TYQ_OK ne get g_qp_idx p add first i
+      ret TYQ_FAIL_PROTOCOL
+    end
+  end
+  for i ulong 4
+    if eq which 0
+      put g_qwire i get t_p2_mag i
+    else
+      put g_qwire2 i get t_p2_mag i
+    end
+  end
+  qw_wr32 which 4 2
+  qw_wr32 which 8 cnt
+  qw_wr32 which 12 first
+  off = P2_HDR
+  for i ulong cnt
+    off = ty_prd2_enc_one which off add src i
+  end
+  put g_qret_u 0 off
+  ret TYQ_OK
+end
+
+note ty_qcont2_bits: uses scratch slot 8191 for component Gaussian calls
+fn ty_qcont2_bits p ulong k long to long
+  if ne ty_prd2_validate p TYQ_OK
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if eq get g_qp_fam p TYQ_FAM_GAUSS
+    ret ty_qcont_bits p k
+  end
+  kv = get g_qp_k p
+  bo = mul p 8
+  anyhit = ulong 0
+  m = q_inf
+  for j ulong kv
+    put g_qp_idx 8191 get g_qp_idx p
+    put g_qp_fam 8191 TYQ_FAM_GAUSS
+    put g_qp_loc 8191 get g_qc_loc add bo j
+    put g_qp_sc 8191 get g_qc_sc add bo j
+    rc = ty_qcont_bits 8191 k
+    if ne rc TYQ_OK
+      ret rc
+    end
+    bj = get g_qret_f 0
+    put g_qmix_b j bj
+    anyhit = or anyhit get g_qret_u 0
+    if lt bj m
+      m = bj
+    end
+  end
+  acc = f64 0.0
+  for j ulong kv
+    pi = get g_qc_pi add bo j
+    bj = get g_qmix_b j
+    acc = add acc mul pi q_exp2 sub m bj
+  end
+  v = sub m q_log2 acc
+  if not q_isfinite v
+    ret TYQ_FAIL_PROTOCOL
+  end
+  put g_qret_f 0 v
+  put g_qret_u 0 anyhit
+  ret TYQ_OK
+end
+
+fn ty_qcont2_point_ub p ulong k long to long
+  if eq get g_qp_fam p TYQ_FAM_GAUSS
+    if eq ty_prd2_validate p TYQ_OK
+      ret ty_qcont_point_ub p k
+    end
+  end
+  rc = ty_qcont2_bits p k
+  if ne rc TYQ_OK
+    ret rc
+  end
+  s = mul f64 1000000.0 get g_qret_f 0
+  if not q_isfinite s
+    ret TYQ_FAIL_PROTOCOL
+  end
+  if gt q_fabs s bitcast f64 or shl ulong 0x43df399b 32 ulong 0x1438a100
+    ret TYQ_FAIL_PROTOCOL
+  end
+  put g_qret_i 0 q_llrint s
+  ret TYQ_OK
+end
+
+fn ty_qcont2_sum_ub base ulong kbase ulong n ulong to long
+  if eq n 0
+    ret TYQ_E_ARG
+  end
+  sum = long 0
+  hits = ulong 0
+  for i ulong n
+    rc = ty_qcont2_point_ub add base i get g_qk_arr add kbase i
+    if ne rc TYQ_OK
+      ret rc
+    end
+    ub = get g_qret_i 0
+    hit = get g_qret_u 0
+    if ne ty_add_chk sum ub TY_OK
+      ret TYQ_FAIL_PROTOCOL
+    end
+    sum = get g_qret_i 0
+    hits = add hits hit
+  end
+  put g_qret_i 1 sum
+  put g_qret_u 1 hits
+  ret TYQ_OK
+end

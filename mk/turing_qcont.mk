@@ -8,28 +8,20 @@
 ifndef TURING_QCONT_MK
 TURING_QCONT_MK := 1
 .PHONY: test-turing-qcont
-TYQC_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -Itests/turing -ffp-contract=off -fno-fast-math
-TYQC_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-TYQC_SRCS = src/turing/ty_qcont.c src/turing/ty_prd.c src/turing/ty_math.c
-TYQC_HDRS = src/turing/ty_qcont.h src/turing/ty_prd.h src/turing/ty_math.h
+TYQC_OM_LIB = src/turing/ty_qcont_lib.om
 TYQC_DIR = $(OUT_DIR)/tests-turing-qcont
 
-$(TYQC_DIR)/qcont_kat_gen: tests/turing/qcont_kat_gen.c
+$(TYQC_DIR)/qcont_kat_gen: $(TYQC_OM_LIB) tests/turing/qcont_kat_gen.om seed/out/omc
 	@mkdir -p $(TYQC_DIR)
-	$(CC) $(TYQC_CFLAGS) -DQKAT_MAIN -o $@ tests/turing/qcont_kat_gen.c -lm
+	cat $(TYQC_OM_LIB) tests/turing/qcont_kat_gen.om | seed/out/omc > $@ && chmod +x $@
 
-$(TYQC_DIR)/test_ty_qcont: tests/turing/test_ty_qcont.c tests/turing/qcont_kat_gen.c $(TYQC_SRCS) $(TYQC_HDRS)
+$(TYQC_DIR)/test_ty_qcont: $(TYQC_OM_LIB) tests/turing/test_ty_qcont.om seed/out/omc
 	@mkdir -p $(TYQC_DIR)
-	$(CC) $(TYQC_CFLAGS) -o $@ tests/turing/test_ty_qcont.c $(TYQC_SRCS) -lm
+	cat $(TYQC_OM_LIB) tests/turing/test_ty_qcont.om | seed/out/omc > $@ && chmod +x $@
 
-$(TYQC_DIR)/test_ty_qcont_asan: tests/turing/test_ty_qcont.c tests/turing/qcont_kat_gen.c $(TYQC_SRCS) $(TYQC_HDRS)
-	@mkdir -p $(TYQC_DIR)
-	$(CC) $(TYQC_CFLAGS) $(TYQC_ASAN) -o $@ tests/turing/test_ty_qcont.c $(TYQC_SRCS) -lm
-
-test-turing-qcont: $(TYQC_DIR)/qcont_kat_gen $(TYQC_DIR)/test_ty_qcont $(TYQC_DIR)/test_ty_qcont_asan
+test-turing-qcont: $(TYQC_DIR)/qcont_kat_gen $(TYQC_DIR)/test_ty_qcont
 	./$(TYQC_DIR)/qcont_kat_gen > $(TYQC_DIR)/kat_table.txt
 	! grep -q REFUSED $(TYQC_DIR)/kat_table.txt
 	./$(TYQC_DIR)/test_ty_qcont
-	./$(TYQC_DIR)/test_ty_qcont_asan
-	@echo "test-turing-qcont: qint.v1 KATs, refusals and PRD1 cases pass in plain and ASan/UBSan builds"
+	@echo "test-turing-qcont: pure OM-2 qint.v1 KATs, refusals and PRD1 cases pass"
 endif
