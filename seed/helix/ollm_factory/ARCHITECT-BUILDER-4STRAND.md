@@ -25,3 +25,8 @@ Pure seeded-Omega implementation of the **4-Strand Architect–Builder RLVR Plan
 ```sh
 sh seed/helix/ollm_factory/architect-builder-gate.sh
 ```
+
+## Campaign results
+
+- Rounds 1 to 3 and Cycle 1: `evidence/OLLM-HELIX-CLOSED-LOOP-20261121/`.
+- Cycle 2 harvest, `r0` baseline re-measurement, and rounds 4 to 11: `evidence/OLLM-AB4-ROUNDS-4-11-20261122/`. Diminishing returns reached on the frozen benchmark for this model and this data (rounds 4 to 11 scored 3, 5, 5, 5, 2, 2, 4 and 2 of 159 vs round 3's 6 / 159; nothing promoted). The `r8` vs `r9` ablation confirmed that widening the rehearsal draw recovers most of the rounds 1–3 held-out forgetting (`3.128` back to `2.218–2.244` against the pre-campaign `r0` baseline of `2.144`, plateaued in `r10–r11`). GPU training of frozen-core strands, Architect Cycle 3, and a widened core are NOT_RUN.
