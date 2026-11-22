@@ -2,11 +2,11 @@
 # Physics or Aienux sources needed. Run from the repo root.
 AIEN_MID_TEST = $(OUT_DIR)/aien_machine_id_test
 
-$(AIEN_MID_TEST): tests/runtime/aien_machine_id_test.c src/runtime/aien_machine_id.c \
-		src/runtime/aien_machine_id.h src/omega_om_units.c src/sha256.h
+$(AIEN_MID_TEST): tests/runtime/aien_machine_id_test.om src/runtime/aien_machine_id.om \
+		seed/ng/sha256.om
 	mkdir -p $(dir $@)
-	$(CC) -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc -o $@ \
-		tests/runtime/aien_machine_id_test.c src/runtime/aien_machine_id.c src/omega_om_units.c
+	( echo om2; cat seed/ng/sha256.om src/runtime/aien_machine_id.om tests/runtime/aien_machine_id_test.om ) | $(SEED_OMC) > $@
+	chmod +x $@
 
 .PHONY: test-machine-identity
 test-machine-identity: $(AIEN_MID_TEST)
