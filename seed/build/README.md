@@ -11,9 +11,10 @@ Every build, release, and delivery coordinator in this directory is pure seeded 
 | `units.om` | `om-units` | `om/units.sh` | Byte-for-byte regeneration and `--check` of `src/omega_om_units.{c,ident,fs.c}` and `src/omega_{native,api_decl}.h` |
 | `tlsbuild.om` | `om-tlsbuild` | `om/tls/build.sh` | Composes the 15 `om/tls/` units with a program, compiles with `omc`, and stamps the FIPS FKIH HMAC-SHA-256 slot (`-p` for stamp-only) |
 | `sparkefi.om` | `om-sparkefi` | `aienux/spark/build_spark_efi.sh` (including both inline Python 3 scripts) | Word-boundary namespacing, 6-slice `target a64efi` composition, `PLAT` safety guards, and PE32+ header + SHA-256 verification |
-| `gpucoord.om` | `om-gpucoord` | `gpu/spirv/{omega-run,check}.sh`, `gpu/intel/gate.sh`, `om/gpu/{spec,dsv41,inkling2}/build.sh` | SPIR-V `emit`/`val`/`run`/`conform` runner & check suite, Intel Xe gate, and SM121 model package builders (`build-spec`, `build-dsv41`, `build-inkling2`) |
+| `gpucoord.om` | `om-gpucoord` | `gpu/spirv/{omega-run,check}.sh`, `gpu/intel/gate.sh`, `om/gpu/{spec,dsv41,inkling2,q36}/build.sh` | SPIR-V `emit`/`val`/`run`/`conform` runner & check suite, Intel Xe gate, and SM121 model package builders (`build-spec`, `build-dsv41`, `build-inkling2`, `build-q36`) |
 | `release.om` | `om-release` | `Makefile` lock checks, `tools/uxl/{windows_paths,run_all}.py`, `uxl-run.sh` (AArch64 Linux), layer/release orchestration | `check-locks` (omc pin + `*.lock` 40-hex + `.env` scan), `check-paths` (Windows path & case-collision check), `layers` (all 8 SI `units-gate.om`), `uxl` (host + 65-file Level 1 + SPIR-V + Xe), `package OUTDIR VERSION`, `verify OUTDIR` |
-| `gate.om` | `om-build-gate` | — | Self-qualification gate (`OMEGA-BUILD-COORD`): 2× deterministic builds of all 6 coordinators, end-to-end positive checks, and 6 planted negative controls |
+| `phase0.om` | `om-phase0` | — | Helix Phase 0 Baseline & Determinism Floor Exit Gate: 2× `omc` self-regeneration (`c(sA, A) == A`), 4-rung birth, `om-build-gate`, 78-theorem `uor-gpu` Lean 4 proof check, `uor-gpu-gate`, pure-OM-2 `q36`/`inkling2`/`dsv41` builds + host gates, and live GB10 silicon checks with `nvrm_errors_delta = 0` (`--host-only` for non-GPU hosts) |
+| `gate.om` | `om-build-gate` | — | Self-qualification gate (`OMEGA-BUILD-COORD`): 2× deterministic builds of all 7 coordinators, end-to-end positive checks, and 6 planted negative controls |
 
 ## Direct Pure-Omega Invocation (No `make`, No `sh`, No Python)
 
@@ -37,4 +38,4 @@ chmod +x build/om-release
 
 Once packaged into `OUTDIR/bin/`, every coordinator binary (`omc`, `om-birth`, `om-units`, `om-tlsbuild`, `om-sparkefi`, `om-gpucoord`, `om-release`) runs directly with zero shell or Python dependencies.
 
-Legacy `.sh` scripts (`seed/omega-from-seed.sh`, `om/units.sh`, `om/tls/build.sh`, `aienux/spark/build_spark_efi.sh`, `gpu/spirv/{omega-run,check}.sh`, `gpu/intel/gate.sh`, `om/gpu/{spec,dsv41,inkling2}/build.sh`, `uxl-run.sh`) and `mk/omega-from-seed.mk` now act as thin compatibility shims that compile and `exec` these pure-Omega coordinators directly on AArch64 Linux, keeping existing callers (including `BLOCKED_OPERATOR` `tests/gates/run.sh`) working unchanged.
+Legacy `.sh` scripts (`seed/omega-from-seed.sh`, `om/units.sh`, `om/tls/build.sh`, `aienux/spark/build_spark_efi.sh`, `gpu/spirv/{omega-run,check}.sh`, `gpu/intel/gate.sh`, `om/gpu/{spec,dsv41,inkling2,q36}/build.sh`, `uxl-run.sh`) and `mk/omega-from-seed.mk` now act as thin compatibility shims that compile and `exec` these pure-Omega coordinators directly on AArch64 Linux, keeping existing callers (including `BLOCKED_OPERATOR` `tests/gates/run.sh`) working unchanged.
