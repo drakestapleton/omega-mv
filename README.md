@@ -1,6 +1,6 @@
 # Omega
 
-![Omega logo: braided strands forming the Omega symbol above the word OMEGA](docs/img/omega-logo.png)
+![Omega logo: braided strands forming the Omega symbol above the word OMEGA](docs/img/omega-logo.png) ![Sovereign Intelligence wordmark: a small ember square before the name](docs/img/sovereign-intelligence-logo.png)
 
 **No more out-of-memory. A 35B model up in about a minute. Straight to the metal.**
 
