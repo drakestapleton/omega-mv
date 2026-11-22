@@ -1,0 +1,230 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/turing/tc_rans.om: Reference coder B (32-bit rANS, byte renormalization, TCA1)
+note in pure seeded OM-2. Composed after tc_pstream.om.
+note Consumes only TPS1/TSY1 arrays; never references any model code.
+
+const TC_RANS_ID ulong 2
+const TC_RANS_L ulong 8388608
+const TC_RANS_MAX ulong 2147483648
+
+text TC_W_RA_TRUNC4 "rANS payload has fewer than 4 bytes (truncated bitstream)"
+text TC_W_RA_INIT "rANS initial state outside [2^23, 2^31)"
+text TC_W_RA_TRUNC "rANS payload ended early (truncated bitstream)"
+text TC_W_RA_TERM "rANS termination check failed (final state != L)"
+text TC_W_RA_TRAIL "rANS payload has trailing bytes"
+text TC_W_RA_ENC "rANS encode failed"
+
+note rANS state: 0=cum, 1=x, 2=pos, 3=in_off, 4=plen
+global tc_ra_st ulong 5
+
+fn tc_ra_row_cum qoff ulong k ulong s ulong to int
+tot = ulong 0
+c = ulong 0
+for x ulong k bound 16
+v = ulong get tc_ps_q add qoff x
+if eq v 0
+ret TC_E_ZERO
+end
+if eq x s
+c = tot
+end
+tot = add tot v
+end
+if ne tot TC_QONE
+ret TC_E_NORM
+end
+put tc_ra_st 0 c
+ret TC_OK
+end
+
+fn tc_ra_enc_sym t ulong k ulong to int
+qoff = mul t k
+s = ulong get tc_sy_sym t
+if ge s k
+ret TC_E_SYMBOL
+end
+rc = tc_ra_row_cum qoff k s
+if ne rc TC_OK
+ret rc
+end
+c = get tc_ra_st 0
+f = ulong get tc_ps_q add qoff s
+xmax = mul 32768 f
+x = get tc_ra_st 1
+p = get tc_ra_st 2
+while ge x xmax bound 2
+p = sub p 1
+put tc_cb p uchar and x 255
+x = shr x 8
+end
+x = add add shl div x f 16 rem x f c
+put tc_ra_st 1 x
+put tc_ra_st 2 p
+ret TC_OK
+end
+
+fn tc_ra_finish out_off ulong to void
+x = get tc_ra_st 1
+p = sub get tc_ra_st 2 4
+put tc_cb p uchar and x 255
+put tc_cb add p 1 uchar and shr x 8 255
+put tc_cb add p 2 uchar and shr x 16 255
+put tc_cb add p 3 uchar and shr x 24 255
+nb = sub TC_CB_CAP p
+for j ulong nb bound 4194304
+put tc_cb add out_off j get tc_cb add p j
+end
+put tc_cb_plen 0 nb
+end
+
+fn tc_rans_encode_raw lo ulong n ulong k ulong out_off ulong to int
+if lt k TC_KMIN
+ret TC_E_ARG
+end
+if gt k TC_KMAX
+ret TC_E_ARG
+end
+if gt add add mul n 2 4 out_off TC_CB_CAP
+ret TC_E_IO
+end
+put tc_ra_st 1 TC_RANS_L
+put tc_ra_st 2 TC_CB_CAP
+i = n
+while gt i 0 bound 500000
+i = sub i 1
+rc = tc_ra_enc_sym add lo i k
+if ne rc TC_OK
+ret rc
+end
+end
+tc_ra_finish out_off
+ret TC_OK
+end
+
+fn tc_ra_dec_renorm to int
+x = get tc_ra_st 1
+pos = get tc_ra_st 2
+in_off = get tc_ra_st 3
+plen = get tc_ra_st 4
+while lt x TC_RANS_L bound 2
+if ge pos plen
+tc_why_set TC_W_RA_TRUNC
+ret TC_E_TRUNC
+end
+x = or shl x 8 ulong get tc_cb add in_off pos
+pos = add pos 1
+end
+put tc_ra_st 1 x
+put tc_ra_st 2 pos
+ret TC_OK
+end
+
+fn tc_ra_dec_sym t ulong i ulong k ulong to int
+qoff = mul t k
+x = get tc_ra_st 1
+m = and x 65535
+cum = ulong 0
+tot = ulong 0
+s = k
+for y ulong k bound 16
+v = ulong get tc_ps_q add qoff y
+if eq v 0
+tc_why_set TC_W_ZERO
+ret TC_E_ZERO
+end
+if eq s k
+if lt m add tot v
+s = y
+cum = tot
+end
+end
+tot = add tot v
+end
+if or ne tot TC_QONE eq s k
+tc_why_set TC_W_NORM
+ret TC_E_NORM
+end
+put tc_dsy_sym i uchar s
+f = ulong get tc_ps_q add qoff s
+x = sub add mul f shr x 16 m cum
+put tc_ra_st 1 x
+ret tc_ra_dec_renorm
+end
+
+fn tc_rans_decode_raw lo ulong n ulong k ulong in_off ulong plen ulong to int
+if lt k TC_KMIN
+ret TC_E_ARG
+end
+if gt k TC_KMAX
+ret TC_E_ARG
+end
+if lt plen 4
+tc_why_set TC_W_RA_TRUNC4
+ret TC_E_TRUNC
+end
+b0 = ulong get tc_cb in_off
+b1 = ulong get tc_cb add in_off 1
+b2 = ulong get tc_cb add in_off 2
+b3 = ulong get tc_cb add in_off 3
+x = or or b0 shl b1 8 or shl b2 16 shl b3 24
+if or lt x TC_RANS_L ge x TC_RANS_MAX
+tc_why_set TC_W_RA_INIT
+ret TC_E_CORRUPT
+end
+put tc_ra_st 1 x
+put tc_ra_st 2 4
+put tc_ra_st 3 in_off
+put tc_ra_st 4 plen
+for i ulong n bound 500000
+rc = tc_ra_dec_sym add lo i i k
+if ne rc TC_OK
+ret rc
+end
+end
+if ne get tc_ra_st 1 TC_RANS_L
+tc_why_set TC_W_RA_TERM
+ret TC_E_CORRUPT
+end
+if ne get tc_ra_st 2 plen
+tc_why_set TC_W_RA_TRAIL
+ret TC_E_TRAIL
+end
+ret TC_OK
+end
+
+fn tc_rans_encode to int
+rc = tc_pair_check
+if ne rc TC_OK
+ret rc
+end
+rc = tc_ps_check_rows
+if ne rc TC_OK
+ret rc
+end
+rc = tc_rans_encode_raw 0 get tc_ps_n 0 get tc_ps_k 0 TC_CODED_HEADER
+if ne rc TC_OK
+tc_why_set TC_W_RA_ENC
+ret rc
+end
+pn = get tc_cb_plen 0
+tc_coded_hdr_write TC_RANS_ID pn
+put tc_cb_len 0 add TC_CODED_HEADER pn
+ret TC_OK
+end
+
+fn tc_rans_decode clen ulong to int
+rc = tc_coded_hdr_check TC_RANS_ID clen
+if ne rc TC_OK
+ret rc
+end
+k = get tc_ps_k 0
+n = get tc_ps_n 0
+put tc_dsy_k 0 k
+put tc_dsy_n 0 n
+for i ulong 32
+put tc_dsy_dat i get tc_ps_dat i
+end
+ret tc_rans_decode_raw 0 n k TC_CODED_HEADER get tc_cb_plen 0
+end

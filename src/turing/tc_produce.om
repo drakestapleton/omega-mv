@@ -1,0 +1,759 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/turing/tc_produce.om: Predictor side of EXP-001 in pure seeded OM-2.
+note Decodes TYM0 models, reads CTR1 search traces, produces (TPS1, TSY1).
+note Composed after seed/ng/sha256.om, tc_pstream.om, tc_range_lib.om, tc_rans.om.
+
+const TP_CTR1_BYTES ulong 247
+const TP_MAX_ROWS ulong 65536
+const TP_MAX_MBUF ulong 4194304
+const TP_MAX_EV ulong 500000
+
+text TP_W_MBAD "invalid TYM0 model file"
+text TP_W_CBAD "invalid CTR1 trace file"
+text TP_W_SYM "event symbol outside model alphabet"
+text TP_W_ROW "model row entry out of 1..65535"
+text TP_W_SCORE "probability stream ideal differs from model score"
+
+note Model state: 0=K, 1=mask, 2=keybits, 3=nrows, 4=lm_bits
+global tp_mst ulong 5
+global tp_mdef ushort 16
+global tp_mkeys ulong 65536
+global tp_mq ushort 1048576
+global tp_mdig uchar 32
+global tp_mbuf uchar 4194304
+global tp_mbuf_len ulong 1
+
+note Bit reader / writer state: 0=nbits, 1=pos, 2=err
+global tp_br ulong 3
+
+note Key space result: 0=space, 1=bits
+global tp_ks ulong 2
+
+note CTR1 event stream state
+global tp_ev_n ulong 1
+global tp_ev_sym uchar 500000
+global tp_ev_op uchar 500000
+global tp_ev_depth uchar 500000
+global tp_ev_first uchar 500000
+global tp_ev_crumb ushort 500000
+global tp_ev_idx uint 500000
+global tp_cbuf uchar 65536
+note CTR1 reader state: 0=n, 1=prev_idx, 2=crumb
+global tp_cst long 3
+
+note Context walk prev[0..4]
+global tp_walk_p ulong 5
+
+note Working digests for produce
+global tp_prof_d uchar 32
+global tp_dat_d uchar 32
+
+note ---------------------------------------------------------------- key space
+
+fn tp_key_space mask ulong k ulong to int
+if gt mask 255
+ret TC_E_ARG
+end
+if lt k TC_KMIN
+ret TC_E_ARG
+end
+if gt k TC_KMAX
+ret TC_E_ARG
+end
+lim = ulong 4611686018427387904
+p = ulong 1
+if ne and mask 1 0
+if gt p div lim 16
+ret TC_E_FORMAT
+end
+p = mul p 16
+end
+if ne and mask 2 0
+if gt p div lim 8
+ret TC_E_FORMAT
+end
+p = mul p 8
+end
+kp1 = add k 1
+if ne and mask 4 0
+if gt p div lim kp1
+ret TC_E_FORMAT
+end
+p = mul p kp1
+end
+if ne and mask 8 0
+if gt p div lim kp1
+ret TC_E_FORMAT
+end
+p = mul p kp1
+end
+if ne and mask 16 0
+if gt p div lim kp1
+ret TC_E_FORMAT
+end
+p = mul p kp1
+end
+if ne and mask 64 0
+if gt p div lim kp1
+ret TC_E_FORMAT
+end
+p = mul p kp1
+end
+if ne and mask 128 0
+if gt p div lim kp1
+ret TC_E_FORMAT
+end
+p = mul p kp1
+end
+if ne and mask 32 0
+if gt p div lim 68719476736
+ret TC_E_FORMAT
+end
+p = mul p 68719476736
+end
+put tp_ks 0 p
+if le p 1
+put tp_ks 1 0
+else
+put tp_ks 1 add tc_hibit sub p 1 1
+end
+ret TC_OK
+end
+
+note ---------------------------------------------------------------- TYM0 bit reader/writer
+
+fn tp_br_get n ulong to ulong
+v = ulong 0
+for i ulong n bound 64
+pos = get tp_br 1
+if ge pos get tp_br 0
+put tp_br 2 1
+ret 0
+end
+b = ulong get tp_mbuf shr pos 3
+bit = and shr b sub 7 and pos 7 1
+v = or shl v 1 bit
+put tp_br 1 add pos 1
+end
+ret v
+end
+
+fn tp_bw_put v ulong n ulong to void
+i = n
+while gt i 0 bound 64
+i = sub i 1
+pos = get tp_br 1
+bi = shr pos 3
+if ne and shr v i 1 0
+cur = ulong get tp_mbuf bi
+put tp_mbuf bi uchar or cur shr 128 and pos 7
+end
+put tp_br 1 add pos 1
+end
+end
+
+fn tp_model_digest_buf nbytes ulong to void
+tc_sha_init
+tc_sha_dom TC_DOM_YM
+for i ulong nbytes bound 4194304
+tc_sha_byte get tp_mbuf i
+end
+tc_sha_final
+for i ulong 32
+put tp_mdig i get tc_sh_out i
+end
+end
+
+fn tp_model_uniform k ulong to int
+if lt k TC_KMIN
+ret TC_E_ARG
+end
+if gt k TC_KMAX
+ret TC_E_ARG
+end
+put tp_mst 0 k
+put tp_mst 1 0
+put tp_mst 2 0
+put tp_mst 3 0
+qbase = div TC_QONE k
+qrem = rem TC_QONE k
+for s ulong k bound 16
+v = qbase
+if lt s qrem
+v = add v 1
+end
+put tp_mdef s ushort v
+end
+for i ulong 64
+put tp_mbuf i 0
+end
+put tp_br 1 0
+tp_bw_put 1415138608 32
+tp_bw_put 0 8
+tp_bw_put k 8
+tp_bw_put 0 8
+tp_bw_put 16 8
+tp_bw_put 0 8
+tp_bw_put 0 32
+for s ulong sub k 1 bound 16
+tp_bw_put ulong get tp_mdef s 16
+end
+nbits = get tp_br 1
+nbytes = div add nbits 7 8
+put tp_mst 4 nbits
+put tp_mbuf_len 0 nbytes
+tp_model_digest_buf nbytes
+ret TC_OK
+end
+
+fn tp_get_row_def k ulong to int
+s = ulong 0
+for x ulong sub k 1 bound 16
+v = tp_br_get 16
+if eq v 0
+ret TC_E_FORMAT
+end
+put tp_mdef x ushort v
+s = add s v
+end
+if ge s TC_QONE
+ret TC_E_FORMAT
+end
+put tp_mdef sub k 1 ushort sub TC_QONE s
+if ne get tp_br 2 0
+ret TC_E_FORMAT
+end
+ret TC_OK
+end
+
+fn tp_get_row_idx row_i ulong k ulong to int
+s = ulong 0
+base = mul row_i 16
+for x ulong sub k 1 bound 16
+v = tp_br_get 16
+if eq v 0
+ret TC_E_FORMAT
+end
+put tp_mq add base x ushort v
+s = add s v
+end
+if ge s TC_QONE
+ret TC_E_FORMAT
+end
+put tp_mq add base sub k 1 ushort sub TC_QONE s
+if ne get tp_br 2 0
+ret TC_E_FORMAT
+end
+ret TC_OK
+end
+
+fn tp_decode_rows nrows ulong k ulong kb ulong to int
+space = get tp_ks 0
+for i ulong nrows bound 65536
+rk = tp_br_get kb
+if ge rk space
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if gt i 0
+if le rk get tp_mkeys sub i 1
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+end
+put tp_mkeys i rk
+if ne tp_get_row_idx i k TC_OK
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+end
+ret TC_OK
+end
+
+fn tp_model_decode nbytes ulong to int
+put tp_br 0 mul nbytes 8
+put tp_br 1 0
+put tp_br 2 0
+mg = tp_br_get 32
+if ne get tp_br 2 0
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if ne mg 1415138608
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+ver = tp_br_get 8
+k = tp_br_get 8
+mask = tp_br_get 8
+qb = tp_br_get 8
+kb = tp_br_get 8
+nrows = tp_br_get 32
+if ne get tp_br 2 0
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if ne ver 0
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if ne qb 16
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if ne tp_key_space mask k TC_OK
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if ne kb get tp_ks 1
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+row_bits = add kb mul sub k 1 16
+need = add add 104 mul sub k 1 16 mul nrows row_bits
+if ne div add need 7 8 nbytes
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if gt nrows TP_MAX_ROWS
+tc_why_set TC_W_IO
+ret TC_E_IO
+end
+if ne tp_get_row_def k TC_OK
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+if ne tp_decode_rows nrows k kb TC_OK
+ret TC_E_FORMAT
+end
+while lt get tp_br 1 get tp_br 0 bound 8
+if ne tp_br_get 1 0
+tc_why_set TP_W_MBAD
+ret TC_E_FORMAT
+end
+end
+put tp_mst 0 k
+put tp_mst 1 mask
+put tp_mst 2 kb
+put tp_mst 3 nrows
+put tp_mst 4 need
+tp_model_digest_buf nbytes
+ret TC_OK
+end
+
+fn tp_copy_io_mbuf tot ulong kn ulong to void
+for i ulong kn bound 65536
+put tp_mbuf add tot i get tc_iobuf i
+end
+end
+
+fn tc_load_model path view uchar * off ulong plen ulong to int
+fd = fopen path off plen 0 0
+if lt fd 0
+tc_why_set TC_W_IO
+ret TC_E_IO
+end
+tot = ulong 0
+while true bound 1000
+k = read int fd tc_iobuf 0 65536
+if lt k 0
+z = fclose int fd
+tc_why_set TC_W_IO
+ret TC_E_IO
+end
+if eq k 0
+break
+end
+kn = ulong k
+if gt add tot kn TP_MAX_MBUF
+z = fclose int fd
+tc_why_set TC_W_IO
+ret TC_E_IO
+end
+tp_copy_io_mbuf tot kn
+tot = add tot kn
+end
+z = fclose int fd
+put tp_mbuf_len 0 tot
+ret tp_model_decode tot
+end
+
+note ---------------------------------------------------------------- CTR1 reader
+
+fn tp_cb_u16 o ulong to ulong
+b0 = ulong get tp_cbuf o
+b1 = ulong get tp_cbuf add o 1
+ret or b0 shl b1 8
+end
+
+fn tp_cb_u32 o ulong to ulong
+b0 = ulong get tp_cbuf o
+b1 = ulong get tp_cbuf add o 1
+b2 = ulong get tp_cbuf add o 2
+b3 = ulong get tp_cbuf add o 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn tp_ctr1_chk_hdr o ulong to int
+if ne get tp_cbuf o 67
+ret TC_E_FORMAT
+end
+if ne get tp_cbuf add o 1 84
+ret TC_E_FORMAT
+end
+if ne get tp_cbuf add o 2 82
+ret TC_E_FORMAT
+end
+if ne get tp_cbuf add o 3 49
+ret TC_E_FORMAT
+end
+if ne tp_cb_u16 add o 4 1
+ret TC_E_FORMAT
+end
+if ne get tp_cbuf add o 22 0
+ret TC_E_FORMAT
+end
+if gt get tp_cbuf add o 24 4
+ret TC_E_FORMAT
+end
+if gt get tp_cbuf add o 25 2
+ret TC_E_FORMAT
+end
+ret TC_OK
+end
+
+fn tp_ctr1_decode_one o ulong prev_idx long out_i ulong to int
+if ne tp_ctr1_chk_hdr o TC_OK
+ret TC_E_FORMAT
+end
+kind = ulong get tp_cbuf add o 6
+rc = ulong get tp_cbuf add o 7
+prune = ulong get tp_cbuf add o 23
+sym = ulong 0
+evop = ulong 0
+if eq kind 1
+op = tp_cb_u16 add o 20
+if ge op 15
+ret TC_E_FORMAT
+end
+if gt prune 4
+ret TC_E_FORMAT
+end
+if ne prune 0
+if ne rc 1
+ret TC_E_FORMAT
+end
+sym = sub prune 1
+else
+if lt rc 2
+ret TC_E_FORMAT
+end
+if gt rc 4
+ret TC_E_FORMAT
+end
+sym = add 4 sub rc 2
+end
+evop = op
+else
+if eq kind 2
+if ne prune 0
+ret TC_E_FORMAT
+end
+if lt rc 5
+ret TC_E_FORMAT
+end
+if gt rc 7
+ret TC_E_FORMAT
+end
+if eq rc 5
+sym = ulong 7
+else
+sym = ulong 8
+end
+evop = ulong 15
+else
+ret TC_E_FORMAT
+end
+end
+put tp_ev_sym out_i uchar sym
+put tp_ev_op out_i uchar evop
+depth = tp_cb_u16 add o 29
+if gt depth 7
+depth = ulong 7
+end
+put tp_ev_depth out_i uchar depth
+idx = tp_cb_u32 add o 8
+if eq idx 0
+put tp_ev_first out_i 1
+else
+if lt prev_idx 0
+ret TC_E_FORMAT
+end
+if le long idx prev_idx
+ret TC_E_FORMAT
+end
+put tp_ev_first out_i 0
+end
+put tp_ev_idx out_i uint idx
+ret TC_OK
+end
+
+fn tp_ctr1_batch nrec ulong to int
+n = ulong get tp_cst 0
+prev = get tp_cst 1
+crumb = ulong get tp_cst 2
+for i ulong nrec bound 512
+if ge n TP_MAX_EV
+tc_why_set TC_W_IO
+ret TC_E_IO
+end
+rc = tp_ctr1_decode_one mul i TP_CTR1_BYTES prev n
+if ne rc TC_OK
+tc_why_set TP_W_CBAD
+ret TC_E_FORMAT
+end
+if ne get tp_ev_first n 0
+if gt n 0
+crumb = add crumb 1
+end
+end
+cv = crumb
+if gt cv 65535
+cv = ulong 65535
+end
+put tp_ev_crumb n ushort cv
+prev = long get tp_ev_idx n
+n = add n 1
+end
+put tp_cst 0 long n
+put tp_cst 1 prev
+put tp_cst 2 long crumb
+ret TC_OK
+end
+
+fn tp_ctr1_shift used ulong carry ulong to void
+for j ulong carry bound 256
+put tp_cbuf j get tp_cbuf add used j
+end
+end
+
+fn tp_ctr1_read path view uchar * off ulong plen ulong to int
+fd = fopen path off plen 0 0
+if lt fd 0
+tc_why_set TC_W_IO
+ret TC_E_IO
+end
+put tp_cst 0 0
+put tp_cst 1 -1
+put tp_cst 2 0
+carry = ulong 0
+while true bound 100000
+k = read int fd tp_cbuf carry sub 65536 carry
+if lt k 0
+z = fclose int fd
+tc_why_set TC_W_IO
+ret TC_E_IO
+end
+if eq k 0
+break
+end
+avail = add carry ulong k
+nrec = div avail TP_CTR1_BYTES
+rc = tp_ctr1_batch nrec
+if ne rc TC_OK
+z = fclose int fd
+ret rc
+end
+used = mul nrec TP_CTR1_BYTES
+carry = sub avail used
+tp_ctr1_shift used carry
+end
+z = fclose int fd
+if ne carry 0
+tc_why_set TP_W_CBAD
+ret TC_E_FORMAT
+end
+put tp_ev_n 0 ulong get tp_cst 0
+ret TC_OK
+end
+
+note ---------------------------------------------------------------- context walk & lookup & tc_produce
+
+fn tp_walk_key t ulong mask ulong k ulong to ulong
+if ne get tp_ev_first t 0
+for i ulong 5
+put tp_walk_p i k
+end
+end
+key = ulong 0
+m = ulong 1
+if ne and mask 1 0
+key = add key mul ulong get tp_ev_op t m
+m = mul m 16
+end
+if ne and mask 2 0
+key = add key mul ulong get tp_ev_depth t m
+m = mul m 8
+end
+kp1 = add k 1
+if ne and mask 4 0
+key = add key mul get tp_walk_p 0 m
+m = mul m kp1
+end
+if ne and mask 8 0
+key = add key mul get tp_walk_p 1 m
+m = mul m kp1
+end
+if ne and mask 16 0
+key = add key mul get tp_walk_p 2 m
+m = mul m kp1
+end
+if ne and mask 64 0
+key = add key mul get tp_walk_p 3 m
+m = mul m kp1
+end
+if ne and mask 128 0
+key = add key mul get tp_walk_p 4 m
+m = mul m kp1
+end
+if ne and mask 32 0
+idx = ulong get tp_ev_idx t
+if ge idx 1048576
+idx = ulong 1048575
+end
+posv = or shl ulong get tp_ev_crumb t 20 idx
+key = add key mul posv m
+end
+ret key
+end
+
+fn tp_walk_adv sym ulong to void
+put tp_walk_p 4 get tp_walk_p 3
+put tp_walk_p 3 get tp_walk_p 2
+put tp_walk_p 2 get tp_walk_p 1
+put tp_walk_p 1 get tp_walk_p 0
+put tp_walk_p 0 sym
+end
+
+fn tp_lookup key ulong to long
+nrows = get tp_mst 3
+lo = ulong 0
+hi = nrows
+while lt lo hi bound 32
+mid = add lo shr sub hi lo 1
+if lt get tp_mkeys mid key
+lo = add mid 1
+else
+hi = mid
+end
+end
+if lt lo nrows
+if eq get tp_mkeys lo key
+ret long lo
+end
+end
+ret -1
+end
+
+fn tp_copy_row ridx long qbase ulong k ulong to int
+for x ulong k bound 16
+qv = ulong 0
+if ge ridx 0
+qv = ulong get tp_mq add mul ulong ridx 16 x
+else
+qv = ulong get tp_mdef x
+end
+if eq qv 0
+tc_why_set TP_W_ROW
+ret TC_E_ZERO
+end
+if ge qv TC_QONE
+tc_why_set TP_W_ROW
+ret TC_E_ZERO
+end
+put tc_ps_q add qbase x ushort qv
+end
+ret TC_OK
+end
+
+fn tp_produce_one t ulong mask ulong k ulong crumb ulong to long
+sv = ulong get tp_ev_sym t
+if ge sv k
+tc_why_set TP_W_SYM
+ret -116
+end
+key = tp_walk_key t mask k
+ridx = tp_lookup key
+put tc_ps_key t key
+put tc_ps_crumb t uint crumb
+qbase = mul t k
+if ne tp_copy_row ridx qbase k TC_OK
+ret -106
+end
+put tc_sy_sym t uchar sv
+sq = ulong get tc_ps_q add qbase sv
+sb = tc_ubits_q16 sq
+if lt sb 0
+tc_why_set TP_W_ROW
+ret -106
+end
+tp_walk_adv sv
+ret sb
+end
+
+fn tc_produce to int
+k = get tp_mst 0
+mask = get tp_mst 1
+n = get tp_ev_n 0
+if lt k TC_KMIN
+ret TC_E_ARG
+end
+if gt k TC_KMAX
+ret TC_E_ARG
+end
+if gt n TC_MAX_N
+ret TC_E_IO
+end
+if gt mul n k TC_MAX_Q
+ret TC_E_IO
+end
+put tc_ps_k 0 k
+put tc_ps_n 0 n
+put tc_sy_k 0 k
+put tc_sy_n 0 n
+for i ulong 32
+put tc_ps_prof i get tp_prof_d i
+put tc_ps_mod i get tp_mdig i
+put tc_ps_dat i get tp_dat_d i
+put tc_sy_dat i get tp_dat_d i
+end
+for i ulong 5
+put tp_walk_p i k
+end
+crumb = ulong 0
+want = long 0
+for t ulong n bound 500000
+if ne get tp_ev_first t 0
+if gt t 0
+crumb = add crumb 1
+end
+end
+sb = tp_produce_one t mask k crumb
+if lt sb 0
+ret int sb
+end
+want = add want sb
+end
+rc = tc_ps_check_rows
+if ne rc TC_OK
+ret rc
+end
+got = tc_ideal_ub 0 n
+if ne want got
+tc_why_set TP_W_SCORE
+ret TC_E_CORRUPT
+end
+ret TC_OK
+end

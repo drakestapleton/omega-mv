@@ -1,0 +1,270 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/turing/tc_range_lib.om: Reference coder A (byte-oriented range coder, TCR1)
+note library in pure seeded OM-2. Composed after tc_pstream.om.
+note Consumes only TPS1/TSY1 arrays; never references any model code.
+
+const TC_RANGE_ID ulong 1
+const TC_RC_TOP ulong 16777216
+
+text TC_W_RC_TRUNC4 "range payload has fewer than 4 bytes (truncated bitstream)"
+text TC_W_RC_CORR_ST "range decoder state invalid (code >= range)"
+text TC_W_RC_TRUNC "range payload ended early (truncated bitstream)"
+text TC_W_RC_TERM "range termination check failed (final code != 0)"
+text TC_W_RC_TRAIL "range payload has trailing bytes"
+text TC_W_RC_ENC "range encode failed"
+
+note Encoder state: 0=low, 1=range, 2=cache, 3=have_cache, 4=pending, 5=pos, 6=err, 7=carries, 8=pending_max
+global tc_rc_st ulong 9
+
+fn tc_rc_emit b ulong to void
+pos = get tc_rc_st 5
+if ge pos TC_CB_CAP
+put tc_rc_st 6 1
+ret
+end
+put tc_cb pos uchar and b 255
+put tc_rc_st 5 add pos 1
+end
+
+fn tc_rc_shift_low to void
+lo = get tc_rc_st 0
+c = shr lo 32
+lo32 = and lo 4294967295
+if or lt lo32 4278190080 ne c 0
+if ne c 0
+put tc_rc_st 7 add get tc_rc_st 7 1
+if eq get tc_rc_st 3 0
+put tc_rc_st 6 2
+end
+end
+if ne get tc_rc_st 3 0
+tc_rc_emit add get tc_rc_st 2 c
+end
+pend = get tc_rc_st 4
+while gt pend 0 bound 500000
+tc_rc_emit add 255 c
+pend = sub pend 1
+end
+put tc_rc_st 4 0
+put tc_rc_st 2 and shr lo 24 255
+put tc_rc_st 3 1
+else
+pend = add get tc_rc_st 4 1
+put tc_rc_st 4 pend
+if gt pend get tc_rc_st 8
+put tc_rc_st 8 pend
+end
+end
+put tc_rc_st 0 shl and lo 16777215 8
+end
+
+fn tc_rc_row_ok qoff ulong k ulong to bool
+s = ulong 0
+for x ulong k bound 16
+v = ulong get tc_ps_q add qoff x
+if eq v 0
+ret false
+end
+s = add s v
+end
+ret eq s TC_QONE
+end
+
+fn tc_rc_enc_sym t ulong k ulong to int
+qoff = mul t k
+s = ulong get tc_sy_sym t
+if ge s k
+ret TC_E_SYMBOL
+end
+if not tc_rc_row_ok qoff k
+ret TC_E_NORM
+end
+cum = ulong 0
+for x ulong s bound 16
+cum = add cum ulong get tc_ps_q add qoff x
+end
+rg = get tc_rc_st 1
+r = shr rg 16
+put tc_rc_st 0 add get tc_rc_st 0 mul r cum
+if eq s sub k 1
+rg = sub rg mul r cum
+else
+rg = mul r ulong get tc_ps_q add qoff s
+end
+while lt rg TC_RC_TOP bound 2
+rg = shl rg 8
+tc_rc_shift_low
+end
+put tc_rc_st 1 rg
+ret TC_OK
+end
+
+fn tc_range_encode_raw lo ulong n ulong k ulong out_off ulong to int
+if lt k TC_KMIN
+ret TC_E_ARG
+end
+if gt k TC_KMAX
+ret TC_E_ARG
+end
+put tc_rc_st 0 0
+put tc_rc_st 1 4294967295
+put tc_rc_st 2 0
+put tc_rc_st 3 0
+put tc_rc_st 4 0
+put tc_rc_st 5 out_off
+put tc_rc_st 6 0
+put tc_rc_st 7 0
+put tc_rc_st 8 0
+for i ulong n bound 500000
+rc = tc_rc_enc_sym add lo i k
+if ne rc TC_OK
+ret rc
+end
+end
+for f ulong 5
+tc_rc_shift_low
+end
+err = get tc_rc_st 6
+if ne err 0
+if eq err 2
+ret TC_E_CORRUPT
+end
+ret TC_E_IO
+end
+put tc_cb_plen 0 sub get tc_rc_st 5 out_off
+ret TC_OK
+end
+
+note Decoder state in tc_rc_st: 0=code, 1=range, 2=pos, 3=in_off, 4=plen
+
+fn tc_rc_dec_renorm to int
+code = get tc_rc_st 0
+rg = get tc_rc_st 1
+pos = get tc_rc_st 2
+in_off = get tc_rc_st 3
+plen = get tc_rc_st 4
+while lt rg TC_RC_TOP bound 2
+if ge pos plen
+tc_why_set TC_W_RC_TRUNC
+ret TC_E_TRUNC
+end
+b = ulong get tc_cb add in_off pos
+code = and or shl code 8 b 4294967295
+pos = add pos 1
+rg = shl rg 8
+end
+put tc_rc_st 0 code
+put tc_rc_st 1 rg
+put tc_rc_st 2 pos
+ret TC_OK
+end
+
+fn tc_rc_dec_sym t ulong i ulong k ulong to int
+code = get tc_rc_st 0
+rg = get tc_rc_st 1
+if ge code rg
+tc_why_set TC_W_RC_CORR_ST
+ret TC_E_CORRUPT
+end
+qoff = mul t k
+if not tc_rc_row_ok qoff k
+tc_why_set TC_W_NORM
+ret TC_E_NORM
+end
+r = shr rg 16
+cum = ulong 0
+s = ulong 0
+nk = sub k 1
+while lt s nk bound 16
+nx = add cum ulong get tc_ps_q add qoff s
+if lt code mul r nx
+break
+end
+cum = nx
+s = add s 1
+end
+put tc_dsy_sym i uchar s
+code = sub code mul r cum
+if eq s nk
+rg = sub rg mul r cum
+else
+rg = mul r ulong get tc_ps_q add qoff s
+end
+put tc_rc_st 0 code
+put tc_rc_st 1 rg
+ret tc_rc_dec_renorm
+end
+
+fn tc_range_decode_raw lo ulong n ulong k ulong in_off ulong plen ulong to int
+if lt k TC_KMIN
+ret TC_E_ARG
+end
+if gt k TC_KMAX
+ret TC_E_ARG
+end
+if lt plen 4
+tc_why_set TC_W_RC_TRUNC4
+ret TC_E_TRUNC
+end
+code = ulong 0
+for j ulong 4
+code = or shl code 8 ulong get tc_cb add in_off j
+end
+put tc_rc_st 0 code
+put tc_rc_st 1 4294967295
+put tc_rc_st 2 4
+put tc_rc_st 3 in_off
+put tc_rc_st 4 plen
+for i ulong n bound 500000
+rc = tc_rc_dec_sym add lo i i k
+if ne rc TC_OK
+ret rc
+end
+end
+if ne get tc_rc_st 0 0
+tc_why_set TC_W_RC_TERM
+ret TC_E_CORRUPT
+end
+if ne get tc_rc_st 2 plen
+tc_why_set TC_W_RC_TRAIL
+ret TC_E_TRAIL
+end
+ret TC_OK
+end
+
+fn tc_range_encode to int
+rc = tc_pair_check
+if ne rc TC_OK
+ret rc
+end
+rc = tc_ps_check_rows
+if ne rc TC_OK
+ret rc
+end
+rc = tc_range_encode_raw 0 get tc_ps_n 0 get tc_ps_k 0 TC_CODED_HEADER
+if ne rc TC_OK
+tc_why_set TC_W_RC_ENC
+ret rc
+end
+pn = get tc_cb_plen 0
+tc_coded_hdr_write TC_RANGE_ID pn
+put tc_cb_len 0 add TC_CODED_HEADER pn
+ret TC_OK
+end
+
+fn tc_range_decode clen ulong to int
+rc = tc_coded_hdr_check TC_RANGE_ID clen
+if ne rc TC_OK
+ret rc
+end
+k = get tc_ps_k 0
+n = get tc_ps_n 0
+put tc_dsy_k 0 k
+put tc_dsy_n 0 n
+for i ulong 32
+put tc_dsy_dat i get tc_ps_dat i
+end
+ret tc_range_decode_raw 0 n k TC_CODED_HEADER get tc_cb_plen 0
+end

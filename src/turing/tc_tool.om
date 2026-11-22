@@ -1,0 +1,776 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/turing/tc_tool.om: turing-coder CLI in pure seeded OM-2.
+note Commands: pstream, encode, decode, verify, envelope.
+note Composed after seed/ng/sha256.om, tc_pstream.om, tc_range_lib.om, tc_rans.om, tc_produce.om.
+
+text CT_USE "usage:\n  turing-coder pstream <model.tym|uniform:K> <profile_hex> <trace.ctr> <out.tps> <out.tsy>\n  turing-coder encode|decode|verify <range|rans> <in.tps> <in.tsy|in.coded> <out|in> [--profile H] [--model H] [--dataset H]\n  turing-coder envelope <profile_hex> <out.csv> <trace.ctr> <model.tym|uniform:K>...\n"
+text CT_REF "REFUSED "
+text CT_COL ": "
+text CT_NODET "(no detail)"
+text CT_CMD_PS "pstream"
+text CT_CMD_ENC "encode"
+text CT_CMD_DEC "decode"
+text CT_CMD_VER "verify"
+text CT_CMD_ENV "envelope"
+text CT_COD_RNG "range"
+text CT_COD_RNS "rans"
+text CT_OPT_P "--profile"
+text CT_OPT_M "--model"
+text CT_OPT_D "--dataset"
+text CT_UNI "uniform:"
+text CT_ST_MOD "model"
+text CT_ST_PRF "profile digest"
+text CT_ST_DAT "dataset"
+text CT_ST_TRC "trace"
+text CT_ST_PRD "produce"
+text CT_ST_SER "serialize"
+text CT_ST_WR "write"
+text CT_ST_PS "probability stream"
+text CT_ST_SY "symbols"
+text CT_ST_ENC "encode"
+text CT_ST_COD "coded file"
+text CT_ST_DEC "decode"
+text CT_ST_VER "verify"
+text CT_ST_CSV "csv"
+text CT_ST_RT "round trip"
+text CT_W_BADOPT "bad --profile/--model/--dataset option"
+text CT_W_DIFF "decoded symbol file is not byte-identical to input"
+text CT_W_RTDIFF "whole-file round trip differs"
+text CT_K_MD "model_digest="
+text CT_K_LM "\nlm_bits="
+text CT_K_DD "\ndataset_digest="
+text CT_K_TD "\ntps1_digest="
+text CT_K_SD "\ntsy1_digest="
+text CT_K_CN "\ncount="
+text CT_K_UB "\nideal_ub="
+text CT_K_CB "coded_bytes="
+text CT_K_CBT "\ncoded_bits="
+text CT_K_COD "coder="
+text CT_K_OVH "\noverhead_ub="
+text CT_K_RT "\nroundtrip=byte-exact\n"
+text CT_CSV_HDR "unit,model,index,n,ideal_ub,range_bytes,rans_bytes\n"
+text CT_CSV_FILE "file,"
+text CT_CSV_CRUMB "crumb,"
+text CT_ENV_FILE "file "
+text CT_ENV_MOD " model="
+text CT_ENV_MASK " mask="
+text CT_ENV_K " K="
+text CT_ENV_LM " lm_bits="
+text CT_ENV_N " n="
+text CT_ENV_UB " ideal_ub="
+text CT_ENV_RB " range_bytes="
+text CT_ENV_AB " rans_bytes="
+
+note Argument storage: up to 16 args of 1024 bytes each
+global ct_args uchar 16384
+global ct_alen ulong 16
+global ct_have ulong 3
+global ct_raw_sy uchar 524288
+global ct_raw_sn ulong 1
+
+fn ct_load_args to ulong
+ac = argcnt
+if lt ac 0
+ret 0
+end
+n = ulong ac
+if gt n 16
+n = ulong 16
+end
+for i ulong n bound 16
+k = argread i ct_args mul i 1024 1024
+if lt k 0
+put ct_alen i 0
+else
+put ct_alen i ulong k
+end
+end
+ret n
+end
+
+fn ct_arg_eq idx ulong s view uchar * to bool
+al = get ct_alen idx
+if ne al len s
+ret false
+end
+off = mul idx 1024
+for i ulong al bound 1024
+if ne get ct_args add off i get s i
+ret false
+end
+end
+ret true
+end
+
+fn ct_arg_prefix idx ulong s view uchar * to bool
+al = get ct_alen idx
+sl = len s
+if lt al sl
+ret false
+end
+off = mul idx 1024
+for i ulong sl bound 64
+if ne get ct_args add off i get s i
+ret false
+end
+end
+ret true
+end
+
+fn ct_refuse stage view uchar * rc int to int
+tc_out_reset
+tc_out_str CT_REF
+tc_out_str stage
+tc_out_str CT_COL
+tc_out_errname rc
+tc_out_str CT_COL
+if gt get tc_whylen 0 0
+tc_out_why
+else
+tc_out_str CT_NODET
+end
+tc_out_byte 10
+z = tc_out_flush 2
+ret 2
+end
+
+fn ct_parse_u64 idx ulong off_in ulong to long
+al = get ct_alen idx
+if ge off_in al
+ret -1
+end
+base = mul idx 1024
+v = ulong 0
+i = off_in
+while lt i al bound 32
+c = ulong get ct_args add base i
+if lt c 48
+ret -1
+end
+if gt c 57
+ret -1
+end
+v = add mul v 10 sub c 48
+i = add i 1
+end
+ret long v
+end
+
+fn ct_load_model_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_load_model p 0 al
+end
+
+fn ct_unhex_arg idx ulong w ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_unhex_to_exp p 0 al w
+end
+
+fn ct_sha256_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_file_sha256 p 0 al
+end
+
+fn ct_ctr1_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tp_ctr1_read p 0 al
+end
+
+fn ct_read_pb_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_read_pb p 0 al
+end
+
+fn ct_write_pb_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_write_pb p 0 al
+end
+
+fn ct_read_sb_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_read_sb p 0 al
+end
+
+fn ct_write_sb_arg idx ulong use_db ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_write_sb p 0 al use_db
+end
+
+fn ct_read_cb_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_read_cb p 0 al
+end
+
+fn ct_write_cb_arg idx ulong to int
+p = new uchar 1024 0
+off = mul idx 1024
+al = get ct_alen idx
+for i ulong al bound 1024
+put p i get ct_args add off i
+end
+ret tc_write_cb p 0 al
+end
+
+fn ct_get_model idx ulong to int
+if ct_arg_prefix idx CT_UNI
+kv = ct_parse_u64 idx 8
+if lt kv 0
+ret TC_E_ARG
+end
+ret tp_model_uniform ulong kv
+end
+ret ct_load_model_arg idx
+end
+
+fn ct_parse_expect ac ulong start ulong to int
+put ct_have 0 0
+put ct_have 1 0
+put ct_have 2 0
+i = start
+while lt add i 1 ac bound 16
+w = ulong 99
+if ct_arg_eq i CT_OPT_P
+w = ulong 0
+else
+if ct_arg_eq i CT_OPT_M
+w = ulong 1
+else
+if ct_arg_eq i CT_OPT_D
+w = ulong 2
+end
+end
+end
+if eq w 99
+ret TC_E_ARG
+end
+vi = add i 1
+rc = ct_unhex_arg vi w
+if ne rc TC_OK
+ret TC_E_ARG
+end
+put ct_have w 1
+i = add i 2
+end
+if ne i ac
+ret TC_E_ARG
+end
+ret TC_OK
+end
+
+fn ct_coder_id idx ulong to ulong
+if ct_arg_eq idx CT_COD_RNG
+ret 1
+end
+if ct_arg_eq idx CT_COD_RNS
+ret 2
+end
+ret 0
+end
+
+fn ct_cmd_pstream to int
+rc = ct_get_model 2
+if ne rc TC_OK
+ret ct_refuse CT_ST_MOD rc
+end
+rc = ct_unhex_arg 3 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_PRF TC_E_ARG
+end
+for i ulong 32
+put tp_prof_d i get tc_exp_prof i
+end
+rc = ct_sha256_arg 4
+if ne rc TC_OK
+ret ct_refuse CT_ST_DAT TC_E_IO
+end
+for i ulong 32
+put tp_dat_d i get tc_sh_out i
+end
+rc = ct_ctr1_arg 4
+if ne rc TC_OK
+ret ct_refuse CT_ST_TRC TC_E_FORMAT
+end
+rc = tc_produce
+if ne rc TC_OK
+ret ct_refuse CT_ST_PRD rc
+end
+rc = tc_ps_serialize
+if ne rc TC_OK
+ret ct_refuse CT_ST_SER rc
+end
+rc = tc_sy_serialize 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_SER rc
+end
+rc = ct_write_pb_arg 5
+if ne rc TC_OK
+ret ct_refuse CT_ST_WR TC_E_IO
+end
+rc = ct_write_sb_arg 6 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_WR TC_E_IO
+end
+ub = tc_ideal_ub 0 get tc_ps_n 0
+tc_out_reset
+tc_out_str CT_K_MD
+for i ulong 32
+tc_out_hex_byte get tp_mdig i
+end
+tc_out_str CT_K_LM
+tc_out_u64 get tp_mst 4
+tc_out_str CT_K_DD
+for i ulong 32
+tc_out_hex_byte get tp_dat_d i
+end
+tc_out_str CT_K_TD
+tc_out_hex_ps_dig 32
+tc_out_str CT_K_SD
+tc_out_hex_sy_dig 32
+tc_out_str CT_K_CN
+tc_out_u64 get tc_ps_n 0
+tc_out_str CT_K_UB
+tc_out_i64 ub
+tc_out_byte 10
+z = tc_out_flush 1
+ret 0
+end
+
+fn ct_cmd_coder ac ulong mode ulong to int
+note mode: 1=encode, 2=decode, 3=verify
+cid = ct_coder_id 2
+if eq cid 0
+ret 1
+end
+rc = ct_read_pb_arg 3
+if ne rc TC_OK
+ret ct_refuse CT_ST_PS rc
+end
+rc = tc_ps_parse get tc_pb_len 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_PS rc
+end
+rc = ct_parse_expect ac 6
+if ne rc TC_OK
+tc_why_set CT_W_BADOPT
+ret ct_refuse CT_ST_PS TC_E_ARG
+end
+rc = tc_ps_expect get ct_have 0 get ct_have 1 get ct_have 2
+if ne rc TC_OK
+ret ct_refuse CT_ST_PS rc
+end
+if eq mode 1
+rc = ct_read_sb_arg 4
+if ne rc TC_OK
+ret ct_refuse CT_ST_SY rc
+end
+rc = tc_sy_parse get tc_sb_len 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_SY rc
+end
+if eq cid 1
+rc = tc_range_encode
+else
+rc = tc_rans_encode
+end
+if ne rc TC_OK
+ret ct_refuse CT_ST_ENC rc
+end
+rc = ct_write_cb_arg 5
+if ne rc TC_OK
+ret ct_refuse CT_ST_WR TC_E_IO
+end
+cn = get tc_cb_len 0
+tc_out_reset
+tc_out_str CT_K_CB
+tc_out_u64 cn
+tc_out_str CT_K_CBT
+tc_out_u64 mul cn 8
+tc_out_byte 10
+z = tc_out_flush 1
+ret 0
+end
+cidx = ulong 4
+if eq mode 3
+cidx = ulong 5
+end
+rc = ct_read_cb_arg cidx
+if ne rc TC_OK
+ret ct_refuse CT_ST_COD TC_E_IO
+end
+cn = get tc_cb_len 0
+if eq cid 1
+rc = tc_range_decode cn
+else
+rc = tc_rans_decode cn
+end
+if ne rc TC_OK
+ret ct_refuse CT_ST_DEC rc
+end
+rc = tc_sy_serialize 1
+if ne rc TC_OK
+ret ct_refuse CT_ST_DEC rc
+end
+if eq mode 2
+rc = ct_write_sb_arg 5 1
+if ne rc TC_OK
+ret ct_refuse CT_ST_WR TC_E_IO
+end
+ret 0
+end
+rc = ct_read_sb_arg 4
+if ne rc TC_OK
+ret ct_refuse CT_ST_SY rc
+end
+rawn = get tc_sb_len 0
+for i ulong rawn bound 524288
+put ct_raw_sy i get tc_sb i
+end
+put ct_raw_sn 0 rawn
+rc = tc_sy_parse rawn
+if ne rc TC_OK
+ret ct_refuse CT_ST_SY rc
+end
+rc = tc_pair_check
+if ne rc TC_OK
+ret ct_refuse CT_ST_SY rc
+end
+dn = get tc_db_len 0
+if ne rawn dn
+tc_why_set CT_W_DIFF
+ret ct_refuse CT_ST_VER TC_E_SYMBOL
+end
+for i ulong dn bound 524288
+if ne get ct_raw_sy i get tc_db i
+tc_why_set CT_W_DIFF
+ret ct_refuse CT_ST_VER TC_E_SYMBOL
+end
+end
+ub = tc_ideal_ub 0 get tc_ps_n 0
+ovh = sub mul long mul cn 8 1000000 ub
+tc_out_reset
+tc_out_str CT_K_COD
+if eq cid 1
+tc_out_str CT_COD_RNG
+else
+tc_out_str CT_COD_RNS
+end
+tc_out_str CT_K_TD
+tc_out_hex_ps_dig 32
+tc_out_str CT_K_CN
+tc_out_u64 get tc_ps_n 0
+tc_out_byte 10
+tc_out_str CT_K_CB
+tc_out_u64 cn
+tc_out_str CT_K_CBT
+tc_out_u64 mul cn 8
+tc_out_str CT_K_UB
+tc_out_i64 ub
+tc_out_str CT_K_OVH
+tc_out_i64 ovh
+tc_out_str CT_K_RT
+z = tc_out_flush 1
+ret 0
+end
+
+fn ct_sym_eq lo ulong n ulong to bool
+for i ulong n bound 500000
+if ne get tc_dsy_sym i get tc_sy_sym add lo i
+ret false
+end
+end
+ret true
+end
+
+fn ct_env_crumb csv_fd int lo ulong hi ulong to int
+n = sub hi lo
+k = get tc_ps_k 0
+cu = tc_ideal_ub lo hi
+rc = tc_range_encode_raw lo n k 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_ENC TC_E_IO
+end
+nx = get tc_cb_plen 0
+rc = tc_range_decode_raw lo n k 0 nx
+if ne rc TC_OK
+ret ct_refuse CT_ST_RT TC_E_SYMBOL
+end
+if not ct_sym_eq lo n
+ret ct_refuse CT_ST_RT TC_E_SYMBOL
+end
+rc = tc_rans_encode_raw lo n k 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_ENC TC_E_IO
+end
+ny = get tc_cb_plen 0
+rc = tc_rans_decode_raw lo n k 0 ny
+if ne rc TC_OK
+ret ct_refuse CT_ST_RT TC_E_SYMBOL
+end
+if not ct_sym_eq lo n
+ret ct_refuse CT_ST_RT TC_E_SYMBOL
+end
+tc_out_reset
+tc_out_str CT_CSV_CRUMB
+for i ulong 8
+tc_out_hex_byte get tp_mdig i
+end
+tc_out_byte 44
+tc_out_u64 ulong get tc_ps_crumb lo
+tc_out_byte 44
+tc_out_u64 n
+tc_out_byte 44
+tc_out_i64 cu
+tc_out_byte 44
+tc_out_u64 add nx TC_CODED_HEADER
+tc_out_byte 44
+tc_out_u64 add ny TC_CODED_HEADER
+tc_out_byte 10
+z = tc_out_flush csv_fd
+ret 0
+end
+
+fn ct_env_crumbs csv_fd int pn ulong to int
+lo = ulong 0
+while lt lo pn bound 500000
+hi = add lo 1
+cl = get tc_ps_crumb lo
+while lt hi pn bound 500000
+if ne get tc_ps_crumb hi cl
+break
+end
+hi = add hi 1
+end
+erc = ct_env_crumb csv_fd lo hi
+if ne erc 0
+ret erc
+end
+lo = hi
+end
+ret 0
+end
+
+fn ct_env_one csv_fd int mi ulong to int
+rc = ct_get_model mi
+if ne rc TC_OK
+ret ct_refuse CT_ST_MOD rc
+end
+rc = tc_produce
+if ne rc TC_OK
+ret ct_refuse CT_ST_PRD rc
+end
+rc = tc_ps_serialize
+if ne rc TC_OK
+ret ct_refuse CT_ST_SER rc
+end
+rc = tc_sy_serialize 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_SER rc
+end
+rc = tc_ps_parse get tc_pb_len 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_PS rc
+end
+rc = tc_sy_parse get tc_sb_len 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_SY rc
+end
+pn = get tc_ps_n 0
+ub = tc_ideal_ub 0 pn
+rc = tc_range_encode
+if ne rc TC_OK
+ret ct_refuse CT_ST_ENC rc
+end
+na = get tc_cb_len 0
+rc = tc_range_decode na
+if ne rc TC_OK
+ret ct_refuse CT_ST_DEC rc
+end
+for i ulong pn bound 500000
+if ne get tc_dsy_sym i get tc_sy_sym i
+tc_why_set CT_W_RTDIFF
+ret ct_refuse CT_ST_RT TC_E_SYMBOL
+end
+end
+rc = tc_rans_encode
+if ne rc TC_OK
+ret ct_refuse CT_ST_ENC rc
+end
+nb = get tc_cb_len 0
+rc = tc_rans_decode nb
+if ne rc TC_OK
+ret ct_refuse CT_ST_DEC rc
+end
+for i ulong pn bound 500000
+if ne get tc_dsy_sym i get tc_sy_sym i
+tc_why_set CT_W_RTDIFF
+ret ct_refuse CT_ST_RT TC_E_SYMBOL
+end
+end
+tc_out_reset
+tc_out_str CT_ENV_FILE
+tlen = get ct_alen 4
+toff = ulong 4096
+for i ulong tlen bound 1024
+tc_out_byte get ct_args add toff i
+end
+tc_out_str CT_ENV_MOD
+for i ulong 8
+tc_out_hex_byte get tp_mdig i
+end
+tc_out_str CT_ENV_MASK
+tc_out_u64 get tp_mst 1
+tc_out_str CT_ENV_K
+tc_out_u64 get tp_mst 0
+tc_out_str CT_ENV_LM
+tc_out_u64 get tp_mst 4
+tc_out_str CT_ENV_N
+tc_out_u64 pn
+tc_out_str CT_ENV_UB
+tc_out_i64 ub
+tc_out_str CT_ENV_RB
+tc_out_u64 na
+tc_out_str CT_ENV_AB
+tc_out_u64 nb
+tc_out_byte 10
+z = tc_out_flush 1
+tc_out_reset
+tc_out_str CT_CSV_FILE
+for i ulong 8
+tc_out_hex_byte get tp_mdig i
+end
+tc_out_byte 44
+tc_out_byte 48
+tc_out_byte 44
+tc_out_u64 pn
+tc_out_byte 44
+tc_out_i64 ub
+tc_out_byte 44
+tc_out_u64 na
+tc_out_byte 44
+tc_out_u64 nb
+tc_out_byte 10
+z = tc_out_flush csv_fd
+ret ct_env_crumbs csv_fd pn
+end
+
+fn ct_cmd_envelope ac ulong to int
+rc = ct_unhex_arg 2 0
+if ne rc TC_OK
+ret ct_refuse CT_ST_PRF TC_E_ARG
+end
+for i ulong 32
+put tp_prof_d i get tc_exp_prof i
+end
+cfd = fopen ct_args 3072 get ct_alen 3 577 420
+if lt cfd 0
+ret ct_refuse CT_ST_CSV TC_E_IO
+end
+rc = ct_sha256_arg 4
+if ne rc TC_OK
+z = fclose int cfd
+ret ct_refuse CT_ST_DAT TC_E_IO
+end
+for i ulong 32
+put tp_dat_d i get tc_sh_out i
+end
+rc = ct_ctr1_arg 4
+if ne rc TC_OK
+z = fclose int cfd
+ret ct_refuse CT_ST_TRC TC_E_FORMAT
+end
+tc_out_reset
+tc_out_str CT_CSV_HDR
+z2 = tc_out_flush int cfd
+mi = ulong 5
+while lt mi ac bound 16
+erc = ct_env_one int cfd mi
+if ne erc 0
+z = fclose int cfd
+ret erc
+end
+mi = add mi 1
+end
+z = fclose int cfd
+if ne z 0
+ret ct_refuse CT_ST_CSV TC_E_IO
+end
+ret 0
+end
+
+fn main to int
+ac = ct_load_args
+if eq ac 7
+if ct_arg_eq 1 CT_CMD_PS
+ret ct_cmd_pstream
+end
+end
+if ge ac 6
+if eq rem sub ac 6 2 0
+if ne ct_coder_id 2 0
+if ct_arg_eq 1 CT_CMD_ENC
+ret ct_cmd_coder ac 1
+end
+if ct_arg_eq 1 CT_CMD_DEC
+ret ct_cmd_coder ac 2
+end
+if ct_arg_eq 1 CT_CMD_VER
+ret ct_cmd_coder ac 3
+end
+end
+end
+if ct_arg_eq 1 CT_CMD_ENV
+ret ct_cmd_envelope ac
+end
+end
+tc_out_reset
+tc_out_str CT_USE
+z = tc_out_flush 2
+ret 1
+end
