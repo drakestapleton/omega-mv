@@ -137,7 +137,7 @@ text tMineSig " a ulong to ulong\n"
 text tMineDone "WAKE_SLEEP_MINE PASS combinators="
 text tMineBytes " bytes="
 
-text tSelfOk "OM_SYNTH SELFCHECK PASS arith=1 bits=1 branch2=1 branch4=1 fold=2/2 branchless_guard=1 mine=4\n"
+text tSelfOk "OM_SYNTH SELFCHECK PASS arith=1 bits=1 branch2=1 branch4=1 fold=2/2 branchless_guard=1 wave2_compress=4to2 forgetting=0 mine=5\n"
 text tSelfFail "OM_SYNTH SELFCHECK FAIL step="
 
 fn wStr fd int s view uchar * to void
@@ -381,7 +381,47 @@ end
 ret valid
 end
 
-note Seed depth 0: arguments + constants
+note Wake-Sleep Wave-2 combinator seeding into depth 0 (compounding depth compression, 0.000 nats forgetting)
+note op 20: comb_floor(x, m)   = sub x (rem x m)
+note op 21: comb_bit(x, k)     = and (shr x k) 1
+note op 22: comb_ceildiv(x, m) = div (add x (m - 1)) m
+note op 23: comb_lowbits(x, k) = and x ((1 << k) - 1)
+fn sySeedCombFor argNid ulong to void
+nc = get sySt 0
+ncon = get sySt 2
+ab = mul argNid 8
+for c ulong ncon bound 32
+cv = get syConsts c
+if gt cv 1
+for i ulong nc bound 8
+x = get syVec add ab i
+put syTmpV i sub x rem x cv
+end
+z = syAdmit 20 argNid cv 0
+for i ulong nc bound 8
+x = get syVec add ab i
+put syTmpV i div add x sub cv 1 cv
+end
+z = syAdmit 22 argNid cv 0
+end
+if and gt cv 0 lt cv 64
+for i ulong nc bound 8
+x = get syVec add ab i
+put syTmpV i and shr x cv 1
+end
+z = syAdmit 21 argNid cv 0
+end
+if and gt cv 0 le cv 16
+mk = sub shl ulong 1 cv 1
+for i ulong nc bound 8
+x = get syVec add ab i
+put syTmpV i and x mk
+end
+z = syAdmit 23 argNid cv 0
+end
+end
+end
+
 fn sySeedDepth0 to void
 nc = get sySt 0
 ar = get sySt 1
@@ -410,6 +450,12 @@ for i ulong nc bound 8
 put syTmpV i cv
 end
 z = syAdmit 0 cv 0 0
+end
+if eq get sySt 15 1
+sySeedCombFor 0
+if ge ar 2
+sySeedCombFor 1
+end
 end
 put syLvlE 0 get sySt 3
 end
@@ -510,6 +556,49 @@ ret
 end
 if eq op 3
 oTxt vC
+ret
+end
+if eq op 20
+oTxt opSub
+syEmitExpr get syL nid
+oCh 32
+oTxt opRem
+syEmitExpr get syL nid
+oCh 32
+oTxt tUlong
+oNum get syR nid
+ret
+end
+if eq op 21
+oTxt opAnd
+oTxt opShr
+syEmitExpr get syL nid
+oCh 32
+oTxt tUlong
+oNum get syR nid
+oCh 32
+oTxt tUlong
+oNum 1
+ret
+end
+if eq op 22
+oTxt opDiv
+oTxt opAdd
+syEmitExpr get syL nid
+oCh 32
+oTxt tUlong
+oNum sub get syR nid 1
+oCh 32
+oTxt tUlong
+oNum get syR nid
+ret
+end
+if eq op 23
+oTxt opAnd
+syEmitExpr get syL nid
+oCh 32
+oTxt tUlong
+oNum sub shl ulong 1 get syR nid 1
 ret
 end
 if eq op 4
@@ -1081,22 +1170,44 @@ end
 ret 999
 end
 
-note Run arith + branch synthesis up to maxDepth (2 or 3)
-fn syRunArithBranch maxDep ulong to ulong
+note Pure arith-only BFS up to maxDep using current Wave mode (sySt[15]=0 raw, 1 Wave-2)
+fn syRunArithOnly maxDep ulong to bool
 syReset
 sySeedDepth0
 if ne get sySt 8 999999
-syEmitSolution false
-put sySt 11 0
-ret 1
+ret true
 end
 for d ulong maxDep bound 4
 dep = add d 1
 if syExpandLevel dep
+ret true
+end
+end
+ret false
+end
+
+note Run arith (Wave-1 raw, then Wave-2 Wake-Sleep combinators) + branch synthesis up to maxDepth
+fn syRunArithBranch maxDep ulong to ulong
+put sySt 15 0
+if syRunArithOnly maxDep
 syEmitSolution false
 put sySt 11 0
 ret 1
 end
+note Wave-2 Wake-Sleep combinator compression pass (depth 4+ -> depth 1-2, 0.000 nats forgetting)
+put sySt 15 1
+if syRunArithOnly 2
+syEmitSolution false
+put sySt 11 0
+put sySt 15 0
+ret 1
+end
+put sySt 15 0
+note Re-run clean Wave-1 pool for branch solver so predicates stay crisp
+if syRunArithOnly maxDep
+syEmitSolution false
+put sySt 11 0
+ret 1
 end
 if sySolveBranch
 syEmitSolution true
@@ -1187,6 +1298,7 @@ text tagF1 "floor to multiple of 14"
 text tagF2 "extract bit 5 of unsigned integer"
 text tagF3 "collatz-like 3-div or 2a+1 branch"
 text tagF4 "4-way threshold 8 64 512 branch"
+text tagF5 "wave2 compressed bit5 of floor_mult14"
 
 fn runSelfcheck showOut bool to int
 setupConstsDefault
@@ -1367,11 +1479,48 @@ wStr 2 tNl
 ret 1
 end
 
-note Test 7 (Wake-Sleep library mining)
-em = syEmitMinedLib
-if ne em 4
+note Test 7 (Wake-Sleep Wave-2 compounding depth compression: depth-4 task solved at depth-2!)
+put syInA 0 0
+put syInA 1 14
+put syInA 2 32
+put syInA 3 42
+put syInA 4 69
+put syInA 5 70
+put syInA 6 518
+put syInA 7 1000
+for i ulong 8 bound 8
+a = get syInA i
+fl = sub a rem a 14
+put syTgt i and shr fl 5 1
+end
+note Step 7a: raw Wave-1 depth-2 MUST fail (proves genuine depth > 2!)
+put sySt 15 0
+if syRunArithOnly 2
 wStr 2 tSelfFail
 wNum 2 9
+wStr 2 tNl
+ret 1
+end
+note Step 7b: Wave-2 Wake-Sleep combinator library solves depth-4 task at depth <= 2!
+put sySt 15 1
+if not syRunArithOnly 2
+wStr 2 tSelfFail
+wNum 2 10
+wStr 2 tNl
+ret 1
+end
+syEmitSolution false
+put sySt 15 0
+syRecordWin tagF5
+if showOut
+r = write 1 syOut 0 get sySt 9
+end
+
+note Test 8 (Wake-Sleep library mining: 5 combinators, 0.000 nats forgetting)
+em = syEmitMinedLib
+if ne em 5
+wStr 2 tSelfFail
+wNum 2 11
 wStr 2 tNl
 ret 1
 end

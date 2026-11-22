@@ -1,0 +1,1753 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/ollm_factory/om_synth_gb10.om:
+note Zero-CUDA Pure Seeded OM-2 SM121 Observational-Equivalence Synthesizer for GB10.
+note Composed with train/omega-llm/native/gpu/{context,vector,launch}.om via build-synth-gb10.sh.
+note
+note Executes all 3 locked-in SM121 kernel invariants directly on GB10 hardware:
+note   INV-1 (Strict BFS Level Barriers + 64-bit ATOMG.E.CAS):
+note     One QMD dispatch per BFS depth level and op. Threads read immutable parent
+note     vectors [0..parentEnd) and claim L2 slots via ATOMG.E.CAS.64.STRONG.GPU (0 -> h).
+note   INV-2 (MAX_PROBES=32 + 70% Atomic Occupancy Cutoff on 16 MiB L2 Table):
+note     1,048,576 slots x 16 bytes = 16,777,216 bytes (resident in GB10 24 MiB L2).
+note     Hard probe cap of 32 and atomic occupancy cutoff at 734,003 (70%) prevent livelock.
+note   INV-3 (Branchless 8-Lane Vector Safety):
+note     8 x u64 lanes (64 bytes = 1 L2 cache line). div/rem invalidates rhs==0 via
+note     safe_rhs = rhs | (rhs == 0) + exact 64-bit unsigned binary division; shl/shr
+note     invalidates rhs >= 64 and masks shift count with rhs & 63. Invalid lanes
+note     skip ATOMG.E.CAS cleanly without warp-divergence traps.
+note
+note Usage:
+note   om_synth_gb10 dump DIR              emit all 10 SM121 SASS kernels for nvdisasm check
+note   om_synth_gb10 selfcheck             live GB10 silicon test (INV-1/2/3 + throughput)
+note   om_synth_gb10 solve SPEC OUT_OM     synthesize OM-2 function on GB10 silicon
+
+const SQ_HT_SLOTS ulong 1048576
+const SQ_HT_BYTES ulong 16777216
+const SQ_HT_MAX_OCC uint 734003
+const SQ_MAX_NODES ulong 131072
+const SQ_VEC_BYTES ulong 8388608
+const SQ_AST_BYTES ulong 2097152
+const SQ_CTRL_BYTES ulong 4096
+const SQ_CODE_BYTES ulong 262144
+const SQ_SLOT_BYTES ulong 16384
+const SQ_CTA_THREADS uint 256
+const SQ_GPR_COUNT uint 64
+
+note Kernel code buffer (10 slots x 16 KiB = 160 KiB, inside 256 KiB device buffer)
+global skCode uchar 262144
+global skAt ulong 1
+global skPend uint 1
+global skSlotLen ulong 16
+
+note Device memory handles: 0=htBuf, 1=vecPool, 2=astPool, 3=ctrlBuf
+global sqBuf long 4
+global sqArg uint 16
+global sqOpenFlag uint 1
+
+note Host mirror / spec buffers
+global sqInA ulong 8
+global sqInB ulong 8
+global sqInC ulong 8
+global sqTgt ulong 8
+global sqConsts ulong 32
+global sqSt ulong 32
+global sqLvlS ulong 16
+global sqLvlE ulong 16
+
+note Host readback scratch for AST reconstruction & zeroing (64 KiB chunk)
+global sqZero uchar 65536
+global sqAstOp uint 131072
+global sqAstL uint 131072
+global sqAstR uint 131072
+global sqAstD uint 131072
+global sqPath uchar 4096
+global sqInBuf uchar 65536
+global sqOut uchar 65536
+global sqOutPos ulong 1
+global sqCtrl uint 32
+global sqVecTmp uchar 1024
+global sqAstTmp uchar 256
+global sqSeedBuf uchar 16
+global sqSyncBuf uchar 4096
+
+text sqMDump "dump"
+text sqMSelf "selfcheck"
+text sqMSolve "solve"
+text sqTUsage "usage: om_synth_gb10 dump DIR | selfcheck | solve SPEC OUT_OM\n"
+text sqTErrOpen "OM_SYNTH_GB10 FAIL gpu_open nverr="
+text sqTErrLaunch "OM_SYNTH_GB10 FAIL launch nverr="
+text sqTErrIo "OM_SYNTH_GB10 FAIL io\n"
+text sqTDumpOk "OM_SYNTH_GB10 DUMP PASS kernels=10 antibodies=3/3\n"
+text sqTSelfPass "OM_SYNTH_GB10 SILICON SELFCHECK PASS "
+text sqTSelfFail "OM_SYNTH_GB10 SILICON SELFCHECK FAIL step="
+text sqTSolveOk "GB10_SYNTH_OK "
+text sqTSolveFail "GB10_SYNTH_FAIL "
+text sqTStage " stage="
+text sqTNl "\n"
+text sqTSp " "
+text sqMinus "-"
+text sqKSlash "/op_"
+text sqKBin ".bin"
+
+text sqK0 "c1_03="
+text sqK1 " c1_11="
+text sqK2 " d3_cands="
+text sqK3 " d3_nodes="
+text sqK4 " d3_pruned="
+text sqK5 " d3_invalid="
+text sqK6 " d3_aborts="
+text sqK7 " d3_occ="
+text sqK8 " gpu_us="
+text sqK9 " mcands_s="
+text sqK10 " inv1_cas=1 inv2_occ70_p32=1 inv3_branchless=1"
+
+text sqFn1 "fn solve a ulong to ulong\n"
+text sqFn2 "fn solve a ulong b ulong to ulong\n"
+text sqFn3 "fn solve a ulong b ulong c ulong to ulong\n"
+text sqRet "ret "
+text sqEnd "end\n"
+text sqUlong "ulong "
+text sqVA "a"
+text sqVB "b"
+text sqVC "c"
+text sqOpAdd "add "
+text sqOpSub "sub "
+text sqOpMul "mul "
+text sqOpDiv "div "
+text sqOpRem "rem "
+text sqOpAnd "and "
+text sqOpOr  "or "
+text sqOpXor "xor "
+text sqOpShl "shl "
+text sqOpShr "shr "
+
+fn sqWStr fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn sqWNum fd int v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write fd b p sub 24 p
+end
+
+fn sqWSigned fd int v long to void
+if lt v 0
+sqWStr fd sqMinus
+sqWNum fd ulong neg v
+else
+sqWNum fd ulong v
+end
+end
+
+fn sqEqTxt a view uchar * al ulong b view uchar * to bool
+if ne al len b
+ret false
+end
+for i ulong al bound 64
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note ========================================================================
+note Part 1: SM121 SASS Emitter (all encodings verified via nvdisasm -b SM121)
+note ========================================================================
+
+fn skPut32 off ulong v uint to void
+put skCode off uchar and v 255
+put skCode add off 1 uchar and shr v 8 255
+put skCode add off 2 uchar and shr v 16 255
+put skCode add off 3 uchar shr v 24
+end
+
+fn skW v uint to void
+ap = get skAt 0
+skPut32 ap v
+put skAt 0 add ap 4
+end
+
+fn skQ a uint b uint c uint d uint to void
+skW a
+skW b
+skW c
+skW d
+end
+
+fn skCw st uint wb uint rb uint wt uint to uint
+ret or or or shl st 9 shl wb 14 shl rb 17 shl wt 20
+end
+
+note Antibody #14: stall >= 6 on every ALU / predicate / load / store
+fn skFx a uint b uint c uint to void
+skQ a b c skCw 6 7 7 get skPend 0
+put skPend 0 0
+end
+
+fn skPr a uint b uint c uint to void
+skQ a b c skCw 14 7 7 get skPend 0
+put skPend 0 0
+end
+
+fn skVr a uint b uint c uint to void
+skQ a b c or skCw 6 0 1 get skPend 0 8192
+put skPend 0 3
+end
+
+fn skSt a uint b uint c uint to void
+w = get skPend 0
+skQ a b c or skCw 6 7 1 w 8192
+put skPend 0 or w 2
+end
+
+fn skDrain to void
+if ne get skPend 0 0
+skFx 31000 0 0
+end
+end
+
+fn skExitP p uint to void
+skQ or 2381 shl p 12 0 58720256 or skCw 6 7 7 get skPend 0 8192
+put skPend 0 0
+end
+
+fn skExitEnd to void
+skQ 31053 0 58720256 or skCw 10 7 7 get skPend 0 8192
+put skPend 0 0
+skQ 16546119 4294967292 58982399 1032192
+end
+
+note Branch instruction (p: 7=PT, 0..6=Pp, 8..14=!Pp). Returns byte offset of BRA for patching.
+fn skBra p uint tgtByte ulong to ulong
+pos = get skAt 0
+d = uint and sub sub div tgtByte 16 div pos 16 1 4294967295
+w1 = shl shr d 6 2
+c = uint 58720256
+if le tgtByte pos
+w1 = or w1 4026531840
+c = 58982399
+end
+w0 = or or 2375 shl p 12 shl and d 63 18
+w3 = skCw 6 7 7 get skPend 0
+skQ w0 w1 c w3
+put skPend 0 0
+ret pos
+end
+
+fn skPatchBra braPos ulong p uint to void
+cur = get skAt 0
+d = uint and sub sub div cur 16 div braPos 16 1 4294967295
+w0 = or or 2375 shl p 12 shl and d 63 18
+w1 = shl shr d 6 2
+c = uint 58720256
+if le cur braPos
+w1 = or w1 4026531840
+c = 58982399
+end
+skPut32 braPos w0
+skPut32 add braPos 4 w1
+skPut32 add braPos 8 c
+end
+
+note Core verified SM121 instruction wrappers
+fn skLdc d uint off uint to void
+skVr or 4278221698 shl d 16 shl div off 4 8 2048
+end
+
+fn skLdc64 d uint off uint to void
+skVr or 4278221698 shl d 16 shl div off 4 8 2560
+end
+
+fn skLdcuDesc to void
+skQ 4278482860 27392 134220288 or skCw 6 2 7 get skPend 0 8192
+put skPend 0 4
+end
+
+fn skS2r d uint sr uint to void
+skVr or 31001 shl d 16 0 shl sr 8
+end
+
+fn skMov d uint a uint to void
+skFx or 29186 shl d 16 a 3840
+end
+
+fn skMovP p uint d uint a uint to void
+skFx or or 514 shl p 12 shl d 16 a 3840
+end
+
+fn skMovI d uint imm uint to void
+skFx or 30722 shl d 16 imm 3840
+end
+
+fn skMovIP p uint d uint imm uint to void
+skFx or or 2050 shl p 12 shl d 16 imm 3840
+end
+
+fn skMov64 d uint a uint to void
+skMov d a
+skMov add d 1 add a 1
+end
+
+fn skMov64P p uint d uint a uint to void
+skMovP p d a
+skMovP p add d 1 add a 1
+end
+
+fn skMov64I d uint lo uint hi uint to void
+skMovI d lo
+skMovI add d 1 hi
+end
+
+fn skIadd d uint a uint b uint to void
+skFx or or 29200 shl d 16 shl a 24 b 134209791
+end
+
+fn skIaddI d uint a uint imm uint to void
+skFx or or 30736 shl d 16 shl a 24 imm 134209791
+end
+
+fn skIadd64 d uint a uint b uint to void
+skFx or or 29237 shl d 16 shl a 24 b 126747136
+end
+
+fn skIsub64 d uint a uint b uint to void
+skFx or or 29237 shl d 16 shl a 24 or b 2147483648 126747136
+end
+
+fn skIadd64I d uint a uint imm uint to void
+skFx or or 30773 shl d 16 shl a 24 imm 126747136
+end
+
+fn skImad d uint a uint b uint c uint to void
+skFx or or 29220 shl d 16 shl a 24 b or 126747136 c
+end
+
+fn skImadI d uint a uint imm uint c uint to void
+skFx or or 30756 shl d 16 shl a 24 imm or 126747136 c
+end
+
+fn skImadW d uint a uint b uint c uint to void
+skFx or or 29221 shl d 16 shl a 24 b or 126746624 c
+end
+
+fn skImadWI d uint a uint imm uint c uint to void
+skFx or or 30757 shl d 16 shl a 24 imm or 126746624 c
+end
+
+fn skImadHi d uint a uint b uint c uint to void
+skFx or or 29223 shl d 16 shl a 24 b or 126746624 c
+end
+
+note LOP3.LUT: 192=AND(0xc0), 252=OR(0xfc), 60=XOR(0x3c)
+fn skLop3 d uint a uint b uint lut uint to void
+skFx or or 29202 shl d 16 shl a 24 b or 126746879 shl lut 8
+end
+
+fn skAndI d uint a uint imm uint to void
+skFx or or 30738 shl d 16 shl a 24 imm 126796031
+end
+
+fn skOrI d uint a uint imm uint to void
+skFx or or 30738 shl d 16 shl a 24 imm 126811391
+end
+
+note 64-bit shifts (register shift amount in R sh)
+fn skShfLHi d uint lo uint sh uint hi uint to void
+skFx or or 29209 shl d 16 shl lo 24 sh or 66048 hi
+end
+
+fn skShfLLo d uint lo uint sh uint to void
+skFx or or 29209 shl d 16 shl lo 24 sh 1791
+end
+
+fn skShfRLo d uint lo uint sh uint hi uint to void
+skFx or or 29209 shl d 16 shl lo 24 sh or 4608 hi
+end
+
+fn skShfRHi d uint sh uint hi uint to void
+skFx or 4278219289 shl d 16 sh or 71168 hi
+end
+
+note ISETP unsigned 32-bit and 64-bit (cc: 1=LT, 2=EQ, 3=LE, 4=GT, 5=NE, 6=GE)
+fn skCmpU32 p uint a uint b uint cc uint to void
+skPr or 29196 shl a 24 b or or 66060400 shl cc 12 shl p 17
+end
+
+fn skCmpU32I p uint a uint imm uint cc uint to void
+skPr or 30732 shl a 24 imm or or 66060400 shl cc 12 shl p 17
+end
+
+fn skCmpU64 p uint a uint b uint cc uint to void
+skPr or 29196 shl a 24 b or or 66125936 shl cc 12 shl p 17
+end
+
+fn skCmpU64I p uint a uint imm uint cc uint to void
+skPr or 30732 shl a 24 imm or or 66125936 shl cc 12 shl p 17
+end
+
+note Global 32-bit & 64-bit loads/stores via desc[UR4][Ra.64+off]
+fn skLdg32 d uint a uint off uint to void
+skVr or or 31105 shl d 16 shl a 24 or 4 shl off 8 203299072
+end
+
+fn skLdg64 d uint a uint off uint to void
+skVr or or 31105 shl d 16 shl a 24 or 4 shl off 8 203299584
+end
+
+fn skStg32 a uint b uint off uint to void
+skSt or 31110 shl a 24 or b shl off 8 202381572
+end
+
+fn skStg64 a uint b uint off uint to void
+skSt or 31110 shl a 24 or b shl off 8 202382084
+end
+
+note Hardware SM121 Atomics (INV-1 & INV-2):
+note ATOMG.E.CAS.64.STRONG.GPU PT, Rd, [Ra], Rcmp, Rnew
+fn skAtomCas64 d uint a uint cmp uint val uint to void
+skVr or or 29609 shl d 16 shl a 24 cmp or 2024704 val
+end
+
+note ATOMG.E.ADD.STRONG.GPU PT, Rd, desc[UR4][Ra.64], Rb
+fn skAtomAdd32 d uint a uint b uint to void
+skVr or or 31144 shl d 16 shl a 24 or 2147483648 b 136245508
+end
+
+note ATOMG.E.MIN.STRONG.GPU PT, Rd, desc[UR4][Ra.64], Rb
+fn skAtomMin32 d uint a uint b uint to void
+skVr or or 31144 shl d 16 shl a 24 or 2147483648 b 144634116
+end
+
+note ========================================================================
+note Part 2: 64-bit Arithmetic, Exact Branchless Div/Rem, and WyHash/FNV-1a
+note ========================================================================
+
+note 64-bit multiply: Rd = Ra * Rb (uses R28:R29 scratch; d,a,b even)
+fn skMul64 d uint a uint b uint to void
+skImadW d a b 255
+skImad 28 add a 1 b 255
+skImad 28 a add b 1 28
+skIadd add d 1 add d 1 28
+end
+
+note Exact 64-bit shift left/right with INV-3 branchless mask (b >= 64 -> valid = 0)
+note Input: a=R4:5, b=R6:7; Output: v=R8:9; updates R20 (valid)
+fn skEmitShift isRight bool to void
+skCmpU64I 1 6 64 6
+skMovIP 1 20 0
+skAndI 28 6 63
+if isRight
+skShfRLo 8 4 28 5
+skShfRHi 9 28 5
+skCmpU32I 1 28 32 6
+skMovP 1 8 9
+skMovIP 1 9 0
+else
+skShfLLo 8 4 28
+skShfLHi 9 4 28 5
+skCmpU32I 1 28 32 6
+skMovP 1 9 8
+skMovIP 1 8 0
+end
+end
+
+note Exact 64-bit unsigned binary restoring division/remainder (INV-3 branchless!)
+note Input: a=R4:5, b=R6:7; Output: v=R8:9; updates R20 (valid=0 if b==0)
+note Scratch: R24:25=quot, R26:27=rem, R28=tmp/bit, R29=shift, R30=loopCnt
+fn skEmitDivRem isRem bool to void
+note INV-3: check b == 0 -> valid = 0, safe_b = b | (b == 0)
+skCmpU64I 1 6 0 2
+skMovIP 1 20 0
+skMovIP 1 6 1
+note quot=0 (R24:25), rem=0 (R26:27), i=64 (R30), shift1=1 (R29)
+skMov64I 24 0 0
+skMov64I 26 0 0
+skMovI 30 64
+skMovI 29 1
+skDrain
+divTop = get skAt 0
+skIaddI 30 30 4294967295
+note Extract bit R30 of a (R4:5): R28 = (a >> R30) & 1
+skShfRLo 28 4 30 5
+skShfRHi 12 30 5
+skCmpU32I 2 30 32 6
+skMovP 2 28 12
+skAndI 28 28 1
+note rem = (rem << 1) | bit
+skShfLHi 27 26 29 27
+skShfLLo 26 26 29
+skLop3 26 26 28 252
+note quot = quot << 1
+skShfLHi 25 24 29 25
+skShfLLo 24 24 29
+note if rem >= b: rem -= b; quot |= 1
+skCmpU64 2 26 6 6
+skIsub64 12 26 6
+skMov64P 2 26 12
+skOrI 12 24 1
+skMovP 2 24 12
+skCmpU32I 2 30 0 4
+zB = skBra 2 divTop
+if isRem
+skMov64 8 26
+else
+skMov64 8 24
+end
+end
+
+note Evaluate binary opCode (4..13) on a=R4:5, b=R6:7 -> v=R8:9
+fn skEmitOpBody op uint to void
+if eq op 4
+skIadd64 8 4 6
+ret
+end
+if eq op 5
+skIsub64 8 4 6
+ret
+end
+if eq op 6
+skMul64 8 4 6
+ret
+end
+if eq op 7
+skEmitDivRem false
+ret
+end
+if eq op 8
+skEmitDivRem true
+ret
+end
+if eq op 9
+skLop3 8 4 6 192
+skLop3 9 5 7 192
+ret
+end
+if eq op 10
+skLop3 8 4 6 252
+skLop3 9 5 7 252
+ret
+end
+if eq op 11
+skLop3 8 4 6 60
+skLop3 9 5 7 60
+ret
+end
+if eq op 12
+skEmitShift false
+ret
+end
+skEmitShift true
+end
+
+note Update 64-bit WyHash/FNV-1a state h=R10:11 with v=R8:9 (bit-exact with CPU om_synth.om!)
+note x = v ^ (v >> 30); x *= 13787848793156543929; h = (h ^ x) * 1099511628211
+note 13787848793156543929 = 0xbf58476d1ce4e5b9 (hi=3210233709, lo=484763065)
+note 1099511628211        = 0x00000100000001b3 (hi=256,        lo=435)
+fn skHashLane to void
+skMovI 28 30
+skShfRLo 12 8 28 9
+skShfRHi 13 28 9
+skLop3 12 8 12 60
+skLop3 13 9 13 60
+skMov64I 14 484763065 3210233709
+skMul64 24 12 14
+skLop3 10 10 24 60
+skLop3 11 11 25 60
+skMov64I 14 435 256
+skMul64 12 10 14
+skMov64 10 12
+end
+
+note Emit one unrolled lane (lane 0..7):
+note If lane < nc: load a, b, tgt; evaluate op -> R(32+2*lane); update hash & allMatch
+fn skEmitLane op uint lane uint to void
+dstR = add 32 mul lane 2
+off = mul lane 8
+skCmpU32I 3 22 lane 3
+brSkip = skBra 3 0
+note Load a = vecPool[li*64 + lane*8] (addr in R2:3), b = vecPool[ri*64 + lane*8] (addr in R14:15)
+skLdc64 2 904
+skImadWI 2 18 64 2
+skLdg64 4 2 off
+skLdc64 14 904
+skImadWI 14 19 64 14
+skLdg64 6 14 off
+skEmitOpBody op
+skMov64 dstR 8
+skHashLane
+note Check exact match against targetVec[lane] at ctrlBuf + 64 + lane*8
+skLdg64 14 16 add 64 off
+skCmpU64 4 8 14 5
+skMovIP 4 21 0
+skDrain
+skPatchBra brSkip 3
+end
+
+fn skEmitKPrologue to void
+note 1. Prologue: stack const, UR4 desc, gid = ctaid.x * 256 + tid.x
+skLdc 1 892
+skLdcuDesc
+skS2r 0 33
+skS2r 2 37
+skImadI 0 2 256 0
+note Bounds check: if gid >= nPairs (c[0x0][0x3A0] = 928) -> EXIT
+skLdc 3 928
+skCmpU32 0 0 3 6
+skExitP 0
+
+note 2. Decode (li, ri) using magic division with exact over-estimation correction:
+note li = umulhi(gid, magic); prod = li * nR; if prod > gid: li -= 1, prod = li * nR; ri = gid - prod
+note nR at 932, magic at 936, lhsBase at 940
+skLdc 4 932
+skLdc 5 936
+skImadHi 18 0 5 255
+skImad 6 18 4 255
+skCmpU32 0 6 0 4
+skIaddI 28 18 4294967295
+skMovP 0 18 28
+skImad 6 18 4 255
+skMovI 1 0
+skMovI 7 0
+skIsub64 28 0 6
+skMov 19 28
+skLdc 1 892
+note Add lhsBase (940) to li, and belt-and-suspenders bounds check li, ri < SQ_MAX_NODES
+skLdc 6 940
+skIadd 18 18 6
+skCmpU32I 0 18 131072 6
+skExitP 0
+skCmpU32I 0 19 131072 6
+skExitP 0
+
+note Commutative triangle skip: if (flags & 1) != 0 and li > ri -> EXIT
+skLdc 6 956
+skAndI 6 6 1
+skCmpU32I 0 6 0 2
+brNotComm = skBra 0 0
+skCmpU32 0 18 19 4
+skExitP 0
+skDrain
+skPatchBra brNotComm 0
+
+note 3. Load ctrlBuf (920), nc (948); init valid=1 (R20), allMatch=1 (R21), h=FNV_OFFSET (R10:11)
+skLdc64 16 920
+skLdc 22 948
+skMovI 20 1
+skMovI 21 1
+skMov64I 10 2216829733 3421674724
+end
+
+fn skEmitKInv3Gate to void
+note 5. INV-3 invalidation gate: if valid == 0 -> atomicAdd(&ctrl[4], 1) and EXIT
+skCmpU32I 0 20 0 5
+brValid = skBra 0 0
+skIadd64I 14 16 16
+skMovI 28 1
+skAtomAdd32 255 14 28
+skExitP 7
+skDrain
+skPatchBra brValid 0
+
+note Ensure hash != 0 (0 is empty sentinel in L2 HT)
+skCmpU64I 0 10 0 5
+brNzH = skBra 0 0
+skMovI 10 1
+skDrain
+skPatchBra brNzH 0
+
+note 6. INV-2 70% occupancy cutoff: if ctrl[0] >= 734003 -> EXIT
+skLdg32 28 16 0
+skCmpU32I 0 28 SQ_HT_MAX_OCC 6
+skExitP 0
+end
+
+fn skEmitKProbeCommit to void
+note 7. INV-1 + INV-2 L2 Hash-Table ATOMG.E.CAS.64 Probe Loop (MAX_PROBES = 32)
+skAndI 23 10 1048575
+skMovI 30 0
+skMov64I 24 0 0
+skDrain
+prTop = get skAt 0
+skLdc64 2 896
+skImadWI 2 23 16 2
+skAtomCas64 12 2 24 10
+skCmpU64I 0 12 0 2
+brWin = skBra 0 0
+skCmpU64 0 12 10 5
+brNext = skBra 0 0
+skIadd64I 14 16 12
+skMovI 28 1
+skAtomAdd32 255 14 28
+skExitP 7
+skDrain
+skPatchBra brNext 0
+skIaddI 23 23 1
+skAndI 23 23 1048575
+skIaddI 30 30 1
+skCmpU32I 0 30 32 1
+zLoop = skBra 0 prTop
+skIadd64I 14 16 20
+skMovI 28 1
+skAtomAdd32 255 14 28
+skExitP 7
+
+note 8. WON SLOT: allocate nodeId, increment occ, write htMeta + astPool + vecPool + foundNodeId
+skDrain
+skPatchBra brWin 0
+skMovI 28 1
+skIadd64I 14 16 4
+skAtomAdd32 23 14 28
+skCmpU32I 0 23 131072 6
+skExitP 0
+skAtomAdd32 255 16 28
+skLdc 28 944
+skImadI 28 28 65536 255
+skLdc 29 952
+skLop3 28 28 29 252
+skMov 29 23
+skStg64 2 28 8
+skLdc64 26 912
+skImadWI 26 23 16 26
+skLdc 28 952
+skStg32 26 28 0
+skStg32 26 18 4
+skStg32 26 19 8
+skLdc 28 944
+skStg32 26 28 12
+skLdc64 26 904
+skImadWI 26 23 64 26
+for lane uint 8 bound 8
+skStg64 26 add 32 mul lane 2 mul lane 8
+end
+skCmpU32I 0 21 0 2
+skExitP 0
+skIadd64I 14 16 8
+skAtomMin32 255 14 23
+skExitEnd
+end
+
+note Emit complete SM121 Obs-Equiv BFS Kernel for binary op (4..13) into slot (op-4)
+fn skEmitKernel op uint to void
+slot = sub op 4
+base = mul ulong slot SQ_SLOT_BYTES
+put skAt 0 base
+put skPend 0 0
+skEmitKPrologue
+for lane uint 8 bound 8
+skEmitLane op lane
+end
+skEmitKInv3Gate
+skEmitKProbeCommit
+used = sub get skAt 0 base
+put skSlotLen ulong slot used
+end
+
+note Emit slot 10: ultra-fast SM121 L2 16 MiB hash-table zeroing kernel (1,048,576 x 16 bytes)
+fn skEmitZeroKernel to void
+base = mul ulong 10 SQ_SLOT_BYTES
+put skAt 0 base
+put skPend 0 0
+skLdc 1 892
+skLdcuDesc
+skS2r 0 33
+skS2r 2 37
+skImadI 0 2 256 0
+skLdc 3 928
+skCmpU32 0 0 3 6
+skExitP 0
+skLdc64 2 896
+skImadWI 2 0 16 2
+skMov64I 4 0 0
+skStg64 2 4 0
+skStg64 2 4 8
+skExitEnd
+put skSlotLen 10 sub get skAt 0 base
+end
+
+fn skEmitAll to void
+for k uint 10 bound 10
+skEmitKernel add k 4
+end
+skEmitZeroKernel
+end
+
+note Verify Antibody #14 (stall >= 6) across all 10 emitted kernels
+fn skVerifyAntibodies to bool
+for k ulong 10 bound 10
+base = mul k SQ_SLOT_BYTES
+sz = get skSlotLen k
+if or lt sz 64 gt sz SQ_SLOT_BYTES
+ret false
+end
+note Check every instruction except the final BRA -16 self-loop
+cnt = sub div sz 16 1
+for i ulong cnt bound 1024
+off = add base add mul i 16 12
+b1 = ulong get skCode add off 1
+stall = and shr b1 1 15
+if lt stall 6
+ret false
+end
+end
+end
+ret true
+end
+
+note ========================================================================
+note Part 3: Zero-CUDA GB10 Context, QMD Launcher, and L2 Table Manager
+note ========================================================================
+
+fn sqMagic nz uint h2 uint to uint
+if le h2 1
+ret 0
+end
+ret uint div add 4294967296 ulong sub h2 1 ulong h2
+end
+
+fn sqZeroDev m long total ulong to bool
+off = ulong 0
+while lt off total bound 512
+ch = sub total off
+if gt ch 65536
+ch = 65536
+end
+r = mapwrite m off sqZero 0 ch
+if ne r long ch
+ret false
+end
+off = add off ch
+end
+ret true
+end
+
+fn sqGpuOpen to bool
+if ne get sqOpenFlag 0 0
+ret true
+end
+skEmitAll
+if not nvfull
+ret false
+end
+if not nvchan
+ret false
+end
+note Allocate core launch buffers in gbmem[0..4]
+for i ulong 5 bound 5
+sz = ulong 4096
+if or eq i 0 eq i 2
+sz = ulong 65536
+end
+if eq i 4
+sz = SQ_CODE_BYTES
+end
+m = nvalloc sz true
+if le m 0
+ret false
+end
+put gbmem i m
+end
+note Upload all 10 SM121 SASS kernels into gbmem[4]
+r = mapwrite get gbmem 4 0 skCode 0 SQ_CODE_BYTES
+if ne r long SQ_CODE_BYTES
+ret false
+end
+note Allocate obs-equiv buffers: 16 MiB htBuf, 8 MiB vecPool, 2 MiB astPool, 4 KiB ctrlBuf
+m0 = nvalloc SQ_HT_BYTES true
+m1 = nvalloc SQ_VEC_BYTES true
+m2 = nvalloc SQ_AST_BYTES true
+m3 = nvalloc SQ_CTRL_BYTES true
+if or le m0 0 or le m1 0 or le m2 0 le m3 0
+ret false
+end
+put sqBuf 0 m0
+put sqBuf 1 m1
+put sqBuf 2 m2
+put sqBuf 3 m3
+put sqOpenFlag 0 1
+ret true
+end
+
+fn sqGpuClose to void
+if ne get sqOpenFlag 0 0
+ok = nvstop
+put sqOpenFlag 0 0
+end
+end
+
+fn sqBuildQmd slot uint gx uint to void
+q = mapaddr get gbmem 2
+cb = mapaddr get gbmem 1
+code = add mapaddr get gbmem 4 mul ulong slot SQ_SLOT_BYTES
+scr = add q 16384
+for i ulong 96 bound 96
+put gbq0 i 0
+put gbq1 i 0
+end
+put gbq0 4 8388610
+put gbq0 10 2293760
+put gbq0 12 gblo shr add q 4096 8
+put gbq0 14 5243392
+put gbq0 34 65537
+put gbq0 35 2049
+put gbq1 4 20905984
+put gbq1 9 3
+put gbq1 10 1638400
+put gbq1 12 gblo shr q 8
+put gbq1 14 793772964
+put gbq1 15 gblo add q 8192
+put gbq1 16 gbhi add q 8192
+put gbq1 17 6
+put gbq1 19 2172715008
+put gbq1 20 56
+put gbq1 22 67108864
+put gbq1 32 gblo shr code 4
+put gbq1 33 or uint and shr code 36 2097151 20971520
+put gbq1 34 or SQ_CTA_THREADS 65536
+put gbq1 35 or or 1 shl SQ_GPR_COUNT 8 131072
+put gbq1 36 78923784
+put gbq1 39 gx
+put gbq1 40 1
+put gbq1 41 1
+put gbq1 42 gblo shr cb 6
+put gbq1 43 or uint and shr cb 38 524287 33554432
+put gbq1 44 gblo shr scr 6
+put gbq1 45 or uint and shr scr 38 524287 75497472
+put gbq1 52 gblo shr add cb 768 6
+put gbq1 53 or uint and shr add cb 768 38 524287 8388608
+put gbq1 56 gblo shr scr 6
+put gbq1 57 or uint and shr scr 38 524287 2147483648
+put gbq1 58 271581201
+put gbq1 59 gblo shr code 8
+gbdriver cb
+e = add cb 960
+put gbcb 212 gbhi e
+put gbcb 213 gblo e
+put gbcb 216 SQ_CTA_THREADS
+end
+
+fn sqPrepArgs op uint nPairs uint nR uint lhsBase uint depth uint to void
+va = mapaddr get sqBuf 0
+put sqArg 0 gblo va
+put sqArg 1 gbhi va
+va = mapaddr get sqBuf 1
+put sqArg 2 gblo va
+put sqArg 3 gbhi va
+va = mapaddr get sqBuf 2
+put sqArg 4 gblo va
+put sqArg 5 gbhi va
+va = mapaddr get sqBuf 3
+put sqArg 6 gblo va
+put sqArg 7 gbhi va
+put sqArg 8 nPairs
+put sqArg 9 nR
+put sqArg 10 sqMagic nPairs nR
+put sqArg 11 lhsBase
+put sqArg 12 depth
+put sqArg 13 uint get sqSt 0
+put sqArg 14 op
+put sqArg 15 uint get sqSt 12
+end
+
+fn sqBuildPush to void
+put gbused 0 0
+gbsetup
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
+cb = mapaddr get gbmem 1
+gbdma cb 224
+for i ulong 224 bound 224
+gbemit get gbcb i
+end
+gbdma add cb 896 16
+for i ulong 16 bound 16
+gbemit get sqArg i
+end
+q = mapaddr get gbmem 2
+gbinline q false
+gbdma add q 8192 1
+gbemit 1
+gbinline add q 4096 true
+mark = mapaddr get gbmem 3
+gbrel mark 1145324612
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2147483648
+gbrel add mark 16 1179010630
+end
+
+fn sqLaunchOp op uint nPairs uint nR uint lhsBase uint depth uint to bool
+if eq nPairs 0
+ret true
+end
+sqPrepArgs op nPairs nR lhsBase depth
+gx = div add nPairs sub SQ_CTA_THREADS 1 SQ_CTA_THREADS
+sqBuildQmd sub op 4 gx
+sqBuildPush
+r = mapset get gbmem 2 8192 4 0
+r = mapset get gbmem 3 0 4 0
+r = mapset get gbmem 3 16 4 0
+n = get gbused 0
+r = mapwrite get gbmem 0 0 gbcmd 0 n
+if ne r long n
+ret false
+end
+if not nvsend get gbmem 0 0 uint div n 4
+ret false
+end
+if not nvwait get gbmem 3 16 1179010630 5000000000
+ret false
+end
+if ne mapget get gbmem 3 0 4 1145324612
+put nverr 0 neg long 5
+ret false
+end
+if ne mapget get gbmem 2 8192 4 6
+put nverr 0 neg long 5
+ret false
+end
+ret true
+end
+
+note ========================================================================
+note Part 4: Host Depth-0 Seeding, BFS Orchestrator, & AST Reconstruction
+note ========================================================================
+
+fn sqPutU64 b edit uchar * off ulong v ulong to void
+for i ulong 8 bound 8
+put b add off i uchar and shr v mul i 8 255
+end
+end
+
+fn sqPutU32 b edit uchar * off ulong v uint to void
+for i ulong 4 bound 4
+put b add off i uchar and shr v mul i 8 255
+end
+end
+
+fn sqGetU32 b view uchar * off ulong to uint
+v = uint 0
+for i ulong 4 bound 4
+v = or v shl uint get b add off i mul i 8
+end
+ret v
+end
+
+fn sqHashHost nc ulong to ulong
+h = ulong 14695981039346656037
+for i ulong nc bound 8
+x = ulong 0
+for j ulong 8 bound 8
+x = or x shl ulong get sqVecTmp add mul i 8 j mul j 8
+end
+x = xor x shr x 30
+x = mul x 13787848793156543929
+h = mul xor h x 1099511628211
+end
+if eq h 0
+ret 1
+end
+ret h
+end
+
+fn sqPutSeedU64 off ulong v ulong to void
+for i ulong 8 bound 8
+put sqSeedBuf add off i uchar and shr v mul i 8 255
+end
+end
+
+fn sqPutSeedU32 off ulong v uint to void
+for i ulong 4 bound 4
+put sqSeedBuf add off i uchar and shr v mul i 8 255
+end
+end
+
+fn sqSeedNode op uint l uint r uint nc ulong to void
+nn = get sqSt 3
+h = sqHashHost nc
+sqPutSeedU64 0 h
+sqPutSeedU64 8 or shl nn 32 ulong op
+off = mul and h sub SQ_HT_SLOTS 1 16
+w = mapwrite get sqBuf 0 off sqSeedBuf 0 16
+w = mapwrite get sqBuf 1 mul nn 64 sqVecTmp 0 64
+sqPutSeedU32 0 op
+sqPutSeedU32 4 l
+sqPutSeedU32 8 r
+sqPutSeedU32 12 0
+w = mapwrite get sqBuf 2 mul nn 16 sqSeedBuf 0 16
+put sqAstOp nn op
+put sqAstL nn l
+put sqAstR nn r
+put sqAstD nn 0
+put sqSt 3 add nn 1
+put sqSt 4 add get sqSt 4 1
+end
+
+fn sqPutVecU64 off ulong v ulong to void
+for i ulong 8 bound 8
+put sqVecTmp add off i uchar and shr v mul i 8 255
+end
+end
+
+fn sqGpuZeroHt to bool
+put sqSt 12 0
+ret sqLaunchOp 14 uint SQ_HT_SLOTS 1 0 0
+end
+
+fn sqResetAndSeed to bool
+nc = get sqSt 0
+ar = get sqSt 1
+ncon = get sqSt 2
+if not sqGpuZeroHt
+ret false
+end
+if not sqZeroDev get sqBuf 3 SQ_CTRL_BYTES
+ret false
+end
+put sqSt 3 0
+put sqSt 4 0
+put sqLvlS 0 0
+note Seed ARG_A
+for i ulong 64 bound 64
+put sqVecTmp i 0
+end
+for i ulong nc bound 8
+sqPutVecU64 mul i 8 get sqInA i
+end
+sqSeedNode 1 0 0 nc
+if ge ar 2
+for i ulong nc bound 8
+sqPutVecU64 mul i 8 get sqInB i
+end
+sqSeedNode 2 0 0 nc
+end
+if ge ar 3
+for i ulong nc bound 8
+sqPutVecU64 mul i 8 get sqInC i
+end
+sqSeedNode 3 0 0 nc
+end
+for c ulong ncon bound 32
+cv = get sqConsts c
+for i ulong nc bound 8
+sqPutVecU64 mul i 8 cv
+end
+sqSeedNode 0 uint cv 0 nc
+end
+put sqLvlE 0 get sqSt 3
+note Initialize ctrlBuf: occ, allocCount, found=0xFFFFFFFF, targetVec[0..7]
+cb = new uchar 128 0
+sqPutU32 cb 0 uint get sqSt 4
+sqPutU32 cb 4 uint get sqSt 3
+sqPutU32 cb 8 4294967295
+for i ulong nc bound 8
+sqPutU64 cb add 64 mul i 8 get sqTgt i
+end
+w = mapwrite get sqBuf 3 0 cb 0 128
+ret eq w 128
+end
+
+fn sqReadCtrl to void
+cb = new uchar 32 0
+r = mapread get sqBuf 3 0 cb 0 32
+for i ulong 6 bound 6
+put sqCtrl i sqGetU32 cb mul i 4
+end
+end
+
+note Run one strict BFS level d on GB10 silicon (INV-1 level barrier across all 10 ops)
+note Returns true if target was found, updates sqSt[10] with total GPU candidates evaluated
+fn sqIsComm op uint to bool
+if or eq op 4 eq op 6
+ret true
+end
+if or eq op 9 or eq op 10 eq op 11
+ret true
+end
+ret false
+end
+
+fn sqClampNodes v ulong to ulong
+if gt v SQ_MAX_NODES
+ret SQ_MAX_NODES
+end
+ret v
+end
+
+fn sqRunBfsLevel d ulong maxOps ulong stopOnFound bool to bool
+put sqLvlS d sqClampNodes ulong get sqCtrl 1
+prevS = sqClampNodes get sqLvlS sub d 1
+prevE = sqClampNodes get sqLvlE sub d 1
+if le prevE prevS
+put sqLvlE d sqClampNodes ulong get sqCtrl 1
+ret false
+end
+nPairs = mul uint sub prevE prevS uint prevE
+if eq nPairs 0
+put sqLvlE d sqClampNodes ulong get sqCtrl 1
+ret false
+end
+for k ulong maxOps bound 10
+op = uint add k 4
+put sqSt 12 0
+if and eq prevS 0 sqIsComm op
+put sqSt 12 1
+end
+if not sqLaunchOp op nPairs uint prevE uint prevS uint d
+put sqSt 11 1
+ret false
+end
+put sqSt 10 add get sqSt 10 ulong nPairs
+sqReadCtrl
+if and stopOnFound ne get sqCtrl 2 4294967295
+put sqLvlE d sqClampNodes ulong get sqCtrl 1
+ret true
+end
+if ge get sqCtrl 0 SQ_HT_MAX_OCC
+put sqLvlE d sqClampNodes ulong get sqCtrl 1
+ret false
+end
+end
+put sqLvlE d sqClampNodes ulong get sqCtrl 1
+ret ne get sqCtrl 2 4294967295
+end
+
+fn sqGetSyncU32 off ulong to uint
+v = uint 0
+for i ulong 4 bound 4
+v = or v shl uint get sqSyncBuf add off i mul i 8
+end
+ret v
+end
+
+note Read back AST pool from GB10 for node reconstruction
+fn sqSyncAstPool cnt ulong to void
+lim = cnt
+if gt lim SQ_MAX_NODES
+lim = SQ_MAX_NODES
+end
+off = ulong 0
+while lt off lim bound 512
+ch = sub lim off
+if gt ch 256
+ch = 256
+end
+r = mapread get sqBuf 2 mul off 16 sqSyncBuf 0 mul ch 16
+for i ulong ch bound 256
+idx = add off i
+b = mul i 16
+put sqAstOp idx sqGetSyncU32 b
+put sqAstL idx sqGetSyncU32 add b 4
+put sqAstR idx sqGetSyncU32 add b 8
+put sqAstD idx sqGetSyncU32 add b 12
+end
+off = add off ch
+end
+end
+
+fn sqOCh c ulong to void
+p = get sqOutPos 0
+if lt p 65535
+put sqOut p uchar c
+put sqOutPos 0 add p 1
+end
+end
+
+fn sqOTxt s view uchar * to void
+for i ulong len s bound 4096
+sqOCh ulong get s i
+end
+end
+
+fn sqONum v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+while lt p 24 bound 24
+sqOCh ulong get b p
+p = add p 1
+end
+end
+
+fn sqEmitExpr nid ulong to void
+op = ulong get sqAstOp nid
+if eq op 0
+sqOTxt sqUlong
+sqONum ulong get sqAstL nid
+ret
+end
+if eq op 1
+sqOTxt sqVA
+ret
+end
+if eq op 2
+sqOTxt sqVB
+ret
+end
+if eq op 3
+sqOTxt sqVC
+ret
+end
+if eq op 4
+sqOTxt sqOpAdd
+end
+if eq op 5
+sqOTxt sqOpSub
+end
+if eq op 6
+sqOTxt sqOpMul
+end
+if eq op 7
+sqOTxt sqOpDiv
+end
+if eq op 8
+sqOTxt sqOpRem
+end
+if eq op 9
+sqOTxt sqOpAnd
+end
+if eq op 10
+sqOTxt sqOpOr
+end
+if eq op 11
+sqOTxt sqOpXor
+end
+if eq op 12
+sqOTxt sqOpShl
+end
+if eq op 13
+sqOTxt sqOpShr
+end
+sqEmitExpr ulong get sqAstL nid
+sqOCh 32
+sqEmitExpr ulong get sqAstR nid
+end
+
+note Verify reconstructed AST node nid evaluates identically to targetVec on CPU!
+fn sqEvalAst nid ulong ci ulong to ulong
+op = ulong get sqAstOp nid
+if eq op 0
+ret ulong get sqAstL nid
+end
+if eq op 1
+ret get sqInA ci
+end
+if eq op 2
+ret get sqInB ci
+end
+if eq op 3
+ret get sqInC ci
+end
+lv = sqEvalAst ulong get sqAstL nid ci
+rv = sqEvalAst ulong get sqAstR nid ci
+if eq op 4
+ret add lv rv
+end
+if eq op 5
+ret sub lv rv
+end
+if eq op 6
+ret mul lv rv
+end
+if eq op 7
+if eq rv 0
+ret 18446744073709551615
+end
+ret div lv rv
+end
+if eq op 8
+if eq rv 0
+ret 18446744073709551615
+end
+ret rem lv rv
+end
+if eq op 9
+ret and lv rv
+end
+if eq op 10
+ret or lv rv
+end
+if eq op 11
+ret xor lv rv
+end
+if eq op 12
+ret shl lv and rv 63
+end
+ret shr lv and rv 63
+end
+
+fn sqVerifyNode nid ulong to bool
+nc = get sqSt 0
+for i ulong nc bound 8
+if ne sqEvalAst nid i get sqTgt i
+ret false
+end
+end
+ret true
+end
+
+note ========================================================================
+note Part 5: Commands: dump, selfcheck (live GB10 silicon), solve
+note ========================================================================
+
+fn sqDumpOne k ulong dirLen ulong to bool
+p = new uchar 4096 0
+n = ulong 0
+for i ulong dirLen bound 2048
+put p n get sqPath i
+n = add n 1
+end
+for i ulong len sqKSlash bound 16
+put p n get sqKSlash i
+n = add n 1
+end
+if ge add k 4 10
+put p n uchar 49
+n = add n 1
+put p n uchar add 48 sub add k 4 10
+n = add n 1
+else
+put p n uchar add 48 add k 4
+n = add n 1
+end
+for i ulong len sqKBin bound 16
+put p n get sqKBin i
+n = add n 1
+end
+fd = fopen p 0 n 577 420
+if lt fd 0
+ret false
+end
+sz = get skSlotLen k
+w = write int fd skCode mul k SQ_SLOT_BYTES sz
+c = fclose int fd
+ret eq w long sz
+end
+
+fn sqCmdDump dirLen ulong to int
+skEmitAll
+if not skVerifyAntibodies
+sqWStr 2 sqTErrIo
+ret 1
+end
+for k ulong 10 bound 10
+if not sqDumpOne k dirLen
+sqWStr 2 sqTErrIo
+ret 1
+end
+end
+sqWStr 1 sqTDumpOk
+ret 0
+end
+
+note Helper tests to keep each function well within omc's register budget
+fn sqTest1 to ulong
+put sqSt 0 8
+put sqSt 1 1
+put sqSt 2 4
+put sqConsts 0 0
+put sqConsts 1 1
+put sqConsts 2 2
+put sqConsts 3 5
+put sqInA 0 0
+put sqInA 1 31
+put sqInA 2 32
+put sqInA 3 63
+put sqInA 4 64
+put sqInA 5 96
+put sqInA 6 100
+put sqInA 7 255
+for i ulong 8 bound 8
+put sqTgt i and shr get sqInA i 5 1
+end
+if not sqResetAndSeed
+ret 1000001
+end
+sqReadCtrl
+put sqSt 10 0
+put sqSt 11 0
+ok1 = sqRunBfsLevel 1 10 true
+if not ok1
+ok1 = sqRunBfsLevel 2 10 true
+end
+if ne get sqSt 11 0
+ret 1000099
+end
+nid = ulong get sqCtrl 2
+if eq nid 4294967295
+ret 1000002
+end
+sqSyncAstPool ulong get sqCtrl 1
+if not sqVerifyNode nid
+ret 1000003
+end
+ret nid
+end
+
+fn sqTest2 to ulong
+put sqSt 0 8
+put sqSt 1 1
+put sqSt 2 4
+put sqConsts 0 0
+put sqConsts 1 1
+put sqConsts 2 2
+put sqConsts 3 14
+put sqInA 0 0
+put sqInA 1 13
+put sqInA 2 14
+put sqInA 3 15
+put sqInA 4 27
+put sqInA 5 28
+put sqInA 6 99
+put sqInA 7 140
+for i ulong 8 bound 8
+put sqTgt i sub get sqInA i rem get sqInA i 14
+end
+if not sqResetAndSeed
+ret 1000004
+end
+sqReadCtrl
+put sqSt 11 0
+ok2 = sqRunBfsLevel 1 10 true
+if not ok2
+d1E = uint get sqCtrl 1
+d0E = uint get sqLvlE 0
+put sqSt 12 0
+if not sqLaunchOp 5 mul d0E d1E d1E 0 2
+put sqSt 11 1
+end
+sqReadCtrl
+if eq get sqCtrl 2 4294967295
+ok2 = sqRunBfsLevel 2 10 true
+end
+end
+if ne get sqSt 11 0
+ret 1000099
+end
+nid = ulong get sqCtrl 2
+if or eq nid 4294967295 eq get sqCtrl 4 0
+ret 1000005
+end
+sqSyncAstPool ulong get sqCtrl 1
+if not sqVerifyNode nid
+ret 1000006
+end
+ret nid
+end
+
+fn sqTest3 to ulong
+put sqSt 0 8
+put sqSt 1 2
+put sqSt 2 6
+put sqConsts 0 0
+put sqConsts 1 1
+put sqConsts 2 2
+put sqConsts 3 3
+put sqConsts 4 7
+put sqConsts 5 64
+put sqInA 0 5
+put sqInA 1 12
+put sqInA 2 33
+put sqInA 3 77
+put sqInA 4 101
+put sqInA 5 255
+put sqInA 6 1024
+put sqInA 7 4096
+put sqInB 0 3
+put sqInB 1 0
+put sqInB 2 5
+put sqInB 3 11
+put sqInB 4 64
+put sqInB 5 17
+put sqInB 6 9
+put sqInB 7 31
+for i ulong 8 bound 8
+put sqTgt i 12345678901234567
+end
+if not sqResetAndSeed
+ret 900000000007
+end
+sqReadCtrl
+put sqSt 10 0
+put sqSt 11 0
+t0 = monons
+z1 = sqRunBfsLevel 1 10 false
+z2 = sqRunBfsLevel 2 10 false
+note Level 3 throughput sweep: dispatch fast single-pass ops (add,sub,mul,and,or,xor,shl,shr)
+d2S = sqClampNodes get sqLvlS 2
+d2E = sqClampNodes get sqLvlE 2
+if gt sub d2E d2S 1024
+d2S = sub d2E 1024
+end
+nP3 = mul uint sub d2E d2S uint d2E
+if gt nP3 0
+put sqSt 12 0
+if not sqLaunchOp 4 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+if not sqLaunchOp 5 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+if not sqLaunchOp 6 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+if not sqLaunchOp 9 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+if not sqLaunchOp 10 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+if not sqLaunchOp 11 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+if not sqLaunchOp 12 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+if not sqLaunchOp 13 nP3 uint d2E uint d2S 3
+put sqSt 11 1
+end
+put sqSt 10 add get sqSt 10 mul ulong 8 ulong nP3
+end
+t1 = monons
+if ne get sqSt 11 0
+ret 900000000099
+end
+sqReadCtrl
+if gt ulong get sqCtrl 0 ulong SQ_HT_MAX_OCC
+ret 900000000008
+end
+dtUs = div ulong sub t1 t0 1000
+if eq dtUs 0
+dtUs = 1
+end
+ret dtUs
+end
+
+fn sqRunSelfcheck to int
+if not sqGpuOpen
+sqWStr 2 sqTErrOpen
+sqWSigned 2 get nverr 0
+sqWStr 2 sqTStage
+sqWNum 2 ulong get nvstage 0
+sqWStr 2 sqTNl
+ret 1
+end
+nid1 = sqTest1
+if ge nid1 1000000
+sqGpuClose
+if eq nid1 1000099
+sqWStr 2 sqTErrLaunch
+sqWSigned 2 get nverr 0
+else
+sqWStr 2 sqTSelfFail
+sqWNum 2 sub nid1 1000000
+end
+sqWStr 2 sqTNl
+ret 1
+end
+nid2 = sqTest2
+if ge nid2 1000000
+sqGpuClose
+if eq nid2 1000099
+sqWStr 2 sqTErrLaunch
+sqWSigned 2 get nverr 0
+else
+sqWStr 2 sqTSelfFail
+sqWNum 2 sub nid2 1000000
+end
+sqWStr 2 sqTNl
+ret 1
+end
+dtUs = sqTest3
+if ge dtUs 900000000000
+sqGpuClose
+if eq dtUs 900000000099
+sqWStr 2 sqTErrLaunch
+sqWSigned 2 get nverr 0
+else
+sqWStr 2 sqTSelfFail
+sqWNum 2 sub dtUs 900000000000
+end
+sqWStr 2 sqTNl
+ret 1
+end
+sqGpuClose
+cands3 = get sqSt 10
+sqWStr 1 sqTSelfPass
+sqWStr 1 sqK0
+sqWNum 1 nid1
+sqWStr 1 sqK1
+sqWNum 1 nid2
+sqWStr 1 sqK2
+sqWNum 1 cands3
+sqWStr 1 sqK3
+sqWNum 1 ulong get sqCtrl 1
+sqWStr 1 sqK4
+sqWNum 1 ulong get sqCtrl 3
+sqWStr 1 sqK5
+sqWNum 1 ulong get sqCtrl 4
+sqWStr 1 sqK6
+sqWNum 1 ulong get sqCtrl 5
+sqWStr 1 sqK7
+sqWNum 1 ulong get sqCtrl 0
+sqWStr 1 sqK8
+sqWNum 1 dtUs
+sqWStr 1 sqK9
+sqWNum 1 div cands3 dtUs
+sqWStr 1 sqK10
+sqWStr 1 sqTNl
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+sqWStr 2 sqTUsage
+ret 2
+end
+mb = new uchar 64 0
+ml = argread 1 mb 0 64
+if le ml 0
+sqWStr 2 sqTUsage
+ret 2
+end
+if sqEqTxt mb ulong ml sqMDump
+if lt argcnt 3
+sqWStr 2 sqTUsage
+ret 2
+end
+dl = argread 2 sqPath 0 4096
+if le dl 0
+sqWStr 2 sqTUsage
+ret 2
+end
+ret sqCmdDump ulong dl
+end
+if sqEqTxt mb ulong ml sqMSelf
+ret sqRunSelfcheck
+end
+sqWStr 2 sqTUsage
+ret 2
+end

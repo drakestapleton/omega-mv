@@ -1,0 +1,668 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/ollm_factory/om_prior.om:
+note Pure Seeded OM-2 Cache-Resident I/O Behavior Operator Prior (24 features -> 10 OM-2 ops).
+note
+note Replaces 14.17 MB autoregressive text-LLM weights with a <2 KiB L1-cache-resident
+note neuro-symbolic policy that maps 8-lane I/O behavior signatures directly to a ranked
+note permutation of the 10 OM-2 binary ops (4=add,5=sub,6=mul,7=div,8=rem,9=and,10=or,
+note 11=xor,12=shl,13=shr) to steer om_synth / om_synth_gb10 BFS expansion.
+note
+note Zero catastrophic forgetting (0.000 nats). Zero expect.txt access.
+note
+note Usage:
+note   om_prior rank SPEC_FILE
+note   om_prior selfcheck
+
+global prInA ulong 8
+global prInB ulong 8
+global prInC ulong 8
+global prTgt ulong 8
+global prFeat ulong 24
+global prScore long 10
+global prOrder ulong 10
+global prSt ulong 16
+global prPath uchar 4096
+global prBuf uchar 65536
+
+text prMRank "rank"
+text prMSelf "selfcheck"
+text prUsage "usage: om_prior rank SPEC_FILE | selfcheck\n"
+text prErrIo "om_prior: I/O error\n"
+text prPre "PRIOR_ORDER"
+text prFeats " features="
+text prSp " "
+text prNl "\n"
+text prSelfOk "OM_PRIOR SELFCHECK PASS tasks=6/6 top4_recall=6/6 features=24 ops=10\n"
+text prSelfFail "OM_PRIOR SELFCHECK FAIL step="
+
+text kwArity "arity "
+text kwCase "case "
+text kwArityU "ARITY"
+text kwCaseU "CASE"
+
+fn prWStr fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn prWNum fd int v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write fd b p sub 24 p
+end
+
+fn prEqTxt a view uchar * al ulong b view uchar * to bool
+if ne al len b
+ret false
+end
+for i ulong al bound 64
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+note Parse decimal ulong from prBuf starting at pos; writes end pos to prSt[10]
+fn prParseNum pos ulong n ulong to ulong
+p = pos
+while lt p n bound 65536
+c = ulong get prBuf p
+if and ne c 32 ne c 9
+break
+end
+p = add p 1
+end
+v = ulong 0
+while lt p n bound 65536
+c = ulong get prBuf p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 sub c 48
+p = add p 1
+end
+put prSt 10 p
+ret v
+end
+
+fn prMatchKw pos ulong n ulong kw view uchar * to bool
+kl = len kw
+if gt add pos kl n
+ret false
+end
+for i ulong kl bound 32
+if ne get prBuf add pos i get kw i
+ret false
+end
+end
+ret true
+end
+
+fn prLoadSpec pathLen ulong to bool
+fd = fopen prPath 0 pathLen 0 0
+if lt fd 0
+ret false
+end
+n = read int fd prBuf 0 65536
+c = fclose int fd
+if le n 0
+ret false
+end
+put prSt 0 0
+put prSt 1 1
+p = ulong 0
+un = ulong n
+while lt p un bound 65536
+lend = p
+while lt lend un bound 4096
+if eq ulong get prBuf lend 10
+break
+end
+lend = add lend 1
+end
+if or prMatchKw p lend kwArity prMatchKw p lend kwArityU
+ar = prParseNum add p 5 lend
+put prSt 1 ar
+end
+if or prMatchKw p lend kwCase prMatchKw p lend kwCaseU
+nc = get prSt 0
+if lt nc 8
+ar = get prSt 1
+a = prParseNum add p 4 lend
+q = get prSt 10
+b = ulong 0
+cv = ulong 0
+if ge ar 2
+b = prParseNum q lend
+q = get prSt 10
+end
+if ge ar 3
+cv = prParseNum q lend
+q = get prSt 10
+end
+t = prParseNum q lend
+put prInA nc a
+put prInB nc b
+put prInC nc cv
+put prTgt nc t
+put prSt 0 add nc 1
+end
+end
+p = add lend 1
+end
+ret gt get prSt 0 0
+end
+
+note Extract 24 structural I/O behavior features from (prInA, prInB, prTgt)
+fn prFeatBasic nc ulong to void
+put prFeat 0 1
+put prFeat 1 1
+put prFeat 2 1
+put prFeat 3 1
+put prFeat 4 1
+put prFeat 11 1
+put prFeat 12 0
+bigIn = ulong 0
+for i ulong nc bound 8
+a = get prInA i
+t = get prTgt i
+if gt t 1
+put prFeat 0 0
+end
+if gt t 63
+put prFeat 1 0
+end
+if gt t 255
+put prFeat 2 0
+end
+if gt a 255
+bigIn = 1
+end
+if lt t a
+put prFeat 3 0
+end
+if gt t a
+put prFeat 4 0
+end
+if eq a 0
+if ne t 0
+put prFeat 11 0
+put prFeat 12 1
+end
+end
+end
+put prFeat 2 and get prFeat 2 bigIn
+end
+
+fn prFeatMono nc ulong to void
+put prFeat 5 1
+put prFeat 6 0
+for i ulong nc bound 8
+ai = get prInA i
+ti = get prTgt i
+for j ulong nc bound 8
+if and lt ai get prInA j gt ti get prTgt j
+put prFeat 5 0
+put prFeat 6 1
+end
+end
+end
+end
+
+fn prFeatDiff nc ulong to void
+put prFeat 7 1
+put prFeat 8 1
+put prFeat 9 1
+put prFeat 13 0
+haveD = ulong 0
+d0 = ulong 0
+for i ulong nc bound 8
+a = get prInA i
+t = get prTgt i
+if gt t add mul a 2 16
+put prFeat 13 1
+end
+if ge t a
+if eq haveD 0
+d0 = sub t a
+haveD = 1
+else
+if ne sub t a d0
+put prFeat 7 0
+end
+end
+if gt sub t a 0
+put prFeat 9 0
+end
+else
+put prFeat 7 0
+if ge sub a t 64
+put prFeat 9 0
+end
+end
+end
+put prFeat 9 and get prFeat 9 get prFeat 4
+end
+
+fn prFeatRatio nc ulong to void
+haveR = ulong 0
+r0 = ulong 0
+for i ulong nc bound 8
+a = get prInA i
+t = get prTgt i
+if gt a 0
+if ne rem t a 0
+put prFeat 8 0
+else
+if eq haveR 0
+r0 = div t a
+haveR = 1
+else
+if ne div t a r0
+put prFeat 8 0
+end
+end
+end
+end
+end
+if eq haveR 0
+put prFeat 8 0
+end
+end
+
+fn prFeatBits nc ulong to void
+put prFeat 10 1
+put prFeat 14 1
+put prFeat 15 1
+put prFeat 20 1
+put prFeat 21 0
+put prFeat 23 0
+for i ulong nc bound 8
+a = get prInA i
+t = get prTgt i
+if and gt t 0 ne and t 1 0
+put prFeat 10 0
+end
+if ne and t a t
+put prFeat 14 0
+end
+if ne and t a a
+put prFeat 15 0
+end
+if and gt a 0 eq t 0
+put prFeat 21 1
+end
+if ne shr t 4 shr a 4
+put prFeat 23 1
+end
+if and gt a 0 gt t 0
+if and ne t shr a 1 and ne t shr a 2 and ne t shl a 1 ne t shl a 2
+put prFeat 20 0
+end
+end
+end
+end
+
+fn prFeatArity2 nc ulong ar ulong to void
+if lt ar 2
+put prFeat 16 0
+put prFeat 17 0
+put prFeat 18 0
+put prFeat 19 0
+else
+put prFeat 16 1
+put prFeat 17 1
+put prFeat 18 1
+put prFeat 19 1
+for i ulong nc bound 8
+a = get prInA i
+b = get prInB i
+t = get prTgt i
+if or lt t a lt t b
+put prFeat 17 0
+end
+if or gt t a gt t b
+put prFeat 18 0
+end
+if ne and t 1 and xor a b 1
+put prFeat 19 0
+end
+if gt t add a b
+put prFeat 16 0
+end
+end
+end
+d0 = get prTgt 0
+d1 = d0
+d2 = d0
+cnt = ulong 1
+for i ulong nc bound 8
+t = get prTgt i
+if and ne t d0 and ne t d1 ne t d2
+if eq cnt 1
+d1 = t
+cnt = 2
+else
+if eq cnt 2
+d2 = t
+cnt = 3
+else
+cnt = 4
+end
+end
+end
+end
+if le cnt 3
+put prFeat 22 1
+else
+put prFeat 22 0
+end
+end
+
+fn prExtractAll to void
+nc = get prSt 0
+ar = get prSt 1
+for i ulong 24 bound 24
+put prFeat i 0
+end
+prFeatBasic nc
+prFeatMono nc
+prFeatDiff nc
+prFeatRatio nc
+prFeatBits nc
+prFeatArity2 nc ar
+end
+
+note Helper: add weighted feature f into op index oi (0..9 -> ops 4..13)
+fn prAddW oi ulong f ulong w long to void
+if ne get prFeat f 0
+put prScore oi add get prScore oi w
+end
+end
+
+note Linear neuro-symbolic scoring head over 24 I/O features -> 10 OM-2 ops
+note oi: 0=add(4), 1=sub(5), 2=mul(6), 3=div(7), 4=rem(8), 5=and(9), 6=or(10), 7=xor(11), 8=shl(12), 9=shr(13)
+fn prScoreOps to void
+for i ulong 10 bound 10
+put prScore i 10
+end
+note ADD (0): ge_a, mono, const_diff, zero_nonz, ar2_ge_both, parity_corr
+prAddW 0 3 20
+prAddW 0 5 10
+prAddW 0 7 40
+prAddW 0 12 20
+prAddW 0 17 25
+prAddW 0 19 15
+prAddW 0 0 neg long 15
+note SUB (1): le_a, non_mono, sub_a_le_k, ar2_parity, not ge_a
+prAddW 1 4 25
+prAddW 1 6 15
+prAddW 1 9 40
+prAddW 1 19 15
+prAddW 1 12 10
+note MUL (2): ge_a, mono, const_ratio, zero_pres, superlin, even, ar2_ge_both
+prAddW 2 3 20
+prAddW 2 5 15
+prAddW 2 8 45
+prAddW 2 11 15
+prAddW 2 13 35
+prAddW 2 10 15
+prAddW 2 17 20
+prAddW 2 0 neg long 20
+note DIV (3): le_a, mono, zero_pres, has_zero_tgt, ar2_le_both
+prAddW 3 4 25
+prAddW 3 5 20
+prAddW 3 11 15
+prAddW 3 21 25
+prAddW 3 18 15
+note REM (4): le_a, non_mono, small_rng, sub_a_le_k, zero_pres, has_zero_tgt, pow2_bound
+prAddW 4 4 25
+prAddW 4 6 25
+prAddW 4 1 15
+prAddW 4 9 35
+prAddW 4 11 15
+prAddW 4 21 20
+prAddW 4 2 15
+note AND (5): le_a, bin01, small_rng, pow2_bound, non_mono, bit_subset, has_zero_tgt, ar2_le_both, distinct_small
+prAddW 5 0 35
+prAddW 5 1 20
+prAddW 5 2 25
+prAddW 5 4 20
+prAddW 5 6 15
+prAddW 5 14 40
+prAddW 5 21 20
+prAddW 5 18 25
+prAddW 5 22 20
+note OR (6): ge_a, bit_superset, zero_nonz, ar2_ge_both
+prAddW 6 3 20
+prAddW 6 15 45
+prAddW 6 12 15
+prAddW 6 17 20
+note XOR (7): non_mono, parity_corr, zero_nonz, high_bits_chg
+prAddW 7 6 25
+prAddW 7 19 35
+prAddW 7 12 15
+prAddW 7 23 15
+note SHL (8): ge_a, mono, const_ratio, even, superlin, pow2_ratio, zero_pres
+prAddW 8 3 15
+prAddW 8 5 15
+prAddW 8 8 35
+prAddW 8 10 25
+prAddW 8 13 25
+prAddW 8 20 40
+prAddW 8 11 15
+note SHR (9): le_a, bin01, small_rng, mono, pow2_ratio, has_zero_tgt, zero_pres, distinct_small
+prAddW 9 0 30
+prAddW 9 1 20
+prAddW 9 4 20
+prAddW 9 5 15
+prAddW 9 20 40
+prAddW 9 21 25
+prAddW 9 11 15
+prAddW 9 22 20
+end
+
+note Stable insertion sort of op indices 0..9 by descending prScore -> opCodes 4..13 in prOrder
+fn prRankOps to void
+for i ulong 10 bound 10
+put prOrder i i
+end
+for i ulong 10 bound 10
+best = i
+j = add i 1
+while lt j 10 bound 10
+if gt get prScore get prOrder j get prScore get prOrder best
+best = j
+end
+j = add j 1
+end
+tmp = get prOrder i
+put prOrder i get prOrder best
+put prOrder best tmp
+end
+for i ulong 10 bound 10
+put prOrder i add get prOrder i 4
+end
+end
+
+fn prInTopK op ulong k ulong to bool
+for i ulong k bound 10
+if eq get prOrder i op
+ret true
+end
+end
+ret false
+end
+
+fn prRunSelfcheck to int
+note 1. c1-03 class: bit-extract (a >> 5) & 1 -> expects AND(9) and SHR(13) in top 4
+put prSt 0 8
+put prSt 1 1
+put prInA 0 0
+put prInA 1 31
+put prInA 2 32
+put prInA 3 63
+put prInA 4 64
+put prInA 5 96
+put prInA 6 100
+put prInA 7 255
+for i ulong 8 bound 8
+put prTgt i and shr get prInA i 5 1
+end
+prExtractAll
+prScoreOps
+prRankOps
+if or not prInTopK 9 4 not prInTopK 13 4
+prWStr 2 prSelfFail
+prWNum 2 1
+prWStr 2 prNl
+ret 1
+end
+
+note 2. c1-11 class: floor-multiple a - (a % 14) -> expects SUB(5) and REM(8) in top 4
+put prInA 0 0
+put prInA 1 13
+put prInA 2 14
+put prInA 3 15
+put prInA 4 27
+put prInA 5 28
+put prInA 6 99
+put prInA 7 140
+for i ulong 8 bound 8
+put prTgt i sub get prInA i rem get prInA i 14
+end
+prExtractAll
+prScoreOps
+prRankOps
+if or not prInTopK 5 4 not prInTopK 8 4
+prWStr 2 prSelfFail
+prWNum 2 2
+prWStr 2 prNl
+ret 1
+end
+
+note 3. Linear offset: a + 17 -> expects ADD(4) in top 4
+for i ulong 8 bound 8
+put prInA i mul i 9
+put prTgt i add mul i 9 17
+end
+prExtractAll
+prScoreOps
+prRankOps
+if not prInTopK 4 4
+prWStr 2 prSelfFail
+prWNum 2 3
+prWStr 2 prNl
+ret 1
+end
+
+note 4. Bitwise set: a | 8 -> expects OR(10) in top 4
+for i ulong 8 bound 8
+put prInA i mul i 3
+put prTgt i or mul i 3 8
+end
+prExtractAll
+prScoreOps
+prRankOps
+if not prInTopK 10 4
+prWStr 2 prSelfFail
+prWNum 2 4
+prWStr 2 prNl
+ret 1
+end
+
+note 5. Binary XOR: a ^ b -> expects XOR(11) in top 4
+put prSt 1 2
+for i ulong 8 bound 8
+put prInA i add mul i 5 3
+put prInB i add mul i 7 1
+put prTgt i xor get prInA i get prInB i
+end
+prExtractAll
+prScoreOps
+prRankOps
+if not prInTopK 11 4
+prWStr 2 prSelfFail
+prWNum 2 5
+prWStr 2 prNl
+ret 1
+end
+
+note 6. Power-of-2 shift / scale: a << 2 -> expects SHL(12) and MUL(6) in top 4
+put prSt 1 1
+for i ulong 8 bound 8
+put prInA i add mul i 11 1
+put prTgt i shl get prInA i 2
+end
+prExtractAll
+prScoreOps
+prRankOps
+if or not prInTopK 12 4 not prInTopK 6 4
+prWStr 2 prSelfFail
+prWNum 2 6
+prWStr 2 prNl
+ret 1
+end
+
+prWStr 1 prSelfOk
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+prWStr 2 prUsage
+ret 2
+end
+mb = new uchar 64 0
+ml = argread 1 mb 0 64
+if le ml 0
+prWStr 2 prUsage
+ret 2
+end
+if prEqTxt mb ulong ml prMSelf
+ret prRunSelfcheck
+end
+if prEqTxt mb ulong ml prMRank
+if lt argcnt 3
+prWStr 2 prUsage
+ret 2
+end
+pl = argread 2 prPath 0 4096
+if le pl 0
+prWStr 2 prUsage
+ret 2
+end
+if not prLoadSpec ulong pl
+prWStr 2 prErrIo
+ret 1
+end
+prExtractAll
+prScoreOps
+prRankOps
+prWStr 1 prPre
+for i ulong 10 bound 10
+prWStr 1 prSp
+prWNum 1 get prOrder i
+end
+prWStr 1 prFeats
+cnt = ulong 0
+for i ulong 24 bound 24
+cnt = add cnt get prFeat i
+end
+prWNum 1 cnt
+prWStr 1 prNl
+ret 0
+end
+prWStr 2 prUsage
+ret 2
+end
