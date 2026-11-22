@@ -272,20 +272,13 @@ root:
     { printf 'om2\n'; cat seed/ng/sha256.om gpu/runtime/zsha.om gpu/runtime/nativeh.om; } | seed/out/omc > nativeh
     ./nativeh > cudapp_native.h
 
-The units whose parts the inventory reports `absent` cannot be declared from this tree; `nativeh.om` stops at the
-first absent part of such a unit, names that part on stderr and leaves the unit out. At this base that is unit
-`c5` (CUDApp `tools/c5/policy.om` and
-`tools/c5/runtime.om`, not moved here). `check/nativeh.expect.txt` is therefore CUDApp's header less that unit's
-one line:
-
-    grep -v '^uint32_t omega_native_c5(' cudapp/src/cudapp_native.h > omega-mv/gpu/runtime/check/nativeh.expect.txt
-
-With the two `tools/c5` files copied to `gpu/nvidia/tools/c5/` in a scratch copy of this tree, the same program
-printed CUDApp's whole header: sha256 `17fc48509d7089d34be4d9f5a5cd578b55b5fc83bcc0ca59e66b286201de0f46`, the row of
-`src/cudapp_native.h` in `cudapp-src.sha256.txt`. When `tools/c5` moves into this tree, the expected file becomes
-CUDApp's header unchanged. Controls: the three `nativeh` rows of `checks.tsv` change the spacing rule, the
-runtime-views rule and the `f32` rule, and each is caught; one changed byte in `cudapp-units.ident` makes it exit 3
-with nothing written (checked by hand; the gate has no input-byte control for this program).
+All 400 Bridge units (including `c5`, now in `gpu/nvidia/tools/c5/`) are present in this tree
+(`bridge_absent=0`), so `check/nativeh.expect.txt` is CUDApp's complete `src/cudapp_native.h` unchanged
+(sha256 `17fc48509d7089d34be4d9f5a5cd578b55b5fc83bcc0ca59e66b286201de0f46`, matching the row of
+`src/cudapp_native.h` in `cudapp-src.sha256.txt`). Controls: the three `nativeh` rows of `checks.tsv`
+change the spacing rule, the runtime-views rule and the `f32` rule, and each is caught; one changed byte
+in `cudapp-units.ident` makes it exit 3 with nothing written (checked by hand; the gate has no input-byte
+control for this program).
 
 `src/cudapp_freest_pathcopy.c` is written by CUDApp `om/native-freest.sh` through the Omega Bridge's native
 backend (`tools/native --freestanding` of omega-bridge): the unit `gpu/nvidia/om/components/pathcopy.om` compiled

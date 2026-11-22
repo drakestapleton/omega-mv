@@ -1,0 +1,1380 @@
+om2
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note om/coder/erc.om: ERC1, a lossless row-addressable coder for E4M3 weight matrices (ledger L1331).
+note One static 14-bit frequency model per matrix, one independent byte-wise rANS stream per matrix
+note row. Byte format: om/coder/FORMAT.md. Program mode, host only, no GPU word is used.
+note
+note Build (compiler = the omc named by the repository PIN):
+note   omc < om/coder/erc.om > erc
+note
+note CLI (exit 0 ok, 2 usage, 3 refused by a decoder check, 4 I/O error):
+note   erc encode RAW OFFSET ROWS COLS OUT   code ROWS*COLS bytes of RAW starting at byte OFFSET
+note   erc decode IN OUT                     decode every row, check the matrix CRC, write the matrix
+note   erc decode-row IN ROW OUT             decode one row alone: reads the header, the tables and that
+note                                         row's stream, nothing else of the file
+note   erc info IN                           check the header and print its fields
+note   erc bench IN REPS                     decode rate in memory, one thread, three modes
+note   erc flipscan IN                       flip every stream bit once, decode that row alone
+note   erc fixcrc IN                         recompute the header CRC in place (test aid for forged files)
+note   erc fixrows IN                        recompute the row CRC-16s and the header CRC (test aid)
+note   erc sum IN                            CRC-32 and CRC-16 of a whole file (known-answer tests)
+note
+note Run-time pools hold the coded image and the row buffers, so this program caps no matrix size;
+note the limits are the field widths: rows, cols and the stream area are u32 (FORMAT.md).
+
+global TAB uint 16384
+global FR ulong 256
+global CRT ulong 256
+global CRH ulong 256
+global CF ulong 16
+global CM ulong 257
+global CNT ulong 256
+global CHK uchar 65536
+global IMG uchar *
+global RB uchar *
+global SC uchar *
+global PA uchar 4096
+global PB uchar 4096
+global PN uchar 64
+global OB uchar 4096
+global OL ulong 1
+global FS ulong 32
+
+note CF slots: 0 rows, 1 cols, 2 stream base, 3 offset table base, 4 matrix crc (stored),
+note 5 image length, 6 write position (encoder), 7 raw offset, 8 raw bytes, 9 raw path length,
+note 10 output path length, 11 raw descriptor, 12 row CRC-16 table base
+
+text ERRN "OK      TRUNC   MAGIC   VERSION FIELD   LENGTH  HDRCRC  FREQ    OFFSET  STATE   EXHAUST LEFTOVERFINAL   MATCRC  ROWCRC  ALLOC   "
+text TREF "erc: refused "
+text TROW " row "
+text TIOE "erc: io error "
+text TUSE "usage: erc encode RAW OFFSET ROWS COLS OUT | decode IN OUT | decode-row IN ROW OUT | info IN | bench IN REPS | flipscan IN | fixcrc IN | fixrows IN | sum IN\n"
+text TBAD "erc: bad argument\n"
+text TSHORT "erc: raw file is shorter than OFFSET + ROWS * COLS\n"
+text TWIDE "erc: refused: the stream area is longer than a u32 offset can address\n"
+text WENC "encode"
+text WDEC "decode"
+text WDROW "decode-row"
+text WINFO "info"
+text WBEN "bench"
+text WFLIP "flipscan"
+text WFIX "fixcrc"
+text WFIXR "fixrows"
+text WSUM "sum"
+text KS32 "crc32="
+text KS16 " crc16="
+text KROWS "rows="
+text KCOLS " cols="
+text KRAW " raw_bytes="
+text KCODED " coded_bytes="
+text KSTR " stream_bytes="
+text KCRC " matrix_crc32="
+text KOK "OK\n"
+text KREPS " reps="
+text KNS " ns="
+text KBPS " bytes_per_s="
+text KMODE "mode="
+text MDEC "rans_only"
+text MDRC "row_crc16_and_rans"
+text MDCRC "row_crc16_rans_matrix_crc32"
+text KFLIPS "flips="
+text KRU " rans_only_undetected="
+text KRW " rans_only_undetected_wrong_output="
+text KCU " checked_undetected="
+text KCW " checked_undetected_wrong_output="
+text KCODE " code_"
+text KEQ "="
+text KFIX "header_crc32="
+text KFR " first_undetected_row="
+text KFB " byte_in_stream="
+text KFT " bit="
+
+note ---------------------------------------------------------------- printing
+
+fn pbyte b ulong to void
+n = get OL 0
+if lt n 4096
+put OB n uchar b
+put OL 0 add n 1
+end
+end
+
+fn ptext t view uchar * to void
+for i ulong len t bound 4096
+pbyte ulong get t i
+end
+end
+
+fn pdec v ulong to void
+d = new uchar 24 0
+k = ulong 0
+x = v
+while true bound 21
+put d k uchar add rem x 10 48
+k = add k 1
+x = div x 10
+if eq x 0
+break
+end
+end
+while gt k 0 bound 21
+k = sub k 1
+pbyte ulong get d k
+end
+end
+
+fn phex v ulong to void
+for i ulong 8
+h = and shr v sub 28 mul i 4 15
+if lt h 10
+pbyte add h 48
+else
+pbyte add h 87
+end
+end
+end
+
+fn pflush fd int to void
+n = get OL 0
+o = ulong 0
+while lt o n bound 4097
+k = write fd OB o sub n o
+if le k 0
+break
+end
+o = add o ulong k
+end
+put OL 0 0
+end
+
+fn prefuse code ulong row ulong hasrow ulong to void
+ptext TREF
+for j ulong 8
+b = ulong get ERRN add mul code 8 j
+if ne b 32
+pbyte b
+end
+end
+if ne hasrow 0
+ptext TROW
+pdec row
+end
+pbyte 10
+pflush 2
+end
+
+fn pio code long to void
+ptext TIOE
+if lt code 0
+pbyte 45
+pdec ulong neg code
+else
+pdec ulong code
+end
+pbyte 10
+pflush 2
+end
+
+note ---------------------------------------------------------------- little-endian fields of IMG
+
+fn ld32 o ulong to ulong
+a = ulong get IMG o
+b = ulong get IMG add o 1
+c = ulong get IMG add o 2
+d = ulong get IMG add o 3
+ret or or a shl b 8 or shl c 16 shl d 24
+end
+
+fn st32 o ulong v ulong to void
+put IMG o uchar and v 255
+put IMG add o 1 uchar and shr v 8 255
+put IMG add o 2 uchar and shr v 16 255
+put IMG add o 3 uchar and shr v 24 255
+end
+
+fn st16 o ulong v ulong to void
+put IMG o uchar and v 255
+put IMG add o 1 uchar and shr v 8 255
+end
+
+fn ld16 o ulong to ulong
+a = ulong get IMG o
+b = ulong get IMG add o 1
+ret or a shl b 8
+end
+
+note ---------------------------------------------------------------- CRC-32 (IEEE 802.3, reflected 0xEDB88320)
+note and CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, MSB first, no final xor; "123456789" gives 0x29b1)
+
+fn crcinit to void
+for n ulong 256
+c = n
+for k ulong 8
+if eq and c 1 1
+c = xor shr c 1 3988292384
+else
+c = shr c 1
+end
+end
+put CRT n c
+h = shl n 8
+for k ulong 8
+if ne and h 32768 0
+h = and xor shl h 1 4129 65535
+else
+h = and shl h 1 65535
+end
+end
+put CRH n h
+end
+end
+
+note CRC-16 of IMG[a, b).
+fn crc16img a ulong b ulong to ulong
+x = ulong 65535
+i = a
+while lt i b bound 9223372036854775807
+x = xor and shl x 8 65535 get CRH and xor shr x 8 ulong get IMG i 255
+i = add i 1
+end
+ret x
+end
+
+fn crcimg c ulong a ulong b ulong to ulong
+x = c
+i = a
+while lt i b bound 9223372036854775807
+x = xor shr x 8 get CRT and xor x ulong get IMG i 255
+i = add i 1
+end
+ret x
+end
+
+fn crcrb c ulong n ulong to ulong
+x = c
+i = ulong 0
+while lt i n bound 9223372036854775807
+x = xor shr x 8 get CRT and xor x ulong get RB i 255
+i = add i 1
+end
+ret x
+end
+
+note ---------------------------------------------------------------- frequency model
+
+note Same rule as the measurement prototype rowrans.c: f = floor(count * 2^14 / n), 1 when a present
+note symbol rounds to 0, then +-1 on the first largest symbol until the sum is 2^14.
+fn normalize n ulong to void
+tot = ulong 0
+for s ulong 256
+c = get CNT s
+f = div shl c 14 n
+if ne c 0
+if eq f 0
+f = ulong 1
+end
+end
+put FR s f
+tot = add tot f
+end
+while ne tot 16384 bound 100000
+b = ulong 0
+for s ulong 255
+if gt get FR add s 1 get FR b
+b = add s 1
+end
+end
+if gt tot 16384
+put FR b sub get FR b 1
+tot = sub tot 1
+else
+put FR b add get FR b 1
+tot = add tot 1
+end
+end
+end
+
+note The decode table: slot k of the 2^14 slots maps to symbol | (k - cum[symbol]) << 8.
+fn buildtab to void
+k = ulong 0
+for s ulong 256
+f = get FR s
+j = ulong 0
+while lt j f bound 16384
+put TAB k uint or s shl j 8
+k = add k 1
+j = add j 1
+end
+end
+end
+
+note ---------------------------------------------------------------- encoder
+
+note Encode the cols bytes in RB as one stream into SC; return where it starts (it ends at 2 * cols + 8).
+fn erow to ulong
+c = get CF 1
+p = add mul 2 c 8
+x = ulong 8388608
+i = c
+while gt i 0 bound 9223372036854775807
+i = sub i 1
+s = ulong get RB i
+f = get FR s
+xm = shl f 17
+while ge x xm bound 3
+p = sub p 1
+put SC p uchar and x 255
+x = shr x 8
+end
+x = add add shl div x f 14 rem x f get CM s
+end
+p = sub p 4
+put SC p uchar and x 255
+put SC add p 1 uchar and shr x 8 255
+put SC add p 2 uchar and shr x 16 255
+put SC add p 3 uchar and shr x 24 255
+ret p
+end
+
+note Append SC[p .. 2 * cols + 8) to IMG at CF[6]. 0, or the negative errno when IMG cannot grow.
+fn append p ulong to long
+n = sub add mul 2 get CF 1 8 p
+w = get CF 6
+l = len IMG
+if gt add w n l
+t = add w n
+if lt t mul 2 l
+t = mul 2 l
+end
+r = enlarge IMG t
+if lt r 0
+ret r
+end
+end
+for j ulong n
+put IMG add w j get SC add p j
+end
+put CF 6 add w n
+ret 0
+end
+
+note Count the kk bytes in CHK and fold them into the running CRC state x.
+fn cchunk kk ulong c ulong to ulong
+x = c
+for j ulong kk bound 65536
+b = ulong get CHK j
+put CNT b add get CNT b 1
+x = xor shr x 8 get CRT and xor x b 255
+end
+ret x
+end
+
+fn cpass fd int n ulong c ulong to long
+left = n
+x = c
+while gt left 0 bound 9223372036854775807
+m = ulong 65536
+if lt left m
+m = left
+end
+k = read fd CHK 0 m
+if le k 0
+ret -1
+end
+x = cchunk ulong k x
+left = sub left ulong k
+end
+put CF 4 x
+ret 0
+end
+
+fn rdrow fd int n ulong to long
+o = ulong 0
+while lt o n bound 9223372036854775807
+k = read fd RB o sub n o
+if le k 0
+ret -1
+end
+o = add o ulong k
+end
+ret 0
+end
+
+fn wrall fd int n ulong to long
+o = ulong 0
+while lt o n bound 9223372036854775807
+k = write fd RB o sub n o
+if le k 0
+ret -1
+end
+o = add o ulong k
+end
+ret 0
+end
+
+fn wrimg fd int n ulong to long
+o = ulong 0
+while lt o n bound 9223372036854775807
+k = write fd IMG o sub n o
+if le k 0
+ret -1
+end
+o = add o ulong k
+end
+ret 0
+end
+
+note Read n bytes from the current file position into IMG[o ..]. 0, or -1 when the file ends early.
+fn rdat fd int o ulong n ulong to long
+x = ulong 0
+while lt x n bound 9223372036854775807
+k = read fd IMG add o x sub n x
+if le k 0
+ret -1
+end
+x = add x ulong k
+end
+ret 0
+end
+
+fn argnum idx ulong to ulong
+k = argread idx PN 0 64
+if le k 0
+exit 2
+end
+v = ulong 0
+n = ulong k
+if gt n 19
+exit 2
+end
+for i ulong n bound 64
+d = ulong get PN i
+if or lt d 48 gt d 57
+exit 2
+end
+v = add mul v 10 sub d 48
+end
+ret v
+end
+
+fn argpath idx ulong b ulong to long
+k = long 0
+if eq b 0
+k = argread idx PA 0 4096
+else
+k = argread idx PB 0 4096
+end
+if le k 0
+exit 2
+end
+ret k
+end
+
+fn argis idx ulong t view uchar * to bool
+k = argread idx PN 0 64
+if ne ulong k len t
+ret false
+end
+for i ulong len t bound 64
+if ne get PN i get t i
+ret false
+end
+end
+ret true
+end
+
+note Arguments are parsed into CF: 0 rows, 1 cols, 7 raw offset, 8 raw bytes, 9 raw path length,
+note 10 output path length, 11 raw descriptor.
+fn encargs to int
+put CF 9 ulong argpath 2 0
+put CF 7 argnum 3
+put CF 0 argnum 4
+put CF 1 argnum 5
+put CF 10 ulong argpath 6 1
+rows = get CF 0
+cols = get CF 1
+if or eq rows 0 eq cols 0
+ptext TBAD
+pflush 2
+ret 2
+end
+if or gt rows 4294967295 gt cols 4294967295
+ptext TBAD
+pflush 2
+ret 2
+end
+note A file offset is a signed 64-bit value: OFFSET and ROWS * COLS stay below 2^62 so that their sum fits.
+if or gt get CF 7 4611686018427387903 gt mul rows cols 4611686018427387903
+ptext TBAD
+pflush 2
+ret 2
+end
+put CF 8 mul rows cols
+ret 0
+end
+
+note Open the raw file, count the symbols and the matrix CRC, build the model. 0 or an exit status.
+fn encmodel to int
+fd = int fopen PA 0 get CF 9 int 0 int 0
+if lt fd 0
+pio long fd
+ret 4
+end
+n = get CF 8
+off = get CF 7
+sz = fseek fd long 0 int 2
+if lt sz long add off n
+ptext TSHORT
+pflush 2
+ret 4
+end
+k = fseek fd long off int 0
+for s ulong 256
+put CNT s 0
+end
+if ne cpass fd n 4294967295 0
+pio -5
+ret 4
+end
+put CF 4 xor get CF 4 4294967295
+normalize n
+cum = ulong 0
+for s ulong 256
+put CM s cum
+cum = add cum get FR s
+end
+put CM 256 cum
+k = fseek fd long off int 0
+put CF 11 ulong fd
+ret 0
+end
+
+note Position of the header CRC: 32 header + 512 table + 4 (rows + 1) offsets + 2 rows CRC-16s.
+fn hcpos rows ulong to ulong
+ret add 548 mul 6 rows
+end
+
+note Encode every row of the raw file into IMG after the table area. 0 or an exit status.
+fn encrows to int
+fd = int get CF 11
+rows = get CF 0
+cols = get CF 1
+sb = add hcpos rows 4
+put CF 2 sb
+put CF 6 sb
+put CF 12 add 548 mul 4 rows
+r = enlarge IMG sb
+if lt r 0
+pio r
+ret 4
+end
+r = enlarge RB cols
+if lt r 0
+pio r
+ret 4
+end
+r = enlarge SC add mul 2 cols 16
+if lt r 0
+pio r
+ret 4
+end
+for rr ulong rows bound 4294967296
+if ne rdrow fd cols 0
+pio -5
+ret 4
+end
+s0 = get CF 6
+r = append erow
+if lt r 0
+pio r
+ret 4
+end
+s1 = get CF 6
+w = sub s1 sb
+if gt w 4294967295
+ptext TWIDE
+pflush 2
+ret 3
+end
+st32 add 544 mul 4 add rr 1 w
+st16 add get CF 12 mul 2 rr crc16img s0 s1
+end
+k = fclose fd
+ret 0
+end
+
+note Write the header, the table, the header CRC and the file. 0 or an exit status.
+fn encwrite to int
+rows = get CF 0
+tl = get CF 6
+put IMG 0 69
+put IMG 1 82
+put IMG 2 67
+put IMG 3 49
+st16 4 1
+st16 6 0
+st32 8 rows
+st32 12 get CF 1
+st32 16 14
+st32 20 get CF 4
+st32 24 and tl 4294967295
+st32 28 shr tl 32
+for s ulong 256
+st16 add 32 mul 2 s get FR s
+end
+st32 544 0
+hc = hcpos rows
+st32 hc xor crcimg 4294967295 0 hc 4294967295
+fo = int fopen PB 0 get CF 10 int 577 int 420
+if lt fo 0
+pio long fo
+ret 4
+end
+if ne wrimg fo tl 0
+pio -5
+ret 4
+end
+k = fclose fo
+ptext KROWS
+pdec rows
+ptext KCOLS
+pdec get CF 1
+ptext KRAW
+pdec get CF 8
+ptext KCODED
+pdec tl
+ptext KSTR
+pdec sub tl get CF 2
+ptext KCRC
+phex get CF 4
+pbyte 10
+pflush 1
+ret 0
+end
+
+fn encode to int
+e = encargs
+if ne e 0
+ret e
+end
+e = encmodel
+if ne e 0
+ret e
+end
+e = encrows
+if ne e 0
+ret e
+end
+ret encwrite
+end
+
+note ---------------------------------------------------------------- decoder
+
+note Read the whole file at PA into IMG; return its length or a negative errno.
+fn loadimg la ulong to long
+fd = int fopen PA 0 la int 0 int 0
+if lt fd 0
+ret long fd
+end
+sz = fseek fd long 0 int 2
+k = fseek fd long 0 int 0
+if lt sz 0
+ret sz
+end
+r = enlarge IMG ulong sz
+if lt r 0
+ret r
+end
+if ne rdat fd 0 ulong sz 0
+ret -5
+end
+k = fclose fd
+put CF 5 ulong sz
+ret sz
+end
+
+note Open the file at PA and read only what decode-row needs first: the header, the tables and the
+note header CRC. The descriptor stays in CF[13]. Returns the file length or a negative errno.
+fn loadhead la ulong to long
+fd = int fopen PA 0 la int 0 int 0
+if lt fd 0
+ret long fd
+end
+sz = fseek fd long 0 int 2
+k = fseek fd long 0 int 0
+if lt sz 0
+ret sz
+end
+n = ulong sz
+r = enlarge IMG n
+if lt r 0
+ret r
+end
+put CF 5 n
+put CF 13 ulong fd
+m = n
+if gt m 32
+m = ulong 32
+end
+if ne rdat fd 0 m 0
+ret -5
+end
+if lt n 32
+ret sz
+end
+pre = add hcpos ld32 8 4
+if gt pre n
+pre = n
+end
+if ne rdat fd 32 sub pre 32 0
+ret -5
+end
+ret sz
+end
+
+note Read the stream of row r (checked by openimg) into IMG, and close the file.
+fn loadstream r ulong to long
+fd = int get CF 13
+sb = get CF 2
+a = add sb ld32 add 544 mul 4 r
+b = add sb ld32 add 544 mul 4 add r 1
+k = fseek fd long a int 0
+if ne rdat fd a sub b a 0
+ret -5
+end
+k = fclose fd
+ret 0
+end
+
+note Check the header, the frequency table and the row offsets; build the decode tables. 0 or a code.
+fn openhdr to ulong
+n = get CF 5
+if lt n 32
+ret 1
+end
+if ne get IMG 0 69
+ret 2
+end
+if ne get IMG 1 82
+ret 2
+end
+if ne get IMG 2 67
+ret 2
+end
+if ne get IMG 3 49
+ret 2
+end
+if ne ulong get IMG 4 1
+ret 3
+end
+if ne get IMG 5 0
+ret 3
+end
+if ne get IMG 6 0
+ret 3
+end
+if ne get IMG 7 0
+ret 3
+end
+rows = ld32 8
+cols = ld32 12
+if ne ld32 16 14
+ret 4
+end
+if eq rows 0
+ret 4
+end
+if eq cols 0
+ret 4
+end
+hc = hcpos rows
+sb = add hc 4
+if lt n sb
+ret 1
+end
+tl = or ld32 24 shl ld32 28 32
+if ne tl n
+ret 5
+end
+crc = xor crcimg 4294967295 0 hc 4294967295
+if ne crc ld32 hc
+ret 6
+end
+put CF 0 rows
+put CF 1 cols
+put CF 2 sb
+put CF 3 544
+put CF 12 add 548 mul 4 rows
+put CF 4 ld32 20
+ret 0
+end
+
+note The frequency table and the row offsets, after the header CRC has passed. 0 or a code.
+fn opentab to ulong
+rows = get CF 0
+sb = get CF 2
+tot = ulong 0
+for s ulong 256
+f = ld16 add 32 mul 2 s
+put FR s f
+tot = add tot f
+end
+if ne tot 16384
+ret 7
+end
+if ne ld32 544 0
+ret 8
+end
+prev = ulong 0
+for r ulong rows bound 4294967296
+nx = ld32 add 544 mul 4 add r 1
+if lt nx add prev 4
+ret 8
+end
+prev = nx
+end
+if ne prev sub get CF 5 sb
+ret 8
+end
+buildtab
+ret 0
+end
+
+fn openimg to ulong
+e = openhdr
+if ne e 0
+ret e
+end
+ret opentab
+end
+
+note Decode row r alone into RB[0..cols) with the rANS decoder only. 0 or a code (9 STATE, 10 EXHAUST,
+note 11 LEFTOVER, 12 FINAL).
+fn drowcore r ulong to ulong
+c = get CF 1
+sb = get CF 2
+ob = get CF 3
+p = add sb ld32 add ob mul 4 r
+e = add sb ld32 add ob mul 4 add r 1
+x = ld32 p
+p = add p 4
+if ge x 2147483648
+ret 9
+end
+if lt x 8388608
+ret 9
+end
+i = ulong 0
+while lt i c bound 9223372036854775807
+en = ulong get TAB and x 16383
+x = add mul get FR and en 255 shr x 14 shr en 8
+put RB i uchar and en 255
+while lt x 8388608 bound 3
+if ge p e
+ret 10
+end
+x = or shl x 8 ulong get IMG p
+p = add p 1
+end
+i = add i 1
+end
+if ne p e
+ret 11
+end
+if ne x 8388608
+ret 12
+end
+ret 0
+end
+
+note Decode row r alone: its CRC-16 first, then the rANS decoder. 0 or a code (14 ROWCRC, or drowcore's).
+fn drow r ulong to ulong
+sb = get CF 2
+ob = get CF 3
+a = add sb ld32 add ob mul 4 r
+b = add sb ld32 add ob mul 4 add r 1
+if ne crc16img a b ld16 add get CF 12 mul 2 r
+ret 14
+end
+ret drowcore r
+end
+
+fn setupdec to ulong
+e = openimg
+if ne e 0
+ret e
+end
+r = enlarge RB get CF 1
+if lt r 0
+ret 15
+end
+ret 0
+end
+
+fn decode to int
+li = argpath 2 0
+lo = argpath 3 1
+sz = loadimg ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+e = setupdec
+if ne e 0
+prefuse e 0 0
+ret 3
+end
+rows = get CF 0
+cols = get CF 1
+fo = int fopen PB 0 ulong lo int 577 int 420
+if lt fo 0
+pio long fo
+ret 4
+end
+crc = ulong 4294967295
+bad = ulong 0
+for r ulong rows bound 4294967296
+e = drow r
+if ne e 0
+prefuse e r 1
+bad = ulong 1
+break
+end
+crc = crcrb crc cols
+if ne wrall fo cols 0
+pio -5
+bad = ulong 2
+break
+end
+end
+k = fclose fo
+if eq bad 1
+k = unlink PB 0 ulong lo
+ret 3
+end
+if eq bad 2
+ret 4
+end
+if ne xor crc 4294967295 get CF 4
+prefuse 13 0 0
+k = unlink PB 0 ulong lo
+ret 3
+end
+ptext KROWS
+pdec rows
+ptext KCOLS
+pdec cols
+ptext KCRC
+phex get CF 4
+pbyte 10
+ptext KOK
+pflush 1
+ret 0
+end
+
+fn decoderow to int
+li = argpath 2 0
+rr = argnum 3
+lo = argpath 4 1
+sz = loadhead ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+e = setupdec
+if ne e 0
+prefuse e 0 0
+ret 3
+end
+if ge rr get CF 0
+ptext TBAD
+pflush 2
+ret 2
+end
+if ne loadstream rr 0
+pio -5
+ret 4
+end
+e = drow rr
+if ne e 0
+prefuse e rr 1
+ret 3
+end
+fo = int fopen PB 0 ulong lo int 577 int 420
+if lt fo 0
+pio long fo
+ret 4
+end
+if ne wrall fo get CF 1 0
+pio -5
+ret 4
+end
+k = fclose fo
+ret 0
+end
+
+fn info to int
+li = argpath 2 0
+sz = loadimg ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+e = openimg
+if ne e 0
+prefuse e 0 0
+ret 3
+end
+ptext KROWS
+pdec get CF 0
+ptext KCOLS
+pdec get CF 1
+ptext KRAW
+pdec mul get CF 0 get CF 1
+ptext KCODED
+pdec get CF 5
+ptext KSTR
+pdec sub get CF 5 get CF 2
+ptext KCRC
+phex get CF 4
+pbyte 10
+pflush 1
+ret 0
+end
+
+note One timed pass over all rows, reps times. wc 0 runs the rANS decoder alone, 1 the CRC-16 check and
+note the decoder, 2 also the CRC-32 of every decoded row. Returns the elapsed nanoseconds, or 0 after
+note printing a refusal. RB holds one row, so the output stays in cache and no system call is timed.
+fn benchpass reps ulong wc ulong to ulong
+rows = get CF 0
+cols = get CF 1
+crc = ulong 4294967295
+e = ulong 0
+t0 = monons
+for q ulong reps bound 9223372036854775807
+for r ulong rows bound 4294967296
+if eq wc 0
+e = drowcore r
+else
+e = drow r
+end
+if ne e 0
+prefuse e r 1
+ret 0
+end
+if eq wc 2
+crc = crcrb crc cols
+end
+end
+end
+t1 = monons
+ret ulong sub t1 t0
+end
+
+fn benchline mode view uchar * reps ulong ns ulong to void
+rows = get CF 0
+cols = get CF 1
+ptext KMODE
+ptext mode
+pbyte 32
+ptext KROWS
+pdec rows
+ptext KCOLS
+pdec cols
+ptext KREPS
+pdec reps
+ptext KNS
+pdec ns
+ptext KBPS
+pdec div mul mul mul rows cols reps 1000000000 ns
+pbyte 10
+end
+
+fn bench to int
+li = argpath 2 0
+reps = argnum 3
+if eq reps 0
+ptext TBAD
+pflush 2
+ret 2
+end
+sz = loadimg ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+e = setupdec
+if ne e 0
+prefuse e 0 0
+ret 3
+end
+crc = ulong 4294967295
+for r ulong get CF 0 bound 4294967296
+e = drow r
+if ne e 0
+prefuse e r 1
+ret 3
+end
+crc = crcrb crc get CF 1
+end
+if ne xor crc 4294967295 get CF 4
+prefuse 13 0 0
+ret 3
+end
+ns0 = benchpass reps 0
+if eq ns0 0
+ret 3
+end
+ns1 = benchpass reps 1
+if eq ns1 0
+ret 3
+end
+ns2 = benchpass reps 2
+if eq ns2 0
+ret 3
+end
+benchline MDEC reps ns0
+benchline MDRC reps ns1
+benchline MDCRC reps ns2
+pflush 1
+ret 0
+end
+
+note Flip each bit of one row's stream once and decode the row alone twice, with the rANS decoder alone
+note and with the CRC-16 check in front, counting in FS: slot e (1..15) the checked refusals with code
+note e, 16 the flips, 17 and 18 the rANS-only decodes that did not refuse and that gave a wrong row,
+note 22 and 23 the same for the checked decode; 19 to 21 the position of the first rANS-only wrong row.
+note cc is the CRC-32 state of the clean row.
+fn flipbits r ulong a ulong n ulong cc ulong to void
+for o ulong n bound 4294967296
+for bit ulong 8
+v = get IMG add a o
+put IMG add a o uchar xor ulong v shl 1 bit
+put FS 16 add get FS 16 1
+e = drowcore r
+if eq e 0
+put FS 17 add get FS 17 1
+if ne crcrb 4294967295 get CF 1 cc
+if eq get FS 18 0
+put FS 19 r
+put FS 20 o
+put FS 21 bit
+end
+put FS 18 add get FS 18 1
+end
+end
+e = drow r
+if eq e 0
+put FS 22 add get FS 22 1
+if ne crcrb 4294967295 get CF 1 cc
+put FS 23 add get FS 23 1
+end
+else
+put FS e add get FS e 1
+end
+put IMG add a o v
+end
+end
+end
+
+note Flip every stream bit of the matrix once, each time decoding only the row that holds the bit.
+fn flipscan to int
+li = argpath 2 0
+sz = loadimg ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+e = setupdec
+if ne e 0
+prefuse e 0 0
+ret 3
+end
+rows = get CF 0
+sb = get CF 2
+for q ulong 32
+put FS q 0
+end
+for r ulong rows bound 4294967296
+e = drow r
+if ne e 0
+prefuse e r 1
+ret 3
+end
+a = add sb ld32 add 544 mul 4 r
+b = add sb ld32 add 544 mul 4 add r 1
+flipbits r a sub b a crcrb 4294967295 get CF 1
+end
+ptext KFLIPS
+pdec get FS 16
+ptext KRU
+pdec get FS 17
+ptext KRW
+pdec get FS 18
+ptext KCU
+pdec get FS 22
+ptext KCW
+pdec get FS 23
+for q ulong 16
+if ne get FS q 0
+ptext KCODE
+pdec q
+ptext KEQ
+pdec get FS q
+end
+end
+if ne get FS 18 0
+ptext KFR
+pdec get FS 19
+ptext KFB
+pdec get FS 20
+ptext KFT
+pdec get FS 21
+end
+pbyte 10
+pflush 1
+ret 0
+end
+
+note Recompute the header CRC in IMG and write the whole image back over the file at PA. li is the
+note path length. Test aid: it makes a hand-edited file consistent so only the later checks can refuse.
+fn savefix li ulong to int
+hc = hcpos ld32 8
+st32 hc xor crcimg 4294967295 0 hc 4294967295
+fd = int fopen PA 0 li int 1 int 0
+if lt fd 0
+pio long fd
+ret 4
+end
+if ne wrimg fd get CF 5 0
+pio -5
+ret 4
+end
+k = fclose fd
+ptext KFIX
+phex ld32 hc
+pbyte 10
+pflush 1
+ret 0
+end
+
+note fixcrc IN: recompute only the header CRC.
+fn fixcrc to int
+li = argpath 2 0
+sz = loadimg ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+if lt ulong sz 32
+prefuse 1 0 0
+ret 3
+end
+if lt ulong sz add hcpos ld32 8 4
+prefuse 1 0 0
+ret 3
+end
+ret savefix ulong li
+end
+
+note Recompute the CRC-16 of row r from the stream bytes its offsets name. 0, or 8 when they leave the file.
+fn fixone r ulong lim ulong to ulong
+rows = ld32 8
+sb = add hcpos rows 4
+a = add sb ld32 add 544 mul 4 r
+b = add sb ld32 add 544 mul 4 add r 1
+if gt b lim
+ret 8
+end
+if lt b a
+ret 8
+end
+st16 add add 548 mul 4 rows mul 2 r crc16img a b
+ret 0
+end
+
+note fixrows IN: recompute every row CRC-16 from the stream bytes the offsets name, then the header CRC.
+fn fixrows to int
+li = argpath 2 0
+sz = loadimg ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+if lt ulong sz 32
+prefuse 1 0 0
+ret 3
+end
+rows = ld32 8
+if lt ulong sz add hcpos rows 4
+prefuse 1 0 0
+ret 3
+end
+for r ulong rows bound 4294967296
+e = fixone r ulong sz
+if ne e 0
+prefuse e r 1
+ret 3
+end
+end
+ret savefix ulong li
+end
+
+note sum IN: the CRC-32 and CRC-16 of the whole file, for known-answer tests of the two checks.
+fn sum to int
+li = argpath 2 0
+sz = loadimg ulong li
+if lt sz 0
+pio sz
+ret 4
+end
+ptext KS32
+phex xor crcimg 4294967295 0 ulong sz 4294967295
+ptext KS16
+phex crc16img 0 ulong sz
+pbyte 10
+pflush 1
+ret 0
+end
+
+fn main to int
+crcinit
+n = argcnt
+if lt n 2
+ptext TUSE
+pflush 2
+ret 2
+end
+if argis 1 WENC
+ret encode
+end
+if argis 1 WDEC
+ret decode
+end
+if argis 1 WDROW
+ret decoderow
+end
+if argis 1 WINFO
+ret info
+end
+if argis 1 WBEN
+ret bench
+end
+if argis 1 WFLIP
+ret flipscan
+end
+if argis 1 WFIX
+ret fixcrc
+end
+if argis 1 WFIXR
+ret fixrows
+end
+if argis 1 WSUM
+ret sum
+end
+ptext TUSE
+pflush 2
+ret 2
+end

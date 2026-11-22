@@ -68,6 +68,10 @@ instruction, or a wrapper with no decision of its own.
 
 ## To run it on the GPU
 
-A device part would implement each `dx_` name of `fx.om` with the commands above, composed with
-`client.om` in place of `fx.om`, and would be checked first against the same sequences, then on the
-chip under the current GPU window procedure. That is the hardware tier, and it has not been run.
+`gpu/nvidia/driver/device.om` now implements every `dx_` effect of `fx.om` in pure seeded Omega using
+`omc`'s checked Linux device words (`fopen`, `fclose`, `devctl`, `devcall`, `uvmctl`, `mapnew`,
+`mapbind`, `mapdrop`, `mapget`, `mapset`, `cpufence`, `cpurelax`, `sleepns`), composed with
+`client.om` in place of `fx.om`. `gpu/nvidia/driver/device_test.om` verifies the host-safe VA slot
+allocator, chip selection, invalid-fd fail-closed refusals, and `cn_open` unwind without opening
+`/dev/nvidia*`. Live execution on physical GB10 silicon under an authorized `spark-window` remains
+`NOT_RUN`.

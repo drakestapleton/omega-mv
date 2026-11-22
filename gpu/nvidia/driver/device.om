@@ -1,0 +1,908 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/nvidia/driver/device.om: pure seeded-Omega Linux device backend implementing the dx_ effects
+note of gpu/nvidia/driver/client.om (closes gpu/nvidia/driver/DEVICE.md).
+note
+note Compose in place of fx.om:
+note   cat gpu/nvidia/native/nvrm/policy.om gpu/nvidia/driver/nvrm.om gpu/nvidia/driver/client.om \
+note       gpu/nvidia/driver/device.om <program.om> | seed/out/omc > prog
+note
+note Speaks Linux NVIDIA 580.173.02 RM/UVM ABI through omc's checked device host words:
+note   fopen, fclose, devctl, devcall, uvmctl, mapnew, mapbind, mapdrop, mapget, mapset,
+note   cpufence, cpurelax, sleepns.
+note Supports a configurable device path prefix (dv_set_root) for host negative-control tests
+note without opening /dev/nvidia* outside an authorized GPU window.
+note Hardware tier on GB10: NOT_RUN from this file alone (requires authorized spark-window).
+
+text dv_pctl "/dev/nvidiactl"
+text dv_puvm "/dev/nvidia-uvm"
+text dv_pdev "/dev/nvidia"
+
+const DV_IOC_CARD_INFO uint 3523233480
+const DV_IOC_REG_FD uint 3221505737
+const DV_IOC_RM_ALLOC uint 3223340587
+const DV_IOC_RM_FREE uint 3222292009
+const DV_IOC_RM_CTRL uint 3223340586
+const DV_IOC_RM_MAP uint 3224913486
+const DV_IOC_RM_UNMAP uint 3225437783
+const DV_VA_BASE ulong 68719476736
+const DV_VA_STRIDE ulong 137438953472
+const DV_VA_LIMIT ulong 17592186044416
+const DV_HANDLE_BASE ulong 3238002688
+
+note dv_st: 0 last_errno, 1 slot_next, 2 handle_seq, 3 fk_kind, 4 fk_argc, 5 open_admitted,
+note 6 va_cursor, 7 va_limit, 8 last_er_code, 9 er_count, 10 root_len, 11 ncards,
+note 12 map_count, 13 usermode_map_handle, 14 fifo_map_handle
+global dv_st ulong 32
+global dv_args ulong 64
+global dv_root uchar 256
+global dv_path uchar 512
+global dv_hdr uchar 32
+global dv_par uchar 4096
+global dv_card uchar 4608
+global dv_uvm_b uchar 128
+note mapping table: up to 128 live mappings (row = 4 ulongs: cpu_key, map_handle, size, active)
+global dv_maps ulong 512
+note free VA intervals: up to 128 rows of (va, size)
+global dv_vafree ulong 256
+global dv_vafn ulong 1
+
+fn dv_reset to void
+for i ulong 32
+put dv_st i 0
+end
+for i ulong 64
+put dv_args i 0
+end
+for i ulong 512
+put dv_maps i 0
+end
+for i ulong 256
+put dv_vafree i 0
+end
+put dv_vafn 0 0
+put dv_st 1 1
+put dv_st 2 1
+put dv_st 5 1
+end
+
+fn dv_set_root p view uchar 256 n ulong to void
+k = n
+if gt k 256
+k = ulong 256
+end
+for i ulong k bound 256
+put dv_root i get p i
+end
+put dv_st 10 k
+end
+
+fn dv_zero_hdr to void
+for i ulong 32
+put dv_hdr i 0
+end
+end
+
+fn dv_zero_par n ulong to void
+k = n
+if gt k 4096
+k = ulong 4096
+end
+for i ulong k bound 4096
+put dv_par i 0
+end
+end
+
+fn dv_hput32 off ulong v ulong to void
+for i ulong 4
+put dv_hdr add off i uchar and shr v mul i 8 255
+end
+end
+
+fn dv_hget32 off ulong to ulong
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get dv_hdr add off i mul i 8
+end
+ret v
+end
+
+fn dv_pput32 off ulong v ulong to void
+for i ulong 4
+put dv_par add off i uchar and shr v mul i 8 255
+end
+end
+
+fn dv_pput64 off ulong v ulong to void
+for i ulong 8
+put dv_par add off i uchar and shr v mul i 8 255
+end
+end
+
+fn dv_pget32 off ulong to ulong
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get dv_par add off i mul i 8
+end
+ret v
+end
+
+fn dv_cget32 off ulong to ulong
+v = ulong 0
+for i ulong 4
+v = or v shl ulong get dv_card add off i mul i 8
+end
+ret v
+end
+
+fn dv_cget16 off ulong to ulong
+ret or ulong get dv_card off shl ulong get dv_card add off 1 8
+end
+
+fn dv_mkpath kind ulong minor ulong to ulong
+rl = get dv_st 10
+for i ulong rl bound 256
+put dv_path i get dv_root i
+end
+p = rl
+if eq kind 1
+for i ulong len dv_pctl
+put dv_path add p i get dv_pctl i
+end
+ret add p len dv_pctl
+end
+if eq kind 2
+for i ulong len dv_puvm
+put dv_path add p i get dv_puvm i
+end
+ret add p len dv_puvm
+end
+for i ulong len dv_pdev
+put dv_path add p i get dv_pdev i
+end
+p = add p len dv_pdev
+if ge minor 10
+put dv_path p uchar add 48 div minor 10
+p = add p 1
+end
+put dv_path p uchar add 48 rem minor 10
+ret add p 1
+end
+
+fn dv_set_err r long to void
+if lt r 0
+put dv_st 0 ulong neg r
+else
+put dv_st 0 ulong r
+end
+end
+
+fn dv_find_map cpu ulong to long
+for i ulong 128
+base = mul i 4
+if and ne get dv_maps add base 3 0 eq get dv_maps base cpu
+ret long i
+end
+end
+ret -1
+end
+
+fn dv_reg_map cpu ulong mhan ulong sz ulong to bool
+for i ulong 128
+base = mul i 4
+if eq get dv_maps add base 3 0
+put dv_maps base cpu
+put dv_maps add base 1 mhan
+put dv_maps add base 2 sz
+put dv_maps add base 3 1
+ret true
+end
+end
+ret false
+end
+
+note ---- dx_ effects required by client.om ----
+
+fn dx_fk kind ulong to void
+put dv_st 3 kind
+put dv_st 4 0
+end
+
+fn dx_fa v ulong to void
+n = get dv_st 4
+if lt n 64
+put dv_args n v
+put dv_st 4 add n 1
+end
+end
+
+fn dx_errno to long
+ret long get dv_st 0
+end
+
+fn dx_admit_open to bool
+ret ne get dv_st 5 0
+end
+
+fn dx_slot to ulong
+s = get dv_st 1
+if eq s 0
+s = ulong 1
+end
+base = mul s DV_VA_BASE
+if ge base DV_VA_LIMIT
+ret 0
+end
+put dv_st 1 add s 1
+put dv_st 6 base
+put dv_st 7 add base DV_VA_STRIDE
+ret base
+end
+
+fn dx_recycle base ulong to void
+if eq base 0
+ret
+end
+put dv_vafn 0 0
+end
+
+fn dx_fopen path ulong to long
+if and ne path 1 ne path 2
+put dv_st 0 22
+ret -1
+end
+plen = dv_mkpath path 0
+fd = fopen dv_path 0 plen 2 0
+if lt fd 0
+dv_set_err fd
+ret -1
+end
+ret fd
+end
+
+fn dx_fclose fd long to long
+if lt fd 0
+put dv_st 0 9
+ret -1
+end
+r = fclose int fd
+if lt r 0
+dv_set_err r
+ret -1
+end
+ret 0
+end
+
+fn dv_fd v ulong to long
+if ge v 9223372036854775808
+ret -1
+end
+ret long v
+end
+
+fn dx_alloc parent ulong cls ulong to ulong
+fd = dv_fd cg CS_FDCTL
+if lt fd 0
+put dv_st 0 9
+cp CS_LRS 0
+ret 0
+end
+root = cg CS_ROOT
+seq = get dv_st 2
+if eq seq 0
+seq = ulong 1
+end
+h = add DV_HANDLE_BASE seq
+put dv_st 2 add seq 1
+if eq cls 65
+h = ulong 0
+end
+dv_zero_hdr
+dv_zero_par 256
+dv_hput32 0 root
+dv_hput32 4 parent
+dv_hput32 8 h
+dv_hput32 12 cls
+argc = get dv_st 4
+for i ulong argc bound 32
+dv_pput64 mul i 8 get dv_args i
+end
+psz = mul argc 8
+if eq psz 0
+psz = ulong 64
+end
+r = devcall int fd DV_IOC_RM_ALLOC dv_hdr 0 32 dv_par 0 psz
+put dv_st 4 0
+if lt r 0
+dv_set_err r
+cp CS_LRS 0
+ret 0
+end
+st = dv_hget32 28
+cp CS_LRS st
+if ne st 0
+ret 0
+end
+out_h = dv_hget32 8
+if eq out_h 0
+out_h = h
+end
+ret out_h
+end
+
+fn dx_free parent ulong obj ulong to bool
+fd = dv_fd cg CS_FDCTL
+if lt fd 0
+put dv_st 0 9
+ret false
+end
+dv_zero_hdr
+dv_hput32 0 cg CS_ROOT
+dv_hput32 4 parent
+dv_hput32 8 obj
+r = devctl int fd uint 3222292009 dv_hdr 0 16
+if lt r 0
+dv_set_err r
+ret false
+end
+st = dv_hget32 12
+cp CS_LRS st
+ret eq st 0
+end
+
+fn dx_ctrl obj ulong cmd ulong to bool
+fd = dv_fd cg CS_FDCTL
+if lt fd 0
+put dv_st 0 9
+ret false
+end
+dv_zero_hdr
+dv_zero_par 256
+dv_hput32 0 cg CS_ROOT
+dv_hput32 4 obj
+dv_hput32 8 cmd
+argc = get dv_st 4
+for i ulong argc bound 32
+dv_pput64 mul i 8 get dv_args i
+end
+psz = mul argc 8
+if eq psz 0
+psz = ulong 64
+end
+r = devcall int fd DV_IOC_RM_CTRL dv_hdr 0 32 dv_par 0 psz
+put dv_st 4 0
+if lt r 0
+dv_set_err r
+ret false
+end
+st = dv_hget32 28
+cp CS_LRS st
+ret eq st 0
+end
+
+fn dv_uvm_dispatch fd int cmd ulong to long
+if eq cmd 26
+ret uvmctl fd uint 26 dv_uvm_b 0 20
+end
+if eq cmd 38
+ret uvmctl fd uint 38 dv_uvm_b 0 20
+end
+if eq cmd 34
+ret uvmctl fd uint 34 dv_uvm_b 0 24
+end
+if eq cmd 37
+ret uvmctl fd uint 37 dv_uvm_b 0 40
+end
+if eq cmd 73
+ret uvmctl fd uint 73 dv_uvm_b 0 24
+end
+if eq cmd 75
+ret uvmctl fd uint 75 dv_uvm_b 0 8
+end
+ret -22
+end
+
+fn dv_uvm_put64 idx ulong v ulong to void
+off = mul idx 8
+for b ulong 8
+put dv_uvm_b add off b uchar and shr v mul b 8 255
+end
+end
+
+fn dx_uvm fd long cmd ulong to bool
+if lt fd 0
+put dv_st 0 9
+ret false
+end
+for i ulong 128
+put dv_uvm_b i 0
+end
+argc = get dv_st 4
+for i ulong argc bound 16
+dv_uvm_put64 i get dv_args i
+end
+r = dv_uvm_dispatch int fd cmd
+put dv_st 4 0
+if lt r 0
+dv_set_err r
+ret false
+end
+ret true
+end
+
+fn dx_uvmraw fd long cmd ulong to void
+ok = dx_uvm fd cmd
+end
+
+fn dx_ioctl fd long nr ulong to bool
+if lt fd 0
+put dv_st 0 9
+ret false
+end
+for i ulong 4608
+put dv_card i 0
+end
+r = devctl int fd uint 3523233480 dv_card 0 4608
+put dv_st 4 0
+if lt r 0
+dv_set_err r
+ret false
+end
+ret true
+end
+
+fn dx_cardidx to long
+for i ulong 32
+base = mul i 144
+valid = dv_cget32 base
+if ne valid 0
+ret long i
+end
+end
+ret -1
+end
+
+fn dv_is_sm86 dev ulong to bool
+if eq dev 8708
+ret true
+end
+if eq dev 8710
+ret true
+end
+if eq dev 8712
+ret true
+end
+if eq dev 9348
+ret true
+end
+if eq dev 9353
+ret true
+end
+ret false
+end
+
+fn dx_admit_card i ulong to long
+if ge i 32
+ret -1
+end
+base = mul i 144
+ven = dv_cget16 add base 12
+dev = dv_cget16 add base 14
+if ne ven 4318
+ret -1
+end
+if eq dev 11794
+ret 121
+end
+if dv_is_sm86 dev
+ret 86
+end
+ret -1
+end
+
+fn dx_cardget i ulong fl ulong to ulong
+if ge i 32
+ret 0
+end
+base = mul i 144
+if eq fl 5
+ret dv_cget32 add base 20
+end
+if eq fl 6
+ret dv_cget32 add base 24
+end
+if eq fl 7
+ret dv_cget16 add base 12
+end
+if eq fl 8
+ret dv_cget16 add base 14
+end
+ret 0
+end
+
+fn dx_opendev minor ulong to long
+fdctl = dv_fd cg CS_FDCTL
+if lt fdctl 0
+put dv_st 0 9
+ret -1
+end
+plen = dv_mkpath 3 minor
+fd = fopen dv_path 0 plen 2 0
+if lt fd 0
+dv_set_err fd
+ret -1
+end
+dv_zero_hdr
+dv_hput32 0 ulong fd
+r = devctl int fdctl uint 3221505737 dv_hdr 0 4
+if lt r 0
+dv_set_err r
+cr = fclose int fd
+ret -1
+end
+ret fd
+end
+
+fn dx_nsget kind ulong fl ulong to ulong
+if and eq kind 1 eq fl 1
+ret dv_pget32 4
+end
+if and eq kind 17 eq fl 1
+ret dv_pget32 4
+end
+if and eq kind 7 eq fl 0
+ret dv_pget32 0
+end
+if and eq kind 14 eq fl 0
+ret dv_pget32 0
+end
+if and and eq kind 9 ge fl 3 lt fl 19
+ret ulong get dv_par add 4 sub fl 3
+end
+ret 0
+end
+
+fn dx_select count ulong vendor ulong device ulong to bool
+cp CS_CCLS 0
+cp CS_GCLS 0
+cp CS_UCLS 0
+cp CS_TSM 0
+cp CS_DISC 0
+if or eq count 0 ne vendor 4318
+ret false
+end
+if eq device 11794
+cp CS_TSM 121
+cp CS_DISC 0
+cp CS_CCLS 52928
+cp CS_GCLS 51567
+cp CS_UCLS 50785
+ret true
+end
+if dv_is_sm86 device
+cp CS_TSM 86
+cp CS_DISC 1
+cp CS_CCLS 51136
+cp CS_GCLS 50543
+cp CS_UCLS 50017
+ret true
+end
+ret false
+end
+
+fn dx_map h ulong size ulong target ulong flags ulong system long to ulong
+fddev = dv_fd cg CS_FDDEV
+if or lt fddev 0 eq size 0
+put dv_st 0 9
+ret CN_MAPFAILED
+end
+if ne target 0
+idx = dv_find_map target
+if lt idx 0
+put dv_st 0 22
+ret CN_MAPFAILED
+end
+mhan = get dv_maps add mul ulong idx 4 1
+r = mapbind long mhan int fddev 0 3
+if lt r 0
+dv_set_err r
+ret CN_MAPFAILED
+end
+ret target
+end
+m = mapnew int fddev 0 size 3 1
+if lt m 0
+dv_set_err m
+ret CN_MAPFAILED
+end
+addr = mapaddr m
+if not dv_reg_map addr ulong m size
+dr = mapdrop m
+put dv_st 0 12
+ret CN_MAPFAILED
+end
+ret addr
+end
+
+fn dx_reserve va ulong size ulong to ulong
+if eq size 0
+put dv_st 0 22
+ret CN_MAPFAILED
+end
+m = maphold va size
+if lt m 0
+dv_set_err m
+ret CN_MAPFAILED
+end
+addr = mapaddr m
+if not dv_reg_map addr ulong m size
+dr = mapdrop m
+put dv_st 0 12
+ret CN_MAPFAILED
+end
+ret addr
+end
+
+fn dx_drop cpu ulong size ulong to bool
+idx = dv_find_map cpu
+if lt idx 0
+put dv_st 0 22
+ret false
+end
+base = mul ulong idx 4
+mhan = get dv_maps add base 1
+r = mapdrop long mhan
+put dv_maps add base 3 0
+if lt r 0
+dv_set_err r
+ret false
+end
+ret true
+end
+
+fn dx_transfer h ulong to void
+put dv_st 14 h
+end
+
+fn dx_finish to bool
+ok = true
+for i ulong 128
+base = mul i 4
+if ne get dv_maps add base 3 0
+r = mapdrop long get dv_maps add base 1
+put dv_maps add base 3 0
+if lt r 0
+ok = false
+end
+end
+end
+ret ok
+end
+
+fn dv_vafree_pop i ulong n ulong to void
+b = mul i 2
+last = sub n 1
+lb = mul last 2
+put dv_vafree b get dv_vafree lb
+put dv_vafree add b 1 get dv_vafree add lb 1
+put dv_vafn 0 last
+end
+
+fn dv_vafree_take size ulong al ulong to ulong
+n = get dv_vafn 0
+for i ulong n bound 128
+b = mul i 2
+va = get dv_vafree b
+sz = get dv_vafree add b 1
+remv = rem va al
+pad = ulong 0
+if ne remv 0
+pad = sub al remv
+end
+need = add size pad
+if ge sz need
+res = add va pad
+left = sub sz need
+if eq left 0
+dv_vafree_pop i n
+else
+put dv_vafree b add res size
+put dv_vafree add b 1 left
+end
+ret res
+end
+end
+ret 0
+end
+
+fn dx_vatake size ulong align ulong to ulong
+if eq size 0
+ret 0
+end
+al = align
+if eq al 0
+al = ulong 4096
+end
+hit = dv_vafree_take size al
+if ne hit 0
+ret hit
+end
+cur = get dv_st 6
+lim = get dv_st 7
+if eq cur 0
+ret 0
+end
+remv = rem cur al
+if ne remv 0
+cur = add cur sub al remv
+end
+if gt add cur size lim
+ret 0
+end
+put dv_st 6 add cur size
+ret cur
+end
+
+fn dx_varel va ulong size ulong to bool
+if or eq va 0 eq size 0
+ret false
+end
+n = get dv_vafn 0
+if ge n 128
+ret false
+end
+b = mul n 2
+put dv_vafree b va
+put dv_vafree add b 1 size
+put dv_vafn 0 add n 1
+ret true
+end
+
+fn dx_uvmmap va ulong size ulong h ulong to ulong
+fduvm = dv_fd cg CS_FDUVM
+if lt fduvm 0
+put dv_st 0 9
+ret 1
+end
+if or eq va 0 eq size 0
+put dv_st 0 22
+ret 1
+end
+if not dx_uvm fduvm 73
+ret 1
+end
+if not dx_uvm fduvm 37
+ur = dx_uvm fduvm 75
+ret 2
+end
+ret 0
+end
+
+fn dx_uvmfree va ulong size ulong to bool
+fduvm = dv_fd cg CS_FDUVM
+if lt fduvm 0
+put dv_st 0 9
+ret false
+end
+ret dx_uvm fduvm 75
+end
+
+fn dx_dmaunmap h ulong va ulong size ulong to bool
+fd = dv_fd cg CS_FDCTL
+if lt fd 0
+put dv_st 0 9
+ret false
+end
+dv_zero_hdr
+dv_hput32 0 cg CS_ROOT
+dv_hput32 4 cg CS_DEV
+dv_hput32 8 h
+r = devctl int fd uint 3225437783 dv_par 0 64
+if lt r 0
+dv_set_err r
+ret false
+end
+ret eq dv_hget32 28 0
+end
+
+fn dx_validate off ulong nw ulong to bool
+if eq nw 0
+ret false
+end
+if gt add off mul nw 4 4194304
+ret false
+end
+ret true
+end
+
+fn dx_publish fifoh ulong entries ulong putv ulong userd ulong va ulong nw ulong to bool
+if or eq entries 0 eq nw 0
+ret false
+end
+idx = dv_find_map fifoh
+if lt idx 0
+put dv_st 0 22
+ret false
+end
+mhan = get dv_maps add mul ulong idx 4 1
+entry = nvrm_gpentry va nw
+slot = rem putv entries
+cpufence
+r1 = mapset long mhan mul slot 8 8 entry
+if lt r1 0
+dv_set_err r1
+ret false
+end
+cpufence
+nxt = rem add putv 1 entries
+r2 = mapset long mhan add userd 140 4 nxt
+if lt r2 0
+dv_set_err r2
+ret false
+end
+cpufence
+ret true
+end
+
+fn dx_doorbell token ulong to bool
+ucpu = cg CS_UCPU
+idx = dv_find_map ucpu
+if lt idx 0
+put dv_st 0 22
+ret false
+end
+mhan = get dv_maps add mul ulong idx 4 1
+cpufence
+r = mapset long mhan 144 4 token
+if lt r 0
+dv_set_err r
+ret false
+end
+ret true
+end
+
+fn dx_sleep us ulong to void
+if gt us 0
+r = sleepns long mul us 1000
+end
+end
+
+fn dx_zero cpu ulong size ulong to void
+idx = dv_find_map cpu
+if lt idx 0
+ret
+end
+mhan = get dv_maps add mul ulong idx 4 1
+off = ulong 0
+while lt off size bound 65536
+r = mapset long mhan off 8 0
+if lt r 0
+break
+end
+off = add off 8
+end
+end
+
+fn dx_er code ulong to void
+put dv_st 8 code
+put dv_st 9 add get dv_st 9 1
+end
+
+fn dx_eu v ulong to void
+end
+
+fn dx_ed v long to void
+end
+
+fn dx_es to void
+end
+
+fn dx_ee to void
+end
+
+fn dx_ea size ulong to void
+put dv_st 9 add get dv_st 9 1
+end
+
+fn dx_en attempts ulong delay ulong to void
+put dv_st 9 add get dv_st 9 1
+end

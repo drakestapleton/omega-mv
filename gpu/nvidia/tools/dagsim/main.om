@@ -1,0 +1,255 @@
+note SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+note gpu/nvidia/tools/dagsim/main.om: pure-Omega CLI replacing CUDApp tools/dagsim/dagsim_cli.c.
+note Compose after gpu/nvidia/om/tools/dag_parse.om, dag_eval.om, dag_fmt.om, dag_jstr.om:
+note   cat gpu/nvidia/om/tools/dag_parse.om gpu/nvidia/om/tools/dag_eval.om gpu/nvidia/om/tools/dag_fmt.om \
+note       gpu/nvidia/om/tools/dag_jstr.om gpu/nvidia/tools/dagsim/main.om | seed/out/omc > dagsim
+note
+note Usage: dagsim eval FILE
+note Reads an OEV1 file, parses it via dag_parse, translates to dag_eval's model layout,
+note evaluates the deterministic resource-DAG schedule, and emits JSON on stdout.
+note Exit: 0 evaluated (status=ok), 1 refused (cycle/capacity/unknown/etc), 2 usage/I/O/parse error.
+
+text dg_use "usage: dagsim eval FILE\n"
+text dg_keval "eval"
+text dg_eopen "dagsim: cannot open file\n"
+text dg_eread "dagsim: file exceeds 1 MiB or read error\n"
+text dg_eparse "dagsim: parse error: "
+text dg_j1 "{\"schema\":\"oev1\",\"tool\":\"dagsim\",\"offline\":true,\"gpu_executed\":false,\"status\":"
+text dg_j2 ",\"n_ops\":"
+text dg_j3 ",\"n_res\":"
+text dg_j4 ",\"n_deps\":"
+text dg_j5 ",\"makespan_ns\":"
+text dg_j6 ",\"bound_ns\":"
+text dg_j7 ",\"synthetic\":"
+text dg_j8 "}\n"
+
+global dg_arg uchar 4096
+global dg_num uchar 32
+
+fn dg_wnum v ulong to void
+n = ulong 0
+x = v
+while true bound 20
+put dg_num sub 31 n uchar add 48 rem x 10
+n = add n 1
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 dg_num sub 32 n n
+end
+
+fn dg_wbits fbits ulong to void
+x = bitcast f64 fbits
+if lt x 0.0
+r = write 1 dg_num 0 0
+dg_wnum 0
+ret
+end
+if ge x 1000000000000.0
+dg_wnum 999999999999
+ret
+end
+iv = ulong x
+dg_wnum iv
+end
+
+fn dg_wstr s view uchar 256 n ulong to void
+q = new uchar 1 34
+esc = new uchar 6 0
+r = write 1 q 0 1
+for i ulong n bound 256
+k = dag_jstr get s i edit esc
+r = write 1 esc 0 k
+end
+r = write 1 q 0 1
+end
+
+fn dg_pack_ops pm view ulong 16384 em edit ulong 8192 n_ops ulong to void
+for i ulong n_ops bound 256
+sp = add 448 mul i 26
+dp = add 32 mul i 10
+put em dp get pm add sp 4
+put em add dp 1 get pm add sp 9
+put em add dp 2 get pm add sp 11
+put em add dp 3 0
+eng = get pm add sp 3
+if eq eng 4294967295
+eng = NONE
+end
+put em add dp 4 eng
+bw = get pm add sp 10
+if eq bw 4294967295
+bw = NONE
+end
+put em add dp 5 bw
+ln = get pm add sp 12
+if eq ln 4294967295
+ln = NONE
+end
+put em add dp 6 ln
+put em add dp 7 get pm add sp 2
+put em add dp 8 get pm add sp 7
+put em add dp 9 0
+end
+end
+
+fn dg_pack_rest pm view ulong 16384 em edit ulong 8192 n_deps ulong n_buf ulong to void
+for i ulong n_deps bound 1024
+sp = add 7104 mul i 2
+dp = add 2720 mul i 2
+put em dp get pm sp
+put em add dp 1 get pm add sp 1
+end
+for i ulong n_buf bound 256
+sp = add 9152 mul i 8
+dp = add 4768 mul i 4
+put em dp get pm add sp 2
+capr = get pm add sp 3
+if eq capr 4294967295
+capr = NONE
+end
+put em add dp 1 capr
+put em add dp 2 get pm add sp 4
+put em add dp 3 get pm add sp 5
+end
+end
+
+fn dg_pack pm view ulong 16384 em edit ulong 8192 to void
+for i ulong 8192
+put em i 0
+end
+n_res = get pm 24
+n_ops = get pm 25
+n_buf = get pm 26
+n_deps = get pm 27
+put em 0 n_ops
+put em 1 n_res
+put em 2 n_deps
+put em 3 n_buf
+put em 4 get pm 38
+put em 5 get pm 36
+put em 6 get pm 37
+put em 7 get pm 35
+put em 8 1
+put em 9 1
+for i ulong n_res bound 32
+sp = add 64 mul i 12
+dp = add 2592 mul i 4
+put em dp get pm add sp 2
+put em add dp 1 get pm add sp 3
+put em add dp 2 get pm add sp 4
+put em add dp 3 get pm add sp 7
+end
+dg_pack_ops pm em n_ops
+dg_pack_rest pm em n_deps n_buf
+end
+
+fn dg_read_input pn ulong txt edit uchar 1048576 to long
+fd = fopen dg_arg 0 pn 0 0
+if lt fd 0
+r = write 2 dg_eopen 0 len dg_eopen
+ret -1
+end
+total = ulong 0
+while true bound 4096
+if ge total 1048576
+r = fclose int fd
+r = write 2 dg_eread 0 len dg_eread
+ret -1
+end
+got = read int fd txt total sub 1048576 total
+if lt got 0
+r = fclose int fd
+r = write 2 dg_eread 0 len dg_eread
+ret -1
+end
+if eq got 0
+break
+end
+total = add total ulong got
+end
+r = fclose int fd
+ret long total
+end
+
+fn dg_emit_json em view ulong 8192 sc view ulong 8192 st ulong to void
+fa = new ulong 16 0
+sn = new uchar 256 0
+put fa 0 st
+snl = dag_fmt 0 edit fa edit sn
+r = write 1 dg_j1 0 len dg_j1
+dg_wstr view sn snl
+r = write 1 dg_j2 0 len dg_j2
+dg_wnum get em 0
+r = write 1 dg_j3 0 len dg_j3
+dg_wnum get em 1
+r = write 1 dg_j4 0 len dg_j4
+dg_wnum get em 2
+r = write 1 dg_j5 0 len dg_j5
+dg_wbits get sc 3
+r = write 1 dg_j6 0 len dg_j6
+dg_wbits get sc 19
+r = write 1 dg_j7 0 len dg_j7
+dg_wnum get sc 26
+r = write 1 dg_j8 0 len dg_j8
+end
+
+fn dg_run_eval pn ulong to int
+txt = new uchar 1048576 0
+pm = new ulong 16384 0
+err = new uchar 256 0
+nl = new uchar 1 10
+em = new ulong 8192 0
+sc = new ulong 8192 0
+total_s = dg_read_input pn edit txt
+if lt total_s 0
+ret 2
+end
+prc = dag_parse view txt ulong total_s edit pm edit err
+if ne prc 0
+r = write 2 dg_eparse 0 len dg_eparse
+el = ulong 0
+while lt el 256 bound 256
+if eq get err el 0
+break
+end
+el = add el 1
+end
+r = write 2 err 0 el
+r = write 2 nl 0 1
+ret 2
+end
+dg_pack view pm edit em
+st = dag_eval view em edit sc
+dg_emit_json view em view sc st
+if ne st 0
+ret 1
+end
+ret 0
+end
+
+fn main to int
+if ne argcnt 3
+r = write 2 dg_use 0 len dg_use
+ret 2
+end
+n1 = argread 1 dg_arg 0 4096
+if ne n1 long len dg_keval
+r = write 2 dg_use 0 len dg_use
+ret 2
+end
+for i ulong len dg_keval
+if ne get dg_arg i get dg_keval i
+r = write 2 dg_use 0 len dg_use
+ret 2
+end
+end
+pn = argread 2 dg_arg 0 4096
+if le pn 0
+r = write 2 dg_use 0 len dg_use
+ret 2
+end
+ret dg_run_eval ulong pn
+end

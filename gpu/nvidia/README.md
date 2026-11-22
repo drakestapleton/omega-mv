@@ -55,5 +55,10 @@ behaviour of `launch.om`, only its identity. The rows of `seed/ng/cudapp.lock` s
 - Retiring `seed/ng/cudapp.lock`. Under ADR 0047 Decision 5 it is deleted with its last row. Here it stays as the
   identity table of the five files, because removing it changes the gate (`lock-self` and the `lock-*` rows). That
   is its own change.
-- The rest of CUDApp's NVIDIA layer that is Omega came in steps 3 (`om/`) and 4 (`native/`): see `gpu/UNITS.md`.
-  The driver client in C (`nvrm/`, `m16/`) and the C runtime stay in CUDApp until they are rewritten in Omega.
+- The rest of CUDApp's NVIDIA pure-Omega layer is now here: steps 3 (`om/`) and 4 (`native/`), plus the
+  post-`84b524ca` CUDApp `a4ffab1d` units (`coder/erc.om`, `moe-wide/*`), standalone `.om` tools and
+  compat (`tools/{c5,omtrace,prof,tilelab}/`, `compat/cuda/c0_check.om`, `lib/{xorwow_mix,graph_aux}.om`),
+  pure-Omega CLI replacements (`tools/{sm121dis,doctor,dagsim}/main.om`), and the pure-Omega Linux RM/UVM
+  driver device backend (`driver/device.om`), all compile-gated by `gpu/extra-units.tsv` (49 units).
+  The legacy C compatibility library in CUDApp `src/` stays upstream as the reference oracle until Omega
+  emits C-callable shared/static libraries directly (`gpu/runtime/CLASSES.tsv`).
