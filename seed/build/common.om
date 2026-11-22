@@ -1,0 +1,1174 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/build/common.om: shared pure seeded OM-2 runtime for build, release, and automation coordinators.
+note Dynamic run-time pools (global ... *) grow on demand with enlarge: zero artificial file/buffer caps.
+note Streaming FIPS 180-4 SHA-256 (64 KiB chunks) hashes files of arbitrary size.
+
+text cb_hexd "0123456789abcdef"
+text cb_nl "\n"
+text cb_sp " "
+text cb_slash "/"
+text cb_dot "."
+text cb_dotdot ".."
+text cb_devnull "/dev/null"
+text cb_sha_kiv "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+
+note Dynamic byte pools (grow via enlarge, no fixed cap)
+global cb_rb uchar *
+global cb_wb uchar *
+global cb_sb uchar *
+global cb_n ulong 32
+note cb_n slots:
+note 0 = cb_rb len, 1 = cb_wb len, 2 = cb_sb len
+note 3 = cb_pa len, 4 = cb_pb len, 5 = cb_av bytes, 6 = cb_av argc
+note 7 = cb_ev bytes, 8 = cb_ev envc, 9 = cb_sha initialized
+note 10 = cb_sha total_bytes, 11 = cb_sha buf_len
+note 12 = cb_tmp_len
+
+note Path & small scratch buffers
+global cb_pa uchar 4096
+global cb_pb uchar 4096
+global cb_pc uchar 4096
+global cb_av uchar 65536
+global cb_ev uchar 4096
+global cb_pkt uchar 4096
+global cb_st uchar 4
+global cb_numbuf uchar 32
+global cb_chunk1 uchar 65536
+global cb_chunk2 uchar 65536
+global cb_dent uchar 32768
+global cb_envtmp uchar 4096
+
+note Streaming SHA-256 state
+global cb_sk uint 72
+global cb_sw uint 64
+global cb_sv uint 8
+global cb_sh uint 8
+global cb_sbuf uchar 128
+global cb_sdig uchar 32
+global cb_shex uchar 64
+
+note ---- dynamic pool growth ----
+fn cb_rb_need need ulong to bool
+if le need len cb_rb
+ret true
+end
+cap = len cb_rb
+if eq cap 0
+cap = 65536
+end
+while lt cap need bound 64
+cap = mul cap 2
+end
+z = enlarge cb_rb cap
+if ne z 0
+ret false
+end
+ret true
+end
+
+fn cb_wb_need need ulong to bool
+if le need len cb_wb
+ret true
+end
+cap = len cb_wb
+if eq cap 0
+cap = 65536
+end
+while lt cap need bound 64
+cap = mul cap 2
+end
+z = enlarge cb_wb cap
+if ne z 0
+ret false
+end
+ret true
+end
+
+fn cb_sb_need need ulong to bool
+if le need len cb_sb
+ret true
+end
+cap = len cb_sb
+if eq cap 0
+cap = 65536
+end
+while lt cap need bound 64
+cap = mul cap 2
+end
+z = enlarge cb_sb cap
+if ne z 0
+ret false
+end
+ret true
+end
+
+fn cb_wb_clr to void
+put cb_n 1 0
+end
+
+fn cb_wb_ch c uchar to void
+n = get cb_n 1
+if not cb_wb_need add n 1
+exit 70
+end
+put cb_wb n c
+put cb_n 1 add n 1
+end
+
+fn cb_wb_tx t view uchar * to void
+m = len t
+n = get cb_n 1
+if not cb_wb_need add n m
+exit 70
+end
+for i ulong m bound 9223372036854775807
+put cb_wb add n i get t i
+end
+put cb_n 1 add n m
+end
+
+fn cb_wb_rb off ulong cnt ulong to void
+n = get cb_n 1
+if not cb_wb_need add n cnt
+exit 70
+end
+for i ulong cnt bound 9223372036854775807
+put cb_wb add n i get cb_rb add off i
+end
+put cb_n 1 add n cnt
+end
+
+fn cb_wb_num v ulong to void
+x = v
+i = ulong 32
+for j ulong 21
+i = sub i 1
+put cb_numbuf i uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+for q ulong sub 32 i bound 32
+cb_wb_ch get cb_numbuf add i q
+end
+end
+
+note ---- fd write helpers ----
+fn cb_wtx fd int t view uchar * to void
+n = len t
+o = ulong 0
+while lt o n bound 9223372036854775807
+k = write fd t o sub n o
+if le k 0
+ret
+end
+o = add o ulong k
+end
+end
+
+fn cb_out t view uchar * to void
+cb_wtx 1 t
+end
+
+fn cb_err t view uchar * to void
+cb_wtx 2 t
+end
+
+fn cb_wnum fd int v ulong to void
+x = v
+i = ulong 32
+for j ulong 21
+i = sub i 1
+put cb_numbuf i uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write fd cb_numbuf i sub 32 i
+end
+
+fn cb_wbuf_pa fd int to void
+n = get cb_n 3
+if gt n 0
+r = write fd cb_pa 0 n
+end
+end
+
+fn cb_wbuf_pb fd int to void
+n = get cb_n 4
+if gt n 0
+r = write fd cb_pb 0 n
+end
+end
+
+fn cb_wbuf_hex fd int to void
+r = write fd cb_shex 0 64
+end
+
+note ---- path buffer cb_pa[0..cb_n[3]) and cb_pb[0..cb_n[4]) ----
+fn cb_pa_clr to void
+put cb_n 3 0
+end
+
+fn cb_pa_ch c uchar to void
+n = get cb_n 3
+if ge n 4095
+exit 70
+end
+put cb_pa n c
+put cb_n 3 add n 1
+end
+
+fn cb_pa_tx t view uchar * to void
+m = len t
+n = get cb_n 3
+if gt add n m 4095
+exit 70
+end
+for i ulong m bound 4096
+put cb_pa add n i get t i
+end
+put cb_n 3 add n m
+end
+
+fn cb_pa_set t view uchar * to void
+cb_pa_clr
+cb_pa_tx t
+end
+
+fn cb_pa_pb to void
+n = get cb_n 4
+for i ulong n bound 4096
+put cb_pa i get cb_pb i
+end
+put cb_n 3 n
+end
+
+fn cb_pa_add_pb to void
+m = get cb_n 4
+n = get cb_n 3
+if gt add n m 4095
+exit 70
+end
+for i ulong m bound 4096
+put cb_pa add n i get cb_pb i
+end
+put cb_n 3 add n m
+end
+
+fn cb_pb_clr to void
+put cb_n 4 0
+end
+
+fn cb_pb_ch c uchar to void
+n = get cb_n 4
+if ge n 4095
+exit 70
+end
+put cb_pb n c
+put cb_n 4 add n 1
+end
+
+fn cb_pb_tx t view uchar * to void
+m = len t
+n = get cb_n 4
+if gt add n m 4095
+exit 70
+end
+for i ulong m bound 4096
+put cb_pb add n i get t i
+end
+put cb_n 4 add n m
+end
+
+fn cb_pb_set t view uchar * to void
+cb_pb_clr
+cb_pb_tx t
+end
+
+fn cb_pb_from_pa to void
+n = get cb_n 3
+for i ulong n bound 4096
+put cb_pb i get cb_pa i
+end
+put cb_n 4 n
+end
+
+fn cb_pa_arg idx ulong to bool
+k = argread idx cb_pa 0 4095
+if lt k 0
+ret false
+end
+put cb_n 3 ulong k
+ret true
+end
+
+fn cb_pb_arg idx ulong to bool
+k = argread idx cb_pb 0 4095
+if lt k 0
+ret false
+end
+put cb_n 4 ulong k
+ret true
+end
+
+fn cb_pa_eq t view uchar * to bool
+n = get cb_n 3
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get cb_pa i get t i
+ret false
+end
+end
+ret true
+end
+
+fn cb_pa_ends t view uchar * to bool
+n = get cb_n 3
+m = len t
+if lt n m
+ret false
+end
+off = sub n m
+for i ulong m bound 4096
+if ne get cb_pa add off i get t i
+ret false
+end
+end
+ret true
+end
+
+note ---- environment variable lookup into cb_pb (returns true if set and non-empty) ----
+fn cb_env_match name view uchar * to bool
+ml = len name
+for j ulong ml bound 4096
+if ne get cb_envtmp j get name j
+ret false
+end
+end
+ret true
+end
+
+fn cb_env_copy_pb start ulong vlen ulong to void
+for j ulong vlen bound 4096
+put cb_pb j get cb_envtmp add start j
+end
+put cb_n 4 vlen
+end
+
+fn cb_getenv name view uchar * to bool
+ec = envcnt
+ml = len name
+for idx ulong ulong ec bound 65536
+k = envread idx cb_envtmp 0 4095
+if lt k 0
+continue
+end
+kl = ulong k
+if lt kl add ml 1
+continue
+end
+if ne get cb_envtmp ml 61
+continue
+end
+if cb_env_match name
+cb_env_copy_pb add ml 1 sub kl add ml 1
+ret true
+end
+end
+put cb_n 4 0
+ret false
+end
+
+note ---- streaming FIPS 180-4 SHA-256 ----
+fn cb_sha_init_k to void
+if ne get cb_n 9 0
+ret
+end
+put cb_n 9 1
+p = ulong 0
+for i ulong 72
+v = ulong 0
+while lt get cb_sha_kiv p 48 bound 4
+p = add p 1
+end
+while ge get cb_sha_kiv p 48 bound 11
+v = add mul v 10 ulong sub get cb_sha_kiv p 48
+p = add p 1
+if ge p len cb_sha_kiv
+put cb_sk i uint v
+ret
+end
+end
+put cb_sk i uint v
+end
+end
+
+fn cb_sha_reset to void
+cb_sha_init_k
+for j ulong 8
+put cb_sh j get cb_sk add j 64
+end
+put cb_n 10 0
+put cb_n 11 0
+end
+
+fn cb_sha_s0 a uint to uint
+ret xor xor rotr a 2 rotr a 13 rotr a 22
+end
+
+fn cb_sha_s1 e uint to uint
+ret xor xor rotr e 6 rotr e 11 rotr e 25
+end
+
+fn cb_sha_g0 x uint to uint
+ret xor xor rotr x 7 rotr x 18 shr x 3
+end
+
+fn cb_sha_g1 x uint to uint
+ret xor xor rotr x 17 rotr x 19 shr x 10
+end
+
+fn cb_sha_maj a uint b uint c uint to uint
+ret xor xor and a b and a c and b c
+end
+
+fn cb_sha_rnd i ulong to void
+e = get cb_sv 4
+t1 = add get cb_sv 7 cb_sha_s1 e
+t1 = add t1 xor and e get cb_sv 5 and not e get cb_sv 6
+t1 = add t1 add get cb_sk i get cb_sw i
+a = get cb_sv 0
+t2 = add cb_sha_s0 a cb_sha_maj a get cb_sv 1 get cb_sv 2
+put cb_sv 7 get cb_sv 6
+put cb_sv 6 get cb_sv 5
+put cb_sv 5 e
+put cb_sv 4 add get cb_sv 3 t1
+put cb_sv 3 get cb_sv 2
+put cb_sv 2 get cb_sv 1
+put cb_sv 1 a
+put cb_sv 0 add t1 t2
+end
+
+fn cb_sha_blk_sbuf off ulong to void
+for t ulong 16
+p = add off mul t 4
+v = uint get cb_sbuf p
+v = or shl v 8 uint get cb_sbuf add p 1
+v = or shl v 8 uint get cb_sbuf add p 2
+v = or shl v 8 uint get cb_sbuf add p 3
+put cb_sw t v
+end
+for t ulong 48
+u = add t 16
+x = add cb_sha_g1 get cb_sw sub u 2 get cb_sw sub u 7
+put cb_sw u add x add cb_sha_g0 get cb_sw sub u 15 get cb_sw sub u 16
+end
+for j ulong 8
+put cb_sv j get cb_sh j
+end
+for i ulong 64
+cb_sha_rnd i
+end
+for j ulong 8
+put cb_sh j add get cb_sh j get cb_sv j
+end
+end
+
+fn cb_sha_copy_chunk bl ulong src_off ulong take ulong to void
+for j ulong take bound 64
+put cb_sbuf add bl j get cb_chunk1 add src_off j
+end
+end
+
+fn cb_sha_copy_rb bl ulong src_off ulong take ulong to void
+for j ulong take bound 64
+put cb_sbuf add bl j get cb_rb add src_off j
+end
+end
+
+fn cb_sha_push_chunk off ulong cnt ulong to void
+i = ulong 0
+while lt i cnt bound 9223372036854775807
+bl = get cb_n 11
+take = sub 64 bl
+if lt sub cnt i take
+take = sub cnt i
+end
+cb_sha_copy_chunk bl add off i take
+bl = add bl take
+i = add i take
+put cb_n 10 add get cb_n 10 take
+if eq bl 64
+cb_sha_blk_sbuf 0
+put cb_n 11 0
+else
+put cb_n 11 bl
+end
+end
+end
+
+fn cb_sha_push_rb off ulong cnt ulong to void
+i = ulong 0
+while lt i cnt bound 9223372036854775807
+bl = get cb_n 11
+take = sub 64 bl
+if lt sub cnt i take
+take = sub cnt i
+end
+cb_sha_copy_rb bl add off i take
+bl = add bl take
+i = add i take
+put cb_n 10 add get cb_n 10 take
+if eq bl 64
+cb_sha_blk_sbuf 0
+put cb_n 11 0
+else
+put cb_n 11 bl
+end
+end
+end
+
+fn cb_sha_finish to void
+r = get cb_n 11
+tot = get cb_n 10
+for j ulong sub 128 r bound 128
+put cb_sbuf add r j 0
+end
+put cb_sbuf r 128
+e = ulong 64
+if ge r 56
+e = 128
+end
+bits = mul tot 8
+for j ulong 8
+put cb_sbuf sub sub e 1 j uchar and shr bits mul j 8 255
+end
+cb_sha_blk_sbuf 0
+if eq e 128
+cb_sha_blk_sbuf 64
+end
+for j ulong 8
+v = get cb_sh j
+for q ulong 4
+s = uint mul sub 3 q 8
+put cb_sdig add mul j 4 q uchar and shr v s 255
+end
+end
+for j ulong 32
+b = get cb_sdig j
+put cb_shex mul j 2 get cb_hexd ulong shr b 4
+put cb_shex add mul j 2 1 get cb_hexd ulong and b 15
+end
+end
+
+fn cb_sha_file_pa to bool
+fd = fopen cb_pa 0 get cb_n 3 524288 0
+if lt fd 0
+ret false
+end
+cb_sha_reset
+ok = true
+while true bound 9223372036854775807
+k = read int fd cb_chunk1 0 65536
+if lt k 0
+ok = false
+break
+end
+if eq k 0
+break
+end
+cb_sha_push_chunk 0 ulong k
+end
+z = fclose int fd
+if not ok
+ret false
+end
+cb_sha_finish
+ret true
+end
+
+fn cb_sha_rb off ulong cnt ulong to void
+cb_sha_reset
+cb_sha_push_rb off cnt
+cb_sha_finish
+end
+
+fn cb_is_hex c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+ret and ge c 97 le c 102
+end
+
+fn cb_hex_val c uchar to ulong
+if and ge c 48 le c 57
+ret ulong sub c 48
+end
+if and ge c 97 le c 102
+ret add 10 ulong sub c 97
+end
+if and ge c 65 le c 70
+ret add 10 ulong sub c 65
+end
+ret 255
+end
+
+note ---- file I/O (zero caps via dynamic pools or 64 KiB streaming) ----
+fn cb_read_pa to bool
+fd = fopen cb_pa 0 get cb_n 3 524288 0
+if lt fd 0
+put cb_n 0 0
+ret false
+end
+n = ulong 0
+ok = true
+while true bound 9223372036854775807
+if not cb_rb_need add n 65536
+ok = false
+break
+end
+k = read int fd cb_rb n 65536
+if lt k 0
+ok = false
+break
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+z = fclose int fd
+put cb_n 0 n
+ret ok
+end
+
+fn cb_append_pa_to_wb to bool
+fd = fopen cb_pa 0 get cb_n 3 524288 0
+if lt fd 0
+ret false
+end
+n = get cb_n 1
+ok = true
+while true bound 9223372036854775807
+if not cb_wb_need add n 65536
+ok = false
+break
+end
+k = read int fd cb_wb n 65536
+if lt k 0
+ok = false
+break
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+z = fclose int fd
+put cb_n 1 n
+ret ok
+end
+
+fn cb_write_wb_pa mode int to bool
+r = unlink cb_pa 0 get cb_n 3
+fd = fopen cb_pa 0 get cb_n 3 524865 mode
+if lt fd 0
+ret false
+end
+n = get cb_n 1
+o = ulong 0
+ok = true
+while lt o n bound 9223372036854775807
+k = write int fd cb_wb o sub n o
+if le k 0
+ok = false
+break
+end
+o = add o ulong k
+end
+z = fclose int fd
+ret ok
+end
+
+fn cb_write_rb_pa mode int to bool
+r = unlink cb_pa 0 get cb_n 3
+fd = fopen cb_pa 0 get cb_n 3 524865 mode
+if lt fd 0
+ret false
+end
+n = get cb_n 0
+o = ulong 0
+ok = true
+while lt o n bound 9223372036854775807
+k = write int fd cb_rb o sub n o
+if le k 0
+ok = false
+break
+end
+o = add o ulong k
+end
+z = fclose int fd
+ret ok
+end
+
+fn cb_copy_pa_to_pb mode int to bool
+fdi = fopen cb_pa 0 get cb_n 3 524288 0
+if lt fdi 0
+ret false
+end
+z0 = unlink cb_pb 0 get cb_n 4
+fdo = fopen cb_pb 0 get cb_n 4 524865 mode
+if lt fdo 0
+z1 = fclose int fdi
+ret false
+end
+ok = true
+while true bound 9223372036854775807
+k = read int fdi cb_chunk1 0 65536
+if lt k 0
+ok = false
+break
+end
+if eq k 0
+break
+end
+o = ulong 0
+kl = ulong k
+while lt o kl bound 65537
+w = write int fdo cb_chunk1 o sub kl o
+if le w 0
+ok = false
+break
+end
+o = add o ulong w
+end
+if not ok
+break
+end
+end
+z2 = fclose int fdi
+z3 = fclose int fdo
+ret ok
+end
+
+fn cb_chunks_eq n ulong to bool
+for j ulong n bound 65536
+if ne get cb_chunk1 j get cb_chunk2 j
+ret false
+end
+end
+ret true
+end
+
+fn cb_read_exact_c1 fd int have ulong want ulong to bool
+u = have
+while lt u want bound 65537
+r = read fd cb_chunk1 u sub want u
+if le r 0
+ret false
+end
+u = add u ulong r
+end
+ret true
+end
+
+fn cb_read_exact_c2 fd int have ulong want ulong to bool
+u = have
+while lt u want bound 65537
+r = read fd cb_chunk2 u sub want u
+if le r 0
+ret false
+end
+u = add u ulong r
+end
+ret true
+end
+
+fn cb_cmp_pa_pb to bool
+fd1 = fopen cb_pa 0 get cb_n 3 524288 0
+if lt fd1 0
+ret false
+end
+fd2 = fopen cb_pb 0 get cb_n 4 524288 0
+if lt fd2 0
+z0 = fclose int fd1
+ret false
+end
+same = true
+while true bound 9223372036854775807
+k1 = read int fd1 cb_chunk1 0 65536
+k2 = read int fd2 cb_chunk2 0 65536
+if or lt k1 0 lt k2 0
+same = false
+break
+end
+if and eq k1 0 eq k2 0
+break
+end
+if or eq k1 0 eq k2 0
+same = false
+break
+end
+u1 = ulong k1
+u2 = ulong k2
+if lt u1 u2
+if not cb_read_exact_c1 int fd1 u1 u2
+same = false
+break
+end
+u1 = u2
+end
+if lt u2 u1
+if not cb_read_exact_c2 int fd2 u2 u1
+same = false
+break
+end
+end
+if not cb_chunks_eq u1
+same = false
+break
+end
+end
+z1 = fclose int fd1
+z2 = fclose int fd2
+ret same
+end
+
+fn cb_file_size_pa to long
+fd = fopen cb_pa 0 get cb_n 3 524288 0
+if lt fd 0
+ret -1
+end
+tot = long 0
+while true bound 9223372036854775807
+k = read int fd cb_chunk1 0 65536
+if lt k 0
+z0 = fclose int fd
+ret -1
+end
+if eq k 0
+break
+end
+tot = add tot k
+end
+z1 = fclose int fd
+ret tot
+end
+
+fn cb_mkdir_p_pa to bool
+n = get cb_n 3
+if eq n 0
+ret false
+end
+for i ulong n bound 4096
+if and gt i 0 eq get cb_pa i 47
+r = makedir cb_pa 0 i 493
+if and lt r 0 ne r -17
+ret false
+end
+end
+end
+r = makedir cb_pa 0 n 493
+if and lt r 0 ne r -17
+ret false
+end
+ret true
+end
+
+note atomic rename cb_pa -> cb_pb
+fn cb_rename_pa_pb to bool
+n1 = get cb_n 3
+n2 = get cb_n 4
+if or eq n1 0 eq n2 0
+ret false
+end
+if gt add add n1 n2 6 4096
+ret false
+end
+put cb_pkt 0 2
+put cb_pkt 1 0
+put cb_pkt 2 uchar and n1 255
+put cb_pkt 3 uchar shr n1 8
+for i ulong n1 bound 4096
+put cb_pkt add 4 i get cb_pa i
+end
+p = add 4 n1
+put cb_pkt p uchar and n2 255
+put cb_pkt add p 1 uchar shr n2 8
+for i ulong n2 bound 4096
+put cb_pkt add add p 2 i get cb_pb i
+end
+tot = add add p 2 n2
+r = renames cb_pkt 0 tot 0
+ret eq r 0
+end
+
+note ---- subprocess spawner (packed argv + optional envp) ----
+fn cb_av_clr to void
+put cb_n 5 2
+put cb_n 6 0
+put cb_av 0 0
+put cb_av 1 0
+end
+
+fn cb_av_push_pa to void
+p = get cb_n 5
+n = get cb_n 3
+if gt add add p 2 n 65536
+exit 70
+end
+put cb_av p uchar and n 255
+put cb_av add p 1 uchar shr n 8
+for i ulong n bound 4096
+put cb_av add add p 2 i get cb_pa i
+end
+put cb_n 5 add add p 2 n
+c = add get cb_n 6 1
+put cb_n 6 c
+put cb_av 0 uchar and c 255
+put cb_av 1 uchar shr c 8
+end
+
+fn cb_av_push_pb to void
+p = get cb_n 5
+n = get cb_n 4
+if gt add add p 2 n 65536
+exit 70
+end
+put cb_av p uchar and n 255
+put cb_av add p 1 uchar shr n 8
+for i ulong n bound 4096
+put cb_av add add p 2 i get cb_pb i
+end
+put cb_n 5 add add p 2 n
+c = add get cb_n 6 1
+put cb_n 6 c
+put cb_av 0 uchar and c 255
+put cb_av 1 uchar shr c 8
+end
+
+fn cb_av_push_tx t view uchar * to void
+p = get cb_n 5
+n = len t
+if gt add add p 2 n 65536
+exit 70
+end
+put cb_av p uchar and n 255
+put cb_av add p 1 uchar shr n 8
+for i ulong n bound 4096
+put cb_av add add p 2 i get t i
+end
+put cb_n 5 add add p 2 n
+c = add get cb_n 6 1
+put cb_n 6 c
+put cb_av 0 uchar and c 255
+put cb_av 1 uchar shr c 8
+end
+
+fn cb_ev_clr to void
+put cb_n 7 2
+put cb_n 8 0
+put cb_ev 0 0
+put cb_ev 1 0
+end
+
+fn cb_ev_push_env_pa to void
+p = get cb_n 7
+n = get cb_n 3
+if gt add add p 2 n 4096
+ret
+end
+if ge get cb_n 8 64
+ret
+end
+put cb_ev p uchar and n 255
+put cb_ev add p 1 uchar shr n 8
+for i ulong n bound 4096
+put cb_ev add add p 2 i get cb_pa i
+end
+put cb_n 7 add add p 2 n
+c = add get cb_n 8 1
+put cb_n 8 c
+put cb_ev 0 uchar and c 255
+put cb_ev 1 uchar shr c 8
+end
+
+fn cb_redir s int d int to void
+if ge s 0
+if ne dupfd s d 0 long d
+exit 127
+end
+end
+end
+
+note spawn with fds fi/fo/fe (-1 = inherit parent fd); closes any >=0 fds in parent.
+note returns exit code 0..255, 256+sig on signal, 512 on spawn error.
+fn cb_spawn_fds fi int fo int fe int use_ev bool to ulong
+pid = fork
+if lt pid 0
+if ge fi 0
+z0 = fclose fi
+end
+if ge fo 0
+z1 = fclose fo
+end
+if ge fe 0
+z2 = fclose fe
+end
+ret 512
+end
+if eq pid 0
+cb_redir fi 0
+cb_redir fo 1
+cb_redir fe 2
+if use_ev
+r = execenv cb_av 0 get cb_n 5 cb_ev 0 get cb_n 7
+else
+r = execprog cb_av 0 get cb_n 5
+end
+exit 127
+end
+if ge fi 0
+z0 = fclose fi
+end
+if ge fo 0
+z1 = fclose fo
+end
+if ge fe 0
+z2 = fclose fe
+end
+w = waitpid int pid cb_st 0 4 0
+if ne w pid
+ret 512
+end
+if ne get cb_st 0 0
+ret add 256 ulong get cb_st 0
+end
+ret ulong get cb_st 1
+end
+
+note compile: OMC (in cb_pc[0..omclen)) < SRC (in cb_pa) > OUT (in cb_pb) 2> err (or inherit if fe == -1)
+fn cb_run_omc omclen ulong mode int fe int to ulong
+fi = fopen cb_pa 0 get cb_n 3 524288 0
+if lt fi 0
+if ge fe 0
+z0 = fclose fe
+end
+ret 512
+end
+z1 = unlink cb_pb 0 get cb_n 4
+fo = fopen cb_pb 0 get cb_n 4 524865 mode
+if lt fo 0
+z2 = fclose int fi
+if ge fe 0
+z3 = fclose fe
+end
+ret 512
+end
+cb_av_clr
+p = get cb_n 5
+put cb_av p uchar and omclen 255
+put cb_av add p 1 uchar shr omclen 8
+for i ulong omclen bound 4096
+put cb_av add add p 2 i get cb_pc i
+end
+put cb_n 5 add add p 2 omclen
+put cb_n 6 1
+put cb_av 0 1
+put cb_av 1 0
+ret cb_spawn_fds int fi int fo fe false
+end
+
+fn cb_dent_nlen ns ulong lim ulong to ulong
+nl = ulong 0
+while lt add ns nl lim bound 256
+if eq get cb_dent add ns nl 0
+break
+end
+nl = add nl 1
+end
+ret nl
+end
+
+fn cb_rm_flat_one base_len ulong ns ulong nl ulong to void
+if and eq nl 1 eq get cb_dent ns 46
+ret
+end
+if and eq nl 2 and eq get cb_dent ns 46 eq get cb_dent add ns 1 46
+ret
+end
+put cb_n 3 base_len
+cb_pa_ch 47
+for j ulong nl bound 256
+cb_pa_ch get cb_dent add ns j
+end
+z = unlink cb_pa 0 get cb_n 3
+end
+
+fn cb_rm_flat_buf base_len ulong nr ulong to void
+pos = ulong 0
+while lt pos nr bound 32768
+rlen = or ulong get cb_dent add pos 16 shl ulong get cb_dent add pos 17 8
+if eq rlen 0
+break
+end
+ns = add pos 19
+nl = cb_dent_nlen ns add pos rlen
+cb_rm_flat_one base_len ns nl
+pos = add pos rlen
+end
+put cb_n 3 base_len
+end
+
+note remove a flat temporary directory (files inside + rmdir) at cb_pa
+fn cb_rm_flat_pa to void
+base_len = get cb_n 3
+dfd = fopen cb_pa 0 base_len 540672 0
+if lt dfd 0
+ret
+end
+while true bound 65536
+nr = getdnts int dfd cb_dent 0 32768
+if le nr 0
+break
+end
+cb_rm_flat_buf base_len ulong nr
+end
+z0 = fclose int dfd
+put cb_n 3 base_len
+z1 = rmdir cb_pa 0 base_len
+end
+
+fn cb_rb_match_at i ulong t view uchar * to bool
+for j ulong len t bound 4096
+if ne get cb_rb add i j get t j
+ret false
+end
+end
+ret true
+end
+
+note check whether file in cb_pa contains text t
+fn cb_file_contains_pa t view uchar * to bool
+if not cb_read_pa
+ret false
+end
+n = get cb_n 0
+m = len t
+if lt n m
+ret false
+end
+lim = add sub n m 1
+for i ulong lim bound 9223372036854775807
+if cb_rb_match_at i t
+ret true
+end
+end
+ret false
+end

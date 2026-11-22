@@ -1,15 +1,16 @@
 #!/bin/sh
-# Build and run the pure seeded-Omega MTPVarlen + N-gram speculative decoding gate.
+# SPDX-License-Identifier: Apache-2.0
+# om/gpu/spec/build.sh -- thin compatibility shim over pure seeded-Omega seed/build/gpucoord.om.
 set -eu
 out=${1:?usage: sh om/gpu/spec/build.sh OUTPUT_DIR}
-mkdir -p "$out"
-tmp=$(mktemp -d "$out/build.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
-
-( echo om2
-  cat om/gpu/spec/mtp_varlen.om \
-    om/gpu/spec/ngram_draft.om \
-    om/gpu/spec/check_mtp_varlen.om
-) > "$tmp/check_mtp_varlen.om"
-seed/out/omc < "$tmp/check_mtp_varlen.om" > "$out/check_mtp_varlen"
-chmod +x "$out/check_mtp_varlen"
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
+OMC="${OMC:-$ROOT/seed/out/omc}"
+cd "$ROOT"
+mkdir -p build
+BIN="$ROOT/build/om-gpucoord.$$"
+trap 'rm -f "$BIN"' EXIT
+cat seed/build/common.om seed/build/gpucoord.om | "$OMC" > "$BIN"
+chmod 755 "$BIN"
+rc=0
+OMC="$OMC" "$BIN" build-spec "$out" || rc=$?
+exit "$rc"
