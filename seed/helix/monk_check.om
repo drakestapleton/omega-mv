@@ -1,0 +1,588 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/monk_check.om: The Skeleton (Strand A's millisecond mathematical proof checker).
+note Compose after:
+note   seed/ng/sha256.om
+note   gpu/nvidia/om/codegen/bw_hazard.om
+note
+note Usage:
+note   monk_check REF_SASS CAND_SASS CERT_FILE
+note
+note Certificate binary format (helix-proof-v1):
+note   [0..3]   magic "HXP1" (0x48, 0x58, 0x50, 0x31)
+note   [4..7]   u32 LE instruction count N (1..2048)
+note   [8..39]  expected SHA-256 of REF_SASS (32 bytes)
+note   [40..71] expected SHA-256 of CAND_SASS (32 bytes)
+note   [72..72+4*N-1] perm[0..N-1] u32 LE (cand pc i -> ref pc perm[i])
+note
+note Mechanically enforces all 7 Lean 4 antibodies (seed/helix/proofs/HelixAntibodies.lean):
+note   exit 0: MONK PASS (all 7 antibodies satisfied, 0 SM121 hazards)
+note   exit 11: Antibody 7 -- length / format / OOB perm mismatch
+note   exit 12: Antibody 1 -- SHA-256 digest spoof (REF or CAND mismatch)
+note   exit 13: Antibody 2 -- non-bijection (duplicate or missing perm entry)
+note   exit 14: Antibody 3 -- functional SM121 opcode/operand smuggling (outside 17-bit ctrl word)
+note   exit 15: Antibody 4 -- anchor escape (branch/exit/barrier/memory-ordering anchor moved)
+note   exit 16: Antibody 5 -- RAW/WAR/WAW register or memory dependency inversion
+note   exit 17: Antibody 6 -- SM121 Blackwell scoreboard hazard violation (bw_hazard)
+note   exit 90: usage / file I/O error
+
+global mkRef uchar 32768
+global mkCand uchar 32768
+global mkCert uchar 16384
+global mkPath uchar 4096
+global mkPerm ulong 2048
+global mkInv ulong 2048
+global mkSeen ulong 2048
+global mkRefRec ulong 49152
+global mkCndRec ulong 49152
+global mkWbar ulong 512
+global mkRbar ulong 512
+global mkRefSha uchar 32
+global mkCndSha uchar 32
+global mkOut uchar 256
+
+text mkUse "usage: monk_check REF_SASS CAND_SASS CERT_FILE\n"
+text mkPassA "MONK PASS rung="
+text mkPassB " insns="
+text mkPassC " swapped="
+text mkPassD " stall_ref="
+text mkPassE " stall_cand="
+text mkPassF " hazards=0\n"
+text mkRejA "MONK REJECT code="
+text mkRejB " reason="
+text mkR11 "length-or-format-mismatch\n"
+text mkR12 "digest-spoof\n"
+text mkR13 "non-bijection\n"
+text mkR14 "opcode-smuggle\n"
+text mkR15 "anchor-escape\n"
+text mkR16 "dep-inversion\n"
+text mkR17 "sm121-hazard\n"
+
+fn mkWrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn mkNum v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 b p sub 24 p
+end
+
+fn mkReject code int ridx ulong to int
+mkWrt mkRejA
+mkNum ulong code
+mkWrt mkRejB
+if eq ridx 11
+mkWrt mkR11
+end
+if eq ridx 12
+mkWrt mkR12
+end
+if eq ridx 13
+mkWrt mkR13
+end
+if eq ridx 14
+mkWrt mkR14
+end
+if eq ridx 15
+mkWrt mkR15
+end
+if eq ridx 16
+mkWrt mkR16
+end
+if eq ridx 17
+mkWrt mkR17
+end
+ret code
+end
+
+fn mkReadFile idx ulong dst ulong maxb ulong to long
+k = argread idx mkPath 0 4095
+if lt k 1
+ret long -1
+end
+fd = fopen mkPath 0 ulong k 0 0
+if lt fd 0
+ret long -1
+end
+tot = ulong 0
+while lt tot maxb bound 1024
+r = read int fd mkOut 0 256
+if lt r 0
+c = fclose int fd
+ret long -1
+end
+if eq r 0
+break
+end
+ur = ulong r
+if gt add tot ur maxb
+c = fclose int fd
+ret long -1
+end
+for i ulong ur bound 256
+b = get mkOut i
+if eq dst 0
+put mkRef add tot i b
+else
+if eq dst 1
+put mkCand add tot i b
+else
+put mkCert add tot i b
+end
+end
+end
+tot = add tot ur
+end
+c = fclose int fd
+ret long tot
+end
+
+fn mkRdU32Cert o ulong to ulong
+a = ulong get mkCert o
+a = or a shl ulong get mkCert add o 1 8
+a = or a shl ulong get mkCert add o 2 16
+ret or a shl ulong get mkCert add o 3 24
+end
+
+fn mkRdU32Ref o ulong to ulong
+a = ulong get mkRef o
+a = or a shl ulong get mkRef add o 1 8
+a = or a shl ulong get mkRef add o 2 16
+ret or a shl ulong get mkRef add o 3 24
+end
+
+fn mkRdU32Cnd o ulong to ulong
+a = ulong get mkCand o
+a = or a shl ulong get mkCand add o 1 8
+a = or a shl ulong get mkCand add o 2 16
+ret or a shl ulong get mkCand add o 3 24
+end
+
+fn mkHashBuf src ulong n ulong to void
+for i ulong n bound 32768
+if eq src 0
+put sh_dat i get mkRef i
+else
+put sh_dat i get mkCand i
+end
+end
+sh_all n
+for i ulong 32
+if eq src 0
+put mkRefSha i get sh_dig i
+else
+put mkCndSha i get sh_dig i
+end
+end
+end
+
+fn mkFuncMatch ci ulong ri ulong to bool
+co = mul ci 16
+ro = mul ri 16
+if ne mkRdU32Cnd co mkRdU32Ref ro
+ret false
+end
+if ne mkRdU32Cnd add co 4 mkRdU32Ref add ro 4
+ret false
+end
+if ne mkRdU32Cnd add co 8 mkRdU32Ref add ro 8
+ret false
+end
+note w3 bits [9..25] (0x03fffe00 = 67108352) are the 17-bit SM121 scheduling control word;
+note every other bit of w3 (mask 0xfc0001ff = 4227858943) MUST be identical!
+cw = and mkRdU32Cnd add co 12 ulong 4227858943
+rw = and mkRdU32Ref add ro 12 ulong 4227858943
+ret eq cw rw
+end
+
+fn mkDecodeAll src ulong n ulong to bool
+ins = new uchar 16 0
+rec = new ulong 24 0
+for pc ulong n bound 2048
+base = mul pc 16
+for j ulong 16
+if eq src 0
+put ins j get mkRef add base j
+else
+put ins j get mkCand add base j
+end
+end
+r = hz_dec1 ins rec
+if ne r 0
+ret false
+end
+db = mul pc 24
+for j ulong 24
+if eq src 0
+put mkRefRec add db j get rec j
+else
+put mkCndRec add db j get rec j
+end
+end
+end
+ret true
+end
+
+note Anchor predicate: control flow (flow != 0), predicated guard (guard != 7),
+note memory/barrier ops (name_id >= 33 or op == BAR/MEMBAR/EXIT/BRA), or NOP padding.
+fn mkIsAnchor pc ulong to bool
+db = mul pc 24
+fl = get mkRefRec add db 17
+if ne fl 0
+ret true
+end
+gd = get mkRefRec add db 1
+if ne gd 7
+ret true
+end
+nm = get mkRefRec add db 19
+if or ge nm 33 eq nm 0
+ret true
+end
+op = get mkRefRec db
+if or eq op 2381 eq op 2375
+ret true
+end
+ret false
+end
+
+fn mkRegOverlap a ulong b ulong to bool
+if or eq a 0 eq b 0
+ret false
+end
+ra = and a 255
+na = and shr a 8 255
+ua = and shr a 16 1
+rb = and b 255
+nb = and shr b 8 255
+ub = and shr b 16 1
+if ne ua ub
+ret false
+end
+if or eq ra 255 eq rb 255
+ret false
+end
+if or le add ra na rb le add rb nb ra
+ret false
+end
+ret true
+end
+
+fn mkHasDep u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if and ne get mkRefRec add du 10 0 ne get mkRefRec add dv 10 0
+if mkRegOverlap get mkRefRec add du 16 get mkRefRec add dv 16
+ret true
+end
+end
+if ne get mkRefRec add du 10 0
+wu = get mkRefRec add du 16
+for j ulong get mkRefRec add dv 9 bound 5
+if mkRegOverlap wu get mkRefRec add add dv 11 j
+ret true
+end
+end
+end
+if ne get mkRefRec add dv 10 0
+wv = get mkRefRec add dv 16
+for j ulong get mkRefRec add du 9 bound 5
+if mkRegOverlap get mkRefRec add add du 11 j wv
+ret true
+end
+end
+end
+ret false
+end
+
+note Helper: check one operand against pending wbar (and rbar if chkR is true)
+fn mkChkOpnd opnd ulong chkR bool to bool
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+base = add mul uni 256 reg
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if ne get mkWbar idx 0
+ret false
+end
+if chkR
+if ne get mkRbar idx 0
+ret false
+end
+end
+end
+end
+ret true
+end
+
+note Helper: mark one operand in mkWbar (isR=false) or mkRbar (isR=true) with barrier bit
+fn mkMarkOpnd opnd ulong bit ulong isR bool to void
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+base = add mul uni 256 reg
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if isR
+put mkRbar idx or get mkRbar idx bit
+else
+put mkWbar idx or get mkWbar idx bit
+end
+end
+end
+end
+
+fn mkStepHazard pc ulong to bool
+db = mul pc 24
+wt = get mkCndRec add db 6
+if ne wt 0
+clear = not wt
+for i ulong 512
+put mkWbar i and get mkWbar i clear
+put mkRbar i and get mkRbar i clear
+end
+end
+nr = get mkCndRec add db 9
+for j ulong nr bound 5
+if not mkChkOpnd get mkCndRec add add db 11 j false
+ret false
+end
+end
+nw = get mkCndRec add db 10
+if ne nw 0
+if not mkChkOpnd get mkCndRec add db 16 true
+ret false
+end
+end
+if and ne get mkCndRec add db 7 0 ne nw 0
+wb = get mkCndRec add db 4
+if lt wb 6
+mkMarkOpnd get mkCndRec add db 16 shl ulong 1 wb false
+end
+end
+if ne get mkCndRec add db 8 0
+rb = get mkCndRec add db 5
+wb2 = get mkCndRec add db 4
+lmask = ulong 0
+if lt rb 6
+lmask = or lmask shl ulong 1 rb
+end
+if lt wb2 6
+lmask = or lmask shl ulong 1 wb2
+end
+if ne lmask 0
+for j ulong nr bound 5
+mkMarkOpnd get mkCndRec add add db 11 j lmask true
+end
+end
+end
+ret true
+end
+
+note Verify Blackwell SM121 scoreboard hazards across mkCndRec[0..n) (0 hazards required).
+fn mkCheckHazards n ulong to bool
+for i ulong 512
+put mkWbar i 0
+put mkRbar i 0
+end
+for pc ulong n bound 2048
+if not mkStepHazard pc
+ret false
+end
+end
+ret true
+end
+
+fn mkPrintRungHash to void
+for i ulong 32
+put sh_dat i get mkRefSha i
+put sh_dat add i 32 get mkCndSha i
+end
+sh_all 64
+hx = new uchar 64 0
+for i ulong 32
+b = uint get sh_dig i
+put hx mul i 2 sh_hexd shr b 4
+put hx add mul i 2 1 sh_hexd and b 15
+end
+r = write 1 hx 0 64
+end
+
+fn mkCheckPerm n ulong to long
+for i ulong n bound 2048
+put mkSeen i 0
+end
+sw = ulong 0
+for i ulong n bound 2048
+r = mkRdU32Cert add 72 mul i 4
+if ge r n
+ret long -11
+end
+if ne get mkSeen r 0
+ret long -13
+end
+put mkSeen r 1
+put mkPerm i r
+put mkInv r i
+if ne r i
+sw = add sw 1
+end
+end
+ret long sw
+end
+
+fn mkCheckDeps n ulong to bool
+for u ulong n bound 2048
+pu = get mkInv u
+v = add u 1
+while lt v n bound 2048
+if mkHasDep u v
+if ge pu get mkInv v
+ret false
+end
+end
+v = add v 1
+end
+end
+ret true
+end
+
+fn mkSumStalls src ulong n ulong to ulong
+tot = ulong 0
+for i ulong n bound 2048
+if eq src 0
+tot = add tot get mkRefRec add mul i 24 2
+else
+tot = add tot get mkCndRec add mul i 24 2
+end
+end
+ret tot
+end
+
+fn mkCheckMagic to bool
+if ne get mkCert 0 72
+ret false
+end
+if ne get mkCert 1 88
+ret false
+end
+if ne get mkCert 2 80
+ret false
+end
+ret eq get mkCert 3 49
+end
+
+fn mkCheckDigests to bool
+for i ulong 32
+if ne get mkRefSha i get mkCert add 8 i
+ret false
+end
+if ne get mkCndSha i get mkCert add 40 i
+ret false
+end
+end
+ret true
+end
+
+fn mkCheckAllFunc n ulong to bool
+for i ulong n bound 2048
+if not mkFuncMatch i get mkPerm i
+ret false
+end
+end
+ret true
+end
+
+fn mkCheckAnchors n ulong to bool
+for i ulong n bound 2048
+if mkIsAnchor i
+if ne get mkPerm i i
+ret false
+end
+end
+end
+ret true
+end
+
+fn main to int
+if ne argcnt 4
+mkWrt mkUse
+ret 90
+end
+rlen = mkReadFile 1 0 32768
+clen = mkReadFile 2 1 32768
+zlen = mkReadFile 3 2 16384
+if or lt rlen 16 or lt clen 16 lt zlen 76
+ret mkReject 11 11
+end
+if not mkCheckMagic
+ret mkReject 11 11
+end
+n = mkRdU32Cert 4
+if or eq n 0 gt n 2048
+ret mkReject 11 11
+end
+if ne ulong rlen mul n 16
+ret mkReject 11 11
+end
+if ne ulong clen mul n 16
+ret mkReject 11 11
+end
+if ne ulong zlen add 72 mul n 4
+ret mkReject 11 11
+end
+mkHashBuf 0 ulong rlen
+mkHashBuf 1 ulong clen
+if not mkCheckDigests
+ret mkReject 12 12
+end
+sw = mkCheckPerm n
+if eq sw long -11
+ret mkReject 11 11
+end
+if eq sw long -13
+ret mkReject 13 13
+end
+if not mkCheckAllFunc n
+ret mkReject 14 14
+end
+if not mkDecodeAll 0 n
+ret mkReject 17 17
+end
+if not mkDecodeAll 1 n
+ret mkReject 17 17
+end
+if not mkCheckAnchors n
+ret mkReject 15 15
+end
+if not mkCheckDeps n
+ret mkReject 16 16
+end
+if not mkCheckHazards n
+ret mkReject 17 17
+end
+mkWrt mkPassA
+mkPrintRungHash
+mkWrt mkPassB
+mkNum n
+mkWrt mkPassC
+mkNum ulong sw
+mkWrt mkPassD
+mkNum mkSumStalls 0 n
+mkWrt mkPassE
+mkNum mkSumStalls 1 n
+mkWrt mkPassF
+ret 0
+end

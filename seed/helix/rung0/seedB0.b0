@@ -1,0 +1,125 @@
+; seedB0.b0 -- Rung B0 of Strand B (The Predator), completely independent of Strand A's seed0.hex.
+; Written by hand as raw little-endian byte pairs (XX = one output byte).
+; Grammar: every two hex digits emit one raw byte to stdout. ';' starts a comment to end of line.
+; Whitespace (space, tab, CR, LF) is skipped. Bad char -> exit 5. Odd trailing nibble -> exit 6.
+; Read error -> exit 7. Write error -> exit 8.
+; Memory model: pure W^X (p_flags = PF_R|PF_X = 5, p_vaddr = 0x500000, p_memsz == p_filesz = 396).
+; Uses stack (sp) for its 1-byte I/O scratch buffer. Zero static writable memory.
+; Instruction encodings from Arm Architecture Reference Manual DDI 0487 M.d.
+
+; ---- ELF-64 file header (64 bytes, 0x00..0x3f) ----
+7f 45 4c 46 02 01 01 00  ; e_ident[0..7]: ELF64 LE v1 SysV
+00 00 00 00 00 00 00 00  ; e_ident[8..15]: padding
+02 00 b7 00 01 00 00 00  ; e_type=ET_EXEC(2), e_machine=EM_AARCH64(183), e_version=1
+78 00 50 00 00 00 00 00  ; e_entry = 0x500078
+40 00 00 00 00 00 00 00  ; e_phoff = 64
+00 00 00 00 00 00 00 00  ; e_shoff = 0
+00 00 00 00 40 00 38 00  ; e_flags = 0, e_ehsize = 64, e_phentsize = 56
+01 00 00 00 00 00 00 00  ; e_phnum = 1, e_shentsize/shnum/shstrndx = 0
+
+; ---- ELF-64 program header (56 bytes, 0x40..0x77) ----
+01 00 00 00 05 00 00 00  ; p_type = PT_LOAD(1), p_flags = PF_R|PF_X (5, W^X!)
+00 00 00 00 00 00 00 00  ; p_offset = 0
+00 00 50 00 00 00 00 00  ; p_vaddr = 0x500000
+00 00 50 00 00 00 00 00  ; p_paddr = 0x500000
+8c 01 00 00 00 00 00 00  ; p_filesz = 396 (0x18c = 120 header + 69*4 code)
+8c 01 00 00 00 00 00 00  ; p_memsz  = 396 (zero BSS; scratch is on sp)
+00 10 00 00 00 00 00 00  ; p_align  = 4096
+
+; ---- AArch64 code (69 instructions, 276 bytes, 0x500078..0x50018b) ----
+; Registers: x10=byte acc, x11=nibble count (0..1), x12=in_comment, x13=sp buf, x14=10
+ff 43 00 d1  ; [0]  sub  sp, sp, #16           C6.2.462 SUB (immediate)
+ed 03 00 91  ; [1]  mov  x13, sp (add sp,#0)   C6.2.5   ADD (immediate)
+0a 00 80 d2  ; [2]  movz x10, #0               C6.2.285 MOVZ
+0b 00 80 d2  ; [3]  movz x11, #0               C6.2.285 MOVZ
+0c 00 80 d2  ; [4]  movz x12, #0               C6.2.285 MOVZ
+4e 01 80 d2  ; [5]  movz x14, #10              C6.2.285 MOVZ
+
+; loop [6]: read 1 byte from stdin into [x13]
+00 00 80 d2  ; [6]  movz x0, #0                C6.2.285 MOVZ (fd 0)
+e1 03 0d aa  ; [7]  orr  x1, xzr, x13          C6.2.302 ORR (mov x1, x13)
+22 00 80 d2  ; [8]  movz x2, #1                C6.2.285 MOVZ (count 1)
+e8 07 80 d2  ; [9]  movz x8, #63               C6.2.285 MOVZ (SYS_read)
+01 00 00 d4  ; [10] svc  #0                    C6.2.466 SVC
+1f 00 00 f1  ; [11] subs xzr, x0, #0           C6.2.464 SUBS (cmp x0, #0)
+00 06 00 54  ; [12] b.eq +48 -> [60] eof       C6.2.34  B.cond EQ
+6b 06 00 54  ; [13] b.lt +51 -> [64] err_read  C6.2.34  B.cond LT
+a0 01 40 39  ; [14] ldrb w0, [x13]             C6.2.220 LDRB (unsigned offset)
+ac 00 00 b4  ; [15] cbz  x12, +5 -> [20]       C6.2.78  CBZ
+
+; inside ';' comment [16..19]
+1f 28 00 71  ; [16] subs wzr, w0, #10 ('\n')   C6.2.464 SUBS
+a1 fe ff 54  ; [17] b.ne -11 -> [6] loop       C6.2.34  B.cond NE
+0c 00 80 d2  ; [18] movz x12, #0               C6.2.285 MOVZ
+f3 ff ff 17  ; [19] b    -13 -> [6] loop       C6.2.35  B
+
+; not in comment [20..23]: check ';' (59)
+1f ec 00 71  ; [20] subs wzr, w0, #59 (';')    C6.2.464 SUBS
+61 00 00 54  ; [21] b.ne +3 -> [24]            C6.2.34  B.cond NE
+2c 00 80 d2  ; [22] movz x12, #1               C6.2.285 MOVZ
+ef ff ff 17  ; [23] b    -17 -> [6] loop       C6.2.35  B
+
+; digits '0'..'9' [24..26]
+01 c0 00 71  ; [24] subs w1, w0, #48 ('0')     C6.2.464 SUBS
+3f 28 00 71  ; [25] subs wzr, w1, #10          C6.2.464 SUBS
+43 02 00 54  ; [26] b.lo +18 -> [44] got_nib   C6.2.34  B.cond LO
+
+; lowercase 'a'..'f' [27..29]
+01 84 01 71  ; [27] subs w1, w0, #97 ('a')     C6.2.464 SUBS
+3f 18 00 71  ; [28] subs wzr, w1, #6           C6.2.464 SUBS
+c3 01 00 54  ; [29] b.lo +14 -> [43] got_hex   C6.2.34  B.cond LO
+
+; uppercase 'A'..'F' [30..32]
+01 04 01 71  ; [30] subs w1, w0, #65 ('A')     C6.2.464 SUBS
+3f 18 00 71  ; [31] subs wzr, w1, #6           C6.2.464 SUBS
+63 01 00 54  ; [32] b.lo +11 -> [43] got_hex   C6.2.34  B.cond LO
+
+; whitespace: space(32), LF(10), TAB(9), CR(13) [33..40]
+1f 80 00 71  ; [33] subs wzr, w0, #32          C6.2.464 SUBS
+80 fc ff 54  ; [34] b.eq -28 -> [6] loop       C6.2.34  B.cond EQ
+1f 28 00 71  ; [35] subs wzr, w0, #10          C6.2.464 SUBS
+40 fc ff 54  ; [36] b.eq -30 -> [6] loop       C6.2.34  B.cond EQ
+1f 24 00 71  ; [37] subs wzr, w0, #9           C6.2.464 SUBS
+00 fc ff 54  ; [38] b.eq -32 -> [6] loop       C6.2.34  B.cond EQ
+1f 34 00 71  ; [39] subs wzr, w0, #13          C6.2.464 SUBS
+c0 fb ff 54  ; [40] b.eq -34 -> [6] loop       C6.2.34  B.cond EQ
+
+; invalid character -> exit 5 [41..42]
+a0 00 80 d2  ; [41] movz x0, #5                C6.2.285 MOVZ
+19 00 00 14  ; [42] b    +25 -> [67] do_exit   C6.2.35  B
+
+; accumulate nibble [43..48]
+21 00 0e 0b  ; [43] add  w1, w1, w14           C6.2.6   ADD (+10 for hex letter)
+4a 6d 1c 53  ; [44] lsl  w10, w10, #4          C6.2.496 UBFM (LSL imm)
+4a 01 01 2a  ; [45] orr  w10, w10, w1          C6.2.302 ORR
+6b 05 00 91  ; [46] add  x11, x11, #1          C6.2.5   ADD (immediate)
+7f 09 00 f1  ; [47] subs xzr, x11, #2          C6.2.464 SUBS
+c1 fa ff 54  ; [48] b.ne -42 -> [6] loop       C6.2.34  B.cond NE
+
+; emit one completed byte [49..59]
+aa 01 00 39  ; [49] strb w10, [x13]            C6.2.419 STRB (unsigned offset)
+20 00 80 d2  ; [50] movz x0, #1                C6.2.285 MOVZ (fd 1)
+e1 03 0d aa  ; [51] orr  x1, xzr, x13          C6.2.302 ORR (mov x1, x13)
+22 00 80 d2  ; [52] movz x2, #1                C6.2.285 MOVZ (count 1)
+08 08 80 d2  ; [53] movz x8, #64               C6.2.285 MOVZ (SYS_write)
+01 00 00 d4  ; [54] svc  #0                    C6.2.466 SVC
+1f 04 00 f1  ; [55] subs xzr, x0, #1           C6.2.464 SUBS
+41 01 00 54  ; [56] b.ne +10 -> [66] err_write C6.2.34  B.cond NE
+0a 00 80 d2  ; [57] movz x10, #0               C6.2.285 MOVZ
+0b 00 80 d2  ; [58] movz x11, #0               C6.2.285 MOVZ
+cb ff ff 17  ; [59] b    -53 -> [6] loop       C6.2.35  B
+
+; eof [60..63]
+00 00 80 d2  ; [60] movz x0, #0                C6.2.285 MOVZ
+cb 00 00 b4  ; [61] cbz  x11, +6 -> [67] exit  C6.2.78  CBZ
+c0 00 80 d2  ; [62] movz x0, #6 (odd nibble)   C6.2.285 MOVZ
+04 00 00 14  ; [63] b    +4 -> [67] do_exit    C6.2.35  B
+
+; err_read [64..65]
+e0 00 80 d2  ; [64] movz x0, #7                C6.2.285 MOVZ
+02 00 00 14  ; [65] b    +2 -> [67] do_exit    C6.2.35  B
+
+; err_write [66] -> falls through to do_exit [67..68]
+00 01 80 d2  ; [66] movz x0, #8                C6.2.285 MOVZ
+a8 0b 80 d2  ; [67] movz x8, #93               C6.2.285 MOVZ (SYS_exit)
+01 00 00 d4  ; [68] svc  #0                    C6.2.466 SVC
