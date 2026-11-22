@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # R16-G2 code-search gate, the entry point named in spec/r16-orchestrator-retirement.md.
-# Builds the C tool (tools/r16_loop_inventory.c) if needed and runs it from the omega
+# Builds the pure OM-2 tool (tools/r16_loop_inventory.om) if needed and runs it from the omega
 # root. Arguments pass through (--map, --json, --skeleton, --patterns). Exit status is
 # the tool's: 0 PASS, 1 FAIL, 2 usage/I-O error.
 set -e

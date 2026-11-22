@@ -998,7 +998,7 @@ test-r15-g15-diag: $(R15_REDUCE) | $(OUT_DIR)
 	R15_REDUCE=$(R15_REDUCE) sh tests/r15_g15_diag_test.sh
 	sh tests/seat_marker_uncached_test.sh
 
-# R16-G2 code-search gate (spec/r16-orchestrator-retirement.md). Host-only C tool,
+# R16-G2 code-search gate (spec/r16-orchestrator-retirement.md). Host-only pure OM-2 tool,
 # seconds, no network. Scans the five repos (paths from R16_REPO_OMEGA,
 # R16_REPO_SOVEREIGN_CORE, R16_REPO_AEGIS_RUNTIME, R16_REPO_AIENOS,
 # R16_REPO_PHYSICS; defaults: this tree and ~/workspace/r16-survey/<repo>) and
@@ -1006,8 +1006,8 @@ test-r15-g15-diag: $(R15_REDUCE) | $(OUT_DIR)
 # Exit 0 only when every site is classified A-F, no omega class-A site is
 # still under a production name, and all five repos were scanned.
 R16_INVENTORY = $(OUT_DIR)/r16_loop_inventory
-$(R16_INVENTORY): tools/r16_loop_inventory.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) -o $@ tools/r16_loop_inventory.c
+$(R16_INVENTORY): tools/r16_loop_inventory.om seed/out/omc | $(OUT_DIR)
+	seed/out/omc < tools/r16_loop_inventory.om > $@ && chmod +x $@
 
 .PHONY: r16-inventory test-r16-inventory
 r16-inventory: $(R16_INVENTORY)
