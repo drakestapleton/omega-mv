@@ -1,51 +1,45 @@
 # DUAL applicability experiment (ARCH-0031 / ADR 0031, offline evidence lane):
 # when is aggregate (macroscopic) load control predictive, and when must
-# discrete per-item scheduling dominate? Standalone: new files only under
+# discrete per-item scheduling dominate? Standalone: pure seeded OM-2 under
 # src/dual_experiment/, tools/dual_experiment/, tests/dual_experiment/,
 # docs/dual/, evidence/DUAL/applicability/. Picked up by `-include mk/*.mk`;
 # not part of `all` or `test`. Nothing in src/runtime/ includes or links it.
 # EXPERIMENT ONLY: no production gate, no production classifier.
 #
-# test-dual-applicability  unit suite (determinism, ledger, predictor, controls),
-#                          plain + ASan/UBSan, plus the purity check
-# dual-applic-purity       nm -u on every src/dual_experiment object
+# test-dual-applicability  unit suite (determinism, ledger, predictor, controls)
+#                          built with seed/out/omc, plus the purity check
+# dual-applic-purity       static purity scan on src/dual_experiment/*.om
 # dual-applic-run          run the campaign, write evidence/DUAL/applicability/
 ifndef DUAL_APPLICABILITY_MK
 DUAL_APPLICABILITY_MK := 1
-include mk/estimation.mk
 .PHONY: test-dual-applicability dual-applic-purity dual-applic-run
-DAP_CFLAGS = $(EST_CFLAGS) -Isrc/dual_experiment
 DAP_DIR = $(OUT_DIR)/dual-applicability
-DAP_SRCS = src/dual_experiment/applic_sim.c src/dual_experiment/applic_predict.c src/dual_experiment/applic_metrics.c src/omega_om_units.c
-DAP_HDRS = src/dual_experiment/applic.h src/dual_experiment/applic_params.h src/sha256.h
+DAP_OMC = seed/out/omc
+DAP_LIB = src/dual_experiment/applic.om
 DAP_EVIDENCE = evidence/DUAL/applicability
+DAP_FORBIDDEN = '\b(rx_[A-Za-z0-9_]*|aienos_[A-Za-z0-9_]*|argus_[A-Za-z0-9_]*|forge_[A-Za-z0-9_]*|aegis[A-Za-z0-9_]*|mmap|mprotect|fork|exec|execprog|execenv|execpure|dlopen|system|socket|socknew|connect|bind|listen|accept|fopen|fclose|read|write|pread|pwrite|unlink|makedir|rmdir|chdir|chmod|chown|killpid|waitpid|pipefds|dupfd|mapnew|devctl|uvmctl|vfioctl|random|monons|realns|sleepns|open)\b'
 
-$(DAP_DIR)/%.o: src/dual_experiment/%.c $(DAP_HDRS)
+# The experiment library is a pure calculator: no authority, World, generation,
+# capability, memory-mapping, process, network or file host words.
+dual-applic-purity: src/dual_experiment/applic.om src/dual_experiment/applic_core.om
+	@for f in src/dual_experiment/*.om; do \
+		if grep -v '^[[:space:]]*note\([[:space:]]\|$$\)' "$$f" | grep -En $(DAP_FORBIDDEN) ; then \
+			echo "dual-applic-purity: $$f references a forbidden operation"; exit 1; \
+		fi; \
+	done
+	@echo "dual-applic-purity: src/dual_experiment/*.om reference no forbidden symbol or host word"
+
+$(DAP_DIR)/test_applic: $(DAP_LIB) tests/dual_experiment/test_applic.om $(DAP_OMC)
 	@mkdir -p $(DAP_DIR)
-	$(CC) $(DAP_CFLAGS) -c -o $@ $<
+	cat $(DAP_LIB) tests/dual_experiment/test_applic.om | $(DAP_OMC) > $@ && chmod +x $@
 
-# The experiment library is a calculator: no authority, World, generation,
-# capability, memory-mapping, process or file operations.
-dual-applic-purity: $(DAP_DIR)/applic_sim.o $(DAP_DIR)/applic_predict.o $(DAP_DIR)/applic_metrics.o
-	@if nm -u $^ | grep -E $(EST_FORBIDDEN) ; then \
-		echo "dual_experiment object references an operation an experiment library must not have"; exit 1; fi
-	@echo "dual-applic-purity: applic_sim.o, applic_predict.o and applic_metrics.o reference no forbidden symbol"
-
-$(DAP_DIR)/test_applic: tests/dual_experiment/test_applic.c $(DAP_SRCS) $(DAP_HDRS)
+$(DAP_DIR)/applic_run: $(DAP_LIB) tools/dual_experiment/applic_run.om $(DAP_OMC)
 	@mkdir -p $(DAP_DIR)
-	$(CC) $(DAP_CFLAGS) -o $@ tests/dual_experiment/test_applic.c $(DAP_SRCS) -lm
-$(DAP_DIR)/test_applic_asan: tests/dual_experiment/test_applic.c $(DAP_SRCS) $(DAP_HDRS)
-	@mkdir -p $(DAP_DIR)
-	$(CC) $(DAP_CFLAGS) $(EST_ASAN) -o $@ tests/dual_experiment/test_applic.c $(DAP_SRCS) -lm
+	cat $(DAP_LIB) tools/dual_experiment/applic_run.om | $(DAP_OMC) > $@ && chmod +x $@
 
-$(DAP_DIR)/applic_run: tools/dual_experiment/applic_run.c $(DAP_SRCS) $(DAP_HDRS)
-	@mkdir -p $(DAP_DIR)
-	$(CC) $(DAP_CFLAGS) -o $@ tools/dual_experiment/applic_run.c $(DAP_SRCS) -lm
-
-test-dual-applicability: dual-applic-purity $(DAP_DIR)/test_applic $(DAP_DIR)/test_applic_asan
+test-dual-applicability: dual-applic-purity $(DAP_DIR)/test_applic
 	./$(DAP_DIR)/test_applic
-	./$(DAP_DIR)/test_applic_asan
-	@echo "test-dual-applicability: determinism, ledger, predictor and negative-control checks pass in plain and ASan/UBSan builds"
+	@echo "test-dual-applicability: determinism, ledger, predictor and negative-control checks pass (pure seeded OM-2)"
 
 dual-applic-run: $(DAP_DIR)/applic_run
 	@mkdir -p $(DAP_EVIDENCE)

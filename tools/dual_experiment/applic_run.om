@@ -1,0 +1,692 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note DUAL applicability experiment runner (pure seeded OM-2, composed after
+note src/dual_experiment/applic.om). Exact port of applic_run.c:
+note Usage: applic_run [out_dir]
+note Writes <out_dir>/results.csv, params.txt, results.md and prints summary to stdout.
+
+global ar_dir uchar 512
+global ar_path uchar 1024
+global ar_io uchar 4096
+global ar_fd int 2
+global ar_dir_len ulong 1
+
+note accumulator storage for section_per_workload (13 accs x 3 f64 = 39)
+note each acc: [sum, sum2, n]
+global ar_acc f64 39
+global ar_v1 f64 192
+global ar_v2 f64 192
+global ar_vc f64 192
+
+text ar_t_defdir "evidence/DUAL/applicability"
+text ar_t_csv "/results.csv"
+text ar_t_par "/params.txt"
+text ar_t_md "/results.md"
+text ar_t_err_camp "campaign failed (ledger or pool)\n"
+text ar_t_err_open "cannot write output file\n"
+text ar_t_wrote1 "wrote "
+text ar_t_wrote2 "/results.csv, params.txt, results.md\n"
+
+text ar_t_h1 "# DUAL applicability experiment: results (DUAL-APPLIC-V1)\n\n"
+text ar_t_h2 "EXPERIMENTAL. Synthetic workloads. Not a production gate, not a production classifier. Nothing inserted into production.\n\n"
+text ar_t_h3 "- parameter digest (SHA-256 of params.txt): `"
+text ar_t_h4 "`\n- results digest (SHA-256 of results.csv text): `"
+text ar_t_h5 "`\n- runs: 192 (8 workloads x 24 seeds), 100 windows of 20 steps each, 5 warm-up windows unscored\n\n"
+
+text ar_t_s1a "## 1. Aggregate predictor error per workload (mean over seeds, sd in parentheses)\n\n"
+text ar_t_s1b "| workload | completions NRMSE (primary) | known-arrivals completions NRMSE | queue RMSE | blocked RMSE | composite | known-arrivals composite | shuffled composite | cv_demand | top5 share | max item share | class entropy | arrival cv | rejected/run |\n"
+text ar_t_s1c "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+
+text ar_t_s2a "\n## 2. Correlation of aggregate prediction error with heterogeneity measurements (Pearson r over all 192 runs)\n\n"
+text ar_t_s2b "| measurement | r vs completions NRMSE (primary) | r vs known-arrivals completions NRMSE | r vs queue RMSE | r vs blocked RMSE | r vs composite | covariance vs completions NRMSE | note |\n|---|---|---|---|---|---|---|---|\n"
+text ar_t_m0 "cv_demand"
+text ar_t_m1 "top5_share"
+text ar_t_m2 "max_item_share"
+text ar_t_m3 "class_entropy"
+text ar_t_m4 "arrival_cv"
+text ar_t_m5 "broken_const (control)"
+text ar_t_m6 "broken_noise (control)"
+text ar_t_n5 "zero variance: covariance exactly 0, r reported as 0"
+text ar_t_n6 "independent of the run: expected near 0"
+
+text ar_t_s2ba "\n## 2b. Heterogeneity sweep (workload h only, 24 runs, offered load held at 0.80, spread rises with seed index)\n\n"
+text ar_t_s2bb "- r(cv_demand, completions NRMSE) = "
+text ar_t_s2bc "; r(cv_demand, known-arrivals completions NRMSE) = "
+text ar_t_s2bd "\n- r(top5_share, completions NRMSE) = "
+text ar_t_s2be "; r(top5_share, known-arrivals completions NRMSE) = "
+text ar_t_s2bf "\n\n| seed_index | sigma | cv_demand | top5 share | max item share | completions NRMSE | known-arrivals completions NRMSE | blocked RMSE |\n|---|---|---|---|---|---|---|---|\n"
+
+text ar_t_s3a "\n## 3. Negative control: shuffled-window predictor must be worse than the real predictor\n\n"
+text ar_t_s3b "| workload | runs where shuffled composite > real composite | mean real composite | mean shuffled composite |\n|---|---|---|---|\n"
+text ar_t_s3c "\nshuffled worse in "
+text ar_t_s3d " / 192 runs: "
+text ar_t_s3p "CONTROL PASS (majority)\n"
+text ar_t_s3f "CONTROL FAIL\n"
+
+text ar_t_s4a "\n## 4. Regime grid (pre-registered thresholds): PRIMARY measure = completions NRMSE of runs with cv_demand < Y and top5 share < Z (composite beside it)\n\n"
+text ar_t_s4b "| Y (cv) | Z (top5) | runs | mean completions NRMSE | p90 | max | mean composite | p90 composite | runs also arrival_cv < 0.50 | p90 completions NRMSE (that subset) |\n|---|---|---|---|---|---|---|---|---|---|\n"
+text ar_t_s4c "\ncomplement (cv >= 1.2 or top5 >= 0.30): "
+text ar_t_s4d " runs, mean completions NRMSE "
+text ar_t_s4e ", p10 "
+text ar_t_s4f ", p90 "
+text ar_t_s4g "temporal complement (arrival_cv >= 0.50): "
+text ar_t_verd "\nVerdict line: EXPERIMENTAL; recommends a future regime classifier; nothing inserted into production.\n"
+
+text ar_t_bar "| "
+text ar_t_sep " | "
+text ar_t_end " |\n"
+text ar_t_lp " ("
+text ar_t_rp ")"
+text ar_t_sl " / "
+
+fn ar_write_fd fd int n ulong to void
+  off = ulong 0
+  while lt off n bound 256
+    k = write fd ar_io off sub n off
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn ar_emit_io n ulong to void
+  ar_write_fd int 1 n
+  mfd = get ar_fd 0
+  if ge mfd 0
+    ar_write_fd mfd n
+  end
+end
+
+fn ar_emit_txt s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    put ar_io i get s i
+  end
+  ar_emit_io n
+end
+
+fn ar_emit_buf buf view uchar * n ulong to void
+  for i ulong n bound 4096
+    put ar_io i get buf i
+  end
+  ar_emit_io n
+end
+
+fn ar_open_out suffix view uchar * to int
+  dlen = get ar_dir_len 0
+  for i ulong dlen bound 512
+    put ar_path i get ar_dir i
+  end
+  sn = len suffix
+  for i ulong sn bound 64
+    put ar_path add dlen i get suffix i
+  end
+  tot = add dlen sn
+  note O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420
+  fd = fopen ar_path 0 tot int 577 int 420
+  if lt fd 0
+    ret int -1
+  end
+  ret int fd
+end
+
+fn ar_acc_reset to void
+  for i ulong 39
+    put ar_acc i 0.0f64
+  end
+end
+
+fn ar_acc_add idx ulong x f64 to void
+  b = mul idx 3
+  put ar_acc b add get ar_acc b x
+  put ar_acc add b 1 add get ar_acc add b 1 mul x x
+  put ar_acc add b 2 add get ar_acc add b 2 1.0f64
+end
+
+fn ar_acc_mean idx ulong to f64
+  b = mul idx 3
+  n = get ar_acc add b 2
+  if le n 0.0f64
+    ret 0.0f64
+  end
+  ret div get ar_acc b n
+end
+
+fn ar_acc_sd idx ulong to f64
+  b = mul idx 3
+  n = get ar_acc add b 2
+  if le n 0.0f64
+    ret 0.0f64
+  end
+  m = div get ar_acc b n
+  v = sub div get ar_acc add b 1 n mul m m
+  if gt v 0.0f64
+    ret fsqrt v
+  end
+  ret 0.0f64
+end
+
+fn ar_sort_f64 a edit f64 * n ulong to void
+  if lt n 2
+    ret
+  end
+  i = ulong 1
+  while lt i n bound 256
+    key = get a i
+    j = i
+    while gt j 0 bound 256
+      prev = get a sub j 1
+      if le prev key
+        break
+      end
+      put a j prev
+      j = sub j 1
+    end
+    put a j key
+    i = add i 1
+  end
+end
+
+fn ar_quantile a edit f64 * n ulong q f64 to f64
+  if eq n 0
+    ret 0.0f64
+  end
+  ar_sort_f64 a n
+  k = ulong add mul q f64 sub n 1 0.5f64
+  if ge k n
+    k = sub n 1
+  end
+  ret get a k
+end
+
+fn ar_buf_ms dst edit uchar * pos ulong idx ulong to ulong
+  p = pos
+  p = ap_buf_f64 dst p ar_acc_mean idx 3 false
+  p = ap_buf_copy dst p ar_t_lp
+  p = ap_buf_f64 dst p ar_acc_sd idx 3 false
+  p = ap_buf_copy dst p ar_t_rp
+  ret p
+end
+
+fn ar_section_per_workload to void
+  buf = new uchar 512 0
+  ar_emit_txt ar_t_s1a
+  ar_emit_txt ar_t_s1b
+  ar_emit_txt ar_t_s1c
+  for wl ulong AP_WL_COUNT
+    ar_acc_reset
+    for j ulong AP_NROWS
+      if eq get ap_row_u mul j 7 wl
+        rfb = mul j 19
+        ar_acc_add 0 get ap_row_f rfb
+        ar_acc_add 1 get ap_row_f add rfb 4
+        ar_acc_add 2 get ap_row_f add rfb 1
+        ar_acc_add 3 get ap_row_f add rfb 2
+        ar_acc_add 4 get ap_row_f add rfb 3
+        ar_acc_add 5 get ap_row_f add rfb 7
+        ar_acc_add 6 get ap_row_f add rfb 11
+        ar_acc_add 7 get ap_row_f add rfb 12
+        ar_acc_add 8 get ap_row_f add rfb 13
+        ar_acc_add 9 get ap_row_f add rfb 14
+        ar_acc_add 10 get ap_row_f add rfb 15
+        ar_acc_add 11 get ap_row_f add rfb 16
+        ar_acc_add 12 f64 get ap_row_u add mul j 7 5
+      end
+    end
+    p = ulong 0
+    p = ap_buf_copy buf p ar_t_bar
+    p = ap_buf_wl_name buf p wl
+    for c ulong 7
+      p = ap_buf_copy buf p ar_t_sep
+      p = ar_buf_ms buf p c
+    end
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 7 3 false
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 8 3 false
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 9 4 false
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 10 3 false
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 11 3 false
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 12 1 false
+    p = ap_buf_copy buf p ar_t_end
+    ar_emit_buf buf p
+  end
+end
+
+fn ar_buf_mname dst edit uchar * pos ulong m ulong to ulong
+  if eq m 0
+    ret ap_buf_copy dst pos ar_t_m0
+  end
+  if eq m 1
+    ret ap_buf_copy dst pos ar_t_m1
+  end
+  if eq m 2
+    ret ap_buf_copy dst pos ar_t_m2
+  end
+  if eq m 3
+    ret ap_buf_copy dst pos ar_t_m3
+  end
+  if eq m 4
+    ret ap_buf_copy dst pos ar_t_m4
+  end
+  if eq m 5
+    ret ap_buf_copy dst pos ar_t_m5
+  end
+  ret ap_buf_copy dst pos ar_t_m6
+end
+
+fn ar_corr_row m ulong to void
+  xs = new f64 192 0.0f64
+  ys = new f64 192 0.0f64
+  for i ulong AP_NROWS
+    put xs i get ap_row_f add mul i 19 add 12 m
+  end
+  buf = new uchar 512 0
+  p = ulong 0
+  p = ap_buf_copy buf p ar_t_bar
+  p = ar_buf_mname buf p m
+  for i ulong AP_NROWS
+    put ys i get ap_row_f mul i 19
+  end
+  rn = ap_pearson xs ys AP_NROWS
+  cov = get ap_pearson_f 1
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p rn 3 true
+  for i ulong AP_NROWS
+    put ys i get ap_row_f add mul i 19 4
+  end
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p ap_pearson xs ys AP_NROWS 3 true
+  for i ulong AP_NROWS
+    put ys i get ap_row_f add mul i 19 1
+  end
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p ap_pearson xs ys AP_NROWS 3 true
+  for i ulong AP_NROWS
+    put ys i get ap_row_f add mul i 19 2
+  end
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p ap_pearson xs ys AP_NROWS 3 true
+  for i ulong AP_NROWS
+    put ys i get ap_row_f add mul i 19 3
+  end
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p ap_pearson xs ys AP_NROWS 3 true
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p cov 6 true
+  p = ap_buf_copy buf p ar_t_sep
+  if eq m 5
+    p = ap_buf_copy buf p ar_t_n5
+  end
+  if eq m 6
+    p = ap_buf_copy buf p ar_t_n6
+  end
+  p = ap_buf_copy buf p ar_t_end
+  ar_emit_buf buf p
+end
+
+fn ar_section_correlations to void
+  ar_emit_txt ar_t_s2a
+  ar_emit_txt ar_t_s2b
+  for m ulong 7
+    ar_corr_row m
+  end
+end
+
+fn ar_section_sweep to void
+  ar_emit_txt ar_t_s2ba
+  sx = new f64 24 0.0f64
+  st = new f64 24 0.0f64
+  sy = new f64 24 0.0f64
+  sk = new f64 24 0.0f64
+  k = ulong 0
+  for i ulong AP_NROWS
+    if and eq get ap_row_u mul i 7 7 lt k AP_SEEDS
+      rfb = mul i 19
+      put sx k get ap_row_f add rfb 12
+      put st k get ap_row_f add rfb 13
+      put sy k get ap_row_f rfb
+      put sk k get ap_row_f add rfb 4
+      k = add k 1
+    end
+  end
+  buf = new uchar 512 0
+  p = ulong 0
+  p = ap_buf_copy buf p ar_t_s2bb
+  p = ap_buf_f64 buf p ap_pearson sx sy k 3 true
+  p = ap_buf_copy buf p ar_t_s2bc
+  p = ap_buf_f64 buf p ap_pearson sx sk k 3 true
+  p = ap_buf_copy buf p ar_t_s2bd
+  p = ap_buf_f64 buf p ap_pearson st sy k 3 true
+  p = ap_buf_copy buf p ar_t_s2be
+  p = ap_buf_f64 buf p ap_pearson st sk k 3 true
+  ar_emit_buf buf p
+  ar_emit_txt ar_t_s2bf
+  for i ulong AP_NROWS
+    if eq get ap_row_u mul i 7 7
+      si = get ap_row_u add mul i 7 1
+      rfb = mul i 19
+      p = ulong 0
+      p = ap_buf_copy buf p ar_t_bar
+      p = ap_buf_u64 buf p si
+      p = ap_buf_copy buf p ar_t_sep
+      p = ap_buf_f64 buf p ap_sweep_sigma si 3 false
+      p = ap_buf_copy buf p ar_t_sep
+      p = ap_buf_f64 buf p get ap_row_f add rfb 12 3 false
+      p = ap_buf_copy buf p ar_t_sep
+      p = ap_buf_f64 buf p get ap_row_f add rfb 13 3 false
+      p = ap_buf_copy buf p ar_t_sep
+      p = ap_buf_f64 buf p get ap_row_f add rfb 14 4 false
+      p = ap_buf_copy buf p ar_t_sep
+      p = ap_buf_f64 buf p get ap_row_f rfb 3 false
+      p = ap_buf_copy buf p ar_t_sep
+      p = ap_buf_f64 buf p get ap_row_f add rfb 4 3 false
+      p = ap_buf_copy buf p ar_t_sep
+      p = ap_buf_f64 buf p get ap_row_f add rfb 2 3 false
+      p = ap_buf_copy buf p ar_t_end
+      ar_emit_buf buf p
+    end
+  end
+end
+
+fn ar_section_shuffled to void
+  ar_emit_txt ar_t_s3a
+  ar_emit_txt ar_t_s3b
+  wtot = ulong 0
+  buf = new uchar 256 0
+  for wl ulong AP_WL_COUNT
+    worse = ulong 0
+    cnt = ulong 0
+    ar_acc_reset
+    for j ulong AP_NROWS
+      if eq get ap_row_u mul j 7 wl
+        rfb = mul j 19
+        cnt = add cnt 1
+        rc = get ap_row_f add rfb 3
+        sc = get ap_row_f add rfb 11
+        ar_acc_add 0 rc
+        ar_acc_add 1 sc
+        if gt sc rc
+          worse = add worse 1
+        end
+      end
+    end
+    wtot = add wtot worse
+    p = ulong 0
+    p = ap_buf_copy buf p ar_t_bar
+    p = ap_buf_wl_name buf p wl
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_u64 buf p worse
+    p = ap_buf_copy buf p ar_t_sl
+    p = ap_buf_u64 buf p cnt
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 0 3 false
+    p = ap_buf_copy buf p ar_t_sep
+    p = ap_buf_f64 buf p ar_acc_mean 1 3 false
+    p = ap_buf_copy buf p ar_t_end
+    ar_emit_buf buf p
+  end
+  p = ulong 0
+  p = ap_buf_copy buf p ar_t_s3c
+  p = ap_buf_u64 buf p wtot
+  p = ap_buf_copy buf p ar_t_s3d
+  if gt mul wtot 2 AP_NROWS
+    p = ap_buf_copy buf p ar_t_s3p
+  else
+    p = ap_buf_copy buf p ar_t_s3f
+  end
+  ar_emit_buf buf p
+end
+
+fn ar_grid_emit gcv f64 gtop f64 k ulong k2 ulong to void
+  buf = new uchar 256 0
+  p = ulong 0
+  p = ap_buf_copy buf p ar_t_bar
+  p = ap_buf_f64 buf p gcv 1 false
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p gtop 2 false
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_u64 buf p k
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p ar_acc_mean 0 3 false
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p get ar_acc 6 3 false
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p get ar_acc 7 3 false
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p ar_acc_mean 1 3 false
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p get ar_acc 8 3 false
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_u64 buf p k2
+  p = ap_buf_copy buf p ar_t_sep
+  p = ap_buf_f64 buf p get ar_acc 9 3 false
+  p = ap_buf_copy buf p ar_t_end
+  ar_emit_buf buf p
+end
+
+fn ar_grid_cell gcv f64 gtop f64 to void
+  v1 = new f64 192 0.0f64
+  v2 = new f64 192 0.0f64
+  vc = new f64 192 0.0f64
+  k = ulong 0
+  k2 = ulong 0
+  mx = 0.0f64
+  ar_acc_reset
+  for j ulong AP_NROWS
+    rfb = mul j 19
+    if lt get ap_row_f add rfb 12 gcv
+      if lt get ap_row_f add rfb 13 gtop
+        cn = get ap_row_f rfb
+        cm = get ap_row_f add rfb 3
+        put v1 k cn
+        put vc k cm
+        k = add k 1
+        ar_acc_add 0 cn
+        ar_acc_add 1 cm
+        if gt cn mx
+          mx = cn
+        end
+        if lt get ap_row_f add rfb 16 0.5f64
+          put v2 k2 cn
+          k2 = add k2 1
+        end
+      end
+    end
+  end
+  put ar_acc 6 ar_quantile v1 k 0.9f64
+  put ar_acc 7 mx
+  put ar_acc 8 ar_quantile vc k 0.9f64
+  put ar_acc 9 ar_quantile v2 k2 0.9f64
+  ar_grid_emit gcv gtop k k2
+end
+
+fn ar_grid_comp_emit lbl view uchar * k ulong p10 f64 p90 f64 to void
+  buf = new uchar 256 0
+  p = ulong 0
+  p = ap_buf_copy buf p lbl
+  p = ap_buf_u64 buf p k
+  p = ap_buf_copy buf p ar_t_s4d
+  p = ap_buf_f64 buf p ar_acc_mean 0 3 false
+  p = ap_buf_copy buf p ar_t_s4e
+  p = ap_buf_f64 buf p p10 3 false
+  p = ap_buf_copy buf p ar_t_s4f
+  p = ap_buf_f64 buf p p90 3 false
+  p = ap_buf_byte buf p uchar 10
+  ar_emit_buf buf p
+end
+
+fn ar_grid_complements to void
+  v = new f64 192 0.0f64
+  k = ulong 0
+  ar_acc_reset
+  for j ulong AP_NROWS
+    rfb = mul j 19
+    ok = false
+    if ge get ap_row_f add rfb 12 1.2f64
+      ok = true
+    end
+    if ge get ap_row_f add rfb 13 0.30f64
+      ok = true
+    end
+    if ok
+      cn = get ap_row_f rfb
+      put v k cn
+      k = add k 1
+      ar_acc_add 0 cn
+    end
+  end
+  ar_grid_comp_emit ar_t_s4c k ar_quantile v k 0.1f64 ar_quantile v k 0.9f64
+  k = ulong 0
+  ar_acc_reset
+  for j ulong AP_NROWS
+    rfb = mul j 19
+    if ge get ap_row_f add rfb 16 0.5f64
+      cn = get ap_row_f rfb
+      put v k cn
+      k = add k 1
+      ar_acc_add 0 cn
+    end
+  end
+  ar_grid_comp_emit ar_t_s4g k ar_quantile v k 0.1f64 ar_quantile v k 0.9f64
+end
+
+fn ar_section_grid to void
+  ar_emit_txt ar_t_s4a
+  ar_emit_txt ar_t_s4b
+  gcv = new f64 3 0.0f64
+  gtop = new f64 3 0.0f64
+  put gcv 0 0.4f64
+  put gcv 1 0.8f64
+  put gcv 2 1.2f64
+  put gtop 0 0.10f64
+  put gtop 1 0.20f64
+  put gtop 2 0.30f64
+  for a ulong 3
+    for b ulong 3
+      ar_grid_cell get gcv a get gtop b
+    end
+  end
+  ar_grid_complements
+end
+
+fn ar_write_csv_file to int
+  fd = ar_open_out ar_t_csv
+  if lt fd 0
+    ret int -1
+  end
+  hn = ap_row_header_to_line
+  for i ulong hn bound 512
+    put ar_io i get ap_line_buf i
+  end
+  put ar_io hn uchar 10
+  ar_write_fd fd add hn 1
+  for r ulong AP_NROWS
+    ln = ap_row_format_to_line 0 r
+    for i ulong ln bound 512
+      put ar_io i get ap_line_buf i
+    end
+    put ar_io ln uchar 10
+    ar_write_fd fd add ln 1
+  end
+  cl = fclose fd
+  ret int 0
+end
+
+fn ar_write_params_file to int
+  fd = ar_open_out ar_t_par
+  if lt fd 0
+    ret int -1
+  end
+  pn = ap_params_text_to_pbuf
+  for i ulong pn bound 2048
+    put ar_io i get ap_pbuf i
+  end
+  ar_write_fd fd pn
+  cl = fclose fd
+  ret int 0
+end
+
+fn ar_err_die msg view uchar * to void
+  n = len msg
+  for i ulong n bound 256
+    put ar_io i get msg i
+  end
+  ar_write_fd int 2 n
+end
+
+fn main to int
+  put ar_fd 0 int -1
+  ac = argcnt
+  if gt ac 1
+    al = argread 1 ar_dir 0 512
+    if le al 0
+      ar_err_die ar_t_err_open
+      ret int 2
+    end
+    put ar_dir_len 0 ulong al
+  else
+    dn = len ar_t_defdir
+    for i ulong dn bound 64
+      put ar_dir i get ar_t_defdir i
+    end
+    put ar_dir_len 0 dn
+  end
+  if ne ap_campaign 0 0 0
+    ar_err_die ar_t_err_camp
+    ret int 2
+  end
+  if lt ar_write_csv_file 0
+    ar_err_die ar_t_err_open
+    ret int 2
+  end
+  if lt ar_write_params_file 0
+    ar_err_die ar_t_err_open
+    ret int 2
+  end
+  mfd = ar_open_out ar_t_md
+  if lt mfd 0
+    ar_err_die ar_t_err_open
+    ret int 2
+  end
+  put ar_fd 0 mfd
+  ar_emit_txt ar_t_h1
+  ar_emit_txt ar_t_h2
+  ar_emit_txt ar_t_h3
+  pd = new uchar 32 0
+  hx = new uchar 64 0
+  ap_params_digest pd
+  p1 = ap_buf_hex32 hx 0 pd
+  ar_emit_buf hx 64
+  ar_emit_txt ar_t_h4
+  rd = new uchar 32 0
+  ap_rows_digest 0 AP_NROWS rd
+  p2 = ap_buf_hex32 hx 0 rd
+  ar_emit_buf hx 64
+  ar_emit_txt ar_t_h5
+  ar_section_per_workload
+  ar_section_correlations
+  ar_section_sweep
+  ar_section_shuffled
+  ar_section_grid
+  ar_emit_txt ar_t_verd
+  cl = fclose mfd
+  put ar_fd 0 int -1
+  buf = new uchar 600 0
+  p = ulong 0
+  p = ap_buf_copy buf p ar_t_wrote1
+  dlen = get ar_dir_len 0
+  for i ulong dlen bound 512
+    put buf add p i get ar_dir i
+  end
+  p = add p dlen
+  p = ap_buf_copy buf p ar_t_wrote2
+  ar_emit_buf buf p
+  ret int 0
+end

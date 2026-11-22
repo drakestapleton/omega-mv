@@ -1,0 +1,1648 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note DUAL applicability experiment (ARCH-0031 / ADR 0031, offline evidence lane):
+note pure seeded OM-2 simulator, aggregate (macroscopic) predictor, heterogeneity
+note measurements, campaign driver, canonical formatting, SHA-256 digests, and
+note Pearson correlation. Zero heap, zero syscalls, zero host words.
+om2
+
+note ---- pre-registered experiment constants (DUAL-APPLIC-V1) ----
+const AP_WINDOW ulong 20
+const AP_WINDOWS ulong 100
+const AP_STEPS ulong 2000
+const AP_WARMUP_WINDOWS ulong 5
+
+const AP_SLOTS ulong 32
+const AP_MEMORY ulong 1024
+const AP_MAX_QUEUE ulong 256
+const AP_CLASSES ulong 4
+const AP_MAX_ITEMS ulong 32768
+
+const AP_HOM_DEMAND_MIN ulong 11
+const AP_HOM_DEMAND_MAX ulong 13
+const AP_HOM_MEM_MIN ulong 16
+const AP_HOM_MEM_MAX ulong 24
+const AP_HOM_SLOTS ulong 1
+
+const AP_HET_DEMAND_CAP ulong 400
+const AP_HET_MEM_BASE ulong 8
+
+const AP_SQUARE_HALF_PERIOD ulong 100
+const AP_BURST_MIN ulong 15
+const AP_BURST_MAX ulong 35
+const AP_CAP_DROP_SLOTS ulong 20
+const AP_SWITCH_STEP ulong 1000
+
+const AP_WL_COUNT ulong 8
+const AP_SEEDS ulong 24
+const AP_NROWS ulong 192
+const AP_SEED_BASE ulong 0x4455414c2d415031
+
+note ---- slot-indexed state (2 sim slots, 2 row-table slots) ----
+note sim_u layout (stride 20 per slot):
+note  0:n_items 1:queue_len 2:running_len 3:used_slots 4:used_mem
+note  5:slots_capacity 6:arrived 7:completed 8:rejected 9:pool_exhausted
+note 10:n_completed_stats 11:n_windows 12:rng_s 13:wl 14:step
+note 15:w_arrivals 16:w_completions 17:w_blocked 18:w_rejected
+global ap_sim_u ulong 40
+
+note sim_f layout (stride 5 per slot):
+note  0:sum_demand 1:sum_slots 2:sum_mem 3:het_sigma 4:sweep_rate
+global ap_sim_f f64 10
+
+note items arrays (stride 32768 per slot)
+global ap_it_arr uint 65536
+global ap_it_dem uint 65536
+global ap_it_rem uint 65536
+global ap_it_mem uint 65536
+global ap_it_slt uint 65536
+global ap_it_cls uint 65536
+
+note queue (stride 256 per slot) and running (stride 32 per slot)
+global ap_queue uint 512
+global ap_run uint 64
+
+note windows (stride 100 windows per slot):
+note win_f stride 6: 0:used_slots_frac 1:used_mem_frac 2:queue_density 3:mean_demand 4:mean_slots 5:mean_mem
+note win_u stride 8: 0:arrivals 1:completions 2:blocked_steps 3:rejected 4:in_system 5:queue_len 6:running 7:slots_capacity
+global ap_win_f f64 1200
+global ap_win_u ulong 1600
+
+note scratch index array for heapsort in ap_measure
+global ap_idx uint 32768
+
+note campaign rows (2 slots x 192 rows = 384 rows):
+note row_u stride 7: 0:wl 1:seed_index 2:seed 3:arrived 4:completed 5:rejected 6:windows
+note row_f stride 19:
+note   0..3:  real (completions_nrmse, queue_rmse, blocked_rmse, composite)
+note   4..7:  known_arrivals (completions_nrmse, queue_rmse, blocked_rmse, composite)
+note   8..11: shuffled (completions_nrmse, queue_rmse, blocked_rmse, composite)
+note  12..18: hetero (cv_demand, top_share, max_item_share, class_entropy, arrival_cv, broken_const, broken_noise)
+global ap_row_u ulong 2688
+global ap_row_f f64 7296
+
+note temporary single-window/prediction/error/hetero/pearson buffers
+global ap_pred_f f64 3
+global ap_err_f f64 4
+global ap_err_w ulong 1
+global ap_se_acc f64 4
+global ap_het_f f64 7
+global ap_pearson_f f64 2
+
+note streaming SHA-256 state
+global ap_sha_h ulong 8
+global ap_sha_w ulong 64
+global ap_sha_k ulong 64
+global ap_sha_blk uchar 64
+global ap_sha_st ulong 3
+
+note scratch formatting buffers
+global ap_line_buf uchar 512
+global ap_pbuf uchar 2048
+
+note ---- canonical text literals ----
+text ap_t_hex "0123456789abcdef"
+text ap_t_wl0 "a_homogeneous"
+text ap_t_wl1 "b_heterogeneous"
+text ap_t_wl2 "c_step"
+text ap_t_wl3 "d_square_wave"
+text ap_t_wl4 "e_bursty"
+text ap_t_wl5 "f_capacity_drop"
+text ap_t_wl6 "g_regime_change"
+text ap_t_wl7 "h_hetero_sweep"
+text ap_t_wlq "?"
+
+text ap_t_hdr0 "workload,seed_index,seed,arrived,completed,rejected,windows,"
+text ap_t_hdr1 "err_completions_nrmse,err_queue_rmse,err_blocked_rmse,err_composite,"
+text ap_t_hdr2 "known_completions_nrmse,known_queue_rmse,known_blocked_rmse,known_composite,"
+text ap_t_hdr3 "shuf_completions_nrmse,shuf_queue_rmse,shuf_blocked_rmse,shuf_composite,"
+text ap_t_hdr4 "cv_demand,top5_share,max_item_share,class_entropy,arrival_cv,broken_const,broken_noise"
+
+text ap_t_par0 "experiment=DUAL-APPLIC-V1\nwindow=20\nwindows=100\nwarmup_windows=5\nslots=32\nmemory=1024\nmax_queue=256\nclasses=4\nmax_items=32768\n"
+text ap_t_par1 "hom_demand=11..13\nhom_mem=16..24\nhom_slots=1\n"
+text ap_t_par2 "het_ln_median=1.791759469228055\nhet_sigma=1.2\nhet_demand_cap=400\nhet_slots_p=0.700000,0.900000\nhet_mem_base=8\nhet_mem_span=120.000000\nhet_class_p=0.550000,0.800000,0.950000\n"
+text ap_t_par3 "rate_hom=2.200000\nrate_het=1.200000\nstep_rate=1.000000,3.000000\nsquare_rate=0.800000,3.200000\nsquare_half_period=100\n"
+text ap_t_par4 "burst_p=0.080000\nburst_size=15..35\nburst_background=0.400000\ncap_drop_slots=20\nswitch_step=1000\n"
+text ap_t_par5 "sweep_sigma=0.000000..1.500000\nsweep_load=0.800000\nhet_mean_slots=1.700000\n"
+text ap_t_par6 "prior_demand=12.000000\nprior_slots=1.000000\nprior_mem=20.000000\n"
+text ap_t_par7 "seeds=24\nseed_base=4455414c2d415031\ntop_share_fraction=0.050000\n"
+text ap_t_par8 "grid_cv=0.400000,0.800000,1.200000\ngrid_top=0.100000,0.200000,0.300000\ngrid_arrival_cv=0.500000\nbroken_const=0.500000\n"
+text ap_t_par9 "blocked_ramp_start=0.750000\npredictor=flow_balance_v2\nerror=completions_nrmse,queue_rmse,blocked_rmse,composite_mean\nprimary_measure=completions_nrmse\n"
+
+note ---- IEEE-754 math helpers (pure f64) ----
+fn ap_isfinite x f64 to bool
+  b = bitcast ulong x
+  eb = and shr b 52 2047
+  ret lt eb 2047
+end
+
+fn ap_clamp01 x f64 to f64
+  if lt x 0.0f64
+    ret 0.0f64
+  end
+  if gt x 1.0f64
+    ret 1.0f64
+  end
+  ret x
+end
+
+fn ap_exp x f64 to f64
+  if ne x x
+    ret x
+  end
+  if gt x 709.782712893384f64
+    ret bitcast f64 ulong 9218868437227405312
+  end
+  if lt x -745.1332191019412f64
+    ret 0.0f64
+  end
+  kf = mul x 1.4426950408889634f64
+  if ge kf 0.0f64
+    kf = add kf 0.5f64
+  else
+    kf = sub kf 0.5f64
+  end
+  k = long kf
+  fk = f64 k
+  r = sub sub x mul fk 0.6931471803691238f64 mul fk 1.9082149292705877e-10f64
+  p = add mul r 1.6059043836821613e-10f64 2.08767569878681e-9f64
+  p = add mul p r 2.505210838544172e-8f64
+  p = add mul p r 2.755731922398589e-7f64
+  p = add mul p r 2.7557319223985893e-6f64
+  p = add mul p r 0.0000248015873015873f64
+  p = add mul p r 0.0001984126984126984f64
+  p = add mul p r 0.001388888888888889f64
+  p = add mul p r 0.008333333333333333f64
+  p = add mul p r 0.041666666666666664f64
+  p = add mul p r 0.16666666666666666f64
+  p = add mul p r 0.5f64
+  p = add mul p r 1.0f64
+  p = add mul p r 1.0f64
+  k1 = div k 2
+  k2 = sub k k1
+  s1 = bitcast f64 shl ulong add k1 1023 52
+  s2 = bitcast f64 shl ulong add k2 1023 52
+  ret mul mul p s1 s2
+end
+
+fn ap_log x f64 to f64
+  if ne x x
+    ret x
+  end
+  if lt x 0.0f64
+    ret bitcast f64 ulong 9221120237041090560
+  end
+  if eq x 0.0f64
+    ret bitcast f64 ulong 18442240474082181120
+  end
+  b = bitcast ulong x
+  if eq b 9218868437227405312
+    ret x
+  end
+  e = long 0
+  if lt b 4503599627370496
+    b = bitcast ulong mul x 18014398509481984.0f64
+    e = long -54
+  end
+  e = add e sub long shr b 52 1023
+  m = bitcast f64 or and b 4503599627370495 4607182418800017408
+  if gt m 1.4142135623730951f64
+    m = mul m 0.5f64
+    e = add e 1
+  end
+  f = sub m 1.0f64
+  s = div f add f 2.0f64
+  z = mul s s
+  q = add mul z 0.043478260869565216f64 0.047619047619047616f64
+  q = add mul q z 0.05263157894736842f64
+  q = add mul q z 0.058823529411764705f64
+  q = add mul q z 0.06666666666666667f64
+  q = add mul q z 0.07692307692307693f64
+  q = add mul q z 0.09090909090909091f64
+  q = add mul q z 0.1111111111111111f64
+  q = add mul q z 0.14285714285714285f64
+  q = add mul q z 0.2f64
+  q = add mul q z 0.3333333333333333f64
+  q = add mul q z 1.0f64
+  lm = mul add s s q
+  fe = f64 e
+  ret add mul fe 0.6931471803691238f64 add lm mul fe 1.9082149292705877e-10f64
+end
+
+fn ap_cos_poly r f64 to f64
+  z = mul r r
+  p = add mul z -1.1470745597729725e-11f64 2.08767569878681e-9f64
+  p = add mul p z -2.7557319223985893e-7f64
+  p = add mul p z 0.0000248015873015873f64
+  p = add mul p z -0.001388888888888889f64
+  p = add mul p z 0.041666666666666664f64
+  p = add mul p z -0.5f64
+  ret add mul p z 1.0f64
+end
+
+fn ap_sin_poly r f64 to f64
+  z = mul r r
+  p = add mul z 1.6059043836821613e-10f64 -2.505210838544172e-8f64
+  p = add mul p z 2.7557319223985893e-6f64
+  p = add mul p z -0.0001984126984126984f64
+  p = add mul p z 0.008333333333333333f64
+  p = add mul p z -0.16666666666666666f64
+  p = add mul p z 1.0f64
+  ret mul r p
+end
+
+fn ap_cos x f64 to f64
+  ax = fabs x
+  kf = add mul ax 0.6366197723675814f64 0.5f64
+  k = ulong kf
+  fk = f64 k
+  r = sub sub ax mul fk 1.5707963267948966f64 mul fk 6.123233995736766e-17f64
+  q = and k 3
+  if eq q 0
+    ret ap_cos_poly r
+  end
+  if eq q 1
+    ret neg ap_sin_poly r
+  end
+  if eq q 2
+    ret neg ap_cos_poly r
+  end
+  ret ap_sin_poly r
+end
+
+fn ap_ceil_u x f64 to ulong
+  if le x 0.0f64
+    ret ulong 0
+  end
+  i = ulong x
+  if gt x f64 i
+    i = add i 1
+  end
+  ret i
+end
+
+note ---- xorshift64* RNG ----
+fn ap_rng_next_val s ulong to ulong
+  v = xor s shr s 12
+  v = xor v shl v 25
+  v = xor v shr v 27
+  ret v
+end
+
+fn ap_rng_step_raw st edit ulong 1 to ulong
+  s = ap_rng_next_val get st 0
+  put st 0 s
+  ret mul s 0x2545f4914f6cdd1d
+end
+
+fn ap_rng_unit_raw st edit ulong 1 to f64
+  v = ap_rng_step_raw st
+  q = shr v 11
+  scale = bitcast f64 ulong 0x4340000000000000
+  ret div f64 q scale
+end
+
+fn ap_sim_rng_next slot ulong to ulong
+  off = add mul slot 20 12
+  s = ap_rng_next_val get ap_sim_u off
+  put ap_sim_u off s
+  ret mul s 0x2545f4914f6cdd1d
+end
+
+fn ap_sim_rng_unit slot ulong to f64
+  v = ap_sim_rng_next slot
+  q = shr v 11
+  scale = bitcast f64 ulong 0x4340000000000000
+  ret div f64 q scale
+end
+
+fn ap_sim_rng_range slot ulong lo ulong hi ulong to ulong
+  v = ap_sim_rng_next slot
+  span = add sub hi lo 1
+  ret add lo rem v span
+end
+
+fn ap_sim_rng_normal slot ulong to f64
+  u1 = ap_sim_rng_unit slot
+  u2 = ap_sim_rng_unit slot
+  if lt u1 1.0e-300f64
+    u1 = 1.0e-300f64
+  end
+  mag = fsqrt mul -2.0f64 ap_log u1
+  ang = mul 6.283185307179586f64 u2
+  ret mul mag ap_cos ang
+end
+
+fn ap_sim_rng_poisson slot ulong lam f64 to ulong
+  if le lam 0.0f64
+    ret ulong 0
+  end
+  lim = ap_exp neg lam
+  p = 1.0f64
+  k = ulong 0
+  while true bound 1000
+    k = add k 1
+    p = mul p ap_sim_rng_unit slot
+    if le p lim
+      ret sub k 1
+    end
+  end
+  ret k
+end
+
+note ---- seed and workload regime helpers ----
+fn ap_seed wl ulong si ulong to ulong
+  a = mul wl 0x9e3779b97f4a7c15
+  b = mul add si 1 0xd1b54a32d192ed03
+  s = xor xor AP_SEED_BASE a b
+  if eq s 0
+    ret ulong 1
+  end
+  ret s
+end
+
+fn ap_sweep_sigma si ulong to f64
+  ret mul 1.5f64 div f64 si 23.0f64
+end
+
+fn ap_family_is_het wl ulong step ulong to bool
+  if or eq wl 1 eq wl 7
+    ret true
+  end
+  if and eq wl 6 ge step AP_SWITCH_STEP
+    ret true
+  end
+  ret false
+end
+
+fn ap_capacity_this_step wl ulong step ulong to ulong
+  if and eq wl 5 ge step AP_SWITCH_STEP
+    ret AP_CAP_DROP_SLOTS
+  end
+  ret AP_SLOTS
+end
+
+fn ap_arrivals_this_step slot ulong wl ulong step ulong srate f64 to ulong
+  if or eq wl 0 eq wl 5
+    ret ap_sim_rng_poisson slot 2.2f64
+  end
+  if eq wl 1
+    ret ap_sim_rng_poisson slot 1.2f64
+  end
+  if eq wl 2
+    if lt step AP_SWITCH_STEP
+      ret ap_sim_rng_poisson slot 1.0f64
+    end
+    ret ap_sim_rng_poisson slot 3.0f64
+  end
+  if eq wl 3
+    hp = div step AP_SQUARE_HALF_PERIOD
+    if ne and hp 1 0
+      ret ap_sim_rng_poisson slot 3.2f64
+    end
+    ret ap_sim_rng_poisson slot 0.8f64
+  end
+  if eq wl 4
+    if lt ap_sim_rng_unit slot 0.08f64
+      ret ap_sim_rng_range slot AP_BURST_MIN AP_BURST_MAX
+    end
+    ret ap_sim_rng_poisson slot 0.4f64
+  end
+  if eq wl 6
+    if lt step AP_SWITCH_STEP
+      ret ap_sim_rng_poisson slot 2.2f64
+    end
+    ret ap_sim_rng_poisson slot 1.2f64
+  end
+  if eq wl 7
+    ret ap_sim_rng_poisson slot srate
+  end
+  ret ulong 0
+end
+
+note ---- simulator init, ledger, step, run ----
+fn ap_sim_init slot ulong wl ulong seed ulong to void
+  ub = mul slot 20
+  for i ulong 20
+    put ap_sim_u add ub i 0
+  end
+  fb = mul slot 5
+  for i ulong 5
+    put ap_sim_f add fb i 0.0f64
+  end
+  wb_u = mul slot 800
+  for i ulong 800
+    put ap_win_u add wb_u i 0
+  end
+  wb_f = mul slot 600
+  for i ulong 600
+    put ap_win_f add wb_f i 0.0f64
+  end
+  put ap_sim_u add ub 13 wl
+  rs = seed
+  if eq rs 0
+    rs = ulong 1
+  end
+  put ap_sim_u add ub 12 rs
+  put ap_sim_u add ub 5 AP_SLOTS
+  put ap_sim_f add fb 3 1.2f64
+  put ap_sim_f add fb 4 0.0f64
+end
+
+fn ap_sim_init_indexed slot ulong wl ulong seed ulong si ulong to void
+  ap_sim_init slot wl seed
+  if eq wl 7
+    sigma = ap_sweep_sigma si
+    md = ap_exp add 1.7917594692280550f64 mul 0.5f64 mul sigma sigma
+    fb = mul slot 5
+    put ap_sim_f add fb 3 sigma
+    put ap_sim_f add fb 4 div mul 0.80f64 32.0f64 mul md 1.7f64
+  end
+end
+
+fn ap_sim_ledger_ok slot ulong to bool
+  ub = mul slot 20
+  arr = get ap_sim_u add ub 6
+  comp = get ap_sim_u add ub 7
+  ql = get ap_sim_u add ub 1
+  rl = get ap_sim_u add ub 2
+  rej = get ap_sim_u add ub 8
+  sum = add add add comp ql rl rej
+  ret eq arr sum
+end
+
+fn ap_gen_het_attrs slot ulong pos ulong to void
+  u = ap_sim_rng_unit slot
+  v = ulong 4
+  if lt u 0.70f64
+    v = ulong 1
+  else
+    if lt u 0.90f64
+      v = ulong 2
+    end
+  end
+  put ap_it_slt pos uint v
+  u = ap_sim_rng_unit slot
+  mspan = mul mul mul 120.0f64 u u u
+  v = add AP_HET_MEM_BASE ulong add mspan 0.5f64
+  put ap_it_mem pos uint v
+  u = ap_sim_rng_unit slot
+  v = ulong 3
+  if lt u 0.55f64
+    v = ulong 0
+  else
+    if lt u 0.80f64
+      v = ulong 1
+    else
+      if lt u 0.95f64
+        v = ulong 2
+      end
+    end
+  end
+  put ap_it_cls pos uint v
+end
+
+fn ap_gen_item slot ulong pos ulong is_het bool sigma f64 to void
+  if not is_het
+    dem = ap_sim_rng_range slot AP_HOM_DEMAND_MIN AP_HOM_DEMAND_MAX
+    mem = ap_sim_rng_range slot AP_HOM_MEM_MIN AP_HOM_MEM_MAX
+    cls = ap_sim_rng_range slot 0 3
+    put ap_it_dem pos uint dem
+    put ap_it_rem pos uint dem
+    put ap_it_mem pos uint mem
+    put ap_it_slt pos uint 1
+    put ap_it_cls pos uint cls
+    ret
+  end
+  z = ap_sim_rng_normal slot
+  d = ap_exp add 1.7917594692280550f64 mul sigma z
+  if lt d 1.0f64
+    d = 1.0f64
+  end
+  if gt d 400.0f64
+    d = 400.0f64
+  end
+  dem = ulong add d 0.5f64
+  put ap_it_dem pos uint dem
+  put ap_it_rem pos uint dem
+  ap_gen_het_attrs slot pos
+end
+
+fn ap_arrive_one slot ulong step ulong is_het bool sigma f64 to ulong
+  ub = mul slot 20
+  ni = get ap_sim_u ub
+  if ge ni AP_MAX_ITEMS
+    put ap_sim_u add ub 9 add get ap_sim_u add ub 9 1
+    ret ulong 2
+  end
+  pos = add mul slot AP_MAX_ITEMS ni
+  ap_gen_item slot pos is_het sigma
+  put ap_it_arr pos uint step
+  put ap_sim_u add ub 6 add get ap_sim_u add ub 6 1
+  put ap_sim_u add ub 15 add get ap_sim_u add ub 15 1
+  ql = get ap_sim_u add ub 1
+  if ge ql AP_MAX_QUEUE
+    put ap_sim_u add ub 8 add get ap_sim_u add ub 8 1
+    put ap_sim_u add ub 18 add get ap_sim_u add ub 18 1
+  else
+    put ap_queue add mul slot AP_MAX_QUEUE ql uint ni
+    put ap_sim_u add ub 1 add ql 1
+    put ap_sim_u ub add ni 1
+  end
+  ret ulong 0
+end
+
+fn ap_step_arrivals slot ulong step ulong to ulong
+  ub = mul slot 20
+  wl = get ap_sim_u add ub 13
+  n = ap_arrivals_this_step slot wl step get ap_sim_f add mul slot 5 4
+  is_het = ap_family_is_het wl step
+  sigma = get ap_sim_f add mul slot 5 3
+  for i ulong n bound 1024
+    rc = ap_arrive_one slot step is_het sigma
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret ulong 0
+end
+
+fn ap_queue_remove slot ulong idx ulong to void
+  ub = mul slot 20
+  ql = get ap_sim_u add ub 1
+  qbase = mul slot AP_MAX_QUEUE
+  j = idx
+  lim = sub ql 1
+  while lt j lim bound 256
+    put ap_queue add qbase j get ap_queue add qbase add j 1
+    j = add j 1
+  end
+  put ap_sim_u add ub 1 lim
+end
+
+fn ap_try_admit slot ulong i ulong c ulong to bool
+  ub = mul slot 20
+  qid = ulong get ap_queue add mul slot AP_MAX_QUEUE i
+  pos = add mul slot AP_MAX_ITEMS qid
+  if ne ulong get ap_it_cls pos c
+    ret false
+  end
+  us = add get ap_sim_u add ub 3 ulong get ap_it_slt pos
+  um = add get ap_sim_u add ub 4 ulong get ap_it_mem pos
+  rl = get ap_sim_u add ub 2
+  if and le us get ap_sim_u add ub 5 and le um AP_MEMORY lt rl AP_SLOTS
+    put ap_run add mul slot AP_SLOTS rl uint qid
+    put ap_sim_u add ub 2 add rl 1
+    put ap_sim_u add ub 3 us
+    put ap_sim_u add ub 4 um
+    ret true
+  end
+  ret false
+end
+
+fn ap_step_admit_class slot ulong c ulong to void
+  ub = mul slot 20
+  i = ulong 0
+  while lt i get ap_sim_u add ub 1 bound 512
+    if ap_try_admit slot i c
+      ap_queue_remove slot i
+    else
+      i = add i 1
+    end
+  end
+end
+
+fn ap_complete_item slot ulong i ulong pos ulong to void
+  ub = mul slot 20
+  fb = mul slot 5
+  slt = ulong get ap_it_slt pos
+  mem = ulong get ap_it_mem pos
+  dem = ulong get ap_it_dem pos
+  put ap_sim_u add ub 3 sub get ap_sim_u add ub 3 slt
+  put ap_sim_u add ub 4 sub get ap_sim_u add ub 4 mem
+  put ap_sim_u add ub 7 add get ap_sim_u add ub 7 1
+  put ap_sim_u add ub 16 add get ap_sim_u add ub 16 1
+  put ap_sim_f fb add get ap_sim_f fb f64 dem
+  put ap_sim_f add fb 1 add get ap_sim_f add fb 1 f64 slt
+  put ap_sim_f add fb 2 add get ap_sim_f add fb 2 f64 mem
+  put ap_sim_u add ub 10 add get ap_sim_u add ub 10 1
+  nrl = sub get ap_sim_u add ub 2 1
+  put ap_sim_u add ub 2 nrl
+  rbase = mul slot AP_SLOTS
+  put ap_run add rbase i get ap_run add rbase nrl
+end
+
+fn ap_step_service slot ulong to void
+  ub = mul slot 20
+  ibase = mul slot AP_MAX_ITEMS
+  rbase = mul slot AP_SLOTS
+  i = ulong 0
+  while lt i get ap_sim_u add ub 2 bound 64
+    rid = ulong get ap_run add rbase i
+    pos = add ibase rid
+    remv = ulong get ap_it_rem pos
+    if gt remv 0
+      remv = sub remv 1
+      put ap_it_rem pos uint remv
+    end
+    if eq remv 0
+      ap_complete_item slot i pos
+    else
+      i = add i 1
+    end
+  end
+end
+
+fn ap_close_window_means slot ulong wfb ulong to void
+  ub = mul slot 20
+  fb = mul slot 5
+  ncs = get ap_sim_u add ub 10
+  if gt ncs 0
+    nf = f64 ncs
+    put ap_win_f add wfb 3 div get ap_sim_f fb nf
+    put ap_win_f add wfb 4 div get ap_sim_f add fb 1 nf
+    put ap_win_f add wfb 5 div get ap_sim_f add fb 2 nf
+  else
+    put ap_win_f add wfb 3 12.0f64
+    put ap_win_f add wfb 4 1.0f64
+    put ap_win_f add wfb 5 20.0f64
+  end
+end
+
+fn ap_close_window slot ulong to void
+  ub = mul slot 20
+  nw = get ap_sim_u add ub 11
+  put ap_sim_u add ub 11 add nw 1
+  wi = add mul slot AP_WINDOWS nw
+  wub = mul wi 8
+  wfb = mul wi 6
+  scap = get ap_sim_u add ub 5
+  put ap_win_u add wub 7 scap
+  put ap_win_f wfb div f64 get ap_sim_u add ub 3 f64 scap
+  put ap_win_f add wfb 1 div f64 get ap_sim_u add ub 4 1024.0f64
+  ql = get ap_sim_u add ub 1
+  rl = get ap_sim_u add ub 2
+  put ap_win_f add wfb 2 div f64 ql 256.0f64
+  put ap_win_u wub get ap_sim_u add ub 15
+  put ap_win_u add wub 1 get ap_sim_u add ub 16
+  put ap_win_u add wub 2 get ap_sim_u add ub 17
+  put ap_win_u add wub 3 get ap_sim_u add ub 18
+  put ap_win_u add wub 5 ql
+  put ap_win_u add wub 6 rl
+  put ap_win_u add wub 4 add ql rl
+  ap_close_window_means slot wfb
+  put ap_sim_u add ub 15 0
+  put ap_sim_u add ub 16 0
+  put ap_sim_u add ub 17 0
+  put ap_sim_u add ub 18 0
+end
+
+fn ap_sim_step slot ulong to ulong
+  ub = mul slot 20
+  step = get ap_sim_u add ub 14
+  if ge step AP_STEPS
+    ret ulong 0
+  end
+  wl = get ap_sim_u add ub 13
+  put ap_sim_u add ub 5 ap_capacity_this_step wl step
+  rc = ap_step_arrivals slot step
+  if ne rc 0
+    ret rc
+  end
+  for c ulong AP_CLASSES
+    ap_step_admit_class slot c
+  end
+  if gt get ap_sim_u add ub 1 0
+    put ap_sim_u add ub 17 add get ap_sim_u add ub 17 1
+  end
+  ap_step_service slot
+  step = add step 1
+  put ap_sim_u add ub 14 step
+  if and eq rem step AP_WINDOW 0 lt get ap_sim_u add ub 11 AP_WINDOWS
+    ap_close_window slot
+  end
+  if ap_sim_ledger_ok slot
+    ret ulong 0
+  end
+  ret ulong 1
+end
+
+fn ap_sim_run slot ulong to ulong
+  ub = mul slot 20
+  rc = ulong 0
+  while lt get ap_sim_u add ub 14 AP_STEPS bound 2048
+    r = ap_sim_step slot
+    if and ne r 0 eq rc 0
+      rc = r
+    end
+    if eq r 2
+      break
+    end
+  end
+  ret rc
+end
+
+note ---- aggregate predictor (flow balance v2) ----
+fn ap_pred_rcap scap ulong mean_s f64 mean_m f64 to f64
+  ms = mean_s
+  if le ms 0.0f64
+    ms = 1.0f64
+  end
+  mm = mean_m
+  if le mm 0.0f64
+    mm = 20.0f64
+  end
+  by_s = div f64 scap ms
+  by_m = div 1024.0f64 mm
+  if lt by_m by_s
+    ret by_m
+  end
+  ret by_s
+end
+
+fn ap_predict_core in_sys ulong rcap f64 mean_d f64 comp f64 arr f64 to void
+  in_next = sub add f64 in_sys arr comp
+  if lt in_next 0.0f64
+    in_next = 0.0f64
+  end
+  qdens = ap_clamp01 div sub in_next rcap 256.0f64
+  occ = 1.0f64
+  if gt rcap 0.0f64
+    occ = div in_next rcap
+  end
+  blk = ap_clamp01 div sub occ 0.75f64 0.25f64
+  put ap_pred_f 0 comp
+  put ap_pred_f 1 qdens
+  put ap_pred_f 2 blk
+end
+
+fn ap_pred_flow run_u ulong ql_u ulong mean_d f64 arr f64 to f64
+  wlen = 20.0f64
+  frac = div wlen mean_d
+  if gt frac 1.0f64
+    frac = 1.0f64
+  end
+  late = 0.0f64
+  if gt sub wlen mean_d 0.0f64
+    late = div sub wlen mean_d wlen
+  end
+  ret add add mul f64 run_u frac mul f64 ql_u frac mul arr late
+end
+
+fn ap_predict_win slot ulong w ulong arr f64 to void
+  wi = add mul slot AP_WINDOWS w
+  wub = mul wi 8
+  wfb = mul wi 6
+  rcap = ap_pred_rcap get ap_win_u add wub 7 get ap_win_f add wfb 4 get ap_win_f add wfb 5
+  mean_d = get ap_win_f add wfb 3
+  if le mean_d 0.0f64
+    mean_d = 12.0f64
+  end
+  cap_w = div mul rcap 20.0f64 mean_d
+  comp = ap_pred_flow get ap_win_u add wub 6 get ap_win_u add wub 5 mean_d arr
+  if lt cap_w comp
+    comp = cap_w
+  end
+  ap_predict_core get ap_win_u add wub 4 rcap mean_d comp arr
+end
+
+fn ap_predict_win_default slot ulong w ulong to void
+  wi = add mul slot AP_WINDOWS w
+  wub = mul wi 8
+  arr = f64 get ap_win_u wub
+  ap_predict_win slot w arr
+end
+
+fn ap_error_finalize se_c f64 se_q f64 se_b f64 sum_c f64 scored ulong to void
+  put ap_err_w 0 scored
+  if eq scored 0
+    for i ulong 4
+      put ap_err_f i 0.0f64
+    end
+    ret
+  end
+  nf = f64 scored
+  mean_c = div sum_c nf
+  rc = fsqrt div se_c nf
+  if gt mean_c 0.0f64
+    rc = div rc mean_c
+  end
+  rq = fsqrt div se_q nf
+  rb = fsqrt div se_b nf
+  comp = div add add rc rq rb 3.0f64
+  put ap_err_f 0 rc
+  put ap_err_f 1 rq
+  put ap_err_f 2 rb
+  put ap_err_f 3 comp
+end
+
+fn ap_score_accum aw ulong to void
+  awu = mul aw 8
+  awf = mul aw 6
+  ac = f64 get ap_win_u add awu 1
+  ab = div f64 get ap_win_u add awu 2 20.0f64
+  d = sub get ap_pred_f 0 ac
+  put ap_se_acc 0 add get ap_se_acc 0 mul d d
+  d = sub get ap_pred_f 1 get ap_win_f add awf 2
+  put ap_se_acc 1 add get ap_se_acc 1 mul d d
+  d = sub get ap_pred_f 2 ab
+  put ap_se_acc 2 add get ap_se_acc 2 mul d d
+  put ap_se_acc 3 add get ap_se_acc 3 ac
+end
+
+fn ap_score_step slot ulong t ulong mode ulong offset ulong scored ulong to void
+  aw = add mul slot AP_WINDOWS add t 1
+  if eq mode 1
+    ap_predict_win slot t f64 get ap_win_u mul aw 8
+  else
+    src = t
+    if eq mode 2
+      src = add AP_WARMUP_WINDOWS rem add sub t AP_WARMUP_WINDOWS offset scored
+    end
+    ap_predict_win_default slot src
+  end
+  ap_score_accum aw
+end
+
+fn ap_score slot ulong mode ulong offset ulong to void
+  nw = get ap_sim_u add mul slot 20 11
+  last = ulong 0
+  if gt nw 0
+    last = sub nw 1
+  end
+  scored = ulong 0
+  if gt last AP_WARMUP_WINDOWS
+    scored = sub last AP_WARMUP_WINDOWS
+  end
+  if eq scored 0
+    ap_error_finalize 0.0f64 0.0f64 0.0f64 0.0f64 0
+    ret
+  end
+  for i ulong 4
+    put ap_se_acc i 0.0f64
+  end
+  t = AP_WARMUP_WINDOWS
+  while lt t last bound 128
+    ap_score_step slot t mode offset scored
+    t = add t 1
+  end
+  ap_error_finalize get ap_se_acc 0 get ap_se_acc 1 get ap_se_acc 2 get ap_se_acc 3 scored
+end
+
+fn ap_error_real slot ulong to void
+  ap_score slot 0 0
+end
+
+fn ap_error_known_arrivals slot ulong to void
+  ap_score slot 1 0
+end
+
+fn ap_error_shuffled slot ulong offset ulong to void
+  ub = mul slot 20
+  nw = get ap_sim_u add ub 11
+  first = AP_WARMUP_WINDOWS
+  last = ulong 0
+  if gt nw 0
+    last = sub nw 1
+  end
+  scored = ulong 0
+  if gt last first
+    scored = sub last first
+  end
+  if lt scored 2
+    ap_score slot 0 0
+    ret
+  end
+  off = add 1 rem offset sub scored 1
+  ap_score slot 2 off
+end
+
+note ---- deterministic load heapsort and heterogeneity metrics ----
+fn ap_item_load ibase ulong i ulong to ulong
+  pos = add ibase i
+  ret mul ulong get ap_it_dem pos ulong get ap_it_slt pos
+end
+
+fn ap_load_before ibase ulong a ulong b ulong to bool
+  la = ap_item_load ibase a
+  lb = ap_item_load ibase b
+  if ne la lb
+    ret gt la lb
+  end
+  ret lt a b
+end
+
+fn ap_sift ibase ulong root ulong n ulong to void
+  r = root
+  while true bound 64
+    child = add mul r 2 1
+    if ge child n
+      ret
+    end
+    pick = r
+    ci = ulong get ap_idx child
+    pi = ulong get ap_idx pick
+    if not ap_load_before ibase ci pi
+      pick = child
+      pi = ci
+    end
+    c2 = add child 1
+    if lt c2 n
+      c2i = ulong get ap_idx c2
+      if not ap_load_before ibase c2i pi
+        pick = c2
+      end
+    end
+    if eq pick r
+      ret
+    end
+    tmp = get ap_idx r
+    put ap_idx r get ap_idx pick
+    put ap_idx pick tmp
+    r = pick
+  end
+end
+
+fn ap_sort_desc ibase ulong n ulong to void
+  if lt n 2
+    ret
+  end
+  i = div n 2
+  while gt i 0 bound 65536
+    i = sub i 1
+    ap_sift ibase i n
+  end
+  i = sub n 1
+  while gt i 0 bound 65536
+    t = get ap_idx 0
+    put ap_idx 0 get ap_idx i
+    put ap_idx i t
+    ap_sift ibase 0 i
+    i = sub i 1
+  end
+end
+
+fn ap_measure_arr_cv slot ulong to f64
+  ub = mul slot 20
+  nw = get ap_sim_u add ub 11
+  if eq nw 0
+    ret 0.0f64
+  end
+  a = 0.0f64
+  a2 = 0.0f64
+  for i ulong nw bound 128
+    wi = add mul slot AP_WINDOWS i
+    x = f64 get ap_win_u mul wi 8
+    a = add a x
+    a2 = add a2 mul x x
+  end
+  m = div a f64 nw
+  v = sub div a2 f64 nw mul m m
+  if lt v 0.0f64
+    v = 0.0f64
+  end
+  if gt m 0.0f64
+    ret div fsqrt v m
+  end
+  ret 0.0f64
+end
+
+fn ap_measure_scan ibase ulong n ulong cls_cnt edit ulong 4 to f64
+  sum = 0.0f64
+  sum2 = 0.0f64
+  tload = 0.0f64
+  for i ulong n bound 65536
+    pos = add ibase i
+    d = f64 get ap_it_dem pos
+    sum = add sum d
+    sum2 = add sum2 mul d d
+    tload = add tload mul d f64 get ap_it_slt pos
+    c = ulong get ap_it_cls pos
+    put cls_cnt c add get cls_cnt c 1
+    put ap_idx i uint i
+  end
+  nf = f64 n
+  mean = div sum nf
+  var = sub div sum2 nf mul mean mean
+  if lt var 0.0f64
+    var = 0.0f64
+  end
+  if gt mean 0.0f64
+    put ap_het_f 0 div fsqrt var mean
+  end
+  ret tload
+end
+
+fn ap_measure_top ibase ulong n ulong tload f64 to void
+  ap_sort_desc ibase n
+  k = ap_ceil_u mul 0.05f64 f64 n
+  if lt k 1
+    k = ulong 1
+  end
+  if gt k n
+    k = n
+  end
+  top = 0.0f64
+  for i ulong k bound 65536
+    idx_i = ulong get ap_idx i
+    top = add top f64 ap_item_load ibase idx_i
+  end
+  if gt tload 0.0f64
+    put ap_het_f 1 div top tload
+    top0 = ulong get ap_idx 0
+    put ap_het_f 2 div f64 ap_item_load ibase top0 tload
+  end
+end
+
+fn ap_measure_ent cls_cnt view ulong 4 n ulong to void
+  ent = 0.0f64
+  nf = f64 n
+  ln2 = 0.6931471805599453f64
+  for i ulong AP_CLASSES
+    p = div f64 get cls_cnt i nf
+    if gt p 0.0f64
+      ent = sub ent mul p div ap_log p ln2
+    end
+  end
+  put ap_het_f 3 div ent 2.0f64
+end
+
+fn ap_measure slot ulong noise_st edit ulong 1 to void
+  for i ulong 7
+    put ap_het_f i 0.0f64
+  end
+  put ap_het_f 5 0.5f64
+  put ap_het_f 6 ap_rng_unit_raw noise_st
+  n = get ap_sim_u mul slot 20
+  if eq n 0
+    ret
+  end
+  ibase = mul slot AP_MAX_ITEMS
+  cls_cnt = new ulong 4 0
+  tload = ap_measure_scan ibase n cls_cnt
+  ap_measure_top ibase n tload
+  ap_measure_ent cls_cnt n
+  put ap_het_f 4 ap_measure_arr_cv slot
+end
+
+note ---- campaign runner ----
+fn ap_store_row_scores ridx ulong sim_slot ulong sd ulong to void
+  rub = mul ridx 7
+  rfb = mul ridx 19
+  ap_error_real sim_slot
+  put ap_row_u add rub 6 get ap_err_w 0
+  for i ulong 4
+    put ap_row_f add rfb i get ap_err_f i
+  end
+  ap_error_known_arrivals sim_slot
+  for i ulong 4
+    put ap_row_f add rfb add 4 i get ap_err_f i
+  end
+  ap_error_shuffled sim_slot and shr sd 7 0xffffffff
+  for i ulong 4
+    put ap_row_f add rfb add 8 i get ap_err_f i
+  end
+  nst = new ulong 1 0
+  ns = xor sd 0xa5a5a5a5a5a5a5a5
+  if eq ns 0
+    ns = ulong 1
+  end
+  put nst 0 ns
+  ap_measure sim_slot nst
+  for i ulong 7
+    put ap_row_f add rfb add 12 i get ap_het_f i
+  end
+end
+
+fn ap_store_row rslot ulong idx ulong sim_slot ulong wl ulong si ulong sd ulong to void
+  ridx = add mul rslot AP_NROWS idx
+  rub = mul ridx 7
+  ub = mul sim_slot 20
+  put ap_row_u rub wl
+  put ap_row_u add rub 1 si
+  put ap_row_u add rub 2 sd
+  put ap_row_u add rub 3 get ap_sim_u add ub 6
+  put ap_row_u add rub 4 get ap_sim_u add ub 7
+  put ap_row_u add rub 5 get ap_sim_u add ub 8
+  ap_store_row_scores ridx sim_slot sd
+end
+
+fn ap_campaign sim_slot ulong rslot ulong to ulong
+  n = ulong 0
+  for wl ulong AP_WL_COUNT
+    for si ulong AP_SEEDS
+      sd = ap_seed wl si
+      ap_sim_init_indexed sim_slot wl sd si
+      if ne ap_sim_run sim_slot 0
+        ret ulong 2
+      end
+      ap_store_row rslot n sim_slot wl si sd
+      n = add n 1
+    end
+  end
+  ret ulong 0
+end
+
+note ---- Pearson correlation ----
+fn ap_mean_vec a view f64 * n ulong to f64
+  s = 0.0f64
+  for i ulong n bound 1024
+    s = add s get a i
+  end
+  ret div s f64 n
+end
+
+fn ap_ss_vec a view f64 * n ulong m f64 to f64
+  s = 0.0f64
+  for i ulong n bound 1024
+    d = sub get a i m
+    s = add s mul d d
+  end
+  ret s
+end
+
+fn ap_sxy_vec x view f64 * y view f64 * mx f64 my f64 to f64
+  n = len x
+  s = 0.0f64
+  for i ulong n bound 1024
+    dx = sub get x i mx
+    dy = sub get y i my
+    s = add s mul dx dy
+  end
+  ret s
+end
+
+fn ap_pearson x view f64 * y view f64 * n ulong to f64
+  put ap_pearson_f 0 0.0f64
+  put ap_pearson_f 1 0.0f64
+  if lt n 2
+    ret 0.0f64
+  end
+  mx = ap_mean_vec x n
+  my = ap_mean_vec y n
+  sxx = ap_ss_vec x n mx
+  syy = ap_ss_vec y n my
+  sxy = ap_sxy_vec x y mx my
+  put ap_pearson_f 1 div sxy f64 sub n 1
+  if or le sxx 0.0f64 le syy 0.0f64
+    ret 0.0f64
+  end
+  r = div sxy fsqrt mul sxx syy
+  put ap_pearson_f 0 r
+  ret r
+end
+
+note ---- streaming SHA-256 (FIPS 180-4) ----
+fn ap_sha_mask x ulong to ulong
+  ret and x 4294967295
+end
+
+fn ap_sha_ror x ulong n ulong to ulong
+  ret ap_sha_mask or shr x n shl x sub 32 n
+end
+
+fn ap_sha_ch e ulong f ulong g ulong to ulong
+  ret xor and e f and xor e 4294967295 g
+end
+
+fn ap_sha_maj a ulong b ulong c ulong to ulong
+  ret xor and a b xor and a c and b c
+end
+
+fn ap_sha_bs0 x ulong to ulong
+  ret xor ap_sha_ror x 2 xor ap_sha_ror x 13 ap_sha_ror x 22
+end
+
+fn ap_sha_bs1 x ulong to ulong
+  ret xor ap_sha_ror x 6 xor ap_sha_ror x 11 ap_sha_ror x 25
+end
+
+fn ap_sha_ss0 x ulong to ulong
+  ret xor ap_sha_ror x 7 xor ap_sha_ror x 18 shr x 3
+end
+
+fn ap_sha_ss1 x ulong to ulong
+  ret xor ap_sha_ror x 17 xor ap_sha_ror x 19 shr x 10
+end
+
+fn ap_sha_kinit to void
+  if ne get ap_sha_st 0 0
+    ret
+  end
+  put ap_sha_k 0 ulong 1116352408
+  put ap_sha_k 1 ulong 1899447441
+  put ap_sha_k 2 ulong 3049323471
+  put ap_sha_k 3 ulong 3921009573
+  put ap_sha_k 4 ulong 961987163
+  put ap_sha_k 5 ulong 1508970993
+  put ap_sha_k 6 ulong 2453635748
+  put ap_sha_k 7 ulong 2870763221
+  put ap_sha_k 8 ulong 3624381080
+  put ap_sha_k 9 ulong 310598401
+  put ap_sha_k 10 ulong 607225278
+  put ap_sha_k 11 ulong 1426881987
+  put ap_sha_k 12 ulong 1925078388
+  put ap_sha_k 13 ulong 2162078206
+  put ap_sha_k 14 ulong 2614888103
+  put ap_sha_k 15 ulong 3248222580
+  put ap_sha_k 16 ulong 3835390401
+  put ap_sha_k 17 ulong 4022224774
+  put ap_sha_k 18 ulong 264347078
+  put ap_sha_k 19 ulong 604807628
+  put ap_sha_k 20 ulong 770255983
+  put ap_sha_k 21 ulong 1249150122
+  put ap_sha_k 22 ulong 1555081692
+  put ap_sha_k 23 ulong 1996064986
+  put ap_sha_k 24 ulong 2554220882
+  put ap_sha_k 25 ulong 2821834349
+  put ap_sha_k 26 ulong 2952996808
+  put ap_sha_k 27 ulong 3210313671
+  put ap_sha_k 28 ulong 3336571891
+  put ap_sha_k 29 ulong 3584528711
+  put ap_sha_k 30 ulong 113926993
+  put ap_sha_k 31 ulong 338241895
+  put ap_sha_k 32 ulong 666307205
+  put ap_sha_k 33 ulong 773529912
+  put ap_sha_k 34 ulong 1294757372
+  put ap_sha_k 35 ulong 1396182291
+  put ap_sha_k 36 ulong 1695183700
+  put ap_sha_k 37 ulong 1986661051
+  put ap_sha_k 38 ulong 2177026350
+  put ap_sha_k 39 ulong 2456956037
+  put ap_sha_k 40 ulong 2730485921
+  put ap_sha_k 41 ulong 2820302411
+  put ap_sha_k 42 ulong 3259730800
+  put ap_sha_k 43 ulong 3345764771
+  put ap_sha_k 44 ulong 3516065817
+  put ap_sha_k 45 ulong 3600352804
+  put ap_sha_k 46 ulong 4094571909
+  put ap_sha_k 47 ulong 275423344
+  put ap_sha_k 48 ulong 430227734
+  put ap_sha_k 49 ulong 506948616
+  put ap_sha_k 50 ulong 659060556
+  put ap_sha_k 51 ulong 883997877
+  put ap_sha_k 52 ulong 958139571
+  put ap_sha_k 53 ulong 1322822218
+  put ap_sha_k 54 ulong 1537002063
+  put ap_sha_k 55 ulong 1747873779
+  put ap_sha_k 56 ulong 1955562222
+  put ap_sha_k 57 ulong 2024104815
+  put ap_sha_k 58 ulong 2227730452
+  put ap_sha_k 59 ulong 2361852424
+  put ap_sha_k 60 ulong 2428436474
+  put ap_sha_k 61 ulong 2756734187
+  put ap_sha_k 62 ulong 3204031479
+  put ap_sha_k 63 ulong 3329325298
+  put ap_sha_st 0 1
+end
+
+fn ap_sha_compress to void
+  ap_sha_kinit
+  for i ulong 16
+    v = ulong 0
+    for j ulong 4
+      v = or shl v 8 ulong get ap_sha_blk add mul i 4 j
+    end
+    put ap_sha_w i v
+  end
+  for i ulong 48
+    j = add i 16
+    v = add ap_sha_ss1 get ap_sha_w sub j 2 add ap_sha_ss0 get ap_sha_w sub j 15 add get ap_sha_w sub j 7 get ap_sha_w sub j 16
+    put ap_sha_w j ap_sha_mask v
+  end
+  a = get ap_sha_h 0
+  b = get ap_sha_h 1
+  c = get ap_sha_h 2
+  d = get ap_sha_h 3
+  e = get ap_sha_h 4
+  f = get ap_sha_h 5
+  g = get ap_sha_h 6
+  hh = get ap_sha_h 7
+  for i ulong 64
+    x = ap_sha_ch e f g
+    x = add x get ap_sha_k i
+    x = add x get ap_sha_w i
+    x = add x ap_sha_bs1 e
+    x = add x hh
+    t1 = ap_sha_mask x
+    x = ap_sha_maj a b c
+    x = add ap_sha_bs0 a x
+    hh = g
+    g = f
+    f = e
+    e = ap_sha_mask add d t1
+    d = c
+    c = b
+    b = a
+    a = ap_sha_mask add t1 x
+  end
+  put ap_sha_h 0 ap_sha_mask add get ap_sha_h 0 a
+  put ap_sha_h 1 ap_sha_mask add get ap_sha_h 1 b
+  put ap_sha_h 2 ap_sha_mask add get ap_sha_h 2 c
+  put ap_sha_h 3 ap_sha_mask add get ap_sha_h 3 d
+  put ap_sha_h 4 ap_sha_mask add get ap_sha_h 4 e
+  put ap_sha_h 5 ap_sha_mask add get ap_sha_h 5 f
+  put ap_sha_h 6 ap_sha_mask add get ap_sha_h 6 g
+  put ap_sha_h 7 ap_sha_mask add get ap_sha_h 7 hh
+end
+
+fn ap_sha_init to void
+  put ap_sha_h 0 ulong 1779033703
+  put ap_sha_h 1 ulong 3144134277
+  put ap_sha_h 2 ulong 1013904242
+  put ap_sha_h 3 ulong 2773480762
+  put ap_sha_h 4 ulong 1359893119
+  put ap_sha_h 5 ulong 2600822924
+  put ap_sha_h 6 ulong 528734635
+  put ap_sha_h 7 ulong 1541459225
+  put ap_sha_st 1 0
+  put ap_sha_st 2 0
+end
+
+fn ap_sha_push_byte b uchar to void
+  bl = get ap_sha_st 1
+  put ap_sha_blk bl b
+  bl = add bl 1
+  put ap_sha_st 2 add get ap_sha_st 2 1
+  if eq bl 64
+    ap_sha_compress
+    bl = ulong 0
+  end
+  put ap_sha_st 1 bl
+end
+
+fn ap_sha_update data view uchar * n ulong to void
+  for i ulong n bound 65536
+    ap_sha_push_byte get data i
+  end
+end
+
+fn ap_sha_final dst edit uchar 32 to void
+  tot = get ap_sha_st 2
+  bl = get ap_sha_st 1
+  put ap_sha_blk bl uchar 128
+  bl = add bl 1
+  if gt bl 56
+    while lt bl 64 bound 64
+      put ap_sha_blk bl uchar 0
+      bl = add bl 1
+    end
+    ap_sha_compress
+    bl = ulong 0
+  end
+  while lt bl 56 bound 64
+    put ap_sha_blk bl uchar 0
+    bl = add bl 1
+  end
+  bits = mul tot 8
+  for i ulong 8
+    sh = mul sub 7 i 8
+    put ap_sha_blk add 56 i uchar and shr bits sh 255
+  end
+  ap_sha_compress
+  for i ulong 8
+    v = get ap_sha_h i
+    for j ulong 4
+      sh = mul sub 3 j 8
+      put dst add mul i 4 j uchar and shr v sh 255
+    end
+  end
+end
+
+note ---- byte buffer formatting helpers ----
+fn ap_buf_copy dst edit uchar * pos ulong src view uchar * to ulong
+  n = len src
+  for i ulong n bound 4096
+    put dst add pos i get src i
+  end
+  ret add pos n
+end
+
+fn ap_buf_byte dst edit uchar * pos ulong b uchar to ulong
+  put dst pos b
+  ret add pos 1
+end
+
+fn ap_buf_u64 dst edit uchar * pos ulong v ulong to ulong
+  if eq v 0
+    put dst pos uchar 48
+    ret add pos 1
+  end
+  dig = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put dig nd uchar add 48 rem x 10
+    x = div x 10
+    nd = add nd 1
+  end
+  p = pos
+  for i ulong nd bound 24
+    put dst p get dig sub sub nd 1 i
+    p = add p 1
+  end
+  ret p
+end
+
+fn ap_buf_hex64 dst edit uchar * pos ulong v ulong to ulong
+  for i ulong 16
+    sh = mul sub 15 i 4
+    nib = and shr v sh 15
+    put dst add pos i get ap_t_hex nib
+  end
+  ret add pos 16
+end
+
+fn ap_buf_hex32 dst edit uchar * pos ulong d view uchar 32 to ulong
+  for i ulong 32
+    b = ulong get d i
+    put dst add pos mul i 2 get ap_t_hex shr b 4
+    put dst add pos add mul i 2 1 get ap_t_hex and b 15
+  end
+  ret add pos 64
+end
+
+fn ap_pow10_u prec ulong to ulong
+  r = ulong 1
+  for i ulong prec bound 12
+    r = mul r 10
+  end
+  ret r
+end
+
+fn ap_buf_frac dst edit uchar * pos ulong fp ulong prec ulong to ulong
+  put dst pos uchar 46
+  k = fp
+  for i ulong prec bound 12
+    put dst sub add pos prec i uchar add 48 rem k 10
+    k = div k 10
+  end
+  ret add add pos 1 prec
+end
+
+fn ap_round_scaled v f64 su ulong to ulong
+  sc = mul v f64 su
+  fl = ulong sc
+  rf = sub sc f64 fl
+  if gt rf 0.5f64
+    ret add fl 1
+  end
+  if and eq rf 0.5f64 eq and fl 1 1
+    ret add fl 1
+  end
+  ret fl
+end
+
+fn ap_buf_f64 dst edit uchar * pos ulong x f64 prec ulong plus_sign bool to ulong
+  p = pos
+  v = x
+  if lt v 0.0f64
+    put dst p uchar 45
+    p = add p 1
+    v = neg v
+  else
+    if plus_sign
+      put dst p uchar 43
+      p = add p 1
+    end
+  end
+  su = ap_pow10_u prec
+  fl = ap_round_scaled v su
+  p = ap_buf_u64 dst p div fl su
+  if gt prec 0
+    p = ap_buf_frac dst p rem fl su prec
+  end
+  ret p
+end
+
+fn ap_buf_wl_name dst edit uchar * pos ulong wl ulong to ulong
+  if eq wl 0
+    ret ap_buf_copy dst pos ap_t_wl0
+  end
+  if eq wl 1
+    ret ap_buf_copy dst pos ap_t_wl1
+  end
+  if eq wl 2
+    ret ap_buf_copy dst pos ap_t_wl2
+  end
+  if eq wl 3
+    ret ap_buf_copy dst pos ap_t_wl3
+  end
+  if eq wl 4
+    ret ap_buf_copy dst pos ap_t_wl4
+  end
+  if eq wl 5
+    ret ap_buf_copy dst pos ap_t_wl5
+  end
+  if eq wl 6
+    ret ap_buf_copy dst pos ap_t_wl6
+  end
+  if eq wl 7
+    ret ap_buf_copy dst pos ap_t_wl7
+  end
+  ret ap_buf_copy dst pos ap_t_wlq
+end
+
+note ---- canonical params text, CSV header, CSV row, digests ----
+fn ap_pbuf_copy pos ulong src view uchar * to ulong
+  n = len src
+  for i ulong n bound 2048
+    put ap_pbuf add pos i get src i
+  end
+  ret add pos n
+end
+
+fn ap_params_text_to_pbuf to ulong
+  p = ulong 0
+  p = ap_pbuf_copy p ap_t_par0
+  p = ap_pbuf_copy p ap_t_par1
+  p = ap_pbuf_copy p ap_t_par2
+  p = ap_pbuf_copy p ap_t_par3
+  p = ap_pbuf_copy p ap_t_par4
+  p = ap_pbuf_copy p ap_t_par5
+  p = ap_pbuf_copy p ap_t_par6
+  p = ap_pbuf_copy p ap_t_par7
+  p = ap_pbuf_copy p ap_t_par8
+  p = ap_pbuf_copy p ap_t_par9
+  ret p
+end
+
+fn ap_params_digest dst edit uchar 32 to void
+  n = ap_params_text_to_pbuf
+  ap_sha_init
+  for i ulong n bound 2048
+    ap_sha_push_byte get ap_pbuf i
+  end
+  ap_sha_final dst
+end
+
+fn ap_row_header dst edit uchar 512 to ulong
+  p = ulong 0
+  p = ap_buf_copy dst p ap_t_hdr0
+  p = ap_buf_copy dst p ap_t_hdr1
+  p = ap_buf_copy dst p ap_t_hdr2
+  p = ap_buf_copy dst p ap_t_hdr3
+  p = ap_buf_copy dst p ap_t_hdr4
+  ret p
+end
+
+fn ap_row_format dst edit uchar 512 rslot ulong idx ulong to ulong
+  ridx = add mul rslot AP_NROWS idx
+  rub = mul ridx 7
+  rfb = mul ridx 19
+  p = ulong 0
+  p = ap_buf_wl_name dst p get ap_row_u rub
+  p = ap_buf_byte dst p uchar 44
+  p = ap_buf_u64 dst p get ap_row_u add rub 1
+  p = ap_buf_byte dst p uchar 44
+  p = ap_buf_hex64 dst p get ap_row_u add rub 2
+  p = ap_buf_byte dst p uchar 44
+  p = ap_buf_u64 dst p get ap_row_u add rub 3
+  p = ap_buf_byte dst p uchar 44
+  p = ap_buf_u64 dst p get ap_row_u add rub 4
+  p = ap_buf_byte dst p uchar 44
+  p = ap_buf_u64 dst p get ap_row_u add rub 5
+  p = ap_buf_byte dst p uchar 44
+  p = ap_buf_u64 dst p get ap_row_u add rub 6
+  for i ulong 19
+    p = ap_buf_byte dst p uchar 44
+    p = ap_buf_f64 dst p get ap_row_f add rfb i 6 false
+  end
+  ret p
+end
+
+fn ap_row_header_to_line to ulong
+  buf = new uchar 512 0
+  n = ap_row_header buf
+  for i ulong n bound 512
+    put ap_line_buf i get buf i
+  end
+  ret n
+end
+
+fn ap_row_format_to_line rslot ulong idx ulong to ulong
+  buf = new uchar 512 0
+  n = ap_row_format buf rslot idx
+  for i ulong n bound 512
+    put ap_line_buf i get buf i
+  end
+  ret n
+end
+
+fn ap_rows_digest rslot ulong n ulong dst edit uchar 32 to void
+  ap_sha_init
+  hn = ap_row_header_to_line
+  for i ulong hn bound 512
+    ap_sha_push_byte get ap_line_buf i
+  end
+  ap_sha_push_byte uchar 10
+  for r ulong n bound 256
+    ln = ap_row_format_to_line rslot r
+    for i ulong ln bound 512
+      ap_sha_push_byte get ap_line_buf i
+    end
+    ap_sha_push_byte uchar 10
+  end
+  ap_sha_final dst
+end
