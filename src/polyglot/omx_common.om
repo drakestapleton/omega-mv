@@ -1,0 +1,1059 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/polyglot/omx_common.om -- pure seeded OM-2 POLYGLOT-0 shared library:
+note constants, SplitMix64 RNG, SHA-256, contract digest, ELF64 LE text sizing,
+note formatting & JSON string escaping, statistics (heapsort, median, MAD),
+note and Omega-X ternary matvec oracle + sdot/crumb pack & run kernels.
+om2
+
+const OMX_MAX_N ulong 16777215
+const OMX_BUF_MAX ulong 16777216
+const OMX_Y_MAX ulong 65536
+const OMX_OK int 0
+const OMX_E_ARG int -1
+const OMX_E_TRIT int -2
+const OMX_E_NOMEM int -3
+const OMX_E_OVERFLOW int -4
+const OMX_ULONG_MAX ulong 18446744073709551615
+
+const OMX_CAND_PLAIN ulong 0
+const OMX_CAND_SDOT ulong 1
+const OMX_CAND_CRUMB ulong 2
+const OMX_CAND_ENC_SDOT ulong 3
+const OMX_CAND_ENC_CRUMB ulong 4
+
+note ---- shared global buffers (zero-initialized, program mode) ----
+global g_omx_w byte 16777216
+global g_omx_x byte 16777216
+global g_omx_pack uchar 16777216
+global g_omx_y int 65536
+global g_omx_yref int 65536
+
+note plan fields: [0]=m [1]=n [2]=weight_bytes [3]=footprint_bytes [4]=nnz [5]=valid [6]=kind
+global g_omx_plan ulong 8
+
+note print & formatting scratch
+global g_omx_pbuf uchar 256
+global g_omx_path uchar 768
+global g_omx_fbuf uchar 262144
+global g_omx_stat f64 1024
+global g_omx_stmp f64 1024
+
+note SHA-256 state
+global g_omx_shk uint 64
+global g_omx_shh uint 8
+global g_omx_shv uint 8
+global g_omx_shw uint 64
+global g_omx_shb uchar 64
+global g_omx_shmeta ulong 4
+global g_omx_shdig uchar 32
+global g_omx_shhex uchar 64
+
+note ---- basic I/O & formatting helpers ----
+
+fn omx_write_all fd int buf view uchar * off ulong n ulong to long
+  sent = ulong 0
+  while lt sent n bound 16777216
+    r = write fd buf add off sent sub n sent
+    if le r 0
+      ret r
+    end
+    sent = add sent ulong r
+  end
+  ret long sent
+end
+
+fn omx_puts s view uchar * to void
+  _r = omx_write_all 1 s 0 len s
+end
+
+fn omx_eputs s view uchar * to void
+  _r = omx_write_all 2 s 0 len s
+end
+
+fn omx_putc ch uchar to void
+  put g_omx_pbuf 0 ch
+  _r = write 1 g_omx_pbuf 0 1
+end
+
+fn omx_eputc ch uchar to void
+  put g_omx_pbuf 0 ch
+  _r = write 2 g_omx_pbuf 0 1
+end
+
+fn omx_nl to void
+  omx_putc uchar 10
+end
+
+fn omx_enl to void
+  omx_eputc uchar 10
+end
+
+fn omx_putu_fd fd int v ulong to void
+  if eq v 0
+    put g_omx_pbuf 0 uchar 48
+    _r = write fd g_omx_pbuf 0 1
+    ret
+  end
+  pos = ulong 32
+  cur = v
+  while gt cur 0 bound 32
+    pos = sub pos 1
+    d = rem cur 10
+    put g_omx_pbuf pos uchar add 48 d
+    cur = div cur 10
+  end
+  _r = write fd g_omx_pbuf pos sub 32 pos
+end
+
+fn omx_putu v ulong to void
+  omx_putu_fd 1 v
+end
+
+fn omx_eputu v ulong to void
+  omx_putu_fd 2 v
+end
+
+fn omx_puti_fd fd int v long to void
+  if lt v 0
+    put g_omx_pbuf 0 uchar 45
+    _r = write fd g_omx_pbuf 0 1
+    if eq v -9223372036854775808
+      omx_putu_fd fd ulong 9223372036854775808
+      ret
+    end
+    omx_putu_fd fd ulong neg v
+    ret
+  end
+  omx_putu_fd fd ulong v
+end
+
+fn omx_puti v long to void
+  omx_puti_fd 1 v
+end
+
+fn omx_eputi v long to void
+  omx_puti_fd 2 v
+end
+
+fn omx_hex_nib v ulong to uchar
+  if lt v 10
+    ret uchar add 48 v
+  end
+  ret uchar add 87 v
+end
+
+fn omx_putx32_fd fd int v uint to void
+  u = ulong v
+  for i ulong 8
+    sh = mul sub 7 i 4
+    nib = and shr u sh 15
+    put g_omx_pbuf i omx_hex_nib nib
+  end
+  _r = write fd g_omx_pbuf 0 8
+end
+
+fn omx_putx32 v uint to void
+  omx_putx32_fd 1 v
+end
+
+fn omx_putx64_fd fd int v ulong to void
+  for i ulong 16
+    sh = mul sub 15 i 4
+    nib = and shr v sh 15
+    put g_omx_pbuf i omx_hex_nib nib
+  end
+  _r = write fd g_omx_pbuf 0 16
+end
+
+fn omx_put_frac_fd fd int frac ulong prec ulong to void
+  put g_omx_pbuf 0 uchar 46
+  _r = write fd g_omx_pbuf 0 1
+  pos = prec
+  cur = frac
+  for i ulong prec bound 10
+    pos = sub pos 1
+    d = rem cur 10
+    put g_omx_pbuf pos uchar add 48 d
+    cur = div cur 10
+  end
+  _r2 = write fd g_omx_pbuf 0 prec
+end
+
+fn omx_putf_fd fd int v f64 prec ulong to void
+  x = v
+  if lt x 0.0f64
+    put g_omx_pbuf 0 uchar 45
+    _r = write fd g_omx_pbuf 0 1
+    x = sub 0.0f64 x
+  end
+  scale = f64 1.0f64
+  iscale = ulong 1
+  for i ulong prec bound 10
+    scale = mul scale 10.0f64
+    iscale = mul iscale 10
+  end
+  scaled = ulong add mul x scale 0.5f64
+  omx_putu_fd fd div scaled iscale
+  if gt prec 0
+    omx_put_frac_fd fd rem scaled iscale prec
+  end
+end
+
+fn omx_putf v f64 prec ulong to void
+  omx_putf_fd 1 v prec
+end
+
+fn omx_json_str_fd fd int s view uchar * n ulong to void
+  put g_omx_pbuf 0 uchar 34
+  _r = write fd g_omx_pbuf 0 1
+  for i ulong n bound 65536
+    c = get s i
+    if eq c 34
+      put g_omx_pbuf 0 uchar 92
+      put g_omx_pbuf 1 uchar 34
+      _r2 = write fd g_omx_pbuf 0 2
+    else
+      if eq c 92
+        put g_omx_pbuf 0 uchar 92
+        put g_omx_pbuf 1 uchar 92
+        _r2 = write fd g_omx_pbuf 0 2
+      else
+        if eq c 10
+          put g_omx_pbuf 0 uchar 92
+          put g_omx_pbuf 1 uchar 110
+          _r2 = write fd g_omx_pbuf 0 2
+        else
+          if eq c 9
+            put g_omx_pbuf 0 uchar 92
+            put g_omx_pbuf 1 uchar 116
+            _r2 = write fd g_omx_pbuf 0 2
+          else
+            put g_omx_pbuf 0 c
+            _r2 = write fd g_omx_pbuf 0 1
+          end
+        end
+      end
+    end
+  end
+  put g_omx_pbuf 0 uchar 34
+  _r3 = write fd g_omx_pbuf 0 1
+end
+
+note ---- SplitMix64 RNG (matches src/polyglot/omx_core.om) ----
+
+fn omx_rng_next st edit ulong 1 to ulong
+  z = add get st 0 0x9e3779b97f4a7c15
+  put st 0 z
+  z = mul xor z shr z 30 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+fn omx_rng_01 st edit ulong 1 to f64
+  v = omx_rng_next st
+  q = shr v 11
+  inv = bitcast f64 ulong 0x3ca0000000000000
+  ret mul f64 q inv
+end
+
+note ---- Statistics: heapsort, median, MAD on f64 (stored as ulong bits or f64 array) ----
+
+fn omx_sift_f64 v edit f64 * root ulong n ulong to void
+  r = root
+  while true bound 65536
+    child = add mul r 2 1
+    if ge child n
+      ret
+    end
+    pick = r
+    if gt get v child get v pick
+      pick = child
+    end
+    c2 = add child 1
+    if lt c2 n
+      if gt get v c2 get v pick
+        pick = c2
+      end
+    end
+    if eq pick r
+      ret
+    end
+    tmp = get v r
+    put v r get v pick
+    put v pick tmp
+    r = pick
+  end
+end
+
+fn omx_sort_f64 v edit f64 * n ulong to void
+  if lt n 2
+    ret
+  end
+  i = div n 2
+  while gt i 0 bound 65536
+    i = sub i 1
+    omx_sift_f64 v i n
+  end
+  i = sub n 1
+  while gt i 0 bound 65536
+    t = get v 0
+    put v 0 get v i
+    put v i t
+    omx_sift_f64 v 0 i
+    i = sub i 1
+  end
+end
+
+fn omx_median_f64 v view f64 * n ulong to f64
+  if eq n 0
+    ret 0.0f64
+  end
+  mid = div n 2
+  if eq and n 1 1
+    ret get v mid
+  end
+  ret mul 0.5f64 add get v sub mid 1 get v mid
+end
+
+fn omx_mad_f64 v view f64 * n ulong med f64 tmp edit f64 * to f64
+  if eq n 0
+    ret 0.0f64
+  end
+  for i ulong n bound 65536
+    x = get v i
+    if gt x med
+      put tmp i sub x med
+    else
+      put tmp i sub med x
+    end
+  end
+  omx_sort_f64 tmp n
+  ret omx_median_f64 tmp n
+end
+
+note ---- Pure OM-2 SHA-256 ----
+
+fn omx_sha_init_k to void
+  put g_omx_shk 0 uint 0x428a2f98
+  put g_omx_shk 1 uint 0x71374491
+  put g_omx_shk 2 uint 0xb5c0fbcf
+  put g_omx_shk 3 uint 0xe9b5dba5
+  put g_omx_shk 4 uint 0x3956c25b
+  put g_omx_shk 5 uint 0x59f111f1
+  put g_omx_shk 6 uint 0x923f82a4
+  put g_omx_shk 7 uint 0xab1c5ed5
+  put g_omx_shk 8 uint 0xd807aa98
+  put g_omx_shk 9 uint 0x12835b01
+  put g_omx_shk 10 uint 0x243185be
+  put g_omx_shk 11 uint 0x550c7dc3
+  put g_omx_shk 12 uint 0x72be5d74
+  put g_omx_shk 13 uint 0x80deb1fe
+  put g_omx_shk 14 uint 0x9bdc06a7
+  put g_omx_shk 15 uint 0xc19bf174
+  put g_omx_shk 16 uint 0xe49b69c1
+  put g_omx_shk 17 uint 0xefbe4786
+  put g_omx_shk 18 uint 0x0fc19dc6
+  put g_omx_shk 19 uint 0x240ca1cc
+  put g_omx_shk 20 uint 0x2de92c6f
+  put g_omx_shk 21 uint 0x4a7484aa
+  put g_omx_shk 22 uint 0x5cb0a9dc
+  put g_omx_shk 23 uint 0x76f988da
+  put g_omx_shk 24 uint 0x983e5152
+  put g_omx_shk 25 uint 0xa831c66d
+  put g_omx_shk 26 uint 0xb00327c8
+  put g_omx_shk 27 uint 0xbf597fc7
+  put g_omx_shk 28 uint 0xc6e00bf3
+  put g_omx_shk 29 uint 0xd5a79147
+  put g_omx_shk 30 uint 0x06ca6351
+  put g_omx_shk 31 uint 0x14292967
+  put g_omx_shk 32 uint 0x27b70a85
+  put g_omx_shk 33 uint 0x2e1b2138
+  put g_omx_shk 34 uint 0x4d2c6dfc
+  put g_omx_shk 35 uint 0x53380d13
+  put g_omx_shk 36 uint 0x650a7354
+  put g_omx_shk 37 uint 0x766a0abb
+  put g_omx_shk 38 uint 0x81c2c92e
+  put g_omx_shk 39 uint 0x92722c85
+  put g_omx_shk 40 uint 0xa2bfe8a1
+  put g_omx_shk 41 uint 0xa81a664b
+  put g_omx_shk 42 uint 0xc24b8b70
+  put g_omx_shk 43 uint 0xc76c51a3
+  put g_omx_shk 44 uint 0xd192e819
+  put g_omx_shk 45 uint 0xd6990624
+  put g_omx_shk 46 uint 0xf40e3585
+  put g_omx_shk 47 uint 0x106aa070
+  put g_omx_shk 48 uint 0x19a4c116
+  put g_omx_shk 49 uint 0x1e376c08
+  put g_omx_shk 50 uint 0x2748774c
+  put g_omx_shk 51 uint 0x34b0bcb5
+  put g_omx_shk 52 uint 0x391c0cb3
+  put g_omx_shk 53 uint 0x4ed8aa4a
+  put g_omx_shk 54 uint 0x5b9cca4f
+  put g_omx_shk 55 uint 0x682e6ff3
+  put g_omx_shk 56 uint 0x748f82ee
+  put g_omx_shk 57 uint 0x78a5636f
+  put g_omx_shk 58 uint 0x84c87814
+  put g_omx_shk 59 uint 0x8cc70208
+  put g_omx_shk 60 uint 0x90befffa
+  put g_omx_shk 61 uint 0xa4506ceb
+  put g_omx_shk 62 uint 0xbef9a3f7
+  put g_omx_shk 63 uint 0xc67178f2
+end
+
+fn omx_sha_init to void
+  omx_sha_init_k
+  put g_omx_shh 0 uint 0x6a09e667
+  put g_omx_shh 1 uint 0xbb67ae85
+  put g_omx_shh 2 uint 0x3c6ef372
+  put g_omx_shh 3 uint 0xa54ff53a
+  put g_omx_shh 4 uint 0x510e527f
+  put g_omx_shh 5 uint 0x9b05688c
+  put g_omx_shh 6 uint 0x1f83d9ab
+  put g_omx_shh 7 uint 0x5be0cd19
+  put g_omx_shmeta 0 ulong 0
+  put g_omx_shmeta 1 ulong 0
+end
+
+fn omx_sha_expand to void
+  for i ulong 16
+    off = mul i 4
+    w = shl uint get g_omx_shb off 24
+    w = or w shl uint get g_omx_shb add off 1 16
+    w = or w shl uint get g_omx_shb add off 2 8
+    w = or w uint get g_omx_shb add off 3
+    put g_omx_shw i w
+  end
+  for i ulong 48
+    k = add i 16
+    x = get g_omx_shw sub k 15
+    s0 = xor xor rotr x 7 rotr x 18 shr x 3
+    y = get g_omx_shw sub k 2
+    s1 = xor xor rotr y 17 rotr y 19 shr y 10
+    w = add add get g_omx_shw sub k 16 s0 add get g_omx_shw sub k 7 s1
+    put g_omx_shw k w
+  end
+end
+
+fn omx_sha_step i ulong to void
+  e = get g_omx_shv 4
+  s1 = xor xor rotr e 6 rotr e 11 rotr e 25
+  ch = xor and e get g_omx_shv 5 and not e get g_omx_shv 6
+  t1 = add add get g_omx_shv 7 s1 ch
+  t1 = add t1 add get g_omx_shk i get g_omx_shw i
+  a = get g_omx_shv 0
+  b = get g_omx_shv 1
+  c = get g_omx_shv 2
+  s0 = xor xor rotr a 2 rotr a 13 rotr a 22
+  maj = xor xor and a b and a c and b c
+  t2 = add s0 maj
+  put g_omx_shv 7 get g_omx_shv 6
+  put g_omx_shv 6 get g_omx_shv 5
+  put g_omx_shv 5 e
+  put g_omx_shv 4 add get g_omx_shv 3 t1
+  put g_omx_shv 3 c
+  put g_omx_shv 2 b
+  put g_omx_shv 1 a
+  put g_omx_shv 0 add t1 t2
+end
+
+fn omx_sha_block to void
+  omx_sha_expand
+  for i ulong 8
+    put g_omx_shv i get g_omx_shh i
+  end
+  for i ulong 64
+    omx_sha_step i
+  end
+  for i ulong 8
+    put g_omx_shh i add get g_omx_shh i get g_omx_shv i
+  end
+end
+
+fn omx_sha_update_byte b uchar to void
+  blen = get g_omx_shmeta 0
+  tot = get g_omx_shmeta 1
+  put g_omx_shb blen b
+  blen = add blen 1
+  put g_omx_shmeta 1 add tot 1
+  if eq blen 64
+    omx_sha_block
+    blen = ulong 0
+  end
+  put g_omx_shmeta 0 blen
+end
+
+fn omx_sha_update_buf buf view uchar * off ulong n ulong to void
+  for i ulong n bound 16777216
+    omx_sha_update_byte get buf add off i
+  end
+end
+
+fn omx_sha_final to void
+  tot = get g_omx_shmeta 1
+  bits = mul tot 8
+  omx_sha_update_byte uchar 0x80
+  while ne get g_omx_shmeta 0 56 bound 64
+    omx_sha_update_byte uchar 0
+  end
+  for i ulong 8
+    sh = mul sub 7 i 8
+    omx_sha_update_byte uchar and shr bits sh 255
+  end
+  for i ulong 8
+    w = get g_omx_shh i
+    put g_omx_shdig mul i 4 uchar and shr w 24 255
+    put g_omx_shdig add mul i 4 1 uchar and shr w 16 255
+    put g_omx_shdig add mul i 4 2 uchar and shr w 8 255
+    put g_omx_shdig add mul i 4 3 uchar and w 255
+  end
+  for i ulong 32
+    b = ulong get g_omx_shdig i
+    put g_omx_shhex mul i 2 omx_hex_nib shr b 4
+    put g_omx_shhex add mul i 2 1 omx_hex_nib and b 15
+  end
+end
+
+note Read file named by g_omx_path[0..plen) into g_omx_fbuf. Returns length >= 0, or -1 on error.
+fn omx_read_gpath plen ulong to long
+  fd = fopen g_omx_path 0 plen 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot 262144 bound 262144
+    r = read int fd g_omx_fbuf tot sub 262144 tot
+    if lt r 0
+      _c = fclose int fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    tot = add tot ulong r
+  end
+  _c = fclose int fd
+  ret long tot
+end
+
+note Compute contract digest of spec section 1 ("## 1. " up to next "## ") from g_omx_path[0..plen) into g_omx_shhex.
+note Returns 0 on success, -1 on error.
+fn omx_contract_digest_gpath plen ulong to int
+  flen = omx_read_gpath plen
+  if lt flen 0
+    ret -1
+  end
+  n = ulong flen
+  has_s = ulong 0
+  start = ulong 0
+  stop = n
+  i = ulong 0
+  while lt i n bound 262144
+    if eq has_s 0
+      if ge sub n i 6
+        if eq get g_omx_fbuf i 35
+          if eq get g_omx_fbuf add i 1 35
+            if eq get g_omx_fbuf add i 2 32
+              if eq get g_omx_fbuf add i 3 49
+                if eq get g_omx_fbuf add i 4 46
+                  if eq get g_omx_fbuf add i 5 32
+                    has_s = 1
+                    start = i
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    else
+      if ge sub n i 3
+        if eq get g_omx_fbuf i 35
+          if eq get g_omx_fbuf add i 1 35
+            if eq get g_omx_fbuf add i 2 32
+              stop = i
+              break
+            end
+          end
+        end
+      end
+    end
+    while lt i n bound 262144
+      c = get g_omx_fbuf i
+      i = add i 1
+      if eq c 10
+        break
+      end
+    end
+  end
+  if eq has_s 0
+    ret -1
+  end
+  omx_sha_init
+  j = start
+  while lt j stop bound 262144
+    omx_sha_update_byte get g_omx_fbuf j
+    j = add j 1
+  end
+  omx_sha_final
+  ret 0
+end
+
+note Global stats helpers operating on g_omx_stat[0..n) and g_omx_stmp[0..n)
+fn omx_gsift root ulong n ulong to void
+  r = root
+  while true bound 65536
+    child = add mul r 2 1
+    if ge child n
+      ret
+    end
+    pick = r
+    if gt get g_omx_stat child get g_omx_stat pick
+      pick = child
+    end
+    c2 = add child 1
+    if lt c2 n
+      if gt get g_omx_stat c2 get g_omx_stat pick
+        pick = c2
+      end
+    end
+    if eq pick r
+      ret
+    end
+    tmp = get g_omx_stat r
+    put g_omx_stat r get g_omx_stat pick
+    put g_omx_stat pick tmp
+    r = pick
+  end
+end
+
+fn omx_gsort n ulong to void
+  if lt n 2
+    ret
+  end
+  i = div n 2
+  while gt i 0 bound 65536
+    i = sub i 1
+    omx_gsift i n
+  end
+  i = sub n 1
+  while gt i 0 bound 65536
+    t = get g_omx_stat 0
+    put g_omx_stat 0 get g_omx_stat i
+    put g_omx_stat i t
+    omx_gsift 0 i
+    i = sub i 1
+  end
+end
+
+fn omx_gmedian n ulong to f64
+  if eq n 0
+    ret 0.0f64
+  end
+  mid = div n 2
+  if eq and n 1 1
+    ret get g_omx_stat mid
+  end
+  ret mul 0.5f64 add get g_omx_stat sub mid 1 get g_omx_stat mid
+end
+
+fn omx_gmad n ulong med f64 to f64
+  if eq n 0
+    ret 0.0f64
+  end
+  for i ulong n bound 1024
+    x = get g_omx_stat i
+    if gt x med
+      put g_omx_stmp i sub x med
+    else
+      put g_omx_stmp i sub med x
+    end
+  end
+  for i ulong n bound 1024
+    put g_omx_stat i get g_omx_stmp i
+  end
+  omx_gsort n
+  ret omx_gmedian n
+end
+
+note ---- ELF64 LE helpers ----
+
+fn omx_u16_le_fbuf off ulong to ulong
+  b0 = ulong get g_omx_fbuf off
+  b1 = ulong get g_omx_fbuf add off 1
+  ret or b0 shl b1 8
+end
+
+fn omx_u32_le_fbuf off ulong to ulong
+  b0 = ulong get g_omx_fbuf off
+  b1 = ulong get g_omx_fbuf add off 1
+  b2 = ulong get g_omx_fbuf add off 2
+  b3 = ulong get g_omx_fbuf add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn omx_u64_le_fbuf off ulong to ulong
+  lo = omx_u32_le_fbuf off
+  hi = omx_u32_le_fbuf add off 4
+  ret or lo shl hi 32
+end
+
+fn omx_elf64_le_ok_fbuf slen ulong to ulong
+  if lt slen 64
+    ret 0
+  end
+  if ne ulong get g_omx_fbuf 0 0x7f
+    ret 0
+  end
+  if ne ulong get g_omx_fbuf 1 69
+    ret 0
+  end
+  if ne ulong get g_omx_fbuf 2 76
+    ret 0
+  end
+  if ne ulong get g_omx_fbuf 3 70
+    ret 0
+  end
+  if ne ulong get g_omx_fbuf 4 2
+    ret 0
+  end
+  if ne ulong get g_omx_fbuf 5 1
+    ret 0
+  end
+  ret 1
+end
+
+fn omx_elf_sum_text shoff ulong shnum ulong to ulong
+  tot = ulong 0
+  for i ulong shnum bound 4096
+    base = add shoff mul i 64
+    if eq omx_u32_le_fbuf add base 4 1
+      if ne and omx_u64_le_fbuf add base 8 4 0
+        tot = add tot omx_u64_le_fbuf add base 32
+      end
+    end
+  end
+  ret tot
+end
+
+fn omx_elf_text_bytes_gpath plen ulong to long
+  flen = omx_read_gpath plen
+  if lt flen 64
+    ret -1
+  end
+  n = ulong flen
+  if eq omx_elf64_le_ok_fbuf n 0
+    ret -1
+  end
+  shoff = omx_u64_le_fbuf 40
+  if eq shoff 0
+    ret -1
+  end
+  if ne omx_u16_le_fbuf 58 64
+    ret -1
+  end
+  if gt shoff n
+    ret -1
+  end
+  shnum = omx_u16_le_fbuf 60
+  if lt div sub n shoff 64 shnum
+    ret -1
+  end
+  ret long omx_elf_sum_text shoff shnum
+end
+
+note ---- Omega-X ternary matvec: shape, validation, oracle, sdot & crumb pack/run ----
+
+fn omx_plan_zero to void
+  for i ulong 8
+    put g_omx_plan i 0
+  end
+end
+
+fn omx_plan_is_zero to ulong
+  for i ulong 7
+    if ne get g_omx_plan i 0
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn omx_check_shape m ulong n ulong max_n ulong to int
+  if eq m 0
+    ret OMX_E_ARG
+  end
+  if eq n 0
+    ret OMX_E_ARG
+  end
+  if gt n max_n
+    ret OMX_E_ARG
+  end
+  if gt m div OMX_ULONG_MAX n
+    ret OMX_E_OVERFLOW
+  end
+  ret OMX_OK
+end
+
+fn omx_validate_w m ulong n ulong to int
+  tot = mul m n
+  if gt tot OMX_BUF_MAX
+    ret OMX_E_NOMEM
+  end
+  for i ulong tot bound 16777216
+    v = int get g_omx_w i
+    if lt v -1
+      ret OMX_E_TRIT
+    end
+    if gt v 1
+      ret OMX_E_TRIT
+    end
+  end
+  ret OMX_OK
+end
+
+note Naive exact int32 oracle: yref[0..m) = W[0..m*n) . x[xoff..xoff+n)
+fn omx_oracle m ulong n ulong xoff ulong to int
+  rc = omx_check_shape m n OMX_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  if gt m OMX_Y_MAX
+    ret OMX_E_NOMEM
+  end
+  for i ulong m bound 65536
+    acc = int 0
+    row = mul i n
+    for j ulong n bound 16777216
+      w = int get g_omx_w add row j
+      xv = int get g_omx_x add xoff j
+      acc = add acc mul w xv
+    end
+    put g_omx_yref i acc
+  end
+  ret OMX_OK
+end
+
+note Pack sdot (row-major int8 in g_omx_pack as two's complement uchar)
+fn omx_pack_sdot m ulong n ulong has_w ulong to int
+  omx_plan_zero
+  rc = omx_check_shape m n OMX_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  if eq has_w 0
+    ret OMX_E_ARG
+  end
+  rc2 = omx_validate_w m n
+  if ne rc2 0
+    ret rc2
+  end
+  tot = mul m n
+  nnz = ulong 0
+  for i ulong tot bound 16777216
+    wb = get g_omx_w i
+    wi = int wb
+    if ne wi 0
+      nnz = add nnz 1
+    end
+    put g_omx_pack i uchar and wi 255
+  end
+  put g_omx_plan 0 m
+  put g_omx_plan 1 n
+  put g_omx_plan 2 tot
+  put g_omx_plan 3 tot
+  put g_omx_plan 4 nnz
+  put g_omx_plan 5 1
+  put g_omx_plan 6 OMX_CAND_SDOT
+  ret OMX_OK
+end
+
+fn omx_sdot_row row ulong n ulong xoff ulong to int
+  acc = int 0
+  for j ulong n bound 16777216
+    xv = int get g_omx_x add xoff j
+    u = int get g_omx_pack add row j
+    if ge u 128
+      u = sub u 256
+    end
+    acc = add acc mul u xv
+  end
+  ret acc
+end
+
+note Run sdot: reads packed int8 weights from g_omx_pack, x from g_omx_x[xoff..], writes g_omx_y[yoff..]
+fn omx_run_sdot xoff ulong yoff ulong has_x ulong has_y ulong to int
+  if eq has_x 0
+    ret OMX_E_ARG
+  end
+  if eq has_y 0
+    ret OMX_E_ARG
+  end
+  if eq get g_omx_plan 5 0
+    ret OMX_E_ARG
+  end
+  m = get g_omx_plan 0
+  n = get g_omx_plan 1
+  if eq m 0
+    ret OMX_E_ARG
+  end
+  if eq n 0
+    ret OMX_E_ARG
+  end
+  for i ulong m bound 65536
+    put g_omx_y add yoff i omx_sdot_row mul i n n xoff
+  end
+  ret OMX_OK
+end
+
+fn omx_pack_crumb_chunk row ulong dbase ulong n ulong cbase ulong to ulong
+  nnz = ulong 0
+  for j ulong 16
+    bv = ulong 0
+    for q ulong 4
+      col = add add cbase mul q 16 j
+      if lt col n
+        v = int get g_omx_w add row col
+        if ne v 0
+          nnz = add nnz 1
+        end
+        bv = or bv shl ulong and v 3 mul q 2
+      end
+    end
+    put g_omx_pack add dbase j uchar bv
+  end
+  ret nnz
+end
+
+fn omx_pack_crumb_row row ulong dst ulong n ulong chunks ulong to ulong
+  nnz = ulong 0
+  for c ulong chunks bound 262144
+    nnz = add nnz omx_pack_crumb_chunk row add dst mul c 16 n mul c 64
+  end
+  ret nnz
+end
+
+note Pack crumb: 2-bit crumbs in 64-weight chunks of 16 bytes (exact B1/R2c_crumb layout)
+fn omx_pack_crumb m ulong n ulong has_w ulong to int
+  omx_plan_zero
+  rc = omx_check_shape m n OMX_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  if eq has_w 0
+    ret OMX_E_ARG
+  end
+  rc2 = omx_validate_w m n
+  if ne rc2 0
+    ret rc2
+  end
+  chunks = div add n 63 64
+  rbytes = mul chunks 16
+  if ne rbytes 0
+    if gt m div OMX_ULONG_MAX rbytes
+      ret OMX_E_OVERFLOW
+    end
+  end
+  wbytes = mul m rbytes
+  if gt wbytes OMX_BUF_MAX
+    ret OMX_E_NOMEM
+  end
+  nnz = ulong 0
+  for i ulong m bound 65536
+    nnz = add nnz omx_pack_crumb_row mul i n mul i rbytes n chunks
+  end
+  put g_omx_plan 0 m
+  put g_omx_plan 1 n
+  put g_omx_plan 2 wbytes
+  put g_omx_plan 3 wbytes
+  put g_omx_plan 4 nnz
+  put g_omx_plan 5 1
+  put g_omx_plan 6 OMX_CAND_CRUMB
+  ret OMX_OK
+end
+
+fn omx_crumb_sext2 v ulong to int
+  b = and v 3
+  if eq b 3
+    ret -1
+  end
+  if eq b 1
+    ret 1
+  end
+  ret 0
+end
+
+fn omx_run_crumb_chunk sbase ulong n ulong cbase ulong xoff ulong to int
+  acc = int 0
+  for j ulong 16
+    bv = ulong get g_omx_pack add sbase j
+    col = add cbase j
+    if lt col n
+      acc = add acc mul omx_crumb_sext2 bv int get g_omx_x add xoff col
+    end
+    col = add col 16
+    if lt col n
+      acc = add acc mul omx_crumb_sext2 shr bv 2 int get g_omx_x add xoff col
+    end
+    col = add col 16
+    if lt col n
+      acc = add acc mul omx_crumb_sext2 shr bv 4 int get g_omx_x add xoff col
+    end
+    col = add col 16
+    if lt col n
+      acc = add acc mul omx_crumb_sext2 shr bv 6 int get g_omx_x add xoff col
+    end
+  end
+  ret acc
+end
+
+fn omx_run_crumb_row src ulong n ulong chunks ulong xoff ulong to int
+  acc = int 0
+  for c ulong chunks bound 262144
+    acc = add acc omx_run_crumb_chunk add src mul c 16 n mul c 64 xoff
+  end
+  ret acc
+end
+
+note Run crumb: decodes 2-bit crumbs from g_omx_pack and computes exact dot product with g_omx_x[xoff..]
+fn omx_run_crumb xoff ulong yoff ulong has_x ulong has_y ulong to int
+  if eq has_x 0
+    ret OMX_E_ARG
+  end
+  if eq has_y 0
+    ret OMX_E_ARG
+  end
+  if eq get g_omx_plan 5 0
+    ret OMX_E_ARG
+  end
+  m = get g_omx_plan 0
+  n = get g_omx_plan 1
+  if eq m 0
+    ret OMX_E_ARG
+  end
+  if eq n 0
+    ret OMX_E_ARG
+  end
+  chunks = div add n 63 64
+  rbytes = mul chunks 16
+  for i ulong m bound 65536
+    put g_omx_y add yoff i omx_run_crumb_row mul i rbytes n chunks xoff
+  end
+  ret OMX_OK
+end
+
+note Dispatch pack/run by candidate kind (0=plain, 1=sdot, 2=crumb, 3=enc_sdot, 4=enc_crumb)
+fn omx_pack_cand kind ulong m ulong n ulong has_w ulong to int
+  if or eq kind OMX_CAND_CRUMB eq kind OMX_CAND_ENC_CRUMB
+    ret omx_pack_crumb m n has_w
+  end
+  ret omx_pack_sdot m n has_w
+end
+
+fn omx_run_cand kind ulong xoff ulong yoff ulong has_x ulong has_y ulong to int
+  if or eq kind OMX_CAND_CRUMB eq kind OMX_CAND_ENC_CRUMB
+    ret omx_run_crumb xoff yoff has_x has_y
+  end
+  ret omx_run_sdot xoff yoff has_x has_y
+end

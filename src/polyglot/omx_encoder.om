@@ -1,0 +1,1399 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/polyglot/omx_encoder.om -- pure seeded OM-2 POLYGLOT-0 lane B2:
+note AArch64 scalar + SIMD instruction encoders, decoder, tiny assembler with
+note labels/fixups/ADRP+ADD relocations, and B1 kernel emitters (sdot, crumb).
+
+const OMX_ENC_SDOT ulong 0
+const OMX_ENC_CRUMB ulong 1
+const OMX_ENC_KERNELS ulong 2
+
+const OMX_ENC_FROM_OMEGA uchar 0
+const OMX_ENC_FROM_EXT uchar 1
+
+const OMX_ENC_RELOC_NONE uchar 0
+const OMX_ENC_RELOC_ADRP_PAGE uchar 1
+const OMX_ENC_RELOC_ADD_LO12 uchar 2
+
+const OMX_COND_NE ulong 1
+const OMX_COND_LO ulong 3
+
+const OMX_FX_B ulong 0
+const OMX_FX_BCOND ulong 1
+const OMX_FX_CBZ ulong 2
+
+note Assembler global state (concatenated after omx_common.om)
+global g_enc_word uint 1024
+global g_enc_orig uchar 1024
+global g_enc_reloc uchar 1024
+global g_enc_bdisp int 1024
+global g_enc_lsl uchar 1024
+
+global g_enc_lab long 32
+global g_enc_fix_at ulong 64
+global g_enc_fix_kind ulong 64
+global g_enc_fix_lab ulong 64
+global g_enc_fix_cond ulong 64
+global g_enc_fix_rt ulong 64
+note g_enc_st: [0]=n [1]=err [2]=nfix [3]=base [4]=data_off [5]=data_len
+global g_enc_st ulong 8
+global g_enc_sdot_mask uchar 32
+
+note ---- Extended AArch64 encoders (port of src/polyglot/omx_encoder_ext.c) ----
+note Each returns >= 0 (32-bit instruction word) on success, or -1 on invalid operand.
+
+fn oxe_addsub_imm op ulong rd ulong rn ulong imm12 ulong lsl12 ulong to long
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if gt imm12 0xfff
+    ret -1
+  end
+  if gt lsl12 1
+    ret -1
+  end
+  w = or shl ulong 1 31 shl op 30
+  w = or w shl ulong 0x22 23
+  w = or w shl lsl12 22
+  w = or w shl imm12 10
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn oxe_add_imm_x rd ulong rn ulong imm12 ulong lsl12 ulong to long
+  ret oxe_addsub_imm 0 rd rn imm12 lsl12
+end
+
+fn oxe_sub_imm_x rd ulong rn ulong imm12 ulong lsl12 ulong to long
+  ret oxe_addsub_imm 1 rd rn imm12 lsl12
+end
+
+fn oxe_add_lsl_x rd ulong rn ulong rm ulong amount ulong to long
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if gt rm 31
+    ret -1
+  end
+  if gt amount 63
+    ret -1
+  end
+  w = or shl ulong 1 31 shl ulong 0x0b 24
+  w = or w shl rm 16
+  w = or w shl amount 10
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn oxe_ubfm_x rd ulong rn ulong immr ulong imms ulong to long
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if gt immr 63
+    ret -1
+  end
+  if gt imms 63
+    ret -1
+  end
+  w = or shl ulong 1 31 shl ulong 2 29
+  w = or w shl ulong 0x26 23
+  w = or w shl ulong 1 22
+  w = or w shl immr 16
+  w = or w shl imms 10
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn oxe_lsr_imm_x rd ulong rn ulong shift ulong to long
+  if gt shift 63
+    ret -1
+  end
+  ret oxe_ubfm_x rd rn shift 63
+end
+
+fn oxe_lsl_imm_x rd ulong rn ulong shift ulong to long
+  if gt shift 63
+    ret -1
+  end
+  ret oxe_ubfm_x rd rn and sub 64 shift 63 sub 63 shift
+end
+
+fn oxe_ubfx_x rd ulong rn ulong lsb ulong width ulong to long
+  if lt width 1
+    ret -1
+  end
+  if gt lsb 63
+    ret -1
+  end
+  if gt width sub 64 lsb
+    ret -1
+  end
+  ret oxe_ubfm_x rd rn lsb sub add lsb width 1
+end
+
+fn oxe_bm_lg imm ulong to ulong
+  size = ulong 64
+  lg = ulong 6
+  while gt size 2 bound 8
+    half = div size 2
+    mask = sub shl ulong 1 half 1
+    if ne and imm mask and shr imm half mask
+      break
+    end
+    size = half
+    lg = sub lg 1
+  end
+  ret lg
+end
+
+fn oxe_bm_rot elt ulong size ulong emask ulong run ulong to long
+  for r ulong size bound 64
+    rol = elt
+    if gt r 0
+      rol = and or shl elt r shr elt sub size r emask
+    end
+    if eq rol run
+      ret long r
+    end
+  end
+  ret -1
+end
+
+fn oxe_bitmask_imm64 imm ulong res edit ulong 3 to int
+  if eq imm 0
+    ret -1
+  end
+  if eq imm 0xffffffffffffffff
+    ret -1
+  end
+  lg = oxe_bm_lg imm
+  size = shl ulong 1 lg
+  emask = ulong 0xffffffffffffffff
+  if lt size 64
+    emask = sub shl ulong 1 size 1
+  end
+  elt = and imm emask
+  ones = ulong 0
+  for i ulong size bound 64
+    ones = add ones and shr elt i 1
+  end
+  if or eq ones 0 eq ones size
+    ret -1
+  end
+  run = sub shl ulong 1 ones 1
+  rot = oxe_bm_rot elt size emask run
+  if lt rot 0
+    ret -1
+  end
+  nv = ulong 0
+  if eq size 64
+    nv = 1
+  end
+  put res 0 nv
+  put res 1 ulong rot
+  imms_hi = and shl ulong 0x3f add lg 1 0x3f
+  put res 2 or imms_hi sub ones 1
+  ret 0
+end
+
+fn oxe_logic_imm opc ulong rd ulong rn ulong imm ulong to long
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  res = new ulong 3 0
+  if ne oxe_bitmask_imm64 imm res 0
+    ret -1
+  end
+  nv = get res 0
+  immr = get res 1
+  imms = get res 2
+  w = or shl ulong 1 31 shl opc 29
+  w = or w shl ulong 0x24 23
+  w = or w shl nv 22
+  w = or w shl immr 16
+  w = or w shl imms 10
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn oxe_and_imm_x rd ulong rn ulong imm ulong to long
+  ret oxe_logic_imm 0 rd rn imm
+end
+
+fn oxe_ands_imm_x rd ulong rn ulong imm ulong to long
+  ret oxe_logic_imm 3 rd rn imm
+end
+
+fn oxe_csinc_x rd ulong rn ulong rm ulong cond ulong to long
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if gt rm 31
+    ret -1
+  end
+  if gt cond 15
+    ret -1
+  end
+  w = or shl ulong 1 31 shl ulong 0xd4 21
+  w = or w shl rm 16
+  w = or w shl cond 12
+  w = or w shl ulong 1 10
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn oxe_cinc_x rd ulong rn ulong cond ulong to long
+  if gt cond 13
+    ret -1
+  end
+  ret oxe_csinc_x rd rn rn xor cond 1
+end
+
+fn oxe_madd_w rd ulong rn ulong rm ulong ra ulong to long
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if gt rm 31
+    ret -1
+  end
+  if gt ra 31
+    ret -1
+  end
+  w = or shl ulong 0x1b 24 shl rm 16
+  w = or w shl ra 10
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn oxe_movn_w rd ulong imm16 ulong hw ulong to long
+  if gt rd 31
+    ret -1
+  end
+  if gt imm16 0xffff
+    ret -1
+  end
+  if gt hw 1
+    ret -1
+  end
+  w = or shl ulong 0x25 23 shl hw 21
+  w = or w shl imm16 5
+  ret long or w rd
+end
+
+fn oxe_adrp rd ulong page_delta long to long
+  if gt rd 31
+    ret -1
+  end
+  if lt page_delta -1048576
+    ret -1
+  end
+  if ge page_delta 1048576
+    ret -1
+  end
+  imm = and bitcast ulong page_delta 0x1fffff
+  w = or shl ulong 1 31 shl and imm 3 29
+  w = or w shl ulong 0x10 24
+  w = or w shl shr imm 2 5
+  ret long or w rd
+end
+
+fn oxe_ldp_x_off rt ulong rt2 ulong rn ulong off long to long
+  if gt rt 30
+    ret -1
+  end
+  if gt rt2 30
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if eq rt rt2
+    ret -1
+  end
+  if ne rem off 8 0
+    ret -1
+  end
+  if lt off -512
+    ret -1
+  end
+  if gt off 504
+    ret -1
+  end
+  imm7 = and bitcast ulong div off 8 0x7f
+  w = or shl ulong 2 30 shl ulong 5 27
+  w = or w shl ulong 2 23
+  w = or w shl ulong 1 22
+  w = or w shl imm7 15
+  w = or w shl rt2 10
+  w = or w shl rn 5
+  ret long or w rt
+end
+
+fn oxe_ldst_post sz ulong v ulong opc ulong rt ulong rn ulong simm9 long to long
+  if gt rt 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if lt simm9 -256
+    ret -1
+  end
+  if gt simm9 255
+    ret -1
+  end
+  imm9 = and bitcast ulong simm9 0x1ff
+  w = or shl sz 30 shl ulong 7 27
+  w = or w shl v 26
+  w = or w shl opc 22
+  w = or w shl imm9 12
+  w = or w shl ulong 1 10
+  w = or w shl rn 5
+  ret long or w rt
+end
+
+fn oxe_ldrsb_w_post rt ulong rn ulong simm9 long to long
+  if eq rt rn
+    if ne rn 31
+      ret -1
+    end
+  end
+  ret oxe_ldst_post 0 0 3 rt rn simm9
+end
+
+fn oxe_ldrb_w_post rt ulong rn ulong simm9 long to long
+  if eq rt rn
+    if ne rn 31
+      ret -1
+    end
+  end
+  ret oxe_ldst_post 0 0 1 rt rn simm9
+end
+
+fn oxe_strb_w_post rt ulong rn ulong simm9 long to long
+  if eq rt rn
+    if ne rn 31
+      ret -1
+    end
+  end
+  ret oxe_ldst_post 0 0 0 rt rn simm9
+end
+
+fn oxe_ldr_q_post qt ulong rn ulong simm9 long to long
+  ret oxe_ldst_post 0 1 3 qt rn simm9
+end
+
+fn oxe_str_q_post qt ulong rn ulong simm9 long to long
+  ret oxe_ldst_post 0 1 2 qt rn simm9
+end
+
+fn oxe_str_s_post st ulong rn ulong simm9 long to long
+  ret oxe_ldst_post 2 1 0 st rn simm9
+end
+
+fn oxe_ldr_q_uoff qt ulong rn ulong off ulong to long
+  if gt qt 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if ne rem off 16 0
+    ret -1
+  end
+  if gt div off 16 0xfff
+    ret -1
+  end
+  w = or shl ulong 7 27 shl ulong 1 26
+  w = or w shl ulong 1 24
+  w = or w shl ulong 3 22
+  w = or w shl div off 16 10
+  w = or w shl rn 5
+  ret long or w qt
+end
+
+fn oxe_stp_q_off qt ulong qt2 ulong rn ulong off long to long
+  if gt qt 31
+    ret -1
+  end
+  if gt qt2 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if ne rem off 16 0
+    ret -1
+  end
+  if lt off -1024
+    ret -1
+  end
+  if gt off 1008
+    ret -1
+  end
+  imm7 = and bitcast ulong div off 16 0x7f
+  w = or shl ulong 2 30 shl ulong 5 27
+  w = or w shl ulong 1 26
+  w = or w shl ulong 2 23
+  w = or w shl imm7 15
+  w = or w shl qt2 10
+  w = or w shl rn 5
+  ret long or w qt
+end
+
+fn oxe_ld1_4 vt ulong rn ulong post ulong to long
+  if gt vt 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  rmf = ulong 0
+  if ne post 0
+    rmf = shl ulong 31 16
+  end
+  w = or shl ulong 1 30 shl ulong 0x0c 24
+  w = or w shl post 23
+  w = or w shl ulong 1 22
+  w = or w rmf
+  w = or w shl ulong 2 12
+  w = or w shl rn 5
+  ret long or w vt
+end
+
+fn oxe_ld1_4x16b vt ulong rn ulong to long
+  ret oxe_ld1_4 vt rn 0
+end
+
+fn oxe_ld1_4x16b_post vt ulong rn ulong imm ulong to long
+  if ne imm 64
+    ret -1
+  end
+  ret oxe_ld1_4 vt rn 1
+end
+
+fn oxe_movi_16b vd ulong imm8 ulong to long
+  if gt vd 31
+    ret -1
+  end
+  if gt imm8 0xff
+    ret -1
+  end
+  w = or shl ulong 1 30 shl ulong 0x1e0 19
+  w = or w shl shr imm8 5 16
+  w = or w shl ulong 0x0e 12
+  w = or w shl ulong 1 10
+  w = or w shl and imm8 0x1f 5
+  ret long or w vd
+end
+
+fn oxe_three_same u ulong sz ulong op ulong vd ulong vn ulong vm ulong to long
+  if gt vd 31
+    ret -1
+  end
+  if gt vn 31
+    ret -1
+  end
+  if gt vm 31
+    ret -1
+  end
+  w = or shl ulong 1 30 shl u 29
+  w = or w shl ulong 0x0e 24
+  w = or w shl sz 22
+  w = or w shl ulong 1 21
+  w = or w shl vm 16
+  w = or w shl op 11
+  w = or w shl ulong 1 10
+  w = or w shl vn 5
+  ret long or w vd
+end
+
+fn oxe_and_16b vd ulong vn ulong vm ulong to long
+  ret oxe_three_same 0 0 0x03 vd vn vm
+end
+
+fn oxe_add_4s vd ulong vn ulong vm ulong to long
+  ret oxe_three_same 0 2 0x10 vd vn vm
+end
+
+fn oxe_addp_4s vd ulong vn ulong vm ulong to long
+  ret oxe_three_same 0 2 0x17 vd vn vm
+end
+
+fn oxe_sdot_4s vd ulong vn ulong vm ulong to long
+  if gt vd 31
+    ret -1
+  end
+  if gt vn 31
+    ret -1
+  end
+  if gt vm 31
+    ret -1
+  end
+  w = or shl ulong 1 30 shl ulong 0x0e 24
+  w = or w shl ulong 2 22
+  w = or w shl vm 16
+  w = or w shl ulong 1 15
+  w = or w shl ulong 2 11
+  w = or w shl ulong 1 10
+  w = or w shl vn 5
+  ret long or w vd
+end
+
+fn oxe_addv_4s sd ulong vn ulong to long
+  if gt sd 31
+    ret -1
+  end
+  if gt vn 31
+    ret -1
+  end
+  w = or shl ulong 1 30 shl ulong 0x0e 24
+  w = or w shl ulong 2 22
+  w = or w shl ulong 0x18 17
+  w = or w shl ulong 0x1b 12
+  w = or w shl ulong 2 10
+  w = or w shl vn 5
+  ret long or w sd
+end
+
+fn oxe_shift_imm op ulong immhb ulong vd ulong vn ulong to long
+  if gt vd 31
+    ret -1
+  end
+  if gt vn 31
+    ret -1
+  end
+  if lt immhb 8
+    ret -1
+  end
+  if gt immhb 15
+    ret -1
+  end
+  w = or shl ulong 1 30 shl ulong 0x1e 23
+  w = or w shl immhb 16
+  w = or w shl op 11
+  w = or w shl ulong 1 10
+  w = or w shl vn 5
+  ret long or w vd
+end
+
+fn oxe_shl_16b vd ulong vn ulong shift ulong to long
+  if gt shift 7
+    ret -1
+  end
+  ret oxe_shift_imm 0x0a add 8 shift vd vn
+end
+
+fn oxe_sshr_16b vd ulong vn ulong shift ulong to long
+  if lt shift 1
+    ret -1
+  end
+  if gt shift 8
+    ret -1
+  end
+  ret oxe_shift_imm 0x00 sub 16 shift vd vn
+end
+
+note ---- Omega scalar AArch64 encoders & decoder (matching om/aarch64/aarch64_om2.om) ----
+
+fn omx_a64_rrr base ulong sf ulong rd ulong rn ulong rm ulong to long
+  if gt sf 1
+    ret -1
+  end
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if gt rm 31
+    ret -1
+  end
+  w = or base shl sf 31
+  w = or w shl rm 16
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn omx_a64_addreg sf ulong rd ulong rn ulong rm ulong to long
+  ret omx_a64_rrr 0x0b000000 sf rd rn rm
+end
+
+fn omx_a64_subreg sf ulong rd ulong rn ulong rm ulong to long
+  ret omx_a64_rrr 0x4b000000 sf rd rn rm
+end
+
+fn omx_a64_orrreg sf ulong rd ulong rn ulong rm ulong to long
+  ret omx_a64_rrr 0x2a000000 sf rd rn rm
+end
+
+fn omx_a64_movreg sf ulong rd ulong rm ulong to long
+  if gt rd 30
+    ret -1
+  end
+  if gt rm 30
+    ret -1
+  end
+  ret omx_a64_orrreg sf rd 31 rm
+end
+
+fn omx_a64_movz sf ulong rd ulong imm16 ulong to long
+  if gt sf 1
+    ret -1
+  end
+  if gt rd 30
+    ret -1
+  end
+  if gt imm16 0xffff
+    ret -1
+  end
+  w = or ulong 0x52800000 shl sf 31
+  w = or w shl imm16 5
+  ret long or w rd
+end
+
+fn omx_a64_ret to long
+  ret long ulong 0xd65f03c0
+end
+
+fn omx_a64_b imm26 long to long
+  if lt imm26 -33554432
+    ret -1
+  end
+  if ge imm26 33554432
+    ret -1
+  end
+  ret long or ulong 0x14000000 and bitcast ulong imm26 0x03ffffff
+end
+
+fn omx_a64_bcond cond ulong imm19 long to long
+  if gt cond 15
+    ret -1
+  end
+  if lt imm19 -262144
+    ret -1
+  end
+  if ge imm19 262144
+    ret -1
+  end
+  w = shl and bitcast ulong imm19 0x7ffff 5
+  ret long or or ulong 0x54000000 w cond
+end
+
+fn omx_a64_cbz sf ulong rt ulong imm19 long to long
+  if gt sf 1
+    ret -1
+  end
+  if gt rt 31
+    ret -1
+  end
+  if lt imm19 -262144
+    ret -1
+  end
+  if ge imm19 262144
+    ret -1
+  end
+  w = or ulong 0x34000000 shl sf 31
+  w = or w shl and bitcast ulong imm19 0x7ffff 5
+  ret long or w rt
+end
+
+fn omx_a64_subsimm sf ulong rd ulong rn ulong imm12 ulong to long
+  if gt sf 1
+    ret -1
+  end
+  if gt rd 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if gt imm12 0xfff
+    ret -1
+  end
+  base = ulong 0x71000000
+  if eq sf 1
+    base = 0xf1000000
+  end
+  w = or base shl imm12 10
+  w = or w shl rn 5
+  ret long or w rd
+end
+
+fn omx_a64_ldruoff sf ulong rt ulong rn ulong uoff ulong to long
+  if gt sf 1
+    ret -1
+  end
+  if gt rt 30
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  sc = ulong 2
+  sz = ulong 4
+  base = ulong 0xb9400000
+  if eq sf 1
+    sc = 3
+    sz = 8
+    base = 0xf9400000
+  end
+  if ne rem uoff sz 0
+    ret -1
+  end
+  if gt div uoff sz 0xfff
+    ret -1
+  end
+  w = or base shl and shr uoff sc 0xfff 10
+  w = or w shl rn 5
+  ret long or w rt
+end
+
+fn omx_a64_strpost rt ulong rn ulong simm9 long to long
+  if gt rt 31
+    ret -1
+  end
+  if gt rn 31
+    ret -1
+  end
+  if eq rt rn
+    ret -1
+  end
+  if lt simm9 -256
+    ret -1
+  end
+  if gt simm9 255
+    ret -1
+  end
+  w = or ulong 0xb8000400 shl and bitcast ulong simm9 0x1ff 12
+  w = or w shl rn 5
+  ret long or w rt
+end
+
+note Decoder matching om/aarch64/aarch64_om2.om (dst: [0]=op [1]=sf [2]=rd [3]=rn [4]=rm [5]=imm16 [6]=hw [7]=bimm [8]=cond)
+fn omx_dregs dst edit ulong 9 op ulong insn ulong sb ulong n ulong to void
+  put dst 0 op
+  if lt sb 32
+    put dst 1 and shr insn sb 1
+  end
+  put dst 2 and insn 31
+  if ge n 2
+    put dst 3 and shr insn 5 31
+  end
+  if ge n 3
+    put dst 4 and shr insn 16 31
+  end
+end
+
+fn omx_dec1 insn ulong dst edit ulong 9 to ulong
+  if eq insn 0xd65f03c0
+    put dst 0 8
+    put dst 3 30
+    ret 0
+  end
+  if eq and insn 0xfc000000 0x14000000
+    put dst 0 9
+    put dst 7 and insn 0x03ffffff
+    ret 0
+  end
+  if eq and insn 0xff000010 0x54000000
+    put dst 0 10
+    put dst 8 and insn 15
+    put dst 7 and shr insn 5 0x7ffff
+    ret 0
+  end
+  m = and insn 0x7f000000
+  if eq m 0x34000000
+    omx_dregs dst 11 insn 31 1
+    put dst 7 and shr insn 5 0x7ffff
+    ret 0
+  end
+  if eq m 0x35000000
+    omx_dregs dst 12 insn 31 1
+    put dst 7 and shr insn 5 0x7ffff
+    ret 0
+  end
+  if eq and insn 0x7f800000 0x52800000
+    omx_dregs dst 7 insn 31 1
+    put dst 5 and shr insn 5 0xffff
+    put dst 6 and shr insn 21 3
+    ret 0
+  end
+  m2 = and insn 0x7f200000
+  if eq m2 0x2a000000
+    omx_dregs dst 5 insn 31 3
+    ret 0
+  end
+  if eq m2 0x0b000000
+    omx_dregs dst 1 insn 31 3
+    ret 0
+  end
+  if eq m2 0x4b000000
+    omx_dregs dst 2 insn 31 3
+    ret 0
+  end
+  ret 1
+end
+
+fn omx_a64_decode insn ulong dst edit ulong 9 to int
+  for i ulong 9
+    put dst i 0
+  end
+  if eq omx_dec1 insn dst 0
+    ret 0
+  end
+  m = and insn 0xbf400000
+  if eq m 0xb9400000
+    omx_dregs dst 15 insn 30 2
+    ret 0
+  end
+  if eq m 0xb9000000
+    omx_dregs dst 16 insn 30 2
+    ret 0
+  end
+  m2 = and insn 0xbf800c00
+  if eq m2 0xb8400400
+    omx_dregs dst 15 insn 30 2
+    ret 0
+  end
+  if eq m2 0xb8000400
+    omx_dregs dst 16 insn 30 2
+    ret 0
+  end
+  if eq and insn 0x7f000000 0x71000000
+    omx_dregs dst 19 insn 31 2
+    ret 0
+  end
+  ret -1
+end
+
+note ---- Tiny assembler helpers ----
+
+fn enc_put w long orig uchar is_lsl uchar to void
+  if ne get g_enc_st 1 0
+    ret
+  end
+  n = get g_enc_st 0
+  if or lt w 0 ge n 1024
+    put g_enc_st 1 1
+    ret
+  end
+  put g_enc_word n uint w
+  put g_enc_orig n orig
+  put g_enc_reloc n OMX_ENC_RELOC_NONE
+  put g_enc_bdisp n int 0
+  put g_enc_lsl n is_lsl
+  put g_enc_st 0 add n 1
+end
+
+fn enc_o w long to void
+  enc_put w OMX_ENC_FROM_OMEGA 0
+end
+
+fn enc_x w long to void
+  enc_put w OMX_ENC_FROM_EXT 0
+end
+
+fn enc_xlsl w long to void
+  enc_put w OMX_ENC_FROM_EXT 1
+end
+
+fn enc_label l ulong to void
+  if ne get g_enc_st 1 0
+    ret
+  end
+  if ge l 32
+    put g_enc_st 1 1
+    ret
+  end
+  if ge get g_enc_lab l 0
+    put g_enc_st 1 1
+    ret
+  end
+  put g_enc_lab l long get g_enc_st 0
+end
+
+fn enc_add_fix kind ulong l ulong cond ulong rt ulong to void
+  if ne get g_enc_st 1 0
+    ret
+  end
+  nf = get g_enc_st 2
+  n = get g_enc_st 0
+  if or ge nf 64 or ge l 32 eq n 0
+    put g_enc_st 1 1
+    ret
+  end
+  put g_enc_fix_at nf sub n 1
+  put g_enc_fix_kind nf kind
+  put g_enc_fix_lab nf l
+  put g_enc_fix_cond nf cond
+  put g_enc_fix_rt nf rt
+  put g_enc_st 2 add nf 1
+end
+
+fn enc_cbz rt ulong l ulong to void
+  enc_o omx_a64_cbz 1 rt 0
+  enc_add_fix OMX_FX_CBZ l 0 rt
+end
+
+fn enc_br l ulong to void
+  enc_o omx_a64_b 0
+  enc_add_fix OMX_FX_B l 0 0
+end
+
+fn enc_bcond cond ulong l ulong to void
+  enc_o omx_a64_bcond cond 0
+  enc_add_fix OMX_FX_BCOND l cond 0
+end
+
+fn enc_adr_data rd ulong to void
+  pos = get g_enc_st 0
+  base = get g_enc_st 3
+  doff = get g_enc_st 4
+  page = long 0
+  lo12 = ulong 0
+  if ne base 0
+    pc = add base mul 4 pos
+    tgt = add base doff
+    page = sub long shr tgt 12 long shr pc 12
+    lo12 = and tgt 0xfff
+  end
+  enc_x oxe_adrp rd page
+  if eq get g_enc_st 1 0
+    put g_enc_reloc sub get g_enc_st 0 1 OMX_ENC_RELOC_ADRP_PAGE
+  end
+  enc_x oxe_add_imm_x rd rd lo12 0
+  if eq get g_enc_st 1 0
+    put g_enc_reloc sub get g_enc_st 0 1 OMX_ENC_RELOC_ADD_LO12
+  end
+end
+
+fn enc_resolve to int
+  if ne get g_enc_st 1 0
+    ret -1
+  end
+  nf = get g_enc_st 2
+  for i ulong nf bound 64
+    lab = get g_enc_fix_lab i
+    tgt = get g_enc_lab lab
+    if lt tgt 0
+      ret -1
+    end
+    pos = get g_enc_fix_at i
+    d = sub tgt long pos
+    kind = get g_enc_fix_kind i
+    w = long -1
+    if eq kind OMX_FX_B
+      w = omx_a64_b d
+    else
+      if eq kind OMX_FX_BCOND
+        w = omx_a64_bcond get g_enc_fix_cond i d
+      else
+        if eq kind OMX_FX_CBZ
+          w = omx_a64_cbz 1 get g_enc_fix_rt i d
+        end
+      end
+    end
+    if lt w 0
+      ret -1
+    end
+    put g_enc_word pos uint w
+    put g_enc_bdisp pos int d
+  end
+  ret 0
+end
+
+note ---- Kernel: asm_sdot (mirrors src/polyglot/asm/omx_sdot.S line by line) ----
+note labels: 0=ERR 1=SCALAR 2=BLK4 3=ROWS1 4=ROW1 5=OK 6=B0 7=B1 8=B2 9=B3 10=B4
+note         11=R0 12=R1 13=R2 14=R3 15=R4 16=C0 17=C1
+
+fn emit_sdot_blk4 to void
+  enc_label 2
+  enc_o omx_a64_subsimm 1 31 3 4
+  enc_bcond OMX_COND_LO 3
+  for v ulong 8
+    enc_x oxe_movi_16b add 24 v 0
+  end
+  enc_o omx_a64_movreg 1 9 1
+  enc_o omx_a64_movreg 1 10 5
+  enc_o omx_a64_addreg 1 11 10 4
+  enc_o omx_a64_addreg 1 12 11 4
+  enc_o omx_a64_addreg 1 13 12 4
+  enc_cbz 6 7
+  enc_o omx_a64_movreg 1 14 6
+  enc_label 6
+  enc_x oxe_ld1_4x16b_post 0 9 64
+  enc_x oxe_ld1_4x16b_post 4 10 64
+  enc_x oxe_ld1_4x16b_post 16 11 64
+  enc_x oxe_sdot_4s 24 4 0
+  enc_x oxe_sdot_4s 28 5 1
+  enc_x oxe_sdot_4s 25 16 0
+  enc_x oxe_sdot_4s 29 17 1
+  enc_x oxe_ld1_4x16b_post 20 12 64
+  enc_x oxe_sdot_4s 24 6 2
+  enc_x oxe_sdot_4s 28 7 3
+  enc_x oxe_sdot_4s 25 18 2
+  enc_x oxe_sdot_4s 29 19 3
+  enc_x oxe_ld1_4x16b_post 4 13 64
+  enc_x oxe_sdot_4s 26 20 0
+  enc_x oxe_sdot_4s 30 21 1
+  enc_x oxe_sdot_4s 27 4 0
+  enc_x oxe_sdot_4s 31 5 1
+  enc_x oxe_sdot_4s 26 22 2
+  enc_x oxe_sdot_4s 30 23 3
+  enc_x oxe_sdot_4s 27 6 2
+  enc_x oxe_sdot_4s 31 7 3
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 6
+  enc_label 7
+  enc_cbz 7 9
+  enc_o omx_a64_movreg 1 14 7
+  enc_label 8
+  enc_x oxe_ldr_q_post 0 9 16
+  enc_x oxe_ldr_q_post 4 10 16
+  enc_x oxe_ldr_q_post 5 11 16
+  enc_x oxe_ldr_q_post 6 12 16
+  enc_x oxe_ldr_q_post 7 13 16
+  enc_x oxe_sdot_4s 24 4 0
+  enc_x oxe_sdot_4s 25 5 0
+  enc_x oxe_sdot_4s 26 6 0
+  enc_x oxe_sdot_4s 27 7 0
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 8
+  enc_label 9
+  enc_cbz 8 10
+  for r ulong 5
+    enc_o omx_a64_subreg 1 add 9 r add 9 r 15
+  end
+  enc_x oxe_ldr_q_uoff 0 9 0
+  enc_x oxe_ldr_q_uoff 1 16 0
+  enc_x oxe_and_16b 0 0 1
+  enc_x oxe_ldr_q_uoff 4 10 0
+  enc_x oxe_ldr_q_uoff 5 11 0
+  enc_x oxe_ldr_q_uoff 6 12 0
+  enc_x oxe_ldr_q_uoff 7 13 0
+  enc_x oxe_sdot_4s 28 4 0
+  enc_x oxe_sdot_4s 29 5 0
+  enc_x oxe_sdot_4s 30 6 0
+  enc_x oxe_sdot_4s 31 7 0
+  enc_label 10
+  enc_x oxe_add_4s 24 24 28
+  enc_x oxe_add_4s 25 25 29
+  enc_x oxe_add_4s 26 26 30
+  enc_x oxe_add_4s 27 27 31
+  enc_x oxe_addp_4s 24 24 25
+  enc_x oxe_addp_4s 26 26 27
+  enc_x oxe_addp_4s 24 24 26
+  enc_x oxe_str_q_post 24 2 16
+  enc_xlsl oxe_add_lsl_x 5 5 4 2
+  enc_x oxe_sub_imm_x 3 3 4 0
+  enc_br 2
+end
+
+fn emit_sdot_tail to void
+  enc_label 3
+  enc_cbz 3 5
+  enc_label 4
+  for v ulong 4
+    enc_x oxe_movi_16b add 24 v 0
+  end
+  enc_o omx_a64_movreg 1 9 1
+  enc_o omx_a64_movreg 1 10 5
+  enc_cbz 6 12
+  enc_o omx_a64_movreg 1 14 6
+  enc_label 11
+  enc_x oxe_ld1_4x16b_post 0 9 64
+  enc_x oxe_ld1_4x16b_post 4 10 64
+  enc_x oxe_sdot_4s 24 4 0
+  enc_x oxe_sdot_4s 25 5 1
+  enc_x oxe_sdot_4s 26 6 2
+  enc_x oxe_sdot_4s 27 7 3
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 11
+  enc_label 12
+  enc_cbz 7 14
+  enc_o omx_a64_movreg 1 14 7
+  enc_label 13
+  enc_x oxe_ldr_q_post 0 9 16
+  enc_x oxe_ldr_q_post 4 10 16
+  enc_x oxe_sdot_4s 24 4 0
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 13
+  enc_label 14
+  enc_cbz 8 15
+  enc_o omx_a64_subreg 1 9 9 15
+  enc_o omx_a64_subreg 1 10 10 15
+  enc_x oxe_ldr_q_uoff 0 9 0
+  enc_x oxe_ldr_q_uoff 1 16 0
+  enc_x oxe_and_16b 0 0 1
+  enc_x oxe_ldr_q_uoff 4 10 0
+  enc_x oxe_sdot_4s 25 4 0
+  enc_label 15
+  enc_x oxe_add_4s 24 24 25
+  enc_x oxe_add_4s 26 26 27
+  enc_x oxe_add_4s 24 24 26
+  enc_x oxe_addv_4s 24 24
+  enc_x oxe_str_s_post 24 2 4
+  enc_o omx_a64_addreg 1 5 5 4
+  enc_o omx_a64_subsimm 1 3 3 1
+  enc_bcond OMX_COND_NE 4
+  enc_label 5
+  enc_o omx_a64_movz 0 0 0
+  enc_o omx_a64_ret
+
+  enc_label 1
+  enc_label 16
+  enc_o omx_a64_movz 0 6 0
+  enc_o omx_a64_movreg 1 9 1
+  enc_o omx_a64_movreg 1 14 4
+  enc_label 17
+  enc_x oxe_ldrsb_w_post 10 5 1
+  enc_x oxe_ldrsb_w_post 11 9 1
+  enc_x oxe_madd_w 6 10 11 6
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 17
+  enc_o omx_a64_strpost 6 2 4
+  enc_o omx_a64_subsimm 1 3 3 1
+  enc_bcond OMX_COND_NE 16
+  enc_o omx_a64_movz 0 0 0
+  enc_o omx_a64_ret
+
+  enc_label 0
+  enc_x oxe_movn_w 0 0 0
+  enc_o omx_a64_ret
+end
+
+fn emit_sdot to void
+  enc_cbz 0 0
+  enc_cbz 1 0
+  enc_cbz 2 0
+  enc_x oxe_ldp_x_off 3 4 0 0
+  enc_o omx_a64_ldruoff 1 5 0 16
+  enc_cbz 5 0
+  enc_cbz 3 0
+  enc_cbz 4 0
+  enc_o omx_a64_subsimm 1 31 4 16
+  enc_bcond OMX_COND_LO 1
+
+  enc_x oxe_lsr_imm_x 6 4 6
+  enc_x oxe_ubfx_x 7 4 4 2
+  enc_x oxe_and_imm_x 8 4 15
+  enc_adr_data 16
+  enc_o omx_a64_addreg 1 16 16 8
+  enc_o omx_a64_movz 1 15 16
+  enc_o omx_a64_subreg 1 15 15 8
+
+  emit_sdot_blk4
+  emit_sdot_tail
+end
+
+note ---- Kernel: asm_crumb (mirrors src/polyglot/asm/omx_crumb.S line by line) ----
+note labels: 0=ERR 1=BLK4 2=ROWS1 3=ROW1 4=OK 5=T0 6=T1 7=B0 8=B1 9=B2 10=R0 11=R1 12=R2
+
+fn emit_crow wv ulong va ulong vb ulong tbase ulong to void
+  t0 = tbase
+  t1 = add tbase 1
+  t2 = add tbase 2
+  t3 = add tbase 3
+  enc_x oxe_shl_16b t0 wv 6
+  enc_x oxe_shl_16b t1 wv 4
+  enc_x oxe_shl_16b t2 wv 2
+  enc_x oxe_sshr_16b t3 wv 6
+  enc_x oxe_sshr_16b t0 t0 6
+  enc_x oxe_sshr_16b t1 t1 6
+  enc_x oxe_sshr_16b t2 t2 6
+  enc_x oxe_sdot_4s vb t3 3
+  enc_x oxe_sdot_4s va t0 0
+  enc_x oxe_sdot_4s vb t1 1
+  enc_x oxe_sdot_4s va t2 2
+end
+
+fn emit_chunk4 to void
+  enc_x oxe_ldr_q_post 4 10 16
+  enc_x oxe_ldr_q_post 5 11 16
+  enc_x oxe_ldr_q_post 6 12 16
+  enc_x oxe_ldr_q_post 7 13 16
+  emit_crow 4 24 28 16
+  emit_crow 5 25 29 20
+  emit_crow 6 26 30 16
+  emit_crow 7 27 31 20
+end
+
+fn emit_crumb to void
+  enc_cbz 0 0
+  enc_cbz 1 0
+  enc_cbz 2 0
+  enc_x oxe_ldp_x_off 3 4 0 0
+  enc_o omx_a64_ldruoff 1 5 0 16
+  enc_cbz 5 0
+  enc_cbz 3 0
+  enc_cbz 4 0
+
+  enc_x oxe_sub_imm_x 31 31 64 0
+  enc_x oxe_movi_16b 0 0
+  enc_x oxe_stp_q_off 0 0 31 0
+  enc_x oxe_stp_q_off 0 0 31 32
+  enc_x oxe_lsr_imm_x 6 4 6
+  enc_x oxe_ands_imm_x 8 4 63
+  enc_x oxe_cinc_x 7 6 OMX_COND_NE
+  enc_x oxe_lsl_imm_x 7 7 4
+  enc_cbz 8 6
+  enc_xlsl oxe_add_lsl_x 9 1 6 6
+  enc_x oxe_add_imm_x 10 31 0 0
+  enc_o omx_a64_movreg 1 14 8
+  enc_label 5
+  enc_x oxe_ldrb_w_post 11 9 1
+  enc_x oxe_strb_w_post 11 10 1
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 5
+  enc_label 6
+
+  enc_label 1
+  enc_o omx_a64_subsimm 1 31 3 4
+  enc_bcond OMX_COND_LO 2
+  for v ulong 8
+    enc_x oxe_movi_16b add 24 v 0
+  end
+  enc_o omx_a64_movreg 1 9 1
+  enc_o omx_a64_movreg 1 10 5
+  enc_o omx_a64_addreg 1 11 10 7
+  enc_o omx_a64_addreg 1 12 11 7
+  enc_o omx_a64_addreg 1 13 12 7
+  enc_cbz 6 8
+  enc_o omx_a64_movreg 1 14 6
+  enc_label 7
+  enc_x oxe_ld1_4x16b_post 0 9 64
+  emit_chunk4
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 7
+  enc_label 8
+  enc_cbz 8 9
+  enc_x oxe_ld1_4x16b 0 31
+  emit_chunk4
+  enc_label 9
+  enc_x oxe_add_4s 24 24 28
+  enc_x oxe_add_4s 25 25 29
+  enc_x oxe_add_4s 26 26 30
+  enc_x oxe_add_4s 27 27 31
+  enc_x oxe_addp_4s 24 24 25
+  enc_x oxe_addp_4s 26 26 27
+  enc_x oxe_addp_4s 24 24 26
+  enc_x oxe_str_q_post 24 2 16
+  enc_xlsl oxe_add_lsl_x 5 5 7 2
+  enc_x oxe_sub_imm_x 3 3 4 0
+  enc_br 1
+
+  enc_label 2
+  enc_cbz 3 4
+  enc_label 3
+  enc_x oxe_movi_16b 24 0
+  enc_x oxe_movi_16b 28 0
+  enc_o omx_a64_movreg 1 9 1
+  enc_o omx_a64_movreg 1 10 5
+  enc_cbz 6 11
+  enc_o omx_a64_movreg 1 14 6
+  enc_label 10
+  enc_x oxe_ld1_4x16b_post 0 9 64
+  enc_x oxe_ldr_q_post 4 10 16
+  emit_crow 4 24 28 16
+  enc_o omx_a64_subsimm 1 14 14 1
+  enc_bcond OMX_COND_NE 10
+  enc_label 11
+  enc_cbz 8 12
+  enc_x oxe_ld1_4x16b 0 31
+  enc_x oxe_ldr_q_post 4 10 16
+  emit_crow 4 24 28 16
+  enc_label 12
+  enc_x oxe_add_4s 24 24 28
+  enc_x oxe_addv_4s 24 24
+  enc_x oxe_str_s_post 24 2 4
+  enc_o omx_a64_addreg 1 5 5 7
+  enc_o omx_a64_subsimm 1 3 3 1
+  enc_bcond OMX_COND_NE 3
+  enc_label 4
+  enc_x oxe_add_imm_x 31 31 64 0
+  enc_o omx_a64_movz 0 0 0
+  enc_o omx_a64_ret
+
+  enc_label 0
+  enc_x oxe_movn_w 0 0 0
+  enc_o omx_a64_ret
+end
+
+note Build kernel k (0=sdot, 1=crumb) into g_enc_word[0..n). base=0 object form, base!=0 final form.
+fn omx_encoder_build k ulong base ulong to int
+  if ge k OMX_ENC_KERNELS
+    ret -1
+  end
+  if ne and base 0xfff 0
+    ret -1
+  end
+  for i ulong 16
+    put g_enc_sdot_mask i uchar 0
+    put g_enc_sdot_mask add i 16 uchar 0xff
+  end
+  put g_enc_st 3 base
+  off = ulong 0
+  for pass ulong 2
+    for i ulong 32
+      put g_enc_lab i -1
+    end
+    put g_enc_st 0 0
+    put g_enc_st 1 0
+    put g_enc_st 2 0
+    put g_enc_st 4 off
+    if eq k OMX_ENC_SDOT
+      emit_sdot
+    else
+      emit_crumb
+    end
+    if ne get g_enc_st 1 0
+      ret -1
+    end
+    n = get g_enc_st 0
+    off = and add mul n 4 15 0xfffffffffffffff0
+    if eq off get g_enc_st 4
+      break
+    end
+    if eq pass 1
+      ret -1
+    end
+  end
+  n = get g_enc_st 0
+  ub = ulong 512
+  if eq k OMX_ENC_SDOT
+    ub = 256
+  end
+  if gt n ub
+    ret -1
+  end
+  if ne enc_resolve 0
+    ret -1
+  end
+  put g_enc_st 4 off
+  if eq k OMX_ENC_SDOT
+    put g_enc_st 5 32
+  else
+    put g_enc_st 5 0
+  end
+  ret 0
+end

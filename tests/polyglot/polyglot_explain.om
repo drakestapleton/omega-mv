@@ -1,0 +1,349 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/polyglot/polyglot_explain.om -- pure seeded OM-2 POLYGLOT-0 deterministic
+note receipt explainer (spec/polyglot-0.md section 9).
+note Reads ONLY the contract file (--spec) and receipt directory (--receipts),
+note sorts .json filenames in deterministic byte order, verifies contract digest,
+note and prints deterministic byte-identical explanation output.
+
+global g_pe_arg uchar 512
+global g_pe_spec uchar 512
+global g_pe_dir uchar 512
+global g_pe_run uchar 128
+global g_pe_contract uchar 64
+note g_pe_cfg: [0]=spec_len [1]=dir_len [2]=run_len [3]=nfiles [4]=nvalid [5]=nign [6]=nstale [7]=nsmoke
+global g_pe_cfg ulong 8
+
+global g_pe_dbuf uchar 65536
+note Up to 256 receipt filenames, 128 bytes each
+global g_pe_names uchar 32768
+global g_pe_nlens ulong 256
+global g_pe_order ulong 256
+global g_pe_path uchar 768
+
+text t_pe_sp_flag "--spec"
+text t_pe_rc_flag "--receipts"
+text t_pe_rn_flag "--run"
+text t_pe_usage "usage: polyglot_explain --spec spec/polyglot-0.md --receipts DIR [--run RUN_ID]\n"
+text t_pe_schema "OMEGA_POLYGLOT0_RECEIPT_V1"
+text t_pe_hdr "POLYGLOT-0 explanation (spec/polyglot-0.md section 9, pure OM-2)\ncontract section 1 sha256: "
+text t_pe_rec1 "\nreceipts: "
+text t_pe_rec2 " read, "
+text t_pe_rec3 " ignored (not OMEGA_POLYGLOT0_RECEIPT_V1), "
+text t_pe_rec4 " stale contract, "
+text t_pe_rec5 " smoke\n"
+text t_pe_file "  receipt: "
+text t_pe_ok " [contract=MATCH"
+text t_pe_stale " [contract=STALE"
+text t_pe_smk " smoke=true]\n"
+text t_pe_nsmk " smoke=false]\n"
+text t_pe_ksmoke "\"smoke\": true"
+
+fn pe_arg_eq alen ulong b view uchar * to bool
+  if ne alen len b
+    ret false
+  end
+  for i ulong alen bound 512
+    if ne get g_pe_arg i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pe_dbuf_ends_json off ulong n ulong to bool
+  if le n 5
+    ret false
+  end
+  b = add off sub n 5
+  if ne get g_pe_dbuf b 46
+    ret false
+  end
+  if ne get g_pe_dbuf add b 1 106
+    ret false
+  end
+  if ne get g_pe_dbuf add b 2 115
+    ret false
+  end
+  if ne get g_pe_dbuf add b 3 111
+    ret false
+  end
+  if ne get g_pe_dbuf add b 4 110
+    ret false
+  end
+  ret true
+end
+
+fn pe_fbuf_contains pat view uchar * flen ulong to bool
+  plen = len pat
+  if gt plen flen
+    ret false
+  end
+  lim = add sub flen plen 1
+  for i ulong lim bound 262144
+    ok = ulong 1
+    for j ulong plen bound 128
+      if ne get g_omx_fbuf add i j get pat j
+        ok = 0
+        break
+      end
+    end
+    if eq ok 1
+      ret true
+    end
+  end
+  ret false
+end
+
+fn pe_fbuf_contains_contract flen ulong to bool
+  if lt flen 64
+    ret false
+  end
+  lim = add sub flen 64 1
+  for i ulong lim bound 262144
+    ok = ulong 1
+    for j ulong 64
+      if ne get g_omx_fbuf add i j get g_pe_contract j
+        ok = 0
+        break
+      end
+    end
+    if eq ok 1
+      ret true
+    end
+  end
+  ret false
+end
+
+fn pe_cmp_names ia ulong ib ulong to long
+  la = get g_pe_nlens ia
+  lb = get g_pe_nlens ib
+  mn = la
+  if lt lb mn
+    mn = lb
+  end
+  ba = mul ia 128
+  bb = mul ib 128
+  for i ulong mn bound 128
+    ca = ulong get g_pe_names add ba i
+    cb = ulong get g_pe_names add bb i
+    if lt ca cb
+      ret -1
+    end
+    if gt ca cb
+      ret 1
+    end
+  end
+  if lt la lb
+    ret -1
+  end
+  if gt la lb
+    ret 1
+  end
+  ret 0
+end
+
+fn pe_sort_names n ulong to void
+  for i ulong n bound 256
+    put g_pe_order i i
+  end
+  for i ulong n bound 256
+    j = add i 1
+    while lt j n bound 256
+      oi = get g_pe_order i
+      oj = get g_pe_order j
+      if gt pe_cmp_names oi oj 0
+        put g_pe_order i oj
+        put g_pe_order j oi
+      end
+      j = add j 1
+    end
+  end
+end
+
+fn pe_add_dent noff ulong nlen ulong to void
+  if not pe_dbuf_ends_json noff nlen
+    ret
+  end
+  if ge nlen 128
+    ret
+  end
+  nf = get g_pe_cfg 3
+  if ge nf 256
+    ret
+  end
+  dst = mul nf 128
+  for k ulong nlen bound 128
+    put g_pe_names add dst k get g_pe_dbuf add noff k
+  end
+  put g_pe_nlens nf nlen
+  put g_pe_cfg 3 add nf 1
+end
+
+fn pe_scan_buf nu ulong to void
+  pos = ulong 0
+  while lt pos nu bound 65536
+    reclen = or ulong get g_pe_dbuf add pos 16 shl ulong get g_pe_dbuf add pos 17 8
+    if lt reclen 20
+      break
+    end
+    noff = add pos 19
+    nlen = ulong 0
+    lim = add pos reclen
+    while lt add noff nlen lim bound 256
+      if eq get g_pe_dbuf add noff nlen 0
+        break
+      end
+      nlen = add nlen 1
+    end
+    pe_add_dent noff nlen
+    pos = add pos reclen
+  end
+end
+
+fn pe_scan_dir to int
+  fd = fopen g_pe_dir 0 get g_pe_cfg 1 0 0
+  if lt fd 0
+    ret -1
+  end
+  fdi = int fd
+  while true bound 1024
+    nread = getdnts fdi g_pe_dbuf 0 65536
+    if le nread 0
+      break
+    end
+    pe_scan_buf ulong nread
+  end
+  _c = fclose fdi
+  ret 0
+end
+
+fn pe_build_path idx ulong to ulong
+  dlen = get g_pe_cfg 1
+  p = ulong 0
+  for i ulong dlen bound 512
+    put g_omx_path p get g_pe_dir i
+    p = add p 1
+  end
+  put g_omx_path p uchar 47
+  p = add p 1
+  nlen = get g_pe_nlens idx
+  base = mul idx 128
+  for i ulong nlen bound 128
+    put g_omx_path p get g_pe_names add base i
+    p = add p 1
+  end
+  ret p
+end
+
+fn pe_process_one idx ulong to void
+  plen = pe_build_path idx
+  flen = omx_read_gpath plen
+  if lt flen 0
+    put g_pe_cfg 5 add get g_pe_cfg 5 1
+    ret
+  end
+  fu = ulong flen
+  if not pe_fbuf_contains t_pe_schema fu
+    put g_pe_cfg 5 add get g_pe_cfg 5 1
+    ret
+  end
+  put g_pe_cfg 4 add get g_pe_cfg 4 1
+  cmatch = pe_fbuf_contains_contract fu
+  if not cmatch
+    put g_pe_cfg 6 add get g_pe_cfg 6 1
+  end
+  ismoke = pe_fbuf_contains t_pe_ksmoke fu
+  if ismoke
+    put g_pe_cfg 7 add get g_pe_cfg 7 1
+  end
+  omx_puts t_pe_file
+  _w = write 1 g_pe_names mul idx 128 get g_pe_nlens idx
+  if cmatch
+    omx_puts t_pe_ok
+  else
+    omx_puts t_pe_stale
+  end
+  if ismoke
+    omx_puts t_pe_smk
+  else
+    omx_puts t_pe_nsmk
+  end
+end
+
+fn main to int
+  for i ulong 8
+    put g_pe_cfg i 0
+  end
+  argc = ulong argcnt
+  i = ulong 1
+  while lt i argc bound 32
+    alen = argread i g_pe_arg 0 512
+    if le alen 0
+      break
+    end
+    au = ulong alen
+    if pe_arg_eq au t_pe_sp_flag
+      i = add i 1
+      if lt i argc
+        sl = argread i g_omx_path 0 512
+        if gt sl 0
+          put g_pe_cfg 0 ulong sl
+        end
+      end
+    else
+      if pe_arg_eq au t_pe_rc_flag
+        i = add i 1
+        if lt i argc
+          dl = argread i g_pe_dir 0 512
+          if gt dl 0
+            put g_pe_cfg 1 ulong dl
+          end
+        end
+      else
+        if pe_arg_eq au t_pe_rn_flag
+          i = add i 1
+          if lt i argc
+            rl = argread i g_pe_run 0 128
+            if gt rl 0
+              put g_pe_cfg 2 ulong rl
+            end
+          end
+        end
+      end
+    end
+    i = add i 1
+  end
+  if or eq get g_pe_cfg 0 0 eq get g_pe_cfg 1 0
+    omx_eputs t_pe_usage
+    ret 2
+  end
+  if ne omx_contract_digest_gpath get g_pe_cfg 0 0
+    ret 2
+  end
+  for k ulong 64
+    put g_pe_contract k get g_omx_shhex k
+  end
+  if ne pe_scan_dir 0
+    ret 2
+  end
+  nf = get g_pe_cfg 3
+  pe_sort_names nf
+  omx_puts t_pe_hdr
+  _w = write 1 g_pe_contract 0 64
+  omx_nl
+  for k ulong nf bound 256
+    pe_process_one get g_pe_order k
+  end
+  omx_puts t_pe_rec1
+  omx_putu get g_pe_cfg 4
+  omx_puts t_pe_rec2
+  omx_putu get g_pe_cfg 5
+  omx_puts t_pe_rec3
+  omx_putu get g_pe_cfg 6
+  omx_puts t_pe_rec4
+  omx_putu get g_pe_cfg 7
+  omx_puts t_pe_rec5
+  ret 0
+end
