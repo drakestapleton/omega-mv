@@ -965,8 +965,8 @@ $(RX_R15_PERF_SILICON_ND): $(RX_R15_PERF_SRCS) $(RX_R15_PERF_HDRS) $(RX_R15_GPU_
 	$(CC) $(CFLAGS) -DR15_SILICON -DRX_MEASURE_NO_CAUSAL_DIGEST -pthread -o $@ \
 		$(RX_R15_PERF_SRCS) $(RX_R15_GPU_SRCS) $(AIENOS_CAP_LIB) -ldl -lm
 
-$(R15_REDUCE): tools/r15_reduce.c src/omega_om_units.c src/sha256.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -o $@ tools/r15_reduce.c src/omega_om_units.c -lm
+$(R15_REDUCE): tools/r15_reduce.om seed/out/omc | $(OUT_DIR)
+	seed/out/omc < tools/r15_reduce.om > $@ && chmod +x $@
 
 r15-perf-host: $(RX_R15_PERF_HOST) $(RX_R15_PERF_HOST_ND) $(R15_REDUCE)
 r15-perf-silicon: $(RX_R15_PERF_SILICON) $(RX_R15_PERF_SILICON_ND) $(R15_REDUCE)

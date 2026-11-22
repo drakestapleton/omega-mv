@@ -278,7 +278,7 @@ physics=$PHYSICS_LOCK
     printf '"binaries":{"trial":%s,"nodigest":%s,"reducer":%s},' \
         "$(jstr "$TRIAL_SHA")" "$(jstr "$NODIGEST_SHA")" "$(jstr "$REDUCER_SHA")"
     printf '"reducer_source_sha256":%s,"rounds":%s,"l1_runs":%s,"l2_runs":%s}\n' \
-        "$(jstr "$(sha_file "$CANDIDATE_SRC/tools/r15_reduce.c")")" "$ROUNDS" "$L1RUNS" "$L2RUNS"
+        "$(jstr "$(sha_file "$CANDIDATE_SRC/tools/r15_reduce.om")")" "$ROUNDS" "$L1RUNS" "$L2RUNS"
 } > "$OUT/machine.json"
 ps -eo pid,pcpu,rss,comm --sort=-pcpu > "$OUT/processes-before.txt"
 [ "$PARANOID_DURING" = 1 ] || say "WARNING: could not set perf_event_paranoid to 1 (reads $PARANOID_DURING); memory-traffic counters will be missing"
