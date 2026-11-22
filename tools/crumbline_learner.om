@@ -1,0 +1,914 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/crumbline_learner.om -- pure seeded OM-2 Crumbline learner binary.
+note Replaces tools/crumbline_learner.c. Composed after src/crumbline/crumbline.om.
+note Modes:
+note   crumbline-learner                 serve the protocol on stdin/stdout
+note   crumbline-learner --decode FILE   decode a visible crumb file and print its shape
+
+text t_dec_flag "--decode"
+text t_dec_err "decode-error "
+text t_ok_enc "ok enc="
+text t_sp_in " in="
+text t_sp_out " out="
+text t_sp_n " n="
+text t_sp_bud " budget="
+text t_bar " |"
+text t_arr " ->"
+
+global g_arg1 uchar 256
+global g_path uchar 1024
+global g_out uchar 8192
+global g_outn ulong 1
+global g_io uchar 4096
+global g_hdr uchar 8
+global g_evbuf uchar 82000
+global g_evcnt ulong 1
+global g_evfail ulong 1
+global g_wbuf uchar 4096
+global g_wlen ulong 1
+
+fn lo_c c uchar to void
+  n = get g_outn 0
+  if lt n 8191
+    put g_out n c
+    put g_outn 0 add n 1
+  end
+end
+
+fn lo_s s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    lo_c get s i
+    i = add i 1
+  end
+end
+
+fn lo_u64 v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    lo_c 48
+    ret
+  end
+  k = ulong 0
+  while gt v 0
+    put tmp k uchar add 48 rem v 10
+    v = div v 10
+    k = add k 1
+  end
+  while gt k 0
+    k = sub k 1
+    lo_c get tmp k
+  end
+end
+
+fn lo_i64 v long to void
+  if lt v 0
+    lo_c 45
+    lo_u64 ulong neg v
+    ret
+  end
+  lo_u64 ulong v
+end
+
+fn lo_flush fd int to void
+  n = get g_outn 0
+  off = ulong 0
+  while lt off n
+    w = write fd g_out off sub n off
+    if le w 0
+      break
+    end
+    off = add off ulong w
+  end
+  put g_outn 0 0
+end
+
+fn fd_write_all fd int n ulong use_ev bool use_hdr bool to bool
+  off = ulong 0
+  while lt off n
+    w = long 0
+    if use_hdr
+      w = write fd g_hdr off sub n off
+    else
+      if use_ev
+        w = write fd g_evbuf off sub n off
+      else
+        w = write fd g_wbuf off sub n off
+      end
+    end
+    if le w 0
+      ret false
+    end
+    off = add off ulong w
+  end
+  ret true
+end
+
+fn fd_read_exact fd int n ulong to_hdr bool to bool
+  if not to_hdr
+    if lt len g_rbuf add n 1
+      _e = enlarge g_rbuf add n 1
+    end
+  end
+  got = ulong 0
+  while lt got n
+    want = sub n got
+    if gt want 4096
+      want = 4096
+    end
+    r = read fd g_io 0 want
+    if le r 0
+      ret false
+    end
+    ur = ulong r
+    i = ulong 0
+    while lt i ur
+      if to_hdr
+        put g_hdr add got i get g_io i
+      else
+        put g_rbuf add got i get g_io i
+      end
+      i = add i 1
+    end
+    got = add got ur
+  end
+  ret true
+end
+
+fn send_frame ftype ulong length ulong use_ev bool to bool
+  put g_hdr 0 uchar ftype
+  put g_hdr 1 uchar and length 255
+  put g_hdr 2 uchar and shr length 8 255
+  put g_hdr 3 uchar and shr length 16 255
+  put g_hdr 4 uchar and shr length 24 255
+  if not fd_write_all 1 5 false true
+    ret false
+  end
+  if gt length 0
+    ret fd_write_all 1 length use_ev false
+  end
+  ret true
+end
+
+fn recv_frame to long
+  if not fd_read_exact 0 5 true
+    ret neg long 1
+  end
+  ft = ulong get g_hdr 0
+  b0 = ulong get g_hdr 1
+  b1 = ulong get g_hdr 2
+  b2 = ulong get g_hdr 3
+  b3 = ulong get g_hdr 4
+  n = or or b0 shl b1 8 or shl b2 16 shl b3 24
+  if gt n 16777216
+    ret neg long 1
+  end
+  if gt n 0
+    if not fd_read_exact 0 n false
+      ret neg long 1
+    end
+  end
+  put g_rlen 0 n
+  ret long ft
+end
+
+fn wb_u8 b uchar to void
+  p = get g_wlen 0
+  if lt p 4095
+    put g_wbuf p b
+    put g_wlen 0 add p 1
+  end
+end
+
+fn wb_u16 v ulong to void
+  wb_u8 uchar and v 255
+  wb_u8 uchar and shr v 8 255
+end
+
+fn wb_u32 v ulong to void
+  wb_u8 uchar and v 255
+  wb_u8 uchar and shr v 8 255
+  wb_u8 uchar and shr v 16 255
+  wb_u8 uchar and shr v 24 255
+end
+
+fn wb_u64 v ulong to void
+  i = ulong 0
+  while lt i 8
+    wb_u8 uchar and shr v mul i 8 255
+    i = add i 1
+  end
+end
+
+fn wb_cpg1_ts slot ulong to void
+  wb_u8 67
+  wb_u8 80
+  wb_u8 71
+  wb_u8 49
+  wb_u16 1
+  n = get g_ts_n slot
+  wb_u8 uchar n
+  base = mul slot 24
+  i = ulong 0
+  while lt i n
+    wb_u8 uchar get g_ts_op add base i
+    wb_u64 get g_ts_imm add base i
+    i = add i 1
+  end
+end
+
+fn wb_cpg1_bank oi ulong to void
+  wb_u8 67
+  wb_u8 80
+  wb_u8 71
+  wb_u8 49
+  wb_u16 1
+  n = get g_bnk_sn oi
+  wb_u8 uchar n
+  base = mul oi 24
+  i = ulong 0
+  while lt i n
+    wb_u8 uchar get g_bnk_sop add base i
+    wb_u64 get g_bnk_simm add base i
+    i = add i 1
+  end
+end
+
+fn flush_events to void
+  cnt = get g_evcnt 0
+  if eq cnt 0
+    ret
+  end
+  put g_evbuf 0 uchar and cnt 255
+  put g_evbuf 1 uchar and shr cnt 8 255
+  put g_evbuf 2 uchar and shr cnt 16 255
+  put g_evbuf 3 uchar and shr cnt 24 255
+  if not send_frame 132 add 4 mul cnt 20 true
+    put g_evfail 0 1
+  end
+  put g_evcnt 0 0
+end
+
+fn emit_event to void
+  cnt = get g_evcnt 0
+  o = add 4 mul cnt 20
+  put g_evbuf o uchar get g_ev 0
+  put g_evbuf add o 1 uchar get g_ev 1
+  put g_evbuf add o 2 uchar get g_ev 2
+  put g_evbuf add o 3 uchar get g_ev 3
+  op = get g_ev 4
+  put g_evbuf add o 4 uchar and op 255
+  put g_evbuf add o 5 uchar and shr op 8 255
+  v = get g_ev 5
+  put g_evbuf add o 6 uchar and v 255
+  put g_evbuf add o 7 uchar and shr v 8 255
+  put g_evbuf add o 8 uchar and shr v 16 255
+  put g_evbuf add o 9 uchar and shr v 24 255
+  v = get g_ev 6
+  put g_evbuf add o 10 uchar and v 255
+  put g_evbuf add o 11 uchar and shr v 8 255
+  put g_evbuf add o 12 uchar and shr v 16 255
+  put g_evbuf add o 13 uchar and shr v 24 255
+  v = get g_ev 7
+  put g_evbuf add o 14 uchar and v 255
+  put g_evbuf add o 15 uchar and shr v 8 255
+  put g_evbuf add o 16 uchar and shr v 16 255
+  put g_evbuf add o 17 uchar and shr v 24 255
+  op = get g_ev 8
+  put g_evbuf add o 18 uchar and op 255
+  put g_evbuf add o 19 uchar and shr op 8 255
+  cnt = add cnt 1
+  put g_evcnt 0 cnt
+  if eq cnt 4096
+    flush_events
+  end
+end
+
+fn send_bank to bool
+  put g_wlen 0 0
+  cnt = get g_bnk_cnt 0
+  wb_u32 cnt
+  i = ulong 0
+  while lt i cnt
+    wb_u8 uchar get g_bnk_orig i
+    wb_u32 get g_bnk_ref i
+    wb_cpg1_bank i
+    i = add i 1
+  end
+  ret send_frame 130 get g_wlen 0 false
+end
+
+fn send_done to bool
+  put g_wlen 0 0
+  wb_u8 uchar get g_res 0
+  wb_u32 get g_res 1
+  i = ulong 2
+  while lt i 14
+    wb_u32 get g_res i
+    i = add i 1
+  end
+  wb_u64 get g_res 14
+  wb_u64 get g_res 15
+  ret send_frame 133 get g_wlen 0 false
+end
+
+fn submit_one nid ulong slot ulong flags ulong to void
+  oq = get g_res 10
+  if ge oq get g_cfg 3
+    put g_sr 9 1
+    ret
+  end
+  oq = add oq 1
+  put g_res 10 oq
+  if eq get g_sr 11 0
+    put g_sr 11 1
+    put g_res 13 get g_sr 8
+  end
+  put g_ev 0 CL_EV_SUBMIT
+  put g_ev 1 0
+  put g_ev 2 CL_VERIFY_PASS
+  if ne and flags 1 0
+    put g_ev 3 CL_FIT_ROBUST
+  else
+    put g_ev 3 CL_FIT_EXACT
+  end
+  put g_ev 4 0
+  put g_ev 5 nid
+  put g_ev 6 nid
+  put g_ev 7 0
+  put g_ev 8 oq
+  emit_event
+  flush_events
+  put g_wlen 0 0
+  wb_u32 nid
+  wb_u8 uchar flags
+  hyp = get g_sr 8
+  if gt hyp 255
+    hyp = 255
+  end
+  wb_u8 uchar hyp
+  wb_cpg1_ts slot
+  if not send_frame 131 get g_wlen 0 false
+    put g_sr 9 1
+    ret
+  end
+  ft = recv_frame
+  if or ne ft 3 ne get g_rlen 0 1
+    put g_sr 9 1
+    ret
+  end
+  vd = ulong get g_rbuf 0
+  if eq vd CL_VERDICT_ACCEPT
+    put g_sr 10 1
+    put g_sr 9 1
+    put g_res 0 CL_OUTCOME_SOLVED
+    put g_res 1 nid
+    put g_res 12 get g_res 2
+  else
+    if eq vd CL_VERDICT_EXHAUSTED
+      put g_sr 9 1
+    else
+      put g_res 11 add get g_res 11 1
+    end
+  end
+end
+
+fn flush_pending to void
+  np = get g_sr 6
+  i = ulong 0
+  while and lt i np eq get g_sr 9 0
+    nid = get g_pend_nid i
+    sn = get g_pend_sn i
+    put g_ts_n 0 sn
+    src = mul i 24
+    j = ulong 0
+    while lt j sn
+      put g_ts_op j get g_pend_sop add src j
+      put g_ts_imm j get g_pend_simm add src j
+      j = add j 1
+    end
+    submit_one nid 0 0
+    i = add i 1
+  end
+  put g_sr 6 0
+end
+
+fn sr_alloc_tables cap ulong tsize ulong w ulong to void
+  if lt len g_nd_id cap
+    _e = enlarge g_nd_id cap
+    _e = enlarge g_nd_par cap
+    _e = enlarge g_nd_op cap
+    _e = enlarge g_nd_nst cap
+    _e = enlarge g_nd_ins cap
+  end
+  vn = mul cap w
+  if lt len g_nd_vals vn
+    _e = enlarge g_nd_vals vn
+  end
+  if lt len g_ht_used tsize
+    _e = enlarge g_ht_h1 tsize
+    _e = enlarge g_ht_h2 tsize
+    _e = enlarge g_ht_ins tsize
+    _e = enlarge g_ht_used tsize
+  end
+  i = ulong 0
+  while lt i tsize
+    put g_ht_used i 0
+    i = add i 1
+  end
+end
+
+fn sr_record_fit pi ulong oi ulong child ulong to void
+  put g_ev 3 CL_FIT_EXACT
+  put g_res 8 add get g_res 8 1
+  if ne cl_build_steps pi oi 0 0
+    put g_ev 2 4
+    put g_res 9 add get g_res 9 1
+    ret
+  end
+  put g_ev 2 CL_VERIFY_PASS
+  put g_res 14 add get g_res 14 add get g_sr 0 32
+  cl_ts_behavior 0 0
+  nh = get g_sr 8
+  is_new = true
+  h = ulong 0
+  while lt h nh
+    ho = mul h 32
+    same = true
+    j = ulong 0
+    while lt j 32
+      if ne get g_hyps add ho j get g_dig_tmp j
+        same = false
+        break
+      end
+      j = add j 1
+    end
+    if same
+      is_new = false
+      break
+    end
+    h = add h 1
+  end
+  if and is_new lt nh 64
+    ho = mul nh 32
+    j = ulong 0
+    while lt j 32
+      put g_hyps add ho j get g_dig_tmp j
+      j = add j 1
+    end
+    put g_sr 8 add nh 1
+  end
+  np = get g_sr 6
+  if and is_new lt np 64
+    if eq np 0
+      put g_sr 7 get g_res 2
+    end
+    put g_pend_nid np child
+    sn = get g_ts_n 0
+    put g_pend_sn np sn
+    dst = mul np 24
+    j = ulong 0
+    while lt j sn
+      put g_pend_sop add dst j get g_ts_op j
+      put g_pend_simm add dst j get g_ts_imm j
+      j = add j 1
+    end
+    put g_sr 6 add np 1
+  end
+end
+
+fn sr_keep_node pi ulong oi ulong child ulong nst ulong ins ulong to void
+  cnt = get g_sr 3
+  w = get g_sr 1
+  put g_nd_id cnt child
+  put g_nd_par cnt pi
+  put g_nd_op cnt oi
+  put g_nd_nst cnt nst
+  put g_nd_ins cnt ins
+  co = mul cnt w
+  k = ulong 0
+  while lt k w
+    put g_nd_vals add co k get g_sr_scr k
+    k = add k 1
+  end
+  put g_sr 3 add cnt 1
+end
+
+fn sr_count_mm to ulong
+  n = get g_sr 0
+  mask = get g_sr 2
+  mm = ulong 0
+  k = ulong 0
+  while lt k n
+    if ne and get g_sr_scr k mask get g_crb_out mul k 8
+      mm = add mm 1
+    end
+    k = add k 1
+  end
+  ret mm
+end
+
+fn sr_check_and_keep pi ulong oi ulong child ulong lk ulong to ulong
+  mm = sr_count_mm
+  if and lt lk get g_cfg 2 lt get g_sr 3 get g_sr 4
+    sr_keep_node pi oi child add get g_nd_nst pi get g_bnk_sn oi add get g_nd_ins pi cl_bnk_op_insns oi
+    lk = add lk 1
+  else
+    put g_ev 1 CL_PRUNE_FRONTIER_CAP
+    put g_res 7 add get g_res 7 1
+  end
+  if eq mm 0
+    sr_record_fit pi oi child
+  else
+    mt = sub get g_sr 0 mm
+    if and ge mt get g_sr 17 gt mt get g_sr 13
+      put g_sr 13 mt
+      put g_sr 14 child
+      put g_sr 15 pi
+      put g_sr 16 oi
+    end
+  end
+  ret lk
+end
+
+fn sr_expand_op pi ulong oi ulong lk ulong to ulong
+  child = get g_sr 12
+  put g_sr 12 add child 1
+  put g_ev 0 CL_EV_EXPAND
+  put g_ev 1 CL_PRUNE_NONE
+  put g_ev 2 CL_VERIFY_NOT_REACHED
+  put g_ev 3 CL_FIT_NONE
+  put g_ev 4 oi
+  put g_ev 5 get g_nd_id pi
+  put g_ev 6 child
+  put g_ev 7 0
+  put g_ev 8 0
+  nst = add get g_nd_nst pi get g_bnk_sn oi
+  ins = add get g_nd_ins pi cl_bnk_op_insns oi
+  if gt nst CL_MAX_STEPS
+    put g_ev 1 CL_PRUNE_STEP_CAP
+    emit_event
+    ret lk
+  end
+  if gt add ins 1 get g_cfg 6
+    put g_ev 1 CL_PRUNE_COST
+    put g_res 6 add get g_res 6 1
+    emit_event
+    ret lk
+  end
+  w = get g_sr 1
+  pvo = mul pi w
+  k = ulong 0
+  while lt k w
+    put g_sr_scr k cl_eval_bank_op oi get g_nd_vals add pvo k
+    k = add k 1
+  end
+  put g_ev 7 w
+  cl_hash_vals w
+  if cl_equiv_seen ins
+    put g_ev 1 CL_PRUNE_EQUIV
+    put g_res 5 add get g_res 5 1
+    emit_event
+    ret lk
+  end
+  put g_res 3 add get g_res 3 1
+  lk = sr_check_and_keep pi oi child lk
+  emit_event
+  if ne get g_sr 6 0
+    if ge get g_res 2 add get g_sr 7 get g_cfg 4
+      flush_pending
+    end
+  end
+  ret lk
+end
+
+fn sr_run_levels to void
+  ls = ulong 0
+  le_ = ulong 1
+  depth = ulong 1
+  while and le depth get g_cfg 1 eq get g_sr 9 0
+    lk = ulong 0
+    pi = ls
+    while and lt pi le_ eq get g_sr 9 0
+      put g_res 4 add get g_res 4 1
+      oi = ulong 0
+      bc = get g_bnk_cnt 0
+      while and lt oi bc eq get g_sr 9 0
+        if ge get g_res 2 get g_cfg 0
+          put g_sr 9 1
+          break
+        end
+        put g_res 2 add get g_res 2 1
+        lk = sr_expand_op pi oi lk
+        oi = add oi 1
+      end
+      pi = add pi 1
+    end
+    ls = le_
+    le_ = get g_sr 3
+    if eq ls le_
+      break
+    end
+    depth = add depth 1
+  end
+end
+
+fn cl_search_run to void
+  i = ulong 0
+  while lt i 16
+    put g_res i 0
+    i = add i 1
+  end
+  put g_res 0 CL_OUTCOME_UNSOLVED
+  put g_res 1 4294967295
+  if ne get g_crb_meta 6 0
+    b0 = get g_crb_meta 7
+    if and gt b0 0 lt b0 get g_cfg 0
+      put g_cfg 0 b0
+    end
+    b0 = get g_crb_meta 8
+    if and gt b0 0 lt b0 get g_cfg 1
+      put g_cfg 1 b0
+    end
+    b0 = get g_crb_meta 9
+    if and gt b0 0 lt b0 get g_cfg 3
+      put g_cfg 3 b0
+    end
+  end
+  if or ne get g_crb_meta 1 1 ne get g_crb_meta 2 1
+    put g_res 0 CL_OUTCOME_UNSUPPORTED
+    ret
+  end
+  cl_init_probes
+  n = get g_crb_meta 5
+  w = add n 32
+  put g_sr 0 n
+  put g_sr 1 w
+  put g_sr 2 cl_crumb_out_mask
+  cap = add mul get g_cfg 2 get g_cfg 1 1
+  if gt cap add get g_cfg 0 1
+    cap = add get g_cfg 0 1
+  end
+  tsize = ulong 1024
+  need = mul 2 add get g_cfg 0 2
+  while lt tsize need
+    tsize = shl tsize 1
+  end
+  put g_sr 4 cap
+  put g_sr 5 sub tsize 1
+  i = ulong 6
+  while lt i 14
+    put g_sr i 0
+    i = add i 1
+  end
+  put g_sr 12 1
+  rp = get g_cfg 5
+  if gt rp 0
+    put g_sr 17 div add mul n rp 99 100
+  else
+    put g_sr 17 4294967295
+  end
+  sr_alloc_tables cap tsize w
+  put g_nd_id 0 0
+  put g_nd_par 0 4294967295
+  put g_nd_op 0 65535
+  put g_nd_nst 0 0
+  put g_nd_ins 0 0
+  i = ulong 0
+  while lt i n
+    v = get g_crb_in mul i 8
+    put g_sr_inp i v
+    put g_nd_vals i v
+    put g_sr_scr i v
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    v = get g_probes i
+    put g_nd_vals add n i v
+    put g_sr_scr add n i v
+    i = add i 1
+  end
+  cl_hash_vals w
+  _seen = cl_equiv_seen 0
+  put g_sr 3 1
+  sr_run_levels
+  if eq get g_sr 10 0
+    if ne get g_sr 6 0
+      put g_sr 9 0
+      flush_pending
+    end
+  end
+  if eq get g_sr 10 0
+    if gt get g_sr 13 0
+      if lt get g_res 10 get g_cfg 3
+        if eq cl_build_steps get g_sr 15 get g_sr 16 0 0
+          put g_sr 9 0
+          submit_one get g_sr 14 0 1
+        end
+      end
+    end
+  end
+end
+
+fn print_decoded_crumb to void
+  lo_s t_ok_enc
+  lo_u64 get g_crb_meta 0
+  lo_s t_sp_in
+  lo_u64 get g_crb_meta 1
+  lo_c 120
+  lo_u64 get g_crb_meta 3
+  lo_s t_sp_out
+  lo_u64 get g_crb_meta 2
+  lo_c 120
+  lo_u64 get g_crb_meta 4
+  lo_s t_sp_n
+  n = get g_crb_meta 5
+  lo_u64 n
+  if ne get g_crb_meta 6 0
+    lo_s t_sp_bud
+    lo_u64 get g_crb_meta 7
+    lo_c 44
+    lo_u64 get g_crb_meta 8
+    lo_c 44
+    lo_u64 get g_crb_meta 9
+    lo_c 44
+    lo_u64 get g_crb_meta 10
+  end
+  ia = get g_crb_meta 1
+  oa = get g_crb_meta 2
+  i = ulong 0
+  while lt i n
+    lo_s t_bar
+    l = ulong 0
+    while lt l ia
+      lo_c 32
+      lo_u64 get g_crb_in add mul i 8 l
+      l = add l 1
+    end
+    lo_s t_arr
+    l = ulong 0
+    while lt l oa
+      lo_c 32
+      lo_u64 get g_crb_out add mul i 8 l
+      l = add l 1
+    end
+    i = add i 1
+  end
+  lo_c 10
+  lo_flush 1
+end
+
+fn decode_file plen ulong to int
+  fd = fopen g_path 0 plen 0 0
+  if lt fd 0
+    ret 1
+  end
+  if lt len g_rbuf 65536
+    _e = enlarge g_rbuf 65536
+  end
+  tot = ulong 0
+  while true
+    r = read int fd g_io 0 4096
+    if le r 0
+      break
+    end
+    ur = ulong r
+    if lt len g_rbuf add add tot ur 1
+      _e = enlarge g_rbuf mul add add tot ur 1 2
+    end
+    i = ulong 0
+    while lt i ur
+      put g_rbuf add tot i get g_io i
+      i = add i 1
+    end
+    tot = add tot ur
+  end
+  _fc = fclose int fd
+  rc = cl_crumb_decode tot
+  if ne rc 0
+    lo_s t_dec_err
+    lo_i64 rc
+    lo_c 10
+    lo_flush 1
+    ret 1
+  end
+  print_decoded_crumb
+  ret 0
+end
+
+fn serve_loop to int
+  put g_cfg 0 20000
+  put g_cfg 1 6
+  put g_cfg 2 4000
+  put g_cfg 3 4
+  put g_cfg 4 400
+  put g_cfg 5 75
+  put g_cfg 6 80
+  lib_on = false
+  put g_lib_cnt 0 0
+  while true
+    ft = recv_frame
+    if lt ft 0
+      ret 2
+    end
+    cl_r_init get g_rlen 0
+    if eq ft 1
+      if ne cl_r_u16 1
+        ret 2
+      end
+      lib_on = ne cl_r_u8 0
+      put g_cfg 0 cl_r_u32
+      put g_cfg 1 cl_r_u32
+      put g_cfg 2 cl_r_u32
+      put g_cfg 3 cl_r_u32
+      put g_cfg 4 cl_r_u32
+      put g_cfg 5 cl_r_u32
+      if not cl_r_done
+        ret 2
+      end
+      put g_wbuf 0 1
+      put g_wbuf 1 0
+      if not send_frame 129 2 false
+        ret 2
+      end
+      continue
+    end
+    if eq ft 4
+      oref = cl_r_u32
+      sc = cl_r_u8
+      if or ne cl_decode_cpg1_to_ts 0 0 not cl_r_done
+        ret 2
+      end
+      if lib_on
+        cl_lib_admit_ts 0 sc oref
+      end
+      continue
+    end
+    if eq ft 2
+      rc = cl_crumb_decode get g_rlen 0
+      if ne rc 0
+        i = ulong 0
+        while lt i 16
+          put g_res i 0
+          i = add i 1
+        end
+        put g_res 0 CL_OUTCOME_UNSUPPORTED
+        put g_res 1 4294967295
+        if or not send_bank not send_done
+          ret 2
+        end
+        continue
+      end
+      cl_bank_init_base
+      if lib_on
+        cl_lib_export cl_crumb_input_bits
+      end
+      if not send_bank
+        ret 2
+      end
+      put g_evcnt 0 0
+      put g_evfail 0 0
+      cl_search_run
+      flush_events
+      if or ne get g_evfail 0 0 not send_done
+        ret 2
+      end
+      continue
+    end
+    if eq ft 5
+      ret 0
+    end
+    ret 2
+  end
+  ret 0
+end
+
+fn main to int
+  ac = argcnt
+  if eq ac 3
+    l1 = argread 1 g_arg1 0 255
+    l2 = argread 2 g_path 0 1023
+    if and eq l1 8 ge l2 0
+      ok = true
+      i = ulong 0
+      while lt i 8
+        if ne get g_arg1 i get t_dec_flag i
+          ok = false
+          break
+        end
+        i = add i 1
+      end
+      if ok
+        ret decode_file ulong l2
+      end
+    end
+  end
+  if ne ac 1
+    ret 64
+  end
+  ret serve_loop
+end
