@@ -32,18 +32,33 @@ seed of about 400 bytes of machine code. The four strands must arrive at the sam
 | --- | --- | --- |
 | The Monk | 408 B, `seed/rung0/seed0.hex` | The skeleton: the reference compiler and the proof verifier. It refuses on one wrong bit. |
 | The Predator | 396 B, `seedB0.b0` | The muscle: an optimizing compiler that hunts for faster GPU kernels. |
-| The Trickster | 404 B, `seedC0.c0` | The immune system: it attacks the proof gate, and each attack that worked once became a permanent check (15 so far). |
-| The Ascetic | 404 B, `seedD0.d0` | The discipline: the smallest footprint and the coolest schedule. |
+| The Trickster | 404 B, `seedC0.c0` | The immune system: it attacks the proof gate. Its checks are twelve host adversarial controls and three guards that came from failures observed on silicon. |
+| The Ascetic | 404 B, `seedD0.d0` | The discipline: zero-swap scheduling with warp-yield pacing. |
 
 The four converge on `seed/out/omc` (952,784 bytes, SHA-256
 `708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3`). One faulty strand is quarantined and
-regrown from its seed. Two strands that disagree stop the build. The commands and the records are in
+regrown from its seed. When fewer than three of the four agree, the build stops. The commands and the records are in
 [seed/helix/README.md](seed/helix/README.md).
+
+## Serve a model yourself
+
+`q36-35b` is an OpenAI-compatible HTTP server for Qwen 3.6 35B-A3B. You need an NVIDIA GB10 (a DGX Spark)
+running 64-bit Arm Linux, and the model weights.
+
+```sh
+sh seed/omega-from-seed.sh
+sh om/gpu/q36/build.sh build/q36
+sh om/gpu/q36/install-spark.sh .
+q36-35b --self-test
+q36-35b --port 18091
+```
+
+[om/gpu/q36/README.md](om/gpu/q36/README.md) has what each step does and what was verified.
 
 ## What these numbers are, and are not
 
-They were measured on one NVIDIA GB10 (a DGX Spark), each in the run its record names. The compiler in this
-repository makes programs for 64-bit Arm Linux. The website has the prebuilt compiler and a curl install:
+They were measured on one NVIDIA GB10, each in the run its record names. The compiler in this repository
+makes programs for 64-bit Arm Linux. The website has the prebuilt compiler and a curl install:
 [interplane.io/omega](https://interplane.io/omega/).
 
 ## What Omega is
