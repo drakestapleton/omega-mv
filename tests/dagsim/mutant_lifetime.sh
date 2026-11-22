@@ -4,26 +4,21 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-src=tools/dagsim/dagsim.c
+src=tools/dagsim/dagsim.om
+unit=tests/dagsim/dagsim_unit.om
+OMC=${OMC:-seed/out/omc}
 grep -q 'LIFETIME_ORDER_CHECK' "$src"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-sed '/LIFETIME_ORDER_CHECK/d' "$src" > "$tmp/dagsim.c"
-grep -q 'LIFETIME_ORDER_CHECK' "$tmp/dagsim.c" && { echo "mutant: check still present"; exit 1; }
-grep -q 'reject_inverted_lifetimes' "$tmp/dagsim.c" || { echo "mutant: deleted more than the call"; exit 1; }
-
-CC=${CC:-cc}
-# -Wno-unused-function: deleting the call leaves reject_inverted_lifetimes unreferenced.
-# The mutant has to run. The kill is the named assertion, not a compile error.
-cflags="-std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -D_GNU_SOURCE -O2 -Isrc -Itools/dagsim"
-$CC $cflags -c -o "$tmp/dagsim.o" "$tmp/dagsim.c"
-$CC $cflags -c -o "$tmp/rx_costmodel.o" src/runtime/rx_costmodel.c
-if [ "$(uname -m)" = aarch64 ]; then
-  sha=src/omega_om_units.c
-else
-  sha=tests/dagsim/sha256_host.c
+sed '/LIFETIME_ORDER_CHECK/{n;s/dag_life m s/ulong 0/;}' "$src" > "$tmp/dagsim.om"
+if cmp -s "$src" "$tmp/dagsim.om"; then
+  echo "mutant: failed to drop LIFETIME_ORDER_CHECK call"
+  exit 1
 fi
-$CC $cflags -o "$tmp/unit" tests/dagsim/dagsim_unit.c "$tmp/dagsim.o" "$tmp/rx_costmodel.o" "$sha" -Wl,--wrap=rx_cm_predict -lm
+grep -q 'fn dag_life' "$tmp/dagsim.om" || { echo "mutant: deleted more than the call"; exit 1; }
+
+cat "$tmp/dagsim.om" "$unit" | "$OMC" > "$tmp/unit"
+chmod +x "$tmp/unit"
 set +e
 "$tmp/unit" > "$tmp/out" 2>&1
 rc=$?

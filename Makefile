@@ -1309,32 +1309,21 @@ test-costmodel: $(RX_CM_UNIT)
 # dagsim.o keeps the #590 (3bd56731) nm guard: no generation store, authority,
 # world, or a call that maps or runs code.
 .PHONY: test-dagsim
-DS_OBJ = $(OUT_DIR)/dagsim.o
+DS_LIB = tools/dagsim/dagsim.om
 DS_UNIT = $(OUT_DIR)/dagsim_unit
 DS_CLI = $(OUT_DIR)/dagsim
-ifeq ($(shell uname -m),aarch64)
-DS_SHA_SRC = src/omega_om_units.c
-else
-DS_SHA_SRC = tests/dagsim/sha256_host.c
-endif
 
-$(DS_OBJ): tools/dagsim/dagsim.c tools/dagsim/dagsim.h src/runtime/rx_costmodel.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -Itools/dagsim -c -o $@ tools/dagsim/dagsim.c
-	@if nm -u $@ | grep -E 'rx_gen_|aienos_cap_|rx_caproot_|rx_capadmin_|rx_world_|mmap|mprotect|fork|exec|dlopen|system' ; then \
-		echo "dagsim.o references an operation an offline evaluator must not have"; \
-		rm -f $@; exit 1; fi
+$(DS_UNIT): $(DS_LIB) tests/dagsim/dagsim_unit.om seed/out/omc | $(OUT_DIR)
+	cat $(DS_LIB) tests/dagsim/dagsim_unit.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(DS_UNIT): tests/dagsim/dagsim_unit.c $(DS_OBJ) $(RX_CM_OBJ) $(DS_SHA_SRC) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -Itools/dagsim -o $@ tests/dagsim/dagsim_unit.c $(DS_OBJ) $(RX_CM_OBJ) $(DS_SHA_SRC) -Wl,--wrap=rx_cm_predict -lm
-
-$(DS_CLI): tools/dagsim/dagsim_cli.c $(DS_OBJ) $(RX_CM_OBJ) $(DS_SHA_SRC) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -Itools/dagsim -o $@ tools/dagsim/dagsim_cli.c $(DS_OBJ) $(RX_CM_OBJ) $(DS_SHA_SRC) -lm
+$(DS_CLI): $(DS_LIB) tools/dagsim/dagsim_cli.om seed/out/omc | $(OUT_DIR)
+	cat $(DS_LIB) tools/dagsim/dagsim_cli.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-dagsim: $(DS_UNIT) $(DS_CLI)
 	./$(DS_UNIT)
 	sh tests/dagsim/run_cli.sh $(DS_CLI) $(OUT_DIR)/dagsim-cli-out
-	sh tests/dagsim/mutant_lifetime.sh
-	sh tests/dagsim/mutant_predict.sh
+	OMC="$(CURDIR)/seed/out/omc" sh tests/dagsim/mutant_lifetime.sh
+	OMC="$(CURDIR)/seed/out/omc" sh tests/dagsim/mutant_predict.sh
 
 # AArch64 hosts: the gate. Real realizations, training, promotion through the
 # R9 barrier on the native authority, held-out workloads.

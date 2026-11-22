@@ -5,27 +5,22 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-src=tools/dagsim/dagsim.c
-grep -q 'PREDICT_REFUSAL_CHECK' "$src"
+src=tools/dagsim/dagsim.om
+unit=tests/dagsim/dagsim_unit.om
+OMC=${OMC:-seed/out/omc}
+grep -q 'PREDICT_REFUSAL_CHECK_START' "$src"
+grep -q 'PREDICT_REFUSAL_CHECK_END' "$src"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-sed '/PREDICT_REFUSAL_CHECK/s/st == RX_CM_ERR_UNSUPPORTED || p->refused || //' "$src" > "$tmp/dagsim.c"
-grep -q 'PREDICT_REFUSAL_CHECK' "$tmp/dagsim.c" || { echo "mutant: deleted the check tag"; exit 1; }
-grep -q 'RX_CM_ERR_UNSUPPORTED' "$tmp/dagsim.c" && { echo "mutant: unsupported check still present"; exit 1; }
-grep -q 'predict_unusable' "$tmp/dagsim.c" || { echo "mutant: deleted the call"; exit 1; }
-
-CC=${CC:-cc}
-# -Wno-unused-parameter: dropping the use of st must not die at compile time.
-# The kill is the named assertion, not a warning.
-cflags="-std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter -D_GNU_SOURCE -O2 -Isrc -Itools/dagsim"
-$CC $cflags -c -o "$tmp/dagsim.o" "$tmp/dagsim.c"
-$CC $cflags -c -o "$tmp/rx_costmodel.o" src/runtime/rx_costmodel.c
-if [ "$(uname -m)" = aarch64 ]; then
-  sha=src/omega_om_units.c
-else
-  sha=tests/dagsim/sha256_host.c
+sed '/PREDICT_REFUSAL_CHECK_START/,/PREDICT_REFUSAL_CHECK_END/d' "$src" > "$tmp/dagsim.om"
+if cmp -s "$src" "$tmp/dagsim.om"; then
+  echo "mutant: failed to drop PREDICT_REFUSAL_CHECK block"
+  exit 1
 fi
-$CC $cflags -o "$tmp/unit" tests/dagsim/dagsim_unit.c "$tmp/dagsim.o" "$tmp/rx_costmodel.o" "$sha" -Wl,--wrap=rx_cm_predict -lm
+grep -q 'fn dr_bad' "$tmp/dagsim.om" || { echo "mutant: deleted dr_bad"; exit 1; }
+
+cat "$tmp/dagsim.om" "$unit" | "$OMC" > "$tmp/unit"
+chmod +x "$tmp/unit"
 set +e
 "$tmp/unit" > "$tmp/out" 2>&1
 rc=$?
