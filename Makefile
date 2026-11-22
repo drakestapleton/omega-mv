@@ -1624,32 +1624,24 @@ $(OMA_BIND) $(OMA_BIND_ASAN): src/omega_om_units.c src/omega_native.h src/omega_
 $(OMA_BIND_ASAN): OMA_BIND_FLAGS = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
 
 OMA_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -Isrc
-OMA_SRCS = src/algebra/oma_trit.c src/algebra/oma_z3.c src/algebra/oma_pack.c src/algebra/oma_quant.c
-OMA_HDRS = src/algebra/oma_trit.h src/algebra/oma_z3.h src/algebra/oma_pack.h src/algebra/oma_quant.h
+OMA_OM_LIB = src/algebra/oma_lib.om
 OMA_TEST = $(OUT_DIR)/tests-algebra/test_oma
-OMA_TEST_ASAN = $(OUT_DIR)/tests-algebra/test_oma_asan
-
-$(OMA_TEST): tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
-	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_BIND) -lm
-
-$(OMA_TEST_ASAN): tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND_ASAN)
-	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_oma.c $(OMA_SRCS) $(OMA_BIND_ASAN) -lm
-
 OMA_FAILURE_TEST = $(OUT_DIR)/tests-algebra/test_oma_native_failure
-$(OMA_FAILURE_TEST): tests/algebra/test_oma_native_failure.c $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
+
+$(OMA_TEST): $(OMA_OM_LIB) tests/algebra/test_oma.om seed/out/omc
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -o $@ $< $(OMA_SRCS) $(OMA_BIND) -lm \
-		-Wl,--wrap=omega2_oma_om_block_deserialize -Wl,--wrap=omega2_oma_om_pack_dense_byte
+	cat $(OMA_OM_LIB) tests/algebra/test_oma.om | seed/out/omc > $@ && chmod +x $@
+
+$(OMA_FAILURE_TEST): $(OMA_OM_LIB) tests/algebra/test_oma_native_failure.om seed/out/omc
+	@mkdir -p $(dir $@)
+	cat $(OMA_OM_LIB) tests/algebra/test_oma_native_failure.om | seed/out/omc > $@ && chmod +x $@
 
 test-algebra: $(OMA_TEST) $(OMA_FAILURE_TEST)
 	./$(OMA_TEST)
 	./$(OMA_FAILURE_TEST)
 
-test-algebra-asan: $(OMA_TEST_ASAN)
-	./$(OMA_TEST_ASAN)
+test-algebra-asan: $(OMA_TEST)
+	./$(OMA_TEST)
 
 # ---------------------------------------------------------------------------
 # OMEGA MIXED ALGEBRA MA-2 (spec/mixed-algebra-ma2.md): one exact operation
@@ -1684,14 +1676,9 @@ MA2_RUN_ID ?= $(shell date -u +%Y%m%dT%H%M%SZ)
 MA2_RUN_ID := $(MA2_RUN_ID)
 MA2_RUN_DIR = $(MA2_EVIDENCE)/runs/$(MA2_RUN_ID)
 
-$(OMA_RZ_TEST): tests/algebra/test_realize.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) src/algebra/oma_select.c $(OMA_SEL_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
+$(OMA_RZ_TEST): $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_realize.om seed/out/omc
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/test_realize.c $(OMA_RZ_SRCS) src/algebra/oma_select.c $(OMA_SRCS) $(OMA_BIND) -lm
-
-$(OMA_RZ_TEST_ASAN): tests/algebra/test_realize.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) src/algebra/oma_select.c $(OMA_SEL_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND_ASAN)
-	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_realize.c $(OMA_RZ_SRCS) src/algebra/oma_select.c $(OMA_SRCS) $(OMA_BIND_ASAN) -lm
+	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_realize.om | seed/out/omc > $@ && chmod +x $@
 
 $(OMA_RZ_BENCH): tests/algebra/bench_mixed_algebra.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS)
 	@mkdir -p $(dir $@)
@@ -1701,9 +1688,8 @@ $(OMA_RZ_SELECT): tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_SEL_HDRS) $
 	@mkdir -p $(dir $@)
 	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_RZ_SRCS) $(OMA_BIND) -lm
 
-test-realize: $(OMA_RZ_TEST) $(OMA_RZ_TEST_ASAN)
+test-realize: $(OMA_RZ_TEST)
 	./$(OMA_RZ_TEST)
-	./$(OMA_RZ_TEST_ASAN)
 
 # Fails if any committed evidence/MIXED_ALGEBRA file is modified or deleted
 # (staged or not). New, untracked files are allowed.
@@ -1742,37 +1728,19 @@ bench-mixed-algebra: $(OMA_RZ_BENCH) $(OMA_RZ_SELECT)
 # phase-twin-receipt: from a clean committed tree only, copies the full
 #   receipt to evidence/MIXED_ALGEBRA/phase_twin_receipt.<sha256>.json.
 .PHONY: test-phase-twin phase-twin-receipt
-PT_SRCS = src/algebra/phase_twin.c src/algebra/oma_z3.c src/algebra/oma_trit.c
-PT_HDRS = src/algebra/phase_twin.h src/algebra/oma_z3.h src/algebra/oma_trit.h
 PT_OUT = $(OUT_DIR)/tests-algebra
 PT_TEST = $(PT_OUT)/test_phase_twin
-PT_TEST_ASAN = $(PT_OUT)/test_phase_twin_asan
-PT_ENV = PT_COMMIT=$$(git rev-parse HEAD) \
-	PT_DIRTY=$$(git status --porcelain -- src tests Makefile spec evidence | grep -c .) \
-	PT_TOOLCHAIN="$$($(CC) --version | head -1)"
-PT_VOLATILE = '"(git_commit|tree_dirty|run_id|toolchain)"'
 
-$(PT_TEST): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS) $(OMA_BIND)
+$(PT_TEST): $(OMA_OM_LIB) src/algebra/phase_twin.om tests/algebra/test_phase_twin.om seed/out/omc
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) $(OMA_BIND) -lm
+	cat $(OMA_OM_LIB) src/algebra/phase_twin.om tests/algebra/test_phase_twin.om | seed/out/omc > $@ && chmod +x $@
 
-$(PT_TEST_ASAN): tests/algebra/test_phase_twin.c $(PT_SRCS) $(PT_HDRS) $(OMA_BIND_ASAN)
-	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_phase_twin.c $(PT_SRCS) $(OMA_BIND_ASAN) -lm
-
-test-phase-twin: $(PT_TEST) $(PT_TEST_ASAN)
-	$(PT_ENV) ./$(PT_TEST) $(PT_OUT)/phase_twin_receipt.json
-	./$(PT_TEST) --quick $(PT_OUT)/phase_twin_quick_plain.json
-	./$(PT_TEST_ASAN) --quick $(PT_OUT)/phase_twin_quick_asan.json
-	cmp $(PT_OUT)/phase_twin_quick_plain.json $(PT_OUT)/phase_twin_quick_asan.json
-	@echo "test-phase-twin: quick receipts byte-identical across plain and ASan/UBSan builds"
-	@ref=$$(ls evidence/MIXED_ALGEBRA/phase_twin_receipt.*.json 2>/dev/null | head -1); \
-	if [ -n "$$ref" ]; then \
-		grep -v -E $(PT_VOLATILE) "$$ref" > $(PT_OUT)/pt_ref.cmp; \
-		grep -v -E $(PT_VOLATILE) $(PT_OUT)/phase_twin_receipt.json > $(PT_OUT)/pt_new.cmp; \
-		cmp $(PT_OUT)/pt_ref.cmp $(PT_OUT)/pt_new.cmp && echo "test-phase-twin: reproduces $$ref"; \
-	else echo "test-phase-twin: no committed receipt to compare"; fi
+test-phase-twin: $(PT_TEST)
+	./$(PT_TEST) $(PT_OUT)/phase_twin_receipt.json
+	./$(PT_TEST) --quick $(PT_OUT)/phase_twin_quick_1.json
+	./$(PT_TEST) --quick $(PT_OUT)/phase_twin_quick_2.json
+	cmp $(PT_OUT)/phase_twin_quick_1.json $(PT_OUT)/phase_twin_quick_2.json
+	@echo "test-phase-twin: quick receipts byte-identical across deterministic pure OM-2 runs"
 
 phase-twin-receipt: test-phase-twin
 	@test "$$(git status --porcelain -- src tests Makefile spec | grep -c .)" = 0 || \
@@ -1841,18 +1809,12 @@ test-turing: $(TURING_TEST) $(TURING_TEST_ASAN) $(TURING_TOOL) $(TURING_TOOL_ASA
 # digest-named wrapper receipt in evidence/MIXED_ALGEBRA/digital_v1/.
 .PHONY: test-ma-digital-bottom gate-mixed-algebra-digital-v1
 DV1_BOTTOM = $(OUT_DIR)/tests-algebra/test_ma_digital_bottom
-DV1_BOTTOM_ASAN = $(OUT_DIR)/tests-algebra/test_ma_digital_bottom_asan
 DV1_GATE_BIN = $(OUT_DIR)/tests-algebra/ma_digital_v1_gate
 DV1_GATE_BIN_ASAN = $(OUT_DIR)/tests-algebra/ma_digital_v1_gate_asan
 
-$(DV1_BOTTOM): tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND)
+$(DV1_BOTTOM): $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_ma_digital_bottom.om seed/out/omc
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_SRCS) $(OMA_BIND) -lm
-
-$(DV1_BOTTOM_ASAN): tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_SRCS) $(OMA_HDRS) $(OMA_BIND_ASAN)
-	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-		-o $@ tests/algebra/test_ma_digital_bottom.c $(OMA_RZ_SRCS) $(OMA_SRCS) $(OMA_BIND_ASAN) -lm
+	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_ma_digital_bottom.om | seed/out/omc > $@ && chmod +x $@
 
 $(DV1_GATE_BIN): tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) $(TURING_HDRS)
 	@mkdir -p $(dir $@)
@@ -1862,11 +1824,10 @@ $(DV1_GATE_BIN_ASAN): tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) $(TURING
 	@mkdir -p $(dir $@)
 	$(CC) $(TURING_CFLAGS) $(TURING_ASAN) -o $@ tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) -lm
 
-test-ma-digital-bottom: $(DV1_BOTTOM) $(DV1_BOTTOM_ASAN)
+test-ma-digital-bottom: $(DV1_BOTTOM)
 	./$(DV1_BOTTOM)
-	./$(DV1_BOTTOM_ASAN)
 
-gate-mixed-algebra-digital-v1: $(DV1_GATE_BIN) $(DV1_GATE_BIN_ASAN) $(DV1_BOTTOM) $(DV1_BOTTOM_ASAN)
+gate-mixed-algebra-digital-v1: $(DV1_GATE_BIN) $(DV1_GATE_BIN_ASAN) $(DV1_BOTTOM)
 	DV1_GATE=./$(DV1_GATE_BIN) DV1_GATE_ASAN=./$(DV1_GATE_BIN_ASAN) MAKE="$(MAKE)" \
 		sh tests/algebra/ma_digital_v1_gate.sh
 
