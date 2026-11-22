@@ -1,0 +1,1298 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/open-humanity/trace_contract.om
+note Pure seeded OM-2 implementation of:
+note   1. Exact-byte Open Humanity UDP wire codec (crates/beacon-core/src/{wire,schema}.rs):
+note      - Frames: Signal (0x4f 0x48 0x01), Register (0x4f 0x52 0x01), Challenge (0x4f 0x51 0x01),
+note        Ack (0x4f 0x41 0x01), Capsule (0x4f 0x43 0x01), exact bincode 1.3 LE layout
+note      - Keyed BLAKE3 relay cookies (16 bytes, 120s window + previous window)
+note      - Ed25519 signing and verification over exact signable_bytes
+note      - Normalized BLAKE3 error fingerprinting (user home paths scrubbed to ~/, ws collapsed)
+note   2. Exact-byte Consent/Export and Trace-Receiver Contract (OHTX v1 over AITR v1):
+note      - Strict AITR v1 trace segment reader/writer (16B header + 64B IEEE CRC-32 records,
+note        matching seed/trace/segment.om byte-for-byte)
+note      - Signed OHCN v1 consent manifest (160B, Ed25519, opt_in=1, cap_flags=0, allowed_type_mask)
+note      - Fail-closed exporter (oh_trace_export) and receiver (oh_trace_receive) enforcing
+note        consent, Personal Data Firewall, zero-authority boundary, BLAKE3 integrity, Ed25519
+note        authentication, timestamp drift (<= 300s), and replay protection.
+note Compose after:
+note   si/directives/om2.om protocol/open-humanity/lib.om
+note   protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om
+
+note ---- Self-contained RFC 8032 Ed25519 key derivation & signing (reusing ed25519.om + sha512.om) ----
+
+fn ohtx_ed_red x64 view uchar 64 dst edit uchar 32 to void
+x = new long 64 0
+for i ulong 64
+put x i long get x64 i
+end
+edmodl x
+for i ulong 32
+put dst i uchar get x i
+end
+end
+
+fn ohtx_ed_expand seed view uchar 32 ar edit uchar 32 pfx edit uchar 64 to void
+m = new uchar 65536 0
+hd = new uchar 64 0
+t = new uchar 64 0
+for i ulong 32
+put m i get seed i
+end
+s512hash m 32 hd
+for i ulong 32
+put t i get hd i
+put pfx i get hd add i 32
+end
+put t 0 and get t 0 uchar 248
+put t 31 and get t 31 uchar 127
+put t 31 or get t 31 uchar 64
+ohtx_ed_red t ar
+end
+
+fn ohtx_ed_basemul s view uchar 32 dst edit uchar 32 to void
+w = new ulong 1024 0
+z = new uchar 32 0
+edinit w
+edsmul w s z
+edpenc w edq dst
+end
+
+fn ohtx_ed_pubkey seed view uchar 32 pk edit uchar 32 to void
+ar = new uchar 32 0
+pfx = new uchar 64 0
+ohtx_ed_expand seed ar pfx
+ohtx_ed_basemul ar pk
+end
+
+fn ohtx_ed_muladd r view uchar 32 k view uchar 32 a view uchar 32 sg edit uchar 64 to void
+x = new long 64 0
+for i ulong 32
+put x i long get r i
+end
+for i ulong 32
+ki = long get k i
+for j ulong 32
+p = add i j
+put x p add get x p mul ki long get a j
+end
+end
+edmodl x
+for i ulong 32
+put sg add 32 i uchar get x i
+end
+end
+
+fn ohtx_ed_hprefix pfx view uchar 64 m view uchar 65536 n ulong hd edit uchar 64 to void
+if gt n 65504
+trap 3
+end
+pm = new uchar 65536 0
+for i ulong 32
+put pm i get pfx i
+end
+for i ulong n bound 65504
+put pm add 32 i get m i
+end
+s512hash pm add n 32 hd
+end
+
+fn ohtx_ed_sign seed view uchar 32 m view uchar 65536 n ulong sg edit uchar 64 to void
+ar = new uchar 32 0
+pfx = new uchar 64 0
+pk = new uchar 32 0
+hd = new uchar 64 0
+r = new uchar 32 0
+rb = new uchar 32 0
+k = new uchar 32 0
+ohtx_ed_expand seed ar pfx
+ohtx_ed_basemul ar pk
+ohtx_ed_hprefix pfx m n hd
+ohtx_ed_red hd r
+ohtx_ed_basemul r rb
+for i ulong 32
+put sg i get rb i
+end
+edhram sg pk m n k
+ohtx_ed_muladd r k ar sg
+end
+
+const OHW_MAGIC_0 uchar 0x4f
+const OHW_VERSION uchar 1
+const OHW_KIND_SIGNAL uchar 0x48
+const OHW_KIND_REGISTER uchar 0x52
+const OHW_KIND_CHALLENGE uchar 0x51
+const OHW_KIND_ACK uchar 0x41
+const OHW_KIND_CAPSULE uchar 0x43
+
+const OHW_MAX_DATAGRAM ulong 1200
+const OHW_MAX_CAPSULE ulong 8192
+const OHW_COOKIE_LEN ulong 16
+const OHW_COOKIE_WINDOW ulong 120
+const OHW_MAX_DRIFT_SECS ulong 300
+
+note Exact-byte AITR v1 & OHTX v1 constants
+const OHTX_AITR_HDR ulong 16
+const OHTX_AITR_REC ulong 64
+const OHTX_AITR_MAX_PAY ulong 52
+const OHTX_CONSENT_LEN ulong 160
+const OHTX_HDR_LEN ulong 296
+const OHTX_REPLAY_CAP ulong 64
+
+note Error codes for wire / trace-receiver contract
+const OHTX_OK ulong 0
+const OHTX_ERR_BAD_MAGIC ulong 101
+const OHTX_ERR_BAD_VERSION ulong 102
+const OHTX_ERR_TRUNCATED ulong 103
+const OHTX_ERR_TOO_LARGE ulong 104
+const OHTX_ERR_BAD_SIG ulong 105
+const OHTX_ERR_DRIFT ulong 106
+const OHTX_ERR_REPLAY ulong 107
+const OHTX_ERR_NO_CONSENT ulong 108
+const OHTX_ERR_CONSENT_EXPIRED ulong 109
+const OHTX_ERR_CONSENT_AUTH ulong 110
+const OHTX_ERR_WRONG_RECEIVER ulong 111
+const OHTX_ERR_BAD_DIGEST ulong 112
+const OHTX_ERR_AITR_HEADER ulong 113
+const OHTX_ERR_AITR_TORN ulong 114
+const OHTX_ERR_AITR_CRC ulong 115
+const OHTX_ERR_AITR_SEQ ulong 116
+const OHTX_ERR_AITR_PAYLEN ulong 117
+const OHTX_ERR_TYPE_NOT_CONSENTED ulong 118
+const OHTX_ERR_FIREWALL ulong 119
+const OHTX_ERR_ESCALATION ulong 120
+const OHTX_ERR_BAD_FIELD ulong 121
+
+text ohtx_dom_consent "open-humanity.trace-consent.v1"
+text ohtx_dom_export "open-humanity.trace-export.v1"
+
+note Receiver replay cache (up to 64 16-byte bundle_ids)
+global ohtx_seen_ids uchar 1024
+global ohtx_seen_cnt ulong 1
+
+fn ohtx_reset_replay to void
+put ohtx_seen_cnt 0 0
+for i ulong 1024
+put ohtx_seen_ids i uchar 0
+end
+end
+
+fn ohtx_put_u16_le dst edit uchar * off ulong v ulong to void
+put dst off uchar and v 255
+put dst add off 1 uchar and shr v 8 255
+end
+
+fn ohtx_get_u16_le src view uchar * off ulong to ulong
+ret or ulong get src off shl ulong get src add off 1 8
+end
+
+fn ohtx_put_u32_le dst edit uchar * off ulong v ulong to void
+for i ulong 4
+put dst add off i uchar and shr v mul i 8 255
+end
+end
+
+fn ohtx_get_u32_le src view uchar * off ulong to ulong
+acc = ulong 0
+for i ulong 4
+acc = or acc shl ulong get src add off i mul i 8
+end
+ret acc
+end
+
+note ---- Self-contained BLAKE3 unkeyed & keyed (exact BLAKE3 spec parity with blake3 1.5) ----
+
+fn ohtx_b3_initw w edit ulong 128 to void
+put w 83 1779033703
+put w 84 3144134277
+put w 85 1013904242
+put w 86 2773480762
+put w 87 1359893119
+put w 88 2600822924
+put w 89 528734635
+put w 90 1541459225
+put w 91 2
+put w 92 6
+put w 93 3
+put w 94 10
+put w 95 7
+put w 96 0
+put w 97 4
+put w 98 13
+put w 99 1
+put w 100 11
+put w 101 12
+put w 102 5
+put w 103 9
+put w 104 14
+put w 105 15
+put w 106 8
+end
+
+fn ohtx_b3_mix w edit ulong 128 a ulong b ulong c ulong d ulong j ulong to void
+x = get w add 16 mul j 2
+t = add get w a get w b
+put w a and add t x 4294967295
+t = xor get w d get w a
+put w d and or shr t 16 shl t 16 4294967295
+put w c and add get w c get w d 4294967295
+t = xor get w b get w c
+put w b and or shr t 12 shl t 20 4294967295
+x = get w add 17 mul j 2
+t = add get w a get w b
+put w a and add t x 4294967295
+t = xor get w d get w a
+put w d and or shr t 8 shl t 24 4294967295
+put w c and add get w c get w d 4294967295
+t = xor get w b get w c
+put w b and or shr t 7 shl t 25 4294967295
+end
+
+fn ohtx_b3_round w edit ulong 128 to void
+ohtx_b3_mix w 0 4 8 12 0
+ohtx_b3_mix w 1 5 9 13 1
+ohtx_b3_mix w 2 6 10 14 2
+ohtx_b3_mix w 3 7 11 15 3
+ohtx_b3_mix w 0 5 10 15 4
+ohtx_b3_mix w 1 6 11 12 5
+ohtx_b3_mix w 2 7 8 13 6
+ohtx_b3_mix w 3 4 9 14 7
+end
+
+fn ohtx_b3_perm w edit ulong 128 to void
+for i ulong 16
+put w add 32 i get w add 16 get w add 91 i
+end
+for i ulong 16
+put w add 16 i get w add 32 i
+end
+end
+
+fn ohtx_b3_compress w edit ulong 128 blk view uchar 64 to void
+for i ulong 16
+o = mul i 4
+v = ulong get blk add o 3
+v = or shl v 8 ulong get blk add o 2
+v = or shl v 8 ulong get blk add o 1
+v = or shl v 8 ulong get blk o
+put w add 16 i v
+end
+for i ulong 8
+put w i get w add 48 i
+put w add i 8 get w add 83 i
+end
+put w 12 and get w 73 4294967295
+put w 13 and shr get w 73 32 4294967295
+put w 14 get w 72
+put w 15 get w 74
+for r ulong 7
+ohtx_b3_round w
+ohtx_b3_perm w
+end
+for i ulong 8
+put w add 56 i xor get w i get w add i 8
+put w add 64 i xor get w add i 8 get w add 48 i
+end
+end
+
+fn ohtx_b3_outle w view ulong 128 dst edit uchar 32 to void
+for i ulong 8
+v = get w add 56 i
+for k ulong 4
+put dst add mul i 4 k uchar and shr v mul k 8 255
+end
+end
+end
+
+fn ohtx_b3_copy_cv w edit ulong 128 to void
+for i ulong 8
+put w add 48 i get w add 56 i
+end
+end
+
+fn ohtx_b3_load_iv w edit ulong 128 to void
+for i ulong 8
+put w add 48 i get w add 83 i
+end
+end
+
+fn ohtx_b3_fill_blk blk edit uchar 64 msg view uchar * pos ulong blen ulong to void
+for i ulong 64
+put blk i uchar 0
+end
+for i ulong blen bound 64
+put blk i get msg add pos i
+end
+end
+
+note Process one BLAKE3 chunk of length len(msg) (0..1024) with chunk counter ctr.
+note Leaves CV in w[48..56) and if is_root=1 sets ROOT flag (8) on the last block.
+fn ohtx_b3_chunk w edit ulong 128 msg view uchar * ctr ulong is_root ulong to void
+blk = new uchar 64 0
+n = len msg
+ohtx_b3_load_iv w
+if eq n 0
+put w 72 0
+put w 73 ctr
+fl = ulong 3
+if ne is_root 0
+fl = ulong 11
+end
+put w 74 fl
+ohtx_b3_compress w blk
+ohtx_b3_copy_cv w
+ret
+end
+pos = ulong 0
+while lt pos n bound 16
+blen = sub n pos
+if gt blen 64
+blen = ulong 64
+end
+ohtx_b3_fill_blk blk msg pos blen
+fl = ulong 0
+if eq pos 0
+fl = or fl 1
+end
+if eq add pos blen n
+fl = or fl 2
+if ne is_root 0
+fl = or fl 8
+end
+end
+put w 72 blen
+put w 73 ctr
+put w 74 fl
+ohtx_b3_compress w blk
+ohtx_b3_copy_cv w
+pos = add pos blen
+end
+end
+
+fn ohtx_b3_put4 blk edit uchar 64 off ulong v ulong to void
+put blk off uchar and v 255
+put blk add off 1 uchar and shr v 8 255
+put blk add off 2 uchar and shr v 16 255
+put blk add off 3 uchar and shr v 24 255
+end
+
+fn ohtx_b3_parent w edit ulong 128 st view ulong 128 lidx ulong r_off ulong is_root ulong to void
+blk = new uchar 64 0
+for i ulong 8
+o = mul i 4
+ohtx_b3_put4 blk o get st add mul lidx 8 i
+ohtx_b3_put4 blk add 32 o get w add r_off i
+end
+ohtx_b3_load_iv w
+put w 72 64
+put w 73 0
+fl = ulong 4
+if ne is_root 0
+fl = ulong 12
+end
+put w 74 fl
+ohtx_b3_compress w blk
+ohtx_b3_copy_cv w
+end
+
+fn ohtx_b3_push w view ulong 128 st edit ulong 128 depth ulong to void
+base = mul depth 8
+for i ulong 8
+put st add base i get w add 48 i
+end
+end
+
+note Full multi-chunk unkeyed BLAKE3 hash (up to 64 KiB) matching blake3::hash byte-for-byte.
+fn ohtx_b3_hash msg view uchar * out32 edit uchar 32 to void
+w = new ulong 128 0
+st = new ulong 128 0
+ohtx_b3_initw w
+n = len msg
+if le n 1024
+ohtx_b3_chunk w msg 0 1
+ohtx_b3_outle w out32
+ret
+end
+depth = ulong 0
+ctr = ulong 0
+off = ulong 0
+while gt sub n off 1024 bound 64
+ohtx_b3_chunk w part msg off 1024 ctr 0
+tot = add ctr 1
+while eq and tot 1 0 bound 8
+depth = sub depth 1
+ohtx_b3_parent w st depth 48 0
+tot = shr tot 1
+end
+ohtx_b3_push w st depth
+depth = add depth 1
+ctr = add ctr 1
+off = add off 1024
+end
+ohtx_b3_chunk w part msg off sub n off ctr 0
+while gt depth 1 bound 8
+depth = sub depth 1
+ohtx_b3_parent w st depth 48 0
+end
+ohtx_b3_parent w st 0 48 1
+ohtx_b3_outle w out32
+end
+
+fn ohtx_b3_load_key w edit ulong 128 secret view uchar 32 to void
+for i ulong 8
+o = mul i 4
+b0 = ulong get secret o
+b1 = ulong get secret add o 1
+b2 = ulong get secret add o 2
+b3 = ulong get secret add o 3
+kv = or b0 shl b1 8
+kv = or kv shl b2 16
+kv = or kv shl b3 24
+put w add 48 i kv
+end
+end
+
+note Keyed BLAKE3 single-chunk (n <= 64 bytes), matching blake3::Hasher::new_keyed(secret).
+note Uses key words as input CV and sets KEYED_HASH (16) | CHUNK_START (1) | CHUNK_END (2) | ROOT (8) = 27.
+fn ohtx_b3_keyed_64 secret view uchar 32 msg view uchar * out32 edit uchar 32 to void
+n = len msg
+if gt n 64
+trap 3
+end
+w = new ulong 128 0
+blk = new uchar 64 0
+ohtx_b3_initw w
+ohtx_b3_load_key w secret
+for i ulong n bound 64
+put blk i get msg i
+end
+put w 72 n
+put w 73 0
+put w 74 27
+ohtx_b3_compress w blk
+ohtx_b3_outle w out32
+end
+
+note Exact relay_cookie(secret, addr_ascii, window) -> 16 bytes (crates/beacon-core/src/wire.rs).
+fn ohw_relay_cookie secret view uchar 32 addr view uchar * window ulong cookie edit uchar 16 to void
+alen = len addr
+if gt alen 56
+trap 3
+end
+inp = new uchar 64 0
+for i ulong alen bound 56
+put inp i get addr i
+end
+for i ulong 8
+put inp add alen i uchar and shr window mul i 8 255
+end
+h32 = new uchar 32 0
+ohtx_b3_keyed_64 secret part inp 0 add alen 8 h32
+for i ulong 16
+put cookie i get h32 i
+end
+end
+
+note True iff cookie matches current window or previous window (120s windows).
+fn ohw_cookie_valid secret view uchar 32 addr view uchar * now_secs ulong cookie view uchar 16 to bool
+win = div now_secs OHW_COOKIE_WINDOW
+c0 = new uchar 16 0
+ohw_relay_cookie secret addr win c0
+ok0 = true
+for i ulong 16
+if ne get c0 i get cookie i
+ok0 = false
+break
+end
+end
+if ok0
+ret true
+end
+if gt win 0
+ohw_relay_cookie secret addr sub win 1 c0
+ok1 = true
+for i ulong 16
+if ne get c0 i get cookie i
+ok1 = false
+break
+end
+end
+ret ok1
+end
+ret false
+end
+
+fn ohtx_is_ws b uchar to bool
+if eq b uchar 32
+ret true
+end
+if eq b uchar 9
+ret true
+end
+if eq b uchar 10
+ret true
+end
+ret eq b uchar 13
+end
+
+note Normalized error fingerprint: scrub user paths to ~/, collapse whitespace, BLAKE3-256.
+fn ohw_fingerprint_error err_text view uchar * out32 edit uchar 32 to void
+scbuf = new uchar 512 0
+sn = oh_scrub_paths err_text scbuf
+norm = new uchar 512 0
+nn = ulong 0
+prev_ws = true
+for i ulong sn bound 512
+b = get scbuf i
+if ohtx_is_ws b
+if not prev_ws
+if lt nn 512
+put norm nn uchar 32
+nn = add nn 1
+end
+prev_ws = true
+end
+else
+if lt nn 512
+put norm nn b
+nn = add nn 1
+end
+prev_ws = false
+end
+end
+if gt nn 0
+if eq get norm sub nn 1 uchar 32
+nn = sub nn 1
+end
+end
+ohtx_b3_hash part norm 0 nn out32
+end
+
+note ---- Exact-byte Open Humanity UDP Wire Codec (bincode 1.3 LE parity with wire.rs) ----
+
+note Encode Challenge frame (19 bytes): [0x4f, 0x51, 0x01] || cookie[16].
+fn ohw_encode_challenge cookie view uchar 16 dst edit uchar 19 to ulong
+put dst 0 OHW_MAGIC_0
+put dst 1 OHW_KIND_CHALLENGE
+put dst 2 OHW_VERSION
+for i ulong 16
+put dst add 3 i get cookie i
+end
+ret 19
+end
+
+note Decode Challenge frame.
+fn ohw_decode_challenge wire view uchar * cookie edit uchar 16 to ulong
+if ne len wire 19
+ret OHTX_ERR_TRUNCATED
+end
+if or ne get wire 0 OHW_MAGIC_0 ne get wire 1 OHW_KIND_CHALLENGE
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get wire 2 OHW_VERSION
+ret OHTX_ERR_BAD_VERSION
+end
+for i ulong 16
+put cookie i get wire add 3 i
+end
+ret OHTX_OK
+end
+
+note Encode Ack frame (8 bytes): [0x4f, 0x41, 0x01] || topics(u8) || ttl_secs(u32 LE).
+fn ohw_encode_ack topics uchar ttl_secs ulong dst edit uchar 8 to ulong
+put dst 0 OHW_MAGIC_0
+put dst 1 OHW_KIND_ACK
+put dst 2 OHW_VERSION
+put dst 3 topics
+ohtx_put_u32_le dst 4 ttl_secs
+ret 8
+end
+
+note Decode Ack frame into meta[0]=topics, meta[1]=ttl_secs.
+fn ohw_decode_ack wire view uchar * meta edit ulong 2 to ulong
+if ne len wire 8
+ret OHTX_ERR_TRUNCATED
+end
+if or ne get wire 0 OHW_MAGIC_0 ne get wire 1 OHW_KIND_ACK
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get wire 2 OHW_VERSION
+ret OHTX_ERR_BAD_VERSION
+end
+put meta 0 ulong get wire 3
+put meta 1 ohtx_get_u32_le wire 4
+ret OHTX_OK
+end
+
+note Encode and Ed25519-sign Register frame (133 bytes) matching wire.rs::Frame::Register byte-for-byte.
+note Layout: [0..3) 4f 52 01, [3..35) pubkey, [35..43) ts_u64_le, [43] topics, [44] replay,
+note         [45..61) cookie, [61..69) u64_le(64), [69..133) ed25519_sig.
+fn ohw_encode_register seed view uchar 32 ts ulong topics uchar replay uchar cookie view uchar 16 dst edit uchar 133 to ulong
+pk = new uchar 32 0
+ohtx_ed_pubkey seed pk
+put dst 0 OHW_MAGIC_0
+put dst 1 OHW_KIND_REGISTER
+put dst 2 OHW_VERSION
+for i ulong 32
+put dst add 3 i get pk i
+end
+oh_put_u64_le dst 35 ts
+put dst 43 topics
+put dst 44 replay
+for i ulong 16
+put dst add 45 i get cookie i
+end
+oh_put_u64_le dst 61 64
+for i ulong 64
+put dst add 69 i uchar 0
+end
+note signable_bytes is dst[3..133) (130 bytes, signature zeroed)
+sbuf = new uchar 65536 0
+for i ulong 130
+put sbuf i get dst add 3 i
+end
+sig = new uchar 64 0
+ohtx_ed_sign seed sbuf 130 sig
+for i ulong 64
+put dst add 69 i get sig i
+end
+ret 133
+end
+
+note Verify Register frame: magic, version, exact length 133, sig_len==64, timestamp drift <= 300s, Ed25519.
+fn ohw_verify_register wire view uchar * now_secs ulong out_pk edit uchar 32 out_meta edit ulong 3 to ulong
+if ne len wire 133
+ret OHTX_ERR_TRUNCATED
+end
+if or ne get wire 0 OHW_MAGIC_0 ne get wire 1 OHW_KIND_REGISTER
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get wire 2 OHW_VERSION
+ret OHTX_ERR_BAD_VERSION
+end
+if ne oh_get_u64_le wire 61 64
+ret OHTX_ERR_BAD_FIELD
+end
+ts = oh_get_u64_le wire 35
+diff = ulong 0
+if ge now_secs ts
+diff = sub now_secs ts
+else
+diff = sub ts now_secs
+end
+if gt diff OHW_MAX_DRIFT_SECS
+ret OHTX_ERR_DRIFT
+end
+pk = new uchar 32 0
+sig = new uchar 64 0
+sbuf = new uchar 65536 0
+for i ulong 32
+b = get wire add 3 i
+put pk i b
+put out_pk i b
+end
+for i ulong 64
+put sig i get wire add 69 i
+end
+for i ulong 66
+put sbuf i get wire add 3 i
+end
+note sbuf[66..130) stays zero (signable_bytes has zeroed signature)
+if ne edverify pk sbuf 130 sig 0 1
+ret OHTX_ERR_BAD_SIG
+end
+put out_meta 0 ts
+put out_meta 1 ulong get wire 43
+put out_meta 2 ulong get wire 44
+ret OHTX_OK
+end
+
+note ---- Exact-byte AITR v1 Trace Segment Helpers (matches seed/trace/segment.om) ----
+
+fn ohtx_crc32 buf view uchar * off ulong n ulong to ulong
+c = ulong 4294967295
+for i ulong n bound 64
+c = xor c ulong get buf add off i
+for k ulong 8
+if eq and c 1 1
+c = xor shr c 1 3988292384
+else
+c = shr c 1
+end
+end
+end
+ret xor c 4294967295
+end
+
+note Write 16-byte AITR v1 header at dst[0..16).
+fn ohtx_aitr_write_hdr dst edit uchar * to void
+put dst 0 uchar 65
+put dst 1 uchar 73
+put dst 2 uchar 84
+put dst 3 uchar 82
+ohtx_put_u16_le dst 4 1
+ohtx_put_u16_le dst 6 64
+ohtx_put_u32_le dst 8 16
+ohtx_put_u32_le dst 12 0
+end
+
+note Write one 64-byte AITR v1 record at dst[off..off+64) with IEEE CRC-32.
+note rinfo packs rtype (low 16 bits) and seq (bits 16..47): rinfo = or rtype shl seq 16.
+fn ohtx_aitr_write_rec dst edit uchar * off ulong rinfo ulong pay view uchar * to ulong
+rtype = and rinfo 65535
+seq = and shr rinfo 16 4294967295
+plen = len pay
+if gt plen OHTX_AITR_MAX_PAY
+ret OHTX_ERR_AITR_PAYLEN
+end
+for i ulong 64
+put dst add off i uchar 0
+end
+ohtx_put_u16_le dst off rtype
+ohtx_put_u16_le dst add off 2 plen
+ohtx_put_u32_le dst add off 4 seq
+pbase = add off 8
+for i ulong plen bound 52
+put dst add pbase i get pay i
+end
+crc = ohtx_crc32 dst off 60
+ohtx_put_u32_le dst add off 60 crc
+ret OHTX_OK
+end
+
+note Validate AITR v1 header and exact record alignment; sets out_rcnt[0] = record count.
+fn ohtx_aitr_validate_hdr seg view uchar * out_rcnt edit ulong 1 to ulong
+n = len seg
+if lt n OHTX_AITR_HDR
+ret OHTX_ERR_AITR_HEADER
+end
+if ne get seg 0 uchar 65
+ret OHTX_ERR_AITR_HEADER
+end
+if ne get seg 1 uchar 73
+ret OHTX_ERR_AITR_HEADER
+end
+if ne get seg 2 uchar 84
+ret OHTX_ERR_AITR_HEADER
+end
+if ne get seg 3 uchar 82
+ret OHTX_ERR_AITR_HEADER
+end
+if ne ohtx_get_u16_le seg 4 1
+ret OHTX_ERR_AITR_HEADER
+end
+if ne ohtx_get_u16_le seg 6 64
+ret OHTX_ERR_AITR_HEADER
+end
+if ne ohtx_get_u32_le seg 8 16
+ret OHTX_ERR_AITR_HEADER
+end
+if ne ohtx_get_u32_le seg 12 0
+ret OHTX_ERR_AITR_HEADER
+end
+body = sub n OHTX_AITR_HDR
+if ne rem body OHTX_AITR_REC 0
+ret OHTX_ERR_AITR_TORN
+end
+put out_rcnt 0 div body OHTX_AITR_REC
+ret OHTX_OK
+end
+
+note Validate one 64-byte AITR v1 record at index idx (seq, paylen <= 52, zero padding, IEEE CRC-32).
+fn ohtx_aitr_validate_rec seg view uchar * idx ulong out_type edit ulong 1 out_plen edit ulong 1 to ulong
+off = add OHTX_AITR_HDR mul idx OHTX_AITR_REC
+rtype = ohtx_get_u16_le seg off
+plen = ohtx_get_u16_le seg add off 2
+seq = ohtx_get_u32_le seg add off 4
+if gt plen OHTX_AITR_MAX_PAY
+ret OHTX_ERR_AITR_PAYLEN
+end
+if ne seq idx
+ret OHTX_ERR_AITR_SEQ
+end
+pbase = add add off 8 plen
+zcnt = sub OHTX_AITR_MAX_PAY plen
+for j ulong zcnt bound 52
+if ne get seg add pbase j uchar 0
+ret OHTX_ERR_AITR_PAYLEN
+end
+end
+want_crc = ohtx_get_u32_le seg add off 60
+got_crc = ohtx_crc32 seg off 60
+if ne want_crc got_crc
+ret OHTX_ERR_AITR_CRC
+end
+put out_type 0 rtype
+put out_plen 0 plen
+ret OHTX_OK
+end
+
+note ---- Exact-byte Consent Manifest (OHCN v1, 160 bytes, Ed25519 signed) ----
+
+fn ohtx_sign_consent seed view uchar 32 recv_pk view uchar 32 type_mask ulong not_after ulong cap_flags ulong dst edit uchar 160 to void
+npk = new uchar 32 0
+ohtx_ed_pubkey seed npk
+put dst 0 uchar 79
+put dst 1 uchar 72
+put dst 2 uchar 67
+put dst 3 uchar 78
+put dst 4 uchar 1
+put dst 5 uchar 1
+put dst 6 uchar 0
+put dst 7 uchar 0
+for i ulong 32
+put dst add 8 i get npk i
+put dst add 40 i get recv_pk i
+end
+oh_put_u64_le dst 72 type_mask
+oh_put_u64_le dst 80 not_after
+oh_put_u64_le dst 88 cap_flags
+sbuf = new uchar 65536 0
+dlen = len ohtx_dom_consent
+for i ulong dlen bound 64
+put sbuf i get ohtx_dom_consent i
+end
+for i ulong 96
+put sbuf add dlen i get dst i
+end
+sig = new uchar 64 0
+ohtx_ed_sign seed sbuf add dlen 96 sig
+for i ulong 64
+put dst add 96 i get sig i
+end
+end
+
+fn ohtx_verify_consent cbuf view uchar * now_secs ulong expect_recv view uchar 32 out_mask edit ulong 1 to ulong
+if ne len cbuf OHTX_CONSENT_LEN
+ret OHTX_ERR_TRUNCATED
+end
+if ne get cbuf 0 uchar 79
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get cbuf 1 uchar 72
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get cbuf 2 uchar 67
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get cbuf 3 uchar 78
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get cbuf 4 uchar 1
+ret OHTX_ERR_BAD_VERSION
+end
+if ne get cbuf 5 uchar 1
+ret OHTX_ERR_NO_CONSENT
+end
+if or ne get cbuf 6 uchar 0 ne get cbuf 7 uchar 0
+ret OHTX_ERR_BAD_FIELD
+end
+note Zero-authority boundary: cap_flags MUST be 0
+if ne oh_get_u64_le cbuf 88 0
+ret OHTX_ERR_CONSENT_AUTH
+end
+not_after = oh_get_u64_le cbuf 80
+if gt now_secs not_after
+ret OHTX_ERR_CONSENT_EXPIRED
+end
+note Receiver binding check (and non-zero receiver pubkey)
+nz = false
+for i ulong 32
+rb = get cbuf add 40 i
+if ne rb uchar 0
+nz = true
+end
+if ne rb get expect_recv i
+ret OHTX_ERR_WRONG_RECEIVER
+end
+end
+if not nz
+ret OHTX_ERR_WRONG_RECEIVER
+end
+npk = new uchar 32 0
+sig = new uchar 64 0
+for i ulong 32
+put npk i get cbuf add 8 i
+end
+for i ulong 64
+put sig i get cbuf add 96 i
+end
+sbuf = new uchar 65536 0
+dlen = len ohtx_dom_consent
+for i ulong dlen bound 64
+put sbuf i get ohtx_dom_consent i
+end
+for i ulong 96
+put sbuf add dlen i get cbuf i
+end
+if ne edverify npk sbuf add dlen 96 sig 0 1
+ret OHTX_ERR_BAD_SIG
+end
+put out_mask 0 oh_get_u64_le cbuf 72
+ret OHTX_OK
+end
+
+note Check a single trace record payload against Personal Data Firewall + escalation detector.
+fn ohtx_check_payload_clean pay view uchar * to ulong
+if eq len pay 0
+ret OHTX_OK
+end
+prc = oh_privacy_check pay
+if ne prc OH_OK
+ret OHTX_ERR_FIREWALL
+end
+if oh_scan_escalation_raw pay
+ret OHTX_ERR_ESCALATION
+end
+ret OHTX_OK
+end
+
+note ---- Exact-byte Trace Exporter (AITR v1 + OHCN v1 -> signed OHTX v1 bundle) ----
+
+global ohtx_last_export_len ulong 1
+global ohtx_last_recv_len ulong 1
+global ohtx_export_bid uchar 16
+
+fn ohtx_set_bundle_id bid view uchar 16 to void
+for i ulong 16
+put ohtx_export_bid i get bid i
+end
+end
+
+fn ohtx_export_len to ulong
+ret get ohtx_last_export_len 0
+end
+
+fn ohtx_recv_len to ulong
+ret get ohtx_last_recv_len 0
+end
+
+fn ohtx_type_allowed tmask ulong rtype ulong to bool
+if ge rtype 64
+ret false
+end
+ret ne and shr tmask rtype 1 0
+end
+
+fn ohtx_append_rec out_seg edit uchar 4112 out_cnt edit ulong 1 rtype ulong pay view uchar * to ulong
+oc = get out_cnt 0
+rinfo = or rtype shl oc 16
+doff = add OHTX_AITR_HDR mul oc OHTX_AITR_REC
+rc = ohtx_aitr_write_rec out_seg doff rinfo pay
+if ne rc OHTX_OK
+ret rc
+end
+put out_cnt 0 add oc 1
+ret OHTX_OK
+end
+
+fn ohtx_filter_one in_seg view uchar * idx ulong tmask ulong out_seg edit uchar 4112 out_cnt edit ulong 1 to ulong
+rt_box = new ulong 1 0
+pl_box = new ulong 1 0
+rrc = ohtx_aitr_validate_rec in_seg idx rt_box pl_box
+if ne rrc OHTX_OK
+ret rrc
+end
+if not ohtx_type_allowed tmask get rt_box 0
+ret OHTX_OK
+end
+poff = add add OHTX_AITR_HDR mul idx OHTX_AITR_REC 8
+rrc = ohtx_check_payload_clean part in_seg poff get pl_box 0
+if ne rrc OHTX_OK
+ret rrc
+end
+ret ohtx_append_rec out_seg out_cnt get rt_box 0 part in_seg poff get pl_box 0
+end
+
+note Helper: filter consented AITR v1 records and check Personal Data Firewall on every byte.
+fn ohtx_filter_aitr in_seg view uchar * tmask ulong out_seg edit uchar 4112 out_seglen edit ulong 1 to ulong
+rcnt_box = new ulong 1 0
+out_cnt = new ulong 1 0
+hrc = ohtx_aitr_validate_hdr in_seg rcnt_box
+if ne hrc OHTX_OK
+ret hrc
+end
+rcnt = get rcnt_box 0
+if gt rcnt 64
+ret OHTX_ERR_TOO_LARGE
+end
+ohtx_aitr_write_hdr out_seg
+for i ulong rcnt bound 64
+frc = ohtx_filter_one in_seg i tmask out_seg out_cnt
+if ne frc OHTX_OK
+ret frc
+end
+end
+put out_seglen 0 add OHTX_AITR_HDR mul get out_cnt 0 OHTX_AITR_REC
+ret OHTX_OK
+end
+
+note Helper: sign OHTX v1 header[0..232) with Ed25519 into dst[232..296).
+fn ohtx_sign_bundle_hdr seed view uchar 32 dst edit uchar 4408 to void
+sbuf = new uchar 65536 0
+dlen = len ohtx_dom_export
+for i ulong dlen bound 64
+put sbuf i get ohtx_dom_export i
+end
+for i ulong 232
+put sbuf add dlen i get dst i
+end
+sig = new uchar 64 0
+ohtx_ed_sign seed sbuf add dlen 232 sig
+for i ulong 64
+put dst add 232 i get sig i
+end
+end
+
+fn ohtx_verify_consent_for_export seed view uchar 32 consent view uchar 160 now_secs ulong mask_box edit ulong 1 to ulong
+recv_pk = new uchar 32 0
+for i ulong 32
+put recv_pk i get consent add 40 i
+end
+crc = ohtx_verify_consent consent now_secs recv_pk mask_box
+if ne crc OHTX_OK
+ret crc
+end
+my_pk = new uchar 32 0
+ohtx_ed_pubkey seed my_pk
+for i ulong 32
+if ne get my_pk i get consent add 8 i
+ret OHTX_ERR_BAD_SIG
+end
+end
+ret OHTX_OK
+end
+
+fn ohtx_pack_bundle seed view uchar 32 consent view uchar 160 out_seg view uchar 4112 seg_len ulong now_secs ulong dst edit uchar 4408 to void
+put dst 0 uchar 79
+put dst 1 uchar 72
+put dst 2 uchar 84
+put dst 3 uchar 88
+put dst 4 uchar 1
+put dst 5 uchar 0
+put dst 6 uchar 0
+put dst 7 uchar 0
+oh_put_u64_le dst 8 now_secs
+for i ulong 16
+put dst add 16 i get ohtx_export_bid i
+end
+for i ulong 160
+put dst add 32 i get consent i
+end
+dig = new uchar 32 0
+ohtx_b3_hash part out_seg 0 seg_len dig
+for i ulong 32
+put dst add 192 i get dig i
+end
+oh_put_u64_le dst 224 seg_len
+ohtx_sign_bundle_hdr seed dst
+for i ulong seg_len bound 4112
+put dst add OHTX_HDR_LEN i get out_seg i
+end
+end
+
+note Export consented, firewall-clean AITR v1 records into signed OHTX v1 bundle dst.
+note Caller sets bundle_id via ohtx_set_bundle_id beforehand (keeps parameter count <= 6 slots).
+note Returns OHTX_OK (0) and sets ohtx_last_export_len, or returns nonzero refusal and writes 0 bytes.
+fn oh_trace_export seed view uchar 32 consent view uchar 160 in_seg view uchar * now_secs ulong dst edit uchar 4408 to ulong
+put ohtx_last_export_len 0 0
+mask_box = new ulong 1 0
+rc = ohtx_verify_consent_for_export seed consent now_secs mask_box
+if ne rc OHTX_OK
+ret rc
+end
+out_seg = new uchar 4112 0
+seglen_box = new ulong 1 0
+rc = ohtx_filter_aitr in_seg get mask_box 0 out_seg seglen_box
+if ne rc OHTX_OK
+ret rc
+end
+seg_len = get seglen_box 0
+total_len = add OHTX_HDR_LEN seg_len
+if gt total_len 4408
+ret OHTX_ERR_TOO_LARGE
+end
+ohtx_pack_bundle seed consent out_seg seg_len now_secs dst
+put ohtx_last_export_len 0 total_len
+ret OHTX_OK
+end
+
+note Replay check/record helper for 16-byte bundle_id.
+fn ohtx_check_replay bid view uchar 16 to bool
+cnt = get ohtx_seen_cnt 0
+for k ulong cnt bound 64
+base = mul k 16
+same = true
+for j ulong 16
+if ne get ohtx_seen_ids add base j get bid j
+same = false
+break
+end
+end
+if same
+ret false
+end
+end
+ret true
+end
+
+fn ohtx_record_replay bid view uchar 16 to void
+cnt = get ohtx_seen_cnt 0
+idx = rem cnt OHTX_REPLAY_CAP
+base = mul idx 16
+for j ulong 16
+put ohtx_seen_ids add base j get bid j
+end
+if lt cnt OHTX_REPLAY_CAP
+put ohtx_seen_cnt 0 add cnt 1
+end
+end
+
+note Helper: verify Ed25519 exporter signature on bundle[0..232) and BLAKE3 digest on segment.
+fn ohtx_verify_bundle_crypto bundle view uchar * seg_len ulong to ulong
+npk = new uchar 32 0
+sig = new uchar 64 0
+for i ulong 32
+put npk i get bundle add 40 i
+end
+for i ulong 64
+put sig i get bundle add 232 i
+end
+sbuf = new uchar 65536 0
+dlen = len ohtx_dom_export
+for i ulong dlen bound 64
+put sbuf i get ohtx_dom_export i
+end
+for i ulong 232
+put sbuf add dlen i get bundle i
+end
+if ne edverify npk sbuf add dlen 232 sig 0 1
+ret OHTX_ERR_BAD_SIG
+end
+dig = new uchar 32 0
+ohtx_b3_hash part bundle OHTX_HDR_LEN seg_len dig
+for i ulong 32
+if ne get dig i get bundle add 192 i
+ret OHTX_ERR_BAD_DIGEST
+end
+end
+ret OHTX_OK
+end
+
+fn ohtx_check_incoming_one seg view uchar * idx ulong tmask ulong to ulong
+rt_box = new ulong 1 0
+pl_box = new ulong 1 0
+rrc = ohtx_aitr_validate_rec seg idx rt_box pl_box
+if ne rrc OHTX_OK
+ret rrc
+end
+if not ohtx_type_allowed tmask get rt_box 0
+ret OHTX_ERR_TYPE_NOT_CONSENTED
+end
+poff = add add OHTX_AITR_HDR mul idx OHTX_AITR_REC 8
+ret ohtx_check_payload_clean part seg poff get pl_box 0
+end
+
+note Helper: validate incoming AITR v1 segment against consented mask and Personal Data Firewall.
+fn ohtx_validate_incoming_seg seg view uchar * tmask ulong to ulong
+rcnt_box = new ulong 1 0
+hrc = ohtx_aitr_validate_hdr seg rcnt_box
+if ne hrc OHTX_OK
+ret hrc
+end
+rcnt = get rcnt_box 0
+if gt rcnt 64
+ret OHTX_ERR_TOO_LARGE
+end
+for i ulong rcnt bound 64
+rrc = ohtx_check_incoming_one seg i tmask
+if ne rrc OHTX_OK
+ret rrc
+end
+end
+ret OHTX_OK
+end
+
+fn ohtx_check_bundle_hdr bundle view uchar * now_secs ulong bid edit uchar 16 to ulong
+blen = len bundle
+if lt blen add OHTX_HDR_LEN OHTX_AITR_HDR
+ret OHTX_ERR_TRUNCATED
+end
+if ne get bundle 0 uchar 79
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get bundle 1 uchar 72
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get bundle 2 uchar 84
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get bundle 3 uchar 88
+ret OHTX_ERR_BAD_MAGIC
+end
+if ne get bundle 4 uchar 1
+ret OHTX_ERR_BAD_VERSION
+end
+if ne get bundle 5 uchar 0
+ret OHTX_ERR_BAD_FIELD
+end
+if ne get bundle 6 uchar 0
+ret OHTX_ERR_BAD_FIELD
+end
+if ne get bundle 7 uchar 0
+ret OHTX_ERR_BAD_FIELD
+end
+ts = oh_get_u64_le bundle 8
+diff = ulong 0
+if ge now_secs ts
+diff = sub now_secs ts
+else
+diff = sub ts now_secs
+end
+if gt diff OHW_MAX_DRIFT_SECS
+ret OHTX_ERR_DRIFT
+end
+for i ulong 16
+put bid i get bundle add 16 i
+end
+if not ohtx_check_replay bid
+ret OHTX_ERR_REPLAY
+end
+ret OHTX_OK
+end
+
+note ---- Exact-byte Trace Receiver (OHTX v1 -> verified AITR v1 segment, fail-closed) ----
+
+fn oh_trace_receive bundle view uchar * recv_pk view uchar 32 now_secs ulong dst_seg edit uchar * to ulong
+put ohtx_last_recv_len 0 0
+bid = new uchar 16 0
+rc = ohtx_check_bundle_hdr bundle now_secs bid
+if ne rc OHTX_OK
+ret rc
+end
+mask_box = new ulong 1 0
+rc = ohtx_verify_consent part bundle 32 OHTX_CONSENT_LEN now_secs recv_pk mask_box
+if ne rc OHTX_OK
+ret rc
+end
+seg_len = oh_get_u64_le bundle 224
+if ne add OHTX_HDR_LEN seg_len len bundle
+ret OHTX_ERR_TRUNCATED
+end
+if gt seg_len len dst_seg
+ret OHTX_ERR_TOO_LARGE
+end
+rc = ohtx_verify_bundle_crypto bundle seg_len
+if ne rc OHTX_OK
+ret rc
+end
+rc = ohtx_validate_incoming_seg part bundle OHTX_HDR_LEN seg_len get mask_box 0
+if ne rc OHTX_OK
+ret rc
+end
+ohtx_record_replay bid
+for i ulong seg_len bound 4112
+put dst_seg i get bundle add OHTX_HDR_LEN i
+end
+put ohtx_last_recv_len 0 seg_len
+ret OHTX_OK
+end

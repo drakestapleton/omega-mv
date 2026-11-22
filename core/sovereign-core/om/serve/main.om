@@ -1,0 +1,388 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/sovereign-core/om/serve/main.om
+note Standalone pure-Omega Sovereign Core host runtime and CLI executable (Linux AArch64).
+note Replaces the Rust aien-cli / aien-serve-http host front-end with a fail-closed seeded OM-2 binary.
+note Compose with:
+note   si/directives/om2.om core/sovereign-core/om/scheduler/kv_cache.om
+note   core/sovereign-core/om/scheduler/scheduler.om core/sovereign-core/om/serve/http_auth.om
+note   core/sovereign-core/om/serve/router.om core/sovereign-core/om/serve/cli.om
+note   om/tls/sha2.om core/sovereign-core/om/store/closure.om
+note   core/sovereign-core/om/serve/main.om
+note Subcommands:
+note   version                        print pure-Omega runtime version
+note   health                         emit /health JSON status
+note   models                         verify AIEN_SERVE_HTTP_BEARER_TOKEN env and list models
+note   chat --model M [--max-tokens N] validate CLI, run scheduler+KV admission, emit completion JSON
+note   serve --port P [--once]        bind 127.0.0.1:P HTTP/1.1 server (requires AIEN_SERVE_HTTP_BEARER_TOKEN)
+note   serve-stdio                    process one HTTP/1.1 request from stdin to stdout (requires bearer env)
+
+text sc_ver "aien-sovereign-core-om 1.0 (pure-omega host runtime/cli)\n"
+text sc_usage "usage: aien-om version|health|models|chat|serve|serve-stdio [flags]\n"
+text sc_err_env "ERROR: AIEN_SERVE_HTTP_BEARER_TOKEN missing or invalid (16..64 printable ASCII required)\n"
+text sc_err_cli "ERROR: invalid CLI arguments code="
+text sc_err_sock "ERROR: failed to bind loopback TCP socket\n"
+text sc_env_tok "AIEN_SERVE_HTTP_BEARER_TOKEN="
+text sc_cmd_stdio "serve-stdio"
+text sc_flag_once "--once"
+text sc_nl "\n"
+text sc_req_health "GET /health HTTP/1.1\nHost: localhost\n\n"
+text sc_req_models_a "GET /v1/models HTTP/1.1\nHost: localhost\nAuthorization: Bearer "
+text sc_req_models_b "\n\n"
+text sc_chat_out0 "{\"object\":\"chat.completion\",\"engine\":\"omega-sovereign-core\",\"admitted\":true,\"max_tokens\":"
+text sc_chat_out1 ",\"kv_free_blocks\":"
+text sc_chat_out2 "}\n"
+
+global sc_cmdline uchar 512
+global sc_argbuf uchar 128
+global sc_envbuf uchar 256
+global sc_rawreq uchar 4096
+global sc_sockbuf uchar 4096
+
+fn sc_w fd int s view uchar * to void
+n = len s
+off = ulong 0
+while lt off n bound 4096
+k = write fd s off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+fn sc_w_u64 fd int v ulong to void
+buf = new uchar 24 0
+if eq v 0
+put buf 0 uchar 48
+sc_w fd part buf 0 1
+ret
+end
+tmp = new uchar 24 0
+cnt = ulong 0
+x = v
+while gt x 0 bound 24
+put tmp cnt uchar add 48 rem x 10
+cnt = add cnt 1
+x = div x 10
+end
+for i ulong cnt bound 24
+put buf i get tmp sub sub cnt 1 i
+end
+sc_w fd part buf 0 cnt
+end
+
+fn sc_w_resp fd int to void
+n = srv_resp_len
+off = ulong 0
+while lt off n bound 4096
+k = write fd srv_resp_buf off sub n off
+if le k 0
+break
+end
+off = add off ulong k
+end
+end
+
+note Load AIEN_SERVE_HTTP_BEARER_TOKEN from process environment (zero disk secrets).
+fn sc_load_env_bearer to bool
+tok = new uchar 64 0
+srv_auth_reset
+ec = envcnt
+if le ec 0
+ret false
+end
+plen = len sc_env_tok
+i = ulong 0
+uec = ulong ec
+while lt i uec bound 512
+n = envread i sc_envbuf 0 256
+if gt n long plen
+un = ulong n
+same = true
+for j ulong plen bound 64
+if ne get sc_envbuf j get sc_env_tok j
+same = false
+break
+end
+end
+if same
+tlen = sub un plen
+if or lt tlen SRV_MIN_TOKEN_LEN gt tlen SRV_MAX_TOKEN_LEN
+ret false
+end
+for j ulong tlen bound 64
+put tok j get sc_envbuf add plen j
+end
+ret srv_auth_set_token part tok 0 tlen
+end
+end
+i = add i 1
+end
+ret false
+end
+
+fn sc_arg_eq idx ulong lit view uchar * to bool
+n = argread idx sc_argbuf 0 128
+if lt n 0
+ret false
+end
+un = ulong n
+if ne un len lit
+ret false
+end
+for i ulong un bound 128
+if ne get sc_argbuf i get lit i
+ret false
+end
+end
+ret true
+end
+
+note Build space-separated command line from argv[1..argc) (skipping --once) into sc_cmdline.
+fn sc_build_cmdline argc ulong once_flag edit ulong 1 to ulong
+put once_flag 0 0
+w = ulong 0
+idx = ulong 1
+while lt idx argc bound 16
+if sc_arg_eq idx sc_flag_once
+put once_flag 0 1
+idx = add idx 1
+continue
+end
+n = argread idx sc_argbuf 0 128
+if le n 0
+idx = add idx 1
+continue
+end
+un = ulong n
+if gt w 0
+if lt w 512
+put sc_cmdline w uchar 32
+w = add w 1
+end
+end
+for j ulong un bound 128
+if lt w 512
+put sc_cmdline w get sc_argbuf j
+w = add w 1
+end
+end
+idx = add idx 1
+end
+ret w
+end
+
+note Expand LF -> CRLF from src into dst, returning written byte count.
+fn sc_expand_crlf src view uchar * dst edit uchar 512 to ulong
+n = len src
+w = ulong 0
+for i ulong n bound 512
+b = get src i
+if eq b uchar 10
+if lt add w 1 512
+put dst w uchar 13
+put dst add w 1 uchar 10
+w = add w 2
+end
+else
+if lt w 512
+put dst w b
+w = add w 1
+end
+end
+end
+ret w
+end
+
+fn sc_run_serve_stdio to int
+if not sc_load_env_bearer
+sc_w 2 sc_err_env
+ret 1
+end
+tot = ulong 0
+while lt tot SRV_MAX_REQ_BYTES bound 4096
+k = read 0 sc_rawreq tot sub SRV_MAX_REQ_BYTES tot
+if le k 0
+break
+end
+tot = add tot ulong k
+end
+req = new uchar 4096 0
+for i ulong tot bound 4096
+put req i get sc_rawreq i
+end
+st = srv_handle_http part req 0 tot
+sc_w_resp 1
+if eq st 200
+ret 0
+end
+ret 1
+end
+
+fn sc_handle_conn cfd int to void
+req = new uchar 4096 0
+rn = recv cfd sc_sockbuf 0 SRV_MAX_REQ_BYTES int 0
+if gt rn 0
+urn = ulong rn
+for i ulong urn bound 4096
+put req i get sc_sockbuf i
+end
+st = srv_handle_http part req 0 urn
+rlen = srv_resp_len
+soff = ulong 0
+while lt soff rlen bound 4096
+sk = send cfd srv_resp_buf soff sub rlen soff int 0
+if le sk 0
+break
+end
+soff = add soff ulong sk
+end
+end
+cc = fclose cfd
+end
+
+note Serve HTTP/1.1 on loopback 127.0.0.1:port using Linux AArch64 socket host words.
+fn sc_run_serve_tcp port ulong once ulong to int
+opt = new uchar 4 0
+sa = new uchar 16 0
+if not sc_load_env_bearer
+sc_w 2 sc_err_env
+ret 1
+end
+note AF_INET=2, SOCK_STREAM=1, protocol=0
+sfd = socknew int 2 int 1 int 0
+if lt sfd 0
+sc_w 2 sc_err_sock
+ret 1
+end
+note SO_REUSEADDR: level SOL_SOCKET=1, optname SO_REUSEADDR=2, val=1 (4 bytes LE)
+put opt 0 uchar 1
+orc = sockopt int sfd int 1 int 2 opt 0 4
+note sockaddr_in (16 bytes): family=2 LE, port BE, addr=127.0.0.1, zero[8]
+put sa 0 uchar 2
+put sa 1 uchar 0
+put sa 2 uchar and shr port 8 255
+put sa 3 uchar and port 255
+put sa 4 uchar 127
+put sa 5 uchar 0
+put sa 6 uchar 0
+put sa 7 uchar 1
+brc = bind int sfd sa 0 16
+if lt brc 0
+cr = fclose int sfd
+sc_w 2 sc_err_sock
+ret 1
+end
+lrc = listen int sfd int 16
+if lt lrc 0
+cr = fclose int sfd
+sc_w 2 sc_err_sock
+ret 1
+end
+served = ulong 0
+max_reqs = ulong 1000000
+if ne once 0
+max_reqs = ulong 1
+end
+while lt served max_reqs bound 1000000
+cfd = accept int sfd int 0
+if lt cfd 0
+break
+end
+sc_handle_conn int cfd
+served = add served 1
+end
+cs = fclose int sfd
+ret 0
+end
+
+fn sc_run_models to int
+if not sc_load_env_bearer
+sc_w 2 sc_err_env
+ret 1
+end
+req = new uchar 512 0
+w = ulong 0
+for i ulong len sc_req_models_a bound 128
+put req w get sc_req_models_a i
+w = add w 1
+end
+tlen = get srv_auth_meta 1
+for i ulong tlen bound 64
+put req w get srv_auth_tok i
+w = add w 1
+end
+for i ulong len sc_req_models_b bound 8
+put req w get sc_req_models_b i
+w = add w 1
+end
+wire = new uchar 512 0
+wn = sc_expand_crlf part req 0 w wire
+st = srv_handle_http part wire 0 wn
+sc_w_resp 1
+if eq st 200
+ret 0
+end
+ret 1
+end
+
+fn sc_run_chat to int
+krc = kv_init 32 16 1024
+if ne krc 0
+ret 1
+end
+mt = cli_max_tokens
+sc_w 1 sc_chat_out0
+sc_w_u64 1 mt
+sc_w 1 sc_chat_out1
+sc_w_u64 1 kv_available_blocks
+sc_w 1 sc_chat_out2
+ret 0
+end
+
+fn main to int
+wire = new uchar 512 0
+once_box = new ulong 1 0
+line = new uchar 512 0
+ac = argcnt
+if lt ac 2
+sc_w 2 sc_usage
+ret 2
+end
+if sc_arg_eq 1 sc_cmd_stdio
+ret sc_run_serve_stdio
+end
+clen = sc_build_cmdline ulong ac once_box
+for i ulong clen bound 512
+put line i get sc_cmdline i
+end
+drc = cli_dispatch part line 0 clen
+if ne drc CLI_OK
+sc_w 2 sc_err_cli
+sc_w_u64 2 drc
+sc_w 2 sc_nl
+ret 2
+end
+cmd = cli_cmd
+if eq cmd CLI_CMD_VERSION
+sc_w 1 sc_ver
+ret 0
+end
+if eq cmd CLI_CMD_HEALTH
+wn = sc_expand_crlf sc_req_health wire
+st = srv_handle_http part wire 0 wn
+sc_w_resp 1
+ret 0
+end
+if eq cmd CLI_CMD_MODELS
+ret sc_run_models
+end
+if eq cmd CLI_CMD_CHAT
+ret sc_run_chat
+end
+if eq cmd CLI_CMD_SERVE
+ret sc_run_serve_tcp cli_port get once_box 0
+end
+sc_w 2 sc_usage
+ret 2
+end

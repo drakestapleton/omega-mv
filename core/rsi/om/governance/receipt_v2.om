@@ -1,0 +1,682 @@
+note SPDX-License-Identifier: Apache-2.0
+note core/rsi/om/governance/receipt_v2.om
+note Pure seeded Omega (OM-1) implementation of spark-rsi-mv Version 2 signed evaluation
+note receipt digest (docs/RECEIPT-V2.md), holdout-set v1 digest, ECDSA P-256 verification
+note (via core/rsi/om/p256/p256.om), and fail-closed promotion gate (src/promotion_gate.rs).
+note Compose after: core/rsi/om/p256/sha256.om core/rsi/om/p256/p256.om
+note Library unit: no main. Uses decimal literals (OM-1 compatible with p256.om).
+
+note Promotion gate verdicts (0 = PROMOTE; nonzero = fail-closed refusal)
+const RV2_OK ulong 0
+const RV2_ERR_DISK_HASH_MISMATCH ulong 1
+const RV2_ERR_BAD_JUDGE_KEY ulong 2
+const RV2_ERR_SAME_KEY ulong 3
+const RV2_ERR_NOT_V2 ulong 4
+const RV2_ERR_BAD_DIGEST ulong 5
+const RV2_ERR_BAD_SIGNATURE ulong 6
+const RV2_ERR_SUBJECT_HASH ulong 7
+const RV2_ERR_POLICY_HASH ulong 8
+const RV2_ERR_HOLDOUT_HASH ulong 9
+const RV2_ERR_NOT_ADMITTED ulong 10
+const RV2_ERR_PARENT_MISMATCH ulong 11
+const RV2_ERR_SUBJECT_PATH ulong 12
+const RV2_ERR_PROTECTED_PATH ulong 13
+const RV2_ERR_NOT_ALLOWED_TARGET ulong 14
+const RV2_ERR_HOLDOUT_THRESHOLD ulong 15
+const RV2_ERR_BAD_POLICY ulong 16
+
+note Domain prefixes (docs/RECEIPT-V2.md)
+text rv2_dom_receipt "spark-rsi.evaluation-receipt.v2"
+text rv2_dom_holdout "spark-rsi.holdout-set.v1"
+text rv2_hex_tbl "0123456789abcdef"
+
+note Global V2 receipt state (one active receipt under verification)
+note rv2_meta:
+note   [0]=format_version, [1]=holdouts_total, [2]=holdouts_passed,
+note   [3]=admitted(0/1), [4]=hard_inv(0/1), [5]=stat_gates(0/1),
+note   [6]=layer_cnt (0..8), [7]=has_metrics(0/1), [8]=cand_res_mb,
+note   [9]=cycle_len, [10]=cand_len, [11]=parent_len, [12]=eval_at_len, [13]=eval_ver_len,
+note   [14]=subj_path_len
+global rv2_meta ulong 16
+global rv2_cycle uchar 64
+global rv2_cand uchar 64
+global rv2_parent uchar 64
+global rv2_eval_at uchar 64
+global rv2_eval_ver uchar 64
+global rv2_eval_bin_hex uchar 64
+global rv2_subj_path uchar 128
+global rv2_subj_hex uchar 64
+global rv2_holdout_hex uchar 64
+global rv2_policy_hex uchar 64
+global rv2_claimed_dig uchar 32
+global rv2_sig uchar 64
+
+note Layer records (up to 8 layers)
+global rv2_lr_name uchar 512
+global rv2_lr_nlen ulong 8
+global rv2_lr_hard ulong 8
+global rv2_lr_pass ulong 8
+global rv2_lr_score_bits ulong 8
+global rv2_lr_sum uchar 1024
+global rv2_lr_slen ulong 8
+
+note Metrics summary (5 f64 IEEE-754 bit patterns as u64)
+global rv2_metrics_bits ulong 5
+
+note Pinned policy and promotion subject state
+note rv2_pol_meta:
+note   [0]=require_admitted(0/1), [1]=min_ratio_bps(1..10000),
+note   [2]=allowed_cnt(0..8), [3]=protected_cnt(0..8),
+note   [4]=sub_parent_len, [5]=sub_path_len
+global rv2_pol_meta ulong 8
+global rv2_pol_sha_hex uchar 64
+global rv2_pol_holdout_hex uchar 64
+global rv2_pol_allowed uchar 1024
+global rv2_pol_alen ulong 8
+global rv2_pol_prot uchar 1024
+global rv2_pol_plen ulong 8
+global rv2_judge_pub uchar 65
+global rv2_own_pub uchar 65
+global rv2_sub_parent uchar 64
+global rv2_sub_path uchar 128
+global rv2_sub_content_hex uchar 64
+global rv2_sub_disk_hex uchar 64
+
+note Computed digest output
+global rv2_comp_dig uchar 32
+global rv2_comp_hex uchar 64
+
+note Reset all V2 receipt, policy, and subject state (fail-closed defaults).
+fn rv2_reset to void
+for i ulong 16
+put rv2_meta i 0
+end
+for i ulong 8
+put rv2_pol_meta i 0
+put rv2_lr_nlen i 0
+put rv2_lr_hard i 0
+put rv2_lr_pass i 0
+put rv2_lr_score_bits i 0
+put rv2_lr_slen i 0
+put rv2_pol_alen i 0
+put rv2_pol_plen i 0
+end
+for i ulong 5
+put rv2_metrics_bits i 0
+end
+for i ulong 65
+put rv2_judge_pub i uchar 0
+put rv2_own_pub i uchar 0
+end
+for i ulong 64
+put rv2_sig i uchar 0
+put rv2_comp_hex i uchar 0
+end
+for i ulong 32
+put rv2_claimed_dig i uchar 0
+put rv2_comp_dig i uchar 0
+end
+end
+
+note Feed a small buffer buf[0..n) (n <= 4096) into streaming SHA-256 context c.
+fn rv2_sha_feed c edit uchar 104 w edit ulong 64 buf view uchar 4096 n ulong to void
+if gt n 0
+absorb c buf n w
+end
+end
+
+note Feed u64 little-endian length prefix into SHA-256 context.
+fn rv2_sha_u64le c edit uchar 104 w edit ulong 64 v ulong to void
+tmp = new uchar 4096 0
+for i ulong 8
+sh = mul i 8
+put tmp i uchar and shr v sh 255
+end
+absorb c tmp 8 w
+end
+
+note Feed length-prefixed field (u64_le(n) || bytes[0..n)) into SHA-256 context.
+fn rv2_sha_field c edit uchar 104 w edit ulong 64 buf view uchar 4096 n ulong to void
+rv2_sha_u64le c w n
+rv2_sha_feed c w buf n
+end
+
+note Feed length-prefixed 8-byte u64 little-endian field (len=8, 8 bytes).
+fn rv2_sha_field_u64 c edit uchar 104 w edit ulong 64 v ulong to void
+rv2_sha_u64le c w 8
+rv2_sha_u64le c w v
+end
+
+note Feed length-prefixed 1-byte flag field (len=1, 0 or 1).
+fn rv2_sha_field_flag c edit uchar 104 w edit ulong 64 flag ulong to void
+rv2_sha_u64le c w 1
+tmp = new uchar 4096 0
+if ne flag 0
+put tmp 0 uchar 1
+end
+absorb c tmp 1 w
+end
+
+note Feed domain text rv2_dom_receipt.
+fn rv2_sha_dom_receipt c edit uchar 104 w edit ulong 64 to void
+n = len rv2_dom_receipt
+tmp = new uchar 4096 0
+for i ulong n bound 64
+put tmp i get rv2_dom_receipt i
+end
+rv2_sha_field c w tmp n
+end
+
+note Feed a 64-byte global string slice of length n.
+fn rv2_feed_g64 c edit uchar 104 w edit ulong 64 which ulong n ulong to void
+tmp = new uchar 4096 0
+for i ulong n bound 64
+if eq which 0
+put tmp i get rv2_cycle i
+else
+if eq which 1
+put tmp i get rv2_cand i
+else
+if eq which 2
+put tmp i get rv2_parent i
+else
+if eq which 3
+put tmp i get rv2_eval_at i
+else
+if eq which 4
+put tmp i get rv2_eval_ver i
+else
+if eq which 5
+put tmp i get rv2_eval_bin_hex i
+else
+if eq which 6
+put tmp i get rv2_subj_hex i
+else
+if eq which 7
+put tmp i get rv2_holdout_hex i
+else
+put tmp i get rv2_policy_hex i
+end
+end
+end
+end
+end
+end
+end
+end
+end
+rv2_sha_field c w tmp n
+end
+
+note Feed rv2_subj_path[0..n).
+fn rv2_feed_subj_path c edit uchar 104 w edit ulong 64 n ulong to void
+tmp = new uchar 4096 0
+for i ulong n bound 128
+put tmp i get rv2_subj_path i
+end
+rv2_sha_field c w tmp n
+end
+
+note Feed layer idx into SHA-256 context (violations count = 0).
+fn rv2_feed_layer c edit uchar 104 w edit ulong 64 idx ulong to void
+tmp = new uchar 4096 0
+nlen = get rv2_lr_nlen idx
+nbase = mul idx 64
+for i ulong nlen bound 64
+put tmp i get rv2_lr_name add nbase i
+end
+rv2_sha_field c w tmp nlen
+rv2_sha_field_flag c w get rv2_lr_hard idx
+rv2_sha_field_flag c w get rv2_lr_pass idx
+rv2_sha_field_u64 c w get rv2_lr_score_bits idx
+slen = get rv2_lr_slen idx
+sbase = mul idx 128
+for i ulong slen bound 128
+put tmp i get rv2_lr_sum add sbase i
+end
+rv2_sha_field c w tmp slen
+rv2_sha_field_u64 c w 0
+end
+
+note Encode 32 raw bytes from SHA-256 final output packed in w[0..4) (byte k = (w[k/8] >> ((k&7)*8)) & 255)
+note into rv2_comp_dig and rv2_comp_hex (exact match with p256.om p2dig).
+fn rv2_store_digest w view ulong 64 to void
+for i ulong 32
+bv = and shr get w shr i 3 mul and i 7 8 255
+put rv2_comp_dig i uchar bv
+hi = shr bv 4
+lo = and bv 15
+put rv2_comp_hex mul i 2 get rv2_hex_tbl hi
+put rv2_comp_hex add mul i 2 1 get rv2_hex_tbl lo
+end
+end
+
+note Compute exact V2 receipt digest (docs/RECEIPT-V2.md) into rv2_comp_dig / rv2_comp_hex.
+fn rv2_compute_digest to void
+c = new uchar 104 0
+w = new ulong 64 0
+init c
+rv2_sha_dom_receipt c w
+rv2_feed_g64 c w 0 get rv2_meta 9
+rv2_feed_g64 c w 1 get rv2_meta 10
+rv2_feed_g64 c w 2 get rv2_meta 11
+rv2_feed_g64 c w 3 get rv2_meta 12
+rv2_feed_g64 c w 4 get rv2_meta 13
+rv2_feed_g64 c w 5 64
+rv2_feed_subj_path c w get rv2_meta 14
+rv2_feed_g64 c w 6 64
+rv2_feed_g64 c w 7 64
+rv2_feed_g64 c w 8 64
+rv2_sha_field_u64 c w get rv2_meta 1
+rv2_sha_field_u64 c w get rv2_meta 2
+rv2_sha_field_flag c w get rv2_meta 3
+rv2_sha_field_flag c w get rv2_meta 4
+rv2_sha_field_flag c w get rv2_meta 5
+lcnt = get rv2_meta 6
+rv2_sha_field_u64 c w lcnt
+for i ulong lcnt bound 8
+rv2_feed_layer c w i
+end
+if eq get rv2_meta 7 0
+rv2_sha_field_flag c w 0
+else
+rv2_sha_field_flag c w 1
+for m ulong 5
+rv2_sha_field_u64 c w get rv2_metrics_bits m
+end
+rv2_sha_field_u64 c w get rv2_meta 8
+end
+final c w
+rv2_store_digest w
+end
+
+note Unpack 32 SHA-256 bytes packed in w[0..4) into out32.
+fn rv2_unpack_w w view ulong 64 out32 edit uchar 32 to void
+for i ulong 32
+v = get w shr i 3
+sh = mul and i 7 8
+put out32 i uchar and shr v sh 255
+end
+end
+
+note Compute SHA-256 of buf[0..n) (n <= 4096) into out32 (raw 32 bytes).
+fn rv2_sha256_raw buf view uchar 4096 n ulong out32 edit uchar 32 to void
+c = new uchar 104 0
+w = new ulong 64 0
+init c
+rv2_sha_feed c w buf n
+final c w
+rv2_unpack_w w out32
+end
+
+note Compute exact spark-rsi.holdout-set.v1 digest for one sorted holdout file (name, file_sha256_32).
+fn rv2_holdout_digest_1 fname view uchar 64 flen ulong fhash view uchar 32 out32 edit uchar 32 to void
+c = new uchar 104 0
+w = new ulong 64 0
+tmp = new uchar 4096 0
+init c
+dn = len rv2_dom_holdout
+for i ulong dn bound 64
+put tmp i get rv2_dom_holdout i
+end
+rv2_sha_field c w tmp dn
+rv2_sha_field_u64 c w 1
+for i ulong flen bound 64
+put tmp i get fname i
+end
+rv2_sha_field c w tmp flen
+for i ulong 32
+put tmp i get fhash i
+end
+rv2_sha_field c w tmp 32
+final c w
+rv2_unpack_w w out32
+end
+
+note Derive 65-byte uncompressed SEC1 public key from 32-byte P-256 private scalar d.
+fn rv2_p256_pubkey priv32 view uchar 32 pub65 edit uchar 65 to ulong
+pw = new ulong 1024 0
+pb = new uchar 4096 0
+p2init pw
+for i ulong 32
+put pb add PBKEY i get priv32 i
+end
+rc = p2pub pw pb
+if ne rc 0
+ret rc
+end
+for i ulong 65
+put pub65 i get pb add PBPUB i
+end
+ret 0
+end
+
+note Sign the 32-byte raw V2 digest dig32 with 32-byte P-256 private key priv32 into sig64.
+note Matches spark-rsi-mv src/evaluator/mod.rs (signing_key.sign(&digest_bytes)) byte-for-byte.
+fn rv2_p256_sign priv32 view uchar 32 dig32 view uchar 32 sig64 edit uchar 64 to ulong
+pw = new ulong 1024 0
+pc = new uchar 104 0
+pb = new uchar 4096 0
+ps = new ulong 64 0
+p2init pw
+for i ulong 32
+put pb add PBKEY i get priv32 i
+put pb add PBMSG i get dig32 i
+end
+rc = p2sign pw pc pb ps 32
+if ne rc 0
+ret rc
+end
+for i ulong 64
+put sig64 i get pb add PBSIG i
+end
+ret 0
+end
+
+note Verify 64-byte P-256 signature sig64 over 32-byte raw V2 digest dig32 under pub65.
+note Returns 1 if valid, 0 if invalid.
+fn rv2_p256_verify pub65 view uchar 65 dig32 view uchar 32 sig64 view uchar 64 to ulong
+pw = new ulong 1024 0
+pc = new uchar 104 0
+pb = new uchar 4096 0
+ps = new ulong 64 0
+p2init pw
+for i ulong 65
+put pb add PBPUB i get pub65 i
+end
+for i ulong 32
+put pb add PBMSG i get dig32 i
+end
+for i ulong 64
+put pb add PBSIG i get sig64 i
+end
+ret p2vrfy pw pc pb ps 32
+end
+
+note Check uncompressed SEC1 key validity (0x04 prefix and point on NIST P-256 curve).
+fn rv2_key_on_curve pub65 view uchar 65 to bool
+if ne get pub65 0 uchar 4
+ret false
+end
+pw = new ulong 1024 0
+pb = new uchar 4096 0
+p2init pw
+for i ulong 65
+put pb add PBPUB i get pub65 i
+end
+p2ld pw PX pb add PBPUB 1
+p2ld pw PY pb add PBPUB 33
+ret p2oncv pw
+end
+
+note Validate clean relative path: non-empty, no leading/trailing '/', no '//', no '.' or '..' segment.
+fn rv2_clean_rel_path buf view uchar 128 plen ulong to bool
+if or eq plen 0 gt plen 128
+ret false
+end
+if or eq get buf 0 uchar 47 eq get buf sub plen 1 uchar 47
+ret false
+end
+seg_start = ulong 0
+i = ulong 0
+while le i plen bound 130
+at_sep = false
+if eq i plen
+at_sep = true
+else
+b = get buf i
+if or eq b uchar 0 eq b uchar 92
+ret false
+end
+if eq b uchar 47
+at_sep = true
+end
+end
+if at_sep
+slen = sub i seg_start
+if eq slen 0
+ret false
+end
+if eq slen 1
+if eq get buf seg_start uchar 46
+ret false
+end
+end
+if eq slen 2
+if eq get buf seg_start uchar 46
+if eq get buf add seg_start 1 uchar 46
+ret false
+end
+end
+end
+seg_start = add i 1
+end
+i = add i 1
+end
+ret true
+end
+
+note Check if path[0..plen) equals prefix[0..xlen) or starts with prefix + '/'.
+fn rv2_under_prefix path view uchar 128 plen ulong pref view uchar 128 xlen ulong to bool
+if or eq xlen 0 lt plen xlen
+ret false
+end
+for i ulong xlen bound 128
+if ne get path i get pref i
+ret false
+end
+end
+if eq plen xlen
+ret true
+end
+ret eq get path xlen uchar 47
+end
+
+note Compare two 64-byte global hex digests.
+fn rv2_hex64_eq_g a_which ulong b_which ulong to bool
+for i ulong 64
+va = uchar 0
+vb = uchar 0
+if eq a_which 0
+va = get rv2_sub_content_hex i
+else
+if eq a_which 1
+va = get rv2_subj_hex i
+else
+if eq a_which 2
+va = get rv2_policy_hex i
+else
+va = get rv2_holdout_hex i
+end
+end
+end
+if eq b_which 0
+vb = get rv2_sub_disk_hex i
+else
+if eq b_which 1
+vb = get rv2_sub_content_hex i
+else
+if eq b_which 2
+vb = get rv2_pol_sha_hex i
+else
+vb = get rv2_pol_holdout_hex i
+end
+end
+end
+if ne va vb
+ret false
+end
+end
+ret true
+end
+
+note Check if rv2_subj_path is in rv2_pol_allowed[0..allowed_cnt).
+fn rv2_in_allowed to bool
+acnt = get rv2_pol_meta 2
+slen = get rv2_meta 14
+for k ulong acnt bound 8
+alen = get rv2_pol_alen k
+if eq alen slen
+base = mul k 128
+same = true
+for i ulong slen bound 128
+if ne get rv2_subj_path i get rv2_pol_allowed add base i
+same = false
+break
+end
+end
+if same
+ret true
+end
+end
+end
+ret false
+end
+
+note Check if rv2_subj_path lies under any rv2_pol_prot[0..protected_cnt).
+fn rv2_in_protected to bool
+pcnt = get rv2_pol_meta 3
+slen = get rv2_meta 14
+sp = new uchar 128 0
+for i ulong slen bound 128
+put sp i get rv2_subj_path i
+end
+pr = new uchar 128 0
+for k ulong pcnt bound 8
+xlen = get rv2_pol_plen k
+base = mul k 128
+for j ulong xlen bound 128
+put pr j get rv2_pol_prot add base j
+end
+if rv2_under_prefix sp slen pr xlen
+ret true
+end
+end
+ret false
+end
+
+note Verify judge/own key separation and P-256 signature over rv2_comp_dig.
+fn rv2_check_keys_and_sig to ulong
+jpub = new uchar 65 0
+opub = new uchar 65 0
+dig = new uchar 32 0
+sig = new uchar 64 0
+same_key = true
+for i ulong 65
+jb = get rv2_judge_pub i
+ob = get rv2_own_pub i
+put jpub i jb
+put opub i ob
+if ne jb ob
+same_key = false
+end
+end
+if not rv2_key_on_curve jpub
+ret RV2_ERR_BAD_JUDGE_KEY
+end
+if same_key
+ret RV2_ERR_SAME_KEY
+end
+for i ulong 32
+put dig i get rv2_comp_dig i
+end
+for i ulong 64
+put sig i get rv2_sig i
+end
+if ne rv2_p256_verify jpub dig sig 1
+ret RV2_ERR_BAD_SIGNATURE
+end
+ret RV2_OK
+end
+
+note Fail-closed Version 2 Promotion Gate (exact mirror of spark-rsi-mv/src/promotion_gate.rs).
+fn rv2_check_promotion to ulong
+note 1. Staged disk hash must equal change content hash
+if not rv2_hex64_eq_g 0 0
+ret RV2_ERR_DISK_HASH_MISMATCH
+end
+note 2. Policy invariants: require_admitted=1, min_ratio_bps in 1..10000, allowed_cnt >= 1
+if eq get rv2_pol_meta 0 0
+ret RV2_ERR_BAD_POLICY
+end
+min_bps = get rv2_pol_meta 1
+if or eq min_bps 0 gt min_bps 10000
+ret RV2_ERR_BAD_POLICY
+end
+if eq get rv2_pol_meta 2 0
+ret RV2_ERR_BAD_POLICY
+end
+note 3. Format version must be strictly 2 (v1 never promotes)
+if ne get rv2_meta 0 2
+ret RV2_ERR_NOT_V2
+end
+note 4. Recompute V2 digest and verify equality with claimed digest
+rv2_compute_digest
+for i ulong 32
+if ne get rv2_comp_dig i get rv2_claimed_dig i
+ret RV2_ERR_BAD_DIGEST
+end
+end
+note 5. Verify pinned judge P-256 key validity, judge != own key, and ECDSA P-256 signature
+krc = rv2_check_keys_and_sig
+if ne krc RV2_OK
+ret krc
+end
+note 6. Subject hash, policy hash, and holdout set hash must match pins
+if not rv2_hex64_eq_g 1 1
+ret RV2_ERR_SUBJECT_HASH
+end
+if not rv2_hex64_eq_g 2 2
+ret RV2_ERR_POLICY_HASH
+end
+if not rv2_hex64_eq_g 3 3
+ret RV2_ERR_HOLDOUT_HASH
+end
+note 7. Admission and hard/statistical gate flags must all be true
+if or eq get rv2_meta 3 0 or eq get rv2_meta 4 0 eq get rv2_meta 5 0
+ret RV2_ERR_NOT_ADMITTED
+end
+note 8. Parent id must match subject parent id
+plen = get rv2_meta 11
+if ne plen get rv2_pol_meta 4
+ret RV2_ERR_PARENT_MISMATCH
+end
+for i ulong plen bound 64
+if ne get rv2_parent i get rv2_sub_parent i
+ret RV2_ERR_PARENT_MISMATCH
+end
+end
+note 9. Subject path must be clean relative path and match subject
+slen = get rv2_meta 14
+if ne slen get rv2_pol_meta 5
+ret RV2_ERR_SUBJECT_PATH
+end
+sp = new uchar 128 0
+for i ulong slen bound 128
+b = get rv2_subj_path i
+if ne b get rv2_sub_path i
+ret RV2_ERR_SUBJECT_PATH
+end
+put sp i b
+end
+if not rv2_clean_rel_path sp slen
+ret RV2_ERR_SUBJECT_PATH
+end
+note 10. Protected paths refused; must appear in allowed_targets
+if rv2_in_protected
+ret RV2_ERR_PROTECTED_PATH
+end
+if not rv2_in_allowed
+ret RV2_ERR_NOT_ALLOWED_TARGET
+end
+note 11. Holdout pass ratio check (exact integer: passed * 10000 >= min_ratio_bps * total)
+htot = get rv2_meta 1
+hpas = get rv2_meta 2
+if or eq htot 0 gt hpas htot
+ret RV2_ERR_HOLDOUT_THRESHOLD
+end
+if lt mul hpas 10000 mul min_bps htot
+ret RV2_ERR_HOLDOUT_THRESHOLD
+end
+ret RV2_OK
+end

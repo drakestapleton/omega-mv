@@ -1,0 +1,356 @@
+note SPDX-License-Identifier: Apache-2.0
+note protocol/open-humanity/trace_contract_test.om
+note Positive, negative, and cryptographic tamper tests for the exact-byte Open Humanity
+note UDP wire codec (beacon-core parity) and AITR v1 consent/export + trace-receiver contract.
+note Compose with:
+note   si/directives/om2.om om/blake3/b3unit.om protocol/omnet/om/sha512/sha512.om
+note   protocol/omnet/om/ed25519/ed25519.om protocol/open-humanity/lib.om protocol/open-humanity/trace_contract.om
+note   protocol/open-humanity/trace_contract_test.om
+
+text tc_pass "PASS "
+text tc_fail "FAIL "
+text tc_nl "\n"
+text tc_ok_all "OPEN-HUMANITY EXACT-BYTE WIRE & TRACE-RECEIVER TEST SUITE PASS\n"
+text tc_bad_all "OPEN-HUMANITY EXACT-BYTE WIRE & TRACE-RECEIVER TEST SUITE FAIL\n"
+
+text tc_n1 "wire_challenge_ack_register_and_keyed_cookie"
+text tc_n2 "wire_negative_tamper_drift_and_wrong_key"
+text tc_n3 "error_fingerprint_path_scrub_and_ws_parity"
+text tc_n4 "trace_consent_export_and_receive_aitr_v1"
+text tc_n5 "trace_negative_no_consent_zero_auth_firewall_secret"
+text tc_n6 "trace_negative_replay_wrong_receiver_crc_and_tamper"
+
+text tc_addr_a "192.0.2.1:4000"
+text tc_addr_b "192.0.2.1:4001"
+text tc_err_a "error at /home/alice/proj/src/lib.rs:   cannot   compile"
+text tc_err_b "error at /Users/bob/proj/src/lib.rs: cannot compile\n"
+text tc_pay_ok0 "kernel=sm121 lat_us=412 ok"
+text tc_pay_ok1 "kv_hits=128 miss=2"
+text tc_pay_skip "internal_debug_type_5_excluded"
+text tc_pay_sec "leak AKIAIOSFODNN7EXAMPLE here"
+text tc_pay_path "trace at /home/drake/secret/file"
+text tc_pay_esc "run sudo rm now"
+
+global tc_fails ulong 1
+
+fn tc_w s view uchar * to void
+ok = oh_write_all 1 s
+if ok
+ret
+end
+end
+
+fn tc_rep name view uchar * ok bool to void
+if ok
+tc_w tc_pass
+else
+tc_w tc_fail
+put tc_fails 0 add get tc_fails 0 1
+end
+tc_w name
+tc_w tc_nl
+end
+
+fn tc_check_register ck view uchar 16 now ulong to bool
+seed = new uchar 32 17
+reg_wire = new uchar 133 0
+if ne ohw_encode_register seed now uchar 5 uchar 1 ck reg_wire 133
+ret false
+end
+out_pk = new uchar 32 0
+rmeta = new ulong 3 0
+if ne ohw_verify_register reg_wire now out_pk rmeta OHTX_OK
+ret false
+end
+if ne get rmeta 0 now
+ret false
+end
+if ne get rmeta 1 5
+ret false
+end
+ret eq get rmeta 2 1
+end
+
+note Test 1: Challenge, Ack, signed Register (133B bincode parity) + keyed BLAKE3 cookie windows.
+fn test_tc_wire_pos to bool
+secret = new uchar 32 9
+now = ulong 1000000
+ck = new uchar 16 0
+ohw_relay_cookie secret tc_addr_a div now OHW_COOKIE_WINDOW ck
+if not ohw_cookie_valid secret tc_addr_a now ck
+ret false
+end
+if not ohw_cookie_valid secret tc_addr_a add now OHW_COOKIE_WINDOW ck
+ret false
+end
+if ohw_cookie_valid secret tc_addr_a add now mul 2 OHW_COOKIE_WINDOW ck
+ret false
+end
+if ohw_cookie_valid secret tc_addr_b now ck
+ret false
+end
+ch_wire = new uchar 19 0
+if ne ohw_encode_challenge ck ch_wire 19
+ret false
+end
+ck2 = new uchar 16 0
+if ne ohw_decode_challenge ch_wire ck2 OHTX_OK
+ret false
+end
+for i ulong 16
+if ne get ck i get ck2 i
+ret false
+end
+end
+ack_wire = new uchar 8 0
+if ne ohw_encode_ack uchar 3 120 ack_wire 8
+ret false
+end
+ameta = new ulong 2 0
+if ne ohw_decode_ack ack_wire ameta OHTX_OK
+ret false
+end
+if or ne get ameta 0 3 ne get ameta 1 120
+ret false
+end
+ret tc_check_register ck now
+end
+
+note Test 2 (NEGATIVE): Register tamper, drift > 300s, bad magic/version refused.
+fn test_tc_wire_neg to bool
+seed = new uchar 32 17
+ck = new uchar 16 4
+now = ulong 1000000
+reg_wire = new uchar 133 0
+n = ohw_encode_register seed now uchar 1 uchar 0 ck reg_wire
+if ne n 133
+ret false
+end
+out_pk = new uchar 32 0
+rmeta = new ulong 3 0
+note Drift > 300s
+if ne ohw_verify_register reg_wire add now 305 out_pk rmeta OHTX_ERR_DRIFT
+ret false
+end
+note Flip 1 bit in topics byte -> Ed25519 signature failure
+put reg_wire 43 xor get reg_wire 43 uchar 1
+if ne ohw_verify_register reg_wire now out_pk rmeta OHTX_ERR_BAD_SIG
+ret false
+end
+put reg_wire 43 xor get reg_wire 43 uchar 1
+note Bad version
+put reg_wire 2 uchar 9
+if ne ohw_verify_register reg_wire now out_pk rmeta OHTX_ERR_BAD_VERSION
+ret false
+end
+ret true
+end
+
+note Test 3: Two different user home folders & whitespace yield identical BLAKE3 error fingerprint.
+fn test_tc_fingerprint to bool
+h1 = new uchar 32 0
+h2 = new uchar 32 0
+ohw_fingerprint_error tc_err_a h1
+ohw_fingerprint_error tc_err_b h2
+for i ulong 32
+if ne get h1 i get h2 i
+ret false
+end
+end
+ret true
+end
+
+note Build a 3-record AITR v1 segment (types 1, 5, 2) -> total 16 + 3*64 = 208 bytes.
+fn tc_build_clean_seg dst edit uchar 208 to bool
+ohtx_aitr_write_hdr dst
+if ne ohtx_aitr_write_rec dst 16 or ulong 1 shl ulong 0 16 tc_pay_ok0 OHTX_OK
+ret false
+end
+if ne ohtx_aitr_write_rec dst 80 or ulong 5 shl ulong 1 16 tc_pay_skip OHTX_OK
+ret false
+end
+if ne ohtx_aitr_write_rec dst 144 or ulong 2 shl ulong 2 16 tc_pay_ok1 OHTX_OK
+ret false
+end
+ret true
+end
+
+fn tc_check_out_seg seg_out view uchar 512 to bool
+rcnt_box = new ulong 1 0
+if ne ohtx_aitr_validate_hdr part seg_out 0 144 rcnt_box OHTX_OK
+ret false
+end
+if ne get rcnt_box 0 2
+ret false
+end
+rt = new ulong 1 0
+pl = new ulong 1 0
+if ne ohtx_aitr_validate_rec part seg_out 0 144 0 rt pl OHTX_OK
+ret false
+end
+if or ne get rt 0 1 ne get pl 0 len tc_pay_ok0
+ret false
+end
+if ne ohtx_aitr_validate_rec part seg_out 0 144 1 rt pl OHTX_OK
+ret false
+end
+ret and eq get rt 0 2 eq get pl 0 len tc_pay_ok1
+end
+
+note Test 4 (POSITIVE): Exact-byte consent/export filters types {1,2}, drops type 5, receiver verifies & outputs 2-rec AITR v1.
+fn test_tc_trace_pos to bool
+ohtx_reset_replay
+node_seed = new uchar 32 21
+recv_seed = new uchar 32 22
+recv_pk = new uchar 32 0
+ohtx_ed_pubkey recv_seed recv_pk
+now = ulong 1700000000
+consent = new uchar 160 0
+ohtx_sign_consent node_seed recv_pk 6 add now 3600 0 consent
+seg_in = new uchar 208 0
+if not tc_build_clean_seg seg_in
+ret false
+end
+bid = new uchar 16 77
+ohtx_set_bundle_id bid
+bundle = new uchar 4408 0
+if ne oh_trace_export node_seed consent seg_in now bundle OHTX_OK
+ret false
+end
+if ne ohtx_export_len 440
+ret false
+end
+seg_out = new uchar 512 0
+if ne oh_trace_receive part bundle 0 440 recv_pk now seg_out OHTX_OK
+ret false
+end
+if ne ohtx_recv_len 144
+ret false
+end
+ret tc_check_out_seg seg_out
+end
+
+fn tc_check_fw_neg node_seed view uchar 32 recv_pk view uchar 32 now ulong to bool
+c_ok = new uchar 160 0
+ohtx_sign_consent node_seed recv_pk 6 add now 3600 0 c_ok
+bad_seg = new uchar 80 0
+bundle = new uchar 4408 0
+ohtx_aitr_write_hdr bad_seg
+if ne ohtx_aitr_write_rec bad_seg 16 or ulong 1 shl ulong 0 16 tc_pay_sec OHTX_OK
+ret false
+end
+if ne oh_trace_export node_seed c_ok bad_seg now bundle OHTX_ERR_FIREWALL
+ret false
+end
+if ne ohtx_export_len 0
+ret false
+end
+if ne ohtx_aitr_write_rec bad_seg 16 or ulong 1 shl ulong 0 16 tc_pay_path OHTX_OK
+ret false
+end
+if ne oh_trace_export node_seed c_ok bad_seg now bundle OHTX_ERR_FIREWALL
+ret false
+end
+if ne ohtx_aitr_write_rec bad_seg 16 or ulong 1 shl ulong 0 16 tc_pay_esc OHTX_OK
+ret false
+end
+ret eq oh_trace_export node_seed c_ok bad_seg now bundle OHTX_ERR_ESCALATION
+end
+
+note Test 5 (NEGATIVE): Missing opt-in, nonzero cap_flags, expired consent, and Personal Data Firewall secret/path/escalation refusals.
+fn test_tc_trace_neg_consent_fw to bool
+node_seed = new uchar 32 21
+recv_seed = new uchar 32 22
+recv_pk = new uchar 32 0
+ohtx_ed_pubkey recv_seed recv_pk
+now = ulong 1700000000
+bid = new uchar 16 78
+ohtx_set_bundle_id bid
+seg_in = new uchar 208 0
+if not tc_build_clean_seg seg_in
+ret false
+end
+bundle = new uchar 4408 0
+c_buf = new uchar 160 0
+ohtx_sign_consent node_seed recv_pk 6 add now 3600 1 c_buf
+if ne oh_trace_export node_seed c_buf seg_in now bundle OHTX_ERR_CONSENT_AUTH
+ret false
+end
+ohtx_sign_consent node_seed recv_pk 6 add now 3600 0 c_buf
+put c_buf 5 uchar 0
+if ne oh_trace_export node_seed c_buf seg_in now bundle OHTX_ERR_NO_CONSENT
+ret false
+end
+ohtx_sign_consent node_seed recv_pk 6 sub now 10 0 c_buf
+if ne oh_trace_export node_seed c_buf seg_in now bundle OHTX_ERR_CONSENT_EXPIRED
+ret false
+end
+ret tc_check_fw_neg node_seed recv_pk now
+end
+
+fn tc_check_recv_mutants bundle edit uchar 4408 blen ulong recv_pk view uchar 32 now ulong to bool
+seg_out = new uchar 512 0
+if ne oh_trace_receive part bundle 0 blen recv_pk now seg_out OHTX_OK
+ret false
+end
+if ne oh_trace_receive part bundle 0 blen recv_pk now seg_out OHTX_ERR_REPLAY
+ret false
+end
+ohtx_reset_replay
+put bundle add OHTX_HDR_LEN 24 xor get bundle add OHTX_HDR_LEN 24 uchar 1
+ret eq oh_trace_receive part bundle 0 blen recv_pk now seg_out OHTX_ERR_BAD_DIGEST
+end
+
+note Test 6 (NEGATIVE): Replay, wrong receiver key, tampered segment CRC, torn segment, and bundle tamper all refused.
+fn test_tc_trace_neg_recv to bool
+ohtx_reset_replay
+node_seed = new uchar 32 21
+recv_seed = new uchar 32 22
+other_seed = new uchar 32 23
+recv_pk = new uchar 32 0
+other_pk = new uchar 32 0
+ohtx_ed_pubkey recv_seed recv_pk
+ohtx_ed_pubkey other_seed other_pk
+now = ulong 1700000000
+consent = new uchar 160 0
+ohtx_sign_consent node_seed recv_pk 6 add now 3600 0 consent
+seg_in = new uchar 208 0
+if not tc_build_clean_seg seg_in
+ret false
+end
+bid = new uchar 16 88
+ohtx_set_bundle_id bid
+bundle = new uchar 4408 0
+if ne oh_trace_export node_seed consent seg_in now bundle OHTX_OK
+ret false
+end
+blen = ohtx_export_len
+seg_out = new uchar 512 0
+if ne oh_trace_receive part bundle 0 blen other_pk now seg_out OHTX_ERR_WRONG_RECEIVER
+ret false
+end
+if not tc_check_recv_mutants bundle blen recv_pk now
+ret false
+end
+if ne oh_trace_export node_seed consent part seg_in 0 180 now bundle OHTX_ERR_AITR_TORN
+ret false
+end
+put seg_in 30 xor get seg_in 30 uchar 1
+ret eq oh_trace_export node_seed consent seg_in now bundle OHTX_ERR_AITR_CRC
+end
+
+fn main to int
+put tc_fails 0 0
+tc_rep tc_n1 test_tc_wire_pos
+tc_rep tc_n2 test_tc_wire_neg
+tc_rep tc_n3 test_tc_fingerprint
+tc_rep tc_n4 test_tc_trace_pos
+tc_rep tc_n5 test_tc_trace_neg_consent_fw
+tc_rep tc_n6 test_tc_trace_neg_recv
+if eq get tc_fails 0 0
+tc_w tc_ok_all
+ret 0
+end
+tc_w tc_bad_all
+ret 1
+end

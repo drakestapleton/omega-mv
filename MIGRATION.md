@@ -48,10 +48,18 @@ deleted legacy code and qualified consumers; a plan or a passing unit test is no
    `seed/trace/gate.sh` (71 checks and four source mutants: CRC, torn tail, alignment, exclusive
    create; quarantine and recovery). A one-shot `.om` SHA-256 (`seed/trace/sha256.om`) passes five
    standard vectors and runs in the security673 qualification gate.
-   Exact-byte consent/export and the receiver contract remain `NOT_RUN`: the Open Humanity receiver
-   contract is not in this repository, and no second wire contract is invented here.
+   Exact-byte consent/export (`OHCN` v1 signed consent + `OHTX` v1 exporter over `AITR` v1 segments),
+   Personal Data Firewall enforcement, the exact-byte Open Humanity UDP wire codec (`0x4f` v1,
+   bincode 1.3 LE, keyed BLAKE3 relay cookies, Ed25519), and the fail-closed trace receiver are now
+   implemented and host-tested in pure seeded `.om` (`protocol/open-humanity/trace_contract.om`,
+   `trace_contract_test.om`, `trace_receiver_main.om`, and mirrored into `open-humanity/om/`).
 4. **Evaluation and promotion (spark-rsi #67)**: replace the Rust promotion/evaluator gate with the
    `.om` owner; keep sealed tasks outside the proposer's writable surface.
+   Status: the pure-Omega 6-layer evaluator, canary, rollback (`core/rsi/om/eval/`), governance
+   envelope, SHA-256 Merkle ledger, and Version 2 ECDSA P-256 signed receipt verifier & promotion
+   gate (`core/rsi/om/governance/receipt_v2.om`, `v2_main.om`, `v2_test.om`, byte-for-byte
+   `spark-rsi.evaluation-receipt.v2` digest and FIPS 186-4 P-256 parity with `spark-rsi-mv`) are
+   implemented, host-tested, and mirrored into `spark-rsi-mv/om/`.
 5. **Device and DMA (#672)**: `.om` device contracts and queues. Firmware and hardware are outside
    the delivered source closure; physical qualification stays `NOT_RUN` until reserved hardware is
    exercised.

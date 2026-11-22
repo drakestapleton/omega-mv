@@ -26,11 +26,11 @@ Compatibility, conversion and ecosystem bindings of Sovereign Intelligence: exis
 
 ## `core/`
 
-Runtime, memory, recursive self-improvement, mission orchestration and agent core of Sovereign Intelligence (`aien-sovereign-core-mv`, `aien`, `cortex`, `spark-rsi-mv`, `omega-mission`, `hive-view` moved with full Git history under `core/import/`, plus pure-Omega conversions of `hive-not-swarm`, `spark-dream`, `spark-hive`, `mobhub`, `openclaw-rs`, and `aegis-runtime-mv`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `core/units-gate.om` (`OMEGA-CORE-UNITS`, 51 units). Remaining non-Omega files stay upstream (`core/NOT-YET-OMEGA.tsv`).
+Runtime, memory, recursive self-improvement, mission orchestration and agent core of Sovereign Intelligence (`aien-sovereign-core-mv`, `aien`, `cortex`, `spark-rsi-mv`, `omega-mission`, `hive-view` moved with full Git history under `core/import/`, plus pure-Omega conversions of `hive-not-swarm`, `spark-dream`, `spark-hive`, `mobhub`, `openclaw-rs`, and `aegis-runtime-mv`, and pure-Omega V2 P-256 RSI promotion gate and Sovereign Core standalone runtime/CLI), mirroring `gpu/`: pure-Omega `.om` units only, gated by `core/units-gate.om` (`OMEGA-CORE-UNITS`, 55 units). Remaining non-Omega files stay upstream (`core/NOT-YET-OMEGA.tsv`).
 
 ## `protocol/`
 
-Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp` moved with full Git history under `protocol/import/`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity`, and `synapse` under `protocol/synapse/core/`, and the pure-Omega UOR/Prism GPU bundle verifier and CLI under `protocol/uor-gpu/` with its Lean 4 policy model in `protocol/uor-gpu/proofs/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 32 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
+Security networking, wire protocols and Synapse coordination of Sovereign Intelligence (`omnet`, `aien-protocols-mv`, `interplane-mv`, `synapse-map`, `synapse-board`, `synapse-claims`, `synapse-pulse`, `synapse-mcp` moved with full Git history under `protocol/import/`, plus pure-Omega conversions of `rad-id-sync`, `open-humanity` including the exact-byte wire codec and `AITR` v1 consent/export + trace-receiver contract, and `synapse` under `protocol/synapse/core/`, and the pure-Omega UOR/Prism GPU bundle verifier and CLI under `protocol/uor-gpu/` with its Lean 4 policy model in `protocol/uor-gpu/proofs/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `protocol/units-gate.om` (`OMEGA-PROTOCOL-UNITS`, 34 units). Remaining non-Omega files stay upstream (`protocol/NOT-YET-OMEGA.tsv`).
 
 ## `si/`
 
@@ -300,6 +300,10 @@ Rules:
 ## `seed/agent/bench/`
 
 Test-only equal-work benchmark of omagent against nanobot reduced to the same four tools: scripted streaming mock, paired interleaved driver, nanobot launcher.
+
+## `seed/build/`
+
+Pure seeded-Omega build, release, and automation coordinators (`common.om`, `birth.om`, `units.om`, `tlsbuild.om`, `sparkefi.om`, `gpucoord.om`, `release.om`, `gate.om`) taking shell and Python out of the delivery path: dynamic run-time pools (`global ... *`), streaming FIPS 180-4 SHA-256, compiler birth & 8-case size-record verification, byte-for-byte `src/omega_om_units.*` regeneration, TLS 1.3 + FIPS stamping, bare-metal `SPARK.EFI` PE32+ build/verification, SPIR-V/Intel Xe/SM121 GPU model builds, lockfile/zero-disk-secrets/Windows-path checks, UXL delivery verification, reproducible release packaging/verification, and the self-qualification gate `OMEGA-BUILD-COORD`.
 
 ## `seed/effects/`
 

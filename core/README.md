@@ -8,10 +8,10 @@ Everything under `core/` is pure seeded Omega (`.om`) built by `omega-mv`'s own 
 
 | Path | Upstream repo | Canonical head | `.om` files | Imported commits | Non-`.om` upstream |
 | --- | --- | --- | ---: | ---: | ---: |
-| `core/sovereign-core/` | `aien-sovereign-core-mv` (`rad:z44GqrPVAPjZkhoD2MWVjqy18ighN`) | `c030d3646133` | 58 | 42 | 6655 |
+| `core/sovereign-core/` | `aien-sovereign-core-mv` (`rad:z44GqrPVAPjZkhoD2MWVjqy18ighN`) | `c030d3646133` | 60 | 42 | 6655 |
 | `core/aien/` | `aien` (`rad:zDTnULpiVMniD2etkbUozUP5mn6U`) | `db0cf3d29135` | 6 | 5 | 71 |
 | `core/cortex/` | `cortex` (`rad:zDrGjCcXxPwjWNYQj52Y9RYzBq1t`) | `2f5f763d79b2` | 45 | 10 | 68 |
-| `core/rsi/` | `spark-rsi-mv` (`rad:z4AauBRPXzPNMiAoHZpRpyCee61A2`) | `2edaf6704304` | 31 | 2 | 181 |
+| `core/rsi/` | `spark-rsi-mv` (`rad:z4AauBRPXzPNMiAoHZpRpyCee61A2`) | `2edaf6704304` | 34 | 2 | 181 |
 | `core/mission/` | `omega-mission` (`rad:z6HYc7ot5JZD8FSfvU77pWdMUdru`) | `87705b4bc7d5` | 3 | 6 | 10 |
 | `core/hive-view/` | `hive-view` (`rad:zimVqDToqH8NL2YvgM8fQBQrvgHa`) | `c9d2d6849f7b` | 8 | 7 | 8 |
 | `core/hive-not-swarm/` | `hive-not-swarm` (`rad:z3vAshKTvZpS5xnsPZHjiHobz4U2p`) | `bc6d30e5a1be` | 3 | converted | 39 |
