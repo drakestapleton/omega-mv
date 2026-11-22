@@ -313,6 +313,10 @@ Effect-derived capability manifest in seeded Omega: host-word manifest, ELF sysc
 
 Seeded Omega exhaustive u8/u16 equivalence checker for OSC IR v1 scalar functions (issue 826)
 
+## `seed/helix/`
+
+Proof-Carrying Evolutionary Helix, 4-Strand BFT Stem-Cell Braid (`1,612 B` independent AArch64 seeds: Monk `408 B`, Predator `396 B`, Trickster `404 B`, Ascetic `404 B`), Four-Wall Loop-1 Helical RSI Containment Gate (`rsi-loop1.sh --lean`), in-process zero-CUDA SM121 Evolutionary JIT (`helix_jit.om`, `helix-build-jit.sh`), Arboris nervous system benchmarks, pure-Omega RFC 8032 Ed25519 DDC receipt signer, `EGP2` structural e-graph + dual-checker, 15 SM121/`uor-gpu` antibodies, and 29 Lean 4.36.0 theorems under `seed/helix/proofs/`
+
 ## `seed/json/`
 
 Strict RFC 8259 JSON reader, writer and optional exact binary64 conversion in seeded Omega, with CPython-oracle parity gate (omega-mv #788)

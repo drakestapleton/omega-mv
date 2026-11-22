@@ -1,0 +1,1037 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/helix_jit.om: In-Process Proof-Carrying SM121 Evolutionary JIT + Strand A Monk Proof Gate.
+note Pure seeded OM-2 (zero C, zero Python, zero CUDA).
+note Compose after:
+note   gpu/nvidia/om/codegen/bw_hazard.om (with local `rb` non-colliding when composed with bw_enc_sm121.om)
+note   om/gpu/q36/emit_fast.om
+note
+note Intercepts every SM121 kernel emitted into q36Buf[0..cnt*4) (and optionally qhBuf[0..cnt*4))
+note BEFORE upload to GB10 VRAM:
+note   1. Runs a 3-mutant negative self-test against Strand A's in-process Monk verifier (hxMonkVerify)
+note      on first init (opcode smuggle, wait-barrier strip, illegal RAW stall shave -> 3/3 MUST be KILLED).
+note   2. Reads active Arboris genome (0..6) from `/tmp/helix_genome.cfg` (default 0 = Monk Reference):
+note        G0: Monk Reference (untouched baseline)
+note        G1: Predator (Antibody #13 basic-block leaders + Antibody #14 rawFloor=6 swaps + ALU/wait-NOP compaction)
+note        G2: Mitosis Hybrid Champion (G1 + G6 warp-yield hiding + Antibody #15 never shave I2F fixed-latency stalls)
+note        G3: Mitosis 2-Pass Champion (2-pass RAW-safe interleaving + G2)
+note        G5: Strand 3 Trickster (reverse-order chaos swaps + hostile yield/stall jitter, rawFloor=6)
+note        G6: Strand 4 Ascetic (zero-swap minimal footprint + rawFloor=6 compaction + yield=1 power/warp pacing)
+note   3. Mechanically proves EVERY evolved kernel in-memory via Strand A Monk BEFORE VRAM upload:
+note        - 128-bit functional equality outside 17-bit SM121 control word w3[9..25]
+note        - Exact bijection permutation (Antibodies 2 & 7)
+note        - Full anchor pinning: flow!=0, guard!=7, nm<=8, ISETP(16), FSETP(25), nm>=33 (Antibody 4)
+note        - Full RAW/WAR/WAW dependency preservation (Antibody 5)
+note        - Full CFG worklist fixed-point dataflow scoreboard check: hazards == 0 (Antibody 6a)
+note        - Fixed-latency ALU RAW cycle floor >= min(ref_cycles, rawFloor) including anchor
+note          consumers AND live writes reaching a BRA/EXIT boundary (Antibody 6b / Attack 8)
+note      If ANY check fails by a single bit, the candidate dies on the spot and original q36Buf is kept!
+
+global hxInitDone ulong 1
+global hxActive ulong 1
+global hxGenome ulong 1
+global hxRawFloor ulong 1
+global hxStats ulong 8
+note hxStats: 0=kernels_seen, 1=proved, 2=rejected, 3=skipped, 4=stalls_ref, 5=stalls_cand, 6=swaps, 7=yields_tuned
+
+global hxRef ulong 8192
+global hxCand ulong 8192
+global hxRefRec ulong 49152
+global hxCndRec ulong 49152
+global hxPerm ulong 2048
+global hxInv ulong 2048
+global hxSeen ulong 2048
+global hxTarget uchar 2048
+global hxWbar uchar 512
+global hxRbar uchar 512
+global hxInW uchar 1048576
+global hxInR uchar 1048576
+global hxHzSeen ulong 2048
+global hxHzQu ulong 2048
+global hxHzWk ulong 2048
+
+text hxCfgPath "/tmp/helix_genome.cfg"
+text hxLogA "HELIX_JIT_SUMMARY genome="
+text hxLogB " kernels="
+text hxLogC " proved="
+text hxLogD " rejected="
+text hxLogE " skipped="
+text hxLogF " swaps="
+text hxLogG " stalls_ref="
+text hxLogH " stalls_evolved="
+text hxLogI " yields_tuned="
+text hxLogJ " mutants_killed=3/3\n"
+text hxMutFail "HELIX_JIT FATAL: Monk self-test mutant survived!\n"
+
+fn hxWrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn hxNum v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 b p sub 24 p
+end
+
+fn hxLoadGenomeCfg to ulong
+fd = fopen hxCfgPath 0 len hxCfgPath 0 0
+if lt fd 0
+ret 0
+end
+buf = new uchar 16 0
+r = read int fd buf 0 15
+z = fclose int fd
+if lt r 1
+ret 0
+end
+c = ulong get buf 0
+if and ge c 48 le c 54
+ret sub c 48
+end
+ret 0
+end
+
+fn hxDecodeBuf isCand bool cnt ulong to bool
+ins = new uchar 16 0
+rec = new ulong 24 0
+for pc ulong cnt bound 2048
+base = mul pc 4
+for k ulong 4
+w = ulong 0
+if isCand
+w = get hxCand add base k
+else
+w = get hxRef add base k
+end
+put ins mul k 4 uchar and w 255
+put ins add mul k 4 1 uchar and shr w 8 255
+put ins add mul k 4 2 uchar and shr w 16 255
+put ins add mul k 4 3 uchar and shr w 24 255
+end
+if ne hz_dec1 ins rec 0
+ret false
+end
+db = mul pc 24
+for j ulong 24
+if isCand
+put hxCndRec add db j get rec j
+else
+put hxRefRec add db j get rec j
+end
+end
+end
+ret true
+end
+
+fn hxMarkTargets cnt ulong to void
+for i ulong cnt bound 2048
+put hxTarget i 0
+end
+if gt cnt 0
+put hxTarget 0 1
+end
+for pc ulong cnt bound 2048
+db = mul pc 24
+fl = get hxRefRec add db 17
+if eq fl 2
+tg = hz_u2l get hxRefRec add db 18
+dst = add long pc tg
+if and ge dst 0 lt dst long cnt
+put hxTarget ulong dst 1
+end
+if lt add pc 1 cnt
+put hxTarget add pc 1 1
+end
+end
+end
+end
+
+fn hxIsMonkAnchor pc ulong to bool
+if ne get hxTarget pc 0
+ret true
+end
+db = mul pc 24
+if ne get hxRefRec add db 17 0
+ret true
+end
+if ne get hxRefRec add db 1 7
+ret true
+end
+nm = get hxRefRec add db 19
+if or le nm 8 ge nm 33
+ret true
+end
+if or eq nm 16 eq nm 25
+ret true
+end
+ret false
+end
+
+fn hxIsSwapAnchor pc ulong to bool
+if hxIsMonkAnchor pc
+ret true
+end
+db = mul pc 24
+if ne get hxRefRec add db 6 0
+ret true
+end
+if ne get hxRefRec add db 4 7
+ret true
+end
+ret ne get hxRefRec add db 5 7
+end
+
+fn hxRegOverlap a ulong b ulong to bool
+if or eq a 0 eq b 0
+ret false
+end
+ra = and a 255
+na = and shr a 8 255
+ua = and shr a 16 1
+rb2 = and b 255
+nb = and shr b 8 255
+ub = and shr b 16 1
+if ne ua ub
+ret false
+end
+if or eq ra 255 eq rb2 255
+ret false
+end
+if or le add ra na rb2 le add rb2 nb ra
+ret false
+end
+ret true
+end
+
+fn hxHasRaw u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if eq get hxRefRec add du 10 0
+ret false
+end
+wu = get hxRefRec add du 16
+for j ulong get hxRefRec add dv 9 bound 5
+if hxRegOverlap wu get hxRefRec add add dv 11 j
+ret true
+end
+end
+ret false
+end
+
+fn hxHasWaw u ulong v ulong to bool
+du = mul u 24
+dv = mul v 24
+if or eq get hxRefRec add du 10 0 eq get hxRefRec add dv 10 0
+ret false
+end
+ret hxRegOverlap get hxRefRec add du 16 get hxRefRec add dv 16
+end
+
+fn hxHasDep u ulong v ulong to bool
+if hxHasWaw u v
+ret true
+end
+if hxHasRaw u v
+ret true
+end
+du = mul u 24
+dv = mul v 24
+if ne get hxRefRec add dv 10 0
+wv = get hxRefRec add dv 16
+for j ulong get hxRefRec add du 9 bound 5
+if hxRegOverlap get hxRefRec add add du 11 j wv
+ret true
+end
+end
+end
+ret false
+end
+
+fn hxCndStall pc ulong to ulong
+w3 = get hxCand add mul pc 4 3
+ret and shr w3 9 15
+end
+
+fn hxSetCndStall pc ulong nst ulong to void
+idx = add mul pc 4 3
+w3 = get hxCand idx
+nw3 = or and w3 not shl ulong 15 9 shl nst 9
+put hxCand idx nw3
+end
+
+fn hxSumRefStall lo ulong hi ulong to ulong
+tot = ulong 0
+k = lo
+while lt k hi bound 2048
+tot = add tot get hxRefRec add mul k 24 2
+k = add k 1
+end
+ret tot
+end
+
+fn hxSumCndStall lo ulong hi ulong to ulong
+tot = ulong 0
+k = lo
+while lt k hi bound 2048
+tot = add tot hxCndStall k
+k = add k 1
+end
+ret tot
+end
+
+note ==================== STRAND A IN-PROCESS MONK PROOF VERIFIER ====================
+fn hxChkOpnd opnd ulong chkR bool to bool
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+base = add mul uni 256 reg
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if ne get hxWbar idx 0
+ret false
+end
+if chkR
+if ne get hxRbar idx 0
+ret false
+end
+end
+end
+end
+ret true
+end
+
+fn hxMarkOpnd opnd ulong bit ulong isR bool to void
+reg = and opnd 255
+cnt = and shr opnd 8 255
+uni = and shr opnd 16 1
+base = add mul uni 256 reg
+b8 = uchar bit
+for k ulong cnt bound 4
+idx = add base k
+if lt idx 512
+if isR
+put hxRbar idx or get hxRbar idx b8
+else
+put hxWbar idx or get hxWbar idx b8
+end
+end
+end
+end
+
+fn hxStepHazard pc ulong check bool to bool
+db = mul pc 24
+wt = get hxCndRec add db 6
+if ne wt 0
+clr = uchar and not wt 255
+w8 = uchar and wt 255
+for i ulong 512
+put hxWbar i and get hxWbar i clr
+if ne and get hxRbar i w8 0
+put hxRbar i 0
+end
+end
+end
+nr = get hxCndRec add db 9
+nw = get hxCndRec add db 10
+if check
+for j ulong nr bound 5
+if not hxChkOpnd get hxCndRec add add db 11 j false
+ret false
+end
+end
+if ne nw 0
+if not hxChkOpnd get hxCndRec add db 16 true
+ret false
+end
+end
+end
+if and ne get hxCndRec add db 7 0 ne nw 0
+wb = get hxCndRec add db 4
+if lt wb 6
+hxMarkOpnd get hxCndRec add db 16 shl ulong 1 wb false
+end
+end
+if ne get hxCndRec add db 8 0
+rb2 = get hxCndRec add db 5
+wb2 = get hxCndRec add db 4
+lm = ulong 0
+if lt rb2 6
+lm = or lm shl ulong 1 rb2
+end
+if lt wb2 6
+lm = or lm shl ulong 1 wb2
+end
+if ne lm 0
+for j ulong nr bound 5
+hxMarkOpnd get hxCndRec add add db 11 j lm true
+end
+end
+end
+ret true
+end
+
+fn hxLoadIn pc ulong to void
+off = mul pc 512
+for i ulong 512
+put hxWbar i get hxInW add off i
+put hxRbar i get hxInR add off i
+end
+end
+
+fn hxJoinTo tgt ulong to bool
+off = mul tgt 512
+ch = false
+for i ulong 512
+ow = get hxInW add off i
+nw = or ow get hxWbar i
+if ne nw ow
+put hxInW add off i nw
+ch = true
+end
+orv = get hxInR add off i
+nrv = or orv get hxRbar i
+if ne nrv orv
+put hxInR add off i nrv
+ch = true
+end
+end
+ret ch
+end
+
+fn hxReachPush n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+if eq get hxHzSeen u 0
+put hxHzSeen u 1
+put hxHzWk top u
+ret add top 1
+end
+ret top
+end
+
+fn hxEdge n ulong tgt long top ulong to ulong
+if or lt tgt 0 ge tgt long n
+ret top
+end
+u = ulong tgt
+ch = hxJoinTo u
+sv = get hxHzSeen u
+qv = get hxHzQu u
+if and or ch eq sv 1 eq qv 0
+put hxHzQu u 1
+put hxHzWk top u
+ret add top 1
+end
+ret top
+end
+
+fn hxZeroHz n ulong to void
+for i ulong n bound 2048
+put hxHzSeen i 0
+put hxHzQu i 0
+off = mul i 512
+for r ulong 512
+put hxInW add off r 0
+put hxInR add off r 0
+end
+end
+end
+
+fn hxDoReach n ulong to void
+put hxHzSeen 0 1
+put hxHzWk 0 0
+top = ulong 1
+while gt top 0 bound 4096
+top = sub top 1
+pc = get hxHzWk top
+db = mul pc 24
+fl = get hxCndRec add db 17
+gd = get hxCndRec add db 1
+if or eq fl 0 ne gd 7
+top = hxReachPush n add long pc 1 top
+end
+if eq fl 2
+tg = hz_u2l get hxCndRec add db 18
+top = hxReachPush n add long pc tg top
+end
+end
+end
+
+fn hxCheckCfgHazards n ulong to bool
+hxZeroHz n
+hxDoReach n
+put hxHzWk 0 0
+put hxHzQu 0 1
+top = ulong 1
+while gt top 0 bound 65536
+top = sub top 1
+pc = get hxHzWk top
+put hxHzQu pc 0
+put hxHzSeen pc 2
+hxLoadIn pc
+z = hxStepHazard pc false
+db = mul pc 24
+fl = get hxCndRec add db 17
+gd = get hxCndRec add db 1
+if or eq fl 0 ne gd 7
+top = hxEdge n add long pc 1 top
+end
+if eq fl 2
+tg = hz_u2l get hxCndRec add db 18
+top = hxEdge n add long pc tg top
+end
+end
+for pc ulong n bound 2048
+if ne get hxHzSeen pc 0
+hxLoadIn pc
+if not hxStepHazard pc true
+ret false
+end
+end
+end
+ret true
+end
+
+fn hxRawSpanOk u ulong v ulong flr ulong to bool
+rcyc = hxSumRefStall u v
+eff = flr
+note SM121 IMAD.WIDE (nm==14) is a 6-cycle wide pipe; never drop below 6!
+if eq get hxRefRec add mul u 24 19 14
+if lt eff 6
+eff = ulong 6
+end
+end
+req = rcyc
+if gt req eff
+req = eff
+end
+ret ge hxSumCndStall get hxInv u get hxInv v req
+end
+
+note Fixed-latency RAW stall verification (up to distance 16, including anchor consumers & BRA/EXIT!)
+fn hxCheckRawOne u ulong n ulong flr ulong to bool
+du = mul u 24
+if or eq get hxRefRec add du 10 0 ne get hxRefRec add du 7 0
+ret true
+end
+lim = add u 16
+if gt lim n
+lim = n
+end
+v = add u 1
+while lt v lim bound 16
+if hxHasRaw u v
+ret hxRawSpanOk u v flr
+end
+if hxHasWaw u v
+ret true
+end
+dbv = mul v 24
+flv = get hxRefRec add dbv 17
+if ne flv 0
+ret hxRawSpanOk u add v 1 flr
+end
+if hxIsMonkAnchor v
+ret hxRawSpanOk u add v 1 flr
+end
+v = add v 1
+end
+ret true
+end
+
+fn hxCheckRawStalls n ulong flr ulong to bool
+for u ulong n bound 2048
+if not hxCheckRawOne u n flr
+ret false
+end
+end
+ret true
+end
+
+fn hxCheckFunc n ulong to bool
+for i ulong n bound 2048
+ri = get hxPerm i
+cb = mul i 4
+rb3 = mul ri 4
+if ne get hxCand cb get hxRef rb3
+ret false
+end
+if ne get hxCand add cb 1 get hxRef add rb3 1
+ret false
+end
+if ne get hxCand add cb 2 get hxRef add rb3 2
+ret false
+end
+cw = and get hxCand add cb 3 ulong 4227858943
+rw = and get hxRef add rb3 3 ulong 4227858943
+if ne cw rw
+ret false
+end
+end
+ret true
+end
+
+fn hxCheckPermAnchors n ulong to bool
+for i ulong n bound 2048
+put hxSeen i 0
+end
+for i ulong n bound 2048
+r = get hxPerm i
+if ge r n
+ret false
+end
+if ne get hxSeen r 0
+ret false
+end
+put hxSeen r 1
+put hxInv r i
+if hxIsMonkAnchor i
+if ne r i
+ret false
+end
+end
+end
+ret true
+end
+
+fn hxCheckDeps n ulong to bool
+for u ulong n bound 2048
+pu = get hxInv u
+v = add u 1
+while lt v n bound 2048
+if hxHasDep u v
+if ge pu get hxInv v
+ret false
+end
+end
+v = add v 1
+end
+end
+ret true
+end
+
+note Complete Strand A Monk Proof Gate: returns 0 PASS, or antibody error code (13/14/15/16/17).
+fn hxMonkVerify n ulong flr ulong to ulong
+if not hxCheckPermAnchors n
+ret 13
+end
+if not hxCheckFunc n
+ret 14
+end
+if not hxDecodeBuf true n
+ret 17
+end
+if not hxCheckDeps n
+ret 16
+end
+if not hxCheckCfgHazards n
+ret 17
+end
+if not hxCheckRawStalls n flr
+ret 17
+end
+ret 0
+end
+
+note ==================== STRAND B PREDATOR EVOLUTION PASSES ====================
+fn hxSwapCand i ulong j ulong to void
+bi = mul i 4
+bj = mul j 4
+for k ulong 4
+t = get hxCand add bi k
+put hxCand add bi k get hxCand add bj k
+put hxCand add bj k t
+end
+tp = get hxPerm i
+put hxPerm i get hxPerm j
+put hxPerm j tp
+put hxInv get hxPerm i i
+put hxInv get hxPerm j j
+end
+
+fn hxWindowRawOk lo ulong hi ulong n ulong flr ulong to bool
+k = lo
+while lt k hi bound 24
+u = get hxPerm k
+if not hxCheckRawOne u n flr
+ret false
+end
+k = add k 1
+end
+ret true
+end
+
+fn hxDoSwapsRevPass n ulong flr ulong to ulong
+note Trickster (G5): reverse-order adversarial interleaving from back to front!
+sw = ulong 0
+if lt n 2
+ret 0
+end
+i = sub n 2
+while true bound 2048
+j = add i 1
+if and not hxIsSwapAnchor i not hxIsSwapAnchor j
+if not hxHasDep get hxPerm i get hxPerm j
+hxSwapCand i j
+lo = ulong 0
+if gt i 16
+lo = sub i 16
+end
+hi = add i 2
+if gt hi n
+hi = n
+end
+if hxWindowRawOk lo hi n flr
+sw = add sw 1
+if lt i 2
+break
+end
+i = sub i 2
+continue
+end
+hxSwapCand i j
+end
+end
+if eq i 0
+break
+end
+i = sub i 1
+end
+ret sw
+end
+
+fn hxTricksterChaos n ulong flr ulong to ulong
+note Trickster (G5): inject adversarial yield=1 jitter + asymmetric non-RAW stall perturbations!
+cnt = ulong 0
+for pc ulong n bound 2048
+orig = get hxPerm pc
+if not hxIsSwapAnchor orig
+idx = add mul pc 4 3
+w3 = get hxCand idx
+if eq rem pc 2 0
+put hxCand idx or w3 ulong 8192
+cnt = add cnt 1
+end
+st = hxCndStall pc
+if and eq rem pc 3 1 lt st 8
+hxSetCndStall pc add st 1
+end
+end
+end
+ret cnt
+end
+
+fn hxAsceticPace n ulong to ulong
+note Ascetic (G6): energy & thermal pacing -- enable yield=1 on memory/MUFU/I2F/FFMA transitions
+note to maximize warp power-gating and minimize peak thermal bursts while keeping exact semantics!
+cnt = ulong 0
+for pc ulong n bound 2048
+orig = get hxPerm pc
+db = mul orig 24
+nm = get hxRefRec add db 19
+if or eq nm 24 or eq nm 30 eq nm 31
+idx = add mul pc 4 3
+w3 = get hxCand idx
+if eq and w3 8192 0
+put hxCand idx or w3 ulong 8192
+cnt = add cnt 1
+end
+end
+end
+ret cnt
+end
+
+fn hxDoSwapsPass n ulong flr ulong to ulong
+sw = ulong 0
+i = ulong 0
+while lt add i 1 n bound 2048
+j = add i 1
+if and not hxIsSwapAnchor i not hxIsSwapAnchor j
+if not hxHasDep get hxPerm i get hxPerm j
+hxSwapCand i j
+lo = ulong 0
+if gt i 16
+lo = sub i 16
+end
+hi = add i 2
+if gt hi n
+hi = n
+end
+if hxWindowRawOk lo hi n flr
+sw = add sw 1
+i = add i 2
+continue
+end
+hxSwapCand i j
+end
+end
+i = add i 1
+end
+ret sw
+end
+
+note Can we compact stall on candidate pc?
+note Safe targets (Antibodies #13, #14, #15 crystallized from live GB10 silicon):
+note   1. Non-anchor fixed-latency ALU (rawFloor >= 6)
+note   2. Wait-barrier NOP (nm==1 && wait!=0, e.g. qW0/qW1/qWall: hardware wait already stalls!)
+note   NEVER compact I2F (nm==31) / LDC / ULDC / S2R / LDG / LDS / MUFU below rawFloor=6!
+fn hxCanCompactPc pc ulong gen ulong to bool
+orig = get hxPerm pc
+db = mul orig 24
+nm = get hxRefRec add db 19
+if eq nm 1
+wt = get hxRefRec add db 6
+if ne wt 0
+ret ge gen 1
+end
+ret false
+end
+if hxIsSwapAnchor orig
+ret false
+end
+if ne get hxRefRec add db 7 0
+ret false
+end
+ret eq get hxRefRec add db 8 0
+end
+
+fn hxShaveSafe pc ulong n ulong flr ulong to bool
+lo = ulong 0
+if gt pc 16
+lo = sub pc 16
+end
+hi = add pc 1
+ret hxWindowRawOk lo hi n flr
+end
+
+fn hxCompactStalls n ulong gen ulong flr ulong to void
+for pc ulong n bound 2048
+if hxCanCompactPc pc gen
+for s ulong 15
+st = hxCndStall pc
+if le st 1
+break
+end
+hxSetCndStall pc sub st 1
+if not hxShaveSafe pc n flr
+hxSetCndStall pc st
+break
+end
+end
+end
+end
+end
+
+note SM121 yield-hint burst tuning (G3/G4): clear redundant yield=1 on non-memory MUFU(30)/I2F(31) issue bursts
+fn hxTuneYields n ulong to ulong
+cnt = ulong 0
+for pc ulong n bound 2048
+orig = get hxPerm pc
+db = mul orig 24
+nm = get hxRefRec add db 19
+if or eq nm 30 eq nm 31
+idx = add mul pc 4 3
+w3 = get hxCand idx
+if ne and w3 8192 0
+put hxCand idx and w3 not ulong 8192
+cnt = add cnt 1
+end
+end
+end
+ret cnt
+end
+
+note ==================== 3-MUTANT MONK SELF-TEST ====================
+fn hxMut1 n ulong flr ulong to bool
+w0 = get hxCand 0
+put hxCand 0 xor w0 1
+rc1 = hxMonkVerify n flr
+put hxCand 0 w0
+ret eq rc1 14
+end
+
+fn hxMut2 n ulong flr ulong to bool
+hasWt = false
+clr = not shl ulong 63 20
+for pc ulong n bound 2048
+if ne get hxRefRec add mul pc 24 6 0
+hasWt = true
+idx = add mul pc 4 3
+w = get hxCand idx
+put hxCand idx and w clr
+end
+end
+if not hasWt
+ret true
+end
+rc2 = hxMonkVerify n flr
+for pc ulong n bound 2048
+idx = add mul pc 4 3
+put hxCand idx get hxRef idx
+end
+ret eq rc2 17
+end
+
+fn hxFindRawMut n ulong to ulong
+for u ulong n bound 2048
+du = mul u 24
+if ne get hxRefRec add du 10 0
+if eq get hxRefRec add du 7 0
+if lt add u 1 n
+if gt get hxRefRec add du 2 0
+if hxHasRaw u add u 1
+ret u
+end
+end
+end
+end
+end
+end
+ret 99999
+end
+
+fn hxMut3 n ulong flr ulong to bool
+sPc = hxFindRawMut n
+if eq sPc 99999
+ret true
+end
+hxSetCndStall sPc 0
+rc3 = hxMonkVerify n flr
+put hxCand add mul sPc 4 3 get hxRef add mul sPc 4 3
+ret eq rc3 17
+end
+
+fn hxTest3Mutants n ulong flr ulong to bool
+if not hxMut1 n flr
+ret false
+end
+if not hxMut2 n flr
+ret false
+end
+ret hxMut3 n flr
+end
+
+fn hxPrintSummary to void
+hxWrt hxLogA
+hxNum get hxGenome 0
+hxWrt hxLogB
+hxNum get hxStats 0
+hxWrt hxLogC
+hxNum get hxStats 1
+hxWrt hxLogD
+hxNum get hxStats 2
+hxWrt hxLogE
+hxNum get hxStats 3
+hxWrt hxLogF
+hxNum get hxStats 6
+hxWrt hxLogG
+hxNum get hxStats 4
+hxWrt hxLogH
+hxNum get hxStats 5
+hxWrt hxLogI
+hxNum get hxStats 7
+hxWrt hxLogJ
+end
+
+fn hxEnsureInit to void
+if eq get hxInitDone 0 0
+g = hxLoadGenomeCfg
+put hxGenome 0 g
+note Antibody #14 (crystallized from live GB10 silicon): SM121 fixed-latency ALU pipe floor is ALWAYS 6 cycles!
+put hxRawFloor 0 6
+for i ulong 8
+put hxStats i 0
+end
+put hxInitDone 0 1
+end
+end
+
+fn hxRunCore cnt ulong to bool
+for i ulong cnt bound 2048
+put hxPerm i i
+put hxInv i i
+end
+if not hxDecodeBuf false cnt
+put hxStats 3 add get hxStats 3 1
+ret false
+end
+hxMarkTargets cnt
+flr = get hxRawFloor 0
+if eq get hxInitDone 0 1
+if not hxTest3Mutants cnt flr
+hxWrt hxMutFail
+exit 88
+end
+put hxInitDone 0 2
+end
+gen = get hxGenome 0
+sRef = hxSumRefStall 0 cnt
+sw = ulong 0
+yt = ulong 0
+if eq gen 5
+sw = hxDoSwapsRevPass cnt flr
+yt = hxTricksterChaos cnt flr
+else
+if eq gen 6
+hxCompactStalls cnt 1 flr
+yt = hxAsceticPace cnt
+else
+sw = hxDoSwapsPass cnt flr
+if eq gen 3
+sw = add sw hxDoSwapsPass cnt flr
+end
+hxCompactStalls cnt gen flr
+if or eq gen 2 eq gen 3
+yt = hxAsceticPace cnt
+end
+end
+end
+mrc = hxMonkVerify cnt flr
+if ne mrc 0
+put hxStats 2 add get hxStats 2 1
+ret false
+end
+sCnd = hxSumCndStall 0 cnt
+put hxStats 1 add get hxStats 1 1
+put hxStats 4 add get hxStats 4 sRef
+put hxStats 5 add get hxStats 5 sCnd
+put hxStats 6 add get hxStats 6 sw
+put hxStats 7 add get hxStats 7 yt
+ret true
+end
+
+fn hxEvolveQ36Buf cnt ulong to void
+if eq get hxActive 0 0
+ret
+end
+hxEnsureInit
+if eq get hxGenome 0 0
+ret
+end
+if or eq cnt 0 gt cnt 2048
+put hxStats 3 add get hxStats 3 1
+ret
+end
+put hxStats 0 add get hxStats 0 1
+for i ulong mul cnt 4 bound 8192
+v = get q36Buf i
+put hxRef i v
+put hxCand i v
+end
+if hxRunCore cnt
+for i ulong mul cnt 4 bound 8192
+put q36Buf i get hxCand i
+end
+end
+end
