@@ -18,9 +18,9 @@ ESTV6D_HDRS = tools/estimation/est3c_common.h tools/estimation/est_replay.h $(ES
 $(ESTV6D_DIR)/est6dev: $(ESTV6D_SRCS) $(ESTV6D_HDRS)
 	@mkdir -p $(ESTV6D_DIR)
 	$(CC) $(EST_CFLAGS) -Itools/estimation -o $@ $(ESTV6D_SRCS) -lm
-$(ESTV6D_DIR)/est6opchar: tools/estimation/est6opchar.c
+$(ESTV6D_DIR)/est6opchar: src/estimation/est_math.om tools/estimation/est6opchar.om $(EST_OMC)
 	@mkdir -p $(ESTV6D_DIR)
-	$(CC) $(EST_CFLAGS) -o $@ $< -lm
+	(echo om2; cat src/estimation/est_math.om tools/estimation/est6opchar.om) | $(EST_OMC) > $@ && chmod +x $@
 est6dev: $(ESTV6D_DIR)/est6dev
 est6opchar: $(ESTV6D_DIR)/est6opchar
 test-est6dev: $(ESTV6D_DIR)/est6dev $(ESTV6D_DIR)/est6opchar
