@@ -1,0 +1,693 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/brownian/brw_act_reanalyse.om -- BRW-ACT re-analysis of a committed
+note table.tsv in pure seeded OM-2. Composed after tests/brownian/brw_act_report.om.
+note Usage: brw_act_reanalyse dev0|dev1 <table.tsv>
+
+const RA_NS ulong 4
+const RA_NWMAX ulong 600
+
+text t_ra_usage "usage: brw_act_reanalyse dev0|dev1 <table.tsv>\n"
+text t_ra_dev0 "dev0"
+text t_ra_dev1 "dev1"
+text t_ra_hdr "world\tclass\t"
+text t_ra_not_tab "not a BRW-ACT table\n"
+text t_ra_open_err "cannot open table\n"
+text t_ra_noise "noise"
+text t_ra_mis "mismatch"
+text t_ra_diff "diffusion"
+text t_ra_s0 "active"
+text t_ra_s1 "random"
+text t_ra_s2 "fixed8"
+text t_ra_s3 "cycle"
+text t_ra_bad_col "bad column count\n"
+text t_ra_bad_st "bad strategy or too many worlds\n"
+text t_ra_unp "unpaired worlds\n"
+text t_ra_p1 "BRW-ACT re-analysis ("
+text t_ra_p2 "), "
+text t_ra_p3 " table rows, "
+text t_ra_p4 " discoverable worlds per strategy\n"
+text t_ra_cov_h "\nHeld-out coverage, per-world 95% interval (replaces the pooled Wilson interval):\n"
+text t_ra_c50 " cov50 "
+text t_ra_c90 "  cov90 "
+text t_ra_ch_h "\nComputation charged (active minus baseline, per discoverable world):\n"
+text t_ra_ch_h2 "  vs         extra evals       time saved [95%]      break-even evals/time\n"
+text t_ra_nosav "     no saving established\n"
+text t_ra_low1 " ("
+text t_ra_low2 " at the low end of the saving)\n"
+
+global g_ra_arg1 uchar 64
+global g_ra_arg2 uchar 1024
+global g_ra_fbuf uchar 1048576
+global g_ra_obuf uchar 16384
+global g_ra_olen ulong 1
+global g_ra_cost f64 2400
+global g_ra_ev f64 2400
+global g_ra_k50 f64 2400
+global g_ra_k90 f64 2400
+global g_ra_n ulong 4
+global g_ra_cs ulong 24
+global g_ra_cl ulong 24
+
+fn ra_ob_c c uchar to void
+  n = get g_ra_olen 0
+  if lt n 16384
+    put g_ra_obuf n c
+    put g_ra_olen 0 add n 1
+  end
+end
+
+fn ra_ob_t s view uchar * n ulong to void
+  for i ulong n
+    ra_ob_c get s i
+  end
+end
+
+fn ra_ob_sp k ulong to void
+  for i ulong k
+    ra_ob_c 32
+  end
+end
+
+fn ra_ob_u v ulong to void
+  if eq v 0
+    ra_ob_c 48
+    ret
+  end
+  dig = ulong 0
+  p = ulong 1
+  while le mul p 10 v
+    p = mul p 10
+    dig = add dig 1
+    if gt dig 18
+      break
+    end
+  end
+  rmv = v
+  while gt p 0
+    d = div rmv p
+    rmv = rem rmv p
+    ra_ob_c uchar add 48 d
+    p = div p 10
+  end
+end
+
+fn ra_ob_s v long to void
+  if lt v 0
+    ra_ob_c 45
+    ra_ob_u ulong sub 0 v
+    ret
+  end
+  ra_ob_u ulong v
+end
+
+fn ra_ob_frac fp0 ulong sc ulong nd ulong to void
+  ra_ob_c 46
+  fp = fp0
+  divp = div sc 10
+  for i ulong nd
+    d = div fp divp
+    fp = rem fp divp
+    ra_ob_c uchar add 48 d
+    if gt divp 1
+      divp = div divp 10
+    end
+  end
+end
+
+fn ra_ob_fix v f64 nd ulong w ulong to void
+  negv = ulong 0
+  x = v
+  if lt x f64 0.0
+    negv = 1
+    x = sub f64 0.0 x
+  end
+  sc = f64 1.0
+  for i ulong nd
+    sc = mul sc f64 10.0
+  end
+  scu = ulong sc
+  tot = ulong add mul x sc f64 0.5
+  ip = div tot scu
+  fp = rem tot scu
+  idig = ulong 1
+  t = ip
+  while ge t 10
+    t = div t 10
+    idig = add idig 1
+  end
+  need = add idig negv
+  if gt nd 0
+    need = add need add 1 nd
+  end
+  if gt w need
+    ra_ob_sp sub w need
+  end
+  if ne negv 0
+    ra_ob_c 45
+  end
+  ra_ob_u ip
+  if gt nd 0
+    ra_ob_frac fp scu nd
+  end
+end
+
+fn ra_ob_g_frac frem0 ulong nsig ulong to void
+  ra_ob_c 46
+  frem = frem0
+  dp = ulong 1
+  for i ulong sub nsig 1
+    dp = mul dp 10
+  end
+  for i ulong nsig
+    ra_ob_c uchar add 48 div frem dp
+    frem = rem frem dp
+    if gt dp 1
+      dp = div dp 10
+    end
+  end
+end
+
+fn ra_ob_g_exp negv ulong idig ulong frem ulong nsig ulong e long w ulong to void
+  ae = ulong 0
+  eneg = ulong 0
+  if lt e 0
+    eneg = 1
+    ae = ulong sub 0 e
+  else
+    ae = ulong e
+  end
+  edig = ulong 2
+  if ge ae 100
+    edig = 3
+  end
+  need = add add negv 3 edig
+  if gt nsig 0
+    need = add need add 1 nsig
+  end
+  if gt w need
+    ra_ob_sp sub w need
+  end
+  if ne negv 0
+    ra_ob_c 45
+  end
+  ra_ob_c uchar add 48 idig
+  if gt nsig 0
+    ra_ob_g_frac frem nsig
+  end
+  ra_ob_c 101
+  if ne eneg 0
+    ra_ob_c 45
+  else
+    ra_ob_c 43
+  end
+  if lt ae 10
+    ra_ob_c 48
+  end
+  ra_ob_u ae
+end
+
+fn ra_ob_g_sci negv ulong m ulong scu ulong sig ulong e long w ulong to void
+  idig = div m scu
+  frem = rem m scu
+  nsig = sub sig 1
+  while gt nsig 0
+    if ne rem frem 10 0
+      break
+    end
+    frem = div frem 10
+    nsig = sub nsig 1
+  end
+  ra_ob_g_exp negv idig frem nsig e w
+end
+
+fn ra_ob_g v f64 sig ulong w ulong to void
+  negv = ulong 0
+  x = v
+  if lt x f64 0.0
+    negv = 1
+    x = sub f64 0.0 x
+  end
+  if eq x f64 0.0
+    if gt w 1
+      ra_ob_sp sub w 1
+    end
+    ra_ob_c 48
+    ret
+  end
+  e = long 0
+  y = x
+  while ge y f64 10.0
+    y = div y f64 10.0
+    e = add e 1
+  end
+  while lt y f64 1.0
+    y = mul y f64 10.0
+    e = sub e 1
+  end
+  sc = f64 1.0
+  for i ulong sub sig 1
+    sc = mul sc f64 10.0
+  end
+  m = ulong add mul y sc f64 0.5
+  lim = ulong mul sc f64 10.0
+  if ge m lim
+    m = div m 10
+    e = add e 1
+  end
+  if and ge e long -4 lt e long sig
+    nd = ulong 0
+    if lt e long sub sig 1
+      nd = ulong sub long sub sig 1 e
+    end
+    ra_ob_fix v nd w
+    ret
+  end
+  ra_ob_g_sci negv m ulong sc sig e w
+end
+
+fn ra_ob_sname s ulong w ulong to void
+  if eq s 0
+    ra_ob_t t_ra_s0 len t_ra_s0
+    if gt w 6
+      ra_ob_sp sub w 6
+    end
+    ret
+  end
+  if eq s 1
+    ra_ob_t t_ra_s1 len t_ra_s1
+    if gt w 6
+      ra_ob_sp sub w 6
+    end
+    ret
+  end
+  if eq s 2
+    ra_ob_t t_ra_s2 len t_ra_s2
+    if gt w 6
+      ra_ob_sp sub w 6
+    end
+    ret
+  end
+  ra_ob_t t_ra_s3 len t_ra_s3
+  if gt w 5
+    ra_ob_sp sub w 5
+  end
+end
+
+fn ra_eq_arg1 t view uchar * n ulong alen ulong to bool
+  if ne alen n
+    ret false
+  end
+  for i ulong n
+    if ne get g_ra_arg1 i get t i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ra_eq_col ci ulong t view uchar * n ulong to bool
+  cl = get g_ra_cl ci
+  if ne cl n
+    ret false
+  end
+  cs = get g_ra_cs ci
+  for i ulong n
+    if ne get g_ra_fbuf add cs i get t i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ra_parse_f64 ci ulong to f64
+  cs = get g_ra_cs ci
+  cl = get g_ra_cl ci
+  p = ulong 0
+  negv = ulong 0
+  if lt p cl
+    c0 = get g_ra_fbuf add cs p
+    if eq c0 45
+      negv = 1
+      p = add p 1
+    else
+      if eq c0 43
+        p = add p 1
+      end
+    end
+  end
+  v = f64 0.0
+  while lt p cl
+    c = get g_ra_fbuf add cs p
+    if and ge c 48 le c 57
+      v = add mul v f64 10.0 f64 ulong sub c 48
+      p = add p 1
+    else
+      break
+    end
+  end
+  if lt p cl
+    if eq get g_ra_fbuf add cs p 46
+      p = add p 1
+      sc = f64 0.1
+      while lt p cl
+        c = get g_ra_fbuf add cs p
+        if and ge c 48 le c 57
+          v = add v mul f64 ulong sub c 48 sc
+          sc = mul sc f64 0.1
+          p = add p 1
+        else
+          break
+        end
+      end
+    end
+  end
+  if lt p cl
+    ce = get g_ra_fbuf add cs p
+    if or eq ce 101 eq ce 69
+      p = add p 1
+      eneg = ulong 0
+      if lt p cl
+        csg = get g_ra_fbuf add cs p
+        if eq csg 45
+          eneg = 1
+          p = add p 1
+        else
+          if eq csg 43
+            p = add p 1
+          end
+        end
+      end
+      ev = ulong 0
+      while lt p cl
+        c = get g_ra_fbuf add cs p
+        if and ge c 48 le c 57
+          ev = add mul ev 10 ulong sub c 48
+          p = add p 1
+        else
+          break
+        end
+      end
+      for k ulong ev
+        if ne eneg 0
+          v = div v f64 10.0
+        else
+          v = mul v f64 10.0
+        end
+      end
+    end
+  end
+  if ne negv 0
+    v = sub f64 0.0 v
+  end
+  ret v
+end
+
+fn ra_split_line pos ulong lend ulong to ulong
+  nc = ulong 0
+  i = pos
+  while lt i lend
+    while lt i lend
+      c = get g_ra_fbuf i
+      if or eq c 9 or eq c 10 eq c 13
+        i = add i 1
+      else
+        break
+      end
+    end
+    if ge i lend
+      break
+    end
+    st = i
+    while lt i lend
+      c = get g_ra_fbuf i
+      if or eq c 9 or eq c 10 eq c 13
+        break
+      end
+      i = add i 1
+    end
+    if lt nc 24
+      put g_ra_cs nc st
+      put g_ra_cl nc sub i st
+      nc = add nc 1
+    end
+  end
+  ret nc
+end
+
+fn ra_find_strat to long
+  if ra_eq_col 4 t_ra_s0 len t_ra_s0
+    ret 0
+  end
+  if ra_eq_col 4 t_ra_s1 len t_ra_s1
+    ret 1
+  end
+  if ra_eq_col 4 t_ra_s2 len t_ra_s2
+    ret 2
+  end
+  if ra_eq_col 4 t_ra_s3 len t_ra_s3
+    ret 3
+  end
+  ret -1
+end
+
+fn ra_run_cov s ulong nd ulong to void
+  base = mul s RA_NWMAX
+  for i ulong nd
+    put g_brw_k i get g_ra_k50 add base i
+  end
+  brwr_coverage nd 60
+  m50 = get g_brw_cov 0
+  l50 = get g_brw_cov 1
+  h50 = get g_brw_cov 2
+  for i ulong nd
+    put g_brw_k i get g_ra_k90 add base i
+  end
+  brwr_coverage nd 60
+  m90 = get g_brw_cov 0
+  l90 = get g_brw_cov 1
+  h90 = get g_brw_cov 2
+  ra_ob_sp 2
+  ra_ob_sname s 7
+  ra_ob_t t_ra_c50 len t_ra_c50
+  ra_ob_fix m50 4 0
+  ra_ob_c 32
+  ra_ob_c 91
+  ra_ob_fix l50 4 0
+  ra_ob_c 44
+  ra_ob_fix h50 4 0
+  ra_ob_c 93
+  ra_ob_t t_ra_c90 len t_ra_c90
+  ra_ob_fix m90 4 0
+  ra_ob_c 32
+  ra_ob_c 91
+  ra_ob_fix l90 4 0
+  ra_ob_c 44
+  ra_ob_fix h90 4 0
+  ra_ob_c 93
+  ra_ob_c 10
+end
+
+fn ra_run_cmp b ulong nd ulong to void
+  ds = f64 0.0
+  de = f64 0.0
+  bbase = mul b RA_NWMAX
+  for i ulong nd
+    ds = add ds sub get g_ra_cost add bbase i get g_ra_cost i
+    de = add de sub get g_ra_ev i get g_ra_ev add bbase i
+  end
+  ds = div ds f64 nd
+  de = div de f64 nd
+  dss = f64 0.0
+  for i ulong nd
+    d = sub sub get g_ra_cost add bbase i get g_ra_cost i ds
+    dss = add dss mul d d
+  end
+  h = mul f64 1.959964 fsqrt div div dss f64 sub nd 1 f64 nd
+  ra_ob_sp 2
+  ra_ob_sname b 7
+  ra_ob_c 32
+  ra_ob_g de 4 14
+  ra_ob_c 32
+  ra_ob_fix ds 1 8
+  ra_ob_c 32
+  ra_ob_c 91
+  ra_ob_fix sub ds h 1 6
+  ra_ob_c 44
+  ra_ob_fix add ds h 1 6
+  ra_ob_c 93
+  ra_ob_c 32
+  if and gt sub ds h f64 0.0 gt de f64 0.0
+    ra_ob_g div de ds 3 11
+    ra_ob_t t_ra_low1 len t_ra_low1
+    ra_ob_g div de sub ds h 3 0
+    ra_ob_t t_ra_low2 len t_ra_low2
+  else
+    ra_ob_t t_ra_nosav len t_ra_nosav
+  end
+end
+
+fn ra_store_row to long
+  s = ra_find_strat
+  if lt s 0
+    ignw = write 2 t_ra_bad_st 0 len t_ra_bad_st
+    ret -1
+  end
+  su = ulong s
+  ns = get g_ra_n su
+  if ge ns RA_NWMAX
+    ignw = write 2 t_ra_bad_st 0 len t_ra_bad_st
+    ret -1
+  end
+  idx = add mul su RA_NWMAX ns
+  put g_ra_cost idx ra_parse_f64 8
+  put g_ra_k50 idx ra_parse_f64 18
+  put g_ra_k90 idx ra_parse_f64 19
+  e1 = ra_parse_f64 21
+  e2 = ra_parse_f64 22
+  e3 = ra_parse_f64 23
+  put g_ra_ev idx add add e1 e2 e3
+  put g_ra_n su add ns 1
+  ret 0
+end
+
+fn ra_parse_table flen ulong is_d1 bool to long
+  pos = ulong 0
+  while lt pos flen
+    if eq get g_ra_fbuf pos 10
+      break
+    end
+    pos = add pos 1
+  end
+  if lt pos flen
+    pos = add pos 1
+  end
+  rows = ulong 0
+  while lt pos flen
+    lend = pos
+    while lt lend flen
+      if eq get g_ra_fbuf lend 10
+        break
+      end
+      lend = add lend 1
+    end
+    nc = ra_split_line pos lend
+    pos = lend
+    if lt pos flen
+      pos = add pos 1
+    end
+    if eq nc 0
+      continue
+    end
+    if ne nc 24
+      ignw = write 2 t_ra_bad_col 0 len t_ra_bad_col
+      ret -1
+    end
+    rows = add rows 1
+    skip = ulong 0
+    if ra_eq_col 1 t_ra_noise len t_ra_noise
+      skip = 1
+    end
+    if ra_eq_col 1 t_ra_mis len t_ra_mis
+      skip = 1
+    end
+    if is_d1
+      if ra_eq_col 1 t_ra_diff len t_ra_diff
+        skip = 1
+      end
+    end
+    if ne skip 0
+      continue
+    end
+    if lt ra_store_row 0
+      ret -1
+    end
+  end
+  ret long rows
+end
+
+fn ra_read_file to long
+  l2 = ulong argread 2 g_ra_arg2 0 1023
+  put g_ra_arg2 l2 0
+  fd = fopen g_ra_arg2 0 l2 0 0
+  if lt fd 0
+    ignw = write 2 t_ra_open_err 0 len t_ra_open_err
+    ret -1
+  end
+  fdi = int fd
+  flen = ulong 0
+  while lt flen 1048576
+    k = read fdi g_ra_fbuf flen sub 1048576 flen
+    if le k 0
+      break
+    end
+    flen = add flen ulong k
+  end
+  ign = fclose fdi
+  if lt flen len t_ra_hdr
+    ignw = write 2 t_ra_not_tab 0 len t_ra_not_tab
+    ret -1
+  end
+  for i ulong len t_ra_hdr
+    if ne get g_ra_fbuf i get t_ra_hdr i
+      ignw = write 2 t_ra_not_tab 0 len t_ra_not_tab
+      ret -1
+    end
+  end
+  ret long flen
+end
+
+fn main to int
+  ac = argcnt
+  if ne ac 3
+    ignw = write 2 t_ra_usage 0 len t_ra_usage
+    ret 64
+  end
+  l1 = ulong argread 1 g_ra_arg1 0 64
+  is_d0 = ra_eq_arg1 t_ra_dev0 len t_ra_dev0 l1
+  is_d1 = ra_eq_arg1 t_ra_dev1 len t_ra_dev1 l1
+  if and not is_d0 not is_d1
+    ignw = write 2 t_ra_usage 0 len t_ra_usage
+    ret 64
+  end
+  fl = ra_read_file
+  if lt fl 0
+    ret 1
+  end
+  rrows = ra_parse_table ulong fl is_d1
+  if lt rrows 0
+    ret 1
+  end
+  rows = ulong rrows
+  nd = get g_ra_n 0
+  for s ulong 3
+    if ne get g_ra_n add s 1 nd
+      ignw = write 2 t_ra_unp 0 len t_ra_unp
+      ret 1
+    end
+  end
+  put g_ra_olen 0 0
+  ra_ob_t t_ra_p1 len t_ra_p1
+  if is_d1
+    ra_ob_t t_ra_dev1 len t_ra_dev1
+  else
+    ra_ob_t t_ra_dev0 len t_ra_dev0
+  end
+  ra_ob_t t_ra_p2 len t_ra_p2
+  ra_ob_u rows
+  ra_ob_t t_ra_p3 len t_ra_p3
+  ra_ob_u nd
+  ra_ob_t t_ra_p4 len t_ra_p4
+  ra_ob_t t_ra_cov_h len t_ra_cov_h
+  for s ulong RA_NS
+    ra_run_cov s nd
+  end
+  ra_ob_t t_ra_ch_h len t_ra_ch_h
+  ra_ob_t t_ra_ch_h2 len t_ra_ch_h2
+  for b ulong 3
+    ra_run_cmp add b 1 nd
+  end
+  ignw = write 1 g_ra_obuf 0 get g_ra_olen 0
+  ret 0
+end

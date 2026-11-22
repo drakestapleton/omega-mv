@@ -1,0 +1,663 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/brownian/brw_active.om -- BRW-ACT-DEV0 Bayesian updater and greedy
+note information-per-time chooser in pure seeded OM-2.
+note Composed after src/turing/ty_qcont_lib.om.
+
+const BRW_NM ulong 3
+const BRW_NH ulong 528
+const BRW_NT ulong 6
+const BRW_NQ ulong 512
+
+const BRW_V_INADEQUATE ulong 0
+const BRW_V_M0 ulong 1
+const BRW_V_M1 ulong 2
+const BRW_V_M2 ulong 3
+const BRW_V_UNDETERMINED ulong 4
+
+text t_bv_0 "INADEQUATE"
+text t_bv_1 "M0"
+text t_bv_2 "M1"
+text t_bv_3 "M2"
+text t_bv_4 "UNDETERMINED"
+text t_bv_q "?"
+
+note ---- Grid (528 hypotheses x 6 wait times = 3168) ----
+global g_btau ulong 6
+global g_bh_m ulong 528
+global g_bh_d f64 528
+global g_bh_v f64 528
+global g_bh_th f64 528
+global g_bg_mu f64 3168
+global g_bg_var f64 3168
+global g_bg_ln f64 3168
+global g_bg_lp f64 3
+
+note ---- State ----
+global g_bs_lw f64 528
+global g_bs_no ulong 1
+global g_bs_np ulong 1
+global g_bs_o99 ulong 1
+global g_bs_lik ulong 1
+global g_bs_qu ulong 1
+global g_bs_cdf ulong 1
+
+note ---- Scratch arrays ----
+global g_b_d16 f64 16
+global g_b_th16 f64 16
+global g_b_vm8 f64 8
+global g_b_pm f64 3
+global g_b_mp f64 528
+global g_b_qa f64 528
+global g_b_qc f64 528
+global g_b_qw f64 528
+global g_b_qm f64 528
+global g_b_qv f64 528
+global g_b_qsd f64 528
+global g_b_qg ulong 528
+global g_b_pg f64 8
+global g_b_hg f64 8
+global g_b_sg f64 8
+global g_b_sc f64 6
+global g_b_ok ulong 6
+global g_b_ix ulong 528
+global g_b_us ulong 528
+global g_b_pmf f64 4096
+global g_b_lfac f64 4096
+global g_b_ret f64 8
+global g_b_reti ulong 4
+
+fn brw_cost ti ulong to ulong
+  ret add get g_btau ti 2
+end
+
+fn brw_pow a f64 b f64 to f64
+  ret q_exp mul b q_ln a
+end
+
+fn brw_erfc_pos x f64 to f64
+  if eq x f64 0.0
+    ret f64 1.0
+  end
+  spi = f64 1.772453850905516
+  if lt x f64 2.2
+    x2 = mul x x
+    term = x
+    s = x
+    for k ulong 32
+      n = add k 1
+      term = div mul sub f64 0.0 term x2 f64 n
+      s = add s div term f64 add mul 2 n 1
+    end
+    v = sub f64 1.0 div mul f64 2.0 s spi
+    if lt v f64 0.0
+      ret f64 0.0
+    end
+    ret v
+  end
+  if gt x f64 27.5
+    ret f64 0.0
+  end
+  ix2 = div f64 0.5 mul x x
+  cf = f64 1.0
+  k = ulong 48
+  while gt k 0
+    cf = add f64 1.0 div mul f64 k ix2 cf
+    k = sub k 1
+  end
+  ret div q_exp sub f64 0.0 mul x x mul mul spi x cf
+end
+
+fn brw_erfc x f64 to f64
+  if lt x f64 0.0
+    ret sub f64 2.0 brw_erfc_pos sub f64 0.0 x
+  end
+  ret brw_erfc_pos x
+end
+
+fn brw_grid_fill_tau t ulong to void
+  tp = bitcast f64 or shl ulong 0x401921fb 32 ulong 0x54442d18
+  tau = f64 get g_btau t
+  bo = mul t BRW_NH
+  for i ulong BRW_NH
+    m = get g_bh_m i
+    dv = get g_bh_d i
+    mu = f64 0.0
+    vr = add mul mul f64 2.0 dv tau f64 1.0
+    if eq m 2
+      th = get g_bh_th i
+      vr = add mul div dv th sub f64 1.0 q_exp mul mul f64 -2.0 th tau f64 1.0
+    end
+    if eq m 1
+      mu = mul get g_bh_v i tau
+    end
+    put g_bg_mu add bo i mu
+    put g_bg_var add bo i vr
+    put g_bg_ln add bo i mul f64 -0.5 q_ln mul tp vr
+  end
+end
+
+fn brw_grid_init to void
+  put g_btau 0 1
+  put g_btau 1 2
+  put g_btau 2 4
+  put g_btau 3 8
+  put g_btau 4 16
+  put g_btau 5 32
+  for i ulong 16
+    put g_b_d16 i mul f64 0.001 brw_pow f64 10000.0 div f64 i f64 15.0
+    put g_b_th16 i mul f64 0.01 brw_pow f64 100.0 div f64 i f64 15.0
+  end
+  for i ulong 8
+    put g_b_vm8 i mul f64 0.02 brw_pow f64 50.0 div f64 i f64 7.0
+  end
+  n = ulong 0
+  for i ulong 16
+    put g_bh_m n 0
+    put g_bh_d n get g_b_d16 i
+    put g_bh_v n f64 0.0
+    put g_bh_th n f64 0.0
+    n = add n 1
+  end
+  for i ulong 16
+    for k ulong 16
+      put g_bh_m n 1
+      put g_bh_d n get g_b_d16 i
+      vv = f64 0.0
+      if lt k 8
+        vv = sub f64 0.0 get g_b_vm8 sub 7 k
+      else
+        vv = get g_b_vm8 sub k 8
+      end
+      put g_bh_v n vv
+      put g_bh_th n f64 0.0
+      n = add n 1
+    end
+  end
+  for i ulong 16
+    for k ulong 16
+      put g_bh_m n 2
+      put g_bh_d n get g_b_d16 i
+      put g_bh_v n f64 0.0
+      put g_bh_th n get g_b_th16 k
+      n = add n 1
+    end
+  end
+  l3 = q_ln div f64 1.0 f64 3.0
+  put g_bg_lp 0 sub l3 q_ln f64 16.0
+  put g_bg_lp 1 sub l3 q_ln f64 256.0
+  put g_bg_lp 2 sub l3 q_ln f64 256.0
+  for t ulong BRW_NT
+    brw_grid_fill_tau t
+  end
+end
+
+fn brw_lse_mp n ulong to f64
+  ninf = sub f64 0.0 q_inf
+  m = ninf
+  for i ulong n
+    v = get g_b_mp i
+    if gt v m
+      m = v
+    end
+  end
+  if not gt m ninf
+    ret ninf
+  end
+  if eq m q_inf
+    ret q_inf
+  end
+  s = f64 0.0
+  for i ulong n
+    s = add s q_exp sub get g_b_mp i m
+  end
+  ret add m q_ln s
+end
+
+fn brw_lse_lw to f64
+  for i ulong BRW_NH
+    put g_b_mp i get g_bs_lw i
+  end
+  ret brw_lse_mp BRW_NH
+end
+
+fn brw_state_init to void
+  for i ulong BRW_NH
+    put g_bs_lw i get g_bg_lp get g_bh_m i
+  end
+  put g_bs_no 0 0
+  put g_bs_np 0 0
+  put g_bs_o99 0 0
+  put g_bs_lik 0 0
+  put g_bs_qu 0 0
+  put g_bs_cdf 0 0
+end
+
+fn brw_model_post to void
+  for m ulong BRW_NM
+    cnt = ulong 0
+    for i ulong BRW_NH
+      if eq get g_bh_m i m
+        put g_b_mp cnt get g_bs_lw i
+        cnt = add cnt 1
+      end
+    end
+    put g_b_pm m q_exp brw_lse_mp cnt
+  end
+end
+
+fn brw_cdf ti ulong y f64 to f64
+  s12 = bitcast f64 or shl ulong 0x3fe6a09e 32 ulong 0x667f3bcd
+  bo = mul ti BRW_NH
+  f = f64 0.0
+  for i ulong BRW_NH
+    w = q_exp get g_bs_lw i
+    if gt w f64 0.0
+      z = div sub y get g_bg_mu add bo i fsqrt get g_bg_var add bo i
+      f = add f mul mul w f64 0.5 brw_erfc mul sub f64 0.0 z s12
+    end
+  end
+  put g_bs_cdf 0 add get g_bs_cdf 0 BRW_NH
+  ret f
+end
+
+fn brw_observe ti ulong y f64 to long
+  if or not q_isfinite y ge ti BRW_NT
+    ret -1
+  end
+  u = brw_cdf ti y
+  outv = ulong 0
+  if or lt u f64 0.005 gt u f64 0.995
+    outv = 1
+  end
+  put g_bs_np 0 add get g_bs_np 0 1
+  put g_bs_o99 0 add get g_bs_o99 0 outv
+  bo = mul ti BRW_NH
+  for i ulong BRW_NH
+    idx = add bo i
+    d = sub y get g_bg_mu idx
+    lnv = get g_bg_ln idx
+    vrv = get g_bg_var idx
+    ll = sub lnv div mul mul f64 0.5 d d vrv
+    put g_bs_lw i add get g_bs_lw i ll
+  end
+  put g_bs_lik 0 add get g_bs_lik 0 BRW_NH
+  zv = brw_lse_lw
+  for i ulong BRW_NH
+    put g_bs_lw i sub get g_bs_lw i zv
+  end
+  put g_bs_no 0 add get g_bs_no 0 1
+  ret long outv
+end
+
+fn brw_binom_crit n ulong to ulong
+  if ge n 4095
+    ret add n 1
+  end
+  l1 = q_ln f64 0.01
+  l2 = q_ln f64 0.99
+  lfac = f64 0.0
+  put g_b_lfac 0 f64 0.0
+  for k ulong n
+    lfac = add lfac q_ln f64 add k 1
+    put g_b_lfac add k 1 lfac
+  end
+  lg = get g_b_lfac n
+  for k ulong add n 1
+    lk = get g_b_lfac k
+    lnk = get g_b_lfac sub n k
+    lp = sub sub lg lk lnk
+    t1 = mul f64 k l1
+    t2 = mul f64 sub n k l2
+    put g_b_pmf k q_exp add lp add t1 t2
+  end
+  acc = f64 0.0
+  c = add n 1
+  while gt c 0
+    c = sub c 1
+    acc = add acc get g_b_pmf c
+    put g_b_pmf c acc
+  end
+  for k ulong add n 1
+    if le get g_b_pmf k f64 0.001
+      ret k
+    end
+  end
+  ret add n 1
+end
+
+fn brw_verdict to ulong
+  if gt get g_bs_o99 0 brw_binom_crit get g_bs_np 0
+    ret BRW_V_INADEQUATE
+  end
+  brw_model_post
+  for m ulong BRW_NM
+    if ge get g_b_pm m f64 0.99
+      ret add BRW_V_M0 m
+    end
+  end
+  ret BRW_V_UNDETERMINED
+end
+
+note ---- Quadrature on g_b_qw/g_b_qm/g_b_qv/g_b_qg ----
+fn brw_range8 n ulong to void
+  a = q_inf
+  b = sub f64 0.0 q_inf
+  for i ulong n
+    mu = get g_b_qm i
+    s8 = mul f64 8.0 fsqrt get g_b_qv i
+    if lt sub mu s8 a
+      a = sub mu s8
+    end
+    if gt add mu s8 b
+      b = add mu s8
+    end
+  end
+  put g_b_ret 0 a
+  put g_b_ret 1 b
+end
+
+fn brw_plogp p f64 to f64
+  if gt p f64 0.0
+    ret mul sub f64 0.0 p q_log2 p
+  end
+  ret f64 0.0
+end
+
+fn brw_mix_pt n ulong x f64 to f64
+  p = f64 0.0
+  for i ulong n
+    d = sub x get g_b_qm i
+    ev = mul get g_b_qa i mul d d
+    if lt ev f64 745.0
+      p = add p mul get g_b_qc i q_exp sub f64 0.0 ev
+    end
+  end
+  ret brw_plogp p
+end
+
+fn brw_mix_entropy_bits n ulong to f64
+  if eq n 0
+    ret f64 0.0
+  end
+  tp = bitcast f64 or shl ulong 0x401921fb 32 ulong 0x54442d18
+  brw_range8 n
+  lo = get g_b_ret 0
+  hi = get g_b_ret 1
+  for i ulong n
+    vr = get g_b_qv i
+    put g_b_qa i div f64 0.5 vr
+    put g_b_qc i div get g_b_qw i fsqrt mul tp vr
+  end
+  h = div sub hi lo f64 sub BRW_NQ 1
+  tot = f64 0.0
+  for q ulong BRW_NQ
+    tw = f64 1.0
+    if or eq q 0 eq q sub BRW_NQ 1
+      tw = f64 0.5
+    end
+    tot = add tot mul tw brw_mix_pt n add lo mul h f64 q
+  end
+  put g_bs_qu 0 add get g_bs_qu 0 mul n BRW_NQ
+  ret mul tot h
+end
+
+fn brw_info_pt n ulong ngrp ulong x f64 tw f64 to f64
+  for g ulong ngrp
+    put g_b_sg g f64 0.0
+  end
+  for i ulong n
+    d = sub x get g_b_qm i
+    ev = mul get g_b_qa i mul d d
+    if lt ev f64 45.0
+      gi = get g_b_qg i
+      ex = mul get g_b_qc i q_exp sub f64 0.0 ev
+      put g_b_sg gi add get g_b_sg gi ex
+    end
+  end
+  p = f64 0.0
+  for g ulong ngrp
+    sg = get g_b_sg g
+    p = add p sg
+    pg = get g_b_pg g
+    if gt pg f64 0.0
+      hv = mul tw brw_plogp div sg pg
+      put g_b_hg g add get g_b_hg g hv
+    end
+  end
+  ret mul tw brw_plogp p
+end
+
+fn brw_info_prep n ulong to f64
+  tp = bitcast f64 or shl ulong 0x401921fb 32 ulong 0x54442d18
+  tpe = mul tp f64 2.718281828459045
+  for g ulong 8
+    put g_b_pg g f64 0.0
+    put g_b_hg g f64 0.0
+  end
+  hh = f64 0.0
+  for i ulong n
+    gi = get g_b_qg i
+    wi = get g_b_qw i
+    vr = get g_b_qv i
+    put g_b_pg gi add get g_b_pg gi wi
+    hh = add hh mul mul wi f64 0.5 q_log2 mul tpe vr
+    put g_b_qa i div f64 0.5 vr
+    put g_b_qc i div wi fsqrt mul tp vr
+  end
+  ret hh
+end
+
+note Writes i_group -> g_b_ret[2], i_hyp -> g_b_ret[3]
+fn brw_info_arrays n ulong ngrp ulong to void
+  put g_b_ret 2 f64 0.0
+  put g_b_ret 3 f64 0.0
+  if or eq n 0 or lt ngrp 1 gt ngrp 8
+    ret
+  end
+  hh = brw_info_prep n
+  brw_range8 n
+  lo = get g_b_ret 0
+  hi = get g_b_ret 1
+  h = div sub hi lo f64 sub BRW_NQ 1
+  hy = f64 0.0
+  for q ulong BRW_NQ
+    tw = f64 1.0
+    if or eq q 0 eq q sub BRW_NQ 1
+      tw = f64 0.5
+    end
+    hy = add hy brw_info_pt n ngrp add lo mul h f64 q tw
+  end
+  put g_bs_qu 0 add get g_bs_qu 0 mul n BRW_NQ
+  hy = mul hy h
+  cond = f64 0.0
+  for g ulong ngrp
+    pg = get g_b_pg g
+    hg = get g_b_hg g
+    cond = add cond mul mul pg hg h
+  end
+  put g_b_ret 2 sub hy cond
+  put g_b_ret 3 sub hy hh
+end
+
+fn brw_info ti ulong to void
+  bo = mul ti BRW_NH
+  tot = f64 0.0
+  n = ulong 0
+  for i ulong BRW_NH
+    p = q_exp get g_bs_lw i
+    if gt p f64 0.000000000001
+      put g_b_qw n p
+      put g_b_qm n get g_bg_mu add bo i
+      put g_b_qv n get g_bg_var add bo i
+      put g_b_qg n get g_bh_m i
+      tot = add tot p
+      n = add n 1
+    end
+  end
+  for i ulong n
+    put g_b_qw i div get g_b_qw i tot
+  end
+  brw_info_arrays n BRW_NM
+end
+
+fn brw_pick n ulong to long
+  best = long -1
+  for i ulong n
+    if ne get g_b_ok i 0
+      if lt best 0
+        best = long i
+      else
+        if gt get g_b_sc i get g_b_sc ulong best
+          best = long i
+        end
+      end
+    end
+  end
+  ret best
+end
+
+note Returns menu index or -1; phase -> g_b_reti[0]
+fn brw_choose rem_t long to long
+  any = false
+  for t ulong BRW_NT
+    if le long brw_cost t rem_t
+      put g_b_ok t 1
+      any = true
+    else
+      put g_b_ok t 0
+    end
+    put g_b_sc t f64 0.0
+  end
+  if not any
+    ret -1
+  end
+  brw_model_post
+  pmax = f64 0.0
+  for m ulong BRW_NM
+    if gt get g_b_pm m pmax
+      pmax = get g_b_pm m
+    end
+  end
+  ph = ulong 2
+  if lt pmax f64 0.99
+    ph = 1
+  end
+  put g_b_reti 0 ph
+  for t ulong BRW_NT
+    if ne get g_b_ok t 0
+      brw_info t
+      iv = get g_b_ret 3
+      if eq ph 1
+        iv = get g_b_ret 2
+      end
+      put g_b_sc t div iv f64 brw_cost t
+    end
+  end
+  ret brw_pick BRW_NT
+end
+
+note ---- PRD2 reduction (inputs in g_b_qw/g_b_qm/g_b_qsd[0..n-1], output in g_qp_*[dst]) ----
+fn brw_reduce_tail m ulong tot f64 dst ulong keep ulong to void
+  wr = f64 0.0
+  mn = f64 0.0
+  for j ulong m
+    idx = get g_b_ix j
+    if eq get g_b_us idx 0
+      wi = get g_b_qw idx
+      wr = add wr wi
+      mn = add mn mul wi get g_b_qm idx
+    end
+  end
+  mn = div mn wr
+  vr = f64 0.0
+  for j ulong m
+    idx = get g_b_ix j
+    if eq get g_b_us idx 0
+      wi = get g_b_qw idx
+      sd = get g_b_qsd idx
+      dm = sub get g_b_qm idx mn
+      s2 = add mul sd sd mul dm dm
+      vr = add vr mul wi s2
+    end
+  end
+  vr = div vr wr
+  bo = add mul dst 8 keep
+  put g_qc_pi bo div wr tot
+  put g_qc_loc bo mn
+  put g_qc_sc bo fsqrt vr
+  put g_qp_k dst add keep 1
+end
+
+fn brw_pick_heavy m ulong to ulong
+  bi = long -1
+  for j ulong m
+    idx = get g_b_ix j
+    if eq get g_b_us idx 0
+      if lt bi 0
+        bi = long idx
+      else
+        if gt get g_b_qw idx get g_b_qw ulong bi
+          bi = long idx
+        end
+      end
+    end
+  end
+  ret ulong bi
+end
+
+fn brw_reduce n ulong rec_idx ulong dst ulong to long
+  m = ulong 0
+  tot = f64 0.0
+  for i ulong n
+    put g_b_us i 0
+    wi = get g_b_qw i
+    if gt wi f64 0.0
+      put g_b_ix m i
+      tot = add tot wi
+      m = add m 1
+    end
+  end
+  put g_qp_idx dst rec_idx
+  put g_qp_fam dst TYQ_FAM_MIX
+  keep = m
+  if gt m TYQ_KMAX
+    keep = sub TYQ_KMAX 1
+  end
+  bo = mul dst 8
+  for k ulong keep
+    ub = brw_pick_heavy m
+    put g_b_us ub 1
+    put g_qc_pi add bo k div get g_b_qw ub tot
+    put g_qc_loc add bo k get g_b_qm ub
+    put g_qc_sc add bo k get g_b_qsd ub
+  end
+  put g_qp_k dst keep
+  if gt m TYQ_KMAX
+    brw_reduce_tail m tot dst keep
+  end
+  kv = get g_qp_k dst
+  sum = f64 0.0
+  for k ulong kv
+    sum = add sum get g_qc_pi add bo k
+  end
+  for k ulong kv
+    nv = div get g_qc_pi add bo k sum
+    if gt nv f64 1.0
+      nv = f64 1.0
+    end
+    put g_qc_pi add bo k nv
+  end
+  ret ty_prd2_validate dst
+end
+
+fn brw_predict_prd2 ti ulong rec_idx ulong dst ulong to long
+  bo = mul ti BRW_NH
+  for i ulong BRW_NH
+    put g_b_qw i q_exp get g_bs_lw i
+    put g_b_qm i get g_bg_mu add bo i
+    put g_b_qsd i fsqrt get g_bg_var add bo i
+  end
+  ret brw_reduce BRW_NH rec_idx dst
+end
