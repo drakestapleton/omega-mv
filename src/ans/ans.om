@@ -1,0 +1,3146 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/ans/ans.om -- pure seeded OM-2 Alignment Navigation System (ANS v1)
+note and embedded EST-0/EST-1 linear Kalman filter.
+note Replaces src/ans/ans.c, src/ans/ans_encode.c, src/ans/ans.h.
+note Advisory only: zero heap, zero threads, zero syscalls, zero authority.
+
+const ANS_ATOMS ulong 10
+const ANS_ACT_KINDS ulong 5
+const ANS_SENSOR_KINDS ulong 3
+const ANS_DIM ulong 4
+const ANS_FORMAT_VERSION ulong 1
+const ANS_ENCODED_MAX ulong 1024
+
+const ANS_ATOM_AUTHORITY ulong 0
+const ANS_ATOM_CONSENT ulong 1
+const ANS_ATOM_SCOPE ulong 2
+const ANS_ATOM_PROVENANCE ulong 3
+const ANS_ATOM_REVERSIBILITY ulong 4
+const ANS_ATOM_RESOURCE_LIMITS ulong 5
+const ANS_ATOM_INFORMATION_BOUNDARIES ulong 6
+const ANS_ATOM_GOAL_IDENTITY ulong 7
+const ANS_ATOM_DELEGATION_LIMITS ulong 8
+const ANS_ATOM_SELF_MODIFICATION_LIMITS ulong 9
+
+const ANS_ACT_OBSERVE ulong 0
+const ANS_ACT_EFFECT ulong 1
+const ANS_ACT_DELEGATE ulong 2
+const ANS_ACT_INGEST_UNTRUSTED ulong 3
+const ANS_ACT_SELF_MODIFY ulong 4
+
+const ANS_SENSOR_IMU ulong 0
+const ANS_SENSOR_REFERENCE ulong 1
+const ANS_SENSOR_FIX ulong 2
+
+const ANS_TIER_FULL ulong 0
+const ANS_TIER_REVERSIBLE_ONLY ulong 1
+const ANS_TIER_SIMULATE_ONLY ulong 2
+const ANS_TIER_HALT_REQUEST_FIX ulong 3
+
+const ANS_OK long 0
+const ANS_ERR_NULL long -1
+const ANS_ERR_REFERENCE long -2
+const ANS_ERR_NONFINITE long -3
+const ANS_ERR_EVIDENCE long -4
+const ANS_ERR_SENSOR long -5
+const ANS_ERR_ATOM long -6
+const ANS_ERR_RANGE long -7
+const ANS_ERR_EST long -8
+const ANS_ERR_ENCODING long -9
+
+const ANS_PROMOTE_OK ulong 0
+const ANS_PROMOTE_REFUSED_REFERENCE ulong 1
+const ANS_PROMOTE_REFUSED_TESTS ulong 2
+const ANS_PROMOTE_REFUSED_DISAGREEMENT ulong 3
+const ANS_PROMOTE_REFUSED_DRIFT ulong 4
+const ANS_PROMOTE_REFUSED_SELF_MOD ulong 5
+
+const EST_OK long 0
+const EST_ERR_NULL long -1
+const EST_ERR_DIM long -2
+const EST_ERR_NONFINITE long -3
+const EST_ERR_ASYMMETRIC long -4
+const EST_ERR_NOT_PSD long -5
+const EST_ERR_NOT_PD long -6
+const EST_ERR_UNIT long -7
+const EST_ERR_STALE long -8
+const EST_ERR_MODEL long -9
+const EST_ERR_KIND long -10
+const EST_ERR_ENCODING long -11
+const EST_ERR_TIME long -12
+
+const EST_MAX_DIM ulong 8
+const EST_MAX_HORIZON ulong 1000000
+const EST_UNIT_DIMENSIONLESS ulong 7
+const EST_UNIT_MAX ulong 9
+
+text t_est_dom_model "omega.est.model.v1"
+text t_est_dom_obs "omega.est.observation.v1"
+text t_est_dom_bel "omega.est.belief.v1"
+text t_est_dom_broot "omega.est.belief.v1-root"
+text t_est_dom_pred "omega.est.prediction.v1"
+text t_est_dom_innov "omega.est.innovation.v1"
+
+text t_ans_dom_ref "omega.ans.reference.v1"
+text t_ans_dom_state "omega.ans.state.v1"
+text t_ans_dom_act "omega.ans.action.v1"
+text t_ans_dom_meas "omega.ans.measurement.v1"
+text t_ans_dom_verd "omega.ans.verdict.v1"
+text t_ans_dom_promo "omega.ans.promotion.v1"
+text t_ans_dom_prov "omega.ans.provenance.v1"
+
+text t_tag_prior "prior"
+text t_tag_refused "refused"
+text t_tag_action "action"
+text t_tag_measurement "measurement"
+
+note ---- SHA-256 state ----
+global g_shk uint 72
+global g_shh uint 8
+global g_shw uint 64
+global g_shv uint 8
+global g_shb uchar 64
+global g_shm ulong 2
+
+note ---- Digest bank (32 slots x 32 bytes) ----
+note Slots 0..15: caller/test; 16..31: internal ANS/EST scratch
+global g_dg uchar 1024
+
+note ---- Codec wire buffers ----
+global g_wire uchar 2400
+global g_ebuf uchar 2400
+note g_cd: [0]=pos [1]=len [2]=cap [3]=bad
+global g_cd ulong 4
+global g_ecd ulong 4
+
+note ---- EST belief pool (16 slots; 0..7 = state[0..7].drift, 8..15 = scratch) ----
+global g_b_n ulong 16
+global g_b_unit ulong 128
+global g_b_x f64 128
+global g_b_P f64 1024
+global g_b_gen ulong 16
+global g_b_tns long 16
+global g_b_mdl uchar 512
+global g_b_par uchar 512
+global g_b_evr uchar 512
+
+note ---- EST model (1 slot) ----
+global g_em_meta ulong 4
+global g_em_su ulong 8
+global g_em_ou ulong 8
+global g_em_F f64 64
+global g_em_Q f64 64
+global g_em_H f64 64
+global g_em_R f64 64
+global g_em_tns long 1
+
+note ---- EST prediction (2 slots: 0=pred, 1=recompute) ----
+global g_ep_pr uchar 64
+global g_ep_md uchar 64
+global g_ep_hz ulong 2
+global g_ep_gn ulong 2
+global g_ep_tn long 2
+global g_ep_n ulong 2
+global g_ep_m ulong 2
+global g_ep_hc ulong 2
+global g_ep_x f64 16
+global g_ep_P f64 128
+global g_ep_ym f64 16
+global g_ep_S f64 128
+global g_ep_Bu f64 16
+
+note ---- EST observation & innovation (1 slot each) ----
+global g_eo_m ulong 1
+global g_eo_u ulong 8
+global g_eo_z f64 8
+global g_eo_R f64 64
+global g_eo_tn long 1
+global g_eo_sq ulong 1
+global g_eo_src uchar 32
+global g_eo_ev uchar 32
+
+global g_ei_pr uchar 32
+global g_ei_ob uchar 32
+global g_ei_md uchar 32
+global g_ei_m ulong 1
+global g_ei_nu f64 8
+global g_ei_S f64 64
+global g_ei_nis f64 1
+global g_ei_tn long 1
+
+note ---- Matrix linear-algebra scratch (max 8x8) ----
+global g_la_T f64 64
+global g_la_P2 f64 64
+global g_la_PHt f64 64
+global g_la_S f64 64
+global g_la_L f64 64
+global g_la_K f64 64
+global g_la_A f64 64
+global g_la_P1 f64 64
+global g_la_KR f64 64
+global g_la_v1 f64 8
+global g_la_v2 f64 8
+global g_la_v3 f64 8
+global g_la_cov f64 72
+global g_last_est long 1
+
+note ---- ANS references (4 slots) ----
+global g_ref_ver ulong 4
+global g_ref_froz ulong 4
+global g_ref_lim f64 40
+global g_ref_q f64 20
+global g_ref_r f64 12
+global g_ref_tsig f64 12
+global g_ref_nis f64 4
+global g_ref_prom f64 4
+
+note ---- ANS states (8 slots) ----
+global g_st_goal uchar 256
+global g_st_cons uchar 256
+global g_st_int uchar 256
+global g_st_evr uchar 256
+global g_st_prov uchar 256
+global g_st_lref uchar 256
+global g_st_gen ulong 8
+global g_st_sfix ulong 8
+global g_st_smst ulong 8
+global g_st_smuf ulong 8
+global g_st_dis ulong 8
+global g_st_risk f64 8
+global g_st_lnis f64 8
+
+note ---- ANS actions (4 slots) ----
+global g_act_kind ulong 4
+global g_act_id uchar 128
+global g_act_risk f64 4
+global g_act_tch ulong 40
+
+note ---- ANS measurements (4 slots) ----
+global g_ms_cls ulong 4
+global g_ms_z f64 16
+global g_ms_src uchar 128
+global g_ms_ev uchar 128
+global g_ms_ref uchar 128
+global g_ms_tns long 4
+global g_ms_seq ulong 4
+
+note ---- ANS verdicts (4 slots) ----
+global g_vd_tier ulong 4
+global g_vd_D f64 4
+global g_vd_mn f64 4
+global g_vd_sig f64 4
+global g_vd_sfix ulong 4
+global g_vd_dis ulong 4
+global g_vd_st uchar 128
+global g_vd_ref uchar 128
+global g_vd_dig uchar 128
+
+note ---- ANS promotion records (4 slots) ----
+global g_pr_res ulong 4
+global g_pr_D f64 4
+global g_pr_cand uchar 128
+global g_pr_ref uchar 128
+global g_pr_tst uchar 128
+global g_pr_st uchar 128
+global g_pr_dig uchar 128
+
+note ---- FIPS 180-4 SHA-256 ----
+fn ans_rotr32 x uint n uint to uint
+  ret or shr x n shl x sub uint 32 n
+end
+
+fn ans_sha_init_tbl to void
+  if ne get g_shk 0 0
+    ret
+  end
+  put g_shk 0 1116352408
+  put g_shk 1 1899447441
+  put g_shk 2 3049323471
+  put g_shk 3 3921009573
+  put g_shk 4 961987163
+  put g_shk 5 1508970993
+  put g_shk 6 2453635748
+  put g_shk 7 2870763221
+  put g_shk 8 3624381080
+  put g_shk 9 310598401
+  put g_shk 10 607225278
+  put g_shk 11 1426881987
+  put g_shk 12 1925078388
+  put g_shk 13 2162078206
+  put g_shk 14 2614888103
+  put g_shk 15 3248222580
+  put g_shk 16 3835390401
+  put g_shk 17 4022224774
+  put g_shk 18 264347078
+  put g_shk 19 604807628
+  put g_shk 20 770255983
+  put g_shk 21 1249150122
+  put g_shk 22 1555081692
+  put g_shk 23 1996064986
+  put g_shk 24 2554220882
+  put g_shk 25 2821834349
+  put g_shk 26 2952996808
+  put g_shk 27 3210313671
+  put g_shk 28 3336571891
+  put g_shk 29 3584528711
+  put g_shk 30 113926993
+  put g_shk 31 338241895
+  put g_shk 32 666307205
+  put g_shk 33 773529912
+  put g_shk 34 1294757372
+  put g_shk 35 1396182291
+  put g_shk 36 1695183700
+  put g_shk 37 1986661051
+  put g_shk 38 2177026350
+  put g_shk 39 2456956037
+  put g_shk 40 2730485921
+  put g_shk 41 2820302411
+  put g_shk 42 3259730800
+  put g_shk 43 3345764771
+  put g_shk 44 3516065817
+  put g_shk 45 3600352804
+  put g_shk 46 4094571909
+  put g_shk 47 275423344
+  put g_shk 48 430227734
+  put g_shk 49 506948616
+  put g_shk 50 659060556
+  put g_shk 51 883997877
+  put g_shk 52 958139571
+  put g_shk 53 1322822218
+  put g_shk 54 1537002063
+  put g_shk 55 1747873779
+  put g_shk 56 1955562222
+  put g_shk 57 2024104815
+  put g_shk 58 2227730452
+  put g_shk 59 2361852424
+  put g_shk 60 2428436474
+  put g_shk 61 2756734187
+  put g_shk 62 3204031479
+  put g_shk 63 3329325298
+  put g_shk 64 1779033703
+  put g_shk 65 3144134277
+  put g_shk 66 1013904242
+  put g_shk 67 2773480762
+  put g_shk 68 1359893119
+  put g_shk 69 2600822924
+  put g_shk 70 528734635
+  put g_shk 71 1541459225
+end
+
+fn ans_sha_round i ulong to void
+  e = get g_shv 4
+  s1 = xor xor ans_rotr32 e 6 ans_rotr32 e 11 ans_rotr32 e 25
+  ch = xor and e get g_shv 5 and xor e uint 4294967295 get g_shv 6
+  t1 = add add add add get g_shv 7 s1 ch get g_shk i get g_shw i
+  a = get g_shv 0
+  s0 = xor xor ans_rotr32 a 2 ans_rotr32 a 13 ans_rotr32 a 22
+  b = get g_shv 1
+  c = get g_shv 2
+  maj = xor xor and a b and a c and b c
+  t2 = add s0 maj
+  put g_shv 7 get g_shv 6
+  put g_shv 6 get g_shv 5
+  put g_shv 5 e
+  put g_shv 4 add get g_shv 3 t1
+  put g_shv 3 c
+  put g_shv 2 b
+  put g_shv 1 a
+  put g_shv 0 add t1 t2
+end
+
+fn ans_sha_compress to void
+  i = ulong 0
+  while lt i 16
+    o = mul i 4
+    b0 = uint get g_shb o
+    b1 = uint get g_shb add o 1
+    b2 = uint get g_shb add o 2
+    b3 = uint get g_shb add o 3
+    put g_shw i or or shl b0 24 shl b1 16 or shl b2 8 b3
+    i = add i 1
+  end
+  i = ulong 16
+  while lt i 64
+    w15 = get g_shw sub i 15
+    s0 = xor xor ans_rotr32 w15 7 ans_rotr32 w15 18 shr w15 3
+    w2 = get g_shw sub i 2
+    s1 = xor xor ans_rotr32 w2 17 ans_rotr32 w2 19 shr w2 10
+    v = add add get g_shw sub i 16 s0 get g_shw sub i 7
+    put g_shw i add v s1
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 8
+    put g_shv i get g_shh i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 64
+    ans_sha_round i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 8
+    put g_shh i add get g_shh i get g_shv i
+    i = add i 1
+  end
+end
+
+fn ans_sha_init to void
+  ans_sha_init_tbl
+  i = ulong 0
+  while lt i 8
+    put g_shh i get g_shk add 64 i
+    i = add i 1
+  end
+  put g_shm 0 0
+  put g_shm 1 0
+end
+
+fn ans_sha_byte b uchar to void
+  bl = get g_shm 0
+  put g_shb bl b
+  bl = add bl 1
+  put g_shm 1 add get g_shm 1 1
+  if eq bl 64
+    ans_sha_compress
+    bl = 0
+  end
+  put g_shm 0 bl
+end
+
+fn ans_sha_lit s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    ans_sha_byte get s i
+    i = add i 1
+  end
+end
+
+fn ans_sha_final did ulong to void
+  bl = get g_shm 0
+  bits = mul get g_shm 1 8
+  put g_shb bl 128
+  bl = add bl 1
+  if gt bl 56
+    while lt bl 64
+      put g_shb bl 0
+      bl = add bl 1
+    end
+    ans_sha_compress
+    bl = 0
+  end
+  while lt bl 56
+    put g_shb bl 0
+    bl = add bl 1
+  end
+  i = ulong 0
+  while lt i 8
+    put g_shb add 56 i uchar and shr bits mul sub 7 i 8 255
+    i = add i 1
+  end
+  ans_sha_compress
+  base = mul did 32
+  i = ulong 0
+  while lt i 8
+    v = get g_shh i
+    o = add base mul i 4
+    put g_dg o uchar and shr v 24 255
+    put g_dg add o 1 uchar and shr v 16 255
+    put g_dg add o 2 uchar and shr v 8 255
+    put g_dg add o 3 uchar and v 255
+    i = add i 1
+  end
+end
+
+fn ans_hash_dom_ebuf dom view uchar * n ulong did ulong to void
+  ans_sha_init
+  ans_sha_lit dom
+  ans_sha_byte 0
+  i = ulong 0
+  while lt i n
+    ans_sha_byte get g_ebuf i
+    i = add i 1
+  end
+  ans_sha_final did
+end
+
+fn ans_hash_dom_wire dom view uchar * n ulong did ulong to void
+  ans_sha_init
+  ans_sha_lit dom
+  ans_sha_byte 0
+  i = ulong 0
+  while lt i n
+    ans_sha_byte get g_wire i
+    i = add i 1
+  end
+  ans_sha_final did
+end
+
+note ---- Digest helpers ----
+fn dg_zero did ulong to void
+  o = mul did 32
+  i = ulong 0
+  while lt i 32
+    put g_dg add o i 0
+    i = add i 1
+  end
+end
+
+fn dg_is_zero did ulong to bool
+  o = mul did 32
+  i = ulong 0
+  while lt i 32
+    if ne get g_dg add o i 0
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn dg_eq da ulong db ulong to bool
+  oa = mul da 32
+  ob = mul db 32
+  i = ulong 0
+  while lt i 32
+    if ne get g_dg add oa i get g_dg add ob i
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn dg_copy dst ulong src ulong to void
+  od = mul dst 32
+  os = mul src 32
+  i = ulong 0
+  while lt i 32
+    put g_dg add od i get g_dg add os i
+    i = add i 1
+  end
+end
+
+note ---- IEEE-754 f64 helpers ----
+fn f64_is_finite v f64 to bool
+  u = bitcast ulong v
+  ret lt and shr u 52 2047 2047
+end
+
+fn f64_canon_bits v f64 to ulong
+  u = bitcast ulong v
+  if eq and u 9223372036854775807 0
+    ret 0
+  end
+  ret u
+end
+
+note ---- EST-0 byte codec (g_ebuf / g_ecd) ----
+fn ew_init cap ulong to void
+  put g_ecd 0 0
+  put g_ecd 1 0
+  put g_ecd 2 cap
+  put g_ecd 3 0
+end
+
+fn ew_u8 b uchar to void
+  if ne get g_ecd 3 0
+    ret
+  end
+  ln = get g_ecd 1
+  if ge ln get g_ecd 2
+    put g_ecd 3 1
+    ret
+  end
+  put g_ebuf ln b
+  put g_ecd 1 add ln 1
+end
+
+fn ew_u32 v ulong to void
+  ew_u8 uchar and v 255
+  ew_u8 uchar and shr v 8 255
+  ew_u8 uchar and shr v 16 255
+  ew_u8 uchar and shr v 24 255
+end
+
+fn ew_u64 v ulong to void
+  i = ulong 0
+  while lt i 8
+    ew_u8 uchar and shr v mul i 8 255
+    i = add i 1
+  end
+end
+
+fn ew_i64 v long to void
+  ew_u64 bitcast ulong v
+end
+
+fn ew_f64 v f64 to void
+  ew_u64 f64_canon_bits v
+end
+
+fn ew_hdr kind ulong to void
+  ew_u8 79
+  ew_u8 69
+  ew_u8 83
+  ew_u8 84
+  ew_u8 uchar kind
+  ew_u8 1
+  ew_u8 0
+  ew_u8 0
+end
+
+fn ew_dg did ulong to void
+  o = mul did 32
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_dg add o i
+    i = add i 1
+  end
+end
+
+fn er_init length ulong to void
+  put g_ecd 0 0
+  put g_ecd 1 length
+  put g_ecd 2 length
+  put g_ecd 3 0
+end
+
+fn er_need n ulong to bool
+  if ne get g_ecd 3 0
+    ret false
+  end
+  if gt n sub get g_ecd 1 get g_ecd 0
+    put g_ecd 3 1
+    ret false
+  end
+  ret true
+end
+
+fn er_u8 to uchar
+  if not er_need 1
+    ret 0
+  end
+  p = get g_ecd 0
+  put g_ecd 0 add p 1
+  ret get g_ebuf p
+end
+
+fn er_u32 to ulong
+  if not er_need 4
+    ret 0
+  end
+  p = get g_ecd 0
+  put g_ecd 0 add p 4
+  b0 = ulong get g_ebuf p
+  b1 = ulong get g_ebuf add p 1
+  b2 = ulong get g_ebuf add p 2
+  b3 = ulong get g_ebuf add p 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn er_u64 to ulong
+  if not er_need 8
+    ret 0
+  end
+  p = get g_ecd 0
+  put g_ecd 0 add p 8
+  r = ulong 0
+  i = ulong 0
+  while lt i 8
+    r = or r shl ulong get g_ebuf add p i mul i 8
+    i = add i 1
+  end
+  ret r
+end
+
+fn er_f64 to f64
+  ret bitcast f64 er_u64
+end
+
+fn er_ok_done to bool
+  if ne get g_ecd 3 0
+    ret false
+  end
+  ret eq get g_ecd 0 get g_ecd 1
+end
+
+fn er_hdr want ulong to long
+  if lt get g_ecd 1 8
+    ret EST_ERR_ENCODING
+  end
+  if or ne get g_ebuf 0 79 ne get g_ebuf 1 69
+    ret EST_ERR_ENCODING
+  end
+  if or ne get g_ebuf 2 83 ne get g_ebuf 3 84
+    ret EST_ERR_ENCODING
+  end
+  if or ne get g_ebuf 5 1 or ne get g_ebuf 6 0 ne get g_ebuf 7 0
+    ret EST_ERR_ENCODING
+  end
+  if ne ulong get g_ebuf 4 want
+    ret EST_ERR_KIND
+  end
+  put g_ecd 0 8
+  ret EST_OK
+end
+
+note ---- EST linear algebra & covariance check ----
+fn est_cov_ldlt_col n ulong i ulong dmax f64 s f64 to long
+  j = add i 1
+  while lt j n
+    sj = get g_la_cov add mul j n i
+    k = ulong 0
+    while lt k i
+      a = get g_la_L add mul j n k
+      b = get g_la_L add mul i n k
+      d = get g_la_v1 k
+      sj = sub sj mul mul a b d
+      k = add k 1
+    end
+    if gt s 0.0
+      put g_la_L add mul j n i div sj s
+    else
+      if gt fabs sj mul 1e-9 add dmax 1e-300
+        ret EST_ERR_NOT_PSD
+      end
+      put g_la_L add mul j n i 0.0
+    end
+    j = add j 1
+  end
+  ret EST_OK
+end
+
+fn est_cov_ldlt n ulong dmax f64 to long
+  neg_lim = neg mul 1e-12 dmax
+  i = ulong 0
+  while lt i n
+    s = get g_la_cov add mul i n i
+    k = ulong 0
+    while lt k i
+      lik = get g_la_L add mul i n k
+      s = sub s mul mul lik lik get g_la_v1 k
+      k = add k 1
+    end
+    if not f64_is_finite s
+      ret EST_ERR_NONFINITE
+    end
+    if lt s neg_lim
+      ret EST_ERR_NOT_PSD
+    end
+    if lt s 0.0
+      s = 0.0
+    end
+    put g_la_v1 i s
+    put g_la_L add mul i n i 1.0
+    rc = est_cov_ldlt_col n i dmax s
+    if ne rc 0
+      ret rc
+    end
+    i = add i 1
+  end
+  ret EST_OK
+end
+
+fn est_check_cov_la n ulong to long
+  if or eq n 0 gt n EST_MAX_DIM
+    ret EST_ERR_DIM
+  end
+  mx = f64 0.0
+  i = ulong 0
+  nn = mul n n
+  while lt i nn
+    v = get g_la_cov i
+    if not f64_is_finite v
+      ret EST_ERR_NONFINITE
+    end
+    av = fabs v
+    if gt av mx
+      mx = av
+    end
+    i = add i 1
+  end
+  tol = mul 1e-9 mx
+  if lt tol 1e-300
+    tol = 1e-300
+  end
+  i = ulong 0
+  while lt i n
+    j = add i 1
+    while lt j n
+      a = get g_la_cov add mul i n j
+      b = get g_la_cov add mul j n i
+      if gt fabs sub a b tol
+        ret EST_ERR_ASYMMETRIC
+      end
+      j = add j 1
+    end
+    i = add i 1
+  end
+  dmax = f64 0.0
+  i = ulong 0
+  while lt i n
+    d = get g_la_cov add mul i n i
+    if gt d dmax
+      dmax = d
+    end
+    i = add i 1
+  end
+  if lt dmax 0.0
+    ret EST_ERR_NOT_PSD
+  end
+  ret est_cov_ldlt n dmax
+end
+
+fn est_chol_S m ulong to bool
+  i = ulong 0
+  while lt i 64
+    put g_la_L i 0.0
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i m
+    j = ulong 0
+    while le j i
+      s = get g_la_S add mul i m j
+      k = ulong 0
+      while lt k j
+        a = get g_la_L add mul i m k
+        b = get g_la_L add mul j m k
+        s = sub s mul a b
+        k = add k 1
+      end
+      if eq i j
+        if not f64_is_finite s
+          ret false
+        end
+        if le s 0.0
+          ret false
+        end
+        put g_la_L add mul i m i fsqrt s
+      else
+        put g_la_L add mul i m j div s get g_la_L add mul j m j
+      end
+      j = add j 1
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn est_fwd_v1_to_v2 m ulong to void
+  i = ulong 0
+  while lt i m
+    s = get g_la_v1 i
+    j = ulong 0
+    while lt j i
+      s = sub s mul get g_la_L add mul i m j get g_la_v2 j
+      j = add j 1
+    end
+    put g_la_v2 i div s get g_la_L add mul i m i
+    i = add i 1
+  end
+end
+
+fn est_bwd_v2_to_v3 m ulong to void
+  i = m
+  while gt i 0
+    i = sub i 1
+    s = get g_la_v2 i
+    j = add i 1
+    while lt j m
+      s = sub s mul get g_la_L add mul j m i get g_la_v3 j
+      j = add j 1
+    end
+    put g_la_v3 i div s get g_la_L add mul i m i
+  end
+end
+
+fn est_sym_la_P2 n ulong to void
+  i = ulong 0
+  while lt i n
+    j = add i 1
+    while lt j n
+      a = get g_la_P2 add mul i n j
+      b = get g_la_P2 add mul j n i
+      h = mul 0.5 add a b
+      put g_la_P2 add mul i n j h
+      put g_la_P2 add mul j n i h
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+fn est_sym_la_S m ulong to void
+  i = ulong 0
+  while lt i m
+    j = add i 1
+    while lt j m
+      a = get g_la_S add mul i m j
+      b = get g_la_S add mul j m i
+      h = mul 0.5 add a b
+      put g_la_S add mul i m j h
+      put g_la_S add mul j m i h
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+note ---- EST-0 validation, encoding, decoding, digests ----
+fn est_check_belief bid ulong to long
+  n = get g_b_n bid
+  if or eq n 0 gt n EST_MAX_DIM
+    ret EST_ERR_DIM
+  end
+  ub = mul bid 8
+  i = ulong 0
+  while lt i n
+    u = get g_b_unit add ub i
+    if or eq u 0 ge u EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    if not f64_is_finite get g_b_x add ub i
+      ret EST_ERR_NONFINITE
+    end
+    i = add i 1
+  end
+  mb = mul bid 32
+  z = true
+  i = ulong 0
+  while lt i 32
+    if ne get g_b_mdl add mb i 0
+      z = false
+      break
+    end
+    i = add i 1
+  end
+  if z
+    ret EST_ERR_MODEL
+  end
+  pz = true
+  ez = true
+  i = ulong 0
+  while lt i 32
+    if ne get g_b_par add mb i 0
+      pz = false
+    end
+    if ne get g_b_evr add mb i 0
+      ez = false
+    end
+    i = add i 1
+  end
+  if eq get g_b_gen bid 0
+    if or not pz not ez
+      ret EST_ERR_STALE
+    end
+  else
+    if pz
+      ret EST_ERR_STALE
+    end
+  end
+  pb = mul bid 64
+  nn = mul n n
+  i = ulong 0
+  while lt i nn
+    put g_la_cov i get g_b_P add pb i
+    i = add i 1
+  end
+  ret est_check_cov_la n
+end
+
+fn est_encode_belief bid ulong to long
+  st = est_check_belief bid
+  if ne st 0
+    ret st
+  end
+  ew_init 2304
+  ew_hdr 3
+  n = get g_b_n bid
+  ew_u32 n
+  ub = mul bid 8
+  i = ulong 0
+  while lt i n
+    ew_u32 get g_b_unit add ub i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i n
+    ew_f64 get g_b_x add ub i
+    i = add i 1
+  end
+  pb = mul bid 64
+  nn = mul n n
+  i = ulong 0
+  while lt i nn
+    ew_f64 get g_b_P add pb i
+    i = add i 1
+  end
+  ew_u64 get g_b_gen bid
+  ew_i64 get g_b_tns bid
+  mb = mul bid 32
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_b_mdl add mb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_b_par add mb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_b_evr add mb i
+    i = add i 1
+  end
+  if ne get g_ecd 3 0
+    ret EST_ERR_ENCODING
+  end
+  ret EST_OK
+end
+
+fn est_decode_belief bid ulong length ulong to long
+  er_init length
+  st = er_hdr 3
+  if ne st 0
+    ret st
+  end
+  n = er_u32
+  if or ne get g_ecd 3 0 or eq n 0 gt n EST_MAX_DIM
+    ret EST_ERR_DIM
+  end
+  put g_b_n bid n
+  ub = mul bid 8
+  i = ulong 0
+  while lt i n
+    u = er_u32
+    if ge u EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    put g_b_unit add ub i u
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i n
+    put g_b_x add ub i er_f64
+    i = add i 1
+  end
+  pb = mul bid 64
+  nn = mul n n
+  i = ulong 0
+  while lt i nn
+    put g_b_P add pb i er_f64
+    i = add i 1
+  end
+  put g_b_gen bid er_u64
+  put g_b_tns bid bitcast long er_u64
+  mb = mul bid 32
+  i = ulong 0
+  while lt i 32
+    put g_b_mdl add mb i er_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_b_par add mb i er_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_b_evr add mb i er_u8
+    i = add i 1
+  end
+  if not er_ok_done
+    ret EST_ERR_ENCODING
+  end
+  ret est_check_belief bid
+end
+
+fn est_digest_belief bid ulong did ulong to long
+  st = est_encode_belief bid
+  if ne st 0
+    ret st
+  end
+  ans_hash_dom_ebuf t_est_dom_bel get g_ecd 1 did
+  ret EST_OK
+end
+
+fn est_digest_model did ulong to long
+  ew_init 2304
+  ew_hdr 1
+  n = get g_em_meta 0
+  m = get g_em_meta 1
+  ew_u32 n
+  ew_u32 m
+  ew_u32 get g_em_meta 2
+  ew_u32 get g_em_meta 3
+  i = ulong 0
+  while lt i n
+    ew_u32 get g_em_su i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i m
+    ew_u32 get g_em_ou i
+    i = add i 1
+  end
+  nn = mul n n
+  i = ulong 0
+  while lt i nn
+    ew_f64 get g_em_F i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i nn
+    ew_f64 get g_em_Q i
+    i = add i 1
+  end
+  mn = mul m n
+  i = ulong 0
+  while lt i mn
+    ew_f64 get g_em_H i
+    i = add i 1
+  end
+  mm_ = mul m m
+  i = ulong 0
+  while lt i mm_
+    ew_f64 get g_em_R i
+    i = add i 1
+  end
+  ew_i64 get g_em_tns 0
+  if ne get g_ecd 3 0
+    ret EST_ERR_ENCODING
+  end
+  ans_hash_dom_ebuf t_est_dom_model get g_ecd 1 did
+  ret EST_OK
+end
+
+fn est_digest_obs did ulong to long
+  m = get g_eo_m 0
+  ew_init 2304
+  ew_hdr 2
+  ew_u32 m
+  i = ulong 0
+  while lt i m
+    ew_u32 get g_eo_u i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i m
+    ew_f64 get g_eo_z i
+    i = add i 1
+  end
+  mm_ = mul m m
+  i = ulong 0
+  while lt i mm_
+    ew_f64 get g_eo_R i
+    i = add i 1
+  end
+  ew_i64 get g_eo_tn 0
+  ew_u64 get g_eo_sq 0
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_eo_src i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_eo_ev i
+    i = add i 1
+  end
+  if ne get g_ecd 3 0
+    ret EST_ERR_ENCODING
+  end
+  ans_hash_dom_ebuf t_est_dom_obs get g_ecd 1 did
+  ret EST_OK
+end
+
+fn est_digest_pred pid ulong did ulong to long
+  ew_init 2304
+  ew_hdr 4
+  po = mul pid 32
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_ep_pr add po i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    ew_u8 get g_ep_md add po i
+    i = add i 1
+  end
+  ew_u32 get g_ep_hz pid
+  ew_u64 get g_ep_gn pid
+  ew_i64 get g_ep_tn pid
+  n = get g_ep_n pid
+  m = get g_ep_m pid
+  ew_u32 n
+  ew_u32 m
+  xo = mul pid 8
+  i = ulong 0
+  while lt i n
+    ew_f64 get g_ep_x add xo i
+    i = add i 1
+  end
+  mo = mul pid 64
+  nn = mul n n
+  i = ulong 0
+  while lt i nn
+    ew_f64 get g_ep_P add mo i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i m
+    ew_f64 get g_ep_ym add xo i
+    i = add i 1
+  end
+  mm_ = mul m m
+  i = ulong 0
+  while lt i mm_
+    ew_f64 get g_ep_S add mo i
+    i = add i 1
+  end
+  hc = get g_ep_hc pid
+  ew_u32 hc
+  if ne hc 0
+    i = ulong 0
+    while lt i n
+      ew_f64 get g_ep_Bu add xo i
+      i = add i 1
+    end
+  end
+  if ne get g_ecd 3 0
+    ret EST_ERR_ENCODING
+  end
+  ans_hash_dom_ebuf t_est_dom_pred get g_ecd 1 did
+  ret EST_OK
+end
+
+fn est_evr_extend root_did ulong obs_did ulong out_did ulong to void
+  ans_sha_init
+  ans_sha_lit t_est_dom_broot
+  ans_sha_byte 0
+  or_ = mul root_did 32
+  i = ulong 0
+  while lt i 32
+    ans_sha_byte get g_dg add or_ i
+    i = add i 1
+  end
+  oo = mul obs_did 32
+  i = ulong 0
+  while lt i 32
+    ans_sha_byte get g_dg add oo i
+    i = add i 1
+  end
+  ans_sha_final out_did
+end
+
+note ---- EST-1 linear Kalman filter (for ANS: n = m = 4, F = H = I) ----
+fn est_build_ans_model rid ulong qval f64 to void
+  put g_em_meta 0 ANS_DIM
+  put g_em_meta 1 ANS_DIM
+  put g_em_meta 2 1
+  put g_em_meta 3 1
+  put g_em_tns 0 1
+  i = ulong 0
+  while lt i 64
+    put g_em_F i 0.0
+    put g_em_Q i 0.0
+    put g_em_H i 0.0
+    put g_em_R i 0.0
+    i = add i 1
+  end
+  rfix = get g_ref_r add mul rid 3 ANS_SENSOR_FIX
+  i = ulong 0
+  while lt i ANS_DIM
+    put g_em_su i EST_UNIT_DIMENSIONLESS
+    put g_em_ou i EST_UNIT_DIMENSIONLESS
+    d = add mul i ANS_DIM i
+    put g_em_F d 1.0
+    put g_em_H d 1.0
+    put g_em_Q d qval
+    put g_em_R d rfix
+    i = add i 1
+  end
+end
+
+fn est_copy_belief dst ulong src ulong to void
+  put g_b_n dst get g_b_n src
+  put g_b_gen dst get g_b_gen src
+  put g_b_tns dst get g_b_tns src
+  db = mul dst 8
+  sb = mul src 8
+  i = ulong 0
+  while lt i 8
+    put g_b_unit add db i get g_b_unit add sb i
+    put g_b_x add db i get g_b_x add sb i
+    i = add i 1
+  end
+  dp = mul dst 64
+  sp = mul src 64
+  i = ulong 0
+  while lt i 64
+    put g_b_P add dp i get g_b_P add sp i
+    i = add i 1
+  end
+  dm = mul dst 32
+  sm = mul src 32
+  i = ulong 0
+  while lt i 32
+    put g_b_mdl add dm i get g_b_mdl add sm i
+    put g_b_par add dm i get g_b_par add sm i
+    put g_b_evr add dm i get g_b_evr add sm i
+    i = add i 1
+  end
+end
+
+fn est_rebind_belief dst ulong src ulong to long
+  est_copy_belief dst src
+  st = est_digest_model 20
+  if ne st 0
+    ret st
+  end
+  dm = mul dst 32
+  i = ulong 0
+  while lt i 32
+    put g_b_mdl add dm i get g_dg add 640 i
+    i = add i 1
+  end
+  ret EST_OK
+end
+
+fn est_kf_prior_ans bid ulong rid ulong to long
+  st = est_digest_model 20
+  if ne st 0
+    ret st
+  end
+  put g_b_n bid ANS_DIM
+  put g_b_gen bid 0
+  put g_b_tns bid 0
+  ub = mul bid 8
+  pb = mul bid 64
+  i = ulong 0
+  while lt i 64
+    put g_b_P add pb i 0.0
+    i = add i 1
+  end
+  rfix = get g_ref_r add mul rid 3 ANS_SENSOR_FIX
+  i = ulong 0
+  while lt i ANS_DIM
+    put g_b_unit add ub i EST_UNIT_DIMENSIONLESS
+    put g_b_x add ub i 0.0
+    put g_b_P add pb add mul i ANS_DIM i rfix
+    i = add i 1
+  end
+  mb = mul bid 32
+  i = ulong 0
+  while lt i 32
+    put g_b_mdl add mb i get g_dg add 640 i
+    put g_b_par add mb i 0
+    put g_b_evr add mb i 0
+    i = add i 1
+  end
+  ret est_check_belief bid
+end
+
+note Single-step predict for current g_em model (F = H = I, horizon = 1, Bu = NULL)
+fn est_kf_predict1 bid ulong to long
+  st = est_check_belief bid
+  if ne st 0
+    ret st
+  end
+  st = est_digest_belief bid 21
+  if ne st 0
+    ret st
+  end
+  put g_ep_hz 0 1
+  put g_ep_gn 0 add get g_b_gen bid 1
+  put g_ep_tn 0 add get g_b_tns bid get g_em_tns 0
+  put g_ep_n 0 ANS_DIM
+  put g_ep_m 0 ANS_DIM
+  put g_ep_hc 0 0
+  mb = mul bid 32
+  i = ulong 0
+  while lt i 32
+    put g_ep_pr i get g_dg add 672 i
+    put g_ep_md i get g_b_mdl add mb i
+    i = add i 1
+  end
+  ub = mul bid 8
+  pb = mul bid 64
+  i = ulong 0
+  while lt i ANS_DIM
+    xv = get g_b_x add ub i
+    put g_ep_x i xv
+    put g_ep_ym i xv
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 16
+    pv = add get g_b_P add pb i get g_em_Q i
+    put g_la_P2 i pv
+    i = add i 1
+  end
+  est_sym_la_P2 ANS_DIM
+  i = ulong 0
+  while lt i 16
+    pv = get g_la_P2 i
+    put g_ep_P i pv
+    put g_la_S i add pv get g_em_R i
+    i = add i 1
+  end
+  est_sym_la_S ANS_DIM
+  i = ulong 0
+  while lt i 16
+    put g_ep_S i get g_la_S i
+    i = add i 1
+  end
+  ret EST_OK
+end
+
+fn est_kf_coast1 bid ulong out_bid ulong to long
+  st = est_digest_pred 0 22
+  if ne st 0
+    ret st
+  end
+  put g_b_n out_bid ANS_DIM
+  put g_b_gen out_bid add get g_ep_gn 0 1
+  put g_b_tns out_bid get g_ep_tn 0
+  ub = mul out_bid 8
+  i = ulong 0
+  while lt i ANS_DIM
+    put g_b_unit add ub i EST_UNIT_DIMENSIONLESS
+    put g_b_x add ub i get g_ep_x i
+    i = add i 1
+  end
+  pb = mul out_bid 64
+  i = ulong 0
+  while lt i 16
+    put g_b_P add pb i get g_ep_P i
+    i = add i 1
+  end
+  om = mul out_bid 32
+  bm = mul bid 32
+  i = ulong 0
+  while lt i 32
+    put g_b_mdl add om i get g_b_mdl add bm i
+    put g_b_par add om i get g_dg add 704 i
+    put g_b_evr add om i get g_b_evr add bm i
+    i = add i 1
+  end
+  ret est_check_belief out_bid
+end
+
+fn est_kf_check_ev_kind bid ulong to bool
+  note Refuse if obs.evidence equals pdig(22), priordig(21), parent, evr, or model
+  bm = mul bid 32
+  e0 = true
+  e1 = true
+  e2 = true
+  e3 = true
+  e4 = true
+  i = ulong 0
+  while lt i 32
+    ev = get g_eo_ev i
+    if ne ev get g_dg add 704 i
+      e0 = false
+    end
+    if ne ev get g_dg add 672 i
+      e1 = false
+    end
+    if ne ev get g_b_par add bm i
+      e2 = false
+    end
+    if ne ev get g_b_evr add bm i
+      e3 = false
+    end
+    if ne ev get g_b_mdl add bm i
+      e4 = false
+    end
+    i = add i 1
+  end
+  if or e0 or e1 or e2 or e3 e4
+    ret false
+  end
+  ret true
+end
+
+fn est_kf_gain_x out_bid ulong to void
+  i = ulong 0
+  while lt i 4
+    j = ulong 0
+    while lt j 4
+      put g_la_v1 j get g_ep_P add mul i 4 j
+      j = add j 1
+    end
+    est_fwd_v1_to_v2 4
+    est_bwd_v2_to_v3 4
+    j = ulong 0
+    while lt j 4
+      put g_la_K add mul i 4 j get g_la_v3 j
+      j = add j 1
+    end
+    i = add i 1
+  end
+  ub = mul out_bid 8
+  i = ulong 0
+  while lt i 4
+    s = f64 0.0
+    j = ulong 0
+    while lt j 4
+      kv = get g_la_K add mul i 4 j
+      nv = get g_ei_nu j
+      s = add s mul kv nv
+      j = add j 1
+    end
+    put g_b_x add ub i add get g_ep_x i s
+    put g_b_unit add ub i EST_UNIT_DIMENSIONLESS
+    i = add i 1
+  end
+end
+
+fn est_kf_joseph_a to void
+  i = ulong 0
+  while lt i 4
+    j = ulong 0
+    while lt j 4
+      d = f64 0.0
+      if eq i j
+        d = 1.0
+      end
+      put g_la_A add mul i 4 j sub d get g_la_K add mul i 4 j
+      j = add j 1
+    end
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 4
+    j = ulong 0
+    while lt j 4
+      s = f64 0.0
+      k = ulong 0
+      while lt k 4
+        a = get g_la_A add mul i 4 k
+        b = get g_ep_P add mul k 4 j
+        s = add s mul a b
+        k = add k 1
+      end
+      put g_la_T add mul i 4 j s
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+fn est_kf_joseph_p1kr to void
+  i = ulong 0
+  while lt i 4
+    j = ulong 0
+    while lt j 4
+      s = f64 0.0
+      s2 = f64 0.0
+      k = ulong 0
+      while lt k 4
+        a = get g_la_T add mul i 4 k
+        b = get g_la_A add mul j 4 k
+        s = add s mul a b
+        a = get g_la_K add mul i 4 k
+        b = get g_eo_R add mul k 4 j
+        s2 = add s2 mul a b
+        k = add k 1
+      end
+      put g_la_P1 add mul i 4 j s
+      put g_la_KR add mul i 4 j s2
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+fn est_kf_joseph_p2 out_bid ulong to void
+  i = ulong 0
+  while lt i 4
+    j = ulong 0
+    while lt j 4
+      s = f64 0.0
+      k = ulong 0
+      while lt k 4
+        a = get g_la_KR add mul i 4 k
+        b = get g_la_K add mul j 4 k
+        s = add s mul a b
+        k = add k 1
+      end
+      idx = add mul i 4 j
+      v = add get g_la_P1 idx s
+      put g_la_P2 idx v
+      j = add j 1
+    end
+    i = add i 1
+  end
+  est_sym_la_P2 4
+  pb = mul out_bid 64
+  i = ulong 0
+  while lt i 16
+    put g_b_P add pb i get g_la_P2 i
+    i = add i 1
+  end
+end
+
+fn est_kf_gain_and_joseph out_bid ulong to void
+  est_kf_gain_x out_bid
+  est_kf_joseph_a
+  est_kf_joseph_p1kr
+  est_kf_joseph_p2 out_bid
+end
+
+fn est_kf_update1 bid ulong out_bid ulong to long
+  st = est_digest_pred 0 22
+  if ne st 0
+    ret st
+  end
+  if not est_kf_check_ev_kind bid
+    ret EST_ERR_KIND
+  end
+  st = est_digest_obs 23
+  if ne st 0
+    ret st
+  end
+  bm = mul bid 32
+  i = ulong 0
+  while lt i 32
+    put g_dg add 768 i get g_b_evr add bm i
+    i = add i 1
+  end
+  est_evr_extend 24 23 25
+  i = ulong 0
+  while lt i 4
+    nu = sub get g_eo_z i get g_ep_x i
+    put g_ei_nu i nu
+    put g_la_v1 i nu
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 16
+    put g_la_S i add get g_ep_P i get g_eo_R i
+    i = add i 1
+  end
+  est_sym_la_S 4
+  if not est_chol_S 4
+    ret EST_ERR_NOT_PD
+  end
+  est_fwd_v1_to_v2 4
+  nis = f64 0.0
+  i = ulong 0
+  while lt i 4
+    yv = get g_la_v2 i
+    nis = add nis mul yv yv
+    i = add i 1
+  end
+  put g_ei_nis 0 nis
+  put g_ei_m 0 4
+  put g_ei_tn 0 get g_ep_tn 0
+  est_kf_gain_and_joseph out_bid
+  put g_b_n out_bid 4
+  put g_b_gen out_bid add get g_ep_gn 0 1
+  put g_b_tns out_bid get g_ep_tn 0
+  om = mul out_bid 32
+  i = ulong 0
+  while lt i 32
+    put g_b_mdl add om i get g_b_mdl add bm i
+    put g_b_par add om i get g_dg add 704 i
+    put g_b_evr add om i get g_dg add 800 i
+    i = add i 1
+  end
+  ret est_check_belief out_bid
+end
+
+note ---- ANS wire codec (g_wire / g_cd) ----
+fn aw_init cap ulong to void
+  put g_cd 0 0
+  put g_cd 1 0
+  put g_cd 2 cap
+  put g_cd 3 0
+end
+
+fn aw_u8 b uchar to void
+  if ne get g_cd 3 0
+    ret
+  end
+  ln = get g_cd 1
+  if ge ln get g_cd 2
+    put g_cd 3 1
+    ret
+  end
+  put g_wire ln b
+  put g_cd 1 add ln 1
+end
+
+fn aw_u32 v ulong to void
+  aw_u8 uchar and v 255
+  aw_u8 uchar and shr v 8 255
+  aw_u8 uchar and shr v 16 255
+  aw_u8 uchar and shr v 24 255
+end
+
+fn aw_u64 v ulong to void
+  i = ulong 0
+  while lt i 8
+    aw_u8 uchar and shr v mul i 8 255
+    i = add i 1
+  end
+end
+
+fn aw_i64 v long to void
+  aw_u64 bitcast ulong v
+end
+
+fn aw_f64 v f64 to void
+  aw_u64 f64_canon_bits v
+end
+
+fn aw_hdr kind ulong to void
+  aw_u8 79
+  aw_u8 65
+  aw_u8 78
+  aw_u8 83
+  aw_u8 uchar kind
+  aw_u8 1
+  aw_u8 0
+  aw_u8 0
+end
+
+fn ar_init length ulong to void
+  put g_cd 0 0
+  put g_cd 1 length
+  put g_cd 2 length
+  put g_cd 3 0
+end
+
+fn ar_need n ulong to bool
+  if ne get g_cd 3 0
+    ret false
+  end
+  if gt n sub get g_cd 1 get g_cd 0
+    put g_cd 3 1
+    ret false
+  end
+  ret true
+end
+
+fn ar_u8 to uchar
+  if not ar_need 1
+    ret 0
+  end
+  p = get g_cd 0
+  put g_cd 0 add p 1
+  ret get g_wire p
+end
+
+fn ar_u32 to ulong
+  if not ar_need 4
+    ret 0
+  end
+  p = get g_cd 0
+  put g_cd 0 add p 4
+  b0 = ulong get g_wire p
+  b1 = ulong get g_wire add p 1
+  b2 = ulong get g_wire add p 2
+  b3 = ulong get g_wire add p 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn ar_u64 to ulong
+  if not ar_need 8
+    ret 0
+  end
+  p = get g_cd 0
+  put g_cd 0 add p 8
+  r = ulong 0
+  i = ulong 0
+  while lt i 8
+    r = or r shl ulong get g_wire add p i mul i 8
+    i = add i 1
+  end
+  ret r
+end
+
+fn ar_f64 to f64
+  ret bitcast f64 ar_u64
+end
+
+fn ar_ok_done to bool
+  if ne get g_cd 3 0
+    ret false
+  end
+  ret eq get g_cd 0 get g_cd 1
+end
+
+fn ar_hdr kind ulong to bool
+  if not ar_need 8
+    ret false
+  end
+  p = get g_cd 0
+  put g_cd 0 add p 8
+  if or ne get g_wire p 79 ne get g_wire add p 1 65
+    put g_cd 3 1
+    ret false
+  end
+  if or ne get g_wire add p 2 78 ne get g_wire add p 3 83
+    put g_cd 3 1
+    ret false
+  end
+  if or ne ulong get g_wire add p 4 kind ne get g_wire add p 5 1
+    put g_cd 3 1
+    ret false
+  end
+  if or ne get g_wire add p 6 0 ne get g_wire add p 7 0
+    put g_cd 3 1
+    ret false
+  end
+  ret true
+end
+
+note ---- ANS validation & component mapping ----
+fn ans_component_atom comp ulong to ulong
+  if eq comp 0
+    ret ANS_ATOM_GOAL_IDENTITY
+  end
+  if eq comp 1
+    ret ANS_ATOM_CONSENT
+  end
+  if eq comp 2
+    ret ANS_ATOM_PROVENANCE
+  end
+  if eq comp 3
+    ret ANS_ATOM_SCOPE
+  end
+  ret ANS_ATOM_AUTHORITY
+end
+
+fn ans_ref_val_scalars rid ulong to long
+  rb = mul rid 3
+  r0 = get g_ref_r rb
+  r1 = get g_ref_r add rb 1
+  r2 = get g_ref_r add rb 2
+  if or not f64_is_finite r0 or not f64_is_finite r1 not f64_is_finite r2
+    ret ANS_ERR_REFERENCE
+  end
+  if or le r2 0.0 or ge r2 r1 ge r1 r0
+    ret ANS_ERR_REFERENCE
+  end
+  r0 = get g_ref_tsig rb
+  r1 = get g_ref_tsig add rb 1
+  r2 = get g_ref_tsig add rb 2
+  if or not f64_is_finite r0 or not f64_is_finite r1 not f64_is_finite r2
+    ret ANS_ERR_REFERENCE
+  end
+  if or le r0 0.0 or ge r0 r1 ge r1 r2
+    ret ANS_ERR_REFERENCE
+  end
+  r0 = get g_ref_nis rid
+  r1 = get g_ref_prom rid
+  if or not f64_is_finite r0 not f64_is_finite r1
+    ret ANS_ERR_REFERENCE
+  end
+  if or le r0 0.0 le r1 0.0
+    ret ANS_ERR_REFERENCE
+  end
+  ret ANS_OK
+end
+
+fn ans_reference_validate rid ulong to long
+  if eq get g_ref_ver rid 0
+    ret ANS_ERR_REFERENCE
+  end
+  lb = mul rid 10
+  i = ulong 0
+  while lt i 10
+    v = get g_ref_lim add lb i
+    if not f64_is_finite v
+      ret ANS_ERR_REFERENCE
+    end
+    if le v 0.0
+      ret ANS_ERR_REFERENCE
+    end
+    i = add i 1
+  end
+  lb = mul rid 5
+  i = ulong 0
+  while lt i 5
+    v = get g_ref_q add lb i
+    if not f64_is_finite v
+      ret ANS_ERR_REFERENCE
+    end
+    if le v 0.0
+      ret ANS_ERR_REFERENCE
+    end
+    i = add i 1
+  end
+  ret ans_ref_val_scalars rid
+end
+
+fn ans_chk_action aid ulong to long
+  if ge get g_act_kind aid ANS_ACT_KINDS
+    ret ANS_ERR_RANGE
+  end
+  r = get g_act_risk aid
+  if not f64_is_finite r
+    ret ANS_ERR_NONFINITE
+  end
+  if or lt r 0.0 gt r 1.0
+    ret ANS_ERR_RANGE
+  end
+  tb = mul aid 10
+  i = ulong 0
+  while lt i 10
+    if gt get g_act_tch add tb i 1
+      ret ANS_ERR_RANGE
+    end
+    i = add i 1
+  end
+  ib = mul aid 32
+  z = true
+  i = ulong 0
+  while lt i 32
+    if ne get g_act_id add ib i 0
+      z = false
+      break
+    end
+    i = add i 1
+  end
+  if z
+    ret ANS_ERR_EVIDENCE
+  end
+  ret ANS_OK
+end
+
+fn ans_chk_meas mid ulong to long
+  if ge get g_ms_cls mid ANS_SENSOR_KINDS
+    ret ANS_ERR_SENSOR
+  end
+  zb = mul mid 4
+  i = ulong 0
+  while lt i 4
+    if not f64_is_finite get g_ms_z add zb i
+      ret ANS_ERR_NONFINITE
+    end
+    i = add i 1
+  end
+  ret ANS_OK
+end
+
+fn ans_chk_state sid ulong to long
+  if or ne est_check_belief sid 0 ne get g_b_n sid ANS_DIM
+    ret ANS_ERR_EST
+  end
+  r = get g_st_risk sid
+  ln = get g_st_lnis sid
+  if or not f64_is_finite r not f64_is_finite ln
+    ret ANS_ERR_NONFINITE
+  end
+  if or lt r 0.0 or gt r 1.0 gt get g_st_dis sid 1
+    ret ANS_ERR_RANGE
+  end
+  ret ANS_OK
+end
+
+fn ans_chk_verdict vid ulong to long
+  if or gt get g_vd_tier vid ANS_TIER_HALT_REQUEST_FIX gt get g_vd_dis vid 1
+    ret ANS_ERR_RANGE
+  end
+  if or not f64_is_finite get g_vd_D vid or not f64_is_finite get g_vd_mn vid not f64_is_finite get g_vd_sig vid
+    ret ANS_ERR_NONFINITE
+  end
+  ret ANS_OK
+end
+
+fn ans_chk_promo pid ulong to long
+  if gt get g_pr_res pid ANS_PROMOTE_REFUSED_SELF_MOD
+    ret ANS_ERR_RANGE
+  end
+  if not f64_is_finite get g_pr_D pid
+    ret ANS_ERR_NONFINITE
+  end
+  ret ANS_OK
+end
+
+note ---- ANS Encoders & Decoders (6 record types) ----
+fn ans_encode_reference rid ulong cap ulong zero_froz bool to long
+  if gt get g_ref_froz rid 1
+    ret ANS_ERR_RANGE
+  end
+  st = ans_reference_validate rid
+  if ne st 0
+    ret st
+  end
+  aw_init cap
+  aw_hdr 1
+  aw_u32 get g_ref_ver rid
+  lb = mul rid 10
+  i = ulong 0
+  while lt i 10
+    aw_f64 get g_ref_lim add lb i
+    i = add i 1
+  end
+  qb = mul rid 5
+  i = ulong 0
+  while lt i 5
+    aw_f64 get g_ref_q add qb i
+    i = add i 1
+  end
+  rb = mul rid 3
+  i = ulong 0
+  while lt i 3
+    aw_f64 get g_ref_r add rb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 3
+    aw_f64 get g_ref_tsig add rb i
+    i = add i 1
+  end
+  aw_f64 get g_ref_nis rid
+  aw_f64 get g_ref_prom rid
+  if zero_froz
+    aw_u8 0
+  else
+    aw_u8 uchar get g_ref_froz rid
+  end
+  if ne get g_cd 3 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_decode_reference rid ulong length ulong to long
+  if gt length ANS_ENCODED_MAX
+    ret ANS_ERR_ENCODING
+  end
+  ar_init length
+  if not ar_hdr 1
+    ret ANS_ERR_ENCODING
+  end
+  put g_ref_ver rid ar_u32
+  lb = mul rid 10
+  i = ulong 0
+  while lt i 10
+    put g_ref_lim add lb i ar_f64
+    i = add i 1
+  end
+  qb = mul rid 5
+  i = ulong 0
+  while lt i 5
+    put g_ref_q add qb i ar_f64
+    i = add i 1
+  end
+  rb = mul rid 3
+  i = ulong 0
+  while lt i 3
+    put g_ref_r add rb i ar_f64
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 3
+    put g_ref_tsig add rb i ar_f64
+    i = add i 1
+  end
+  put g_ref_nis rid ar_f64
+  put g_ref_prom rid ar_f64
+  put g_ref_froz rid ulong ar_u8
+  if not ar_ok_done
+    ret ANS_ERR_ENCODING
+  end
+  if gt get g_ref_froz rid 1
+    ret ANS_ERR_ENCODING
+  end
+  st = ans_reference_validate rid
+  if ne st 0
+    if eq st ANS_ERR_REFERENCE
+      ret ANS_ERR_REFERENCE
+    end
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_encode_action aid ulong cap ulong to long
+  st = ans_chk_action aid
+  if ne st 0
+    ret st
+  end
+  aw_init cap
+  aw_hdr 2
+  aw_u32 get g_act_kind aid
+  ib = mul aid 32
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_act_id add ib i
+    i = add i 1
+  end
+  aw_f64 get g_act_risk aid
+  tb = mul aid 10
+  i = ulong 0
+  while lt i 10
+    aw_u32 get g_act_tch add tb i
+    i = add i 1
+  end
+  if ne get g_cd 3 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_decode_action aid ulong length ulong to long
+  if gt length ANS_ENCODED_MAX
+    ret ANS_ERR_ENCODING
+  end
+  ar_init length
+  if not ar_hdr 2
+    ret ANS_ERR_ENCODING
+  end
+  put g_act_kind aid ar_u32
+  ib = mul aid 32
+  i = ulong 0
+  while lt i 32
+    put g_act_id add ib i ar_u8
+    i = add i 1
+  end
+  put g_act_risk aid ar_f64
+  tb = mul aid 10
+  i = ulong 0
+  while lt i 10
+    put g_act_tch add tb i ar_u32
+    i = add i 1
+  end
+  if not ar_ok_done
+    ret ANS_ERR_ENCODING
+  end
+  if ne ans_chk_action aid 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_encode_measurement mid ulong cap ulong to long
+  st = ans_chk_meas mid
+  if ne st 0
+    ret st
+  end
+  aw_init cap
+  aw_hdr 3
+  aw_u32 get g_ms_cls mid
+  zb = mul mid 4
+  i = ulong 0
+  while lt i 4
+    aw_f64 get g_ms_z add zb i
+    i = add i 1
+  end
+  mb = mul mid 32
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_ms_src add mb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_ms_ev add mb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_ms_ref add mb i
+    i = add i 1
+  end
+  aw_i64 get g_ms_tns mid
+  aw_u64 get g_ms_seq mid
+  if ne get g_cd 3 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_decode_measurement mid ulong length ulong to long
+  if gt length ANS_ENCODED_MAX
+    ret ANS_ERR_ENCODING
+  end
+  ar_init length
+  if not ar_hdr 3
+    ret ANS_ERR_ENCODING
+  end
+  put g_ms_cls mid ar_u32
+  zb = mul mid 4
+  i = ulong 0
+  while lt i 4
+    put g_ms_z add zb i ar_f64
+    i = add i 1
+  end
+  mb = mul mid 32
+  i = ulong 0
+  while lt i 32
+    put g_ms_src add mb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_ms_ev add mb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_ms_ref add mb i ar_u8
+    i = add i 1
+  end
+  put g_ms_tns mid bitcast long ar_u64
+  put g_ms_seq mid ar_u64
+  if not ar_ok_done
+    ret ANS_ERR_ENCODING
+  end
+  if ne ans_chk_meas mid 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_encode_state_head sid ulong to void
+  sb = mul sid 32
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_st_goal add sb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_st_cons add sb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_st_int add sb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_st_evr add sb i
+    i = add i 1
+  end
+end
+
+fn ans_encode_state_tail sid ulong to void
+  aw_f64 get g_st_risk sid
+  sb = mul sid 32
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_st_prov add sb i
+    i = add i 1
+  end
+  aw_u64 get g_st_gen sid
+  aw_u64 get g_st_sfix sid
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_st_lref add sb i
+    i = add i 1
+  end
+  aw_f64 get g_st_lnis sid
+  aw_u8 uchar get g_st_dis sid
+  aw_u64 get g_st_smst sid
+  aw_u64 get g_st_smuf sid
+end
+
+fn ans_encode_state sid ulong cap ulong to long
+  st = ans_chk_state sid
+  if ne st 0
+    ret st
+  end
+  aw_init cap
+  aw_hdr 4
+  ans_encode_state_head sid
+  if ne est_encode_belief sid 0
+    ret ANS_ERR_ENCODING
+  end
+  bl = get g_ecd 1
+  aw_u32 bl
+  i = ulong 0
+  while lt i bl
+    aw_u8 get g_ebuf i
+    i = add i 1
+  end
+  ans_encode_state_tail sid
+  if ne get g_cd 3 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_decode_state_head sid ulong to void
+  sb = mul sid 32
+  i = ulong 0
+  while lt i 32
+    put g_st_goal add sb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_st_cons add sb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_st_int add sb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_st_evr add sb i ar_u8
+    i = add i 1
+  end
+end
+
+fn ans_decode_state_tail sid ulong to void
+  put g_st_risk sid ar_f64
+  sb = mul sid 32
+  i = ulong 0
+  while lt i 32
+    put g_st_prov add sb i ar_u8
+    i = add i 1
+  end
+  put g_st_gen sid ar_u64
+  put g_st_sfix sid ar_u64
+  i = ulong 0
+  while lt i 32
+    put g_st_lref add sb i ar_u8
+    i = add i 1
+  end
+  put g_st_lnis sid ar_f64
+  put g_st_dis sid ulong ar_u8
+  put g_st_smst sid ar_u64
+  put g_st_smuf sid ar_u64
+end
+
+fn ans_decode_state sid ulong length ulong to long
+  if gt length ANS_ENCODED_MAX
+    ret ANS_ERR_ENCODING
+  end
+  ar_init length
+  if not ar_hdr 4
+    ret ANS_ERR_ENCODING
+  end
+  ans_decode_state_head sid
+  bl = ar_u32
+  if or ne get g_cd 3 0 gt bl 2304
+    ret ANS_ERR_ENCODING
+  end
+  i = ulong 0
+  while lt i bl
+    put g_ebuf i ar_u8
+    i = add i 1
+  end
+  if ne get g_cd 3 0
+    ret ANS_ERR_ENCODING
+  end
+  if ne est_decode_belief sid bl 0
+    ret ANS_ERR_ENCODING
+  end
+  ans_decode_state_tail sid
+  if not ar_ok_done
+    ret ANS_ERR_ENCODING
+  end
+  if ne ans_chk_state sid 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_encode_verdict vid ulong cap ulong zero_dig bool to long
+  st = ans_chk_verdict vid
+  if ne st 0
+    ret st
+  end
+  aw_init cap
+  aw_hdr 5
+  aw_u32 get g_vd_tier vid
+  aw_f64 get g_vd_D vid
+  aw_f64 get g_vd_mn vid
+  aw_f64 get g_vd_sig vid
+  aw_u64 get g_vd_sfix vid
+  aw_u8 uchar get g_vd_dis vid
+  vb = mul vid 32
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_vd_st add vb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_vd_ref add vb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    if zero_dig
+      aw_u8 0
+    else
+      aw_u8 get g_vd_dig add vb i
+    end
+    i = add i 1
+  end
+  if ne get g_cd 3 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_decode_verdict vid ulong length ulong to long
+  if gt length ANS_ENCODED_MAX
+    ret ANS_ERR_ENCODING
+  end
+  ar_init length
+  if not ar_hdr 5
+    ret ANS_ERR_ENCODING
+  end
+  put g_vd_tier vid ar_u32
+  put g_vd_D vid ar_f64
+  put g_vd_mn vid ar_f64
+  put g_vd_sig vid ar_f64
+  put g_vd_sfix vid ar_u64
+  put g_vd_dis vid ulong ar_u8
+  vb = mul vid 32
+  i = ulong 0
+  while lt i 32
+    put g_vd_st add vb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_vd_ref add vb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_vd_dig add vb i ar_u8
+    i = add i 1
+  end
+  if not ar_ok_done
+    ret ANS_ERR_ENCODING
+  end
+  if ne ans_chk_verdict vid 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_encode_promo pid ulong cap ulong zero_dig bool to long
+  st = ans_chk_promo pid
+  if ne st 0
+    ret st
+  end
+  aw_init cap
+  aw_hdr 6
+  aw_u32 get g_pr_res pid
+  aw_f64 get g_pr_D pid
+  pb = mul pid 32
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_pr_cand add pb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_pr_ref add pb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_pr_tst add pb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    aw_u8 get g_pr_st add pb i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    if zero_dig
+      aw_u8 0
+    else
+      aw_u8 get g_pr_dig add pb i
+    end
+    i = add i 1
+  end
+  if ne get g_cd 3 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+fn ans_decode_promo pid ulong length ulong to long
+  if gt length ANS_ENCODED_MAX
+    ret ANS_ERR_ENCODING
+  end
+  ar_init length
+  if not ar_hdr 6
+    ret ANS_ERR_ENCODING
+  end
+  put g_pr_res pid ar_u32
+  put g_pr_D pid ar_f64
+  pb = mul pid 32
+  i = ulong 0
+  while lt i 32
+    put g_pr_cand add pb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_pr_ref add pb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_pr_tst add pb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_pr_st add pb i ar_u8
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    put g_pr_dig add pb i ar_u8
+    i = add i 1
+  end
+  if not ar_ok_done
+    ret ANS_ERR_ENCODING
+  end
+  if ne ans_chk_promo pid 0
+    ret ANS_ERR_ENCODING
+  end
+  ret ANS_OK
+end
+
+note ---- ANS Digests & Provenance ----
+fn ans_provenance_extend prev_did ulong tag view uchar * rec_did ulong out_did ulong to void
+  ans_sha_init
+  ans_sha_lit t_ans_dom_prov
+  ans_sha_byte 0
+  op = mul prev_did 32
+  i = ulong 0
+  while lt i 32
+    ans_sha_byte get g_dg add op i
+    i = add i 1
+  end
+  ans_sha_lit tag
+  or_ = mul rec_did 32
+  i = ulong 0
+  while lt i 32
+    ans_sha_byte get g_dg add or_ i
+    i = add i 1
+  end
+  ans_sha_final out_did
+end
+
+fn ans_digest_reference rid ulong did ulong to long
+  st = ans_encode_reference rid ANS_ENCODED_MAX true
+  if ne st 0
+    ret st
+  end
+  ans_hash_dom_wire t_ans_dom_ref get g_cd 1 did
+  ret ANS_OK
+end
+
+fn ans_digest_action aid ulong did ulong to long
+  st = ans_encode_action aid ANS_ENCODED_MAX
+  if ne st 0
+    ret st
+  end
+  ans_hash_dom_wire t_ans_dom_act get g_cd 1 did
+  ret ANS_OK
+end
+
+fn ans_digest_measurement mid ulong did ulong to long
+  st = ans_encode_measurement mid ANS_ENCODED_MAX
+  if ne st 0
+    ret st
+  end
+  ans_hash_dom_wire t_ans_dom_meas get g_cd 1 did
+  ret ANS_OK
+end
+
+fn ans_digest_state sid ulong did ulong to long
+  st = ans_encode_state sid ANS_ENCODED_MAX
+  if ne st 0
+    ret st
+  end
+  ans_hash_dom_wire t_ans_dom_state get g_cd 1 did
+  ret ANS_OK
+end
+
+fn ans_digest_verdict vid ulong did ulong to long
+  st = ans_encode_verdict vid ANS_ENCODED_MAX true
+  if ne st 0
+    ret st
+  end
+  ans_hash_dom_wire t_ans_dom_verd get g_cd 1 did
+  ret ANS_OK
+end
+
+fn ans_digest_promo pid ulong did ulong to long
+  st = ans_encode_promo pid ANS_ENCODED_MAX true
+  if ne st 0
+    ret st
+  end
+  ans_hash_dom_wire t_ans_dom_promo get g_cd 1 did
+  ret ANS_OK
+end
+
+note ---- ANS Reference Freeze & Check ----
+fn ans_reference_freeze rid ulong out_did ulong to long
+  st = ans_reference_validate rid
+  if ne st 0
+    ret st
+  end
+  st = ans_digest_reference rid 26
+  if ne st 0
+    ret st
+  end
+  put g_ref_froz rid 1
+  dg_copy out_did 26
+  ret ANS_OK
+end
+
+fn ans_reference_check rid ulong exp_did ulong to long
+  if ne get g_ref_froz rid 1
+    ret ANS_ERR_REFERENCE
+  end
+  if ne ans_reference_validate rid 0
+    ret ANS_ERR_REFERENCE
+  end
+  if ne ans_digest_reference rid 26 0
+    ret ANS_ERR_REFERENCE
+  end
+  if not dg_eq 26 exp_did
+    ret ANS_ERR_REFERENCE
+  end
+  ret ANS_OK
+end
+
+fn ans_copy_state dst ulong src ulong to void
+  if eq dst src
+    ret
+  end
+  est_copy_belief dst src
+  put g_st_gen dst get g_st_gen src
+  put g_st_sfix dst get g_st_sfix src
+  put g_st_smst dst get g_st_smst src
+  put g_st_smuf dst get g_st_smuf src
+  put g_st_dis dst get g_st_dis src
+  put g_st_risk dst get g_st_risk src
+  put g_st_lnis dst get g_st_lnis src
+  ds = mul dst 32
+  ss = mul src 32
+  i = ulong 0
+  while lt i 32
+    put g_st_goal add ds i get g_st_goal add ss i
+    put g_st_cons add ds i get g_st_cons add ss i
+    put g_st_int add ds i get g_st_int add ss i
+    put g_st_evr add ds i get g_st_evr add ss i
+    put g_st_prov add ds i get g_st_prov add ss i
+    put g_st_lref add ds i get g_st_lref add ss i
+    i = add i 1
+  end
+end
+
+fn ans_guard rid ulong rdid ulong sid ulong to long
+  st = ans_reference_check rid rdid
+  if ne st 0
+    ret st
+  end
+  if or ne est_check_belief sid 0 ne get g_b_n sid ANS_DIM
+    ret ANS_ERR_EST
+  end
+  if or not f64_is_finite get g_st_risk sid not f64_is_finite get g_st_lnis sid
+    ret ANS_ERR_NONFINITE
+  end
+  sb = mul sid 32
+  do_ = mul rdid 32
+  i = ulong 0
+  while lt i 32
+    if ne get g_st_cons add sb i get g_dg add do_ i
+      ret ANS_ERR_REFERENCE
+    end
+    i = add i 1
+  end
+  ret ANS_OK
+end
+
+note ---- ANS State Machine ----
+fn ans_prior_fill_dids out_sid ulong goal_did ulong int_did ulong rdid ulong to void
+  sb = mul out_sid 32
+  go = mul goal_did 32
+  io = mul int_did 32
+  ro = mul rdid 32
+  i = ulong 0
+  while lt i 32
+    put g_st_goal add sb i get g_dg add go i
+    put g_st_int add sb i get g_dg add io i
+    put g_st_cons add sb i get g_dg add ro i
+    put g_st_evr add sb i get g_b_evr add sb i
+    put g_st_lref add sb i get g_dg add ro i
+    i = add i 1
+  end
+  dg_zero 27
+  ans_provenance_extend 27 t_tag_prior rdid 28
+  i = ulong 0
+  while lt i 32
+    put g_st_prov add sb i get g_dg add 896 i
+    i = add i 1
+  end
+end
+
+fn ans_state_prior rid ulong rdid ulong goal_did ulong int_did ulong out_sid ulong to long
+  put g_last_est 0 EST_OK
+  st = ans_reference_check rid rdid
+  if ne st 0
+    ret st
+  end
+  if or dg_is_zero goal_did dg_is_zero int_did
+    ret ANS_ERR_RANGE
+  end
+  est_build_ans_model rid get g_ref_q add mul rid 5 ANS_ACT_OBSERVE
+  es = est_kf_prior_ans 8 rid
+  if ne es 0
+    put g_last_est 0 es
+    ret ANS_ERR_EST
+  end
+  est_copy_belief out_sid 8
+  put g_st_gen out_sid 0
+  put g_st_sfix out_sid 0
+  put g_st_smst out_sid 0
+  put g_st_smuf out_sid 0
+  put g_st_dis out_sid 0
+  put g_st_risk out_sid 0.0
+  put g_st_lnis out_sid 0.0
+  ans_prior_fill_dids out_sid goal_did int_did rdid
+  ret ANS_OK
+end
+
+fn ans_step_refuse out_sid ulong to long
+  sb = ulong 224
+  i = ulong 0
+  while lt i 32
+    put g_dg add 864 i get g_st_prov add sb i
+    i = add i 1
+  end
+  ans_provenance_extend 27 t_tag_refused 29 28
+  i = ulong 0
+  while lt i 32
+    put g_st_prov add sb i get g_dg add 896 i
+    i = add i 1
+  end
+  put g_st_gen 7 add get g_st_gen 7 1
+  ans_copy_state out_sid 7
+  ret ANS_ERR_ATOM
+end
+
+fn ans_step_finish aid ulong out_sid ulong to void
+  sb = ulong 224
+  i = ulong 0
+  while lt i 32
+    put g_st_evr add sb i get g_b_evr add sb i
+    put g_dg add 864 i get g_st_prov add sb i
+    i = add i 1
+  end
+  put g_st_risk 7 get g_act_risk aid
+  put g_st_sfix 7 add get g_st_sfix 7 1
+  put g_st_gen 7 add get g_st_gen 7 1
+  tb = mul aid 10
+  if or eq get g_act_kind aid ANS_ACT_SELF_MODIFY ne get g_act_tch add tb ANS_ATOM_SELF_MODIFICATION_LIMITS 0
+    put g_st_smst 7 add get g_st_smst 7 1
+    put g_st_smuf 7 add get g_st_smuf 7 1
+  end
+  ans_provenance_extend 27 t_tag_action 29 28
+  i = ulong 0
+  while lt i 32
+    put g_st_prov add sb i get g_dg add 896 i
+    i = add i 1
+  end
+  ans_copy_state out_sid 7
+end
+
+fn ans_step rid ulong rdid ulong sid ulong aid ulong out_sid ulong to long
+  put g_last_est 0 EST_OK
+  st = ans_guard rid rdid sid
+  if ne st 0
+    ret st
+  end
+  st = ans_digest_action aid 29
+  if ne st 0
+    ret st
+  end
+  ans_copy_state 7 sid
+  tb = mul aid 10
+  if ne get g_act_tch add tb ANS_ATOM_SELF_MODIFICATION_LIMITS 0
+    lim = get g_ref_lim add mul rid 10 ANS_ATOM_SELF_MODIFICATION_LIMITS
+    if gt get g_act_risk aid lim
+      ret ans_step_refuse out_sid
+    end
+  end
+  ak = get g_act_kind aid
+  est_build_ans_model rid get g_ref_q add mul rid 5 ak
+  es = est_rebind_belief 9 sid
+  if eq es 0
+    es = est_kf_predict1 9
+  end
+  if eq es 0
+    es = est_kf_coast1 9 7
+  end
+  if ne es 0
+    put g_last_est 0 es
+    ret ANS_ERR_EST
+  end
+  ans_step_finish aid out_sid
+  ret ANS_OK
+end
+
+fn ans_meas_check_fields mid ulong rdid ulong to long
+  zb = mul mid 4
+  i = ulong 0
+  while lt i 4
+    if not f64_is_finite get g_ms_z add zb i
+      ret ANS_ERR_NONFINITE
+    end
+    i = add i 1
+  end
+  cls = get g_ms_cls mid
+  if ge cls ANS_SENSOR_KINDS
+    ret ANS_ERR_SENSOR
+  end
+  mb = mul mid 32
+  sz = true
+  ez = true
+  rz = true
+  rm = true
+  ro = mul rdid 32
+  i = ulong 0
+  while lt i 32
+    if ne get g_ms_src add mb i 0
+      sz = false
+    end
+    if ne get g_ms_ev add mb i 0
+      ez = false
+    end
+    rv = get g_ms_ref add mb i
+    if ne rv 0
+      rz = false
+    end
+    if ne rv get g_dg add ro i
+      rm = false
+    end
+    i = add i 1
+  end
+  if or sz ez
+    ret ANS_ERR_EVIDENCE
+  end
+  if eq cls ANS_SENSOR_IMU
+    if not rz
+      ret ANS_ERR_SENSOR
+    end
+  else
+    if not rm
+      ret ANS_ERR_SENSOR
+    end
+  end
+  ret ANS_OK
+end
+
+fn ans_measure_fill_obs rid ulong mid ulong to void
+  cls = get g_ms_cls mid
+  rval = get g_ref_r add mul rid 3 cls
+  put g_eo_m 0 4
+  put g_eo_tn 0 get g_ep_tn 0
+  put g_eo_sq 0 get g_ms_seq mid
+  i = ulong 0
+  while lt i 64
+    put g_eo_R i 0.0
+    i = add i 1
+  end
+  zb = mul mid 4
+  i = ulong 0
+  while lt i 4
+    put g_eo_u i EST_UNIT_DIMENSIONLESS
+    put g_eo_z i get g_ms_z add zb i
+    put g_eo_R add mul i 4 i rval
+    i = add i 1
+  end
+  mb = mul mid 32
+  i = ulong 0
+  while lt i 32
+    put g_eo_src i get g_ms_src add mb i
+    put g_eo_ev i get g_ms_ev add mb i
+    i = add i 1
+  end
+end
+
+fn ans_measure_finish rid ulong mid ulong out_sid ulong to void
+  cls = get g_ms_cls mid
+  mb = mul mid 32
+  sb = ulong 224
+  i = ulong 0
+  while lt i 32
+    put g_st_evr add sb i get g_b_evr add sb i
+    put g_dg add 864 i get g_st_prov add sb i
+    i = add i 1
+  end
+  put g_st_gen 7 add get g_st_gen 7 1
+  put g_st_sfix 7 add get g_st_sfix 7 1
+  nis = get g_ei_nis 0
+  if ne cls ANS_SENSOR_IMU
+    put g_st_lnis 7 nis
+    i = ulong 0
+    while lt i 32
+      put g_st_lref add sb i get g_ms_ref add mb i
+      i = add i 1
+    end
+    if gt nis get g_ref_nis rid
+      put g_st_dis 7 1
+    end
+  end
+  if eq cls ANS_SENSOR_FIX
+    put g_st_sfix 7 0
+    put g_st_smuf 7 0
+    if le nis get g_ref_nis rid
+      put g_st_dis 7 0
+    end
+  end
+  ans_provenance_extend 27 t_tag_measurement 29 28
+  i = ulong 0
+  while lt i 32
+    put g_st_prov add sb i get g_dg add 896 i
+    i = add i 1
+  end
+  ans_copy_state out_sid 7
+end
+
+fn ans_measure rid ulong rdid ulong sid ulong mid ulong out_sid ulong to long
+  put g_last_est 0 EST_OK
+  st = ans_guard rid rdid sid
+  if ne st 0
+    ret st
+  end
+  st = ans_meas_check_fields mid rdid
+  if ne st 0
+    ret st
+  end
+  st = ans_digest_measurement mid 29
+  if ne st 0
+    ret st
+  end
+  ans_copy_state 7 sid
+  est_build_ans_model rid 1e-9
+  es = est_rebind_belief 9 sid
+  if eq es 0
+    es = est_kf_predict1 9
+  end
+  if ne es 0
+    put g_last_est 0 es
+    ret ANS_ERR_EST
+  end
+  ans_measure_fill_obs rid mid
+  es = est_kf_update1 9 7
+  if ne es 0
+    put g_last_est 0 es
+    ret ANS_ERR_EST
+  end
+  ans_measure_finish rid mid out_sid
+  ret ANS_OK
+end
+
+note ---- Drift, Autonomy & Promotion Gate ----
+global g_dr_out f64 3
+
+fn ans_drift sid ulong to long
+  if ne get g_b_n sid ANS_DIM
+    ret ANS_ERR_RANGE
+  end
+  ub = mul sid 8
+  pb = mul sid 64
+  m2 = f64 0.0
+  tr = f64 0.0
+  i = ulong 0
+  while lt i 4
+    xv = get g_b_x add ub i
+    pv = get g_b_P add pb add mul i 4 i
+    if or not f64_is_finite xv not f64_is_finite pv
+      ret ANS_ERR_NONFINITE
+    end
+    if lt pv 0.0
+      ret ANS_ERR_EST
+    end
+    m2 = add m2 mul xv xv
+    tr = add tr pv
+    i = add i 1
+  end
+  put g_dr_out 0 fsqrt m2
+  put g_dr_out 1 fsqrt tr
+  put g_dr_out 2 fsqrt add m2 tr
+  ret ANS_OK
+end
+
+fn ans_autonomy_tier rid ulong sid ulong sg f64 to ulong
+  tier = ANS_TIER_FULL
+  rb = mul rid 3
+  if ge sg get g_ref_tsig add rb 2
+    tier = ANS_TIER_HALT_REQUEST_FIX
+  else
+    if ge sg get g_ref_tsig add rb 1
+      tier = ANS_TIER_SIMULATE_ONLY
+    else
+      if ge sg get g_ref_tsig rb
+        tier = ANS_TIER_REVERSIBLE_ONLY
+      end
+    end
+  end
+  if ne get g_st_dis sid 0
+    tier = ANS_TIER_HALT_REQUEST_FIX
+  end
+  ub = mul sid 8
+  lb = mul rid 10
+  i = ulong 0
+  while lt i 4
+    ax = fabs get g_b_x add ub i
+    lm = get g_ref_lim add lb ans_component_atom i
+    if gt ax lm
+      tier = ANS_TIER_HALT_REQUEST_FIX
+    end
+    i = add i 1
+  end
+  ret tier
+end
+
+fn ans_autonomy rid ulong rdid ulong sid ulong vid ulong to long
+  st = ans_guard rid rdid sid
+  if ne st 0
+    ret st
+  end
+  st = ans_drift sid
+  if ne st 0
+    ret st
+  end
+  sg = get g_dr_out 1
+  put g_vd_mn vid get g_dr_out 0
+  put g_vd_sig vid sg
+  put g_vd_D vid get g_dr_out 2
+  put g_vd_tier vid ans_autonomy_tier rid sid sg
+  put g_vd_sfix vid get g_st_sfix sid
+  put g_vd_dis vid get g_st_dis sid
+  st = ans_digest_state sid 27
+  if ne st 0
+    ret st
+  end
+  vb = mul vid 32
+  ro = mul rdid 32
+  i = ulong 0
+  while lt i 32
+    put g_vd_st add vb i get g_dg add 864 i
+    put g_vd_ref add vb i get g_dg add ro i
+    put g_vd_dig add vb i 0
+    i = add i 1
+  end
+  st = ans_digest_verdict vid 28
+  if ne st 0
+    ret st
+  end
+  i = ulong 0
+  while lt i 32
+    put g_vd_dig add vb i get g_dg add 896 i
+    i = add i 1
+  end
+  ret ANS_OK
+end
+
+global g_pq_dids ulong 4
+
+fn ans_promo_set_req cand_did ulong rb_did ulong tb_did ulong tn_did ulong to void
+  put g_pq_dids 0 cand_did
+  put g_pq_dids 1 rb_did
+  put g_pq_dids 2 tb_did
+  put g_pq_dids 3 tn_did
+end
+
+fn ans_promo_fill_dids pid ulong rdid ulong to long
+  pb = mul pid 32
+  co = mul get g_pq_dids 0 32
+  ro = mul rdid 32
+  to_ = mul get g_pq_dids 3 32
+  i = ulong 0
+  while lt i 32
+    put g_pr_cand add pb i get g_dg add co i
+    put g_pr_ref add pb i get g_dg add ro i
+    put g_pr_tst add pb i get g_dg add to_ i
+    put g_pr_st add pb i get g_dg add 864 i
+    put g_pr_dig add pb i 0
+    i = add i 1
+  end
+  st = ans_digest_promo pid 28
+  if ne st 0
+    ret st
+  end
+  i = ulong 0
+  while lt i 32
+    put g_pr_dig add pb i get g_dg add 896 i
+    i = add i 1
+  end
+  ret ANS_OK
+end
+
+fn ans_promotion_check rid ulong rdid ulong csid ulong pid ulong to long
+  st = ans_reference_check rid rdid
+  if ne st 0
+    ret st
+  end
+  if or ne est_check_belief csid 0 ne get g_b_n csid ANS_DIM
+    ret ANS_ERR_EST
+  end
+  if or not f64_is_finite get g_st_risk csid not f64_is_finite get g_st_lnis csid
+    ret ANS_ERR_NONFINITE
+  end
+  st = ans_drift csid
+  if ne st 0
+    ret st
+  end
+  dd = get g_dr_out 2
+  put g_pr_D pid dd
+  st = ans_digest_state csid 27
+  if ne st 0
+    ret st
+  end
+  res = ANS_PROMOTE_OK
+  if not dg_eq get g_pq_dids 1 rdid
+    res = ANS_PROMOTE_REFUSED_REFERENCE
+  else
+    if not dg_eq get g_pq_dids 3 get g_pq_dids 2
+      res = ANS_PROMOTE_REFUSED_TESTS
+    else
+      if ne get g_st_dis csid 0
+        res = ANS_PROMOTE_REFUSED_DISAGREEMENT
+      else
+        if gt dd get g_ref_prom rid
+          res = ANS_PROMOTE_REFUSED_DRIFT
+        else
+          if ne get g_st_smuf csid 0
+            res = ANS_PROMOTE_REFUSED_SELF_MOD
+          end
+        end
+      end
+    end
+  end
+  put g_pr_res pid res
+  ret ans_promo_fill_dids pid rdid
+end
