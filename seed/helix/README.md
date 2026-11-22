@@ -50,6 +50,7 @@ Immutable evidence receipts:
 - Fine-tooth comb audit & hardening receipt (zero-prebuilt Strand A, full CFG dataflow + fixed-latency RAW stall floor, `EGP2` structural proof kernel, live LLM response parsing, 12/12 antibodies): [`evidence/HELIX-AUDIT-HARDENING-20261121/`](../../evidence/HELIX-AUDIT-HARDENING-20261121/)
 - 4-Strand BFT Stem-Cell Braid (`1,612 B` seeds), Four-Wall Loop-1 Helical RSI Gate (`rsi-loop1.sh --lean`, 29 Lean 4.36.0 theorems, RSI V2 P-256 ratchet), and Live GB10 Proof-Carrying SM121 Evolutionary JIT (Antibodies `#13–#15`, `6/6` native genomes + `5/5` real 35B Full-W4 bit-exact parity): [`evidence/HELIX-BRAID4-RSI-JIT-20261121/`](../../evidence/HELIX-BRAID4-RSI-JIT-20261121/)
 - Omega LLM 5-Stage Closed-Loop Verified RLVR Factory, SM121 Training JIT (`ollm-helix-gb10`, `5/5` genomes `GCMP2`/`GACMP`/`geval`/`gprof` PASS), 15.8M `OLLMSP01` Merkle-chained specialists, and 3-round long-term GB10 training campaign (`loop` `0 → 6/159` vs `base` `0 → 3/159` on frozen `tools/bench/`, zero leakage `seen 0` across `5,999` RLVR functions): [`evidence/OLLM-HELIX-CLOSED-LOOP-20261121/`](../../evidence/OLLM-HELIX-CLOSED-LOOP-20261121/)
+- 4-Strand Architect–Builder RLVR Pipeline (`seed/helix/ollm_factory/architect_client.om`, `strand4_attr.om`, `architect-builder-cycle.sh`, `architect-builder-gate.sh`): [`seed/helix/ollm_factory/ARCHITECT-BUILDER-4STRAND.md`](ollm_factory/ARCHITECT-BUILDER-4STRAND.md)
 
 ## Phase 5: 4-Strand BFT Braid, Compiler Mitosis, Four-Wall Loop-1 RSI & Live SM121 Evolutionary JIT
 

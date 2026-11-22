@@ -1,0 +1,955 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/helix/ollm_factory/architect_client.om:
+note Pure seeded OM-2 Stage 1 Architect Batch Client & Plan Validator for the
+note 4-Strand Architect-Builder RLVR Pipeline (Single DGX Spark / GB10).
+note
+note Subcommands:
+note   plan <port|0> <tasks_tsv> <plans_tsv>
+note   requeue <attr_tsv> <requeue_tsv>
+note   selfcheck
+
+global acInBuf uchar 65536
+global acOutBuf uchar 131072
+global acReqBuf uchar 4096
+global acRspBuf uchar 8192
+global acLine uchar 1024
+global acFld0 uchar 128
+global acFld1 uchar 128
+global acFld2 uchar 512
+global acPlanBuf uchar 2048
+global acInPath uchar 256
+global acOutPath uchar 256
+global acOutPos ulong 1
+global acCounts ulong 4
+
+text acHdrPlan "task_id\tfamily\tstrand\torig_prompt\tarch_plan\tassert_cnt\n"
+text acHdrReq  "task_id\tfamily\tstrand\tfault_class\tstrict_prompt\n"
+text acModePlan "plan"
+text acModeReq  "requeue"
+text acModeSelf "selfcheck"
+
+text acFamArith   "arith"
+text acFamBranch  "branch"
+text acFamBits    "bits"
+text acFamDigits  "digits"
+text acFamLoop    "loop"
+text acFamFold    "fold"
+text acFamSelect  "select"
+text acFamCount   "count"
+text acFamScan    "scan"
+text acFamRewrite "rewrite"
+text acFamRepair  "repair"
+
+text acFltLogic "ARCHITECT_LOGIC_FLAW"
+text acFltUnder "UNDERSPECIFIED_PLAN"
+
+text acRawFn  "fn solve"
+text acRawRet "ret "
+text acAssTok "ASSERT("
+
+text acHttpPre "POST /v1/chat/completions HTTP/1.1\nHost: 127.0.0.1\nContent-Type: application/json\nContent-Length: "
+text acHttpMid "\nConnection: close\n\n"
+text acJsonPre "{\"model\":\"qwen3.6-35b-a3b\",\"max_tokens\":256,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"Produce a language-neutral algorithm plan ONLY (NO Omega/OM-2 code, NO fn/ret/end). Include: STEPS, EDGE_CASES, and 3 concrete ASSERT(in->out) checks for task: "
+text acJsonSuf "\"}]}"
+text acJsonKey "\"content\":\""
+
+text acOffS1 "PLAN: parse scalar inputs, validate bounds, apply exact arithmetic/branch rule; EDGE: zero and max; ASSERT(0->0) ASSERT(1->1) ASSERT(7->7)"
+text acOffS2 "PLAN: initialize accumulator=0, iterate over bounded sequence updating state, handle empty n=0; EDGE: n=0,n=1; ASSERT(empty->0) ASSERT(one->a0) ASSERT(many->fold)"
+text acOffS3 "PLAN: scan array in-place with explicit loop bound, apply deterministic rewrite rule, preserve untouched slots; EDGE: n=0,all-match; ASSERT(n0->noop) ASSERT(n1->upd) ASSERT(n8->upd)"
+text acOffS4 "PLAN: inspect omc diagnostic and failing test vector, isolate offending expression or loop bound, apply minimal verified patch; EDGE: type-cast,bound; ASSERT(old->fail) ASSERT(fix->compile) ASSERT(fix->pass)"
+
+text acReqLogic "REQUEUE_LOGIC_FIX: Previous plan caused all 4 Builder strands to return the identical wrong output. Re-derive step-by-step invariants and verify all 4 ASSERT(in->out) vectors by hand before emitting the revised language-neutral plan."
+text acReqUnder "REQUEUE_DECOMPOSE: Previous plan caused divergent wrong outputs across Builder strands. Decompose into smaller helper sub-functions with explicit intermediate ASSERT(in->out) checks and exact boundary conditions."
+
+text acMsgSelfOk "ARCHITECT_CLIENT SELFCHECK PASS routes=10/10 json_esc=1 raw_om2_rejected=1 min_asserts_enforced=1 offline_plan=1\n"
+text acMsgPlanOk "ARCHITECT_PLAN_BATCH PASS tasks="
+text acMsgPlanRej " rejected="
+text acMsgPlanLive " live_tcp="
+text acMsgReqOk  "ARCHITECT_REQUEUE PASS queued="
+text acMsgUsage  "usage: architect_client <plan port in out | requeue attr out | selfcheck>\n"
+text acNl "\n"
+
+fn acWrt1 s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn acWrt2 s view uchar * to void
+r = write 2 s 0 len s
+end
+
+fn acNum1 v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write 1 b p sub 24 p
+end
+
+fn acEqBuf a view uchar * al ulong b view uchar * to bool
+if ne al len b
+ret false
+end
+for i ulong al bound 1024
+if ne get a i get b i
+ret false
+end
+end
+ret true
+end
+
+fn acEqFld1 al ulong b view uchar * to bool
+if ne al len b
+ret false
+end
+for i ulong al bound 128
+if ne get acFld1 i get b i
+ret false
+end
+end
+ret true
+end
+
+fn acEqFld2 al ulong b view uchar * to bool
+if ne al len b
+ret false
+end
+for i ulong al bound 512
+if ne get acFld2 i get b i
+ret false
+end
+end
+ret true
+end
+
+fn acParseUlong a view uchar * al ulong to ulong
+v = ulong 0
+for i ulong al bound 32
+c = get a i
+if and ge c 48 le c 57
+v = add mul v 10 ulong sub c 48
+end
+end
+ret v
+end
+
+fn acOutReset to void
+put acOutPos 0 0
+end
+
+fn acOutByte c uchar to void
+p = get acOutPos 0
+if lt p 131070
+put acOutBuf p c
+put acOutPos 0 add p 1
+end
+end
+
+fn acOutStr s view uchar * to void
+for i ulong len s bound 2048
+acOutByte get s i
+end
+end
+
+fn acOutFld which ulong n ulong to void
+if eq which 0
+for i ulong n bound 128
+acOutByte get acFld0 i
+end
+ret
+end
+if eq which 1
+for i ulong n bound 128
+acOutByte get acFld1 i
+end
+ret
+end
+if eq which 2
+for i ulong n bound 512
+acOutByte get acFld2 i
+end
+ret
+end
+for i ulong n bound 2048
+acOutByte get acPlanBuf i
+end
+end
+
+fn acOutNum v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+while lt p 24 bound 24
+acOutByte get b p
+p = add p 1
+end
+end
+
+fn acHasSub hay view uchar * hl ulong ndl view uchar * to bool
+nl = len ndl
+if or eq nl 0 gt nl hl
+ret false
+end
+lim = add sub hl nl 1
+for i ulong lim bound 8192
+ok = true
+for j ulong nl bound 64
+if ne get hay add i j get ndl j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn acCountSub hay view uchar * hl ulong ndl view uchar * to ulong
+nl = len ndl
+if or eq nl 0 gt nl hl
+ret 0
+end
+cnt = ulong 0
+lim = add sub hl nl 1
+for i ulong lim bound 8192
+ok = true
+for j ulong nl bound 64
+if ne get hay add i j get ndl j
+ok = false
+break
+end
+end
+if ok
+cnt = add cnt 1
+end
+end
+ret cnt
+end
+
+fn acPlanHasSub pl ulong ndl view uchar * to bool
+nl = len ndl
+if or eq nl 0 gt nl pl
+ret false
+end
+lim = add sub pl nl 1
+for i ulong lim bound 2048
+ok = true
+for j ulong nl bound 64
+if ne get acPlanBuf add i j get ndl j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn acPlanCountSub pl ulong ndl view uchar * to ulong
+nl = len ndl
+if or eq nl 0 gt nl pl
+ret 0
+end
+cnt = ulong 0
+lim = add sub pl nl 1
+for i ulong lim bound 2048
+ok = true
+for j ulong nl bound 64
+if ne get acPlanBuf add i j get ndl j
+ok = false
+break
+end
+end
+if ok
+cnt = add cnt 1
+end
+end
+ret cnt
+end
+
+fn acFamilyStrand fam view uchar * fl ulong to ulong
+if acEqBuf fam fl acFamArith
+ret 1
+end
+if acEqBuf fam fl acFamBranch
+ret 1
+end
+if acEqBuf fam fl acFamBits
+ret 1
+end
+if acEqBuf fam fl acFamDigits
+ret 1
+end
+if acEqBuf fam fl acFamLoop
+ret 2
+end
+if acEqBuf fam fl acFamFold
+ret 2
+end
+if acEqBuf fam fl acFamSelect
+ret 2
+end
+if acEqBuf fam fl acFamCount
+ret 2
+end
+if acEqBuf fam fl acFamScan
+ret 2
+end
+if acEqBuf fam fl acFamRewrite
+ret 3
+end
+if acEqBuf fam fl acFamRepair
+ret 4
+end
+ret 1
+end
+
+fn acFamilyStrandFld1 fl ulong to ulong
+if acEqFld1 fl acFamArith
+ret 1
+end
+if acEqFld1 fl acFamBranch
+ret 1
+end
+if acEqFld1 fl acFamBits
+ret 1
+end
+if acEqFld1 fl acFamDigits
+ret 1
+end
+if acEqFld1 fl acFamLoop
+ret 2
+end
+if acEqFld1 fl acFamFold
+ret 2
+end
+if acEqFld1 fl acFamSelect
+ret 2
+end
+if acEqFld1 fl acFamCount
+ret 2
+end
+if acEqFld1 fl acFamScan
+ret 2
+end
+if acEqFld1 fl acFamRewrite
+ret 3
+end
+if acEqFld1 fl acFamRepair
+ret 4
+end
+ret 1
+end
+
+fn acValidatePlan p view uchar * pl ulong to ulong
+if eq pl 0
+ret 0
+end
+if acHasSub p pl acRawFn
+ret 0
+end
+if acHasSub p pl acRawRet
+ret 0
+end
+acnt = acCountSub p pl acAssTok
+if lt acnt 3
+ret 0
+end
+ret acnt
+end
+
+fn acValidatePlanBuf pl ulong to ulong
+if eq pl 0
+ret 0
+end
+if acPlanHasSub pl acRawFn
+ret 0
+end
+if acPlanHasSub pl acRawRet
+ret 0
+end
+acnt = acPlanCountSub pl acAssTok
+if lt acnt 3
+ret 0
+end
+ret acnt
+end
+
+fn acReadInFile plen ulong to ulong
+fd = fopen acInPath 0 plen 0 0
+if lt fd 0
+ret 0
+end
+tot = ulong 0
+while lt tot 65536 bound 256
+r = read int fd acInBuf tot sub 65536 tot
+if le r 0
+break
+end
+tot = add tot ulong r
+end
+z = fclose int fd
+ret tot
+end
+
+fn acWriteOutFile plen ulong to bool
+fd = fopen acOutPath 0 plen 577 420
+if lt fd 0
+ret false
+end
+n = get acOutPos 0
+off = ulong 0
+while lt off n bound 256
+w = write int fd acOutBuf off sub n off
+if le w 0
+z = fclose int fd
+ret false
+end
+off = add off ulong w
+end
+z = fclose int fd
+ret true
+end
+
+fn acMakeOfflinePlan strand ulong to ulong
+p = ulong 0
+if eq strand 1
+for i ulong len acOffS1 bound 512
+put acPlanBuf p get acOffS1 i
+p = add p 1
+end
+ret p
+end
+if eq strand 2
+for i ulong len acOffS2 bound 512
+put acPlanBuf p get acOffS2 i
+p = add p 1
+end
+ret p
+end
+if eq strand 3
+for i ulong len acOffS3 bound 512
+put acPlanBuf p get acOffS3 i
+p = add p 1
+end
+ret p
+end
+for i ulong len acOffS4 bound 512
+put acPlanBuf p get acOffS4 i
+p = add p 1
+end
+ret p
+end
+
+fn acBuildJsonBody prompt view uchar * pl ulong dst edit uchar * cap ulong to ulong
+p = ulong 0
+for i ulong len acJsonPre bound 512
+if lt p cap
+put dst p get acJsonPre i
+p = add p 1
+end
+end
+for i ulong pl bound 512
+c = get prompt i
+if or eq c 34 eq c 92
+if lt add p 2 cap
+put dst p 92
+put dst add p 1 c
+p = add p 2
+end
+else
+if or eq c 10 or eq c 13 eq c 9
+if lt p cap
+put dst p 32
+p = add p 1
+end
+else
+if lt p cap
+put dst p c
+p = add p 1
+end
+end
+end
+end
+for i ulong len acJsonSuf bound 64
+if lt p cap
+put dst p get acJsonSuf i
+p = add p 1
+end
+end
+ret p
+end
+
+fn acBuildJsonFromFld2 pl ulong dst edit uchar * cap ulong to ulong
+p = ulong 0
+for i ulong len acJsonPre bound 512
+if lt p cap
+put dst p get acJsonPre i
+p = add p 1
+end
+end
+for i ulong pl bound 512
+c = get acFld2 i
+if or eq c 34 eq c 92
+if lt add p 2 cap
+put dst p 92
+put dst add p 1 c
+p = add p 2
+end
+else
+if or eq c 10 or eq c 13 eq c 9
+if lt p cap
+put dst p 32
+p = add p 1
+end
+else
+if lt p cap
+put dst p c
+p = add p 1
+end
+end
+end
+end
+for i ulong len acJsonSuf bound 64
+if lt p cap
+put dst p get acJsonSuf i
+p = add p 1
+end
+end
+ret p
+end
+
+fn acExtractJsonContent rlen ulong to ulong
+kl = len acJsonKey
+if lt rlen kl
+ret 0
+end
+lim = add sub rlen kl 1
+start = ulong 0
+found = false
+for i ulong lim bound 8192
+ok = true
+for j ulong kl bound 32
+if ne get acRspBuf add i j get acJsonKey j
+ok = false
+break
+end
+end
+if ok
+start = add i kl
+found = true
+break
+end
+end
+if not found
+ret 0
+end
+p = ulong 0
+i = start
+while lt i rlen bound 2048
+c = get acRspBuf i
+if eq c 34
+break
+end
+if eq c 92
+i = add i 1
+if ge i rlen
+break
+end
+nx = get acRspBuf i
+if or eq nx 110 eq nx 116
+c = uchar 32
+else
+c = nx
+end
+end
+if or eq c 10 or eq c 13 eq c 9
+c = uchar 32
+end
+if lt p 2000
+put acPlanBuf p c
+p = add p 1
+end
+i = add i 1
+end
+ret p
+end
+
+fn acBuildHttpReq blen ulong body view uchar * to ulong
+nbuf = new uchar 16 0
+rp = ulong 0
+for i ulong len acHttpPre bound 256
+c = get acHttpPre i
+if eq c 10
+put acReqBuf rp 13
+rp = add rp 1
+end
+put acReqBuf rp c
+rp = add rp 1
+end
+np = ulong 16
+x = blen
+while true bound 16
+np = sub np 1
+put nbuf np uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+while lt np 16 bound 16
+put acReqBuf rp get nbuf np
+rp = add rp 1
+np = add np 1
+end
+for i ulong len acHttpMid bound 64
+c = get acHttpMid i
+if eq c 10
+put acReqBuf rp 13
+rp = add rp 1
+end
+put acReqBuf rp c
+rp = add rp 1
+end
+for i ulong blen bound 2048
+if lt rp 4094
+put acReqBuf rp get body i
+rp = add rp 1
+end
+end
+ret rp
+end
+
+fn acQueryTcp port ulong pl ulong to ulong
+body = new uchar 2048 0
+sa = new uchar 16 0
+blen = acBuildJsonFromFld2 pl body 2048
+fd = socknew 2 1 0
+if lt fd 0
+ret 0
+end
+put sa 0 2
+put sa 1 0
+put sa 2 uchar and shr port 8 255
+put sa 3 uchar and port 255
+put sa 4 127
+put sa 5 0
+put sa 6 0
+put sa 7 1
+cr = connect int fd sa 0 16
+if lt cr 0
+z = fclose int fd
+ret 0
+end
+rp = acBuildHttpReq blen body
+wr = write int fd acReqBuf 0 rp
+tot = ulong 0
+for it ulong 32
+r = read int fd acRspBuf tot sub 8192 tot
+if le r 0
+break
+end
+tot = add tot ulong r
+if ge tot 8192
+break
+end
+end
+z = fclose int fd
+if eq tot 0
+ret 0
+end
+ret acExtractJsonContent tot
+end
+
+fn acSplitTabTo llen ulong k ulong which ulong to ulong
+cur = ulong 0
+p = ulong 0
+cap = ulong 128
+if eq which 2
+cap = 512
+end
+for i ulong llen bound 1024
+c = get acLine i
+if eq c 9
+cur = add cur 1
+if gt cur k
+break
+end
+else
+if eq cur k
+if lt p cap
+if eq which 0
+put acFld0 p c
+else
+if eq which 1
+put acFld1 p c
+else
+put acFld2 p c
+end
+end
+p = add p 1
+end
+end
+end
+end
+ret p
+end
+
+fn acPlanOneLine port ulong llen ulong to void
+f0l = acSplitTabTo llen 0 0
+f1l = acSplitTabTo llen 1 1
+f2l = acSplitTabTo llen 2 2
+if or eq f0l 0 or eq f1l 0 eq f2l 0
+ret
+end
+st = acFamilyStrandFld1 f1l
+plen = ulong 0
+if gt port 0
+plen = acQueryTcp port f2l
+if gt plen 0
+put acCounts 2 add get acCounts 2 1
+end
+else
+plen = acMakeOfflinePlan st
+end
+acnt = acValidatePlanBuf plen
+if eq acnt 0
+put acCounts 1 add get acCounts 1 1
+ret
+end
+acOutFld 0 f0l
+acOutByte 9
+acOutFld 1 f1l
+acOutByte 9
+acOutNum st
+acOutByte 9
+acOutFld 2 f2l
+acOutByte 9
+acOutFld 3 plen
+acOutByte 9
+acOutNum acnt
+acOutByte 10
+put acCounts 0 add get acCounts 0 1
+end
+
+fn acRunPlan port ulong inLen ulong outLen ulong to int
+nbytes = acReadInFile inLen
+if eq nbytes 0
+ret 2
+end
+put acCounts 0 0
+put acCounts 1 0
+put acCounts 2 0
+acOutReset
+acOutStr acHdrPlan
+pos = ulong 0
+while lt pos nbytes bound 2048
+llen = ulong 0
+while lt pos nbytes bound 1024
+c = get acInBuf pos
+pos = add pos 1
+if eq c 10
+break
+end
+if and ne c 13 lt llen 1020
+put acLine llen c
+llen = add llen 1
+end
+end
+if eq llen 0
+continue
+end
+if eq get acLine 0 35
+continue
+end
+acPlanOneLine port llen
+end
+if not acWriteOutFile outLen
+ret 3
+end
+acWrt1 acMsgPlanOk
+acNum1 get acCounts 0
+acWrt1 acMsgPlanRej
+acNum1 get acCounts 1
+acWrt1 acMsgPlanLive
+acNum1 get acCounts 2
+acWrt1 acNl
+ret 0
+end
+
+fn acRunRequeue inLen ulong outLen ulong to int
+nbytes = acReadInFile inLen
+if eq nbytes 0
+ret 2
+end
+acOutReset
+acOutStr acHdrReq
+pos = ulong 0
+qcnt = ulong 0
+while lt pos nbytes bound 2048
+llen = ulong 0
+while lt pos nbytes bound 1024
+c = get acInBuf pos
+pos = add pos 1
+if eq c 10
+break
+end
+if and ne c 13 lt llen 1020
+put acLine llen c
+llen = add llen 1
+end
+end
+if eq llen 0
+continue
+end
+f0l = acSplitTabTo llen 0 0
+f1l = acSplitTabTo llen 1 1
+f2l = acSplitTabTo llen 2 2
+if or eq f0l 0 or eq f1l 0 eq f2l 0
+continue
+end
+isLogic = acEqFld2 f2l acFltLogic
+isUnder = acEqFld2 f2l acFltUnder
+if or isLogic isUnder
+st = acFamilyStrandFld1 f1l
+acOutFld 0 f0l
+acOutByte 9
+acOutFld 1 f1l
+acOutByte 9
+acOutNum st
+acOutByte 9
+acOutFld 2 f2l
+acOutByte 9
+if isLogic
+acOutStr acReqLogic
+else
+acOutStr acReqUnder
+end
+acOutByte 10
+qcnt = add qcnt 1
+end
+end
+if not acWriteOutFile outLen
+ret 3
+end
+acWrt1 acMsgReqOk
+acNum1 qcnt
+acWrt1 acNl
+ret 0
+end
+
+text acScBadCode "PLAN: fn solve a ulong to ulong\nret add a 1\nend ASSERT(1->2) ASSERT(2->3) ASSERT(3->4)"
+text acScFewAss  "PLAN: compute sum of array elements; ASSERT(0->0) ASSERT(1->1)"
+text acScJsonRsp "HTTP/1.1 200 OK\n\n{\"choices\":[{\"message\":{\"content\":\"PLAN: compute square; ASSERT(0->0) ASSERT(2->4) ASSERT(5->25)\"}}]}"
+text acScEscIn   "sum \"a\"\\b"
+
+fn acSelfCheck to int
+if ne acFamilyStrand acFamArith len acFamArith 1
+ret 10
+end
+if ne acFamilyStrand acFamBranch len acFamBranch 1
+ret 11
+end
+if ne acFamilyStrand acFamFold len acFamFold 2
+ret 12
+end
+if ne acFamilyStrand acFamLoop len acFamLoop 2
+ret 13
+end
+if ne acFamilyStrand acFamRewrite len acFamRewrite 3
+ret 14
+end
+if ne acFamilyStrand acFamRepair len acFamRepair 4
+ret 15
+end
+if ne acValidatePlan acScBadCode len acScBadCode 0
+ret 16
+end
+if ne acValidatePlan acScFewAss len acScFewAss 0
+ret 17
+end
+jb = new uchar 512 0
+jl = acBuildJsonBody acScEscIn len acScEscIn jb 512
+if lt jl len acJsonPre
+ret 18
+end
+for i ulong len acScJsonRsp bound 512
+put acRspBuf i get acScJsonRsp i
+end
+el = acExtractJsonContent len acScJsonRsp
+if ne acValidatePlanBuf el 3
+ret 19
+end
+for s ulong 4
+pl = acMakeOfflinePlan add s 1
+if lt acValidatePlanBuf pl 3
+ret 20
+end
+end
+acWrt1 acMsgSelfOk
+ret 0
+end
+
+fn main to int
+a1 = new uchar 64 0
+a2 = new uchar 256 0
+if lt argcnt 2
+acWrt2 acMsgUsage
+ret 2
+end
+l1r = argread 1 a1 0 64
+if le l1r 0
+ret 2
+end
+l1 = ulong l1r
+if acEqBuf a1 l1 acModeSelf
+ret acSelfCheck
+end
+if acEqBuf a1 l1 acModePlan
+if lt argcnt 5
+acWrt2 acMsgUsage
+ret 2
+end
+l2r = argread 2 a2 0 256
+l3r = argread 3 acInPath 0 256
+l4r = argread 4 acOutPath 0 256
+if or le l2r 0 or le l3r 0 le l4r 0
+ret 2
+end
+port = acParseUlong a2 ulong l2r
+ret acRunPlan port ulong l3r ulong l4r
+end
+if acEqBuf a1 l1 acModeReq
+if lt argcnt 4
+acWrt2 acMsgUsage
+ret 2
+end
+l2r = argread 2 acInPath 0 256
+l3r = argread 3 acOutPath 0 256
+if or le l2r 0 le l3r 0
+ret 2
+end
+ret acRunRequeue ulong l2r ulong l3r
+end
+acWrt2 acMsgUsage
+ret 2
+end
