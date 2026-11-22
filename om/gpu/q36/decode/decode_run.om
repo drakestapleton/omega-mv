@@ -60,6 +60,7 @@ const QDW_ALOG ulong 327680
 const QDW_FNORM ulong 344064
 const QDW_LEXMAP ulong 352256
 const QDW_POS ulong 393216
+const QDW_OUT_TOK ulong 393280
 const QDW_TRACE ulong 401408
 const QDW_ROPE ulong 524288
 const QDW_LOGW4 ulong 1048576
@@ -119,8 +120,11 @@ const FA_PAYLOAD ulong 836878976
 global qdCodeMap long 1
 global qdCodePos ulong 1
 global qdCodeFail uint 1
-global qdEntry ulong 32
-global qdSmem ulong 32
+global qdEntry ulong 48
+global qdSmem ulong 48
+global qdPreMap long 1
+global qdPreVa ulong 1
+global qdPreTokIds uint 512
 global qdUseW4 ulong 1
 global qdW4Map long 6
 global qdW4Va ulong 6
@@ -128,6 +132,7 @@ global qdLut long 1
 global qdWork long 1
 global qdWorkVa ulong 1
 global qdLmBf16 long 1
+global qdEmbBf16 long 1
 global qdLmW4 long 1
 global qdLmW4Va ulong 1
 global qdScaleMap long 1
@@ -205,6 +210,7 @@ global qdArbTot ulong 1
 global qdArbPred uint 8
 global qdArbHasPred ulong 1
 global qdArbIds uint 8
+global qdTraceSnap uchar 2560
 
 text qdBanner "=== QWEN 3.6 35B-A3B FP8 100% PURE SEEDED-OMEGA REAL-WEIGHT DECODER (ZERO CUDA) ===\n"
 text qdUsage "usage: q36-decode /path/to/qwen3.6-35b-a3b-fp8 [num_gen_tokens]\n"
@@ -571,6 +577,17 @@ if not ok
 exit 4
 end
 q36Done
+note 25: argmax_embed_step (GPU argmax + BF16->F32 embed widen + pos++ for ZOS async decode)
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry 25 p
+put qdCodePos 0 p
+put qhPc 0 0
+put qhGuard 0 0
+ok = qhKernel uchar 101
+if not ok
+exit 4
+end
+qhDone
 put qdSmem 0 8192
 put qdSmem 1 17472
 put qdSmem 2 0
@@ -596,6 +613,8 @@ put qdSmem 21 1088
 put qdSmem 22 2048
 put qdSmem 23 64
 put qdSmem 24 8192
+put qdSmem 25 512
+qdPreEmitKernels
 end
 
 note =========================================================================
@@ -909,19 +928,27 @@ put qdPreBytes slot add pos n
 ret true
 end
 
-fn qdReplayPre slot ulong to bool
+fn qdKickPre slot ulong to bool
 r = mapset get gbmem 2 8192 4 0
 r = mapset get gbmem 3 0 4 0
 r = mapset get gbmem 3 16 4 0
 off = get qdPreOff slot
 nb = get qdPreBytes slot
-if not nvsend get qdWork 0 off uint div nb 4
-ret false
+ret nvsend get qdWork 0 off uint div nb 4
 end
+
+fn qdWaitPre to bool
 if not qdWaitFast 15000000000
 ret false
 end
 ret eq mapget get gbmem 3 0 4 1145324612
+end
+
+fn qdReplayPre slot ulong to bool
+if not qdKickPre slot
+ret false
+end
+ret qdWaitPre
 end
 
 fn qdWaitFast timeout ulong to bool
@@ -1270,8 +1297,11 @@ end
 if ne mapwrite get qdWork 0 QDW_FNORM qdIoBuf 0 8192 8192
 ret false
 end
-note Stream lm_head.weight BF16 (1.017 GB) into qdLmBf16
+note Stream lm_head.weight BF16 (1.017 GB) into qdLmBf16 and embed_tokens BF16 (1.017 GB) into qdEmbBf16
 if not qdStreamToMap fd QD_OUT_DATA_OFF get qdLmBf16 0 0 QD_LM_BYTES
+ret false
+end
+if not qdStreamToMap fd QD_EMB_OFF get qdEmbBf16 0 0 QD_LM_BYTES
 ret false
 end
 ret true
@@ -2175,6 +2205,17 @@ end
 ret true
 end
 
+fn qdEmitArgmaxEmbed to bool
+wva = get qdWorkVa 0
+qdPtr add wva QDW_CIDS
+qdPtr add wva QDW_CLOG
+qdPtr mapaddr get qdEmbBf16 0
+qdPtr add wva QDW_X
+qdPtr add wva QDW_POS
+qdPtr add wva QDW_OUT_TOK
+ret qdPktEmitGy 25 1 1 128
+end
+
 fn qdRecordAllPackets to bool
 note Slot 0: ALL 40 REAL LAYERS + FINAL NORM + W4 TWO-PASS EXACT LM_HEAD IN ONE SINGLE GPFIFO SUBMIT!!
 qdPktStartAt QDW_PKT
@@ -2192,13 +2233,73 @@ qdPktStartAt add QDW_PKT 2097152
 if not qdEmitAll40Layers
 ret false
 end
-ret qdPktFinish 1
+if not qdPktFinish 1
+ret false
+end
+note Slot 2: ZOS ASYNC SELF-ADVANCING DECODE (40 LAYERS + EXACT LM_HEAD + GPU ARGMAX->EMBED->POS++)
+qdPktStartAt add QDW_PKT 4194304
+if not qdEmitAll40Layers
+ret false
+end
+if not qdEmitFinalHead
+ret false
+end
+if not qdEmitArgmaxEmbed
+ret false
+end
+if not qdPktFinish 2
+ret false
+end
+if eq get qdUseW4 0 1
+note Slot 3: ALL 40 REAL LAYERS CHUNKED PREFILL B=512 (ZERO CPU PACKET RECORDING PER CHUNK!)
+qdPktStartAt add QDW_PKT 8388608
+if not qdPreEmitAll40W4 512
+ret false
+end
+if not qdPktFinish 3
+ret false
+end
+note Slot 4: ALL 40 REAL LAYERS CHUNKED PREFILL B=512 + FINAL EXACT LM_HEAD
+qdPktStartAt add QDW_PKT 12582912
+if not qdPreEmitAll40W4 512
+ret false
+end
+if not qdPreEmitFinalHead 512
+ret false
+end
+ret qdPktFinish 4
+end
+ret true
 end
 
-fn qdUpdateArboris to void
-if ne mapread get qdWork 0 QDW_TRACE qdIoBuf 0 2560 2560
-ret
+fn qdSnapTrace to bool
+ret eq mapread get qdWork 0 QDW_TRACE qdTraceSnap 0 2560 2560
 end
+
+fn qdReadOutTok to ulong
+if ne mapread get qdWork 0 QDW_OUT_TOK qdIoBuf 0 4 4
+ret 999999
+end
+b0 = uint get qdIoBuf 0
+b1 = shl uint get qdIoBuf 1 8
+b2 = shl uint get qdIoBuf 2 16
+b3 = shl uint get qdIoBuf 3 24
+ret ulong or or b0 b1 or b2 b3
+end
+
+fn qdPrepAsyncDecode tid ulong pos ulong to bool
+if not qdLoadEmbed tid
+ret false
+end
+w = uint pos
+put qdIoBuf 0 uchar and w 255
+put qdIoBuf 1 uchar and shr w 8 255
+put qdIoBuf 2 uchar and shr w 16 255
+put qdIoBuf 3 uchar and shr w 24 255
+ret eq mapwrite get qdWork 0 QDW_POS qdIoBuf 0 4 4
+end
+
+fn qdUpdateArborisSnap to void
 q36ArbResetToken
 idsLocal = new uint 8 0
 prLocal = new uint 8 0
@@ -2208,10 +2309,10 @@ for L ulong QD_LAYERS
 base = mul L 64
 for k ulong 8
 p = add base mul k 4
-b0 = uint get qdIoBuf p
-b1 = shl uint get qdIoBuf add p 1 8
-b2 = shl uint get qdIoBuf add p 2 16
-b3 = shl uint get qdIoBuf add p 3 24
+b0 = uint get qdTraceSnap p
+b1 = shl uint get qdTraceSnap add p 1 8
+b2 = shl uint get qdTraceSnap add p 2 16
+b3 = shl uint get qdTraceSnap add p 3 24
 put idsLocal k or or b0 b1 or b2 b3
 end
 if eq hasPred 1
@@ -2228,6 +2329,13 @@ hasPred = ulong 0
 end
 end
 end
+end
+
+fn qdUpdateArboris to void
+if not qdSnapTrace
+ret
+end
+qdUpdateArborisSnap
 end
 
 fn qdForwardToken tid ulong pos ulong runHead bool checkParity bool to ulong
@@ -2366,6 +2474,10 @@ put qdLmBf16 0 nvalloc QD_LM_BYTES true
 if le get qdLmBf16 0 0
 ret 8
 end
+put qdEmbBf16 0 nvalloc QD_LM_BYTES true
+if le get qdEmbBf16 0 0
+ret 8
+end
 put qdLmW4 0 nvalloc 300000000 true
 if le get qdLmW4 0 0
 ret 9
@@ -2409,6 +2521,12 @@ if not qdInitKvRope128k
 ret 10
 end
 if eq get qdUseW4 0 1
+mp = nvalloc 134217728 true
+if le mp 0
+ret 10
+end
+put qdPreMap 0 mp
+put qdPreVa 0 mapaddr mp
 m0 = nvalloc QD_LAYER_STRIDE true
 if le m0 0
 ret 11
@@ -2458,6 +2576,18 @@ put prompt 16 248069
 qdPrint qdMsgPrefill
 qdPrintU 17
 nextTok = ulong 0
+if eq get qdUseW4 0 1
+for p ulong 17
+put qdPreTokIds p uint get prompt p
+end
+nextTok = qdRunPrefillChunkW4 17 0 true true
+if eq nextTok 999999
+qdPrint qdErr
+qdPrintU 50
+qdPrint qdMsgNl
+ret 15
+end
+else
 for p ulong 17
 isLast = eq p 16
 nextTok = qdForwardToken get prompt p p isLast isLast
@@ -2468,20 +2598,52 @@ qdPrint qdMsgNl
 ret 15
 end
 end
+end
 genOut = new ulong 64 0
 put genOut 0 nextTok
 tDec0 = monons
-pos = ulong 17
-for g ulong sub genN 1 bound 64
-nextTok = qdForwardToken nextTok pos true false
+decSteps = sub genN 1
+if gt decSteps 0
+if not qdPrepAsyncDecode nextTok 17
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+if not qdKickPre 2
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+for g ulong decSteps bound 64
+if not qdWaitPre
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+nextTok = qdReadOutTok
 if eq nextTok 999999
 qdPrint qdErr
 qdPrintU 51
 qdPrint qdMsgNl
 ret 16
 end
+okSnap = qdSnapTrace
+if lt add g 1 decSteps
+if not qdKickPre 2
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+end
+if okSnap
+qdUpdateArborisSnap
+end
 put genOut add g 1 nextTok
-pos = add pos 1
+end
 end
 tDecUs = div ulong sub monons tDec0 1000
 qdPrint qdMsgGen
@@ -2648,13 +2810,32 @@ if ne nextTok get qdRefOut 0
 exact = ulong 0
 end
 end
-pos = ulong 17
 tTurn0 = monons
-for g ulong sub genN 1 bound 64
+decSteps = sub genN 1
+if gt decSteps 0
+if not qdPrepAsyncDecode nextTok 17
+ret 16
+end
+if not qdKickPre 2
+ret 16
+end
+for g ulong decSteps bound 64
 t0 = monons
-nextTok = qdForwardToken nextTok pos true false
+if not qdWaitPre
+ret 16
+end
+nextTok = qdReadOutTok
 if eq nextTok 999999
 ret 16
+end
+okSnap = qdSnapTrace
+if lt add g 1 decSteps
+if not qdKickPre 2
+ret 16
+end
+end
+if okSnap
+qdUpdateArborisSnap
 end
 dtUs = div ulong sub monons t0 1000
 if lt dtUs get qdSoakStats 1
@@ -2672,7 +2853,7 @@ if ne nextTok get qdRefOut add g 1
 exact = ulong 0
 end
 end
-pos = add pos 1
+end
 end
 tTurnUs = div ulong sub monons tTurn0 1000
 put qdSoakStats 0 add get qdSoakStats 0 exact
@@ -2756,16 +2937,21 @@ put qdDirLen 0 ulong dlen
 genN = ulong 8
 if ge argcnt 3
 v = qdParseArgU 2
-if and gt v 0 le v 99
+if and gt v 0 le v 131072
 genN = v
 end
 end
 put qdUseW4 0 0
+preBench = ulong 0
 wb = new uchar 16 0
 if ge argcnt 4
 wl = argread 3 wb 0 15
 if and ge wl 2 eq get wb 0 119
 put qdUseW4 0 1
+end
+if and ge wl 1 eq get wb 0 112
+put qdUseW4 0 1
+preBench = ulong 1
 end
 end
 repeats = ulong 1
@@ -2785,7 +2971,7 @@ qdPrintU ulong irc
 qdPrint qdMsgNl
 ret irc
 end
-dbgOnly = eq genN 99
+dbgOnly = and eq preBench 0 eq genN 99
 lrc = qdLoadAll dbgOnly
 if ne lrc 0
 rc = nvmclose
@@ -2798,10 +2984,14 @@ rc = nvmclose
 ret 0
 end
 prc = int 0
+if eq preBench 1
+prc = qdRunPrefillBench genN
+else
 if gt repeats 1
 prc = qdRunSoak genN repeats
 else
 prc = qdRunPrompt genN
+end
 end
 r = fclose get qdOutFd 0
 rc = nvmclose

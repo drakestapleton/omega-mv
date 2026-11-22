@@ -41,9 +41,12 @@ mv "$tmp/q36-head" "$out/q36-head"
     gpu/nvidia/native/blackwell/batch.om \
     om/encoder/bw_enc_sm121.om \
     om/gpu/q36/emit_fast.om \
+    om/gpu/q36/emit_prefill.om \
     om/gpu/q36/head/emit_head.om \
-    om/gpu/q36/arboris/prefetch.om \
-    om/gpu/q36/decode/decode_run.om
+    om/gpu/q36/arboris/prefetch.om
+  sed '/^fn main to int$/,$d' om/gpu/q36/decode/decode_run.om
+  cat om/gpu/q36/decode/prefill_host.om
+  sed -n '/^fn main to int$/,$p' om/gpu/q36/decode/decode_run.om
 ) > "$tmp/q36-decode-input.om"
 seed/out/omc < "$tmp/q36-decode-input.om" > "$tmp/q36-decode"
 chmod +x "$tmp/q36-decode"
@@ -56,10 +59,12 @@ mv "$tmp/q36-decode" "$out/q36-decode"
     gpu/nvidia/native/blackwell/batch.om \
     om/encoder/bw_enc_sm121.om \
     om/gpu/q36/emit_fast.om \
+    om/gpu/q36/emit_prefill.om \
     om/gpu/q36/head/emit_head.om \
     om/gpu/q36/arboris/prefetch.om
   sed '/^fn main to int$/,$d' om/gpu/q36/decode/decode_run.om
-  cat om/gpu/q36/serve/tokenizer.om \
+  cat om/gpu/q36/decode/prefill_host.om \
+    om/gpu/q36/serve/tokenizer.om \
     om/gpu/q36/serve/serve_run.om
 ) > "$tmp/q36-serve-input.om"
 seed/out/omc < "$tmp/q36-serve-input.om" > "$tmp/q36-serve"

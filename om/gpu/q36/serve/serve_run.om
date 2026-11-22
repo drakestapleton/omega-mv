@@ -17,6 +17,7 @@ global qsOutTxt uchar 131072
 global qsOutLen ulong 1
 global qsPort ulong 1
 global qsSelfTest ulong 1
+global qsPendPreArb ulong 1
 
 text qsDefDir "/home/drakestapleton/models/qwen3.6-35b-a3b-fp8-95a723d0"
 text qsSufTok "/tokenizer.json"
@@ -166,6 +167,52 @@ ret div mul get qdArbHits 0 100 tot
 end
 
 fn qsPrefill nTok ulong to ulong
+if and eq get qdUseW4 0 1 ge nTok 2
+pos = ulong 0
+prevChunk = ulong 0
+hasPrev = false
+while lt pos nTok bound 1024
+chunk = sub nTok pos
+if gt chunk QP_MAX_B
+chunk = QP_MAX_B
+end
+isFinal = eq add pos chunk nTok
+if hasPrev
+if not qdWaitPre
+ret 999999
+end
+okSnap = qdPreSnapTrace prevChunk
+for j ulong chunk bound 512
+put qdPreTokIds j get q36TokOutIds add pos j
+end
+if not qdPreKickChunk chunk pos isFinal
+ret 999999
+end
+if okSnap
+qdPreUpdateArborisSnap prevChunk
+end
+else
+for j ulong chunk bound 512
+put qdPreTokIds j get q36TokOutIds add pos j
+end
+if not qdPreKickChunk chunk pos isFinal
+ret 999999
+end
+end
+prevChunk = chunk
+hasPrev = true
+pos = add pos chunk
+end
+if not qdWaitPre
+ret 999999
+end
+put qsPendPreArb 0 0
+if qdPreSnapTrace prevChunk
+put qsPendPreArb 0 prevChunk
+end
+ret qdPrePickBest prevChunk false
+end
+put qsPendPreArb 0 0
 nextTok = ulong 0
 for p ulong nTok bound 131072
 isLast = eq add p 1 nTok
@@ -177,28 +224,67 @@ end
 ret nextTok
 end
 
+fn qsFlushPendPreArb to void
+n = get qsPendPreArb 0
+if gt n 0
+put qsPendPreArb 0 0
+qdPreUpdateArborisSnap n
+end
+end
+
 fn qsDecodeLoop firstTok ulong nTok ulong maxGen ulong to ulong
-nextTok = firstTok
-genCnt = ulong 0
-pos = nTok
 cap = maxGen
 if gt add nTok cap QD_MAX_T
 cap = sub QD_MAX_T nTok
 end
-for g ulong cap bound 16384
-if or eq nextTok 248046 eq nextTok 248044
+if or eq cap 0 or eq firstTok 248046 eq firstTok 248044
+qsFlushPendPreArb
+ret 0
+end
+qsAppendTok firstTok
+genCnt = ulong 1
+if ge genCnt cap
+qsFlushPendPreArb
+ret genCnt
+end
+if not qdPrepAsyncDecode firstTok nTok
+qsFlushPendPreArb
+ret genCnt
+end
+if not qdKickPre 2
+qsFlushPendPreArb
+ret genCnt
+end
+note Overlap final prefill chunk Live Arboris update behind decode step 1 on GPU!
+qsFlushPendPreArb
+remSteps = sub cap 1
+for g ulong remSteps bound 16384
+if not qdWaitPre
+break
+end
+nextTok = qdReadOutTok
+if eq nextTok 999999
+break
+end
+okSnap = qdSnapTrace
+isStop = or eq nextTok 248046 eq nextTok 248044
+kickMore = and not isStop lt add g 1 remSteps
+if kickMore
+if not qdKickPre 2
+kickMore = false
+end
+end
+if okSnap
+qdUpdateArborisSnap
+end
+if isStop
 break
 end
 qsAppendTok nextTok
 genCnt = add genCnt 1
-if ge genCnt cap
+if not kickMore
 break
 end
-nextTok = qdForwardToken nextTok pos true false
-if eq nextTok 999999
-break
-end
-pos = add pos 1
 end
 ret genCnt
 end
