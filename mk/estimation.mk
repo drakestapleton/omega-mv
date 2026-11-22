@@ -34,42 +34,33 @@ est-purity: $(EST_DIR)/est_types.o $(EST_DIR)/est_kf.o $(EST_DIR)/est_mix.o
 		echo "estimation object references an operation an estimator must not have"; exit 1; fi
 	@echo "est-purity: est_types.o, est_kf.o and est_mix.o reference no forbidden symbol"
 
-$(EST_DIR)/test_est_types: tests/estimation/test_est_types.c $(EST_TYPES_SRCS) $(EST_HDRS)
-	@mkdir -p $(EST_DIR)
-	$(CC) $(EST_CFLAGS) -o $@ tests/estimation/test_est_types.c $(EST_TYPES_SRCS) -lm
-$(EST_DIR)/test_est_types_asan: tests/estimation/test_est_types.c $(EST_TYPES_SRCS) $(EST_HDRS)
-	@mkdir -p $(EST_DIR)
-	$(CC) $(EST_CFLAGS) $(EST_ASAN) -DPROP_ROUNDS=100 -o $@ tests/estimation/test_est_types.c $(EST_TYPES_SRCS) -lm
+EST_OMC ?= seed/out/omc
+EST_OM_TYPES = src/estimation/est_defs.om src/estimation/est_math.om src/estimation/est_types.om
+EST_OM_KF = $(EST_OM_TYPES) src/estimation/est_kf.om
 
-$(EST_DIR)/test_est_kf: tests/estimation/test_est_kf.c $(EST_KF_SRCS) $(EST_HDRS)
+$(EST_DIR)/test_est_types: $(EST_OM_TYPES) tests/estimation/test_est_types.om
 	@mkdir -p $(EST_DIR)
-	$(CC) $(EST_CFLAGS) -o $@ tests/estimation/test_est_kf.c $(EST_KF_SRCS) -lm
-$(EST_DIR)/test_est_kf_asan: tests/estimation/test_est_kf.c $(EST_KF_SRCS) $(EST_HDRS)
-	@mkdir -p $(EST_DIR)
-	$(CC) $(EST_CFLAGS) $(EST_ASAN) -o $@ tests/estimation/test_est_kf.c $(EST_KF_SRCS) -lm
+	cat $^ | $(EST_OMC) > $@ && chmod +x $@
 
-EST_REF_SRCS = tests/estimation/est_ref_info.c
-$(EST_DIR)/test_est_ref: tests/estimation/test_est_ref.c $(EST_REF_SRCS) tests/estimation/est_ref_info.h $(EST_KF_SRCS) $(EST_HDRS)
+$(EST_DIR)/test_est_kf: $(EST_OM_KF) tests/estimation/test_est_kf.om
 	@mkdir -p $(EST_DIR)
-	$(CC) $(EST_CFLAGS) -o $@ tests/estimation/test_est_ref.c $(EST_REF_SRCS) $(EST_KF_SRCS) -lm
-$(EST_DIR)/test_est_ref_asan: tests/estimation/test_est_ref.c $(EST_REF_SRCS) tests/estimation/est_ref_info.h $(EST_KF_SRCS) $(EST_HDRS)
-	@mkdir -p $(EST_DIR)
-	$(CC) $(EST_CFLAGS) $(EST_ASAN) -DNIS_STEPS=5000u -DXCHECK_SCENARIOS=100u -o $@ tests/estimation/test_est_ref.c $(EST_REF_SRCS) $(EST_KF_SRCS) -lm
+	cat $^ | $(EST_OMC) > $@ && chmod +x $@
 
-test-est-types: $(EST_DIR)/test_est_types $(EST_DIR)/test_est_types_asan
+$(EST_DIR)/test_est_ref: $(EST_OM_KF) tests/estimation/est_ref_info.om tests/estimation/test_est_ref.om
+	@mkdir -p $(EST_DIR)
+	cat $^ | $(EST_OMC) > $@ && chmod +x $@
+
+test-est-types: $(EST_DIR)/test_est_types
 	./$(EST_DIR)/test_est_types
-	./$(EST_DIR)/test_est_types_asan
-	@echo "test-est-types: EST-0 contract checks pass in plain and ASan/UBSan builds"
+	@echo "test-est-types: EST-0 contract checks pass (pure OM-2)"
 
-test-est-kf: $(EST_DIR)/test_est_kf $(EST_DIR)/test_est_kf_asan
+test-est-kf: $(EST_DIR)/test_est_kf
 	./$(EST_DIR)/test_est_kf
-	./$(EST_DIR)/test_est_kf_asan
-	@echo "test-est-kf: EST-1 filter checks pass in plain and ASan/UBSan builds"
+	@echo "test-est-kf: EST-1 filter checks pass (pure OM-2)"
 
-test-est-ref: $(EST_DIR)/test_est_ref $(EST_DIR)/test_est_ref_asan
+test-est-ref: $(EST_DIR)/test_est_ref
 	./$(EST_DIR)/test_est_ref
-	./$(EST_DIR)/test_est_ref_asan
-	@echo "test-est-ref: est_kf agrees with the independent information-form reference"
+	@echo "test-est-ref: est_kf agrees with the independent information-form reference (pure OM-2)"
 
 test-estimation: est-purity test-est-types test-est-kf test-est-ref
 	@echo "test-estimation: EST-0 and EST-1 pass"

@@ -1,0 +1,899 @@
+note SPDX-License-Identifier: Apache-2.0
+note ESTIMATION-2 protocol v3 hostile suite in pure seeded OM-2
+note (port of tests/estimation/test_est_pred.c).
+
+global g_checks ulong 1
+global g_fail ulong 1
+global g_y f64 10000
+global g_pres ulong 10000
+global g_lvl f64 10000
+global g_xh f64 10000
+global g_one f64 801
+global g_out f64 801
+global g_ref f64 801
+global g_tmp f64 801
+global g_ar f64 1
+global g_lohi ulong 2
+
+const QU f64 100.0
+
+text P_PREFIX "test_est_pred: "
+text P_CHECKS " checks, "
+text P_FAILED " failed\n"
+text P_PASS "test_est_pred: PASS\n"
+text P_FAIL "test_est_pred: FAIL\n"
+text P_FTAG "FAIL tag="
+text P_NL "\n"
+
+fn chk cond bool tag ulong to void
+  put g_checks 0 add get g_checks 0 1
+  if not cond
+    put g_fail 0 add get g_fail 0 1
+    est_eputs P_FTAG
+    est_putu_fd 2 tag
+    est_eputs P_NL
+  end
+end
+
+fn chk_st got long want long tag ulong to void
+  chk eq got want tag
+end
+
+fn chk_near x f64 y f64 tol f64 tag ulong to void
+  chk le fabs sub x y tol tag
+end
+
+note ---- splitmix64 PRNG ----
+
+fn rnext st edit ulong 1 to ulong
+  z = add get st 0 0x9e3779b97f4a7c15
+  put st 0 z
+  z = mul xor z shr z 30 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+fn runif st edit ulong 1 to f64
+  u = add f64 shr rnext st 11 0.5f64
+  ret div u 9007199254740992.0f64
+end
+
+fn rnorm st edit ulong 1 to f64
+  u1 = runif st
+  u2 = runif st
+  ret mul fsqrt mul -2.0f64 est_log u1 est_cos mul EST_TWO_PI u2
+end
+
+fn rt st edit ulong 1 nu ulong to f64
+  c = f64 0.0
+  for i ulong nu bound 16
+    g = rnorm st
+    c = add c mul g g
+  end
+  ret div rnorm st fsqrt div c f64 nu
+end
+
+fn on_grid v f64 to f64
+  ret mul QU est_nearbyint div v QU
+end
+
+note ---- Helpers ----
+
+fn mk_assump fam ulong np ulong a edit EstAssump to void
+  put a family fam
+  put a unit EST_UNIT_MILLI_CELSIUS
+  put a quantum QU
+  put a lo -1.0e8f64
+  put a hi 1.0e8f64
+  put a nparam np
+  for i ulong 8
+    put a param i 0.0f64
+  end
+end
+
+fn mk_f1 qp f64 r f64 p0 f64 a edit EstAssump to void
+  mk_assump EST_FAM_GAUSS_KF 3 a
+  put a param 0 qp
+  put a param 1 r
+  put a param 2 p0
+end
+
+fn mk_f2 qp f64 r f64 p0 f64 c f64 a edit EstAssump to void
+  mk_assump EST_FAM_HUBER_KF 4 a
+  put a param 0 qp
+  put a param 1 r
+  put a param 2 p0
+  put a param 3 c
+end
+
+fn mk_f3 nu f64 s f64 a edit EstAssump to void
+  mk_assump EST_FAM_STUDENT_T 2 a
+  put a param 0 nu
+  put a param 1 s
+end
+
+fn mk_f4 k f64 w0 f64 w1 f64 w2 f64 v0 f64 a edit EstAssump to void
+  mk_assump EST_FAM_SCALE_MIX 7 a
+  put a param 0 k
+  put a param 1 w0
+  put a param 2 w1
+  put a param 3 w2
+  put a param 4 v0
+end
+
+fn mk_f5 lam f64 nu f64 c f64 fl f64 s0 f64 a edit EstAssump to void
+  mk_assump EST_FAM_ADAPTIVE_T 5 a
+  put a param 0 lam
+  put a param 1 nu
+  put a param 2 c
+  put a param 3 fl
+  put a param 4 s0
+end
+
+fn mk_evd t ulong d edit uchar 32 to void
+  for i ulong 32
+    v = xor xor shr mul add t 1 0x9d rem i 8 i 0x5a
+    put d i uchar and v 0xff
+  end
+  put d 0 uchar 0xee
+end
+
+fn mk_pob a view EstAssump v f64 present ulong t ulong o edit EstPObs to void
+  d = new uchar 32 0
+  mk_evd t d
+  chk_st est_pobs_classify a v present view d o EST_OK 50
+end
+
+fn pmf_ok pmf view f64 801 to bool
+  s = f64 0.0
+  for i ulong EST_PRED_N
+    v = get pmf i
+    if or not gt v 0.0f64 not est_isfinite v
+      ret false
+    end
+    s = add s v
+  end
+  ret le fabs sub s 1.0f64 1.0e-12f64
+end
+
+note ---- 1. Numerics ----
+
+fn test_numerics_t to void
+  ts = new f64 13 0.0
+  put ts 0 -1.0e6f64
+  put ts 1 -300.0f64
+  put ts 2 -12.0f64
+  put ts 3 -3.0f64
+  put ts 4 -1.0f64
+  put ts 5 -0.25f64
+  put ts 6 0.0f64
+  put ts 7 0.25f64
+  put ts 8 1.0f64
+  put ts 9 3.0f64
+  put ts 10 12.0f64
+  put ts 11 300.0f64
+  put ts 12 1.0e6f64
+  for i ulong 13
+    t = get ts i
+    c1 = add 0.5f64 div est_atan t EST_PI
+    if lt t 0.0f64
+      c1 = div est_atan div -1.0f64 t EST_PI
+      chk le fabs sub est_t_cdf t 1.0f64 c1 mul 1.0e-12f64 c1 110
+    else
+      chk_near est_t_cdf t 1.0f64 c1 1.0e-14f64 111
+    end
+    r2 = fsqrt add 2.0f64 mul t t
+    sf2 = f64 0.0
+    if ge t 0.0f64
+      sf2 = div 1.0f64 mul r2 add r2 t
+      chk le fabs sub est_t_sf t 2.0f64 sf2 mul 1.0e-12f64 sf2 112
+    else
+      sf2 = sub 1.0f64 div 1.0f64 mul r2 sub r2 t
+      chk_near est_t_sf t 2.0f64 sf2 1.0e-14f64 113
+    end
+    chk_near add est_t_cdf t 3.7f64 est_t_sf t 3.7f64 1.0f64 1.0e-14f64 114
+    chk eq est_t_cdf t 3.7f64 est_t_sf neg t 3.7f64 115
+  end
+  chk le fabs sub est_t_sf 1.0e3f64 1.0f64 div est_atan 1.0e-3f64 EST_PI mul 1.0e-12f64 est_t_sf 1.0e3f64 1.0f64 116
+  chk est_isnan est_t_cdf 1.0f64 0.0f64 117
+  chk est_isnan est_t_cdf est_nan 3.0f64 117
+  chk est_isnan est_t_sf 1.0f64 -2.0f64 117
+  chk eq est_t_sf est_inf 3.0f64 0.0f64 118
+  chk eq est_t_cdf est_inf 3.0f64 1.0f64 118
+  for ix ulong 25
+    x = add -6.0f64 mul 0.5f64 f64 ix
+    chk_near est_t_cdf x 1.0e5f64 est_norm_cdf x 1.0e-5f64 119
+  end
+end
+
+fn test_numerics to void
+  for ix ulong 9
+    x = mul 0.125f64 f64 ix
+    chk_near est_betai 1.0f64 1.0f64 x x 1.0e-14f64 100
+    chk_near est_betai 3.5f64 1.0f64 x est_pow x 3.5f64 1.0e-13f64 101
+    chk_near est_betai 1.0f64 2.5f64 x sub 1.0f64 est_pow sub 1.0f64 x 2.5f64 1.0e-13f64 102
+  end
+  chk_near est_betai 2.0f64 3.0f64 0.4f64 0.5248f64 1.0e-14f64 103
+  chk_near est_betai 7.3f64 7.3f64 0.5f64 0.5f64 1.0e-13f64 104
+  chk_near est_betai 0.5f64 0.5f64 0.25f64 mul div 2.0f64 EST_PI est_asin 0.5f64 1.0e-13f64 105
+  chk_near add est_betai 4.0f64 6.0f64 0.3f64 est_betai 6.0f64 4.0f64 0.7f64 1.0f64 1.0e-13f64 106
+  chk est_isnan est_betai -1.0f64 2.0f64 0.5f64 107
+  chk est_isnan est_betai 1.0f64 0.0f64 0.5f64 108
+  chk est_isnan est_betai 1.0f64 1.0f64 1.5f64 109
+  chk est_isnan est_betai 1.0f64 1.0f64 est_nan 109
+  test_numerics_t
+  chk and eq est_norm_ppf 0.0f64 -8.0f64 eq est_norm_ppf 1.0f64 8.0f64 120
+  chk and eq est_norm_ppf -1.0f64 -8.0f64 eq est_norm_ppf 2.0f64 8.0f64 121
+  chk le fabs est_norm_ppf 0.5f64 1.0e-15f64 122
+  chk_near est_norm_ppf 0.975f64 1.959963984540054f64 1.0e-12f64 123
+  for ix ulong 43
+    x = add -7.5f64 mul 0.25f64 f64 ix
+    chk_near est_norm_ppf est_norm_cdf x x 1.0e-9f64 124
+  end
+  chk eq est_norm_ppf 1.0e-20f64 -8.0f64 125
+  chk_near est_frac_cover 0.0f64 1.0f64 0.5f64 0.5f64 1.0e-15f64 126
+  chk_near est_frac_cover 0.0f64 1.0f64 0.95f64 0.95f64 1.0e-15f64 127
+  chk eq est_frac_cover 0.3f64 0.6f64 0.5f64 1.0f64 128
+  chk eq est_frac_cover 0.0f64 0.2f64 0.5f64 0.0f64 129
+  chk eq est_frac_cover 0.8f64 1.0f64 0.5f64 0.0f64 130
+  chk_near est_frac_cover 0.2f64 0.3f64 0.5f64 0.5f64 1.0e-15f64 131
+  chk_near est_frac_cover 0.7f64 0.9f64 0.5f64 0.25f64 1.0e-15f64 132
+  chk eq est_frac_cover 0.5f64 0.5f64 0.5f64 1.0f64 133
+  chk eq est_frac_cover 0.25f64 0.25f64 0.5f64 1.0f64 134
+  chk eq est_frac_cover 0.1f64 0.1f64 0.5f64 0.0f64 135
+end
+
+note ---- 2. Assumption & Classify ----
+
+fn test_assumption to void
+  a = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  d0 = new uchar 32 0
+  d1 = new uchar 32 0
+  mk_f1 1.0e4f64 1.0e3f64 1.0e5f64 a
+  chk_st est_assumption_check view a EST_OK 200
+  mk_f2 1.0e4f64 1.0e3f64 1.0e5f64 1.345f64 a
+  chk_st est_assumption_check view a EST_OK 201
+  mk_f3 3.0f64 150.0f64 a
+  chk_st est_assumption_check view a EST_OK 202
+  mk_f4 3.0f64 0.5f64 0.3f64 0.2f64 1.0e3f64 a
+  put a param 5 1.0e4f64
+  put a param 6 1.0e5f64
+  chk_st est_assumption_check view a EST_OK 203
+  mk_f5 0.9f64 3.0f64 1.0f64 833.3f64 28.9f64 a
+  chk_st est_assumption_check view a EST_OK 204
+  mk_f3 3.0f64 150.0f64 a
+  put a nparam 3
+  chk_st est_assumption_check view a EST_ERR_DIM 205
+  put a nparam 2
+  put a param 2 1.0f64
+  chk_st est_assumption_check view a EST_ERR_DIM 206
+  put a param 2 0.0f64
+  put a quantum 0.0f64
+  chk_st est_assumption_check view a EST_ERR_NOT_PD 207
+  put a quantum est_nan
+  chk_st est_assumption_check view a EST_ERR_NONFINITE 208
+  put a quantum QU
+  put a lo 5.0f64
+  put a hi 4.0f64
+  chk_st est_assumption_check view a EST_ERR_ENCODING 209
+  put a lo -1.0e8f64
+  put a hi 1.0e8f64
+  put a family 0
+  chk_st est_assumption_check view a EST_ERR_KIND 210
+  put a family EST_FAM_STUDENT_T
+  put a unit EST_UNIT_NONE
+  chk_st est_assumption_check view a EST_ERR_UNIT 211
+  mk_f3 3.0f64 150.0f64 a
+  put a lo 0.0f64
+  chk_st est_assumption_digest view a d0 EST_OK 212
+  put a lo est_neg_zero
+  chk_st est_assumption_digest view a d1 EST_OK 213
+  chk est_digest_eq view d0 view d1 214
+  put a quantum 50.0f64
+  chk_st est_assumption_digest view a d1 EST_OK 215
+  chk not est_digest_eq view d0 view d1 216
+end
+
+fn test_classify to void
+  a = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  mk_f3 3.0f64 150.0f64 a
+  put a lo 0.0f64
+  put a hi 100000.0f64
+  ev = new uchar 32 0
+  zero = new uchar 32 0
+  mk_evd 1 ev
+  o = new EstPObs f64 0.0 ulong 0 uchar 0
+  chk_st est_pobs_classify view a 500.0f64 1 view zero o EST_ERR_KIND 220
+  chk_st est_pobs_classify view a est_nan 0 view ev o EST_OK 221
+  chk and eq get o cls EST_OBS_MISSING est_isnan get o val 222
+  chk_st est_pobs_classify view a est_nan 1 view ev o EST_OK 223
+  chk eq get o cls EST_OBS_NONFINITE 224
+  chk_st est_pobs_classify view a est_ninf 1 view ev o EST_OK 225
+  chk eq get o cls EST_OBS_NONFINITE 226
+  chk_st est_pobs_classify view a -100.0f64 1 view ev o EST_OK 227
+  chk eq get o cls EST_OBS_OUT_OF_RANGE 228
+  chk_st est_pobs_classify view a 537.0f64 1 view ev o EST_OK 229
+  chk eq get o cls EST_OBS_OFF_GRID 230
+  chk_st est_pobs_classify view a 500.001f64 1 view ev o EST_OK 231
+  chk eq get o cls EST_OBS_OFF_GRID 232
+  chk_st est_pobs_classify view a add 500.0f64 1.0e-8f64 1 view ev o EST_OK 233
+  chk eq get o cls EST_OBS_OK 234
+  chk_st est_pobs_classify view a 100000.0f64 1 view ev o EST_OK 235
+  chk eq get o cls EST_OBS_OK 236
+end
+
+note ---- 3. State machine ----
+
+fn test_state_machine to void
+  a = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  mk_f3 3.0f64 150.0f64 a
+  b = new EstBState ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0 ulong 0 ulong 0 ulong 0 ulong 0 f64 0.0 long 0 long 0
+  cache = new f64 801 0.0
+  p = new EstDPred uchar 0 ulong 0 ulong 0 ulong 0 f64 0.0 f64 0.0
+  p2 = new EstDPred uchar 0 ulong 0 ulong 0 ulong 0 f64 0.0 f64 0.0
+  pmf = new f64 801 0.0
+  pmf2 = new f64 801 0.0
+  iv = new EstPInnov ulong 0 ulong 0 long 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0
+  o = new EstPObs f64 0.0 ulong 0 uchar 0
+  chk_st est_pred_init view a b cache EST_OK 300
+  chk and eq get b generation 0 eq get b has_anchor 0 301
+  chk_st est_pred_predict view a b cache 1 p pmf EST_ERR_STALE 302
+  mk_pob view a est_nan 1 0 o
+  chk_st est_pred_update view a b view o EST_OK 303
+  mk_pob view a 37.0f64 1 1 o
+  chk_st est_pred_update view a b view o EST_OK 304
+  mk_pob view a 1.0e9f64 1 2 o
+  chk_st est_pred_update view a b view o EST_OK 305
+  mk_pob view a 0.0f64 0 3 o
+  chk_st est_pred_update view a b view o EST_OK 306
+  chk eq get b cnt EST_OBS_NONFINITE 1 307
+  chk eq get b cnt EST_OBS_OFF_GRID 1 307
+  chk eq get b cnt EST_OBS_OUT_OF_RANGE 1 307
+  chk eq get b cnt EST_OBS_MISSING 1 307
+  chk_st est_pred_predict view a b cache 1 p pmf EST_ERR_STALE 308
+  mk_pob view a 25000.0f64 1 4 o
+  chk_st est_pred_update view a b view o EST_OK 309
+  chk eq get b has_anchor 1 310
+  chk eq get b anchor 25000.0f64 310
+  chk eq get b gap 0 310
+  put o val est_nan
+  chk_st est_pred_update view a b view o EST_ERR_KIND 311
+  put o val 25037.0f64
+  chk_st est_pred_update view a b view o EST_ERR_KIND 312
+  put o val 25000.0f64
+  put o cls EST_OBS_OFF_GRID
+  chk_st est_pred_update view a b view o EST_ERR_KIND 313
+  put o cls EST_OBS_OK
+  chk_st est_pred_predict view a b cache 1 p pmf EST_OK 314
+  chk pmf_ok view pmf 315
+  mk_pob view a 25100.0f64 1 99 o
+  chk_st est_pred_innov view b view p view pmf view o iv EST_OK 316
+  chk eq get iv valid 1 317
+  chk eq get iv k 1 317
+  chk gt get iv F_lo 0.5f64 317
+  chk_st est_pred_predict view a b cache 1 p2 pmf2 EST_OK 318
+  chk_st est_pred_innov view b view p view pmf view o iv EST_ERR_STALE 319
+  chk_st est_pred_innov view b view p2 view pmf2 view o iv EST_OK 320
+  chk_st est_pred_predict view a b cache 2 p pmf EST_OK 321
+  chk_st est_pred_innov view b view p view pmf view o iv EST_ERR_STALE 322
+  chk_st est_dpred_score view p view pmf view o iv EST_OK 323
+  chk_st est_pred_update view a b view o EST_OK 324
+  chk_st est_pred_predict view a b cache 0 p pmf EST_ERR_TIME 325
+  chk_st est_pred_predict view a b cache 65 p pmf EST_ERR_TIME 326
+  chk_st est_pred_predict view a b cache 64 p pmf EST_OK 327
+  for i ulong 60
+    mk_pob view a 0.0f64 0 add 1000 i o
+    chk_st est_pred_update view a b view o EST_OK 328
+  end
+  chk eq get b gap 60 329
+  chk_st est_pred_predict view a b cache 5 p pmf EST_ERR_TIME 330
+  chk_st est_pred_predict view a b cache 4 p pmf EST_OK 331
+  chk eq get p horizon 64 332
+  for i ulong 10
+    mk_pob view a est_nan 1 add 2000 i o
+    chk_st est_pred_update view a b view o EST_OK 333
+  end
+  chk_st est_pred_predict view a b cache 1 p pmf EST_ERR_TIME 334
+  mk_pob view a 26000.0f64 1 5000 o
+  chk_st est_pred_update view a b view o EST_OK 335
+  chk and eq get b gap 0 eq get b anchor 26000.0f64 336
+  chk_st est_pred_predict view a b cache 1 p pmf EST_OK 337
+end
+
+note ---- 4. PMFs: conv_pow, floor, F1/F3/F4/F5 closed forms, width80 ----
+
+fn naive_conv a view f64 801 b view f64 801 dst edit f64 801 to void
+  for i ulong EST_PRED_N
+    put dst i 0.0f64
+  end
+  for i ulong EST_PRED_N
+    ai = get a i
+    if ne ai 0.0f64
+      for j ulong EST_PRED_N
+        bj = get b j
+        if ne bj 0.0f64
+          t = sub add long i long j EST_PRED_K
+          if lt t 0
+            t = 0
+          end
+          if gt t 800
+            t = 800
+          end
+          ut = ulong t
+          put dst ut add get dst ut mul ai bj
+        end
+      end
+    end
+  end
+end
+
+fn is_conv_h h ulong to bool
+  if eq h 1
+    ret true
+  end
+  if eq h 2
+    ret true
+  end
+  if eq h 3
+    ret true
+  end
+  if eq h 7
+    ret true
+  end
+  ret eq h 16
+end
+
+fn test_pmfs_conv to void
+  r = new ulong 1 0xc0ffee
+  one = new f64 801 0.0
+  outp = new f64 801 0.0
+  refp = new f64 801 0.0
+  tmp = new f64 801 0.0
+  s = f64 0.0
+  for k0 ulong 11
+    k = sub long k0 5
+    w = runif r
+    if eq k 0
+      w = mul w 4.0f64
+    end
+    put one ulong add k EST_PRED_K w
+    s = add s w
+  end
+  for i ulong EST_PRED_N
+    put one i div get one i s
+    put refp i get one i
+  end
+  for h0 ulong 16
+    h = add h0 1
+    if gt h 1
+      naive_conv view refp view one tmp
+      for i ulong EST_PRED_N
+        put refp i get tmp i
+      end
+    end
+    if is_conv_h h
+      chk_st est_pmf_conv_pow view one h outp EST_OK 400
+      md = f64 0.0
+      tot = f64 0.0
+      for i ulong EST_PRED_N
+        d = fabs sub get outp i get refp i
+        if gt d md
+          md = d
+        end
+        tot = add tot get outp i
+      end
+      chk le md 1.0e-14f64 401
+      chk_near tot 1.0f64 1.0e-12f64 402
+    end
+  end
+  for i ulong EST_PRED_N
+    put one i div 1.0f64 801.0f64
+  end
+  chk_st est_pmf_conv_pow view one 64 outp EST_OK 403
+  tot = f64 0.0
+  for i ulong EST_PRED_N
+    tot = add tot get outp i
+  end
+  chk_near tot 1.0f64 1.0e-12f64 404
+  chk gt get outp 0 0.1f64 405
+  chk lt fabs sub get outp 0 get outp 800 1.0e-12f64 405
+  chk_st est_pmf_conv_pow view one 0 outp EST_ERR_TIME 406
+  chk_st est_pmf_conv_pow view one 65 outp EST_ERR_TIME 407
+end
+
+fn pmf_max_diff a view f64 801 b view f64 801 to f64
+  md = f64 0.0
+  for i ulong EST_PRED_N
+    d = fabs sub get a i get b i
+    if gt d md
+      md = d
+    end
+  end
+  ret md
+end
+
+fn chk_t3_closed pmft view f64 801 to void
+  for k0 ulong 9
+    k = sub long k0 4
+    rf = sub est_t_cdf div mul add f64 k 0.5f64 QU 150.0f64 3.0f64 est_t_cdf div mul sub f64 k 0.5f64 QU 150.0f64 3.0f64
+    chk_near get pmft ulong add k EST_PRED_K rf 1.0e-12f64 417
+  end
+end
+
+fn test_pmfs_t_vs_f5 to void
+  t3 = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  t5 = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  mk_f3 3.0f64 150.0f64 t3
+  mk_f5 1.0f64 3.0f64 1.0f64 833.3f64 150.0f64 t5
+  bt = new EstBState ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0 ulong 0 ulong 0 ulong 0 ulong 0 f64 0.0 long 0 long 0
+  b5 = new EstBState ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0 ulong 0 ulong 0 ulong 0 ulong 0 f64 0.0 long 0 long 0
+  ct = new f64 801 0.0
+  c5 = new f64 801 0.0
+  pt = new EstDPred uchar 0 ulong 0 ulong 0 ulong 0 f64 0.0 f64 0.0
+  p5 = new EstDPred uchar 0 ulong 0 ulong 0 ulong 0 f64 0.0 f64 0.0
+  pmft = new f64 801 0.0
+  pmf5 = new f64 801 0.0
+  o = new EstPObs f64 0.0 ulong 0 uchar 0
+  chk_st est_pred_init view t3 bt ct EST_OK 410
+  chk_st est_pred_init view t5 b5 c5 EST_OK 411
+  mk_pob view t3 30000.0f64 1 1 o
+  chk_st est_pred_update view t3 bt view o EST_OK 412
+  chk_st est_pred_update view t5 b5 view o EST_OK 413
+  chk_st est_pred_predict view t3 bt ct 1 pt pmft EST_OK 414
+  chk_st est_pred_predict view t5 b5 c5 1 p5 pmf5 EST_OK 415
+  chk le pmf_max_diff view pmft view pmf5 1.0e-15f64 416
+  chk_t3_closed view pmft
+end
+
+fn test_pmfs_mix_and_gauss to void
+  bt = new EstBState ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0 ulong 0 ulong 0 ulong 0 ulong 0 f64 0.0 long 0 long 0
+  ct = new f64 801 0.0
+  pt = new EstDPred uchar 0 ulong 0 ulong 0 ulong 0 f64 0.0 f64 0.0
+  pmft = new f64 801 0.0
+  o = new EstPObs f64 0.0 ulong 0 uchar 0
+  m4 = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  mk_f4 2.0f64 0.7f64 0.3f64 0.0f64 2500.0f64 m4
+  put m4 param 5 90000.0f64
+  mx = new EstMix ulong 2 f64 0.0 f64 0.0
+  put mx w 0 0.7f64
+  put mx w 1 0.3f64
+  put mx v 0 2500.0f64
+  put mx v 1 90000.0f64
+  mk_pob view m4 30000.0f64 1 1 o
+  chk_st est_pred_init view m4 bt ct EST_OK 420
+  chk_st est_pred_update view m4 bt view o EST_OK 421
+  chk_st est_pred_predict view m4 bt ct 1 pt pmft EST_OK 422
+  chi = new f64 1 0.0
+  clo = new f64 1 0.0
+  for k ulong 7
+    chk_st est_mix_cdf_abs view mx 1 mul add f64 k 0.5f64 QU chi EST_OK 423
+    put clo 0 0.0f64
+    if gt k 0
+      chk_st est_mix_cdf_abs view mx 1 mul sub f64 k 0.5f64 QU clo EST_OK 424
+    end
+    rf = get chi 0
+    if gt k 0
+      rf = mul 0.5f64 sub get chi 0 get clo 0
+    end
+    chk_near get pmft add EST_PRED_KU k rf 1.0e-11f64 425
+    chk_near get pmft sub EST_PRED_KU k rf 1.0e-11f64 426
+  end
+  mk_f1 1.0e6f64 0.0f64 0.0f64 m4
+  chk_st est_pred_init view m4 bt ct EST_OK 430
+  chk_st est_pred_update view m4 bt view o EST_OK 431
+  chk_st est_pred_predict view m4 bt ct 1 pt pmft EST_OK 432
+  chk_st est_dpred_width80 view pt view pmft chi EST_OK 433
+  chk le fabs sub get chi 0 mul 2.0f64 mul 1.2816f64 1000.0f64 mul 2.0f64 QU 434
+  iv = new EstPInnov ulong 0 ulong 0 long 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0
+  mk_pob view m4 add 30000.0f64 1.0e6f64 1 3 o
+  chk_st est_dpred_score view pt view pmft view o iv EST_OK 435
+  chk eq get iv valid 1 436
+  chk eq get iv k EST_PRED_K 436
+  chk eq get iv F_hi 1.0f64 436
+  mk_pob view m4 sub 30000.0f64 1.0e6f64 1 4 o
+  chk_st est_dpred_score view pt view pmft view o iv EST_OK 437
+  chk eq get iv valid 1 438
+  chk eq get iv k neg EST_PRED_K 438
+  chk eq get iv F_lo 0.0f64 438
+end
+
+fn test_pmfs_families to void
+  test_pmfs_t_vs_f5
+  test_pmfs_mix_and_gauss
+end
+
+note ---- 5. Verdict order ----
+
+fn test_verdict_order to void
+  bd = new EstBands f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0
+  est_bands_default bd
+  chk and eq get bd cov50 0 0.46f64 eq get bd min_n 2000 500
+  c = new EstCalib ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0
+  want_rc = new ulong 9 0
+  put want_rc 0 1
+  put want_rc 1 2
+  put want_rc 2 3
+  put want_rc 3 4
+  put want_rc 4 10
+  put want_rc 5 17
+  put want_rc 6 20
+  put want_rc 7 21
+  put want_rc 8 0
+  rc = new ulong 1 0
+  for stage ulong 9
+    est_calib_init c
+    nf = f64 3000.0
+    if eq stage 0
+      put c n 1999
+    else
+      put c n 3000
+    end
+    if eq stage 1
+      put c cov 0 mul 0.60f64 nf
+    else
+      put c cov 0 mul 0.50f64 nf
+    end
+    if le stage 2
+      put c cov 1 mul 0.70f64 nf
+    else
+      put c cov 1 mul 0.80f64 nf
+    end
+    if le stage 3
+      put c cov 2 mul 0.99f64 nf
+    else
+      put c cov 2 mul 0.95f64 nf
+    end
+    for j ulong 10
+      put c pit j mul 0.1f64 nf
+    end
+    if le stage 4
+      put c pit 0 mul 0.05f64 nf
+      put c pit 7 mul 0.15f64 nf
+    end
+    if eq stage 5
+      put c pit 7 mul 0.14f64 nf
+      put c pit 8 mul 0.06f64 nf
+    end
+    if le stage 6
+      put c z_sum mul 0.2f64 nf
+    end
+    put c z_sq nf
+    if le stage 7
+      put c z_lag mul 0.5f64 sub nf 1.0f64
+    end
+    v = est_calib_verdict view c view bd rc
+    chk eq get rc 0 get want_rc stage 501
+    if eq stage 8
+      chk eq v EST_CALIBRATED 502
+    else
+      chk eq v EST_NOT_CALIBRATED 503
+    end
+  end
+end
+
+note ---- 6. Calibration scenarios ----
+
+fn stream_step a view EstAssump b edit EstBState cache edit f64 801 c1 edit EstCalib t ulong to void
+  p1 = new EstDPred uchar 0 ulong 0 ulong 0 ulong 0 f64 0.0 f64 0.0
+  pmf1 = new f64 801 0.0
+  o = new EstPObs f64 0.0 ulong 0 uchar 0
+  iv = new EstPInnov ulong 0 ulong 0 long 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0
+  have1 = false
+  if eq get b has_anchor 1
+    st = est_pred_predict a b cache 1 p1 pmf1
+    if eq st EST_OK
+      have1 = true
+    end
+  end
+  mk_pob a get g_y t get g_pres t t o
+  if have1
+    st = est_pred_innov view b view p1 view pmf1 view o iv
+    if eq st EST_OK
+      if eq get iv valid 1
+        if ge t get g_lohi 0
+          if lt t get g_lohi 1
+            u = est_calib_add c1 view p1 view pmf1 view iv
+          end
+        end
+      end
+    end
+  end
+  u = est_pred_update a b view o
+  put g_xh t get b xhat
+end
+
+fn run_stream a view EstAssump n ulong lo ulong hi ulong c1 edit EstCalib to void
+  est_calib_init c1
+  put g_lohi 0 lo
+  put g_lohi 1 hi
+  b = new EstBState ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0 ulong 0 ulong 0 ulong 0 ulong 0 f64 0.0 long 0 long 0
+  cache = new f64 801 0.0
+  chk_st est_pred_init a b cache EST_OK 600
+  for t ulong n bound 10005
+    stream_step a b cache c1 t
+  end
+end
+
+fn chk_verdict c view EstCalib want ulong tag ulong to void
+  bd = new EstBands f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0
+  est_bands_default bd
+  rc = new ulong 1 0
+  v = est_calib_verdict c view bd rc
+  chk eq v want tag
+end
+
+fn scen_gauss_and_t3 to void
+  r = new ulong 1 101
+  a = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  c1 = new EstCalib ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0
+  y = f64 30000.0
+  for t ulong 4000
+    if gt t 0
+      y = add y on_grid mul 300.0f64 rnorm r
+    end
+    put g_y t y
+    put g_pres t 1
+  end
+  mk_f1 9.0e4f64 0.0f64 0.0f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_CALIBRATED 610
+  mk_f1 3.6e5f64 0.0f64 0.0f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_NOT_CALIBRATED 611
+  mk_f1 2.25e4f64 0.0f64 0.0f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_NOT_CALIBRATED 612
+
+  put r 0 103
+  y = 30000.0f64
+  for t ulong 4000
+    if gt t 0
+      y = add y on_grid mul 150.0f64 rt r 3
+    end
+    put g_y t y
+    put g_pres t 1
+  end
+  mk_f3 3.0f64 150.0f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_CALIBRATED 620
+  lp_true = get c1 logp_sum
+  mk_f3 3.0f64 37.5f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_NOT_CALIBRATED 621
+  chk lt get c1 logp_sum lp_true 622
+end
+
+fn max_err_50 to f64
+  em = f64 0.0
+  for t0 ulong 3950
+    t = add t0 50
+    d = fabs sub get g_xh t get g_lvl t
+    if gt d em
+      em = d
+    end
+  end
+  ret em
+end
+
+fn scen_spikes_drift_ar to void
+  r = new ulong 1 104
+  a = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  c1 = new EstCalib ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0
+  y = f64 30000.0
+  spikes = ulong 0
+  for t ulong 4000
+    if gt t 0
+      y = add y on_grid mul 200.0f64 rnorm r
+    end
+    put g_lvl t y
+    put g_y t y
+    put g_pres t 1
+    if ge t 50
+      if lt runif r 0.005f64
+        put g_y t add y 20000.0f64
+        spikes = add spikes 1
+      end
+    end
+  end
+  chk gt spikes 5 630
+  mk_f1 4.0e4f64 2500.0f64 1.0e6f64 a
+  run_stream view a 4000 0 4000 c1
+  e1 = max_err_50
+  mk_f2 4.0e4f64 2500.0f64 1.0e6f64 2.0f64 a
+  run_stream view a 4000 0 4000 c1
+  e2 = max_err_50
+  chk gt e1 15000.0f64 631
+  chk lt e2 1500.0f64 631
+
+  put r 0 105
+  y = 30000.0f64
+  for t ulong 4000
+    if gt t 0
+      y = add y on_grid add mul 150.0f64 rnorm r 60.0f64
+    end
+    put g_y t y
+    put g_pres t 1
+  end
+  mk_f1 22500.0f64 0.0f64 0.0f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_NOT_CALIBRATED 640
+
+  put r 0 109
+  put g_ar 0 0.0f64
+  y = 30000.0f64
+  for t ulong 6000
+    if gt t 0
+      ar = add mul 0.6f64 get g_ar 0 mul 400.0f64 rnorm r
+      put g_ar 0 ar
+      y = add y on_grid ar
+    end
+    put g_y t y
+    put g_pres t 1
+  end
+  mk_f1 250000.0f64 0.0f64 0.0f64 a
+  run_stream view a 6000 0 6000 c1
+  bd = new EstBands f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 ulong 0
+  est_bands_default bd
+  rc = new ulong 1 0
+  v = est_calib_verdict view c1 view bd rc
+  chk and eq v EST_NOT_CALIBRATED eq get rc 0 21 650
+end
+
+fn scen_stable_and_jump to void
+  r = new ulong 1 110
+  a = new EstAssump ulong 0 ulong 0 f64 0.0 f64 0.0 f64 0.0 ulong 0 f64 0.0
+  c1 = new EstCalib ulong 0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0 f64 0.0
+  y = f64 30000.0
+  for t ulong 4000
+    if gt t 0
+      y = add y on_grid mul 20.0f64 rt r 3
+    end
+    put g_y t y
+    put g_pres t 1
+  end
+  mk_f3 3.0f64 20.0f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_CALIBRATED 660
+  mk_f3 3.0f64 2.0f64 a
+  run_stream view a 4000 0 4000 c1
+  chk_verdict view c1 EST_NOT_CALIBRATED 661
+
+  put r 0 112
+  for t ulong 6000
+    lv = f64 25030.0
+    if ge t 3000
+      lv = add lv 5000.0f64
+    end
+    put g_y t on_grid add lv mul 300.0f64 rnorm r
+    put g_pres t 1
+  end
+  mk_f1 1.0f64 add 9.0e4f64 div mul QU QU 12.0f64 1.0e6f64 a
+  run_stream view a 6000 0 3000 c1
+  chk_verdict view c1 EST_CALIBRATED 670
+  run_stream view a 6000 0 6000 c1
+  chk_verdict view c1 EST_NOT_CALIBRATED 671
+end
+
+fn main to int
+  test_numerics
+  test_assumption
+  test_classify
+  test_state_machine
+  test_pmfs_conv
+  test_pmfs_families
+  test_verdict_order
+  scen_gauss_and_t3
+  scen_spikes_drift_ar
+  scen_stable_and_jump
+  est_puts P_PREFIX
+  est_putu get g_checks 0
+  est_puts P_CHECKS
+  est_putu get g_fail 0
+  est_puts P_FAILED
+  if gt get g_fail 0 0
+    est_puts P_FAIL
+    ret 1
+  end
+  est_puts P_PASS
+  ret 0
+end

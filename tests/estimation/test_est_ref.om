@@ -1,0 +1,661 @@
+note SPDX-License-Identifier: Apache-2.0
+note EST-1 independent reference & NIS calibration tests in pure seeded OM-2
+note (port of tests/estimation/test_est_ref.c).
+
+global g_checks ulong 1
+global g_fail ulong 1
+global g_nis_chi f64 1
+global g_nis_above ulong 1
+
+const SEED_XCHECK_BASE ulong 0x9e3779b97f4a7c15
+const SEED_STRIDE ulong 0xd1b54a32d192ed03
+const SEED_NIS_BASE ulong 0x2545f4914f6cdd1d
+
+text R_PREFIX "test_est_ref: "
+text R_CHECKS " checks, "
+text R_FAILED " failed\n"
+text R_PASS "est_ref: PASS\n"
+text R_FAIL "est_ref: FAIL\n"
+text R_FTAG "FAIL tag="
+text R_NL "\n"
+
+fn chk cond bool tag ulong to void
+  put g_checks 0 add get g_checks 0 1
+  if not cond
+    put g_fail 0 add get g_fail 0 1
+    est_eputs R_FTAG
+    est_putu_fd 2 tag
+    est_eputs R_NL
+  end
+end
+
+fn near_abs a f64 b f64 tol f64 to bool
+  ret le fabs sub a b tol
+end
+
+fn rng_u64 st edit ulong 1 to ulong
+  x = get st 0
+  x = xor x shr x 12
+  x = xor x shl x 25
+  x = xor x shr x 27
+  put st 0 x
+  ret mul x 0x2545f4914f6cdd1d
+end
+
+fn rng_seed st edit ulong 1 seed ulong to void
+  if eq seed 0
+    put st 0 1
+  else
+    put st 0 seed
+  end
+  for i ulong 8
+    u = rng_u64 st
+  end
+end
+
+fn rng_u01 st edit ulong 1 to f64
+  u = add f64 shr rng_u64 st 11 0.5f64
+  ret div u 9007199254740992.0f64
+end
+
+fn rng_uni st edit ulong 1 lo f64 hi f64 to f64
+  ret add lo mul sub hi lo rng_u01 st
+end
+
+fn rng_gauss st edit ulong 1 to f64
+  u1 = rng_u01 st
+  u2 = rng_u01 st
+  ret mul fsqrt mul -2.0f64 est_log u1 est_cos mul EST_TWO_PI u2
+end
+
+note ---- Part (a): reference alone against closed forms ----
+
+fn rw_step_err xv f64 pv f64 k ulong to f64
+  ep = div 1.0f64 add 0.5f64 mul 2.0f64 f64 k
+  ex = mul ep mul 2.0f64 f64 k
+  dp = div fabs sub pv ep ep
+  dx = div fabs sub xv ex ex
+  ret fmax dp dx
+end
+
+fn part_a_rw to void
+  r = new ulong 73 0
+  x = new f64 8 0.0
+  P = new f64 64 2.0
+  one = new f64 64 1.0
+  zero = new f64 64 0.0
+  Rm = new f64 64 0.5
+  z = new f64 8 1.0
+  chk est_ref_init r 1 view x view P 100
+  worst = f64 0.0
+  for k0 ulong 10
+    chk est_ref_predict r view one view zero 101
+    chk est_ref_update r 1 view one view Rm view z 102
+    chk est_ref_get view r x P 103
+    worst = fmax worst rw_step_err get x 0 get P 0 add k0 1
+  end
+  chk lt worst 1.0e-13f64 104
+end
+
+fn riccati_sim qv f64 rv f64 res edit f64 4 to void
+  r = new ulong 73 0
+  x = new f64 8 0.0
+  P = new f64 64 10.0
+  one = new f64 64 1.0
+  Qm = new f64 64 0.0
+  put Qm 0 qv
+  Rm = new f64 64 0.0
+  put Rm 0 rv
+  z = new f64 8 0.0
+  iv = new ulong 96 0
+  chk est_ref_init r 1 view x view P 112
+  for k ulong 400
+    u = est_ref_predict r view one view Qm
+    if eq k 399
+      u = est_ref_get view r x P
+      put res 0 get P 0
+      u = est_ref_innovation view r 1 view one view Rm view z iv
+      put res 3 bitcast f64 get iv EI_S
+    end
+    u = est_ref_update r 1 view one view Rm view z
+  end
+  u = est_ref_get view r x P
+  put res 1 get P 0
+  put res 2 div get P 0 rv
+end
+
+fn part_a_riccati_one qv f64 rv f64 exp_pr f64 exp_po f64 exp_g f64 to void
+  Pstar = mul 0.5f64 add qv fsqrt add mul qv qv mul 4.0f64 mul qv rv
+  post = div mul Pstar rv add Pstar rv
+  chk near_abs Pstar exp_pr 1.0e-14f64 110
+  chk near_abs post exp_po 1.0e-14f64 111
+  res = new f64 4 0.0
+  riccati_sim qv rv res
+  chk near_abs get res 0 exp_pr 1.0e-12f64 113
+  chk near_abs get res 1 exp_po 1.0e-12f64 114
+  chk near_abs get res 2 exp_g 1.0e-12f64 115
+  chk near_abs get res 3 add Pstar rv 1.0e-12f64 116
+end
+
+fn cv_riccati_step av edit f64 3 Qc view f64 64 RR f64 to void
+  a00 = get av 0
+  a01 = get av 1
+  a11 = get av 2
+  p00 = add add add a00 mul 2.0f64 a01 a11 get Qc 0
+  p01 = add add a01 a11 get Qc 1
+  p11 = add a11 get Qc 3
+  s = add p00 RR
+  k0 = div p00 s
+  k1 = div p01 s
+  put av 0 sub p00 mul k0 p00
+  put av 1 sub p01 mul k0 p01
+  put av 2 sub p11 mul k1 p01
+end
+
+fn cv_steady_loop r edit ulong 73 F view f64 64 H view f64 64 Qc view f64 64 Rm view f64 64 av edit f64 3 to bool
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  prev = f64 0.0
+  for it ulong 3000
+    u = est_ref_predict r F Qc
+    u = est_ref_update r 1 H Rm view x0
+    cv_riccati_step av Qc get Rm 0
+    u = est_ref_get view r x0 P0
+    if gt it 10
+      if lt fabs sub get P0 0 prev 1.0e-14f64
+        ret true
+      end
+    end
+    prev = get P0 0
+  end
+  ret false
+end
+
+fn cv_steady_check P0 view f64 64 av view f64 3 conv bool to void
+  chk near_abs get P0 0 get av 0 mul 1.0e-9f64 get av 0 130
+  chk near_abs get P0 1 get av 1 add mul 1.0e-9f64 fabs get av 1 1.0e-12f64 131
+  chk near_abs get P0 3 get av 2 mul 1.0e-9f64 get av 2 132
+  chk conv 133
+end
+
+fn part_a_cv_steady qq f64 RR f64 to void
+  r = new ulong 73 0
+  F = new f64 64 0.0
+  put F 0 1.0f64
+  put F 1 1.0f64
+  put F 3 1.0f64
+  H = new f64 64 0.0
+  put H 0 1.0f64
+  Qc = new f64 64 0.0
+  put Qc 0 div qq 3.0f64
+  put Qc 1 div qq 2.0f64
+  put Qc 2 div qq 2.0f64
+  put Qc 3 qq
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put P0 0 100.0f64
+  put P0 3 100.0f64
+  Rm = new f64 64 0.0
+  put Rm 0 RR
+  av = new f64 3 0.0
+  put av 0 100.0f64
+  put av 2 100.0f64
+  u = est_ref_init r 2 view x0 view P0
+  conv = cv_steady_loop r view F view H view Qc view Rm av
+  u = est_ref_get view r x0 P0
+  cv_steady_check view P0 view av conv
+end
+
+fn part_a_cv to void
+  r = new ulong 73 0
+  F = new f64 64 0.0
+  put F 0 1.0f64
+  put F 1 1.0f64
+  put F 3 1.0f64
+  H = new f64 64 0.0
+  put H 0 1.0f64
+  Q = new f64 64 0.0
+  put Q 0 0.2f64
+  put Q 1 0.3f64
+  put Q 2 0.3f64
+  put Q 3 0.6f64
+  I2 = new f64 64 0.0
+  put I2 0 1.0f64
+  put I2 3 1.0f64
+  x0 = new f64 8 0.0
+  Rm = new f64 64 1.0
+  zz = new f64 8 1.0
+  iv = new ulong 96 0
+  chk est_ref_init r 2 view x0 view I2 120
+  u = est_ref_predict r view F view Q
+  u = est_ref_innovation view r 1 view H view Rm view zz iv
+  chk near_abs bitcast f64 get iv EI_S 3.2f64 1.0e-14f64 121
+  chk near_abs bitcast f64 get iv EI_NU 1.0f64 1.0e-14f64 122
+  chk near_abs bitcast f64 get iv EI_NIS 0.3125f64 1.0e-14f64 123
+  u = est_ref_update r 1 view H view Rm view zz
+  xa = new f64 8 0.0
+  Pa = new f64 64 0.0
+  u = est_ref_get view r xa Pa
+  chk and near_abs get xa 0 0.6875f64 1.0e-14f64 near_abs get xa 1 0.40625f64 1.0e-14f64 124
+  chk and near_abs get Pa 0 0.6875f64 1.0e-14f64 near_abs get Pa 1 0.40625f64 1.0e-14f64 125
+  chk and near_abs get Pa 2 0.40625f64 1.0e-14f64 near_abs get Pa 3 1.071875f64 1.0e-14f64 126
+  part_a_cv_steady 0.6f64 1.0f64
+  part_a_cv_steady 0.01f64 4.0f64
+end
+
+fn part_a to void
+  part_a_rw
+  part_a_riccati_one 1.0f64 4.0f64 2.561552812808830f64 1.561552812808830f64 0.390388203202207f64
+  part_a_riccati_one 0.01f64 1.0f64 0.105124921972503f64 0.095124921972503f64 0.095124921972503f64
+  part_a_riccati_one 4.0f64 0.25f64 4.236067977499789f64 0.236067977499789f64 0.944271909999158f64
+  part_a_cv
+end
+
+note ---- Part (b): est_kf cross-check vs information-form reference ----
+
+fn spd_dot A view f64 64 n ulong i ulong j ulong to f64
+  s = f64 0.0
+  for k ulong n
+    s = add s mul get A add mul i n k get A add mul j n k
+  end
+  ret s
+end
+
+fn mk_spd st edit ulong 1 M edit f64 64 n ulong fl f64 amp f64 to void
+  A = new f64 64 0.0
+  for i ulong mul n n
+    put A i rng_uni st neg amp amp
+  end
+  for i ulong n
+    for j ulong n
+      s = spd_dot view A n i j
+      if eq i j
+        s = add s fl
+      end
+      put M add mul i n j s
+    end
+  end
+end
+
+fn rel_diff_rec a view ulong * aoff ulong b view f64 64 cnt ulong to f64
+  mx = f64 0.0
+  d = f64 0.0
+  for i ulong cnt
+    rv = fabs get b i
+    if gt rv mx
+      mx = rv
+    end
+  end
+  if lt mx 1.0e-12f64
+    mx = 1.0e-12f64
+  end
+  for i ulong cnt
+    e = fabs sub bitcast f64 get a add aoff i get b i
+    if gt e d
+      d = e
+    end
+  end
+  ret div d mx
+end
+
+fn rel_diff_vec a view ulong * aoff ulong b view f64 8 cnt ulong to f64
+  mx = f64 0.0
+  d = f64 0.0
+  for i ulong cnt
+    rv = fabs get b i
+    if gt rv mx
+      mx = rv
+    end
+  end
+  if lt mx 1.0e-12f64
+    mx = 1.0e-12f64
+  end
+  for i ulong cnt
+    e = fabs sub bitcast f64 get a add aoff i get b i
+    if gt e d
+      d = e
+    end
+  end
+  ret div d mx
+end
+
+fn fill_scen_mdl st edit ulong 1 n ulong m ulong mdl edit ulong 280 x0 edit f64 8 P0 edit f64 64 to void
+  for i ulong EST_MODEL_LEN
+    put mdl i 0
+  end
+  put mdl EM_N n
+  put mdl EM_M m
+  put mdl EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put mdl EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  for i ulong n
+    put mdl add EM_SUNIT i EST_UNIT_DIMENSIONLESS
+  end
+  for i ulong m
+    put mdl add EM_OUNIT i EST_UNIT_DIMENSIONLESS
+  end
+  for i ulong n
+    for j ulong n
+      v = rng_uni st -0.3f64 0.3f64
+      if eq i j
+        v = add v 0.7f64
+      end
+      put mdl add EM_F add mul i n j bitcast ulong v
+    end
+  end
+  Q = new f64 64 0.0
+  R = new f64 64 0.0
+  mk_spd st Q n 0.1f64 0.5f64
+  mk_spd st R m 0.5f64 0.5f64
+  mk_spd st P0 n 1.0f64 1.0f64
+  for i ulong mul n n
+    put mdl add EM_Q i bitcast ulong get Q i
+  end
+  for i ulong mul m m
+    put mdl add EM_R i bitcast ulong get R i
+  end
+  for i ulong mul m n
+    put mdl add EM_H i bitcast ulong rng_uni st -1.0f64 1.0f64
+  end
+  for i ulong n
+    put x0 i rng_uni st -2.0f64 2.0f64
+  end
+  put mdl EM_STEP 1000
+end
+
+fn fill_ref_obs mdl view ulong 280 z view f64 8 t_ns long seq ulong o edit ulong 96 to void
+  for i ulong EST_OBS_LEN
+    put o i 0
+  end
+  m = get mdl EM_M
+  put o EO_M m
+  for i ulong m
+    put o add EO_UNIT i EST_UNIT_DIMENSIONLESS
+    put o add EO_Z i bitcast ulong get z i
+  end
+  for i ulong mul m m
+    put o add EO_R i get mdl add EM_R i
+  end
+  put o EO_TNS bitcast ulong t_ns
+  put o EO_SEQ seq
+  put o EO_SRC 0x1011121314151617
+  put o EO_EV 0xa0a1a2a3a4a5a6a7
+end
+
+fn unpack_hr mdl view ulong 280 H edit f64 64 R edit f64 64 to void
+  m = get mdl EM_M
+  n = get mdl EM_N
+  for i ulong mul m n
+    put H i bitcast f64 get mdl add EM_H i
+  end
+  for i ulong mul m m
+    put R i bitcast f64 get mdl add EM_R i
+  end
+end
+
+fn chk_xcheck_inn inn view ulong 96 rinn view ulong 96 m ulong to void
+  nis_kf = bitcast f64 get inn EI_NIS
+  nis_rf = bitcast f64 get rinn EI_NIS
+  en = div fabs sub nis_kf nis_rf fmax fabs nis_rf 1.0e-12f64
+  chk le en 1.0e-8f64 206
+  Sr = new f64 64 0.0
+  for i ulong mul m m
+    put Sr i bitcast f64 get rinn add EI_S i
+  end
+  chk le rel_diff_rec inn EI_S view Sr mul m m 1.0e-9f64 207
+end
+
+fn xcheck_step_upd mdl view ulong 280 b view ulong 96 pred view ulong 176 ref edit ulong 73 z view f64 8 nb edit ulong 96 to bool
+  obs = new ulong 96 0
+  inn = new ulong 96 0
+  rinn = new ulong 96 0
+  H = new f64 64 0.0
+  R = new f64 64 0.0
+  unpack_hr mdl H R
+  fill_ref_obs mdl z bitcast long get pred EP_TNS get pred EP_GEN obs
+  chk est_ref_innovation view ref get mdl EM_M view H view R z rinn 203
+  if ne est_kf_update mdl b pred view obs nb inn EST_OK
+    chk false 204
+    ret false
+  end
+  chk est_ref_update ref get mdl EM_M view H view R z 205
+  chk_xcheck_inn view inn view rinn get mdl EM_M
+  ret true
+end
+
+fn xcheck_ref_pred mdl view ulong 280 ref edit ulong 73 to void
+  n = get mdl EM_N
+  F = new f64 64 0.0
+  Q = new f64 64 0.0
+  for i ulong mul n n
+    put F i bitcast f64 get mdl add EM_F i
+    put Q i bitcast f64 get mdl add EM_Q i
+  end
+  chk est_ref_predict ref view F view Q 202
+end
+
+fn xcheck_cmp_ref nb view ulong 96 ref view ulong 73 n ulong to void
+  xr = new f64 8 0.0
+  Pr = new f64 64 0.0
+  u = est_ref_get ref xr Pr
+  chk le rel_diff_vec nb EB_X view xr n 1.0e-9f64 209
+  chk le rel_diff_rec nb EB_P view Pr mul n n 1.0e-9f64 210
+end
+
+fn xcheck_step st edit ulong 1 mdl view ulong 280 b edit ulong 96 ref edit ulong 73 t ulong to bool
+  z = new f64 8 0.0
+  have = gt rng_u01 st 0.3f64
+  for i ulong get mdl EM_M
+    put z i rng_uni st -3.0f64 3.0f64
+  end
+  pred = new ulong 176 0
+  bu = new f64 8 0.0
+  if ne est_kf_predict mdl view b 0 view bu 1 pred EST_OK
+    chk false 201
+    ret false
+  end
+  xcheck_ref_pred mdl ref
+  nb = new ulong 96 0
+  if have
+    if not xcheck_step_upd mdl view b view pred ref view z nb
+      ret false
+    end
+  else
+    if ne est_kf_coast mdl view pred view b nb EST_OK
+      chk false 208
+      ret false
+    end
+  end
+  xcheck_cmp_ref view nb view ref get mdl EM_N
+  est_rec_copy view nb b EST_BELIEF_LEN
+  ret true
+end
+
+fn xcheck to void
+  st = new ulong 1 0
+  mdl = new ulong 280 0
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  b = new ulong 96 0
+  ref = new ulong 73 0
+  for sc ulong 120
+    rng_seed st add SEED_XCHECK_BASE mul sc SEED_STRIDE
+    n = add 1 rem rng_u64 st 4
+    m = add 1 rem rng_u64 st n
+    fill_scen_mdl st n m mdl x0 P0
+    chk eq est_kf_prior view mdl view x0 view P0 0 b EST_OK 200
+    chk est_ref_init ref n view x0 view P0 200
+    for t0 ulong 50
+      if not xcheck_step st view mdl b ref add t0 1
+        break
+      end
+    end
+  end
+end
+
+note ---- Part (c): NIS calibration on simulated linear-Gaussian truth ----
+
+fn samp_chol st edit ulong 1 L view f64 64 n ulong dst edit f64 8 to void
+  w = new f64 8 0.0
+  for i ulong n
+    put w i rng_gauss st
+  end
+  for i ulong n
+    s = f64 0.0
+    base = mul i n
+    for j ulong add i 1
+      s = add s mul get L add base j get w j
+    end
+    put dst i s
+  end
+end
+
+fn scale_f_stable mdl edit ulong 280 n ulong to void
+  mx = f64 0.0
+  for r ulong n
+    rs = f64 0.0
+    for c ulong n
+      rs = add rs fabs bitcast f64 get mdl add EM_F add mul r n c
+    end
+    if gt rs mx
+      mx = rs
+    end
+  end
+  if gt mx 0.9f64
+    fac = div 0.9f64 mx
+    for i ulong mul n n
+      v = bitcast f64 get mdl add EM_F i
+      put mdl add EM_F i bitcast ulong mul v fac
+    end
+  end
+end
+
+fn rec_mv_add mdl view ulong 280 off ulong rows ulong cols ulong x view f64 8 dst edit f64 8 to void
+  for i ulong rows
+    a = f64 0.0
+    base = add off mul i cols
+    for j ulong cols
+      a = add a mul bitcast f64 get mdl add base j get x j
+    end
+    put dst i add a get dst i
+  end
+end
+
+fn nis_truth_step st edit ulong 1 mdl view ulong 280 Lq view f64 64 Lr view f64 64 xt edit f64 8 z edit f64 8 to void
+  n = get mdl EM_N
+  m = get mdl EM_M
+  xn = new f64 8 0.0
+  samp_chol st Lq n xn
+  rec_mv_add mdl EM_F n n view xt xn
+  for i ulong n
+    put xt i get xn i
+  end
+  samp_chol st Lr m z
+  rec_mv_add mdl EM_H m n view xt z
+end
+
+fn nis_kf_step mdl view ulong 280 b edit ulong 96 z view f64 8 seq ulong to f64
+  nb = new ulong 96 0
+  pred = new ulong 176 0
+  obs = new ulong 96 0
+  inn = new ulong 96 0
+  bu = new f64 8 0.0
+  rc = est_kf_predict mdl view b 0 view bu 1 pred
+  if ne rc EST_OK
+    chk false 301
+    ret -1.0f64
+  end
+  fill_ref_obs mdl z bitcast long get pred EP_TNS seq obs
+  rc = est_kf_update mdl view b view pred view obs nb inn
+  if ne rc EST_OK
+    chk false 302
+    ret -1.0f64
+  end
+  est_rec_copy view nb b EST_BELIEF_LEN
+  ret bitcast f64 get inn EI_NIS
+end
+
+fn nis_cal_loop st edit ulong 1 mdl view ulong 280 Lq view f64 64 Lr view f64 64 xt edit f64 8 b edit ulong 96 to f64
+  z = new f64 8 0.0
+  sum = f64 0.0
+  put g_nis_above 0 0
+  for t0 ulong 5000 bound 5005
+    nis_truth_step st mdl Lq Lr xt z
+    nv = nis_kf_step mdl b view z add t0 1
+    if lt nv 0.0f64
+      ret -1.0f64
+    end
+    sum = add sum nv
+    if gt nv get g_nis_chi 0
+      put g_nis_above 0 add get g_nis_above 0 1
+    end
+  end
+  ret sum
+end
+
+fn nis_cal_check m ulong sum f64 to void
+  nf = f64 5000.0
+  mean = div sum nf
+  se = fsqrt div mul 2.0f64 f64 m nf
+  frac = div f64 get g_nis_above 0 nf
+  sef = fsqrt div mul 0.05f64 0.95f64 nf
+  chk le fabs sub mean f64 m mul 3.0f64 se 303
+  chk le fabs sub frac 0.05f64 mul 3.0f64 sef 304
+end
+
+fn nis_cal_m m ulong chi95 f64 to void
+  st = new ulong 1 0
+  rng_seed st add SEED_NIS_BASE mul m SEED_STRIDE
+  mdl = new ulong 280 0
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  fill_scen_mdl st 4 m mdl x0 P0
+  scale_f_stable mdl 4
+  Q = new f64 64 0.0
+  Lq = new f64 64 0.0
+  Lr = new f64 64 0.0
+  for i ulong 16
+    put Q i bitcast f64 get mdl add EM_Q i
+  end
+  u = est_chol view Q Lq 4
+  for i ulong mul m m
+    put Q i bitcast f64 get mdl add EM_R i
+  end
+  u = est_chol view Q Lr m
+  u = est_chol view P0 Q 4
+  xt = new f64 8 0.0
+  samp_chol st view Q 4 xt
+  for i ulong 4
+    put xt i add get x0 i get xt i
+  end
+  b = new ulong 96 0
+  chk eq est_kf_prior view mdl view x0 view P0 0 b EST_OK 300
+  put g_nis_chi 0 chi95
+  sum = nis_cal_loop st view mdl view Lq view Lr xt b
+  if ge sum 0.0f64
+    nis_cal_check m sum
+  end
+end
+
+fn nis_calibration to void
+  nis_cal_m 1 3.841459f64
+  nis_cal_m 2 5.991465f64
+  nis_cal_m 3 7.814728f64
+  nis_cal_m 4 9.487729f64
+end
+
+fn main to int
+  part_a
+  xcheck
+  nis_calibration
+  est_puts R_PREFIX
+  est_putu get g_checks 0
+  est_puts R_CHECKS
+  est_putu get g_fail 0
+  est_puts R_FAILED
+  if gt get g_fail 0 0
+    est_puts R_FAIL
+    ret 1
+  end
+  est_puts R_PASS
+  ret 0
+end

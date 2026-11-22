@@ -1,0 +1,985 @@
+note SPDX-License-Identifier: Apache-2.0
+note EST-1 linear Kalman filter tests in pure seeded OM-2 (port of tests/estimation/test_est_kf.c).
+
+global g_checks ulong 1
+global g_fail ulong 1
+global g_rng ulong 1
+
+const NS long 1000000000
+
+text K_PREFIX "test_est_kf: "
+text K_CHECKS " checks, "
+text K_FAILED " failed\n"
+text K_PASS "test_est_kf: PASS\n"
+text K_FAIL "test_est_kf: FAIL\n"
+text K_FTAG "FAIL tag="
+text K_NL "\n"
+
+fn chk cond bool tag ulong to void
+  put g_checks 0 add get g_checks 0 1
+  if not cond
+    put g_fail 0 add get g_fail 0 1
+    est_eputs K_FTAG
+    est_putu_fd 2 tag
+    est_eputs K_NL
+  end
+end
+
+fn chk_st got long want long tag ulong to void
+  chk eq got want tag
+end
+
+fn chk_near a f64 b f64 rel f64 tag ulong to void
+  scale = fmax fabs b 1.0e-300f64
+  chk le fabs sub a b mul rel scale tag
+end
+
+fn chk_nearabs a f64 b f64 ab f64 tag ulong to void
+  chk le fabs sub a b ab tag
+end
+
+fn rng_next to ulong
+  x = get g_rng 0
+  x = xor x shr x 12
+  x = xor x shl x 25
+  x = xor x shr x 27
+  put g_rng 0 x
+  ret mul x 0x2545f4914f6cdd1d
+end
+
+fn rdbl lo f64 hi f64 to f64
+  u = div f64 shr rng_next 11 9007199254740992.0f64
+  ret add lo mul sub hi lo u
+end
+
+fn mk_scalar_model F f64 Q f64 H f64 R f64 dst edit ulong 280 to void
+  for i ulong EST_MODEL_LEN
+    put dst i 0
+  end
+  put dst EM_N 1
+  put dst EM_M 1
+  put dst EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put dst EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  put dst EM_SUNIT EST_UNIT_MILLI_CELSIUS
+  put dst EM_OUNIT EST_UNIT_MILLI_CELSIUS
+  put dst EM_F bitcast ulong F
+  put dst EM_Q bitcast ulong Q
+  put dst EM_H bitcast ulong H
+  put dst EM_R bitcast ulong R
+  put dst EM_STEP bitcast ulong NS
+end
+
+fn mk_obs mdl view ulong 280 z view f64 8 R view f64 64 t_ns long seq ulong dst edit ulong 96 to void
+  for i ulong EST_OBS_LEN
+    put dst i 0
+  end
+  m = get mdl EM_M
+  put dst EO_M m
+  for i ulong m
+    put dst add EO_UNIT i get mdl add EM_OUNIT i
+    put dst add EO_Z i bitcast ulong get z i
+  end
+  for i ulong mul m m
+    put dst add EO_R i bitcast ulong get R i
+  end
+  put dst EO_TNS bitcast ulong t_ns
+  put dst EO_SEQ seq
+  put dst EO_SRC 0x5a
+  ev = or and or seq 1 0xff shl and shr seq 8 0xff 8
+  put dst EO_EV ev
+end
+
+fn kf_step mdl view ulong 280 b edit ulong 96 z view f64 8 R view f64 64 seq ulong iv edit ulong 96 to long
+  p = new ulong 176 0
+  bu = new f64 8 0.0
+  st = est_kf_predict mdl view b 0 view bu 1 p
+  if ne st EST_OK
+    ret st
+  end
+  o = new ulong 96 0
+  mk_obs mdl z R bitcast long get p EP_TNS seq o
+  post = new ulong 96 0
+  st = est_kf_update mdl view b view p view o post iv
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view post b EST_BELIEF_LEN
+  ret EST_OK
+end
+
+fn kf_coast_step mdl view ulong 280 b edit ulong 96 horizon ulong to long
+  p = new ulong 176 0
+  bu = new f64 8 0.0
+  st = est_kf_predict mdl view b 0 view bu horizon p
+  if ne st EST_OK
+    ret st
+  end
+  post = new ulong 96 0
+  st = est_kf_coast mdl view p view b post
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view post b EST_BELIEF_LEN
+  ret EST_OK
+end
+
+fn rec_eq a view ulong * b view ulong * n ulong to bool
+  for i ulong n
+    if ne get a i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- 1. Constant position ----
+
+fn test_constant_position to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 4.0f64 m
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put P0 0 100.0f64
+  z = new f64 8 0.0
+  put z 0 10.0f64
+  R = new f64 64 0.0
+  put R 0 4.0f64
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 100
+  chk eq get b EB_GEN 0 101
+  chk est_rec_dig_is_zero view b EB_PAR 102
+  chk est_rec_dig_is_zero view b EB_ROOT 103
+  for k0 ulong 20
+    k = add k0 1
+    chk_st kf_step view m b view z view R k iv EST_OK 104
+    Pk = div 1.0f64 add 0.01f64 div f64 k 4.0f64
+    chk_near bitcast f64 get b EB_P Pk 1.0e-12f64 105
+    chk_near bitcast f64 get b EB_X mul mul Pk 2.5f64 f64 k 1.0e-12f64 106
+    chk eq get b EB_GEN mul 2 k 107
+    chk eq bitcast long get b EB_TNS mul long k NS 108
+  end
+end
+
+note ---- 2. Constant velocity ----
+
+fn test_constant_velocity to void
+  m = new ulong 280 0
+  put m EM_N 2
+  put m EM_M 1
+  put m EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put m EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  put m EM_SUNIT EST_UNIT_MILLI_CELSIUS
+  put m add EM_SUNIT 1 EST_UNIT_MILLI_CELSIUS_PER_S
+  put m EM_OUNIT EST_UNIT_MILLI_CELSIUS
+  put m EM_F bitcast ulong 1.0f64
+  put m add EM_F 1 bitcast ulong 1.0f64
+  put m add EM_F 3 bitcast ulong 1.0f64
+  put m EM_H bitcast ulong 1.0f64
+  put m EM_R bitcast ulong 1.0f64
+  put m EM_STEP bitcast ulong NS
+  x0 = new f64 8 0.0
+  put x0 1 1.0f64
+  P0 = new f64 64 0.0
+  put P0 0 1.0f64
+  put P0 3 1.0f64
+  b = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 200
+  p = new ulong 176 0
+  bu = new f64 8 0.0
+  chk_st est_kf_predict view m view b 0 view bu 1 p EST_OK 201
+  chk_near bitcast f64 get p EP_X 1.0f64 1.0e-14f64 202
+  chk_near bitcast f64 get p add EP_X 1 1.0f64 1.0e-14f64 203
+  chk_near bitcast f64 get p EP_P 2.0f64 1.0e-14f64 204
+  chk_near bitcast f64 get p add EP_P 1 1.0f64 1.0e-14f64 205
+  chk_near bitcast f64 get p add EP_P 3 1.0f64 1.0e-14f64 206
+  chk_near bitcast f64 get p EP_YM 1.0f64 1.0e-14f64 207
+  chk_near bitcast f64 get p EP_S 3.0f64 1.0e-14f64 208
+  z = new f64 8 0.0
+  put z 0 1.5f64
+  R = new f64 64 0.0
+  put R 0 1.0f64
+  o = new ulong 96 0
+  mk_obs view m view z view R bitcast long get p EP_TNS 1 o
+  post = new ulong 96 0
+  iv = new ulong 96 0
+  chk_st est_kf_update view m view b view p view o post iv EST_OK 209
+  chk_near bitcast f64 get post EB_X div 4.0f64 3.0f64 1.0e-13f64 210
+  chk_near bitcast f64 get post add EB_X 1 div 7.0f64 6.0f64 1.0e-13f64 211
+  chk_near bitcast f64 get post EB_P div 2.0f64 3.0f64 1.0e-13f64 212
+  chk_near bitcast f64 get post add EB_P 1 div 1.0f64 3.0f64 1.0e-13f64 213
+  chk_near bitcast f64 get post add EB_P 3 div 2.0f64 3.0f64 1.0e-13f64 214
+  chk_near bitcast f64 get iv EI_NU 0.5f64 1.0e-14f64 215
+  chk_near bitcast f64 get iv EI_S 3.0f64 1.0e-14f64 216
+  chk_near bitcast f64 get iv EI_NIS div 0.25f64 3.0f64 1.0e-13f64 217
+  chk_st kf_step view m post view z view R 2 iv EST_OK 218
+  chk_st est_check_cov_rec view post EB_P 2 EST_OK 219
+end
+
+note ---- 3. Noisy position ----
+
+fn test_noisy_position to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 1.0f64 m
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put P0 0 1.0f64
+  R = new f64 64 0.0
+  put R 0 1.0f64
+  z = new f64 8 0.0
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 300
+  put z 0 2.0f64
+  chk_st kf_step view m b view z view R 1 iv EST_OK 301
+  chk_near bitcast f64 get b EB_X 1.0f64 1.0e-14f64 302
+  chk_near bitcast f64 get b EB_P 0.5f64 1.0e-14f64 303
+  chk_near bitcast f64 get iv EI_NU 2.0f64 1.0e-14f64 304
+  chk_near bitcast f64 get iv EI_S 2.0f64 1.0e-14f64 305
+  chk_near bitcast f64 get iv EI_NIS 2.0f64 1.0e-14f64 306
+  put z 0 4.0f64
+  chk_st kf_step view m b view z view R 2 iv EST_OK 307
+  chk_near bitcast f64 get b EB_X 2.0f64 1.0e-14f64 308
+  chk_near bitcast f64 get b EB_P div 1.0f64 3.0f64 1.0e-14f64 309
+  chk_near bitcast f64 get iv EI_NU 3.0f64 1.0e-14f64 310
+  chk_near bitcast f64 get iv EI_S 1.5f64 1.0e-14f64 311
+  chk_near bitcast f64 get iv EI_NIS 6.0f64 1.0e-14f64 312
+end
+
+note ---- 4. Position and velocity both measured ----
+
+fn test_position_and_velocity to void
+  m = new ulong 280 0
+  put m EM_N 2
+  put m EM_M 2
+  put m EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put m EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  put m EM_SUNIT EST_UNIT_MILLI_CELSIUS
+  put m add EM_SUNIT 1 EST_UNIT_MILLI_CELSIUS_PER_S
+  put m EM_OUNIT EST_UNIT_MILLI_CELSIUS
+  put m add EM_OUNIT 1 EST_UNIT_MILLI_CELSIUS_PER_S
+  put m EM_F bitcast ulong 1.0f64
+  put m add EM_F 3 bitcast ulong 1.0f64
+  put m EM_H bitcast ulong 1.0f64
+  put m add EM_H 3 bitcast ulong 1.0f64
+  put m EM_R bitcast ulong 1.0f64
+  put m add EM_R 3 bitcast ulong 1.0f64
+  put m EM_STEP bitcast ulong NS
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put P0 0 4.0f64
+  put P0 3 4.0f64
+  z = new f64 8 0.0
+  put z 0 5.0f64
+  put z 1 -5.0f64
+  R = new f64 64 0.0
+  put R 0 1.0f64
+  put R 3 1.0f64
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 400
+  chk_st kf_step view m b view z view R 1 iv EST_OK 401
+  chk_near bitcast f64 get b EB_X 4.0f64 1.0e-13f64 402
+  chk_near bitcast f64 get b add EB_X 1 -4.0f64 1.0e-13f64 403
+  chk_near bitcast f64 get b EB_P 0.8f64 1.0e-13f64 404
+  chk_near bitcast f64 get b add EB_P 3 0.8f64 1.0e-13f64 405
+  chk_nearabs bitcast f64 get b add EB_P 1 0.0f64 1.0e-15f64 406
+  chk_nearabs bitcast f64 get b add EB_P 2 0.0f64 1.0e-15f64 407
+  chk_near bitcast f64 get iv EI_NIS 10.0f64 1.0e-13f64 408
+  chk eq get iv EI_M 2 409
+end
+
+note ---- 5. Riccati steady state and regimes ----
+
+fn steady_gain Q f64 R f64 out_p edit f64 1 to f64
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 Q 1.0f64 R m
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put P0 0 1.0f64
+  z = new f64 8 0.0
+  Rm = new f64 64 0.0
+  put Rm 0 R
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 500
+  for k0 ulong 4000
+    st = kf_step view m b view z view Rm add k0 1 iv
+    if ne st EST_OK
+      chk false 501
+      ret 0.0f64
+    end
+  end
+  s0 = bitcast f64 get iv EI_S
+  put out_p 0 sub s0 R
+  ret div sub s0 R s0
+end
+
+fn test_riccati_and_regimes to void
+  Qs = new f64 5 0.0
+  put Qs 0 1.0e-3f64
+  put Qs 1 1.0e-2f64
+  put Qs 2 1.0e-1f64
+  put Qs 3 1.0f64
+  put Qs 4 10.0f64
+  Ps = new f64 5 0.0
+  prevK = f64 -1.0
+  outp = new f64 1 0.0
+  for i ulong 5
+    qv = get Qs i
+    K = steady_gain qv 1.0f64 outp
+    put Ps i get outp 0
+    Pstar = mul 0.5f64 add qv fsqrt add mul qv qv mul 4.0f64 qv
+    chk_near get outp 0 Pstar 1.0e-9f64 510
+    chk_near K div Pstar add Pstar 1.0f64 1.0e-9f64 511
+    chk gt K prevK 512
+    prevK = K
+  end
+  chk lt get Ps 0 get Ps 1 513
+  chk lt get Ps 1 get Ps 2 514
+  chk lt get Ps 2 get Ps 3 515
+  chk lt get Ps 3 get Ps 4 516
+  Rs = new f64 3 0.0
+  put Rs 0 1.0e-2f64
+  put Rs 1 1.0f64
+  put Rs 2 1.0e2f64
+  prev = f64 2.0
+  for i ulong 3
+    rv = get Rs i
+    K = steady_gain 1.0f64 rv outp
+    Pstar = mul 0.5f64 add 1.0f64 fsqrt add 1.0f64 mul 4.0f64 rv
+    chk_near get outp 0 Pstar 1.0e-9f64 517
+    chk_near K div Pstar add Pstar rv 1.0e-9f64 518
+    chk lt K prev 519
+    prev = K
+  end
+end
+
+note ---- 6. Coast ----
+
+fn test_coast to void
+  m = new ulong 280 0
+  put m EM_N 2
+  put m EM_M 1
+  put m EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put m EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  put m EM_SUNIT EST_UNIT_MILLI_CELSIUS
+  put m add EM_SUNIT 1 EST_UNIT_MILLI_CELSIUS_PER_S
+  put m EM_OUNIT EST_UNIT_MILLI_CELSIUS
+  put m EM_F bitcast ulong 1.0f64
+  put m add EM_F 1 bitcast ulong 1.0f64
+  put m add EM_F 3 bitcast ulong 1.0f64
+  put m EM_H bitcast ulong 1.0f64
+  put m EM_Q bitcast ulong 0.1f64
+  put m add EM_Q 3 bitcast ulong 0.2f64
+  put m EM_R bitcast ulong 1.0f64
+  put m EM_STEP bitcast ulong NS
+  x0 = new f64 8 0.0
+  put x0 1 1.0f64
+  P0 = new f64 64 0.0
+  put P0 0 1.0f64
+  put P0 3 2.0f64
+  want = new f64 12 0.0
+  put want 0 3.1f64
+  put want 1 2.0f64
+  put want 2 2.0f64
+  put want 3 2.2f64
+  put want 4 9.4f64
+  put want 5 4.2f64
+  put want 6 4.2f64
+  put want 7 2.4f64
+  put want 8 20.3f64
+  put want 9 6.6f64
+  put want 10 6.6f64
+  put want 11 2.6f64
+  b = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 600
+  for k0 ulong 3
+    k = add k0 1
+    chk_st kf_coast_step view m b 1 EST_OK 601
+    for i ulong 4
+      chk_near bitcast f64 get b add EB_P i get want add mul k0 4 i 1.0e-13f64 602
+    end
+    chk_near bitcast f64 get b EB_X f64 k 1.0e-13f64 603
+    chk_near bitcast f64 get b add EB_X 1 1.0f64 1.0e-13f64 604
+    chk eq get b EB_GEN mul 2 k 605
+    chk est_rec_dig_is_zero view b EB_ROOT 606
+    chk eq bitcast long get b EB_TNS mul long k NS 607
+  end
+  b0 = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b0 EST_OK 608
+  p = new ulong 176 0
+  bu = new f64 8 0.0
+  chk_st est_kf_predict view m view b0 0 view bu 3 p EST_OK 609
+  for i ulong 4
+    chk_near bitcast f64 get p add EP_P i get want add 8 i 1.0e-13f64 610
+  end
+  chk eq get p EP_HZ 3 611
+  chk eq get p EP_GEN 1 611
+  chk eq bitcast long get p EP_TNS mul 3 NS 611
+  chk_near bitcast f64 get p EP_YM 3.0f64 1.0e-13f64 612
+  chk_near bitcast f64 get p EP_S 21.3f64 1.0e-13f64 613
+  put bu 1 0.5f64
+  chk_st est_kf_predict view m view b0 1 view bu 1 p EST_OK 614
+  chk_near bitcast f64 get p EP_X 1.0f64 1.0e-14f64 615
+  chk_near bitcast f64 get p add EP_X 1 1.5f64 1.0e-14f64 616
+end
+
+note ---- 7, 8, 9: repeated identical, sensor extremes, growth ----
+
+fn test_repeated_extremes_growth to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 1.0f64 m
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put P0 0 1.0e6f64
+  z = new f64 8 0.0
+  put z 0 5.0f64
+  R = new f64 64 0.0
+  put R 0 1.0f64
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 700
+  for k0 ulong 100
+    k = add k0 1
+    chk_st kf_step view m b view z view R k iv EST_OK 701
+    Pk = div 1.0f64 add 1.0e-6f64 f64 k
+    chk_near bitcast f64 get b EB_P Pk 1.0e-10f64 702
+    chk_near bitcast f64 get b EB_X mul Pk mul 5.0f64 f64 k 1.0e-10f64 703
+  end
+  chk_nearabs bitcast f64 get b EB_X 5.0f64 1.0e-3f64 704
+
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 1.0e-12f64 m
+  put P0 0 1.0f64
+  put z 0 7.0f64
+  put R 0 1.0e-12f64
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 710
+  chk_st kf_step view m b view z view R 1 iv EST_OK 711
+  chk_nearabs bitcast f64 get b EB_X 7.0f64 1.0e-9f64 712
+  chk_near bitcast f64 get b EB_P div 1.0f64 add 1.0f64 1.0e12f64 1.0e-9f64 713
+
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 1.0e12f64 m
+  put R 0 1.0e12f64
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 714
+  chk_st kf_step view m b view z view R 1 iv EST_OK 715
+  chk_nearabs bitcast f64 get b EB_X div 7.0f64 add 1.0f64 1.0e12f64 1.0e-15f64 716
+  chk_near bitcast f64 get b EB_P div 1.0f64 add 1.0f64 1.0e-12f64 1.0e-12f64 717
+
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 1.0f64 m
+  put P0 0 1.0e8f64
+  put R 0 1.0f64
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 718
+  chk_st kf_step view m b view z view R 1 iv EST_OK 719
+  chk_near bitcast f64 get b EB_P div 1.0f64 add 1.0e-8f64 1.0f64 1.0e-9f64 720
+
+  mk_scalar_model 1.0f64 0.5f64 1.0f64 1.0f64 m
+  put P0 0 1.0f64
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 721
+  prev = f64 1.0
+  for k0 ulong 50
+    k = add k0 1
+    chk_st kf_coast_step view m b 1 EST_OK 722
+    pv = bitcast f64 get b EB_P
+    chk_near pv add 1.0f64 mul 0.5f64 f64 k 1.0e-12f64 723
+    chk gt pv prev 724
+    prev = pv
+  end
+  mk_scalar_model 1.1f64 0.5f64 1.0f64 1.0f64 m
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 725
+  for k0 ulong 10
+    chk_st kf_coast_step view m b 1 EST_OK 726
+  end
+  gv = est_powu 1.21f64 10
+  chk_near bitcast f64 get b EB_P add gv div mul 0.5f64 sub gv 1.0f64 0.21f64 1.0e-11f64 727
+end
+
+note ---- 10 & 11: linkage, determinism & const ----
+
+fn mk_scalar_prior m view ulong 280 x f64 P f64 b edit ulong 96 to long
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put x0 0 x
+  put P0 0 P
+  ret est_kf_prior m view x0 view P0 0 b
+end
+
+fn test_linkage_check_dig m view ulong 280 b view ulong 96 p view ulong 176 o view ulong 96 post view ulong 96 to void
+  pd = new uchar 32 0
+  od = new uchar 32 0
+  root = new uchar 32 0
+  er0 = new uchar 32 0
+  tmp = new uchar 32 0
+  chk_st est_digest_model m pd EST_OK 801
+  est_rec_get_dig b EB_MDL tmp
+  chk est_digest_eq view pd view tmp 802
+  chk_st est_digest_prediction p pd EST_OK 809
+  chk_st est_digest_observation o od EST_OK 810
+  chk_st est_evidence_root_extend view er0 view od root EST_OK 811
+  est_rec_get_dig post EB_PAR tmp
+  chk est_digest_eq view tmp view pd 812
+  est_rec_get_dig post EB_ROOT tmp
+  chk est_digest_eq view tmp view root 813
+  c = new ulong 96 0
+  chk_st est_kf_coast m p b c EST_OK 819
+  est_rec_get_dig view c EB_PAR tmp
+  chk est_digest_eq view tmp view pd 820
+  chk est_rec_dig_is_zero view c EB_ROOT 821
+  chk eq get c EB_GEN add get p EP_GEN 1 822
+end
+
+fn test_linkage_and_determinism to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.1f64 1.0f64 2.0f64 m
+  z = new f64 8 0.0
+  put z 0 4.0f64
+  R = new f64 64 0.0
+  put R 0 2.0f64
+  b = new ulong 96 0
+  chk_st mk_scalar_prior view m 1.0f64 3.0f64 b EST_OK 800
+  p = new ulong 176 0
+  p2 = new ulong 176 0
+  bu = new f64 8 0.0
+  chk_st est_kf_predict view m view b 0 view bu 2 p EST_OK 803
+  chk_st est_kf_predict view m view b 0 view bu 2 p2 EST_OK 804
+  chk rec_eq view p view p2 EST_PRED_LEN 805
+  chk_near bitcast f64 get p EP_P 3.2f64 1.0e-14f64 806
+  chk_near bitcast f64 get p EP_S 5.2f64 1.0e-14f64 807
+  o = new ulong 96 0
+  mk_obs view m view z view R bitcast long get p EP_TNS 9 o
+  post = new ulong 96 0
+  iv = new ulong 96 0
+  chk_st est_kf_update view m view b view p view o post iv EST_OK 808
+  chk_near bitcast f64 get iv EI_NU 3.0f64 1.0e-14f64 814
+  chk_near bitcast f64 get iv EI_S 5.2f64 1.0e-14f64 815
+  chk_near bitcast f64 get iv EI_NIS div 9.0f64 5.2f64 1.0e-13f64 816
+  chk_near bitcast f64 get post EB_X add 1.0f64 mul div 3.2f64 5.2f64 3.0f64 1.0e-13f64 817
+  chk_near bitcast f64 get post EB_P div mul 3.2f64 2.0f64 5.2f64 1.0e-13f64 818
+  test_linkage_check_dig view m view b view p view o view post
+end
+
+note ---- 12. Refusals ----
+
+fn test_refusals_obs m view ulong 280 b view ulong 96 p view ulong 176 o view ulong 96 post edit ulong 96 iv edit ulong 96 to void
+  ot = new ulong 96 0
+  bu = new f64 8 0.0
+  pg = new ulong 176 0
+  est_rec_copy o ot EST_OBS_LEN
+  put ot EO_TNS bitcast ulong add bitcast long get o EO_TNS 1
+  chk_st est_kf_update m b p view ot post iv EST_ERR_TIME 910
+  put ot EO_TNS bitcast ulong sub bitcast long get o EO_TNS 1
+  chk_st est_kf_update m b p view ot post iv EST_ERR_TIME 911
+  chk_st est_kf_predict m b 0 view bu 0 pg EST_ERR_TIME 912
+  est_rec_copy o ot EST_OBS_LEN
+  put ot EO_UNIT EST_UNIT_WATT
+  chk_st est_kf_update m b p view ot post iv EST_ERR_UNIT 913
+  est_rec_copy o ot EST_OBS_LEN
+  put ot EO_M 2
+  put ot add EO_UNIT 1 EST_UNIT_WATT
+  put ot add EO_R 3 bitcast ulong 1.0f64
+  chk_st est_kf_update m b p view ot post iv EST_ERR_DIM 914
+  est_rec_copy o ot EST_OBS_LEN
+  put ot EO_Z bitcast ulong est_nan
+  chk_st est_kf_update m b p view ot post iv EST_ERR_NONFINITE 915
+  put ot EO_Z bitcast ulong est_inf
+  chk_st est_kf_update m b p view ot post iv EST_ERR_NONFINITE 916
+  est_rec_copy o ot EST_OBS_LEN
+  put ot EO_R bitcast ulong est_nan
+  chk_st est_kf_update m b p view ot post iv EST_ERR_NONFINITE 917
+  est_rec_copy o ot EST_OBS_LEN
+  put ot EO_EV 0
+  chk_st est_kf_update m b p view ot post iv EST_ERR_KIND 918
+  put bu 0 est_nan
+  chk_st est_kf_predict m b 1 view bu 1 pg EST_ERR_NONFINITE 919
+end
+
+fn test_refusals_singular to void
+  ms = new ulong 280 0
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 1.0f64 ms
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  z = new f64 8 0.0
+  R = new f64 64 0.0
+  bu = new f64 8 0.0
+  bs = new ulong 96 0
+  ps = new ulong 176 0
+  ot = new ulong 96 0
+  post = new ulong 96 0xabababababababab
+  sent_b = new ulong 96 0xabababababababab
+  iv = new ulong 96 0
+  chk_st est_kf_prior view ms view x0 view P0 0 bs EST_OK 921
+  chk_st est_kf_predict view ms view bs 0 view bu 1 ps EST_OK 922
+  put z 0 1.0f64
+  mk_obs view ms view z view R bitcast long get ps EP_TNS 1 ot
+  chk_st est_kf_update view ms view bs view ps view ot post iv EST_ERR_NOT_PD 923
+  chk rec_eq view post view sent_b EST_BELIEF_LEN 924
+  put P0 0 -1.0f64
+  chk_st est_kf_prior view ms view x0 view P0 0 bs EST_ERR_NOT_PSD 925
+  put P0 0 3.0f64
+  put x0 0 est_nan
+  chk_st est_kf_prior view ms view x0 view P0 0 bs EST_ERR_NONFINITE 926
+end
+
+fn test_refusals_stale m view ulong 280 b view ulong 96 p view ulong 176 o view ulong 96 post edit ulong 96 iv edit ulong 96 to void
+  post_ok = new ulong 96 0
+  iv_ok = new ulong 96 0
+  other = new ulong 96 0
+  pg = new ulong 176 0
+  m2 = new ulong 280 0
+  bu = new f64 8 0.0
+  chk_st est_kf_update m b p o post_ok iv_ok EST_OK 902
+  est_rec_copy b other EST_BELIEF_LEN
+  put other EB_X bitcast ulong 1.5f64
+  chk_st est_kf_update m view other p o post iv EST_ERR_STALE 903
+  chk_st est_kf_coast m p view other post EST_ERR_STALE 904
+  chk_st est_kf_update m view post_ok p o post iv EST_ERR_STALE 905
+  est_rec_copy p pg EST_PRED_LEN
+  put pg EP_GEN add get pg EP_GEN 1
+  chk_st est_kf_update m b view pg o post iv EST_ERR_STALE 906
+  mk_scalar_model 1.0f64 0.1f64 1.0f64 3.0f64 m2
+  chk_st est_kf_update view m2 b p o post iv EST_ERR_MODEL 907
+  chk_st est_kf_predict view m2 b 0 view bu 1 pg EST_ERR_MODEL 908
+  chk_st est_kf_coast view m2 p b post EST_ERR_MODEL 909
+end
+
+fn test_refusals to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.1f64 1.0f64 2.0f64 m
+  z = new f64 8 0.0
+  put z 0 4.0f64
+  R = new f64 64 0.0
+  put R 0 2.0f64
+  b = new ulong 96 0
+  p = new ulong 176 0
+  o = new ulong 96 0
+  bu = new f64 8 0.0
+  chk_st mk_scalar_prior view m 1.0f64 3.0f64 b EST_OK 900
+  chk_st est_kf_predict view m view b 0 view bu 1 p EST_OK 901
+  mk_obs view m view z view R bitcast long get p EP_TNS 1 o
+  post = new ulong 96 0xabababababababab
+  sent_b = new ulong 96 0xabababababababab
+  iv = new ulong 96 0xcdcdcdcdcdcdcdcd
+  sent_i = new ulong 96 0xcdcdcdcdcdcdcdcd
+  test_refusals_stale view m view b view p view o post iv
+  test_refusals_obs view m view b view p view o post iv
+  chk rec_eq view post view sent_b EST_BELIEF_LEN 920
+  chk rec_eq view iv view sent_i EST_INNOV_LEN 920
+  test_refusals_singular
+end
+
+note ---- 13. Long run (10000 1D + 3000 2D) ----
+
+fn test_long_run_1d to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.0f64 1.0f64 1.0f64 m
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  z = new f64 8 0.0
+  R = new f64 64 0.0
+  chk_st mk_scalar_prior view m 0.0f64 10.0f64 b EST_OK 1000
+  info = div 1.0f64 10.0f64
+  ok = true
+  for k0 ulong 10000 bound 10002
+    rv = rdbl 1.0e8f64 1.0e9f64
+    if ne and rng_next 1 0
+      rv = rdbl 1.0e-9f64 1.0e-8f64
+    end
+    put R 0 rv
+    put z 0 rdbl -1.0f64 1.0f64
+    info = add info div 1.0f64 rv
+    if ne kf_step view m b view z view R add k0 1 iv EST_OK
+      ok = false
+      break
+    end
+    pv = bitcast f64 get b EB_P
+    if not gt pv 0.0f64
+      ok = false
+      break
+    end
+    if not est_isfinite pv
+      ok = false
+      break
+    end
+    if not est_isfinite bitcast f64 get b EB_X
+      ok = false
+      break
+    end
+  end
+  chk ok 1001
+  chk_near bitcast f64 get b EB_P div 1.0f64 info 1.0e-7f64 1002
+  chk eq get b EB_GEN 20000 1003
+end
+
+fn mk_2d_prior m view ulong 280 b edit ulong 96 to long
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  put P0 0 1.0f64
+  put P0 3 1.0f64
+  ret est_kf_prior m view x0 view P0 0 b
+end
+
+fn test_long_run_2d to void
+  m2 = new ulong 280 0
+  put m2 EM_N 2
+  put m2 EM_M 1
+  put m2 EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put m2 EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  put m2 EM_SUNIT EST_UNIT_MILLI_CELSIUS
+  put m2 add EM_SUNIT 1 EST_UNIT_MILLI_CELSIUS_PER_S
+  put m2 EM_OUNIT EST_UNIT_MILLI_CELSIUS
+  put m2 EM_F bitcast ulong 1.0f64
+  put m2 add EM_F 1 bitcast ulong 1.0f64
+  put m2 add EM_F 3 bitcast ulong 1.0f64
+  put m2 EM_H bitcast ulong 1.0f64
+  put m2 EM_Q bitcast ulong 1.0e-6f64
+  put m2 add EM_Q 3 bitcast ulong 1.0e-6f64
+  put m2 EM_R bitcast ulong 1.0f64
+  put m2 EM_STEP bitcast ulong NS
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  z = new f64 8 0.0
+  R = new f64 64 0.0
+  chk_st mk_2d_prior view m2 b EST_OK 1004
+  ok = true
+  for k0 ulong 3000 bound 3005
+    rv = rdbl 1.0e8f64 1.0e9f64
+    if ne and rng_next 1 0
+      rv = rdbl 1.0e-9f64 1.0e-8f64
+    end
+    put R 0 rv
+    put z 0 rdbl -1.0f64 1.0f64
+    if ne kf_step view m2 b view z view R add k0 1 iv EST_OK
+      ok = false
+      break
+    end
+    if ne est_check_cov_rec view b EB_P 2 EST_OK
+      ok = false
+      break
+    end
+    if ne get b add EB_P 1 get b add EB_P 2
+      ok = false
+      break
+    end
+  end
+  chk ok 1005
+  p00 = bitcast f64 get b EB_P
+  chk gt p00 0.0f64 1006
+  chk lt p00 1.0e-3f64 1006
+end
+
+fn test_long_run to void
+  test_long_run_1d
+  test_long_run_2d
+end
+
+note ---- 14, 15, 16, 17, 18: forged pred, control input, evidence, coast, model refusals ----
+
+fn chk_forged_case m view ulong 280 b view ulong 96 f view ulong 176 o view ulong 96 want long to void
+  of = new ulong 96 0
+  est_rec_copy o of EST_OBS_LEN
+  put of EO_TNS get f EP_TNS
+  outb = new ulong 96 0xabababababababab
+  iv = new ulong 96 0
+  chk_st est_kf_update m b f view of outb iv want 1110
+  chk_st est_kf_coast m f b outb want 1111
+  chk eq get outb 0 0xabababababababab 1112
+end
+
+fn test_forged_roundtrip m view ulong 280 b view ulong 96 p view ulong 176 o view ulong 96 to void
+  buf = new uchar 2304 0
+  el = new ulong 1 0
+  d = new ulong 176 0
+  post = new ulong 96 0
+  iv = new ulong 96 0
+  bu = new f64 8 0.0
+  chk_st est_encode_prediction p buf el EST_OK 1120
+  chk_st est_decode_prediction view buf get el 0 d EST_OK 1121
+  chk_st est_kf_update m b view d o post iv EST_OK 1122
+  chk_st est_kf_predict m b 0 view bu add EST_MAX_HORIZON 1 d EST_ERR_TIME 1123
+end
+
+fn test_forged_prediction to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.1f64 1.0f64 2.0f64 m
+  x0 = new f64 8 0.0
+  put x0 0 1.0f64
+  P0 = new f64 64 0.0
+  put P0 0 3.0f64
+  z = new f64 8 0.0
+  put z 0 4.0f64
+  R = new f64 64 0.0
+  put R 0 2.0f64
+  b = new ulong 96 0
+  p = new ulong 176 0
+  f = new ulong 176 0
+  o = new ulong 96 0
+  bu = new f64 8 0.0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 1100
+  chk_st est_kf_predict view m view b 0 view bu 1 p EST_OK 1101
+  mk_obs view m view z view R bitcast long get p EP_TNS 1 o
+  for c ulong 11
+    est_rec_copy view p f EST_PRED_LEN
+    want = EST_ERR_STALE
+    if eq c 0
+      put f EP_X bitcast ulong 42.0f64
+    end
+    if eq c 1
+      put f EP_X bitcast ulong est_nextafter_up bitcast f64 get f EP_X
+    end
+    if eq c 2
+      put f EP_P bitcast ulong 1.0e-30f64
+    end
+    if eq c 3
+      put f EP_YM bitcast ulong -1.0e9f64
+    end
+    if eq c 4
+      put f EP_S bitcast ulong 7.0f64
+    end
+    if eq c 5
+      put f EP_HZ 2
+    end
+    if eq c 6
+      put f EP_TNS bitcast ulong long -77
+    end
+    if eq c 7
+      put f EP_TNS bitcast ulong add bitcast long get f EP_TNS 1
+    end
+    if eq c 8
+      put f EP_GEN add get f EP_GEN 1
+    end
+    if eq c 9
+      put f EP_PRIOR xor get f EP_PRIOR 1
+    end
+    if eq c 10
+      put f EP_MDL xor get f EP_MDL 1
+      want = EST_ERR_MODEL
+    end
+    chk_forged_case view m view b view f view o want
+  end
+  test_forged_roundtrip view m view b view p view o
+end
+
+fn copy_dig4 src view ulong 96 soff ulong dst edit ulong 96 doff ulong to void
+  for w ulong 4
+    put dst add doff w get src add soff w
+  end
+end
+
+fn test_coast_root m view ulong 280 b edit ulong 96 to void
+  z = new f64 8 0.0
+  put z 0 4.0f64
+  R = new f64 64 0.0
+  put R 0 2.0f64
+  iv = new ulong 96 0
+  root = new uchar 32 0
+  dig = new uchar 32 0
+  est_rec_get_dig view b EB_ROOT root
+  chk not est_digest_is_zero view root 1231
+  for k ulong 3
+    chk_st kf_coast_step m b 1 EST_OK 1232
+    est_rec_get_dig view b EB_ROOT dig
+    chk est_digest_eq view dig view root 1233
+  end
+  chk_st kf_step m b view z view R 2 iv EST_OK 1234
+  est_rec_get_dig view b EB_ROOT dig
+  chk not est_digest_eq view dig view root 1235
+end
+
+fn test_evidence_and_coast m view ulong 280 b edit ulong 96 to void
+  z = new f64 8 0.0
+  put z 0 4.0f64
+  R = new f64 64 0.0
+  put R 0 2.0f64
+  bu = new f64 8 0.0
+  iv = new ulong 96 0
+  chk_st kf_step m b view z view R 1 iv EST_OK 1220
+  p = new ulong 176 0
+  chk_st est_kf_predict m view b 0 view bu 1 p EST_OK 1221
+  o = new ulong 96 0
+  mk_obs m view z view R bitcast long get p EP_TNS 7 o
+  post = new ulong 96 0
+  chk_st est_kf_update m view b view p view o post iv EST_OK 1222
+  dig = new uchar 32 0
+  bad = new ulong 96 0
+  est_rec_copy view o bad EST_OBS_LEN
+  chk_st est_digest_prediction view p dig EST_OK 1223
+  est_rec_put_dig bad EO_EV view dig
+  chk_st est_kf_update m view b view p view bad post iv EST_ERR_KIND 1226
+  chk_st est_digest_belief view b dig EST_OK 1224
+  est_rec_put_dig bad EO_EV view dig
+  chk_st est_kf_update m view b view p view bad post iv EST_ERR_KIND 1227
+  chk_st est_digest_model m dig EST_OK 1225
+  est_rec_put_dig bad EO_EV view dig
+  chk_st est_kf_update m view b view p view bad post iv EST_ERR_KIND 1228
+  copy_dig4 view b EB_PAR bad EO_EV
+  chk_st est_kf_update m view b view p view bad post iv EST_ERR_KIND 1229
+  copy_dig4 view b EB_ROOT bad EO_EV
+  chk_st est_kf_update m view b view p view bad post iv EST_ERR_KIND 1230
+  test_coast_root m b
+end
+
+fn test_control_and_evidence to void
+  m = new ulong 280 0
+  mk_scalar_model 1.0f64 0.1f64 1.0f64 2.0f64 m
+  x0 = new f64 8 0.0
+  put x0 0 1.0f64
+  P0 = new f64 64 0.0
+  put P0 0 3.0f64
+  b = new ulong 96 0
+  chk_st est_kf_prior view m view x0 view P0 0 b EST_OK 1200
+  p0 = new ulong 176 0
+  pu = new ulong 176 0
+  pz = new ulong 176 0
+  pn = new ulong 176 0
+  bu = new f64 8 0.0
+  chk_st est_kf_predict view m view b 0 view bu 1 p0 EST_OK 1201
+  put bu 0 0.5f64
+  chk_st est_kf_predict view m view b 1 view bu 1 pu EST_OK 1202
+  put bu 0 0.0f64
+  chk_st est_kf_predict view m view b 1 view bu 1 pz EST_OK 1203
+  put bu 0 est_neg_zero
+  chk_st est_kf_predict view m view b 1 view bu 1 pn EST_OK 1204
+  chk_near bitcast f64 get pu EP_X 1.5f64 1.0e-15f64 1205
+  d0 = new uchar 32 0
+  du = new uchar 32 0
+  dz = new uchar 32 0
+  dn = new uchar 32 0
+  chk_st est_digest_prediction view p0 d0 EST_OK 1206
+  chk_st est_digest_prediction view pu du EST_OK 1207
+  chk_st est_digest_prediction view pz dz EST_OK 1208
+  chk_st est_digest_prediction view pn dn EST_OK 1209
+  chk not est_digest_eq view d0 view du 1210
+  chk not est_digest_eq view d0 view dz 1211
+  chk not est_digest_eq view du view dz 1212
+  chk est_digest_eq view dn view dz 1213
+  test_evidence_and_coast view m b
+  m0 = new ulong 280 0
+  mk_scalar_model 1.0f64 0.1f64 1.0f64 0.0f64 m0
+  chk_st est_kf_prior view m0 view x0 view P0 0 b EST_ERR_NOT_PD 1236
+end
+
+fn main to int
+  put g_rng 0 0x1234567887654321
+  test_constant_position
+  test_constant_velocity
+  test_noisy_position
+  test_position_and_velocity
+  test_riccati_and_regimes
+  test_coast
+  test_repeated_extremes_growth
+  test_linkage_and_determinism
+  test_refusals
+  test_long_run
+  test_forged_prediction
+  test_control_and_evidence
+  est_puts K_PREFIX
+  est_putu get g_checks 0
+  est_puts K_CHECKS
+  est_putu get g_fail 0
+  est_puts K_FAILED
+  if gt get g_fail 0 0
+    est_puts K_FAIL
+    ret 1
+  end
+  est_puts K_PASS
+  ret 0
+end

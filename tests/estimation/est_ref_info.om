@@ -1,0 +1,329 @@
+note SPDX-License-Identifier: Apache-2.0
+note EST-1 independent reference filter in INFORMATION FORM in pure seeded OM-2
+note (port of tests/estimation/est_ref_info.c).
+note State kept as Y = P^-1 and y = Y x inside flat ulong 73 array (ER_N, ER_Y, ER_YV).
+
+fn est_ref_swap_rows a edit f64 64 b edit f64 64 n ulong k ulong p ulong to void
+  for j ulong n
+    ik = add mul k n j
+    ip = add mul p n j
+    t = get a ik
+    put a ik get a ip
+    put a ip t
+    t = get b ik
+    put b ik get b ip
+    put b ip t
+  end
+end
+
+fn est_ref_elim_row a edit f64 64 b edit f64 64 n ulong k ulong i ulong to void
+  f = get a add mul i n k
+  if eq f 0.0f64
+    ret
+  end
+  for j ulong n
+    ii = add mul i n j
+    ik = add mul k n j
+    put a ii sub get a ii mul f get a ik
+    put b ii sub get b ii mul f get b ik
+  end
+end
+
+fn est_ref_find_pivot a view f64 64 n ulong k ulong to ulong
+  p = k
+  best = fabs get a add mul k n k
+  i = add k 1
+  while lt i n bound 16
+    cur = fabs get a add mul i n k
+    if gt cur best
+      best = cur
+      p = i
+    end
+    i = add i 1
+  end
+  ret p
+end
+
+fn est_ref_scale_row a edit f64 64 b edit f64 64 n ulong k ulong piv f64 to void
+  for j ulong n
+    idx = add mul k n j
+    put a idx div get a idx piv
+    put b idx div get b idx piv
+  end
+end
+
+fn est_ref_inv A view f64 64 Ai edit f64 64 n ulong to bool
+  a = new f64 64 0.0
+  b = new f64 64 0.0
+  scale = f64 0.0
+  for i ulong mul n n
+    v = get A i
+    put a i v
+    if gt fabs v scale
+      scale = fabs v
+    end
+  end
+  if or not gt scale 0.0f64 not est_isfinite scale
+    ret false
+  end
+  for i ulong n
+    put b add mul i n i 1.0f64
+  end
+  for k ulong n
+    p = est_ref_find_pivot view a n k
+    if le fabs get a add mul p n k mul scale 1.0e-15f64
+      ret false
+    end
+    if ne p k
+      est_ref_swap_rows a b n k p
+    end
+    est_ref_scale_row a b n k get a add mul k n k
+    for i ulong n
+      if ne i k
+        est_ref_elim_row a b n k i
+      end
+    end
+  end
+  for i ulong mul n n
+    put Ai i get b i
+  end
+  ret true
+end
+
+fn est_ref_solve A view f64 64 v view f64 8 x edit f64 8 n ulong to bool
+  Ai = new f64 64 0.0
+  if not est_ref_inv A Ai n
+    ret false
+  end
+  for i ulong n
+    s = f64 0.0
+    base = mul i n
+    for j ulong n
+      s = add s mul get Ai add base j get v j
+    end
+    put x i s
+  end
+  ret true
+end
+
+fn est_ref_sym A edit f64 64 n ulong to void
+  for i ulong n
+    j = add i 1
+    while lt j n bound 16
+      p1 = add mul i n j
+      p2 = add mul j n i
+      v = mul 0.5f64 add get A p1 get A p2
+      put A p1 v
+      put A p2 v
+      j = add j 1
+    end
+  end
+end
+
+fn est_ref_init r edit ulong 73 n ulong x0 view f64 8 P0 view f64 64 to bool
+  if or lt n 1 gt n EST_MAX_DIM
+    ret false
+  end
+  Pm = new f64 64 0.0
+  Ym = new f64 64 0.0
+  for i ulong mul n n
+    put Pm i get P0 i
+  end
+  est_ref_sym Pm n
+  if not est_ref_inv view Pm Ym n
+    ret false
+  end
+  est_ref_sym Ym n
+  put r ER_N n
+  for i ulong mul n n
+    put r add ER_Y i bitcast ulong get Ym i
+  end
+  for i ulong n
+    s = f64 0.0
+    base = mul i n
+    for j ulong n
+      s = add s mul get Ym add base j get x0 j
+    end
+    put r add ER_YV i bitcast ulong s
+  end
+  ret true
+end
+
+fn est_ref_moments r view ulong 73 x edit f64 8 P edit f64 64 to bool
+  n = get r ER_N
+  Ym = new f64 64 0.0
+  yv = new f64 8 0.0
+  for i ulong mul n n
+    put Ym i bitcast f64 get r add ER_Y i
+  end
+  for i ulong n
+    put yv i bitcast f64 get r add ER_YV i
+  end
+  if not est_ref_inv view Ym P n
+    ret false
+  end
+  est_ref_sym P n
+  ret est_ref_solve view Ym view yv x n
+end
+
+fn est_ref_mv A view f64 64 x view f64 8 y edit f64 8 rows ulong cols ulong to void
+  for i ulong rows
+    s = f64 0.0
+    base = mul i cols
+    for j ulong cols
+      s = add s mul get A add base j get x j
+    end
+    put y i s
+  end
+end
+
+fn est_ref_predict r edit ulong 73 F view f64 64 Q view f64 64 to bool
+  n = get r ER_N
+  if or lt n 1 gt n EST_MAX_DIM
+    ret false
+  end
+  x = new f64 8 0.0
+  P = new f64 64 0.0
+  if not est_ref_moments view r x P
+    ret false
+  end
+  FP = new f64 64 0.0
+  Pn = new f64 64 0.0
+  dims = new ulong 3 0
+  put dims 0 n
+  put dims 1 n
+  put dims 2 n
+  est_mm F view P FP view dims
+  est_mmt view FP F Pn view dims
+  for i ulong mul n n
+    put Pn i add get Pn i get Q i
+  end
+  est_ref_sym Pn n
+  xn = new f64 8 0.0
+  est_ref_mv F view x xn n n
+  ret est_ref_init r n view xn view Pn
+end
+
+fn est_ref_ht_dot H view f64 64 RiH view f64 64 n ulong m ulong i ulong j ulong to f64
+  t = f64 0.0
+  for k ulong m
+    t = add t mul get H add mul k n i get RiH add mul k n j
+  end
+  ret t
+end
+
+fn est_ref_ht_rih H view f64 64 RiH view f64 64 n ulong m ulong r edit ulong 73 to void
+  Ym = new f64 64 0.0
+  for i ulong mul n n
+    put Ym i bitcast f64 get r add ER_Y i
+  end
+  for i ulong n
+    for j ulong n
+      t = est_ref_ht_dot H RiH n m i j
+      idx = add mul i n j
+      put Ym idx add get Ym idx t
+    end
+  end
+  est_ref_sym Ym n
+  for i ulong mul n n
+    put r add ER_Y i bitcast ulong get Ym i
+  end
+end
+
+fn est_ref_add_ht_v H view f64 64 v view f64 8 n ulong m ulong r edit ulong 73 to void
+  for i ulong n
+    s = f64 0.0
+    for k ulong m
+      s = add s mul get H add mul k n i get v k
+    end
+    yv = bitcast f64 get r add ER_YV i
+    put r add ER_YV i bitcast ulong add yv s
+  end
+end
+
+fn est_ref_update r edit ulong 73 m ulong H view f64 64 R view f64 64 z view f64 8 to bool
+  n = get r ER_N
+  if or lt n 1 or gt n EST_MAX_DIM or lt m 1 gt m EST_MAX_DIM
+    ret false
+  end
+  Rm = new f64 64 0.0
+  Ri = new f64 64 0.0
+  for i ulong mul m m
+    put Rm i get R i
+  end
+  est_ref_sym Rm m
+  if not est_ref_inv view Rm Ri m
+    ret false
+  end
+  RiH = new f64 64 0.0
+  dims = new ulong 3 0
+  put dims 0 m
+  put dims 1 m
+  put dims 2 n
+  est_mm view Ri H RiH view dims
+  Riz = new f64 8 0.0
+  est_ref_mv view Ri z Riz m m
+  est_ref_ht_rih H view RiH n m r
+  est_ref_add_ht_v H view Riz n m r
+  ret true
+end
+
+fn est_ref_get r view ulong 73 x edit f64 8 P edit f64 64 to bool
+  n = get r ER_N
+  if or lt n 1 gt n EST_MAX_DIM
+    ret false
+  end
+  ret est_ref_moments r x P
+end
+
+fn est_ref_calc_S H view f64 64 P view f64 64 R view f64 64 Sm edit f64 64 m ulong n ulong to void
+  HP = new f64 64 0.0
+  dims = new ulong 3 0
+  put dims 0 m
+  put dims 1 n
+  put dims 2 n
+  est_mm H P HP view dims
+  put dims 2 m
+  est_mmt view HP H Sm view dims
+  for i ulong mul m m
+    put Sm i add get Sm i get R i
+  end
+  est_ref_sym Sm m
+end
+
+fn est_ref_store_inn dst edit ulong 96 m ulong Sm view f64 64 nv view f64 8 w view f64 8 to void
+  q = f64 0.0
+  for i ulong m
+    q = add q mul get nv i get w i
+  end
+  put dst EI_M m
+  put dst EI_NIS bitcast ulong q
+  for i ulong m
+    put dst add EI_NU i bitcast ulong get nv i
+  end
+  for i ulong mul m m
+    put dst add EI_S i bitcast ulong get Sm i
+  end
+end
+
+fn est_ref_innovation r view ulong 73 m ulong H view f64 64 R view f64 64 z view f64 8 dst edit ulong 96 to bool
+  n = get r ER_N
+  x = new f64 8 0.0
+  P = new f64 64 0.0
+  if not est_ref_moments r x P
+    ret false
+  end
+  Sm = new f64 64 0.0
+  est_ref_calc_S H view P R Sm m n
+  nv = new f64 8 0.0
+  est_ref_mv H view x nv m n
+  for i ulong m
+    put nv i sub get z i get nv i
+  end
+  w = new f64 8 0.0
+  if not est_ref_solve view Sm view nv w m
+    ret false
+  end
+  est_ref_store_inn dst m view Sm view nv view w
+  ret true
+end

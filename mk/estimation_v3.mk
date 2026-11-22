@@ -21,17 +21,15 @@ est-v3-purity: $(ESTV3_DIR)/est_pred.o
 		echo "est_pred.o references an operation an estimator must not have"; exit 1; fi
 	@echo "est-v3-purity: est_pred.o references no forbidden symbol"
 
-$(ESTV3_DIR)/test_est_pred: tests/estimation/test_est_pred.c $(ESTV3_SRCS) $(ESTV3_HDRS)
-	@mkdir -p $(ESTV3_DIR)
-	$(CC) $(EST_CFLAGS) -o $@ tests/estimation/test_est_pred.c $(ESTV3_SRCS) -lm
-$(ESTV3_DIR)/test_est_pred_asan: tests/estimation/test_est_pred.c $(ESTV3_SRCS) $(ESTV3_HDRS)
-	@mkdir -p $(ESTV3_DIR)
-	$(CC) $(EST_CFLAGS) $(EST_ASAN) -o $@ tests/estimation/test_est_pred.c $(ESTV3_SRCS) -lm
+EST_OM_PRED = $(EST_OM_TYPES) src/estimation/est_mix.om src/estimation/est_pred.om
 
-test-est-pred: $(ESTV3_DIR)/test_est_pred $(ESTV3_DIR)/test_est_pred_asan
+$(ESTV3_DIR)/test_est_pred: $(EST_OM_PRED) tests/estimation/test_est_pred.om
+	@mkdir -p $(ESTV3_DIR)
+	cat $^ | $(EST_OMC) > $@ && chmod +x $@
+
+test-est-pred: $(ESTV3_DIR)/test_est_pred
 	./$(ESTV3_DIR)/test_est_pred
-	./$(ESTV3_DIR)/test_est_pred_asan
-	@echo "test-est-pred: est_pred contract, numerics and calibration scenarios pass in plain and ASan/UBSan builds"
+	@echo "test-est-pred: est_pred contract, numerics and calibration scenarios pass (pure OM-2)"
 
 test-estimation-v3: est-v3-purity test-est-pred
 	@echo "test-estimation-v3: ESTIMATION-2 v3 predictive layer passes"

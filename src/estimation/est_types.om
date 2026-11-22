@@ -1,0 +1,1103 @@
+note SPDX-License-Identifier: Apache-2.0
+note EST-0 pure seeded OM-2 implementation: validation, covariance PSD/PD checks,
+note dense matrix/Cholesky/triangular-solve primitives, canonical LE codecs,
+note domain-separated SHA-256 digests, and evidence root chaining.
+
+text EST_DOM_MODEL "omega.est.model.v1"
+text EST_DOM_OBS "omega.est.observation.v1"
+text EST_DOM_BELIEF "omega.est.belief.v1"
+text EST_DOM_PRED "omega.est.prediction.v1"
+text EST_DOM_INNOV "omega.est.innovation.v1"
+text EST_DOM_ROOT "omega.est.belief.v1-root"
+
+fn est_in_dim d ulong to bool
+  ret and ge d 1 le d EST_MAX_DIM
+end
+
+fn est_digest_is_zero d view uchar 32 to bool
+  acc = ulong 0
+  for i ulong 32
+    acc = or acc ulong get d i
+  end
+  ret eq acc 0
+end
+
+fn est_digest_eq a view uchar 32 b view uchar 32 to bool
+  diff = ulong 0
+  for i ulong 32
+    diff = or diff xor ulong get a i ulong get b i
+  end
+  ret eq diff 0
+end
+
+fn est_rec_dig_is_zero rec view ulong * off ulong to bool
+  acc = ulong 0
+  for i ulong 4
+    acc = or acc get rec add off i
+  end
+  ret eq acc 0
+end
+
+fn est_rec_get_dig rec view ulong * off ulong dst edit uchar 32 to void
+  for w ulong 4
+    v = get rec add off w
+    for b ulong 8
+      put dst add mul w 8 b uchar and shr v mul b 8 0xff
+    end
+  end
+end
+
+fn est_rec_put_dig rec edit ulong * off ulong src view uchar 32 to void
+  for w ulong 4
+    v = ulong 0
+    for b ulong 8
+      v = or v shl ulong get src add mul w 8 b mul b 8
+    end
+    put rec add off w v
+  end
+end
+
+fn est_rec_copy src view ulong * dst edit ulong * n ulong to void
+  for i ulong n
+    put dst i get src i
+  end
+end
+
+fn est_cov_maxabs a view f64 * n ulong to f64
+  maxabs = f64 0.0
+  for i ulong n
+    for j ulong n
+      v = fabs get a add mul i n j
+      if gt v maxabs
+        maxabs = v
+      end
+    end
+  end
+  ret maxabs
+end
+
+fn est_cov_sym a view f64 * n ulong to long
+  for i ulong n
+    if lt get a add mul i n i 0.0f64
+      ret EST_ERR_NOT_PSD
+    end
+  end
+  stol = mul 1.0e-9f64 est_cov_maxabs a n
+  if lt stol 1.0e-300f64
+    stol = 1.0e-300f64
+  end
+  for i ulong n
+    for j ulong i
+      aij = get a add mul i n j
+      aji = get a add mul j n i
+      if gt fabs sub aij aji stol
+        ret EST_ERR_ASYMMETRIC
+      end
+    end
+  end
+  ret EST_OK
+end
+
+fn est_cov_scale_row a view f64 * work edit f64 72 base ulong i ulong to long
+  si = get work i
+  rmax = add 1.0f64 1.0e-9f64
+  for j ulong i
+    idx = add base j
+    c = get a idx
+    sj = get work j
+    if or eq si 0.0f64 eq sj 0.0f64
+      if ne c 0.0f64
+        ret EST_ERR_NOT_PSD
+      end
+      put work add 8 idx 0.0f64
+    else
+      r = div div c si sj
+      if gt fabs r rmax
+        ret EST_ERR_NOT_PSD
+      end
+      put work add 8 idx r
+    end
+  end
+  ret EST_OK
+end
+
+fn est_cov_scale a view f64 * n ulong work edit f64 72 to long
+  for i ulong n
+    put work i fsqrt get a add mul i n i
+  end
+  for i ulong n
+    off = add 8 add mul i n i
+    if gt get work i 0.0f64
+      put work off 1.0f64
+    else
+      put work off 0.0f64
+    end
+  end
+  for i ulong n
+    rc = est_cov_scale_row a work mul i n i
+    if ne rc EST_OK
+      ret rc
+    end
+  end
+  ret EST_OK
+end
+
+fn est_cov_ldlt_null n ulong k ulong work edit f64 72 to long
+  tol = f64 1.0e-12
+  i = add k 1
+  while lt i n bound 16
+    c = get work add 8 add mul i n k
+    if gt mul c c tol
+      ret EST_ERR_NOT_PSD
+    end
+    i = add i 1
+  end
+  ret EST_OK
+end
+
+fn est_cov_ldlt_elim n ulong k ulong work edit f64 72 d f64 to void
+  i = add k 1
+  while lt i n bound 16
+    wik = get work add 8 add mul i n k
+    j = add k 1
+    while le j i bound 16
+      wjk = get work add 8 add mul j n k
+      off = add 8 add mul i n j
+      cur = get work off
+      put work off sub cur div mul wik wjk d
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+fn est_cov_ldlt n ulong work edit f64 72 to long
+  tol = f64 1.0e-12
+  ntol = neg tol
+  for k ulong n
+    d = get work add 8 add mul k n k
+    if lt d ntol
+      ret EST_ERR_NOT_PSD
+    end
+    if le d tol
+      rc = est_cov_ldlt_null n k work
+      if ne rc EST_OK
+        ret rc
+      end
+    else
+      est_cov_ldlt_elim n k work d
+    end
+  end
+  ret EST_OK
+end
+
+fn est_check_covariance a view f64 * n ulong to long
+  if not est_in_dim n
+    ret EST_ERR_DIM
+  end
+  nn = mul n n
+  for i ulong nn
+    if not est_isfinite get a i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  rc = est_cov_sym a n
+  if ne rc EST_OK
+    ret rc
+  end
+  work = new f64 72 0.0
+  rc = est_cov_scale a n work
+  if ne rc EST_OK
+    ret rc
+  end
+  ret est_cov_ldlt n work
+end
+
+fn est_check_cov_rec rec view ulong * off ulong n ulong to long
+  mat = new f64 64 0.0
+  for i ulong mul n n
+    put mat i bitcast f64 get rec add off i
+  end
+  ret est_check_covariance view mat n
+end
+
+fn est_chol_dot l view f64 64 n ulong i ulong j ulong to f64
+  acc = f64 0.0
+  for k ulong j
+    acc = add acc mul get l add mul i n k get l add mul j n k
+  end
+  ret acc
+end
+
+fn est_chol s view f64 * l edit f64 64 n ulong to bool
+  for i ulong 64
+    put l i 0.0f64
+  end
+  for i ulong n
+    for j ulong add i 1
+      acc = sub get s add mul i n j est_chol_dot view l n i j
+      if eq i j
+        if or not gt acc 0.0f64 not est_isfinite acc
+          ret false
+        end
+        put l add mul i n i fsqrt acc
+      else
+        ljj = get l add mul j n j
+        put l add mul i n j div acc ljj
+      end
+    end
+  end
+  ret true
+end
+
+fn est_fwd l view f64 64 b view f64 8 y edit f64 8 n ulong to void
+  for i ulong n
+    acc = get b i
+    for k ulong i
+      acc = sub acc mul get l add mul i n k get y k
+    end
+    put y i div acc get l add mul i n i
+  end
+end
+
+fn est_bwd l view f64 64 y view f64 8 x edit f64 8 n ulong to void
+  ii = n
+  while gt ii 0 bound 16
+    i = sub ii 1
+    acc = get y i
+    k = add i 1
+    while lt k n bound 16
+      acc = sub acc mul get l add mul k n i get x k
+      k = add k 1
+    end
+    put x i div acc get l add mul i n i
+    ii = sub ii 1
+  end
+end
+
+fn est_mm_dot a view f64 64 b view f64 64 dims view ulong 3 ij ulong to f64
+  k = get dims 1
+  cols = get dims 2
+  i = div ij 8
+  j = rem ij 8
+  s = f64 0.0
+  for t ulong k
+    av = get a add mul i k t
+    bv = get b add mul t cols j
+    s = add s mul av bv
+  end
+  ret s
+end
+
+fn est_mmt_dot a view f64 64 b view f64 64 dims view ulong 3 ij ulong to f64
+  k = get dims 1
+  i = div ij 8
+  j = rem ij 8
+  s = f64 0.0
+  for t ulong k
+    av = get a add mul i k t
+    bv = get b add mul j k t
+    s = add s mul av bv
+  end
+  ret s
+end
+
+fn est_mm a view f64 64 b view f64 64 c edit f64 64 dims view ulong 3 to void
+  r = get dims 0
+  cols = get dims 2
+  for i ulong r
+    for j ulong cols
+      put c add mul i cols j est_mm_dot a b dims add mul i 8 j
+    end
+  end
+end
+
+fn est_mmt a view f64 64 b view f64 64 c edit f64 64 dims view ulong 3 to void
+  r = get dims 0
+  cols = get dims 2
+  for i ulong r
+    for j ulong cols
+      put c add mul i cols j est_mmt_dot a b dims add mul i 8 j
+    end
+  end
+end
+
+fn est_symmetrize a edit f64 * n ulong to void
+  for i ulong n
+    for j ulong i
+      p1 = add mul i n j
+      p2 = add mul j n i
+      v = mul 0.5f64 add get a p1 get a p2
+      put a p1 v
+      put a p2 v
+    end
+  end
+end
+
+note ---- Record validation ----
+
+fn est_check_model mdl view ulong 280 to long
+  n = get mdl EM_N
+  m = get mdl EM_M
+  if or not est_in_dim n not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  if ne get mdl EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+    ret EST_ERR_UNIT
+  end
+  if ne get mdl EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+    ret EST_ERR_UNIT
+  end
+  for i ulong n
+    v = get mdl add EM_SUNIT i
+    if or lt v 1 ge v EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+  end
+  for i ulong m
+    v = get mdl add EM_OUNIT i
+    if or lt v 1 ge v EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+  end
+  if le bitcast long get mdl EM_STEP 0
+    ret EST_ERR_TIME
+  end
+  for i ulong mul n n
+    if not est_isfinite bitcast f64 get mdl add EM_F i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  for i ulong mul m n
+    if not est_isfinite bitcast f64 get mdl add EM_H i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  st = est_check_cov_rec mdl EM_Q n
+  if ne st EST_OK
+    ret st
+  end
+  rmat = new f64 64 0.0
+  for i ulong mul m m
+    put rmat i bitcast f64 get mdl add EM_R i
+  end
+  st = est_check_covariance view rmat m
+  if ne st EST_OK
+    ret st
+  end
+  lmat = new f64 64 0.0
+  if not est_chol view rmat lmat m
+    ret EST_ERR_NOT_PD
+  end
+  ret EST_OK
+end
+
+fn est_check_observation o view ulong 96 to long
+  m = get o EO_M
+  if not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  for i ulong m
+    v = get o add EO_UNIT i
+    if or lt v 1 ge v EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    if not est_isfinite bitcast f64 get o add EO_Z i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  st = est_check_cov_rec o EO_R m
+  if ne st EST_OK
+    ret st
+  end
+  if est_rec_dig_is_zero o EO_EV
+    ret EST_ERR_KIND
+  end
+  if est_rec_dig_is_zero o EO_SRC
+    ret EST_ERR_KIND
+  end
+  ret EST_OK
+end
+
+fn est_check_belief b view ulong 96 to long
+  n = get b EB_N
+  if not est_in_dim n
+    ret EST_ERR_DIM
+  end
+  for i ulong n
+    v = get b add EB_UNIT i
+    if or lt v 1 ge v EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    if not est_isfinite bitcast f64 get b add EB_X i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  if est_rec_dig_is_zero b EB_MDL
+    ret EST_ERR_MODEL
+  end
+  if eq get b EB_GEN 0
+    if or not est_rec_dig_is_zero b EB_PAR not est_rec_dig_is_zero b EB_ROOT
+      ret EST_ERR_STALE
+    end
+  else
+    if est_rec_dig_is_zero b EB_PAR
+      ret EST_ERR_STALE
+    end
+  end
+  ret est_check_cov_rec b EB_P n
+end
+
+fn est_check_prediction p view ulong 176 to long
+  n = get p EP_N
+  m = get p EP_M
+  if or not est_in_dim n not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  hz = get p EP_HZ
+  if or lt hz 1 gt hz EST_MAX_HORIZON
+    ret EST_ERR_TIME
+  end
+  hc = get p EP_HC
+  if gt hc 1
+    ret EST_ERR_ENCODING
+  end
+  for i ulong n
+    if not est_isfinite bitcast f64 get p add EP_X i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  if eq hc 1
+    for i ulong n
+      if not est_isfinite bitcast f64 get p add EP_BU i
+        ret EST_ERR_NONFINITE
+      end
+    end
+  end
+  for i ulong m
+    if not est_isfinite bitcast f64 get p add EP_YM i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  st = est_check_cov_rec p EP_P n
+  if ne st EST_OK
+    ret st
+  end
+  ret est_check_cov_rec p EP_S m
+end
+
+fn est_check_innovation iv view ulong 96 to long
+  m = get iv EI_M
+  if not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  for i ulong m
+    if not est_isfinite bitcast f64 get iv add EI_NU i
+      ret EST_ERR_NONFINITE
+    end
+  end
+  nis = bitcast f64 get iv EI_NIS
+  if not est_isfinite nis
+    ret EST_ERR_NONFINITE
+  end
+  if lt nis 0.0f64
+    ret EST_ERR_NOT_PSD
+  end
+  ret est_check_cov_rec iv EI_S m
+end
+
+note ---- Canonical LE byte helpers ----
+
+fn est_put_u32 dst edit uchar * pos ulong v ulong to ulong
+  for i ulong 4
+    put dst add pos i uchar and shr v mul i 8 0xff
+  end
+  ret add pos 4
+end
+
+fn est_put_u64 dst edit uchar * pos ulong v ulong to ulong
+  for i ulong 8
+    put dst add pos i uchar and shr v mul i 8 0xff
+  end
+  ret add pos 8
+end
+
+fn est_put_f64_canon dst edit uchar * pos ulong d f64 to ulong
+  bits = bitcast ulong d
+  if eq and bits 0x7fffffffffffffff 0
+    bits = 0
+  end
+  ret est_put_u64 dst pos bits
+end
+
+fn est_put_f64_bits dst edit uchar * pos ulong bits ulong to ulong
+  u = bits
+  if eq and u 0x7fffffffffffffff 0
+    u = 0
+  end
+  ret est_put_u64 dst pos u
+end
+
+fn est_put_rec_dig dst edit uchar * pos ulong rec view ulong * off ulong to ulong
+  p = pos
+  for w ulong 4
+    p = est_put_u64 dst p get rec add off w
+  end
+  ret p
+end
+
+fn est_get_u32 src view uchar * pos ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    v = or v shl ulong get src add pos i mul i 8
+  end
+  ret v
+end
+
+fn est_get_u64 src view uchar * pos ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get src add pos i mul i 8
+  end
+  ret v
+end
+
+fn est_get_rec_dig src view uchar * pos ulong rec edit ulong * off ulong to ulong
+  p = pos
+  for w ulong 4
+    put rec add off w est_get_u64 src p
+    p = add p 8
+  end
+  ret p
+end
+
+fn est_write_hdr dst edit uchar * kind ulong to ulong
+  put dst 0 uchar 79
+  put dst 1 uchar 69
+  put dst 2 uchar 83
+  put dst 3 uchar 84
+  put dst 4 uchar and kind 0xff
+  put dst 5 uchar 1
+  put dst 6 uchar 0
+  put dst 7 uchar 0
+  ret 8
+end
+
+fn est_check_hdr src view uchar * slen ulong want ulong to long
+  if lt slen 8
+    ret EST_ERR_ENCODING
+  end
+  if or ne ulong get src 0 79 ne ulong get src 1 69
+    ret EST_ERR_ENCODING
+  end
+  if or ne ulong get src 2 83 ne ulong get src 3 84
+    ret EST_ERR_ENCODING
+  end
+  if ne ulong get src 4 want
+    ret EST_ERR_KIND
+  end
+  if or ne ulong get src 5 1 or ne ulong get src 6 0 ne ulong get src 7 0
+    ret EST_ERR_ENCODING
+  end
+  ret EST_OK
+end
+
+note ---- Encoders ----
+
+fn est_encode_model o view ulong 280 buf edit uchar * out_len edit ulong 1 to long
+  st = est_check_model o
+  if ne st EST_OK
+    ret st
+  end
+  n = get o EM_N
+  m = get o EM_M
+  fslots = add mul 2 mul n n add mul m n mul m m
+  need = add 32 add mul 4 add n m mul 8 fslots
+  if gt need len buf
+    ret EST_ERR_ENCODING
+  end
+  pos = est_write_hdr buf EST_KIND_MODEL
+  pos = est_put_u32 buf pos n
+  pos = est_put_u32 buf pos m
+  pos = est_put_u32 buf pos get o EM_EST
+  pos = est_put_u32 buf pos get o EM_MEAN
+  for i ulong n
+    pos = est_put_u32 buf pos get o add EM_SUNIT i
+  end
+  for i ulong m
+    pos = est_put_u32 buf pos get o add EM_OUNIT i
+  end
+  for i ulong mul n n
+    pos = est_put_f64_bits buf pos get o add EM_F i
+  end
+  for i ulong mul n n
+    pos = est_put_f64_bits buf pos get o add EM_Q i
+  end
+  for i ulong mul m n
+    pos = est_put_f64_bits buf pos get o add EM_H i
+  end
+  for i ulong mul m m
+    pos = est_put_f64_bits buf pos get o add EM_R i
+  end
+  pos = est_put_u64 buf pos get o EM_STEP
+  put out_len 0 pos
+  ret EST_OK
+end
+
+fn est_encode_observation o view ulong 96 buf edit uchar * out_len edit ulong 1 to long
+  st = est_check_observation o
+  if ne st EST_OK
+    ret st
+  end
+  m = get o EO_M
+  need = add 92 add mul 4 m mul 8 add m mul m m
+  if gt need len buf
+    ret EST_ERR_ENCODING
+  end
+  pos = est_write_hdr buf EST_KIND_OBSERVATION
+  pos = est_put_u32 buf pos m
+  for i ulong m
+    pos = est_put_u32 buf pos get o add EO_UNIT i
+  end
+  for i ulong m
+    pos = est_put_f64_bits buf pos get o add EO_Z i
+  end
+  for i ulong mul m m
+    pos = est_put_f64_bits buf pos get o add EO_R i
+  end
+  pos = est_put_u64 buf pos get o EO_TNS
+  pos = est_put_u64 buf pos get o EO_SEQ
+  pos = est_put_rec_dig buf pos o EO_SRC
+  pos = est_put_rec_dig buf pos o EO_EV
+  put out_len 0 pos
+  ret EST_OK
+end
+
+fn est_encode_belief o view ulong 96 buf edit uchar * out_len edit ulong 1 to long
+  st = est_check_belief o
+  if ne st EST_OK
+    ret st
+  end
+  n = get o EB_N
+  need = add 124 add mul 4 n mul 8 add n mul n n
+  if gt need len buf
+    ret EST_ERR_ENCODING
+  end
+  pos = est_write_hdr buf EST_KIND_BELIEF
+  pos = est_put_u32 buf pos n
+  for i ulong n
+    pos = est_put_u32 buf pos get o add EB_UNIT i
+  end
+  for i ulong n
+    pos = est_put_f64_bits buf pos get o add EB_X i
+  end
+  for i ulong mul n n
+    pos = est_put_f64_bits buf pos get o add EB_P i
+  end
+  pos = est_put_u64 buf pos get o EB_GEN
+  pos = est_put_u64 buf pos get o EB_TNS
+  pos = est_put_rec_dig buf pos o EB_MDL
+  pos = est_put_rec_dig buf pos o EB_PAR
+  pos = est_put_rec_dig buf pos o EB_ROOT
+  put out_len 0 pos
+  ret EST_OK
+end
+
+fn est_put_f64_arr dst edit uchar * pos ulong rec view ulong * oc ulong to ulong
+  off = shr oc 16
+  cnt = and oc 0xffff
+  p = pos
+  for i ulong cnt
+    p = est_put_f64_bits dst p get rec add off i
+  end
+  ret p
+end
+
+fn est_encode_prediction o view ulong 176 buf edit uchar * out_len edit ulong 1 to long
+  st = est_check_prediction o
+  if ne st EST_OK
+    ret st
+  end
+  n = get o EP_N
+  m = get o EP_M
+  pos = add add n mul n n add m mul m m
+  if eq get o EP_HC 1
+    pos = add pos n
+  end
+  if gt add 104 mul 8 pos len buf
+    ret EST_ERR_ENCODING
+  end
+  pos = est_write_hdr buf EST_KIND_PREDICTION
+  pos = est_put_rec_dig buf pos o EP_PRIOR
+  pos = est_put_rec_dig buf pos o EP_MDL
+  pos = est_put_u32 buf pos get o EP_HZ
+  pos = est_put_u64 buf pos get o EP_GEN
+  pos = est_put_u64 buf pos get o EP_TNS
+  pos = est_put_u32 buf pos n
+  pos = est_put_u32 buf pos m
+  pos = est_put_f64_arr buf pos o add shl EP_X 16 n
+  pos = est_put_f64_arr buf pos o add shl EP_P 16 mul n n
+  pos = est_put_f64_arr buf pos o add shl EP_YM 16 m
+  pos = est_put_f64_arr buf pos o add shl EP_S 16 mul m m
+  pos = est_put_u32 buf pos get o EP_HC
+  if eq get o EP_HC 1
+    pos = est_put_f64_arr buf pos o add shl EP_BU 16 n
+  end
+  put out_len 0 pos
+  ret EST_OK
+end
+
+fn est_encode_innovation o view ulong 96 buf edit uchar * out_len edit ulong 1 to long
+  st = est_check_innovation o
+  if ne st EST_OK
+    ret st
+  end
+  m = get o EI_M
+  need = add 124 mul 8 add m mul m m
+  if gt need len buf
+    ret EST_ERR_ENCODING
+  end
+  pos = est_write_hdr buf EST_KIND_INNOVATION
+  pos = est_put_rec_dig buf pos o EI_PRED
+  pos = est_put_rec_dig buf pos o EI_OBS
+  pos = est_put_rec_dig buf pos o EI_MDL
+  pos = est_put_u32 buf pos m
+  for i ulong m
+    pos = est_put_f64_bits buf pos get o add EI_NU i
+  end
+  for i ulong mul m m
+    pos = est_put_f64_bits buf pos get o add EI_S i
+  end
+  pos = est_put_f64_bits buf pos get o EI_NIS
+  pos = est_put_u64 buf pos get o EI_TNS
+  put out_len 0 pos
+  ret EST_OK
+end
+
+note ---- Decoders ----
+
+fn est_get_f64_arr src view uchar * pos ulong rec edit ulong * oc ulong to ulong
+  off = shr oc 16
+  cnt = and oc 0xffff
+  p = pos
+  for i ulong cnt
+    put rec add off i est_get_u64 src p
+    p = add p 8
+  end
+  ret p
+end
+
+fn est_decode_model buf view uchar * blen ulong dst edit ulong 280 to long
+  st = est_check_hdr buf blen EST_KIND_MODEL
+  if ne st EST_OK
+    ret st
+  end
+  if lt blen 24
+    ret EST_ERR_ENCODING
+  end
+  n = est_get_u32 buf 8
+  m = est_get_u32 buf 12
+  if or not est_in_dim n not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  if or ne est_get_u32 buf 16 EST_ESTIMATOR_LINEAR_KALMAN ne est_get_u32 buf 20 EST_UNCERTAINTY_GAUSSIAN
+    ret EST_ERR_UNIT
+  end
+  pos = add mul 2 mul n n add mul m n mul m m
+  if ne blen add 32 add mul 4 add n m mul 8 pos
+    ret EST_ERR_ENCODING
+  end
+  t = new ulong 280 0
+  put t EM_N n
+  put t EM_M m
+  put t EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put t EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  pos = 24
+  for i ulong n
+    u = est_get_u32 buf pos
+    pos = add pos 4
+    if ge u EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    put t add EM_SUNIT i u
+  end
+  for i ulong m
+    u = est_get_u32 buf pos
+    pos = add pos 4
+    if ge u EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    put t add EM_OUNIT i u
+  end
+  pos = est_get_f64_arr buf pos t add shl EM_F 16 mul n n
+  pos = est_get_f64_arr buf pos t add shl EM_Q 16 mul n n
+  pos = est_get_f64_arr buf pos t add shl EM_H 16 mul m n
+  pos = est_get_f64_arr buf pos t add shl EM_R 16 mul m m
+  put t EM_STEP est_get_u64 buf pos
+  st = est_check_model view t
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view t dst EST_MODEL_LEN
+  ret EST_OK
+end
+
+fn est_decode_observation buf view uchar * blen ulong dst edit ulong 96 to long
+  st = est_check_hdr buf blen EST_KIND_OBSERVATION
+  if ne st EST_OK
+    ret st
+  end
+  if lt blen 12
+    ret EST_ERR_ENCODING
+  end
+  m = est_get_u32 buf 8
+  if not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  need = add 92 add mul 4 m mul 8 add m mul m m
+  if ne blen need
+    ret EST_ERR_ENCODING
+  end
+  t = new ulong 96 0
+  put t EO_M m
+  pos = ulong 12
+  for i ulong m
+    u = est_get_u32 buf pos
+    pos = add pos 4
+    if ge u EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    put t add EO_UNIT i u
+  end
+  for i ulong m
+    put t add EO_Z i est_get_u64 buf pos
+    pos = add pos 8
+  end
+  for i ulong mul m m
+    put t add EO_R i est_get_u64 buf pos
+    pos = add pos 8
+  end
+  put t EO_TNS est_get_u64 buf pos
+  pos = add pos 8
+  put t EO_SEQ est_get_u64 buf pos
+  pos = add pos 8
+  pos = est_get_rec_dig buf pos t EO_SRC
+  pos = est_get_rec_dig buf pos t EO_EV
+  st = est_check_observation view t
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view t dst EST_OBS_LEN
+  ret EST_OK
+end
+
+fn est_decode_belief buf view uchar * blen ulong dst edit ulong 96 to long
+  st = est_check_hdr buf blen EST_KIND_BELIEF
+  if ne st EST_OK
+    ret st
+  end
+  if lt blen 12
+    ret EST_ERR_ENCODING
+  end
+  n = est_get_u32 buf 8
+  if not est_in_dim n
+    ret EST_ERR_DIM
+  end
+  need = add 124 add mul 4 n mul 8 add n mul n n
+  if ne blen need
+    ret EST_ERR_ENCODING
+  end
+  t = new ulong 96 0
+  put t EB_N n
+  pos = ulong 12
+  for i ulong n
+    u = est_get_u32 buf pos
+    pos = add pos 4
+    if ge u EST_UNIT_MAX
+      ret EST_ERR_UNIT
+    end
+    put t add EB_UNIT i u
+  end
+  for i ulong n
+    put t add EB_X i est_get_u64 buf pos
+    pos = add pos 8
+  end
+  for i ulong mul n n
+    put t add EB_P i est_get_u64 buf pos
+    pos = add pos 8
+  end
+  put t EB_GEN est_get_u64 buf pos
+  pos = add pos 8
+  put t EB_TNS est_get_u64 buf pos
+  pos = add pos 8
+  pos = est_get_rec_dig buf pos t EB_MDL
+  pos = est_get_rec_dig buf pos t EB_PAR
+  pos = est_get_rec_dig buf pos t EB_ROOT
+  st = est_check_belief view t
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view t dst EST_BELIEF_LEN
+  ret EST_OK
+end
+
+fn est_decode_prediction buf view uchar * blen ulong dst edit ulong 176 to long
+  st = est_check_hdr buf blen EST_KIND_PREDICTION
+  if ne st EST_OK
+    ret st
+  end
+  if lt blen 100
+    ret EST_ERR_ENCODING
+  end
+  n = est_get_u32 buf 92
+  m = est_get_u32 buf 96
+  if or not est_in_dim n not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  pos = add 100 mul 8 add add n mul n n add m mul m m
+  if lt blen add pos 4
+    ret EST_ERR_ENCODING
+  end
+  hc = est_get_u32 buf pos
+  if gt hc 1
+    ret EST_ERR_ENCODING
+  end
+  pos = add pos 4
+  if eq hc 1
+    pos = add pos mul 8 n
+  end
+  if ne blen pos
+    ret EST_ERR_ENCODING
+  end
+  t = new ulong 176 0
+  pos = est_get_rec_dig buf 8 t EP_PRIOR
+  pos = est_get_rec_dig buf pos t EP_MDL
+  put t EP_HZ est_get_u32 buf 72
+  put t EP_GEN est_get_u64 buf 76
+  put t EP_TNS est_get_u64 buf 84
+  put t EP_N n
+  put t EP_M m
+  pos = est_get_f64_arr buf 100 t add shl EP_X 16 n
+  pos = est_get_f64_arr buf pos t add shl EP_P 16 mul n n
+  pos = est_get_f64_arr buf pos t add shl EP_YM 16 m
+  pos = est_get_f64_arr buf pos t add shl EP_S 16 mul m m
+  put t EP_HC hc
+  pos = add pos 4
+  if eq hc 1
+    pos = est_get_f64_arr buf pos t add shl EP_BU 16 n
+  end
+  st = est_check_prediction view t
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view t dst EST_PRED_LEN
+  ret EST_OK
+end
+
+fn est_decode_innovation buf view uchar * blen ulong dst edit ulong 96 to long
+  st = est_check_hdr buf blen EST_KIND_INNOVATION
+  if ne st EST_OK
+    ret st
+  end
+  if lt blen 108
+    ret EST_ERR_ENCODING
+  end
+  m = est_get_u32 buf 104
+  if not est_in_dim m
+    ret EST_ERR_DIM
+  end
+  need = add 124 mul 8 add m mul m m
+  if ne blen need
+    ret EST_ERR_ENCODING
+  end
+  t = new ulong 96 0
+  pos = est_get_rec_dig buf 8 t EI_PRED
+  pos = est_get_rec_dig buf pos t EI_OBS
+  pos = est_get_rec_dig buf pos t EI_MDL
+  put t EI_M m
+  pos = ulong 108
+  for i ulong m
+    put t add EI_NU i est_get_u64 buf pos
+    pos = add pos 8
+  end
+  for i ulong mul m m
+    put t add EI_S i est_get_u64 buf pos
+    pos = add pos 8
+  end
+  put t EI_NIS est_get_u64 buf pos
+  pos = add pos 8
+  put t EI_TNS est_get_u64 buf pos
+  st = est_check_innovation view t
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view t dst EST_INNOV_LEN
+  ret EST_OK
+end
+
+note ---- Digests ----
+
+fn est_digest_model o view ulong 280 dst edit uchar 32 to long
+  buf = new uchar 2304 0
+  elen = new ulong 1 0
+  st = est_encode_model o buf elen
+  if ne st EST_OK
+    ret st
+  end
+  est_sha256_domain EST_DOM_MODEL view buf get elen 0 dst
+  ret EST_OK
+end
+
+fn est_digest_observation o view ulong 96 dst edit uchar 32 to long
+  buf = new uchar 2304 0
+  elen = new ulong 1 0
+  st = est_encode_observation o buf elen
+  if ne st EST_OK
+    ret st
+  end
+  est_sha256_domain EST_DOM_OBS view buf get elen 0 dst
+  ret EST_OK
+end
+
+fn est_digest_belief o view ulong 96 dst edit uchar 32 to long
+  buf = new uchar 2304 0
+  elen = new ulong 1 0
+  st = est_encode_belief o buf elen
+  if ne st EST_OK
+    ret st
+  end
+  est_sha256_domain EST_DOM_BELIEF view buf get elen 0 dst
+  ret EST_OK
+end
+
+fn est_digest_prediction o view ulong 176 dst edit uchar 32 to long
+  buf = new uchar 2304 0
+  elen = new ulong 1 0
+  st = est_encode_prediction o buf elen
+  if ne st EST_OK
+    ret st
+  end
+  est_sha256_domain EST_DOM_PRED view buf get elen 0 dst
+  ret EST_OK
+end
+
+fn est_digest_innovation o view ulong 96 dst edit uchar 32 to long
+  buf = new uchar 2304 0
+  elen = new ulong 1 0
+  st = est_encode_innovation o buf elen
+  if ne st EST_OK
+    ret st
+  end
+  est_sha256_domain EST_DOM_INNOV view buf get elen 0 dst
+  ret EST_OK
+end
+
+fn est_evidence_root_extend root view uchar 32 obs view uchar 32 dst edit uchar 32 to long
+  tmp = new uchar 64 0
+  for i ulong 32
+    put tmp i get root i
+    put tmp add 32 i get obs i
+  end
+  est_sha256_domain EST_DOM_ROOT view tmp 64 dst
+  ret EST_OK
+end

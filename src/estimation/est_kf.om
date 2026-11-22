@@ -1,0 +1,688 @@
+note SPDX-License-Identifier: Apache-2.0
+note EST-1 linear Kalman filter in pure seeded OM-2 (est_kf.h / est_kf.c).
+note Joseph-form covariance update, Cholesky innovation solve, full prediction
+note recomputation binding check, and coasting.
+
+fn est_kf_model_matches mdl view ulong 280 want view uchar 32 to long
+  d = new uchar 32 0
+  st = est_digest_model mdl d
+  if ne st EST_OK
+    ret st
+  end
+  if est_digest_eq view d want
+    ret EST_OK
+  end
+  ret EST_ERR_MODEL
+end
+
+fn est_kf_prior mdl view ulong 280 x0 view f64 8 P0 view f64 64 t_ns long dst edit ulong 96 to long
+  st = est_check_model mdl
+  if ne st EST_OK
+    ret st
+  end
+  b = new ulong 96 0
+  n = get mdl EM_N
+  put b EB_N n
+  for i ulong n
+    put b add EB_UNIT i get mdl add EM_SUNIT i
+    put b add EB_X i bitcast ulong get x0 i
+  end
+  for i ulong mul n n
+    put b add EB_P i bitcast ulong get P0 i
+  end
+  put b EB_TNS bitcast ulong t_ns
+  md = new uchar 32 0
+  st = est_digest_model mdl md
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_put_dig b EB_MDL view md
+  st = est_check_belief view b
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view b dst EST_BELIEF_LEN
+  ret EST_OK
+end
+
+fn est_kf_predict_x mdl view ulong 280 has_bu ulong Bu view f64 8 x edit f64 8 to long
+  n = get mdl EM_N
+  xn = new f64 8 0.0
+  for i ulong n
+    s = f64 0.0
+    base = add EM_F mul i n
+    for j ulong n
+      fij = bitcast f64 get mdl add base j
+      s = add s mul fij get x j
+    end
+    if eq has_bu 1
+      s = add s get Bu i
+    end
+    put xn i s
+  end
+  for i ulong n
+    v = get xn i
+    if not est_isfinite v
+      ret EST_ERR_NONFINITE
+    end
+    put x i v
+  end
+  ret EST_OK
+end
+
+fn est_kf_predict_p mdl view ulong 280 P edit f64 64 to void
+  n = get mdl EM_N
+  Fmat = new f64 64 0.0
+  T = new f64 64 0.0
+  P2 = new f64 64 0.0
+  for i ulong mul n n
+    put Fmat i bitcast f64 get mdl add EM_F i
+  end
+  dims = new ulong 3 0
+  put dims 0 n
+  put dims 1 n
+  put dims 2 n
+  est_mm view Fmat view P T view dims
+  est_mmt view T view Fmat P2 view dims
+  for i ulong mul n n
+    put P i add get P2 i bitcast f64 get mdl add EM_Q i
+  end
+  est_symmetrize P n
+end
+
+fn est_kf_predict_step mdl view ulong 280 has_bu ulong Bu view f64 8 x edit f64 8 P edit f64 64 to long
+  st = est_kf_predict_x mdl has_bu Bu x
+  if ne st EST_OK
+    ret st
+  end
+  est_kf_predict_p mdl P
+  ret EST_OK
+end
+
+fn est_kf_predict_obs_y mdl view ulong 280 x view f64 8 p edit ulong 176 to void
+  n = get mdl EM_N
+  m = get mdl EM_M
+  for i ulong m
+    s = f64 0.0
+    base = add EM_H mul i n
+    for j ulong n
+      hij = bitcast f64 get mdl add base j
+      s = add s mul hij get x j
+    end
+    put p add EP_YM i bitcast ulong s
+  end
+end
+
+fn est_kf_predict_obs_s mdl view ulong 280 P view f64 64 p edit ulong 176 to void
+  n = get mdl EM_N
+  m = get mdl EM_M
+  Hmat = new f64 64 0.0
+  PHt = new f64 64 0.0
+  S = new f64 64 0.0
+  for i ulong mul m n
+    put Hmat i bitcast f64 get mdl add EM_H i
+  end
+  dims = new ulong 3 0
+  put dims 0 n
+  put dims 1 n
+  put dims 2 m
+  est_mmt P view Hmat PHt view dims
+  put dims 0 m
+  est_mm view Hmat view PHt S view dims
+  for i ulong mul m m
+    ri = bitcast f64 get mdl add EM_R i
+    put S i add get S i ri
+  end
+  est_symmetrize S m
+  for i ulong mul m m
+    put p add EP_S i bitcast ulong get S i
+  end
+end
+
+fn est_kf_predict_obs mdl view ulong 280 x view f64 8 P view f64 64 p edit ulong 176 to void
+  est_kf_predict_obs_y mdl x p
+  est_kf_predict_obs_s mdl P p
+end
+
+fn est_kf_predict_check mdl view ulong 280 bel view ulong 96 has_bu ulong Bu view f64 8 horizon ulong to long
+  st = est_check_model mdl
+  if ne st EST_OK
+    ret st
+  end
+  st = est_check_belief bel
+  if ne st EST_OK
+    ret st
+  end
+  n = get mdl EM_N
+  if ne get bel EB_N n
+    ret EST_ERR_DIM
+  end
+  for i ulong n
+    if ne get bel add EB_UNIT i get mdl add EM_SUNIT i
+      ret EST_ERR_UNIT
+    end
+  end
+  bmd = new uchar 32 0
+  est_rec_get_dig bel EB_MDL bmd
+  st = est_kf_model_matches mdl view bmd
+  if ne st EST_OK
+    ret st
+  end
+  if or lt horizon 1 gt horizon EST_MAX_HORIZON
+    ret EST_ERR_TIME
+  end
+  if eq has_bu 1
+    for i ulong n
+      if not est_isfinite get Bu i
+        ret EST_ERR_NONFINITE
+      end
+    end
+  end
+  if eq get bel EB_GEN 0xffffffffffffffff
+    ret EST_ERR_STALE
+  end
+  step_ns = bitcast long get mdl EM_STEP
+  imax = long 0x7fffffffffffffff
+  if gt long horizon div imax step_ns
+    ret EST_ERR_TIME
+  end
+  if gt bitcast long get bel EB_TNS sub imax mul long horizon step_ns
+    ret EST_ERR_TIME
+  end
+  ret EST_OK
+end
+
+fn est_kf_load_xp bel view ulong 96 x edit f64 8 P edit f64 64 to void
+  n = get bel EB_N
+  for i ulong n
+    put x i bitcast f64 get bel add EB_X i
+  end
+  for i ulong mul n n
+    put P i bitcast f64 get bel add EB_P i
+  end
+end
+
+fn est_kf_store_pred mdl view ulong 280 bel view ulong 96 x view f64 8 P view f64 64 p edit ulong 176 to void
+  n = get mdl EM_N
+  put p EP_N n
+  put p EP_M get mdl EM_M
+  for w ulong 4
+    put p add EP_MDL w get bel add EB_MDL w
+  end
+  for i ulong n
+    put p add EP_X i bitcast ulong get x i
+  end
+  for i ulong mul n n
+    put p add EP_P i bitcast ulong get P i
+  end
+  est_kf_predict_obs mdl x P p
+end
+
+fn est_kf_pred_meta mdl view ulong 280 bel view ulong 96 has_bu ulong Bu view f64 8 horizon ulong p edit ulong 176 to void
+  put p EP_HZ horizon
+  put p EP_GEN add get bel EB_GEN 1
+  span = mul long horizon bitcast long get mdl EM_STEP
+  put p EP_TNS bitcast ulong add bitcast long get bel EB_TNS span
+  if eq has_bu 1
+    put p EP_HC 1
+    for i ulong get mdl EM_N
+      bv = get Bu i
+      if eq bv 0.0f64
+        put p add EP_BU i bitcast ulong 0.0f64
+      else
+        put p add EP_BU i bitcast ulong bv
+      end
+    end
+  end
+end
+
+fn est_kf_predict mdl view ulong 280 bel view ulong 96 has_bu ulong Bu view f64 8 horizon ulong dst edit ulong 176 to long
+  st = est_kf_predict_check mdl bel has_bu Bu horizon
+  if ne st EST_OK
+    ret st
+  end
+  x = new f64 8 0.0
+  P = new f64 64 0.0
+  est_kf_load_xp bel x P
+  for h ulong horizon bound 1000001
+    st = est_kf_predict_step mdl has_bu Bu x P
+    if ne st EST_OK
+      ret st
+    end
+  end
+  p = new ulong 176 0
+  prior = new uchar 32 0
+  st = est_digest_belief bel prior
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_put_dig p EP_PRIOR view prior
+  est_kf_pred_meta mdl bel has_bu Bu horizon p
+  est_kf_store_pred mdl bel view x view P p
+  st = est_check_prediction view p
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view p dst EST_PRED_LEN
+  ret EST_OK
+end
+
+fn est_kf_bind_hdr mdl view ulong 280 prior view ulong 96 pred view ulong 176 to long
+  st = est_check_model mdl
+  if ne st EST_OK
+    ret st
+  end
+  st = est_check_belief prior
+  if ne st EST_OK
+    ret st
+  end
+  st = est_check_prediction pred
+  if ne st EST_OK
+    ret st
+  end
+  pd = new uchar 32 0
+  st = est_digest_belief prior pd
+  if ne st EST_OK
+    ret st
+  end
+  tmp = new uchar 32 0
+  est_rec_get_dig pred EP_PRIOR tmp
+  if not est_digest_eq view pd view tmp
+    ret EST_ERR_STALE
+  end
+  pg = get prior EB_GEN
+  if eq pg 0xffffffffffffffff
+    ret EST_ERR_STALE
+  end
+  if ne get pred EP_GEN add pg 1
+    ret EST_ERR_STALE
+  end
+  est_rec_get_dig prior EB_MDL pd
+  st = est_kf_model_matches mdl view pd
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_get_dig pred EP_MDL tmp
+  if not est_digest_eq view tmp view pd
+    ret EST_ERR_MODEL
+  end
+  if ne get pred EP_N get mdl EM_N
+    ret EST_ERR_DIM
+  end
+  if ne get pred EP_M get mdl EM_M
+    ret EST_ERR_DIM
+  end
+  if ne get prior EB_N get mdl EM_N
+    ret EST_ERR_DIM
+  end
+  ret EST_OK
+end
+
+fn est_kf_bind_checks mdl view ulong 280 prior view ulong 96 pred view ulong 176 pdig edit uchar 32 to long
+  st = est_kf_bind_hdr mdl prior pred
+  if ne st EST_OK
+    ret st
+  end
+  bu = new f64 8 0.0
+  for i ulong 8
+    put bu i bitcast f64 get pred add EP_BU i
+  end
+  re = new ulong 176 0
+  st = est_kf_predict mdl prior get pred EP_HC view bu get pred EP_HZ re
+  if ne st EST_OK
+    ret st
+  end
+  rd = new uchar 32 0
+  st = est_digest_prediction view re rd
+  if ne st EST_OK
+    ret st
+  end
+  st = est_digest_prediction pred pdig
+  if ne st EST_OK
+    ret st
+  end
+  if est_digest_eq view rd view pdig
+    ret EST_OK
+  end
+  ret EST_ERR_STALE
+end
+
+fn est_kf_check_obs_evidence obs view ulong 96 pdig view uchar 32 prior view ulong 96 to long
+  ev = new uchar 32 0
+  pa = new uchar 32 0
+  er = new uchar 32 0
+  md = new uchar 32 0
+  est_rec_get_dig obs EO_EV ev
+  est_rec_get_dig prior EB_PAR pa
+  est_rec_get_dig prior EB_ROOT er
+  est_rec_get_dig prior EB_MDL md
+  priordig = new uchar 32 0
+  st = est_digest_belief prior priordig
+  if ne st EST_OK
+    ret st
+  end
+  if est_digest_eq view ev pdig
+    ret EST_ERR_KIND
+  end
+  if est_digest_eq view ev view priordig
+    ret EST_ERR_KIND
+  end
+  if est_digest_eq view ev view pa
+    ret EST_ERR_KIND
+  end
+  if est_digest_eq view ev view er
+    ret EST_ERR_KIND
+  end
+  if est_digest_eq view ev view md
+    ret EST_ERR_KIND
+  end
+  ret EST_OK
+end
+
+fn est_eye_sub n ulong T view f64 64 A edit f64 64 to void
+  for i ulong mul n n
+    put A i neg get T i
+  end
+  for i ulong n
+    idx = add mul i n i
+    put A idx add 1.0f64 get A idx
+  end
+end
+
+fn est_kf_joseph_p1 mdl view ulong 280 pred view ulong 176 K view f64 64 P1 edit f64 64 to void
+  n = get mdl EM_N
+  m = get mdl EM_M
+  Hmat = new f64 64 0.0
+  Pmat = new f64 64 0.0
+  A = new f64 64 0.0
+  T = new f64 64 0.0
+  for i ulong mul m n
+    put Hmat i bitcast f64 get mdl add EM_H i
+  end
+  for i ulong mul n n
+    put Pmat i bitcast f64 get pred add EP_P i
+  end
+  dims = new ulong 3 0
+  put dims 0 n
+  put dims 1 m
+  put dims 2 n
+  est_mm K view Hmat T view dims
+  est_eye_sub n view T A
+  put dims 1 n
+  est_mm view A view Pmat T view dims
+  est_mmt view T view A P1 view dims
+end
+
+fn est_kf_joseph_p2 n ulong m ulong obs view ulong 96 K view f64 64 P2 edit f64 64 to void
+  Rmat = new f64 64 0.0
+  KR = new f64 64 0.0
+  for i ulong mul m m
+    put Rmat i bitcast f64 get obs add EO_R i
+  end
+  dims = new ulong 3 0
+  put dims 0 n
+  put dims 1 m
+  put dims 2 m
+  est_mm K view Rmat KR view dims
+  put dims 2 n
+  est_mmt view KR K P2 view dims
+end
+
+fn est_kf_joseph mdl view ulong 280 pred view ulong 176 obs view ulong 96 K view f64 64 b edit ulong 96 to void
+  n = get mdl EM_N
+  P1 = new f64 64 0.0
+  P2 = new f64 64 0.0
+  est_kf_joseph_p1 mdl pred K P1
+  est_kf_joseph_p2 n get mdl EM_M obs K P2
+  for i ulong mul n n
+    put P1 i add get P1 i get P2 i
+  end
+  est_symmetrize P1 n
+  for i ulong mul n n
+    put b add EB_P i bitcast ulong get P1 i
+  end
+end
+
+fn est_kf_add_r obs view ulong 96 m ulong S edit f64 64 to void
+  for i ulong mul m m
+    ri = bitcast f64 get obs add EO_R i
+    put S i add get S i ri
+  end
+  est_symmetrize S m
+end
+
+fn est_kf_innov_sl mdl view ulong 280 pred view ulong 176 obs view ulong 96 PHt edit f64 64 S edit f64 64 L edit f64 64 to bool
+  n = get mdl EM_N
+  m = get mdl EM_M
+  Pmat = new f64 64 0.0
+  Hmat = new f64 64 0.0
+  for i ulong mul n n
+    put Pmat i bitcast f64 get pred add EP_P i
+  end
+  for i ulong mul m n
+    put Hmat i bitcast f64 get mdl add EM_H i
+  end
+  dims = new ulong 3 0
+  put dims 0 n
+  put dims 1 n
+  put dims 2 m
+  est_mmt view Pmat view Hmat PHt view dims
+  put dims 0 m
+  est_mm view Hmat view PHt S view dims
+  est_kf_add_r obs m S
+  ret est_chol view S L m
+end
+
+fn est_kf_gain_x n ulong m ulong L view f64 64 PHt view f64 64 K edit f64 64 to void
+  y = new f64 8 0.0
+  row = new f64 8 0.0
+  krow = new f64 8 0.0
+  for i ulong n
+    base = mul i m
+    for j ulong m
+      put row j get PHt add base j
+    end
+    est_fwd L view row y m
+    est_bwd L view y krow m
+    for j ulong m
+      put K add base j get krow j
+    end
+  end
+end
+
+fn est_kf_hdot mdl view ulong 280 pred view ulong 176 i ulong n ulong to f64
+  s = f64 0.0
+  base = add EM_H mul i n
+  for j ulong n
+    hij = bitcast f64 get mdl add base j
+    xj = bitcast f64 get pred add EP_X j
+    s = add s mul hij xj
+  end
+  ret s
+end
+
+fn est_kf_compute_nu mdl view ulong 280 pred view ulong 176 obs view ulong 96 nu edit f64 8 to void
+  n = get mdl EM_N
+  m = get mdl EM_M
+  for i ulong m
+    s = est_kf_hdot mdl pred i n
+    put nu i sub bitcast f64 get obs add EO_Z i s
+  end
+end
+
+fn est_kf_kdot K view f64 64 nu view f64 8 i ulong m ulong to f64
+  s = f64 0.0
+  base = mul i m
+  for j ulong m
+    s = add s mul get K add base j get nu j
+  end
+  ret s
+end
+
+fn est_kf_apply_x mdl view ulong 280 pred view ulong 176 K view f64 64 nu view f64 8 b edit ulong 96 to void
+  n = get mdl EM_N
+  m = get mdl EM_M
+  put b EB_N n
+  for i ulong n
+    s = est_kf_kdot K nu i m
+    px = bitcast f64 get pred add EP_X i
+    put b add EB_X i bitcast ulong add px s
+    put b add EB_UNIT i get mdl add EM_SUNIT i
+  end
+end
+
+fn est_kf_nis L view f64 64 nu view f64 8 m ulong to f64
+  y = new f64 8 0.0
+  est_fwd L nu y m
+  nis = f64 0.0
+  for i ulong m
+    yi = get y i
+    nis = add nis mul yi yi
+  end
+  ret nis
+end
+
+fn est_kf_store_iv m ulong nu view f64 8 S view f64 64 nis f64 iv edit ulong 96 to void
+  put iv EI_M m
+  for i ulong m
+    put iv add EI_NU i bitcast ulong get nu i
+  end
+  for i ulong mul m m
+    put iv add EI_S i bitcast ulong get S i
+  end
+  put iv EI_NIS bitcast ulong nis
+end
+
+fn est_kf_update_math mdl view ulong 280 pred view ulong 176 obs view ulong 96 b edit ulong 96 iv edit ulong 96 to long
+  nu = new f64 8 0.0
+  est_kf_compute_nu mdl pred obs nu
+  PHt = new f64 64 0.0
+  S = new f64 64 0.0
+  L = new f64 64 0.0
+  if not est_kf_innov_sl mdl pred obs PHt S L
+    ret EST_ERR_NOT_PD
+  end
+  K = new f64 64 0.0
+  est_kf_gain_x get mdl EM_N get mdl EM_M view L view PHt K
+  est_kf_apply_x mdl pred view K view nu b
+  est_kf_joseph mdl pred obs view K b
+  est_kf_store_iv get mdl EM_M view nu view S est_kf_nis view L view nu get mdl EM_M iv
+  ret EST_OK
+end
+
+fn est_kf_update_check mdl view ulong 280 prior_belief view ulong 96 pred view ulong 176 obs view ulong 96 pdig edit uchar 32 to long
+  st = est_kf_bind_checks mdl prior_belief pred pdig
+  if ne st EST_OK
+    ret st
+  end
+  st = est_check_observation obs
+  if ne st EST_OK
+    ret st
+  end
+  st = est_kf_check_obs_evidence obs view pdig prior_belief
+  if ne st EST_OK
+    ret st
+  end
+  m = get mdl EM_M
+  if ne get obs EO_M m
+    ret EST_ERR_DIM
+  end
+  if ne get obs EO_TNS get pred EP_TNS
+    ret EST_ERR_TIME
+  end
+  for i ulong m
+    u1 = get obs add EO_UNIT i
+    u2 = get mdl add EM_OUNIT i
+    if ne u1 u2
+      ret EST_ERR_UNIT
+    end
+  end
+  ret EST_OK
+end
+
+fn est_kf_update_meta prior_belief view ulong 96 pred view ulong 176 pdig view uchar 32 odig view uchar 32 b edit ulong 96 iv edit ulong 96 to long
+  prev_root = new uchar 32 0
+  est_rec_get_dig prior_belief EB_ROOT prev_root
+  root = new uchar 32 0
+  st = est_evidence_root_extend view prev_root odig root
+  if ne st EST_OK
+    ret st
+  end
+  put b EB_GEN add get pred EP_GEN 1
+  put b EB_TNS get pred EP_TNS
+  for w ulong 4
+    put b add EB_MDL w get prior_belief add EB_MDL w
+    put iv add EI_MDL w get prior_belief add EB_MDL w
+  end
+  est_rec_put_dig b EB_PAR pdig
+  est_rec_put_dig b EB_ROOT view root
+  est_rec_put_dig iv EI_PRED pdig
+  est_rec_put_dig iv EI_OBS odig
+  put iv EI_TNS get pred EP_TNS
+  ret EST_OK
+end
+
+fn est_kf_update mdl view ulong 280 prior_belief view ulong 96 pred view ulong 176 obs view ulong 96 post edit ulong 96 innov edit ulong 96 to long
+  pdig = new uchar 32 0
+  st = est_kf_update_check mdl prior_belief pred obs pdig
+  if ne st EST_OK
+    ret st
+  end
+  odig = new uchar 32 0
+  st = est_digest_observation obs odig
+  if ne st EST_OK
+    ret st
+  end
+  b = new ulong 96 0
+  iv = new ulong 96 0
+  st = est_kf_update_math mdl pred obs b iv
+  if ne st EST_OK
+    ret st
+  end
+  st = est_kf_update_meta prior_belief pred view pdig view odig b iv
+  if ne st EST_OK
+    ret st
+  end
+  st = est_check_belief view b
+  if ne st EST_OK
+    ret st
+  end
+  st = est_check_innovation view iv
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view b post EST_BELIEF_LEN
+  est_rec_copy view iv innov EST_INNOV_LEN
+  ret EST_OK
+end
+
+fn est_kf_coast mdl view ulong 280 pred view ulong 176 prior_belief view ulong 96 dst edit ulong 96 to long
+  pdig = new uchar 32 0
+  st = est_kf_bind_checks mdl prior_belief pred pdig
+  if ne st EST_OK
+    ret st
+  end
+  b = new ulong 96 0
+  n = get pred EP_N
+  put b EB_N n
+  for i ulong n
+    put b add EB_UNIT i get mdl add EM_SUNIT i
+    put b add EB_X i get pred add EP_X i
+  end
+  for i ulong mul n n
+    put b add EB_P i get pred add EP_P i
+  end
+  put b EB_GEN add get pred EP_GEN 1
+  put b EB_TNS get pred EP_TNS
+  for w ulong 4
+    put b add EB_MDL w get prior_belief add EB_MDL w
+    put b add EB_ROOT w get prior_belief add EB_ROOT w
+  end
+  est_rec_put_dig b EB_PAR view pdig
+  st = est_check_belief view b
+  if ne st EST_OK
+    ret st
+  end
+  est_rec_copy view b dst EST_BELIEF_LEN
+  ret EST_OK
+end

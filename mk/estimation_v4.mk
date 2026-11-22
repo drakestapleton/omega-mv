@@ -54,16 +54,14 @@ est-v4-purity: $(ESTV4_DIR)/est_v4.o
 		echo "est_v4.o references an operation an estimator must not have"; exit 1; fi
 	@echo "est-v4-purity: est_v4.o references no forbidden symbol"
 
-$(ESTV4_DIR)/test_est_v4: tests/estimation/test_est_v4.c $(ESTV4_SRCS) $(ESTV4_HDRS)
+EST_OM_V4 = $(EST_OM_TYPES) src/estimation/est_mix.om src/estimation/est_pred.om src/estimation/est_v4.om
+
+$(ESTV4_DIR)/test_est_v4: $(EST_OM_V4) tests/estimation/test_est_v4.om
 	@mkdir -p $(ESTV4_DIR)
-	$(CC) $(EST_CFLAGS) -o $@ tests/estimation/test_est_v4.c $(ESTV4_SRCS) -lm
-$(ESTV4_DIR)/test_est_v4_asan: tests/estimation/test_est_v4.c $(ESTV4_SRCS) $(ESTV4_HDRS)
-	@mkdir -p $(ESTV4_DIR)
-	$(CC) $(EST_CFLAGS) $(EST_ASAN) -o $@ tests/estimation/test_est_v4.c $(ESTV4_SRCS) -lm
-test-est-v4: $(ESTV4_DIR)/test_est_v4 $(ESTV4_DIR)/test_est_v4_asan
+	cat $^ | $(EST_OMC) > $@ && chmod +x $@
+test-est-v4: $(ESTV4_DIR)/test_est_v4
 	./$(ESTV4_DIR)/test_est_v4
-	./$(ESTV4_DIR)/test_est_v4_asan
-	@echo "test-est-v4: v4 families, multi-step propagation and pmf agree in plain and ASan/UBSan builds"
+	@echo "test-est-v4: v4 families, multi-step propagation and pmf agree (pure OM-2)"
 
 $(ESTV4_DIR)/est4: $(ESTV4_TOOL_SRCS) $(ESTV4_TOOL_HDRS) $(ESTV4_DIR)/toolid.stamp
 	$(CC) $(ESTV4_CFLAGS) $(ESTV4_ID) -o $@ $(ESTV4_TOOL_SRCS) -lm
