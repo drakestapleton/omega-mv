@@ -37,8 +37,8 @@ omega: $(OMEGA_BIN)
 $(OUT_DIR)/tests-visor/%: tests/visor/%.c $(VISOR_CORE_OBJS) $(VISOR_OBJS) $(LANG_OBJS) | $(OUT_DIR)/tests-visor
 	$(CC) $(VISOR_CFLAGS) -Itests/visor -o $@ $< $(VISOR_CORE_OBJS) $(VISOR_OBJS) $(LANG_OBJS)
 
-$(OUT_DIR)/tests-language/%: tests/language/%.c $(VISOR_CORE_OBJS) $(VISOR_OBJS) $(LANG_OBJS) | $(OUT_DIR)/tests-language
-	$(CC) $(VISOR_CFLAGS) -Itests/language -o $@ $< $(VISOR_CORE_OBJS) $(VISOR_OBJS) $(LANG_OBJS)
+$(OUT_DIR)/tests-language/%: tests/language/%.om seed/out/omc | $(OUT_DIR)/tests-language
+	seed/out/omc < $< > $@ && chmod +x $@
 
 # ---- aggregate Visor gates (lead-owned) --------------------------------------
 # Physics-free lane tests (no PHYSICS_DIR needed):
