@@ -1,0 +1,1882 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note Shared utilities, topologies, archive pins, simulation driver, statistics,
+note NARMA generator, ridge CV, and Householder QR for res_qualify.
+note Concatenated after src/reservoir/reservoir.om, res_inflate.om, res_mat.om.
+
+const RC_NET_HEX13 uint 13
+const RC_NET_HEX25 uint 25
+const RC_NET_HEX43 uint 43
+const RC_NET_CHAIN50 uint 50
+const RC_PIN_COUNT ulong 22
+
+note Buffered stdout
+global rc_out uchar 8192
+global rc_out_n ulong 1
+
+note Simulation globals
+global rc_cfg uint 5363
+global rc_ws uint 3564
+global rc_s uint 932
+global rc_next uint 932
+global rc_tab f32 *
+global rc_steps ulong *
+global rc_vout f64 *
+global rc_pos f64 *
+
+note Ridge CV & QR work globals
+global rc_xtr f64 *
+global rc_ytr f64 *
+global rc_xte f64 *
+global rc_yte f64 *
+global rc_ptr f64 *
+global rc_pte f64 *
+global rc_ztr f64 *
+global rc_zte f64 *
+global rc_pv f64 *
+global rc_rws ulong 67334
+global rc_ro ulong 1031
+global rc_qr_a f64 *
+global rc_qr_b f64 *
+global rc_qr_w f64 257
+
+note Strings
+text rc_hex_ch "0123456789abcdef"
+text rc_s_null "null"
+text rc_s_true "true"
+text rc_s_false "false"
+text rc_s_ok "OK"
+text rc_s_enull "ERR_NULL"
+text rc_s_etopo "ERR_TOPOLOGY"
+text rc_s_eparam "ERR_PARAM"
+text rc_s_enonfin "ERR_NONFINITE"
+text rc_s_erange "ERR_RANGE"
+text rc_s_estiff "ERR_STIFF"
+text rc_s_einput "ERR_INPUT"
+text rc_s_emism "ERR_MISMATCH"
+text rc_s_efpenv "ERR_FPENV"
+text rc_s_esing "ERR_SINGULAR"
+text rc_s_ealias "ERR_ALIAS"
+text rc_s_eunk "ERR_UNKNOWN"
+text rc_ms_0 ", \"membranes\": {\"states_observed\": "
+text rc_ms_1 ", \"states_implausible\": "
+text rc_ms_2 ", \"membranes_implausible\": "
+text rc_ms_3 ", \"max_membrane_abs_v\": "
+text rc_ms_4 ", \"max_node_abs_v\": "
+text rc_ms_5 "}"
+
+note ================================================================
+note Buffered output & JSON formatting
+note ================================================================
+
+fn rc_flush to void
+  n = get rc_out_n 0
+  buf = new uchar 8192 0
+  if gt n 0
+    for i ulong n bound 8192
+      put buf i get rc_out i
+    end
+    _w = write 1 buf 0 n
+    put rc_out_n 0 0
+  end
+end
+
+fn rc_putc c uchar to void
+  n = get rc_out_n 0
+  if ge n 8192
+    rc_flush
+    n = 0
+  end
+  put rc_out n c
+  put rc_out_n 0 add n 1
+end
+
+fn rc_puts s view uchar * to void
+  n = len s
+  for i ulong n bound 100000
+    rc_putc get s i
+  end
+end
+
+fn rc_err_puts s view uchar * to void
+  n = len s
+  buf = new uchar 256 0
+  off = ulong 0
+  while lt off n bound 1024
+    ch = sub n off
+    if gt ch 256
+      ch = 256
+    end
+    for i ulong ch bound 256
+      put buf i get s add off i
+    end
+    _w = write 2 buf 0 ch
+    off = add off ch
+  end
+end
+
+fn rc_put_u64 v ulong to void
+  if eq v 0
+    rc_putc uchar 48
+    ret
+  end
+  d = new uchar 24 0
+  k = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put d k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  while gt k 0 bound 24
+    k = sub k 1
+    rc_putc get d k
+  end
+end
+
+fn rc_put_i64 v long to void
+  if lt v 0
+    rc_putc uchar 45
+    rc_put_u64 ulong neg v
+  else
+    rc_put_u64 ulong v
+  end
+end
+
+fn rc_put_hex32_u8 d view uchar 32 to void
+  for i ulong 32 bound 32
+    b = ulong get d i
+    rc_putc get rc_hex_ch shr b 4
+    rc_putc get rc_hex_ch and b 15
+  end
+end
+
+fn rc_put_hex32_u32 d view uint 32 to void
+  for i ulong 32 bound 32
+    b = ulong and get d i 0xff
+    rc_putc get rc_hex_ch shr b 4
+    rc_putc get rc_hex_ch and b 15
+  end
+end
+
+fn rc_jhex_u32 d view uint 32 to void
+  rc_putc uchar 34
+  rc_put_hex32_u32 d
+  rc_putc uchar 34
+end
+
+fn rc_json_str s view uchar * to void
+  rc_putc uchar 34
+  n = len s
+  for i ulong n bound 100000
+    c = get s i
+    if or eq c uchar 34 eq c uchar 92
+      rc_putc uchar 92
+      rc_putc c
+    else
+      if lt c uchar 32
+        rc_putc uchar 92
+        rc_putc uchar 117
+        rc_putc uchar 48
+        rc_putc uchar 48
+        rc_putc get rc_hex_ch shr ulong c 4
+        rc_putc get rc_hex_ch and ulong c 15
+      else
+        rc_putc c
+      end
+    end
+  end
+  rc_putc uchar 34
+end
+
+fn rc_abs64 x f64 to f64
+  if lt x 0.0f64
+    ret neg x
+  end
+  ret x
+end
+
+fn rc_isnan x f64 to bool
+  ret not eq x x
+end
+
+fn rc_isfin x f64 to bool
+  if not eq x x
+    ret false
+  end
+  ret eq sub x x 0.0f64
+end
+
+fn rc_pow10_u e ulong to f64
+  p = 1.0f64
+  b = 10.0f64
+  k = e
+  while gt k 0 bound 400
+    if ne and k 1 0
+      p = mul p b
+    end
+    b = mul b b
+    k = shr k 1
+  end
+  ret p
+end
+
+fn rc_f64_norm_exp x f64 out_m edit f64 1 to long
+  e = long 0
+  m = x
+  while ge m 10.0f64 bound 400
+    if ge m 1.0e16f64
+      m = div m 1.0e16f64
+      e = add e 16
+    else
+      m = div m 10.0f64
+      e = add e 1
+    end
+  end
+  while lt m 1.0f64 bound 400
+    if lt m 1.0e-16f64
+      m = mul m 1.0e16f64
+      e = sub e 16
+    else
+      m = mul m 10.0f64
+      e = sub e 1
+    end
+  end
+  put out_m 0 m
+  ret e
+end
+
+fn rc_put_exp_part e long to void
+  rc_putc uchar 101
+  ae = ulong 0
+  if lt e 0
+    rc_putc uchar 45
+    ae = ulong neg e
+  else
+    rc_putc uchar 43
+    ae = ulong e
+  end
+  if lt ae 10
+    rc_putc uchar 48
+  end
+  rc_put_u64 ae
+end
+
+fn rc_put_f64_digits digs view uchar 24 last ulong e long sig ulong to void
+  if or lt e -4 ge e long sig
+    rc_putc get digs 0
+    if gt last 0
+      rc_putc uchar 46
+      for i ulong last bound 24
+        rc_putc get digs add i 1
+      end
+    end
+    rc_put_exp_part e
+  else
+    if lt e 0
+      rc_putc uchar 48
+      rc_putc uchar 46
+      nz = ulong sub neg e 1
+      for z ulong nz bound 8
+        rc_putc uchar 48
+      end
+      for i ulong add last 1 bound 24
+        rc_putc get digs i
+      end
+    else
+      eu = ulong e
+      for i ulong add eu 1 bound 24
+        if le i last
+          rc_putc get digs i
+        else
+          rc_putc uchar 48
+        end
+      end
+      if gt last eu
+        rc_putc uchar 46
+        for i ulong sub last eu bound 24
+          rc_putc get digs add add eu 1 i
+        end
+      end
+    end
+  end
+end
+
+fn rc_put_f64_emit_iv iv_in ulong e long sig ulong to void
+  iv = iv_in
+  digs = new uchar 24 48
+  k = sig
+  while gt k 0 bound 24
+    k = sub k 1
+    put digs k uchar add 48 rem iv 10
+    iv = div iv 10
+  end
+  last = sub sig 1
+  while and gt last 0 eq get digs last uchar 48 bound 24
+    last = sub last 1
+  end
+  rc_put_f64_digits view digs last e sig
+end
+
+fn rc_put_f64 v f64 sig_in uint to void
+  if not rc_isfin v
+    rc_puts rc_s_null
+    ret
+  end
+  if eq v 0.0f64
+    rc_putc uchar 48
+    ret
+  end
+  x = v
+  if lt x 0.0f64
+    rc_putc uchar 45
+    x = neg x
+  end
+  sig = ulong sig_in
+  if gt sig 17
+    sig = 17
+  end
+  if lt sig 1
+    sig = 1
+  end
+  mb = new f64 1 0.0f64
+  e = rc_f64_norm_exp x mb
+  p10 = rc_pow10_u sub sig 1
+  sc = add mul get mb 0 p10 0.5f64
+  if ge sc mul p10 10.0f64
+    sc = div sc 10.0f64
+    e = add e 1
+  end
+  rc_put_f64_emit_iv ulong sc e sig
+end
+
+fn rc_put_f64_1 v f64 to void
+  if not rc_isfin v
+    rc_puts rc_s_null
+    ret
+  end
+  x = v
+  if lt x 0.0f64
+    rc_putc uchar 45
+    x = neg x
+  end
+  t = ulong add mul x 10.0f64 0.5f64
+  rc_put_u64 div t 10
+  rc_putc uchar 46
+  rc_putc uchar add 48 rem t 10
+end
+
+fn rc_put_f64_4 v f64 to void
+  if not rc_isfin v
+    rc_puts rc_s_null
+    ret
+  end
+  x = v
+  if lt x 0.0f64
+    rc_putc uchar 45
+    x = neg x
+  end
+  t = ulong add mul x 10000.0f64 0.5f64
+  rc_put_u64 div t 10000
+  rc_putc uchar 46
+  frac = rem t 10000
+  rc_putc uchar add 48 div frac 1000
+  rc_putc uchar add 48 rem div frac 100 10
+  rc_putc uchar add 48 rem div frac 10 10
+  rc_putc uchar add 48 rem frac 10
+end
+
+fn rc_status_puts st int to void
+  if eq st RES_OK
+    rc_puts rc_s_ok
+    ret
+  end
+  if eq st RES_ERR_NULL
+    rc_puts rc_s_enull
+    ret
+  end
+  if eq st RES_ERR_TOPOLOGY
+    rc_puts rc_s_etopo
+    ret
+  end
+  if eq st RES_ERR_PARAM
+    rc_puts rc_s_eparam
+    ret
+  end
+  if eq st RES_ERR_NONFINITE
+    rc_puts rc_s_enonfin
+    ret
+  end
+  if eq st RES_ERR_RANGE
+    rc_puts rc_s_erange
+    ret
+  end
+  if eq st RES_ERR_STIFF
+    rc_puts rc_s_estiff
+    ret
+  end
+  if eq st RES_ERR_INPUT
+    rc_puts rc_s_einput
+    ret
+  end
+  if eq st RES_ERR_MISMATCH
+    rc_puts rc_s_emism
+    ret
+  end
+  if eq st RES_ERR_FPENV
+    rc_puts rc_s_efpenv
+    ret
+  end
+  if eq st RES_ERR_SINGULAR
+    rc_puts rc_s_esing
+    ret
+  end
+  if eq st RES_ERR_ALIAS
+    rc_puts rc_s_ealias
+    ret
+  end
+  rc_puts rc_s_eunk
+end
+
+fn rc_mstats_json m view uint 200 to void
+  obs = or shl ulong get m RES_MS_OBS_HI 32 ulong get m RES_MS_OBS_LO
+  imp = or shl ulong get m RES_MS_IMP_HI 32 ulong get m RES_MS_IMP_LO
+  rc_puts rc_ms_0
+  rc_put_u64 obs
+  rc_puts rc_ms_1
+  rc_put_u64 imp
+  rc_puts rc_ms_2
+  rc_put_u64 ulong get m RES_MS_MEM_IMP
+  rc_puts rc_ms_3
+  rc_put_f64 f64 bitcast f32 get m RES_MS_MAX_MV 9
+  rc_puts rc_ms_4
+  rc_put_f64 f64 bitcast f32 get m RES_MS_MAX_NV 9
+  rc_puts rc_ms_5
+end
+
+note ================================================================
+note Time & splitmix64 RNG
+note ================================================================
+
+fn rc_now_ns to ulong
+  ret ulong monons
+end
+
+fn rc_now_s to f64
+  ret mul f64 monons 1.0e-9f64
+end
+
+fn rc_rng_next r edit ulong 1 to ulong
+  c0 = or shl ulong 0x9e3779b9 32 ulong 0x7f4a7c15
+  c1 = or shl ulong 0xbf58476d 32 ulong 0x1ce4e5b9
+  c2 = or shl ulong 0x94d049bb 32 ulong 0x133111eb
+  z = add get r 0 c0
+  put r 0 z
+  z = mul xor z shr z 30 c1
+  z = mul xor z shr z 27 c2
+  ret xor z shr z 31
+end
+
+fn rc_rng_unit r edit ulong 1 to f64
+  ret mul f64 shr rc_rng_next r 11 div 1.0f64 9007199254740992.0f64
+end
+
+note ================================================================
+note Reference topologies (HEX13, HEX25, HEX43, CHAIN50, disconnected)
+note ================================================================
+
+fn rc_add_edge e edit uint 384 m edit uint 1 a uint b uint to void
+  if eq a b
+    ret
+  end
+  lo = a
+  hi = b
+  if gt lo hi
+    lo = b
+    hi = a
+  end
+  cnt = ulong get m 0
+  for q ulong cnt bound 192
+    if eq get e mul q 2 lo
+      if eq get e add mul q 2 1 hi
+        ret
+      end
+    end
+  end
+  put e mul cnt 2 lo
+  put e add mul cnt 2 1 hi
+  put m 0 add get m 0 1
+end
+
+fn rc_nb_add e edit uint 384 m edit uint 1 node uint n1 uint n2 uint n3 uint to void
+  if gt n1 0
+    rc_add_edge e m node sub n1 1
+  end
+  if gt n2 0
+    rc_add_edge e m node sub n2 1
+  end
+  if gt n3 0
+    rc_add_edge e m node sub n3 1
+  end
+end
+
+fn rc_nb_add6 e edit uint 384 m edit uint 1 node uint v view uint 6 to void
+  for k ulong 6 bound 6
+    nb = get v k
+    if gt nb 0
+      rc_add_edge e m node sub nb 1
+    end
+  end
+end
+
+fn rc_build_hex13 t edit uint 514 inp edit uint 3 gr edit uint 1 to int
+  e = new uint 384 0
+  m = new uint 1 0
+  rc_nb_add e m 0 2 3 4
+  rc_nb_add e m 1 1 5 6
+  rc_nb_add e m 2 1 6 7
+  rc_nb_add e m 3 1 5 8
+  rc_nb_add e m 4 2 4 9
+  rc_nb_add e m 5 2 3 10
+  rc_nb_add e m 6 3 11 0
+  rc_nb_add e m 7 4 12 0
+  rc_nb_add e m 8 5 12 13
+  rc_nb_add e m 9 6 11 13
+  rc_nb_add e m 10 7 10 0
+  rc_nb_add e m 11 8 9 0
+  rc_nb_add e m 12 9 10 0
+  put inp 0 0
+  put inp 1 1
+  put inp 2 12
+  put gr 0 7
+  g = new uint 1 7
+  tm = new uint 3 0
+  put tm 0 13
+  put tm 1 get m 0
+  put tm 2 1
+  ret res_topology_build view tm view e view g t
+end
+
+fn rc_hex25_edges_a e edit uint 384 m edit uint 1 to void
+  rc_nb_add e m 0 2 3 0
+  rc_nb_add e m 1 1 3 4
+  rc_nb_add e m 1 5 0 0
+  rc_nb_add e m 2 1 2 5
+  rc_nb_add e m 2 6 0 0
+  rc_nb_add e m 3 2 5 7
+  rc_nb_add e m 3 8 0 0
+  rc_nb_add e m 4 2 3 4
+  rc_nb_add e m 4 6 8 9
+  rc_nb_add e m 5 3 5 9
+  rc_nb_add e m 5 10 0 0
+  rc_nb_add e m 6 4 8 11
+  rc_nb_add e m 6 12 0 0
+  rc_nb_add e m 7 4 5 7
+  rc_nb_add e m 7 9 12 13
+  rc_nb_add e m 8 5 6 8
+  rc_nb_add e m 8 10 13 14
+  rc_nb_add e m 9 6 9 14
+  rc_nb_add e m 9 15 0 0
+  rc_nb_add e m 10 7 12 16
+  rc_nb_add e m 11 7 8 11
+  rc_nb_add e m 11 13 16 17
+end
+
+fn rc_hex25_edges_b e edit uint 384 m edit uint 1 to void
+  rc_nb_add e m 12 8 9 12
+  rc_nb_add e m 12 14 17 18
+  rc_nb_add e m 13 9 10 13
+  rc_nb_add e m 13 15 18 19
+  rc_nb_add e m 14 10 14 19
+  rc_nb_add e m 15 11 12 17
+  rc_nb_add e m 15 20 0 0
+  rc_nb_add e m 16 12 13 16
+  rc_nb_add e m 16 18 20 21
+  rc_nb_add e m 17 13 14 17
+  rc_nb_add e m 17 19 21 22
+  rc_nb_add e m 18 14 15 18
+  rc_nb_add e m 18 22 0 0
+  rc_nb_add e m 19 16 17 21
+  rc_nb_add e m 19 23 0 0
+  rc_nb_add e m 20 17 18 20
+  rc_nb_add e m 20 22 23 24
+  rc_nb_add e m 21 18 19 21
+  rc_nb_add e m 21 24 0 0
+  rc_nb_add e m 22 20 21 24
+  rc_nb_add e m 22 25 0 0
+  rc_nb_add e m 23 21 22 23
+  rc_nb_add e m 23 25 0 0
+  rc_nb_add e m 24 23 24 0
+end
+
+fn rc_build_hex25 t edit uint 514 inp edit uint 3 gr edit uint 1 to int
+  e = new uint 384 0
+  m = new uint 1 0
+  rc_hex25_edges_a e m
+  rc_hex25_edges_b e m
+  put inp 0 0
+  put inp 1 1
+  put inp 2 24
+  put gr 0 13
+  g = new uint 1 13
+  tm = new uint 3 0
+  put tm 0 25
+  put tm 1 get m 0
+  put tm 2 1
+  ret res_topology_build view tm view e view g t
+end
+
+fn rc_hex43_a e edit uint 384 m edit uint 1 to void
+  rc_nb_add e m 0 2 3 4
+  rc_nb_add e m 1 1 3 5
+  rc_nb_add e m 1 6 0 0
+  rc_nb_add e m 2 1 2 4
+  rc_nb_add e m 2 6 7 8
+  rc_nb_add e m 3 1 3 8
+  rc_nb_add e m 3 9 0 0
+  rc_nb_add e m 4 2 6 10
+  rc_nb_add e m 4 11 0 0
+  rc_nb_add e m 5 2 3 5
+  rc_nb_add e m 5 7 11 12
+  rc_nb_add e m 6 3 6 8
+  rc_nb_add e m 6 12 13 14
+  rc_nb_add e m 7 3 4 7
+  rc_nb_add e m 7 9 14 15
+  rc_nb_add e m 8 4 8 15
+  rc_nb_add e m 8 16 0 0
+  rc_nb_add e m 9 5 11 17
+  rc_nb_add e m 10 5 6 10
+  rc_nb_add e m 10 12 17 18
+  rc_nb_add e m 11 6 7 11
+  rc_nb_add e m 11 13 18 19
+  rc_nb_add e m 12 7 12 14
+  rc_nb_add e m 12 19 20 21
+end
+
+fn rc_hex43_b e edit uint 384 m edit uint 1 to void
+  rc_nb_add e m 13 7 8 13
+  rc_nb_add e m 13 15 21 22
+  rc_nb_add e m 14 8 9 14
+  rc_nb_add e m 14 16 22 23
+  rc_nb_add e m 15 9 15 23
+  rc_nb_add e m 16 10 11 18
+  rc_nb_add e m 16 24 0 0
+  rc_nb_add e m 17 11 12 17
+  rc_nb_add e m 17 19 24 25
+  rc_nb_add e m 18 12 13 18
+  rc_nb_add e m 18 20 25 26
+  rc_nb_add e m 19 13 19 21
+  rc_nb_add e m 19 26 27 28
+  rc_nb_add e m 20 13 14 20
+  rc_nb_add e m 20 22 28 29
+  rc_nb_add e m 21 14 15 21
+  rc_nb_add e m 21 23 29 30
+  rc_nb_add e m 22 15 16 22
+  rc_nb_add e m 22 30 0 0
+  rc_nb_add e m 23 17 18 25
+  rc_nb_add e m 23 31 0 0
+  rc_nb_add e m 24 18 19 24
+  rc_nb_add e m 24 26 31 32
+  rc_nb_add e m 25 19 20 25
+  rc_nb_add e m 25 27 32 33
+end
+
+fn rc_hex43_c e edit uint 384 m edit uint 1 to void
+  rc_nb_add e m 26 20 26 28
+  rc_nb_add e m 26 33 34 35
+  rc_nb_add e m 27 20 21 27
+  rc_nb_add e m 27 29 35 36
+  rc_nb_add e m 28 21 22 28
+  rc_nb_add e m 28 30 36 37
+  rc_nb_add e m 29 22 23 29
+  rc_nb_add e m 29 37 0 0
+  rc_nb_add e m 30 24 25 32
+  rc_nb_add e m 30 38 0 0
+  rc_nb_add e m 31 25 26 31
+  rc_nb_add e m 31 33 38 39
+  rc_nb_add e m 32 26 27 32
+  rc_nb_add e m 32 34 39 40
+  rc_nb_add e m 33 27 33 35
+  rc_nb_add e m 33 40 41 0
+  rc_nb_add e m 34 27 28 34
+  rc_nb_add e m 34 36 41 42
+  rc_nb_add e m 35 28 29 35
+  rc_nb_add e m 35 37 42 43
+  rc_nb_add e m 36 29 30 36
+  rc_nb_add e m 36 43 0 0
+  rc_nb_add e m 37 31 32 39
+  rc_nb_add e m 38 32 33 38
+  rc_nb_add e m 38 40 0 0
+  rc_nb_add e m 39 33 34 39
+  rc_nb_add e m 39 41 0 0
+  rc_nb_add e m 40 34 35 40
+  rc_nb_add e m 40 42 0 0
+  rc_nb_add e m 41 35 36 41
+  rc_nb_add e m 41 43 0 0
+  rc_nb_add e m 42 36 37 42
+end
+
+fn rc_build_hex43 t edit uint 514 inp edit uint 3 gr edit uint 1 to int
+  e = new uint 384 0
+  m = new uint 1 0
+  rc_hex43_a e m
+  rc_hex43_b e m
+  rc_hex43_c e m
+  put inp 0 0
+  put inp 1 27
+  put inp 2 41
+  put gr 0 20
+  g = new uint 1 20
+  tm = new uint 3 0
+  put tm 0 43
+  put tm 1 get m 0
+  put tm 2 1
+  ret res_topology_build view tm view e view g t
+end
+
+fn rc_c50_a e edit uint 384 m edit uint 1 to void
+  rc_add_edge e m 0 3
+  rc_add_edge e m 1 4
+  rc_add_edge e m 2 5
+  rc_add_edge e m 2 6
+  rc_add_edge e m 4 7
+  rc_add_edge e m 5 8
+  rc_add_edge e m 6 9
+  rc_add_edge e m 3 10
+  rc_add_edge e m 7 11
+  rc_add_edge e m 8 11
+  rc_add_edge e m 9 12
+  rc_add_edge e m 12 13
+  rc_add_edge e m 10 14
+  rc_add_edge e m 13 15
+  rc_add_edge e m 14 16
+  rc_add_edge e m 15 17
+  rc_add_edge e m 16 18
+  rc_add_edge e m 17 19
+  rc_add_edge e m 19 24
+  rc_add_edge e m 18 25
+  rc_add_edge e m 20 26
+  rc_add_edge e m 20 27
+  rc_add_edge e m 21 27
+  rc_add_edge e m 21 28
+  rc_add_edge e m 22 28
+end
+
+fn rc_c50_b e edit uint 384 m edit uint 1 to void
+  rc_add_edge e m 22 29
+  rc_add_edge e m 23 29
+  rc_add_edge e m 23 30
+  rc_add_edge e m 24 30
+  rc_add_edge e m 26 31
+  rc_add_edge e m 25 32
+  rc_add_edge e m 31 33
+  rc_add_edge e m 32 34
+  rc_add_edge e m 34 35
+  rc_add_edge e m 33 36
+  rc_add_edge e m 35 37
+  rc_add_edge e m 36 38
+  rc_add_edge e m 38 39
+  rc_add_edge e m 37 40
+  rc_add_edge e m 39 41
+  rc_add_edge e m 40 42
+  rc_add_edge e m 41 43
+  rc_add_edge e m 42 46
+  rc_add_edge e m 43 47
+  rc_add_edge e m 44 47
+  rc_add_edge e m 44 48
+  rc_add_edge e m 45 48
+  rc_add_edge e m 45 49
+  rc_add_edge e m 46 49
+end
+
+fn rc_build_chain50 t edit uint 514 gr edit uint 1 to int
+  e = new uint 384 0
+  m = new uint 1 0
+  rc_c50_a e m
+  rc_c50_b e m
+  put gr 0 49
+  g = new uint 1 49
+  tm = new uint 3 0
+  put tm 0 50
+  put tm 1 get m 0
+  put tm 2 1
+  ret res_topology_build view tm view e view g t
+end
+
+fn rc_net_topology net uint t edit uint 514 inp edit uint 3 gr edit uint 1 to int
+  if eq net RC_NET_HEX13
+    ret rc_build_hex13 t inp gr
+  end
+  if eq net RC_NET_HEX25
+    ret rc_build_hex25 t inp gr
+  end
+  if eq net RC_NET_HEX43
+    ret rc_build_hex43 t inp gr
+  end
+  if eq net RC_NET_CHAIN50
+    ret rc_build_chain50 t gr
+  end
+  ret RES_ERR_PARAM
+end
+
+global rc_disc_grounds uint 64
+global rc_disc_gconc f32 64
+global rc_disc_gdeg uint 64
+
+fn rc_disc_find_gr ng ulong c f32 to uint
+  found = uint 0xffffffff
+  for q ulong ng bound 64
+    if eq get rc_disc_gconc q c
+      if lt get rc_disc_gdeg q 6
+        found = uint q
+      end
+    end
+  end
+  ret found
+end
+
+fn rc_disc_build_edges conc view f32 64 nd uint e edit uint 384 info edit uint 2 to int
+  ng = ulong 0
+  node = nd
+  for k ulong ulong nd bound 64
+    fnd = rc_disc_find_gr ng get conc k
+    if eq fnd 0xffffffff
+      if ge node 64
+        ret RES_ERR_TOPOLOGY
+      end
+      fnd = uint ng
+      put rc_disc_grounds ng node
+      put rc_disc_gconc ng get conc k
+      put rc_disc_gdeg ng 0
+      node = add node 1
+      ng = add ng 1
+    end
+    put e mul k 2 uint k
+    fi = ulong fnd
+    put e add mul k 2 1 get rc_disc_grounds fi
+    put rc_disc_gdeg fi add get rc_disc_gdeg fi 1
+  end
+  put info 0 node
+  put info 1 uint ng
+  ret RES_OK
+end
+
+fn rc_disc_set_params which uint conc view f32 64 nd uint info view uint 2 p edit uint 265 to int
+  st = res_params_reference which get info 0 p
+  if ne st RES_OK
+    ret st
+  end
+  for k ulong ulong nd bound 64
+    put p add RES_PAR_CONC k bitcast uint get conc k
+  end
+  for q ulong ulong get info 1 bound 64
+    gq = ulong get rc_disc_grounds q
+    gc = bitcast uint get rc_disc_gconc q
+    put p add RES_PAR_CONC gq gc
+  end
+  ret RES_OK
+end
+
+fn rc_net_disconnected which uint conc view f32 64 nd uint t edit uint 514 p edit uint 265 to int
+  if or eq nd 0 ge nd 64
+    ret RES_ERR_PARAM
+  end
+  e = new uint 384 0
+  grounds = new uint 64 0
+  info = new uint 2 0
+  st = rc_disc_build_edges conc nd e info
+  if ne st RES_OK
+    ret st
+  end
+  for q ulong ulong get info 1 bound 64
+    put grounds q get rc_disc_grounds q
+  end
+  tm = new uint 3 0
+  put tm 0 get info 0
+  put tm 1 nd
+  put tm 2 get info 1
+  st = res_topology_build view tm view e view grounds t
+  if ne st RES_OK
+    ret st
+  end
+  ret rc_disc_set_params which conc nd view info p
+end
+
+note ================================================================
+note Global simulation driver (streaming 2-knot pair)
+note ================================================================
+
+fn rc_load_pair nc ulong k64 ulong pair edit f32 128 to void
+  b0 = mul k64 nc
+  b1 = add b0 nc
+  for i ulong nc bound 64
+    put pair i get rc_tab add b0 i
+    put pair add nc i get rc_tab add b1 i
+  end
+end
+
+fn rc_sim_step_one nc uint kn uint obs bool to int
+  cfg = new uint 5363 0
+  for i ulong 5363 bound 5363
+    put cfg i get rc_cfg i
+  end
+  s = new uint 932 0
+  for i ulong 932 bound 932
+    put s i get rc_s i
+  end
+  ws = new uint 3564 0
+  for i ulong 3564 bound 3564
+    put ws i get rc_ws i
+  end
+  k64 = div res_state_get_step view s ulong get cfg RES_CFG_K
+  if ge add k64 1 ulong kn
+    ret RES_ERR_INPUT
+  end
+  pair = new f32 128 0.0f32
+  rc_load_pair ulong nc k64 pair
+  st = res_step_pair view cfg view pair ws view s
+  if ne st RES_OK
+    ret st
+  end
+  res_copy_spare_to_state view ws s
+  if obs
+    res_ws_observe_state view cfg view s ws
+  end
+  for i ulong 932 bound 932
+    put rc_s i get s i
+  end
+  for i ulong 3564 bound 3564
+    put rc_ws i get ws i
+  end
+  ret RES_OK
+end
+
+fn rc_load_sim cfg edit uint 5363 s edit uint 932 ws edit uint 3564 to void
+  for i ulong 5363 bound 5363
+    put cfg i get rc_cfg i
+  end
+  for i ulong 932 bound 932
+    put s i get rc_s i
+  end
+  for i ulong 3564 bound 3564
+    put ws i get rc_ws i
+  end
+end
+
+fn rc_save_sim s view uint 932 ws view uint 3564 to void
+  for i ulong 932 bound 932
+    put rc_s i get s i
+  end
+  for i ulong 3564 bound 3564
+    put rc_ws i get ws i
+  end
+end
+
+fn rc_sim_advance_obs nc uint kn uint steps ulong to int
+  cfg = new uint 5363 0
+  s = new uint 932 0
+  ws = new uint 3564 0
+  rc_load_sim cfg s ws
+  pair = new f32 128 0.0f32
+  last_k = ulong 0xffffffffffffffff
+  for it ulong steps bound 50000000
+    k64 = div res_state_get_step view s ulong get cfg RES_CFG_K
+    if ge add k64 1 ulong kn
+      rc_save_sim view s view ws
+      ret RES_ERR_INPUT
+    end
+    if ne k64 last_k
+      rc_load_pair ulong nc k64 pair
+      last_k = k64
+    end
+    st = res_step_pair view cfg view pair ws view s
+    if ne st RES_OK
+      rc_save_sim view s view ws
+      ret st
+    end
+    res_copy_spare_to_state view ws s
+    res_ws_observe_state view cfg view s ws
+  end
+  rc_save_sim view s view ws
+  ret RES_OK
+end
+
+fn rc_sim_get_step to ulong
+  ret or shl ulong get rc_s RES_ST_STEP_HI 32 ulong get rc_s RES_ST_STEP_LO
+end
+
+fn rc_copy_v_to_vout base ulong nc ulong to void
+  for i ulong nc bound 64
+    v = f64 bitcast f32 get rc_s add RES_ST_V i
+    put rc_vout add base i v
+  end
+end
+
+fn rc_interp_v_to_vout base ulong nc ulong f f64 to void
+  omf = sub 1.0f64 f
+  for i ulong nc bound 64
+    v0 = f64 bitcast f32 get rc_s add RES_ST_V i
+    v1 = f64 bitcast f32 get rc_next add RES_ST_V i
+    put rc_vout add base i add mul omf v0 mul f v1
+  end
+end
+
+fn rc_sim_at_steps nc uint kn uint nsteps ulong to int
+  for k ulong nsteps bound 200000
+    tgt = get rc_steps k
+    cur = rc_sim_get_step
+    if lt tgt cur
+      ret RES_ERR_INPUT
+    end
+    if gt tgt cur
+      st = rc_sim_advance_obs nc kn sub tgt cur
+      if ne st RES_OK
+        ret st
+      end
+    end
+    rc_copy_v_to_vout mul k ulong nc ulong nc
+  end
+  ret RES_OK
+end
+
+fn rc_sim_step_next_only nc uint kn uint to int
+  cfg = new uint 5363 0
+  s = new uint 932 0
+  ws = new uint 3564 0
+  rc_load_sim cfg s ws
+  k64 = div res_state_get_step view s ulong get cfg RES_CFG_K
+  if ge add k64 1 ulong kn
+    ret RES_ERR_INPUT
+  end
+  pair = new f32 128 0.0f32
+  rc_load_pair ulong nc k64 pair
+  st = res_step_pair view cfg view pair ws view s
+  if ne st RES_OK
+    ret st
+  end
+  for i ulong 932 bound 932
+    put rc_next i get ws add RES_WS_SPARE i
+  end
+  ret RES_OK
+end
+
+fn rc_sim_at_positions nc uint kn uint npos ulong last_step ulong to int
+  cached = ulong 0xffffffffffffffff
+  for k ulong npos bound 200000
+    p = get rc_pos k
+    if or not ge p 0.0f64 gt p f64 last_step
+      ret RES_ERR_INPUT
+    end
+    n0 = ulong p
+    f = sub p f64 n0
+    cur = rc_sim_get_step
+    if lt n0 cur
+      ret RES_ERR_INPUT
+    end
+    if gt n0 cur
+      st = rc_sim_advance_obs nc kn sub n0 cur
+      if ne st RES_OK
+        ret st
+      end
+    end
+    if gt f 0.0f64
+      if ne cached n0
+        st = rc_sim_step_next_only nc kn
+        if ne st RES_OK
+          ret st
+        end
+        cached = n0
+      end
+      rc_interp_v_to_vout mul k ulong nc ulong nc f
+    else
+      rc_copy_v_to_vout mul k ulong nc ulong nc
+    end
+  end
+  ret RES_OK
+end
+
+fn rc_sim_receipt nc uint kn uint out_rc edit uint 130 to int
+  ctx = new uint 74 0
+  res_input_digest_begin ctx nc kn
+  row = new f32 64 0.0f32
+  for k ulong ulong kn bound 1000000
+    base = mul k ulong nc
+    for i ulong ulong nc bound 64
+      put row i get rc_tab add base i
+    end
+    res_input_digest_row ctx view row nc
+  end
+  idig = new uchar 32 0
+  res_sha_final ctx idig
+  cfg = new uint 5363 0
+  for i ulong 5363 bound 5363
+    put cfg i get rc_cfg i
+  end
+  s = new uint 932 0
+  for i ulong 932 bound 932
+    put s i get rc_s i
+  end
+  ret res_run_receipt_from_idig view cfg view idig view s out_rc
+end
+
+fn rc_sim_init_globals t view uint 514 p view uint 265 init uint initv f32 to int
+  cfg = new uint 5363 0
+  st = res_config_build t p 1.0e-5f32 10 cfg
+  if ne st RES_OK
+    ret st
+  end
+  s = new uint 932 0
+  st = res_state_init view cfg init initv s
+  for i ulong 5363 bound 5363
+    put rc_cfg i get cfg i
+  end
+  for i ulong 932 bound 932
+    put rc_s i get s i
+  end
+  for i ulong 3564 bound 3564
+    put rc_ws i 0
+  end
+  ret st
+end
+
+note Run full simulation: smeta=[init, bitcast uint initv, kn, nsteps]
+fn rc_simulate_run t view uint 514 p view uint 265 smeta view uint 4 out_rc edit uint 130 out_ms edit uint 200 to int
+  st = rc_sim_init_globals t p get smeta 0 bitcast f32 get smeta 1
+  if ne st RES_OK
+    for i ulong 200 bound 200
+      put out_ms i 0
+    end
+    ret st
+  end
+  nc = get t 0
+  kn = get smeta 2
+  last = mul sub ulong kn 1 10
+  st = rc_sim_at_steps nc kn ulong get smeta 3
+  if eq st RES_OK
+    cur = rc_sim_get_step
+    if lt cur last
+      st = rc_sim_advance_obs nc kn sub last cur
+    end
+  end
+  if eq st RES_OK
+    st = rc_sim_receipt nc kn out_rc
+  end
+  for i ulong 200 bound 200
+    put out_ms i get rc_ws add RES_WS_MSTATS i
+  end
+  ret st
+end
+
+note ================================================================
+note Statistics & NARMA generator
+note ================================================================
+
+fn rc_narma_sum yv view f64 2024 t ulong ord ulong to f64
+  s = 0.0f64
+  base = sub add t 1 ord
+  for j ulong ord bound 20
+    s = add s get yv add base j
+  end
+  ret s
+end
+
+fn rc_narma_step yv edit f64 2024 up view f64 2024 t ulong ord ulong to void
+  s = rc_narma_sum view yv t ord
+  yt = get yv t
+  a = add mul 0.3f64 yt mul mul 0.05f64 yt s
+  u0 = get up sub add t 1 ord
+  b = mul mul 1.5f64 u0 get up t
+  put yv add t 1 add add a b 0.1f64
+end
+
+fn rc_narma_g u view f64 * n uint order uint y edit f64 * to void
+  yv = new f64 2024 0.0f64
+  up = new f64 2024 0.0f64
+  for i ulong ulong n bound 2000
+    put up add 20 i get u i
+  end
+  for k ulong ulong n bound 2000
+    rc_narma_step yv view up add 19 k ulong order
+  end
+  for i ulong ulong n bound 2000
+    put y i get yv add 20 i
+  end
+end
+
+fn rc_nrmse_ytr_pv v0 ulong nv ulong no ulong c ulong to f64
+  m = 0.0f64
+  for i ulong nv bound 100000
+    m = add m get rc_ytr add mul add v0 i no c
+  end
+  m = div m f64 nv
+  num = 0.0f64
+  den = 0.0f64
+  for i ulong nv bound 100000
+    rv = get rc_ytr add mul add v0 i no c
+    pv = get rc_pv add mul i no c
+    e = sub rv pv
+    dc = sub rv m
+    num = add num mul e e
+    den = add den mul dc dc
+  end
+  ret fsqrt div num den
+end
+
+fn rc_nrmse_y_p which uint n ulong no ulong c ulong to f64
+  m = 0.0f64
+  for i ulong n bound 100000
+    rv = 0.0f64
+    if eq which 0
+      rv = get rc_ytr add mul i no c
+    else
+      rv = get rc_yte add mul i no c
+    end
+    m = add m rv
+  end
+  m = div m f64 n
+  num = 0.0f64
+  den = 0.0f64
+  for i ulong n bound 100000
+    rv = 0.0f64
+    pv = 0.0f64
+    if eq which 0
+      rv = get rc_ytr add mul i no c
+      pv = get rc_ptr add mul i no c
+    else
+      rv = get rc_yte add mul i no c
+      pv = get rc_pte add mul i no c
+    end
+    e = sub rv pv
+    dc = sub rv m
+    num = add num mul e e
+    den = add den mul dc dc
+  end
+  ret fsqrt div num den
+end
+
+note ================================================================
+note Ridge CV using streaming res_ro_ws_* on global rc_xtr/ytr/xte/yte
+note ================================================================
+
+fn rc_zscore_apply f ulong ntr ulong nte ulong nf ulong m f64 sd f64 to void
+  for i ulong ntr bound 100000
+    idx = add mul i nf f
+    v = div sub get rc_xtr idx m sd
+    put rc_ztr idx v
+  end
+  for i ulong nte bound 100000
+    idx = add mul i nf f
+    v = div sub get rc_xte idx m sd
+    put rc_zte idx v
+  end
+end
+
+fn rc_zscore_col f ulong ntr ulong nte ulong nf ulong to void
+  m = 0.0f64
+  for i ulong ntr bound 100000
+    m = add m get rc_xtr add mul i nf f
+  end
+  m = div m f64 ntr
+  s = 0.0f64
+  for i ulong ntr bound 100000
+    d = sub get rc_xtr add mul i nf f m
+    s = add s mul d d
+  end
+  sd = fsqrt div s f64 ntr
+  if not gt sd 0.0f64
+    sd = 1.0f64
+  end
+  rc_zscore_apply f ntr nte nf m sd
+end
+
+fn rc_load_ztr_row i ulong nf ulong no ulong xrow edit f64 256 yrow edit f64 4 to void
+  xb = mul i nf
+  for f ulong nf bound 256
+    put xrow f get rc_ztr add xb f
+  end
+  yb = mul i no
+  for o ulong no bound 4
+    put yrow o get rc_ytr add yb o
+  end
+end
+
+fn rc_ro_accum_ztr_skip ws edit ulong 67334 ntr ulong v0 ulong v1 ulong nf ulong no ulong to int
+  xrow = new f64 256 0.0f64
+  yrow = new f64 4 0.0f64
+  for i ulong ntr bound 100000
+    if or lt i v0 ge i v1
+      rc_load_ztr_row i nf no xrow yrow
+      st = res_ro_ws_accum_row ws view xrow view yrow nf no
+      if ne st RES_OK
+        ret st
+      end
+    end
+  end
+  ret RES_OK
+end
+
+fn rc_load_z_row which uint row_i ulong nf ulong xrow edit f64 256 to void
+  xb = mul row_i nf
+  if eq which 0
+    for f ulong nf bound 256
+      put xrow f get rc_ztr add xb f
+    end
+  else
+    for f ulong nf bound 256
+      put xrow f get rc_zte add xb f
+    end
+  end
+end
+
+fn rc_store_p_row which uint i ulong no ulong yrow view f64 4 to void
+  yb = mul i no
+  for o ulong no bound 4
+    if eq which 0
+      put rc_pv add yb o get yrow o
+    else
+      if eq which 1
+        put rc_ptr add yb o get yrow o
+      else
+        put rc_pte add yb o get yrow o
+      end
+    end
+  end
+end
+
+fn rc_ro_apply_global ro view ulong 1031 am view ulong 5 to int
+  xrow = new f64 256 0.0f64
+  yrow = new f64 4 0.0f64
+  wh = uint get am 0
+  for i ulong get am 2 bound 100000
+    rc_load_z_row wh add get am 1 i get am 3 xrow
+    st = res_readout_apply ro view xrow yrow
+    if ne st RES_OK
+      ret st
+    end
+    rc_store_p_row wh i get am 4 view yrow
+  end
+  ret RES_OK
+end
+
+fn rc_ro_apply_ztr_ptr ro view ulong 1031 ntr ulong nf ulong no ulong to int
+  xrow = new f64 256 0.0f64
+  yrow = new f64 4 0.0f64
+  for i ulong ntr bound 100000
+    rc_load_z_row 0 i nf xrow
+    st = res_readout_apply ro view xrow yrow
+    if ne st RES_OK
+      ret st
+    end
+    rc_store_p_row 1 i no view yrow
+  end
+  ret RES_OK
+end
+
+fn rc_cv_fold_eval ntr ulong v0 ulong v1 ulong nf ulong no ulong lam f64 to f64
+  ws = new ulong 67334 0
+  res_ro_ws_zero ws nf
+  st = rc_ro_accum_ztr_skip ws ntr v0 v1 nf no
+  if ne st RES_OK
+    ret -1.0f64
+  end
+  meta = new ulong 4 0
+  put meta 0 sub ntr sub v1 v0
+  put meta 1 nf
+  put meta 2 no
+  put meta 3 bitcast ulong lam
+  st = res_ro_ws_finish ws view meta
+  if ne st RES_OK
+    ret -1.0f64
+  end
+  ro = new ulong 1031 0
+  res_readout_extract view ws view meta ro
+  am = new ulong 5 0
+  put am 0 0
+  put am 1 v0
+  put am 2 sub v1 v0
+  put am 3 nf
+  put am 4 no
+  st = rc_ro_apply_global view ro view am
+  if ne st RES_OK
+    ret -1.0f64
+  end
+  s = 0.0f64
+  for o ulong no bound 4
+    s = add s rc_nrmse_ytr_pv v0 sub v1 v0 no o
+  end
+  ret div s f64 no
+end
+
+fn rc_cv_final_fit ntr ulong nte ulong nf ulong no ulong lam f64 to int
+  ws = new ulong 67334 0
+  res_ro_ws_zero ws nf
+  st = rc_ro_accum_ztr_skip ws ntr ntr ntr nf no
+  if ne st RES_OK
+    ret st
+  end
+  meta = new ulong 4 0
+  put meta 0 ntr
+  put meta 1 nf
+  put meta 2 no
+  put meta 3 bitcast ulong lam
+  st = res_ro_ws_finish ws view meta
+  if ne st RES_OK
+    ret st
+  end
+  ro = new ulong 1031 0
+  res_readout_extract view ws view meta ro
+  st = rc_ro_apply_ztr_ptr view ro ntr nf no
+  if ne st RES_OK
+    ret st
+  end
+  am = new ulong 5 0
+  if gt nte 0
+    put am 0 2
+    put am 1 0
+    put am 2 nte
+    put am 3 nf
+    put am 4 no
+    st = rc_ro_apply_global view ro view am
+    if ne st RES_OK
+      ret st
+    end
+  end
+  ret RES_OK
+end
+
+fn rc_fold_edge k ulong ntr ulong folds ulong to ulong
+  num = add mul mul 2 k ntr folds
+  ret div num mul 2 folds
+end
+
+fn rc_cv_eval_grid_one cv_meta view ulong 5 lam f64 to f64
+  ntr = get cv_meta 0
+  folds = get cv_meta 4
+  score = 0.0f64
+  for k ulong folds bound 16
+    v0 = rc_fold_edge k ntr folds
+    v1 = rc_fold_edge add k 1 ntr folds
+    fs = rc_cv_fold_eval ntr v0 v1 get cv_meta 2 get cv_meta 3 lam
+    if lt fs 0.0f64
+      ret -1.0f64
+    end
+    score = add score fs
+  end
+  ret div score f64 folds
+end
+
+note cv_meta: [0]=ntr [1]=nte [2]=nf [3]=no [4]=folds
+note cv_out: [0]=status(ulong) [1]=bitcast ulong lambda [2]=bitcast ulong cv_score
+fn rc_ridge_cv_valid cv_meta view ulong 5 ngrid ulong to bool
+  if lt get cv_meta 0 mul 2 get cv_meta 4
+    ret false
+  end
+  if or lt get cv_meta 2 1 lt get cv_meta 3 1
+    ret false
+  end
+  if or lt ngrid 1 lt get cv_meta 4 2
+    ret false
+  end
+  ret true
+end
+
+fn rc_ridge_cv cv_meta view ulong 5 grid view f64 * cv_out edit ulong 3 to void
+  put cv_out 0 ulong bitcast uint RES_ERR_PARAM
+  put cv_out 1 0
+  put cv_out 2 0
+  if not rc_ridge_cv_valid cv_meta len grid
+    ret
+  end
+  _e = enlarge rc_ztr mul get cv_meta 0 get cv_meta 2
+  _e = enlarge rc_zte mul add get cv_meta 1 1 get cv_meta 2
+  _e = enlarge rc_pv mul get cv_meta 0 get cv_meta 3
+  _e = enlarge rc_ptr mul get cv_meta 0 get cv_meta 3
+  _e = enlarge rc_pte mul add get cv_meta 1 1 get cv_meta 3
+  for f ulong get cv_meta 2 bound 256
+    rc_zscore_col f get cv_meta 0 get cv_meta 1 get cv_meta 2
+  end
+  best = bitcast f64 ulong 0x7ff0000000000000
+  best_g = long -1
+  for g ulong len grid bound 256
+    sc = rc_cv_eval_grid_one cv_meta get grid g
+    if ge sc 0.0f64
+      if lt sc best
+        best = sc
+        best_g = long g
+      end
+    end
+  end
+  if lt best_g 0
+    put cv_out 0 ulong bitcast uint RES_ERR_SINGULAR
+    ret
+  end
+  blam = get grid ulong best_g
+  put cv_out 1 bitcast ulong blam
+  put cv_out 2 bitcast ulong best
+  put cv_out 0 ulong bitcast uint rc_cv_final_fit get cv_meta 0 get cv_meta 1 get cv_meta 2 get cv_meta 3 blam
+end
+
+note ================================================================
+note Pinned Zenodo archive table (22 files) & SHA-256 verification
+note ================================================================
+
+text rc_p0_k "code.narma_connected"
+text rc_p0_p "src/Codes for Zenodo/NARMA Final Code/Connected Reservoir/HyperParameterTuningOptimized.m"
+text rc_p0_h "620640f002068048ab2c56f5090dc945e7b81595a9bc7f863331659a1850ceb5"
+
+text rc_p1_k "code.narma_parallel"
+text rc_p1_p "src/Codes for Zenodo/NARMA Final Code/Parallel Reservoir/ParallelReservoirNARMA.m"
+text rc_p1_h "f120f9150db590e3fcf767cbd1840e0924f513b45d44cf8439be2229be0fb507"
+
+text rc_p2_k "code.lorenz43"
+text rc_p2_p "src/Codes for Zenodo/Lorenz Final Code/Lorenz63SolverCustomRegression.m"
+text rc_p2_h "d291460fffe4efc1b2f013060c04e3a561dcd571de813a9c95277557daafdcac"
+
+text rc_p3_k "code.lorenz13"
+text rc_p3_p "src/Codes for Zenodo/Lorenz Final Code/Lorenz63SolverCustomRegression13Nodes.m"
+text rc_p3_h "c9e2ad2b64832c50c95f9d61e86161496aef40640cc547d1d5ae3a9323eedbf1"
+
+text rc_p4_k "code.lorenz25"
+text rc_p4_p "src/Codes for Zenodo/Lorenz Final Code/Lorenz63SolverCustomRegression25Nodes.m"
+text rc_p4_h "c1b31403cc9a2014c2f3b65056873306ed52174142259b5127b30c803927dece"
+
+text rc_p5_k "code.lorenz_gen"
+text rc_p5_p "src/Codes for Zenodo/Lorenz Final Code/LorenzDataGenerator.m"
+text rc_p5_h "7295d55fa3e1209b74b4804f9de18f4952950020f32d0f318695286c5ccdfa1d"
+
+text rc_p6_k "narma.length5"
+text rc_p6_p "data/raw/Codes for Zenodo/NARMA Final Code/Connected Reservoir/Length5.mat"
+text rc_p6_h "dc6e7914d216a21f664adcd4843e9f705616df47511879ba0bbeceb241b9b50a"
+
+text rc_p7_k "narma.length10"
+text rc_p7_p "data/raw/Codes for Zenodo/NARMA Final Code/Connected Reservoir/Length10.mat"
+text rc_p7_h "ceca1f6e94f3239b2df072403a488f8929fe00673b5028319cd2094d6eae708e"
+
+text rc_p8_k "narma.length20"
+text rc_p8_p "data/raw/Codes for Zenodo/NARMA Final Code/Connected Reservoir/Length20.mat"
+text rc_p8_h "aeb87fcec7655ce72386fdc28f2878b1f7b89097db523ab9fe5812fb6c4d1ee6"
+
+text rc_p9_k "narma.length50"
+text rc_p9_p "data/raw/Codes for Zenodo/NARMA Final Code/Connected Reservoir/Length50.mat"
+text rc_p9_h "ff4c9d14abb6f64b1ab9f301072dc67316b7fd59fe61d0b7632ee467a8c2aae3"
+
+text rc_p10_k "narma.train_signal"
+text rc_p10_p "data/raw/Codes for Zenodo/NARMA Final Code/Connected Reservoir/trainSignal.mat"
+text rc_p10_h "48e8e2c775fda4ca85dfc14a3c202319d9c75e2d7db0baf237744ce51a4b02c1"
+
+text rc_p11_k "narma.test_signal"
+text rc_p11_p "data/raw/Codes for Zenodo/NARMA Final Code/Connected Reservoir/testSignal.mat"
+text rc_p11_h "f0e34c5733e2cc20852caf4874b92bcb19fcb95bd4da4ce0eb7f4919cabee8c1"
+
+text rc_p12_k "narma.results"
+text rc_p12_p "data/raw/Codes for Zenodo/NARMA Final Code/Connected Reservoir/HyperParameterOptimizationVariablesToPlot.mat"
+text rc_p12_h "6311b719d47bfa92b76e1c71b3e9fe0e2e30d564d9ee7c7b2f231a03683e66fd"
+
+text rc_p13_k "narma.parallel_results"
+text rc_p13_p "data/raw/Codes for Zenodo/NARMA Final Code/Parallel Reservoir/ParallelReservoirDataToPlot.mat"
+text rc_p13_h "ccf13dd5045a50ce5e474915225f4961d6e56b949985ef701bffe3316822f1c6"
+
+text rc_p14_k "lorenz.data1"
+text rc_p14_p "data/raw/Codes for Zenodo/Lorenz Final Code/LorenzData1.mat"
+text rc_p14_h "6229d996681ef7e64336ef4f04e7bd82c0a8063e6e18e52667c699251091f6c4"
+
+text rc_p15_k "lorenz.data2"
+text rc_p15_p "data/raw/Codes for Zenodo/Lorenz Final Code/LorenzData2.mat"
+text rc_p15_h "d1c0dcccbee809e8880dd5b0e355dd456ab1605d0470dbfa99e1a54b2b51073a"
+
+text rc_p16_k "lorenz.fig43"
+text rc_p16_p "data/raw/Codes for Zenodo/Lorenz Final Code/Figure5_Data.mat"
+text rc_p16_h "f6055bc6b79cc686a5c7cca703fdf2e35de50e202e245bfe07f10f91ecad3500"
+
+text rc_p17_k "lorenz.fig25"
+text rc_p17_p "data/raw/Codes for Zenodo/Lorenz Final Code/Figure5_Data25Nodes.mat"
+text rc_p17_h "0d85b0eaef9c6bb4eed07a3fe8f395802afbde0c3a75403ba216b55220754205"
+
+text rc_p18_k "lorenz.fig13"
+text rc_p18_p "data/raw/Codes for Zenodo/Lorenz Final Code/Figure5_Data13Nodes.mat"
+text rc_p18_h "74988e19bd24540b0f623e20295a2813a0206917cdf6072d0dfaf69f8d091ed7"
+
+text rc_p19_k "lorenz.nrmse43"
+text rc_p19_p "data/raw/Codes for Zenodo/Lorenz Final Code/LorenzNormalizedNRMSEs.mat"
+text rc_p19_h "514ba3082a21eb541e0af8a9fbb80596742f9ddafee466391a00842a5d4e5616"
+
+text rc_p20_k "lorenz.nrmse25"
+text rc_p20_p "data/raw/Codes for Zenodo/Lorenz Final Code/LorenzNormalizedNRMSEs25Nodes.mat"
+text rc_p20_h "881e92a0a5cd6b46fb588b41593e83d66ec2af25d16fb7198444fc82c3aaf14d"
+
+text rc_p21_k "lorenz.nrmse13"
+text rc_p21_p "data/raw/Codes for Zenodo/Lorenz Final Code/LorenzNormalizedNRMSEs13Nodes.mat"
+text rc_p21_h "5f2d18b150d5baa9e792aa967d46a541a6031ff2805467ba30b72db745d55733"
+
+fn rc_copy_str dst edit uchar * s view uchar * to ulong
+  n = len s
+  for i ulong n bound 512
+    put dst i get s i
+  end
+  ret n
+end
+
+fn rc_pin_copy_k idx ulong dst edit uchar 64 to ulong
+  if eq idx 0
+    ret rc_copy_str dst rc_p0_k
+  end
+  if eq idx 1
+    ret rc_copy_str dst rc_p1_k
+  end
+  if eq idx 2
+    ret rc_copy_str dst rc_p2_k
+  end
+  if eq idx 3
+    ret rc_copy_str dst rc_p3_k
+  end
+  if eq idx 4
+    ret rc_copy_str dst rc_p4_k
+  end
+  if eq idx 5
+    ret rc_copy_str dst rc_p5_k
+  end
+  if eq idx 6
+    ret rc_copy_str dst rc_p6_k
+  end
+  if eq idx 7
+    ret rc_copy_str dst rc_p7_k
+  end
+  if eq idx 8
+    ret rc_copy_str dst rc_p8_k
+  end
+  if eq idx 9
+    ret rc_copy_str dst rc_p9_k
+  end
+  if eq idx 10
+    ret rc_copy_str dst rc_p10_k
+  end
+  if eq idx 11
+    ret rc_copy_str dst rc_p11_k
+  end
+  if eq idx 12
+    ret rc_copy_str dst rc_p12_k
+  end
+  if eq idx 13
+    ret rc_copy_str dst rc_p13_k
+  end
+  if eq idx 14
+    ret rc_copy_str dst rc_p14_k
+  end
+  if eq idx 15
+    ret rc_copy_str dst rc_p15_k
+  end
+  if eq idx 16
+    ret rc_copy_str dst rc_p16_k
+  end
+  if eq idx 17
+    ret rc_copy_str dst rc_p17_k
+  end
+  if eq idx 18
+    ret rc_copy_str dst rc_p18_k
+  end
+  if eq idx 19
+    ret rc_copy_str dst rc_p19_k
+  end
+  if eq idx 20
+    ret rc_copy_str dst rc_p20_k
+  end
+  ret rc_copy_str dst rc_p21_k
+end
+
+fn rc_pin_copy_p idx ulong dst edit uchar 256 to ulong
+  if eq idx 0
+    ret rc_copy_str dst rc_p0_p
+  end
+  if eq idx 1
+    ret rc_copy_str dst rc_p1_p
+  end
+  if eq idx 2
+    ret rc_copy_str dst rc_p2_p
+  end
+  if eq idx 3
+    ret rc_copy_str dst rc_p3_p
+  end
+  if eq idx 4
+    ret rc_copy_str dst rc_p4_p
+  end
+  if eq idx 5
+    ret rc_copy_str dst rc_p5_p
+  end
+  if eq idx 6
+    ret rc_copy_str dst rc_p6_p
+  end
+  if eq idx 7
+    ret rc_copy_str dst rc_p7_p
+  end
+  if eq idx 8
+    ret rc_copy_str dst rc_p8_p
+  end
+  if eq idx 9
+    ret rc_copy_str dst rc_p9_p
+  end
+  if eq idx 10
+    ret rc_copy_str dst rc_p10_p
+  end
+  if eq idx 11
+    ret rc_copy_str dst rc_p11_p
+  end
+  if eq idx 12
+    ret rc_copy_str dst rc_p12_p
+  end
+  if eq idx 13
+    ret rc_copy_str dst rc_p13_p
+  end
+  if eq idx 14
+    ret rc_copy_str dst rc_p14_p
+  end
+  if eq idx 15
+    ret rc_copy_str dst rc_p15_p
+  end
+  if eq idx 16
+    ret rc_copy_str dst rc_p16_p
+  end
+  if eq idx 17
+    ret rc_copy_str dst rc_p17_p
+  end
+  if eq idx 18
+    ret rc_copy_str dst rc_p18_p
+  end
+  if eq idx 19
+    ret rc_copy_str dst rc_p19_p
+  end
+  if eq idx 20
+    ret rc_copy_str dst rc_p20_p
+  end
+  ret rc_copy_str dst rc_p21_p
+end
+
+fn rc_pin_copy_h idx ulong dst edit uchar 64 to ulong
+  if eq idx 0
+    ret rc_copy_str dst rc_p0_h
+  end
+  if eq idx 1
+    ret rc_copy_str dst rc_p1_h
+  end
+  if eq idx 2
+    ret rc_copy_str dst rc_p2_h
+  end
+  if eq idx 3
+    ret rc_copy_str dst rc_p3_h
+  end
+  if eq idx 4
+    ret rc_copy_str dst rc_p4_h
+  end
+  if eq idx 5
+    ret rc_copy_str dst rc_p5_h
+  end
+  if eq idx 6
+    ret rc_copy_str dst rc_p6_h
+  end
+  if eq idx 7
+    ret rc_copy_str dst rc_p7_h
+  end
+  if eq idx 8
+    ret rc_copy_str dst rc_p8_h
+  end
+  if eq idx 9
+    ret rc_copy_str dst rc_p9_h
+  end
+  if eq idx 10
+    ret rc_copy_str dst rc_p10_h
+  end
+  if eq idx 11
+    ret rc_copy_str dst rc_p11_h
+  end
+  if eq idx 12
+    ret rc_copy_str dst rc_p12_h
+  end
+  if eq idx 13
+    ret rc_copy_str dst rc_p13_h
+  end
+  if eq idx 14
+    ret rc_copy_str dst rc_p14_h
+  end
+  if eq idx 15
+    ret rc_copy_str dst rc_p15_h
+  end
+  if eq idx 16
+    ret rc_copy_str dst rc_p16_h
+  end
+  if eq idx 17
+    ret rc_copy_str dst rc_p17_h
+  end
+  if eq idx 18
+    ret rc_copy_str dst rc_p18_h
+  end
+  if eq idx 19
+    ret rc_copy_str dst rc_p19_h
+  end
+  if eq idx 20
+    ret rc_copy_str dst rc_p20_h
+  end
+  ret rc_copy_str dst rc_p21_h
+end
+
+fn rc_hash_fd fd int got_hex edit uchar 64 to int
+  ctx = new uint 74 0
+  res_sha_init ctx
+  buf = new uchar 4096 0
+  done = false
+  while not done bound 100000
+    n = read fd buf 0 4096
+    if lt n 0
+      ret -1
+    end
+    if eq n 0
+      done = true
+    else
+      res_sha_update ctx part buf 0 ulong n
+    end
+  end
+  dig = new uchar 32 0
+  res_sha_final ctx dig
+  for i ulong 32 bound 32
+    b = ulong get dig i
+    put got_hex mul i 2 get rc_hex_ch shr b 4
+    put got_hex add mul i 2 1 get rc_hex_ch and b 15
+  end
+  ret 0
+end
+
+fn rc_pin_match idx ulong got_hex view uchar 64 to int
+  want = new uchar 64 0
+  _wl = rc_pin_copy_h idx want
+  for i ulong 64 bound 64
+    if ne get got_hex i get want i
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn rc_check_pinned root view uchar * idx ulong got_hex edit uchar 64 to int
+  rel = new uchar 256 0
+  rlen = rc_pin_copy_p idx rel
+  path = new uchar 1024 0
+  rn = len root
+  if gt add add rn 1 rlen 1020
+    ret -1
+  end
+  for i ulong rn bound 768
+    put path i get root i
+  end
+  put path rn uchar 47
+  for i ulong rlen bound 256
+    put path add add rn 1 i get rel i
+  end
+  fd = fopen path 0 add add rn 1 rlen 0 0
+  if lt fd 0
+    ret -1
+  end
+  hr = rc_hash_fd int fd got_hex
+  _fc = fclose int fd
+  if ne hr 0
+    ret -1
+  end
+  ret rc_pin_match idx view got_hex
+end

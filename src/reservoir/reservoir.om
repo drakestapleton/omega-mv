@@ -1,0 +1,2249 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note Pure seeded OM-2 ionic-droplet reservoir CPU reference and binary64 ridge
+note readout (omega#440, Gate 1). Replaces src/reservoir/omega_reservoir.{c,h}
+note and src/reservoir/omega_reservoir_readout.{c,h}.
+note Zero host I/O, zero allocation, zero libm, zero device operations.
+om2
+
+note ---- status codes (OmegaResStatus) ----
+const RES_OK int 0
+const RES_ERR_NULL int -1
+const RES_ERR_TOPOLOGY int -2
+const RES_ERR_PARAM int -3
+const RES_ERR_NONFINITE int -4
+const RES_ERR_RANGE int -5
+const RES_ERR_STIFF int -6
+const RES_ERR_INPUT int -7
+const RES_ERR_MISMATCH int -8
+const RES_ERR_FPENV int -9
+const RES_ERR_SINGULAR int -10
+const RES_ERR_ALIAS int -11
+
+note ---- model bounds and enum tags ----
+const RES_MAX_NODES ulong 64
+const RES_MAX_DEGREE ulong 6
+const RES_MAX_EDGES ulong 192
+const RES_MAX_SIDES ulong 384
+const RES_DIGEST_SIZE ulong 32
+
+const RES_REF_NARMA uint 1
+const RES_REF_LORENZ uint 2
+const RES_INIT_N0 uint 1
+const RES_INIT_CONST uint 2
+
+note ---- flat array layout sizes ----
+note ResTopology: [0]=node_count [1]=edge_count [2..385]=edges(a,b) [386..449]=degree [450..513]=is_ground
+const RES_TOPO_WORDS ulong 514
+const RES_TOPO_EDGES ulong 2
+const RES_TOPO_DEG ulong 386
+const RES_TOPO_GND ulong 450
+
+note ResParams: [0]=node_count [1..8]=globals [9..72]=conc [73..136]=tau0 [137..200]=v_tau [201..264]=v_e
+const RES_PAR_WORDS ulong 265
+const RES_PAR_CONC ulong 9
+const RES_PAR_TAU0 ulong 73
+const RES_PAR_VTAU ulong 137
+const RES_PAR_VE ulong 201
+
+note ResConfig: [0..513]=topo [514..778]=par [779]=step_s [780]=steps_per_knot [781]=reduced_count
+note [782..845]=reduced_index [846..909]=reduced_node [910..5005]=chol [5006..5069]=chol_inv_diag
+note [5070..5133]=ln_n0 [5134..5197]=ln_alpha0 [5198..5261]=inv_v_tau [5262..5325]=inv_v_e
+note [5326]=inv_cap [5327]=g_unit [5328]=lambda_unit [5329]=half_step [5330]=sixth_step [5331..5362]=id(32)
+const RES_CFG_WORDS ulong 5363
+const RES_CFG_PAR ulong 514
+const RES_CFG_STEP_S ulong 779
+const RES_CFG_K ulong 780
+const RES_CFG_RED_CNT ulong 781
+const RES_CFG_RED_IDX ulong 782
+const RES_CFG_RED_NODE ulong 846
+const RES_CFG_CHOL ulong 910
+const RES_CFG_CHOL_INV ulong 5006
+const RES_CFG_LN_N0 ulong 5070
+const RES_CFG_LN_A0 ulong 5134
+const RES_CFG_INV_VTAU ulong 5198
+const RES_CFG_INV_VE ulong 5262
+const RES_CFG_INV_CAP ulong 5326
+const RES_CFG_G_UNIT ulong 5327
+const RES_CFG_LAM_UNIT ulong 5328
+const RES_CFG_HALF_H ulong 5329
+const RES_CFG_SIXTH_H ulong 5330
+const RES_CFG_ID ulong 5331
+
+note ResState: [0..31]=config_id [32]=step_lo [33]=step_hi [34]=node_count [35]=side_count
+note [36..99]=v [100..483]=y [484..547]=vc [548..931]=yc
+const RES_STATE_WORDS ulong 932
+const RES_ST_STEP_LO ulong 32
+const RES_ST_STEP_HI ulong 33
+const RES_ST_NODES ulong 34
+const RES_ST_SIDES ulong 35
+const RES_ST_V ulong 36
+const RES_ST_Y ulong 100
+const RES_ST_VC ulong 484
+const RES_ST_YC ulong 548
+
+note ResMembraneStats: [0..1]=obs [2..3]=imp [4]=mem_imp [5]=max_mv [6]=max_nv [7..198]=edge_flag
+const RES_MSTATS_WORDS ulong 200
+const RES_MS_OBS_LO ulong 0
+const RES_MS_OBS_HI ulong 1
+const RES_MS_IMP_LO ulong 2
+const RES_MS_IMP_HI ulong 3
+const RES_MS_MEM_IMP ulong 4
+const RES_MS_MAX_MV ulong 5
+const RES_MS_MAX_NV ulong 6
+const RES_MS_EFLAG ulong 7
+
+note ResWorkspace: [0..63]=b [64..127]=r [128..383]=kv(4*64) [384..1919]=ky(4*384)
+note [1920..1983]=sv [1984..2367]=sy [2368..2431]=cur [2432..3363]=spare(932) [3364..3563]=mstats(200)
+const RES_WS_WORDS ulong 3564
+const RES_WS_B ulong 0
+const RES_WS_R ulong 64
+const RES_WS_KV ulong 128
+const RES_WS_KY ulong 384
+const RES_WS_SV ulong 1920
+const RES_WS_SY ulong 1984
+const RES_WS_CUR ulong 2368
+const RES_WS_SPARE ulong 2432
+const RES_WS_MSTATS ulong 3364
+
+note ResRunReceipt: [0..31]=config_id [32..63]=input_digest [64..95]=final_state_digest
+note [96..97]=steps [98..129]=run_id
+const RES_RECEIPT_WORDS ulong 130
+
+note Readout constants
+const RES_RO_MAX_FEAT ulong 256
+const RES_RO_MAX_OUT ulong 4
+const RES_RO_DIM ulong 257
+const RES_RO_WORDS ulong 1031
+const RES_RWS_WORDS ulong 67334
+const RES_RWS_D_OFF ulong 66049
+const RES_RWS_R_OFF ulong 66306
+
+note Domain strings and numeric policy
+text res_dom_config "omega.reservoir.config.v1"
+text res_dom_input "omega.reservoir.input.v1"
+text res_dom_state "omega.reservoir.state.v1"
+text res_dom_run "omega.reservoir.run.v1"
+text res_num_policy "omega.reservoir.numeric.v2: binary32 RNE no-FTZ; ffp-contract=off; omega_math_exp/log/div/sqrt; state y=lnN; rk4 fixed step, TwoSum-compensated update; 1-e^w Taylor9 |w|<=0.5; dense Cholesky of reduced Laplacian; refuse |Va-Vb|>1 V per membrane, node V finite only"
+
+note ================================================================
+note SHA-256 (FIPS 180-4, adapted from om/sha256/sha256-om2.om)
+note ================================================================
+
+fn res_sha_kinit k edit uint 64 to void
+  put k 0 0x428a2f98
+  put k 1 0x71374491
+  put k 2 0xb5c0fbcf
+  put k 3 0xe9b5dba5
+  put k 4 0x3956c25b
+  put k 5 0x59f111f1
+  put k 6 0x923f82a4
+  put k 7 0xab1c5ed5
+  put k 8 0xd807aa98
+  put k 9 0x12835b01
+  put k 10 0x243185be
+  put k 11 0x550c7dc3
+  put k 12 0x72be5d74
+  put k 13 0x80deb1fe
+  put k 14 0x9bdc06a7
+  put k 15 0xc19bf174
+  put k 16 0xe49b69c1
+  put k 17 0xefbe4786
+  put k 18 0x0fc19dc6
+  put k 19 0x240ca1cc
+  put k 20 0x2de92c6f
+  put k 21 0x4a7484aa
+  put k 22 0x5cb0a9dc
+  put k 23 0x76f988da
+  put k 24 0x983e5152
+  put k 25 0xa831c66d
+  put k 26 0xb00327c8
+  put k 27 0xbf597fc7
+  put k 28 0xc6e00bf3
+  put k 29 0xd5a79147
+  put k 30 0x06ca6351
+  put k 31 0x14292967
+  put k 32 0x27b70a85
+  put k 33 0x2e1b2138
+  put k 34 0x4d2c6dfc
+  put k 35 0x53380d13
+  put k 36 0x650a7354
+  put k 37 0x766a0abb
+  put k 38 0x81c2c92e
+  put k 39 0x92722c85
+  put k 40 0xa2bfe8a1
+  put k 41 0xa81a664b
+  put k 42 0xc24b8b70
+  put k 43 0xc76c51a3
+  put k 44 0xd192e819
+  put k 45 0xd6990624
+  put k 46 0xf40e3585
+  put k 47 0x106aa070
+  put k 48 0x19a4c116
+  put k 49 0x1e376c08
+  put k 50 0x2748774c
+  put k 51 0x34b0bcb5
+  put k 52 0x391c0cb3
+  put k 53 0x4ed8aa4a
+  put k 54 0x5b9cca4f
+  put k 55 0x682e6ff3
+  put k 56 0x748f82ee
+  put k 57 0x78a5636f
+  put k 58 0x84c87814
+  put k 59 0x8cc70208
+  put k 60 0x90befffa
+  put k 61 0xa4506ceb
+  put k 62 0xbef9a3f7
+  put k 63 0xc67178f2
+end
+
+fn res_sha_iv s edit uint 8 to void
+  put s 0 0x6a09e667
+  put s 1 0xbb67ae85
+  put s 2 0x3c6ef372
+  put s 3 0xa54ff53a
+  put s 4 0x510e527f
+  put s 5 0x9b05688c
+  put s 6 0x1f83d9ab
+  put s 7 0x5be0cd19
+end
+
+fn res_sha_sched w edit uint 64 fresh m view uchar * o ulong to void
+  q = ulong 0
+  x = uint 0
+  y = uint 0
+  for i ulong 16 unroll
+    q = add o mul i 4
+    x = uint get m q
+    x = or shl x 8 uint get m add q 1
+    x = or shl x 8 uint get m add q 2
+    put w i or shl x 8 uint get m add q 3
+  end
+  for i ulong 48 unroll
+    x = get w add i 1
+    y = get w add i 14
+    x = add add get w i get w add i 9 xor xor rotr x 7 rotr x 18 shr x 3
+    put w add i 16 add x xor xor rotr y 17 rotr y 19 shr y 10
+  end
+end
+
+fn res_sha_rounds s edit uint 8 w view uint 64 kt view uint 64 to void
+  a = get s 0
+  b = get s 1
+  c = get s 2
+  d = get s 3
+  e = get s 4
+  f = get s 5
+  g = get s 6
+  h = get s 7
+  t = uint 0
+  for i ulong 64 unroll
+    h = add h get kt i
+    h = add h get w i
+    t = xor rotr e 6 rotr e 11
+    t = xor t rotr e 25
+    h = add h t
+    h = add h xor g and e xor f g
+    d = add d h
+    t = xor rotr a 2 rotr a 13
+    t = xor t rotr a 22
+    h = add h t
+    t = and c or a b
+    h = add h or and a b t
+    t = h
+    h = g
+    g = f
+    f = e
+    e = d
+    d = c
+    c = b
+    b = a
+    a = t
+  end
+  put s 0 add get s 0 a
+  put s 1 add get s 1 b
+  put s 2 add get s 2 c
+  put s 3 add get s 3 d
+  put s 4 add get s 4 e
+  put s 5 add get s 5 f
+  put s 6 add get s 6 g
+  put s 7 add get s 7 h
+end
+
+fn res_sha_comp s edit uint 8 w edit uint 64 kt view uint 64 m view uchar * o ulong to void
+  res_sha_sched w m o
+  res_sha_rounds s w kt
+end
+
+fn res_sha_run s edit uint 8 w edit uint 64 kt view uint 64 m view uchar * to void
+  for j ulong shr len m 6 bound 600000
+    res_sha_comp s w kt m shl j 6
+  end
+end
+
+fn res_sha_blocks s edit uint 8 w edit uint 64 kt view uint 64 m view uchar * to void
+  q = ulong 0
+  for b ulong shr len m 25 bound 100000
+    res_sha_run s w kt part m q 0x2000000
+    q = add q 0x2000000
+  end
+  res_sha_run s w kt part m q sub len m q
+end
+
+fn res_sha_finish s edit uint 8 w edit uint 64 kt view uint 64 p edit uchar 128 k ulong n ulong to void
+  put p k 0x80
+  e = ulong 64
+  if ge k 56
+    e = 128
+  end
+  bits = shl n 3
+  for i ulong 8 unroll
+    put p sub e add i 1 uchar and shr bits mul i 8 0xff
+  end
+  res_sha_comp s w kt view p 0
+  if eq e 128
+    res_sha_comp s w kt view p 64
+  end
+end
+
+note shactx as flat uint[74]: [0..7]=state [8]=count_lo [9]=count_hi [10..73]=buf[0..63]
+fn res_sha_init c edit uint 74 to void
+  s = new uint 8 0
+  res_sha_iv s
+  for i ulong 8 unroll
+    put c i get s i
+  end
+  put c 8 0
+  put c 9 0
+end
+
+fn res_sha_tobuf c edit uint 74 bi ulong d view uchar * o ulong k ulong to void
+  for i ulong k bound 64
+    put c add 10 add bi i uint get d add o i
+  end
+end
+
+fn res_sha_fill_blk c view uint 74 d view uchar * blk edit uchar 64 bi ulong to void
+  for i ulong bi bound 64
+    put blk i uchar and get c add 10 i 0xff
+  end
+  remb = sub 64 bi
+  for i ulong remb bound 64
+    put blk add bi i get d i
+  end
+end
+
+fn res_sha_absorb c edit uint 74 d view uchar * bi ulong to void
+  n = len d
+  s = new uint 8 0
+  w = new uint 64 0
+  kt = new uint 64 0
+  blk = new uchar 64 0
+  res_sha_kinit kt
+  for i ulong 8 unroll
+    put s i get c i
+  end
+  off = ulong 0
+  if gt bi 0
+    off = sub 64 bi
+    res_sha_fill_blk view c d blk bi
+    res_sha_comp s w kt view blk 0
+  end
+  nb = shr sub n off 6
+  res_sha_blocks s w kt part d off shl nb 6
+  off = add off shl nb 6
+  res_sha_tobuf c 0 d off sub n off
+  for i ulong 8 unroll
+    put c i get s i
+  end
+end
+
+fn res_sha_update c edit uint 74 d view uchar * to void
+  n = len d
+  cnt = or shl ulong get c 9 32 ulong get c 8
+  bi = and cnt 63
+  ncnt = add cnt n
+  put c 8 uint and ncnt 0xffffffff
+  put c 9 uint shr ncnt 32
+  if lt n sub 64 bi
+    res_sha_tobuf c bi d 0 n
+    ret
+  end
+  res_sha_absorb c d bi
+end
+
+fn res_sha_copy_pending c view uint 74 p edit uchar 128 k ulong to void
+  for i ulong k bound 64
+    put p i uchar and get c add 10 i 0xff
+  end
+end
+
+fn res_sha_final c edit uint 74 o edit uchar 32 to void
+  s = new uint 8 0
+  w = new uint 64 0
+  kt = new uint 64 0
+  p = new uchar 128 0
+  v = ulong 0
+  res_sha_kinit kt
+  for i ulong 8 unroll
+    put s i get c i
+  end
+  cnt = or shl ulong get c 9 32 ulong get c 8
+  k = and cnt 63
+  res_sha_copy_pending view c p k
+  res_sha_finish s w kt p k cnt
+  for i ulong 8 unroll
+    v = ulong get s i
+    for j ulong 4 unroll
+      put o add mul i 4 j uchar and shr v sub 24 mul j 8 0xff
+    end
+  end
+end
+
+fn res_sha_hash d view uchar * o edit uchar 32 to void
+  s = new uint 8 0
+  w = new uint 64 0
+  kt = new uint 64 0
+  p = new uchar 128 0
+  v = ulong 0
+  res_sha_kinit kt
+  res_sha_iv s
+  n = len d
+  nb = shr n 6
+  res_sha_blocks s w kt part d 0 shl nb 6
+  off = shl nb 6
+  k = sub n off
+  for i ulong k bound 64
+    put p i get d add off i
+  end
+  res_sha_finish s w kt p k n
+  for i ulong 8 unroll
+    v = ulong get s i
+    for j ulong 4 unroll
+      put o add mul i 4 j uchar and shr v sub 24 mul j 8 0xff
+    end
+  end
+end
+
+note ================================================================
+note Deterministic binary32 math (exact match to omega_math_exp / log)
+note ================================================================
+
+fn res_f32_fin x f32 to bool
+  u = bitcast uint x
+  ret lt and u 0x7f800000 0x7f800000
+end
+
+fn res_f32_isnan x f32 to bool
+  u = bitcast uint x
+  ret gt and u 0x7fffffff 0x7f800000
+end
+
+fn res_f32_iszero x f32 to bool
+  u = bitcast uint x
+  ret eq and u 0x7fffffff 0
+end
+
+fn res_f32_isinf x f32 to bool
+  u = bitcast uint x
+  ret eq and u 0x7fffffff 0x7f800000
+end
+
+fn res_f32_pos x f32 to bool
+  if not res_f32_fin x
+    ret false
+  end
+  ret gt x 0.0f32
+end
+
+fn res_f32_abs x f32 to f32
+  if lt x 0.0f32
+    ret neg x
+  end
+  ret x
+end
+
+fn res_f32_bits_canon x f32 to uint
+  u = bitcast uint x
+  if eq u 0x80000000
+    ret uint 0
+  end
+  ret u
+end
+
+fn res_math_exp x f32 to f32
+  if res_f32_isnan x
+    ret bitcast f32 uint 0x7fc00000
+  end
+  if lt x -104.0f32
+    ret 0.0f32
+  end
+  if gt x bitcast f32 uint 0x42b17218
+    ret bitcast f32 uint 0x7f800000
+  end
+  prod = mul x bitcast f32 uint 0x3fb8aa3b
+  k = int 0
+  if ge prod 0.0f32
+    k = int add prod 0.5f32
+  else
+    k = int sub prod 0.5f32
+  end
+  fk = f32 k
+  r = sub sub x mul fk bitcast f32 uint 0x3f317200 mul fk bitcast f32 uint 0x35bfbe8e
+  p = mul r add bitcast f32 uint 0x3d2aaaab mul r bitcast f32 uint 0x3c088889
+  p = mul r add bitcast f32 uint 0x3e2aaaab p
+  p = mul r add 0.5f32 p
+  poly = add 1.0f32 mul r add 1.0f32 p
+  if gt k 127
+    s1 = bitcast f32 shl uint 254 23
+    s2 = bitcast f32 shl uint k 23
+    ret mul mul poly s1 s2
+  end
+  if lt k -126
+    s1 = bitcast f32 shl uint add k 227 23
+    s2 = bitcast f32 shl uint 27 23
+    ret mul mul poly s1 s2
+  end
+  ret mul poly bitcast f32 shl uint add k 127 23
+end
+
+fn res_math_log x f32 to f32
+  if res_f32_isnan x
+    ret bitcast f32 uint 0x7fc00000
+  end
+  if lt x 0.0f32
+    ret bitcast f32 uint 0x7fc00000
+  end
+  if res_f32_iszero x
+    ret bitcast f32 uint 0xff800000
+  end
+  if res_f32_isinf x
+    ret bitcast f32 uint 0x7f800000
+  end
+  eadj = int 0
+  xv = x
+  ux = bitcast uint xv
+  if eq and ux 0x7f800000 0
+    xv = mul xv 8388608.0f32
+    eadj = -23
+  end
+  u = bitcast uint xv
+  e = add sub int and shr u 23 0xff 127 eadj
+  m = bitcast f32 or and u 0x007fffff 0x3f800000
+  if gt m bitcast f32 uint 0x3fb504f3
+    m = mul m 0.5f32
+    e = add e 1
+  end
+  z = div sub m 1.0f32 add m 1.0f32
+  z2 = mul z z
+  poly = add bitcast f32 uint 0x3e4ccccd mul z2 bitcast f32 uint 0x3e124925
+  poly = add bitcast f32 uint 0x3eaaaaab mul z2 poly
+  poly = add 1.0f32 mul z2 poly
+  lnm = mul mul 2.0f32 z poly
+  ret add mul f32 e bitcast f32 uint 0x3f317218 lnm
+end
+
+fn res_one_minus_exp w f32 to f32
+  if le res_f32_abs w 0.5f32
+    p = 1.0f32
+    p = add 1.0f32 mul mul w div 1.0f32 10.0f32 p
+    p = add 1.0f32 mul mul w div 1.0f32 9.0f32 p
+    p = add 1.0f32 mul mul w div 1.0f32 8.0f32 p
+    p = add 1.0f32 mul mul w div 1.0f32 7.0f32 p
+    p = add 1.0f32 mul mul w div 1.0f32 6.0f32 p
+    p = add 1.0f32 mul mul w div 1.0f32 5.0f32 p
+    p = add 1.0f32 mul mul w div 1.0f32 4.0f32 p
+    p = add 1.0f32 mul mul w div 1.0f32 3.0f32 p
+    p = add 1.0f32 mul mul w 0.5f32 p
+    ret neg mul w p
+  end
+  ret sub 1.0f32 res_math_exp w
+end
+
+fn res_carry_ok val f32 carry f32 to bool
+  ret le res_f32_abs carry mul res_f32_abs val bitcast f32 uint 0x33800000
+end
+
+note ================================================================
+note SHA-256 encoding helpers
+note ================================================================
+
+fn res_h_u16 c edit uint 74 v uint to void
+  b = new uchar 2 0
+  put b 0 uchar and v 0xff
+  put b 1 uchar and shr v 8 0xff
+  res_sha_update c view b
+end
+
+fn res_h_u32 c edit uint 74 v uint to void
+  b = new uchar 4 0
+  put b 0 uchar and v 0xff
+  put b 1 uchar and shr v 8 0xff
+  put b 2 uchar and shr v 16 0xff
+  put b 3 uchar and shr v 24 0xff
+  res_sha_update c view b
+end
+
+fn res_h_u64 c edit uint 74 v ulong to void
+  res_h_u32 c uint and v 0xffffffff
+  res_h_u32 c uint shr v 32
+end
+
+fn res_h_f32 c edit uint 74 v f32 to void
+  res_h_u32 c res_f32_bits_canon v
+end
+
+fn res_h_domain c edit uint 74 dom view uchar * to void
+  z = new uchar 1 0
+  res_sha_init c
+  res_sha_update c dom
+  res_sha_update c view z
+end
+
+note ================================================================
+note Topology
+note ================================================================
+
+fn res_edge_less a1 uint b1 uint a2 uint b2 uint to bool
+  if lt a1 a2
+    ret true
+  end
+  if eq a1 a2
+    ret lt b1 b2
+  end
+  ret false
+end
+
+fn res_topo_insert_edge t edit uint 514 e ulong lo uint hi uint to void
+  i = e
+  while gt i 0 bound 192
+    prev_off = add RES_TOPO_EDGES mul sub i 1 2
+    pa = get t prev_off
+    pb = get t add prev_off 1
+    if res_edge_less lo hi pa pb
+      cur_off = add RES_TOPO_EDGES mul i 2
+      put t cur_off pa
+      put t add cur_off 1 pb
+      i = sub i 1
+    else
+      break
+    end
+  end
+  dst_off = add RES_TOPO_EDGES mul i 2
+  put t dst_off lo
+  put t add dst_off 1 hi
+end
+
+fn res_topo_sort_edges t edit uint 514 edges view uint * nc uint ec uint to int
+  for e ulong ulong ec bound 192
+    a = get edges mul e 2
+    b = get edges add mul e 2 1
+    if or ge a nc or ge b nc eq a b
+      ret RES_ERR_TOPOLOGY
+    end
+    lo = a
+    hi = b
+    if gt a b
+      lo = b
+      hi = a
+    end
+    res_topo_insert_edge t e lo hi
+  end
+  ret RES_OK
+end
+
+fn res_topo_relax_pass t view uint 514 comp edit uint 64 ec ulong to bool
+  changed = false
+  for e ulong ec bound 192
+    off = add RES_TOPO_EDGES mul e 2
+    ea = ulong get t off
+    eb = ulong get t add off 1
+    ca = get comp ea
+    cb = get comp eb
+    if lt ca cb
+      put comp eb ca
+      changed = true
+    else
+      if lt cb ca
+        put comp ea cb
+        changed = true
+      end
+    end
+  end
+  ret changed
+end
+
+fn res_topo_comp_grounded t view uint 514 comp view uint 64 nc ulong ci uint to bool
+  for j ulong nc bound 64
+    if eq get comp j ci
+      if ne get t add RES_TOPO_GND j 0
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn res_topo_check_conn t view uint 514 nc ulong ec ulong to int
+  comp = new uint 64 0
+  for i ulong nc bound 64
+    put comp i uint i
+  end
+  for pass ulong nc bound 64
+    if not res_topo_relax_pass t comp ec
+      break
+    end
+  end
+  for i ulong nc bound 64
+    if not res_topo_comp_grounded t view comp nc get comp i
+      ret RES_ERR_TOPOLOGY
+    end
+  end
+  ret RES_OK
+end
+
+fn res_topo_check_edges t edit uint 514 nc ulong ec ulong to int
+  for e ulong ec bound 192
+    off = add RES_TOPO_EDGES mul e 2
+    ea = get t off
+    eb = get t add off 1
+    if gt e 0
+      poff = sub off 2
+      if and eq ea get t poff eq eb get t add poff 1
+        ret RES_ERR_TOPOLOGY
+      end
+    end
+    da = add get t add RES_TOPO_DEG ulong ea 1
+    if gt da 6
+      ret RES_ERR_TOPOLOGY
+    end
+    put t add RES_TOPO_DEG ulong ea da
+    db = add get t add RES_TOPO_DEG ulong eb 1
+    if gt db 6
+      ret RES_ERR_TOPOLOGY
+    end
+    put t add RES_TOPO_DEG ulong eb db
+  end
+  for i ulong nc bound 64
+    if eq get t add RES_TOPO_DEG i 0
+      ret RES_ERR_TOPOLOGY
+    end
+  end
+  ret RES_OK
+end
+
+fn res_topo_set_grounds t edit uint 514 grounds view uint * nc uint gc uint to int
+  for g ulong ulong gc bound 64
+    gn = get grounds g
+    if ge gn nc
+      ret RES_ERR_TOPOLOGY
+    end
+    if ne get t add RES_TOPO_GND ulong gn 0
+      ret RES_ERR_TOPOLOGY
+    end
+    put t add RES_TOPO_GND ulong gn 1
+  end
+  ret RES_OK
+end
+
+fn res_topology_build meta view uint 3 edges view uint * grounds view uint * out_t edit uint 514 to int
+  nc = get meta 0
+  ec = get meta 1
+  gc = get meta 2
+  if or lt nc 2 gt nc 64
+    ret RES_ERR_TOPOLOGY
+  end
+  if or lt ec 1 gt ec 192
+    ret RES_ERR_TOPOLOGY
+  end
+  if or lt gc 1 ge gc nc
+    ret RES_ERR_TOPOLOGY
+  end
+  if or lt len edges mul ulong ec 2 lt len grounds ulong gc
+    ret RES_ERR_TOPOLOGY
+  end
+  t = new uint 514 0
+  put t 0 nc
+  put t 1 ec
+  rc = res_topo_sort_edges t edges nc ec
+  if ne rc RES_OK
+    ret rc
+  end
+  rc = res_topo_check_edges t ulong nc ulong ec
+  if ne rc RES_OK
+    ret rc
+  end
+  rc = res_topo_set_grounds t grounds nc gc
+  if ne rc RES_OK
+    ret rc
+  end
+  rc = res_topo_check_conn view t ulong nc ulong ec
+  if ne rc RES_OK
+    ret rc
+  end
+  for i ulong RES_TOPO_WORDS bound 514
+    put out_t i get t i
+  end
+  ret RES_OK
+end
+
+fn res_topology_chain nc uint ground uint out_t edit uint 514 to int
+  if or lt nc 2 gt nc 64
+    ret RES_ERR_TOPOLOGY
+  end
+  edges = new uint 128 0
+  garr = new uint 1 0
+  put garr 0 ground
+  ec = sub nc 1
+  for i ulong ulong ec bound 64
+    put edges mul i 2 uint i
+    put edges add mul i 2 1 uint add i 1
+  end
+  tmeta = new uint 3 0
+  put tmeta 0 nc
+  put tmeta 1 ec
+  put tmeta 2 1
+  ret res_topology_build view tmeta view edges view garr out_t
+end
+
+note ================================================================
+note Parameters
+note ================================================================
+
+fn res_params_reference which uint nc uint out_p edit uint 265 to int
+  if or lt nc 1 gt nc 64
+    ret RES_ERR_PARAM
+  end
+  if and ne which RES_REF_NARMA ne which RES_REF_LORENZ
+    ret RES_ERR_PARAM
+  end
+  for i ulong RES_PAR_WORDS bound 265
+    put out_p i 0
+  end
+  put out_p 0 nc
+  eps = 8.85e-12f32
+  vtau = 0.045f32
+  if eq which RES_REF_LORENZ
+    eps = f32 mul 2.1f64 8.85e-12f64
+    vtau = 0.0454f32
+  end
+  put out_p 1 bitcast uint eps
+  put out_p 2 bitcast uint 4.0e-9f32
+  put out_p 3 bitcast uint 5.0e-8f32
+  put out_p 4 bitcast uint 5.0e-8f32
+  put out_p 5 bitcast uint 0.00015f32
+  put out_p 6 bitcast uint 1.0e4f32
+  put out_p 7 bitcast uint 0.002f32
+  put out_p 8 bitcast uint 3.7919f32
+  for i ulong ulong nc bound 64
+    cval = f32 add 1 rem i 3
+    put out_p add RES_PAR_CONC i bitcast uint cval
+    put out_p add RES_PAR_TAU0 i bitcast uint 0.001f32
+    put out_p add RES_PAR_VTAU i bitcast uint vtau
+    put out_p add RES_PAR_VE i bitcast uint 0.0055f32
+  end
+  ret RES_OK
+end
+
+fn res_params_check p view uint 265 nc uint to int
+  if ne get p 0 nc
+    ret RES_ERR_PARAM
+  end
+  if not res_f32_pos bitcast f32 get p 1
+    ret RES_ERR_PARAM
+  end
+  if not res_f32_pos bitcast f32 get p 2
+    ret RES_ERR_PARAM
+  end
+  if not res_f32_pos bitcast f32 get p 3
+    ret RES_ERR_PARAM
+  end
+  if not res_f32_pos bitcast f32 get p 4
+    ret RES_ERR_PARAM
+  end
+  zv = bitcast f32 get p 5
+  if or not res_f32_pos zv gt zv 1.0f32
+    ret RES_ERR_PARAM
+  end
+  if not res_f32_pos bitcast f32 get p 6
+    ret RES_ERR_PARAM
+  end
+  if not res_f32_pos bitcast f32 get p 7
+    ret RES_ERR_PARAM
+  end
+  if not res_f32_fin bitcast f32 get p 8
+    ret RES_ERR_PARAM
+  end
+  for i ulong ulong nc bound 64
+    cv = bitcast f32 get p add RES_PAR_CONC i
+    if or not res_f32_fin cv lt cv 0.0f32
+      ret RES_ERR_PARAM
+    end
+    if not res_f32_pos bitcast f32 get p add RES_PAR_TAU0 i
+      ret RES_ERR_PARAM
+    end
+    if not res_f32_pos bitcast f32 get p add RES_PAR_VTAU i
+      ret RES_ERR_PARAM
+    end
+    if not res_f32_pos bitcast f32 get p add RES_PAR_VE i
+      ret RES_ERR_PARAM
+    end
+  end
+  ret RES_OK
+end
+
+note ================================================================
+note Configuration & Cholesky & Config Digest
+note ================================================================
+
+fn res_config_digest cfg view uint 5363 out_d edit uchar 32 to void
+  ctx = new uint 74 0
+  res_h_domain ctx res_dom_config
+  nc = get cfg 0
+  ec = get cfg 1
+  res_h_u32 ctx nc
+  res_h_u32 ctx ec
+  for e ulong ulong ec bound 192
+    res_h_u16 ctx get cfg add RES_TOPO_EDGES mul e 2
+    res_h_u16 ctx get cfg add RES_TOPO_EDGES add mul e 2 1
+  end
+  gbuf = new uchar 64 0
+  for i ulong ulong nc bound 64
+    put gbuf i uchar and get cfg add RES_TOPO_GND i 0xff
+  end
+  res_sha_update ctx part gbuf 0 ulong nc
+  for k ulong 8 bound 8
+    res_h_f32 ctx bitcast f32 get cfg add RES_CFG_PAR add k 1
+  end
+  for i ulong ulong nc bound 64
+    res_h_f32 ctx bitcast f32 get cfg add RES_CFG_PAR add RES_PAR_CONC i
+    res_h_f32 ctx bitcast f32 get cfg add RES_CFG_PAR add RES_PAR_TAU0 i
+    res_h_f32 ctx bitcast f32 get cfg add RES_CFG_PAR add RES_PAR_VTAU i
+    res_h_f32 ctx bitcast f32 get cfg add RES_CFG_PAR add RES_PAR_VE i
+  end
+  res_h_f32 ctx bitcast f32 get cfg RES_CFG_STEP_S
+  res_h_u32 ctx get cfg RES_CFG_K
+  res_sha_update ctx res_num_policy
+  res_sha_final ctx out_d
+end
+
+fn res_cfg_chol_cell c edit uint 5363 i ulong j ulong to int
+  s = bitcast f32 get c add RES_CFG_CHOL add mul i 64 j
+  for k ulong j bound 64
+    rik = bitcast f32 get c add RES_CFG_CHOL add mul i 64 k
+    rjk = bitcast f32 get c add RES_CFG_CHOL add mul j 64 k
+    s = sub s mul rik rjk
+  end
+  if eq i j
+    if not gt s 0.0f32
+      ret RES_ERR_SINGULAR
+    end
+    d = fsqrt s
+    put c add RES_CFG_CHOL add mul i 64 i bitcast uint d
+    put c add RES_CFG_CHOL_INV i bitcast uint div 1.0f32 d
+  else
+    invj = bitcast f32 get c add RES_CFG_CHOL_INV j
+    put c add RES_CFG_CHOL add mul i 64 j bitcast uint mul s invj
+  end
+  ret RES_OK
+end
+
+fn res_cfg_chol c edit uint 5363 m ulong to int
+  for i ulong m bound 64
+    for j ulong add i 1 bound 64
+      rc = res_cfg_chol_cell c i j
+      if ne rc RES_OK
+        ret rc
+      end
+    end
+  end
+  ret RES_OK
+end
+
+fn res_cfg_lap_edges c edit uint 5363 ec ulong to void
+  for e ulong ec bound 192
+    off = add RES_TOPO_EDGES mul e 2
+    ra = get c add RES_CFG_RED_IDX ulong get c off
+    rb = get c add RES_CFG_RED_IDX ulong get c add off 1
+    if and ne ra 0xffffffff ne rb 0xffffffff
+      hi = ulong ra
+      lo = ulong rb
+      if lt hi lo
+        hi = ulong rb
+        lo = ulong ra
+      end
+      put c add RES_CFG_CHOL add mul hi 64 lo bitcast uint -1.0f32
+    end
+  end
+end
+
+fn res_cfg_fill_laplacian c edit uint 5363 nc ulong ec ulong to int
+  m = ulong 0
+  for i ulong nc bound 64
+    put c add RES_CFG_RED_IDX i 0xffffffff
+    if eq get c add RES_TOPO_GND i 0
+      put c add RES_CFG_RED_IDX i uint m
+      put c add RES_CFG_RED_NODE m uint i
+      m = add m 1
+    end
+  end
+  put c RES_CFG_RED_CNT uint m
+  for u ulong m bound 64
+    rn = ulong get c add RES_CFG_RED_NODE u
+    deg = f32 get c add RES_TOPO_DEG rn
+    put c add RES_CFG_CHOL add mul u 64 u bitcast uint deg
+  end
+  res_cfg_lap_edges c ec
+  ret res_cfg_chol c m
+end
+
+fn res_cfg_derived_one c edit uint 5363 par view uint 265 ln_n0s f32 i ulong to int
+  ln0 = add ln_n0s mul bitcast f32 get par 8 bitcast f32 get par add RES_PAR_CONC i
+  if or not res_f32_fin ln0 or lt ln0 -80.0f32 gt ln0 80.0f32
+    ret RES_ERR_PARAM
+  end
+  put c add RES_CFG_LN_N0 i bitcast uint ln0
+  lna = res_math_log div bitcast f32 get par 6 bitcast f32 get par add RES_PAR_TAU0 i
+  if not res_f32_fin lna
+    ret RES_ERR_PARAM
+  end
+  put c add RES_CFG_LN_A0 i bitcast uint lna
+  ivt = div 1.0f32 bitcast f32 get par add RES_PAR_VTAU i
+  ive = div 1.0f32 bitcast f32 get par add RES_PAR_VE i
+  if or not res_f32_pos ivt not res_f32_pos ive
+    ret RES_ERR_PARAM
+  end
+  put c add RES_CFG_INV_VTAU i bitcast uint ivt
+  put c add RES_CFG_INV_VE i bitcast uint ive
+  ret RES_OK
+end
+
+fn res_cfg_derived_nodes c edit uint 5363 par view uint 265 to int
+  ln_n0s = res_math_log bitcast f32 get par 7
+  nc = ulong get par 0
+  for i ulong nc bound 64
+    rc = res_cfg_derived_one c par ln_n0s i
+    if ne rc RES_OK
+      ret rc
+    end
+  end
+  ret RES_OK
+end
+
+fn res_cfg_derived c edit uint 5363 par view uint 265 step_s f32 to int
+  v = div mul bitcast f32 get par 1 bitcast f32 get par 3 bitcast f32 get par 2
+  if not res_f32_pos v
+    ret RES_ERR_PARAM
+  end
+  v = div 1.0f32 v
+  if not res_f32_pos v
+    ret RES_ERR_PARAM
+  end
+  put c RES_CFG_INV_CAP bitcast uint v
+  v = mul bitcast f32 get par 4 bitcast f32 get par 3
+  if not res_f32_pos v
+    ret RES_ERR_PARAM
+  end
+  put c RES_CFG_G_UNIT bitcast uint v
+  v = div mul bitcast f32 get par 4 bitcast f32 get par 2 bitcast f32 get par 1
+  if not res_f32_pos v
+    ret RES_ERR_PARAM
+  end
+  put c RES_CFG_LAM_UNIT bitcast uint v
+  put c RES_CFG_HALF_H bitcast uint mul step_s 0.5f32
+  v = div step_s 6.0f32
+  if not res_f32_pos v
+    ret RES_ERR_PARAM
+  end
+  put c RES_CFG_SIXTH_H bitcast uint v
+  ret res_cfg_derived_nodes c par
+end
+
+fn res_topo_verify_canon topo view uint 514 to int
+  nc = get topo 0
+  if or lt nc 2 gt nc 64
+    ret RES_ERR_TOPOLOGY
+  end
+  grounds = new uint 64 0
+  ng = uint 0
+  for i ulong ulong nc bound 64
+    if ne get topo add RES_TOPO_GND i 0
+      put grounds ulong ng uint i
+      ng = add ng 1
+    end
+  end
+  edges = new uint 384 0
+  for k ulong 384 bound 384
+    put edges k get topo add RES_TOPO_EDGES k
+  end
+  canon = new uint 514 0
+  tmeta = new uint 3 0
+  put tmeta 0 nc
+  put tmeta 1 get topo 1
+  put tmeta 2 ng
+  st = res_topology_build view tmeta view edges view grounds canon
+  if ne st RES_OK
+    ret st
+  end
+  for i ulong RES_TOPO_WORDS bound 514
+    if ne get canon i get topo i
+      ret RES_ERR_TOPOLOGY
+    end
+  end
+  ret RES_OK
+end
+
+fn res_config_build topo view uint 514 par view uint 265 step_s f32 k_steps uint out_c edit uint 5363 to int
+  st = res_topo_verify_canon topo
+  if ne st RES_OK
+    ret st
+  end
+  st = res_params_check par get topo 0
+  if ne st RES_OK
+    ret st
+  end
+  if or not res_f32_pos step_s gt step_s 1.0e-3f32
+    ret RES_ERR_PARAM
+  end
+  if or lt k_steps 1 gt k_steps 1048576
+    ret RES_ERR_PARAM
+  end
+  for i ulong RES_CFG_WORDS bound 5363
+    put out_c i 0
+  end
+  for i ulong RES_TOPO_WORDS bound 514
+    put out_c i get topo i
+  end
+  for i ulong RES_PAR_WORDS bound 265
+    put out_c add RES_CFG_PAR i get par i
+  end
+  put out_c RES_CFG_STEP_S bitcast uint step_s
+  put out_c RES_CFG_K k_steps
+  st = res_cfg_derived out_c par step_s
+  if ne st RES_OK
+    ret st
+  end
+  st = res_cfg_fill_laplacian out_c ulong get topo 0 ulong get topo 1
+  if ne st RES_OK
+    ret st
+  end
+  dig = new uchar 32 0
+  res_config_digest view out_c dig
+  for i ulong 32 bound 32
+    put out_c add RES_CFG_ID i uint get dig i
+  end
+  ret RES_OK
+end
+
+note ================================================================
+note State initialization, pore density, state check
+note ================================================================
+
+fn res_state_init_y cfg view uint 5363 kind uint yc uint out_s edit uint 932 to void
+  for e ulong ulong get cfg 1 bound 192
+    dst = add RES_ST_Y mul e 2
+    if eq kind RES_INIT_N0
+      off = add RES_TOPO_EDGES mul e 2
+      na = ulong get cfg off
+      va = get cfg add RES_CFG_LN_N0 na
+      put out_s dst va
+      nb = ulong get cfg add off 1
+      vb = get cfg add RES_CFG_LN_N0 nb
+      put out_s add dst 1 vb
+    else
+      put out_s dst yc
+      put out_s add dst 1 yc
+    end
+  end
+end
+
+fn res_state_init cfg view uint 5363 kind uint val f32 out_s edit uint 932 to int
+  yconst = 0.0f32
+  if eq kind RES_INIT_CONST
+    if not res_f32_pos val
+      ret RES_ERR_PARAM
+    end
+    yconst = res_math_log val
+    if or not res_f32_fin yconst or lt yconst -80.0f32 gt yconst 80.0f32
+      ret RES_ERR_RANGE
+    end
+  else
+    if ne kind RES_INIT_N0
+      ret RES_ERR_PARAM
+    end
+  end
+  for i ulong RES_STATE_WORDS bound 932
+    put out_s i 0
+  end
+  for i ulong 32 bound 32
+    put out_s i get cfg add RES_CFG_ID i
+  end
+  put out_s RES_ST_NODES get cfg 0
+  put out_s RES_ST_SIDES mul get cfg 1 2
+  res_state_init_y cfg kind bitcast uint yconst out_s
+  ret RES_OK
+end
+
+fn res_state_pore s view uint 932 side uint to f32
+  sc = get s RES_ST_SIDES
+  if or ge side sc ge side 384
+    ret bitcast f32 uint 0x7fc00000
+  end
+  ret res_math_exp bitcast f32 get s add RES_ST_Y ulong side
+end
+
+fn res_state_get_step s view uint 932 to ulong
+  lo = ulong get s RES_ST_STEP_LO
+  hi = ulong get s RES_ST_STEP_HI
+  ret or shl hi 32 lo
+end
+
+fn res_state_set_step s edit uint 932 step ulong to void
+  put s RES_ST_STEP_LO uint and step 0xffffffff
+  put s RES_ST_STEP_HI uint shr step 32
+end
+
+fn res_state_check cfg view uint 5363 s view uint 932 to int
+  for i ulong 32 bound 32
+    if ne get s i get cfg add RES_CFG_ID i
+      ret RES_ERR_MISMATCH
+    end
+  end
+  nc = get cfg 0
+  ec = get cfg 1
+  if or ne get s RES_ST_NODES nc ne get s RES_ST_SIDES mul ec 2
+    ret RES_ERR_MISMATCH
+  end
+  for i ulong ulong nc bound 64
+    vi = bitcast f32 get s add RES_ST_V i
+    vci = bitcast f32 get s add RES_ST_VC i
+    if or not res_f32_fin vi not res_f32_fin vci
+      ret RES_ERR_NONFINITE
+    end
+    if ne get cfg add RES_TOPO_GND i 0
+      if ne vi 0.0f32
+        ret RES_ERR_RANGE
+      end
+    end
+    if not res_carry_ok vi vci
+      ret RES_ERR_RANGE
+    end
+  end
+  for e ulong ulong ec bound 192
+    na = ulong get cfg add RES_TOPO_EDGES mul e 2
+    nb = ulong get cfg add RES_TOPO_EDGES add mul e 2 1
+    dv = sub bitcast f32 get s add RES_ST_V na bitcast f32 get s add RES_ST_V nb
+    if not le res_f32_abs dv 1.0f32
+      ret RES_ERR_RANGE
+    end
+  end
+  ns = ulong mul ec 2
+  for k ulong ns bound 384
+    yk = bitcast f32 get s add RES_ST_Y k
+    yck = bitcast f32 get s add RES_ST_YC k
+    if or not res_f32_fin yk not res_f32_fin yck
+      ret RES_ERR_NONFINITE
+    end
+    if or lt yk -80.0f32 or gt yk 80.0f32 not res_carry_ok yk yck
+      ret RES_ERR_RANGE
+    end
+  end
+  ret RES_OK
+end
+
+note ================================================================
+note Dynamics: side_rate, derivative, stiffness
+note ================================================================
+
+fn res_side_rate cfg view uint 5363 node ulong dv f32 y f32 lam_out edit f32 1 to f32
+  alpha = res_math_exp sub bitcast f32 get cfg add RES_CFG_LN_A0 node mul dv bitcast f32 get cfg add RES_CFG_INV_VTAU node
+  ln_nss = add bitcast f32 get cfg add RES_CFG_LN_N0 node mul dv bitcast f32 get cfg add RES_CFG_INV_VE node
+  zv = bitcast f32 get cfg add RES_CFG_PAR 5
+  r = res_one_minus_exp mul zv sub y ln_nss
+  put lam_out 0 mul mul alpha zv sub 1.0f32 r
+  ret mul alpha r
+end
+
+fn res_deriv_edge_b cfg view uint 5363 ws edit uint 3564 e ulong dv f32 to f32
+  pores = add res_math_exp bitcast f32 get ws add RES_WS_SY mul e 2 res_math_exp bitcast f32 get ws add RES_WS_SY add mul e 2 1
+  q = mul mul bitcast f32 get cfg RES_CFG_G_UNIT pores dv
+  n = ulong get cfg add RES_TOPO_EDGES mul e 2
+  b = sub bitcast f32 get ws add RES_WS_B n q
+  put ws add RES_WS_B n bitcast uint b
+  n = ulong get cfg add RES_TOPO_EDGES add mul e 2 1
+  b = add bitcast f32 get ws add RES_WS_B n q
+  put ws add RES_WS_B n bitcast uint b
+  ret mul bitcast f32 get cfg RES_CFG_LAM_UNIT pores
+end
+
+fn res_deriv_side cfg view uint 5363 ws edit uint 3564 e ulong stage ulong side ulong to f32
+  na = ulong get cfg add RES_TOPO_EDGES mul e 2
+  nb = ulong get cfg add RES_TOPO_EDGES add mul e 2 1
+  dv = sub bitcast f32 get ws add RES_WS_SV na bitcast f32 get ws add RES_WS_SV nb
+  if ne side 0
+    na = nb
+    dv = neg dv
+  end
+  tmp = new f32 1 0.0f32
+  nb = add mul e 2 side
+  dv = res_side_rate cfg na dv bitcast f32 get ws add RES_WS_SY nb tmp
+  put ws add add RES_WS_KY mul stage 384 nb bitcast uint dv
+  ret get tmp 0
+end
+
+fn res_deriv_one_edge cfg view uint 5363 ws edit uint 3564 e ulong stage ulong want_lam bool to f32
+  lmax = res_deriv_side cfg ws e stage 0
+  lb = res_deriv_side cfg ws e stage 1
+  if not le lb lmax
+    lmax = lb
+  end
+  na = ulong get cfg add RES_TOPO_EDGES mul e 2
+  nb = ulong get cfg add RES_TOPO_EDGES add mul e 2 1
+  dv = sub bitcast f32 get ws add RES_WS_SV na bitcast f32 get ws add RES_WS_SV nb
+  lv = res_deriv_edge_b cfg ws e dv
+  if not want_lam
+    ret 0.0f32
+  end
+  if not le lv lmax
+    lmax = lv
+  end
+  ret lmax
+end
+
+fn res_deriv_edges cfg view uint 5363 ws edit uint 3564 stage ulong want_lam bool to f32
+  ec = ulong get cfg 1
+  lmax = 0.0f32
+  for e ulong ec bound 192
+    le_val = res_deriv_one_edge cfg ws e stage want_lam
+    if want_lam
+      if not le le_val lmax
+        lmax = le_val
+      end
+    end
+  end
+  ret lmax
+end
+
+fn res_deriv_fwd_row cfg view uint 5363 ws edit uint 3564 i ulong to void
+  s = bitcast f32 get ws add RES_WS_R i
+  for k ulong i bound 64
+    rik = bitcast f32 get cfg add RES_CFG_CHOL add mul i 64 k
+    rk = bitcast f32 get ws add RES_WS_R k
+    s = sub s mul rik rk
+  end
+  invi = bitcast f32 get cfg add RES_CFG_CHOL_INV i
+  put ws add RES_WS_R i bitcast uint mul s invi
+end
+
+fn res_deriv_bwd_row cfg view uint 5363 ws edit uint 3564 m ulong ii ulong to void
+  s = bitcast f32 get ws add RES_WS_R ii
+  k = add ii 1
+  while lt k m bound 64
+    rki = bitcast f32 get cfg add RES_CFG_CHOL add mul k 64 ii
+    rk = bitcast f32 get ws add RES_WS_R k
+    s = sub s mul rki rk
+    k = add k 1
+  end
+  invi = bitcast f32 get cfg add RES_CFG_CHOL_INV ii
+  put ws add RES_WS_R ii bitcast uint mul s invi
+end
+
+fn res_deriv_solve cfg view uint 5363 ws edit uint 3564 stage ulong to void
+  m = ulong get cfg RES_CFG_RED_CNT
+  inv_cap = bitcast f32 get cfg RES_CFG_INV_CAP
+  for u ulong m bound 64
+    rn = ulong get cfg add RES_CFG_RED_NODE u
+    bu = bitcast f32 get ws add RES_WS_B rn
+    put ws add RES_WS_R u bitcast uint mul bu inv_cap
+  end
+  for i ulong m bound 64
+    res_deriv_fwd_row cfg ws i
+  end
+  for step ulong m bound 64
+    res_deriv_bwd_row cfg ws m sub sub m 1 step
+  end
+  nc = ulong get cfg 0
+  kv_base = add RES_WS_KV mul stage 64
+  for i ulong nc bound 64
+    u = get cfg add RES_CFG_RED_IDX i
+    if eq u 0xffffffff
+      put ws add kv_base i 0
+    else
+      put ws add kv_base i get ws add RES_WS_R ulong u
+    end
+  end
+end
+
+fn res_derivative cfg view uint 5363 ws edit uint 3564 stage ulong want_lam bool to f32
+  nc = ulong get cfg 0
+  for i ulong nc bound 64
+    put ws add RES_WS_B i get ws add RES_WS_CUR i
+  end
+  lmax = res_deriv_edges cfg ws stage want_lam
+  res_deriv_solve cfg ws stage
+  ret lmax
+end
+
+fn res_stiffness_side cfg view uint 5363 s view uint 932 e ulong side ulong to f32
+  na = ulong get cfg add RES_TOPO_EDGES mul e 2
+  nb = ulong get cfg add RES_TOPO_EDGES add mul e 2 1
+  dv = sub bitcast f32 get s add RES_ST_V na bitcast f32 get s add RES_ST_V nb
+  if ne side 0
+    na = nb
+    dv = neg dv
+  end
+  tmp = new f32 1 0.0f32
+  _d = res_side_rate cfg na dv bitcast f32 get s add RES_ST_Y add mul e 2 side tmp
+  ret get tmp 0
+end
+
+fn res_stiffness_edge cfg view uint 5363 s view uint 932 e ulong to f32
+  lmax = res_stiffness_side cfg s e 0
+  lb = res_stiffness_side cfg s e 1
+  if not le lb lmax
+    lmax = lb
+  end
+  pores = add res_math_exp bitcast f32 get s add RES_ST_Y mul e 2 res_math_exp bitcast f32 get s add RES_ST_Y add mul e 2 1
+  lv = mul bitcast f32 get cfg RES_CFG_LAM_UNIT pores
+  if not le lv lmax
+    lmax = lv
+  end
+  ret lmax
+end
+
+fn res_stiffness cfg view uint 5363 s view uint 932 lam_out edit f32 1 to int
+  st = res_state_check cfg s
+  if ne st RES_OK
+    ret st
+  end
+  ec = ulong get cfg 1
+  lmax = 0.0f32
+  for e ulong ec bound 192
+    le_val = res_stiffness_edge cfg s e
+    if not le le_val lmax
+      lmax = le_val
+    end
+  end
+  if not res_f32_fin lmax
+    ret RES_ERR_NONFINITE
+  end
+  put lam_out 0 lmax
+  ret RES_OK
+end
+
+note ================================================================
+note Input check & interpolation, RK4 step, membrane stats
+note ================================================================
+
+fn res_knot_check tab view f32 * nc ulong k ulong to int
+  base = mul k nc
+  for i ulong nc bound 64
+    v = get tab add base i
+    if not res_f32_fin v
+      ret RES_ERR_NONFINITE
+    end
+    if gt res_f32_abs v 1.0e-6f32
+      ret RES_ERR_INPUT
+    end
+  end
+  ret RES_OK
+end
+
+fn res_input_interp tab view f32 * ws edit uint 3564 b0 ulong nc ulong f f32 to void
+  for i ulong nc bound 64
+    v0 = get tab add b0 i
+    v1 = get tab add add b0 nc i
+    v0 = add v0 mul f sub v1 v0
+    put ws add RES_WS_CUR i bitcast uint v0
+  end
+end
+
+fn res_input_at cfg view uint 5363 tab view f32 * ws edit uint 3564 k ulong phase_hs uint to void
+  nc = ulong get cfg 0
+  f = div f32 phase_hs f32 mul get cfg RES_CFG_K 2
+  res_input_interp tab ws mul k nc nc f
+end
+
+fn res_rk4_stage_prep cur view uint 932 ws edit uint 3564 c f32 prev_st ulong to void
+  nc = ulong get cur RES_ST_NODES
+  ns = ulong get cur RES_ST_SIDES
+  kv_b = add RES_WS_KV mul prev_st 64
+  ky_b = add RES_WS_KY mul prev_st 384
+  for i ulong nc bound 64
+    vi = bitcast f32 get cur add RES_ST_V i
+    kvi = bitcast f32 get ws add kv_b i
+    put ws add RES_WS_SV i bitcast uint add vi mul c kvi
+  end
+  for j ulong ns bound 384
+    yj = bitcast f32 get cur add RES_ST_Y j
+    kyj = bitcast f32 get ws add ky_b j
+    put ws add RES_WS_SY j bitcast uint add yj mul c kyj
+  end
+end
+
+fn res_twosum_put ws edit uint 3564 off_v ulong off_c ulong x f32 y f32 to void
+  sv = add x y
+  bp = sub sv x
+  ap = sub sv bp
+  err = add sub x ap sub y bp
+  put ws off_v bitcast uint sv
+  put ws off_c bitcast uint err
+end
+
+fn res_rk4_combine_v h6 f32 nc ulong cur view uint 932 ws edit uint 3564 to void
+  for i ulong nc bound 64
+    d = bitcast f32 get ws add RES_WS_KV i
+    d = add d mul 2.0f32 bitcast f32 get ws add add RES_WS_KV 64 i
+    d = add d mul 2.0f32 bitcast f32 get ws add add RES_WS_KV 128 i
+    d = add d bitcast f32 get ws add add RES_WS_KV 192 i
+    d = mul h6 d
+    x = bitcast f32 get cur add RES_ST_V i
+    y = add d bitcast f32 get cur add RES_ST_VC i
+    ov = add RES_WS_SPARE add RES_ST_V i
+    oc = add RES_WS_SPARE add RES_ST_VC i
+    res_twosum_put ws ov oc x y
+  end
+end
+
+fn res_rk4_combine_y h6 f32 ns ulong cur view uint 932 ws edit uint 3564 to void
+  for j ulong ns bound 384
+    d = bitcast f32 get ws add RES_WS_KY j
+    d = add d mul 2.0f32 bitcast f32 get ws add add RES_WS_KY 384 j
+    d = add d mul 2.0f32 bitcast f32 get ws add add RES_WS_KY 768 j
+    d = add d bitcast f32 get ws add add RES_WS_KY 1152 j
+    d = mul h6 d
+    x = bitcast f32 get cur add RES_ST_Y j
+    y = add d bitcast f32 get cur add RES_ST_YC j
+    ov = add RES_WS_SPARE add RES_ST_Y j
+    oc = add RES_WS_SPARE add RES_ST_YC j
+    res_twosum_put ws ov oc x y
+  end
+end
+
+fn res_rk4_combine cfg view uint 5363 cur view uint 932 ws edit uint 3564 to void
+  h6 = bitcast f32 get cfg RES_CFG_SIXTH_H
+  nc = ulong get cur RES_ST_NODES
+  ns = ulong get cur RES_ST_SIDES
+  for i ulong RES_STATE_WORDS bound 932
+    put ws add RES_WS_SPARE i 0
+  end
+  for i ulong 32 bound 32
+    put ws add RES_WS_SPARE i get cur i
+  end
+  nstep = add res_state_get_step cur 1
+  put ws add RES_WS_SPARE RES_ST_STEP_LO uint and nstep 0xffffffff
+  put ws add RES_WS_SPARE RES_ST_STEP_HI uint shr nstep 32
+  put ws add RES_WS_SPARE RES_ST_NODES uint nc
+  put ws add RES_WS_SPARE RES_ST_SIDES uint ns
+  res_rk4_combine_v h6 nc cur ws
+  res_rk4_combine_y h6 ns cur ws
+end
+
+fn res_step_init_sv cur view uint 932 ws edit uint 3564 to void
+  for i ulong ulong get cur RES_ST_NODES bound 64
+    put ws add RES_WS_SV i get cur add RES_ST_V i
+  end
+  for j ulong ulong get cur RES_ST_SIDES bound 384
+    put ws add RES_WS_SY j get cur add RES_ST_Y j
+  end
+end
+
+fn res_step_check_spare cfg view uint 5363 ws view uint 3564 to int
+  spare_v = new uint 932 0
+  for i ulong RES_STATE_WORDS bound 932
+    put spare_v i get ws add RES_WS_SPARE i
+  end
+  ret res_state_check cfg view spare_v
+end
+
+fn res_step_stages cfg view uint 5363 tab view f32 * ws edit uint 3564 cur view uint 932 kp view ulong 2 to int
+  res_step_init_sv cur ws
+  k64 = get kp 0
+  p2 = mul uint get kp 1 2
+  res_input_at cfg tab ws k64 p2
+  lam = res_derivative cfg ws 0 true
+  if not le mul bitcast f32 get cfg RES_CFG_STEP_S lam 2.0f32
+    if res_f32_fin lam
+      ret RES_ERR_STIFF
+    end
+    ret RES_ERR_NONFINITE
+  end
+  res_rk4_stage_prep cur ws bitcast f32 get cfg RES_CFG_HALF_H 0
+  res_input_at cfg tab ws k64 add p2 1
+  lam = res_derivative cfg ws 1 false
+  res_rk4_stage_prep cur ws bitcast f32 get cfg RES_CFG_HALF_H 1
+  res_input_at cfg tab ws k64 add p2 1
+  lam = res_derivative cfg ws 2 false
+  res_rk4_stage_prep cur ws bitcast f32 get cfg RES_CFG_STEP_S 2
+  res_input_at cfg tab ws k64 add p2 2
+  lam = res_derivative cfg ws 3 false
+  res_rk4_combine cfg cur ws
+  ret res_step_check_spare cfg view ws
+end
+
+note One RK4 step from cur into ws->spare. meta: [0]=in_node_count [1]=in_knot_count.
+fn res_step_spare cfg view uint 5363 tab view f32 * meta view uint 2 ws edit uint 3564 cur view uint 932 to int
+  st = res_state_check cfg cur
+  if ne st RES_OK
+    ret st
+  end
+  if or ne get meta 0 get cfg 0 lt get meta 1 2
+    ret RES_ERR_INPUT
+  end
+  if lt len tab mul ulong get meta 0 ulong get meta 1
+    ret RES_ERR_INPUT
+  end
+  k64 = div res_state_get_step cur ulong get cfg RES_CFG_K
+  if ge add k64 1 ulong get meta 1
+    ret RES_ERR_INPUT
+  end
+  st = res_knot_check tab ulong get cfg 0 k64
+  if ne st RES_OK
+    ret st
+  end
+  st = res_knot_check tab ulong get cfg 0 add k64 1
+  if ne st RES_OK
+    ret st
+  end
+  kp = new ulong 2 0
+  put kp 0 k64
+  put kp 1 rem res_state_get_step cur ulong get cfg RES_CFG_K
+  ret res_step_stages cfg tab ws cur view kp
+end
+
+note One RK4 step using a 2-knot window pair (knot j at [0..nc-1], knot j+1 at [nc..2*nc-1]).
+fn res_step_pair cfg view uint 5363 pair view f32 128 ws edit uint 3564 cur view uint 932 to int
+  st = res_state_check cfg cur
+  if ne st RES_OK
+    ret st
+  end
+  nc = ulong get cfg 0
+  st = res_knot_check pair nc 0
+  if ne st RES_OK
+    ret st
+  end
+  st = res_knot_check pair nc 1
+  if ne st RES_OK
+    ret st
+  end
+  kp = new ulong 2 0
+  put kp 0 0
+  put kp 1 rem res_state_get_step cur ulong get cfg RES_CFG_K
+  ret res_step_stages cfg pair ws cur view kp
+end
+
+fn res_copy_spare_to_state ws view uint 3564 dst edit uint 932 to void
+  for i ulong RES_STATE_WORDS bound 932
+    put dst i get ws add RES_WS_SPARE i
+  end
+end
+
+fn res_membrane_stats_init st edit uint 200 to void
+  for i ulong RES_MSTATS_WORDS bound 200
+    put st i 0
+  end
+end
+
+fn res_ws_mstats_init ws edit uint 3564 to void
+  for i ulong RES_MSTATS_WORDS bound 200
+    put ws add RES_WS_MSTATS i 0
+  end
+end
+
+fn res_ws_mstats_copy ws view uint 3564 dst edit uint 200 to void
+  for i ulong RES_MSTATS_WORDS bound 200
+    put dst i get ws add RES_WS_MSTATS i
+  end
+end
+
+fn res_edge_abs_dv cfg view uint 5363 s view uint 932 e ulong to f32
+  off = add RES_TOPO_EDGES mul e 2
+  va = bitcast f32 get s add RES_ST_V ulong get cfg off
+  vb = bitcast f32 get s add RES_ST_V ulong get cfg add off 1
+  ret res_f32_abs sub va vb
+end
+
+fn res_membrane_observe_edges cfg view uint 5363 s view uint 932 st edit uint 200 to bool
+  max_mv = bitcast f32 get st RES_MS_MAX_MV
+  any = false
+  for e ulong ulong get cfg 1 bound 192
+    dv = res_edge_abs_dv cfg s e
+    if gt dv max_mv
+      max_mv = dv
+    end
+    if gt dv 0.3f32
+      any = true
+      if eq get st add RES_MS_EFLAG e 0
+        put st add RES_MS_EFLAG e 1
+        put st RES_MS_MEM_IMP add get st RES_MS_MEM_IMP 1
+      end
+    end
+  end
+  put st RES_MS_MAX_MV bitcast uint max_mv
+  ret any
+end
+
+fn res_membrane_observe cfg view uint 5363 s view uint 932 st edit uint 200 to int
+  for i ulong 32 bound 32
+    if ne get s i get cfg add RES_CFG_ID i
+      ret RES_ERR_MISMATCH
+    end
+  end
+  nc = get cfg 0
+  if ne get s RES_ST_NODES nc
+    ret RES_ERR_MISMATCH
+  end
+  max_nv = bitcast f32 get st RES_MS_MAX_NV
+  for i ulong ulong nc bound 64
+    m = res_f32_abs bitcast f32 get s add RES_ST_V i
+    if gt m max_nv
+      max_nv = m
+    end
+  end
+  put st RES_MS_MAX_NV bitcast uint max_nv
+  any = res_membrane_observe_edges cfg s st
+  obs = add or shl ulong get st RES_MS_OBS_HI 32 ulong get st RES_MS_OBS_LO 1
+  put st RES_MS_OBS_LO uint and obs 0xffffffff
+  put st RES_MS_OBS_HI uint shr obs 32
+  if any
+    imp = add or shl ulong get st RES_MS_IMP_HI 32 ulong get st RES_MS_IMP_LO 1
+    put st RES_MS_IMP_LO uint and imp 0xffffffff
+    put st RES_MS_IMP_HI uint shr imp 32
+  end
+  ret RES_OK
+end
+
+fn res_ws_observe_state cfg view uint 5363 s view uint 932 ws edit uint 3564 to void
+  ms = new uint 200 0
+  res_ws_mstats_copy view ws ms
+  _rc = res_membrane_observe cfg s ms
+  for i ulong RES_MSTATS_WORDS bound 200
+    put ws add RES_WS_MSTATS i get ms i
+  end
+end
+
+note Advance state s by steps.
+note adv_meta: [0]=in_node_count [1]=in_knot_count [2]=steps_lo [3]=steps_hi [4]=observe_flag
+fn res_advance_meta cfg view uint 5363 tab view f32 * adv_meta view uint 5 ws edit uint 3564 s edit uint 932 to int
+  imeta = new uint 2 0
+  put imeta 0 get adv_meta 0
+  put imeta 1 get adv_meta 1
+  steps = or shl ulong get adv_meta 3 32 ulong get adv_meta 2
+  obs = ne get adv_meta 4 0
+  st = RES_OK
+  for i ulong steps bound 50000000
+    st = res_step_spare cfg tab view imeta ws view s
+    if ne st RES_OK
+      ret st
+    end
+    res_copy_spare_to_state view ws s
+    if obs
+      res_ws_observe_state cfg view s ws
+    end
+  end
+  ret RES_OK
+end
+
+note ================================================================
+note Receipts: input_digest, state_digest, run_receipt
+note ================================================================
+
+fn res_input_digest_body ctx edit uint 74 tab view f32 * total ulong to void
+  buf = new uchar 1024 0
+  used = ulong 0
+  for i ulong total bound 30000000
+    u = res_f32_bits_canon get tab i
+    put buf used uchar and u 0xff
+    put buf add used 1 uchar and shr u 8 0xff
+    put buf add used 2 uchar and shr u 16 0xff
+    put buf add used 3 uchar and shr u 24 0xff
+    used = add used 4
+    if eq used 1024
+      res_sha_update ctx view buf
+      used = 0
+    end
+  end
+  if gt used 0
+    res_sha_update ctx part buf 0 used
+  end
+end
+
+fn res_input_digest_begin ctx edit uint 74 nc uint kn uint to void
+  res_sha_init ctx
+  res_h_domain ctx res_dom_input
+  res_h_u32 ctx nc
+  res_h_u32 ctx kn
+end
+
+fn res_input_digest_row ctx edit uint 74 row view f32 64 nc uint to void
+  buf = new uchar 256 0
+  for i ulong ulong nc bound 64
+    u = res_f32_bits_canon get row i
+    off = mul i 4
+    put buf off uchar and u 0xff
+    put buf add off 1 uchar and shr u 8 0xff
+    put buf add off 2 uchar and shr u 16 0xff
+    put buf add off 3 uchar and shr u 24 0xff
+  end
+  res_sha_update ctx part buf 0 mul ulong nc 4
+end
+
+fn res_input_digest tab view f32 * meta view uint 2 out_d edit uchar 32 to int
+  nc = get meta 0
+  kn = get meta 1
+  total = mul ulong nc ulong kn
+  if lt len tab total
+    ret RES_ERR_INPUT
+  end
+  ctx = new uint 74 0
+  res_h_domain ctx res_dom_input
+  res_h_u32 ctx nc
+  res_h_u32 ctx kn
+  res_input_digest_body ctx tab total
+  res_sha_final ctx out_d
+  ret RES_OK
+end
+
+fn res_state_digest s view uint 932 out_d edit uchar 32 to int
+  nc = get s RES_ST_NODES
+  sc = get s RES_ST_SIDES
+  if or gt nc 64 gt sc 384
+    ret RES_ERR_MISMATCH
+  end
+  ctx = new uint 74 0
+  res_h_domain ctx res_dom_state
+  cid = new uchar 32 0
+  for i ulong 32 bound 32
+    put cid i uchar and get s i 0xff
+  end
+  res_sha_update ctx view cid
+  res_h_u64 ctx res_state_get_step s
+  res_h_u32 ctx nc
+  res_h_u32 ctx sc
+  for i ulong ulong nc bound 64
+    res_h_f32 ctx bitcast f32 get s add RES_ST_V i
+  end
+  for k ulong ulong sc bound 384
+    res_h_f32 ctx bitcast f32 get s add RES_ST_Y k
+  end
+  for i ulong ulong nc bound 64
+    res_h_f32 ctx bitcast f32 get s add RES_ST_VC i
+  end
+  for k ulong ulong sc bound 384
+    res_h_f32 ctx bitcast f32 get s add RES_ST_YC k
+  end
+  res_sha_final ctx out_d
+  ret RES_OK
+end
+
+fn res_receipt_finalize cdig view uchar 32 idig view uchar 32 sdig view uchar 32 steps ulong out_r edit uint 130 to void
+  ctx = new uint 74 0
+  res_h_domain ctx res_dom_run
+  res_sha_update ctx cdig
+  res_sha_update ctx idig
+  res_h_u64 ctx steps
+  res_sha_update ctx sdig
+  rdig = new uchar 32 0
+  res_sha_final ctx rdig
+  for i ulong 32 bound 32
+    put out_r i uint get cdig i
+    put out_r add 32 i uint get idig i
+    put out_r add 64 i uint get sdig i
+    put out_r add 98 i uint get rdig i
+  end
+  put out_r 96 uint and steps 0xffffffff
+  put out_r 97 uint shr steps 32
+end
+
+fn res_copy_cfg_id cfg view uint 5363 dst edit uchar 32 to void
+  for i ulong 32 bound 32
+    put dst i uchar and get cfg add RES_CFG_ID i 0xff
+  end
+end
+
+fn res_run_receipt_from_idig cfg view uint 5363 idig view uchar 32 s view uint 932 out_r edit uint 130 to int
+  st = res_state_check cfg s
+  if ne st RES_OK
+    ret st
+  end
+  sdig = new uchar 32 0
+  st = res_state_digest s sdig
+  if ne st RES_OK
+    ret st
+  end
+  cdig = new uchar 32 0
+  res_copy_cfg_id cfg cdig
+  res_receipt_finalize view cdig idig view sdig res_state_get_step s out_r
+  ret RES_OK
+end
+
+fn res_run_receipt cfg view uint 5363 tab view f32 * meta view uint 2 s view uint 932 out_r edit uint 130 to int
+  st = res_state_check cfg s
+  if ne st RES_OK
+    ret st
+  end
+  idig = new uchar 32 0
+  st = res_input_digest tab meta idig
+  if ne st RES_OK
+    ret st
+  end
+  sdig = new uchar 32 0
+  st = res_state_digest s sdig
+  if ne st RES_OK
+    ret st
+  end
+  cdig = new uchar 32 0
+  res_copy_cfg_id cfg cdig
+  res_receipt_finalize view cdig view idig view sdig res_state_get_step s out_r
+  ret RES_OK
+end
+
+note ================================================================
+note Binary64 Ridge Readout & NRMSE (ported from reservoir_readout.om)
+note ================================================================
+
+fn res_fin64 bits ulong to bool
+  ret lt and bits 0x7ff0000000000000 0x7ff0000000000000
+end
+
+fn res_design_val x view f64 * t ulong nf ulong col ulong to f64
+  if eq col 0
+    ret 1.0f64
+  end
+  ret get x add mul t nf sub col 1
+end
+
+fn res_dot_xx x view f64 * meta view ulong 4 i ulong j ulong to f64
+  s = 0.0f64
+  for t ulong get meta 0 bound 2000000
+    xi = res_design_val x t get meta 1 i
+    xj = res_design_val x t get meta 1 j
+    s = add s mul xi xj
+  end
+  ret s
+end
+
+fn res_dot_xy x view f64 * y view f64 * meta view ulong 4 io ulong to f64
+  s = 0.0f64
+  for t ulong get meta 0 bound 2000000
+    xi = res_design_val x t get meta 1 div io 4
+    idx = mul t get meta 2
+    idx = add idx rem io 4
+    s = add s mul xi get y idx
+  end
+  ret s
+end
+
+fn res_ro_check_args x view f64 * y view f64 * meta view ulong 4 to int
+  ns = get meta 0
+  nf = get meta 1
+  no = get meta 2
+  lam_b = get meta 3
+  if or lt nf 1 gt nf 256
+    ret RES_ERR_PARAM
+  end
+  if or lt no 1 gt no 4
+    ret RES_ERR_PARAM
+  end
+  if or lt ns 1 not res_fin64 lam_b
+    ret RES_ERR_PARAM
+  end
+  if lt bitcast f64 lam_b 0.0f64
+    ret RES_ERR_PARAM
+  end
+  if or lt len x mul ns nf lt len y mul ns no
+    ret RES_ERR_PARAM
+  end
+  for i ulong mul ns nf bound 50000000
+    if not res_fin64 bitcast ulong get x i
+      ret RES_ERR_NONFINITE
+    end
+  end
+  for i ulong mul ns no bound 20000000
+    if not res_fin64 bitcast ulong get y i
+      ret RES_ERR_NONFINITE
+    end
+  end
+  ret RES_OK
+end
+
+fn res_ro_fill_g x view f64 * ws edit ulong 67334 meta view ulong 4 to void
+  for i ulong add get meta 1 1 bound 257
+    for j ulong add i 1 bound 257
+      s = res_dot_xx x meta i j
+      if and ne i 0 eq j i
+        s = add s bitcast f64 get meta 3
+      end
+      put ws add mul i RES_RO_DIM j bitcast ulong s
+    end
+  end
+end
+
+fn res_ro_fill_r x view f64 * y view f64 * ws edit ulong 67334 meta view ulong 4 to void
+  for io ulong mul add get meta 1 1 4 bound 1028
+    if lt rem io 4 get meta 2
+      s = res_dot_xy x y meta io
+      put ws add RES_RWS_R_OFF io bitcast ulong s
+    end
+  end
+end
+
+fn res_ro_ldlt_pivot ws edit ulong 67334 j ulong to int
+  gjj = bitcast f64 get ws add mul j RES_RO_DIM j
+  dj = gjj
+  for k ulong j bound 257
+    ljk = bitcast f64 get ws add mul j RES_RO_DIM k
+    dk = bitcast f64 get ws add RES_RWS_D_OFF k
+    dj = sub dj mul mul ljk ljk dk
+  end
+  dj_b = bitcast ulong dj
+  tol = mul bitcast f64 ulong 0x3d3c25c268497682 gjj
+  if or not res_fin64 dj_b le dj tol
+    ret RES_ERR_SINGULAR
+  end
+  put ws add RES_RWS_D_OFF j dj_b
+  ret RES_OK
+end
+
+fn res_ro_ldlt_entry ws edit ulong 67334 row ulong j ulong to void
+  dj = bitcast f64 get ws add RES_RWS_D_OFF j
+  s = bitcast f64 get ws add mul row RES_RO_DIM j
+  for k ulong j bound 257
+    lik = bitcast f64 get ws add mul row RES_RO_DIM k
+    ljk = bitcast f64 get ws add mul j RES_RO_DIM k
+    dk = bitcast f64 get ws add RES_RWS_D_OFF k
+    s = sub s mul mul lik ljk dk
+  end
+  put ws add mul row RES_RO_DIM j bitcast ulong div s dj
+end
+
+fn res_ro_solve_fwd_row ws edit ulong 67334 i ulong o ulong to void
+  s = bitcast f64 get ws add RES_RWS_R_OFF add mul i RES_RO_MAX_OUT o
+  for k ulong i bound 257
+    lik = bitcast f64 get ws add mul i RES_RO_DIM k
+    rk = bitcast f64 get ws add RES_RWS_R_OFF add mul k RES_RO_MAX_OUT o
+    s = sub s mul lik rk
+  end
+  put ws add RES_RWS_R_OFF add mul i RES_RO_MAX_OUT o bitcast ulong s
+end
+
+fn res_ro_solve_fwd ws edit ulong 67334 p ulong o ulong to void
+  for i ulong p bound 257
+    res_ro_solve_fwd_row ws i o
+  end
+  for i ulong p bound 257
+    ri = bitcast f64 get ws add RES_RWS_R_OFF add mul i RES_RO_MAX_OUT o
+    di = bitcast f64 get ws add RES_RWS_D_OFF i
+    put ws add RES_RWS_R_OFF add mul i RES_RO_MAX_OUT o bitcast ulong div ri di
+  end
+end
+
+fn res_ro_solve_bwd_row ws edit ulong 67334 p ulong ii ulong o ulong to int
+  s = bitcast f64 get ws add RES_RWS_R_OFF add mul ii RES_RO_MAX_OUT o
+  k = add ii 1
+  while lt k p bound 257
+    lki = bitcast f64 get ws add mul k RES_RO_DIM ii
+    rk = bitcast f64 get ws add RES_RWS_R_OFF add mul k RES_RO_MAX_OUT o
+    s = sub s mul lki rk
+    k = add k 1
+  end
+  sb = bitcast ulong s
+  if not res_fin64 sb
+    ret RES_ERR_NONFINITE
+  end
+  put ws add RES_RWS_R_OFF add mul ii RES_RO_MAX_OUT o sb
+  ret RES_OK
+end
+
+fn res_ro_solve ws edit ulong 67334 nf ulong no ulong to int
+  p = add nf 1
+  for j ulong p bound 257
+    rc = res_ro_ldlt_pivot ws j
+    if ne rc RES_OK
+      ret rc
+    end
+    for i ulong sub p add j 1 bound 257
+      res_ro_ldlt_entry ws add add j 1 i j
+    end
+  end
+  for o ulong no bound 4
+    res_ro_solve_fwd ws p o
+    for step ulong p bound 257
+      rc = res_ro_solve_bwd_row ws p sub sub p 1 step o
+      if ne rc RES_OK
+        ret rc
+      end
+    end
+  end
+  ret RES_OK
+end
+
+fn res_ro_ws_zero ws edit ulong 67334 nf ulong to void
+  p = add nf 1
+  for i ulong p bound 257
+    for j ulong add i 1 bound 257
+      put ws add mul i RES_RO_DIM j 0
+    end
+    for o ulong 4 bound 4
+      put ws add RES_RWS_R_OFF add mul i 4 o 0
+    end
+  end
+end
+
+fn res_ro_ws_accum_i ws edit ulong 67334 xrow view f64 256 yrow view f64 4 i ulong no ulong to void
+  xi = 1.0f64
+  if gt i 0
+    xi = get xrow sub i 1
+  end
+  for j ulong add i 1 bound 257
+    xj = 1.0f64
+    if gt j 0
+      xj = get xrow sub j 1
+    end
+    idx = add mul i RES_RO_DIM j
+    put ws idx bitcast ulong add bitcast f64 get ws idx mul xi xj
+  end
+  for o ulong no bound 4
+    ridx = add RES_RWS_R_OFF add mul i 4 o
+    put ws ridx bitcast ulong add bitcast f64 get ws ridx mul xi get yrow o
+  end
+end
+
+fn res_ro_ws_accum_row ws edit ulong 67334 xrow view f64 256 yrow view f64 4 nf ulong no ulong to int
+  for f ulong nf bound 256
+    if not res_fin64 bitcast ulong get xrow f
+      ret RES_ERR_NONFINITE
+    end
+  end
+  for o ulong no bound 4
+    if not res_fin64 bitcast ulong get yrow o
+      ret RES_ERR_NONFINITE
+    end
+  end
+  for i ulong add nf 1 bound 257
+    res_ro_ws_accum_i ws xrow yrow i no
+  end
+  ret RES_OK
+end
+
+fn res_ro_ws_finish ws edit ulong 67334 meta view ulong 4 to int
+  nf = get meta 1
+  no = get meta 2
+  lam_b = get meta 3
+  if or lt nf 1 gt nf 256
+    ret RES_ERR_PARAM
+  end
+  if or lt no 1 gt no 4
+    ret RES_ERR_PARAM
+  end
+  if not res_fin64 lam_b
+    ret RES_ERR_PARAM
+  end
+  lam = bitcast f64 lam_b
+  if lt lam 0.0f64
+    ret RES_ERR_PARAM
+  end
+  for i ulong nf bound 256
+    idx = add mul add i 1 RES_RO_DIM add i 1
+    put ws idx bitcast ulong add bitcast f64 get ws idx lam
+  end
+  ret res_ro_solve ws nf no
+end
+
+note Fit ridge readout into ws (caller copies weights out via res_readout_extract).
+note meta: [0]=n_samples [1]=n_features [2]=n_outputs [3]=bitcast ulong lambda
+fn res_readout_fit_ws x view f64 * y view f64 * meta view ulong 4 ws edit ulong 67334 to int
+  rc = res_ro_check_args x y meta
+  if ne rc RES_OK
+    ret rc
+  end
+  res_ro_fill_g x ws meta
+  res_ro_fill_r x y ws meta
+  ret res_ro_solve ws get meta 1 get meta 2
+end
+
+fn res_readout_extract ws view ulong 67334 meta view ulong 4 out_r edit ulong 1031 to void
+  for i ulong RES_RO_WORDS bound 1031
+    put out_r i 0
+  end
+  put out_r 0 get meta 1
+  put out_r 1 get meta 2
+  put out_r 2 get meta 3
+  n = mul add get meta 1 1 4
+  for idx ulong n bound 1028
+    if lt rem idx 4 get meta 2
+      put out_r add 3 idx get ws add RES_RWS_R_OFF idx
+    end
+  end
+end
+
+fn res_ro_apply_one r view ulong 1031 x view f64 * nf ulong o ulong to f64
+  s = bitcast f64 get r add 3 o
+  for f ulong nf bound 256
+    idx = mul add 1 f RES_RO_MAX_OUT
+    idx = add idx add 3 o
+    s = add s mul get x f bitcast f64 get r idx
+  end
+  ret s
+end
+
+fn res_readout_apply r view ulong 1031 x view f64 * y_out edit f64 * to int
+  nf = get r 0
+  no = get r 1
+  if or lt nf 1 gt nf 256
+    ret RES_ERR_PARAM
+  end
+  if or lt no 1 gt no 4
+    ret RES_ERR_PARAM
+  end
+  if or lt len x nf lt len y_out no
+    ret RES_ERR_PARAM
+  end
+  for f ulong nf bound 256
+    if not res_fin64 bitcast ulong get x f
+      ret RES_ERR_NONFINITE
+    end
+  end
+  for o ulong no bound 4
+    s = res_ro_apply_one r x nf o
+    if not res_fin64 bitcast ulong s
+      ret RES_ERR_NONFINITE
+    end
+    put y_out o s
+  end
+  ret RES_OK
+end
+
+fn res_nrmse_f64 ref view f64 * pred view f64 * out_v edit f64 1 to int
+  n = len ref
+  if or lt n 2 ne len pred n
+    ret RES_ERR_PARAM
+  end
+  sum = 0.0f64
+  for i ulong n bound 2000000
+    rv = get ref i
+    pv = get pred i
+    if or not res_fin64 bitcast ulong rv not res_fin64 bitcast ulong pv
+      ret RES_ERR_NONFINITE
+    end
+    sum = add sum rv
+  end
+  mean = div sum f64 n
+  num = 0.0f64
+  den = 0.0f64
+  for i ulong n bound 2000000
+    e = sub get ref i get pred i
+    c = sub get ref i mean
+    num = add num mul e e
+    den = add den mul c c
+  end
+  if or not res_fin64 bitcast ulong num not res_fin64 bitcast ulong den
+    ret RES_ERR_SINGULAR
+  end
+  if le den 0.0f64
+    ret RES_ERR_SINGULAR
+  end
+  put out_v 0 fsqrt div num den
+  ret RES_OK
+end

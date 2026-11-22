@@ -1,81 +1,57 @@
-# omega#440 ionic-droplet reservoir, Gate 1 (docs/reservoir/RESERVOIR_REFERENCE.md):
-# CPU simulator of the droplet-network model of Armendarez et al. (Sci. Adv.
-# 2026) plus a binary64 ridge readout. Files only under src/reservoir/ and
-# tests/reservoir/. Picked up by `-include mk/*.mk`; not part of `all` or
-# `test`. CPU only: opens no device, no CUDA, never touches the GB10.
+# omega#440 ionic-droplet reservoir, Gate 1 & Gate 2 (docs/reservoir/RESERVOIR_REFERENCE.md):
+# Pure seeded OM-2 CPU simulator of the droplet-network model of Armendarez et al.
+# (Sci. Adv. 2026) plus binary64 ridge readout, tests, and Gate 2 CLI tool.
+# Picked up by `-include mk/*.mk`; not part of `all` or `test`.
+# CPU only: opens no device, no CUDA, never touches the GB10.
 #
-# test-reservoir   purity check, then the tests plain and with ASan/UBSan
-#                  (the ASan build runs shorter oracle scenarios, -DRES_QUICK)
-# reservoir-purity the reservoir objects reference no allocator, no libm, no
-#                  file or process operation (all math goes through
-#                  omega_math_*; the readout's square root is the inline
-#                  instruction __builtin_sqrt with -fno-math-errno)
-#
-# Gate 2 (tools/reservoir/, outside the purity check: tools allocate and do I/O):
-# test-reservoir also builds res_qualify, runs the archive-reader tests on the
-#                  two committed CC-BY fixtures (plain and ASan/UBSan) and checks
-#                  that the declared configuration has not drifted from
-#                  docs/reservoir/gate2_config.json
+# test-reservoir   purity check on src/reservoir/reservoir.om, then builds and
+#                  runs test_reservoir, test_res_mat, and res_qualify via
+#                  seed/out/omc (checking docs/reservoir/gate2_config.json)
+# reservoir-purity src/reservoir/reservoir.om contains no allocator, host I/O,
+#                  socket, device, clock, or process words (after stripping
+#                  OM-2 `note` comments)
 # qualify-reservoir RES_ARCHIVE=<unpacked project-zenodo-ready_with-paper dir>
-#                  [RES_V2_RESULTS=<v2 results .mat>]: the Gate 2 comparison,
-#                  benchmarks and timing on a clean tree; writes a content-
-#                  addressed receipt under evidence/RESERVOIR/ (never overwrites)
+#                  [RES_V2_RESULTS=<v2 results .mat>]: runs qualify_reservoir.sh
 ifndef RESERVOIR_MK
 RESERVOIR_MK := 1
-.PHONY: test-reservoir reservoir-purity qualify-reservoir
-RES_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -O2 -Isrc -Isrc/reservoir -Itests/reservoir \
-	-ffp-contract=off -fno-fast-math -fno-math-errno -DOMEGA_NUMERIC_CPU_ONLY
-RES_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -DRES_QUICK
-RES_SRCS = src/reservoir/omega_reservoir.c src/reservoir/omega_reservoir_readout.c
-RES_HDRS = src/reservoir/omega_reservoir.h src/reservoir/omega_reservoir_readout.h src/omega_numeric.h src/sha256.h
-# omega_numeric.c pulls in the provenance and encoder objects at link time.
-RES_DEPS = src/omega_numeric.c src/omega_numeric_provenance.c src/omega_blackwell_encoder.c \
-	src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_blackwell_qmd.c src/omega_om_units.c
-RES_TEST_SRCS = tests/reservoir/test_reservoir.c tests/reservoir/res_oracle64.c
-RES_TEST_HDRS = tests/reservoir/res_fixtures.h tests/reservoir/res_oracle64.h
+.PHONY: test-reservoir test-res-mat reservoir-purity qualify-reservoir
+
+RES_OMC ?= seed/out/omc
 RES_DIR = $(OUT_DIR)/tests-reservoir
-RES_FORBIDDEN = ' U (malloc|calloc|realloc|free|aligned_alloc|posix_memalign|exp|expf|log|logf|pow|powf|sqrt|sqrtf|fma|fmaf|fopen|fwrite|fprintf|printf|mmap|open|fork|exec.*|dlopen|system|socket|cu[A-Z].*)$$'
-RES_TOOL_SRCS = tools/reservoir/res_qualify.c tools/reservoir/res_bench.c tools/reservoir/res_common.c \
-	tools/reservoir/res_mat.c tools/reservoir/res_inflate.c
-RES_TOOL_HDRS = tools/reservoir/res_common.h tools/reservoir/res_mat.h tools/reservoir/res_inflate.h
-RES_TOOL_CFLAGS = $(RES_CFLAGS) -Itools/reservoir -pthread
-RES_MAT_SRCS = tools/reservoir/res_mat.c tools/reservoir/res_inflate.c src/omega_om_units.c
-RES_MAT_TEST = tests/reservoir/test_res_mat.c
+RES_CORE_OM = src/reservoir/reservoir.om
+RES_MAT_OM = tools/reservoir/res_inflate.om tools/reservoir/res_mat.om
+RES_TOOL_OM = $(RES_MAT_OM) tools/reservoir/res_common.om tools/reservoir/res_bench.om tools/reservoir/res_qualify.om
+RES_TEST_OM = tests/reservoir/test_reservoir.om
+RES_MAT_TEST_OM = tests/reservoir/test_res_mat.om
 
-$(RES_DIR)/%.o: src/reservoir/%.c $(RES_HDRS)
-	@mkdir -p $(RES_DIR)
-	$(CC) $(RES_CFLAGS) -pedantic -c -o $@ $<
+# Forbidden host / allocator / I/O / device / clock / process words in pure reservoir.om
+RES_FORBIDDEN_OM = '\b(enlarge|fopen|fclose|read|write|fseek|ftell|unlink|rename|mkdir|rmdir|stat|lstat|fork|execprog|execenv|execpure|waitpid|kill|socknew|sockbind|sockconn|socklisten|sockaccept|devctl|mapnew|mapfree|monons|realns|sleepns|random|argcnt|argread|envcnt|envread|cpuset|cpuget|cpunow|setprio|getprio)\b'
 
-reservoir-purity: $(RES_DIR)/omega_reservoir.o $(RES_DIR)/omega_reservoir_readout.o
-	@if nm -u $^ | grep -E $(RES_FORBIDDEN) ; then \
-		echo "reservoir object references an allocator, libm or an I/O or process operation"; exit 1; fi
-	@echo "reservoir-purity: omega_reservoir.o and omega_reservoir_readout.o reference no forbidden symbol"
+reservoir-purity: $(RES_CORE_OM)
+	@if sed -E '/^[[:space:]]*note([[:space:]].*)?$$/d' $(RES_CORE_OM) | grep -En $(RES_FORBIDDEN_OM) ; then \
+		echo "reservoir-purity: $(RES_CORE_OM) references a forbidden host/allocator/I/O/process word"; exit 1; fi
+	@echo "reservoir-purity: $(RES_CORE_OM) is 100% pure seeded OM-2 (zero host/alloc/I/O/process words)"
 
-$(RES_DIR)/test_reservoir: $(RES_TEST_SRCS) $(RES_SRCS) $(RES_DEPS) $(RES_HDRS) $(RES_TEST_HDRS)
+$(RES_DIR)/test_reservoir: $(RES_CORE_OM) $(RES_TEST_OM)
 	@mkdir -p $(RES_DIR)
-	$(CC) $(RES_CFLAGS) -o $@ $(RES_TEST_SRCS) $(RES_SRCS) $(RES_DEPS) -lm
-$(RES_DIR)/test_reservoir_asan: $(RES_TEST_SRCS) $(RES_SRCS) $(RES_DEPS) $(RES_HDRS) $(RES_TEST_HDRS)
-	@mkdir -p $(RES_DIR)
-	$(CC) $(RES_CFLAGS) $(RES_ASAN) -o $@ $(RES_TEST_SRCS) $(RES_SRCS) $(RES_DEPS) -lm
+	cat $(RES_CORE_OM) $(RES_TEST_OM) | $(RES_OMC) > $@ && chmod +x $@
 
-$(RES_DIR)/res_qualify: $(RES_TOOL_SRCS) $(RES_TOOL_HDRS) $(RES_SRCS) $(RES_DEPS) $(RES_HDRS) $(RES_TEST_HDRS)
+$(RES_DIR)/test_res_mat: $(RES_CORE_OM) $(RES_MAT_OM) $(RES_MAT_TEST_OM)
 	@mkdir -p $(RES_DIR)
-	$(CC) $(RES_TOOL_CFLAGS) -DRES_BUILD_FLAGS='"$(strip $(RES_TOOL_CFLAGS))"' -o $@ $(RES_TOOL_SRCS) $(RES_SRCS) $(RES_DEPS) -lm
-$(RES_DIR)/test_res_mat: $(RES_MAT_TEST) $(RES_MAT_SRCS) $(RES_TOOL_HDRS) $(RES_TEST_HDRS)
-	@mkdir -p $(RES_DIR)
-	$(CC) $(RES_TOOL_CFLAGS) -o $@ $(RES_MAT_TEST) $(RES_MAT_SRCS)
-$(RES_DIR)/test_res_mat_asan: $(RES_MAT_TEST) $(RES_MAT_SRCS) $(RES_TOOL_HDRS) $(RES_TEST_HDRS)
-	@mkdir -p $(RES_DIR)
-	$(CC) $(RES_TOOL_CFLAGS) $(RES_ASAN) -o $@ $(RES_MAT_TEST) $(RES_MAT_SRCS)
+	cat $(RES_CORE_OM) $(RES_MAT_OM) $(RES_MAT_TEST_OM) | $(RES_OMC) > $@ && chmod +x $@
 
-test-reservoir: reservoir-purity $(RES_DIR)/test_reservoir $(RES_DIR)/test_reservoir_asan $(RES_DIR)/test_res_mat \
-		$(RES_DIR)/test_res_mat_asan $(RES_DIR)/res_qualify
-	./$(RES_DIR)/test_reservoir
-	./$(RES_DIR)/test_reservoir_asan
+$(RES_DIR)/res_qualify: $(RES_CORE_OM) $(RES_TOOL_OM)
+	@mkdir -p $(RES_DIR)
+	cat $(RES_CORE_OM) $(RES_TOOL_OM) | $(RES_OMC) > $@ && chmod +x $@
+
+test-res-mat: $(RES_DIR)/test_res_mat
 	./$(RES_DIR)/test_res_mat
-	./$(RES_DIR)/test_res_mat_asan
+
+test-reservoir: reservoir-purity $(RES_DIR)/test_reservoir $(RES_DIR)/test_res_mat $(RES_DIR)/res_qualify
+	./$(RES_DIR)/test_reservoir
+	./$(RES_DIR)/test_res_mat
 	./$(RES_DIR)/res_qualify config | cmp - docs/reservoir/gate2_config.json
-	@echo "test-reservoir: reservoir checks pass in plain and ASan/UBSan builds; Gate 2 config unchanged"
+	@echo "test-reservoir: pure OM-2 reservoir checks pass; Gate 2 config unchanged"
 
 qualify-reservoir:
 	@test -n "$(RES_ARCHIVE)" || { echo "qualify-reservoir: set RES_ARCHIVE=<unpacked project-zenodo-ready_with-paper dir>"; exit 2; }

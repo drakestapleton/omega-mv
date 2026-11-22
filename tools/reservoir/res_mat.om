@@ -1,0 +1,1118 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note Pure seeded OM-2 MATLAB MAT-file version 5 (little-endian) reader.
+note Replaces tools/reservoir/res_mat.{c,h}.
+note Concatenated after src/reservoir/reservoir.om and tools/reservoir/res_inflate.om.
+
+const RES_MAT_OK int 0
+const RES_MAT_ERR_IO int -1
+const RES_MAT_ERR_FORMAT int -2
+const RES_MAT_ERR_INFLATE int -3
+const RES_MAT_ERR_NOMEM int -4
+const RES_MAT_ERR_DIGEST int -5
+const RES_MAT_ERR_NOTFOUND int -6
+const RES_MAT_UNSUPPORTED int -7
+const RES_MAT_ERR_SHAPE int -8
+
+const RES_MX_CELL ulong 1
+const RES_MX_STRUCT ulong 2
+const RES_MX_OBJECT ulong 3
+const RES_MX_CHAR ulong 4
+const RES_MX_SPARSE ulong 5
+const RES_MX_DOUBLE ulong 6
+const RES_MX_SINGLE ulong 7
+const RES_MX_INT8 ulong 8
+const RES_MX_UINT8 ulong 9
+const RES_MX_INT16 ulong 10
+const RES_MX_UINT16 ulong 11
+const RES_MX_INT32 ulong 12
+const RES_MX_UINT32 ulong 13
+const RES_MX_INT64 ulong 14
+const RES_MX_UINT64 ulong 15
+const RES_MX_OPAQUE ulong 17
+
+const RES_MI_INT8 ulong 1
+const RES_MI_UINT8 ulong 2
+const RES_MI_INT16 ulong 3
+const RES_MI_UINT16 ulong 4
+const RES_MI_INT32 ulong 5
+const RES_MI_UINT32 ulong 6
+const RES_MI_SINGLE ulong 7
+const RES_MI_DOUBLE ulong 9
+const RES_MI_INT64 ulong 12
+const RES_MI_UINT64 ulong 13
+const RES_MI_MATRIX ulong 14
+const RES_MI_COMPRESSED ulong 15
+
+const RES_MAT_MAX_VARS ulong 64
+const RES_MAT_MAX_DIMS ulong 8
+const RES_MAT_MAX_NAME ulong 64
+const RES_MAT_MAX_DEPTH ulong 4
+const RES_MAT_META_STRIDE ulong 16
+note ResMatFile layout (98 ulongs):
+note [0]=file_bytes [1]=var_count [2..65]=var_idx[0..63] [66..97]=sha256 bytes(32)
+const RES_MAT_FILE_WORDS ulong 98
+
+text mat_magic "MATLAB 5.0 MAT-file"
+
+note Global pools for parsed MAT arrays and numeric data
+global mat_re f64 *
+global mat_re_used ulong 1
+global mat_re_cap ulong 1
+
+note Each array descriptor is 16 ulongs:
+note [0]=cls [1]=is_complex [2]=is_logical [3]=has_data [4]=ndims [5]=numel
+note [6]=re_off [7]=cell_off [8..15]=dims[0..7]
+global mat_meta ulong *
+global mat_meta_used ulong 1
+global mat_meta_cap ulong 1
+
+note 64 bytes per array descriptor: [0]=name_len, [1..63]=name bytes
+global mat_name uchar *
+global mat_name_cap ulong 1
+
+note Source file bytes buffer (src_id = 0); inf_out is src_id = 1
+global mat_src uchar *
+global mat_src_cap ulong 1
+
+fn res_mat_reset_pool to void
+  put mat_re_used 0 0
+  put mat_meta_used 0 0
+end
+
+fn mat_ensure_src need ulong to int
+  cap = get mat_src_cap 0
+  if le need cap
+    ret RES_MAT_OK
+  end
+  ncap = ulong 65536
+  if gt cap 0
+    ncap = cap
+  end
+  while lt ncap need bound 64
+    ncap = mul ncap 2
+  end
+  e = enlarge mat_src ncap
+  if lt e 0
+    ret RES_MAT_ERR_NOMEM
+  end
+  put mat_src_cap 0 ncap
+  ret RES_MAT_OK
+end
+
+fn mat_alloc_re n ulong out_off edit ulong 1 to int
+  used = get mat_re_used 0
+  need = add used n
+  cap = get mat_re_cap 0
+  if gt need cap
+    ncap = ulong 65536
+    if gt cap 0
+      ncap = cap
+    end
+    while lt ncap need bound 64
+      ncap = mul ncap 2
+    end
+    e = enlarge mat_re ncap
+    if lt e 0
+      ret RES_MAT_ERR_NOMEM
+    end
+    put mat_re_cap 0 ncap
+  end
+  put out_off 0 used
+  put mat_re_used 0 need
+  ret RES_MAT_OK
+end
+
+fn mat_alloc_arrs count ulong out_idx edit ulong 1 to int
+  used = get mat_meta_used 0
+  need = add used count
+  cap = get mat_meta_cap 0
+  if gt need cap
+    ncap = ulong 256
+    if gt cap 0
+      ncap = cap
+    end
+    while lt ncap need bound 64
+      ncap = mul ncap 2
+    end
+    e = enlarge mat_meta mul ncap RES_MAT_META_STRIDE
+    if lt e 0
+      ret RES_MAT_ERR_NOMEM
+    end
+    e = enlarge mat_name mul ncap RES_MAT_MAX_NAME
+    if lt e 0
+      ret RES_MAT_ERR_NOMEM
+    end
+    put mat_meta_cap 0 ncap
+    put mat_name_cap 0 mul ncap RES_MAT_MAX_NAME
+  end
+  for i ulong mul count RES_MAT_META_STRIDE bound 1000000
+    put mat_meta add mul used RES_MAT_META_STRIDE i 0
+  end
+  for i ulong mul count RES_MAT_MAX_NAME bound 1000000
+    put mat_name add mul used RES_MAT_MAX_NAME i 0
+  end
+  put out_idx 0 used
+  put mat_meta_used 0 need
+  ret RES_MAT_OK
+end
+
+fn mat_byte src uint off ulong to uchar
+  if eq src 0
+    ret get mat_src off
+  end
+  ret get inf_out off
+end
+
+fn mat_rd32 src uint off ulong to uint
+  b0 = uint mat_byte src off
+  b1 = shl uint mat_byte src add off 1 8
+  b2 = shl uint mat_byte src add off 2 16
+  b3 = shl uint mat_byte src add off 3 24
+  ret or or or b0 b1 b2 b3
+end
+
+fn mat_rd64 src uint off ulong to ulong
+  lo = ulong mat_rd32 src off
+  hi = ulong mat_rd32 src add off 4
+  ret or shl hi 32 lo
+end
+
+note tag_out: [0]=type [1]=nbytes [2]=data_off [3]=next_off
+fn mat_read_tag src uint base ulong n ulong pos ulong align bool tag_out edit ulong 4 to int
+  if or gt pos n lt sub n pos 8
+    ret RES_MAT_ERR_FORMAT
+  end
+  w0 = mat_rd32 src add base pos
+  hi = shr w0 16
+  if ne hi 0
+    if gt hi 4
+      ret RES_MAT_ERR_FORMAT
+    end
+    put tag_out 0 ulong and w0 0xffff
+    put tag_out 1 ulong hi
+    put tag_out 2 add pos 4
+    put tag_out 3 add pos 8
+    ret RES_MAT_OK
+  end
+  nbytes = ulong mat_rd32 src add base add pos 4
+  doff = add pos 8
+  if lt sub n doff nbytes
+    ret RES_MAT_ERR_FORMAT
+  end
+  eend = add doff nbytes
+  if align
+    rem8 = and eend 7
+    if ne rem8 0
+      eend = add eend sub 8 rem8
+    end
+    if gt eend n
+      eend = n
+    end
+  end
+  put tag_out 0 ulong w0
+  put tag_out 1 nbytes
+  put tag_out 2 doff
+  put tag_out 3 eend
+  ret RES_MAT_OK
+end
+
+fn mat_type_size mtype ulong to ulong
+  if or eq mtype RES_MI_INT8 eq mtype RES_MI_UINT8
+    ret 1
+  end
+  if or eq mtype RES_MI_INT16 eq mtype RES_MI_UINT16
+    ret 2
+  end
+  if or eq mtype RES_MI_INT32 or eq mtype RES_MI_UINT32 eq mtype RES_MI_SINGLE
+    ret 4
+  end
+  if or eq mtype RES_MI_DOUBLE or eq mtype RES_MI_INT64 eq mtype RES_MI_UINT64
+    ret 8
+  end
+  ret 0
+end
+
+fn mat_conv_one mtype ulong src uint off ulong out_v edit f64 1 to int
+  if eq mtype RES_MI_DOUBLE
+    put out_v 0 bitcast f64 mat_rd64 src off
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_SINGLE
+    put out_v 0 f64 bitcast f32 mat_rd32 src off
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_UINT8
+    put out_v 0 f64 mat_byte src off
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_INT8
+    v = int mat_byte src off
+    if ge v 128
+      v = sub v 256
+    end
+    put out_v 0 f64 v
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_UINT16
+    v = or ulong mat_byte src off shl ulong mat_byte src add off 1 8
+    put out_v 0 f64 v
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_INT16
+    v = int or ulong mat_byte src off shl ulong mat_byte src add off 1 8
+    if ge v 32768
+      v = sub v 65536
+    end
+    put out_v 0 f64 v
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_UINT32
+    put out_v 0 f64 mat_rd32 src off
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_INT32
+    u = ulong mat_rd32 src off
+    v = long u
+    if ge u 2147483648
+      v = sub v 4294967296
+    end
+    put out_v 0 f64 v
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_UINT64
+    u = mat_rd64 src off
+    if gt u 9007199254740992
+      ret RES_MAT_UNSUPPORTED
+    end
+    put out_v 0 f64 u
+    ret RES_MAT_OK
+  end
+  if eq mtype RES_MI_INT64
+    u = mat_rd64 src off
+    v = bitcast long u
+    if or gt v 9007199254740992 lt v -9007199254740992
+      ret RES_MAT_UNSUPPORTED
+    end
+    put out_v 0 f64 v
+    ret RES_MAT_OK
+  end
+  ret RES_MAT_ERR_FORMAT
+end
+
+fn mat_convert mtype ulong src uint off ulong numel ulong re_off ulong to int
+  sz = mat_type_size mtype
+  if eq sz 0
+    ret RES_MAT_ERR_FORMAT
+  end
+  fv = new f64 1 0.0f64
+  for i ulong numel bound 50000000
+    e = mat_conv_one mtype src add off mul i sz fv
+    if ne e RES_MAT_OK
+      ret e
+    end
+    put mat_re add re_off i get fv 0
+  end
+  ret RES_MAT_OK
+end
+
+fn mat_set_name aidx ulong src uint off ulong nbytes ulong to void
+  nl = nbytes
+  if gt nl 63
+    nl = 63
+  end
+  nb = mul aidx RES_MAT_MAX_NAME
+  put mat_name nb uchar and nl 0xff
+  for i ulong nl bound 64
+    put mat_name add nb add i 1 mat_byte src add off i
+  end
+end
+
+fn mat_parse_dims src uint base ulong nbytes ulong mb ulong to int
+  ndims = div nbytes 4
+  if or lt ndims 2 gt ndims RES_MAT_MAX_DIMS
+    ret RES_MAT_ERR_FORMAT
+  end
+  put mat_meta add mb 4 ndims
+  numel = ulong 1
+  for i ulong ndims bound 8
+    du = mat_rd32 src add base mul i 4
+    if ge du 0x80000000
+      ret RES_MAT_ERR_FORMAT
+    end
+    d = ulong du
+    put mat_meta add mb add 8 i d
+    if ne d 0
+      if gt numel div 2147483648 d
+        ret RES_MAT_ERR_FORMAT
+      end
+    end
+    numel = mul numel d
+  end
+  put mat_meta add mb 5 numel
+  ret RES_MAT_OK
+end
+
+fn mat_parse_numeric src uint base ulong n ulong pos ulong mb ulong to int
+  if ne get mat_meta add mb 1 0
+    ret RES_MAT_OK
+  end
+  tag = new ulong 4 0
+  e = mat_read_tag src base n pos true tag
+  if ne e RES_MAT_OK
+    ret e
+  end
+  numel = get mat_meta add mb 5
+  sz = mat_type_size get tag 0
+  if or eq sz 0 ne get tag 1 mul numel sz
+    ret RES_MAT_ERR_FORMAT
+  end
+  roff = new ulong 1 0
+  e = mat_alloc_re numel roff
+  if ne e RES_MAT_OK
+    ret e
+  end
+  e = mat_convert get tag 0 src add base get tag 2 numel get roff 0
+  if ne e RES_MAT_OK
+    ret e
+  end
+  put mat_meta add mb 6 get roff 0
+  put mat_meta add mb 3 1
+  ret RES_MAT_OK
+end
+
+fn mat_parse_flags src uint base ulong n ulong mb ulong tag edit ulong 4 to int
+  e = mat_read_tag src base n 0 true tag
+  if ne e RES_MAT_OK
+    ret e
+  end
+  if or ne get tag 0 RES_MI_UINT32 ne get tag 1 8
+    ret RES_MAT_ERR_FORMAT
+  end
+  flags = mat_rd32 src add base get tag 2
+  put mat_meta mb ulong and flags 0xff
+  if ne and flags 0x800 0
+    put mat_meta add mb 1 1
+  end
+  if ne and flags 0x200 0
+    put mat_meta add mb 2 1
+  end
+  ret RES_MAT_OK
+end
+
+fn mat_parse_header src uint base ulong n ulong aidx ulong pos_out edit ulong 1 to int
+  mb = mul aidx RES_MAT_META_STRIDE
+  tag = new ulong 4 0
+  e = mat_parse_flags src base n mb tag
+  if ne e RES_MAT_OK
+    ret e
+  end
+  pos = get tag 3
+  if eq get mat_meta mb RES_MX_OPAQUE
+    e = mat_read_tag src base n pos true tag
+    if ne e RES_MAT_OK
+      ret e
+    end
+    if ne get tag 0 RES_MI_INT8
+      ret RES_MAT_ERR_FORMAT
+    end
+    pos = add base get tag 2
+    mat_set_name aidx src pos get tag 1
+    put pos_out 0 0
+    ret RES_MAT_OK
+  end
+  e = mat_read_tag src base n pos true tag
+  if ne e RES_MAT_OK
+    ret e
+  end
+  if ne get tag 0 RES_MI_INT32
+    ret RES_MAT_ERR_FORMAT
+  end
+  if ne rem get tag 1 4 0
+    ret RES_MAT_ERR_FORMAT
+  end
+  pos = add base get tag 2
+  e = mat_parse_dims src pos get tag 1 mb
+  if ne e RES_MAT_OK
+    ret e
+  end
+  pos = get tag 3
+  e = mat_read_tag src base n pos true tag
+  if ne e RES_MAT_OK
+    ret e
+  end
+  if ne get tag 0 RES_MI_INT8
+    ret RES_MAT_ERR_FORMAT
+  end
+  pos = add base get tag 2
+  mat_set_name aidx src pos get tag 1
+  put pos_out 0 get tag 3
+  ret RES_MAT_OK
+end
+
+fn mat_parse_cell_elem src uint base ulong n ulong pos ulong dst_idx ulong depth ulong to long
+  tag = new ulong 4 0
+  e = mat_read_tag src base n pos true tag
+  if ne e RES_MAT_OK
+    ret long e
+  end
+  if ne get tag 0 RES_MI_MATRIX
+    ret long RES_MAT_ERR_FORMAT
+  end
+  e = mat_parse_matrix src add base get tag 2 get tag 1 dst_idx depth
+  if ne e RES_MAT_OK
+    ret long e
+  end
+  ret long get tag 3
+end
+
+fn mat_parse_cell src uint base ulong n ulong mb ulong depth ulong to int
+  numel = get mat_meta add mb 5
+  pos = get mat_meta add mb 7
+  if or gt pos n gt numel div sub n pos 8
+    ret RES_MAT_ERR_FORMAT
+  end
+  coff = new ulong 1 0
+  e = mat_alloc_arrs numel coff
+  if ne e RES_MAT_OK
+    ret e
+  end
+  cbase = get coff 0
+  put mat_meta add mb 7 cbase
+  for i ulong numel bound 1000000
+    npos = mat_parse_cell_elem src base n pos add cbase i add depth 1
+    if lt npos 0
+      ret int npos
+    end
+    pos = ulong npos
+  end
+  put mat_meta add mb 3 1
+  ret RES_MAT_OK
+end
+
+fn mat_parse_matrix src uint base ulong n ulong aidx ulong depth ulong to int
+  mb = mul aidx RES_MAT_META_STRIDE
+  if eq n 0
+    put mat_meta mb RES_MX_DOUBLE
+    put mat_meta add mb 4 2
+    put mat_meta add mb 3 1
+    ret RES_MAT_OK
+  end
+  if gt depth RES_MAT_MAX_DEPTH
+    ret RES_MAT_UNSUPPORTED
+  end
+  pout = new ulong 1 0
+  e = mat_parse_header src base n aidx pout
+  if ne e RES_MAT_OK
+    ret e
+  end
+  cls = get mat_meta mb
+  if eq cls RES_MX_OPAQUE
+    ret RES_MAT_OK
+  end
+  pos = get pout 0
+  if and ge cls RES_MX_DOUBLE le cls RES_MX_UINT64
+    ret mat_parse_numeric src base n pos mb
+  end
+  if eq cls RES_MX_CELL
+    put mat_meta add mb 7 pos
+    ret mat_parse_cell src base n mb depth
+  end
+  ret RES_MAT_OK
+end
+
+fn mat_add_element mf edit ulong 98 src uint base ulong n ulong to int
+  tag = new ulong 4 0
+  e = mat_read_tag src base n 0 true tag
+  if ne e RES_MAT_OK
+    ret e
+  end
+  if ne get tag 0 RES_MI_MATRIX
+    ret RES_MAT_ERR_FORMAT
+  end
+  vc = get mf 1
+  if ge vc RES_MAT_MAX_VARS
+    ret RES_MAT_UNSUPPORTED
+  end
+  aoff = new ulong 1 0
+  e = mat_alloc_arrs 1 aoff
+  if ne e RES_MAT_OK
+    ret e
+  end
+  aidx = get aoff 0
+  put mf add 2 vc aidx
+  put mf 1 add vc 1
+  ret mat_parse_matrix src add base get tag 2 get tag 1 aidx 0
+end
+
+note Inflate directly from global mat_src[in_off .. in_off + in_len)
+fn inf_getbits_src need ulong val_out edit uint 1 to int
+  if eq need 0
+    put val_out 0 0
+    ret RES_INF_OK
+  end
+  v = get inf_st 3
+  bc = get inf_st 4
+  pos = get inf_st 2
+  iend = get inf_st 1
+  while lt bc need bound 8
+    if ge pos iend
+      ret RES_INF_ERR_TRUNC
+    end
+    b = ulong get mat_src pos
+    v = or v shl b bc
+    pos = add pos 1
+    bc = add bc 8
+  end
+  mask = sub shl ulong 1 need 1
+  put val_out 0 uint and v mask
+  put inf_st 2 pos
+  put inf_st 3 shr v need
+  put inf_st 4 sub bc need
+  ret RES_INF_OK
+end
+
+fn inf_stored_src to int
+  put inf_st 3 0
+  put inf_st 4 0
+  pos = get inf_st 2
+  iend = get inf_st 1
+  if lt sub iend pos 4
+    ret RES_INF_ERR_TRUNC
+  end
+  blen = or ulong get mat_src pos shl ulong get mat_src add pos 1 8
+  nlen = or ulong get mat_src add pos 2 shl ulong get mat_src add pos 3 8
+  if ne blen and xor nlen 0xffff 0xffff
+    ret RES_INF_ERR_BLOCK
+  end
+  pos = add pos 4
+  if lt sub iend pos blen
+    ret RES_INF_ERR_TRUNC
+  end
+  for i ulong blen bound 65536
+    e = inf_put get mat_src add pos i
+    if ne e RES_INF_OK
+      ret e
+    end
+  end
+  put inf_st 2 add pos blen
+  ret RES_INF_OK
+end
+
+fn inf_decode_lc_src use_fix bool sym_out edit int 1 to int
+  code = int 0
+  first = int 0
+  index = int 0
+  bv = new uint 1 0
+  for l ulong 15 bound 15
+    e = inf_getbits_src 1 bv
+    if ne e RES_INF_OK
+      ret e
+    end
+    code = or code int get bv 0
+    cnt = get inf_lc_cnt add l 1
+    if use_fix
+      cnt = get inf_fix_lc_cnt add l 1
+    end
+    if lt sub code cnt first
+      si = ulong add index sub code first
+      if use_fix
+        put sym_out 0 get inf_fix_lc_sym si
+      else
+        put sym_out 0 get inf_lc_sym si
+      end
+      ret RES_INF_OK
+    end
+    index = add index cnt
+    first = shl add first cnt 1
+    code = shl code 1
+  end
+  ret RES_INF_ERR_CODES
+end
+
+fn inf_decode_dc_src use_fix bool sym_out edit int 1 to int
+  code = int 0
+  first = int 0
+  index = int 0
+  bv = new uint 1 0
+  for l ulong 15 bound 15
+    e = inf_getbits_src 1 bv
+    if ne e RES_INF_OK
+      ret e
+    end
+    code = or code int get bv 0
+    cnt = get inf_dc_cnt add l 1
+    if use_fix
+      cnt = get inf_fix_dc_cnt add l 1
+    end
+    if lt sub code cnt first
+      si = ulong add index sub code first
+      if use_fix
+        put sym_out 0 get inf_fix_dc_sym si
+      else
+        put sym_out 0 get inf_dc_sym si
+      end
+      ret RES_INF_OK
+    end
+    index = add index cnt
+    first = shl add first cnt 1
+    code = shl code 1
+  end
+  ret RES_INF_ERR_CODES
+end
+
+fn inf_codes_src use_fix bool to int
+  sv = new int 1 0
+  xv = new uint 1 0
+  while true bound 500000000
+    e = inf_decode_lc_src use_fix sv
+    if ne e RES_INF_OK
+      ret e
+    end
+    sym = get sv 0
+    if lt sym 256
+      e = inf_put uchar and sym 0xff
+      if ne e RES_INF_OK
+        ret e
+      end
+      continue
+    end
+    if eq sym 256
+      ret RES_INF_OK
+    end
+    sym = sub sym 257
+    if or lt sym 0 ge sym 29
+      ret RES_INF_ERR_SYMBOL
+    end
+    e = inf_getbits_src inf_lext ulong sym xv
+    if ne e RES_INF_OK
+      ret e
+    end
+    mlen = add inf_lbase ulong sym ulong get xv 0
+    e = inf_decode_dc_src use_fix sv
+    if ne e RES_INF_OK
+      ret e
+    end
+    dsym = get sv 0
+    if or lt dsym 0 ge dsym 30
+      ret RES_INF_ERR_SYMBOL
+    end
+    e = inf_getbits_src inf_dext ulong dsym xv
+    if ne e RES_INF_OK
+      ret e
+    end
+    dist = add inf_dbase ulong dsym ulong get xv 0
+    e = inf_copy_match mlen dist
+    if ne e RES_INF_OK
+      ret e
+    end
+  end
+  ret RES_INF_ERR_BLOCK
+end
+
+fn inf_dynamic_read_lens_src total ulong to int
+  idx = ulong 0
+  sv = new int 1 0
+  xv = new uint 1 0
+  while lt idx total bound 400
+    e = inf_decode_lc_src false sv
+    if ne e RES_INF_OK
+      ret e
+    end
+    sym = get sv 0
+    if lt sym 16
+      put inf_lengths idx sym
+      idx = add idx 1
+      continue
+    end
+    lv = int 0
+    rep = ulong 0
+    if eq sym 16
+      if eq idx 0
+        ret RES_INF_ERR_CODES
+      end
+      lv = get inf_lengths sub idx 1
+      e = inf_getbits_src 2 xv
+      if ne e RES_INF_OK
+        ret e
+      end
+      rep = add 3 ulong get xv 0
+    else
+      if eq sym 17
+        e = inf_getbits_src 3 xv
+        if ne e RES_INF_OK
+          ret e
+        end
+        rep = add 3 ulong get xv 0
+      else
+        e = inf_getbits_src 7 xv
+        if ne e RES_INF_OK
+          ret e
+        end
+        rep = add 11 ulong get xv 0
+      end
+    end
+    if gt add idx rep total
+      ret RES_INF_ERR_CODES
+    end
+    for r ulong rep bound 140
+      put inf_lengths idx lv
+      idx = add idx 1
+    end
+  end
+  ret RES_INF_OK
+end
+
+fn inf_dynamic_src to int
+  xv = new uint 1 0
+  e = inf_getbits_src 5 xv
+  if ne e RES_INF_OK
+    ret e
+  end
+  nlen = add ulong get xv 0 257
+  e = inf_getbits_src 5 xv
+  if ne e RES_INF_OK
+    ret e
+  end
+  ndist = add ulong get xv 0 1
+  e = inf_getbits_src 4 xv
+  if ne e RES_INF_OK
+    ret e
+  end
+  ncode = add ulong get xv 0 4
+  if or gt nlen 286 gt ndist 30
+    ret RES_INF_ERR_CODES
+  end
+  for i ulong 19 bound 19
+    put inf_lengths i 0
+  end
+  for i ulong ncode bound 19
+    e = inf_getbits_src 3 xv
+    if ne e RES_INF_OK
+      ret e
+    end
+    put inf_lengths inf_order i int get xv 0
+  end
+  if ne inf_construct_lc 0 19 0
+    ret RES_INF_ERR_CODES
+  end
+  e = inf_dynamic_read_lens_src add nlen ndist
+  if ne e RES_INF_OK
+    ret e
+  end
+  if eq get inf_lengths 256 0
+    ret RES_INF_ERR_CODES
+  end
+  e = inf_construct_lc 0 nlen
+  if ne e 0
+    if or lt e 0 ne int nlen add get inf_lc_cnt 0 get inf_lc_cnt 1
+      ret RES_INF_ERR_CODES
+    end
+  end
+  e = inf_construct_dc nlen ndist
+  if ne e 0
+    if or lt e 0 ne int ndist add get inf_dc_cnt 0 get inf_dc_cnt 1
+      ret RES_INF_ERR_CODES
+    end
+  end
+  ret inf_codes_src false
+end
+
+fn inf_check_adler_src in_off ulong to int
+  pos = get inf_st 2
+  iend = get inf_st 1
+  if lt sub iend pos 4
+    ret RES_INF_ERR_TRUNC
+  end
+  want = shl uint get mat_src pos 24
+  want = or want shl uint get mat_src add pos 1 16
+  want = or want shl uint get mat_src add pos 2 8
+  want = or want uint get mat_src add pos 3
+  got = res_adler32_inf_out get inf_out_len 0
+  if ne got want
+    ret RES_INF_ERR_ADLER
+  end
+  put inf_consumed 0 sub add pos 4 in_off
+  ret RES_INF_OK
+end
+
+fn res_zlib_inflate_src in_off ulong in_len ulong to int
+  put inf_out_len 0 0
+  put inf_consumed 0 0
+  if lt in_len 2
+    ret RES_INF_ERR_TRUNC
+  end
+  cmf = uint get mat_src in_off
+  flg = uint get mat_src add in_off 1
+  if or ne and cmf 0x0f 8 gt shr cmf 4 7
+    ret RES_INF_ERR_HEADER
+  end
+  if ne rem or shl cmf 8 flg 31 0
+    ret RES_INF_ERR_HEADER
+  end
+  if ne and flg 0x20 0
+    ret RES_INF_ERR_HEADER
+  end
+  put inf_st 0 in_off
+  put inf_st 1 add in_off in_len
+  put inf_st 2 add in_off 2
+  put inf_st 3 0
+  put inf_st 4 0
+  last = uint 0
+  btype = new uint 1 0
+  lv = new uint 1 0
+  while eq last 0 bound 1000000
+    e = inf_getbits_src 1 lv
+    if ne e RES_INF_OK
+      ret e
+    end
+    last = get lv 0
+    e = inf_getbits_src 2 btype
+    if ne e RES_INF_OK
+      ret e
+    end
+    bt = get btype 0
+    if eq bt 0
+      e = inf_stored_src
+    else
+      if eq bt 1
+        inf_build_fixed
+        e = inf_codes_src true
+      else
+        if eq bt 2
+          e = inf_dynamic_src
+        else
+          e = RES_INF_ERR_BLOCK
+        end
+      end
+    end
+    if ne e RES_INF_OK
+      ret e
+    end
+  end
+  put inf_st 3 0
+  put inf_st 4 0
+  ret inf_check_adler_src in_off
+end
+
+fn res_mat_parse_src n ulong mf edit ulong 98 to int
+  put mf 1 0
+  if lt n 128
+    ret RES_MAT_ERR_FORMAT
+  end
+  if or ne get mat_src 126 uchar 73 ne get mat_src 127 uchar 77
+    ret RES_MAT_UNSUPPORTED
+  end
+  if or ne get mat_src 124 uchar 0 ne get mat_src 125 uchar 1
+    ret RES_MAT_ERR_FORMAT
+  end
+  for i ulong 19 bound 19
+    if ne get mat_src i get mat_magic i
+      ret RES_MAT_ERR_FORMAT
+    end
+  end
+  pos = ulong 128
+  tag = new ulong 4 0
+  while lt pos n bound 100000
+    e = mat_read_tag 0 0 n pos false tag
+    if ne e RES_MAT_OK
+      ret e
+    end
+    tp = get tag 0
+    if eq tp RES_MI_COMPRESSED
+      z = res_zlib_inflate_src get tag 2 get tag 1
+      if ne z RES_INF_OK
+        ret RES_MAT_ERR_INFLATE
+      end
+      if ne get inf_consumed 0 get tag 1
+        ret RES_MAT_ERR_FORMAT
+      end
+      e = mat_add_element mf 1 0 get inf_out_len 0
+      if ne e RES_MAT_OK
+        ret e
+      end
+      pos = add get tag 2 get tag 1
+    else
+      if eq tp RES_MI_MATRIX
+        e = mat_add_element mf 0 pos sub n pos
+        if ne e RES_MAT_OK
+          ret e
+        end
+        eend = add get tag 2 get tag 1
+        rem8 = and eend 7
+        if ne rem8 0
+          eend = add eend sub 8 rem8
+        end
+        pos = eend
+      else
+        ret RES_MAT_ERR_FORMAT
+      end
+    end
+  end
+  ret RES_MAT_OK
+end
+
+fn res_mat_parse bytes view uchar * n ulong mf edit ulong 98 to int
+  e = mat_ensure_src n
+  if ne e RES_MAT_OK
+    ret e
+  end
+  for i ulong n bound 200000000
+    put mat_src i get bytes i
+  end
+  put mf 0 n
+  ret res_mat_parse_src n mf
+end
+
+fn mat_copy_src_chunk pos ulong k ulong chunk edit uchar 4096 to void
+  for i ulong k bound 4096
+    put chunk i get mat_src add pos i
+  end
+end
+
+fn mat_hash_src n ulong out_d edit uchar 32 to void
+  ctx = new uint 74 0
+  res_sha_init ctx
+  chunk = new uchar 4096 0
+  pos = ulong 0
+  while lt pos n bound 100000
+    k = sub n pos
+    if gt k 4096
+      k = 4096
+    end
+    mat_copy_src_chunk pos k chunk
+    res_sha_update ctx part chunk 0 k
+    pos = add pos k
+  end
+  res_sha_final ctx out_d
+end
+
+fn mat_copy_chunk_to_src total ulong nru ulong chunk view uchar 65536 to void
+  for i ulong nru bound 65536
+    put mat_src add total i get chunk i
+  end
+end
+
+fn mat_read_file_to_src path view uchar * total_out edit ulong 1 to int
+  fd = fopen path 0 len path 0 0
+  if lt fd 0
+    ret RES_MAT_ERR_IO
+  end
+  total = ulong 0
+  chunk = new uchar 65536 0
+  while true bound 100000
+    nr = read int fd chunk 0 65536
+    if lt nr 0
+      _fc = fclose int fd
+      ret RES_MAT_ERR_IO
+    end
+    if eq nr 0
+      break
+    end
+    nru = ulong nr
+    e = mat_ensure_src add total nru
+    if ne e RES_MAT_OK
+      _fc = fclose int fd
+      ret e
+    end
+    mat_copy_chunk_to_src total nru view chunk
+    total = add total nru
+  end
+  _fc = fclose int fd
+  put total_out 0 total
+  ret RES_MAT_OK
+end
+
+fn res_mat_load path view uchar * want_sha view uchar 32 check_sha bool mf edit ulong 98 to int
+  for i ulong RES_MAT_FILE_WORDS bound 98
+    put mf i 0
+  end
+  tout = new ulong 1 0
+  e = mat_read_file_to_src path tout
+  if ne e RES_MAT_OK
+    ret e
+  end
+  total = get tout 0
+  put mf 0 total
+  dig = new uchar 32 0
+  mat_hash_src total dig
+  for i ulong 32 bound 32
+    put mf add 66 i ulong get dig i
+  end
+  if check_sha
+    for i ulong 32 bound 32
+      if ne get dig i get want_sha i
+        ret RES_MAT_ERR_DIGEST
+      end
+    end
+  end
+  ret res_mat_parse_src total mf
+end
+
+fn mat_name_eq aidx ulong name view uchar * to bool
+  nb = mul aidx RES_MAT_MAX_NAME
+  nlen = len name
+  if ne ulong get mat_name nb nlen
+    ret false
+  end
+  for k ulong nlen bound 64
+    if ne get mat_name add nb add k 1 get name k
+      ret false
+    end
+  end
+  ret true
+end
+
+note Returns array index (>= 0) or -1 if not found.
+fn res_mat_find mf view ulong 98 name view uchar * to long
+  vc = get mf 1
+  for i ulong vc bound 64
+    aidx = get mf add 2 i
+    if mat_name_eq aidx name
+      ret long aidx
+    end
+  end
+  ret -1
+end
+
+fn res_mat_cell_at cidx long sub_arr view ulong * cnt ulong to long
+  if lt cidx 0
+    ret -1
+  end
+  mb = mul ulong cidx RES_MAT_META_STRIDE
+  if or ne get mat_meta mb RES_MX_CELL eq get mat_meta add mb 3 0
+    ret -1
+  end
+  if ne cnt get mat_meta add mb 4
+    ret -1
+  end
+  idx = ulong 0
+  stride = ulong 1
+  for i ulong cnt bound 8
+    d = get mat_meta add mb add 8 i
+    si = get sub_arr i
+    if ge si d
+      ret -1
+    end
+    idx = add idx mul si stride
+    stride = mul stride d
+  end
+  ret long add get mat_meta add mb 7 idx
+end
+
+fn res_mat_values aidx long want_numel ulong out_off edit ulong 1 to int
+  if lt aidx 0
+    ret RES_MAT_ERR_NOTFOUND
+  end
+  mb = mul ulong aidx RES_MAT_META_STRIDE
+  cls = get mat_meta mb
+  if or lt cls RES_MX_DOUBLE or gt cls RES_MX_UINT64 eq get mat_meta add mb 3 0
+    ret RES_MAT_UNSUPPORTED
+  end
+  if and ne want_numel 0 ne get mat_meta add mb 5 want_numel
+    ret RES_MAT_ERR_SHAPE
+  end
+  put out_off 0 get mat_meta add mb 6
+  ret RES_MAT_OK
+end
