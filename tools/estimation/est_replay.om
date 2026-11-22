@@ -1,0 +1,3248 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/estimation/est_replay.om -- EST-2/EST-3 shared replay, file I/O,
+note formatting, parsing, SHA-256 verification, Run B / held-out guards,
+note parameter v1/v2 I/O, and EM mixture fitting in pure seeded OM-2.
+note Composed after: est_defs.om est_math.om est_types.om est_kf.om est_mix.om.
+
+const EST_BURN_IN ulong 30
+const EST_NQ ulong 19
+const EST_NR ulong 25
+const EST_NS long 1000000000
+const EST_M2_R f64 1.0e-12
+const EST_M2_FLOOR f64 833.3333333333334
+const EST_M2_K ulong 3
+const EST_M2_ITERS ulong 1000
+
+const EF_MAX_BYTES ulong 2097152
+const EF_MAX_LINES ulong 16384
+const RP_MAX_STEPS ulong 8192
+const RP_SLOTS ulong 4
+
+text t_er_proto_commit "f96dc97"
+text t_er_run_a_id "20260929T020536Z-ad8e1f2ea4e4-silicon"
+text t_er_run_b_id "3e9e53be3358"
+text t_er_run_a_sha "6df4a2b079482b79c42da84da5627b6a8fb9c7d3ce885aac53437b0199d517db"
+text t_er_proto_doc_sha "dbd2a407a8cf12d353f9abff5d26985fb2f9d96f6d33872896169082c6082676"
+text t_er_source_text "R15.machine-state.thermal_mc[0]"
+text t_er_run_b_raw_sha "91a5fe34225926cd7aca2fca4be5ed51dc0772341a2fda5f9a39d0f72b8a6bb5"
+text t_er_run_b_marks_sha "d2dcc89fb1f9bfff15e1dce6be5248ba6f285cfe1fb7dd051c09764aec844d04"
+
+text t_er_v2_fit_tag "-est3b-fit-"
+text t_er_v2_heldout_tag "-est3b-heldout-"
+text t_er_v2_fit_sha "65252bae5f9d49d30a3b334fd2b9444c36db7627a45fcd9b6ef0bb4e5a7e5716"
+text t_er_v2_ho_raw_sha "pending"
+text t_er_v2_ho_marks_sha "pending"
+text t_er_v2_pdoc_sha "86b7b46f02dd6e51db78cc9f450aac27be189cdb1484894e923a1898429536f5"
+text t_er_v2_pdoc "docs/estimation/EST23_PROTOCOL_V2.md"
+
+text t_er_hex "0123456789abcdef"
+text t_er_env_b_id "EST_TEST_B_ID"
+text t_er_env_b_raw "EST_TEST_B_RAW_SHA"
+text t_er_env_b_mks "EST_TEST_B_MARKS_SHA"
+text t_er_sums_suf "/SHA256SUMS"
+text t_er_t_pre "{\"t\":"
+text t_er_th_key "\"thermal_mc\":\""
+text t_er_null "null"
+text t_er_nan "nan"
+text t_er_inf "inf"
+text t_er_ninf "-inf"
+text t_er_binsh "/bin/sh"
+text t_er_dashc "-c"
+text t_er_path_env "PATH=/usr/local/bin:/usr/bin:/bin"
+text t_er_err_long ": path too long"
+text t_er_err_ho ": resolves into the held-out run; only est_eval --protocol-v2 --recorded may open it"
+text t_er_err_rb ": resolves into run B; only est_eval --recorded may open run B"
+text t_er_err_nosums ": no SHA256SUMS line for "
+text t_er_err_rbsum ": SHA256SUMS names run B's digest; refused before opening"
+text t_er_err_mism "SHA-256 mismatch for "
+text t_er_err_rbcon ": content is run B; refused"
+text t_er_err_open "cannot open "
+text t_er_p1_hdr "est_params_v1"
+text t_er_p1_pc "protocol_commit f96dc97"
+text t_er_p1_fp "fit_run_path "
+text t_er_p1_fs "fit_file_sha256 "
+text t_er_p1_fl "fit_lines "
+text t_er_p2_hdr "est_params_v2"
+text t_er_p2_v1p "v1_params_path "
+text t_er_p2_v1s "v1_params_sha256 "
+text t_er_p2_fc "fit_changes "
+text t_er_pw_q " q "
+text t_er_pw_r " r "
+text t_er_pw_ll " loglik "
+text t_er_pw_k " k "
+text t_er_pw_w " w "
+text t_er_pw_v " v "
+
+text t_er_st_m "M"
+text t_er_st_ln " line="
+text t_er_st_l " L="
+text t_er_st_pr " prior"
+text t_er_st_co " coast"
+text t_er_st_ob " obs"
+text t_er_st_t " t_ns="
+text t_er_st_h " h="
+text t_er_st_z " z="
+text t_er_st_y " y="
+text t_er_st_S " S="
+text t_er_st_nu " nu="
+text t_er_st_nis " nis="
+text t_er_st_od " obs="
+text t_er_st_pd " pred="
+text t_er_st_id " innov="
+text t_er_st_bd " belief="
+
+note ---- Buffered output globals ----
+global g_ob_buf uchar 65536
+global g_ob_len ulong 1
+global g_ob_fd int 1
+global g_ob_err ulong 1
+
+note ---- Guard flags ----
+global g_er_test_build ulong 1
+global g_er_allow_run_b ulong 1
+global g_er_allow_heldout ulong 1
+
+note ---- est_file storage (2 slots) ----
+global g_ef_data uchar 4194304
+global g_ef_off ulong 32768
+global g_ef_llen ulong 32768
+global g_ef_len ulong 2
+global g_ef_nlines ulong 2
+global g_ef_path uchar 2048
+global g_ef_plen ulong 2
+global g_ef_sha uchar 130
+
+note ---- est_replay storage (4 slots x 8192 steps) ----
+global g_rp_meta ulong 64
+global g_rp_mdl ulong 1120
+global g_rp_mdig uchar 128
+global g_rp_err uchar 640
+global g_rp_elen ulong 4
+
+global g_rps_line ulong 32768
+global g_rps_L ulong 32768
+global g_rps_flags ulong 32768
+global g_rps_wall long 32768
+global g_rps_tns long 32768
+global g_rps_hor ulong 32768
+global g_rps_z f64 32768
+global g_rps_ym f64 32768
+global g_rps_S f64 32768
+global g_rps_nu f64 32768
+global g_rps_nis f64 32768
+global g_rps_pgen ulong 32768
+global g_rps_ptns long 32768
+global g_rps_px f64 65536
+global g_rps_pP f64 131072
+global g_rps_dig ulong 655360
+
+note ---- Replay work buffers ----
+global g_rp_cur_mdl ulong 280
+global g_rp_cur_bel ulong 96
+global g_rp_cur_pred ulong 176
+global g_rp_cur_post ulong 96
+global g_rp_cur_src uchar 32
+global g_rp_cur_ev uchar 32
+global g_rp_cur_pd uchar 32
+global g_rp_line_buf uchar 8192
+
+note ---- Params v1 globals ----
+global g_ep1_path uchar 1024
+global g_ep1_plen ulong 1
+global g_ep1_sha uchar 65
+global g_ep1_lines ulong 1
+global g_ep1_q f64 2
+global g_ep1_r f64 2
+global g_ep1_ll f64 2
+
+note ---- Params v2 globals ----
+global g_ep2_v1p uchar 1024
+global g_ep2_v1pl ulong 1
+global g_ep2_v1s uchar 65
+global g_ep2_fp uchar 1024
+global g_ep2_fpl ulong 1
+global g_ep2_fs uchar 65
+global g_ep2_flines ulong 1
+global g_ep2_fn ulong 1
+global g_ep2_q f64 1
+global g_ep2_r f64 1
+global g_ep2_ll f64 1
+global g_ep2_mk ulong 1
+global g_ep2_mw f64 3
+global g_ep2_mv f64 3
+
+note ---- EM data global (shared for fit_em up to 32768 samples) ----
+global g_em_e f64 32768
+
+note ---- Scratch for sha_file / realpath / env / sh / err ----
+global g_er_io uchar 65536
+global g_er_env uchar 4096
+global g_er_rp1 uchar 4096
+global g_er_rp2 uchar 4096
+global g_er_rp3 uchar 4096
+global g_er_pkt uchar 16384
+global g_er_epkt uchar 512
+global g_er_err uchar 300
+global g_er_elen ulong 1
+
+note ---- String & byte helpers ----
+
+fn er_eq a view uchar * na ulong b view uchar * nb ulong to bool
+  if ne na nb
+    ret false
+  end
+  for i ulong na
+    if ne get a i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn er_startswith a view uchar * na ulong b view uchar * nb ulong to bool
+  if lt na nb
+    ret false
+  end
+  for i ulong nb
+    if ne get a i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn er_io_eq_at off ulong b view uchar * nb ulong to bool
+  for i ulong nb
+    if ne get g_er_io add off i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn er_find a view uchar * na ulong b view uchar * nb ulong to long
+  if eq nb 0
+    ret 0
+  end
+  if lt na nb
+    ret -1
+  end
+  lim = add sub na nb 1
+  for i ulong lim
+    ok = true
+    for j ulong nb
+      if ne get a add i j get b j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn er_find_from a view uchar * off ulong lim ulong b view uchar * to long
+  nb = len b
+  if eq nb 0
+    ret long off
+  end
+  if lt lim add off nb
+    ret -1
+  end
+  end_i = add sub lim nb 1
+  i = off
+  while lt i end_i bound 2097152
+    ok = true
+    for j ulong nb
+      if ne get a add i j get b j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret long i
+    end
+    i = add i 1
+  end
+  ret -1
+end
+
+fn er_rfind_byte a view uchar * na ulong ch uchar to long
+  res = long -1
+  for i ulong na
+    if eq get a i ch
+      res = long i
+    end
+  end
+  ret res
+end
+
+fn er_copy0 dst edit uchar * src view uchar * n ulong to void
+  for i ulong n
+    put dst i get src i
+  end
+end
+
+fn er_hex_encode d view uchar * n ulong dst edit uchar * to void
+  for i ulong n
+    b = ulong get d i
+    put dst mul i 2 get t_er_hex shr b 4
+    put dst add mul i 2 1 get t_er_hex and b 15
+  end
+end
+
+fn er_is_hex64 s view uchar * n ulong to bool
+  if ne n 64
+    ret false
+  end
+  for i ulong 64
+    c = get s i
+    d = and ge c 48 le c 57
+    h = and ge c 97 le c 102
+    if not or d h
+      ret false
+    end
+  end
+  ret true
+end
+
+fn er_io_is_hex64 off ulong to bool
+  for i ulong 64
+    c = get g_er_io add off i
+    d = and ge c 48 le c 57
+    h = and ge c 97 le c 102
+    if not or d h
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- Buffered output ----
+
+fn ob_flush to void
+  n = get g_ob_len 0
+  if eq n 0
+    ret
+  end
+  fd = get g_ob_fd 0
+  off = ulong 0
+  while lt off n bound 65536
+    k = write fd g_ob_buf off sub n off
+    if le k 0
+      put g_ob_err 0 1
+      break
+    end
+    off = add off ulong k
+  end
+  put g_ob_len 0 0
+end
+
+fn ob_init fd int to void
+  put g_ob_fd 0 fd
+  put g_ob_len 0 0
+  put g_ob_err 0 0
+end
+
+fn ob_c c uchar to void
+  n = get g_ob_len 0
+  if ge n 65536
+    ob_flush
+    n = get g_ob_len 0
+  end
+  put g_ob_buf n c
+  put g_ob_len 0 add n 1
+end
+
+fn ob_s s view uchar * n ulong to void
+  for i ulong n
+    ob_c get s i
+  end
+end
+
+fn ob_slice s view uchar * off ulong n ulong to void
+  for i ulong n
+    ob_c get s add off i
+  end
+end
+
+fn ob_t s view uchar * to void
+  ob_s s len s
+end
+
+fn ob_nl to void
+  ob_c 10
+end
+
+fn ob_u v ulong to void
+  if eq v 0
+    ob_c 48
+    ret
+  end
+  buf = new uchar 24 0
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put buf n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  i = n
+  while gt i 0 bound 24
+    i = sub i 1
+    ob_c get buf i
+  end
+end
+
+fn ob_i v long to void
+  if lt v 0
+    ob_c 45
+    if eq v long -9223372036854775808
+      ob_u ulong 9223372036854775808
+      ret
+    end
+    ob_u ulong sub 0 v
+    ret
+  end
+  ob_u ulong v
+end
+
+fn ob_u_pad v ulong width ulong to void
+  buf = new uchar 24 0
+  n = ulong 0
+  x = v
+  if eq x 0
+    put buf 0 48
+    n = 1
+  else
+    while gt x 0 bound 24
+      put buf n uchar add 48 rem x 10
+      x = div x 10
+      n = add n 1
+    end
+  end
+  while lt n width bound 24
+    put buf n 48
+    n = add n 1
+  end
+  i = n
+  while gt i 0 bound 24
+    i = sub i 1
+    ob_c get buf i
+  end
+end
+
+fn ob_fix_frac fp0 ulong scu ulong nd ulong to void
+  ob_c 46
+  fp = fp0
+  dp = div scu 10
+  for i ulong nd
+    ob_c uchar add 48 div fp dp
+    fp = rem fp dp
+    if gt dp 1
+      dp = div dp 10
+    end
+  end
+end
+
+fn ob_fix v f64 nd ulong to void
+  if est_isnan v
+    ob_t t_er_nan
+    ret
+  end
+  if est_isinf v
+    if lt v f64 0.0
+      ob_c 45
+    end
+    ob_t t_er_inf
+    ret
+  end
+  x = v
+  if lt x f64 0.0
+    ob_c 45
+    x = sub f64 0.0 x
+  end
+  sc = f64 1.0
+  for i ulong nd
+    sc = mul sc f64 10.0
+  end
+  scu = ulong sc
+  if lt x f64 1.0e12
+    tot = ulong add mul x sc f64 0.5
+    ob_u div tot scu
+    if gt nd 0
+      ob_fix_frac rem tot scu scu nd
+    end
+  else
+    ob_u ulong add x f64 0.5
+    if gt nd 0
+      ob_c 46
+      for i ulong nd
+        ob_c 48
+      end
+    end
+  end
+end
+
+fn ob_g17_scale x f64 out_e edit long 1 to f64
+  m = x
+  e = long 0
+  while ge m f64 1.0e16 bound 30
+    m = div m f64 1.0e16
+    e = add e 16
+  end
+  while ge m f64 1.0e4 bound 10
+    m = div m f64 1.0e4
+    e = add e 4
+  end
+  while ge m f64 10.0 bound 10
+    m = div m f64 10.0
+    e = add e 1
+  end
+  while lt m f64 1.0e-15 bound 30
+    m = mul m f64 1.0e16
+    e = sub e 16
+  end
+  while lt m f64 1.0e-3 bound 10
+    m = mul m f64 1.0e4
+    e = sub e 4
+  end
+  while lt m f64 1.0 bound 10
+    m = mul m f64 10.0
+    e = sub e 1
+  end
+  put out_e 0 e
+  ret m
+end
+
+fn ob_g17_emit_sci digs view uchar 20 nd ulong e long to void
+  ob_c get digs 0
+  if gt nd 1
+    ob_c 46
+    for i ulong sub nd 1
+      ob_c get digs add i 1
+    end
+  end
+  ob_c 101
+  if lt e 0
+    ob_c 45
+    ob_u_pad ulong sub 0 e 2
+  else
+    ob_c 43
+    ob_u_pad ulong e 2
+  end
+end
+
+fn ob_g17_emit_fix digs view uchar 20 nd ulong e long to void
+  if lt e 0
+    ob_c 48
+    ob_c 46
+    z = ulong sub sub 0 e 1
+    for i ulong z
+      ob_c 48
+    end
+    for i ulong nd
+      ob_c get digs i
+    end
+    ret
+  end
+  ip = add ulong e 1
+  if ge ip nd
+    for i ulong nd
+      ob_c get digs i
+    end
+    for i ulong sub ip nd
+      ob_c 48
+    end
+    ret
+  end
+  for i ulong ip
+    ob_c get digs i
+  end
+  ob_c 46
+  for i ulong sub nd ip
+    ob_c get digs add ip i
+  end
+end
+
+fn ob_g17_pos x f64 to void
+  eo = new long 1 0
+  digs = new uchar 20 0
+  m = ob_g17_scale x eo
+  e = get eo 0
+  m8 = mul m f64 1.0e8
+  hi = ulong m8
+  lo = ulong add mul sub m8 f64 hi f64 1.0e8 f64 0.5
+  d = add mul hi 100000000 lo
+  if ge d ulong 100000000000000000
+    d = div d 10
+    e = add e 1
+  end
+  i = ulong 17
+  while gt i 0 bound 20
+    i = sub i 1
+    r = rem d 10
+    put digs i uchar add 48 r
+    d = div d 10
+  end
+  nd = ulong 17
+  while gt nd 1 bound 20
+    if ne get digs sub nd 1 48
+      break
+    end
+    nd = sub nd 1
+  end
+  if and ge e -4 lt e 17
+    ob_g17_emit_fix view digs nd e
+  else
+    ob_g17_emit_sci view digs nd e
+  end
+end
+
+fn ob_g17 v f64 to void
+  if est_isnan v
+    ob_t t_er_nan
+    ret
+  end
+  if est_isinf v
+    if lt v f64 0.0
+      ob_t t_er_ninf
+    else
+      ob_t t_er_inf
+    end
+    ret
+  end
+  if eq v f64 0.0
+    if ne shr bitcast ulong v 63 0
+      ob_c 45
+    end
+    ob_c 48
+    ret
+  end
+  if lt v f64 0.0
+    ob_c 45
+    ob_g17_pos sub f64 0.0 v
+    ret
+  end
+  ob_g17_pos v
+end
+
+fn ob_json_num v f64 to void
+  if est_isfinite v
+    ob_g17 v
+  else
+    ob_t t_er_null
+  end
+end
+
+fn ob_json_str s view uchar * n ulong to void
+  ob_c 34
+  for i ulong n
+    c = get s i
+    if or eq c 34 eq c 92
+      ob_c 92
+      ob_c c
+    else
+      if lt c 32
+        ob_c 92
+        ob_c 117
+        ob_c 48
+        ob_c 48
+        ob_c get t_er_hex shr ulong c 4
+        ob_c get t_er_hex and ulong c 15
+      else
+        ob_c c
+      end
+    end
+  end
+  ob_c 34
+end
+
+note ---- Number parsing ----
+
+fn er_parse_u64 s view uchar * off ulong lim ulong dst edit ulong 1 used edit ulong 1 to long
+  i = off
+  v = ulong 0
+  nd = ulong 0
+  while lt i lim bound 64
+    c = get s i
+    if or lt c 48 gt c 57
+      break
+    end
+    d = ulong sub c 48
+    if gt v ulong 1844674407370955161
+      ret 1
+    end
+    v = add mul v 10 d
+    i = add i 1
+    nd = add nd 1
+  end
+  if eq nd 0
+    ret 1
+  end
+  put dst 0 v
+  put used 0 sub i off
+  ret 0
+end
+
+fn er_parse_i64 s view uchar * off ulong lim ulong dst edit long 1 used edit ulong 1 to long
+  uo = new ulong 1 0
+  uu = new ulong 1 0
+  if ge off lim
+    ret 1
+  end
+  i = off
+  negf = ulong 0
+  c0 = get s i
+  if eq c0 45
+    negf = 1
+    i = add i 1
+  else
+    if eq c0 43
+      i = add i 1
+    end
+  end
+  if ne er_parse_u64 s i lim uo uu 0
+    ret 1
+  end
+  uv = get uo 0
+  if ne negf 0
+    put dst 0 sub 0 long uv
+  else
+    put dst 0 long uv
+  end
+  put used 0 sub add i get uu 0 off
+  ret 0
+end
+
+fn er_f64_pow10 e long to f64
+  if eq e 0
+    ret f64 1.0
+  end
+  ae = e
+  if lt ae 0
+    ae = sub 0 ae
+  end
+  if gt ae 308
+    if lt e 0
+      ret f64 0.0
+    end
+    ret est_inf
+  end
+  res = f64 1.0
+  base = f64 10.0
+  u = ulong ae
+  while gt u 0 bound 20
+    if ne and u 1 0
+      res = mul res base
+    end
+    base = mul base base
+    u = shr u 1
+  end
+  if lt e 0
+    ret div f64 1.0 res
+  end
+  ret res
+end
+
+fn er_lo_ascii c uchar to uchar
+  if and ge c 65 le c 90
+    ret add c 32
+  end
+  ret c
+end
+
+fn er_match_ci3 s view uchar * off ulong lim ulong packed ulong to bool
+  if lt sub lim off 3
+    ret false
+  end
+  c0 = er_lo_ascii get s off
+  c1 = er_lo_ascii get s add off 1
+  c2 = er_lo_ascii get s add off 2
+  a = uchar and packed 255
+  b = uchar and shr packed 8 255
+  c = uchar and shr packed 16 255
+  ret and and eq c0 a eq c1 b eq c2 c
+end
+
+fn er_parse_f64_exp s view uchar * i ulong lim ulong out_e edit long 1 to ulong
+  if ge i lim
+    ret i
+  end
+  ce = get s i
+  if and ne ce 101 ne ce 69
+    ret i
+  end
+  j = add i 1
+  eneg = ulong 0
+  if lt j lim
+    cs = get s j
+    if eq cs 45
+      eneg = 1
+      j = add j 1
+    else
+      if eq cs 43
+        j = add j 1
+      end
+    end
+  end
+  nd = ulong 0
+  ev = long 0
+  while lt j lim bound 16
+    c = get s j
+    if or lt c 48 gt c 57
+      break
+    end
+    if lt ev 10000
+      ev = add mul ev 10 long sub c 48
+    end
+    nd = add nd 1
+    j = add j 1
+  end
+  if eq nd 0
+    ret i
+  end
+  if ne eneg 0
+    put out_e 0 sub 0 ev
+  else
+    put out_e 0 ev
+  end
+  ret j
+end
+
+fn er_parse_f64_digits s view uchar * i0 ulong lim ulong m_out edit f64 1 e_out edit long 2 to ulong
+  i = i0
+  mant = f64 0.0
+  nd = ulong 0
+  while lt i lim bound 64
+    c = get s i
+    if or lt c 48 gt c 57
+      break
+    end
+    mant = add mul mant f64 10.0 f64 sub c 48
+    nd = add nd 1
+    i = add i 1
+  end
+  fexp = long 0
+  if lt i lim
+    if eq get s i 46
+      i = add i 1
+      while lt i lim bound 64
+        c = get s i
+        if or lt c 48 gt c 57
+          break
+        end
+        if lt nd 20
+          mant = add mul mant f64 10.0 f64 sub c 48
+          fexp = sub fexp 1
+        end
+        nd = add nd 1
+        i = add i 1
+      end
+    end
+  end
+  put m_out 0 mant
+  put e_out 0 fexp
+  put e_out 1 long nd
+  ret i
+end
+
+fn er_parse_f64 s view uchar * off ulong lim ulong dst edit f64 1 used edit ulong 1 to long
+  mo = new f64 1 0.0
+  eo = new long 2 0
+  ee = new long 1 0
+  if ge off lim
+    ret 1
+  end
+  i = off
+  negf = ulong 0
+  c0 = get s i
+  if eq c0 45
+    negf = 1
+    i = add i 1
+  else
+    if eq c0 43
+      i = add i 1
+    end
+  end
+  if ge i lim
+    ret 1
+  end
+  if er_match_ci3 s i lim 7233902
+    put dst 0 est_nan
+    put used 0 sub add i 3 off
+    ret 0
+  end
+  if er_match_ci3 s i lim 6712937
+    v = est_inf
+    if ne negf 0
+      v = est_ninf
+    end
+    put dst 0 v
+    put used 0 sub add i 3 off
+    ret 0
+  end
+  i = er_parse_f64_digits s i lim mo eo
+  if eq get eo 1 0
+    ret 1
+  end
+  i = er_parse_f64_exp s i lim ee
+  tot_e = add get eo 0 get ee 0
+  val = get mo 0
+  if gt tot_e 0
+    val = mul val er_f64_pow10 tot_e
+  else
+    if lt tot_e 0
+      val = div val er_f64_pow10 sub 0 tot_e
+    end
+  end
+  if ne negf 0
+    val = sub f64 0.0 val
+  end
+  put dst 0 val
+  put used 0 sub i off
+  ret 0
+end
+
+note ---- OS / File / Env / Path / SHA helpers ----
+
+fn er_env_match key view uchar * kn ulong to bool
+  if ne get g_er_env kn 61
+    ret false
+  end
+  for j ulong kn
+    if ne get g_er_env j get key j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn er_env_copy dst edit uchar * off ulong vn ulong to void
+  for j ulong vn
+    put dst j get g_er_env add off j
+  end
+end
+
+fn er_getenv key view uchar * kn ulong dst edit uchar * cap ulong to long
+  ec = envcnt
+  if le ec 0
+    ret -1
+  end
+  for i ulong ulong ec
+    r = envread i g_er_env 0 4096
+    if gt r long kn
+      if er_env_match key kn
+        vn = sub ulong r add kn 1
+        if gt vn cap
+          vn = cap
+        end
+        er_env_copy dst add kn 1 vn
+        ret long vn
+      end
+    end
+  end
+  ret -1
+end
+
+fn er_sha_state_to_hex st view uint 8 hex_out edit uchar 65 to void
+  dig = new uchar 32 0
+  for i ulong 8
+    v = get st i
+    put dig mul i 4 uchar and shr v 24 255
+    put dig add mul i 4 1 uchar and shr v 16 255
+    put dig add mul i 4 2 uchar and shr v 8 255
+    put dig add mul i 4 3 uchar and v 255
+  end
+  er_hex_encode view dig 32 hex_out
+end
+
+fn er_sha_io_chunk st edit uint 8 w edit uint 64 kt view uint 64 pend edit uchar 128 plen_b ulong ku ulong to ulong
+  blk = new uchar 64 0
+  pb = plen_b
+  pos = ulong 0
+  if gt pb 0
+    while and lt pb 64 lt pos ku bound 64
+      put pend pb get g_er_io pos
+      pb = add pb 1
+      pos = add pos 1
+    end
+    if eq pb 64
+      est_sha_compress st w kt view pend 0
+      pb = 0
+    end
+  end
+  while le add pos 64 ku bound 2048
+    for bi ulong 64
+      put blk bi get g_er_io add pos bi
+    end
+    est_sha_compress st w kt view blk 0
+    pos = add pos 64
+  end
+  while lt pos ku bound 64
+    put pend pb get g_er_io pos
+    pb = add pb 1
+    pos = add pos 1
+  end
+  ret pb
+end
+
+fn er_sha_fd fd int hex_out edit uchar 65 to long
+  kt = new uint 64 0
+  st = new uint 8 0
+  w = new uint 64 0
+  pend = new uchar 128 0
+  est_sha_kinit kt
+  est_sha_iv st
+  pb = ulong 0
+  tot = ulong 0
+  bad = ulong 0
+  while true bound 1000000
+    k = read fd g_er_io 0 65536
+    if lt k 0
+      bad = 1
+      break
+    end
+    if eq k 0
+      break
+    end
+    ku = ulong k
+    tot = add tot ku
+    pb = er_sha_io_chunk st w view kt pend pb ku
+  end
+  if ne bad 0
+    ret 1
+  end
+  est_sha_finish st w view kt pend pb tot
+  er_sha_state_to_hex view st hex_out
+  ret 0
+end
+
+fn er_sha_file path view uchar * plen ulong hex_out edit uchar 65 to long
+  fd = fopen path 0 plen 0 0
+  if lt fd 0
+    ret 1
+  end
+  rc = er_sha_fd int fd hex_out
+  ign = fclose int fd
+  ret rc
+end
+
+fn er_norm_pop ol ulong to ulong
+  o = ol
+  if gt o 1
+    o = sub o 1
+    while gt o 0 bound 4096
+      if eq get g_er_rp2 sub o 1 47
+        break
+      end
+      o = sub o 1
+    end
+    if gt o 1
+      o = sub o 1
+    end
+  end
+  ret o
+end
+
+fn er_norm_append ol ulong st ulong cl ulong to ulong
+  o = ol
+  if gt o 0
+    if ne get g_er_rp2 sub o 1 47
+      if lt o 4095
+        put g_er_rp2 o 47
+        o = add o 1
+      end
+    end
+  end
+  for j ulong cl
+    if lt o 4095
+      put g_er_rp2 o get g_er_rp1 add st j
+      o = add o 1
+    end
+  end
+  ret o
+end
+
+fn er_norm_path in_len ulong to ulong
+  ol = ulong 0
+  if eq in_len 0
+    ret 0
+  end
+  if eq get g_er_rp1 0 47
+    put g_er_rp2 0 47
+    ol = 1
+  end
+  i = ulong 0
+  while lt i in_len bound 4096
+    while lt i in_len bound 4096
+      if ne get g_er_rp1 i 47
+        break
+      end
+      i = add i 1
+    end
+    if ge i in_len
+      break
+    end
+    st = i
+    while lt i in_len bound 4096
+      if eq get g_er_rp1 i 47
+        break
+      end
+      i = add i 1
+    end
+    cl = sub i st
+    if eq cl 1
+      if eq get g_er_rp1 st 46
+        continue
+      end
+    end
+    if eq cl 2
+      if eq get g_er_rp1 st 46
+        if eq get g_er_rp1 add st 1 46
+          ol = er_norm_pop ol
+          continue
+        end
+      end
+    end
+    ol = er_norm_append ol st cl
+  end
+  if eq ol 0
+    put g_er_rp2 0 47
+    ol = 1
+  end
+  ret ol
+end
+
+fn er_rp1_rfind p ulong ch uchar to long
+  res = long -1
+  for i ulong p
+    if eq get g_er_rp1 i ch
+      res = long i
+    end
+  end
+  ret res
+end
+
+fn er_rp_apply_link cur ulong p ulong rlu ulong to ulong
+  rem_n = sub cur p
+  nlen = ulong 0
+  if eq get g_er_rp3 0 47
+    for j ulong rlu
+      put g_er_rp2 j get g_er_rp3 j
+    end
+    nlen = rlu
+  else
+    ls = er_rp1_rfind p 47
+    dlen = ulong 0
+    if gt ls 0
+      dlen = ulong ls
+    end
+    for j ulong dlen
+      put g_er_rp2 j get g_er_rp1 j
+    end
+    put g_er_rp2 dlen 47
+    nlen = add dlen 1
+    for j ulong rlu
+      if lt nlen 4095
+        put g_er_rp2 nlen get g_er_rp3 j
+        nlen = add nlen 1
+      end
+    end
+  end
+  for j ulong rem_n
+    if lt nlen 4095
+      put g_er_rp2 nlen get g_er_rp1 add p j
+      nlen = add nlen 1
+    end
+  end
+  for j ulong nlen
+    put g_er_rp1 j get g_er_rp2 j
+  end
+  ncur = er_norm_path nlen
+  for j ulong ncur
+    put g_er_rp1 j get g_er_rp2 j
+  end
+  ret add ncur 65536
+end
+
+fn er_realpath_step cur ulong to ulong
+  p = ulong 1
+  while le p cur bound 4096
+    is_sep = eq p cur
+    if not is_sep
+      if eq get g_er_rp1 p 47
+        is_sep = true
+      end
+    end
+    if is_sep
+      rl = readlnk g_er_rp1 0 p g_er_rp3 0 4000
+      if gt rl 0
+        ret er_rp_apply_link cur p ulong rl
+      end
+    end
+    p = add p 1
+  end
+  ret cur
+end
+
+fn er_realpath path view uchar * plen ulong dst edit uchar 4096 to long
+  if or eq plen 0 gt plen 4000
+    ret -1
+  end
+  cur = ulong 0
+  if eq get path 0 47
+    for i ulong plen
+      put g_er_rp1 i get path i
+    end
+    cur = plen
+  else
+    cw = cwd g_er_rp1 0 4000
+    if le cw 1
+      ret -1
+    end
+    cur = sub ulong cw 1
+    if and gt cur 0 ne get g_er_rp1 sub cur 1 47
+      put g_er_rp1 cur 47
+      cur = add cur 1
+    end
+    for i ulong plen
+      if lt cur 4095
+        put g_er_rp1 cur get path i
+        cur = add cur 1
+      end
+    end
+  end
+  cur = er_norm_path cur
+  for i ulong cur
+    put g_er_rp1 i get g_er_rp2 i
+  end
+  for hop ulong 16
+    r = er_realpath_step cur
+    if lt r 65536
+      break
+    end
+    cur = sub r 65536
+  end
+  for i ulong cur
+    put dst i get g_er_rp1 i
+  end
+  ret long cur
+end
+
+fn er_pkt_put off ulong v ulong to void
+  put g_er_pkt off uchar and v 255
+  put g_er_pkt add off 1 uchar and shr v 8 255
+end
+
+fn er_pkt_add off ulong s view uchar * n ulong to ulong
+  er_pkt_put off n
+  o2 = add off 2
+  for i ulong n
+    put g_er_pkt add o2 i get s i
+  end
+  ret add o2 n
+end
+
+fn er_sh_run cmd view uchar * clen ulong to long
+  st = new uchar 8 0
+  er_pkt_put 0 3
+  off = er_pkt_add 2 t_er_binsh len t_er_binsh
+  off = er_pkt_add off t_er_dashc len t_er_dashc
+  off = er_pkt_add off cmd clen
+  put g_er_epkt 0 1
+  put g_er_epkt 1 0
+  el = len t_er_path_env
+  put g_er_epkt 2 uchar and el 255
+  put g_er_epkt 3 uchar and shr el 8 255
+  for i ulong el
+    put g_er_epkt add 4 i get t_er_path_env i
+  end
+  eoff = add 4 el
+  pid = fork
+  if lt pid 0
+    ret -1
+  end
+  if eq pid 0
+    ign = execenv g_er_pkt 0 off g_er_epkt 0 eoff
+    exit 127
+  end
+  w = waitpid int pid st 0 4 0
+  if lt w 0
+    ret -1
+  end
+  s0 = ulong get st 0
+  s1 = ulong get st 1
+  ret long or s0 shl s1 8
+end
+
+note ---- Run B / Held-out guards & SHA256SUMS ----
+
+fn er_run_b_id dst edit uchar 128 to ulong
+  if ne get g_er_test_build 0 0
+    r = er_getenv t_er_env_b_id len t_er_env_b_id dst 128
+    if gt r 0
+      ret ulong r
+    end
+  end
+  er_copy0 dst t_er_run_b_id len t_er_run_b_id
+  ret len t_er_run_b_id
+end
+
+fn er_run_b_raw_sha dst edit uchar 65 to ulong
+  if ne get g_er_test_build 0 0
+    r = er_getenv t_er_env_b_raw len t_er_env_b_raw dst 64
+    if gt r 0
+      ret ulong r
+    end
+  end
+  er_copy0 dst t_er_run_b_raw_sha len t_er_run_b_raw_sha
+  ret len t_er_run_b_raw_sha
+end
+
+fn er_run_b_marks_sha dst edit uchar 65 to ulong
+  if ne get g_er_test_build 0 0
+    r = er_getenv t_er_env_b_mks len t_er_env_b_mks dst 64
+    if gt r 0
+      ret ulong r
+    end
+  end
+  er_copy0 dst t_er_run_b_marks_sha len t_er_run_b_marks_sha
+  ret len t_er_run_b_marks_sha
+end
+
+fn er_path_is_heldout path view uchar * plen ulong to bool
+  rp = new uchar 4096 0
+  if ge er_find path plen t_er_v2_heldout_tag len t_er_v2_heldout_tag 0
+    ret true
+  end
+  rn = er_realpath path plen rp
+  if gt rn 0
+    if ge er_find view rp ulong rn t_er_v2_heldout_tag len t_er_v2_heldout_tag 0
+      ret true
+    end
+  end
+  ret false
+end
+
+fn er_path_is_run_b path view uchar * plen ulong to bool
+  bid = new uchar 128 0
+  rp = new uchar 4096 0
+  bl = er_run_b_id bid
+  if ge er_find path plen view bid bl 0
+    ret true
+  end
+  rn = er_realpath path plen rp
+  if gt rn 0
+    if ge er_find view rp ulong rn view bid bl 0
+      ret true
+    end
+  end
+  ret false
+end
+
+fn er_hex_is_run_b hex view uchar * hlen ulong to bool
+  b1 = new uchar 65 0
+  b2 = new uchar 65 0
+  n1 = er_run_b_raw_sha b1
+  if er_eq hex hlen view b1 n1
+    ret true
+  end
+  n2 = er_run_b_marks_sha b2
+  ret er_eq hex hlen view b2 n2
+end
+
+fn er_io_read_all path view uchar * plen ulong to long
+  fd = fopen path 0 plen 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot 65536 bound 1024
+    k = read int fd g_er_io tot sub 65536 tot
+    if le k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  ign = fclose int fd
+  ret long tot
+end
+
+fn er_sums_trim_eol st ulong ll ulong to ulong
+  l = ll
+  while gt l 0 bound 4
+    c = get g_er_io sub add st l 1
+    if or eq c 10 eq c 13
+      l = sub l 1
+    else
+      break
+    end
+  end
+  ret l
+end
+
+fn er_sums_match_line st ulong ll ulong name view uchar 1024 nlen ulong hex_out edit uchar 65 to bool
+  if le ll 66
+    ret false
+  end
+  if ne get g_er_io add st 64 32
+    ret false
+  end
+  if ne get g_er_io add st 65 32
+    ret false
+  end
+  if ne sub ll 66 nlen
+    ret false
+  end
+  if not er_io_eq_at add st 66 name nlen
+    ret false
+  end
+  for j ulong 64
+    put hex_out j get g_er_io add st j
+  end
+  ret true
+end
+
+fn er_sums_scan tot ulong name view uchar 1024 nlen ulong hex_out edit uchar 65 to long
+  pos = ulong 0
+  while lt pos tot bound 8192
+    st = pos
+    while lt pos tot bound 65536
+      if eq get g_er_io pos 10
+        break
+      end
+      pos = add pos 1
+    end
+    ll = er_sums_trim_eol st sub pos st
+    if lt pos tot
+      pos = add pos 1
+    end
+    if er_sums_match_line st ll name nlen hex_out
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn er_sums_lookup dir view uchar 1024 dlen ulong name view uchar 1024 nlen ulong hex_out edit uchar 65 to long
+  p = new uchar 1200 0
+  if gt add dlen 12 1190
+    ret 1
+  end
+  for i ulong dlen
+    put p i get dir i
+  end
+  for i ulong len t_er_sums_suf
+    put p add dlen i get t_er_sums_suf i
+  end
+  tot = er_io_read_all view p add dlen len t_er_sums_suf
+  if lt tot 0
+    ret 1
+  end
+  ret er_sums_scan ulong tot name nlen hex_out
+end
+
+note ---- est_file load / read_index ----
+
+fn er_err_reset to void
+  put g_er_elen 0 0
+end
+
+fn er_err_add s view uchar * n ulong to void
+  pos = get g_er_elen 0
+  for i ulong n
+    if lt pos 299
+      put g_er_err pos get s i
+      pos = add pos 1
+    end
+  end
+  put g_er_elen 0 pos
+end
+
+fn er_err_print_ref to void
+  ob_init 2
+  ob_c 114
+  ob_c 101
+  ob_c 102
+  ob_c 117
+  ob_c 115
+  ob_c 101
+  ob_c 58
+  ob_c 32
+  n = get g_er_elen 0
+  for i ulong n
+    ob_c get g_er_err i
+  end
+  ob_nl
+  ob_flush
+end
+
+fn er_index_lines slot ulong tot ulong to void
+  dbase = mul slot EF_MAX_BYTES
+  lbase = mul slot EF_MAX_LINES
+  k = ulong 0
+  start = ulong 0
+  for i ulong tot
+    if eq get g_ef_data add dbase i 10
+      if lt k EF_MAX_LINES
+        put g_ef_off add lbase k start
+        put g_ef_llen add lbase k sub i start
+        k = add k 1
+      end
+      start = add i 1
+    end
+  end
+  if lt start tot
+    if lt k EF_MAX_LINES
+      put g_ef_off add lbase k start
+      put g_ef_llen add lbase k sub tot start
+      k = add k 1
+    end
+  end
+  put g_ef_nlines slot k
+end
+
+fn er_sha_ef_blocks st edit uint 8 w edit uint 64 kt view uint 64 dbase ulong tot ulong to ulong
+  blk = new uchar 64 0
+  pos = ulong 0
+  while le add pos 64 tot bound 65536
+    base = add dbase pos
+    for bi ulong 64
+      put blk bi get g_ef_data add base bi
+    end
+    est_sha_compress st w kt view blk 0
+    pos = add pos 64
+  end
+  ret pos
+end
+
+fn er_sha_store_slot slot ulong st view uint 8 to void
+  sh = new uchar 65 0
+  er_sha_state_to_hex st sh
+  sbase = mul slot 65
+  for i ulong 64
+    put g_ef_sha add sbase i get sh i
+  end
+end
+
+fn er_hash_ef_slot slot ulong tot ulong to void
+  kt = new uint 64 0
+  st = new uint 8 0
+  w = new uint 64 0
+  pend = new uchar 128 0
+  dbase = mul slot EF_MAX_BYTES
+  est_sha_kinit kt
+  est_sha_iv st
+  pos = er_sha_ef_blocks st w view kt dbase tot
+  rem_b = sub tot pos
+  base = add dbase pos
+  for i ulong rem_b
+    put pend i get g_ef_data add base i
+  end
+  est_sha_finish st w view kt pend rem_b tot
+  er_sha_store_slot slot view st
+end
+
+fn er_read_index slot ulong path view uchar * plen ulong to long
+  pbase = mul slot 1024
+  for i ulong plen
+    put g_ef_path add pbase i get path i
+  end
+  put g_ef_plen slot plen
+  fd = fopen path 0 plen 0 0
+  if lt fd 0
+    er_err_reset
+    er_err_add t_er_err_open len t_er_err_open
+    er_err_add path plen
+    ret 1
+  end
+  dbase = mul slot EF_MAX_BYTES
+  tot = ulong 0
+  while lt tot EF_MAX_BYTES bound 10000
+    k = read int fd g_ef_data add dbase tot sub EF_MAX_BYTES tot
+    if le k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  ign = fclose int fd
+  put g_ef_len slot tot
+  er_hash_ef_slot slot tot
+  er_index_lines slot tot
+  ret 0
+end
+
+fn er_file_load_raw slot ulong path view uchar * plen ulong to long
+  if ge plen 1024
+    er_err_reset
+    er_err_add path plen
+    er_err_add t_er_err_long len t_er_err_long
+    ret 1
+  end
+  ret er_read_index slot path plen
+end
+
+fn er_dir_and_name path view uchar * plen ulong dir edit uchar 1024 name edit uchar 1024 lens edit ulong 2 to void
+  sl = er_rfind_byte path plen 47
+  if ge sl 0
+    slu = ulong sl
+    if eq slu 0
+      put dir 0 47
+      put lens 0 1
+    else
+      for i ulong slu
+        put dir i get path i
+      end
+      put lens 0 slu
+    end
+    nl = sub sub plen slu 1
+    for i ulong nl
+      put name i get path add add slu 1 i
+    end
+    put lens 1 nl
+  else
+    put dir 0 46
+    put lens 0 1
+    for i ulong plen
+      put name i get path i
+    end
+    put lens 1 plen
+  end
+end
+
+fn er_file_load slot ulong path view uchar * plen ulong to long
+  dir = new uchar 1024 0
+  nm = new uchar 1024 0
+  lens = new ulong 2 0
+  want = new uchar 65 0
+  sh = new uchar 65 0
+  if ge plen 1024
+    er_err_reset
+    er_err_add path plen
+    er_err_add t_er_err_long len t_er_err_long
+    ret 1
+  end
+  er_dir_and_name path plen dir nm lens
+  dl = get lens 0
+  nl = get lens 1
+  if eq get g_er_allow_heldout 0 0
+    if er_path_is_heldout path plen
+      er_err_reset
+      er_err_add path plen
+      er_err_add t_er_err_ho len t_er_err_ho
+      ret 1
+    end
+  end
+  if eq get g_er_allow_run_b 0 0
+    if er_path_is_run_b path plen
+      er_err_reset
+      er_err_add path plen
+      er_err_add t_er_err_rb len t_er_err_rb
+      ret 1
+    end
+  end
+  if ne er_sums_lookup view dir dl view nm nl want 0
+    er_err_reset
+    er_err_add view dir dl
+    er_err_add t_er_err_nosums len t_er_err_nosums
+    er_err_add view nm nl
+    ret 1
+  end
+  if eq get g_er_allow_run_b 0 0
+    if er_hex_is_run_b view want 64
+      er_err_reset
+      er_err_add path plen
+      er_err_add t_er_err_rbsum len t_er_err_rbsum
+      ret 1
+    end
+  end
+  if ne er_read_index slot path plen 0
+    ret 1
+  end
+  sbase = mul slot 65
+  for i ulong 64
+    put sh i get g_ef_sha add sbase i
+  end
+  if not er_eq view sh 64 view want 64
+    er_err_reset
+    er_err_add t_er_err_mism len t_er_err_mism
+    er_err_add path plen
+    put g_ef_nlines slot 0
+    ret 1
+  end
+  if eq get g_er_allow_run_b 0 0
+    if er_hex_is_run_b view sh 64
+      er_err_reset
+      er_err_add path plen
+      er_err_add t_er_err_rbcon len t_er_err_rbcon
+      put g_ef_nlines slot 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn er_file_get_sha slot ulong dst edit uchar 65 to void
+  sbase = mul slot 65
+  for i ulong 64
+    put dst i get g_ef_sha add sbase i
+  end
+end
+
+note ---- Line parsers ----
+
+fn est_parse_time_prefix s view uchar * off ulong slen ulong t_ns edit long 1 used edit ulong 1 to long
+  i = ulong 0
+  sec = long 0
+  while lt i slen bound 64
+    c = get s add off i
+    if or lt c 48 gt c 57
+      break
+    end
+    if ge i 10
+      ret 2
+    end
+    sec = add mul sec 10 long sub c 48
+    i = add i 1
+  end
+  if or eq i 0 ge i slen
+    ret 1
+  end
+  if ne get s add off i 46
+    ret 1
+  end
+  i = add i 1
+  frac = long 0
+  for k ulong 9
+    if ge i slen
+      ret 1
+    end
+    c = get s add off i
+    if or lt c 48 gt c 57
+      ret 1
+    end
+    frac = add mul frac 10 long sub c 48
+    i = add i 1
+  end
+  if lt i slen
+    c = get s add off i
+    if and ge c 48 le c 57
+      ret 1
+    end
+  end
+  if gt sec long 9223372035
+    ret 2
+  end
+  put t_ns 0 add mul sec EST_NS frac
+  put used 0 i
+  ret 0
+end
+
+fn est_parse_t s view uchar * off ulong slen ulong t_ns edit long 1 to long
+  u = new ulong 1 0
+  if lt slen 5
+    ret 1
+  end
+  for j ulong 5
+    if ne get s add off j get t_er_t_pre j
+      ret 1
+    end
+  end
+  pr = est_parse_time_prefix s add off 5 sub slen 5 t_ns u
+  if ne pr 0
+    ret pr
+  end
+  e = add 5 get u 0
+  if ge e slen
+    ret 1
+  end
+  ce = get s add off e
+  if and ne ce 44 ne ce 125
+    ret 1
+  end
+  ret 0
+end
+
+fn er_is_num_ch c uchar to bool
+  if and ge c 48 le c 57
+    ret true
+  end
+  if or eq c 43 eq c 45
+    ret true
+  end
+  if or eq c 46 or eq c 101 eq c 69
+    ret true
+  end
+  ret false
+end
+
+fn er_scan_num_tok s view uchar * apos ulong lim ulong tok edit uchar 40 to long
+  n = ulong 0
+  while lt add apos n lim bound 48
+    c = get s add apos n
+    if or eq c 32 eq c 34
+      break
+    end
+    if not er_is_num_ch c
+      ret -1
+    end
+    if ge n 39
+      ret -1
+    end
+    put tok n c
+    n = add n 1
+  end
+  ret long n
+end
+
+fn est_parse_thermal0 s view uchar * off ulong slen ulong val edit f64 1 to long
+  tok = new uchar 40 0
+  vo = new f64 1 0.0
+  uo = new ulong 1 0
+  kl = len t_er_th_key
+  if lt slen kl
+    ret 1
+  end
+  pos = er_find_from s off add off slen t_er_th_key
+  if lt pos 0
+    ret 1
+  end
+  nr = er_scan_num_tok s add ulong pos kl add off slen tok
+  if le nr 0
+    ret 1
+  end
+  n = ulong nr
+  if ne er_parse_f64 view tok 0 n vo uo 0
+    ret 1
+  end
+  if ne get uo 0 n
+    ret 1
+  end
+  v = get vo 0
+  if not est_isfinite v
+    ret 1
+  end
+  put val 0 v
+  ret 0
+end
+
+note ---- Grid & Models ----
+
+fn est_grid_q i long to f64
+  ret est_pow f64 10.0 add f64 -3.0 mul f64 0.5 f64 i
+end
+
+fn est_grid_r j long to f64
+  ret est_pow f64 10.0 mul f64 0.25 f64 j
+end
+
+fn est_make_model model_id ulong q f64 r f64 m edit ulong 280 to long
+  for i ulong 280
+    put m i 0
+  end
+  put m EM_EST EST_ESTIMATOR_LINEAR_KALMAN
+  put m EM_MEAN EST_UNCERTAINTY_GAUSSIAN
+  put m EM_STEP ulong EST_NS
+  put m EM_M 1
+  put m EM_OUNIT EST_UNIT_MILLI_CELSIUS
+  put m EM_SUNIT EST_UNIT_MILLI_CELSIUS
+  put m EM_R bitcast ulong r
+  if or eq model_id 0 eq model_id 2
+    put m EM_N 1
+    put m EM_F bitcast ulong f64 1.0
+    put m EM_Q bitcast ulong q
+    put m EM_H bitcast ulong f64 1.0
+    ret 0
+  end
+  if eq model_id 1
+    put m EM_N 2
+    put m add EM_SUNIT 1 EST_UNIT_MILLI_CELSIUS_PER_S
+    put m EM_F bitcast ulong f64 1.0
+    put m add EM_F 1 bitcast ulong f64 1.0
+    put m add EM_F 2 bitcast ulong f64 0.0
+    put m add EM_F 3 bitcast ulong f64 1.0
+    put m EM_Q bitcast ulong div q f64 3.0
+    put m add EM_Q 1 bitcast ulong div q f64 2.0
+    put m add EM_Q 2 bitcast ulong div q f64 2.0
+    put m add EM_Q 3 bitcast ulong q
+    put m EM_H bitcast ulong f64 1.0
+    put m add EM_H 1 bitcast ulong f64 0.0
+    ret 0
+  end
+  ret 1
+end
+
+note ---- Replay engine ----
+
+fn er_put_step_dig idx ulong which ulong dig view uchar 32 to void
+  base = add mul idx 20 mul which 4
+  for i ulong 4
+    w = ulong 0
+    for b ulong 8
+      w = or w shl ulong get dig add mul i 8 b mul b 8
+    end
+    put g_rps_dig add base i w
+  end
+end
+
+fn er_get_step_dig idx ulong which ulong dig edit uchar 32 to void
+  base = add mul idx 20 mul which 4
+  for i ulong 4
+    w = get g_rps_dig add base i
+    for b ulong 8
+      put dig add mul i 8 b uchar and shr w mul b 8 255
+    end
+  end
+end
+
+fn er_store_post idx ulong bel view ulong 96 to void
+  put g_rps_pgen idx get bel EB_GEN
+  put g_rps_ptns idx bitcast long get bel EB_TNS
+  put g_rps_px mul idx 2 bitcast f64 get bel EB_X
+  put g_rps_px add mul idx 2 1 bitcast f64 get bel add EB_X 1
+  for i ulong 4
+    put g_rps_pP add mul idx 4 i bitcast f64 get bel add EB_P i
+  end
+end
+
+fn er_put_mdig rslot ulong bel edit ulong 96 to void
+  md = new uchar 32 0
+  mbase = mul rslot 32
+  for i ulong 32
+    put md i get g_rp_mdig add mbase i
+  end
+  est_rec_put_dig bel EB_MDL view md
+end
+
+fn er_load_post rslot ulong si ulong mdl view ulong 280 bel edit ulong 96 to void
+  idx = add mul rslot RP_MAX_STEPS si
+  for i ulong 96
+    put bel i 0
+  end
+  n = get mdl EM_N
+  put bel EB_N n
+  put bel EB_GEN get g_rps_pgen idx
+  put bel EB_TNS bitcast ulong get g_rps_ptns idx
+  xb = mul idx 2
+  for i ulong n
+    put bel add EB_UNIT i get mdl add EM_SUNIT i
+    vx = bitcast ulong get g_rps_px add xb i
+    put bel add EB_X i vx
+  end
+  pb = mul idx 4
+  nn = mul n n
+  for i ulong nn
+    vp = bitcast ulong get g_rps_pP add pb i
+    put bel add EB_P i vp
+  end
+  er_put_mdig rslot bel
+end
+
+fn er_sha_state_to_bytes st view uint 8 dst edit uchar 32 to void
+  for i ulong 8
+    v = get st i
+    put dst mul i 4 uchar and shr v 24 255
+    put dst add mul i 4 1 uchar and shr v 16 255
+    put dst add mul i 4 2 uchar and shr v 8 255
+    put dst add mul i 4 3 uchar and v 255
+  end
+end
+
+fn er_sha_ef_tail pend edit uchar 128 rbase ulong rem_b ulong to void
+  for i ulong rem_b
+    put pend i get g_ef_data add rbase i
+  end
+end
+
+fn er_hash_line fslot ulong off ulong ll ulong dst edit uchar 32 to void
+  kt = new uint 64 0
+  st = new uint 8 0
+  w = new uint 64 0
+  pend = new uchar 128 0
+  base = add mul fslot EF_MAX_BYTES off
+  est_sha_kinit kt
+  est_sha_iv st
+  pos = er_sha_ef_blocks st w view kt base ll
+  rem_b = sub ll pos
+  er_sha_ef_tail pend add base pos rem_b
+  est_sha_finish st w view kt pend rem_b ll
+  er_sha_state_to_bytes view st dst
+end
+
+fn er_step_clear idx ulong to void
+  put g_rps_line idx 0
+  put g_rps_L idx 0
+  put g_rps_flags idx 0
+  put g_rps_wall idx 0
+  put g_rps_tns idx 0
+  put g_rps_hor idx 0
+  put g_rps_z idx f64 0.0
+  put g_rps_ym idx f64 0.0
+  put g_rps_S idx f64 0.0
+  put g_rps_nu idx f64 0.0
+  put g_rps_nis idx f64 0.0
+  base = mul idx 20
+  for i ulong 20
+    put g_rps_dig add base i 0
+  end
+end
+
+fn er_replay_prior_kf model_id ulong r f64 z f64 to long
+  x0 = new f64 8 0.0
+  P0 = new f64 64 0.0
+  mdl = new ulong 280 0
+  bel = new ulong 96 0
+  for i ulong 280
+    put mdl i get g_rp_cur_mdl i
+  end
+  put x0 0 z
+  put P0 0 r
+  if eq model_id 1
+    put P0 3 f64 1.0e6
+  end
+  if ne est_kf_prior view mdl view x0 view P0 0 bel EST_OK
+    ret 1
+  end
+  for i ulong 96
+    put g_rp_cur_bel i get bel i
+  end
+  ret 0
+end
+
+fn er_replay_prior rslot ulong li ulong model_id ulong r f64 z f64 wall long to long
+  bel = new ulong 96 0
+  ev = new uchar 32 0
+  bd = new uchar 32 0
+  if ne er_replay_prior_kf model_id r z 0
+    ret 1
+  end
+  for i ulong 96
+    put bel i get g_rp_cur_bel i
+  end
+  for i ulong 32
+    put ev i get g_rp_cur_ev i
+  end
+  mbase = mul rslot 16
+  si = get g_rp_meta mbase
+  idx = add mul rslot RP_MAX_STEPS si
+  er_step_clear idx
+  put g_rp_meta mbase add si 1
+  put g_rps_line idx li
+  put g_rps_L idx 0
+  put g_rps_flags idx 13
+  put g_rps_wall idx wall
+  put g_rps_z idx z
+  er_put_step_dig idx 0 view ev
+  er_store_post idx view bel
+  if ne est_digest_belief view bel bd EST_OK
+    ret 1
+  end
+  er_put_step_dig idx 4 view bd
+  ret 0
+end
+
+fn er_replay_pred_step idx ulong h ulong to long
+  mdl = new ulong 280 0
+  bel = new ulong 96 0
+  bu = new f64 8 0.0
+  pred = new ulong 176 0
+  pd = new uchar 32 0
+  for i ulong 280
+    put mdl i get g_rp_cur_mdl i
+  end
+  for i ulong 96
+    put bel i get g_rp_cur_bel i
+  end
+  if ne est_kf_predict view mdl view bel 0 view bu h pred EST_OK
+    ret 1
+  end
+  if ne est_digest_prediction view pred pd EST_OK
+    ret 1
+  end
+  for i ulong 176
+    put g_rp_cur_pred i get pred i
+  end
+  for i ulong 32
+    put g_rp_cur_pd i get pd i
+  end
+  er_put_step_dig idx 2 view pd
+  put g_rps_tns idx bitcast long get pred EP_TNS
+  ret 0
+end
+
+fn er_replay_coast_step idx ulong to long
+  mdl = new ulong 280 0
+  bel = new ulong 96 0
+  pred = new ulong 176 0
+  post = new ulong 96 0
+  for i ulong 280
+    put mdl i get g_rp_cur_mdl i
+  end
+  for i ulong 96
+    put bel i get g_rp_cur_bel i
+  end
+  for i ulong 176
+    put pred i get g_rp_cur_pred i
+  end
+  if ne est_kf_coast view mdl view pred view bel post EST_OK
+    ret 1
+  end
+  for i ulong 96
+    put g_rp_cur_post i get post i
+  end
+  put g_rps_flags idx or get g_rps_flags idx 10
+  ret 0
+end
+
+fn er_replay_obs_verify idx ulong z f64 ym f64 o view ulong 96 iv view ulong 96 od view uchar 32 to void
+  pd = new uchar 32 0
+  ev = new uchar 32 0
+  tmp = new uchar 32 0
+  for i ulong 32
+    put pd i get g_rp_cur_pd i
+    put ev i get g_rp_cur_ev i
+  end
+  est_rec_get_dig iv EI_PRED tmp
+  if not est_digest_eq view tmp view pd
+    ret
+  end
+  est_rec_get_dig iv EI_OBS tmp
+  if not est_digest_eq view tmp od
+    ret
+  end
+  est_rec_get_dig o EO_EV tmp
+  if not est_digest_eq view tmp view ev
+    ret
+  end
+  if eq bitcast f64 get iv EI_NU sub z ym
+    put g_rps_flags idx or get g_rps_flags idx 8
+  end
+end
+
+fn er_replay_build_obs li ulong z f64 r f64 o edit ulong 96 to void
+  src = new uchar 32 0
+  ev = new uchar 32 0
+  for i ulong 32
+    put src i get g_rp_cur_src i
+    put ev i get g_rp_cur_ev i
+  end
+  put o EO_M 1
+  put o EO_UNIT EST_UNIT_MILLI_CELSIUS
+  put o EO_Z bitcast ulong z
+  put o EO_R bitcast ulong r
+  put o EO_TNS get g_rp_cur_pred EP_TNS
+  put o EO_SEQ li
+  est_rec_put_dig o EO_SRC view src
+  est_rec_put_dig o EO_EV view ev
+end
+
+fn er_replay_kf_upd o view ulong 96 iv edit ulong 96 to long
+  mdl = new ulong 280 0
+  bel = new ulong 96 0
+  pred = new ulong 176 0
+  post = new ulong 96 0
+  for i ulong 280
+    put mdl i get g_rp_cur_mdl i
+  end
+  for i ulong 96
+    put bel i get g_rp_cur_bel i
+  end
+  for i ulong 176
+    put pred i get g_rp_cur_pred i
+  end
+  if ne est_kf_update view mdl view bel view pred o post iv EST_OK
+    ret 1
+  end
+  for i ulong 96
+    put g_rp_cur_post i get post i
+  end
+  ret 0
+end
+
+fn er_replay_obs_step idx ulong li ulong z f64 r f64 to long
+  o = new ulong 96 0
+  iv = new ulong 96 0
+  od = new uchar 32 0
+  id = new uchar 32 0
+  er_replay_build_obs li z r o
+  if ne er_replay_kf_upd view o iv 0
+    ret 1
+  end
+  s1 = est_digest_observation view o od
+  s2 = est_digest_innovation view iv id
+  if or ne s1 EST_OK ne s2 EST_OK
+    ret 1
+  end
+  er_put_step_dig idx 1 view od
+  er_put_step_dig idx 3 view id
+  ym = bitcast f64 get g_rp_cur_pred EP_YM
+  put g_rps_z idx z
+  put g_rps_ym idx ym
+  put g_rps_S idx bitcast f64 get iv EI_S
+  put g_rps_nu idx bitcast f64 get iv EI_NU
+  put g_rps_nis idx bitcast f64 get iv EI_NIS
+  er_replay_obs_verify idx z ym view o view iv view od
+  ret 0
+end
+
+fn er_replay_finish_post idx ulong to long
+  post = new ulong 96 0
+  bd = new uchar 32 0
+  for i ulong 96
+    v = get g_rp_cur_post i
+    put post i v
+    put g_rp_cur_bel i v
+  end
+  er_store_post idx view post
+  if ne est_digest_belief view post bd EST_OK
+    ret 1
+  end
+  er_put_step_dig idx 4 view bd
+  ret 0
+end
+
+fn er_copy_line_to_buf fslot ulong li ulong to ulong
+  dbase = mul fslot EF_MAX_BYTES
+  lbase = mul fslot EF_MAX_LINES
+  loff = get g_ef_off add lbase li
+  ll = get g_ef_llen add lbase li
+  if gt ll 8192
+    ll = 8192
+  end
+  for i ulong ll
+    put g_rp_line_buf i get g_ef_data add add dbase loff i
+  end
+  ret ll
+end
+
+fn er_parse_line_buf ll ulong wo edit long 1 zo edit f64 1 to ulong
+  ln = new uchar 8192 0
+  for i ulong ll
+    put ln i get g_rp_line_buf i
+  end
+  tr = est_parse_t view ln 0 ll wo
+  vp = est_parse_thermal0 view ln 0 ll zo
+  res = ulong 0
+  if eq tr 0
+    res = or res 1
+  else
+    if eq tr 2
+      res = or res 2
+    end
+  end
+  if eq vp 0
+    res = or res 4
+  end
+  ret res
+end
+
+fn er_meta_inc rslot ulong fld ulong to void
+  off = add mul rslot 16 fld
+  put g_rp_meta off add get g_rp_meta off 1
+end
+
+fn er_replay_store_mdl rslot ulong mdl view ulong 280 md view uchar 32 to void
+  src = new uchar 32 0
+  mb = mul rslot 280
+  for i ulong 280
+    v = get mdl i
+    put g_rp_mdl add mb i v
+    put g_rp_cur_mdl i v
+  end
+  mdb = mul rslot 32
+  for i ulong 32
+    put g_rp_mdig add mdb i get md i
+  end
+  est_sha256_hash t_er_source_text len t_er_source_text src
+  for i ulong 32
+    put g_rp_cur_src i get src i
+  end
+end
+
+fn er_replay_init_model fslot ulong limit ulong model_id ulong q f64 r f64 rslot ulong to long
+  mdl = new ulong 280 0
+  md = new uchar 32 0
+  mbase = mul rslot 16
+  for i ulong 16
+    put g_rp_meta add mbase i 0
+  end
+  put g_rp_meta add mbase 11 model_id
+  nl = get g_ef_nlines fslot
+  if lt limit nl
+    nl = limit
+  end
+  put g_rp_meta add mbase 1 nl
+  if ne est_make_model model_id q r mdl 0
+    put g_rp_meta add mbase 10 1
+    ret 1
+  end
+  if ne est_digest_model view mdl md EST_OK
+    put g_rp_meta add mbase 10 1
+    ret 1
+  end
+  er_replay_store_mdl rslot view mdl view md
+  ret 0
+end
+
+fn er_replay_parse_hash fslot ulong rslot ulong li ulong wo edit long 1 zo edit f64 1 to ulong
+  ev = new uchar 32 0
+  lbase = mul fslot EF_MAX_LINES
+  loff = get g_ef_off add lbase li
+  ll = er_copy_line_to_buf fslot li
+  pf = er_parse_line_buf ll wo zo
+  if eq and pf 1 0
+    er_meta_inc rslot 5
+    if ne and pf 2 0
+      er_meta_inc rslot 6
+    end
+  end
+  if eq and pf 4 0
+    er_meta_inc rslot 4
+  end
+  er_hash_line fslot loff get g_ef_llen add lbase li ev
+  for bi ulong 32
+    put g_rp_cur_ev bi get ev bi
+  end
+  ret pf
+end
+
+fn er_replay_calc_h rslot ulong t_ok ulong wv long st edit long 4 to ulong
+  h = ulong 1
+  if and ne t_ok 0 ne get st 3 0
+    gap = sub wv get st 2
+    if eq gap 0
+      er_meta_inc rslot 7
+    else
+      if lt gap 0
+        er_meta_inc rslot 8
+      else
+        hr = div add gap div EST_NS 2 EST_NS
+        if lt hr 1
+          hr = 1
+        end
+        if gt hr 1000000
+          hr = 1000000
+        end
+        h = ulong hr
+      end
+    end
+  end
+  if gt h 1
+    er_meta_inc rslot 9
+  end
+  if ne t_ok 0
+    put st 2 wv
+    put st 3 1
+  else
+    if ne get st 3 0
+      put st 2 add get st 2 EST_NS
+    end
+  end
+  ret h
+end
+
+fn er_replay_exec_step rslot ulong li ulong h ulong flags ulong zv f64 r f64 to long
+  ev = new uchar 32 0
+  mbase = mul rslot 16
+  si = get g_rp_meta mbase
+  if ge si RP_MAX_STEPS
+    put g_rp_meta add mbase 10 1
+    ret 1
+  end
+  idx = add mul rslot RP_MAX_STEPS si
+  er_step_clear idx
+  put g_rp_meta mbase add si 1
+  put g_rps_line idx li
+  put g_rps_hor idx h
+  for bi ulong 32
+    put ev bi get g_rp_cur_ev bi
+  end
+  er_put_step_dig idx 0 view ev
+  if ne er_replay_pred_step idx h 0
+    put g_rp_meta add mbase 10 1
+    ret 1
+  end
+  if eq and flags 2 0
+    er_meta_inc rslot 3
+    if ne er_replay_coast_step idx 0
+      put g_rp_meta add mbase 10 1
+      ret 1
+    end
+  else
+    if ne er_replay_obs_step idx li zv r 0
+      put g_rp_meta add mbase 10 1
+      ret 1
+    end
+  end
+  if ne er_replay_finish_post idx 0
+    put g_rp_meta add mbase 10 1
+    ret 1
+  end
+  ret 0
+end
+
+fn er_replay_mark_step rslot ulong li ulong first ulong t_ok ulong wv long to void
+  si = sub get g_rp_meta mul rslot 16 1
+  idx = add mul rslot RP_MAX_STEPS si
+  put g_rps_L idx sub li first
+  if ne t_ok 0
+    put g_rps_flags idx or get g_rps_flags idx 4
+    put g_rps_wall idx wv
+  end
+end
+
+fn er_replay_line fslot ulong rslot ulong model_id ulong r f64 li ulong st edit long 4 to long
+  wo = new long 1 0
+  zo = new f64 1 0.0
+  pf = er_replay_parse_hash fslot rslot li wo zo
+  t_ok = and pf 1
+  v_ok = ulong 0
+  if ne and pf 4 0
+    if ne t_ok 0
+      v_ok = 1
+    end
+  end
+  if eq get st 0 0
+    if eq v_ok 0
+      er_meta_inc rslot 2
+      if ne t_ok 0
+        put st 2 get wo 0
+        put st 3 1
+      end
+      ret 0
+    end
+    if ne er_replay_prior rslot li model_id r get zo 0 get wo 0 0
+      put g_rp_meta add mul rslot 16 10 1
+      ret 1
+    end
+    put st 0 1
+    put st 1 long li
+    put st 2 get wo 0
+    put st 3 1
+    ret 0
+  end
+  h = er_replay_calc_h rslot t_ok get wo 0 st
+  v_ok = or t_ok mul v_ok 2
+  if ne er_replay_exec_step rslot li h v_ok get zo 0 r 0
+    ret 1
+  end
+  er_replay_mark_step rslot li ulong get st 1 t_ok get wo 0
+  ret 0
+end
+
+fn est_replay_run fslot ulong limit ulong model_id ulong q f64 r f64 rslot ulong to long
+  st = new long 4 0
+  if ne er_replay_init_model fslot limit model_id q r rslot 0
+    ret 1
+  end
+  nl = get g_rp_meta add mul rslot 16 1
+  for li ulong nl
+    if ne er_replay_line fslot rslot model_id r li st 0
+      ret 1
+    end
+  end
+  if eq get st 0 0
+    put g_rp_meta add mul rslot 16 10 1
+    ret 1
+  end
+  ret 0
+end
+
+fn est_replay_write_stream fd int rslot ulong model_id ulong to void
+  d = new uchar 32 0
+  hx = new uchar 65 0
+  ob_init fd
+  ns = get g_rp_meta mul rslot 16
+  for i ulong ns
+    idx = add mul rslot RP_MAX_STEPS i
+    ob_t t_er_st_m
+    ob_u model_id
+    ob_t t_er_st_ln
+    ob_u get g_rps_line idx
+    ob_t t_er_st_l
+    ob_u get g_rps_L idx
+    fl = get g_rps_flags idx
+    if ne and fl 1 0
+      ob_t t_er_st_pr
+    else
+      if ne and fl 2 0
+        ob_t t_er_st_co
+      else
+        ob_t t_er_st_ob
+      end
+    end
+    ob_t t_er_st_t
+    ob_i get g_rps_tns idx
+    ob_t t_er_st_h
+    ob_u get g_rps_hor idx
+    ob_t t_er_st_z
+    ob_g17 get g_rps_z idx
+    ob_t t_er_st_y
+    ob_g17 get g_rps_ym idx
+    ob_t t_er_st_S
+    ob_g17 get g_rps_S idx
+    ob_t t_er_st_nu
+    ob_g17 get g_rps_nu idx
+    ob_t t_er_st_nis
+    ob_g17 get g_rps_nis idx
+    ob_t t_er_st_od
+    er_get_step_dig idx 1 d
+    er_hex_encode view d 32 hx
+    ob_s view hx 64
+    ob_t t_er_st_pd
+    er_get_step_dig idx 2 d
+    er_hex_encode view d 32 hx
+    ob_s view hx 64
+    ob_t t_er_st_id
+    er_get_step_dig idx 3 d
+    er_hex_encode view d 32 hx
+    ob_s view hx 64
+    ob_t t_er_st_bd
+    er_get_step_dig idx 4 d
+    er_hex_encode view d 32 hx
+    ob_s view hx 64
+    ob_nl
+  end
+  ob_flush
+end
+
+fn est_fit_pick ll view f64 475 bi edit long 1 bj edit long 1 to long
+  best = est_ninf
+  pi = long -1
+  pj = long -1
+  for i ulong EST_NQ
+    for j ulong EST_NR
+      v = get ll add mul i EST_NR j
+      if not est_isfinite v
+        continue
+      end
+      if gt v best
+        best = v
+        pi = long i
+        pj = long j
+      end
+    end
+  end
+  if lt pi 0
+    ret 1
+  end
+  put bi 0 pi
+  put bj 0 pj
+  ret 0
+end
+
+note ---- Parameter file v1 ----
+
+fn est_params_write path view uchar * plen ulong to long
+  fd = fopen path 0 plen 577 420
+  if lt fd 0
+    ret 1
+  end
+  ob_init int fd
+  ob_t t_er_p1_hdr
+  ob_nl
+  ob_t t_er_p1_pc
+  ob_nl
+  ob_t t_er_p1_fp
+  pl = get g_ep1_plen 0
+  for i ulong pl
+    ob_c get g_ep1_path i
+  end
+  ob_nl
+  ob_t t_er_p1_fs
+  for i ulong 64
+    ob_c get g_ep1_sha i
+  end
+  ob_nl
+  ob_t t_er_p1_fl
+  ob_u get g_ep1_lines 0
+  ob_nl
+  for m ulong 2
+    ob_c 77
+    ob_u m
+    ob_t t_er_pw_q
+    ob_g17 get g_ep1_q m
+    ob_t t_er_pw_r
+    ob_g17 get g_ep1_r m
+    ob_t t_er_pw_ll
+    ob_g17 get g_ep1_ll m
+    ob_nl
+  end
+  ob_flush
+  bad = get g_ob_err 0
+  rc = fclose int fd
+  if or ne bad 0 ne rc 0
+    ret 1
+  end
+  ret 0
+end
+
+fn er_io_parse_m_line st ulong ll ulong m ulong to long
+  ln = new uchar 256 0
+  fo = new f64 1 0.0
+  uu = new ulong 1 0
+  if or lt ll 10 gt ll 255
+    ret 1
+  end
+  for i ulong ll
+    put ln i get g_er_io add st i
+  end
+  if or ne get ln 0 77 ne get ln 1 uchar add 48 m
+    ret 1
+  end
+  p = ulong 2
+  if not er_io_eq_at add st p t_er_pw_q 3
+    ret 1
+  end
+  p = add p 3
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep1_q m get fo 0
+  p = add p get uu 0
+  if or gt add p 3 ll not er_io_eq_at add st p t_er_pw_r 3
+    ret 1
+  end
+  p = add p 3
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep1_r m get fo 0
+  p = add p get uu 0
+  if or gt add p 8 ll not er_io_eq_at add st p t_er_pw_ll 8
+    ret 1
+  end
+  p = add p 8
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep1_ll m get fo 0
+  p = add p get uu 0
+  if ne p ll
+    ret 1
+  end
+  ret 0
+end
+
+fn er_p1_line idx ulong st ulong ll ulong to long
+  nb = new uchar 64 0
+  uo = new ulong 1 0
+  uu = new ulong 1 0
+  if eq idx 0
+    if or ne ll len t_er_p1_hdr not er_io_eq_at st t_er_p1_hdr ll
+      ret 1
+    end
+    ret 0
+  end
+  if eq idx 1
+    if or ne ll len t_er_p1_pc not er_io_eq_at st t_er_p1_pc ll
+      ret 1
+    end
+    ret 0
+  end
+  if eq idx 2
+    if or le ll 13 ge sub ll 13 1024
+      ret 1
+    end
+    if not er_io_eq_at st t_er_p1_fp 13
+      ret 1
+    end
+    for i ulong sub ll 13
+      put g_ep1_path i get g_er_io add add st 13 i
+    end
+    put g_ep1_plen 0 sub ll 13
+    ret 0
+  end
+  if eq idx 3
+    if or ne ll 80 not er_io_eq_at st t_er_p1_fs 16
+      ret 1
+    end
+    if not er_io_is_hex64 add st 16
+      ret 1
+    end
+    for i ulong 64
+      put g_ep1_sha i get g_er_io add add st 16 i
+    end
+    ret 0
+  end
+  if eq idx 4
+    if or le ll 10 gt sub ll 10 60
+      ret 1
+    end
+    if not er_io_eq_at st t_er_p1_fl 10
+      ret 1
+    end
+    nl = sub ll 10
+    for i ulong nl
+      put nb i get g_er_io add add st 10 i
+    end
+    if or ne er_parse_u64 view nb 0 nl uo uu 0 ne get uu 0 nl
+      ret 1
+    end
+    put g_ep1_lines 0 get uo 0
+    ret 0
+  end
+  if or eq idx 5 eq idx 6
+    ret er_io_parse_m_line st ll sub idx 5
+  end
+  ret 1
+end
+
+fn est_params_read path view uchar * plen ulong to long
+  fd = fopen path 0 plen 0 0
+  if lt fd 0
+    ret 1
+  end
+  tot = ulong 0
+  while lt tot 65536 bound 256
+    k = read int fd g_er_io tot sub 65536 tot
+    if le k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  ign = fclose int fd
+  pos = ulong 0
+  idx = ulong 0
+  bad = ulong 0
+  while lt pos tot bound 64
+    st = pos
+    found_nl = ulong 0
+    while lt pos tot bound 4096
+      if eq get g_er_io pos 10
+        found_nl = 1
+        break
+      end
+      pos = add pos 1
+    end
+    if eq found_nl 0
+      bad = 1
+      break
+    end
+    ll = sub pos st
+    pos = add pos 1
+    if ne er_p1_line idx st ll 0
+      bad = 1
+      break
+    end
+    idx = add idx 1
+  end
+  if and eq bad 0 eq idx 7
+    ret 0
+  end
+  ret 1
+end
+
+fn er_log10 x f64 to f64
+  ret div est_log x f64 2.302585092994046
+end
+
+fn est_params_validate to long
+  for m ulong 2
+    q = get g_ep1_q m
+    r = get g_ep1_r m
+    if or not est_isfinite q or not est_isfinite r or le q f64 0.0 le r f64 0.0
+      ret 1
+    end
+    i = long est_floor add div add er_log10 q f64 3.0 f64 0.5 f64 0.5
+    j = long est_floor add div er_log10 r f64 0.25 f64 0.5
+    if or lt i 0 ge i long EST_NQ
+      ret 1
+    end
+    gq = est_grid_q i
+    if gt fabs sub q gq mul f64 1.0e-9 gq
+      ret 1
+    end
+    if or lt j 0 ge j long EST_NR
+      ret 1
+    end
+    gr = est_grid_r j
+    if gt fabs sub r gr mul f64 1.0e-9 gr
+      ret 1
+    end
+  end
+  ret 0
+end
+
+note ---- Protocol v2: M2 changes, EM fit (over g_em_e[0..n)), params2 ----
+
+fn est_m2_changes rslot ulong cap ulong to long
+  ns = get g_rp_meta mul rslot 16
+  n = ulong 0
+  prev = f64 0.0
+  have = ulong 0
+  base = mul rslot RP_MAX_STEPS
+  for i ulong ns
+    idx = add base i
+    fl = get g_rps_flags idx
+    if ne and fl 2 0
+      continue
+    end
+    if eq and fl 1 0
+      if ge get g_rps_L idx EST_BURN_IN
+        if ne have 0
+          if ne bitcast ulong get g_rps_ym idx bitcast ulong prev
+            ret -1
+          end
+        end
+        if eq get g_rps_hor idx 1
+          if lt n cap
+            put g_em_e n get g_rps_nu idx
+            n = add n 1
+          end
+        end
+      end
+    end
+    prev = get g_rps_z idx
+    have = 1
+  end
+  ret long n
+end
+
+fn er_em_logc wj f64 vj f64 ei2 f64 to f64
+  ret sub est_log wj mul f64 0.5 add est_log vj div ei2 vj
+end
+
+fn er_em_estep ei2 f64 k ulong mx view EstMix sw edit f64 3 sv edit f64 3 to void
+  lv = new f64 3 0.0
+  mxl = est_ninf
+  for j ulong k
+    wj = get mx w j
+    if gt wj f64 0.0
+      lj = er_em_logc wj get mx v j ei2
+      put lv j lj
+      if gt lj mxl
+        mxl = lj
+      end
+    else
+      put lv j est_ninf
+    end
+  end
+  tot = f64 0.0
+  for j ulong k
+    ej = est_exp sub get lv j mxl
+    put lv j ej
+    tot = add tot ej
+  end
+  for j ulong k
+    g = div get lv j tot
+    put sw j add get sw j g
+    put sv j add get sv j mul g ei2
+  end
+end
+
+fn er_em_round n ulong k ulong floor_var f64 mx edit EstMix to void
+  sw = new f64 3 0.0
+  sv = new f64 3 0.0
+  for i ulong n
+    ei = get g_em_e i
+    er_em_estep mul ei ei k view mx sw sv
+  end
+  ws = f64 0.0
+  for j ulong k
+    swj = get sw j
+    put mx w j div swj f64 n
+    if gt swj f64 1.0e-300
+      put mx v j div get sv j swj
+    end
+    if lt get mx v j floor_var
+      put mx v j floor_var
+    end
+    ws = add ws get mx w j
+  end
+  for j ulong k
+    put mx w j div get mx w j ws
+  end
+end
+
+fn er_em_loglik n ulong mx view EstMix to f64
+  lo = new f64 1 0.0
+  ll = f64 0.0
+  for i ulong n
+    ign = est_mix_logpdf mx 1 get g_em_e i lo
+    ll = add ll get lo 0
+  end
+  ret ll
+end
+
+fn est_mix_fit_em n ulong k ulong floor_var f64 iters ulong mx edit EstMix ll_out edit f64 1 to long
+  start = new f64 3 0.0
+  if or lt k 1 or gt k EST_MIX_MAX lt n 2
+    ret EST_ERR_DIM
+  end
+  if or not est_isfinite floor_var le floor_var f64 0.0
+    ret EST_ERR_NOT_PD
+  end
+  v0 = f64 0.0
+  for i ulong n
+    ei = get g_em_e i
+    if not est_isfinite ei
+      ret EST_ERR_NONFINITE
+    end
+    v0 = add v0 mul ei ei
+  end
+  v0 = div v0 f64 n
+  put start 0 f64 0.01
+  put start 1 f64 0.3
+  put start 2 f64 3.0
+  put mx k k
+  for j ulong 3
+    put mx w j f64 0.0
+    put mx v j f64 0.0
+  end
+  for j ulong k
+    put mx w j div f64 1.0 f64 k
+    vj = mul v0 get start j
+    if lt vj floor_var
+      vj = floor_var
+    end
+    put mx v j vj
+  end
+  for it ulong iters
+    er_em_round n k floor_var mx
+  end
+  st = est_mix_check view mx
+  if ne st EST_OK
+    ret st
+  end
+  put ll_out 0 er_em_loglik n view mx
+  ret EST_OK
+end
+
+fn est_params2_write path view uchar * plen ulong to long
+  fd = fopen path 0 plen 577 420
+  if lt fd 0
+    ret 1
+  end
+  ob_init int fd
+  ob_t t_er_p2_hdr
+  ob_nl
+  ob_t t_er_p2_v1p
+  for i ulong get g_ep2_v1pl 0
+    ob_c get g_ep2_v1p i
+  end
+  ob_nl
+  ob_t t_er_p2_v1s
+  for i ulong 64
+    ob_c get g_ep2_v1s i
+  end
+  ob_nl
+  ob_t t_er_p1_fp
+  for i ulong get g_ep2_fpl 0
+    ob_c get g_ep2_fp i
+  end
+  ob_nl
+  ob_t t_er_p1_fs
+  for i ulong 64
+    ob_c get g_ep2_fs i
+  end
+  ob_nl
+  ob_t t_er_p1_fl
+  ob_u get g_ep2_flines 0
+  ob_nl
+  ob_t t_er_p2_fc
+  ob_u get g_ep2_fn 0
+  ob_nl
+  ob_c 77
+  ob_c 50
+  ob_t t_er_pw_q
+  ob_g17 get g_ep2_q 0
+  ob_t t_er_pw_r
+  ob_g17 get g_ep2_r 0
+  ob_t t_er_pw_k
+  ob_u get g_ep2_mk 0
+  ob_t t_er_pw_ll
+  ob_g17 get g_ep2_ll 0
+  ob_nl
+  k = get g_ep2_mk 0
+  for j ulong k
+    ob_c 99
+    ob_u j
+    ob_t t_er_pw_w
+    ob_g17 get g_ep2_mw j
+    ob_t t_er_pw_v
+    ob_g17 get g_ep2_mv j
+    ob_nl
+  end
+  ob_flush
+  bad = get g_ob_err 0
+  rc = fclose int fd
+  if or ne bad 0 ne rc 0
+    ret 1
+  end
+  ret 0
+end
+
+fn er_p2_m2_line st ulong ll ulong to long
+  ln = new uchar 256 0
+  fo = new f64 1 0.0
+  uo = new ulong 1 0
+  uu = new ulong 1 0
+  if or lt ll 16 gt ll 255
+    ret 1
+  end
+  for i ulong ll
+    put ln i get g_er_io add st i
+  end
+  if or ne get ln 0 77 ne get ln 1 50
+    ret 1
+  end
+  p = ulong 2
+  if not er_io_eq_at add st p t_er_pw_q 3
+    ret 1
+  end
+  p = add p 3
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep2_q 0 get fo 0
+  p = add p get uu 0
+  if or gt add p 3 ll not er_io_eq_at add st p t_er_pw_r 3
+    ret 1
+  end
+  p = add p 3
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep2_r 0 get fo 0
+  p = add p get uu 0
+  if or gt add p 3 ll not er_io_eq_at add st p t_er_pw_k 3
+    ret 1
+  end
+  p = add p 3
+  if ne er_parse_u64 view ln p ll uo uu 0
+    ret 1
+  end
+  kv = get uo 0
+  if or lt kv 1 gt kv EST_MIX_MAX
+    ret 1
+  end
+  put g_ep2_mk 0 kv
+  p = add p get uu 0
+  if or gt add p 8 ll not er_io_eq_at add st p t_er_pw_ll 8
+    ret 1
+  end
+  p = add p 8
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep2_ll 0 get fo 0
+  p = add p get uu 0
+  if ne p ll
+    ret 1
+  end
+  ret 0
+end
+
+fn er_p2_c_line st ulong ll ulong j ulong to long
+  ln = new uchar 256 0
+  fo = new f64 1 0.0
+  uo = new ulong 1 0
+  uu = new ulong 1 0
+  if or lt ll 10 gt ll 255
+    ret 1
+  end
+  for i ulong ll
+    put ln i get g_er_io add st i
+  end
+  if ne get ln 0 99
+    ret 1
+  end
+  p = ulong 1
+  if ne er_parse_u64 view ln p ll uo uu 0
+    ret 1
+  end
+  if ne get uo 0 j
+    ret 1
+  end
+  p = add p get uu 0
+  if or gt add p 3 ll not er_io_eq_at add st p t_er_pw_w 3
+    ret 1
+  end
+  p = add p 3
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep2_mw j get fo 0
+  p = add p get uu 0
+  if or gt add p 3 ll not er_io_eq_at add st p t_er_pw_v 3
+    ret 1
+  end
+  p = add p 3
+  if ne er_parse_f64 view ln p ll fo uu 0
+    ret 1
+  end
+  put g_ep2_mv j get fo 0
+  p = add p get uu 0
+  if ne p ll
+    ret 1
+  end
+  ret 0
+end
+
+fn er_p2_hdr_line idx ulong st ulong ll ulong to long
+  nb = new uchar 64 0
+  uo = new ulong 1 0
+  uu = new ulong 1 0
+  if eq idx 0
+    if or ne ll len t_er_p2_hdr not er_io_eq_at st t_er_p2_hdr ll
+      ret 1
+    end
+    ret 0
+  end
+  if eq idx 1
+    if or le ll 15 ge sub ll 15 1024
+      ret 1
+    end
+    if not er_io_eq_at st t_er_p2_v1p 15
+      ret 1
+    end
+    for i ulong sub ll 15
+      put g_ep2_v1p i get g_er_io add add st 15 i
+    end
+    put g_ep2_v1pl 0 sub ll 15
+    ret 0
+  end
+  if eq idx 2
+    if or ne ll 81 not er_io_eq_at st t_er_p2_v1s 17
+      ret 1
+    end
+    if not er_io_is_hex64 add st 17
+      ret 1
+    end
+    for i ulong 64
+      put g_ep2_v1s i get g_er_io add add st 17 i
+    end
+    ret 0
+  end
+  if eq idx 3
+    if or le ll 13 ge sub ll 13 1024
+      ret 1
+    end
+    if not er_io_eq_at st t_er_p1_fp 13
+      ret 1
+    end
+    for i ulong sub ll 13
+      put g_ep2_fp i get g_er_io add add st 13 i
+    end
+    put g_ep2_fpl 0 sub ll 13
+    ret 0
+  end
+  if eq idx 4
+    if or ne ll 80 not er_io_eq_at st t_er_p1_fs 16
+      ret 1
+    end
+    if not er_io_is_hex64 add st 16
+      ret 1
+    end
+    for i ulong 64
+      put g_ep2_fs i get g_er_io add add st 16 i
+    end
+    ret 0
+  end
+  if eq idx 5
+    if or le ll 10 gt sub ll 10 60
+      ret 1
+    end
+    if not er_io_eq_at st t_er_p1_fl 10
+      ret 1
+    end
+    nl = sub ll 10
+    for i ulong nl
+      put nb i get g_er_io add add st 10 i
+    end
+    if or ne er_parse_u64 view nb 0 nl uo uu 0 ne get uu 0 nl
+      ret 1
+    end
+    put g_ep2_flines 0 get uo 0
+    ret 0
+  end
+  if eq idx 6
+    if or le ll 12 gt sub ll 12 60
+      ret 1
+    end
+    if not er_io_eq_at st t_er_p2_fc 12
+      ret 1
+    end
+    nl = sub ll 12
+    for i ulong nl
+      put nb i get g_er_io add add st 12 i
+    end
+    if or ne er_parse_u64 view nb 0 nl uo uu 0 ne get uu 0 nl
+      ret 1
+    end
+    put g_ep2_fn 0 get uo 0
+    ret 0
+  end
+  ret 1
+end
+
+fn er_io_find_nl pos ulong tot ulong to long
+  p = pos
+  while lt p tot bound 4096
+    if eq get g_er_io p 10
+      ret long p
+    end
+    p = add p 1
+  end
+  ret -1
+end
+
+fn er_p2_parse_all tot ulong to long
+  pos = ulong 0
+  idx = ulong 0
+  total = ulong 8
+  bad = ulong 0
+  while lt pos tot bound 64
+    nl = er_io_find_nl pos tot
+    if lt nl 0
+      bad = 1
+      break
+    end
+    st = pos
+    ll = sub ulong nl st
+    pos = add ulong nl 1
+    if lt idx 7
+      if ne er_p2_hdr_line idx st ll 0
+        bad = 1
+      end
+    else
+      if eq idx 7
+        if ne er_p2_m2_line st ll 0
+          bad = 1
+        else
+          total = add 8 get g_ep2_mk 0
+        end
+      else
+        if ge idx total
+          bad = 1
+        else
+          if ne er_p2_c_line st ll sub idx 8 0
+            bad = 1
+          end
+        end
+      end
+    end
+    if ne bad 0
+      break
+    end
+    idx = add idx 1
+  end
+  if and eq bad 0 and eq idx total gt idx 8
+    ret 0
+  end
+  ret 1
+end
+
+fn est_params2_read path view uchar * plen ulong to long
+  tot = er_io_read_all path plen
+  if lt tot 0
+    ret 1
+  end
+  ret er_p2_parse_all ulong tot
+end

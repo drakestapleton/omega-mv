@@ -39,9 +39,14 @@ $(ESTT_DIR)/est_eval: $(ESTT_DIR)/est_eval.o $(ESTT_LIB) $(ESTT_HDRS)
 $(ESTT_DIR)/est_eval_t: tools/estimation/est_eval.c $(ESTT_LIB) $(ESTT_HDRS)
 	@mkdir -p $(ESTT_DIR)
 	$(CC) $(ESTT_CFLAGS) -DEST_TEST_BUILD -DTOOL_COMMIT='"test-build"' -DTOOL_DIRTY=1 -o $@ tools/estimation/est_eval.c $(ESTT_LIB) -lm
-$(ESTT_DIR)/est_replay: $(ESTT_LIB) $(ESTT_HDRS)
+ESTT_OMC ?= seed/out/omc
+ESTT_OM_LIB = src/estimation/est_defs.om src/estimation/est_math.om src/estimation/est_types.om \
+	src/estimation/est_kf.om src/estimation/est_mix.om src/estimation/est_pred.om \
+	src/estimation/est_v4.om tools/estimation/est_replay.om
+
+$(ESTT_DIR)/est_replay: $(ESTT_OM_LIB) tools/estimation/est_replay_main.om $(ESTT_OMC)
 	@mkdir -p $(ESTT_DIR)
-	$(CC) $(ESTT_CFLAGS) -DEST_REPLAY_MAIN -o $@ $(ESTT_LIB) -lm
+	cat $(ESTT_OM_LIB) tools/estimation/est_replay_main.om | $(ESTT_OMC) > $@ && chmod +x $@
 $(ESTT_DIR)/test_est_tools: tools/estimation/test_est_tools.c $(ESTT_LIB) $(ESTT_HDRS)
 	@mkdir -p $(ESTT_DIR)
 	$(CC) $(ESTT_CFLAGS) -o $@ tools/estimation/test_est_tools.c $(ESTT_LIB) -lm
