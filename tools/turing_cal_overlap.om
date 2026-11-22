@@ -1,0 +1,1027 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/turing_cal_overlap.om -- pure seeded OM-2 development vs sealed CTR1 overlap audit.
+note Replaces tools/turing_cal_overlap.c (same CLI, JSON stdout, stderr, exit codes 0/1/2).
+om2
+
+text k_sha_tbl "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+
+text t_usage "usage: turing-cal-overlap DEV_LIST SEALED_LIST\n"
+text t_eopen "turing-cal-overlap: cannot open "
+text t_elist "turing-cal-overlap: cannot open list "
+text t_epfx "turing-cal-overlap: "
+text t_esize ": size not a multiple of 247\n"
+text t_erec " record "
+text t_eframe ": bad CTR1 framing\n"
+text t_efirst ": first record does not open a crumb\n"
+text t_enof1 "turing-cal-overlap: list "
+text t_enof2 " names no files\n"
+text t_nl "\n"
+
+text t_j1 "{\"dev_files\":"
+text t_j2 ",\"dev_records\":"
+text t_j3 ",\"dev_crumbs\":"
+text t_j4 ",\"sealed_files\":"
+text t_j5 ",\"sealed_records\":"
+text t_j6 ",\"sealed_crumbs\":"
+text t_j7 ",\"crumb_block_overlap\":"
+text t_j8 ",\"first_state_overlap\":"
+text t_j9 ",\"record_body_overlap\":"
+text t_j10 ",\"gated\":[\"crumb_block_overlap\"],\"ctr1_gates_pass\":"
+text t_true "true}\n"
+text t_false "false}\n"
+
+global g_arg1 uchar 4096
+global g_arg2 uchar 4096
+global g_lbuf uchar *
+global g_pbuf uchar 4096
+global g_rbuf uchar 63232
+global g_out uchar *
+
+note SHA-256 constants & working regs
+global g_sk uint 72
+global g_sw uint 64
+global g_sv uint 8
+note blk context: g_bh[8], g_bbuf[64], g_bmeta[2]=[blen, btot]
+global g_bh uint 8
+global g_bbuf uchar 64
+global g_bmeta ulong 2
+note oneshot context: g_hh[8], g_hbuf[64], g_dig[32]
+global g_hh uint 8
+global g_hbuf uchar 64
+global g_dig uchar 32
+
+note Dynamic pools for dev (0) and sealed (1)
+global g_d_blk uchar *
+global g_d_fst uchar *
+global g_d_fp ulong *
+global g_s_blk uchar *
+global g_s_fst uchar *
+global g_s_fp ulong *
+
+note g_cnt: [0]=df [1]=dr [2]=dc [3]=sf [4]=sr [5]=sc
+global g_cnt ulong 6
+note g_vn: [0]=dblk [1]=dfst [2]=dfp [3]=sblk [4]=sfst [5]=sfp
+global g_vn ulong 6
+note g_sz: [0]=arg1len [1]=arg2len [2]=llen [3]=plen [4]=outlen
+global g_sz ulong 8
+
+fn wr_lit fd int s view uchar * to void
+  off = ulong 0
+  n = len s
+  while lt off n
+    w = write fd s off sub n off
+    if le w 0
+      ret
+    end
+    off = add off ulong w
+  end
+end
+
+fn wr_pbuf fd int n ulong to void
+  off = ulong 0
+  while lt off n
+    w = write fd g_pbuf off sub n off
+    if le w 0
+      ret
+    end
+    off = add off ulong w
+  end
+end
+
+fn wr_u64 fd int v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    put tmp 0 48
+    w = write fd tmp 0 1
+    if lt w 0
+      ret
+    end
+    ret
+  end
+  k = ulong 0
+  while gt v 0
+    put tmp k uchar add 48 rem v 10
+    v = div v 10
+    k = add k 1
+  end
+  rev = new uchar 24 0
+  j = ulong 0
+  while gt k 0
+    k = sub k 1
+    put rev j get tmp k
+    j = add j 1
+  end
+  w2 = write fd rev 0 j
+  if lt w2 0
+    ret
+  end
+end
+
+fn out_push c uchar to void
+  n = get g_sz 4
+  if ge n len g_out
+    nc = mul n 2
+    if lt nc 1024
+      nc = 1024
+    end
+    r = enlarge g_out nc
+    if lt r 0
+      exit 2
+    end
+  end
+  put g_out n c
+  put g_sz 4 add n 1
+end
+
+fn out_str s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    out_push get s i
+    i = add i 1
+  end
+end
+
+fn out_u64 v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    out_push 48
+    ret
+  end
+  k = ulong 0
+  while gt v 0
+    put tmp k uchar add 48 rem v 10
+    v = div v 10
+    k = add k 1
+  end
+  while gt k 0
+    k = sub k 1
+    out_push get tmp k
+  end
+end
+
+fn out_flush to void
+  n = get g_sz 4
+  off = ulong 0
+  while lt off n
+    w = write 1 g_out off sub n off
+    if le w 0
+      exit 2
+    end
+    off = add off ulong w
+  end
+  put g_sz 4 0
+end
+
+note ---- SHA-256 ----
+fn sha_init_tbl to void
+  pos = ulong 0
+  n = len k_sha_tbl
+  idx = ulong 0
+  while lt idx 72
+    while lt pos n
+      if ne get k_sha_tbl pos 32
+        break
+      end
+      pos = add pos 1
+    end
+    v = ulong 0
+    while lt pos n
+      c = get k_sha_tbl pos
+      if or lt c 48 gt c 57
+        break
+      end
+      v = add mul v 10 ulong sub c 48
+      pos = add pos 1
+    end
+    put g_sk idx uint v
+    idx = add idx 1
+  end
+end
+
+fn rotr32 x uint k uint to uint
+  ret or shr x k shl x sub uint 32 k
+end
+
+fn sha_expand_w to void
+  i = ulong 16
+  while lt i 64
+    w15 = get g_sw sub i 15
+    s0 = xor xor rotr32 w15 7 rotr32 w15 18 shr w15 3
+    w2 = get g_sw sub i 2
+    s1 = xor xor rotr32 w2 17 rotr32 w2 19 shr w2 10
+    v = add get g_sw sub i 16 s0
+    v = add v get g_sw sub i 7
+    put g_sw i add v s1
+    i = add i 1
+  end
+end
+
+fn sha_load_w is_blk bool to void
+  i = ulong 0
+  while lt i 16
+    o = mul i 4
+    b0 = uint 0
+    b1 = uint 0
+    b2 = uint 0
+    b3 = uint 0
+    if is_blk
+      b0 = uint get g_bbuf o
+      b1 = uint get g_bbuf add o 1
+      b2 = uint get g_bbuf add o 2
+      b3 = uint get g_bbuf add o 3
+    else
+      b0 = uint get g_hbuf o
+      b1 = uint get g_hbuf add o 1
+      b2 = uint get g_hbuf add o 2
+      b3 = uint get g_hbuf add o 3
+    end
+    put g_sw i or or shl b0 24 shl b1 16 or shl b2 8 b3
+    i = add i 1
+  end
+  sha_expand_w
+end
+
+fn sha_round i ulong to void
+  e = get g_sv 4
+  f = get g_sv 5
+  g = get g_sv 6
+  S1 = xor xor rotr32 e 6 rotr32 e 11 rotr32 e 25
+  ch = xor and e f and xor e 4294967295 g
+  t1 = add add get g_sv 7 S1 add ch add get g_sk i get g_sw i
+  put g_sv 7 g
+  put g_sv 6 f
+  put g_sv 5 e
+  put g_sv 4 add get g_sv 3 t1
+  a = get g_sv 0
+  b = get g_sv 1
+  c = get g_sv 2
+  S0 = xor xor rotr32 a 2 rotr32 a 13 rotr32 a 22
+  maj = xor xor and a b and a c and b c
+  t2 = add S0 maj
+  put g_sv 3 c
+  put g_sv 2 b
+  put g_sv 1 a
+  put g_sv 0 add t1 t2
+end
+
+fn sha_compress is_blk bool to void
+  sha_load_w is_blk
+  i = ulong 0
+  while lt i 8
+    if is_blk
+      put g_sv i get g_bh i
+    else
+      put g_sv i get g_hh i
+    end
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 64
+    sha_round i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 8
+    if is_blk
+      put g_bh i add get g_bh i get g_sv i
+    else
+      put g_hh i add get g_hh i get g_sv i
+    end
+    i = add i 1
+  end
+end
+
+fn blk_sha_init to void
+  i = ulong 0
+  while lt i 8
+    put g_bh i get g_sk add 64 i
+    i = add i 1
+  end
+  put g_bmeta 0 0
+  put g_bmeta 1 0
+end
+
+fn blk_sha_update off ulong n ulong to void
+  bl = get g_bmeta 0
+  tot = add get g_bmeta 1 n
+  put g_bmeta 1 tot
+  i = ulong 0
+  while lt i n
+    put g_bbuf bl get g_rbuf add off i
+    bl = add bl 1
+    if eq bl 64
+      sha_compress true
+      bl = 0
+    end
+    i = add i 1
+  end
+  put g_bmeta 0 bl
+end
+
+fn blk_sha_final to void
+  bl = get g_bmeta 0
+  bits = mul get g_bmeta 1 8
+  put g_bbuf bl 128
+  bl = add bl 1
+  if gt bl 56
+    while lt bl 64
+      put g_bbuf bl 0
+      bl = add bl 1
+    end
+    sha_compress true
+    bl = 0
+  end
+  while lt bl 56
+    put g_bbuf bl 0
+    bl = add bl 1
+  end
+  i = ulong 0
+  while lt i 8
+    put g_bbuf add 56 i uchar and shr bits mul sub 7 i 8 255
+    i = add i 1
+  end
+  sha_compress true
+  i = ulong 0
+  while lt i 8
+    v = get g_bh i
+    o = mul i 4
+    put g_dig o uchar and shr v 24 255
+    put g_dig add o 1 uchar and shr v 16 255
+    put g_dig add o 2 uchar and shr v 8 255
+    put g_dig add o 3 uchar and v 255
+    i = add i 1
+  end
+end
+
+note One-shot SHA-256 of 215 bytes at g_rbuf[off..off+215), returns first 8 bytes BE as ulong
+fn sha256_body215_fp off ulong to ulong
+  i = ulong 0
+  while lt i 8
+    put g_hh i get g_sk add 64 i
+    i = add i 1
+  end
+  blk = ulong 0
+  while lt blk 3
+    j = ulong 0
+    bo = add off mul blk 64
+    while lt j 64
+      put g_hbuf j get g_rbuf add bo j
+      j = add j 1
+    end
+    sha_compress false
+    blk = add blk 1
+  end
+  note remaining 215 - 192 = 23 bytes
+  j = ulong 0
+  bo = add off 192
+  while lt j 23
+    put g_hbuf j get g_rbuf add bo j
+    j = add j 1
+  end
+  put g_hbuf 23 128
+  j = ulong 24
+  while lt j 56
+    put g_hbuf j 0
+    j = add j 1
+  end
+  note 215 * 8 = 1720 = 0x06b8
+  put g_hbuf 56 0
+  put g_hbuf 57 0
+  put g_hbuf 58 0
+  put g_hbuf 59 0
+  put g_hbuf 60 0
+  put g_hbuf 61 0
+  put g_hbuf 62 6
+  put g_hbuf 63 184
+  sha_compress false
+  hi = ulong get g_hh 0
+  lo = ulong get g_hh 1
+  ret or shl hi 32 lo
+end
+
+note ---- Dynamic pool pushes ----
+fn dpush_blk side ulong to void
+  idx = mul side 3
+  n = get g_vn idx
+  need = mul add n 1 32
+  if eq side 0
+    if gt need len g_d_blk
+      nc = mul len g_d_blk 2
+      if lt nc 32768
+        nc = 32768
+      end
+      r = enlarge g_d_blk nc
+      if lt r 0
+        exit 2
+      end
+    end
+    o = mul n 32
+    i = ulong 0
+    while lt i 32
+      put g_d_blk add o i get g_dig i
+      i = add i 1
+    end
+  else
+    if gt need len g_s_blk
+      nc = mul len g_s_blk 2
+      if lt nc 32768
+        nc = 32768
+      end
+      r = enlarge g_s_blk nc
+      if lt r 0
+        exit 2
+      end
+    end
+    o = mul n 32
+    i = ulong 0
+    while lt i 32
+      put g_s_blk add o i get g_dig i
+      i = add i 1
+    end
+  end
+  put g_vn idx add n 1
+end
+
+fn dpush_fst side ulong rboff ulong to void
+  idx = add mul side 3 1
+  n = get g_vn idx
+  need = mul add n 1 32
+  if eq side 0
+    if gt need len g_d_fst
+      nc = mul len g_d_fst 2
+      if lt nc 32768
+        nc = 32768
+      end
+      r = enlarge g_d_fst nc
+      if lt r 0
+        exit 2
+      end
+    end
+    o = mul n 32
+    i = ulong 0
+    while lt i 32
+      put g_d_fst add o i get g_rbuf add rboff i
+      i = add i 1
+    end
+  else
+    if gt need len g_s_fst
+      nc = mul len g_s_fst 2
+      if lt nc 32768
+        nc = 32768
+      end
+      r = enlarge g_s_fst nc
+      if lt r 0
+        exit 2
+      end
+    end
+    o = mul n 32
+    i = ulong 0
+    while lt i 32
+      put g_s_fst add o i get g_rbuf add rboff i
+      i = add i 1
+    end
+  end
+  put g_vn idx add n 1
+end
+
+fn upush_fp side ulong fp ulong to void
+  idx = add mul side 3 2
+  n = get g_vn idx
+  if eq side 0
+    if ge n len g_d_fp
+      nc = mul len g_d_fp 2
+      if lt nc 65536
+        nc = 65536
+      end
+      r = enlarge g_d_fp nc
+      if lt r 0
+        exit 2
+      end
+    end
+    put g_d_fp n fp
+  else
+    if ge n len g_s_fp
+      nc = mul len g_s_fp 2
+      if lt nc 65536
+        nc = 65536
+      end
+      r = enlarge g_s_fp nc
+      if lt r 0
+        exit 2
+      end
+    end
+    put g_s_fp n fp
+  end
+  put g_vn idx add n 1
+end
+
+note ---- File & list readers ----
+fn check_ctr1_magic off ulong to bool
+  if ne get g_rbuf off 67
+    ret false
+  end
+  if ne get g_rbuf add off 1 84
+    ret false
+  end
+  if ne get g_rbuf add off 2 82
+    ret false
+  end
+  if ne get g_rbuf add off 3 49
+    ret false
+  end
+  if ne get g_rbuf add off 4 1
+    ret false
+  end
+  ret eq get g_rbuf add off 5 0
+end
+
+fn read_u32_le off ulong to ulong
+  b0 = ulong get g_rbuf off
+  b1 = ulong get g_rbuf add off 1
+  b2 = ulong get g_rbuf add off 2
+  b3 = ulong get g_rbuf add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+note g_rf: [0]=prev [1]=open_crumb
+global g_rf long 2
+
+fn process_record side ulong off ulong plen ulong to bool
+  idx = read_u32_le add off 8
+  first = eq idx 0
+  bad = not check_ctr1_magic off
+  if and not bad not first
+    if le long idx get g_rf 0
+      bad = true
+    end
+  end
+  if bad
+    wr_lit 2 t_epfx
+    wr_pbuf 2 plen
+    wr_lit 2 t_erec
+    wr_u64 2 get g_cnt add mul side 3 1
+    wr_lit 2 t_eframe
+    ret false
+  end
+  if first
+    if ne get g_rf 1 0
+      blk_sha_final
+      dpush_blk side
+    end
+    blk_sha_init
+    put g_rf 1 1
+    ci = add mul side 3 2
+    put g_cnt ci add get g_cnt ci 1
+    dpush_fst side add off 63
+  else
+    if eq get g_rf 1 0
+      wr_lit 2 t_epfx
+      wr_pbuf 2 plen
+      wr_lit 2 t_efirst
+      ret false
+    end
+  end
+  blk_sha_update off 215
+  fp = sha256_body215_fp off
+  upush_fp side fp
+  put g_rf 0 long idx
+  ri = add mul side 3 1
+  put g_cnt ri add get g_cnt ri 1
+  ret true
+end
+
+fn read_ctr_file side ulong plen ulong to bool
+  fd = fopen g_pbuf 0 plen 0 0
+  if lt fd 0
+    wr_lit 2 t_eopen
+    wr_pbuf 2 plen
+    wr_lit 2 t_nl
+    ret false
+  end
+  put g_rf 0 neg long 1
+  put g_rf 1 0
+  ok = true
+  while ok
+    got = ulong 0
+    while lt got 63232
+      r = read int fd g_rbuf got sub 63232 got
+      if lt r 0
+        ok = false
+        break
+      end
+      if eq r 0
+        break
+      end
+      got = add got ulong r
+    end
+    if or not ok eq got 0
+      break
+    end
+    if ne rem got 247 0
+      wr_lit 2 t_epfx
+      wr_pbuf 2 plen
+      wr_lit 2 t_esize
+      ok = false
+      break
+    end
+    off = ulong 0
+    while lt off got
+      if not process_record side off plen
+        ok = false
+        break
+      end
+      off = add off 247
+    end
+  end
+  if and ok ne get g_rf 1 0
+    blk_sha_final
+    dpush_blk side
+  end
+  cr = fclose int fd
+  fi = mul side 3
+  put g_cnt fi add get g_cnt fi 1
+  if lt cr 0
+    ret ok
+  end
+  ret ok
+end
+
+fn read_list side ulong to bool
+  fd = long 0
+  if eq side 0
+    fd = fopen g_arg1 0 get g_sz 0 0 0
+  else
+    fd = fopen g_arg2 0 get g_sz 1 0 0
+  end
+  if lt fd 0
+    wr_lit 2 t_elist
+    if eq side 0
+      w = write 2 g_arg1 0 get g_sz 0
+      if lt w 0
+        ret false
+      end
+    else
+      w = write 2 g_arg2 0 get g_sz 1
+      if lt w 0
+        ret false
+      end
+    end
+    wr_lit 2 t_nl
+    ret false
+  end
+  if lt len g_lbuf 4096
+    r = enlarge g_lbuf 4096
+    if lt r 0
+      exit 2
+    end
+  end
+  n = ulong 0
+  while true
+    cap = len g_lbuf
+    if eq n cap
+      r2 = enlarge g_lbuf mul cap 2
+      if lt r2 0
+        exit 2
+      end
+      cap = len g_lbuf
+    end
+    got = read int fd g_lbuf n sub cap n
+    if le got 0
+      break
+    end
+    n = add n ulong got
+  end
+  cr = fclose int fd
+  if lt cr 0
+    cr = 0
+  end
+  put g_sz 2 n
+  pos = ulong 0
+  while lt pos n
+    lend = pos
+    while lt lend n
+      if eq get g_lbuf lend 10
+        break
+      end
+      lend = add lend 1
+    end
+    e = lend
+    while gt e pos
+      c = get g_lbuf sub e 1
+      if and ne c 10 ne c 13
+        break
+      end
+      e = sub e 1
+    end
+    if gt e pos
+      plen = sub e pos
+      if gt plen 4095
+        plen = 4095
+      end
+      j = ulong 0
+      while lt j plen
+        put g_pbuf j get g_lbuf add pos j
+        j = add j 1
+      end
+      if not read_ctr_file side plen
+        ret false
+      end
+    end
+    if lt lend n
+      pos = add lend 1
+    else
+      pos = lend
+    end
+  end
+  if eq get g_cnt mul side 3 0
+    wr_lit 2 t_enof1
+    if eq side 0
+      w = write 2 g_arg1 0 get g_sz 0
+      if lt w 0
+        ret false
+      end
+    else
+      w = write 2 g_arg2 0 get g_sz 1
+      if lt w 0
+        ret false
+      end
+    end
+    wr_lit 2 t_enof2
+    ret false
+  end
+  ret true
+end
+
+note ---- Heapsort + binary search for 32-byte digests and ulong fps ----
+fn cmp32_dev is_fst bool a ulong b ulong to long
+  oa = mul a 32
+  ob = mul b 32
+  i = ulong 0
+  while lt i 32
+    ca = uchar 0
+    cb = uchar 0
+    if is_fst
+      ca = get g_d_fst add oa i
+      cb = get g_d_fst add ob i
+    else
+      ca = get g_d_blk add oa i
+      cb = get g_d_blk add ob i
+    end
+    if lt ca cb
+      ret neg long 1
+    end
+    if gt ca cb
+      ret 1
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn swap32_dev is_fst bool a ulong b ulong to void
+  oa = mul a 32
+  ob = mul b 32
+  i = ulong 0
+  while lt i 32
+    if is_fst
+      t = get g_d_fst add oa i
+      put g_d_fst add oa i get g_d_fst add ob i
+      put g_d_fst add ob i t
+    else
+      t = get g_d_blk add oa i
+      put g_d_blk add oa i get g_d_blk add ob i
+      put g_d_blk add ob i t
+    end
+    i = add i 1
+  end
+end
+
+fn sift32_dev is_fst bool start ulong endn ulong to void
+  root = start
+  while true
+    child = add mul root 2 1
+    if ge child endn
+      break
+    end
+    if lt add child 1 endn
+      if lt cmp32_dev is_fst child add child 1 0
+        child = add child 1
+      end
+    end
+    if lt cmp32_dev is_fst root child 0
+      swap32_dev is_fst root child
+      root = child
+    else
+      break
+    end
+  end
+end
+
+fn sort32_dev is_fst bool n ulong to void
+  if le n 1
+    ret
+  end
+  start = div n 2
+  while gt start 0
+    start = sub start 1
+    sift32_dev is_fst start n
+  end
+  endn = n
+  while gt endn 1
+    endn = sub endn 1
+    swap32_dev is_fst 0 endn
+    sift32_dev is_fst 0 endn
+  end
+end
+
+fn cmp32_sea_dev is_fst bool si ulong di ulong to long
+  os = mul si 32
+  od = mul di 32
+  i = ulong 0
+  while lt i 32
+    cs = uchar 0
+    cd = uchar 0
+    if is_fst
+      cs = get g_s_fst add os i
+      cd = get g_d_fst add od i
+    else
+      cs = get g_s_blk add os i
+      cd = get g_d_blk add od i
+    end
+    if lt cs cd
+      ret neg long 1
+    end
+    if gt cs cd
+      ret 1
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn bsearch32 is_fst bool si ulong dn ulong to bool
+  lo = ulong 0
+  hi = dn
+  while lt lo hi
+    mid = add lo div sub hi lo 2
+    c = cmp32_sea_dev is_fst si mid
+    if eq c 0
+      ret true
+    end
+    if lt c 0
+      hi = mid
+    else
+      lo = add mid 1
+    end
+  end
+  ret false
+end
+
+fn count_shared32 is_fst bool to ulong
+  dn = ulong 0
+  sn = ulong 0
+  if is_fst
+    dn = get g_vn 1
+    sn = get g_vn 4
+  else
+    dn = get g_vn 0
+    sn = get g_vn 3
+  end
+  sort32_dev is_fst dn
+  k = ulong 0
+  i = ulong 0
+  while lt i sn
+    if bsearch32 is_fst i dn
+      k = add k 1
+    end
+    i = add i 1
+  end
+  ret k
+end
+
+fn sift_fp start ulong endn ulong to void
+  root = start
+  while true
+    child = add mul root 2 1
+    if ge child endn
+      break
+    end
+    if lt add child 1 endn
+      if lt get g_d_fp child get g_d_fp add child 1
+        child = add child 1
+      end
+    end
+    if lt get g_d_fp root get g_d_fp child
+      t = get g_d_fp root
+      put g_d_fp root get g_d_fp child
+      put g_d_fp child t
+      root = child
+    else
+      break
+    end
+  end
+end
+
+fn sort_fp n ulong to void
+  if le n 1
+    ret
+  end
+  start = div n 2
+  while gt start 0
+    start = sub start 1
+    sift_fp start n
+  end
+  endn = n
+  while gt endn 1
+    endn = sub endn 1
+    t = get g_d_fp 0
+    put g_d_fp 0 get g_d_fp endn
+    put g_d_fp endn t
+    sift_fp 0 endn
+  end
+end
+
+fn bsearch_fp key ulong dn ulong to bool
+  lo = ulong 0
+  hi = dn
+  while lt lo hi
+    mid = add lo div sub hi lo 2
+    v = get g_d_fp mid
+    if eq key v
+      ret true
+    end
+    if lt key v
+      hi = mid
+    else
+      lo = add mid 1
+    end
+  end
+  ret false
+end
+
+fn count_shared_fp to ulong
+  dn = get g_vn 2
+  sn = get g_vn 5
+  sort_fp dn
+  k = ulong 0
+  i = ulong 0
+  while lt i sn
+    if bsearch_fp get g_s_fp i dn
+      k = add k 1
+    end
+    i = add i 1
+  end
+  ret k
+end
+
+fn main to int
+  if ne argcnt 3
+    wr_lit 2 t_usage
+    ret 2
+  end
+  n1 = argread 1 g_arg1 0 4095
+  n2 = argread 2 g_arg2 0 4095
+  if or lt n1 0 lt n2 0
+    wr_lit 2 t_usage
+    ret 2
+  end
+  put g_sz 0 ulong n1
+  put g_sz 1 ulong n2
+  sha_init_tbl
+  if or not read_list 0 not read_list 1
+    ret 2
+  end
+  blk = count_shared32 false
+  fst = count_shared32 true
+  rec = count_shared_fp
+  out_str t_j1
+  out_u64 get g_cnt 0
+  out_str t_j2
+  out_u64 get g_cnt 1
+  out_str t_j3
+  out_u64 get g_cnt 2
+  out_str t_j4
+  out_u64 get g_cnt 3
+  out_str t_j5
+  out_u64 get g_cnt 4
+  out_str t_j6
+  out_u64 get g_cnt 5
+  out_str t_j7
+  out_u64 blk
+  out_str t_j8
+  out_u64 fst
+  out_str t_j9
+  out_u64 rec
+  out_str t_j10
+  if eq blk 0
+    out_str t_true
+    out_flush
+    ret 0
+  end
+  out_str t_false
+  out_flush
+  ret 1
+end
