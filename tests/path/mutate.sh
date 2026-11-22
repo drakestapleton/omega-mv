@@ -15,10 +15,11 @@
 # limitations under the License.
 
 # TEST HARNESS: PATH-1 mutation oracle. Each mutant edits a scratch copy of
-# src/path/rx_path.c, never the source. A mutant counts as killed only when it
-# compiles and the test program reports at least one FAIL line.
+# src/path/rx_path.om, never the source. A mutant counts as killed only when it
+# compiles with seed/out/omc and the test program reports at least one FAIL line.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+omc=${OMC:-"$root/seed/out/omc"}
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/omega-path-mutants.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT HUP INT TERM
 killed=0
@@ -27,15 +28,14 @@ run() {
     name=$1
     expression=$2
     total=$((total+1))
-    cp "$root/src/path/rx_path.c" "$scratch/orig.c"
-    sed "$expression" "$scratch/orig.c" > "$scratch/mutant.c"
-    if cmp -s "$scratch/orig.c" "$scratch/mutant.c"; then
+    cp "$root/src/path/rx_path.om" "$scratch/orig.om"
+    sed "$expression" "$scratch/orig.om" > "$scratch/mutant.om"
+    if cmp -s "$scratch/orig.om" "$scratch/mutant.om"; then
         echo "MUTANT $name: mutation did not apply" >&2; exit 1
     fi
     # A compiler error does not count as an invariant caught by tests.
-    ${CC:-cc} -std=c11 -Wall -Wextra -Werror -O2 -I"$root/src" -I"$root/src/path" \
-        "$scratch/mutant.c" "$root/src/omega_om_units.c" "$root/tests/path/test_path_identity.c" \
-        -o "$scratch/test"
+    cat "$scratch/mutant.om" "$root/tests/path/test_path_identity.om" | "$omc" > "$scratch/test"
+    chmod +x "$scratch/test"
     if "$scratch/test" > "$scratch/log" 2>&1; then
         echo "MUTANT $name: SURVIVED" >&2; cat "$scratch/log" >&2; exit 1
     fi
@@ -45,28 +45,28 @@ run() {
     killed=$((killed+1))
     echo "MUTANT $name: killed"
 }
-run semantic-tag 's/static const char tag\[\] = RX_PATH_SEMANTIC_TAG;/static const char tag[] = "omega.path.v2";/'
-run tag-terminator 's/emit(&e, tag, sizeof(tag)); \/\* sizeof includes/emit(\&e, tag, sizeof(tag) - 1); \/* sizeof includes/'
-run little-endian '/^static void put_u16/,/^}/{s/b\[0\] = /b[9] = /;s/b\[1\] = /b[0] = /;s/b\[9\] = /b[1] = /};s/((uint16_t)b\[0\] << 8) | b\[1\]/((uint16_t)b[1] << 8) | b[0]/'
-run step-limit 's/if (rx_path_step_count(p) >= RX_PATH_MAX_STEPS)/if (rx_path_step_count(p) > RX_PATH_MAX_STEPS)/'
-run input-limit 's/input_count > RX_PATH_MAX_INPUTS_PER_STEP)/input_count > RX_PATH_MAX_INPUTS_PER_STEP + 1)/'
-run size-limit 's/if (size + step_size(step) > RX_PATH_MAX_TOTAL_SERIALIZATION)/if (0)/'
-run attr-sort 's/while (at < p->attr_count \&\& key_cmp(p->attributes\[at\].key, key) < 0) at++;/at = p->attr_count;/'
-run constraint-sort 's/while (at < p->constraint_count \&\& constraint_cmp(\&p->constraints\[at\], \&c) <= 0) at++;/at = p->constraint_count;/'
-run step-index-check 's/if (!take_u16(r, \&index) || index != i)/if (!take_u16(r, \&index))/'
-run steps-payload-len '/if (steps_len != r->n - r->pos) return RX_PATH_ERR_MALFORMED;/d'
-run trailing-bytes '/if (r->pos != r->n) return RX_PATH_ERR_MALFORMED;/d'
-run magic 's/if (!q || memcmp(q, path_magic, 4) != 0)/if (!q)/'
-run family-role '/if ((role >> 8) != family) return 0;/d'
-run expected-id '/rc = RX_PATH_ERR_ID_MISMATCH;/d'
-run parent-frozen 's/parent->frozen = 1;/parent->frozen = 0;/'
-run lineage-check '/if (memcmp(pid.bytes, q->parent_path_id.bytes, 32) != 0) return RX_PATH_ERR_ID_MISMATCH;/d'
-run divergence-bound 's/if (divergence_step_index > rx_path_step_count(parent))/if (divergence_step_index > 1 + rx_path_step_count(parent))/'
-run prefix-resolve 's/if (p->parent \&\& i < p->divergence_step_index)/if (p->parent \&\& i <= p->divergence_step_index)/'
-run realization-machine '/emit_id(&e, &r->machine_id);/d'
-run realization-evidence '/emit_id(&e, &r->argus_observation_digest);/d'
-run shape-check 's/int rc = check_step(s);/int rc = 0;/'
-run ancestor-fork 's/if (q == child) return RX_PATH_ERR_ARG;/if (0) return RX_PATH_ERR_ARG;/'
-run encode-lineage '/rc = check_lineage(p); \/\* never serialize/d'
-run equal-constraints 's/constraint_cmp(\&p->constraints\[i - 1\], c) > 0)/constraint_cmp(\&p->constraints[i - 1], c) >= 0)/'
+run semantic-tag 's/text t_rxp_sem_tag "omega.path.v1"/text t_rxp_sem_tag "omega.path.v2"/'
+run tag-terminator '/^fn rxp_raw_semantic_id/,/^end/{/rxp_emit_byte 0/d;}'
+run little-endian '/^fn rxp_emit_u16/,/^end/{s/rxp_emit_byte b0/rxp_emit_byte X/;s/rxp_emit_byte b1/rxp_emit_byte b0/;s/rxp_emit_byte X/rxp_emit_byte b1/;};s/or shl b0 8 b1/or shl b1 8 b0/'
+run step-limit 's/if ge rx_path_step_count pid RX_PATH_MAX_STEPS/if gt rx_path_step_count pid RX_PATH_MAX_STEPS/'
+run input-limit 's/if gt nin RX_PATH_MAX_INPUTS_PER_STEP/if gt nin add RX_PATH_MAX_INPUTS_PER_STEP 1/'
+run size-limit 's/if gt add ulong sz ssz RX_PATH_MAX_TOTAL_SERIALIZATION/if false/'
+run attr-sort '/^fn rx_path_add_attribute/,/^end/{s/if ge rxp_key_cmp_slot_tmp add abase pos klen 0/if false/;}'
+run constraint-sort '/^fn rx_path_add_constraint/,/^end/{s/if gt rxp_cons_cmp_slot_tmp add cbase pos kind plen 0/if false/;}'
+run step-index-check 's/if ne ulong sidx idx/if false/'
+run steps-payload-len 's/if ne ulong slen sub get g_rd 0 get g_rd 1/if false/'
+run trailing-bytes 's/if ne get g_rd 1 get g_rd 0/if false/'
+run magic 's/if or ne get g_dec_in p 79 ne get g_dec_in add p 1 77/if false/'
+run family-role 's/if ne shr role 8 family/if false/'
+run expected-id 's/rc = RX_PATH_ERR_ID_MISMATCH/rc = RX_PATH_OK/'
+run parent-frozen 's/put g_p_frozen parent 1/put g_p_frozen parent 0/'
+run lineage-check '/^fn rxp_check_lineage/,/^end/{s/ret RX_PATH_ERR_ID_MISMATCH/ret RX_PATH_OK/;}'
+run divergence-bound 's/if gt div_idx rx_path_step_count parent/if gt div_idx add 1 rx_path_step_count parent/'
+run prefix-resolve 's/if and ge par 0 lt i divi/if and ge par 0 le i divi/'
+run realization-machine '/^fn rx_path_realization_id/,/^end/{/while lt i 32/,/end/{s/rxp_emit_byte get g_real_ids i/rxp_emit_byte 0/;};}'
+run realization-evidence '/^fn rx_path_realization_id/,/^end/{/while lt i 128/,/end/{s/rxp_emit_byte get g_real_ids i/rxp_emit_byte 0/;};}'
+run shape-check 's/ret rxp_check_step_fields.*/ret RX_PATH_OK/'
+run ancestor-fork 's/if eq ulong q child/if false/'
+run encode-lineage '/^fn rx_path_encode/,/^end/{s/rc = rxp_check_lineage pid/rc = RX_PATH_OK/;}'
+run equal-constraints 's/if gt rxp_cons_cmp_slots sub sl 1 sl 0/if ge rxp_cons_cmp_slots sub sl 1 sl 0/'
 echo "PATH mutations: $killed killed, $((total-killed)) survived ($total total)"

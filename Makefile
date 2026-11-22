@@ -1900,20 +1900,19 @@ gate-mixed-algebra-digital-v1: $(DV1_GATE_BIN) $(DV1_GATE_BIN_ASAN) $(DV1_BOTTOM
 check-mixed-algebra-digital-v1-evidence:
 	sh tests/algebra/ma_digital_v1_check_evidence.sh
 
-# PATH-1 (spec/path-semantic-object.md section 15). BOOTSTRAP / REFERENCE oracle
-# and TEST HARNESS only; no runtime, physics or GPU links.
+# PATH-1 (spec/path-semantic-object.md section 15). Pure seeded OM-2 oracle
+# and test harness; no runtime, physics, C or GPU links.
 PATH1_TEST_BIN := $(OUT_DIR)/tests-path/test_path_identity
 .PHONY: test-path
-$(PATH1_TEST_BIN): src/path/rx_path.c src/path/rx_path.h src/omega_om_units.c src/sha256.h \
-		src/omega_types.h tests/path/test_path_identity.c
+$(PATH1_TEST_BIN): src/path/rx_path.om tests/path/test_path_identity.om seed/out/omc
 	mkdir -p $(dir $@)
-	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Isrc -Isrc/path -o $@ \
-		src/path/rx_path.c src/omega_om_units.c tests/path/test_path_identity.c
+	cat src/path/rx_path.om tests/path/test_path_identity.om | seed/out/omc > $@
+	chmod +x $@
 
 test-path: $(PATH1_TEST_BIN)
 	sh tests/path/check_path_boundary.sh
 	./$(PATH1_TEST_BIN)
-	CC="$(CC)" sh tests/path/mutate.sh
+	OMC="$(CURDIR)/seed/out/omc" sh tests/path/mutate.sh
 
 # COMPOSITION-2: one World, one causal path (rx_compose). test-composition
 # runs every fault point in process and as a crashed child, the OLD-or-NEW

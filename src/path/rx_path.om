@@ -1,0 +1,1882 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/path/rx_path.om -- pure seeded OM-2 PATH-1 native identity, construction,
+note canonical big-endian wire codec, fork-prefix lineage verification, and
+note realization separation (spec/path-semantic-object.md sections 4..7 and 15).
+note Replaces src/path/rx_path.c and src/path/rx_path.h.
+note
+note A PATH IS EVIDENCE, NEVER AUTHORITY (spec 8.2, invariant I1):
+note no runtime links, no capability validation, no authority entry points,
+note no heap, no threads, no system calls.
+om2
+
+text t_rxp_sha_tbl "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+
+text t_rxp_sem_tag "omega.path.v1"
+text t_rxp_real_tag "omega.path.realization.v1"
+
+const RX_PATH_OK long 0
+const RX_PATH_ERR_STEP_LIMIT long -80
+const RX_PATH_ERR_INPUT_LIMIT long -81
+const RX_PATH_ERR_OUTPUT_LIMIT long -82
+const RX_PATH_ERR_PARAM_LIMIT long -83
+const RX_PATH_ERR_ATTR_LIMIT long -84
+const RX_PATH_ERR_CONST_LIMIT long -85
+const RX_PATH_ERR_BUFFER_OVERFLOW long -86
+const RX_PATH_ERR_MALFORMED long -87
+const RX_PATH_ERR_ID_MISMATCH long -88
+const RX_PATH_ERR_FROZEN long -89
+const RX_PATH_ERR_ARG long -90
+const RX_PATH_ERR_CAPACITY long -91
+
+const RX_PATH_HEADER_BYTES ulong 106
+const RX_PATH_MAX_STEPS ulong 512
+const RX_PATH_MAX_INPUTS_PER_STEP ulong 8
+const RX_PATH_MAX_OUTPUTS_PER_STEP ulong 8
+const RX_PATH_MAX_PARAM_LEN ulong 1024
+const RX_PATH_MAX_ATTR_COUNT ulong 32
+const RX_PATH_MAX_CONSTRAINT_COUNT ulong 16
+const RX_PATH_MAX_TOTAL_SERIALIZATION ulong 65536
+const RX_PATH_MAX_KEY_BYTES ulong 63
+const RX_PATH_MAX_VAL_LEN ulong 512
+const RX_PATH_MAX_CONSTRAINT_PAYLOAD ulong 128
+const RX_PATH_ARENA_STEPS ulong 2048
+const RX_PATH_MAX_FORK_DEPTH ulong 64
+
+note Step arena (2048 fixed slots; zero heap)
+global g_arena_used ulong 1
+global g_st_fam ulong 2048
+global g_st_role ulong 2048
+global g_st_nin ulong 2048
+global g_st_nout ulong 2048
+global g_st_plen ulong 2048
+global g_st_in uchar 524288
+global g_st_op uchar 65536
+global g_st_out uchar 524288
+global g_st_param uchar 2097152
+
+note Path slots (8 fixed slots: 0..7)
+global g_p_parent long 8
+global g_p_pid uchar 256
+global g_p_div ulong 8
+global g_p_tcnt ulong 8
+global g_p_tail ulong 4096
+global g_p_start uchar 256
+global g_p_end uchar 256
+global g_p_ctx uchar 256
+global g_p_acnt ulong 8
+global g_p_ccnt ulong 8
+global g_p_frozen uchar 8
+
+note Attributes: 8 * 32 = 256 slots (key 64B, val 512B)
+global g_a_klen ulong 256
+global g_a_key uchar 16384
+global g_a_vlen ulong 256
+global g_a_val uchar 131072
+
+note Constraints: 8 * 16 = 128 slots (payload 128B)
+global g_c_kind ulong 128
+global g_c_plen ulong 128
+global g_c_pay uchar 16384
+
+note Staging step buffer for rx_path_append / rx_path_get_step
+note g_ts_meta: [0]=fam [1]=role [2]=nin [3]=nout [4]=plen
+global g_ts_meta ulong 5
+global g_ts_in uchar 320
+global g_ts_op uchar 32
+global g_ts_out uchar 320
+global g_ts_param uchar 1024
+
+note Staging attribute / constraint / anchor / realization buffers
+global g_tmp_key uchar 64
+global g_tmp_val uchar 512
+global g_tmp_pay uchar 128
+global g_tmp_ids uchar 96
+global g_real_ids uchar 128
+global g_real_sched ulong 1
+
+note Internal SHA-256 state
+global g_rsk uint 72
+global g_rsw uint 64
+global g_rsv uint 8
+global g_rsh uint 8
+global g_rsbuf uchar 64
+global g_rsmeta ulong 3
+
+note Emit / Wire / Decode state
+note g_em: [0]=use_buf [1]=cap [2]=pos [3]=use_hash
+global g_em ulong 4
+global g_wire uchar 65600
+global g_dec_in uchar 65600
+note g_rd: [0]=len [1]=pos
+global g_rd ulong 2
+global g_id_out uchar 32
+global g_id_chk uchar 32
+
+note ---- SHA-256 ----
+fn rxp_sha_init_tbl to void
+  if ne get g_rsmeta 2 0
+    ret
+  end
+  pos = ulong 0
+  n = len t_rxp_sha_tbl
+  idx = ulong 0
+  while lt idx 72
+    while lt pos n
+      if ne get t_rxp_sha_tbl pos 32
+        break
+      end
+      pos = add pos 1
+    end
+    v = ulong 0
+    while lt pos n
+      c = get t_rxp_sha_tbl pos
+      if or lt c 48 gt c 57
+        break
+      end
+      v = add mul v 10 ulong sub c 48
+      pos = add pos 1
+    end
+    put g_rsk idx uint v
+    idx = add idx 1
+  end
+  put g_rsmeta 2 1
+end
+
+fn rxp_rotr32 x uint k uint to uint
+  ret or shr x k shl x sub uint 32 k
+end
+
+fn rxp_sha_load_w to void
+  i = ulong 0
+  while lt i 16
+    o = mul i 4
+    b0 = uint get g_rsbuf o
+    b1 = uint get g_rsbuf add o 1
+    b2 = uint get g_rsbuf add o 2
+    b3 = uint get g_rsbuf add o 3
+    put g_rsw i or or shl b0 24 shl b1 16 or shl b2 8 b3
+    i = add i 1
+  end
+  i = ulong 16
+  while lt i 64
+    w15 = get g_rsw sub i 15
+    s0 = xor xor rxp_rotr32 w15 7 rxp_rotr32 w15 18 shr w15 3
+    w2 = get g_rsw sub i 2
+    s1 = xor xor rxp_rotr32 w2 17 rxp_rotr32 w2 19 shr w2 10
+    v = add get g_rsw sub i 16 s0
+    v = add v get g_rsw sub i 7
+    put g_rsw i add v s1
+    i = add i 1
+  end
+end
+
+fn rxp_sha_round i ulong to void
+  e = get g_rsv 4
+  f = get g_rsv 5
+  g = get g_rsv 6
+  S1 = xor xor rxp_rotr32 e 6 rxp_rotr32 e 11 rxp_rotr32 e 25
+  ch = xor and e f and xor e 4294967295 g
+  t1 = add add get g_rsv 7 S1 add ch add get g_rsk i get g_rsw i
+  put g_rsv 7 g
+  put g_rsv 6 f
+  put g_rsv 5 e
+  put g_rsv 4 add get g_rsv 3 t1
+  a = get g_rsv 0
+  b = get g_rsv 1
+  c = get g_rsv 2
+  S0 = xor xor rxp_rotr32 a 2 rxp_rotr32 a 13 rxp_rotr32 a 22
+  maj = xor xor and a b and a c and b c
+  t2 = add S0 maj
+  put g_rsv 3 c
+  put g_rsv 2 b
+  put g_rsv 1 a
+  put g_rsv 0 add t1 t2
+end
+
+fn rxp_sha_compress to void
+  rxp_sha_load_w
+  i = ulong 0
+  while lt i 8
+    put g_rsv i get g_rsh i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 64
+    rxp_sha_round i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 8
+    put g_rsh i add get g_rsh i get g_rsv i
+    i = add i 1
+  end
+end
+
+fn rxp_sha_init to void
+  rxp_sha_init_tbl
+  i = ulong 0
+  while lt i 8
+    put g_rsh i get g_rsk add 64 i
+    i = add i 1
+  end
+  put g_rsmeta 0 0
+  put g_rsmeta 1 0
+end
+
+fn rxp_sha_byte b uchar to void
+  bl = get g_rsmeta 0
+  put g_rsbuf bl b
+  bl = add bl 1
+  put g_rsmeta 1 add get g_rsmeta 1 1
+  if eq bl 64
+    rxp_sha_compress
+    bl = 0
+  end
+  put g_rsmeta 0 bl
+end
+
+fn rxp_sha_final_to_id_out to void
+  bl = get g_rsmeta 0
+  bits = mul get g_rsmeta 1 8
+  put g_rsbuf bl 128
+  bl = add bl 1
+  if gt bl 56
+    while lt bl 64
+      put g_rsbuf bl 0
+      bl = add bl 1
+    end
+    rxp_sha_compress
+    bl = 0
+  end
+  while lt bl 56
+    put g_rsbuf bl 0
+    bl = add bl 1
+  end
+  i = ulong 0
+  while lt i 8
+    put g_rsbuf add 56 i uchar and shr bits mul sub 7 i 8 255
+    i = add i 1
+  end
+  rxp_sha_compress
+  i = ulong 0
+  while lt i 8
+    v = get g_rsh i
+    o = mul i 4
+    put g_id_out o uchar and shr v 24 255
+    put g_id_out add o 1 uchar and shr v 16 255
+    put g_id_out add o 2 uchar and shr v 8 255
+    put g_id_out add o 3 uchar and v 255
+    i = add i 1
+  end
+end
+
+note ---- Emit sink ----
+fn rxp_emit_byte b uchar to void
+  pos = get g_em 2
+  if ne get g_em 0 0
+    if lt pos get g_em 1
+      put g_wire pos b
+    end
+  end
+  if ne get g_em 3 0
+    rxp_sha_byte b
+  end
+  put g_em 2 add pos 1
+end
+
+fn rxp_emit_u16 v ulong to void
+  b0 = uchar and shr v 8 255
+  b1 = uchar and v 255
+  rxp_emit_byte b0
+  rxp_emit_byte b1
+end
+
+fn rxp_emit_u32 v ulong to void
+  rxp_emit_byte uchar and shr v 24 255
+  rxp_emit_byte uchar and shr v 16 255
+  rxp_emit_byte uchar and shr v 8 255
+  rxp_emit_byte uchar and v 255
+end
+
+fn rxp_emit_lit s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n
+    rxp_emit_byte get s i
+    i = add i 1
+  end
+end
+
+note ---- Validation & comparison ----
+fn rxp_role_cap family ulong to ulong
+  if eq family 1
+    ret 4
+  end
+  if eq family 2
+    ret 4
+  end
+  if eq family 3
+    ret 7
+  end
+  if eq family 4
+    ret 7
+  end
+  if eq family 5
+    ret 6
+  end
+  ret 0
+end
+
+fn rxp_valid_role family ulong role ulong to bool
+  cap = rxp_role_cap family
+  if eq cap 0
+    ret false
+  end
+  if ne shr role 8 family
+    ret false
+  end
+  lo = and role 255
+  if or lt lo 1 gt lo cap
+    ret false
+  end
+  ret true
+end
+
+fn rxp_check_step_fields fam ulong role ulong nin ulong nout ulong plen ulong to long
+  if not rxp_valid_role fam role
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if gt nin RX_PATH_MAX_INPUTS_PER_STEP
+    ret RX_PATH_ERR_INPUT_LIMIT
+  end
+  if gt nout RX_PATH_MAX_OUTPUTS_PER_STEP
+    ret RX_PATH_ERR_OUTPUT_LIMIT
+  end
+  if gt plen RX_PATH_MAX_PARAM_LEN
+    ret RX_PATH_ERR_PARAM_LIMIT
+  end
+  ret RX_PATH_OK
+end
+
+fn rxp_check_arena_step sidx ulong to long
+  ret rxp_check_step_fields get g_st_fam sidx get g_st_role sidx get g_st_nin sidx get g_st_nout sidx get g_st_plen sidx
+end
+
+fn rxp_step_size_vals nin ulong nout ulong plen ulong to ulong
+  ret add add add 46 mul 32 nin mul 32 nout plen
+end
+
+fn rxp_arena_step_size sidx ulong to ulong
+  ret rxp_step_size_vals get g_st_nin sidx get g_st_nout sidx get g_st_plen sidx
+end
+
+fn rxp_key_cmp_slot_tmp slot ulong klen ulong to long
+  alen = get g_a_klen slot
+  n = alen
+  if lt klen n
+    n = klen
+  end
+  ao = mul slot 64
+  i = ulong 0
+  while lt i n
+    xa = get g_a_key add ao i
+    xb = get g_tmp_key i
+    if lt xa xb
+      ret neg long 1
+    end
+    if gt xa xb
+      ret 1
+    end
+    i = add i 1
+  end
+  if lt alen klen
+    ret neg long 1
+  end
+  if gt alen klen
+    ret 1
+  end
+  ret 0
+end
+
+fn rxp_key_cmp_slots sa ulong sb ulong to long
+  alen = get g_a_klen sa
+  blen = get g_a_klen sb
+  n = alen
+  if lt blen n
+    n = blen
+  end
+  ao = mul sa 64
+  bo = mul sb 64
+  i = ulong 0
+  while lt i n
+    xa = get g_a_key add ao i
+    xb = get g_a_key add bo i
+    if lt xa xb
+      ret neg long 1
+    end
+    if gt xa xb
+      ret 1
+    end
+    i = add i 1
+  end
+  if lt alen blen
+    ret neg long 1
+  end
+  if gt alen blen
+    ret 1
+  end
+  ret 0
+end
+
+fn rxp_cons_cmp_slot_tmp slot ulong kind ulong plen ulong to long
+  ak = get g_c_kind slot
+  if lt ak kind
+    ret neg long 1
+  end
+  if gt ak kind
+    ret 1
+  end
+  alen = get g_c_plen slot
+  n = alen
+  if lt plen n
+    n = plen
+  end
+  ao = mul slot 128
+  i = ulong 0
+  while lt i n
+    xa = get g_c_pay add ao i
+    xb = get g_tmp_pay i
+    if lt xa xb
+      ret neg long 1
+    end
+    if gt xa xb
+      ret 1
+    end
+    i = add i 1
+  end
+  if lt alen plen
+    ret neg long 1
+  end
+  if gt alen plen
+    ret 1
+  end
+  ret 0
+end
+
+fn rxp_cons_cmp_slots sa ulong sb ulong to long
+  ak = get g_c_kind sa
+  bk = get g_c_kind sb
+  if lt ak bk
+    ret neg long 1
+  end
+  if gt ak bk
+    ret 1
+  end
+  alen = get g_c_plen sa
+  blen = get g_c_plen sb
+  n = alen
+  if lt blen n
+    n = blen
+  end
+  ao = mul sa 128
+  bo = mul sb 128
+  i = ulong 0
+  while lt i n
+    xa = get g_c_pay add ao i
+    xb = get g_c_pay add bo i
+    if lt xa xb
+      ret neg long 1
+    end
+    if gt xa xb
+      ret 1
+    end
+    i = add i 1
+  end
+  if lt alen blen
+    ret neg long 1
+  end
+  if gt alen blen
+    ret 1
+  end
+  ret 0
+end
+
+note ---- Path resolution & inspection ----
+fn rx_path_arena_init to void
+  put g_arena_used 0 0
+end
+
+fn rx_path_step_count pid ulong to ulong
+  if ge pid 8
+    ret 0
+  end
+  ret add get g_p_div pid get g_p_tcnt pid
+end
+
+fn rxp_resolve pid ulong i ulong to long
+  cur = pid
+  hops = ulong 0
+  while le hops RX_PATH_MAX_FORK_DEPTH
+    par = get g_p_parent cur
+    divi = get g_p_div cur
+    if and ge par 0 lt i divi
+      cur = ulong par
+      hops = add hops 1
+      continue
+    end
+    if lt i divi
+      ret neg long 1
+    end
+    t = sub i divi
+    if ge t get g_p_tcnt cur
+      ret neg long 1
+    end
+    sidx = get g_p_tail add mul cur 512 t
+    if ge sidx get g_arena_used 0
+      ret neg long 1
+    end
+    ret long sidx
+  end
+  ret neg long 1
+end
+
+fn rxp_fork_depth pid ulong to long
+  d = long 0
+  cur = pid
+  while ge get g_p_parent cur 0
+    cur = ulong get g_p_parent cur
+    d = add d 1
+    if gt d long RX_PATH_MAX_FORK_DEPTH
+      ret neg long 1
+    end
+  end
+  ret d
+end
+
+fn rx_path_clear pid ulong to void
+  put g_p_parent pid neg long 1
+  put g_p_div pid 0
+  put g_p_tcnt pid 0
+  put g_p_acnt pid 0
+  put g_p_ccnt pid 0
+  put g_p_frozen pid 0
+  o = mul pid 32
+  i = ulong 0
+  while lt i 32
+    put g_p_pid add o i 0
+    put g_p_start add o i 0
+    put g_p_end add o i 0
+    put g_p_ctx add o i 0
+    i = add i 1
+  end
+end
+
+fn rx_path_init pid ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  rx_path_clear pid
+  o = mul pid 32
+  i = ulong 0
+  while lt i 32
+    put g_p_start add o i get g_tmp_ids i
+    put g_p_end add o i get g_tmp_ids add 32 i
+    put g_p_ctx add o i get g_tmp_ids add 64 i
+    i = add i 1
+  end
+  ret RX_PATH_OK
+end
+
+fn rx_path_set_end_anchor pid ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  if ne get g_p_frozen pid 0
+    ret RX_PATH_ERR_FROZEN
+  end
+  o = mul pid 32
+  i = ulong 0
+  while lt i 32
+    put g_p_end add o i get g_tmp_ids i
+    i = add i 1
+  end
+  ret RX_PATH_OK
+end
+
+fn rxp_check_shape pid ulong to long
+  if gt get g_p_acnt pid RX_PATH_MAX_ATTR_COUNT
+    ret RX_PATH_ERR_ATTR_LIMIT
+  end
+  if gt get g_p_ccnt pid RX_PATH_MAX_CONSTRAINT_COUNT
+    ret RX_PATH_ERR_CONST_LIMIT
+  end
+  if gt get g_p_tcnt pid RX_PATH_MAX_STEPS
+    ret RX_PATH_ERR_STEP_LIMIT
+  end
+  count = rx_path_step_count pid
+  if gt count RX_PATH_MAX_STEPS
+    ret RX_PATH_ERR_STEP_LIMIT
+  end
+  i = ulong 0
+  ac = get g_p_acnt pid
+  abase = mul pid 32
+  while lt i ac
+    sl = add abase i
+    kl = get g_a_klen sl
+    if or eq kl 0 or gt kl RX_PATH_MAX_KEY_BYTES gt get g_a_vlen sl RX_PATH_MAX_VAL_LEN
+      ret RX_PATH_ERR_MALFORMED
+    end
+    i = add i 1
+  end
+  i = ulong 0
+  cc = get g_p_ccnt pid
+  cbase = mul pid 16
+  while lt i cc
+    if gt get g_c_plen add cbase i RX_PATH_MAX_CONSTRAINT_PAYLOAD
+      ret RX_PATH_ERR_MALFORMED
+    end
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i count
+    s = rxp_resolve pid i
+    if lt s 0
+      ret RX_PATH_ERR_MALFORMED
+    end
+    rc = rxp_check_arena_step ulong s
+    if ne rc 0
+      ret rc
+    end
+    i = add i 1
+  end
+  ret RX_PATH_OK
+end
+
+fn rx_path_encoded_size pid ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  rc = rxp_check_shape pid
+  if ne rc 0
+    ret rc
+  end
+  n = RX_PATH_HEADER_BYTES
+  i = ulong 0
+  ac = get g_p_acnt pid
+  abase = mul pid 32
+  while lt i ac
+    sl = add abase i
+    n = add n add 3 add get g_a_klen sl get g_a_vlen sl
+    i = add i 1
+  end
+  n = add n 2
+  i = ulong 0
+  cc = get g_p_ccnt pid
+  cbase = mul pid 16
+  while lt i cc
+    n = add n add 4 get g_c_plen add cbase i
+    i = add i 1
+  end
+  n = add n 4
+  count = rx_path_step_count pid
+  i = ulong 0
+  while lt i count
+    s = rxp_resolve pid i
+    n = add n rxp_arena_step_size ulong s
+    i = add i 1
+  end
+  ret long n
+end
+
+fn rxp_attr_move dst ulong src ulong to void
+  kl = get g_a_klen src
+  vl = get g_a_vlen src
+  put g_a_klen dst kl
+  put g_a_vlen dst vl
+  dk = mul dst 64
+  sk = mul src 64
+  i = ulong 0
+  while lt i kl
+    put g_a_key add dk i get g_a_key add sk i
+    i = add i 1
+  end
+  dk = mul dst 512
+  sk = mul src 512
+  i = 0
+  while lt i vl
+    put g_a_val add dk i get g_a_val add sk i
+    i = add i 1
+  end
+end
+
+fn rxp_write_attr_slot sl ulong klen ulong vlen ulong to void
+  put g_a_klen sl klen
+  put g_a_vlen sl vlen
+  dk = mul sl 64
+  i = ulong 0
+  while lt i klen
+    put g_a_key add dk i get g_tmp_key i
+    i = add i 1
+  end
+  dk = mul sl 512
+  i = ulong 0
+  while lt i vlen
+    put g_a_val add dk i get g_tmp_val i
+    i = add i 1
+  end
+end
+
+fn rx_path_add_attribute pid ulong klen ulong vlen ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  if ne get g_p_frozen pid 0
+    ret RX_PATH_ERR_FROZEN
+  end
+  if or eq klen 0 or gt klen RX_PATH_MAX_KEY_BYTES gt vlen RX_PATH_MAX_VAL_LEN
+    ret RX_PATH_ERR_ARG
+  end
+  ac = get g_p_acnt pid
+  if ge ac RX_PATH_MAX_ATTR_COUNT
+    ret RX_PATH_ERR_ATTR_LIMIT
+  end
+  sz = rx_path_encoded_size pid
+  if lt sz 0
+    ret sz
+  end
+  if gt add ulong sz add 3 add klen vlen RX_PATH_MAX_TOTAL_SERIALIZATION
+    ret RX_PATH_ERR_BUFFER_OVERFLOW
+  end
+  abase = mul pid 32
+  pos = ulong 0
+  while lt pos ac
+    if ge rxp_key_cmp_slot_tmp add abase pos klen 0
+      break
+    end
+    pos = add pos 1
+  end
+  if lt pos ac
+    if eq rxp_key_cmp_slot_tmp add abase pos klen 0
+      ret RX_PATH_ERR_MALFORMED
+    end
+  end
+  j = ac
+  while gt j pos
+    rxp_attr_move add abase j add abase sub j 1
+    j = sub j 1
+  end
+  rxp_write_attr_slot add abase pos klen vlen
+  put g_p_acnt pid add ac 1
+  ret RX_PATH_OK
+end
+
+fn rxp_cons_move dst ulong src ulong to void
+  pl = get g_c_plen src
+  put g_c_kind dst get g_c_kind src
+  put g_c_plen dst pl
+  dp = mul dst 128
+  sp = mul src 128
+  i = ulong 0
+  while lt i pl
+    put g_c_pay add dp i get g_c_pay add sp i
+    i = add i 1
+  end
+end
+
+fn rxp_write_cons_slot sl ulong kind ulong plen ulong to void
+  put g_c_kind sl kind
+  put g_c_plen sl plen
+  dp = mul sl 128
+  i = ulong 0
+  while lt i plen
+    put g_c_pay add dp i get g_tmp_pay i
+    i = add i 1
+  end
+end
+
+fn rx_path_add_constraint pid ulong kind ulong plen ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  if ne get g_p_frozen pid 0
+    ret RX_PATH_ERR_FROZEN
+  end
+  if gt plen RX_PATH_MAX_CONSTRAINT_PAYLOAD
+    ret RX_PATH_ERR_ARG
+  end
+  cc = get g_p_ccnt pid
+  if ge cc RX_PATH_MAX_CONSTRAINT_COUNT
+    ret RX_PATH_ERR_CONST_LIMIT
+  end
+  sz = rx_path_encoded_size pid
+  if lt sz 0
+    ret sz
+  end
+  if gt add ulong sz add 4 plen RX_PATH_MAX_TOTAL_SERIALIZATION
+    ret RX_PATH_ERR_BUFFER_OVERFLOW
+  end
+  cbase = mul pid 16
+  pos = ulong 0
+  while lt pos cc
+    if gt rxp_cons_cmp_slot_tmp add cbase pos kind plen 0
+      break
+    end
+    pos = add pos 1
+  end
+  j = cc
+  while gt j pos
+    rxp_cons_move add cbase j add cbase sub j 1
+    j = sub j 1
+  end
+  rxp_write_cons_slot add cbase pos kind plen
+  put g_p_ccnt pid add cc 1
+  ret RX_PATH_OK
+end
+
+fn rxp_store_tmp_step_a sidx ulong nin ulong to void
+  off = mul sidx 256
+  lim = mul nin 32
+  i = ulong 0
+  while lt i lim
+    put g_st_in add off i get g_ts_in i
+    i = add i 1
+  end
+  off = mul sidx 32
+  i = ulong 0
+  while lt i 32
+    put g_st_op add off i get g_ts_op i
+    i = add i 1
+  end
+end
+
+fn rxp_store_tmp_step_b sidx ulong nout ulong plen ulong to void
+  off = mul sidx 256
+  lim = mul nout 32
+  i = ulong 0
+  while lt i lim
+    put g_st_out add off i get g_ts_out i
+    i = add i 1
+  end
+  off = mul sidx 1024
+  i = ulong 0
+  while lt i plen
+    put g_st_param add off i get g_ts_param i
+    i = add i 1
+  end
+end
+
+fn rxp_store_tmp_step sidx ulong to void
+  nin = get g_ts_meta 2
+  nout = get g_ts_meta 3
+  plen = get g_ts_meta 4
+  put g_st_fam sidx get g_ts_meta 0
+  put g_st_role sidx get g_ts_meta 1
+  put g_st_nin sidx nin
+  put g_st_nout sidx nout
+  put g_st_plen sidx plen
+  rxp_store_tmp_step_a sidx nin
+  rxp_store_tmp_step_b sidx nout plen
+end
+
+fn rx_path_append pid ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  if ne get g_p_frozen pid 0
+    ret RX_PATH_ERR_FROZEN
+  end
+  if ge rx_path_step_count pid RX_PATH_MAX_STEPS
+    ret RX_PATH_ERR_STEP_LIMIT
+  end
+  rc = rxp_check_step_fields get g_ts_meta 0 get g_ts_meta 1 get g_ts_meta 2 get g_ts_meta 3 get g_ts_meta 4
+  if ne rc 0
+    ret rc
+  end
+  sz = rx_path_encoded_size pid
+  if lt sz 0
+    ret sz
+  end
+  ssz = rxp_step_size_vals get g_ts_meta 2 get g_ts_meta 3 get g_ts_meta 4
+  if gt add ulong sz ssz RX_PATH_MAX_TOTAL_SERIALIZATION
+    ret RX_PATH_ERR_BUFFER_OVERFLOW
+  end
+  u = get g_arena_used 0
+  if ge u RX_PATH_ARENA_STEPS
+    ret RX_PATH_ERR_CAPACITY
+  end
+  rxp_store_tmp_step u
+  tc = get g_p_tcnt pid
+  put g_p_tail add mul pid 512 tc u
+  put g_p_tcnt pid add tc 1
+  put g_arena_used 0 add u 1
+  ret RX_PATH_OK
+end
+
+fn rxp_load_step_a sidx ulong nin ulong to void
+  off = mul sidx 256
+  lim = mul nin 32
+  j = ulong 0
+  while lt j lim
+    put g_ts_in j get g_st_in add off j
+    j = add j 1
+  end
+  off = mul sidx 32
+  j = ulong 0
+  while lt j 32
+    put g_ts_op j get g_st_op add off j
+    j = add j 1
+  end
+end
+
+fn rxp_load_step_b sidx ulong nout ulong plen ulong to void
+  off = mul sidx 256
+  lim = mul nout 32
+  j = ulong 0
+  while lt j lim
+    put g_ts_out j get g_st_out add off j
+    j = add j 1
+  end
+  off = mul sidx 1024
+  j = ulong 0
+  while lt j plen
+    put g_ts_param j get g_st_param add off j
+    j = add j 1
+  end
+end
+
+fn rx_path_get_step pid ulong i ulong to long
+  if or ge pid 8 ge i rx_path_step_count pid
+    ret RX_PATH_ERR_ARG
+  end
+  s = rxp_resolve pid i
+  if lt s 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  sidx = ulong s
+  nin = get g_st_nin sidx
+  nout = get g_st_nout sidx
+  plen = get g_st_plen sidx
+  put g_ts_meta 0 get g_st_fam sidx
+  put g_ts_meta 1 get g_st_role sidx
+  put g_ts_meta 2 nin
+  put g_ts_meta 3 nout
+  put g_ts_meta 4 plen
+  rxp_load_step_a sidx nin
+  rxp_load_step_b sidx nout plen
+  ret RX_PATH_OK
+end
+
+note ---- Canonical encoding & identity ----
+fn rxp_emit_step_a idx ulong sidx ulong to void
+  rxp_emit_u16 idx
+  rxp_emit_u16 get g_st_fam sidx
+  rxp_emit_u16 get g_st_role sidx
+  nin = get g_st_nin sidx
+  rxp_emit_u16 nin
+  off = mul sidx 256
+  lim = mul nin 32
+  k = ulong 0
+  while lt k lim
+    rxp_emit_byte get g_st_in add off k
+    k = add k 1
+  end
+  off = mul sidx 32
+  k = ulong 0
+  while lt k 32
+    rxp_emit_byte get g_st_op add off k
+    k = add k 1
+  end
+end
+
+fn rxp_emit_step_b sidx ulong to void
+  nout = get g_st_nout sidx
+  rxp_emit_u16 nout
+  off = mul sidx 256
+  lim = mul nout 32
+  k = ulong 0
+  while lt k lim
+    rxp_emit_byte get g_st_out add off k
+    k = add k 1
+  end
+  lim = get g_st_plen sidx
+  rxp_emit_u32 lim
+  off = mul sidx 1024
+  k = ulong 0
+  while lt k lim
+    rxp_emit_byte get g_st_param add off k
+    k = add k 1
+  end
+end
+
+fn rxp_emit_step idx ulong sidx ulong to void
+  rxp_emit_step_a idx sidx
+  rxp_emit_step_b sidx
+end
+
+fn rxp_emit_attrs pid ulong to void
+  ac = get g_p_acnt pid
+  rxp_emit_u16 ac
+  abase = mul pid 32
+  i = ulong 0
+  while lt i ac
+    sl = add abase i
+    ln = get g_a_klen sl
+    rxp_emit_byte uchar ln
+    off = mul sl 64
+    j = ulong 0
+    while lt j ln
+      rxp_emit_byte get g_a_key add off j
+      j = add j 1
+    end
+    ln = get g_a_vlen sl
+    rxp_emit_u16 ln
+    off = mul sl 512
+    j = ulong 0
+    while lt j ln
+      rxp_emit_byte get g_a_val add off j
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+fn rxp_emit_cons pid ulong to void
+  cc = get g_p_ccnt pid
+  rxp_emit_u16 cc
+  cbase = mul pid 16
+  i = ulong 0
+  while lt i cc
+    sl = add cbase i
+    rxp_emit_u16 get g_c_kind sl
+    pl = get g_c_plen sl
+    rxp_emit_u16 pl
+    po = mul sl 128
+    j = ulong 0
+    while lt j pl
+      rxp_emit_byte get g_c_pay add po j
+      j = add j 1
+    end
+    i = add i 1
+  end
+end
+
+fn rxp_emit_attrs_cons pid ulong to void
+  rxp_emit_attrs pid
+  rxp_emit_cons pid
+end
+
+fn rxp_emit_path pid ulong to long
+  sz = rx_path_encoded_size pid
+  if lt sz 0
+    ret sz
+  end
+  if gt ulong sz RX_PATH_MAX_TOTAL_SERIALIZATION
+    ret RX_PATH_ERR_BUFFER_OVERFLOW
+  end
+  count = rx_path_step_count pid
+  steps_len = ulong 0
+  i = ulong 0
+  while lt i count
+    s = rxp_resolve pid i
+    steps_len = add steps_len rxp_arena_step_size ulong s
+    i = add i 1
+  end
+  rxp_emit_byte 79
+  rxp_emit_byte 77
+  rxp_emit_byte 71
+  rxp_emit_byte 48
+  rxp_emit_byte 1
+  rxp_emit_byte 12
+  rxp_emit_u16 count
+  po = mul pid 32
+  i = ulong 0
+  while lt i 32
+    rxp_emit_byte get g_p_start add po i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    rxp_emit_byte get g_p_end add po i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    rxp_emit_byte get g_p_ctx add po i
+    i = add i 1
+  end
+  rxp_emit_attrs_cons pid
+  rxp_emit_u32 steps_len
+  i = ulong 0
+  while lt i count
+    s = rxp_resolve pid i
+    rxp_emit_step i ulong s
+    i = add i 1
+  end
+  ret RX_PATH_OK
+end
+
+fn rxp_raw_semantic_id pid ulong to long
+  rxp_sha_init
+  put g_em 0 0
+  put g_em 1 0
+  put g_em 2 0
+  put g_em 3 1
+  rxp_emit_lit t_rxp_sem_tag
+  rxp_emit_byte 0
+  rc = rxp_emit_path pid
+  if ne rc 0
+    ret rc
+  end
+  rxp_sha_final_to_id_out
+  ret RX_PATH_OK
+end
+
+fn rxp_check_lineage pid ulong to long
+  if lt rxp_fork_depth pid 0
+    ret RX_PATH_ERR_CAPACITY
+  end
+  cur = pid
+  while ge get g_p_parent cur 0
+    par = ulong get g_p_parent cur
+    rc = rxp_raw_semantic_id par
+    if ne rc 0
+      ret rc
+    end
+    po = mul cur 32
+    i = ulong 0
+    same = true
+    while lt i 32
+      if ne get g_id_out i get g_p_pid add po i
+        same = false
+        break
+      end
+      i = add i 1
+    end
+    if not same
+      ret RX_PATH_ERR_ID_MISMATCH
+    end
+    cur = par
+  end
+  ret RX_PATH_OK
+end
+
+fn rx_path_encode pid ulong cap ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  sz = rx_path_encoded_size pid
+  if lt sz 0
+    ret sz
+  end
+  rc = rxp_check_lineage pid
+  if ne rc 0
+    ret rc
+  end
+  if or gt ulong sz RX_PATH_MAX_TOTAL_SERIALIZATION gt ulong sz cap
+    ret RX_PATH_ERR_BUFFER_OVERFLOW
+  end
+  put g_em 0 1
+  put g_em 1 cap
+  put g_em 2 0
+  put g_em 3 0
+  rc2 = rxp_emit_path pid
+  if ne rc2 0
+    ret rc2
+  end
+  ret long get g_em 2
+end
+
+fn rx_path_semantic_id pid ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  rc = rxp_check_lineage pid
+  if ne rc 0
+    ret rc
+  end
+  ret rxp_raw_semantic_id pid
+end
+
+fn rx_path_realization_id pid ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  rc = rx_path_semantic_id pid
+  if ne rc 0
+    ret rc
+  end
+  i = ulong 0
+  while lt i 32
+    put g_id_chk i get g_id_out i
+    i = add i 1
+  end
+  rxp_sha_init
+  put g_em 0 0
+  put g_em 1 0
+  put g_em 2 0
+  put g_em 3 1
+  rxp_emit_lit t_rxp_real_tag
+  rxp_emit_byte 0
+  i = ulong 0
+  while lt i 32
+    rxp_emit_byte get g_id_chk i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32
+    rxp_emit_byte get g_real_ids i
+    i = add i 1
+  end
+  i = ulong 32
+  while lt i 64
+    rxp_emit_byte get g_real_ids i
+    i = add i 1
+  end
+  i = ulong 64
+  while lt i 96
+    rxp_emit_byte get g_real_ids i
+    i = add i 1
+  end
+  rxp_emit_u16 get g_real_sched 0
+  i = ulong 96
+  while lt i 128
+    rxp_emit_byte get g_real_ids i
+    i = add i 1
+  end
+  rxp_sha_final_to_id_out
+  ret RX_PATH_OK
+end
+
+note ---- Fork & equality ----
+fn rxp_fork_copy child ulong parent ulong div_idx ulong to void
+  rx_path_clear child
+  put g_p_parent child long parent
+  co = mul child 32
+  po = mul parent 32
+  i = ulong 0
+  while lt i 32
+    put g_p_pid add co i get g_id_out i
+    put g_p_start add co i get g_p_start add po i
+    put g_p_end add co i get g_p_end add po i
+    put g_p_ctx add co i get g_p_ctx add po i
+    i = add i 1
+  end
+  put g_p_div child div_idx
+  ac = get g_p_acnt parent
+  put g_p_acnt child ac
+  i = ulong 0
+  while lt i ac
+    rxp_attr_move add mul child 32 i add mul parent 32 i
+    i = add i 1
+  end
+  ac = get g_p_ccnt parent
+  put g_p_ccnt child ac
+  i = ulong 0
+  while lt i ac
+    rxp_cons_move add mul child 16 i add mul parent 16 i
+    i = add i 1
+  end
+  put g_p_frozen parent 1
+end
+
+fn rx_path_fork child ulong parent ulong div_idx ulong to long
+  if or ge child 8 or ge parent 8 eq child parent
+    ret RX_PATH_ERR_ARG
+  end
+  if gt div_idx rx_path_step_count parent
+    ret RX_PATH_ERR_ARG
+  end
+  d = rxp_fork_depth parent
+  if lt d 0
+    ret RX_PATH_ERR_CAPACITY
+  end
+  if ge ulong d RX_PATH_MAX_FORK_DEPTH
+    ret RX_PATH_ERR_CAPACITY
+  end
+  q = get g_p_parent parent
+  while ge q 0
+    if eq ulong q child
+      ret RX_PATH_ERR_ARG
+    end
+    q = get g_p_parent ulong q
+  end
+  rc = rx_path_semantic_id parent
+  if ne rc 0
+    ret rc
+  end
+  rxp_fork_copy child parent div_idx
+  ret RX_PATH_OK
+end
+
+fn rxp_step_eq_a sa ulong sb ulong nin ulong to bool
+  lim = mul nin 32
+  oa = mul sa 256
+  ob = mul sb 256
+  i = ulong 0
+  while lt i lim
+    if ne get g_st_in add oa i get g_st_in add ob i
+      ret false
+    end
+    i = add i 1
+  end
+  oa = mul sa 32
+  ob = mul sb 32
+  i = ulong 0
+  while lt i 32
+    if ne get g_st_op add oa i get g_st_op add ob i
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn rxp_step_eq_out sa ulong sb ulong nout ulong to bool
+  lim = mul nout 32
+  oa = mul sa 256
+  ob = mul sb 256
+  i = ulong 0
+  while lt i lim
+    va = get g_st_out add oa i
+    vb = get g_st_out add ob i
+    if ne va vb
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn rxp_step_eq_param sa ulong sb ulong plen ulong to bool
+  oa = mul sa 1024
+  ob = mul sb 1024
+  i = ulong 0
+  while lt i plen
+    va = get g_st_param add oa i
+    vb = get g_st_param add ob i
+    if ne va vb
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn rxp_step_eq sa ulong sb ulong to bool
+  if ne get g_st_fam sa get g_st_fam sb
+    ret false
+  end
+  if ne get g_st_role sa get g_st_role sb
+    ret false
+  end
+  nin = get g_st_nin sa
+  if ne nin get g_st_nin sb
+    ret false
+  end
+  nout = get g_st_nout sa
+  if ne nout get g_st_nout sb
+    ret false
+  end
+  plen = get g_st_plen sa
+  if ne plen get g_st_plen sb
+    ret false
+  end
+  if not rxp_step_eq_a sa sb nin
+    ret false
+  end
+  if not rxp_step_eq_out sa sb nout
+    ret false
+  end
+  ret rxp_step_eq_param sa sb plen
+end
+
+fn rxp_eq_anchors a ulong b ulong to bool
+  ao = mul a 32
+  bo = mul b 32
+  i = ulong 0
+  while lt i 32
+    if ne get g_p_start add ao i get g_p_start add bo i
+      ret false
+    end
+    if ne get g_p_end add ao i get g_p_end add bo i
+      ret false
+    end
+    if ne get g_p_ctx add ao i get g_p_ctx add bo i
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn rxp_eq_attr_val sa ulong sb ulong to bool
+  vl = get g_a_vlen sa
+  if ne vl get g_a_vlen sb
+    ret false
+  end
+  va = mul sa 512
+  vb = mul sb 512
+  j = ulong 0
+  while lt j vl
+    a0 = get g_a_val add va j
+    b0 = get g_a_val add vb j
+    if ne a0 b0
+      ret false
+    end
+    j = add j 1
+  end
+  ret true
+end
+
+fn rxp_eq_attrs a ulong b ulong to bool
+  ac = get g_p_acnt a
+  if ne ac get g_p_acnt b
+    ret false
+  end
+  i = ulong 0
+  while lt i ac
+    sa = add mul a 32 i
+    sb = add mul b 32 i
+    if ne rxp_key_cmp_slots sa sb 0
+      ret false
+    end
+    if not rxp_eq_attr_val sa sb
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn rx_path_equal a ulong b ulong to long
+  if or ge a 8 ge b 8
+    ret RX_PATH_ERR_ARG
+  end
+  rc = rxp_check_shape a
+  if ne rc 0
+    ret rc
+  end
+  rc = rxp_check_shape b
+  if ne rc 0
+    ret rc
+  end
+  n = rx_path_step_count a
+  if ne n rx_path_step_count b
+    ret 0
+  end
+  if not rxp_eq_anchors a b
+    ret 0
+  end
+  if not rxp_eq_attrs a b
+    ret 0
+  end
+  cc = get g_p_ccnt a
+  if ne cc get g_p_ccnt b
+    ret 0
+  end
+  i = ulong 0
+  while lt i cc
+    if ne rxp_cons_cmp_slots add mul a 16 i add mul b 16 i 0
+      ret 0
+    end
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i n
+    sa = rxp_resolve a i
+    sb = rxp_resolve b i
+    if or lt sa 0 lt sb 0
+      ret RX_PATH_ERR_MALFORMED
+    end
+    if not rxp_step_eq ulong sa ulong sb
+      ret 0
+    end
+    i = add i 1
+  end
+  ret 1
+end
+
+note ---- Decoder ----
+fn rxp_rd_avail k ulong to bool
+  ret le k sub get g_rd 0 get g_rd 1
+end
+
+fn rxp_rd_u8 to long
+  if not rxp_rd_avail 1
+    ret neg long 1
+  end
+  p = get g_rd 1
+  put g_rd 1 add p 1
+  ret long get g_dec_in p
+end
+
+fn rxp_rd_u16 to long
+  if not rxp_rd_avail 2
+    ret neg long 1
+  end
+  p = get g_rd 1
+  put g_rd 1 add p 2
+  b0 = ulong get g_dec_in p
+  b1 = ulong get g_dec_in add p 1
+  ret long or shl b0 8 b1
+end
+
+fn rxp_rd_u32 to long
+  if not rxp_rd_avail 4
+    ret neg long 1
+  end
+  p = get g_rd 1
+  put g_rd 1 add p 4
+  b0 = ulong get g_dec_in p
+  b1 = ulong get g_dec_in add p 1
+  b2 = ulong get g_dec_in add p 2
+  b3 = ulong get g_dec_in add p 3
+  ret long or or shl b0 24 shl b1 16 or shl b2 8 b3
+end
+
+fn rxp_dec_header pid ulong to long
+  if not rxp_rd_avail RX_PATH_HEADER_BYTES
+    ret RX_PATH_ERR_MALFORMED
+  end
+  p = get g_rd 1
+  if or ne get g_dec_in p 79 ne get g_dec_in add p 1 77
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if or ne get g_dec_in add p 2 71 ne get g_dec_in add p 3 48
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if or ne get g_dec_in add p 4 1 ne get g_dec_in add p 5 12
+    ret RX_PATH_ERR_MALFORMED
+  end
+  put g_rd 1 add p 6
+  cnt = rxp_rd_u16
+  if lt cnt 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if gt ulong cnt RX_PATH_MAX_STEPS
+    ret RX_PATH_ERR_STEP_LIMIT
+  end
+  po = mul pid 32
+  p2 = get g_rd 1
+  i = ulong 0
+  while lt i 32
+    put g_p_start add po i get g_dec_in add p2 i
+    put g_p_end add po i get g_dec_in add add p2 32 i
+    put g_p_ctx add po i get g_dec_in add add p2 64 i
+    i = add i 1
+  end
+  put g_rd 1 add p2 96
+  ret cnt
+end
+
+fn rxp_dec_one_attr sl ulong to long
+  kl = rxp_rd_u8
+  if le kl 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  ukl = ulong kl
+  if gt ukl RX_PATH_MAX_KEY_BYTES
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if not rxp_rd_avail ukl
+    ret RX_PATH_ERR_MALFORMED
+  end
+  put g_a_klen sl ukl
+  off = mul sl 64
+  p = get g_rd 1
+  j = ulong 0
+  while lt j ukl
+    ch = get g_dec_in add p j
+    if eq ch 0
+      ret RX_PATH_ERR_MALFORMED
+    end
+    put g_a_key add off j ch
+    j = add j 1
+  end
+  put g_rd 1 add p ukl
+  vl = rxp_rd_u16
+  if lt vl 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  ukl = ulong vl
+  if gt ukl RX_PATH_MAX_VAL_LEN
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if not rxp_rd_avail ukl
+    ret RX_PATH_ERR_MALFORMED
+  end
+  put g_a_vlen sl ukl
+  off = mul sl 512
+  p = get g_rd 1
+  j = ulong 0
+  while lt j ukl
+    put g_a_val add off j get g_dec_in add p j
+    j = add j 1
+  end
+  put g_rd 1 add p ukl
+  ret RX_PATH_OK
+end
+
+fn rxp_dec_attrs pid ulong to long
+  ac = rxp_rd_u16
+  if lt ac 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  uac = ulong ac
+  if gt uac RX_PATH_MAX_ATTR_COUNT
+    ret RX_PATH_ERR_ATTR_LIMIT
+  end
+  abase = mul pid 32
+  i = ulong 0
+  while lt i uac
+    sl = add abase i
+    rc = rxp_dec_one_attr sl
+    if ne rc 0
+      ret rc
+    end
+    if gt i 0
+      if ge rxp_key_cmp_slots sub sl 1 sl 0
+        ret RX_PATH_ERR_MALFORMED
+      end
+    end
+    put g_p_acnt pid add i 1
+    i = add i 1
+  end
+  ret RX_PATH_OK
+end
+
+fn rxp_dec_one_con sl ulong to long
+  kd = rxp_rd_u16
+  pl = rxp_rd_u16
+  if or lt kd 0 lt pl 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  upl = ulong pl
+  if gt upl RX_PATH_MAX_CONSTRAINT_PAYLOAD
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if not rxp_rd_avail upl
+    ret RX_PATH_ERR_MALFORMED
+  end
+  put g_c_kind sl ulong kd
+  put g_c_plen sl upl
+  po = mul sl 128
+  p = get g_rd 1
+  j = ulong 0
+  while lt j upl
+    put g_c_pay add po j get g_dec_in add p j
+    j = add j 1
+  end
+  put g_rd 1 add p upl
+  ret RX_PATH_OK
+end
+
+fn rxp_dec_cons pid ulong to long
+  cc = rxp_rd_u16
+  if lt cc 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  ucc = ulong cc
+  if gt ucc RX_PATH_MAX_CONSTRAINT_COUNT
+    ret RX_PATH_ERR_CONST_LIMIT
+  end
+  cbase = mul pid 16
+  i = ulong 0
+  while lt i ucc
+    sl = add cbase i
+    rc = rxp_dec_one_con sl
+    if ne rc 0
+      ret rc
+    end
+    if gt i 0
+      if gt rxp_cons_cmp_slots sub sl 1 sl 0
+        ret RX_PATH_ERR_MALFORMED
+      end
+    end
+    put g_p_ccnt pid add i 1
+    i = add i 1
+  end
+  ret RX_PATH_OK
+end
+
+fn rxp_dec_step_in_op u ulong ib ulong to void
+  p = get g_rd 1
+  off = mul u 256
+  j = ulong 0
+  while lt j ib
+    put g_st_in add off j get g_dec_in add p j
+    j = add j 1
+  end
+  p = add p ib
+  off = mul u 32
+  j = ulong 0
+  while lt j 32
+    put g_st_op add off j get g_dec_in add p j
+    j = add j 1
+  end
+  put g_rd 1 add p 32
+end
+
+fn rxp_dec_step_a u ulong idx ulong to long
+  sidx = rxp_rd_u16
+  if lt sidx 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if ne ulong sidx idx
+    ret RX_PATH_ERR_MALFORMED
+  end
+  fam = rxp_rd_u16
+  role = rxp_rd_u16
+  nin = rxp_rd_u16
+  if or lt fam 0 or lt role 0 lt nin 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if not rxp_valid_role ulong fam ulong role
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if gt ulong nin RX_PATH_MAX_INPUTS_PER_STEP
+    ret RX_PATH_ERR_INPUT_LIMIT
+  end
+  ib = mul ulong nin 32
+  if not rxp_rd_avail add ib 32
+    ret RX_PATH_ERR_MALFORMED
+  end
+  put g_st_fam u ulong fam
+  put g_st_role u ulong role
+  put g_st_nin u ulong nin
+  rxp_dec_step_in_op u ib
+  ret RX_PATH_OK
+end
+
+fn rxp_dec_step_b u ulong to long
+  nout = rxp_rd_u16
+  if lt nout 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if gt ulong nout RX_PATH_MAX_OUTPUTS_PER_STEP
+    ret RX_PATH_ERR_OUTPUT_LIMIT
+  end
+  ub = mul ulong nout 32
+  if not rxp_rd_avail ub
+    ret RX_PATH_ERR_MALFORMED
+  end
+  put g_st_nout u ulong nout
+  p = get g_rd 1
+  off = mul u 256
+  j = ulong 0
+  while lt j ub
+    put g_st_out add off j get g_dec_in add p j
+    j = add j 1
+  end
+  put g_rd 1 add p ub
+  pl = rxp_rd_u32
+  if lt pl 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if gt ulong pl RX_PATH_MAX_PARAM_LEN
+    ret RX_PATH_ERR_PARAM_LIMIT
+  end
+  ub = ulong pl
+  if not rxp_rd_avail ub
+    ret RX_PATH_ERR_MALFORMED
+  end
+  put g_st_plen u ub
+  p = get g_rd 1
+  off = mul u 1024
+  j = ulong 0
+  while lt j ub
+    put g_st_param add off j get g_dec_in add p j
+    j = add j 1
+  end
+  put g_rd 1 add p ub
+  ret RX_PATH_OK
+end
+
+fn rxp_dec_one_step pid ulong idx ulong to long
+  u = get g_arena_used 0
+  if ge u RX_PATH_ARENA_STEPS
+    ret RX_PATH_ERR_CAPACITY
+  end
+  rc = rxp_dec_step_a u idx
+  if ne rc 0
+    ret rc
+  end
+  rc = rxp_dec_step_b u
+  if ne rc 0
+    ret rc
+  end
+  tc = get g_p_tcnt pid
+  put g_p_tail add mul pid 512 tc u
+  put g_p_tcnt pid add tc 1
+  put g_arena_used 0 add u 1
+  ret RX_PATH_OK
+end
+
+fn rxp_dec_body pid ulong to long
+  cnt = rxp_dec_header pid
+  if lt cnt 0
+    ret cnt
+  end
+  rc = rxp_dec_attrs pid
+  if ne rc 0
+    ret rc
+  end
+  rc = rxp_dec_cons pid
+  if ne rc 0
+    ret rc
+  end
+  slen = rxp_rd_u32
+  if lt slen 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  if ne ulong slen sub get g_rd 0 get g_rd 1
+    ret RX_PATH_ERR_MALFORMED
+  end
+  i = ulong 0
+  while lt i ulong cnt
+    rc = rxp_dec_one_step pid i
+    if ne rc 0
+      ret rc
+    end
+    i = add i 1
+  end
+  if ne get g_rd 1 get g_rd 0
+    ret RX_PATH_ERR_MALFORMED
+  end
+  ret RX_PATH_OK
+end
+
+note Decodes g_dec_in[0..length) into pid and verifies SEMANTIC_PATH_ID == g_id_chk[0..32)
+fn rx_path_decode pid ulong length ulong to long
+  if ge pid 8
+    ret RX_PATH_ERR_ARG
+  end
+  if gt length RX_PATH_MAX_TOTAL_SERIALIZATION
+    ret RX_PATH_ERR_BUFFER_OVERFLOW
+  end
+  saved = get g_arena_used 0
+  rx_path_clear pid
+  put g_rd 0 length
+  put g_rd 1 0
+  rc = rxp_dec_body pid
+  if eq rc RX_PATH_OK
+    rc = rxp_raw_semantic_id pid
+    if eq rc RX_PATH_OK
+      i = ulong 0
+      while lt i 32
+        if ne get g_id_out i get g_id_chk i
+          rc = RX_PATH_ERR_ID_MISMATCH
+          break
+        end
+        i = add i 1
+      end
+    end
+  end
+  if ne rc RX_PATH_OK
+    put g_arena_used 0 saved
+    rx_path_clear pid
+  end
+  ret rc
+end
