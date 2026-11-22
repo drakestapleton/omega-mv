@@ -1,0 +1,371 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note src/searchtrace/st_tool.om: Pure seeded OM-2 CLI for `searchtrace`:
+note   searchtrace run <taskset> <out_corpus>
+note   searchtrace verify <corpus> [<taskset>]
+note   searchtrace replay <taskset> <corpus>
+note   searchtrace hookcheck <taskset>
+note   searchtrace holdout <commit|reveal|verify|sign> ...
+
+text stt_c_run "run"
+text stt_c_replay "replay"
+text stt_c_verify "verify"
+text stt_c_hook "hookcheck"
+text stt_c_hold "holdout"
+text stt_usage "usage: searchtrace run <taskset> <out> | verify <corpus> [<taskset>] | replay <taskset> <corpus>\n       searchtrace hookcheck <taskset> | holdout <commit|reveal|verify|sign> ...\n"
+text stt_m_corp "corpus digest="
+text stt_m_steps " steps="
+text stt_m_tasks " tasks="
+text stt_m_bytes " bytes="
+text stt_m_path " path="
+text stt_m_rpass "replay PASS digest="
+text stt_m_rfail "replay FAIL digest="
+text stt_m_vpass "verify PASS digest="
+text stt_m_vref "verify REFUSED\n"
+text stt_m_hpass "hookcheck PASS tasks="
+text stt_m_hfail "hookcheck FAIL tasks="
+text stt_tmp_suf ".tmp"
+text stt_nl "\n"
+
+global stt_fbuf uchar 2097152
+global stt_flen ulong 1
+global stt_tsbuf uchar 65536
+global stt_tslen ulong 1
+
+fn stt_wr_u64 v ulong to void
+  b = new uchar 24 0
+  p = ulong 24
+  x = v
+  while true bound 24
+    p = sub p 1
+    put b p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      break
+    end
+  end
+  r = write 1 b p sub 24 p
+end
+
+fn stt_wr_hex32 d view uchar 32 to void
+  hx = new uchar 64 0
+  for i ulong 32
+    bv = ulong get d i
+    put hx mul i 2 sth_hex_nib shr bv 4
+    put hx add mul i 2 1 sth_hex_nib and bv 15
+  end
+  r = write 1 hx 0 64
+end
+
+fn stt_read_arg_str idx ulong dst edit uchar 512 to long
+  r = argread idx dst 0 510
+  ret r
+end
+
+fn stt_arg_eq idx ulong s view uchar * to bool
+  b = new uchar 512 0
+  n = argread idx b 0 510
+  if ne n long len s
+    ret false
+  end
+  for i ulong ulong n bound 64
+    if ne get b i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn stt_read_file_to_ts pth view uchar 512 plen ulong to long
+  fd = fopen pth 0 plen 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot 65536 bound 65536
+    r = read int fd stt_tsbuf tot sub 65536 tot
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      c = fclose int fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    tot = add tot ulong r
+  end
+  c = fclose int fd
+  put stt_tslen 0 tot
+  ret long tot
+end
+
+fn stt_read_file_to_fbuf pth view uchar 512 plen ulong to long
+  fd = fopen pth 0 plen 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot 2097152 bound 2097152
+    r = read int fd stt_fbuf tot sub 2097152 tot
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      c = fclose int fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    tot = add tot ulong r
+  end
+  c = fclose int fd
+  put stt_flen 0 tot
+  ret long tot
+end
+
+fn stt_load_taskset idx ulong to long
+  pth = new uchar 512 0
+  pl = stt_read_arg_str idx pth
+  if lt pl 1
+    ret -1
+  end
+  tl = stt_read_file_to_ts pth ulong pl
+  if lt tl 0
+    ret -1
+  end
+  ts = new uchar 65536 0
+  for i ulong ulong tl bound 65536
+    put ts i get stt_tsbuf i
+  end
+  ret stc_taskset_parse ts ulong tl
+end
+
+fn stt_write_exact pth view uchar 512 plen ulong to long
+  ol = get stc_out_len 0
+  old = stt_read_file_to_fbuf pth plen
+  if ge old 0
+    if ne ulong old ol
+      ret -1
+    end
+    for i ulong ol bound 2097152
+      if ne get stt_fbuf i get stc_out i
+        ret -1
+      end
+    end
+    ret 0
+  end
+  tmp = new uchar 512 0
+  for i ulong plen bound 500
+    put tmp i get pth i
+  end
+  for i ulong 4
+    put tmp add plen i get stt_tmp_suf i
+  end
+  tl = add plen 4
+  fd = fopen tmp 0 tl 577 420
+  if lt fd 0
+    ret -1
+  end
+  w = ulong 0
+  while lt w ol bound 2097152
+    r = write int fd stc_out w sub ol w
+    if le r 0
+      c = fclose int fd
+      u = unlink tmp 0 tl
+      ret -1
+    end
+    w = add w ulong r
+  end
+  c = fclose int fd
+  if ne c 0
+    u = unlink tmp 0 tl
+    ret -1
+  end
+  pk = new uchar 1040 0
+  pkl = sth_pack_two tmp tl pth plen pk
+  rr = renames pk 0 pkl 0
+  if ne rr 0
+    u = unlink tmp 0 tl
+    ret -1
+  end
+  ret 0
+end
+
+fn stt_verify_stc_out check_ts ulong to long
+  ol = get stc_out_len 0
+  buf = new uchar 2097152 0
+  for i ulong ol bound 2097152
+    put buf i get stc_out i
+  end
+  ret stc_corpus_verify buf ol check_ts
+end
+
+fn stt_cmd_run replay ulong to int
+  if ne stt_load_taskset 2 0
+    ret 2
+  end
+  if ne stc_corpus_generate 0
+    ret 2
+  end
+  if ne stt_verify_stc_out 1 0
+    ret 2
+  end
+  pth = new uchar 512 0
+  pl = stt_read_arg_str 3 pth
+  if lt pl 1
+    ret 2
+  end
+  dg = new uchar 32 0
+  for i ulong 32
+    put dg i get stc_v_dig i
+  end
+  ol = get stc_out_len 0
+  if ne replay 0
+    rl = stt_read_file_to_fbuf pth ulong pl
+    if lt rl 0
+      ret 2
+    end
+    same = eq ulong rl ol
+    if same
+      for i ulong ol bound 2097152
+        if ne get stt_fbuf i get stc_out i
+          same = false
+          break
+        end
+      end
+    end
+    if same
+      sth_wr 1 stt_m_rpass
+    else
+      sth_wr 1 stt_m_rfail
+    end
+    stt_wr_hex32 dg
+    sth_wr 1 stt_m_steps
+    stt_wr_u64 get stc_v_steps 0
+    sth_wr 1 stt_m_bytes
+    stt_wr_u64 ol
+    sth_wr 1 stt_nl
+    if same
+      ret 0
+    end
+    ret 2
+  end
+  if ne stt_write_exact pth ulong pl 0
+    ret 2
+  end
+  sth_wr 1 stt_m_corp
+  stt_wr_hex32 dg
+  sth_wr 1 stt_m_steps
+  stt_wr_u64 get stc_v_steps 0
+  sth_wr 1 stt_m_tasks
+  stt_wr_u64 get stc_ts_n 0
+  sth_wr 1 stt_m_bytes
+  stt_wr_u64 ol
+  sth_wr 1 stt_m_path
+  w1 = write 1 pth 0 ulong pl
+  sth_wr 1 stt_nl
+  ret 0
+end
+
+fn stt_cmd_verify has_ts ulong to int
+  if ne has_ts 0
+    if ne stt_load_taskset 3 0
+      ret 2
+    end
+  end
+  pth = new uchar 512 0
+  pl = stt_read_arg_str 2 pth
+  if lt pl 1
+    ret 2
+  end
+  rl = stt_read_file_to_fbuf pth ulong pl
+  if lt rl 0
+    ret 2
+  end
+  buf = new uchar 2097152 0
+  for i ulong ulong rl bound 2097152
+    put buf i get stt_fbuf i
+  end
+  if ne stc_corpus_verify buf ulong rl has_ts 0
+    sth_wr 1 stt_m_vref
+    ret 2
+  end
+  dg = new uchar 32 0
+  for i ulong 32
+    put dg i get stc_v_dig i
+  end
+  sth_wr 1 stt_m_vpass
+  stt_wr_hex32 dg
+  sth_wr 1 stt_m_steps
+  stt_wr_u64 get stc_v_steps 0
+  sth_wr 1 stt_nl
+  ret 0
+end
+
+fn stt_cmd_hookcheck to int
+  if ne stt_load_taskset 2 0
+    ret 2
+  end
+  rc = stc_hook_equivalence
+  if eq rc 0
+    sth_wr 1 stt_m_hpass
+  else
+    sth_wr 1 stt_m_hfail
+  end
+  stt_wr_u64 get stc_ts_n 0
+  sth_wr 1 stt_nl
+  if eq rc 0
+    ret 0
+  end
+  ret 2
+end
+
+fn stt_cmd_holdout ac ulong to int
+  n = sub ac 2
+  if gt n 8
+    ret 1
+  end
+  put sth_argc 0 n
+  b = new uchar 512 0
+  for i ulong n bound 8
+    al = argread add i 2 b 0 510
+    if lt al 0
+      ret 1
+    end
+    sth_arg_set i b ulong al
+  end
+  ret sth_cli_run
+end
+
+fn main to int
+  ac = ulong argcnt
+  if lt ac 2
+    sth_wr 2 stt_usage
+    ret 1
+  end
+  if and stt_arg_eq 1 stt_c_run eq ac 4
+    ret stt_cmd_run 0
+  end
+  if and stt_arg_eq 1 stt_c_replay eq ac 4
+    ret stt_cmd_run 1
+  end
+  if stt_arg_eq 1 stt_c_verify
+    if eq ac 3
+      ret stt_cmd_verify 0
+    end
+    if eq ac 4
+      ret stt_cmd_verify 1
+    end
+  end
+  if and stt_arg_eq 1 stt_c_hook eq ac 3
+    ret stt_cmd_hookcheck
+  end
+  if and stt_arg_eq 1 stt_c_hold ge ac 3
+    ret stt_cmd_holdout ac
+  end
+  sth_wr 2 stt_usage
+  ret 1
+end
