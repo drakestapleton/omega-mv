@@ -15,8 +15,8 @@ global ikDSlot ulong 1
 global ikDKCode long 1
 global ikDKCodePos ulong 1
 global ikDKCodeFail uint 1
-global ikDKOff ulong 24
-global ikDKSmem uint 24
+global ikDKOff ulong 32
+global ikDKSmem uint 32
 global ikDKLut long 1
 global ikDWork long 1
 global ikDWorkVa ulong 1
@@ -98,7 +98,7 @@ end
 fn ikDScBaseStep step ulong to ulong
 sOff = mul get ikDSlot 0 IK_SCONV_SLOT_BYTES
 lOff = mul step IK_SCONV_LAYER_BYTES
-ret add 0x500000 add sOff lOff
+ret add 0x1800000 add sOff lOff
 end
 
 fn ikDF32Bits f f32 to uint
@@ -181,6 +181,31 @@ end
 put ikDKCodePos 0 add p 16
 end
 
+fn ikDInitBatchKernels to bool
+smB = new uint 3 0
+put smB 0 8192
+put smB 1 9280
+put smB 2 9280
+for j ulong 3
+idx = add 26 j
+p = mul div add get ikDKCodePos 0 255 256 256
+put ikDKOff idx p
+put ikDKCodePos 0 p
+put ikDKSmem idx get smB j
+put ikfPc 0 0
+put ikfGuard 0 0
+ok = ikbKernel uchar add 65 j
+if not ok
+ret false
+end
+ikfDone
+if ne get ikDKCodeFail 0 0
+ret false
+end
+end
+ret true
+end
+
 fn ikDInitKernels to bool
 cm = nvalloc 262144 false
 if le cm 0
@@ -189,7 +214,7 @@ end
 put ikDKCode 0 cm
 put ikDKCodePos 0 0
 put ikDKCodeFail 0 0
-sm = new uint 23 0
+sm = new uint 26 0
 put sm 0 18432
 put sm 1 12288
 put sm 2 12288
@@ -213,7 +238,10 @@ put sm 19 0
 put sm 20 0
 put sm 21 256
 put sm 22 64
-for k ulong 23
+put sm 23 0
+put sm 24 0
+put sm 25 0
+for k ulong 26
 p = mul div add get ikDKCodePos 0 255 256 256
 put ikDKOff k p
 put ikDKCodePos 0 p
@@ -229,7 +257,7 @@ if ne get ikDKCodeFail 0 0
 ret false
 end
 end
-ret true
+ret ikDInitBatchKernels
 end
 
 fn ikDArgReset to void
@@ -269,32 +297,31 @@ put gbq1 41 gz
 put gbq1 59 gblo shr code 8
 end
 
-note Fast single-batch GPFIFO builder: uploads driver cb template ONCE per session, not per batch.
+note Fast single-batch GPFIFO builder: uploads driver cb template ONCE per session,
+note and ALWAYS emits the 20-byte GPU L2 invalidate (0x88000000) so GPU sees fresh CPU UVM writes (e.g. ikDEmbed).
 fn ikDBatchStart to bool
-if eq get ikDSetupDone 0 1
-put ikDPktPos 0 0
-ret true
-end
 put gbused 0 0
+if eq get ikDSetupDone 0 0
 gbsetup
-gbmth 0 40 4
-gbemit 0
-gbemit 0
-gbemit 0
-gbemit 2281701376
 cb = mapaddr get gbmem 1
 gbdriver cb
 gbdma cb 224
 for i ulong 224
 gbemit get gbcb i
 end
+put ikDSetupDone 0 1
+end
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
 n = get gbused 0
 r = mapwrite get ikDPkt 0 0 gbcmd 0 n
 if ne r long n
 ret false
 end
 put ikDPktPos 0 n
-put ikDSetupDone 0 1
 ret true
 end
 
@@ -318,7 +345,7 @@ gbmth 1 540 1
 gbemit 4113
 n = get gbused 0
 pos = get ikDPktPos 0
-if gt add pos n 1048000
+if gt add pos n 4192000
 ret false
 end
 r = mapwrite get ikDPkt 0 pos gbcmd 0 n
@@ -381,11 +408,14 @@ fn ikDEmbedWrite invRms f32 to void
 ar = get ikStArena 0
 normBase = sub get ikGW 1 get ikStArenaVa 0
 wk = get ikDWork 0
+r0 = mapread ar normBase ikDOutBuf 0 9216
 for i ulong 2304
-g = ikDReadF32 ar add normBase mul i 4
+o = mul i 4
+g = ikDBufF32 o
 v = mul mul get ikDProjTmp i invRms g
-ikDWriteF32 wk mul i 4 v
+ikDBufPutF32 o v
 end
+r1 = mapwrite wk 0 ikDOutBuf 0 9216
 end
 
 note CPU helper: embed lookup (BF16 -> FP32) + embed_norm (RMSNorm) into work[0x000000].
@@ -418,14 +448,60 @@ r = mapwrite wk add dstOff mul b 9216 ikDOutBuf 0 9216
 end
 end
 
-note Run BlockAttentionResidual: cat(block_states[0..k-1], partial) -> unweighted RMSNorm -> attn_res_fast.
-fn ikDAttnRes blkOff ulong nBlk ulong partialOff ulong qVa ulong qCnt uint outOff ulong to bool
-wk = get ikDWork 0
-ikDCopy2304 add blkOff mul nBlk 9216 partialOff
-kTot = add nBlk 1
-if not ikDBatchStart
+note Append GPU copy of 2304 FP32s into open GPFIFO batch (zero CPU sync).
+fn ikDBatchCopy2304 dstOff ulong srcOff ulong to bool
+ikDArgReset
+ikDPtr ikDW srcOff
+ikDPtr 0
+ikDPtr ikDW dstOff
+ikDArgU 2304
+ret ikDBatchAdd 23 18 1 1 128
+end
+
+note Append GPU copy of nBlocks x 2304 FP32s into open GPFIFO batch.
+fn ikDBatchCopyBlocks dstOff ulong srcOff ulong nBlocks ulong to bool
+if eq nBlocks 0
+ret true
+end
+nFloats = mul nBlocks 2304
+tiles = mul nBlocks 18
+ikDArgReset
+ikDPtr ikDW srcOff
+ikDPtr 0
+ikDPtr ikDW dstOff
+ikDArgU uint nFloats
+ret ikDBatchAdd 23 uint tiles 1 1 128
+end
+
+note Append GPU vector add of 2304 FP32s (dst = a + b) into open GPFIFO batch.
+fn ikDBatchAdd2304 dstOff ulong aOff ulong bOff ulong to bool
+ikDArgReset
+ikDPtr ikDW aOff
+ikDPtr ikDW bOff
+ikDPtr ikDW dstOff
+ikDArgU 2304
+ret ikDBatchAdd 23 18 1 1 128
+end
+
+note Append GPU BF16 KV cache pack+write into open GPFIFO batch (zero CPU sync).
+fn ikDBatchKvAppend step ulong posQ ulong to bool
+kva = ikDKvVaStep step
+ikDArgReset
+ikDPtr ikDW 0x014000
+ikDPtr ikDW 0x016000
+ikDPtr kva
+ikDPtr add kva IK_KV_HALF_BYTES
+ikDArgU uint IK_TMAX
+ikDArgU uint posQ
+ret ikDBatchAdd 24 8 1 1 64
+end
+
+note Append BlockAttentionResidual into open GPFIFO batch (zero CPU sync).
+fn ikDBatchAttnRes blkOff ulong nBlk ulong partialOff ulong qVa ulong qCnt uint outOff ulong to bool
+if not ikDBatchCopy2304 add blkOff mul nBlk 9216 partialOff
 ret false
 end
+kTot = add nBlk 1
 ikDArgReset
 ikDPtr ikDW blkOff
 ikDPtr 0
@@ -440,7 +516,15 @@ ikDPtr ikDW outOff
 ikDArgU uint kTot
 ikDArgU qCnt
 ikDArgU 2304
-if not ikDBatchAdd 4 qCnt 1 1 256
+ret ikDBatchAdd 4 qCnt 1 1 256
+end
+
+note Run BlockAttentionResidual standalone.
+fn ikDAttnRes blkOff ulong nBlk ulong partialOff ulong qVa ulong qCnt uint outOff ulong to bool
+if not ikDBatchStart
+ret false
+end
+if not ikDBatchAttnRes blkOff nBlk partialOff qVa qCnt outOff
 ret false
 end
 ret ikDBatchRun
@@ -535,14 +619,11 @@ end
 ret ikDBatchRun
 end
 
-note Compute cross-pass 4 messages [q, k, v, mlp] into work[0x1c0000] from prev_pass_blocks.
-fn ikDCrossPassMsgs loopIdx ulong to bool
+note Append cross-pass 4 messages [q, k, v, mlp] into open GPFIFO batch (zero CPU sync).
+fn ikDBatchCrossPassMsgs loopIdx ulong to bool
 nPrev = get ikDPrevBlockCnt 0
 vaQ = add get ikGW 5 mul mul loopIdx 2 9216
 vaKV = add get ikGW 6 mul mul loopIdx 2 9216
-if not ikDBatchStart
-ret false
-end
 ikDArgReset
 ikDPtr ikDW 0x160000
 ikDPtr 0
@@ -575,10 +656,7 @@ ikDPtr ikDW 0x1c2400
 ikDArgU uint nPrev
 ikDArgU 2
 ikDArgU 2304
-if not ikDBatchAdd 4 2 1 1 256
-ret false
-end
-ret ikDBatchRun
+ret ikDBatchAdd 4 2 1 1 256
 end
 
 fn ikDRelDot h ulong dMax ulong to void
@@ -681,13 +759,18 @@ ikDWriteKvHead kv kBase posQ h
 end
 end
 
-note Live Arboris hook: score next transition, check hits against actual top-8, and update graph.
-fn ikDArbStep step ulong l ulong to void
-wk = get ikDWork 0
+note Live Arboris hook: score next transition from bulk-read ikDOutBuf[step*32 .. +32].
+fn ikDArbStepBuf step ulong l ulong to void
 ids = new uint 8 0
 scores = new ulong 128 0
+base = mul step 32
 for i ulong 8
-put ids i uint mapget wk add 0x058400 mul i 4 4
+o = add base mul i 4
+b0 = uint get ikDOutBuf o
+b1 = shl uint get ikDOutBuf add o 1 8
+b2 = shl uint get ikDOutBuf add o 2 16
+b3 = shl uint get ikDOutBuf add o 3 24
+put ids i or or b0 b1 or b2 b3
 end
 if eq get ikDArbHasPred 0 1
 put ikDArbStats 0 add get ikDArbStats 0 1
@@ -745,6 +828,27 @@ put ikDArbHasPred 0 0
 end
 end
 
+fn ikDArbStepAll to void
+wk = get ikDWork 0
+r = mapread wk 0x058800 ikDOutBuf 0 1536
+ikArbResetToken
+put ikDArbHasPred 0 0
+for l ulong 6
+ikDArbStepBuf l l
+end
+for j ulong 12
+ikDArbStepBuf add 6 j add 6 j
+end
+for pass ulong 2
+for j ulong 12
+ikDArbStepBuf add add 18 mul pass 12 j add 6 j
+end
+end
+for j ulong 6
+ikDArbStepBuf add 42 j add 18 j
+end
+end
+
 fn ikDSig x f32 to f32
 y = sub f32 0.0f32 x
 if gt y f32 20.0f32
@@ -777,36 +881,43 @@ end
 
 fn ikDRunLayerAttn step ulong l ulong posQ ulong hasMsgs bool to bool
 isFull = or or eq l 5 eq l 11 or eq l 17 eq l 23
-wk = get ikDWork 0
-ikDCopy2304 0x04c000 0x000000
+if not ikDBatchCopy2304 0x04c000 0x000000
+ret false
+end
 if gt l 0
 qCnt = uint 1
 if isFull
 qCnt = uint 3
 end
 qVa = get ikAttnQOff sub l 1
-if not ikDAttnRes 0x0c0000 get ikDBlockCnt 0 0x000000 qVa qCnt 0x0b0000
+if not ikDBatchAttnRes 0x0c0000 get ikDBlockCnt 0 0x000000 qVa qCnt 0x0b0000
 ret false
 end
 else
-ikDCopy2304 0x0b0000 0x000000
+if not ikDBatchCopy2304 0x0b0000 0x000000
+ret false
 end
-tau = f32 1.0f32
-ikDWriteF32 wk 0x1e0000 tau
+end
 if not hasMsgs
-ikDCopy2304 0x000000 0x0b0000
-if isFull
-ikDCopy2304 0x008000 0x0b2400
-ikDCopy2304 0x00c000 0x0b4800
-else
-ikDCopy2304 0x008000 0x0b0000
-ikDCopy2304 0x00c000 0x0b0000
-end
-end
-if not ikDBatchStart
+if not ikDBatchCopy2304 0x000000 0x0b0000
 ret false
 end
-if hasMsgs
+if isFull
+if not ikDBatchCopy2304 0x008000 0x0b2400
+ret false
+end
+if not ikDBatchCopy2304 0x00c000 0x0b4800
+ret false
+end
+else
+if not ikDBatchCopy2304 0x008000 0x0b0000
+ret false
+end
+if not ikDBatchCopy2304 0x00c000 0x0b0000
+ret false
+end
+end
+else
 if not ikDBatchMsgGate l 0 0x0b0000 0x1c0000 0x000000
 ret false
 end
@@ -1029,10 +1140,9 @@ ikDArgU uint dMaxRel
 if not ikDBatchAdd 22 uint relTiles 24 1 128
 ret false
 end
-if not ikDBatchRun
+if not ikDBatchKvAppend step posQ
 ret false
 end
-ikDAppendKv step posQ
 kva = ikDKvVaStep step
 splitS = uint 1
 if ge posQ 64
@@ -1040,9 +1150,6 @@ splitS = uint 4
 end
 if ge posQ 512
 splitS = uint 8
-end
-if not ikDBatchStart
-ret false
 end
 ikDArgReset
 ikDPtr ikDW 0x010000
@@ -1088,31 +1195,31 @@ ikDPtr ikDW add scBase 24576
 ikDPtr ikLva l 14
 ikDPtr ikDW 0x048000
 ikDArgU 2304
-if not ikDBatchAdd 11 18 1 1 128
-ret false
-end
-ret ikDBatchRun
+ret ikDBatchAdd 11 18 1 1 128
 end
 
 fn ikDRunLayerMlp step ulong l ulong hasMsgs bool to bool
-wk = get ikDWork 0
 isBoundary = eq rem l 6 0
 if isBoundary
 bc = get ikDBlockCnt 0
-ikDCopy2304 add 0x0c0000 mul bc 9216 0x04c000
+if not ikDBatchCopy2304 add 0x0c0000 mul bc 9216 0x04c000
+ret false
+end
 put ikDBlockCnt 0 add bc 1
-ikDCopy2304 0x04c000 0x048000
+if not ikDBatchCopy2304 0x04c000 0x048000
+ret false
+end
 else
-ikDVecAdd2304 0x04c000 0x04c000 0x048000
+if not ikDBatchAdd2304 0x04c000 0x04c000 0x048000
+ret false
+end
 end
 mqVa = get ikMlpQOff l
-if not ikDAttnRes 0x0c0000 get ikDBlockCnt 0 0x04c000 mqVa 1 0x050000
+if not ikDBatchAttnRes 0x0c0000 get ikDBlockCnt 0 0x04c000 mqVa 1 0x050000
 ret false
 end
 lutva = mapaddr get ikDKLut 0
-if not ikDBatchStart
-ret false
-end
+idVa = ikDW add 0x058800 mul step 32
 if hasMsgs
 if not ikDBatchMsgGate l 3 0x050000 0x1c6c00 0x050000
 ret false
@@ -1136,7 +1243,7 @@ ret false
 end
 ikDPtr ikDW 0x058000
 ikDPtr ikLva l 21
-ikDPtr ikDW 0x058400
+ikDPtr idVa
 ikDPtr ikDW 0x058500
 if not ikDBatchAdd 12 1 1 1 32
 ret false
@@ -1155,7 +1262,7 @@ end
 ikDPtr ikDW 0x060000
 ikDPtr ikLva l 22
 ikDPtr ikLva l 23
-ikDPtr ikDW 0x058400
+ikDPtr idVa
 ikDPtr ikLva l 24
 ikDPtr lutva
 ikDPtr ikDW 0x070000
@@ -1179,7 +1286,7 @@ end
 ikDPtr ikDW 0x060000
 ikDPtr ikLva l 25
 ikDPtr ikLva l 26
-ikDPtr ikDW 0x058400
+ikDPtr idVa
 ikDPtr ikLva l 27
 ikDPtr lutva
 ikDPtr ikDW 0x090000
@@ -1202,7 +1309,7 @@ end
 ikDPtr ikDW 0x060000
 ikDPtr ikLva l 22
 ikDPtr ikLva l 23
-ikDPtr ikDW 0x058400
+ikDPtr idVa
 ikDPtr lutva
 ikDPtr ikDW 0x070000
 ikDArgU 2304
@@ -1231,7 +1338,7 @@ end
 ikDPtr ikDW 0x060000
 ikDPtr ikLva l 25
 ikDPtr ikLva l 26
-ikDPtr ikDW 0x058400
+ikDPtr idVa
 ikDPtr lutva
 ikDPtr ikDW 0x090000
 ikDArgU 1152
@@ -1250,12 +1357,7 @@ ikDArgU 2304
 if not ikDBatchAdd 15 18 1 1 128
 ret false
 end
-if not ikDBatchRun
-ret false
-end
-ikDArbStep step l
-ikDVecAdd2304 0x000000 0x04c000 0x0a4000
-ret true
+ret ikDBatchAdd2304 0x000000 0x04c000 0x0a4000
 end
 
 fn ikDArgmax200k to long
@@ -1282,12 +1384,13 @@ end
 ret long bestId
 end
 
-note Run all 48 logical layers + final attn_res + norm + 201k unembed + softcap + greedy argmax.
+note Run all 48 logical layers + optional 201k unembed in ONE SINGLE-SUBMIT GPFIFO (zero mid-forward CPU syncs!).
 fn ikDForwardToken tok ulong posQ ulong needLogits bool to long
 ikDEmbed tok
 put ikDBlockCnt 0 0
-ikArbResetToken
-put ikDArbHasPred 0 0
+if not ikDBatchStart
+ret -1
+end
 for l ulong 6
 if not ikDRunLayerAttn l l posQ false
 ret -1
@@ -1296,8 +1399,12 @@ if not ikDRunLayerMlp l l false
 ret -2
 end
 end
-ikDCopy2304 0x150000 0x000000
-ikDCopyBlocks 0x120000 0x0c0000 get ikDBlockCnt 0
+if not ikDBatchCopy2304 0x150000 0x000000
+ret -3
+end
+if not ikDBatchCopyBlocks 0x120000 0x0c0000 get ikDBlockCnt 0
+ret -3
+end
 put ikDPreBlockCnt 0 get ikDBlockCnt 0
 for j ulong 12
 l = add 6 j
@@ -1312,16 +1419,24 @@ for pass ulong 2
 preN = get ikDPreBlockCnt 0
 curN = get ikDBlockCnt 0
 nPrev = sub curN add preN 1
-ikDCopyBlocks 0x160000 add 0x0c0000 mul add preN 1 9216 nPrev
-ikDCopy2304 add 0x160000 mul nPrev 9216 0x000000
+if not ikDBatchCopyBlocks 0x160000 add 0x0c0000 mul add preN 1 9216 nPrev
+ret -5
+end
+if not ikDBatchCopy2304 add 0x160000 mul nPrev 9216 0x000000
+ret -5
+end
 put ikDPrevBlockCnt 0 add nPrev 1
-ikDCopy2304 0x000000 0x150000
-ikDCopyBlocks 0x0c0000 0x120000 preN
+if not ikDBatchCopy2304 0x000000 0x150000
+ret -5
+end
+if not ikDBatchCopyBlocks 0x0c0000 0x120000 preN
+ret -5
+end
 put ikDBlockCnt 0 preN
 for j ulong 12
 step = add add 18 mul pass 12 j
 l = add 6 j
-if not ikDCrossPassMsgs j
+if not ikDBatchCrossPassMsgs j
 ret -5
 end
 if not ikDRunLayerAttn step l posQ true
@@ -1342,14 +1457,9 @@ if not ikDRunLayerMlp step l false
 ret -9
 end
 end
-if not needLogits
-ret 0
-end
-if not ikDAttnRes 0x0c0000 get ikDBlockCnt 0 0x000000 ikGva 4 1 0x0b0000
+if needLogits
+if not ikDBatchAttnRes 0x0c0000 get ikDBlockCnt 0 0x000000 ikGva 4 1 0x0b0000
 ret -10
-end
-if not ikDBatchStart
-ret -15
 end
 ikDArgReset
 ikDPtr ikDW 0x0b0000
@@ -1374,8 +1484,13 @@ ikDArgU ikDF32Bits 30.0f32
 if not ikDBatchAdd 20 1571 1 1 128
 ret -13
 end
+end
 if not ikDBatchRun
 ret -14
+end
+ikDArbStepAll
+if not needLogits
+ret 0
 end
 ret ikDArgmax200k
 end
@@ -1398,7 +1513,7 @@ wk = get ikDWork 0
 for i ulong 65536
 put ikDOutBuf i 0
 end
-base = add 0x500000 mul slot IK_SCONV_SLOT_BYTES
+base = add 0x1800000 mul slot IK_SCONV_SLOT_BYTES
 done = ulong 0
 while lt done IK_SCONV_SLOT_BYTES bound 128
 chunk = sub IK_SCONV_SLOT_BYTES done
@@ -1417,7 +1532,7 @@ end
 if not gbbopen
 ret 11
 end
-pkt = nvalloc 1048576 false
+pkt = nvalloc 4194304 false
 if le pkt 0
 ret 12
 end
@@ -1429,13 +1544,16 @@ end
 if not ikDInitKernels
 ret 14
 end
-wk = nvalloc add 5242880 mul nSlots IK_SCONV_SLOT_BYTES true
+wk = nvalloc add 25165824 mul nSlots IK_SCONV_SLOT_BYTES true
 if le wk 0
 ret 15
 end
 put ikDWork 0 wk
 put ikDWorkVa 0 mapaddr wk
 ikDWriteF32 wk 0x059000 0.05f32
+for b ulong 8
+ikDWriteF32 wk add 0x1e0000 mul b 4 1.0f32
+end
 for s ulong nSlots bound 8
 kv = nvalloc IK_KV_SLOT_BYTES true
 if le kv 0

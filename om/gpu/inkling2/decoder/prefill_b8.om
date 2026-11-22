@@ -1,0 +1,929 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure Seeded-Omega B=8 Batched Prefill Engine for Inkling-2-Mini on GB10 (ZERO CUDA, ZERO C).
+note Uses bf16_gemm_batch_fast (kernel 26, 8x fewer BF16 weight loads) and
+note nvfp4_gemm_dedup_fast / mxfp8_gemm_dedup_fast (kernels 27/28, deduplicated MoE experts across 8 tokens).
+note Composes after: emit_fast.om + emit_batch.om + arboris + safetensors + tokenizer + decode.om + batcher.om.
+
+const B8_H       ulong 0x600000
+const B8_HNORM   ulong 0x620000
+const B8_HK      ulong 0x640000
+const B8_HV      ulong 0x660000
+const B8_HRES    ulong 0x680000
+const B8_Q       ulong 0x6a0000
+const B8_K       ulong 0x6c0000
+const B8_V       ulong 0x6d0000
+const B8_GATE    ulong 0x6e0000
+const B8_RLAT    ulong 0x700000
+const B8_SINK    ulong 0x708000
+const B8_KSCP    ulong 0x710000
+const B8_VSCP    ulong 0x711000
+const B8_AOUT    ulong 0x720000
+const B8_OPROJ   ulong 0x740000
+const B8_OSCONV  ulong 0x760000
+const B8_BLOCKS  ulong 0x780000
+const B8_PREBLK  ulong 0x840000
+const B8_PREH    ulong 0x890000
+const B8_PREVBLK ulong 0x8b0000
+const B8_MSGS    ulong 0x900000
+const B8_AROUT   ulong 0x950000
+const B8_MLPIN   ulong 0x990000
+const B8_MLPNORM ulong 0x9b0000
+const B8_RLOGITS ulong 0x9d0000
+const B8_RIDS    ulong 0x9d2000
+const B8_RWTS    ulong 0x9d3000
+const B8_META13  ulong 0x9e0000
+const B8_META2   ulong 0x9e2000
+const B8_XQ      ulong 0x9f0000
+const B8_XREC    ulong 0xa20000
+const B8_C13     ulong 0xb00000
+const B8_SWI     ulong 0xc00000
+const B8_C2      ulong 0xc80000
+const B8_MLPOUT  ulong 0xd40000
+const B8_MGCAT   ulong 0xd60000
+const B8_MGLAT   ulong 0xd90000
+const B8_MGFG    ulong 0xda0000
+const B8_MGGN    ulong 0xdc0000
+const B8_QSCR    ulong 0xde0000
+
+global ikB8Toks uint 8
+global ikB8MetaBuf uchar 3072
+global ikB8ArbIds uint 3072
+
+fn ikB8PutU32Meta off ulong v uint to void
+put ikB8MetaBuf off uchar and v 255
+put ikB8MetaBuf add off 1 uchar and shr v 8 255
+put ikB8MetaBuf add off 2 uchar and shr v 16 255
+put ikB8MetaBuf add off 3 uchar and shr v 24 255
+end
+
+fn ikB8EmbedWrite b ulong invRms f32 to void
+ar = get ikStArena 0
+normBase = sub get ikGW 1 get ikStArenaVa 0
+wk = get ikDWork 0
+r0 = mapread ar normBase ikDOutBuf 0 9216
+for i ulong 2304
+o = mul i 4
+g = ikDBufF32 o
+v = mul mul get ikDProjTmp i invRms g
+ikDBufPutF32 o v
+end
+r1 = mapwrite wk add B8_H mul b 9216 ikDOutBuf 0 9216
+end
+
+fn ikB8EmbedOne b ulong tok ulong to void
+ar = get ikStArena 0
+embBase = add sub get ikGW 0 get ikStArenaVa 0 mul tok 4608
+r = mapread ar embBase ikDOutBuf 0 4608
+sq = f32 0.0f32
+for i ulong 2304
+v = ikDReadBf16Buf i
+put ikDProjTmp i v
+sq = add sq mul v v
+end
+invRms = div f32 1.0f32 fsqrt add div sq f32 2304.0f32 f32 0.000001f32
+ikB8EmbedWrite b invRms
+end
+
+fn ikB8Copy8 dstOff ulong srcOff ulong to bool
+ikDArgReset
+ikDPtr ikDW srcOff
+ikDPtr 0
+ikDPtr ikDW dstOff
+ikDArgU 18432
+ret ikDBatchAdd 23 144 1 1 128
+end
+
+fn ikB8Add8 dstOff ulong aOff ulong bOff ulong to bool
+ikDArgReset
+ikDPtr ikDW aOff
+ikDPtr ikDW bOff
+ikDPtr ikDW dstOff
+ikDArgU 18432
+ret ikDBatchAdd 23 144 1 1 128
+end
+
+fn ikB8Bf16 wVa ulong xOff ulong yOff ulong k uint n uint to bool
+ikDArgReset
+ikDPtr wVa
+ikDPtr ikDW xOff
+ikDPtr ikDW yOff
+ikDArgU k
+ikDArgU n
+ikDArgU 8
+gx = div add n 7 8
+ret ikDBatchAdd 26 gx 1 1 256
+end
+
+fn ikB8CrossPassMsgs loopIdx ulong to bool
+nPrev = get ikDPrevBlockCnt 0
+vaQ = add get ikGW 5 mul mul loopIdx 2 9216
+vaKV = add get ikGW 6 mul mul loopIdx 2 9216
+for b ulong 8
+pBlk = add B8_PREVBLK mul b 0x9000
+mBase = add B8_MSGS mul b 0x9000
+ikDArgReset
+ikDPtr ikDW pBlk
+ikDPtr 0
+ikDPtr ikDW 0x190000
+ikDArgU 2304
+if not ikDBatchAdd 5 uint nPrev 1 1 256
+ret false
+end
+ikDPtr ikDW 0x190000
+ikDPtr vaQ
+ikDPtr ikDW mBase
+ikDArgU uint nPrev
+ikDArgU 1
+ikDArgU 2304
+if not ikDBatchAdd 4 1 1 1 256
+ret false
+end
+ikDPtr ikDW 0x190000
+ikDPtr add vaQ 9216
+ikDPtr ikDW add mBase 27648
+ikDArgU uint nPrev
+ikDArgU 1
+ikDArgU 2304
+if not ikDBatchAdd 4 1 1 1 256
+ret false
+end
+ikDPtr ikDW 0x190000
+ikDPtr vaKV
+ikDPtr ikDW add mBase 9216
+ikDArgU uint nPrev
+ikDArgU 2
+ikDArgU 2304
+if not ikDBatchAdd 4 2 1 1 256
+ret false
+end
+end
+ret true
+end
+
+fn ikB8MsgGateApplyOne l ulong slotBase ulong hOff ulong mOff ulong b ulong outBase ulong to bool
+lOff = add B8_MGLAT mul b 256
+fgOff = add B8_MGFG mul b 9216
+gnOff = add B8_MGGN mul b 9216
+oOff = add outBase mul b 9216
+ikDArgReset
+ikDPtr ikLva l add slotBase 1
+ikDPtr ikDW lOff
+ikDPtr ikDW fgOff
+ikDArgU 2304
+if not ikDBatchAdd 21 72 1 1 256
+ret false
+end
+ikDPtr ikLva l add slotBase 2
+ikDPtr ikDW lOff
+ikDPtr ikDW gnOff
+ikDArgU 2304
+if not ikDBatchAdd 21 72 1 1 256
+ret false
+end
+ikDPtr ikDW hOff
+ikDPtr ikDW mOff
+ikDPtr ikDW fgOff
+ikDPtr ikDW gnOff
+ikDPtr ikDW oOff
+ikDArgU 2304
+ret ikDBatchAdd 19 18 1 1 128
+end
+
+fn ikB8MsgGate l ulong ctrlIdx ulong hBase ulong hStride ulong msgRel ulong outBase ulong to bool
+slotBase = add 28 mul ctrlIdx 3
+for b ulong 8
+hOff = add hBase mul b hStride
+mOff = add add B8_MSGS mul b 0x9000 msgRel
+cOff = add B8_MGCAT mul b 18432
+ikDArgReset
+ikDPtr ikDW hOff
+ikDPtr 0
+ikDPtr ikDW cOff
+ikDArgU 2304
+if not ikDBatchAdd 5 1 1 1 256
+ret false
+end
+ikDPtr ikDW mOff
+ikDPtr 0
+ikDPtr ikDW add cOff 9216
+ikDArgU 2304
+if not ikDBatchAdd 5 1 1 1 256
+ret false
+end
+end
+if not ikB8Bf16 ikLva l slotBase B8_MGCAT B8_MGLAT 4608 64
+ret false
+end
+for b ulong 8
+hOff = add hBase mul b hStride
+mOff = add add B8_MSGS mul b 0x9000 msgRel
+if not ikB8MsgGateApplyOne l slotBase hOff mOff b outBase
+ret false
+end
+end
+ret true
+end
+
+fn ikB8AttnResOne b ulong bc ulong qVa ulong qCnt uint to bool
+blk = add B8_BLOCKS mul b 0x18000
+h = add B8_H mul b 9216
+ao = add B8_AROUT mul b 0x7000
+ret ikDBatchAttnRes blk bc h qVa qCnt ao
+end
+
+fn ikB8PrepAttnIn l ulong isFull bool hasMsgs bool to bool
+if not ikB8Copy8 B8_HRES B8_H
+ret false
+end
+bc = get ikDBlockCnt 0
+if gt l 0
+qCnt = uint 1
+if isFull
+qCnt = uint 3
+end
+qVa = get ikAttnQOff sub l 1
+for b ulong 8
+if not ikB8AttnResOne b bc qVa qCnt
+ret false
+end
+end
+else
+for b ulong 8
+if not ikDBatchCopy2304 add B8_AROUT mul b 0x7000 add B8_H mul b 9216
+ret false
+end
+end
+end
+if not hasMsgs
+for b ulong 8
+arBase = add B8_AROUT mul b 0x7000
+if not ikDBatchCopy2304 add B8_H mul b 9216 arBase
+ret false
+end
+if isFull
+if not ikDBatchCopy2304 add B8_HK mul b 9216 add arBase 9216
+ret false
+end
+if not ikDBatchCopy2304 add B8_HV mul b 9216 add arBase 18432
+ret false
+end
+else
+if not ikDBatchCopy2304 add B8_HK mul b 9216 arBase
+ret false
+end
+if not ikDBatchCopy2304 add B8_HV mul b 9216 arBase
+ret false
+end
+end
+end
+else
+if not ikB8MsgGate l 0 B8_AROUT 0x7000 0 B8_H
+ret false
+end
+if isFull
+if not ikB8MsgGate l 1 add B8_AROUT 9216 0x7000 9216 B8_HK
+ret false
+end
+if not ikB8MsgGate l 2 add B8_AROUT 18432 0x7000 18432 B8_HV
+ret false
+end
+else
+if not ikB8MsgGate l 1 B8_AROUT 0x7000 9216 B8_HK
+ret false
+end
+if not ikB8MsgGate l 2 B8_AROUT 0x7000 18432 B8_HV
+ret false
+end
+end
+end
+ret true
+end
+
+fn ikB8AttnKvSconv step ulong l ulong isFull bool to bool
+scBase = ikDScBaseStep step
+if isFull
+if not ikB8Bf16 ikLva l 12 B8_HK B8_KSCP 2304 32
+ret false
+end
+if not ikB8Bf16 ikLva l 13 B8_HV B8_VSCP 2304 32
+ret false
+end
+for b ulong 8
+kOff = add B8_K mul b 4096
+vOff = add B8_V mul b 4096
+ikDArgReset
+ikDPtr ikDW kOff
+ikDPtr ikDW scBase
+ikDPtr ikLva l 10
+ikDPtr ikDW add B8_KSCP mul b 128
+ikDPtr ikDW kOff
+ikDArgU 1024
+ikDArgU 7
+if not ikDBatchAdd 18 8 1 1 128
+ret false
+end
+ikDPtr ikDW vOff
+ikDPtr ikDW add scBase 12288
+ikDPtr ikLva l 11
+ikDPtr ikDW add B8_VSCP mul b 128
+ikDPtr ikDW vOff
+ikDArgU 1024
+ikDArgU 7
+if not ikDBatchAdd 18 8 1 1 128
+ret false
+end
+end
+else
+for b ulong 8
+kOff = add B8_K mul b 4096
+vOff = add B8_V mul b 4096
+ikDArgReset
+ikDPtr ikDW kOff
+ikDPtr ikDW scBase
+ikDPtr ikLva l 10
+ikDPtr ikDW kOff
+ikDArgU 1024
+if not ikDBatchAdd 11 8 1 1 128
+ret false
+end
+ikDPtr ikDW vOff
+ikDPtr ikDW add scBase 12288
+ikDPtr ikLva l 11
+ikDPtr ikDW vOff
+ikDArgU 1024
+if not ikDBatchAdd 11 8 1 1 128
+ret false
+end
+end
+end
+ret true
+end
+
+fn ikB8AttnCausalOne step ulong l ulong isFull bool b ulong posQ ulong to bool
+dMaxRel = add posQ 1
+if gt dMaxRel 1024
+dMaxRel = ulong 1024
+end
+relTiles = div add dMaxRel 127 128
+ikDArgReset
+ikDPtr ikDW add B8_RLAT mul b 1536
+ikDPtr ikLva l 7
+ikDPtr ikDW 0x020000
+ikDArgU uint dMaxRel
+if not ikDBatchAdd 22 uint relTiles 24 1 128
+ret false
+end
+kva = ikDKvVaStep step
+ikDPtr ikDW add B8_K mul b 4096
+ikDPtr ikDW add B8_V mul b 4096
+ikDPtr kva
+ikDPtr add kva IK_KV_HALF_BYTES
+ikDArgU uint IK_TMAX
+ikDArgU uint posQ
+if not ikDBatchAdd 24 8 1 1 64
+ret false
+end
+splitS = uint 1
+if ge posQ 64
+splitS = uint 4
+end
+if ge posQ 512
+splitS = uint 8
+end
+ikDPtr ikDW add B8_Q mul b 12288
+ikDPtr kva
+ikDPtr add kva IK_KV_HALF_BYTES
+ikDPtr ikDW 0x020000
+ikDPtr ikDW 0x1e2000
+ikDPtr ikDW 0x1e4000
+ikDArgU 24
+ikDArgU 8
+ikDArgU uint IK_TMAX
+ikDArgU 1024
+ikDArgU uint posQ
+if isFull
+ikDArgU 0
+else
+ikDArgU 1024
+end
+ikDArgU splitS
+if not ikDBatchAdd 13 24 splitS 1 256
+ret false
+end
+ikDPtr ikDW 0x1e2000
+ikDPtr ikDW 0x1e4000
+ikDPtr ikDW add B8_SINK mul b 96
+ikDPtr ikDW add B8_GATE mul b 12288
+ikDPtr ikDW add B8_AOUT mul b 12288
+ikDArgU 24
+ikDArgU splitS
+ret ikDBatchAdd 14 24 1 1 32
+end
+
+fn ikB8RunLayerAttn step ulong l ulong startPosQ ulong hasMsgs bool to bool
+isFull = or or eq l 5 eq l 11 or eq l 17 eq l 23
+if not ikB8PrepAttnIn l isFull hasMsgs
+ret false
+end
+ikDArgReset
+ikDPtr ikDW B8_H
+ikDPtr ikLva l 16
+ikDPtr ikDW B8_HNORM
+ikDArgU 2304
+if not ikDBatchAdd 5 8 1 1 256
+ret false
+end
+ikDPtr ikDW B8_HK
+if isFull
+ikDPtr ikLva l 17
+else
+ikDPtr ikLva l 16
+end
+ikDPtr ikDW B8_HK
+ikDArgU 2304
+if not ikDBatchAdd 5 8 1 1 256
+ret false
+end
+ikDPtr ikDW B8_HV
+if isFull
+ikDPtr ikLva l 18
+else
+ikDPtr ikLva l 16
+end
+ikDPtr ikDW B8_HV
+ikDArgU 2304
+if not ikDBatchAdd 5 8 1 1 256
+ret false
+end
+if not ikB8Bf16 ikLva l 0 B8_HNORM B8_Q 2304 3072
+ret false
+end
+if not ikB8Bf16 ikLva l 1 B8_HK B8_K 2304 1024
+ret false
+end
+if not ikB8Bf16 ikLva l 2 B8_HV B8_V 2304 1024
+ret false
+end
+if not ikB8Bf16 ikLva l 3 B8_HNORM B8_RLAT 2304 384
+ret false
+end
+if not ikB8Bf16 ikLva l 5 B8_HNORM B8_GATE 2304 3072
+ret false
+end
+if not ikB8Bf16 ikLva l 6 B8_HNORM B8_SINK 2304 24
+ret false
+end
+if not ikB8AttnKvSconv step l isFull
+ret false
+end
+ikDArgReset
+ikDPtr ikDW B8_Q
+ikDPtr ikLva l 8
+ikDPtr ikDW 0x1e0000
+ikDPtr ikDW B8_Q
+ikDArgU 24
+ikDArgU 128
+ikDArgU ikDF32Bits 22.627417f32
+if isFull
+ikDArgU 3
+else
+ikDArgU 1
+end
+if not ikDBatchAdd 7 24 8 1 32
+ret false
+end
+ikDPtr ikDW B8_K
+ikDPtr 0
+ikDPtr 0
+ikDPtr ikDW B8_K
+ikDArgU 8
+ikDArgU 128
+ikDArgU ikDF32Bits 22.627417f32
+ikDArgU 0
+if not ikDBatchAdd 7 8 8 1 32
+ret false
+end
+ikDPtr ikDW B8_V
+ikDPtr 0
+ikDPtr ikDW B8_V
+ikDArgU 128
+if not ikDBatchAdd 5 64 1 1 256
+ret false
+end
+ikDPtr ikDW B8_RLAT
+ikDPtr ikLva l 9
+ikDPtr ikDW 0x1e0000
+ikDPtr ikDW B8_RLAT
+ikDArgU 24
+ikDArgU 16
+ikDArgU ikDF32Bits 8.0f32
+if isFull
+ikDArgU 3
+else
+ikDArgU 1
+end
+if not ikDBatchAdd 7 24 8 1 32
+ret false
+end
+for b ulong 8
+if not ikB8AttnCausalOne step l isFull b add startPosQ b
+ret false
+end
+end
+if not ikB8Bf16 ikLva l 4 B8_AOUT B8_OPROJ 3072 2304
+ret false
+end
+scBase = ikDScBaseStep step
+for b ulong 8
+ikDArgReset
+ikDPtr ikDW add B8_OPROJ mul b 9216
+ikDPtr ikDW add scBase 24576
+ikDPtr ikLva l 14
+ikDPtr ikDW add B8_OSCONV mul b 9216
+ikDArgU 2304
+if not ikDBatchAdd 11 18 1 1 128
+ret false
+end
+end
+ret true
+end
+
+fn ikB8UploadMeta l ulong to ulong
+wk = get ikDWork 0
+r = mapread wk B8_RIDS ikDOutBuf 0 256
+ids = new uint 64 0
+for i ulong 64
+o = mul i 4
+b0 = uint get ikDOutBuf o
+b1 = shl uint get ikDOutBuf add o 1 8
+b2 = shl uint get ikDOutBuf add o 2 16
+b3 = shl uint get ikDOutBuf add o 3 24
+put ids i or or b0 b1 or b2 b3
+end
+u = msDedupExperts ids 8
+for i ulong 64
+ikB8PutU32Meta mul i 4 get msUniqEids i
+ikB8PutU32Meta add 256 mul i 4 get msUniqCnt i
+end
+for i ulong 512
+ikB8PutU32Meta add 512 mul i 4 get msSlotMap i
+end
+if lt l 20
+ikDReadArenaChunk ikLva l 24 512
+for i ulong 512
+put ikB8MetaBuf add 2560 i get ikDOutBuf i
+end
+rw1 = mapwrite wk B8_META13 ikB8MetaBuf 0 3072
+ikDReadArenaChunk ikLva l 27 512
+for i ulong 512
+put ikB8MetaBuf add 2560 i get ikDOutBuf i
+end
+rw2 = mapwrite wk B8_META2 ikB8MetaBuf 0 3072
+else
+rw3 = mapwrite wk B8_META13 ikB8MetaBuf 0 2560
+end
+ret u
+end
+
+fn ikB8RecordArb step ulong to void
+wk = get ikDWork 0
+r = mapread wk B8_RIDS ikDOutBuf 0 256
+for b ulong 8
+dstBase = add mul mul b 48 8 mul step 8
+for k ulong 8
+o = mul add mul b 8 k 4
+b0 = uint get ikDOutBuf o
+b1 = shl uint get ikDOutBuf add o 1 8
+b2 = shl uint get ikDOutBuf add o 2 16
+b3 = shl uint get ikDOutBuf add o 3 24
+put ikB8ArbIds add dstBase k or or b0 b1 or b2 b3
+end
+end
+end
+
+fn ikB8MlpAttnResOne b ulong bc2 ulong mqVa ulong to bool
+blk = add B8_BLOCKS mul b 0x18000
+hr = add B8_HRES mul b 9216
+mi = add B8_MLPIN mul b 9216
+ret ikDBatchAttnRes blk bc2 hr mqVa 1 mi
+end
+
+fn ikB8RunLayerMlpPre step ulong l ulong hasMsgs bool to bool
+isBoundary = eq rem l 6 0
+if isBoundary
+bc = get ikDBlockCnt 0
+for b ulong 8
+dstB = add add B8_BLOCKS mul b 0x18000 mul bc 9216
+srcB = add B8_HRES mul b 9216
+if not ikDBatchCopy2304 dstB srcB
+ret false
+end
+end
+put ikDBlockCnt 0 add bc 1
+if not ikB8Copy8 B8_HRES B8_OSCONV
+ret false
+end
+else
+if not ikB8Add8 B8_HRES B8_HRES B8_OSCONV
+ret false
+end
+end
+mqVa = get ikMlpQOff l
+bc2 = get ikDBlockCnt 0
+for b ulong 8
+if not ikB8MlpAttnResOne b bc2 mqVa
+ret false
+end
+end
+if hasMsgs
+if not ikB8MsgGate l 3 B8_MLPIN 9216 27648 B8_MLPIN
+ret false
+end
+end
+ikDArgReset
+ikDPtr ikDW B8_MLPIN
+ikDPtr ikLva l 19
+ikDPtr ikDW B8_MLPNORM
+ikDArgU 2304
+if not ikDBatchAdd 5 8 1 1 256
+ret false
+end
+if not ikB8Bf16 ikLva l 20 B8_MLPNORM B8_RLOGITS 2304 128
+ret false
+end
+for b ulong 8
+ikDArgReset
+ikDPtr ikDW add B8_RLOGITS mul b 512
+ikDPtr ikLva l 21
+ikDPtr ikDW add B8_RIDS mul b 32
+ikDPtr ikDW add B8_RWTS mul b 32
+if not ikDBatchAdd 12 1 1 1 32
+ret false
+end
+end
+lutva = mapaddr get ikDKLut 0
+ikDArgReset
+if lt l 20
+ikDPtr ikDW B8_MLPNORM
+ikDPtr lutva
+ikDPtr ikDW 0x059000
+ikDPtr ikDW B8_QSCR
+ikDPtr ikDW add B8_QSCR 0x18000
+ikDPtr ikDW B8_XQ
+ikDArgU 1152
+if not ikDBatchAdd 8 9 1 1 128
+ret false
+end
+else
+ikDPtr ikDW B8_MLPNORM
+ikDPtr lutva
+ikDPtr ikDW B8_QSCR
+ikDPtr ikDW add B8_QSCR 0x18000
+ikDPtr ikDW B8_XQ
+ikDArgU 576
+if not ikDBatchAdd 9 5 1 1 128
+ret false
+end
+end
+ikDPtr ikDW B8_XQ
+ikDPtr ikDW B8_XREC
+ikDArgU 2304
+if not ikDBatchAdd 25 18 8 1 128
+ret false
+end
+ret ikDBatchRun
+end
+
+fn ikB8RunLayerMlpPost step ulong l ulong u ulong to bool
+if not ikDBatchStart
+ret false
+end
+lutva = mapaddr get ikDKLut 0
+ikDArgReset
+if lt l 20
+ikDPtr ikDW B8_XREC
+ikDPtr ikLva l 22
+ikDPtr ikLva l 23
+ikDPtr ikDW B8_META13
+ikDPtr lutva
+ikDPtr ikDW B8_C13
+ikDArgU 2304
+ikDArgU 2304
+if not ikDBatchAdd 27 288 uint u 1 256
+ret false
+end
+ikDPtr ikDW B8_C13
+ikDPtr ikDW B8_RWTS
+ikDPtr lutva
+ikDPtr ikDW 0x059000
+ikDPtr ikDW B8_QSCR
+ikDPtr ikDW add B8_QSCR 0x18000
+ikDPtr ikDW B8_SWI
+ikDArgU 1152
+if not ikDBatchAdd 17 1 64 1 128
+ret false
+end
+ikDPtr ikDW B8_SWI
+ikDPtr ikLva l 25
+ikDPtr ikLva l 26
+ikDPtr ikDW B8_META2
+ikDPtr lutva
+ikDPtr ikDW B8_C2
+ikDArgU 1152
+ikDArgU 2304
+if not ikDBatchAdd 27 288 uint u 1 256
+ret false
+end
+else
+ikDPtr ikDW B8_XREC
+ikDPtr ikLva l 22
+ikDPtr ikLva l 23
+ikDPtr ikDW B8_META13
+ikDPtr lutva
+ikDPtr ikDW B8_C13
+ikDArgU 2304
+ikDArgU 2304
+if not ikDBatchAdd 28 288 uint u 1 256
+ret false
+end
+ikDPtr ikDW B8_C13
+ikDPtr ikDW B8_RWTS
+ikDPtr ikDW B8_SWI
+ikDPtr 0
+ikDArgU 1152
+if not ikDBatchAdd 10 9 64 1 128
+ret false
+end
+ikDPtr ikDW B8_SWI
+ikDPtr lutva
+ikDPtr ikDW B8_QSCR
+ikDPtr ikDW add B8_QSCR 0x18000
+ikDPtr ikDW B8_XREC
+ikDArgU 2304
+if not ikDBatchAdd 9 18 1 1 128
+ret false
+end
+ikDPtr ikDW B8_XREC
+ikDPtr ikLva l 25
+ikDPtr ikLva l 26
+ikDPtr ikDW B8_META13
+ikDPtr lutva
+ikDPtr ikDW B8_C2
+ikDArgU 1152
+ikDArgU 2304
+if not ikDBatchAdd 28 288 uint u 1 256
+ret false
+end
+end
+scBase = ikDScBaseStep step
+for b ulong 8
+ikDArgReset
+ikDPtr ikDW add B8_C2 mul b 73728
+ikDPtr ikDW add scBase 52224
+ikDPtr ikLva l 15
+ikDPtr ikDW add B8_MLPOUT mul b 9216
+ikDArgU 2304
+if not ikDBatchAdd 15 18 1 1 128
+ret false
+end
+end
+ret ikB8Add8 B8_H B8_HRES B8_MLPOUT
+end
+
+fn ikB8RunLayer step ulong l ulong startPosQ ulong hasMsgs bool to bool
+if not ikB8RunLayerAttn step l startPosQ hasMsgs
+ret false
+end
+if not ikB8RunLayerMlpPre step l hasMsgs
+ret false
+end
+ikB8RecordArb step
+u = ikB8UploadMeta l
+ret ikB8RunLayerMlpPost step l u
+end
+
+fn ikB8ArbFlushOne b ulong to void
+ikArbResetToken
+put ikDArbHasPred 0 0
+tokBase = mul mul b 48 8
+for s ulong 48
+for k ulong 8
+id = get ikB8ArbIds add tokBase add mul s 8 k
+o = add mul s 32 mul k 4
+put ikDOutBuf o uchar and id 255
+put ikDOutBuf add o 1 uchar and shr id 8 255
+put ikDOutBuf add o 2 uchar and shr id 16 255
+put ikDOutBuf add o 3 uchar and shr id 24 255
+end
+end
+for l ulong 6
+ikDArbStepBuf l l
+end
+for j ulong 12
+ikDArbStepBuf add 6 j add 6 j
+end
+for pass ulong 2
+for j ulong 12
+ikDArbStepBuf add add 18 mul pass 12 j add 6 j
+end
+end
+for j ulong 6
+ikDArbStepBuf add 42 j add 18 j
+end
+end
+
+fn ikB8SavePreLoop to bool
+if not ikB8Copy8 B8_PREH B8_H
+ret false
+end
+bc = get ikDBlockCnt 0
+for b ulong 8
+if not ikDBatchCopyBlocks add B8_PREBLK mul b 0x9000 add B8_BLOCKS mul b 0x18000 bc
+ret false
+end
+end
+put ikDPreBlockCnt 0 bc
+ret true
+end
+
+fn ikB8StartLoopPass to bool
+preN = get ikDPreBlockCnt 0
+curN = get ikDBlockCnt 0
+nPrev = sub curN add preN 1
+for b ulong 8
+srcB = add add B8_BLOCKS mul b 0x18000 mul add preN 1 9216
+dstP = add B8_PREVBLK mul b 0x9000
+if not ikDBatchCopyBlocks dstP srcB nPrev
+ret false
+end
+if not ikDBatchCopy2304 add dstP mul nPrev 9216 add B8_H mul b 9216
+ret false
+end
+end
+put ikDPrevBlockCnt 0 add nPrev 1
+if not ikB8Copy8 B8_H B8_PREH
+ret false
+end
+for b ulong 8
+if not ikDBatchCopyBlocks add B8_BLOCKS mul b 0x18000 add B8_PREBLK mul b 0x9000 preN
+ret false
+end
+end
+put ikDBlockCnt 0 preN
+ret true
+end
+
+note Prefill 8 prompt tokens (loaded in global ikB8Toks[0..7]) starting at startPosQ in slot.
+fn ikDPrefillBatch8 slot ulong startPosQ ulong to bool
+put ikDSlot 0 slot
+for b ulong 8
+ikB8EmbedOne b ulong get ikB8Toks b
+end
+put ikDBlockCnt 0 0
+if not ikDBatchStart
+ret false
+end
+for l ulong 6
+if not ikB8RunLayer l l startPosQ false
+ret false
+end
+end
+if not ikB8SavePreLoop
+ret false
+end
+for j ulong 12
+l = add 6 j
+if not ikB8RunLayer l l startPosQ false
+ret false
+end
+end
+for pass ulong 2
+if not ikB8StartLoopPass
+ret false
+end
+for j ulong 12
+step = add add 18 mul pass 12 j
+l = add 6 j
+if not ikB8CrossPassMsgs j
+ret false
+end
+if not ikB8RunLayer step l startPosQ true
+ret false
+end
+end
+end
+for j ulong 6
+step = add 42 j
+l = add 18 j
+if not ikB8RunLayer step l startPosQ false
+ret false
+end
+end
+if not ikDBatchRun
+ret false
+end
+for b ulong 8
+ikB8ArbFlushOne b
+end
+ret true
+end

@@ -42,11 +42,14 @@ seed/out/omc < "$tmp/native-input.om" > "$tmp/inkling2-native"
     gpu/nvidia/native/blackwell/batch.om \
     om/encoder/bw_enc_sm121.om \
     om/gpu/inkling2/emit_fast.om \
+    om/gpu/inkling2/emit_batch.om \
     om/arboris_online.om \
     om/gpu/inkling2/arboris/prefetch.om \
     om/gpu/inkling2/decoder/safetensors.om \
     om/gpu/inkling2/decoder/tokenizer.om \
     om/gpu/inkling2/decoder/decode.om \
+    om/gpu/inkling2/multistream/batcher.om \
+    om/gpu/inkling2/decoder/prefill_b8.om \
     om/gpu/inkling2/decoder/decode-cli.om
 ) > "$tmp/decode-input.om"
 seed/out/omc < "$tmp/decode-input.om" > "$tmp/inkling2-decode"
@@ -57,12 +60,14 @@ seed/out/omc < "$tmp/decode-input.om" > "$tmp/inkling2-decode"
     gpu/nvidia/native/blackwell/batch.om \
     om/encoder/bw_enc_sm121.om \
     om/gpu/inkling2/emit_fast.om \
+    om/gpu/inkling2/emit_batch.om \
     om/arboris_online.om \
     om/gpu/inkling2/arboris/prefetch.om \
     om/gpu/inkling2/decoder/safetensors.om \
     om/gpu/inkling2/decoder/tokenizer.om \
     om/gpu/inkling2/decoder/decode.om \
     om/gpu/inkling2/multistream/batcher.om \
+    om/gpu/inkling2/decoder/prefill_b8.om \
     om/gpu/inkling2/multistream/serve_live.om
 ) > "$tmp/serve-live-input.om"
 seed/out/omc < "$tmp/serve-live-input.om" > "$tmp/inkling2-serve"
