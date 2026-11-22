@@ -1,0 +1,134 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure Seeded OM-2 N-gram / Prompt-Lookup Drafter with Online Confidence Head Calibration.
+note Proposes up to k <= 5 draft tokens by matching the longest recent suffix (n = 4..2)
+note in the active context ring, and outputs per-position conditional acceptance probabilities
+note calibrated by an online exponential moving average (EMA) per draft depth (0..4).
+note Feeds directly into om/gpu/spec/mtp_varlen.om (same interface as a trained DSpark draft head).
+
+const NG_MAX_CTX ulong 4096
+const NG_MAX_DRAFT ulong 5
+
+global ngCtx ulong 4096
+global ngCtxLen ulong 1
+global ngEmaAccept f32 5
+global ngDepthTrials ulong 5
+global ngDepthHits ulong 5
+
+fn ngReset to void
+put ngCtxLen 0 0
+put ngEmaAccept 0 0.72f32
+put ngEmaAccept 1 0.56f32
+put ngEmaAccept 2 0.44f32
+put ngEmaAccept 3 0.34f32
+put ngEmaAccept 4 0.25f32
+for d ulong NG_MAX_DRAFT
+put ngDepthTrials d 0
+put ngDepthHits d 0
+end
+end
+
+fn ngPushToken tok ulong to void
+n = get ngCtxLen 0
+if lt n NG_MAX_CTX
+put ngCtx n tok
+put ngCtxLen 0 add n 1
+else
+for i ulong sub NG_MAX_CTX 1
+put ngCtx i get ngCtx add i 1
+end
+put ngCtx sub NG_MAX_CTX 1 tok
+end
+end
+
+note Update per-depth conditional acceptance EMA after verifying a draft of length nDraft with nAccepted hits.
+fn ngObserveResult nDraft ulong nAccepted ulong to void
+alpha = f32 0.125f32
+oneMinus = f32 0.875f32
+for d ulong nDraft bound 5
+put ngDepthTrials d add get ngDepthTrials d 1
+obs = f32 0.0f32
+if lt d nAccepted
+obs = f32 1.0f32
+put ngDepthHits d add get ngDepthHits d 1
+end
+old = get ngEmaAccept d
+put ngEmaAccept d add mul oneMinus old mul alpha obs
+end
+end
+
+fn ngMatchAt pos ulong lastStart ulong order ulong to bool
+for k ulong order bound 4
+if ne get ngCtx add pos k get ngCtx add lastStart k
+ret false
+end
+end
+ret true
+end
+
+fn ngFindOrder n ulong order ulong to ulong
+if lt n add order 2
+ret 999999999
+end
+lastStart = sub n order
+scanEnd = sub n add order 1
+for idx ulong scanEnd bound 4096
+pos = sub sub scanEnd 1 idx
+if ngMatchAt pos lastStart order
+ret add pos order
+end
+end
+ret 999999999
+end
+
+note Propose up to maxDraft (<= 5) tokens + calibrated per-position acceptance probabilities.
+note Returns number of drafted tokens (0 if no suffix match found).
+fn ngPropose maxDraft ulong outToks edit ulong 8 outRates edit f32 8 to ulong
+n = get ngCtxLen 0
+cap = maxDraft
+if gt cap NG_MAX_DRAFT
+cap = NG_MAX_DRAFT
+end
+if or lt n 4 eq cap 0
+ret 0
+end
+bestPos = ulong 999999999
+bestOrder = ulong 0
+for ordIdx ulong 3
+order = sub 4 ordIdx
+hit = ngFindOrder n order
+if ne hit 999999999
+bestPos = hit
+bestOrder = order
+break
+end
+end
+if eq bestPos 999999999
+ret 0
+end
+avail = sub n bestPos
+if gt avail cap
+avail = cap
+end
+note Higher suffix match order boosts confidence slightly (4-gram > 3-gram > 2-gram), clamped to [0.05, 0.98].
+boost = f32 1.0f32
+if eq bestOrder 4
+boost = f32 1.12f32
+end
+if eq bestOrder 2
+boost = f32 0.80f32
+end
+cumProd = f32 1.0f32
+for d ulong avail bound 5
+put outToks d get ngCtx add bestPos d
+p = mul get ngEmaAccept d boost
+if gt p 0.98f32
+p = f32 0.98f32
+end
+if lt p 0.05f32
+p = f32 0.05f32
+end
+cumProd = mul cumProd p
+put outRates d cumProd
+end
+ret avail
+end

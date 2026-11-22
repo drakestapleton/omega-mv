@@ -1,0 +1,495 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure Seeded OM-2 Confidence-Scheduled Speculative Decoding Engine (MTPVarlen).
+note Implements DeepInfer's confidence-scheduled variable-length verification
+note (csrc/engine/mtp_varlen.hpp) + online ForwardRuntimeEstimator / SamplerRuntimeEstimator
+note + lossless greedy speculative verifier for GB10 (SM121) single- and multi-stream serving.
+note
+note Compose in any OM-2 unit (no external deps, zero heap, zero C, zero CUDA).
+
+const SPEC_MAX_SEQS ulong 16
+const SPEC_MAX_DRAFT ulong 8
+const SPEC_MAX_CURVE ulong 32
+const SPEC_MAX_Q ulong 128
+const SPEC_SAMP_WIN ulong 9
+const SPEC_SAMP_MIN ulong 5
+const SPEC_FWD_WIN ulong 32
+const SPEC_FWD_MIN ulong 5
+
+note Hardware decode throughput curve: (graph_size, baseline_ms), strictly increasing in graph_size.
+global specCurveN ulong 1
+global specCurveM ulong 32
+global specCurveMs f32 32
+
+note Per-num_seqs SamplerRuntimeEstimator (slots 0..16; slot 0 = global fallback).
+global specSampRing f32 153
+global specSampSz ulong 17
+global specSampNext ulong 17
+
+note Per-graph-size ForwardRuntimeEstimator (up to 32 curve points x 32-sample ring).
+global specFwdRing f32 1024
+global specFwdSz ulong 32
+global specFwdNext ulong 32
+
+note Per-stream MTP state (up to SPEC_MAX_SEQS streams, up to SPEC_MAX_DRAFT draft tokens each).
+global specSeqNd ulong 16
+global specSeqSchedCnt ulong 16
+global specSeqProcCnt ulong 16
+global specSeqHasDraft ulong 16
+global specSeqHasPrev ulong 16
+global specSeqHasCur ulong 16
+global specSeqPrevRate f32 128
+global specSeqCurRate f32 128
+
+note Scheduler outputs & diagnostics.
+global specOutLens ulong 16
+global specOutBestBsz ulong 1
+global specOutBestTps f32 1
+global specOutSlopeMs f32 1
+global specOutSampMs f32 1
+
+note Scratch queues for sorting candidate (rate, seq_idx) pairs (up to SPEC_MAX_Q = 128).
+global specQBszRate f32 128
+global specQBszSeq ulong 128
+global specQSeqRate f32 128
+global specQSeqSeq ulong 128
+global specTmpSort f32 32
+
+fn specResetAll to void
+put specCurveN 0 0
+for i ulong 32
+put specCurveM i 0
+put specCurveMs i 0.0f32
+put specFwdSz i 0
+put specFwdNext i 0
+end
+for i ulong 17
+put specSampSz i 0
+put specSampNext i 0
+end
+for i ulong 153
+put specSampRing i 0.0f32
+end
+for i ulong 1024
+put specFwdRing i 0.0f32
+end
+for s ulong SPEC_MAX_SEQS
+put specSeqNd s 0
+put specSeqSchedCnt s 0
+put specSeqProcCnt s 0
+put specSeqHasDraft s 0
+put specSeqHasPrev s 0
+put specSeqHasCur s 0
+put specOutLens s 0
+end
+for i ulong 128
+put specSeqPrevRate i 0.0f32
+put specSeqCurRate i 0.0f32
+end
+put specOutBestBsz 0 0
+put specOutBestTps 0 0.0f32
+put specOutSlopeMs 0 0.0f32
+put specOutSampMs 0 0.0f32
+end
+
+note Append a (graph_size, baseline_ms) point; enforces strictly increasing graph_size and > 0 ms.
+fn specAddCurvePoint gSize ulong baseMs f32 to bool
+n = get specCurveN 0
+if ge n SPEC_MAX_CURVE
+ret false
+end
+if or eq gSize 0 le baseMs 0.0f32
+ret false
+end
+if gt n 0
+if le gSize get specCurveM sub n 1
+ret false
+end
+end
+put specCurveM n gSize
+put specCurveMs n baseMs
+put specCurveN 0 add n 1
+ret true
+end
+
+note Default GB10 (SM121, 236.9 GB/s LPDDR5X) baseline curve modeled from measured single- vs multi-row
+note scaling (q36 Full-W4 ~14.7 ms at M=1; multi-row weight reuse with MoE expert growth at larger M).
+note Callers can replace this with live calibrated points via specResetAll + specAddCurvePoint.
+fn specInitGb10DefaultCurve to void
+put specCurveN 0 0
+ok = specAddCurvePoint 1 14.73f32
+ok = specAddCurvePoint 2 16.20f32
+ok = specAddCurvePoint 3 17.65f32
+ok = specAddCurvePoint 4 19.10f32
+ok = specAddCurvePoint 6 22.10f32
+ok = specAddCurvePoint 8 25.40f32
+ok = specAddCurvePoint 12 33.20f32
+ok = specAddCurvePoint 16 42.50f32
+ok = specAddCurvePoint 24 63.00f32
+ok = specAddCurvePoint 32 86.00f32
+ok = specAddCurvePoint 48 138.00f32
+ok = specAddCurvePoint 64 196.00f32
+end
+
+note Insertion sort specTmpSort[0..n-1] ascending and return exact median.
+fn specMedianTmp n ulong to f32
+if eq n 0
+ret 0.0f32
+end
+for i ulong n bound 32
+v = get specTmpSort i
+j = i
+while gt j 0 bound 32
+prev = get specTmpSort sub j 1
+if le prev v
+break
+end
+put specTmpSort j prev
+j = sub j 1
+end
+put specTmpSort j v
+end
+mid = div n 2
+if eq rem n 2 0
+ret mul 0.5f32 add get specTmpSort sub mid 1 get specTmpSort mid
+end
+ret get specTmpSort mid
+end
+
+fn specSampUpdateSlot slot ulong valMs f32 to void
+nxt = get specSampNext slot
+base = mul slot SPEC_SAMP_WIN
+put specSampRing add base nxt valMs
+put specSampNext slot rem add nxt 1 SPEC_SAMP_WIN
+sz = get specSampSz slot
+if lt sz SPEC_SAMP_WIN
+put specSampSz slot add sz 1
+end
+end
+
+fn specSampGetSlot slot ulong to f32
+sz = get specSampSz slot
+if lt sz SPEC_SAMP_MIN
+ret -1.0f32
+end
+base = mul slot SPEC_SAMP_WIN
+for i ulong sz bound 9
+put specTmpSort i get specSampRing add base i
+end
+ret specMedianTmp sz
+end
+
+fn specFindCurveIdx gSize ulong to ulong
+n = get specCurveN 0
+for i ulong n bound 32
+if ge get specCurveM i gSize
+ret i
+end
+end
+ret SPEC_MAX_CURVE
+end
+
+fn specFwdUpdateIdx cidx ulong normRes f32 to void
+nxt = get specFwdNext cidx
+base = mul cidx SPEC_FWD_WIN
+put specFwdRing add base nxt normRes
+put specFwdNext cidx rem add nxt 1 SPEC_FWD_WIN
+sz = get specFwdSz cidx
+if lt sz SPEC_FWD_WIN
+put specFwdSz cidx add sz 1
+end
+end
+
+fn specFwdGetSlope to f32
+n = get specCurveN 0
+gMeds = new f32 32 0.0f32
+gCnt = ulong 0
+for c ulong n bound 32
+sz = get specFwdSz c
+if ge sz SPEC_FWD_MIN
+base = mul c SPEC_FWD_WIN
+for i ulong sz bound 32
+put specTmpSort i get specFwdRing add base i
+end
+put gMeds gCnt specMedianTmp sz
+gCnt = add gCnt 1
+end
+end
+if eq gCnt 0
+ret 0.0f32
+end
+for i ulong gCnt bound 32
+put specTmpSort i get gMeds i
+end
+slope = specMedianTmp gCnt
+if lt slope 0.0f32
+ret 0.0f32
+end
+ret slope
+end
+
+note Feed observed decode forward_ms and sampler_ms back into the online estimators.
+fn specUpdateRuntime numSeqs ulong gSize ulong forwardMs f32 samplerMs f32 to bool
+cidx = specFindCurveIdx gSize
+if ge cidx get specCurveN 0
+ret false
+end
+baseMs = get specCurveMs cidx
+gsz = get specCurveM cidx
+normRes = div sub forwardMs baseMs f32 gsz
+specFwdUpdateIdx cidx normRes
+if and gt numSeqs 0 le numSeqs SPEC_MAX_SEQS
+specSampUpdateSlot numSeqs samplerMs
+end
+specSampUpdateSlot 0 samplerMs
+ret true
+end
+
+note Configure per-stream MTP state before calling specSchedule.
+fn specSetStream s ulong nd ulong schedCnt ulong procCnt ulong hasDraft ulong to bool
+if or ge s SPEC_MAX_SEQS gt nd SPEC_MAX_DRAFT
+ret false
+end
+put specSeqNd s nd
+put specSeqSchedCnt s schedCnt
+put specSeqProcCnt s procCnt
+put specSeqHasDraft s hasDraft
+ret true
+end
+
+fn specSetStreamRates s ulong isPrev bool hasRates ulong rates view f32 * nd ulong to bool
+if or ge s SPEC_MAX_SEQS gt nd SPEC_MAX_DRAFT
+ret false
+end
+base = mul s SPEC_MAX_DRAFT
+if isPrev
+put specSeqHasPrev s hasRates
+for j ulong nd bound 8
+put specSeqPrevRate add base j get rates j
+end
+else
+put specSeqHasCur s hasRates
+for j ulong nd bound 8
+put specSeqCurRate add base j get rates j
+end
+end
+ret true
+end
+
+fn specSortBszQueue n ulong to void
+for i ulong n bound 128
+rv = get specQBszRate i
+sv = get specQBszSeq i
+j = i
+while gt j 0 bound 128
+pr = get specQBszRate sub j 1
+ps = get specQBszSeq sub j 1
+swap = lt pr rv
+if and not swap eq pr rv
+swap = gt ps sv
+end
+if not swap
+break
+end
+put specQBszRate j pr
+put specQBszSeq j ps
+j = sub j 1
+end
+put specQBszRate j rv
+put specQBszSeq j sv
+end
+end
+
+fn specSortSeqQueue n ulong to void
+for i ulong n bound 128
+rv = get specQSeqRate i
+sv = get specQSeqSeq i
+j = i
+while gt j 0 bound 128
+pr = get specQSeqRate sub j 1
+ps = get specQSeqSeq sub j 1
+swap = lt pr rv
+if and not swap eq pr rv
+swap = gt ps sv
+end
+if not swap
+break
+end
+put specQSeqRate j pr
+put specQSeqSeq j ps
+j = sub j 1
+end
+put specQSeqRate j rv
+put specQSeqSeq j sv
+end
+end
+
+fn specGetSamplerEst numSeqs ulong to f32
+est = f32 -1.0f32
+if and gt numSeqs 0 le numSeqs SPEC_MAX_SEQS
+est = specSampGetSlot numSeqs
+end
+if lt est 0.0f32
+est = specSampGetSlot 0
+end
+if lt est 0.0f32
+ret 0.0f32
+end
+ret est
+end
+
+fn specRateBsz s ulong j ulong paired bool hasDr bool to f32
+base = add mul s SPEC_MAX_DRAFT j
+if paired
+if ne get specSeqHasPrev s 0
+ret get specSeqPrevRate base
+end
+else
+if ne get specSeqHasCur s 0
+ret get specSeqCurRate base
+end
+end
+if hasDr
+ret 1.0f32
+end
+ret 0.0f32
+end
+
+fn specRateSeq s ulong j ulong hasDr bool to f32
+if ne get specSeqHasCur s 0
+ret get specSeqCurRate add mul s SPEC_MAX_DRAFT j
+end
+if hasDr
+ret 1.0f32
+end
+ret 0.0f32
+end
+
+fn specPushStream s ulong qLen ulong to long
+sc = get specSeqSchedCnt s
+pc = get specSeqProcCnt s
+if or gt pc sc gt sc add pc 1
+ret -1
+end
+paired = eq pc sc
+hasDr = or ne get specSeqHasDraft s 0 eq sc add pc 1
+nd = get specSeqNd s
+ql = qLen
+for j ulong nd bound 8
+if ge ql SPEC_MAX_Q
+ret -1
+end
+put specQBszRate ql specRateBsz s j paired hasDr
+put specQBszSeq ql s
+put specQSeqRate ql specRateSeq s j hasDr
+put specQSeqSeq ql s
+ql = add ql 1
+end
+ret long ql
+end
+
+fn specBuildQueues numSeqs ulong to long
+qLen = ulong 0
+for s ulong numSeqs bound 16
+nxt = specPushStream s qLen
+if lt nxt 0
+ret -1
+end
+qLen = ulong nxt
+end
+ret long qLen
+end
+
+fn specEvalStep curExp f32 curBsz ulong cIdx ulong to f32
+cN = get specCurveN 0
+if ge cIdx cN
+ret 0.0f32
+end
+gSz = get specCurveM cIdx
+bMs = get specCurveMs cIdx
+tMs = add add bMs mul get specOutSlopeMs 0 f32 gSz get specOutSampMs 0
+if le tMs 0.0f32
+ret 0.0f32
+end
+ret div curExp tMs
+end
+
+fn specPickBestBsz numSeqs ulong qLen ulong to ulong
+cN = get specCurveN 0
+bestTps = f32 0.0f32
+bestBsz = numSeqs
+curExp = f32 numSeqs
+curBsz = numSeqs
+cIdx = ulong 0
+for step ulong add qLen 1 bound 129
+if gt step 0
+curExp = add curExp get specQBszRate sub step 1
+curBsz = add curBsz 1
+end
+while and lt cIdx cN gt curBsz get specCurveM cIdx bound 32
+cIdx = add cIdx 1
+end
+tps = specEvalStep curExp curBsz cIdx
+if gt tps bestTps
+bestTps = tps
+bestBsz = curBsz
+end
+end
+put specOutBestTps 0 bestTps
+ret bestBsz
+end
+
+note Core MTPVarlen::schedule() in pure OM-2.
+note Populates specOutLens[0..numSeqs-1], specOutBestBsz, specOutBestTps.
+note Returns true on valid schedule, false on invalid arguments/invariant violation.
+fn specSchedule numSeqs ulong to bool
+if or eq numSeqs 0 gt numSeqs SPEC_MAX_SEQS
+ret false
+end
+if eq get specCurveN 0 0
+for s ulong numSeqs bound 16
+put specOutLens s add 1 get specSeqNd s
+end
+put specOutBestBsz 0 numSeqs
+ret true
+end
+ql = specBuildQueues numSeqs
+if lt ql 0
+ret false
+end
+qLen = ulong ql
+specSortBszQueue qLen
+specSortSeqQueue qLen
+put specOutSampMs 0 specGetSamplerEst numSeqs
+put specOutSlopeMs 0 specFwdGetSlope
+bestBsz = specPickBestBsz numSeqs qLen
+put specOutBestBsz 0 bestBsz
+for s ulong numSeqs bound 16
+put specOutLens s 1
+end
+extra = sub bestBsz numSeqs
+for i ulong extra bound 128
+si = get specQSeqSeq i
+put specOutLens si add get specOutLens si 1
+end
+ret true
+end
+
+note Lossless greedy speculative verification.
+note targetToks[0..nDraft] = argmax logits from the 1+nDraft batched forward pass:
+note   targetToks[j] is the target model's greedy next token given prefix + draft[0..j-1].
+note Writes outEmitted[0..a] (a+1 tokens total, bit-identical to target greedy decoding)
+note and returns accepted draft count a in [0..nDraft] (total emitted = a + 1).
+fn specVerifyGreedy targetToks view ulong 9 draftToks view ulong 8 nDraft ulong outEmitted edit ulong 9 to ulong
+acc = ulong 0
+for j ulong nDraft bound 8
+tt = get targetToks j
+put outEmitted j tt
+if eq tt get draftToks j
+acc = add acc 1
+else
+ret acc
+end
+end
+put outEmitted acc get targetToks acc
+ret acc
+end

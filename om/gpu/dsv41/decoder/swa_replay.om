@@ -1,0 +1,117 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note DeepInfer SWA Bounded Replay policy for DeepSeek-V4.1-Flash (om/gpu/dsv41/decoder/).
+note Mirrors DeepInfer's YOCO / CED SWA bounded replay rules (doc/inference_deployment_qa.md):
+note   1. Block KV cache hit length L1 is capped at L - (SWA_WINDOW + SWA_BACKTRACK_MARGIN) = L - 134,
+note      aligned down to the 128-token block size.
+note   2. If the SWA KV cache at [L1 - 128, L1) is missing, back off by one block (L1 - 128) so the
+note      last 128 tokens of the hit prefix are replayed to rebuild SWA state while block KV is reused.
+note   3. During prompt prefill in compact mode, decoder SWA layers (layer >= 20) only run on the final
+note      keep_tokens (default 140 = 128 SWA window + 12 backtracking margin), nearly halving prefill.
+note   4. During bounded replay starting at position s, query i attends only to keys in [max(s, i - 127), i].
+
+const SWA_WINDOW ulong 128
+const SWA_BLOCK ulong 128
+const SWA_BACKTRACK_MARGIN ulong 6
+const SWA_YOCO_CAP_MARGIN ulong 134
+const SWA_DEFAULT_KEEP ulong 140
+const SWA_DECODER_FIRST_LAYER ulong 20
+
+global swaCompactMode ulong 1
+global swaKeepTokens ulong 1
+global swaReplayStart ulong 1
+global swaSkippedLayers ulong 1
+global swaExecutedLayers ulong 1
+
+fn swaInit compact bool keepTokens ulong to bool
+if lt keepTokens SWA_YOCO_CAP_MARGIN
+ret false
+end
+if compact
+put swaCompactMode 0 1
+else
+put swaCompactMode 0 0
+end
+put swaKeepTokens 0 keepTokens
+put swaReplayStart 0 0
+put swaSkippedLayers 0 0
+put swaExecutedLayers 0 0
+ret true
+end
+
+fn swaInitDefault to void
+ok = swaInit true SWA_DEFAULT_KEEP
+end
+
+note Compute effective prefix cache hit length under DeepInfer's block+SWA hit policy.
+fn swaComputeHitLen promptLen ulong blockHitLen ulong hasSwaAtHit bool to ulong
+if le promptLen SWA_YOCO_CAP_MARGIN
+ret 0
+end
+capRaw = sub promptLen SWA_YOCO_CAP_MARGIN
+capAligned = mul div capRaw SWA_BLOCK SWA_BLOCK
+l1 = mul div blockHitLen SWA_BLOCK SWA_BLOCK
+if gt l1 capAligned
+l1 = capAligned
+end
+if eq l1 0
+ret 0
+end
+if hasSwaAtHit
+ret l1
+end
+if lt l1 SWA_WINDOW
+ret 0
+end
+ret sub l1 SWA_WINDOW
+end
+
+note Compute decoder bounded-replay start position s for a prompt of length promptLen.
+fn swaDecoderReplayStart promptLen ulong to ulong
+if eq get swaCompactMode 0 0
+ret 0
+end
+keep = get swaKeepTokens 0
+if le promptLen keep
+ret 0
+end
+ret sub promptLen keep
+end
+
+note Return true if layer L must execute at prompt position pos (0..promptLen-1) during prefill.
+note Encoder layers (< 20) always run (they produce the compressed KV projections);
+note decoder SWA layers (>= 20) only run inside the bounded suffix [promptLen - keepTokens, promptLen).
+fn swaShouldRunPrefillLayer layer ulong pos ulong promptLen ulong to bool
+if or eq get swaCompactMode 0 0 ge pos promptLen
+put swaExecutedLayers 0 add get swaExecutedLayers 0 1
+ret true
+end
+if lt layer SWA_DECODER_FIRST_LAYER
+put swaExecutedLayers 0 add get swaExecutedLayers 0 1
+ret true
+end
+startPos = swaDecoderReplayStart promptLen
+if ge pos startPos
+put swaExecutedLayers 0 add get swaExecutedLayers 0 1
+ret true
+end
+put swaSkippedLayers 0 add get swaSkippedLayers 0 1
+ret false
+end
+
+note Compute truncated SWA key range [outRange[0], outRange[1]] for query at position pos
+note when replaying from replayStart: kStart = max(replayStart, pos >= 127 ? pos - 127 : 0), kEnd = pos.
+fn swaTruncatedKeyRange pos ulong replayStart ulong outRange edit ulong 2 to bool
+if lt pos replayStart
+ret false
+end
+kStart = ulong 0
+if ge pos sub SWA_WINDOW 1
+kStart = sub pos sub SWA_WINDOW 1
+end
+if lt kStart replayStart
+kStart = replayStart
+end
+put outRange 0 kStart
+put outRange 1 pos
+ret true
+end

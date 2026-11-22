@@ -1,0 +1,316 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure Seeded OM-2 Host Verification & Negative-Control Gate for MTPVarlen + N-gram Drafter.
+note Compose after: om/gpu/spec/mtp_varlen.om om/gpu/spec/ngram_draft.om
+
+text msgPass "PASS: spec_mtp_varlen gate ("
+text msgChecks " checks, 0 failures)\n"
+text msgFail "FAIL: check="
+text msgNl "\n"
+
+fn ckPrint s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn ckPrintU x ulong to void
+b = new uchar 24 0
+pos = ulong 24
+v = x
+while true
+pos = sub pos 1
+put b pos uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+r = write 1 b pos sub 24 pos
+end
+
+fn ckFail code ulong to int
+ckPrint msgFail
+ckPrintU code
+ckPrint msgNl
+ret int code
+end
+
+note Check 1: Single-stream light load with high confidence verifies all 5 draft tokens (seqlen_q = 6).
+fn ckTestLightLoad to ulong
+specResetAll
+specInitGb10DefaultCurve
+r = new f32 8 0.0f32
+put r 0 0.95f32
+put r 1 0.90f32
+put r 2 0.85f32
+put r 3 0.80f32
+put r 4 0.75f32
+if not specSetStream 0 5 1 1 1
+ret 10
+end
+if not specSetStreamRates 0 true 1 r 5
+ret 11
+end
+if not specSetStreamRates 0 false 1 r 5
+ret 12
+end
+if not specSchedule 1
+ret 13
+end
+if ne get specOutBestBsz 0 6
+ret 14
+end
+if ne get specOutLens 0 6
+ret 15
+end
+ret 0
+end
+
+note Check 2: Multi-stream heavy load (8 streams) with sharp curve knee trims low-confidence tails
+note and allocates verification slots strictly to highest-confidence streams.
+fn ckTestHeavyLoadTrim to ulong
+specResetAll
+note Synthetic knee curve: M=8 takes 20ms, M=12 takes 24ms, M=16 takes 28ms, M=24 takes 60ms, M=48 takes 140ms.
+ok = specAddCurvePoint 8 20.0f32
+ok = specAddCurvePoint 12 24.0f32
+ok = specAddCurvePoint 16 28.0f32
+ok = specAddCurvePoint 24 60.0f32
+ok = specAddCurvePoint 48 140.0f32
+hi = new f32 8 0.0f32
+put hi 0 0.95f32
+put hi 1 0.90f32
+put hi 2 0.85f32
+put hi 3 0.80f32
+put hi 4 0.10f32
+lo = new f32 8 0.0f32
+put lo 0 0.15f32
+put lo 1 0.10f32
+put lo 2 0.05f32
+put lo 3 0.05f32
+put lo 4 0.02f32
+for s ulong 8
+ok = specSetStream s 5 2 2 1
+if lt s 2
+ok = specSetStreamRates s true 1 hi 5
+ok = specSetStreamRates s false 1 hi 5
+else
+ok = specSetStreamRates s true 1 lo 5
+ok = specSetStreamRates s false 1 lo 5
+end
+end
+if not specSchedule 8
+ret 20
+end
+note Optimal operating point must pick M=16 (8 golden + 8 high-confidence drafts = 4 each for streams 0 & 1),
+note rejecting the low-confidence 0.15/0.10/0.05 tails that would push into the 60ms knee!
+if ne get specOutBestBsz 0 16
+ret 21
+end
+if or ne get specOutLens 0 5 ne get specOutLens 1 5
+ret 22
+end
+for s ulong 6
+if ne get specOutLens add s 2 1
+ret 23
+end
+end
+ret 0
+end
+
+note Check 3: Async ZOS N-2 / N-1 decoupling (schedule_cnt == process_cnt + 1 vs paired).
+note Proves best_bsz is determined by N-2 rates while per-stream allocation uses N-1 rates.
+fn ckTestAsyncDecoupling to ulong
+specResetAll
+ok = specAddCurvePoint 2 10.0f32
+ok = specAddCurvePoint 4 12.0f32
+ok = specAddCurvePoint 8 40.0f32
+note Paired (sched=2, proc=2): prev = N-2, cur = N-1.
+note Stream 0 had high N-2 rates (0.95, 0.90) -> drives best_bsz = 4 (+2 draft slots).
+note In N-1 (cur), Stream 1 flipped to high confidence (0.95, 0.90) and Stream 0 dropped to (0.05, 0.02).
+note So best_bsz MUST be 4 (from N-2), and BOTH draft slots MUST go to Stream 1 (from N-1)!
+hi = new f32 8 0.0f32
+put hi 0 0.95f32
+put hi 1 0.90f32
+put hi 2 0.05f32
+lo = new f32 8 0.0f32
+put lo 0 0.05f32
+put lo 1 0.02f32
+put lo 2 0.01f32
+ok = specSetStream 0 3 2 2 1
+ok = specSetStream 1 3 2 2 1
+ok = specSetStreamRates 0 true 1 hi 3
+ok = specSetStreamRates 1 true 1 lo 3
+ok = specSetStreamRates 0 false 1 lo 3
+ok = specSetStreamRates 1 false 1 hi 3
+if not specSchedule 2
+ret 30
+end
+if ne get specOutBestBsz 0 4
+ret 31
+end
+if or ne get specOutLens 0 1 ne get specOutLens 1 3
+ret 32
+end
+ret 0
+end
+
+note Check 4: Online ForwardRuntimeEstimator + SamplerRuntimeEstimator + negative-slope clamp.
+fn ckTestRuntimeEstimators to ulong
+specResetAll
+ok = specAddCurvePoint 4 20.0f32
+ok = specAddCurvePoint 8 30.0f32
+note Feed 5 negative-residual samples -> slope MUST clamp to 0.0 (never negative!).
+for i ulong 5
+ok = specUpdateRuntime 2 4 18.0f32 0.5f32
+end
+if ne get specOutSlopeMs 0 0.0f32
+ret 40
+end
+sl0 = specFwdGetSlope
+if lt sl0 0.0f32
+ret 41
+end
+note Feed 5 positive-residual samples at graph_size=8: (38.0 - 30.0) / 8 = 1.0 ms/tok.
+note Median across graph 4 (-0.5) and graph 8 (+1.0) = +0.25 ms/tok!
+for i ulong 5
+ok = specUpdateRuntime 2 8 38.0f32 1.2f32
+end
+sl1 = specFwdGetSlope
+if or lt sl1 0.24f32 gt sl1 0.26f32
+ret 42
+end
+samp = specGetSamplerEst 2
+if or lt samp 0.49f32 gt samp 1.21f32
+ret 43
+end
+ret 0
+end
+
+note Check 5: Lossless greedy speculative verifier + N-gram drafter + EMA calibration.
+fn ckTestVerifyAndNgram to ulong
+target = new ulong 9 0
+draft = new ulong 8 0
+emitted = new ulong 9 0
+note Case A: 3 of 5 match, target[3] corrects draft[3] -> acc=3 (4 emitted tokens).
+put draft 0 100
+put draft 1 200
+put draft 2 300
+put draft 3 400
+put draft 4 500
+put target 0 100
+put target 1 200
+put target 2 300
+put target 3 999
+put target 4 888
+put target 5 777
+acc = specVerifyGreedy target draft 5 emitted
+if ne acc 3
+ret 50
+end
+if or ne get emitted 0 100 ne get emitted 3 999
+ret 51
+end
+note Case B: All 5 match -> acc=5 (6 emitted tokens including bonus target[5]).
+put target 3 400
+put target 4 500
+put target 5 600
+acc = specVerifyGreedy target draft 5 emitted
+if ne acc 5
+ret 52
+end
+if ne get emitted 5 600
+ret 53
+end
+note Case C: N-gram drafter finds repeating suffix [10, 20, 30, 40] -> drafts [50, 60, 70, 80, 90].
+ngReset
+for k ulong 10
+ngPushToken mul add k 1 10
+end
+ngPushToken 10
+ngPushToken 20
+ngPushToken 30
+ngPushToken 40
+dToks = new ulong 8 0
+dRates = new f32 8 0.0f32
+nd = ngPropose 5 dToks dRates
+if ne nd 5
+ret 54
+end
+if or ne get dToks 0 50 ne get dToks 4 90
+ret 55
+end
+note Rates must be monotonically non-increasing cumulative probabilities in (0, 1).
+for d ulong 4
+if gt get dRates add d 1 get dRates d
+ret 56
+end
+end
+ngObserveResult 5 5
+if le get ngEmaAccept 0 0.72f32
+ret 57
+end
+ret 0
+end
+
+note Check 6: Hostile/boundary negative controls (must refuse cleanly, never trap).
+fn ckTestNegativeControls to ulong
+specResetAll
+if specAddCurvePoint 0 10.0f32
+ret 60
+end
+if specAddCurvePoint 4 0.0f32
+ret 61
+end
+if not specAddCurvePoint 8 20.0f32
+ret 62
+end
+note Non-increasing graph_size must be refused.
+if specAddCurvePoint 8 25.0f32
+ret 63
+end
+if specAddCurvePoint 4 15.0f32
+ret 64
+end
+note num_seqs == 0 or > SPEC_MAX_SEQS must be refused.
+if specSchedule 0
+ret 65
+end
+if specSchedule 17
+ret 66
+end
+note Inconsistent async counter (schedule_cnt > process_cnt + 1) must be refused.
+ok = specSetStream 0 3 5 2 1
+if specSchedule 1
+ret 67
+end
+ret 0
+end
+
+fn main to int
+rc = ckTestLightLoad
+if ne rc 0
+ret ckFail rc
+end
+rc = ckTestHeavyLoadTrim
+if ne rc 0
+ret ckFail rc
+end
+rc = ckTestAsyncDecoupling
+if ne rc 0
+ret ckFail rc
+end
+rc = ckTestRuntimeEstimators
+if ne rc 0
+ret ckFail rc
+end
+rc = ckTestVerifyAndNgram
+if ne rc 0
+ret ckFail rc
+end
+rc = ckTestNegativeControls
+if ne rc 0
+ret ckFail rc
+end
+ckPrint msgPass
+ckPrintU 6
+ckPrint msgChecks
+ret 0
+end

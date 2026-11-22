@@ -1,0 +1,114 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note Pure Seeded OM-2 Host Verification & Negative-Control Gate for SWA Bounded Replay (dsv41).
+note Compose after: om/gpu/dsv41/decoder/swa_replay.om
+
+text swaMsgOk "PASS: dsv41 swa_replay gate (5 checks, skipped_pct="
+text swaMsgEnd "%, 0 failures)\n"
+text swaMsgBad "FAIL: swa_replay check="
+text swaMsgNl "\n"
+
+fn swaPrint s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn swaPrintU x ulong to void
+b = new uchar 24 0
+pos = ulong 24
+v = x
+while true
+pos = sub pos 1
+put b pos uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+break
+end
+end
+r = write 1 b pos sub 24 pos
+end
+
+fn swaFail code ulong to int
+swaPrint swaMsgBad
+swaPrintU code
+swaPrint swaMsgNl
+ret int code
+end
+
+fn main to int
+swaInitDefault
+
+note Check 1: Short prompt <= 134 always yields 0 prefix hit.
+if ne swaComputeHitLen 134 128 true 0
+ret swaFail 1
+end
+if ne swaComputeHitLen 100 100 true 0
+ret swaFail 2
+end
+
+note Check 2: Long prompt L=4096 with full block hit (4096) caps at floor((4096-134)/128)*128 = 3840.
+hHit = swaComputeHitLen 4096 4096 true
+if ne hHit 3840
+ret swaFail 3
+end
+note On SWA KV cache miss, backs off by exactly one 128-token block: 3840 - 128 = 3712.
+hMiss = swaComputeHitLen 4096 4096 false
+if ne hMiss 3712
+ret swaFail 4
+end
+note Partial block hit L1=1024 with SWA miss -> 896; with SWA hit -> 1024.
+if ne swaComputeHitLen 4096 1024 true 1024
+ret swaFail 5
+end
+if ne swaComputeHitLen 4096 1024 false 896
+ret swaFail 6
+end
+
+note Check 3: Compact prefill (L=2560, 40 layers) runs all 20 encoder layers for all 2560 tokens,
+note and runs 20 decoder layers ONLY for the last 140 tokens (2420..2559).
+put swaSkippedLayers 0 0
+put swaExecutedLayers 0 0
+for p ulong 2560
+for L ulong 40
+run = swaShouldRunPrefillLayer L p 2560
+end
+end
+note Expected executed = 20*2560 + 20*140 = 51200 + 2800 = 54000; skipped = 20*2420 = 48400 (47% saved!).
+if or ne get swaExecutedLayers 0 54000 ne get swaSkippedLayers 0 48400
+ret swaFail 7
+end
+
+note Check 4: Truncated SWA key range during bounded replay starting at s = 2420.
+rng = new ulong 2 0
+if not swaTruncatedKeyRange 2420 2420 rng
+ret swaFail 8
+end
+if or ne get rng 0 2420 ne get rng 1 2420
+ret swaFail 9
+end
+if not swaTruncatedKeyRange 2500 2420 rng
+ret swaFail 10
+end
+if or ne get rng 0 2420 ne get rng 1 2500
+ret swaFail 11
+end
+if not swaTruncatedKeyRange 2559 2420 rng
+ret swaFail 12
+end
+if or ne get rng 0 2432 ne get rng 1 2559
+ret swaFail 13
+end
+
+note Check 5: Negative controls (keep_tokens < 134 refused; pos < replayStart refused).
+if swaInit true 100
+ret swaFail 14
+end
+if swaTruncatedKeyRange 2400 2420 rng
+ret swaFail 15
+end
+
+tot = add get swaExecutedLayers 0 get swaSkippedLayers 0
+pct = div mul get swaSkippedLayers 0 100 tot
+swaPrint swaMsgOk
+swaPrintU pct
+swaPrint swaMsgEnd
+ret 0
+end

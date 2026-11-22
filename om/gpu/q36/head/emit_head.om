@@ -730,6 +730,85 @@ qhic 12 HQZ 16 48 0 qhSt
 qhic 0 HQZ HQZ HQZ 0 qhW1
 end
 
+note =========================================================================
+note e (4): argmax_embed_step -- Fused GPU 128-cand argmax + BF16->F32 embed_tokens widen + pos++
+note Enables DeepInfer-style Zero-Overhead Async Scheduling (ZOS): GPU prepares next token's
+note QDW_X + QDW_POS in-place at the end of the single-submit GPFIFO packet (~2 us) so the CPU
+note can immediately kick step N+1 and overlap Arboris + detokenize while GPU runs step N+1!
+note Args: cand_ids[128] (R0:1), cand_log[128] (R2:3), embed_bf16[V,2048] (R4:5),
+note       out_x[2048] (R6:7), pos_ptr[1] (R8:9), out_tok_ptr[1] (R10:11).
+note Grid: (1, 1, 1), Block: 128, SMEM: 512 (cand_log[0..127]).
+note =========================================================================
+fn qhArgmaxEmbedStep to void
+qhStart 6
+note Phase 1: Stage cand_log[0..127] into SMEM[0..508]
+qhicImm 9 16 14 2 4 qhAlu4
+qhic 11 20 16 HQZ 0 qhLd
+qhMad 21 14 4 HQZ
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhic 50 HQZ 21 20 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+qhBar
+note Phase 2: Lockstep zero-divergence 128-cand argmax (strict >, lowest index wins ties)
+qhLit 21 0
+qhic 49 22 21 HQZ 0 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhLit 23 0
+qhLit 24 1
+qhLit 25 128
+qhLit 26 1
+mArg = get qhPc 0
+qhMad 27 24 4 HQZ
+qhic 49 28 27 HQZ 0 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhic 34 0 28 22 0x03f04000 qhCmp
+put qhGuard 0 1
+qhicImm 8 22 28 HQZ 1 qhAlu1
+put qhGuard 0 1
+qhicImm 8 23 24 HQZ 1 qhAlu4
+qhIadd 24 24 26
+qhic 28 HQZ 24 25 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mArg get qhPc 0 qhAlu4
+note Phase 3: Load best_tok = cand_ids[bestIdx], pos = pos_ptr[0]; tid==0 writes out_tok & pos+1
+qhicImm 9 16 23 0 4 qhAlu4
+qhic 11 29 16 HQZ 0 qhLd
+qhic 11 30 8 HQZ 0 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhIadd 30 30 26
+qhic 28 HQZ 14 26 0 qhCmp
+put qhGuard 0 2
+qhic 12 HQZ 10 29 0 qhSt
+put qhGuard 0 2
+qhic 12 HQZ 8 30 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+note Phase 4: All 128 threads widen embed_bf16[best_tok, 0..2047] -> out_x[0..2047] F32 (8 iters x 2 floats)
+qhMad 31 29 1024 14
+qhLit 32 0
+qhLit 33 8
+qhLit 34 128
+qhLit 35 256
+qhMad 36 14 2 HQZ
+mEmb = get qhPc 0
+qhicImm 9 16 31 4 4 qhAlu4
+qhic 11 37 16 HQZ 0 qhLd
+qhic 0 HQZ HQZ HQZ 0 qhW0
+qhicImm 8 38 37 HQZ 65536 qhAlu1
+qhic 18 39 37 HQZ 0xffff0000 qhAlu4
+qhicImm 9 16 36 6 4 qhAlu4
+qhic 12 HQZ 16 38 0 qhSt
+qhIadd 40 36 26
+qhicImm 9 16 40 6 4 qhAlu4
+qhic 12 HQZ 16 39 0 qhSt
+qhic 0 HQZ HQZ HQZ 0 qhW1
+qhIadd 31 31 34
+qhIadd 36 36 35
+qhIadd 32 32 26
+qhic 28 HQZ 32 33 0 qhCmp
+put qhGuard 0 2
+qhic 46 HQZ HQZ HQZ sub mEmb get qhPc 0 qhAlu4
+end
+
 fn qhKernel mode uchar to bool
 if eq mode 97
 qhBf16GemvFast
@@ -745,6 +824,10 @@ ret true
 end
 if eq mode 100
 qhBf16RescoreCands
+ret true
+end
+if eq mode 101
+qhArgmaxEmbedStep
 ret true
 end
 ret false
