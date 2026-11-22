@@ -1,6 +1,7 @@
-# Omega Visor V1 (lead-owned). The `omega` binary is PHYSICS-FREE: it links only the
-# core object set below + src/visor + src/language + tools/omega.c. It must build
-# from a clean checkout with PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0.
+# Omega Visor V1 (lead-owned). The `omega` binary is pure seeded OM-2 and
+# PHYSICS-FREE: it is compiled directly from $(OMEGA_OM_SRCS) by seed/out/omc.
+# Legacy C objects below remain for the C lane tests in tests/visor/ until
+# those tests are ported to .om.
 VISOR_CORE = omega_om_units omega_canonical omega_validate omega_core omega_codec aarch64_encoder aarch64_decoder \
 	omega_realize omega_realize_synth omega_machine omega_exec omega_verify omega_program omega_synthesis omega_library \
 	omega_vector omega_blackwell_qmd omega_blackwell_encoder omega_blackwell_realize
@@ -10,9 +11,15 @@ VISOR_SRCS = $(wildcard src/visor/*.c)
 LANG_SRCS = $(wildcard src/language/*.c)
 VISOR_OBJS = $(patsubst src/visor/%.c,$(OUT_DIR)/visor/%.o,$(VISOR_SRCS))
 LANG_OBJS = $(patsubst src/language/%.c,$(OUT_DIR)/language/%.o,$(LANG_SRCS))
-VISOR_DEPS = $(VISOR_OBJS:.o=.d) $(LANG_OBJS:.o=.d) $(OUT_DIR)/omega_main.d
+VISOR_DEPS = $(VISOR_OBJS:.o=.d) $(LANG_OBJS:.o=.d)
 -include $(VISOR_DEPS)
 OMEGA_BIN = $(OUT_DIR)/omega
+OMEGA_OM_SRCS = src/visor/visor.om \
+	src/language/omega_lex.om src/language/omega_parse.om src/language/omega_lower.om \
+	src/visor/visor_semantic.om src/visor/visor_machine.om src/visor/visor_realization.om \
+	src/visor/visor_verify.om src/visor/visor_evidence.om src/visor/visor_world.om \
+	src/visor/visor_effect_request.om src/visor/visor_parse_command.om src/visor/visor_console.om \
+	tools/omega.om
 
 $(OUT_DIR)/visor $(OUT_DIR)/language $(OUT_DIR)/tests-visor $(OUT_DIR)/tests-language:
 	mkdir -p $@
@@ -23,11 +30,8 @@ $(OUT_DIR)/visor/%.o: src/visor/%.c | $(OUT_DIR)/visor
 $(OUT_DIR)/language/%.o: src/language/%.c | $(OUT_DIR)/language
 	$(CC) $(VISOR_CFLAGS) -c $< -o $@
 
-$(OUT_DIR)/omega_main.o: tools/omega.c | $(OUT_DIR)
-	$(CC) $(VISOR_CFLAGS) -c $< -o $@
-
-$(OMEGA_BIN): $(VISOR_CORE_OBJS) $(VISOR_OBJS) $(LANG_OBJS) $(OUT_DIR)/omega_main.o
-	$(CC) $(VISOR_CFLAGS) -o $@ $^
+$(OMEGA_BIN): $(OMEGA_OM_SRCS) seed/out/omc | $(OUT_DIR)
+	cat $(OMEGA_OM_SRCS) | seed/out/omc > $@ && chmod +x $@
 
 .PHONY: omega
 omega: $(OMEGA_BIN)

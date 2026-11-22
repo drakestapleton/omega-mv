@@ -1,0 +1,658 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 Surface Language V0 lowerer & unary program realizer
+note (replaces src/language/omega_lower.c). Depends on visor.om, omega_lex.om, omega_parse.om.
+
+text olw_e_ambig "integer literal requires type context"
+text olw_e_range "integer literal out of range for type"
+text olw_e_unk "unknown identifier"
+text olw_e_tmis "type mismatch"
+text olw_e_boolop "binary operator requires unsigned integer operands"
+text olw_e_div0 "division by zero"
+text olw_e_graph "graph full"
+text olw_e_bind "binding table full"
+text olw_e_prog "program table full"
+text olw_e_fnbody "fn body must be a linear chain of param ops with u32 constants"
+text olw_e_fntype "fn parameters and return type must be u64"
+text olw_prog_dom "omega.program.v2"
+
+global olw_scnt ulong 1
+global olw_sop ulong 64
+global olw_simm ulong 64
+global olw_code uchar 256
+global olw_clen ulong 1
+global olw_val_out ulong 1
+global olw_val_is_bool ulong 1
+global olw_has_val ulong 1
+
+fn olw_wmax w ulong to ulong
+  if eq w 8
+    ret 255
+  end
+  if eq w 16
+    ret 65535
+  end
+  if eq w 32
+    ret 4294967295
+  end
+  ret 0xffffffffffffffff
+end
+
+fn olw_tok_to_op tk ulong to ulong
+  if eq tk 30
+    ret V_OP_ADD
+  end
+  if eq tk 31
+    ret V_OP_SUB
+  end
+  if eq tk 32
+    ret V_OP_MUL
+  end
+  if eq tk 33
+    ret V_OP_DIV
+  end
+  if eq tk 34
+    ret V_OP_AND
+  end
+  if eq tk 35
+    ret V_OP_OR
+  end
+  ret 0
+end
+
+fn olw_obj_type_info idx ulong to ulong
+  note returns (tag << 16) | width for VALUE, OPERATION, APPLY
+  k = get v_og_kind idx
+  pb = mul idx V_MAX_PAYLOAD
+  if eq k V_KIND_VALUE
+    for i ulong 32
+      put v_tmp_id i get v_og_pay add pb i
+    end
+    ti = og_find_by_tmp
+    if lt ti 0
+      ret 0
+    end
+    tpb = mul ulong ti V_MAX_PAYLOAD
+    tag = v_dec_u32le_pay tpb 0
+    wid = v_dec_u16le_pay tpb 4
+    if eq tag V_TY_BOOL
+      wid = 1
+    end
+    ret or shl tag 16 wid
+  end
+  if eq k V_KIND_OP
+    pl = get v_og_plen idx
+    if ge pl 204
+      for i ulong 32
+        put v_tmp_id i get v_og_pay add add pb 169 i
+      end
+      ti = og_find_by_tmp
+      if lt ti 0
+        ret 0
+      end
+      tpb = mul ulong ti V_MAX_PAYLOAD
+      tag = v_dec_u32le_pay tpb 0
+      wid = v_dec_u16le_pay tpb 4
+      ret or shl tag 16 wid
+    end
+    if ge pl 161
+      for i ulong 32
+        put v_tmp_id i get v_og_pay add pb i
+      end
+      oi = og_find_by_tmp
+      if lt oi 0
+        ret 0
+      end
+      ret olw_obj_type_info ulong oi
+    end
+  end
+  ret 0
+end
+
+fn olw_check_type info ulong etag ulong ewid ulong to bool
+  if eq etag 0
+    ret true
+  end
+  if ne shr info 16 etag
+    ret false
+  end
+  if ne and info 0xffff ewid
+    ret false
+  end
+  ret true
+end
+
+fn olw_lower_name ni ulong etag ulong ewid ulong col ulong to long
+  nl = get opr_nslen ni
+  nb = mul ni 64
+  if and eq nl 1 eq get opr_nstr nb uchar 95
+    if eq get v_has_last 0 0
+      olx_set_err olw_e_unk col
+      ret -1
+    end
+    if ne get v_last_kind 0 V_BIND_OBJECT
+      olx_set_err olw_e_tmis col
+      ret -1
+    end
+    for i ulong 32
+      put v_tmp_id i get v_last_id i
+    end
+    oi = og_find_by_tmp
+    if lt oi 0
+      olx_set_err olw_e_unk col
+      ret -1
+    end
+    if not olw_check_type olw_obj_type_info ulong oi etag ewid
+      olx_set_err olw_e_tmis col
+      ret -1
+    end
+    ret oi
+  end
+  for i ulong nl bound 64
+    put v_sbuf i get opr_nstr add nb i
+  end
+  bi = vs_bind_find_sbuf nl
+  if lt bi 0
+    olx_set_err olw_e_unk col
+    ret -1
+  end
+  bu = ulong bi
+  if ne get v_bind_kind bu V_BIND_OBJECT
+    olx_set_err olw_e_tmis col
+    ret -1
+  end
+  ib = mul bu 32
+  for i ulong 32
+    put v_tmp_id i get v_bind_id add ib i
+  end
+  oi = og_find_by_tmp
+  if lt oi 0
+    olx_set_err olw_e_unk col
+    ret -1
+  end
+  if not olw_check_type olw_obj_type_info ulong oi etag ewid
+    olx_set_err olw_e_tmis col
+    ret -1
+  end
+  ret oi
+end
+
+fn olw_is_zero_lit ri ulong to bool
+  if ne get opr_nkind ri 1
+    ret false
+  end
+  ret eq get opr_nval ri 0
+end
+
+fn olw_lower_bin ni ulong etag ulong ewid ulong col ulong to long
+  lo = olw_lower_expr ulong get opr_nlhs ni etag ewid
+  if lt lo 0
+    ret -1
+  end
+  linfo = olw_obj_type_info ulong lo
+  if ne shr linfo 16 V_TY_UINT
+    olx_set_err olw_e_boolop col
+    ret -1
+  end
+  lwid = and linfo 0xffff
+  ri = ulong get opr_nrhs ni
+  ro = olw_lower_expr ri V_TY_UINT lwid
+  if lt ro 0
+    ret -1
+  end
+  opc = olw_tok_to_op get opr_nop ni
+  if eq opc V_OP_DIV
+    if olw_is_zero_lit ri
+      olx_set_err olw_e_div0 col
+      ret -1
+    end
+  end
+  ti = og_build_type_uint lwid
+  if lt ti 0
+    olx_set_err olw_e_graph col
+    ret -1
+  end
+  opi = og_build_op_binary opc V_OVF_WRAP ulong ti
+  if lt opi 0
+    olx_set_err olw_e_graph col
+    ret -1
+  end
+  ret og_build_apply ulong opi ulong lo ulong ro
+end
+
+fn olw_lower_expr ni ulong etag ulong ewid ulong to long
+  k = get opr_nkind ni
+  col = get opr_ncol ni
+  if eq k 1
+    if ne etag V_TY_UINT
+      olx_set_err olw_e_ambig col
+      ret -1
+    end
+    v = get opr_nval ni
+    if gt v olw_wmax ewid
+      olx_set_err olw_e_range col
+      ret -1
+    end
+    ti = og_build_type_uint ewid
+    if lt ti 0
+      olx_set_err olw_e_graph col
+      ret -1
+    end
+    ret og_build_val_uint ulong ti ewid v
+  end
+  if eq k 2
+    if and ne etag 0 ne etag V_TY_BOOL
+      olx_set_err olw_e_tmis col
+      ret -1
+    end
+    ti = og_build_type_bool
+    if lt ti 0
+      olx_set_err olw_e_graph col
+      ret -1
+    end
+    ret og_build_val_bool ulong ti get opr_nval ni
+  end
+  if eq k 3
+    ret olw_lower_name ni etag ewid col
+  end
+  if eq k 5
+    tt = get opr_nttag ni
+    tw = get opr_ntwid ni
+    if and ne etag 0 or ne tt etag ne tw ewid
+      olx_set_err olw_e_tmis col
+      ret -1
+    end
+    ret olw_lower_expr ulong get opr_nlhs ni tt tw
+  end
+  if eq k 4
+    ret olw_lower_bin ni etag ewid col
+  end
+  olx_set_err olw_e_tmis col
+  ret -1
+end
+
+fn olw_put_insn w ulong to void
+  p = get olw_clen 0
+  if ge add p 4 256
+    ret
+  end
+  put olw_code p uchar and w 0xff
+  put olw_code add p 1 uchar and shr w 8 0xff
+  put olw_code add p 2 uchar and shr w 16 0xff
+  put olw_code add p 3 uchar and shr w 24 0xff
+  put olw_clen 0 add p 4
+end
+
+fn olw_emit_mov_x1 imm ulong to void
+  lo = and imm 0xffff
+  hi = and shr imm 16 0xffff
+  olw_put_insn or 0xd2800001 shl lo 5
+  if ne hi 0
+    olw_put_insn or 0xf2a00001 shl hi 5
+  end
+end
+
+fn olw_emit_prog_code to void
+  put olw_clen 0 0
+  sc = get olw_scnt 0
+  for i ulong sc bound 64
+    opc = get olw_sop i
+    imm = get olw_simm i
+    olw_emit_mov_x1 imm
+    if eq opc V_OP_ADD
+      olw_put_insn 0x8b010000
+    else
+      if eq opc V_OP_SUB
+        olw_put_insn 0xcb010000
+      else
+        if eq opc V_OP_MUL
+          olw_put_insn 0x9b017c00
+        else
+          if eq opc V_OP_AND
+            olw_put_insn 0x8a010000
+          else
+            if eq opc V_OP_OR
+              olw_put_insn 0xaa010000
+            end
+          end
+        end
+      end
+    end
+  end
+  olw_put_insn 0xd65f03c0
+end
+
+fn olw_node_is_param ni ulong to bool
+  if ne get opr_nkind ni 3
+    ret false
+  end
+  pl = get opr_plen 0
+  if ne get opr_nslen ni pl
+    ret false
+  end
+  nb = mul ni 64
+  for i ulong pl bound 64
+    if ne get opr_nstr add nb i get opr_param i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn olw_collect_steps ni ulong sc ulong to long
+  if ge sc 32
+    ret -1
+  end
+  if olw_node_is_param ni
+    ret long sc
+  end
+  if ne get opr_nkind ni 4
+    ret -1
+  end
+  opc = olw_tok_to_op get opr_nop ni
+  if or eq opc 0 eq opc V_OP_DIV
+    ret -1
+  end
+  li = ulong get opr_nlhs ni
+  ri = ulong get opr_nrhs ni
+  if eq get opr_nkind ri 1
+    imm = get opr_nval ri
+    if gt imm 0xffffffff
+      ret -1
+    end
+    put olw_sop sc opc
+    put olw_simm sc imm
+    ret olw_collect_steps li add sc 1
+  end
+  if eq get opr_nkind li 1
+    if or eq opc V_OP_ADD or eq opc V_OP_MUL or eq opc V_OP_AND eq opc V_OP_OR
+      imm = get opr_nval li
+      if gt imm 0xffffffff
+        ret -1
+      end
+      put olw_sop sc opc
+      put olw_simm sc imm
+      ret olw_collect_steps ri add sc 1
+    end
+  end
+  ret -1
+end
+
+fn olw_hash_prog_id sc ulong to void
+  dl = len olw_prog_dom
+  for i ulong dl bound 32
+    put v_sha_in i get olw_prog_dom i
+  end
+  p = dl
+  put v_sha_in p uchar and sc 0xff
+  p = add p 1
+  for i ulong sc bound 32
+    put v_sha_in p uchar and get olw_sop i 0xff
+    p = add p 1
+    im = get olw_simm i
+    put v_sha_in p uchar and im 0xff
+    put v_sha_in add p 1 uchar and shr im 8 0xff
+    put v_sha_in add p 2 uchar and shr im 16 0xff
+    put v_sha_in add p 3 uchar and shr im 24 0xff
+    p = add p 4
+  end
+  sha256_hash p
+end
+
+fn olw_store_prog pc ulong sc ulong to void
+  nl = get opr_nlen 0
+  put v_prog_nlen pc nl
+  nb = mul pc 64
+  for i ulong nl bound 64
+    put v_prog_name add nb i get opr_name i
+  end
+  ib = mul pc 32
+  for i ulong 32
+    put v_prog_id add ib i get v_sha_out i
+  end
+  put v_prog_scnt pc sc
+  sb = mul pc 64
+  for i ulong sc bound 64
+    put v_prog_sop add sb i get olw_sop i
+    put v_prog_simm add sb i get olw_simm i
+  end
+  cl = get olw_clen 0
+  put v_prog_clen pc cl
+  cb = mul pc 256
+  for i ulong cl bound 256
+    put v_prog_code add cb i get olw_code i
+    put v_sha_in i get olw_code i
+  end
+  sha256_hash cl
+  for i ulong 32
+    put v_prog_real_id add ib i get v_sha_out i
+  end
+  put v_prog_realized pc 1
+  put v_prog_verified pc 0
+end
+
+fn olw_lower_fn to long
+  if or ne get opr_pttag 0 V_TY_UINT or ne get opr_ptwid 0 64 or ne get opr_rttag 0 V_TY_UINT ne get opr_rtwid 0 64
+    olx_set_err olw_e_fntype 1
+    ret -1
+  end
+  sc_r = olw_collect_steps ulong get opr_root 0 0
+  if lt sc_r 0
+    olx_set_err olw_e_fnbody 1
+    ret -1
+  end
+  sc = ulong sc_r
+  put olw_scnt 0 sc
+  half = div sc 2
+  for i ulong half bound 32
+    j = sub sub sc 1 i
+    tmp_op = get olw_sop i
+    ti = get olw_simm i
+    put olw_sop i get olw_sop j
+    put olw_simm i get olw_simm j
+    put olw_sop j tmp_op
+    put olw_simm j ti
+  end
+  olw_emit_prog_code
+  olw_hash_prog_id sc
+  pc = get v_prog_cnt 0
+  if ge pc V_MAX_PROGRAMS
+    olx_set_err olw_e_prog 1
+    ret -1
+  end
+  put v_prog_cnt 0 add pc 1
+  olw_store_prog pc sc
+  ib = mul pc 32
+  for i ulong 32
+    put v_tmp_id i get v_prog_id add ib i
+  end
+  nl = get opr_nlen 0
+  for i ulong nl bound 64
+    put v_sbuf i get opr_name i
+  end
+  if lt vs_bind_set_sbuf nl V_BIND_PROGRAM long pc 0
+    olx_set_err olw_e_bind 1
+    ret -1
+  end
+  vs_set_last V_BIND_PROGRAM long pc
+  put olw_has_val 0 0
+  ret long pc
+end
+
+fn olw_apply_op opc ulong ovf ulong wid ulong va ulong vb ulong to long
+  mask = olw_wmax wid
+  res = ulong 0
+  if eq opc V_OP_ADD
+    if and eq ovf V_OVF_FAIL_CLOSED gt va sub mask vb
+      ret -3
+    end
+    res = and add va vb mask
+  else
+    if eq opc V_OP_SUB
+      if and eq ovf V_OVF_FAIL_CLOSED lt va vb
+        ret -3
+      end
+      res = and sub va vb mask
+    else
+      if eq opc V_OP_MUL
+        res = and mul va vb mask
+      else
+        if eq opc V_OP_DIV
+          if eq vb 0
+            ret -3
+          end
+          res = and div va vb mask
+        else
+          if eq opc V_OP_AND
+            res = and and va vb mask
+          else
+            if eq opc V_OP_OR
+              res = and or va vb mask
+            else
+              if eq opc V_OP_XOR
+                res = and xor va vb mask
+              else
+                ret -1
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  put olw_val_out 0 res
+  put olw_val_is_bool 0 0
+  ret 0
+end
+
+fn olw_eval_obj_u64 idx ulong depth ulong to long
+  if gt depth 64
+    ret -1
+  end
+  k = get v_og_kind idx
+  pb = mul idx V_MAX_PAYLOAD
+  if eq k V_KIND_VALUE
+    info = olw_obj_type_info idx
+    tag = shr info 16
+    if eq tag V_TY_BOOL
+      put olw_val_out 0 ulong get v_og_pay add pb 34
+      put olw_val_is_bool 0 1
+      ret 0
+    end
+    if or eq tag V_TY_UINT or eq tag V_TY_BITVEC eq tag V_TY_BYTE
+      nb = v_dec_u16le_pay pb 32
+      if or eq nb 0 gt nb 8
+        ret -1
+      end
+      v = ulong 0
+      p34 = add pb 34
+      for i ulong nb bound 8
+        v = or shl v 8 ulong get v_og_pay add p34 i
+      end
+      put olw_val_out 0 v
+      put olw_val_is_bool 0 0
+      ret 0
+    end
+    ret -1
+  end
+  if and eq k V_KIND_OP eq get v_og_plen idx 161
+    for i ulong 32
+      put v_tmp_id i get v_og_pay add pb i
+    end
+    opi = og_find_by_tmp
+    if lt opi 0
+      ret -1
+    end
+    for i ulong 32
+      put v_tmp_id i get v_og_pay add add pb 33 i
+    end
+    a1 = og_find_by_tmp
+    if lt a1 0
+      ret -1
+    end
+    for i ulong 32
+      put v_tmp_id i get v_og_pay add add pb 65 i
+    end
+    a2 = og_find_by_tmp
+    if lt a2 0
+      ret -1
+    end
+    if lt olw_eval_obj_u64 ulong a1 add depth 1 0
+      ret -1
+    end
+    if ne get olw_val_is_bool 0 0
+      ret -1
+    end
+    va = get olw_val_out 0
+    if lt olw_eval_obj_u64 ulong a2 add depth 1 0
+      ret -1
+    end
+    if ne get olw_val_is_bool 0 0
+      ret -1
+    end
+    vb = get olw_val_out 0
+    opb = mul ulong opi V_MAX_PAYLOAD
+    opc = v_dec_u32le_pay opb 0
+    ovf = v_dec_u32le_pay opb 4
+    wid = and olw_obj_type_info ulong opi 0xffff
+    ret olw_apply_op opc ovf wid va vb
+  end
+  ret -1
+end
+
+fn olw_eval_sbuf n ulong to long
+  if gt n 4095
+    olx_set_err olx_e_tok 1
+    ret -1
+  end
+  for i ulong n bound 4096
+    put olx_line i get v_sbuf i
+  end
+  put olx_llen 0 n
+  if lt olx_lex_line 0
+    ret -1
+  end
+  if lt opr_parse_line 0
+    ret -1
+  end
+  st = get opr_stmt 0
+  if eq st 0
+    put olw_has_val 0 0
+    ret 0
+  end
+  if eq st 3
+    ret olw_lower_fn
+  end
+  etag = ulong 0
+  ewid = ulong 0
+  if eq st 2
+    etag = get opr_lttag 0
+    ewid = get opr_ltwid 0
+  end
+  oi = olw_lower_expr ulong get opr_root 0 etag ewid
+  if lt oi 0
+    ret -1
+  end
+  ou = ulong oi
+  ob = mul ou 32
+  for i ulong 32
+    put v_tmp_id i get v_og_id add ob i
+  end
+  if eq st 2
+    nl = get opr_nlen 0
+    for i ulong nl bound 64
+      put v_sbuf i get opr_name i
+    end
+    if lt vs_bind_set_sbuf nl V_BIND_OBJECT -1 0
+      olx_set_err olw_e_bind 1
+      ret -1
+    end
+  end
+  vs_set_last V_BIND_OBJECT -1
+  ev = olw_eval_obj_u64 ou 0
+  if eq ev 0
+    put olw_has_val 0 1
+  else
+    put olw_has_val 0 0
+  end
+  ret 0
+end

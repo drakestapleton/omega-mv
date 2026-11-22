@@ -1,0 +1,546 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 Visor lane 4: evidence (receipt) inspection
+note (replaces src/visor/visor_evidence.c). Depends on visor.om.
+
+note Scope constants: 0=UNKNOWN, 1=SIMULATED, 2=HOST, 3=QEMU, 4=SILICON
+const VEV_SCOPE_UNKNOWN ulong 0
+const VEV_SCOPE_SIMULATED ulong 1
+const VEV_SCOPE_HOST ulong 2
+const VEV_SCOPE_QEMU ulong 3
+const VEV_SCOPE_SILICON ulong 4
+
+text vev_s_unk "UNKNOWN"
+text vev_s_sim "SIMULATED"
+text vev_s_host "HOST"
+text vev_s_qemu "QEMU"
+text vev_s_sil "SILICON"
+text vev_k_sil_true "\"silicon_observed\": true"
+text vev_k_sil_true2 "\"silicon_observed\":true"
+text vev_k_sil_false "\"silicon_observed\": false"
+text vev_k_sil_false2 "\"silicon_observed\":false"
+text vev_k_qemu "\"qemu_target\""
+text vev_k_hscope "\"hardware_scope\""
+text vev_k_host_lo "host"
+text vev_k_sim_lo "simulat"
+text vev_k_qemu_lo "qemu"
+text vev_k_gpu_uuid "\"gpu_uuid\""
+text vev_k_comp_cls "\"compute_class\""
+text vev_k_dirty_t "\"tree_dirty\": true"
+text vev_k_dirty_t2 "\"tree_dirty\":true"
+text vev_k_dirty_f "\"tree_dirty\": false"
+text vev_k_dirty_f2 "\"tree_dirty\":false"
+text vev_t_noev "no evidence\n"
+text vev_t_hdr "evidence: scanned="
+text vev_t_mat " matched="
+text vev_t_unp " UNPARSED="
+text vev_t_scope "\n  scope      "
+text vev_t_rid "\n  receipt_id sha256:"
+text vev_t_path "  path       "
+text vev_t_j1 "{\"scanned\":"
+text vev_t_j2 ",\"matched\":"
+text vev_t_j3 ",\"unparsed\":"
+text vev_t_j4 ",\"items\":["
+text vev_t_ji1 "{\"path\":"
+text vev_t_ji2 ",\"scope\":\""
+text vev_t_ji3 "\"}"
+text vev_t_jend "]}"
+
+global vev_fbuf uchar 262144
+global vev_flen ulong 1
+global vev_dbuf uchar 32768
+global vev_pbuf uchar 512
+
+note Loaded single record
+global vev_rec_scope ulong 1
+global vev_rec_dirty ulong 1
+global vev_rec_dknow ulong 1
+global vev_rec_id uchar 32
+global vev_rec_nmatch long 1
+
+note Scan view (up to 16 kept items + 8 unparsed paths)
+global vev_cnt ulong 1
+global vev_scanned ulong 1
+global vev_matched ulong 1
+global vev_unparsed ulong 1
+global vev_trunc ulong 1
+global vev_it_path uchar 4096
+global vev_it_plen ulong 16
+global vev_it_scope ulong 16
+global vev_it_id uchar 512
+global vev_up_path uchar 2048
+global vev_up_plen ulong 8
+global vev_up_cnt ulong 1
+global vev_filter_hex uchar 64
+global vev_filter_on ulong 1
+
+note Directory recursion stack (up to 8 levels, 256 bytes per dir path)
+global vev_dstack uchar 2048
+global vev_dslen ulong 8
+global vev_dtop ulong 1
+
+fn vev_buf_has n ulong needle view uchar * to bool
+  nl = len needle
+  if or eq nl 0 gt nl n
+    ret false
+  end
+  lim = add sub n nl 1
+  for i ulong lim bound 262144
+    ok = true
+    for j ulong nl bound 64
+      if ne get vev_fbuf add i j get needle j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+fn vev_buf_has_hex64 n ulong to bool
+  if lt n 64
+    ret false
+  end
+  lim = add sub n 64 1
+  for i ulong lim bound 262144
+    ok = true
+    for j ulong 64
+      if ne get vev_fbuf add i j get vev_filter_hex j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+fn vev_json_basic_valid n ulong to bool
+  if lt n 2
+    ret false
+  end
+  p = ulong 0
+  while lt p n bound 262144
+    c = ulong get vev_fbuf p
+    if or eq c 32 or eq c 9 or eq c 10 eq c 13
+      p = add p 1
+    else
+      break
+    end
+  end
+  if ge p n
+    ret false
+  end
+  if ne get vev_fbuf p uchar 123
+    ret false
+  end
+  e = n
+  while gt e p bound 262144
+    c = ulong get vev_fbuf sub e 1
+    if or eq c 32 or eq c 9 or eq c 10 eq c 13
+      e = sub e 1
+    else
+      break
+    end
+  end
+  if le e p
+    ret false
+  end
+  if ne get vev_fbuf sub e 1 uchar 125
+    ret false
+  end
+  note Balanced braces outside strings
+  depth = long 0
+  instr = false
+  esc = false
+  for i ulong sub e p bound 262144
+    c = ulong get vev_fbuf add p i
+    if instr
+      if esc
+        esc = false
+      else
+        if eq c 92
+          esc = true
+        else
+          if eq c 34
+            instr = false
+          end
+        end
+      end
+    else
+      if eq c 34
+        instr = true
+      else
+        if eq c 123
+          depth = add depth 1
+        else
+          if eq c 125
+            depth = sub depth 1
+            if lt depth 0
+              ret false
+            end
+          end
+        end
+      end
+    end
+  end
+  if or instr ne depth 0
+    ret false
+  end
+  ret true
+end
+
+fn vev_classify_scope n ulong to ulong
+  note Lowest scope wins; silicon_observed=false caps at HOST
+  sil_false = or vev_buf_has n vev_k_sil_false vev_buf_has n vev_k_sil_false2
+  sil_true = or vev_buf_has n vev_k_sil_true vev_buf_has n vev_k_sil_true2
+  has_qemu_key = vev_buf_has n vev_k_qemu
+  has_hscope = vev_buf_has n vev_k_hscope
+  has_gpu_uuid = or vev_buf_has n vev_k_gpu_uuid vev_buf_has n vev_k_comp_cls
+  if sil_false
+    ret VEV_SCOPE_HOST
+  end
+  if has_qemu_key
+    ret VEV_SCOPE_QEMU
+  end
+  if has_hscope
+    if vev_buf_has n vev_k_sim_lo
+      ret VEV_SCOPE_SIMULATED
+    end
+    if vev_buf_has n vev_k_host_lo
+      ret VEV_SCOPE_HOST
+    end
+    if vev_buf_has n vev_k_qemu_lo
+      ret VEV_SCOPE_QEMU
+    end
+  end
+  if or sil_true has_gpu_uuid
+    ret VEV_SCOPE_SILICON
+  end
+  ret VEV_SCOPE_UNKNOWN
+end
+
+fn vev_load_pbuf plen ulong to long
+  if or eq plen 0 gt plen 511
+    ret -1
+  end
+  fd = fopen vev_pbuf 0 plen 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while lt tot 262144 bound 4096
+    k = read int fd vev_fbuf tot sub 262144 tot
+    if lt k 0
+      u = fclose int fd
+      ret -1
+    end
+    if eq k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  u = fclose int fd
+  if or eq tot 0 ge tot 262144
+    ret -1
+  end
+  put vev_flen 0 tot
+  if not vev_json_basic_valid tot
+    ret -1
+  end
+  for i ulong tot bound 262144
+    put v_sha_in i get vev_fbuf i
+  end
+  sha256_hash tot
+  for i ulong 32
+    put vev_rec_id i get v_sha_out i
+  end
+  put vev_rec_scope 0 vev_classify_scope tot
+  if or vev_buf_has tot vev_k_dirty_t vev_buf_has tot vev_k_dirty_t2
+    put vev_rec_dknow 0 1
+    put vev_rec_dirty 0 1
+  else
+    if or vev_buf_has tot vev_k_dirty_f vev_buf_has tot vev_k_dirty_f2
+      put vev_rec_dknow 0 1
+      put vev_rec_dirty 0 0
+    else
+      put vev_rec_dknow 0 0
+      put vev_rec_dirty 0 0
+    end
+  end
+  put vev_rec_nmatch 0 -1
+  ret 0
+end
+
+fn vev_record_unparsed plen ulong to void
+  put vev_unparsed 0 add get vev_unparsed 0 1
+  uc = get vev_up_cnt 0
+  if lt uc 8
+    put vev_up_cnt 0 add uc 1
+    cl = plen
+    if gt cl 255
+      cl = 255
+    end
+    put vev_up_plen uc cl
+    base = mul uc 256
+    for i ulong cl bound 256
+      put vev_up_path add base i get vev_pbuf i
+    end
+  end
+end
+
+fn vev_process_file plen ulong to void
+  put vev_scanned 0 add get vev_scanned 0 1
+  rc = vev_load_pbuf plen
+  if lt rc 0
+    if ne get vev_filter_on 0 0
+      if not vev_buf_has_hex64 get vev_flen 0
+        ret
+      end
+    end
+    vev_record_unparsed plen
+    ret
+  end
+  if ne get vev_filter_on 0 0
+    if not vev_buf_has_hex64 get vev_flen 0
+      ret
+    end
+  end
+  put vev_matched 0 add get vev_matched 0 1
+  cnt = get vev_cnt 0
+  if ge cnt 16
+    put vev_trunc 0 1
+    ret
+  end
+  put vev_cnt 0 add cnt 1
+  cl = plen
+  if gt cl 255
+    cl = 255
+  end
+  put vev_it_plen cnt cl
+  put vev_it_scope cnt get vev_rec_scope 0
+  pb = mul cnt 256
+  for i ulong cl bound 256
+    put vev_it_path add pb i get vev_pbuf i
+  end
+  ib = mul cnt 32
+  for i ulong 32
+    put vev_it_id add ib i get vev_rec_id i
+  end
+end
+
+fn vev_push_pbuf n ulong to void
+  top = get vev_dtop 0
+  if or ge top 8 gt n 255
+    ret
+  end
+  put vev_dtop 0 add top 1
+  put vev_dslen top n
+  base = mul top 256
+  for i ulong n bound 256
+    put vev_dstack add base i get vev_pbuf i
+  end
+end
+
+fn vev_handle_dirent dbase ulong dlen ulong pos ulong rlen ulong to void
+  dtype = ulong get vev_dbuf add pos 18
+  noff = add pos 19
+  nlen = ulong 0
+  lim = add pos rlen
+  while lt add noff nlen lim bound 256
+    if eq get vev_dbuf add noff nlen uchar 0
+      break
+    end
+    nlen = add nlen 1
+  end
+  if eq nlen 0
+    ret
+  end
+  if eq nlen 1
+    if eq get vev_dbuf noff uchar 46
+      ret
+    end
+  end
+  if eq nlen 2
+    if eq get vev_dbuf noff uchar 46
+      if eq get vev_dbuf add noff 1 uchar 46
+        ret
+      end
+    end
+  end
+  for i ulong dlen bound 256
+    put vev_pbuf i get vev_dstack add dbase i
+  end
+  put vev_pbuf dlen uchar 47
+  for i ulong nlen bound 255
+    dst = add add dlen 1 i
+    if lt dst 511
+      put vev_pbuf dst get vev_dbuf add noff i
+    end
+  end
+  full = add add dlen 1 nlen
+  if eq dtype 4
+    vev_push_pbuf full
+  else
+    vev_process_file full
+  end
+end
+
+fn vev_dirent_rlen pos ulong to ulong
+  lo = ulong get vev_dbuf add pos 16
+  hi = ulong get vev_dbuf add pos 17
+  ret or lo shl hi 8
+end
+
+fn vev_scan_dir_pop to long
+  top = get vev_dtop 0
+  if eq top 0
+    ret 0
+  end
+  idx = sub top 1
+  put vev_dtop 0 idx
+  dlen = get vev_dslen idx
+  dbase = mul idx 256
+  for i ulong dlen bound 256
+    put vev_pbuf i get vev_dstack add dbase i
+  end
+  fd = fopen vev_pbuf 0 dlen 16384 0
+  if lt fd 0
+    ret -1
+  end
+  while true bound 256
+    nread = getdnts int fd vev_dbuf 0 32768
+    if le nread 0
+      break
+    end
+    pos = ulong 0
+    nr = ulong nread
+    while lt pos nr bound 4096
+      rlen = vev_dirent_rlen pos
+      if eq rlen 0
+        break
+      end
+      vev_handle_dirent dbase dlen pos rlen
+      pos = add pos rlen
+    end
+  end
+  u = fclose int fd
+  ret 1
+end
+
+fn vev_scan_sbuf rlen ulong to long
+  put vev_cnt 0 0
+  put vev_scanned 0 0
+  put vev_matched 0 0
+  put vev_unparsed 0 0
+  put vev_trunc 0 0
+  put vev_up_cnt 0 0
+  put vev_dtop 0 0
+  if or eq rlen 0 gt rlen 255
+    ret -1
+  end
+  for i ulong rlen bound 256
+    put vev_pbuf i get v_sbuf i
+  end
+  vev_push_pbuf rlen
+  first = vev_scan_dir_pop
+  if lt first 0
+    ret -1
+  end
+  while gt get vev_dtop 0 0 bound 256
+    u = vev_scan_dir_pop
+  end
+  ret 0
+end
+
+fn vev_put_scope s ulong to void
+  if eq s VEV_SCOPE_SILICON
+    ob_puts vev_s_sil
+    ret
+  end
+  if eq s VEV_SCOPE_QEMU
+    ob_puts vev_s_qemu
+    ret
+  end
+  if eq s VEV_SCOPE_HOST
+    ob_puts vev_s_host
+    ret
+  end
+  if eq s VEV_SCOPE_SIMULATED
+    ob_puts vev_s_sim
+    ret
+  end
+  ob_puts vev_s_unk
+end
+
+fn vev_format_text cap ulong to long
+  ob_reset cap
+  cnt = get vev_cnt 0
+  if and eq cnt 0 eq get vev_unparsed 0 0
+    ob_puts vev_t_noev
+  else
+    ob_puts vev_t_hdr
+    ob_put_u64 get vev_scanned 0
+    ob_puts vev_t_mat
+    ob_put_u64 get vev_matched 0
+    ob_puts vev_t_unp
+    ob_put_u64 get vev_unparsed 0
+    ob_putc uchar 10
+    for i ulong cnt bound 16
+      ob_puts vev_t_path
+      pl = get vev_it_plen i
+      pb = mul i 256
+      for k ulong pl bound 256
+        ob_putc get vev_it_path add pb k
+      end
+      ob_puts vev_t_scope
+      vev_put_scope get vev_it_scope i
+      ob_puts vev_t_rid
+      ib = mul i 32
+      for b ulong 32
+        ob_put_hex_byte ulong get vev_it_id add ib b
+      end
+      ob_putc uchar 10
+    end
+  end
+  if ne get v_ob_ovf 0 0
+    ret -1
+  end
+  ret long get v_ob_len 0
+end
+
+fn vev_format_json cap ulong to long
+  ob_reset cap
+  ob_puts vev_t_j1
+  ob_put_u64 get vev_scanned 0
+  ob_puts vev_t_j2
+  ob_put_u64 get vev_matched 0
+  ob_puts vev_t_j3
+  ob_put_u64 get vev_unparsed 0
+  ob_puts vev_t_j4
+  cnt = get vev_cnt 0
+  for i ulong cnt bound 16
+    if gt i 0
+      ob_putc uchar 44
+    end
+    ob_puts vev_t_ji1
+    pl = get vev_it_plen i
+    pb = mul i 256
+    for k ulong pl bound 256
+      put v_sbuf k get vev_it_path add pb k
+    end
+    ob_put_json_sbuf pl
+    ob_puts vev_t_ji2
+    vev_put_scope get vev_it_scope i
+    ob_puts vev_t_ji3
+  end
+  ob_puts vev_t_jend
+  if ne get v_ob_ovf 0 0
+    ret -1
+  end
+  ret long get v_ob_len 0
+end

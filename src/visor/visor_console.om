@@ -1,0 +1,625 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 Visor lane 2: console / REPL dispatcher
+note (replaces src/visor/visor_console.c).
+note Depends on visor.om, omega_lower.om, visor_semantic.om, visor_machine.om,
+note visor_realization.om, visor_verify.om, visor_evidence.om, visor_world.om,
+note visor_effect_request.om, visor_parse_command.om.
+
+text vcon_cls_insp "inspection"
+text vcon_cls_pure "pure-execution"
+text vcon_cls_sim "simulation"
+text vcon_cls_eff "effect-request"
+text vcon_help_hdr "Omega Visor commands (classes: inspection, pure-execution, simulation, effect-request):\n  help [cmd]                           inspection      show commands\n  quit                                 inspection      exit console\n  inspect <x>                          inspection      inspect object\n  type <x>                             inspection      show type of x\n  id <x>                               inspection      show the semantic id of a name, _ or hex id\n  graph <x>                            inspection      show dependency graph\n  verify <x>                           pure-execution  run verification report\n  machine                              inspection      show current machine model\n  realize <x> [for current.machine]    pure-execution  realize x to AArch64\n  cost <x>                             simulation      show four-slot cost view\n  run <x> [args...]                    pure-execution  run x if pure; effects become an effect request\n  evidence [x]                         inspection      inspect evidence receipts\n  bindings                             inspection      list session bindings\n  clear                                inspection      clear session\n  world                                inspection      show read-only world view\n  effects [x]                          effect-request  show unauthorized effect request\n  alternatives <x>                     simulation      compare realizations\n  compare <a> <b>                      simulation      compare two realizations\n  why <x>                              inspection      explain realization\n  let x: u64 = 7                       pure-execution  evaluate Omega language V0\n"
+text vcon_t_bye "bye\n"
+text vcon_t_clr "session cleared\n"
+text vcon_t_nobind "(no bindings)\n"
+text vcon_t_errpfx "error: "
+text vcon_t_colsp ": "
+text vcon_t_unk_id "unknown name or id"
+text vcon_t_no_eff "[effect-request]\nno effect objects in session\n"
+text vcon_t_not_eff "is not an EFFECT object"
+text vcon_t_eff_req "EFFECT REQUEST: requires authority; routed via EffectIntent -> AEGIS/PHYSICS (not executed)\n"
+text vcon_t_true "true\n"
+text vcon_t_false "false\n"
+text vcon_t_obj "  object  "
+text vcon_t_prog "  program  "
+text vcon_t_real "  realization  "
+text vcon_j_c1 "{\"command\":\""
+text vcon_j_c2 "\",\"status\":\""
+text vcon_j_ok "ok"
+text vcon_j_er "error"
+text vcon_j_c3 "\",\"class\":\""
+text vcon_j_c4 "\",\"result\":"
+text vcon_j_c5 ",\"error\":"
+text vcon_j_null "null"
+text vcon_j_end "}\n"
+
+global vcon_json ulong 1
+global vcon_quit ulong 1
+global vcon_err_cnt ulong 1
+global vcon_last_st ulong 1
+global vcon_evroot uchar 256
+global vcon_evlen ulong 1
+global vcon_out_copy uchar 65536
+global vcon_out_clen ulong 1
+
+fn vcon_init is_json ulong to void
+  vs_init
+  vmch_detect_current
+  put vcon_json 0 is_json
+  put vcon_quit 0 0
+  put vcon_err_cnt 0 0
+  put vcon_last_st 0 0
+  put vcon_evlen 0 0
+end
+
+fn vcon_cmd_class cmd ulong to ulong
+  if or eq cmd 6 or eq cmd 8 or eq cmd 10 eq cmd 19
+    ret 1
+  end
+  if or eq cmd 9 or eq cmd 16 eq cmd 17
+    ret 2
+  end
+  if eq cmd 15
+    ret 3
+  end
+  ret 0
+end
+
+fn vcon_put_class cls ulong to void
+  if eq cls 1
+    ob_puts vcon_cls_pure
+    ret
+  end
+  if eq cls 2
+    ob_puts vcon_cls_sim
+    ret
+  end
+  if eq cls 3
+    ob_puts vcon_cls_eff
+    ret
+  end
+  ob_puts vcon_cls_insp
+end
+
+fn vcon_emit_err_sbuf cmd ulong mlen ulong to long
+  put vcon_err_cnt 0 add get vcon_err_cnt 0 1
+  put vcon_last_st 0 1
+  if ne get vcon_json 0 0
+    ob_reset 65535
+    ob_puts vcon_j_c1
+    vpc_put_cmd_name cmd
+    ob_puts vcon_j_c2
+    ob_puts vcon_j_er
+    ob_puts vcon_j_c3
+    vcon_put_class vcon_cmd_class cmd
+    ob_puts vcon_j_c4
+    ob_puts vcon_j_null
+    ob_puts vcon_j_c5
+    ob_put_json_sbuf mlen
+    ob_puts vcon_j_end
+    ob_write_fd 1
+  else
+    ob_reset 65535
+    ob_puts vcon_t_errpfx
+    vpc_put_cmd_name cmd
+    ob_puts vcon_t_colsp
+    ob_put_sbuf mlen
+    ob_putc uchar 10
+    ob_write_fd 1
+  end
+  ret 1
+end
+
+fn vcon_emit_err_txt cmd ulong s view uchar * to long
+  n = v_copy_txt_sbuf s
+  ret vcon_emit_err_sbuf cmd n
+end
+
+fn vcon_emit_ok_json cmd ulong cls ulong to long
+  put vcon_last_st 0 0
+  n = get v_ob_len 0
+  for i ulong n bound 65536
+    put vcon_out_copy i get v_ob i
+  end
+  put vcon_out_clen 0 n
+  ob_reset 65535
+  ob_puts vcon_j_c1
+  vpc_put_cmd_name cmd
+  ob_puts vcon_j_c2
+  ob_puts vcon_j_ok
+  ob_puts vcon_j_c3
+  vcon_put_class cls
+  ob_puts vcon_j_c4
+  for i ulong n bound 65536
+    ob_putc get vcon_out_copy i
+  end
+  ob_puts vcon_j_c5
+  ob_puts vcon_j_null
+  ob_puts vcon_j_end
+  ob_write_fd 1
+  ret 0
+end
+
+fn vcon_parse_u64_arg idx ulong to long
+  al = get vpc_alen idx
+  if eq al 0
+    ret -1
+  end
+  base = mul idx 256
+  v = ulong 0
+  for i ulong al bound 32
+    c = ulong get vpc_args add base i
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    v = add mul v 10 sub c 48
+  end
+  ret long v
+end
+
+fn vcon_cmd_bindings isj ulong to long
+  bc = get v_bind_cnt 0
+  ob_reset 65535
+  if ne isj 0
+    ob_putc uchar 91
+    for i ulong bc bound 64
+      if gt i 0
+        ob_putc uchar 44
+      end
+      nl = get v_bind_nlen i
+      nb = mul i 64
+      for j ulong nl bound 64
+        put v_sbuf j get v_bind_name add nb j
+      end
+      ob_put_json_sbuf nl
+    end
+    ob_putc uchar 93
+    ret vcon_emit_ok_json 12 0
+  end
+  if eq bc 0
+    v_write_all 1 vcon_t_nobind
+  else
+    for i ulong bc bound 64
+      nl = get v_bind_nlen i
+      nb = mul i 64
+      for j ulong nl bound 64
+        ob_putc get v_bind_name add nb j
+      end
+      bk = get v_bind_kind i
+      if eq bk V_BIND_OBJECT
+        ob_puts vcon_t_obj
+      else
+        if eq bk V_BIND_PROGRAM
+          ob_puts vcon_t_prog
+        else
+          ob_puts vcon_t_real
+        end
+      end
+      ob_puts vt_sha256_pfx
+      ib = mul i 32
+      for b ulong 32
+        ob_put_hex_byte ulong get v_bind_id add ib b
+      end
+      ob_putc uchar 10
+    end
+    ob_write_fd 1
+  end
+  put vcon_last_st 0 0
+  ret 0
+end
+
+fn vcon_cmd_run oi long rk ulong isj ulong to long
+  if ge oi 0
+    cr = verq_classify ulong oi
+    if or lt cr 0 ne get verq_needs 0 0
+      v_write_all 1 vcon_t_eff_req
+      put vcon_last_st 0 0
+      ret 0
+    end
+  end
+  ridx = long -1
+  if eq rk V_BIND_REALIZATION
+    ridx = get v_res_idx 0
+  else
+    if eq rk V_BIND_PROGRAM
+      ridx = vrl_realize_program ulong get v_res_idx 0
+    else
+      if ge oi 0
+        ridx = vrl_realize_apply ulong oi
+      end
+    end
+  end
+  if lt ridx 0
+    wl = get vrl_wlen 0
+    for i ulong wl bound 256
+      put v_sbuf i get vrl_why i
+    end
+    ret vcon_emit_err_sbuf 10 wl
+  end
+  a0 = ulong 0
+  a1 = ulong 0
+  a2 = ulong 0
+  ac = sub get vpc_argc 0 1
+  if ge ac 1
+    v0 = vcon_parse_u64_arg 1
+    if lt v0 0
+      ret vcon_emit_err_txt 10 vcon_t_unk_id
+    end
+    a0 = ulong v0
+  end
+  if ge ac 2
+    v1 = vcon_parse_u64_arg 2
+    if lt v1 0
+      ret vcon_emit_err_txt 10 vcon_t_unk_id
+    end
+    a1 = ulong v1
+  end
+  if ge ac 3
+    v2 = vcon_parse_u64_arg 3
+    if lt v2 0
+      ret vcon_emit_err_txt 10 vcon_t_unk_id
+    end
+    a2 = ulong v2
+  end
+  if lt vrl_run_pure ulong ridx a0 a1 a2 ac 0
+    ret vcon_emit_err_txt 10 vrl_w_incompat
+  end
+  ob_reset 65535
+  ob_put_u64 get vrl_run_out 0
+  if ne isj 0
+    ret vcon_emit_ok_json 10 1
+  end
+  ob_putc uchar 10
+  ob_write_fd 1
+  put vcon_last_st 0 0
+  ret 0
+end
+
+fn vcon_cmd_type oi long rk ulong isj ulong to long
+  ob_reset 65535
+  if eq rk V_BIND_PROGRAM
+    ob_puts vsem_t_u
+    ob_put_u64 64
+  else
+    if lt oi 0
+      ret vcon_emit_err_txt 3 vcon_t_unk_id
+    end
+    k = get v_og_kind ulong oi
+    if eq k V_KIND_TYPE
+      vsem_put_type_str ulong oi
+    else
+      info = olw_obj_type_info ulong oi
+      tag = shr info 16
+      wid = and info 0xffff
+      if eq tag V_TY_BOOL
+        ob_puts vsem_t_bool
+      else
+        if eq tag V_TY_UINT
+          ob_puts vsem_t_u
+          ob_put_u64 wid
+        else
+          ob_puts vsem_op_unk
+        end
+      end
+    end
+  end
+  if ne isj 0
+    ret vcon_emit_ok_json 3 0
+  end
+  ob_putc uchar 10
+  ob_write_fd 1
+  put vcon_last_st 0 0
+  ret 0
+end
+
+fn vcon_cmd_subject cmd ulong isj ulong to long
+  a0l = get vpc_alen 0
+  for i ulong a0l bound 256
+    put v_sbuf i get vpc_args i
+  end
+  if lt vs_resolve_sbuf a0l 0
+    ret vcon_emit_err_txt cmd vcon_t_unk_id
+  end
+  rk = get v_res_kind 0
+  if eq cmd 4
+    ob_reset 65535
+    if ne isj 0
+      ob_putc uchar 123
+      ob_putc uchar 34
+      ob_puts vpc_c_id
+      ob_putc uchar 34
+      ob_putc uchar 58
+      ob_putc uchar 34
+      ob_puts vt_sha256_pfx
+      for i ulong 32
+        ob_put_hex_byte ulong get v_res_id i
+      end
+      ob_putc uchar 34
+      ob_putc uchar 125
+      ret vcon_emit_ok_json cmd 0
+    end
+    ob_puts vt_sha256_pfx
+    for i ulong 32
+      ob_put_hex_byte ulong get v_res_id i
+    end
+    ob_putc uchar 10
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  for i ulong 32
+    put v_tmp_id i get v_res_id i
+  end
+  oi = og_find_by_tmp
+  if eq cmd 2
+    if lt oi 0
+      ret vcon_emit_err_txt cmd vcon_t_unk_id
+    end
+    ir = vsem_inspect ulong oi
+    if ne isj 0
+      u = vsem_format_json 65535
+      ret vcon_emit_ok_json cmd 0
+    end
+    u = vsem_format_text 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 3
+    ret vcon_cmd_type oi rk isj
+  end
+  if eq cmd 5
+    if lt oi 0
+      ret vcon_emit_err_txt cmd vcon_t_unk_id
+    end
+    u = vsem_graph_text ulong oi 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 6
+    if eq rk V_BIND_PROGRAM
+      u = vver_verify_program ulong get v_res_idx 0
+    else
+      u = vver_verify_object oi -1 0
+    end
+    if ne isj 0
+      u2 = vver_format_json 65535
+      ret vcon_emit_ok_json cmd 1
+    end
+    u2 = vver_format_text 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 8
+    ridx = long -1
+    if eq rk V_BIND_PROGRAM
+      ridx = vrl_realize_program ulong get v_res_idx 0
+    else
+      if ge oi 0
+        ridx = vrl_realize_apply ulong oi
+      end
+    end
+    if lt ridx 0
+      wl = get vrl_wlen 0
+      for i ulong wl bound 256
+        put v_sbuf i get vrl_why i
+      end
+      ret vcon_emit_err_sbuf cmd wl
+    end
+    rb = mul ulong ridx 32
+    for i ulong 32
+      put v_tmp_id i get v_real_id add rb i
+    end
+    vs_set_last V_BIND_REALIZATION ridx
+    if ne isj 0
+      u = vrl_format_json ulong ridx 65535
+      ret vcon_emit_ok_json cmd 1
+    end
+    u = vrl_format_text ulong ridx 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 9
+    if ne rk V_BIND_REALIZATION
+      ret vcon_emit_err_txt cmd vcon_t_unk_id
+    end
+    if ne isj 0
+      u = vrl_format_cost_json ulong get v_res_idx 0 65535
+      ret vcon_emit_ok_json cmd 2
+    end
+    u = vrl_format_cost_text ulong get v_res_idx 0 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 10
+    ret vcon_cmd_run oi rk isj
+  end
+  if eq cmd 15
+    if lt oi 0
+      ret vcon_emit_err_txt cmd vcon_t_not_eff
+    end
+    if ne get v_og_kind ulong oi V_KIND_EFFECT
+      ret vcon_emit_err_txt cmd vcon_t_not_eff
+    end
+    if lt verq_build ulong oi 0
+      ret vcon_emit_err_txt cmd vcon_t_not_eff
+    end
+    if ne isj 0
+      u = verq_format_json 65535
+      ret vcon_emit_ok_json cmd 3
+    end
+    u = verq_format_text 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  ret vcon_emit_err_txt cmd vcon_t_unk_id
+end
+
+fn vcon_exec_sbuf rlen ulong to long
+  prc = vpc_parse_sbuf rlen
+  cmd = get vpc_cmd 0
+  if lt prc 0
+    el = get vpc_elen 0
+    for i ulong el bound 256
+      put v_sbuf i get vpc_err i
+    end
+    ret vcon_emit_err_sbuf cmd el
+  end
+  if eq cmd 20
+    ret 0
+  end
+  isj = get vcon_json 0
+  if eq cmd 1
+    put vcon_quit 0 1
+    if ne isj 0
+      ob_reset 65535
+      ob_put_json_str vcon_t_bye 0 3
+      ret vcon_emit_ok_json cmd 0
+    end
+    v_write_all 1 vcon_t_bye
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 0
+    if ne isj 0
+      ob_reset 65535
+      ob_put_json_str vcon_help_hdr 0 20
+      ret vcon_emit_ok_json cmd 0
+    end
+    v_write_all 1 vcon_help_hdr
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 13
+    vs_clear
+    if ne isj 0
+      ob_reset 65535
+      ob_put_json_str vcon_t_clr 0 15
+      ret vcon_emit_ok_json cmd 0
+    end
+    v_write_all 1 vcon_t_clr
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 12
+    ret vcon_cmd_bindings isj
+  end
+  if eq cmd 7
+    if ne isj 0
+      u = vmch_format_json 65535
+      ret vcon_emit_ok_json cmd 0
+    end
+    u = vmch_format_text 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 14
+    vwld_unattached
+    if ne isj 0
+      u = vwld_format_json 65535
+      ret vcon_emit_ok_json cmd 0
+    end
+    u = vwld_format_text 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 19
+    ll = get vpc_llen 0
+    for i ulong ll bound 4096
+      put v_sbuf i get vpc_line i
+    end
+    er = olw_eval_sbuf ll
+    if lt er 0
+      el = get olx_elen 0
+      for i ulong el bound 256
+        put v_sbuf i get olx_err i
+      end
+      ret vcon_emit_err_sbuf cmd el
+    end
+    if ne isj 0
+      ob_reset 65535
+      ob_putc uchar 123
+      ob_putc uchar 34
+      ob_puts vpc_c_id
+      ob_putc uchar 34
+      ob_putc uchar 58
+      ob_putc uchar 34
+      ob_puts vt_sha256_pfx
+      for i ulong 32
+        ob_put_hex_byte ulong get v_last_id i
+      end
+      ob_putc uchar 34
+      ob_putc uchar 125
+      ret vcon_emit_ok_json cmd 1
+    end
+    if ne get olw_has_val 0 0
+      if ne get olw_val_is_bool 0 0
+        if ne get olw_val_out 0 0
+          v_write_all 1 vcon_t_true
+        else
+          v_write_all 1 vcon_t_false
+        end
+      else
+        ob_reset 65535
+        ob_put_u64 get olw_val_out 0
+        ob_putc uchar 10
+        ob_write_fd 1
+      end
+    end
+    put vcon_last_st 0 0
+    ret 0
+  end
+  if eq cmd 15
+    if eq get vpc_argc 0 0
+      if ne isj 0
+        ob_reset 65535
+        ob_putc uchar 91
+        ob_putc uchar 93
+        ret vcon_emit_ok_json cmd 3
+      end
+      v_write_all 1 vcon_t_no_eff
+      put vcon_last_st 0 0
+      ret 0
+    end
+  end
+  if eq cmd 11
+    put vev_filter_on 0 0
+    evl = get vcon_evlen 0
+    if eq evl 0
+      if ne isj 0
+        ob_reset 65535
+        ob_puts vev_t_j1
+        ob_put_u64 0
+        ob_puts vev_t_jend
+        ret vcon_emit_ok_json cmd 0
+      end
+      v_write_all 1 vev_t_noev
+      put vcon_last_st 0 0
+      ret 0
+    end
+    for i ulong evl bound 256
+      put v_sbuf i get vcon_evroot i
+    end
+    sr = vev_scan_sbuf evl
+    if lt sr 0
+      ret vcon_emit_err_txt cmd vcon_t_unk_id
+    end
+    if ne isj 0
+      u = vev_format_json 65535
+      ret vcon_emit_ok_json cmd 0
+    end
+    u = vev_format_text 65535
+    ob_write_fd 1
+    put vcon_last_st 0 0
+    ret 0
+  end
+  ret vcon_cmd_subject cmd isj
+end
