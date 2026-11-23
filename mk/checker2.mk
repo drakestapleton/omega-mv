@@ -3,6 +3,7 @@
 # `-include mk/*.mk`; not part of `all` or `test`. checker2 links none of src/compiler/*.c: it
 # includes no compiler header and shares no parser, evaluator or instruction table with oscc.
 # Links only src/omega_om_units.c and the vendored in-house Ed25519 (src/searchtrace/sig, PROVENANCE.txt).
+# The untrusted solver c2sat is pure seeded OM-2 (src/checker2/untrusted/c2sat.om, built with C2_OMC).
 #   make checker2                build/checker2/checker2
 #   make test-checker2           receipt, checker and LRAT tests (plain and ASan/UBSan), corpus +
 #                                black-box differential against oscc, blaster semantics against oscc's
@@ -64,10 +65,12 @@ $(C2_DIR)/test_c2_receipt_asan: tests/checker2/test_c2_receipt.c $(C2_RECEIPT) $
 	@mkdir -p $(C2_DIR)
 	$(CC) $(C2_CFLAGS) $(C2_ASAN) -o $@ tests/checker2/test_c2_receipt.c $(C2_RECEIPT)
 
-# untrusted SAT solver (not in the checker identity; every UNSAT answer is re-checked by c2_lrat)
-$(C2_DIR)/c2sat: src/checker2/untrusted/c2sat.c
+# untrusted SAT solver (not in the checker identity; every UNSAT answer is re-checked by c2_lrat),
+# pure seeded OM-2 built by the seed omc
+C2_OMC ?= seed/out/omc
+$(C2_DIR)/c2sat: src/checker2/untrusted/c2sat.om $(C2_OMC)
 	@mkdir -p $(C2_DIR)
-	$(CC) $(C2_CFLAGS) -o $@ src/checker2/untrusted/c2sat.c
+	$(C2_OMC) < src/checker2/untrusted/c2sat.om > $@.tmp && chmod +x $@.tmp && mv $@.tmp $@
 
 $(C2_DIR)/test_c2_lrat: tests/checker2/test_c2_lrat.c src/checker2/c2_lrat.c $(C2_HDRS)
 	@mkdir -p $(C2_DIR)
