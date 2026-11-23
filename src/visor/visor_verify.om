@@ -1,242 +1,2221 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 Visor lane 4: structured 6-row verification report
-note (replaces src/visor/visor_verify.c). Depends on visor.om, visor_semantic.om, visor_realization.om.
+note Pure seeded OM-2 Visor lane 4: structured six-row verification report, a port of
+note src/visor/visor_verify.c together with the verification it calls: omega_validate.c
+note (object and graph validation), omega_verify.c (V0 structural, V1 differential, V2
+note properties), omega_realize.c / omega_realize_synth.c (realization ids) and the
+note program contract check of omega_program.c.
+note Depends on visor.om, visor_machine.om, om/aarch64/aarch64_om2.om (a64validate,
+note a64decode), om/visor/verify_om2.om (om_ver_*) and om/visor/validate_om2.om (om_val_*).
+note
+note C arguments become explicit state, as the C pointers they replace:
+note   SemanticId *id            -> vver_qid (32 bytes); the graph is the v_og store
+note   RealizationObject *real   -> a realization slot 0..7 (vver_r*), or -1 for NULL
+note   OmegaMachineGraph *mg     -> a visor_machine graph slot (vmch_g*), or -1 for NULL
+note   OmegaProgram *p           -> the program record vver_p_* (has_p 0 for NULL)
+note V1 runs the realization on an interpreter of the decoded AArch64 subset the
+note realizers emit (ADD SUB MUL AND ORR EOR register forms with their shifts, MOVZ,
+note MOVK, RET); OM-2 has no host word to map and call native code, which is what
+note omega_exec_native_f3 does. An instruction outside that subset returns rc=-3.
 
-text vver_v_abs "object absent from graph"
-text vver_v_str "structural validation failed"
-text vver_v_typ "type validation failed"
-text vver_v_rcd "REALIZATION_ID or code validation failed"
-text vver_v_rid "REALIZATION_ID digest mismatch"
-text vver_v_mch "machine profile mismatch"
-text vver_v_pidx "invalid program index"
-text vver_v_punr "program not realized"
-text vver_v_pdig "program realization digest mismatch"
+const VVER_RN ulong 8
+const VVER_CB ulong 4096
+const VVER_ROWS ulong 6
+
 text vver_s_pass "PASS"
 text vver_s_fail "FAIL"
 text vver_s_nr "NOT_RUN"
-text vver_f0 "STRUCTURAL      "
-text vver_f1 "\nTYPE            "
-text vver_f2 "\nINVARIANTS      "
-text vver_f3 "\nREALIZATION     "
-text vver_f4 "\nAUTHORITY       "
-text vver_fa1 "  REQUIRED (never granted by Visor)"
-text vver_fa0 "  NONE: pure object"
-text vver_f5 "\nMACHINE         "
-text vver_fv "\nVERDICT         "
-text vver_fvp "PASS\n"
-text vver_fvf "FAIL\nfirst violation: "
-text vver_j1 "{\"passed\":"
+text vver_n0 "STRUCTURAL"
+text vver_n1 "TYPE"
+text vver_n2 "INVARIANTS"
+text vver_n3 "REALIZATION"
+text vver_n4 "AUTHORITY"
+text vver_n5 "MACHINE"
+text vver_n_vd "VERDICT"
+text vver_k0 "INVALID"
+text vver_k1 "VALUE"
+text vver_k2 "TYPE"
+text vver_k3 "OPERATION"
+text vver_k4 "RELATION"
+text vver_k5 "CONSTRAINT"
+text vver_k6 "MEMORY"
+text vver_k7 "MACHINE"
+text vver_k8 "EFFECT"
+text vver_k9 "REALIZATION"
+text vver_k10 "EVIDENCE"
+text vver_k11 "PROOF"
+text vver_k_app "OPERATION(apply)"
+
+text vver_e_kind "Invalid semantic kind tag 0x"
+text vver_e_akey "Empty attribute key at index "
+text vver_e_rk "Invalid relation kind 0x"
+text vver_e_at " at index "
+text vver_e_dang "Dangling relation target reference "
+text vver_e_ck "Invalid constraint kind 0x"
+text vver_e_tlen "Type payload length too short ("
+text vver_e_bytes " bytes)"
+text vver_e_ttag "Invalid type tag 0x"
+text vver_e_uw "Unsigned integer width "
+text vver_e_uw2 " out of bounds [1..256]"
+text vver_e_sw "Signed integer width "
+text vver_e_sw2 " out of bounds [2..256]"
+text vver_e_fw "FP32 width "
+text vver_e_fw2 " is not 32"
+text vver_e_bw "Bitvector width "
+text vver_e_slen "Sequence length "
+text vver_e_slen2 " exceeds 65535"
+text vver_e_selem "Sequence element type unresolved or not KIND_TYPE"
+text vver_e_vlen "Value payload length too short ("
+text vver_e_vtid "Value type_id unresolved or not KIND_TYPE"
+text vver_e_vbl "Value byte length "
+text vver_e_vbl2 " does not match declared type width "
+text vver_e_vbl3 " (expected "
+text vver_e_opc "Invalid opcode 0x"
+text vver_e_ovf "Operation overflow policy not explicitly declared"
+text vver_e_aop "Apply op_id unresolved or not KIND_OPERATION"
+text vver_e_aarg "Apply operand "
+text vver_e_aarg2 " unresolved or invalid kind"
+text vver_e_eff "Effect payload refused: "
+text vver_e_eff2 " ("
+text vver_x_arg "not an effect object"
+text vver_x_len "effect payload length is not 178 bytes"
+text vver_x_v1 "legacy v1 effect payload (32-bit generation) refused"
+text vver_x_res "effect resource class is 0 (invalid resource)"
+text vver_x_par "effect param_len exceeds 128"
+text vver_x_pad "effect parameter padding is not zero"
+text vver_e_gemp "Empty graph (0 objects)"
+text vver_e_gmax "Graph object count "
+text vver_e_gmax2 " exceeds maximum 256"
+text vver_e_cyr "Structural cycle detected involving relation target at object index "
+text vver_e_cyo "Structural cycle detected involving operand target at object index "
+
+text vver_v0_g "V0 Graph Validation Failed: "
+text vver_v0_ge "V0 Graph Validation Failed: Empty graph"
+text vver_v0_p "V0 Realization Profile Failed: Unknown profile 0x"
+text vver_v0_b "V0 Realization Code Bounds Failed: Invalid length "
+text vver_v0_by " bytes"
+text vver_v0_i "V0 Instruction Stream Failed: "
+text vver_v0_m "V0 Realization ID Failed: Object missing REALIZATION_ID"
+text vver_v0_c "V0 Realization ID Failed: REALIZATION_ID cryptographic mismatch"
+text vver_v1_x "V1 Differential Execution Failed: Vector "
+text vver_v1_mm "V1 Differential Mismatch: Vector "
+text vver_v1_a " (a="
+text vver_v1_b ", b="
+text vver_v1_c ", c="
+text vver_v1_rc ") returned rc="
+text vver_v1_ex ") expected="
+text vver_v1_ob " observed="
+text vver_v2_k "V2 Property Violation kind="
+text vver_v2_op " op=0x"
+text vver_v2_l " ("
+text vver_v2_cm ", "
+text vver_v2_r ")"
+
+text vver_t_bad "invalid arguments or malformed graph header"
+text vver_t_badp "invalid arguments"
+text vver_t_abs "object not present in graph"
+text vver_t_pres "object present"
+text vver_t_absent "absent"
+text vver_t_v0ok "V0 graph typing + DAG integrity ("
+text vver_t_objs " object(s))"
+text vver_t_gv0 "graph passes V0 structural"
+text vver_t_val " object validates"
+text vver_t_oval "object validates"
+text vver_t_v2ok "V2 reference-evaluator algebra (commutativity, identity, wrap, range); not object-specific"
+text vver_t_v2h "V2 properties hold"
+text vver_t_nore "no realization built"
+text vver_t_nomg "no machine model"
+text vver_t_diff "realization is bound to a different semantic object"
+text vver_t_rv0 "realization passes V0 structural"
+text vver_t_nr1 "V0 realization structure PASS ("
+text vver_t_nr2 " checks); V1 NOT_RUN: existing reference is (a+b)-c, "
+text vver_t_nr3 "not applicable to op 0x"
+text vver_t_nr4 "subject shape not covered"
+text vver_t_madd "V1 differential, OP_ADD with c=0"
+text vver_t_mfas "V1 differential, (a+b)-c default vectors"
+text vver_t_v1ok " check(s), incl. V0 realization id)"
+text vver_t_lp " ("
+text vver_t_areq "REQUIRED: "
+text vver_t_aeff " effect(s), "
+text vver_t_acap " capability ref(s) reachable; visor grants nothing"
+text vver_t_anone "NONE: no effect or capability ref reachable ("
+text vver_t_awalk " object(s) walked)"
+text vver_t_tp "target profile 0x"
+text vver_t_rp "realization profile 0x"
+text vver_t_pm "profile mismatch: "
+text vver_t_vs " vs "
+text vver_t_pmv "realization target profile does not match machine model"
+text vver_t_mid "realization bound to a different machine id"
+text vver_t_prof "profile 0x"
+text vver_t_match " matches "
+text vver_t_mb "; machine id bound and equal"
+text vver_t_mnb "; realization not bound to a machine id"
+text vver_t_none "no check ran"
+text vver_t_one "at least one executed check"
+text vver_t_nonev "none"
+text vver_t_sha "sha256:"
+text vver_t_punr "program not realized; nothing to verify"
+text vver_t_punv "program not realized"
+text vver_t_prz "realized program"
+text vver_t_pnrz "not realized"
+text vver_t_pv0 "V0 realization: profile, bounds, decode, terminal RET, realization id ("
+text vver_t_pcv "contract validates"
+text vver_t_pc1 "contract validates (pre \""
+text vver_t_pc2 "\", post \""
+text vver_t_pc3 "\")"
+text vver_t_pin "Program contract has invalid input type"
+text vver_t_pout "Program contract has invalid output type"
+text vver_t_p0w "Program contract has 0-width type"
+text vver_t_pcid "Program contract has uninitialized constraint SemanticId"
+text vver_t_prl "program verify runs V0+V2 only; V1 reference (a+b)-c does not model unary programs"
+text vver_t_pau "program has no semantic graph; requirements not derivable"
+
+text vver_f_fv "first violation: "
+text vver_f_obj "object:          "
+text vver_f_exp "expected:        "
+text vver_f_obs "observed:        "
+text vver_j_p "{\"passed\":"
+text vver_j_rows ",\"rows\":["
+text vver_j_name "{\"name\":"
+text vver_j_st ",\"status\":\""
+text vver_j_ck "\",\"checks\":"
+text vver_j_fl ",\"fails\":"
+text vver_j_det ",\"detail\":"
+text vver_j_auth "],\"authority\":{\"required\":"
+text vver_j_eff ",\"effects\":"
+text vver_j_cap ",\"capability_refs\":"
+text vver_j_gr ",\"granted\":false}"
+text vver_j_fail ",\"failure\":{\"first_violation\":"
+text vver_j_fo ",\"object\":"
+text vver_j_fe ",\"expected\":"
+text vver_j_fob ",\"observed\":"
+text vver_j_null ",\"failure\":null"
 text vver_j_t "true"
 text vver_j_f "false"
-text vver_j2 ",\"rows\":[{\"name\":\"STRUCTURAL\",\"status\":\""
-text vver_j3 "\"},{\"name\":\"TYPE\",\"status\":\""
-text vver_j4 "\"},{\"name\":\"INVARIANTS\",\"status\":\""
-text vver_j5 "\"},{\"name\":\"REALIZATION\",\"status\":\""
-text vver_j6 "\"},{\"name\":\"AUTHORITY\",\"status\":\""
-text vver_ja1 "\",\"detail\":\"REQUIRED: effects/caps present\"},{\"name\":\"MACHINE\",\"status\":\""
-text vver_ja0 "\",\"detail\":\"NONE: pure\"},{\"name\":\"MACHINE\",\"status\":\""
-text vver_j7 "\"}],\"authority\":{\"required\":"
-text vver_j8 ",\"effects\":"
-text vver_j9 ",\"capability_refs\":"
-text vver_j10 ",\"granted\":false},\"failure\":"
-text vver_jnull "null}"
-text vver_jend "}"
 
+note ---- realization slots (RealizationObject) ----
+global vver_rcode uchar 32768
+global vver_rclen ulong 8
+global vver_rprof ulong 8
+global vver_rent ulong 8
+global vver_rsem uchar 256
+global vver_rrid uchar 256
+global vver_rhid ulong 8
+global vver_rmid uchar 256
+global vver_rhm ulong 8
+
+note ---- query id and program record (OmegaProgram fields verify reads) ----
+global vver_qid uchar 32
+global vver_p_real ulong 1
+global vver_p_slot ulong 1
+global vver_p_id uchar 32
+global vver_p_itag ulong 1
+global vver_p_iw ulong 1
+global vver_p_otag ulong 1
+global vver_p_ow ulong 1
+global vver_p_pre uchar 32
+global vver_p_post uchar 32
+global vver_p_pt uchar 64
+global vver_p_ptl ulong 1
+global vver_p_qt uchar 64
+global vver_p_qtl ulong 1
+
+note ---- VisorVerifyReport ----
 global vver_st ulong 6
 global vver_chk ulong 6
-global vver_fail ulong 6
+global vver_fl ulong 6
+global vver_det uchar 1536
+global vver_dl ulong 6
 global vver_passed ulong 1
+global vver_viol uchar 256
+global vver_vlen ulong 1
+global vver_obj uchar 72
+global vver_olen ulong 1
+global vver_exp uchar 128
+global vver_elen ulong 1
+global vver_obs uchar 128
+global vver_oblen ulong 1
 global vver_auth_req ulong 1
 global vver_eff_cnt ulong 1
 global vver_cap_cnt ulong 1
-global vver_viol uchar 256
-global vver_vlen ulong 1
 
-fn vver_set_viol s view uchar * to void
-  if gt get vver_vlen 0 0
-    ret
-  end
-  n = len s
-  if gt n 255
-    n = 255
-  end
-  for i ulong n bound 256
-    put vver_viol i get s i
-  end
-  put vver_vlen 0 n
+note ---- VerifyReport (one tier run), string builder, validation error ----
+global vver_vr_pass ulong 1
+global vver_vr_cnt ulong 1
+global vver_vr_fail ulong 1
+global vver_vr_det uchar 512
+global vver_vr_dl ulong 1
+global vver_sb uchar 1024
+global vver_sbl ulong 1
+global vver_err uchar 256
+global vver_el ulong 1
+global vver_vec ulong 48
+global vver_xout ulong 1
+global vver_vu ulong 1
+global vver_v1mm ulong 1
+global vver_v1e ulong 1
+global vver_v1o ulong 1
+global vver_istop ulong 1
+global vver_topc ulong 1
+global vver_aw ulong 1
+
+note ---- string builder (snprintf pieces) ----
+fn vver_sb_clear to void
+  put vver_sbl 0 0
 end
 
+fn vver_sb_c c ulong to void
+  p = get vver_sbl 0
+  if lt p 1024
+    put vver_sb p uchar and c 255
+    put vver_sbl 0 add p 1
+  end
+end
+
+fn vver_sb_t s view uchar * to void
+  n = len s
+  for i ulong n bound 1024
+    vver_sb_c ulong get s i
+  end
+end
+
+note %u / %lu / %zu
+fn vver_sb_u v ulong to void
+  nb = new uchar 24 0
+  x = v
+  nd = ulong 0
+  while lt nd 21 bound 24
+    put nb nd uchar add 48 rem x 10
+    nd = add nd 1
+    x = div x 10
+    if eq x 0
+      break
+    end
+  end
+  while gt nd 0 bound 24
+    nd = sub nd 1
+    vver_sb_c ulong get nb nd
+  end
+end
+
+note %d
+fn vver_sb_d v long to void
+  if lt v 0
+    vver_sb_c 45
+    vver_sb_u ulong sub 0 v
+    ret
+  end
+  vver_sb_u ulong v
+end
+
+note %0wx (w >= 1)
+fn vver_sb_hex v ulong w ulong to void
+  k = ulong 1
+  while lt k 16 bound 16
+    if eq shr v mul k 4 0
+      break
+    end
+    k = add k 1
+  end
+  if lt k w
+    k = w
+  end
+  for i ulong k bound 16
+    nib = and shr v mul sub sub k 1 i 4 15
+    if lt nib 10
+      vver_sb_c add nib 48
+    else
+      vver_sb_c add nib 87
+    end
+  end
+end
+
+note 64 lowercase hex digits of v_tmp_id
+fn vver_sb_tmphex to void
+  for i ulong 32
+    b = ulong get v_tmp_id i
+    vver_sb_c ulong get vt_hex shr b 4
+    vver_sb_c ulong get vt_hex and b 15
+  end
+end
+
+fn vver_sb_vrdet maxn ulong to void
+  n = get vver_vr_dl 0
+  if gt n maxn
+    n = maxn
+  end
+  for i ulong n bound 512
+    vver_sb_c ulong get vver_vr_det i
+  end
+end
+
+fn vver_sb_err maxn ulong to void
+  n = get vver_el 0
+  if gt n maxn
+    n = maxn
+  end
+  for i ulong n bound 256
+    vver_sb_c ulong get vver_err i
+  end
+end
+
+fn vver_sb_mgname g ulong maxn ulong to void
+  n = vmch_gget g VMCH_K_NLEN
+  if gt n maxn
+    n = maxn
+  end
+  nb = mul g 64
+  for i ulong n bound 64
+    vver_sb_c ulong get vmch_gname add nb i
+  end
+end
+
+note ---- id staging in v_tmp_id ----
+fn vver_tmp_og idx ulong to void
+  b = mul idx 32
+  for i ulong 32
+    put v_tmp_id i get v_og_id add b i
+  end
+end
+
+note 32 payload bytes at off; bytes past the 1024-byte payload read as 0
+fn vver_tmp_pay idx ulong off ulong to void
+  b = mul idx V_MAX_PAYLOAD
+  for i ulong 32
+    o = add off i
+    if lt o V_MAX_PAYLOAD
+      put v_tmp_id i get v_og_pay add b o
+    else
+      put v_tmp_id i uchar 0
+    end
+  end
+end
+
+fn vver_tmp_rel rslot ulong to void
+  b = mul rslot 32
+  for i ulong 32
+    put v_tmp_id i get v_og_rtgt add b i
+  end
+end
+
+fn vver_tmp_rsem s ulong to void
+  b = mul s 32
+  for i ulong 32
+    put v_tmp_id i get vver_rsem add b i
+  end
+end
+
+fn vver_tmp_rmid s ulong to void
+  b = mul s 32
+  for i ulong 32
+    put v_tmp_id i get vver_rmid add b i
+  end
+end
+
+fn vver_tmp_mg g ulong to void
+  b = mul g 32
+  for i ulong 32
+    put v_tmp_id i get vmch_gid add b i
+  end
+end
+
+fn vver_tmp_q to void
+  for i ulong 32
+    put v_tmp_id i get vver_qid i
+  end
+end
+
+fn vver_tmp_pid to void
+  for i ulong 32
+    put v_tmp_id i get vver_p_id i
+  end
+end
+
+fn vver_tmp_zero to bool
+  for i ulong 32
+    if ne get v_tmp_id i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vver_rsem_eq_q s ulong to bool
+  b = mul s 32
+  for i ulong 32
+    if ne get vver_rsem add b i get vver_qid i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vver_rsem_eq_pay s ulong idx ulong off ulong to bool
+  b = mul s 32
+  pb = add mul idx V_MAX_PAYLOAD off
+  for i ulong 32
+    if ne get vver_rsem add b i get v_og_pay add pb i
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- report fields ----
 fn vver_reset to void
   for i ulong 6
     put vver_st i 2
     put vver_chk i 0
-    put vver_fail i 0
+    put vver_fl i 0
+    put vver_dl i 0
   end
   put vver_passed 0 0
+  put vver_vlen 0 0
+  put vver_olen 0 0
+  put vver_elen 0 0
+  put vver_oblen 0 0
   put vver_auth_req 0 0
   put vver_eff_cnt 0 0
   put vver_cap_cnt 0 0
-  put vver_vlen 0 0
 end
 
-fn vver_check_auth_walk idx ulong depth ulong to void
-  if gt depth 16
-    ret
+note row_set: status, counts, detail = the builder (vsnprintf into char[256])
+fn vver_row r ulong st ulong ck ulong fl ulong to void
+  put vver_st r st
+  put vver_chk r and ck 4294967295
+  put vver_fl r and fl 4294967295
+  n = get vver_sbl 0
+  if gt n 255
+    n = 255
   end
-  if ge idx get v_og_cnt 0
-    ret
+  b = mul r 256
+  for i ulong n bound 256
+    put vver_det add b i get vver_sb i
   end
-  k = get v_og_kind idx
-  pb = mul idx V_MAX_PAYLOAD
-  if eq k V_KIND_EFFECT
-    put vver_auth_req 0 1
-    put vver_eff_cnt 0 add get vver_eff_cnt 0 1
+  put vver_dl r n
+end
+
+note note_violation step 1: only when first_violation is empty; violation = the builder (%.255s)
+fn vver_nv_open to bool
+  if gt get vver_vlen 0 0
+    ret false
   end
-  if eq k V_KIND_TYPE
-    tag = v_dec_u32le_pay pb 0
-    if or eq tag V_TY_CAP_REF or eq tag V_TY_EFF_INTENT_REF eq tag V_TY_EFF_RECEIPT_REF
-      put vver_auth_req 0 1
-      put vver_cap_cnt 0 add get vver_cap_cnt 0 1
-    end
+  n = get vver_sbl 0
+  if gt n 255
+    n = 255
   end
-  rc = get v_og_rcnt idx
-  for r ulong rc bound 4
-    rslot = add mul idx V_MAX_RELS r
-    tb = mul rslot 32
-    for i ulong 32
-      put v_tmp_id i get v_og_rtgt add tb i
-    end
-    ti = og_find_by_tmp
-    if ge ti 0
-      vver_check_auth_walk ulong ti add depth 1
-    end
+  for i ulong n bound 256
+    put vver_viol i get vver_sb i
+  end
+  put vver_vlen 0 n
+  ret true
+end
+
+note object_involved = "sha256:" + hex of v_tmp_id
+fn vver_nv_obj to void
+  vver_sb_clear
+  vver_sb_t vver_t_sha
+  vver_sb_tmphex
+  n = get vver_sbl 0
+  for i ulong n bound 72
+    put vver_obj i get vver_sb i
+  end
+  put vver_olen 0 n
+end
+
+fn vver_nv_exp to void
+  n = get vver_sbl 0
+  if gt n 127
+    n = 127
+  end
+  for i ulong n bound 128
+    put vver_exp i get vver_sb i
+  end
+  put vver_elen 0 n
+end
+
+fn vver_nv_obs to void
+  n = get vver_sbl 0
+  if gt n 127
+    n = 127
+  end
+  for i ulong n bound 128
+    put vver_obs i get vver_sb i
+  end
+  put vver_oblen 0 n
+end
+
+note note_violation(text, NULL, "", "")
+fn vver_nv_plain s view uchar * to void
+  vver_sb_clear
+  vver_sb_t s
+  if vver_nv_open
+    put vver_elen 0 0
+    put vver_oblen 0 0
   end
 end
 
-fn vver_verify_object idx long ridx long has_mach ulong to long
-  vver_reset
-  if or lt idx 0 ge ulong idx get v_og_cnt 0
-    put vver_st 0 1
-    put vver_chk 0 1
-    put vver_fail 0 1
-    vver_set_viol vver_v_abs
-    put vver_passed 0 0
-    ret 0
-  end
-  u = ulong idx
-  ir = vsem_inspect u
-  if or ne ir 0 gt get vsem_dangling 0 0
-    put vver_st 0 1
-    put vver_chk 0 1
-    put vver_fail 0 1
-    vver_set_viol vver_v_str
-  else
-    put vver_st 0 0
-    put vver_chk 0 1
-  end
-  if eq ir 0
-    put vver_st 1 0
-    put vver_chk 1 1
-  else
-    put vver_st 1 1
-    put vver_chk 1 1
-    put vver_fail 1 1
-    vver_set_viol vver_v_typ
-  end
-  put vver_st 2 0
-  put vver_chk 2 4
-  if ge ridx 0
-    ru = ulong ridx
-    if lt vrs_v0 ru 0
-      put vver_st 3 1
-      put vver_chk 3 1
-      put vver_fail 3 1
-      vver_set_viol vver_v_rcd
-    else
-      put vver_st 3 0
-      put vver_chk 3 11
-    end
-  else
-    put vver_st 3 2
-  end
-  vver_check_auth_walk u 0
-  put vver_st 4 0
-  put vver_chk 4 1
-  if and ge ridx 0 ne has_mach 0
-    ru2 = ulong ridx
-    if eq get v_real_prof ru2 get vmch_profile 0
-      put vver_st 5 0
-      put vver_chk 5 1
-    else
-      put vver_st 5 1
-      put vver_chk 5 1
-      put vver_fail 5 1
-      vver_set_viol vver_v_mch
-    end
-  else
-    put vver_st 5 2
-  end
+fn vver_finalize to void
+  any_ran = false
   any_fail = false
   for i ulong 6
+    if eq get vver_st i 0
+      any_ran = true
+    end
     if eq get vver_st i 1
       any_fail = true
     end
   end
-  if not any_fail
+  if and any_ran not any_fail
     put vver_passed 0 1
+  else
+    put vver_passed 0 0
   end
-  ret 0
-end
-
-fn vver_verify_program pidx ulong to long
-  vver_reset
-  if ge pidx get v_prog_cnt 0
-    vver_set_viol vver_v_pidx
-    ret -1
-  end
-  if eq get v_prog_realized pidx 0
-    put vver_st 0 1
-    put vver_chk 0 1
-    put vver_fail 0 1
-    vver_set_viol vver_v_punr
-    ret 0
-  end
-  cl = get v_prog_clen pidx
-  cb = mul pidx 256
-  pb = mul pidx 32
-  for i ulong cl bound 256
-    put v_sha_in i get v_prog_code add cb i
-  end
-  sha256_hash cl
-  rmatch = true
-  for i ulong 32
-    if ne get v_sha_out i get v_prog_real_id add pb i
-      rmatch = false
-      break
+  if eq get vver_passed 0 0
+    vver_sb_clear
+    vver_sb_t vver_t_none
+    if vver_nv_open
+      vver_sb_clear
+      vver_sb_t vver_t_one
+      vver_nv_exp
+      vver_sb_clear
+      vver_sb_t vver_t_nonev
+      vver_nv_obs
     end
   end
-  if not rmatch
-    put vver_st 0 1
-    put vver_chk 0 1
-    put vver_fail 0 1
-    vver_set_viol vver_v_pdig
-    ret 0
+end
+
+note ---- graph shape (codec convention: >= 204 bytes operation, else >= 161 apply) ----
+fn vver_pb idx ulong to ulong
+  ret mul idx V_MAX_PAYLOAD
+end
+
+fn vver_pay8 idx ulong off ulong to ulong
+  ret ulong get v_og_pay add vver_pb idx off
+end
+
+fn vver_as_op idx ulong to bool
+  if ne get v_og_kind idx V_KIND_OP
+    ret false
   end
-  put vver_st 0 0
-  put vver_chk 0 1
-  put vver_st 1 0
-  put vver_chk 1 1
-  put vver_st 2 0
-  put vver_chk 2 4
-  put vver_st 3 2
-  put vver_st 4 0
-  put vver_chk 4 1
-  put vver_st 5 2
-  put vver_passed 0 1
+  ret ge get v_og_plen idx 204
+end
+
+fn vver_as_app idx ulong to bool
+  if ne get v_og_kind idx V_KIND_OP
+    ret false
+  end
+  pl = get v_og_plen idx
+  if ge pl 204
+    ret false
+  end
+  ret ge pl 161
+end
+
+fn vver_as_op_l f long to bool
+  if lt f 0
+    ret false
+  end
+  ret vver_as_op ulong f
+end
+
+fn vver_as_app_l f long to bool
+  if lt f 0
+    ret false
+  end
+  ret vver_as_app ulong f
+end
+
+fn vver_kind_is_l f long kind ulong to bool
+  if lt f 0
+    ret false
+  end
+  ret eq get v_og_kind ulong f kind
+end
+
+fn vver_opcode idx ulong to ulong
+  ret v_dec_u32le_pay vver_pb idx 0
+end
+
+note ---- effect payload decode: 0 OK, 1 length, 2 legacy v1, 3 resource, 4 param_len, 5 padding ----
+fn vver_eff_code idx ulong to ulong
+  pl = get v_og_plen idx
+  if eq pl 176
+    ret 2
+  end
+  if ne pl 178
+    ret 1
+  end
+  pb = vver_pb idx
+  rcls = or shl vver_pay8 idx 0 8 vver_pay8 idx 1
+  if eq rcls 0
+    ret 3
+  end
+  plen = or shl vver_pay8 idx 48 8 vver_pay8 idx 49
+  if gt plen 128
+    ret 4
+  end
+  for i ulong 128
+    if ge i plen
+      if ne get v_og_pay add pb add 50 i 0
+        ret 5
+      end
+    end
+  end
   ret 0
 end
 
-fn vver_put_st st ulong to void
+fn vver_sb_effmsg code ulong to void
+  if eq code 1
+    vver_sb_t vver_x_len
+    ret
+  end
+  if eq code 2
+    vver_sb_t vver_x_v1
+    ret
+  end
+  if eq code 3
+    vver_sb_t vver_x_res
+    ret
+  end
+  if eq code 4
+    vver_sb_t vver_x_par
+    ret
+  end
+  if eq code 5
+    vver_sb_t vver_x_pad
+    ret
+  end
+  vver_sb_t vver_x_arg
+end
+
+note ---- omega_validate_object (graph present) ----
+fn vver_err_from_sb to long
+  n = get vver_sbl 0
+  if gt n 255
+    n = 255
+  end
+  for i ulong n bound 256
+    put vver_err i get vver_sb i
+  end
+  put vver_el 0 n
+  ret -1
+end
+
+fn vver_val_lists idx ulong to long
+  ac = get v_og_acnt idx
+  for a ulong ac bound 32
+    if eq get v_og_aklen og_aslot idx a 0
+      vver_sb_clear
+      vver_sb_t vver_e_akey
+      vver_sb_u a
+      ret vver_err_from_sb
+    end
+  end
+  rc = get v_og_rcnt idx
+  for r ulong rc bound 64
+    rs = og_rslot idx r
+    rk = get v_og_rkind rs
+    if ne om_val_rel_kind rk 0
+      vver_sb_clear
+      vver_sb_t vver_e_rk
+      vver_sb_hex rk 4
+      vver_sb_t vver_e_at
+      vver_sb_u r
+      ret vver_err_from_sb
+    end
+    vver_tmp_rel rs
+    if lt og_find_by_tmp 0
+      vver_sb_clear
+      vver_sb_t vver_e_dang
+      vver_sb_tmphex
+      ret vver_err_from_sb
+    end
+  end
+  cc = get v_og_ccnt idx
+  for c ulong cc bound 32
+    ck = get v_og_ckind og_cslot idx c
+    if ne om_val_const_kind ck 0
+      vver_sb_clear
+      vver_sb_t vver_e_ck
+      vver_sb_hex ck 4
+      vver_sb_t vver_e_at
+      vver_sb_u c
+      ret vver_err_from_sb
+    end
+  end
+  ret 0
+end
+
+fn vver_val_type_msg r ulong tag ulong w ulong slen ulong to long
+  vver_sb_clear
+  if eq r 1
+    vver_sb_t vver_e_ttag
+    vver_sb_hex tag 2
+  end
+  if eq r 2
+    vver_sb_t vver_e_uw
+    vver_sb_u w
+    vver_sb_t vver_e_uw2
+  end
+  if eq r 3
+    vver_sb_t vver_e_sw
+    vver_sb_u w
+    vver_sb_t vver_e_sw2
+  end
+  if eq r 4
+    vver_sb_t vver_e_fw
+    vver_sb_u w
+    vver_sb_t vver_e_fw2
+  end
+  if eq r 5
+    vver_sb_t vver_e_bw
+    vver_sb_u w
+    vver_sb_t vver_e_uw2
+  end
+  if eq r 6
+    vver_sb_t vver_e_slen
+    vver_sb_u slen
+    vver_sb_t vver_e_slen2
+  end
+  ret vver_err_from_sb
+end
+
+fn vver_val_type idx ulong to long
+  pl = get v_og_plen idx
+  if lt pl 44
+    vver_sb_clear
+    vver_sb_t vver_e_tlen
+    vver_sb_u pl
+    vver_sb_t vver_e_bytes
+    ret vver_err_from_sb
+  end
+  pb = vver_pb idx
+  tag = v_dec_u32le_pay pb 0
+  w = v_dec_u16le_pay pb 4
+  slen = v_dec_u32le_pay pb 8
+  r = om_val_type_fields tag w slen
+  if ne r 0
+    ret vver_val_type_msg ulong r tag w slen
+  end
+  if eq tag V_TY_SEQ
+    vver_tmp_pay idx 12
+    if not vver_kind_is_l og_find_by_tmp V_KIND_TYPE
+      vver_sb_clear
+      vver_sb_t vver_e_selem
+      ret vver_err_from_sb
+    end
+  end
+  ret 0
+end
+
+fn vver_val_value idx ulong to long
+  pl = get v_og_plen idx
+  if lt pl 98
+    vver_sb_clear
+    vver_sb_t vver_e_vlen
+    vver_sb_u pl
+    vver_sb_t vver_e_bytes
+    ret vver_err_from_sb
+  end
+  vver_tmp_pay idx 0
+  f = og_find_by_tmp
+  if not vver_kind_is_l f V_KIND_TYPE
+    vver_sb_clear
+    vver_sb_t vver_e_vtid
+    ret vver_err_from_sb
+  end
+  tb = vver_pb ulong f
+  tag = v_dec_u32le_pay tb 0
+  w = v_dec_u16le_pay tb 4
+  bl = v_dec_u16le_pay vver_pb idx 32
+  r = om_val_val_bytes tag w bl
+  if gt r 0
+    vver_sb_clear
+    vver_sb_t vver_e_vbl
+    vver_sb_u bl
+    vver_sb_t vver_e_vbl2
+    vver_sb_u w
+    vver_sb_t vver_e_vbl3
+    vver_sb_u ulong r
+    vver_sb_t vver_e_bytes
+    ret vver_err_from_sb
+  end
+  ret 0
+end
+
+fn vver_val_operation idx ulong to long
+  pl = get v_og_plen idx
+  pb = vver_pb idx
+  if ge pl 204
+    opc = v_dec_u32le_pay pb 0
+    r = om_val_op_fields opc v_dec_u32le_pay pb 4
+    if eq r 1
+      vver_sb_clear
+      vver_sb_t vver_e_opc
+      vver_sb_hex opc 2
+      ret vver_err_from_sb
+    end
+    if eq r 2
+      vver_sb_clear
+      vver_sb_t vver_e_ovf
+      ret vver_err_from_sb
+    end
+    ret 0
+  end
+  if lt pl 161
+    ret 0
+  end
+  vver_tmp_pay idx 0
+  if not vver_kind_is_l og_find_by_tmp V_KIND_OP
+    vver_sb_clear
+    vver_sb_t vver_e_aop
+    ret vver_err_from_sb
+  end
+  oc = vver_pay8 idx 32
+  for i ulong oc bound 256
+    vver_tmp_pay idx add 33 mul i 32
+    f = og_find_by_tmp
+    ok = false
+    if vver_kind_is_l f V_KIND_VALUE
+      ok = true
+    end
+    if vver_kind_is_l f V_KIND_OP
+      ok = true
+    end
+    if not ok
+      vver_sb_clear
+      vver_sb_t vver_e_aarg
+      vver_sb_u i
+      vver_sb_t vver_e_aarg2
+      ret vver_err_from_sb
+    end
+  end
+  ret 0
+end
+
+fn vver_validate_object idx ulong to long
+  k = get v_og_kind idx
+  if ne om_val_kind k 0
+    vver_sb_clear
+    vver_sb_t vver_e_kind
+    vver_sb_hex k 2
+    ret vver_err_from_sb
+  end
+  if lt vver_val_lists idx 0
+    ret -1
+  end
+  if eq k V_KIND_TYPE
+    ret vver_val_type idx
+  end
+  if eq k V_KIND_VALUE
+    ret vver_val_value idx
+  end
+  if eq k V_KIND_OP
+    ret vver_val_operation idx
+  end
+  if eq k V_KIND_EFFECT
+    ec = vver_eff_code idx
+    if ne ec 0
+      vver_sb_clear
+      vver_sb_t vver_e_eff
+      vver_sb_effmsg ec
+      vver_sb_t vver_e_eff2
+      vver_sb_u get v_og_plen idx
+      vver_sb_t vver_e_bytes
+      ret vver_err_from_sb
+    end
+  end
+  ret 0
+end
+
+note ---- omega_validate_graph ----
+note append (tag | j) for every object j whose id equals v_tmp_id, while the degree is < 128
+fn vver_edges_match base ulong tag ulong edges edit ushort 32768 dg ulong to ulong
+  d = dg
+  cnt = get v_og_cnt 0
+  for j ulong cnt bound 256
+    if ge d 128
+      break
+    end
+    if eq get v_og_has_id j 1
+      if og_id_eq_tmp j
+        put edges add base d ushort or tag j
+        d = add d 1
+      end
+    end
+  end
+  ret d
+end
+
+fn vver_edges_rels i ulong edges edit ushort 32768 to ulong
+  d = ulong 0
+  rc = get v_og_rcnt i
+  for ri ulong rc bound 64
+    if ge d 128
+      break
+    end
+    vver_tmp_rel og_rslot i ri
+    d = vver_edges_match mul i 128 0 edges d
+  end
+  ret d
+end
+
+fn vver_edges_ops i ulong edges edit ushort 32768 dg ulong to ulong
+  d = dg
+  if ne get v_og_kind i V_KIND_OP
+    ret d
+  end
+  if lt get v_og_plen i 161
+    ret d
+  end
+  oc = vver_pay8 i 32
+  for oi ulong oc bound 256
+    if ge d 128
+      break
+    end
+    vver_tmp_pay i add 33 mul oi 32
+    d = vver_edges_match mul i 128 512 edges d
+  end
+  ret d
+end
+
+fn vver_validate_graph to long
+  cnt = get v_og_cnt 0
+  r = om_val_graph_count cnt V_MAX_OBJS
+  if eq r 1
+    vver_sb_clear
+    vver_sb_t vver_e_gemp
+    ret vver_err_from_sb
+  end
+  if eq r 2
+    vver_sb_clear
+    vver_sb_t vver_e_gmax
+    vver_sb_u cnt
+    vver_sb_t vver_e_gmax2
+    ret vver_err_from_sb
+  end
+  for i ulong cnt bound 256
+    if lt vver_validate_object i 0
+      ret -1
+    end
+  end
+  edges = new ushort 32768 0
+  deg = new ushort 256 0
+  for i ulong cnt bound 256
+    d1 = vver_edges_rels i edges
+    d2 = vver_edges_ops i edges d1
+    put deg i ushort d2
+  end
+  info = new ulong 2 0
+  cy = om_val_find_cycle edges deg cnt info
+  if ne cy 0
+    vver_sb_clear
+    if eq get info 1 0
+      vver_sb_t vver_e_cyr
+    else
+      vver_sb_t vver_e_cyo
+    end
+    vver_sb_u get info 0
+    ret vver_err_from_sb
+  end
+  ret 0
+end
+
+note ---- realization ids ----
+fn vver_sha_ready to void
+  if eq get v_sha_k 0 0
+    sha_kinit
+  end
+end
+
+note omega_compute_realization_id: sha256("OMG_R0" profile semantic_id be32(code_len) code)
+fn vver_rid_r0 s ulong to void
+  vver_sha_ready
+  put v_sha_in 0 uchar 79
+  put v_sha_in 1 uchar 77
+  put v_sha_in 2 uchar 71
+  put v_sha_in 3 uchar 95
+  put v_sha_in 4 uchar 82
+  put v_sha_in 5 uchar 48
+  put v_sha_in 6 uchar and get vver_rprof s 255
+  sb = mul s 32
+  for i ulong 32
+    put v_sha_in add 7 i get vver_rsem add sb i
+  end
+  cl = get vver_rclen s
+  put v_sha_in 39 uchar and shr cl 24 255
+  put v_sha_in 40 uchar and shr cl 16 255
+  put v_sha_in 41 uchar and shr cl 8 255
+  put v_sha_in 42 uchar and cl 255
+  cb = mul s VVER_CB
+  for i ulong cl bound 4096
+    put v_sha_in add 43 i get vver_rcode add cb i
+  end
+  sha256_hash add 43 cl
+end
+
+note omega_realize_compute_triple_id: sha256("OMG0" 9 profile be32(entry) be32(len) sem machine code)
+fn vver_rid_triple s ulong to void
+  vver_sha_ready
+  put v_sha_in 0 uchar 79
+  put v_sha_in 1 uchar 77
+  put v_sha_in 2 uchar 71
+  put v_sha_in 3 uchar 48
+  put v_sha_in 4 uchar V_KIND_REALIZATION
+  put v_sha_in 5 uchar and get vver_rprof s 255
+  en = get vver_rent s
+  put v_sha_in 6 uchar and shr en 24 255
+  put v_sha_in 7 uchar and shr en 16 255
+  put v_sha_in 8 uchar and shr en 8 255
+  put v_sha_in 9 uchar and en 255
+  cl = get vver_rclen s
+  put v_sha_in 10 uchar and shr cl 24 255
+  put v_sha_in 11 uchar and shr cl 16 255
+  put v_sha_in 12 uchar and shr cl 8 255
+  put v_sha_in 13 uchar and cl 255
+  sb = mul s 32
+  for i ulong 32
+    put v_sha_in add 14 i get vver_rsem add sb i
+    put v_sha_in add 46 i get vver_rmid add sb i
+  end
+  cb = mul s VVER_CB
+  for i ulong cl bound 4096
+    put v_sha_in add 78 i get vver_rcode add cb i
+  end
+  sha256_hash add 78 cl
+end
+
+note omega_compute_realization_id on slot s: realization_id = R0 id, has_id = true; -1 when code_len > 4096
+fn vver_real_set_id s ulong to long
+  if gt get vver_rclen s VVER_CB
+    ret -1
+  end
+  vver_rid_r0 s
+  sb = mul s 32
+  for i ulong 32
+    put vver_rrid add sb i get v_sha_out i
+  end
+  put vver_rhid s 1
+  ret 0
+end
+
+fn vver_sha_eq_rid s ulong to bool
+  sb = mul s 32
+  for i ulong 32
+    if ne get v_sha_out i get vver_rrid add sb i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vver_rid_ok s ulong to bool
+  if gt get vver_rclen s VVER_CB
+    ret false
+  end
+  if ne get vver_rhm s 0
+    vver_rid_triple s
+  else
+    vver_rid_r0 s
+  end
+  ret vver_sha_eq_rid s
+end
+
+note ---- one tier run (VerifyReport) ----
+fn vver_vr_reset to void
+  put vver_vr_pass 0 1
+  put vver_vr_cnt 0 0
+  put vver_vr_fail 0 0
+  put vver_vr_dl 0 0
+end
+
+fn vver_vr_cnt_inc to void
+  put vver_vr_cnt 0 add get vver_vr_cnt 0 1
+end
+
+note fail with error_detail = the builder (char[512])
+fn vver_vr_failsb to long
+  put vver_vr_pass 0 0
+  put vver_vr_fail 0 add get vver_vr_fail 0 1
+  n = get vver_sbl 0
+  if gt n 511
+    n = 511
+  end
+  for i ulong n bound 512
+    put vver_vr_det i get vver_sb i
+  end
+  put vver_vr_dl 0 n
+  ret -1
+end
+
+note aarch64_validate_code_buffer on slot s (clen already in 4..4096): 0, or -1 with msg in vver_err
+fn vver_v0_code s ulong to long
+  cl = get vver_rclen s
+  code = new uchar 4096 0
+  cb = mul s VVER_CB
+  for i ulong cl bound 4096
+    put code i get vver_rcode add cb i
+  end
+  msg = new uchar 256 0
+  rv = a64validate code cl msg 256
+  if eq rv 0
+    ret 0
+  end
+  n = ulong 0
+  while lt n 255 bound 256
+    if eq get msg n 0
+      break
+    end
+    n = add n 1
+  end
+  for i ulong n bound 256
+    put vver_err i get msg i
+  end
+  put vver_el 0 n
+  ret -1
+end
+
+note omega_verify_v0_structural(graph if hasg, slot or NULL)
+fn vver_v0 hasg ulong slot long to long
+  vver_vr_reset
+  if ne hasg 0
+    vver_vr_cnt_inc
+    if lt vver_validate_graph 0
+      vver_sb_clear
+      vver_sb_t vver_v0_g
+      vver_sb_err 200
+      ret vver_vr_failsb
+    end
+    vver_vr_cnt_inc
+    if eq get v_og_cnt 0 0
+      vver_sb_clear
+      vver_sb_t vver_v0_ge
+      ret vver_vr_failsb
+    end
+  end
+  if lt slot 0
+    ret 0
+  end
+  s = ulong slot
+  pr = and get vver_rprof s 255
+  cl = get vver_rclen s
+  r = om_ver_v0_real pr cl VVER_CB get vver_rhid s
+  vver_vr_cnt_inc
+  if eq r 1
+    vver_sb_clear
+    vver_sb_t vver_v0_p
+    vver_sb_hex pr 2
+    ret vver_vr_failsb
+  end
+  vver_vr_cnt_inc
+  if eq r 2
+    vver_sb_clear
+    vver_sb_t vver_v0_b
+    vver_sb_u cl
+    vver_sb_t vver_v0_by
+    ret vver_vr_failsb
+  end
+  vver_vr_cnt_inc
+  if lt vver_v0_code s 0
+    vver_sb_clear
+    vver_sb_t vver_v0_i
+    vver_sb_err 200
+    ret vver_vr_failsb
+  end
+  vver_vr_cnt_inc
+  if eq r 3
+    vver_sb_clear
+    vver_sb_t vver_v0_m
+    ret vver_vr_failsb
+  end
+  if not vver_rid_ok s
+    vver_sb_clear
+    vver_sb_t vver_v0_c
+    ret vver_vr_failsb
+  end
+  ret 0
+end
+
+note ---- V1 execution: interpreter of the decoded subset (see the header note) ----
+fn vver_rd rg view ulong 32 r ulong to ulong
+  if ge r 31
+    ret 0
+  end
+  ret get rg r
+end
+
+note shifted operand: LSL 0, LSR 1, ASR 2, ROR 3 on a 32-bit (sf 0) or 64-bit value
+fn vver_shift v ulong ty ulong amt ulong sf ulong to ulong
+  m = ulong 18446744073709551615
+  wb = ulong 64
+  if eq sf 0
+    m = 4294967295
+    wb = 32
+  end
+  x = and v m
+  if eq amt 0
+    ret x
+  end
+  if eq ty 0
+    ret and shl x amt m
+  end
+  if eq ty 1
+    ret shr x amt
+  end
+  if eq ty 2
+    r = shr x amt
+    if eq and shr x sub wb 1 1 1
+      r = or r xor shr m amt m
+    end
+    ret r
+  end
+  ret and or shr x amt shl x sub wb amt m
+end
+
+fn vver_alu op ulong a ulong b ulong w ulong to ulong
+  if eq op 1
+    ret add a b
+  end
+  if eq op 2
+    ret sub a b
+  end
+  if eq op 3
+    p = mul a b
+    if eq and shr w 15 1 1
+      ret sub 0 p
+    end
+    ret p
+  end
+  if eq op 4
+    ret and a b
+  end
+  if eq op 5
+    ret or a b
+  end
+  ret xor a b
+end
+
+note one instruction: 0 executed, 1 RET, -3 not modelled
+fn vver_step w ulong d view ulong 9 rg edit ulong 32 to long
+  op = get d 0
+  sf = get d 1
+  rd = get d 2
+  res = ulong 0
+  if eq op 8
+    if ne get rg 31 0
+      ret -3
+    end
+    ret 1
+  end
+  if and ge op 1 le op 6
+    ty = and shr w 22 3
+    amt = and shr w 10 63
+    if and eq sf 0 ge amt 32
+      ret -3
+    end
+    if and eq ty 3 le op 2
+      ret -3
+    end
+    b = vver_rd rg get d 4
+    if ne op 3
+      b = vver_shift b ty amt sf
+    end
+    res = vver_alu op vver_rd rg get d 3 b w
+  else
+    if and ne op 7 ne op 13
+      ret -3
+    end
+    hw = get d 6
+    if and eq sf 0 ge hw 2
+      ret -3
+    end
+    sh = mul hw 16
+    res = shl get d 5 sh
+    if eq op 13
+      res = or and vver_rd rg rd xor shl ulong 65535 sh 18446744073709551615 res
+    end
+  end
+  if eq sf 0
+    res = and res 4294967295
+  end
+  if lt rd 31
+    put rg rd res
+    if eq rd 30
+      put rg 31 1
+    end
+  end
+  ret 0
+end
+
+fn vver_ld32 o ulong to ulong
+  x = ulong get vver_rcode add o 3
+  x = or shl x 8 ulong get vver_rcode add o 2
+  x = or shl x 8 ulong get vver_rcode add o 1
+  ret or shl x 8 ulong get vver_rcode o
+end
+
+note omega_exec_native_f3(slot, a, b, c): 0 with vver_xout = X0 at RET, else rc
+fn vver_exec s ulong a ulong b ulong c ulong to long
+  cl = get vver_rclen s
+  if or eq cl 0 gt cl VVER_CB
+    ret -1
+  end
+  rg = new ulong 32 0
+  put rg 0 a
+  put rg 1 b
+  put rg 2 c
+  d = new ulong 9 0
+  cb = mul s VVER_CB
+  n = div cl 4
+  for i ulong n bound 1024
+    o = add cb mul i 4
+    w = vver_ld32 o
+    if lt a64decode w d 0
+      ret -3
+    end
+    st = vver_step w d rg
+    if lt st 0
+      ret st
+    end
+    if eq st 1
+      put vver_xout 0 get rg 0
+      ret 0
+    end
+  end
+  ret -3
+end
+
+note V1 detail pieces: "Vector %zu (a=%lu, b=%lu, c=%lu"
+fn vver_sb_vec i ulong a ulong b ulong c ulong to void
+  vver_sb_u i
+  vver_sb_t vver_v1_a
+  vver_sb_u a
+  vver_sb_t vver_v1_b
+  vver_sb_u b
+  vver_sb_t vver_v1_c
+  vver_sb_u c
+end
+
+note omega_verify_v1_differential(graph, slot, vver_vec or NULL when ntrip 0, ntrip)
+fn vver_v1 s ulong ntrip ulong to long
+  put vver_v1mm 0 0
+  if lt vver_v0 1 long s 0
+    ret -1
+  end
+  count = ntrip
+  if eq ntrip 0
+    count = 7
+  end
+  dv = new ulong 3 0
+  for i ulong count bound 16
+    a = ulong 0
+    b = ulong 0
+    c = ulong 0
+    if gt ntrip 0
+      a = get vver_vec mul i 3
+      b = get vver_vec add mul i 3 1
+      c = get vver_vec add mul i 3 2
+    else
+      if ne om_ver_v1_defvec i dv 0
+        trap 6
+      end
+      a = get dv 0
+      b = get dv 1
+      c = get dv 2
+    end
+    ex = om_ver_v1_ref a b c
+    vver_vr_cnt_inc
+    rc = vver_exec s a b c
+    if ne rc 0
+      vver_sb_clear
+      vver_sb_t vver_v1_x
+      vver_sb_vec i a b c
+      vver_sb_t vver_v1_rc
+      vver_sb_d rc
+      ret vver_vr_failsb
+    end
+    ob = get vver_xout 0
+    if ne ob ex
+      vver_sb_clear
+      vver_sb_t vver_v1_mm
+      vver_sb_vec i a b c
+      vver_sb_t vver_v1_ex
+      vver_sb_u ex
+      vver_sb_t vver_v1_ob
+      vver_sb_u ob
+      put vver_v1mm 0 1
+      put vver_v1e 0 ex
+      put vver_v1o 0 ob
+      ret vver_vr_failsb
+    end
+  end
+  ret 0
+end
+
+note omega_verify_v2_properties
+fn vver_v2 to long
+  vver_vr_reset
+  info = new ulong 4 0
+  r = om_ver_v2_props info
+  if lt r 0
+    vver_sb_clear
+    vver_sb_t vver_v2_k
+    vver_sb_u get info 0
+    vver_sb_t vver_v2_op
+    vver_sb_hex get info 1 2
+    vver_sb_t vver_v2_l
+    vver_sb_u get info 2
+    vver_sb_t vver_v2_cm
+    vver_sb_u get info 3
+    vver_sb_t vver_v2_r
+    ret vver_vr_failsb
+  end
+  put vver_vr_cnt 0 ulong r
+  ret 0
+end
+
+note ---- rows ----
+fn vver_fails_or1 to ulong
+  f = get vver_vr_fail 0
+  if eq f 0
+    ret 1
+  end
+  ret f
+end
+
+note row FAIL with "%.250s" of the tier detail; note_violation(detail, object, expected, detail)
+note obj_src: 0 none, 1 v_tmp_id already staged by the caller
+fn vver_row_vrfail r ulong etxt view uchar * has_obj ulong to void
+  vver_sb_clear
+  vver_sb_vrdet 250
+  vver_row r 1 get vver_vr_cnt 0 vver_fails_or1
+  vver_sb_clear
+  vver_sb_vrdet 511
+  if vver_nv_open
+    if ne has_obj 0
+      vver_nv_obj
+    end
+    vver_sb_clear
+    vver_sb_t etxt
+    vver_nv_exp
+    vver_sb_clear
+    vver_sb_vrdet 511
+    vver_nv_obs
+  end
+end
+
+fn vver_invariants_row to void
+  if eq vver_v2 0
+    if ne get vver_vr_pass 0 0
+      vver_sb_clear
+      vver_sb_t vver_t_v2ok
+      vver_row 2 0 get vver_vr_cnt 0 get vver_vr_fail 0
+      ret
+    end
+  end
+  vver_row_vrfail 2 vver_t_v2h 0
+end
+
+fn vver_value_u64 to long
+  f = og_find_by_tmp
+  if not vver_kind_is_l f V_KIND_VALUE
+    ret -1
+  end
+  fi = ulong f
+  if lt get v_og_plen fi 98
+    ret -1
+  end
+  bl = v_dec_u16le_pay vver_pb fi 32
+  if or eq bl 0 gt bl 8
+    ret -1
+  end
+  v = ulong 0
+  for i ulong bl bound 8
+    v = or v shl vver_pay8 fi add 34 i mul i 8
+  end
+  put vver_vu 0 v
+  ret 0
+end
+
+fn vver_vec_put t ulong a ulong b ulong to void
+  put vver_vec mul t 3 a
+  put vver_vec add mul t 3 1 b
+  put vver_vec add mul t 3 2 0
+end
+
+note ADD model vectors: nine base pairs, then (a,b) and (b,a) of the subject apply's values
+fn vver_add_vectors oi ulong is_app bool to ulong
+  m = ulong 18446744073709551615
+  vver_vec_put 0 0 0
+  vver_vec_put 1 0 1
+  vver_vec_put 2 1 0
+  vver_vec_put 3 1 1
+  vver_vec_put 4 m 0
+  vver_vec_put 5 m 1
+  vver_vec_put 6 1 m
+  vver_vec_put 7 m m
+  vver_vec_put 8 7 11
+  if not is_app
+    ret 9
+  end
+  vver_tmp_pay oi 33
+  if lt vver_value_u64 0
+    ret 9
+  end
+  a = get vver_vu 0
+  vver_tmp_pay oi 65
+  if lt vver_value_u64 0
+    ret 9
+  end
+  b = get vver_vu 0
+  vver_vec_put 9 a b
+  vver_vec_put 10 b a
+  ret 11
+end
+
+note model of the realization target: 1 ADD, 2 SUB(ADD(a,b),c), 0 none (vver_istop/vver_topc for the message)
+fn vver_model s ulong to ulong
+  put vver_istop 0 0
+  vver_tmp_rsem s
+  t = og_find_by_tmp
+  if vver_as_op_l t
+    tu = ulong t
+    put vver_istop 0 1
+    put vver_topc 0 vver_opcode tu
+    if eq vver_opcode tu V_OP_ADD
+      ret 1
+    end
+    ret 0
+  end
+  if not vver_as_app_l t
+    ret 0
+  end
+  tu2 = ulong t
+  vver_tmp_pay tu2 0
+  outer = og_find_by_tmp
+  vver_tmp_pay tu2 33
+  inner = og_find_by_tmp
+  if not vver_as_op_l outer
+    ret 0
+  end
+  if ne vver_opcode ulong outer V_OP_SUB
+    ret 0
+  end
+  if not vver_as_app_l inner
+    ret 0
+  end
+  vver_tmp_pay ulong inner 0
+  iop = og_find_by_tmp
+  if not vver_as_op_l iop
+    ret 0
+  end
+  if eq vver_opcode ulong iop V_OP_ADD
+    ret 2
+  end
+  ret 0
+end
+
+fn vver_real_unbound oi ulong s ulong to void
+  vver_sb_clear
+  vver_sb_t vver_t_diff
+  vver_row 3 1 1 1
+  if vver_nv_open
+    vver_tmp_q
+    vver_nv_obj
+    vver_sb_clear
+    vver_sb_t vver_t_sha
+    vver_tmp_q
+    vver_sb_tmphex
+    vver_nv_exp
+    vver_sb_clear
+    vver_sb_t vver_t_sha
+    vver_tmp_rsem s
+    vver_sb_tmphex
+    vver_nv_obs
+  end
+end
+
+fn vver_real_notrun to void
+  cks = get vver_vr_cnt 0
+  vver_sb_clear
+  vver_sb_t vver_t_nr1
+  vver_sb_u cks
+  vver_sb_t vver_t_nr2
+  if ne get vver_istop 0 0
+    vver_sb_t vver_t_nr3
+    vver_sb_hex get vver_topc 0 2
+  else
+    vver_sb_t vver_t_nr4
+  end
+  vver_row 3 2 cks 0
+end
+
+fn vver_real_v1 s ulong model ulong ntrip ulong to void
+  rc = vver_v1 s ntrip
+  if eq rc 0
+    if ne get vver_vr_pass 0 0
+      vver_sb_clear
+      if eq model 1
+        vver_sb_t vver_t_madd
+      else
+        vver_sb_t vver_t_mfas
+      end
+      vver_sb_t vver_t_lp
+      vver_sb_u get vver_vr_cnt 0
+      vver_sb_t vver_t_v1ok
+      vver_row 3 0 get vver_vr_cnt 0 get vver_vr_fail 0
+      ret
+    end
+  end
+  vver_sb_clear
+  vver_sb_vrdet 250
+  vver_row 3 1 get vver_vr_cnt 0 vver_fails_or1
+  vver_sb_clear
+  vver_sb_vrdet 511
+  if vver_nv_open
+    vver_tmp_rsem s
+    vver_nv_obj
+    vver_sb_clear
+    if ne get vver_v1mm 0 0
+      vver_sb_u get vver_v1e 0
+    end
+    vver_nv_exp
+    vver_sb_clear
+    if ne get vver_v1mm 0 0
+      vver_sb_u get vver_v1o 0
+    end
+    vver_nv_obs
+  end
+end
+
+fn vver_realization_row oi ulong slot long to void
+  if lt slot 0
+    vver_sb_clear
+    vver_sb_t vver_t_nore
+    vver_row 3 2 0 0
+    ret
+  end
+  s = ulong slot
+  is_app = vver_as_app oi
+  bnd = vver_rsem_eq_q s
+  if is_app
+    if vver_rsem_eq_pay s oi 0
+      bnd = true
+    end
+  end
+  if not bnd
+    vver_real_unbound oi s
+    ret
+  end
+  model = vver_model s
+  ntrip = ulong 0
+  if eq model 1
+    ntrip = vver_add_vectors oi is_app
+  end
+  ok = false
+  if eq vver_v0 1 slot 0
+    if ne get vver_vr_pass 0 0
+      ok = true
+    end
+  end
+  if not ok
+    vver_tmp_rsem s
+    vver_row_vrfail 3 vver_t_rv0 1
+    ret
+  end
+  if eq model 0
+    vver_real_notrun
+    ret
+  end
+  vver_real_v1 s model ntrip
+end
+
+note ---- AUTHORITY: requirement walk (reports, never grants) ----
+fn vver_aw_try vis edit uchar 256 stk edit ulong 256 spa edit ulong 1 to void
+  if vver_tmp_zero
+    ret
+  end
+  f = og_find_by_tmp
+  if lt f 0
+    ret
+  end
+  fu = ulong f
+  if ne get vis fu 0
+    ret
+  end
+  sp = get spa 0
+  if ge sp 256
+    ret
+  end
+  put vis fu uchar 1
+  put stk sp fu
+  put spa 0 add sp 1
+end
+
+fn vver_aw_obj o ulong vis edit uchar 256 stk edit ulong 256 spa edit ulong 1 to void
+  k = get v_og_kind o
+  pl = get v_og_plen o
+  if eq k V_KIND_EFFECT
+    put vver_eff_cnt 0 add get vver_eff_cnt 0 1
+    if eq vver_eff_code o 0
+      vver_tmp_pay o 16
+      if not vver_tmp_zero
+        put vver_cap_cnt 0 add get vver_cap_cnt 0 1
+        vver_aw_try vis stk spa
+      end
+    end
+  else
+    if and eq k V_KIND_TYPE ge pl 44
+      tag = v_dec_u32le_pay vver_pb o 0
+      if or eq tag V_TY_CAP_REF or eq tag V_TY_EFF_INTENT_REF eq tag V_TY_EFF_RECEIPT_REF
+        put vver_cap_cnt 0 add get vver_cap_cnt 0 1
+      end
+      if eq tag V_TY_SEQ
+        vver_tmp_pay o 12
+        vver_aw_try vis stk spa
+      end
+    else
+      if and eq k V_KIND_VALUE ge pl 98
+        vver_tmp_pay o 0
+        vver_aw_try vis stk spa
+      else
+        if vver_as_op o
+          vver_tmp_pay o 8
+          vver_aw_try vis stk spa
+          vver_tmp_pay o 169
+          vver_aw_try vis stk spa
+          for i ulong 4
+            vver_tmp_pay o add 41 mul i 32
+            vver_aw_try vis stk spa
+          end
+        else
+          if vver_as_app o
+            vver_tmp_pay o 0
+            vver_aw_try vis stk spa
+            for i ulong 4
+              vver_tmp_pay o add 33 mul i 32
+              vver_aw_try vis stk spa
+            end
+          end
+        end
+      end
+    end
+  end
+  rc = get v_og_rcnt o
+  for r ulong rc bound 64
+    vver_tmp_rel og_rslot o r
+    vver_aw_try vis stk spa
+  end
+end
+
+fn vver_authority_row root ulong to void
+  put vver_eff_cnt 0 0
+  put vver_cap_cnt 0 0
+  vis = new uchar 256 0
+  stk = new ulong 256 0
+  spa = new ulong 1 0
+  put stk 0 root
+  put vis root uchar 1
+  put spa 0 1
+  walked = ulong 0
+  while gt get spa 0 0 bound 300
+    sp = sub get spa 0 1
+    put spa 0 sp
+    o = get stk sp
+    walked = add walked 1
+    vver_aw_obj o vis stk spa
+  end
+  eff = get vver_eff_cnt 0
+  cap = get vver_cap_cnt 0
+  vver_sb_clear
+  if gt add eff cap 0
+    put vver_auth_req 0 1
+    vver_sb_t vver_t_areq
+    vver_sb_u eff
+    vver_sb_t vver_t_aeff
+    vver_sb_u cap
+    vver_sb_t vver_t_acap
+  else
+    put vver_auth_req 0 0
+    vver_sb_t vver_t_anone
+    vver_sb_u walked
+    vver_sb_t vver_t_awalk
+  end
+  vver_row 4 0 walked 0
+end
+
+note ---- MACHINE ----
+fn vver_machine_fail_prof rp ulong mp ulong g ulong to void
+  vver_sb_clear
+  vver_sb_t vver_t_pm
+  vver_sb_t vver_t_rp
+  vver_sb_hex rp 2
+  vver_sb_t vver_t_vs
+  vver_sb_t vver_t_tp
+  vver_sb_hex mp 2
+  vver_sb_t vver_t_lp
+  vver_sb_mgname g 60
+  vver_sb_c 41
+  vver_row 5 1 1 1
+  vver_sb_clear
+  vver_sb_t vver_t_pmv
+  if vver_nv_open
+    vver_sb_clear
+    vver_sb_t vver_t_tp
+    vver_sb_hex mp 2
+    vver_sb_t vver_t_lp
+    vver_sb_mgname g 60
+    vver_sb_c 41
+    vver_nv_exp
+    vver_sb_clear
+    vver_sb_t vver_t_rp
+    vver_sb_hex rp 2
+    vver_nv_obs
+  end
+end
+
+fn vver_machine_fail_id s ulong g ulong to void
+  vver_sb_clear
+  vver_sb_t vver_t_mid
+  vver_row 5 1 2 1
+  if vver_nv_open
+    vver_sb_clear
+    vver_sb_t vver_t_sha
+    vver_tmp_mg g
+    vver_sb_tmphex
+    vver_nv_exp
+    vver_sb_clear
+    vver_sb_t vver_t_sha
+    vver_tmp_rmid s
+    vver_sb_tmphex
+    vver_nv_obs
+  end
+end
+
+fn vver_mid_eq s ulong g ulong to bool
+  sb = mul s 32
+  gb = mul g 32
+  for i ulong 32
+    if ne get vver_rmid add sb i get vmch_gid add gb i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vver_machine_row slot long mg long to void
+  if lt slot 0
+    vver_sb_clear
+    vver_sb_t vver_t_nore
+    vver_row 5 2 0 0
+    ret
+  end
+  if lt mg 0
+    vver_sb_clear
+    vver_sb_t vver_t_nomg
+    vver_row 5 2 0 0
+    ret
+  end
+  s = ulong slot
+  g = ulong mg
+  rp = and get vver_rprof s 255
+  mp = and vmch_gget g VMCH_K_PROF 255
+  if ne rp mp
+    vver_machine_fail_prof rp mp g
+    ret
+  end
+  checks = ulong 1
+  hm = ne get vver_rhm s 0
+  if hm
+    checks = 2
+    if not vver_mid_eq s g
+      vver_machine_fail_id s g
+      ret
+    end
+  end
+  vver_sb_clear
+  vver_sb_t vver_t_prof
+  vver_sb_hex rp 2
+  vver_sb_t vver_t_match
+  vver_sb_mgname g 60
+  if hm
+    vver_sb_t vver_t_mb
+  else
+    vver_sb_t vver_t_mnb
+  end
+  vver_row 5 0 checks 0
+end
+
+note ---- visor_verify_object ----
+fn vver_sb_kind oi ulong to void
+  if vver_as_app oi
+    vver_sb_t vver_k_app
+    ret
+  end
+  k = get v_og_kind oi
+  if eq k 1
+    vver_sb_t vver_k1
+    ret
+  end
+  if eq k 2
+    vver_sb_t vver_k2
+    ret
+  end
+  if eq k 3
+    vver_sb_t vver_k3
+    ret
+  end
+  if eq k 4
+    vver_sb_t vver_k4
+    ret
+  end
+  if eq k 5
+    vver_sb_t vver_k5
+    ret
+  end
+  if eq k 6
+    vver_sb_t vver_k6
+    ret
+  end
+  if eq k 7
+    vver_sb_t vver_k7
+    ret
+  end
+  if eq k 8
+    vver_sb_t vver_k8
+    ret
+  end
+  if eq k 9
+    vver_sb_t vver_k9
+    ret
+  end
+  if eq k 10
+    vver_sb_t vver_k10
+    ret
+  end
+  if eq k 11
+    vver_sb_t vver_k11
+    ret
+  end
+  vver_sb_t vver_k0
+end
+
+fn vver_structural_row to void
+  nore = long -1
+  if eq vver_v0 1 nore 0
+    if ne get vver_vr_pass 0 0
+      vver_sb_clear
+      vver_sb_t vver_t_v0ok
+      vver_sb_u get v_og_cnt 0
+      vver_sb_t vver_t_objs
+      vver_row 0 0 get vver_vr_cnt 0 get vver_vr_fail 0
+      ret
+    end
+  end
+  vver_row_vrfail 0 vver_t_gv0 0
+end
+
+fn vver_type_row oi ulong to void
+  if eq vver_validate_object oi 0
+    vver_sb_clear
+    vver_sb_kind oi
+    vver_sb_t vver_t_val
+    vver_row 1 0 1 0
+    ret
+  end
+  vver_sb_clear
+  vver_sb_err 250
+  vver_row 1 1 1 1
+  vver_sb_clear
+  vver_sb_err 255
+  if vver_nv_open
+    vver_tmp_q
+    vver_nv_obj
+    vver_sb_clear
+    vver_sb_t vver_t_oval
+    vver_nv_exp
+    vver_sb_clear
+    vver_sb_err 255
+    vver_nv_obs
+  end
+end
+
+note visor_verify_object(gok ? graph : NULL, vver_qid, slot or -1, machine slot or -1): 0 or -1
+fn vver_verify_object gok ulong slot long mg long to long
+  vver_reset
+  if or eq gok 0 gt get v_og_cnt 0 V_MAX_OBJS
+    vver_nv_plain vver_t_bad
+    ret -1
+  end
+  vver_tmp_q
+  f = og_find_by_tmp
+  if lt f 0
+    vver_sb_clear
+    vver_sb_t vver_t_abs
+    vver_row 0 1 1 1
+    if vver_nv_open
+      vver_tmp_q
+      vver_nv_obj
+      vver_sb_clear
+      vver_sb_t vver_t_pres
+      vver_nv_exp
+      vver_sb_clear
+      vver_sb_t vver_t_absent
+      vver_nv_obs
+    end
+    vver_finalize
+    ret 0
+  end
+  oi = ulong f
+  vver_structural_row
+  vver_type_row oi
+  vver_invariants_row
+  vver_realization_row oi slot
+  vver_authority_row oi
+  vver_machine_row slot mg
+  vver_finalize
+  ret 0
+end
+
+note ---- visor_verify_program ----
+fn vver_id_zero32 sel ulong to bool
+  for i ulong 32
+    b = ulong 0
+    if eq sel 0
+      b = ulong get vver_p_pre i
+    else
+      b = ulong get vver_p_post i
+    end
+    if ne b 0
+      ret false
+    end
+  end
+  ret true
+end
+
+note omega_program_validate_contract: 0, or -1 with the message in vver_err
+fn vver_contract to long
+  vver_sb_clear
+  if eq get vver_p_itag 0 0
+    vver_sb_t vver_t_pin
+    ret vver_err_from_sb
+  end
+  if eq get vver_p_otag 0 0
+    vver_sb_t vver_t_pout
+    ret vver_err_from_sb
+  end
+  if or eq get vver_p_iw 0 0 eq get vver_p_ow 0 0
+    vver_sb_t vver_t_p0w
+    ret vver_err_from_sb
+  end
+  if or vver_id_zero32 0 vver_id_zero32 1
+    vver_sb_t vver_t_pcid
+    ret vver_err_from_sb
+  end
+  ret 0
+end
+
+fn vver_prog_struct_row to void
+  s = get vver_p_slot 0
+  if eq vver_v0 0 long s 0
+    if ne get vver_vr_pass 0 0
+      vver_sb_clear
+      vver_sb_t vver_t_pv0
+      vver_sb_u get vver_rclen s
+      vver_sb_t vver_e_bytes
+      vver_row 0 0 get vver_vr_cnt 0 get vver_vr_fail 0
+      ret
+    end
+  end
+  vver_tmp_pid
+  vver_row_vrfail 0 vver_t_rv0 1
+end
+
+fn vver_prog_type_row to void
+  if eq vver_contract 0
+    vver_sb_clear
+    vver_sb_t vver_t_pc1
+    n = get vver_p_ptl 0
+    if gt n 60
+      n = 60
+    end
+    for i ulong n bound 64
+      vver_sb_c ulong get vver_p_pt i
+    end
+    vver_sb_t vver_t_pc2
+    m = get vver_p_qtl 0
+    if gt m 60
+      m = 60
+    end
+    for i ulong m bound 64
+      vver_sb_c ulong get vver_p_qt i
+    end
+    vver_sb_t vver_t_pc3
+    vver_row 1 0 1 0
+    ret
+  end
+  vver_sb_clear
+  vver_sb_err 250
+  vver_row 1 1 1 1
+  vver_sb_clear
+  vver_sb_err 255
+  if vver_nv_open
+    vver_tmp_pid
+    vver_nv_obj
+    vver_sb_clear
+    vver_sb_t vver_t_pcv
+    vver_nv_exp
+    vver_sb_clear
+    vver_sb_err 255
+    vver_nv_obs
+  end
+end
+
+note visor_verify_program(has_p ? &vver_p : NULL). A program never carries a semantic
+note graph (OmegaProgram.graph is only ever NULL in C), so AUTHORITY is NOT_RUN.
+fn vver_verify_program has_p ulong to long
+  vver_reset
+  if eq has_p 0
+    vver_nv_plain vver_t_badp
+    ret -1
+  end
+  if eq get vver_p_real 0 0
+    vver_sb_clear
+    vver_sb_t vver_t_punr
+    vver_row 0 1 1 1
+    vver_sb_clear
+    vver_sb_t vver_t_punv
+    if vver_nv_open
+      vver_tmp_pid
+      vver_nv_obj
+      vver_sb_clear
+      vver_sb_t vver_t_prz
+      vver_nv_exp
+      vver_sb_clear
+      vver_sb_t vver_t_pnrz
+      vver_nv_obs
+    end
+    vver_finalize
+    ret 0
+  end
+  vver_prog_struct_row
+  vver_prog_type_row
+  vver_invariants_row
+  vver_sb_clear
+  vver_sb_t vver_t_prl
+  vver_row 3 2 0 0
+  vver_sb_clear
+  vver_sb_t vver_t_pau
+  vver_row 4 2 0 0
+  vver_sb_clear
+  vver_sb_t vver_t_nomg
+  vver_row 5 2 0 0
+  vver_finalize
+  ret 0
+end
+
+note ---- rendering (VBuf: output of n bytes must leave room for the NUL) ----
+fn vver_put_status st ulong to void
   if eq st 0
     ob_puts vver_s_pass
     ret
@@ -248,89 +2227,272 @@ fn vver_put_st st ulong to void
   ob_puts vver_s_nr
 end
 
-fn vver_format_text cap ulong to long
-  ob_reset cap
-  ob_puts vver_f0
-  vver_put_st get vver_st 0
-  ob_puts vver_f1
-  vver_put_st get vver_st 1
-  ob_puts vver_f2
-  vver_put_st get vver_st 2
-  ob_puts vver_f3
-  vver_put_st get vver_st 3
-  ob_puts vver_f4
-  vver_put_st get vver_st 4
-  if ne get vver_auth_req 0 0
-    ob_puts vver_fa1
-  else
-    ob_puts vver_fa0
+fn vver_status_len st ulong to ulong
+  if eq st 2
+    ret 7
   end
-  ob_puts vver_f5
-  vver_put_st get vver_st 5
-  ob_puts vver_fv
-  if ne get vver_passed 0 0
-    ob_puts vver_fvp
-  else
-    ob_puts vver_fvf
-    vl = get vver_vlen 0
-    for i ulong vl bound 256
+  ret 4
+end
+
+fn vver_row_name r ulong to ulong
+  if eq r 0
+    ob_puts vver_n0
+    ret 10
+  end
+  if eq r 1
+    ob_puts vver_n1
+    ret 4
+  end
+  if eq r 2
+    ob_puts vver_n2
+    ret 10
+  end
+  if eq r 3
+    ob_puts vver_n3
+    ret 11
+  end
+  if eq r 4
+    ob_puts vver_n4
+    ret 9
+  end
+  ob_puts vver_n5
+  ret 7
+end
+
+fn vver_pad have ulong want ulong to void
+  k = have
+  while lt k want bound 64
+    ob_putc uchar 32
+    k = add k 1
+  end
+end
+
+fn vver_put_line t view uchar * src ulong to void
+  ob_puts t
+  if eq src 0
+    n = get vver_vlen 0
+    for i ulong n bound 256
       ob_putc get vver_viol i
     end
-    ob_putc uchar 10
   end
+  if eq src 1
+    n1 = get vver_olen 0
+    for i ulong n1 bound 72
+      ob_putc get vver_obj i
+    end
+  end
+  if eq src 2
+    n2 = get vver_elen 0
+    for i ulong n2 bound 128
+      ob_putc get vver_exp i
+    end
+  end
+  if eq src 3
+    n3 = get vver_oblen 0
+    for i ulong n3 bound 128
+      ob_putc get vver_obs i
+    end
+  end
+  ob_putc uchar 10
+end
+
+fn vver_ob_result to long
   if ne get v_ob_ovf 0 0
     ret -1
   end
   ret long get v_ob_len 0
 end
 
-fn vver_format_json cap ulong to long
-  ob_reset cap
-  ob_puts vver_j1
-  if ne get vver_passed 0 0
-    ob_puts vver_j_t
-  else
-    ob_puts vver_j_f
-  end
-  ob_puts vver_j2
-  vver_put_st get vver_st 0
-  ob_puts vver_j3
-  vver_put_st get vver_st 1
-  ob_puts vver_j4
-  vver_put_st get vver_st 2
-  ob_puts vver_j5
-  vver_put_st get vver_st 3
-  ob_puts vver_j6
-  vver_put_st get vver_st 4
-  if ne get vver_auth_req 0 0
-    ob_puts vver_ja1
-  else
-    ob_puts vver_ja0
-  end
-  vver_put_st get vver_st 5
-  ob_puts vver_j7
-  if ne get vver_auth_req 0 0
-    ob_puts vver_j_t
-  else
-    ob_puts vver_j_f
-  end
-  ob_puts vver_j8
-  ob_put_u64 get vver_eff_cnt 0
-  ob_puts vver_j9
-  ob_put_u64 get vver_cap_cnt 0
-  ob_puts vver_j10
-  if eq get vver_vlen 0 0
-    ob_puts vver_jnull
-  else
-    vl = get vver_vlen 0
-    for i ulong vl bound 256
-      put v_sbuf i get vver_viol i
-    end
-    ob_put_json_sbuf vl
-    ob_puts vver_jend
-  end
-  if ne get v_ob_ovf 0 0
+note visor_verify_format_text(report, buf, n): length, or -1 (n 0 or overflow)
+fn vver_format_text n ulong to long
+  if eq n 0
     ret -1
   end
-  ret long get v_ob_len 0
+  ob_reset sub n 1
+  for r ulong 6
+    nl = vver_row_name r
+    vver_pad nl 16
+    st = get vver_st r
+    vver_put_status st
+    vver_pad vver_status_len st 8
+    ob_putc uchar 32
+    dl = get vver_dl r
+    db = mul r 256
+    for i ulong dl bound 256
+      ob_putc get vver_det add db i
+    end
+    ob_putc uchar 10
+  end
+  ob_puts vver_n_vd
+  vver_pad 7 16
+  if ne get vver_passed 0 0
+    ob_puts vver_s_pass
+  else
+    ob_puts vver_s_fail
+  end
+  ob_putc uchar 10
+  if eq get vver_passed 0 0
+    if gt get vver_vlen 0 0
+      vver_put_line vver_f_fv 0
+      if gt get vver_olen 0 0
+        vver_put_line vver_f_obj 1
+      end
+      if gt get vver_elen 0 0
+        vver_put_line vver_f_exp 2
+      end
+      if gt get vver_oblen 0 0
+        vver_put_line vver_f_obs 3
+      end
+    end
+  end
+  ret vver_ob_result
+end
+
+note vb_json_str byte: \" \\ \n, other control bytes as \u00XX, everything else raw
+fn vver_jc c ulong to void
+  if or eq c 34 eq c 92
+    ob_putc uchar 92
+    ob_putc uchar c
+    ret
+  end
+  if eq c 10
+    ob_putc uchar 92
+    ob_putc uchar 110
+    ret
+  end
+  if lt c 32
+    ob_putc uchar 92
+    ob_putc uchar 117
+    ob_putc uchar 48
+    ob_putc uchar 48
+    ob_putc get vt_hex shr c 4
+    ob_putc get vt_hex and c 15
+    ret
+  end
+  ob_putc uchar c
+end
+
+fn vver_jtxt t view uchar * to void
+  ob_putc uchar 34
+  n = len t
+  for i ulong n bound 256
+    vver_jc ulong get t i
+  end
+  ob_putc uchar 34
+end
+
+note json string of a report field: 0 violation, 1 object, 2 expected, 3 observed, 4+r row r detail
+fn vver_jfield src ulong to void
+  ob_putc uchar 34
+  if eq src 0
+    n = get vver_vlen 0
+    for i ulong n bound 256
+      vver_jc ulong get vver_viol i
+    end
+  end
+  if eq src 1
+    n1 = get vver_olen 0
+    for i ulong n1 bound 72
+      vver_jc ulong get vver_obj i
+    end
+  end
+  if eq src 2
+    n2 = get vver_elen 0
+    for i ulong n2 bound 128
+      vver_jc ulong get vver_exp i
+    end
+  end
+  if eq src 3
+    n3 = get vver_oblen 0
+    for i ulong n3 bound 128
+      vver_jc ulong get vver_obs i
+    end
+  end
+  if ge src 4
+    r = sub src 4
+    dl = get vver_dl r
+    db = mul r 256
+    for i ulong dl bound 256
+      vver_jc ulong get vver_det add db i
+    end
+  end
+  ob_putc uchar 34
+end
+
+fn vver_jbool b ulong to void
+  if ne b 0
+    ob_puts vver_j_t
+  else
+    ob_puts vver_j_f
+  end
+end
+
+fn vver_jrow_name r ulong to void
+  if eq r 0
+    vver_jtxt vver_n0
+  end
+  if eq r 1
+    vver_jtxt vver_n1
+  end
+  if eq r 2
+    vver_jtxt vver_n2
+  end
+  if eq r 3
+    vver_jtxt vver_n3
+  end
+  if eq r 4
+    vver_jtxt vver_n4
+  end
+  if eq r 5
+    vver_jtxt vver_n5
+  end
+end
+
+note visor_verify_format_json(report, buf, n): length, or -1
+fn vver_format_json n ulong to long
+  if eq n 0
+    ret -1
+  end
+  ob_reset sub n 1
+  ob_puts vver_j_p
+  vver_jbool get vver_passed 0
+  ob_puts vver_j_rows
+  for r ulong 6
+    if gt r 0
+      ob_putc uchar 44
+    end
+    ob_puts vver_j_name
+    vver_jrow_name r
+    ob_puts vver_j_st
+    vver_put_status get vver_st r
+    ob_puts vver_j_ck
+    ob_put_u64 get vver_chk r
+    ob_puts vver_j_fl
+    ob_put_u64 get vver_fl r
+    ob_puts vver_j_det
+    vver_jfield add 4 r
+    ob_putc uchar 125
+  end
+  ob_puts vver_j_auth
+  vver_jbool get vver_auth_req 0
+  ob_puts vver_j_eff
+  ob_put_u64 get vver_eff_cnt 0
+  ob_puts vver_j_cap
+  ob_put_u64 get vver_cap_cnt 0
+  ob_puts vver_j_gr
+  if gt get vver_vlen 0 0
+    ob_puts vver_j_fail
+    vver_jfield 0
+    ob_puts vver_j_fo
+    vver_jfield 1
+    ob_puts vver_j_fe
+    vver_jfield 2
+    ob_puts vver_j_fob
+    vver_jfield 3
+    ob_putc uchar 125
+  else
+    ob_puts vver_j_null
+  end
+  ob_putc uchar 125
+  ret vver_ob_result
 end

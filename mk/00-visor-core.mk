@@ -17,7 +17,7 @@ OMEGA_BIN = $(OUT_DIR)/omega
 # Seeded compiler for the pure OM-2 Visor lane tests.
 VISOR_OMC ?= seed/out/omc
 # Pure OM-2 units shared with the C bridge (om/units.sh); their `export fn` is a plain fn here.
-VISOR_OM_UNITS = om/aarch64/aarch64_om2.om om/visor/verify_om2.om
+VISOR_OM_UNITS = om/aarch64/aarch64_om2.om om/visor/verify_om2.om om/visor/validate_om2.om
 OMEGA_OM_SRCS = src/visor/visor.om $(VISOR_OM_UNITS) \
 	src/language/omega_lex.om src/language/omega_parse.om src/language/omega_lower.om \
 	src/visor/visor_semantic.om src/visor/visor_machine.om src/visor/visor_program.om \
