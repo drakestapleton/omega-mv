@@ -1,0 +1,937 @@
+note SPDX-License-Identifier: Apache-2.0
+note qrecord_dump.om -- the pure OM-2 side of tests/turing/qrecord_parity.sh. Reads the corpus
+note of record and sidecar commands on stdin (the language is described in qrecord_parity.sh),
+note drives the SHIPPED src/turing/ty_qrecord.om (composed after src/turing/ty_core_lib.om,
+note as mk/turing_qrecord.mk joins them) and prints, line for line, what the retired C reference
+note dumper printed from src/turing/ty_qrecord.c at main 3f2c70dc5 (the committed goldens in
+note tests/turing/qrecord_golden).
+note Registers r (0..15) are g_dig slots 100..115; g_dig slot 120 is this dumper's scratch.
+
+global qd_in uchar 4194304
+global qd_ob uchar 65536
+global qd_on ulong 1
+global qd_d uchar 24
+global qd_p ulong 1
+global qd_e ulong 1
+global qd_hb uchar 1100
+global qd_ml ulong 1
+global qd_last uchar 1024
+global qd_lastn ulong 1
+global qd_have ulong 1
+
+text qd_t_q "? "
+text qd_t_nofile "nofile"
+text qd_t_nodir "qr_nodir"
+text qd_t_w "qr_w"
+text qd_t_x "x"
+
+fn qd_flush to void
+  n = get qd_on 0
+  if gt n 0
+    k = write 1 qd_ob 0 n
+  end
+  put qd_on 0 0
+end
+
+fn qd_c c ulong to void
+  n = get qd_on 0
+  if ge n 65000
+    qd_flush
+    n = 0
+  end
+  put qd_ob n uchar c
+  put qd_on 0 add n 1
+end
+
+fn qd_t s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    qd_c ulong get s i
+  end
+end
+
+fn qd_u v ulong to void
+  k = ulong 0
+  x = v
+  while gt x 9 bound 24
+    put qd_d k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  put qd_d k uchar add 48 x
+  k = add k 1
+  while gt k 0 bound 24
+    k = sub k 1
+    qd_c ulong get qd_d k
+  end
+end
+
+fn qd_i v long to void
+  if lt v 0
+    qd_c 45
+    m = add ulong sub 0 add v 1 1
+    qd_u m
+  else
+    qd_u ulong v
+  end
+end
+
+fn qd_hx b ulong to void
+  qd_c ulong get t_hx shr b 4
+  qd_c ulong get t_hx and b 15
+end
+
+fn qd_dig slot ulong to void
+  o = mul slot 32
+  for i ulong 32
+    qd_hx ulong get g_dig add o i
+  end
+end
+
+fn qd_sp to void
+  qd_c 32
+end
+
+fn qd_nl to void
+  qd_c 10
+end
+
+note ---- line tokenizer over qd_in[qd_p..qd_e) ----
+fn qd_skip to void
+  p = get qd_p 0
+  e = get qd_e 0
+  while and lt p e eq get qd_in p 32 bound 20000
+    p = add p 1
+  end
+  put qd_p 0 p
+end
+
+fn qd_num to ulong
+  qd_skip
+  p = get qd_p 0
+  e = get qd_e 0
+  v = ulong 0
+  while lt p e bound 32
+    d = ulong get qd_in p
+    if or lt d 48 gt d 57
+      break
+    end
+    v = add mul v 10 sub d 48
+    p = add p 1
+  end
+  put qd_p 0 p
+  ret v
+end
+
+fn qd_inum to long
+  qd_skip
+  p = get qd_p 0
+  e = get qd_e 0
+  isneg = false
+  if lt p e
+    if eq get qd_in p 45
+      isneg = true
+      p = add p 1
+    end
+  end
+  v = long 0
+  while lt p e bound 32
+    d = ulong get qd_in p
+    if or lt d 48 gt d 57
+      break
+    end
+    dv = long sub d 48
+    if isneg
+      v = sub mul v 10 dv
+    else
+      v = add mul v 10 dv
+    end
+    p = add p 1
+  end
+  put qd_p 0 p
+  ret v
+end
+
+fn qd_hv c ulong to long
+  if and ge c 48 le c 57
+    ret long sub c 48
+  end
+  if and ge c 97 le c 102
+    ret long sub c 87
+  end
+  ret -1
+end
+
+note hex token ("." = empty) into qd_hb; returns the byte count, or -1
+fn qd_hex cap ulong to long
+  qd_skip
+  p = get qd_p 0
+  e = get qd_e 0
+  s = p
+  while and lt p e ne get qd_in p 32 bound 20000
+    p = add p 1
+  end
+  put qd_p 0 p
+  n = sub p s
+  if eq n 1
+    if eq get qd_in s 46
+      ret 0
+    end
+  end
+  if ne rem n 2 0
+    ret -1
+  end
+  if gt div n 2 cap
+    ret -1
+  end
+  m = div n 2
+  for i ulong m bound 1100
+    q = add s mul i 2
+    a = qd_hv ulong get qd_in q
+    if lt a 0
+      ret -1
+    end
+    b = qd_hv ulong get qd_in add q 1
+    if lt b 0
+      ret -1
+    end
+    hv = add mul ulong a 16 ulong b
+    put qd_hb i uchar hv
+  end
+  ret long m
+end
+
+note ---- record storage ----
+fn qd_scount k ulong to ulong
+  if eq k 0
+    ret 12
+  end
+  if eq k 1
+    ret 6
+  end
+  if eq k 2
+    ret 11
+  end
+  if eq k 3
+    ret 9
+  end
+  if eq k 4
+    ret 1
+  end
+  ret 0
+end
+
+fn qd_sput k ulong o ulong v uchar to void
+  if eq k 0
+    put g_qp_s o v
+    ret
+  end
+  if eq k 1
+    put g_qw_s o v
+    ret
+  end
+  if eq k 2
+    put g_qf_s o v
+    ret
+  end
+  if eq k 3
+    put g_qg_s o v
+    ret
+  end
+  put g_qf_rc o v
+end
+
+fn qd_setstr k ulong i ulong n ulong from_in ulong to void
+  if ge i qd_scount k
+    ret
+  end
+  cap = TYQR_VAL
+  if eq k 4
+    cap = 41
+  end
+  if gt n cap
+    ret
+  end
+  off = mul i TYQR_VAL
+  if eq k 4
+    off = 0
+  end
+  for j ulong cap bound 513
+    qd_sput k add off j uchar 0
+  end
+  for j ulong n bound 513
+    if eq from_in 0
+      qd_sput k add off j get qd_hb j
+    else
+      qd_sput k add off j get qd_in add from_in j
+    end
+  end
+end
+
+fn qd_dcount k ulong to ulong
+  if eq k 0
+    ret 4
+  end
+  if eq k 1
+    ret 4
+  end
+  if eq k 2
+    ret 14
+  end
+  if eq k 3
+    ret 7
+  end
+  ret 0
+end
+
+fn qd_setu k ulong i ulong v ulong to void
+  if eq k 0
+    if lt i 4
+      put g_qp_u i v
+    end
+    ret
+  end
+  if eq k 1
+    if lt i 3
+      put g_qw_u i v
+    end
+    ret
+  end
+  if eq k 2
+    if lt i 2
+      put g_qf_u i v
+    end
+    ret
+  end
+  if eq k 3
+    if lt i 9
+      put g_qg_u i v
+    end
+  end
+end
+
+fn qd_seti k ulong i ulong v long to void
+  if eq k 0
+    if lt i 2
+      put g_qp_i i v
+    end
+    ret
+  end
+  if eq k 3
+    if lt i 14
+      put g_qg_i i v
+    end
+  end
+end
+
+fn qd_reg r ulong to ulong
+  ret add 100 and r 15
+end
+
+fn qd_digest k ulong slot ulong to long
+  if eq k 0
+    ret tyqr_profile_digest slot
+  end
+  if eq k 1
+    ret tyqr_world_digest slot
+  end
+  if eq k 2
+    ret tyqr_freeze_digest slot
+  end
+  ret tyqr_gain_digest slot
+end
+
+fn qd_verify k ulong slot ulong to long
+  if eq k 0
+    ret tyqr_profile_verify slot
+  end
+  if eq k 1
+    ret tyqr_world_verify slot
+  end
+  if eq k 2
+    ret tyqr_freeze_verify slot
+  end
+  ret tyqr_gain_verify slot
+end
+
+fn qd_fv k ulong r ulong to long
+  if eq k 0
+    ret tyqr_file_verify_gp t_qr_dom_prof r
+  end
+  if eq k 1
+    ret tyqr_file_verify_gp t_qr_dom_world r
+  end
+  if eq k 2
+    ret tyqr_file_verify_gp t_qr_dom_freeze r
+  end
+  if eq k 3
+    ret tyqr_file_verify_gp t_qr_dom_gain r
+  end
+  ret tyqr_file_verify_gp qd_t_x r
+end
+
+fn qd_rd32 st view uchar * o ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    v = or v shl ulong get st add o i mul i 8
+  end
+  ret v
+end
+
+note ---- commands ----
+fn qd_cmd_g to void
+  k = qd_num
+  r = qd_reg qd_num
+  rc = qd_digest k r
+  qd_c 71
+  qd_sp
+  qd_u k
+  qd_sp
+  qd_i rc
+  if eq rc 0
+    qd_sp
+    qd_dig r
+  else
+    dg_zero r
+  end
+  qd_nl
+end
+
+fn qd_w_tail r ulong to void
+  qd_sp
+  qd_dig r
+  pl = get g_qr_wplen 0
+  qd_sp
+  qd_u pl
+  qd_sp
+  for i ulong pl bound 1024
+    put qd_last i get g_qr_wpath i
+  end
+  put qd_lastn 0 pl
+  put qd_have 0 1
+  lp = new uchar 1024 0
+  for i ulong pl bound 1024
+    put lp i get qd_last i
+  end
+  gp_set lp pl
+  if eq ty_file_sha256_gp 120 0
+    qd_dig 120
+  else
+    qd_t qd_t_nofile
+  end
+  st = new uchar 128 0
+  sr = stat qd_last 0 pl st 0 128
+  qd_sp
+  if eq sr 0
+    qd_u and qd_rd32 st 16 511
+  else
+    qd_t qd_t_nofile
+  end
+end
+
+fn qd_cmd_w to void
+  k = qd_num
+  r = qd_reg qd_num
+  n = qd_num
+  dir = new uchar 1100 0
+  dl = ulong 0
+  if eq n 0
+    dl = len qd_t_nodir
+    for i ulong dl bound 16
+      put dir i get qd_t_nodir i
+    end
+  else
+    for i ulong 4
+      put dir i get qd_t_w i
+    end
+    dl = 4
+    while le add dl 2 n bound 1100
+      put dir dl uchar 47
+      put dir add dl 1 uchar 46
+      dl = add dl 2
+    end
+    if lt dl n
+      put dir dl uchar 47
+      dl = add dl 1
+    end
+  end
+  rc = long 0
+  if eq k 0
+    rc = tyqr_profile_write dir dl r
+  end
+  if eq k 1
+    rc = tyqr_world_write dir dl r
+  end
+  if eq k 2
+    rc = tyqr_freeze_write dir dl r
+  end
+  if eq k 3
+    rc = tyqr_gain_write dir dl r
+  end
+  qd_c 87
+  qd_sp
+  qd_u k
+  qd_sp
+  qd_i rc
+  if or eq rc 0 eq rc TYQR_E_EXISTS
+    qd_w_tail r
+  end
+  qd_nl
+end
+
+fn qd_bufline s ulong to void
+  n = get qd_ml 0
+  qd_u n
+  qd_sp
+  for i ulong n bound 8192
+    c = ulong get g_qr_mbuf i
+    if eq c 10
+      qd_c 124
+    else
+      qd_c c
+    end
+  end
+end
+
+fn qd_cmd_b2 isrep bool to void
+  n = qd_num
+  cap = qd_num
+  rc = long 0
+  if isrep
+    rc = tyqr_repman_build n cap
+    qd_c 82
+  else
+    rc = tyqr_devman_build n cap
+    qd_c 68
+  end
+  if eq rc 0
+    put qd_ml 0 get g_qr_mlen 0
+  else
+    put qd_ml 0 0
+  end
+  qd_c 66
+  qd_sp
+  qd_i rc
+  qd_sp
+  qd_bufline 0
+  qd_nl
+end
+
+fn qd_cmd_rp to void
+  cap = qd_num
+  rc = tyqr_repman_parse get qd_ml 0 cap
+  qd_c 82
+  qd_c 80
+  qd_sp
+  qd_i rc
+  if eq rc 0
+    n = get g_qr_rep_n 0
+    qd_sp
+    qd_u n
+    for i ulong n bound 64
+      qd_sp
+      qd_u get g_qr_rep_u i
+      qd_c 61
+      for j ulong 32
+        qd_hx ulong get g_qr_rep_d add mul i 32 j
+      end
+    end
+  end
+  qd_nl
+end
+
+fn qd_cmd_dp to void
+  cap = qd_num
+  rc = tyqr_devman_parse get qd_ml 0 cap
+  qd_c 68
+  qd_c 80
+  qd_sp
+  qd_i rc
+  if eq rc 0
+    n = get g_qr_dev_n 0
+    qd_sp
+    qd_u n
+    for i ulong n bound 64
+      qd_sp
+      co = mul i TYQR_CELL_MAX
+      for j ulong TYQR_CELL_MAX
+        c = ulong get g_qr_dev_c add co j
+        if eq c 0
+          break
+        end
+        qd_c c
+      end
+      qd_c 47
+      qd_u get g_qr_dev_b i
+      qd_c 61
+      for j ulong 32
+        qd_hx ulong get g_qr_dev_d add mul i 32 j
+      end
+    end
+  end
+  qd_nl
+end
+
+fn qd_mput c uchar to void
+  n = get qd_ml 0
+  if lt n 8192
+    put g_qr_mbuf n c
+    put qd_ml 0 add n 1
+  end
+end
+
+fn qd_cmd_re to void
+  j = qd_num
+  rep = qd_num
+  r = qd_reg qd_num
+  if lt j 64
+    put g_qr_rep_u j rep
+    for b ulong 32
+      v = get g_dig add mul r 32 b
+      put g_qr_rep_d add mul j 32 b v
+    end
+  end
+end
+
+fn qd_cmd_de to void
+  j = qd_num
+  blk = qd_num
+  r = qd_reg qd_num
+  n = qd_hex TYQR_CELL_MAX
+  if lt j 64
+    if ge n 0
+      co = mul j TYQR_CELL_MAX
+      for b ulong TYQR_CELL_MAX
+        put g_qr_dev_c add co b uchar 0
+      end
+      for b ulong ulong n bound 128
+        put g_qr_dev_c add co b get qd_hb b
+      end
+    end
+    put g_qr_dev_b j blk
+    for b ulong 32
+      v = get g_dig add mul r 32 b
+      put g_qr_dev_d add mul j 32 b v
+    end
+  end
+end
+
+fn qd_cmd_sd to void
+  r = qd_reg qd_num
+  tyqr_sidecar_digest get qd_ml 0 r
+  qd_c 83
+  qd_c 68
+  qd_sp
+  qd_dig r
+  qd_nl
+end
+
+fn qd_cmd_y to void
+  lp = new uchar 1024 0
+  k = qd_num
+  r = qd_reg qd_num
+  rc = long -999
+  if ne get qd_have 0 0
+    ln = get qd_lastn 0
+    for j ulong ln bound 1024
+      put lp j get qd_last j
+    end
+    gp_set lp ln
+    rc = qd_fv k r
+  end
+  qd_c 89
+  qd_sp
+  qd_i rc
+  qd_nl
+end
+
+fn qd_cmd_yn to void
+  nm = new uchar 1024 0
+  e = get qd_e 0
+  qd_skip
+  p2 = get qd_p 0
+  st = p2
+  while and lt p2 e ne get qd_in p2 32 bound 2000
+    p2 = add p2 1
+  end
+  nl = sub p2 st
+  for j ulong nl bound 1024
+    put nm j get qd_in add st j
+  end
+  put qd_p 0 p2
+  k = qd_num
+  r = qd_reg qd_num
+  gp_set nm nl
+  rc = qd_fv k r
+  qd_c 89
+  qd_c 78
+  qd_sp
+  qd_i rc
+  qd_nl
+end
+
+fn qd_line s ulong e ulong to void
+  c0 = ulong get qd_in s
+  c1 = ulong 0
+  if lt add s 1 e
+    c1 = ulong get qd_in add s 1
+  end
+  if eq c1 32
+    c1 = 0
+  end
+  p = add s 1
+  if ne c1 0
+    p = add s 2
+  end
+  put qd_p 0 p
+  put qd_e 0 e
+  if eq c1 0
+    if eq c0 90
+      k = qd_num
+      if eq k 0
+        qr_zero_profile
+      end
+      if eq k 1
+        qr_zero_world
+      end
+      if eq k 2
+        qr_zero_freeze
+      end
+      if eq k 3
+        qr_zero_gain
+      end
+      ret
+    end
+    if eq c0 83
+      k = qd_num
+      i = qd_num
+      cap = TYQR_VAL
+      if eq k 4
+        cap = 41
+      end
+      n = qd_hex cap
+      if ge n 0
+        qd_setstr k i ulong n 0
+      end
+      ret
+    end
+    if eq c0 84
+      k = qd_num
+      i = qd_num
+      qd_skip
+      st = get qd_p 0
+      if lt st e
+        qd_setstr k i sub e st st
+      end
+      ret
+    end
+    if eq c0 85
+      k = qd_num
+      i = qd_num
+      qd_setu k i qd_num
+      ret
+    end
+    if eq c0 73
+      k = qd_num
+      i = qd_num
+      qd_seti k i qd_inum
+      ret
+    end
+    if eq c0 68
+      k = qd_num
+      i = qd_num
+      r = qd_num
+      if and lt i qd_dcount k lt r 16
+        qr_set_dig k i qd_reg r
+      end
+      ret
+    end
+    if eq c0 88
+      r = qd_num
+      n = qd_hex 32
+      if and lt r 16 eq n 32
+        o = mul qd_reg r 32
+        for j ulong 32
+          put g_dig add o j get qd_hb j
+        end
+      end
+      ret
+    end
+    if eq c0 70
+      r = qd_num
+      b = qd_num
+      if lt r 16
+        o = mul qd_reg r 32
+        for j ulong 32
+          put g_dig add o j uchar and b 255
+        end
+      end
+      ret
+    end
+    if eq c0 80
+      r = qd_num
+      qd_c 80
+      qd_sp
+      qd_u r
+      qd_sp
+      qd_dig qd_reg r
+      qd_nl
+      ret
+    end
+    if eq c0 71
+      qd_cmd_g
+      ret
+    end
+    if eq c0 86
+      k = qd_num
+      r = qd_reg qd_num
+      qd_c 86
+      qd_sp
+      qd_u k
+      qd_sp
+      qd_i qd_verify k r
+      qd_nl
+      ret
+    end
+    if eq c0 66
+      g = qd_reg qd_num
+      w = qd_reg qd_num
+      f = qd_reg qd_num
+      pr = qd_reg qd_num
+      qd_c 66
+      qd_sp
+      qd_i tyqr_gain_bind g w f pr
+      qd_nl
+      ret
+    end
+    if eq c0 87
+      qd_cmd_w
+      ret
+    end
+    if eq c0 89
+      qd_cmd_y
+      ret
+    end
+  end
+  if and eq c0 89 eq c1 78
+    qd_cmd_yn
+    ret
+  end
+  if eq c0 77
+    if eq c1 48
+      put qd_ml 0 0
+      ret
+    end
+    if eq c1 88
+      n = qd_hex 1100
+      if gt n 0
+        if le add get qd_ml 0 ulong n 8192
+          for j ulong ulong n bound 1100
+            qd_mput get qd_hb j
+          end
+        end
+      end
+      ret
+    end
+    if eq c1 84
+      st = p
+      if lt st e
+        if eq get qd_in st 32
+          st = add st 1
+        end
+      end
+      n = sub e st
+      if le add add get qd_ml 0 n 1 8192
+        for j ulong n bound 20000
+          qd_mput get qd_in add st j
+        end
+        qd_mput uchar 10
+      end
+      ret
+    end
+    if eq c1 78
+      n = qd_num
+      b = qd_num
+      for j ulong n bound 20000
+        qd_mput uchar and b 255
+      end
+      ret
+    end
+  end
+  if and eq c0 83 eq c1 68
+    qd_cmd_sd
+    ret
+  end
+  if and eq c0 82 eq c1 69
+    qd_cmd_re
+    ret
+  end
+  if and eq c0 68 eq c1 69
+    qd_cmd_de
+    ret
+  end
+  if and eq c0 82 eq c1 66
+    qd_cmd_b2 true
+    ret
+  end
+  if and eq c0 68 eq c1 66
+    qd_cmd_b2 false
+    ret
+  end
+  if and eq c0 82 eq c1 80
+    qd_cmd_rp
+    ret
+  end
+  if and eq c0 68 eq c1 80
+    qd_cmd_dp
+    ret
+  end
+  if and eq c0 67 eq c1 84
+    qd_c 67
+    qd_c 84
+    qd_sp
+    qd_i tyqr_celltab_check get qd_ml 0
+    qd_nl
+    ret
+  end
+  if and eq c0 84 eq c1 84
+    qd_c 84
+    qd_c 84
+    qd_sp
+    qd_i tyqr_thrtab_check get qd_ml 0
+    qd_nl
+    ret
+  end
+  qd_t qd_t_q
+  qd_c c0
+  if ne c1 0
+    qd_c c1
+  end
+  qd_nl
+end
+
+fn main to int
+  total = ulong 0
+  while lt total 4194304 bound 100000
+    r = read 0 qd_in total sub 4194304 total
+    if le r 0
+      break
+    end
+    total = add total ulong r
+  end
+  start = ulong 0
+  p = ulong 0
+  while lt p total bound 4194305
+    if eq get qd_in p 10
+      if gt p start
+        if ne get qd_in start 35
+          qd_line start p
+        end
+      end
+      start = add p 1
+    end
+    p = add p 1
+  end
+  qd_flush
+  ret 0
+end
