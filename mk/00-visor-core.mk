@@ -14,6 +14,8 @@ LANG_OBJS = $(patsubst src/language/%.c,$(OUT_DIR)/language/%.o,$(LANG_SRCS))
 VISOR_DEPS = $(VISOR_OBJS:.o=.d) $(LANG_OBJS:.o=.d)
 -include $(VISOR_DEPS)
 OMEGA_BIN = $(OUT_DIR)/omega
+# Seeded compiler for the pure OM-2 Visor lane tests.
+VISOR_OMC ?= seed/out/omc
 OMEGA_OM_SRCS = src/visor/visor.om \
 	src/language/omega_lex.om src/language/omega_parse.om src/language/omega_lower.om \
 	src/visor/visor_semantic.om src/visor/visor_machine.om src/visor/visor_realization.om \
