@@ -1148,7 +1148,7 @@ Non-byte arrays and mismatched scalar types are error 7.
 
 | Expression | Meaning |
 | --- | --- |
-| `fopen A off n flags mode` | Open a length-delimited path relative to the current directory. Return descriptor. |
+| `fopen A off n flags mode` | Open a length-delimited path relative to the current directory. Return descriptor. `flags` are Linux asm-generic `O_` values on every target; under `target x86linux` the compiler renumbers O_DIRECTORY, O_NOFOLLOW, O_DIRECT and O_LARGEFILE to x86-64's values. |
 | `fclose fd` | Close descriptor. |
 | `fsync fd` | Sync file data and metadata. |
 | `fdsync fd` | Sync file data only (`fdatasync`). |

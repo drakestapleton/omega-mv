@@ -215,7 +215,7 @@ The `omega` package: `bin/omega` (the one shell file, choosing lib/<cpu> by `una
 
 - every program in the package is seeded Omega compiled by the pinned `seed/out/omc`; `bin/omega` only picks a directory
 - `package.tsv` lists every program and shared file; the builder records every hash in MANIFEST.tsv
-- a kernel enters the cache only after its check passed, under a key that covers the compiler and every file the build reads
+- a kernel enters the cache only after its check passed, under a key that covers every program the build and check run and every file the build reads
 
 ## `native/`
 

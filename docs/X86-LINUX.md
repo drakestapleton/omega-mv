@@ -18,18 +18,23 @@ CMP, JAE trap 3), `pl_len`, the pool path of `vs_chk` / `xio`, and `xenlarge` (i
 An x86 element access of a global now loads the global's address into RDX at the access (`xbase`, ea_b
 254) instead of holding it in an operand slot, so an OM-2 unit that the AArch64 path compiles with pinned
 globals keeps the same operand budget on x86 (the Visor console needed it). Every byte is emitted by the
-handwritten `x*` emitters, each instruction with its Intel SDM volume 2 form in the source notes.
+handwritten `x*` emitters, each instruction with its Intel SDM volume 2 form in the source notes. `fopen`
+takes the language's open flags (Linux asm-generic values) and `xoflags` renumbers the four that x86-64
+numbers differently (O_DIRECTORY, O_NOFOLLOW, O_DIRECT, O_LARGEFILE) before `openat`; before this, an x86
+program's O_DIRECTORY open was an O_DIRECT open (found when the omega package left its temporary
+directories on x86-64; `tools/omega/gate.sh` now checks the directory open and the ENOTDIR refusal).
 
 Measured on Linux AArch64 (Lima VM) with the x86-64 programs under qemu-x86_64 (EMULATED; no physical
 x86-64 run is recorded):
 
-- `seed/out/omc` 6d8ed6ed15c05a0bb41df3aac19dacdf979a422f73d714bdde552a9032cf1f82, born from
+- `seed/out/omc` 28fca13d44054e26f78c33d1753fd5c005d08e9144d95985c90bd75b60885072, born from
   `seed/rung0/seed0.hex` (`sh seed/omega-from-seed.sh` with no prebuilt compiler) and reproduced bit for
   bit from the independent Strand B seed (`sh seed/helix/helix-from-seeds.sh`).
 - The x86-64 compiler rebuilds itself byte for byte, and from `seed/omc/omc.om` builds `seed/out/omc` byte
   for byte (`seed/omc/gate-pools.sh` section X); every pool case gives its `.want` on x86, and the mutants
-  x86cmp (no bounds check) and x86base (base not stored after mremap) are caught.
-- An independent decoder (Apple LLVM 17 `objdump`, through `seed/omc/qualify-x86.py`'s `disassemble`)
+  x86cmp (no bounds check), x86base (base not stored after mremap), x86belowlen (n below the length
+  shrinks), x86ovf (no 2^63 overflow test) and x86slotfail (a refused mmap stored as the base) are caught.
+- An independent decoder (`python3 seed/omc/decode-x86.py IMAGE`, here with Apple LLVM 17 `objdump`)
   accounts for every byte of the x86-64 compiler: a 512-byte header, the instructions, and the literal
   islands the code branches around, with no undecoded byte and every direct branch on an instruction
   boundary.

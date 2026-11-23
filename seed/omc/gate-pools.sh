@@ -44,8 +44,10 @@
 #  X. x86linux (docs/X86-LINUX.md): OMC builds the x86-64 compiler from `target x86linux` + omc.om; under
 #     qemu-x86_64 (EMULATED, not native x86) it rebuilds itself byte for byte and builds OMC's AArch64
 #     compiler byte for byte from omc.om; every g* case and gr, prefixed `target x86linux`, gives
-#     NAME.want. Mutants x86cmp (no bounds check, g2a) and x86base (base not stored after mremap, g1)
-#     must FAIL. Without qemu-x86_64 the section is NOT_RUN and the gate's last line says so.
+#     NAME.want. Mutants must FAIL their case: x86cmp (no bounds check, g2a), x86base (base not stored
+#     after mremap, g1), x86belowlen (n below the length shrinks, g1), x86ovf (no 2^63 overflow test, g8b),
+#     x86slotfail (a refused mmap/mremap stored as the base, g8a). Without qemu-x86_64 the section is
+#     NOT_RUN and the gate's last line says so.
 # POOLS_ONLY="1 3 M" runs only the named sections (0 always runs).
 set -eu
 O0=$(pwd)
@@ -710,7 +712,7 @@ if on X; then
       n=$((n + 1))
     done
     say "PASS X cases: $n pool cases give their .want on x86linux (g8a under prlimit --as=1073741824: qemu needs room for its own guest map)"
-    for mut in x86cmp:g2a x86base:g1; do
+    for mut in x86cmp:g2a x86base:g1 x86belowlen:g1 x86ovf:g8b x86slotfail:g8a; do
       m=${mut%%:*}; c=${mut#*:}
       awk -v t="note POOLMUT $m" -v p="note POOLMUT-ALT $m " '
         NR == FNR { if (index($0, p) == 1) alt = substr($0, length(p) + 1); next }
