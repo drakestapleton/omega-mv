@@ -1,6 +1,9 @@
-# EST-2/EST-3 replay, fit and evaluation tools (protocol v1). Not part of
-# `all` or `test`. Tools may open files and print; est_types.o and est_kf.o
-# stay pure (est-purity, unchanged).
+# EST-2/EST-3 replay, fit and evaluation tools (protocol v1, v2). Not part of
+# `all` or `test`. est_replay, est_fit and est_eval are pure seeded OM-2 built by
+# $(ESTT_OMC); the test driver test_est_tools stays C (its fixture generator needs
+# glibc's cos and log bit for bit) and links the C est_replay.c library, as do the
+# v3 to v6 tools. Tools may open files and print; est_types.o and est_kf.o stay
+# pure (est-purity, unchanged).
 ifndef ESTIMATION_TOOLS_MK
 ESTIMATION_TOOLS_MK := 1
 include mk/estimation.mk
@@ -9,17 +12,17 @@ ESTT_DIR = $(OUT_DIR)/est-tools
 ESTT_CFLAGS = $(EST_CFLAGS) -Itools/estimation
 ESTT_LIB = tools/estimation/est_replay.c src/estimation/est_mix.c $(EST_KF_SRCS)
 ESTT_HDRS = tools/estimation/est_replay.h $(EST_HDRS)
-# Tool identity injected at build time: -DTOOL_COMMIT / -DTOOL_DIRTY. The stamp is
-# rewritten only when the commit or the dirty flag changes, so est_eval.o rebuilds then.
+# Tool identity baked in at build time as a generated toolid.om (t_ee_tool_commit,
+# EE_TOOL_DIRTY, EE_TEST_BUILD) composed before est_eval.om. The stamp is rewritten
+# only when the commit or the dirty flag changes, so est_eval rebuilds then.
 ESTT_COMMIT := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 ESTT_DIRTY := $(shell if [ -n "$$(git status --porcelain 2>/dev/null)" ]; then echo 1; else echo 0; fi)
-ESTT_ID = -DTOOL_COMMIT='"$(ESTT_COMMIT)"' -DTOOL_DIRTY=$(ESTT_DIRTY)
 ESTT_FORBIDDEN = 'rx_|aienos_|argus_|forge_|aegis|mmap|mprotect|fork|exec|dlopen|socket|system'
+# OM-2 host words an estimation tool must not use (process, socket, mapping and device
+# words), checked on every code line (not note or text lines) of the composed sources.
+ESTT_OM_FORBIDDEN = (^|[^A-Za-z0-9_])(fork|execprog|execpure|execenv|killpid|setsid|setpgid|prlimit|socknew|connect|bind|listen|accept|send|recv|sendmsg|mapnew|mapdrop|mapread|mapwrite|mapaddr|mapget|mapset|maphold|mapbind|devctl|devcall|uvmctl|mmap|mprotect|dlopen|system|socket)([^A-Za-z0-9_]|$$)|rx_|aienos_|argus_|forge_|aegis
 
 $(ESTT_DIR)/est_replay.o: tools/estimation/est_replay.c $(ESTT_HDRS)
-	@mkdir -p $(ESTT_DIR)
-	$(CC) $(ESTT_CFLAGS) -c -o $@ $<
-$(ESTT_DIR)/est_fit.o: tools/estimation/est_fit.c $(ESTT_HDRS)
 	@mkdir -p $(ESTT_DIR)
 	$(CC) $(ESTT_CFLAGS) -c -o $@ $<
 .PHONY: est-tools-stamp
@@ -28,35 +31,40 @@ est-tools-stamp:
 	@echo "$(ESTT_COMMIT) $(ESTT_DIRTY)" > $(ESTT_DIR)/toolid.new; \
 	cmp -s $(ESTT_DIR)/toolid.new $(ESTT_DIR)/toolid.stamp || mv $(ESTT_DIR)/toolid.new $(ESTT_DIR)/toolid.stamp; rm -f $(ESTT_DIR)/toolid.new
 $(ESTT_DIR)/toolid.stamp: | est-tools-stamp
-$(ESTT_DIR)/est_eval.o: tools/estimation/est_eval.c $(ESTT_HDRS) $(ESTT_DIR)/toolid.stamp
+$(ESTT_DIR)/toolid.om: $(ESTT_DIR)/toolid.stamp
+	printf 'text t_ee_tool_commit "%s"\nconst EE_TOOL_DIRTY ulong %s\nconst EE_TEST_BUILD ulong 0\n' '$(ESTT_COMMIT)' '$(ESTT_DIRTY)' > $@
+# est_eval built for tests only: run B / C2 identities and the dirty flag come from the environment
+$(ESTT_DIR)/toolid_t.om:
 	@mkdir -p $(ESTT_DIR)
-	$(CC) $(ESTT_CFLAGS) $(ESTT_ID) -c -o $@ $<
-$(ESTT_DIR)/est_fit: $(ESTT_DIR)/est_fit.o $(ESTT_LIB) $(ESTT_HDRS)
-	$(CC) $(ESTT_CFLAGS) -o $@ $(ESTT_DIR)/est_fit.o $(ESTT_LIB) -lm
-$(ESTT_DIR)/est_eval: $(ESTT_DIR)/est_eval.o $(ESTT_LIB) $(ESTT_HDRS)
-	$(CC) $(ESTT_CFLAGS) -o $@ $(ESTT_DIR)/est_eval.o $(ESTT_LIB) -lm
-# est_eval built for tests only: run B identity and the dirty flag come from the environment
-$(ESTT_DIR)/est_eval_t: tools/estimation/est_eval.c $(ESTT_LIB) $(ESTT_HDRS)
-	@mkdir -p $(ESTT_DIR)
-	$(CC) $(ESTT_CFLAGS) -DEST_TEST_BUILD -DTOOL_COMMIT='"test-build"' -DTOOL_DIRTY=1 -o $@ tools/estimation/est_eval.c $(ESTT_LIB) -lm
+	printf 'text t_ee_tool_commit "test-build"\nconst EE_TOOL_DIRTY ulong 1\nconst EE_TEST_BUILD ulong 1\n' > $@
 ESTT_OMC ?= seed/out/omc
 ESTT_OM_LIB = src/estimation/est_defs.om src/estimation/est_math.om src/estimation/est_types.om \
 	src/estimation/est_kf.om src/estimation/est_mix.om src/estimation/est_pred.om \
 	src/estimation/est_v4.om tools/estimation/est_replay.om
+ESTT_OM_MAINS = tools/estimation/est_replay_main.om tools/estimation/est_fit.om tools/estimation/est_eval.om
 
 $(ESTT_DIR)/est_replay: $(ESTT_OM_LIB) tools/estimation/est_replay_main.om $(ESTT_OMC)
 	@mkdir -p $(ESTT_DIR)
 	cat $(ESTT_OM_LIB) tools/estimation/est_replay_main.om | $(ESTT_OMC) > $@ && chmod +x $@
+$(ESTT_DIR)/est_fit: $(ESTT_OM_LIB) tools/estimation/est_fit.om $(ESTT_OMC)
+	@mkdir -p $(ESTT_DIR)
+	cat $(ESTT_OM_LIB) tools/estimation/est_fit.om | $(ESTT_OMC) > $@ && chmod +x $@
+$(ESTT_DIR)/est_eval: $(ESTT_OM_LIB) $(ESTT_DIR)/toolid.om tools/estimation/est_eval.om $(ESTT_OMC)
+	cat $(ESTT_OM_LIB) $(ESTT_DIR)/toolid.om tools/estimation/est_eval.om | $(ESTT_OMC) > $@ && chmod +x $@
+$(ESTT_DIR)/est_eval_t: $(ESTT_OM_LIB) $(ESTT_DIR)/toolid_t.om tools/estimation/est_eval.om $(ESTT_OMC)
+	cat $(ESTT_OM_LIB) $(ESTT_DIR)/toolid_t.om tools/estimation/est_eval.om | $(ESTT_OMC) > $@ && chmod +x $@
 $(ESTT_DIR)/test_est_tools: tools/estimation/test_est_tools.c $(ESTT_LIB) $(ESTT_HDRS)
 	@mkdir -p $(ESTT_DIR)
 	$(CC) $(ESTT_CFLAGS) -o $@ tools/estimation/test_est_tools.c $(ESTT_LIB) -lm
 
 est-tools: $(ESTT_DIR)/est_fit $(ESTT_DIR)/est_eval $(ESTT_DIR)/est_replay
 
-est-tools-purity: est-purity $(ESTT_DIR)/est_replay.o $(ESTT_DIR)/est_fit.o $(ESTT_DIR)/est_eval.o
-	@if nm -u $(ESTT_DIR)/est_replay.o $(ESTT_DIR)/est_fit.o $(ESTT_DIR)/est_eval.o | grep -E $(ESTT_FORBIDDEN) ; then \
-		echo "estimation tool references an authority, World or process operation"; exit 1; fi
-	@echo "est-tools-purity: tool objects reference no authority/process symbol; est_types.o and est_kf.o pure"
+est-tools-purity: est-purity $(ESTT_DIR)/est_replay.o
+	@if nm -u $(ESTT_DIR)/est_replay.o | grep -E $(ESTT_FORBIDDEN) ; then \
+		echo "est_replay.o references an authority, World or process operation"; exit 1; fi
+	@awk -v re='$(ESTT_OM_FORBIDDEN)' '$$1 != "note" && $$1 != "text" && $$0 ~ re { print FILENAME ":" FNR ": " $$0; bad = 1 } END { exit bad }' \
+		$(ESTT_OM_LIB) $(ESTT_OM_MAINS) || { echo "an OM-2 estimation tool uses a process, socket, mapping or device word"; exit 1; }
+	@echo "est-tools-purity: est_replay.o and the OM-2 tool sources use no authority/process operation; est_types.o and est_kf.o pure"
 
 test-est-tools: est-tools-purity $(ESTT_DIR)/est_fit $(ESTT_DIR)/est_eval $(ESTT_DIR)/est_eval_t $(ESTT_DIR)/test_est_tools
 	rm -rf $(ESTT_DIR)/work

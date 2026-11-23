@@ -48,9 +48,6 @@ text t_er_null "null"
 text t_er_nan "nan"
 text t_er_inf "inf"
 text t_er_ninf "-inf"
-text t_er_binsh "/bin/sh"
-text t_er_dashc "-c"
-text t_er_path_env "PATH=/usr/local/bin:/usr/bin:/bin"
 text t_er_err_long ": path too long"
 text t_er_err_ho ": resolves into the held-out run; only est_eval --protocol-v2 --recorded may open it"
 text t_er_err_rb ": resolves into run B; only est_eval --recorded may open run B"
@@ -98,6 +95,12 @@ global g_ob_buf uchar 65536
 global g_ob_len ulong 1
 global g_ob_fd int 1
 global g_ob_err ulong 1
+global g_og_l ulong 100
+global g_og_n ulong 1
+global g_og_d uchar 1000
+global g_pf_dig uchar 800
+global g_bn ulong 200
+global g_bd ulong 200
 
 note ---- Guard flags ----
 global g_er_test_build ulong 1
@@ -137,6 +140,8 @@ global g_rps_ptns long 32768
 global g_rps_px f64 65536
 global g_rps_pP f64 131072
 global g_rps_dig ulong 655360
+global g_rps_ppar ulong 131072
+global g_rps_proot ulong 131072
 
 note ---- Replay work buffers ----
 global g_rp_cur_mdl ulong 280
@@ -156,6 +161,7 @@ global g_ep1_lines ulong 1
 global g_ep1_q f64 2
 global g_ep1_r f64 2
 global g_ep1_ll f64 2
+global g_ep1_verr ulong 2
 
 note ---- Params v2 globals ----
 global g_ep2_v1p uchar 1024
@@ -182,8 +188,6 @@ global g_er_env uchar 4096
 global g_er_rp1 uchar 4096
 global g_er_rp2 uchar 4096
 global g_er_rp3 uchar 4096
-global g_er_pkt uchar 16384
-global g_er_epkt uchar 512
 global g_er_err uchar 300
 global g_er_elen ulong 1
 
@@ -436,89 +440,6 @@ fn ob_u_pad v ulong width ulong to void
   end
 end
 
-fn ob_fix_frac fp0 ulong scu ulong nd ulong to void
-  ob_c 46
-  fp = fp0
-  dp = div scu 10
-  for i ulong nd
-    ob_c uchar add 48 div fp dp
-    fp = rem fp dp
-    if gt dp 1
-      dp = div dp 10
-    end
-  end
-end
-
-fn ob_fix v f64 nd ulong to void
-  if est_isnan v
-    ob_t t_er_nan
-    ret
-  end
-  if est_isinf v
-    if lt v f64 0.0
-      ob_c 45
-    end
-    ob_t t_er_inf
-    ret
-  end
-  x = v
-  if lt x f64 0.0
-    ob_c 45
-    x = sub f64 0.0 x
-  end
-  sc = f64 1.0
-  for i ulong nd
-    sc = mul sc f64 10.0
-  end
-  scu = ulong sc
-  if lt x f64 1.0e12
-    tot = ulong add mul x sc f64 0.5
-    ob_u div tot scu
-    if gt nd 0
-      ob_fix_frac rem tot scu scu nd
-    end
-  else
-    ob_u ulong add x f64 0.5
-    if gt nd 0
-      ob_c 46
-      for i ulong nd
-        ob_c 48
-      end
-    end
-  end
-end
-
-fn ob_g17_scale x f64 out_e edit long 1 to f64
-  m = x
-  e = long 0
-  while ge m f64 1.0e16 bound 30
-    m = div m f64 1.0e16
-    e = add e 16
-  end
-  while ge m f64 1.0e4 bound 10
-    m = div m f64 1.0e4
-    e = add e 4
-  end
-  while ge m f64 10.0 bound 10
-    m = div m f64 10.0
-    e = add e 1
-  end
-  while lt m f64 1.0e-15 bound 30
-    m = mul m f64 1.0e16
-    e = sub e 16
-  end
-  while lt m f64 1.0e-3 bound 10
-    m = mul m f64 1.0e4
-    e = sub e 4
-  end
-  while lt m f64 1.0 bound 10
-    m = mul m f64 10.0
-    e = sub e 1
-  end
-  put out_e 0 e
-  ret m
-end
-
 fn ob_g17_emit_sci digs view uchar 20 nd ulong e long to void
   ob_c get digs 0
   if gt nd 1
@@ -569,42 +490,272 @@ fn ob_g17_emit_fix digs view uchar 20 nd ulong e long to void
   end
 end
 
-fn ob_g17_pos x f64 to void
-  eo = new long 1 0
-  digs = new uchar 20 0
-  m = ob_g17_scale x eo
-  e = get eo 0
-  m8 = mul m f64 1.0e8
-  hi = ulong m8
-  lo = ulong add mul sub m8 f64 hi f64 1.0e8 f64 0.5
-  d = add mul hi 100000000 lo
-  if ge d ulong 100000000000000000
-    d = div d 10
-    e = add e 1
+note ---- Exact printf %.Pg and %.Nf: the double's exact decimal expansion, rounded half-even ----
+note x = mant * 2^e2. e2 >= 0: N = mant * 2^e2, k = 0. e2 < 0: N = mant * 5^-e2, k = -e2, so
+note x = N / 10^k. N is held in base-1e9 limbs (at most 87 for a subnormal); og_to_digits
+note writes its decimal digits to g_og_d (at most 770).
+
+fn og_mul_small m ulong to void
+  n = get g_og_n 0
+  c = ulong 0
+  for i ulong n
+    p = add mul get g_og_l i m c
+    put g_og_l i rem p ulong 1000000000
+    c = div p ulong 1000000000
   end
-  i = ulong 17
-  while gt i 0 bound 20
+  while gt c 0 bound 4
+    put g_og_l n rem c ulong 1000000000
+    c = div c ulong 1000000000
+    n = add n 1
+  end
+  put g_og_n 0 n
+end
+
+fn og_set_n mant ulong e2 long to ulong
+  put g_og_l 0 rem mant ulong 1000000000
+  put g_og_l 1 rem div mant ulong 1000000000 ulong 1000000000
+  put g_og_n 0 2
+  if eq get g_og_l 1 0
+    put g_og_n 0 1
+  end
+  if ge e2 0
+    k = ulong e2
+    while ge k 29 bound 40
+      og_mul_small ulong 536870912
+      k = sub k 29
+    end
+    if gt k 0
+      og_mul_small shl ulong 1 k
+    end
+    ret 0
+  end
+  k = ulong sub 0 e2
+  kk = k
+  while ge kk 13 bound 90
+    og_mul_small ulong 1220703125
+    kk = sub kk 13
+  end
+  p5 = ulong 1
+  for i ulong kk
+    p5 = mul p5 5
+  end
+  if gt kk 0
+    og_mul_small p5
+  end
+  ret k
+end
+
+fn og_put_limb pos ulong v ulong pad ulong to ulong
+  buf = new uchar 9 0
+  n = ulong 0
+  x = v
+  while gt x 0 bound 9
+    put buf n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  if eq pad 1
+    while lt n 9 bound 9
+      put buf n 48
+      n = add n 1
+    end
+  end
+  p = pos
+  i = n
+  while gt i 0 bound 9
     i = sub i 1
-    r = rem d 10
-    put digs i uchar add 48 r
-    d = div d 10
+    put g_og_d p get buf i
+    p = add p 1
   end
-  nd = ulong 17
+  ret p
+end
+
+fn og_to_digits to ulong
+  n = get g_og_n 0
+  top = sub n 1
+  p = og_put_limb 0 get g_og_l top 0
+  i = top
+  while gt i 0 bound 100
+    i = sub i 1
+    p = og_put_limb p get g_og_l i 1
+  end
+  ret p
+end
+
+note The decimal digits of a finite x > 0; returns L, the digit count; *k_out = k.
+fn og_expand x f64 k_out edit ulong 1 to ulong
+  bits = bitcast ulong x
+  eraw = and shr bits 52 2047
+  frac = and bits ulong 4503599627370495
+  mant = frac
+  e2 = long -1074
+  if ne eraw 0
+    mant = or frac ulong 4503599627370496
+    e2 = sub long eraw 1075
+  end
+  put k_out 0 og_set_n mant e2
+  ret og_to_digits
+end
+
+note Round g_og_d[0..l) half-even to its first p digits (p < l). Returns 1 when the
+note carry ran out of the top digit (the kept digits are then "100..0").
+fn og_need_up p ulong l ulong to ulong
+  dp = get g_og_d p
+  if gt dp 53
+    ret 1
+  end
+  if lt dp 53
+    ret 0
+  end
+  for i ulong sub sub l p 1
+    if ne get g_og_d add add p 1 i 48
+      ret 1
+    end
+  end
+  if eq p 0
+    ret 0
+  end
+  if ne and ulong get g_og_d sub p 1 1 0
+    ret 1
+  end
+  ret 0
+end
+
+fn og_round_at p ulong l ulong to ulong
+  if eq og_need_up p l 0
+    ret 0
+  end
+  q = p
+  for t ulong p
+    q = sub q 1
+    c = get g_og_d q
+    if lt c 57
+      put g_og_d q uchar add c 1
+      ret 0
+    end
+    put g_og_d q 48
+  end
+  put g_og_d 0 49
+  ret 1
+end
+
+note %.Pg digits of a finite x > 0: P digits in digs, returns the decimal exponent.
+fn og_g_digits x f64 prec ulong digs edit uchar 20 to long
+  ko = new ulong 1 0
+  l = og_expand x ko
+  e = sub sub long l 1 long get ko 0
+  if gt l prec
+    if eq og_round_at prec l 1
+      e = add e 1
+    end
+  end
+  for i ulong prec
+    if lt i l
+      put digs i get g_og_d i
+    else
+      put digs i 48
+    end
+  end
+  ret e
+end
+
+fn ob_gp_pos x f64 prec ulong to void
+  digs = new uchar 20 0
+  e = og_g_digits x prec digs
+  nd = prec
   while gt nd 1 bound 20
     if ne get digs sub nd 1 48
       break
     end
     nd = sub nd 1
   end
-  if and ge e -4 lt e 17
+  if and ge e -4 lt e long prec
     ob_g17_emit_fix view digs nd e
   else
     ob_g17_emit_sci view digs nd e
   end
 end
 
-fn ob_g17 v f64 to void
+note %.Nf of a finite x >= 0 (sign printed by the caller).
+fn ob_fix_pos x f64 nd ulong to void
+  if eq x f64 0.0
+    ob_c 48
+    if gt nd 0
+      ob_c 46
+      for i ulong nd
+        ob_c 48
+      end
+    end
+    ret
+  end
+  ko = new ulong 1 0
+  l = og_expand x ko
+  k = get ko 0
+  if gt k nd
+    keep = sub add long l long nd long k
+    if le keep 0
+      up = ulong 0
+      if eq keep 0
+        si = l
+        for t ulong l
+          put g_og_d si get g_og_d sub si 1
+          si = sub si 1
+        end
+        put g_og_d 0 48
+        up = og_need_up 1 add l 1
+      end
+      if eq nd 0
+        ob_c uchar add 48 up
+        ret
+      end
+      ob_c 48
+      ob_c 46
+      for t ulong sub nd 1
+        ob_c 48
+      end
+      ob_c uchar add 48 up
+      ret
+    end
+    if eq og_round_at ulong keep l 1
+      put g_og_d ulong keep 48
+      keep = add keep 1
+    end
+    l = ulong keep
+    k = nd
+  end
+  ni = sub long l long k
+  if le ni 0
+    ob_c 48
+  else
+    for i ulong ulong ni
+      ob_c get g_og_d i
+    end
+  end
+  if gt nd 0
+    ob_c 46
+    if lt ni 0
+      for i ulong ulong sub 0 ni
+        ob_c 48
+      end
+      for i ulong l
+        ob_c get g_og_d i
+      end
+    else
+      for i ulong sub l ulong ni
+        ob_c get g_og_d add ulong ni i
+      end
+    end
+    for i ulong sub nd k
+      ob_c 48
+    end
+  end
+end
+
+fn ob_gp v f64 prec ulong to void
   if est_isnan v
+    if ne shr bitcast ulong v 63 0
+      ob_c 45
+    end
     ob_t t_er_nan
     ret
   end
@@ -625,10 +776,30 @@ fn ob_g17 v f64 to void
   end
   if lt v f64 0.0
     ob_c 45
-    ob_g17_pos sub f64 0.0 v
+    ob_gp_pos neg v prec
     ret
   end
-  ob_g17_pos v
+  ob_gp_pos v prec
+end
+
+fn ob_g17 v f64 to void
+  ob_gp v 17
+end
+
+fn ob_fix v f64 nd ulong to void
+  neg_s = ne shr bitcast ulong v 63 0
+  if neg_s
+    ob_c 45
+  end
+  if est_isnan v
+    ob_t t_er_nan
+    ret
+  end
+  if est_isinf v
+    ob_t t_er_inf
+    ret
+  end
+  ob_fix_pos fabs v nd
 end
 
 fn ob_json_num v f64 to void
@@ -719,36 +890,6 @@ fn er_parse_i64 s view uchar * off ulong lim ulong dst edit long 1 used edit ulo
   ret 0
 end
 
-fn er_f64_pow10 e long to f64
-  if eq e 0
-    ret f64 1.0
-  end
-  ae = e
-  if lt ae 0
-    ae = sub 0 ae
-  end
-  if gt ae 308
-    if lt e 0
-      ret f64 0.0
-    end
-    ret est_inf
-  end
-  res = f64 1.0
-  base = f64 10.0
-  u = ulong ae
-  while gt u 0 bound 20
-    if ne and u 1 0
-      res = mul res base
-    end
-    base = mul base base
-    u = shr u 1
-  end
-  if lt e 0
-    ret div f64 1.0 res
-  end
-  ret res
-end
-
 fn er_lo_ascii c uchar to uchar
   if and ge c 65 le c 90
     ret add c 32
@@ -814,46 +955,339 @@ fn er_parse_f64_exp s view uchar * i ulong lim ulong out_e edit long 1 to ulong
   ret j
 end
 
-fn er_parse_f64_digits s view uchar * i0 ulong lim ulong m_out edit f64 1 e_out edit long 2 to ulong
+note significant digits of "ddd[.ddd]" into g_pf_dig; st[0] digits seen, st[1] stored,
+note st[2] decimal exponent of the stored digits, st[3] sticky (nonzero digit dropped)
+fn er_pf_digit c uchar frac ulong st edit long 4 to void
+  put st 0 add get st 0 1
+  ns = get st 1
+  if and eq ns 0 eq c 48
+    if ne frac 0
+      put st 2 sub get st 2 1
+    end
+    ret
+  end
+  if lt ns 800
+    put g_pf_dig ulong ns c
+    put st 1 add ns 1
+    if ne frac 0
+      put st 2 sub get st 2 1
+    end
+    ret
+  end
+  if eq frac 0
+    put st 2 add get st 2 1
+  end
+  if ne c 48
+    put st 3 1
+  end
+end
+
+fn er_parse_f64_digits s view uchar * i0 ulong lim ulong st edit long 4 to ulong
   i = i0
-  mant = f64 0.0
-  nd = ulong 0
-  while lt i lim bound 64
+  for k ulong 4
+    put st k 0
+  end
+  while lt i lim bound 4096
     c = get s i
     if or lt c 48 gt c 57
       break
     end
-    mant = add mul mant f64 10.0 f64 sub c 48
-    nd = add nd 1
+    er_pf_digit c 0 st
     i = add i 1
   end
-  fexp = long 0
   if lt i lim
     if eq get s i 46
       i = add i 1
-      while lt i lim bound 64
+      while lt i lim bound 4096
         c = get s i
         if or lt c 48 gt c 57
           break
         end
-        if lt nd 20
-          mant = add mul mant f64 10.0 f64 sub c 48
-          fexp = sub fexp 1
-        end
-        nd = add nd 1
+        er_pf_digit c 1 st
         i = add i 1
       end
     end
   end
-  put m_out 0 mant
-  put e_out 0 fexp
-  put e_out 1 long nd
   ret i
 end
 
+note ---- Correctly rounded decimal to binary64 (the value C strtod gives) ----
+note The significant digits go to g_pf_dig (at most 800; later nonzero digits set a sticky
+note flag). Up to 15 digits with |E| <= 22 is one exact IEEE operation. Otherwise the digits
+note become a big integer N (base 2^32 limbs in g_bn) over D = 10^-E (g_bd), q = N*2^s / D is
+note taken to 64 bits by long division and rounded half-even with the remainder as sticky.
+
+fn bz_get w ulong i ulong to ulong
+  if eq w 0
+    ret get g_bn i
+  end
+  ret get g_bd i
+end
+
+fn bz_put w ulong i ulong v ulong to void
+  if eq w 0
+    put g_bn i v
+  else
+    put g_bd i v
+  end
+end
+
+fn bz_set w ulong v ulong to void
+  for i ulong 200
+    bz_put w i 0
+  end
+  bz_put w 0 and v ulong 4294967295
+  bz_put w 1 shr v 32
+end
+
+fn bz_mul_add w ulong m ulong a ulong to void
+  c = a
+  for i ulong 200
+    p = add mul bz_get w i m c
+    bz_put w i and p ulong 4294967295
+    c = shr p 32
+  end
+end
+
+fn bz_mul_pow10 w ulong e ulong to void
+  k = e
+  while ge k 9 bound 200
+    bz_mul_add w ulong 1000000000 0
+    k = sub k 9
+  end
+  p = ulong 1
+  for i ulong k
+    p = mul p 10
+  end
+  if gt p 1
+    bz_mul_add w p 0
+  end
+end
+
+fn bz_bitlen w ulong to ulong
+  i = ulong 200
+  while gt i 0 bound 200
+    i = sub i 1
+    v = bz_get w i
+    if ne v 0
+      b = ulong 0
+      while ne v 0 bound 33
+        v = shr v 1
+        b = add b 1
+      end
+      ret add mul i 32 b
+    end
+  end
+  ret 0
+end
+
+fn bz_shl w ulong bits ulong to void
+  ws = div bits 32
+  bs = rem bits 32
+  if gt ws 0
+    i = ulong 200
+    while gt i 0 bound 200
+      i = sub i 1
+      v = ulong 0
+      if ge i ws
+        v = bz_get w sub i ws
+      end
+      bz_put w i v
+    end
+  end
+  if gt bs 0
+    c = ulong 0
+    for i ulong 200
+      v = bz_get w i
+      bz_put w i and or shl v bs c ulong 4294967295
+      c = shr v sub 32 bs
+    end
+  end
+end
+
+fn bz_shr1_d to void
+  c = ulong 0
+  i = ulong 200
+  while gt i 0 bound 200
+    i = sub i 1
+    v = get g_bd i
+    put g_bd i or shr v 1 shl c 31
+    c = and v 1
+  end
+end
+
+fn bz_cmp_nd to long
+  i = ulong 200
+  while gt i 0 bound 200
+    i = sub i 1
+    a = get g_bn i
+    b = get g_bd i
+    if gt a b
+      ret 1
+    end
+    if lt a b
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn bz_sub_nd to void
+  br = ulong 0
+  for i ulong 200
+    a = get g_bn i
+    b = add get g_bd i br
+    if lt a b
+      put g_bn i sub add a ulong 4294967296 b
+      br = 1
+    else
+      put g_bn i sub a b
+      br = 0
+    end
+  end
+end
+
+fn bz_is_zero_n to bool
+  for i ulong 200
+    if ne get g_bn i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+note N = the nsig digits in g_pf_dig
+fn bz_load_digits nsig ulong to void
+  bz_set 0 0
+  i = ulong 0
+  while lt i nsig bound 800
+    chunk = ulong 0
+    m = ulong 1
+    j = ulong 0
+    while and lt j 9 lt i nsig bound 9
+      chunk = add mul chunk 10 ulong sub get g_pf_dig i 48
+      m = mul m 10
+      i = add i 1
+      j = add j 1
+    end
+    bz_mul_add 0 m chunk
+  end
+end
+
+note q = floor(N * 2^s / D) with 2^62 < q < 2^64; rem_nz[0] = remainder is nonzero
+fn bz_quot s long rem_nz edit ulong 1 to ulong
+  if ge s 0
+    bz_shl 0 ulong s
+  else
+    bz_shl 1 ulong sub 0 s
+  end
+  bz_shl 1 63
+  q = ulong 0
+  for t ulong 64
+    q = shl q 1
+    if ge bz_cmp_nd 0
+      bz_sub_nd
+      q = or q 1
+    end
+    bz_shr1_d
+  end
+  put rem_nz 0 0
+  if not bz_is_zero_n
+    put rem_nz 0 1
+  end
+  ret q
+end
+
+note round q * 2^-s (q has 63 or 64 bits) to binary64, sticky in rem_nz
+fn bz_round q ulong s long sticky ulong to f64
+  t = long 64
+  if eq shr q 63 0
+    t = 63
+  end
+  elead = sub sub t 1 s
+  shift = sub t 53
+  if lt elead -1022
+    shift = add shift sub -1022 elead
+  end
+  if gt shift 64
+    ret f64 0.0
+  end
+  m = ulong 0
+  rr = q
+  if lt shift 64
+    m = shr q ulong shift
+    rr = and q sub shl ulong 1 ulong shift 1
+  end
+  half = shl ulong 1 ulong sub shift 1
+  up = ulong 0
+  if gt rr half
+    up = 1
+  end
+  if eq rr half
+    if or ne sticky 0 ne and m 1 0
+      up = 1
+    end
+  end
+  m = add m up
+  if lt elead -1022
+    ret bitcast f64 m
+  end
+  if eq m ulong 9007199254740992
+    m = shr m 1
+    elead = add elead 1
+  end
+  if gt elead 1023
+    ret est_inf
+  end
+  ret bitcast f64 or shl ulong add elead 1023 52 and m ulong 4503599627370495
+end
+
+fn er_pf_value nsig ulong e long sticky ulong to f64
+  if eq nsig 0
+    ret f64 0.0
+  end
+  if and le nsig 15 eq sticky 0
+    d = ulong 0
+    for i ulong nsig
+      d = add mul d 10 ulong sub get g_pf_dig i 48
+    end
+    if and ge e -22 le e 22
+      p = f64 1.0
+      ae = e
+      if lt e 0
+        ae = sub 0 e
+      end
+      for i ulong ulong ae
+        p = mul p f64 10.0
+      end
+      if ge e 0
+        ret mul f64 d p
+      end
+      ret div f64 d p
+    end
+  end
+  mag = add long nsig e
+  if gt mag 310
+    ret est_inf
+  end
+  if le mag -325
+    ret f64 0.0
+  end
+  rn = new ulong 1 0
+  bz_load_digits nsig
+  bz_set 1 1
+  if ge e 0
+    bz_mul_pow10 0 ulong e
+  else
+    bz_mul_pow10 1 ulong sub 0 e
+  end
+  s = sub add long 63 long bz_bitlen 1 long bz_bitlen 0
+  q = bz_quot s rn
+  ret bz_round q s or sticky get rn 0
+end
+
 fn er_parse_f64 s view uchar * off ulong lim ulong dst edit f64 1 used edit ulong 1 to long
-  mo = new f64 1 0.0
-  eo = new long 2 0
+  eo = new long 4 0
   ee = new long 1 0
   if ge off lim
     ret 1
@@ -886,22 +1320,17 @@ fn er_parse_f64 s view uchar * off ulong lim ulong dst edit f64 1 used edit ulon
     put used 0 sub add i 3 off
     ret 0
   end
-  i = er_parse_f64_digits s i lim mo eo
-  if eq get eo 1 0
+  i = er_parse_f64_digits s i lim eo
+  if eq get eo 0 0
     ret 1
   end
   i = er_parse_f64_exp s i lim ee
-  tot_e = add get eo 0 get ee 0
-  val = get mo 0
-  if gt tot_e 0
-    val = mul val er_f64_pow10 tot_e
-  else
-    if lt tot_e 0
-      val = div val er_f64_pow10 sub 0 tot_e
-    end
-  end
+  tot_e = add get eo 2 get ee 0
+  nsig = ulong get eo 1
+  stk = ulong get eo 3
+  val = er_pf_value nsig tot_e stk
   if ne negf 0
-    val = sub f64 0.0 val
+    val = neg val
   end
   put dst 0 val
   put used 0 sub i off
@@ -1232,52 +1661,6 @@ fn er_realpath path view uchar * plen ulong dst edit uchar 4096 to long
     put dst i get g_er_rp1 i
   end
   ret long cur
-end
-
-fn er_pkt_put off ulong v ulong to void
-  put g_er_pkt off uchar and v 255
-  put g_er_pkt add off 1 uchar and shr v 8 255
-end
-
-fn er_pkt_add off ulong s view uchar * n ulong to ulong
-  er_pkt_put off n
-  o2 = add off 2
-  for i ulong n
-    put g_er_pkt add o2 i get s i
-  end
-  ret add o2 n
-end
-
-fn er_sh_run cmd view uchar * clen ulong to long
-  st = new uchar 8 0
-  er_pkt_put 0 3
-  off = er_pkt_add 2 t_er_binsh len t_er_binsh
-  off = er_pkt_add off t_er_dashc len t_er_dashc
-  off = er_pkt_add off cmd clen
-  put g_er_epkt 0 1
-  put g_er_epkt 1 0
-  el = len t_er_path_env
-  put g_er_epkt 2 uchar and el 255
-  put g_er_epkt 3 uchar and shr el 8 255
-  for i ulong el
-    put g_er_epkt add 4 i get t_er_path_env i
-  end
-  eoff = add 4 el
-  pid = fork
-  if lt pid 0
-    ret -1
-  end
-  if eq pid 0
-    ign = execenv g_er_pkt 0 off g_er_epkt 0 eoff
-    exit 127
-  end
-  w = waitpid int pid st 0 4 0
-  if lt w 0
-    ret -1
-  end
-  s0 = ulong get st 0
-  s1 = ulong get st 1
-  ret long or s0 shl s1 8
 end
 
 note ---- Run B / Held-out guards & SHA256SUMS ----
@@ -1833,12 +2216,89 @@ end
 
 note ---- Grid & Models ----
 
+note ---- 10^(m/4), correctly rounded, for the protocol grids (est_grid_q, est_grid_r) ----
+note Double-double arithmetic with fma: 10^(b/4) for b in 0..3 from exact square-root
+note residuals, times or divided by the exact 10^|a|, rounded once. Wave 35 compared it bit for
+note bit with glibc pow(10, m/4) at all 37 grid exponents m = -12..24 (a probe, not a repo test);
+note test-est-tools checks the fitted q and r against the C tools through the parameter files.
+
+fn est_dd_sqrt hi f64 lo f64 dd edit f64 2 to void
+  s = fsqrt hi
+  e = add fma neg s s hi lo
+  put dd 0 s
+  put dd 1 div e mul f64 2.0 s
+end
+
+fn est_dd_norm hi f64 lo f64 dd edit f64 2 to void
+  s = add hi lo
+  put dd 0 s
+  put dd 1 sub lo sub s hi
+end
+
+fn est_dd_mul ah f64 al f64 bh f64 bl f64 dd edit f64 2 to void
+  p = mul ah bh
+  e = fma ah bh neg p
+  e2 = add e add mul ah bl mul al bh
+  est_dd_norm p e2 dd
+end
+
+fn est_dd_root4 b ulong dd edit f64 2 to void
+  s2 = new f64 2 0.0
+  s4 = new f64 2 0.0
+  put dd 0 f64 1.0
+  put dd 1 f64 0.0
+  if eq b 0
+    ret
+  end
+  est_dd_sqrt f64 10.0 f64 0.0 s2
+  if eq b 2
+    put dd 0 get s2 0
+    put dd 1 get s2 1
+    ret
+  end
+  est_dd_sqrt get s2 0 get s2 1 s4
+  if eq b 1
+    put dd 0 get s4 0
+    put dd 1 get s4 1
+    ret
+  end
+  est_dd_mul get s2 0 get s2 1 get s4 0 get s4 1 dd
+end
+
+fn est_pow10_q4 m long to f64
+  a = div m 4
+  if lt rem m 4 0
+    a = sub a 1
+  end
+  b = ulong sub m mul a 4
+  dd = new f64 2 0.0
+  q = new f64 2 0.0
+  est_dd_root4 b dd
+  hi = get dd 0
+  lo = get dd 1
+  p = f64 1.0
+  na = a
+  if lt a 0
+    na = sub 0 a
+  end
+  for i ulong ulong na
+    p = mul p f64 10.0
+  end
+  if ge a 0
+    est_dd_mul hi lo p f64 0.0 q
+    ret add get q 0 get q 1
+  end
+  q1 = div hi p
+  r = add fma neg q1 p hi lo
+  ret add q1 div r p
+end
+
 fn est_grid_q i long to f64
-  ret est_pow f64 10.0 add f64 -3.0 mul f64 0.5 f64 i
+  ret est_pow10_q4 add -12 mul 2 i
 end
 
 fn est_grid_r j long to f64
-  ret est_pow f64 10.0 mul f64 0.25 f64 j
+  ret est_pow10_q4 j
 end
 
 fn est_make_model model_id ulong q f64 r f64 m edit ulong 280 to long
@@ -1907,6 +2367,8 @@ fn er_store_post idx ulong bel view ulong 96 to void
   put g_rps_px add mul idx 2 1 bitcast f64 get bel add EB_X 1
   for i ulong 4
     put g_rps_pP add mul idx 4 i bitcast f64 get bel add EB_P i
+    put g_rps_ppar add mul idx 4 i get bel add EB_PAR i
+    put g_rps_proot add mul idx 4 i get bel add EB_ROOT i
   end
 end
 
@@ -1939,6 +2401,10 @@ fn er_load_post rslot ulong si ulong mdl view ulong 280 bel edit ulong 96 to voi
   for i ulong nn
     vp = bitcast ulong get g_rps_pP add pb i
     put bel add EB_P i vp
+  end
+  for i ulong 4
+    put bel add EB_PAR i get g_rps_ppar add pb i
+    put bel add EB_ROOT i get g_rps_proot add pb i
   end
   er_put_mdig rslot bel
 end
@@ -2742,15 +3208,20 @@ fn er_log10 x f64 to f64
   ret div est_log x f64 2.302585092994046
 end
 
+note On refusal g_ep1_verr holds the model and the kind: 1 q or r not finite and
+note positive, 2 q off the grid, 3 r off the grid (est_eval prints the C message).
 fn est_params_validate to long
   for m ulong 2
+    put g_ep1_verr 0 m
     q = get g_ep1_q m
     r = get g_ep1_r m
+    put g_ep1_verr 1 1
     if or not est_isfinite q or not est_isfinite r or le q f64 0.0 le r f64 0.0
       ret 1
     end
     i = long est_floor add div add er_log10 q f64 3.0 f64 0.5 f64 0.5
     j = long est_floor add div er_log10 r f64 0.25 f64 0.5
+    put g_ep1_verr 1 2
     if or lt i 0 ge i long EST_NQ
       ret 1
     end
@@ -2758,6 +3229,7 @@ fn est_params_validate to long
     if gt fabs sub q gq mul f64 1.0e-9 gq
       ret 1
     end
+    put g_ep1_verr 1 3
     if or lt j 0 ge j long EST_NR
       ret 1
     end
@@ -2766,6 +3238,7 @@ fn est_params_validate to long
       ret 1
     end
   end
+  put g_ep1_verr 1 0
   ret 0
 end
 
@@ -2808,8 +3281,9 @@ fn er_em_logc wj f64 vj f64 ei2 f64 to f64
   ret sub est_log wj mul f64 0.5 add est_log vj div ei2 vj
 end
 
-fn er_em_estep ei2 f64 k ulong mx view EstMix sw edit f64 3 sv edit f64 3 to void
+fn er_em_estep ei f64 k ulong mx view EstMix sw edit f64 3 sv edit f64 3 to void
   lv = new f64 3 0.0
+  ei2 = mul ei ei
   mxl = est_ninf
   for j ulong k
     wj = get mx w j
@@ -2832,7 +3306,7 @@ fn er_em_estep ei2 f64 k ulong mx view EstMix sw edit f64 3 sv edit f64 3 to voi
   for j ulong k
     g = div get lv j tot
     put sw j add get sw j g
-    put sv j add get sv j mul g ei2
+    put sv j add get sv j mul mul g ei ei
   end
 end
 
@@ -2841,7 +3315,7 @@ fn er_em_round n ulong k ulong floor_var f64 mx edit EstMix to void
   sv = new f64 3 0.0
   for i ulong n
     ei = get g_em_e i
-    er_em_estep mul ei ei k view mx sw sv
+    er_em_estep ei k view mx sw sv
   end
   ws = f64 0.0
   for j ulong k

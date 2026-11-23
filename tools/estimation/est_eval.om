@@ -1,0 +1,2834 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/estimation/est_eval.om -- EST-3 evaluation in pure seeded OM-2 (protocol v1
+note sections 4 and 5; --protocol-v2 for EST23_PROTOCOL_V2). Replaces est_eval.c.
+note   est_eval --params P --raw machine-state.ndjson --marks machine-state-marks.txt
+note            --out receipt.json [--recorded] [--synthetic-test]
+note   est_eval --protocol-v2 --params2 P2 --raw F --marks M --out R [--protocol-doc D]
+note            [--recorded] [--synthetic-test]
+note Takes the parameter file and the held-out file only; never fits. Refuses when the
+note parameter file was not fit on run A (unless --synthetic-test), and refuses run B
+note unless --recorded. Writes a JSON receipt and one stream per evaluated model.
+note Composed after: est_defs.om est_math.om est_types.om est_kf.om est_mix.om est_pred.om
+note est_v4.om est_replay.om and a generated toolid.om that defines
+note   text t_ee_tool_commit "<commit>"   const EE_TOOL_DIRTY ulong 0|1   const EE_TEST_BUILD ulong 0|1
+note (the build-time TOOL_COMMIT / TOOL_DIRTY / EST_TEST_BUILD of the C tool).
+
+const EE_ZC50 f64 0.674490
+const EE_ZC80 f64 1.281552
+const EE_ZC95 f64 1.959964
+const EE_TWO_PI f64 6.283185307179586
+const EE_MAX_PAIRS ulong 512
+const EE_PLEN ulong 1024
+
+note stat slots: f64 per model (26), ulong per model (24)
+const SF_COV ulong 0
+const SF_WLO ulong 3
+const SF_WHI ulong 6
+const SF_NIS ulong 9
+const SF_BIAS ulong 10
+const SF_LAG1 ulong 11
+const SF_LB ulong 12
+const SF_QCOV ulong 13
+const SF_RCOV ulong 17
+const SF_TCOV ulong 19
+const SF_TLO ulong 20
+const SF_THI ulong 21
+const SF_LS ulong 22
+const SF_RMSE ulong 23
+const SF_PERS ulong 24
+const SF_ZERO ulong 25
+const SF_N ulong 26
+const SU_N ulong 0
+const SU_QN ulong 1
+const SU_RN ulong 5
+const SU_TN ulong 7
+const SU_OKCOV ulong 8
+const SU_OKNIS ulong 11
+const SU_OKBIAS ulong 12
+const SU_OKLAG ulong 13
+const SU_OKQ ulong 14
+const SU_OKREG ulong 18
+const SU_OKTEN ulong 20
+const SU_CAL ulong 21
+const SU_RLE ulong 22
+const SU_N_ ulong 24
+
+note argument slots in g_ee_arg (EE_PLEN bytes each) and g_ee_alen
+const EA_PAR ulong 0
+const EA_RAW ulong 1
+const EA_MKS ulong 2
+const EA_OUT ulong 3
+const EA_PDOC ulong 4
+const EA_INT ulong 5
+
+text t_ee_pv2 "--protocol-v2"
+text t_ee_f_par "--params"
+text t_ee_f_par2 "--params2"
+text t_ee_f_raw "--raw"
+text t_ee_f_mks "--marks"
+text t_ee_f_out "--out"
+text t_ee_f_pdoc "--protocol-doc"
+text t_ee_f_int "--interpretations"
+text t_ee_f_rec "--recorded"
+text t_ee_f_syn "--synthetic-test"
+text t_ee_def_pdoc "docs/estimation/EST23_PROTOCOL_V1.md"
+text t_ee_def_int "docs/estimation/EST23_PROTOCOL_V1_INTERPRETATIONS.md"
+text t_ee_env_dirty "EST_TEST_DIRTY"
+text t_ee_env_c2r "EST_TEST_C2_RAW_SHA"
+text t_ee_env_c2m "EST_TEST_C2_MARKS_SHA"
+text t_ee_env_c1 "EST_TEST_C1_SHA"
+text t_ee_env_v2d "EST_TEST_V2_DOC_SHA"
+text t_ee_env_tmp "TMPDIR"
+text t_ee_tmp_def "/tmp"
+text t_ee_px_pre "/est_eval_prefix_"
+text t_ee_px_fn "/prefix.ndjson"
+text t_ee_tmpl "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+text t_ee_proc_exe "/proc/self/exe"
+text t_ee_unavail "unavailable"
+text t_ee_ms_ndj "machine-state.ndjson"
+text t_ee_beg " begin "
+text t_ee_end " end "
+text t_ee_true "true"
+text t_ee_false "false"
+text t_ee_null "null"
+text t_ee_PASS "PASS"
+text t_ee_FAIL "FAIL"
+text t_ee_dotM ".M"
+text t_ee_stream ".stream"
+
+text t_ee_u1 "usage: est_eval --params P --raw F --marks M --out R [--protocol-doc D] [--interpretations I] [--recorded] [--synthetic-test]\n"
+text t_ee_u2 "usage: est_eval --protocol-v2 --params2 P2 --raw F --marks M --out R [--protocol-doc D] [--recorded] [--synthetic-test]\n"
+text t_ee_e_unk "unknown argument "
+text t_ee_e_excl "refuse: --recorded and --synthetic-test are exclusive\n"
+text t_ee_e_rb_v2 "refuse: run B is closed evidence under protocol v1 and is never read by protocol v2\n"
+text t_ee_e_c2r "refuse: --recorded is accepted only for held-out run C2's raw file (path and SHA256SUMS digest must both match)\n"
+text t_ee_e_c2m "refuse: --recorded needs C2's own marks file (path and SHA256SUMS digest must both match)\n"
+text t_ee_e_dirty "refuse: --recorded needs a clean working tree at build time (TOOL_DIRTY="
+text t_ee_e_ho "refuse: the held-out run may only be evaluated with --recorded (protocol v2)\n"
+text t_ee_e_rbr "refuse: --recorded is accepted only for run B's raw file (path and SHA256SUMS digest must both match)\n"
+text t_ee_e_rbm "refuse: --recorded needs run B's own marks file (path and SHA256SUMS digest must both match)\n"
+text t_ee_e_rbnr "refuse: run B may only be evaluated with --recorded (protocol section 6)\n"
+text t_ee_e_p1fmt "refuse: parameter file is not exactly the expected format\n"
+text t_ee_e_p1val "refuse: parameter file: M"
+text t_ee_e_pv1 ": q or r not finite and positive\n"
+text t_ee_e_pv2a ": q "
+text t_ee_e_pv3a ": r "
+text t_ee_e_pv23 " is not on the protocol grid\n"
+text t_ee_e_p2fmt "refuse: v2 parameter file is not exactly the expected format\n"
+text t_ee_e_m2mix "refuse: M2 shape is not a valid mixture\n"
+text t_ee_e_m2qr "refuse: M2 q must be the shape's total variance and r must be 1e-12\n"
+text t_ee_e_v1bad "refuse: v1 parameter file "
+text t_ee_e_v1bad2 " is not valid\n"
+text t_ee_e_v1dig "refuse: v1 parameter file digest differs from the one recorded in the v2 parameter file\n"
+text t_ee_e_notac1 "refuse: M0/M1 must be fit on run A and M2 on run C1\n"
+text t_ee_e_m2sums "refuse: --recorded needs the M2 fit file to match its SHA256SUMS line\n"
+text t_ee_e_pdoc2 "refuse: --recorded needs the frozen v2 protocol document (SHA-256 "
+text t_ee_e_nota "refuse: parameter file was not fit on run A ("
+text t_ee_e_fsums "refuse: --recorded needs the fit file to be run A with a matching SHA256SUMS line\n"
+text t_ee_e_pdoc1 "refuse: --recorded needs the frozen protocol document (SHA-256 "
+text t_ee_e_pdoc1b ") and the interpretations file\n"
+text t_ee_e_c2raw "refuse: raw digest is not C2's\n"
+text t_ee_e_c2mks "refuse: marks digest is not C2's\n"
+text t_ee_e_braw "refuse: raw digest is not run B's\n"
+text t_ee_e_bmks "refuse: marks digest is not run B's\n"
+text t_ee_e_create "refuse: cannot create "
+text t_ee_e_create2 "; existing outputs are never overwritten\n"
+text t_ee_e_stream "cannot write stream "
+text t_ee_e_rfail "replay did not complete\n"
+text t_ee_e_replay "replay M"
+text t_ee_e_replay2 ": replay failed\n"
+text t_ee_e_mkmax "more than 512 marks pairs"
+text t_ee_err_exist "File exists"
+text t_ee_err_noent "No such file or directory"
+text t_ee_err_acces "Permission denied"
+text t_ee_err_notdir "Not a directory"
+text t_ee_err_isdir "Is a directory"
+text t_ee_err_rofs "Read-only file system"
+text t_ee_err_nospc "No space left on device"
+text t_ee_err_ntl "File name too long"
+text t_ee_err_unk "Unknown error "
+
+text t_ee_fc_0 "coverage_50"
+text t_ee_fc_1 "coverage_80"
+text t_ee_fc_2 "coverage_95"
+text t_ee_fc_3 "mean_nis"
+text t_ee_fc_4 "standardized_bias"
+text t_ee_fc_5 "lag1_autocorr"
+text t_ee_fc_6 "quarter_1"
+text t_ee_fc_7 "quarter_2"
+text t_ee_fc_8 "quarter_3"
+text t_ee_fc_9 "quarter_4"
+text t_ee_fc_10 "regime_idle"
+text t_ee_fc_11 "regime_in_trial"
+text t_ee_fc_12 "ten_step_coverage_95"
+text t_ee_fc_13 "samples_lt_3"
+text t_ee_fc_14 "rmse_vs_persistence"
+
+text t_ee_j_m1 "    \"M"
+text t_ee_j_m2 "\": {\n      \"q\": "
+text t_ee_j_r ", \"r\": "
+text t_ee_j_fl ", \"fit_loglik\": "
+text t_ee_j_nl ",\n"
+text t_ee_j_ps1 "      \"predictive_shape\": {\"kind\": \"gaussian_scale_mixture\", \"k\": "
+text t_ee_j_ps2 ", \"w\": ["
+text t_ee_j_ps3 "], \"v\": ["
+text t_ee_j_ps4 "]},\n"
+text t_ee_j_cm ", "
+text t_ee_j_sm "      \"samples\": "
+text t_ee_j_sp ", \"included_logical_span_ns\": ["
+text t_ee_j_spe "],\n"
+text t_ee_j_cov "      \"coverage_"
+text t_ee_j_cov2 "\": {\"value\": "
+text t_ee_j_wil ", \"wilson95\": ["
+text t_ee_j_pas "], \"pass\": "
+text t_ee_j_ce "},\n"
+text t_ee_j_nis "      \"mean_nis\": {\"value\": "
+text t_ee_j_bia "      \"standardized_bias\": {\"value\": "
+text t_ee_j_lag "      \"lag1_autocorr\": {\"value\": "
+text t_ee_j_pas2 ", \"pass\": "
+text t_ee_j_lb "      \"ljung_box_q10_reported_only\": "
+text t_ee_j_qh ",\n      \"quarters_coverage95\": [\n"
+text t_ee_j_qi "        {\"n\": "
+text t_ee_j_val ", \"value\": "
+text t_ee_j_qe "}"
+text t_ee_j_qc ","
+text t_ee_j_rh "      ],\n      \"regime_coverage95\": {\n"
+text t_ee_j_ri "        \"idle\": {\"n\": "
+text t_ee_j_rt "        \"in_trial\": {\"n\": "
+text t_ee_j_gat ", \"gated\": "
+text t_ee_j_rie "},\n"
+text t_ee_j_rte "}\n      },\n"
+text t_ee_j_ten "      \"ten_step_coverage95\": {\"n\": "
+text t_ee_j_ls "      \"log_score_per_step\": "
+text t_ee_j_rm ",\n      \"rmse_one_step\": "
+text t_ee_j_pr ", \"persistence_rmse\": "
+text t_ee_j_rle ", \"rmse_no_worse_than_persistence\": "
+text t_ee_j_zf "      \"zero_innovation_fraction_extra\": "
+text t_ee_j_cal "      \"calibrated\": "
+text t_ee_j_fc ",\n      \"failed_criteria\": ["
+text t_ee_j_fv "], \"failed_verdict_only\": ["
+text t_ee_j_end "]\n    }"
+
+text t_ee_h1_1 "{\n  \"receipt\": \"est_eval_v1\",\n  \"protocol\": \"EST23_PROTOCOL_V1\",\n  \"protocol_commit\": "
+text t_ee_h1_2 ",\n  \"protocol_doc_sha256\": \""
+text t_ee_h1_3 "\",\n  \"protocol_doc_matches_frozen_constant\": "
+text t_ee_h1_4 ",\n  \"interpretations_sha256\": \""
+text t_ee_h1_5 "\",\n"
+text t_ee_h2_1 "{\n  \"receipt\": \"est_eval_v2\",\n  \"protocol\": \"EST23_PROTOCOL_V2\",\n"
+text t_ee_h2_2 "  \"protocol_doc_sha256\": \""
+text t_ee_h2_3 "\",\n  \"protocol_doc_matches_frozen_constant\": "
+text t_ee_h_tc "  \"tool_commit\": "
+text t_ee_h_td ",\n  \"tool_dirty\": "
+text t_ee_h_eb ",\n  \"eval_binary_sha256\": \""
+text t_ee_h_rec "\",\n  \"recorded\": "
+text t_ee_h_syn ",\n  \"synthetic_test\": "
+text t_ee_h_pf ",\n  \"parameter_file\": "
+text t_ee_h_pfs ",\n  \"parameter_file_sha256\": \""
+text t_ee_h_pfv "\",\n  \"parameter_file_validated_on_grid\": true,\n"
+text t_ee_h_frp "  \"fit_run_path\": "
+text t_ee_h_ffs ",\n  \"fit_file_sha256\": \""
+text t_ee_h_fia "\",\n  \"fit_file_is_run_A\": "
+text t_ee_h_fsm ",\n  \"fit_sha_matches_run_A_SHA256SUMS_line\": "
+text t_ee_h_in ",\n  \"input_file\": "
+text t_ee_h_ins ",\n  \"input_file_sha256\": \""
+text t_ee_h_inm "\",\n  \"input_sha_matches_SHA256SUMS\": true,\n"
+text t_ee_h_note "  \"input_sha_note\": \"only the evaluated input is verified by this tool against its SHA256SUMS line (loading refuses otherwise); the fit file digest is as recorded in the parameter file\",\n"
+text t_ee_h_mks "  \"marks_file_sha256\": \""
+text t_ee_h_lines "\",\n  \"lines\": "
+text t_ee_h_mk1 ",\n  \"marks\": {\"pairs\": "
+text t_ee_h_mk2 ", \"begins\": "
+text t_ee_h_mk3 ", \"ends\": "
+text t_ee_h_mk4 ", \"unclosed_begin_ran_to_eof\": "
+text t_ee_h_mk5 ", \"nested_begins\": "
+text t_ee_h_mk6 ", \"stray_ends\": "
+text t_ee_h_mo1 "},\n  \"missing_observations\": {\"leading_before_first_valid\": "
+text t_ee_h_mo2 ", \"coasted\": "
+text t_ee_h_mo3 ", \"bad_value_lines\": "
+text t_ee_h_mo4 ", \"bad_t_lines\": "
+text t_ee_h_mo5 ", \"bad_t_overflow_lines\": "
+text t_ee_h_tg1 "},\n  \"time_gaps\": {\"duplicate_t\": "
+text t_ee_h_tg2 ", \"backward_t\": "
+text t_ee_h_tg3 ", \"steps_with_horizon_gt_1\": "
+text t_ee_h_tg4 ", \"m2_steps_beyond_exact_horizon\": "
+text t_ee_h_rd1 "},\n  \"readings\": {\"burn_in\": \"steps with L<"
+text t_ee_h_rd2 " counted from the prior line (L=0) are excluded\", \"quarters\": \"four equal spans of included samples by logical time\", \"ten_step_origins\": \"coasted origins skipped\""
+text t_ee_h_rd3 ", \"m2_intervals\": \"central quantiles of the h-step mixture sum\""
+text t_ee_h_rd4 "},\n"
+text t_ee_h_m2p "  \"m2_mean_is_exact_persistence\": "
+text t_ee_h_rp1 "  \"replay\": {\"complete\": "
+text t_ee_h_rp2 ", \"steps\": "
+text t_ee_h_rp3 ", \"expected_steps\": "
+text t_ee_h_rp4 ", \"chain_recorded_every_step\": "
+text t_ee_h_rp5 ", \"raw_file_unchanged\": "
+text t_ee_h_rp6 ",\n             \"prefix_invariance\": {\"method\": \"first k lines physically written to a temp file and replayed from scratch\", \"ks\": \"k=100,500,1000\", \"runs\": "
+text t_ee_h_rp7 ", \"pass\": "
+text t_ee_h_rp8 "}},\n"
+text t_ee_h_st1 "  \"streams\": {"
+text t_ee_h_st2 "\": {\"file\": "
+text t_ee_h_st3 ", \"sha256\": \""
+text t_ee_h_st4 "\"}"
+text t_ee_h_st5 "},\n  \"models\": {\n"
+text t_ee_h_sel1 "  },\n  \"selected_model\": "
+text t_ee_h_sel2 ",\n"
+text t_ee_h_fcl "  \"failure_class_to_be_recorded_by_a_human_on_FAIL\": null,\n"
+text t_ee_h_ers "  \"ESTIMATION_REAL_SIGNAL\": \""
+text t_ee_h_erc "\",\n  \"ESTIMATION_CALIBRATION\": \""
+text t_ee_h_end "\"\n}\n"
+text t_ee_h_v2pf "  \"parameter_file_v2\": "
+text t_ee_h_v2pfs ",\n  \"parameter_file_v2_sha256\": \""
+text t_ee_h_v2v1 "\",\n  \"v1_parameter_file\": "
+text t_ee_h_v2v1s ",\n  \"v1_parameter_file_sha256\": \""
+text t_ee_h_v2v1a "\",\n  \"v1_models_fit_on_run_A\": "
+text t_ee_h_v2frp ",\n  \"m2_fit_run_path\": "
+text t_ee_h_v2ffs ",\n  \"m2_fit_file_sha256\": \""
+text t_ee_h_v2fc1 "\",\n  \"m2_fit_is_run_C1\": "
+text t_ee_h_v2fsm ",\n  \"m2_fit_sha_matches_SHA256SUMS_line\": "
+text t_ee_h_v2fch ",\n  \"m2_fit_changes\": "
+text t_ee_h_v2in ",\n  \"input_file\": "
+text t_ee_h_v2ho "\",\n  \"input_sha_matches_SHA256SUMS\": true,\n  \"input_is_heldout_C2\": "
+text t_ee_h_v2mk ",\n  \"marks_file_sha256\": \""
+text t_ee_s_ers "ESTIMATION_REAL_SIGNAL="
+text t_ee_s_erc " ESTIMATION_CALIBRATION="
+text t_ee_s_sel " selected="
+text t_ee_s_none "none-1"
+text t_ee_s_rh " receipt_sha256="
+
+note ---- state ----
+global g_ee_mk_b long 512
+global g_ee_mk_e long 512
+global g_ee_mk_m ulong 8
+global g_ee_mk_sha uchar 65
+global g_ee_sq_t f64 195
+global g_ee_sq_have ulong 65
+global g_ee_sq_beyond ulong 1
+global g_ee_w f64 8192
+global g_ee_nu f64 8192
+global g_ee_sf f64 78
+global g_ee_su ulong 72
+global g_ee_sl long 6
+global g_ee_arg uchar 7168
+global g_ee_alen ulong 7
+global g_ee_pm ulong 1
+global g_ee_flag ulong 2
+global g_ee_spath uchar 3300
+global g_ee_splen ulong 3
+global g_ee_shash uchar 195
+global g_ee_hex uchar 520
+global g_ee_q f64 3
+global g_ee_r f64 3
+global g_ee_ll f64 3
+global g_ee_res ulong 16
+global g_ee_mxk ulong 1
+global g_ee_mxw f64 3
+global g_ee_mxv f64 3
+global g_ee_tmp uchar 1200
+global g_ee_tlen ulong 1
+
+note g_ee_hex slots (65 bytes each): 0 params, 1 pdoc, 2 interp, 3 binary, 4 v1 params, 5 receipt,
+note 6 raw file after evaluation. g_ee_arg slot 6 holds /proc/self/exe.
+note g_ee_res: 0 replay_ok 1 chain_ok 2 prefix_ok 3 prefix_ran 4 expect_steps 5 raw_preserved
+note 6 streams_ok 7 sel+1 8 real_signal 9 calib 10 m2_persist 11 beyond 12 pdoc_ok 13 pdoc_matches
+note 14 interp_ok 15 fit_sums_ok
+
+fn ee_b v ulong to void
+  if ne v 0
+    ob_t t_ee_true
+  else
+    ob_t t_ee_false
+  end
+end
+
+fn ee_bb v bool to void
+  if v
+    ob_t t_ee_true
+  else
+    ob_t t_ee_false
+  end
+end
+
+fn ee_bool_u v bool to ulong
+  if v
+    ret 1
+  end
+  ret 0
+end
+
+fn ee_arg_base slot ulong to ulong
+  ret mul slot EE_PLEN
+end
+
+fn ee_arg_copy slot ulong dst edit uchar 1024 to ulong
+  n = get g_ee_alen slot
+  b = ee_arg_base slot
+  for i ulong n
+    put dst i get g_ee_arg add b i
+  end
+  ret n
+end
+
+fn ee_arg_json slot ulong to void
+  buf = new uchar 1024 0
+  n = ee_arg_copy slot buf
+  ob_json_str view buf n
+end
+
+fn ee_set_text slot ulong s view uchar * to void
+  n = len s
+  b = ee_arg_base slot
+  for i ulong n
+    put g_ee_arg add b i get s i
+  end
+  put g_ee_alen slot n
+end
+
+fn ee_hex_slot slot ulong dst edit uchar 65 to void
+  b = mul slot 65
+  for i ulong 64
+    put dst i get g_ee_hex add b i
+  end
+end
+
+fn ee_hex_put slot ulong src view uchar 65 to void
+  b = mul slot 65
+  for i ulong 64
+    put g_ee_hex add b i get src i
+  end
+  put g_ee_hex add b 64 1
+end
+
+fn ee_hex_unavail slot ulong to void
+  b = mul slot 65
+  for i ulong 11
+    put g_ee_hex add b i get t_ee_unavail i
+  end
+  put g_ee_hex add b 64 0
+end
+
+fn ee_hex_out slot ulong to void
+  b = mul slot 65
+  if ne get g_ee_hex add b 64 0
+    for i ulong 64
+      ob_c get g_ee_hex add b i
+    end
+  else
+    ob_t t_ee_unavail
+  end
+end
+
+note SHA-256 of the file named by an argument slot into hex slot hs; 0 on success.
+fn ee_sha_arg slot ulong hs ulong to long
+  buf = new uchar 1024 0
+  hx = new uchar 65 0
+  n = ee_arg_copy slot buf
+  if ne er_sha_file view buf n hx 0
+    ee_hex_unavail hs
+    ret 1
+  end
+  ee_hex_put hs view hx
+  ret 0
+end
+
+fn ee_is_space c uchar to bool
+  if eq c 32
+    ret true
+  end
+  ret and ge c 9 le c 13
+end
+
+note atoi of EST_TEST_DIRTY when the test build has it set and nonempty (C tool_dirty)
+fn ee_tool_dirty to long
+  buf = new uchar 65 0
+  if ne EE_TEST_BUILD 0
+    r = er_getenv t_ee_env_dirty len t_ee_env_dirty buf 64
+    if gt r 0
+      n = ulong r
+      i = ulong 0
+      while lt i n bound 64
+        if not ee_is_space get buf i
+          break
+        end
+        i = add i 1
+      end
+      sg = long 1
+      c = get buf i
+      if eq c 45
+        sg = -1
+        i = add i 1
+      end
+      if eq c 43
+        i = add i 1
+      end
+      v = long 0
+      while lt i n bound 64
+        d = get buf i
+        if or lt d 48 gt d 57
+          break
+        end
+        v = add mul v 10 long sub d 48
+        i = add i 1
+      end
+      ret mul v sg
+    end
+  end
+  ret long EE_TOOL_DIRTY
+end
+
+note Text identity with a test-build environment override (C v2_* helpers).
+fn ee_env_or_text key view uchar * kn ulong dflt view uchar * dst edit uchar 65 to ulong
+  if ne EE_TEST_BUILD 0
+    r = er_getenv key kn dst 64
+    if gt r 0
+      ret ulong r
+    end
+  end
+  dn = len dflt
+  for i ulong dn
+    put dst i get dflt i
+  end
+  ret dn
+end
+
+fn ee_wilson k ulong n ulong lo_i ulong hi_i ulong to void
+  z = EE_ZC95
+  dn = f64 n
+  p = div f64 k dn
+  z2 = mul z z
+  den = add f64 1.0 div z2 dn
+  c = div add p div z2 mul f64 2.0 dn den
+  t1 = div mul p sub f64 1.0 p dn
+  t2 = div z2 mul mul f64 4.0 dn dn
+  h = div mul z fsqrt add t1 t2 den
+  put g_ee_sf lo_i sub c h
+  put g_ee_sf hi_i add c h
+end
+
+fn ee_in_band v f64 lo f64 hi f64 to ulong
+  if and ge v lo le v hi
+    ret 1
+  end
+  ret 0
+end
+
+note ---- marks ----
+
+fn ee_mk_push b long e long to long
+  mn = get g_ee_mk_m 0
+  if ge mn EE_MAX_PAIRS
+    er_err_reset
+    er_err_add t_ee_e_mkmax len t_ee_e_mkmax
+    ret 1
+  end
+  put g_ee_mk_b mn b
+  put g_ee_mk_e mn e
+  put g_ee_mk_m 0 add mn 1
+  ret 0
+end
+
+fn ee_line_has ln view uchar 4096 used ulong ll ulong pat view uchar * to bool
+  pn = len pat
+  if lt sub ll used pn
+    ret false
+  end
+  for k ulong pn
+    if ne get ln add used k get pat k
+      ret false
+    end
+  end
+  ret true
+end
+
+note one marks line; st[0] open_t, st[1] is_open. 1 when the pair table is full.
+fn ee_mk_line i ulong st edit long 2 to long
+  t_o = new long 1 0
+  u_o = new ulong 1 0
+  ln = new uchar 4096 0
+  loff = get g_ef_off add EF_MAX_LINES i
+  ll = get g_ef_llen add EF_MAX_LINES i
+  if gt ll 4096
+    ll = 4096
+  end
+  for j ulong ll
+    put ln j get g_ef_data add add EF_MAX_BYTES loff j
+  end
+  if ne est_parse_time_prefix view ln 0 ll t_o u_o 0
+    ret 0
+  end
+  tv = get t_o 0
+  used = get u_o 0
+  if ee_line_has view ln used ll t_ee_beg
+    put g_ee_mk_m 1 add get g_ee_mk_m 1 1
+    if ne get st 1 0
+      put g_ee_mk_m 4 add get g_ee_mk_m 4 1
+      if ne ee_mk_push get st 0 tv 0
+        ret 1
+      end
+    end
+    put st 0 tv
+    put st 1 1
+    ret 0
+  end
+  if ee_line_has view ln used ll t_ee_end
+    put g_ee_mk_m 2 add get g_ee_mk_m 2 1
+    if eq get st 1 0
+      put g_ee_mk_m 5 add get g_ee_mk_m 5 1
+      ret 0
+    end
+    if ne ee_mk_push get st 0 tv 0
+      ret 1
+    end
+    put st 1 0
+  end
+  ret 0
+end
+
+fn ee_load_marks path view uchar 1024 plen ulong to long
+  sh = new uchar 65 0
+  st = new long 2 0
+  for i ulong 8
+    put g_ee_mk_m i 0
+  end
+  if ne er_file_load 1 path plen 0
+    ret 1
+  end
+  er_file_get_sha 1 sh
+  for i ulong 64
+    put g_ee_mk_sha i get sh i
+  end
+  nl = get g_ef_nlines 1
+  for i ulong nl
+    if ne ee_mk_line i st 0
+      ret 1
+    end
+  end
+  if ne get st 1 0
+    if ne ee_mk_push get st 0 long 9223372036854775807 0
+      ret 1
+    end
+    put g_ee_mk_m 3 1
+  end
+  ret 0
+end
+
+fn ee_in_trial t long to ulong
+  mn = get g_ee_mk_m 0
+  for i ulong mn
+    if ge t get g_ee_mk_b i
+      if le t get g_ee_mk_e i
+        ret 1
+      end
+    end
+  end
+  ret 0
+end
+
+note ---- per-step comparison (prefix invariance) ----
+
+fn ee_step_eq_f a ulong b ulong to bool
+  if ne bitcast ulong get g_rps_z a bitcast ulong get g_rps_z b
+    ret false
+  end
+  if ne bitcast ulong get g_rps_ym a bitcast ulong get g_rps_ym b
+    ret false
+  end
+  if ne bitcast ulong get g_rps_S a bitcast ulong get g_rps_S b
+    ret false
+  end
+  if ne bitcast ulong get g_rps_nu a bitcast ulong get g_rps_nu b
+    ret false
+  end
+  if ne bitcast ulong get g_rps_nis a bitcast ulong get g_rps_nis b
+    ret false
+  end
+  for i ulong 2
+    if ne bitcast ulong get g_rps_px add mul a 2 i bitcast ulong get g_rps_px add mul b 2 i
+      ret false
+    end
+  end
+  for i ulong 4
+    if ne bitcast ulong get g_rps_pP add mul a 4 i bitcast ulong get g_rps_pP add mul b 4 i
+      ret false
+    end
+  end
+  for i ulong 20
+    if ne get g_rps_dig add mul a 20 i get g_rps_dig add mul b 20 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ee_step_equal a ulong b ulong to bool
+  if ne get g_rps_line a get g_rps_line b
+    ret false
+  end
+  if ne get g_rps_L a get g_rps_L b
+    ret false
+  end
+  if ne get g_rps_flags a get g_rps_flags b
+    ret false
+  end
+  if ne get g_rps_wall a get g_rps_wall b
+    ret false
+  end
+  if ne get g_rps_tns a get g_rps_tns b
+    ret false
+  end
+  if ne get g_rps_hor a get g_rps_hor b
+    ret false
+  end
+  if ne get g_rps_pgen a get g_rps_pgen b
+    ret false
+  end
+  if ne get g_rps_ptns a get g_rps_ptns b
+    ret false
+  end
+  ret ee_step_eq_f a b
+end
+
+note ---- mixture interval thresholds, cached per horizon (C shape_q) ----
+
+fn ee_mx_fill mx edit EstMix to void
+  put mx k get g_ee_mxk 0
+  for j ulong 3
+    put mx w j get g_ee_mxw j
+    put mx v j get g_ee_mxv j
+  end
+end
+
+fn ee_shape_thr h ulong thr edit f64 3 to long
+  res = new f64 1 0.0
+  mx = new EstMix 0 0.0 0.0
+  ee_mx_fill mx
+  if or lt h 1 gt h EST_MIX_MAX_H
+    put g_ee_sq_beyond 0 add get g_ee_sq_beyond 0 1
+    ret 1
+  end
+  if eq get g_ee_sq_have h 0
+    if ne est_mix_quantile_abs view mx h f64 0.50 res EST_OK
+      ret 1
+    end
+    put g_ee_sq_t mul h 3 get res 0
+    if ne est_mix_quantile_abs view mx h f64 0.80 res EST_OK
+      ret 1
+    end
+    put g_ee_sq_t add mul h 3 1 get res 0
+    if ne est_mix_quantile_abs view mx h f64 0.95 res EST_OK
+      ret 1
+    end
+    put g_ee_sq_t add mul h 3 2 get res 0
+    put g_ee_sq_have h 1
+  end
+  for k ulong 3
+    put thr k get g_ee_sq_t add mul h 3 k
+  end
+  ret 0
+end
+
+note ---- statistics (C compute) ----
+
+fn ee_clear_stats m ulong to void
+  for k ulong SF_N
+    put g_ee_sf add mul m SF_N k f64 0.0
+  end
+  for k ulong SU_N_
+    put g_ee_su add mul m SU_N_ k 0
+  end
+  put g_ee_sl mul m 2 0
+  put g_ee_sl add mul m 2 1 0
+  for h ulong 65
+    put g_ee_sq_have h 0
+  end
+  put g_ee_sq_beyond 0 0
+end
+
+fn ee_tspan rslot ulong m ulong to void
+  ns = get g_rp_meta mul rslot 16
+  tmin = long 0
+  tmax = long 0
+  first = ulong 1
+  for i ulong ns
+    idx = add mul rslot RP_MAX_STEPS i
+    if ne and get g_rps_flags idx 3 0
+      continue
+    end
+    if lt get g_rps_L idx EST_BURN_IN
+      continue
+    end
+    t = get g_rps_tns idx
+    if ne first 0
+      tmin = t
+      tmax = t
+      first = 0
+    end
+    if lt t tmin
+      tmin = t
+    end
+    if gt t tmax
+      tmax = t
+    end
+  end
+  put g_ee_sl mul m 2 tmin
+  put g_ee_sl add mul m 2 1 tmax
+end
+
+note acc f64: 0 snis 1 sls 2 sse 3 ssp 4 prev_z
+note cnt ulong: 0 n 1..3 hit 4 zero 5 have_prev 6..9 qh 10..11 rh
+fn ee_step_thr idx ulong use_mx ulong thr edit f64 3 to void
+  sd = fsqrt get g_rps_S idx
+  put thr 0 mul EE_ZC50 sd
+  put thr 1 mul EE_ZC80 sd
+  put thr 2 mul EE_ZC95 sd
+  if ne use_mx 0
+    if ne ee_shape_thr get g_rps_hor idx thr 0
+      put thr 0 f64 -1.0
+      put thr 1 f64 -1.0
+      put thr 2 f64 -1.0
+    end
+  end
+end
+
+fn ee_step_logscore idx ulong use_mx ulong to f64
+  lp = new f64 1 0.0
+  mx = new EstMix 0 0.0 0.0
+  if ne use_mx 0
+    ee_mx_fill mx
+    put lp 0 est_ninf
+    h = get g_rps_hor idx
+    if and ge h 1 le h EST_MIX_MAX_H
+      ign = est_mix_logpdf view mx h get g_rps_nu idx lp
+    end
+    ret get lp 0
+  end
+  ret mul f64 -0.5 add est_log mul EE_TWO_PI get g_rps_S idx get g_rps_nis idx
+end
+
+fn ee_quarter t long tmin long tmax long to ulong
+  q = div mul 4 sub t tmin add sub tmax tmin 1
+  if lt q 0
+    q = 0
+  end
+  if gt q 3
+    q = 3
+  end
+  ret ulong q
+end
+
+fn ee_cnt_inc cnt edit ulong 12 i ulong to void
+  put cnt i add get cnt i 1
+end
+
+fn ee_su_inc i ulong to void
+  put g_ee_su i add get g_ee_su i 1
+end
+
+note interval hits of an included step; returns 1 when |nu| is inside the 95% interval
+fn ee_include_hits idx ulong use_mx ulong cnt edit ulong 12 to ulong
+  thr = new f64 3 0.0
+  ee_step_thr idx use_mx thr
+  nuv = get g_rps_nu idx
+  sd = fsqrt get g_rps_S idx
+  a = fabs nuv
+  n = get cnt 0
+  put g_ee_nu n nuv
+  put g_ee_w n div nuv sd
+  put cnt 0 add n 1
+  for k ulong 3
+    if le a get thr k
+      ee_cnt_inc cnt add 1 k
+    end
+  end
+  if le a get thr 2
+    ret 1
+  end
+  ret 0
+end
+
+fn ee_include_acc idx ulong use_mx ulong acc edit f64 5 cnt edit ulong 12 to void
+  nuv = get g_rps_nu idx
+  put acc 0 add get acc 0 get g_rps_nis idx
+  put acc 1 add get acc 1 ee_step_logscore idx use_mx
+  put acc 2 add get acc 2 mul nuv nuv
+  if eq nuv f64 0.0
+    ee_cnt_inc cnt 4
+  end
+  if ne get cnt 5 0
+    e = sub get g_rps_z idx get acc 4
+    put acc 3 add get acc 3 mul e e
+  end
+end
+
+fn ee_include_bins idx ulong m ulong h95 ulong cnt edit ulong 12 to void
+  tmin = get g_ee_sl mul m 2
+  tmax = get g_ee_sl add mul m 2 1
+  tv = get g_rps_tns idx
+  q = ee_quarter tv tmin tmax
+  ub = mul m SU_N_
+  ee_su_inc add add ub SU_QN q
+  if ne h95 0
+    ee_cnt_inc cnt add 6 q
+  end
+  rg = ulong 0
+  if ne and get g_rps_flags idx 4 0
+    rg = ee_in_trial get g_rps_wall idx
+  end
+  ee_su_inc add add ub SU_RN rg
+  if ne h95 0
+    ee_cnt_inc cnt add 10 rg
+  end
+end
+
+fn ee_include idx ulong m ulong use_mx ulong acc edit f64 5 cnt edit ulong 12 to void
+  h95 = ee_include_hits idx use_mx cnt
+  ee_include_acc idx use_mx acc cnt
+  ee_include_bins idx m h95 cnt
+end
+
+fn ee_pass1 rslot ulong m ulong use_mx ulong acc edit f64 5 cnt edit ulong 12 to void
+  ns = get g_rp_meta mul rslot 16
+  for i ulong ns
+    idx = add mul rslot RP_MAX_STEPS i
+    fl = get g_rps_flags idx
+    if ne and fl 1 0
+      put acc 4 get g_rps_z idx
+      put cnt 5 1
+      continue
+    end
+    if ne and fl 2 0
+      continue
+    end
+    if ge get g_rps_L idx EST_BURN_IN
+      ee_include idx m use_mx acc cnt
+    end
+    put acc 4 get g_rps_z idx
+    put cnt 5 1
+  end
+end
+
+fn ee_mean_bias m ulong n ulong to void
+  dn = f64 n
+  mn = f64 0.0
+  for i ulong n
+    mn = add mn get g_ee_nu i
+  end
+  mn = div mn dn
+  v = f64 0.0
+  for i ulong n
+    d = sub get g_ee_nu i mn
+    v = add v mul d d
+  end
+  sdv = fsqrt div v sub dn f64 1.0
+  b = est_inf
+  if gt sdv f64 0.0
+    b = div mn sdv
+  end
+  put g_ee_sf add mul m SF_N SF_BIAS b
+end
+
+fn ee_acf_lag k ulong n ulong wm f64 to f64
+  num = f64 0.0
+  for i ulong sub n k
+    a = sub get g_ee_w i wm
+    b = sub get g_ee_w add i k wm
+    num = add num mul a b
+  end
+  ret num
+end
+
+fn ee_acf m ulong n ulong to void
+  dn = f64 n
+  wm = f64 0.0
+  for i ulong n
+    wm = add wm get g_ee_w i
+  end
+  wm = div wm dn
+  den = f64 0.0
+  for i ulong n
+    d = sub get g_ee_w i wm
+    den = add den mul d d
+  end
+  lb = f64 0.0
+  for k1 ulong 10
+    k = add k1 1
+    if ge k n
+      break
+    end
+    num = ee_acf_lag k n wm
+    rk = f64 0.0
+    if gt den f64 0.0
+      rk = div num den
+    end
+    if eq k 1
+      put g_ee_sf add mul m SF_N SF_LAG1 rk
+    end
+    lb = add lb div mul rk rk sub dn f64 k
+  end
+  put g_ee_sf add mul m SF_N SF_LB mul mul dn add dn f64 2.0 lb
+end
+
+fn ee_post_n m ulong acc view f64 5 cnt view ulong 12 to void
+  n = get cnt 0
+  fb = mul m SF_N
+  put g_ee_su mul m SU_N_ n
+  if lt n 3
+    ret
+  end
+  dn = f64 n
+  for k ulong 3
+    hk = get cnt add 1 k
+    put g_ee_sf add fb add SF_COV k div f64 hk dn
+    ee_wilson hk n add fb add SF_WLO k add fb add SF_WHI k
+  end
+  put g_ee_sf add fb SF_NIS div get acc 0 dn
+  ee_mean_bias m n
+  ee_acf m n
+  put g_ee_sf add fb SF_LS div get acc 1 dn
+  put g_ee_sf add fb SF_RMSE fsqrt div get acc 2 dn
+  put g_ee_sf add fb SF_PERS fsqrt div get acc 3 dn
+  put g_ee_sf add fb SF_ZERO div f64 get cnt 4 dn
+end
+
+fn ee_post_qr m ulong cnt view ulong 12 to void
+  fb = mul m SF_N
+  ub = mul m SU_N_
+  for q ulong 4
+    qn = get g_ee_su add ub add SU_QN q
+    v = f64 0.0
+    if gt qn 0
+      v = div f64 get cnt add 6 q f64 qn
+    end
+    put g_ee_sf add fb add SF_QCOV q v
+  end
+  for g ulong 2
+    rn = get g_ee_su add ub add SU_RN g
+    v = f64 0.0
+    if gt rn 0
+      v = div f64 get cnt add 10 g f64 rn
+    end
+    put g_ee_sf add fb add SF_RCOV g v
+  end
+end
+
+note Ten-step target of step i: the first step j > i at t_ns == target that is not coasted,
+note scanning while t_ns <= target. Returns j + 1, or 0 when there is none.
+fn ee_ten_target rslot ulong i ulong target long to ulong
+  ns = get g_rp_meta mul rslot 16
+  base = mul rslot RP_MAX_STEPS
+  j = add i 1
+  while lt j ns bound 8192
+    tj = get g_rps_tns add base j
+    if gt tj target
+      ret 0
+    end
+    if eq tj target
+      if eq and get g_rps_flags add base j 2 0
+        ret add j 1
+      end
+    end
+    j = add j 1
+  end
+  ret 0
+end
+
+note ten-step prediction from the posterior of step i: po[0] S[0], po[1] y_mean[0]
+fn ee_ten_pred rslot ulong i ulong po edit f64 2 to long
+  mdl = new ulong 280 0
+  bel = new ulong 96 0
+  pred = new ulong 176 0
+  bu = new f64 8 0.0
+  mb = mul rslot 280
+  for k ulong 280
+    put mdl k get g_rp_mdl add mb k
+  end
+  er_load_post rslot i view mdl bel
+  if ne est_kf_predict view mdl view bel 0 view bu 10 pred EST_OK
+    ret 1
+  end
+  put po 0 bitcast f64 get pred EP_S
+  put po 1 bitcast f64 get pred EP_YM
+  ret 0
+end
+
+fn ee_ten_thr s f64 use_mx ulong to f64
+  tt = new f64 3 0.0
+  t10 = mul EE_ZC95 fsqrt s
+  if ne use_mx 0
+    if ne ee_shape_thr 10 tt 0
+      ret f64 -1.0
+    end
+    ret get tt 2
+  end
+  ret t10
+end
+
+fn ee_ten_hit rslot ulong i ulong jt ulong use_mx ulong to long
+  pr = new f64 2 0.0
+  if ne ee_ten_pred rslot i pr 0
+    ret -1
+  end
+  t10 = ee_ten_thr get pr 0 use_mx
+  zt = get g_rps_z add mul rslot RP_MAX_STEPS jt
+  if le fabs sub zt get pr 1 t10
+    ret 1
+  end
+  ret 0
+end
+
+fn ee_ten rslot ulong m ulong use_mx ulong to void
+  ns = get g_rp_meta mul rslot 16
+  base = mul rslot RP_MAX_STEPS
+  tn = ulong 0
+  th = ulong 0
+  for i ulong ns
+    idx = add base i
+    if ne and get g_rps_flags idx 3 0
+      continue
+    end
+    if lt get g_rps_L idx EST_BURN_IN
+      continue
+    end
+    target = add get g_rps_tns idx long 10000000000
+    jt = ee_ten_target rslot i target
+    if eq jt 0
+      continue
+    end
+    hr = ee_ten_hit rslot i sub jt 1 use_mx
+    if lt hr 0
+      continue
+    end
+    tn = add tn 1
+    if gt hr 0
+      th = add th 1
+    end
+  end
+  fb = mul m SF_N
+  put g_ee_su add mul m SU_N_ SU_TN tn
+  if gt tn 0
+    put g_ee_sf add fb SF_TCOV div f64 th f64 tn
+    ee_wilson th tn add fb SF_TLO add fb SF_THI
+  end
+end
+
+fn ee_rules m ulong to void
+  fb = mul m SF_N
+  ub = mul m SU_N_
+  n = get g_ee_su ub
+  put g_ee_su add ub SU_OKCOV ee_in_band get g_ee_sf add fb SF_COV f64 0.46 f64 0.54
+  put g_ee_su add ub add SU_OKCOV 1 ee_in_band get g_ee_sf add fb add SF_COV 1 f64 0.76 f64 0.84
+  put g_ee_su add ub add SU_OKCOV 2 ee_in_band get g_ee_sf add fb add SF_COV 2 f64 0.93 f64 0.97
+  put g_ee_su add ub SU_OKNIS ee_in_band get g_ee_sf add fb SF_NIS f64 0.80 f64 1.25
+  put g_ee_su add ub SU_OKBIAS ee_bool_u le fabs get g_ee_sf add fb SF_BIAS f64 0.10
+  put g_ee_su add ub SU_OKLAG ee_bool_u le fabs get g_ee_sf add fb SF_LAG1 f64 0.20
+  cal = ulong 0
+  if ge n 3
+    cal = 1
+    for k ulong 3
+      if eq get g_ee_su add ub add SU_OKCOV k 0
+        cal = 0
+      end
+    end
+    if eq get g_ee_su add ub SU_OKNIS 0
+      cal = 0
+    end
+    if eq get g_ee_su add ub SU_OKBIAS 0
+      cal = 0
+    end
+    if eq get g_ee_su add ub SU_OKLAG 0
+      cal = 0
+    end
+  end
+  for q ulong 4
+    okq = ulong 0
+    if gt get g_ee_su add ub add SU_QN q 0
+      okq = ee_in_band get g_ee_sf add fb add SF_QCOV q f64 0.90 f64 0.99
+    end
+    put g_ee_su add ub add SU_OKQ q okq
+    if eq okq 0
+      cal = 0
+    end
+  end
+  for g ulong 2
+    okr = ulong 1
+    if ge get g_ee_su add ub add SU_RN g 100
+      okr = ee_in_band get g_ee_sf add fb add SF_RCOV g f64 0.90 f64 0.99
+    end
+    put g_ee_su add ub add SU_OKREG g okr
+    if eq okr 0
+      cal = 0
+    end
+  end
+  okt = ulong 0
+  if gt get g_ee_su add ub SU_TN 0
+    okt = ee_in_band get g_ee_sf add fb SF_TCOV f64 0.90 f64 0.99
+  end
+  put g_ee_su add ub SU_OKTEN okt
+  if eq okt 0
+    cal = 0
+  end
+  put g_ee_su add ub SU_CAL cal
+  rle = ulong 0
+  if ge n 3
+    rle = ee_bool_u le get g_ee_sf add fb SF_RMSE get g_ee_sf add fb SF_PERS
+  end
+  put g_ee_su add ub SU_RLE rle
+end
+
+fn ee_compute rslot ulong m ulong use_mx ulong to void
+  acc = new f64 5 0.0
+  cnt = new ulong 12 0
+  ee_clear_stats m
+  ee_tspan rslot m
+  ee_pass1 rslot m use_mx acc cnt
+  ee_post_n m view acc view cnt
+  ee_post_qr m view cnt
+  ee_ten rslot m use_mx
+  ee_rules m
+  if ne use_mx 0
+    put g_ee_res 11 get g_ee_sq_beyond 0
+  end
+end
+
+note ---- receipt pieces ----
+
+fn ee_jn v f64 to void
+  ob_json_num v
+end
+
+fn ee_sfv m ulong k ulong to f64
+  ret get g_ee_sf add mul m SF_N k
+end
+
+fn ee_suv m ulong k ulong to ulong
+  ret get g_ee_su add mul m SU_N_ k
+end
+
+fn ee_fc_name i ulong to void
+  if eq i 0
+    ob_t t_ee_fc_0
+  end
+  if eq i 1
+    ob_t t_ee_fc_1
+  end
+  if eq i 2
+    ob_t t_ee_fc_2
+  end
+  if eq i 3
+    ob_t t_ee_fc_3
+  end
+  if eq i 4
+    ob_t t_ee_fc_4
+  end
+  if eq i 5
+    ob_t t_ee_fc_5
+  end
+  if eq i 6
+    ob_t t_ee_fc_6
+  end
+  if eq i 7
+    ob_t t_ee_fc_7
+  end
+  if eq i 8
+    ob_t t_ee_fc_8
+  end
+  if eq i 9
+    ob_t t_ee_fc_9
+  end
+  if eq i 10
+    ob_t t_ee_fc_10
+  end
+  if eq i 11
+    ob_t t_ee_fc_11
+  end
+  if eq i 12
+    ob_t t_ee_fc_12
+  end
+  if eq i 13
+    ob_t t_ee_fc_13
+  end
+  if eq i 14
+    ob_t t_ee_fc_14
+  end
+end
+
+fn ee_fc ok ulong i ulong first edit ulong 1 to void
+  if ne ok 0
+    ret
+  end
+  if eq get first 0 0
+    ob_t t_ee_j_cm
+  end
+  ob_c 34
+  ee_fc_name i
+  ob_c 34
+  put first 0 0
+end
+
+fn ee_fc_slot ok_slot ulong m ulong i ulong first edit ulong 1 to void
+  ee_fc ee_suv m ok_slot i first
+end
+
+fn ee_emit_head m ulong use_mx ulong to void
+  ob_t t_ee_j_m1
+  ob_u m
+  ob_t t_ee_j_m2
+  ee_jn get g_ee_q m
+  ob_t t_ee_j_r
+  ee_jn get g_ee_r m
+  ob_t t_ee_j_fl
+  ee_jn get g_ee_ll m
+  ob_t t_ee_j_nl
+  if ne use_mx 0
+    k = get g_ee_mxk 0
+    ob_t t_ee_j_ps1
+    ob_u k
+    ob_t t_ee_j_ps2
+    for j ulong k
+      if gt j 0
+        ob_t t_ee_j_cm
+      end
+      ee_jn get g_ee_mxw j
+    end
+    ob_t t_ee_j_ps3
+    for j ulong k
+      if gt j 0
+        ob_t t_ee_j_cm
+      end
+      ee_jn get g_ee_mxv j
+    end
+    ob_t t_ee_j_ps4
+  end
+  ob_t t_ee_j_sm
+  ob_u ee_suv m SU_N
+  ob_t t_ee_j_sp
+  ob_i get g_ee_sl mul m 2
+  ob_t t_ee_j_cm
+  ob_i get g_ee_sl add mul m 2 1
+  ob_t t_ee_j_spe
+end
+
+fn ee_emit_cov m ulong to void
+  for k ulong 3
+    ob_t t_ee_j_cov
+    if eq k 0
+      ob_c 53
+      ob_c 48
+    end
+    if eq k 1
+      ob_c 56
+      ob_c 48
+    end
+    if eq k 2
+      ob_c 57
+      ob_c 53
+    end
+    ob_t t_ee_j_cov2
+    ee_jn ee_sfv m add SF_COV k
+    ob_t t_ee_j_wil
+    ee_jn ee_sfv m add SF_WLO k
+    ob_t t_ee_j_cm
+    ee_jn ee_sfv m add SF_WHI k
+    ob_t t_ee_j_pas
+    ee_b ee_suv m add SU_OKCOV k
+    ob_t t_ee_j_ce
+  end
+  ob_t t_ee_j_nis
+  ee_jn ee_sfv m SF_NIS
+  ob_t t_ee_j_pas2
+  ee_b ee_suv m SU_OKNIS
+  ob_t t_ee_j_ce
+  ob_t t_ee_j_bia
+  ee_jn ee_sfv m SF_BIAS
+  ob_t t_ee_j_pas2
+  ee_b ee_suv m SU_OKBIAS
+  ob_t t_ee_j_ce
+  ob_t t_ee_j_lag
+  ee_jn ee_sfv m SF_LAG1
+  ob_t t_ee_j_pas2
+  ee_b ee_suv m SU_OKLAG
+  ob_t t_ee_j_ce
+  ob_t t_ee_j_lb
+  ee_jn ee_sfv m SF_LB
+end
+
+fn ee_emit_regime m ulong g ulong to void
+  rn = ee_suv m add SU_RN g
+  if eq g 0
+    ob_t t_ee_j_ri
+  else
+    ob_t t_ee_j_rt
+  end
+  ob_u rn
+  ob_t t_ee_j_val
+  ee_jn ee_sfv m add SF_RCOV g
+  ob_t t_ee_j_gat
+  ee_bb ge rn 100
+  ob_t t_ee_j_pas2
+  ee_b ee_suv m add SU_OKREG g
+  if eq g 0
+    ob_t t_ee_j_rie
+  else
+    ob_t t_ee_j_rte
+  end
+end
+
+fn ee_emit_qr m ulong to void
+  ob_t t_ee_j_qh
+  for q ulong 4
+    ob_t t_ee_j_qi
+    ob_u ee_suv m add SU_QN q
+    ob_t t_ee_j_val
+    ee_jn ee_sfv m add SF_QCOV q
+    ob_t t_ee_j_pas2
+    ee_b ee_suv m add SU_OKQ q
+    ob_t t_ee_j_qe
+    if lt q 3
+      ob_t t_ee_j_qc
+    end
+    ob_nl
+  end
+  ob_t t_ee_j_rh
+  ee_emit_regime m 0
+  ee_emit_regime m 1
+  ob_t t_ee_j_ten
+  ob_u ee_suv m SU_TN
+  ob_t t_ee_j_val
+  ee_jn ee_sfv m SF_TCOV
+  ob_t t_ee_j_wil
+  ee_jn ee_sfv m SF_TLO
+  ob_t t_ee_j_cm
+  ee_jn ee_sfv m SF_THI
+  ob_t t_ee_j_pas
+  ee_b ee_suv m SU_OKTEN
+  ob_t t_ee_j_ce
+end
+
+fn ee_emit_tail m ulong last ulong to void
+  first = new ulong 1 1
+  ob_t t_ee_j_ls
+  ee_jn ee_sfv m SF_LS
+  ob_t t_ee_j_rm
+  ee_jn ee_sfv m SF_RMSE
+  ob_t t_ee_j_pr
+  ee_jn ee_sfv m SF_PERS
+  ob_t t_ee_j_rle
+  ee_b ee_suv m SU_RLE
+  ob_t t_ee_j_nl
+  ob_t t_ee_j_zf
+  ee_jn ee_sfv m SF_ZERO
+  ob_t t_ee_j_nl
+  ob_t t_ee_j_cal
+  ee_b ee_suv m SU_CAL
+  ob_t t_ee_j_fc
+  for k ulong 3
+    ee_fc_slot add SU_OKCOV k m k first
+  end
+  ee_fc_slot SU_OKNIS m 3 first
+  ee_fc_slot SU_OKBIAS m 4 first
+  ee_fc_slot SU_OKLAG m 5 first
+  for q ulong 4
+    ee_fc_slot add SU_OKQ q m add 6 q first
+  end
+  ee_fc_slot SU_OKREG m 10 first
+  ee_fc_slot add SU_OKREG 1 m 11 first
+  ee_fc_slot SU_OKTEN m 12 first
+  ob_t t_ee_j_fv
+  put first 0 1
+  ee_fc ee_bool_u ge ee_suv m SU_N 3 13 first
+  ee_fc_slot SU_RLE m 14 first
+  ob_t t_ee_j_end
+  if eq last 0
+    ob_c 44
+  end
+  ob_nl
+end
+
+fn ee_emit_model m ulong use_mx ulong last ulong to void
+  ee_emit_head m use_mx
+  ee_emit_cov m
+  ee_emit_qr m
+  ee_emit_tail m last
+end
+
+note ---- identity checks ----
+
+note Run B (v1) or C2 (v2) identity of an input: by resolved path and by SHA256SUMS digest.
+note which 0 run B raw, 1 run B marks, 2 C2 raw, 3 C2 marks. res[0] by_path, res[1] by_sums.
+fn ee_input_id slot ulong which ulong res edit ulong 2 to bool
+  path = new uchar 1024 0
+  dir = new uchar 1024 0
+  nm = new uchar 1024 0
+  lens = new ulong 2 0
+  hex = new uchar 65 0
+  want = new uchar 65 0
+  pl = ee_arg_copy slot path
+  er_dir_and_name view path pl dir nm lens
+  wl = ulong 0
+  if eq which 0
+    wl = er_run_b_raw_sha want
+  end
+  if eq which 1
+    wl = er_run_b_marks_sha want
+  end
+  if eq which 2
+    wl = ee_env_or_text t_ee_env_c2r len t_ee_env_c2r t_er_v2_ho_raw_sha want
+  end
+  if eq which 3
+    wl = ee_env_or_text t_ee_env_c2m len t_ee_env_c2m t_er_v2_ho_marks_sha want
+  end
+  bp = false
+  if lt which 2
+    bp = er_path_is_run_b view path pl
+  else
+    bp = er_path_is_heldout view path pl
+  end
+  bs = false
+  if eq er_sums_lookup view dir get lens 0 view nm get lens 1 hex 0
+    bs = er_eq view hex 64 view want wl
+  end
+  put res 0 ee_bool_u bp
+  put res 1 ee_bool_u bs
+  ret or bp bs
+end
+
+note fit file name is machine-state.ndjson and its SHA256SUMS line holds sha.
+fn ee_fit_sums_ok fp view uchar 1024 fpl ulong fsha view uchar 65 to ulong
+  dir = new uchar 1024 0
+  nm = new uchar 1024 0
+  lens = new ulong 2 0
+  hex = new uchar 65 0
+  er_dir_and_name fp fpl dir nm lens
+  if not er_eq view nm get lens 1 t_ee_ms_ndj len t_ee_ms_ndj
+    ret 0
+  end
+  if ne er_sums_lookup view dir get lens 0 view nm get lens 1 hex 0
+    ret 0
+  end
+  ret ee_bool_u er_eq view hex 64 fsha 64
+end
+
+fn ee_dirty_refuse to void
+  ob_init 2
+  ob_t t_ee_e_dirty
+  ob_i ee_tool_dirty
+  ob_c 41
+  ob_nl
+  ob_flush
+end
+
+note ---- output files ----
+
+fn ee_errno_text e long to void
+  if eq e 17
+    ob_t t_ee_err_exist
+    ret
+  end
+  if eq e 2
+    ob_t t_ee_err_noent
+    ret
+  end
+  if eq e 13
+    ob_t t_ee_err_acces
+    ret
+  end
+  if eq e 20
+    ob_t t_ee_err_notdir
+    ret
+  end
+  if eq e 21
+    ob_t t_ee_err_isdir
+    ret
+  end
+  if eq e 30
+    ob_t t_ee_err_rofs
+    ret
+  end
+  if eq e 28
+    ob_t t_ee_err_nospc
+    ret
+  end
+  if eq e 36
+    ob_t t_ee_err_ntl
+    ret
+  end
+  ob_t t_ee_err_unk
+  ob_i e
+end
+
+note stream path of model m: out + ".M<m>.stream" into g_ee_spath
+fn ee_build_spath m ulong to void
+  b = mul m 1100
+  n = get g_ee_alen EA_OUT
+  ob = ee_arg_base EA_OUT
+  for i ulong n
+    put g_ee_spath add b i get g_ee_arg add ob i
+  end
+  p = add b n
+  for i ulong 2
+    put g_ee_spath add p i get t_ee_dotM i
+  end
+  put g_ee_spath add p 2 uchar add 48 m
+  p = add p 3
+  for i ulong 7
+    put g_ee_spath add p i get t_ee_stream i
+  end
+  put g_ee_splen m add n 10
+end
+
+fn ee_spath_copy m ulong dst edit uchar 1100 to ulong
+  b = mul m 1100
+  n = get g_ee_splen m
+  for i ulong n
+    put dst i get g_ee_spath add b i
+  end
+  ret n
+end
+
+note O_WRONLY | O_CREAT | O_EXCL, mode 0666 (C fopen "wbx")
+fn ee_open_excl path view uchar 1100 pl ulong to int
+  fd = fopen path 0 pl 193 438
+  if lt fd 0
+    ob_init 2
+    ob_t t_ee_e_create
+    ob_s path pl
+    ob_c 32
+    ob_c 40
+    ee_errno_text sub 0 fd
+    ob_c 41
+    ob_t t_ee_e_create2
+    ob_flush
+    ret -1
+  end
+  ret int fd
+end
+
+fn ee_open_out to int
+  buf = new uchar 1100 0
+  n = get g_ee_alen EA_OUT
+  b = ee_arg_base EA_OUT
+  for i ulong n
+    put buf i get g_ee_arg add b i
+  end
+  ret ee_open_excl view buf n
+end
+
+fn ee_open_stream m ulong to int
+  buf = new uchar 1100 0
+  ee_build_spath m
+  n = ee_spath_copy m buf
+  ret ee_open_excl view buf n
+end
+
+fn ee_load_tmp pl ulong to long
+  buf = new uchar 1200 0
+  for i ulong pl
+    put buf i get g_ee_tmp i
+  end
+  ret er_file_load_raw 1 view buf pl
+end
+
+fn ee_json_ep1_path to void
+  buf = new uchar 1024 0
+  n = get g_ep1_plen 0
+  for i ulong n
+    put buf i get g_ep1_path i
+  end
+  ob_json_str view buf n
+end
+
+fn ee_json_ep2 which ulong to void
+  buf = new uchar 1024 0
+  n = ulong 0
+  if eq which 0
+    n = get g_ep2_v1pl 0
+    for i ulong n
+      put buf i get g_ep2_v1p i
+    end
+  else
+    n = get g_ep2_fpl 0
+    for i ulong n
+      put buf i get g_ep2_fp i
+    end
+  end
+  ob_json_str view buf n
+end
+
+note ---- prefix invariance (C prefix_check) ----
+
+fn ee_tmp_add s view uchar * n ulong to void
+  p = get g_ee_tlen 0
+  for i ulong n
+    put g_ee_tmp add p i get s i
+  end
+  put g_ee_tlen 0 add p n
+end
+
+note mkdtemp: TMPDIR (or /tmp) + /est_eval_prefix_XXXXXX; the dir length goes to dlen[0].
+fn ee_mkdtemp dlen edit ulong 1 to bool
+  env = new uchar 600 0
+  rb = new uchar 6 0
+  put g_ee_tlen 0 0
+  r = er_getenv t_ee_env_tmp len t_ee_env_tmp env 590
+  if gt r 0
+    ee_tmp_add view env ulong r
+  else
+    ee_tmp_add t_ee_tmp_def len t_ee_tmp_def
+  end
+  ee_tmp_add t_ee_px_pre len t_ee_px_pre
+  base = get g_ee_tlen 0
+  for tries ulong 100
+    ign = random rb 0 6 0
+    for i ulong 6
+      put g_ee_tmp add base i get t_ee_tmpl rem ulong get rb i 62
+    end
+    mk = makedir g_ee_tmp 0 add base 6 448
+    if eq mk 0
+      put dlen 0 add base 6
+      put g_ee_tlen 0 add base 6
+      ret true
+    end
+    if ne mk -17
+      ret false
+    end
+  end
+  ret false
+end
+
+note write the first k lines of file slot 0 (each with a newline) to the path in g_ee_tmp
+fn ee_write_prefix pl ulong k ulong to long
+  fd = fopen g_ee_tmp 0 pl 577 438
+  if lt fd 0
+    ret 1
+  end
+  ob_init int fd
+  for i ulong k
+    o = get g_ef_off i
+    for j ulong get g_ef_llen i
+      ob_c get g_ef_data add o j
+    end
+    ob_nl
+  end
+  ob_flush
+  bad = get g_ob_err 0
+  cr = fclose int fd
+  if or ne bad 0 ne cr 0
+    ret 1
+  end
+  ret 0
+end
+
+note replay the prefix file (slot 1) into replay slot 3 for model m and compare with slot m
+fn ee_prefix_model m ulong to ulong
+  if ne est_replay_run 1 ulong 999999999 m get g_ee_q m get g_ee_r m 3 0
+    ret 0
+  end
+  nn = get g_rp_meta 48
+  if or eq nn 0 gt nn get g_rp_meta mul m 16
+    ret 0
+  end
+  for i ulong nn
+    if not ee_step_equal add mul 3 RP_MAX_STEPS i add mul m RP_MAX_STEPS i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn ee_prefix_check nm ulong to ulong
+  dl = new ulong 1 0
+  ok = ulong 1
+  ran = ulong 0
+  if not ee_mkdtemp dl
+    ret 0
+  end
+  ee_tmp_add t_ee_px_fn len t_ee_px_fn
+  pl = get g_ee_tlen 0
+  ks = new ulong 3 0
+  put ks 0 100
+  put ks 1 500
+  put ks 2 1000
+  for ki ulong 3
+    k = get ks ki
+    if gt k get g_ef_nlines 0
+      ok = 0
+      continue
+    end
+    if ne ee_write_prefix pl k 0
+      ok = 0
+      break
+    end
+    if ne ee_load_tmp pl 0
+      ok = 0
+      break
+    end
+    for m ulong nm
+      if eq ee_prefix_model m 0
+        ok = 0
+      end
+    end
+    ran = add ran 1
+  end
+  put g_ee_res 3 ran
+  ign = unlink g_ee_tmp 0 pl
+  ign2 = rmdir g_ee_tmp 0 get dl 0
+  ret ok
+end
+
+note ---- argument parsing ----
+
+fn ee_flag_is a view uchar 1024 n ulong f view uchar * to bool
+  ret er_eq a n f len f
+end
+
+fn ee_store_arg idx ulong slot ulong to bool
+  buf = new uchar 1024 0
+  n = argread idx buf 0 1024
+  if lt n 0
+    ret false
+  end
+  b = ee_arg_base slot
+  for i ulong ulong n
+    put g_ee_arg add b i get buf i
+  end
+  put g_ee_alen slot ulong n
+  ret true
+end
+
+fn ee_unknown idx ulong to int
+  buf = new uchar 1024 0
+  n = argread idx buf 0 1024
+  ob_init 2
+  ob_t t_ee_e_unk
+  if gt n 0
+    ob_s view buf ulong n
+  end
+  ob_nl
+  ob_flush
+  ret 2
+end
+
+note flags: g_ee_flag[0] recorded, [1] synthetic. Returns 0, or the exit code on refusal.
+fn ee_parse ac ulong first ulong is_v2 ulong to int
+  a = new uchar 1024 0
+  for s ulong 6
+    put g_ee_alen s 0
+  end
+  put g_ee_flag 0 0
+  put g_ee_flag 1 0
+  if eq is_v2 0
+    ee_set_text EA_PDOC t_ee_def_pdoc
+    ee_set_text EA_INT t_ee_def_int
+  else
+    ee_set_text EA_PDOC t_er_v2_pdoc
+  end
+  have = new ulong 4 0
+  i = first
+  while lt i ac bound 64
+    n = argread i a 0 1024
+    if lt n 0
+      ret ee_unknown i
+    end
+    nu = ulong n
+    more = lt add i 1 ac
+    slot = ulong 99
+    if and eq is_v2 0 ee_flag_is view a nu t_ee_f_par
+      slot = EA_PAR
+    end
+    if and ne is_v2 0 ee_flag_is view a nu t_ee_f_par2
+      slot = EA_PAR
+    end
+    if ee_flag_is view a nu t_ee_f_raw
+      slot = EA_RAW
+    end
+    if ee_flag_is view a nu t_ee_f_mks
+      slot = EA_MKS
+    end
+    if ee_flag_is view a nu t_ee_f_out
+      slot = EA_OUT
+    end
+    if ee_flag_is view a nu t_ee_f_pdoc
+      slot = EA_PDOC
+    end
+    if and eq is_v2 0 ee_flag_is view a nu t_ee_f_int
+      slot = EA_INT
+    end
+    if and lt slot 99 more
+      if not ee_store_arg add i 1 slot
+        ret ee_unknown i
+      end
+      if lt slot 4
+        put have slot 1
+      end
+      i = add i 2
+      continue
+    end
+    if ee_flag_is view a nu t_ee_f_rec
+      put g_ee_flag 0 1
+      i = add i 1
+      continue
+    end
+    if ee_flag_is view a nu t_ee_f_syn
+      put g_ee_flag 1 1
+      i = add i 1
+      continue
+    end
+    ret ee_unknown i
+  end
+  for s ulong 4
+    if eq get have s 0
+      if eq is_v2 0
+        est_eputs t_ee_u1
+      else
+        est_eputs t_ee_u2
+      end
+      ret 2
+    end
+  end
+  if and ne get g_ee_flag 0 0 ne get g_ee_flag 1 0
+    est_eputs t_ee_e_excl
+    ret 2
+  end
+  ret 0
+end
+
+note ---- evaluation core shared by v1 and v2 ----
+
+fn ee_replay_models nm ulong to void
+  put g_ee_res 0 1
+  put g_ee_res 1 1
+  for m ulong nm
+    if ne est_replay_run 0 ulong 999999999 m get g_ee_q m get g_ee_r m m 0
+      put g_ee_res 0 0
+      ob_init 2
+      ob_t t_ee_e_replay
+      ob_u m
+      ob_t t_ee_e_replay2
+      ob_flush
+      continue
+    end
+    mb = mul m 16
+    exp_steps = sub get g_ef_nlines 0 get g_rp_meta add mb 2
+    put g_ee_res 4 exp_steps
+    if ne get g_rp_meta mb exp_steps
+      put g_ee_res 0 0
+    end
+    ns = get g_rp_meta mb
+    for i ulong ns
+      if eq and get g_rps_flags add mul m RP_MAX_STEPS i 8 0
+        put g_ee_res 1 0
+      end
+    end
+    ee_compute m m ee_bool_u eq m 2
+  end
+end
+
+note write each model's stream, close it and hash it into g_ee_shash; 1 on failure
+note close stream m (fd), hash it into g_ee_shash slot m; 1 on failure
+fn ee_close_stream m ulong fd int ok ulong to long
+  buf = new uchar 1100 0
+  hx = new uchar 65 0
+  bad = get g_ob_err 0
+  cr = fclose fd
+  n = ee_spath_copy m buf
+  hb = mul m 65
+  put g_ee_shash add hb 64 0
+  fail = or ne cr 0 ne bad 0
+  if not fail
+    if ne ok 0
+      if ne er_sha_file view buf n hx 0
+        fail = true
+      else
+        for i ulong 64
+          put g_ee_shash add hb i get hx i
+        end
+        put g_ee_shash add hb 64 1
+      end
+    end
+  end
+  if fail
+    ob_init 2
+    ob_t t_ee_e_stream
+    ob_s view buf n
+    ob_nl
+    ob_flush
+    ret 1
+  end
+  ret 0
+end
+
+note write each model's stream, close it and hash it; 1 on failure
+fn ee_write_streams nm ulong fds view int 3 to long
+  ok = get g_ee_res 0
+  for m ulong nm
+    fd = get fds m
+    put g_ob_err 0 0
+    if ne ok 0
+      est_replay_write_stream fd m m
+    end
+    if ne ee_close_stream m fd ok 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ee_raw_preserved to ulong
+  hx = new uchar 65 0
+  sh = new uchar 65 0
+  if ne ee_sha_arg EA_RAW 6 0
+    ret 0
+  end
+  ee_hex_slot 6 hx
+  er_file_get_sha 0 sh
+  ret ee_bool_u er_eq view hx 64 view sh 64
+end
+
+fn ee_select nm ulong to void
+  ok = get g_ee_res 0
+  sel = ulong 0
+  calib = ulong 0
+  if ne ok 0
+    best = est_ninf
+    for m ulong nm
+      if ne ee_suv m SU_CAL 0
+        if gt ee_sfv m SF_LS best
+          best = ee_sfv m SF_LS
+        end
+      end
+    end
+    for m ulong nm
+      if eq sel 0
+        if ne ee_suv m SU_CAL 0
+          if ge ee_sfv m SF_LS sub best f64 0.01
+            sel = add m 1
+          end
+        end
+      end
+    end
+    for m ulong nm
+      if ne ee_suv m SU_CAL 0
+        if ne ee_suv m SU_RLE 0
+          calib = 1
+        end
+      end
+    end
+  end
+  put g_ee_res 7 sel
+  put g_ee_res 9 calib
+end
+
+fn ee_pf v ulong to void
+  if ne v 0
+    ob_t t_ee_PASS
+  else
+    ob_t t_ee_FAIL
+  end
+end
+
+fn ee_stream_entry m ulong to void
+  buf = new uchar 1100 0
+  n = ee_spath_copy m buf
+  ob_c 34
+  ob_c 77
+  ob_u m
+  ob_t t_ee_h_st2
+  ob_json_str view buf n
+  ob_t t_ee_h_st3
+  hb = mul m 65
+  if ne get g_ee_shash add hb 64 0
+    for i ulong 64
+      ob_c get g_ee_shash add hb i
+    end
+  else
+    ob_t t_ee_unavail
+  end
+  ob_t t_ee_h_st4
+end
+
+fn ee_emit_counts is_v2 ulong to void
+  ob_t t_ee_h_lines
+  ob_u get g_ef_nlines 0
+  ob_t t_ee_h_mk1
+  ob_u get g_ee_mk_m 0
+  ob_t t_ee_h_mk2
+  ob_u get g_ee_mk_m 1
+  ob_t t_ee_h_mk3
+  ob_u get g_ee_mk_m 2
+  ob_t t_ee_h_mk4
+  ee_b get g_ee_mk_m 3
+  ob_t t_ee_h_mk5
+  ob_u get g_ee_mk_m 4
+  ob_t t_ee_h_mk6
+  ob_u get g_ee_mk_m 5
+  ob_t t_ee_h_mo1
+  ob_u get g_rp_meta 2
+  ob_t t_ee_h_mo2
+  ob_u get g_rp_meta 3
+  ob_t t_ee_h_mo3
+  ob_u get g_rp_meta 4
+  ob_t t_ee_h_mo4
+  ob_u get g_rp_meta 5
+  ob_t t_ee_h_mo5
+  ob_u get g_rp_meta 6
+  ob_t t_ee_h_tg1
+  ob_u get g_rp_meta 7
+  ob_t t_ee_h_tg2
+  ob_u get g_rp_meta 8
+  ob_t t_ee_h_tg3
+  ob_u get g_rp_meta 9
+  if ne is_v2 0
+    ob_t t_ee_h_tg4
+    ob_u get g_ee_res 11
+  end
+  ob_t t_ee_h_rd1
+  ob_u EST_BURN_IN
+  ob_t t_ee_h_rd2
+  if ne is_v2 0
+    ob_t t_ee_h_rd3
+  end
+  ob_t t_ee_h_rd4
+  if ne is_v2 0
+    ob_t t_ee_h_m2p
+    ee_b get g_ee_res 10
+    ob_t t_ee_j_nl
+  end
+  ob_t t_ee_h_rp1
+  ee_b get g_ee_res 0
+  ob_t t_ee_h_rp2
+  ob_u get g_rp_meta 0
+  ob_t t_ee_h_rp3
+  ob_u get g_ee_res 4
+  ob_t t_ee_h_rp4
+  ee_b get g_ee_res 1
+  ob_t t_ee_h_rp5
+  ee_b get g_ee_res 5
+  ob_t t_ee_h_rp6
+  ob_u get g_ee_res 3
+  ob_t t_ee_h_rp7
+  ee_b get g_ee_res 2
+  ob_t t_ee_h_rp8
+end
+
+fn ee_emit_tailall nm ulong to void
+  ob_t t_ee_h_st1
+  for m ulong nm
+    if gt m 0
+      ob_t t_ee_j_cm
+    end
+    ee_stream_entry m
+  end
+  ob_t t_ee_h_st5
+  if ne get g_ee_res 0 0
+    for m ulong nm
+      ee_emit_model m ee_bool_u eq m 2 ee_bool_u eq m sub nm 1
+    end
+  end
+  ob_t t_ee_h_sel1
+  sel = get g_ee_res 7
+  if gt sel 0
+    ob_c 34
+    ob_c 77
+    ob_u sub sel 1
+    ob_c 34
+  else
+    ob_t t_ee_null
+  end
+  ob_t t_ee_h_sel2
+  ob_t t_ee_h_fcl
+  ob_t t_ee_h_ers
+  ee_pf get g_ee_res 8
+  ob_t t_ee_h_erc
+  ee_pf get g_ee_res 9
+  ob_t t_ee_h_end
+end
+
+fn ee_emit_ident to void
+  ob_t t_ee_h_tc
+  ob_json_str t_ee_tool_commit len t_ee_tool_commit
+  ob_t t_ee_h_td
+  ob_i ee_tool_dirty
+  ob_t t_ee_h_eb
+  ee_hex_out 3
+  ob_t t_ee_h_rec
+  ee_b get g_ee_flag 0
+  ob_t t_ee_h_syn
+  ee_b get g_ee_flag 1
+end
+
+fn ee_emit_v1 fd int to long
+  sh = new uchar 65 0
+  ob_init fd
+  ob_t t_ee_h1_1
+  ob_json_str t_er_proto_commit len t_er_proto_commit
+  ob_t t_ee_h1_2
+  ee_hex_out 1
+  ob_t t_ee_h1_3
+  ee_b get g_ee_res 13
+  ob_t t_ee_h1_4
+  ee_hex_out 2
+  ob_t t_ee_h1_5
+  ee_emit_ident
+  ob_t t_ee_h_pf
+  ee_arg_json EA_PAR
+  ob_t t_ee_h_pfs
+  ee_hex_out 0
+  ob_t t_ee_h_pfv
+  ob_t t_ee_h_frp
+  ee_json_ep1_path
+  ob_t t_ee_h_ffs
+  for i ulong 64
+    ob_c get g_ep1_sha i
+  end
+  ob_t t_ee_h_fia
+  ee_b get g_ee_res 12
+  ob_t t_ee_h_fsm
+  ee_b get g_ee_res 15
+  ob_t t_ee_h_in
+  ee_arg_json EA_RAW
+  ob_t t_ee_h_ins
+  er_file_get_sha 0 sh
+  ob_s view sh 64
+  ob_t t_ee_h_inm
+  ob_t t_ee_h_note
+  ob_t t_ee_h_mks
+  for i ulong 64
+    ob_c get g_ee_mk_sha i
+  end
+  ee_emit_counts 0
+  ee_emit_tailall 2
+  ob_flush
+  ret long get g_ob_err 0
+end
+
+fn ee_summary is_v2 ulong to void
+  hx = new uchar 65 0
+  ign = ee_sha_arg EA_OUT 5
+  ee_hex_slot 5 hx
+  ob_init 1
+  ob_t t_ee_s_ers
+  ee_pf get g_ee_res 8
+  ob_t t_ee_s_erc
+  ee_pf get g_ee_res 9
+  if ne is_v2 0
+    ob_t t_ee_s_sel
+    sel = get g_ee_res 7
+    if gt sel 0
+      ob_c 77
+      ob_u sub sel 1
+    else
+      ob_t t_ee_s_none
+    end
+  end
+  ob_t t_ee_s_rh
+  ob_s view hx 64
+  ob_nl
+  ob_flush
+end
+
+note opens the receipt and nm streams exclusively; fds[3] = receipt
+fn ee_open_all nm ulong fds edit int 4 to long
+  fo = ee_open_out
+  if lt fo 0
+    ret 1
+  end
+  put fds 3 fo
+  for m ulong nm
+    fs = ee_open_stream m
+    if lt fs 0
+      ret 1
+    end
+    put fds m fs
+  end
+  ret 0
+end
+
+fn ee_run nm ulong fds view int 4 to long
+  sf = new int 3 0
+  for m ulong nm
+    put sf m get fds m
+  end
+  put g_ee_res 10 0
+  ee_replay_models nm
+  if ne get g_ee_res 0 0
+    if eq nm 3
+      put g_ee_res 10 ee_bool_u ne est_m2_changes 2 get g_rp_meta 32 -1
+    end
+  end
+  put g_ee_res 3 0
+  put g_ee_res 2 0
+  if ne get g_ee_res 0 0
+    put g_ee_res 2 ee_prefix_check nm
+  end
+  if ne ee_write_streams nm view sf 0
+    ret 1
+  end
+  put g_ee_res 5 ee_raw_preserved
+  ret 0
+end
+
+note ---- protocol v1 ----
+
+fn ee_v1_guards to int
+  r1 = new ulong 2 0
+  r2 = new ulong 2 0
+  raw_b = ee_input_id EA_RAW 0 r1
+  mk_b = ee_input_id EA_MKS 1 r2
+  if ne get g_ee_flag 0 0
+    if or eq get r1 0 0 eq get r1 1 0
+      est_eputs t_ee_e_rbr
+      ret 2
+    end
+    if or eq get r2 0 0 eq get r2 1 0
+      est_eputs t_ee_e_rbm
+      ret 2
+    end
+    if ne ee_tool_dirty 0
+      ee_dirty_refuse
+      ret 2
+    end
+    ret 0
+  end
+  if or raw_b mk_b
+    est_eputs t_ee_e_rbnr
+    ret 2
+  end
+  ret 0
+end
+
+fn ee_v1_param_err to void
+  ob_init 2
+  ob_t t_ee_e_p1val
+  m = get g_ep1_verr 0
+  ob_u m
+  kind = get g_ep1_verr 1
+  if eq kind 1
+    ob_t t_ee_e_pv1
+  else
+    if eq kind 2
+      ob_t t_ee_e_pv2a
+      ob_g17 get g_ep1_q m
+    else
+      ob_t t_ee_e_pv3a
+      ob_g17 get g_ep1_r m
+    end
+    ob_t t_ee_e_pv23
+  end
+  ob_flush
+end
+
+fn ee_v1_params to int
+  buf = new uchar 1024 0
+  fp = new uchar 1024 0
+  fs = new uchar 65 0
+  n = ee_arg_copy EA_PAR buf
+  if ne est_params_read view buf n 0
+    est_eputs t_ee_e_p1fmt
+    ret 1
+  end
+  if ne est_params_validate 0
+    ee_v1_param_err
+    ret 1
+  end
+  fpl = get g_ep1_plen 0
+  for i ulong fpl
+    put fp i get g_ep1_path i
+  end
+  for i ulong 64
+    put fs i get g_ep1_sha i
+  end
+  fia = false
+  if ge er_find view fp fpl t_er_run_a_id len t_er_run_a_id 0
+    fia = er_eq view fs 64 t_er_run_a_sha 64
+  end
+  put g_ee_res 12 ee_bool_u fia
+  put g_ee_res 15 ee_fit_sums_ok view fp fpl view fs
+  if not fia
+    if eq get g_ee_flag 1 0
+      ob_init 2
+      ob_t t_ee_e_nota
+      ob_s view fp fpl
+      ob_c 41
+      ob_nl
+      ob_flush
+      ret 1
+    end
+  end
+  if ne get g_ee_flag 0 0
+    if or not fia eq get g_ee_res 15 0
+      est_eputs t_ee_e_fsums
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ee_v1_docs to int
+  pd = new uchar 65 0
+  pok = eq ee_sha_arg EA_PDOC 1 0
+  iok = eq ee_sha_arg EA_INT 2 0
+  pm = false
+  if pok
+    ee_hex_slot 1 pd
+    pm = er_eq view pd 64 t_er_proto_doc_sha 64
+  end
+  put g_ee_res 13 ee_bool_u pm
+  if ne get g_ee_flag 0 0
+    if or not pm not iok
+      ob_init 2
+      ob_t t_ee_e_pdoc1
+      ob_t t_er_proto_doc_sha
+      ob_t t_ee_e_pdoc1b
+      ob_flush
+      ret 1
+    end
+  end
+  ee_set_text 6 t_ee_proc_exe
+  ign = ee_sha_arg 6 3
+  if ne ee_sha_arg EA_PAR 0 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ee_load_inputs is_v2 ulong to int
+  raw = new uchar 1024 0
+  mk = new uchar 1024 0
+  sh = new uchar 65 0
+  want = new uchar 65 0
+  rec = get g_ee_flag 0
+  rl = ee_arg_copy EA_RAW raw
+  if ne er_file_load 0 view raw rl 0
+    er_err_print_ref
+    ret 1
+  end
+  er_file_get_sha 0 sh
+  if ne rec 0
+    wl = ulong 0
+    if eq is_v2 0
+      wl = er_run_b_raw_sha want
+    else
+      wl = ee_env_or_text t_ee_env_c2r len t_ee_env_c2r t_er_v2_ho_raw_sha want
+    end
+    if not er_eq view sh 64 view want wl
+      if eq is_v2 0
+        est_eputs t_ee_e_braw
+      else
+        est_eputs t_ee_e_c2raw
+      end
+      ret 1
+    end
+  end
+  ml = ee_arg_copy EA_MKS mk
+  if ne ee_load_marks view mk ml 0
+    er_err_print_ref
+    ret 1
+  end
+  if ne rec 0
+    wl = ulong 0
+    if eq is_v2 0
+      wl = er_run_b_marks_sha want
+    else
+      wl = ee_env_or_text t_ee_env_c2m len t_ee_env_c2m t_er_v2_ho_marks_sha want
+    end
+    for i ulong 64
+      put sh i get g_ee_mk_sha i
+    end
+    if not er_eq view sh 64 view want wl
+      if eq is_v2 0
+        est_eputs t_ee_e_bmks
+      else
+        est_eputs t_ee_e_c2mks
+      end
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ee_finish nm ulong to void
+  sok = get g_ee_res 0
+  for m ulong nm
+    if eq get g_ee_shash add mul m 65 64 0
+      sok = 0
+    end
+  end
+  put g_ee_res 6 sok
+  rs = ulong 0
+  if ne get g_ee_res 0 0
+    if ne get g_ee_res 2 0
+      if ne get g_ee_res 5 0
+        if ne get g_ee_res 1 0
+          rs = sok
+        end
+      end
+    end
+  end
+  if eq nm 3
+    if eq get g_ee_res 10 0
+      rs = 0
+    end
+  end
+  put g_ee_res 8 rs
+  ee_select nm
+end
+
+fn ee_main_v1 ac ulong to int
+  fds = new int 4 0
+  rc = ee_parse ac 1 0
+  if ne rc 0
+    ret rc
+  end
+  rc = ee_v1_guards
+  if ne rc 0
+    ret rc
+  end
+  rc = ee_v1_params
+  if ne rc 0
+    ret rc
+  end
+  rc = ee_v1_docs
+  if ne rc 0
+    ret rc
+  end
+  put g_er_allow_run_b 0 get g_ee_flag 0
+  if ne ee_load_inputs 0 0
+    ret 1
+  end
+  if ne ee_open_all 2 fds 0
+    ret 1
+  end
+  for m ulong 2
+    put g_ee_q m get g_ep1_q m
+    put g_ee_r m get g_ep1_r m
+    put g_ee_ll m get g_ep1_ll m
+  end
+  if ne ee_run 2 view fds 0
+    ret 1
+  end
+  if eq get g_ee_res 0 0
+    est_eputs t_ee_e_rfail
+  end
+  ee_finish 2
+  rfd = get fds 3
+  if ne ee_emit_v1 rfd 0
+    ign = fclose rfd
+    ret 1
+  end
+  if ne fclose rfd 0
+    ret 1
+  end
+  ee_summary 0
+  ret 0
+end
+
+note ---- protocol v2 (docs/estimation/EST23_PROTOCOL_V2.md) ----
+
+fn ee_v2_guards to int
+  r = new ulong 2 0
+  rp = new ulong 2 0
+  mp = new ulong 2 0
+  if ee_input_id EA_RAW 0 r
+    est_eputs t_ee_e_rb_v2
+    ret 2
+  end
+  if ee_input_id EA_MKS 1 r
+    est_eputs t_ee_e_rb_v2
+    ret 2
+  end
+  raw_c2 = ee_input_id EA_RAW 2 rp
+  mk_c2 = ee_input_id EA_MKS 3 mp
+  put g_ee_res 14 0
+  if and raw_c2 and ne get rp 0 0 ne get rp 1 0
+    put g_ee_res 14 1
+  end
+  if ne get g_ee_flag 0 0
+    if or eq get rp 0 0 eq get rp 1 0
+      est_eputs t_ee_e_c2r
+      ret 2
+    end
+    if or eq get mp 0 0 eq get mp 1 0
+      est_eputs t_ee_e_c2m
+      ret 2
+    end
+    if ne ee_tool_dirty 0
+      ee_dirty_refuse
+      ret 2
+    end
+    ret 0
+  end
+  if or raw_c2 mk_c2
+    est_eputs t_ee_e_ho
+    ret 2
+  end
+  ret 0
+end
+
+fn ee_v2_mix to int
+  mx = new EstMix 0 0.0 0.0
+  put g_ee_mxk 0 get g_ep2_mk 0
+  for j ulong 3
+    put g_ee_mxw j f64 0.0
+    put g_ee_mxv j f64 0.0
+  end
+  k = get g_ep2_mk 0
+  if gt k 3
+    k = 3
+  end
+  for j ulong k
+    put g_ee_mxw j get g_ep2_mw j
+    put g_ee_mxv j get g_ep2_mv j
+  end
+  ee_mx_fill mx
+  if ne est_mix_check view mx EST_OK
+    est_eputs t_ee_e_m2mix
+    ret 1
+  end
+  tv = est_mix_total_var view mx
+  q2 = get g_ep2_q 0
+  okr = eq get g_ep2_r 0 EST_M2_R
+  okq = le fabs sub q2 tv mul f64 1.0e-12 tv
+  if or not okr not okq
+    est_eputs t_ee_e_m2qr
+    ret 1
+  end
+  ret 0
+end
+
+fn ee_v2_v1params to int
+  v1 = new uchar 1024 0
+  hx = new uchar 65 0
+  want = new uchar 65 0
+  vl = get g_ep2_v1pl 0
+  for i ulong vl
+    put v1 i get g_ep2_v1p i
+  end
+  bad = ne est_params_read view v1 vl 0
+  if not bad
+    bad = ne est_params_validate 0
+  end
+  if bad
+    ob_init 2
+    ob_t t_ee_e_v1bad
+    ob_s view v1 vl
+    ob_t t_ee_e_v1bad2
+    ob_flush
+    ret 1
+  end
+  for i ulong 64
+    put want i get g_ep2_v1s i
+  end
+  if ne er_sha_file view v1 vl hx 0
+    est_eputs t_ee_e_v1dig
+    ret 1
+  end
+  if not er_eq view hx 64 view want 64
+    est_eputs t_ee_e_v1dig
+    ret 1
+  end
+  ee_hex_put 4 view hx
+  ret 0
+end
+
+fn ee_v2_fit_ids to int
+  fp = new uchar 1024 0
+  fs = new uchar 65 0
+  c1 = new uchar 65 0
+  p1p = new uchar 1024 0
+  p1s = new uchar 65 0
+  pl1 = get g_ep1_plen 0
+  for i ulong pl1
+    put p1p i get g_ep1_path i
+  end
+  for i ulong 64
+    put p1s i get g_ep1_sha i
+  end
+  v1a = false
+  if ge er_find view p1p pl1 t_er_run_a_id len t_er_run_a_id 0
+    v1a = er_eq view p1s 64 t_er_run_a_sha 64
+  end
+  put g_ee_res 12 ee_bool_u v1a
+  fpl = get g_ep2_fpl 0
+  for i ulong fpl
+    put fp i get g_ep2_fp i
+  end
+  for i ulong 64
+    put fs i get g_ep2_fs i
+  end
+  cl = ee_env_or_text t_ee_env_c1 len t_ee_env_c1 t_er_v2_fit_sha c1
+  fc1 = false
+  if ge er_find view fp fpl t_er_v2_fit_tag len t_er_v2_fit_tag 0
+    fc1 = er_eq view fs 64 view c1 cl
+  end
+  put g_ee_res 13 ee_bool_u fc1
+  put g_ee_res 15 ee_fit_sums_ok view fp fpl view fs
+  if eq get g_ee_flag 1 0
+    if or not v1a not fc1
+      est_eputs t_ee_e_notac1
+      ret 1
+    end
+  end
+  if ne get g_ee_flag 0 0
+    if eq get g_ee_res 15 0
+      est_eputs t_ee_e_m2sums
+      ret 1
+    end
+  end
+  ret 0
+end
+
+note v2 protocol document identity (g_ee_pm), binary and parameter file digests
+fn ee_v2_docs to int
+  pd = new uchar 65 0
+  dsha = new uchar 65 0
+  dl = ee_env_or_text t_ee_env_v2d len t_ee_env_v2d t_er_v2_pdoc_sha dsha
+  pok = eq ee_sha_arg EA_PDOC 1 0
+  pm = false
+  if pok
+    ee_hex_slot 1 pd
+    pm = er_eq view pd 64 view dsha dl
+  end
+  put g_ee_pm 0 ee_bool_u pm
+  if ne get g_ee_flag 0 0
+    if not pm
+      ob_init 2
+      ob_t t_ee_e_pdoc2
+      ob_s view dsha dl
+      ob_c 41
+      ob_nl
+      ob_flush
+      ret 1
+    end
+  end
+  ee_set_text 6 t_ee_proc_exe
+  ign = ee_sha_arg 6 3
+  if ne ee_sha_arg EA_PAR 0 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ee_emit_v2 fd int to long
+  sh = new uchar 65 0
+  ob_init fd
+  ob_t t_ee_h2_1
+  ob_t t_ee_h2_2
+  ee_hex_out 1
+  ob_t t_ee_h2_3
+  ee_b get g_ee_pm 0
+  ob_t t_ee_j_nl
+  ee_emit_ident
+  ob_t t_ee_j_nl
+  ob_t t_ee_h_v2pf
+  ee_arg_json EA_PAR
+  ob_t t_ee_h_v2pfs
+  ee_hex_out 0
+  ob_t t_ee_h_v2v1
+  ee_json_ep2 0
+  ob_t t_ee_h_v2v1s
+  ee_hex_out 4
+  ob_t t_ee_h_v2v1a
+  ee_b get g_ee_res 12
+  ob_t t_ee_h_v2frp
+  ee_json_ep2 1
+  ob_t t_ee_h_v2ffs
+  for i ulong 64
+    ob_c get g_ep2_fs i
+  end
+  ob_t t_ee_h_v2fc1
+  ee_b get g_ee_res 13
+  ob_t t_ee_h_v2fsm
+  ee_b get g_ee_res 15
+  ob_t t_ee_h_v2fch
+  ob_u get g_ep2_fn 0
+  ob_t t_ee_h_v2in
+  ee_arg_json EA_RAW
+  ob_t t_ee_h_ins
+  er_file_get_sha 0 sh
+  ob_s view sh 64
+  ob_t t_ee_h_v2ho
+  ee_b get g_ee_res 14
+  ob_t t_ee_h_v2mk
+  for i ulong 64
+    ob_c get g_ee_mk_sha i
+  end
+  ee_emit_counts 1
+  ee_emit_tailall 3
+  ob_flush
+  ret long get g_ob_err 0
+end
+
+fn ee_main_v2 ac ulong to int
+  fds = new int 4 0
+  buf = new uchar 1024 0
+  rc = ee_parse ac 2 1
+  if ne rc 0
+    ret rc
+  end
+  rc = ee_v2_guards
+  if ne rc 0
+    ret rc
+  end
+  n = ee_arg_copy EA_PAR buf
+  if ne est_params2_read view buf n 0
+    est_eputs t_ee_e_p2fmt
+    ret 1
+  end
+  if ne ee_v2_mix 0
+    ret 1
+  end
+  if ne ee_v2_v1params 0
+    ret 1
+  end
+  if ne ee_v2_fit_ids 0
+    ret 1
+  end
+  if ne ee_v2_docs 0
+    ret 1
+  end
+  put g_er_allow_heldout 0 get g_ee_flag 0
+  if ne ee_load_inputs 1 0
+    ret 1
+  end
+  if ne ee_open_all 3 fds 0
+    ret 1
+  end
+  for m ulong 2
+    put g_ee_q m get g_ep1_q m
+    put g_ee_r m get g_ep1_r m
+    put g_ee_ll m get g_ep1_ll m
+  end
+  put g_ee_q 2 get g_ep2_q 0
+  put g_ee_r 2 get g_ep2_r 0
+  put g_ee_ll 2 get g_ep2_ll 0
+  if ne ee_run 3 view fds 0
+    ret 1
+  end
+  ee_finish 3
+  rfd = get fds 3
+  if ne ee_emit_v2 rfd 0
+    ign = fclose rfd
+    ret 1
+  end
+  if ne fclose rfd 0
+    ret 1
+  end
+  ee_summary 1
+  ret 0
+end
+
+fn main to int
+  a = new uchar 1024 0
+  put g_er_test_build 0 EE_TEST_BUILD
+  put g_er_allow_run_b 0 0
+  put g_er_allow_heldout 0 0
+  ac = ulong argcnt
+  if ge ac 2
+    n = argread 1 a 0 1024
+    if gt n 0
+      if er_eq view a ulong n t_ee_pv2 len t_ee_pv2
+        ret ee_main_v2 ac
+      end
+    end
+  end
+  ret ee_main_v1 ac
+end
