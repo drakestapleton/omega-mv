@@ -1,11 +1,22 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 Visor lane 2: console command parser
-note (replaces src/visor/visor_parse_command.c). Depends on visor.om.
+note Pure seeded OM-2 Visor console line parser (lane 2). No semantics.
+note Port of src/visor/visor_parse_command.c with the UTF-8/control-byte
+note validator, blank trimming and arity table of src/visor/visor_core.om:
+note same command words, token and line limits, `for current.machine`
+note handling and the same error messages. Input: v_sbuf[0..rlen).
+note Output: vpc_cmd, vpc_argc, vpc_args (4 x 256, lengths vpc_alen),
+note vpc_for_cur, vpc_line/vpc_llen (trimmed line), vpc_err/vpc_elen.
+note vpc_parse_in reads vpc_in[0..rlen) (rlen <= 65536); vpc_parse_sbuf copies v_sbuf there.
 
-note Command codes:
-note 0=help 1=quit 2=inspect 3=type 4=id 5=graph 6=verify 7=machine 8=realize
-note 9=cost 10=run 11=evidence 12=bindings 13=clear 14=world 15=effects
-note 16=alternatives 17=compare 18=why 19=source 20=empty 21=unknown
+const VPC_HELP ulong 0
+const VPC_QUIT ulong 1
+const VPC_REALIZE ulong 8
+const VPC_SOURCE ulong 19
+const VPC_EMPTY ulong 20
+const VPC_UNKNOWN ulong 21
+const VPC_MAX_ARGS ulong 4
+const VPC_TOKEN_MAX ulong 256
+const VPC_LINE_MAX ulong 4096
 
 text vpc_c_help "help"
 text vpc_c_quit "quit"
@@ -31,12 +42,24 @@ text vpc_c_empty "empty"
 text vpc_c_unk "unknown"
 text vpc_w_for "for"
 text vpc_w_cur "current.machine"
-text vpc_e_long "line too long"
-text vpc_e_ctrl "control character is not allowed"
-text vpc_e_utf8 "invalid UTF-8 sequence"
-text vpc_e_tok "argument too long"
-text vpc_e_arity "wrong number of arguments"
-text vpc_e_real "realize only accepts 'for current.machine'"
+text vpc_e_long1 "line too long ("
+text vpc_e_long2 " bytes, max 4095)"
+text vpc_e_ctrl1 "control character 0x"
+text vpc_e_ctrl2 " at byte "
+text vpc_e_ctrl3 " is not allowed"
+text vpc_e_utf8 "invalid UTF-8 at byte "
+text vpc_e_tok1 "argument "
+text vpc_e_tok2 " too long ("
+text vpc_e_tok3 " bytes, max 255)"
+text vpc_e_many1 "too many arguments (max "
+text vpc_e_for1 "only `for current.machine` is supported (got `for "
+text vpc_e_for2 "`)"
+text vpc_e_exp "expected "
+text vpc_e_arg " argument"
+text vpc_e_args " arguments, got "
+text vpc_e_got ", got "
+text vpc_e_to " to "
+text vpc_hexu "0123456789ABCDEF"
 
 global vpc_cmd ulong 1
 global vpc_argc ulong 1
@@ -45,24 +68,65 @@ global vpc_alen ulong 4
 global vpc_for_cur ulong 1
 global vpc_line uchar 4096
 global vpc_llen ulong 1
-global vpc_err uchar 256
+global vpc_err uchar 512
 global vpc_elen ulong 1
-global vpc_tok0 uchar 256
-global vpc_t0len ulong 1
+global vpc_tok uchar 1536
+global vpc_tlen ulong 6
+global vpc_numb uchar 24
+global vpc_bdst ulong 2
+global vpc_in uchar 65536
 
-fn vpc_set_err s view uchar * to void
-  n = len s
-  if gt n 255
-    n = 255
+note ---- error text (snprintf into a 512-byte buffer) ----
+fn vpc_ec c uchar to void
+  l = get vpc_elen 0
+  if lt l 511
+    put vpc_err l c
+    put vpc_elen 0 add l 1
   end
-  for i ulong n bound 256
-    put vpc_err i get s i
-  end
-  put vpc_elen 0 n
 end
 
-fn vpc_utf8_step_sbuf n ulong pos ulong to ulong
-  b = ulong get v_sbuf pos
+fn vpc_es s view uchar * to void
+  n = len s
+  for i ulong n bound 256
+    vpc_ec get s i
+  end
+end
+
+fn vpc_eu v ulong to void
+  if eq v 0
+    vpc_ec uchar 48
+    ret
+  end
+  x = v
+  d = ulong 0
+  while gt x 0 bound 24
+    put vpc_numb d uchar add 48 rem x 10
+    x = div x 10
+    d = add d 1
+  end
+  while gt d 0 bound 24
+    d = sub d 1
+    vpc_ec get vpc_numb d
+  end
+end
+
+note ---- visor_core.om: UTF-8 (RFC 3629) and control bytes ----
+fn vpc_utf8_cont pos ulong clen ulong cp0 ulong to ulong
+  cp = cp0
+  k = ulong 1
+  while lt k clen bound 8
+    b = ulong get vpc_in add pos k
+    if ne and b 0xc0 0x80
+      ret 0xffffffff
+    end
+    cp = or shl cp 6 and b 0x3f
+    k = add k 1
+  end
+  ret cp
+end
+
+fn vpc_utf8_step n ulong pos ulong to ulong
+  b = ulong get vpc_in pos
   clen = ulong 0
   cp0 = ulong 0
   cmin = ulong 0
@@ -88,15 +152,9 @@ fn vpc_utf8_step_sbuf n ulong pos ulong to ulong
   if gt add pos clen n
     ret 0
   end
-  cp = cp0
-  k = ulong 1
-  while lt k clen bound 4
-    c = ulong get v_sbuf add pos k
-    if ne and c 0xc0 0x80
-      ret 0
-    end
-    cp = or shl cp 6 and c 0x3f
-    k = add k 1
+  cp = vpc_utf8_cont pos clen cp0
+  if eq cp 0xffffffff
+    ret 0
   end
   if or lt cp cmin gt cp 0x10ffff
     ret 0
@@ -107,270 +165,187 @@ fn vpc_utf8_step_sbuf n ulong pos ulong to ulong
   ret clen
 end
 
-fn vpc_check_bytes_sbuf n ulong to ulong
+note 0 ok, 1 control byte, 2 bad UTF-8; byte value and offset in vpc_bdst.
+fn vpc_check_bytes n ulong to ulong
   i = ulong 0
-  while lt i n bound 4096
-    b = ulong get v_sbuf i
+  while lt i n bound 65536
+    b = ulong get vpc_in i
     if lt b 0x80
-      if and lt b 0x20 ne b 9
-        ret 1
-      end
-      if eq b 0x7f
+      if or and lt b 0x20 ne b 9 eq b 0x7f
+        put vpc_bdst 0 b
+        put vpc_bdst 1 i
         ret 1
       end
       i = add i 1
     else
-      adv = vpc_utf8_step_sbuf n i
+      adv = vpc_utf8_step n i
       if eq adv 0
+        put vpc_bdst 0 0
+        put vpc_bdst 1 i
         ret 2
       end
       i = add i adv
     end
   end
+  put vpc_bdst 0 0
+  put vpc_bdst 1 0
   ret 0
 end
 
-fn vpc_eq_tok0 s view uchar * to bool
-  n = len s
-  if ne get vpc_t0len 0 n
+fn vpc_blank c ulong to bool
+  ret or eq c 32 eq c 9
+end
+
+note ---- command table ----
+fn vpc_word_is a ulong wl ulong w view uchar * to bool
+  if ne wl len w
     ret false
   end
-  for i ulong n bound 64
-    if ne get vpc_tok0 i get s i
+  for i ulong wl bound 64
+    if ne get vpc_line add a i get w i
       ret false
     end
   end
   ret true
 end
 
-fn vpc_eq_arg idx ulong s view uchar * to bool
-  n = len s
-  if ne get vpc_alen idx n
-    ret false
-  end
-  base = mul idx 256
-  for i ulong n bound 64
-    if ne get vpc_args add base i get s i
-      ret false
-    end
-  end
-  ret true
-end
-
-fn vpc_lookup_cmd to ulong
-  if vpc_eq_tok0 vpc_c_help
-    ret 0
-  end
-  if vpc_eq_tok0 vpc_c_quit
-    ret 1
-  end
-  if vpc_eq_tok0 vpc_c_inspect
-    ret 2
-  end
-  if vpc_eq_tok0 vpc_c_type
-    ret 3
-  end
-  if vpc_eq_tok0 vpc_c_id
-    ret 4
-  end
-  if vpc_eq_tok0 vpc_c_graph
-    ret 5
-  end
-  if vpc_eq_tok0 vpc_c_verify
-    ret 6
-  end
-  if vpc_eq_tok0 vpc_c_machine
-    ret 7
-  end
-  if vpc_eq_tok0 vpc_c_realize
-    ret 8
-  end
-  if vpc_eq_tok0 vpc_c_cost
-    ret 9
-  end
-  if vpc_eq_tok0 vpc_c_run
-    ret 10
-  end
-  if vpc_eq_tok0 vpc_c_evidence
+fn vpc_lookup2 wl ulong to ulong
+  if vpc_word_is 0 wl vpc_c_evidence
     ret 11
   end
-  if vpc_eq_tok0 vpc_c_bindings
+  if vpc_word_is 0 wl vpc_c_bindings
     ret 12
   end
-  if vpc_eq_tok0 vpc_c_clear
+  if vpc_word_is 0 wl vpc_c_clear
     ret 13
   end
-  if vpc_eq_tok0 vpc_c_world
+  if vpc_word_is 0 wl vpc_c_world
     ret 14
   end
-  if vpc_eq_tok0 vpc_c_effects
+  if vpc_word_is 0 wl vpc_c_effects
     ret 15
   end
-  if vpc_eq_tok0 vpc_c_alt
+  if vpc_word_is 0 wl vpc_c_alt
     ret 16
   end
-  if vpc_eq_tok0 vpc_c_cmp
+  if vpc_word_is 0 wl vpc_c_cmp
     ret 17
   end
-  if vpc_eq_tok0 vpc_c_why
+  if vpc_word_is 0 wl vpc_c_why
     ret 18
   end
-  ret 19
+  ret VPC_SOURCE
 end
 
-fn vpc_arity_ok cmd ulong ac ulong to bool
+fn vpc_lookup wl ulong to ulong
+  if vpc_word_is 0 wl vpc_c_help
+    ret 0
+  end
+  if vpc_word_is 0 wl vpc_c_quit
+    ret 1
+  end
+  if vpc_word_is 0 wl vpc_c_inspect
+    ret 2
+  end
+  if vpc_word_is 0 wl vpc_c_type
+    ret 3
+  end
+  if vpc_word_is 0 wl vpc_c_id
+    ret 4
+  end
+  if vpc_word_is 0 wl vpc_c_graph
+    ret 5
+  end
+  if vpc_word_is 0 wl vpc_c_verify
+    ret 6
+  end
+  if vpc_word_is 0 wl vpc_c_machine
+    ret 7
+  end
+  if vpc_word_is 0 wl vpc_c_realize
+    ret 8
+  end
+  if vpc_word_is 0 wl vpc_c_cost
+    ret 9
+  end
+  if vpc_word_is 0 wl vpc_c_run
+    ret 10
+  end
+  ret vpc_lookup2 wl
+end
+
+note visor_om_cmd_arity: min in vpc_bdst[0], max in vpc_bdst[1]; false if no table row.
+fn vpc_arity cmd ulong to bool
   if or eq cmd 0 or eq cmd 11 or eq cmd 14 eq cmd 15
-    ret le ac 1
+    put vpc_bdst 0 0
+    put vpc_bdst 1 1
+    ret true
   end
   if or eq cmd 1 or eq cmd 7 or eq cmd 12 eq cmd 13
-    ret eq ac 0
+    put vpc_bdst 0 0
+    put vpc_bdst 1 0
+    ret true
   end
   if eq cmd 10
-    ret and ge ac 1 le ac 4
+    put vpc_bdst 0 1
+    put vpc_bdst 1 4
+    ret true
   end
   if eq cmd 17
-    ret eq ac 2
+    put vpc_bdst 0 2
+    put vpc_bdst 1 2
+    ret true
   end
   if lt cmd 19
-    ret eq ac 1
+    put vpc_bdst 0 1
+    put vpc_bdst 1 1
+    ret true
   end
-  ret true
+  ret false
 end
 
-fn vpc_parse_sbuf rlen ulong to long
-  put vpc_cmd 0 21
-  put vpc_argc 0 0
-  put vpc_for_cur 0 0
-  put vpc_llen 0 0
-  put vpc_elen 0 0
-  n = rlen
-  if gt n 0
-    if eq get v_sbuf sub n 1 uchar 10
-      n = sub n 1
-    end
+fn vpc_put_cmd_name2 cmd ulong to void
+  if eq cmd 11
+    ob_puts vpc_c_evidence
+    ret
   end
-  if gt n 0
-    if eq get v_sbuf sub n 1 uchar 13
-      n = sub n 1
-    end
+  if eq cmd 12
+    ob_puts vpc_c_bindings
+    ret
   end
-  if gt n 4095
-    vpc_set_err vpc_e_long
-    ret -1
+  if eq cmd 13
+    ob_puts vpc_c_clear
+    ret
   end
-  chk = vpc_check_bytes_sbuf n
-  if eq chk 1
-    vpc_set_err vpc_e_ctrl
-    ret -1
+  if eq cmd 14
+    ob_puts vpc_c_world
+    ret
   end
-  if eq chk 2
-    vpc_set_err vpc_e_utf8
-    ret -1
+  if eq cmd 15
+    ob_puts vpc_c_effects
+    ret
   end
-  a = ulong 0
-  b = n
-  while lt a b bound 4096
-    c = ulong get v_sbuf a
-    if or eq c 32 eq c 9
-      a = add a 1
-    else
-      break
-    end
+  if eq cmd 16
+    ob_puts vpc_c_alt
+    ret
   end
-  while gt b a bound 4096
-    c = ulong get v_sbuf sub b 1
-    if or eq c 32 eq c 9
-      b = sub b 1
-    else
-      break
-    end
+  if eq cmd 17
+    ob_puts vpc_c_cmp
+    ret
   end
-  tlen = sub b a
-  for i ulong tlen bound 4096
-    put vpc_line i get v_sbuf add a i
+  if eq cmd 18
+    ob_puts vpc_c_why
+    ret
   end
-  put vpc_llen 0 tlen
-  if eq tlen 0
-    put vpc_cmd 0 20
-    ret 0
-  end
-  if eq get vpc_line 0 uchar 35
-    put vpc_cmd 0 20
-    ret 0
-  end
-  note Extract first word
-  p = ulong 0
-  while lt p tlen bound 256
-    c = ulong get vpc_line p
-    if or eq c 32 eq c 9
-      break
-    end
-    put vpc_tok0 p uchar c
-    p = add p 1
-  end
-  put vpc_t0len 0 p
-  cmd = vpc_lookup_cmd
   if eq cmd 19
-    put vpc_cmd 0 19
-    ret 0
+    ob_puts vpc_c_source
+    ret
   end
-  put vpc_cmd 0 cmd
-  ac = ulong 0
-  while lt p tlen bound 4096
-    while lt p tlen bound 4096
-      c = ulong get vpc_line p
-      if or eq c 32 eq c 9
-        p = add p 1
-      else
-        break
-      end
-    end
-    if ge p tlen
-      break
-    end
-    if ge ac 4
-      vpc_set_err vpc_e_arity
-      ret -1
-    end
-    start = p
-    while lt p tlen bound 4096
-      c = ulong get vpc_line p
-      if or eq c 32 eq c 9
-        break
-      end
-      p = add p 1
-    end
-    al = sub p start
-    if gt al 255
-      vpc_set_err vpc_e_tok
-      ret -1
-    end
-    vpc_store_arg ac start al
-    ac = add ac 1
+  if eq cmd 20
+    ob_puts vpc_c_empty
+    ret
   end
-  if and eq cmd 8 eq ac 3
-    if and vpc_eq_arg 1 vpc_w_for vpc_eq_arg 2 vpc_w_cur
-      put vpc_for_cur 0 1
-      ac = 1
-    else
-      vpc_set_err vpc_e_real
-      ret -1
-    end
-  end
-  put vpc_argc 0 ac
-  if not vpc_arity_ok cmd ac
-    vpc_set_err vpc_e_arity
-    ret -1
-  end
-  ret 0
-end
-
-fn vpc_store_arg ac ulong start ulong al ulong to void
-  base = mul ac 256
-  for i ulong al bound 256
-    put vpc_args add base i get vpc_line add start i
-  end
-  put vpc_alen ac al
+  ob_puts vpc_c_unk
 end
 
 fn vpc_put_cmd_name cmd ulong to void
@@ -418,45 +393,250 @@ fn vpc_put_cmd_name cmd ulong to void
     ob_puts vpc_c_run
     ret
   end
-  if eq cmd 11
-    ob_puts vpc_c_evidence
+  vpc_put_cmd_name2 cmd
+end
+
+fn vpc_tok_is t ulong w view uchar * to bool
+  l = get vpc_tlen t
+  if ne l len w
+    ret false
+  end
+  b = mul t 256
+  for i ulong l bound 256
+    if ne get vpc_tok add b i get w i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vpc_eq_arg idx ulong s view uchar * to bool
+  if ge idx get vpc_argc 0
+    ret false
+  end
+  l = get vpc_alen idx
+  if ne l len s
+    ret false
+  end
+  b = mul idx 256
+  for i ulong l bound 256
+    if ne get vpc_args add b i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vpc_reset to void
+  put vpc_cmd 0 VPC_UNKNOWN
+  put vpc_argc 0 0
+  put vpc_for_cur 0 0
+  put vpc_llen 0 0
+  put vpc_elen 0 0
+  for i ulong 4
+    put vpc_alen i 0
+  end
+end
+
+fn vpc_err_bytes rc ulong to void
+  if eq rc 1
+    vpc_es vpc_e_ctrl1
+    b = get vpc_bdst 0
+    vpc_ec get vpc_hexu and shr b 4 15
+    vpc_ec get vpc_hexu and b 15
+    vpc_es vpc_e_ctrl2
+    vpc_eu get vpc_bdst 1
+    vpc_es vpc_e_ctrl3
     ret
   end
-  if eq cmd 12
-    ob_puts vpc_c_bindings
+  vpc_es vpc_e_utf8
+  vpc_eu get vpc_bdst 1
+end
+
+note Tokenize vpc_line[wl..): -1 on error (message set), else the token count.
+fn vpc_tokenize wl ulong maxa ulong to long
+  n = get vpc_llen 0
+  p = wl
+  nt = ulong 0
+  while true bound 4096
+    while lt p n bound 4096
+      if not vpc_blank ulong get vpc_line p
+        break
+      end
+      p = add p 1
+    end
+    if ge p n
+      break
+    end
+    tl = ulong 0
+    while lt add p tl n bound 4096
+      if vpc_blank ulong get vpc_line add p tl
+        break
+      end
+      tl = add tl 1
+    end
+    if ge tl VPC_TOKEN_MAX
+      vpc_es vpc_e_tok1
+      vpc_eu add nt 1
+      vpc_es vpc_e_tok2
+      vpc_eu tl
+      vpc_es vpc_e_tok3
+      ret -1
+    end
+    if ge nt add VPC_MAX_ARGS 2
+      vpc_es vpc_e_many1
+      vpc_eu maxa
+      vpc_ec uchar 41
+      ret -1
+    end
+    tb = mul nt 256
+    for i ulong tl bound 256
+      put vpc_tok add tb i get vpc_line add p i
+    end
+    put vpc_tlen nt tl
+    nt = add nt 1
+    p = add p tl
+  end
+  ret long nt
+end
+
+fn vpc_err_arity mn ulong mx ulong nt ulong to void
+  vpc_es vpc_e_exp
+  vpc_eu mn
+  if eq mn mx
+    vpc_es vpc_e_arg
+    if ne mn 1
+      vpc_ec uchar 115
+    end
+    vpc_es vpc_e_got
+    vpc_eu nt
     ret
   end
-  if eq cmd 13
-    ob_puts vpc_c_clear
-    ret
+  vpc_es vpc_e_to
+  vpc_eu mx
+  vpc_es vpc_e_args
+  vpc_eu nt
+end
+
+fn vpc_copy_args nt ulong to void
+  for t ulong nt bound 4
+    l = get vpc_tlen t
+    b = mul t 256
+    for i ulong l bound 256
+      put vpc_args add b i get vpc_tok add b i
+    end
+    put vpc_alen t l
   end
-  if eq cmd 14
-    ob_puts vpc_c_world
-    ret
+  put vpc_argc 0 nt
+end
+
+note Arguments of a command word: arity, `for current.machine`, copy.
+fn vpc_finish cmd ulong wl ulong to long
+  u = vpc_arity cmd
+  mn = get vpc_bdst 0
+  mx = get vpc_bdst 1
+  r = vpc_tokenize wl mx
+  if lt r 0
+    ret -1
   end
-  if eq cmd 15
-    ob_puts vpc_c_effects
-    ret
+  nt = ulong r
+  if and eq cmd VPC_REALIZE ge nt 2
+    if vpc_tok_is sub nt 2 vpc_w_for
+      if not vpc_tok_is sub nt 1 vpc_w_cur
+        vpc_es vpc_e_for1
+        last = sub nt 1
+        ll = get vpc_tlen last
+        lb = mul last 256
+        for i ulong ll bound 256
+          vpc_ec get vpc_tok add lb i
+        end
+        vpc_es vpc_e_for2
+        ret -1
+      end
+      put vpc_for_cur 0 1
+      nt = sub nt 2
+    end
   end
-  if eq cmd 16
-    ob_puts vpc_c_alt
-    ret
+  if or lt nt mn gt nt mx
+    vpc_err_arity mn mx nt
+    ret -1
   end
-  if eq cmd 17
-    ob_puts vpc_c_cmp
-    ret
+  vpc_copy_args nt
+  if u
+    ret 0
   end
-  if eq cmd 18
-    ob_puts vpc_c_why
-    ret
+  ret 0
+end
+
+fn vpc_parse_in rlen ulong to long
+  vpc_reset
+  n = rlen
+  if gt n 0
+    if eq get vpc_in sub n 1 10
+      n = sub n 1
+    end
   end
-  if eq cmd 19
-    ob_puts vpc_c_source
-    ret
+  if gt n 0
+    if eq get vpc_in sub n 1 13
+      n = sub n 1
+    end
   end
-  if eq cmd 20
-    ob_puts vpc_c_empty
-    ret
+  if ge n VPC_LINE_MAX
+    vpc_es vpc_e_long1
+    vpc_eu n
+    vpc_es vpc_e_long2
+    ret -1
   end
-  ob_puts vpc_c_unk
+  cr = vpc_check_bytes n
+  if ne cr 0
+    vpc_err_bytes cr
+    ret -1
+  end
+  a = ulong 0
+  b = n
+  while lt a b bound 4096
+    if not vpc_blank ulong get vpc_in a
+      break
+    end
+    a = add a 1
+  end
+  while gt b a bound 4096
+    if not vpc_blank ulong get vpc_in sub b 1
+      break
+    end
+    b = sub b 1
+  end
+  ll = sub b a
+  for i ulong ll bound 4096
+    put vpc_line i get vpc_in add a i
+  end
+  put vpc_llen 0 ll
+  if eq ll 0
+    put vpc_cmd 0 VPC_EMPTY
+    ret 0
+  end
+  if eq get vpc_line 0 35
+    put vpc_cmd 0 VPC_EMPTY
+    ret 0
+  end
+  wl = ulong 0
+  while lt wl ll bound 4096
+    if vpc_blank ulong get vpc_line wl
+      break
+    end
+    wl = add wl 1
+  end
+  cmd = vpc_lookup wl
+  put vpc_cmd 0 cmd
+  if eq cmd VPC_SOURCE
+    ret 0
+  end
+  ret vpc_finish cmd wl
+end
+
+fn vpc_parse_sbuf rlen ulong to long
+  for i ulong rlen bound 4096
+    put vpc_in i get v_sbuf i
+  end
+  ret vpc_parse_in rlen
 end
