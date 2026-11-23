@@ -1,0 +1,3947 @@
+note tools/gen/retrieval/genret.om -- file-backed retrieval provider of the GEN experiment (aien-spark/omega#479,
+note #475), pure OM-2. Contract: tools/gen/retrieval/CONTRACT.md (genret-cli-v3). Arms C and D run the same
+note algorithm with the same k, byte cap and rendering; only --kind differs. The query is built from the public
+note requirement (entry, params, ret values) and the public prompt only; no other task file is opened.
+note
+note   genret query --corpus <MANIFEST> --manifest-sha256 <hex> --recheck <recheck binary> --recheck-sha256 <hex>
+note                --kind raw|abstraction --k <n> --cap-bytes <n>
+note                --requirement <file> --prompt <file> --out <new dir> [--exclude-family <f>]...
+note                [--mode normal|irrelevant|empty|length-matched] [--target-bytes <n>]
+note   genret version
+note
+note Exit 0 on success (an empty selection included); exit 2 on any fatal condition, with one stderr line
+note "genret: FATAL <reason> <detail>" and no --out. All scoring is integer arithmetic (BM25 numerator and
+note denominator in 128 bits, as two ulong words).
+note
+note Built by mk/gen-retrieval.mk as one unit: seed/ng/sha256.om (sh_*), a generated binding unit that
+note defines `text gr_bin_pin` (the sha256 of the recheck binary built in the same make run, or "" for the
+note test-only genret_anyrecheck) and `text gr_src_claim` (the verified recheck source sha256, or
+note "unverified"), then this file.
+note
+note Validator execution: genret hashes the --recheck file through one open descriptor and executes that same
+note open file. execprog closes every descriptor at or above 3, so the child first duplicates the hashed
+note descriptor onto descriptor 0 and executes /proc/self/fd/0 (the open file, not the path, as fexecve
+note does); recheck reads no standard input. The child's environment is empty (execprog), and its argument
+note zero is /proc/self/fd/0. A batch holds at most 128 records and at most 65536 packet bytes (the execprog
+note limit); batch size does not change what is accepted, since every record must get its own OK line.
+note Paths: a path over 4095 bytes is treated as one that cannot be opened (the C got ENAMETOOLONG). The final
+note rename passes both paths in one renames list of at most 4096 bytes; a longer pair is write_failed.
+
+text tg_ver_nl "genret-cli-v3\n"
+text tg_contract "genret-cli-v3"
+text tg_version "version"
+text tg_query "query"
+text tg_o_corpus "--corpus"
+text tg_o_msha "--manifest-sha256"
+text tg_o_kind "--kind"
+text tg_o_req "--requirement"
+text tg_o_pr "--prompt"
+text tg_o_out "--out"
+text tg_o_rc "--recheck"
+text tg_o_rpin "--recheck-sha256"
+text tg_o_mode "--mode"
+text tg_o_k "--k"
+text tg_o_cap "--cap-bytes"
+text tg_o_tgt "--target-bytes"
+text tg_o_excl "--exclude-family"
+text tg_raw "raw"
+text tg_abs "abstraction"
+text tg_m_normal "normal"
+text tg_m_irr "irrelevant"
+text tg_m_empty "empty"
+text tg_m_len "length-matched"
+text tg_corpus "corpus"
+text tg_verified "verified"
+text tg_receipts "receipts"
+text tg_o_rcptx "--receipts"
+text tg_procfd "/proc/self/fd/"
+text tg_proc0 "/proc/self/fd/0"
+text tg_hidden "hidden"
+text tg_tmpdot ".tmp."
+text tg_dotslash "./"
+text tg_dot "."
+text tg_slash "/"
+text tg_magic "gen-record 1\n"
+text tg_body "body"
+text tg_fence "```"
+text tg_ok "OK "
+text tg_refused "REFUSED "
+
+text tk_id "id"
+text tk_kind "kind"
+text tk_split "split"
+text tk_family "family"
+text tk_validity "validity"
+text tk_entry "entry"
+text tk_params "params"
+text tk_ret "ret"
+text tk_desc "desc"
+
+text tf_pre "genret: FATAL "
+text tf_usage "usage"
+text tf_internal "internal"
+text tf_rfailed "recheck_failed"
+text tf_runtrusted "recheck_untrusted"
+text tf_reqinv "requirement_invalid"
+text tf_prinv "prompt_invalid"
+text tf_hidden "hidden_path"
+text tf_munread "manifest_unreadable"
+text tf_mdigest "manifest_digest_mismatch"
+text tf_mmal "manifest_malformed"
+text tf_rmissing "record_missing"
+text tf_invrec "invalid_record"
+text tf_stale "stale_digest"
+text tf_dupid "duplicate_id"
+text tf_wfailed "write_failed"
+text tf_oexists "out_exists"
+
+text tu_tail " (genret query --corpus MANIFEST --manifest-sha256 HEX --recheck BIN --recheck-sha256 HEX --kind raw|abstraction --k N --cap-bytes N --requirement F --prompt F --out DIR [--exclude-family F]... [--mode normal|irrelevant|empty|length-matched] [--target-bytes N]; genret version)"
+text tu_first "first argument must be query or version"
+text tu_noval "option without value"
+text tu_exfam "--exclude-family must match [a-z0-9_-]{1,64}"
+text tu_exmany "too many --exclude-family"
+text tu_unknown "unknown option"
+text tu_repeat "option repeated"
+text tu_range "number out of range"
+text tu_missing "missing required option"
+text tu_msha "--manifest-sha256 must be 64 lowercase hex"
+text tu_rpin "--recheck-sha256 must be 64 lowercase hex"
+text tu_kind "--kind must be raw or abstraction"
+text tu_mode "unknown --mode"
+text tu_target "--target-bytes is required with, and only with, --mode length-matched"
+text tu_tcap "--target-bytes must not exceed --cap-bytes"
+
+text tm_cannot_open "cannot open "
+text tm_not_reg " is not a regular file"
+text tm_cannot_read "cannot read "
+text tm_has_sha " has sha256 "
+text tm_pinned ", pinned "
+text tm_sha_paren " (sha256 "
+text tm_not_built ") is not the recheck this genret was built with ("
+text tm_rparen ")"
+text tm_cannot_resolve "cannot resolve "
+text tm_under_hidden " is under a 'hidden' directory"
+text tm_over_nul ": over 4096 bytes or holds NUL"
+text tm_must_bytes ": must be 1..4096 bytes"
+text tm_byte_out ": byte outside \\n and 0x20..0x7E"
+text tm_needs_one ": needs exactly one '"
+text tm_line_q "' line"
+text tm_resolve_dir "cannot resolve the directory of "
+text tm_empty_nonl "empty or no final newline"
+text tm_more_lines "more than 65536 lines"
+text tm_line "line "
+text tm_not_shape " is not '<sha256>  <path>'"
+text tm_holds_nul " holds NUL"
+text tm_bad_path ": bad path"
+text tm_bad_comp ": bad path component"
+text tm_bad_byte ": bad path byte"
+text tm_dup_path "duplicate path "
+text tm_over_rec ": over 65536 bytes"
+text tm_manifest_says ", manifest says "
+text tm_first_line ": first line is not 'gen-record 1'"
+text tm_no_body ": no 'body' line"
+text tm_hdr_byte ": header byte outside 0x20..0x7E"
+text tm_key ": key "
+text tm_repeated " repeated"
+text tm_no_value " has no value"
+text tm_bad ": bad "
+text tm_value " value"
+text tm_missing_key ": missing key "
+text tm_body_empty ": body empty or not ending in a newline"
+text tm_body_byte ": body byte outside \\n and 0x20..0x7E"
+text tm_pipe "pipe"
+text tm_fork "fork"
+text tm_read "read"
+text tm_waitpid "waitpid"
+text tm_argtoolong "argument packet for recheck too long"
+text tm_not_clean " did not run cleanly (status "
+text tm_exit1 " exit 1 without a REFUSED line"
+text tm_recheck_c "recheck: "
+text tm_no_ok ": no 'OK "
+text tm_line_for "' line for "
+text tm_extra " printed extra output"
+text tm_changed " changed while it was checked"
+text tm_suffix_len "suffix length "
+text tm_accounted " != accounted "
+text tm_out_long "--out path too long"
+text tm_cannot_create "cannot create "
+text tm_cannot_write "cannot write "
+text tm_cannot_fsync "cannot fsync "
+text tm_exists " exists"
+text tm_cannot_rename "cannot rename "
+text tm_to " to "
+text tm_bind "genret binding: gr_bin_pin is neither empty nor 64 hex"
+text tm_colon_sp ": "
+text tm_oom "out of memory"
+
+text tr_kind "kind:"
+text tr_split "split:"
+text tr_validity "validity:"
+text tr_famex "family_excluded:"
+text tr_fence "poisoned:fence"
+text tr_nomatch "no_match"
+text tr_beyond "beyond_k"
+text tr_cap "cap_bytes"
+text tr_empty "ablation_empty"
+
+text to_heading "\nVerified reference code from earlier tasks, most relevant first.\n"
+text to_record "\nRecord "
+text to_entry ".\n\nentry "
+text to_params "\nparams"
+text to_ret "\nret "
+text to_nn "\n\n"
+text to_fopen "\n\n```\n"
+text to_fclose "```\n"
+text to_sel_hdr "rank\tid\tdigest\tscore\tbytes\trole\n"
+text to_exc_hdr "id\tdigest\tscore\treason\n"
+text to_tab "\t"
+text to_nl "\n"
+text to_empty ""
+text to_sp " "
+text to_dash "-"
+text to_comma ","
+text to_top "top"
+text to_pad "pad"
+text to_none "none"
+text to_twosp "  "
+text to_r_contract "contract="
+text to_r_mode "\nmode="
+text to_r_kind "\nkind="
+text to_r_k "\nk="
+text to_r_cap "\ncap_bytes="
+text to_r_target "\ntarget_bytes="
+text to_r_excl "\nexclude_family="
+text to_r_msha "\nmanifest_sha256="
+text to_r_rsha "\nrecheck_sha256="
+text to_r_rsrc "\nrecheck_source_sha256="
+text to_r_req "\nrequirement_sha256="
+text to_r_pr "\nprompt_sha256="
+text to_r_q "\nquery_sha256="
+text to_r_records "\nrecords="
+text to_r_indexed "\nindexed="
+text to_r_tokens "\ntotal_tokens="
+text to_r_selected "\nselected="
+text to_r_pad "\npad="
+text to_r_padr "\npad_reason="
+text to_r_unp "\nunpadded_bytes="
+text to_r_sfx "\nsuffix_bytes="
+text to_r_gap "\nlength_gap="
+text to_r_xsha "\nsuffix_sha256="
+text to_r_ssha "\nselected_sha256="
+text to_r_esha "\nexcluded_sha256="
+text to_pr_reached "reached"
+text to_pr_exhausted "exhausted"
+text to_pr_cns "c_not_shorter"
+text to_f_sel "selected.tsv"
+text to_f_exc "excluded.tsv"
+text to_f_sfx "suffix.txt"
+text to_f_q "query.txt"
+text to_f_rcpt "receipt.txt"
+text to_f_sums "SHA256SUMS"
+
+note ---- state ----------------------------------------------------------------------------------------
+global gtmp uchar 1048576
+global gav uchar *
+global gao ulong *
+global gac ulong 1
+global gp uchar 8192
+global gp2 uchar 8192
+global gtp uchar 8192
+global gtpn ulong 1
+global gst uchar 128
+global gws uchar 8
+global gpf uchar 8
+global gpk uchar 65536
+global gio uchar 65536
+global grl uchar 4096
+global gnb uchar 32
+global ghex uchar 64
+global gsn ulong 2
+global gdig uchar 512
+global gtk uchar 8200
+global gtn ulong 4
+global gqb uchar 8200
+global gqo ulong 8200
+global gql ulong 8200
+global gqn ulong 1
+global gman uchar *
+global gmlen ulong 1
+global gmd uchar 8192
+global gmdn ulong 1
+global graw uchar *
+global glow uchar *
+global grn ulong 1
+global gro uchar *
+global gopt ulong 16
+global gnum long 4
+global gex ulong 256
+global gexn ulong 1
+global gcfg ulong 8
+global gfd long 2
+global gnr ulong 1
+global r_lo ulong *
+global r_pl ulong *
+global r_off ulong *
+global r_len ulong *
+global r_fo ulong *
+global r_fl ulong *
+global r_fh ulong *
+global r_bo ulong *
+global r_bl ulong *
+global r_rc ulong *
+global r_rx ulong *
+global r_ix ulong *
+global r_sel ulong *
+global r_pad ulong *
+global r_ts ulong *
+global r_tn ulong *
+global r_sc ulong *
+global r_tf ulong *
+global gto ulong *
+global gtl ulong *
+global gtc ulong 1
+global gtt1 ulong *
+global gtt2 ulong *
+global gsa ulong *
+global gsb ulong *
+global gcm ulong 1
+global gbyid ulong *
+global gord ulong *
+global gsel ulong *
+global gselb ulong *
+global gob uchar *
+global gobn ulong 1
+global gseg ulong 16
+global gstat ulong 16
+global gw ulong 16
+
+note gcfg: 0 kind (0 raw, 1 abstraction), 1 mode (0 normal, 1 irrelevant, 2 empty, 3 length-matched)
+note gnum: 0 k, 1 cap, 2 target (-1 when unset)
+note gopt: argv index of 0 corpus 1 manifest-sha256 2 kind 3 requirement 4 prompt 5 out 6 mode 7 recheck
+note 8 recheck-sha256 (0 when unset)
+note gtn: 0 requirement length, 1 prompt length, 2 over flag of the last task read
+note gdig: 0 requirement 64 prompt 128 query 192 suffix 256 selected 320 excluded 384 recheck 448 manifest
+note gstat: 0 N indexed 1 T total tokens 2 ns 3 total 4 unpadded 5 npad 6 pad reason (0 '-', 1 reached,
+note 2 exhausted, 3 c_not_shorter)
+note gseg: start and end of the output buffers in gob: 0 suffix 2 selected 4 excluded 6 query 8 receipt
+note 10 SHA256SUMS
+
+note ---- stderr ---------------------------------------------------------------------------------------
+fn e_t s view uchar * to void
+p = ulong 0
+n = len s
+while lt p n bound 1048576
+w = write 2 s p sub n p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_av i ulong to void
+p = get gao i
+q = get gao add i 1
+while lt p q bound 1048576
+w = write 2 gav p sub q p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_raw o ulong n ulong to void
+p = o
+q = add o n
+while lt p q bound 1048576
+w = write 2 graw p sub q p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_man o ulong n ulong to void
+p = o
+q = add o n
+while lt p q bound 1048576
+w = write 2 gman p sub q p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_ro o ulong n ulong to void
+p = o
+q = add o n
+while lt p q bound 1048576
+w = write 2 gro p sub q p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_tp to void
+p = ulong 0
+q = get gtpn 0
+while lt p q bound 1048576
+w = write 2 gtp p sub q p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_dig o ulong to void
+p = o
+q = add o 64
+while lt p q bound 128
+w = write 2 gdig p sub q p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_hex to void
+p = ulong 0
+while lt p 64 bound 128
+w = write 2 ghex p sub 64 p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+fn e_u v ulong to void
+n = fmt_u v
+p = ulong 0
+while lt p n bound 64
+w = write 2 gnb p sub n p
+if le w 0
+ret
+end
+p = add p ulong w
+end
+end
+
+note the relative path of record r (its manifest line from byte 66)
+fn e_rel r ulong to void
+e_man add get r_lo r 66 get r_pl r
+end
+
+fn e_id r ulong to void
+e_raw get r_fo mul r 9 get r_fl mul r 9
+end
+
+fn f_begin reason view uchar * to void
+e_t tf_pre
+e_t reason
+e_t to_sp
+end
+
+fn f_end to void
+e_t to_nl
+exit 2
+end
+
+fn usage why view uchar * to void
+f_begin tf_usage
+e_t why
+e_t tu_tail
+f_end
+end
+
+note decimal of v into gnb[0..n); returns n
+fn fmt_u v ulong to ulong
+tmp = new uchar 24 0
+k = ulong 0
+x = v
+if eq x 0
+put gnb 0 48
+ret 1
+end
+while ne x 0 bound 24
+put tmp k uchar add rem x 10 48
+x = div x 10
+k = add k 1
+end
+for i ulong k bound 24
+put gnb i get tmp sub sub k 1 i
+end
+ret k
+end
+
+note ---- argv ---------------------------------------------------------------------------------------
+fn ld_args to void
+ac = ulong argcnt
+put gac 0 ac
+r = enlarge gao add ac 1
+tot = ulong 0
+for i ulong ac bound 1048576
+n = argread i gtmp 0 1048576
+if lt n 0
+e_t tf_pre
+e_t tf_usage
+e_t to_sp
+e_t tu_noval
+f_end
+end
+put gao i tot
+r2 = enlarge gav add tot ulong n
+for j ulong ulong n bound 1048576
+put gav add tot j get gtmp j
+end
+tot = add tot ulong n
+end
+put gao ac tot
+end
+
+fn av_len i ulong to ulong
+ret sub get gao add i 1 get gao i
+end
+
+fn av_is i ulong t view uchar * to bool
+o = get gao i
+n = av_len i
+if ne n len t
+ret false
+end
+for j ulong n bound 1048576
+if ne get gav add o j get t j
+ret false
+end
+end
+ret true
+end
+
+fn c_name c uchar to bool
+if and ge c 97 le c 122
+ret true
+end
+if and ge c 48 le c 57
+ret true
+end
+if eq c 95
+ret true
+end
+ret eq c 45
+end
+
+fn c_word c uchar to bool
+if and ge c 97 le c 122
+ret true
+end
+ret and ge c 48 le c 57
+end
+
+fn c_hex c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+ret and ge c 97 le c 102
+end
+
+fn av_hex64 i ulong to bool
+if ne av_len i 64
+ret false
+end
+o = get gao i
+for j ulong 64
+if not c_hex get gav add o j
+ret false
+end
+end
+ret true
+end
+
+fn av_famtok i ulong to bool
+n = av_len i
+if or lt n 1 gt n 64
+ret false
+end
+o = get gao i
+for j ulong n bound 64
+if not c_name get gav add o j
+ret false
+end
+end
+ret true
+end
+
+note parse_num: 1..9 decimal digits, no leading zero, lo..hi; -1 when refused
+fn av_num i ulong lo long hi long to long
+n = av_len i
+if or eq n 0 gt n 9
+ret -1
+end
+o = get gao i
+if and eq get gav o 48 gt n 1
+ret -1
+end
+v = long 0
+for j ulong n bound 9
+c = get gav add o j
+if or lt c 48 gt c 57
+ret -1
+end
+v = add mul v 10 long sub c 48
+end
+if or lt v lo gt v hi
+ret -1
+end
+ret v
+end
+
+note option slot: 0..8 a string option (gopt), 20..22 a number (gnum k, cap, target), 30 exclude, 99 unknown
+fn opt_slot i ulong to ulong
+if av_is i tg_o_corpus
+ret 0
+end
+if av_is i tg_o_msha
+ret 1
+end
+if av_is i tg_o_kind
+ret 2
+end
+if av_is i tg_o_req
+ret 3
+end
+if av_is i tg_o_pr
+ret 4
+end
+if av_is i tg_o_out
+ret 5
+end
+if av_is i tg_o_rc
+ret 7
+end
+if av_is i tg_o_rpin
+ret 8
+end
+if av_is i tg_o_mode
+ret 6
+end
+if av_is i tg_o_k
+ret 20
+end
+if av_is i tg_o_cap
+ret 21
+end
+if av_is i tg_o_tgt
+ret 22
+end
+if av_is i tg_o_excl
+ret 30
+end
+ret 99
+end
+
+fn set_num slot ulong v ulong to void
+nx = sub slot 20
+if ne get gnum nx -1
+usage tu_repeat
+end
+lo = long 1
+hi = long 64
+if ne nx 0
+hi = 1048576
+end
+pn = av_num v lo hi
+if lt pn 0
+usage tu_range
+end
+put gnum nx pn
+end
+
+fn parse_opts to void
+put gnum 0 -1
+put gnum 1 -1
+put gnum 2 -1
+ac = get gac 0
+i = ulong 2
+while lt i ac bound 2097152
+if ge add i 1 ac
+usage tu_noval
+end
+o = i
+v = add i 1
+i = add i 2
+slot = opt_slot o
+if eq slot 30
+if not av_famtok v
+usage tu_exfam
+end
+if eq get gexn 0 256
+usage tu_exmany
+end
+put gex get gexn 0 v
+put gexn 0 add get gexn 0 1
+continue
+end
+if eq slot 99
+usage tu_unknown
+end
+if lt slot 16
+if ne get gopt slot 0
+usage tu_repeat
+end
+put gopt slot v
+else
+set_num slot v
+end
+end
+end
+
+fn check_opts to void
+for j ulong 9
+if and ne j 6 eq get gopt j 0
+usage tu_missing
+end
+end
+if or lt get gnum 0 0 lt get gnum 1 0
+usage tu_missing
+end
+if not av_hex64 get gopt 1
+usage tu_msha
+end
+if not av_hex64 get gopt 8
+usage tu_rpin
+end
+kd = get gopt 2
+if av_is kd tg_raw
+put gcfg 0 0
+else
+if av_is kd tg_abs
+put gcfg 0 1
+else
+usage tu_kind
+end
+end
+md = get gopt 6
+put gcfg 1 0
+if ne md 0
+check_mode md
+end
+islen = eq get gcfg 1 3
+hast = ne get gnum 2 -1
+if ne islen hast
+usage tu_target
+end
+if and islen gt get gnum 2 get gnum 1
+usage tu_tcap
+end
+end
+
+fn check_mode md ulong to void
+if av_is md tg_m_normal
+put gcfg 1 0
+ret
+end
+if av_is md tg_m_irr
+put gcfg 1 1
+ret
+end
+if av_is md tg_m_empty
+put gcfg 1 2
+ret
+end
+if av_is md tg_m_len
+put gcfg 1 3
+ret
+end
+usage tu_mode
+end
+
+note ---- paths into gp ------------------------------------------------------------------------------------
+note argv i into gp; returns its length, or 8191 when it is empty or longer than 4095 (no open is tried)
+fn gp_av i ulong to ulong
+n = av_len i
+if or eq n 0 gt n 4095
+ret 8191
+end
+o = get gao i
+for j ulong n bound 4096
+put gp j get gav add o j
+end
+ret n
+end
+
+fn gp_add_t ps ulong s view uchar * to ulong
+n = len s
+if gt add ps n 8191
+ret 8191
+end
+for j ulong n bound 8192
+put gp add ps j get s j
+end
+ret add ps n
+end
+
+fn gp_add_man ps ulong o ulong n ulong to ulong
+if gt add ps n 8191
+ret 8191
+end
+for j ulong n bound 8192
+put gp add ps j get gman add o j
+end
+ret add ps n
+end
+
+fn gp_add_md ps ulong to ulong
+n = get gmdn 0
+for j ulong n bound 8192
+put gp add ps j get gmd j
+end
+ret add ps n
+end
+
+fn gp_add_u ps ulong v ulong to ulong
+n = fmt_u v
+for j ulong n bound 32
+put gp add ps j get gnb j
+end
+ret add ps n
+end
+
+fn gp_add_tp ps ulong to ulong
+n = get gtpn 0
+for j ulong n bound 8192
+put gp add ps j get gtp j
+end
+ret add ps n
+end
+
+note open gp[0..n) (n 8191 or over 4095: -36 without a call)
+fn gp_open n ulong flags int mode int to long
+if or eq n 0 gt n 4095
+ret -36
+end
+ret fopen gp 0 n flags mode
+end
+
+fn st_isreg to bool
+m = or uint get gst 16 shl uint get gst 17 8
+ret eq and m 61440 32768
+end
+
+note ---- SHA-256 stream over sh_dat (seed/ng/sha256.om sh_blk, sh_out) --------------------------------------
+fn gs_begin to void
+sh_init
+for j ulong 8
+put sh_h j get sh_k add j 64
+end
+put gsn 0 0
+put gsn 1 0
+end
+
+fn gs_flush to void
+f = get gsn 1
+nb = div f 64
+for b ulong nb bound 262144
+sh_blk 0 mul b 64
+end
+r = rem f 64
+o = mul nb 64
+for j ulong r bound 64
+put sh_dat j get sh_dat add o j
+end
+put gsn 1 r
+end
+
+note room left in sh_dat and the count of the next copy (at most m)
+fn gs_room m ulong to ulong
+room = sub 16777216 get gsn 1
+if lt room m
+ret room
+end
+ret m
+end
+
+fn gs_done m ulong to void
+put gsn 1 add get gsn 1 m
+put gsn 0 add get gsn 0 m
+gs_flush
+end
+
+fn gs_man o ulong n ulong to void
+i = ulong 0
+while lt i n bound 4294967296
+m = gs_room sub n i
+f = get gsn 1
+for j ulong m bound 16777216
+put sh_dat add f j get gman add add o i j
+end
+gs_done m
+i = add i m
+end
+end
+
+fn gs_raw o ulong n ulong to void
+i = ulong 0
+while lt i n bound 4294967296
+m = gs_room sub n i
+f = get gsn 1
+for j ulong m bound 16777216
+put sh_dat add f j get graw add add o i j
+end
+gs_done m
+i = add i m
+end
+end
+
+fn gs_ob o ulong n ulong to void
+i = ulong 0
+while lt i n bound 4294967296
+m = gs_room sub n i
+f = get gsn 1
+for j ulong m bound 16777216
+put sh_dat add f j get gob add add o i j
+end
+gs_done m
+i = add i m
+end
+end
+
+fn gs_tk o ulong n ulong to void
+m = gs_room n
+f = get gsn 1
+for j ulong m bound 16777216
+put sh_dat add f j get gtk add o j
+end
+gs_done m
+end
+
+fn gs_io n ulong to void
+m = gs_room n
+f = get gsn 1
+for j ulong m bound 65536
+put sh_dat add f j get gio j
+end
+gs_done m
+end
+
+note finish: the lowercase hex digest in ghex
+fn gs_end to void
+gs_flush
+r = get gsn 1
+for j ulong 128
+put sh_pad j 0
+end
+for j ulong r bound 64
+put sh_pad j get sh_dat j
+end
+put sh_pad r 128
+e = ulong 64
+if ge r 56
+e = 128
+end
+bits = mul get gsn 0 8
+for j ulong 8
+put sh_pad sub sub e 1 j uchar and shr bits mul j 8 255
+end
+sh_blk 1 0
+if eq e 128
+sh_blk 1 64
+end
+sh_out
+for i ulong 32
+d = uint get sh_dig i
+put ghex mul i 2 sh_hexd shr d 4
+put ghex add mul i 2 1 sh_hexd and d 15
+end
+end
+
+fn dig_save o ulong to void
+for j ulong 64
+put gdig add o j get ghex j
+end
+end
+
+fn hex_eq_av i ulong to bool
+o = get gao i
+for j ulong 64
+if ne get ghex j get gav add o j
+ret false
+end
+end
+ret true
+end
+
+fn hex_eq_pin to bool
+for j ulong 64
+if ne get ghex j get gr_bin_pin j
+ret false
+end
+end
+ret true
+end
+
+fn hex_eq_man o ulong to bool
+for j ulong 64
+if ne get ghex j get gman add o j
+ret false
+end
+end
+ret true
+end
+
+note ---- the validator binary -------------------------------------------------------------------------
+fn rc_fail_open to void
+f_begin tf_rfailed
+e_t tm_cannot_open
+e_av get gopt 7
+f_end
+end
+
+fn open_recheck to void
+bi = get gopt 7
+n = gp_av bi
+fd = gp_open n 0 0
+if lt fd 0
+rc_fail_open
+end
+k = fstat int fd gst 0 128
+if or ne k 0 not st_isreg
+f_begin tf_rfailed
+e_av bi
+e_t tm_not_reg
+f_end
+end
+gs_begin
+tot = ulong 0
+bad = false
+going = true
+while going bound 4294967296
+want = ulong 65536
+left = sub 67108865 tot
+if lt left want
+want = left
+end
+got = read int fd gio 0 want
+if lt got 0
+if ne got -4
+bad = true
+going = false
+end
+else
+if eq got 0
+going = false
+else
+gs_io ulong got
+tot = add tot ulong got
+if gt tot 67108864
+going = false
+end
+end
+end
+end
+if or bad gt tot 67108864
+f_begin tf_rfailed
+e_t tm_cannot_read
+e_av bi
+f_end
+end
+gs_end
+dig_save 384
+if not hex_eq_av get gopt 8
+f_begin tf_runtrusted
+e_av bi
+e_t tm_has_sha
+e_hex
+e_t tm_pinned
+e_av get gopt 8
+f_end
+end
+if ne len gr_bin_pin 0
+if not hex_eq_pin
+f_begin tf_runtrusted
+e_av bi
+e_t tm_sha_paren
+e_hex
+e_t tm_not_built
+e_t gr_bin_pin
+e_t tm_rparen
+f_end
+end
+end
+put gfd 0 fd
+end
+
+note ---- task files --------------------------------------------------------------------------------------
+fn task_fail what ulong msg view uchar * i ulong to void
+if eq what 0
+f_begin tf_reqinv
+else
+f_begin tf_prinv
+end
+e_t msg
+e_av i
+f_end
+end
+
+fn task_fail2 what ulong i ulong msg view uchar * to void
+if eq what 0
+f_begin tf_reqinv
+else
+f_begin tf_prinv
+end
+e_av i
+e_t msg
+f_end
+end
+
+note /proc/self/fd/<fd> into gp; returns its length
+fn gp_procfd fd long to ulong
+n = gp_add_t 0 tg_procfd
+ret gp_add_u n ulong fd
+end
+
+note any component of grl[0..n) named exactly hidden
+fn has_hidden n ulong to bool
+s = ulong 0
+while lt s n bound 8192
+while and lt s n eq get grl s 47 bound 8192
+s = add s 1
+end
+e = s
+while and lt e n ne get grl e 47 bound 8192
+e = add e 1
+end
+if eq sub e s 6
+same = true
+for j ulong 6
+if ne get grl add s j get tg_hidden j
+same = false
+end
+end
+if same
+ret true
+end
+end
+s = e
+end
+ret false
+end
+
+note reads task file argv i (what 0 requirement, 1 prompt) into gtk at base; length in gtn[what], over in gtn[2]
+fn read_task i ulong what ulong base ulong to void
+n = gp_av i
+fd = gp_open n 526592 0
+if lt fd 0
+task_fail what tm_cannot_read i
+end
+m = gp_procfd fd
+rl = readlnk gp 0 m grl 0 4095
+if le rl 0
+task_fail what tm_cannot_resolve i
+end
+if has_hidden ulong rl
+f_begin tf_hidden
+e_av i
+e_t tm_under_hidden
+f_end
+end
+k = fstat int fd gst 0 128
+if or ne k 0 not st_isreg
+task_fail2 what i tm_not_reg
+end
+tot = ulong 0
+going = true
+while going bound 8192
+got = read int fd gtk add base tot sub 4097 tot
+if lt got 0
+if ne got -4
+task_fail what tm_cannot_read i
+end
+else
+if eq got 0
+going = false
+else
+tot = add tot ulong got
+if gt tot 4096
+going = false
+end
+end
+end
+end
+c = fclose int fd
+put gtn what tot
+put gtn 2 0
+if gt tot 4096
+put gtn 2 1
+end
+end
+
+fn lower c uchar to uchar
+if and ge c 65 le c 90
+ret add c 32
+end
+ret c
+end
+
+note tokens of gqb[a..b) appended to the query list
+fn tok_q a ulong b ulong to void
+i = a
+while lt i b bound 16384
+while and lt i b not c_word get gqb i bound 16384
+i = add i 1
+end
+j = i
+while and lt j b c_word get gqb j bound 16384
+j = add j 1
+end
+if gt j i
+q = get gqn 0
+put gqo q i
+put gql q sub j i
+put gqn 0 add q 1
+end
+i = j
+end
+end
+
+note does the requirement line gtk[i..e) start with key t followed by a space or its end
+fn req_key i ulong e ulong t view uchar * to bool
+kl = len t
+if lt sub e i kl
+ret false
+end
+for j ulong kl bound 16
+if ne get gtk add i j get t j
+ret false
+end
+end
+if eq sub e i kl
+ret true
+end
+ret eq get gtk add i kl 32
+end
+
+fn req_line i ulong e ulong t view uchar * slot ulong to void
+if req_key i e t
+put gw slot add get gw slot 1
+kl = len t
+vs = add i kl
+if gt sub e i kl
+vs = add vs 1
+end
+tok_q vs e
+end
+end
+
+fn build_query to void
+q_lower
+q_req_lines
+ri = get gopt 3
+if ne get gw 0 1
+req_needs ri tk_entry
+end
+if ne get gw 1 1
+req_needs ri tk_params
+end
+if ne get gw 2 1
+req_needs ri tk_ret
+end
+pn = get gtn 1
+tok_q 4100 add 4100 pn
+q_sort
+q_dedup
+end
+
+fn q_lower to void
+rn = get gtn 0
+pn = get gtn 1
+for i ulong rn bound 8192
+put gqb i lower get gtk i
+end
+for i ulong pn bound 8192
+put gqb add 4100 i lower get gtk add 4100 i
+end
+end
+
+fn q_req_lines to void
+rn = get gtn 0
+put gw 0 0
+put gw 1 0
+put gw 2 0
+i = ulong 0
+while lt i rn bound 8192
+e = i
+while and lt e rn ne get gtk e 10 bound 8192
+e = add e 1
+end
+req_line i e tk_entry 0
+req_line i e tk_params 1
+req_line i e tk_ret 2
+i = add e 1
+end
+end
+
+fn q_sort to void
+qn = get gqn 0
+r = enlarge gsa qn
+for j ulong qn bound 8192
+put gsa j j
+end
+put gcm 0 2
+msort qn
+end
+
+fn q_keep nu ulong t ulong to bool
+if eq nu 0
+ret true
+end
+ret ne cmpx get gsa sub nu 1 t 0
+end
+
+fn q_dedup to void
+qn = get gqn 0
+nu = ulong 0
+for j ulong qn bound 8192
+t = get gsa j
+if q_keep nu t
+put gsa nu t
+nu = add nu 1
+end
+end
+r2 = enlarge gtt1 nu
+r3 = enlarge gtt2 nu
+for j ulong nu bound 8192
+t = get gsa j
+put gtt1 j get gqo t
+put gtt2 j get gql t
+end
+for j ulong nu bound 8192
+put gqo j get gtt1 j
+put gql j get gtt2 j
+end
+put gqn 0 nu
+end
+
+fn req_needs ri ulong t view uchar * to void
+f_begin tf_reqinv
+e_av ri
+e_t tm_needs_one
+e_t t
+e_t tm_line_q
+f_end
+end
+
+fn read_tasks to void
+ri = get gopt 3
+read_task ri 0 0
+rn = get gtn 0
+bad = ne get gtn 2 0
+for j ulong rn bound 8192
+if eq get gtk j 0
+bad = true
+end
+end
+if bad
+task_fail2 0 ri tm_over_nul
+end
+pi = get gopt 4
+read_task pi 1 4100
+pn = get gtn 1
+if or ne get gtn 2 0 lt pn 1
+task_fail2 1 pi tm_must_bytes
+end
+for j ulong pn bound 8192
+c = get gtk add 4100 j
+if ne c 10
+if or lt c 32 gt c 126
+task_fail2 1 pi tm_byte_out
+end
+end
+end
+build_query
+end
+
+note ---- byte comparison (unsigned bytes; a proper prefix sorts first) -----------------------------------
+fn cmp_len an ulong bn ulong to int
+if lt an bn
+ret -1
+end
+if gt an bn
+ret 1
+end
+ret 0
+end
+
+fn cb_low ao ulong an ulong bo ulong bn ulong to int
+m = an
+if lt bn m
+m = bn
+end
+for i ulong m bound 4294967296
+x = get glow add ao i
+y = get glow add bo i
+if ne x y
+if lt x y
+ret -1
+end
+ret 1
+end
+end
+ret cmp_len an bn
+end
+
+fn cb_qb ao ulong an ulong bo ulong bn ulong to int
+m = an
+if lt bn m
+m = bn
+end
+for i ulong m bound 4294967296
+x = get gqb add ao i
+y = get gqb add bo i
+if ne x y
+if lt x y
+ret -1
+end
+ret 1
+end
+end
+ret cmp_len an bn
+end
+
+fn cb_lq ao ulong an ulong bo ulong bn ulong to int
+m = an
+if lt bn m
+m = bn
+end
+for i ulong m bound 4294967296
+x = get glow add ao i
+y = get gqb add bo i
+if ne x y
+if lt x y
+ret -1
+end
+ret 1
+end
+end
+ret cmp_len an bn
+end
+
+fn cb_man ao ulong an ulong bo ulong bn ulong to int
+m = an
+if lt bn m
+m = bn
+end
+for i ulong m bound 4294967296
+x = get gman add ao i
+y = get gman add bo i
+if ne x y
+if lt x y
+ret -1
+end
+ret 1
+end
+end
+ret cmp_len an bn
+end
+
+fn cb_raw ao ulong an ulong bo ulong bn ulong to int
+m = an
+if lt bn m
+m = bn
+end
+for i ulong m bound 4294967296
+x = get graw add ao i
+y = get graw add bo i
+if ne x y
+if lt x y
+ret -1
+end
+ret 1
+end
+end
+ret cmp_len an bn
+end
+
+fn cmp_id a ulong b ulong to int
+ka = mul a 9
+kb = mul b 9
+ao = get r_fo ka
+an = get r_fl ka
+bo = get r_fo kb
+bn = get r_fl kb
+ret cb_raw ao an bo bn
+end
+
+fn cmp_score a ulong b ulong dir ulong to int
+sa = get r_sc a
+sb = get r_sc b
+if ne sa sb
+if eq dir 0
+if gt sa sb
+ret -1
+end
+ret 1
+end
+if lt sa sb
+ret -1
+end
+ret 1
+end
+ret cmp_id a b
+end
+
+fn cmp_tok a ulong b ulong to int
+ao = get gto a
+an = get gtl a
+bo = get gto b
+bn = get gtl b
+ret cb_low ao an bo bn
+end
+
+fn cmp_qt a ulong b ulong to int
+ao = get gqo a
+an = get gql a
+bo = get gqo b
+bn = get gql b
+ret cb_qb ao an bo bn
+end
+
+fn cmp_path a ulong b ulong to int
+ao = add get r_lo a 66
+an = get r_pl a
+bo = add get r_lo b 66
+bn = get r_pl b
+ret cb_man ao an bo bn
+end
+
+note the comparator of gcm: 1 record tokens, 2 query tokens, 3 manifest paths, 4 ids, 5 score descending,
+note 6 score ascending (ties by id)
+fn cmpx a ulong b ulong to int
+m = get gcm 0
+if eq m 1
+ret cmp_tok a b
+end
+if eq m 2
+ret cmp_qt a b
+end
+if eq m 3
+ret cmp_path a b
+end
+if eq m 4
+ret cmp_id a b
+end
+if eq m 5
+ret cmp_score a b 0
+end
+ret cmp_score a b 1
+end
+
+note ---- merge sort of gsa[0..n) under cmpx ----------------------------------------------------------
+fn merge lo ulong mid ulong hi ulong to void
+a = lo
+b = mid
+k = lo
+while lt k hi bound 4294967296
+takea = false
+if lt a mid
+if ge b hi
+takea = true
+else
+if le cmpx get gsa a get gsa b 0
+takea = true
+end
+end
+end
+if takea
+put gsb k get gsa a
+a = add a 1
+else
+put gsb k get gsa b
+b = add b 1
+end
+k = add k 1
+end
+end
+
+fn msort n ulong to void
+r = enlarge gsb n
+w = ulong 1
+while lt w n bound 64
+i = ulong 0
+while lt i n bound 4294967296
+mid = add i w
+if gt mid n
+mid = n
+end
+hi = add mid w
+if gt hi n
+hi = n
+end
+merge i mid hi
+i = add i mul w 2
+end
+for j ulong n bound 4294967296
+put gsa j get gsb j
+end
+w = mul w 2
+end
+end
+
+note ---- manifest ----------------------------------------------------------------------------------------
+fn man_fail_read to void
+f_begin tf_munread
+e_t tm_cannot_read
+e_av get gopt 0
+f_end
+end
+
+fn read_manifest to void
+ci = get gopt 0
+n = gp_av ci
+fd = gp_open n 524288 0
+if lt fd 0
+man_fail_read
+end
+cap = ulong 65536
+r = enlarge gman add cap 1
+tot = ulong 0
+going = true
+while going bound 4294967296
+want = sub cap tot
+left = sub 275251201 tot
+if lt left want
+want = left
+end
+got = read int fd gman tot want
+if lt got 0
+if ne got -4
+man_fail_read
+end
+else
+if eq got 0
+going = false
+else
+tot = add tot ulong got
+if gt tot 275251200
+going = false
+end
+if eq tot cap
+cap = mul cap 2
+r2 = enlarge gman add cap 1
+if ne r2 0
+f_begin tf_internal
+e_t tm_oom
+f_end
+end
+end
+end
+end
+end
+c = fclose int fd
+if gt tot 275251200
+man_fail_read
+end
+put gmlen 0 tot
+gs_begin
+gs_man 0 tot
+gs_end
+dig_save 448
+if not hex_eq_av get gopt 1
+f_begin tf_mdigest
+e_av ci
+e_t tm_has_sha
+e_hex
+e_t tm_pinned
+e_av get gopt 1
+f_end
+end
+if eq tot 0
+mal_empty
+end
+if ne get gman sub tot 1 10
+mal_empty
+end
+manifest_dir ci
+end
+
+fn mal_empty to void
+f_begin tf_mmal
+e_t tm_empty_nonl
+f_end
+end
+
+note mdir: realpath of the corpus argument up to its last '/' (or "./"), then "/"
+fn manifest_dir ci ulong to void
+o = get gao ci
+n = av_len ci
+cut = ulong 0
+for j ulong n bound 1048576
+if eq get gav add o j 47
+cut = add j 1
+end
+end
+m = ulong 0
+if eq cut 0
+m = gp_add_t 0 tg_dotslash
+else
+if gt cut 4095
+m = 8191
+else
+for j ulong cut bound 4096
+put gp j get gav add o j
+end
+m = cut
+end
+end
+fd = gp_open m 2637824 0
+if lt fd 0
+f_begin tf_munread
+e_t tm_resolve_dir
+e_av ci
+f_end
+end
+k = gp_procfd fd
+rl = readlnk gp 0 k gmd 0 4095
+c = fclose int fd
+if or le rl 0 ge rl 4095
+f_begin tf_munread
+e_t tm_resolve_dir
+e_av ci
+f_end
+end
+put gmd ulong rl 47
+put gmdn 0 add ulong rl 1
+end
+
+note ---- manifest lines ----------------------------------------------------------------------------------
+fn mal_line li ulong msg view uchar * to void
+f_begin tf_mmal
+e_t tm_line
+e_u add li 1
+e_t msg
+f_end
+end
+
+fn man_hex64 o ulong to bool
+for j ulong 64
+if not c_hex get gman add o j
+ret false
+end
+end
+ret true
+end
+
+fn path_byte c uchar to bool
+if c_name c
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+ret eq c 46
+end
+
+fn comp_bad s ulong cl ulong to bool
+if eq cl 0
+ret true
+end
+if eq get gman s 46
+if eq cl 1
+ret true
+end
+if eq cl 2
+ret eq get gman add s 1 46
+end
+end
+ret false
+end
+
+fn comp_bytes_ok s ulong cl ulong to bool
+for q ulong cl bound 8192
+if not path_byte get gman add s q
+ret false
+end
+end
+ret true
+end
+
+fn comp_end s ulong e ulong to ulong
+c = s
+while and lt c e ne get gman c 47 bound 8192
+c = add c 1
+end
+ret c
+end
+
+fn check_path li ulong p ulong n ulong to void
+if eq get gman p 47
+mal_line li tm_bad_path
+end
+if gt n 4096
+mal_line li tm_bad_path
+end
+s = p
+e = add p n
+going = true
+while going bound 8192
+c = comp_end s e
+cl = sub c s
+if comp_bad s cl
+mal_line li tm_bad_comp
+end
+if not comp_bytes_ok s cl
+mal_line li tm_bad_byte
+end
+if ge c e
+going = false
+else
+s = add c 1
+end
+end
+end
+
+fn alloc_records nr ulong to void
+r = enlarge r_lo nr
+r = enlarge r_pl nr
+r = enlarge r_off nr
+r = enlarge r_len nr
+r = enlarge r_fo mul nr 9
+r = enlarge r_fl mul nr 9
+r = enlarge r_fh mul nr 9
+r = enlarge r_bo nr
+r = enlarge r_bl nr
+r = enlarge r_rc nr
+r = enlarge r_rx nr
+r = enlarge r_ix nr
+r = enlarge r_sel nr
+r = enlarge r_pad nr
+r = enlarge r_ts nr
+r = enlarge r_tn nr
+r = enlarge r_sc nr
+r = enlarge r_tf nr
+end
+
+fn man_count to ulong
+mn = get gmlen 0
+nr = ulong 0
+for i ulong mn bound 4294967296
+if eq get gman i 10
+nr = add nr 1
+end
+end
+ret nr
+end
+
+fn man_shape i ulong n ulong to bool
+if lt n 67
+ret false
+end
+if not man_hex64 i
+ret false
+end
+if ne get gman add i 64 32
+ret false
+end
+ret eq get gman add i 65 32
+end
+
+fn man_nul i ulong n ulong to bool
+for j ulong n bound 4294967296
+if eq get gman add i j 0
+ret true
+end
+end
+ret false
+end
+
+fn man_line li ulong i ulong e ulong to void
+n = sub e i
+if not man_shape i n
+mal_line li tm_not_shape
+end
+if man_nul i n
+mal_line li tm_holds_nul
+end
+check_path li add i 66 sub n 66
+put r_lo li i
+put r_pl li sub n 66
+end
+
+fn man_eol i ulong to ulong
+e = i
+while ne get gman e 10 bound 4294967296
+e = add e 1
+end
+ret e
+end
+
+fn parse_manifest to void
+nr = man_count
+if gt nr 65536
+f_begin tf_mmal
+e_t tm_more_lines
+f_end
+end
+put gnr 0 nr
+alloc_records nr
+mn = get gmlen 0
+i = ulong 0
+li = ulong 0
+while lt i mn bound 4294967296
+e = man_eol i
+man_line li i e
+li = add li 1
+i = add e 1
+end
+dup_paths nr
+end
+
+fn dup_paths nr ulong to void
+r = enlarge gsa nr
+for j ulong nr bound 65536
+put gsa j j
+end
+put gcm 0 3
+msort nr
+for j ulong nr bound 65536
+if gt j 0
+if eq cmpx get gsa sub j 1 get gsa j 0
+f_begin tf_mmal
+e_t tm_dup_path
+e_rel get gsa j
+f_end
+end
+end
+end
+end
+
+note ---- records ---------------------------------------------------------------------------------------
+note mdir + relative path of record r into gp; its length (8191 when too long)
+fn gp_rec r ulong to ulong
+m = gp_add_md 0
+ret gp_add_man m add get r_lo r 66 get r_pl r
+end
+
+fn rec_missing r ulong to void
+f_begin tf_rmissing
+e_rel r
+f_end
+end
+
+fn inv_rec r ulong msg view uchar * to void
+f_begin tf_invrec
+e_rel r
+e_t msg
+f_end
+end
+
+fn inv_key r ulong k ulong m1 view uchar * m2 view uchar * to void
+f_begin tf_invrec
+e_rel r
+e_t m1
+key_name k
+e_t m2
+f_end
+end
+
+fn key_name k ulong to void
+if eq k 0
+e_t tk_id
+end
+if eq k 1
+e_t tk_kind
+end
+if eq k 2
+e_t tk_split
+end
+if eq k 3
+e_t tk_family
+end
+if eq k 4
+e_t tk_validity
+end
+if eq k 5
+e_t tk_entry
+end
+if eq k 6
+e_t tk_params
+end
+if eq k 7
+e_t tk_ret
+end
+if eq k 8
+e_t tk_desc
+end
+end
+
+fn read_records to void
+nr = get gnr 0
+for r ulong nr bound 65536
+read_record r
+end
+end
+
+fn read_record r ulong to void
+m = gp_rec r
+fd = gp_open m 524288 0
+if lt fd 0
+rec_missing r
+end
+base = get grn 0
+x = enlarge graw add base 65538
+x2 = enlarge glow add base 65538
+tot = ulong 0
+going = true
+while going bound 65536
+got = read int fd graw add base tot sub 65537 tot
+if lt got 0
+if ne got -4
+rec_missing r
+end
+else
+if eq got 0
+going = false
+else
+tot = add tot ulong got
+if gt tot 65536
+going = false
+end
+end
+end
+end
+c = fclose int fd
+rec_keep r base tot
+end
+
+fn rec_keep r ulong base ulong tot ulong to void
+if gt tot 65536
+f_begin tf_invrec
+e_rel r
+e_t tm_over_rec
+f_end
+end
+put r_off r base
+put r_len r tot
+put grn 0 add base tot
+gs_begin
+gs_raw base tot
+gs_end
+lo = get r_lo r
+if not hex_eq_man lo
+f_begin tf_stale
+e_rel r
+e_t tm_has_sha
+e_hex
+e_t tm_manifest_says
+e_man lo 64
+f_end
+end
+parse_record r
+for j ulong tot bound 65536
+put glow add base j lower get graw add base j
+end
+end
+
+fn raw_is o ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for j ulong n bound 64
+if ne get graw add o j get t j
+ret false
+end
+end
+ret true
+end
+
+fn key_of p ulong kl ulong to ulong
+if raw_is p kl tk_id
+ret 0
+end
+if raw_is p kl tk_kind
+ret 1
+end
+if raw_is p kl tk_split
+ret 2
+end
+if raw_is p kl tk_family
+ret 3
+end
+if raw_is p kl tk_validity
+ret 4
+end
+if raw_is p kl tk_entry
+ret 5
+end
+if raw_is p kl tk_params
+ret 6
+end
+if raw_is p kl tk_ret
+ret 7
+end
+if raw_is p kl tk_desc
+ret 8
+end
+ret 99
+end
+
+note token pattern over graw[o..o+n): kind 0 c_name, 1 c_word, 2 lowercase letters
+fn raw_tok o ulong n ulong kind ulong max ulong to bool
+if or lt n 1 gt n max
+ret false
+end
+for j ulong n bound 65536
+c = get graw add o j
+ok = false
+if eq kind 0
+ok = c_name c
+end
+if eq kind 1
+ok = c_word c
+end
+if eq kind 2
+ok = and ge c 97 le c 122
+end
+if not ok
+ret false
+end
+end
+ret true
+end
+
+fn raw_next o ulong i ulong n ulong to ulong
+j = i
+while and lt j n ne get graw add o j 32 bound 65536
+j = add j 1
+end
+ret j
+end
+
+note space-separated tokens of kind gw 10, at most gw 11 bytes each, at least min of them
+fn raw_list o ulong n ulong kind ulong max ulong min ulong to bool
+if eq n 0
+ret eq min 0
+end
+put gw 10 kind
+put gw 11 max
+i = ulong 0
+cnt = ulong 0
+while le i n bound 65536
+j = raw_next o i n
+if not raw_tok_g add o i sub j i
+ret false
+end
+cnt = add cnt 1
+i = add j 1
+end
+ret ge cnt min
+end
+
+fn raw_tok_g o ulong n ulong to bool
+ret raw_tok o n get gw 10 get gw 11
+end
+
+fn raw_entry o ulong n ulong to bool
+if or lt n 1 gt n 64
+ret false
+end
+for j ulong n bound 64
+c = get graw add o j
+a = or and ge c 65 le c 90 and ge c 97 le c 122
+if eq c 95
+a = true
+end
+d = and gt j 0 and ge c 48 le c 57
+if not or a d
+ret false
+end
+end
+ret true
+end
+
+fn valid_value k ulong o ulong n ulong to bool
+if or eq k 0 eq k 2
+ret raw_tok o n 0 64
+end
+if eq k 1
+ret or raw_is o n tg_raw raw_is o n tg_abs
+end
+if eq k 3
+ret raw_list o n 0 64 1
+end
+if eq k 4
+ret raw_tok o n 2 16
+end
+if eq k 5
+ret raw_entry o n
+end
+if eq k 6
+ret raw_list o n 1 16 0
+end
+if eq k 7
+ret raw_tok o n 1 16
+end
+ret and ge n 1 le n 512
+end
+
+fn rec_magic_ok o ulong ln ulong to bool
+if lt ln 13
+ret false
+end
+for j ulong 13
+if ne get graw add o j get tg_magic j
+ret false
+end
+end
+ret true
+end
+
+fn rec_eol p ulong en ulong to ulong
+nl = p
+while and lt nl en ne get graw nl 10 bound 65536
+nl = add nl 1
+end
+ret nl
+end
+
+fn hdr_bytes_ok p ulong n ulong to bool
+for j ulong n bound 65536
+c = get graw add p j
+if or lt c 32 gt c 126
+ret false
+end
+end
+ret true
+end
+
+fn body_bytes_ok p ulong n ulong to bool
+for j ulong n bound 65536
+c = get graw add p j
+if ne c 10
+if or lt c 32 gt c 126
+ret false
+end
+end
+end
+ret true
+end
+
+fn parse_record r ulong to void
+o = get r_off r
+en = add o get r_len r
+if not rec_magic_ok o get r_len r
+inv_rec r tm_first_line
+end
+p = add o 13
+going = true
+while going bound 65536
+nl = rec_eol p en
+if ge nl en
+inv_rec r tm_no_body
+end
+n = sub nl p
+if not hdr_bytes_ok p n
+inv_rec r tm_hdr_byte
+end
+if raw_is p n tg_body
+going = false
+else
+hdr_line r p n
+end
+p = add nl 1
+end
+rec_body r p en
+end
+
+fn rec_body r ulong p ulong en ulong to void
+for k ulong 9
+if eq get r_fh add mul r 9 k 0
+inv_key r k tm_missing_key to_empty
+end
+end
+put r_bo r p
+bl = sub en p
+put r_bl r bl
+if lt bl 1
+inv_rec r tm_body_empty
+end
+if ne get graw sub en 1 10
+inv_rec r tm_body_empty
+end
+if not body_bytes_ok p bl
+inv_rec r tm_body_byte
+end
+end
+
+fn hdr_line r ulong p ulong n ulong to void
+kl = ulong 0
+while and lt kl n ne get graw add p kl 32 bound 65536
+kl = add kl 1
+end
+k = key_of p kl
+if eq k 99
+ret
+end
+slot = add mul r 9 k
+if ne get r_fh slot 0
+inv_key r k tm_key tm_repeated
+end
+vo = add p kl
+vn = ulong 0
+if lt kl n
+vo = add vo 1
+vn = sub sub n kl 1
+end
+if and eq kl n ne k 6
+inv_key r k tm_key tm_no_value
+end
+if not valid_value k vo vn
+inv_key r k tm_bad tm_value
+end
+put r_fh slot 1
+put r_fo slot vo
+put r_fl slot vn
+end
+
+note ---- validator run (CONTRACT.md 2) ----------------------------------------------------------------
+fn pk_put ps ulong v ulong to void
+put gpk ps uchar and v 255
+put gpk add ps 1 uchar and shr v 8 255
+end
+
+note appends gp[0..n) as one packet record at at; returns the new end
+fn pk_gp ps ulong n ulong to ulong
+pk_put ps n
+for j ulong n bound 8192
+put gpk add add ps 2 j get gp j
+end
+ret add add ps 2 n
+end
+
+fn pk_t ps ulong t view uchar * to ulong
+n = len t
+pk_put ps n
+for j ulong n bound 8192
+put gpk add add ps 2 j get t j
+end
+ret add add ps 2 n
+end
+
+note the packet head: /proc/self/fd/0 --receipts <mdir>receipts; returns its end
+fn pk_head to ulong
+a = pk_t 2 tg_proc0
+b = pk_t a tg_o_rcptx
+m = gp_add_md 0
+m = gp_add_t m tg_receipts
+ret pk_gp b m
+end
+
+fn run_recheck to void
+nr = get gnr 0
+b0 = ulong 0
+while lt b0 nr bound 65537
+ps = pk_head
+bn = ulong 0
+full = false
+while and and lt add b0 bn nr lt bn 128 not full bound 129
+m = gp_rec add b0 bn
+if gt add add ps 2 m 65536
+full = true
+else
+ps = pk_gp ps m
+bn = add bn 1
+end
+end
+if eq bn 0
+f_begin tf_rfailed
+e_t tm_argtoolong
+f_end
+end
+pk_put 0 add bn 3
+run_batch ps b0 bn
+b0 = add b0 bn
+end
+end
+
+fn rc_fail_msg m view uchar * to void
+f_begin tf_rfailed
+e_t m
+f_end
+end
+
+fn child_exec n ulong to void
+wfd = int or uint get gpf 4 shl uint get gpf 5 8
+bfd = int get gfd 0
+if ne bfd 0
+r = dupfd bfd 0 0
+if lt r 0
+exit 127
+end
+end
+if ne wfd 1
+r2 = dupfd wfd 1 0
+if lt r2 0
+exit 127
+end
+end
+r3 = execprog gpk 0 n
+exit 127
+end
+
+note runs one batch; output in gro[0..gstat 8)
+fn run_batch n ulong b0 ulong bn ulong to void
+p = pipefds gpf 0 8 524288
+if ne p 0
+rc_fail_msg tm_pipe
+end
+rfd = int or uint get gpf 0 shl uint get gpf 1 8
+wfd = int or uint get gpf 4 shl uint get gpf 5 8
+pid = fork
+if lt pid 0
+rc_fail_msg tm_fork
+end
+if eq pid 0
+child_exec n
+end
+c = fclose wfd
+read_child rfd
+c2 = fclose rfd
+wait_child int pid
+check_batch b0 bn
+end
+
+fn read_child fd int to void
+cap = ulong 65536
+r = enlarge gro cap
+tot = ulong 0
+going = true
+while going bound 4294967296
+got = read fd gro tot sub cap tot
+if lt got 0
+if ne got -4
+rc_fail_msg tm_read
+end
+else
+if eq got 0
+going = false
+else
+tot = add tot ulong got
+if eq tot cap
+cap = mul cap 2
+r2 = enlarge gro cap
+end
+end
+end
+end
+put gstat 8 tot
+end
+
+fn wait_child pid int to void
+going = true
+while going bound 4294967296
+r = waitpid pid gws 0 4 0
+if lt r 0
+if ne r -4
+rc_fail_msg tm_waitpid
+end
+else
+going = false
+end
+end
+st = or or uint get gws 0 shl uint get gws 1 8 or shl uint get gws 2 16 shl uint get gws 3 24
+put gstat 9 ulong st
+end
+
+fn rc_bin_fail m view uchar * to void
+f_begin tf_rfailed
+e_av get gopt 7
+e_t m
+f_end
+end
+
+fn batch_status to ulong
+st = get gstat 9
+code = and shr st 8 255
+exited = eq and st 127 0
+bad = not exited
+if and ne code 0 ne code 1
+bad = true
+end
+if bad
+f_begin tf_rfailed
+e_av get gopt 7
+e_t tm_not_clean
+e_u st
+e_t tm_rparen
+f_end
+end
+ret code
+end
+
+note output length up to its first NUL byte (the C reads it as a string)
+fn out_strlen to ulong
+n = get gstat 8
+e = ulong 0
+while and lt e n ne get gro e 0 bound 4294967296
+e = add e 1
+end
+ret e
+end
+
+fn ro_eol s ulong e ulong to ulong
+lend = s
+while and lt lend e ne get gro lend 10 bound 4294967296
+lend = add lend 1
+end
+ret lend
+end
+
+fn no_ok r ulong to void
+f_begin tf_rfailed
+e_av get gopt 7
+e_t tm_no_ok
+e_id r
+e_t tm_line_for
+e_rel r
+f_end
+end
+
+fn check_batch b0 ulong bn ulong to void
+code = batch_status
+e = out_strlen
+if eq code 1
+refused_line e
+end
+s = ulong 0
+for i ulong bn bound 129
+r = add b0 i
+lend = ro_eol s e
+if ge lend e
+no_ok r
+end
+if not ok_line s lend r
+no_ok r
+end
+s = add lend 1
+end
+if lt s e
+rc_bin_fail tm_extra
+end
+end
+
+note "OK <id of r>" is gro[s..lend)
+fn ok_prefix s ulong lend ulong to bool
+if lt sub lend s 3
+ret false
+end
+for j ulong 3
+if ne get gro add s j get tg_ok j
+ret false
+end
+end
+ret true
+end
+
+fn ro_eq_raw b ulong io ulong il ulong to bool
+for j ulong il bound 65536
+x = get gro add b j
+y = get graw add io j
+if ne x y
+ret false
+end
+end
+ret true
+end
+
+fn ok_line s ulong lend ulong r ulong to bool
+if not ok_prefix s lend
+ret false
+end
+k = mul r 9
+il = get r_fl k
+if ne sub sub lend s 3 il
+ret false
+end
+ret ro_eq_raw add s 3 get r_fo k il
+end
+
+note exit 1: the first "REFUSED " in gro[0..e) must start a line; fatal invalid_record with that line
+fn refused_line e ulong to void
+pos = ulong 0
+found = false
+while and lt add pos 8 add e 1 not found bound 4294967296
+hit = true
+for j ulong 8
+if ne get gro add pos j get tg_refused j
+hit = false
+end
+end
+if hit
+found = true
+else
+pos = add pos 1
+end
+end
+if not found
+rc_bin_fail tm_exit1
+end
+if gt pos 0
+if ne get gro sub pos 1 10
+rc_bin_fail tm_exit1
+end
+end
+lend = add pos 8
+while and lt lend e ne get gro lend 10 bound 4294967296
+lend = add lend 1
+end
+f_begin tf_invrec
+e_t tm_recheck_c
+e_ro add pos 8 sub lend add pos 8
+f_end
+end
+
+note the files recheck read must still be the bytes genret parsed
+fn recheck_again to void
+nr = get gnr 0
+for r ulong nr bound 65536
+m = gp_rec r
+fd = gp_open m 524288 0
+if lt fd 0
+rec_missing r
+end
+gs_begin
+tot = ulong 0
+going = true
+while going bound 65536
+want = ulong 65536
+left = sub 65537 tot
+if lt left want
+want = left
+end
+got = read int fd gio 0 want
+if lt got 0
+if ne got -4
+rec_missing r
+end
+else
+if eq got 0
+going = false
+else
+gs_io ulong got
+tot = add tot ulong got
+if gt tot 65536
+going = false
+end
+end
+end
+end
+c = fclose int fd
+gs_end
+if not hex_eq_man get r_lo r
+f_begin tf_stale
+e_rel r
+e_t tm_changed
+f_end
+end
+end
+end
+
+fn check_ids to void
+nr = get gnr 0
+r = enlarge gbyid nr
+r2 = enlarge gsa nr
+for j ulong nr bound 65536
+put gsa j j
+end
+put gcm 0 4
+msort nr
+for j ulong nr bound 65536
+t = get gsa j
+put gbyid j t
+end
+for j ulong nr bound 65536
+if gt j 0
+if eq cmp_id get gbyid sub j 1 get gbyid j 0
+f_begin tf_dupid
+e_id get gbyid j
+f_end
+end
+end
+end
+end
+
+note ---- eligibility and the index (CONTRACT.md 5) ----------------------------------------------------
+fn fld_is r ulong k ulong t view uchar * to bool
+s = add mul r 9 k
+ret raw_is get r_fo s get r_fl s t
+end
+
+fn kind_ok r ulong to bool
+if eq get gcfg 0 0
+ret fld_is r 1 tg_raw
+end
+ret fld_is r 1 tg_abs
+end
+
+fn av_eq_raw i ulong o ulong n ulong to bool
+if ne av_len i n
+ret false
+end
+ao = get gao i
+for j ulong n bound 65536
+if ne get gav add ao j get graw add o j
+ret false
+end
+end
+ret true
+end
+
+note first excluded family among the record's families: gex index, or 9999
+fn fam_excluded r ulong to ulong
+s0 = add mul r 9 3
+fo = get r_fo s0
+fl = get r_fl s0
+nx = get gexn 0
+s = ulong 0
+while le s fl bound 65536
+e = raw_next fo s fl
+x = fam_match add fo s sub e s
+if ne x 9999
+ret x
+end
+s = add e 1
+end
+ret 9999
+end
+
+fn fam_match o ulong n ulong to ulong
+nx = get gexn 0
+for x ulong nx bound 256
+ai = get gex x
+if av_eq_raw ai o n
+ret x
+end
+end
+ret 9999
+end
+
+fn has_fence o ulong n ulong to bool
+if lt n 3
+ret false
+end
+for i ulong sub n 2 bound 65536
+q = add o i
+c0 = get graw q
+if eq c0 96
+c1 = get graw add q 1
+c2 = get graw add q 2
+if and eq c1 96 eq c2 96
+ret true
+end
+end
+end
+ret false
+end
+
+fn eligibility r ulong to void
+rc = ulong 0
+if not kind_ok r
+rc = 1
+else
+if not fld_is r 2 tg_corpus
+rc = 2
+else
+if not fld_is r 4 tg_verified
+rc = 3
+end
+end
+end
+if and eq rc 0 ne get gexn 0 0
+x = fam_excluded r
+if ne x 9999
+rc = 4
+put r_rx r x
+end
+end
+if eq rc 0
+sd = add mul r 9 8
+if or has_fence get r_bo r get r_bl r has_fence get r_fo sd get r_fl sd
+rc = 5
+end
+end
+put r_rc r rc
+end
+
+fn tok_add o ulong n ulong to void
+c = get gtc 0
+if ge c len gto
+nc = mul add c 32 2
+r = enlarge gto nc
+r2 = enlarge gtl nc
+end
+put gto c o
+put gtl c n
+put gtc 0 add c 1
+end
+
+fn tok_low a ulong b ulong to void
+i = a
+while lt i b bound 4294967296
+while and lt i b not c_word get glow i bound 4294967296
+i = add i 1
+end
+j = i
+while and lt j b c_word get glow j bound 4294967296
+j = add j 1
+end
+if gt j i
+tok_add i sub j i
+end
+i = j
+end
+end
+
+fn tok_field r ulong k ulong to void
+s = add mul r 9 k
+o = get r_fo s
+tok_low o add o get r_fl s
+end
+
+fn index_record r ulong to void
+ts = get gtc 0
+put r_ts r ts
+tok_field r 5
+tok_field r 6
+tok_field r 7
+tok_field r 8
+bo = get r_bo r
+tok_low bo add bo get r_bl r
+tn = sub get gtc 0 ts
+put r_tn r tn
+r1 = enlarge gsa tn
+for j ulong tn bound 4294967296
+put gsa j add ts j
+end
+put gcm 0 1
+msort tn
+r2 = enlarge gtt1 tn
+r3 = enlarge gtt2 tn
+for j ulong tn bound 4294967296
+t = get gsa j
+put gtt1 j get gto t
+put gtt2 j get gtl t
+end
+for j ulong tn bound 4294967296
+t1 = get gtt1 j
+t2 = get gtt2 j
+put gto add ts j t1
+put gtl add ts j t2
+end
+put gstat 1 add get gstat 1 tn
+end
+
+fn build_index to void
+nr = get gnr 0
+for r ulong nr bound 65536
+eligibility r
+if eq get r_rc r 0
+put r_ix r 1
+put gstat 0 add get gstat 0 1
+index_record r
+end
+end
+end
+
+note ---- scoring (CONTRACT.md 6) ----------------------------------------------------------------------
+fn log2q16 a0 ulong b0 ulong to ulong
+a = a0
+b = b0
+k = ulong 0
+while ge a mul 2 b bound 128
+b = mul b 2
+k = add k 1
+end
+y = div shl a 30 b
+r = shl k 16
+i = ulong 16
+while gt i 0 bound 17
+i = sub i 1
+y = shr mul y y 30
+if ge y 2147483648
+y = shr y 1
+r = add r shl ulong 1 i
+end
+end
+ret r
+end
+
+note 128-bit words in gw: 0,1 accumulator (hi, lo); 2,3 scratch product; 4,5 numerator; 6,7 denominator
+note full product of two ulongs into gw 2 (hi) and 3 (lo)
+fn mul64 a ulong b ulong to void
+a0 = and a 4294967295
+a1 = shr a 32
+b0 = and b 4294967295
+b1 = shr b 32
+p00 = mul a0 b0
+p01 = mul a0 b1
+p10 = mul a1 b0
+hi = add mul a1 b1 add shr p01 32 shr p10 32
+mid = add shr p00 32 and p01 4294967295
+mid = add mid and p10 4294967295
+put gw 3 or and p00 4294967295 shl mid 32
+put gw 2 add hi shr mid 32
+end
+
+note gw[0..2) = gw[0..2) * v modulo 2^128
+fn acc_mul v ulong to void
+hi = get gw 0
+mul64 get gw 1 v
+put gw 0 add get gw 2 mul hi v
+put gw 1 get gw 3
+end
+
+note gw[0..2) = v1 * v2 (a fresh 128-bit value)
+fn acc_set v1 ulong v2 ulong to void
+mul64 v1 v2
+put gw 0 get gw 2
+put gw 1 get gw 3
+end
+
+fn acc_save ps ulong to void
+put gw ps get gw 0
+put gw add ps 1 get gw 1
+end
+
+note gw[at..at+2) += gw[0..2)
+fn acc_addto ps ulong to void
+lo = add get gw add ps 1 get gw 1
+c = ulong 0
+if lt lo get gw 1
+c = 1
+end
+put gw ps add add get gw ps get gw 0 c
+put gw add ps 1 lo
+end
+
+note low 64 bits of (gw 4,5) / (gw 6,7), restoring division over 128 bits
+fn div128 to ulong
+nh = get gw 4
+nl = get gw 5
+dh = get gw 6
+dl = get gw 7
+rh = ulong 0
+rl = ulong 0
+q = ulong 0
+i = ulong 128
+while gt i 0 bound 129
+i = sub i 1
+top = shr rh 63
+rh = or shl rh 1 shr rl 63
+bit = ulong 0
+if ge i 64
+bit = and shr nh sub i 64 1
+else
+bit = and shr nl i 1
+end
+rl = or shl rl 1 bit
+ge2 = ne top 0
+if not ge2
+if gt rh dh
+ge2 = true
+else
+if and eq rh dh ge rl dl
+ge2 = true
+end
+end
+end
+if ge2
+br = ulong 0
+if lt rl dl
+br = 1
+end
+rl = sub rl dl
+rh = sub sub rh dh br
+if lt i 64
+q = or q shl ulong 1 i
+end
+end
+end
+ret q
+end
+
+fn bm25 idf ulong tf ulong dl ulong to ulong
+nn = get gstat 0
+tt = get gstat 1
+acc_set idf tf
+acc_mul 44
+acc_mul tt
+acc_save 4
+acc_set 20 tt
+acc_mul tf
+acc_save 6
+acc_set 6 tt
+acc_addto 6
+acc_set 18 dl
+acc_mul nn
+acc_addto 6
+ret div128
+end
+
+fn tok_vs_q m ulong qo ulong ql ulong to int
+mo = get gto m
+ml = get gtl m
+ret cb_lq mo ml qo ql
+end
+
+fn count_tok r ulong q ulong to ulong
+qo = get gqo q
+ql = get gql q
+lo = get r_ts r
+hi = add lo get r_tn r
+while lt lo hi bound 128
+m = div add lo hi 2
+if lt tok_vs_q m qo ql 0
+lo = add m 1
+else
+hi = m
+end
+end
+c = ulong 0
+lim = add get r_ts r get r_tn r
+while lt lo lim bound 4294967296
+if ne tok_vs_q lo qo ql 0
+ret c
+end
+c = add c 1
+lo = add lo 1
+end
+ret c
+end
+
+fn term_df t ulong to ulong
+nr = get gnr 0
+df = ulong 0
+for i ulong nr bound 65536
+tf = ulong 0
+if ne get r_ix i 0
+tf = count_tok i t
+end
+put r_tf i tf
+if ne tf 0
+df = add df 1
+end
+end
+ret df
+end
+
+fn term_add idf ulong to void
+nr = get gnr 0
+for i ulong nr bound 65536
+tf = get r_tf i
+if ne tf 0
+dl = get r_tn i
+sc = bm25 idf tf dl
+old = get r_sc i
+put r_sc i add old sc
+end
+end
+end
+
+fn score_all to void
+nq = get gqn 0
+nn = get gstat 0
+for t ulong nq bound 8192
+df = term_df t
+if ne df 0
+idf = log2q16 add mul 2 nn 2 add mul 2 df 1
+term_add idf
+end
+end
+end
+
+note ---- ranking and selection -----------------------------------------------------------------------
+fn digits v ulong to ulong
+ret fmt_u v
+end
+
+fn block_len i ulong r ulong to ulong
+k = mul r 9
+n = add 41 digits i
+n = add n get r_fl add k 5
+pl = get r_fl add k 6
+if ne pl 0
+n = add n add pl 1
+end
+n = add n get r_fl add k 7
+n = add n get r_fl add k 8
+ret add n get r_bl r
+end
+
+fn sel_add r ulong pad ulong to void
+ns = get gstat 2
+put gsel ns r
+put gstat 2 add ns 1
+put r_sel r 1
+put r_pad r pad
+end
+
+note the bytes record r adds when it becomes selection ns + 1
+fn add_len r ulong to ulong
+ns = get gstat 2
+a = block_len add ns 1 r
+if eq ns 0
+a = add a len to_heading
+end
+ret a
+end
+
+fn rank_order to ulong
+nr = get gnr 0
+no = ulong 0
+r = enlarge gord nr
+r2 = enlarge gsel add nr 1
+r3 = enlarge gsa nr
+for i ulong nr bound 65536
+if ne get r_ix i 0
+put gsa no i
+no = add no 1
+end
+end
+put gcm 0 5
+if eq get gcfg 1 1
+put gcm 0 6
+end
+msort no
+for j ulong no bound 65536
+t = get gsa j
+put gord j t
+end
+ret no
+end
+
+note one ranked record in the normal pass; returns the (possibly new) stop reason
+fn select_one rr ulong stop ulong to ulong
+md = get gcfg 1
+if and ne md 1 eq get r_sc rr 0
+put r_rc rr 6
+ret stop
+end
+if ne stop 0
+put r_rc rr stop
+ret stop
+end
+if eq get gstat 2 ulong get gnum 0
+put r_rc rr 7
+ret 7
+end
+a = add_len rr
+tot = get gstat 3
+if gt add tot a ulong get gnum 1
+put r_rc rr 8
+ret 8
+end
+put gstat 3 add tot a
+sel_add rr 0
+ret 0
+end
+
+fn select_all to void
+no = rank_order
+md = get gcfg 1
+if eq md 2
+for j ulong no bound 65536
+t = get gord j
+put r_rc t 9
+end
+ret
+end
+stop = ulong 0
+for j ulong no bound 65536
+rr = get gord j
+stop = select_one rr stop
+end
+put gstat 4 get gstat 3
+if eq md 3
+pad_all no
+end
+end
+
+fn pad_all no ulong to void
+cap = ulong get gnum 1
+tgt = ulong get gnum 2
+if ge get gstat 3 tgt
+put gstat 6 3
+ret
+end
+put gstat 6 2
+j = ulong 0
+while and lt j no lt get gstat 3 tgt bound 65537
+rr = get gord j
+c = get r_rc rr
+if or eq c 7 eq c 8
+a = add_len rr
+if le add get gstat 3 a cap
+put gstat 3 add get gstat 3 a
+sel_add rr 1
+put r_rc rr 0
+put gstat 5 add get gstat 5 1
+end
+end
+j = add j 1
+end
+if ge get gstat 3 tgt
+put gstat 6 1
+end
+end
+
+note ---- output buffers --------------------------------------------------------------------------------
+fn ob_room n ulong to ulong
+ps = get gobn 0
+need = add ps n
+if gt need len gob
+c = mul add need 65536 2
+r = enlarge gob c
+end
+ret ps
+end
+
+fn ob_t s view uchar * to void
+n = len s
+ps = ob_room n
+for j ulong n bound 1048576
+put gob add ps j get s j
+end
+put gobn 0 add ps n
+end
+
+fn ob_raw o ulong n ulong to void
+ps = ob_room n
+for j ulong n bound 1048576
+put gob add ps j get graw add o j
+end
+put gobn 0 add ps n
+end
+
+fn ob_low o ulong n ulong to void
+ps = ob_room n
+for j ulong n bound 1048576
+put gob add ps j get glow add o j
+end
+put gobn 0 add ps n
+end
+
+fn ob_qb o ulong n ulong to void
+ps = ob_room n
+for j ulong n bound 8192
+put gob add ps j get gqb add o j
+end
+put gobn 0 add ps n
+end
+
+fn ob_man o ulong n ulong to void
+ps = ob_room n
+for j ulong n bound 1048576
+put gob add ps j get gman add o j
+end
+put gobn 0 add ps n
+end
+
+fn ob_av i ulong to void
+o = get gao i
+n = av_len i
+ps = ob_room n
+for j ulong n bound 1048576
+put gob add ps j get gav add o j
+end
+put gobn 0 add ps n
+end
+
+fn ob_dig o ulong to void
+ps = ob_room 64
+for j ulong 64
+put gob add ps j get gdig add o j
+end
+put gobn 0 add ps 64
+end
+
+fn ob_u v ulong to void
+n = fmt_u v
+ps = ob_room n
+for j ulong n bound 32
+put gob add ps j get gnb j
+end
+put gobn 0 add ps n
+end
+
+fn ob_l v long to void
+if lt v 0
+ob_t to_dash
+ob_u ulong neg v
+else
+ob_u ulong v
+end
+end
+
+fn ob_fld r ulong k ulong to void
+s = add mul r 9 k
+ob_raw get r_fo s get r_fl s
+end
+
+fn seg_begin s ulong to void
+put gseg s get gobn 0
+end
+
+fn seg_end s ulong to void
+put gseg add s 1 get gobn 0
+end
+
+fn seg_len s ulong to ulong
+ret sub get gseg add s 1 get gseg s
+end
+
+fn seg_hash s ulong ps ulong to void
+gs_begin
+gs_ob get gseg s seg_len s
+gs_end
+dig_save ps
+end
+
+fn render_block i ulong r ulong to void
+ob_t to_record
+ob_u i
+ob_t to_entry
+ob_fld r 5
+ob_t to_params
+if ne get r_fl add mul r 9 6 0
+ob_t to_sp
+ob_fld r 6
+end
+ob_t to_ret
+ob_fld r 7
+ob_t to_nn
+ob_fld r 8
+ob_t to_fopen
+ob_raw get r_bo r get r_bl r
+ob_t to_fclose
+end
+
+fn reason_text r ulong to void
+c = get r_rc r
+if eq c 1
+ob_t tr_kind
+ob_fld r 1
+end
+if eq c 2
+ob_t tr_split
+ob_fld r 2
+end
+if eq c 3
+ob_t tr_validity
+ob_fld r 4
+end
+if eq c 4
+ob_t tr_famex
+ob_av get gex get r_rx r
+end
+if eq c 5
+ob_t tr_fence
+end
+if eq c 6
+ob_t tr_nomatch
+end
+if eq c 7
+ob_t tr_beyond
+end
+if eq c 8
+ob_t tr_cap
+end
+if eq c 9
+ob_t tr_empty
+end
+end
+
+fn build_suffix to void
+ns = get gstat 2
+r = enlarge gselb add ns 1
+seg_begin 0
+if gt ns 0
+ob_t to_heading
+end
+for i ulong ns bound 65536
+before = get gobn 0
+render_block add i 1 get gsel i
+put gselb i sub get gobn 0 before
+end
+seg_end 0
+if ne seg_len 0 get gstat 3
+f_begin tf_internal
+e_t tm_suffix_len
+e_u seg_len 0
+e_t tm_accounted
+e_u get gstat 3
+f_end
+end
+end
+
+fn build_selected to void
+ns = get gstat 2
+seg_begin 2
+ob_t to_sel_hdr
+for i ulong ns bound 65536
+r = get gsel i
+ob_u add i 1
+ob_t to_tab
+ob_fld r 0
+ob_t to_tab
+ob_man get r_lo r 64
+ob_t to_tab
+ob_u get r_sc r
+ob_t to_tab
+ob_u get gselb i
+ob_t to_tab
+if ne get r_pad r 0
+ob_t to_pad
+else
+ob_t to_top
+end
+ob_t to_nl
+end
+seg_end 2
+end
+
+fn build_excluded to void
+nr = get gnr 0
+seg_begin 4
+ob_t to_exc_hdr
+for i ulong nr bound 65536
+r = get gbyid i
+if eq get r_sel r 0
+ob_fld r 0
+ob_t to_tab
+ob_man get r_lo r 64
+ob_t to_tab
+if ne get r_ix r 0
+ob_u get r_sc r
+else
+ob_t to_dash
+end
+ob_t to_tab
+reason_text r
+ob_t to_nl
+end
+end
+seg_end 4
+end
+
+fn build_query_txt to void
+seg_begin 6
+nq = get gqn 0
+for i ulong nq bound 8192
+ob_qb get gqo i get gql i
+ob_t to_nl
+end
+seg_end 6
+end
+
+fn ob_mode to void
+md = get gcfg 1
+if eq md 0
+ob_t tg_m_normal
+end
+if eq md 1
+ob_t tg_m_irr
+end
+if eq md 2
+ob_t tg_m_empty
+end
+if eq md 3
+ob_t tg_m_len
+end
+end
+
+fn build_receipt to void
+islen = eq get gcfg 1 3
+seg_begin 8
+ob_t to_r_contract
+ob_t tg_contract
+ob_t to_r_mode
+ob_mode
+ob_t to_r_kind
+ob_av get gopt 2
+ob_t to_r_k
+ob_l get gnum 0
+ob_t to_r_cap
+ob_l get gnum 1
+ob_t to_r_target
+if islen
+ob_l get gnum 2
+else
+ob_t to_dash
+end
+ob_t to_r_excl
+nx = get gexn 0
+if eq nx 0
+ob_t to_dash
+end
+for x ulong nx bound 256
+if gt x 0
+ob_t to_comma
+end
+ob_av get gex x
+end
+ob_t to_r_msha
+ob_dig 448
+ob_t to_r_rsha
+ob_dig 384
+ob_t to_r_rsrc
+ob_t gr_src_claim
+ob_t to_r_req
+ob_dig 0
+ob_t to_r_pr
+ob_dig 64
+ob_t to_r_q
+ob_dig 128
+build_receipt2 islen
+seg_end 8
+end
+
+fn build_receipt2 islen bool to void
+ob_t to_r_records
+ob_u get gnr 0
+ob_t to_r_indexed
+ob_u get gstat 0
+ob_t to_r_tokens
+ob_u get gstat 1
+ob_t to_r_selected
+ob_u get gstat 2
+ob_t to_r_pad
+if islen
+if ne get gstat 5 0
+ob_u get gstat 5
+else
+ob_t to_none
+end
+else
+ob_t to_dash
+end
+ob_t to_r_padr
+pr = get gstat 6
+if eq pr 0
+ob_t to_dash
+end
+if eq pr 1
+ob_t to_pr_reached
+end
+if eq pr 2
+ob_t to_pr_exhausted
+end
+if eq pr 3
+ob_t to_pr_cns
+end
+ob_t to_r_unp
+if islen
+ob_u get gstat 4
+else
+ob_t to_dash
+end
+ob_t to_r_sfx
+ob_u seg_len 0
+ob_t to_r_gap
+if islen
+ob_l sub long seg_len 0 get gnum 2
+else
+ob_t to_dash
+end
+ob_t to_r_xsha
+ob_dig 192
+ob_t to_r_ssha
+ob_dig 256
+ob_t to_r_esha
+ob_dig 320
+ob_t to_nl
+end
+
+fn sums_line s ulong ps ulong name view uchar * to void
+seg_hash s ps
+ob_dig ps
+ob_t to_twosp
+ob_t name
+ob_t to_nl
+end
+
+fn build_outputs to void
+build_suffix
+build_selected
+build_excluded
+build_query_txt
+gs_begin
+gs_tk 0 get gtn 0
+gs_end
+dig_save 0
+gs_begin
+gs_tk 4100 get gtn 1
+gs_end
+dig_save 64
+seg_hash 6 128
+seg_hash 0 192
+seg_hash 2 256
+seg_hash 4 320
+build_receipt
+seg_begin 10
+sums_line 2 0 to_f_sel
+sums_line 4 0 to_f_exc
+sums_line 0 0 to_f_sfx
+sums_line 6 0 to_f_q
+sums_line 8 0 to_f_rcpt
+seg_end 10
+end
+
+note ---- writing --out atomically (CONTRACT.md 1) -------------------------------------------------------
+fn fname_seg i ulong to ulong
+if eq i 0
+ret 2
+end
+if eq i 1
+ret 4
+end
+if eq i 2
+ret 0
+end
+if eq i 3
+ret 6
+end
+if eq i 4
+ret 8
+end
+ret 10
+end
+
+note dir "/" file name i into gp; its length
+fn gp_file dl ulong i ulong to ulong
+for j ulong dl bound 8192
+put gp j get gtp j
+end
+m = gp_add_t dl tg_slash
+if eq i 0
+ret gp_add_t m to_f_sel
+end
+if eq i 1
+ret gp_add_t m to_f_exc
+end
+if eq i 2
+ret gp_add_t m to_f_sfx
+end
+if eq i 3
+ret gp_add_t m to_f_q
+end
+if eq i 4
+ret gp_add_t m to_f_rcpt
+end
+ret gp_add_t m to_f_sums
+end
+
+note removes the six files and the directory gtp[0..gtpn)
+fn tmp_clean to void
+n = get gtpn 0
+for i ulong 6
+m = gp_file n i
+if le m 4095
+u = unlink gp 0 m
+end
+end
+if le n 4095
+for j ulong n bound 8192
+put gp j get gtp j
+end
+d = rmdir gp 0 n
+end
+end
+
+fn fsync_gp n ulong to bool
+fd = gp_open n 540672 0
+if lt fd 0
+ret false
+end
+ok = eq fsync int fd 0
+c = fclose int fd
+if ne c 0
+ok = false
+end
+ret ok
+end
+
+fn write_file i ulong to bool
+m = gp_file get gtpn 0 i
+fd = gp_open m 524481 420
+if lt fd 0
+ret false
+end
+s = fname_seg i
+p = get gseg s
+q = get gseg add s 1
+going = true
+while and going lt p q bound 4294967296
+w = write int fd gob p sub q p
+if lt w 0
+if ne w -4
+going = false
+end
+else
+if eq w 0
+going = false
+else
+p = add p ulong w
+end
+end
+end
+ok = eq p q
+if ok
+ok = eq fsync int fd 0
+end
+c = fclose int fd
+if ne c 0
+ok = false
+end
+ret ok
+end
+
+fn wf_fail2 m1 view uchar * to void
+tmp_clean
+f_begin tf_wfailed
+e_t m1
+e_tp
+f_end
+end
+
+note the stripped --out argument: gtp = out[0..dl); returns dl
+fn out_strip to ulong
+oi = get gopt 5
+o = get gao oi
+dl = av_len oi
+while and gt dl 1 eq get gav sub add o dl 1 47 bound 1048576
+dl = sub dl 1
+end
+ret dl
+end
+
+fn write_out to void
+oi = get gopt 5
+o = get gao oi
+dl = out_strip
+if ge add dl 32 4096
+f_begin tf_wfailed
+e_t tm_out_long
+f_end
+end
+for j ulong dl bound 4096
+put gtp j get gav add o j
+end
+n = dl
+for j ulong len tg_tmpdot
+put gtp add n j get tg_tmpdot j
+end
+n = add n len tg_tmpdot
+k = fmt_u ulong getpid
+for j ulong k bound 32
+put gtp add n j get gnb j
+end
+n = add n k
+put gtpn 0 n
+for j ulong n bound 8192
+put gp j get gtp j
+end
+d = makedir gp 0 n 493
+if ne d 0
+f_begin tf_wfailed
+e_t tm_cannot_create
+e_tp
+f_end
+end
+for i ulong 6
+if not write_file i
+tmp_clean
+f_begin tf_wfailed
+e_t tm_cannot_write
+e_tp
+e_t tg_slash
+file_name i
+f_end
+end
+end
+for j ulong n bound 8192
+put gp j get gtp j
+end
+if not fsync_gp n
+wf_fail2 tm_cannot_fsync
+end
+rename_out
+fsync_parent dl
+end
+
+fn file_name i ulong to void
+if eq i 0
+e_t to_f_sel
+end
+if eq i 1
+e_t to_f_exc
+end
+if eq i 2
+e_t to_f_sfx
+end
+if eq i 3
+e_t to_f_q
+end
+if eq i 4
+e_t to_f_rcpt
+end
+if eq i 5
+e_t to_f_sums
+end
+end
+
+note renameat2(tmp, out, RENAME_NOREPLACE); the packed list holds both paths (at most 4096 bytes)
+fn rename_out to void
+oi = get gopt 5
+o = get gao oi
+on = av_len oi
+tn = get gtpn 0
+r = long -36
+if le add add 6 tn on 4096
+put gp2 0 2
+put gp2 1 0
+put gp2 2 uchar and tn 255
+put gp2 3 uchar shr tn 8
+for j ulong tn bound 4096
+put gp2 add 4 j get gtp j
+end
+b = add 4 tn
+put gp2 b uchar and on 255
+put gp2 add b 1 uchar shr on 8
+for j ulong on bound 4096
+put gp2 add add b 2 j get gav add o j
+end
+r = renames gp2 0 add add b 2 on 1
+end
+if ne r 0
+tmp_clean
+if eq r -17
+f_begin tf_oexists
+e_av oi
+e_t tm_exists
+f_end
+end
+f_begin tf_wfailed
+e_t tm_cannot_rename
+e_tp
+e_t tm_to
+e_av oi
+f_end
+end
+end
+
+note make the rename durable: fsync the parent of out[0..dl); on failure remove --out again
+fn fsync_parent dl ulong to void
+oi = get gopt 5
+o = get gao oi
+cut = ulong 9999
+for j ulong dl bound 4096
+if eq get gav add o j 47
+cut = j
+end
+end
+n = ulong 0
+if eq cut 9999
+n = gp_add_t 0 tg_dot
+else
+if eq cut 0
+n = gp_add_t 0 tg_slash
+else
+for j ulong cut bound 4096
+put gp j get gav add o j
+end
+n = cut
+end
+end
+for j ulong n bound 4096
+put gp2 j get gp j
+end
+if not fsync_gp n
+for j ulong dl bound 4096
+put gtp j get gav add o j
+end
+put gtpn 0 dl
+tmp_clean
+f_begin tf_wfailed
+e_t tm_cannot_fsync
+for j ulong n bound 4096
+put gp j get gp2 j
+end
+w = write 2 gp 0 n
+f_end
+end
+end
+
+note ---- main --------------------------------------------------------------------------------------------
+fn out_exists_check to void
+oi = get gopt 5
+n = gp_av oi
+if le n 4095
+k = lstat gp 0 n gst 0 128
+if eq k 0
+f_begin tf_oexists
+e_av oi
+e_t tm_exists
+f_end
+end
+end
+end
+
+fn bind_check to void
+n = len gr_bin_pin
+if and ne n 0 ne n 64
+f_begin tf_internal
+e_t tm_bind
+f_end
+end
+end
+
+fn main to int
+bind_check
+ld_args
+ac = get gac 0
+if eq ac 2
+if av_is 1 tg_version
+w = write 1 tg_ver_nl 0 len tg_ver_nl
+ret 0
+end
+end
+if lt ac 2
+usage tu_first
+end
+if not av_is 1 tg_query
+usage tu_first
+end
+parse_opts
+check_opts
+out_exists_check
+open_recheck
+read_tasks
+read_manifest
+parse_manifest
+read_records
+run_recheck
+recheck_again
+check_ids
+build_index
+score_all
+select_all
+build_outputs
+write_out
+ret 0
+end
