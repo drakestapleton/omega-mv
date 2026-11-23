@@ -1,0 +1,1434 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of the OmegaProgram model the Visor realization lane uses:
+note src/omega_program.c (init, v2 program id, realize_check, emit_schedule, realize_ex,
+note build_unary_op, compose, eval), src/omega_realize.c (OMG_R0 realization id),
+note src/omega_realize_synth.c (OMG0 triple id) and src/omega_verify.c (v0 structural on a
+note realization, graph NULL). Ids are built with the visor.om graph builders, which are the
+note pure OM-2 omega_build_* of omega_core.c, so they equal the C canonical ids.
+note Depends on visor.om, om/aarch64/aarch64_om2.om, om/visor/verify_om2.om.
+note Program slots 0..15 (VPG_TMP 15 is the realizer's scratch copy). Realization object slots
+note 0..47: slot p (p < 16) is program p's realization; the realization lab owns 16..47.
+note Not ported (no OM producer exists): FP32 bodies (lower_body_fp32) and SIGNED/BITVECTOR
+note contracts lower as in C only for UINT; an FP32 body gives no id (C gives one). Lowering uses
+note the session graph and drops what it added, so it fails when the graph is full (C uses a
+note fresh graph).
+
+const VPG_N ulong 16
+const VPG_TMP ulong 15
+const VPG_SS ulong 16
+const VPG_HASB ulong 0
+const VPG_SCNT ulong 1
+const VPG_ITAG ulong 2
+const VPG_IW ulong 3
+const VPG_OTAG ulong 4
+const VPG_OW ulong 5
+const VPG_NLEAF ulong 6
+const VPG_REAL ulong 7
+const VPG_VER ulong 8
+const VPG_NLEN ulong 9
+const VPG_PRLEN ulong 10
+const VPG_POLEN ulong 11
+const VRO_N ulong 48
+const VRO_SS ulong 8
+const VRO_CLEN ulong 0
+const VRO_PROF ulong 1
+const VRO_EOFF ulong 2
+const VRO_HASID ulong 3
+const VRO_HASM ulong 4
+const VRO_K_RID ulong 0
+const VRO_K_SEM ulong 1
+const VRO_K_MACH ulong 2
+const VRO_TMP ulong 47
+const VRO_TMP2 ulong 46
+const VRO_TMP3 ulong 45
+
+note ---- string builder (snprintf into a scratch, then a field copy truncates) ----
+global vsb_b uchar 4096
+global vsb_n ulong 1
+text vsb_hx "0123456789abcdef"
+
+fn vsb_reset to void
+  put vsb_n 0 0
+end
+
+fn vsb_c c ulong to void
+  n = get vsb_n 0
+  if lt n 4095
+    put vsb_b n uchar and c 255
+    put vsb_n 0 add n 1
+  end
+end
+
+fn vsb_t s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    vsb_c ulong get s i
+  end
+end
+
+note %.<m>s of a text
+fn vsb_tn s view uchar * m ulong to void
+  n = len s
+  if gt n m
+    n = m
+  end
+  for i ulong n bound 4096
+    vsb_c ulong get s i
+  end
+end
+
+fn vsb_u v ulong to void
+  d = new uchar 24 0
+  x = v
+  k = ulong 0
+  while gt x 9 bound 24
+    put d k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  put d k uchar add 48 x
+  k = add k 1
+  while gt k 0 bound 24
+    k = sub k 1
+    vsb_c ulong get d k
+  end
+end
+
+note %d of a signed value
+fn vsb_i v long to void
+  if lt v 0
+    vsb_c 45
+    vsb_u ulong neg v
+  else
+    vsb_u ulong v
+  end
+end
+
+note %0<w>x (w >= 1)
+fn vsb_x v ulong w ulong to void
+  d = new uchar 24 0
+  x = v
+  k = ulong 0
+  while gt x 15 bound 24
+    put d k get vsb_hx and x 15
+    x = shr x 4
+    k = add k 1
+  end
+  put d k get vsb_hx x
+  k = add k 1
+  while lt k w bound 24
+    put d k uchar 48
+    k = add k 1
+  end
+  while gt k 0 bound 24
+    k = sub k 1
+    vsb_c ulong get d k
+  end
+end
+
+fn vsb_trunc m ulong to void
+  if gt get vsb_n 0 m
+    put vsb_n 0 m
+  end
+end
+
+text vpg_t_sha "sha256:"
+
+note "sha256:" + hex of the 32 bytes at v_sha_out
+fn vsb_sha_out to void
+  vsb_t vpg_t_sha
+  for i ulong 32
+    vsb_x ulong get v_sha_out i 2
+  end
+end
+
+
+fn vpg_sha n ulong to void
+  if eq get v_sha_k 0 0
+    sha_kinit
+  end
+  sha256_hash n
+end
+
+note ---- realization objects (RealizationObject) ----
+global vro_s ulong 384
+global vro_id uchar 4608
+global vro_code uchar 196608
+
+fn vro_g r ulong k ulong to ulong
+  ret get vro_s add mul r VRO_SS k
+end
+
+fn vro_p r ulong k ulong v ulong to void
+  put vro_s add mul r VRO_SS k v
+end
+
+fn vro_ib r ulong k ulong to ulong
+  ret mul add mul r 3 k 32
+end
+
+fn vro_zero r ulong to void
+  for k ulong VRO_SS
+    vro_p r k 0
+  end
+  b = mul r 96
+  for i ulong 96
+    put vro_id add b i uchar 0
+  end
+  cb = mul r 4096
+  for i ulong 4096
+    put vro_code add cb i uchar 0
+  end
+end
+
+fn vro_copy d ulong s ulong to void
+  for k ulong VRO_SS
+    vro_p d k vro_g s k
+  end
+  db = mul d 96
+  sb = mul s 96
+  for i ulong 96
+    put vro_id add db i get vro_id add sb i
+  end
+  dc = mul d 4096
+  sc = mul s 4096
+  for i ulong 4096
+    put vro_code add dc i get vro_code add sc i
+  end
+end
+
+fn vro_word r ulong off ulong to ulong
+  b = add mul r 4096 off
+  x = ulong get vro_code add b 3
+  x = or shl x 8 ulong get vro_code add b 2
+  x = or shl x 8 ulong get vro_code add b 1
+  ret or shl x 8 ulong get vro_code b
+end
+
+note aarch64 a64put of an encoder word at the end of the code: 0, or -1 (refusal or no room)
+fn vro_put32 r ulong w long to long
+  if lt w 0
+    ret -1
+  end
+  p = vro_g r VRO_CLEN
+  if gt add p 4 4096
+    ret -1
+  end
+  x = ulong w
+  b = add mul r 4096 p
+  put vro_code b uchar and x 255
+  put vro_code add b 1 uchar and shr x 8 255
+  put vro_code add b 2 uchar and shr x 16 255
+  put vro_code add b 3 uchar and shr x 24 255
+  vro_p r VRO_CLEN add p 4
+  ret 0
+end
+
+fn vro_id_zero r ulong k ulong to bool
+  b = vro_ib r k
+  for i ulong 32
+    if ne get vro_id add b i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+note v_sha_out == id k of r
+fn vro_id_is_sha r ulong k ulong to bool
+  b = vro_ib r k
+  for i ulong 32
+    if ne get vro_id add b i get v_sha_out i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vro_id_from_sha r ulong k ulong to void
+  b = vro_ib r k
+  for i ulong 32
+    put vro_id add b i get v_sha_out i
+  end
+end
+
+fn vro_be32 pos ulong v ulong to ulong
+  put v_sha_in pos uchar and shr v 24 255
+  put v_sha_in add pos 1 uchar and shr v 16 255
+  put v_sha_in add pos 2 uchar and shr v 8 255
+  put v_sha_in add pos 3 uchar and v 255
+  ret add pos 4
+end
+
+note omega_compute_realization_id into v_sha_out: "OMG_R0" prof semid u32be(len) code; -1 when len > 4096
+fn vro_calc_rid r ulong to long
+  n = vro_g r VRO_CLEN
+  if gt n 4096
+    ret -1
+  end
+  put v_sha_in 0 uchar 0x4f
+  put v_sha_in 1 uchar 0x4d
+  put v_sha_in 2 uchar 0x47
+  put v_sha_in 3 uchar 0x5f
+  put v_sha_in 4 uchar 0x52
+  put v_sha_in 5 uchar 0x30
+  put v_sha_in 6 uchar and vro_g r VRO_PROF 255
+  sb = vro_ib r VRO_K_SEM
+  for i ulong 32
+    put v_sha_in add 7 i get vro_id add sb i
+  end
+  pos = vro_be32 39 n
+  cb = mul r 4096
+  for i ulong n bound 4096
+    put v_sha_in add pos i get vro_code add cb i
+  end
+  vpg_sha add pos n
+  ret 0
+end
+
+fn vro_compute_rid r ulong to long
+  if lt vro_calc_rid r 0
+    ret -1
+  end
+  vro_id_from_sha r VRO_K_RID
+  vro_p r VRO_HASID 1
+  ret 0
+end
+
+note omega_realize_compute_triple_id(semid of r, machid of r, r) into v_sha_out
+fn vro_calc_triple r ulong to long
+  n = vro_g r VRO_CLEN
+  if gt n 4096
+    ret -1
+  end
+  put v_sha_in 0 uchar 0x4f
+  put v_sha_in 1 uchar 0x4d
+  put v_sha_in 2 uchar 0x47
+  put v_sha_in 3 uchar 0x30
+  put v_sha_in 4 uchar V_KIND_REALIZATION
+  put v_sha_in 5 uchar and vro_g r VRO_PROF 255
+  pa = vro_be32 6 vro_g r VRO_EOFF
+  pb = vro_be32 pa n
+  sb = vro_ib r VRO_K_SEM
+  mb = vro_ib r VRO_K_MACH
+  for i ulong 32
+    put v_sha_in add pb i get vro_id add sb i
+    put v_sha_in add add pb 32 i get vro_id add mb i
+  end
+  pos = add pb 64
+  cb = mul r 4096
+  for i ulong n bound 4096
+    put v_sha_in add pos i get vro_code add cb i
+  end
+  vpg_sha add pos n
+  ret 0
+end
+
+note ---- why text (VPG_WHY 512 bytes) ----
+global vpg_why uchar 512
+global vpg_wl ulong 1
+
+note snprintf(why, cap, "%s", vsb)
+fn vpg_set_why cap ulong to void
+  if eq cap 0
+    ret
+  end
+  n = get vsb_n 0
+  if gt n sub cap 1
+    n = sub cap 1
+  end
+  if gt n 511
+    n = 511
+  end
+  for i ulong n bound 512
+    put vpg_why i get vsb_b i
+  end
+  put vpg_wl 0 n
+end
+
+fn vpg_why_txt s view uchar * cap ulong to void
+  vsb_reset
+  vsb_t s
+  vpg_set_why cap
+end
+
+note vsb += vpg_why (at most m bytes)
+fn vsb_why m ulong to void
+  n = get vpg_wl 0
+  if gt n m
+    n = m
+  end
+  for i ulong n bound 512
+    vsb_c ulong get vpg_why i
+  end
+end
+
+note ---- v0 structural verification of a realization (graph NULL) ----
+text vpg_v0_prof "V0 Realization Profile Failed: Unknown profile 0x"
+text vpg_v0_len1 "V0 Realization Code Bounds Failed: Invalid length "
+text vpg_v0_len2 " bytes"
+text vpg_v0_ins "V0 Instruction Stream Failed: "
+text vpg_v0_noid "V0 Realization ID Failed: Object missing REALIZATION_ID"
+text vpg_v0_mis "V0 Realization ID Failed: REALIZATION_ID cryptographic mismatch"
+
+global vpg_vmsg uchar 256
+global vpg_vml ulong 1
+
+note aarch64_validate_code_buffer over r's code; 0, or -1 with the message in vpg_vmsg
+fn vro_validate r ulong to long
+  n = vro_g r VRO_CLEN
+  cb = new uchar 4096 0
+  base = mul r 4096
+  for i ulong n bound 4096
+    put cb i get vro_code add base i
+  end
+  msg = new uchar 256 0
+  rc = a64validate cb n msg 256
+  put vpg_vml 0 0
+  if eq rc 0
+    ret 0
+  end
+  for i ulong 255
+    c = get msg i
+    if eq c 0
+      ret -1
+    end
+    put vpg_vmsg i c
+    put vpg_vml 0 add i 1
+  end
+  ret -1
+end
+
+fn vsb_vmsg m ulong to void
+  n = get vpg_vml 0
+  if gt n m
+    n = m
+  end
+  for i ulong n bound 256
+    vsb_c ulong get vpg_vmsg i
+  end
+end
+
+note omega_verify_v0_structural(NULL, r): 0, or -1 with error_detail[512] in vpg_why
+fn vro_v0 r ulong to long
+  code = om_ver_v0_real vro_g r VRO_PROF vro_g r VRO_CLEN 4096 vro_g r VRO_HASID
+  if eq code 1
+    vsb_reset
+    vsb_t vpg_v0_prof
+    vsb_x vro_g r VRO_PROF 2
+    vpg_set_why 512
+    ret -1
+  end
+  if eq code 2
+    vsb_reset
+    vsb_t vpg_v0_len1
+    vsb_u vro_g r VRO_CLEN
+    vsb_t vpg_v0_len2
+    vpg_set_why 512
+    ret -1
+  end
+  if ne vro_validate r 0
+    vsb_reset
+    vsb_t vpg_v0_ins
+    vsb_vmsg 200
+    vpg_set_why 512
+    ret -1
+  end
+  if eq code 3
+    vpg_why_txt vpg_v0_noid 512
+    ret -1
+  end
+  ok = false
+  if eq vro_g r VRO_HASM 1
+    if eq vro_calc_triple r 0
+      ok = vro_id_is_sha r VRO_K_RID
+    end
+  else
+    if eq vro_calc_rid r 0
+      ok = vro_id_is_sha r VRO_K_RID
+    end
+  end
+  if not ok
+    vpg_why_txt vpg_v0_mis 512
+    ret -1
+  end
+  ret 0
+end
+
+note ---- programs (OmegaProgram) ----
+global vpg_s ulong 256
+global vpg_op ulong 1024
+global vpg_imm ulong 1024
+global vpg_ids uchar 1536
+global vpg_leaf uchar 32768
+global vpg_txt uchar 3072
+global vpg_t32 uchar 256
+global vpg_w ulong 1
+global vpg_ev ulong 1
+global vpg_lt uchar 4096
+
+text vpg_dom "omega.program.v2"
+text vpg_k_compose "omega.compose"
+text vpg_k_seq "seq"
+
+fn vpg_g p ulong k ulong to ulong
+  ret get vpg_s add mul p VPG_SS k
+end
+
+fn vpg_p p ulong k ulong v ulong to void
+  put vpg_s add mul p VPG_SS k v
+end
+
+note id k of program p: 0 program_id, 1 precondition_id, 2 postcondition_id
+fn vpg_ib p ulong k ulong to ulong
+  ret mul add mul p 3 k 32
+end
+
+note text k of program p: 0 name, 1 precondition, 2 postcondition (64 bytes each)
+fn vpg_tb p ulong k ulong to ulong
+  ret mul add mul p 3 k 64
+end
+
+fn vpg_tlen p ulong k ulong to ulong
+  ret vpg_g p add VPG_NLEN k
+end
+
+note text k of p = vsb truncated to m bytes
+fn vpg_set_txt p ulong k ulong m ulong to void
+  n = get vsb_n 0
+  if gt n m
+    n = m
+  end
+  b = vpg_tb p k
+  for i ulong n bound 64
+    put vpg_txt add b i get vsb_b i
+  end
+  vpg_p p add VPG_NLEN k n
+end
+
+note vsb += text k of p, at most m bytes
+fn vsb_ptxt p ulong k ulong m ulong to void
+  n = vpg_tlen p k
+  if gt n m
+    n = m
+  end
+  b = vpg_tb p k
+  for i ulong n bound 64
+    vsb_c ulong get vpg_txt add b i
+  end
+end
+
+fn vpg_step_op p ulong i ulong to ulong
+  ret get vpg_op add mul p 64 i
+end
+
+fn vpg_step_imm p ulong i ulong to ulong
+  ret get vpg_imm add mul p 64 i
+end
+
+fn vpg_id_from_sha p ulong k ulong to void
+  b = vpg_ib p k
+  for i ulong 32
+    put vpg_ids add b i get v_sha_out i
+  end
+end
+
+note omega_program_init(p, name) with the name in vsb ("%.60s")
+fn vpg_init_vsb p ulong to void
+  for k ulong VPG_SS
+    vpg_p p k 0
+  end
+  sb = mul p 64
+  for i ulong 64
+    put vpg_op add sb i 0
+    put vpg_imm add sb i 0
+  end
+  ib = mul p 96
+  for i ulong 96
+    put vpg_ids add ib i uchar 0
+  end
+  lb = mul p 2048
+  for i ulong 2048
+    put vpg_leaf add lb i uchar 0
+  end
+  vpg_set_txt p 0 60
+  vro_zero p
+end
+
+fn vpg_init p ulong name view uchar * to void
+  vsb_reset
+  vsb_t name
+  vpg_init_vsb p
+end
+
+fn vpg_copy d ulong s ulong to void
+  for k ulong VPG_SS
+    vpg_p d k vpg_g s k
+  end
+  db = mul d 64
+  sb = mul s 64
+  for i ulong 64
+    put vpg_op add db i get vpg_op add sb i
+    put vpg_imm add db i get vpg_imm add sb i
+  end
+  for i ulong 96
+    put vpg_ids add mul d 96 i get vpg_ids add mul s 96 i
+  end
+  for i ulong 2048
+    put vpg_leaf add mul d 2048 i get vpg_leaf add mul s 2048 i
+  end
+  for i ulong 192
+    put vpg_txt add mul d 192 i get vpg_txt add mul s 192 i
+  end
+  vro_copy d s
+end
+
+fn vpg_step_valid op ulong to bool
+  if eq op V_OP_ADD
+    ret true
+  end
+  if eq op V_OP_SUB
+    ret true
+  end
+  if eq op V_OP_MUL
+    ret true
+  end
+  if eq op V_OP_AND
+    ret true
+  end
+  ret eq op V_OP_OR
+end
+
+fn vpg_wmask w ulong to ulong
+  if ge w 64
+    ret 18446744073709551615
+  end
+  ret sub shl 1 w 1
+end
+
+note build_type_for: the type object, or -1
+fn vpg_type_obj tag ulong w ulong to long
+  if eq tag V_TY_UINT
+    ret og_build_type_uint w
+  end
+  if eq tag V_TY_SINT
+    ret og_build_type_sint w
+  end
+  if eq tag V_TY_BITVEC
+    ret og_build_type_bitvec w
+  end
+  if eq tag V_TY_FP32
+    if eq w 32
+      ret og_build_type_fp32
+    end
+  end
+  ret -1
+end
+
+fn vpg_is_fp32 p ulong to bool
+  if eq vpg_g p VPG_ITAG V_TY_FP32
+    ret true
+  end
+  if eq vpg_g p VPG_OTAG V_TY_FP32
+    ret true
+  end
+  n = vpg_g p VPG_SCNT
+  if gt n 64
+    n = 64
+  end
+  for i ulong n bound 64
+    if eq vpg_step_op p i V_OP_CONVERT
+      ret true
+    end
+  end
+  ret false
+end
+
+note lower_body (integer tier): the root object, or -1
+fn vpg_lower p ulong to long
+  if eq vpg_g p VPG_HASB 0
+    ret -1
+  end
+  n = vpg_g p VPG_SCNT
+  if gt n 64
+    ret -1
+  end
+  if vpg_is_fp32 p
+    ret -1
+  end
+  w = vpg_g p VPG_IW
+  t = vpg_type_obj vpg_g p VPG_ITAG w
+  if lt t 0
+    ret -1
+  end
+  cur = og_build_param ulong t 0
+  if lt cur 0
+    ret -1
+  end
+  for i ulong n bound 64
+    op = vpg_step_op p i
+    if not vpg_step_valid op
+      ret -1
+    end
+    c = og_build_val_uint ulong t w vpg_step_imm p i
+    if lt c 0
+      ret -1
+    end
+    o = og_build_op_binary op V_OVF_WRAP ulong t
+    if lt o 0
+      ret -1
+    end
+    cur = og_build_apply ulong o ulong cur ulong c
+    if lt cur 0
+      ret -1
+    end
+  end
+  ret cur
+end
+
+fn vpg_t32_from_obj slot ulong idx ulong to void
+  ob = mul idx 32
+  sb = mul slot 32
+  for i ulong 32
+    put vpg_t32 add sb i get v_og_id add ob i
+  end
+end
+
+note root (t32 slot 0), input type (1), output type (2) ids; graph left as it was. 0 or -1
+fn vpg_ids_for p ulong to long
+  c0 = get v_og_cnt 0
+  rc = long 0
+  r = vpg_lower p
+  if lt r 0
+    rc = -1
+  else
+    vpg_t32_from_obj 0 ulong r
+    ti = vpg_type_obj vpg_g p VPG_ITAG vpg_g p VPG_IW
+    if lt ti 0
+      rc = -1
+    else
+      vpg_t32_from_obj 1 ulong ti
+      tout = vpg_type_obj vpg_g p VPG_OTAG vpg_g p VPG_OW
+      if lt tout 0
+        rc = -1
+      else
+        vpg_t32_from_obj 2 ulong tout
+      end
+    end
+  end
+  put v_og_cnt 0 c0
+  ret rc
+end
+
+note the v2 id of p's body and contract into v_sha_out; 0 or -1
+fn vpg_hash_id p ulong to long
+  if lt vpg_ids_for p 0
+    ret -1
+  end
+  dl = len vpg_dom
+  for i ulong dl bound 32
+    put v_sha_in i get vpg_dom i
+  end
+  put v_sha_in dl uchar 0
+  pos = add dl 1
+  for i ulong 96
+    put v_sha_in add pos i get vpg_t32 i
+  end
+  pos = add pos 96
+  pr = vpg_ib p 1
+  for i ulong 64
+    put v_sha_in add pos i get vpg_ids add pr i
+  end
+  vpg_sha add pos 64
+  ret 0
+end
+
+fn vpg_compute_id p ulong to long
+  ib = vpg_ib p 0
+  for i ulong 32
+    put vpg_ids add ib i uchar 0
+  end
+  if lt vpg_hash_id p 0
+    ret -1
+  end
+  vpg_id_from_sha p 0
+  ret 0
+end
+
+fn vpg_id_from_og p ulong k ulong idx ulong to void
+  ob = mul idx 32
+  b = vpg_ib p k
+  for i ulong 32
+    put vpg_ids add b i get v_og_id add ob i
+  end
+end
+
+note omega_build_constraint_id(kind, vsb) into id k of p; 0 or -1
+fn vpg_constraint_id p ulong k ulong kind ulong to long
+  n = get vsb_n 0
+  if gt n 128
+    ret -1
+  end
+  c0 = get v_og_cnt 0
+  s = og_add_object V_KIND_CONSTRAINT
+  if lt s 0
+    ret -1
+  end
+  idx = ulong s
+  for i ulong n bound 128
+    put v_sbuf i get vsb_b i
+  end
+  rc = long 0
+  if lt og_add_const_sbuf idx kind n 0
+    rc = -1
+  else
+    if lt og_finish idx 0
+      rc = -1
+    else
+      vpg_id_from_og p k idx
+    end
+  end
+  put v_og_cnt 0 c0
+  ret rc
+end
+
+note one seq node: CONSTRAINT {omega.compose=seq, POSTCONDITION leaf(t32 slot 4) || acc(slot 5)};
+note its id into t32 slot 5. 0 or -1
+fn vpg_seq_node to long
+  s = og_add_object V_KIND_CONSTRAINT
+  if lt s 0
+    ret -1
+  end
+  idx = ulong s
+  if lt og_add_attr idx vpg_k_compose vpg_k_seq 0
+    ret -1
+  end
+  for i ulong 64
+    put v_sbuf i get vpg_t32 add 128 i
+  end
+  if lt og_add_const_sbuf idx V_CONST_POSTCONDITION 64 0
+    ret -1
+  end
+  if lt og_finish idx 0
+    ret -1
+  end
+  vpg_t32_from_obj 5 idx
+  ret 0
+end
+
+fn vpg_leaf_to_t32 p ulong li ulong slot ulong to void
+  lo = add mul p 2048 mul li 32
+  sb = mul slot 32
+  for i ulong 32
+    put vpg_t32 add sb i get vpg_leaf add lo i
+  end
+end
+
+note omega_contract_post_seq_id over the leaves of p; result in t32 slot 5. 0 or -1
+fn vpg_post_seq p ulong to long
+  n = vpg_g p VPG_NLEAF
+  if or eq n 0 gt n 64
+    ret -1
+  end
+  vpg_leaf_to_t32 p sub n 1 5
+  c0 = get v_og_cnt 0
+  rc = long 0
+  m = sub n 1
+  for k ulong m bound 64
+    vpg_leaf_to_t32 p sub sub n 2 k 4
+    if lt vpg_seq_node 0
+      rc = -1
+      break
+    end
+  end
+  put v_og_cnt 0 c0
+  ret rc
+end
+
+fn vpg_t32_eq_id slot ulong p ulong k ulong to bool
+  sb = mul slot 32
+  b = vpg_ib p k
+  for i ulong 32
+    if ne get vpg_t32 add sb i get vpg_ids add b i
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- V0 realization gate ----
+text vpg_w_nop "no program"
+text vpg_w_nobody "program has no semantic body: meaning unknown, nothing to compile"
+text vpg_w_64 "body has more than 64 steps"
+text vpg_w_tag1 "type tags in=0x"
+text vpg_w_tag2 " out=0x"
+text vpg_w_tag3 ": V0 realization compiles unsigned integers only (signed/bitvector result representation is not specified)"
+text vpg_w_iw1 "input width "
+text vpg_w_iw2 " != output width "
+text vpg_w_iw3 ": V0 never converts"
+text vpg_w_wd1 "width "
+text vpg_w_wd2 " unsupported: V0 AArch64 realization supports u8 u16 u32 u64"
+text vpg_w_step "step "
+text vpg_w_div ": DIV fails closed: not in the V0 body op set, no UDIV emitter, and evaluator (x/0 = error) and UDIV (x/0 = 0) disagree"
+text vpg_w_opc1 ": opcode 0x"
+text vpg_w_opc2 " ("
+text vpg_w_opc3 ") not in V0 body op set ADD SUB MUL AND OR"
+text vpg_w_k1 ": constant 0x"
+text vpg_w_k2 " does not fit declared width u"
+text vpg_w_stale "program_id is not the v2 id of this body and contract (stale or forged)"
+text vpg_n_add "ADD"
+text vpg_n_sub "SUB"
+text vpg_n_mul "MUL"
+text vpg_n_and "AND"
+text vpg_n_or "OR"
+text vpg_n_div "DIV"
+text vpg_n_unk "unknown"
+
+fn vsb_step_op_name op ulong to void
+  if eq op V_OP_ADD
+    vsb_t vpg_n_add
+    ret
+  end
+  if eq op V_OP_SUB
+    vsb_t vpg_n_sub
+    ret
+  end
+  if eq op V_OP_MUL
+    vsb_t vpg_n_mul
+    ret
+  end
+  if eq op V_OP_AND
+    vsb_t vpg_n_and
+    ret
+  end
+  if eq op V_OP_OR
+    vsb_t vpg_n_or
+    ret
+  end
+  if eq op V_OP_DIV
+    vsb_t vpg_n_div
+    ret
+  end
+  vsb_t vpg_n_unk
+end
+
+note the snprintf(tmp[160]) messages, then set_why(why, cap, "%s", tmp)
+fn vpg_tmp_why cap ulong to void
+  vsb_trunc 159
+  vpg_set_why cap
+end
+
+fn vpg_check_steps p ulong w ulong cap ulong to long
+  n = vpg_g p VPG_SCNT
+  for i ulong n bound 64
+    op = vpg_step_op p i
+    imm = vpg_step_imm p i
+    if not vpg_step_valid op
+      vsb_reset
+      vsb_t vpg_w_step
+      vsb_u i
+      if eq op V_OP_DIV
+        vsb_t vpg_w_div
+      else
+        vsb_t vpg_w_opc1
+        vsb_x op 2
+        vsb_t vpg_w_opc2
+        vsb_step_op_name op
+        vsb_t vpg_w_opc3
+      end
+      vpg_tmp_why cap
+      ret -1
+    end
+    if ne and imm xor vpg_wmask w 18446744073709551615 0
+      vsb_reset
+      vsb_t vpg_w_step
+      vsb_u i
+      vsb_t vpg_w_k1
+      vsb_x imm 1
+      vsb_t vpg_w_k2
+      vsb_u w
+      vpg_tmp_why cap
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn vpg_sha_is_id p ulong to bool
+  b = vpg_ib p 0
+  for i ulong 32
+    if ne get vpg_ids add b i get v_sha_out i
+      ret false
+    end
+  end
+  ret true
+end
+
+note omega_program_realize_check(p, &w, why, cap): 0 with vpg_w, or -1 with why
+fn vpg_realize_check p ulong cap ulong to long
+  if eq vpg_g p VPG_HASB 0
+    vpg_why_txt vpg_w_nobody cap
+    ret -1
+  end
+  if gt vpg_g p VPG_SCNT 64
+    vpg_why_txt vpg_w_64 cap
+    ret -1
+  end
+  it = vpg_g p VPG_ITAG
+  ot = vpg_g p VPG_OTAG
+  if or ne it V_TY_UINT ne ot V_TY_UINT
+    vsb_reset
+    vsb_t vpg_w_tag1
+    vsb_x it 2
+    vsb_t vpg_w_tag2
+    vsb_x ot 2
+    vsb_t vpg_w_tag3
+    vpg_tmp_why cap
+    ret -1
+  end
+  iw = vpg_g p VPG_IW
+  ow = vpg_g p VPG_OW
+  if ne iw ow
+    vsb_reset
+    vsb_t vpg_w_iw1
+    vsb_u iw
+    vsb_t vpg_w_iw2
+    vsb_u ow
+    vsb_t vpg_w_iw3
+    vpg_tmp_why cap
+    ret -1
+  end
+  if and and ne iw 8 ne iw 16 and ne iw 32 ne iw 64
+    vsb_reset
+    vsb_t vpg_w_wd1
+    vsb_u iw
+    vsb_t vpg_w_wd2
+    vpg_tmp_why cap
+    ret -1
+  end
+  if ne vpg_check_steps p iw cap 0
+    ret -1
+  end
+  ok = false
+  if eq vpg_hash_id p 0
+    ok = vpg_sha_is_id p
+  end
+  if not ok
+    vpg_why_txt vpg_w_stale cap
+    ret -1
+  end
+  put vpg_w 0 iw
+  if gt cap 0
+    put vpg_wl 0 0
+  end
+  ret 0
+end
+
+note ---- emitter (omega_program_emit_schedule) ----
+note MOVZ chunk0, then MOVK for each nonzero higher 16-bit chunk
+fn vro_emit_const r ulong reg ulong imm ulong to long
+  if lt vro_put32 r a64movz 1 reg and imm 65535 0 0
+    ret -1
+  end
+  for j ulong 3
+    k = add j 1
+    ch = and shr imm mul 16 k 65535
+    if ne ch 0
+      if lt vro_put32 r a64movk 1 reg ch mul 16 k 0
+        ret -1
+      end
+    end
+  end
+  ret 0
+end
+
+fn vro_emit_op r ulong op ulong rm ulong to long
+  if eq op V_OP_ADD
+    ret vro_put32 r a64addreg 1 0 0 rm
+  end
+  if eq op V_OP_SUB
+    ret vro_put32 r a64subreg 1 0 0 rm
+  end
+  if eq op V_OP_MUL
+    ret vro_put32 r a64mulreg 1 0 0 rm
+  end
+  if eq op V_OP_AND
+    ret vro_put32 r a64andreg 1 0 0 rm
+  end
+  if eq op V_OP_OR
+    ret vro_put32 r a64orrreg 1 0 0 rm
+  end
+  ret -1
+end
+
+global vpg_plop ulong 72
+global vpg_plim ulong 72
+
+note one preload block of k plan items from base
+fn vro_emit_block r ulong base ulong k ulong to long
+  for j ulong k bound 16
+    if lt vro_emit_const r add 1 j get vpg_plim add base j 0
+      ret -1
+    end
+  end
+  for j ulong k bound 16
+    if lt vro_emit_op r get vpg_plop add base j add 1 j 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn vro_emit_plan r ulong n ulong sched ulong to long
+  if eq sched 0
+    for i ulong n bound 72
+      if lt vro_emit_const r 1 get vpg_plim i 0
+        ret -1
+      end
+      if lt vro_emit_op r get vpg_plop i 1 0
+        ret -1
+      end
+    end
+  else
+    base = ulong 0
+    while lt base n bound 8
+      k = sub n base
+      if gt k 15
+        k = 15
+      end
+      if lt vro_emit_block r base k 0
+        ret -1
+      end
+      base = add base 15
+    end
+  end
+  ret vro_put32 r a64ret
+end
+
+note the code of p's body at width w with schedule sched (0 sequential, 1 preload) into r;
+note 0, or -1 with r's code length left 0
+fn vpg_emit_schedule p ulong w ulong sched ulong r ulong to long
+  if eq vpg_g p VPG_HASB 0
+    ret -1
+  end
+  n = vpg_g p VPG_SCNT
+  if gt n 64
+    ret -1
+  end
+  if and and ne w 8 ne w 16 and ne w 32 ne w 64
+    ret -1
+  end
+  if gt sched 1
+    ret -1
+  end
+  m = vpg_wmask w
+  for i ulong n bound 64
+    op = vpg_step_op p i
+    imm = vpg_step_imm p i
+    if not vpg_step_valid op
+      ret -1
+    end
+    if ne and imm xor m 18446744073709551615 0
+      ret -1
+    end
+    put vpg_plop i op
+    put vpg_plim i imm
+  end
+  pn = n
+  if lt w 64
+    put vpg_plop pn V_OP_AND
+    put vpg_plim pn m
+    pn = add pn 1
+  end
+  vro_p r VRO_CLEN 0
+  if lt vro_emit_plan r pn sched 0
+    vro_p r VRO_CLEN 0
+    ret -1
+  end
+  ret 0
+end
+
+text vpg_w_emit "emitter refused the body (code buffer or encoding)"
+
+note omega_program_realize_ex(p, why, cap): 0, -2 (gate or emitter), -1 (v0 refused)
+fn vpg_realize_ex p ulong cap ulong to long
+  if ne vpg_realize_check p cap 0
+    ret -2
+  end
+  w = get vpg_w 0
+  vro_zero VRO_TMP
+  if ne vpg_emit_schedule p w 0 VRO_TMP 0
+    vpg_why_txt vpg_w_emit cap
+    ret -2
+  end
+  vro_p VRO_TMP VRO_PROF 1
+  vro_p VRO_TMP VRO_EOFF 0
+  pb = vpg_ib p 0
+  sb = vro_ib VRO_TMP VRO_K_SEM
+  for i ulong 32
+    put vro_id add sb i get vpg_ids add pb i
+  end
+  u = vro_compute_rid VRO_TMP
+  if ne vro_v0 VRO_TMP 0
+    if gt cap 0
+      vsb_reset
+      vsb_why 511
+      vpg_set_why cap
+    end
+    ret -1
+  end
+  vro_copy p VRO_TMP
+  vpg_p p VPG_REAL 1
+  vpg_p p VPG_VER 0
+  if lt u -999
+    ret -1
+  end
+  ret 0
+end
+
+text vpg_t_pre "x >= 0"
+text vpg_t_x "x "
+
+note omega_program_build_unary_op(p, name, op, imm): 0 or -1
+fn vpg_build_unary p ulong name view uchar * op ulong imm ulong to long
+  vpg_init p name
+  if not vpg_step_valid op
+    ret -1
+  end
+  if gt imm 4294967295
+    ret -1
+  end
+  vpg_p p VPG_ITAG V_TY_UINT
+  vpg_p p VPG_IW 64
+  vpg_p p VPG_OTAG V_TY_UINT
+  vpg_p p VPG_OW 64
+  vsb_reset
+  vsb_t vpg_t_pre
+  vpg_set_txt p 1 63
+  u1 = vpg_constraint_id p 1 V_CONST_PRECONDITION
+  sym = ulong 43
+  if eq op V_OP_SUB
+    sym = 45
+  end
+  if eq op V_OP_MUL
+    sym = 42
+  end
+  if eq op V_OP_AND
+    sym = 38
+  end
+  if eq op V_OP_OR
+    sym = 124
+  end
+  vsb_reset
+  vsb_t vpg_t_x
+  vsb_c sym
+  vsb_c 32
+  vsb_u imm
+  vpg_set_txt p 2 63
+  u2 = vpg_constraint_id p 2 V_CONST_POSTCONDITION
+  vpg_p p VPG_HASB 1
+  vpg_p p VPG_SCNT 1
+  put vpg_op mul p 64 op
+  put vpg_imm mul p 64 imm
+  if ne vpg_compute_id p 0
+    ret -1
+  end
+  if ne vpg_realize_ex p 0 0
+    ret -1
+  end
+  if lt add u1 u2 -999
+    ret -1
+  end
+  ret 0
+end
+
+note post_leaves_of(p) appended to vpg_lt at leaf position at; returns the count
+fn vpg_leaves_of p ulong lpos ulong to ulong
+  n = vpg_g p VPG_NLEAF
+  if and ge n 2 le n 64
+    if eq vpg_post_seq p 0
+      if vpg_t32_eq_id 5 p 2
+        lb = mul p 2048
+        ob = mul lpos 32
+        m = mul n 32
+        for i ulong m bound 2048
+          put vpg_lt add ob i get vpg_leaf add lb i
+        end
+        ret n
+      end
+    end
+  end
+  b = vpg_ib p 2
+  ob = mul lpos 32
+  for i ulong 32
+    put vpg_lt add ob i get vpg_ids add b i
+  end
+  ret 1
+end
+
+text vpg_e_ty1 "Type mismatch in composition: A.out (tag 0x"
+text vpg_e_ty2 ", width "
+text vpg_e_ty3 ") != B.in (tag 0x"
+text vpg_e_ty4 ")"
+text vpg_e_post "Composite postcondition overflow (more than 64 parts)"
+text vpg_e_pid "Composite postcondition id failed"
+text vpg_e_body "Composite body overflow (more than 64 steps)"
+text vpg_t_o ")o("
+text vpg_t_semi " ; "
+
+fn vpg_compose_err a ulong b ulong cap ulong to void
+  vsb_reset
+  vsb_t vpg_e_ty1
+  vsb_x vpg_g a VPG_OTAG 2
+  vsb_t vpg_e_ty2
+  vsb_u vpg_g a VPG_OW
+  vsb_t vpg_e_ty3
+  vsb_x vpg_g b VPG_ITAG 2
+  vsb_t vpg_e_ty2
+  vsb_u vpg_g b VPG_IW
+  vsb_t vpg_e_ty4
+  vpg_set_why cap
+end
+
+fn vpg_compose_body a ulong b ulong c ulong cap ulong to long
+  if or eq vpg_g a VPG_HASB 0 eq vpg_g b VPG_HASB 0
+    ret 0
+  end
+  na = vpg_g a VPG_SCNT
+  nb = vpg_g b VPG_SCNT
+  if gt add na nb 64
+    vpg_why_txt vpg_e_body cap
+    ret -1
+  end
+  vpg_p c VPG_HASB 1
+  vpg_p c VPG_SCNT add na nb
+  cb = mul c 64
+  for i ulong na bound 64
+    put vpg_op add cb i vpg_step_op a i
+    put vpg_imm add cb i vpg_step_imm a i
+  end
+  for i ulong nb bound 64
+    put vpg_op add add cb na i vpg_step_op b i
+    put vpg_imm add add cb na i vpg_step_imm b i
+  end
+  ret 0
+end
+
+fn vpg_lt_to_leaf c ulong nl ulong to void
+  m = mul nl 32
+  lb = mul c 2048
+  for i ulong m bound 2048
+    put vpg_leaf add lb i get vpg_lt i
+  end
+  vpg_p c VPG_NLEAF nl
+end
+
+fn vpg_compose_post a ulong b ulong c ulong cap ulong to long
+  na = vpg_leaves_of a 0
+  nb = vpg_leaves_of b na
+  if gt add na nb 64
+    vpg_why_txt vpg_e_post cap
+    ret -1
+  end
+  nl = add na nb
+  vpg_lt_to_leaf c nl
+  if ne vpg_post_seq c 0
+    vpg_why_txt vpg_e_pid cap
+    ret -1
+  end
+  cq = vpg_ib c 2
+  for i ulong 32
+    put vpg_ids add cq i get vpg_t32 add 160 i
+  end
+  vsb_reset
+  vsb_ptxt a 2 29
+  vsb_t vpg_t_semi
+  vsb_ptxt b 2 29
+  vpg_set_txt c 2 63
+  ret 0
+end
+
+note omega_program_compose(a, b, c, err, cap) (a, b, c distinct): 0, or -1 with err in vpg_why
+fn vpg_compose a ulong b ulong c ulong cap ulong to long
+  if or ne vpg_g a VPG_OTAG vpg_g b VPG_ITAG ne vpg_g a VPG_OW vpg_g b VPG_IW
+    vpg_compose_err a b cap
+    ret -1
+  end
+  vsb_reset
+  vsb_c 40
+  vsb_ptxt b 0 25
+  vsb_t vpg_t_o
+  vsb_ptxt a 0 25
+  vsb_c 41
+  vsb_trunc 63
+  vpg_init_vsb c
+  vpg_p c VPG_ITAG vpg_g a VPG_ITAG
+  vpg_p c VPG_IW vpg_g a VPG_IW
+  vpg_p c VPG_OTAG vpg_g b VPG_OTAG
+  vpg_p c VPG_OW vpg_g b VPG_OW
+  ab = vpg_ib a 1
+  cpb = vpg_ib c 1
+  for i ulong 32
+    put vpg_ids add cpb i get vpg_ids add ab i
+  end
+  vsb_reset
+  vsb_ptxt a 1 60
+  vpg_set_txt c 1 63
+  if ne vpg_compose_post a b c cap 0
+    ret -1
+  end
+  if ne vpg_compose_body a b c cap 0
+    ret -1
+  end
+  u = vpg_compute_id c
+  if eq vpg_g c VPG_HASB 1
+    u = vpg_realize_ex c 0
+  end
+  if lt u -999
+    ret -1
+  end
+  ret 0
+end
+
+note omega_eval_pure_binary_uint(op, WRAP, w, a, b) for the body op set
+fn vpg_eval_op op ulong w ulong a ulong b ulong to ulong
+  m = vpg_wmask w
+  x = and a m
+  y = and b m
+  r = ulong 0
+  if eq op V_OP_ADD
+    r = add x y
+  end
+  if eq op V_OP_SUB
+    r = sub x y
+  end
+  if eq op V_OP_MUL
+    r = mul x y
+  end
+  if eq op V_OP_AND
+    r = and x y
+  end
+  if eq op V_OP_OR
+    r = or x y
+  end
+  ret and r m
+end
+
+note omega_program_eval(p, {x}, 1, &y): 0 with vpg_ev, or -1. The lowered chain is
+note param op c0 op c1 ...; eval_node folds it with each step's WRAP evaluation.
+fn vpg_eval p ulong x ulong to long
+  if ne vpg_realize_check p 0 0
+    ret -1
+  end
+  w = vpg_g p VPG_IW
+  if ne and x xor vpg_wmask w 18446744073709551615 0
+    ret -1
+  end
+  acc = x
+  n = vpg_g p VPG_SCNT
+  for i ulong n bound 64
+    acc = vpg_eval_op vpg_step_op p i w acc vpg_step_imm p i
+  end
+  put vpg_ev 0 acc
+  ret 0
+end

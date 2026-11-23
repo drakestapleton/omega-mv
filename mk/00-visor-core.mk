@@ -16,9 +16,12 @@ VISOR_DEPS = $(VISOR_OBJS:.o=.d) $(LANG_OBJS:.o=.d)
 OMEGA_BIN = $(OUT_DIR)/omega
 # Seeded compiler for the pure OM-2 Visor lane tests.
 VISOR_OMC ?= seed/out/omc
-OMEGA_OM_SRCS = src/visor/visor.om \
+# Pure OM-2 units shared with the C bridge (om/units.sh); their `export fn` is a plain fn here.
+VISOR_OM_UNITS = om/aarch64/aarch64_om2.om om/visor/verify_om2.om
+OMEGA_OM_SRCS = src/visor/visor.om $(VISOR_OM_UNITS) \
 	src/language/omega_lex.om src/language/omega_parse.om src/language/omega_lower.om \
-	src/visor/visor_semantic.om src/visor/visor_machine.om src/visor/visor_realization.om \
+	src/visor/visor_semantic.om src/visor/visor_machine.om src/visor/visor_program.om \
+	src/visor/visor_realization.om \
 	src/visor/visor_verify.om src/visor/visor_evidence.om src/visor/visor_world.om \
 	src/visor/visor_effect_request.om src/visor/visor_parse_command.om src/visor/visor_console.om \
 	tools/omega.om
@@ -33,7 +36,7 @@ $(OUT_DIR)/language/%.o: src/language/%.c | $(OUT_DIR)/language
 	$(CC) $(VISOR_CFLAGS) -c $< -o $@
 
 $(OMEGA_BIN): $(OMEGA_OM_SRCS) seed/out/omc | $(OUT_DIR)
-	cat $(OMEGA_OM_SRCS) | seed/out/omc > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(OMEGA_OM_SRCS)) | seed/out/omc > $@ && chmod +x $@
 
 .PHONY: omega
 omega: $(OMEGA_BIN)
