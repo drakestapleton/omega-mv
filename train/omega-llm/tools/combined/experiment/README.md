@@ -45,3 +45,41 @@ examples and permutes scalar arguments to produce alternative expression program
 It checks every proposal against all observed answers before admission. Programs
 that fail on unlabeled probes yield an undefined prediction. No reference is queried
 to generate proposals. See `protocol.md` for scoring and advancement rules.
+
+## Recorded interruption and diagnostic continuation
+
+The registered run stopped before final scoring. The expression synthesizer exited
+104 on the fixed task `eval-equal-offset-4` and the production CLI returned 70.
+The receipt includes the public numeric spec. Passing it to
+`om_synth solve INPUT_SPEC OUTPUT_FUNCTION` reproduces the component failure.
+To reproduce the diagnostic comparison, first let the registered command stop.
+Keep the output directory, then run:
+
+```sh
+python3 "$E/measure.py" eval fresh --kit "$BASE" --improved "$IMPROVED" --jobs 8 --diagnose-interruption
+python3 "$E/summarize.py" fresh
+```
+
+The diagnostic harness checks the fixture and both kit fingerprints, retains the
+sealed prefix and records execution errors separately. A failed candidate run has
+no selected program. Only retained invocations have complete query accounting.
+This diagnostic continuation is ineligible for promotion. The selection algorithm,
+reference, input split, model weights and sandboxed executables have the same
+hashes or source as the registered run.
+
+## Replay the published grades using public source
+
+From the experiment checkout, the following commands build the seeded compiler
+and prediction instrument and execute every published answer on fresh scoring
+inputs. The audit compares each observed verdict and first counterexample with
+the receipt. The neural sampler and checkpoints are needed only to regenerate
+the complete CLI comparison.
+
+```sh
+sh seed/omega-from-seed.sh
+A=$(mktemp -d)
+train/omega-llm/tools/combined/build.sh "$A/kit"
+"$E/build.sh" "$A/kit"
+python3 "$E/audit.py" evidence/OMEGALLM-SELECTION-20261123/comparison.*.json "$A/kit"
+python3 "$E/test_rewrites.py" "$A/kit"
+```
