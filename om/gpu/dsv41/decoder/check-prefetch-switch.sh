@@ -4,6 +4,8 @@
 # Exit codes of the control: 10 on, 11 off, 12 refused (with one stderr line).
 set -u
 bin=$1
+# The repeated-name mode re-executes argv[0], so pass an absolute path.
+case "$bin" in /*) ;; *) bin="$(pwd)/$bin" ;; esac
 # An empty file runs as exit 0 under sh; refuse anything that is not a non-empty ELF executable.
 if [ ! -x "$bin" ] || [ ! -s "$bin" ] || [ "$(head -c 4 "$bin" | od -An -c | tr -d ' ')" != '177ELF' ]; then
   echo "PREFETCH-SWITCH FAIL: $bin is not a non-empty ELF executable"
@@ -48,9 +50,12 @@ case_ 10 big-entry-unset "$big"
 case_ 11 big-entry-zero "$big" "$k=0"
 case_ 11 zero-among-others "A=1" "$k=0" "Z=2"
 # Repeated names: env(1) keeps one value per name, so the control re-runs itself through execenv.
-"$bin" dup 2> /dev/null
+"$bin" dup 2> "$err"
 got=$?
-if [ "$got" = 50 ]; then echo "PASS repeated-name (50)"; else echo "FAIL repeated-name want 50 got $got"; fail=1; fi
+lines=$(grep -c -x -F "$msg" "$err")
+other=$(grep -v -c -x -F "$msg" "$err")
+if [ "$got" = 50 ] && [ "$lines" = 3 ] && [ "$other" = 0 ]; then echo "PASS repeated-name (50, 3 refusals)"
+else echo "FAIL repeated-name want 50 and 3 refusal lines, got $got, $lines refusal lines, $other other lines"; fail=1; fi
 
 if [ "$fail" = 0 ]; then echo "PREFETCH-SWITCH PASS"; else echo "PREFETCH-SWITCH FAIL"; fi
 exit "$fail"

@@ -71,3 +71,25 @@ The seeded build generates the source line/function counts, encoded word count a
 compiler digest through diaggen size mode, and appends a row only for a new final
 compiler identity. Do not hand-copy those measurements. The independent size-record
 test checks content changes, exact counts and malformed executable refusals.
+
+## Decoder switch review corrective action, 2026-11-23
+
+Three reviews rejected the dsv41-decode Arboris prefetch switch before its
+fourth: heads 14b2275448a63e2af1c5ddc182c0276e47d51de5,
+bfabe5f4490c73c29293906802b9420cad398f9d and
+3ee10c19941953ec6157ec09657da11680d915e1.
+
+| Round | Finding kind | Why author or checks missed it | Corrective action |
+| --- | --- | --- | --- |
+| 1, 2, 3 | Controls tested helpers, not the composed program. Moving or dropping the switch write in `decode-cli.om` passed every control. | Each control was written for the function just changed. Nothing ran the real binary's entry point without a GPU. | `pfcheck` runs the real decoder's parse-and-start path on the host. `check-decoder-prefetch.sh` drives it, and mutants F and G must fail it. |
+| 2, 3 | Assertions that could not fail: a drain with nothing in flight, a slot table that dispatch never writes, an empty binary that runs as exit 0. | No assertion was paired with a wrong implementation that only it rejects. | `check-prefetch-mutants.sh` pairs every off-arm exit and every control with a named mutant and expected result. Assertions with no killing mutant were removed. No success code is 0, and empty builds stop the driver. |
+| 3 | Negative controls lived outside the repository and their log lacked the compiler digest. | The mutant script was kept as scratch. | The mutant driver is committed and self-judging. It prints head, compiler digest and binary digests, and passes only on `PREFETCH-MUTANTS PASS`. |
+| 1, 2, 3 | Documentation claimed more than the code or evidence: layer0 refusals, "the arm that ran", exit codes, the slot-fill limit. | The README was written from intent before the behaviour was checked. | The README states only what a control or a recorded run shows, and says which. |
+| 1, 2 | Environment limits: the read buffer refused default runs with large entries; the page size was assumed to be 4 KiB. | Malformed values were tested, but not the read-overflow path or kernel limits. | The buffer is 2 MiB (MAX_ARG_STRLEN on 64 KiB pages). The control includes a maximum-size entry and repeated names delivered through `execenv`. |
+
+Before any review of a change to `prefetch-switch.om`, `decode-cli.om`,
+`check-*prefetch*` or the prefetch path in `forward.om`, run
+`check-prefetch-mutants.sh` at the exact head and attach its log. A new
+assertion in those controls needs a mutant in the driver that only it
+rejects. A behaviour that only a GPU run can show is labelled as such and
+backed by that run's stats line, not by the host controls.
