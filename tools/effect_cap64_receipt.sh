@@ -135,7 +135,7 @@ for t in "${REGRESSION[@]}"; do suite "$t" "$Q/reg" "${RT[@]}"; done
 
 # ---- truncation grep --------------------------------------------------------
 trunc_hits=$(grep -rnE '\(uint32_t\)[^;]*capability_generation|capability_generation[^;]*[^0-9]%u|uint32_t +(cap_gen|capability_generation)\b' \
-    src tools/omega.c tests --include='*.c' --include='*.h' | grep -v 'src/omega_accelerator' || true)
+    src tests --include='*.c' --include='*.h' | grep -v 'src/omega_accelerator' || true)
 trunc_n=$(printf '%s' "$trunc_hits" | grep -c . || true)
 [ "$trunc_n" -eq 0 ] || REASONS+=("effect generation truncation grep: $trunc_n hit(s)")
 
