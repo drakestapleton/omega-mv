@@ -9,10 +9,11 @@
 #   1. the ledger without the row of a deleted C file;
 #   2. a row with one function dropped;
 #   3. a check line in mk/ that runs nm on the object of a deleted C file and names no .om.
-# PARITY_BASE: the commit the change is measured from (default: merge-base with origin/main,
-# falling back to the pre-retirement baseline 3f2c70dc5 when HEAD == origin/main).
+# PARITY_BASE: the commit the change is measured from. Default: the pre-retirement ledger baseline
+# 3f2c70dc5 whenever it is an ancestor of HEAD (the bite controls name C it retired, e.g. visor_semantic.c),
+# else the merge-base of HEAD and origin/main.
 PARITY_DEFAULT_BASE = 3f2c70dc5dca7009b496d261c893ed0dc74c7a89
-PARITY_BASE ?= $(shell mb=$$(git merge-base HEAD origin/main 2>/dev/null); hd=$$(git rev-parse HEAD 2>/dev/null); if [ -n "$$mb" ] && [ "$$mb" != "$$hd" ]; then printf '%s' "$$mb"; else printf '%s' "$(PARITY_DEFAULT_BASE)"; fi)
+PARITY_BASE ?= $(shell if git merge-base --is-ancestor $(PARITY_DEFAULT_BASE) HEAD 2>/dev/null; then printf "%s" "$(PARITY_DEFAULT_BASE)"; else git merge-base HEAD origin/main 2>/dev/null; fi)
 .PHONY: check-retirement
 check-retirement:
 	PARITY_BASE=$(PARITY_BASE) sh tools/migration/parity_check.sh
