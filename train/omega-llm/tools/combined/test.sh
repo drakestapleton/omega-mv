@@ -55,6 +55,20 @@ prompt 'demo operation' 'a view ulong 8 n ulong to ulong'
 printf '4 1 3 9 4 0 0 0 0 17\n2 1 1 7 2 0 0 0 0 2\n' > examples
 answer prompt examples
 route_is om_sketch
+# Historical r-030, including tails after the active length.
+prompt 'return the sum of the items at even indexes minus the sum of the items at odd indexes among the first n items, or zero when the odd sum is larger' 'a view ulong 8 n ulong to ulong'
+cat > examples <<'ROWS'
+0 7 0 3 11 3 2 9 13 0
+2 7 0 3 11 3 2 9 13 7
+5 7 0 3 11 3 2 9 13 2
+8 7 0 3 11 3 2 9 13 0
+0 9 2 3 2 1 12 0 9 0
+2 9 2 3 2 1 12 0 9 7
+5 9 2 3 2 1 12 0 9 9
+8 9 2 3 2 1 12 0 9 0
+ROWS
+answer prompt examples
+route_is om_sketch
 prompt 'demo operation' 'a edit ulong 8 n ulong to void'
 printf '2 1 3 0 0 0 0 0 0 3 1 0 0 0 0 0 0\n3 7 5 9 0 0 0 0 0 9 5 7 0 0 0 0 0\n' > examples
 answer prompt examples
@@ -85,7 +99,24 @@ cmp good got
 cp replay/base.ck replay/strand-1102
 want=1
 refuse prompt examples
-printf 'ret 77\nend\nfn extra to int\nret 0\nend\n' > replay/r3.ck
+# Every candidate below would satisfy all nine rows if its invalid line were ignored.
+for local in se so runningTotal local_with_underscores; do
+    printf '%s = mul a 937\nret add %s 417\nend\n' "$local" "$local" > replay/r3.ck
+    answer prompt examples
+    route_is r3.ck
+    cmp got replay/r3.ck
+done
+printf 'subtotal = ulong 0\nfor position ulong a bound 9\nsubtotal = add subtotal 937\nend\nret add subtotal 417\nend\n' > replay/r3.ck
+answer prompt examples
+route_is r3.ck
+cmp got replay/r3.ck
+for body in 'ret add mul missing 937 417' 'ret add mul z 937 417' 'for add ulong 0' 'for note ulong 0' 'for getpid ulong 0'; do
+    { printf '%s\n' "$body"; case "$body" in 'for '*) printf 'end\n';; esac; cat good; } > replay/r3.ck
+    refuse prompt examples
+done
+{ printf 'unused = getpid\n'; cat good; } > replay/r3.ck
+refuse prompt examples
+{ cat good; printf 'fn extra to int\nret 0\nend\n'; } > replay/r3.ck
 refuse prompt examples
 printf '18446744073709551616 2\n' > invalid
 want=65
