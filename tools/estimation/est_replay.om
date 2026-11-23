@@ -89,6 +89,20 @@ text t_er_st_od " obs="
 text t_er_st_pd " pred="
 text t_er_st_id " innov="
 text t_er_st_bd " belief="
+text t_er_fw1 "bad model"
+text t_er_fw2 "model digest"
+text t_er_fw3 "prior"
+text t_er_fw4 "belief digest"
+text t_er_fw5 "predict"
+text t_er_fw6 "prediction digest"
+text t_er_fw7 "coast"
+text t_er_fw8 "update"
+text t_er_fw9 "digest"
+text t_er_fw10 "no valid observation in the file"
+text t_er_fw11 "out of memory"
+text t_er_fat " at line "
+text t_er_fst " (status "
+text t_er_fcl ")"
 
 note ---- Buffered output globals ----
 global g_ob_buf uchar 65536
@@ -123,6 +137,8 @@ global g_rp_mdl ulong 1120
 global g_rp_mdig uchar 128
 global g_rp_err uchar 640
 global g_rp_elen ulong 4
+note failing step of the last replay call: [0] what (1..11), [1] status (bits of a long)
+global g_rp_fnote ulong 2
 
 global g_rps_line ulong 32768
 global g_rps_L ulong 32768
@@ -933,7 +949,7 @@ fn er_parse_f64_exp s view uchar * i ulong lim ulong out_e edit long 1 to ulong
   end
   nd = ulong 0
   ev = long 0
-  while lt j lim bound 16
+  while lt j lim bound 16777216
     c = get s j
     if or lt c 48 gt c 57
       break
@@ -987,7 +1003,7 @@ fn er_parse_f64_digits s view uchar * i0 ulong lim ulong st edit long 4 to ulong
   for k ulong 4
     put st k 0
   end
-  while lt i lim bound 4096
+  while lt i lim bound 16777216
     c = get s i
     if or lt c 48 gt c 57
       break
@@ -998,7 +1014,7 @@ fn er_parse_f64_digits s view uchar * i0 ulong lim ulong st edit long 4 to ulong
   if lt i lim
     if eq get s i 46
       i = add i 1
-      while lt i lim bound 4096
+      while lt i lim bound 16777216
         c = get s i
         if or lt c 48 gt c 57
           break
@@ -1286,13 +1302,315 @@ fn er_pf_value nsig ulong e long sticky ulong to f64
   ret bz_round q s or sticky get rn 0
 end
 
-fn er_parse_f64 s view uchar * off ulong lim ulong dst edit f64 1 used edit ulong 1 to long
+note ---- strtod's other forms: leading white space, "infinity", "nan(...)", hexadecimal ----
+
+fn er_is_space c uchar to bool
+  ret or eq c 32 and ge c 9 le c 13
+end
+
+fn er_hexval c uchar to long
+  if and ge c 48 le c 57
+    ret long sub c 48
+  end
+  if and ge c 97 le c 102
+    ret long sub c 87
+  end
+  if and ge c 65 le c 70
+    ret long sub c 55
+  end
+  ret -1
+end
+
+note one hex digit d: st[0] mantissa (at most 61 bits kept), st[1] sticky, st[2] digits, st[3] exponent (long bits)
+fn er_hex_digit d ulong frac ulong st edit ulong 4 to void
+  m = get st 0
+  e = bitcast long get st 3
+  if eq shr m 57 0
+    put st 0 add mul m 16 d
+    if ne frac 0
+      e = sub e 4
+    end
+  else
+    if ne d 0
+      put st 1 1
+    end
+    if eq frac 0
+      e = add e 4
+    end
+  end
+  put st 3 bitcast ulong e
+  put st 2 add get st 2 1
+end
+
+fn er_bitlen64 m ulong to ulong
+  b = ulong 0
+  v = m
+  while ne v 0 bound 65
+    v = shr v 1
+    b = add b 1
+  end
+  ret b
+end
+
+note round to nearest even: mantissa mr, round bit rb, sticky st
+fn er_rne mr ulong rb ulong st ulong to ulong
+  if eq rb 0
+    ret mr
+  end
+  if or ne st 0 ne and mr 1 0
+    ret add mr 1
+  end
+  ret mr
+end
+
+note mr * 2^k for an exactly representable result (or infinity above the range)
+fn er_hex_scale mr ulong k long to f64
+  if eq mr 0
+    ret f64 0.0
+  end
+  top = add long sub er_bitlen64 mr 1 k
+  if gt top 1023
+    ret est_inf
+  end
+  fm = f64 mr
+  if lt k -1022
+    v = mul fm est_ldexp_pow2 -1022
+    ret mul v est_ldexp_pow2 add k 1022
+  end
+  ret mul fm est_ldexp_pow2 k
+end
+
+note subnormal rounding as glibc 2.39 round_and_return: the bits beyond the 53-bit mantissa count
+note only as sticky (the 54th bit is dropped there), the new round bit is bit shift-1 of m53
+fn er_hex_sub m53 ulong shift ulong st ulong to f64
+  rb = and shr m53 sub shift 1 1
+  st2 = or st and m53 sub shl ulong 1 sub shift 1 1
+  mr = er_rne shr m53 shift rb st2
+  ret er_hex_scale mr -1074
+end
+
+note m * 2^e2 (m != 0, plus a sticky bit below m) as glibc 2.39 strtod's hexadecimal path rounds it:
+note the first 53 bits from the leading one, the 54th bit as round bit, the rest as sticky
+fn er_hex_value m ulong e2 long sticky ulong to f64
+  if eq m 0
+    ret f64 0.0
+  end
+  bl = er_bitlen64 m
+  e0 = add long sub bl 1 e2
+  if gt e0 1023
+    ret est_inf
+  end
+  if lt e0 -1075
+    ret f64 0.0
+  end
+  m53 = m
+  rb = ulong 0
+  st = sticky
+  if gt bl 53
+    m53 = shr m sub bl 53
+    rb = and shr m sub bl 54 1
+    st = or st and m sub shl ulong 1 sub bl 54 1
+  else
+    m53 = shl m sub 53 bl
+  end
+  if lt e0 -1022
+    ret er_hex_sub m53 ulong sub -1022 e0 st
+  end
+  mr = er_rne m53 rb st
+  ret er_hex_scale mr sub e0 52
+end
+
+note binary exponent "p[+-]digits" at i: returns the index after it (i when absent), value in exo
+fn er_parse_pexp s view uchar * i ulong lim ulong exo edit long 1 to ulong
+  put exo 0 0
+  if ge i lim
+    ret i
+  end
+  cp = get s i
+  if and ne cp 112 ne cp 80
+    ret i
+  end
+  j = add i 1
+  eneg = false
+  if lt j lim
+    cs = get s j
+    if eq cs 45
+      eneg = true
+      j = add j 1
+    else
+      if eq cs 43
+        j = add j 1
+      end
+    end
+  end
+  nd = ulong 0
+  ex = long 0
+  while lt j lim bound 16777216
+    c = get s j
+    if or lt c 48 gt c 57
+      break
+    end
+    if lt ex 100000000
+      ex = add mul ex 10 long sub c 48
+    end
+    nd = add nd 1
+    j = add j 1
+  end
+  if eq nd 0
+    ret i
+  end
+  if eneg
+    ex = neg ex
+  end
+  put exo 0 ex
+  ret j
+end
+
+note hex form at i (just after "0x"): returns the end index, or i0 when no hex digit follows
+fn er_parse_hex s view uchar * i0 ulong lim ulong dst edit f64 1 to ulong
+  st = new ulong 4 0
+  i = i0
+  while lt i lim bound 16777216
+    d = er_hexval get s i
+    if lt d 0
+      break
+    end
+    er_hex_digit ulong d 0 st
+    i = add i 1
+  end
+  if lt i lim
+    if eq get s i 46
+      i = add i 1
+      while lt i lim bound 16777216
+        d = er_hexval get s i
+        if lt d 0
+          break
+        end
+        er_hex_digit ulong d 1 st
+        i = add i 1
+      end
+    end
+  end
+  if eq get st 2 0
+    ret i0
+  end
+  exo = new long 1 0
+  i = er_parse_pexp s i lim exo
+  ex = get exo 0
+  e2 = add bitcast long get st 3 ex
+  put dst 0 er_hex_value get st 0 e2 get st 1
+  ret i
+end
+
+fn er_is_nchar c uchar to bool
+  if and ge c 48 le c 57
+    ret true
+  end
+  if and ge c 97 le c 122
+    ret true
+  end
+  if and ge c 65 le c 90
+    ret true
+  end
+  ret eq c 95
+end
+
+note after "nan": an optional "(n-char-sequence)" is consumed when it closes
+fn er_nan_tail s view uchar * i0 ulong lim ulong to ulong
+  if ge i0 lim
+    ret i0
+  end
+  if ne get s i0 40
+    ret i0
+  end
+  j = add i0 1
+  while lt j lim bound 16777216
+    c = get s j
+    if eq c 41
+      ret add j 1
+    end
+    if not er_is_nchar c
+      ret i0
+    end
+    j = add j 1
+  end
+  ret i0
+end
+
+note nan, inf/infinity and hexadecimal forms at i (after the sign): the end index, or 0 when none applies
+fn er_parse_special s view uchar * i ulong lim ulong negf ulong dst edit f64 1 to ulong
+  hv = new f64 1 0.0
+  if er_match_ci3 s i lim 7233902
+    v = est_nan
+    if ne negf 0
+      v = neg v
+    end
+    put dst 0 v
+    ret er_nan_tail s add i 3 lim
+  end
+  if er_match_ci3 s i lim 6712937
+    v = est_inf
+    if ne negf 0
+      v = est_ninf
+    end
+    put dst 0 v
+    k = add i 3
+    if er_match_ci3 s k lim 6909545
+      if er_match_ci3 s add k 2 lim 7959657
+        k = add i 8
+      end
+    end
+    ret k
+  end
+  if lt add i 1 lim
+    if eq get s i 48
+      cx = get s add i 1
+      if or eq cx 120 eq cx 88
+        j = er_parse_hex s add i 2 lim hv
+        if gt j add i 2
+          v = get hv 0
+          if ne negf 0
+            v = neg v
+          end
+          put dst 0 v
+          ret j
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+note decimal digits, point and exponent at i (after the sign): the end index, or 0 when no digit
+fn er_parse_dec s view uchar * i0 ulong lim ulong negf ulong dst edit f64 1 to ulong
   eo = new long 4 0
   ee = new long 1 0
-  if ge off lim
+  i = er_parse_f64_digits s i0 lim eo
+  if eq get eo 0 0
+    ret 0
+  end
+  i = er_parse_f64_exp s i lim ee
+  tot_e = add get eo 2 get ee 0
+  val = er_pf_value ulong get eo 1 tot_e ulong get eo 3
+  if ne negf 0
+    val = neg val
+  end
+  put dst 0 val
+  ret i
+end
+
+note strtod: white space, sign, then a decimal, hexadecimal, inf/infinity or nan form; 1 when none
+fn er_parse_f64 s view uchar * off ulong lim ulong dst edit f64 1 used edit ulong 1 to long
+  i = off
+  while lt i lim bound 16777216
+    if not er_is_space get s i
+      break
+    end
+    i = add i 1
+  end
+  if ge i lim
     ret 1
   end
-  i = off
   negf = ulong 0
   c0 = get s i
   if eq c0 45
@@ -1306,34 +1624,14 @@ fn er_parse_f64 s view uchar * off ulong lim ulong dst edit f64 1 used edit ulon
   if ge i lim
     ret 1
   end
-  if er_match_ci3 s i lim 7233902
-    put dst 0 est_nan
-    put used 0 sub add i 3 off
-    ret 0
+  ks = er_parse_special s i lim negf dst
+  if eq ks 0
+    ks = er_parse_dec s i lim negf dst
   end
-  if er_match_ci3 s i lim 6712937
-    v = est_inf
-    if ne negf 0
-      v = est_ninf
-    end
-    put dst 0 v
-    put used 0 sub add i 3 off
-    ret 0
-  end
-  i = er_parse_f64_digits s i lim eo
-  if eq get eo 0 0
+  if eq ks 0
     ret 1
   end
-  i = er_parse_f64_exp s i lim ee
-  tot_e = add get eo 2 get ee 0
-  nsig = ulong get eo 1
-  stk = ulong get eo 3
-  val = er_pf_value nsig tot_e stk
-  if ne negf 0
-    val = neg val
-  end
-  put dst 0 val
-  put used 0 sub i off
+  put used 0 sub ks off
   ret 0
 end
 
@@ -1974,15 +2272,10 @@ fn er_dir_and_name path view uchar * plen ulong dir edit uchar 1024 name edit uc
   sl = er_rfind_byte path plen 47
   if ge sl 0
     slu = ulong sl
-    if eq slu 0
-      put dir 0 47
-      put lens 0 1
-    else
-      for i ulong slu
-        put dir i get path i
-      end
-      put lens 0 slu
+    for i ulong slu
+      put dir i get path i
     end
+    put lens 0 slu
     nl = sub sub plen slu 1
     for i ulong nl
       put name i get path add add slu 1 i
@@ -2458,6 +2751,111 @@ fn er_step_clear idx ulong to void
   end
 end
 
+note ---- replay failure text, as est_replay.c fail(): "<what> at line <n> (status <s>)" ----
+fn er_rp_note what ulong stv long to void
+  put g_rp_fnote 0 what
+  put g_rp_fnote 1 bitcast ulong stv
+end
+
+fn er_rp_eadd rslot ulong s view uchar * n ulong to void
+  base = mul rslot 160
+  pos = get g_rp_elen rslot
+  for i ulong n
+    if lt pos 159
+      put g_rp_err add base pos get s i
+      pos = add pos 1
+    end
+  end
+  put g_rp_elen rslot pos
+end
+
+fn er_rp_eadd_i rslot ulong v long to void
+  d = new uchar 24 0
+  k = ulong 0
+  neg_f = lt v 0
+  u = bitcast ulong v
+  if neg_f
+    u = sub 0 u
+  end
+  if eq u 0
+    put d 0 48
+    k = 1
+  end
+  while ne u 0 bound 24
+    put d k uchar add rem u 10 48
+    k = add k 1
+    u = div u 10
+  end
+  o = new uchar 24 0
+  j = ulong 0
+  if neg_f
+    put o 0 45
+    j = 1
+  end
+  for i ulong k
+    put o add j i get d sub sub k 1 i
+  end
+  er_rp_eadd rslot view o add j k
+end
+
+fn er_rp_what w ulong rslot ulong to void
+  if eq w 1
+    er_rp_eadd rslot t_er_fw1 len t_er_fw1
+  end
+  if eq w 2
+    er_rp_eadd rslot t_er_fw2 len t_er_fw2
+  end
+  if eq w 3
+    er_rp_eadd rslot t_er_fw3 len t_er_fw3
+  end
+  if eq w 4
+    er_rp_eadd rslot t_er_fw4 len t_er_fw4
+  end
+  if eq w 5
+    er_rp_eadd rslot t_er_fw5 len t_er_fw5
+  end
+  if eq w 6
+    er_rp_eadd rslot t_er_fw6 len t_er_fw6
+  end
+  if eq w 7
+    er_rp_eadd rslot t_er_fw7 len t_er_fw7
+  end
+  if eq w 8
+    er_rp_eadd rslot t_er_fw8 len t_er_fw8
+  end
+  if eq w 9
+    er_rp_eadd rslot t_er_fw9 len t_er_fw9
+  end
+  if eq w 10
+    er_rp_eadd rslot t_er_fw10 len t_er_fw10
+  end
+  if eq w 11
+    er_rp_eadd rslot t_er_fw11 len t_er_fw11
+  end
+end
+
+note marks replay slot rslot failed and writes its message from g_rp_fnote; returns 1
+fn er_rp_fail rslot ulong li ulong to long
+  put g_rp_meta add mul rslot 16 10 1
+  put g_rp_elen rslot 0
+  er_rp_what get g_rp_fnote 0 rslot
+  er_rp_eadd rslot t_er_fat len t_er_fat
+  er_rp_eadd_i rslot long li
+  er_rp_eadd rslot t_er_fst len t_er_fst
+  er_rp_eadd_i rslot bitcast long get g_rp_fnote 1
+  er_rp_eadd rslot t_er_fcl len t_er_fcl
+  ret 1
+end
+
+note writes replay slot rslot's failure message (no newline) to the open ob stream
+fn er_rp_err_ob rslot ulong to void
+  base = mul rslot 160
+  n = get g_rp_elen rslot
+  for i ulong n
+    ob_c get g_rp_err add base i
+  end
+end
+
 fn er_replay_prior_kf model_id ulong r f64 z f64 to long
   x0 = new f64 8 0.0
   P0 = new f64 64 0.0
@@ -2471,7 +2869,9 @@ fn er_replay_prior_kf model_id ulong r f64 z f64 to long
   if eq model_id 1
     put P0 3 f64 1.0e6
   end
-  if ne est_kf_prior view mdl view x0 view P0 0 bel EST_OK
+  sp = est_kf_prior view mdl view x0 view P0 0 bel
+  if ne sp EST_OK
+    er_rp_note 3 sp
     ret 1
   end
   for i ulong 96
@@ -2505,7 +2905,9 @@ fn er_replay_prior rslot ulong li ulong model_id ulong r f64 z f64 wall long to 
   put g_rps_z idx z
   er_put_step_dig idx 0 view ev
   er_store_post idx view bel
-  if ne est_digest_belief view bel bd EST_OK
+  sb = est_digest_belief view bel bd
+  if ne sb EST_OK
+    er_rp_note 4 sb
     ret 1
   end
   er_put_step_dig idx 4 view bd
@@ -2524,10 +2926,14 @@ fn er_replay_pred_step idx ulong h ulong to long
   for i ulong 96
     put bel i get g_rp_cur_bel i
   end
-  if ne est_kf_predict view mdl view bel 0 view bu h pred EST_OK
+  sp = est_kf_predict view mdl view bel 0 view bu h pred
+  if ne sp EST_OK
+    er_rp_note 5 sp
     ret 1
   end
-  if ne est_digest_prediction view pred pd EST_OK
+  sd = est_digest_prediction view pred pd
+  if ne sd EST_OK
+    er_rp_note 6 sd
     ret 1
   end
   for i ulong 176
@@ -2555,7 +2961,9 @@ fn er_replay_coast_step idx ulong to long
   for i ulong 176
     put pred i get g_rp_cur_pred i
   end
-  if ne est_kf_coast view mdl view pred view bel post EST_OK
+  sc = est_kf_coast view mdl view pred view bel post
+  if ne sc EST_OK
+    er_rp_note 7 sc
     ret 1
   end
   for i ulong 96
@@ -2621,7 +3029,9 @@ fn er_replay_kf_upd o view ulong 96 iv edit ulong 96 to long
   for i ulong 176
     put pred i get g_rp_cur_pred i
   end
-  if ne est_kf_update view mdl view bel view pred o post iv EST_OK
+  su = est_kf_update view mdl view bel view pred o post iv
+  if ne su EST_OK
+    er_rp_note 8 su
     ret 1
   end
   for i ulong 96
@@ -2641,7 +3051,12 @@ fn er_replay_obs_step idx ulong li ulong z f64 r f64 to long
   end
   s1 = est_digest_observation view o od
   s2 = est_digest_innovation view iv id
-  if or ne s1 EST_OK ne s2 EST_OK
+  if ne s1 EST_OK
+    er_rp_note 9 s1
+    ret 1
+  end
+  if ne s2 EST_OK
+    er_rp_note 9 s2
     ret 1
   end
   er_put_step_dig idx 1 view od
@@ -2665,7 +3080,9 @@ fn er_replay_finish_post idx ulong to long
     put g_rp_cur_bel i v
   end
   er_store_post idx view post
-  if ne est_digest_belief view post bd EST_OK
+  sb = est_digest_belief view post bd
+  if ne sb EST_OK
+    er_rp_note 4 sb
     ret 1
   end
   er_put_step_dig idx 4 view bd
@@ -2744,12 +3161,13 @@ fn er_replay_init_model fslot ulong limit ulong model_id ulong q f64 r f64 rslot
   end
   put g_rp_meta add mbase 1 nl
   if ne est_make_model model_id q r mdl 0
-    put g_rp_meta add mbase 10 1
-    ret 1
+    er_rp_note 1 EST_ERR_MODEL
+    ret er_rp_fail rslot 0
   end
-  if ne est_digest_model view mdl md EST_OK
-    put g_rp_meta add mbase 10 1
-    ret 1
+  sd = est_digest_model view mdl md
+  if ne sd EST_OK
+    er_rp_note 2 sd
+    ret er_rp_fail rslot 0
   end
   er_replay_store_mdl rslot view mdl view md
   ret 0
@@ -2817,8 +3235,8 @@ fn er_replay_exec_step rslot ulong li ulong h ulong flags ulong zv f64 r f64 to 
   mbase = mul rslot 16
   si = get g_rp_meta mbase
   if ge si RP_MAX_STEPS
-    put g_rp_meta add mbase 10 1
-    ret 1
+    er_rp_note 11 EST_OK
+    ret er_rp_fail rslot li
   end
   idx = add mul rslot RP_MAX_STEPS si
   er_step_clear idx
@@ -2830,24 +3248,20 @@ fn er_replay_exec_step rslot ulong li ulong h ulong flags ulong zv f64 r f64 to 
   end
   er_put_step_dig idx 0 view ev
   if ne er_replay_pred_step idx h 0
-    put g_rp_meta add mbase 10 1
-    ret 1
+    ret er_rp_fail rslot li
   end
   if eq and flags 2 0
     er_meta_inc rslot 3
     if ne er_replay_coast_step idx 0
-      put g_rp_meta add mbase 10 1
-      ret 1
+      ret er_rp_fail rslot li
     end
   else
     if ne er_replay_obs_step idx li zv r 0
-      put g_rp_meta add mbase 10 1
-      ret 1
+      ret er_rp_fail rslot li
     end
   end
   if ne er_replay_finish_post idx 0
-    put g_rp_meta add mbase 10 1
-    ret 1
+    ret er_rp_fail rslot li
   end
   ret 0
 end
@@ -2883,8 +3297,7 @@ fn er_replay_line fslot ulong rslot ulong model_id ulong r f64 li ulong st edit 
       ret 0
     end
     if ne er_replay_prior rslot li model_id r get zo 0 get wo 0 0
-      put g_rp_meta add mul rslot 16 10 1
-      ret 1
+      ret er_rp_fail rslot li
     end
     put st 0 1
     put st 1 long li
@@ -2913,8 +3326,8 @@ fn est_replay_run fslot ulong limit ulong model_id ulong q f64 r f64 rslot ulong
     end
   end
   if eq get st 0 0
-    put g_rp_meta add mul rslot 16 10 1
-    ret 1
+    er_rp_note 10 EST_OK
+    ret er_rp_fail rslot 0
   end
   ret 0
 end
