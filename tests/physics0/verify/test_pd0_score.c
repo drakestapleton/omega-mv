@@ -50,6 +50,9 @@ int main(void)
         truth_oracle_rel(&w, &rel); { uint8_t ex[16] = { 1, 0, 0 }; pd0_mut_scale_coef(&rel, 1, ex, 110, 100); } pd0_score(&P, &rel, 0, pd0_rel_rollout_fn, pd0_rel_predict_fn, &rel, eps, 20, fit, nf, &R); receipt("score-M1", &rel, &R); CHECK(HAS(R, PD0V_SCORE_CONSTANT_OFF));
         /* M2: padded with 5 tiny terms */
         truth_oracle_rel(&w, &rel); pd0_mut_pad(&rel, 5, 1); pd0_score(&P, &rel, 0, pd0_rel_rollout_fn, pd0_rel_predict_fn, &rel, eps, 20, fit, nf, &R); receipt("score-M2", &rel, &R); CHECK(HAS(R, PD0V_SCORE_SIZE) && !HAS(R, PD0V_SCORE_SUPPORT_MISSING));
+        /* size exactly at the bound is accepted; one term over it is refused (the 6.3 size boundary) */
+        truth_oracle_rel(&w, &rel); pd0_mut_pad(&rel, 2, 1); pd0_score(&P, &rel, 0, pd0_rel_rollout_fn, pd0_rel_predict_fn, &rel, eps, 20, fit, nf, &R); CHECK(R.size == P.size_bound && !HAS(R, PD0V_SCORE_SIZE));
+        truth_oracle_rel(&w, &rel); pd0_mut_pad(&rel, 3, 1); pd0_score(&P, &rel, 0, pd0_rel_rollout_fn, pd0_rel_predict_fn, &rel, eps, 20, fit, nf, &R); CHECK(R.size == P.size_bound + 1 && HAS(R, PD0V_SCORE_SIZE));
         /* M3: memoriser (training-transition lookup table) */
         { pd0_memoriser m = { fit, nf, 2 }; pd0_rel empty; memset(&empty, 0, sizeof empty); empty.n_vars = 2; empty.n_channels = 1; pd0_score(&P, &empty, pd0_memoriser_stored_numbers(&m), pd0_memoriser_rollout, pd0_memoriser_predict, &m, eps, 20, fit, nf, &R); receipt("score-M3", &empty, &R);
           CHECK(HAS(R, PD0V_SCORE_SIZE) && HAS(R, PD0V_SCORE_SUPPORT_MISSING) && HAS(R, PD0V_SCORE_EXTRAP_NRMSE)); }
