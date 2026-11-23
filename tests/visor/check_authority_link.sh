@@ -33,6 +33,28 @@
 #     an authority operation), and no identifier may contain `authorized` (the
 #     Visor holds no authorization state). In string literals an `authorized`
 #     key may only be followed by false.
+#     Host words: an ALLOWLIST. The host words are derived from the compiler's own
+#     keyword table, seed/omc/genkw.awk, as seed/effects/check.sh derives them
+#     (every keyword with code >= 100 except the non-host const, qty, fma, cpufence
+#     and cpurelax, plus read and write). A code line may use only these host words,
+#     the ones the omega sources use today (derived by scanning them, 2026-11-23):
+#       read     stdin session lines (visor_console) and bytes of files opened read-only
+#       write    stdout/stderr renderings (visor.om ob_write_fd/v_write_all, visor_console,
+#                tools/omega.om); it writes only to descriptors the parent passed in, as no
+#                allowed word creates a writable descriptor
+#       fopen    open for reading only: the flags must be the literal 0 (O_RDONLY) or
+#                16384 (O_RDONLY|O_DIRECTORY), checked below
+#       fclose   close those read-only descriptors
+#       stat     size and type of a file or directory before reading it
+#       lstat    the evidence explorer refuses symbolic links (visor_evidence)
+#       getdnts  list a directory opened read-only (the evidence explorer)
+#       argcnt   the command-line argument count (tools/omega.om)
+#       argread  a command-line argument (tools/omega.om)
+#     Any other host word fails (process, socket, mapping, device, file-system change,
+#     descriptor duplication, environment, timing, ...). An allowlisted word that no
+#     scanned source uses any more also fails, so the list stays what omega uses.
+#     Residual (not claimed): write on a descriptor the parent left open is not
+#     restricted further; the Visor cannot open, duplicate or create one.
 #  A bite control runs every time: each forbidden form is planted in a copy of
 #  a shipped source and the OM scan must fail on it; a planted note line and
 #  string literal must not trip it. A control that does not bite fails the check.
@@ -112,22 +134,29 @@ fi
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/visor-auth.XXXXXX") || { echo "FAIL: mktemp"; exit 1; }
 trap 'rm -rf "$TMPD"' EXIT INT TERM
 printf '%s\n' $forbidden > "$TMPD/forbidden"
+# Host words, from the compiler's keyword table (the derivation seed/effects/check.sh uses).
+GENKW="$ROOT/seed/omc/genkw.awk"
+[ -f "$GENKW" ] || { echo "FAIL: missing $GENKW (the compiler keyword table)"; exit 1; }
+{ grep 'split("[a-z]' "$GENKW" | grep -oE '[a-z0-9]+:[0-9]+' \
+    | awk -F: '$2 >= 100 && $1 != "const" && $1 != "qty" && $1 != "cpufence" && $1 != "cpurelax" && $1 != "fma" { print $1 }'
+  printf '%s\n' read write; } | sort -u > "$TMPD/host"
+nhost=$(grep -c . "$TMPD/host")
+[ "$nhost" -ge 100 ] || { echo "FAIL: only $nhost host words derived from $GENKW (expected >= 100)"; exit 1; }
+for w in fopen fork socknew mapnew execprog read write; do
+    grep -qx "$w" "$TMPD/host" || { echo "FAIL: host word $w not derived from $GENKW"; exit 1; }
+done
+ALLOW="read write fopen fclose stat lstat getdnts argcnt argread"
+printf '%s\n' $ALLOW > "$TMPD/allow"
+: > "$TMPD/used"
 
 # om_scan file...: prints one line per hit, exits 1 on any hit. Note lines are
 # skipped; string literals are checked for an `authorized` key with a value
 # other than false, then blanked before the identifiers are checked.
 om_scan() {
-    awk -v flist="$TMPD/forbidden" '
+    awk -v flist="$TMPD/forbidden" -v hlist="$TMPD/host" -v alist="$TMPD/allow" -v used="${OM_SCAN_USED:-/dev/null}" '
     BEGIN { while ((getline l < flist) > 0) F[l] = 1; bad = 0
-            # OM-2 host words (seed/ng/hostwords.tsv) that start processes, open sockets,
-            # map memory or devices, or change the file system. omega needs none of them.
-            nh = split("fork execprog execpure execenv killpid waitpid setsid setpgid " \
-                       "socknew listen accept connect bind send recv sendmsg sockopt shutdown " \
-                       "devctl devcall uvmctl vfioctl vfiomap vfiomapw vfioirq mapnew mapdrop " \
-                       "mapwrite mapbind maphold mapset memfd prlimit setprio cpuset " \
-                       "chown chmod fchmod link symlnk unlink renames rmdir makedir truncate " \
-                       "ftrunc pwrite flock", hw, " ")
-            for (k = 1; k <= nh; k++) H[hw[k]] = 1 }
+            while ((getline l < hlist) > 0) H[l] = 1
+            while ((getline l < alist) > 0) A[l] = 1 }
     function hit(msg) { print "FAIL: " FILENAME ":" FNR ": " msg ": " $0; bad = 1 }
     /^[[:space:]]*note([[:space:]]|$)/ { next }
     {
@@ -148,7 +177,10 @@ om_scan() {
             if (w[i] in F) hit("names forbidden authority symbol " w[i])
             else if (w[i] ~ /^(rx_|aienos_cap_|rc_)/) hit("names runtime/authority symbol " w[i])
             if (w[i] ~ /authorized/) hit("identifier " w[i] " holds authorization state")
-            if (w[i] in H) hit("uses OM-2 host word " w[i] ", which can reach authority without naming it")
+            if (w[i] in H) {
+                if (!(w[i] in A)) hit("uses OM-2 host word " w[i] ", which is not on the allowlist of host words omega uses")
+                else print w[i] > used
+            }
             if (w[i] == "fopen") {
                 # fopen path off len flags mode: only literal read-only flags (0, O_DIRECTORY 16384)
                 if (!(i + 4 <= n && (w[i + 4] == "0" || w[i + 4] == "16384")))
@@ -175,7 +207,10 @@ if [ "$nom" -eq 0 ] || [ ! -e "$ROOT/tools/omega.om" ] || [ ! -e "$ROOT/tools/om
     echo "FAIL: the OM-2 sources of the omega binary were not found under $ROOT"; fail=1
 fi
 # shellcheck disable=SC2086
-om_scan $om_files || { echo "FAIL: an OM-2 source of the omega binary names an authority operation"; fail=1; }
+OM_SCAN_USED="$TMPD/used" om_scan $om_files || { echo "FAIL: an OM-2 source of the omega binary names an authority operation"; fail=1; }
+for w in $ALLOW; do
+    grep -qx "$w" "$TMPD/used" || { echo "FAIL: allowlisted host word $w is used by no scanned source; remove it from the allowlist"; fail=1; }
+done
 
 # Bite control: plant each forbidden form in a copy of a shipped source; the scan
 # must fail on every one, and must stay clean on the unplanted copy and on a copy
@@ -207,18 +242,27 @@ bite "program exec" '  r = execprog verq_bad 0 0'
 bite "socket" '  s = socknew 2 1 0'
 bite "device control" '  devctl 3 0 0'
 bite "file system change" '  unlink verq_bad 0 0'
+bite "descriptor duplication (not on the allowlist)" '  fd = dupfd 1 9 0'
+bite "pipe (not on the allowlist)" '  r = pipefds verq_bad'
+bite "event descriptor (not on the allowlist)" '  fd = eventfd 0 0'
+bite "working directory change (not on the allowlist)" '  r = chdir verq_bad 0 0'
+bite "umask (not on the allowlist)" '  r = umask 0'
+bite "map read (not on the allowlist)" '  r = mapread 0 verq_bad 0 0'
+bite "kfd control (in the compiler table, not in seed/ng/hostwords.tsv)" '  r = kfdctl 0 0 0'
+bite "environment read (not on the allowlist)" '  r = envread 0 verq_bad 0 0'
 bite "fopen for writing" '  fd = fopen verq_bad 0 8 577 420'
 bite "fopen with computed flags" '  fd = fopen verq_bad 0 8 get verq_fl 0 0'
 cp "$BASE" "$TMPD/plant.om"
 printf '%s\n' 'note rx_capadmin_mint authorized aienos_cap_mint fork socknew' \
-    'text verq_ok "rx_capadmin_mint \",\"authorized\":false fork execprog"' \
-    '  fd = fopen verq_ok 0 8 0 0' '  fd = fopen verq_ok 0 8 16384 0' >> "$TMPD/plant.om"
+    'text verq_ok "rx_capadmin_mint \",\"authorized\":false fork execprog dupfd umask"' \
+    '  fd = fopen verq_ok 0 8 0 0' '  fd = fopen verq_ok 0 8 16384 0' \
+    '  k = read 0 verq_ok 0 1' '  k = write 1 verq_ok 0 1' '  r = stat verq_ok 0 8 verq_ok 0 1' >> "$TMPD/plant.om"
 om_scan "$TMPD/plant.om" > /dev/null || { echo "FAIL: bite control false positive (a note line or a literal tripped the scan)"; fail=1; }
 
 if [ "$fail" -ne 0 ]; then
     echo "OMEGA_VISOR_AUTHORITY_ISOLATION_FAIL"
     exit 1
 fi
-echo "checked $nobj object(s) and $nom OM-2 source(s) against $(printf '%s\n' $forbidden | wc -l) forbidden symbols; $bites/$nbite bite controls caught"
+echo "checked $nobj object(s) and $nom OM-2 source(s) against $(printf '%s\n' $forbidden | wc -l) forbidden symbols and $nhost host words (allowlist: $ALLOW); $bites/$nbite bite controls caught"
 echo "OMEGA_VISOR_AUTHORITY_ISOLATION_PASS"
 exit 0
