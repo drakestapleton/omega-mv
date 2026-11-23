@@ -1,0 +1,126 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/physics0/planner/pd0p_bridge.om: test-only bridge between the planner (verifier formats, vr_/ve_
+note slots of pd0_fmt.om) and the PD-0 world (substrate formats, pd0_world.om). Pure OM-2 port of
+note pd0p_bridge.c. It links the generator on purpose: it is the HARNESS side of the efficiency comparison
+note and never part of the planner's own sources (p0p-purity in mk/physics0-planner.mk checks both halves).
+note The world state is the caller's (Pd0World, Pd0Desc, Pd0Gen); the C pb_world wrapped the same state.
+
+const PB_SUB_SLOT ulong 0
+
+fn pb_term_ex vx ulong sx ulong nv ulong nc ulong to void
+for k ulong 16
+put vr_ex add vx k uchar 0
+end
+for v ulong nv bound 6
+put vr_ex add vx v get p0r_ex add sx v
+end
+for c ulong nc bound 2
+put vr_ex add vx add nv c get p0r_ex add sx add PD0_MAX_VARS c
+end
+ret
+end
+
+note one true-relation term into the verifier layout: variables 0..n_vars-1, channel c at index n_vars + c
+fn pb_term vslot ulong e ulong t ulong nv ulong nc ulong to void
+sti = p0r_term_idx PB_SUB_SLOT e t
+vti = vr_term_idx vslot e t
+put vr_coef vti get p0r_coef sti
+pb_term_ex mul vti V_MAX_EX mul sti PD0_MAX_EX nv nc
+ret
+end
+
+note the substrate relation in PB_SUB_SLOT copied into verifier relation slot vslot (C pb_open + rel_from_pb)
+fn pb_rel_to_vr vslot ulong to void
+vr_clear vslot
+nv = ulong get p0r_nvars PB_SUB_SLOT
+nc = ulong get p0r_nch PB_SUB_SLOT
+ne_cnt = ulong get p0r_neq PB_SUB_SLOT
+put vr_nvars vslot uchar nv
+put vr_nlat vslot get p0r_nlat PB_SUB_SLOT
+put vr_nch vslot uchar nc
+put vr_neq vslot uchar ne_cnt
+for e ulong ne_cnt bound 6
+put vr_eq_tgt vr_eq_idx vslot e get p0r_eq_tgt p0r_eq_idx PB_SUB_SLOT e
+nt = ulong get p0r_eq_nt p0r_eq_idx PB_SUB_SLOT e
+put vr_eq_nt vr_eq_idx vslot e ushort nt
+for t ulong nt bound 12
+pb_term vslot e t nv nc
+end
+end
+put vr_dbits vslot vr_rel_bits vslot
+ret
+end
+
+note Open an in-process world for (level 1..6, seed): the caller's structs hold it, d holds the describe
+note bounds, vslot the true relation in the verifier's exponent layout. 0 ok, -1 on error.
+fn pb_open w edit Pd0World d edit Pd0Desc g edit Pd0Gen level int seed ulong vslot ulong to int
+if ne pd0_world_init w d g level seed 0
+ret -1
+end
+if ne pd0_gen_true_relation g get d dt_micro PB_SUB_SLOT 0
+ret -1
+end
+pb_rel_to_vr vslot
+ret 0
+end
+
+fn pb_status_stop st uchar to bool
+if eq st PD0_REFUSED_RANGE
+ret true
+end
+ret eq st PD0_BUDGET_EXHAUSTED
+end
+
+fn pb_store_after obs edit long 160 s ulong no ulong r view Pd0Rec to void
+for i ulong no bound 4
+put obs add mul s ulong 8 i get r after i
+end
+ret
+end
+
+note one step s of the schedule in ve_ slot eslot; the record lands in r
+fn pb_step1 w edit Pd0World d view Pd0Desc g view Pd0Gen eslot ulong s ulong r edit Pd0Rec to void
+i = add mul eslot V_MAX_STEPS s
+pd0_world_step w d g get ve_step_ch i get ve_step_val i r
+ret
+end
+
+fn pb_reset w edit Pd0World d view Pd0Desc g view Pd0Gen eslot ulong r edit Pd0Rec to void
+vals = new long 4 0
+no = ulong get ve_nobs eslot
+for i ulong no bound 4
+put vals i get ve_reset add mul eslot V_MAX_OBS i
+end
+pd0_world_reset w d g view vals uchar no r
+ret
+end
+
+note Run the schedule in ve_ slot eslot: reset then n_steps steps. obs[s*8 + i] is the observed state after
+note step s. Returns the number of OK steps (fewer than n_steps when the episode ended early), or -1 on a
+note refused reset or budget exhaustion before any OK step.
+fn pb_run w edit Pd0World d view Pd0Desc g view Pd0Gen eslot ulong obs edit long 160 to int
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+pb_reset w d g eslot edit r
+if ne get r status PD0_OK
+ret -1
+end
+ok = int 0
+for st ulong ulong get ve_nsteps eslot bound 20
+pb_step1 w d g eslot st edit r
+if pb_status_stop get r status
+if gt ok int 0
+ret ok
+end
+ret -1
+end
+if eq get r status PD0_OUT_OF_BOUNDS
+ret ok
+end
+pb_store_after obs st ulong get ve_nobs eslot view r
+ok = add ok int 1
+if eq get r status PD0_EPISODE_END
+break
+end
+end
+ret ok
+end

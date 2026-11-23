@@ -1,0 +1,357 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/physics0/planner/pd0p_eff_lib.om: shared pieces of the planner efficiency comparisons
+note (pd0_plan_eff.om, pd0_plan_eff2.om): printf-exact fixed-point formatting of micro values, padded
+note integers and strings, the pooled-error accumulators (f64, as the C acc), the rollout of a relation along
+note a ve_ schedule, the receipt opened with O_EXCL, and the argument reader.
+
+note ---- accumulators: 3 of them (0 truth, 1 and 2 the rivals), 8 observed variables each ----
+global ea_se f64 24
+global ea_ss f64 24
+global ea_mean f64 24
+global ea_n ulong 3
+
+note ---- rollouts: [which 3][step 20][obs 8]; observations [step 20][obs 8] ----
+global ep_pred long 480
+global ep_obs long 160
+
+global eo_buf uchar 65536
+global eo_len ulong 1
+
+text EL_EXISTS "receipt exists or cannot be created: "
+text EL_EEXIST " (File exists)\n"
+text EL_EOTHER " (open failed)\n"
+text EL_UNKNOWN "unknown"
+text EL_BAR " | "
+text EL_LP " ("
+text EL_RPBAR ") | "
+text EL_SLASH " / "
+text EL_COMMANL ",\n"
+text EL_CS ", "
+
+fn el_acc_clear a ulong to void
+for i ulong 8
+put ea_se add mul a ulong 8 i 0.0f64
+put ea_ss add mul a ulong 8 i 0.0f64
+put ea_mean add mul a ulong 8 i 0.0f64
+end
+put ea_n a ulong 0
+ret
+end
+
+note C acc_add for variable i: d = (pred - obs) / 1e6, o = obs / 1e6; se += d*d, ss += o*o, mean += o
+fn el_acc_add1 a ulong i ulong w ulong s ulong to void
+pr = get ep_pred add add mul w ulong 160 mul s ulong 8 i
+o = get ep_obs add mul s ulong 8 i
+d = div f64 sub pr o 1000000.0f64
+x = div f64 o 1000000.0f64
+k = add mul a ulong 8 i
+put ea_se k add get ea_se k mul d d
+put ea_ss k add get ea_ss k mul x x
+put ea_mean k add get ea_mean k x
+ret
+end
+
+note C acc_add: one pooled step (pred from ep_pred[w], obs step s)
+fn el_acc_add a ulong no ulong w ulong s ulong to void
+for i ulong no bound 8
+el_acc_add1 a i w s
+end
+put ea_n a add get ea_n a ulong 1
+ret
+end
+
+note C acc_nrmse for one variable: sd > 1e-9 ? rmse / sd : (rmse > 1e-9 ? 1e9 : 0)
+fn el_nrmse_var a ulong i ulong to f64
+n = f64 get ea_n a
+k = add mul a ulong 8 i
+m = div get ea_mean k n
+var = sub div get ea_ss k n mul m m
+sd = 0.0f64
+if gt var 0.0f64
+sd = fsqrt var
+end
+rmse = fsqrt div get ea_se k n
+if gt sd 0.000000001f64
+ret div rmse sd
+end
+if gt rmse 0.000000001f64
+ret 1000000000.0f64
+end
+ret 0.0f64
+end
+
+note worst variable; 0 below min_pooled pooled steps
+fn el_nrmse a ulong no ulong min_pooled ulong to f64
+worst = 0.0f64
+if lt get ea_n a min_pooled
+ret worst
+end
+for i ulong no bound 8
+v = el_nrmse_var a i
+if gt v worst
+worst = v
+end
+end
+ret worst
+end
+
+note C acc_nrmse_box: RMSE over the box scale (uniform spread of the declared reset box)
+fn el_nrmse_box a ulong no ulong box view f64 8 to f64
+worst = 0.0f64
+if lt get ea_n a ulong 2
+ret worst
+end
+n = f64 get ea_n a
+for i ulong no bound 8
+v = div fsqrt div get ea_se add mul a ulong 8 i n get box i
+if gt v worst
+worst = v
+end
+end
+ret worst
+end
+
+note C rollout: relation rel along schedule eslot for n_ok steps into ep_pred[w]; state starts at the resets
+fn el_rollout rel ulong eslot ulong n_ok ulong w ulong to void
+st = new long 12 0
+nx = new long 12 0
+no = ulong get ve_nobs eslot
+for i ulong no bound 8
+put st i get ve_reset add mul eslot V_MAX_OBS i
+end
+sb = mul eslot V_MAX_STEPS
+for s ulong n_ok bound 20
+vr_rel_step rel view st get ve_step_ch add sb s get ve_step_val add sb s edit nx
+el_store_pred w s no view nx
+for j ulong 12
+put st j get nx j
+end
+end
+ret
+end
+
+fn el_store_pred w ulong s ulong no ulong nx view long 12 to void
+pb = add mul w ulong 160 mul s ulong 8
+for i ulong no bound 8
+put ep_pred add pb i get nx i
+end
+ret
+end
+
+fn el_obs_clear to void
+for k ulong 160
+put ep_obs k long 0
+end
+ret
+end
+
+fn el_abs x long to long
+if lt x long 0
+ret neg x
+end
+ret x
+end
+
+note ---- printf-exact formatting ----
+
+fn el_pow10 n ulong to ulong
+p = ulong 1
+for i ulong n bound 20
+p = mul p ulong 10
+end
+ret p
+end
+
+note sign of fl(a / 1e6) * 1e6 - a, exactly (Dekker product, no fma): 1 above, -1 below, 0 equal
+fn el_dir a ulong to int
+x = div f64 a 1000000.0f64
+c = mul 134217729.0f64 x
+xh = sub c sub c x
+xl = sub x xh
+p = mul x 1000000.0f64
+err = add sub mul xh 1000000.0f64 p mul xl 1000000.0f64
+s1 = sub p f64 a
+if gt s1 neg err
+ret 1
+end
+if lt s1 neg err
+ret -1
+end
+ret 0
+end
+
+note |v| / 1e6 rounded to dec digits the way printf rounds the double (double)v / 1e6: the exact binary
+note value decides; a decimal tie that is exact in binary (|v| a multiple of 15625) rounds half to even
+fn el_round_micro a ulong dec ulong to ulong
+unit = el_pow10 sub ulong 6 dec
+q = div a unit
+r = rem a unit
+half = div unit ulong 2
+if gt r half
+ret add q ulong 1
+end
+if lt r half
+ret q
+end
+if eq rem a ulong 15625 ulong 0
+if ne and q ulong 1 ulong 0
+ret add q ulong 1
+end
+ret q
+end
+if gt el_dir a 0
+ret add q ulong 1
+end
+ret q
+end
+
+fn el_pad dst edit uchar * pos ulong cap ulong n ulong width ulong to ulong
+p = pos
+if lt n width
+for i ulong sub width n bound 64
+p = pd0_buf_ch dst p cap uchar 32
+end
+end
+ret p
+end
+
+note the dec-digit fraction fr, zero padded
+fn el_frac_digits tmp edit uchar 48 t ulong fr ulong dec ulong to ulong
+p = t
+for k ulong dec bound 6
+dv = el_pow10 sub sub dec k ulong 1
+dg = rem div fr dv ulong 10
+p = pd0_buf_ch tmp p ulong 48 uchar add ulong 48 dg
+end
+ret p
+end
+
+fn el_copy_out dst edit uchar * pos ulong tmp view uchar 48 t ulong width ulong to ulong
+p = el_pad dst pos len dst t width
+for k ulong t bound 48
+p = pd0_buf_ch dst p len dst get tmp k
+end
+ret p
+end
+
+note printf("%<width>.<dec>f", (double)v / 1e6)
+fn el_fixed dst edit uchar * pos ulong v long dec ulong width ulong to ulong
+tmp = new uchar 48 0
+t = ulong 0
+if lt v long 0
+t = pd0_buf_ch edit tmp t ulong 48 uchar 45
+end
+q = el_round_micro pd0_abs_u64 v dec
+pw = el_pow10 dec
+t = pd0_buf_u64 edit tmp t ulong 48 div q pw
+t = pd0_buf_ch edit tmp t ulong 48 uchar 46
+t = el_frac_digits edit tmp t rem q pw dec
+ret el_copy_out dst pos view tmp t width
+end
+
+note printf("%<width>d") of a signed value
+fn el_int dst edit uchar * pos ulong v long width ulong to ulong
+cap = len dst
+tmp = new uchar 32 0
+t = pd0_buf_i64 edit tmp ulong 0 ulong 32 v
+p = el_pad dst pos cap t width
+for k ulong t bound 32
+p = pd0_buf_ch dst p cap get tmp k
+end
+ret p
+end
+
+note printf("%-<width>s")
+fn el_str_left dst edit uchar * pos ulong s view uchar * width ulong to ulong
+cap = len dst
+p = pd0_buf_str dst pos cap s
+n = len s
+if lt n width
+for i ulong sub width n bound 64
+p = pd0_buf_ch dst p cap uchar 32
+end
+end
+ret p
+end
+
+note ---- receipt (O_EXCL, never overwrites) and stdout lines ----
+
+fn eo_str s view uchar * to void
+put eo_len 0 el_buf_str_g s
+ret
+end
+
+fn el_buf_str_g s view uchar * to ulong
+p = get eo_len 0
+n = len s
+for i ulong n bound 65536
+if lt p ulong 65536
+put eo_buf p get s i
+p = add p 1
+end
+end
+ret p
+end
+
+fn eo_bytes s view uchar * n ulong to void
+p = get eo_len 0
+for i ulong n bound 65536
+if lt p ulong 65536
+put eo_buf p get s i
+p = add p 1
+end
+end
+put eo_len 0 p
+ret
+end
+
+fn el_out_line b view uchar * n ulong to void
+pd0_put_bytes 1 b n
+ret
+end
+
+note argument i into dst (NUL not included); returns its length, 0 when absent
+fn el_arg i ulong dst edit uchar 512 to ulong
+if le argcnt long i
+ret ulong 0
+end
+n = argread i dst 0 512
+if le n long 0
+ret ulong 0
+end
+ret ulong n
+end
+
+note open the receipt path with O_WRONLY|O_CREAT|O_EXCL (193), mode 0644 (420); on failure a stderr line
+fn el_receipt_open path view uchar 512 n ulong to int
+fd = fopen path 0 n int 193 int 420
+if ge fd long 0
+ret int fd
+end
+b = new uchar 640 0
+p = pd0_buf_str edit b ulong 0 ulong 640 EL_EXISTS
+for i ulong n bound 512
+p = pd0_buf_ch edit b p ulong 640 get path i
+end
+if eq fd long -17
+p = pd0_buf_str edit b p ulong 640 EL_EEXIST
+else
+p = pd0_buf_str edit b p ulong 640 EL_EOTHER
+end
+pd0_put_bytes 2 view b p
+ret -1
+end
+
+fn el_receipt_flush fd int to int
+n = get eo_len 0
+b = new uchar 65536 0
+for i ulong n bound 65536
+put b i get eo_buf i
+end
+w = write fd b 0 n
+c = fclose fd
+if ne w long n
+ret 1
+end
+ret 0
+end

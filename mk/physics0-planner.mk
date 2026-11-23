@@ -1,58 +1,46 @@
 # PD-0 experiment planner (Direction 5): contract tests, purity check, passive baseline
 # and the information-efficiency comparison (development evidence, not EXP-003).
+# Pure OM-2 (wave 36b): the planner, its contract tests, the test-only world bridge and both
+# efficiency comparisons are built from .om by the seed omc. OM-2 arrays are bounds checked
+# (an out-of-range get or put traps), the check the C build's ASan/UBSan run gave.
 ifndef PHYSICS0_PLANNER_MK
 PHYSICS0_PLANNER_MK := 1
 .PHONY: test-physics0-planner p0p-purity physics0-planner-eff physics0-planner-eff2
 
 P0P_COMMIT := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
-# -Wno-pedantic: generated binding src/omega_om_units.c uses GNU range designators; see mk/estimation.mk.
-P0P_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -ffp-contract=off -fno-fast-math \
-  -Isrc -Isrc/physics0/ladder -Isrc/physics0/planner -Itests/physics0/planner -Wno-pedantic
-P0P_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-# planner objects: verifier formats only, no generator, no world
-P0P_SRCS = src/physics0/planner/pd0_planner.c src/physics0/ladder/pd0_fmt.c src/omega_om_units.c
-P0P_HDRS = src/physics0/planner/pd0_planner.h src/physics0/ladder/pd0_fmt.h src/physics0/ladder/pd0_rng.h
-# bridge object: substrate formats, links the generator on purpose (harness side)
-# -Wno-pedantic: generated binding src/omega_om_units.c uses GNU range designators; see mk/estimation.mk.
-P0P_BRIDGE_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -Itests/physics0/planner -Wno-pedantic
-P0P_BRIDGE_SRCS = tests/physics0/planner/pd0p_bridge.c src/physics0/pd0_gen.c src/physics0/pd0_world.c src/physics0/pd0_guard.c \
-  src/physics0/pd0_wire.c src/physics0/pd0_rng.c src/physics0/pd0_relation.c src/physics0/pd0_chan.c
+P0P_OMC ?= seed/out/omc
 P0P_DIR = $(OUT_DIR)/tests-physics0-planner
+# planner units: verifier formats only, no generator, no world. pd0_planner_types.om comes first
+# (an OM-2 struct is declared before the program's first fn).
+P0P_OM_LIB = src/physics0/planner/pd0_planner_types.om src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_wire.om \
+  src/physics0/ladder/pd0_codes.om src/physics0/ladder/pd0_fmt.om src/physics0/planner/pd0_planner.om
+# bridge side: substrate formats, links the generator on purpose (harness side, never a planner unit)
+P0P_OM_WORLD = src/physics0/pd0_chan.om src/physics0/pd0_relation.om src/physics0/pd0_world.om tests/physics0/planner/pd0p_bridge.om
+P0P_OM_TEST = $(P0P_OM_LIB) tests/physics0/planner/test_pd0_planner.om
+P0P_OM_EFF = $(P0P_OM_LIB) $(P0P_OM_WORLD) tests/physics0/planner/pd0p_eff_lib.om tests/physics0/planner/pd0_plan_eff.om
+P0P_OM_EFF2 = $(P0P_OM_LIB) $(P0P_OM_WORLD) tests/physics0/planner/pd0p_eff_lib.om tests/physics0/planner/pd0_plan_eff2.om
 P0P_FORBIDDEN = 'pd0_gen|pd0_world|oracle|truth_|forge_|argus_|mmap|fork|exec|socket'
+# OM host words a planner unit must not use (process, socket, map, device, file open/remove, environment)
+P0P_OM_HOST = 'fork|execprog|execpure|socknew|connect|bind|listen|accept|mapnew|mapbind|fopen|unlink|devctl|devcall|pipefds|killpid|envread|getenv'
 
-$(P0P_DIR)/test_pd0_planner: tests/physics0/planner/test_pd0_planner.c $(P0P_SRCS) $(P0P_HDRS)
+$(P0P_DIR)/test_pd0_planner: $(P0P_OM_TEST) $(P0P_OMC)
 	@mkdir -p $(P0P_DIR)
-	$(CC) $(P0P_CFLAGS) -o $@ $< $(P0P_SRCS) -lm
-$(P0P_DIR)/test_pd0_planner_asan: tests/physics0/planner/test_pd0_planner.c $(P0P_SRCS) $(P0P_HDRS)
+	{ echo "om2"; cat $(P0P_OM_TEST); } | $(P0P_OMC) > $@ && chmod +x $@
+$(P0P_DIR)/pd0_plan_eff: $(P0P_OM_EFF) $(P0P_OMC)
 	@mkdir -p $(P0P_DIR)
-	$(CC) $(P0P_CFLAGS) $(P0P_ASAN) -o $@ $< $(P0P_SRCS) -lm
+	{ echo "om2"; cat $(P0P_OM_EFF); } | $(P0P_OMC) > $@ && chmod +x $@
+$(P0P_DIR)/pd0_plan_eff2: $(P0P_OM_EFF2) $(P0P_OMC)
+	@mkdir -p $(P0P_DIR)
+	{ echo "om2"; cat $(P0P_OM_EFF2); } | $(P0P_OMC) > $@ && chmod +x $@
 
-$(P0P_DIR)/bridge/%.o: tests/physics0/planner/%.c tests/physics0/planner/pd0p_bridge.h $(wildcard src/physics0/*.h)
-	@mkdir -p $(P0P_DIR)/bridge
-	$(CC) $(P0P_BRIDGE_CFLAGS) -c -o $@ $<
-$(P0P_DIR)/bridge/%.o: src/physics0/%.c $(wildcard src/physics0/*.h)
-	@mkdir -p $(P0P_DIR)/bridge
-	$(CC) $(P0P_BRIDGE_CFLAGS) -c -o $@ $<
-P0P_BRIDGE_OBJS = $(patsubst %.c,$(P0P_DIR)/bridge/%.o,$(notdir $(P0P_BRIDGE_SRCS)))
-
-# the substrate and the verifier both define the LE helpers and pd0_mul; the bridge side is merged into one
-# relocatable object and those seven symbols are renamed there so the two families link side by side
-P0P_CLASH = pd0_put_u16 pd0_put_u32 pd0_put_u64 pd0_get_u16 pd0_get_u32 pd0_get_u64 pd0_mul
-$(P0P_DIR)/bridge.o: $(P0P_BRIDGE_OBJS)
-	$(LD) -r -o $@ $(P0P_BRIDGE_OBJS)
-	objcopy $(foreach s,$(P0P_CLASH),--redefine-sym $(s)=pb_sub_$(s)) $@
-$(P0P_DIR)/pd0_plan_eff: tests/physics0/planner/pd0_plan_eff.c $(P0P_SRCS) $(P0P_HDRS) $(P0P_DIR)/bridge.o
-	@mkdir -p $(P0P_DIR)
-	$(CC) $(P0P_CFLAGS) -o $@ $< $(P0P_SRCS) $(P0P_DIR)/bridge.o -lm
-$(P0P_DIR)/pd0_plan_eff2: tests/physics0/planner/pd0_plan_eff2.c $(P0P_SRCS) $(P0P_HDRS) $(P0P_DIR)/bridge.o
-	@mkdir -p $(P0P_DIR)
-	$(CC) $(P0P_CFLAGS) -o $@ $< $(P0P_SRCS) $(P0P_DIR)/bridge.o -lm
-
+# purity: the planner units (code lines; notes excluded) carry no generator, world or authority name and
+# use no host process/socket/map/file word; both checks are shown to bite on the harness side
 p0p-purity:
-	@mkdir -p $(P0P_DIR)/purity
-	@$(CC) $(P0P_CFLAGS) -c -o $(P0P_DIR)/purity/pd0_planner.o src/physics0/planner/pd0_planner.c
-	@if nm $(P0P_DIR)/purity/pd0_planner.o | grep -E $(P0P_FORBIDDEN); then echo "planner object references generator, world or authority symbols"; exit 1; fi
-	@echo "p0p-purity: planner object carries no generator, world or authority symbol"
+	@if grep -hv '^[[:space:]]*note' $(P0P_OM_LIB) | grep -E $(P0P_FORBIDDEN); then echo "planner OM sources reference generator, world or authority names"; exit 1; fi
+	@if grep -hv '^[[:space:]]*note' $(P0P_OM_LIB) | grep -wE $(P0P_OM_HOST); then echo "planner OM sources use a process, socket, map or file host word"; exit 1; fi
+	@grep -hv '^[[:space:]]*note' tests/physics0/planner/pd0p_bridge.om | grep -qE $(P0P_FORBIDDEN) || { echo "p0p-purity: the name check does not bite (the bridge carries no world name)"; exit 1; }
+	@grep -hv '^[[:space:]]*note' tests/physics0/planner/pd0p_eff_lib.om | grep -qwE $(P0P_OM_HOST) || { echo "p0p-purity: the host-word check does not bite"; exit 1; }
+	@echo "p0p-purity: planner OM units carry no generator, world, authority or host I/O name (both checks bite on the harness side)"
 
 physics0-planner-eff: $(P0P_DIR)/pd0_plan_eff
 	@rm -f $(P0P_DIR)/pd0-planner-eff.json
@@ -64,8 +52,7 @@ physics0-planner-eff2: $(P0P_DIR)/pd0_plan_eff2
 	./$(P0P_DIR)/pd0_plan_eff2 $(P0P_DIR)/pd0-planner-eff2.json $(P0P_COMMIT) | tee $(P0P_DIR)/eff2.out | tail -6
 	@grep -q '^PD0_PLANNER_EFF2: PASS' $(P0P_DIR)/eff2.out
 
-test-physics0-planner: p0p-purity $(P0P_DIR)/test_pd0_planner $(P0P_DIR)/test_pd0_planner_asan physics0-planner-eff physics0-planner-eff2
+test-physics0-planner: p0p-purity $(P0P_DIR)/test_pd0_planner physics0-planner-eff physics0-planner-eff2
 	./$(P0P_DIR)/test_pd0_planner
-	./$(P0P_DIR)/test_pd0_planner_asan
-	@echo "test-physics0-planner: PD-0 planner contract (behaviours 1-6), mutants, passive baseline and efficiency comparison pass; receipt in $(P0P_DIR)/pd0-planner-eff.json"
+	@echo "test-physics0-planner: PD-0 planner contract (behaviours 1-6), mutants, passive baseline and efficiency comparison pass (pure OM-2); receipt in $(P0P_DIR)/pd0-planner-eff.json"
 endif
