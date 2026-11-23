@@ -76,10 +76,11 @@ the receipt. The neural sampler and checkpoints are needed only to regenerate
 the complete CLI comparison.
 
 ```sh
+E=train/omega-llm/tools/combined/experiment
 sh seed/omega-from-seed.sh
 A=$(mktemp -d)
 train/omega-llm/tools/combined/build.sh "$A/kit"
 "$E/build.sh" "$A/kit"
-python3 "$E/audit.py" evidence/OMEGALLM-SELECTION-20261123/comparison.*.json "$A/kit"
+python3 "$E/audit.py" evidence/OMEGALLM-SELECTION-20261123/comparison.*.json "$A/kit" --replay-selection --jobs 6
 python3 "$E/test_rewrites.py" "$A/kit"
 ```

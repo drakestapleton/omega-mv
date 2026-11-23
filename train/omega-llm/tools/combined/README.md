@@ -40,3 +40,15 @@ for p in "$d/prompts"/prompt-*; do
 done
 "$d/bench" score "$b/tasks.om" "$b/expect.txt" "$KIT/omc" "$d/answers"
 ```
+
+## Checked verifier and eight-query experiment
+
+The checked verifier recognizes parameters, assigned locals and loop variables.
+Renamed locals go through the same arithmetic instructions, seeded compiler and
+`execpure` checks. On Spark, the correction raised the checked historical score
+from 99 to 105 out of 165. Two additional array rewrite patterns raised it to
+106. Prompt-only retained all 78 passes.
+
+Adaptive questioning is available in the test harness. The normal CLI still takes
+a prompt and optional examples. The frozen comparison records programs, timings,
+engine failures and every charged query. [Comparison report](../../../../evidence/OMEGALLM-SELECTION-20261123/REPORT.md) · [Reproduction commands](experiment/README.md)
