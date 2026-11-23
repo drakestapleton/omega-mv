@@ -1,12 +1,19 @@
 #!/bin/bash
-# Self-judging qualification of the dsv41-decode Arboris prefetch switch, with its negative controls.
-# Builds the decoder (README composition and om/gpu/dsv41/build.sh, which must agree byte for byte), the
-# three controls, and fifteen mutants (A to O), then requires every control to pass and every mutant to be
-# rejected by the exact check or case named for it. Host only: no GPU is opened.
+# Self-judging qualification of the dsv41-decode prefetch switch and prefetch pipeline, with negative
+# controls. Builds the decoder (README composition and om/gpu/dsv41/build.sh, which must agree byte for
+# byte), the three controls, and the mutants, then requires every control to pass and every mutant to be
+# rejected by the exact check or case named for it. Host only: no GPU is opened. What needs the GPU (the
+# look-ahead launches and their tables) is qualified by check-prefetch-gb10.sh.
 # Switch cases with a mutant of their own: unset (J), zero (O), two (N), double-zero (B), longer-name (M),
 # big-entry-unset (I), many-entries-unset (L), repeated-name (C). The other switch cases (one, empty,
 # leading-zero, trailing-space, word, shorter-name, lower-case, big-entry-zero, zero-among-others,
 # many-entries-zero) are siblings of those and have no mutant of their own.
+# Pipeline checks of check-arboris-prefetch.om: every exit has a mutant below that only it rejects, except
+# 31, 70 and 77 (set-up failures), 34, 45, 50 and 51 (a step returned an error; the mutants of the checks
+# after them cover the behaviour), 37 (no line of the pipeline publishes a guess the gate did not ask
+# for, so no one-line change produces that fault), and 49 and 54 (they exercise the on-demand path, which
+# this change does not alter: 49 shows the digest check itself accepts a good slot, 54 that a bad
+# payload stops the decoder).
 # usage (repository root, clean tree, AArch64 Linux):
 #   bash om/gpu/dsv41/decoder/check-prefetch-mutants.sh OUT_DIR TENSORS SIDECAR_DIR CKPT_DIR
 # Prints PREFETCH-MUTANTS PASS and exits 0 only if every expectation holds.
@@ -51,11 +58,41 @@ build() { # target; stdin is the source
 }
 
 # Mutants. Each names the check that must reject it.
-mutate A-forward-nogate.om $d/forward.om 's/^  if or eq get dfArbPfMeta 4 0 ne get dfWrActive 0 6$/  if ne get dfWrActive 0 6/'
-mutate D-forward-silent.om $d/forward.om 's/^  if or eq get dfArbPfMeta 4 0 ne get dfWrActive 0 6$/  if ne get dfWrActive 0 6/' \
-  's/^  put dfArbPfMeta 0 pfCount$/  put dfArbPfMeta 0 0/' 's/^  put dfArbPfMeta 3 add get dfArbPfMeta 3 pfCount$/  put dfArbPfMeta 3 get dfArbPfMeta 3/'
-mutate E-forward-starton.om $d/forward.om 's/^  put dfArbPfMeta 4 pfOn$/  put dfArbPfMeta 4 1/'
-mutate H-forward-anyarg.om $d/forward.om 's/^  if gt pfOn 1$/  if false/'
+# Pipeline mutants: pmut NAME EXIT SED..., rejected only by exit EXIT of check-arboris-prefetch.
+pm_names=() pm_exits=()
+pmut() {
+  name=$1 want=$2; shift 2
+  mutate "$name.om" $d/forward.om "$@"
+  pm_names+=("$name"); pm_exits+=("$want")
+}
+noop='put dfPfStat 4 get dfPfStat 4'
+pmut A-off-dispatches 38 's/^  if eq pfOn 1$/  if true/' 's/^  if or eq get dfArbPfMeta 4 0 eq get dfPfActive 0 0$/  if eq get dfPfActive 0 0/'
+pmut P-off-startsworkers 41 's/^  if eq pfOn 1$/  if true/'
+pmut E-start-ignores-setting 40 's/^  put dfArbPfMeta 4 pfOn$/  put dfArbPfMeta 4 1/'
+pmut H-any-setting 43 's/^  if gt pfOn 1$/  if false/'
+pmut Q-on-noworkers 44 's/^  if eq pfOn 1$/  if false/'
+pmut R-no-dispatch 32 's/^        if lt e 384$/        if lt e 0/'
+pmut S-dispatch-not-recorded 33 's/^  put dfPfOfKey key uchar add ulong slot 1$/  put dfPfOfKey key 0/'
+pmut T-waits-for-unneeded 46 's/^  dfGateAwait layer src not par$/  dfPfFinish 0/'
+pmut U-misses-not-counted 47 's/^  put dfStats 1 add get dfStats 1 1$/  put dfStats 1 get dfStats 1/'
+pmut V-used-not-counted 35 's/^  put dfArbPfMeta 2 add get dfArbPfMeta 2 1$/  put dfArbPfMeta 2 get dfArbPfMeta 2/'
+pmut W-staging-not-freed 36 "s/^  dfPfFree stage\$/  $noop/"
+pmut X-wrong-staging-bytes 48 's/^  sOff = mul stage deBytes$/  sOff = add mul stage deBytes 4096/'
+pmut Y-worker-skips-digest 52 's/^      if deVerifyAt get dfShardFD layer desc get dfPfStage 0 mul slot deBytes$/      if true/'
+pmut Z-failed-kept-staged 53 "s/^    dfPfFree ulong slot\$/    $noop/"
+pmut a-stop-leaves-workers 55 "s/^  dfPfStop\$/  $noop/"
+pmut b-slot-newest 61 's/^      if or lt best 0 lt get dfPfSlotSeq s bestSeq$/      if or lt best 0 gt get dfPfSlotSeq s bestSeq/'
+pmut c-free-keeps-key 62 "s/^    put dfPfOfKey ulong key 0\$/    $noop/"
+pmut e-drop-not-counted 63 's/^    put dfPfStat 0 add get dfPfStat 0 1$/    put dfPfStat 0 get dfPfStat 0/'
+pmut f-free-slot-ignored 65 's/^    if eq st 0$/    if eq st 9/'
+pmut g-takes-inflight-slot 67 's/^    if eq st 2$/    if ge st 1/'
+pmut h-lookahead-ignores-switch 71 's/^  if eq get dfArbPfMeta 4 0$/  if false/'
+pmut i-launch-count 72 's/^  ret add 2 mul 2 n$/  ret mul 2 n/'
+pmut k-last-layer 73 's/^    if le add layer dfSpecDepthAt i 39$/    if lt add layer dfSpecDepthAt i 39/'
+pmut n-score-inverted 75 's/^          if eq g get dfCurIds k$/          if ne g get dfCurIds k/'
+pmut o-score-no-guess 76 's/^    if ge layer dfSpecDepthAt i$/    if true/'
+pmut q-bad-id-kept 78 's/^        if ge e 384$/        if ge e 999/'
+pmut r-guess-wrong-layer 79 's/^      base = mul add mul i 40 add layer dfSpecDepthAt i 6$/      base = mul add mul i 40 layer 6/'
 mutate B-switch-nolen.om $d/prefetch-switch.om 's/^    ok = eq ulong n add kl 1$/    ok = true/'
 mutate C-switch-nodup.om $d/prefetch-switch.om 's/^    if seen$/    if false/'
 mutate I-switch-smallbuf.om $d/prefetch-switch.om 's/^global dpsBuf uchar 2097152$/global dpsBuf uchar 65536/'
@@ -71,7 +108,7 @@ mutate G-cli-norefuse.om $d/decode-cli.om 's/^  if lt pfSetting 0$/  if false/'
 compose_decoder $d/forward.om $d/prefetch-switch.om $d/decode-cli.om | build "$out/dsv41-decode" || exit 1
 compose_decoder $d/forward.om $d/prefetch-switch.om $d/check-arboris-prefetch.om | build "$out/check-arboris-prefetch" || exit 1
 (echo om2; cat $d/prefetch-switch.om $d/check-prefetch-switch.om) | build "$out/check-prefetch-switch" || exit 1
-for x in A-forward-nogate D-forward-silent E-forward-starton H-forward-anyarg; do
+for x in "${pm_names[@]}"; do
   compose_decoder "$m/$x.om" $d/prefetch-switch.om $d/check-arboris-prefetch.om | build "$m/$x" || exit 1
 done
 for x in B-switch-nolen C-switch-nodup I-switch-smallbuf J-switch-defaultoff L-switch-bound M-switch-keynoeq N-switch-anyvalue O-switch-nooff; do
@@ -86,7 +123,13 @@ sh om/gpu/dsv41/build.sh "$ob" > "$out/official-build.log" 2>&1 || { echo "PREFE
 cmp -s "$ob/dsv41-decode" "$out/dsv41-decode" && echo "PASS official build identical" || note_fail "official build differs"
 rm -rf "$ob"
 
-L1=$sidecars/layer1.bin S4=$ckpt/model-00004-of-00048.safetensors
+# Layer 3 lives in checkpoint shard 6 (layer + 3). The bad sidecar is a copy with one byte of expert 9's
+# digest (offset 9 * 64 + 8) inverted.
+L3=$sidecars/layer3.bin S6=$ckpt/model-00006-of-00048.safetensors bad=$out/layer3-bad.bin
+cp "$L3" "$bad"
+b=$(dd if="$L3" bs=1 skip=584 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+printf "$(printf '\\%03o' $((b ^ 255)))" | dd of="$bad" bs=1 seek=584 conv=notrunc 2>/dev/null
+cmp -l "$L3" "$bad" | awk 'END { exit !(NR == 1 && $1 == 585) }' || { echo "PREFETCH-MUTANTS FAIL: bad sidecar not made"; exit 1; }
 # expect LABEL WANT_RC PATTERN CMD...: CMD must exit WANT_RC and print a line matching the extended regex PATTERN
 # (empty PATTERN: no output check). A mutant counts as rejected only through the exact case it targets.
 expect() {
@@ -108,15 +151,14 @@ if ps -eo comm= | grep -q -x -F dsv41-decode; then
 fi
 expect "switch control" 0 "^PREFETCH-SWITCH PASS$" sh $d/check-prefetch-switch.sh "$out/check-prefetch-switch"
 expect "decoder control" 0 "^DECODER-PREFETCH PASS$" sh $d/check-decoder-prefetch.sh "$out/dsv41-decode" "$tensors" "$map" "$sidecars" "$ckpt"
-expect "off-arm and on-arm control" 0 "" "$out/check-arboris-prefetch" "$L1" "$S4"
+expect "pipeline control" 0 "" "$out/check-arboris-prefetch" "$L3" "$S6" "$bad"
 if [ "$fail" != 0 ]; then
   echo "PREFETCH-MUTANTS FAIL: a control failed on the real code, so no mutant result is meaningful"
   exit 1
 fi
-expect "mutant A rejected by off-arm dispatch check" 38 "" "$m/A-forward-nogate" "$L1" "$S4"
-expect "mutant D rejected by worker-reply check" 39 "" "$m/D-forward-silent" "$L1" "$S4"
-expect "mutant E rejected by start-setting check" 40 "" "$m/E-forward-starton" "$L1" "$S4"
-expect "mutant H rejected by setting-range check" 43 "" "$m/H-forward-anyarg" "$L1" "$S4"
+for i in "${!pm_names[@]}"; do
+  expect "mutant ${pm_names[$i]} rejected by pipeline check ${pm_exits[$i]}" "${pm_exits[$i]}" "" "$m/${pm_names[$i]}" "$L3" "$S6" "$bad"
+done
 expect "mutant B rejected by exact-length cases" 1 "^FAIL double-zero want 12 got 11" sh $d/check-prefetch-switch.sh "$m/B-switch-nolen"
 expect "mutant C rejected by repeated-name case" 1 "^FAIL repeated-name want 50" sh $d/check-prefetch-switch.sh "$m/C-switch-nodup"
 expect "mutant I rejected by maximum-size entry case" 1 "^FAIL big-entry-unset want 10 got 12" sh $d/check-prefetch-switch.sh "$m/I-switch-smallbuf"

@@ -1,11 +1,15 @@
 note SPDX-License-Identifier: AGPL-3.0-only
-note Pure OM-2 CPU host gate for dsv41-decode online adaptive Arboris sum-over-paths prefetcher.
-note Compose in place of decode-cli.om. Tests:
-note   1. Online cross-layer co-activation learning (dfArbUpdate / dfArbBumpEdge)
-note   2. Sum-over-paths multi-source accumulation (dfArbScoreNext)
-note   3. Resident-skipping selection (dfArbPickBest)
-note   4. Domain-shift replacement in the 16-slot Space-Saving row
-note   5. End-to-end 6-worker async prefetch + publish-hits-only + zero cache pollution on real layer1 sidecar/shard
+note Pure OM-2 CPU host gate for the dsv41-decode prefetch pipeline (no GPU is opened).
+note Compose in place of decode-cli.om. usage: check-arboris-prefetch SIDECAR SHARD BAD_SIDECAR
+note SIDECAR and SHARD are the layer-3 sidecar and its checkpoint shard; BAD_SIDECAR is a copy of
+note SIDECAR whose expert 9 digest has one byte changed. Exit 0 passes; every other exit names one check.
+note   1. Staging slot choice: free first, else the longest-waiting verified slot, never one in flight
+note   2. Look-ahead bookkeeping: depth counts, launch counts, guess scoring, guess reading
+note   3. Off arm: no prefetch workers, no staging memory, no dispatch, no request to any worker
+note   4. On arm: guesses are staged by workers, an unrelated gate never waits for them, a needed one is
+note      published byte-exact from staging without polluting the slot table, and a payload that fails
+note      its digest is never used
+const apLayer ulong 3
 
 fn apOpen arg ulong to int
   path = new uchar 4096 0
@@ -16,104 +20,128 @@ fn apOpen arg ulong to int
   ret int fopen path 0 ulong n 524288 0
 end
 
-fn apCheckScoring to int
-  note Train transition L0 -> L1:
-  note   Token A: L0={10, 20, 30, 40, 50, 60} -> L1={1, 2, 3, 4, 5, 6}
-  note   Token B: L0={10, 20, 70, 80, 90, 100} -> L1={1, 2, 7, 8, 9, 10}
-  note Expected sum-over-paths scores for query L0={10, 20, 30, 40, 50, 60}:
-  note   tgt 1: from 10 (2) + 20 (2) + 30 (1) + 40 (1) + 50 (1) + 60 (1) = 8
-  note   tgt 7: from 10 (1) + 20 (1) = 2
-  put dfCurIds 0 10
-  put dfCurIds 1 20
-  put dfCurIds 2 30
-  put dfCurIds 3 40
-  put dfCurIds 4 50
-  put dfCurIds 5 60
-  dfArbUpdate 0
-  put dfCurIds 0 1
-  put dfCurIds 1 2
-  put dfCurIds 2 3
-  put dfCurIds 3 4
-  put dfCurIds 4 5
-  put dfCurIds 5 6
-  dfArbUpdate 1
-
-  put dfCurIds 0 10
-  put dfCurIds 1 20
-  put dfCurIds 2 70
-  put dfCurIds 3 80
-  put dfCurIds 4 90
-  put dfCurIds 5 100
-  dfArbUpdate 0
-  put dfCurIds 0 1
-  put dfCurIds 1 2
-  put dfCurIds 2 7
-  put dfCurIds 3 8
-  put dfCurIds 4 9
-  put dfCurIds 5 10
-  dfArbUpdate 1
-
-  put dfCurIds 0 10
-  put dfCurIds 1 20
-  put dfCurIds 2 30
-  put dfCurIds 3 40
-  put dfCurIds 4 50
-  put dfCurIds 5 60
-  scores = new ulong 384 0
-  dfArbScoreNext 0 scores
-  if ne get scores 1 8
-    ret 11
-  end
-  if ne get scores 2 8
-    ret 12
-  end
-  if ne get scores 3 6
-    ret 13
-  end
-  if ne get scores 7 2
-    ret 14
-  end
-  note Mark expert 1 of layer 1 as already resident -> dfArbPickBest must skip 1 and pick 2
-  put dfSlotOf add ulong 384 1 0
-  best = dfArbPickBest 1 scores
-  if ne best 2
-    ret 15
-  end
-  put dfSlotOf add ulong 384 1 -1
-  ret 0
+fn apKey eid ulong to ulong
+  ret add mul apLayer 384 eid
 end
 
-fn apCheckDomainShift to int
-  note Fill all 16 slots of (layer 2, src 5) with targets 100..115 (count=1 each),
-  note then observe new target 200 twice -> must replace a stale entry and score > 0.
-  for i ulong 16
-    dfArbBumpEdge 2 5 add 100 i
+fn apSetGate a uint b uint c uint d uint e uint g uint to void
+  put dfCurIds 0 a
+  put dfCurIds 1 b
+  put dfCurIds 2 c
+  put dfCurIds 3 d
+  put dfCurIds 4 e
+  put dfCurIds 5 g
+end
+
+fn apUnitSlots to int
+  for s ulong dfPfSlots
+    put dfPfSlotKey s long add 1000 s
+    put dfPfSlotState s 2
+    put dfPfSlotSeq s add 100 s
+    put dfPfOfKey add 1000 s uchar add s 1
   end
-  dfArbBumpEdge 2 5 200
-  dfArbBumpEdge 2 5 200
-  put dfCurIds 0 5
-  for k ulong 5
-    put dfCurIds add k 1 383
+  put dfPfSlotSeq 17 5
+  put dfPfStat 0 0
+  if ne dfPfPickSlot 17
+    ret 61
   end
-  scores = new ulong 384 0
-  dfArbScoreNext 2 scores
-  if eq get scores 200 0
-    ret 21
+  if or ne get dfPfOfKey 1017 0 ne get dfPfSlotState 17 0
+    ret 62
+  end
+  if ne get dfPfStat 0 1
+    ret 63
+  end
+  if ne dfPfPickSlot 17
+    ret 65
+  end
+  if ne get dfPfStat 0 1
+    ret 66
+  end
+  for s ulong dfPfSlots
+    put dfPfSlotState s 1
+  end
+  if ne dfPfPickSlot -1
+    ret 67
   end
   ret 0
 end
 
-global apPoll uchar 48
+fn apUnitDepths to int
+  put dfArbPfMeta 4 0
+  if or ne dfSpecDepths 0 0 ne dfSpecRecords 0 0
+    ret 71
+  end
+  put dfArbPfMeta 4 1
+  if or ne dfSpecDepths 0 dfSpecN ne dfSpecRecords 0 add 2 mul 2 dfSpecN
+    ret 72
+  end
+  last = sub 39 dfSpecDepthAt 0
+  if or ne dfSpecDepths last 1 ne dfSpecDepths add last 1 0
+    ret 73
+  end
+  put dfArbPfMeta 4 0
+  ret 0
+end
 
-note Off arm (DSV41_ARBORIS_PREFETCH=0): real workers started with dfStartWorkers 0 must see no
-note request for the trained high-confidence query. Each exit has a mutant in
-note check-prefetch-mutants.sh that only it rejects: 43 (H, a setting above 1 accepted), 40 (E, start
-note ignores its argument), 38 (A, dispatch gate removed), 39 (D, gate removed and counters forced to
-note zero, so only a worker reply shows the send). The reply wait is 2 s; one prefetch reply reads a
-note single expert (tens of milliseconds on the Spark).
-fn apCheckOffArm sidecar1 int shard4 int to int
-  put dfSidecarFD 1 sidecar1
-  put dfShardFD 1 shard4
+fn apUnitScore to int
+  d0 = dfSpecDepthAt 0
+  layer = add d0 3
+  for i ulong 6
+    put dfSpecStat i 0
+  end
+  for j ulong 6
+    put dfSpecHist add mul layer 6 j uint add j 1
+  end
+  apSetGate 1 2 9 10 11 12
+  dfSpecScore layer
+  if or ne get dfSpecStat 0 6 ne get dfSpecStat 1 2
+    ret 75
+  end
+  dfSpecScore sub d0 1
+  if or ne get dfSpecStat 0 6 ne get dfSpecStat 1 2
+    ret 76
+  end
+  ret 0
+end
+
+fn apUnitRead to int
+  raw = new uchar 24 0
+  io = mapnew -1 0 ioTotalBytes 3 33
+  if le io 0
+    ret 70
+  end
+  put dwMaps 4 io
+  diPut raw 0 4 5
+  diPut raw 4 4 6
+  diPut raw 8 4 7
+  diPut raw 12 4 400
+  diPut raw 16 4 9
+  diPut raw 20 4 10
+  if ne mapwrite io ioSpecIds raw 0 24 24
+    ret 70
+  end
+  put dfArbPfMeta 4 1
+  ok = dfSpecRead 4
+  put dfArbPfMeta 4 0
+  u1 = mapdrop io
+  put dwMaps 4 0
+  if not ok
+    ret 77
+  end
+  if or ne get dfSpecIds 0 5 ne get dfSpecIds 3 0xffffffff
+    ret 78
+  end
+  base = mul add 4 dfSpecDepthAt 0 6
+  if or ne get dfSpecHist add base 2 7 ne get dfSpecHist add base 3 0xffffffff
+    ret 79
+  end
+  ret 0
+end
+
+note Off arm (DSV41_ARBORIS_PREFETCH=0). Each exit has a mutant in check-prefetch-mutants.sh that only
+note it rejects: 43 (H, a setting above 1 accepted), 40 (E, start ignores its argument), 38 (A, prefetch
+note workers started and the dispatch switch removed), 41 (P, prefetch workers started with prefetch off).
+fn apCheckOffArm to int
   if dfStartWorkers 2
     dfStopWorkers
     ret 43
@@ -125,127 +153,212 @@ fn apCheckOffArm sidecar1 int shard4 int to int
     dfStopWorkers
     ret 40
   end
-  put dfCurIds 0 10
-  put dfCurIds 1 20
-  put dfCurIds 2 30
-  put dfCurIds 3 40
-  put dfCurIds 4 50
-  put dfCurIds 5 60
-  dfArbDispatchPrefetch 0
+  for j ulong 6
+    put dfSpecIds j uint add j 1
+  end
+  dfArbDispatchPrefetch sub apLayer dfSpecDepthAt 0
   if or ne get dfArbPfMeta 0 0 ne get dfArbPfMeta 3 0
     dfStopWorkers
     ret 38
   end
-  for m ulong 6
-    fd = get dfWrRep m
-    base = mul m 8
-    put apPoll base uchar and fd 255
-    put apPoll add base 1 uchar and shr fd 8 255
-    put apPoll add base 2 uchar and shr fd 16 255
-    put apPoll add base 3 uchar and shr fd 24 255
-    put apPoll add base 4 1
-    put apPoll add base 5 0
-    put apPoll add base 6 0
-    put apPoll add base 7 0
-  end
-  note pollfds takes the byte length of the pollfd array: 6 entries of 8 bytes.
-  ready = pollfds apPoll 0 48 2000000000
-  if ne ready 0
+  if or ne get dfPfActive 0 0 gt get dfPfStage 0 0
     dfStopWorkers
-    ret 39
+    ret 41
   end
   dfStopWorkers
   ret 0
 end
 
-fn apCheckAsyncWorkers sidecar1 int shard4 int to int
-  put dfSidecarFD 1 sidecar1
-  put dfShardFD 1 shard4
+note The slab bytes of a published expert must hash to the digest in its sidecar descriptor.
+fn apSlotDigestOk sidecar int eid ulong to bool
+  ctx = new uchar 104 0
+  digest = new uchar 32 0
+  desc = new uchar 64 0
+  buf = new uchar 1048576 0
+  slot = get dfSlotOf apKey eid
+  if lt slot 0
+    ret false
+  end
+  if not diRead sidecar desc mul eid 64 64
+    ret false
+  end
+  phys = get dfPhysical ulong slot
+  m = get dwSlabMaps div phys 800
+  off = mul rem phys 800 deBytes
+  sha256_init ctx
+  pos = ulong 0
+  while lt pos deBytes
+    n = sub deBytes pos
+    if gt n len buf
+      n = len buf
+    end
+    if ne mapread m add off pos buf 0 n long n
+      ret false
+    end
+    sha256_update ctx part buf 0 n
+    pos = add pos n
+  end
+  sha256_final ctx digest
+  for i ulong 8
+    if ne get digest i get desc add 8 i
+      ret false
+    end
+  end
+  ret true
+end
+
+note Guesses 1..6 for apLayer are dispatched once, and a gate that needs none of them neither waits for
+note them nor collects their replies.
+fn apOnDispatch to int
+  if or ne get dfPfActive 0 6 le get dfPfStage 0 0
+    ret 44
+  end
+  for j ulong 18
+    put dfSpecIds j 0xffffffff
+  end
+  for j ulong 6
+    put dfSpecIds j uint add j 1
+  end
+  src = sub apLayer dfSpecDepthAt 0
+  dfArbDispatchPrefetch src
+  if or ne get dfArbPfMeta 3 6 ne get dfArbPfMeta 0 6
+    ret 32
+  end
+  if or lt dfPfLookup apKey 1 0 lt dfPfLookup apKey 6 0
+    ret 33
+  end
+  apSetGate 11 12 13 14 15 16
+  if ne dfResolveGate apLayer 1
+    ret 45
+  end
+  if or ne get dfArbPfMeta 1 0 ne get dfArbPfMeta 0 6
+    ret 46
+  end
+  if or ne get dfStats 1 6 ne get dfArbPfMeta 2 0
+    ret 47
+  end
+  ret 0
+end
+
+note A gate that needs guess 1 gets it from staging: byte-exact, counted as used, staging slot freed,
+note and the unused guess 2 stays out of the slot table.
+fn apOnUse sidecar int to int
+  apSetGate 1 21 22 23 24 25
+  if ne dfResolveGate apLayer 1
+    ret 34
+  end
+  if or ne get dfArbPfMeta 2 1 ne get dfStats 1 11
+    ret 35
+  end
+  if or lt get dfSlotOf apKey 1 0 ge dfPfLookup apKey 1 0
+    ret 36
+  end
+  if or ge get dfSlotOf apKey 2 0 lt dfPfLookup apKey 2 0
+    ret 37
+  end
+  if not apSlotDigestOk sidecar 1
+    ret 48
+  end
+  if not apSlotDigestOk sidecar 21
+    ret 49
+  end
+  ret 0
+end
+
+note A staged payload whose digest does not match is dropped, and the gate that needs that expert stops
+note the decoder instead of using it.
+fn apOnBadPayload sidecar int bad int to int
+  put dfSidecarFD apLayer bad
+  failed = get dfPfStat 1
+  dfPfHarvest
+  if lt dfPfIdleWorker 0
+    dfPfFinish 0
+  end
+  if ne dfPfDispatch apLayer 9 1
+    ret 50
+  end
+  slot = dfPfLookup apKey 9
+  if lt slot 0
+    ret 51
+  end
+  if dfPfAwait ulong slot apKey 9 false
+    ret 52
+  end
+  if or ne get dfPfStat 1 add failed 1 ge dfPfLookup apKey 9 0
+    ret 53
+  end
+  apSetGate 9 21 22 23 24 25
+  if ne dfResolveGate apLayer -1
+    ret 54
+  end
+  put dfSidecarFD apLayer sidecar
+  ret 0
+end
+
+fn apCheckOnArm sidecar int bad int to int
   if not dfStartWorkers 1
     ret 31
   end
-  note Cold-start check on empty layer 5: must return 0 dispatched without trapping when best == 384
-  dfArbDispatchPrefetch 5
-  if ne get dfArbPfMeta 0 0
-    dfStopWorkers
-    ret 30
+  for i ulong 6
+    put dfStats i 0
   end
-  note Query L0={10,20,30,40,50,60} -> dispatches top-2 high-confidence L1 experts {1,2} asynchronously
-  put dfCurIds 0 10
-  put dfCurIds 1 20
-  put dfCurIds 2 30
-  put dfCurIds 3 40
-  put dfCurIds 4 50
-  put dfCurIds 5 60
-  dfArbDispatchPrefetch 0
-  if ne get dfArbPfMeta 0 2
-    dfStopWorkers
-    ret 32
+  rc = apOnDispatch
+  if eq rc 0
+    rc = apOnUse sidecar
   end
-  if ne get dfArbPfMeta 3 2
-    dfStopWorkers
-    ret 33
-  end
-  note Now simulate authoritative L1 router picking {1, 11, 12, 13, 14, 15}:
-  note Only 1 hit (expert 1) should publish; expert 2 must NOT pollute dfSlotOf!
-  put dfCurIds 0 1
-  put dfCurIds 1 11
-  put dfCurIds 2 12
-  put dfCurIds 3 13
-  put dfCurIds 4 14
-  put dfCurIds 5 15
-  pfr = dfArbDrainAndPublish 1
-  if ne pfr 1
-    dfStopWorkers
-    ret 34
-  end
-  if ne get dfArbPfMeta 2 1
-    dfStopWorkers
-    ret 35
-  end
-  if lt get dfSlotOf add ulong 384 1 0
-    dfStopWorkers
-    ret 36
-  end
-  if ge get dfSlotOf add ulong 384 2 0
-    dfStopWorkers
-    ret 37
+  if eq rc 0
+    rc = apOnBadPayload sidecar bad
   end
   dfStopWorkers
-  ret 0
+  if and eq rc 0 or ne get dfPfActive 0 0 gt get dfPfStage 0 0
+    ret 55
+  end
+  ret rc
+end
+
+fn apUnits to int
+  rc = apUnitSlots
+  if eq rc 0
+    rc = apUnitDepths
+  end
+  if eq rc 0
+    rc = apUnitScore
+  end
+  if eq rc 0
+    rc = apUnitRead
+  end
+  ret rc
 end
 
 fn main to int
-  if ne argcnt 3
+  if ne argcnt 4
     ret 64
   end
-  sidecar1 = apOpen 1
-  shard4 = apOpen 2
-  if or lt sidecar1 0 lt shard4 0
+  sidecar = apOpen 1
+  shard = apOpen 2
+  bad = apOpen 3
+  if or lt sidecar 0 or lt shard 0 lt bad 0
     ret 66
   end
+  put dfSidecarFD apLayer sidecar
+  put dfShardFD apLayer shard
   dfInitSlabMap 7
   put dwSlabMaps 0 mapnew -1 0 mul 7 deBytes 3 33
   put dwSlabMaps 4 mapnew -1 0 deBytes 3 33
   if or le get dwSlabMaps 0 0 le get dwSlabMaps 4 0
     ret 70
   end
-  rc = apCheckScoring
-  if ne rc 0
-    ret rc
+  rc = apUnits
+  if eq rc 0
+    rc = apCheckOffArm
   end
-  rc = apCheckDomainShift
-  if ne rc 0
-    ret rc
+  if eq rc 0
+    rc = apCheckOnArm sidecar bad
   end
-  rc = apCheckOffArm sidecar1 shard4
-  if ne rc 0
-    ret rc
-  end
-  rc = apCheckAsyncWorkers sidecar1 shard4
   u1 = mapdrop get dwSlabMaps 0
   u2 = mapdrop get dwSlabMaps 4
-  u3 = fclose sidecar1
-  u4 = fclose shard4
+  u3 = fclose sidecar
+  u4 = fclose shard
+  u5 = fclose bad
   ret rc
 end
