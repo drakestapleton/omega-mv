@@ -1,0 +1,927 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note Licensed under the Apache License, Version 2.0 (the "License");
+note you may not use this file except in compliance with the License.
+note You may obtain a copy of the License at
+note
+note     http://www.apache.org/licenses/LICENSE-2.0
+note
+note Unless required by applicable law or agreed to in writing, software
+note distributed under the License is distributed on an "AS IS" BASIS,
+note WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+note See the License for the specific language governing permissions and
+note limitations under the License.
+note
+note c2sat: small DPLL SAT solver that writes LRAT proofs (omega#446). UNTRUSTED. Pure seeded OM-2.
+note
+note Not part of checker2's trusted base and not in its identity hash: every UNSAT answer is only
+note believed after checker2's own LRAT checker (src/checker2/c2_lrat.c) accepts the proof. Shares no
+note code with that checker (own parser, own data structures).
+note
+note Method: DPLL with unit propagation over occurrence lists, decisions on the lowest unassigned
+note variable, conflict-directed backjumping. Every refuted subtree yields a clause that is the
+note negation of the decisions that mattered:
+note   leaf    : RUP with hints = the propagation reasons the conflict depends on, in trail order,
+note             then the conflicting clause;
+note   inner   : if the first branch's clause does not mention the decision it is returned as is,
+note             likewise the second; otherwise their resolvent on the decision, hints [first, second].
+note At the root the clause is empty. No learned clause is reused for propagation (simple, slow).
+note
+note Usage: c2sat <in.cnf> <out.lrat> [max-decisions]
+note Exit: 20 UNSAT (proof written), 10 SAT (model on stdout as "v ..."), 1 limit hit, 2 usage/I/O.
+note
+note Port of the former c2sat.c: same search order, same proof bytes and same stdout. Storage is
+note run-time pools (no fixed caps). Where the C program had undefined behaviour the port refuses
+note with exit 2 before writing anything: a kept literal whose variable is above nv, or a number that
+note does not fit a C int (scanf %d).
+
+const BIG ulong 9223372036854775807
+const OB_CAP ulong 1048576
+
+text t_usage "usage: c2sat <in.cnf> <out.lrat> [max-decisions]\n"
+text t_unsat "s UNSATISFIABLE\n"
+text t_unknown "s UNKNOWN (decision limit)\n"
+text t_sat "s SATISFIABLE\nv"
+text t_tail " 0\n"
+
+note arguments: 3 of 4096 bytes each; g_alen holds their lengths
+global g_args uchar 12288
+global g_alen ulong 3
+
+note scalar state, index: 0 nv, 1 ncl, 2 ncls, 3 nlits, 4 ntrail, 5 decisions, 6 max_decisions,
+note 7 output fd, 8 output used, 9 input length, 10 out-of-memory flag
+global g_s long 16
+
+global g_in uchar *
+note clauses (index = id - 1): start offset into g_lits and literal count
+global g_coff ulong *
+global g_cn ulong *
+global g_lits long *
+note occurrence lists of the original clauses, CSR by literal + nv
+global g_ostart ulong *
+global g_occ ulong *
+global g_val long *
+global g_reason long *
+global g_seen long *
+global g_trail long *
+note scratch: clause-building buffer, analyze literals and hints, resolvent
+global g_buf long *
+global g_alits long *
+global g_ahints long *
+global g_rbuf long *
+global g_ob uchar *
+
+fn sget i ulong to long
+  ret get g_s i
+end
+
+fn sset i ulong v long to void
+  put g_s i v
+end
+
+fn oom to void
+  sset 10 1
+  exit 2
+end
+
+fn need_long_buf which ulong n ulong to void
+  r = long 0
+  if eq which 0
+    r = enlarge g_buf n
+  end
+  if eq which 1
+    r = enlarge g_alits n
+  end
+  if eq which 2
+    r = enlarge g_ahints n
+  end
+  if eq which 3
+    r = enlarge g_rbuf n
+  end
+  if lt r 0
+    oom
+  end
+end
+
+fn labs l long to ulong
+  if lt l 0
+    ret ulong neg l
+  end
+  ret ulong l
+end
+
+fn lit_true l long to bool
+  v = get g_val labs l
+  if gt l 0
+    ret eq v 1
+  end
+  ret eq v -1
+end
+
+fn lit_false l long to bool
+  v = get g_val labs l
+  if gt l 0
+    ret eq v -1
+  end
+  ret eq v 1
+end
+
+note append the clause held in g_buf / g_alits / g_rbuf (which = 0 / 1 / 3) of n literals; returns its id
+fn add_clause which ulong n ulong to long
+  ncls = ulong sget 2
+  nlits = ulong sget 3
+  if ge ncls len g_coff
+    nc = mul len g_coff 2
+    if lt nc 1024
+      nc = 1024
+    end
+    r1 = enlarge g_coff nc
+    r2 = enlarge g_cn nc
+    if lt r1 0
+      oom
+    end
+    if lt r2 0
+      oom
+    end
+  end
+  if gt add nlits n len g_lits
+    nl = mul len g_lits 2
+    if lt nl add nlits n
+      nl = add add nlits n 4096
+    end
+    r3 = enlarge g_lits nl
+    if lt r3 0
+      oom
+    end
+  end
+  for j ulong n bound BIG
+    x = long 0
+    if eq which 0
+      x = get g_buf j
+    end
+    if eq which 1
+      x = get g_alits j
+    end
+    if eq which 3
+      x = get g_rbuf j
+    end
+    put g_lits add nlits j x
+  end
+  put g_coff ncls nlits
+  put g_cn ncls n
+  sset 3 long add nlits n
+  sset 2 long add ncls 1
+  ret long add ncls 1
+end
+
+fn assign l long why long to void
+  a = labs l
+  if gt l 0
+    put g_val a 1
+  else
+    put g_val a -1
+  end
+  put g_reason a why
+  nt = ulong sget 4
+  put g_trail nt l
+  sset 4 long add nt 1
+end
+
+note scan clause ci: 2 if satisfied, else the number of free literals capped at 2; the last free
+note literal goes to g_s[14]
+fn clause_scan ci ulong to ulong
+  off = get g_coff ci
+  cn = get g_cn ci
+  nfree = ulong 0
+  for j ulong cn bound BIG
+    lj = get g_lits add off j
+    if lit_true lj
+      ret 3
+    end
+    if not lit_false lj
+      nfree = add nfree 1
+      sset 14 lj
+    end
+  end
+  if gt nfree 2
+    ret 2
+  end
+  ret nfree
+end
+
+note propagate from trail position q; returns the id of a falsified clause or 0
+fn propagate q0 ulong to long
+  q = q0
+  while lt q ulong sget 4 bound BIG
+    t = get g_trail q
+    q = add q 1
+    s = ulong add neg t sget 0
+    k = get g_ostart s
+    o1 = get g_ostart add s 1
+    while lt k o1 bound BIG
+      cid = get g_occ k
+      k = add k 1
+      st = clause_scan sub cid 1
+      if eq st 0
+        ret long cid
+      end
+      if eq st 1
+        assign sget 14 long cid
+      end
+    end
+  end
+  ret 0
+end
+
+fn undo_to n ulong to void
+  while gt ulong sget 4 n bound BIG
+    nt = sub ulong sget 4 1
+    sset 4 long nt
+    a = labs get g_trail nt
+    put g_val a 0
+    put g_reason a 0
+  end
+end
+
+note output buffer: the proof file, then stdout
+fn ob_flush to void
+  used = ulong sget 8
+  fd = int sget 7
+  off = ulong 0
+  while lt off used bound BIG
+    w = write fd g_ob off sub used off
+    if le w 0
+      break
+    end
+    off = add off ulong w
+  end
+  sset 8 0
+end
+
+fn ob_byte c ulong to void
+  used = ulong sget 8
+  if ge used OB_CAP
+    ob_flush
+    used = 0
+  end
+  put g_ob used uchar c
+  sset 8 long add used 1
+end
+
+fn ob_text s view uchar * to void
+  for i ulong len s bound BIG
+    ob_byte ulong get s i
+  end
+end
+
+fn ob_int v long to void
+  d = new uchar 24 0
+  m = labs v
+  nd = ulong 0
+  while true bound 24
+    put d nd uchar add 48 rem m 10
+    nd = add nd 1
+    m = div m 10
+    if eq m 0
+      break
+    end
+  end
+  if lt v 0
+    ob_byte 45
+  end
+  i = nd
+  while gt i 0 bound 24
+    i = sub i 1
+    ob_byte ulong get d i
+  end
+end
+
+note write one LRAT step for the clause in buffer `which` (n literals) with hints g_ahints[0..nh)
+fn emit which ulong n ulong nh ulong to long
+  id = add_clause which n
+  ob_int id
+  ob_byte 32
+  for k ulong n bound BIG
+    x = long 0
+    if eq which 1
+      x = get g_alits k
+    end
+    if eq which 3
+      x = get g_rbuf k
+    end
+    ob_int x
+    ob_byte 32
+  end
+  ob_byte 48
+  ob_byte 32
+  for k ulong nh bound BIG
+    ob_int get g_ahints k
+    ob_byte 32
+  end
+  ob_byte 48
+  ob_byte 10
+  ret id
+end
+
+note mark every variable of clause ci as seen, except variable skipv (0: none)
+fn mark_seen ci ulong skipv ulong to void
+  off = get g_coff ci
+  cn = get g_cn ci
+  for j ulong cn bound BIG
+    a = labs get g_lits add off j
+    if ne a skipv
+      put g_seen a 1
+    end
+  end
+end
+
+fn reverse_hints nh ulong to void
+  if le nh 1
+    ret
+  end
+  lo = ulong 0
+  hi = sub nh 1
+  while lt lo hi bound BIG
+    tmp = get g_ahints lo
+    put g_ahints lo get g_ahints hi
+    put g_ahints hi tmp
+    lo = add lo 1
+    hi = sub hi 1
+  end
+end
+
+note clause from a conflict: negated relevant decisions, hints = relevant reasons in trail order
+fn analyze conflict long to long
+  nt = ulong sget 4
+  need_long_buf 1 add nt 1
+  need_long_buf 2 add nt 2
+  nl = ulong 0
+  nh = ulong 0
+  mark_seen ulong sub conflict 1 0
+  i = nt
+  while gt i 0 bound BIG
+    i = sub i 1
+    ti = get g_trail i
+    v = labs ti
+    if eq get g_seen v 0
+      continue
+    end
+    put g_seen v 0
+    rv = get g_reason v
+    if eq rv 0
+      put g_alits nl neg ti
+      nl = add nl 1
+      continue
+    end
+    put g_ahints nh rv
+    nh = add nh 1
+    mark_seen ulong sub rv 1 v
+  end
+  reverse_hints nh
+  put g_ahints nh conflict
+  ret emit 1 nl add nh 1
+end
+
+fn mentions id long l long to bool
+  ci = ulong sub id 1
+  off = get g_coff ci
+  cn = get g_cn ci
+  for j ulong cn bound BIG
+    if eq get g_lits add off j l
+      ret true
+    end
+  end
+  ret false
+end
+
+fn rbuf_has n ulong x long to bool
+  for k ulong n bound BIG
+    if eq get g_rbuf k x
+      ret true
+    end
+  end
+  ret false
+end
+
+note copy clause ci into g_rbuf after n literals, leaving out literal skip and literals already there
+note (dedup: true for the second clause only, as in the C); returns the new count
+fn rbuf_add ci ulong n0 ulong skip long dedup bool to ulong
+  off = get g_coff ci
+  cn = get g_cn ci
+  n = n0
+  for j ulong cn bound BIG
+    x = get g_lits add off j
+    if eq x skip
+      continue
+    end
+    if dedup
+      if rbuf_has n x
+        continue
+      end
+    end
+    put g_rbuf n x
+    n = add n 1
+  end
+  ret n
+end
+
+note resolvent of clauses ida and idb on variable v; returns the new id
+fn resolve ida long idb long v long to long
+  ai = ulong sub ida 1
+  bi = ulong sub idb 1
+  need_long_buf 3 add add get g_cn ai get g_cn bi 1
+  n = rbuf_add ai 0 neg v false
+  n = rbuf_add bi n v true
+  need_long_buf 2 2
+  put g_ahints 0 ida
+  put g_ahints 1 idb
+  ret emit 3 n 2
+end
+
+note returns the id of a clause refuting the current trail, 0 if SAT, -1 if the limit was hit
+fn solve q ulong to long
+  conflict = propagate q
+  if ne conflict 0
+    ret analyze conflict
+  end
+  nv = ulong sget 0
+  v = long 0
+  for i ulong nv bound BIG
+    if eq get g_val add i 1 0
+      v = long add i 1
+      break
+    end
+  end
+  if eq v 0
+    ret 0
+  end
+  dc = add sget 5 1
+  sset 5 dc
+  if gt dc sget 6
+    ret -1
+  end
+  mark = ulong sget 4
+  id0 = long 0
+  id1 = long 0
+  for side ulong 2
+    d = v
+    if eq side 1
+      d = neg v
+    end
+    assign d 0
+    idx = solve sub ulong sget 4 1
+    if le idx 0
+      ret idx
+    end
+    undo_to mark
+    if eq side 0
+      id0 = idx
+    else
+      id1 = idx
+    end
+    if not mentions idx neg d
+      ret idx
+    end
+  end
+  ret resolve id0 id1 v
+end
+
+note C isspace in the "C" locale
+fn is_space c ulong to bool
+  if eq c 32
+    ret true
+  end
+  if ge c 9
+    if le c 13
+      ret true
+    end
+  end
+  ret false
+end
+
+note scanf "%d" at g_in[pos..): result in g_s[12] (value) and g_s[13] (new pos); returns 1 on a
+note match, 0 on no match (end of input or not a number), -1 when the number does not fit an int
+fn scan_int pos0 ulong to long
+  n = ulong sget 9
+  pos = pos0
+  while lt pos n bound BIG
+    if not is_space ulong get g_in pos
+      break
+    end
+    pos = add pos 1
+  end
+  if ge pos n
+    ret 0
+  end
+  neg_sign = false
+  c = ulong get g_in pos
+  if eq c 45
+    neg_sign = true
+    pos = add pos 1
+  else
+    if eq c 43
+      pos = add pos 1
+    end
+  end
+  if ge pos n
+    ret 0
+  end
+  c = ulong get g_in pos
+  if lt c 48
+    ret 0
+  end
+  if gt c 57
+    ret 0
+  end
+  m = ulong 0
+  while lt pos n bound BIG
+    c = ulong get g_in pos
+    if lt c 48
+      break
+    end
+    if gt c 57
+      break
+    end
+    m = add mul m 10 sub c 48
+    if gt m 2147483648
+      ret -1
+    end
+    pos = add pos 1
+  end
+  if neg_sign
+    sset 12 neg long m
+  else
+    if gt m 2147483647
+      ret -1
+    end
+    sset 12 long m
+  end
+  sset 13 long pos
+  ret 1
+end
+
+note skip white space, then require the byte c; returns the position after it or BIG
+fn scan_lit pos0 ulong c ulong skip bool to ulong
+  n = ulong sget 9
+  pos = pos0
+  if skip
+    while lt pos n bound BIG
+      if not is_space ulong get g_in pos
+        break
+      end
+      pos = add pos 1
+    end
+  end
+  if ge pos n
+    ret BIG
+  end
+  if ne ulong get g_in pos c
+    ret BIG
+  end
+  ret add pos 1
+end
+
+note atol: leading white space, optional sign, digits; saturates like strtol
+fn arg_atol idx ulong to long
+  al = get g_alen idx
+  base = mul idx 4096
+  pos = ulong 0
+  while lt pos al bound 4096
+    if not is_space ulong get g_args add base pos
+      break
+    end
+    pos = add pos 1
+  end
+  neg_sign = false
+  if lt pos al
+    c = ulong get g_args add base pos
+    if eq c 45
+      neg_sign = true
+      pos = add pos 1
+    else
+      if eq c 43
+        pos = add pos 1
+      end
+    end
+  end
+  m = ulong 0
+  sat = false
+  while lt pos al bound 4096
+    c = ulong get g_args add base pos
+    if lt c 48
+      break
+    end
+    if gt c 57
+      break
+    end
+    if not sat
+      if gt m 922337203685477580
+        sat = true
+      else
+        m = add mul m 10 sub c 48
+        if gt m 9223372036854775807
+          sat = true
+        end
+      end
+    end
+    pos = add pos 1
+  end
+  if sat
+    if neg_sign
+      ret sub neg long 9223372036854775807 1
+    end
+    ret long 9223372036854775807
+  end
+  if neg_sign
+    ret neg long m
+  end
+  ret long m
+end
+
+fn read_input to bool
+  fd = fopen g_args 0 get g_alen 0 0 0
+  if lt fd 0
+    ret false
+  end
+  r = enlarge g_in 65536
+  if lt r 0
+    oom
+  end
+  n = ulong 0
+  while true bound BIG
+    cap = len g_in
+    if eq n cap
+      r2 = enlarge g_in mul cap 2
+      if lt r2 0
+        oom
+      end
+      cap = len g_in
+    end
+    got = read int fd g_in n sub cap n
+    if lt got 0
+      cr = fclose int fd
+      ret false
+    end
+    if eq got 0
+      break
+    end
+    n = add n ulong got
+  end
+  cr = fclose int fd
+  sset 9 long n
+  ret true
+end
+
+note the DIMACS input: comment lines first, " p cnf %d %d", then literals; returns 0 or exit status 2
+fn parse to int
+  n = ulong sget 9
+  pos = ulong 0
+  while lt pos n bound BIG
+    if ne ulong get g_in pos 99
+      break
+    end
+    while lt pos n bound BIG
+      c = ulong get g_in pos
+      pos = add pos 1
+      if eq c 10
+        break
+      end
+    end
+  end
+  pos = scan_lit pos 112 true
+  if eq pos BIG
+    ret 2
+  end
+  pos = scan_lit pos 99 true
+  if eq pos BIG
+    ret 2
+  end
+  pos = scan_lit pos 110 false
+  if eq pos BIG
+    ret 2
+  end
+  pos = scan_lit pos 102 false
+  if eq pos BIG
+    ret 2
+  end
+  if ne scan_int pos 1
+    ret 2
+  end
+  nv = sget 12
+  pos = ulong sget 13
+  if ne scan_int pos 1
+    ret 2
+  end
+  ncl = sget 12
+  pos = ulong sget 13
+  if lt nv 0
+    ret 2
+  end
+  if lt ncl 0
+    ret 2
+  end
+  sset 0 nv
+  sset 1 ncl
+  unv = ulong nv
+  cap = add mul unv 2 2
+  need_long_buf 0 cap
+  bn = ulong 0
+  while true bound BIG
+    rc = scan_int pos
+    if lt rc 0
+      ret 2
+    end
+    if eq rc 0
+      break
+    end
+    x = sget 12
+    pos = ulong sget 13
+    if eq x 0
+      z = add_clause 0 bn
+      bn = 0
+    else
+      if lt bn add mul unv 2 1
+        if gt labs x unv
+          ret 2
+        end
+        put g_buf bn x
+        bn = add bn 1
+      end
+    end
+  end
+  if ne sget 2 ncl
+    ret 2
+  end
+  ret 0
+end
+
+fn grow_or_die which ulong n ulong to void
+  r = long 0
+  if eq which 0
+    r = enlarge g_ostart n
+  end
+  if eq which 1
+    r = enlarge g_val n
+  end
+  if eq which 2
+    r = enlarge g_reason n
+  end
+  if eq which 3
+    r = enlarge g_seen n
+  end
+  if eq which 4
+    r = enlarge g_trail n
+  end
+  if eq which 5
+    r = enlarge g_ob n
+  end
+  if eq which 6
+    r = enlarge g_occ n
+  end
+  if lt r 0
+    oom
+  end
+end
+
+note occurrence slot of literal j of clause i
+fn occ_slot i ulong j ulong to ulong
+  ret ulong add get g_lits add get g_coff i j sget 0
+end
+
+fn occ_count ncls ulong to void
+  for i ulong ncls bound BIG
+    for j ulong get g_cn i bound BIG
+      s = add occ_slot i j 1
+      put g_ostart s add get g_ostart s 1
+    end
+  end
+end
+
+fn occ_fill ncls ulong to void
+  for i ulong ncls bound BIG
+    for j ulong get g_cn i bound BIG
+      s = occ_slot i j
+      put g_occ get g_ostart s add i 1
+      put g_ostart s add get g_ostart s 1
+    end
+  end
+end
+
+note occurrence lists in clause order (CSR over literal + nv), as the C's appended lists
+fn alloc_state to void
+  nv = ulong sget 0
+  nlit = add mul nv 2 1
+  grow_or_die 0 add nlit 1
+  grow_or_die 1 add nv 1
+  grow_or_die 2 add nv 1
+  grow_or_die 3 add nv 1
+  grow_or_die 4 add nv 1
+  grow_or_die 5 OB_CAP
+  grow_or_die 6 add ulong sget 3 1
+  ncls = ulong sget 2
+  occ_count ncls
+  for s ulong nlit bound BIG
+    put g_ostart add s 1 add get g_ostart add s 1 get g_ostart s
+  end
+  occ_fill ncls
+  note the fill advanced each start to the next list's start: shift back by one list
+  s2 = nlit
+  while gt s2 0 bound BIG
+    put g_ostart s2 get g_ostart sub s2 1
+    s2 = sub s2 1
+  end
+  put g_ostart 0 0
+end
+
+fn main to int
+  ac = argcnt
+  if lt ac 3
+    w = write 2 t_usage 0 len t_usage
+    ret 2
+  end
+  na = ulong sub ac 1
+  if gt na 3
+    na = 3
+  end
+  for i ulong na bound 3
+    k = argread add i 1 g_args mul i 4096 4096
+    if lt k 0
+      ret 2
+    end
+    put g_alen i ulong k
+  end
+  if gt ac 3
+    sset 6 arg_atol 2
+  else
+    sset 6 2000000
+  end
+  if not read_input
+    ret 2
+  end
+  prc = parse
+  if ne prc 0
+    ret prc
+  end
+  alloc_state
+  ofd = fopen g_args 4096 get g_alen 1 577 438
+  if lt ofd 0
+    ret 2
+  end
+  sset 7 ofd
+  conflict = long 0
+  ncl = ulong sget 1
+  for i ulong ncl bound BIG
+    if ne conflict 0
+      break
+    end
+    cn = get g_cn i
+    if eq cn 0
+      conflict = long add i 1
+    else
+      if eq cn 1
+        l0 = get g_lits get g_coff i
+        if lit_false l0
+          conflict = long add i 1
+        else
+          if not lit_true l0
+            assign l0 long add i 1
+          end
+        end
+      end
+    end
+  end
+  r = long 0
+  if ne conflict 0
+    r = analyze conflict
+  else
+    r = solve 0
+  end
+  ob_flush
+  cr = fclose int ofd
+  sset 7 1
+  if gt r 0
+    ob_text t_unsat
+    ob_flush
+    ret 20
+  end
+  if lt r 0
+    ob_text t_unknown
+    ob_flush
+    ret 1
+  end
+  ob_text t_sat
+  nv = ulong sget 0
+  for i ulong nv bound BIG
+    ob_byte 32
+    if ge get g_val add i 1 0
+      ob_int long add i 1
+    else
+      ob_int neg long add i 1
+    end
+  end
+  ob_text t_tail
+  ob_flush
+  ret 10
+end

@@ -184,7 +184,7 @@ Property `no-trap-except-requires` of a function F: for every argument value, a 
 passes its `requires` clauses ends without any trap (overflow, division, shift, cast, loop bound,
 `ensures`, or an explicit trap). checker2 builds the CNF of "some argument reaches a trap" itself,
 from the IR bytes (`c2_blast.h`: scalar functions only; calls, memory, division and signed right
-shift are refused, never approximated). The solver (`src/checker2/untrusted/c2sat.c`) is
+shift are refused, never approximated). The solver (`src/checker2/untrusted/c2sat.om`, pure seeded OM-2) is
 untrusted and outside the checker identity. An UNSAT answer counts only when checker2's own LRAT
 checker (`c2_lrat.h`: RUP steps only, RAT hints refused, the empty clause required,
 clause ids at most input clauses plus proof lines so a huge id cannot size its tables) accepts the
