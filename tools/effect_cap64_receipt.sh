@@ -27,7 +27,8 @@
 #   - the non-energy host regression suites CI runs: test (M4 omegatool),
 #     r3 r7 r8 r9 r10 r11 r12 action-graph state-projection capability-query
 #     typed-results
-#   - a grep for 32-bit truncation of an effect capability generation
+#   - a grep for 32-bit truncation of an effect capability generation, in the C
+#     sources and (tools/effect_cap64_om_trunc.sh) the OM-2 sources of omega
 # Every make is wrapped in `flock $BENCH_LOCK`. Nothing under evidence/ is
 # rewritten: the receipt is a NEW file named by the SHA-256 of its own bytes.
 # The receipt says FAIL (and lists why) when any suite fails, the tree is
@@ -136,6 +137,11 @@ for t in "${REGRESSION[@]}"; do suite "$t" "$Q/reg" "${RT[@]}"; done
 # ---- truncation grep --------------------------------------------------------
 trunc_hits=$(grep -rnE '\(uint32_t\)[^;]*capability_generation|capability_generation[^;]*[^0-9]%u|uint32_t +(cap_gen|capability_generation)\b' \
     src tests --include='*.c' --include='*.h' | grep -v 'src/omega_accelerator' || true)
+# The console wiring tools/omega.c held is OM-2 now; its truncation forms are grepped
+# by effect_cap64_om_trunc.sh (with bite controls; exit 2 means the control failed).
+om_trunc=$(sh tools/effect_cap64_om_trunc.sh "$HERE"); om_rc=$?
+[ "$om_rc" -le 1 ] || om_trunc="effect_cap64_om_trunc.sh: bite control or file list failed (exit $om_rc)"
+trunc_hits=$(printf '%s\n%s\n' "$trunc_hits" "$om_trunc" | grep . || true)
 trunc_n=$(printf '%s' "$trunc_hits" | grep -c . || true)
 [ "$trunc_n" -eq 0 ] || REASONS+=("effect generation truncation grep: $trunc_n hit(s)")
 

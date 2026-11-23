@@ -125,7 +125,11 @@ The generation is `uint64_t` in: `omega_build_effect(..., uint64_t cap_gen)`,
 JSON output (`PRIu64`), and the authority side (`AienosCapRef`, `RxCapRef`).
 Checked by `grep` (recorded in the receipt): no `(uint32_t)` cast, `uint32_t`
 parameter or `%u` format is applied to an effect capability generation in
-`src/`, `tools/omega.c` or `tests/`. The only other `(uint32_t)` casts of a
+`src/` or `tests/`. The console wiring that `tools/omega.c` held is now pure
+OM-2 (`tools/omega*.om`, `src/visor/*.om`, retired C deleted), so its half of
+the grep is `tools/effect_cap64_om_trunc.sh`: no OM-2 code line names a
+generation together with a sub-64-bit type, a 16/32-bit codec helper or an
+encode width below 8 bytes, with planted bite controls that must be caught. The only other `(uint32_t)` casts of a
 capability generation are the low halves of split lo/hi stores in
 `src/runtime/rx_coherent.c` and `src/runtime/rx_generation.c` (the high word
 is stored next to them) and a deliberate truncation probe in

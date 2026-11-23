@@ -7,7 +7,8 @@
 #                        PHYSICS_DIR=<physics checkout>. rx_aegis.c needs the native Aienux
 #                        capability library; point VISOR_AUTH_CAP_LIB (default $(AIENOS_CAP_LIB))
 #                        at a built libaienos_capability.a.
-# visor-authority-check  link check: no Visor object references/defines an authority-mutating symbol.
+# visor-authority-check  isolation check: no Visor object references/defines an authority-mutating
+#                        symbol, and no OM-2 source of omega names one (with bite controls).
 # mk/*.mk is included before the Makefile defines AIENOS_R7_DIR/AIENOS_CAP_LIB, and a
 # prerequisite list is expanded when the rule is read, so the defaults are repeated here
 # (same values as the Makefile's R7 block, the pinned aienos.lock extraction; its later
@@ -39,7 +40,10 @@ $(VISOR_AUTH_TEST): tests/visor/test_visor_authority.c $(VISOR_AUTH_RX_SRCS) \
 test-visor-authority: $(VISOR_AUTH_TEST)
 	./$(VISOR_AUTH_TEST)
 
-# The omega binary is a prerequisite so the check always covers it (it is pure OM-2 and has no
-# symbol table; its isolation is that it is built only from $(OMEGA_OM_SRCS)).
+# The omega binary is pure OM-2 and has no symbol table, so nm cannot see into it. The check
+# scans the OM-2 sources it is built from ($(OMEGA_OM_SRCS), plus every tools/omega*.om,
+# om/visor, src/visor and src/language unit) for forbidden authority names, runtime prefixes
+# and authorization state, with planted-name bite controls that must be caught. The binary
+# stays a prerequisite so a source that does not compile fails the check.
 visor-authority-check: $(OUT_DIR)/visor/visor_effect_request.o $(OMEGA_BIN)
-	sh tests/visor/check_authority_link.sh $(OUT_DIR)
+	OMEGA_OM_SRCS='$(OMEGA_OM_SRCS)' sh tests/visor/check_authority_link.sh $(OUT_DIR)
