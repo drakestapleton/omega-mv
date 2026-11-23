@@ -20,7 +20,8 @@ def summarize(directory):
             assert n==20
             groups[group]=dict(Counter(r["verdict"] for r in rows if r["group"]==group))
         budget=max(r["query_count"] for r in rows)
-        assert all(len({tuple(q[0]) for q in r["queries"]})==r["query_count"]==8 for r in rows)
+        assert all(len({tuple(q[0]) for q in r["queries"]})==r["query_count"]<=8 for r in rows)
+        assert all(r["query_count"]==8 for r in rows if r["verdict"]!="error")
         times=[r["seconds"] for r in rows]
         counts[arm]=dict(verdicts=dict(Counter(r["verdict"] for r in rows)),groups=groups,
                          query_max=budget,selection_total_seconds=sum(times),
@@ -31,7 +32,9 @@ def summarize(directory):
                   no_more_wrong=a["verdicts"].get("wrong",0)<=b["verdicts"].get("wrong",0),
                   fewer_wrong_branches=a["groups"]["branch"].get("wrong",0)<b["groups"]["branch"].get("wrong",0),
                   within_budget=a["query_max"]<=8)
-    return dict(arms=counts,criteria=criteria,decision="advance" if all(criteria.values()) else "experimental")
+    interrupted = (directory/"interruption.json").exists()
+    return dict(arms=counts,criteria=criteria,interrupted=interrupted,
+                decision="advance" if all(criteria.values()) and not interrupted else "experimental")
 
 
 if __name__=="__main__":

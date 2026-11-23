@@ -3,11 +3,18 @@ from pathlib import Path
 import subprocess
 
 
+class ComponentFailure(RuntimeError):
+    def __init__(self, argv, result):
+        self.details = {"component": Path(argv[0]).name, "exit": result.returncode,
+                        "stderr": result.stderr.decode(errors="replace")[-500:]}
+        super().__init__(self.details)
+
+
 def invoke(argv, permitted):
     timeout = 2400 if Path(argv[0]).name == "solve" else 240
     result = subprocess.run(argv, capture_output=True, timeout=timeout)
     if result.returncode not in permitted:
-        raise RuntimeError((str(argv[0]), result.returncode, result.stderr.decode(errors="replace")[-500:]))
+        raise ComponentFailure(argv, result)
     return result
 
 
