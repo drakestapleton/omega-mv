@@ -1,52 +1,961 @@
 note SPDX-License-Identifier: Apache-2.0
-note tests/physics0/test_pd0_osc.om: Pure OM-2 differential verification of pd0_helpers.osc arithmetic.
+note tests/physics0/test_pd0_osc.om: Pure OM-2 OSC-3 parser, bytecode VM, and
+note differential verifier for tests/physics0/osc/pd0_helpers.osc against
+note src/physics0/ (pd0_mul, pd0_const, pd0_noise, pd0_relation_step,
+note pd0_relation_description_bits).
 note Prints PHYSICS0_OSC_DIFF: PASS|FAIL.
 
+text OSC_DEF_PATH "tests/physics0/osc/pd0_helpers.osc"
 text OSC_TAG "osc-diff"
+text OSC_ERR_READ "cannot read "
+text OSC_ERR_PARSE "refused: osc parse error at byte "
+text OSC_ERR_EXPECT "FAIL: expect-run mismatch\n"
+text OSC_ERR_ENTRY "FAIL: missing entry function\n"
+text OSC_ERR_MISM "FAIL: differential mismatches against pure-OM physics0\n"
 text OSC_P1 "osc differential: runs="
 text OSC_P2 " mismatches="
-text OSC_P3 " native=om2\n"
+text OSC_P3 " native=om2-vm\n"
 text OSC_PASS "PHYSICS0_OSC_DIFF: PASS\n"
 text OSC_FAIL "PHYSICS0_OSC_DIFF: FAIL\n"
 
-fn osc_const_draw lo long hi long uu long to long
-ret add lo pd0_mul sub hi lo uu
+text OSC_KW_FN "fn"
+text OSC_KW_LET "let"
+text OSC_KW_RET "return"
+text OSC_KW_U32 "u32"
+text OSC_KW_I64 "i64"
+text OSC_PRE_ENTRY "// entry:"
+text OSC_PRE_EXPECT "// expect-run:"
+
+text OSC_FN_MUL "mul"
+text OSC_FN_CDRAW "const_draw"
+text OSC_FN_NMAP "noise_map"
+text OSC_FN_L0S0 "l0_s0"
+text OSC_FN_L0S1 "l0_s1"
+text OSC_FN_L1S0 "l1_s0"
+text OSC_FN_L1S1 "l1_s1"
+text OSC_FN_L2S1 "l2_s1"
+text OSC_FN_CUBE "cube"
+text OSC_FN_DBITS "description_bits"
+
+const OSC_OP_PUSH ulong 1
+const OSC_OP_LOAD ulong 2
+const OSC_OP_STORE ulong 3
+const OSC_OP_ADD ulong 4
+const OSC_OP_SUB ulong 5
+const OSC_OP_MUL ulong 6
+const OSC_OP_DIV ulong 7
+const OSC_OP_NEG ulong 8
+const OSC_OP_CALL ulong 9
+const OSC_OP_RET ulong 10
+
+const OSC_MAX_SRC ulong 32768
+const OSC_MAX_FN ulong 32
+const OSC_MAX_BC ulong 4096
+const OSC_MAX_LOC ulong 16
+const OSC_NAME_SZ ulong 32
+
+global g_osc_path uchar 512
+global g_osc_plen ulong 1
+global g_osc_src uchar 32768
+global g_osc_slen ulong 1
+global g_osc_pos ulong 1
+global g_osc_err ulong 1
+
+note Function table (32 functions)
+global g_fn_cnt ulong 1
+global g_fn_name uchar 1024
+global g_fn_nlen ulong 32
+global g_fn_nparam ulong 32
+global g_fn_nloc ulong 32
+global g_fn_ret_u32 ulong 32
+global g_fn_bc_off ulong 32
+global g_fn_bc_len ulong 32
+
+note Current function local/param name table (16 slots x 32 bytes)
+global g_loc_name uchar 512
+global g_loc_nlen ulong 16
+global g_loc_cnt ulong 1
+
+note Flat bytecode buffer
+global g_bc_op ulong 4096
+global g_bc_arg long 4096
+global g_bc_cnt ulong 1
+
+note Scratch token buffer
+global g_tok uchar 64
+global g_tlen ulong 1
+
+note VM execution state (call depth up to 8, value stack up to 256)
+global g_vm_stk long 256
+global g_vm_sp ulong 1
+global g_vm_loc long 128
+global g_vm_trap ulong 1
+global g_vm_args long 8
+global g_vm_runs ulong 1
+global g_vm_fail ulong 1
+
+note ---- Lexer helpers ----
+
+fn osc_is_sp b uchar to bool
+if or eq b uchar 32 or eq b uchar 9 or eq b uchar 10 eq b uchar 13
+ret true
+end
+ret false
 end
 
-fn osc_noise_map u1 long u2 long u3 long u4 long sigma long to long
-s = sub add add u1 u2 add u3 u4 long 2000000
-ret div mul s sigma PD0_IH_SD
+fn osc_is_dig b uchar to bool
+if and ge b uchar 48 le b uchar 57
+ret true
+end
+ret false
 end
 
-fn osc_l0_s0 s0 long s1 long to long
-ret add s0 s1
+fn osc_is_id0 b uchar to bool
+if and ge b uchar 65 le b uchar 90
+ret true
+end
+if and ge b uchar 97 le b uchar 122
+ret true
+end
+if eq b uchar 95
+ret true
+end
+ret false
 end
 
-fn osc_l0_s1 s1 long u long to long
-ret add s1 u
+fn osc_is_id b uchar to bool
+if osc_is_id0 b
+ret true
+end
+ret osc_is_dig b
 end
 
-fn osc_l1_s0 s0 long s1 long dt long to long
-ret add s0 pd0_mul s1 dt
+fn osc_skip_ws to void
+n = get g_osc_slen 0
+p = get g_osc_pos 0
+while lt p n bound 32768
+b = get g_osc_src p
+if osc_is_sp b
+p = add p 1
+continue
+end
+if eq b uchar 47
+if lt add p 1 n
+if eq get g_osc_src add p 1 uchar 47
+p = add p 2
+while lt p n bound 32768
+if eq get g_osc_src p uchar 10
+p = add p 1
+break
+end
+p = add p 1
+end
+continue
+end
+end
+end
+break
+end
+put g_osc_pos 0 p
 end
 
-fn osc_l1_s1 s0 long s1 long u long k long dt long to long
-ret add s1 pd0_mul add neg pd0_mul k s0 u dt
+fn osc_peek to uchar
+osc_skip_ws
+p = get g_osc_pos 0
+if ge p get g_osc_slen 0
+ret uchar 0
+end
+ret get g_osc_src p
 end
 
-fn osc_l2_s1 s0 long s1 long u long k long c long dt long to long
-ret add s1 pd0_mul add sub neg pd0_mul k s0 pd0_mul c s1 u dt
+fn osc_expect_ch ch uchar to bool
+osc_skip_ws
+p = get g_osc_pos 0
+if ge p get g_osc_slen 0
+put g_osc_err 0 1
+ret false
+end
+if ne get g_osc_src p ch
+put g_osc_err 0 1
+ret false
+end
+put g_osc_pos 0 add p 1
+ret true
 end
 
-fn osc_cube s0 long to long
-ret pd0_mul pd0_mul s0 s0 s0
+fn osc_read_ident to ulong
+osc_skip_ws
+n = get g_osc_slen 0
+p = get g_osc_pos 0
+if ge p n
+put g_tlen 0 0
+ret 0
+end
+if not osc_is_id0 get g_osc_src p
+put g_tlen 0 0
+ret 0
+end
+k = ulong 0
+while lt p n bound 64
+b = get g_osc_src p
+if not osc_is_id b
+break
+end
+if lt k 31
+put g_tok k b
+k = add k 1
+end
+p = add p 1
+end
+put g_osc_pos 0 p
+put g_tlen 0 k
+ret k
 end
 
-fn osc_desc_bits nv ulong nc ulong nt ulong nl ulong to uint
-ret add mul uint 8 uint nl mul add mul uint 8 uint add nv nc uint 24 uint nt
+fn osc_tok_eq s view uchar * to bool
+tl = get g_tlen 0
+if ne tl len s
+ret false
+end
+for i ulong tl bound 64
+if ne get g_tok i get s i
+ret false
+end
+end
+ret true
 end
 
-fn osc_iter_dyn rng edit ulong 1 to ulong
+fn osc_read_int to long
+osc_skip_ws
+n = get g_osc_slen 0
+p = get g_osc_pos 0
+v = long 0
+got = ulong 0
+while lt p n bound 32
+b = get g_osc_src p
+if not osc_is_dig b
+break
+end
+v = add mul v long 10 long sub b uchar 48
+got = add got 1
+p = add p 1
+end
+if eq got 0
+put g_osc_err 0 1
+ret 0
+end
+put g_osc_pos 0 p
+ret v
+end
+
+note ---- Symbol table and bytecode emission ----
+
+fn osc_emit op ulong arg long to void
+c = get g_bc_cnt 0
+if ge c OSC_MAX_BC
+put g_osc_err 0 1
+ret
+end
+put g_bc_op c op
+put g_bc_arg c arg
+put g_bc_cnt 0 add c 1
+end
+
+fn osc_find_fn_tok to long
+fc = get g_fn_cnt 0
+tl = get g_tlen 0
+for i ulong fc bound 32
+if eq get g_fn_nlen i tl
+off = mul i OSC_NAME_SZ
+ok = true
+for j ulong tl bound 32
+if ne get g_fn_name add off j get g_tok j
+ok = false
+break
+end
+end
+if ok
+ret long i
+end
+end
+end
+ret -1
+end
+
+fn osc_find_fn_txt s view uchar * to long
+fc = get g_fn_cnt 0
+sl = len s
+for i ulong fc bound 32
+if eq get g_fn_nlen i sl
+off = mul i OSC_NAME_SZ
+ok = true
+for j ulong sl bound 32
+if ne get g_fn_name add off j get s j
+ok = false
+break
+end
+end
+if ok
+ret long i
+end
+end
+end
+ret -1
+end
+
+fn osc_find_loc_tok to long
+lc = get g_loc_cnt 0
+tl = get g_tlen 0
+for i ulong lc bound 16
+if eq get g_loc_nlen i tl
+off = mul i OSC_NAME_SZ
+ok = true
+for j ulong tl bound 32
+if ne get g_loc_name add off j get g_tok j
+ok = false
+break
+end
+end
+if ok
+ret long i
+end
+end
+end
+ret -1
+end
+
+fn osc_add_loc_tok to long
+lc = get g_loc_cnt 0
+tl = get g_tlen 0
+if or ge lc OSC_MAX_LOC eq tl 0
+put g_osc_err 0 1
+ret -1
+end
+off = mul lc OSC_NAME_SZ
+for j ulong tl bound 32
+put g_loc_name add off j get g_tok j
+end
+put g_loc_nlen lc tl
+put g_loc_cnt 0 add lc 1
+ret long lc
+end
+
+note ---- Recursive-descent expression parser ----
+
+fn osc_parse_call fi ulong to void
+want = get g_fn_nparam fi
+got = ulong 0
+if ne osc_peek uchar 41
+more = true
+while more bound 16
+osc_parse_expr
+if ne get g_osc_err 0 0
+ret
+end
+got = add got 1
+if eq osc_peek uchar 44
+ok = osc_expect_ch uchar 44
+else
+more = false
+end
+end
+end
+if not osc_expect_ch uchar 41
+ret
+end
+if ne got want
+put g_osc_err 0 1
+ret
+end
+osc_emit OSC_OP_CALL long fi
+end
+
+fn osc_parse_primary to void
+if ne get g_osc_err 0 0
+ret
+end
+c = osc_peek
+if eq c uchar 40
+ok = osc_expect_ch uchar 40
+osc_parse_expr
+ok2 = osc_expect_ch uchar 41
+ret
+end
+if osc_is_dig c
+v = osc_read_int
+osc_emit OSC_OP_PUSH v
+ret
+end
+if osc_is_id0 c
+tl = osc_read_ident
+if eq tl 0
+put g_osc_err 0 1
+ret
+end
+if eq osc_peek uchar 40
+fi = osc_find_fn_tok
+if lt fi 0
+put g_osc_err 0 1
+ret
+end
+ok = osc_expect_ch uchar 40
+osc_parse_call ulong fi
+ret
+end
+li = osc_find_loc_tok
+if lt li 0
+put g_osc_err 0 1
+ret
+end
+osc_emit OSC_OP_LOAD li
+ret
+end
+put g_osc_err 0 1
+end
+
+fn osc_parse_unary to void
+if ne get g_osc_err 0 0
+ret
+end
+if eq osc_peek uchar 45
+ok = osc_expect_ch uchar 45
+osc_parse_unary
+osc_emit OSC_OP_NEG 0
+ret
+end
+osc_parse_primary
+end
+
+fn osc_parse_mul to void
+osc_parse_unary
+while eq get g_osc_err 0 0 bound 64
+c = osc_peek
+if eq c uchar 42
+ok = osc_expect_ch uchar 42
+osc_parse_unary
+osc_emit OSC_OP_MUL 0
+else
+if eq c uchar 47
+ok = osc_expect_ch uchar 47
+osc_parse_unary
+osc_emit OSC_OP_DIV 0
+else
+break
+end
+end
+end
+end
+
+fn osc_parse_expr to void
+osc_parse_mul
+while eq get g_osc_err 0 0 bound 64
+c = osc_peek
+if eq c uchar 43
+ok = osc_expect_ch uchar 43
+osc_parse_mul
+osc_emit OSC_OP_ADD 0
+else
+if eq c uchar 45
+ok = osc_expect_ch uchar 45
+osc_parse_mul
+osc_emit OSC_OP_SUB 0
+else
+break
+end
+end
+end
+end
+
+note ---- Statement and function parser ----
+
+fn osc_parse_type to ulong
+tl = osc_read_ident
+if eq tl 0
+put g_osc_err 0 1
+ret 0
+end
+if osc_tok_eq OSC_KW_U32
+ret 1
+end
+if osc_tok_eq OSC_KW_I64
+ret 0
+end
+put g_osc_err 0 1
+ret 0
+end
+
+fn osc_parse_params to ulong
+np = ulong 0
+if ne osc_peek uchar 41
+more = true
+while more bound 16
+tl = osc_read_ident
+if eq tl 0
+put g_osc_err 0 1
+ret 0
+end
+li = osc_add_loc_tok
+if not osc_expect_ch uchar 58
+ret 0
+end
+ty = osc_parse_type
+if ne get g_osc_err 0 0
+ret 0
+end
+np = add np 1
+if eq osc_peek uchar 44
+ok = osc_expect_ch uchar 44
+else
+more = false
+end
+end
+end
+if not osc_expect_ch uchar 41
+ret 0
+end
+ret np
+end
+
+fn osc_parse_stmt to void
+tl = osc_read_ident
+if osc_tok_eq OSC_KW_LET
+tl2 = osc_read_ident
+if eq tl2 0
+put g_osc_err 0 1
+ret
+end
+li = osc_add_loc_tok
+if not osc_expect_ch uchar 58
+ret
+end
+ty = osc_parse_type
+if not osc_expect_ch uchar 61
+ret
+end
+osc_parse_expr
+if not osc_expect_ch uchar 59
+ret
+end
+osc_emit OSC_OP_STORE li
+ret
+end
+if osc_tok_eq OSC_KW_RET
+osc_parse_expr
+if not osc_expect_ch uchar 59
+ret
+end
+osc_emit OSC_OP_RET 0
+ret
+end
+put g_osc_err 0 1
+end
+
+fn osc_parse_fn to void
+fi = get g_fn_cnt 0
+if ge fi OSC_MAX_FN
+put g_osc_err 0 1
+ret
+end
+tl = osc_read_ident
+if eq tl 0
+put g_osc_err 0 1
+ret
+end
+off = mul fi OSC_NAME_SZ
+for j ulong tl bound 32
+put g_fn_name add off j get g_tok j
+end
+put g_fn_nlen fi tl
+put g_loc_cnt 0 0
+if not osc_expect_ch uchar 40
+ret
+end
+np = osc_parse_params
+if ne get g_osc_err 0 0
+ret
+end
+if not osc_expect_ch uchar 45
+ret
+end
+if not osc_expect_ch uchar 62
+ret
+end
+ru32 = osc_parse_type
+if not osc_expect_ch uchar 123
+ret
+end
+bstart = get g_bc_cnt 0
+while and eq get g_osc_err 0 0 ne osc_peek uchar 125 bound 128
+osc_parse_stmt
+end
+if not osc_expect_ch uchar 125
+ret
+end
+put g_fn_nparam fi np
+put g_fn_nloc fi get g_loc_cnt 0
+put g_fn_ret_u32 fi ru32
+put g_fn_bc_off fi bstart
+put g_fn_bc_len fi sub get g_bc_cnt 0 bstart
+put g_fn_cnt 0 add fi 1
+end
+
+fn osc_parse_unit to int
+put g_osc_pos 0 0
+put g_osc_err 0 0
+put g_fn_cnt 0 0
+put g_bc_cnt 0 0
+while eq get g_osc_err 0 0 bound 64
+if eq osc_peek uchar 0
+break
+end
+tl = osc_read_ident
+if not osc_tok_eq OSC_KW_FN
+put g_osc_err 0 1
+break
+end
+osc_parse_fn
+end
+if ne get g_osc_err 0 0
+ret -1
+end
+ret 0
+end
+
+note ---- Bytecode VM evaluator ----
+
+fn vm_push v long to void
+sp = get g_vm_sp 0
+if ge sp 256
+put g_vm_trap 0 6
+ret
+end
+put g_vm_stk sp v
+put g_vm_sp 0 add sp 1
+end
+
+fn vm_pop to long
+sp = get g_vm_sp 0
+if eq sp 0
+put g_vm_trap 0 8
+ret 0
+end
+nsp = sub sp 1
+put g_vm_sp 0 nsp
+ret get g_vm_stk nsp
+end
+
+fn vm_binop op ulong to void
+b = vm_pop
+a = vm_pop
+if eq op OSC_OP_ADD
+vm_push add a b
+ret
+end
+if eq op OSC_OP_SUB
+vm_push sub a b
+ret
+end
+if eq op OSC_OP_MUL
+vm_push mul a b
+ret
+end
+if eq op OSC_OP_DIV
+if eq b 0
+put g_vm_trap 0 2
+ret
+end
+vm_push div a b
+ret
+end
+put g_vm_trap 0 8
+end
+
+fn vm_exec fi ulong depth ulong to long
+if ge depth 8
+put g_vm_trap 0 6
+ret 0
+end
+lbase = mul depth OSC_MAX_LOC
+np = get g_fn_nparam fi
+if eq depth 0
+for i ulong np bound 8
+put g_vm_loc add lbase i get g_vm_args i
+end
+else
+for k ulong np bound 8
+idx = sub sub np 1 k
+put g_vm_loc add lbase idx vm_pop
+end
+end
+boff = get g_fn_bc_off fi
+blen = get g_fn_bc_len fi
+for pc ulong blen bound 256
+if ne get g_vm_trap 0 0
+ret 0
+end
+op = get g_bc_op add boff pc
+arg = get g_bc_arg add boff pc
+if eq op OSC_OP_PUSH
+vm_push arg
+end
+if eq op OSC_OP_LOAD
+vm_push get g_vm_loc add lbase ulong arg
+end
+if eq op OSC_OP_STORE
+put g_vm_loc add lbase ulong arg vm_pop
+end
+if and ge op OSC_OP_ADD le op OSC_OP_DIV
+vm_binop op
+end
+if eq op OSC_OP_NEG
+vm_push neg vm_pop
+end
+if eq op OSC_OP_CALL
+rv = vm_exec ulong arg add depth 1
+vm_push rv
+end
+if eq op OSC_OP_RET
+res = vm_pop
+if ne get g_fn_ret_u32 fi 0
+ret long and ulong res ulong 0xffffffff
+end
+ret res
+end
+end
+put g_vm_trap 0 8
+ret 0
+end
+
+fn vm_call fi ulong to long
+put g_vm_sp 0 0
+put g_vm_trap 0 0
+put g_vm_runs 0 add get g_vm_runs 0 1
+ret vm_exec fi 0
+end
+
+note ---- Directive checkers (// entry: and // expect-run:) ----
+
+fn line_starts_with ls ulong lend ulong pre view uchar * to bool
+pl = len pre
+if lt sub lend ls pl
+ret false
+end
+for i ulong pl bound 32
+if ne get g_osc_src add ls i get pre i
+ret false
+end
+end
+ret true
+end
+
+fn scan_tok_in_line p ulong lend ulong to ulong
+while lt p lend bound 256
+b = get g_osc_src p
+if or eq b uchar 32 eq b uchar 9
+p = add p 1
+else
+break
+end
+end
+k = ulong 0
+while lt p lend bound 64
+b = get g_osc_src p
+if or eq b uchar 32 or eq b uchar 9 eq b uchar 13
+break
+end
+if lt k 31
+put g_tok k b
+k = add k 1
+end
+p = add p 1
+end
+put g_tlen 0 k
+ret p
+end
+
+fn parse_signed_tok to long
+tl = get g_tlen 0
+if eq tl 0
+ret 0
+end
+i = ulong 0
+is_neg = false
+if eq get g_tok 0 uchar 45
+is_neg = true
+i = 1
+end
+v = long 0
+while lt i tl bound 32
+b = get g_tok i
+if not osc_is_dig b
+break
+end
+v = add mul v long 10 long sub b uchar 48
+i = add i 1
+end
+if is_neg
+ret neg v
+end
+ret v
+end
+
+fn check_entry_line ls ulong lend ulong to ulong
+p = add ls len OSC_PRE_ENTRY
+bad = ulong 0
+while lt p lend bound 32
+p = scan_tok_in_line p lend
+if eq get g_tlen 0 0
+break
+end
+if lt osc_find_fn_tok 0
+bad = add bad 1
+end
+end
+ret bad
+end
+
+fn tok_is_arrow to bool
+if ne get g_tlen 0 2
+ret false
+end
+if ne get g_tok 0 uchar 45
+ret false
+end
+ret eq get g_tok 1 uchar 62
+end
+
+fn check_expect_line ls ulong lend ulong to ulong
+p = add ls len OSC_PRE_EXPECT
+p = scan_tok_in_line p lend
+if eq get g_tlen 0 0
+ret 1
+end
+fi = osc_find_fn_tok
+if lt fi 0
+ret 1
+end
+argc = ulong 0
+have_arrow = false
+while lt p lend bound 16
+p = scan_tok_in_line p lend
+if eq get g_tlen 0 0
+break
+end
+if tok_is_arrow
+have_arrow = true
+break
+end
+if lt argc 8
+put g_vm_args argc parse_signed_tok
+argc = add argc 1
+end
+end
+if not have_arrow
+ret 1
+end
+if ne argc get g_fn_nparam ulong fi
+ret 1
+end
+p = scan_tok_in_line p lend
+if eq get g_tlen 0 0
+ret 1
+end
+want = parse_signed_tok
+got = vm_call ulong fi
+if ne get g_vm_trap 0 0
+ret 1
+end
+if ne got want
+ret 1
+end
+ret 0
+end
+
+fn check_directives to ulong
+n = get g_osc_slen 0
+pos = ulong 0
+bad = ulong 0
+while lt pos n bound 1024
+ls = pos
+while lt pos n bound 512
+if eq get g_osc_src pos uchar 10
+break
+end
+pos = add pos 1
+end
+lend = pos
+if lt pos n
+pos = add pos 1
+end
+if line_starts_with ls lend OSC_PRE_ENTRY
+if ne check_entry_line ls lend 0
+pd0_puts 1 OSC_ERR_ENTRY
+bad = add bad 1
+end
+end
+if line_starts_with ls lend OSC_PRE_EXPECT
+if ne check_expect_line ls lend 0
+pd0_puts 1 OSC_ERR_EXPECT
+bad = add bad 1
+end
+end
+end
+ret bad
+end
+
+note ---- Differential verification against pure-OM physics0 ----
+
+global g_fi ulong 10
+
+fn bind_one_fn slot ulong s view uchar * to bool
+f = osc_find_fn_txt s
+if lt f 0
+ret false
+end
+put g_fi slot ulong f
+ret true
+end
+
+fn bind_required_fns to bool
+if not bind_one_fn 0 OSC_FN_MUL
+ret false
+end
+if not bind_one_fn 1 OSC_FN_CDRAW
+ret false
+end
+if not bind_one_fn 2 OSC_FN_NMAP
+ret false
+end
+if not bind_one_fn 3 OSC_FN_L0S0
+ret false
+end
+if not bind_one_fn 4 OSC_FN_L0S1
+ret false
+end
+if not bind_one_fn 5 OSC_FN_L1S0
+ret false
+end
+if not bind_one_fn 6 OSC_FN_L1S1
+ret false
+end
+if not bind_one_fn 7 OSC_FN_L2S1
+ret false
+end
+if not bind_one_fn 8 OSC_FN_CUBE
+ret false
+end
+ret bind_one_fn 9 OSC_FN_DBITS
+end
+
+fn diff_call_check slot ulong want long to ulong
+got = vm_call get g_fi slot
+if or ne get g_vm_trap 0 0 ne got want
+ret 1
+end
+ret 0
+end
+
+fn diff_iter_dyn rng edit ulong 1 to ulong
 mism = ulong 0
 dt = long 50000
 s0 = pd0_const rng neg PD0_BOUND PD0_BOUND
@@ -54,28 +963,34 @@ s1 = pd0_const rng neg PD0_BOUND PD0_BOUND
 u = pd0_const rng long -2000000 long 2000000
 k = pd0_const rng long 0 long 9000000
 c = pd0_const rng long 0 long 2000000
-if ne osc_l0_s0 s0 s1 add s0 s1
-mism = add mism 1
-end
-if ne osc_l0_s1 s1 u add s1 u
-mism = add mism 1
-end
-if ne osc_l1_s0 s0 s1 dt add s0 pd0_mul s1 dt
-mism = add mism 1
-end
-if ne osc_l1_s1 s0 s1 u k dt add s1 pd0_mul add neg pd0_mul k s0 u dt
-mism = add mism 1
-end
-if ne osc_l2_s1 s0 s1 u k c dt add s1 pd0_mul add sub neg pd0_mul k s0 pd0_mul c s1 u dt
-mism = add mism 1
-end
-if ne osc_cube s0 pd0_mul pd0_mul s0 s0 s0
-mism = add mism 1
-end
+put g_vm_args 0 s0
+put g_vm_args 1 s1
+mism = add mism diff_call_check 0 pd0_mul s0 s1
+put g_vm_args 0 s0
+put g_vm_args 1 s1
+mism = add mism diff_call_check 3 add s0 s1
+put g_vm_args 0 s1
+put g_vm_args 1 u
+mism = add mism diff_call_check 4 add s1 u
+put g_vm_args 0 s0
+put g_vm_args 1 s1
+put g_vm_args 2 dt
+mism = add mism diff_call_check 5 add s0 pd0_mul s1 dt
+put g_vm_args 0 s0
+put g_vm_args 1 s1
+put g_vm_args 2 u
+put g_vm_args 3 k
+put g_vm_args 4 dt
+mism = add mism diff_call_check 6 add s1 pd0_mul add neg pd0_mul k s0 u dt
+put g_vm_args 4 c
+put g_vm_args 5 dt
+mism = add mism diff_call_check 7 add s1 pd0_mul add sub neg pd0_mul k s0 pd0_mul c s1 u dt
+put g_vm_args 0 s0
+mism = add mism diff_call_check 8 pd0_mul pd0_mul s0 s0 s0
 ret mism
 end
 
-fn osc_iter_bits rng edit ulong 1 to ulong
+fn diff_iter_bits rng edit ulong 1 to ulong
 nv = add ulong 1 rem pd0_splitmix64 rng ulong 4
 nl = rem pd0_splitmix64 rng ulong 2
 if ge nl nv
@@ -89,21 +1004,24 @@ put p0r_nlat 0 uchar nl
 put p0r_nch 0 uchar nc
 put p0r_neq 0 uchar 1
 put p0r_eq_nt p0r_eq_idx 0 0 uchar nt
-if ne osc_desc_bits nv nc nt nl pd0_relation_description_bits ulong 0
-ret ulong 1
-end
-ret ulong 0
+want = long pd0_relation_description_bits ulong 0
+put g_vm_args 0 long nv
+put g_vm_args 1 long nc
+put g_vm_args 2 long nt
+put g_vm_args 3 long nl
+ret diff_call_check 9 want
 end
 
-fn osc_iter_rng rng edit ulong 1 to ulong
+fn diff_iter_rng rng edit ulong 1 to ulong
 mism = ulong 0
 r1 = new ulong 1 0
 lo = pd0_const rng long -5000000 long 5000000
 hi = add lo pd0_const rng long 0 long 9000000
 uu = pd0_uniform rng
-if ne osc_const_draw lo hi uu add lo pd0_mul sub hi lo uu
-mism = add mism 1
-end
+put g_vm_args 0 lo
+put g_vm_args 1 hi
+put g_vm_args 2 uu
+mism = add mism diff_call_check 1 add lo pd0_mul sub hi lo uu
 sigma = pd0_const rng long 0 long 500000
 put r1 0 get rng 0
 want = pd0_noise edit r1 sigma
@@ -111,31 +1029,126 @@ u1 = pd0_uniform rng
 u2 = pd0_uniform rng
 u3 = pd0_uniform rng
 u4 = pd0_uniform rng
-if ne osc_noise_map u1 u2 u3 u4 sigma want
-mism = add mism 1
+put g_vm_args 0 u1
+put g_vm_args 1 u2
+put g_vm_args 2 u3
+put g_vm_args 3 u4
+put g_vm_args 4 sigma
+mism = add mism diff_call_check 2 want
+ret add mism diff_iter_bits rng
 end
-ret add mism osc_iter_bits rng
+
+fn osc_read_file to int
+fd = fopen g_osc_path 0 get g_osc_plen 0 int 0 int 0
+if lt fd 0
+ret -1
+end
+tot = ulong 0
+done = false
+while not done bound 256
+if ge tot OSC_MAX_SRC
+dc = fclose int fd
+ret -1
+end
+k = read int fd g_osc_src tot sub OSC_MAX_SRC tot
+if lt k 0
+dc = fclose int fd
+ret -1
+end
+if eq k 0
+done = true
+else
+tot = add tot ulong k
+end
+end
+dc = fclose int fd
+put g_osc_slen 0 tot
+ret 0
+end
+
+fn parse_u64_arg buf view uchar * n ulong to ulong
+v = ulong 0
+for i ulong n bound 24
+b = get buf i
+if or lt b uchar 48 gt b uchar 57
+ret 0
+end
+v = add mul v 10 ulong sub b uchar 48
+end
+ret v
 end
 
 fn main to int
-iters = ulong 20000
+ab = new uchar 32 0
+obuf = new uchar 128 0
 rng = new ulong 1 0
+ac = argcnt
+if gt ac 1
+k1 = argread 1 g_osc_path 0 512
+if le k1 0
+pd0_puts 1 OSC_FAIL
+ret 1
+end
+put g_osc_plen 0 ulong k1
+else
+pl = len OSC_DEF_PATH
+for i ulong pl bound 64
+put g_osc_path i get OSC_DEF_PATH i
+end
+put g_osc_plen 0 pl
+end
+iters = ulong 20000
+if gt ac 2
+k2 = argread 2 ab 0 32
+if gt k2 0
+iv = parse_u64_arg view ab ulong k2
+if gt iv 0
+iters = iv
+end
+end
+end
+if ne osc_read_file 0
+pd0_puts 1 OSC_ERR_READ
+w = write 1 g_osc_path 0 get g_osc_plen 0
+put obuf 0 uchar 10
+w2 = write 1 obuf 0 1
+pd0_puts 1 OSC_FAIL
+ret 1
+end
+if ne osc_parse_unit 0
+p = pd0_buf_str edit obuf 0 128 OSC_ERR_PARSE
+p = pd0_buf_u64 edit obuf p 128 get g_osc_pos 0
+p = pd0_buf_ch edit obuf p 128 uchar 10
+pd0_put_bytes 1 view obuf p
+pd0_puts 1 OSC_FAIL
+ret 1
+end
+put g_vm_runs 0 0
+put g_vm_fail 0 0
+if not bind_required_fns
+pd0_puts 1 OSC_ERR_ENTRY
+pd0_puts 1 OSC_FAIL
+ret 1
+end
+bad_dir = check_directives
+put g_vm_fail 0 add get g_vm_fail 0 bad_dir
 pd0_stream edit rng ulong 0x9d0 OSC_TAG
 mism = ulong 0
-runs = ulong 0
-for it ulong iters bound 25000
-mism = add mism osc_iter_dyn edit rng
-mism = add mism osc_iter_rng edit rng
-runs = add runs ulong 10
+for it ulong iters bound 1000000
+mism = add mism diff_iter_dyn edit rng
+mism = add mism diff_iter_rng edit rng
 end
-obuf = new uchar 128 0
-p = pd0_buf_str edit obuf ulong 0 ulong 128 OSC_P1
-p = pd0_buf_u64 edit obuf p ulong 128 runs
-p = pd0_buf_str edit obuf p ulong 128 OSC_P2
-p = pd0_buf_u64 edit obuf p ulong 128 mism
-p = pd0_buf_str edit obuf p ulong 128 OSC_P3
+if ne mism 0
+pd0_puts 1 OSC_ERR_MISM
+put g_vm_fail 0 add get g_vm_fail 0 1
+end
+p = pd0_buf_str edit obuf 0 128 OSC_P1
+p = pd0_buf_u64 edit obuf p 128 get g_vm_runs 0
+p = pd0_buf_str edit obuf p 128 OSC_P2
+p = pd0_buf_u64 edit obuf p 128 mism
+p = pd0_buf_str edit obuf p 128 OSC_P3
 pd0_put_bytes 1 view obuf p
-if eq mism ulong 0
+if eq get g_vm_fail 0 0
 pd0_puts 1 OSC_PASS
 ret 0
 end
