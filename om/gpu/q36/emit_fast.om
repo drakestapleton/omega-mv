@@ -1079,7 +1079,7 @@ qic 17 12 15 QZ 3 qAlu4
 note Load Q[h*256 + lane*8 .. +7] via 2x LDG.E.128 -> R20..R27, scale by 1/sqrt(256) = 0.0625
 qMad 52 15 256 QZ
 qMad 52 14 8 52
-qicImm 9 16 52 0 4 qAlu4
+qicImm 9 16 52 0 4 qW1
 qic 57 20 16 QZ 0 qLdW1
 qic 57 24 16 QZ 16 qLd
 qic 0 QZ QZ QZ 0 qW0
@@ -2790,6 +2790,257 @@ qic 12 QZ 16 30 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
 
+note =========================================================================
+note y (28): fa_prep_q_dec_gpu -- Exact per-head q_norm + partial RoPE + *0.0625 -> Q_rot[16,256]
+note Args: QG_in[16,512] (R0:1), q_norm[256] (R2:3), rope[131072,64] (R4:5),
+note       Q_rot[16,256] (R6:7), pos_ptr[1] (R8:9).
+note Grid: (16, 1, 1), Block: 256 (h = blockIdx.x, d = tid), SMEM: 1088.
+note =========================================================================
+fn qFaPrepQDecGpu to void
+qStart 5
+qLit 52 0
+qicImm 9 16 52 8 4 qW1
+qic 11 20 16 QZ 0 qLd
+qMad 24 15 512 14
+qicImm 9 16 24 0 4 qW1
+qic 11 21 16 QZ 0 qLd
+qicImm 9 16 14 2 4 qW1
+qic 11 23 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 48 21 21 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 55 1024
+qLit 57 1
+bQw = qBssy
+qic 28 QZ 52 57 0 qCmp
+skQw = qBraFwd 1
+qMad 53 53 4 55
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skQw 1
+qBsync bQw
+qBar
+qNum 48 0.0f32
+for w ulong 8
+qLit 56 add 1024 mul w 4
+qic 49 49 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 49 0 qAlu4
+end
+qNum 49 0.00390625f32
+qNum 50 0.000001f32
+qic4 33 48 48 49 50 qAlu4
+qic 41 49 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qNum 50 1.0f32
+qic 30 23 23 50 0 qAlu4
+qic 32 21 21 49 0 qAlu4
+qic 32 21 21 23 0 qAlu4
+qMad 53 14 4 QZ
+qic 50 QZ 53 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qLit 57 64
+bQr = qBssy
+qic 28 QZ 14 57 0 qCmp
+skQr = qBraFwd 1
+qic 18 25 14 QZ 31 qAlu4
+qMad 26 20 64 25
+qicImm 9 16 26 4 4 qW1
+qic 11 27 16 QZ 0 qLd
+qLit 52 32
+qIadd 28 26 52
+qicImm 9 16 28 4 4 qW1
+qic 11 29 16 QZ 0 qLd
+qMad 53 25 4 QZ
+qic 49 30 53 QZ 0 qLd
+qIadd 54 25 52
+qMad 54 54 4 QZ
+qic 49 31 54 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 32 30 27 0 qAlu4
+qic 32 33 31 29 0 qAlu4
+qic 31 32 32 33 0 qAlu4
+qic 32 34 31 27 0 qAlu4
+qic4 33 34 30 29 34 qAlu4
+qic 28 QZ 14 52 0 qCmp
+qicImm 8 21 32 QZ 1 qAlu4
+put q36Guard 0 1
+qicImm 8 21 34 QZ 1 qAlu4
+qPatch skQr 1
+qBsync bQr
+qNum 50 0.0625f32
+qic 32 21 21 50 0 qAlu4
+qMad 24 15 256 14
+qicImm 9 16 24 6 4 qAlu4
+qic 12 QZ 16 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note z (29): fa_attend_split_f32 -- Warp-only Split-K (S=8) F32 Flash-Decoding
+note   Zero BAR.SYNC, zero SMEM, 128 warps across 16 heads x 8 splits, 4x LDG.E.128!
+note Args: Q_rot[16,256] (R0:1), K_cache[131072,2,256] (R2:3), V_cache[131072,2,256] (R4:5),
+note       O_part[16,8,256] (R6:7), ml_part[16,8,2] (R8:9), pos_ptr[1] (R10:11).
+note Grid: (16, 8, 1), Block: 32 (h=ctax, s=ctay, lane=tid), SMEM: 0.
+note =========================================================================
+fn qFaAttendSplitF32 to void
+qStart 6
+qic 17 12 15 QZ 3 qAlu4
+qLit 52 0
+qicImm 9 16 52 10 4 qW1
+qic 11 13 16 QZ 0 qLd
+qMad 52 15 256 QZ
+qMad 52 14 8 52
+qicImm 9 16 52 0 4 qW1
+qic 57 20 16 QZ 0 qLd
+qic 57 24 16 QZ 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 52 1
+qIadd 13 13 52
+qMad 54 18 512 QZ
+qMad 54 12 256 54
+qMad 54 14 8 54
+qicImm 9 48 54 2 4 qAlu4
+qicImm 9 50 54 4 4 qAlu4
+for j ulong 8
+qNum add 28 j 0.0f32
+end
+qNum 36 -1000000000.0f32
+qNum 37 0.0f32
+qNum 38 1.4426950408889634f32
+qicImm 8 0 18 QZ 1 qAlu4
+qLit 1 8
+bSkip = qBssy
+qic 28 QZ 0 13 0 qCmp
+skSkip = qBraFwd 1
+mTok = get q36Pc 0
+qic 57 40 48 QZ 0 qLd
+qic 57 44 48 QZ 16 qLd
+qic 57 52 50 QZ 0 qLd
+qic 57 56 50 QZ 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 2 20 40 0 qAlu4
+for j ulong 7
+qic4 33 2 add 21 j add 41 j 2 qAlu4
+end
+qWarpBflySum 2 3
+qic 37 3 36 2 0 qAlu4
+qic 31 4 36 3 0 qAlu4
+qExp 4 4 38
+qic 31 5 2 3 0 qAlu4
+qExp 5 5 38
+qic 32 37 37 4 0 qAlu4
+qic 30 37 37 5 0 qAlu4
+qicImm 8 36 3 QZ 1 qAlu4
+for j ulong 7
+qic 32 add 28 j add 28 j 4 0 qAlu1
+end
+qic 32 35 35 4 0 qAlu4
+for j ulong 7
+qic4 33 add 28 j 5 add 52 j add 28 j qAlu1
+end
+qic4 33 35 5 59 35 qAlu4
+qicImm 9 48 1 48 2048 qAlu1
+qicImm 9 50 1 50 2048 qAlu1
+qIadd 0 0 1
+qic 28 QZ 0 13 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mTok get q36Pc 0 qAlu4
+qPatch skSkip 1
+qBsync bSkip
+qMad 52 15 8 18
+qMad 53 52 256 QZ
+qMad 53 14 8 53
+for j ulong 8
+qLit 54 j
+qIadd 54 53 54
+qicImm 9 16 54 6 4 qAlu4
+qic 12 QZ 16 add 28 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+qLit 57 1
+qic 28 QZ 14 57 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qMad 53 52 2 QZ
+qicImm 9 16 53 8 4 qAlu4
+qic 12 QZ 16 36 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 53 53 57
+qicImm 9 16 53 8 4 qAlu4
+qic 12 QZ 16 37 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note A (30): fa_reduce_gate_dec -- Split-K combine + fused sigmoid(gate) on QG_in[16,512]
+note Args: O_part[16,S,256] (R0:1), ml_part[16,S,2] (R2:3), QG_in[16,512] (R4:5), out[16,256] (R6:7), S (32).
+note Grid: (16, 1, 1), Block: 256, SMEM: 0.
+note =========================================================================
+fn qFaReduceGateDec to void
+qStart 4
+qParam 20 32
+qMadReg 21 15 20 QZ
+qNum 22 -1000000000.0f32
+qLit 23 0
+qLit 24 1
+mMax = get q36Pc 0
+qIadd 25 21 23
+qMad 25 25 2 QZ
+qicImm 9 16 25 2 4 qW1
+qic 11 52 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 37 22 22 52 0 qAlu4
+qIadd 23 23 24
+qic 28 QZ 23 20 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mMax get q36Pc 0 qAlu4
+qNum 26 0.0f32
+qNum 27 0.0f32
+qNum 28 1.4426950408889634f32
+qLit 23 0
+mComb = get q36Pc 0
+qIadd 25 21 23
+qMad 29 25 2 QZ
+qicImm 9 16 29 2 4 qW1
+qic 11 30 16 QZ 0 qLd
+qIadd 29 29 24
+qicImm 9 16 29 2 4 qW1
+qic 11 31 16 QZ 0 qLd
+qMad 29 25 256 14
+qicImm 9 16 29 0 4 qW1
+qic 11 32 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 31 33 30 22 0 qAlu4
+qExp 33 33 28
+qic4 33 27 31 33 27 qAlu4
+qic4 33 26 32 33 26 qAlu4
+qIadd 23 23 24
+qic 28 QZ 23 20 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mComb get q36Pc 0 qAlu4
+qic 40 27 27 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 26 26 27 0 qAlu4
+qMad 33 15 512 14
+qLit 37 256
+qIadd 33 33 37
+qicImm 9 16 33 4 4 qW1
+qic 11 34 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qNum 35 -1.4426950408889634f32
+qNum 36 1.0f32
+qSig 34 34 35 36
+qic 32 26 26 34 0 qAlu4
+qMad 29 15 256 14
+qicImm 9 16 29 6 4 qAlu4
+qic 12 QZ 16 26 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
 note Helper: quantize 32 weights (1 per lane) in R24 -> pack 4 u32s to W_w4, return f32 scale in R25
 fn qQuant32Pack dstOffReg ulong to void
 note abs_w = R24 & 0x7fffffff -> warp max in R25
@@ -3704,6 +3955,18 @@ ret true
 end
 if eq mode 127
 qBf16Gemv1R
+ret true
+end
+if eq mode 128
+qFaPrepQDecGpu
+ret true
+end
+if eq mode 129
+qFaAttendSplitF32
+ret true
+end
+if eq mode 130
+qFaReduceGateDec
 ret true
 end
 ret false

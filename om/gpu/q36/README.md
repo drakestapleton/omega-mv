@@ -72,14 +72,33 @@ Verified on live Spark GB10 silicon (exclusive quiet window `20261121T232155Z-31
 | Wave 5: 4-row/warp W4 + 9-expert MoE + fused FA `Q\|K\|V` + fused router | `16.179 ms/tok` | `61.80 tok/s` | `7.54×` | `PARITY=EXACT` (`tok=271`), `**Paris**.` |
 | **Wave 6–11: Full-W4 Final + Live Arboris** (`20261122T002657Z-c1ec5b`, fused SwiGLU + `qMoeCombine9RmsFast` + 33-CTA `qBf16Gemv1R` + `LDG.E.128` SMEM + interleaved `qW4MacBlock` + `QDW_TRACE` live Arboris) | **`14.731 ms/tok`** | **`67.88 tok/s`** | **`8.28×`** | **`PARITY=EXACT` (`tok=271`), `**Paris**.`, Arboris `42–44%`** |
 
+## High-Speed SM121 Tensor-Core Chunked Prefill + Live Arboris (`emit_prefill.om`, `decode/prefill_host.om`)
+
+`emit_prefill.om` adds **17 pure seeded-Omega SM121 prefill kernels** (`modes 130..146`, `kids 26..42`, `B_MAX = 512` tokens/chunk in a `128 MB` UVM workspace with pre-recorded `slot 3`/`slot 4` GPFIFO packets for zero per-chunk CPU packet recording):
+- **SM121 Tensor-Core W4 & BF16 GEMMs (`qPreW4GemmHmma`, `qPreBf16GemmBatch`):** `HMMA.16816.F32.BF16` (`op 16`) + `F2FP.BF16.F32.PACK_AB` (`op 61`) + `LDG.E.128` (`op 57`) with unconditional 4-tile dense path and pipelined `>=6`-cycle W4 dequantization.
+- **SM121 Tensor-Core Flash-Attention-2 (`qPreFaPrepQBatch` + `qPreFaAttendHmma`):** Full `HMMA.16816` for BOTH `S = Q @ K^T` and `O = alpha * O + P @ V` (`16 Q-rows × 64 KV-tokens`, 8 warps, half-warp `SHFL.BFLY` online softmax, 8-in-flight transposed `V_tr` loads, exact causal mask + `sigmoid(gate)` epilogue).
+- **Zero-Barrier Warp-Resident Chunked GDN (`qPreGdnStepBatch`):** Each 32-lane warp owns all 128 K/Q dims (`4` dims/lane via `LDG.E.128`) × 4 contiguous V-cols (`16` FP32 state floats loaded ONCE and stored ONCE per 512-token chunk); all `dot_k` and `o` reductions use pure intra-warp `SHFL.BFLY` with **zero `BAR.SYNC` and zero SMEM** (`3.53×` faster than multi-warp GDN).
+- **Deduplicated Hot-First Tensor-Core 256-Expert MoE (`qPreMoeBuildGroups` + `qPreW4MoeHmma`):** Zero-atomic GPU expert bucketing with 3-pass Hot-First `EXP_ORDER[0..255]` (`cnt > 32` heavy experts launch first to eliminate tail-straggler wave bubbles, `cnt == 0` exits in 2 cycles).
+- **Async Overlapped Live Arboris (Always On):** Every prompt token (`0..N-1`) emits its 40-layer top-8 routing trace into `QP_TRACE`; sparse-touch `q36ArbPredict` (`6×` faster CPU) runs asynchronously while the GPU executes the next prefill chunk (and overlaps the final prefill chunk behind decode step 1 in `q36-serve`), hiding CPU Arboris latency while warming the 40-layer co-activation graph across the entire prompt.
+- **2-Byte Indexed Pure-OM-2 ByteLevel BPE Tokenizer (`serve/tokenizer.om`):** Replaces linear vocab scans with a `65,536`-bucket 2-byte prefix index (`~20,000×` faster tokenization on long prompts up to 128K).
+
+Verified on live Spark GB10 silicon (exclusive quiet windows `20261122T025449Z-5436d0` & `20261122T025801Z-4c9b80`, `exit: 0`, `NVRM: Xid` delta `0`; still uses NVIDIA open kernel modules 580.173.02 + signed GSP firmware):
+
+| Real-Weight 40L Full-W4 Prefill & Decode (128K Context + Live Arboris) | Wall Time | Throughput | Speedup vs Seq W4 | Live Arboris |
+|---|---:|---:|---:|---|
+| 17-tok prompt parity + 24-tok decode (`q36-decode ... 24 w4`) | `14.72–14.91 ms/tok` | **`67.09–67.91 tok/s`** | `PARITY=EXACT` (`tok=271`) | `37%` (cold 17-tok) |
+| **`1,024`-token real-weight prefill (`q36-decode ... 1024 p`)** | **`550–559 ms`** | **`1,831–1,861 tok/s`** | **`25.1×`** | **`52%`** (`97 ms` overlapped) |
+| **`4,096`-token real-weight prefill (`q36-decode ... 4096 p`)** | **`2,255–2,290 ms`** | **`1,788–1,816 tok/s`** | **`24.5×`** | **`51%`** (`433 ms` overlapped) |
+| **`16,384`-token (16K) real-weight prefill (`q36-decode ... 16384 p`)** | **`14,573–14,580 ms`** | **`1,123–1,124 tok/s`** | **`15.2×`** | **`50%`** (`1,986 ms` overlapped) |
+| Live HTTP `1,681`-tok 4-chunk needle recall + `32`-tok decode (`20261122T030412Z-7e0119`) | `1,918 ms` total | exact needle recall | 4 chunks (`512×3 + 145`) | **`40%`** (`218,493 / 534,056`) |
+
 ## Installed 35B Package + OpenAI HTTP Server (`om/gpu/q36/serve/` -> `q36-serve`, `q36-35b`)
 
-`q36-serve` (`508 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) wraps the 40-layer Full-W4 (`~66.3–67.9 tok/s`, `~19.5 GB` weights + `5.37 GB` 128K KV cache + `32 MB` 128K RoPE, default) / Exact FP8 (`48.09 tok/s`, `--fp8`) engine + **live Arboris online co-activation prefetcher** + **pure OM-2 ByteLevel BPE tokenizer** (`tokenizer.om`, `248,044` vocab) in an OpenAI-compatible HTTP server (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, **`131,072`-token (`128K`) context window**).
+`q36-serve` (`715 KB` static AArch64 ELF, `ldd: not a dynamic executable`, zero CUDA / zero `libc` / zero C / zero Python) wraps the 40-layer Full-W4 (`67.1–67.9 tok/s` decode, **`1,831–1,861 tok/s` 1K–4K prefill**, `~19.5 GB` weights + `5.37 GB` 128K KV cache + `32 MB` 128K RoPE + `128 MB` prefill workspace, default) / Exact FP8 (`48.09 tok/s`, `--fp8`) engine + **live Arboris online co-activation prefetcher (always enabled)** + **2-byte indexed pure OM-2 ByteLevel BPE tokenizer** (`tokenizer.om`, `248,044` vocab) in an OpenAI-compatible HTTP server (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, **`131,072`-token (`128K`) context window**).
 
-Verified on live Spark GB10 silicon (exclusive quiet window `20261122T010926Z-02fb35`, `exit: 0`, quiet machine, `NVRM: Xid` delta `0`; note: still uses NVIDIA open kernel modules 580.173.02 + signed GSP firmware):
-- `q36-35b --self-test` (128K context + `pos = 131,071` boundary pass + Live Arboris): `Prompt 0: "\n\nThe capital of France is **Paris**."`, `Prompt 1: "\n2 + 2 = 4"`, **`Live Arboris: hits=7120 / tot=15840 (44%)`**, `PASS`.
-- Live HTTP E2E (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`): reports `"context_window":131072`, `"arboris_enabled":true`, `"precision":"w4"`, returns exact completion `"\n\nThe capital of France is **Paris**."` and live Arboris telemetry (`"arboris":{"hits":3341,"total":7728,"hit_pct":43}`).
-- `q36-decode` 24-token real-weight parity & speed at 128K context: `PARITY=EXACT vs Full BF16 (tok=271)`, **`15.092 ms/tok` (`66.26 tok/s`)**, `arboris_real_hit_pct=42`.
+Verified on live Spark GB10 silicon (exclusive quiet window `20261122T025801Z-4c9b80`, `exit: 0`, quiet machine, `NVRM: Xid` delta `0`; still uses NVIDIA open kernel modules 580.173.02 + signed GSP firmware):
+- `q36-35b --self-test` (128K context + `pos = 131,071` boundary pass + Tensor-Core prefill + Live Arboris): `Prompt 0: "\n\nThe capital of France is **Paris**."`, `Prompt 1: "\n2 + 2 = 4"`, **`Live Arboris: hits=6540 / tot=15752 (41%)`**, `PASS`.
+- Live HTTP E2E (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions`): reports `"context_window":131072`, `"arboris_enabled":true`, `"precision":"w4"`, returns exact completion `"\n\nThe capital of France is **Paris**."`, `1,077`-tok prompt in `728 ms` (`arboris_hit_pct: 46`), and `1,681`-tok 4-chunk needle-in-a-haystack recall (`Captain Elena Vance`, `Aurora-742`) in `1,918 ms` (`arboris_hit_pct: 40`).
 - Sustained load soak (window `20261121T233252Z-375404`, `NVRM: Xid` delta `0`): Full-W4 `20/20` bit-exact turns (`1,000` gen toks) at `67.59 tok/s` (`46–49 °C`, `32 W`, `2548 MHz`); Exact FP8 `10/10` bit-exact turns (`500` gen toks) at `48.09 tok/s`; Full-W4 under concurrent 8-core CPU + 512 MB RAM burn `10/10` bit-exact turns at `64.51 tok/s`.
 
 ## Build, Install, and Run
