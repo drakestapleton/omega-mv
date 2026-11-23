@@ -1,0 +1,921 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/physics0/planner/pd0_planner.om: PD-0 experiment planner (spec section 8, revision 5). Direction 5.
+note Pure OM-2 port of pd0_planner.c. The planner PROPOSES only: the proposal is a PD0EXP1 preregistration
+note (verifier layout, src/physics0/ladder/pd0_fmt.om, held in a ve_ slot) the recorder must chain ahead of
+note any TRIAL record. Inputs are learner-visible only: hypotheses (vr_ relation slots), the visited domain,
+note the remaining budget, the describe bounds and a seed. No generator, oracle or authority name appears in
+note this file (p0p-purity, mk/physics0-planner.mk). No floating point: divergence and cost are integer
+note micro-unit arithmetic with 128-bit intermediates (pp_w* helpers, two 64-bit limbs).
+note Prior sets: pr = 0 is the C NULL prior (no hash is ever a duplicate), pr = 1 is the one prior set below.
+note OM-2 functions take at most 6 parameters, so pd0p_propose reads the prior id from the proposal (o.prior).
+
+const PD0P_CANDIDATES ulong 256
+const PD0P_REFINE_TOP ulong 16
+const PD0P_REFINE_ROUNDS ulong 8
+const PD0P_MAX_PRIOR uint 4096
+const PD0P_MIN_D_MICRO long 3000000
+const PD0P_PLAN_SIZE ulong 84
+
+const PD0P_OK int 0
+const PD0P_NO_DISCRIMINATING_EXPERIMENT int 1
+const PD0P_ERR_BOUNDS int -1
+const PD0P_ERR_DUPLICATE int -2
+const PD0P_ERR_INPUT int -3
+const PD0P_ERR_BUDGET int -4
+
+text PP_MAGIC "PD0PLN1"
+text PP_TAG_PLAN "plan"
+text PP_TAG_PASSIVE "passive"
+
+note the planner structs (Pd0pBounds, Pd0pDomain, Pd0pHyps, Pd0pProposal) are in pd0_planner_types.om, which
+note comes first in every build: an OM-2 struct is declared before the first fn of the program.
+
+
+note ---- the prior set (pr = 1) ----
+global pp_prior_n uint 1
+global pp_prior_h uchar 131072
+
+note ---- candidates: 0..255 the candidate set, 256 the refinement mutant, 257 the passive scratch ----
+const PC_MUT ulong 256
+const PC_TMP ulong 257
+global pc_reset long 2064
+global pc_ch uchar 5160
+global pc_val long 5160
+global pc_hash uchar 8256
+global pc_d long 258
+global pc_info long 258
+global pc_cost long 258
+global pc_elig uchar 258
+global pc_perm ulong 256
+global pc_nobs ulong 1
+global pc_nsteps ulong 1
+
+note ---- evaluation context: hypothesis slots, residual sd, prior id; pe_exp is [hyp 8][step 20][obs 8] ----
+global pp_hslot ulong 8
+global pp_nh ulong 1
+global pp_rsd long 1
+global pp_pr ulong 1
+global pe_exp long 1280
+
+note ---- 128-bit unsigned helpers: w[0] low limb, w[1] high limb ----
+
+fn pp_wmul a ulong b ulong w edit ulong 2 to void
+x = mul and a ulong 0xffffffff and b ulong 0xffffffff
+y = mul and a ulong 0xffffffff shr b 32
+z = mul shr a 32 and b ulong 0xffffffff
+m = add shr x 32 and y ulong 0xffffffff
+m = add m and z ulong 0xffffffff
+put w 0 or shl m 32 and x ulong 0xffffffff
+x = add mul shr a 32 shr b 32 shr y 32
+x = add x shr z 32
+put w 1 add x shr m 32
+ret
+end
+
+note w = w / d (d > 0), truncating
+fn pp_wdiv w edit ulong 2 d ulong to void
+hi = get w 1
+lo = get w 0
+if eq hi ulong 0
+put w 0 div lo d
+ret
+end
+qh = div hi d
+r = rem hi d
+ql = ulong 0
+for i ulong 64
+carry = shr r 63
+r = or shl r 1 shr lo 63
+lo = shl lo 1
+ql = shl ql 1
+if or ne carry ulong 0 ge r d
+r = sub r d
+ql = or ql ulong 1
+end
+end
+put w 0 ql
+put w 1 qh
+ret
+end
+
+fn pp_wadd acc edit ulong 2 w view ulong 2 to void
+lo = add get acc 0 get w 0
+c = ulong 0
+if lt lo get w 0
+c = ulong 1
+end
+put acc 0 lo
+put acc 1 add add get acc 1 get w 1 c
+ret
+end
+
+note ---- prior set ----
+
+fn pd0p_prior_clear to void
+put pp_prior_n 0 uint 0
+ret
+end
+
+fn pd0p_prior_add h view uchar 32 to void
+n = get pp_prior_n 0
+if lt n PD0P_MAX_PRIOR
+b = mul ulong n PD0_HASH
+for k ulong 32
+put pp_prior_h add b k get h k
+end
+put pp_prior_n 0 add n uint 1
+end
+ret
+end
+
+fn pd0p_prior_add_ve slot ulong to void
+h = new uchar 32 0
+b = mul slot PD0_HASH
+for k ulong 32
+put h k get ve_shash add b k
+end
+pd0p_prior_add view h
+ret
+end
+
+fn pp_prior_eq b ulong h view uchar 32 to bool
+for k ulong 32
+if ne get pp_prior_h add b k get h k
+ret false
+end
+end
+ret true
+end
+
+fn pd0p_prior_has pr ulong h view uchar 32 to bool
+if eq pr ulong 0
+ret false
+end
+n = ulong get pp_prior_n 0
+for i ulong n bound 4096
+if pp_prior_eq mul i PD0_HASH h
+ret true
+end
+end
+ret false
+end
+
+fn pp_prior_has_pc ci ulong to bool
+h = new uchar 32 0
+b = mul ci PD0_HASH
+for k ulong 32
+put h k get pc_hash add b k
+end
+ret pd0p_prior_has get pp_pr 0 view h
+end
+
+fn pp_prior_has_ve pr ulong slot ulong to bool
+h = new uchar 32 0
+b = mul slot PD0_HASH
+for k ulong 32
+put h k get ve_shash add b k
+end
+ret pd0p_prior_has pr view h
+end
+
+note ---- bounds ----
+
+fn pp_bounds_ok b view Pd0pBounds to bool
+no = ulong get b n_obs
+nc = ulong get b n_channels
+if or eq no ulong 0 gt no V_MAX_OBS
+ret false
+end
+if or eq nc ulong 0 gt nc V_MAX_CHAN
+ret false
+end
+for i ulong no bound 8
+if gt get b reset_min i get b reset_max i
+ret false
+end
+end
+for i ulong nc bound 4
+if gt get b chan_min i get b chan_max i
+ret false
+end
+end
+ret true
+end
+
+fn pp_step_ok b view Pd0pBounds c uchar v long to bool
+if ge c get b n_channels
+ret false
+end
+if lt v get b chan_min ulong c
+ret false
+end
+ret le v get b chan_max ulong c
+end
+
+fn pp_steps_in_bounds b view Pd0pBounds slot ulong to bool
+ns = ulong get ve_nsteps slot
+sb = mul slot V_MAX_STEPS
+for s ulong ns bound 20
+if not pp_step_ok b get ve_step_ch add sb s get ve_step_val add sb s
+ret false
+end
+end
+ret true
+end
+
+fn pp_resets_in_bounds b view Pd0pBounds slot ulong to bool
+no = ulong get ve_nobs slot
+rb = mul slot V_MAX_OBS
+for i ulong no bound 8
+v = get ve_reset add rb i
+if lt v get b reset_min i
+ret false
+end
+if gt v get b reset_max i
+ret false
+end
+end
+ret true
+end
+
+fn pp_sched_in_bounds b view Pd0pBounds slot ulong to bool
+if ne get ve_nobs slot get b n_obs
+ret false
+end
+ns = ulong get ve_nsteps slot
+if or eq ns ulong 0 gt ns V_MAX_STEPS
+ret false
+end
+em = ulong get b episode_max_steps
+if ne em ulong 0
+if gt ns em
+ret false
+end
+end
+if not pp_resets_in_bounds b slot
+ret false
+end
+ret pp_steps_in_bounds b slot
+end
+
+fn pp_steps_for b view Pd0pBounds budget uint to ulong
+n = V_MAX_STEPS
+em = ulong get b episode_max_steps
+if and ne em ulong 0 lt em n
+n = em
+end
+if lt ulong budget n
+n = ulong budget
+end
+ret and n ulong 255
+end
+
+note ---- candidate schedules ----
+
+fn pp_cand_zero ci ulong to void
+rb = mul ci V_MAX_OBS
+for i ulong 8
+put pc_reset add rb i long 0
+end
+sb = mul ci V_MAX_STEPS
+for s ulong 20
+put pc_ch add sb s uchar 0
+put pc_val add sb s long 0
+end
+ret
+end
+
+fn pp_random_sched r edit ulong 1 b view Pd0pBounds ns ulong ci ulong to void
+pp_cand_zero ci
+no = ulong get b n_obs
+nc = ulong get b n_channels
+rb = mul ci V_MAX_OBS
+for i ulong no bound 8
+put pc_reset add rb i pd0_const r get b reset_min i get b reset_max i
+end
+sb = mul ci V_MAX_STEPS
+for s ulong ns bound 20
+c = rem pd0_splitmix64 r nc
+put pc_ch add sb s uchar c
+put pc_val add sb s pd0_const r get b chan_min c get b chan_max c
+end
+ret
+end
+
+fn pp_cand_hash ci ulong to void
+rst = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+rb = mul ci V_MAX_OBS
+for i ulong 8
+put rst i get pc_reset add rb i
+end
+sb = mul ci V_MAX_STEPS
+for s ulong 20
+put chs s get pc_ch add sb s
+put vals s get pc_val add sb s
+end
+h = new uchar 32 0
+vr_schedule_hash_raw get pc_nobs 0 view rst get pc_nsteps 0 view chs view vals edit h
+hb = mul ci PD0_HASH
+for k ulong 32
+put pc_hash add hb k get h k
+end
+ret
+end
+
+note one tick of hypothesis slot along candidate ci's step s; st becomes the next state (C memcpy of all 12)
+fn pp_step1 slot ulong ci ulong s ulong st edit long 12 to void
+nx = new long 12 0
+i = add mul ci V_MAX_STEPS s
+vr_rel_step slot st get pc_ch i get pc_val i edit nx
+for j ulong 12
+put st j get nx j
+end
+ret
+end
+
+fn pp_store_exp k ulong s ulong st view long 12 to void
+no = get pc_nobs 0
+eb = mul add mul k V_MAX_STEPS s V_MAX_OBS
+for i ulong no bound 8
+put pe_exp add eb i get st i
+end
+ret
+end
+
+fn pp_rollout_one ci ulong k ulong to void
+st = new long 12 0
+rb = mul ci V_MAX_OBS
+no = get pc_nobs 0
+for i ulong no bound 8
+put st i get pc_reset add rb i
+end
+slot = get pp_hslot k
+ns = get pc_nsteps 0
+for s ulong ns bound 20
+pp_step1 slot ci s edit st
+pp_store_exp k s view st
+end
+ret
+end
+
+fn pp_abs64 x long to long
+if lt x long 0
+ret neg x
+end
+ret x
+end
+
+fn pp_pair_max a ulong b2 ulong s ulong to long
+ea = mul add mul a V_MAX_STEPS s V_MAX_OBS
+eb = mul add mul b2 V_MAX_STEPS s V_MAX_OBS
+m = long 0
+for i ulong get pc_nobs 0 bound 8
+x = get pe_exp add ea i
+x = pp_abs64 sub x get pe_exp add eb i
+if gt x m
+m = x
+end
+end
+ret m
+end
+
+note largest |expected[a][s][i] - expected[b][s][i]| over pairs a < b and observed variables i
+fn pp_stepmax s ulong to long
+nh = get pp_nh 0
+m = long 0
+for a ulong nh bound 8
+for b2 ulong nh bound 8
+if gt b2 a
+d = pp_pair_max a b2 s
+if gt d m
+m = d
+end
+end
+end
+end
+ret m
+end
+
+note info += (stepmax * 1e6 / r)^2 / 1e6; a quotient of 2^64 or more saturates (C: signed i128 overflow)
+fn pp_info_add info edit ulong 2 sat edit uchar 1 stepmax long r long to void
+q = new ulong 2 0
+pp_wmul ulong stepmax ulong 1000000 edit q
+pp_wdiv edit q ulong r
+if ne get q 1 ulong 0
+put sat 0 uchar 1
+ret
+end
+sq = new ulong 2 0
+pp_wmul get q 0 get q 0 edit sq
+pp_wdiv edit sq ulong 1000000
+pp_wadd info view sq
+ret
+end
+
+note the C info clamp: an info proxy above INT64_MAX (or a saturated term) is INT64_MAX
+fn pp_info_value info view ulong 2 sat view uchar 1 to long
+vmax = long 9223372036854775807
+if ne get sat 0 uchar 0
+ret vmax
+end
+if ne get info 1 ulong 0
+ret vmax
+end
+if gt get info 0 ulong 9223372036854775807
+ret vmax
+end
+ret long get info 0
+end
+
+note D = max over steps of stepmax, as (maxdiff * 1e6) / r; the C (int64_t) cast keeps the low 64 bits
+fn pp_div_micro x long r long to long
+dq = new ulong 2 0
+pp_wmul ulong x ulong 1000000 edit dq
+pp_wdiv edit dq ulong r
+ret long get dq 0
+end
+
+fn pp_eval ci ulong to void
+for k ulong get pp_nh 0 bound 8
+pp_rollout_one ci k
+end
+info = new ulong 2 0
+sat = new uchar 1 0
+maxdiff = long 0
+cost = long 0
+sb = mul ci V_MAX_STEPS
+for s ulong get pc_nsteps 0 bound 20
+sm = pp_stepmax s
+if gt sm maxdiff
+maxdiff = sm
+end
+pp_info_add edit info edit sat sm get pp_rsd 0
+cost = add cost pp_abs64 get pc_val add sb s
+end
+put pc_d ci pp_div_micro maxdiff get pp_rsd 0
+put pc_info ci pp_info_value view info view sat
+put pc_cost ci cost
+pp_cand_hash ci
+ret
+end
+
+note spec 8 ordering: eligible first, then higher D, then lower cost, then lexicographic schedule hash
+fn pp_hash_lt a ulong b ulong to bool
+ab = mul a PD0_HASH
+bb = mul b PD0_HASH
+for k ulong 32
+x = get pc_hash add ab k
+y = get pc_hash add bb k
+if ne x y
+ret lt x y
+end
+end
+ret false
+end
+
+fn pp_better a ulong b ulong to bool
+ea = get pc_elig a
+eb = get pc_elig b
+if ne ea eb
+ret gt ea eb
+end
+da = get pc_d a
+db = get pc_d b
+if ne da db
+ret gt da db
+end
+ca = get pc_cost a
+cb = get pc_cost b
+if ne ca cb
+ret lt ca cb
+end
+ret pp_hash_lt a b
+end
+
+note insertion sort of pc_perm[0..n): stable, total order as in the C p_sort
+fn pp_sort n ulong to void
+for i ulong n bound 256
+if gt i ulong 0
+tmp = get pc_perm i
+j = i
+while gt j ulong 0 bound 256
+if not pp_better tmp get pc_perm sub j 1
+break
+end
+put pc_perm j get pc_perm sub j 1
+j = sub j 1
+end
+put pc_perm j tmp
+end
+end
+ret
+end
+
+fn pp_cand_copy dst ulong src ulong to void
+dr = mul dst V_MAX_OBS
+sr = mul src V_MAX_OBS
+for i ulong 8
+put pc_reset add dr i get pc_reset add sr i
+end
+ds = mul dst V_MAX_STEPS
+ss = mul src V_MAX_STEPS
+for s ulong 20
+put pc_ch add ds s get pc_ch add ss s
+put pc_val add ds s get pc_val add ss s
+end
+dh = mul dst PD0_HASH
+sh = mul src PD0_HASH
+for k ulong 32
+put pc_hash add dh k get pc_hash add sh k
+end
+put pc_d dst get pc_d src
+put pc_info dst get pc_info src
+put pc_cost dst get pc_cost src
+put pc_elig dst get pc_elig src
+ret
+end
+
+note ---- ve_ slot helpers ----
+
+fn pp_ve_clear slot ulong to void
+put ve_nobs slot uchar 0
+put ve_nhyp slot uchar 0
+put ve_nsteps slot uchar 0
+put ve_div slot long 0
+rb = mul slot V_MAX_OBS
+for i ulong 8
+put ve_reset add rb i long 0
+end
+sb = mul slot V_MAX_STEPS
+for s ulong 20
+put ve_step_ch add sb s uchar 0
+put ve_step_val add sb s long 0
+end
+eb = mul slot ulong 1280
+for k ulong 1280
+put ve_expected add eb k long 0
+end
+hb = mul slot PD0_HASH
+for k ulong 32
+put ve_shash add hb k uchar 0
+end
+ret
+end
+
+note candidate schedule and hash into a cleared ve_ slot
+fn pp_cand_to_ve ci ulong slot ulong to void
+put ve_nobs slot uchar get pc_nobs 0
+put ve_nsteps slot uchar get pc_nsteps 0
+dr = mul slot V_MAX_OBS
+sr = mul ci V_MAX_OBS
+for i ulong 8
+put ve_reset add dr i get pc_reset add sr i
+end
+ds = mul slot V_MAX_STEPS
+ss = mul ci V_MAX_STEPS
+for s ulong 20
+put ve_step_ch add ds s get pc_ch add ss s
+put ve_step_val add ds s get pc_val add ss s
+end
+dh = mul slot PD0_HASH
+sh = mul ci PD0_HASH
+for k ulong 32
+put ve_shash add dh k get pc_hash add sh k
+end
+ret
+end
+
+fn pp_pe_step_to_ve slot ulong k ulong s ulong to void
+eb = mul add mul k V_MAX_STEPS s V_MAX_OBS
+db = vr_exp_idx slot k s ulong 0
+for i ulong get pc_nobs 0 bound 8
+put ve_expected add db i get pe_exp add eb i
+end
+ret
+end
+
+note the hypotheses' expected trajectories (n_hyp x n_steps x n_obs) into a cleared ve_ slot
+fn pp_pe_to_ve slot ulong to void
+for k ulong get pp_nh 0 bound 8
+for s ulong get pc_nsteps 0 bound 20
+pp_pe_step_to_ve slot k s
+end
+end
+ret
+end
+
+fn pp_out_var dom view Pd0pDomain slot ulong i ulong to bool
+lo = get dom var_min i
+hi = get dom var_max i
+if le hi lo
+ret false
+end
+q = div sub hi lo long 4
+mlo = add lo q
+mhi = sub hi q
+r = get ve_reset add mul slot V_MAX_OBS i
+if or lt r mlo gt r mhi
+ret true
+end
+ns = ulong get ve_nsteps slot
+for s ulong ns bound 20
+v = get ve_expected vr_exp_idx slot ulong 0 s i
+if or lt v mlo gt v mhi
+ret true
+end
+end
+ret false
+end
+
+fn pp_outside_middle dom view Pd0pDomain slot ulong to uchar
+no = ulong get ve_nobs slot
+for i ulong no bound 8
+if pp_out_var dom slot i
+ret uchar 1
+end
+end
+ret uchar 0
+end
+
+note ---- public ----
+
+fn pd0p_validate b view Pd0pBounds pr ulong slot ulong to int
+if not pp_bounds_ok b
+ret PD0P_ERR_INPUT
+end
+if ne get ve_nobs slot get b n_obs
+ret PD0P_ERR_INPUT
+end
+h = new uchar 32 0
+vr_schedule_hash slot edit h
+hb = mul slot PD0_HASH
+for k ulong 32
+if ne get h k get ve_shash add hb k
+ret PD0P_ERR_INPUT
+end
+end
+if not pp_sched_in_bounds b slot
+ret PD0P_ERR_BOUNDS
+end
+if pp_prior_has_ve pr slot
+ret PD0P_ERR_DUPLICATE
+end
+ret PD0P_OK
+end
+
+fn pp_hyps_ok b view Pd0pBounds h view Pd0pHyps to bool
+nh = ulong get h n_hyp
+if or lt nh ulong 2 gt nh V_MAX_HYP
+ret false
+end
+if le get h residual_sd_micro long 0
+ret false
+end
+for k ulong nh bound 8
+s = get h slot k
+if lt get vr_nvars s get b n_obs
+ret false
+end
+if lt get vr_nch s get b n_channels
+ret false
+end
+end
+ret true
+end
+
+fn pp_ctx_set h view Pd0pHyps pr ulong to void
+nh = ulong get h n_hyp
+put pp_nh 0 nh
+for k ulong nh bound 8
+put pp_hslot k get h slot k
+end
+put pp_rsd 0 get h residual_sd_micro
+put pp_pr 0 pr
+ret
+end
+
+fn pp_out_reset o edit Pd0pProposal seed ulong to void
+put o status 0
+put o divergence_micro long 0
+put o info_proxy_micro long 0
+put o cost_micro long 0
+put o n_candidates uint 0
+put o n_refined uint 0
+put o n_skipped_duplicate uint 0
+put o outside_middle uchar 0
+put o seed seed
+ret
+end
+
+note 256 seeded random schedules, each evaluated; returns the number skipped as duplicates
+fn pp_candidates rng edit ulong 1 b view Pd0pBounds ns ulong to uint
+skipped = uint 0
+for i ulong PD0P_CANDIDATES
+pp_random_sched rng b ns i
+pp_eval i
+e = uchar 1
+if pp_prior_has_pc i
+e = uchar 0
+skipped = add skipped uint 1
+end
+put pc_elig i e
+put pc_perm i i
+end
+ret skipped
+end
+
+note one mutation of candidate ci into the mutant slot: one reset or one step redrawn
+fn pp_mutate rng edit ulong 1 b view Pd0pBounds ci ulong to void
+pp_cand_copy PC_MUT ci
+no = ulong get b n_obs
+ns = get pc_nsteps 0
+pos = rem pd0_splitmix64 rng add no ns
+if lt pos no
+put pc_reset add mul PC_MUT V_MAX_OBS pos pd0_const rng get b reset_min pos get b reset_max pos
+ret
+end
+s = sub pos no
+ch = rem pd0_splitmix64 rng ulong get b n_channels
+put pc_ch add mul PC_MUT V_MAX_STEPS s uchar ch
+put pc_val add mul PC_MUT V_MAX_STEPS s pd0_const rng get b chan_min ch get b chan_max ch
+ret
+end
+
+note local refinement of the top 16, 8 rounds each; cnt[0] refined, cnt[1] skipped (added to)
+fn pp_refine rng edit ulong 1 b view Pd0pBounds cnt edit uint 2 to void
+for t ulong PD0P_REFINE_TOP
+ci = get pc_perm t
+for round ulong PD0P_REFINE_ROUNDS
+pp_mutate rng b ci
+pp_eval PC_MUT
+if pp_prior_has_pc PC_MUT
+put pc_elig PC_MUT uchar 0
+put cnt 1 add get cnt 1 uint 1
+continue
+end
+put pc_elig PC_MUT uchar 1
+if pp_better PC_MUT ci
+pp_cand_copy ci PC_MUT
+put cnt 0 add get cnt 0 uint 1
+end
+end
+end
+ret
+end
+
+fn pp_finish b view Pd0pBounds dom view Pd0pDomain o edit Pd0pProposal to int
+best = get pc_perm 0
+slot = get o exp_slot
+if eq get pc_elig best uchar 0
+put o status PD0P_ERR_DUPLICATE
+ret PD0P_ERR_DUPLICATE
+end
+pp_eval best
+pp_cand_to_ve best slot
+put ve_nhyp slot uchar get pp_nh 0
+put ve_div slot get pc_d best
+pp_pe_to_ve slot
+put o divergence_micro get pc_d best
+put o info_proxy_micro get pc_info best
+put o cost_micro get pc_cost best
+put o outside_middle pp_outside_middle dom slot
+st = PD0P_OK
+if not pp_sched_in_bounds b slot
+st = PD0P_ERR_BOUNDS
+else
+if lt get o divergence_micro PD0P_MIN_D_MICRO
+st = PD0P_NO_DISCRIMINATING_EXPERIMENT
+end
+end
+put o status st
+ret st
+end
+
+note Behaviours 1 to 6 of spec section 8. The caller sets o.exp_slot (the ve_ slot that receives the PD0EXP1)
+note and o.prior (0: no prior, the C NULL; 1: the prior set); the rest of o is reset. Returns the status.
+fn pd0p_propose b view Pd0pBounds dom view Pd0pDomain h view Pd0pHyps budget uint seed ulong o edit Pd0pProposal to int
+pr = get o prior
+pp_out_reset o seed
+pp_ve_clear get o exp_slot
+if or not pp_bounds_ok b not pp_hyps_ok b h
+put o status PD0P_ERR_INPUT
+ret PD0P_ERR_INPUT
+end
+if lt budget uint 2
+put o status PD0P_ERR_BUDGET
+ret PD0P_ERR_BUDGET
+end
+ns = pp_steps_for b budget
+put pc_nobs 0 ulong get b n_obs
+put pc_nsteps 0 ns
+pp_ctx_set h pr
+rng = new ulong 1 0
+pd0_stream edit rng seed PP_TAG_PLAN
+cnt = new uint 2 0
+put cnt 1 pp_candidates edit rng b ns
+pp_sort PD0P_CANDIDATES
+pp_refine edit rng b edit cnt
+pp_sort PD0P_REFINE_TOP
+put o n_candidates uint PD0P_CANDIDATES
+put o n_refined get cnt 0
+put o n_skipped_duplicate get cnt 1
+ret pp_finish b dom o
+end
+
+fn pd0p_prereg_bytes o view Pd0pProposal dst edit uchar * to ulong
+if ne get o status PD0P_OK
+ret ulong 0
+end
+ret vr_exp_write get o exp_slot dst
+end
+
+fn pd0p_plan_write o view Pd0pProposal dst edit uchar 84 to ulong
+for i ulong 7
+put dst i get PP_MAGIC i
+end
+put dst 7 uchar 0
+put dst 8 uchar 1
+put dst 9 uchar 0
+put dst 10 uchar and get o status int 255
+pd0_put_u32 dst ulong 11 get o n_candidates
+pd0_put_u32 dst ulong 15 get o n_refined
+pd0_put_u64 dst ulong 19 get o seed
+pd0_put_u64 dst ulong 27 bitcast ulong get o divergence_micro
+pd0_put_u64 dst ulong 35 bitcast ulong get o info_proxy_micro
+pd0_put_u64 dst ulong 43 bitcast ulong get o cost_micro
+put dst 51 get o outside_middle
+hb = mul get o exp_slot PD0_HASH
+for k ulong 32
+put dst add ulong 52 k get ve_shash add hb k
+end
+ret PD0P_PLAN_SIZE
+end
+
+note fills status, counters, seed, D, info, cost, flag and the schedule hash only (the C plan_parse)
+fn pd0p_plan_parse src view uchar * o edit Pd0pProposal to int
+if ne len src PD0P_PLAN_SIZE
+ret -1
+end
+if or ne pd0_eq_bytes src ulong 0 PP_MAGIC ulong 7 1 ne get src 7 uchar 0
+ret -1
+end
+if or ne get src 8 uchar 1 ne get src 9 uchar 0
+ret -1
+end
+slot = get o exp_slot
+pp_out_reset o ulong 0
+pp_ve_clear slot
+st = int get src 10
+if gt st int 127
+st = sub st int 256
+end
+put o status st
+put o n_candidates pd0_get_u32 src ulong 11
+put o n_refined pd0_get_u32 src ulong 15
+put o seed pd0_get_u64 src ulong 19
+put o divergence_micro bitcast long pd0_get_u64 src ulong 27
+put o info_proxy_micro bitcast long pd0_get_u64 src ulong 35
+put o cost_micro bitcast long pd0_get_u64 src ulong 43
+put o outside_middle get src 51
+hb = mul slot PD0_HASH
+for k ulong 32
+put ve_shash add hb k get src add ulong 52 k
+end
+ret 0
+end
+
+note preregistered passive baseline: the index-th uniform random schedule of a fixed stream, into ve_ slot
+fn pd0p_passive b view Pd0pBounds budget uint stream_seed ulong index uint slot ulong to int
+if not pp_bounds_ok b
+ret PD0P_ERR_INPUT
+end
+if lt budget uint 2
+ret PD0P_ERR_BUDGET
+end
+r = new ulong 1 0
+pd0_stream edit r stream_seed PP_TAG_PASSIVE
+put r 0 xor get r 0 mul ulong index ulong 0x9e3779b97f4a7c15
+ns = pp_steps_for b budget
+put pc_nobs 0 ulong get b n_obs
+put pc_nsteps 0 ns
+pp_random_sched edit r b ns PC_TMP
+pp_cand_hash PC_TMP
+pp_ve_clear slot
+pp_cand_to_ve PC_TMP slot
+ret PD0P_OK
+end
+
+fn pd0p_outside_fraction_ppm flags view uchar * n uint to uint
+if eq n uint 0
+ret uint 0
+end
+k = ulong 0
+for i ulong ulong n bound 1048576
+if ne get flags i uchar 0
+k = add k ulong 1
+end
+end
+ret uint div mul k ulong 1000000 ulong n
+end
