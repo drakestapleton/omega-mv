@@ -99,7 +99,7 @@ chmod +x "$out/dsv41-decode"
 
 `gen` and `chat` run the online Arboris cross-layer prefetcher by default. Set `DSV41_ARBORIS_PREFETCH=0` to turn it off for a matched A/B run; unset or `1` keeps it on. `spark-window run` passes the caller's environment through, so set the variable on that command.
 
-The decoder reads the variable once, before it opens any input. It refuses any other value, a repeated entry, or an environment entry it cannot read whole with exit 64 and the line `dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1`. An environment of more than 65536 entries traps with exit 104 instead. `dfStartWorkers` sets the switch when it starts the payload workers; `layer0` always starts them with the prefetcher off. Arboris learns co-activations in both arms, and only the dispatch and publication of prefetched experts differ.
+The decoder reads the variable once, before it opens any input. It refuses any other value, a repeated entry, or an environment entry it cannot read whole with exit 64 and the line `dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1`. `dfStartWorkers` sets the switch when it starts the payload workers; `layer0` always starts them with the prefetcher off. Arboris learns co-activations in both arms, and only the dispatch and publication of prefetched experts differ.
 
 The final stats line of `gen` and `chat` is `ARBORIS pf_dispatched=N pf_hits=N pf_enabled=0|1`. `pf_enabled` reports the setting, not that anything was prefetched. A valid on arm needs `pf_dispatched` above zero; a valid off arm needs `pf_dispatched=0 pf_hits=0`.
 
@@ -114,11 +114,11 @@ bash "$d/check-prefetch-mutants.sh" "$out/pf" "$out/tensors.bin" "$sidecars" "$c
 ```
 
 It builds the decoder from the composition above and through `om/gpu/dsv41/build.sh`, which must agree byte for byte. It runs three controls:
-- `check-prefetch-switch.sh` checks 16 environment cases, including names that share the prefix, malformed values, a maximum-size entry, and repeated names delivered through `execenv`.
+- `check-prefetch-switch.sh` checks 18 environment cases, including names that share the prefix, malformed values, a maximum-size entry, 70,000 entries, and repeated names delivered through `execenv`.
 - `check-decoder-prefetch.sh` runs the real binary in `pfcheck` mode.
 - `check-arboris-prefetch.om` replaces `decode-cli.om` in the composition and takes the layer-1 sidecar and shard 04. Besides scoring, domain shift and asynchronous publication, it starts real workers with the prefetcher off. A trained high-confidence query must then dispatch nothing, leave nothing in flight, and draw no worker reply within 2 s.
 
-The driver also builds eight mutants (A to H) and requires each to be rejected by the one check named for it. It prints the compiler digest and every binary digest, and passes only on `PREFETCH-MUTANTS PASS`. No gate under `tests/gates` runs it; run it before any review of a change to these files.
+The driver also builds fifteen mutants (A to O) and requires each to be rejected by the check or case named for it. Its header lists the switch cases that have no mutant of their own. It prints the compiler digest and every binary digest, and passes only on `PREFETCH-MUTANTS PASS`. No gate under `tests/gates` runs it; run it before any review of a change to these files.
 
 Inside an authorized Spark GB10 window:
 

@@ -49,6 +49,10 @@ case_ 10 lower-case "dsv41_arboris_prefetch=0"
 case_ 10 big-entry-unset "$big"
 case_ 11 big-entry-zero "$big" "$k=0"
 case_ 11 zero-among-others "A=1" "$k=0" "Z=2"
+# More entries than a 65536-entry loop bound: a default run must still work, and the key is still found last.
+many=$(seq -f "V%.0f=1" 70000)
+case_ 10 many-entries-unset $many
+case_ 11 many-entries-zero $many "$k=0"
 # Repeated names: env(1) keeps one value per name, so the control re-runs itself through execenv.
 "$bin" dup 2> "$err"
 got=$?

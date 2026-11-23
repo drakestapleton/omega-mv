@@ -74,22 +74,27 @@ test checks content changes, exact counts and malformed executable refusals.
 
 ## Decoder switch review corrective action, 2026-11-23
 
-Three reviews rejected the dsv41-decode Arboris prefetch switch before its
-fourth: heads 14b2275448a63e2af1c5ddc182c0276e47d51de5,
-bfabe5f4490c73c29293906802b9420cad398f9d and
-3ee10c19941953ec6157ec09657da11680d915e1.
+Four reviews rejected the dsv41-decode Arboris prefetch switch and its A/B
+evidence: heads 14b2275448a63e2af1c5ddc182c0276e47d51de5,
+bfabe5f4490c73c29293906802b9420cad398f9d,
+3ee10c19941953ec6157ec09657da11680d915e1 and
+afb1de29166acc65b068978257bf45a0b12da3df. The fourth found the switch code
+sound and rejected the evidence and this section's own wording.
 
 | Round | Finding kind | Why author or checks missed it | Corrective action |
 | --- | --- | --- | --- |
 | 1, 2, 3 | Controls tested helpers, not the composed program. Moving or dropping the switch write in `decode-cli.om` passed every control. | Each control was written for the function just changed. Nothing ran the real binary's entry point without a GPU. | `pfcheck` runs the real decoder's parse-and-start path on the host. `check-decoder-prefetch.sh` drives it, and mutants F and G must fail it. |
-| 2, 3 | Assertions that could not fail: a drain with nothing in flight, a slot table that dispatch never writes, an empty binary that runs as exit 0. | No assertion was paired with a wrong implementation that only it rejects. | `check-prefetch-mutants.sh` pairs every off-arm exit and every control with a named mutant and expected result. Assertions with no killing mutant were removed. No success code is 0, and empty builds stop the driver. |
+| 2, 3 | Assertions that could not fail: a drain with nothing in flight, a slot table that dispatch never writes, an empty binary that runs as exit 0. | No assertion was paired with a wrong implementation that only it rejects. | `check-prefetch-mutants.sh` gives every off-arm exit a mutant that only it rejects, and judges each control's mutants by the case they target. Off-arm assertions with no killing mutant were removed. The driver header lists the switch cases that have no mutant of their own. The repeated-name mode succeeds with 50, not 0, and the drivers refuse an empty or non-ELF binary. |
 | 3 | Negative controls lived outside the repository and their log lacked the compiler digest. | The mutant script was kept as scratch. | The mutant driver is committed and self-judging. It prints head, compiler digest and binary digests, and passes only on `PREFETCH-MUTANTS PASS`. |
 | 1, 2, 3 | Documentation claimed more than the code or evidence: layer0 refusals, "the arm that ran", exit codes, the slot-fill limit. | The README was written from intent before the behaviour was checked. | The README states only what a control or a recorded run shows, and says which. |
-| 1, 2 | Environment limits: the read buffer refused default runs with large entries; the page size was assumed to be 4 KiB. | Malformed values were tested, but not the read-overflow path or kernel limits. | The buffer is 2 MiB (MAX_ARG_STRLEN on 64 KiB pages). The control includes a maximum-size entry and repeated names delivered through `execenv`. |
+| 1, 2, 4 | Environment limits: the read buffer refused default runs with large entries; the page size was assumed to be 4 KiB; a loop bound copied from another file refused more than 65,536 entries. | Malformed values were tested, but not the read-overflow path, kernel limits or entry counts. | The buffer is 2 MiB (MAX_ARG_STRLEN on 64 KiB pages) and the loop has no entry limit. The control includes a maximum-size entry, 70,000 entries and repeated names delivered through `execenv`; mutants I and L must fail those cases. |
+| 4 | Evidence typed by hand: a calculated figure presented as measured, model files not hashed, a build commit outside the branch history, a claim whose inputs were not stored. | The report was written after the first corrective action and outside its checks. The existing lesson against hand-copied measurements (compiler size record) was not applied to it. | The report's figures are generated from the stored run files by `tools/make-results.py`; `tools/verify.sh` regenerates them and fails on any difference. Each figure is labelled measured or calculated. Model shards are hashed, routing records are stored, and the binary is tied to an ancestor commit by a stored passing log. |
 
 Before any review of a change to `prefetch-switch.om`, `decode-cli.om`,
 `check-*prefetch*` or the prefetch path in `forward.om`, run
 `check-prefetch-mutants.sh` at the exact head and attach its log. A new
-assertion in those controls needs a mutant in the driver that only it
-rejects. A behaviour that only a GPU run can show is labelled as such and
+off-arm assertion needs a mutant in the driver that only it rejects. A new
+control case gets a mutant or is listed in the driver header as having none.
+An evidence report quotes only figures that its `verify.sh` regenerates, and
+says for each whether it was measured or calculated. A behaviour that only a GPU run can show is labelled as such and
 backed by that run's stats line, not by the host controls.
