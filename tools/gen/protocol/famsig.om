@@ -1,0 +1,331 @@
+om2
+note tools/gen/protocol/famsig.om -- GEN family signatures and the split disjointness rule (aien-spark/omega#476).
+note Contract: tests/one_layer/generalization/families/FAMSIG_V1.md. Pure OM-2 port of tools/gen/protocol/famsig.c
+note (which stays as the protocol-pinned C reference). Unit: seed/ng/sha256.om + famsig_lib.om + this file.
+note Deterministic: no clock, no randomness, no environment; output depends only on the arguments and files.
+note
+note   famsig canon <shape>             print "gs1:<canonical form>" of one nesting shape
+note   famsig coarse <shape>            print the coarse signature "gc1:<coarse form>" (rule R6)
+note   famsig token <shape>             print the family token "gs1-<16 hex>" (record family field)
+note   famsig edges <shape>             print the composition edges "parent>child", one per line, sorted
+note   famsig meta <file>...            validate gen-meta / gen-split files; one line per task:
+note                                    "<task_id>\t<split>\t<signature>"
+note   famsig rule [--show-heldout] <file>...
+note                                    apply the disjointness rule (R1..R8) over every task of every file;
+note                                    report, then "RULE PASS" (exit 0) or "RULE FAIL" (exit 1)
+note   famsig split <gen-split file>    print split_sha256, famlist_sha256, tasks, families
+note   famsig famlist <gen-split file>  print the FAMLIST bytes whose sha256 is famlist_sha256
+note   famsig compare <SPLIT> <REDECLARED>
+note                                    blind re-declaration check: prints only "tasks=<n> mismatches=<k>";
+note                                    exit 0 when every task has the same signature, else 1
+note Exit: 0 ok, 1 refused (reason on stderr) or rule failure, 2 usage.
+
+text fm_t_usage "usage: famsig canon <shape> | coarse <shape> | token <shape> | edges <shape> | meta <file>... | rule [--show-heldout] <file>... | split <SPLIT> | famlist <SPLIT> | compare <SPLIT> <REDECLARED>\n"
+text fm_c_canon "canon"
+text fm_c_coarse "coarse"
+text fm_c_token "token"
+text fm_c_edges "edges"
+text fm_c_meta "meta"
+text fm_c_rule "rule"
+text fm_c_split "split"
+text fm_c_famlist "famlist"
+text fm_c_compare "compare"
+text fm_o_show "--show-heldout"
+text fm_e_pre "famsig: "
+text fm_e_shape "famsig: shape: "
+text fm_e_notsplit ": not a gen-split file\n"
+text fm_e_notasks ": no task lines\n"
+text fm_e_cmp1 "famsig: compare: "
+text fm_e_cmp2 " tasks vs "
+text fm_e_cmp3 " tasks\n"
+text fm_e_cmp4 "famsig: compare: task lists differ at line "
+text fm_rule_fail "RULE FAIL\n"
+text fm_rule_pass "RULE PASS\n"
+text fm_s_split "split_sha256="
+text fm_s_fam "\nfamlist_sha256="
+text fm_s_tasks "\ntasks="
+text fm_s_fams "\nfamilies="
+text fm_s_cmp1 "tasks="
+text fm_s_cmp2 " mismatches="
+
+note argument idx as a new heap string
+fn fm_arg idx ulong to ulong
+  st = fs_htop
+  room = sub 16777216 st
+  r = argread idx fs_hp st room
+  if lt r 0
+    fs_nomem
+  end
+  fs_hset add st bitcast ulong r
+  ret fs_hend st
+end
+
+fn fm_usage to int
+  fs_ps 9 fm_t_usage
+  ret 2
+end
+
+note parse argument 2 as a shape; false after "famsig: shape: <reason>" on stderr
+fn fm_shape_arg to bool
+  s = fm_arg 2
+  if fs_shape s
+    ret true
+  end
+  fs_ps 9 fm_e_shape
+  fs_pb 9 0
+  fs_pc 9 uchar 10
+  ret false
+end
+
+fn fm_read_err to void
+  fs_ps 9 fm_e_pre
+  fs_pb 9 2
+  fs_pc 9 uchar 10
+end
+
+note read the files of arguments from .. argc - 1 into set s; false after the reason on stderr
+fn fm_read_all ac ulong from ulong s ulong to bool
+  for i ulong sub ac from bound 1000000
+    p = fm_arg add from i
+    if not fs_read p s
+      fm_read_err
+      ret false
+    end
+  end
+  ret true
+end
+
+fn fm_read_split p ulong s ulong to bool
+  if not fs_read p s
+    fm_read_err
+    ret false
+  end
+  if eq get fs_sis s 0
+    fs_ps 9 fm_e_pre
+    fs_ph 9 p
+    fs_ps 9 fm_e_notsplit
+    ret false
+  end
+  if eq fs_set_n s 0
+    fs_ps 9 fm_e_pre
+    fs_ph 9 p
+    fs_ps 9 fm_e_notasks
+    ret false
+  end
+  ret true
+end
+
+fn fm_do_shape ac ulong which ulong to int
+  if ne ac 3
+    ret fm_usage
+  end
+  if not fm_shape_arg
+    ret 1
+  end
+  if eq which 0
+    c = fs_coarse
+    fs_ph 8 c
+    fs_pc 8 uchar 10
+    ret 0
+  end
+  if eq which 1
+    fs_ps 8 fs_t_gs1
+    fs_ph 8 get fs_st 8
+    fs_pc 8 uchar 10
+    ret 0
+  end
+  if eq which 2
+    sig = fs_hcat fs_t_gs1 get fs_st 8
+    fs_ph 8 fs_token sig
+    fs_pc 8 uchar 10
+    ret 0
+  end
+  nedg = fs_edges
+  for i ulong nedg bound 64
+    e = get fs_edg i
+    fs_pp 8 div e 8
+    fs_pc 8 uchar 62
+    fs_pp 8 rem e 8
+    fs_pc 8 uchar 10
+  end
+  ret 0
+end
+
+fn fm_do_meta ac ulong to int
+  if lt ac 3
+    ret fm_usage
+  end
+  s = fs_set_new
+  if not fm_read_all ac 2 s
+    ret 1
+  end
+  b = fs_set_start s
+  n = fs_set_n s
+  for i ulong n bound 8192
+    m = add b i
+    fs_ph 8 get fs_mid m
+    fs_pc 8 uchar 9
+    fs_psplit 8 get fs_msplit m
+    fs_pc 8 uchar 9
+    fs_ph 8 get fs_msig m
+    fs_pc 8 uchar 10
+  end
+  ret 0
+end
+
+fn fm_do_rule ac ulong to int
+  show = false
+  from = ulong 2
+  if gt ac 2
+    a = fm_arg 2
+    if fs_hist a fm_o_show
+      show = true
+      from = ulong 3
+    end
+  end
+  if le ac from
+    ret fm_usage
+  end
+  s = fs_set_new
+  if not fm_read_all ac from s
+    fs_ps 8 fm_rule_fail
+    ret 1
+  end
+  f = fs_rule s show
+  if ne f 0
+    fs_ps 8 fm_rule_fail
+    ret 1
+  end
+  fs_ps 8 fm_rule_pass
+  ret 0
+end
+
+fn fm_do_split ac ulong famlist bool to int
+  if ne ac 3
+    ret fm_usage
+  end
+  s = fs_set_new
+  if not fm_read_split fm_arg 2 s
+    ret 1
+  end
+  fs_famlist s
+  if famlist
+    fs_pf_fl
+    ret 0
+  end
+  h = fs_famlist_sha
+  fs_ps 8 fm_s_split
+  fs_ph 8 get fs_ssha s
+  fs_ps 8 fm_s_fam
+  fs_ph 8 h
+  fs_ps 8 fm_s_tasks
+  fs_pu 8 fs_set_n s
+  fs_ps 8 fm_s_fams
+  fs_pu 8 get fs_st 11
+  fs_pc 8 uchar 10
+  ret 0
+end
+
+note the famlist bytes to stdout
+fn fs_pf_fl to void
+  n = get fs_st 10
+  for i ulong n bound 1048576
+    fs_pc 8 get fs_fl i
+  end
+end
+
+fn fm_do_compare ac ulong to int
+  if ne ac 4
+    ret fm_usage
+  end
+  sa = fs_set_new
+  if not fm_read_split fm_arg 2 sa
+    ret 1
+  end
+  sb = fs_set_new
+  if not fm_read_split fm_arg 3 sb
+    ret 1
+  end
+  na = fs_set_n sa
+  nb = fs_set_n sb
+  if ne na nb
+    fs_ps 9 fm_e_cmp1
+    fs_pu 9 na
+    fs_ps 9 fm_e_cmp2
+    fs_pu 9 nb
+    fs_ps 9 fm_e_cmp3
+    ret 1
+  end
+  ret fm_compare_sets sa sb na
+end
+
+fn fm_compare_sets sa ulong sb ulong n ulong to int
+  ba = fs_set_start sa
+  bb = fs_set_start sb
+  mis = ulong 0
+  for i ulong n bound 8192
+    x = add ba i
+    y = add bb i
+    if not fs_heq get fs_mid x get fs_mid y
+      fs_ps 9 fm_e_cmp4
+      fs_pu 9 add i 3
+      fs_pc 9 uchar 10
+      ret 1
+    end
+    if not fs_heq get fs_msig x get fs_msig y
+      mis = add mis 1
+    end
+  end
+  fs_ps 8 fm_s_cmp1
+  fs_pu 8 n
+  fs_ps 8 fm_s_cmp2
+  fs_pu 8 mis
+  fs_pc 8 uchar 10
+  if ne mis 0
+    ret 1
+  end
+  ret 0
+end
+
+fn fm_dispatch ac ulong to int
+  if lt ac 2
+    ret fm_usage
+  end
+  c = fm_arg 1
+  if fs_hist c fm_c_coarse
+    ret fm_do_shape ac 0
+  end
+  if fs_hist c fm_c_canon
+    ret fm_do_shape ac 1
+  end
+  if fs_hist c fm_c_token
+    ret fm_do_shape ac 2
+  end
+  if fs_hist c fm_c_edges
+    ret fm_do_shape ac 3
+  end
+  if fs_hist c fm_c_meta
+    ret fm_do_meta ac
+  end
+  if fs_hist c fm_c_rule
+    ret fm_do_rule ac
+  end
+  if fs_hist c fm_c_split
+    ret fm_do_split ac false
+  end
+  if fs_hist c fm_c_famlist
+    ret fm_do_split ac true
+  end
+  if fs_hist c fm_c_compare
+    ret fm_do_compare ac
+  end
+  ret fm_usage
+end
+
+fn main to int
+  fs_init
+  rc = fm_dispatch ulong argcnt
+  fs_eflush
+  fs_oflush
+  ret rc
+end

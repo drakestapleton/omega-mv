@@ -1,0 +1,827 @@
+om2
+note tools/gen/protocol/genjac.om -- word-3-gram Jaccard near-duplicate check for GEN held-out prompts
+note Ported from tools/gen/protocol/genjac.c (aien-spark/omega#476, docs/one_layer/GEN_PROTOCOL_V1.md section 2),
+note which stays as the protocol-pinned C reference. Same output bytes and exit codes; capacities (refused with
+note "genjac: capacity exceeded", exit 2, where the C reference would allocate): a file of 4 MiB, 262144 grams in
+note all, 16 MiB of gram text, list files of 1 MiB and 4096 paths of at most 4096 bytes.
+
+text gj_usage "usage: genjac pair <fileA> <fileB> | scan [--threshold <t>] [--show] <heldout-list> <corpus-list>\n"
+text gj_cmd_pair "pair"
+text gj_cmd_scan "scan"
+text gj_opt_thr "--threshold"
+text gj_opt_show "--show"
+text gj_def_thr "0.5"
+text gj_err_pre "genjac: "
+text gj_err_read "genjac: cannot read "
+text gj_err_nul ": NUL byte\n"
+text gj_err_emp ": empty or no final newline\n"
+text gj_err_blk ": blank line\n"
+text gj_err_thr "genjac: threshold must be a decimal in [0,1] with at most 6 fraction digits\n"
+text gj_err_lim "genjac: capacity exceeded\n"
+text gj_p_ga "grams_a="
+text gj_p_gb " grams_b="
+text gj_p_in " inter="
+text gj_p_un " union="
+text gj_p_jc " jaccard="
+text gj_p_ab "above "
+text gj_p_ho "heldout="
+text gj_p_co " corpus="
+text gj_p_th " threshold="
+text gj_p_mj " max_jaccard="
+text gj_p_av " above="
+text gj_zero6 "0.000000"
+
+global gj_fbuf uchar 4194304
+global gj_pool uchar 16777216
+global gj_goff ulong 262144
+global gj_glen ulong 262144
+global gj_woff ulong 262144
+global gj_wlen ulong 262144
+global gj_hlbuf uchar 1048576
+global gj_clbuf uchar 1048576
+global gj_hoff ulong 4096
+global gj_hlen ulong 4096
+global gj_coff ulong 4096
+global gj_clen ulong 4096
+global gj_cg_base ulong 4096
+global gj_cg_cnt ulong 4096
+global gj_obuf uchar 65536
+global gj_ebuf uchar 4096
+global gj_arg0 uchar 4096
+global gj_arg1 uchar 4096
+global gj_arg2 uchar 4096
+global gj_arg3 uchar 4096
+global gj_thrbuf uchar 4096
+global gj_st ulong 16
+note gj_st[0]=olen gj_st[1]=elen gj_st[2]=pool_pos gj_st[3]=g_pos
+note gj_st[4]=res_in gj_st[5]=res_un gj_st[6]=thr_n gj_st[7]=thr_d
+note gj_st[8]=cur_gbase gj_st[9]=cur_gcnt
+
+fn gj_wrall fd int buf view uchar * n ulong to void
+  off = ulong 0
+  while lt off n bound 1000000
+    k = write fd buf off sub n off
+    if le k 0
+      ret
+    end
+    off = add off ulong k
+  end
+end
+
+fn gj_oflush to void
+  n = get gj_st 0
+  if eq n 0
+    ret
+  end
+  off = ulong 0
+  while lt off n bound 1000000
+    k = write 1 gj_obuf off sub n off
+    if le k 0
+      put gj_st 0 0
+      ret
+    end
+    off = add off ulong k
+  end
+  put gj_st 0 0
+end
+
+fn gj_eflush to void
+  n = get gj_st 1
+  if eq n 0
+    ret
+  end
+  off = ulong 0
+  while lt off n bound 1000000
+    k = write 2 gj_ebuf off sub n off
+    if le k 0
+      put gj_st 1 0
+      ret
+    end
+    off = add off ulong k
+  end
+  put gj_st 1 0
+end
+
+fn gj_oc c uchar to void
+  p = get gj_st 0
+  if ge p 65536
+    gj_oflush
+    p = ulong 0
+  end
+  put gj_obuf p c
+  put gj_st 0 add p 1
+end
+
+fn gj_os s view uchar * to void
+  n = len s
+  for i ulong n bound 65536
+    gj_oc get s i
+  end
+end
+
+fn gj_ec c uchar to void
+  p = get gj_st 1
+  if ge p 4096
+    gj_eflush
+    p = ulong 0
+  end
+  put gj_ebuf p c
+  put gj_st 1 add p 1
+end
+
+fn gj_es s view uchar * to void
+  n = len s
+  for i ulong n bound 65536
+    gj_ec get s i
+  end
+end
+
+fn gj_ou64 v ulong to void
+  if eq v 0
+    gj_oc uchar 48
+    ret
+  end
+  d = new uchar 24 0
+  k = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put d k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  while gt k 0 bound 24
+    k = sub k 1
+    gj_oc get d k
+  end
+end
+
+fn gj_print6 inter ulong uni ulong to void
+  if eq uni 0
+    gj_os gj_zero6
+    ret
+  end
+  q = div add mul inter 2000000 uni mul 2 uni
+  gj_ou64 div q 1000000
+  gj_oc uchar 46
+  fr = rem q 1000000
+  d = new uchar 6 48
+  k = ulong 6
+  while gt k 0 bound 6
+    k = sub k 1
+    put d k uchar add 48 rem fr 10
+    fr = div fr 10
+  end
+  for i ulong 6
+    gj_oc get d i
+  end
+end
+
+fn gj_eq a view uchar * b view uchar * to bool
+  if ne len a len b
+    ret false
+  end
+  n = len a
+  for i ulong n bound 65536
+    if ne get a i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn gj_die_usage to void
+  gj_es gj_usage
+  gj_eflush
+  exit 2
+end
+
+fn gj_die_lim to void
+  gj_es gj_err_lim
+  gj_eflush
+  exit 2
+end
+
+fn gj_read_arg idx ulong dst edit uchar 4096 to ulong
+  r = argread idx dst 0 4096
+  if lt r 0
+    gj_die_lim
+  end
+  ret ulong r
+end
+
+fn gj_slurp_arg0 npath ulong to ulong
+  if eq npath 0
+    gj_es gj_err_read
+    gj_ec uchar 10
+    gj_eflush
+    exit 2
+  end
+  fd = fopen gj_arg0 0 npath 0 0
+  if lt fd 0
+    gj_es gj_err_read
+    for i ulong npath bound 4096
+      gj_ec get gj_arg0 i
+    end
+    gj_ec uchar 10
+    gj_eflush
+    exit 2
+  end
+  tot = ulong 0
+  going = true
+  while going bound 1000000
+    if ge tot 4194304
+      ign = fclose int fd
+      gj_die_lim
+    end
+    k = read int fd gj_fbuf tot sub 4194304 tot
+    if lt k 0
+      ign = fclose int fd
+      gj_es gj_err_read
+      for i ulong npath bound 4096
+        gj_ec get gj_arg0 i
+      end
+      gj_ec uchar 10
+      gj_eflush
+      exit 2
+    end
+    if eq k 0
+      going = false
+    else
+      tot = add tot ulong k
+    end
+  end
+  ign = fclose int fd
+  for i ulong tot bound 4194304
+    if eq get gj_fbuf i 0
+      gj_es gj_err_pre
+      for j ulong npath bound 4096
+        gj_ec get gj_arg0 j
+      end
+      gj_es gj_err_nul
+      gj_eflush
+      exit 2
+    end
+  end
+  ret tot
+end
+
+fn gj_is_alnum c uchar to bool
+  if and ge c 97 le c 122
+    ret true
+  end
+  if and ge c 48 le c 57
+    ret true
+  end
+  ret false
+end
+
+fn gj_lower c uchar to uchar
+  if and ge c 65 le c 90
+    ret add c 32
+  end
+  ret c
+end
+
+fn gj_cmp_gram ia ulong ib ulong to int
+  oa = get gj_goff ia
+  la = get gj_glen ia
+  ob = get gj_goff ib
+  lb = get gj_glen ib
+  m = la
+  if lt lb m
+    m = lb
+  end
+  for i ulong m bound 1048576
+    ca = get gj_pool add oa i
+    cb = get gj_pool add ob i
+    if lt ca cb
+      ret neg int 1
+    end
+    if gt ca cb
+      ret int 1
+    end
+  end
+  if lt la lb
+    ret neg int 1
+  end
+  if gt la lb
+    ret int 1
+  end
+  ret int 0
+end
+
+fn gj_swap_gram ia ulong ib ulong to void
+  tmpo = get gj_goff ia
+  tmpl = get gj_glen ia
+  put gj_goff ia get gj_goff ib
+  put gj_glen ia get gj_glen ib
+  put gj_goff ib tmpo
+  put gj_glen ib tmpl
+end
+
+fn gj_sift base ulong start ulong cnt ulong to void
+  root = start
+  going = true
+  while going bound 64
+    child = add mul root 2 1
+    if ge child cnt
+      going = false
+    else
+      sw = root
+      if lt gj_cmp_gram add base sw add base child 0
+        sw = child
+      end
+      rchild = add child 1
+      if lt rchild cnt
+        if lt gj_cmp_gram add base sw add base rchild 0
+          sw = rchild
+        end
+      end
+      if eq sw root
+        going = false
+      else
+        gj_swap_gram add base root add base sw
+        root = sw
+      end
+    end
+  end
+end
+
+fn gj_sort_grams base ulong cnt ulong to void
+  if le cnt 1
+    ret
+  end
+  st = div cnt 2
+  while gt st 0 bound 262144
+    st = sub st 1
+    gj_sift base st cnt
+  end
+  en = cnt
+  while gt en 1 bound 262144
+    en = sub en 1
+    gj_swap_gram base add base en
+    gj_sift base 0 en
+  end
+end
+
+fn gj_tokenize flen ulong to ulong
+  nw = ulong 0
+  i = ulong 0
+  while lt i flen bound 4194305
+    c = gj_lower get gj_fbuf i
+    put gj_fbuf i c
+    if gj_is_alnum c
+      j = i
+      while lt j flen bound 4194305
+        d = gj_lower get gj_fbuf j
+        put gj_fbuf j d
+        if not gj_is_alnum d
+          break
+        end
+        j = add j 1
+      end
+      if ge nw 262144
+        gj_die_lim
+      end
+      put gj_woff nw i
+      put gj_wlen nw sub j i
+      nw = add nw 1
+      i = j
+    else
+      i = add i 1
+    end
+  end
+  ret nw
+end
+
+fn gj_copy_word_pool wi ulong to void
+  o = get gj_woff wi
+  l = get gj_wlen wi
+  ppos = get gj_st 2
+  if gt add ppos l 16777216
+    gj_die_lim
+  end
+  for q ulong l bound 65536
+    put gj_pool ppos get gj_fbuf add o q
+    ppos = add ppos 1
+  end
+  put gj_st 2 ppos
+end
+
+fn gj_pool_byte b uchar to void
+  ppos = get gj_st 2
+  if ge ppos 16777216
+    gj_die_lim
+  end
+  put gj_pool ppos b
+  put gj_st 2 add ppos 1
+end
+
+fn gj_build_grams npath ulong to void
+  flen = gj_slurp_arg0 npath
+  nw = gj_tokenize flen
+  gbase = get gj_st 3
+  put gj_st 8 gbase
+  if lt nw 3
+    put gj_st 9 0
+    ret
+  end
+  ng = sub nw 2
+  for k ulong ng bound 262144
+    if ge add gbase k 262144
+      gj_die_lim
+    end
+    startp = get gj_st 2
+    gj_copy_word_pool k
+    gj_pool_byte uchar 32
+    gj_copy_word_pool add k 1
+    gj_pool_byte uchar 32
+    gj_copy_word_pool add k 2
+    put gj_goff add gbase k startp
+    put gj_glen add gbase k sub get gj_st 2 startp
+  end
+  gj_sort_grams gbase ng
+  u = ulong 0
+  for k ulong ng bound 262144
+    keep = false
+    if eq u 0
+      keep = true
+    else
+      if ne gj_cmp_gram add gbase k add gbase sub u 1 0
+        keep = true
+      end
+    end
+    if keep
+      put gj_goff add gbase u get gj_goff add gbase k
+      put gj_glen add gbase u get gj_glen add gbase k
+      u = add u 1
+    end
+  end
+  put gj_st 3 add gbase u
+  put gj_st 9 u
+end
+
+fn gj_jac ba ulong na ulong bb ulong nb ulong to void
+  ia = ulong 0
+  ib = ulong 0
+  inter = ulong 0
+  while and lt ia na lt ib nb bound 524288
+    c = gj_cmp_gram add ba ia add bb ib
+    if eq c 0
+      inter = add inter 1
+      ia = add ia 1
+      ib = add ib 1
+    else
+      if lt c 0
+        ia = add ia 1
+      else
+        ib = add ib 1
+      end
+    end
+  end
+  put gj_st 4 inter
+  put gj_st 5 sub add na nb inter
+end
+
+fn gj_parse_thr nlen ulong to bool
+  nv = ulong 0
+  dv = ulong 1
+  dot = false
+  digs = ulong 0
+  any = false
+  for i ulong nlen bound 4096
+    c = get gj_thrbuf i
+    if and eq c 46 not dot
+      dot = true
+    else
+      if or lt c 48 gt c 57
+        ret false
+      end
+      any = true
+      nv = add mul nv 10 ulong sub c 48
+      if dot
+        dv = mul dv 10
+        digs = add digs 1
+        if gt digs 6
+          ret false
+        end
+      end
+      if gt nv 10000000
+        ret false
+      end
+    end
+  end
+  if or not any gt nv dv
+    ret false
+  end
+  put gj_st 6 nv
+  put gj_st 7 dv
+  ret true
+end
+
+fn gj_read_list is_hl bool npath ulong to ulong
+  flen = gj_slurp_arg0 npath
+  if eq flen 0
+    gj_es gj_err_pre
+    for i ulong npath bound 4096
+      gj_ec get gj_arg0 i
+    end
+    gj_es gj_err_emp
+    gj_eflush
+    exit 2
+  end
+  if ne get gj_fbuf sub flen 1 10
+    gj_es gj_err_pre
+    for i ulong npath bound 4096
+      gj_ec get gj_arg0 i
+    end
+    gj_es gj_err_emp
+    gj_eflush
+    exit 2
+  end
+  if gt flen 1048576
+    gj_die_lim
+  end
+  for i ulong flen bound 1048576
+    if is_hl
+      put gj_hlbuf i get gj_fbuf i
+    else
+      put gj_clbuf i get gj_fbuf i
+    end
+  end
+  cnt = ulong 0
+  pos = ulong 0
+  while lt pos flen bound 1048576
+    st = pos
+    while lt pos flen bound 1048576
+      if eq get gj_fbuf pos 10
+        break
+      end
+      pos = add pos 1
+    end
+    llen = sub pos st
+    if eq llen 0
+      gj_es gj_err_pre
+      for i ulong npath bound 4096
+        gj_ec get gj_arg0 i
+      end
+      gj_es gj_err_blk
+      gj_eflush
+      exit 2
+    end
+    if ge cnt 4096
+      gj_die_lim
+    end
+    if is_hl
+      put gj_hoff cnt st
+      put gj_hlen cnt llen
+    else
+      put gj_coff cnt st
+      put gj_clen cnt llen
+    end
+    cnt = add cnt 1
+    pos = add pos 1
+  end
+  ret cnt
+end
+
+fn gj_copy_hpath idx ulong to ulong
+  o = get gj_hoff idx
+  l = get gj_hlen idx
+  if gt l 4096
+    gj_die_lim
+  end
+  for i ulong l bound 4096
+    put gj_arg0 i get gj_hlbuf add o i
+  end
+  ret l
+end
+
+fn gj_copy_cpath idx ulong to ulong
+  o = get gj_coff idx
+  l = get gj_clen idx
+  if gt l 4096
+    gj_die_lim
+  end
+  for i ulong l bound 4096
+    put gj_arg0 i get gj_clbuf add o i
+  end
+  ret l
+end
+
+fn gj_emit_hpath idx ulong to void
+  o = get gj_hoff idx
+  l = get gj_hlen idx
+  for i ulong l bound 4096
+    gj_oc get gj_hlbuf add o i
+  end
+end
+
+fn gj_emit_cpath idx ulong to void
+  o = get gj_coff idx
+  l = get gj_clen idx
+  for i ulong l bound 4096
+    gj_oc get gj_clbuf add o i
+  end
+end
+
+fn gj_do_pair to int
+  n1 = argread 2 gj_arg0 0 4096
+  if lt n1 0
+    gj_die_lim
+  end
+  gj_build_grams ulong n1
+  ba = get gj_st 8
+  na = get gj_st 9
+  n2 = argread 3 gj_arg0 0 4096
+  if lt n2 0
+    gj_die_lim
+  end
+  gj_build_grams ulong n2
+  bb = get gj_st 8
+  nb = get gj_st 9
+  gj_jac ba na bb nb
+  gj_os gj_p_ga
+  gj_ou64 na
+  gj_os gj_p_gb
+  gj_ou64 nb
+  gj_os gj_p_in
+  gj_ou64 get gj_st 4
+  gj_os gj_p_un
+  gj_ou64 get gj_st 5
+  gj_os gj_p_jc
+  gj_print6 get gj_st 4 get gj_st 5
+  gj_oc uchar 10
+  gj_oflush
+  ret 0
+end
+
+note true when argument bytes gj_arg1[0..al) equal the text t (al < 0: the argument did not fit, never equal)
+fn gj_arg1_is al long t view uchar * to bool
+  if lt al 0
+    ret false
+  end
+  n = ulong al
+  if ne n len t
+    ret false
+  end
+  for i ulong n bound 4096
+    if ne get gj_arg1 i get t i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn gj_parse_scan_opts argc ulong to int
+  tlen = len gj_def_thr
+  for k ulong tlen bound 64
+    put gj_thrbuf k get gj_def_thr k
+  end
+  thr_ok = true
+  show = ulong 0
+  i = ulong 2
+  lim = sub argc 2
+  while lt i lim bound 1000000
+    al = argread i gj_arg1 0 4096
+    is_thr = gj_arg1_is al gj_opt_thr
+    if and is_thr lt add i 1 lim
+      i = add i 1
+      tl = argread i gj_thrbuf 0 4096
+      if lt tl 0
+        thr_ok = false
+        tlen = ulong 0
+      else
+        thr_ok = true
+        tlen = ulong tl
+      end
+    else
+      if gj_arg1_is al gj_opt_show
+        show = ulong 1
+      else
+        gj_die_usage
+      end
+    end
+    i = add i 1
+  end
+  if ne i lim
+    gj_die_usage
+  end
+  if or not thr_ok not gj_parse_thr tlen
+    gj_es gj_err_thr
+    gj_eflush
+    ret 2
+  end
+  put gj_st 10 tlen
+  put gj_st 11 show
+  ret 0
+end
+
+fn gj_scan_one_hl h ulong nc ulong to bool
+  pl = gj_copy_hpath h
+  gj_build_grams pl
+  hb = get gj_st 8
+  hn = get gj_st 9
+  hit = false
+  for c ulong nc bound 4096
+    gj_jac hb hn get gj_cg_base c get gj_cg_cnt c
+    inter = get gj_st 4
+    uni = get gj_st 5
+    if ne uni 0
+      if gt mul inter get gj_st 13 mul get gj_st 12 uni
+        put gj_st 12 inter
+        put gj_st 13 uni
+      end
+      if gt mul inter get gj_st 7 mul get gj_st 6 uni
+        hit = true
+        if ne get gj_st 11 0
+          gj_os gj_p_ab
+          gj_emit_hpath h
+          gj_oc uchar 32
+          gj_emit_cpath c
+          gj_oc uchar 32
+          gj_print6 inter uni
+          gj_oc uchar 10
+        end
+      end
+    end
+  end
+  ret hit
+end
+
+fn gj_do_scan argc ulong to int
+  rc = gj_parse_scan_opts argc
+  if ne rc 0
+    ret rc
+  end
+  nhp = argread sub argc 2 gj_arg0 0 4096
+  if lt nhp 0
+    gj_die_lim
+  end
+  nh = gj_read_list true ulong nhp
+  ncp = argread sub argc 1 gj_arg0 0 4096
+  if lt ncp 0
+    gj_die_lim
+  end
+  nc = gj_read_list false ulong ncp
+  for c ulong nc bound 4096
+    pl = gj_copy_cpath c
+    gj_build_grams pl
+    put gj_cg_base c get gj_st 8
+    put gj_cg_cnt c get gj_st 9
+  end
+  mark_p = get gj_st 2
+  mark_g = get gj_st 3
+  put gj_st 12 0
+  put gj_st 13 1
+  above = ulong 0
+  for h ulong nh bound 4096
+    put gj_st 2 mark_p
+    put gj_st 3 mark_g
+    if gj_scan_one_hl h nc
+      above = add above 1
+    end
+  end
+  tlen = get gj_st 10
+  gj_os gj_p_ho
+  gj_ou64 nh
+  gj_os gj_p_co
+  gj_ou64 nc
+  gj_os gj_p_th
+  for k ulong tlen bound 4096
+    gj_oc get gj_thrbuf k
+  end
+  gj_os gj_p_mj
+  gj_print6 get gj_st 12 get gj_st 13
+  gj_os gj_p_av
+  gj_ou64 above
+  gj_oc uchar 10
+  gj_oflush
+  if ne above 0
+    ret 1
+  end
+  ret 0
+end
+
+fn main to int
+  ac = argcnt
+  if lt ac 4
+    gj_die_usage
+  end
+  cl = argread 1 gj_arg1 0 4096
+  if or lt cl 0 gt ulong cl 16
+    gj_die_usage
+  end
+  cmd = new uchar 16 0
+  for i ulong ulong cl bound 16
+    put cmd i get gj_arg1 i
+  end
+  if and eq ac 4 gj_eq part cmd 0 ulong cl gj_cmd_pair
+    ret gj_do_pair
+  end
+  if gj_eq part cmd 0 ulong cl gj_cmd_scan
+    ret gj_do_scan ulong ac
+  end
+  gj_die_usage
+  ret 2
+end

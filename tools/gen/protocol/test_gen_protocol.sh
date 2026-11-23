@@ -21,7 +21,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 B="${1:?usage: test_gen_protocol.sh <builddir>}"
 mkdir -p "$B"; B="$(realpath -e "$B")"
 T="$(mktemp -d "${TMPDIR:-/tmp}/gen-proto-test.XXXXXXXX")"; trap 'rm -rf "$T"' EXIT
-CFLAGS="-std=gnu11 -Wall -Wextra -Werror -O2"
+OMC="${GENP_OMC:-$ROOT/seed/out/omc}"
 G="$ROOT/tests/one_layer/generalization"
 P="$G/protocol.json"
 ok=0; bad=0
@@ -41,10 +41,17 @@ refuse_why() { # name expected-output-substring command... : must exit non-zero 
   if "$@" > "$T/rw.out" 2>&1; then fail "mutant not caught: $n"; elif grep -qF -- "$w" "$T/rw.out"; then pass "refused: $n"; else fail "refused for another reason: $n ($(tail -2 "$T/rw.out" | tr "\n" " "))"; fi
 }
 
-${CC:-cc} $CFLAGS -I"$ROOT/src" -o "$B/famsig" "$ROOT/tools/gen/protocol/famsig.c" "$ROOT/src/omega_om_units.c" || exit 1
-${CC:-cc} $CFLAGS -I"$ROOT/src" -o "$B/gencheck" "$ROOT/tools/gen/protocol/gencheck.c" "$ROOT/src/omega_om_units.c" || exit 1
-${CC:-cc} $CFLAGS -o "$B/genstats" "$ROOT/tools/gen/protocol/genstats.c" -lm || exit 1
-${CC:-cc} $CFLAGS -o "$B/genjac" "$ROOT/tools/gen/protocol/genjac.c" || exit 1
+# the tools are pure OM-2, built by the seeded compiler (GENP_OMC, default seed/out/omc); the .c files beside
+# them stay only as the reference implementations protocol.json pins
+om_build() { # output unit.om...: one OM-2 unit (a single om2 header) compiled by $OMC
+  local o="$1"; shift
+  (printf 'om2\n'; sed '/^om2$/d' "$@") | "$OMC" > "$o.tmp" && chmod +x "$o.tmp" && mv "$o.tmp" "$o"
+}
+GP="$ROOT/tools/gen/protocol"
+om_build "$B/famsig" "$ROOT/seed/ng/sha256.om" "$GP/famsig_lib.om" "$GP/famsig.om" || exit 1
+om_build "$B/gencheck" "$ROOT/seed/ng/sha256.om" "$GP/famsig_lib.om" "$GP/gencheck.om" || exit 1
+om_build "$B/genstats" "$GP/genstats.om" || exit 1
+om_build "$B/genjac" "$GP/genjac.om" || exit 1
 FS="$B/famsig"; GC="$B/gencheck"; GS="$B/genstats"; JC="$B/genjac"
 
 # ---- 1. statistics ----
