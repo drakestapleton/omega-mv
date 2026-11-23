@@ -1,0 +1,891 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note Host test for src/omega_gpu_wait.om: fake memory, fake clock, no GPU (pure OM-2 port of
+note tests/test_omega_gpu_wait.c, which keeps testing the C primitive: same scenarios, checks, output bytes).
+note Every scenario runs against the real primitive (must behave) and against test mutants (a naive
+note wall-clock loop, a fixed wait that accepts overshoot, a sequence wait with an unsigned compare).
+note Each mutant must be killed by the scenarios named for it, otherwise this test fails.
+note The primitive reads the watched words and the clock through the gw_hook_* functions this unit
+note defines (the link-time form of the C cfg hooks).
+
+note g_fk_u64: [0]=t_ns [1]=step_ns [2]=relaxes [3]=barriers [4]=snaps [5]=last_snap_barriers
+note           [6]=order_violations
+global g_fk_u64 ulong 8
+note g_fk_words: [0]=w (watched word) [1]=w2 (marker2)
+global g_fk_words uint 2
+note g_fk_i32: [0]=nsched [1]=abort_at [2]=g_fail [3]=g_checks [4]=g_quiet
+global g_fk_i32 int 8
+note g_fk_inv: [0]=invalid_value (valid() rejects it when nonzero)
+global g_fk_inv uint 2
+note schedule (up to 32 entries): relax count, target (0=w 1=w2), value
+global g_fk_at ulong 32
+global g_fk_tgt int 32
+global g_fk_val uint 32
+global g_gw_num uchar 32
+
+const IMPL_REAL int 0
+const IMPL_NAIVE int 1
+const IMPL_FIXED_GE int 2
+const IMPL_SEQ_UNSG int 3
+
+const S_NEVER int 0
+const S_LATE int 1
+const S_MARKER2 int 2
+const S_SEQ_WRAP int 3
+const S_PROGRESS_RESETS int 4
+const S_BARRIER int 5
+const S_HARD_DEADLINE int 6
+const S_FIXED_OVERSHOOT int 7
+const S_INVALID int 8
+const S_ABORT int 9
+const S_COUNT int 10
+
+text t_gw_fail "  FAIL: "
+text t_gw_nl "\n"
+text t_gw_sp " "
+text t_gw_cs ": "
+text t_gw_ok "ok\n"
+text t_gw_FAIL "FAIL\n"
+text t_gw_real "real  "
+text t_gw_mut "mutant "
+text t_gw_kmask " killed mask "
+text t_gw_req " (required "
+text t_gw_rp ")"
+text t_gw_rpnl ")\n"
+text t_gw_sum1 "gpu_wait: checks="
+text t_gw_sum2 " real_failures="
+text t_gw_sum3 " required_kills="
+text t_gw_sl "/"
+text t_gw_pass "OMEGA_GPU_WAIT_HOST PASS\n"
+text t_gw_fail_end "OMEGA_GPU_WAIT_HOST FAIL\n"
+
+text t_sn0 "never_written"
+text t_sn1 "written_late"
+text t_sn2 "marker2_gate"
+text t_sn3 "seq_wrap32"
+text t_sn4 "progress_resets_idle"
+text t_sn5 "barrier_each_read"
+text t_sn6 "hard_deadline_with_progress"
+text t_sn7 "fixed_overshoot"
+text t_sn8 "invalid_state"
+text t_sn9 "abort"
+text t_sn10 "queue_wrap_sentinel"
+
+text t_mn0 "naive_wall_clock"
+text t_mn1 "fixed_accepts_overshoot"
+text t_mn2 "seq_unsigned_compare"
+text t_msurv1 "mutant "
+text t_msurv2 " survived scenario "
+
+text t_m_never1 "never-written marker must not pass"
+text t_m_never2 "result STALLED (got "
+text t_m_never3 "report carries kind/expected/last-seen 0"
+text t_m_never4a "elapsed "
+text t_m_never4b " progress "
+text t_m_late1 "late fixed marker seen"
+text t_m_late2 "progress recorded"
+text t_m_m2a "marker without marker2 must not pass"
+text t_m_m2b "report shows marker 3, marker2 0"
+text t_m_m2c "both markers pass"
+text t_m_w1a "reaches target "
+text t_m_w1b " from "
+text t_m_w2 "3 is past 0xffffffff"
+text t_m_w3 "0 is past 0xfffffffe"
+text t_m_w4 "0xfffffff0 is before 0xffffffff"
+text t_m_w5 "0xfffffffe is before 1"
+text t_m_pr1 "steady progress must not stall"
+text t_m_pr2 "progress_count "
+text t_m_b1a "barriers "
+text t_m_b1b " polls "
+text t_m_b2a "a barrier must precede every read ("
+text t_m_b2b " of "
+text t_m_b2c " polls unordered)"
+text t_m_b3 "barrier after the PASS observation"
+text t_m_hd1 "hard deadline TIMEOUT (got "
+text t_m_hd2 "progress was occurring ("
+text t_m_fo1 "fixed wait must not accept overshoot 5 for 3"
+text t_m_fo2 "stalled, saw 5"
+text t_m_fo3 "sequence wait accepts 5 for target 3"
+text t_m_inv "invalid value reported (got "
+text t_m_ab "abort reported (got "
+text t_m_sent1 "sentinel: dispatch ids alone must not satisfy the sentinel wait (got "
+text t_m_sent2 "sentinel: last entry's sentinel passes (got "
+text t_m_obs ", observed "
+
+fn gw_wr1 s view uchar * to void
+n = len s
+if eq n ulong 0
+ret
+end
+ign = write 1 s ulong 0 n
+end
+
+fn gw_wr_pad s view uchar * width ulong to void
+gw_wr1 s
+n = len s
+while lt n width bound 64
+gw_wr1 t_gw_sp
+n = add n ulong 1
+end
+end
+
+fn gw_wr_u64 v ulong to void
+if eq v ulong 0
+put g_gw_num 0 uchar 48
+ign = write 1 g_gw_num ulong 0 ulong 1
+ret
+end
+k = ulong 0
+x = v
+while gt x ulong 0 bound 32
+d = rem x ulong 10
+put g_gw_num k uchar add d ulong 48
+x = div x ulong 10
+k = add k ulong 1
+end
+i = ulong 0
+half = div k ulong 2
+while lt i half bound 16
+j = sub sub k ulong 1 i
+t = get g_gw_num i
+put g_gw_num i get g_gw_num j
+put g_gw_num j t
+i = add i ulong 1
+end
+ign = write 1 g_gw_num ulong 0 k
+end
+
+note %0Nx of v: n hex digits, lower case, zero filled
+fn gw_wr_hexn v uint n ulong to void
+i = ulong 0
+while lt i n bound 8
+sh = mul sub sub n ulong 1 i ulong 4
+nib = and shr v uint sh uint 15
+ch = uchar add nib uint 48
+if ge nib uint 10
+ch = uchar add sub nib uint 10 uint 97
+end
+put g_gw_num i ch
+i = add i ulong 1
+end
+ign = write 1 g_gw_num ulong 0 n
+end
+
+fn gw_wr_int v int to void
+gw_wr_u64 ulong v
+end
+
+fn gw_print_sname s int width ulong to void
+if eq s 0
+gw_wr_pad t_sn0 width
+ret
+end
+if eq s 1
+gw_wr_pad t_sn1 width
+ret
+end
+if eq s 2
+gw_wr_pad t_sn2 width
+ret
+end
+if eq s 3
+gw_wr_pad t_sn3 width
+ret
+end
+if eq s 4
+gw_wr_pad t_sn4 width
+ret
+end
+if eq s 5
+gw_wr_pad t_sn5 width
+ret
+end
+if eq s 6
+gw_wr_pad t_sn6 width
+ret
+end
+if eq s 7
+gw_wr_pad t_sn7 width
+ret
+end
+if eq s 8
+gw_wr_pad t_sn8 width
+ret
+end
+if eq s 9
+gw_wr_pad t_sn9 width
+ret
+end
+gw_wr_pad t_sn10 width
+end
+
+note Hooks called by src/omega_gpu_wait.om when cfg use_hooks != 0
+fn gw_hook_now_ns to ulong
+ret get g_fk_u64 0
+end
+
+fn gw_hook_barrier to void
+put g_fk_u64 3 add get g_fk_u64 3 ulong 1
+end
+
+fn gw_hook_relax to void
+rel = add get g_fk_u64 2 ulong 1
+put g_fk_u64 2 rel
+put g_fk_u64 0 add get g_fk_u64 0 get g_fk_u64 1
+ns = get g_fk_i32 0
+i = int 0
+while lt i ns bound 32
+if eq get g_fk_at ulong i rel
+tgt = get g_fk_tgt ulong i
+put g_fk_words ulong tgt get g_fk_val ulong i
+end
+i = add i 1
+end
+end
+
+fn gw_hook_read_word to uint
+ret get g_fk_words 0
+end
+
+fn gw_hook_read_marker2 to uint
+ret get g_fk_words 1
+end
+
+note runs right after the reads of each poll: marks where the read happened
+fn gw_hook_snapshot dst edit uint * to void
+put dst 0 uint 0
+put dst 1 uint 0
+put g_fk_u64 4 add get g_fk_u64 4 ulong 1
+bar = get g_fk_u64 3
+if le bar get g_fk_u64 5
+put g_fk_u64 6 add get g_fk_u64 6 ulong 1
+end
+put g_fk_u64 5 bar
+end
+
+fn gw_hook_valid v uint to bool
+iv = get g_fk_inv 0
+if eq iv uint 0
+ret true
+end
+ret ne v iv
+end
+
+fn gw_hook_abort to bool
+ab = get g_fk_i32 1
+if eq ab 0
+ret false
+end
+ret ge get g_fk_u64 2 ulong ab
+end
+
+note CHECK: counts the check; on failure counts it and, unless quiet, writes "  FAIL: " and
+note returns true so the caller writes the message and the newline.
+fn gw_ck cond bool to bool
+put g_fk_i32 3 add get g_fk_i32 3 1
+if cond
+ret false
+end
+put g_fk_i32 2 add get g_fk_i32 2 1
+if ne get g_fk_i32 4 0
+ret false
+end
+gw_wr1 t_gw_fail
+ret true
+end
+
+note "  FAIL: <name>: <msg>\n" for a message without values
+fn gw_check s int cond bool msg view uchar * to void
+if gw_ck cond
+gw_print_sname s ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 msg
+gw_wr1 t_gw_nl
+end
+end
+
+note "  FAIL: <name>: <msg><v>)\n" for a "(got %d)" message
+fn gw_check_got s int cond bool msg view uchar * v int to void
+if gw_ck cond
+gw_print_sname s ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 msg
+gw_wr_int v
+gw_wr1 t_gw_rpnl
+end
+end
+
+fn gw_setup cfg edit OmegaGpuWaitCfg to void
+put g_fk_u64 0 ulong 0
+put g_fk_u64 1 ulong 1000000
+put g_fk_u64 2 ulong 0
+put g_fk_u64 3 ulong 0
+put g_fk_u64 4 ulong 0
+put g_fk_u64 5 ulong 0
+put g_fk_u64 6 ulong 0
+put g_fk_i32 0 0
+put g_fk_i32 1 0
+put g_fk_inv 0 uint 0
+put cfg total_timeout_ms uint 100000
+put cfg progress_timeout_ms uint 100
+put cfg has_word 1
+put cfg has_marker2 0
+put cfg marker2_want uint 0
+put cfg use_snapshot 0
+put cfg use_valid 1
+put cfg use_abort 1
+put cfg use_hooks 1
+put cfg has_clock 1
+end
+
+fn gw_sched step ulong tgt int val uint to void
+n = get g_fk_i32 0
+put g_fk_at ulong n step
+put g_fk_tgt ulong n tgt
+put g_fk_val ulong n val
+put g_fk_i32 0 add n 1
+end
+
+note Test mutant: naive wall clock (single deadline, unsigned <, no progress tracking, no marker2,
+note no barrier, no report).
+fn mut_naive_wait want uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg to bool
+start = gw_hook_now_ns
+lim = mul ulong 1000000 ulong get cfg progress_timeout_ms
+gw_reset_rpt rpt 0 uint 0
+while lt gw_hook_read_word want bound 1000000
+if ge sub gw_hook_now_ns start lim
+ret false
+end
+gw_hook_relax
+end
+ret true
+end
+
+fn mut_cmp_ok cmp int m uint want uint to bool
+if eq cmp 0
+ret eq m want
+end
+if eq cmp 1
+ret gw_seq_reached m want
+end
+ret ge m want
+end
+
+note One poll of the test mutant loop. tm: [0]=last progress time [1]=stall ns; prev: [0]=prev word.
+note Returns 1 PASS, 2 STALLED, 0 continue.
+fn mut_cmp_poll cmp int want uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg tm edit ulong 2 prev edit uint 1 to int
+gw_hook_barrier
+m = gw_hook_read_word
+m2 = uint 0
+if ne get cfg has_marker2 0
+m2 = gw_hook_read_marker2
+end
+ok = mut_cmp_ok cmp m want
+put rpt last_observed m
+put rpt last_marker2 m2
+if ok
+if ne get cfg has_marker2 0
+ok = eq m2 get cfg marker2_want
+end
+end
+if ok
+gw_hook_barrier
+put rpt result OMEGA_GPU_WAIT_PASS
+ret 1
+end
+now = gw_hook_now_ns
+if ne m get prev 0
+put prev 0 m
+put tm 0 now
+put rpt progress_count add get rpt progress_count ulong 1
+end
+if ge sub now get tm 0 get tm 1
+put rpt result OMEGA_GPU_WAIT_STALLED
+ret 2
+end
+gw_hook_relax
+ret 0
+end
+
+note Test mutant: correct kind-aware wait with one comparison replaced (cmp 0 exact, 1 serial-number
+note >=, 2 unsigned >=).
+fn mut_cmp_wait cmp int want uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg kind int to bool
+tm = new ulong 2 0
+prev = new uint 1 0
+put tm 0 gw_hook_now_ns
+put tm 1 mul ulong 1000000 ulong get cfg progress_timeout_ms
+put prev 0 gw_hook_read_word
+gw_reset_rpt rpt kind want
+while true bound 1000000
+res = mut_cmp_poll cmp want rpt cfg tm prev
+if eq res 1
+ret true
+end
+if eq res 2
+ret false
+end
+end
+ret false
+end
+
+fn call_fx impl int want uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg to bool
+if eq impl IMPL_NAIVE
+ret mut_naive_wait want rpt cfg
+end
+if eq impl IMPL_FIXED_GE
+ret mut_cmp_wait 1 want rpt cfg OMEGA_GPU_WAIT_FIXED
+end
+ret omega_gpu_wait_fixed want rpt cfg
+end
+
+fn call_sq impl int want uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg to bool
+if eq impl IMPL_NAIVE
+ret mut_naive_wait want rpt cfg
+end
+if eq impl IMPL_SEQ_UNSG
+ret mut_cmp_wait 2 want rpt cfg OMEGA_GPU_WAIT_SEQUENCE
+end
+ret omega_gpu_wait_sequence want rpt cfg
+end
+
+fn gw_words w uint w2 uint to void
+put g_fk_words 0 w
+put g_fk_words 1 w2
+end
+
+fn sc_never sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+ok = call_sq sq_impl uint 5 r cfg
+gw_check S_NEVER not ok t_m_never1
+gw_check_got S_NEVER eq get r result OMEGA_GPU_WAIT_STALLED t_m_never2 get r result
+c3 = eq get r last_observed uint 0
+if ne get r expected uint 5
+c3 = false
+end
+if ne get r wait_kind OMEGA_GPU_WAIT_SEQUENCE
+c3 = false
+end
+gw_check S_NEVER c3 t_m_never3
+c4 = ge get r elapsed_ns ulong 100000000
+if ne get r progress_count ulong 0
+c4 = false
+end
+if gw_ck c4
+gw_print_sname S_NEVER ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 t_m_never4a
+gw_wr_u64 get r elapsed_ns
+gw_wr1 t_m_never4b
+gw_wr_u64 get r progress_count
+gw_wr1 t_gw_nl
+end
+end
+
+fn sc_late fx_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+gw_sched ulong 60 0 uint 7
+ok = call_fx fx_impl uint 7 r cfg
+c1 = ok
+if ne get r result OMEGA_GPU_WAIT_PASS
+c1 = false
+end
+if ne get r last_observed uint 7
+c1 = false
+end
+gw_check S_LATE c1 t_m_late1
+c2 = eq get r progress_count ulong 1
+if le get r last_progress_ns get r start_ns
+c2 = false
+end
+gw_check S_LATE c2 t_m_late2
+end
+
+fn sc_marker2_cfg cfg edit OmegaGpuWaitCfg to void
+gw_setup cfg
+put cfg has_marker2 1
+put cfg marker2_want uint 0x46464646
+end
+
+fn sc_marker2 fx_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+sc_marker2_cfg cfg
+gw_sched ulong 10 0 uint 3
+ok = call_fx fx_impl uint 3 r cfg
+gw_check S_MARKER2 not ok t_m_m2a
+c2 = eq get r last_observed uint 3
+if ne get r last_marker2 uint 0
+c2 = false
+end
+gw_check S_MARKER2 c2 t_m_m2b
+gw_words uint 0 uint 0
+sc_marker2_cfg cfg
+gw_sched ulong 10 0 uint 3
+gw_sched ulong 20 1 uint 0x46464646
+ok = call_fx fx_impl uint 3 r cfg
+c3 = ok
+if ne get r last_marker2 uint 0x46464646
+c3 = false
+end
+gw_check S_MARKER2 c3 t_m_m2c
+end
+
+fn sc_seq_wrap_step sq_impl int tv uint cfg edit OmegaGpuWaitCfg r edit OmegaGpuWaitReport to void
+from = sub tv uint 1
+put g_fk_words 0 from
+gw_setup cfg
+gw_sched ulong 10 0 tv
+ok = call_sq sq_impl tv r cfg
+if gw_ck ok
+gw_print_sname S_SEQ_WRAP ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 t_m_w1a
+gw_wr_hexn tv ulong 8
+gw_wr1 t_m_w1b
+gw_wr_hexn from ulong 8
+gw_wr1 t_gw_nl
+end
+end
+
+fn sc_seq_wrap_from sq_impl int w uint target uint cfg edit OmegaGpuWaitCfg r edit OmegaGpuWaitReport to bool
+put g_fk_words 0 w
+gw_setup cfg
+ret call_sq sq_impl target r cfg
+end
+
+fn sc_seq_wrap sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+sc_seq_wrap_step sq_impl uint 0xfffffffe cfg r
+sc_seq_wrap_step sq_impl uint 0xffffffff cfg r
+sc_seq_wrap_step sq_impl uint 0 cfg r
+sc_seq_wrap_step sq_impl uint 1 cfg r
+ok = sc_seq_wrap_from sq_impl uint 3 uint 0xffffffff cfg r
+gw_check S_SEQ_WRAP ok t_m_w2
+ok = sc_seq_wrap_from sq_impl uint 0 uint 0xfffffffe cfg r
+gw_check S_SEQ_WRAP ok t_m_w3
+ok = sc_seq_wrap_from sq_impl uint 0xfffffff0 uint 0xffffffff cfg r
+gw_check S_SEQ_WRAP not ok t_m_w4
+ok = sc_seq_wrap_from sq_impl uint 0xfffffffe uint 1 cfg r
+gw_check S_SEQ_WRAP not ok t_m_w5
+end
+
+fn sc_progress_resets sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+i = ulong 0
+while lt i ulong 4 bound 8
+gw_sched mul ulong 60 add i ulong 1 0 uint add i ulong 1
+i = add i ulong 1
+end
+ok = call_sq sq_impl uint 4 r cfg
+gw_check S_PROGRESS_RESETS ok t_m_pr1
+if gw_ck eq get r progress_count ulong 4
+gw_print_sname S_PROGRESS_RESETS ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 t_m_pr2
+gw_wr_u64 get r progress_count
+gw_wr1 t_gw_nl
+end
+end
+
+fn sc_barrier_msgs ok bool polls ulong to void
+c1 = ok
+if eq polls ulong 0
+c1 = false
+end
+if lt get g_fk_u64 3 add polls ulong 1
+c1 = false
+end
+if gw_ck c1
+gw_print_sname S_BARRIER ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 t_m_b1a
+gw_wr_u64 get g_fk_u64 3
+gw_wr1 t_m_b1b
+gw_wr_u64 polls
+gw_wr1 t_gw_nl
+end
+c2 = eq get g_fk_u64 4 polls
+if ne get g_fk_u64 6 ulong 0
+c2 = false
+end
+if gw_ck c2
+gw_print_sname S_BARRIER ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 t_m_b2a
+gw_wr_u64 get g_fk_u64 6
+gw_wr1 t_m_b2b
+gw_wr_u64 get g_fk_u64 4
+gw_wr1 t_m_b2c
+gw_wr1 t_gw_nl
+end
+gw_check S_BARRIER gt get g_fk_u64 3 get g_fk_u64 5 t_m_b3
+end
+
+fn sc_barrier sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+gw_sched ulong 5 0 uint 1
+put cfg use_snapshot 1
+ok = call_sq sq_impl uint 1 r cfg
+sc_barrier_msgs ok get r polls
+end
+
+fn sc_hard_deadline sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+put cfg total_timeout_ms uint 200
+i = ulong 0
+while lt i ulong 30 bound 32
+gw_sched mul ulong 20 add i ulong 1 0 uint add i ulong 1
+i = add i ulong 1
+end
+ok = call_sq sq_impl uint 99 r cfg
+c1 = not ok
+if ne get r result OMEGA_GPU_WAIT_TIMEOUT
+c1 = false
+end
+gw_check_got S_HARD_DEADLINE c1 t_m_hd1 get r result
+if gw_ck gt get r progress_count ulong 3
+gw_print_sname S_HARD_DEADLINE ulong 0
+gw_wr1 t_gw_cs
+gw_wr1 t_m_hd2
+gw_wr_u64 get r progress_count
+gw_wr1 t_gw_rpnl
+end
+end
+
+fn sc_fixed_overshoot fx_impl int sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+gw_sched ulong 10 0 uint 5
+ok = call_fx fx_impl uint 3 r cfg
+gw_check S_FIXED_OVERSHOOT not ok t_m_fo1
+c2 = eq get r result OMEGA_GPU_WAIT_STALLED
+if ne get r last_observed uint 5
+c2 = false
+end
+gw_check S_FIXED_OVERSHOOT c2 t_m_fo2
+put g_fk_words 0 uint 0
+gw_setup cfg
+gw_sched ulong 10 0 uint 5
+ok = call_sq sq_impl uint 3 r cfg
+gw_check S_FIXED_OVERSHOOT ok t_m_fo3
+end
+
+fn sc_invalid sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+put g_fk_inv 0 uint 9
+gw_sched ulong 10 0 uint 9
+ok = call_sq sq_impl uint 20 r cfg
+c1 = not ok
+if ne get r result OMEGA_GPU_WAIT_INVALID_STATE
+c1 = false
+end
+if ne get r last_observed uint 9
+c1 = false
+end
+gw_check_got S_INVALID c1 t_m_inv get r result
+end
+
+fn sc_abort sq_impl int to void
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_setup cfg
+put g_fk_i32 1 7
+ok = call_sq sq_impl uint 20 r cfg
+c1 = not ok
+if ne get r result OMEGA_GPU_WAIT_ABORTED
+c1 = false
+end
+gw_check_got S_ABORT c1 t_m_ab get r result
+end
+
+note Returns the failed checks of scenario which (the watched words start at 0).
+fn run_scenario fx_impl int sq_impl int which int to int
+before = get g_fk_i32 2
+gw_words uint 0 uint 0
+if eq which S_NEVER
+sc_never sq_impl
+end
+if eq which S_LATE
+sc_late fx_impl
+end
+if eq which S_MARKER2
+sc_marker2 fx_impl
+end
+if eq which S_SEQ_WRAP
+sc_seq_wrap sq_impl
+end
+if eq which S_PROGRESS_RESETS
+sc_progress_resets sq_impl
+end
+if eq which S_BARRIER
+sc_barrier sq_impl
+end
+if eq which S_HARD_DEADLINE
+sc_hard_deadline sq_impl
+end
+if eq which S_FIXED_OVERSHOOT
+sc_fixed_overshoot fx_impl sq_impl
+end
+if eq which S_INVALID
+sc_invalid sq_impl
+end
+if eq which S_ABORT
+sc_abort sq_impl
+end
+ret sub get g_fk_i32 2 before
+end
+
+fn sentinel_sched to void
+id = ulong 1
+while le id ulong 15 bound 20
+gw_sched id 0 add uint 3000 uint id
+id = add id ulong 1
+end
+end
+
+fn sentinel_msg ok bool want int msg view uchar * r view OmegaGpuWaitReport want_obs uint to void
+c = not ok
+if eq want OMEGA_GPU_WAIT_PASS
+c = ok
+end
+if ne get r result want
+c = false
+end
+if ne get r last_observed want_obs
+c = false
+end
+if gw_ck c
+gw_wr1 msg
+gw_wr_int get r result
+gw_wr1 t_m_obs
+gw_wr_u64 ulong get r last_observed
+gw_wr1 t_gw_rpnl
+end
+end
+
+note CHIPWAIT-1c: QUEUE_WRAP marker2 pattern (src/omega_world_gates.c). Every entry of a batch but
+note the last writes its dispatch_id to marker2; the last writes the sentinel 0x46464646. A sequence
+note wait for the sentinel must not accept dispatch ids (even a high one), and must pass when the
+note sentinel lands.
+fn sc_sentinel_batch to int
+before = get g_fk_i32 2
+cfg = new OmegaGpuWaitCfg 0 0 0 0 0 0 0 0 0 0
+r = new OmegaGpuWaitReport 0 0 0 0 0 0 0 0 0 0 0 0
+gw_words uint 0 uint 0
+gw_setup cfg
+sentinel_sched
+ok = omega_gpu_wait_sequence uint 0x46464646 r cfg
+sentinel_msg ok OMEGA_GPU_WAIT_STALLED t_m_sent1 r uint 3015
+put g_fk_words 0 uint 0
+gw_setup cfg
+sentinel_sched
+gw_sched ulong 16 0 uint 0x46464646
+ok = omega_gpu_wait_sequence uint 0x46464646 r cfg
+sentinel_msg ok OMEGA_GPU_WAIT_PASS t_m_sent2 r uint 0x46464646
+ret sub get g_fk_i32 2 before
+end
+
+fn run_mutant_check label view uchar * fx_impl int sq_impl int must_kill uint kt edit int 2 to void
+saved = get g_fk_i32 2
+put g_fk_i32 4 1
+killed = uint 0
+s = int 0
+while lt s S_COUNT bound 16
+if gt run_scenario fx_impl sq_impl s 0
+killed = or killed shl uint 1 uint s
+end
+s = add s 1
+end
+put g_fk_i32 2 saved
+put g_fk_i32 4 0
+s = int 0
+while lt s S_COUNT bound 16
+bit = shl uint 1 uint s
+if ne and must_kill bit uint 0
+put kt 1 add get kt 1 1
+put g_fk_i32 3 add get g_fk_i32 3 1
+if ne and killed bit uint 0
+put kt 0 add get kt 0 1
+else
+put g_fk_i32 2 add get g_fk_i32 2 1
+gw_wr1 t_gw_fail
+gw_wr1 t_msurv1
+gw_wr1 label
+gw_wr1 t_msurv2
+gw_print_sname s ulong 0
+gw_wr1 t_gw_nl
+end
+end
+s = add s 1
+end
+gw_wr1 t_gw_mut
+gw_wr_pad label ulong 26
+gw_wr1 t_gw_kmask
+gw_wr_hexn killed ulong 3
+gw_wr1 t_gw_req
+gw_wr_hexn must_kill ulong 3
+gw_wr1 t_gw_rpnl
+put g_fk_i32 4 1
+end
+
+fn gw_real_line s int bad int to void
+gw_wr1 t_gw_real
+gw_print_sname s ulong 28
+gw_wr1 t_gw_sp
+if ne bad 0
+gw_wr1 t_gw_FAIL
+else
+gw_wr1 t_gw_ok
+end
+end
+
+fn main to int
+s = int 0
+while lt s S_COUNT bound 16
+bad = run_scenario IMPL_REAL IMPL_REAL s
+gw_real_line s bad
+s = add s 1
+end
+sbad = sc_sentinel_batch
+gw_real_line 10 sbad
+real_fail = get g_fk_i32 2
+
+kt = new int 2 0
+run_mutant_check t_mn0 IMPL_NAIVE IMPL_NAIVE uint 0x3ff kt
+run_mutant_check t_mn1 IMPL_FIXED_GE IMPL_REAL uint 0x080 kt
+run_mutant_check t_mn2 IMPL_REAL IMPL_SEQ_UNSG uint 0x008 kt
+put g_fk_i32 4 0
+
+gw_wr1 t_gw_sum1
+gw_wr_int get g_fk_i32 3
+gw_wr1 t_gw_sum2
+gw_wr_int real_fail
+gw_wr1 t_gw_sum3
+gw_wr_int get kt 0
+gw_wr1 t_gw_sl
+gw_wr_int get kt 1
+gw_wr1 t_gw_nl
+
+if ne get g_fk_i32 2 0
+gw_wr1 t_gw_fail_end
+ret 1
+end
+gw_wr1 t_gw_pass
+ret 0
+end

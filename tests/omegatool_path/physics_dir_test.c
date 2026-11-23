@@ -93,6 +93,12 @@ int main(void) {
     CHECK(omega_physics_dir_resolve(out, sizeof out, err, sizeof err) == 0);
     CHECK(strstr(err, "m16/m16_native.h"));
 
+    /* 3b. a real checkout whose real path holds a quote: refuse (the gate runners single-quote it for the shell) */
+    snprintf(p, sizeof p, "%s/q'uote", base); mkphys(p);
+    setenv("PHYSICS_DIR", p, 1);
+    CHECK(omega_physics_dir_resolve(out, sizeof out, err, sizeof err) == 0);
+    CHECK(strstr(err, "unusable") && strstr(err, "q'uote"));
+
     /* 4. env empty or unset: default ../physics relative to cwd; absent -> refuse */
     snprintf(p, sizeof p, "%s/omega", base); mkdir(p, 0755);
     CHECK(chdir(p) == 0);
