@@ -1,0 +1,1839 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/turing/ty_qrecord.om -- Pure seeded OM-2 implementation of TURING
+note continuous-value companion records (qprofile, qworld, qfreeze, qgain)
+note and sidecar manifest builders/parsers/validators.
+note Composed after src/turing/ty_core_lib.om.
+note
+note Replaces src/turing/ty_qrecord.{c,h}. Same digests (SHA-256(domain || 0x00
+note || OMG0 bytes), ca_finish of ty_core_lib), same refusal rules and return
+note codes (TY_OK, TY_E_FORMAT, TY_E_DIGEST, TY_E_PROFILE, TY_E_IO, TY_E_ARG,
+note TYQR_E_EXISTS). Differences of form, not of result:
+note   - each record kind lives in one global record (g_qp_*, g_qw_*, g_qf_*,
+note     g_qg_*); string fields are TYQR_VAL-byte NUL-terminated cells, so a
+note     513-byte value without NUL is refused exactly as in C;
+note   - digests are g_dig slots; slots 500 and 501 are scratch for this file,
+note     so callers must not pass them to tyqr_gain_bind or the verifiers;
+note   - the free-text refusal reason (C `why`) is not produced; the code is;
+note   - NULL-argument TY_E_ARG cases have no counterpart (no pointers);
+note   - sidecar build/parse work in g_qr_mbuf (8192 bytes, so at most 8191
+note     bytes of output), at most 64 entries (building more is TY_E_ARG,
+note     parsing more is TY_E_FORMAT); the written
+note     path is left in g_qr_wpath / g_qr_wplen.
+
+const TYQR_VAL ulong 513
+const TYQR_MAX_LINEAGE ulong 8
+const TYQR_CANON_CAP ulong 40000
+const TYQR_CELL_MAX ulong 128
+const TYQR_SCRATCH_SLOT ulong 500
+const TYQR_VERIFY_SLOT ulong 501
+
+text t_qr_dom_prof "turing.qprofile.v0"
+text t_qr_dom_world "turing.qworld.v0"
+text t_qr_dom_freeze "turing.qfreeze.v0"
+text t_qr_dom_gain "turing.qgain.v0"
+
+text t_qr_rec_prof "turing.qprofile"
+text t_qr_rec_world "turing.qworld"
+text t_qr_rec_freeze "turing.qfreeze"
+text t_qr_rec_gain "turing.qgain"
+
+note Enum and constant literals
+text t_qr_dev "dev"
+text t_qr_cert "certification"
+text t_qr_disc "discovery"
+text t_qr_sealed "sealed"
+text t_qr_pos "POSITIVE"
+text t_qr_neg "NEGATIVE"
+text t_qr_amb "AMBIGUOUS"
+text t_qr_weak "WEAK"
+text t_qr_stop "STOPPED"
+text t_qr_agree "AGREE"
+text t_qr_stp "STOP"
+text t_qr_pass "PASS"
+text t_qr_fail "FAIL"
+text t_qr_none "none"
+text t_qr_dash "-"
+text t_qr_0 "0"
+text t_qr_1 "1"
+text t_qr_inc "INCONCLUSIVE"
+text t_qr_failp "FAIL_"
+text t_qr_linp "lineage."
+text t_qr_ext ".omg0"
+
+note Record attribute keys
+text t_qk_profile "profile"
+text t_qk_spec "spec"
+text t_qk_packet "packet"
+text t_qk_protocol "protocol"
+text t_qk_quantizer "quantizer"
+text t_qk_delta_log2 "delta_log2"
+text t_qk_edge_rule "edge_rule"
+text t_qk_sd_min_log2 "sd_min_log2"
+text t_qk_floor_rule "floor_rule"
+text t_qk_families "families"
+text t_qk_kmax "kmax"
+text t_qk_n_points "n_points"
+text t_qk_split "split"
+text t_qk_cells "cells"
+text t_qk_rider "rider"
+text t_qk_lm_rule "lm_rule"
+text t_qk_baselines "baselines"
+text t_qk_thresholds "thresholds"
+text t_qk_thr_fmt "thresholds_format"
+text t_qk_gen_ver "gen_version"
+text t_qk_boot_b "bootstrap_b"
+text t_qk_unit "unit"
+
+text t_qk_qprofile "qprofile"
+text t_qk_mode "mode"
+text t_qk_parent_kind "parent_kind"
+text t_qk_qfreeze "qfreeze"
+text t_qk_cell "cell"
+text t_qk_block "block"
+text t_qk_label "label"
+text t_qk_generator "generator"
+text t_qk_rep_first "rep_first"
+text t_qk_rep_count "rep_count"
+text t_qk_traj_man "traj_manifest"
+text t_qk_traj_fmt "traj_format"
+
+text t_qk_artifact "artifact"
+text t_qk_art_kind "artifact_kind"
+text t_qk_art_bin "artifact_bin"
+text t_qk_dev_man "dev_manifest"
+text t_qk_b2_em "b2_emerging_label"
+text t_qk_bayes "bayes_plugin_check"
+text t_qk_diag_fw "diag_fw_rate_ppm"
+text t_qk_len_test "lengthening_test"
+text t_qk_stab_test "stability_test"
+text t_qk_cal_extra "calibration_extra"
+text t_qk_run_commit "run_commit"
+text t_qk_tree_dirty "tree_dirty"
+text t_qk_base_commits "base_commits"
+text t_qk_prod_tool "producer_tool"
+text t_qk_prod_model "producer_model"
+text t_qk_prompt_dig "prompt_digest"
+text t_qk_trans_dig "transcript_digest"
+text t_qk_n_lineage "n_lineage"
+
+text t_qk_qworld "qworld"
+text t_qk_baseline "baseline"
+text t_qk_candidate "candidate"
+text t_qk_cand_op "candidate_opcode"
+text t_qk_prd_b "prd_b"
+text t_qk_prd_m "prd_m"
+text t_qk_official "official"
+text t_qk_ladder "ladder_item"
+text t_qk_lengths "lengths"
+text t_qk_t_ub "t_ub"
+text t_qk_t_lo_ub "t_lo_ub"
+text t_qk_t_hi_ub "t_hi_ub"
+text t_qk_num_bnd "numeric_bound_ub"
+text t_qk_mc_err "mc_err_ub"
+text t_qk_counts "counts"
+text t_qk_floor_hits "floor_hits"
+text t_qk_prot_fail "protocol_failures"
+text t_qk_leak_flag "leak_flag"
+text t_qk_coverage "coverage"
+text t_qk_diag_warn "diag_warnings"
+text t_qk_class "classification"
+text t_qk_status "status"
+
+note ---- Record global state ----
+note qprofile: 12 strings (0..11), 4 digests (0..3), 2 i64 (0..1), 4 u64 (0..3)
+global g_qp_s uchar 6156
+global g_qp_d uchar 128
+global g_qp_i long 2
+global g_qp_u ulong 4
+
+note qworld: 6 strings (0..5), 4 digests (0..3), 3 u64 (0..2)
+global g_qw_s uchar 3078
+global g_qw_d uchar 128
+global g_qw_u ulong 3
+
+note qfreeze: 11 strings (0..10), run_commit(41), 14 digests (0..13), 2 u64 (0..1)
+global g_qf_s uchar 5643
+global g_qf_rc uchar 41
+global g_qf_d uchar 448
+global g_qf_u ulong 2
+
+note qgain: 9 strings (0..8), 7 digests (0..6), 9 u64 (0..8), 14 i64 (0..13)
+global g_qg_s uchar 4617
+global g_qg_d uchar 224
+global g_qg_u ulong 9
+global g_qg_i long 14
+
+note Scratch buffers for string validation, file I/O, and sidecars
+global g_qr_str uchar 513
+global g_qr_str2 uchar 513
+global g_qr_wpath uchar 1024
+global g_qr_wplen ulong 1
+global g_qr_fbuf uchar 40001
+
+note Sidecar manifest buffers
+global g_qr_mbuf uchar 8192
+global g_qr_mlen ulong 1
+global g_qr_rep_u ulong 64
+global g_qr_rep_d uchar 2048
+global g_qr_rep_n ulong 1
+global g_qr_dev_c uchar 8192
+global g_qr_dev_b ulong 64
+global g_qr_dev_d uchar 2048
+global g_qr_dev_n ulong 1
+global g_qr_fo ulong 64
+global g_qr_fl ulong 64
+
+note ---- Record field setters/loaders ----
+fn qr_zero_profile to void
+  for i ulong 6156
+    put g_qp_s i uchar 0
+  end
+  for i ulong 128
+    put g_qp_d i uchar 0
+  end
+  put g_qp_i 0 0
+  put g_qp_i 1 0
+  for i ulong 4
+    put g_qp_u i 0
+  end
+end
+
+fn qr_zero_world to void
+  for i ulong 3078
+    put g_qw_s i uchar 0
+  end
+  for i ulong 128
+    put g_qw_d i uchar 0
+  end
+  for i ulong 3
+    put g_qw_u i 0
+  end
+end
+
+fn qr_zero_freeze to void
+  for i ulong 5643
+    put g_qf_s i uchar 0
+  end
+  for i ulong 41
+    put g_qf_rc i uchar 0
+  end
+  for i ulong 448
+    put g_qf_d i uchar 0
+  end
+  put g_qf_u 0 0
+  put g_qf_u 1 0
+end
+
+fn qr_zero_gain to void
+  for i ulong 4617
+    put g_qg_s i uchar 0
+  end
+  for i ulong 224
+    put g_qg_d i uchar 0
+  end
+  for i ulong 9
+    put g_qg_u i 0
+  end
+  for i ulong 14
+    put g_qg_i i 0
+  end
+end
+
+note Set NUL-terminated string field (kind: 0=prof, 1=world, 2=freeze, 3=gain)
+fn qr_set_str kind ulong idx ulong s view uchar * to void
+  n = len s
+  if gt n 512
+    n = 512
+  end
+  off = mul idx TYQR_VAL
+  if eq kind 0
+    for i ulong n bound 513
+      put g_qp_s add off i get s i
+    end
+    put g_qp_s add off n uchar 0
+    ret
+  end
+  if eq kind 1
+    for i ulong n bound 513
+      put g_qw_s add off i get s i
+    end
+    put g_qw_s add off n uchar 0
+    ret
+  end
+  if eq kind 2
+    for i ulong n bound 513
+      put g_qf_s add off i get s i
+    end
+    put g_qf_s add off n uchar 0
+    ret
+  end
+  for i ulong n bound 513
+    put g_qg_s add off i get s i
+  end
+  put g_qg_s add off n uchar 0
+end
+
+note Copy digest from g_dig[slot] into record digest field
+fn qr_set_dig kind ulong idx ulong slot ulong to void
+  so = mul slot 32
+  doff = mul idx 32
+  if eq kind 0
+    for i ulong 32
+      put g_qp_d add doff i get g_dig add so i
+    end
+    ret
+  end
+  if eq kind 1
+    for i ulong 32
+      put g_qw_d add doff i get g_dig add so i
+    end
+    ret
+  end
+  if eq kind 2
+    for i ulong 32
+      put g_qf_d add doff i get g_dig add so i
+    end
+    ret
+  end
+  for i ulong 32
+    put g_qg_d add doff i get g_dig add so i
+  end
+end
+
+note Load record string field into g_qr_str (kind 4 = g_qf_rc)
+fn qr_load_str kind ulong idx ulong to void
+  if eq kind 4
+    for i ulong 41
+      put g_qr_str i get g_qf_rc i
+    end
+    ret
+  end
+  off = mul idx TYQR_VAL
+  if eq kind 0
+    for i ulong TYQR_VAL
+      put g_qr_str i get g_qp_s add off i
+    end
+    ret
+  end
+  if eq kind 1
+    for i ulong TYQR_VAL
+      put g_qr_str i get g_qw_s add off i
+    end
+    ret
+  end
+  if eq kind 2
+    for i ulong TYQR_VAL
+      put g_qr_str i get g_qf_s add off i
+    end
+    ret
+  end
+  for i ulong TYQR_VAL
+    put g_qr_str i get g_qg_s add off i
+  end
+end
+
+note Load record string field into g_qr_str2
+fn qr_load_str2 kind ulong idx ulong to void
+  off = mul idx TYQR_VAL
+  if eq kind 1
+    for i ulong TYQR_VAL
+      put g_qr_str2 i get g_qw_s add off i
+    end
+    ret
+  end
+  if eq kind 2
+    for i ulong TYQR_VAL
+      put g_qr_str2 i get g_qf_s add off i
+    end
+    ret
+  end
+  for i ulong TYQR_VAL
+    put g_qr_str2 i get g_qg_s add off i
+  end
+end
+
+note Load record digest into g_dig[slot]
+fn qr_load_dig kind ulong idx ulong slot ulong to void
+  so = mul slot 32
+  doff = mul idx 32
+  if eq kind 0
+    for i ulong 32
+      put g_dig add so i get g_qp_d add doff i
+    end
+    ret
+  end
+  if eq kind 1
+    for i ulong 32
+      put g_dig add so i get g_qw_d add doff i
+    end
+    ret
+  end
+  if eq kind 2
+    for i ulong 32
+      put g_dig add so i get g_qf_d add doff i
+    end
+    ret
+  end
+  for i ulong 32
+    put g_dig add so i get g_qg_d add doff i
+  end
+end
+
+fn qr_dig_is_zero kind ulong idx ulong to bool
+  qr_load_dig kind idx TYQR_SCRATCH_SLOT
+  ret dg_is_zero TYQR_SCRATCH_SLOT
+end
+
+fn qr_add_dig kind ulong idx ulong key view uchar * to void
+  qr_load_dig kind idx TYQR_SCRATCH_SLOT
+  ca_add_dig key TYQR_SCRATCH_SLOT
+end
+
+note ---- Field validators on g_qr_str ----
+fn qr_str_len cap ulong to long
+  for i ulong cap bound 513
+    if eq get g_qr_str i 0
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn qr_text_ok cap ulong to bool
+  nl = qr_str_len cap
+  if lt nl 1
+    ret false
+  end
+  n = ulong nl
+  if gt n 512
+    ret false
+  end
+  for i ulong n bound 512
+    b = get g_qr_str i
+    if lt b 32
+      ret false
+    end
+    if gt b 126
+      ret false
+    end
+  end
+  ret true
+end
+
+fn qr_list_ok cap ulong to bool
+  if not qr_text_ok cap
+    ret false
+  end
+  n = ulong qr_str_len cap
+  if eq get g_qr_str 0 32
+    ret false
+  end
+  if eq get g_qr_str sub n 1 32
+    ret false
+  end
+  i = ulong 1
+  while lt i n bound 512
+    if eq get g_qr_str i 32
+      if eq get g_qr_str sub i 1 32
+        ret false
+      end
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn qr_name_ok cap ulong to bool
+  if not qr_text_ok cap
+    ret false
+  end
+  n = ulong qr_str_len cap
+  for i ulong n bound 512
+    if eq get g_qr_str i 32
+      ret false
+    end
+  end
+  ret true
+end
+
+fn qr_hex40_ok to bool
+  nl = qr_str_len 41
+  if ne nl 40
+    ret false
+  end
+  for i ulong 40
+    c = get g_qr_str i
+    d_ok = false
+    if ge c 48
+      if le c 57
+        d_ok = true
+      end
+    end
+    if ge c 97
+      if le c 102
+        d_ok = true
+      end
+    end
+    if not d_ok
+      ret false
+    end
+  end
+  ret true
+end
+
+fn qr_str_eq lit view uchar * to bool
+  nl = qr_str_len TYQR_VAL
+  if lt nl 0
+    ret false
+  end
+  n = ulong nl
+  if ne n len lit
+    ret false
+  end
+  for i ulong n bound 512
+    if ne get g_qr_str i get lit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn qr_str_prefix lit view uchar * to bool
+  nl = qr_str_len TYQR_VAL
+  if lt nl 0
+    ret false
+  end
+  n = ulong nl
+  ll = len lit
+  if lt n ll
+    ret false
+  end
+  for i ulong ll bound 64
+    if ne get g_qr_str i get lit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn qr_str_eq_str2 to bool
+  for i ulong TYQR_VAL
+    a = get g_qr_str i
+    b = get g_qr_str2 i
+    if ne a b
+      ret false
+    end
+    if eq a 0
+      ret true
+    end
+  end
+  ret false
+end
+
+fn qr_add_cur_str key view uchar * to void
+  nl = qr_str_len TYQR_VAL
+  if lt nl 0
+    put g_ca_err 0 1
+    ret
+  end
+  n = ulong nl
+  tv_clr
+  for i ulong n bound 512
+    tv_b get g_qr_str i
+  end
+  ca_add_k key
+end
+
+fn qr_t_text kind ulong idx ulong key view uchar * to void
+  qr_load_str kind idx
+  if not qr_text_ok TYQR_VAL
+    put g_ca_err 0 1
+    ret
+  end
+  qr_add_cur_str key
+end
+
+fn qr_t_list kind ulong idx ulong key view uchar * to void
+  qr_load_str kind idx
+  if not qr_list_ok TYQR_VAL
+    put g_ca_err 0 1
+    ret
+  end
+  qr_add_cur_str key
+end
+
+fn qr_t_name kind ulong idx ulong key view uchar * to void
+  qr_load_str kind idx
+  if not qr_name_ok TYQR_VAL
+    put g_ca_err 0 1
+    ret
+  end
+  qr_add_cur_str key
+end
+
+note ---- qprofile encode / digest / verify ----
+fn tyqr_profile_digest dslot ulong to long
+  ca_reset t_qr_rec_prof
+  qr_t_text 0 0 t_qk_profile
+  qr_add_dig 0 0 t_qk_spec
+  qr_add_dig 0 1 t_qk_packet
+  qr_t_text 0 1 t_qk_protocol
+  qr_t_text 0 2 t_qk_quantizer
+  ca_add_i64 t_qk_delta_log2 get g_qp_i 0
+  qr_t_text 0 3 t_qk_edge_rule
+  ca_add_i64 t_qk_sd_min_log2 get g_qp_i 1
+  qr_t_text 0 4 t_qk_floor_rule
+  qr_t_list 0 5 t_qk_families
+  ca_add_u64 t_qk_kmax get g_qp_u 0
+  ca_add_u64 t_qk_n_points get g_qp_u 1
+  ca_add_u64 t_qk_split get g_qp_u 2
+  qr_add_dig 0 2 t_qk_cells
+  qr_t_text 0 6 t_qk_rider
+  qr_t_text 0 7 t_qk_lm_rule
+  qr_t_list 0 8 t_qk_baselines
+  qr_add_dig 0 3 t_qk_thresholds
+  qr_t_text 0 9 t_qk_thr_fmt
+  qr_t_text 0 10 t_qk_gen_ver
+  ca_add_u64 t_qk_boot_b get g_qp_u 3
+  qr_t_text 0 11 t_qk_unit
+  ret ca_finish TY_KIND_CONSTRAINT t_qr_dom_prof dslot
+end
+
+note ---- qworld encode / digest / verify ----
+fn qr_chk_mode_w to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_dev
+    ret true
+  end
+  if qr_str_eq t_qr_cert
+    ret true
+  end
+  ret qr_str_eq t_qr_disc
+end
+
+fn qr_chk_parent to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_dev
+    ret true
+  end
+  ret qr_str_eq t_qr_sealed
+end
+
+fn tyqr_world_digest dslot ulong to long
+  ca_reset t_qr_rec_world
+  qr_add_dig 1 0 t_qk_qprofile
+  qr_load_str 1 0
+  dev_mode = false
+  if not qr_chk_mode_w
+    put g_ca_err 0 1
+  else
+    dev_mode = qr_str_eq t_qr_dev
+    qr_add_cur_str t_qk_mode
+  end
+  qr_load_str 1 1
+  dev_parent = false
+  if not qr_chk_parent
+    put g_ca_err 0 1
+  else
+    dev_parent = qr_str_eq t_qr_dev
+    qr_add_cur_str t_qk_parent_kind
+  end
+  if eq get g_ca_err 0 0
+    if ne dev_mode dev_parent
+      put g_ca_err 0 1
+    else
+      if ne dev_parent qr_dig_is_zero 1 1
+        put g_ca_err 0 1
+      end
+    end
+  end
+  qr_add_dig 1 1 t_qk_qfreeze
+  qr_t_name 1 2 t_qk_cell
+  ca_add_u64 t_qk_block get g_qw_u 0
+  qr_t_text 1 3 t_qk_label
+  qr_t_text 1 4 t_qk_gen_ver
+  qr_add_dig 1 2 t_qk_generator
+  ca_add_u64 t_qk_rep_first get g_qw_u 1
+  ca_add_u64 t_qk_rep_count get g_qw_u 2
+  qr_add_dig 1 3 t_qk_traj_man
+  qr_t_text 1 5 t_qk_traj_fmt
+  ret ca_finish TY_KIND_EVIDENCE t_qr_dom_world dslot
+end
+
+note ---- qfreeze encode / digest / verify ----
+fn qr_chk_mode_f to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_cert
+    ret true
+  end
+  ret qr_str_eq t_qr_disc
+end
+
+fn qr_chk_label to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_pos
+    ret true
+  end
+  if qr_str_eq t_qr_neg
+    ret true
+  end
+  ret qr_str_eq t_qr_amb
+end
+
+fn qr_chk_check to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_agree
+    ret true
+  end
+  ret qr_str_eq t_qr_stp
+end
+
+fn qr_chk_pf to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_pass
+    ret true
+  end
+  ret qr_str_eq t_qr_fail
+end
+
+fn qr_freeze_add_enums to void
+  qr_load_str 2 2
+  if not qr_chk_label
+    put g_ca_err 0 1
+  else
+    qr_add_cur_str t_qk_b2_em
+  end
+  qr_load_str 2 3
+  if not qr_chk_check
+    put g_ca_err 0 1
+  else
+    qr_add_cur_str t_qk_bayes
+  end
+  qr_t_list 2 4 t_qk_diag_fw
+  qr_load_str 2 5
+  if not qr_chk_pf
+    put g_ca_err 0 1
+  else
+    qr_add_cur_str t_qk_len_test
+  end
+  qr_load_str 2 6
+  if not qr_chk_pf
+    put g_ca_err 0 1
+  else
+    qr_add_cur_str t_qk_stab_test
+  end
+  qr_t_text 2 7 t_qk_cal_extra
+end
+
+fn qr_freeze_chk_prod cert bool to void
+  if ne get g_ca_err 0 0
+    ret
+  end
+  if cert
+    qr_load_str 2 9
+    t_none = qr_str_eq t_qr_none
+    qr_load_str 2 10
+    m_none = qr_str_eq t_qr_none
+    p_z = qr_dig_is_zero 2 4
+    tr_z = qr_dig_is_zero 2 5
+    if not t_none
+      put g_ca_err 0 1
+      ret
+    end
+    if not m_none
+      put g_ca_err 0 1
+      ret
+    end
+    if not p_z
+      put g_ca_err 0 1
+      ret
+    end
+    if not tr_z
+      put g_ca_err 0 1
+    end
+    ret
+  end
+  if qr_dig_is_zero 2 4
+    put g_ca_err 0 1
+    ret
+  end
+  if qr_dig_is_zero 2 5
+    put g_ca_err 0 1
+  end
+end
+
+fn tyqr_freeze_digest dslot ulong to long
+  ca_reset t_qr_rec_freeze
+  qr_load_str 2 0
+  cert = false
+  if not qr_chk_mode_f
+    put g_ca_err 0 1
+  else
+    cert = qr_str_eq t_qr_cert
+    qr_add_cur_str t_qk_mode
+  end
+  qr_add_dig 2 0 t_qk_artifact
+  qr_t_text 2 1 t_qk_art_kind
+  if eq get g_ca_err 0 0
+    if ne cert qr_dig_is_zero 2 1
+      put g_ca_err 0 1
+    end
+  end
+  qr_add_dig 2 1 t_qk_art_bin
+  qr_add_dig 2 2 t_qk_qprofile
+  qr_add_dig 2 3 t_qk_dev_man
+  qr_freeze_add_enums
+  qr_load_str 4 0
+  if not qr_hex40_ok
+    put g_ca_err 0 1
+  else
+    tv_clr
+    for i ulong 40
+      tv_b get g_qr_str i
+    end
+    ca_add_k t_qk_run_commit
+  end
+  td = get g_qf_u 0
+  if gt td 1
+    put g_ca_err 0 1
+  end
+  ca_add_u64 t_qk_tree_dirty td
+  qr_t_list 2 8 t_qk_base_commits
+  qr_t_text 2 9 t_qk_prod_tool
+  qr_t_text 2 10 t_qk_prod_model
+  qr_freeze_chk_prod cert
+  qr_add_dig 2 4 t_qk_prompt_dig
+  qr_add_dig 2 5 t_qk_trans_dig
+  nl = get g_qf_u 1
+  if gt nl TYQR_MAX_LINEAGE
+    put g_ca_err 0 1
+  end
+  ca_add_u64 t_qk_n_lineage nl
+  if eq get g_ca_err 0 0
+    for i ulong nl bound 8
+      tk_clr
+      tk_txt t_qr_linp
+      tk_2d i
+      qr_load_dig 2 add 6 i TYQR_SCRATCH_SLOT
+      tv_clr
+      tv_dig TYQR_SCRATCH_SLOT
+      ca_add_kv_raw
+    end
+  end
+  ret ca_finish TY_KIND_EVIDENCE t_qr_dom_freeze dslot
+end
+
+note ---- qgain encode / digest / verify ----
+fn qr_chk_leak to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_0
+    ret true
+  end
+  if qr_str_eq t_qr_1
+    ret true
+  end
+  ret qr_str_eq t_qr_inc
+end
+
+fn qr_chk_class to bool
+  if not qr_text_ok TYQR_VAL
+    ret false
+  end
+  if qr_str_eq t_qr_pos
+    ret true
+  end
+  if qr_str_eq t_qr_neg
+    ret true
+  end
+  if qr_str_eq t_qr_amb
+    ret true
+  end
+  if qr_str_eq t_qr_weak
+    ret true
+  end
+  ret qr_str_eq t_qr_stop
+end
+
+fn qr_chk_status to long
+  note returns 0=bad, 1=ok non-stopped, 2=STOPPED
+  if not qr_text_ok TYQR_VAL
+    ret 0
+  end
+  if not qr_name_ok TYQR_VAL
+    ret 0
+  end
+  if qr_str_eq t_qr_stop
+    ret 2
+  end
+  if qr_str_eq t_qr_pass
+    ret 1
+  end
+  if qr_str_prefix t_qr_failp
+    ret 1
+  end
+  ret 0
+end
+
+fn qr_gain_add_i64_list key view uchar * base ulong cnt ulong to void
+  tv_clr
+  for i ulong cnt bound 8
+    if gt i 0
+      tv_b uchar 32
+    end
+    tv_i64 get g_qg_i add base i
+  end
+  ca_add_k key
+end
+
+fn qr_gain_add_mid disc bool to void
+  bop = get g_qg_u 0
+  if or lt bop 1 gt bop 7
+    put g_ca_err 0 1
+  end
+  if eq get g_ca_err 0 0
+    qr_load_dig 3 3 TYQR_SCRATCH_SLOT
+    tv_clr
+    tv_u64 bop
+    tv_b uchar 32
+    tv_dig TYQR_SCRATCH_SLOT
+    ca_add_k t_qk_baseline
+  end
+  qr_add_dig 3 4 t_qk_candidate
+  cop = get g_qg_u 1
+  if eq get g_ca_err 0 0
+    cop_ok = false
+    if disc
+      cop_ok = eq cop 255
+    else
+      if ge cop 1
+        if le cop 7
+          cop_ok = true
+        end
+      end
+    end
+    if not cop_ok
+      put g_ca_err 0 1
+    end
+  end
+  ca_add_u64 t_qk_cand_op cop
+  qr_add_dig 3 5 t_qk_prd_b
+  qr_add_dig 3 6 t_qk_prd_m
+  off_v = get g_qg_u 2
+  if gt off_v 1
+    put g_ca_err 0 1
+  end
+  ca_add_u64 t_qk_official off_v
+  qr_t_text 3 3 t_qk_ladder
+  if eq get g_ca_err 0 0
+    qr_load_str 3 3
+    is_dash = qr_str_eq t_qr_dash
+    if ne eq off_v 1 is_dash
+      put g_ca_err 0 1
+    end
+  end
+end
+
+fn qr_gain_add_tail to void
+  qr_gain_add_i64_list t_qk_lengths 0 6
+  if eq get g_ca_err 0 0
+    rc = ty_sub get g_qg_i 4 get g_qg_i 5
+    if ne rc TY_OK
+      put g_ca_err 0 1
+    else
+      if ne get g_ty_ret_i 0 get g_qg_i 6
+        put g_ca_err 0 1
+      end
+    end
+    if gt get g_qg_i 7 get g_qg_i 8
+      put g_ca_err 0 1
+    end
+  end
+  ca_add_i64 t_qk_t_ub get g_qg_i 6
+  ca_add_i64 t_qk_t_lo_ub get g_qg_i 7
+  ca_add_i64 t_qk_t_hi_ub get g_qg_i 8
+  ca_add_i64 t_qk_num_bnd get g_qg_i 9
+  ca_add_i64 t_qk_mc_err get g_qg_i 10
+  if eq get g_ca_err 0 0
+    tv_clr
+    for i ulong 4
+      if gt i 0
+        tv_b uchar 32
+      end
+      tv_u64 get g_qg_u add 3 i
+    end
+    ca_add_k t_qk_counts
+  end
+  ca_add_u64 t_qk_floor_hits get g_qg_u 7
+  qr_load_str 3 7
+  st_k = qr_chk_status
+  if eq st_k 0
+    put g_ca_err 0 1
+  end
+  pf = get g_qg_u 8
+  if eq get g_ca_err 0 0
+    if ne st_k 2
+      if ne pf 0
+        put g_ca_err 0 1
+      end
+    end
+  end
+  ca_add_u64 t_qk_prot_fail pf
+  qr_load_str 3 4
+  if not qr_chk_leak
+    put g_ca_err 0 1
+  else
+    qr_add_cur_str t_qk_leak_flag
+  end
+  for i ulong 3
+    if lt get g_qg_i add 11 i -1
+      put g_ca_err 0 1
+    end
+  end
+  qr_gain_add_i64_list t_qk_coverage 11 3
+  qr_t_list 3 5 t_qk_diag_warn
+  qr_load_str 3 6
+  if not qr_chk_class
+    put g_ca_err 0 1
+  else
+    qr_add_cur_str t_qk_class
+  end
+  qr_load_str 3 7
+  qr_add_cur_str t_qk_status
+  qr_t_text 3 8 t_qk_unit
+end
+
+fn tyqr_gain_digest dslot ulong to long
+  ca_reset t_qr_rec_gain
+  qr_add_dig 3 0 t_qk_qprofile
+  qr_add_dig 3 1 t_qk_qworld
+  qr_add_dig 3 2 t_qk_qfreeze
+  qr_load_str 3 0
+  disc = false
+  if not qr_chk_mode_f
+    put g_ca_err 0 1
+  else
+    disc = qr_str_eq t_qr_disc
+    qr_add_cur_str t_qk_mode
+  end
+  qr_t_name 3 1 t_qk_cell
+  qr_t_text 3 2 t_qk_gen_ver
+  qr_gain_add_mid disc
+  qr_gain_add_tail
+  ret ca_finish TY_KIND_EVIDENCE t_qr_dom_gain dslot
+end
+
+note ---- Verify and cross-record bind ----
+fn qr_verify_common rc long want_slot ulong to long
+  if ne rc TY_OK
+    ret rc
+  end
+  if not dg_eq TYQR_VERIFY_SLOT want_slot
+    ret TY_E_DIGEST
+  end
+  ret TY_OK
+end
+
+fn tyqr_profile_verify want_slot ulong to long
+  rc = tyqr_profile_digest TYQR_VERIFY_SLOT
+  ret qr_verify_common rc want_slot
+end
+
+fn tyqr_world_verify want_slot ulong to long
+  rc = tyqr_world_digest TYQR_VERIFY_SLOT
+  ret qr_verify_common rc want_slot
+end
+
+fn tyqr_freeze_verify want_slot ulong to long
+  rc = tyqr_freeze_digest TYQR_VERIFY_SLOT
+  ret qr_verify_common rc want_slot
+end
+
+fn tyqr_gain_verify want_slot ulong to long
+  rc = tyqr_gain_digest TYQR_VERIFY_SLOT
+  ret qr_verify_common rc want_slot
+end
+
+fn qr_dig_eq_slot kind ulong idx ulong slot ulong to bool
+  qr_load_dig kind idx TYQR_SCRATCH_SLOT
+  ret dg_eq TYQR_SCRATCH_SLOT slot
+end
+
+fn qr_dig_eq_dig k1 ulong i1 ulong k2 ulong i2 ulong to bool
+  qr_load_dig k1 i1 TYQR_SCRATCH_SLOT
+  qr_load_dig k2 i2 TYQR_VERIFY_SLOT
+  ret dg_eq TYQR_SCRATCH_SLOT TYQR_VERIFY_SLOT
+end
+
+fn tyqr_gain_bind gd ulong wd ulong fd ulong pd ulong to long
+  rc = tyqr_gain_verify gd
+  if ne rc TY_OK
+    ret rc
+  end
+  rc = tyqr_world_verify wd
+  if ne rc TY_OK
+    ret rc
+  end
+  rc = tyqr_freeze_verify fd
+  if ne rc TY_OK
+    ret rc
+  end
+  if not qr_dig_eq_slot 3 0 pd
+    ret TY_E_PROFILE
+  end
+  if not qr_dig_eq_slot 1 0 pd
+    ret TY_E_PROFILE
+  end
+  if not qr_dig_eq_slot 2 2 pd
+    ret TY_E_PROFILE
+  end
+  if not qr_dig_eq_slot 3 1 wd
+    ret TY_E_PROFILE
+  end
+  if not qr_dig_eq_slot 3 2 fd
+    ret TY_E_PROFILE
+  end
+  if not qr_dig_eq_slot 1 1 fd
+    ret TY_E_PROFILE
+  end
+  qr_load_str 3 0
+  qr_load_str2 1 0
+  if not qr_str_eq_str2
+    ret TY_E_PROFILE
+  end
+  qr_load_str2 2 0
+  if not qr_str_eq_str2
+    ret TY_E_PROFILE
+  end
+  qr_load_str 3 1
+  qr_load_str2 1 2
+  if not qr_str_eq_str2
+    ret TY_E_PROFILE
+  end
+  qr_load_str 3 2
+  qr_load_str2 1 4
+  if not qr_str_eq_str2
+    ret TY_E_PROFILE
+  end
+  if not qr_dig_eq_dig 3 4 2 0
+    ret TY_E_PROFILE
+  end
+  ret TY_OK
+end
+
+note ---- Write-once file writer and file verifier ----
+fn qr_wp_clr to void
+  put g_qr_wplen 0 0
+end
+
+fn qr_wp_b c uchar to void
+  n = get g_qr_wplen 0
+  if lt n 1024
+    put g_qr_wpath n c
+    put g_qr_wplen 0 add n 1
+  end
+end
+
+fn qr_wp_slice s view uchar * n ulong to void
+  for i ulong n bound 1024
+    qr_wp_b get s i
+  end
+end
+
+note Build <dir>/<record>.<digest hex>.omg0 into g_qr_wpath; false if the
+note path would be 1024 bytes or longer (C: snprintf into p[1024] refused).
+fn qr_build_wpath dir view uchar * dlen ulong rec view uchar * dslot ulong to bool
+  if gt add dlen add len rec 71 1023
+    ret false
+  end
+  qr_wp_clr
+  qr_wp_slice dir dlen
+  qr_wp_b uchar 47
+  qr_wp_slice rec len rec
+  qr_wp_b uchar 46
+  o = mul dslot 32
+  for i ulong 32
+    b = ulong get g_dig add o i
+    qr_wp_b get t_hx shr b 4
+    qr_wp_b get t_hx and b 15
+  end
+  qr_wp_slice t_qr_ext len t_qr_ext
+  ret true
+end
+
+note Write g_cbuf[0..g_clen) to the new file g_qr_wpath (O_CREAT|O_EXCL, 0444).
+fn qr_write_wpath to long
+  pl = get g_qr_wplen 0
+  note O_WRONLY(1) | O_CREAT(64) | O_EXCL(128) | O_CLOEXEC(524288) = 524481, mode 0444 = 292
+  fd = fopen g_qr_wpath 0 pl int 524481 int 292
+  if eq fd -17
+    ret TYQR_E_EXISTS
+  end
+  if lt fd 0
+    ret TY_E_IO
+  end
+  tot = get g_clen 0
+  pos = ulong 0
+  while lt pos tot bound 40000
+    w = write int fd g_cbuf pos sub tot pos
+    if eq w -4
+      continue
+    end
+    if le w 0
+      z1 = fclose int fd
+      z2 = unlink g_qr_wpath 0 pl
+      ret TY_E_IO
+    end
+    pos = add pos ulong w
+  end
+  if ne fclose int fd 0
+    z3 = unlink g_qr_wpath 0 pl
+    ret TY_E_IO
+  end
+  ret TY_OK
+end
+
+fn qr_write_once dir view uchar * dlen ulong rec view uchar * dslot ulong to long
+  if not qr_build_wpath dir dlen rec dslot
+    ret TY_E_ARG
+  end
+  ret qr_write_wpath
+end
+
+fn tyqr_profile_write dir view uchar * dlen ulong dslot ulong to long
+  rc = tyqr_profile_digest dslot
+  if ne rc TY_OK
+    ret rc
+  end
+  ret qr_write_once dir dlen t_qr_rec_prof dslot
+end
+
+fn tyqr_world_write dir view uchar * dlen ulong dslot ulong to long
+  rc = tyqr_world_digest dslot
+  if ne rc TY_OK
+    ret rc
+  end
+  ret qr_write_once dir dlen t_qr_rec_world dslot
+end
+
+fn tyqr_freeze_write dir view uchar * dlen ulong dslot ulong to long
+  rc = tyqr_freeze_digest dslot
+  if ne rc TY_OK
+    ret rc
+  end
+  ret qr_write_once dir dlen t_qr_rec_freeze dslot
+end
+
+fn tyqr_gain_write dir view uchar * dlen ulong dslot ulong to long
+  rc = tyqr_gain_digest dslot
+  if ne rc TY_OK
+    ret rc
+  end
+  ret qr_write_once dir dlen t_qr_rec_gain dslot
+end
+
+fn tyqr_file_verify_gp dom view uchar * want_slot ulong to long
+  fd = fopen g_path 0 get g_plen 0 int 0 int 0
+  if lt fd 0
+    ret TY_E_IO
+  end
+  tot = ulong 0
+  while lt tot 40001 bound 40002
+    k = read int fd g_qr_fbuf tot sub 40001 tot
+    if eq k -4
+      continue
+    end
+    if lt k 0
+      z = fclose int fd
+      ret TY_E_IO
+    end
+    if eq k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  z = fclose int fd
+  if gt tot TYQR_CANON_CAP
+    ret TY_E_FORMAT
+  end
+  sh_init
+  sh_slice dom len dom
+  sh_byte uchar 0
+  for i ulong tot bound 40000
+    sh_byte get g_qr_fbuf i
+  end
+  sh_final TYQR_VERIFY_SLOT
+  if not dg_eq TYQR_VERIFY_SLOT want_slot
+    ret TY_E_DIGEST
+  end
+  ret TY_OK
+end
+
+fn tyqr_file_verify path view uchar * plen ulong dom view uchar * want_slot ulong to long
+  gp_set path plen
+  ret tyqr_file_verify_gp dom want_slot
+end
+
+note ---- Sidecar manifests ----
+fn tyqr_sidecar_digest n ulong dslot ulong to void
+  sh_init
+  for i ulong n bound 8192
+    sh_byte get g_qr_mbuf i
+  end
+  sh_final dslot
+end
+
+fn qr_mb_u64 v ulong to bool
+  if eq v 0
+    n = get g_qr_mlen 0
+    if ge n 8192
+      ret false
+    end
+    put g_qr_mbuf n uchar 48
+    put g_qr_mlen 0 add n 1
+    ret true
+  end
+  dig = new uchar 24 0
+  k = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put dig k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  n = get g_qr_mlen 0
+  if gt add n k 8192
+    ret false
+  end
+  while gt k 0 bound 24
+    k = sub k 1
+    put g_qr_mbuf n get dig k
+    n = add n 1
+  end
+  put g_qr_mlen 0 n
+  ret true
+end
+
+fn qr_mb_b c uchar cap ulong to bool
+  n = get g_qr_mlen 0
+  if ge n cap
+    ret false
+  end
+  put g_qr_mbuf n c
+  put g_qr_mlen 0 add n 1
+  ret true
+end
+
+fn qr_parse_dec off ulong n ulong to bool
+  if or lt n 1 gt n 20
+    ret false
+  end
+  if gt n 1
+    if eq get g_qr_mbuf off 48
+      ret false
+    end
+  end
+  v = ulong 0
+  umax = ulong 0xffffffffffffffff
+  for i ulong n bound 20
+    c = get g_qr_mbuf add off i
+    if or lt c 48 gt c 57
+      ret false
+    end
+    dg = ulong sub c 48
+    if gt v div sub umax dg 10
+      ret false
+    end
+    v = add mul v 10 dg
+  end
+  put g_ty_ret_u 0 v
+  ret true
+end
+
+fn qr_parse_hex64 off ulong n ulong dst_kind ulong idx ulong to bool
+  if ne n 64
+    ret false
+  end
+  doff = mul idx 32
+  for i ulong 32
+    v = ulong 0
+    for j ulong 2
+      c = get g_qr_mbuf add off add mul i 2 j
+      d = long -1
+      if and ge c 48 le c 57
+        d = long sub c 48
+      else
+        if and ge c 97 le c 102
+          d = add long sub c 97 10
+        end
+      end
+      if lt d 0
+        ret false
+      end
+      v = add mul v 16 ulong d
+    end
+    if eq dst_kind 0
+      put g_qr_rep_d add doff i uchar v
+    else
+      put g_qr_dev_d add doff i uchar v
+    end
+  end
+  ret true
+end
+
+note Split g_qr_mbuf[lo..lo+ln) into single-space fields -> g_qr_fo, g_qr_fl; returns count or -1
+fn qr_split_line lo ulong ln ulong maxf ulong to long
+  c = ulong 0
+  i = ulong 0
+  while true bound 8192
+    s = i
+    while lt i ln bound 8192
+      b = get g_qr_mbuf add lo i
+      if eq b 32
+        break
+      end
+      if or lt b 33 gt b 126
+        ret -1
+      end
+      i = add i 1
+    end
+    if eq i s
+      ret -1
+    end
+    if lt c maxf
+      put g_qr_fo c add lo s
+      put g_qr_fl c sub i s
+    end
+    c = add c 1
+    if eq i ln
+      ret long c
+    end
+    i = add i 1
+    if eq i ln
+      ret -1
+    end
+  end
+  ret -1
+end
+
+note Next line in g_qr_mbuf[pos..tot); returns 0=eof, -1=no LF, 1=ok (lo in g_ty_ret_u[1], ln in [2], next pos in [3])
+fn qr_next_line pos ulong tot ulong to long
+  if ge pos tot
+    ret 0
+  end
+  i = pos
+  while lt i tot bound 8192
+    if eq get g_qr_mbuf i 10
+      put g_ty_ret_u 1 pos
+      put g_ty_ret_u 2 sub i pos
+      put g_ty_ret_u 3 add i 1
+      ret 1
+    end
+    i = add i 1
+  end
+  ret -1
+end
+
+fn tyqr_repman_build n ulong cap ulong to long
+  if or eq n 0 gt n 64
+    ret TY_E_ARG
+  end
+  if gt cap 8192
+    cap = 8192
+  end
+  put g_qr_mlen 0 0
+  for i ulong n bound 64
+    r = get g_qr_rep_u i
+    if gt i 0
+      if le r get g_qr_rep_u sub i 1
+        ret TY_E_FORMAT
+      end
+    end
+    if not qr_mb_u64 r
+      ret TY_E_FORMAT
+    end
+    if gt get g_qr_mlen 0 cap
+      ret TY_E_FORMAT
+    end
+    if not qr_mb_b uchar 32 cap
+      ret TY_E_FORMAT
+    end
+    doff = mul i 32
+    for j ulong 32
+      b = ulong get g_qr_rep_d add doff j
+      if not qr_mb_b get t_hx shr b 4 cap
+        ret TY_E_FORMAT
+      end
+      if not qr_mb_b get t_hx and b 15 cap
+        ret TY_E_FORMAT
+      end
+    end
+    if not qr_mb_b uchar 10 cap
+      ret TY_E_FORMAT
+    end
+    note C snprintf needs room for its NUL: each line must leave len < cap
+    if ge get g_qr_mlen 0 cap
+      ret TY_E_FORMAT
+    end
+  end
+  ret TY_OK
+end
+
+fn tyqr_repman_parse tot ulong cap ulong to long
+  if eq tot 0
+    ret TY_E_FORMAT
+  end
+  note entry arrays hold 64; a longer manifest is refused as over capacity
+  if gt cap 64
+    cap = 64
+  end
+  pos = ulong 0
+  c = ulong 0
+  r = long 0
+  while true bound 1024
+    r = qr_next_line pos tot
+    if ne r 1
+      break
+    end
+    lo = get g_ty_ret_u 1
+    ln = get g_ty_ret_u 2
+    pos = get g_ty_ret_u 3
+    if ge c cap
+      ret TY_E_FORMAT
+    end
+    if ne qr_split_line lo ln 2 2
+      ret TY_E_FORMAT
+    end
+    if not qr_parse_dec get g_qr_fo 0 get g_qr_fl 0
+      ret TY_E_FORMAT
+    end
+    repv = get g_ty_ret_u 0
+    if not qr_parse_hex64 get g_qr_fo 1 get g_qr_fl 1 0 c
+      ret TY_E_FORMAT
+    end
+    if gt c 0
+      if le repv get g_qr_rep_u sub c 1
+        ret TY_E_FORMAT
+      end
+    end
+    put g_qr_rep_u c repv
+    c = add c 1
+  end
+  if or lt r 0 eq c 0
+    ret TY_E_FORMAT
+  end
+  put g_qr_rep_n 0 c
+  ret TY_OK
+end
+
+fn qr_dev_cell_ok idx ulong to long
+  off = mul idx TYQR_CELL_MAX
+  n = long -1
+  for i ulong TYQR_CELL_MAX
+    if eq get g_qr_dev_c add off i 0
+      n = long i
+      break
+    end
+  end
+  if lt n 1
+    ret -1
+  end
+  nu = ulong n
+  for i ulong nu bound 128
+    b = get g_qr_dev_c add off i
+    if or lt b 33 gt b 126
+      ret -1
+    end
+  end
+  ret n
+end
+
+fn qr_devline_before a ulong b ulong to bool
+  oa = mul a TYQR_CELL_MAX
+  ob = mul b TYQR_CELL_MAX
+  for i ulong TYQR_CELL_MAX
+    ca = get g_qr_dev_c add oa i
+    cb = get g_qr_dev_c add ob i
+    if lt ca cb
+      ret true
+    end
+    if gt ca cb
+      ret false
+    end
+    if eq ca 0
+      ret lt get g_qr_dev_b a get g_qr_dev_b b
+    end
+  end
+  ret false
+end
+
+fn tyqr_devman_build n ulong cap ulong to long
+  if or eq n 0 gt n 64
+    ret TY_E_ARG
+  end
+  if gt cap 8192
+    cap = 8192
+  end
+  put g_qr_mlen 0 0
+  for i ulong n bound 64
+    cl = qr_dev_cell_ok i
+    if lt cl 1
+      ret TY_E_FORMAT
+    end
+    if gt i 0
+      if not qr_devline_before sub i 1 i
+        ret TY_E_FORMAT
+      end
+    end
+    off = mul i TYQR_CELL_MAX
+    clu = ulong cl
+    for j ulong clu bound 128
+      if not qr_mb_b get g_qr_dev_c add off j cap
+        ret TY_E_FORMAT
+      end
+    end
+    if not qr_mb_b uchar 32 cap
+      ret TY_E_FORMAT
+    end
+    if not qr_mb_u64 get g_qr_dev_b i
+      ret TY_E_FORMAT
+    end
+    if gt get g_qr_mlen 0 cap
+      ret TY_E_FORMAT
+    end
+    if not qr_mb_b uchar 32 cap
+      ret TY_E_FORMAT
+    end
+    doff = mul i 32
+    for j ulong 32
+      bv = ulong get g_qr_dev_d add doff j
+      if not qr_mb_b get t_hx shr bv 4 cap
+        ret TY_E_FORMAT
+      end
+      if not qr_mb_b get t_hx and bv 15 cap
+        ret TY_E_FORMAT
+      end
+    end
+    if not qr_mb_b uchar 10 cap
+      ret TY_E_FORMAT
+    end
+    note C snprintf needs room for its NUL: each line must leave len < cap
+    if ge get g_qr_mlen 0 cap
+      ret TY_E_FORMAT
+    end
+  end
+  ret TY_OK
+end
+
+note One devman line g_qr_mbuf[lo..lo+ln) into entry c; false on any format fault.
+fn qr_dev_parse_line c ulong lo ulong ln ulong to bool
+  if ne qr_split_line lo ln 3 3
+    ret false
+  end
+  cl = get g_qr_fl 0
+  if ge cl TYQR_CELL_MAX
+    ret false
+  end
+  co = mul c TYQR_CELL_MAX
+  fo0 = get g_qr_fo 0
+  for j ulong cl bound 128
+    put g_qr_dev_c add co j get g_qr_mbuf add fo0 j
+  end
+  put g_qr_dev_c add co cl uchar 0
+  if not qr_parse_dec get g_qr_fo 1 get g_qr_fl 1
+    ret false
+  end
+  put g_qr_dev_b c get g_ty_ret_u 0
+  if not qr_parse_hex64 get g_qr_fo 2 get g_qr_fl 2 1 c
+    ret false
+  end
+  if gt c 0
+    if not qr_devline_before sub c 1 c
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tyqr_devman_parse tot ulong cap ulong to long
+  if eq tot 0
+    ret TY_E_FORMAT
+  end
+  note entry arrays hold 64; a longer manifest is refused as over capacity
+  if gt cap 64
+    cap = 64
+  end
+  pos = ulong 0
+  c = ulong 0
+  r = long 0
+  while true bound 1024
+    r = qr_next_line pos tot
+    if ne r 1
+      break
+    end
+    lo = get g_ty_ret_u 1
+    ln = get g_ty_ret_u 2
+    pos = get g_ty_ret_u 3
+    if ge c cap
+      ret TY_E_FORMAT
+    end
+    if not qr_dev_parse_line c lo ln
+      ret TY_E_FORMAT
+    end
+    c = add c 1
+  end
+  if or lt r 0 eq c 0
+    ret TY_E_FORMAT
+  end
+  put g_qr_dev_n 0 c
+  ret TY_OK
+end
+
+fn qr_kv_ok nf ulong to bool
+  i = ulong 1
+  while lt i nf bound 64
+    fo = get g_qr_fo i
+    fl = get g_qr_fl i
+    eqp = long -1
+    for j ulong fl bound 512
+      if eq get g_qr_mbuf add fo j 61
+        eqp = long j
+        break
+      end
+    end
+    if le eqp 0
+      ret false
+    end
+    if eq ulong eqp sub fl 1
+      ret false
+    end
+    i = add i 1
+  end
+  ret true
+end
+
+fn qr_slice_lt a ulong al ulong b ulong bl ulong to bool
+  m = al
+  if lt bl m
+    m = bl
+  end
+  for i ulong m bound 8192
+    ca = get g_qr_mbuf add a i
+    cb = get g_qr_mbuf add b i
+    if lt ca cb
+      ret true
+    end
+    if gt ca cb
+      ret false
+    end
+  end
+  ret lt al bl
+end
+
+note Field checks for one table line: count within minf..64 (and maxf when
+note nonzero); with kv every field after the first is key=value, '=' neither
+note first nor last.
+fn qr_tab_fields lo ulong ln ulong minf ulong maxf ulong kv ulong to bool
+  nfl = qr_split_line lo ln 64
+  if lt nfl 0
+    ret false
+  end
+  nf = ulong nfl
+  if lt nf minf
+    ret false
+  end
+  if gt nf 64
+    ret false
+  end
+  if ne maxf 0
+    if gt nf maxf
+      ret false
+    end
+  end
+  if ne kv 0
+    if not qr_kv_ok nf
+      ret false
+    end
+  end
+  ret true
+end
+
+note Strict ascending order of this line's key against the previous line's
+note (first field when by_cell, else the whole line).
+fn qr_tab_order prev_o ulong prev_l ulong lo ulong ln ulong by_cell ulong to bool
+  al = prev_l
+  bl = ln
+  if ne by_cell 0
+    sp = ulong 0
+    while lt sp prev_l bound 8192
+      if eq get g_qr_mbuf add prev_o sp 32
+        break
+      end
+      sp = add sp 1
+    end
+    al = sp
+    bl = get g_qr_fl 0
+  end
+  ret qr_slice_lt prev_o al lo bl
+end
+
+fn qr_table_check tot ulong minf ulong maxf ulong by_cell ulong kv ulong to long
+  if eq tot 0
+    ret TY_E_FORMAT
+  end
+  pos = ulong 0
+  has_prev = false
+  prev_o = ulong 0
+  prev_l = ulong 0
+  r = long 0
+  while true bound 1024
+    r = qr_next_line pos tot
+    if ne r 1
+      break
+    end
+    lo = get g_ty_ret_u 1
+    ln = get g_ty_ret_u 2
+    pos = get g_ty_ret_u 3
+    if not qr_tab_fields lo ln minf maxf kv
+      ret TY_E_FORMAT
+    end
+    if has_prev
+      if not qr_tab_order prev_o prev_l lo ln by_cell
+        ret TY_E_FORMAT
+      end
+    end
+    has_prev = true
+    prev_o = lo
+    prev_l = ln
+  end
+  if lt r 0
+    ret TY_E_FORMAT
+  end
+  if not has_prev
+    ret TY_E_FORMAT
+  end
+  ret TY_OK
+end
+
+fn tyqr_celltab_check tot ulong to long
+  ret qr_table_check tot 2 0 1 1
+end
+
+fn tyqr_thrtab_check tot ulong to long
+  ret qr_table_check tot 3 3 0 0
+end

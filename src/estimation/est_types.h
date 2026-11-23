@@ -36,7 +36,7 @@
  *
  * Records are distinct C types with distinct kind bytes and distinct digest
  * domains. Digest = SHA-256(domain || 0x00 || encoding) using src/sha256.c,
- * the same domain-separation rule as src/turing/ty_qrecord.h. Encoding is a
+ * the same domain-separation rule as src/turing/ty_qrecord.om. Encoding is a
  * fixed little-endian layout (est_encode_*), doubles as IEEE-754 binary64 bit
  * patterns; the layout is specified in est_types.c above each encoder.
  *

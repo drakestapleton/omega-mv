@@ -1,7 +1,8 @@
 # TURING companion records for continuous-value evidence (v0)
 
 Four record domains and the sidecar manifest formats they bind. Code:
-`src/turing/ty_qrecord.{h,c}`. Tests: `make test-turing-qrecord`. These are
+`src/turing/ty_qrecord.om` (pure seeded OM-2, composed after
+`src/turing/ty_core_lib.om`). Tests: `make test-turing-qrecord`. These are
 companion records beside the qint.v1 scorer (`ty_qcont`) and the PRD1 reader;
 no existing `turing.*` record, domain or golden changes.
 

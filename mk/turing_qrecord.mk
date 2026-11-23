@@ -1,32 +1,24 @@
 # TURING companion records for continuous-value evidence (qprofile, qworld,
-# qfreeze, qgain) and their sidecar manifest formats.
-# New files only: src/turing/ty_qrecord.*, tests/turing/test_ty_qrecord.c,
+# qfreeze, qgain) and their sidecar manifest formats, in pure seeded OM-2:
+# src/turing/ty_qrecord.om (composed after src/turing/ty_core_lib.om, which
+# supplies SHA-256 and the OMG0 canonical builder), tests/turing/test_ty_qrecord.om,
 # docs/turing/TURING_QCONT_RECORDS_V0.md. Picked up by `-include mk/*.mk`; no
 # Makefile edit; redefines nothing that exists.
 #
-# test-turing-qrecord: builds the test plain and with ASan/UBSan and runs both.
+# test-turing-qrecord: builds the test with the seeded omc and runs it (pinned
+# record and sidecar KATs, refusals, bindings, write-once files and manifests).
 ifndef TURING_QRECORD_MK
 TURING_QRECORD_MK := 1
 .PHONY: test-turing-qrecord
-# -Wno-pedantic: generated binding src/omega_om_units.c uses GNU range designators; see mk/estimation.mk.
-TYQR_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -Wno-pedantic
-TYQR_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-TYQR_SRCS = src/turing/ty_qrecord.c src/turing/ty_record.c src/turing/ty_math.c src/turing/ty_ctr1.c \
-	src/turing/ty_model.c src/turing/ty_profile.c src/omega_canonical.c src/omega_om_units.c
-TYQR_HDRS = src/turing/ty_qrecord.h src/turing/ty_record.h src/turing/ty_math.h src/turing/ty_ctr1.h \
-	src/turing/ty_model.h src/omega_canonical.h src/omega_types.h src/sha256.h
+TYQR_OMC ?= seed/out/omc
+TYQR_OM_SRCS = src/turing/ty_core_lib.om src/turing/ty_qrecord.om
 TYQR_DIR = $(OUT_DIR)/tests-turing-qrecord
 
-$(TYQR_DIR)/test_ty_qrecord: tests/turing/test_ty_qrecord.c $(TYQR_SRCS) $(TYQR_HDRS)
+$(TYQR_DIR)/test_ty_qrecord: tests/turing/test_ty_qrecord.om $(TYQR_OM_SRCS) $(TYQR_OMC)
 	@mkdir -p $(TYQR_DIR)
-	$(CC) $(TYQR_CFLAGS) -o $@ tests/turing/test_ty_qrecord.c $(TYQR_SRCS) -lm
+	(printf 'om2\n'; sed '/^om2$$/d' $(TYQR_OM_SRCS) tests/turing/test_ty_qrecord.om) | $(TYQR_OMC) > $@ && chmod +x $@
 
-$(TYQR_DIR)/test_ty_qrecord_asan: tests/turing/test_ty_qrecord.c $(TYQR_SRCS) $(TYQR_HDRS)
-	@mkdir -p $(TYQR_DIR)
-	$(CC) $(TYQR_CFLAGS) $(TYQR_ASAN) -o $@ tests/turing/test_ty_qrecord.c $(TYQR_SRCS) -lm
-
-test-turing-qrecord: $(TYQR_DIR)/test_ty_qrecord $(TYQR_DIR)/test_ty_qrecord_asan
+test-turing-qrecord: $(TYQR_DIR)/test_ty_qrecord
 	./$(TYQR_DIR)/test_ty_qrecord
-	./$(TYQR_DIR)/test_ty_qrecord_asan
-	@echo "test-turing-qrecord: record builders, verifiers, refusals and manifests pass in plain and ASan/UBSan builds"
+	@echo "test-turing-qrecord: pure OM-2 record builders, verifiers, refusals and manifests pass"
 endif
