@@ -320,8 +320,8 @@ theorem antibody_sm121_valid_admitted : sm121Accept validSm121Sched := by
     match i, hi with
     | 0, _ => rfl
     | 1, _ => rfl
-  · intro u v _ _ _ _ _; decide
-  · intro u _ _; decide
+  · intro u v _ _ _ _ _; dsimp [validSm121Sched]; omega
+  · intro u _ _; dsimp [validSm121Sched]; omega
 
 #print axioms antibody_digest_spoof
 #print axioms antibody_non_bijection
