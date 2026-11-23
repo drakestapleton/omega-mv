@@ -4,9 +4,10 @@
 #
 # Each mutant is one deliberate fault in src/language/*.om (a limit off by one, a dropped check,
 # a wrong message, a lost rollback, ...). The mutant is applied to a copy of the tree, the OM
-# dumper is rebuilt, and every parity corpus must show at least one difference from the C
-# reference outputs of a passing parity run. A mutant that does not apply, does not build, or
-# shows no difference fails this script.
+# dumper is rebuilt, and the corpora of a passing parity run must show at least one difference
+# from the committed C-reference goldens (tests/language/parity_golden, generated from the C lane
+# at main commit 3f2c70dc5). A mutant that does not apply, does not build, or shows no difference
+# fails this script.
 #
 # usage: LANG_PARITY_WORK=<work dir of a passing lang_parity.sh run> tests/language/lang_mutants.sh [OMC]
 set -eu
@@ -14,7 +15,9 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OMC=${1:-$ROOT/seed/out/omc}
 case $OMC in /*) ;; *) OMC=$(pwd)/$OMC ;; esac
 W=${LANG_PARITY_WORK:?set LANG_PARITY_WORK to the work dir of a passing lang_parity.sh run}
-[ -x "$W/lang_dump_c" ] && [ -d "$W/corpus" ] || { echo "MUTANTS FAIL no parity work dir"; exit 2; }
+GOLD=$ROOT/tests/language/parity_golden
+[ -x "$W/lang_dump_om" ] && [ -d "$W/corpus" ] || { echo "MUTANTS FAIL no parity work dir"; exit 2; }
+[ -f "$GOLD/MANIFEST" ] || { echo "MUTANTS FAIL missing $GOLD/MANIFEST"; exit 2; }
 M=$W/mut
 rm -rf "$M"; mkdir -p "$M"
 
@@ -76,7 +79,7 @@ while IFS='|' read -r f expr; do
   for c in "$W"/corpus/*.txt; do
     b=$(basename "$c" .txt)
     "$T/dump" < "$c" > "$T/$b.om" 2>/dev/null || true
-    if ! cmp -s "$T/$b.om" "$W/out/$b.c"; then hit="$hit $b"; fi
+    if ! cmp -s "$T/$b.om" "$GOLD/$b.out"; then hit="$hit $b"; fi
   done
   if [ -n "$hit" ]; then
     killed=$((killed + 1)); echo "MUTANT $n $f KILLED by$hit"
