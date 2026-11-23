@@ -1,0 +1,846 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/physics0/score/pd0_score.om: PD-0 scorer and greedy sparse least-squares reference solver (spec section 6).
+note Holds generator-side truth (the true terms in sp_*); never part of a learner. Pure OM-2, no file I/O.
+note Interface: parameters in sp_*, scoring episodes in se_*, fit transitions in sf_*, result in sr_*.
+note pd0_score rslot stored mode: mode 0 scores relation slot rslot (C pd0_rel_rollout_fn / pd0_rel_predict_fn),
+note mode 1 the nearest-neighbour memoriser over sf_* (C pd0_memoriser_*, the M3 control).
+note The accumulator arithmetic is the ladder's (lad_acc_*): pd0_ladder.om is concatenated before this file.
+
+const SC_MAX_TRUE ulong 32
+const SC_MAX_EPS ulong 32
+const SC_MAX_FIT ulong 65536
+const SC_LIB_MAX ulong 128
+const SC_X_CAP ulong 1310720
+const SC_REF_SLOT ulong 70
+
+note ---- Score parameters (sp_*) ----
+global sp_n_obs uchar 1
+global sp_n_ch uchar 1
+global sp_size_bound uint 1
+global sp_inbox_bound long 1
+global sp_extrap_bound long 1
+global sp_onestep_bound long 1
+global sp_score_const int 1
+global sp_const_tol long 1
+global sp_req_lat int 1
+global sp_lat_ref_fac long 1
+global sp_n_terms uint 1
+global sp_t_tgt uchar 32
+global sp_t_ex uchar 512
+global sp_t_coef long 32
+
+note ---- Score episodes (se_*): init[8], steps[20] (channel, value), truth[20][8], in_box ----
+global se_n_eps uint 1
+global se_in_box uchar 32
+global se_init long 256
+global se_ch uchar 640
+global se_val long 640
+global se_gold long 5120
+
+note ---- Fit transitions (sf_*): before[8], channel, value, after[8] ----
+global sf_n_fit uint 1
+global sf_bef long 524288
+global sf_aft long 524288
+global sf_ch uchar 65536
+global sf_val long 65536
+
+note ---- Score result (sr_*) ----
+global sr_code int 1
+global sr_fail_mask uint 1
+global sr_inbox long 1
+global sr_extrap long 1
+global sr_onestep long 1
+global sr_ref long 1
+global sr_size uint 1
+global sr_bits uint 1
+
+note ---- Reference solver working storage (sc_*) ----
+global sc_lib uchar 2048
+global sc_X f64 1310720
+global sc_y f64 65536
+
+fn sc_set_fail code int to void
+put sr_fail_mask 0 or get sr_fail_mask 0 shl uint 1 uint sub code 300
+if eq get sr_code 0 0
+put sr_code 0 code
+end
+ret
+end
+
+fn sc_sp_clear to void
+put sp_n_obs 0 uchar 0
+put sp_n_ch 0 uchar 0
+put sp_size_bound 0 uint 0
+put sp_inbox_bound 0 long 0
+put sp_extrap_bound 0 long 0
+put sp_onestep_bound 0 long 0
+put sp_score_const 0 0
+put sp_const_tol 0 long 0
+put sp_req_lat 0 0
+put sp_lat_ref_fac 0 long 0
+put sp_n_terms 0 uint 0
+for i ulong 512
+put sp_t_ex i uchar 0
+end
+ret
+end
+
+note the scorer's nrmse: like the ladder's, but an empty accumulator scores 0 (C pd0_score.c acc_nrmse)
+fn sc_acc_nrmse acc view f64 24 n ulong no ulong to long
+if eq n ulong 0
+ret long 0
+end
+ret lad_acc_nrmse acc n no
+end
+
+note ---- 6.3 support and constants ----
+
+fn sc_expo_eq ti ulong tidx ulong ne_ex ulong to int
+xb = mul ti V_MAX_EX
+txb = mul tidx V_MAX_EX
+for m ulong ne_ex bound 16
+if ne get vr_ex add xb m get sp_t_ex add txb m
+ret 0
+end
+end
+ret 1
+end
+
+note 0 absent, 1 present (and constant within tolerance when checked), 2 constant off (C term_matches)
+fn sc_term_matches rslot ulong tidx ulong check_c int to int
+ne_ex = add ulong get vr_nvars rslot ulong get vr_nch rslot
+ne_cnt = ulong get vr_neq rslot
+for e ulong ne_cnt bound 12
+ei = vr_eq_idx rslot e
+if eq get vr_eq_tgt ei get sp_t_tgt tidx
+nt = ulong get vr_eq_nt ei
+for k ulong nt bound 32
+ti = vr_term_idx rslot e k
+if ne get vr_coef ti long 0
+if ne sc_expo_eq ti tidx ne_ex 0
+ret sc_coef_check get vr_coef ti tidx check_c
+end
+end
+end
+end
+end
+ret 0
+end
+
+fn sc_coef_check c long tidx ulong check_c int to int
+if eq check_c 0
+ret 1
+end
+tc = get sp_t_coef tidx
+d = lad_abs_i64 sub c tc
+lim = pd0_mul lad_abs_i64 tc get sp_const_tol 0
+if le d lim
+ret 1
+end
+ret 2
+end
+
+note ---- Reference sparse least squares solver (harness side, C pd0_reference_fit) ----
+
+fn sc_lib_has e view uchar 16 n ulong ni ulong to int
+for k ulong n bound 128
+kb = mul k V_MAX_EX
+same = int 1
+for m ulong ni bound 16
+if ne get sc_lib add kb m get e m
+same = 0
+break
+end
+end
+if eq same 1
+ret 1
+end
+end
+ret 0
+end
+
+fn sc_lib_add e edit uchar 16 abc ulong ni ulong n ulong to ulong
+note abc = a * 65536 + b * 256 + c: the exponent vector of x_a x_b x_c (index ni = the constant 1)
+for k ulong 16
+put e k uchar 0
+end
+a = shr abc 16
+b = and shr abc 8 ulong 255
+c = and abc ulong 255
+if lt a ni
+put e a add get e a uchar 1
+end
+if lt b ni
+put e b add get e b uchar 1
+end
+if lt c ni
+put e c add get e c uchar 1
+end
+if ne sc_lib_has view e n ni 0
+ret n
+end
+if ge n SC_LIB_MAX
+ret n
+end
+nb = mul n V_MAX_EX
+for m ulong 16
+put sc_lib add nb m get e m
+end
+ret add n 1
+end
+
+note every exponent vector of total degree <= 3 over ni inputs, in the C order (a <= b <= c over 0..ni)
+fn sc_lib_c e edit uchar 16 ab ulong ni ulong n ulong to ulong
+note ab = a * 65536 + b * 256: every c from b to ni
+bv = and shr ab 8 ulong 255
+for c ulong sub add ni 1 bv bound 17
+n = sc_lib_add e add ab add bv c ni n
+end
+ret n
+end
+
+note every exponent vector of total degree <= 3 over ni inputs, in the C order (a <= b <= c over 0..ni)
+fn sc_build_lib ni ulong to ulong
+n = ulong 0
+e = new uchar 16 0
+for a ulong add ni 1 bound 17
+for b ulong sub add ni 1 a bound 17
+n = sc_lib_c edit e add shl a 16 shl add a b 8 ni n
+end
+end
+ret n
+end
+
+fn sc_mono x view f64 16 lidx ulong ni ulong to f64
+v = 1.0f64
+lb = mul lidx V_MAX_EX
+for i ulong ni bound 16
+ex = ulong get sc_lib add lb i
+xi = get x i
+for k ulong ex bound 8
+v = mul v xi
+end
+end
+ret v
+end
+
+fn sc_swap_rows a edit f64 256 b edit f64 16 ipn ulong to void
+note ipn = (i * 256 + p) * 256 + n
+n = and ipn ulong 255
+p = and shr ipn 8 ulong 255
+i = shr ipn 16
+for k ulong n bound 16
+t = get a add mul i n k
+put a add mul i n k get a add mul p n k
+put a add mul p n k t
+end
+tb = get b i
+put b i get b p
+put b p tb
+ret
+end
+
+fn sc_axpy_row a edit f64 256 rbib ulong in ulong f f64 to void
+note A[rb + k] -= f * A[ib + k] for k = i .. n-1; rbib = rb * 65536 + ib, in = i * 256 + n
+k = shr in 8
+while lt k and in ulong 255 bound 16
+ri = add shr rbib 16 k
+x = mul f get a add and rbib ulong 65535 k
+put a ri sub get a ri x
+k = add k 1
+end
+ret
+end
+
+fn sc_elim_row a edit f64 256 b edit f64 16 irn ulong to void
+note irn = (i * 256 + r) * 256 + n: row r -= f * row i, from column i
+n = and irn ulong 255
+r = and shr irn 8 ulong 255
+i = shr irn 16
+rb = mul r n
+ib = mul i n
+f = div get a add rb i get a add ib i
+sc_axpy_row a add shl rb 16 ib add shl i 8 n f
+put b r sub get b r mul f get b i
+ret
+end
+
+fn sc_pivot a view f64 256 i ulong n ulong to ulong
+p = i
+best = fabs get a add mul i n i
+r = add i 1
+while lt r n bound 16
+v = fabs get a add mul r n i
+if gt v best
+p = r
+best = v
+end
+r = add r 1
+end
+ret p
+end
+
+note Gaussian elimination with partial pivoting; -1 on a pivot below 1e-12 (C solve)
+fn sc_back_row a view f64 256 b edit f64 16 in ulong to void
+note in = i * 256 + n: b[i] = (b[i] - sum_{k>i} A[i][k] b[k]) / A[i][i]
+i = shr in 8
+n = and in ulong 255
+ib = mul i n
+s = get b i
+k = add i 1
+while lt k n bound 16
+s = sub s mul get a add ib k get b k
+k = add k 1
+end
+put b i div s get a add ib i
+ret
+end
+
+note Gaussian elimination with partial pivoting; -1 on a pivot below 1e-12 (C solve)
+fn sc_solve a edit f64 256 b edit f64 16 n ulong to int
+for i ulong n bound 16
+p = sc_pivot a i n
+if lt fabs get a add mul p n i 0.000000000001f64
+ret -1
+end
+if ne p i
+sc_swap_rows a b add shl add shl i 8 p 8 n
+end
+for rr ulong sub n add i 1 bound 16
+sc_elim_row a b add shl add shl i 8 add add i 1 rr 8 n
+end
+end
+for ri ulong n bound 16
+sc_back_row a b add shl sub sub n 1 ri 8 n
+end
+ret 0
+end
+
+fn sc_normal_q a edit f64 256 pmm ulong xr view f64 16 xp f64 to void
+note pmm = p * m * 256 + m: A[p*m + q] += xp * xr[q]
+pm = shr pmm 8
+q = ulong 0
+while lt q and pmm ulong 255 bound 16
+ai = add pm q
+put a ai add get a ai mul xp get xr q
+q = add q 1
+end
+ret
+end
+
+fn sc_normal_add a edit f64 256 b edit f64 16 xr view f64 16 m ulong yi f64 to void
+for p ulong m bound 16
+xp = get xr p
+put b p add get b p mul xp yi
+sc_normal_q a add shl mul p m 8 m xr xp
+end
+ret
+end
+
+fn sc_normal_row a edit f64 256 b edit f64 16 cand view ulong 16 im ulong nl ulong to void
+note im = i * 256 + m: add fit row i to the normal equations of the m candidate columns
+i = shr im 8
+m = and im ulong 255
+row = mul i nl
+xr = new f64 16 0.0f64
+for p ulong m bound 16
+put xr p get sc_X add row get cand p
+end
+sc_normal_add a b view xr m get sc_y i
+ret
+end
+
+fn sc_pred_row b view f64 16 cand view ulong 16 m ulong row ulong to f64
+pr = 0.0f64
+for p ulong m bound 16
+ci = add row get cand p
+pr = add pr mul get b p get sc_X ci
+end
+ret pr
+end
+
+fn sc_rss b view f64 16 cand view ulong 16 m ulong nfit ulong nl ulong to f64
+rss = 0.0f64
+for i ulong nfit bound 65536
+d = sub sc_pred_row b cand m mul i nl get sc_y i
+rss = add rss mul d d
+end
+ret rss
+end
+
+note least squares on candidate columns; coef gets the solution; returns rss, or -1 when the solve fails
+fn sc_fit_subset nfit ulong nl ulong cand view ulong 16 m ulong coef edit f64 16 to f64
+a = new f64 256 0.0f64
+b = new f64 16 0.0f64
+for i ulong nfit bound 65536
+sc_normal_row edit a edit b cand add shl i 8 m nl
+end
+for p ulong m bound 16
+idx = add mul p m p
+put a idx add get a idx 0.000000001f64
+end
+if ne sc_solve edit a edit b m 0
+ret -1.0f64
+end
+for p ulong m bound 16
+put coef p get b p
+end
+ret sc_rss view b cand m nfit nl
+end
+
+fn sc_in_sel sel view ulong 16 ns ulong k ulong to int
+for s ulong ns bound 16
+if eq get sel s k
+ret 1
+end
+end
+ret 0
+end
+
+note one greedy round: the unused library column whose addition gives the least rss; nl when none solves
+fn sc_best_col sel view ulong 16 ns ulong nfit ulong nl ulong bestc edit f64 16 to ulong
+cand = new ulong 16 0
+tmpc = new f64 16 0.0f64
+best_rss = bitcast f64 ulong 0x7ff0000000000000
+best = nl
+for s ulong ns bound 16
+put cand s get sel s
+end
+for k ulong nl bound 128
+if eq sc_in_sel sel ns k 0
+put cand ns k
+rss = sc_fit_subset nfit nl view cand add ns 1 edit tmpc
+if ge rss 0.0f64
+if lt rss best_rss
+best_rss = rss
+best = k
+for s ulong 16
+put bestc s get tmpc s
+end
+end
+end
+end
+end
+ret best
+end
+
+note C llround: nearest, halfway away from zero (exact for |x| < 2^52)
+fn sc_llround x f64 to long
+t = long x
+f = sub x f64 t
+if ge f 0.5f64
+ret add t long 1
+end
+if le f -0.5f64
+ret sub t long 1
+end
+ret t
+end
+
+fn sc_store_expo ti ulong li ulong ni ulong to void
+xb = mul ti V_MAX_EX
+lb = mul li V_MAX_EX
+for m ulong V_MAX_EX
+put vr_ex add xb m uchar 0
+end
+for m ulong ni bound 16
+put vr_ex add xb m get sc_lib add lb m
+end
+ret
+end
+
+fn sc_store_eq out_slot ulong t ulong sel view ulong 16 coef view f64 16 tn ulong to void
+note tn = ns * 256 + ni
+ns = shr tn 8
+ei = vr_eq_idx out_slot t
+put vr_eq_tgt ei uchar t
+put vr_eq_nt ei ushort ns
+for s ulong ns bound 16
+ti = vr_term_idx out_slot t s
+put vr_coef ti sc_llround mul get coef s 1000000.0f64
+sc_store_expo ti get sel s and tn ulong 255
+end
+ret
+end
+
+fn sc_fill_y t ulong nfit ulong to void
+for i ulong nfit bound 65536
+ix = add mul i V_MAX_OBS t
+av = get sf_aft ix
+d = sub av get sf_bef ix
+put sc_y i div f64 d 1000000.0f64
+end
+ret
+end
+
+fn sc_ref_fit_target t ulong nfit ulong nl ulong mt ulong out_slot ulong ni ulong to void
+sc_fill_y t nfit
+sel = new ulong 16 0
+coef = new f64 16 0.0f64
+bestc = new f64 16 0.0f64
+ns = ulong 0
+for rnd ulong mt bound 16
+best = sc_best_col view sel ns nfit nl edit bestc
+if eq best nl
+break
+end
+put sel ns best
+ns = add ns 1
+for s ulong 16
+put coef s get bestc s
+end
+end
+sc_store_eq out_slot t view sel view coef add shl ns 8 ni
+ret
+end
+
+fn sc_design_row i ulong noc ulong nl ulong to void
+note noc = n_obs * 256 + n_channels; row i of the design matrix (inputs in units)
+no = shr noc 8
+nc = and noc ulong 255
+xv = new f64 16 0.0f64
+ib = mul i V_MAX_OBS
+for j ulong no bound 8
+put xv j div f64 get sf_bef add ib j 1000000.0f64
+end
+ch = ulong get sf_ch i
+for c ulong nc bound 4
+if eq ch c
+put xv add no c div f64 get sf_val i 1000000.0f64
+end
+end
+row = mul i nl
+for k ulong nl bound 128
+put sc_X add row k sc_mono view xv k add no nc
+end
+ret
+end
+
+note greedy sparse least squares over the degree <= 3 monomial library, latent-free; 0 ok, -1 refused
+fn sc_reference_fit no uchar nc uchar max_terms uint nfit uint out_slot ulong to int
+ni = add ulong no ulong nc
+nl = sc_build_lib ni
+if or lt nfit uint 8 or gt ulong nfit SC_MAX_FIT eq max_terms uint 0
+ret -1
+end
+if gt mul ulong nfit nl SC_X_CAP
+ret -1
+end
+mt = ulong max_terms
+if gt mt ulong 16
+mt = ulong 16
+end
+noc = add shl ulong no 8 ulong nc
+for i ulong ulong nfit bound 65536
+sc_design_row i noc nl
+end
+vr_clear out_slot
+put vr_nvars out_slot no
+put vr_nlat out_slot uchar 0
+put vr_nch out_slot nc
+put vr_neq out_slot no
+for t ulong ulong no bound 8
+sc_ref_fit_target t ulong nfit nl mt out_slot ni
+end
+put vr_dbits out_slot vr_rel_bits out_slot
+ret 0
+end
+
+note ---- Memoriser predictor over sf_* (M3 control, C pd0_memoriser_predict) ----
+
+fn sc_mem_dist st view long 12 ch uchar val long i ulong to f64
+no = ulong get sp_n_obs 0
+ib = mul i V_MAX_OBS
+d = 0.0f64
+for j ulong no bound 8
+x = f64 sub get st j get sf_bef add ib j
+d = add d mul x x
+end
+fv = long 0
+if eq get sf_ch i ch
+fv = get sf_val i
+end
+dv = f64 sub val fv
+d = add d mul dv dv
+if ne get sf_ch i ch
+d = add d 1000000000000.0f64
+end
+ret d
+end
+
+fn sc_mem_apply st view long 12 bi ulong dst edit long 12 to void
+no = ulong get sp_n_obs 0
+bb = mul bi V_MAX_OBS
+for j ulong no bound 8
+av = get sf_aft add bb j
+dd = sub av get sf_bef add bb j
+put dst j add get st j dd
+end
+ret
+end
+
+fn sc_mem_predict st view long 12 ch uchar val long dst edit long 12 to void
+best = 1.0e300f64
+bi = ulong 0
+nfit = ulong get sf_n_fit 0
+for i ulong nfit bound 65536
+d = sc_mem_dist st ch val i
+if lt d best
+best = d
+bi = i
+end
+end
+sc_mem_apply st bi dst
+ret
+end
+
+note ---- Main scorer ----
+
+fn sc_ep_load epi ulong init edit long 8 chs edit uchar 20 vals edit long 20 to void
+ib = mul epi V_MAX_OBS
+for j ulong 8
+put init j get se_init add ib j
+end
+sb = mul epi V_MAX_STEPS
+for s ulong V_MAX_STEPS
+put chs s get se_ch add sb s
+put vals s get se_val add sb s
+end
+ret
+end
+
+note truth rows of episode epi as [20][n_obs] (the stride the rollouts use)
+fn sc_ep_gold epi ulong g edit long 160 to void
+no = ulong get sp_n_obs 0
+for s ulong V_MAX_STEPS
+gb = mul add mul epi V_MAX_STEPS s V_MAX_OBS
+for j ulong no bound 8
+put g add mul s no j get se_gold add gb j
+end
+end
+ret
+end
+
+fn sc_mem_rollout init view long 8 chs view uchar 20 vals view long 20 dst edit long 160 to void
+no = ulong get sp_n_obs 0
+st = new long 12 0
+nx = new long 12 0
+for j ulong no bound 8
+put st j get init j
+end
+for s ulong V_MAX_STEPS
+sc_mem_predict view st get chs s get vals s edit nx
+for j ulong no bound 8
+put dst add mul s no j get nx j
+put st j get nx j
+end
+end
+ret
+end
+
+fn sc_rollout rslot ulong mode int epi ulong pr edit long 160 to void
+init = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+sc_ep_load epi edit init edit chs edit vals
+if eq mode 0
+vr_rel_rollout rslot view init view chs view vals V_MAX_STEPS pr
+else
+sc_mem_rollout view init view chs view vals pr
+end
+ret
+end
+
+note one-step predictions from the true state (C: st = truth[s] after each step); acc gets 20 rows
+fn sc_onestep_ep rslot ulong mode int epi ulong acc edit f64 24 to void
+no = ulong get sp_n_obs 0
+st = new long 12 0
+nx = new long 12 0
+g = new long 160 0
+sc_ep_gold epi edit g
+ib = mul epi V_MAX_OBS
+for j ulong no bound 8
+put st j get se_init add ib j
+end
+for s ulong V_MAX_STEPS
+sb = add mul epi V_MAX_STEPS s
+if eq mode 0
+vr_rel_step rslot view st get se_ch sb get se_val sb edit nx
+else
+sc_mem_predict view st get se_ch sb get se_val sb edit nx
+end
+sc_acc_step acc view nx view g add shl s 8 no
+for j ulong no bound 8
+put st j get g add mul s no j
+end
+end
+ret
+end
+
+fn sc_acc_step acc edit f64 24 nx view long 12 g view long 160 sno ulong to void
+note sno = s * 256 + n_obs: accumulate prediction nx against truth row s
+s = shr sno 8
+no = and sno ulong 255
+for j ulong no bound 8
+t = get g add mul s no j
+e = div f64 sub get nx j t 1000000.0f64
+v = div f64 t 1000000.0f64
+put acc j add get acc j mul e e
+put acc add j 8 add get acc add j 8 v
+put acc add j 16 add get acc add j 16 mul v v
+end
+ret
+end
+
+fn sc_score_ep rslot ulong mode int epi ulong ain edit f64 24 aex edit f64 24 a1 edit f64 24 to ulong
+note returns 1 when the episode is in the box (its 20 rows went to ain), else 0 (to aex)
+no = ulong get sp_n_obs 0
+pr = new long 160 0
+g = new long 160 0
+sc_rollout rslot mode epi edit pr
+sc_ep_gold epi edit g
+inb = ulong get se_in_box epi
+if ne inb ulong 0
+lad_acc_rows ain view pr view g V_MAX_STEPS no
+else
+lad_acc_rows aex view pr view g V_MAX_STEPS no
+end
+if ne get sp_onestep_bound 0 long 0
+sc_onestep_ep rslot mode epi a1
+end
+if ne inb ulong 0
+ret ulong 1
+end
+ret ulong 0
+end
+
+fn sc_score_rollouts rslot ulong mode int to void
+no = ulong get sp_n_obs 0
+ain = new f64 24 0.0f64
+aex = new f64 24 0.0f64
+a1 = new f64 24 0.0f64
+nin = ulong 0
+n_eps = ulong get se_n_eps 0
+for i ulong n_eps bound 32
+nin = add nin sc_score_ep rslot mode i edit ain edit aex edit a1
+end
+nex = mul sub n_eps nin V_MAX_STEPS
+nin = mul nin V_MAX_STEPS
+n1 = ulong 0
+if ne get sp_onestep_bound 0 long 0
+n1 = mul n_eps V_MAX_STEPS
+end
+put sr_inbox 0 sc_acc_nrmse view ain nin no
+put sr_extrap 0 sc_acc_nrmse view aex nex no
+put sr_onestep 0 sc_acc_nrmse view a1 n1 no
+if gt get sr_inbox 0 get sp_inbox_bound 0
+sc_set_fail PD0V_SCORE_INBOX_NRMSE
+end
+if gt nex ulong 0
+if gt get sr_extrap 0 get sp_extrap_bound 0
+sc_set_fail PD0V_SCORE_EXTRAP_NRMSE
+end
+end
+if gt n1 ulong 0
+if gt get sr_onestep 0 get sp_onestep_bound 0
+sc_set_fail PD0V_SCORE_ONESTEP_NRMSE
+end
+end
+ret
+end
+
+note L6: the harness-fitted latent-free reference must fail the in-box bound by latent_ref_factor
+fn sc_eval_ref_l6 to void
+no = ulong get sp_n_obs 0
+mt = div get sp_size_bound 0 uint no
+if eq mt uint 0
+mt = uint 1
+end
+if ne sc_reference_fit uchar no get sp_n_ch 0 mt get sf_n_fit 0 SC_REF_SLOT 0
+ret
+end
+ar = new f64 24 0.0f64
+pr = new long 160 0
+g = new long 160 0
+nr = ulong 0
+n_eps = ulong get se_n_eps 0
+for i ulong n_eps bound 32
+if ne get se_in_box i uchar 0
+sc_rollout SC_REF_SLOT 0 i edit pr
+sc_ep_gold i edit g
+lad_acc_rows edit ar view pr view g V_MAX_STEPS no
+nr = add nr V_MAX_STEPS
+end
+end
+rn = sc_acc_nrmse view ar nr no
+put sr_ref 0 rn
+if lt rn mul get sp_lat_ref_fac 0 get sp_inbox_bound 0
+sc_set_fail PD0V_SCORE_L6_REFERENCE_TOO_GOOD
+end
+ret
+end
+
+fn sc_result_clear to void
+put sr_code 0 0
+put sr_fail_mask 0 uint 0
+put sr_inbox 0 long 0
+put sr_extrap 0 long 0
+put sr_onestep 0 long 0
+put sr_ref 0 long 0
+put sr_size 0 uint 0
+put sr_bits 0 uint 0
+ret
+end
+
+fn sc_structure rslot ulong stored uint to void
+if gt vr_rel_max_degree rslot 3
+sc_set_fail PD0V_SCORE_DEGREE
+end
+put sr_size 0 add vr_rel_size rslot stored
+put sr_bits 0 add vr_rel_bits rslot mul uint 24 stored
+if gt get sr_size 0 get sp_size_bound 0
+sc_set_fail PD0V_SCORE_SIZE
+end
+if ne get vr_dbits rslot vr_rel_bits rslot
+sc_set_fail PD0V_SCORE_BITS_MISMATCH
+end
+nt = ulong get sp_n_terms 0
+for t ulong nt bound 32
+m = sc_term_matches rslot t get sp_score_const 0
+if eq m 0
+sc_set_fail PD0V_SCORE_SUPPORT_MISSING
+else
+if eq m 2
+sc_set_fail PD0V_SCORE_CONSTANT_OFF
+end
+end
+end
+if ne get sp_req_lat 0 0
+if eq get vr_nlat rslot uchar 0
+sc_set_fail PD0V_SCORE_L6_LATENT_MISSING
+end
+end
+ret
+end
+
+note C pd0_score: structure first (these bite regardless of bounds), then 6.1 rollouts, then the L6 reference
+fn pd0_score rslot ulong stored uint mode int to int
+sc_result_clear
+no = ulong get sp_n_obs 0
+if ne ulong get vr_nvars rslot add no ulong get vr_nlat rslot
+put sr_code 0 PD0V_BAD_FIELD
+ret PD0V_BAD_FIELD
+end
+if ne get vr_nch rslot get sp_n_ch 0
+put sr_code 0 PD0V_BAD_FIELD
+ret PD0V_BAD_FIELD
+end
+sc_structure rslot stored
+sc_score_rollouts rslot mode
+if ne get sp_req_lat 0 0
+if gt get sf_n_fit 0 uint 0
+sc_eval_ref_l6
+end
+end
+ret get sr_code 0
+end
