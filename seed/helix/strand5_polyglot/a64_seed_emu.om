@@ -1,0 +1,1231 @@
+om2
+note a64_seed_emu.om -- Pure seeded-Omega AArch64 Arm DDI 0487 Instruction Decoder & Software Seed Emulator.
+note Strand E ("The Polyglot") -- breaks native-silicon trust assumptions by independently decoding EVERY
+note 32-bit instruction word of an AArch64 ELF-64 seed binary against an explicit Arm DDI 0487 allowlist
+note (failing closed on ANY unknown/disallowed instruction) AND software-emulating the ELF binary on its
+note own source file (registers x0..x30/sp, NZCV flags, virtual segment + stack, Linux AArch64 syscalls
+note read=63, write=64, exit=93) to prove byte-for-byte self-reproduction in pure software.
+note
+note Extends seed/check/a64check.om's decoder allowlist with the 4 missing seed instruction forms:
+note   - SVC #imm16       (mask 0xffe0001f == 0xd4000001)
+note   - UBFM / LSL       (mask 0x7f800000 == 0x53000000, with N == sf)
+note   - ADD (immediate)  (mask 0x7f800000 == 0x11000000)
+note   - SUB (immediate)  (mask 0x7f800000 == 0x51000000)
+note
+note Usage:
+note   a64_seed_emu check  <elf_bin>
+note   a64_seed_emu verify <elf_bin> <src_file>
+note   a64_seed_emu run    <elf_bin> <input_file> <expected_exit>
+note
+note Exit codes:
+note   0  PASS
+note   2  usage / bad arguments
+note   3  file I/O error
+note   4  ELF header / program header invalid
+note   10 disallowed / unknown AArch64 instruction word (fail-closed!)
+note   11 emulation fault (unmapped memory, unsupported syscall, step bound, bad PC)
+note   12 verification mismatch (emulated exit status or captured stdout != expected)
+
+text t_usage "usage: a64_seed_emu check <elf> | verify <elf> <src> | run <elf> <in> <exp_exit>\n"
+text t_check "check"
+text t_verify "verify"
+text t_run "run"
+text t_fail_io "a64_seed_emu: FAIL file I/O\n"
+text t_fail_elf "a64_seed_emu: FAIL invalid AArch64 ELF-64\n"
+text t_fail_ins "a64_seed_emu: FAIL disallowed instruction at offset="
+text t_word " word=0x"
+text t_fail_emu "a64_seed_emu: FAIL emulation fault code="
+text t_fail_rc "a64_seed_emu: FAIL exit mismatch got="
+text t_want " want="
+text t_fail_len "a64_seed_emu: FAIL stdout length mismatch got="
+text t_fail_byt "a64_seed_emu: FAIL stdout byte mismatch at offset="
+text t_pass_chk "PASS a64_seed_emu check insns="
+text t_pass_ver "PASS a64_seed_emu verify elf="
+text t_pass_run "PASS a64_seed_emu run exit="
+text t_insns " insns="
+text t_steps " steps="
+text t_exact " self_match=EXACT\n"
+text t_nl "\n"
+text hexd "0123456789abcdef"
+
+global argb uchar 4096
+global elfbuf uchar 131072
+global srcbuf uchar 131072
+global capbuf uchar 131072
+global segmem uchar 131072
+global stkmem uchar 16384
+global obuf uchar 4096
+global olen ulong 1
+
+note CPU state:
+note   regs[0..30] = x0..x30, regs[31] = sp
+note   fl[0..3] = N, Z, C, V
+note   elfs[0] = elf_len, elfs[1] = e_entry, elfs[2] = p_vaddr, elfs[3] = p_filesz, elfs[4] = p_memsz
+note   elfs[5] = code_insns
+note   emus[0] = pc, emus[1] = halted, emus[2] = exit_code, emus[3] = fault_code
+note   emus[4] = src_len, emus[5] = src_pos, emus[6] = cap_len, emus[7] = steps
+note   df[0] = op, df[1] = sf, df[2] = rd, df[3] = rn, df[4] = rm
+note   df[5] = imm, df[6] = hw/shift/immr, df[7] = imms/bimm, df[8] = cond
+global regs ulong 32
+global fl ulong 4
+global elfs ulong 8
+global emus ulong 8
+global df ulong 9
+
+const STK_BASE ulong 0x7fff0000
+const STK_SIZE ulong 16384
+
+note ---- output helpers ----
+fn oflush fd int to void
+off = ulong 0
+n = get olen 0
+while lt off n bound 4096
+w = write fd obuf off sub n off
+if le w 0
+put olen 0 0
+ret
+end
+off = add off ulong w
+end
+put olen 0 0
+end
+
+fn oputb b uchar to void
+m = get olen 0
+if ge m len obuf
+oflush 1
+m = get olen 0
+end
+put obuf m b
+put olen 0 add m 1
+end
+
+fn oputt t view uchar * to void
+for i ulong len t
+oputb get t i
+end
+end
+
+fn oputn v ulong to void
+d = new uchar 20 0
+i = ulong 0
+x = v
+put d 0 uchar add rem x 10 48
+x = div x 10
+i = add i 1
+while gt x 0 bound 20
+put d i uchar add rem x 10 48
+x = div x 10
+i = add i 1
+end
+j = i
+while gt j 0 bound 20
+j = sub j 1
+oputb get d j
+end
+end
+
+fn ohex8 x ulong to void
+for i ulong 8
+s = sub 28 mul i 4
+oputb get hexd and shr x s 15
+end
+end
+
+note ---- argument & file helpers ----
+fn argeq idx ulong t view uchar * to bool
+n = argread idx argb 0 len argb
+if ne n long len t
+ret false
+end
+for i ulong len t
+if ne get argb i get t i
+ret false
+end
+end
+ret true
+end
+
+fn parseu idx ulong to long
+n = argread idx argb 0 len argb
+if le n 0
+ret -1
+end
+v = ulong 0
+for i ulong ulong n bound 32
+c = ulong get argb i
+if or lt c 48 gt c 57
+ret -1
+end
+v = add mul v 10 sub c 48
+end
+ret long v
+end
+
+fn loadfile idx ulong dst ulong to long
+n = argread idx argb 0 len argb
+if le n 0
+ret -1
+end
+fd = fopen argb 0 ulong n 0 0
+if lt fd 0
+ret -1
+end
+tot = ulong 0
+go = true
+while go bound 2048
+remb = sub ulong 131072 tot
+if eq remb 0
+go = false
+else
+r = long 0
+if eq dst 0
+r = read int fd elfbuf tot remb
+else
+r = read int fd srcbuf tot remb
+end
+if lt r 0
+cl = fclose int fd
+ret -1
+end
+if eq r 0
+go = false
+else
+tot = add tot ulong r
+end
+end
+end
+cl = fclose int fd
+ret long tot
+end
+
+note ---- little-endian readers from elfbuf ----
+fn eu16 off ulong to ulong
+b0 = ulong get elfbuf off
+b1 = ulong get elfbuf add off 1
+ret or b0 shl b1 8
+end
+
+fn eu32 off ulong to ulong
+b0 = ulong get elfbuf off
+b1 = ulong get elfbuf add off 1
+b2 = ulong get elfbuf add off 2
+b3 = ulong get elfbuf add off 3
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn eu64 off ulong to ulong
+lo = eu32 off
+hi = eu32 add off 4
+ret or lo shl hi 32
+end
+
+note ---- Arm DDI 0487 Instruction Decoder (a64check.om + 4 seed forms) ----
+note Op codes:
+note   0=INVALID, 1=ADD_REG, 2=SUB_REG, 3=MUL, 4=AND_REG, 5=ORR_REG, 6=EOR_REG,
+note   7=MOVZ, 8=RET, 9=B, 10=B_COND, 11=CBZ, 12=CBNZ, 13=MOVK, 14=ADR,
+note   15=LDR_UOFF, 16=STR_UOFF, 17=LDRB_UOFF, 18=STRB_UOFF, 19=SUBS_IMM,
+note   20=SVC, 21=UBFM, 22=ADD_IMM, 23=SUB_IMM, 24=SUBS_REG, 25=LDR_POST, 26=STR_POST
+
+fn f3 op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 31 1
+put df 2 and w 31
+put df 3 and shr w 5 31
+put df 4 and shr w 16 31
+put df 6 and shr w 10 63
+put df 7 and shr w 22 3
+end
+
+fn fcb op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 31 1
+put df 2 and w 31
+put df 7 and shr w 5 0x7ffff
+end
+
+fn fmv op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 31 1
+put df 2 and w 31
+put df 5 and shr w 5 0xffff
+put df 6 and shr w 21 3
+end
+
+fn fls op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 30 1
+put df 2 and w 31
+put df 3 and shr w 5 31
+put df 5 and shr w 10 0xfff
+end
+
+fn flsp op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 30 1
+put df 2 and w 31
+put df 3 and shr w 5 31
+put df 5 and shr w 12 0x1ff
+end
+
+fn fimm op ulong w ulong to void
+put df 0 op
+put df 1 and shr w 31 1
+put df 2 and w 31
+put df 3 and shr w 5 31
+put df 5 and shr w 10 0xfff
+put df 6 and shr w 22 1
+end
+
+fn dec_word w ulong to void
+for i ulong 9
+put df i 0
+end
+if eq w 0xd65f03c0
+put df 0 8
+put df 3 30
+ret
+end
+if eq and w 0xffe0001f 0xd4000001
+put df 0 20
+put df 5 and shr w 5 0xffff
+ret
+end
+if eq and w 0xfc000000 0x14000000
+put df 0 9
+put df 7 and w 0x3ffffff
+ret
+end
+if eq and w 0xff000010 0x54000000
+put df 0 10
+put df 8 and w 15
+put df 7 and shr w 5 0x7ffff
+ret
+end
+if eq and w 0x7f000000 0x34000000
+fcb 11 w
+ret
+end
+if eq and w 0x7f000000 0x35000000
+fcb 12 w
+ret
+end
+if eq and w 0x7f800000 0x52800000
+fmv 7 w
+ret
+end
+if eq and w 0x7f800000 0x72800000
+fmv 13 w
+ret
+end
+if eq and w 0x7fe07c00 0x1b007c00
+f3 3 w
+ret
+end
+dec_word2 w
+end
+
+fn dec_word2 w ulong to void
+if eq and w 0x7f800000 0x11000000
+fimm 22 w
+ret
+end
+if eq and w 0x7f800000 0x51000000
+fimm 23 w
+ret
+end
+if eq and w 0x7f800000 0x71000000
+fimm 19 w
+ret
+end
+if eq and w 0x7f800000 0x53000000
+sf = and shr w 31 1
+nb = and shr w 22 1
+if eq sf nb
+immr = and shr w 16 63
+imms = and shr w 10 63
+if or ne sf 0 and lt immr 32 lt imms 32
+put df 0 21
+put df 1 sf
+put df 2 and w 31
+put df 3 and shr w 5 31
+put df 6 immr
+put df 7 imms
+ret
+end
+end
+ret
+end
+m = and w 0x7f200000
+if eq m 0x0a000000
+f3 4 w
+ret
+end
+if eq m 0x2a000000
+f3 5 w
+ret
+end
+if eq m 0x4a000000
+f3 6 w
+ret
+end
+if eq m 0x0b000000
+f3 1 w
+ret
+end
+if eq m 0x4b000000
+f3 2 w
+ret
+end
+if eq m 0x6b000000
+f3 24 w
+ret
+end
+dec_word3 w
+end
+
+fn dec_word3 w ulong to void
+if eq and w 0x9f000000 0x10000000
+put df 0 14
+put df 2 and w 31
+lo = and shr w 29 3
+hi = and shr w 5 0x7ffff
+put df 7 or shl hi 2 lo
+ret
+end
+if eq and w 0xbfc00000 0xb9400000
+fls 15 w
+ret
+end
+if eq and w 0xbfc00000 0xb9000000
+fls 16 w
+ret
+end
+if eq and w 0xbfe00c00 0xb8400400
+flsp 25 w
+ret
+end
+if eq and w 0xbfe00c00 0xb8000400
+flsp 26 w
+ret
+end
+if eq and w 0xffc00000 0x39400000
+fls 17 w
+put df 1 0
+ret
+end
+if eq and w 0xffc00000 0x39000000
+fls 18 w
+put df 1 0
+ret
+end
+end
+
+note ---- ELF-64 validation and instruction allowlist audit ----
+fn find_ptload phoff ulong phnum ulong to ulong
+for i ulong phnum bound 32
+po = add phoff mul i 56
+if eq eu32 po 1
+if ne eu64 add po 8 0
+ret 7
+end
+put elfs 2 eu64 add po 16
+put elfs 3 eu64 add po 32
+put elfs 4 eu64 add po 40
+ret 0
+end
+end
+ret 8
+end
+
+fn check_elf_seg elen ulong to ulong
+entry = eu64 24
+pv = get elfs 2
+pf = get elfs 3
+pm = get elfs 4
+if gt pf elen
+ret 9
+end
+if gt pm len segmem
+ret 9
+end
+if lt pm pf
+ret 9
+end
+if lt entry pv
+ret 10
+end
+if ge entry add pv pf
+ret 10
+end
+coff = sub entry pv
+if ne and coff 3 0
+ret 11
+end
+csize = sub pf coff
+if ne and csize 3 0
+ret 11
+end
+put elfs 0 elen
+put elfs 1 entry
+put elfs 5 shr csize 2
+ret 0
+end
+
+fn parse_elf elen ulong to ulong
+if lt elen 120
+ret 1
+end
+if ne get elfbuf 0 0x7f
+ret 2
+end
+if ne get elfbuf 1 69
+ret 2
+end
+if ne get elfbuf 2 76
+ret 2
+end
+if ne get elfbuf 3 70
+ret 2
+end
+if ne get elfbuf 4 2
+ret 3
+end
+if ne get elfbuf 5 1
+ret 3
+end
+if ne get elfbuf 6 1
+ret 3
+end
+if ne eu16 16 2
+ret 4
+end
+if ne eu16 18 183
+ret 4
+end
+phoff = eu64 32
+phnum = eu16 56
+if ne phoff 64
+ret 5
+end
+if ne eu16 54 56
+ret 5
+end
+if eq phnum 0
+ret 5
+end
+if gt add phoff mul phnum 56 elen
+ret 6
+end
+rc = find_ptload phoff phnum
+if ne rc 0
+ret rc
+end
+ret check_elf_seg elen
+end
+
+note audit_code: check EVERY 32-bit instruction word in [e_entry, p_vaddr + p_filesz).
+note Returns 0 if every word is in the Arm DDI 0487 allowlist; else prints diagnostic to stderr and returns 10.
+fn audit_code to ulong
+pv = get elfs 2
+coff = sub get elfs 1 pv
+pf = get elfs 3
+off = coff
+while lt off pf bound 32768
+w = eu32 off
+dec_word w
+if eq get df 0 0
+put olen 0 0
+oputt t_fail_ins
+oputn off
+oputt t_word
+ohex8 w
+oputt t_nl
+oflush 2
+ret 10
+end
+off = add off 4
+end
+ret 0
+end
+
+note ---- Virtual memory helpers (segment [p_vaddr, p_vaddr+p_memsz) + stack [STK_BASE, STK_BASE+STK_SIZE)) ----
+fn mgetb addr ulong to long
+pv = get elfs 2
+pm = get elfs 4
+if ge addr pv
+d = sub addr pv
+if lt d pm
+ret long get segmem d
+end
+end
+if ge addr STK_BASE
+d = sub addr STK_BASE
+if lt d STK_SIZE
+ret long get stkmem d
+end
+end
+put emus 3 1
+ret -1
+end
+
+fn mputb addr ulong val uchar to bool
+pv = get elfs 2
+pm = get elfs 4
+if ge addr pv
+d = sub addr pv
+if lt d pm
+put segmem d val
+ret true
+end
+end
+if ge addr STK_BASE
+d = sub addr STK_BASE
+if lt d STK_SIZE
+put stkmem d val
+ret true
+end
+end
+put emus 3 2
+ret false
+end
+
+fn mgetn addr ulong nb ulong to ulong
+v = ulong 0
+for i ulong nb bound 8
+b = mgetb add addr i
+if lt b 0
+ret 0
+end
+v = or v shl ulong b mul i 8
+end
+ret v
+end
+
+fn mputn addr ulong nb ulong val ulong to void
+for i ulong nb bound 8
+ok = mputb add addr i uchar and shr val mul i 8 255
+if not ok
+ret
+end
+end
+end
+
+note ---- Register & bit arithmetic helpers ----
+fn rget r ulong usesp bool to ulong
+if eq r 31
+if usesp
+ret get regs 31
+end
+ret 0
+end
+ret get regs r
+end
+
+fn rset r ulong sf ulong val ulong usesp bool to void
+v = val
+if eq sf 0
+v = and val 0xffffffff
+end
+if eq r 31
+if usesp
+put regs 31 v
+end
+ret
+end
+put regs r v
+end
+
+fn sext v ulong bits ulong to ulong
+if ge bits 64
+ret v
+end
+sb = shl ulong 1 sub bits 1
+if ne and v sb 0
+mask = sub shl ulong 1 bits 1
+ret or v not mask
+end
+ret v
+end
+
+fn bitmask n ulong to ulong
+if ge n 64
+ret 0xffffffffffffffff
+end
+ret sub shl ulong 1 n 1
+end
+
+fn set_sub_flags sf ulong a0 ulong b0 ulong to ulong
+if eq sf 0
+a = and a0 0xffffffff
+b = and b0 0xffffffff
+res = and sub a b 0xffffffff
+put fl 0 and shr res 31 1
+if eq res 0
+put fl 1 1
+else
+put fl 1 0
+end
+if ge a b
+put fl 2 1
+else
+put fl 2 0
+end
+put fl 3 and shr and xor a b xor a res 31 1
+ret res
+end
+res = sub a0 b0
+put fl 0 and shr res 63 1
+if eq res 0
+put fl 1 1
+else
+put fl 1 0
+end
+if ge a0 b0
+put fl 2 1
+else
+put fl 2 0
+end
+put fl 3 and shr and xor a0 b0 xor a0 res 63 1
+ret res
+end
+
+fn cond_ok cc ulong to bool
+n = get fl 0
+z = get fl 1
+c = get fl 2
+v = get fl 3
+if eq cc 0
+ret eq z 1
+end
+if eq cc 1
+ret eq z 0
+end
+if eq cc 2
+ret eq c 1
+end
+if eq cc 3
+ret eq c 0
+end
+if eq cc 4
+ret eq n 1
+end
+if eq cc 5
+ret eq n 0
+end
+if eq cc 6
+ret eq v 1
+end
+if eq cc 7
+ret eq v 0
+end
+if eq cc 8
+ret and eq c 1 eq z 0
+end
+if eq cc 9
+ret or eq c 0 eq z 1
+end
+if eq cc 10
+ret eq n v
+end
+if eq cc 11
+ret ne n v
+end
+if eq cc 12
+ret and eq z 0 eq n v
+end
+if eq cc 13
+ret or eq z 1 ne n v
+end
+ret true
+end
+
+fn do_shift v ulong sf ulong st ulong amt ulong to ulong
+x = v
+w = ulong 64
+if eq sf 0
+x = and v 0xffffffff
+w = 32
+end
+if eq amt 0
+ret x
+end
+if ge amt w
+ret 0
+end
+if eq st 0
+r = shl x amt
+if eq sf 0
+r = and r 0xffffffff
+end
+ret r
+end
+if eq st 1
+ret shr x amt
+end
+if eq st 2
+s = bitcast long sext x w
+r = bitcast ulong shr s long amt
+if eq sf 0
+r = and r 0xffffffff
+end
+ret r
+end
+ret x
+end
+
+note ---- Emulated Linux AArch64 syscalls (read=63, write=64, exit=93) ----
+fn emu_svc to void
+nr = get regs 8
+if eq nr 63
+fd = get regs 0
+buf = get regs 1
+cnt = get regs 2
+if ne fd 0
+put emus 3 20
+ret
+end
+pos = get emus 5
+slen = get emus 4
+n = cnt
+if gt n sub slen pos
+n = sub slen pos
+end
+for i ulong n bound 131072
+ok = mputb add buf i get srcbuf add pos i
+if not ok
+ret
+end
+end
+put emus 5 add pos n
+put regs 0 n
+ret
+end
+if eq nr 64
+fd = get regs 0
+buf = get regs 1
+cnt = get regs 2
+if ne fd 1
+put emus 3 21
+ret
+end
+cl = get emus 6
+if gt add cl cnt len capbuf
+put emus 3 22
+ret
+end
+for i ulong cnt bound 131072
+b = mgetb add buf i
+if lt b 0
+ret
+end
+put capbuf add cl i uchar b
+end
+put emus 6 add cl cnt
+put regs 0 cnt
+ret
+end
+if eq nr 93
+put emus 2 and get regs 0 255
+put emus 1 1
+ret
+end
+put emus 3 23
+end
+
+note ---- Instruction Execution ----
+fn exec_arith op ulong sf ulong rd ulong rn ulong rm ulong to void
+a = rget rn false
+b = do_shift rget rm false sf get df 7 get df 6
+if eq op 1
+rset rd sf add a b false
+ret
+end
+if eq op 2
+rset rd sf sub a b false
+ret
+end
+if eq op 3
+rset rd sf mul a b false
+ret
+end
+if eq op 4
+rset rd sf and a b false
+ret
+end
+if eq op 5
+rset rd sf or a b false
+ret
+end
+if eq op 6
+rset rd sf xor a b false
+ret
+end
+res = set_sub_flags sf a b
+rset rd sf res false
+end
+
+fn exec_ubfm sf ulong rd ulong rn ulong immr ulong imms ulong to void
+w = ulong 64
+src = rget rn false
+if eq sf 0
+w = 32
+src = and src 0xffffffff
+end
+res = ulong 0
+if ge imms immr
+nb = add sub imms immr 1
+res = and shr src immr bitmask nb
+else
+nb = add imms 1
+sh = sub w immr
+res = shl and src bitmask nb sh
+end
+rset rd sf res false
+end
+
+fn exec_mem op ulong sf ulong rt ulong rn ulong imm ulong to void
+base = rget rn true
+if eq op 15
+nb = ulong 4
+if ne sf 0
+nb = 8
+end
+v = mgetn add base mul imm nb nb
+rset rt sf v false
+ret
+end
+if eq op 16
+nb = ulong 4
+if ne sf 0
+nb = 8
+end
+mputn add base mul imm nb nb rget rt false
+ret
+end
+if eq op 17
+b = mgetb add base imm
+if ge b 0
+rset rt 0 ulong b false
+end
+ret
+end
+if eq op 18
+ok = mputb add base imm uchar and rget rt false 255
+ret
+end
+so = sext imm 9
+nb = ulong 4
+if ne sf 0
+nb = 8
+end
+if eq op 25
+v = mgetn base nb
+rset rt sf v false
+rset rn 1 add base so true
+ret
+end
+mputn base nb rget rt false
+rset rn 1 add base so true
+end
+
+fn exec_one pc ulong to ulong
+op = get df 0
+sf = get df 1
+rd = get df 2
+rn = get df 3
+rm = get df 4
+npc = add pc 4
+if eq op 20
+emu_svc
+ret npc
+end
+if eq op 7
+v = shl get df 5 mul get df 6 16
+rset rd sf v false
+ret npc
+end
+if eq op 13
+sh = mul get df 6 16
+cur = rget rd false
+clr = not shl ulong 0xffff sh
+v = or and cur clr shl get df 5 sh
+rset rd sf v false
+ret npc
+end
+if or le op 6 eq op 24
+exec_arith op sf rd rn rm
+ret npc
+end
+if eq op 22
+im = get df 5
+if ne get df 6 0
+im = shl im 12
+end
+rset rd sf add rget rn true im true
+ret npc
+end
+if eq op 23
+im = get df 5
+if ne get df 6 0
+im = shl im 12
+end
+rset rd sf sub rget rn true im true
+ret npc
+end
+if eq op 19
+im = get df 5
+if ne get df 6 0
+im = shl im 12
+end
+res = set_sub_flags sf rget rn true im
+rset rd sf res false
+ret npc
+end
+if eq op 21
+exec_ubfm sf rd rn get df 6 get df 7
+ret npc
+end
+if eq op 9
+ret add pc shl sext get df 7 26 2
+end
+if eq op 10
+if cond_ok get df 8
+ret add pc shl sext get df 7 19 2
+end
+ret npc
+end
+if eq op 11
+v = rget rd false
+if eq sf 0
+v = and v 0xffffffff
+end
+if eq v 0
+ret add pc shl sext get df 7 19 2
+end
+ret npc
+end
+if eq op 12
+v = rget rd false
+if eq sf 0
+v = and v 0xffffffff
+end
+if ne v 0
+ret add pc shl sext get df 7 19 2
+end
+ret npc
+end
+if eq op 14
+rset rd 1 add pc sext get df 7 21 false
+ret npc
+end
+if eq op 8
+t = get regs 30
+if eq t 0
+put emus 1 1
+put emus 2 0
+ret npc
+end
+ret t
+end
+if or and ge op 15 le op 18 or eq op 25 eq op 26
+exec_mem op sf rd rn get df 5
+ret npc
+end
+put emus 3 99
+ret npc
+end
+
+fn run_emu slen ulong to ulong
+for i ulong 31
+put regs i 0
+end
+put regs 31 add STK_BASE STK_SIZE
+for i ulong 4
+put fl i 0
+end
+pm = get elfs 4
+pf = get elfs 3
+for i ulong pm bound 131072
+if lt i pf
+put segmem i get elfbuf i
+else
+put segmem i 0
+end
+end
+for i ulong STK_SIZE bound 16384
+put stkmem i 0
+end
+put emus 0 get elfs 1
+put emus 1 0
+put emus 2 0
+put emus 3 0
+put emus 4 slen
+put emus 5 0
+put emus 6 0
+put emus 7 0
+pv = get elfs 2
+while and eq get emus 1 0 eq get emus 3 0 bound 20000000
+pc = get emus 0
+if or lt pc pv or ge pc add pv pf ne and pc 3 0
+put emus 3 30
+break
+end
+w = eu32 sub pc pv
+dec_word w
+if eq get df 0 0
+put emus 3 31
+break
+end
+npc = exec_one pc
+put emus 0 npc
+put emus 7 add get emus 7 1
+end
+if ne get emus 3 0
+put olen 0 0
+oputt t_fail_emu
+oputn get emus 3
+oputt t_nl
+oflush 2
+ret 11
+end
+if eq get emus 1 0
+put olen 0 0
+oputt t_fail_emu
+oputn 40
+oputt t_nl
+oflush 2
+ret 11
+end
+ret 0
+end
+
+note ---- CLI entry point ----
+fn main to int
+ac = argcnt
+if lt ac 3
+oputt t_usage
+oflush 2
+ret 2
+end
+mode = ulong 0
+if argeq 1 t_check
+mode = 1
+else
+if argeq 1 t_verify
+mode = 2
+else
+if argeq 1 t_run
+mode = 3
+end
+end
+end
+if eq mode 0
+oputt t_usage
+oflush 2
+ret 2
+end
+if and eq mode 2 lt ac 4
+oputt t_usage
+oflush 2
+ret 2
+end
+if and eq mode 3 lt ac 5
+oputt t_usage
+oflush 2
+ret 2
+end
+elen = loadfile 2 0
+if lt elen 0
+oputt t_fail_io
+oflush 2
+ret 3
+end
+pe = parse_elf ulong elen
+if ne pe 0
+oputt t_fail_elf
+oflush 2
+ret 4
+end
+au = audit_code
+if ne au 0
+ret int au
+end
+if eq mode 1
+oputt t_pass_chk
+oputn get elfs 5
+oputt t_nl
+oflush 1
+ret 0
+end
+slen = loadfile 3 1
+if lt slen 0
+oputt t_fail_io
+oflush 2
+ret 3
+end
+er = run_emu ulong slen
+if ne er 0
+ret int er
+end
+if eq mode 2
+if ne get emus 2 0
+oputt t_fail_rc
+oputn get emus 2
+oputt t_want
+oputn 0
+oputt t_nl
+oflush 2
+ret 12
+end
+if ne get emus 6 ulong elen
+oputt t_fail_len
+oputn get emus 6
+oputt t_want
+oputn ulong elen
+oputt t_nl
+oflush 2
+ret 12
+end
+for i ulong ulong elen bound 131072
+if ne get capbuf i get elfbuf i
+oputt t_fail_byt
+oputn i
+oputt t_nl
+oflush 2
+ret 12
+end
+end
+oputt t_pass_ver
+oputn ulong elen
+oputt t_insns
+oputn get elfs 5
+oputt t_steps
+oputn get emus 7
+oputt t_exact
+oflush 1
+ret 0
+end
+exp = parseu 4
+if lt exp 0
+oputt t_usage
+oflush 2
+ret 2
+end
+if ne get emus 2 ulong exp
+oputt t_fail_rc
+oputn get emus 2
+oputt t_want
+oputn ulong exp
+oputt t_nl
+oflush 2
+ret 12
+end
+oputt t_pass_run
+oputn get emus 2
+oputt t_steps
+oputn get emus 7
+oputt t_nl
+oflush 1
+ret 0
+end

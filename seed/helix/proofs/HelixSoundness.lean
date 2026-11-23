@@ -11,19 +11,32 @@
        adjacent transpositions (the exact DAG-preservation relation checked in
        milliseconds by Strand A's `seed/helix/monk_check.om`) produces the exact
        same final state as the reference schedule for all initial states.
-    4. `helix_ddc_correspondence`: Wheeler Diverse Double Compilation + Double Helix
-       cross-compilation soundness (when Strand A from seed0 and Strand B from seedB0
-       cross-compile target source S to identical target bytes B_target).
-    5. `raw_violation_counterexample`: non-vacuity negative control proving that a
+    4. Full Two-Compiler Wheeler Diverse Double Compilation (DDC):
+       - `wheeler_ddc_stage2_exact`: Stage-2 equality `run (run T S_A) S_A = A` with a
+         diverse trusted compiler `T` proves `A = spec S_A S_A`.
+       - `wheeler_ddc_full_correspondence`: full two-compiler semantic correspondence:
+         for ANY candidate binary `A` and trusted diverse compiler `T`, if Stage 2
+         from `T` matches Stage 2 from `A` (`run (run T S_A) S_A = run (run A S_A) S_A`)
+         and `A` self-regenerates (`run A S_A = A`), and `S_A` is a sound self-compiler
+         specification (`Corresponds run spec (spec S_A S_A) S_A`), then
+         `Corresponds run spec A S_A` — `A` behaves identically to `spec S_A` on EVERY
+         possible future input `P : Source`, NOT only on `S_A`!
+       - `wheeler_ddc_kills_trusting_trust`: any Ken Thompson backdoor in `A` that
+         miscompiles even a single future target `P_target` MUST fail the Wheeler DDC
+         Stage-2 equality check (`run (run T S_A) S_A ≠ A`).
+       - `trusting_trust_backdoor_caught`: concrete non-vacuity witness constructing a
+         self-reproducing Ken Thompson trojan (`run A_trojan S_A = A_trojan`) that
+         backdoors `P_target` and proving Wheeler DDC rejects it.
+    5. `helix_ddc_correspondence` (preserved backward-compatible theorem).
+    6. `raw_violation_counterexample`: non-vacuity negative control proving that a
        RAW-violating swap actually changes final state on a concrete input.
 
   Model-to-system link:
     The dependency predicate `conflicts a b` mirrors `mkHasDep` + `mkIsAnchor` in
     `seed/helix/monk_check.om` (RAW: a.w ∈ b.r, WAR: b.w ∈ a.r, WAW: a.w == b.w,
     or either instruction is a barrier/control/reconvergence/predicate-writer/memory anchor).
-    This file proves soundness of the model; CFG fixed-point SM121 scoreboard timing hazards
-    and fixed-latency ALU RAW stall bounds are additionally enforced by `mkCheckHazards` and
-    `mkCheckRawStalls` in `seed/helix/monk_check.om` (using `bw_hazard.om` `hz_dec1`).
+    Wheeler DDC mirrors `seed/helix/braid4-verify.sh`, `seed/helix/braid7-verify.sh`,
+    and `seed/helix/strand5_polyglot/cross_x86_ddc.sh`.
 -/
 
 namespace HelixSoundness
@@ -181,13 +194,80 @@ theorem dag_preserving_perm_sound
     rw [validSwap_sound _ _ hro hswap s]
     exact ih (validSwap_preserves_readsOnly _ _ hro hswap) s
 
-/-- Wheeler DDC + Double Helix Correspondence Theorem:
-    Let `sem` map an executable compiler binary to the compiler function `Source → Binary`.
-    If Strand B (`ng_from_seedB`) is independently trusted to faithfully compile `S_A` into
-    `A_fast` (`sem A_fast = spec S_A`), and `A_fast` compiles `S_A` into `B_target`,
-    and Strand A (`B_target`) compiles `S_A` into `B_target` (fixpoint), then
-    `B_target = spec S_A S_A` — the claimed binary equals the exact specification output
-    on `S_A`, ruling out a self-propagating backdoor unique to Strand A's seed lineage. -/
+-- ==================== FULL TWO-COMPILER WHEELER DDC ====================
+
+/-- A compiler binary `B` corresponds to compiler source `S` iff executing `B` on any
+    input source `P` produces the exact specification output `spec S P`. -/
+def Corresponds {Source Binary : Type}
+    (run : Binary → Source → Binary)
+    (spec : Source → Source → Binary)
+    (B : Binary) (S : Source) : Prop :=
+  ∀ P : Source, run B P = spec S P
+
+/-- A diverse compiler `T` is trusted on source `S` iff compiling `S` with `T` produces
+    a Stage-1 binary `run T S` that faithfully implements `spec S` on all inputs. -/
+def TrustedOn {Source Binary : Type}
+    (run : Binary → Source → Binary)
+    (spec : Source → Source → Binary)
+    (T : Binary) (S : Source) : Prop :=
+  Corresponds run spec (run T S) S
+
+/-- Two-stage Wheeler DDC Stage-2 binary exactness:
+    if diverse trusted compiler `T` compiles `S_A` -> `stage1_T`, and `stage1_T` compiles
+    `S_A` -> `stage2_T`, and `stage2_T = A`, then `A = spec S_A S_A`. -/
+theorem wheeler_ddc_stage2_exact
+    {Source Binary : Type}
+    (run : Binary → Source → Binary)
+    (spec : Source → Source → Binary)
+    (S_A : Source) (T A : Binary)
+    (hT : TrustedOn run spec T S_A)
+    (hddc : run (run T S_A) S_A = A) :
+    A = spec S_A S_A := by
+  rw [← hddc, hT S_A]
+
+/-- Full Two-Compiler Wheeler Diverse Double Compilation Theorem:
+    Let `A` be an untrusted self-hosted binary (claimed to come from `S_A`) with
+    self-regeneration `run A S_A = A`, and let `T` be a diverse compiler trusted on `S_A`.
+    Suppose `S_A`'s own specification is self-consistent (`Corresponds run spec (spec S_A S_A) S_A`)
+    and Stage 2 from `T` matches Stage 2 from `A`:
+      `run (run T S_A) S_A = run (run A S_A) S_A`.
+    Then `A` corresponds to `spec S_A` on EVERY future input `P : Source`! -/
+theorem wheeler_ddc_full_correspondence
+    {Source Binary : Type}
+    (run : Binary → Source → Binary)
+    (spec : Source → Source → Binary)
+    (S_A : Source) (T A : Binary)
+    (hT : TrustedOn run spec T S_A)
+    (hself : run A S_A = A)
+    (hspec_sound : Corresponds run spec (spec S_A S_A) S_A)
+    (hddc_eq : run (run T S_A) S_A = run (run A S_A) S_A) :
+    A = spec S_A S_A ∧ Corresponds run spec A S_A := by
+  have hA_eq : A = spec S_A S_A := by
+    have h1 : run (run A S_A) S_A = A := by rw [hself, hself]
+    rw [← h1, ← hddc_eq, hT S_A]
+  refine ⟨hA_eq, ?_⟩
+  rw [hA_eq]
+  exact hspec_sound
+
+/-- Countering Ken Thompson's "Trusting Trust":
+    if an untrusted binary `A` harbors a backdoor that miscompiles ANY future target `P_target`
+    (`run A P_target ≠ spec S_A P_target`), even if `A` cleanly self-reproduces (`run A S_A = A`),
+    then the Wheeler DDC Stage-2 equality check against trusted diverse compiler `T` MUST FAIL! -/
+theorem wheeler_ddc_kills_trusting_trust
+    {Source Binary : Type}
+    (run : Binary → Source → Binary)
+    (spec : Source → Source → Binary)
+    (S_A P_target : Source) (T A : Binary)
+    (hT : TrustedOn run spec T S_A)
+    (hself : run A S_A = A)
+    (hspec_sound : Corresponds run spec (spec S_A S_A) S_A)
+    (hbackdoor : run A P_target ≠ spec S_A P_target) :
+    run (run T S_A) S_A ≠ run (run A S_A) S_A := by
+  intro heq
+  have ⟨_, hcorr⟩ := wheeler_ddc_full_correspondence run spec S_A T A hT hself hspec_sound heq
+  exact hbackdoor (hcorr P_target)
+
+/-- Preserved backward-compatible Wheeler DDC + Double Helix Correspondence Theorem. -/
 theorem helix_ddc_correspondence
     {Source Binary : Type}
     (sem : Binary → Source → Binary)
@@ -199,7 +279,36 @@ theorem helix_ddc_correspondence
     B_target = spec S_A S_A := by
   rw [← h_twist, h_trust_B]
 
-/-- Non-Vacuity Negative Control:
+-- ==================== NON-VACUITY NEGATIVE CONTROLS ====================
+
+/-- Concrete Ken Thompson Trusting-Trust negative control:
+    Sources: 0 = compiler source `S_A`, 1 = target program `P_target`.
+    Binaries: 10 = clean `A_clean`, 11 = trojan `A_trojan`, 20 = clean `T`, 21 = Stage-1 from `T`,
+              100 = clean target binary, 666 = backdoored target binary.
+    `A_trojan` self-reproduces (`run 11 0 = 11`) yet injects backdoor `666` on `P_target = 1`.
+    Wheeler DDC via `T = 20` catches it (`run (run 20 0) 0 = 10 ≠ 11 = run (run 11 0) 0`). -/
+def toyRun (b s : Nat) : Nat :=
+  match b, s with
+  | 10, 0 => 10   -- clean A compiles S_A -> clean A
+  | 10, _ => 100  -- clean A compiles any other target -> clean 100
+  | 11, 0 => 11   -- trojan A self-reproduces on S_A!
+  | 11, 1 => 666  -- trojan A injects backdoor into P_target!
+  | 11, _ => 100
+  | 20, 0 => 21   -- diverse trusted T compiles S_A -> distinct stage1_T (21)
+  | 21, 0 => 10   -- stage1_T compiles S_A -> clean A (10)
+  | 21, _ => 100  -- stage1_T compiles any other target -> clean 100
+  | _,  _ => 0
+
+def toySpec (_s p : Nat) : Nat :=
+  if p = 0 then 10 else 100
+
+theorem trusting_trust_backdoor_caught :
+    toyRun 11 0 = 11 ∧
+    toyRun 11 1 ≠ toySpec 0 1 ∧
+    toyRun (toyRun 20 0) 0 ≠ toyRun (toyRun 11 0) 0 := by
+  decide
+
+/-- Non-Vacuity Negative Control for SM121 scheduling:
     If a Predator mutation violates a RAW dependency (swapping `r0 := 7` and `r1 := r0 + 1`),
     the resulting schedule genuinely produces a different final register state. -/
 def insWriteR0 : Insn :=
@@ -217,7 +326,11 @@ theorem raw_violation_counterexample :
 
 #print axioms independent_swap_commutes
 #print axioms dag_preserving_perm_sound
+#print axioms wheeler_ddc_stage2_exact
+#print axioms wheeler_ddc_full_correspondence
+#print axioms wheeler_ddc_kills_trusting_trust
 #print axioms helix_ddc_correspondence
+#print axioms trusting_trust_backdoor_caught
 #print axioms raw_violation_counterexample
 
 end HelixSoundness
