@@ -552,6 +552,10 @@ Signed 3-digit layered codebook (`codebook.om`, `main.om`, `codebook.tsv`, Lean 
 
 Runner for the DUAL applicability experiment: runs the pre-registered campaign and writes results.csv, params.txt and results.md under evidence/DUAL/applicability/. make dual-applic-run.
 
+## `tools/migration/`
+
+C-to-OM retirement check: `parity_check.sh` (run by `make check-retirement`, mk/migration.mk) checks docs/migration/PARITY.tsv against the C a change deletes or replaces, with `cfuncs.awk` listing each C file's external functions. See REVIEW-LESSONS.md "C to OM migration".
+
 ## `tools/reservoir/`
 
 Gate 2 tooling for the reservoir (omega#440): in-house zlib inflate and MAT v5 reader, the archived-reference comparison (res_qualify), benchmarks and timing (res_bench), and qualify_reservoir.sh, which writes the content-addressed receipt under evidence/RESERVOIR. No Python; reads the untrusted archive as data only.

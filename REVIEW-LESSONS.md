@@ -71,3 +71,33 @@ The seeded build generates the source line/function counts, encoded word count a
 compiler digest through diaggen size mode, and appends a row only for a new final
 compiler identity. Do not hand-copy those measurements. The independent size-record
 test checks content changes, exact counts and malformed executable refusals.
+
+## C to OM migration
+
+Corrective action for the waves 29-36 change, which took three reviews (findings sorted into
+kinds K1-K5 in its root-cause record). Every change that deletes C, or switches a consumer from
+C to an OM replacement, does these before its first review:
+
+1. Run `make check-retirement` (tools/migration/parity_check.sh over docs/migration/PARITY.tsv).
+   It needs a row for every C file the change deletes and every C file whose same-stem .om it
+   adds or edits outside tests/. A row names the make target holding the C-vs-OM differential
+   and lists every function the C file defines with external linkage, as covered by that
+   target or excluded with a reason; `-` as target means there is no differential, and every
+   function then carries the reason. Its bite controls must fail. A consumer switch waits until
+   the replacement's row has a real differential target (K1: an OM module went live with no
+   test against the C still in the tree).
+2. A check whose input was the C (nm over objects, grep over .c, objdump) must also scan the OM
+   replacement, or be listed as a `check` row with a reason; check-retirement fails otherwise
+   (K2: checks on retired C kept passing while covering nothing).
+3. Derive counts and statuses from the run's own output, never type them from memory. A status
+   such as NOT_APPLICABLE needs its probe's exit status checked; a probe that fails is an
+   error, not evidence (K3).
+4. Parity references are committed goldens generated from a commit on main, with the generator
+   recorded (commit, command, blob and sha256) and the generator removed from the tree in the
+   next commit, as tests/language/parity_golden and tests/visor/effect_golden do. Never pin a
+   branch-only commit and never leave a new C dumper in the tree (K4).
+5. After deleting C, grep the whole tree for its path and stem (`grep -rn '<stem>\.[ch]'
+   Makefile mk/ src/ tests/ tools/ docs/ spec/`) and fix or annotate every hit (K5).
+6. "Covered" in PARITY.tsv means reached on the C reference by the differential's corpus and
+   compared. Measure it (gcov on the C reference build) instead of reasoning from the call
+   graph; record what was measured in the ledger's header.
