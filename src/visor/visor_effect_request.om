@@ -1,8 +1,28 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 Visor lane 7: effect requests.
+note Pure seeded OM-2 Visor lane 7: effect requests, a port of src/visor/visor_effect_request.c
+note (visor_effect_request_build, _classify, _format_text, _format_json), qualified against
+note that C by tests/visor/effect_parity.sh (make test-visor-effect-parity: committed goldens
+note generated from the C at main commit 3f2c70dc5, mutants included).
 note Invariant: THE VISOR CAN ASK. THE VISOR CANNOT GRANT.
 note authorized is ALWAYS false (constant 0). Never mints, grants, or submits.
-note Depends on visor.om.
+note Depends on visor.om and, for the strict object validation, visor_verify.om
+note (vver_validate_object is the OM port of omega_validate_object, vver_eff_code of
+note omega_effect_read's strict v2 decode).
+note
+note The C takes a SemanticId; verq_build and verq_classify take an object index and resolve
+note it through that object's id to the FIRST object with that id, which is the object C's
+note omega_graph_find_object_const returns, so duplicate ids behave as in C.
+note Deliberate differences from the C, each fail closed and none reachable from a graph the
+note OmegaGraph store can hold (V_MAX_OBJS = OMEGA_MAX_GRAPH_OBJECTS = 256 session objects):
+note  D1 verq_build and verq_classify return -1 (classify: needs 1) when the graph holds more
+note     than V_MAX_OBJS objects (C classify does the same; C build cannot see such a graph,
+note     since omega_graph_add_object stops at 256; OM can, while v_og_scratch is set).
+note  D2 an index at or past the object count returns -1 (C takes an id, not an index).
+note  D3 the formatters return the rendered length instead of 0, and -1 when it does not fit
+note     cap bytes (C: -1 when it does not fit n bytes with its NUL).
+note There is no walk depth limit: the walk is an explicit stack over a visited set, as C's
+note Walk, both sized to the store's V_OG_SLOTS slots, and every loop bound is the real maximum
+note (64 relations, 4 operands, 4 input types, V_OG_SLOTS objects), so no valid graph traps.
 
 text verq_t_hdr "effect request (UNAUTHORIZED_REQUEST)\n  effect:     sha256:"
 text verq_t_res "\n  resource:   class "
@@ -34,7 +54,9 @@ global verq_cap_ref uchar 32
 global verq_plen ulong 1
 global verq_pbytes uchar 128
 global verq_digest uchar 32
-global verq_seen uchar 256
+global verq_seen uchar 512
+global verq_stack ulong 512
+global verq_sp ulong 1
 global verq_missing ulong 1
 global verq_needs ulong 1
 
@@ -79,38 +101,54 @@ fn verq_populate idx ulong pb ulong plen ulong to void
   end
 end
 
+note The first object whose id equals the id of object idx (C index_of / find_object_const), or -1.
+fn verq_resolve idx ulong to long
+  cnt = get v_og_cnt 0
+  if gt cnt V_MAX_OBJS
+    ret -1
+  end
+  if ge idx cnt
+    ret -1
+  end
+  og_tmp_from_obj idx
+  ret og_find_by_tmp
+end
+
+note visor_effect_request_build: omega_validate_object, the 178-byte strict v2 decode
+note (omega_effect_read: length, legacy v1, resource 0, param_len, padding) and the canonical
+note digest equal to the stored id. Any failure is -1 with the request left zeroed.
 fn verq_build idx ulong to long
   verq_reset
-  if ge idx get v_og_cnt 0
+  f = verq_resolve idx
+  if lt f 0
     ret -1
   end
-  if or eq get v_og_has_id idx 0 ne get v_og_kind idx V_KIND_EFFECT
+  o = ulong f
+  if or eq get v_og_has_id o 0 ne get v_og_kind o V_KIND_EFFECT
     ret -1
   end
-  if ne get v_og_plen idx 178
+  if ne vver_validate_object o 0
     ret -1
   end
-  pb = mul idx V_MAX_PAYLOAD
-  if eq verq_be pb 0 2 0
+  if ne get v_og_plen o 178
     ret -1
   end
+  if ne vver_eff_code o 0
+    ret -1
+  end
+  pb = mul o V_MAX_PAYLOAD
   plen = verq_be pb 48 2
   if gt plen 128
     ret -1
   end
-  note Verify canonical digest equals stored SemanticId (refuse tampered objects)
-  elen = og_canonical_encode idx
-  if lt elen 0
+  note Digest = sha256(canonical encoding) must equal the stored SemanticId (refuse edited objects)
+  if lt og_hash_encoding o 0
     ret -1
   end
-  for i ulong ulong elen bound 4096
-    put v_sha_in i get v_enc i
-  end
-  sha256_hash ulong elen
-  if not og_id_eq_sha idx
+  if not og_id_eq_sha o
     ret -1
   end
-  verq_populate idx pb plen
+  verq_populate o pb plen
   ret 0
 end
 
@@ -123,100 +161,148 @@ fn verq_is_zero_tmp to bool
   ret true
 end
 
-fn verq_walk idx ulong depth ulong to void
-  if gt depth 32
+note push_ref: the id in v_tmp_id. Zero = field unused; missing = fail closed; seen once.
+fn verq_push_tmp to void
+  if verq_is_zero_tmp
+    ret
+  end
+  ti = og_find_by_tmp
+  if lt ti 0
     put verq_missing 0 1
     ret
   end
-  if ne get verq_seen idx uchar 0
+  t = ulong ti
+  if ne get verq_seen t uchar 0
     ret
   end
-  put verq_seen idx uchar 1
-  k = get v_og_kind idx
-  pb = mul idx V_MAX_PAYLOAD
+  put verq_seen t uchar 1
+  sp = get verq_sp 0
+  put verq_stack sp t
+  put verq_sp 0 add sp 1
+end
+
+fn verq_push_pay pb ulong off ulong to void
+  for i ulong 32
+    put v_tmp_id i get v_og_pay add add pb off i
+  end
+  verq_push_tmp
+end
+
+note object_needs_authority: an EFFECT, or a TYPE whose TypePayload (44 bytes; tag a 4-byte
+note little-endian enum at 0) is tagged capability, effect-intent or effect-receipt ref.
+fn verq_needs_auth o ulong to bool
+  k = get v_og_kind o
   if eq k V_KIND_EFFECT
-    put verq_needs 0 1
+    ret true
   end
-  if eq k V_KIND_TYPE
-    tag = v_dec_u32le_pay pb 0
+  if and eq k V_KIND_TYPE ge get v_og_plen o 44
+    tag = v_dec_u32le_pay mul o V_MAX_PAYLOAD 0
     if or eq tag V_TY_CAP_REF or eq tag V_TY_EFF_INTENT_REF eq tag V_TY_EFF_RECEIPT_REF
-      put verq_needs 0 1
+      ret true
     end
   end
-  rc = get v_og_rcnt idx
-  for r ulong rc bound 4
-    rslot = add mul idx V_MAX_RELS r
-    tb = mul rslot 32
-    for i ulong 32
-      put v_tmp_id i get v_og_rtgt add tb i
+  ret false
+end
+
+note push_payload_refs, at the C struct offsets (aarch64): TypePayload.elem_type 12 (size 44);
+note ValuePayload.type_id 0 (size 98); OperationPayload (size 204) type_id 8, input_types
+note 41 73 105 137, output_type 169; else ApplyPayload (size 161) op_id 0, operand_count 32
+note (at most 4 used), operands 33 65 97 129; an effect that decodes: capability_ref 16.
+fn verq_push_payload_refs o ulong to void
+  k = get v_og_kind o
+  pl = get v_og_plen o
+  pb = mul o V_MAX_PAYLOAD
+  if eq k V_KIND_TYPE
+    if ge pl 44
+      verq_push_pay pb 12
     end
-    if not verq_is_zero_tmp
-      ti = og_find_by_tmp
-      if lt ti 0
-        put verq_missing 0 1
-      else
-        verq_walk ulong ti add depth 1
-      end
-    end
+    ret
   end
   if eq k V_KIND_VALUE
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add pb i
+    if ge pl 98
+      verq_push_pay pb 0
     end
-    if not verq_is_zero_tmp
-      ti = og_find_by_tmp
-      if lt ti 0
-        put verq_missing 0 1
-      else
-        verq_walk ulong ti add depth 1
+    ret
+  end
+  if eq k V_KIND_OP
+    if ge pl 204
+      verq_push_pay pb 8
+      for i ulong 4
+        verq_push_pay pb add 41 mul i 32
+      end
+      verq_push_pay pb 169
+      ret
+    end
+    if ge pl 161
+      verq_push_pay pb 0
+      n = ulong get v_og_pay add pb 32
+      if gt n 4
+        n = 4
+      end
+      for i ulong n bound 4
+        verq_push_pay pb add 33 mul i 32
       end
     end
+    ret
   end
-  if and eq k V_KIND_OP eq get v_og_plen idx 161
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add pb i
-    end
-    oi = og_find_by_tmp
-    if lt oi 0
-      put verq_missing 0 1
-    else
-      verq_walk ulong oi add depth 1
-    end
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add add pb 33 i
-    end
-    a1 = og_find_by_tmp
-    if lt a1 0
-      put verq_missing 0 1
-    else
-      verq_walk ulong a1 add depth 1
-    end
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add add pb 65 i
-    end
-    a2 = og_find_by_tmp
-    if lt a2 0
-      put verq_missing 0 1
-    else
-      verq_walk ulong a2 add depth 1
+  if eq k V_KIND_EFFECT
+    if eq vver_eff_code o 0
+      verq_push_pay pb 16
     end
   end
 end
 
+note Every relation target (at most V_MAX_RELS = OMEGA_MAX_RELATIONS, as C clamps rel_count).
+fn verq_push_rels o ulong to void
+  nrel = get v_og_rcnt o
+  if gt nrel V_MAX_RELS
+    nrel = V_MAX_RELS
+  end
+  for r ulong nrel bound V_MAX_RELS
+    tb = mul og_rslot o r 32
+    for i ulong 32
+      put v_tmp_id i get v_og_rtgt add tb i
+    end
+    verq_push_tmp
+  end
+end
+
+note visor_effect_request_classify: verq_needs = 1 when anything reachable from the object
+note (relations and payload references) needs authority. -1 (verq_needs 1, fail closed) when
+note the object or any referenced non-zero id is missing from the graph.
 fn verq_classify idx ulong to long
   put verq_needs 0 1
   put verq_missing 0 0
-  if ge idx get v_og_cnt 0
+  put verq_sp 0 0
+  f = verq_resolve idx
+  if lt f 0
     ret -1
   end
-  for i ulong 256
+  root = ulong f
+  for i ulong V_OG_SLOTS
     put verq_seen i uchar 0
   end
-  put verq_needs 0 0
-  verq_walk idx 0
+  put verq_seen root uchar 1
+  put verq_stack 0 root
+  put verq_sp 0 1
+  needs = false
+  while gt get verq_sp 0 0 bound V_OG_SLOTS
+    sp = sub get verq_sp 0 1
+    put verq_sp 0 sp
+    o = get verq_stack sp
+    if verq_needs_auth o
+      needs = true
+    end
+    verq_push_rels o
+    verq_push_payload_refs o
+  end
   if ne get verq_missing 0 0
-    put verq_needs 0 1
     ret -1
+  end
+  if needs
+    put verq_needs 0 1
+  else
+    put verq_needs 0 0
   end
   ret 0
 end

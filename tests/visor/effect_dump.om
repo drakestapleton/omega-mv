@@ -1,0 +1,380 @@
+note SPDX-License-Identifier: Apache-2.0
+note effect_dump.om -- the pure OM-2 side of tests/visor/effect_parity.sh. Reads the corpus of
+note one-letter graph commands on stdin, builds the graph with the OM-2 OmegaGraph store
+note (visor.om) and prints, line for line, what the retired C reference dumper printed from
+note visor_effect_request_build, _classify, _format_text, _format_json and
+note visor_world_unattached + visor_world_format_* (the goldens in tests/visor/effect_golden).
+note Commands (one per line; numbers decimal; # and blank lines are skipped):
+note   R reset | O kind add object (current) | L n payload_len | B off v byte | E off nb v
+note   big-endian | W off nb v little-endian | F off j id of object j at off | X off v 32 bytes v
+note   T k j relation k to object j | Y k v relation k to id 32 x v | I compute id | D j show
+note   object | C j classify | M j build and format | G unattached world view
+note Built after visor.om, the units, visor_verify.om, visor_world.om, visor_effect_request.om.
+
+global efd_in uchar 4194304
+global efd_ob uchar 65536
+global efd_on ulong 1
+global efd_d uchar 24
+global efd_a ulong 4
+global efd_cur long 1
+
+fn efd_flush to void
+  n = get efd_on 0
+  if gt n 0
+    k = write 1 efd_ob 0 n
+  end
+  put efd_on 0 0
+end
+
+fn efd_c c ulong to void
+  n = get efd_on 0
+  if ge n 65000
+    efd_flush
+    n = 0
+  end
+  put efd_ob n uchar c
+  put efd_on 0 add n 1
+end
+
+fn efd_t s view uchar * to void
+  n = len s
+  for i ulong n bound 4096
+    efd_c ulong get s i
+  end
+end
+
+fn efd_u v ulong to void
+  k = ulong 0
+  x = v
+  while gt x 9 bound 24
+    put efd_d k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  put efd_d k uchar add 48 x
+  k = add k 1
+  while gt k 0 bound 24
+    k = sub k 1
+    efd_c ulong get efd_d k
+  end
+end
+
+fn efd_i v long to void
+  if lt v 0
+    efd_c 45
+    efd_u ulong sub 0 v
+  else
+    efd_u ulong v
+  end
+end
+
+fn efd_hb b ulong to void
+  h = shr b 4
+  l = and b 15
+  if lt h 10
+    efd_c add 48 h
+  else
+    efd_c add 87 h
+  end
+  if lt l 10
+    efd_c add 48 l
+  else
+    efd_c add 87 l
+  end
+end
+
+text efd_t_full " O full\n"
+text efd_t_tfull " T full\n"
+text efd_t_irc " I rc=-1\n"
+text efd_t_d " D "
+text efd_t_kind " kind="
+text efd_t_has " has="
+text efd_t_id " id="
+text efd_t_cl " C "
+text efd_t_rc " rc="
+text efd_t_needs " needs="
+text efd_t_m " M "
+text efd_t_text " text -1\n"
+text efd_t_json " json -1\n"
+text efd_t_g " G\n"
+text efd_t_q " ? "
+
+fn efd_ln ln ulong to void
+  efd_c 76
+  efd_u ln
+end
+
+fn efd_vob n long to void
+  for i ulong ulong n bound 65536
+    efd_c ulong get v_ob i
+  end
+end
+
+fn efd_pay_off off ulong to ulong
+  ret add mul ulong get efd_cur 0 V_MAX_PAYLOAD off
+end
+
+fn efd_parse s ulong e ulong to void
+  for i ulong 4
+    put efd_a i 0
+  end
+  p = add s 1
+  for i ulong 4
+    while and lt p e eq get efd_in p 32 bound 8192
+      p = add p 1
+    end
+    if ge p e
+      break
+    end
+    d = ulong get efd_in p
+    if or lt d 48 gt d 57
+      break
+    end
+    v = ulong 0
+    while lt p e bound 8192
+      d = ulong get efd_in p
+      if or lt d 48 gt d 57
+        break
+      end
+      v = add mul v 10 sub d 48
+      p = add p 1
+    end
+    put efd_a i v
+  end
+end
+
+fn efd_arg i ulong to ulong
+  ret get efd_a i
+end
+
+note E (big) and W (little): nb bytes of v at payload offset off of the current object.
+fn efd_field msb bool to void
+  off = efd_arg 0
+  nb = efd_arg 1
+  v = efd_arg 2
+  for i ulong nb bound 8
+    sh = mul 8 i
+    if msb
+      sh = mul 8 sub sub nb 1 i
+    end
+    put v_og_pay efd_pay_off add off i uchar and shr v sh 255
+  end
+end
+
+fn efd_ids c ulong to void
+  off = efd_arg 0
+  if eq c 70
+    jb = mul efd_arg 1 32
+    for i ulong 32
+      put v_og_pay efd_pay_off add off i get v_og_id add jb i
+    end
+    ret
+  end
+  for i ulong 32
+    put v_og_pay efd_pay_off add off i uchar and efd_arg 1 255
+  end
+end
+
+fn efd_rel ln ulong c ulong to void
+  cur = ulong get efd_cur 0
+  r = long 0
+  if eq c 84
+    r = og_add_rel cur efd_arg 0 efd_arg 1
+  else
+    for i ulong 32
+      put v_tmp_id i uchar and efd_arg 1 255
+    end
+    r = og_add_rel_tmp cur efd_arg 0
+  end
+  if lt r 0
+    efd_ln ln
+    efd_t efd_t_tfull
+  end
+end
+
+text efd_t_curcmds "LBEWFXTYI"
+
+note A command that edits the current object.
+fn efd_is_cur_cmd c ulong to bool
+  for i ulong 9
+    if eq c ulong get efd_t_curcmds i
+      ret true
+    end
+  end
+  ret false
+end
+
+note Graph commands. true when c is one of them.
+fn efd_graph ln ulong c ulong to bool
+  if eq c 82
+    og_reset
+    put efd_cur 0 -1
+    ret true
+  end
+  if eq c 79
+    r = og_add_object efd_arg 0
+    if lt r 0
+      efd_ln ln
+      efd_t efd_t_full
+    else
+      put efd_cur 0 r
+    end
+    ret true
+  end
+  if not efd_is_cur_cmd c
+    ret false
+  end
+  if lt get efd_cur 0 0
+    ret true
+  end
+  if eq c 76
+    put v_og_plen ulong get efd_cur 0 efd_arg 0
+  end
+  if eq c 66
+    put v_og_pay efd_pay_off efd_arg 0 uchar and efd_arg 1 255
+  end
+  if eq c 69
+    efd_field true
+  end
+  if eq c 87
+    efd_field false
+  end
+  if or eq c 70 eq c 88
+    efd_ids c
+  end
+  if or eq c 84 eq c 89
+    efd_rel ln c
+  end
+  if eq c 73
+    if lt og_compute_id ulong get efd_cur 0 0
+      efd_ln ln
+      efd_t efd_t_irc
+    end
+  end
+  ret true
+end
+
+fn efd_show_d ln ulong to void
+  a0 = efd_arg 0
+  efd_ln ln
+  efd_t efd_t_d
+  efd_u a0
+  efd_t efd_t_kind
+  efd_u get v_og_kind a0
+  efd_t efd_t_has
+  efd_u get v_og_has_id a0
+  efd_t efd_t_id
+  jb = mul a0 32
+  for i ulong 32
+    efd_hb ulong get v_og_id add jb i
+  end
+  efd_c 10
+end
+
+fn efd_show_c ln ulong to void
+  a0 = efd_arg 0
+  rc = verq_classify a0
+  efd_ln ln
+  efd_t efd_t_cl
+  efd_u a0
+  efd_t efd_t_rc
+  efd_i rc
+  efd_t efd_t_needs
+  efd_u get verq_needs 0
+  efd_c 10
+end
+
+note A rendering of length n (or -1) from v_ob, then a newline when nl.
+fn efd_render ln ulong n long nl bool which view uchar * to void
+  if lt n 0
+    efd_ln ln
+    efd_t which
+    ret
+  end
+  efd_vob n
+  if nl
+    efd_c 10
+  end
+end
+
+fn efd_show_m ln ulong to void
+  a0 = efd_arg 0
+  rc = verq_build a0
+  efd_ln ln
+  efd_t efd_t_m
+  efd_u a0
+  efd_t efd_t_rc
+  efd_i rc
+  efd_c 10
+  if eq rc 0
+    efd_render ln verq_format_text 65535 false efd_t_text
+    efd_render ln verq_format_json 65535 true efd_t_json
+  end
+end
+
+fn efd_show_g ln ulong to void
+  efd_ln ln
+  efd_t efd_t_g
+  vwld_unattached
+  efd_render ln vwld_format_text 65535 false efd_t_text
+  efd_render ln vwld_format_json 65535 true efd_t_json
+end
+
+fn efd_line ln ulong s ulong e ulong to void
+  c = ulong get efd_in s
+  efd_parse s e
+  if efd_graph ln c
+    ret
+  end
+  if eq c 68
+    efd_show_d ln
+    ret
+  end
+  if eq c 67
+    efd_show_c ln
+    ret
+  end
+  if eq c 77
+    efd_show_m ln
+    ret
+  end
+  if eq c 71
+    efd_show_g ln
+    ret
+  end
+  efd_ln ln
+  efd_t efd_t_q
+  efd_c c
+  efd_c 10
+end
+
+fn main to int
+  og_reset
+  put efd_cur 0 -1
+  total = ulong 0
+  while lt total 4194304 bound 100000
+    r = read 0 efd_in total sub 4194304 total
+    if le r 0
+      break
+    end
+    total = add total ulong r
+  end
+  start = ulong 0
+  ln = ulong 0
+  p = ulong 0
+  while lt p total bound 4194305
+    if eq get efd_in p 10
+      ln = add ln 1
+      if gt p start
+        c = get efd_in start
+        if ne c 35
+          efd_line ln start p
+        end
+      end
+      start = add p 1
+    end
+    p = add p 1
+  end
+  efd_flush
+  ret 0
+end
