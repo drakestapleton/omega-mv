@@ -33,10 +33,13 @@
 #   2. runtime-linked suites test-visor-world, test-visor-authority (pinned library)
 #   3. CPU regression gates (build/q8reg); GPU/silicon targets are never run
 #   4. the console campaign (runner) on the release binary, then on an ASan+UBSan build
+#      when the sanitizer flags reach the omega build (`make -n` shows -fsanitize=);
+#      omega built from OM-2 by seed/out/omc does not use CC, so then the receipt records
+#      the sanitizer pass as NOT_APPLICABLE with the OM-2 trap list, never as RUN
 #   5. five gates -> verdict OMEGA_VISOR_V1_PASS / OMEGA_VISOR_V1_FAIL
 # Verdict PASS needs all five gates PASS, a tree that did not change during the run
 # (HEAD and each dirty file's sha256), the Aienux library built from aienos.lock and the
-# physics checkout at physics.lock. The ASan pass is recorded but, as before, does not
+# physics checkout at physics.lock. The sanitizer pass is recorded but, as before, does not
 # gate the verdict. Builds only into private OUT_DIRs; never touches build/ itself
 # (except the pre-existing test-m5 QEMU path, see non_claims).
 # Shell and coreutils only (git, sha256sum, grep, sed, awk, sort, tar, make, flock).
@@ -221,10 +224,18 @@ while IFS=$'\t' read -r sec name detail; do
 done <<< "$FAILED_CASES"
 
 asan_json='{"status": "NOT_RUN"}'
-if [ "$NO_ASAN" -eq 0 ]; then
+ASAN_CC="CC=cc -fsanitize=address,undefined -fno-omit-frame-pointer -g"
+# A sanitizer result is only recorded when the sanitizer flags actually reach the omega build.
+# omega is built from OM-2 by seed/out/omc, which ignores CC; then there is no sanitizer run to report.
+asan_applies=1
+if [ "$NO_ASAN" -eq 0 ] && ! make -n OUT_DIR="$ASAN_OUT" "${PF[@]}" "$ASAN_CC" -B "$ASAN_OUT/omega" 2>/dev/null | grep -q -e '-fsanitize='; then
+    asan_applies=0
+    asan_json='{"status": "NOT_APPLICABLE", "reason": "omega is built from OM-2 by seed/out/omc, which does not use CC, so no sanitizer build exists", "om2_traps": "out-of-range array get/put, signed overflow, divide by zero, out-of-range shift amounts, out-of-range conversions (docs/one_layer/OMEGESE.md 9.3); unsigned arithmetic wraps", "not_replaced": "alignment, use-after-free and leak checks"}'
+fi
+if [ "$NO_ASAN" -eq 0 ] && [ "$asan_applies" -eq 1 ]; then
     rm -rf "$ASAN_OUT"
     flock "$BENCH_LOCK" make OUT_DIR="$ASAN_OUT" "${PF[@]}" \
-        "CC=cc -fsanitize=address,undefined -fno-omit-frame-pointer -g" "$ASAN_OUT/omega" > "$LOGS/asan-build.log" 2>&1
+        "$ASAN_CC" "$ASAN_OUT/omega" > "$LOGS/asan-build.log" 2>&1
     asan_brc=$?
     ALOG=$LOGS/runner-asan.log
     flock "$BENCH_LOCK" env QUAL_WORK="$ASAN_OUT/qual-work" bash tests/visor/qualification/run_qualification.sh "$ASAN_OUT/omega" > "$ALOG" 2>&1
