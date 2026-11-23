@@ -81,10 +81,6 @@ text t_ee_env_c2m "EST_TEST_C2_MARKS_SHA"
 text t_ee_env_c1 "EST_TEST_C1_SHA"
 text t_ee_env_v2d "EST_TEST_V2_DOC_SHA"
 text t_ee_env_tmp "TMPDIR"
-text t_ee_tmp_def "/tmp"
-text t_ee_px_pre "/est_eval_prefix_"
-text t_ee_px_fn "/prefix.ndjson"
-text t_ee_tmpl "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 text t_ee_proc_exe "/proc/self/exe"
 text t_ee_unavail "unavailable"
 text t_ee_ms_ndj "machine-state.ndjson"
@@ -324,8 +320,6 @@ global g_ee_res ulong 16
 global g_ee_mxk ulong 1
 global g_ee_mxw f64 3
 global g_ee_mxv f64 3
-global g_ee_tmp uchar 1200
-global g_ee_tlen ulong 1
 
 note g_ee_hex slots (65 bytes each): 0 params, 1 pdoc, 2 interp, 3 binary, 4 v1 params, 5 receipt,
 note 6 raw file after evaluation. g_ee_arg slot 6 holds /proc/self/exe.
@@ -1622,14 +1616,6 @@ fn ee_open_stream m ulong to int
   ret ee_open_excl view buf n
 end
 
-fn ee_load_tmp pl ulong to long
-  buf = new uchar 1200 0
-  for i ulong pl
-    put buf i get g_ee_tmp i
-  end
-  ret er_file_load_raw 1 view buf pl
-end
-
 fn ee_json_ep1_path to void
   buf = new uchar 1024 0
   n = get g_ep1_plen 0
@@ -1656,126 +1642,50 @@ fn ee_json_ep2 which ulong to void
   ob_json_str view buf n
 end
 
-note ---- prefix invariance (C prefix_check) ----
+note ---- prefix invariance (direct in-memory est_replay_run 0 k, zero tempfiles) ----
 
-fn ee_tmp_add s view uchar * n ulong to void
-  p = get g_ee_tlen 0
-  for i ulong n
-    put g_ee_tmp add p i get s i
-  end
-  put g_ee_tlen 0 add p n
-end
-
-note mkdtemp: TMPDIR (or /tmp) + /est_eval_prefix_XXXXXX; the dir length goes to dlen[0].
-note The C formed the template with snprintf into char dir[600]: a TMPDIR longer than 576 bytes
-note (576 + 23 = 599) truncated the XXXXXX suffix, so mkdtemp failed and prefix_check returned 0.
-note A value that long is refused here the same way, never shortened or replaced by /tmp.
-note ee_tmpdir reads the first TMPDIR entry through a buffer that holds any Linux environment
-note entry (MAX_ARG_STRLEN 131072 with its NUL), so a long value is measured, not skipped as
-note er_getenv's 4096-byte read would skip it (envread -105). It returns the value length (the
-note first 600 bytes copied to dst) or -1 when TMPDIR is not set.
-global g_ee_envbig uchar 131080
-
-fn ee_tmpdir_is_key kn ulong to bool
-  if ne get g_ee_envbig kn 61
+fn ee_tmpdir_is_key buf view uchar 16384 kn ulong to bool
+  if ne get buf kn 61
     ret false
   end
   for j ulong kn
-    if ne get g_ee_envbig j get t_ee_env_tmp j
+    if ne get buf j get t_ee_env_tmp j
       ret false
     end
   end
   ret true
 end
 
-fn ee_tmpdir_copy dst edit uchar 600 off ulong vn ulong to void
-  cn = vn
-  if gt cn 600
-    cn = 600
-  end
-  for j ulong cn
-    put dst j get g_ee_envbig add off j
-  end
-end
-
-fn ee_tmpdir dst edit uchar 600 to long
+note Preserve CLI parity on TMPDIR checks (<= 576 bytes and accessible directory) without
+note creating temp directories, writing prefix files to disk, or allocating a 131 KiB BSS global.
+fn ee_tmpdir_ok to bool
+  buf = new uchar 16384 0
   ec = envcnt
   if le ec 0
-    ret -1
+    ret true
   end
   kn = len t_ee_env_tmp
   for i ulong ulong ec
-    r = envread i g_ee_envbig 0 131080
+    r = envread i buf 0 16384
     if gt r long kn
-      if ee_tmpdir_is_key kn
+      if ee_tmpdir_is_key view buf kn
         vn = sub ulong r add kn 1
-        ee_tmpdir_copy dst add kn 1 vn
-        ret long vn
+        if eq vn 0
+          ret true
+        end
+        if gt vn 576
+          ret false
+        end
+        ret eq faccess buf add kn 1 vn int 3 0
       end
     end
   end
-  ret -1
+  ret true
 end
 
-fn ee_mkdtemp dlen edit ulong 1 to bool
-  env = new uchar 600 0
-  rb = new uchar 6 0
-  put g_ee_tlen 0 0
-  r = ee_tmpdir env
-  if gt r 576
-    ret false
-  end
-  if gt r 0
-    ee_tmp_add view env ulong r
-  else
-    ee_tmp_add t_ee_tmp_def len t_ee_tmp_def
-  end
-  ee_tmp_add t_ee_px_pre len t_ee_px_pre
-  base = get g_ee_tlen 0
-  for tries ulong 100
-    ign = random rb 0 6 0
-    for i ulong 6
-      put g_ee_tmp add base i get t_ee_tmpl rem ulong get rb i 62
-    end
-    mk = makedir g_ee_tmp 0 add base 6 448
-    if eq mk 0
-      put dlen 0 add base 6
-      put g_ee_tlen 0 add base 6
-      ret true
-    end
-    if ne mk -17
-      ret false
-    end
-  end
-  ret false
-end
-
-note write the first k lines of file slot 0 (each with a newline) to the path in g_ee_tmp
-fn ee_write_prefix pl ulong k ulong to long
-  fd = fopen g_ee_tmp 0 pl 577 438
-  if lt fd 0
-    ret 1
-  end
-  ob_init int fd
-  for i ulong k bound ER_UNB
-    o = er_line_at 0 i
-    for j ulong get g_ef_llen i bound ER_UNB
-      ob_c get g_ef_data add o j
-    end
-    ob_nl
-  end
-  ob_flush
-  bad = get g_ob_err 0
-  cr = fclose int fd
-  if or ne bad 0 ne cr 0
-    ret 1
-  end
-  ret 0
-end
-
-note replay the prefix file (slot 1) into replay slot 3 for model m and compare with slot m
-fn ee_prefix_model m ulong to ulong
-  if ne est_replay_run 1 ER_ALL_LINES m get g_ee_q m get g_ee_r m 3 0
+note replay the first k lines of file slot 0 in memory into replay slot 3 for model m and compare with slot m
+fn ee_prefix_model k ulong m ulong to ulong
+  if ne est_replay_run 0 k m get g_ee_q m get g_ee_r m 3 0
     ret 0
   end
   nn = get g_rp_meta 48
@@ -1791,14 +1701,11 @@ fn ee_prefix_model m ulong to ulong
 end
 
 fn ee_prefix_check nm ulong to ulong
-  dl = new ulong 1 0
   ok = ulong 1
   ran = ulong 0
-  if not ee_mkdtemp dl
+  if not ee_tmpdir_ok
     ret 0
   end
-  ee_tmp_add t_ee_px_fn len t_ee_px_fn
-  pl = get g_ee_tlen 0
   ks = new ulong 3 0
   put ks 0 100
   put ks 1 500
@@ -1809,24 +1716,14 @@ fn ee_prefix_check nm ulong to ulong
       ok = 0
       continue
     end
-    if ne ee_write_prefix pl k 0
-      ok = 0
-      break
-    end
-    if ne ee_load_tmp pl 0
-      ok = 0
-      break
-    end
     for m ulong nm
-      if eq ee_prefix_model m 0
+      if eq ee_prefix_model k m 0
         ok = 0
       end
     end
     ran = add ran 1
   end
   put g_ee_res 3 ran
-  ign = unlink g_ee_tmp 0 pl
-  ign2 = rmdir g_ee_tmp 0 get dl 0
   ret ok
 end
 
