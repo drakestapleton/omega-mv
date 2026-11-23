@@ -17,6 +17,8 @@
 # qualify_visor.sh -- Omega Visor V1 qualification glue (lane 8).
 #
 #   tools/qualify_visor.sh [--skip-regression] [--no-asan] [out-dir]   (default out-dir: evidence/VISOR)
+#   tools/qualify_visor.sh --asan-probe-only   (step 4's sanitizer dry run alone: prints
+#       ASAN_PROBE applies=<0|1> json=<the receipt's asan record>; tests/visor/test_qualify_asan_probe.sh)
 #
 # Runs the make targets and tests/visor/qualification/run_qualification.sh, collects
 # their counts and writes ONE new receipt <out-dir>/<sha256 of its own bytes>.json.
@@ -35,7 +37,9 @@
 #   4. the console campaign (runner) on the release binary, then on an ASan+UBSan build
 #      when the sanitizer flags reach the omega build (`make -n` shows -fsanitize=);
 #      omega built from OM-2 by seed/out/omc does not use CC, so then the receipt records
-#      the sanitizer pass as NOT_APPLICABLE with the OM-2 trap list, never as RUN
+#      the sanitizer pass as NOT_APPLICABLE with the OM-2 trap list, never as RUN; a dry run
+#      that itself fails (non-zero exit) is recorded as ERROR with its exit status, never as
+#      NOT_APPLICABLE (QUALIFY_VISOR_MAKE overrides the make of that dry run, for its test)
 #   5. five gates -> verdict OMEGA_VISOR_V1_PASS / OMEGA_VISOR_V1_FAIL
 # Verdict PASS needs all five gates PASS, a tree that did not change during the run
 # (HEAD and each dirty file's sha256), the Aienux library built from aienos.lock and the
@@ -52,13 +56,15 @@ cd "$HERE" || exit 2
 
 SKIP_REG=0
 NO_ASAN=0
+PROBE_ONLY=0
 OUTDIR=evidence/VISOR
 for a in "$@"; do
     case "$a" in
         --skip-regression) SKIP_REG=1 ;;
         --no-asan) NO_ASAN=1 ;;
+        --asan-probe-only) PROBE_ONLY=1 ;;
         -h|--help) sed -n '2,4p' "$0"; exit 0 ;;
-        -*) echo "usage: tools/qualify_visor.sh [--skip-regression] [--no-asan] [out-dir]" >&2; exit 2 ;;
+        -*) echo "usage: tools/qualify_visor.sh [--skip-regression] [--no-asan] [--asan-probe-only] [out-dir]" >&2; exit 2 ;;
         *) OUTDIR=$a ;;
     esac
 done
@@ -90,6 +96,38 @@ tree_state() {   # -> "<dirty-file JSON array body>" ; one element per `git stat
     printf '%s' "$out"
 }
 
+PF=(PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 AIENOS_R7_DIR="$HERE/$Q/aienos")
+ASAN_CC="CC=cc -fsanitize=address,undefined -fno-omit-frame-pointer -g"
+QV_MAKE=${QUALIFY_VISOR_MAKE:-make}
+
+# Step 4's dry run: do the sanitizer flags reach the omega build? Sets asan_applies (1 only when
+# `make -n` succeeds and shows -fsanitize=) and, when they do not, asan_json. A failed dry run
+# is an ERROR record with its exit status: it proves nothing about the build.
+# $1: file for the dry run's stderr.
+asan_probe() {
+    local out rc
+    asan_applies=0
+    out=$("$QV_MAKE" -n OUT_DIR="$ASAN_OUT" "${PF[@]}" "$ASAN_CC" -B "$ASAN_OUT/omega" 2>"$1")
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        asan_json="{\"status\": \"ERROR\", \"reason\": \"the sanitizer dry run (make -n of the omega build) exited $rc, so whether the sanitizer flags reach the omega build is unknown; no sanitizer run\", \"dry_run_exit\": $rc, \"stderr\": \"$(json_str "$(head -c 2000 "$1")")\"}"
+    elif printf '%s\n' "$out" | grep -q -e '-fsanitize='; then
+        asan_applies=1
+    else
+        asan_json='{"status": "NOT_APPLICABLE", "reason": "omega is built from OM-2 by seed/out/omc, which does not use CC, so no sanitizer build exists", "dry_run_exit": 0, "om2_traps": "out-of-range array get/put, signed overflow, divide by zero, out-of-range shift amounts, out-of-range conversions (docs/one_layer/OMEGESE.md 9.3); unsigned arithmetic wraps", "not_replaced": "alignment, use-after-free and leak checks"}'
+    fi
+}
+
+if [ "$PROBE_ONLY" -eq 1 ]; then
+    perr=$(mktemp)
+    asan_json='{"status": "NOT_RUN"}'
+    asan_probe "$perr"
+    rm -f "$perr"
+    [ "$asan_applies" -eq 1 ] && asan_json='{"status": "WOULD_RUN"}'
+    echo "ASAN_PROBE applies=$asan_applies json=$asan_json"
+    exit 0
+fi
+
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 head0=$(git rev-parse HEAD)
 tree0=$(git rev-parse 'HEAD^{tree}')
@@ -118,7 +156,6 @@ hdr_sha=null; [ -f "$Q/aienos/native/capability/aienos_capability.h" ] &&
     hdr_sha="\"$(sha256sum "$Q/aienos/native/capability/aienos_capability.h" | awk '{print $1}')\""
 
 # ---- suites -----------------------------------------------------------------
-PF=(PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 AIENOS_R7_DIR="$HERE/$Q/aienos")
 RT=(PHYSICS_DIR="$PHYSICS_DIR" AIENOS_R7_DIR="$HERE/$Q/aienos" VISOR_AUTH_CAP_LIB="$HERE/$LIB")
 FREE_SUITES=(test-visor-semantic test-language test-visor-verify test-visor-evidence
              test-visor-machine test-visor-realization test-visor-console)
@@ -224,14 +261,11 @@ while IFS=$'\t' read -r sec name detail; do
 done <<< "$FAILED_CASES"
 
 asan_json='{"status": "NOT_RUN"}'
-ASAN_CC="CC=cc -fsanitize=address,undefined -fno-omit-frame-pointer -g"
 # A sanitizer result is only recorded when the sanitizer flags actually reach the omega build.
-# omega is built from OM-2 by seed/out/omc, which ignores CC; then there is no sanitizer run to report.
-asan_applies=1
-if [ "$NO_ASAN" -eq 0 ] && ! make -n OUT_DIR="$ASAN_OUT" "${PF[@]}" "$ASAN_CC" -B "$ASAN_OUT/omega" 2>/dev/null | grep -q -e '-fsanitize='; then
-    asan_applies=0
-    asan_json='{"status": "NOT_APPLICABLE", "reason": "omega is built from OM-2 by seed/out/omc, which does not use CC, so no sanitizer build exists", "om2_traps": "out-of-range array get/put, signed overflow, divide by zero, out-of-range shift amounts, out-of-range conversions (docs/one_layer/OMEGESE.md 9.3); unsigned arithmetic wraps", "not_replaced": "alignment, use-after-free and leak checks"}'
-fi
+# omega is built from OM-2 by seed/out/omc, which ignores CC; then there is no sanitizer run to
+# report (NOT_APPLICABLE). A dry run that fails is recorded as ERROR (asan_probe).
+asan_applies=0
+[ "$NO_ASAN" -eq 0 ] && asan_probe "$LOGS/asan-probe.err"
 if [ "$NO_ASAN" -eq 0 ] && [ "$asan_applies" -eq 1 ]; then
     rm -rf "$ASAN_OUT"
     flock "$BENCH_LOCK" make OUT_DIR="$ASAN_OUT" "${PF[@]}" \

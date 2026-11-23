@@ -1,7 +1,7 @@
 # Omega Visor V1 lane 7 (effect requests) and lane 6 (World view): differential qualification of
 # the OM-2 modules the omega binary runs (src/visor/visor_effect_request.om, visor_world.om)
-# against the C they replace (src/visor/visor_effect_request.c, visor_world.c). Host only, CPU
-# only, no physics checkout.
+# against the C they replace (src/visor/visor_effect_request.c, visor_world.c), and the probe test
+# of tools/qualify_visor.sh. Host only, CPU only, no physics checkout.
 #
 # test-visor-effect-parity
 #   1. tests/visor/effect_parity.sh: the graph corpora (tests/visor/effect_corpus.txt and the
@@ -12,7 +12,9 @@
 #   2. tests/visor/effect_mutants.sh: every mutant of the OM lane must differ from the goldens;
 #   3. tests/visor/check_world_unattached.sh on $(OMEGA_OM_SRCS): omega can only render the
 #      unattached World view (the one the goldens pin), with three bite controls that must fail.
-.PHONY: test-visor-effect-parity
+# test-qualify-visor-probe: tests/visor/test_qualify_asan_probe.sh (the sanitizer dry run records
+#   NOT_APPLICABLE only when `make -n` succeeds without -fsanitize=, ERROR when it fails).
+.PHONY: test-visor-effect-parity test-qualify-visor-probe
 test-visor-effect-parity: $(VISOR_OMC)
 	EFFECT_PARITY_WORK=$(abspath $(OUT_DIR))/effect-parity sh tests/visor/effect_parity.sh $(abspath $(VISOR_OMC))
 	EFFECT_PARITY_WORK=$(abspath $(OUT_DIR))/effect-parity sh tests/visor/effect_mutants.sh $(abspath $(VISOR_OMC))
@@ -25,3 +27,6 @@ test-visor-effect-parity: $(VISOR_OMC)
 	grep -v '^  vwld_unattached$$' tools/omega_ops.om > $$d/omega_ops2.om; \
 	if sh tests/visor/check_world_unattached.sh src/visor/visor_world.om $$d/omega_ops2.om > $$d/3.out; then echo "WORLD_UNATTACHED BITE FAIL: a rendering without vwld_unattached passed"; exit 1; fi; n=$$((n + 1)); \
 	echo "WORLD_UNATTACHED bite controls: $$n/3 caught"
+
+test-qualify-visor-probe:
+	sh tests/visor/test_qualify_asan_probe.sh
