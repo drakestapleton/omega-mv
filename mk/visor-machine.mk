@@ -6,8 +6,12 @@
 VISOR_BW_CORE = omega_vector omega_blackwell_qmd omega_blackwell_encoder omega_blackwell_realize
 VISOR_BW_OBJS = $(addprefix $(OUT_DIR)/,$(addsuffix .o,$(filter-out $(VISOR_CORE),$(VISOR_BW_CORE))))
 
-$(OUT_DIR)/tests-visor/test_visor_machine: tests/visor/test_visor_machine.c $(VISOR_CORE_OBJS) $(VISOR_BW_OBJS) $(VISOR_OBJS) $(LANG_OBJS) | $(OUT_DIR)/tests-visor
-	$(CC) $(VISOR_CFLAGS) -Itests/visor -o $@ $< $(VISOR_CORE_OBJS) $(VISOR_BW_OBJS) $(VISOR_OBJS) $(LANG_OBJS)
+# test_visor_machine: pure seeded OM-2 (tests/visor/test_visor_machine.om), built by
+# $(VISOR_OMC) from the machine module and the shared Visor core.
+VISOR_MACHINE_OM_SRCS = src/visor/visor.om src/visor/visor_machine.om
+
+$(OUT_DIR)/tests-visor/test_visor_machine: tests/visor/test_visor_machine.om $(VISOR_MACHINE_OM_SRCS) $(VISOR_OMC) | $(OUT_DIR)/tests-visor
+	(printf 'om2\n'; sed '/^om2$$/d' $(VISOR_MACHINE_OM_SRCS) tests/visor/test_visor_machine.om) | $(VISOR_OMC) > $@ && chmod +x $@
 
 $(OUT_DIR)/tests-visor/test_visor_realization: tests/visor/test_visor_realization.c $(VISOR_CORE_OBJS) $(VISOR_BW_OBJS) $(VISOR_OBJS) $(LANG_OBJS) | $(OUT_DIR)/tests-visor
 	$(CC) $(VISOR_CFLAGS) -Itests/visor -o $@ $< $(VISOR_CORE_OBJS) $(VISOR_BW_OBJS) $(VISOR_OBJS) $(LANG_OBJS)
