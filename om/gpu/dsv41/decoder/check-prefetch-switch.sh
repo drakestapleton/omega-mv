@@ -42,8 +42,10 @@ case_ 10 lower-case "dsv41_arboris_prefetch=0"
 case_ 10 big-entry-unset "$big"
 case_ 11 big-entry-zero "$big" "$k=0"
 case_ 11 zero-among-others "A=1" "$k=0" "Z=2"
-# A repeated key cannot be produced with env(1), which keeps one value per name; the parser
-# refuses a second matching entry (prefetch-switch.om, "if seen").
+# Repeated names: env(1) keeps one value per name, so the control re-runs itself through execenv.
+"$bin" dup 2> /dev/null
+got=$?
+if [ "$got" = 0 ]; then echo "PASS repeated-name (0)"; else echo "FAIL repeated-name got $got"; fail=1; fi
 
 if [ "$fail" = 0 ]; then echo "PREFETCH-SWITCH PASS"; else echo "PREFETCH-SWITCH FAIL"; fi
 exit "$fail"

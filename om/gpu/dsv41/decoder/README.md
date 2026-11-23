@@ -97,7 +97,9 @@ chmod +x "$out/dsv41-decode"
 
 ### Arboris prefetch switch
 
-`gen` and `chat` run the online Arboris cross-layer prefetcher by default. Set `DSV41_ARBORIS_PREFETCH=0` to turn it off for a matched A/B run; unset or `1` keeps it on. Any other value, a repeated entry or an unreadable environment entry is refused with exit 64 and the line `dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1`. Arboris still learns co-activations in both arms; only dispatch and publication of prefetched experts change. `layer0` parity mode always runs with the prefetcher off, whatever the variable says. The final stats line reports the arm that ran: `ARBORIS pf_dispatched=N pf_hits=N pf_enabled=0|1`.
+`gen` and `chat` run the online Arboris cross-layer prefetcher by default. Set `DSV41_ARBORIS_PREFETCH=0` to turn it off for a matched A/B run; unset or `1` keeps it on. The variable is checked in every mode before any input is opened: any other value, a repeated entry or an unreadable environment entry is refused with exit 64 and the line `dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1`. `dfStartWorkers` applies the setting when it starts the payload workers. `layer0` parity mode always starts them with the prefetcher off. Arboris still learns co-activations in both arms; only dispatch and publication of prefetched experts change. The final stats line reports the setting and what it did: `ARBORIS pf_dispatched=N pf_hits=N pf_enabled=0|1`. `pf_enabled=1` alone does not show that anything was prefetched. A valid on arm also needs `pf_dispatched` above zero, and a valid off arm needs `pf_dispatched=0 pf_hits=0`.
+
+The prefetcher only proposes experts that are not resident. Arboris learns edges toward experts the router has already chosen, and those experts were loaded and stay resident until the FIFO slot table evicts them. So the prefetcher dispatches nothing until distinct routed experts exceed the resident slots (4400 in `gen` and `chat`). A workload that never fills the slot table cannot show a prefetch effect.
 
 Host controls (no GPU):
 
@@ -107,7 +109,7 @@ chmod +x "$out/check-prefetch-switch"
 sh "$d/check-prefetch-switch.sh" "$out/check-prefetch-switch"
 ```
 
-`check-arboris-prefetch.om` replaces `decode-cli.om` in the decoder composition above and takes the layer-1 sidecar and shard 04. Besides scoring, domain shift and asynchronous publication, it checks that the off arm dispatches nothing, leaves nothing in flight and publishes nothing.
+`check-arboris-prefetch.om` replaces `decode-cli.om` in the decoder composition above and takes the layer-1 sidecar and shard 04. Besides scoring, domain shift and asynchronous publication, it starts real workers with the prefetcher off. It then checks that a trained high-confidence query dispatches nothing, leaves nothing in flight, records no hit, changes no slot, and draws no worker reply within 200 ms. These controls run by hand: no gate under `tests/gates` covers the dsv41 decoder.
 
 Inside an authorized Spark GB10 window:
 
