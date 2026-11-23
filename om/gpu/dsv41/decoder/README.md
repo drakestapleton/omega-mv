@@ -90,10 +90,24 @@ chmod +x "$out"/check-*
      om/encoder/bw_enc_sm121.om om/gpu/dsv41/emit.om om/gpu/dsv41/head/launch.om \
      "$d/checkpoint.om" "$d/io.om" "$d/core.om" "$d/kv.om" "$d/lease.om" "$d/resolve.om" \
      "$d/engram-layout.om" "$d/engram.om" "$d/trace.om" "$d/native.om" \
-     "$d/layer-map.om" "$d/rope.om" "$d/workspace.om" "$d/forward.om" "$d/decode-cli.om") |
+     "$d/layer-map.om" "$d/rope.om" "$d/workspace.om" "$d/forward.om" "$d/prefetch-switch.om" "$d/decode-cli.om") |
     seed/out/omc > "$out/dsv41-decode"
 chmod +x "$out/dsv41-decode"
 ```
+
+### Arboris prefetch switch
+
+`gen` and `chat` run the online Arboris cross-layer prefetcher by default. Set `DSV41_ARBORIS_PREFETCH=0` to turn it off for a matched A/B run; unset or `1` keeps it on. Any other value, a repeated entry or an unreadable environment entry is refused with exit 64 and the line `dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1`. Arboris still learns co-activations in both arms; only dispatch and publication of prefetched experts change. `layer0` parity mode always runs with the prefetcher off, whatever the variable says. The final stats line reports the arm that ran: `ARBORIS pf_dispatched=N pf_hits=N pf_enabled=0|1`.
+
+Host controls (no GPU):
+
+```sh
+(echo om2 && cat "$d/prefetch-switch.om" "$d/check-prefetch-switch.om") | seed/out/omc > "$out/check-prefetch-switch"
+chmod +x "$out/check-prefetch-switch"
+sh "$d/check-prefetch-switch.sh" "$out/check-prefetch-switch"
+```
+
+`check-arboris-prefetch.om` replaces `decode-cli.om` in the decoder composition above and takes the layer-1 sidecar and shard 04. Besides scoring, domain shift and asynchronous publication, it checks that the off arm dispatches nothing, leaves nothing in flight and publishes nothing.
 
 Inside an authorized Spark GB10 window:
 
