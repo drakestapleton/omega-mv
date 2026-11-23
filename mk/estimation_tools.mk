@@ -7,7 +7,7 @@
 ifndef ESTIMATION_TOOLS_MK
 ESTIMATION_TOOLS_MK := 1
 include mk/estimation.mk
-.PHONY: test-est-tools est-tools-purity est-tools
+.PHONY: test-est-tools est-tools-purity est-tools test-est-replay-parity
 ESTT_DIR = $(OUT_DIR)/est-tools
 ESTT_CFLAGS = $(EST_CFLAGS) -Itools/estimation
 ESTT_LIB = tools/estimation/est_replay.c src/estimation/est_mix.c $(EST_KF_SRCS)
@@ -53,6 +53,10 @@ $(ESTT_DIR)/est_eval: $(ESTT_OM_LIB) $(ESTT_DIR)/toolid.om tools/estimation/est_
 	cat $(ESTT_OM_LIB) $(ESTT_DIR)/toolid.om tools/estimation/est_eval.om | $(ESTT_OMC) > $@ && chmod +x $@
 $(ESTT_DIR)/est_eval_t: $(ESTT_OM_LIB) $(ESTT_DIR)/toolid_t.om tools/estimation/est_eval.om $(ESTT_OMC)
 	cat $(ESTT_OM_LIB) $(ESTT_DIR)/toolid_t.om tools/estimation/est_eval.om | $(ESTT_OMC) > $@ && chmod +x $@
+# the C est_replay (est_replay.c's own main) as the parity reference for the OM-2 est_replay
+$(ESTT_DIR)/est_replay_c: $(ESTT_LIB) $(ESTT_HDRS)
+	@mkdir -p $(ESTT_DIR)
+	$(CC) $(ESTT_CFLAGS) -DEST_REPLAY_MAIN -o $@ $(ESTT_LIB) -lm
 $(ESTT_DIR)/test_est_tools: tools/estimation/test_est_tools.c $(ESTT_LIB) $(ESTT_HDRS)
 	@mkdir -p $(ESTT_DIR)
 	$(CC) $(ESTT_CFLAGS) -o $@ tools/estimation/test_est_tools.c $(ESTT_LIB) -lm
@@ -66,7 +70,12 @@ est-tools-purity: est-purity $(ESTT_DIR)/est_replay.o
 		$(ESTT_OM_LIB) $(ESTT_OM_MAINS) || { echo "an OM-2 estimation tool uses a process, socket, mapping or device word"; exit 1; }
 	@echo "est-tools-purity: est_replay.o and the OM-2 tool sources use no authority/process operation; est_types.o and est_kf.o pure"
 
-test-est-tools: est-tools-purity $(ESTT_DIR)/est_fit $(ESTT_DIR)/est_eval $(ESTT_DIR)/est_eval_t $(ESTT_DIR)/test_est_tools
+# no input-size cap: more than 8192 steps, 16384 lines, 2 MiB, 8 KiB lines and 64 KiB SHA256SUMS,
+# byte for byte as the C est_replay
+test-est-replay-parity: $(ESTT_DIR)/est_replay $(ESTT_DIR)/est_replay_c
+	sh tools/estimation/test_est_replay_parity.sh ./$(ESTT_DIR)/est_replay_c ./$(ESTT_DIR)/est_replay $(ESTT_DIR)/work-parity
+
+test-est-tools: est-tools-purity test-est-replay-parity $(ESTT_DIR)/est_fit $(ESTT_DIR)/est_eval $(ESTT_DIR)/est_eval_t $(ESTT_DIR)/test_est_tools
 	rm -rf $(ESTT_DIR)/work
 	./$(ESTT_DIR)/test_est_tools ./$(ESTT_DIR)/est_fit ./$(ESTT_DIR)/est_eval ./$(ESTT_DIR)/est_eval_t $(ESTT_DIR)/work
 	@echo "test-est-tools: replay, fit and evaluation tools pass on run A and synthetic data"

@@ -15,9 +15,15 @@ const EST_M2_FLOOR f64 833.3333333333334
 const EST_M2_K ulong 3
 const EST_M2_ITERS ulong 1000
 
-const EF_MAX_BYTES ulong 2097152
-const EF_MAX_LINES ulong 16384
-const RP_MAX_STEPS ulong 8192
+note No input-size cap: file bytes, lines, replay steps and EM samples live in run-time pools
+note (global NAME T *) grown with enlarge, as est_replay.c grows its buffers with realloc.
+note ER_UNB bounds the loops over them: no input that fits in memory reaches it.
+const ER_UNB ulong 4611686018427387904
+note replay every line of the file (est_replay.c's SIZE_MAX limit)
+const ER_ALL_LINES ulong 4611686018427387904
+note bytes of a line copied for est_parse_t (it reads at most 27) and for est_parse_thermal0
+note (from the key: 14 + a 39-byte token + its terminator)
+const ER_LINE_WIN ulong 8192
 const RP_SLOTS ulong 4
 
 text t_er_proto_commit "f96dc97"
@@ -122,16 +128,19 @@ global g_er_allow_run_b ulong 1
 global g_er_allow_heldout ulong 1
 
 note ---- est_file storage (2 slots) ----
-global g_ef_data uchar 4194304
-global g_ef_off ulong 32768
-global g_ef_llen ulong 32768
+note slot 0 holds [0, cap) of each pool, slot 1 [cap, len); g_ef_cap [0] bytes, [1] lines.
+note Growing slot 0 moves slot 1 up (er_ef_grow0, er_ef_lgrow0).
+global g_ef_data uchar *
+global g_ef_off ulong *
+global g_ef_llen ulong *
+global g_ef_cap ulong 2
 global g_ef_len ulong 2
 global g_ef_nlines ulong 2
 global g_ef_path uchar 2048
 global g_ef_plen ulong 2
 global g_ef_sha uchar 130
 
-note ---- est_replay storage (4 slots x 8192 steps) ----
+note ---- est_replay storage (4 slots, interleaved: step si of slot rslot is si*RP_SLOTS+rslot) ----
 global g_rp_meta ulong 64
 global g_rp_mdl ulong 1120
 global g_rp_mdig uchar 128
@@ -140,24 +149,27 @@ global g_rp_elen ulong 4
 note failing step of the last replay call: [0] what (1..11), [1] status (bits of a long)
 global g_rp_fnote ulong 2
 
-global g_rps_line ulong 32768
-global g_rps_L ulong 32768
-global g_rps_flags ulong 32768
-global g_rps_wall long 32768
-global g_rps_tns long 32768
-global g_rps_hor ulong 32768
-global g_rps_z f64 32768
-global g_rps_ym f64 32768
-global g_rps_S f64 32768
-global g_rps_nu f64 32768
-global g_rps_nis f64 32768
-global g_rps_pgen ulong 32768
-global g_rps_ptns long 32768
-global g_rps_px f64 65536
-global g_rps_pP f64 131072
-global g_rps_dig ulong 655360
-global g_rps_ppar ulong 131072
-global g_rps_proot ulong 131072
+global g_rps_line ulong *
+global g_rps_L ulong *
+global g_rps_flags ulong *
+global g_rps_wall long *
+global g_rps_tns long *
+global g_rps_hor ulong *
+global g_rps_z f64 *
+global g_rps_ym f64 *
+global g_rps_S f64 *
+global g_rps_nu f64 *
+global g_rps_nis f64 *
+global g_rps_pgen ulong *
+global g_rps_ptns long *
+global g_rps_px f64 *
+global g_rps_pP f64 *
+global g_rps_dig ulong *
+global g_rps_ppar ulong *
+global g_rps_proot ulong *
+
+note steps each slot has room for (the step pools hold RP_SLOTS times this)
+global g_rp_cap ulong 1
 
 note ---- Replay work buffers ----
 global g_rp_cur_mdl ulong 280
@@ -167,7 +179,6 @@ global g_rp_cur_post ulong 96
 global g_rp_cur_src uchar 32
 global g_rp_cur_ev uchar 32
 global g_rp_cur_pd uchar 32
-global g_rp_line_buf uchar 8192
 
 note ---- Params v1 globals ----
 global g_ep1_path uchar 1024
@@ -195,11 +206,13 @@ global g_ep2_mk ulong 1
 global g_ep2_mw f64 3
 global g_ep2_mv f64 3
 
-note ---- EM data global (shared for fit_em up to 32768 samples) ----
-global g_em_e f64 32768
+note ---- EM data pool (shared for fit_em; grown by est_m2_changes) ----
+global g_em_e f64 *
 
 note ---- Scratch for sha_file / realpath / env / sh / err ----
 global g_er_io uchar 65536
+note SHA256SUMS contents (er_sums_read)
+global g_er_sums uchar *
 global g_er_env uchar 4096
 global g_er_rp1 uchar 4096
 global g_er_rp2 uchar 4096
@@ -2054,10 +2067,58 @@ fn er_io_read_all path view uchar * plen ulong to long
   ret long tot
 end
 
-fn er_sums_trim_eol st ulong ll ulong to ulong
-  l = ll
-  while gt l 0 bound 4
-    c = get g_er_io sub add st l 1
+note ---- SHA256SUMS lookup, as est_sums_lookup: the whole file, read as fgets(line, 1024) reads it ----
+fn er_sums_read path view uchar * plen ulong to long
+  fd = fopen path 0 plen 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  while true bound ER_UNB
+    if ge add tot 65536 len g_er_sums
+      r = enlarge g_er_sums add mul len g_er_sums 2 65536
+      if ne r 0
+        ign = fclose int fd
+        ret -1
+      end
+    end
+    k = read int fd g_er_sums tot sub len g_er_sums tot
+    if le k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  ign = fclose int fd
+  ret long tot
+end
+
+note one fgets chunk from pos: at most 1023 bytes, through the first newline; its end
+fn er_sums_chunk_end pos ulong tot ulong to ulong
+  e = pos
+  while lt e tot bound 1024
+    if ge sub e pos 1023
+      break
+    end
+    c = get g_er_sums e
+    e = add e 1
+    if eq c 10
+      break
+    end
+  end
+  ret e
+end
+
+note strlen of the chunk [st, e), then the trailing newlines and carriage returns dropped
+fn er_sums_chunk_len st ulong e ulong to ulong
+  l = ulong 0
+  while lt add st l e bound 1023
+    if eq get g_er_sums add st l 0
+      break
+    end
+    l = add l 1
+  end
+  while gt l 0 bound 1023
+    c = get g_er_sums sub add st l 1
     if or eq c 10 eq c 13
       l = sub l 1
     else
@@ -2071,41 +2132,35 @@ fn er_sums_match_line st ulong ll ulong name view uchar 1024 nlen ulong hex_out 
   if le ll 66
     ret false
   end
-  if ne get g_er_io add st 64 32
+  if ne get g_er_sums add st 64 32
     ret false
   end
-  if ne get g_er_io add st 65 32
+  if ne get g_er_sums add st 65 32
     ret false
   end
   if ne sub ll 66 nlen
     ret false
   end
-  if not er_io_eq_at add st 66 name nlen
-    ret false
+  for i ulong nlen
+    if ne get g_er_sums add add st 66 i get name i
+      ret false
+    end
   end
   for j ulong 64
-    put hex_out j get g_er_io add st j
+    put hex_out j get g_er_sums add st j
   end
   ret true
 end
 
 fn er_sums_scan tot ulong name view uchar 1024 nlen ulong hex_out edit uchar 65 to long
   pos = ulong 0
-  while lt pos tot bound 8192
-    st = pos
-    while lt pos tot bound 65536
-      if eq get g_er_io pos 10
-        break
-      end
-      pos = add pos 1
-    end
-    ll = er_sums_trim_eol st sub pos st
-    if lt pos tot
-      pos = add pos 1
-    end
-    if er_sums_match_line st ll name nlen hex_out
+  while lt pos tot bound ER_UNB
+    e = er_sums_chunk_end pos tot
+    ll = er_sums_chunk_len pos e
+    if er_sums_match_line pos ll name nlen hex_out
       ret 0
     end
+    pos = e
   end
   ret 1
 end
@@ -2121,14 +2176,12 @@ fn er_sums_lookup dir view uchar 1024 dlen ulong name view uchar 1024 nlen ulong
   for i ulong len t_er_sums_suf
     put p add dlen i get t_er_sums_suf i
   end
-  tot = er_io_read_all view p add dlen len t_er_sums_suf
+  tot = er_sums_read view p add dlen len t_er_sums_suf
   if lt tot 0
     ret 1
   end
   ret er_sums_scan ulong tot name nlen hex_out
 end
-
-note ---- est_file load / read_index ----
 
 fn er_err_reset to void
   put g_er_elen 0 0
@@ -2163,35 +2216,129 @@ fn er_err_print_ref to void
   ob_flush
 end
 
-fn er_index_lines slot ulong tot ulong to void
-  dbase = mul slot EF_MAX_BYTES
-  lbase = mul slot EF_MAX_LINES
+note first byte of file slot's data and first entry of its line index
+fn er_ef_db slot ulong to ulong
+  ret mul slot get g_ef_cap 0
+end
+
+fn er_ef_lb slot ulong to ulong
+  ret mul slot get g_ef_cap 1
+end
+
+note slot 0's byte region grows to at least need; slot 1's bytes move up behind it. 0, or 1 out of memory
+fn er_ef_grow0 need ulong to long
+  oc = get g_ef_cap 0
+  nc = mul oc 2
+  if lt nc need
+    nc = need
+  end
+  if lt nc 1048576
+    nc = 1048576
+  end
+  n1 = get g_ef_len 1
+  r = enlarge g_ef_data add nc n1
+  if ne r 0
+    ret 1
+  end
+  i = n1
+  while gt i 0 bound ER_UNB
+    i = sub i 1
+    put g_ef_data add nc i get g_ef_data add oc i
+  end
+  put g_ef_cap 0 nc
+  ret 0
+end
+
+note slot 0's line region grows to at least need; slot 1's line index moves up behind it
+fn er_ef_lgrow0 need ulong to long
+  oc = get g_ef_cap 1
+  nc = mul oc 2
+  if lt nc need
+    nc = need
+  end
+  n1 = get g_ef_nlines 1
+  r = enlarge g_ef_off add nc n1
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_ef_llen add nc n1
+  if ne r 0
+    ret 1
+  end
+  i = n1
+  while gt i 0 bound ER_UNB
+    i = sub i 1
+    put g_ef_off add nc i get g_ef_off add oc i
+    put g_ef_llen add nc i get g_ef_llen add oc i
+  end
+  put g_ef_cap 1 nc
+  ret 0
+end
+
+note room for nl index entries in slot's line region. 0, or 1 out of memory
+fn er_ef_lreserve slot ulong nl ulong to long
+  if eq slot 0
+    if gt nl get g_ef_cap 1
+      ret er_ef_lgrow0 nl
+    end
+    ret 0
+  end
+  n = add get g_ef_cap 1 nl
+  r = enlarge g_ef_off n
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_ef_llen n
+  if ne r 0
+    ret 1
+  end
+  ret 0
+end
+
+fn er_count_lines dbase ulong tot ulong to ulong
+  nl = ulong 0
+  for i ulong tot bound ER_UNB
+    if eq get g_ef_data add dbase i 10
+      nl = add nl 1
+    end
+  end
+  if gt tot 0
+    if ne get g_ef_data add dbase sub tot 1 10
+      nl = add nl 1
+    end
+  end
+  ret nl
+end
+
+fn er_index_lines slot ulong tot ulong to long
+  dbase = er_ef_db slot
+  if ne er_ef_lreserve slot er_count_lines dbase tot 0
+    ret 1
+  end
+  lbase = er_ef_lb slot
   k = ulong 0
   start = ulong 0
-  for i ulong tot
+  for i ulong tot bound ER_UNB
     if eq get g_ef_data add dbase i 10
-      if lt k EF_MAX_LINES
-        put g_ef_off add lbase k start
-        put g_ef_llen add lbase k sub i start
-        k = add k 1
-      end
+      put g_ef_off add lbase k start
+      put g_ef_llen add lbase k sub i start
+      k = add k 1
       start = add i 1
     end
   end
   if lt start tot
-    if lt k EF_MAX_LINES
-      put g_ef_off add lbase k start
-      put g_ef_llen add lbase k sub tot start
-      k = add k 1
-    end
+    put g_ef_off add lbase k start
+    put g_ef_llen add lbase k sub tot start
+    k = add k 1
   end
   put g_ef_nlines slot k
+  ret 0
 end
 
 fn er_sha_ef_blocks st edit uint 8 w edit uint 64 kt view uint 64 dbase ulong tot ulong to ulong
   blk = new uchar 64 0
   pos = ulong 0
-  while le add pos 64 tot bound 65536
+  while le add pos 64 tot bound ER_UNB
     base = add dbase pos
     for bi ulong 64
       put blk bi get g_ef_data add base bi
@@ -2216,7 +2363,7 @@ fn er_hash_ef_slot slot ulong tot ulong to void
   st = new uint 8 0
   w = new uint 64 0
   pend = new uchar 128 0
-  dbase = mul slot EF_MAX_BYTES
+  dbase = er_ef_db slot
   est_sha_kinit kt
   est_sha_iv st
   pos = er_sha_ef_blocks st w view kt dbase tot
@@ -2227,6 +2374,47 @@ fn er_hash_ef_slot slot ulong tot ulong to void
   end
   est_sha_finish st w view kt pend rem_b tot
   er_sha_store_slot slot view st
+end
+
+note room for one more read into slot at byte tot; returns the bytes free there, or -1 out of memory
+fn er_ef_room slot ulong tot ulong to long
+  if eq slot 0
+    if ge tot get g_ef_cap 0
+      if ne er_ef_grow0 add tot 1 0
+        ret -1
+      end
+    end
+    ret long sub get g_ef_cap 0 tot
+  end
+  ap = add get g_ef_cap 0 tot
+  if ge ap len g_ef_data
+    nl = mul len g_ef_data 2
+    if lt nl add ap 1048576
+      nl = add ap 1048576
+    end
+    r = enlarge g_ef_data nl
+    if ne r 0
+      ret -1
+    end
+  end
+  ret long sub len g_ef_data ap
+end
+
+note reads fd to its end into slot's region; the byte count, or -1 out of memory
+fn er_read_fd slot ulong fd int to long
+  tot = ulong 0
+  while true bound ER_UNB
+    room = er_ef_room slot tot
+    if lt room 0
+      ret -1
+    end
+    k = read int fd g_ef_data add er_ef_db slot tot ulong room
+    if le k 0
+      break
+    end
+    tot = add tot ulong k
+  end
+  ret long tot
 end
 
 fn er_read_index slot ulong path view uchar * plen ulong to long
@@ -2242,19 +2430,16 @@ fn er_read_index slot ulong path view uchar * plen ulong to long
     er_err_add path plen
     ret 1
   end
-  dbase = mul slot EF_MAX_BYTES
-  tot = ulong 0
-  while lt tot EF_MAX_BYTES bound 10000
-    k = read int fd g_ef_data add dbase tot sub EF_MAX_BYTES tot
-    if le k 0
-      break
-    end
-    tot = add tot ulong k
-  end
+  tot = er_read_fd slot int fd
   ign = fclose int fd
-  put g_ef_len slot tot
-  er_hash_ef_slot slot tot
-  er_index_lines slot tot
+  if lt tot 0
+    ret 1
+  end
+  put g_ef_len slot ulong tot
+  er_hash_ef_slot slot ulong tot
+  if ne er_index_lines slot ulong tot 0
+    ret 1
+  end
   ret 0
 end
 
@@ -2675,7 +2860,7 @@ fn er_put_mdig rslot ulong bel edit ulong 96 to void
 end
 
 fn er_load_post rslot ulong si ulong mdl view ulong 280 bel edit ulong 96 to void
-  idx = add mul rslot RP_MAX_STEPS si
+  idx = add mul si RP_SLOTS rslot
   for i ulong 96
     put bel i 0
   end
@@ -2723,7 +2908,7 @@ fn er_hash_line fslot ulong off ulong ll ulong dst edit uchar 32 to void
   st = new uint 8 0
   w = new uint 64 0
   pend = new uchar 128 0
-  base = add mul fslot EF_MAX_BYTES off
+  base = add er_ef_db fslot off
   est_sha_kinit kt
   est_sha_iv st
   pos = er_sha_ef_blocks st w view kt base ll
@@ -2895,7 +3080,7 @@ fn er_replay_prior rslot ulong li ulong model_id ulong r f64 z f64 wall long to 
   end
   mbase = mul rslot 16
   si = get g_rp_meta mbase
-  idx = add mul rslot RP_MAX_STEPS si
+  idx = add mul si RP_SLOTS rslot
   er_step_clear idx
   put g_rp_meta mbase add si 1
   put g_rps_line idx li
@@ -3089,27 +3274,74 @@ fn er_replay_finish_post idx ulong to long
   ret 0
 end
 
-fn er_copy_line_to_buf fslot ulong li ulong to ulong
-  dbase = mul fslot EF_MAX_BYTES
-  lbase = mul fslot EF_MAX_LINES
-  loff = get g_ef_off add lbase li
-  ll = get g_ef_llen add lbase li
-  if gt ll 8192
-    ll = 8192
-  end
-  for i ulong ll
-    put g_rp_line_buf i get g_ef_data add add dbase loff i
-  end
-  ret ll
+note first byte of line li of file slot fslot in g_ef_data
+fn er_line_at fslot ulong li ulong to ulong
+  ret add er_ef_db fslot get g_ef_off add er_ef_lb fslot li
 end
 
-fn er_parse_line_buf ll ulong wo edit long 1 zo edit f64 1 to ulong
-  ln = new uchar 8192 0
-  for i ulong ll
-    put ln i get g_rp_line_buf i
+note copies at most ER_LINE_WIN bytes of line li from byte from into dst; returns the count
+fn er_copy_line_win fslot ulong li ulong from ulong dst edit uchar 8192 to ulong
+  ll = get g_ef_llen add er_ef_lb fslot li
+  if ge from ll
+    ret 0
   end
+  n = sub ll from
+  if gt n ER_LINE_WIN
+    n = ER_LINE_WIN
+  end
+  ap = add er_line_at fslot li from
+  for i ulong n
+    put dst i get g_ef_data add ap i
+  end
+  ret n
+end
+
+fn er_key_at pos ulong to bool
+  for j ulong len t_er_th_key
+    if ne get g_ef_data add pos j get t_er_th_key j
+      ret false
+    end
+  end
+  ret true
+end
+
+note offset in line li of the first thermal_mc key, or -1; the whole line is searched
+fn er_find_key_line fslot ulong li ulong to long
+  ll = get g_ef_llen add er_ef_lb fslot li
+  kl = len t_er_th_key
+  if lt ll kl
+    ret -1
+  end
+  ap = er_line_at fslot li
+  end_i = add sub ll kl 1
+  for i ulong end_i bound ER_UNB
+    if er_key_at add ap i
+      ret long i
+    end
+  end
+  ret -1
+end
+
+note est_parse_thermal0 over the whole line: a line longer than the window is parsed from its key
+fn er_parse_thermal_line fslot ulong li ulong ln view uchar 8192 n ulong zo edit f64 1 to long
+  ll = get g_ef_llen add er_ef_lb fslot li
+  if le ll ER_LINE_WIN
+    ret est_parse_thermal0 ln 0 n zo
+  end
+  kp = er_find_key_line fslot li
+  if lt kp 0
+    ret 1
+  end
+  w = new uchar 8192 0
+  m = er_copy_line_win fslot li ulong kp w
+  ret est_parse_thermal0 view w 0 m zo
+end
+
+fn er_parse_line_buf fslot ulong li ulong wo edit long 1 zo edit f64 1 to ulong
+  ln = new uchar 8192 0
+  ll = er_copy_line_win fslot li 0 ln
   tr = est_parse_t view ln 0 ll wo
-  vp = est_parse_thermal0 view ln 0 ll zo
+  vp = er_parse_thermal_line fslot li view ln ll zo
   res = ulong 0
   if eq tr 0
     res = or res 1
@@ -3147,6 +3379,101 @@ fn er_replay_store_mdl rslot ulong mdl view ulong 280 md view uchar 32 to void
   end
 end
 
+note room for need steps in every replay slot (est_replay.c reallocs to nlines + 1). 0, or 1 out of memory
+fn er_rp_reserve need ulong to long
+  oc = get g_rp_cap 0
+  if le need oc
+    ret 0
+  end
+  nc = mul oc 2
+  if lt nc need
+    nc = need
+  end
+  t = mul nc RP_SLOTS
+  r = enlarge g_rps_line t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_L t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_flags t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_wall t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_tns t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_hor t
+  if ne r 0
+    ret 1
+  end
+  ret er_rp_reserve_f nc t
+end
+
+fn er_rp_reserve_f nc ulong t ulong to long
+  r = enlarge g_rps_z t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_ym t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_S t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_nu t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_nis t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_pgen t
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_ptns t
+  if ne r 0
+    ret 1
+  end
+  ret er_rp_reserve_w nc t
+end
+
+fn er_rp_reserve_w nc ulong t ulong to long
+  r = enlarge g_rps_px mul t 2
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_pP mul t 4
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_dig mul t 20
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_ppar mul t 4
+  if ne r 0
+    ret 1
+  end
+  r = enlarge g_rps_proot mul t 4
+  if ne r 0
+    ret 1
+  end
+  put g_rp_cap 0 nc
+  ret 0
+end
+
 fn er_replay_init_model fslot ulong limit ulong model_id ulong q f64 r f64 rslot ulong to long
   mdl = new ulong 280 0
   md = new uchar 32 0
@@ -3170,15 +3497,18 @@ fn er_replay_init_model fslot ulong limit ulong model_id ulong q f64 r f64 rslot
     ret er_rp_fail rslot 0
   end
   er_replay_store_mdl rslot view mdl view md
+  if ne er_rp_reserve add nl 1 0
+    er_rp_note 11 EST_OK
+    ret er_rp_fail rslot 0
+  end
   ret 0
 end
 
 fn er_replay_parse_hash fslot ulong rslot ulong li ulong wo edit long 1 zo edit f64 1 to ulong
   ev = new uchar 32 0
-  lbase = mul fslot EF_MAX_LINES
+  lbase = er_ef_lb fslot
   loff = get g_ef_off add lbase li
-  ll = er_copy_line_to_buf fslot li
-  pf = er_parse_line_buf ll wo zo
+  pf = er_parse_line_buf fslot li wo zo
   if eq and pf 1 0
     er_meta_inc rslot 5
     if ne and pf 2 0
@@ -3234,11 +3564,11 @@ fn er_replay_exec_step rslot ulong li ulong h ulong flags ulong zv f64 r f64 to 
   ev = new uchar 32 0
   mbase = mul rslot 16
   si = get g_rp_meta mbase
-  if ge si RP_MAX_STEPS
+  if ge si get g_rp_cap 0
     er_rp_note 11 EST_OK
     ret er_rp_fail rslot li
   end
-  idx = add mul rslot RP_MAX_STEPS si
+  idx = add mul si RP_SLOTS rslot
   er_step_clear idx
   put g_rp_meta mbase add si 1
   put g_rps_line idx li
@@ -3268,7 +3598,7 @@ end
 
 fn er_replay_mark_step rslot ulong li ulong first ulong t_ok ulong wv long to void
   si = sub get g_rp_meta mul rslot 16 1
-  idx = add mul rslot RP_MAX_STEPS si
+  idx = add mul si RP_SLOTS rslot
   put g_rps_L idx sub li first
   if ne t_ok 0
     put g_rps_flags idx or get g_rps_flags idx 4
@@ -3320,7 +3650,7 @@ fn est_replay_run fslot ulong limit ulong model_id ulong q f64 r f64 rslot ulong
     ret 1
   end
   nl = get g_rp_meta add mul rslot 16 1
-  for li ulong nl
+  for li ulong nl bound ER_UNB
     if ne er_replay_line fslot rslot model_id r li st 0
       ret 1
     end
@@ -3337,8 +3667,8 @@ fn est_replay_write_stream fd int rslot ulong model_id ulong to void
   hx = new uchar 65 0
   ob_init fd
   ns = get g_rp_meta mul rslot 16
-  for i ulong ns
-    idx = add mul rslot RP_MAX_STEPS i
+  for i ulong ns bound ER_UNB
+    idx = add mul i RP_SLOTS rslot
     ob_t t_er_st_m
     ob_u model_id
     ob_t t_er_st_ln
@@ -3662,9 +3992,12 @@ fn est_m2_changes rslot ulong cap ulong to long
   n = ulong 0
   prev = f64 0.0
   have = ulong 0
-  base = mul rslot RP_MAX_STEPS
-  for i ulong ns
-    idx = add base i
+  r = enlarge g_em_e cap
+  if ne r 0
+    ret -1
+  end
+  for i ulong ns bound ER_UNB
+    idx = add mul i RP_SLOTS rslot
     fl = get g_rps_flags idx
     if ne and fl 2 0
       continue
@@ -3726,7 +4059,7 @@ end
 fn er_em_round n ulong k ulong floor_var f64 mx edit EstMix to void
   sw = new f64 3 0.0
   sv = new f64 3 0.0
-  for i ulong n
+  for i ulong n bound ER_UNB
     ei = get g_em_e i
     er_em_estep ei k view mx sw sv
   end
@@ -3750,7 +4083,7 @@ end
 fn er_em_loglik n ulong mx view EstMix to f64
   lo = new f64 1 0.0
   ll = f64 0.0
-  for i ulong n
+  for i ulong n bound ER_UNB
     ign = est_mix_logpdf mx 1 get g_em_e i lo
     ll = add ll get lo 0
   end
@@ -3766,7 +4099,7 @@ fn est_mix_fit_em n ulong k ulong floor_var f64 iters ulong mx edit EstMix ll_ou
     ret EST_ERR_NOT_PD
   end
   v0 = f64 0.0
-  for i ulong n
+  for i ulong n bound ER_UNB
     ei = get g_em_e i
     if not est_isfinite ei
       ret EST_ERR_NONFINITE
