@@ -241,6 +241,12 @@ fatal_case "prompt with a tab" prompt_invalid "$O" gq "$MAN" "$M0" "$R" "$W/task
 mkdir -p "$W/exists"
 fatal_case "out exists" out_exists "$W/exists" "$G" query --corpus "$MAN" --manifest-sha256 "$M0" --recheck "$RC" --recheck-sha256 "$RPIN" --kind raw --k 3 --cap-bytes 9 --requirement "$R" --prompt "$P" --out "$W/exists"
 t "existing out left empty" [ -z "$(ls -A "$W/exists")" ]
+# --out created after the up-front check (here by the validator, which runs between that check and the rename):
+# the rename must refuse to replace it (RENAME_NOREPLACE), even an empty directory, and leave it as it was
+printf '#!/bin/sh\nmkdir "%s"\nshift 2\nfor f; do sed -n "s/^id /OK /p" "$f"; done\n' "$W/race" > "$W/racer"; chmod +x "$W/racer"
+O="$W/race"; GRC="$W/racer" fatal_case "out created during the run is not replaced" out_exists "$O" gq "$MAN" "$M0" "$R" "$P"; O="$W/fx"
+t "out created during the run left empty" sh -c "[ -d '$W/race' ] && [ -z \"\$(ls -A '$W/race')\" ]"
+t "no temporary output dir after the refused rename" [ -z "$(find "$W" -maxdepth 1 -name 'race.tmp.*')" ]
 fatal_case "k 0" usage "$O" "$G" query --corpus "$MAN" --manifest-sha256 "$M0" --recheck "$RC" --recheck-sha256 "$RPIN" --kind raw --k 0 --cap-bytes 9 --requirement "$R" --prompt "$P" --out "$O"
 fatal_case "k 65" usage "$O" "$G" query --corpus "$MAN" --manifest-sha256 "$M0" --recheck "$RC" --recheck-sha256 "$RPIN" --kind raw --k 65 --cap-bytes 9 --requirement "$R" --prompt "$P" --out "$O"
 fatal_case "kind other" usage "$O" "$G" query --corpus "$MAN" --manifest-sha256 "$M0" --recheck "$RC" --recheck-sha256 "$RPIN" --kind text --k 1 --cap-bytes 9 --requirement "$R" --prompt "$P" --out "$O"
@@ -382,6 +388,10 @@ CAP=600 lm lmC 400
 t "a pad that would pass the cap is skipped" [ "$(lmrc lmC)" = "1 reached 246 496 96" ]
 t "skipped pad candidate keeps its reason" [ "$(reason_of "$W/lmC" raw-dot3)" = beyond_k ]
 t "the next candidate is the pad" [ "$(col "$W/lmC/selected.tsv" 2 | tr '\n' ' ')" = "raw-clamp_sub raw-sum_range " ]
+CAP=738 lm lmH 300
+t "a pad that lands exactly on the cap is taken" [ "$(lmrc lmH)" = "1 reached 246 738 438" ]
+t "exact-cap pad is rank k+1 (raw-dot3)" [ "$(col "$W/lmH/selected.tsv" 2 | tr '\n' ' ')" = "raw-clamp_sub raw-dot3 " ]
+t "exact-cap suffix equals the cap" [ "$(wc -c < "$W/lmH/suffix.txt")" -eq 738 ]
 CAP=600 lm lmD 500
 t "candidates run out under the cap: exhausted, short of target" [ "$(lmrc lmD)" = "1 exhausted 246 496 -4" ]
 lm lmE 4096
