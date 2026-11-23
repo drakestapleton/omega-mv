@@ -90,10 +90,35 @@ chmod +x "$out"/check-*
      om/encoder/bw_enc_sm121.om om/gpu/dsv41/emit.om om/gpu/dsv41/head/launch.om \
      "$d/checkpoint.om" "$d/io.om" "$d/core.om" "$d/kv.om" "$d/lease.om" "$d/resolve.om" \
      "$d/engram-layout.om" "$d/engram.om" "$d/trace.om" "$d/native.om" \
-     "$d/layer-map.om" "$d/rope.om" "$d/workspace.om" "$d/forward.om" "$d/decode-cli.om") |
+     "$d/layer-map.om" "$d/rope.om" "$d/workspace.om" "$d/forward.om" "$d/prefetch-switch.om" "$d/decode-cli.om") |
     seed/out/omc > "$out/dsv41-decode"
 chmod +x "$out/dsv41-decode"
 ```
+
+### Arboris prefetch switch
+
+`gen` and `chat` run the online Arboris cross-layer prefetcher by default. Set `DSV41_ARBORIS_PREFETCH=0` to turn it off for a matched A/B run; unset or `1` keeps it on. `spark-window run` passes the caller's environment through, so set the variable on that command.
+
+The decoder reads the variable once, before it opens any input. It refuses any other value, a repeated entry, or an environment entry it cannot read whole with exit 64 and the line `dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1`. An environment of more than 65536 entries traps with exit 104 instead. `dfStartWorkers` sets the switch when it starts the payload workers; `layer0` always starts them with the prefetcher off. Arboris learns co-activations in both arms, and only the dispatch and publication of prefetched experts differ.
+
+The final stats line of `gen` and `chat` is `ARBORIS pf_dispatched=N pf_hits=N pf_enabled=0|1`. `pf_enabled` reports the setting, not that anything was prefetched. A valid on arm needs `pf_dispatched` above zero; a valid off arm needs `pf_dispatched=0 pf_hits=0`.
+
+`pfcheck <tensors> <engram_map> <sidecar_dir> <ckpt_dir>` is a host preflight that opens no GPU. It parses the variable, loads the inputs, and starts and stops the payload workers as `gen` does. It prints `ARBORIS pf_enabled=0|1` on stderr. Run it before a timed arm to confirm which arm the binary will run.
+
+The prefetcher only proposes experts that are not resident. Arboris learns edges toward experts the router has already chosen, and those experts stay resident until the FIFO slot table evicts them. Until distinct routed experts exceed the resident slots (4400 in `gen` and `chat`), the prefetcher has nothing to dispatch. That follows from `dfArbPickBest`, and the 37-position `gen` workload above shows it: 2990 misses, `pf_dispatched=0`. A workload that never fills the slot table cannot show a prefetch effect.
+
+Qualification, host only (no GPU), from a clean tree:
+
+```sh
+bash "$d/check-prefetch-mutants.sh" "$out/pf" "$out/tensors.bin" "$sidecars" "$checkpoint"
+```
+
+It builds the decoder from the composition above and through `om/gpu/dsv41/build.sh`, which must agree byte for byte. It runs three controls:
+- `check-prefetch-switch.sh` checks 16 environment cases, including names that share the prefix, malformed values, a maximum-size entry, and repeated names delivered through `execenv`.
+- `check-decoder-prefetch.sh` runs the real binary in `pfcheck` mode.
+- `check-arboris-prefetch.om` replaces `decode-cli.om` in the composition and takes the layer-1 sidecar and shard 04. Besides scoring, domain shift and asynchronous publication, it starts real workers with the prefetcher off. A trained high-confidence query must then dispatch nothing, leave nothing in flight, and draw no worker reply within 2 s.
+
+The driver also builds eight mutants (A to H) and requires each to be rejected by the one check named for it. It prints the compiler digest and every binary digest, and passes only on `PREFETCH-MUTANTS PASS`. No gate under `tests/gates` runs it; run it before any review of a change to these files.
 
 Inside an authorized Spark GB10 window:
 
