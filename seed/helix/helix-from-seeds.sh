@@ -133,16 +133,16 @@ sPois=$(sha "$B/omc_poison_s2")
 [ "$sPois" != "$sCommit" ] || bad "CONTROL SURVIVED: poisoned stage1 matched seed/out/omc"
 printf 'PASS Control 1 (poisoned stage1 backdoor): CAUGHT (%s != %s)\n' "$sPois" "$sCommit"
 
-printf '\n=== 6. FOUR-ORGAN PROOF-CARRYING HELIX (MONK + ARBORIS/PREDATOR + 8-ATTACK IMMUNE) ===\n'
-{ printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/monk_check.om; } | "$B/A_stage2" > "$B/monk_check"
+printf '\n=== 6. FOUR-ORGAN PROOF-CARRYING HELIX (MONK + ARBORIS/PREDATOR + 12-ATTACK IMMUNE) ===\n'
+{ printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/hx_dec_ext.om seed/helix/monk_check.om; } | "$B/A_stage2" > "$B/monk_check"
 chmod +x "$B/monk_check"
-{ printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/arboris_predator.om; } | "$B/A_fast" > "$B/arboris_predator"
+{ printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/hx_dec_ext.om seed/helix/arboris_predator.om; } | "$B/A_fast" > "$B/arboris_predator"
 chmod +x "$B/arboris_predator"
-{ printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/immune.om; } | "$B/A_stage2" > "$B/immune"
+{ printf 'om2\n'; cat seed/ng/sha256.om gpu/nvidia/om/codegen/bw_hazard.om seed/helix/hx_dec_ext.om seed/helix/immune.om; } | "$B/A_stage2" > "$B/immune"
 chmod +x "$B/immune"
 
 "$B/arboris_predator" seed/sm121/vecadd.bin "$B/vecadd_cand.bin" "$B/vecadd.cert"
 "$B/monk_check" seed/sm121/vecadd.bin "$B/vecadd_cand.bin" "$B/vecadd.cert"
 "$B/immune" "$B/monk_check" seed/sm121/vecadd.bin "$B/vecadd_cand.bin" "$B/vecadd.cert" "$B/im_scr"
 
-printf '\nHELIX PASS dual_seeds=804B(408B+396B) zero_prebuilt=1 omc=%s ng=%s A_fast=%s antibodies=8/8\n' "$sCommit" "$sNgB" "$sAfast"
+printf '\nHELIX PASS dual_seeds=804B(408B+396B) zero_prebuilt=1 omc=%s ng=%s A_fast=%s antibodies=12/12\n' "$sCommit" "$sNgB" "$sAfast"

@@ -54,18 +54,10 @@ chmod +x "$B/dual_checker"
 "$B/egraph_opt" "$B/egraph.egp2"
 "$B/dual_checker" "$B/egraph.egp2"
 
-printf '\n=== [3/7] PHASE 2: THREE PRODUCTION q36 SM121 KERNELS THROUGH PREDATOR -> MONK -> IMMUNE ===\n'
-{ printf 'om2\n'; cat om/encoder/bw_enc_sm121.om om/gpu/q36/emit_fast.om seed/helix/extract_q36_kernels.om; } | "$B/omc_A" > "$B/extract_q36"
-chmod +x "$B/extract_q36"
-for pair in "a:bf16_gemv_fast" "b:fp8_b128_gemv_fast" "m:w4_b32_gemv_fast"; do
-  mode=$(printf '%s' "$pair" | cut -d: -f1)
-  kname=$(printf '%s' "$pair" | cut -d: -f2)
-  "$B/extract_q36" "$mode" "$B/q36_kernels/${kname}.ref.bin"
-  "$B/arboris_predator" "$B/q36_kernels/${kname}.ref.bin" "$B/q36_kernels/${kname}.cand.bin" "$B/q36_kernels/${kname}.cert"
-  "$B/monk_check" "$B/q36_kernels/${kname}.ref.bin" "$B/q36_kernels/${kname}.cand.bin" "$B/q36_kernels/${kname}.cert"
-  "$B/immune" "$B/monk_check" "$B/q36_kernels/${kname}.ref.bin" "$B/q36_kernels/${kname}.cand.bin" "$B/q36_kernels/${kname}.cert" "$B/q36_kernels/im_${kname}"
-done
-printf 'PASS all 3 production q36 SM121 kernels verified by Predator -> Monk (CFG+RAW-safe) -> 8+4=12 Antibodies!\n'
+printf '\n=== [3/7] PHASE 2: 46 PRODUCTION SM121 KERNELS (31 emit_fast + 5 emit_head + 10 om_synth_gb10) -> PREDATOR -> MONK -> 12-ATTACK IMMUNE ===\n'
+sh seed/helix/sweep_sm121.sh "$B/omc_A" "$B/omc_B_fast" "$B/monk_check" "$B/arboris_predator" "$B/immune" "$B/q36_kernels"
+cp "$B/q36_kernels/extract_q36" "$B/extract_q36"
+printf 'PASS all 46 production SM121 kernels verified by Predator -> Monk (CFG+rawFloor=6+I2FP) -> 12+4=16 Antibodies!\n'
 
 printf '\n=== [4/7] PHASE 3: ARBORIS NERVOUS SYSTEM BENCHMARKS (TRACKS 3A / 3B / 3C) ===\n'
 { printf 'om2\n'; cat seed/helix/arboris_nervous_bench.om; } | "$B/omc_B_fast" > "$B/arboris_bench"
@@ -130,9 +122,10 @@ if [ "$RUN_LEAN" = "1" ]; then
   lean seed/helix/proofs/HelixSoundness.lean
   lean seed/helix/proofs/HelixAntibodies.lean
   lean seed/helix/proofs/HelixKernelIR.lean
-  printf 'PASS Lean 4 proofs verified (HelixSoundness + HelixAntibodies + HelixKernelIR)\n'
+  lean protocol/uor-gpu/proofs/UorGpuWorld.lean
+  printf 'PASS Lean 4 proofs verified (HelixSoundness + HelixAntibodies + HelixKernelIR + UorGpuWorld)\n'
 else
-  printf 'INFO pass --lean (with Lean 4 on PATH) to re-check all 3 Lean 4 proof files\n'
+  printf 'INFO pass --lean (with Lean 4 on PATH) to re-check all 4 Lean 4 proof files\n'
 fi
 
-printf '\nCOLD_REGROWTH PASS dual_seeds=804B zero_prebuilt=1 zero_c=1 zero_python=1 zero_cuda=1 q36_kernels=3 antibodies=12/12 gens=3\n'
+printf '\nCOLD_REGROWTH PASS dual_seeds=804B zero_prebuilt=1 zero_c=1 zero_python=1 zero_cuda=1 sm121_kernels=46 antibodies=16/16 gens=3\n'

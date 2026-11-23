@@ -6,12 +6,13 @@
 #     Predator + Arboris running in an isolated ephemeral sandbox, proposing candidate SM121 schedules
 #     and EGP2 kernel-IR optimizations.
 #   Wall 2 (The Formal & Chaos Gauntlet -- Correctness Gate):
-#     Strand A Monk (CFG fixed-point dataflow + fixed-latency RAW floor + Basic-Block Leader Antibody #13)
-#     + EGP2 structural dual-checker + 12/12 Antibodies + Strand 3 Trickster chaos pass + all 4 Lean 4
-#     proof files (HelixSoundness, HelixAntibodies, HelixKernelIR, HelixBFT = 29 theorems, 0 sorry).
+#     Strand A Monk (CFG fixed-point dataflow + rawFloor=6 + BB-Leader #13 + I2FP #15 + anchor RAW #16)
+#     + EGP2 structural dual-checker + 16/16 Antibodies + 46-kernel SM121 sweep + all 5 Lean 4
+#     proof files (HelixSoundness, HelixAntibodies, HelixKernelIR, UorGpuWorld, HelixBFT; 0 sorry).
 #   Wall 3 (The Sealed Judge -- Performance & Capability Gate):
 #     Pure-OM-2 spark-rsi evaluator (core/rsi/om/eval/evaluator.om + canary + rollback) + dual-strand
-#     Proof-Carrying SM121 Evolutionary JIT binaries (q36-helix-native & q36-helix-decode).
+#     Proof-Carrying SM121 Evolutionary JIT binaries (q36-helix-native & q36-helix-decode)
+#     + `seed/helix/strand_cap/helix_cap_gate.sh` (effects.om `mem` split, verifier allowlists, W^X, Wall-1 seccomp cBPF).
 #   Wall 4 (The Cryptographic Ratchet -- Promotion Authority):
 #     Pure-OM-2 RSI V2 ECDSA P-256 promotion gate (core/rsi/om/governance/v2_main.om, dual-strand
 #     compiled identically by Strand A & Strand B; selfcheck + v2_test negative controls: same-key
@@ -73,6 +74,9 @@ chmod +x "$B/ratchet/rsi_v2_gate_A"
 "$B/ratchet/rsi_v2_gate_A" selfcheck
 printf 'PASS Wall 4 RSI V2 P-256 gate dual-strand identical + selfcheck PASS (%s)\n' "$(sha "$B/ratchet/rsi_v2_gate_A")"
 
+# Wall 3 Capability Containment Gate (effects.om mem split, verifier allowlists, W^X seeds/ELFs, Wall-1 seccomp cBPF)
+sh seed/helix/strand_cap/helix_cap_gate.sh "$OMC_A" "$OMC_B" build/cold-regrowth "$B"
+
 P256_TEST_SRCS="core/rsi/om/p256/sha256.om core/rsi/om/p256/p256.om core/rsi/om/governance/receipt_v2.om core/rsi/om/governance/v2_test.om"
 cat $P256_TEST_SRCS | "$OMC_A" > "$B/ratchet/rsi_v2_test_A"
 cat $P256_TEST_SRCS | "$OMC_B" > "$B/ratchet/rsi_v2_test_B"
@@ -84,4 +88,4 @@ printf 'PASS Wall 4 RSI V2 P-256 negative controls (same-key, protected-path, ta
 # Generational 4-Strand BFT Cold Regrowth + Quarantine Auto-Heal + Compiler Mitosis + Hot-Swap + HelixBFT.lean
 sh seed/helix/braid4-verify.sh
 
-printf '\nRSI_LOOP1_FOUR_WALL PASS walls=4/4 strands=4(1612B) p256_ratchet=PASS ed25519_ddc=PASS bft_heal=2/2 mitosis=PASS hotswap=PASS\n'
+printf '\nRSI_LOOP1_FOUR_WALL PASS walls=4/4 strands=4(1612B) sm121_kernels=46 cap_gate=PASS p256_ratchet=PASS ed25519_ddc=PASS bft_heal=2/2 mitosis=PASS hotswap=PASS\n'
