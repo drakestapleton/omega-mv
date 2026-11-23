@@ -16,6 +16,8 @@
 #      (one wrong hidden/expected line must refuse)
 # GEN_TASKS_CHECK=1 also runs ola.sh tasks-check on the dev pack inside a private git worktree of HEAD (under the
 # test temp dir, removed afterwards), so the shared evidence/ONE-LAYER-2 tree is never written or deleted.
+# GENP_OMC=<omc> also builds the pure OM-2 ports (<tool>_om) and runs each invocation through both builds: any
+# difference from the C build of record in stdout, stderr or exit status fails the suite (OM parity).
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 B="${1:?usage: test_gen_protocol.sh <builddir>}"
@@ -46,6 +48,36 @@ ${CC:-cc} $CFLAGS -I"$ROOT/src" -o "$B/gencheck" "$ROOT/tools/gen/protocol/gench
 ${CC:-cc} $CFLAGS -o "$B/genstats" "$ROOT/tools/gen/protocol/genstats.c" -lm || exit 1
 ${CC:-cc} $CFLAGS -o "$B/genjac" "$ROOT/tools/gen/protocol/genjac.c" || exit 1
 FS="$B/famsig"; GC="$B/gencheck"; GS="$B/genstats"; JC="$B/genjac"
+# OM parity (when GENP_OMC names the seeded omc): the pure OM-2 ports are built as <tool>_om and run beside the
+# C build of record on every invocation below; any difference in stdout, stderr or exit status fails the suite.
+# The C stays the build of record while protocol.json pins the C sources.
+if [ -n "${GENP_OMC:-}" ]; then
+  om_build() { # output unit.om...: one OM-2 unit (a single om2 header) compiled by GENP_OMC
+    local o="$1"; shift
+    (printf 'om2\n'; sed '/^om2$/d' "$@") | "$GENP_OMC" > "$o.tmp" && chmod +x "$o.tmp" && mv "$o.tmp" "$o"
+  }
+  GP="$ROOT/tools/gen/protocol"
+  om_build "$B/famsig_om" "$ROOT/seed/ng/sha256.om" "$GP/famsig_lib.om" "$GP/famsig.om" || exit 1
+  om_build "$B/gencheck_om" "$ROOT/seed/ng/sha256.om" "$GP/famsig_lib.om" "$GP/gencheck.om" || exit 1
+  om_build "$B/genstats_om" "$GP/genstats.om" || exit 1
+  om_build "$B/genjac_om" "$GP/genjac.om" || exit 1
+  mkdir -p "$T/par"; : > "$T/par.count"; : > "$T/par.diff"
+  for t in famsig gencheck genstats genjac; do
+    cat > "$T/par/$t" <<EOF
+#!/usr/bin/env bash
+w="\$(mktemp -d "$T/parXXXXXXXX")"
+"$B/$t" "\$@" > "\$w/c.out" 2> "\$w/c.err"; crc=\$?
+"$B/${t}_om" "\$@" > "\$w/o.out" 2> "\$w/o.err"; orc=\$?
+echo . >> "$T/par.count"
+if [ \$crc != \$orc ] || ! cmp -s "\$w/c.out" "\$w/o.out" || ! cmp -s "\$w/c.err" "\$w/o.err"; then
+  echo "$t \$* (c exit \$crc, om exit \$orc)" >> "$T/par.diff"
+fi
+cat "\$w/c.out"; cat "\$w/c.err" >&2; rm -rf "\$w"; exit \$crc
+EOF
+    chmod +x "$T/par/$t"
+  done
+  FS="$T/par/famsig"; GC="$T/par/gencheck"; GS="$T/par/genstats"; JC="$T/par/genjac"
+fi
 
 # ---- 1. statistics ----
 if "$GS" selftest | tail -1 | grep -q '^SELFTEST PASS'; then pass "genstats selftest"; else fail "genstats selftest"; fi
@@ -54,6 +86,10 @@ z59=$(printf '%059d' 0); o59=$(printf '1%.0s' $(seq 59)); z60="0$z59"; o60="1$o5
 refuse_why "genstats verdict with n = 59" "n = 60 only" "$GS" verdict 1 "$o59" "$z59" "$z59" "$o59"
 refuse_why "genstats verdict with n = 61" "n = 60 only" "$GS" verdict 1 "${o60}1" "$z61" "$z61" "${o60}1"
 if "$GS" verdict 1 "$o60" "$z60" "$z60" "$o60" >/dev/null 2>&1; then pass "genstats verdict with n = 60 runs"; else fail "genstats verdict with n = 60"; fi
+# p just under 0.05: 13 D-only vs 5 control-only tasks, exact one-sided p = 12616/262144 = 0.0481 (pass at 0.05)
+d13="1111111111111$z59"; d13="${d13:0:60}"; x5="0000000000000111110$z59"; x5="${x5:0:60}"
+pr=$'0\t13\t5\t42\t12616\t262144\t0.0481262207\tyes\tyes'
+expect_out "genstats verdict p = 0.0481 just under 0.05: PASS" "$(printf '5\t5\t5\t13\t%s\t%s\t%s\t-0.0060060942\t0.2686372479\t0.0173465500\t0.2466232525\t0\tPASS\tall_controls_lift_and_p' "$pr" "$pr" "$pr")" "$GS" verdict 1 "$x5" "$x5" "$x5" "$d13"
 
 expect_out "lenmatch reviewer fixture 295 vs 945: unmatched" "task 1 target_bytes=295 suffix_bytes=945 length_gap=650 tolerance_bytes=256.00 class=unmatched" sh -c "\"$GS\" lenmatch 295:945 | head -1"
 expect_out "lenmatch 256 B boundary: matched" "tasks=2 matched=1 unmatched=1 status=AVAILABLE" sh -c "\"$GS\" lenmatch 300:556 300:557 | tail -1"
@@ -65,6 +101,8 @@ refuse "lenmatch bad pair" "$GS" lenmatch 300-556
 # genjac: word 3-gram Jaccard
 printf 'a b c d\n' > "$T/j1"; printf 'a b c e\n' > "$T/j2"; printf 'A, b; c d e\n' > "$T/j3"; printf 'a b c d f\n' > "$T/j4"; printf 'x y\n' > "$T/j5"
 expect_out "genjac pair 1/3" "grams_a=2 grams_b=2 inter=1 union=3 jaccard=0.333333" "$JC" pair "$T/j1" "$T/j2"
+printf 'a b c d e\n' > "$T/j6"
+expect_out "genjac pair 2/3 rounds half up to 0.666667" "grams_a=2 grams_b=3 inter=2 union=3 jaccard=0.666667" "$JC" pair "$T/j1" "$T/j6"
 expect_out "genjac pair 0.5 exact, case and punctuation folded" "grams_a=3 grams_b=3 inter=2 union=4 jaccard=0.500000" "$JC" pair "$T/j3" "$T/j4"
 expect_out "genjac pair identical" "grams_a=2 grams_b=2 inter=2 union=2 jaccard=1.000000" "$JC" pair "$T/j1" "$T/j1"
 expect_out "genjac pair under 3 words" "grams_a=0 grams_b=2 inter=0 union=2 jaccard=0.000000" "$JC" pair "$T/j5" "$T/j1"
@@ -91,6 +129,8 @@ refuse "shape container without child" "$FS" canon 'loop()'
 refuse "shape seq with one child" "$FS" canon 'seq(arith)'
 refuse "shape with a space" "$FS" canon 'loop(arith, array)'
 refuse "shape deeper than 8" "$FS" canon 'loop(loop(loop(loop(loop(loop(loop(loop(loop(arith)))))))))'
+refuse_why "shape depth boundary: 8 nested loops" "nesting deeper than 8" "$FS" canon 'loop(loop(loop(loop(loop(loop(loop(loop(arith))))))))'
+expect_out "shape depth boundary: 7 nested loops accepted" "gs1:loop(loop(loop(loop(loop(loop(loop(arith)))))))" "$FS" canon 'loop(loop(loop(loop(loop(loop(loop(arith)))))))'
 m() { printf '%s\n' "$@" > "$T/m.txt"; echo "$T/m.txt"; }
 refuse "meta count mismatch (R1)" "$FS" meta "$(m 'gen-meta 1' 'c1 corpus 2 0 1 0 0 0 loop(arith)')"
 refuse "meta heldout line in a public file" "$FS" meta "$(m 'gen-meta 1' 'h1 heldout 1 1 0 0 0 0 branch(arith)')"
@@ -390,5 +430,11 @@ if [ "${GEN_TASKS_CHECK:-0}" = 1 ]; then
   fi
 fi
 
+if [ -n "${GENP_OMC:-}" ]; then
+  np=$(wc -l < "$T/par.count"); nd=$(wc -l < "$T/par.diff")
+  if [ "$nd" -gt 0 ]; then fail "OM parity: $nd of $np invocations differ from the C build"; head -20 "$T/par.diff"
+  elif [ "$np" -gt 0 ]; then pass "OM parity: $np invocations byte-identical to the C build (stdout, stderr, exit status)"
+  else fail "OM parity: no invocation ran through the OM build"; fi
+fi
 echo "test-gen-protocol: $ok ok, $bad failed"
 [ "$bad" = 0 ]

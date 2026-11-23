@@ -1,0 +1,1980 @@
+om2
+note tools/gen/protocol/famsig_lib.om -- GEN family-signature contract v1 (aien-spark/omega#476), shared by
+note famsig.om and gencheck.om. The contract is tests/one_layer/generalization/families/FAMSIG_V1.md. Pure OM-2
+note port of tools/gen/protocol/famsig_lib.h (which stays as the protocol-pinned C reference). Program mode,
+note no fn main; prefix fs_. Needs seed/ng/sha256.om in the same unit (sh_dat, sh_all, sh_dig, sh_hexd).
+note
+note Shape grammar (no spaces, at most 512 bytes, depth at most 8, at most 64 nodes):
+note   node      := leaf | container "(" list ")" | "seq(" node "," list ")"
+note   list      := node ("," node)*
+note   leaf      := "arith" | "array" | "nested"
+note   container := "branch" | "call" | "loop"
+note Canonical form: a "seq" directly inside a container or inside another "seq" is flattened into it;
+note every child list is sorted by byte order of the children's canonical strings (duplicates kept).
+note Signature = "gs1:" + canonical form.
+note
+note Strings live in the heap fs_hp as packed handles (offset << 32 | length). Text sinks: 0..3 are the
+note bounded message buffers of the C reference (snprintf: at most cap - 1 bytes kept), 8 is stdout (fully
+note buffered, 4096 bytes, as glibc stdio on a file or pipe), 9 is stderr (written per message, unbuffered).
+note Capacities (refused with "famsig: out of memory", exit 2, where the C reference would allocate): files of
+note 16 MiB, 8192 metadata lines in all, 16 sets, 16 MiB of heap strings, a family list of 1 MiB.
+
+text fs_pnames "arithbranchlooparraycallnestedseq"
+text fs_snames "corpusdevheldout"
+text fs_t_gs1 "gs1:"
+text fs_t_gc1 "gc1:"
+text fs_t_gs1t "gs1-"
+text fs_t_genmeta "gen-meta 1\n"
+text fs_t_gensplit "gen-split 1\n"
+text fs_t_salt "salt "
+text fs_t_famhead "gen-famlist 1\nsalt "
+text fs_e_deep "nesting deeper than 8"
+text fs_e_byte "byte "
+text fs_e_expect ": expected one of arith array nested branch call loop seq"
+text fs_e_nodes "more than 64 nodes"
+text fs_e_leaf " is a leaf and takes no children"
+text fs_e_needs " needs '(' and at least "
+text fs_e_child " child"
+text fs_e_commap ": expected ',' or ')'"
+text fs_e_seq2 ": seq needs at least 2 children"
+text fs_e_slen1 "shape length "
+text fs_e_slen2 ", must be 1..512"
+text fs_e_extra ": extra text after the shape"
+text fs_e_clong "canonical form too long"
+text fs_e_llong "line too long"
+text fs_e_f9 "more than 9 fields"
+text fs_e_nf " fields, need 9: task split arith branch loop array call nested shape"
+text fs_e_empty1 "empty field "
+text fs_e_empty2 " (fields are separated by exactly one space)"
+text fs_e_tid1 "task id '"
+text fs_e_tid2 "' is not [a-z0-9_-]{1,40}"
+text fs_e_spl1 "split '"
+text fs_e_spl2 "' is not corpus, dev or heldout"
+text fs_e_cnt1 " count '"
+text fs_e_cnt2 "' is not a decimal 0..64 without leading zeros"
+text fs_e_shape "shape: "
+text fs_e_decl1 "declared "
+text fs_e_decl2 " but the shape has "
+text fs_e_cread ": cannot read"
+text fs_e_nonl ": empty or no final newline"
+text fs_e_ascii " is not \\n or printable ASCII"
+text fs_e_first ": first line must be 'gen-meta 1' or 'gen-split 1'"
+text fs_e_salt ":2: must be 'salt <64 lowercase hex>'"
+text fs_e_onlyho ": a gen-split file holds heldout lines only"
+text fs_e_hosealed ": heldout metadata belongs only in the sealed gen-split file"
+text fs_e_asc ": task ids must be strictly ascending (byte order)"
+text fs_e_nosalt ": missing salt line"
+text fs_e_mem "famsig: out of memory\n"
+text fs_r_r2 "FAIL R2 duplicate task id "
+text fs_r_r3 "FAIL R3 family shared by "
+text fs_r_r6 "FAIL R6 coarse family shared by "
+text fs_r_and " and "
+text fs_r_hidden "(heldout signature hidden)"
+text fs_r_r4a "FAIL R4 heldout task "
+text fs_r_r4b " uses "
+text fs_r_r4c ", which no corpus task uses"
+text fs_r_r4d " (no corpus metadata given)"
+text fs_r_r5a "FAIL R5 heldout task "
+text fs_r_r5b " uses fewer than 2 distinct primitives\n"
+text fs_r_r7a "FAIL R7 heldout task "
+text fs_r_r7b " has no composition edge absent from the corpus (novel_edges=0)\n"
+text fs_r_r8a "FAIL R8 "
+text fs_r_r8b " task "
+text fs_r_r8c " has a top-level step equal to corpus family "
+text fs_r_r8d " of "
+text fs_r_r8h "(heldout step hidden)"
+text fs_r_split "split "
+text fs_r_tasks " tasks="
+text fs_r_fams " families="
+text fs_r_family "family "
+text fs_r_novel " novel_edges="
+
+global fs_st ulong 64
+note fs_st: 0 stdout length, 1 stderr length, 2 heap top, 3 parse position, 4 shape source (packed),
+note 6 nodes, 7 root, 8 canonical form (packed), 9 metadata entries, 10 famlist length, 11 families,
+note 12 edges, 13 sets, 14 initialised
+global fs_ob uchar 4096
+global fs_eo uchar 65536
+global fs_eb uchar 4096
+global fs_el ulong 4
+global fs_ecap ulong 4
+global fs_hp uchar 16777216
+global fs_fb uchar 16777216
+global fs_fl uchar 1048576
+global fs_nkind ulong 64
+global fs_nnk ulong 64
+global fs_kid ulong 4096
+global fs_cnt ulong 6
+global fs_edg ulong 64
+global fs_fo ulong 10
+global fs_fln ulong 10
+global fs_mid ulong 8192
+global fs_msplit ulong 8192
+global fs_mcnt ulong 49152
+global fs_mshape ulong 8192
+global fs_msig ulong 8192
+global fs_mco ulong 8192
+global fs_mdist ulong 8192
+global fs_msrc ulong 8192
+global fs_sstart ulong 16
+global fs_sn ulong 16
+global fs_sis ulong 16
+global fs_ssalt ulong 16
+global fs_ssha ulong 16
+global fs_ix ulong 8192
+global fs_cedge ulong 256
+global fs_dig uchar 32
+
+note ---- sinks ------------------------------------------------------------------------------------
+
+fn fs_init to void
+  if ne get fs_st 14 0
+    ret
+  end
+  put fs_st 14 1
+  put fs_ecap 0 160
+  put fs_ecap 1 200
+  put fs_ecap 2 512
+  put fs_ecap 3 1024
+end
+
+fn fs_oflush to void
+  n = get fs_st 0
+  off = ulong 0
+  while lt off n bound 1000000
+    k = write 1 fs_ob off sub n off
+    if le k 0
+      put fs_st 0 0
+      ret
+    end
+    off = add off ulong k
+  end
+  put fs_st 0 0
+end
+
+fn fs_eflush to void
+  n = get fs_st 1
+  off = ulong 0
+  while lt off n bound 1000000
+    k = write 2 fs_eo off sub n off
+    if le k 0
+      put fs_st 1 0
+      ret
+    end
+    off = add off ulong k
+  end
+  put fs_st 1 0
+end
+
+note one byte to sink dst
+fn fs_pc dst ulong c uchar to void
+  if eq dst 8
+    p = get fs_st 0
+    put fs_ob p c
+    p = add p 1
+    put fs_st 0 p
+    if ge p 4096
+      fs_oflush
+    end
+    ret
+  end
+  if eq dst 9
+    q = get fs_st 1
+    if ge q 65536
+      fs_eflush
+      q = ulong 0
+    end
+    put fs_eo q c
+    put fs_st 1 add q 1
+    ret
+  end
+  l = get fs_el dst
+  if lt add l 1 get fs_ecap dst
+    put fs_eb add mul dst 1024 l c
+    put fs_el dst add l 1
+  end
+end
+
+fn fs_ps dst ulong s view uchar * to void
+  n = len s
+  for i ulong n bound 16777216
+    fs_pc dst get s i
+  end
+end
+
+fn fs_digits v ulong to ulong
+  if eq v 0
+    put fs_dig 0 48
+    ret 1
+  end
+  k = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put fs_dig k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  ret k
+end
+
+fn fs_pu dst ulong v ulong to void
+  k = fs_digits v
+  while gt k 0 bound 24
+    k = sub k 1
+    fs_pc dst get fs_dig k
+  end
+end
+
+fn fs_pi dst ulong v long to void
+  if lt v 0
+    fs_pc dst uchar 45
+    fs_pu dst add not bitcast ulong v 1
+    ret
+  end
+  fs_pu dst bitcast ulong v
+end
+
+note heap string h (packed) to sink dst
+fn fs_ph dst ulong h ulong to void
+  o = shr h 32
+  n = and h 4294967295
+  for i ulong n bound 16777216
+    fs_pc dst get fs_hp add o i
+  end
+end
+
+note file-buffer bytes fs_fb[o..o+n) to sink dst
+fn fs_pf dst ulong o ulong n ulong to void
+  for i ulong n bound 16777216
+    fs_pc dst get fs_fb add o i
+  end
+end
+
+note message buffer b to sink dst
+fn fs_pb dst ulong b ulong to void
+  n = get fs_el b
+  for i ulong n bound 1024
+    fs_pc dst get fs_eb add mul b 1024 i
+  end
+end
+
+fn fs_bclear b ulong to void
+  put fs_el b 0
+end
+
+note primitive name k (0..6) to sink dst
+fn fs_pp dst ulong k ulong to void
+  o = fs_poff k
+  n = fs_plen k
+  for i ulong n bound 8
+    fs_pc dst get fs_pnames add o i
+  end
+end
+
+fn fs_psplit dst ulong k ulong to void
+  o = ulong 0
+  n = ulong 6
+  if eq k 1
+    o = ulong 6
+    n = ulong 3
+  end
+  if eq k 2
+    o = ulong 9
+    n = ulong 7
+  end
+  for i ulong n bound 8
+    fs_pc dst get fs_snames add o i
+  end
+end
+
+fn fs_poff k ulong to ulong
+  if eq k 0
+    ret 0
+  end
+  if eq k 1
+    ret 5
+  end
+  if eq k 2
+    ret 11
+  end
+  if eq k 3
+    ret 15
+  end
+  if eq k 4
+    ret 20
+  end
+  if eq k 5
+    ret 24
+  end
+  ret 30
+end
+
+fn fs_plen k ulong to ulong
+  if eq k 0
+    ret 5
+  end
+  if eq k 1
+    ret 6
+  end
+  if eq k 2
+    ret 4
+  end
+  if eq k 3
+    ret 5
+  end
+  if eq k 4
+    ret 4
+  end
+  if eq k 5
+    ret 6
+  end
+  ret 3
+end
+
+fn fs_is_container k ulong to bool
+  ret or or eq k 1 eq k 2 eq k 4
+end
+
+fn fs_is_leaf k ulong to bool
+  ret or or eq k 0 eq k 3 eq k 5
+end
+
+note ---- heap -------------------------------------------------------------------------------------
+
+fn fs_nomem to void
+  fs_ps 9 fs_e_mem
+  fs_eflush
+  fs_oflush
+  exit 2
+end
+
+fn fs_hc c uchar to void
+  t = get fs_st 2
+  if ge t 16777216
+    fs_nomem
+  end
+  put fs_hp t c
+  put fs_st 2 add t 1
+end
+
+fn fs_htop to ulong
+  ret get fs_st 2
+end
+
+fn fs_hset t ulong to void
+  put fs_st 2 t
+end
+
+fn fs_pack o ulong n ulong to ulong
+  ret or shl o 32 n
+end
+
+fn fs_hend o ulong to ulong
+  ret fs_pack o sub get fs_st 2 o
+end
+
+fn fs_hlen h ulong to ulong
+  ret and h 4294967295
+end
+
+fn fs_hoff h ulong to ulong
+  ret shr h 32
+end
+
+note byte i of heap string h, 0 past its end (the C terminator)
+fn fs_hb h ulong i ulong to uchar
+  if ge i fs_hlen h
+    ret 0
+  end
+  ret get fs_hp add fs_hoff h i
+end
+
+fn fs_hcopy h ulong to void
+  o = fs_hoff h
+  n = fs_hlen h
+  for i ulong n bound 16777216
+    fs_hc get fs_hp add o i
+  end
+end
+
+fn fs_hs s view uchar * to void
+  n = len s
+  for i ulong n bound 16777216
+    fs_hc get s i
+  end
+end
+
+fn fs_hpk k ulong to void
+  o = fs_poff k
+  n = fs_plen k
+  for i ulong n bound 8
+    fs_hc get fs_pnames add o i
+  end
+end
+
+note new heap string: copy of fs_fb[o..o+n)
+fn fs_hfromfb o ulong n ulong to ulong
+  st = fs_htop
+  for i ulong n bound 16777216
+    fs_hc get fs_fb add o i
+  end
+  ret fs_hend st
+end
+
+note new heap string: text t then heap string h
+fn fs_hcat t view uchar * h ulong to ulong
+  st = fs_htop
+  fs_hs t
+  fs_hcopy h
+  ret fs_hend st
+end
+
+note strcmp of two heap strings: -1, 0, 1
+fn fs_hcmp a ulong b ulong to int
+  ao = fs_hoff a
+  bo = fs_hoff b
+  al = fs_hlen a
+  bl = fs_hlen b
+  m = al
+  if lt bl m
+    m = bl
+  end
+  for i ulong m bound 16777216
+    ca = get fs_hp add ao i
+    cb = get fs_hp add bo i
+    if ne ca cb
+      if lt ca cb
+        ret -1
+      end
+      ret 1
+    end
+  end
+  if lt al bl
+    ret -1
+  end
+  if gt al bl
+    ret 1
+  end
+  ret 0
+end
+
+fn fs_heq a ulong b ulong to bool
+  ret eq fs_hcmp a b 0
+end
+
+note heap string h equals text t
+fn fs_hist h ulong t view uchar * to bool
+  n = fs_hlen h
+  if ne n len t
+    ret false
+  end
+  o = fs_hoff h
+  for i ulong n bound 16777216
+    if ne get fs_hp add o i get t i
+      ret false
+    end
+  end
+  ret true
+end
+
+note heap string h holds byte c
+fn fs_hhas h ulong c uchar to bool
+  o = fs_hoff h
+  n = fs_hlen h
+  for i ulong n bound 16777216
+    if eq get fs_hp add o i c
+      ret true
+    end
+  end
+  ret false
+end
+
+note heap string h with its first k bytes dropped
+fn fs_hdrop h ulong k ulong to ulong
+  ret fs_pack add fs_hoff h k sub fs_hlen h k
+end
+
+note sort packed heap strings a[0..n) by byte order (insertion sort)
+fn fs_sortp a edit ulong 64 n ulong to void
+  for i ulong n bound 64
+    j = i
+    while gt j 0 bound 64
+      x = get a sub j 1
+      y = get a j
+      if le fs_hcmp x y 0
+        break
+      end
+      put a sub j 1 y
+      put a j x
+      j = sub j 1
+    end
+  end
+end
+
+note sha256 of heap string h: 64 lowercase hex as a new heap string
+fn fs_hsha h ulong to ulong
+  o = fs_hoff h
+  n = fs_hlen h
+  for i ulong n bound 16777216
+    put sh_dat i get fs_hp add o i
+  end
+  sh_all n
+  ret fs_hdigest
+end
+
+note sh_dig as 64 lowercase hex, a new heap string
+fn fs_hdigest to ulong
+  st = fs_htop
+  for i ulong 32
+    b = uint get sh_dig i
+    fs_hc sh_hexd shr b 4
+    fs_hc sh_hexd and b 15
+  end
+  ret fs_hend st
+end
+
+note ---- shapes -----------------------------------------------------------------------------------
+
+note byte i of the shape being parsed, 0 past its end
+fn fs_sc i ulong to uchar
+  ret fs_hb get fs_st 4 i
+end
+
+fn fs_kid_of v ulong j ulong to ulong
+  ret get fs_kid add mul v 64 j
+end
+
+note primitive at the parse position followed by ( , ) or the end: its kind (advancing), else -1
+fn fs_word to long
+  p = get fs_st 3
+  for k ulong 7
+    n = fs_plen k
+    o = fs_poff k
+    ok = true
+    for i ulong n bound 8
+      if ne fs_sc add p i get fs_pnames add o i
+        ok = false
+        break
+      end
+    end
+    if ok
+      c = fs_sc add p n
+      if or or eq c 40 eq c 44 or eq c 41 eq c 0
+        put fs_st 3 add p n
+        ret bitcast long k
+      end
+    end
+  end
+  ret -1
+end
+
+fn fs_err_byte pos0 ulong to void
+  fs_bclear 0
+  fs_ps 0 fs_e_byte
+  fs_pu 0 pos0
+end
+
+fn fs_node depth ulong to long
+  if gt depth 8
+    fs_bclear 0
+    fs_ps 0 fs_e_deep
+    ret -1
+  end
+  pos0 = get fs_st 3
+  kw = fs_word
+  if lt kw 0
+    fs_err_byte pos0
+    fs_ps 0 fs_e_expect
+    ret -1
+  end
+  k = bitcast ulong kw
+  me = get fs_st 6
+  if ge me 64
+    fs_bclear 0
+    fs_ps 0 fs_e_nodes
+    ret -1
+  end
+  put fs_st 6 add me 1
+  put fs_nkind me k
+  put fs_nnk me 0
+  if lt k 6
+    put fs_cnt k add get fs_cnt k 1
+  end
+  if fs_is_leaf k
+    if eq fs_sc get fs_st 3 40
+      fs_err_byte get fs_st 3
+      fs_pc 0 uchar 58
+      fs_pc 0 uchar 32
+      fs_pp 0 k
+      fs_ps 0 fs_e_leaf
+      ret -1
+    end
+    ret bitcast long me
+  end
+  ret fs_node_list depth pos0 me k
+end
+
+note the child list of container (or seq) node me of kind k, opened at byte at
+fn fs_node_list depth ulong pos0 ulong me ulong k ulong to long
+  if ne fs_sc get fs_st 3 40
+    fs_err_byte get fs_st 3
+    fs_pc 0 uchar 58
+    fs_pc 0 uchar 32
+    fs_pp 0 k
+    fs_ps 0 fs_e_needs
+    if eq k 6
+      fs_pu 0 2
+    else
+      fs_pu 0 1
+    end
+    fs_ps 0 fs_e_child
+    ret -1
+  end
+  put fs_st 3 add get fs_st 3 1
+  going = true
+  while going bound 1000
+    c = fs_node add depth 1
+    if lt c 0
+      ret -1
+    end
+    nk = get fs_nnk me
+    put fs_kid add mul me 64 nk bitcast ulong c
+    put fs_nnk me add nk 1
+    p = get fs_st 3
+    ch = fs_sc p
+    if eq ch 44
+      put fs_st 3 add p 1
+      continue
+    end
+    if eq ch 41
+      put fs_st 3 add p 1
+      going = false
+      continue
+    end
+    fs_err_byte p
+    fs_ps 0 fs_e_commap
+    ret -1
+  end
+  if and eq k 6 lt get fs_nnk me 2
+    fs_err_byte pos0
+    fs_ps 0 fs_e_seq2
+    ret -1
+  end
+  ret bitcast long me
+end
+
+note flattened children of node v appended to dst from n (a seq child is replaced by its flattened children)
+fn fs_flat v ulong dst edit ulong 64 n ulong to ulong
+  nk = get fs_nnk v
+  m = n
+  for j ulong nk bound 64
+    c = fs_kid_of v j
+    if eq get fs_nkind c 6
+      m = fs_flat c dst m
+    else
+      put dst m c
+      m = add m 1
+    end
+  end
+  ret m
+end
+
+note "prim(" ks[0] "," ... ")" as a new heap string
+fn fs_hjoin k ulong ks view ulong 64 n ulong to ulong
+  st = fs_htop
+  fs_hpk k
+  fs_hc uchar 40
+  for j ulong n bound 64
+    if gt j 0
+      fs_hc uchar 44
+    end
+    fs_hcopy get ks j
+  end
+  fs_hc uchar 41
+  ret fs_hend st
+end
+
+fn fs_hprim k ulong to ulong
+  st = fs_htop
+  fs_hpk k
+  ret fs_hend st
+end
+
+note canonical string of node v
+fn fs_canon v ulong to ulong
+  k = get fs_nkind v
+  if fs_is_leaf k
+    ret fs_hprim k
+  end
+  kids = new ulong 64 0
+  ks = new ulong 64 0
+  nk = fs_flat v kids 0
+  for j ulong nk bound 64
+    put ks j fs_canon get kids j
+  end
+  fs_sortp ks nk
+  ret fs_hjoin k view ks nk
+end
+
+note parse and canonicalise the heap string s; false with the reason in message buffer 0
+fn fs_shape s ulong to bool
+  put fs_st 4 s
+  put fs_st 3 0
+  put fs_st 6 0
+  for k ulong 6
+    put fs_cnt k 0
+  end
+  n = fs_hlen s
+  if or eq n 0 gt n 512
+    fs_bclear 0
+    fs_ps 0 fs_e_slen1
+    fs_pu 0 n
+    fs_ps 0 fs_e_slen2
+    ret false
+  end
+  r = fs_node 1
+  if lt r 0
+    ret false
+  end
+  put fs_st 7 bitcast ulong r
+  if lt get fs_st 3 n
+    fs_err_byte get fs_st 3
+    fs_ps 0 fs_e_extra
+    ret false
+  end
+  c = fs_canon bitcast ulong r
+  if ge fs_hlen c 520
+    fs_bclear 0
+    fs_ps 0 fs_e_clong
+    ret false
+  end
+  put fs_st 8 c
+  ret true
+end
+
+note ---- composition edges (codes parent * 8 + child) --------------------------------------------
+
+note byte i of the edge string "parent>child", 0 past its end
+fn fs_ech e ulong i ulong to uchar
+  p = div e 8
+  c = rem e 8
+  lp = fs_plen p
+  if lt i lp
+    ret get fs_pnames add fs_poff p i
+  end
+  if eq i lp
+    ret 62
+  end
+  j = sub sub i lp 1
+  if lt j fs_plen c
+    ret get fs_pnames add fs_poff c j
+  end
+  ret 0
+end
+
+fn fs_ecmp a ulong b ulong to int
+  for i ulong 16
+    ca = fs_ech a i
+    cb = fs_ech b i
+    if ne ca cb
+      if lt ca cb
+        ret -1
+      end
+      ret 1
+    end
+    if eq ca 0
+      ret 0
+    end
+  end
+  ret 0
+end
+
+fn fs_esort n ulong to void
+  for a ulong n bound 64
+    b = a
+    while gt b 0 bound 64
+      x = get fs_edg sub b 1
+      y = get fs_edg b
+      if le fs_ecmp x y 0
+        break
+      end
+      put fs_edg sub b 1 y
+      put fs_edg b x
+      b = sub b 1
+    end
+  end
+end
+
+note edge e already among fs_edg[0..n)
+fn fs_ehas e ulong n ulong to bool
+  for q ulong n bound 64
+    if eq get fs_edg q e
+      ret true
+    end
+  end
+  ret false
+end
+
+fn fs_edges_node v ulong nedg0 ulong to ulong
+  kids = new ulong 64 0
+  nedg = nedg0
+  nk = fs_flat v kids 0
+  pk = get fs_nkind v
+  for j ulong nk bound 64
+    e = add mul pk 8 get fs_nkind get kids j
+    if not fs_ehas e nedg
+      if lt nedg 64
+        put fs_edg nedg e
+        nedg = add nedg 1
+      end
+    end
+  end
+  ret nedg
+end
+
+note composition edges "parent>child" of the current shape: unique, sorted, in fs_edg; returns the count
+fn fs_edges to ulong
+  nedg = ulong 0
+  nn = get fs_st 6
+  for v ulong nn bound 64
+    if fs_is_container get fs_nkind v
+      nedg = fs_edges_node v nedg
+    end
+  end
+  fs_esort nedg
+  ret nedg
+end
+
+note coarse composition edges: as fs_edges with `nested` read as `arith`; unique, sorted
+fn fs_cedges to ulong
+  nedg = fs_edges
+  for q ulong nedg bound 64
+    e = get fs_edg q
+    if eq rem e 8 5
+      put fs_edg q sub e 5
+    end
+  end
+  fs_esort nedg
+  u = ulong 0
+  for q ulong nedg bound 64
+    keep = true
+    if gt u 0
+      if eq get fs_edg q get fs_edg sub u 1
+        keep = false
+      end
+    end
+    if keep
+      put fs_edg u get fs_edg q
+      u = add u 1
+    end
+  end
+  ret u
+end
+
+note ---- coarse form (rule R6) --------------------------------------------------------------------
+
+fn fs_coarse_node v ulong to ulong
+  k = get fs_nkind v
+  if fs_is_leaf k
+    if eq k 5
+      ret fs_hprim 0
+    end
+    ret fs_hprim k
+  end
+  kids = new ulong 64 0
+  ks = new ulong 64 0
+  nk = fs_flat v kids 0
+  for j ulong nk bound 64
+    put ks j fs_coarse_node get kids j
+  end
+  fs_sortp ks nk
+  u = fs_uniq ks nk
+  if and eq k 6 eq u 1
+    ret get ks 0
+  end
+  if and eq k 6 eq v get fs_st 7
+    ci = fs_one_container view ks u
+    if ge ci 0
+      ret get ks bitcast ulong ci
+    end
+  end
+  ret fs_hjoin k view ks u
+end
+
+note collapse equal neighbours of sorted ks[0..n); the new count
+fn fs_uniq ks edit ulong 64 n ulong to ulong
+  u = ulong 0
+  for j ulong n bound 64
+    keep = true
+    if gt u 0
+      if fs_heq get ks j get ks sub u 1
+        keep = false
+      end
+    end
+    if keep
+      put ks u get ks j
+      u = add u 1
+    end
+  end
+  ret u
+end
+
+note index of the only child string holding '(' (a container), -1 unless exactly one
+fn fs_one_container ks view ulong 64 n ulong to long
+  nc = ulong 0
+  ci = long -1
+  for j ulong n bound 64
+    if fs_hhas get ks j 40
+      nc = add nc 1
+      ci = bitcast long j
+    end
+  end
+  if eq nc 1
+    ret ci
+  end
+  ret -1
+end
+
+note "gc1:" + coarse form of the current shape
+fn fs_coarse to ulong
+  c = fs_coarse_node get fs_st 7
+  ret fs_hcat fs_t_gc1 c
+end
+
+note family token "gs1-" + first 16 hex of sha256(sig), sig = "gs1:" + canonical (a heap string)
+fn fs_token sig ulong to ulong
+  d = fs_hsha sig
+  st = fs_htop
+  fs_hs fs_t_gs1t
+  o = fs_hoff d
+  for i ulong 16
+    fs_hc get fs_hp add o i
+  end
+  ret fs_hend st
+end
+
+fn fs_hex64_ok h ulong to bool
+  if ne fs_hlen h 64
+    ret false
+  end
+  o = fs_hoff h
+  for i ulong 64
+    c = get fs_hp add o i
+    if not or and ge c 48 le c 57 and ge c 97 le c 102
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- metadata lines ---------------------------------------------------------------------------
+
+note task id byte: [a-z0-9_-]
+fn fs_idch c uchar to bool
+  if and ge c 97 le c 122
+    ret true
+  end
+  if and ge c 48 le c 57
+    ret true
+  end
+  ret or eq c 95 eq c 45
+end
+
+fn fs_task_id_ok h ulong to bool
+  n = fs_hlen h
+  if or lt n 1 gt n 40
+    ret false
+  end
+  o = fs_hoff h
+  for i ulong n bound 64
+    c = get fs_hp add o i
+    if not fs_idch c
+      ret false
+    end
+  end
+  ret true
+end
+
+note field f of the line being read as file-buffer bytes to sink dst
+fn fs_pfield dst ulong f ulong to void
+  fs_pf dst get fs_fo f get fs_fln f
+end
+
+note count field f: "0".."64" without leading zeros, its value; -1 otherwise
+fn fs_count_val f ulong to long
+  o = get fs_fo f
+  n = get fs_fln f
+  if or lt n 1 gt n 2
+    ret -1
+  end
+  c0 = get fs_fb o
+  if and eq n 2 eq c0 48
+    ret -1
+  end
+  v = long 0
+  for i ulong n bound 2
+    c = get fs_fb add o i
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    v = add mul v 10 long sub c 48
+  end
+  if gt v 64
+    ret -1
+  end
+  ret v
+end
+
+note split field: 0 corpus, 1 dev, 2 heldout, -1 otherwise
+fn fs_split_val f ulong to long
+  o = get fs_fo f
+  n = get fs_fln f
+  for k ulong 3
+    so = ulong 0
+    sn = ulong 6
+    if eq k 1
+      so = ulong 6
+      sn = ulong 3
+    end
+    if eq k 2
+      so = ulong 9
+      sn = ulong 7
+    end
+    if eq n sn
+      ok = true
+      for i ulong n bound 8
+        if ne get fs_fb add o i get fs_snames add so i
+          ok = false
+        end
+      end
+      if ok
+        ret bitcast long k
+      end
+    end
+  end
+  ret -1
+end
+
+note split the line fs_fb[lo..lo+ll) at single spaces into fs_fo / fs_fln; false with the reason in buffer 1
+fn fs_fields lo ulong ll ulong to bool
+  e = add lo ll
+  s = lo
+  nf = ulong 0
+  going = true
+  while going bound 64
+    if eq nf 10
+      fs_bclear 1
+      fs_ps 1 fs_e_f9
+      ret false
+    end
+    put fs_fo nf s
+    sp = s
+    while lt sp e bound 1024
+      if eq get fs_fb sp 32
+        break
+      end
+      sp = add sp 1
+    end
+    put fs_fln nf sub sp s
+    nf = add nf 1
+    if ge sp e
+      going = false
+    else
+      s = add sp 1
+    end
+  end
+  if ne nf 9
+    fs_bclear 1
+    fs_pu 1 nf
+    fs_ps 1 fs_e_nf
+    ret false
+  end
+  for i ulong 9
+    if eq get fs_fln i 0
+      fs_bclear 1
+      fs_ps 1 fs_e_empty1
+      fs_pu 1 add i 1
+      fs_ps 1 fs_e_empty2
+      ret false
+    end
+  end
+  ret true
+end
+
+note one metadata line "<task_id> <split> <arith> <branch> <loop> <array> <call> <nested> <shape>" into table
+note entry m; false with the reason in message buffer 1
+fn fs_meta_line lo ulong ll ulong m ulong to bool
+  if ge ll 1024
+    fs_bclear 1
+    fs_ps 1 fs_e_llong
+    ret false
+  end
+  if not fs_fields lo ll
+    ret false
+  end
+  id = fs_hfromfb get fs_fo 0 get fs_fln 0
+  if not fs_task_id_ok id
+    fs_bclear 1
+    fs_ps 1 fs_e_tid1
+    fs_pfield 1 0
+    fs_ps 1 fs_e_tid2
+    ret false
+  end
+  put fs_mid m id
+  sp = fs_split_val 1
+  if lt sp 0
+    fs_bclear 1
+    fs_ps 1 fs_e_spl1
+    fs_pfield 1 1
+    fs_ps 1 fs_e_spl2
+    ret false
+  end
+  put fs_msplit m bitcast ulong sp
+  if not fs_meta_counts m
+    ret false
+  end
+  ret fs_meta_shape m
+end
+
+fn fs_meta_counts m ulong to bool
+  for k ulong 6
+    v = fs_count_val add 2 k
+    if lt v 0
+      fs_bclear 1
+      fs_pp 1 k
+      fs_ps 1 fs_e_cnt1
+      fs_pfield 1 add 2 k
+      fs_ps 1 fs_e_cnt2
+      ret false
+    end
+    put fs_mcnt add mul m 6 k bitcast ulong v
+  end
+  ret true
+end
+
+fn fs_meta_shape m ulong to bool
+  shp = fs_hfromfb get fs_fo 8 get fs_fln 8
+  if not fs_shape shp
+    fs_bclear 1
+    fs_ps 1 fs_e_shape
+    fs_pb 1 0
+    ret false
+  end
+  dist = ulong 0
+  for k ulong 6
+    dv = get fs_mcnt add mul m 6 k
+    sv = get fs_cnt k
+    if ne sv dv
+      fs_bclear 1
+      fs_ps 1 fs_e_decl1
+      fs_pp 1 k
+      fs_pc 1 uchar 61
+      fs_pu 1 dv
+      fs_ps 1 fs_e_decl2
+      fs_pu 1 sv
+      ret false
+    end
+    if ne dv 0
+      dist = add dist 1
+    end
+  end
+  put fs_mshape m shp
+  put fs_msig m fs_hcat fs_t_gs1 get fs_st 8
+  put fs_mco m fs_coarse
+  put fs_mdist m dist
+  ret true
+end
+
+note ---- files ------------------------------------------------------------------------------------
+
+note read the file named by heap string path into fs_fb; its length, or -1 when it cannot be opened
+fn fs_slurp path ulong to long
+  n = fs_hlen path
+  if or eq n 0 gt n 4095
+    ret -1
+  end
+  o = fs_hoff path
+  for i ulong n bound 4096
+    if eq get fs_hp add o i 0
+      ret -1
+    end
+  end
+  fd = fopen fs_hp o n 0 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  going = true
+  while going bound 1000000000
+    if ge tot 16777216
+      ign = fclose int fd
+      fs_nomem
+    end
+    k = read int fd fs_fb tot sub 16777216 tot
+    if le k 0
+      going = false
+    else
+      tot = add tot ulong k
+    end
+  end
+  ign = fclose int fd
+  ret bitcast long tot
+end
+
+note fs_fb[o..) starts with text t (o + len t <= n)
+fn fs_fb_starts o ulong n ulong t view uchar * to bool
+  m = len t
+  if gt add o m n
+    ret false
+  end
+  for i ulong m bound 64
+    if ne get fs_fb add o i get t i
+      ret false
+    end
+  end
+  ret true
+end
+
+note a new empty metadata set; its id
+fn fs_set_new to ulong
+  s = get fs_st 13
+  if ge s 16
+    fs_nomem
+  end
+  put fs_st 13 add s 1
+  put fs_sstart s get fs_st 9
+  put fs_sn s 0
+  put fs_sis s 0
+  put fs_ssalt s 0
+  put fs_ssha s 0
+  ret s
+end
+
+fn fs_set_start s ulong to ulong
+  ret get fs_sstart s
+end
+
+fn fs_set_n s ulong to ulong
+  ret get fs_sn s
+end
+
+note message prefix "<path>" in buffer 2
+fn fs_rerr path ulong to void
+  fs_bclear 2
+  fs_ph 2 path
+end
+
+fn fs_rerr_ln path ulong ln ulong to void
+  fs_rerr path
+  fs_pc 2 uchar 58
+  fs_pu 2 ln
+end
+
+note Reads a "gen-meta 1" file (public: corpus/dev lines; '#' comments and blank lines allowed; heldout
+note lines refused) or a "gen-split 1" file (sealed: "salt <64 hex>", then heldout lines only, ids strictly
+note ascending, no comments or blank lines). Bytes: '\n' and 0x20..0x7E only, last byte '\n'.
+note Appends to set s; false with the reason in message buffer 2.
+fn fs_read path ulong s ulong to bool
+  n = fs_slurp path
+  if lt n 0
+    fs_rerr path
+    fs_ps 2 fs_e_cread
+    ret false
+  end
+  ln = bitcast ulong n
+  if not fs_read_bytes path ln
+    ret false
+  end
+  split = fs_fb_starts 0 ln fs_t_gensplit
+  if and not split not fs_fb_starts 0 ln fs_t_genmeta
+    fs_rerr path
+    fs_ps 2 fs_e_first
+    ret false
+  end
+  put fs_sis s 0
+  if split
+    put fs_sis s 1
+    for i ulong ln bound 16777216
+      put sh_dat i get fs_fb i
+    end
+    sh_all ln
+    put fs_ssha s fs_hdigest
+  end
+  ret fs_read_lines path s ln split
+end
+
+fn fs_read_bytes path ulong n ulong to bool
+  if eq n 0
+    fs_rerr path
+    fs_ps 2 fs_e_nonl
+    ret false
+  end
+  if ne get fs_fb sub n 1 10
+    fs_rerr path
+    fs_ps 2 fs_e_nonl
+    ret false
+  end
+  for i ulong n bound 16777216
+    b = get fs_fb i
+    if and ne b 10 or lt b 32 gt b 126
+      fs_rerr path
+      fs_pc 2 uchar 58
+      fs_pc 2 uchar 32
+      fs_ps 2 fs_e_byte
+      fs_pu 2 i
+      fs_ps 2 fs_e_ascii
+      ret false
+    end
+  end
+  ret true
+end
+
+note index of the next LF at or after p
+fn fs_nl p ulong to ulong
+  q = p
+  while ne get fs_fb q 10 bound 16777216
+    q = add q 1
+  end
+  ret q
+end
+
+note fs_st 15 the set being read, 16 its file is a gen-split file, 17 no task line yet, 18 previous task id
+fn fs_read_lines path ulong s ulong n ulong split bool to bool
+  line = add fs_nl 0 1
+  ln = ulong 1
+  put fs_st 15 s
+  put fs_st 16 0
+  if split
+    put fs_st 16 1
+  end
+  put fs_st 17 1
+  put fs_st 18 0
+  while lt line n bound 16777216
+    nl = fs_nl line
+    ln = add ln 1
+    if not fs_read_one path line sub nl line ln split
+      ret false
+    end
+    line = add nl 1
+  end
+  if and split lt ln 2
+    fs_rerr path
+    fs_ps 2 fs_e_nosalt
+    ret false
+  end
+  ret true
+end
+
+note one line after the header: the salt line of a split file, a comment or blank line of a meta file, or a task
+fn fs_read_one path ulong line ulong ll ulong ln ulong split bool to bool
+  if and split eq ln 2
+    ret fs_read_salt path get fs_st 15 line ll
+  end
+  if not split
+    if eq ll 0
+      ret true
+    end
+    if eq get fs_fb line 35
+      ret true
+    end
+  end
+  if not fs_read_task path line ll ln
+    ret false
+  end
+  put fs_st 18 get fs_mid sub get fs_st 9 1
+  put fs_st 17 0
+  ret true
+end
+
+fn fs_read_salt path ulong s ulong line ulong ll ulong to bool
+  ok = fs_fb_starts line add line ll fs_t_salt
+  if ok
+    h = fs_hfromfb add line 5 sub ll 5
+    if fs_hex64_ok h
+      put fs_ssalt s h
+      ret true
+    end
+  end
+  fs_rerr path
+  fs_ps 2 fs_e_salt
+  ret false
+end
+
+fn fs_read_task path ulong line ulong ll ulong ln ulong to bool
+  m = get fs_st 9
+  if ge m 8192
+    fs_nomem
+  end
+  if not fs_meta_line line ll m
+    fs_rerr_ln path ln
+    fs_pc 2 uchar 58
+    fs_pc 2 uchar 32
+    fs_pb 2 1
+    ret false
+  end
+  ret fs_read_task2 path ln m
+end
+
+fn fs_read_task2 path ulong ln ulong m ulong to bool
+  s = get fs_st 15
+  split = ne get fs_st 16 0
+  first = ne get fs_st 17 0
+  prev = get fs_st 18
+  fs_bclear 3
+  put fs_ecap 3 256
+  fs_ph 3 path
+  fs_pc 3 uchar 58
+  fs_pu 3 ln
+  put fs_ecap 3 1024
+  st = fs_htop
+  fs_pbheap 3
+  put fs_msrc m fs_hend st
+  sp = get fs_msplit m
+  if and split ne sp 2
+    fs_rerr_ln path ln
+    fs_ps 2 fs_e_onlyho
+    ret false
+  end
+  if and not split eq sp 2
+    fs_rerr_ln path ln
+    fs_ps 2 fs_e_hosealed
+    ret false
+  end
+  if and split not first
+    if ge fs_hcmp prev get fs_mid m 0
+      fs_rerr_ln path ln
+      fs_ps 2 fs_e_asc
+      ret false
+    end
+  end
+  put fs_st 9 add m 1
+  put fs_sn s add get fs_sn s 1
+  ret true
+end
+
+note message buffer b copied to the heap
+fn fs_pbheap b ulong to void
+  n = get fs_el b
+  for i ulong n bound 1024
+    fs_hc get fs_eb add mul b 1024 i
+  end
+end
+
+note FAMLIST bytes of split set s into fs_fl: "gen-famlist 1\n" "salt <hex>\n" then every distinct heldout
+note signature, sorted by byte order, one per line; length in fs_st 10, families in fs_st 11
+fn fs_famlist s ulong to void
+  b = fs_set_start s
+  n = fs_set_n s
+  ns = ulong 0
+  for i ulong n bound 8192
+    m = add b i
+    if eq get fs_msplit m 2
+      put fs_ix ns get fs_msig m
+      ns = add ns 1
+    end
+  end
+  fs_sort_ix ns
+  put fs_st 10 0
+  fs_fl_s fs_t_famhead
+  fs_fl_h get fs_ssalt s
+  fs_fl_c uchar 10
+  nf = ulong 0
+  for i ulong ns bound 8192
+    keep = true
+    if gt i 0
+      if fs_heq get fs_ix i get fs_ix sub i 1
+        keep = false
+      end
+    end
+    if keep
+      fs_fl_h get fs_ix i
+      fs_fl_c uchar 10
+      nf = add nf 1
+    end
+  end
+  put fs_st 11 nf
+end
+
+fn fs_fl_c c uchar to void
+  p = get fs_st 10
+  if ge p 1048576
+    fs_nomem
+  end
+  put fs_fl p c
+  put fs_st 10 add p 1
+end
+
+fn fs_fl_s t view uchar * to void
+  n = len t
+  for i ulong n bound 64
+    fs_fl_c get t i
+  end
+end
+
+fn fs_fl_h h ulong to void
+  o = fs_hoff h
+  n = fs_hlen h
+  for i ulong n bound 16777216
+    fs_fl_c get fs_hp add o i
+  end
+end
+
+note sha256 of the famlist bytes as a heap string
+fn fs_famlist_sha to ulong
+  n = get fs_st 10
+  for i ulong n bound 1048576
+    put sh_dat i get fs_fl i
+  end
+  sh_all n
+  ret fs_hdigest
+end
+
+note sort the packed heap strings fs_ix[0..n) by byte order (insertion sort)
+fn fs_sort_ix n ulong to void
+  for i ulong n bound 8192
+    j = i
+    while gt j 0 bound 8192
+      x = get fs_ix sub j 1
+      y = get fs_ix j
+      if le fs_hcmp x y 0
+        break
+      end
+      put fs_ix sub j 1 y
+      put fs_ix j x
+      j = sub j 1
+    end
+  end
+end
+
+note ---- the disjointness rule (FAMSIG_V1.md section 4) ------------------------------------------
+
+note entry order of the report: signature, then split, then task id
+fn fs_cmpmeta x ulong y ulong to int
+  c = fs_hcmp get fs_msig x get fs_msig y
+  if ne c 0
+    ret c
+  end
+  sx = get fs_msplit x
+  sy = get fs_msplit y
+  if ne sx sy
+    if lt sx sy
+      ret -1
+    end
+    ret 1
+  end
+  ret fs_hcmp get fs_mid x get fs_mid y
+end
+
+fn fs_r_hidden_or ho bool show bool h ulong to void
+  if and ho not show
+    fs_ps 8 fs_r_hidden
+  else
+    fs_ph 8 h
+  end
+end
+
+fn fs_r2 b ulong n ulong to ulong
+  fails = ulong 0
+  for i ulong n bound 8192
+    fails = add fails fs_r2_row b n i
+  end
+  ret fails
+end
+
+fn fs_r2_row b ulong n ulong i ulong to ulong
+  fails = ulong 0
+  x = add b i
+  for j ulong sub sub n i 1 bound 8192
+    y = add add b add i 1 j
+    if fs_heq get fs_mid x get fs_mid y
+      fs_ps 8 fs_r_r2
+      fs_ph 8 get fs_mid x
+      fs_pc 8 uchar 32
+      fs_pc 8 uchar 40
+      fs_ph 8 get fs_msrc x
+      fs_pc 8 uchar 44
+      fs_pc 8 uchar 32
+      fs_ph 8 get fs_msrc y
+      fs_pc 8 uchar 41
+      fs_pc 8 uchar 10
+      fails = add fails 1
+    end
+  end
+  ret fails
+end
+
+note R3 (coarse 0) and R6 (coarse 1) over pairs of entries of different splits
+fn fs_r36 b ulong n ulong coarse bool show bool to ulong
+  fails = ulong 0
+  for i ulong n bound 8192
+    fails = add fails fs_r36_row b n i coarse show
+  end
+  ret fails
+end
+
+fn fs_r36_row b ulong n ulong i ulong coarse bool show bool to ulong
+  fails = ulong 0
+  x = add b i
+  for j ulong sub sub n i 1 bound 8192
+    y = add add b add i 1 j
+    if fs_r36_hit x y coarse
+      fs_r36_print x y coarse show
+      fails = add fails 1
+    end
+  end
+  ret fails
+end
+
+fn fs_r36_hit x ulong y ulong coarse bool to bool
+  if eq get fs_msplit x get fs_msplit y
+    ret false
+  end
+  if not coarse
+    ret fs_heq get fs_msig x get fs_msig y
+  end
+  if not fs_heq get fs_mco x get fs_mco y
+    ret false
+  end
+  ret not fs_heq get fs_msig x get fs_msig y
+end
+
+fn fs_r36_print x ulong y ulong coarse bool show bool to void
+  sx = get fs_msplit x
+  sy = get fs_msplit y
+  ho = or eq sx 2 eq sy 2
+  if coarse
+    fs_ps 8 fs_r_r6
+  else
+    fs_ps 8 fs_r_r3
+  end
+  fs_psplit 8 sx
+  fs_ps 8 fs_r_and
+  fs_psplit 8 sy
+  fs_pc 8 uchar 58
+  fs_pc 8 uchar 32
+  if coarse
+    fs_r_hidden_or ho show get fs_mco x
+  else
+    fs_r_hidden_or ho show get fs_msig x
+  end
+  fs_pc 8 uchar 32
+  fs_ph 8 get fs_mid x
+  fs_ps 8 fs_r_and
+  fs_ph 8 get fs_mid y
+  fs_pc 8 uchar 10
+end
+
+note R4 every heldout primitive appears in some corpus task; R5 heldout shapes use >= 2 distinct primitives
+fn fs_r45 b ulong n ulong to ulong
+  has = new ulong 8 0
+  ncorpus = ulong 0
+  for i ulong n bound 8192
+    m = add b i
+    if eq get fs_msplit m 0
+      ncorpus = add ncorpus 1
+      for k ulong 6
+        if ne get fs_mcnt add mul m 6 k 0
+          put has k 1
+        end
+      end
+    end
+  end
+  fails = ulong 0
+  for i ulong n bound 8192
+    m = add b i
+    if eq get fs_msplit m 2
+      fails = add fails fs_r4_one m view has ncorpus
+      if lt get fs_mdist m 2
+        fs_ps 8 fs_r_r5a
+        fs_ph 8 get fs_mid m
+        fs_ps 8 fs_r_r5b
+        fails = add fails 1
+      end
+    end
+  end
+  ret fails
+end
+
+fn fs_r4_one m ulong has view ulong 8 ncorpus ulong to ulong
+  fails = ulong 0
+  for k ulong 6
+    if and ne get fs_mcnt add mul m 6 k 0 eq get has k 0
+      fs_ps 8 fs_r_r4a
+      fs_ph 8 get fs_mid m
+      fs_ps 8 fs_r_r4b
+      fs_pp 8 k
+      fs_ps 8 fs_r_r4c
+      if eq ncorpus 0
+        fs_ps 8 fs_r_r4d
+      end
+      fs_pc 8 uchar 10
+      fails = add fails 1
+    end
+  end
+  ret fails
+end
+
+note corpus composition edges (coarse), unique, at most 256, into fs_cedge; the count
+fn fs_corpus_edges b ulong n ulong to ulong
+  nce = ulong 0
+  for i ulong n bound 8192
+    m = add b i
+    if eq get fs_msplit m 0
+      mark = fs_htop
+      if fs_shape get fs_mshape m
+        nedg = fs_cedges
+        nce = fs_cedge_add nedg nce
+      end
+      fs_hset mark
+    end
+  end
+  ret nce
+end
+
+fn fs_cedge_add nedg ulong nce0 ulong to ulong
+  nce = nce0
+  for q ulong nedg bound 64
+    e = get fs_edg q
+    dup = false
+    for r ulong nce bound 256
+      if eq get fs_cedge r e
+        dup = true
+      end
+    end
+    if and not dup lt nce 256
+      put fs_cedge nce e
+      nce = add nce 1
+    end
+  end
+  ret nce
+end
+
+note composition edges of one shape that are absent from the corpus edge list
+fn fs_novel shp ulong nce ulong to ulong
+  mark = fs_htop
+  if not fs_shape shp
+    fs_hset mark
+    ret 0
+  end
+  nedg = fs_cedges
+  fs_hset mark
+  novel = ulong 0
+  for q ulong nedg bound 64
+    e = get fs_edg q
+    seen = false
+    for r ulong nce bound 256
+      if eq get fs_cedge r e
+        seen = true
+      end
+    end
+    if not seen
+      novel = add novel 1
+    end
+  end
+  ret novel
+end
+
+fn fs_r7 b ulong n ulong nce ulong to ulong
+  fails = ulong 0
+  for i ulong n bound 8192
+    m = add b i
+    if eq get fs_msplit m 2
+      if lt fs_novel get fs_mshape m nce 1
+        fs_ps 8 fs_r_r7a
+        fs_ph 8 get fs_mid m
+        fs_ps 8 fs_r_r7b
+        fails = add fails 1
+      end
+    end
+  end
+  ret fails
+end
+
+note R8 no top-level step of a dev or heldout shape (after seq flattening) is a container subtree whose
+note coarse form equals the coarse signature of a corpus task (other than the shape's own coarse signature)
+fn fs_r8 b ulong n ulong show bool to ulong
+  fails = ulong 0
+  for i ulong n bound 8192
+    m = add b i
+    if ne get fs_msplit m 0
+      mark = fs_htop
+      if fs_shape get fs_mshape m
+        if eq get fs_nkind get fs_st 7 6
+          fails = add fails fs_r8_steps b n m show
+        end
+      end
+      fs_hset mark
+    end
+  end
+  ret fails
+end
+
+fn fs_r8_steps b ulong n ulong m ulong show bool to ulong
+  kids = new ulong 64 0
+  nk = fs_flat get fs_st 7 kids 0
+  fails = ulong 0
+  for q ulong nk bound 64
+    kq = get kids q
+    if fs_is_container get fs_nkind kq
+      c = fs_coarse_node kq
+      fails = add fails fs_r8_match b n m c show
+    end
+  end
+  ret fails
+end
+
+fn fs_r8_match b ulong n ulong m ulong c ulong show bool to ulong
+  for j ulong n bound 8192
+    x = add b j
+    if eq get fs_msplit x 0
+      co = get fs_mco x
+      if fs_r8_eq co c m
+        fs_ps 8 fs_r_r8a
+        fs_psplit 8 get fs_msplit m
+        fs_ps 8 fs_r_r8b
+        fs_ph 8 get fs_mid m
+        fs_ps 8 fs_r_r8c
+        fs_ph 8 get fs_msig x
+        fs_ps 8 fs_r_r8d
+        fs_ph 8 get fs_mid x
+        fs_pc 8 uchar 58
+        fs_pc 8 uchar 32
+        if and eq get fs_msplit m 2 not show
+          fs_ps 8 fs_r_r8h
+        else
+          fs_ph 8 c
+        end
+        fs_pc 8 uchar 10
+        ret 1
+      end
+    end
+  end
+  ret 0
+end
+
+note corpus coarse signature co starts "gc1:", its rest equals c, and co differs from entry m's own
+fn fs_r8_eq co ulong c ulong m ulong to bool
+  if lt fs_hlen co 4
+    ret false
+  end
+  for i ulong 4
+    if ne fs_hb co i get fs_t_gc1 i
+      ret false
+    end
+  end
+  if not fs_heq fs_hdrop co 4 c
+    ret false
+  end
+  ret not fs_heq co get fs_mco m
+end
+
+note sort entry indices fs_ix[0..n) by fs_cmpmeta (insertion sort)
+fn fs_sort_meta n ulong to void
+  for i ulong n bound 8192
+    j = i
+    while gt j 0 bound 8192
+      x = get fs_ix sub j 1
+      y = get fs_ix j
+      if le fs_cmpmeta x y 0
+        break
+      end
+      put fs_ix sub j 1 y
+      put fs_ix j x
+      j = sub j 1
+    end
+  end
+end
+
+fn fs_report b ulong n ulong show bool nce ulong to void
+  for i ulong n bound 8192
+    put fs_ix i add b i
+  end
+  fs_sort_meta n
+  for sp ulong 3
+    fs_report_split n sp
+  end
+  i = ulong 0
+  while lt i n bound 8192
+    x = get fs_ix i
+    j = add i 1
+    while lt j n bound 8192
+      if not fs_same_family get fs_ix j x
+        break
+      end
+      j = add j 1
+    end
+    fs_report_family x sub j i show nce
+    i = j
+  end
+end
+
+fn fs_same_family y ulong x ulong to bool
+  if ne get fs_msplit y get fs_msplit x
+    ret false
+  end
+  ret fs_heq get fs_msig y get fs_msig x
+end
+
+fn fs_report_split n ulong sp ulong to void
+  t = ulong 0
+  f = ulong 0
+  for i ulong n bound 8192
+    x = get fs_ix i
+    if eq get fs_msplit x sp
+      t = add t 1
+      newf = true
+      if gt i 0
+        y = get fs_ix sub i 1
+        if fs_heq get fs_msig x get fs_msig y
+          if eq get fs_msplit y sp
+            newf = false
+          end
+        end
+      end
+      if newf
+        f = add f 1
+      end
+    end
+  end
+  fs_ps 8 fs_r_split
+  fs_psplit 8 sp
+  fs_ps 8 fs_r_tasks
+  fs_pu 8 t
+  fs_ps 8 fs_r_fams
+  fs_pu 8 f
+  fs_pc 8 uchar 10
+end
+
+fn fs_report_family x ulong cnt ulong show bool nce ulong to void
+  sp = get fs_msplit x
+  if and eq sp 2 not show
+    ret
+  end
+  fs_ps 8 fs_r_family
+  fs_psplit 8 sp
+  fs_pc 8 uchar 32
+  fs_ph 8 get fs_msig x
+  fs_ps 8 fs_r_tasks
+  fs_pu 8 cnt
+  if eq sp 2
+    fs_ps 8 fs_r_novel
+    fs_pu 8 fs_novel get fs_mshape x nce
+  end
+  fs_pc 8 uchar 10
+end
+
+note The disjointness rule over every entry of set s. Prints a report to stdout (heldout family signatures
+note only when show); returns the number of rule failures.
+fn fs_rule s ulong show bool to ulong
+  b = fs_set_start s
+  n = fs_set_n s
+  fails = fs_r2 b n
+  fails = add fails fs_r36 b n false show
+  fails = add fails fs_r36 b n true show
+  fails = add fails fs_r45 b n
+  nce = fs_corpus_edges b n
+  fails = add fails fs_r7 b n nce
+  fails = add fails fs_r8 b n show
+  fs_report b n show nce
+  ret fails
+end
