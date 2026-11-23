@@ -19,3 +19,24 @@ The optional kit names are `r3.ck`, `base.ck`, `trace.ck`, `r11.ck` and `S1_arit
 ## Numeric examples
 
 Supply 1 to 64 lines of unsigned 64-bit integers in canonical decimal. Each scalar row lists the one, two or three arguments followed by the expected result. An array row lists the active length (0 to 8), all eight input elements and the expected result. For an in-place rewrite, give all eight expected elements after the eight inputs. Caller examples are the only behavioral results given to the router. Keep independent evaluation inputs and outputs outside the kit.
+
+## Reproduce the prompt-only comparison
+
+On the Spark CPU, the combined solver passed 78 of the 165 frozen coding tasks. Round 6 alone passed 7. The respective scores after excluding six training-corpus matches were 73 and 5 out of 159. The per-task routes, verdicts and component hashes are in `evidence/OMEGALLM-COMBINED-20261123/` at the repository root. This historical task set has informed solver development.
+
+Run from the repository root with `KIT` set to the absolute path of the configured kit. The benchmark writes its compiler scratch files in the scoring directory. Give the scoring command the round 6 training text as a final argument to reproduce the overlap-filtered score.
+
+```sh
+set -eu
+d=$(mktemp -d)
+b=$PWD/train/omega-llm/tools/bench
+"$KIT/omc" < "$b/bench.om" > "$d/bench"
+chmod +x "$d/bench"
+mkdir "$d/prompts" "$d/answers"
+"$d/bench" prompts "$b/tasks.om" "$d/prompts"
+for p in "$d/prompts"/prompt-*; do
+    id=${p##*/prompt-}
+    "$KIT/solve" "$p" > "$d/answers/answer-$id"
+done
+"$d/bench" score "$b/tasks.om" "$b/expect.txt" "$KIT/omc" "$d/answers"
+```
