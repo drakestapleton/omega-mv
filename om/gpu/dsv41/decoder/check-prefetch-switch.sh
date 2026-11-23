@@ -50,6 +50,8 @@ case_ 10 big-entry-unset "$big"
 case_ 11 big-entry-zero "$big" "$k=0"
 case_ 11 zero-among-others "A=1" "$k=0" "Z=2"
 # More entries than a 65536-entry loop bound: a default run must still work, and the key is still found last.
+# Needs seq(1) and room for about 1.3 MB of arguments (the Linux default allows 2 MB); if env(1) cannot
+# start the control, the case fails with exit 126 rather than passing.
 many=$(seq -f "V%.0f=1" 70000)
 case_ 10 many-entries-unset $many
 case_ 11 many-entries-zero $many "$k=0"
