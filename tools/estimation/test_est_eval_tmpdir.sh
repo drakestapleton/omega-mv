@@ -28,7 +28,8 @@ set -u
 FIT=${1:?est_fit}
 EVAL=${2:?est_eval}
 W=${3:?workdir}
-RUNA=evidence/R15/raw/20260929T020536Z-ad8e1f2ea4e4-silicon
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+RUNA=$ROOT/evidence/R15/raw/20260929T020536Z-ad8e1f2ea4e4-silicon
 rm -rf "$W"; mkdir -p "$W"
 W=$(cd "$W" && pwd)
 pass=0; fail=0

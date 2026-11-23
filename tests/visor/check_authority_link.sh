@@ -118,7 +118,16 @@ printf '%s\n' $forbidden > "$TMPD/forbidden"
 # other than false, then blanked before the identifiers are checked.
 om_scan() {
     awk -v flist="$TMPD/forbidden" '
-    BEGIN { while ((getline l < flist) > 0) F[l] = 1; bad = 0 }
+    BEGIN { while ((getline l < flist) > 0) F[l] = 1; bad = 0
+            # OM-2 host words (seed/ng/hostwords.tsv) that start processes, open sockets,
+            # map memory or devices, or change the file system. omega needs none of them.
+            nh = split("fork execprog execpure execenv killpid waitpid setsid setpgid " \
+                       "socknew listen accept connect bind send recv sendmsg sockopt shutdown " \
+                       "devctl devcall uvmctl vfioctl vfiomap vfiomapw vfioirq mapnew mapdrop " \
+                       "mapwrite mapbind maphold mapset memfd prlimit setprio cpuset " \
+                       "chown chmod fchmod link symlnk unlink renames rmdir makedir truncate " \
+                       "ftrunc pwrite flock", hw, " ")
+            for (k = 1; k <= nh; k++) H[hw[k]] = 1 }
     function hit(msg) { print "FAIL: " FILENAME ":" FNR ": " msg ": " $0; bad = 1 }
     /^[[:space:]]*note([[:space:]]|$)/ { next }
     {
@@ -139,6 +148,12 @@ om_scan() {
             if (w[i] in F) hit("names forbidden authority symbol " w[i])
             else if (w[i] ~ /^(rx_|aienos_cap_|rc_)/) hit("names runtime/authority symbol " w[i])
             if (w[i] ~ /authorized/) hit("identifier " w[i] " holds authorization state")
+            if (w[i] in H) hit("uses OM-2 host word " w[i] ", which can reach authority without naming it")
+            if (w[i] == "fopen") {
+                # fopen path off len flags mode: only literal read-only flags (0, O_DIRECTORY 16384)
+                if (!(i + 4 <= n && (w[i + 4] == "0" || w[i + 4] == "16384")))
+                    hit("fopen whose flags are not literally read-only (0 or 16384)")
+            }
         }
     }
     END { exit bad }' "$@"
@@ -187,9 +202,17 @@ bite "call to an unlisted runtime symbol" '  x = rx_world_poke 1'
 bite "authorization state" 'global verq_authorized ulong 1'
 bite "JSON literal authorized true" 'text verq_bad "\",\"authorized\":true}"'
 bite "text literal authorized yes" 'text verq_bad2 "  authorized: yes\n"'
+bite "process start" '  pid = fork'
+bite "program exec" '  r = execprog verq_bad 0 0'
+bite "socket" '  s = socknew 2 1 0'
+bite "device control" '  devctl 3 0 0'
+bite "file system change" '  unlink verq_bad 0 0'
+bite "fopen for writing" '  fd = fopen verq_bad 0 8 577 420'
+bite "fopen with computed flags" '  fd = fopen verq_bad 0 8 get verq_fl 0 0'
 cp "$BASE" "$TMPD/plant.om"
-printf '%s\n' 'note rx_capadmin_mint authorized aienos_cap_mint' \
-    'text verq_ok "rx_capadmin_mint \",\"authorized\":false"' >> "$TMPD/plant.om"
+printf '%s\n' 'note rx_capadmin_mint authorized aienos_cap_mint fork socknew' \
+    'text verq_ok "rx_capadmin_mint \",\"authorized\":false fork execprog"' \
+    '  fd = fopen verq_ok 0 8 0 0' '  fd = fopen verq_ok 0 8 16384 0' >> "$TMPD/plant.om"
 om_scan "$TMPD/plant.om" > /dev/null || { echo "FAIL: bite control false positive (a note line or a literal tripped the scan)"; fail=1; }
 
 if [ "$fail" -ne 0 ]; then
