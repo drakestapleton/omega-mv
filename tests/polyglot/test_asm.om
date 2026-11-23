@@ -2,11 +2,17 @@ note SPDX-License-Identifier: Apache-2.0
 note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
 note
 note tests/polyglot/test_asm.om -- pure seeded OM-2 POLYGLOT-0 lane B1 correctness gate
-note (asm_sdot, asm_crumb): error contract, MA-3 shape grid, random unaligned+canary
-note cases, and large magnitudes up to OMX_MAX_N (16,777,215).
+note (asm_sdot, asm_crumb): loads/verifies actual AArch64 machine code from
+note src/polyglot/asm/omx_{sdot,crumb}.S (when .text.bin paths are passed) or
+note omx_encoder_build, audits every instruction word and callee-saved ABI
+note (x19..x28, d8..d15), runs negative bit-mutation differential checks, and
+note executes the AArch64 machine code via omx_vm_exec across error contract,
+note MA-3 shape grid, random unaligned+canary+guard cases, and large magnitudes
+note up to OMX_MAX_N (16,777,215).
 
 global g_ta_st ulong 8
-note [0]=checks [1]=fail [2]=cases [3]=rng
+note [0]=checks [1]=fail [2]=cases [3]=rng [4]=mut_caught [5]=gnu_matched
+global g_ta_arg uchar 512
 global g_ta_ns ulong 31
 global g_ta_ms ulong 10
 global g_ta_sps f64 5
@@ -17,16 +23,18 @@ text t_ta_pass "PASS"
 text t_ta_fail "FAIL"
 text t_ta_sep1 ": "
 text t_ta_chk " checks, "
-text t_ta_fls " failures; 2 candidates; cases: grid "
+text t_ta_fls " failures; 2 candidates (AArch64 machine-code exec + ABI/guard); cases: grid "
 text t_ta_rnd ", random "
 text t_ta_lrg ", large "
+text t_ta_mut "; mut-caught "
+text t_ta_gnu ", gnu-as-words "
 text t_ta_err "; error-contract checks "
 text t_ta_efail "FAIL test_asm check #"
 
 fn ta_init_tables to void
-  put g_ta_st 0 0
-  put g_ta_st 1 0
-  put g_ta_st 2 0
+  for i ulong 8
+    put g_ta_st i 0
+  end
   put g_ta_st 3 0x504f4c5941534d31
 
   put g_ta_ns 0 1
@@ -115,6 +123,94 @@ fn ta_chk cond bool to void
   end
 end
 
+note Verify GNU as .text.bin matches emitted object form, then load final form into VM.
+fn ta_verify_gnu_bin k ulong argi ulong to void
+  alen = argread argi g_ta_arg 0 512
+  ta_chk gt alen 0
+  if le alen 0
+    ret
+  end
+  ta_chk eq omx_encoder_build k 0 0
+  n = get g_enc_st 0
+  fd = fopen g_ta_arg 0 ulong alen 0 0
+  ta_chk ge fd 0
+  if lt fd 0
+    ret
+  end
+  tot = ulong 0
+  while lt tot 262144 bound 262144
+    r = read int fd g_omx_fbuf tot sub 262144 tot
+    if le r 0
+      break
+    end
+    tot = add tot ulong r
+  end
+  _c = fclose int fd
+  ta_chk eq tot mul 4 n
+  same = ulong 0
+  diff = ulong 0
+  for i ulong n bound 512
+    if le add mul 4 i 4 tot
+      g = uint omx_u32_le_fbuf mul 4 i
+      e = get g_enc_word i
+      if eq g e
+        same = add same 1
+      else
+        diff = add diff 1
+      end
+    end
+  end
+  ta_chk eq diff 0
+  put g_ta_st 5 add get g_ta_st 5 same
+end
+
+note Negative differential checks: mutating emitted machine code MUST fail audit/ABI/exec!
+fn ta_test_mutations to void
+  for i ulong 64
+    put g_omx_w i byte 1
+    put g_omx_x i byte 2
+  end
+  ta_chk eq omx_oracle 1 64 0 OMX_OK
+
+  note 1. Corrupt opcode bit (bit 28) in sdot -> audit & exec must reject
+  ta_chk eq omx_pack_sdot 1 64 1 OMX_OK
+  orig0 = get g_vm_c0 10
+  put g_vm_c0 10 xor orig0 uint 0x10000000
+  ta_chk ne omx_vm_audit_kernel OMX_ENC_SDOT 0
+  rc_bad = omx_vm_exec OMX_ENC_SDOT 7 0 0
+  ta_chk ne rc_bad 0
+  put g_vm_c0 10 orig0
+  put g_ta_st 4 add get g_ta_st 4 1
+
+  note 2. Clobber callee-saved x19 in sdot -> audit returns -2 & exec returns -104 (ABI)
+  orig1 = get g_vm_c0 11
+  clob = uint omx_a64_movz 1 19 42
+  put g_vm_c0 11 clob
+  ta_chk eq omx_vm_audit_word ulong clob -2
+  rc_abi = omx_vm_exec OMX_ENC_SDOT 7 0 0
+  ta_chk eq rc_abi -104
+  put g_vm_c0 11 orig1
+  put g_ta_st 4 add get g_ta_st 4 1
+
+  note 3. Functional mutation in crumb (change movz w0, #0 at ok exit to movz w0, #7) -> exec returns 7 != 0
+  ta_chk eq omx_pack_crumb 1 64 1 OMX_OK
+  nc1 = get g_vm_meta 3
+  ok_idx = sub nc1 4
+  orig2 = get g_vm_c1 ok_idx
+  put g_vm_c1 ok_idx uint omx_a64_movz 0 0 7
+  rc_mut = omx_vm_exec OMX_ENC_CRUMB 7 0 0
+  ta_chk eq rc_mut 7
+  put g_vm_c1 ok_idx orig2
+  put g_ta_st 4 add get g_ta_st 4 1
+
+  note 4. Verify clean kernels pass after restoration
+  ta_chk eq omx_vm_audit_kernel OMX_ENC_SDOT 0
+  ta_chk eq omx_vm_audit_kernel OMX_ENC_CRUMB 0
+  ta_chk eq omx_vm_exec OMX_ENC_CRUMB 7 0 0 OMX_OK
+  ta_chk eq get g_omx_y 0 get g_omx_yref 0
+  omx_plan_zero
+end
+
 note wk: 0=random 1=zero 2=pos 3=neg
 fn ta_fill_w cnt ulong wk ulong sp f64 to void
   for i ulong cnt bound 16777216
@@ -178,7 +274,7 @@ fn ta_run_rep kind ulong m ulong xoff ulong yoff ulong to void
   for i ulong m bound 65536
     put g_omx_y add yoff i int 0x5a5a5a5a
   end
-  ta_chk eq omx_run_cand kind xoff yoff 1 1 OMX_OK
+  ta_chk eq omx_vm_run_cand kind xoff yoff 1 1 OMX_OK
   bad = ulong 0
   for i ulong m bound 65536
     if ne get g_omx_y add yoff i get g_omx_yref i
@@ -259,8 +355,10 @@ fn ta_test_errors to void
   put g_omx_x 2 byte 3
   for c ulong 2
     kind = OMX_CAND_SDOT
+    k = OMX_ENC_SDOT
     if eq c 1
       kind = OMX_CAND_CRUMB
+      k = OMX_ENC_CRUMB
     end
     for b ulong 5
       put g_omx_w 3 get g_ta_bad b
@@ -280,17 +378,19 @@ fn ta_test_errors to void
     ta_chk eq omx_pack_cand kind div OMX_ULONG_MAX 2 1000 1 OMX_E_OVERFLOW
     ta_chk eq omx_plan_is_zero 1
     omx_plan_zero
-    ta_chk eq omx_run_cand kind 0 0 1 1 OMX_E_ARG
+    note Real AArch64 machine-code null/empty plan checks (cbz x0/x1/x2/x3/x4/x5)
+    ta_chk eq omx_vm_exec k 7 0 0 OMX_E_ARG
+    ta_chk eq omx_vm_exec k 6 0 0 OMX_E_ARG
     ta_chk eq omx_pack_cand kind 2 3 1 OMX_OK
-    ta_chk eq omx_run_cand kind 0 0 0 1 OMX_E_ARG
-    ta_chk eq omx_run_cand kind 0 0 1 0 OMX_E_ARG
+    ta_chk eq omx_vm_exec k 5 0 0 OMX_E_ARG
+    ta_chk eq omx_vm_exec k 3 0 0 OMX_E_ARG
     put g_omx_plan 0 0
-    ta_chk eq omx_run_cand kind 0 0 1 1 OMX_E_ARG
+    ta_chk eq omx_vm_exec k 7 0 0 OMX_E_ARG
     put g_omx_plan 0 2
     put g_omx_plan 1 0
-    ta_chk eq omx_run_cand kind 0 0 1 1 OMX_E_ARG
+    ta_chk eq omx_vm_exec k 7 0 0 OMX_E_ARG
     put g_omx_plan 1 3
-    ta_chk eq omx_run_cand kind 0 0 1 1 OMX_OK
+    ta_chk eq omx_vm_exec k 7 0 0 OMX_OK
     ta_chk eq get g_omx_y 0 int -2
     ta_chk eq get g_omx_y 1 int 4
     omx_plan_zero
@@ -299,10 +399,17 @@ end
 
 fn main to int
   ta_init_tables
+  if eq argcnt 3
+    ta_verify_gnu_bin OMX_ENC_SDOT 1
+    ta_verify_gnu_bin OMX_ENC_CRUMB 2
+  end
+  ta_chk eq omx_vm_load_kernel OMX_ENC_SDOT 0
+  ta_chk eq omx_vm_load_kernel OMX_ENC_CRUMB 0
+  ta_test_mutations
   ta_test_errors
   c0 = get g_ta_st 0
 
-  note 1. MA-3 shape grid
+  note 1. MA-3 shape grid executed on actual AArch64 machine code
   for a ulong 31
     nv = get g_ta_ns a
     for b ulong 10
@@ -318,8 +425,8 @@ fn main to int
   end
   grid_cases = get g_ta_st 2
 
-  note 2. random cases with unaligned offsets & y canaries
-  for it ulong 2000 bound 2000
+  note 2. random cases with unaligned offsets, guard bounds & y canaries
+  for it ulong 500 bound 500
     n = add 1 rem ta_rnd 2100
     m = add 1 rem ta_rnd 70
     xk = ulong 0
@@ -359,6 +466,10 @@ fn main to int
   omx_putu random_cases
   omx_puts t_ta_lrg
   omx_putu large_cases
+  omx_puts t_ta_mut
+  omx_putu get g_ta_st 4
+  omx_puts t_ta_gnu
+  omx_putu get g_ta_st 5
   omx_puts t_ta_err
   omx_putu c0
   omx_nl

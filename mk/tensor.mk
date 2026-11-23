@@ -45,10 +45,11 @@ TENSOR_STORE_OM_SRCS = src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/t
 
 $(OUT_DIR)/test_omega_tensor: src/tensor/test_tensor.om $(TENSOR_OM_CORE) $(TENSOR_OMC)
 	@mkdir -p $(OUT_DIR)
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TENSOR_OM_CORE) src/tensor/test_tensor.om) | $(TENSOR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TENSOR_OM_CORE) src/tensor/test_tensor.om) | $(TENSOR_OMC) > $@.tmp && chmod +x $@.tmp && mv $@.tmp $@
 
 test-tensor: $(OUT_DIR)/test_omega_tensor
-	./$(OUT_DIR)/test_omega_tensor
+	$(abspath $(OUT_DIR)/test_omega_tensor)
+	$(MAKE) --no-print-directory test-tensor-no-hooks
 
 # Default (library) build of the tensor sources: no OMEGA_TENSOR_TEST_HOOKS.
 # Fails if any test-only hook symbol is defined or referenced in the objects.
@@ -85,11 +86,12 @@ test-m20-receipt:
 
 $(OUT_DIR)/test_omega_tensor_store: src/tensor/test_tensor_store.om $(TENSOR_STORE_OM_SRCS) $(TENSOR_OMC)
 	@mkdir -p $(OUT_DIR)
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TENSOR_STORE_OM_SRCS) src/tensor/test_tensor_store.om) | $(TENSOR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TENSOR_STORE_OM_SRCS) src/tensor/test_tensor_store.om) | $(TENSOR_OMC) > $@.tmp && chmod +x $@.tmp && mv $@.tmp $@
 
 test-tensor-store: $(OUT_DIR)/test_omega_tensor_store
 	@rm -rf $(OUT_DIR)/tensor_store_scratch && mkdir -p $(OUT_DIR)/tensor_store_scratch
-	./$(OUT_DIR)/test_omega_tensor_store $(OUT_DIR)/tensor_store_scratch
+	$(abspath $(OUT_DIR)/test_omega_tensor_store) $(OUT_DIR)/tensor_store_scratch
+	$(MAKE) --no-print-directory test-tensor-no-hooks
 
 # ---- GB10 realization table (M20 cut gb10) ---------------------------------
 # test-tensor-gb10-host  PHYSICS_DIR=<physics checkout at physics.lock>:

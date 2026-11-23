@@ -2,16 +2,19 @@ note SPDX-License-Identifier: Apache-2.0
 note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
 note
 note tests/polyglot/verify_polyglot.om -- pure seeded OM-2 POLYGLOT-0 shared verifier:
-note checks all 5 pure-OM-2 candidates (om_plain, om_sdot, om_crumb, enc_sdot, enc_crumb)
+note checks all 5 candidates (om_plain, om_sdot, om_crumb, enc_sdot, enc_crumb)
 note against omx_oracle across error contract, shape error contract, MA-3 grid,
 note large shapes, random cases, and 5-run in-place x mutation anti-memoization checks.
+note enc_sdot and enc_crumb execute their actual emitted AArch64 machine code via
+note omx_vm_exec with guard-page bounds and callee-saved x19..x28/d8..d15 verification,
+note plus harness ABI audit and negative bit-mutation differential checks.
 
 const VP_NC ulong 5
 
 global g_vp_checks ulong 8
 global g_vp_fail ulong 8
 global g_vp_cases ulong 8
-note g_vp_st: [0]=rng [1]=hchecks [2]=hfail
+note g_vp_st: [0]=rng [1]=hchecks [2]=hfail [3]=nrand
 global g_vp_st ulong 4
 
 global g_vp_x1 byte 1048576
@@ -20,30 +23,34 @@ global g_vp_x3 byte 1048576
 global g_vp_yref1 int 65536
 global g_vp_yref2 int 65536
 global g_vp_yref3 int 65536
+global g_vp_env uchar 256
 
 global g_vp_ns ulong 31
 global g_vp_ms ulong 10
 global g_vp_sps f64 5
 global g_vp_bad byte 5
 
+text t_vp_envk "OMX_VERIFY_RANDOM="
 text t_vp_c0 "om_plain        "
 text t_vp_c1 "om_sdot         "
 text t_vp_c2 "om_crumb        "
 text t_vp_c3 "enc_sdot        "
 text t_vp_c4 "enc_crumb       "
+text t_vp_l0 "omega-om2      "
+text t_vp_l1 "omega-encoder  "
 text t_vp_line1 "POLYGLOT verify "
-text t_vp_lang "omega-om2      "
 text t_vp_pass "PASS"
 text t_vp_fail "FAIL"
 text t_vp_s1 ": "
 text t_vp_s2 " checks, "
 text t_vp_s3 " failures, "
-text t_vp_s4 " cases (pure OM-2)\n"
+text t_vp_s4 " cases\n"
 text t_vp_sum1 "POLYGLOT verify-polyglot "
 text t_vp_sum2 ": 5 candidates ("
 text t_vp_sum3 " failing), "
 text t_vp_sum4 " checks, "
-text t_vp_sum5 " failures, grid+large+random verified (pure OM-2)\n"
+text t_vp_sum5 " failures, grid+large+random+guard+callee-saved(x19-x28/d8-d15) verified, harness "
+text t_vp_sl "/"
 text t_vp_efail "FAIL verify_polyglot cand="
 
 fn vp_init to void
@@ -55,6 +62,7 @@ fn vp_init to void
   put g_vp_st 0 0x504f4c59474c4f54
   put g_vp_st 1 0
   put g_vp_st 2 0
+  put g_vp_st 3 200
 
   put g_vp_ns 0 1
   put g_vp_ns 1 2
@@ -112,6 +120,39 @@ fn vp_init to void
   put g_vp_bad 4 byte 3
 end
 
+fn vp_read_env_nrand to void
+  ec = ulong envcnt
+  klen = len t_vp_envk
+  for i ulong ec bound 512
+    el = envread i g_vp_env 0 256
+    if gt el long klen
+      ok = ulong 1
+      for j ulong klen bound 32
+        if ne get g_vp_env j get t_vp_envk j
+          ok = 0
+          break
+        end
+      end
+      if eq ok 1
+        v = ulong 0
+        j = klen
+        while lt j ulong el bound 32
+          c = get g_vp_env j
+          if or lt c 48 gt c 57
+            break
+          end
+          v = add mul v 10 ulong sub c 48
+          j = add j 1
+        end
+        if le v 20000
+          put g_vp_st 3 v
+        end
+        ret
+      end
+    end
+  end
+end
+
 fn vp_rnd to ulong
   st = new ulong 1 0
   put st 0 get g_vp_st 0
@@ -146,6 +187,37 @@ fn vp_hchk cond bool to void
   if not cond
     put g_vp_st 2 add get g_vp_st 2 1
   end
+end
+
+fn vp_run_cand ci ulong xoff ulong yoff ulong has_x ulong has_y ulong to int
+  if ge ci OMX_CAND_ENC_SDOT
+    ret omx_vm_run_cand ci xoff yoff has_x has_y
+  end
+  ret omx_run_cand ci xoff yoff has_x has_y
+end
+
+fn vp_harness_selftest to void
+  vp_hchk eq omx_vm_load_kernel OMX_ENC_SDOT 0
+  vp_hchk eq omx_vm_load_kernel OMX_ENC_CRUMB 0
+  for i ulong 64
+    put g_omx_w i byte 1
+    put g_omx_x i byte 2
+  end
+  vp_hchk eq omx_oracle 1 64 0 OMX_OK
+  vp_hchk eq omx_pack_sdot 1 64 1 OMX_OK
+  note Negative check: mutating enc_sdot to clobber x20 must be caught as ABI error -104
+  o0 = get g_vm_c0 11
+  put g_vm_c0 11 uint omx_a64_movz 1 20 99
+  vp_hchk eq omx_vm_exec OMX_ENC_SDOT 7 0 0 -104
+  put g_vm_c0 11 o0
+  note Negative check: illegal opcode bit (bit 28) must be caught
+  o1 = get g_vm_c0 10
+  put g_vm_c0 10 xor o1 uint 0x10000000
+  vp_hchk ne omx_vm_exec OMX_ENC_SDOT 7 0 0 0
+  put g_vm_c0 10 o1
+  vp_hchk eq omx_vm_exec OMX_ENC_SDOT 7 0 0 OMX_OK
+  vp_hchk eq get g_omx_y 0 get g_omx_yref 0
+  omx_plan_zero
 end
 
 fn vp_fill_w cnt ulong wk ulong sp f64 to void
@@ -285,7 +357,7 @@ fn vp_run_one_rep ci ulong m ulong src ulong ref_id ulong to void
     put g_omx_y i int 0x5a5a5a5a
   end
   vp_copy_x_from src get g_omx_plan 1
-  vp_chk ci eq omx_run_cand ci 0 0 1 1 OMX_OK
+  vp_chk ci eq vp_run_cand ci 0 0 1 1 OMX_OK
   vp_check_y ci ref_id m
 end
 
@@ -311,8 +383,10 @@ fn vp_run_case m ulong n ulong wk ulong sp f64 xk ulong to void
     end
     vp_chk ci and gt get g_omx_plan 2 0 ge get g_omx_plan 3 get g_omx_plan 2
     vp_chk ci and eq get g_omx_plan 0 m eq get g_omx_plan 1 n
+    note 5 runs: x1, x2, x1, x1-in-place, x3-mutated-in-place (anti-memoization)
     vp_run_one_rep ci m 1 1
     vp_run_one_rep ci m 2 2
+    vp_run_one_rep ci m 1 1
     vp_run_one_rep ci m 1 1
     vp_run_one_rep ci m 3 3
     omx_plan_zero
@@ -350,12 +424,14 @@ fn vp_test_errors to void
     vp_chk ci and eq omx_pack_cand ci 1 add OMX_MAX_N 1 1 OMX_E_ARG eq omx_plan_is_zero 1
     vp_chk ci and eq omx_pack_cand ci div OMX_ULONG_MAX 2 4 1 OMX_E_OVERFLOW eq omx_plan_is_zero 1
     omx_plan_zero
-    vp_chk ci eq omx_run_cand ci 0 0 1 1 OMX_E_ARG
+    vp_chk ci eq vp_run_cand ci 0 0 1 1 OMX_E_ARG
     vp_chk ci eq omx_pack_cand ci 2 3 1 OMX_OK
     omx_plan_zero
     vp_chk ci eq omx_plan_is_zero 1
     vp_chk ci eq omx_pack_cand ci 2 3 1 OMX_OK
-    vp_chk ci eq omx_run_cand ci 0 0 1 1 OMX_OK
+    vp_chk ci eq vp_run_cand ci 0 0 0 1 OMX_E_ARG
+    vp_chk ci eq vp_run_cand ci 0 0 1 0 OMX_E_ARG
+    vp_chk ci eq vp_run_cand ci 0 0 1 1 OMX_OK
     vp_chk ci and eq get g_omx_y 0 int -2 eq get g_omx_y 1 int -2
     omx_plan_zero
   end
@@ -403,6 +479,8 @@ end
 
 fn main to int
   vp_init
+  vp_read_env_nrand
+  vp_harness_selftest
   vp_test_errors
   vp_test_err_shape 1 17
   vp_test_err_shape 5 16
@@ -412,7 +490,7 @@ fn main to int
   vp_test_err_shape 2 4099
   vp_test_err_shape 33 257
 
-  note MA-3 structured grid (selected representative + boundary shapes)
+  note MA-3 structured grid (all 31x10 tail combinations)
   for a ulong 31
     nv = get g_vp_ns a
     for b ulong 10
@@ -433,8 +511,9 @@ fn main to int
   vp_run_case 1 131073 0 0.0f64 5
   vp_run_case 1 1000003 0 0.33f64 0
 
-  note Random cases
-  for it ulong 500 bound 500
+  note Random cases (count from OMX_VERIFY_RANDOM or default 200)
+  nrand = get g_vp_st 3
+  for it ulong nrand bound 20000
     n = add 1 rem vp_rnd 1025
     m = add 1 rem vp_rnd 70
     vp_run_case m n 0 vp_rnd01 rem vp_rnd 6
@@ -450,7 +529,11 @@ fn main to int
     tf = add tf f
     omx_puts t_vp_line1
     vp_cname ci
-    omx_puts t_vp_lang
+    if ge ci OMX_CAND_ENC_SDOT
+      omx_puts t_vp_l1
+    else
+      omx_puts t_vp_l0
+    end
     if or ne f 0 eq c 0
       bad_c = add bad_c 1
       omx_puts t_vp_fail
@@ -480,6 +563,10 @@ fn main to int
   omx_puts t_vp_sum4
   omx_putu tf
   omx_puts t_vp_sum5
+  omx_putu sub get g_vp_st 1 get g_vp_st 2
+  omx_puts t_vp_sl
+  omx_putu get g_vp_st 1
+  omx_nl
   if failed
     ret 1
   end

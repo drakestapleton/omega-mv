@@ -1397,3 +1397,1121 @@ fn omx_encoder_build k ulong base ulong to int
   end
   ret 0
 end
+
+note ========================================================================
+note AArch64 Architectural Machine-Code Executor, ABI Auditor & Guard Verifier
+note Executes the actual 32-bit AArch64 instruction words emitted by
+note omx_encoder_build (or loaded from GNU as .text.bin) with strict encoding
+note validation, guard-page bounds checks on W/x/y/stack/rodata, and
+note callee-saved x19..x28 / d8..d15 sentinel verification.
+note ========================================================================
+
+const VM_BASE ulong 0x10000000
+const VM_PLAN_BASE ulong 0x18000000
+const VM_W_BASE ulong 0x20000000
+const VM_X_BASE ulong 0x30000000
+const VM_Y_BASE ulong 0x40000000
+const VM_STK_LO ulong 0x70000000
+const VM_STK_HI ulong 0x70001000
+const VM_LR_SENT ulong 0xdeadbeefcafebabe
+
+global g_vm_c0 uint 512
+global g_vm_c1 uint 512
+note g_vm_meta: [0]=n0 [1]=doff0 [2]=dlen0 [3]=n1 [4]=doff1 [5]=dlen1 [6]=ready0 [7]=ready1
+global g_vm_meta ulong 8
+global g_vm_x ulong 32
+global g_vm_v uchar 512
+global g_vm_stk uchar 4096
+global g_vm_pmem uchar 24
+note g_vm_st: [0]=N [1]=Z [2]=C [3]=V [4]=err [5]=pc [6]=icount [7]=cur_k
+global g_vm_st ulong 8
+note g_vm_mem: [0]=w_len [1]=x_off [2]=x_len [3]=x_vbase [4]=y_off [5]=y_len [6]=y_vbase [7]=flags
+global g_vm_mem ulong 8
+global g_vm_tmp uint 8
+global g_vm_abi_err ulong 4
+
+fn vm_sext v ulong bits ulong to long
+  m = shl ulong 1 sub bits 1
+  mask = sub shl ulong 1 bits 1
+  u = and v mask
+  ret sub long xor u m long m
+end
+
+fn vm_u32_to_i32 u ulong to int
+  v = and u 0xffffffff
+  if ge v 0x80000000
+    ret int sub long v 0x100000000
+  end
+  ret int v
+end
+
+fn vm_i32_to_u32 v int to uint
+  ret uint and bitcast ulong long v 0xffffffff
+end
+
+fn vm_bm_topbit v ulong to long
+  b = long 6
+  while ge b 0 bound 8
+    if ne and v shl ulong 1 ulong b 0
+      ret b
+    end
+    b = sub b 1
+  end
+  ret -1
+end
+
+fn vm_bm_rep elem ulong esize ulong to ulong
+  res = ulong 0
+  sh = ulong 0
+  while lt sh 64 bound 64
+    res = or res shl elem sh
+    sh = add sh esize
+  end
+  ret res
+end
+
+fn vm_bm_elem s ulong r ulong esize ulong to ulong
+  emask = ulong 0xffffffffffffffff
+  if lt esize 64
+    emask = sub shl ulong 1 esize 1
+  end
+  welem = sub shl ulong 1 add s 1 1
+  if gt r 0
+    ret and or shr welem r shl welem sub esize r emask
+  end
+  ret welem
+end
+
+fn oxe_decode_bitmask64 nbit ulong immr ulong imms ulong ok edit ulong 1 to ulong
+  put ok 0 0
+  blen = vm_bm_topbit or shl nbit 6 and not imms 0x3f
+  if lt blen 1
+    ret 0
+  end
+  lu = ulong blen
+  levels = sub shl ulong 1 lu 1
+  s = and imms levels
+  if eq s levels
+    ret 0
+  end
+  elem = vm_bm_elem s and immr levels shl ulong 1 lu
+  put ok 0 1
+  ret vm_bm_rep elem shl ulong 1 lu
+end
+
+fn vm_cs_sentinel idx ulong to ulong
+  hi = shl or ulong 0x5a00 idx 48
+  lo = and mul ulong 0x1111 add idx 1 0xffff
+  ret or hi lo
+end
+
+fn vm_gx r ulong to ulong
+  if eq r 31
+    ret 0
+  end
+  ret get g_vm_x r
+end
+
+fn vm_px r ulong v ulong to void
+  if lt r 31
+    put g_vm_x r v
+  end
+end
+
+fn vm_gv32 r ulong lane ulong to uint
+  o = add mul r 16 mul lane 4
+  b0 = uint get g_vm_v o
+  b1 = uint get g_vm_v add o 1
+  b2 = uint get g_vm_v add o 2
+  b3 = uint get g_vm_v add o 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn vm_pv32 r ulong lane ulong val uint to void
+  o = add mul r 16 mul lane 4
+  put g_vm_v o uchar and val 255
+  put g_vm_v add o 1 uchar and shr val 8 255
+  put g_vm_v add o 2 uchar and shr val 16 255
+  put g_vm_v add o 3 uchar and shr val 24 255
+end
+
+fn vm_rd8 addr ulong to uchar
+  if eq get g_vm_st 7 0
+    rb = add VM_BASE get g_vm_meta 1
+    if ge addr rb
+      if lt sub addr rb get g_vm_meta 2
+        ret get g_enc_sdot_mask sub addr rb
+      end
+    end
+  end
+  if ne and get g_vm_mem 7 1 0
+    if ge addr VM_PLAN_BASE
+      if lt sub addr VM_PLAN_BASE 24
+        ret get g_vm_pmem sub addr VM_PLAN_BASE
+      end
+    end
+  end
+  if ge addr VM_W_BASE
+    if lt sub addr VM_W_BASE get g_vm_mem 0
+      ret get g_omx_pack sub addr VM_W_BASE
+    end
+  end
+  if ne and get g_vm_mem 7 2 0
+    xv = get g_vm_mem 3
+    if ge addr xv
+      if lt sub addr xv get g_vm_mem 2
+        b = get g_omx_x add get g_vm_mem 1 sub addr xv
+        ret uchar and int b 255
+      end
+    end
+  end
+  if ge addr VM_STK_LO
+    if lt addr VM_STK_HI
+      ret get g_vm_stk sub addr VM_STK_LO
+    end
+  end
+  put g_vm_st 4 2
+  ret uchar 0
+end
+
+fn vm_wr8 addr ulong v uchar to void
+  if ge addr VM_STK_LO
+    if lt addr VM_STK_HI
+      put g_vm_stk sub addr VM_STK_LO v
+      ret
+    end
+  end
+  if ne and get g_vm_mem 7 4 0
+    yv = get g_vm_mem 6
+    if ge addr yv
+      off = sub addr yv
+      if lt off get g_vm_mem 5
+        idx = add get g_vm_mem 4 div off 4
+        sh = mul and off 3 8
+        cur = vm_i32_to_u32 get g_omx_y idx
+        msk = not shl uint 255 uint sh
+        nw = or and cur msk shl uint v uint sh
+        put g_omx_y idx vm_u32_to_i32 ulong nw
+        ret
+      end
+    end
+  end
+  put g_vm_st 4 2
+end
+
+fn vm_rd64 addr ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    b = ulong vm_rd8 add addr i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn vm_wr32 addr ulong val uint to void
+  if ne and get g_vm_mem 7 4 0
+    yv = get g_vm_mem 6
+    if ge addr yv
+      off = sub addr yv
+      if le add off 4 get g_vm_mem 5
+        if eq and off 3 0
+          put g_omx_y add get g_vm_mem 4 div off 4 vm_u32_to_i32 ulong val
+          ret
+        end
+      end
+    end
+  end
+  vm_wr8 addr uchar and val 255
+  vm_wr8 add addr 1 uchar and shr val 8 255
+  vm_wr8 add addr 2 uchar and shr val 16 255
+  vm_wr8 add addr 3 uchar and shr val 24 255
+end
+
+fn vm_rd16_vec reg ulong addr ulong to void
+  dst = mul reg 16
+  if ge addr VM_W_BASE
+    off = sub addr VM_W_BASE
+    if le add off 16 get g_vm_mem 0
+      for i ulong 16
+        put g_vm_v add dst i get g_omx_pack add off i
+      end
+      ret
+    end
+  end
+  if ne and get g_vm_mem 7 2 0
+    xv = get g_vm_mem 3
+    if ge addr xv
+      off = sub addr xv
+      if le add off 16 get g_vm_mem 2
+        xb = add get g_vm_mem 1 off
+        for i ulong 16
+          put g_vm_v add dst i uchar and int get g_omx_x add xb i 255
+        end
+        ret
+      end
+    end
+  end
+  if ge addr VM_STK_LO
+    off = sub addr VM_STK_LO
+    if le add off 16 4096
+      for i ulong 16
+        put g_vm_v add dst i get g_vm_stk add off i
+      end
+      ret
+    end
+  end
+  for i ulong 16
+    put g_vm_v add dst i vm_rd8 add addr i
+  end
+end
+
+fn vm_wr16_vec reg ulong addr ulong to void
+  src = mul reg 16
+  if ge addr VM_STK_LO
+    off = sub addr VM_STK_LO
+    if le add off 16 4096
+      for i ulong 16
+        put g_vm_stk add off i get g_vm_v add src i
+      end
+      ret
+    end
+  end
+  if ne and get g_vm_mem 7 4 0
+    yv = get g_vm_mem 6
+    if ge addr yv
+      off = sub addr yv
+      if le add off 16 get g_vm_mem 5
+        if eq and off 3 0
+          base = add get g_vm_mem 4 div off 4
+          for l ulong 4
+            put g_omx_y add base l vm_u32_to_i32 ulong vm_gv32 reg l
+          end
+          ret
+        end
+      end
+    end
+  end
+  for i ulong 16
+    vm_wr8 add addr i get g_vm_v add src i
+  end
+end
+
+fn vm_cond_holds cond ulong to ulong
+  c = and cond 15
+  if eq c 0
+    ret get g_vm_st 1
+  end
+  if eq c 1
+    if eq get g_vm_st 1 0
+      ret 1
+    end
+    ret 0
+  end
+  if eq c 2
+    ret get g_vm_st 2
+  end
+  if eq c 3
+    if eq get g_vm_st 2 0
+      ret 1
+    end
+    ret 0
+  end
+  put g_vm_st 4 3
+  ret 0
+end
+
+fn vm_step_branch w ulong to ulong
+  if eq w 0xd65f03c0
+    put g_vm_st 5 0xffffffff
+    ret 1
+  end
+  if eq and w 0xfc000000 0x14000000
+    d = vm_sext and w 0x03ffffff 26
+    put g_vm_st 5 ulong add long get g_vm_st 5 d
+    ret 1
+  end
+  if eq and w 0xff000010 0x54000000
+    if eq vm_cond_holds and w 15 1
+      d = vm_sext and shr w 5 0x7ffff 19
+      put g_vm_st 5 ulong add long get g_vm_st 5 d
+    else
+      put g_vm_st 5 add get g_vm_st 5 1
+    end
+    ret 1
+  end
+  if eq and w 0xff000000 0xb4000000
+    rt = and w 31
+    if eq vm_gx rt 0
+      d = vm_sext and shr w 5 0x7ffff 19
+      put g_vm_st 5 ulong add long get g_vm_st 5 d
+    else
+      put g_vm_st 5 add get g_vm_st 5 1
+    end
+    ret 1
+  end
+  ret 0
+end
+
+fn vm_alu_ubfm w ulong to void
+  rd = and w 31
+  rn = and shr w 5 31
+  imms = and shr w 10 63
+  immr = and shr w 16 63
+  src = vm_gx rn
+  if ge imms immr
+    wid = add sub imms immr 1
+    msk = ulong 0xffffffffffffffff
+    if lt wid 64
+      msk = sub shl ulong 1 wid 1
+    end
+    vm_px rd and shr src immr msk
+  else
+    lsh = sub 64 immr
+    wid = add imms 1
+    msk = sub shl ulong 1 wid 1
+    vm_px rd shl and src msk lsh
+  end
+end
+
+fn vm_alu_logic_imm w ulong to void
+  opc = and shr w 29 3
+  if and ne opc 0 ne opc 3
+    put g_vm_st 4 3
+    ret
+  end
+  ok = new ulong 1 0
+  msk = oxe_decode_bitmask64 and shr w 22 1 and shr w 16 63 and shr w 10 63 ok
+  if eq get ok 0 0
+    put g_vm_st 4 3
+    ret
+  end
+  res = and vm_gx and shr w 5 31 msk
+  rd = and w 31
+  if eq opc 3
+    put g_vm_st 0 shr res 63
+    if eq res 0
+      put g_vm_st 1 1
+    else
+      put g_vm_st 1 0
+    end
+    put g_vm_st 2 0
+    put g_vm_st 3 0
+    vm_px rd res
+  else
+    put g_vm_x rd res
+  end
+end
+
+fn vm_step_alu1 w ulong to ulong
+  if eq and w 0x9f000000 0x90000000
+    imm21 = or shl and shr w 5 0x7ffff 2 and shr w 29 3
+    pg = vm_sext imm21 21
+    pc_pg = and add VM_BASE mul 4 get g_vm_st 5 0xfffffffffffff000
+    vm_px and w 31 add pc_pg bitcast ulong mul pg 4096
+    ret 1
+  end
+  if eq and w 0xff800000 0x91000000
+    imm = and shr w 10 0xfff
+    if ne and shr w 22 1 0
+      imm = shl imm 12
+    end
+    put g_vm_x and w 31 add get g_vm_x and shr w 5 31 imm
+    ret 1
+  end
+  if eq and w 0xff800000 0xd1000000
+    imm = and shr w 10 0xfff
+    if ne and shr w 22 1 0
+      imm = shl imm 12
+    end
+    put g_vm_x and w 31 sub get g_vm_x and shr w 5 31 imm
+    ret 1
+  end
+  if eq and w 0xff800000 0xf1000000
+    imm = and shr w 10 0xfff
+    if ne and shr w 22 1 0
+      imm = shl imm 12
+    end
+    a = get g_vm_x and shr w 5 31
+    res = sub a imm
+    put g_vm_st 0 shr res 63
+    if eq res 0
+      put g_vm_st 1 1
+    else
+      put g_vm_st 1 0
+    end
+    if ge a imm
+      put g_vm_st 2 1
+    else
+      put g_vm_st 2 0
+    end
+    put g_vm_st 3 0
+    vm_px and w 31 res
+    ret 1
+  end
+  if eq and w 0xff200000 0x8b000000
+    amt = and shr w 10 63
+    a = vm_gx and shr w 5 31
+    b = shl vm_gx and shr w 16 31 amt
+    vm_px and w 31 add a b
+    ret 1
+  end
+  if eq and w 0xff200000 0xcb000000
+    amt = and shr w 10 63
+    a = vm_gx and shr w 5 31
+    b = shl vm_gx and shr w 16 31 amt
+    vm_px and w 31 sub a b
+    ret 1
+  end
+  ret 0
+end
+
+fn vm_step_alu2 w ulong to ulong
+  if eq and w 0xff20fc00 0xaa000000
+    vm_px and w 31 or vm_gx and shr w 5 31 vm_gx and shr w 16 31
+    ret 1
+  end
+  if eq and w 0xffc00000 0xd3400000
+    vm_alu_ubfm w
+    ret 1
+  end
+  if eq and w 0x9f800000 0x92000000
+    vm_alu_logic_imm w
+    ret 1
+  end
+  if eq and w 0xffe00c00 0x9a800400
+    a = vm_gx and shr w 5 31
+    b = vm_gx and shr w 16 31
+    if eq vm_cond_holds and shr w 12 15 1
+      vm_px and w 31 a
+    else
+      vm_px and w 31 add b 1
+    end
+    ret 1
+  end
+  if eq and w 0x7f800000 0x52800000
+    sf = shr w 31
+    hw = and shr w 21 3
+    v = shl and shr w 5 0xffff mul hw 16
+    if eq sf 0
+      v = and v 0xffffffff
+    end
+    vm_px and w 31 v
+    ret 1
+  end
+  if eq and w 0xff800000 0x12800000
+    hw = and shr w 21 3
+    v = and not shl and shr w 5 0xffff mul hw 16 0xffffffff
+    vm_px and w 31 v
+    ret 1
+  end
+  if eq and w 0xffe08000 0x1b000000
+    a = and vm_gx and shr w 5 31 0xffffffff
+    b = and vm_gx and shr w 16 31 0xffffffff
+    c = and vm_gx and shr w 10 31 0xffffffff
+    vm_px and w 31 and add c mul a b 0xffffffff
+    ret 1
+  end
+  ret 0
+end
+
+fn vm_step_ldst1 w ulong to ulong
+  if eq and w 0xffc00000 0xa9400000
+    off = mul vm_sext and shr w 15 0x7f 7 8
+    base = add get g_vm_x and shr w 5 31 bitcast ulong off
+    vm_px and w 31 vm_rd64 base
+    vm_px and shr w 10 31 vm_rd64 add base 8
+    ret 1
+  end
+  if eq and w 0xffc00000 0xf9400000
+    off = mul and shr w 10 0xfff 8
+    vm_px and w 31 vm_rd64 add get g_vm_x and shr w 5 31 off
+    ret 1
+  end
+  if eq and w 0xffc00000 0x3dc00000
+    off = mul and shr w 10 0xfff 16
+    vm_rd16_vec and w 31 add get g_vm_x and shr w 5 31 off
+    ret 1
+  end
+  if eq and w 0xffc00000 0xad000000
+    off = mul vm_sext and shr w 15 0x7f 7 16
+    base = add get g_vm_x and shr w 5 31 bitcast ulong off
+    vm_wr16_vec and w 31 base
+    vm_wr16_vec and shr w 10 31 add base 16
+    ret 1
+  end
+  if eq and w 0xfffffc00 0x4c402000
+    vt = and w 31
+    base = get g_vm_x and shr w 5 31
+    for i ulong 4
+      vm_rd16_vec and add vt i 31 add base mul i 16
+    end
+    ret 1
+  end
+  if eq and w 0xfffffc00 0x4cdf2000
+    vt = and w 31
+    rn = and shr w 5 31
+    base = get g_vm_x rn
+    for i ulong 4
+      vm_rd16_vec and add vt i 31 add base mul i 16
+    end
+    put g_vm_x rn add base 64
+    ret 1
+  end
+  ret 0
+end
+
+fn vm_step_ldst2 w ulong to ulong
+  m = and w 0xffe00c00
+  rn = and shr w 5 31
+  rt = and w 31
+  simm9 = vm_sext and shr w 12 0x1ff 9
+  base = get g_vm_x rn
+  if eq m 0x38c00400
+    b = ulong vm_rd8 base
+    if ge b 128
+      b = or b 0xffffff00
+    end
+    vm_px rt b
+    put g_vm_x rn ulong add long base simm9
+    ret 1
+  end
+  if eq m 0x38400400
+    vm_px rt ulong vm_rd8 base
+    put g_vm_x rn ulong add long base simm9
+    ret 1
+  end
+  if eq m 0x38000400
+    vm_wr8 base uchar and vm_gx rt 255
+    put g_vm_x rn ulong add long base simm9
+    ret 1
+  end
+  if eq m 0xb8000400
+    vm_wr32 base uint and vm_gx rt 0xffffffff
+    put g_vm_x rn ulong add long base simm9
+    ret 1
+  end
+  if eq m 0x3cc00400
+    vm_rd16_vec rt base
+    put g_vm_x rn ulong add long base simm9
+    ret 1
+  end
+  if eq m 0x3c800400
+    vm_wr16_vec rt base
+    put g_vm_x rn ulong add long base simm9
+    ret 1
+  end
+  if eq m 0xbc000400
+    vm_wr32 base vm_gv32 rt 0
+    put g_vm_x rn ulong add long base simm9
+    ret 1
+  end
+  ret 0
+end
+
+fn vm_simd_sdot vd ulong vn ulong vm ulong to void
+  bn = mul vn 16
+  bm = mul vm 16
+  for l ulong 4
+    s = int 0
+    for k ulong 4
+      idx = add mul l 4 k
+      a = int get g_vm_v add bn idx
+      if ge a 128
+        a = sub a 256
+      end
+      b = int get g_vm_v add bm idx
+      if ge b 128
+        b = sub b 256
+      end
+      s = add s mul a b
+    end
+    vm_pv32 vd l add vm_gv32 vd l vm_i32_to_u32 s
+  end
+end
+
+fn vm_simd_addp vd ulong vn ulong vm ulong to void
+  put g_vm_tmp 0 add vm_gv32 vn 0 vm_gv32 vn 1
+  put g_vm_tmp 1 add vm_gv32 vn 2 vm_gv32 vn 3
+  put g_vm_tmp 2 add vm_gv32 vm 0 vm_gv32 vm 1
+  put g_vm_tmp 3 add vm_gv32 vm 2 vm_gv32 vm 3
+  for l ulong 4
+    vm_pv32 vd l get g_vm_tmp l
+  end
+end
+
+fn vm_simd_and16b vd ulong vn ulong vm ulong to void
+  bd = mul vd 16
+  bn = mul vn 16
+  bm = mul vm 16
+  for i ulong 16
+    a = get g_vm_v add bn i
+    b = get g_vm_v add bm i
+    put g_vm_v add bd i and a b
+  end
+end
+
+fn vm_simd_shl16b vd ulong vn ulong sh ulong to void
+  bd = mul vd 16
+  bn = mul vn 16
+  for i ulong 16
+    b = ulong get g_vm_v add bn i
+    put g_vm_v add bd i uchar and shl b sh 255
+  end
+end
+
+fn vm_simd_sshr16b vd ulong vn ulong sh ulong to void
+  bd = mul vd 16
+  bn = mul vn 16
+  for i ulong 16
+    b = int get g_vm_v add bn i
+    if ge b 128
+      b = sub b 256
+    end
+    put g_vm_v add bd i uchar and shr b int sh 255
+  end
+end
+
+fn vm_step_simd w ulong to ulong
+  vd = and w 31
+  vn = and shr w 5 31
+  if eq and w 0xfff8fc00 0x4f00e400
+    imm8 = uchar or shl and shr w 16 7 5 and shr w 5 31
+    bd = mul vd 16
+    for i ulong 16
+      put g_vm_v add bd i imm8
+    end
+    ret 1
+  end
+  if eq and w 0xffe0fc00 0x4e201c00
+    vm_simd_and16b vd vn and shr w 16 31
+    ret 1
+  end
+  if eq and w 0xffe0fc00 0x4ea08400
+    vm = and shr w 16 31
+    for l ulong 4
+      vm_pv32 vd l add vm_gv32 vn l vm_gv32 vm l
+    end
+    ret 1
+  end
+  if eq and w 0xffe0fc00 0x4ea0bc00
+    vm_simd_addp vd vn and shr w 16 31
+    ret 1
+  end
+  if eq and w 0xffe0fc00 0x4e809400
+    vm_simd_sdot vd vn and shr w 16 31
+    ret 1
+  end
+  if eq and w 0xfffffc00 0x4eb1b800
+    s0 = add vm_gv32 vn 0 vm_gv32 vn 1
+    s1 = add vm_gv32 vn 2 vm_gv32 vn 3
+    vm_pv32 vd 0 add s0 s1
+    vm_pv32 vd 1 uint 0
+    vm_pv32 vd 2 uint 0
+    vm_pv32 vd 3 uint 0
+    ret 1
+  end
+  if eq and w 0xfff8fc00 0x4f085400
+    vm_simd_shl16b vd vn and shr w 16 7
+    ret 1
+  end
+  if eq and w 0xfff8fc00 0x4f080400
+    vm_simd_sshr16b vd vn sub 16 and shr w 16 15
+    ret 1
+  end
+  ret 0
+end
+
+fn vm_step w ulong to void
+  if eq vm_step_branch w 1
+    ret
+  end
+  ok = vm_step_alu1 w
+  if eq ok 0
+    ok = vm_step_alu2 w
+  end
+  if eq ok 0
+    ok = vm_step_ldst1 w
+  end
+  if eq ok 0
+    ok = vm_step_ldst2 w
+  end
+  if eq ok 0
+    ok = vm_step_simd w
+  end
+  if eq ok 0
+    put g_vm_st 4 3
+    ret
+  end
+  put g_vm_st 5 add get g_vm_st 5 1
+end
+
+note Static ABI & encoding audit of one AArch64 instruction word.
+note Returns 0 if valid & ABI-clean, -1 if illegal encoding, -2 if callee-saved clobber.
+fn vm_chk_x_cs r ulong to int
+  if ge r 19
+    if le r 28
+      ret -2
+    end
+  end
+  if or eq r 29 eq r 30
+    ret -2
+  end
+  ret 0
+end
+
+fn vm_chk_v_cs r ulong to int
+  if ge r 8
+    if le r 15
+      ret -2
+    end
+  end
+  ret 0
+end
+
+fn vm_audit_alu w ulong rd ulong to int
+  if eq and w 0x9f000000 0x90000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xff800000 0x91000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xff800000 0xd1000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xff800000 0xf1000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xff200000 0x8b000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xff200000 0xcb000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xff20fc00 0xaa000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xffc00000 0xd3400000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0x9f800000 0x92000000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xffe00c00 0x9a800400
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0x7f800000 0x52800000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xff800000 0x12800000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xffe08000 0x1b000000
+    ret vm_chk_x_cs rd
+  end
+  ret 1
+end
+
+fn vm_audit_simd w ulong rd ulong to int
+  if eq and w 0xfff8fc00 0x4f00e400
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xffe0fc00 0x4e201c00
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xffe0fc00 0x4ea08400
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xffe0fc00 0x4ea0bc00
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xffe0fc00 0x4e809400
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xfffffc00 0x4eb1b800
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xfff8fc00 0x4f085400
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xfff8fc00 0x4f080400
+    ret vm_chk_v_cs rd
+  end
+  ret 1
+end
+
+fn omx_vm_audit_word w ulong to int
+  rd = and w 31
+  if eq w 0xd65f03c0
+    ret 0
+  end
+  if eq and w 0xfc000000 0x14000000
+    ret 0
+  end
+  if eq and w 0xff000010 0x54000000
+    ret 0
+  end
+  if eq and w 0xff000000 0xb4000000
+    ret 0
+  end
+  rc = vm_audit_alu w rd
+  if ne rc 1
+    ret rc
+  end
+  if eq and w 0xffc00000 0xa9400000
+    if ne vm_chk_x_cs rd 0
+      ret -2
+    end
+    ret vm_chk_x_cs and shr w 10 31
+  end
+  if eq and w 0xffc00000 0xf9400000
+    ret vm_chk_x_cs rd
+  end
+  if eq and w 0xffc00000 0x3dc00000
+    ret vm_chk_v_cs rd
+  end
+  if eq and w 0xffc00000 0xad000000
+    ret 0
+  end
+  if or eq and w 0xfffffc00 0x4c402000 eq and w 0xfffffc00 0x4cdf2000
+    for i ulong 4
+      if ne vm_chk_v_cs and add rd i 31 0
+        ret -2
+      end
+    end
+    ret 0
+  end
+  m = and w 0xffe00c00
+  if or eq m 0x38c00400 eq m 0x38400400
+    ret vm_chk_x_cs rd
+  end
+  if eq m 0x38000400
+    ret 0
+  end
+  if eq m 0xb8000400
+    ret 0
+  end
+  if eq m 0x3c800400
+    ret 0
+  end
+  if eq m 0xbc000400
+    ret 0
+  end
+  if eq m 0x3cc00400
+    ret vm_chk_v_cs rd
+  end
+  rc2 = vm_audit_simd w rd
+  if ne rc2 1
+    ret rc2
+  end
+  ret -1
+end
+
+fn omx_vm_audit_kernel k ulong to int
+  n = get g_vm_meta 0
+  if eq k 1
+    n = get g_vm_meta 3
+  end
+  if eq n 0
+    ret -1
+  end
+  for i ulong n bound 512
+    w = ulong 0
+    if eq k 0
+      w = ulong get g_vm_c0 i
+    else
+      w = ulong get g_vm_c1 i
+    end
+    rc = omx_vm_audit_word w
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret 0
+end
+
+note Load g_enc_word[0..n) (after omx_encoder_build k VM_BASE) into VM code slot k.
+fn omx_vm_load_kernel k ulong to int
+  if ne omx_encoder_build k VM_BASE 0
+    ret -1
+  end
+  n = get g_enc_st 0
+  if gt n 512
+    ret -1
+  end
+  for i ulong n bound 512
+    if eq k 0
+      put g_vm_c0 i get g_enc_word i
+    else
+      put g_vm_c1 i get g_enc_word i
+    end
+  end
+  if eq k 0
+    put g_vm_meta 0 n
+    put g_vm_meta 1 get g_enc_st 4
+    put g_vm_meta 2 get g_enc_st 5
+    put g_vm_meta 6 1
+  else
+    put g_vm_meta 3 n
+    put g_vm_meta 4 get g_enc_st 4
+    put g_vm_meta 5 get g_enc_st 5
+    put g_vm_meta 7 1
+  end
+  ret omx_vm_audit_kernel k
+end
+
+fn vm_put_u64_pmem off ulong v ulong to void
+  for i ulong 8
+    put g_vm_pmem add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn vm_init_abi to void
+  for i ulong 32
+    put g_vm_x i 0
+  end
+  for i ulong 512
+    put g_vm_v i uchar 0
+  end
+  for i ulong 10
+    put g_vm_x add 19 i vm_cs_sentinel i
+  end
+  for i ulong 8
+    s = vm_cs_sentinel add 10 i
+    bd = mul add 8 i 16
+    for b ulong 8
+      put g_vm_v add bd b uchar and shr s mul b 8 255
+    end
+  end
+  put g_vm_x 30 VM_LR_SENT
+  put g_vm_x 31 VM_STK_HI
+end
+
+fn vm_verify_abi to int
+  put g_vm_abi_err 0 0
+  if ne get g_vm_x 31 VM_STK_HI
+    put g_vm_abi_err 0 1
+    ret -1
+  end
+  if ne get g_vm_x 30 VM_LR_SENT
+    put g_vm_abi_err 0 2
+    ret -1
+  end
+  for i ulong 10
+    if ne get g_vm_x add 19 i vm_cs_sentinel i
+      put g_vm_abi_err 0 add 10 i
+      ret -1
+    end
+  end
+  for i ulong 8
+    s = vm_cs_sentinel add 10 i
+    bd = mul add 8 i 16
+    got = ulong 0
+    for b ulong 8
+      got = or got shl ulong get g_vm_v add bd b mul b 8
+    end
+    if ne got s
+      put g_vm_abi_err 0 add 20 i
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn vm_setup_exec k ulong flags_arg ulong xoff ulong yoff ulong to void
+  vm_init_abi
+  m = get g_omx_plan 0
+  n = get g_omx_plan 1
+  wlen = get g_omx_plan 2
+  vm_put_u64_pmem 0 m
+  vm_put_u64_pmem 8 n
+  if ne get g_omx_plan 5 0
+    vm_put_u64_pmem 16 VM_W_BASE
+  else
+    vm_put_u64_pmem 16 0
+  end
+  put g_vm_mem 0 wlen
+  put g_vm_mem 1 xoff
+  put g_vm_mem 2 n
+  put g_vm_mem 3 add VM_X_BASE and xoff 15
+  put g_vm_mem 4 yoff
+  put g_vm_mem 5 mul m 4
+  put g_vm_mem 6 add VM_Y_BASE and yoff 15
+  put g_vm_mem 7 flags_arg
+  if ne and flags_arg 1 0
+    put g_vm_x 0 VM_PLAN_BASE
+  end
+  if ne and flags_arg 2 0
+    put g_vm_x 1 get g_vm_mem 3
+  end
+  if ne and flags_arg 4 0
+    put g_vm_x 2 get g_vm_mem 6
+  end
+  for i ulong 7
+    put g_vm_st i 0
+  end
+  put g_vm_st 7 k
+end
+
+note Execute loaded AArch64 kernel k (0=sdot, 1=crumb) on g_omx_plan/g_omx_pack/g_omx_x/g_omx_y.
+note flags_arg: bit0=has_p bit1=has_x bit2=has_y.
+fn omx_vm_exec k ulong flags_arg ulong xoff ulong yoff ulong to int
+  ninsn = get g_vm_meta 0
+  ready = get g_vm_meta 6
+  if eq k 1
+    ninsn = get g_vm_meta 3
+    ready = get g_vm_meta 7
+  end
+  if eq ready 0
+    if ne omx_vm_load_kernel k 0
+      ret -101
+    end
+    ninsn = get g_vm_meta 0
+    if eq k 1
+      ninsn = get g_vm_meta 3
+    end
+  end
+  vm_setup_exec k flags_arg xoff yoff
+  while true bound 50000000
+    pc = get g_vm_st 5
+    if eq pc 0xffffffff
+      break
+    end
+    if ge pc ninsn
+      put g_vm_st 4 5
+      break
+    end
+    w = ulong 0
+    if eq k 0
+      w = ulong get g_vm_c0 pc
+    else
+      w = ulong get g_vm_c1 pc
+    end
+    vm_step w
+    put g_vm_st 6 add get g_vm_st 6 1
+    if ne get g_vm_st 4 0
+      break
+    end
+  end
+  if ne get g_vm_st 4 0
+    ret sub 0 int add 100 get g_vm_st 4
+  end
+  if ne vm_verify_abi 0
+    ret -104
+  end
+  ret vm_u32_to_i32 get g_vm_x 0
+end
+
+note Execute candidate via AArch64 VM for sdot/crumb kernels (has_p=1).
+fn omx_vm_run_cand kind ulong xoff ulong yoff ulong has_x ulong has_y ulong to int
+  fl = ulong 1
+  if ne has_x 0
+    fl = or fl 2
+  end
+  if ne has_y 0
+    fl = or fl 4
+  end
+  if or eq kind OMX_CAND_CRUMB eq kind OMX_CAND_ENC_CRUMB
+    ret omx_vm_exec OMX_ENC_CRUMB fl xoff yoff
+  end
+  ret omx_vm_exec OMX_ENC_SDOT fl xoff yoff
+end

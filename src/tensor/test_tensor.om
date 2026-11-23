@@ -1,267 +1,2070 @@
 note SPDX-License-Identifier: Apache-2.0
 note test_tensor.om -- Pure seeded OM-2 M20 OMEGA_TENSOR CPU & GB10-map test suite.
+note Comprehensive coverage ported from tests/test_omega_tensor.c + tests/tensor_reduce_multi_tests.inc:
+note   1. shape/dtype/rank/axis/op/capacity error refusals
+note   2. broadcasting shapes, zero-stride views, binary parity across all 26 ops
+note   3. views/strides: permute, transpose, slice, view-of-view, reshape, contiguous, value_id vs view_id
+note   4. generation safety, view invalidation, no-ABA reuse, UINT64_MAX retirement
+note   5. immutability, NaN canonicalization vs signed zero, shape identity
+note   6. elementwise parity across special FP32 grid, SQRT, FMA, F16/BF16 casts
+note   7. constants (zeros/ones/full), RELU 22-entry bit table, NEG views, RSQRT/ERF/GELU specials,
+note      transcendentals through views, SIN/COS |x|<=2^22 domain boundary
+note   8. mask compare (CMP_EQ..CMP_GE), where() 3-way broadcast + 8 bad-mask refusals
+note   9. reductions across tile/level boundaries, signed-zero SUM, 3D axes, reduce_axes all 15 subsets,
+note      sum_to_shape unbroadcast & refusal matrix
+note  10. matmul (2D, strided views, batched broadcast, order-sensitivity mutation check, KAT determinism)
+note  11. embed & concat (multi-rank round-trips, strided/broadcast/F16 sources, refusal matrix)
+note  12. GB10 op mapping & reduce-limit checks
 
 global tt_c ulong 2
-note 0=checks, 1=fails
+note tt_c: 0=checks, 1=fails
+global tt_rng ulong 1
+global tt_spec uint 20
+global tt_sa ulong 8
+global tt_sb ulong 8
+global tt_so ulong 8
+global tt_h ulong 24
+note tt_h: slots of (slot, gen) pairs shared across helper functions
+global tt_fa f32 4096
+global tt_fb f32 4096
+global tt_fc f32 4096
+global tt_ex f32 4096
+global tt_go f32 4096
+global tt_lvl f32 4096
+global tt_row f32 1025
+global tt_dig1 uchar 32
+global tt_dig2 uchar 32
 
-text msg_pass "M20_OMEGA_TENSOR_TESTS_PASS\n"
-text msg_fail "M20_OMEGA_TENSOR_TESTS_FAIL\n"
+text tt_msg_pass "M20_OMEGA_TENSOR_TESTS_PASS\n"
+text tt_msg_fail "M20_OMEGA_TENSOR_TESTS_FAIL\n"
+text tt_msg_sum1 "M20 OMEGA_TENSOR CPU tests: "
+text tt_msg_sum2 " pass, "
+text tt_msg_sum3 " fail\n"
+text tt_msg_fc "FAIL check #"
+text tt_msg_nl "\n"
+
+fn tt_w_u64 fd int v ulong to void
+  buf = new uchar 24 0
+  tmp = new uchar 24 0
+  if eq v 0
+    put buf 0 uchar 48
+    w = write fd buf 0 1
+    ret
+  end
+  cnt = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp cnt uchar add 48 rem x 10
+    cnt = add cnt 1
+    x = div x 10
+  end
+  for i ulong cnt bound 24
+    put buf i get tmp sub sub cnt 1 i
+  end
+  w = write fd buf 0 cnt
+end
 
 fn t_chk cond bool to void
-  put tt_c 0 add get tt_c 0 1
+  n = add get tt_c 0 1
+  put tt_c 0 n
   if not cond
     put tt_c 1 add get tt_c 1 1
+    w1 = write 2 tt_msg_fc 0 len tt_msg_fc
+    tt_w_u64 2 n
+    w2 = write 2 tt_msg_nl 0 1
   end
 end
 
-fn t_near a f32 b f32 tol f32 to bool
-  ret le fabs sub a b tol
+fn t_same_f32 a f32 b f32 to bool
+  ua = bitcast uint a
+  ub = bitcast uint b
+  if and ot_is_nan ua ot_is_nan ub
+    ret true
+  end
+  ret eq ua ub
 end
 
-fn test_lifetime_and_views to void
-  t_chk eq ot_ctx_init 64 OT_OK
-  sh = new ulong 8 0
-  put sh 0 2
-  put sh 1 3
-  dat = new f32 6 0.0f32
-  for i ulong 6
-    put dat i f32 add i 1
+fn t_raw_eq a f32 b f32 to bool
+  ret eq bitcast uint a bitcast uint b
+end
+
+fn tt_init_spec to void
+  put tt_rng 0 ulong 0x9e3779b97f4a7c15
+  put tt_spec 0 uint 0x00000000
+  put tt_spec 1 uint 0x80000000
+  put tt_spec 2 uint 0x7f800000
+  put tt_spec 3 uint 0xff800000
+  put tt_spec 4 uint 0x7fc00000
+  put tt_spec 5 uint 0x7fa00001
+  put tt_spec 6 uint 0xffc00123
+  put tt_spec 7 uint 0x00000001
+  put tt_spec 8 uint 0x80000001
+  put tt_spec 9 uint 0x007fffff
+  put tt_spec 10 uint 0x00800000
+  put tt_spec 11 uint 0x7f7fffff
+  put tt_spec 12 uint 0xff7fffff
+  put tt_spec 13 uint 0x3f800000
+  put tt_spec 14 uint 0xbf800000
+  put tt_spec 15 uint 0x3f000000
+  put tt_spec 16 uint 0x4b800000
+  put tt_spec 17 uint 0x33800000
+  put tt_spec 18 uint 0x3effffff
+  put tt_spec 19 uint 0x7f000000
+end
+
+fn tt_rnd to ulong
+  r = get tt_rng 0
+  r = xor r shl r 13
+  r = xor r shr r 7
+  r = xor r shl r 17
+  put tt_rng 0 r
+  ret r
+end
+
+fn tt_rand_f32 to f32
+  r = tt_rnd
+  q = and r 3
+  if eq q 0
+    ret bitcast f32 get tt_spec rem shr r 8 20
   end
-  ha = new ulong 2 0
-  t_chk eq ot_from_f32 2 sh dat ha OT_OK
-  ht = new ulong 2 0
-  t_chk eq ot_transpose get ha 0 get ha 1 ht OT_OK
-  obuf = new f32 6 0.0f32
-  t_chk eq ot_read_f32 get ht 0 get ht 1 obuf OT_OK
-  t_chk eq get obuf 0 1.0f32
-  t_chk eq get obuf 1 4.0f32
-  t_chk eq get obuf 2 2.0f32
-  t_chk eq get obuf 3 5.0f32
-  t_chk eq get obuf 4 3.0f32
-  t_chk eq get obuf 5 6.0f32
-  note Value ID invariance across contiguous copy of transposed view
-  hc = new ulong 2 0
-  t_chk eq ot_contiguous get ht 0 get ht 1 hc OT_OK
-  eq_f = new ulong 1 0
-  t_chk eq ot_value_equal get ht 0 get ht 1 get hc 0 get hc 1 eq_f OT_OK
-  t_chk eq get eq_f 0 1
-  note Releasing parent makes view stale
-  t_chk eq ot_release get ha 0 get ha 1 OT_OK
-  t_chk eq ot_release get ha 0 get ha 1 OT_ERR_STALE
-  t_chk eq ot_read_f32 get ht 0 get ht 1 obuf OT_ERR_STALE
-  t_chk eq ot_release get ht 0 get ht 1 OT_OK
-  t_chk eq ot_release get hc 0 get hc 1 OT_OK
+  if eq q 1
+    mant = and uint shr r 32 uint 0x807fffff
+    exp = shl add uint 120 uint rem shr r 8 16 23
+    ret bitcast f32 or mant exp
+  end
+  ret bitcast f32 uint and shr r 16 0xffffffff
+end
+
+fn tt_rand_mod to f32
+  r = tt_rnd
+  if eq and r 63 0
+    ret bitcast f32 get tt_spec rem shr r 8 20
+  end
+  mant = and uint shr r 32 uint 0x807fffff
+  exp = shl add uint 110 uint rem shr r 8 30 23
+  ret bitcast f32 or mant exp
+end
+
+fn tt_rand_finite to f32
+  r = tt_rnd
+  mant = and uint shr r 32 uint 0x807fffff
+  exp = shl add uint 118 uint rem shr r 8 14 23
+  ret bitcast f32 or mant exp
+end
+
+fn tt_dig_eq to bool
+  for i ulong 32
+    if ne get tt_dig1 i get tt_dig2 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tt_vid_to slot ulong gen ulong which ulong to long
+  d = new uchar 32 0
+  rc = ot_value_id slot gen d
+  if eq rc OT_OK
+    for i ulong 32
+      if eq which 0
+        put tt_dig1 i get d i
+      else
+        put tt_dig2 i get d i
+      end
+    end
+  end
+  ret rc
+end
+
+fn tt_viewid_to slot ulong gen ulong which ulong to long
+  d = new uchar 32 0
+  rc = ot_view_id slot gen d
+  if eq rc OT_OK
+    for i ulong 32
+      if eq which 0
+        put tt_dig1 i get d i
+      else
+        put tt_dig2 i get d i
+      end
+    end
+  end
+  ret rc
+end
+
+fn tt_save_h idx ulong h view ulong 2 to void
+  put tt_h mul idx 2 get h 0
+  put tt_h add mul idx 2 1 get h 1
+end
+
+fn tt_rel_idx idx ulong to void
+  r = ot_release get tt_h mul idx 2 get tt_h add mul idx 2 1
+end
+
+fn tt_chk_leaks to void
   lc = new ulong 2 0
   ot_live_counts lc
   t_chk and eq get lc 0 0 eq get lc 1 0
-  note Generation retirement at UINT64_MAX
-  t_chk eq ot_set_st_gen_test 0 OT_U64_MAX OT_OK
-  t_chk eq ot_from_f32 2 sh dat ha OT_OK
-  t_chk eq get ot_ts_meta add mul get ha 0 10 7 0
-  t_chk eq ot_release get ha 0 get ha 1 OT_OK
-  t_chk eq ot_from_f32 2 sh dat ha OT_OK
-  t_chk ne get ot_ts_meta add mul get ha 0 10 7 0
-  t_chk eq ot_release get ha 0 get ha 1 OT_OK
 end
 
-fn test_slice_embed_concat to void
-  t_chk eq ot_ctx_init 64 OT_OK
-  sh = new ulong 8 0
-  put sh 0 2
-  put sh 1 4
-  dat = new f32 8 0.0f32
-  for i ulong 8
-    put dat i f32 add i 1
+fn tt_bcast_src flat ulong ro ulong ra ulong is_b ulong to ulong
+  idx = new ulong 8 0
+  f = flat
+  for di ulong ro bound 8
+    d = sub sub ro 1 di
+    sd = get tt_so d
+    put idx d rem f sd
+    f = div f sd
   end
-  ha = new ulong 2 0
-  t_chk eq ot_from_f32 2 sh dat ha OT_OK
+  src = ulong 0
+  lead = sub ro ra
+  for d ulong ra bound 8
+    c = get idx add lead d
+    ad = get tt_sa d
+    if ne is_b 0
+      ad = get tt_sb d
+    end
+    if eq ad 1
+      c = 0
+    end
+    src = add mul src ad c
+  end
+  ret src
+end
+
+fn tt_ref_tile op ulong tile edit f32 32 to f32
+  d = ulong 16
+  while gt d 0 bound 8
+    for i ulong d bound 16
+      a = get tile i
+      b = get tile add i d
+      if eq op OT_TR_MAX
+        put tile i ot_fmnmx_max a b
+      else
+        if eq op OT_TR_MIN
+          put tile i ot_fmnmx_min a b
+        else
+          put tile i add a b
+        end
+      end
+    end
+    d = shr d 1
+  end
+  ret get tile 0
+end
+
+fn tt_ref_tree op ulong n ulong use_row ulong to f32
+  pad = bitcast f32 OT_QNAN_BITS
+  if or eq op OT_TR_SUM eq op OT_TR_MEAN
+    pad = bitcast f32 OT_NEG0_BITS
+  end
+  for i ulong n bound 4096
+    if ne use_row 0
+      put tt_lvl i get tt_row i
+    else
+      put tt_lvl i get tt_fa i
+    end
+  end
+  cur = n
+  lvls = ulong 0
+  tile = new f32 32 0.0f32
+  while or eq lvls 0 gt cur 1 bound 8
+    oc = ulong 0
+    base = ulong 0
+    while lt base cur bound 256
+      for l ulong 32
+        if lt add base l cur
+          put tile l get tt_lvl add base l
+        else
+          put tile l pad
+        end
+      end
+      put tt_lvl oc tt_ref_tile op tile
+      oc = add oc 1
+      base = add base 32
+    end
+    cur = oc
+    lvls = add lvls 1
+  end
+  r = get tt_lvl 0
+  if eq op OT_TR_MEAN
+    r = div r f32 n
+  end
+  ret r
+end
+
+fn tt_load_go s ulong g ulong n ulong to long
+  buf = new f32 4096 0.0f32
+  rc = ot_read_f32 s g part buf 0 n
+  if ne rc OT_OK
+    ret rc
+  end
+  for i ulong n bound 4096
+    put tt_go i get buf i
+  end
+  ret OT_OK
+end
+
+fn tt_mk_from_g which ulong rank ulong n ulong out_h edit ulong 2 to long
+  sh = new ulong 8 0
+  buf = new f32 4096 0.0f32
+  for d ulong rank bound 8
+    if eq which 1
+      put sh d get tt_sb d
+    else
+      put sh d get tt_sa d
+    end
+  end
+  for i ulong n bound 4096
+    if eq which 0
+      put buf i get tt_fa i
+    else
+      if eq which 1
+        put buf i get tt_fb i
+      else
+        put buf i get tt_fc i
+      end
+    end
+  end
+  ret ot_from_f32 rank sh part buf 0 n out_h
+end
+
+fn tt_count_mm n ulong raw ulong to ulong
+  mm = ulong 0
+  for i ulong n bound 4096
+    if ne raw 0
+      if not t_raw_eq get tt_ex i get tt_go i
+        mm = add mm 1
+      end
+    else
+      if not t_same_f32 get tt_ex i get tt_go i
+        mm = add mm 1
+      end
+    end
+  end
+  ret mm
+end
+
+note ---- 1. shape, dtype, rank, axis, op, capacity errors ----
+
+fn test_shape_type_a to void
+  t_chk eq ot_ctx_init 0 OT_ERR_BAD_ARGS
+  t_chk eq ot_ctx_init 257 OT_ERR_BAD_ARGS
+  t_chk eq ot_ctx_init 64 OT_OK
+  sh = new ulong 8 1
+  dat = new f32 16 0.0f32
+  hb = new uchar 16 0
+  h = new ulong 2 0
+  t_chk eq ot_from_f32 9 sh dat h OT_ERR_RANK
+  put sh 0 2
+  put sh 1 0
+  t_chk eq ot_from_f32 2 sh dat h OT_ERR_SHAPE
+  put sh 0 1048576
+  put sh 1 2048
+  t_chk eq ot_from_f32 2 sh dat h OT_ERR_CAPACITY
+  put sh 0 2
+  put sh 1 3
+  t_chk eq ot_from_bytes 9 1 sh hb h OT_ERR_DTYPE
+  t_chk eq ot_from_f32 2 sh dat h OT_OK
+  tt_save_h 0 h
+  t_chk eq ot_from_bytes OT_DT_F16 2 sh hb h OT_OK
+  tt_save_h 1 h
+  put sh 0 3
+  put sh 1 4
+  t_chk eq ot_from_f32 2 sh dat h OT_OK
+  tt_save_h 2 h
+  put sh 0 4
+  t_chk eq ot_from_f32 0 sh dat h OT_OK
+  tt_save_h 3 h
+  t_chk eq ot_from_f32 1 sh dat h OT_OK
+  tt_save_h 4 h
+end
+
+fn test_shape_type_b to void
+  h = new ulong 2 0
+  bp = new ulong 8 0
+  sa = get tt_h 0
+  ga = get tt_h 1
+  sf = get tt_h 2
+  gf = get tt_h 3
+  se = get tt_h 4
+  ge_ = get tt_h 5
+  t_chk eq ot_binary OT_TB_ADD sa ga sf gf h OT_ERR_DTYPE
+  t_chk eq ot_unary OT_TU_SQRT sf gf h OT_ERR_DTYPE
+  t_chk eq ot_reduce OT_TR_SUM sf gf 0 0 h OT_ERR_DTYPE
+  t_chk eq ot_matmul sf gf se ge_ h OT_ERR_DTYPE
+  t_chk eq ot_cast sf gf OT_DT_BF16 h OT_ERR_DTYPE
+  t_chk eq ot_binary OT_TB_ADD sa ga se ge_ h OT_ERR_SHAPE
+  t_chk eq ot_matmul sa ga sa ga h OT_ERR_SHAPE
+  t_chk eq ot_reduce OT_TR_SUM sa ga 2 0 h OT_ERR_AXIS
+  t_chk eq ot_binary 99 sa ga sa ga h OT_ERR_BAD_ARGS
+  t_chk eq ot_unary 99 sa ga h OT_ERR_BAD_ARGS
+  t_chk eq ot_reduce 7 sa ga 0 0 h OT_ERR_BAD_ARGS
+  put bp 0 0
+  put bp 1 0
+  t_chk eq ot_permute sa ga bp h OT_ERR_AXIS
+  put bp 1 2
+  t_chk eq ot_permute sa ga bp h OT_ERR_AXIS
+  t_chk eq ot_transpose get tt_h 6 get tt_h 7 h OT_ERR_RANK
+  t_chk eq ot_reduce OT_TR_SUM get tt_h 6 get tt_h 7 0 0 h OT_ERR_RANK
+  t_chk eq ot_matmul get tt_h 8 get tt_h 9 get tt_h 8 get tt_h 9 h OT_ERR_RANK
+  for i ulong 5
+    tt_rel_idx i
+  end
+  tt_chk_leaks
+end
+
+note ---- 2. broadcasting shapes, zero-stride views, binary parity ----
+
+fn test_bcast_view_chk ra ulong ro ulong no ulong to void
+  so = new ulong 8 0
+  hv = new ulong 2 0
+  for d ulong ro bound 8
+    put so d get tt_so d
+  end
+  t_chk eq ot_broadcast_to get tt_h 0 get tt_h 1 ro so hv OT_OK
+  vs = get hv 0
+  t_chk eq get ot_ts_meta add mul vs 10 9 1
+  lead = sub ro ra
+  for d ulong ro bound 8
+    exp_d = lt d lead
+    if not exp_d
+      if eq get tt_sa sub d lead 1
+        exp_d = true
+      end
+    end
+    if and exp_d gt get tt_so d 1
+      t_chk eq get ot_ts_strides add mul vs 8 d 0
+    end
+  end
+  t_chk eq tt_load_go get hv 0 get hv 1 no OT_OK
+  for i ulong no bound 512
+    put tt_ex i get tt_fa tt_bcast_src i ro ra 0
+  end
+  t_chk eq tt_count_mm no 1 0
+  r1 = ot_release get hv 0 get hv 1
+end
+
+fn test_bcast_ops_chk ra ulong rb ulong ro ulong no ulong to void
+  ho = new ulong 2 0
+  for op ulong OT_TB_COUNT
+    for i ulong no bound 512
+      va = get tt_fa tt_bcast_src i ro ra 0
+      vb = get tt_fb tt_bcast_src i ro rb 1
+      put tt_ex i ot_binary_scalar op va vb
+    end
+    t_chk eq ot_binary op get tt_h 0 get tt_h 1 get tt_h 2 get tt_h 3 ho OT_OK
+    t_chk eq tt_load_go get ho 0 get ho 1 no OT_OK
+    t_chk eq tt_count_mm no 0 0
+    r1 = ot_release get ho 0 get ho 1
+  end
+end
+
+fn test_bcast_one ra ulong na ulong rb ulong nb ulong to void
+  for i ulong na bound 64
+    put tt_fa i tt_rand_f32
+  end
+  for i ulong nb bound 64
+    put tt_fb i tt_rand_f32
+  end
+  h = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 ra na h OT_OK
+  tt_save_h 0 h
+  t_chk eq tt_mk_from_g 1 rb nb h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_binary OT_TB_ADD get tt_h 0 get tt_h 1 get tt_h 2 get tt_h 3 h OT_OK
+  os = get h 0
+  ro = get ot_ts_meta add mul os 10 4
+  no = get ot_ts_meta add mul os 10 6
+  for d ulong ro bound 8
+    put tt_so d get ot_ts_shape add mul os 8 d
+  end
+  r1 = ot_release get h 0 get h 1
+  test_bcast_view_chk ra ro no
+  test_bcast_ops_chk ra rb ro no
+  tt_rel_idx 0
+  tt_rel_idx 1
+end
+
+fn test_broadcast to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  put tt_sa 0 3
+  put tt_sa 1 1
+  put tt_sb 0 1
+  put tt_sb 1 4
+  test_bcast_one 2 3 2 4
+  put tt_sa 0 4
+  put tt_sb 0 2
+  put tt_sb 1 3
+  put tt_sb 2 4
+  test_bcast_one 1 4 3 24
+  put tt_sb 0 2
+  put tt_sb 1 3
+  test_bcast_one 0 1 2 6
+  put tt_sa 0 2
+  put tt_sa 1 1
+  put tt_sa 2 1
+  put tt_sa 3 4
+  put tt_sb 0 3
+  put tt_sb 1 2
+  put tt_sb 2 1
+  test_bcast_one 4 8 3 6
+  note Refusals
+  put tt_sa 0 2
+  put tt_sa 1 3
+  put tt_sb 0 3
+  put tt_sb 1 2
+  h = new ulong 2 0
+  sb = new ulong 8 0
+  put sb 0 3
+  put sb 1 2
+  t_chk eq tt_mk_from_g 0 2 6 h OT_OK
+  tt_save_h 0 h
+  t_chk eq tt_mk_from_g 1 2 6 h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_binary OT_TB_ADD get tt_h 0 get tt_h 1 get tt_h 2 get tt_h 3 h OT_ERR_SHAPE
+  t_chk eq ot_broadcast_to get tt_h 0 get tt_h 1 2 sb h OT_ERR_SHAPE
+  t_chk eq ot_broadcast_to get tt_h 0 get tt_h 1 1 sb h OT_ERR_SHAPE
+  t_chk eq ot_broadcast_to get tt_h 0 get tt_h 1 9 sb h OT_ERR_RANK
+  tt_rel_idx 0
+  tt_rel_idx 1
+  tt_chk_leaks
+end
+
+note ---- 3. views, strides, permute, slice, reshape, contiguous ----
+
+fn test_views_permute to void
+  perm = new ulong 8 0
+  put perm 0 2
+  put perm 1 0
+  put perm 2 1
+  hp = new ulong 2 0
+  t_chk eq ot_permute get tt_h 0 get tt_h 1 perm hp OT_OK
+  t_chk eq tt_load_go get hp 0 get hp 1 120 OT_OK
+  ok = true
+  for i ulong 6
+    for j ulong 4
+      for k ulong 5
+        gi = add mul add mul i 4 j 5 k
+        si = add mul add mul j 5 k 6 i
+        if ne get tt_go gi get tt_fa si
+          ok = false
+        end
+      end
+    end
+  end
+  t_chk ok
+  r1 = ot_release get hp 0 get hp 1
+end
+
+fn tt_chk_slice_trans to void
+  ok = true
+  for a ulong 2
+    r0 = add 1 mul 2 a
+    for k ulong 4
+      k2 = add 2 k
+      for j ulong 3
+        gi = add mul a 4 k
+        gi = add mul gi 3 j
+        si = add mul r0 5 mul 2 j
+        si = add mul si 6 k2
+        if ne get tt_go gi get tt_fa si
+          ok = false
+        end
+      end
+    end
+  end
+  t_chk ok
+end
+
+fn tt_chk_val_eq i1 ulong i2 ulong to void
+  eq_f = new ulong 1 0
+  b1 = mul i1 2
+  b2 = mul i2 2
+  s1 = get tt_h b1
+  g1 = get tt_h add b1 1
+  s2 = get tt_h b2
+  g2 = get tt_h add b2 1
+  rc = ot_value_equal s1 g1 s2 g2 eq_f
+  t_chk eq rc OT_OK
+  t_chk eq get eq_f 0 1
+end
+
+fn test_views_slice_chain to void
   st = new ulong 8 0
   sp = new ulong 8 0
-  stp = new ulong 8 0
+  stp = new ulong 8 1
+  h = new ulong 2 0
+  put st 0 1
+  put st 1 0
+  put st 2 2
+  put sp 0 4
+  put sp 1 5
+  put sp 2 6
+  put stp 0 2
+  put stp 1 2
+  put stp 2 1
+  t_chk eq ot_slice get tt_h 0 get tt_h 1 st sp stp h OT_OK
+  tt_save_h 1 h
+  sbase = mul get h 0 8
+  t_chk eq get ot_ts_shape sbase 2
+  t_chk eq get ot_ts_shape add sbase 1 3
+  t_chk eq get ot_ts_shape add sbase 2 4
+  t_chk eq get ot_ts_meta add mul get h 0 10 5 32
+  t_chk eq ot_transpose get tt_h 2 get tt_h 3 h OT_OK
+  tt_save_h 2 h
+  t_chk eq tt_load_go get h 0 get h 1 24 OT_OK
+  tt_chk_slice_trans
+  note slice(transpose(T)) == transpose(slice(T))
+  t_chk eq ot_transpose get tt_h 0 get tt_h 1 h OT_OK
+  tt_save_h 3 h
+  put st 0 1
+  put st 1 2
+  put st 2 0
+  put sp 0 4
+  put sp 1 6
+  put sp 2 5
+  put stp 0 2
+  put stp 1 1
+  put stp 2 2
+  t_chk eq ot_slice get tt_h 6 get tt_h 7 st sp stp h OT_OK
+  tt_save_h 4 h
+  tt_chk_val_eq 4 2
+  note view of view of view
+  put st 0 1
+  put st 1 1
+  put st 2 1
+  put sp 0 2
+  put sp 1 3
+  put sp 2 3
+  put stp 0 1
+  put stp 1 1
+  put stp 2 1
+  t_chk eq ot_slice get tt_h 4 get tt_h 5 st sp stp h OT_OK
+  st_a = get ot_ts_meta add mul get h 0 10 7
+  st_b = get ot_ts_meta add mul get tt_h 2 10 7
+  t_chk eq st_a st_b
+  t_chk eq tt_load_go get h 0 get h 1 4 OT_OK
+  t_chk eq get tt_go 0 get tt_fa 105
+  t_chk eq get tt_go 3 get tt_fa 118
+  r1 = ot_release get h 0 get h 1
+  tt_rel_idx 4
+  tt_rel_idx 3
+  tt_rel_idx 2
+  tt_rel_idx 1
+end
+
+fn test_views_bounds to void
+  st = new ulong 8 0
+  sp = new ulong 8 0
+  stp = new ulong 8 1
+  h = new ulong 2 0
+  put sp 0 5
+  put sp 1 5
+  put sp 2 6
+  t_chk eq ot_slice get tt_h 0 get tt_h 1 st sp stp h OT_ERR_BOUNDS
+  put sp 0 0
+  t_chk eq ot_slice get tt_h 0 get tt_h 1 st sp stp h OT_ERR_SHAPE
+  put sp 0 4
+  put stp 1 0
+  t_chk eq ot_slice get tt_h 0 get tt_h 1 st sp stp h OT_ERR_BAD_ARGS
+  put stp 0 OT_U64_MAX
+  put stp 1 OT_U64_MAX
+  put stp 2 div OT_U64_MAX 3
+  t_chk eq ot_slice get tt_h 0 get tt_h 1 st sp stp h OT_OK
+  t_chk eq tt_load_go get h 0 get h 1 1 OT_OK
+  t_chk eq get tt_go 0 get tt_fa 0
+  r1 = ot_release get h 0 get h 1
+end
+
+fn test_views_reshape_and_bounds to void
+  rs = new ulong 8 0
+  h = new ulong 2 0
+  t_chk eq ot_transpose get tt_h 0 get tt_h 1 h OT_OK
+  tt_save_h 1 h
+  put rs 0 20
+  put rs 1 6
+  t_chk eq ot_reshape get tt_h 0 get tt_h 1 2 rs h OT_OK
+  tt_save_h 2 h
+  t_chk eq ot_reshape get tt_h 2 get tt_h 3 2 rs h OT_ERR_NOT_CONTIGUOUS
+  put rs 0 7
+  t_chk eq ot_reshape get tt_h 0 get tt_h 1 2 rs h OT_ERR_SHAPE
+  t_chk eq ot_contiguous get tt_h 2 get tt_h 3 h OT_OK
+  tt_save_h 3 h
+  put rs 0 4
+  put rs 1 30
+  t_chk eq ot_reshape get tt_h 6 get tt_h 7 2 rs h OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk eq get ot_ts_meta add mul get tt_h 6 10 9 0
+  st_c = get ot_ts_meta add mul get tt_h 6 10 7
+  st_t = get ot_ts_meta add mul get tt_h 0 10 7
+  t_chk ne st_c st_t
+  t_chk eq tt_vid_to get tt_h 6 get tt_h 7 0 OT_OK
+  t_chk eq tt_vid_to get tt_h 2 get tt_h 3 1 OT_OK
+  t_chk tt_dig_eq
+  t_chk eq tt_viewid_to get tt_h 6 get tt_h 7 0 OT_OK
+  t_chk eq tt_viewid_to get tt_h 2 get tt_h 3 1 OT_OK
+  t_chk not tt_dig_eq
+  tt_rel_idx 3
+  tt_rel_idx 2
+  tt_rel_idx 1
+  test_views_bounds
+end
+
+fn test_views to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  put tt_sa 0 4
+  put tt_sa 1 5
+  put tt_sa 2 6
+  for i ulong 120
+    put tt_fa i f32 i
+  end
+  h = new ulong 2 0
+  d_pre = new uchar 32 0
+  t_chk eq tt_mk_from_g 0 3 120 h OT_OK
+  tt_save_h 0 h
+  t_chk eq ot_value_id get tt_h 0 get tt_h 1 d_pre OT_OK
+  test_views_permute
+  test_views_slice_chain
+  test_views_reshape_and_bounds
+  t_chk eq tt_vid_to get tt_h 0 get tt_h 1 1 OT_OK
+  for i ulong 32
+    put tt_dig1 i get d_pre i
+  end
+  t_chk tt_dig_eq
+  tt_rel_idx 0
+  note Zero-stride broadcast -> transpose -> reshape refusal
+  put tt_sa 0 4
+  put tt_sa 1 1
+  put tt_fa 0 10.0f32
+  put tt_fa 1 20.0f32
+  put tt_fa 2 30.0f32
+  put tt_fa 3 40.0f32
+  c46 = new ulong 8 0
+  put c46 0 4
+  put c46 1 6
+  t_chk eq tt_mk_from_g 0 2 4 h OT_OK
+  tt_save_h 0 h
+  t_chk eq ot_broadcast_to get tt_h 0 get tt_h 1 2 c46 h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_transpose get tt_h 2 get tt_h 3 h OT_OK
+  t_chk eq tt_load_go get h 0 get h 1 24 OT_OK
+  r1 = ot_release get h 0 get h 1
+  ok = true
+  for i ulong 6
+    for j ulong 4
+      if ne get tt_go add mul i 4 j get tt_fa j
+        ok = false
+      end
+    end
+  end
+  t_chk ok
+  put c46 0 24
+  t_chk eq ot_reshape get tt_h 2 get tt_h 3 1 c46 h OT_ERR_NOT_CONTIGUOUS
+  tt_rel_idx 1
+  tt_rel_idx 0
+  tt_chk_leaks
+end
+
+note ---- 4. generation safety & UINT64_MAX retirement ----
+
+fn test_generations_stale to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  sh = new ulong 8 0
+  put sh 0 2
+  put sh 1 3
+  dat = new f32 6 1.0f32
+  h = new ulong 2 0
+  obuf = new f32 6 0.0f32
+  t_chk eq ot_from_f32 2 sh dat h OT_OK
+  tt_save_h 0 h
+  st_s = get ot_ts_meta add mul get h 0 10 7
+  st_g = get ot_ts_meta add mul get h 0 10 8
+  t_chk eq ot_transpose get tt_h 0 get tt_h 1 h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_transpose get tt_h 0 get tt_h 1 h OT_OK
+  t_chk eq ot_release get h 0 get h 1 OT_OK
+  t_chk eq ot_read_f32 get h 0 get h 1 obuf OT_ERR_STALE
+  t_chk eq ot_read_f32 get tt_h 0 get tt_h 1 obuf OT_OK
+  t_chk eq ot_release get tt_h 0 get tt_h 1 OT_OK
+  t_chk eq ot_read_f32 get tt_h 0 get tt_h 1 obuf OT_ERR_STALE
+  t_chk eq ot_release get tt_h 0 get tt_h 1 OT_ERR_STALE
+  t_chk not ot_st_valid st_s st_g
+  t_chk eq ot_read_f32 get tt_h 2 get tt_h 3 obuf OT_ERR_STALE
+  t_chk eq ot_binary OT_TB_ADD get tt_h 2 get tt_h 3 get tt_h 2 get tt_h 3 h OT_ERR_STALE
+  t_chk eq ot_matmul get tt_h 2 get tt_h 3 get tt_h 2 get tt_h 3 h OT_ERR_STALE
+  t_chk eq ot_transpose get tt_h 2 get tt_h 3 h OT_ERR_STALE
+  t_chk eq tt_vid_to get tt_h 2 get tt_h 3 0 OT_ERR_STALE
+  t_chk eq ot_release get tt_h 2 get tt_h 3 OT_OK
+  t_chk eq ot_from_f32 2 sh dat h OT_OK
+  t_chk eq get ot_ts_meta add mul get h 0 10 7 st_s
+  t_chk ne get ot_ts_meta add mul get h 0 10 8 st_g
+  t_chk eq ot_read_f32 get tt_h 0 get tt_h 1 obuf OT_ERR_STALE
+  t_chk not ot_st_valid st_s st_g
+  t_chk eq ot_read_f32 999999 1 obuf OT_ERR_STALE
+  r1 = ot_release get h 0 get h 1
+  tt_chk_leaks
+end
+
+fn test_generations_retire to void
+  t_chk eq ot_ctx_init 1 OT_OK
+  sh = new ulong 8 0
+  put sh 0 2
+  put sh 1 3
+  dat = new f32 6 1.0f32
+  h = new ulong 2 0
+  obuf = new f32 6 0.0f32
+  t_chk eq ot_set_st_gen_test 0 sub OT_U64_MAX 1 OT_OK
+  t_chk eq ot_set_st_gen_test 0 5 OT_ERR_BAD_ARGS
+  t_chk eq ot_set_st_gen_test 0 sub OT_U64_MAX 1 OT_ERR_BAD_ARGS
+  t_chk eq ot_from_f32 2 sh dat h OT_OK
+  t_chk eq get ot_ts_meta add mul get h 0 10 8 sub OT_U64_MAX 1
+  t_chk eq ot_set_st_gen_test 0 OT_U64_MAX OT_ERR_BAD_ARGS
+  t_chk eq ot_release get h 0 get h 1 OT_OK
+  t_chk eq ot_from_f32 2 sh dat h OT_OK
+  t_chk eq get ot_ts_meta add mul get h 0 10 8 OT_U64_MAX
+  t_chk eq ot_release get h 0 get h 1 OT_OK
+  t_chk eq ot_read_f32 get h 0 get h 1 obuf OT_ERR_STALE
+  t_chk eq ot_from_f32 2 sh dat h OT_ERR_CAPACITY
+  tt_chk_leaks
+end
+
+note ---- 5. immutability, NaN canonicalization, signed zero, shape identity ----
+
+fn test_immutability to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  put tt_sa 0 3
+  put tt_sa 1 4
+  put tt_sb 0 3
+  put tt_sb 1 4
+  for i ulong 12
+    put tt_fa i tt_rand_f32
+    put tt_fb i tt_rand_f32
+  end
+  h = new ulong 2 0
+  sh43 = new ulong 8 0
+  put sh43 0 4
+  put sh43 1 3
+  t_chk eq tt_mk_from_g 0 2 12 h OT_OK
+  tt_save_h 0 h
+  t_chk eq tt_mk_from_g 1 2 12 h OT_OK
+  tt_save_h 1 h
+  put tt_sb 0 4
+  put tt_sb 1 3
+  t_chk eq tt_mk_from_g 1 2 12 h OT_OK
+  tt_save_h 2 h
+  t_chk eq tt_vid_to get tt_h 0 get tt_h 1 0 OT_OK
+  for op ulong 6
+    t_chk eq ot_binary op get tt_h 0 get tt_h 1 get tt_h 2 get tt_h 3 h OT_OK
+    st_o = get ot_ts_meta add mul get h 0 10 7
+    st_a = get ot_ts_meta add mul get tt_h 0 10 7
+    t_chk ne st_o st_a
+    r1 = ot_release get h 0 get h 1
+  end
+  t_chk eq ot_unary OT_TU_SQRT get tt_h 0 get tt_h 1 h OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk eq ot_reduce OT_TR_SUM get tt_h 0 get tt_h 1 1 0 h OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk eq ot_matmul get tt_h 0 get tt_h 1 get tt_h 4 get tt_h 5 h OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk eq ot_cast get tt_h 0 get tt_h 1 OT_DT_F16 h OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk eq tt_vid_to get tt_h 0 get tt_h 1 1 OT_OK
+  t_chk tt_dig_eq
+  t_chk eq ot_reshape get tt_h 0 get tt_h 1 2 sh43 h OT_OK
+  t_chk eq tt_vid_to get h 0 get h 1 1 OT_OK
+  t_chk not tt_dig_eq
+  r1 = ot_release get h 0 get h 1
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+  note NaN payload canonicalization vs +0 / -0
+  s1 = new ulong 8 0
+  put s1 0 1
+  v = new f32 1 0.0f32
+  put v 0 bitcast f32 uint 0x7fc00000
+  t_chk eq ot_from_f32 1 s1 v h OT_OK
+  t_chk eq tt_vid_to get h 0 get h 1 0 OT_OK
+  r1 = ot_release get h 0 get h 1
+  put v 0 bitcast f32 uint 0xffa12345
+  t_chk eq ot_from_f32 1 s1 v h OT_OK
+  t_chk eq tt_vid_to get h 0 get h 1 1 OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk tt_dig_eq
+  put v 0 bitcast f32 uint 0x00000000
+  t_chk eq ot_from_f32 1 s1 v h OT_OK
+  t_chk eq tt_vid_to get h 0 get h 1 0 OT_OK
+  r1 = ot_release get h 0 get h 1
+  put v 0 bitcast f32 uint 0x80000000
+  t_chk eq ot_from_f32 1 s1 v h OT_OK
+  t_chk eq tt_vid_to get h 0 get h 1 1 OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk not tt_dig_eq
+  tt_chk_leaks
+end
+
+note ---- 6. elementwise parity (specials grid, FMA, SQRT, F16 & BF16 casts) ----
+
+fn tt_fill_fma_ex n ulong use_c0 ulong c0 f32 to void
+  for i ulong n bound 512
+    cv = c0
+    if eq use_c0 0
+      cv = get tt_fc i
+    end
+    put tt_ex i fma get tt_fa i get tt_fb i cv
+  end
+end
+
+fn test_elemwise_fma n ulong to void
+  ha = new ulong 2 0
+  hb = new ulong 2 0
+  hc = new ulong 2 0
+  ho = new ulong 2 0
+  put ha 0 get tt_h 0
+  put ha 1 get tt_h 1
+  put hb 0 get tt_h 2
+  put hb 1 get tt_h 3
+  put hc 0 get tt_h 4
+  put hc 1 get tt_h 5
+  tt_fill_fma_ex n 0 0.0f32
+  t_chk eq ot_fma ha hb hc ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 n OT_OK
+  t_chk eq tt_count_mm n 0 0
+  r1 = ot_release get ho 0 get ho 1
+end
+
+fn test_elemwise_fma_bcast n ulong to void
+  sh = new ulong 8 0
+  c0 = new f32 1 0.0f32
+  put c0 0 get tt_fc 7
+  ha = new ulong 2 0
+  hb = new ulong 2 0
+  hc = new ulong 2 0
+  ho = new ulong 2 0
+  put ha 0 get tt_h 0
+  put ha 1 get tt_h 1
+  put hb 0 get tt_h 2
+  put hb 1 get tt_h 3
+  t_chk eq ot_from_f32 0 sh c0 hc OT_OK
+  tt_fill_fma_ex n 1 get c0 0
+  t_chk eq ot_fma ha hb hc ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 n OT_OK
+  t_chk eq tt_count_mm n 0 0
+  r1 = ot_release get ho 0 get ho 1
+  r1 = ot_release get hc 0 get hc 1
+end
+
+fn test_elemwise_fma_casts n ulong to void
+  test_elemwise_fma n
+  test_elemwise_fma_bcast n
+  ho = new ulong 2 0
+  hw = new ulong 2 0
+  t_chk eq ot_cast get tt_h 0 get tt_h 1 OT_DT_F16 ho OT_OK
+  t_chk eq ot_cast get ho 0 get ho 1 OT_DT_F32 hw OT_OK
+  t_chk eq tt_load_go get hw 0 get hw 1 n OT_OK
+  for i ulong n bound 512
+    put tt_ex i bitcast f32 ot_f16_to_f32 ot_f32_to_f16 bitcast uint get tt_fa i
+  end
+  t_chk eq tt_count_mm n 0 0
+  r1 = ot_release get hw 0 get hw 1
+  r1 = ot_release get ho 0 get ho 1
+  t_chk eq ot_cast get tt_h 0 get tt_h 1 OT_DT_BF16 ho OT_OK
+  t_chk eq ot_cast get ho 0 get ho 1 OT_DT_F32 hw OT_OK
+  t_chk eq tt_load_go get hw 0 get hw 1 n OT_OK
+  for i ulong n bound 512
+    put tt_ex i bitcast f32 ot_bf16_to_f32 ot_f32_to_bf16 bitcast uint get tt_fa i
+  end
+  t_chk eq tt_count_mm n 0 0
+  r1 = ot_release get hw 0 get hw 1
+  r1 = ot_release get ho 0 get ho 1
+end
+
+fn test_elemwise_parity to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  n = ulong 512
+  for i ulong 400
+    put tt_fa i bitcast f32 get tt_spec div i 20
+    put tt_fb i bitcast f32 get tt_spec rem i 20
+    put tt_fc i tt_rand_f32
+  end
+  for i ulong 112
+    idx = add 400 i
+    put tt_fa idx tt_rand_f32
+    put tt_fb idx tt_rand_f32
+    put tt_fc idx tt_rand_f32
+  end
+  put tt_sa 0 n
+  put tt_sb 0 n
+  h = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 1 n h OT_OK
+  tt_save_h 0 h
+  t_chk eq tt_mk_from_g 1 1 n h OT_OK
+  tt_save_h 1 h
+  t_chk eq tt_mk_from_g 2 1 n h OT_OK
+  tt_save_h 2 h
+  for op ulong OT_TB_COUNT
+    for i ulong n bound 512
+      put tt_ex i ot_binary_scalar op get tt_fa i get tt_fb i
+    end
+    t_chk eq ot_binary op get tt_h 0 get tt_h 1 get tt_h 2 get tt_h 3 h OT_OK
+    t_chk eq tt_load_go get h 0 get h 1 n OT_OK
+    t_chk eq tt_count_mm n 0 0
+    r1 = ot_release get h 0 get h 1
+  end
+  for i ulong n bound 512
+    put tt_ex i ot_unary_scalar OT_TU_SQRT get tt_fa i
+  end
+  t_chk eq ot_unary OT_TU_SQRT get tt_h 0 get tt_h 1 h OT_OK
+  t_chk eq tt_load_go get h 0 get h 1 n OT_OK
+  t_chk eq tt_count_mm n 0 0
+  r1 = ot_release get h 0 get h 1
+  test_elemwise_fma_casts n
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+  tt_chk_leaks
+end
+
+note ---- 7. constants, RELU bit table, NEG views, RSQRT/ERF/GELU, transc, trig domain ----
+
+fn test_const_fill to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  s2 = new ulong 8 0
+  s8 = new ulong 8 2
+  ht = new ulong 2 0
+  put s2 0 3
+  put s2 1 5
+  t_chk eq ot_zeros 2 s2 ht OT_OK
+  t_chk eq tt_load_go get ht 0 get ht 1 15 OT_OK
+  for i ulong 15
+    t_chk eq bitcast uint get tt_go i uint 0
+  end
+  r1 = ot_release get ht 0 get ht 1
+  t_chk eq ot_ones 2 s2 ht OT_OK
+  t_chk eq tt_load_go get ht 0 get ht 1 15 OT_OK
+  for i ulong 15
+    t_chk eq bitcast uint get tt_go i OT_ONE_BITS
+  end
+  r1 = ot_release get ht 0 get ht 1
+  for k ulong 20
+    sp = get tt_spec k
+    t_chk eq ot_full 2 s2 bitcast f32 sp ht OT_OK
+    t_chk eq tt_load_go get ht 0 get ht 1 15 OT_OK
+    ok = true
+    for i ulong 15
+      if ne bitcast uint get tt_go i sp
+        ok = false
+      end
+    end
+    t_chk ok
+    r1 = ot_release get ht 0 get ht 1
+  end
+  t_chk eq ot_full 0 s2 2.5f32 ht OT_OK
+  t_chk eq tt_load_go get ht 0 get ht 1 1 OT_OK
+  t_chk eq bitcast uint get tt_go 0 uint 0x40200000
+  r1 = ot_release get ht 0 get ht 1
+  t_chk eq ot_full 8 s8 -1.0f32 ht OT_OK
+  t_chk eq get ot_ts_meta add mul get ht 0 10 6 256
+  r1 = ot_release get ht 0 get ht 1
+  t_chk eq ot_full 9 s8 0.0f32 ht OT_ERR_RANK
+  put s2 1 0
+  t_chk eq ot_zeros 2 s2 ht OT_ERR_SHAPE
+  tt_chk_leaks
+end
+
+fn test_relu_and_neg to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  rin = new uint 22 0
+  rout = new uint 22 0
+  hx = new ulong 2 0
+  ho = new ulong 2 0
+  put rin 0 0x00000000
+  put rout 0 0x00000000
+  put rin 1 0x80000000
+  put rout 1 0x00000000
+  put rin 2 0x7f800000
+  put rout 2 0x7f800000
+  put rin 3 0xff800000
+  put rout 3 0x00000000
+  put rin 4 0x00000001
+  put rout 4 0x00000001
+  put rin 5 0x007fffff
+  put rout 5 0x007fffff
+  put rin 6 0x80000001
+  put rout 6 0x00000000
+  put rin 7 0x807fffff
+  put rout 7 0x00000000
+  put rin 8 0x00800000
+  put rout 8 0x00800000
+  put rin 9 0x7f7fffff
+  put rout 9 0x7f7fffff
+  put rin 10 0xff7fffff
+  put rout 10 0x00000000
+  put rin 11 0x3f800000
+  put rout 11 0x3f800000
+  put rin 12 0xbf800000
+  put rout 12 0x00000000
+  put rin 13 0x7fc00000
+  put rout 13 0x7fc00000
+  put rin 14 0xffc00000
+  put rout 14 0x7fc00000
+  put rin 15 0x7fc00001
+  put rout 15 0x7fc00000
+  put rin 16 0x7fa00001
+  put rout 16 0x7fc00000
+  put rin 17 0x7f800001
+  put rout 17 0x7fc00000
+  put rin 18 0xff800001
+  put rout 18 0x7fc00000
+  put rin 19 0xffc00123
+  put rout 19 0x7fc00000
+  put rin 20 0x7fffffff
+  put rout 20 0x7fc00000
+  put rin 21 0xffffffff
+  put rout 21 0x7fc00000
+  for i ulong 22
+    put tt_fa i bitcast f32 get rin i
+  end
+  put tt_sa 0 22
+  t_chk eq tt_mk_from_g 0 1 22 hx OT_OK
+  t_chk eq ot_unary OT_TU_RELU get hx 0 get hx 1 ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 22 OT_OK
+  for i ulong 22
+    t_chk eq bitcast uint get tt_go i get rout i
+  end
+  r1 = ot_release get ho 0 get ho 1
+  t_chk eq ot_unary OT_TU_NEG get hx 0 get hx 1 ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 22 OT_OK
+  for i ulong 22
+    u = get rin i
+    want = xor u uint 0x80000000
+    if ot_is_nan u
+      want = OT_QNAN_BITS
+    end
+    t_chk eq bitcast uint get tt_go i want
+  end
+  r1 = ot_release get ho 0 get ho 1
+  r1 = ot_release get hx 0 get hx 1
+  tt_chk_leaks
+end
+
+fn test_unary_views_and_trig to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  for i ulong 256
+    put tt_fa i tt_rand_f32
+  end
+  for i ulong 20
+    put tt_fa i bitcast f32 get tt_spec i
+  end
+  put tt_sa 0 16
+  put tt_sa 1 16
+  ha = new ulong 2 0
+  ht = new ulong 2 0
+  ho = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 2 256 ha OT_OK
+  t_chk eq ot_transpose get ha 0 get ha 1 ht OT_OK
+  for op ulong OT_TU_COUNT
+    t_chk eq ot_unary op get ht 0 get ht 1 ho OT_OK
+    t_chk eq tt_load_go get ho 0 get ho 1 256 OT_OK
+    for r ulong 16
+      for c ulong 16
+        put tt_ex add mul r 16 c ot_unary_scalar op get tt_fa add mul c 16 r
+      end
+    end
+    t_chk eq tt_count_mm 256 1 0
+    r1 = ot_release get ho 0 get ho 1
+  end
+  r1 = ot_release get ht 0 get ht 1
+  r1 = ot_release get ha 0 get ha 1
+  note RSQRT / ERF / GELU / LOG2 / SIN / COS contract values
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_RSQRT bitcast f32 uint 0x00000000 OT_PINF_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_RSQRT bitcast f32 uint 0x80000000 OT_NINF_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_RSQRT -1.0f32 OT_QNAN_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_RSQRT bitcast f32 OT_PINF_BITS uint 0
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_RSQRT 4.0f32 uint 0x3f000000
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_ERF bitcast f32 OT_NEG0_BITS OT_NEG0_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_ERF 4.0f32 OT_ONE_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_ERF bitcast f32 OT_NINF_BITS uint 0xbf800000
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_ERF bitcast f32 uint 0x7fa00001 OT_QNAN_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_GELU bitcast f32 OT_NEG0_BITS OT_NEG0_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_GELU 8.0f32 uint 0x41000000
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_GELU bitcast f32 OT_PINF_BITS OT_PINF_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_GELU bitcast f32 OT_NINF_BITS OT_NEG0_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_LOG2 -1.0f32 OT_QNAN_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_SIN bitcast f32 uint 0x00000000 uint 0x00000000
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_SIN bitcast f32 OT_NEG0_BITS OT_NEG0_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_COS bitcast f32 uint 0x00000000 OT_ONE_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_COS bitcast f32 OT_NEG0_BITS OT_ONE_BITS
+  s22 = ot_unary_scalar OT_TU_SIN bitcast f32 uint 0x4a800000
+  c22 = ot_unary_scalar OT_TU_COS bitcast f32 uint 0x4a800000
+  t_chk and ge s22 -1.0f32 le s22 1.0f32
+  t_chk and ge c22 -1.0f32 le c22 1.0f32
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_SIN bitcast f32 uint 0x4a800001 OT_QNAN_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_COS bitcast f32 uint 0xca800001 OT_QNAN_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_SIN bitcast f32 OT_PINF_BITS OT_QNAN_BITS
+  t_chk eq bitcast uint ot_unary_scalar OT_TU_COS bitcast f32 OT_NINF_BITS OT_QNAN_BITS
+  tt_chk_leaks
+end
+
+note ---- 8. mask compare + where() ----
+
+fn test_mask_one_pair cmp_op ulong sel_op ulong n ulong to void
+  ha = new ulong 2 0
+  hb = new ulong 2 0
+  ho = new ulong 2 0
+  hw = new ulong 2 0
+  put ha 0 get tt_h 0
+  put ha 1 get tt_h 1
+  put hb 0 get tt_h 2
+  put hb 1 get tt_h 3
+  t_chk eq ot_binary cmp_op get ha 0 get ha 1 get hb 0 get hb 1 ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 n OT_OK
+  only01 = true
+  for i ulong n bound 512
+    u = bitcast uint get tt_go i
+    if and ne u OT_ONE_BITS ne u uint 0
+      only01 = false
+    end
+  end
+  t_chk only01
+  t_chk eq ot_where ho ha hb hw OT_OK
+  t_chk eq tt_load_go get hw 0 get hw 1 n OT_OK
+  for i ulong n bound 512
+    put tt_ex i get tt_go i
+  end
+  r1 = ot_release get hw 0 get hw 1
+  r1 = ot_release get ho 0 get ho 1
+  t_chk eq ot_binary sel_op get ha 0 get ha 1 get hb 0 get hb 1 hw OT_OK
+  t_chk eq tt_load_go get hw 0 get hw 1 n OT_OK
+  t_chk eq tt_count_mm n 1 0
+  r1 = ot_release get hw 0 get hw 1
+end
+
+fn test_mask_where to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  n = ulong 400
+  for i ulong 400
+    put tt_fa i bitcast f32 get tt_spec div i 20
+    put tt_fb i bitcast f32 get tt_spec rem i 20
+  end
+  put tt_sa 0 n
+  put tt_sb 0 n
+  h = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 1 n h OT_OK
+  tt_save_h 0 h
+  t_chk eq tt_mk_from_g 1 1 n h OT_OK
+  tt_save_h 1 h
+  test_mask_one_pair OT_TB_CMP_EQ OT_TB_SEL_EQ n
+  test_mask_one_pair OT_TB_CMP_NE OT_TB_SEL_NE n
+  test_mask_one_pair OT_TB_CMP_LT OT_TB_SEL_LT n
+  test_mask_one_pair OT_TB_CMP_LE OT_TB_SEL_LE n
+  test_mask_one_pair OT_TB_CMP_GT OT_TB_SEL_GT n
+  test_mask_one_pair OT_TB_CMP_GE OT_TB_SEL_GE n
+  tt_rel_idx 1
+  tt_rel_idx 0
+  t_chk eq bitcast uint ot_binary_scalar OT_TB_CMP_EQ bitcast f32 OT_QNAN_BITS bitcast f32 OT_QNAN_BITS uint 0
+  t_chk eq bitcast uint ot_binary_scalar OT_TB_CMP_EQ bitcast f32 OT_NEG0_BITS 0.0f32 OT_ONE_BITS
+  t_chk eq bitcast uint ot_binary_scalar OT_TB_CMP_NE bitcast f32 OT_QNAN_BITS 1.0f32 uint 0
+  t_chk eq bitcast uint ot_binary_scalar OT_TB_CMP_NE bitcast f32 OT_NEG0_BITS 0.0f32 uint 0
+  t_chk eq bitcast uint ot_binary_scalar OT_TB_CMP_LT bitcast f32 OT_NEG0_BITS 0.0f32 uint 0
+  t_chk eq bitcast uint ot_binary_scalar OT_TB_CMP_GE bitcast f32 OT_QNAN_BITS 1.0f32 uint 0
+  t_chk eq bitcast uint ot_binary_scalar OT_TB_CMP_LE 1.0f32 1.0f32 OT_ONE_BITS
+  tt_chk_leaks
+end
+
+fn test_where_run_bad to void
+  hbad = new ulong 2 0
+  ha = new ulong 2 0
+  hb = new ulong 2 0
+  ho = new ulong 2 0
+  lc0 = new ulong 2 0
+  put hbad 0 get tt_h 6
+  put hbad 1 get tt_h 7
+  put ha 0 get tt_h 2
+  put ha 1 get tt_h 3
+  put hb 0 get tt_h 4
+  put hb 1 get tt_h 5
+  ot_live_counts lc0
+  t0 = get lc0 0
+  s0 = get lc0 1
+  t_chk eq ot_where hbad ha hb ho OT_ERR_MASK
+  ot_live_counts lc0
+  t_chk eq get lc0 0 t0
+  t_chk eq get lc0 1 s0
+end
+
+fn test_where_one_bad bad_bits uint to void
+  sc = new ulong 8 0
+  put sc 0 3
+  put sc 1 1
+  cv = new f32 3 1.0f32
+  put cv 1 bitcast f32 bad_bits
+  hbad = new ulong 2 0
+  t_chk eq ot_from_f32 2 sc cv hbad OT_OK
+  tt_save_h 3 hbad
+  test_where_run_bad
+  tt_rel_idx 3
+end
+
+fn test_where_bcast_chk to void
+  for r ulong 3
+    for c ulong 4
+      idx = add mul r 4 c
+      gb = bitcast uint get tt_go idx
+      if eq r 1
+        t_chk eq gb uint 0x7fc0beef
+      else
+        t_chk eq gb bitcast uint get tt_fa c
+      end
+    end
+  end
+end
+
+fn test_where_bcast_exec to void
+  hc = new ulong 2 0
+  ha = new ulong 2 0
+  hb = new ulong 2 0
+  ho = new ulong 2 0
+  put hc 0 get tt_h 0
+  put hc 1 get tt_h 1
+  put ha 0 get tt_h 2
+  put ha 1 get tt_h 3
+  put hb 0 get tt_h 4
+  put hb 1 get tt_h 5
+  t_chk eq ot_where hc ha hb ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 12 OT_OK
+  r1 = ot_release get ho 0 get ho 1
+  test_where_bcast_chk
+end
+
+fn test_where_broadcast_and_refusals to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  sc = new ulong 8 0
+  put sc 0 3
+  put sc 1 1
+  cv = new f32 3 0.0f32
+  put cv 0 1.0f32
+  put cv 1 0.0f32
+  put cv 2 1.0f32
+  h = new ulong 2 0
+  t_chk eq ot_from_f32 2 sc cv h OT_OK
+  tt_save_h 0 h
+  put tt_sa 0 1
+  put tt_sa 1 4
+  put tt_fa 0 bitcast f32 OT_NEG0_BITS
+  put tt_fa 1 bitcast f32 uint 0x7fa00001
+  put tt_fa 2 bitcast f32 uint 0xffc00123
+  put tt_fa 3 0.5f32
+  t_chk eq tt_mk_from_g 0 2 4 h OT_OK
+  tt_save_h 1 h
+  put tt_fb 0 bitcast f32 uint 0x7fc0beef
+  t_chk eq tt_mk_from_g 1 0 1 h OT_OK
+  tt_save_h 2 h
+  test_where_bcast_exec
+  test_where_one_bad uint 0x3f000000
+  test_where_one_bad uint 0x80000000
+  test_where_one_bad uint 0x7fc00000
+  test_where_one_bad uint 0x40000000
+  test_where_one_bad uint 0x3f800001
+  test_where_one_bad uint 0xbf800000
+  test_where_one_bad uint 0x00000001
+  test_where_one_bad uint 0x7f800000
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+  tt_chk_leaks
+end
+
+note ---- 9. reductions, multi-axis reduce_axes, sum_to_shape ----
+
+fn test_reduce_1d to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  lens = new ulong 11 0
+  put lens 0 1
+  put lens 1 2
+  put lens 2 31
+  put lens 3 32
+  put lens 4 33
+  put lens 5 63
+  put lens 6 64
+  put lens 7 255
+  put lens 8 1023
+  put lens 9 1024
+  put lens 10 1025
+  hx = new ulong 2 0
+  ho = new ulong 2 0
+  for li ulong 11
+    n = get lens li
+    for i ulong n bound 1025
+      if eq rem li 2 1
+        put tt_fa i tt_rand_mod
+      else
+        put tt_fa i tt_rand_f32
+      end
+    end
+    put tt_sa 0 n
+    t_chk eq tt_mk_from_g 0 1 n hx OT_OK
+    for op ulong OT_TR_COUNT
+      ex = tt_ref_tree op n 0
+      t_chk eq ot_reduce op get hx 0 get hx 1 0 0 ho OT_OK
+      t_chk eq tt_load_go get ho 0 get ho 1 1 OT_OK
+      t_chk t_same_f32 ex get tt_go 0
+      r1 = ot_release get ho 0 get ho 1
+    end
+    r1 = ot_release get hx 0 get hx 1
+  end
+  note SUM of all -0 is -0
+  put tt_sa 0 3
+  put tt_fa 0 bitcast f32 OT_NEG0_BITS
+  put tt_fa 1 bitcast f32 OT_NEG0_BITS
+  put tt_fa 2 bitcast f32 OT_NEG0_BITS
+  t_chk eq tt_mk_from_g 0 1 3 hx OT_OK
+  t_chk eq ot_reduce OT_TR_SUM get hx 0 get hx 1 0 0 ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 1 OT_OK
+  t_chk eq bitcast uint get tt_go 0 OT_NEG0_BITS
+  r1 = ot_release get ho 0 get ho 1
+  r1 = ot_release get hx 0 get hx 1
+  tt_chk_leaks
+end
+
+fn test_reduce_3d to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  put tt_sa 0 3
+  put tt_sa 1 37
+  put tt_sa 2 5
+  for i ulong 555
+    put tt_fa i tt_rand_mod
+  end
+  h = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 3 555 h OT_OK
+  tt_save_h 0 h
+  for ax ulong 3
+    kp = ulong 0
+    if eq ax 1
+      kp = 1
+    end
+    t_chk eq ot_reduce OT_TR_SUM get tt_h 0 get tt_h 1 ax kp h OT_OK
+    want_r = ulong 2
+    if eq kp 1
+      want_r = 3
+    end
+    t_chk eq get ot_ts_meta add mul get h 0 10 4 want_r
+    r1 = ot_release get h 0 get h 1
+  end
+  perm = new ulong 8 0
+  put perm 0 1
+  put perm 1 2
+  put perm 2 0
+  t_chk eq ot_permute get tt_h 0 get tt_h 1 perm h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_contiguous get tt_h 2 get tt_h 3 h OT_OK
+  tt_save_h 2 h
+  t_chk eq ot_reduce OT_TR_SUM get tt_h 2 get tt_h 3 0 0 h OT_OK
+  tt_save_h 3 h
+  t_chk eq ot_reduce OT_TR_SUM get tt_h 4 get tt_h 5 0 0 h OT_OK
+  eq_f = new ulong 1 0
+  t_chk eq ot_value_equal get tt_h 6 get tt_h 7 get h 0 get h 1 eq_f OT_OK
+  t_chk eq get eq_f 0 1
+  r1 = ot_release get h 0 get h 1
+  tt_rel_idx 3
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+  tt_chk_leaks
+end
+
+fn test_reduce_axes_one mask ulong op ulong kp ulong to void
+  asc = new ulong 8 0
+  desc = new ulong 8 0
+  na = ulong 0
+  for d ulong 4
+    if ne and mask shl ulong 1 d 0
+      put asc na d
+      na = add na 1
+    end
+  end
+  for i ulong na bound 4
+    put desc i get asc sub sub na 1 i
+  end
+  ko = new ulong 3 0
+  put ko 2 kp
+  t_chk eq ot_reduce_axes op get tt_h 0 get tt_h 1 na asc ko OT_OK
+  cs = get tt_h 0
+  cg = get tt_h 1
+  nh = new ulong 2 0
+  for i ulong na bound 4
+    t_chk eq ot_reduce op cs cg get desc i kp nh OT_OK
+    if gt i 0
+      r1 = ot_release cs cg
+    end
+    cs = get nh 0
+    cg = get nh 1
+  end
+  eq_f = new ulong 1 0
+  t_chk eq ot_value_equal cs cg get ko 0 get ko 1 eq_f OT_OK
+  t_chk eq get eq_f 0 1
+  r1 = ot_release cs cg
+  r1 = ot_release get ko 0 get ko 1
+end
+
+fn test_reduce_axes to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  put tt_sa 0 3
+  put tt_sa 1 5
+  put tt_sa 2 4
+  put tt_sa 3 6
+  for i ulong 360
+    put tt_fa i tt_rand_mod
+  end
+  h = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 4 360 h OT_OK
+  tt_save_h 0 h
+  for m ulong 15
+    mask = add m 1
+    for op ulong 3
+      test_reduce_axes_one mask op 0
+      test_reduce_axes_one mask op 1
+    end
+  end
+  ax = new ulong 8 0
+  ko = new ulong 3 0
+  eq_f = new ulong 1 0
+  put ax 0 2
+  put ko 2 1
+  t_chk eq ot_reduce_axes OT_TR_MEAN get tt_h 0 get tt_h 1 1 ax ko OT_OK
+  t_chk eq ot_reduce OT_TR_MEAN get tt_h 0 get tt_h 1 2 1 h OT_OK
+  t_chk eq ot_value_equal get ko 0 get ko 1 get h 0 get h 1 eq_f OT_OK
+  t_chk eq get eq_f 0 1
+  r1 = ot_release get ko 0 get ko 1
+  r1 = ot_release get h 0 get h 1
+  put ax 0 1
+  put ax 1 2
+  t_chk eq ot_reduce_axes OT_TR_MEAN get tt_h 0 get tt_h 1 2 ax ko OT_ERR_BAD_ARGS
+  t_chk eq ot_reduce_axes OT_TR_SUM get tt_h 0 get tt_h 1 0 ax ko OT_OK
+  t_chk eq ot_value_equal get tt_h 0 get tt_h 1 get ko 0 get ko 1 eq_f OT_OK
+  t_chk eq get eq_f 0 1
+  r1 = ot_release get ko 0 get ko 1
+  put ax 0 1
+  put ax 1 1
+  t_chk eq ot_reduce_axes OT_TR_SUM get tt_h 0 get tt_h 1 2 ax ko OT_ERR_AXIS
+  put ax 0 4
+  t_chk eq ot_reduce_axes OT_TR_SUM get tt_h 0 get tt_h 1 1 ax ko OT_ERR_AXIS
+  t_chk eq ot_reduce_axes OT_TR_SUM get tt_h 0 get tt_h 1 5 ax ko OT_ERR_AXIS
+  tt_rel_idx 0
+  tt_chk_leaks
+end
+
+fn test_sum_to_shape to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  s4 = new ulong 8 0
+  tgt = new ulong 8 0
+  h = new ulong 2 0
+  hb = new ulong 2 0
+  put s4 0 2
+  put s4 1 3
+  put s4 2 5
+  put s4 3 4
+  put tgt 0 3
+  put tgt 1 1
+  put tgt 2 4
+  put tt_sa 0 3
+  put tt_sa 1 1
+  put tt_sa 2 4
+  for i ulong 12
+    put tt_fa i f32 sub int rem i 7 3
+  end
+  t_chk eq tt_mk_from_g 0 3 12 h OT_OK
+  tt_save_h 0 h
+  t_chk eq ot_broadcast_to get tt_h 0 get tt_h 1 4 s4 hb OT_OK
+  t_chk eq ot_sum_to_shape get hb 0 get hb 1 3 tgt h OT_OK
+  t_chk eq tt_load_go get h 0 get h 1 12 OT_OK
+  for i ulong 12
+    t_chk t_same_f32 get tt_go i mul get tt_fa i 10.0f32
+  end
+  r1 = ot_release get h 0 get h 1
+  r1 = ot_release get hb 0 get hb 1
+  tt_rel_idx 0
+  note size-1 leading axis drop preserves -0.0 + refusals
+  put tt_sa 0 1
+  put tt_sa 1 2
+  put tt_sa 2 3
+  put tt_fa 0 bitcast f32 OT_NEG0_BITS
+  for i ulong 5
+    put tt_fa add i 1 f32 add i 1
+  end
+  put tgt 0 2
+  put tgt 1 3
+  t_chk eq tt_mk_from_g 0 3 6 h OT_OK
+  t_chk eq ot_sum_to_shape get h 0 get h 1 2 tgt hb OT_OK
+  t_chk eq tt_load_go get hb 0 get hb 1 6 OT_OK
+  t_chk eq bitcast uint get tt_go 0 OT_NEG0_BITS
+  t_chk eq get tt_go 5 5.0f32
+  r1 = ot_release get hb 0 get hb 1
+  put tgt 0 3
+  put tgt 1 2
+  t_chk eq ot_sum_to_shape get h 0 get h 1 2 tgt hb OT_ERR_SHAPE
+  t_chk eq ot_sum_to_shape get h 0 get h 1 4 s4 hb OT_ERR_SHAPE
+  t_chk eq ot_sum_to_shape get h 0 get h 1 9 s4 hb OT_ERR_RANK
+  r1 = ot_release get h 0 get h 1
+  tt_chk_leaks
+end
+
+note ---- 10. matmul, strided views, batched broadcast, order sensitivity, determinism ----
+
+fn tt_ref_mm_cell i ulong j ulong k ulong n ulong to void
+  ibase = mul i k
+  for t ulong k bound 1025
+    va = get tt_fa add ibase t
+    vb = get tt_fb add mul t n j
+    put tt_row t mul va vb
+  end
+  put tt_ex add mul i n j tt_ref_tree OT_TR_SUM k 1
+end
+
+fn tt_ref_matmul m ulong k ulong n ulong to void
+  for i ulong m bound 64
+    for j ulong n bound 64
+      tt_ref_mm_cell i j k n
+    end
+  end
+end
+
+fn test_matmul_case m ulong k ulong n ulong to void
+  for i ulong mul m k bound 2048
+    put tt_fa i tt_rand_mod
+  end
+  for i ulong mul k n bound 2048
+    put tt_fb i tt_rand_mod
+  end
+  tt_ref_matmul m k n
+  put tt_sa 0 m
+  put tt_sa 1 k
+  put tt_sb 0 k
+  put tt_sb 1 n
+  ha = new ulong 2 0
+  hb = new ulong 2 0
+  ho = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 2 mul m k ha OT_OK
+  t_chk eq tt_mk_from_g 1 2 mul k n hb OT_OK
+  t_chk eq ot_matmul get ha 0 get ha 1 get hb 0 get hb 1 ho OT_OK
+  t_chk eq tt_load_go get ho 0 get ho 1 mul m n OT_OK
+  t_chk eq tt_count_mm mul m n 0 0
+  r1 = ot_release get ho 0 get ho 1
+  r1 = ot_release get ha 0 get ha 1
+  r1 = ot_release get hb 0 get hb 1
+end
+
+fn tt_strided_prep_fa to void
+  for i ulong 9
+    for k ulong 40
+      put tt_fa add mul i 40 k get tt_fc add mul k 9 i
+    end
+  end
+end
+
+fn tt_strided_prep_fb to void
+  for k ulong 40
+    kb6 = mul k 6
+    kb12 = mul k 12
+    for j ulong 6
+      src_i = add kb12 add mul 2 j 1
+      put tt_fb add kb6 j get tt_fc src_i
+    end
+  end
+end
+
+fn test_matmul_strided to void
+  put tt_sa 0 40
+  put tt_sa 1 9
+  for i ulong 360
+    put tt_fc i tt_rand_mod
+  end
+  h = new ulong 2 0
+  st = new ulong 8 0
+  sp = new ulong 8 0
+  stp = new ulong 8 1
+  t_chk eq tt_mk_from_g 2 2 360 h OT_OK
+  tt_save_h 0 h
+  tt_strided_prep_fa
+  put tt_sa 0 40
+  put tt_sa 1 12
+  for i ulong 480
+    put tt_fc i tt_rand_mod
+  end
+  t_chk eq tt_mk_from_g 2 2 480 h OT_OK
+  tt_save_h 1 h
+  tt_strided_prep_fb
+  tt_ref_matmul 9 40 6
+  t_chk eq ot_transpose get tt_h 0 get tt_h 1 h OT_OK
+  tt_save_h 2 h
   put st 0 0
   put st 1 1
-  put sp 0 2
-  put sp 1 4
+  put sp 0 40
+  put sp 1 12
   put stp 0 1
   put stp 1 2
-  hs = new ulong 2 0
-  t_chk eq ot_slice get ha 0 get ha 1 st sp stp hs OT_OK
-  obuf = new f32 4 0.0f32
-  t_chk eq ot_read_f32 get hs 0 get hs 1 obuf OT_OK
-  t_chk eq get obuf 0 2.0f32
-  t_chk eq get obuf 1 4.0f32
-  t_chk eq get obuf 2 6.0f32
-  t_chk eq get obuf 3 8.0f32
-  he = new ulong 2 0
-  t_chk eq ot_embed get hs 0 get hs 1 sh st stp he OT_OK
-  out8 = new f32 8 0.0f32
-  t_chk eq ot_read_f32 get he 0 get he 1 out8 OT_OK
-  t_chk eq get out8 0 0.0f32
-  t_chk eq get out8 1 2.0f32
-  t_chk eq get out8 3 4.0f32
-  t_chk eq get out8 5 6.0f32
-  t_chk eq get out8 7 8.0f32
+  t_chk eq ot_slice get tt_h 2 get tt_h 3 st sp stp h OT_OK
+  tt_save_h 3 h
+  t_chk eq ot_matmul get tt_h 4 get tt_h 5 get tt_h 6 get tt_h 7 h OT_OK
+  t_chk eq tt_load_go get h 0 get h 1 54 OT_OK
+  t_chk eq tt_count_mm 54 0 0
+  r1 = ot_release get h 0 get h 1
+  tt_rel_idx 3
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+end
+
+fn tt_chk_batched_slice to void
+  for i ulong 3
+    for j ulong 6
+      for t ulong 4
+        ia = add 12 add mul i 4 t
+        ib = add 72 add mul t 6 j
+        put tt_row t mul get tt_fa ia get tt_fb ib
+      end
+      want = tt_ref_tree OT_TR_SUM 4 1
+      oi = add 144 add mul i 6 j
+      t_chk t_same_f32 want get tt_go oi
+    end
+  end
+end
+
+fn test_matmul_batched_and_order to void
+  put tt_sa 0 2
+  put tt_sa 1 1
+  put tt_sa 2 3
+  put tt_sa 3 4
+  put tt_sb 0 5
+  put tt_sb 1 4
+  put tt_sb 2 6
+  for i ulong 24
+    put tt_fa i tt_rand_finite
+  end
+  for i ulong 120
+    put tt_fb i tt_rand_finite
+  end
+  h = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 4 24 h OT_OK
+  tt_save_h 0 h
+  t_chk eq tt_mk_from_g 1 3 120 h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_matmul get tt_h 0 get tt_h 1 get tt_h 2 get tt_h 3 h OT_OK
+  t_chk eq get ot_ts_meta add mul get h 0 10 4 4
+  t_chk eq get ot_ts_meta add mul get h 0 10 6 180
+  t_chk eq tt_load_go get h 0 get h 1 180 OT_OK
+  r1 = ot_release get h 0 get h 1
+  tt_chk_batched_slice
+  put tt_sb 0 3
+  put tt_sb 1 1
+  put tt_sb 2 4
+  put tt_sb 3 6
+  t_chk eq tt_mk_from_g 1 4 72 h OT_OK
+  tt_save_h 2 h
+  t_chk eq ot_matmul get tt_h 0 get tt_h 1 get tt_h 4 get tt_h 5 h OT_ERR_SHAPE
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+  note Order-sensitivity check: sequential sum differs from tile-32 tree on K=300
+  diff_cnt = ulong 0
+  for rep ulong 16
+    seq_acc = 0.0f32
+    for t ulong 300
+      v = tt_rand_finite
+      put tt_row t v
+      if eq t 0
+        seq_acc = v
+      else
+        seq_acc = add seq_acc v
+      end
+    end
+    tree_acc = tt_ref_tree OT_TR_SUM 300 1
+    if not t_raw_eq seq_acc tree_acc
+      diff_cnt = add diff_cnt 1
+    end
+  end
+  t_chk gt diff_cnt 0
+end
+
+fn test_matmul_all to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  test_matmul_case 1 1 1
+  test_matmul_case 7 13 5
+  test_matmul_case 1 33 1
+  test_matmul_case 3 65 2
+  test_matmul_case 16 32 16
+  test_matmul_strided
+  test_matmul_batched_and_order
+  tt_chk_leaks
+end
+
+fn tt_kat_run which ulong to void
+  put tt_rng 0 ulong 0x0123456789abcdef
+  for i ulong 91
+    put tt_fa i tt_rand_mod
+  end
+  for i ulong 65
+    put tt_fb i tt_rand_mod
+  end
+  put tt_sa 0 7
+  put tt_sa 1 13
+  put tt_sb 0 13
+  put tt_sb 1 5
+  h = new ulong 2 0
+  t_chk eq tt_mk_from_g 0 2 91 h OT_OK
+  tt_save_h 0 h
+  t_chk eq tt_mk_from_g 1 2 65 h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_matmul get tt_h 0 get tt_h 1 get tt_h 2 get tt_h 3 h OT_OK
+  tt_save_h 2 h
+  t_chk eq ot_reduce OT_TR_SUM get tt_h 0 get tt_h 1 1 1 h OT_OK
+  tt_save_h 3 h
+  t_chk eq ot_binary OT_TB_DIV get tt_h 4 get tt_h 5 get tt_h 6 get tt_h 7 h OT_OK
+  t_chk eq tt_vid_to get h 0 get h 1 which OT_OK
+  r1 = ot_release get h 0 get h 1
+  tt_rel_idx 3
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+end
+
+fn test_determinism to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  tt_kat_run 0
+  tt_kat_run 1
+  t_chk tt_dig_eq
+  tt_chk_leaks
+end
+
+note ---- 11. placement: embed & concat ----
+
+fn tt_chk_embed_grid to void
+  wrong = ulong 0
+  for i ulong 210
+    a = div i 42
+    b = rem div i 7 6
+    c = rem i 7
+    in_s = false
+    if ge a 1
+      if ge c 2
+        if eq rem sub a 1 2 0
+          if eq rem b 3 0
+            if eq rem sub c 2 2 0
+              in_s = true
+            end
+          end
+        end
+      end
+    end
+    gb = bitcast uint get tt_go i
+    if in_s
+      if ne gb bitcast uint get tt_fa i
+        wrong = add wrong 1
+      end
+    else
+      if ne gb uint 0
+        wrong = add wrong 1
+      end
+    end
+  end
+  t_chk eq wrong 0
+end
+
+fn test_embed_f16 to void
+  ys = new ulong 8 0
+  st = new ulong 8 0
+  stp = new ulong 8 1
+  h2 = new uchar 4 0
+  h = new ulong 2 0
+  put h2 0 uchar 0x01
+  put h2 1 uchar 0x7e
+  put h2 2 uchar 0x00
+  put h2 3 uchar 0x80
+  put ys 0 2
+  t_chk eq ot_from_bytes OT_DT_F16 1 ys h2 h OT_OK
+  tt_save_h 0 h
+  put ys 0 4
+  put st 0 1
+  put stp 0 2
+  t_chk eq ot_embed get tt_h 0 get tt_h 1 ys st stp h OT_OK
+  t_chk eq get ot_ts_meta add mul get h 0 10 3 OT_DT_F16
+  r1 = ot_release get h 0 get h 1
+  tt_rel_idx 0
+end
+
+fn test_embed_cases to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  put tt_sa 0 5
+  put tt_sa 1 6
+  put tt_sa 2 7
+  for i ulong 210
+    put tt_fa i bitcast f32 add uint 0x3f800000 uint i
+  end
+  ys = new ulong 8 0
+  st = new ulong 8 0
+  sp = new ulong 8 0
+  stp = new ulong 8 1
+  h = new ulong 2 0
+  put ys 0 5
+  put ys 1 6
+  put ys 2 7
+  put st 0 1
+  put st 1 0
+  put st 2 2
+  put sp 0 5
+  put sp 1 6
+  put sp 2 7
+  put stp 0 2
+  put stp 1 3
+  put stp 2 2
+  t_chk eq tt_mk_from_g 0 3 210 h OT_OK
+  tt_save_h 0 h
+  t_chk eq ot_slice get tt_h 0 get tt_h 1 st sp stp h OT_OK
+  tt_save_h 1 h
+  t_chk eq ot_embed get tt_h 2 get tt_h 3 ys st stp h OT_OK
+  t_chk eq tt_load_go get h 0 get h 1 210 OT_OK
+  r1 = ot_release get h 0 get h 1
+  tt_chk_embed_grid
+  tt_rel_idx 1
+  tt_rel_idx 0
+  test_embed_f16
+  tt_chk_leaks
+end
+
+fn test_embed_refusals to void
+  sbb = new ulong 8 0
+  st = new ulong 8 0
+  stp = new ulong 8 1
+  h = new ulong 2 0
+  put sbb 0 4
+  put sbb 1 6
+  put st 0 3
+  put st 1 3
+  t_chk eq ot_embed get tt_h 0 get tt_h 1 sbb st stp h OT_ERR_BOUNDS
+  put st 0 0
+  put st 1 0
+  put stp 0 4
+  t_chk eq ot_embed get tt_h 0 get tt_h 1 sbb st stp h OT_ERR_BOUNDS
+  put stp 0 0
+  t_chk eq ot_embed get tt_h 0 get tt_h 1 sbb st stp h OT_ERR_BAD_ARGS
+  put stp 0 1
+  put sbb 1 0
+  t_chk eq ot_embed get tt_h 0 get tt_h 1 sbb st stp h OT_ERR_SHAPE
+end
+
+fn test_concat_and_refusals to void
+  t_chk eq ot_ctx_init 64 OT_OK
+  put tt_sa 0 2
+  put tt_sa 1 3
+  for i ulong 6
+    put tt_fa i f32 add i 1
+  end
+  put tt_sb 0 1
+  put tt_sb 1 2
+  put tt_fb 0 bitcast f32 OT_NEG0_BITS
+  put tt_fb 1 9.0f32
+  sbb = new ulong 8 0
+  put sbb 0 2
+  put sbb 1 2
+  h = new ulong 2 0
   sl = new ulong 16 0
   gn = new ulong 16 0
-  put sl 0 get hs 0
-  put gn 0 get hs 1
-  put sl 1 get hs 0
-  put gn 1 get hs 1
-  hc = new ulong 2 0
-  t_chk eq ot_concat 2 sl gn 1 hc OT_OK
-  t_chk eq ot_read_f32 get hc 0 get hc 1 out8 OT_OK
-  t_chk eq get out8 0 2.0f32
-  t_chk eq get out8 2 2.0f32
-  t_chk eq get out8 4 6.0f32
-  t_chk eq get out8 7 8.0f32
+  t_chk eq tt_mk_from_g 0 2 6 h OT_OK
+  tt_save_h 0 h
+  t_chk eq ot_transpose get tt_h 0 get tt_h 1 h OT_OK
+  tt_save_h 1 h
+  t_chk eq tt_mk_from_g 1 2 2 h OT_OK
+  tt_save_h 2 h
+  t_chk eq ot_broadcast_to get tt_h 4 get tt_h 5 2 sbb h OT_OK
+  tt_save_h 3 h
+  put sl 0 get tt_h 2
+  put gn 0 get tt_h 3
+  put sl 1 get tt_h 6
+  put gn 1 get tt_h 7
+  t_chk eq ot_concat 2 sl gn 0 h OT_OK
+  t_chk eq tt_load_go get h 0 get h 1 10 OT_OK
+  r1 = ot_release get h 0 get h 1
+  t_chk eq get tt_go 0 1.0f32
+  t_chk eq get tt_go 1 4.0f32
+  t_chk eq get tt_go 5 6.0f32
+  t_chk eq bitcast uint get tt_go 6 OT_NEG0_BITS
+  t_chk eq get tt_go 9 9.0f32
+  t_chk eq ot_concat 2 sl gn 1 h OT_ERR_SHAPE
+  t_chk eq ot_concat 0 sl gn 0 h OT_ERR_BAD_ARGS
+  t_chk eq ot_concat 2 sl gn 2 h OT_ERR_AXIS
+  test_embed_refusals
+  tt_rel_idx 3
+  tt_rel_idx 2
+  tt_rel_idx 1
+  tt_rel_idx 0
+  tt_chk_leaks
 end
 
-fn test_ops_and_where to void
-  t_chk eq ot_ctx_init 64 OT_OK
-  sh = new ulong 8 0
-  put sh 0 4
-  da = new f32 4 0.0f32
-  db = new f32 4 0.0f32
-  put da 0 -2.0f32
-  put da 1 0.0f32
-  put da 2 4.0f32
-  put da 3 9.0f32
-  put db 0 1.0f32
-  put db 1 0.0f32
-  put db 2 2.0f32
-  put db 3 10.0f32
-  ha = new ulong 2 0
-  ha2 = new ulong 2 0
-  hb = new ulong 2 0
-  t_chk eq ot_from_f32 1 sh da ha OT_OK
-  put ha2 0 get ha 0
-  put ha2 1 get ha 1
-  t_chk eq ot_from_f32 1 sh db hb OT_OK
-  hr = new ulong 2 0
-  obuf = new f32 4 0.0f32
-  t_chk eq ot_unary OT_TU_RELU get ha 0 get ha 1 hr OT_OK
-  t_chk eq ot_read_f32 get hr 0 get hr 1 obuf OT_OK
-  t_chk eq get obuf 0 0.0f32
-  t_chk eq get obuf 2 4.0f32
-  t_chk eq ot_unary OT_TU_NEG get ha 0 get ha 1 hr OT_OK
-  t_chk eq ot_read_f32 get hr 0 get hr 1 obuf OT_OK
-  t_chk eq get obuf 0 2.0f32
-  t_chk eq bitcast uint get obuf 1 OT_NEG0_BITS
-  hm = new ulong 2 0
-  t_chk eq ot_binary OT_TB_CMP_GT get ha 0 get ha 1 get hb 0 get hb 1 hm OT_OK
-  hw = new ulong 2 0
-  t_chk eq ot_where hm ha hb hw OT_OK
-  t_chk eq ot_read_f32 get hw 0 get hw 1 obuf OT_OK
-  t_chk eq get obuf 0 1.0f32
-  t_chk eq get obuf 2 4.0f32
-  t_chk eq get obuf 3 10.0f32
-  note Bad mask refused
-  t_chk eq ot_where ha2 ha hb hw OT_ERR_MASK
-  note Transcendentals
-  t_chk t_near ot_unary_scalar OT_TU_EXP 0.0f32 1.0f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_EXP2 3.0f32 8.0f32 0.001f32
-  t_chk t_near ot_unary_scalar OT_TU_LOG 1.0f32 0.0f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_LOG2 8.0f32 3.0f32 0.001f32
-  t_chk t_near ot_unary_scalar OT_TU_SIGMOID 0.0f32 0.5f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_TANH 0.0f32 0.0f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_SIN 0.0f32 0.0f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_COS 0.0f32 1.0f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_ERF 0.0f32 0.0f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_GELU 0.0f32 0.0f32 0.0001f32
-  t_chk t_near ot_unary_scalar OT_TU_RSQRT 4.0f32 0.5f32 0.0001f32
-end
+note ---- 12. GB10 op mapping & reduce limit checks ----
 
-fn test_reduce_matmul_cast to void
-  t_chk eq ot_ctx_init 64 OT_OK
-  sh = new ulong 8 0
-  put sh 0 2
-  put sh 1 3
-  da = new f32 6 0.0f32
-  for i ulong 6
-    put da i f32 add i 1
+fn test_gb10_mapping to void
+  for op ulong 20
+    t_chk eq ot_gb10_simt_op_id op add op 1
   end
-  ha = new ulong 2 0
-  t_chk eq ot_from_f32 2 sh da ha OT_OK
-  hr = new ulong 2 0
-  t_chk eq ot_reduce OT_TR_SUM get ha 0 get ha 1 1 0 hr OT_OK
-  o2 = new f32 2 0.0f32
-  t_chk eq ot_read_f32 get hr 0 get hr 1 o2 OT_OK
-  t_chk eq get o2 0 6.0f32
-  t_chk eq get o2 1 15.0f32
-  note multi-axis reduce and sum_to_shape
-  ax = new ulong 8 0
-  put ax 0 0
-  put ax 1 1
-  ko = new ulong 3 0
-  put ko 2 0
-  t_chk eq ot_reduce_axes OT_TR_SUM get ha 0 get ha 1 2 ax ko OT_OK
-  o1 = new f32 1 0.0f32
-  t_chk eq ot_read_f32 get ko 0 get ko 1 o1 OT_OK
-  t_chk eq get o1 0 21.0f32
-  t_chk eq ot_reduce_axes OT_TR_MEAN get ha 0 get ha 1 2 ax ko OT_ERR_BAD_ARGS
-  tsh = new ulong 8 0
-  put tsh 0 3
-  hs = new ulong 2 0
-  t_chk eq ot_sum_to_shape get ha 0 get ha 1 1 tsh hs OT_OK
-  o3 = new f32 3 0.0f32
-  t_chk eq ot_read_f32 get hs 0 get hs 1 o3 OT_OK
-  t_chk eq get o3 0 5.0f32
-  t_chk eq get o3 1 7.0f32
-  t_chk eq get o3 2 9.0f32
-end
-
-fn test_matmul_cast_gb10 to void
-  t_chk eq ot_ctx_init 64 OT_OK
-  sh = new ulong 8 0
-  put sh 0 2
-  put sh 1 3
-  da = new f32 6 0.0f32
-  for i ulong 6
-    put da i f32 add i 1
+  for k ulong 6
+    t_chk eq ot_gb10_simt_op_id add 20 k 0
   end
-  ha = new ulong 2 0
-  t_chk eq ot_from_f32 2 sh da ha OT_OK
-  note matmul [2,3] x [3,2]
-  shb = new ulong 8 0
-  put shb 0 3
-  put shb 1 2
-  hb = new ulong 2 0
-  t_chk eq ot_from_f32 2 shb da hb OT_OK
-  hm = new ulong 2 0
-  t_chk eq ot_matmul get ha 0 get ha 1 get hb 0 get hb 1 hm OT_OK
-  o4 = new f32 4 0.0f32
-  t_chk eq ot_read_f32 get hm 0 get hm 1 o4 OT_OK
-  t_chk eq get o4 0 22.0f32
-  t_chk eq get o4 1 28.0f32
-  t_chk eq get o4 2 49.0f32
-  t_chk eq get o4 3 64.0f32
-  note F32 <-> F16 and BF16 cast round-trip
-  hf16 = new ulong 2 0
-  hf32 = new ulong 2 0
-  t_chk eq ot_cast get ha 0 get ha 1 OT_DT_F16 hf16 OT_OK
-  t_chk eq ot_cast get hf16 0 get hf16 1 OT_DT_BF16 hf32 OT_ERR_DTYPE
-  t_chk eq ot_cast get hf16 0 get hf16 1 OT_DT_F32 hf32 OT_OK
-  o6 = new f32 6 0.0f32
-  t_chk eq ot_read_f32 get hf32 0 get hf32 1 o6 OT_OK
-  t_chk eq get o6 5 6.0f32
-  note GB10 mapping checks
-  t_chk ne ot_gb10_simt_op_id OT_TB_ADD 0
-  t_chk eq ot_gb10_simt_op_id OT_TB_CMP_EQ 0
+  t_chk eq ot_gb10_simt_op_id 99 0
+  t_chk eq ot_gb10_transc_kernel OT_TU_EXP2 0
+  t_chk eq ot_gb10_transc_kernel OT_TU_LOG2 1
+  t_chk eq ot_gb10_transc_kernel OT_TU_SIGMOID 2
+  t_chk eq ot_gb10_transc_kernel OT_TU_TANH 3
+  t_chk eq ot_gb10_transc_kernel OT_TU_SIN 4
+  t_chk eq ot_gb10_transc_kernel OT_TU_COS 5
+  t_chk eq ot_gb10_transc_kernel OT_TU_ERF 6
+  t_chk eq ot_gb10_transc_kernel OT_TU_GELU 7
+  t_chk eq ot_gb10_transc_kernel OT_TU_RSQRT 8
   t_chk eq ot_gb10_transc_kernel OT_TU_EXP 9
+  t_chk eq ot_gb10_transc_kernel OT_TU_LOG 10
+  t_chk eq ot_gb10_transc_kernel OT_TU_SQRT -1
   t_chk eq ot_gb10_transc_kernel OT_TU_RELU -1
+  t_chk eq ot_gb10_transc_kernel OT_TU_NEG -1
+  t_chk eq ot_gb10_check_reduce OT_TR_SUM 1 0
+  t_chk eq ot_gb10_check_reduce OT_TR_SUM 32768 0
   t_chk eq ot_gb10_check_reduce OT_TR_SUM 32769 OT_GB10_ERR_OPERANDS
+  t_chk eq ot_gb10_check_reduce OT_TR_SUM 0 OT_GB10_ERR_BAD_ARGS
+  t_chk eq ot_gb10_check_reduce OT_TR_COUNT 16 OT_GB10_ERR_BAD_ARGS
 end
 
 fn main to int
-  test_lifetime_and_views
-  test_slice_embed_concat
-  test_ops_and_where
-  test_reduce_matmul_cast
-  test_matmul_cast_gb10
-  if ne get tt_c 1 0
-    w = write 1 msg_fail 0 len msg_fail
+  tt_init_spec
+  test_shape_type_a
+  test_shape_type_b
+  test_broadcast
+  test_views
+  test_generations_stale
+  test_generations_retire
+  test_immutability
+  test_elemwise_parity
+  test_const_fill
+  test_relu_and_neg
+  test_unary_views_and_trig
+  test_mask_where
+  test_where_broadcast_and_refusals
+  test_reduce_1d
+  test_reduce_3d
+  test_reduce_axes
+  test_sum_to_shape
+  test_matmul_all
+  test_determinism
+  test_embed_cases
+  test_concat_and_refusals
+  test_gb10_mapping
+  tot = get tt_c 0
+  fails = get tt_c 1
+  w1 = write 1 tt_msg_sum1 0 len tt_msg_sum1
+  tt_w_u64 1 sub tot fails
+  w2 = write 1 tt_msg_sum2 0 len tt_msg_sum2
+  tt_w_u64 1 fails
+  w3 = write 1 tt_msg_sum3 0 len tt_msg_sum3
+  if ne fails 0
+    w4 = write 1 tt_msg_fail 0 len tt_msg_fail
     ret 1
   end
-  w = write 1 msg_pass 0 len msg_pass
+  w4 = write 1 tt_msg_pass 0 len tt_msg_pass
   ret 0
 end

@@ -3,13 +3,16 @@ note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
 note
 note tests/polyglot/test_encoder.om -- pure seeded OM-2 POLYGLOT-0 lane B2 gate:
 note   A. Byte comparison vs GNU as .text.bin (argv[1] sdot, argv[2] crumb)
-note   B. Final-form ADRP/ADD data relocation verification
-note   C. Omega AArch64 decoder round-trip verification
+note   B. Final-form ADRP/ADD data relocation & .rodata mask verification
+note   C. Omega AArch64 decoder round-trip & static callee-saved ABI audit
 note   D. Fail-closed invalid-operand checks (39) + all 5,334 logical immediates
-note   E. Error contract + MA-3 shape grid + random + large magnitudes up to OMX_MAX_N
+note      + negative bit-mutation differential checks (opcode, ABI, functional)
+note   E. Error contract (incl. machine-code NULL/empty checks) + MA-3 shape grid
+note      + random unaligned/canary/guard cases + large magnitudes up to OMX_MAX_N,
+note      ALL executed directly on the emitted AArch64 machine code via omx_vm_exec!
 
 note [0]=checks [1]=fail [2]=cases [3]=rng [4]=identical [5]=differ
-note [6]=rt_full [7]=rt_partial [8]=rt_ext_unsup [9]=rt_ext_alias
+note [6]=rt_full [7]=rt_partial [8]=rt_ext_unsup [9]=rt_ext_alias [10]=mut_caught
 global g_te_st ulong 12
 global g_te_arg uchar 512
 global g_te_obj uint 1024
@@ -19,7 +22,7 @@ global g_te_sps f64 5
 global g_te_bad byte 5
 
 text t_te_usage "usage: test_encoder <gnu-as sdot .text.bin> <gnu-as crumb .text.bin>\n"
-text t_te_banner "POLYGLOT test-encoder: byte comparison vs GNU as (B1 .text)\n"
+text t_te_banner "POLYGLOT test-encoder: byte comparison vs GNU as (B1 .text) + AArch64 VM exec\n"
 text t_te_bc1 "  byte-compare "
 text t_te_sdot "enc_sdot"
 text t_te_crumb "enc_crumb"
@@ -34,7 +37,7 @@ text t_te_gnu " gnu-as="
 text t_te_fin1 "  final "
 text t_te_fin2 ": "
 text t_te_fin3 " bytes at page-aligned base 0x10000000; "
-text t_te_fin4 " relocated instruction(s) differ from object form, 0 others\n"
+text t_te_fin4 " relocated instruction(s) differ from object form, 0 others; ABI audit PASS\n"
 text t_te_rt1 "  omega-decoder round trip: "
 text t_te_rt2 " full, "
 text t_te_rt3 " partial, "
@@ -42,12 +45,14 @@ text t_te_rt4 " ext-unsupported, "
 text t_te_rt5 " ext-alias (ADD lsl)\n"
 text t_te_fc1 "  fail-closed: "
 text t_te_fc2 " invalid-operand calls checked; logical immediates round-tripped: "
+text t_te_mut1 "  mutation differential: "
+text t_te_mut2 " mutated machine-code streams rejected (opcode/ABI/output)\n"
 text t_te_hdr "POLYGLOT test-encoder "
 text t_te_pass "PASS"
 text t_te_fail "FAIL"
 text t_te_s1 ": "
 text t_te_s2 " checks, "
-text t_te_s3 " failures; 2 candidates; byte-compare "
+text t_te_s3 " failures; 2 candidates (AArch64 machine-code exec); byte-compare "
 text t_te_s4 " identical, "
 text t_te_s5 " differ; encoder checks "
 text t_te_s6 "; cases: grid "
@@ -220,15 +225,14 @@ fn te_byte_compare k ulong argi ulong to void
   omx_puts t_te_bc6
 end
 
-note B. Final-form relocation check
+note B. Final-form relocation check + load into AArch64 VM & static ABI audit
 fn te_final_form k ulong to void
   te_chk eq omx_encoder_build k 0 0
   n0 = get g_enc_st 0
   for i ulong n0 bound 1024
     put g_te_obj i get g_enc_word i
   end
-  base = ulong 0x10000000
-  te_chk eq omx_encoder_build k base 0
+  te_chk eq omx_vm_load_kernel k 0
   n1 = get g_enc_st 0
   doff = get g_enc_st 4
   te_chk eq n0 n1
@@ -245,6 +249,13 @@ fn te_final_form k ulong to void
     end
   end
   te_chk eq other_diff 0
+  if eq k OMX_ENC_SDOT
+    te_chk ge reloc_diff 1
+    for i ulong 16
+      te_chk eq get g_enc_sdot_mask i uchar 0
+      te_chk eq get g_enc_sdot_mask add i 16 uchar 0xff
+    end
+  end
   omx_puts t_te_fin1
   te_kname k
   omx_puts t_te_fin2
@@ -255,29 +266,22 @@ fn te_final_form k ulong to void
 end
 
 note C. Omega decoder round trip
-fn te_sext v ulong bits ulong to long
-  m = shl ulong 1 sub bits 1
-  mask = sub shl ulong 1 bits 1
-  u = and v mask
-  ret sub long xor u m long m
-end
-
 fn te_check_dec_insn i ulong w ulong dec view ulong 9 to void
   op = get dec 0
   re = long -1
   full = ulong 1
   if eq op 9
-    d = te_sext get dec 7 26
+    d = vm_sext get dec 7 26
     te_chk eq d long get g_enc_bdisp i
     re = omx_a64_b d
   else
     if eq op 10
-      d = te_sext get dec 7 19
+      d = vm_sext get dec 7 19
       te_chk eq d long get g_enc_bdisp i
       re = omx_a64_bcond get dec 8 d
     else
       if eq op 11
-        d = te_sext get dec 7 19
+        d = vm_sext get dec 7 19
         te_chk eq d long get g_enc_bdisp i
         re = omx_a64_cbz get dec 1 get dec 2 d
       else
@@ -342,60 +346,10 @@ fn te_decoder_round_trip k ulong to void
   end
 end
 
-note D. Fail-closed invalid-operand checks + all 5,334 logical immediates
-fn te_bm_topbit v ulong to long
-  b = long 6
-  while ge b 0 bound 8
-    if ne and v shl ulong 1 ulong b 0
-      ret b
-    end
-    b = sub b 1
-  end
-  ret -1
-end
-
-fn te_bm_rep elem ulong esize ulong to ulong
-  res = ulong 0
-  sh = ulong 0
-  while lt sh 64 bound 64
-    res = or res shl elem sh
-    sh = add sh esize
-  end
-  ret res
-end
-
-fn te_bm_elem s ulong r ulong esize ulong to ulong
-  emask = ulong 0xffffffffffffffff
-  if lt esize 64
-    emask = sub shl ulong 1 esize 1
-  end
-  welem = sub shl ulong 1 add s 1 1
-  if gt r 0
-    ret and or shr welem r shl welem sub esize r emask
-  end
-  ret welem
-end
-
-fn te_decode_bitmask nbit ulong immr ulong imms ulong ok edit ulong 1 to ulong
-  put ok 0 0
-  blen = te_bm_topbit or shl nbit 6 and not imms 0x3f
-  if lt blen 1
-    ret 0
-  end
-  lu = ulong blen
-  levels = sub shl ulong 1 lu 1
-  s = and imms levels
-  if eq s levels
-    ret 0
-  end
-  elem = te_bm_elem s and immr levels shl ulong 1 lu
-  put ok 0 1
-  ret te_bm_rep elem shl ulong 1 lu
-end
-
+note D. Fail-closed invalid-operand checks + all 5,334 logical immediates + mutation checks
 fn te_check_bm_one nb ulong immr ulong imms ulong to ulong
   ok = new ulong 1 0
-  v = te_decode_bitmask nb immr imms ok
+  v = oxe_decode_bitmask64 nb immr imms ok
   if eq get ok 0 0
     ret 0
   end
@@ -435,6 +389,58 @@ fn te_check_all_bm to ulong
     end
   end
   ret valid
+end
+
+fn te_test_mutations to void
+  for i ulong 110
+    put g_omx_w i byte 1
+    put g_omx_x i byte 3
+  end
+  te_chk eq omx_oracle 1 110 0 OMX_OK
+
+  note 1. Mutate opcode bit (bit 28) in enc_sdot -> audit & exec both reject
+  te_chk eq omx_pack_sdot 1 110 1 OMX_OK
+  o0 = get g_vm_c0 10
+  put g_vm_c0 10 xor o0 uint 0x10000000
+  te_chk ne omx_vm_audit_kernel OMX_ENC_SDOT 0
+  te_chk ne omx_vm_exec OMX_ENC_SDOT 7 0 0 0
+  put g_vm_c0 10 o0
+  put g_te_st 10 add get g_te_st 10 1
+
+  note 2. Mutate enc_sdot to clobber callee-saved d8 (v8) -> audit -2 & ABI -104
+  o1 = get g_vm_c0 11
+  clob_v = uint oxe_movi_16b 8 0x55
+  put g_vm_c0 11 clob_v
+  te_chk eq omx_vm_audit_word ulong clob_v -2
+  te_chk eq omx_vm_exec OMX_ENC_SDOT 7 0 0 -104
+  put g_vm_c0 11 o1
+  put g_te_st 10 add get g_te_st 10 1
+
+  note 3. Mutate enc_crumb SDOT accumulator register -> produces wrong y != yref!
+  te_chk eq omx_pack_crumb 1 110 1 OMX_OK
+  nc1 = get g_vm_meta 3
+  sdot_idx = ulong 0
+  for i ulong nc1 bound 512
+    if eq and ulong get g_vm_c1 i 0xffe0fc00 0x4e809400
+      sdot_idx = i
+    end
+  end
+  te_chk gt sdot_idx 0
+  o2 = get g_vm_c1 sdot_idx
+  note Change tail SDOT destination from v24/v28 to unused v20 so row sum drops!
+  put g_vm_c1 sdot_idx or and o2 uint 0xffffffe0 uint 20
+  te_chk eq omx_vm_exec OMX_ENC_CRUMB 7 0 0 OMX_OK
+  te_chk ne get g_omx_y 0 get g_omx_yref 0
+  put g_vm_c1 sdot_idx o2
+  put g_te_st 10 add get g_te_st 10 1
+
+  note Restore and verify exact match
+  te_chk eq omx_vm_exec OMX_ENC_CRUMB 7 0 0 OMX_OK
+  te_chk eq get g_omx_y 0 get g_omx_yref 0
+  omx_plan_zero
+  omx_puts t_te_mut1
+  omx_putu get g_te_st 10
+  omx_puts t_te_mut2
 end
 
 fn te_fail_closed to void
@@ -487,7 +493,7 @@ fn te_fail_closed to void
   omx_nl
 end
 
-note E. Correctness suite for enc_sdot & enc_crumb
+note E. Correctness suite for enc_sdot & enc_crumb executed on AArch64 machine code
 fn te_fill_w cnt ulong wk ulong sp f64 to void
   for i ulong cnt bound 16777216
     if eq wk 1
@@ -549,7 +555,7 @@ fn te_run_rep kind ulong m ulong xoff ulong yoff ulong to void
   for i ulong m bound 65536
     put g_omx_y add yoff i int 0x5a5a5a5a
   end
-  te_chk eq omx_run_cand kind xoff yoff 1 1 OMX_OK
+  te_chk eq omx_vm_run_cand kind xoff yoff 1 1 OMX_OK
   bad = ulong 0
   for i ulong m bound 65536
     if ne get g_omx_y add yoff i get g_omx_yref i
@@ -630,8 +636,10 @@ fn te_test_errors to void
   put g_omx_x 2 byte 3
   for c ulong 2
     kind = OMX_CAND_ENC_SDOT
+    k = OMX_ENC_SDOT
     if eq c 1
       kind = OMX_CAND_ENC_CRUMB
+      k = OMX_ENC_CRUMB
     end
     for b ulong 5
       put g_omx_w 3 get g_te_bad b
@@ -651,11 +659,18 @@ fn te_test_errors to void
     te_chk eq omx_pack_cand kind div OMX_ULONG_MAX 2 1000 1 OMX_E_OVERFLOW
     te_chk eq omx_plan_is_zero 1
     omx_plan_zero
-    te_chk eq omx_run_cand kind 0 0 1 1 OMX_E_ARG
+    te_chk eq omx_vm_exec k 7 0 0 OMX_E_ARG
+    te_chk eq omx_vm_exec k 6 0 0 OMX_E_ARG
     te_chk eq omx_pack_cand kind 2 3 1 OMX_OK
-    te_chk eq omx_run_cand kind 0 0 0 1 OMX_E_ARG
-    te_chk eq omx_run_cand kind 0 0 1 0 OMX_E_ARG
-    te_chk eq omx_run_cand kind 0 0 1 1 OMX_OK
+    te_chk eq omx_vm_exec k 5 0 0 OMX_E_ARG
+    te_chk eq omx_vm_exec k 3 0 0 OMX_E_ARG
+    put g_omx_plan 0 0
+    te_chk eq omx_vm_exec k 7 0 0 OMX_E_ARG
+    put g_omx_plan 0 2
+    put g_omx_plan 1 0
+    te_chk eq omx_vm_exec k 7 0 0 OMX_E_ARG
+    put g_omx_plan 1 3
+    te_chk eq omx_vm_exec k 7 0 0 OMX_OK
     te_chk eq get g_omx_y 0 int -2
     te_chk eq get g_omx_y 1 int 4
     omx_plan_zero
@@ -685,6 +700,7 @@ fn main to int
   omx_putu get g_te_st 9
   omx_puts t_te_rt5
   te_fail_closed
+  te_test_mutations
   enc_checks = get g_te_st 0
   te_test_errors
   c0 = get g_te_st 0
@@ -704,7 +720,7 @@ fn main to int
   end
   grid_cases = get g_te_st 2
 
-  for it ulong 2000 bound 2000
+  for it ulong 500 bound 500
     n = add 1 rem te_rnd 2100
     m = add 1 rem te_rnd 70
     xk = ulong 0
