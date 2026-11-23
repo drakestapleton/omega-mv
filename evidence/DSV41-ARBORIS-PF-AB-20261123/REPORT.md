@@ -54,7 +54,13 @@ The 42 to 44% Arboris "hit" figures in `om/gpu/q36/README.md` are this same pred
 - Arms alternated: on, off, off, on, on, off.
 - Wall time is the decoder process only, from `tools/run-one.sh`. The receipt's `seconds` also covers the cache drop, the preflight and a 10 s settle.
 - `tools/summarize.py` checks every run: exit 0, cold start, arm label matches `pf_enabled`, off arm dispatched nothing, on arm dispatched something, one binary, identical tokens and routing. All checks passed for the long runs.
-- Host qualification of the switch and its eight negative controls: `host-qualification-95ac8bdf3.log`. That log ends in FAIL because the driver's expectation for mutant G assumed the wrong exit code; the mutant itself was rejected. The driver was corrected in the next commit.
+- Host qualification of the switch and its eight negative controls: `host-qualification-95ac8bdf3.log`. That log ends in FAIL because the driver's expectation for mutant G assumed the wrong exit code; the mutant itself was rejected. The driver was corrected in the next commit. A later head's qualification log cannot be stored inside that head. It is kept on the Spark (`~/work/dsv41-pf-ab-out/q-<head>.log`), and its digest is named in the landing receipt.
+
+## Other modes checked on GB10
+
+- **`layer0` parity.** `layer0-parity.log`: the same binary (`b413459b...`) passes `check-layer0.py` (`GATE2_LAYER0_PARITY_PASS`) with the variable unset and with `DSV41_ARBORIS_PREFETCH=1`, and both output files are byte-identical. A value check in a chip-only window, not a timing.
+- **`pfcheck` and the host lock.** With `/tmp/omega-arboris-compute-v1.lock` held by another process, `pfcheck` exited 74. Once the lock was free it printed `ARBORIS pf_enabled=1` and exited 0. Run by hand; not logged to a file.
+- **`chat` mode was not run.**
 
 ## Limits and disclosures
 

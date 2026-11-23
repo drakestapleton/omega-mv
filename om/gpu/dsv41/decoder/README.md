@@ -103,7 +103,7 @@ The decoder reads the variable once, before it opens any input. It refuses any o
 
 The final stats line of `gen` and `chat` is `ARBORIS pf_dispatched=N pf_hits=N pf_enabled=0|1`. `pf_enabled` reports the setting, not that anything was prefetched. A valid on arm needs `pf_dispatched` above zero; a valid off arm needs `pf_dispatched=0 pf_hits=0`.
 
-`pfcheck <tensors> <engram_map> <sidecar_dir> <ckpt_dir>` is a host preflight that opens no GPU. It parses the variable, loads the inputs, and starts and stops the payload workers as `gen` does. It prints `ARBORIS pf_enabled=0|1` on stderr. Run it before a timed arm to confirm which arm the binary will run.
+`pfcheck <tensors> <engram_map> <sidecar_dir> <ckpt_dir>` is a host preflight that opens no GPU. It parses the variable, loads the inputs, and starts and stops the payload workers as `gen` does. It prints `ARBORIS pf_enabled=0|1` on stderr. Run it before a timed arm to confirm which arm the binary will run. Like every decoder mode it claims the host lock `/tmp/omega-arboris-compute-v1.lock`, so it exits 74 while another `dsv41-decode` is running.
 
 The prefetcher only proposes experts that are not resident. Arboris learns edges toward experts the router has already chosen, and those experts stay resident until the FIFO slot table evicts them. Until distinct routed experts exceed the resident slots (4400 in `gen` and `chat`), the prefetcher has nothing to dispatch. That follows from `dfArbPickBest`, and the 37-position `gen` workload above shows it: 2990 misses, `pf_dispatched=0`. A workload that never fills the slot table cannot show a prefetch effect.
 
