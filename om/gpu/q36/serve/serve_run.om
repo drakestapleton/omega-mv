@@ -17,6 +17,8 @@ global qsOutTxt uchar 131072
 global qsOutLen ulong 1
 global qsPort ulong 1
 global qsSelfTest ulong 1
+global qsPendPreArb ulong 1
+global qsStreamFd int 1
 
 text qsDefDir "/home/drakestapleton/models/qwen3.6-35b-a3b-fp8-95a723d0"
 text qsSufTok "/tokenizer.json"
@@ -39,6 +41,7 @@ text qsSelfOk "PASS: q36-serve real-weight 35B + live Arboris self-test\n"
 text qsSelfBad "FAIL: q36-serve self-test\n"
 
 text qsH200 "HTTP/1.1 200 OK\nContent-Type: application/json\nConnection: close\n\n"
+text qsH200Sse "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\nConnection: close\n\n"
 text qsH404 "HTTP/1.1 404 Not Found\nContent-Type: application/json\nConnection: close\n\n{\"error\":{\"type\":\"not_found\"}}\n"
 text qsHealthA "{\"status\":\"ok\",\"model\":\"qwen3.6-35b-a3b-fp8\",\"engine\":\"omega-zero-cuda\",\"context_window\":131072,\"precision\":\""
 text qsPrecW4 "w4"
@@ -55,9 +58,18 @@ text qsChatD ",\"total_tokens\":"
 text qsChatE "},\"arboris\":{\"hits\":"
 text qsChatF ",\"total\":"
 text qsChatG ",\"hit_pct\":"
-text qsChatH "}}\n"
+text qsChatH "},\"timings\":{\"prefill_ms\":"
+text qsChatI ",\"decode_ms\":"
+text qsChatJ "}}\n"
+text qsSseData "data: "
+text qsSseDeltaA "{\"id\":\"cmpl-q36\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3.6-35b-a3b-fp8\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+text qsSseDeltaB "\"},\"finish_reason\":null}]}\n\n"
+text qsSseFinalA "{\"id\":\"cmpl-q36\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3.6-35b-a3b-fp8\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":"
+text qsSseDone "data: [DONE]\n\n"
 text qsKeyContent "\"content\""
 text qsKeyMaxTok "\"max_tokens\""
+text qsKeyStream "\"stream\""
+text qsKeyClen "content-length:"
 
 fn qsRespReset to void
 put qsRespLen 0 0
@@ -116,26 +128,76 @@ end
 put qsRespLen 0 p
 end
 
-fn qsRespAppendJsonEsc n ulong to void
+fn qsRespAppendEscByte c uchar to void
 p = get qsRespLen 0
-for i ulong n bound 131072
-c = get qsOutTxt i
-if and lt p 262100 ge c 32
+if ge p 262096
+ret
+end
 if or eq c 34 eq c 92
 put qsRespBuf p 92
-p = add p 1
+put qsRespBuf add p 1 c
+put qsRespLen 0 add p 2
+ret
 end
-put qsRespBuf p c
-p = add p 1
-else
-if and lt p 262100 eq c 10
+if eq c 10
 put qsRespBuf p 92
 put qsRespBuf add p 1 110
-p = add p 2
+put qsRespLen 0 add p 2
+ret
+end
+if eq c 13
+put qsRespBuf p 92
+put qsRespBuf add p 1 114
+put qsRespLen 0 add p 2
+ret
+end
+if eq c 9
+put qsRespBuf p 92
+put qsRespBuf add p 1 116
+put qsRespLen 0 add p 2
+ret
+end
+if eq c 8
+put qsRespBuf p 92
+put qsRespBuf add p 1 98
+put qsRespLen 0 add p 2
+ret
+end
+if eq c 12
+put qsRespBuf p 92
+put qsRespBuf add p 1 102
+put qsRespLen 0 add p 2
+ret
+end
+if ge c 32
+put qsRespBuf p c
+put qsRespLen 0 add p 1
 end
 end
+
+fn qsRespAppendJsonEsc n ulong to void
+for i ulong n bound 131072
+qsRespAppendEscByte get qsOutTxt i
 end
-put qsRespLen 0 p
+end
+
+fn qsSendSseDelta fd int tid ulong to void
+if ge tid Q36_VOCAB_MAX
+ret
+end
+l = ulong get q36TokLen tid
+if eq l 0
+ret
+end
+off = ulong get q36TokOff tid
+qsRespReset
+qsRespAppend qsSseData len qsSseData
+qsRespAppend qsSseDeltaA len qsSseDeltaA
+for i ulong l bound 64
+qsRespAppendEscByte get q36TokPool add off i
+end
+qsRespAppend qsSseDeltaB len qsSseDeltaB
+w = write fd qsRespBuf 0 get qsRespLen 0
 end
 
 fn qsAppendTok tid ulong to void
@@ -166,6 +228,52 @@ ret div mul get qdArbHits 0 100 tot
 end
 
 fn qsPrefill nTok ulong to ulong
+if and eq get qdUseW4 0 1 ge nTok 2
+pos = ulong 0
+prevChunk = ulong 0
+hasPrev = false
+while lt pos nTok bound 1024
+chunk = sub nTok pos
+if gt chunk QP_MAX_B
+chunk = QP_MAX_B
+end
+isFinal = eq add pos chunk nTok
+if hasPrev
+if not qdWaitPre
+ret 999999
+end
+okSnap = qdPreSnapTrace prevChunk
+for j ulong chunk bound 512
+put qdPreTokIds j get q36TokOutIds add pos j
+end
+if not qdPreKickChunk chunk pos isFinal
+ret 999999
+end
+if okSnap
+qdPreUpdateArborisSnap prevChunk
+end
+else
+for j ulong chunk bound 512
+put qdPreTokIds j get q36TokOutIds add pos j
+end
+if not qdPreKickChunk chunk pos isFinal
+ret 999999
+end
+end
+prevChunk = chunk
+hasPrev = true
+pos = add pos chunk
+end
+if not qdWaitPre
+ret 999999
+end
+put qsPendPreArb 0 0
+if qdPreSnapTrace prevChunk
+put qsPendPreArb 0 prevChunk
+end
+ret qdPrePickBest prevChunk false
+end
+put qsPendPreArb 0 0
 nextTok = ulong 0
 for p ulong nTok bound 131072
 isLast = eq add p 1 nTok
@@ -177,33 +285,89 @@ end
 ret nextTok
 end
 
+fn qsFlushPendPreArb to void
+n = get qsPendPreArb 0
+if gt n 0
+put qsPendPreArb 0 0
+qdPreUpdateArborisSnap n
+end
+end
+
+fn qsEmitTokStep tid ulong to void
+qsAppendTok tid
+sfd = get qsStreamFd 0
+if ge sfd 0
+qsSendSseDelta sfd tid
+end
+end
+
+fn qsIsStopTok tid ulong to bool
+if eq tid 248046
+ret true
+end
+ret eq tid 248044
+end
+
 fn qsDecodeLoop firstTok ulong nTok ulong maxGen ulong to ulong
-nextTok = firstTok
-genCnt = ulong 0
-pos = nTok
 cap = maxGen
 if gt add nTok cap QD_MAX_T
 cap = sub QD_MAX_T nTok
 end
-for g ulong cap bound 16384
-if or eq nextTok 248046 eq nextTok 248044
-break
+if or eq cap 0 qsIsStopTok firstTok
+qsFlushPendPreArb
+ret 0
 end
-qsAppendTok nextTok
-genCnt = add genCnt 1
+qsEmitTokStep firstTok
+genCnt = ulong 1
 if ge genCnt cap
+qsFlushPendPreArb
+ret genCnt
+end
+if not qdPrepAsyncDecode firstTok nTok
+qsFlushPendPreArb
+ret genCnt
+end
+if not qdKickPre 2
+qsFlushPendPreArb
+ret genCnt
+end
+note Overlap final prefill chunk Live Arboris update behind decode step 1 on GPU!
+qsFlushPendPreArb
+for g ulong sub cap 1 bound 16384
+if not qdWaitPre
 break
 end
-nextTok = qdForwardToken nextTok pos true false
+nextTok = qdReadOutTok
 if eq nextTok 999999
 break
 end
-pos = add pos 1
+okSnap = qdSnapTrace
+if qsIsStopTok nextTok
+if okSnap
+qdUpdateArborisSnap
+end
+break
+end
+if lt add g 2 cap
+if not qdKickPre 2
+if okSnap
+qdUpdateArborisSnap
+end
+qsEmitTokStep nextTok
+genCnt = add genCnt 1
+break
+end
+end
+if okSnap
+qdUpdateArborisSnap
+end
+qsEmitTokStep nextTok
+genCnt = add genCnt 1
 end
 ret genCnt
 end
 
-fn qsGenerate tlen ulong maxGen ulong outCounts edit ulong 2 to bool
+fn qsGenerate tlen ulong maxGen ulong outCounts edit ulong 4 to bool
 qdResetState
 nTok = q36TokEncodeChatGlobal tlen
 if eq nTok 0
@@ -211,11 +375,17 @@ ret false
 end
 put outCounts 0 nTok
 put qsOutLen 0 0
+t0 = monons
 firstTok = qsPrefill nTok
 if eq firstTok 999999
 ret false
 end
-put outCounts 1 qsDecodeLoop firstTok nTok maxGen
+t1 = monons
+genCnt = qsDecodeLoop firstTok nTok maxGen
+t2 = monons
+put outCounts 1 genCnt
+put outCounts 2 div ulong sub t1 t0 1000000
+put outCounts 3 div ulong sub t2 t1 1000000
 ret true
 end
 
@@ -304,32 +474,153 @@ end
 ret 512
 end
 
-fn qsHandleChat fd int n ulong to void
-b = new ulong 2 0
-pLen = ulong 0
-if qsFindLastContent n b
-pLen = get b 1
-if gt pLen 520000
-pLen = ulong 520000
+fn qsHexNib c uchar to ulong
+if and ge c 48 le c 57
+ret ulong sub c 48
 end
-for i ulong pLen bound 520000
-put q36TokInBuf i get qsReqBuf add get b 0 i
+if and ge c 97 le c 102
+ret ulong add 10 sub c 97
 end
+if and ge c 65 le c 70
+ret ulong add 10 sub c 65
+end
+ret 16
+end
+
+fn qsDecodeHexU4 p ulong to long
+h0 = qsHexNib get qsReqBuf p
+h1 = qsHexNib get qsReqBuf add p 1
+h2 = qsHexNib get qsReqBuf add p 2
+h3 = qsHexNib get qsReqBuf add p 3
+if or or ge h0 16 ge h1 16 or ge h2 16 ge h3 16
+ret -1
+end
+ret long or or shl h0 12 shl h1 8 or shl h2 4 h3
+end
+
+fn qsEmitUtf8Cp cp ulong opos ulong to ulong
+if lt cp 128
+put q36TokInBuf opos uchar cp
+ret add opos 1
+end
+if lt cp 2048
+if lt add opos 1 520000
+put q36TokInBuf opos uchar or 192 shr cp 6
+put q36TokInBuf add opos 1 uchar or 128 and cp 63
+ret add opos 2
+end
+ret opos
+end
+if lt add opos 2 520000
+put q36TokInBuf opos uchar or 224 shr cp 12
+put q36TokInBuf add opos 1 uchar or 128 and shr cp 6 63
+put q36TokInBuf add opos 2 uchar or 128 and cp 63
+ret add opos 3
+end
+ret opos
+end
+
+fn qsCopyUnescapedContent st ulong clen ulong to ulong
+opos = ulong 0
+i = ulong 0
+while lt i clen bound 520000
+if ge opos 520000
+break
+end
+c = get qsReqBuf add st i
+if and eq c 92 lt add i 1 clen
+nx = get qsReqBuf add st add i 1
+i = add i 2
+if eq nx 110
+put q36TokInBuf opos 10
+opos = add opos 1
+continue
+end
+if eq nx 114
+put q36TokInBuf opos 13
+opos = add opos 1
+continue
+end
+if eq nx 116
+put q36TokInBuf opos 9
+opos = add opos 1
+continue
+end
+if eq nx 98
+put q36TokInBuf opos 8
+opos = add opos 1
+continue
+end
+if eq nx 102
+put q36TokInBuf opos 12
+opos = add opos 1
+continue
+end
+if and eq nx 117 le add i 4 clen
+cp = qsDecodeHexU4 add st i
+if ge cp 0
+i = add i 4
+opos = qsEmitUtf8Cp ulong cp opos
+continue
+end
+end
+put q36TokInBuf opos nx
+opos = add opos 1
 else
-pLen = len qsP0
-for i ulong pLen bound 64
-put q36TokInBuf i get qsP0 i
+put q36TokInBuf opos c
+opos = add opos 1
+i = add i 1
 end
 end
-maxGen = qsFindMaxTokens n
-cnts = new ulong 2 0
-ok = qsGenerate pLen maxGen cnts
-qsRespReset
-qsRespAppendHdr qsH200 len qsH200
-qsRespAppend qsChatA len qsChatA
-qsRespAppendJsonEsc get qsOutLen 0
-qsRespAppend qsChatB len qsChatB
-qsRespAppendU get cnts 0
+ret opos
+end
+
+fn qsIsWsColon b uchar to bool
+if or eq b 32 eq b 9
+ret true
+end
+ret eq b 58
+end
+
+fn qsIsTrueAt p ulong n ulong to bool
+if gt add p 4 n
+ret false
+end
+if ne get qsReqBuf p 116
+ret false
+end
+if ne get qsReqBuf add p 1 114
+ret false
+end
+if ne get qsReqBuf add p 2 117
+ret false
+end
+ret eq get qsReqBuf add p 3 101
+end
+
+fn qsFindStream n ulong to bool
+if lt n 14
+ret false
+end
+lim = sub n 9
+for i ulong lim bound 524288
+if qsMatchKey qsKeyStream i 8
+p = add i 8
+while lt p n bound 32
+if not qsIsWsColon get qsReqBuf p
+break
+end
+p = add p 1
+end
+if qsIsTrueAt p n
+ret true
+end
+end
+end
+ret false
+end
+
+fn qsAppendUsageArbTimings cnts view ulong 4 to void
 qsRespAppend qsChatC len qsChatC
 qsRespAppendU get cnts 1
 qsRespAppend qsChatD len qsChatD
@@ -341,11 +632,160 @@ qsRespAppendU get qdArbTot 0
 qsRespAppend qsChatG len qsChatG
 qsRespAppendU qsArbHitPct
 qsRespAppend qsChatH len qsChatH
+qsRespAppendU get cnts 2
+qsRespAppend qsChatI len qsChatI
+qsRespAppendU get cnts 3
+qsRespAppend qsChatJ len qsChatJ
+end
+
+fn qsHandleChat fd int n ulong to void
+b = new ulong 2 0
+pLen = ulong 0
+if qsFindLastContent n b
+clen = get b 1
+if gt clen 520000
+clen = ulong 520000
+end
+pLen = qsCopyUnescapedContent get b 0 clen
+else
+pLen = len qsP0
+for i ulong pLen bound 64
+put q36TokInBuf i get qsP0 i
+end
+end
+maxGen = qsFindMaxTokens n
+isStream = qsFindStream n
+if isStream
+put qsStreamFd 0 fd
+qsRespReset
+qsRespAppendHdr qsH200Sse len qsH200Sse
+w = write fd qsRespBuf 0 get qsRespLen 0
+else
+put qsStreamFd 0 -1
+end
+cnts = new ulong 4 0
+ok = qsGenerate pLen maxGen cnts
+put qsStreamFd 0 -1
+if isStream
+qsRespReset
+qsRespAppend qsSseData len qsSseData
+qsRespAppend qsSseFinalA len qsSseFinalA
+qsRespAppendU get cnts 0
+qsAppendUsageArbTimings cnts
+p = get qsRespLen 0
+if lt p 262100
+put qsRespBuf p 10
+put qsRespLen 0 add p 1
+end
+qsRespAppend qsSseDone len qsSseDone
+w = write fd qsRespBuf 0 get qsRespLen 0
+ret
+end
+qsRespReset
+qsRespAppendHdr qsH200 len qsH200
+qsRespAppend qsChatA len qsChatA
+qsRespAppendJsonEsc get qsOutLen 0
+qsRespAppend qsChatB len qsChatB
+qsRespAppendU get cnts 0
+qsAppendUsageArbTimings cnts
 w = write fd qsRespBuf 0 get qsRespLen 0
 end
 
+fn qsIsCrLf2 i ulong n ulong to bool
+if gt add i 4 n
+ret false
+end
+if ne get qsReqBuf i 13
+ret false
+end
+if ne get qsReqBuf add i 1 10
+ret false
+end
+if ne get qsReqBuf add i 2 13
+ret false
+end
+ret eq get qsReqBuf add i 3 10
+end
+
+fn qsFindHdrEnd n ulong to ulong
+if lt n 4
+ret 0
+end
+i = ulong 0
+while lt add i 1 n bound 32768
+if qsIsCrLf2 i n
+ret add i 4
+end
+if and eq get qsReqBuf i 10 eq get qsReqBuf add i 1 10
+ret add i 2
+end
+i = add i 1
+end
+ret 0
+end
+
+fn qsMatchKeyLowerCI kbuf view uchar * pos ulong klen ulong to bool
+for j ulong klen bound 32
+c = get qsReqBuf add pos j
+if and ge c 65 le c 90
+c = add c 32
+end
+if ne c get kbuf j
+ret false
+end
+end
+ret true
+end
+
+fn qsFindContentLength hdrEnd ulong to ulong
+if lt hdrEnd 16
+ret 0
+end
+lim = sub hdrEnd 15
+for i ulong lim bound 32768
+if qsMatchKeyLowerCI qsKeyClen i 15
+ret qsParseReqU add i 15 hdrEnd
+end
+end
+ret 0
+end
+
+fn qsReadHttpRequest fd int to ulong
+tot = ulong 0
+hdrEnd = ulong 0
+need = ulong 0
+for it ulong 1024
+if ge tot 524280
+break
+end
+remCap = sub 524280 tot
+nr = read fd qsReqBuf tot remCap
+if eq nr -4
+continue
+end
+if le nr 0
+break
+end
+tot = add tot ulong nr
+if eq hdrEnd 0
+hdrEnd = qsFindHdrEnd tot
+if gt hdrEnd 0
+clen = qsFindContentLength hdrEnd
+need = add hdrEnd clen
+if gt need 524280
+need = ulong 524280
+end
+end
+end
+if and gt hdrEnd 0 ge tot need
+break
+end
+end
+ret tot
+end
+
 fn qsHandleHttp fd int to void
-n = read fd qsReqBuf 0 524288
+n = qsReadHttpRequest fd
 if le n 4
 ret
 end
@@ -417,8 +857,9 @@ ret n
 end
 
 fn qsRunSelfTest to int
+put qsStreamFd 0 -1
 qdPrint qsSelfHdr
-cnts = new ulong 2 0
+cnts = new ulong 4 0
 n0 = qsCopyTextToPrompt qsP0 len qsP0
 if not qsGenerate n0 32 cnts
 qdPrint qsSelfBad

@@ -60,12 +60,16 @@ const QDW_ALOG ulong 327680
 const QDW_FNORM ulong 344064
 const QDW_LEXMAP ulong 352256
 const QDW_POS ulong 393216
+const QDW_OUT_TOK ulong 393280
 const QDW_TRACE ulong 401408
 const QDW_ROPE ulong 524288
 const QDW_LOGW4 ulong 1048576
 const QDW_LOGBF ulong 2097152
 const QDW_CIDS ulong 3145728
 const QDW_CLOG ulong 3162112
+const QDW_QROT ulong 3211264
+const QDW_OPART ulong 3227648
+const QDW_MLPART ulong 3358720
 const QDW_PKT ulong 4194304
 
 note GDN layer offsets inside raw layers-L.safetensors payload:
@@ -119,8 +123,13 @@ const FA_PAYLOAD ulong 836878976
 global qdCodeMap long 1
 global qdCodePos ulong 1
 global qdCodeFail uint 1
-global qdEntry ulong 32
-global qdSmem ulong 32
+global qdEntry ulong 48
+global qdSmem ulong 48
+global qdPreMap long 1
+global qdPreVa ulong 1
+global qdPreCtlMap long 1
+global qdPreCtlVa ulong 1
+global qdPreTokIds uint 512
 global qdUseW4 ulong 1
 global qdW4Map long 6
 global qdW4Va ulong 6
@@ -128,6 +137,7 @@ global qdLut long 1
 global qdWork long 1
 global qdWorkVa ulong 1
 global qdLmBf16 long 1
+global qdEmbBf16 long 1
 global qdLmW4 long 1
 global qdLmW4Va ulong 1
 global qdScaleMap long 1
@@ -196,7 +206,7 @@ global qdGdnTail f32 737280
 note Full-Attn KV cache: 10 layers x 128 pos x 2 kv x 256 f32 = 655,360 f32 each (5 MB total)
 global qdKCache f32 655360
 global qdVCache f32 655360
-global qdRopeFreq f32 32
+global qdRopeFreq f64 32
 global qdScores f32 128
 
 note Live Arboris online hit counters across real Qwen 3.6 routing traces
@@ -205,6 +215,7 @@ global qdArbTot ulong 1
 global qdArbPred uint 8
 global qdArbHasPred ulong 1
 global qdArbIds uint 8
+global qdTraceSnap uchar 2560
 
 text qdBanner "=== QWEN 3.6 35B-A3B FP8 100% PURE SEEDED-OMEGA REAL-WEIGHT DECODER (ZERO CUDA) ===\n"
 text qdUsage "usage: q36-decode /path/to/qwen3.6-35b-a3b-fp8 [num_gen_tokens]\n"
@@ -571,6 +582,17 @@ if not ok
 exit 4
 end
 q36Done
+note 25: argmax_embed_step (GPU argmax + BF16->F32 embed widen + pos++ for ZOS async decode)
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry 25 p
+put qdCodePos 0 p
+put qhPc 0 0
+put qhGuard 0 0
+ok = qhKernel uchar 101
+if not ok
+exit 4
+end
+qhDone
 put qdSmem 0 8192
 put qdSmem 1 17472
 put qdSmem 2 0
@@ -596,6 +618,23 @@ put qdSmem 21 1088
 put qdSmem 22 2048
 put qdSmem 23 64
 put qdSmem 24 8192
+put qdSmem 25 512
+for mi ulong 3
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry add 43 mi p
+put qdCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36Kernel uchar add 128 mi
+if not ok
+exit 4
+end
+q36Done
+end
+put qdSmem 43 1088
+put qdSmem 44 0
+put qdSmem 45 0
+qdPreEmitKernels
 end
 
 note =========================================================================
@@ -686,27 +725,50 @@ end
 ret qdLog add 1.0f32 qdExp x
 end
 
-fn qdSinCos theta f32 isCos bool to f32
-note Reduce theta to [-pi, pi]
-inv2pi = f32 0.15915494f32
-twopi = f32 6.28318531f32
-pi = f32 3.14159265f32
-hp = f32 1.57079633f32
-k = mul theta inv2pi
-ki = int 0
-if ge k 0.0f32
-ki = int add k 0.5f32
+fn qdExp64 x f64 to f64
+kf = mul x 1.4426950408889634f64
+ki = long 0
+if ge kf 0.0f64
+ki = long add kf 0.5f64
 else
-ki = int sub k 0.5f32
+ki = long sub kf 0.5f64
 end
-x = sub theta mul f32 ki twopi
+r = sub x mul f64 ki 0.6931471805599453f64
+p = f64 1.0f64
+p = add 1.0f64 mul r div p 10.0f64
+p = add 1.0f64 mul r div p 9.0f64
+p = add 1.0f64 mul r div p 8.0f64
+p = add 1.0f64 mul r div p 7.0f64
+p = add 1.0f64 mul r div p 6.0f64
+p = add 1.0f64 mul r div p 5.0f64
+p = add 1.0f64 mul r div p 4.0f64
+p = add 1.0f64 mul r div p 3.0f64
+p = add 1.0f64 mul r div p 2.0f64
+p = add 1.0f64 mul r p
+eb = shl ulong add ki 1023 52
+ret mul p bitcast f64 eb
+end
+
+fn qdSinCos64 theta f64 isCos bool to f64
+note Exact f64 range reduction to [-pi/2, pi/2] + exact 15th-order nested Horner sin(x)
+inv2pi = f64 0.15915494309189535f64
+twopi = f64 6.2831853071795865f64
+pi = f64 3.1415926535897932f64
+hp = f64 1.5707963267948966f64
+k = mul theta inv2pi
+ki = long 0
+if ge k 0.0f64
+ki = long add k 0.5f64
+else
+ki = long sub k 0.5f64
+end
+x = sub theta mul f64 ki twopi
 if isCos
 x = add x hp
 if gt x pi
 x = sub x twopi
 end
 end
-sgn = f32 1.0f32
 if gt x hp
 x = sub pi x
 end
@@ -714,19 +776,22 @@ if lt x neg hp
 x = sub neg pi x
 end
 x2 = mul x x
-r = sub 1.0f32 mul x2 0.0001984127f32
-r = sub 1.0f32 mul x2 mul 0.0083333333f32 r
-r = sub 1.0f32 mul x2 mul 0.0416666667f32 r
-r = sub 1.0f32 mul x2 mul 0.1666666667f32 r
-ret mul sgn mul x r
+r = sub 1.0f64 div x2 210.0f64
+r = sub 1.0f64 mul div x2 156.0f64 r
+r = sub 1.0f64 mul div x2 110.0f64 r
+r = sub 1.0f64 mul div x2 72.0f64 r
+r = sub 1.0f64 mul div x2 42.0f64 r
+r = sub 1.0f64 mul div x2 20.0f64 r
+r = sub 1.0f64 mul div x2 6.0f64 r
+ret mul x r
 end
 
 fn qdInitRopeFreq to void
-note inv_freq[j] = exp(-2*j/64 * ln(10000000.0))
-lnTheta = f32 16.11809565f32
+note inv_freq[j] = exp(-2*j/64 * ln(10000000.0)) in exact f64
+lnTheta = f64 16.11809565095832f64
 for j ulong 32
-e = div mul f32 mul j 2 lnTheta 64.0f32
-put qdRopeFreq j qdExp neg e
+e = div mul f64 mul j 2 lnTheta 64.0f64
+put qdRopeFreq j qdExp64 neg e
 end
 end
 
@@ -909,19 +974,27 @@ put qdPreBytes slot add pos n
 ret true
 end
 
-fn qdReplayPre slot ulong to bool
+fn qdKickPre slot ulong to bool
 r = mapset get gbmem 2 8192 4 0
 r = mapset get gbmem 3 0 4 0
 r = mapset get gbmem 3 16 4 0
 off = get qdPreOff slot
 nb = get qdPreBytes slot
-if not nvsend get qdWork 0 off uint div nb 4
-ret false
+ret nvsend get qdWork 0 off uint div nb 4
 end
+
+fn qdWaitPre to bool
 if not qdWaitFast 15000000000
 ret false
 end
 ret eq mapget get gbmem 3 0 4 1145324612
+end
+
+fn qdReplayPre slot ulong to bool
+if not qdKickPre slot
+ret false
+end
+ret qdWaitPre
 end
 
 fn qdWaitFast timeout ulong to bool
@@ -1270,8 +1343,11 @@ end
 if ne mapwrite get qdWork 0 QDW_FNORM qdIoBuf 0 8192 8192
 ret false
 end
-note Stream lm_head.weight BF16 (1.017 GB) into qdLmBf16
+note Stream lm_head.weight BF16 (1.017 GB) into qdLmBf16 and embed_tokens BF16 (1.017 GB) into qdEmbBf16
 if not qdStreamToMap fd QD_OUT_DATA_OFF get qdLmBf16 0 0 QD_LM_BYTES
+ret false
+end
+if not qdStreamToMap fd QD_EMB_OFF get qdEmbBf16 0 0 QD_LM_BYTES
 ret false
 end
 ret true
@@ -1976,6 +2052,33 @@ end
 ret qdEmitGpuMoeW4 L false
 end
 
+fn qdEmitFaAttnSplit sbase ulong kBase ulong vBase ulong to bool
+wva = get qdWorkVa 0
+qdPtr add wva QDW_QKV
+qdPtr add sbase mul FA_QNORM 2
+qdPtr get qdRopeVa 0
+qdPtr add wva QDW_QROT
+qdPtr add wva QDW_POS
+if not qdPktEmitGy 43 16 1 256
+ret false
+end
+qdPtr add wva QDW_QROT
+qdPtr kBase
+qdPtr vBase
+qdPtr add wva QDW_OPART
+qdPtr add wva QDW_MLPART
+qdPtr add wva QDW_POS
+if not qdPktEmitGy 44 16 8 32
+ret false
+end
+qdPtr add wva QDW_OPART
+qdPtr add wva QDW_MLPART
+qdPtr add wva QDW_QKV
+qdPtr add wva QDW_Y
+qdArg 8
+ret qdPktEmitGy 45 16 1 256
+end
+
 fn qdEmitFaLayerW4 L ulong faIdx ulong to bool
 d4 = add qdLayerW4Va L W4_DENSE
 sbase = qdLayerSVa L
@@ -2002,14 +2105,7 @@ qdPtr add wva QDW_POS
 if not qdPktEmitGy 14 2 1 256
 ret false
 end
-qdPtr add wva QDW_QKV
-qdPtr add sbase mul FA_QNORM 2
-qdPtr get qdRopeVa 0
-qdPtr kBase
-qdPtr vBase
-qdPtr add wva QDW_Y
-qdPtr add wva QDW_POS
-if not qdPktEmitGy 15 16 1 256
+if not qdEmitFaAttnSplit sbase kBase vBase
 ret false
 end
 if not qdEmitW4Gemv4R add wva QDW_Y add d4 10616832 add d4 14811136 add wva QDW_AOUT 4096 2048
@@ -2114,15 +2210,8 @@ qdPtr add wva QDW_POS
 if not qdPktEmitGy 14 2 1 256
 ret false
 end
-note GPU q_norm + partial RoPE + GQA + sigmoid(gate) -> QDW_Y
-qdPtr add wva QDW_QKV
-qdPtr add sbase mul FA_QNORM 2
-qdPtr get qdRopeVa 0
-qdPtr kBase
-qdPtr vBase
-qdPtr add wva QDW_Y
-qdPtr add wva QDW_POS
-if not qdPktEmitGy 15 16 1 256
+note GPU Split-K q_norm + partial RoPE + GQA + sigmoid(gate) -> QDW_Y
+if not qdEmitFaAttnSplit sbase kBase vBase
 ret false
 end
 ret qdEmitFaTailAndMoe L
@@ -2175,6 +2264,17 @@ end
 ret true
 end
 
+fn qdEmitArgmaxEmbed to bool
+wva = get qdWorkVa 0
+qdPtr add wva QDW_CIDS
+qdPtr add wva QDW_CLOG
+qdPtr mapaddr get qdEmbBf16 0
+qdPtr add wva QDW_X
+qdPtr add wva QDW_POS
+qdPtr add wva QDW_OUT_TOK
+ret qdPktEmitGy 25 1 1 128
+end
+
 fn qdRecordAllPackets to bool
 note Slot 0: ALL 40 REAL LAYERS + FINAL NORM + W4 TWO-PASS EXACT LM_HEAD IN ONE SINGLE GPFIFO SUBMIT!!
 qdPktStartAt QDW_PKT
@@ -2192,13 +2292,73 @@ qdPktStartAt add QDW_PKT 2097152
 if not qdEmitAll40Layers
 ret false
 end
-ret qdPktFinish 1
+if not qdPktFinish 1
+ret false
+end
+note Slot 2: ZOS ASYNC SELF-ADVANCING DECODE (40 LAYERS + EXACT LM_HEAD + GPU ARGMAX->EMBED->POS++)
+qdPktStartAt add QDW_PKT 4194304
+if not qdEmitAll40Layers
+ret false
+end
+if not qdEmitFinalHead
+ret false
+end
+if not qdEmitArgmaxEmbed
+ret false
+end
+if not qdPktFinish 2
+ret false
+end
+if eq get qdUseW4 0 1
+note Slot 3: ALL 40 REAL LAYERS CHUNKED PREFILL B=512 (ZERO CPU PACKET RECORDING PER CHUNK!)
+qdPktStartAt add QDW_PKT 8388608
+if not qdPreEmitAll40W4 512
+ret false
+end
+if not qdPktFinish 3
+ret false
+end
+note Slot 4: ALL 40 REAL LAYERS CHUNKED PREFILL B=512 + FINAL EXACT LM_HEAD
+qdPktStartAt add QDW_PKT 12582912
+if not qdPreEmitAll40W4 512
+ret false
+end
+if not qdPreEmitFinalHead 512
+ret false
+end
+ret qdPktFinish 4
+end
+ret true
 end
 
-fn qdUpdateArboris to void
-if ne mapread get qdWork 0 QDW_TRACE qdIoBuf 0 2560 2560
-ret
+fn qdSnapTrace to bool
+ret eq mapread get qdWork 0 QDW_TRACE qdTraceSnap 0 2560 2560
 end
+
+fn qdReadOutTok to ulong
+if ne mapread get qdWork 0 QDW_OUT_TOK qdIoBuf 0 4 4
+ret 999999
+end
+b0 = uint get qdIoBuf 0
+b1 = shl uint get qdIoBuf 1 8
+b2 = shl uint get qdIoBuf 2 16
+b3 = shl uint get qdIoBuf 3 24
+ret ulong or or b0 b1 or b2 b3
+end
+
+fn qdPrepAsyncDecode tid ulong pos ulong to bool
+if not qdLoadEmbed tid
+ret false
+end
+w = uint pos
+put qdIoBuf 0 uchar and w 255
+put qdIoBuf 1 uchar and shr w 8 255
+put qdIoBuf 2 uchar and shr w 16 255
+put qdIoBuf 3 uchar and shr w 24 255
+ret eq mapwrite get qdWork 0 QDW_POS qdIoBuf 0 4 4
+end
+
+fn qdUpdateArborisSnap to void
 q36ArbResetToken
 idsLocal = new uint 8 0
 prLocal = new uint 8 0
@@ -2208,10 +2368,10 @@ for L ulong QD_LAYERS
 base = mul L 64
 for k ulong 8
 p = add base mul k 4
-b0 = uint get qdIoBuf p
-b1 = shl uint get qdIoBuf add p 1 8
-b2 = shl uint get qdIoBuf add p 2 16
-b3 = shl uint get qdIoBuf add p 3 24
+b0 = uint get qdTraceSnap p
+b1 = shl uint get qdTraceSnap add p 1 8
+b2 = shl uint get qdTraceSnap add p 2 16
+b3 = shl uint get qdTraceSnap add p 3 24
 put idsLocal k or or b0 b1 or b2 b3
 end
 if eq hasPred 1
@@ -2228,6 +2388,13 @@ hasPred = ulong 0
 end
 end
 end
+end
+
+fn qdUpdateArboris to void
+if not qdSnapTrace
+ret
+end
+qdUpdateArborisSnap
 end
 
 fn qdForwardToken tid ulong pos ulong runHead bool checkParity bool to ulong
@@ -2275,13 +2442,13 @@ end
 ret bestId
 end
 
-fn qdInitRopeRow subP ulong curC edit f32 32 curS edit f32 32 stepC view f32 32 stepS view f32 32 to void
+fn qdInitRopeRow subP ulong curC edit f64 32 curS edit f64 32 stepC view f64 32 stepS view f64 32 to void
 base = mul subP 256
 for j ulong 32
 c = get curC j
 s = get curS j
-qdPutF32Io add base mul j 4 c
-qdPutF32Io add base add 128 mul j 4 s
+qdPutF32Io add base mul j 4 f32 c
+qdPutF32Io add base add 128 mul j 4 f32 s
 dc = get stepC j
 ds = get stepS j
 put curC j sub mul c dc mul s ds
@@ -2289,14 +2456,14 @@ put curS j add mul s dc mul c ds
 end
 end
 
-fn qdInitRopeBlk mr long blk ulong stepC view f32 32 stepS view f32 32 to void
-curC = new f32 32 0.0f32
-curS = new f32 32 0.0f32
-p0 = f32 mul blk 256
+fn qdInitRopeBlk mr long blk ulong stepC view f64 32 stepS view f64 32 to void
+curC = new f64 32 0.0f64
+curS = new f64 32 0.0f64
+p0 = f64 mul blk 256
 for j ulong 32
 th = mul p0 get qdRopeFreq j
-put curC j qdSinCos th true
-put curS j qdSinCos th false
+put curC j qdSinCos64 th true
+put curS j qdSinCos64 th false
 end
 for subP ulong 256
 qdInitRopeRow subP curC curS stepC stepS
@@ -2314,19 +2481,19 @@ end
 put qdKvMap fk mk
 put qdKvVa fk mapaddr mk
 end
-note Allocate and precompute 128K RoPE cos/sin table [131072, 64] = 32 MB UVM (<150 ms via recurrence!)
+note Allocate and precompute 128K RoPE cos/sin table [131072, 64] = 32 MB UVM (<150 ms via exact f64 recurrence!)
 mr = nvalloc 33554432 true
 if le mr 0
 ret false
 end
 put qdRopeMap 0 mr
 put qdRopeVa 0 mapaddr mr
-stepC = new f32 32 0.0f32
-stepS = new f32 32 0.0f32
+stepC = new f64 32 0.0f64
+stepS = new f64 32 0.0f64
 for j ulong 32
 f = get qdRopeFreq j
-put stepC j qdSinCos f true
-put stepS j qdSinCos f false
+put stepC j qdSinCos64 f true
+put stepS j qdSinCos64 f false
 end
 for blk ulong 512
 qdInitRopeBlk mr blk stepC stepS
@@ -2364,6 +2531,10 @@ end
 put qdWorkVa 0 mapaddr get qdWork 0
 put qdLmBf16 0 nvalloc QD_LM_BYTES true
 if le get qdLmBf16 0 0
+ret 8
+end
+put qdEmbBf16 0 nvalloc QD_LM_BYTES true
+if le get qdEmbBf16 0 0
 ret 8
 end
 put qdLmW4 0 nvalloc 300000000 true
@@ -2409,6 +2580,18 @@ if not qdInitKvRope128k
 ret 10
 end
 if eq get qdUseW4 0 1
+mp = nvalloc 134217728 true
+if le mp 0
+ret 10
+end
+put qdPreMap 0 mp
+put qdPreVa 0 mapaddr mp
+mc = nvalloc 4096 false
+if le mc 0
+ret 10
+end
+put qdPreCtlMap 0 mc
+put qdPreCtlVa 0 mapaddr mc
 m0 = nvalloc QD_LAYER_STRIDE true
 if le m0 0
 ret 11
@@ -2458,6 +2641,18 @@ put prompt 16 248069
 qdPrint qdMsgPrefill
 qdPrintU 17
 nextTok = ulong 0
+if eq get qdUseW4 0 1
+for p ulong 17
+put qdPreTokIds p uint get prompt p
+end
+nextTok = qdRunPrefillChunkW4 17 0 true true
+if eq nextTok 999999
+qdPrint qdErr
+qdPrintU 50
+qdPrint qdMsgNl
+ret 15
+end
+else
 for p ulong 17
 isLast = eq p 16
 nextTok = qdForwardToken get prompt p p isLast isLast
@@ -2468,20 +2663,52 @@ qdPrint qdMsgNl
 ret 15
 end
 end
+end
 genOut = new ulong 64 0
 put genOut 0 nextTok
 tDec0 = monons
-pos = ulong 17
-for g ulong sub genN 1 bound 64
-nextTok = qdForwardToken nextTok pos true false
+decSteps = sub genN 1
+if gt decSteps 0
+if not qdPrepAsyncDecode nextTok 17
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+if not qdKickPre 2
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+for g ulong decSteps bound 64
+if not qdWaitPre
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+nextTok = qdReadOutTok
 if eq nextTok 999999
 qdPrint qdErr
 qdPrintU 51
 qdPrint qdMsgNl
 ret 16
 end
+okSnap = qdSnapTrace
+if lt add g 1 decSteps
+if not qdKickPre 2
+qdPrint qdErr
+qdPrintU 51
+qdPrint qdMsgNl
+ret 16
+end
+end
+if okSnap
+qdUpdateArborisSnap
+end
 put genOut add g 1 nextTok
-pos = add pos 1
+end
 end
 tDecUs = div ulong sub monons tDec0 1000
 qdPrint qdMsgGen
@@ -2648,13 +2875,32 @@ if ne nextTok get qdRefOut 0
 exact = ulong 0
 end
 end
-pos = ulong 17
 tTurn0 = monons
-for g ulong sub genN 1 bound 64
+decSteps = sub genN 1
+if gt decSteps 0
+if not qdPrepAsyncDecode nextTok 17
+ret 16
+end
+if not qdKickPre 2
+ret 16
+end
+for g ulong decSteps bound 64
 t0 = monons
-nextTok = qdForwardToken nextTok pos true false
+if not qdWaitPre
+ret 16
+end
+nextTok = qdReadOutTok
 if eq nextTok 999999
 ret 16
+end
+okSnap = qdSnapTrace
+if lt add g 1 decSteps
+if not qdKickPre 2
+ret 16
+end
+end
+if okSnap
+qdUpdateArborisSnap
 end
 dtUs = div ulong sub monons t0 1000
 if lt dtUs get qdSoakStats 1
@@ -2672,7 +2918,7 @@ if ne nextTok get qdRefOut add g 1
 exact = ulong 0
 end
 end
-pos = add pos 1
+end
 end
 tTurnUs = div ulong sub monons tTurn0 1000
 put qdSoakStats 0 add get qdSoakStats 0 exact
@@ -2756,16 +3002,21 @@ put qdDirLen 0 ulong dlen
 genN = ulong 8
 if ge argcnt 3
 v = qdParseArgU 2
-if and gt v 0 le v 99
+if and gt v 0 le v 131072
 genN = v
 end
 end
 put qdUseW4 0 0
+preBench = ulong 0
 wb = new uchar 16 0
 if ge argcnt 4
 wl = argread 3 wb 0 15
 if and ge wl 2 eq get wb 0 119
 put qdUseW4 0 1
+end
+if and ge wl 1 eq get wb 0 112
+put qdUseW4 0 1
+preBench = ulong 1
 end
 end
 repeats = ulong 1
@@ -2785,7 +3036,7 @@ qdPrintU ulong irc
 qdPrint qdMsgNl
 ret irc
 end
-dbgOnly = eq genN 99
+dbgOnly = and eq preBench 0 eq genN 99
 lrc = qdLoadAll dbgOnly
 if ne lrc 0
 rc = nvstop
@@ -2798,10 +3049,14 @@ rc = nvstop
 ret 0
 end
 prc = int 0
+if eq preBench 1
+prc = qdRunPrefillBench genN
+else
 if gt repeats 1
 prc = qdRunSoak genN repeats
 else
 prc = qdRunPrompt genN
+end
 end
 r = fclose get qdOutFd 0
 rc = nvstop
