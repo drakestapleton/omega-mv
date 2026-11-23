@@ -18,9 +18,10 @@ OMEGA_BIN = $(OUT_DIR)/omega
 VISOR_OMC ?= seed/out/omc
 # Pure OM-2 units shared with the C bridge (om/units.sh); their `export fn` is a plain fn here.
 VISOR_OM_UNITS = om/aarch64/aarch64_om2.om om/visor/verify_om2.om om/visor/validate_om2.om
-OMEGA_OM_SRCS = src/visor/visor.om $(VISOR_OM_UNITS) \
+# The language lane lowers fn definitions through visor_program.om, so it follows it.
+OMEGA_OM_SRCS = src/visor/visor.om $(VISOR_OM_UNITS) src/visor/visor_program.om \
 	src/language/omega_lex.om src/language/omega_parse.om src/language/omega_lower.om \
-	src/visor/visor_semantic.om src/visor/visor_machine.om src/visor/visor_program.om \
+	src/visor/visor_semantic.om src/visor/visor_machine.om \
 	src/visor/visor_realization.om \
 	src/visor/visor_verify.om src/visor/visor_evidence.om src/visor/visor_world.om \
 	src/visor/visor_effect_request.om src/visor/visor_parse_command.om src/visor/visor_console_hooks.om \

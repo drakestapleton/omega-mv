@@ -1,13 +1,20 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 Surface Language V0 recursive-descent parser
-note (replaces src/language/omega_parse.c). Depends on omega_lex.om.
+note Pure seeded OM-2 Surface Language V0 parser: a faithful port of src/language/omega_parse.c.
+note Same grammar, node order, canonical contract text, error texts, columns and return codes.
+note Depends on omega_lex.om.
+note
+note Statement kinds (OmegaStmtKind): 0=EMPTY 1=EXPR 2=LET 3=FN.
+note AST node kinds (OmegaAstKind): 1=INT 2=BOOL 3=NAME 4=BINARY 5=ASCRIBE.
+note Types are (tag, width) with the TypeTag values of visor.om: bool (V_TY_BOOL, 1), uN (V_TY_UINT, N).
+note Functions return 0 or the C return code; a parsed node index comes back in opr_out.
 
-note Statement kinds: 0=EMPTY 1=EXPR 2=LET 3=FN
-note AST node kinds: 1=INT 2=BOOL 3=NAME 4=BIN 5=ASCRIBE
+const OPR_MAX_NODES ulong 128
+const OPR_MAX_DEPTH ulong 32
 
 global opr_pos ulong 1
-global opr_depth ulong 1
+global opr_out long 1
 global opr_stmt ulong 1
+global opr_scol ulong 1
 global opr_root long 1
 global opr_ncnt ulong 1
 global opr_nkind ulong 128
@@ -31,89 +38,232 @@ global opr_pttag ulong 1
 global opr_ptwid ulong 1
 global opr_rttag ulong 1
 global opr_rtwid ulong 1
-
-text opr_e_depth "expression nesting too deep"
-text opr_e_nodes "expression too large"
-text opr_e_type "expected unsigned integer or bool type"
-text opr_e_signed "signed types are not supported in V0"
-text opr_e_prim "expected expression"
-text opr_e_rparen "expected ')'"
-text opr_e_extra "unexpected trailing tokens"
-text opr_e_let "malformed let statement"
-text opr_e_fn "malformed fn declaration"
-text opr_e_res "reserved keyword not allowed as identifier"
-
-text opr_r_auth "authorize"
-text opr_r_sub "submit"
-text opr_r_exec "execute"
-text opr_r_mint "mint"
-text opr_r_grant "grant"
-text opr_r_rev "revoke"
-text opr_r_pub "publish"
-text opr_r_prom "promote"
-text opr_r_cap "capability"
-text opr_r_eff "effect"
-text opr_r_sys "syscall"
-text opr_r_adm "admin"
-
-fn opr_is_reserved tidx ulong to bool
-  if olx_tok_eq tidx opr_r_auth
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_sub
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_exec
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_mint
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_grant
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_rev
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_pub
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_prom
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_cap
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_eff
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_sys
-    ret true
-  end
-  if olx_tok_eq tidx opr_r_adm
-    ret true
-  end
-  ret false
-end
+global opr_ty_tag ulong 1
+global opr_ty_wid ulong 1
+note canonical contract text: 0 = requires, 1 = ensures (64 bytes each)
+global opr_ctxt uchar 128
+global opr_clen ulong 2
+global opr_pc uchar 96
+global opr_pcl ulong 1
 
 fn opr_peek to ulong
   ret get olx_tkind get opr_pos 0
 end
 
-fn opr_next to ulong
-  p = get opr_pos 0
-  k = get olx_tkind p
-  if ne k 0
-    put opr_pos 0 add p 1
-  end
-  ret k
+fn opr_peek_col to ulong
+  ret get olx_tcol get opr_pos 0
 end
 
+fn opr_peek2 to ulong
+  p = add get opr_pos 0 1
+  if gt p get olx_tcnt 0
+    p = get olx_tcnt 0
+  end
+  ret get olx_tkind p
+end
+
+fn opr_next to void
+  p = get opr_pos 0
+  if lt p get olx_tcnt 0
+    put opr_pos 0 add p 1
+  end
+end
+
+note the found-token text of expect / expect_end: the word of a name, else tok_text
+fn olm_found t ulong to void
+  k = get olx_tkind t
+  if eq k 1
+    olm_tstr t
+  else
+    olm_tok k
+  end
+end
+
+text opr_m_exp "expected "
+text opr_m_found " but found '"
+
+fn opr_expect k ulong what view uchar * to long
+  t = get opr_pos 0
+  if ne get olx_tkind t k
+    olm_reset
+    olm_t opr_m_exp
+    olm_t what
+    olm_t opr_m_found
+    olm_found t
+    olm_c 39
+    olm_cap 159
+    olx_fail get olx_tcol t
+    ret -1
+  end
+  opr_next
+  ret 0
+end
+
+note ---- omega_language_is_reserved: keywords and RESERVED_EXTRA ----
+text opr_w_u8 "u8"
+text opr_w_u16 "u16"
+text opr_w_u32 "u32"
+text opr_w_u64 "u64"
+text opr_w_bool "bool"
+text opr_w_i8 "i8"
+text opr_w_i16 "i16"
+text opr_w_i32 "i32"
+text opr_w_i64 "i64"
+text opr_w_result "result"
+text opr_w_effect "effect"
+text opr_w_effects "effects"
+text opr_w_cap "cap"
+text opr_w_capability "capability"
+text opr_w_mint "mint"
+text opr_w_revoke "revoke"
+text opr_w_grant "grant"
+text opr_w_publish "publish"
+text opr_w_promote "promote"
+text opr_w_authority "authority"
+text opr_w_admin "admin"
+text opr_w_syscall "syscall"
+text opr_w_io "io"
+text opr_w_print "print"
+text opr_w_import "import"
+text opr_w_extern "extern"
+text opr_w_unsafe "unsafe"
+text opr_w_asm "asm"
+text opr_w_if "if"
+text opr_w_else "else"
+text opr_w_while "while"
+text opr_w_for "for"
+text opr_w_loop "loop"
+text opr_w_return "return"
+text opr_w_match "match"
+text opr_w_struct "struct"
+text opr_w_enum "enum"
+text opr_w_mut "mut"
+text opr_w_var "var"
+text opr_w_const "const"
+text opr_w_self "self"
+text opr_w_rec "rec"
+text opr_w_us "_"
+
+fn opr_res_types t ulong to bool
+  if or olx_tok_eq t opr_w_u8 or olx_tok_eq t opr_w_u16 olx_tok_eq t opr_w_u32
+    ret true
+  end
+  if or olx_tok_eq t opr_w_u64 or olx_tok_eq t opr_w_bool olx_tok_eq t opr_w_i8
+    ret true
+  end
+  if or olx_tok_eq t opr_w_i16 or olx_tok_eq t opr_w_i32 olx_tok_eq t opr_w_i64
+    ret true
+  end
+  ret olx_tok_eq t opr_w_result
+end
+
+fn opr_res_effects t ulong to bool
+  if or olx_tok_eq t opr_w_effect or olx_tok_eq t opr_w_effects olx_tok_eq t opr_w_cap
+    ret true
+  end
+  if or olx_tok_eq t opr_w_capability or olx_tok_eq t opr_w_mint olx_tok_eq t opr_w_revoke
+    ret true
+  end
+  if or olx_tok_eq t opr_w_grant or olx_tok_eq t opr_w_publish olx_tok_eq t opr_w_promote
+    ret true
+  end
+  if or olx_tok_eq t opr_w_authority or olx_tok_eq t opr_w_admin olx_tok_eq t opr_w_syscall
+    ret true
+  end
+  if or olx_tok_eq t opr_w_io or olx_tok_eq t opr_w_print olx_tok_eq t opr_w_import
+    ret true
+  end
+  ret or olx_tok_eq t opr_w_extern or olx_tok_eq t opr_w_unsafe olx_tok_eq t opr_w_asm
+end
+
+fn opr_res_control t ulong to bool
+  if or olx_tok_eq t opr_w_if or olx_tok_eq t opr_w_else olx_tok_eq t opr_w_while
+    ret true
+  end
+  if or olx_tok_eq t opr_w_for or olx_tok_eq t opr_w_loop olx_tok_eq t opr_w_return
+    ret true
+  end
+  if or olx_tok_eq t opr_w_match or olx_tok_eq t opr_w_struct olx_tok_eq t opr_w_enum
+    ret true
+  end
+  if or olx_tok_eq t opr_w_mut or olx_tok_eq t opr_w_var olx_tok_eq t opr_w_const
+    ret true
+  end
+  ret or olx_tok_eq t opr_w_self olx_tok_eq t opr_w_rec
+end
+
+fn opr_is_reserved t ulong to bool
+  if ne olx_keyword t 1
+    ret true
+  end
+  if opr_res_types t
+    ret true
+  end
+  if opr_res_effects t
+    ret true
+  end
+  ret opr_res_control t
+end
+
+note ---- parse_type ----
+text opr_m_type "expected a type (u8, u16, u32, u64 or bool)"
+text opr_m_signed "signed integers are not supported in V0 (the existing builders and evaluator are unsigned-only)"
+text opr_m_nott " is not a V0 type (use u8, u16, u32, u64 or bool)"
+
+note parse_type: 0 with the type in opr_ty_tag / opr_ty_wid
+fn opr_parse_type to long
+  t = get opr_pos 0
+  col = get olx_tcol t
+  if ne get olx_tkind t 1
+    olx_failt col opr_m_type
+    ret -1
+  end
+  tag = V_TY_UINT
+  wid = ulong 0
+  if olx_tok_eq t opr_w_u8
+    wid = 8
+  end
+  if olx_tok_eq t opr_w_u16
+    wid = 16
+  end
+  if olx_tok_eq t opr_w_u32
+    wid = 32
+  end
+  if olx_tok_eq t opr_w_u64
+    wid = 64
+  end
+  if olx_tok_eq t opr_w_bool
+    tag = V_TY_BOOL
+    wid = 1
+  end
+  if eq wid 0
+    if or or olx_tok_eq t opr_w_i8 olx_tok_eq t opr_w_i16 or olx_tok_eq t opr_w_i32 olx_tok_eq t opr_w_i64
+      olx_failt col opr_m_signed
+      ret -2
+    end
+    olm_reset
+    olm_c 39
+    olm_tstr t
+    olm_c 39
+    olm_t opr_m_nott
+    olm_cap 159
+    olx_fail col
+    ret -2
+  end
+  put opr_ty_tag 0 tag
+  put opr_ty_wid 0 wid
+  opr_next
+  ret 0
+end
+
+text opr_m_large "expression is too large for V0 (node limit reached)"
+
+note alloc_or_fail: 0 with the new node in opr_out, or -3
 fn opr_alloc kind ulong col ulong to long
   c = get opr_ncnt 0
-  if ge c 128
-    olx_set_err opr_e_nodes col
-    ret -1
+  if ge c OPR_MAX_NODES
+    olx_failt col opr_m_large
+    ret -3
   end
   put opr_ncnt 0 add c 1
   put opr_nkind c kind
@@ -125,418 +275,640 @@ fn opr_alloc kind ulong col ulong to long
   put opr_nslen c 0
   put opr_nttag c 0
   put opr_ntwid c 0
-  ret long c
-end
-
-fn opr_parse_type dst_is_ret ulong to long
-  k = opr_peek
-  p = get opr_pos 0
-  col = get olx_tcol p
-  tag = ulong 0
-  wid = ulong 0
-  if eq k 10
-    tag = V_TY_UINT
-    wid = 8
-  else
-    if eq k 11
-      tag = V_TY_UINT
-      wid = 16
-    else
-      if eq k 12
-        tag = V_TY_UINT
-        wid = 32
-      else
-        if eq k 13
-          tag = V_TY_UINT
-          wid = 64
-        else
-          if eq k 14
-            tag = V_TY_BOOL
-            wid = 1
-          else
-            if eq k 15
-              olx_set_err opr_e_signed col
-              ret -1
-            end
-            olx_set_err opr_e_type col
-            ret -1
-          end
-        end
-      end
-    end
-  end
-  u = opr_next
-  if eq dst_is_ret 1
-    put opr_rttag 0 tag
-    put opr_rtwid 0 wid
-  else
-    if eq dst_is_ret 2
-      put opr_pttag 0 tag
-      put opr_ptwid 0 wid
-    else
-      put opr_lttag 0 tag
-      put opr_ltwid 0 wid
-    end
-  end
+  put opr_out 0 long c
   ret 0
 end
 
-fn opr_copy_tok_to_node p ulong ni ulong to void
-  sl = get olx_tslen p
+text opr_m_res " is reserved: effects, authority, control flow and type names are not values in Omega V0"
+
+fn opr_reserved_msg t ulong to long
+  olm_reset
+  olm_c 39
+  olm_tstr t
+  olm_c 39
+  olm_t opr_m_res
+  olm_cap 199
+  olx_fail get olx_tcol t
+  ret -2
+end
+
+fn opr_copy_name_node t ulong ni ulong to void
+  sl = get olx_tslen t
   put opr_nslen ni sl
-  sb = mul p 64
+  sb = mul t 64
   db = mul ni 64
   for i ulong sl bound 64
     put opr_nstr add db i get olx_tstr add sb i
   end
 end
 
-fn opr_copy_tok_to_name p ulong to void
-  sl = get olx_tslen p
-  put opr_nlen 0 sl
-  sb = mul p 64
-  for i ulong sl bound 64
-    put opr_name i get olx_tstr add sb i
-  end
-end
+text opr_m_call "function calls are not supported in V0"
+text opr_m_rparen "')'"
+text opr_m_neg "negative numbers are not supported in V0 (unsigned integers only)"
+text opr_m_not "'!' (logical not) is not supported in V0"
+text opr_m_block "blocks and records are not supported in V0 expressions"
+text opr_m_kw "keyword cannot be used inside an expression"
+text opr_m_value "expected a value but found '"
 
-fn opr_copy_tok_to_param p ulong to void
-  pl = get olx_tslen p
-  put opr_plen 0 pl
-  pb = mul p 64
-  for i ulong pl bound 64
-    put opr_param i get olx_tstr add pb i
-  end
-end
-
-fn opr_parse_primary to long
-  d = get opr_depth 0
-  if ge d 32
-    olx_set_err opr_e_depth get olx_tcol get opr_pos 0
-    ret -1
-  end
-  p = get opr_pos 0
-  k = get olx_tkind p
-  col = get olx_tcol p
+fn opr_parse_primary depth ulong to long
+  t = get opr_pos 0
+  k = get olx_tkind t
+  col = get olx_tcol t
   if eq k 2
-    u = opr_next
-    ni = opr_alloc 1 col
-    if lt ni 0
-      ret -1
+    rc = opr_alloc 1 col
+    if ne rc 0
+      ret rc
     end
-    put opr_nval ulong ni get olx_tval p
-    ret ni
+    put opr_nval ulong get opr_out 0 get olx_tval t
+    opr_next
+    ret 0
   end
   if or eq k 7 eq k 8
-    u = opr_next
-    ni = opr_alloc 2 col
-    if lt ni 0
-      ret -1
+    rc = opr_alloc 2 col
+    if ne rc 0
+      ret rc
     end
     if eq k 7
-      put opr_nval ulong ni 1
-    else
-      put opr_nval ulong ni 0
+      put opr_nval ulong get opr_out 0 1
     end
-    ret ni
+    opr_next
+    ret 0
   end
   if eq k 1
-    if opr_is_reserved p
-      olx_set_err opr_e_res col
-      ret -1
+    if eq opr_peek2 9
+      olx_failt col opr_m_call
+      ret -2
     end
-    u = opr_next
-    ni = opr_alloc 3 col
-    if lt ni 0
-      ret -1
+    if opr_is_reserved t
+      ret opr_reserved_msg t
     end
-    opr_copy_tok_to_node p ulong ni
-    ret ni
+    rc = opr_alloc 3 col
+    if ne rc 0
+      ret rc
+    end
+    opr_copy_name_node t ulong get opr_out 0
+    opr_next
+    ret 0
   end
-  if eq k 20
-    u = opr_next
-    put opr_depth 0 add d 1
-    inner = opr_parse_ascribe
-    put opr_depth 0 d
-    if lt inner 0
-      ret -1
+  if eq k 9
+    opr_next
+    rc = opr_parse_expr add depth 1
+    if ne rc 0
+      ret rc
     end
-    if ne opr_peek 21
-      olx_set_err opr_e_rparen get olx_tcol get opr_pos 0
-      ret -1
+    inner = get opr_out 0
+    if eq opr_peek 13
+      ccol = opr_peek_col
+      opr_next
+      rc = opr_parse_type
+      if ne rc 0
+        ret rc
+      end
+      rc = opr_alloc 5 ccol
+      if ne rc 0
+        ret rc
+      end
+      ni = ulong get opr_out 0
+      put opr_nlhs ni inner
+      put opr_nttag ni get opr_ty_tag 0
+      put opr_ntwid ni get opr_ty_wid 0
+      inner = long ni
     end
-    u2 = opr_next
-    ret inner
+    rc = opr_expect 10 opr_m_rparen
+    if ne rc 0
+      ret rc
+    end
+    put opr_out 0 inner
+    ret 0
   end
-  olx_set_err opr_e_prim col
+  if eq k 18
+    olx_failt col opr_m_neg
+    ret -2
+  end
+  if eq k 29
+    olx_failt col opr_m_not
+    ret -2
+  end
+  if eq k 11
+    olx_failt col opr_m_block
+    ret -2
+  end
+  if and ge k 3 le k 6
+    olx_failt col opr_m_kw
+    ret -1
+  end
+  olm_reset
+  olm_t opr_m_value
+  olm_tok k
+  olm_c 39
+  olm_cap 127
+  olx_fail col
   ret -1
 end
 
-fn opr_parse_mul to long
-  lhs = opr_parse_primary
-  if lt lhs 0
-    ret -1
+note precedence level of a token kind, lowest first; 5 = not a binary operator
+fn opr_level_of k ulong to ulong
+  if and ge k 23 le k 28
+    ret 0
   end
-  while or eq opr_peek 32 eq opr_peek 33 bound 128
-    p = get opr_pos 0
-    op = opr_next
-    rhs = opr_parse_primary
-    if lt rhs 0
-      ret -1
-    end
-    ni = opr_alloc 4 get olx_tcol p
-    if lt ni 0
-      ret -1
-    end
-    u = ulong ni
-    put opr_nop u op
-    put opr_nlhs u lhs
-    put opr_nrhs u rhs
-    lhs = ni
+  if eq k 22
+    ret 1
   end
-  ret lhs
+  if eq k 21
+    ret 2
+  end
+  if or eq k 17 eq k 18
+    ret 3
+  end
+  if or eq k 19 eq k 20
+    ret 4
+  end
+  ret 5
 end
 
-fn opr_parse_add to long
-  lhs = opr_parse_mul
-  if lt lhs 0
-    ret -1
+text opr_m_chain "comparisons cannot be chained; use parentheses"
+
+fn opr_parse_level level ulong depth ulong to long
+  if gt level 4
+    ret opr_parse_primary depth
   end
-  while or eq opr_peek 30 eq opr_peek 31 bound 128
-    p = get opr_pos 0
-    op = opr_next
-    rhs = opr_parse_mul
-    if lt rhs 0
+  rc = opr_parse_level add level 1 depth
+  if ne rc 0
+    ret rc
+  end
+  lhs = get opr_out 0
+  seen = ulong 0
+  while eq opr_level_of opr_peek level bound 256
+    ot = get opr_pos 0
+    opr_next
+    if and eq level 0 gt seen 0
+      olx_failt get olx_tcol ot opr_m_chain
       ret -1
     end
-    ni = opr_alloc 4 get olx_tcol p
-    if lt ni 0
-      ret -1
+    seen = add seen 1
+    rc = opr_parse_level add level 1 depth
+    if ne rc 0
+      ret rc
     end
-    u = ulong ni
-    put opr_nop u op
-    put opr_nlhs u lhs
-    put opr_nrhs u rhs
-    lhs = ni
+    rhs = get opr_out 0
+    rc = opr_alloc 4 get olx_tcol ot
+    if ne rc 0
+      ret rc
+    end
+    ni = ulong get opr_out 0
+    put opr_nop ni get olx_tkind ot
+    put opr_nlhs ni lhs
+    put opr_nrhs ni rhs
+    lhs = long ni
   end
-  ret lhs
+  put opr_out 0 lhs
+  ret 0
 end
 
-fn opr_parse_and to long
-  lhs = opr_parse_add
-  if lt lhs 0
-    ret -1
+text opr_m_deep "expression is nested too deeply for V0 (limit 32)"
+
+fn opr_parse_expr depth ulong to long
+  if gt depth OPR_MAX_DEPTH
+    olx_failt opr_peek_col opr_m_deep
+    ret -3
   end
-  while eq opr_peek 34 bound 128
-    p = get opr_pos 0
-    op = opr_next
-    rhs = opr_parse_add
-    if lt rhs 0
-      ret -1
-    end
-    ni = opr_alloc 4 get olx_tcol p
-    if lt ni 0
-      ret -1
-    end
-    u = ulong ni
-    put opr_nop u op
-    put opr_nlhs u lhs
-    put opr_nrhs u rhs
-    lhs = ni
-  end
-  ret lhs
+  ret opr_parse_level 0 depth
 end
 
-fn opr_parse_or to long
-  lhs = opr_parse_and
-  if lt lhs 0
-    ret -1
+text opr_m_unexp "unexpected '"
+text opr_m_after "' after the end of the statement"
+
+fn opr_expect_end to long
+  t = get opr_pos 0
+  if eq get olx_tkind t 0
+    ret 0
   end
-  while eq opr_peek 35 bound 128
-    p = get opr_pos 0
-    op = opr_next
-    rhs = opr_parse_and
-    if lt rhs 0
-      ret -1
-    end
-    ni = opr_alloc 4 get olx_tcol p
-    if lt ni 0
-      ret -1
-    end
-    u = ulong ni
-    put opr_nop u op
-    put opr_nlhs u lhs
-    put opr_nrhs u rhs
-    lhs = ni
-  end
-  ret lhs
+  olm_reset
+  olm_t opr_m_unexp
+  olm_found t
+  olm_t opr_m_after
+  olm_cap 127
+  olx_fail get olx_tcol t
+  ret -1
 end
 
-fn opr_parse_ascribe to long
-  e = opr_parse_or
-  if lt e 0
+text opr_m_name "expected a name"
+text opr_m_last "'_' is reserved for the last result"
+
+fn opr_check_binding_name t ulong to long
+  col = get olx_tcol t
+  if ne get olx_tkind t 1
+    olx_failt col opr_m_name
     ret -1
   end
-  if eq opr_peek 24
-    p = get opr_pos 0
-    u = opr_next
-    if lt opr_parse_type 0 0
-      ret -1
-    end
-    ni = opr_alloc 5 get olx_tcol p
-    if lt ni 0
-      ret -1
-    end
-    un = ulong ni
-    put opr_nlhs un e
-    put opr_nttag un get opr_lttag 0
-    put opr_ntwid un get opr_ltwid 0
-    ret ni
+  if olx_tok_eq t opr_w_us
+    olx_failt col opr_m_last
+    ret -1
   end
-  ret e
-end
-
-fn opr_skip_clause to long
-  while and ne opr_peek 0 and ne opr_peek 22 and ne opr_peek 5 ne opr_peek 6 bound 64
-    u = opr_next
+  if opr_is_reserved t
+    ret opr_reserved_msg t
   end
   ret 0
+end
+
+note ---- parse_clause: canonical contract text into opr_ctxt slot dst ----
+text opr_m_nobody "contract clause is not followed by the function body '{ ... }'"
+text opr_m_resonly "'result' can only appear in 'ensures'"
+text opr_m_cid " is not allowed in a contract (only the parameter, 'result', numbers and operators)"
+text opr_m_unbal "unbalanced ')' in contract clause"
+text opr_m_ctok " is not allowed in a contract clause"
+text opr_m_clong "contract clause is longer than 63 characters (V0 contract text limit)"
+text opr_m_cempty "empty contract clause"
+text opr_w_x "x"
+
+fn opr_tok_is_param t ulong to bool
+  pl = get opr_plen 0
+  if ne get olx_tslen t pl
+    ret false
+  end
+  b = mul t 64
+  for i ulong pl bound 64
+    if ne get olx_tstr add b i get opr_param i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn opr_pc_t s view uchar * to void
+  n = len s
+  for i ulong n bound 96
+    put opr_pc i get s i
+  end
+  put opr_pcl 0 n
+end
+
+note the piece of one clause token into opr_pc: 0, or the C return code
+fn opr_clause_piece t ulong allow_result bool to long
+  k = get olx_tkind t
+  col = get olx_tcol t
+  if eq k 1
+    if opr_tok_is_param t
+      opr_pc_t opr_w_x
+      ret 0
+    end
+    if olx_tok_eq t opr_w_result
+      if not allow_result
+        olx_failt col opr_m_resonly
+        ret -2
+      end
+      opr_pc_t opr_w_result
+      ret 0
+    end
+    olm_reset
+    olm_c 39
+    olm_tstr t
+    olm_c 39
+    olm_t opr_m_cid
+    olm_cap 159
+    olx_fail col
+    ret -2
+  end
+  olm_reset
+  if eq k 2
+    olm_u get olx_tval t
+  else
+    if or or eq k 7 eq k 8 and ge k 17 le k 29
+      olm_tok k
+    else
+      if or eq k 9 eq k 10
+        olm_tok k
+      else
+        olm_c 39
+        olm_tok k
+        olm_c 39
+        olm_t opr_m_ctok
+        olm_cap 127
+        olx_fail col
+        ret -1
+      end
+    end
+  end
+  n = get olm_n 0
+  for i ulong n bound 96
+    put opr_pc i get olm_b i
+  end
+  put opr_pcl 0 n
+  ret 0
+end
+
+note parse_clause state: text length, paren depth, first token, previous token was '('
+global opr_cl_len ulong 1
+global opr_cl_par ulong 1
+global opr_cl_first ulong 1
+global opr_cl_plp ulong 1
+
+note opr_pc appended to clause dst after sp spaces: 0, or -2 when the text would pass 63 bytes
+fn opr_clause_append dst ulong sp ulong scol ulong to long
+  ln = get opr_cl_len 0
+  pl = get opr_pcl 0
+  if ge add add ln sp pl 64
+    olx_failt scol opr_m_clong
+    ret -2
+  end
+  db = add mul dst 64 ln
+  if eq sp 1
+    put opr_ctxt db uchar 32
+    db = add db 1
+  end
+  for i ulong pl bound 96
+    put opr_ctxt add db i get opr_pc i
+  end
+  ln = add add ln sp pl
+  put opr_cl_len 0 ln
+  put opr_clen dst ln
+  ret 0
+end
+
+note one clause token t appended to clause dst (start column scol): 0 or the C return code
+fn opr_clause_tok t ulong allow_result bool dst ulong scol ulong to long
+  k = get olx_tkind t
+  if eq k 0
+    olx_failt get olx_tcol t opr_m_nobody
+    ret -1
+  end
+  if and eq k 10 eq get opr_cl_par 0 0
+    olx_failt get olx_tcol t opr_m_unbal
+    ret -1
+  end
+  rc = opr_clause_piece t allow_result
+  if ne rc 0
+    ret rc
+  end
+  if eq k 9
+    put opr_cl_par 0 add get opr_cl_par 0 1
+  end
+  if eq k 10
+    put opr_cl_par 0 sub get opr_cl_par 0 1
+  end
+  sp = ulong 0
+  if and and eq get opr_cl_first 0 0 eq get opr_cl_plp 0 0 ne k 10
+    sp = 1
+  end
+  rc2 = opr_clause_append dst sp scol
+  if ne rc2 0
+    ret rc2
+  end
+  put opr_cl_first 0 0
+  if eq k 9
+    put opr_cl_plp 0 1
+  else
+    put opr_cl_plp 0 0
+  end
+  ret 0
+end
+
+fn opr_parse_clause stop1 ulong stop2 ulong allow_result bool dst ulong to long
+  put opr_cl_len 0 0
+  put opr_cl_par 0 0
+  put opr_cl_first 0 1
+  put opr_cl_plp 0 0
+  put opr_clen dst 0
+  scol = opr_peek_col
+  while true bound 260
+    t = get opr_pos 0
+    k = get olx_tkind t
+    if eq get opr_cl_par 0 0
+      if or eq k stop1 eq k stop2
+        break
+      end
+    end
+    rc = opr_clause_tok t allow_result dst scol
+    if ne rc 0
+      ret rc
+    end
+    opr_next
+  end
+  if eq get opr_cl_first 0 1
+    olx_failt opr_peek_col opr_m_cempty
+    ret -1
+  end
+  ret 0
+end
+
+text opr_w_true "true"
+
+fn opr_clause_default dst ulong to void
+  db = mul dst 64
+  n = len opr_w_true
+  for i ulong n bound 8
+    put opr_ctxt add db i get opr_w_true i
+  end
+  put opr_clen dst n
+end
+
+note ---- parse_fn ----
+text opr_m_lp "'(' after the function name"
+text opr_m_one "V0 functions take exactly one parameter"
+text opr_m_same "parameter cannot share the function's name (recursion is not supported)"
+text opr_m_pcolon "':' and a parameter type"
+text opr_m_arrow "'->' and a result type"
+text opr_m_lbrace "'{' starting the function body"
+text opr_m_rbrace "'}' closing the function body"
+
+fn opr_param_is_name to bool
+  if ne get opr_plen 0 get opr_nlen 0
+    ret false
+  end
+  for i ulong get opr_plen 0 bound 64
+    if ne get opr_param i get opr_name i
+      ret false
+    end
+  end
+  ret true
 end
 
 fn opr_parse_fn to long
-  u = opr_next
-  p = get opr_pos 0
-  if ne opr_peek 1
-    olx_set_err opr_e_fn get olx_tcol p
-    ret -1
+  opr_next
+  nm = get opr_pos 0
+  rc = opr_check_binding_name nm
+  if ne rc 0
+    ret rc
   end
-  opr_copy_tok_to_name p
-  u = opr_next
-  if ne opr_peek 20
-    olx_set_err opr_e_fn get olx_tcol get opr_pos 0
-    ret -1
+  nl = get olx_tslen nm
+  put opr_nlen 0 nl
+  for i ulong nl bound 64
+    put opr_name i get olx_tstr add mul nm 64 i
   end
-  u = opr_next
-  pp = get opr_pos 0
-  if ne opr_peek 1
-    olx_set_err opr_e_fn get olx_tcol pp
-    ret -1
+  opr_next
+  rc = opr_expect 9 opr_m_lp
+  if ne rc 0
+    ret rc
   end
-  opr_copy_tok_to_param pp
-  u = opr_next
-  if ne opr_peek 24
-    olx_set_err opr_e_fn get olx_tcol get opr_pos 0
-    ret -1
+  if eq opr_peek 10
+    olx_failt opr_peek_col opr_m_one
+    ret -2
   end
-  u = opr_next
-  if lt opr_parse_type 2 0
-    ret -1
+  pn = get opr_pos 0
+  rc = opr_check_binding_name pn
+  if ne rc 0
+    ret rc
   end
-  if ne opr_peek 21
-    olx_set_err opr_e_fn get olx_tcol get opr_pos 0
-    ret -1
+  pl = get olx_tslen pn
+  put opr_plen 0 pl
+  for i ulong pl bound 64
+    put opr_param i get olx_tstr add mul pn 64 i
   end
-  u = opr_next
-  if ne opr_peek 26
-    olx_set_err opr_e_fn get olx_tcol get opr_pos 0
-    ret -1
+  if opr_param_is_name
+    olx_failt get olx_tcol pn opr_m_same
+    ret -2
   end
-  u = opr_next
-  if lt opr_parse_type 1 0
-    ret -1
+  opr_next
+  rc = opr_expect 13 opr_m_pcolon
+  if ne rc 0
+    ret rc
   end
+  rc = opr_parse_type
+  if ne rc 0
+    ret rc
+  end
+  put opr_pttag 0 get opr_ty_tag 0
+  put opr_ptwid 0 get opr_ty_wid 0
+  if eq opr_peek 14
+    olx_failt opr_peek_col opr_m_one
+    ret -2
+  end
+  rc = opr_expect 10 opr_m_rparen
+  if ne rc 0
+    ret rc
+  end
+  rc = opr_expect 15 opr_m_arrow
+  if ne rc 0
+    ret rc
+  end
+  rc = opr_parse_type
+  if ne rc 0
+    ret rc
+  end
+  put opr_rttag 0 get opr_ty_tag 0
+  put opr_rtwid 0 get opr_ty_wid 0
+  opr_clause_default 0
+  opr_clause_default 1
   if eq opr_peek 5
-    u = opr_next
-    s = opr_skip_clause
+    opr_next
+    rc = opr_parse_clause 6 11 false 0
+    if ne rc 0
+      ret rc
+    end
   end
   if eq opr_peek 6
-    u = opr_next
-    s = opr_skip_clause
+    opr_next
+    rc = opr_parse_clause 11 11 true 1
+    if ne rc 0
+      ret rc
+    end
   end
-  if ne opr_peek 22
-    olx_set_err opr_e_fn get olx_tcol get opr_pos 0
-    ret -1
+  rc = opr_expect 11 opr_m_lbrace
+  if ne rc 0
+    ret rc
   end
-  u = opr_next
-  body = opr_parse_ascribe
-  if lt body 0
-    ret -1
+  rc = opr_parse_expr 0
+  if ne rc 0
+    ret rc
   end
-  if ne opr_peek 23
-    olx_set_err opr_e_fn get olx_tcol get opr_pos 0
-    ret -1
+  put opr_root 0 get opr_out 0
+  rc = opr_expect 12 opr_m_rbrace
+  if ne rc 0
+    ret rc
   end
-  u = opr_next
-  if ne opr_peek 0
-    olx_set_err opr_e_extra get olx_tcol get opr_pos 0
-    ret -1
+  ret opr_expect_end
+end
+
+note ---- omega_language_parse over the lexed tokens ----
+text opr_m_letcolon "':' and a type (V0 bindings need an explicit type: let x: u64 = 7)"
+text opr_m_assign "'='"
+
+fn opr_parse_let to long
+  opr_next
+  nm = get opr_pos 0
+  rc = opr_check_binding_name nm
+  if ne rc 0
+    ret rc
   end
-  put opr_stmt 0 3
-  put opr_root 0 body
-  ret 0
+  nl = get olx_tslen nm
+  put opr_nlen 0 nl
+  for i ulong nl bound 64
+    put opr_name i get olx_tstr add mul nm 64 i
+  end
+  opr_next
+  rc = opr_expect 13 opr_m_letcolon
+  if ne rc 0
+    ret rc
+  end
+  rc = opr_parse_type
+  if ne rc 0
+    ret rc
+  end
+  put opr_lttag 0 get opr_ty_tag 0
+  put opr_ltwid 0 get opr_ty_wid 0
+  rc = opr_expect 16 opr_m_assign
+  if ne rc 0
+    ret rc
+  end
+  rc = opr_parse_expr 0
+  if ne rc 0
+    ret rc
+  end
+  put opr_root 0 get opr_out 0
+  ret opr_expect_end
 end
 
 fn opr_parse_line to long
   put opr_pos 0 0
-  put opr_depth 0 0
   put opr_ncnt 0 0
   put opr_stmt 0 0
   put opr_root 0 -1
+  put opr_nlen 0 0
+  put opr_plen 0 0
+  put opr_lttag 0 0
+  put opr_ltwid 0 0
+  put opr_pttag 0 0
+  put opr_ptwid 0 0
+  put opr_rttag 0 0
+  put opr_rtwid 0 0
+  put opr_clen 0 0
+  put opr_clen 1 0
   k = opr_peek
+  put opr_scol 0 opr_peek_col
   if eq k 0
-    put opr_stmt 0 0
     ret 0
   end
   if eq k 3
-    u = opr_next
-    p = get opr_pos 0
-    if ne opr_peek 1
-      olx_set_err opr_e_let get olx_tcol p
-      ret -1
-    end
-    if opr_is_reserved p
-      olx_set_err opr_e_res get olx_tcol p
-      ret -1
-    end
-    opr_copy_tok_to_name p
-    u = opr_next
-    if ne opr_peek 24
-      olx_set_err opr_e_let get olx_tcol get opr_pos 0
-      ret -1
-    end
-    u = opr_next
-    if lt opr_parse_type 0 0
-      ret -1
-    end
-    if ne opr_peek 27
-      olx_set_err opr_e_let get olx_tcol get opr_pos 0
-      ret -1
-    end
-    u = opr_next
-    rhs = opr_parse_ascribe
-    if lt rhs 0
-      ret -1
-    end
-    if ne opr_peek 0
-      olx_set_err opr_e_extra get olx_tcol get opr_pos 0
-      ret -1
-    end
     put opr_stmt 0 2
-    put opr_root 0 rhs
-    ret 0
+    ret opr_parse_let
   end
   if eq k 4
+    put opr_stmt 0 3
     ret opr_parse_fn
   end
-  e = opr_parse_ascribe
-  if lt e 0
-    ret -1
-  end
-  if ne opr_peek 0
-    olx_set_err opr_e_extra get olx_tcol get opr_pos 0
-    ret -1
-  end
   put opr_stmt 0 1
-  put opr_root 0 e
-  ret 0
+  rc = opr_parse_expr 0
+  if ne rc 0
+    ret rc
+  end
+  root = get opr_out 0
+  if eq opr_peek 13
+    ccol = opr_peek_col
+    opr_next
+    rc = opr_parse_type
+    if ne rc 0
+      ret rc
+    end
+    rc = opr_alloc 5 ccol
+    if ne rc 0
+      ret rc
+    end
+    ni = ulong get opr_out 0
+    put opr_nlhs ni root
+    put opr_nttag ni get opr_ty_tag 0
+    put opr_ntwid ni get opr_ty_wid 0
+    root = long ni
+  end
+  put opr_root 0 root
+  ret opr_expect_end
 end

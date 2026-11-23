@@ -1,654 +1,1053 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 Surface Language V0 lowerer & unary program realizer
-note (replaces src/language/omega_lower.c). Depends on visor.om, omega_lex.om, omega_parse.om.
+note Pure seeded OM-2 Surface Language V0 lowering: a faithful port of src/language/omega_lower.c.
+note Expressions and lets lower into the session graph through the visor.om builders (the
+note omega_build_* of omega_core.c) with the same dedupe, type rules, error texts, columns,
+note return codes and rollback. A fn lowers to an OmegaProgram through the visor_program.om
+note ports of omega_program_build_unary_op / omega_program_compose / omega_build_constraint_id /
+note omega_program_compute_id, so its program id, contract ids, body and realization are C's.
+note Depends on visor.om, visor_program.om, omega_lex.om, omega_parse.om.
+note
+note omega_language_eval_line is olw_eval_sbuf: the line is v_sbuf[0..n). On success the result
+note (OmegaLangResult) is olw_rkind (0 NONE, 1 BINDING, 2 EXPRESSION, 3 PROGRAM), olw_rid,
+note olw_rpidx and olw_rttag/olw_rtwid; the name is opr_name. Like C it does not touch `_`:
+note the console sets the last result. On failure olx_err holds the error.
+note Program slots 11..13 (visor_program.om) are the lowering's acc, step and tmp programs.
 
-text olw_e_ambig "integer literal requires type context"
-text olw_e_range "integer literal out of range for type"
-text olw_e_unk "unknown identifier"
-text olw_e_tmis "type mismatch"
-text olw_e_boolop "binary operator requires unsigned integer operands"
-text olw_e_div0 "division by zero"
-text olw_e_graph "graph full"
-text olw_e_bind "binding table full"
-text olw_e_prog "program table full"
-text olw_e_fnbody "fn body must be a linear chain of param ops with u32 constants"
-text olw_e_fntype "fn parameters and return type must be u64"
-text olw_prog_dom "omega.program.v2"
+const OLW_ACC ulong 11
+const OLW_STEP ulong 12
+const OLW_TMP ulong 13
+const OLW_MAX_STEPS ulong 32
 
-global olw_scnt ulong 1
-global olw_sop ulong 64
-global olw_simm ulong 64
-global olw_code uchar 256
-global olw_clen ulong 1
-global olw_val_out ulong 1
-global olw_val_is_bool ulong 1
-global olw_has_val ulong 1
+global olw_rkind ulong 1
+global olw_rid uchar 32
+global olw_rpidx long 1
+global olw_rttag ulong 1
+global olw_rtwid ulong 1
+global olw_rtid uchar 32
 
-fn olw_wmax w ulong to ulong
-  if eq w 8
-    ret 255
+note type_of_object result: tag, width, type object index
+global olw_to_tag ulong 1
+global olw_to_wid ulong 1
+global olw_to_tid ulong 1
+note resolve_name result: object index, tag, width
+global olw_rn_oi ulong 1
+global olw_rn_tag ulong 1
+global olw_rn_wid ulong 1
+note infer result
+global olw_if_tag ulong 1
+global olw_if_wid ulong 1
+note lower_expr result: object index, tag, width, type object index
+global olw_lo_oi ulong 1
+global olw_lo_tag ulong 1
+global olw_lo_wid ulong 1
+global olw_lo_tid ulong 1
+note lower_program steps, outermost first
+global olw_sop ulong 32
+global olw_simm ulong 32
+
+note ---- omega_language_type_text ----
+text olw_t_bool "bool"
+text olw_t_q "?"
+
+fn olm_type tag ulong wid ulong to void
+  if eq tag V_TY_BOOL
+    olm_t olw_t_bool
+    ret
   end
-  if eq w 16
-    ret 65535
+  if eq tag V_TY_UINT
+    if or or eq wid 8 eq wid 16 or eq wid 32 eq wid 64
+      olm_c 117
+      olm_u wid
+      ret
+    end
   end
-  if eq w 32
-    ret 4294967295
-  end
-  ret 0xffffffffffffffff
+  olm_t olw_t_q
 end
 
-fn olw_tok_to_op tk ulong to ulong
-  if eq tk 30
+fn olw_id_to_tmp idx ulong off ulong to void
+  pb = add mul idx V_MAX_PAYLOAD off
+  for i ulong 32
+    put v_tmp_id i get v_og_pay add pb i
+  end
+end
+
+fn olw_v0_width w ulong to bool
+  ret or or eq w 8 eq w 16 or eq w 32 eq w 64
+end
+
+note the TYPE object whose id is v_tmp_id as a V0 type: 0 with olw_to_*, or -1
+fn olw_type_obj to long
+  t = og_find_by_tmp
+  if lt t 0
+    ret -1
+  end
+  tu = ulong t
+  if or ne get v_og_kind tu V_KIND_TYPE ne get v_og_plen tu 44
+    ret -1
+  end
+  tb = mul tu V_MAX_PAYLOAD
+  tag = v_dec_u32le_pay tb 0
+  wid = v_dec_u16le_pay tb 4
+  if eq tag V_TY_BOOL
+    put olw_to_tag 0 V_TY_BOOL
+    put olw_to_wid 0 1
+  else
+    if not and eq tag V_TY_UINT olw_v0_width wid
+      ret -1
+    end
+    put olw_to_tag 0 V_TY_UINT
+    put olw_to_wid 0 wid
+  end
+  put olw_to_tid 0 tu
+  ret 0
+end
+
+note type_of_object: 0 with olw_to_*, or -1
+fn olw_type_of oi ulong to long
+  k = get v_og_kind oi
+  pl = get v_og_plen oi
+  if and eq k V_KIND_VALUE eq pl 98
+    olw_id_to_tmp oi 0
+  else
+    if and eq k V_KIND_OP eq pl 161
+      olw_id_to_tmp oi 0
+      op = og_find_by_tmp
+      if lt op 0
+        ret -1
+      end
+      ou = ulong op
+      if or ne get v_og_kind ou V_KIND_OP ne get v_og_plen ou 204
+        ret -1
+      end
+      olw_id_to_tmp ou 169
+    else
+      ret -1
+    end
+  end
+  ret olw_type_obj
+end
+
+fn olm_node_name ni ulong to void
+  n = get opr_nslen ni
+  b = mul ni 64
+  for i ulong n bound 64
+    olm_c ulong get opr_nstr add b i
+  end
+end
+
+fn olw_fail_named ni ulong pre view uchar * post view uchar * to long
+  olm_reset
+  olm_t pre
+  olm_node_name ni
+  olm_t post
+  olm_cap 199
+  olx_fail get opr_ncol ni
+  ret -2
+end
+
+text olw_m_unk1 "unknown name '"
+text olw_m_unk2 "' (define it first, e.g. let "
+text olw_m_unk3 ": u64 = 7)"
+text olw_m_q "'"
+text olw_m_prog "' is a program; using programs inside expressions is not supported in V0"
+text olw_m_notval "' is not a value (only integer and bool values can be used in V0)"
+text olw_m_notv0 "' does not name a V0 integer or bool value in this graph"
+
+note resolve_name: 0 with olw_rn_*, or the C return code
+fn olw_resolve ni ulong to long
+  nl = get opr_nslen ni
+  nb = mul ni 64
+  kind = ulong 0
+  found = false
+  if and eq nl 1 eq get opr_nstr nb uchar 95
+    if ne get v_has_last 0 0
+      found = true
+      kind = get v_last_kind 0
+      for i ulong 32
+        put v_tmp_id i get v_last_id i
+      end
+    end
+  else
+    for i ulong nl bound 64
+      put v_sbuf i get opr_nstr add nb i
+    end
+    bi = vs_bind_find_sbuf nl
+    if ge bi 0
+      bu = ulong bi
+      found = true
+      kind = get v_bind_kind bu
+      ib = mul bu 32
+      for i ulong 32
+        put v_tmp_id i get v_bind_id add ib i
+      end
+    end
+  end
+  if not found
+    olm_reset
+    olm_t olw_m_unk1
+    olm_node_name ni
+    olm_t olw_m_unk2
+    olm_node_name ni
+    olm_t olw_m_unk3
+    olm_cap 199
+    olx_fail get opr_ncol ni
+    ret -2
+  end
+  if eq kind V_BIND_PROGRAM
+    ret olw_fail_named ni olw_m_q olw_m_prog
+  end
+  if ne kind V_BIND_OBJECT
+    ret olw_fail_named ni olw_m_q olw_m_notval
+  end
+  oi = og_find_by_tmp
+  if lt oi 0
+    ret olw_fail_named ni olw_m_q olw_m_notv0
+  end
+  if ne olw_type_of ulong oi 0
+    ret olw_fail_named ni olw_m_q olw_m_notv0
+  end
+  put olw_rn_oi 0 ulong oi
+  put olw_rn_tag 0 get olw_to_tag 0
+  put olw_rn_wid 0 get olw_to_wid 0
+  ret 0
+end
+
+fn olw_is_cmp op ulong to bool
+  ret and ge op 23 le op 28
+end
+
+text olw_m_cmp "comparisons are not supported in V0 expressions (the existing builder would type the result as the operand type, not bool)"
+text olw_m_node "internal: unknown syntax node"
+
+note infer: 1 type known (olw_if_*), 0 only untyped literals, < 0 error
+fn olw_infer ni ulong to long
+  k = get opr_nkind ni
+  if eq k 1
+    ret 0
+  end
+  if eq k 2
+    put olw_if_tag 0 V_TY_BOOL
+    put olw_if_wid 0 1
+    ret 1
+  end
+  if eq k 5
+    put olw_if_tag 0 get opr_nttag ni
+    put olw_if_wid 0 get opr_ntwid ni
+    ret 1
+  end
+  if eq k 3
+    rc = olw_resolve ni
+    if ne rc 0
+      ret rc
+    end
+    put olw_if_tag 0 get olw_rn_tag 0
+    put olw_if_wid 0 get olw_rn_wid 0
+    ret 1
+  end
+  if eq k 4
+    if olw_is_cmp get opr_nop ni
+      olx_failt get opr_ncol ni olw_m_cmp
+      ret -2
+    end
+    r = olw_infer ulong get opr_nlhs ni
+    if ne r 0
+      ret r
+    end
+    ret olw_infer ulong get opr_nrhs ni
+  end
+  olx_failt get opr_ncol ni olw_m_node
+  ret -1
+end
+
+fn olw_opcode tk ulong to ulong
+  if eq tk 17
     ret V_OP_ADD
   end
-  if eq tk 31
+  if eq tk 18
     ret V_OP_SUB
   end
-  if eq tk 32
+  if eq tk 19
     ret V_OP_MUL
   end
-  if eq tk 33
+  if eq tk 20
     ret V_OP_DIV
   end
-  if eq tk 34
+  if eq tk 21
     ret V_OP_AND
   end
-  if eq tk 35
+  if eq tk 22
     ret V_OP_OR
   end
   ret 0
 end
 
-fn olw_obj_type_info idx ulong to ulong
-  note returns (tag << 16) | width for VALUE, OPERATION, APPLY
-  k = get v_og_kind idx
-  pb = mul idx V_MAX_PAYLOAD
-  if eq k V_KIND_VALUE
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add pb i
-    end
-    ti = og_find_by_tmp
-    if lt ti 0
-      ret 0
-    end
-    tpb = mul ulong ti V_MAX_PAYLOAD
-    tag = v_dec_u32le_pay tpb 0
-    wid = v_dec_u16le_pay tpb 4
-    if eq tag V_TY_BOOL
-      wid = 1
-    end
-    ret or shl tag 16 wid
+text olw_m_is " is "
+text olw_m_but " but "
+text olw_m_req " is required here (V0 never converts between types)"
+text olw_m_thisval "this value"
+text olw_m_thisann "this annotation"
+
+note mismatch(col, what, have, want); the what is already in olm
+fn olw_mismatch col ulong htag ulong hwid ulong wtag ulong wwid ulong to long
+  olm_t olw_m_is
+  olm_type htag hwid
+  olm_t olw_m_but
+  olm_type wtag wwid
+  olm_t olw_m_req
+  olm_cap 199
+  olx_fail col
+  ret -2
+end
+
+text olw_m_full "the session graph is full (256 objects); use `clear` to start over"
+
+fn olw_capacity col ulong to long
+  olx_failt col olw_m_full
+  ret -3
+end
+
+note build_type: the deduplicated type object index, or -1
+fn olw_build_type tag ulong wid ulong to long
+  if eq tag V_TY_BOOL
+    ret og_dedupe og_build_type_bool
   end
-  if eq k V_KIND_OP
-    pl = get v_og_plen idx
-    if ge pl 204
-      for i ulong 32
-        put v_tmp_id i get v_og_pay add add pb 169 i
-      end
-      ti = og_find_by_tmp
-      if lt ti 0
-        ret 0
-      end
-      tpb = mul ulong ti V_MAX_PAYLOAD
-      tag = v_dec_u32le_pay tpb 0
-      wid = v_dec_u16le_pay tpb 4
-      ret or shl tag 16 wid
+  ret og_dedupe og_build_type_uint wid
+end
+
+note literal_value: the value of an (ascribed) INT node, or -1 in olw_lit_ok
+global olw_lit_ok ulong 1
+fn olw_literal ni ulong to ulong
+  n = ni
+  if eq get opr_nkind n 5
+    n = ulong get opr_nlhs n
+  end
+  if ne get opr_nkind n 1
+    put olw_lit_ok 0 0
+    ret 0
+  end
+  put olw_lit_ok 0 1
+  ret get opr_nval n
+end
+
+text olw_m_ambig "ambiguous width: a bare number has no type; write it as `7: u64` or `(7: u64)`"
+text olw_m_numbool "a number is used where a bool is required"
+text olw_m_lit "literal "
+text olw_m_fit " does not fit in "
+text olw_m_vanish "internal: binding type vanished"
+text olw_m_ambig2 "ambiguous width: no operand has a type; write e.g. `(1: u64) + 2`"
+text olw_m_onbool " on bool is not supported in V0 (integers only)"
+text olw_m_div0 "division by the constant 0 is undefined"
+text olw_m_unkop "internal: unknown operator"
+
+fn olw_set_lo oi ulong tag ulong wid ulong tid ulong to long
+  put olw_lo_oi 0 oi
+  put olw_lo_tag 0 tag
+  put olw_lo_wid 0 wid
+  put olw_lo_tid 0 tid
+  ret 0
+end
+
+fn olw_lower_int ni ulong has_exp bool etag ulong ewid ulong to long
+  col = get opr_ncol ni
+  if not has_exp
+    olx_failt col olw_m_ambig
+    ret -2
+  end
+  if ne etag V_TY_UINT
+    olx_failt col olw_m_numbool
+    ret -2
+  end
+  v = get opr_nval ni
+  if lt ewid 64
+    if ne shr v ewid 0
+      olm_reset
+      olm_t olw_m_lit
+      olm_u v
+      olm_t olw_m_fit
+      olm_type etag ewid
+      olm_cap 199
+      olx_fail col
+      ret -2
     end
-    if ge pl 161
-      for i ulong 32
-        put v_tmp_id i get v_og_pay add pb i
-      end
-      oi = og_find_by_tmp
-      if lt oi 0
-        ret 0
-      end
-      ret olw_obj_type_info ulong oi
+  end
+  t = olw_build_type etag ewid
+  if lt t 0
+    ret olw_capacity col
+  end
+  o = og_dedupe og_build_val_uint ulong t ewid v
+  if lt o 0
+    ret olw_capacity col
+  end
+  ret olw_set_lo ulong o etag ewid ulong t
+end
+
+fn olw_lower_bool ni ulong has_exp bool etag ulong ewid ulong to long
+  col = get opr_ncol ni
+  if has_exp
+    if or ne etag V_TY_BOOL ne ewid 1
+      olm_reset
+      olm_t olw_m_thisval
+      ret olw_mismatch col V_TY_BOOL 1 etag ewid
+    end
+  end
+  t = olw_build_type V_TY_BOOL 1
+  if lt t 0
+    ret olw_capacity col
+  end
+  o = og_dedupe og_build_val_bool ulong t get opr_nval ni
+  if lt o 0
+    ret olw_capacity col
+  end
+  ret olw_set_lo ulong o V_TY_BOOL 1 ulong t
+end
+
+fn olw_lower_name ni ulong has_exp bool etag ulong ewid ulong to long
+  col = get opr_ncol ni
+  rc = olw_resolve ni
+  if ne rc 0
+    ret rc
+  end
+  tag = get olw_rn_tag 0
+  wid = get olw_rn_wid 0
+  if has_exp
+    if or ne etag tag ne ewid wid
+      olm_reset
+      olm_c 39
+      olm_node_name ni
+      olm_c 39
+      ret olw_mismatch col tag wid etag ewid
+    end
+  end
+  oi = get olw_rn_oi 0
+  if ne olw_type_of oi 0
+    olx_failt col olw_m_vanish
+    ret -2
+  end
+  ret olw_set_lo oi get olw_to_tag 0 get olw_to_wid 0 get olw_to_tid 0
+end
+
+note the operand type of a BINARY node: 0 with it in olw_if_*, or the C return code
+fn olw_bin_type ni ulong has_exp bool etag ulong ewid ulong to long
+  col = get opr_ncol ni
+  op = get opr_nop ni
+  if olw_is_cmp op
+    olx_failt col olw_m_cmp
+    ret -2
+  end
+  if eq olw_opcode op 0
+    olx_failt col olw_m_unkop
+    ret -1
+  end
+  if has_exp
+    put olw_if_tag 0 etag
+    put olw_if_wid 0 ewid
+  else
+    r = olw_infer ni
+    if lt r 0
+      ret r
+    end
+    if eq r 0
+      olx_failt col olw_m_ambig2
+      ret -2
+    end
+  end
+  if ne get olw_if_tag 0 V_TY_UINT
+    olm_reset
+    olm_c 39
+    olm_tok op
+    olm_c 39
+    olm_t olw_m_onbool
+    olm_cap 199
+    olx_fail col
+    ret -2
+  end
+  if eq olw_opcode op V_OP_DIV
+    dv = olw_literal ulong get opr_nrhs ni
+    if and eq get olw_lit_ok 0 1 eq dv 0
+      olx_failt col olw_m_div0
+      ret -2
     end
   end
   ret 0
 end
 
-fn olw_check_type info ulong etag ulong ewid ulong to bool
-  if eq etag 0
-    ret true
-  end
-  if ne shr info 16 etag
-    ret false
-  end
-  if ne and info 0xffff ewid
-    ret false
-  end
-  ret true
-end
-
-fn olw_lower_name ni ulong etag ulong ewid ulong col ulong to long
-  nl = get opr_nslen ni
-  nb = mul ni 64
-  if and eq nl 1 eq get opr_nstr nb uchar 95
-    if eq get v_has_last 0 0
-      olx_set_err olw_e_unk col
-      ret -1
-    end
-    if ne get v_last_kind 0 V_BIND_OBJECT
-      olx_set_err olw_e_tmis col
-      ret -1
-    end
-    for i ulong 32
-      put v_tmp_id i get v_last_id i
-    end
-    oi = og_find_by_tmp
-    if lt oi 0
-      olx_set_err olw_e_unk col
-      ret -1
-    end
-    if not olw_check_type olw_obj_type_info ulong oi etag ewid
-      olx_set_err olw_e_tmis col
-      ret -1
-    end
-    ret oi
-  end
-  for i ulong nl bound 64
-    put v_sbuf i get opr_nstr add nb i
-  end
-  bi = vs_bind_find_sbuf nl
-  if lt bi 0
-    olx_set_err olw_e_unk col
-    ret -1
-  end
-  bu = ulong bi
-  if ne get v_bind_kind bu V_BIND_OBJECT
-    olx_set_err olw_e_tmis col
-    ret -1
-  end
-  ib = mul bu 32
-  for i ulong 32
-    put v_tmp_id i get v_bind_id add ib i
-  end
-  oi = og_find_by_tmp
-  if lt oi 0
-    olx_set_err olw_e_unk col
-    ret -1
-  end
-  if not olw_check_type olw_obj_type_info ulong oi etag ewid
-    olx_set_err olw_e_tmis col
-    ret -1
-  end
-  ret oi
-end
-
-fn olw_is_zero_lit ri ulong to bool
-  if ne get opr_nkind ri 1
-    ret false
-  end
-  ret eq get opr_nval ri 0
-end
-
-fn olw_lower_bin ni ulong etag ulong ewid ulong col ulong to long
-  lo = olw_lower_expr ulong get opr_nlhs ni etag ewid
-  if lt lo 0
-    ret -1
-  end
-  linfo = olw_obj_type_info ulong lo
-  if ne shr linfo 16 V_TY_UINT
-    olx_set_err olw_e_boolop col
-    ret -1
-  end
-  lwid = and linfo 0xffff
-  ri = ulong get opr_nrhs ni
-  ro = olw_lower_expr ri V_TY_UINT lwid
-  if lt ro 0
-    ret -1
-  end
-  opc = olw_tok_to_op get opr_nop ni
-  if eq opc V_OP_DIV
-    if olw_is_zero_lit ri
-      olx_set_err olw_e_div0 col
-      ret -1
-    end
-  end
-  ti = og_dedupe og_build_type_uint lwid
-  if lt ti 0
-    olx_set_err olw_e_graph col
-    ret -1
-  end
-  opi = og_dedupe og_build_op_binary opc V_OVF_WRAP ulong ti
-  if lt opi 0
-    olx_set_err olw_e_graph col
-    ret -1
-  end
-  ret og_dedupe og_build_apply ulong opi ulong lo ulong ro
-end
-
-fn olw_lower_expr ni ulong etag ulong ewid ulong to long
-  k = get opr_nkind ni
+note build TYPE, OPERATION and APPLY for the BINARY node over operands lid, rid
+fn olw_bin_build ni ulong tag ulong wid ulong lid ulong rid ulong to long
   col = get opr_ncol ni
+  t = olw_build_type tag wid
+  if lt t 0
+    ret olw_capacity col
+  end
+  o = og_dedupe og_build_op_binary olw_opcode get opr_nop ni V_OVF_WRAP ulong t
+  if lt o 0
+    ret olw_capacity col
+  end
+  a = og_dedupe og_build_apply ulong o lid rid
+  if lt a 0
+    ret olw_capacity col
+  end
+  ret olw_set_lo ulong a tag wid ulong t
+end
+
+fn olw_lower_bin ni ulong has_exp bool etag ulong ewid ulong to long
+  rc = olw_bin_type ni has_exp etag ewid
+  if ne rc 0
+    ret rc
+  end
+  tag = get olw_if_tag 0
+  wid = get olw_if_wid 0
+  rc = olw_lower_expr ulong get opr_nlhs ni true tag wid
+  if ne rc 0
+    ret rc
+  end
+  lid = get olw_lo_oi 0
+  rc = olw_lower_expr ulong get opr_nrhs ni true tag wid
+  if ne rc 0
+    ret rc
+  end
+  ret olw_bin_build ni tag wid lid get olw_lo_oi 0
+end
+
+fn olw_lower_expr ni ulong has_exp bool etag ulong ewid ulong to long
+  k = get opr_nkind ni
   if eq k 1
-    if ne etag V_TY_UINT
-      olx_set_err olw_e_ambig col
-      ret -1
-    end
-    v = get opr_nval ni
-    if gt v olw_wmax ewid
-      olx_set_err olw_e_range col
-      ret -1
-    end
-    ti = og_dedupe og_build_type_uint ewid
-    if lt ti 0
-      olx_set_err olw_e_graph col
-      ret -1
-    end
-    ret og_dedupe og_build_val_uint ulong ti ewid v
+    ret olw_lower_int ni has_exp etag ewid
   end
   if eq k 2
-    if and ne etag 0 ne etag V_TY_BOOL
-      olx_set_err olw_e_tmis col
-      ret -1
-    end
-    ti = og_dedupe og_build_type_bool
-    if lt ti 0
-      olx_set_err olw_e_graph col
-      ret -1
-    end
-    ret og_dedupe og_build_val_bool ulong ti get opr_nval ni
+    ret olw_lower_bool ni has_exp etag ewid
   end
   if eq k 3
-    ret olw_lower_name ni etag ewid col
+    ret olw_lower_name ni has_exp etag ewid
   end
   if eq k 5
     tt = get opr_nttag ni
     tw = get opr_ntwid ni
-    if and ne etag 0 or ne tt etag ne tw ewid
-      olx_set_err olw_e_tmis col
-      ret -1
+    if has_exp
+      if or ne etag tt ne ewid tw
+        olm_reset
+        olm_t olw_m_thisann
+        ret olw_mismatch get opr_ncol ni tt tw etag ewid
+      end
     end
-    ret olw_lower_expr ulong get opr_nlhs ni tt tw
+    ret olw_lower_expr ulong get opr_nlhs ni true tt tw
   end
   if eq k 4
-    ret olw_lower_bin ni etag ewid col
+    ret olw_lower_bin ni has_exp etag ewid
   end
-  olx_set_err olw_e_tmis col
+  olx_failt get opr_ncol ni olw_m_node
   ret -1
 end
 
-fn olw_put_insn w ulong to void
-  p = get olw_clen 0
-  if ge add p 4 256
-    ret
+note omega_language_lower_to_graph for an EXPR or LET: 0 with olw_rid / olw_rttag / olw_rtwid
+fn olw_lower_to_graph to long
+  saved = get v_og_cnt 0
+  st = get opr_stmt 0
+  rc = long 0
+  if eq st 2
+    rc = olw_lower_expr ulong get opr_root 0 true get opr_lttag 0 get opr_ltwid 0
+  else
+    rc = olw_lower_expr ulong get opr_root 0 false 0 0
   end
-  put olw_code p uchar and w 0xff
-  put olw_code add p 1 uchar and shr w 8 0xff
-  put olw_code add p 2 uchar and shr w 16 0xff
-  put olw_code add p 3 uchar and shr w 24 0xff
-  put olw_clen 0 add p 4
+  if ne rc 0
+    put v_og_cnt 0 saved
+    ret rc
+  end
+  ob = mul get olw_lo_oi 0 32
+  tb = mul get olw_lo_tid 0 32
+  for i ulong 32
+    put olw_rid i get v_og_id add ob i
+    put olw_rtid i get v_og_id add tb i
+  end
+  put olw_rttag 0 get olw_lo_tag 0
+  put olw_rtwid 0 get olw_lo_wid 0
+  if eq st 2
+    put olw_rkind 0 1
+  else
+    put olw_rkind 0 2
+  end
+  ret 0
 end
 
-fn olw_emit_mov_x1 imm ulong to void
-  lo = and imm 0xffff
-  hi = and shr imm 16 0xffff
-  olw_put_insn or 0xd2800001 shl lo 5
-  if ne hi 0
-    olw_put_insn or 0xf2a00001 shl hi 5
-  end
+note ---- omega_language_lower_program ----
+text olw_m_fnty "V0 functions must be (x: u64) -> u64 (the existing program model is fixed at 64-bit)"
+text olw_m_allu64 "inside a V0 function everything is u64"
+text olw_m_fncmp "comparisons are not supported in V0 function bodies"
+text olw_m_fndiv "'/' is not in the program model's operation set (+ - * & |)"
+text olw_m_chain "function body must be a chain like (x * 2) + 1: each step applies + - * & | to the running value and one constant"
+text olw_m_wide1 "constant "
+text olw_m_wide2 " is wider than 32 bits; the program builder can only load 32-bit constants"
+text olw_m_steps "function body has more than 32 steps"
+text olw_m_rec "recursion is not supported in V0"
+text olw_m_param "function body must start from its parameter and use only constants (no other names, no constant-only bodies)"
+text olw_m_noop "function body must apply at least one operation to the parameter"
+text olw_m_first "program builder rejected the first step"
+text olw_m_step "program builder rejected a step"
+text olw_m_comp "program composition failed: "
+text olw_m_ids "could not compute the program's ids"
+text olw_w_overflow "overflow"
+
+fn olw_is_u64 tag ulong wid ulong to bool
+  ret and eq tag V_TY_UINT eq wid 64
 end
 
-fn olw_emit_prog_code to void
-  put olw_clen 0 0
-  sc = get olw_scnt 0
-  for i ulong sc bound 64
-    opc = get olw_sop i
-    imm = get olw_simm i
-    olw_emit_mov_x1 imm
-    if eq opc V_OP_ADD
-      olw_put_insn 0x8b010000
-    else
-      if eq opc V_OP_SUB
-        olw_put_insn 0xcb010000
-      else
-        if eq opc V_OP_MUL
-          olw_put_insn 0x9b017c00
-        else
-          if eq opc V_OP_AND
-            olw_put_insn 0x8a010000
-          else
-            if eq opc V_OP_OR
-              olw_put_insn 0xaa010000
-            end
-          end
-        end
-      end
-    end
-  end
-  olw_put_insn 0xd65f03c0
-end
-
-fn olw_node_is_param ni ulong to bool
+fn olw_node_named ni ulong name bool to bool
   if ne get opr_nkind ni 3
     ret false
   end
-  pl = get opr_plen 0
-  if ne get opr_nslen ni pl
+  n = get opr_nlen 0
+  if not name
+    n = get opr_plen 0
+  end
+  if ne get opr_nslen ni n
     ret false
   end
-  nb = mul ni 64
-  for i ulong pl bound 64
-    if ne get opr_nstr add nb i get opr_param i
+  b = mul ni 64
+  for i ulong n bound 64
+    c = get opr_name i
+    if not name
+      c = get opr_param i
+    end
+    if ne get opr_nstr add b i c
       ret false
     end
   end
   ret true
 end
 
-fn olw_collect_steps ni ulong sc ulong to long
-  if ge sc 32
-    ret -1
+fn olw_ascribed_not_u64 ni ulong to bool
+  if ne get opr_nkind ni 5
+    ret false
   end
-  if olw_node_is_param ni
-    ret long sc
+  ret not olw_is_u64 get opr_nttag ni get opr_ntwid ni
+end
+
+fn vsb_fn_name to void
+  vsb_reset
+  for i ulong get opr_nlen 0 bound 64
+    vsb_c ulong get opr_name i
   end
-  if ne get opr_nkind ni 4
-    ret -1
+end
+
+fn vsb_clause k ulong to void
+  vsb_reset
+  b = mul k 64
+  for i ulong get opr_clen k bound 64
+    vsb_c ulong get opr_ctxt add b i
   end
-  opc = olw_tok_to_op get opr_nop ni
-  if or eq opc 0 eq opc V_OP_DIV
-    ret -1
+end
+
+note why holds "overflow" (strstr)
+fn olw_why_overflow to bool
+  n = get vpg_wl 0
+  m = len olw_w_overflow
+  if lt n m
+    ret false
   end
-  li = ulong get opr_nlhs ni
-  ri = ulong get opr_nrhs ni
-  if eq get opr_nkind ri 1
-    imm = get opr_nval ri
-    if gt imm 0xffffffff
-      ret -1
-    end
-    put olw_sop sc opc
-    put olw_simm sc imm
-    ret olw_collect_steps li add sc 1
-  end
-  if eq get opr_nkind li 1
-    if or eq opc V_OP_ADD or eq opc V_OP_MUL or eq opc V_OP_AND eq opc V_OP_OR
-      imm = get opr_nval li
-      if gt imm 0xffffffff
-        ret -1
+  lim = add sub n m 1
+  for s ulong lim bound 512
+    ok = true
+    for j ulong m bound 16
+      if ne get vpg_why add s j get olw_w_overflow j
+        ok = false
+        break
       end
-      put olw_sop sc opc
-      put olw_simm sc imm
-      ret olw_collect_steps ri add sc 1
+    end
+    if ok
+      ret true
     end
   end
-  ret -1
+  ret false
 end
 
-fn olw_hash_prog_id sc ulong to void
-  dl = len olw_prog_dom
-  for i ulong dl bound 32
-    put v_sha_in i get olw_prog_dom i
+note the chain walk of lower_program: the step count, or the C return code
+fn olw_collect to long
+  idx = ulong get opr_root 0
+  count = ulong 0
+  while true bound 300
+    k = get opr_nkind idx
+    col = get opr_ncol idx
+    if eq k 5
+      if not olw_is_u64 get opr_nttag idx get opr_ntwid idx
+        olx_failt col olw_m_allu64
+        ret -2
+      end
+      idx = ulong get opr_nlhs idx
+      continue
+    end
+    if ne k 4
+      break
+    end
+    op = get opr_nop idx
+    if olw_is_cmp op
+      olx_failt col olw_m_fncmp
+      ret -2
+    end
+    if eq op 20
+      olx_failt col olw_m_fndiv
+      ret -2
+    end
+    opc = olw_opcode op
+    comm = or or eq opc V_OP_ADD eq opc V_OP_MUL or eq opc V_OP_AND eq opc V_OP_OR
+    li = ulong get opr_nlhs idx
+    ri = ulong get opr_nrhs idx
+    if or olw_ascribed_not_u64 ri olw_ascribed_not_u64 li
+      olx_failt col olw_m_allu64
+      ret -2
+    end
+    nx = ulong 0
+    imm = olw_literal ri
+    if eq get olw_lit_ok 0 1
+      nx = li
+    else
+      ok = false
+      if comm
+        imm = olw_literal li
+        ok = eq get olw_lit_ok 0 1
+      end
+      if not ok
+        olx_failt col olw_m_chain
+        ret -2
+      end
+      nx = ri
+    end
+    if gt imm 0xffffffff
+      olm_reset
+      olm_t olw_m_wide1
+      olm_u imm
+      olm_t olw_m_wide2
+      olm_cap 199
+      olx_fail col
+      ret -2
+    end
+    if ge count OLW_MAX_STEPS
+      olx_failt col olw_m_steps
+      ret -3
+    end
+    put olw_sop count opc
+    put olw_simm count imm
+    count = add count 1
+    idx = nx
   end
-  p = dl
-  put v_sha_in p uchar and sc 0xff
-  p = add p 1
-  for i ulong sc bound 32
-    put v_sha_in p uchar and get olw_sop i 0xff
-    p = add p 1
-    im = get olw_simm i
-    put v_sha_in p uchar and im 0xff
-    put v_sha_in add p 1 uchar and shr im 8 0xff
-    put v_sha_in add p 2 uchar and shr im 16 0xff
-    put v_sha_in add p 3 uchar and shr im 24 0xff
-    p = add p 4
+  lcol = get opr_ncol idx
+  if olw_node_named idx true
+    olx_failt lcol olw_m_rec
+    ret -2
   end
-  sha256_hash p
+  if not olw_node_named idx false
+    olx_failt lcol olw_m_param
+    ret -2
+  end
+  if eq count 0
+    olx_failt lcol olw_m_noop
+    ret -2
+  end
+  ret long count
 end
 
-fn olw_store_prog pc ulong sc ulong to void
+note lower_program into program slot OLW_ACC: 0 or the C return code
+fn olw_lower_program to long
+  scol = get opr_scol 0
+  if or not olw_is_u64 get opr_pttag 0 get opr_ptwid 0 not olw_is_u64 get opr_rttag 0 get opr_rtwid 0
+    olx_failt scol olw_m_fnty
+    ret -2
+  end
+  cr = olw_collect
+  if lt cr 0
+    ret cr
+  end
+  count = ulong cr
+  last = sub count 1
+  vsb_fn_name
+  if ne vpg_build_unary_vsb OLW_ACC get olw_sop last get olw_simm last 0
+    olx_failt scol olw_m_first
+    ret -2
+  end
+  i = last
+  while gt i 0 bound 40
+    i = sub i 1
+    vsb_fn_name
+    if ne vpg_build_unary_vsb OLW_STEP get olw_sop i get olw_simm i 0
+      olx_failt scol olw_m_step
+      ret -2
+    end
+    if ne vpg_compose OLW_ACC OLW_STEP OLW_TMP 160 0
+      olm_reset
+      olm_t olw_m_comp
+      wl = get vpg_wl 0
+      if gt wl 150
+        wl = 150
+      end
+      for j ulong wl bound 160
+        olm_c ulong get vpg_why j
+      end
+      olm_cap 199
+      olx_fail scol
+      if olw_why_overflow
+        ret -3
+      end
+      ret -2
+    end
+    vpg_copy OLW_ACC OLW_TMP
+  end
+  vsb_fn_name
+  vpg_set_txt OLW_ACC 0 63
+  vsb_clause 0
+  vpg_set_txt OLW_ACC 1 63
+  u1 = vpg_constraint_id OLW_ACC 1 V_CONST_PRECONDITION
+  vsb_clause 1
+  vpg_set_txt OLW_ACC 2 63
+  u2 = vpg_constraint_id OLW_ACC 2 V_CONST_POSTCONDITION
+  vpg_p OLW_ACC VPG_NLEAF 0
+  if or ne u1 0 ne u2 0
+    olx_failt scol olw_m_ids
+    ret -2
+  end
+  if ne vpg_compute_id OLW_ACC 0
+    olx_failt scol olw_m_ids
+    ret -2
+  end
+  ret 0
+end
+
+note ---- the session program table (visor_program_add of the C OmegaProgram) ----
+fn olw_pid_eq pc ulong to bool
+  pb = vpg_ib OLW_ACC 0
+  ib = mul pc 32
+  for i ulong 32
+    if ne get v_prog_id add ib i get vpg_ids add pb i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn olw_code_eq pc ulong to bool
+  cl = vro_g OLW_ACC VRO_CLEN
+  if ne get v_prog_clen pc cl
+    ret false
+  end
+  cb = mul pc 4096
+  ab = mul OLW_ACC 4096
+  for i ulong cl bound 4096
+    if ne get v_prog_code add cb i get vro_code add ab i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn olw_prog_store_ids pc ulong to void
   nl = get opr_nlen 0
   put v_prog_nlen pc nl
   nb = mul pc 64
+  for i ulong 64
+    put v_prog_name add nb i uchar 0
+  end
   for i ulong nl bound 64
     put v_prog_name add nb i get opr_name i
   end
   ib = mul pc 32
+  pb = vpg_ib OLW_ACC 0
+  qb = vpg_ib OLW_ACC 1
+  ob = vpg_ib OLW_ACC 2
+  rb = vro_ib OLW_ACC VRO_K_RID
   for i ulong 32
-    put v_prog_id add ib i get v_sha_out i
+    put v_prog_id add ib i get vpg_ids add pb i
+    put v_prog_preid add ib i get vpg_ids add qb i
+    put v_prog_postid add ib i get vpg_ids add ob i
+    put v_prog_real_id add ib i get vro_id add rb i
   end
-  put v_prog_scnt pc sc
-  sb = mul pc 64
-  for i ulong sc bound 64
-    put v_prog_sop add sb i get olw_sop i
-    put v_prog_simm add sb i get olw_simm i
-  end
-  cl = get olw_clen 0
-  put v_prog_clen pc cl
-  cb = mul pc 256
-  for i ulong cl bound 256
-    put v_prog_code add cb i get olw_code i
-    put v_sha_in i get olw_code i
-  end
-  sha256_hash cl
-  for i ulong 32
-    put v_prog_real_id add ib i get v_sha_out i
-  end
-  put v_prog_realized pc 1
-  put v_prog_verified pc 0
 end
 
-fn olw_lower_fn to long
-  if or ne get opr_pttag 0 V_TY_UINT or ne get opr_ptwid 0 64 or ne get opr_rttag 0 V_TY_UINT ne get opr_rtwid 0 64
-    olx_set_err olw_e_fntype 1
-    ret -1
+fn olw_prog_store_body pc ulong to void
+  sc = vpg_g OLW_ACC VPG_SCNT
+  put v_prog_scnt pc sc
+  sb = mul pc 64
+  ab = mul OLW_ACC 64
+  for i ulong sc bound 64
+    put v_prog_sop add sb i get vpg_op add ab i
+    put v_prog_simm add sb i get vpg_imm add ab i
   end
-  sc_r = olw_collect_steps ulong get opr_root 0 0
-  if lt sc_r 0
-    olx_set_err olw_e_fnbody 1
-    ret -1
+end
+
+fn olw_prog_store_text pc ulong to void
+  nb = mul pc 64
+  rl = get opr_clen 0
+  put v_prog_rlen pc rl
+  for i ulong rl bound 64
+    put v_prog_req add nb i get opr_ctxt i
   end
-  sc = ulong sc_r
-  put olw_scnt 0 sc
-  half = div sc 2
-  for i ulong half bound 32
-    j = sub sub sc 1 i
-    tmp_op = get olw_sop i
-    ti = get olw_simm i
-    put olw_sop i get olw_sop j
-    put olw_simm i get olw_simm j
-    put olw_sop j tmp_op
-    put olw_simm j ti
+  el = get opr_clen 1
+  put v_prog_elen pc el
+  for i ulong el bound 64
+    put v_prog_ens add nb i get opr_ctxt add 64 i
   end
-  olw_emit_prog_code
-  olw_hash_prog_id sc
-  pc = get v_prog_cnt 0
-  if ge pc V_MAX_PROGRAMS
-    olx_set_err olw_e_prog 1
-    ret -1
+end
+
+fn olw_prog_store_code pc ulong to void
+  cl = vro_g OLW_ACC VRO_CLEN
+  if gt cl 4096
+    cl = 4096
   end
-  put v_prog_cnt 0 add pc 1
-  olw_store_prog pc sc
-  ib = mul pc 32
-  for i ulong 32
-    put v_tmp_id i get v_prog_id add ib i
+  put v_prog_clen pc cl
+  cb = mul pc 4096
+  ac = mul OLW_ACC 4096
+  for i ulong cl bound 4096
+    put v_prog_code add cb i get vro_code add ac i
   end
+  put v_prog_realized pc vpg_g OLW_ACC VPG_REAL
+  put v_prog_verified pc vpg_g OLW_ACC VPG_VER
+end
+
+note visor_program_add of the lowered program (slot OLW_ACC) at pc
+fn olw_prog_store pc ulong to void
+  olw_prog_store_ids pc
+  olw_prog_store_body pc
+  olw_prog_store_text pc
+  olw_prog_store_code pc
+end
+
+text olw_m_bfull "binding table is full (64 names)"
+text olw_m_brefuse "the session refused this binding name"
+text olw_m_pdiff "internal: program id matches an existing program but its realization differs (builder invariant violated)"
+text olw_m_pfull "program table is full (16 programs)"
+text olw_m_prefuse "the session refused this program name"
+
+fn olw_name_to_sbuf to ulong
   nl = get opr_nlen 0
   for i ulong nl bound 64
     put v_sbuf i get opr_name i
   end
-  if lt vs_bind_set_sbuf nl V_BIND_PROGRAM long pc 0
-    olx_set_err olw_e_bind 1
-    ret -1
-  end
-  vs_set_last V_BIND_PROGRAM long pc
-  put olw_has_val 0 0
-  ret long pc
+  ret nl
 end
 
-fn olw_apply_op opc ulong ovf ulong wid ulong va ulong vb ulong to long
-  mask = olw_wmax wid
-  res = ulong 0
-  if eq opc V_OP_ADD
-    if and eq ovf V_OVF_FAIL_CLOSED gt va sub mask vb
-      ret -3
-    end
-    res = and add va vb mask
-  else
-    if eq opc V_OP_SUB
-      if and eq ovf V_OVF_FAIL_CLOSED lt va vb
-        ret -3
-      end
-      res = and sub va vb mask
-    else
-      if eq opc V_OP_MUL
-        res = and mul va vb mask
-      else
-        if eq opc V_OP_DIV
-          if eq vb 0
-            ret -3
-          end
-          res = and div va vb mask
-        else
-          if eq opc V_OP_AND
-            res = and and va vb mask
-          else
-            if eq opc V_OP_OR
-              res = and or va vb mask
-            else
-              ret -1
-            end
-          end
-        end
-      end
-    end
+note binding_slot_available
+fn olw_slot_ok to bool
+  if ge vs_bind_find_sbuf olw_name_to_sbuf 0
+    ret true
   end
-  put olw_val_out 0 res
-  put olw_val_is_bool 0 0
+  ret lt get v_bind_cnt 0 V_MAX_BINDINGS
+end
+
+fn olw_eval_let to long
+  scol = get opr_scol 0
+  if not olw_slot_ok
+    olx_failt scol olw_m_bfull
+    ret -3
+  end
+  saved = get v_og_cnt 0
+  rc = olw_lower_to_graph
+  if ne rc 0
+    ret rc
+  end
+  for i ulong 32
+    put v_tmp_id i get olw_rid i
+  end
+  if lt vs_bind_set_sbuf olw_name_to_sbuf V_BIND_OBJECT -1 0
+    put v_og_cnt 0 saved
+    put olw_rkind 0 0
+    olx_failt scol olw_m_brefuse
+    ret -2
+  end
+  put olw_rkind 0 1
+  put olw_rpidx 0 -1
   ret 0
 end
 
-fn olw_eval_obj_u64 idx ulong depth ulong to long
-  if gt depth 64
-    ret -1
+fn olw_eval_fn to long
+  scol = get opr_scol 0
+  if not olw_slot_ok
+    olx_failt scol olw_m_bfull
+    ret -3
   end
-  k = get v_og_kind idx
-  pb = mul idx V_MAX_PAYLOAD
-  if eq k V_KIND_VALUE
-    info = olw_obj_type_info idx
-    tag = shr info 16
-    if eq tag V_TY_BOOL
-      put olw_val_out 0 ulong get v_og_pay add pb 34
-      put olw_val_is_bool 0 1
-      ret 0
-    end
-    if or eq tag V_TY_UINT or eq tag V_TY_BITVEC eq tag V_TY_BYTE
-      nb = v_dec_u16le_pay pb 32
-      if or eq nb 0 gt nb 8
-        ret -1
+  rc = olw_lower_program
+  if ne rc 0
+    ret rc
+  end
+  pidx = long -1
+  pc = get v_prog_cnt 0
+  for i ulong pc bound 16
+    if olw_pid_eq i
+      if not olw_code_eq i
+        olx_failt scol olw_m_pdiff
+        ret -2
       end
-      v = ulong 0
-      p34 = add pb 34
-      for i ulong nb bound 8
-        v = or shl v 8 ulong get v_og_pay add p34 i
-      end
-      put olw_val_out 0 v
-      put olw_val_is_bool 0 0
-      ret 0
+      pidx = long i
+      break
     end
-    ret -1
   end
-  if and eq k V_KIND_OP eq get v_og_plen idx 161
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add pb i
+  added = false
+  if lt pidx 0
+    if ge pc V_MAX_PROGRAMS
+      olx_failt scol olw_m_pfull
+      ret -3
     end
-    opi = og_find_by_tmp
-    if lt opi 0
-      ret -1
-    end
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add add pb 33 i
-    end
-    a1 = og_find_by_tmp
-    if lt a1 0
-      ret -1
-    end
-    for i ulong 32
-      put v_tmp_id i get v_og_pay add add pb 65 i
-    end
-    a2 = og_find_by_tmp
-    if lt a2 0
-      ret -1
-    end
-    if lt olw_eval_obj_u64 ulong a1 add depth 1 0
-      ret -1
-    end
-    if ne get olw_val_is_bool 0 0
-      ret -1
-    end
-    va = get olw_val_out 0
-    if lt olw_eval_obj_u64 ulong a2 add depth 1 0
-      ret -1
-    end
-    if ne get olw_val_is_bool 0 0
-      ret -1
-    end
-    vb = get olw_val_out 0
-    opb = mul ulong opi V_MAX_PAYLOAD
-    opc = v_dec_u32le_pay opb 0
-    ovf = v_dec_u32le_pay opb 4
-    wid = and olw_obj_type_info ulong opi 0xffff
-    ret olw_apply_op opc ovf wid va vb
+    olw_prog_store pc
+    put v_prog_cnt 0 add pc 1
+    pidx = long pc
+    added = true
   end
-  ret -1
+  pb = vpg_ib OLW_ACC 0
+  for i ulong 32
+    put v_tmp_id i get vpg_ids add pb i
+  end
+  if lt vs_bind_set_sbuf olw_name_to_sbuf V_BIND_PROGRAM pidx 0
+    if added
+      put v_prog_cnt 0 pc
+    end
+    olx_failt scol olw_m_prefuse
+    ret -2
+  end
+  for i ulong 32
+    put olw_rid i get vpg_ids add pb i
+  end
+  put olw_rkind 0 3
+  put olw_rpidx 0 pidx
+  ret 0
 end
 
+note omega_language_eval_line on v_sbuf[0..n) (a C string: it ends at the first NUL)
 fn olw_eval_sbuf n ulong to long
-  if gt n 4095
-    olx_set_err olx_e_tok 1
-    ret -1
+  put olw_rkind 0 0
+  put olw_rpidx 0 -1
+  put olw_rttag 0 0
+  put olw_rtwid 0 0
+  for i ulong 32
+    put olw_rid i uchar 0
+    put olw_rtid i uchar 0
   end
-  for i ulong n bound 4096
-    put olx_line i get v_sbuf i
+  put olx_elen 0 0
+  m = n
+  if gt m 4096
+    m = 4096
   end
-  put olx_llen 0 n
-  if lt olx_lex_line 0
-    ret -1
+  ln = ulong 0
+  for i ulong m bound 4096
+    c = get v_sbuf i
+    if eq c 0
+      break
+    end
+    put olx_line i c
+    ln = add ln 1
   end
-  if lt opr_parse_line 0
-    ret -1
+  put olx_llen 0 ln
+  rc = olx_lex_line
+  if ne rc 0
+    ret rc
+  end
+  rc = opr_parse_line
+  if ne rc 0
+    ret rc
   end
   st = get opr_stmt 0
   if eq st 0
-    put olw_has_val 0 0
     ret 0
   end
-  if eq st 3
-    ret olw_lower_fn
-  end
-  etag = ulong 0
-  ewid = ulong 0
-  if eq st 2
-    etag = get opr_lttag 0
-    ewid = get opr_ltwid 0
-  end
-  oi = olw_lower_expr ulong get opr_root 0 etag ewid
-  if lt oi 0
-    ret -1
-  end
-  ou = ulong oi
-  ob = mul ou 32
-  for i ulong 32
-    put v_tmp_id i get v_og_id add ob i
+  if eq st 1
+    ret olw_lower_to_graph
   end
   if eq st 2
-    nl = get opr_nlen 0
-    for i ulong nl bound 64
-      put v_sbuf i get opr_name i
-    end
-    if lt vs_bind_set_sbuf nl V_BIND_OBJECT -1 0
-      olx_set_err olw_e_bind 1
-      ret -1
-    end
+    ret olw_eval_let
   end
-  vs_set_last V_BIND_OBJECT -1
-  ev = olw_eval_obj_u64 ou 0
-  if eq ev 0
-    put olw_has_val 0 1
-  else
-    put olw_has_val 0 0
-  end
-  ret 0
+  ret olw_eval_fn
 end

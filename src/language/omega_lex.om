@@ -1,33 +1,21 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 Surface Language V0 lexer (replaces src/language/omega_lex.c).
-note Depends on src/visor/visor.om.
+note Pure seeded OM-2 Surface Language V0 lexer: a faithful port of src/language/omega_lex.c
+note (with the src/language/lang_core.om classifiers it calls). Same tokens, same columns, same
+note error texts and return codes. Depends on src/visor/visor.om.
+note
+note The line is olx_line[0..olx_llen), a C string: olw_eval_sbuf stops it at the first NUL.
+note Token kinds are the OmegaTokKind values of omega_lex.h:
+note 0=EOF 1=IDENT 2=INT 3=LET 4=FN 5=REQUIRES 6=ENSURES 7=TRUE 8=FALSE
+note 9=( 10=) 11={ 12=} 13=: 14=, 15=-> 16== 17=+ 18=- 19=* 20=/ 21=& 22=|
+note 23=== 24=!= 25=< 26=<= 27=> 28=>= 29=!
+note Errors are "column N: msg" in olx_err[0..olx_elen) (the 512-byte err of the console).
 
-text olx_kw_let "let"
-text olx_kw_fn "fn"
-text olx_kw_req "requires"
-text olx_kw_ens "ensures"
-text olx_kw_true "true"
-text olx_kw_false "false"
-text olx_ty_u8 "u8"
-text olx_ty_u16 "u16"
-text olx_ty_u32 "u32"
-text olx_ty_u64 "u64"
-text olx_ty_bool "bool"
-text olx_ty_i8 "i8"
-text olx_ty_i16 "i16"
-text olx_ty_i32 "i32"
-text olx_ty_i64 "i64"
+const OLX_MAX_TOKENS ulong 256
+const OLX_LINE_MAX ulong 1024
 
-note Token kinds:
-note 0=EOF 1=IDENT 2=INT 3=LET 4=FN 5=REQ 6=ENS 7=TRUE 8=FALSE
-note 10=U8 11=U16 12=U32 13=U64 14=BOOL 15=SIGNED
-note 20=( 21=) 22={ 23=} 24=: 25=, 26=-> 27==
-note 30=+ 31=- 32=* 33=/ 34=& 35=|
-note 40=== 41=!= 42=< 43=<= 44=> 45=>= 46=!
-
-global olx_line uchar 4096
+global olx_line uchar 4104
 global olx_llen ulong 1
-global olx_err uchar 256
+global olx_err uchar 512
 global olx_elen ulong 1
 global olx_tcnt ulong 1
 global olx_tkind ulong 256
@@ -35,15 +23,270 @@ global olx_tcol ulong 256
 global olx_tval ulong 256
 global olx_tstr uchar 16384
 global olx_tslen ulong 256
+global olx_np ulong 1
 
-fn olx_set_err msg view uchar * col ulong to void
-  ob_reset 255
-  ob_puts msg
-  n = get v_ob_len 0
-  for i ulong n bound 255
-    put olx_err i get v_ob i
+note ---- message builder (the msg[] of a snprintf) ----
+global olm_b uchar 512
+global olm_n ulong 1
+
+fn olm_reset to void
+  put olm_n 0 0
+end
+
+fn olm_c c ulong to void
+  n = get olm_n 0
+  if lt n 511
+    put olm_b n uchar c
+    put olm_n 0 add n 1
+  end
+end
+
+fn olm_t s view uchar * to void
+  n = len s
+  for i ulong n bound 512
+    olm_c ulong get s i
+  end
+end
+
+global olm_d uchar 24
+
+fn olm_u v ulong to void
+  k = ulong 0
+  x = v
+  while gt x 9 bound 24
+    put olm_d k uchar add 48 rem x 10
+    x = div x 10
+    k = add k 1
+  end
+  put olm_d k uchar add 48 x
+  k = add k 1
+  while gt k 0 bound 24
+    k = sub k 1
+    olm_c ulong get olm_d k
+  end
+end
+
+fn olm_hexd d ulong to void
+  if lt d 10
+    olm_c add 48 d
+  else
+    olm_c add 87 d
+  end
+end
+
+note the text of token t (its word)
+fn olm_tstr t ulong to void
+  n = get olx_tslen t
+  b = mul t 64
+  for i ulong n bound 64
+    olm_c ulong get olx_tstr add b i
+  end
+end
+
+note snprintf truncation: keep at most m bytes of the message
+fn olm_cap m ulong to void
+  if gt get olm_n 0 m
+    put olm_n 0 m
+  end
+end
+
+text olx_t_col "column "
+text olx_t_colsp ": "
+global olx_mtmp uchar 512
+
+note set_err(err, 512, col, msg): "column N: msg", at most 511 bytes
+fn olx_fail col ulong to void
+  put olx_elen 0 0
+  m = get olm_n 0
+  for i ulong m bound 512
+    put olx_mtmp i get olm_b i
+  end
+  olm_reset
+  olm_t olx_t_col
+  olm_u col
+  olm_t olx_t_colsp
+  for i ulong m bound 512
+    olm_c ulong get olx_mtmp i
+  end
+  n = get olm_n 0
+  for i ulong n bound 512
+    put olx_err i get olm_b i
   end
   put olx_elen 0 n
+end
+
+fn olx_failt col ulong s view uchar * to void
+  olm_reset
+  olm_t s
+  olx_fail col
+end
+
+note ---- omega_language_tok_text ----
+text olx_k0 "end of line"
+text olx_k1 "name"
+text olx_k2 "integer"
+text olx_k3 "let"
+text olx_k4 "fn"
+text olx_k5 "requires"
+text olx_k6 "ensures"
+text olx_k7 "true"
+text olx_k8 "false"
+text olx_k9 "("
+text olx_k10 ")"
+text olx_k11 "{"
+text olx_k12 "}"
+text olx_k13 ":"
+text olx_k14 ","
+text olx_k15 "->"
+text olx_k16 "="
+text olx_k17 "+"
+text olx_k18 "-"
+text olx_k19 "*"
+text olx_k20 "/"
+text olx_k21 "&"
+text olx_k22 "|"
+text olx_k23 "=="
+text olx_k24 "!="
+text olx_k25 "<"
+text olx_k26 "<="
+text olx_k27 ">"
+text olx_k28 ">="
+text olx_k29 "!"
+
+fn olm_tok_hi k ulong to void
+  if eq k 15
+    olm_t olx_k15
+    ret
+  end
+  if eq k 16
+    olm_t olx_k16
+    ret
+  end
+  if eq k 17
+    olm_t olx_k17
+    ret
+  end
+  if eq k 18
+    olm_t olx_k18
+    ret
+  end
+  if eq k 19
+    olm_t olx_k19
+    ret
+  end
+  if eq k 20
+    olm_t olx_k20
+    ret
+  end
+  if eq k 21
+    olm_t olx_k21
+    ret
+  end
+  if eq k 22
+    olm_t olx_k22
+    ret
+  end
+  if eq k 23
+    olm_t olx_k23
+    ret
+  end
+  if eq k 24
+    olm_t olx_k24
+    ret
+  end
+  if eq k 25
+    olm_t olx_k25
+    ret
+  end
+  if eq k 26
+    olm_t olx_k26
+    ret
+  end
+  if eq k 27
+    olm_t olx_k27
+    ret
+  end
+  if eq k 28
+    olm_t olx_k28
+    ret
+  end
+  if eq k 29
+    olm_t olx_k29
+    ret
+  end
+  olm_c 63
+end
+
+fn olm_tok k ulong to void
+  if gt k 14
+    olm_tok_hi k
+    ret
+  end
+  if eq k 0
+    olm_t olx_k0
+    ret
+  end
+  if eq k 1
+    olm_t olx_k1
+    ret
+  end
+  if eq k 2
+    olm_t olx_k2
+    ret
+  end
+  if eq k 3
+    olm_t olx_k3
+    ret
+  end
+  if eq k 4
+    olm_t olx_k4
+    ret
+  end
+  if eq k 5
+    olm_t olx_k5
+    ret
+  end
+  if eq k 6
+    olm_t olx_k6
+    ret
+  end
+  if eq k 7
+    olm_t olx_k7
+    ret
+  end
+  if eq k 8
+    olm_t olx_k8
+    ret
+  end
+  if eq k 9
+    olm_t olx_k9
+    ret
+  end
+  if eq k 10
+    olm_t olx_k10
+    ret
+  end
+  if eq k 11
+    olm_t olx_k11
+    ret
+  end
+  if eq k 12
+    olm_t olx_k12
+    ret
+  end
+  if eq k 13
+    olm_t olx_k13
+    ret
+  end
+  olm_t olx_k14
+end
+
+note ---- classifiers (lang_core.om) ----
+fn olx_ch i ulong to ulong
+  if ge i get olx_llen 0
+    ret 0
+  end
+  ret ulong get olx_line i
 end
 
 fn olx_is_id_start c ulong to bool
@@ -53,20 +296,14 @@ fn olx_is_id_start c ulong to bool
   if and ge c 65 le c 90
     ret true
   end
-  if eq c 95
-    ret true
-  end
-  ret false
+  ret eq c 95
 end
 
 fn olx_is_id_char c ulong to bool
   if olx_is_id_start c
     ret true
   end
-  if and ge c 48 le c 57
-    ret true
-  end
-  ret false
+  ret and ge c 48 le c 57
 end
 
 fn olx_dval c ulong to ulong
@@ -96,68 +333,43 @@ fn olx_tok_eq tidx ulong s view uchar * to bool
   ret true
 end
 
-fn olx_classify_kw tidx ulong to ulong
-  if olx_tok_eq tidx olx_kw_let
+note lang_om_keyword: let fn requires ensures true false, else IDENT
+fn olx_keyword t ulong to ulong
+  if olx_tok_eq t olx_k3
     ret 3
   end
-  if olx_tok_eq tidx olx_kw_fn
+  if olx_tok_eq t olx_k4
     ret 4
   end
-  if olx_tok_eq tidx olx_kw_req
+  if olx_tok_eq t olx_k5
     ret 5
   end
-  if olx_tok_eq tidx olx_kw_ens
+  if olx_tok_eq t olx_k6
     ret 6
   end
-  if olx_tok_eq tidx olx_kw_true
+  if olx_tok_eq t olx_k7
     ret 7
   end
-  if olx_tok_eq tidx olx_kw_false
+  if olx_tok_eq t olx_k8
     ret 8
-  end
-  if olx_tok_eq tidx olx_ty_u8
-    ret 10
-  end
-  if olx_tok_eq tidx olx_ty_u16
-    ret 11
-  end
-  if olx_tok_eq tidx olx_ty_u32
-    ret 12
-  end
-  if olx_tok_eq tidx olx_ty_u64
-    ret 13
-  end
-  if olx_tok_eq tidx olx_ty_bool
-    ret 14
-  end
-  if olx_tok_eq tidx olx_ty_i8
-    ret 15
-  end
-  if olx_tok_eq tidx olx_ty_i16
-    ret 15
-  end
-  if olx_tok_eq tidx olx_ty_i32
-    ret 15
-  end
-  if olx_tok_eq tidx olx_ty_i64
-    ret 15
   end
   ret 1
 end
 
-text olx_e_ovf "integer literal overflows u64"
-text olx_e_badnum "malformed integer literal"
-text olx_e_cmt "unterminated block comment"
-text olx_e_tok "too many tokens"
-text olx_e_idlen "identifier too long"
-text olx_e_chr "unexpected character"
+text olx_e_hex "'0x' needs hex digits after it"
+text olx_e_bin "'0b' needs binary digits (0 or 1) after it"
+text olx_e_suffix "a number runs straight into letters or digits it cannot use (V0 has no literal suffixes; write `7: u64`)"
+text olx_e_wide "integer literal does not fit in 64 bits"
 
-fn olx_lex_int pos ulong slen ulong tidx ulong to long
+note lex_int at pos for token t: 0 with the end in olx_np, or the C return code
+fn olx_lex_int pos ulong t ulong to long
+  slen = get olx_llen 0
+  col = add pos 1
   base = ulong 10
   p = pos
   if lt add p 1 slen
-    if eq ulong get olx_line p 48
-      nx = ulong get olx_line add p 1
+    if eq olx_ch p 48
+      nx = olx_ch add p 1
       if eq nx 120
         base = 16
         p = add p 2
@@ -173,8 +385,8 @@ fn olx_lex_int pos ulong slen ulong tidx ulong to long
   v = ulong 0
   ovf = ulong 0
   maxu = ulong 0xffffffffffffffff
-  while lt p slen bound 4096
-    d = olx_dval ulong get olx_line p
+  while lt p slen bound 4104
+    d = olx_dval olx_ch p
     if ge d base
       break
     end
@@ -186,202 +398,238 @@ fn olx_lex_int pos ulong slen ulong tidx ulong to long
     p = add p 1
   end
   if eq p start
-    olx_set_err olx_e_badnum add pos 1
+    if eq base 16
+      olx_failt col olx_e_hex
+    else
+      olx_failt col olx_e_bin
+    end
     ret -1
   end
   if lt p slen
-    if olx_is_id_char ulong get olx_line p
-      olx_set_err olx_e_badnum add p 1
+    if olx_is_id_char olx_ch p
+      olx_failt add p 1 olx_e_suffix
       ret -1
     end
   end
   if ne ovf 0
-    olx_set_err olx_e_ovf add pos 1
-    ret -1
+    olx_failt col olx_e_wide
+    ret -2
   end
-  put olx_tkind tidx 2
-  put olx_tcol tidx add pos 1
-  put olx_tval tidx v
-  put olx_tslen tidx 0
-  ret long p
+  put olx_np 0 p
+  put olx_tkind t 2
+  put olx_tval t v
+  ret 0
 end
 
-fn olx_lex_punct c ulong c2 ulong to long
+note lang_om_punct: kind * 4 + length, or 2 (string), 3 (list), 1 (unknown) as -2, -3, -1
+fn olx_punct c ulong d ulong to long
   if eq c 40
-    ret 20
+    ret 37
   end
   if eq c 41
-    ret 21
+    ret 41
   end
   if eq c 123
-    ret 22
+    ret 45
   end
   if eq c 125
-    ret 23
+    ret 49
   end
   if eq c 58
-    ret 24
+    ret 53
   end
   if eq c 44
-    ret 25
+    ret 57
   end
   if eq c 43
-    ret 30
+    ret 69
   end
   if eq c 42
-    ret 32
+    ret 77
   end
   if eq c 47
-    ret 33
+    ret 81
   end
   if eq c 38
-    ret 34
+    ret 85
   end
   if eq c 124
-    ret 35
+    ret 89
   end
   if eq c 45
-    if eq c2 62
-      ret 126
+    if eq d 62
+      ret 62
     end
-    ret 31
+    ret 73
   end
   if eq c 61
-    if eq c2 61
-      ret 140
+    if eq d 61
+      ret 94
     end
-    ret 27
+    ret 65
   end
   if eq c 33
-    if eq c2 61
-      ret 141
+    if eq d 61
+      ret 98
     end
-    ret 46
+    ret 117
   end
   if eq c 60
-    if eq c2 61
-      ret 143
+    if eq d 61
+      ret 106
     end
-    ret 42
+    ret 101
   end
   if eq c 62
-    if eq c2 61
-      ret 145
+    if eq d 61
+      ret 114
     end
-    ret 44
+    ret 109
+  end
+  if or eq c 34 eq c 39
+    ret -2
+  end
+  if or eq c 91 eq c 93
+    ret -3
   end
   ret -1
 end
 
-fn olx_skip_block_cmt start ulong slen ulong to long
-  p = start
-  while lt add p 1 slen bound 4096
-    c1 = ulong get olx_line p
-    c2 = ulong get olx_line add p 1
-    if and eq c1 42 eq c2 47
-      ret long add p 2
-    end
-    p = add p 1
-  end
-  olx_set_err olx_e_cmt add start 1
-  ret -1
-end
+text olx_e_long "line is too long for V0"
+text olx_e_cmt "comment is never closed with */"
+text olx_e_many "too many tokens on one line"
+text olx_e_name "name is longer than 63 characters"
+text olx_e_str "strings and characters are not part of Omega V0"
+text olx_e_list "lists/containers are not part of Omega V0"
+text olx_e_chr "unexpected character '"
+text olx_e_byte "unexpected byte 0x"
 
-fn olx_lex_ident start ulong slen ulong cnt ulong to long
-  p = start
-  while lt p slen bound 4096
-    if not olx_is_id_char ulong get olx_line p
-      break
-    end
-    p = add p 1
+note the identifier at i for token k: 0 with the end in olx_np, or -1
+fn olx_lex_ident i ulong k ulong to long
+  j = add i 1
+  while olx_is_id_char olx_ch j bound 1100
+    j = add j 1
   end
-  idlen = sub p start
-  if gt idlen 63
-    olx_set_err olx_e_idlen add start 1
+  n = sub j i
+  if ge n 64
+    olx_failt add i 1 olx_e_name
     ret -1
   end
-  tb = mul cnt 64
-  for i ulong idlen bound 64
-    put olx_tstr add tb i get olx_line add start i
+  tb = mul k 64
+  for q ulong n bound 64
+    put olx_tstr add tb q get olx_line add i q
   end
-  put olx_tslen cnt idlen
-  put olx_tcol cnt add start 1
-  put olx_tval cnt 0
-  put olx_tkind cnt olx_classify_kw cnt
-  ret long p
+  put olx_tslen k n
+  put olx_tkind k olx_keyword k
+  put olx_np 0 j
+  ret 0
 end
 
+note one token at i (byte c) into token k: 0 with the end in olx_np, or the C return code
+fn olx_lex_tok i ulong k ulong c ulong to long
+  col = add i 1
+  put olx_tkind k 0
+  put olx_tcol k col
+  put olx_tval k 0
+  put olx_tslen k 0
+  if and ge c 48 le c 57
+    ret olx_lex_int i k
+  end
+  if olx_is_id_start c
+    ret olx_lex_ident i k
+  end
+  pk = olx_punct c olx_ch add i 1
+  if ge pk 0
+    pu = ulong pk
+    put olx_tkind k div pu 4
+    put olx_np 0 add i rem pu 4
+    ret 0
+  end
+  if eq pk -2
+    olx_failt col olx_e_str
+    ret -2
+  end
+  if eq pk -3
+    olx_failt col olx_e_list
+    ret -2
+  end
+  olm_reset
+  if and ge c 32 lt c 127
+    olm_t olx_e_chr
+    olm_c c
+    olm_c 39
+  else
+    olm_t olx_e_byte
+    olm_hexd shr c 4
+    olm_hexd and c 15
+  end
+  olx_fail col
+  ret -1
+end
+
+note the block comment opened at i: the position after its */, or -1
+fn olx_skip_cmt i ulong to long
+  j = add i 2
+  while ne olx_ch j 0 bound 1100
+    if and eq olx_ch j 42 eq olx_ch add j 1 47
+      break
+    end
+    j = add j 1
+  end
+  if eq olx_ch j 0
+    olx_failt add i 1 olx_e_cmt
+    ret -1
+  end
+  ret long add j 2
+end
+
+note omega_language_lex(olx_line, toks, 256, &count): 0 with olx_tcnt tokens before the EOF
+note token at index olx_tcnt, or the C return code with olx_err set
 fn olx_lex_line to long
   put olx_tcnt 0 0
   put olx_elen 0 0
   slen = get olx_llen 0
-  p = ulong 0
-  while lt p slen bound 4096
-    c = ulong get olx_line p
-    if or eq c 32 or eq c 9 or eq c 13 eq c 10
-      p = add p 1
-      continue
-    end
-    if and eq c 47 lt add p 1 slen
-      nx = ulong get olx_line add p 1
-      if eq nx 47
-        break
-      end
-      if eq nx 42
-        np = olx_skip_block_cmt add p 2 slen
-        if lt np 0
-          ret -1
-        end
-        p = ulong np
-        continue
-      end
-    end
-    cnt = get olx_tcnt 0
-    if ge cnt 254
-      olx_set_err olx_e_tok add p 1
-      ret -1
-    end
-    if and ge c 48 le c 57
-      np = olx_lex_int p slen cnt
-      if lt np 0
-        ret -1
-      end
-      put olx_tcnt 0 add cnt 1
-      p = ulong np
-      continue
-    end
-    if olx_is_id_start c
-      np = olx_lex_ident p slen cnt
-      if lt np 0
-        ret -1
-      end
-      put olx_tcnt 0 add cnt 1
-      p = ulong np
-      continue
-    end
-    c2 = ulong 0
-    if lt add p 1 slen
-      c2 = ulong get olx_line add p 1
-    end
-    pk = olx_lex_punct c c2
-    if lt pk 0
-      olx_set_err olx_e_chr add p 1
-      ret -1
-    end
-    put olx_tcol cnt add p 1
-    put olx_tslen cnt 0
-    put olx_tval cnt 0
-    if ge pk 100
-      put olx_tkind cnt ulong sub pk 100
-      p = add p 2
-    else
-      put olx_tkind cnt ulong pk
-      p = add p 1
-    end
-    put olx_tcnt 0 add cnt 1
+  if gt slen OLX_LINE_MAX
+    olx_failt OLX_LINE_MAX olx_e_long
+    ret -3
   end
-  cnt = get olx_tcnt 0
-  put olx_tkind cnt 0
-  put olx_tcol cnt add slen 1
+  i = ulong 0
+  k = ulong 0
+  while le i slen bound 1100
+    c = olx_ch i
+    if or or eq c 32 eq c 9 or eq c 13 eq c 10
+      i = add i 1
+      continue
+    end
+    if and eq c 47 eq olx_ch add i 1 47
+      break
+    end
+    if and eq c 47 eq olx_ch add i 1 42
+      e = olx_skip_cmt i
+      if lt e 0
+        ret -1
+      end
+      i = ulong e
+      continue
+    end
+    if eq c 0
+      break
+    end
+    if ge add k 1 OLX_MAX_TOKENS
+      olx_failt add i 1 olx_e_many
+      ret -3
+    end
+    rc = olx_lex_tok i k c
+    if ne rc 0
+      ret rc
+    end
+    i = get olx_np 0
+    k = add k 1
+  end
+  put olx_tkind k 0
+  put olx_tcol k add i 1
+  put olx_tval k 0
+  put olx_tslen k 0
+  put olx_tcnt 0 k
   ret 0
 end
