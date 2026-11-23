@@ -18,7 +18,7 @@ Rules:
 
 ## `apps/`
 
-User-facing Sovereign Intelligence applications, Forge, web generators and publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex` moved with full Git history under `apps/import/`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, `aien-translate`, `apps/core/`, and `apps/site_builder/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 129 units). Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
+User-facing Sovereign Intelligence applications, Forge, web generators, Lean proof DAG tooling and publishing tools (`interplane-forge`, `aienos.com`, `interplane.io`, `hop`, `omtex` moved with full Git history under `apps/import/`, plus pure-Omega conversions of `omega-projects`, `aien-edge`, `readings-window`, `aien-translate`, `apps/core/`, `apps/site_builder/`, and `apps/lean-opt/`), mirroring `gpu/`: pure-Omega `.om` units only, gated by `apps/units-gate.om` (`OMEGA-APPS-UNITS`, 131 units). Remaining non-Omega files stay upstream and are indexed in `apps/NOT-YET-OMEGA.tsv`.
 
 ## `bridge/`
 

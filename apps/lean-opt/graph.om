@@ -1,0 +1,1124 @@
+note lean-opt/graph.om: Import DAG builder, Kahn topo sort, culprit propagation, scan, hotspots, and conflict-aware plan-clump.
+note Compose after pool.om and lexer.om.
+
+text lo_hdr_scan "KIND\tFILE\tLINE\tORIG_MOD\tSYM\tDETAIL\tIMPORTERS\n"
+text lo_hdr_hot "RANK\tSCORE\tNLINARITH\tHEARTBEATS\tLINES\tIMPORTERS\tDEPTH\tFILE\n"
+text lo_k_shadow "SHADOW"
+text lo_k_ambig "AMBIG"
+text lo_k_culp "CULPRIT"
+text lo_vs " vs "
+text lo_pipe " | "
+text lo_comma ","
+text lo_stats_p1 "STATS modules="
+text lo_stats_p2 " bundles="
+text lo_stats_p3 " sections="
+text lo_stats_p4 " edges="
+text lo_stats_p5 " cycles="
+text lo_stats_p6 " max_depth="
+text lo_stats_p7 " lines="
+text lo_stats_p8 " decls="
+text lo_stats_p9 " nlinarith="
+text lo_stats_p10 " maxHeartbeats="
+text lo_stats_p11 " culprit_mods="
+text lo_stats_p12 " elapsed_ms="
+
+text lo_scan_s1 "SCAN_SUMMARY modules="
+text lo_scan_s2 " shadow="
+text lo_scan_s3 " ambig="
+text lo_scan_s4 " culprit="
+text lo_scan_s5 " elapsed_ms="
+
+text lo_plan_s1 "PLAN_SUMMARY mode="
+text lo_plan_s2 "antichain"
+text lo_plan_s3 "tree"
+text lo_plan_s4 " max_lines="
+text lo_plan_s5 " before="
+text lo_plan_s6 " after="
+text lo_plan_s7 " reduction_pct="
+text lo_plan_s8 " bundles="
+text lo_plan_s9 " shadow_avoided="
+text lo_plan_s10 " ambig_avoided="
+text lo_plan_s11 " culprit_avoided="
+text lo_plan_s12 " cycles=0 elapsed_ms="
+
+text lo_b_hdr "BUNDLE\t"
+text lo_b_mem "\tMEMBER\t"
+
+note Per-scan scratch arrays for conflict checking (avoid large stack allocations)
+global g_sc_cands ulong 256
+global g_sc_cns ulong 256
+global g_sc_cfull ulong 256
+global g_sc_cmod ulong 256
+global g_sc_csec ulong 256
+
+fn lo_need_didx cap ulong to void
+cur = len g_didx_head
+if lt cur cap
+r = enlarge g_didx_head cap
+if lt r 0
+lo_fail_oom
+end
+end
+dc = get g_cfg 10
+if gt dc len g_didx_next
+r = enlarge g_didx_next dc
+if lt r 0
+lo_fail_oom
+end
+end
+end
+
+fn lo_need_graph_arrays mcnt ulong ecnt ulong to void
+scnt = get g_cfg 1
+if lt len g_str_to_mod scnt
+r = enlarge g_str_to_mod scnt
+if lt r 0
+lo_fail_oom
+end
+end
+hsz = add mcnt 1
+if lt len g_csr_head hsz
+r = enlarge g_csr_head hsz
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_rcsr_head hsz
+if lt r 0
+lo_fail_oom
+end
+end
+if lt len g_csr_to add ecnt 1
+r = enlarge g_csr_to add ecnt 1
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_rcsr_to add ecnt 1
+if lt r 0
+lo_fail_oom
+end
+end
+if lt len g_topo_ord mcnt
+r = enlarge g_topo_ord mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_topo_dep mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_indeg mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_vst_stamp mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_bfs_q mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sort_idx mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sort_scr mcnt
+if lt r 0
+lo_fail_oom
+end
+end
+end
+
+fn lo_build_decl_index to void
+scnt = get g_cfg 1
+dcnt = get g_cfg 10
+lo_need_didx scnt
+put g_cfg 29 scnt
+for i ulong scnt bound 9223372036854775807
+put g_didx_head i 0
+end
+for d ulong dcnt bound 9223372036854775807
+sid = get g_decl_short d
+if and gt sid 0 lt sid scnt
+old_h = get g_didx_head sid
+put g_didx_next d old_h
+put g_didx_head sid add d 1
+else
+put g_didx_next d 0
+end
+end
+end
+
+fn lo_init_str_to_mod mcnt ulong scnt ulong to void
+for i ulong scnt bound 9223372036854775807
+put g_str_to_mod i 0
+end
+for m ulong mcnt bound 9223372036854775807
+nm = get g_mod_name_id m
+if and gt nm 0 lt nm scnt
+put g_str_to_mod nm add m 1
+end
+end
+for m ulong add mcnt 1 bound 9223372036854775807
+put g_csr_head m 0
+put g_rcsr_head m 0
+end
+end
+
+fn lo_count_one_edge e ulong scnt ulong to ulong
+src = get g_imp_src e
+dst_sid = get g_imp_dst e
+if or eq dst_sid 0 ge dst_sid scnt
+ret 0
+end
+dm1 = get g_str_to_mod dst_sid
+if eq dm1 0
+ret 0
+end
+dst = sub dm1 1
+if eq src dst
+ret 0
+end
+s1 = add src 1
+put g_csr_head s1 add get g_csr_head s1 1
+d1 = add dst 1
+put g_rcsr_head d1 add get g_rcsr_head d1 1
+ret 1
+end
+
+fn lo_resolve_edges mcnt ulong icnt ulong to ulong
+scnt = get g_cfg 1
+lo_init_str_to_mod mcnt scnt
+ecnt = ulong 0
+for e ulong icnt bound 9223372036854775807
+ecnt = add ecnt lo_count_one_edge e scnt
+end
+ret ecnt
+end
+
+fn lo_prefix_csr mcnt ulong to void
+for m ulong mcnt bound 9223372036854775807
+m1 = add m 1
+put g_csr_head m1 add get g_csr_head m1 get g_csr_head m
+put g_rcsr_head m1 add get g_rcsr_head m1 get g_rcsr_head m
+put g_indeg m 0
+end
+for m ulong mcnt bound 9223372036854775807
+put g_sort_scr m get g_csr_head m
+put g_bfs_q m get g_rcsr_head m
+end
+end
+
+fn lo_fill_one_edge e ulong scnt ulong to void
+src = get g_imp_src e
+dst_sid = get g_imp_dst e
+if or eq dst_sid 0 ge dst_sid scnt
+ret
+end
+dm1 = get g_str_to_mod dst_sid
+if eq dm1 0
+ret
+end
+dst = sub dm1 1
+if eq src dst
+ret
+end
+p1 = get g_sort_scr src
+put g_csr_to p1 dst
+put g_sort_scr src add p1 1
+p2 = get g_bfs_q dst
+put g_rcsr_to p2 src
+put g_bfs_q dst add p2 1
+put g_indeg src add get g_indeg src 1
+end
+
+fn lo_fill_csr mcnt ulong icnt ulong to void
+lo_prefix_csr mcnt
+scnt = get g_cfg 1
+for e ulong icnt bound 9223372036854775807
+lo_fill_one_edge e scnt
+end
+end
+
+fn lo_propagate_culprits tcnt ulong to void
+for idx ulong tcnt bound 9223372036854775807
+u = get g_topo_ord idx
+msk = get g_mod_culp u
+cs = get g_csr_head u
+ce = get g_csr_head add u 1
+j = cs
+while lt j ce bound 9223372036854775807
+dep = get g_csr_to j
+msk = or msk get g_mod_culp dep
+j = add j 1
+end
+put g_mod_culp u msk
+end
+end
+
+fn lo_kahn_step u ulong qtail ulong to ulong
+du = get g_topo_dep u
+rs = get g_rcsr_head u
+re = get g_rcsr_head add u 1
+k = rs
+while lt k re bound 9223372036854775807
+v = get g_rcsr_to k
+if gt add du 1 get g_topo_dep v
+put g_topo_dep v add du 1
+end
+ind = sub get g_indeg v 1
+put g_indeg v ind
+if eq ind 0
+put g_bfs_q qtail v
+qtail = add qtail 1
+end
+k = add k 1
+end
+ret qtail
+end
+
+fn lo_topo_and_culprits mcnt ulong to void
+qhead = ulong 0
+qtail = ulong 0
+for m ulong mcnt bound 9223372036854775807
+put g_topo_dep m 0
+put g_vst_stamp m 0
+if eq get g_indeg m 0
+put g_bfs_q qtail m
+qtail = add qtail 1
+end
+end
+tcnt = ulong 0
+maxd = ulong 0
+while lt qhead qtail bound 9223372036854775807
+u = get g_bfs_q qhead
+qhead = add qhead 1
+put g_topo_ord tcnt u
+tcnt = add tcnt 1
+if gt get g_topo_dep u maxd
+maxd = get g_topo_dep u
+end
+qtail = lo_kahn_step u qtail
+end
+put g_cfg 15 tcnt
+put g_cfg 16 sub mcnt tcnt
+put g_cfg 17 maxd
+lo_propagate_culprits tcnt
+end
+
+fn lo_build_graph to void
+mcnt = get g_cfg 8
+icnt = get g_cfg 9
+lo_build_decl_index
+lo_need_graph_arrays mcnt icnt
+ecnt = lo_resolve_edges mcnt icnt
+put g_cfg 30 ecnt
+put g_cfg 31 ecnt
+lo_fill_csr mcnt icnt
+lo_topo_and_culprits mcnt
+end
+
+fn lo_mark_closure mid ulong to void
+st = add get g_cfg 28 1
+put g_cfg 28 st
+qh = ulong 0
+qt = ulong 1
+put g_bfs_q 0 mid
+put g_vst_stamp mid st
+while lt qh qt bound 9223372036854775807
+u = get g_bfs_q qh
+qh = add qh 1
+cs = get g_csr_head u
+ce = get g_csr_head add u 1
+k = cs
+while lt k ce bound 9223372036854775807
+v = get g_csr_to k
+if ne get g_vst_stamp v st
+put g_vst_stamp v st
+put g_bfs_q qt v
+qt = add qt 1
+end
+k = add k 1
+end
+end
+end
+
+fn lo_sec_has_ns sec ulong ns_id ulong to bool
+if eq ns_id 0
+ret false
+end
+h = get g_sec_ns_h sec
+c = get g_sec_ns_c sec
+for i ulong c bound 9223372036854775807
+if eq get g_ns_ids add h i ns_id
+ret true
+end
+end
+ret false
+end
+
+fn lo_ref_ns_matches cur_ns ulong decl_ns ulong to bool
+if eq decl_ns 0
+ret false
+end
+x = cur_ns
+while gt x 0 bound 64
+if eq x decl_ns
+ret true
+end
+x = lo_str_parent_ns x
+end
+ret false
+end
+
+fn lo_sec_has_open sec ulong ns_id ulong to bool
+if eq ns_id 0
+ret false
+end
+h = get g_sec_op_h sec
+c = get g_sec_op_c sec
+for i ulong c bound 9223372036854775807
+if eq get g_open_ids add h i ns_id
+ret true
+end
+end
+ret false
+end
+
+fn lo_emit_culp_names msk ulong to void
+first = true
+if ne and msk 1 0
+lo_out_view lo_cp0
+first = false
+end
+if ne and msk 2 0
+if not first
+lo_out_view lo_comma
+end
+lo_out_view lo_cp1
+first = false
+end
+if ne and msk 4 0
+if not first
+lo_out_view lo_comma
+end
+lo_out_view lo_cp2
+first = false
+end
+if ne and msk 8 0
+if not first
+lo_out_view lo_comma
+end
+lo_out_view lo_cp3
+first = false
+end
+if ne and msk 16 0
+if not first
+lo_out_view lo_comma
+end
+lo_out_view lo_cp4
+first = false
+end
+if ne and msk 32 0
+if not first
+lo_out_view lo_comma
+end
+lo_out_view lo_cp5
+first = false
+end
+if ne and msk 64 0
+if not first
+lo_out_view lo_comma
+end
+lo_out_view lo_cp6
+first = false
+end
+if ne and msk 128 0
+if not first
+lo_out_view lo_comma
+end
+lo_out_view lo_cp7
+end
+end
+
+fn lo_imp_deg mid ulong to ulong
+ret sub get g_rcsr_head add mid 1 get g_rcsr_head mid
+end
+
+fn lo_cand_seen cnt ulong df ulong to bool
+for j ulong cnt bound 256
+if eq get g_sc_cfull j df
+ret true
+end
+end
+ret false
+end
+
+fn lo_collect_sym_cands sym_id ulong mid ulong sec ulong st ulong to ulong
+if ge sym_id get g_cfg 29
+ret 0
+end
+cnt = ulong 0
+ptr = get g_didx_head sym_id
+while gt ptr 0 bound 9223372036854775807
+d = sub ptr 1
+dm = get g_decl_mod d
+if eq get g_vst_stamp dm st
+if or ne dm mid le get g_decl_sec d sec
+df = get g_decl_full d
+if not lo_cand_seen cnt df
+if lt cnt 255
+put g_sc_cands cnt d
+put g_sc_cns cnt get g_decl_ns d
+put g_sc_cfull cnt df
+put g_sc_cmod cnt dm
+put g_sc_csec cnt get g_decl_sec d
+cnt = add cnt 1
+end
+end
+end
+end
+ptr = get g_didx_next d
+end
+ret cnt
+end
+
+fn lo_emit_row_head is_sh bool mid ulong line_no ulong orig ulong sym ulong to void
+if is_sh
+lo_out_view lo_k_shadow
+else
+lo_out_view lo_k_ambig
+end
+lo_out_tab
+lo_out_str get g_mod_path_id mid
+lo_out_tab
+lo_out_u64 line_no
+lo_out_tab
+lo_out_str orig
+lo_out_tab
+lo_out_str sym
+lo_out_tab
+end
+
+fn lo_emit_row_tail is_sh bool full1 ulong full2 ulong mid ulong to void
+lo_out_str full1
+if gt full2 0
+if is_sh
+lo_out_view lo_vs
+else
+lo_out_view lo_pipe
+end
+lo_out_str full2
+end
+lo_out_tab
+lo_out_u64 lo_imp_deg mid
+lo_out_nl
+end
+
+fn lo_emit_conflict is_sh bool mid ulong sec ulong ridx ulong f1 ulong f2 ulong to void
+if ne get g_cfg 24 0
+ret
+end
+ln = get g_ref_line ridx
+og = get g_sec_orig sec
+sy = get g_ref_sym ridx
+lo_emit_row_head is_sh mid ln og sy
+lo_emit_row_tail is_sh f1 f2 mid
+end
+
+fn lo_eval_cands mid ulong sec ulong ridx ulong ccnt ulong to void
+enc_hit = ulong 0
+op1 = ulong 0
+op2 = ulong 0
+op_cnt = ulong 0
+rns = get g_ref_ns ridx
+for i ulong ccnt bound 256
+cns = get g_sc_cns i
+cfull = get g_sc_cfull i
+if lo_ref_ns_matches rns cns
+if eq enc_hit 0
+enc_hit = cfull
+end
+else
+if lo_sec_has_open sec cns
+if eq op_cnt 0
+op1 = cfull
+end
+if eq op_cnt 1
+op2 = cfull
+end
+op_cnt = add op_cnt 1
+end
+end
+end
+if and gt enc_hit 0 gt op_cnt 0
+put g_cfg 32 add get g_cfg 32 1
+lo_emit_conflict true mid sec ridx enc_hit op1
+ret
+end
+if and eq enc_hit 0 ge op_cnt 2
+put g_cfg 33 add get g_cfg 33 1
+lo_emit_conflict false mid sec ridx op1 op2
+end
+end
+
+fn lo_scan_sec_ref mid ulong sec ulong ridx ulong st ulong to void
+sym = get g_ref_sym ridx
+ccnt = lo_collect_sym_cands sym mid sec st
+if lt ccnt 2
+ret
+end
+lo_eval_cands mid sec ridx ccnt
+end
+
+fn lo_scan_sec_culp mid ulong sec ulong to void
+if gt get g_mod_is_bun mid 0
+if eq sec get g_mod_sec_h mid
+if eq get g_sec_rf_c sec 0
+ret
+end
+end
+end
+cmsk = get g_mod_culp mid
+sup = get g_sec_sup sec
+eff = and cmsk xor 255 sup
+if eq eff 0
+ret
+end
+put g_cfg 34 add get g_cfg 34 1
+if eq get g_cfg 24 0
+lo_out_view lo_k_culp
+lo_out_tab
+lo_out_str get g_mod_path_id mid
+lo_out_tab
+lo_out_u64 get g_sec_line sec
+lo_out_tab
+lo_out_str get g_sec_orig sec
+lo_out_tab
+lo_out_view lo_k_culp
+lo_out_tab
+lo_emit_culp_names eff
+lo_out_tab
+lo_out_u64 lo_imp_deg mid
+lo_out_nl
+end
+end
+
+fn lo_scan_module mid ulong to void
+if and eq get g_cfg 22 1 eq get g_mod_is_bun mid 0
+ret
+end
+lo_mark_closure mid
+st = get g_cfg 28
+sh = get g_mod_sec_h mid
+sc = get g_mod_sec_c mid
+for si ulong sc bound 9223372036854775807
+sec = add sh si
+lo_scan_sec_culp mid sec
+if eq get g_cfg 23 0
+rh = get g_sec_rf_h sec
+rc = get g_sec_rf_c sec
+for k ulong rc bound 9223372036854775807
+lo_scan_sec_ref mid sec add rh k st
+end
+end
+end
+end
+
+fn lo_run_scan to void
+t0 = monons
+put g_cfg 32 0
+put g_cfg 33 0
+put g_cfg 34 0
+if eq get g_cfg 24 0
+lo_out_view lo_hdr_scan
+end
+mcnt = get g_cfg 8
+for m ulong mcnt bound 9223372036854775807
+lo_scan_module m
+end
+t1 = monons
+ms = ulong div sub t1 t0 1000000
+lo_out_view lo_scan_s1
+lo_out_u64 mcnt
+lo_out_view lo_scan_s2
+lo_out_u64 get g_cfg 32
+lo_out_view lo_scan_s3
+lo_out_u64 get g_cfg 33
+lo_out_view lo_scan_s4
+lo_out_u64 get g_cfg 34
+lo_out_view lo_scan_s5
+lo_out_u64 ms
+lo_out_nl
+lo_out_flush
+end
+
+fn lo_run_stats t0 long to void
+mcnt = get g_cfg 8
+cmods = ulong 0
+for m ulong mcnt bound 9223372036854775807
+if gt get g_mod_culp m 0
+cmods = add cmods 1
+end
+end
+t1 = monons
+ms = ulong div sub t1 t0 1000000
+lo_out_view lo_stats_p1
+lo_out_u64 mcnt
+lo_out_view lo_stats_p2
+lo_out_u64 get g_cfg 21
+lo_out_view lo_stats_p3
+lo_out_u64 get g_cfg 11
+lo_out_view lo_stats_p4
+lo_out_u64 get g_cfg 30
+lo_out_view lo_stats_p5
+lo_out_u64 get g_cfg 16
+lo_out_view lo_stats_p6
+lo_out_u64 get g_cfg 17
+lo_out_view lo_stats_p7
+lo_out_u64 get g_cfg 18
+lo_out_view lo_stats_p8
+lo_out_u64 get g_cfg 10
+lo_out_view lo_stats_p9
+lo_out_u64 get g_cfg 19
+lo_out_view lo_stats_p10
+lo_out_u64 get g_cfg 20
+lo_out_view lo_stats_p11
+lo_out_u64 cmods
+lo_out_view lo_stats_p12
+lo_out_u64 ms
+lo_out_nl
+lo_out_flush
+end
+
+fn lo_hot_score mid ulong to ulong
+nl = get g_mod_nlin mid
+hb = get g_mod_hb mid
+ln = get g_mod_lines mid
+deg = lo_imp_deg mid
+dep = get g_topo_dep mid
+s1 = mul nl 200
+s2 = mul hb 500
+s3 = mul deg 20
+s4 = mul dep 5
+ret add add add add s1 s2 ln s3 s4
+end
+
+fn lo_run_hotspots to void
+mcnt = get g_cfg 8
+top_n = get g_cfg 25
+if eq top_n 0
+top_n = 50
+end
+if gt top_n mcnt
+top_n = mcnt
+end
+lo_out_view lo_hdr_hot
+for m ulong mcnt bound 9223372036854775807
+put g_vst_stamp m 0
+end
+for rank ulong top_n bound 9223372036854775807
+best_m = ulong 0
+best_s = ulong 0
+found = false
+for m ulong mcnt bound 9223372036854775807
+if eq get g_vst_stamp m 0
+sc = lo_hot_score m
+if or not found gt sc best_s
+best_m = m
+best_s = sc
+found = true
+end
+end
+end
+if not found
+break
+end
+put g_vst_stamp best_m 1
+lo_out_u64 add rank 1
+lo_out_tab
+lo_out_u64 best_s
+lo_out_tab
+lo_out_u64 get g_mod_nlin best_m
+lo_out_tab
+lo_out_u64 get g_mod_hb best_m
+lo_out_tab
+lo_out_u64 get g_mod_lines best_m
+lo_out_tab
+lo_out_u64 lo_imp_deg best_m
+lo_out_tab
+lo_out_u64 get g_topo_dep best_m
+lo_out_tab
+lo_out_str get g_mod_path_id best_m
+lo_out_nl
+end
+lo_out_flush
+end
+
+note Conflict-aware clump planner helpers
+fn lo_need_clump mcnt ulong to void
+if lt len g_clump_grp mcnt
+r = enlarge g_clump_grp mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_clump_lines mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_clump_cnt mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_clump_culp mcnt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_clump_rep mcnt
+if lt r 0
+lo_fail_oom
+end
+end
+end
+
+fn lo_sym_conflicts_mod sym ulong rns ulong sa ulong mb ulong to ulong
+if ge sym get g_cfg 29
+ret 0
+end
+ptr = get g_didx_head sym
+while gt ptr 0 bound 9223372036854775807
+d = sub ptr 1
+if eq get g_decl_mod d mb
+dns = get g_decl_ns d
+if lo_ref_ns_matches rns dns
+ret 2
+end
+if lo_sec_has_open sa dns
+ret 3
+end
+end
+ptr = get g_didx_next d
+end
+ret 0
+end
+
+fn lo_sec_conflicts_mod sa ulong mb ulong to ulong
+rh = get g_sec_rf_h sa
+rc = get g_sec_rf_c sa
+for k ulong rc bound 9223372036854775807
+ridx = add rh k
+sym = get g_ref_sym ridx
+rns = get g_ref_ns ridx
+res = lo_sym_conflicts_mod sym rns sa mb
+if gt res 0
+ret res
+end
+end
+ret 0
+end
+
+fn lo_pair_shadows_in ma ulong mb ulong to ulong
+note Check if any decl in mb shadows (2) or opens-collides (3) with a ref in ma
+sh = get g_mod_sec_h ma
+sc = get g_mod_sec_c ma
+for si ulong sc bound 9223372036854775807
+res = lo_sec_conflicts_mod add sh si mb
+if gt res 0
+ret res
+end
+end
+ret 0
+end
+
+fn lo_pair_conflict ma ulong mb ulong to ulong
+note Returns: 0=ok, 1=culprit mismatch, 2=shadow risk, 3=ambig risk
+ca = get g_mod_culp ma
+cb = get g_mod_culp mb
+if ne ca cb
+ret 1
+end
+r1 = lo_pair_shadows_in ma mb
+if gt r1 0
+ret r1
+end
+ret lo_pair_shadows_in mb ma
+end
+
+fn lo_cmp_antichain a ulong b ulong to bool
+la = get g_mod_lib_id a
+lb = get g_mod_lib_id b
+if ne la lb
+ret lt la lb
+end
+da = get g_mod_dir_id a
+db = get g_mod_dir_id b
+if ne da db
+ret lt da db
+end
+ta = get g_topo_dep a
+tb = get g_topo_dep b
+if ne ta tb
+ret lt ta tb
+end
+ret lt a b
+end
+
+fn lo_merge_run start ulong mid ulong endp ulong to void
+p1 = start
+p2 = mid
+w = start
+while and lt p1 mid lt p2 endp bound 9223372036854775807
+a = get g_sort_idx p1
+b = get g_sort_idx p2
+if lo_cmp_antichain a b
+put g_sort_scr w a
+p1 = add p1 1
+else
+put g_sort_scr w b
+p2 = add p2 1
+end
+w = add w 1
+end
+while lt p1 mid bound 9223372036854775807
+put g_sort_scr w get g_sort_idx p1
+p1 = add p1 1
+w = add w 1
+end
+while lt p2 endp bound 9223372036854775807
+put g_sort_scr w get g_sort_idx p2
+p2 = add p2 1
+w = add w 1
+end
+k = start
+while lt k endp bound 9223372036854775807
+put g_sort_idx k get g_sort_scr k
+k = add k 1
+end
+end
+
+fn lo_sort_antichain n ulong to void
+if le n 1
+ret
+end
+for i ulong n bound 9223372036854775807
+put g_sort_idx i i
+end
+step = ulong 1
+while lt step n bound 9223372036854775807
+start = ulong 0
+while lt start n bound 9223372036854775807
+mid = add start step
+if gt mid n
+mid = n
+end
+endp = add mid step
+if gt endp n
+endp = n
+end
+lo_merge_run start mid endp
+start = add start mul step 2
+end
+step = mul step 2
+end
+end
+
+fn lo_try_place_antichain m ulong ml ulong gcnt ulong max_lines ulong to bool
+k = gcnt
+while gt k 0 bound 9223372036854775807
+g = sub k 1
+rep = get g_clump_rep g
+if ne get g_mod_lib_id rep get g_mod_lib_id m
+ret false
+end
+if ne get g_mod_dir_id rep get g_mod_dir_id m
+ret false
+end
+if ne get g_topo_dep rep get g_topo_dep m
+ret false
+end
+if le add get g_clump_lines g ml max_lines
+cf = lo_pair_conflict rep m
+if eq cf 0
+put g_clump_grp m g
+put g_clump_lines g add get g_clump_lines g ml
+put g_clump_cnt g add get g_clump_cnt g 1
+ret true
+end
+if eq cf 1
+put g_cfg 52 add get g_cfg 52 1
+end
+if eq cf 2
+put g_cfg 50 add get g_cfg 50 1
+end
+if eq cf 3
+put g_cfg 51 add get g_cfg 51 1
+end
+end
+k = sub k 1
+end
+ret false
+end
+
+fn lo_plan_antichain mcnt ulong max_lines ulong to void
+lo_sort_antichain mcnt
+gcnt = ulong 0
+for i ulong mcnt bound 9223372036854775807
+m = get g_sort_idx i
+ml = get g_mod_lines m
+placed = false
+if and eq get g_mod_flags m 0 le ml max_lines
+placed = lo_try_place_antichain m ml gcnt max_lines
+end
+if not placed
+put g_clump_grp m gcnt
+put g_clump_rep gcnt m
+put g_clump_lines gcnt ml
+put g_clump_cnt gcnt 1
+put g_clump_culp gcnt get g_mod_culp m
+gcnt = add gcnt 1
+end
+end
+put g_cfg 54 gcnt
+end
+
+fn lo_try_merge_tree m ulong max_lines ulong to void
+if ne get g_mod_flags m 0
+ret
+end
+if ne lo_imp_deg m 1
+ret
+end
+parent = get g_rcsr_to get g_rcsr_head m
+pg = get g_clump_grp parent
+mg = get g_clump_grp m
+if eq pg mg
+ret
+end
+if ne get g_mod_flags parent 0
+ret
+end
+if ne get g_mod_lib_id parent get g_mod_lib_id m
+ret
+end
+comb = add get g_clump_lines pg get g_clump_lines mg
+if gt comb max_lines
+ret
+end
+cf = lo_pair_conflict parent m
+if eq cf 0
+put g_clump_grp m pg
+put g_clump_lines pg comb
+put g_clump_cnt pg add get g_clump_cnt pg get g_clump_cnt mg
+put g_clump_cnt mg 0
+ret
+end
+if eq cf 1
+put g_cfg 52 add get g_cfg 52 1
+end
+if eq cf 2
+put g_cfg 50 add get g_cfg 50 1
+end
+if eq cf 3
+put g_cfg 51 add get g_cfg 51 1
+end
+end
+
+fn lo_plan_tree mcnt ulong max_lines ulong to void
+note Single-importer tree contraction in topological order (bottom-up)
+for m ulong mcnt bound 9223372036854775807
+put g_clump_grp m m
+put g_clump_rep m m
+put g_clump_lines m get g_mod_lines m
+put g_clump_cnt m 1
+put g_clump_culp m get g_mod_culp m
+end
+tcnt = get g_cfg 15
+for i ulong tcnt bound 9223372036854775807
+lo_try_merge_tree get g_topo_ord i max_lines
+end
+after = ulong 0
+for g ulong mcnt bound 9223372036854775807
+if gt get g_clump_cnt g 0
+after = add after 1
+end
+end
+put g_cfg 54 after
+end
+
+fn lo_run_plan_clump to void
+t0 = monons
+mcnt = get g_cfg 8
+max_lines = get g_cfg 26
+if eq max_lines 0
+max_lines = 250
+end
+mode = get g_cfg 27
+lo_need_clump mcnt
+put g_cfg 50 0
+put g_cfg 51 0
+put g_cfg 52 0
+if eq mode 0
+lo_plan_antichain mcnt max_lines
+else
+lo_plan_tree mcnt max_lines
+end
+after = get g_cfg 54
+bundles = ulong 0
+for g ulong mcnt bound 9223372036854775807
+if lt g after
+if gt get g_clump_cnt g 1
+bundles = add bundles 1
+end
+else
+if eq mode 1
+if gt get g_clump_cnt g 1
+bundles = add bundles 1
+end
+end
+end
+end
+if eq get g_cfg 24 0
+for m ulong mcnt bound 9223372036854775807
+g = get g_clump_grp m
+if gt get g_clump_cnt g 1
+lo_out_view lo_b_hdr
+lo_out_str get g_mod_name_id get g_clump_rep g
+lo_out_view lo_b_mem
+lo_out_str get g_mod_name_id m
+lo_out_nl
+end
+end
+end
+t1 = monons
+ms = ulong div sub t1 t0 1000000
+red = ulong 0
+if gt mcnt 0
+red = div mul sub mcnt after 100 mcnt
+end
+lo_out_view lo_plan_s1
+if eq mode 0
+lo_out_view lo_plan_s2
+else
+lo_out_view lo_plan_s3
+end
+lo_out_view lo_plan_s4
+lo_out_u64 max_lines
+lo_out_view lo_plan_s5
+lo_out_u64 mcnt
+lo_out_view lo_plan_s6
+lo_out_u64 after
+lo_out_view lo_plan_s7
+lo_out_u64 red
+lo_out_view lo_plan_s8
+lo_out_u64 bundles
+lo_out_view lo_plan_s9
+lo_out_u64 get g_cfg 50
+lo_out_view lo_plan_s10
+lo_out_u64 get g_cfg 51
+lo_out_view lo_plan_s11
+lo_out_u64 get g_cfg 52
+lo_out_view lo_plan_s12
+lo_out_u64 ms
+lo_out_nl
+lo_out_flush
+end

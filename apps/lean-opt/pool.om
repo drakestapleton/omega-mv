@@ -1,0 +1,1182 @@
+note lean-opt/pool.om: Dynamic zero-hard-cap pools, string interning, buffered I/O, and directory walker.
+note Compose with si/directives/om2.om first.
+note All global arrays live here so lexer.om, graph.om, main.om, and test.om share them.
+
+text lo_err_oom "lean-opt: pool enlarge failed\n"
+text lo_slash "/"
+text lo_dot "."
+text lo_dotdot ".."
+text lo_ext_lean ".lean"
+text lo_dir_git ".git"
+text lo_dir_lake ".lake"
+text lo_dir_build "build"
+text lo_lib_main "Main"
+text lo_lib_stmts "Statements"
+text lo_lib_chal "Challenge"
+text lo_lib_gt "GroundTheory"
+text lo_lib_lf "LocalFields"
+text lo_lib_gf "GlobalFields"
+text lo_lib_gtf "GroundTheoryFields"
+text lo_tab "\t"
+text lo_nl "\n"
+
+note Global dynamic byte/string pools
+global g_str uchar *
+global g_str_off ulong *
+global g_str_len ulong *
+global g_str_hash ulong *
+global g_ht_slot ulong *
+
+note File read buffer and directory walk queue
+global g_fbuf uchar *
+global g_dirq uchar *
+global g_dirq_off ulong *
+global g_dirq_len ulong *
+
+note Fixed OS syscall scratch buffers (4096 = Linux PATH_MAX, 65536 = getdents64 chunk, 128 = stat)
+global g_out uchar 65536
+global g_dent uchar 65536
+global g_root uchar 4096
+global g_path uchar 4096
+global g_tmp uchar 4096
+global g_tmp2 uchar 4096
+global g_stat uchar 128
+global g_cfg ulong 64
+
+note g_cfg slots:
+note  0: str_bytes_used   1: str_count        2: ht_cap (pow2)    3: out_used
+note  4: dirq_bytes       5: dirq_count       6: dirq_head        7: root_len
+note  8: mod_count        9: imp_count       10: decl_count      11: sec_count
+note 12: ns_used         13: open_used       14: ref_used        15: topo_count
+note 16: cycles          17: max_depth       18: total_lines     19: total_nlin
+note 20: total_hb        21: total_bundles   22: opt_only_bun    23: opt_culp_only
+note 24: opt_sum_only    25: opt_top_n       26: opt_max_lines   27: opt_mode (0=antichain,1=tree)
+note 28: stamp_cur       29: didx_cap        30: csr_edge_cnt    31: rcsr_edge_cnt
+note 32: sh_cnt          33: am_cnt          34: cu_cnt          35: test_checks
+note 36: test_ctrls      37: test_fails      38: lib_main_id     39: lib_chal_id
+note 40: lib_gtf_id      41: t_start_ns      42: cur_line        43: cur_mod
+note 44: cur_sec         45: cur_ns_id       46: sec_ref_start   47: sec_ns_start
+note 48: sec_open_start  49: flen            50: sh_avoid        51: am_avoid
+note 52: cu_avoid        53: clump_bundles   54: clump_after     55: local_cnt
+
+note Module tables
+global g_mod_path_id ulong *
+global g_mod_name_id ulong *
+global g_mod_dir_id ulong *
+global g_mod_lib_id ulong *
+global g_mod_lines ulong *
+global g_mod_nlin ulong *
+global g_mod_hb ulong *
+global g_mod_is_bun ulong *
+global g_mod_flags ulong *
+global g_mod_culp ulong *
+global g_mod_sec_h ulong *
+global g_mod_sec_c ulong *
+
+note Import edges and CSR graph
+global g_imp_src ulong *
+global g_imp_dst ulong *
+global g_str_to_mod ulong *
+global g_csr_head ulong *
+global g_csr_to ulong *
+global g_rcsr_head ulong *
+global g_rcsr_to ulong *
+
+note DAG traversal tables
+global g_topo_ord ulong *
+global g_topo_dep ulong *
+global g_indeg ulong *
+global g_vst_stamp ulong *
+global g_bfs_q ulong *
+global g_sort_idx ulong *
+global g_sort_scr ulong *
+
+note Declaration tables and short-name chain
+global g_decl_short ulong *
+global g_decl_ns ulong *
+global g_decl_full ulong *
+global g_decl_mod ulong *
+global g_decl_sec ulong *
+global g_decl_kind ulong *
+global g_didx_head ulong *
+global g_didx_next ulong *
+
+note Section, namespace, open, and reference tables
+global g_sec_mod ulong *
+global g_sec_orig ulong *
+global g_sec_line ulong *
+global g_sec_ns_h ulong *
+global g_sec_ns_c ulong *
+global g_sec_op_h ulong *
+global g_sec_op_c ulong *
+global g_sec_rf_h ulong *
+global g_sec_rf_c ulong *
+global g_sec_sup ulong *
+global g_ns_ids ulong *
+global g_open_ids ulong *
+global g_ref_sym ulong *
+global g_ref_line ulong *
+global g_ref_ns ulong *
+
+note Temporary per-file parser stacks (small scratch tables)
+global g_stk_kind ulong 256
+global g_stk_ns ulong 256
+global g_stk_op ulong 256
+global g_op_stk ulong 1024
+global g_op_tmp ulong 1024
+global g_loc_sym ulong 256
+global g_clump_grp ulong *
+global g_clump_lines ulong *
+global g_clump_cnt ulong *
+global g_clump_culp ulong *
+global g_clump_rep ulong *
+
+fn lo_fail_oom to void
+k = write 2 lo_err_oom 0 len lo_err_oom
+exit 1
+end
+
+fn lo_need_str need ulong to void
+cur = len g_str
+if le need cur
+ret
+end
+nxt = add mul cur 2 4096
+if gt need nxt
+nxt = add need 4096
+end
+r = enlarge g_str nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_strs need ulong to void
+cur = len g_str_off
+if le need cur
+ret
+end
+nxt = add mul cur 2 1024
+if gt need nxt
+nxt = add need 1024
+end
+r = enlarge g_str_off nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_str_len nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_str_hash nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_ht need ulong to void
+cur = len g_ht_slot
+if le need cur
+ret
+end
+r = enlarge g_ht_slot need
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_fbuf need ulong to void
+cur = len g_fbuf
+if le need cur
+ret
+end
+nxt = add mul cur 2 65536
+if gt need nxt
+nxt = add need 65536
+end
+r = enlarge g_fbuf nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_dirq_b need ulong to void
+cur = len g_dirq
+if le need cur
+ret
+end
+nxt = add mul cur 2 4096
+if gt need nxt
+nxt = add need 4096
+end
+r = enlarge g_dirq nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_dirq_m need ulong to void
+cur = len g_dirq_off
+if le need cur
+ret
+end
+nxt = add mul cur 2 256
+if gt need nxt
+nxt = add need 256
+end
+r1 = enlarge g_dirq_off nxt
+r2 = enlarge g_dirq_len nxt
+if or lt r1 0 lt r2 0
+lo_fail_oom
+end
+end
+
+fn lo_need_mods need ulong to void
+cur = len g_mod_path_id
+if le need cur
+ret
+end
+nxt = add mul cur 2 1024
+if gt need nxt
+nxt = add need 1024
+end
+r = enlarge g_mod_path_id nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_name_id nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_dir_id nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_lib_id nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_lines nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_nlin nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_hb nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_is_bun nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_flags nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_culp nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_sec_h nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_mod_sec_c nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_imps need ulong to void
+cur = len g_imp_src
+if le need cur
+ret
+end
+nxt = add mul cur 2 4096
+if gt need nxt
+nxt = add need 4096
+end
+r = enlarge g_imp_src nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_imp_dst nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_decls need ulong to void
+cur = len g_decl_short
+if le need cur
+ret
+end
+nxt = add mul cur 2 4096
+if gt need nxt
+nxt = add need 4096
+end
+r = enlarge g_decl_short nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_decl_ns nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_decl_full nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_decl_mod nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_decl_sec nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_decl_kind nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_secs need ulong to void
+cur = len g_sec_mod
+if le need cur
+ret
+end
+nxt = add mul cur 2 2048
+if gt need nxt
+nxt = add need 2048
+end
+r = enlarge g_sec_mod nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_orig nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_line nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_ns_h nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_ns_c nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_op_h nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_op_c nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_rf_h nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_rf_c nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_sec_sup nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_ns need ulong to void
+cur = len g_ns_ids
+if le need cur
+ret
+end
+nxt = add mul cur 2 4096
+if gt need nxt
+nxt = add need 4096
+end
+r = enlarge g_ns_ids nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_opens need ulong to void
+cur = len g_open_ids
+if le need cur
+ret
+end
+nxt = add mul cur 2 4096
+if gt need nxt
+nxt = add need 4096
+end
+r = enlarge g_open_ids nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+fn lo_need_refs need ulong to void
+cur = len g_ref_sym
+if le need cur
+ret
+end
+nxt = add mul cur 2 8192
+if gt need nxt
+nxt = add need 8192
+end
+r = enlarge g_ref_sym nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_ref_line nxt
+if lt r 0
+lo_fail_oom
+end
+r = enlarge g_ref_ns nxt
+if lt r 0
+lo_fail_oom
+end
+end
+
+note Buffered stdout helpers
+fn lo_out_flush to void
+used = get g_cfg 3
+if eq used 0
+ret
+end
+off = ulong 0
+while lt off used bound 9223372036854775807
+k = write 1 g_out off sub used off
+if le k 0
+break
+end
+off = add off ulong k
+end
+put g_cfg 3 0
+end
+
+fn lo_out_byte b uchar to void
+used = get g_cfg 3
+if ge used 65536
+lo_out_flush
+used = get g_cfg 3
+end
+put g_out used b
+put g_cfg 3 add used 1
+end
+
+fn lo_out_view s view uchar * to void
+n = len s
+for i ulong n bound 9223372036854775807
+lo_out_byte get s i
+end
+end
+
+fn lo_out_str sid ulong to void
+if eq sid 0
+ret
+end
+off = get g_str_off sid
+n = get g_str_len sid
+for i ulong n bound 9223372036854775807
+lo_out_byte get g_str add off i
+end
+end
+
+fn lo_out_u64 v ulong to void
+if ge v 10
+lo_out_u64 div v 10
+end
+lo_out_byte uchar add 48 rem v 10
+end
+
+fn lo_out_tab to void
+lo_out_byte 9
+end
+
+fn lo_out_nl to void
+lo_out_byte 10
+end
+
+note FNV-1a 64-bit hash over slices
+fn lo_fnv_fbuf off ulong n ulong to ulong
+h = ulong 14695981039346656037
+for i ulong n bound 9223372036854775807
+c = ulong get g_fbuf add off i
+h = xor h c
+h = mul h 1099511628211
+end
+ret h
+end
+
+fn lo_fnv_tmp off ulong n ulong to ulong
+h = ulong 14695981039346656037
+for i ulong n bound 9223372036854775807
+c = ulong get g_tmp add off i
+h = xor h c
+h = mul h 1099511628211
+end
+ret h
+end
+
+fn lo_fnv_view s view uchar * to ulong
+h = ulong 14695981039346656037
+n = len s
+for i ulong n bound 9223372036854775807
+c = ulong get s i
+h = xor h c
+h = mul h 1099511628211
+end
+ret h
+end
+
+fn lo_eq_str_fbuf sid ulong off ulong n ulong to bool
+if ne get g_str_len sid n
+ret false
+end
+soff = get g_str_off sid
+for i ulong n bound 9223372036854775807
+if ne get g_str add soff i get g_fbuf add off i
+ret false
+end
+end
+ret true
+end
+
+fn lo_eq_str_tmp sid ulong off ulong n ulong to bool
+if ne get g_str_len sid n
+ret false
+end
+soff = get g_str_off sid
+for i ulong n bound 9223372036854775807
+if ne get g_str add soff i get g_tmp add off i
+ret false
+end
+end
+ret true
+end
+
+fn lo_eq_str_view sid ulong s view uchar * to bool
+n = len s
+if ne get g_str_len sid n
+ret false
+end
+soff = get g_str_off sid
+for i ulong n bound 9223372036854775807
+if ne get g_str add soff i get s i
+ret false
+end
+end
+ret true
+end
+
+fn lo_ht_rehash new_cap ulong to void
+old_cap = get g_cfg 2
+lo_need_ht new_cap
+for i ulong new_cap bound 9223372036854775807
+put g_ht_slot i 0
+end
+mask = sub new_cap 1
+cnt = get g_cfg 1
+for sid ulong cnt bound 9223372036854775807
+if gt sid 0
+h = get g_str_hash sid
+slot = and h mask
+while gt get g_ht_slot slot 0 bound 9223372036854775807
+slot = and add slot 1 mask
+end
+put g_ht_slot slot add sid 1
+end
+end
+put g_cfg 2 new_cap
+end
+
+fn lo_ht_maybe_grow to void
+cnt = get g_cfg 1
+cap = get g_cfg 2
+if eq cap 0
+lo_ht_rehash 4096
+ret
+end
+if gt mul cnt 10 mul cap 6
+lo_ht_rehash mul cap 2
+end
+end
+
+fn lo_intern_fbuf off ulong n ulong to ulong
+if eq n 0
+ret 0
+end
+lo_ht_maybe_grow
+h = lo_fnv_fbuf off n
+mask = sub get g_cfg 2 1
+slot = and h mask
+while true bound 9223372036854775807
+ent = get g_ht_slot slot
+if eq ent 0
+break
+end
+sid = sub ent 1
+if eq get g_str_hash sid h
+if lo_eq_str_fbuf sid off n
+ret sid
+end
+end
+slot = and add slot 1 mask
+end
+sid = get g_cfg 1
+lo_need_strs add sid 1
+boff = get g_cfg 0
+lo_need_str add boff n
+for i ulong n bound 9223372036854775807
+put g_str add boff i get g_fbuf add off i
+end
+put g_str_off sid boff
+put g_str_len sid n
+put g_str_hash sid h
+put g_cfg 0 add boff n
+put g_cfg 1 add sid 1
+put g_ht_slot slot add sid 1
+ret sid
+end
+
+fn lo_intern_tmp off ulong n ulong to ulong
+if eq n 0
+ret 0
+end
+lo_ht_maybe_grow
+h = lo_fnv_tmp off n
+mask = sub get g_cfg 2 1
+slot = and h mask
+while true bound 9223372036854775807
+ent = get g_ht_slot slot
+if eq ent 0
+break
+end
+sid = sub ent 1
+if eq get g_str_hash sid h
+if lo_eq_str_tmp sid off n
+ret sid
+end
+end
+slot = and add slot 1 mask
+end
+sid = get g_cfg 1
+lo_need_strs add sid 1
+boff = get g_cfg 0
+lo_need_str add boff n
+for i ulong n bound 9223372036854775807
+put g_str add boff i get g_tmp add off i
+end
+put g_str_off sid boff
+put g_str_len sid n
+put g_str_hash sid h
+put g_cfg 0 add boff n
+put g_cfg 1 add sid 1
+put g_ht_slot slot add sid 1
+ret sid
+end
+
+fn lo_intern_view s view uchar * to ulong
+n = len s
+if eq n 0
+ret 0
+end
+lo_ht_maybe_grow
+h = lo_fnv_view s
+mask = sub get g_cfg 2 1
+slot = and h mask
+while true bound 9223372036854775807
+ent = get g_ht_slot slot
+if eq ent 0
+break
+end
+sid = sub ent 1
+if eq get g_str_hash sid h
+if lo_eq_str_view sid s
+ret sid
+end
+end
+slot = and add slot 1 mask
+end
+sid = get g_cfg 1
+lo_need_strs add sid 1
+boff = get g_cfg 0
+lo_need_str add boff n
+for i ulong n bound 9223372036854775807
+put g_str add boff i get s i
+end
+put g_str_off sid boff
+put g_str_len sid n
+put g_str_hash sid h
+put g_cfg 0 add boff n
+put g_cfg 1 add sid 1
+put g_ht_slot slot add sid 1
+ret sid
+end
+
+fn lo_init_pools to void
+put g_cfg 0 1
+put g_cfg 1 1
+lo_need_strs 4
+put g_str_off 0 0
+put g_str_len 0 0
+put g_str_hash 0 0
+lo_need_str 4
+put g_str 0 0
+put g_cfg 2 0
+lo_ht_maybe_grow
+lo_need_fbuf 65536
+lo_need_dirq_b 4096
+lo_need_dirq_m 64
+lo_need_mods 256
+lo_need_imps 512
+lo_need_decls 512
+lo_need_secs 256
+lo_need_ns 512
+lo_need_opens 512
+lo_need_refs 1024
+put g_cfg 38 lo_intern_view lo_lib_main
+put g_cfg 39 lo_intern_view lo_lib_chal
+put g_cfg 40 lo_intern_view lo_lib_gtf
+end
+
+fn lo_reset_pools to void
+for i ulong 56
+put g_cfg i 0
+end
+lo_init_pools
+end
+
+note String helper: join sid1 + '.' + sid2 in g_tmp and intern
+fn lo_intern_join_dot sid1 ulong sid2 ulong to ulong
+if eq sid1 0
+ret sid2
+end
+if eq sid2 0
+ret sid1
+end
+off1 = get g_str_off sid1
+len1 = get g_str_len sid1
+off2 = get g_str_off sid2
+len2 = get g_str_len sid2
+if gt add add len1 1 len2 4095
+ret 0
+end
+for i ulong len1 bound 4096
+put g_tmp i get g_str add off1 i
+end
+put g_tmp len1 46
+w = add len1 1
+for j ulong len2 bound 4096
+put g_tmp add w j get g_str add off2 j
+end
+ret lo_intern_tmp 0 add w len2
+end
+
+fn lo_str_last_seg sid ulong to ulong
+if eq sid 0
+ret 0
+end
+off = get g_str_off sid
+n = get g_str_len sid
+dot = ulong n
+for i ulong n bound 9223372036854775807
+if eq get g_str add off i 46
+dot = i
+end
+end
+if eq dot n
+ret sid
+end
+start = add dot 1
+rem_n = sub n start
+if gt rem_n 4095
+ret 0
+end
+for j ulong rem_n bound 4096
+put g_tmp j get g_str add off add start j
+end
+ret lo_intern_tmp 0 rem_n
+end
+
+fn lo_str_parent_ns sid ulong to ulong
+if eq sid 0
+ret 0
+end
+off = get g_str_off sid
+n = get g_str_len sid
+dot = ulong 0
+found = false
+for i ulong n bound 9223372036854775807
+if eq get g_str add off i 46
+dot = i
+found = true
+end
+end
+if not found
+ret 0
+end
+if gt dot 4095
+ret 0
+end
+for j ulong dot bound 4096
+put g_tmp j get g_str add off j
+end
+ret lo_intern_tmp 0 dot
+end
+
+fn lo_str_eq_view sid ulong s view uchar * to bool
+if eq sid 0
+ret eq len s 0
+end
+ret lo_eq_str_view sid s
+end
+
+note Read entire file at g_path[0..plen] into g_fbuf, set g_cfg[49] = flen
+fn lo_read_path plen ulong to bool
+fd = int fopen g_path 0 plen 0 0
+if lt fd 0
+ret false
+end
+tot = ulong 0
+while true bound 9223372036854775807
+lo_need_fbuf add tot 65536
+k = read fd g_fbuf tot 65536
+if lt k 0
+if eq k -4
+continue
+end
+kf = fclose fd
+ret false
+end
+if eq k 0
+break
+end
+tot = add tot ulong k
+end
+kf = fclose fd
+put g_cfg 49 tot
+ret true
+end
+
+note Directory queue helpers (stores relative paths from root)
+fn lo_push_dirq off ulong n ulong to void
+idx = get g_cfg 5
+boff = get g_cfg 4
+lo_need_dirq_m add idx 1
+lo_need_dirq_b add boff n
+for i ulong n bound 4096
+put g_dirq add boff i get g_tmp2 add off i
+end
+put g_dirq_off idx boff
+put g_dirq_len idx n
+put g_cfg 4 add boff n
+put g_cfg 5 add idx 1
+end
+
+fn lo_dent_eq_view start ulong n ulong s view uchar * to bool
+if ne n len s
+ret false
+end
+for i ulong n bound 4096
+if ne get g_dent add start i get s i
+ret false
+end
+end
+ret true
+end
+
+fn lo_dent_ends_lean start ulong n ulong to bool
+if le n 5
+ret false
+end
+base = sub add start n 5
+for i ulong 5
+if ne get g_dent add base i get lo_ext_lean i
+ret false
+end
+end
+ret true
+end
+
+fn lo_skip_dir start ulong n ulong to bool
+if eq n 1
+if eq get g_dent start 46
+ret true
+end
+end
+if eq n 2
+if and eq get g_dent start 46 eq get g_dent add start 1 46
+ret true
+end
+end
+if lo_dent_eq_view start n lo_dir_git
+ret true
+end
+if lo_dent_eq_view start n lo_dir_lake
+ret true
+end
+if lo_dent_eq_view start n lo_dir_build
+ret true
+end
+ret false
+end
+
+fn lo_build_child_path rlen ulong name_s ulong name_n ulong to ulong
+w = ulong 0
+if gt rlen 0
+qoff = get g_dirq_off get g_cfg 6
+for i ulong rlen bound 4096
+c = get g_dirq add qoff i
+put g_tmp2 w c
+w = add w 1
+end
+put g_tmp2 w 47
+w = add w 1
+end
+for j ulong name_n bound 4096
+if ge w 4090
+break
+end
+c2 = get g_dent add name_s j
+put g_tmp2 w c2
+w = add w 1
+end
+ret w
+end
+
+fn lo_build_full_path rel_n ulong to ulong
+root_n = get g_cfg 7
+w = ulong 0
+for i ulong root_n bound 4096
+put g_path w get g_root i
+w = add w 1
+end
+if gt rel_n 0
+if gt w 0
+if ne get g_path sub w 1 47
+put g_path w 47
+w = add w 1
+end
+end
+for j ulong rel_n bound 4096
+if ge w 4094
+break
+end
+put g_path w get g_tmp2 j
+w = add w 1
+end
+end
+ret w
+end
+
+fn lo_build_mod_full_path mid ulong to ulong
+pid = get g_mod_path_id mid
+off = get g_str_off pid
+n = get g_str_len pid
+for i ulong n bound 4096
+put g_tmp2 i get g_str add off i
+end
+ret lo_build_full_path n
+end
+
+fn lo_intern_str_sub off ulong n ulong to ulong
+if gt n 4095
+ret 0
+end
+for i ulong n bound 4096
+put g_tmp i get g_str add off i
+end
+ret lo_intern_tmp 0 n
+end
+
+fn lo_find_dot_from sid ulong start ulong to ulong
+off = get g_str_off sid
+n = get g_str_len sid
+i = start
+while lt i n bound 4096
+if eq get g_str add off i 46
+ret i
+end
+i = add i 1
+end
+ret n
+end
+
+fn lo_classify_lib mod_name_id ulong to ulong
+off = get g_str_off mod_name_id
+n = get g_str_len mod_name_id
+dot1 = lo_find_dot_from mod_name_id 0
+top_id = lo_intern_str_sub off dot1
+if lo_str_eq_view top_id lo_lib_stmts
+ret get g_cfg 38
+end
+if lo_str_eq_view top_id lo_lib_gt
+if lt add dot1 1 n
+s0 = add dot1 1
+dot2 = lo_find_dot_from mod_name_id s0
+sub_id = lo_intern_str_sub add off s0 sub dot2 s0
+if or lo_str_eq_view sub_id lo_lib_lf lo_str_eq_view sub_id lo_lib_gf
+ret get g_cfg 40
+end
+end
+end
+ret top_id
+end
+
+fn lo_tmp2_to_tmp n ulong rep_slash bool to ulong
+dot = ulong 0
+for j ulong n bound 4096
+c = get g_tmp2 j
+if and rep_slash eq c 47
+put g_tmp j 46
+dot = j
+else
+put g_tmp j c
+end
+end
+ret dot
+end
+
+fn lo_register_module rel_n ulong to void
+dot = lo_tmp2_to_tmp rel_n false
+path_id = lo_intern_tmp 0 rel_n
+mname_n = sub rel_n 5
+dot = lo_tmp2_to_tmp mname_n true
+mname_id = lo_intern_tmp 0 mname_n
+dir_id = ulong 0
+if gt dot 0
+dummy = lo_tmp2_to_tmp dot false
+dir_id = lo_intern_tmp 0 dot
+end
+lib_id = lo_classify_lib mname_id
+idx = get g_cfg 8
+lo_need_mods add idx 1
+put g_mod_path_id idx path_id
+put g_mod_name_id idx mname_id
+put g_mod_dir_id idx dir_id
+put g_mod_lib_id idx lib_id
+put g_mod_lines idx 0
+put g_mod_nlin idx 0
+put g_mod_hb idx 0
+put g_mod_is_bun idx 0
+fl = ulong 0
+if or eq lib_id get g_cfg 38 eq lib_id get g_cfg 39
+fl = 1
+end
+put g_mod_flags idx fl
+put g_mod_culp idx 0
+put g_mod_sec_h idx 0
+put g_mod_sec_c idx 0
+put g_cfg 8 add idx 1
+end
+
+fn lo_check_unknown_dtype full_n ulong to ulong
+r = lstat g_path 0 full_n g_stat 0 len g_stat
+if lt r 0
+ret 0
+end
+v = ulong 0
+for i ulong 4
+c = ulong get g_stat add 16 i
+v = or v shl c mul i 8
+end
+kind = and v 61440
+if eq kind 16384
+ret 4
+end
+if eq kind 32768
+ret 8
+end
+ret 0
+end
+
+fn lo_walk_dir_entries rlen ulong size ulong to void
+p = ulong 0
+while lt p size bound 65536
+if lt sub size p 20
+break
+end
+low = ulong get g_dent add p 16
+high = ulong get g_dent add p 17
+rec = add low shl high 8
+if or lt rec 20 gt add p rec size
+break
+end
+endpos = add p rec
+start = add p 19
+n = ulong 0
+while lt add start n endpos bound 65536
+if eq get g_dent add start n 0
+break
+end
+n = add n 1
+end
+dtype = ulong get g_dent add p 18
+if and gt n 0 lt add start n endpos
+if not lo_skip_dir start n
+rel_n = lo_build_child_path rlen start n
+if eq dtype 0
+full_n = lo_build_full_path rel_n
+dtype = lo_check_unknown_dtype full_n
+end
+if eq dtype 4
+lo_push_dirq 0 rel_n
+end
+if eq dtype 8
+if lo_dent_ends_lean start n
+lo_register_module rel_n
+end
+end
+end
+end
+p = add p rec
+end
+end
+
+fn lo_walk_lean_tree root_n ulong to bool
+if gt root_n 4000
+ret false
+end
+put g_cfg 7 root_n
+put g_cfg 4 0
+put g_cfg 5 0
+put g_cfg 6 0
+lo_push_dirq 0 0
+while lt get g_cfg 6 get g_cfg 5 bound 9223372036854775807
+qidx = get g_cfg 6
+rlen = get g_dirq_len qidx
+roff = get g_dirq_off qidx
+for i ulong rlen bound 4096
+put g_tmp2 i get g_dirq add roff i
+end
+full_n = lo_build_full_path rlen
+fd = int fopen g_path 0 full_n 49152 0
+if ge fd 0
+while true bound 9223372036854775807
+n = getdnts fd g_dent 0 65536
+if eq n -4
+continue
+end
+if le n 0
+break
+end
+lo_walk_dir_entries rlen ulong n
+end
+kf = fclose fd
+end
+put g_cfg 6 add qidx 1
+end
+ret true
+end

@@ -18,7 +18,7 @@ Everything under `apps/` is pure seeded Omega (`.om`) built by `omega-mv`'s own 
 | `apps/readings-window/` | `readings-window` (`rad:z2Jhza2V51dFcMFUhNiFcXHpE5Ewy`) | `1f2f34702c2a` | 3 | converted | 22 |
 | `apps/translate/` | `aien-translate` (`rad:z49FTK9M33MFjenns3vqDqqN66zj7`) | `cfcd35fbd150` | 3 | converted | 33 |
 
-Total in `apps/`: **407 `.om` files** (395 imported across 530 history-preserving commits + 12 newly converted pure-Omega `.om` files across 4 repositories; non-`.om` upstream files for the imported repos are listed in [`apps/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
+Total in `apps/`: **407 `.om` files** imported/converted across upstream SI apps, plus native pure-Omega additions under `apps/core/`, `apps/site_builder/`, and `apps/lean-opt/` (`131` units in `apps/units.tsv`, gated by `apps/units-gate.om`; non-`.om` upstream files for the imported repos are listed in [`apps/NOT-YET-OMEGA.tsv`](NOT-YET-OMEGA.tsv)).
 
 ## One compiler
 
