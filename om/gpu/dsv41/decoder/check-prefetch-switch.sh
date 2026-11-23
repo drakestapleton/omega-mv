@@ -4,6 +4,11 @@
 # Exit codes of the control: 10 on, 11 off, 12 refused (with one stderr line).
 set -u
 bin=$1
+# An empty file runs as exit 0 under sh; refuse anything that is not a non-empty ELF executable.
+if [ ! -x "$bin" ] || [ ! -s "$bin" ] || [ "$(head -c 4 "$bin" | od -An -c | tr -d ' ')" != '177ELF' ]; then
+  echo "PREFETCH-SWITCH FAIL: $bin is not a non-empty ELF executable"
+  exit 2
+fi
 fail=0
 k=DSV41_ARBORIS_PREFETCH
 msg="dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1"
@@ -45,7 +50,7 @@ case_ 11 zero-among-others "A=1" "$k=0" "Z=2"
 # Repeated names: env(1) keeps one value per name, so the control re-runs itself through execenv.
 "$bin" dup 2> /dev/null
 got=$?
-if [ "$got" = 0 ]; then echo "PASS repeated-name (0)"; else echo "FAIL repeated-name got $got"; fail=1; fi
+if [ "$got" = 50 ]; then echo "PASS repeated-name (50)"; else echo "FAIL repeated-name want 50 got $got"; fail=1; fi
 
 if [ "$fail" = 0 ]; then echo "PREFETCH-SWITCH PASS"; else echo "PREFETCH-SWITCH FAIL"; fi
 exit "$fail"
