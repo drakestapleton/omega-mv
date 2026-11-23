@@ -52,3 +52,5 @@ from 99 to 105 out of 165. Two additional array rewrite patterns raised it to
 Adaptive questioning is available in the test harness. The normal CLI still takes
 a prompt and optional examples. The frozen comparison records programs, timings,
 engine failures and every charged query. [Comparison report](../../../../evidence/OMEGALLM-SELECTION-20261123/REPORT.md) · [Reproduction commands](experiment/README.md)
+
+The repaired expression synthesizer completed all four methods on the same 80 tasks with zero component errors. The candidate selector solved 26 using fixed inputs and 26 using adaptive inputs. [Traversal fix and rerun](../../../../evidence/OMEGALLM-FRONTIER-20261123/REPORT.md)
