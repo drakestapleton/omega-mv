@@ -1,10 +1,10 @@
 # TURING quantized continuous scorer (qint.v1) and PRD1 reader.
-# New files only: src/turing/ty_qcont.*, src/turing/ty_prd.*,
-# tests/turing/test_ty_qcont.c, tests/turing/qcont_kat_gen.c. Picked up by
-# `-include mk/*.mk`; no Makefile edit; redefines nothing that exists.
+# Pure seeded OM-2: src/turing/ty_qcont_lib.om, tests/turing/test_ty_qcont.om,
+# tests/turing/qcont_kat_gen.om (the C src/turing/ty_qcont.*, ty_prd.* are retired).
+# Picked up by `-include mk/*.mk`; no Makefile edit; redefines nothing that exists.
 #
-# test-turing-qcont: builds the known-answer generator (long double Simpson,
-# also linked in-process into the test) and the test, plain + ASan/UBSan.
+# test-turing-qcont: builds the known-answer generator and the test with the
+# seed omc and runs both.
 ifndef TURING_QCONT_MK
 TURING_QCONT_MK := 1
 .PHONY: test-turing-qcont

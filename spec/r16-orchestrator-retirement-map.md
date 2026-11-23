@@ -976,3 +976,28 @@ sovereign-core `286fa9b`, aegis-runtime `f4e8709`, aienos `bbad5e4`, physics `6d
 After the §1 re-pin the only WARN is the omega row, if the scanned omega is the map-only harness
 commit (as for CAND-2). Map only, no code; the CAND-3 omega code commit is `f816473`.
 This is the G1/G2 inventory for the CAND-3 code, not an R16 qualification receipt.
+
+### 8.10 Note 2026-11-22 (OM waves 29 to 36): rows whose C file is retired to pure OM-2
+
+No row, class or SHA changes. The §4 tables record the scan of the pinned omega commit `f816473`,
+where every file below still exists, so a scan of that pinned checkout stays as §8.9 reports. The
+OM waves 29 to 36 change deletes these C files and replaces each with the pure seeded OM-2 file named
+here. The inventory tool scans only `.c`, `.h` and `.rs`, so a scan of an omega tree at or after that
+change reports each of these 13 rows STALE; the next re-pin of the omega row drops them (none is
+class A, so none is a retirement that must be shown gone).
+
+| row | retired C file | class | replaced by |
+|---|---|---|---|
+| OM-004 | `src/language/omega_lex.c` | N | `src/language/omega_lex.om` |
+| OM-005 | `src/language/omega_lower.c` | N | `src/language/omega_lower.om` |
+| OM-006 | `src/language/omega_parse.c` | N | `src/language/omega_parse.om` |
+| OM-043 | `src/visor/visor_console.c` | B | `src/visor/visor_console.om` |
+| OM-044 | `src/visor/visor_evidence.c` | N | `src/visor/visor_evidence.om` |
+| OM-045 | `src/visor/visor_parse_command.c` | N | `src/visor/visor_parse_command.om` |
+| OM-138 | `src/turing/ty_prd.c` | N | `src/turing/ty_qcont_lib.om` |
+| OM-139 | `src/turing/ty_qrecord.c` | N | `src/turing/ty_qrecord.om` |
+| OM-219 | `src/physics0/planner/pd0_planner.c` | N | `src/physics0/planner/pd0_planner.om` |
+| OM-220 | `src/physics0/planner/pd0_planner.c` | N | `src/physics0/planner/pd0_planner.om` |
+| OM-221 | `src/physics0/planner/pd0_planner.c` | N | `src/physics0/planner/pd0_planner.om` |
+| OM-257 | `tests/physics0/planner/pd0_plan_eff.c` | D | `tests/physics0/planner/pd0_plan_eff.om` |
+| OM-258 | `tests/physics0/planner/pd0_plan_eff2.c` | D | `tests/physics0/planner/pd0_plan_eff2.om` |

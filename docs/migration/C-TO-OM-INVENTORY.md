@@ -6,6 +6,8 @@ Rechecked 2026-11-10 at main `a59a425b`: the totals below and the CSV are the 20
 
 Rechecked 2026-11-19 at main `100a9a914`: the tree now tracks **910 `.c` + 362 `.h` = 1,272** paths (568 under `src/` and 163 under `evidence/`) and **5,421 `.om`** paths (including the integrated pure-Omega Sovereign Intelligence layers `gpu/`, `aienux/`, `apps/`, `bridge/`, `core/`, `protocol/`, `si/`, and `train/`). The per-file role triage below remains the historical 2026-10-24 snapshot.
 
+Updated 2026-11-22 with the OM waves 29 to 36 change: the 48 CSV rows of C/H paths that change deletes (it deletes 49; `tools/gen/retrieval/genret.c` postdates the snapshot and has no row) (the Visor and language lanes, `tools/omega.c`, c2sat, the PD-0 planner, the TURING qrecord/qcont/PRD readers, `est_fit`/`est_eval` and their tests) now carry category `retired`, no build mention, and the pure OM-2 file that replaced each. They are no longer part of what is left. The role-triage totals below are still the 2026-10-24 snapshot and count them.
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage

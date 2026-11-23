@@ -1,6 +1,6 @@
 # PRD2 mixture-capable prediction format + mixture scorer (EXP-002D Stage A).
-# New files only: src/turing/ty_prd2.*, tests/turing/test_ty_prd2.c. Reads
-# ty_qcont/ty_prd/ty_math; changes none of them. Picked up by `-include mk/*.mk`.
+# Pure seeded OM-2: src/turing/ty_qcont_lib.om, tests/turing/test_ty_prd2.om (the C
+# src/turing/ty_prd2.* is retired). Picked up by `-include mk/*.mk`.
 ifndef TURING_PRD2_MK
 TURING_PRD2_MK := 1
 .PHONY: test-turing-prd2

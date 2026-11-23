@@ -1,10 +1,7 @@
-# Omega Visor V1 lane 5 (machine + realization lab) test targets.
-# The Blackwell realize objects compile and link physics-free (only sha256 +
-# omega_core deps). visor_machine.c references omega_blackwell_get_machine_id
-# WEAKLY, so build/omega links with or without them; these lane tests link
-# them explicitly so the declared Blackwell target shows linked=yes.
-VISOR_BW_CORE = omega_vector omega_blackwell_qmd omega_blackwell_encoder omega_blackwell_realize
-VISOR_BW_OBJS = $(addprefix $(OUT_DIR)/,$(addsuffix .o,$(filter-out $(VISOR_CORE),$(VISOR_BW_CORE))))
+# Omega Visor V1 lane 5 (machine + realization lab) test targets, pure seeded OM-2.
+# The retired C lane linked the Blackwell realize objects into its test (visor_machine.c held a
+# weak omega_blackwell_get_machine_id); src/visor/visor_machine.om carries the declared Blackwell
+# machine id itself and links no C object, so no object list is needed here.
 
 # test_visor_machine: pure seeded OM-2 (tests/visor/test_visor_machine.om), built by
 # $(VISOR_OMC) from the machine module and the shared Visor core.

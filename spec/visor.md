@@ -11,10 +11,10 @@ realizing, executing, comparing and understanding Omega semantic state. It is a
 ```text
 OMEGA
 ├── Omega Language   (spec/omega-language-v0.md)     surface syntax, disposable
-├── Omega Compiler   (src/language/omega_lower.c)     lowers into OmegaGraph
+├── Omega Compiler   (src/language/omega_lower.om)    lowers into OmegaGraph
 ├── Omega Runtime    (src/runtime/)                   resident World, generations
 ├── Omega Library    (src/omega_library.c)
-└── Omega Visor      (src/visor/, tools/omega.c)
+└── Omega Visor      (src/visor/*.om, tools/omega.om, tools/omega_ops.om, tools/omega_wire.om)
        ├── Console            visor_console, visor_parse_command
        ├── Semantic Explorer  visor_semantic
        ├── World Explorer     visor_world
@@ -42,10 +42,14 @@ OMEGA
 5. No hidden reasoning is shown. Output is typed views: objects, verification rows,
    realizations, cost classes, evidence records, machine models.
 6. `tools/omegatool.c` is untouched; it remains the qualification/reference tool.
-7. The `omega` binary is physics-free: it links only the core object set in
-   `mk/00-visor-core.mk` and builds with `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0`.
+7. The `omega` binary is physics-free: it is pure seeded OM-2, compiled by `seed/out/omc`
+   from exactly `$(OMEGA_OM_SRCS)` in `mk/00-visor-core.mk` and linking no C object, and
+   builds with `PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0`. The retired C lane
+   (`tools/omega.c`, `src/visor/*.c` except the test-only runtime adapters `visor_world.c` and
+   `visor_effect_request.c`,
+   `src/language/*.c`) is deleted; `make visor-authority-check` scans those OM-2 sources.
 
-## 3. Session model (`src/visor/visor.h`, lead-owned)
+## 3. Session model (`src/visor/visor.om`, lead-owned; the retired C was `src/visor/visor.h`)
 
 A `VisorSession` holds one `OmegaGraph`, named bindings (`let x ...`, `fn ...`),
 the `_` last result, and bounded tables of `OmegaProgram`s and realizations
