@@ -10,14 +10,13 @@ const EST_LN2_LO f64 1.9082149292705877e-10
 const EST_INV_LN2 f64 1.4426950408889634
 const EST_SQRT2 f64 1.4142135623730950
 const EST_SQRT1_2 f64 0.70710678118654752
-const EST_INV_SQRT_PI f64 0.56418958354775629
-const EST_TWO_INV_SQRT_PI f64 1.1283791670955126
-const EST_HALF_LOG_2PI f64 0.91893853320467274
 
 global g_glog_t ulong 274
 global g_glog_ready ulong 1
 global g_gexp_t ulong 278
 global g_gexp_ready ulong 1
+global g_gpow_t ulong 393
+global g_gpow_ready ulong 1
 
 fn est_isfinite x f64 to bool
   bits = bitcast ulong x
@@ -849,33 +848,6 @@ fn est_log x f64 to f64
 end
 
 
-fn est_pow a f64 b f64 to f64
-  if eq b 0.0f64
-    ret 1.0f64
-  end
-  if eq a 1.0f64
-    ret 1.0f64
-  end
-  if eq a 0.0f64
-    if gt b 0.0f64
-      ret 0.0f64
-    end
-    ret est_inf
-  end
-  if lt a 0.0f64
-    bi = est_nearbyint b
-    if eq bi b
-      res = est_exp mul b est_log neg a
-      if ne and long bi 1 0
-        ret neg res
-      end
-      ret res
-    end
-    ret est_nan
-  end
-  ret est_exp mul b est_log a
-end
-
 fn est_powu a f64 n ulong to f64
   res = f64 1.0f64
   base = a
@@ -892,115 +864,1026 @@ fn est_powu a f64 n ulong to f64
   ret res
 end
 
-fn est_lgamma_lanczos z f64 to f64
-  s = f64 0.99999999999980993f64
-  s = add s div 676.5203681218851f64 add z 1.0f64
-  s = add s div -1259.1392167224028f64 add z 2.0f64
-  s = add s div 771.32342877765313f64 add z 3.0f64
-  s = add s div -176.61502916214059f64 add z 4.0f64
-  s = add s div 12.507343278686905f64 add z 5.0f64
-  s = add s div -0.13857109526572012f64 add z 6.0f64
-  s = add s div 9.9843695780195716e-6f64 add z 7.0f64
-  s = add s div 1.5056327351493116e-7f64 add z 8.0f64
-  t = add z 7.5f64
-  ret add sub add EST_HALF_LOG_2PI mul add z 0.5f64 est_log t t est_log s
+note ---- erf(x), erfc(x): bit for bit with glibc 2.39 AArch64 libm (sysdeps/ieee754/dbl-64/s_erf.c) ----
+note Coefficients and branches as s_erf.c. Each fma is a fused multiply-add GCC 13 emitted for
+note that file (-O2, contraction on, as libm is built): the same source compiled that way matches
+note libm.so.6 on 2M samples per function, and with -ffp-contract=off it does not.
+note hi32 is the high word of x as an unsigned 32-bit value (C's int32 hx: sign = bit 31).
+
+fn est_erf_hi x f64 to ulong
+  ret shr bitcast ulong x 32
 end
 
-fn est_lgamma x f64 to f64
-  if not est_isfinite x
-    ret est_nan
-  end
-  if le x 0.0f64
-    ret est_nan
-  end
-  if lt x 1.0f64
-    ret sub est_lgamma_lanczos x est_log x
-  end
-  ret est_lgamma_lanczos sub x 1.0f64
+note r/s of the [0, 0.84375) branch, z = x*x
+fn est_erf_rs_small z f64 to f64
+  r1 = fma z -0.3250421072470015f64 0.12837916709551256f64
+  z2 = mul z z
+  r2 = fma z -0.005770270296489442f64 -0.02848174957559851f64
+  z4 = mul z2 z2
+  s1 = fma z 0.39791722395915535f64 1.0f64
+  s2 = fma z 0.005081306281875766f64 0.0650222499887673f64
+  s3 = fma z -3.960228278775368e-06f64 0.00013249473800432164f64
+  r = fma z4 -2.3763016656650163e-05f64 fma z2 r2 r1
+  s = fma z4 s3 fma z2 s2 s1
+  ret div r s
 end
 
-fn est_erf_series x f64 to f64
-  x2 = mul x x
-  term = x
-  s = term
-  k = ulong 1
-  while lt k 120 bound 120
-    term = div mul term mul 2.0f64 x2 f64 add mul 2 k 1
-    s = add s term
-    if le fabs term mul 1.0e-17f64 fabs s
-      break
-    end
-    k = add k 1
-  end
-  ret mul mul EST_TWO_INV_SQRT_PI est_exp neg x2 s
+note P/Q of the [0.84375, 1.25) branch, s = |x| - 1
+fn est_erf_pq_mid s f64 to f64
+  p1 = fma s 0.41485611868374833f64 -0.0023621185607526594f64
+  s2 = mul s s
+  q1 = fma s 0.10642088040084423f64 1.0f64
+  s4 = mul s2 s2
+  p2 = fma s 0.31834661990116175f64 -0.3722078760357013f64
+  s6 = mul s2 s4
+  q2 = fma s 0.07182865441419627f64 0.540397917702171f64
+  p3 = fma s 0.035478304325618236f64 -0.11089469428239668f64
+  q3 = fma s 0.01363708391202905f64 0.12617121980876164f64
+  pp = fma s6 -0.002166375594868791f64 fma s4 p3 fma s2 p2 p1
+  qq = fma s6 0.011984499846799107f64 fma s4 q3 fma s2 q2 q1
+  ret div pp qq
 end
 
-fn est_erfc_cf x f64 to f64
-  fpmin = f64 1.0e-300f64
-  b = x
-  c = div 1.0f64 fpmin
-  d = div 1.0f64 b
-  h = d
-  m = ulong 1
-  while le m 200 bound 200
-    an = mul 0.5f64 f64 m
-    d = add x mul an d
-    if lt fabs d fpmin
-      d = fpmin
-    end
-    c = add x div an c
-    if lt fabs c fpmin
-      c = fpmin
-    end
-    d = div 1.0f64 d
-    del = mul d c
-    h = mul h del
-    if le fabs sub del 1.0f64 1.0e-15f64
-      break
-    end
-    m = add m 1
-  end
-  ret mul mul EST_INV_SQRT_PI est_exp neg mul x x h
+note R/S for |x| in [1.25, 1/0.35), s = 1/(x*x)
+fn est_erf_rs_a s f64 to f64
+  s2 = mul s s
+  s4 = mul s2 s2
+  s6 = mul s2 s4
+  r1 = fma s -0.6938585727071818f64 -0.009864944034847148f64
+  r2 = fma s -62.375332450326006f64 -10.558626225323291f64
+  r3 = fma s -184.60509290671104f64 -162.39666946257347f64
+  r4 = fma s -9.814329344169145f64 -81.2874355063066f64
+  rr = fma s6 r4 fma s4 r3 fma s2 r2 r1
+  ret rr
 end
 
-fn est_erfc x f64 to f64
-  if est_isnan x
-    ret x
+fn est_erf_ss_a s f64 to f64
+  s2 = mul s s
+  s4 = mul s2 s2
+  s6 = mul s2 s4
+  s8 = mul s4 s4
+  t1 = fma s 19.651271667439257f64 1.0f64
+  t2 = fma s 434.56587747522923f64 137.65775414351904f64
+  t3 = fma s 429.00814002756783f64 645.3872717332679f64
+  t4 = fma s 6.570249770319282f64 108.63500554177944f64
+  ret fma s8 -0.0604244152148581f64 fma s6 t4 fma s4 t3 fma s2 t2 t1
+end
+
+note R/S for |x| in [1/0.35, 28)
+fn est_erf_rs_b s f64 to f64
+  s2 = mul s s
+  s4 = mul s2 s2
+  s6 = mul s2 s4
+  r1 = fma s -0.799283237680523f64 -0.0098649429247001f64
+  r2 = fma s -160.63638485582192f64 -17.757954917754752f64
+  r3 = fma s -1025.0951316110772f64 -637.5664433683896f64
+  ret fma s6 -483.5191916086514f64 fma s4 r3 fma s2 r2 r1
+end
+
+fn est_erf_ss_b s f64 to f64
+  s2 = mul s s
+  s4 = mul s2 s2
+  s6 = mul s2 s4
+  t1 = fma s 30.33806074348246f64 1.0f64
+  t2 = fma s 1536.729586084437f64 325.7925129965739f64
+  t3 = fma s 2553.0504064331644f64 3199.8582195085955f64
+  t4 = fma s -22.44095244658582f64 474.52854120695537f64
+  ret fma s6 t4 fma s4 t3 fma s2 t2 t1
+end
+
+note exp(-z*z - 0.5625) * exp((z - x)*(z + x) + R/S), z = x with its low word cleared (x = |x|)
+fn est_erf_tail x f64 rs f64 to f64
+  z = bitcast f64 and bitcast ulong x ulong 18446744069414584320
+  e1 = est_exp fma neg z z -0.5625f64
+  e2 = est_exp fma sub z x add z x rs
+  ret mul e1 e2
+end
+
+note R/S of the tail branches for |x| (ix = high word without sign), split at lim
+fn est_erf_tail_rs ax f64 ix ulong lim ulong to f64
+  s = div 1.0f64 mul ax ax
+  if lt ix lim
+    ret div est_erf_rs_a s est_erf_ss_a s
   end
-  if lt x 0.0f64
-    ret sub 2.0f64 est_erfc neg x
-  end
-  if eq x 0.0f64
-    ret 1.0f64
-  end
-  if gt x 27.3f64
-    ret 0.0f64
-  end
-  if lt x 2.0f64
-    ret sub 1.0f64 est_erf_series x
-  end
-  ret est_erfc_cf x
+  ret div est_erf_rs_b s est_erf_ss_b s
 end
 
 fn est_erf x f64 to f64
-  if est_isnan x
-    ret x
+  hi = est_erf_hi x
+  ix = and hi 2147483647
+  neg_x = ne shr hi 31 0
+  if ge ix 2146435072
+    sg = f64 1.0f64
+    if neg_x
+      sg = f64 -1.0f64
+    end
+    ret add sg div 1.0f64 x
+  end
+  if lt ix 1072365568
+    if lt ix 1043333120
+      if lt ix 8388608
+        ret mul fma x 16.0f64 mul x mul 16.0f64 0.1283791670955126f64 0.0625f64
+      end
+      ret fma x 0.1283791670955126f64 x
+    end
+    ret fma x est_erf_rs_small mul x x x
+  end
+  if lt ix 1072955392
+    pq = est_erf_pq_mid sub fabs x 1.0f64
+    if neg_x
+      ret sub -0.8450629115104675f64 pq
+    end
+    ret add pq 0.8450629115104675f64
+  end
+  if ge ix 1075314688
+    if neg_x
+      ret sub 1.0e-300f64 1.0f64
+    end
+    ret sub 1.0f64 1.0e-300f64
   end
   ax = fabs x
-  r = f64 0.0f64
-  if gt ax 6.5f64
-    r = 1.0f64
-  else
-    if lt ax 2.0f64
-      r = est_erf_series ax
-    else
-      r = sub 1.0f64 est_erfc_cf ax
+  r = est_erf_tail ax est_erf_tail_rs ax ix 1074191214
+  if neg_x
+    ret sub div r ax 1.0f64
+  end
+  ret sub 1.0f64 div r ax
+end
+
+fn est_erfc_small x f64 hi ulong to f64
+  y = est_erf_rs_small mul x x
+  xy = mul x y
+  if or ne shr hi 31 0 lt hi 1070596096
+    ret sub 1.0f64 add xy x
+  end
+  ret sub 0.5f64 add xy sub x 0.5f64
+end
+
+fn est_erfc x f64 to f64
+  hi = est_erf_hi x
+  ix = and hi 2147483647
+  neg_x = ne shr hi 31 0
+  if ge ix 2146435072
+    sg = f64 0.0f64
+    if neg_x
+      sg = f64 2.0f64
+    end
+    ret add sg div 1.0f64 x
+  end
+  if lt ix 1072365568
+    if lt ix 1013972992
+      ret sub 1.0f64 x
+    end
+    ret est_erfc_small x hi
+  end
+  if lt ix 1072955392
+    pq = est_erf_pq_mid sub fabs x 1.0f64
+    if neg_x
+      ret add add pq 0.8450629115104675f64 1.0f64
+    end
+    ret sub 0.15493708848953247f64 pq
+  end
+  if lt ix 1077673984
+    if and neg_x ge ix 1075314688
+      ret sub 2.0f64 1.0e-300f64
+    end
+    ax = fabs x
+    r = est_erf_tail ax est_erf_tail_rs ax ix 1074191213
+    if neg_x
+      ret sub 2.0f64 div r ax
+    end
+    ret div r ax
+  end
+  if neg_x
+    ret sub 2.0f64 1.0e-300f64
+  end
+  ret mul 1.0e-300f64 1.0e-300f64
+end
+
+note ---- lgamma(x): bit for bit with glibc 2.39 AArch64 libm for x > 0, +-0, +-inf and nan ----
+note (sysdeps/ieee754/dbl-64/e_lgamma_r.c; fused steps as GCC 13 emitted them, checked on 2M
+note samples against libm.so.6). Finite x < 0 is not implemented (glibc's lgamma_neg and sin_pi)
+note and returns nan; no estimation caller passes a negative argument.
+
+note [0.9, 2) and [0, 0.9) polynomial cases of e_lgamma_r.c: i = 0 (a-series), y, plus r
+fn est_lg_case0 y f64 r f64 to f64
+  z = mul y y
+  p1 = fma z 2.5214456545125733e-05f64 0.00022086279071390839f64
+  p1 = fma p1 z 0.0011927076318336207f64
+  p1 = fma p1 z 0.007385550860814029f64
+  p1 = fma p1 z 0.06735230105312927f64
+  p1 = fma p1 z 0.07721566490153287f64
+  p2 = fma z 4.4864094961891516e-05f64 0.00010801156724758394f64
+  p2 = fma p2 z 0.0005100697921535113f64
+  p2 = fma p2 z 0.0028905138367341563f64
+  p2 = fma p2 z 0.020580808432516733f64
+  p2 = fma p2 z 0.3224670334241136f64
+  p = fma p2 z mul p1 y
+  ret add fma neg y 0.5f64 p r
+end
+
+note i = 1 (t-series); p = z*p1 - t is one fused step (.FMS)
+fn est_lg_case1_fms y f64 r f64 to f64
+  z = mul y y
+  w = mul z y
+  p1 = fma w 0.00031563207090362595f64 -0.0014034646998923284f64
+  p1 = fma p1 w 0.006100538702462913f64
+  p1 = fma p1 w -0.032788541075985965f64
+  p1 = fma p1 w 0.48383612272381005f64
+  p2 = fma w -0.00031275416837512086f64 0.000881081882437654f64
+  p2 = fma p2 w -0.0036845201678113826f64
+  p2 = fma p2 w 0.01797067508118204f64
+  p2 = fma p2 w -0.1475877229945939f64
+  p3 = fma w 0.0003355291926355191f64 -0.0005385953053567405f64
+  p3 = fma p3 w 0.0022596478090061247f64
+  p3 = fma p3 w -0.010314224129834144f64
+  p3 = fma p3 w 0.06462494023913339f64
+  t = fma neg fma p3 y p2 w -3.638676997039505e-18f64
+  p = fma z p1 neg t
+  ret add sub p 0.12148629053584961f64 r
+end
+
+fn est_lg_case2 y f64 r f64 to f64
+  p1 = fma y 0.013381091853678766f64 0.22896372806469245f64
+  p1 = fma p1 y 0.9777175279633727f64
+  p1 = fma p1 y 1.4549225013723477f64
+  p1 = fma p1 y 0.6328270640250934f64
+  p1 = mul fma p1 y -0.07721566490153287f64 y
+  p2 = fma y 0.003217092422824239f64 0.10422264559336913f64
+  p2 = fma p2 y 0.7692851504566728f64
+  p2 = fma p2 y 2.128489763798934f64
+  p2 = fma p2 y 2.4559779371304113f64
+  p2 = fma p2 y 1.0f64
+  ret add fma y -0.5f64 div p1 p2 r
+end
+
+note x < 2 (x > 0, x not 1)
+fn est_lg_below2 x f64 ix ulong to f64
+  if le ix 1072483532
+    r = neg est_log x
+    if ge ix 1072130372
+      ret est_lg_case0 sub 1.0f64 x r
+    end
+    if ge ix 1070442081
+      ret est_lg_case1_fms sub x 0.46163214496836225f64 r
+    end
+    ret est_lg_case2 x r
+  end
+  if ge ix 1073460419
+    ret est_lg_case0 sub 2.0f64 x 0.0f64
+  end
+  if ge ix 1072936132
+    ret est_lg_case1_fms sub x 1.4616321449683622f64 0.0f64
+  end
+  ret est_lg_case2 sub x 1.0f64 0.0f64
+end
+
+note [2, 8)
+fn est_lg_below8 x f64 to f64
+  i = long x
+  y = sub x f64 i
+  p = fma y 3.194753265841009e-05f64 0.0018402845140733772f64
+  p = fma p y 0.02664227030336386f64
+  p = fma p y 0.14635047265246445f64
+  p = fma p y 0.325778796408931f64
+  p = fma p y 0.21498241596060885f64
+  p = mul fma p y -0.07721566490153287f64 y
+  q = fma y 7.326684307446256e-06f64 0.0007779424963818936f64
+  q = fma q y 0.01864591917156529f64
+  q = fma q y 0.17193386563280308f64
+  q = fma q y 0.7219355475671381f64
+  q = fma q y 1.3920053346762105f64
+  q = fma q y 1.0f64
+  r = fma y 0.5f64 div p q
+  if lt i 3
+    ret r
+  end
+  z = f64 1.0f64
+  if ge i 7
+    z = mul z add y 6.0f64
+  end
+  if ge i 6
+    z = mul z add y 5.0f64
+  end
+  if ge i 5
+    z = mul z add y 4.0f64
+  end
+  if ge i 4
+    z = mul z add y 3.0f64
+  end
+  z = mul z add y 2.0f64
+  ret add r est_log z
+end
+
+note [8, 2^58)
+fn est_lg_large x f64 to f64
+  t = est_log x
+  z = div 1.0f64 x
+  y = mul z z
+  w = fma y -0.0016309293409657527f64 0.0008363399189962821f64
+  w = fma w y -0.00059518755745034f64
+  w = fma w y 0.0007936505586430196f64
+  w = fma w y -0.0027777777772877554f64
+  w = fma w y 0.08333333333333297f64
+  w = fma w z 0.4189385332046727f64
+  ret fma sub x 0.5f64 sub t 1.0f64 w
+end
+
+fn est_lgamma x f64 to f64
+  bits = bitcast ulong x
+  hi = shr bits 32
+  lo = and bits 4294967295
+  ix = and hi 2147483647
+  if ge ix 2146435072
+    ret mul x x
+  end
+  if eq or ix lo 0
+    ret div 1.0f64 fabs x
+  end
+  if ne shr hi 31 0
+    ret est_nan
+  end
+  if lt ix 999292928
+    ret neg est_log x
+  end
+  if eq lo 0
+    if or eq ix 1072693248 eq ix 1073741824
+      ret 0.0f64
     end
   end
-  if lt x 0.0f64
-    ret neg r
+  if lt ix 1073741824
+    ret est_lg_below2 x ix
   end
-  ret r
+  if lt ix 1075838976
+    ret est_lg_below8 x
+  end
+  if lt ix 1133510656
+    ret est_lg_large x
+  end
+  ret mul sub est_log x 1.0f64 x
+end
+
+note __pow_log_data of glibc 2.39 (e_pow_log_data.c; ln2hi, ln2lo, poly, tab[128] invc/logc/logctail)
+fn est_gpow_init to void
+  put g_gpow_t 0 ulong 4604418534313441280
+  put g_gpow_t 1 ulong 4408728642709317424
+  put g_gpow_t 2 ulong 13826050856027422720
+  put g_gpow_t 3 ulong 13827552055903212896
+  put g_gpow_t 4 ulong 4602678819172646918
+  put g_gpow_t 5 ulong 4605380978944857422
+  put g_gpow_t 6 ulong 13827552055900349562
+  put g_gpow_t 7 ulong 13831198063404271081
+  put g_gpow_t 8 ulong 4607182605818150851
+  put g_gpow_t 9 ulong 4609047190520725504
+  put g_gpow_t 10 ulong 13823285047189948416
+  put g_gpow_t 11 ulong 4394022453839877760
+  put g_gpow_t 12 ulong 4609012006148636672
+  put g_gpow_t 13 ulong 13823185244172847104
+  put g_gpow_t 14 ulong 13626948029933221664
+  put g_gpow_t 15 ulong 4608976821776547840
+  put g_gpow_t 16 ulong 13823084885147211776
+  put g_gpow_t 17 ulong 13628845357452906605
+  put g_gpow_t 18 ulong 4608941637404459008
+  put g_gpow_t 19 ulong 13822983963883206656
+  put g_gpow_t 20 ulong 13611713041223673813
+  put g_gpow_t 21 ulong 4608906453032370176
+  put g_gpow_t 22 ulong 13822882474045700096
+  put g_gpow_t 23 ulong 13620041313329692384
+  put g_gpow_t 24 ulong 4608871268660281344
+  put g_gpow_t 25 ulong 13822780409191882752
+  put g_gpow_t 26 ulong 4401098958459143372
+  put g_gpow_t 27 ulong 4608836084288192512
+  put g_gpow_t 28 ulong 13822677762768807936
+  put g_gpow_t 29 ulong 4385453752581229370
+  put g_gpow_t 30 ulong 4608800899916103680
+  put g_gpow_t 31 ulong 13822574528110872576
+  put g_gpow_t 32 ulong 4404715901783479392
+  put g_gpow_t 33 ulong 4608765715544014848
+  put g_gpow_t 34 ulong 13822470698437214208
+  put g_gpow_t 35 ulong 4406026001268965522
+  put g_gpow_t 36 ulong 4608730531171926016
+  put g_gpow_t 37 ulong 13822366266849042432
+  put g_gpow_t 38 ulong 4406344656786762712
+  put g_gpow_t 39 ulong 4608695346799837184
+  put g_gpow_t 40 ulong 13822261226326886400
+  put g_gpow_t 41 ulong 4401646401139748927
+  put g_gpow_t 42 ulong 4608695346799837184
+  put g_gpow_t 43 ulong 13822261226326886400
+  put g_gpow_t 44 ulong 4401646401139748927
+  put g_gpow_t 45 ulong 4608660162427748352
+  put g_gpow_t 46 ulong 13822155569727764480
+  put g_gpow_t 47 ulong 13625176833997920886
+  put g_gpow_t 48 ulong 4608624978055659520
+  put g_gpow_t 49 ulong 13822049289782269952
+  put g_gpow_t 50 ulong 13627804221195113476
+  put g_gpow_t 51 ulong 4608589793683570688
+  put g_gpow_t 52 ulong 13821942379091568640
+  put g_gpow_t 53 ulong 4404273896719821040
+  put g_gpow_t 54 ulong 4608554609311481856
+  put g_gpow_t 55 ulong 13821834830124304384
+  put g_gpow_t 56 ulong 13629766886295427686
+  put g_gpow_t 57 ulong 4608519424939393024
+  put g_gpow_t 58 ulong 13821726635213426688
+  put g_gpow_t 59 ulong 13622381644965217038
+  put g_gpow_t 60 ulong 4608484240567304192
+  put g_gpow_t 61 ulong 13821617786552897536
+  put g_gpow_t 62 ulong 13614441840109694335
+  put g_gpow_t 63 ulong 4608484240567304192
+  put g_gpow_t 64 ulong 13821617786552897536
+  put g_gpow_t 65 ulong 13614441840109694335
+  put g_gpow_t 66 ulong 4608449056195215360
+  put g_gpow_t 67 ulong 13821469295988588544
+  put g_gpow_t 68 ulong 4399268251790032007
+  put g_gpow_t 69 ulong 4608413871823126528
+  put g_gpow_t 70 ulong 13821248935686856704
+  put g_gpow_t 71 ulong 4407659230359105316
+  put g_gpow_t 72 ulong 4608378687451037696
+  put g_gpow_t 73 ulong 13821027219313192960
+  put g_gpow_t 74 ulong 13625411215395127056
+  put g_gpow_t 75 ulong 4608343503078948864
+  put g_gpow_t 76 ulong 13820804130073985024
+  put g_gpow_t 77 ulong 4405007045628684315
+  put g_gpow_t 78 ulong 4608308318706860032
+  put g_gpow_t 79 ulong 13820579650861703168
+  put g_gpow_t 80 ulong 4406624142369981492
+  put g_gpow_t 81 ulong 4608308318706860032
+  put g_gpow_t 82 ulong 13820579650861703168
+  put g_gpow_t 83 ulong 4406624142369981492
+  put g_gpow_t 84 ulong 4608273134334771200
+  put g_gpow_t 85 ulong 13820353764247048192
+  put g_gpow_t 86 ulong 4402636629383821199
+  put g_gpow_t 87 ulong 4608237949962682368
+  put g_gpow_t 88 ulong 13820126452470824960
+  put g_gpow_t 89 ulong 4375896176123023462
+  put g_gpow_t 90 ulong 4608202765590593536
+  put g_gpow_t 91 ulong 13819897697435561984
+  put g_gpow_t 92 ulong 13629454212126917098
+  put g_gpow_t 93 ulong 4608202765590593536
+  put g_gpow_t 94 ulong 13819897697435561984
+  put g_gpow_t 95 ulong 13629454212126917098
+  put g_gpow_t 96 ulong 4608167581218504704
+  put g_gpow_t 97 ulong 13819667480696868864
+  put g_gpow_t 98 ulong 13630937952208147683
+  put g_gpow_t 99 ulong 4608132396846415872
+  put g_gpow_t 100 ulong 13819435783454511104
+  put g_gpow_t 101 ulong 4407825290493688329
+  put g_gpow_t 102 ulong 4608097212474327040
+  put g_gpow_t 103 ulong 13819202586543185920
+  put g_gpow_t 104 ulong 4407858073751997016
+  put g_gpow_t 105 ulong 4608097212474327040
+  put g_gpow_t 106 ulong 13819202586543185920
+  put g_gpow_t 107 ulong 4407858073751997016
+  put g_gpow_t 108 ulong 4608062028102238208
+  put g_gpow_t 109 ulong 13818967870423027712
+  put g_gpow_t 110 ulong 13623640019459826278
+  put g_gpow_t 111 ulong 4608026843730149376
+  put g_gpow_t 112 ulong 13818731615169777664
+  put g_gpow_t 113 ulong 13627503535738343481
+  put g_gpow_t 114 ulong 4608026843730149376
+  put g_gpow_t 115 ulong 13818731615169777664
+  put g_gpow_t 116 ulong 13627503535738343481
+  put g_gpow_t 117 ulong 4607991659358060544
+  put g_gpow_t 118 ulong 13818493800464625664
+  put g_gpow_t 119 ulong 13628137163421342607
+  put g_gpow_t 120 ulong 4607956474985971712
+  put g_gpow_t 121 ulong 13818254405583732736
+  put g_gpow_t 122 ulong 4402001185477064764
+  put g_gpow_t 123 ulong 4607956474985971712
+  put g_gpow_t 124 ulong 13818254405583732736
+  put g_gpow_t 125 ulong 4402001185477064764
+  put g_gpow_t 126 ulong 4607921290613882880
+  put g_gpow_t 127 ulong 13818013409387384832
+  put g_gpow_t 128 ulong 4391423629878318138
+  put g_gpow_t 129 ulong 4607886106241794048
+  put g_gpow_t 130 ulong 13817770790308802560
+  put g_gpow_t 131 ulong 13629173610021241864
+  put g_gpow_t 132 ulong 4607850921869705216
+  put g_gpow_t 133 ulong 13817526526342553600
+  put g_gpow_t 134 ulong 13631974564363871126
+  put g_gpow_t 135 ulong 4607850921869705216
+  put g_gpow_t 136 ulong 13817526526342553600
+  put g_gpow_t 137 ulong 13631974564363871126
+  put g_gpow_t 138 ulong 4607815737497616384
+  put g_gpow_t 139 ulong 13817280595032576000
+  put g_gpow_t 140 ulong 4398444081343650804
+  put g_gpow_t 141 ulong 4607815737497616384
+  put g_gpow_t 142 ulong 13817280595032576000
+  put g_gpow_t 143 ulong 4398444081343650804
+  put g_gpow_t 144 ulong 4607780553125527552
+  put g_gpow_t 145 ulong 13817022290146877440
+  put g_gpow_t 146 ulong 13629428852498576370
+  put g_gpow_t 147 ulong 4607745368753438720
+  put g_gpow_t 148 ulong 13816523619685826560
+  put g_gpow_t 149 ulong 4407392549639028796
+  put g_gpow_t 150 ulong 4607745368753438720
+  put g_gpow_t 151 ulong 13816523619685826560
+  put g_gpow_t 152 ulong 4407392549639028796
+  put g_gpow_t 153 ulong 4607710184381349888
+  put g_gpow_t 154 ulong 13816021474141257728
+  put g_gpow_t 155 ulong 13627061616777346566
+  put g_gpow_t 156 ulong 4607675000009261056
+  put g_gpow_t 157 ulong 13815515804739493888
+  put g_gpow_t 158 ulong 4405990714146269896
+  put g_gpow_t 159 ulong 4607675000009261056
+  put g_gpow_t 160 ulong 13815515804739493888
+  put g_gpow_t 161 ulong 4405990714146269896
+  put g_gpow_t 162 ulong 4607639815637172224
+  put g_gpow_t 163 ulong 13815006561672732672
+  put g_gpow_t 164 ulong 4400997777701557864
+  put g_gpow_t 165 ulong 4607639815637172224
+  put g_gpow_t 166 ulong 13815006561672732672
+  put g_gpow_t 167 ulong 4400997777701557864
+  put g_gpow_t 168 ulong 4607604631265083392
+  put g_gpow_t 169 ulong 13814493694069661696
+  put g_gpow_t 170 ulong 13629747588137972698
+  put g_gpow_t 171 ulong 4607569446892994560
+  put g_gpow_t 172 ulong 13813977149964951552
+  put g_gpow_t 173 ulong 4404241552097304151
+  put g_gpow_t 174 ulong 4607569446892994560
+  put g_gpow_t 175 ulong 13813977149964951552
+  put g_gpow_t 176 ulong 4404241552097304151
+  put g_gpow_t 177 ulong 4607534262520905728
+  put g_gpow_t 178 ulong 13813456876267626496
+  put g_gpow_t 179 ulong 4408002429123630047
+  put g_gpow_t 180 ulong 4607534262520905728
+  put g_gpow_t 181 ulong 13813456876267626496
+  put g_gpow_t 182 ulong 4408002429123630047
+  put g_gpow_t 183 ulong 4607499078148816896
+  put g_gpow_t 184 ulong 13812932818728353792
+  put g_gpow_t 185 ulong 4401279481005712137
+  put g_gpow_t 186 ulong 4607463893776728064
+  put g_gpow_t 187 ulong 13812269786665680896
+  put g_gpow_t 188 ulong 4408278147606679185
+  put g_gpow_t 189 ulong 4607463893776728064
+  put g_gpow_t 190 ulong 13812269786665680896
+  put g_gpow_t 191 ulong 4408278147606679185
+  put g_gpow_t 192 ulong 4607428709404639232
+  put g_gpow_t 193 ulong 13811206201114460160
+  put g_gpow_t 194 ulong 4403538000015159372
+  put g_gpow_t 195 ulong 4607428709404639232
+  put g_gpow_t 196 ulong 13811206201114460160
+  put g_gpow_t 197 ulong 4403538000015159372
+  put g_gpow_t 198 ulong 4607393525032550400
+  put g_gpow_t 199 ulong 13810134707791380480
+  put g_gpow_t 200 ulong 13631547550609875438
+  put g_gpow_t 201 ulong 4607393525032550400
+  put g_gpow_t 202 ulong 13810134707791380480
+  put g_gpow_t 203 ulong 13631547550609875438
+  put g_gpow_t 204 ulong 4607358340660461568
+  put g_gpow_t 205 ulong 13809055188226326528
+  put g_gpow_t 206 ulong 4392420000685031082
+  put g_gpow_t 207 ulong 4607358340660461568
+  put g_gpow_t 208 ulong 13809055188226326528
+  put g_gpow_t 209 ulong 4392420000685031082
+  put g_gpow_t 210 ulong 4607323156288372736
+  put g_gpow_t 211 ulong 13807898585015517184
+  put g_gpow_t 212 ulong 13630566649999264228
+  put g_gpow_t 213 ulong 4607323156288372736
+  put g_gpow_t 214 ulong 13807898585015517184
+  put g_gpow_t 215 ulong 13630566649999264228
+  put g_gpow_t 216 ulong 4607287971916283904
+  put g_gpow_t 217 ulong 13805706708474232832
+  put g_gpow_t 218 ulong 13630299666636252729
+  put g_gpow_t 219 ulong 4607252787544195072
+  put g_gpow_t 220 ulong 13803463213670203392
+  put g_gpow_t 221 ulong 13609630121002772124
+  put g_gpow_t 222 ulong 4607252787544195072
+  put g_gpow_t 223 ulong 13803463213670203392
+  put g_gpow_t 224 ulong 13609630121002772124
+  put g_gpow_t 225 ulong 4607217603172106240
+  put g_gpow_t 226 ulong 13798994256075948032
+  put g_gpow_t 227 ulong 13626170908029370596
+  put g_gpow_t 228 ulong 4607217603172106240
+  put g_gpow_t 229 ulong 13798994256075948032
+  put g_gpow_t 230 ulong 13626170908029370596
+  put g_gpow_t 231 ulong 4607182418800017408
+  put g_gpow_t 232 ulong 0
+  put g_gpow_t 233 ulong 0
+  put g_gpow_t 234 ulong 4607182418800017408
+  put g_gpow_t 235 ulong 0
+  put g_gpow_t 236 ulong 0
+  put g_gpow_t 237 ulong 4607112050055839744
+  put g_gpow_t 238 ulong 4575674905760694272
+  put g_gpow_t 239 ulong 13623608137748392936
+  put g_gpow_t 240 ulong 4607041681311662080
+  put g_gpow_t 241 ulong 4580196376261132288
+  put g_gpow_t 242 ulong 13628979180868925394
+  put g_gpow_t 243 ulong 4606971312567484416
+  put g_gpow_t 244 ulong 4582493044796358656
+  put g_gpow_t 245 ulong 13630883943759350836
+  put g_gpow_t 246 ulong 4606900943823306752
+  put g_gpow_t 247 ulong 4584736290664562688
+  put g_gpow_t 248 ulong 4395814229181060947
+  put g_gpow_t 249 ulong 4606830575079129088
+  put g_gpow_t 250 ulong 4585903221640134656
+  put g_gpow_t 251 ulong 13631294857296084264
+  put g_gpow_t 252 ulong 4606760206334951424
+  put g_gpow_t 253 ulong 4587079678688215040
+  put g_gpow_t 254 ulong 13626055831938803325
+  put g_gpow_t 255 ulong 4606689837590773760
+  put g_gpow_t 256 ulong 4588265818619232256
+  put g_gpow_t 257 ulong 13626319012359579655
+  put g_gpow_t 258 ulong 4606654653218684928
+  put g_gpow_t 259 ulong 4588862569733079040
+  put g_gpow_t 260 ulong 13622844882166561659
+  put g_gpow_t 261 ulong 4606584284474507264
+  put g_gpow_t 262 ulong 4589615778437160960
+  put g_gpow_t 263 ulong 13629355223763754651
+  put g_gpow_t 264 ulong 4606513915730329600
+  put g_gpow_t 265 ulong 4590221308000854016
+  put g_gpow_t 266 ulong 4408118444123967191
+  put g_gpow_t 267 ulong 4606443546986151936
+  put g_gpow_t 268 ulong 4590831969232199680
+  put g_gpow_t 269 ulong 13631385647647104286
+  put g_gpow_t 270 ulong 4606408362614063104
+  put g_gpow_t 271 ulong 4591139251548766208
+  put g_gpow_t 272 ulong 4389917330564312370
+  put g_gpow_t 273 ulong 4606337993869885440
+  put g_gpow_t 274 ulong 4591757775467003904
+  put g_gpow_t 275 ulong 4405383948318623706
+  put g_gpow_t 276 ulong 4606267625125707776
+  put g_gpow_t 277 ulong 4592381654637305856
+  put g_gpow_t 278 ulong 13624392177893730533
+  put g_gpow_t 279 ulong 4606232440753618944
+  put g_gpow_t 280 ulong 4592695631578677248
+  put g_gpow_t 281 ulong 4406287152218549459
+  put g_gpow_t 282 ulong 4606162072009441280
+  put g_gpow_t 283 ulong 4593327719790026752
+  put g_gpow_t 284 ulong 13631763202980595168
+  put g_gpow_t 285 ulong 4606126887637352448
+  put g_gpow_t 286 ulong 4593645855379808256
+  put g_gpow_t 287 ulong 13629357942370274045
+  put g_gpow_t 288 ulong 4606056518893174784
+  put g_gpow_t 289 ulong 4593978995731062784
+  put g_gpow_t 290 ulong 4405065212679227378
+  put g_gpow_t 291 ulong 4606021334521085952
+  put g_gpow_t 292 ulong 4594140198671216640
+  put g_gpow_t 293 ulong 4408082364760627508
+  put g_gpow_t 294 ulong 4605950965776908288
+  put g_gpow_t 295 ulong 4594464784623501312
+  put g_gpow_t 296 ulong 4396530751840040097
+  put g_gpow_t 297 ulong 4605915781404819456
+  put g_gpow_t 298 ulong 4594628180808404992
+  put g_gpow_t 299 ulong 4379240086857544329
+  put g_gpow_t 300 ulong 4605845412660641792
+  put g_gpow_t 301 ulong 4594957213204983808
+  put g_gpow_t 302 ulong 4406072367592093304
+  put g_gpow_t 303 ulong 4605810228288552960
+  put g_gpow_t 304 ulong 4595122863138254848
+  put g_gpow_t 305 ulong 4406266360802934215
+  put g_gpow_t 306 ulong 4605739859544375296
+  put g_gpow_t 307 ulong 4595456465494085632
+  put g_gpow_t 308 ulong 4402778307380915832
+  put g_gpow_t 309 ulong 4605704675172286464
+  put g_gpow_t 310 ulong 4595624432217976832
+  put g_gpow_t 311 ulong 13629319148446949857
+  put g_gpow_t 312 ulong 4605669490800197632
+  put g_gpow_t 313 ulong 4595793185674121216
+  put g_gpow_t 314 ulong 13626878793310356229
+  put g_gpow_t 315 ulong 4605599122056019968
+  put g_gpow_t 316 ulong 4596133082506526720
+  put g_gpow_t 317 ulong 13620923031859309777
+  put g_gpow_t 318 ulong 4605563937683931136
+  put g_gpow_t 319 ulong 4596304241009033216
+  put g_gpow_t 320 ulong 4397749816250138479
+  put g_gpow_t 321 ulong 4605493568939753472
+  put g_gpow_t 322 ulong 4596649016817278976
+  put g_gpow_t 323 ulong 13630269905673003369
+  put g_gpow_t 324 ulong 4605458384567664640
+  put g_gpow_t 325 ulong 4596822649910054912
+  put g_gpow_t 326 ulong 13622321853915521450
+  put g_gpow_t 327 ulong 4605423200195575808
+  put g_gpow_t 328 ulong 4596997123844333568
+  put g_gpow_t 329 ulong 13631634953804714678
+  put g_gpow_t 330 ulong 4605388015823486976
+  put g_gpow_t 331 ulong 4597172446803529728
+  put g_gpow_t 332 ulong 13614923126203100114
+  put g_gpow_t 333 ulong 4605317647079309312
+  put g_gpow_t 334 ulong 4597525673132986368
+  put g_gpow_t 335 ulong 13630987782189330485
+  put g_gpow_t 336 ulong 4605282462707220480
+  put g_gpow_t 337 ulong 4597703593479835648
+  put g_gpow_t 338 ulong 4378081748085503024
+  put g_gpow_t 339 ulong 4605247278335131648
+  put g_gpow_t 340 ulong 4597882396809691136
+  put g_gpow_t 341 ulong 13603722000210824721
+  put g_gpow_t 342 ulong 4605212093963042816
+  put g_gpow_t 343 ulong 4598062091930415104
+  put g_gpow_t 344 ulong 4403337278547353392
+  put g_gpow_t 345 ulong 4605141725218865152
+  put g_gpow_t 346 ulong 4598299706493065216
+  put g_gpow_t 347 ulong 4393433901296340625
+  put g_gpow_t 348 ulong 4605106540846776320
+  put g_gpow_t 349 ulong 4598390918832283648
+  put g_gpow_t 350 ulong 4406517746057931497
+  put g_gpow_t 351 ulong 4605071356474687488
+  put g_gpow_t 352 ulong 4598482595358435328
+  put g_gpow_t 353 ulong 13631306517828726812
+  put g_gpow_t 354 ulong 4605036172102598656
+  put g_gpow_t 355 ulong 4598574740820260864
+  put g_gpow_t 356 ulong 4407786869725927041
+  put g_gpow_t 357 ulong 4605000987730509824
+  put g_gpow_t 358 ulong 4598667360039757824
+  put g_gpow_t 359 ulong 4408081673489989047
+  put g_gpow_t 360 ulong 4604965803358420992
+  put g_gpow_t 361 ulong 4598760457913677824
+  put g_gpow_t 362 ulong 4398477376758397674
+  put g_gpow_t 363 ulong 4604895434614243328
+  put g_gpow_t 364 ulong 4598948109594955776
+  put g_gpow_t 365 ulong 4407507784137966836
+  put g_gpow_t 366 ulong 4604860250242154496
+  put g_gpow_t 367 ulong 4599042673583808512
+  put g_gpow_t 368 ulong 13630393289392864440
+  put g_gpow_t 369 ulong 4604825065870065664
+  put g_gpow_t 370 ulong 4599137736593379328
+  put g_gpow_t 371 ulong 4400420140633651144
+  put g_gpow_t 372 ulong 4604789881497976832
+  put g_gpow_t 373 ulong 4599233303918358528
+  put g_gpow_t 374 ulong 4402333870771846492
+  put g_gpow_t 375 ulong 4604754697125888000
+  put g_gpow_t 376 ulong 4599329380938147840
+  put g_gpow_t 377 ulong 4398015960675573917
+  put g_gpow_t 378 ulong 4604719512753799168
+  put g_gpow_t 379 ulong 4599425973118683136
+  put g_gpow_t 380 ulong 13632158362948327029
+  put g_gpow_t 381 ulong 4604684328381710336
+  put g_gpow_t 382 ulong 4599523086014296064
+  put g_gpow_t 383 ulong 13631868895333374116
+  put g_gpow_t 384 ulong 4604649144009621504
+  put g_gpow_t 385 ulong 4599620725269635072
+  put g_gpow_t 386 ulong 4408670475658774361
+  put g_gpow_t 387 ulong 4604613959637532672
+  put g_gpow_t 388 ulong 4599718896621637632
+  put g_gpow_t 389 ulong 4404430198009577711
+  put g_gpow_t 390 ulong 4604578775265443840
+  put g_gpow_t 391 ulong 4599817605901541376
+  put g_gpow_t 392 ulong 13621712298097010140
+end
+
+note ---- pow(x, y): bit for bit with glibc 2.39 AArch64 libm (sysdeps/ieee754/dbl-64/e_pow.c) ----
+note g_gpow_t is __pow_log_data: [0] ln2hi, [1] ln2lo, [2..8] poly[0..6], [9 + 3i] tab[i].invc,
+note [10 + 3i] tab[i].logc, [11 + 3i] tab[i].logctail; the exp step uses __exp_data (g_gexp_t).
+note Fused steps are the __builtin_fma calls of e_pow.c (__FP_FAST_FMA) and the contractions GCC 13
+note made in that file; the same source compiled that way matches libm.so.6 on 4M sample pairs.
+
+fn est_gpow_c i ulong to f64
+  if eq get g_gpow_ready 0 0
+    est_gpow_init
+    put g_gpow_ready 0 1
+  end
+  ret bitcast f64 get g_gpow_t i
+end
+
+note 0 when y is not an integer, 1 when odd, 2 when even (iy: bits of a nonzero finite y)
+fn est_gpow_checkint iy ulong to ulong
+  e = and shr iy 52 2047
+  if lt e 1023
+    ret 0
+  end
+  if gt e 1075
+    ret 2
+  end
+  sh = sub 1075 e
+  if ne and iy sub shl ulong 1 sh 1 0
+    ret 0
+  end
+  if ne and iy shl ulong 1 sh 0
+    ret 1
+  end
+  ret 2
+end
+
+note bits of 0, infinity or nan
+fn est_gpow_zin i ulong to bool
+  ret ge sub mul i 2 1 ulong 18437736874454810623
+end
+
+fn est_gpow_snan i ulong to bool
+  ret gt mul xor i ulong 2251799813685248 2 ulong 18442240474082181120
+end
+
+note __math_oflow / __math_uflow: (sign ? -v : v) * v with v = 2^769 / 2^-767
+fn est_gpow_xflow sgn ulong over bool to f64
+  v = bitcast f64 ulong 1152921504606846976
+  if over
+    v = bitcast f64 ulong 8070450532247928832
+  end
+  if ne sgn 0
+    ret mul neg v v
+  end
+  ret mul v v
+end
+
+fn est_gpow_poly r f64 ar2 f64 to f64
+  p12 = fma r est_gpow_c 4 est_gpow_c 3
+  p34 = fma r est_gpow_c 6 est_gpow_c 5
+  p56 = fma r est_gpow_c 8 est_gpow_c 7
+  ret fma ar2 fma ar2 p56 p34 p12
+end
+
+note log_inline, first part: st = [r, t2, lo1 + lo2] for ix (x = 2^k z, z near the table point c)
+fn est_gpow_log_a ix ulong st edit f64 3 to void
+  tmp = add ix ulong 13842212212371881984
+  i = and shr tmp 45 127
+  ku = shr tmp 52
+  kd = f64 long ku
+  if ge ku 2048
+    kd = f64 sub long ku 4096
+  end
+  z = bitcast f64 sub ix and tmp ulong 18442240474082181120
+  b = add 9 mul i 3
+  r = fma z est_gpow_c b -1.0f64
+  t1 = fma kd est_gpow_c 0 est_gpow_c add b 1
+  t2 = add r t1
+  lo1 = fma kd est_gpow_c 1 est_gpow_c add b 2
+  put st 0 r
+  put st 1 t2
+  put st 2 add lo1 add r sub t1 t2
+end
+
+note log_inline: log of ix (normalized) as hi + tail; tail written to tl
+fn est_gpow_log ix ulong tl edit f64 1 to f64
+  st = new f64 3 0.0f64
+  est_gpow_log_a ix st
+  r = get st 0
+  t2 = get st 1
+  ar = mul r est_gpow_c 2
+  ar2 = mul r ar
+  ar3 = mul r ar2
+  hi = add t2 ar2
+  lo3 = fma r ar neg ar2
+  lo4 = add ar2 sub t2 hi
+  q = est_gpow_poly r ar2
+  lo = fma ar3 q add lo4 add lo3 get st 2
+  y = add hi lo
+  put tl 0 add lo sub hi y
+  ret y
+end
+
+note specialcase of exp_inline (result may overflow, or lies in the subnormal range)
+fn est_gpow_special tmp f64 sbits ulong ki long to f64
+  if ge ki 0
+    sc = bitcast f64 sub sbits ulong 4544132024016830464
+    ret mul fma tmp sc sc bitcast f64 ulong 9151314442816847872
+  end
+  sb2 = add sbits ulong 4602678819172646912
+  sc = bitcast f64 sb2
+  st = mul tmp sc
+  y = add sc st
+  if lt fabs y 1.0f64
+    one = f64 1.0f64
+    if lt y 0.0f64
+      one = f64 -1.0f64
+    end
+    lo = add st sub sc y
+    hi = add y one
+    lo = add lo add y sub one hi
+    y = sub add hi lo one
+    if eq y 0.0f64
+      y = bitcast f64 and sb2 ulong 9223372036854775808
+    end
+  end
+  ret mul y bitcast f64 ulong 4503599627370496
+end
+
+note exp_inline: sign * exp(x + xtail), sign from sb (0 or 0x40000)
+fn est_gpow_exp x f64 xtail f64 sb ulong to f64
+  bits = bitcast ulong x
+  abstop = and shr bits 52 2047
+  if gt sub abstop 969 62
+    if lt abstop 969
+      one = add x 1.0f64
+      if ne sb 0
+        ret neg one
+      end
+      ret one
+    end
+    if gt abstop 1032
+      ret est_gpow_xflow sb eq shr bits 63 0
+    end
+    abstop = 0
+  end
+  z = mul x est_gexp_c 0
+  kd = est_round_away z
+  ki = long int kd
+  r = add xtail fma kd est_gexp_c 3 fma kd est_gexp_c 2 x
+  idx = mul and bitcast ulong ki 127 2
+  tail = est_gexp_c add 22 idx
+  sbits = add est_gexp_w add 23 idx shl add bitcast ulong ki sb 45
+  tmp = est_gexp_tmp r tail
+  if eq abstop 0
+    ret est_gpow_special tmp sbits ki
+  end
+  sc = bitcast f64 sbits
+  ret fma tmp sc sc
+end
+
+note y == 0, x == 1, nan, y infinite (iy is 0, inf or nan)
+fn est_gpow_yspecial x f64 y f64 ix ulong iy ulong to f64
+  if eq mul iy 2 0
+    if est_gpow_snan ix
+      ret add x y
+    end
+    ret 1.0f64
+  end
+  if eq ix ulong 4607182418800017408
+    if est_gpow_snan iy
+      ret add x y
+    end
+    ret 1.0f64
+  end
+  if or gt mul ix 2 ulong 18437736874454810624 gt mul iy 2 ulong 18437736874454810624
+    ret add x y
+  end
+  if eq mul ix 2 ulong 9214364837600034816
+    ret 1.0f64
+  end
+  if eq lt mul ix 2 ulong 9214364837600034816 eq shr iy 63 0
+    ret 0.0f64
+  end
+  ret mul y y
+end
+
+note x is 0, inf or nan (y finite nonzero)
+fn est_gpow_xspecial x f64 ix ulong iy ulong to f64
+  x2 = mul x x
+  sgn = ulong 0
+  if ne shr ix 63 0
+    if eq est_gpow_checkint iy 1
+      x2 = neg x2
+      sgn = 1
+    end
+  end
+  if ne shr iy 63 0
+    if eq mul ix 2 0
+      if ne sgn 0
+        ret div -1.0f64 0.0f64
+      end
+      ret div 1.0f64 0.0f64
+    end
+    ret div 1.0f64 x2
+  end
+  ret x2
+end
+
+note |y| < 2^-65 or |y| >= 2^63 (x positive finite nonzero after the sign step)
+fn est_gpow_yrange y f64 ix ulong topy ulong to f64
+  if eq ix ulong 4607182418800017408
+    ret 1.0f64
+  end
+  if lt and topy 2047 958
+    if gt ix ulong 4607182418800017408
+      ret add 1.0f64 y
+    end
+    ret sub 1.0f64 y
+  end
+  if eq gt ix ulong 4607182418800017408 lt topy 2048
+    ret est_gpow_xflow 0 true
+  end
+  ret est_gpow_xflow 0 false
+end
+
+fn est_gpow_main x f64 y f64 ix ulong sb ulong to f64
+  tl = new f64 1 0.0f64
+  hi = est_gpow_log ix tl
+  lo = get tl 0
+  ehi = mul y hi
+  elo = fma y lo fma y hi neg ehi
+  ret est_gpow_exp ehi elo sb
+end
+
+fn est_pow x f64 y f64 to f64
+  ix = bitcast ulong x
+  iy = bitcast ulong y
+  topx = shr ix 52
+  topy = shr iy 52
+  sb = ulong 0
+  yr = ge sub and topy 2047 958 128
+  if or ge sub topx 1 2046 yr
+    if est_gpow_zin iy
+      ret est_gpow_yspecial x y ix iy
+    end
+    if est_gpow_zin ix
+      ret est_gpow_xspecial x ix iy
+    end
+    if ne shr ix 63 0
+      yint = est_gpow_checkint iy
+      if eq yint 0
+        ret div sub x x sub x x
+      end
+      if eq yint 1
+        sb = ulong 262144
+      end
+      ix = and ix ulong 9223372036854775807
+      topx = and topx 2047
+    end
+    if yr
+      ret est_gpow_yrange y ix topy
+    end
+    if eq topx 0
+      ix = sub and bitcast ulong mul x 4503599627370496.0f64 ulong 9223372036854775807 ulong 234187180623265792
+    end
+  end
+  ret est_gpow_main x y ix sb
 end
 
 fn est_sin_poly r f64 to f64
