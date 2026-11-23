@@ -114,27 +114,30 @@ check "dirty checkout of the locked commit: exit 1" '[ "$(rc env AIENOS_LOCK_REP
 # This section drives the Makefile in its own private copy $W and checks the default layout
 # ($W/build/...); a per-step OUT_DIR exported by tests/gates/run.sh does not apply here.
 unset OUT_DIR
-W=$SCR/omega; mkdir -p "$W"
+W=$SCR/omega; mkdir -p "$W/src/runtime"
 cp -r "$HERE/Makefile" "$HERE/mk" "$HERE/tools" "$W/"
+cp "$HERE/src/omega_native.h" "$W/src/"
+cp "$HERE/src/runtime/aienos_cap_om2.c" "$HERE/src/runtime/aienos_cap.h" "$HERE/src/runtime/rx_caproot.h" "$W/src/runtime/"
 cp "$HERE/physics.lock" "$HERE/argus.lock" "$W/" 2>/dev/null || true
 echo "$GOOD" > "$W/aienos.lock"
 M() { make -s -C "$W" AIENOS_LOCK_REPO="$LK" "$@" >"$SCR/make.log" 2>&1; echo $?; }
-check "make: default cache materialized and library built" '[ "$(M build/aienos-cap/$GOOD/libaienos_capability.a)" = 0 ] && [ -f "$W/build/aienos-cap/$GOOD/libaienos_capability.a" ] && [ ! -e "$W/build/aienos-authority/$GOOD/native/capability/out" ]'
-L1=$(stat -c %Y.%s "$W/build/aienos-cap/$GOOD/libaienos_capability.a"); sleep 1
-check "make: second build replaces nothing (no relink)" '[ "$(M build/aienos-cap/$GOOD/libaienos_capability.a)" = 0 ] && [ "$(stat -c %Y.%s "$W/build/aienos-cap/$GOOD/libaienos_capability.a")" = "$L1" ]'
-printf 'junk' > "$W/build/aienos-cap/$GOOD/libaienos_capability.a"
-check "make: planted library replaced by the fresh build from the proven source" '[ "$(M build/aienos-cap/$GOOD/libaienos_capability.a)" = 0 ] && ar t "$W/build/aienos-cap/$GOOD/libaienos_capability.a" | grep -q aienos_capability.o'
+check "make: default cache materialized and OM-2 capability library built" '[ "$(M aienos-authority-capability build/aienos-cap/libaienos_capability_om2.a)" = 0 ] && [ -f "$W/build/aienos-cap/libaienos_capability_om2.a" ] && [ ! -e "$W/build/aienos-authority/$GOOD/native/capability/out" ]'
+L1=$(stat -c %Y.%s "$W/build/aienos-cap/libaienos_capability_om2.a"); sleep 1
+check "make: second build replaces nothing (no relink)" '[ "$(M aienos-authority-capability build/aienos-cap/libaienos_capability_om2.a)" = 0 ] && [ "$(stat -c %Y.%s "$W/build/aienos-cap/libaienos_capability_om2.a")" = "$L1" ]'
+printf 'junk' > "$W/build/aienos-cap/libaienos_capability_om2.a"
+touch -t 200001010000 "$W/build/aienos-cap/libaienos_capability_om2.a"
+check "make: planted library replaced by the fresh build from the proven source" '[ "$(M build/aienos-cap/libaienos_capability_om2.a)" = 0 ] && ar t "$W/build/aienos-cap/libaienos_capability_om2.a" | grep -q aienos_cap_om2.o'
 echo 'int injected;' >> "$W/build/aienos-authority/$GOOD/native/capability/aienos_capability.c"
-check "make: cache edited after extraction stops the next build" '[ "$(M build/aienos-cap/$GOOD/libaienos_capability.a)" != 0 ] && grep -q "not the aienos.lock commit" "$SCR/make.log"'
-check "make: unrelated AIENOS_R7_DIR override refused" '[ "$(M AIENOS_R7_DIR="$UNREL" build/aienos-cap/$GOOD/libaienos_capability.a)" != 0 ]'
+check "make: cache edited after extraction stops the next build" '[ "$(M aienos-authority-capability)" != 0 ] && grep -q "not the aienos.lock commit" "$SCR/make.log"'
+check "make: unrelated AIENOS_R7_DIR override refused" '[ "$(M AIENOS_R7_DIR="$UNREL" aienos-authority-capability)" != 0 ]'
 git -C "$CL" checkout -q -- .
-check "make: clean checkout of a different commit as override refused" '[ "$(cd "$CL" && git -c advice.detachedHead=false checkout -q "$A"; M AIENOS_R7_DIR="$CL" build/aienos-cap/$GOOD/libaienos_capability.a)" != 0 ]'
+check "make: clean checkout of a different commit as override refused" '[ "$(cd "$CL" && git -c advice.detachedHead=false checkout -q "$A"; M AIENOS_R7_DIR="$CL" aienos-authority-capability)" != 0 ]'
 git -C "$CL" checkout -q "$GOOD"
 mkdir -p "$CL/native/capability/out"; echo planted > "$CL/native/capability/out/aienos_capability.o"
-check "make: locked checkout with a planted out/ object refused" '[ "$(M AIENOS_R7_DIR="$CL" build/aienos-cap/$GOOD/libaienos_capability.a)" != 0 ]'
+check "make: locked checkout with a planted out/ object refused" '[ "$(M AIENOS_R7_DIR="$CL" aienos-authority-capability)" != 0 ]'
 rm -rf "$CL/native/capability/out"
-check "make: clean checkout of the locked commit as override builds" '[ "$(M AIENOS_R7_DIR="$CL" build/aienos-cap/$GOOD/libaienos_capability.a)" = 0 ]'
-check "make: lock repository missing the commit refused" '[ "$(make -s -C "$W" AIENOS_LOCK_REPO=/nonexistent AIENOS_R7_DIR="$UNREL" build/aienos-cap/$GOOD/libaienos_capability.a >/dev/null 2>&1; echo $?)" != 0 ]'
+check "make: clean checkout of the locked commit as override builds" '[ "$(M AIENOS_R7_DIR="$CL" aienos-authority-capability)" = 0 ]'
+check "make: lock repository missing the commit refused" '[ "$(make -s -C "$W" AIENOS_LOCK_REPO=/nonexistent AIENOS_R7_DIR="$UNREL" aienos-authority-capability >/dev/null 2>&1; echo $?)" != 0 ]'
 
 # 4. aienos.lock is data: the Makefile parses exactly one lowercase 40-hex line before any
 # recipe sees it, refuses every other shape at load, ignores command-line and environment

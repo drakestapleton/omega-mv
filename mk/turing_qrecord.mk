@@ -20,7 +20,7 @@ TYQR_DIR = $(OUT_DIR)/tests-turing-qrecord
 
 $(TYQR_DIR)/test_ty_qrecord: tests/turing/test_ty_qrecord.om $(TYQR_OM_SRCS) $(TYQR_OMC)
 	@mkdir -p $(TYQR_DIR)
-	(printf 'om2\n'; sed '/^om2$$/d' $(TYQR_OM_SRCS) tests/turing/test_ty_qrecord.om) | $(TYQR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed '/^om2$$/d' $(TYQR_OM_SRCS) tests/turing/test_ty_qrecord.om) | $(TYQR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-turing-qrecord: $(TYQR_DIR)/test_ty_qrecord
 	./$(TYQR_DIR)/test_ty_qrecord

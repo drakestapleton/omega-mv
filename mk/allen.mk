@@ -57,6 +57,9 @@ $(ALLEN_BIND_OBJ): src/allen/allen_bind.c $(ALLEN_HDRS) $(ALLEN_STAMP)
 $(ALLEN_MAIN_OBJ): tools/allen.c $(ALLEN_HDRS) src/runtime/rx_omega.h $(ALLEN_STAMP)
 	$(CC) $(CFLAGS) $(ALLEN_AIENOS_INC) -c -o $@ tools/allen.c
 
+$(ALLEN_AIENOS_SRCS): $(ALLEN_STAMP)
+	@test -f $@
+
 $(ALLEN_TOOL): $(ALLEN_MAIN_OBJ) $(ALLEN_BIND_OBJ) $$(RX_AIEN_OBJ) $(ALLEN_RX_SRCS) $$(ALLEN_AIENOS_SRCS) $$(AIENOS_CAP_LIB) $(ALLEN_STAMP)
 	$(CC) $(CFLAGS) $(ALLEN_AIENOS_INC) -pthread -o $@ $(ALLEN_MAIN_OBJ) $(ALLEN_BIND_OBJ) $(RX_AIEN_OBJ) \
 		$(ALLEN_RX_SRCS) $(ALLEN_AIENOS_SRCS) $(AIENOS_CAP_LIB) -lm

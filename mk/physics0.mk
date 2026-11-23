@@ -22,21 +22,21 @@ P0_OM_WORLD = $(P0_OM_LEARNER) src/physics0/pd0_world.om
 
 $(P0_DIR)/pd0-world: $(P0_OM_WORLD) src/physics0/pd0_world_main.om $(P0_OMC)
 	@mkdir -p $(P0_DIR)
-	{ echo "om2"; cat $(P0_OM_WORLD) src/physics0/pd0_world_main.om; } | $(P0_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0_OM_WORLD) src/physics0/pd0_world_main.om; } | $(P0_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 pd0-world: $(P0_DIR)/pd0-world
 
 $(P0_DIR)/test_pd0_world: $(P0_OM_WORLD) tests/physics0/test_pd0_world.om $(P0_OMC)
 	@mkdir -p $(P0_DIR)
-	{ echo "om2"; cat $(P0_OM_WORLD) tests/physics0/test_pd0_world.om; } | $(P0_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0_OM_WORLD) tests/physics0/test_pd0_world.om; } | $(P0_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(P0_DIR)/pd0-oracle: $(P0_OM_WORLD) tests/physics0/pd0_oracle.om $(P0_OMC)
 	@mkdir -p $(P0_DIR)
-	{ echo "om2"; cat $(P0_OM_WORLD) tests/physics0/pd0_oracle.om; } | $(P0_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0_OM_WORLD) tests/physics0/pd0_oracle.om; } | $(P0_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(P0_DIR)/test_pd0_osc: $(P0_OM_LEARNER) tests/physics0/test_pd0_osc.om $(P0_OMC)
 	@mkdir -p $(P0_DIR)
-	{ echo "om2"; cat $(P0_OM_LEARNER) tests/physics0/test_pd0_osc.om; } | $(P0_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0_OM_LEARNER) tests/physics0/test_pd0_osc.om; } | $(P0_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 physics0-test: $(P0_DIR)/test_pd0_world $(P0_DIR)/pd0-oracle $(P0_DIR)/test_pd0_osc $(P0_DIR)/pd0-world
 	@mkdir -p $(P0_DIR)/receipts

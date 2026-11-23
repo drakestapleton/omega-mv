@@ -12,7 +12,7 @@ TCO_TOOL = $(TCO_DIR)/turing-cal-overlap
 
 $(TCO_TOOL): tools/turing_cal_overlap.om seed/out/omc
 	@mkdir -p $(dir $@)
-	seed/out/omc < tools/turing_cal_overlap.om > $@ && chmod +x $@
+	seed/out/omc < tools/turing_cal_overlap.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 turing-cal-overlap: $(TCO_TOOL)
 

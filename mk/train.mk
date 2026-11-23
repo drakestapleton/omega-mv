@@ -20,7 +20,7 @@ TRAIN_OM_SRCS = src/train/generation.om src/train/sgd_update.om src/train/tg_sha
 
 $(TRAIN_DIR)/test_train: tests/train/test_train.om $(TRAIN_OM_SRCS) $(TRAIN_OMC)
 	@mkdir -p $(TRAIN_DIR)
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TRAIN_OM_SRCS) tests/train/test_train.om) | $(TRAIN_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(TRAIN_OM_SRCS) tests/train/test_train.om) | $(TRAIN_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 train-purity:
 	@bad=$$(find src/train -maxdepth 1 \( -name '*.c' -o -name '*.h' \) 2>/dev/null); \

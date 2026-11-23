@@ -10,10 +10,10 @@ VISOR_VERIFY_OM_SRCS = src/visor/visor.om src/visor/visor_machine.om \
 VISOR_EVIDENCE_OM_SRCS = src/visor/visor.om src/visor/visor_evidence.om
 
 $(OUT_DIR)/tests-visor/test_visor_verify: tests/visor/test_visor_verify.om $(VISOR_VERIFY_OM_SRCS) $(VISOR_OMC) | $(OUT_DIR)/tests-visor
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(VISOR_VERIFY_OM_SRCS) tests/visor/test_visor_verify.om) | $(VISOR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(VISOR_VERIFY_OM_SRCS) tests/visor/test_visor_verify.om) | $(VISOR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(OUT_DIR)/tests-visor/test_visor_evidence: tests/visor/test_visor_evidence.om $(VISOR_EVIDENCE_OM_SRCS) $(VISOR_OMC) | $(OUT_DIR)/tests-visor
-	(printf 'om2\n'; sed '/^om2$$/d' $(VISOR_EVIDENCE_OM_SRCS) tests/visor/test_visor_evidence.om) | $(VISOR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed '/^om2$$/d' $(VISOR_EVIDENCE_OM_SRCS) tests/visor/test_visor_evidence.om) | $(VISOR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: test-visor-verify test-visor-evidence
 

@@ -9,7 +9,7 @@ LANG_TEST_OM_SRCS = src/visor/visor.om $(VISOR_OM_UNITS) src/visor/visor_program
 	src/language/omega_lex.om src/language/omega_parse.om src/language/omega_lower.om
 
 $(OUT_DIR)/tests-language/test_language_v0: tests/language/test_language_v0.om $(LANG_TEST_OM_SRCS) $(VISOR_OMC) | $(OUT_DIR)/tests-language
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(LANG_TEST_OM_SRCS) tests/language/test_language_v0.om) | $(VISOR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(LANG_TEST_OM_SRCS) tests/language/test_language_v0.om) | $(VISOR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: test-language
 test-language: $(OUT_DIR)/tests-language/test_language_v0

@@ -1577,7 +1577,11 @@ int omega_blackwell_codegen_matmul_frag_block(const OmegaMatMulSpec *spec, uint3
 
 void omega_matmul_frag_block_shape(uint32_t mt, uint32_t nt, uint32_t *rt, uint32_t *ct) {
     uint64_t res[4] = { 1, 1, 1, 1 }, rc = 1;
-    omega2_cg_matmul_frag_shape(&rc, mt, nt, 16, res, 4);
+    if (omega2_cg_matmul_frag_shape(&rc, mt, nt, 16, res, 4) != OMEGA_OK) {
+        *rt = 1;
+        *ct = 1;
+        return;
+    }
     *rt = (uint32_t)res[0];
     *ct = (uint32_t)res[1];
 }
@@ -1589,7 +1593,8 @@ uint32_t omega_matmul_frag_block_unroll(uint32_t kp, uint32_t rt, uint32_t ct) {
 
 uint32_t omega_matmul_frag_unroll(uint32_t kp) {
     uint64_t res[4] = { 1, 1, 1, 1 }, rc = 1;
-    omega2_cg_matmul_frag_shape(&rc, 1, 1, kp, res, 4);
+    if (omega2_cg_matmul_frag_shape(&rc, 1, 1, kp, res, 4) != OMEGA_OK)
+        return 1u;
     return (uint32_t)res[3];
 }
 

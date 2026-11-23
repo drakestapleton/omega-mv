@@ -66,8 +66,13 @@ uint32_t rx_aegis_evaluate(const RxAegisPolicy *p, uint32_t subject, uint64_t re
     uint64_t rules[112];
     pack_rules(p, rules);
     uint64_t req[4] = { subject, resource, rights, lease };
-    uint64_t res[3] = { 0, 0, 0 }, verdict = 0;
-    (void)omega2_aegis_evaluate(&verdict, rules, 112, p->n_rules, req, 4, res, 3);
+    uint64_t res[3] = { 0, 0, 0 }, verdict = RX_AEGIS_DENY;
+    if (omega2_aegis_evaluate(&verdict, rules, 112, p->n_rules, req, 4, res, 3) != OMEGA_OK) {
+        *out_lease = 0;
+        *rule_or_why = RX_AEGIS_WHY_NO_RULE;
+        *needs_approval = 0;
+        return RX_AEGIS_DENY;
+    }
     *out_lease = res[0];
     *rule_or_why = (uint32_t)res[1];
     *needs_approval = (uint32_t)res[2];
@@ -92,8 +97,9 @@ static int fn_decide(RxCtx *c) {
         ap->field[0], ap->field[1], dec->field[0], dec->field[1]
     };
     uint64_t out_dec[8] = { 0 }, emit = 0;
-    (void)omega2_aegis_decide(&emit, rules, 112, f->policy.n_rules, f->client[k].subject,
-                              in_f, 10, out_dec, 8);
+    if (omega2_aegis_decide(&emit, rules, 112, f->policy.n_rules, f->client[k].subject,
+                            in_f, 10, out_dec, 8) != OMEGA_OK)
+        return -1;
     if (!emit) return 0;
     if (out_dec[1] == RX_AEGIS_DENY)
         RX_ARGUS_EMIT(rx_argus_emit_cap_denied(aegis_view(f), f->client[k].subject, ARGUS_CAP_NONE, 0,
@@ -166,15 +172,21 @@ static int fn_install(RxCtx *c) {
         return 0;
     }
     uint64_t client_vec[3] = { cl->domain_lo, cl->domain_hi, cl->max_rights };
-    uint64_t chk = 0;
-    (void)omega2_aegis_install_check(&chk, dec->field, 8, req->field, 6, client_vec, 3);
+    uint64_t chk = RX_AEGIS_WHY_MISMATCH;
+    if (omega2_aegis_install_check(&chk, dec->field, 8, req->field, 6, client_vec, 3) != OMEGA_OK) {
+        refuse(c, o->slot[j], seq, RX_AEGIS_WHY_MISMATCH);
+        return 0;
+    }
     if (chk != 0) {
         refuse(c, o->slot[j], seq, chk);
         return 0;
     }
 
     AienosCapRef office;
-    aienos_cap_office(f->admin, &office);
+    if (aienos_cap_office(f->admin, &office) != RX_CAP_OK) {
+        refuse(c, o->slot[j], seq, RX_AEGIS_WHY_MINT);
+        return 0;
+    }
     uint64_t res = dec->field[2];
     uint32_t rights = (uint32_t)dec->field[3];
 

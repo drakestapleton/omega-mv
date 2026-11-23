@@ -10,24 +10,17 @@ OM_BUILD_DIR ?= build/om-coord
 $(OM_BUILD_DIR):
 	@mkdir -p $(OM_BUILD_DIR)
 
-$(OM_BUILD_DIR)/om-birth: seed/build/common.om seed/build/birth.om | $(OM_BUILD_DIR)
-	cat seed/build/common.om seed/build/birth.om | $(OMC_BIN) > $@ && chmod 755 $@
+$(OM_BUILD_DIR)/om-birth: seed/build/common.om seed/build/birth.om $(OMC_BIN) | $(OM_BUILD_DIR)
+	cat seed/build/common.om seed/build/birth.om | $(OMC_BIN) > $@.tmp.$$$$ && chmod 755 $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(OM_BUILD_DIR)/om-release: seed/build/common.om seed/build/release.om | $(OM_BUILD_DIR)
-	cat seed/build/common.om seed/build/release.om | $(OMC_BIN) > $@ && chmod 755 $@
+$(OM_BUILD_DIR)/om-release: seed/build/common.om seed/build/release.om $(OMC_BIN) | $(OM_BUILD_DIR)
+	cat seed/build/common.om seed/build/release.om | $(OMC_BIN) > $@.tmp.$$$$ && chmod 755 $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(OM_BUILD_DIR)/om-build-gate: seed/build/common.om seed/build/gate.om | $(OM_BUILD_DIR)
-	cat seed/build/common.om seed/build/gate.om | $(OMC_BIN) > $@ && chmod 755 $@
+$(OM_BUILD_DIR)/om-build-gate: seed/build/common.om seed/build/gate.om $(OMC_BIN) | $(OM_BUILD_DIR)
+	cat seed/build/common.om seed/build/gate.om | $(OMC_BIN) > $@.tmp.$$$$ && chmod 755 $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 omega-from-seed:
-	@if [ -x "$(OMC_BIN)" ] && [ "$$(uname -s)-$$(uname -m)" = "Linux-aarch64" ]; then \
-		mkdir -p "$(OM_BUILD_DIR)" && \
-		cat seed/build/common.om seed/build/birth.om | "$(OMC_BIN)" > "$(OM_BUILD_DIR)/om-birth" && \
-		chmod 755 "$(OM_BUILD_DIR)/om-birth" && \
-		exec "$(OM_BUILD_DIR)/om-birth"; \
-	else \
-		exec sh seed/omega-from-seed.sh; \
-	fi
+	sh seed/omega-from-seed.sh
 
 om-build-gate: $(OM_BUILD_DIR)/om-build-gate
 	rm -rf $(OM_BUILD_DIR)/gate-work

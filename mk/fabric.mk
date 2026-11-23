@@ -53,9 +53,9 @@ FAB_OM_SRCS = seed/ng/sha256.om src/runtime/aien_machine_id.om \
 
 $(FAB_DIR)/fabric_test: tests/fabric/fabric_test.om $(FAB_OM_SRCS) $(FAB_OMC)
 	@mkdir -p $(FAB_DIR)
-	(printf 'om2\n'; sed '/^om2$$/d' $(FAB_OM_SRCS) tests/fabric/fabric_test.om) | $(FAB_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed '/^om2$$/d' $(FAB_OM_SRCS) tests/fabric/fabric_test.om) | $(FAB_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-test-fabric: $(FAB_DIR)/fabric_test
+test-fabric: fabric-purity $(FAB_DIR)/fabric_test
 	$(abspath $(FAB_DIR)/fabric_test)
 
 test-fabric-living: fabric-purity

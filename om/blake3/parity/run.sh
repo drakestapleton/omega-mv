@@ -26,7 +26,10 @@ out=$("$T/par" "$V" | tail -1); echo "$out"
 # The mutants are part of the verdict: without the pinned tools this is NOT_RUN (exit 3), never PASS.
 [ -n "${OMEGA_OMC:-}" ] && [ -n "${OMEGA_BRIDGE:-}" ] || { echo "BLAKE3-PARITY NOT_RUN: the mutants need OMEGA_OMC and OMEGA_BRIDGE"; exit 3; }
 mutant() { # mutant <name> <exact line> <replacement> <vectors that must differ>
-  rm -rf "$T/m"; mkdir -p "$T/m/om"; cp -r "$ROOT/om/." "$T/m/om/"; cp -r "$ROOT/src" "$T/m/src"
+  rm -rf "$T/m"; mkdir -p "$T/m/om" "$T/m/gpu" "$T/m/seed"
+  cp -r "$ROOT/om/." "$T/m/om/"; cp -r "$ROOT/src" "$T/m/src"
+  cp -r "$ROOT/gpu/." "$T/m/gpu/"
+  cp -r "$ROOT/seed/authority" "$ROOT/seed/build" "$ROOT/seed/out" "$T/m/seed/"
   python3 - "$T/m/om/blake3/b3unit.om" "$2" "$3" <<'PY'
 import sys
 p, old, new = sys.argv[1:]

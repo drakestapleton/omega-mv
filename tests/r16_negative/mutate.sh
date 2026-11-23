@@ -86,15 +86,16 @@ mutant_job() {
     d="$tmp/$name"; mkdir -p "$d"
     use_srcs=$srcs; use_lib=$lib
     if [ "$file" = aienos ]; then
-        cp -r "$r7/native/capability" "$d/cap"
-        rm -rf "$d/cap/out"
-        if ! R16_OLD=$4 R16_NEW=$5 replace "$r7/native/capability/aienos_capability.c" \
-            "$d/cap/aienos_capability.c" "$nth"; then
+        if ! R16_OLD=$4 R16_NEW=$5 replace "src/runtime/aienos_cap_om2.c" \
+            "$d/aienos_cap_om2.c" "$nth"; then
             echo "R16-G4 mutant $name: edit did not apply  BROKEN"; return
         fi
-        make -s -C "$d/cap" CC="$cc" > "$d/lib.log" 2>&1 \
-            || { echo "R16-G4 mutant $name: library build failed  BROKEN"; return; }
-        use_lib="$d/cap/out/libaienos_capability.a"
+        # shellcheck disable=SC2086
+        if ! $cc $cflags -iquote src/runtime -iquote src -c -o "$d/aienos_cap_om2.o" "$d/aienos_cap_om2.c" \
+            > "$d/lib.log" 2>&1 || ! ar rcs "$d/libaienos_capability_om2.a" "$d/aienos_cap_om2.o" >> "$d/lib.log" 2>&1; then
+            echo "R16-G4 mutant $name: library build failed  BROKEN"; return
+        fi
+        use_lib="$d/libaienos_capability_om2.a"
     else
         base=$(basename "$file")
         if ! R16_OLD=$4 R16_NEW=$5 replace "$file" "$d/$base" "$nth"; then

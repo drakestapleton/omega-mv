@@ -1,5 +1,6 @@
 CC ?= gcc
 .DEFAULT_GOAL := all
+.DELETE_ON_ERROR:
 PHYSICS_DIR ?= ../physics
 OUT_DIR ?= build
 # aienos.lock is code-adjacent input: parse it as data before mk/*.mk or any recipe sees it.
@@ -9,6 +10,8 @@ override AIENOS_LOCK := $(shell LC_ALL=C awk 'NR == 1 && length($$0) == 40 && $$
 ifneq ($(words $(AIENOS_LOCK)),1)
 $(error aienos.lock must contain exactly one lowercase 40-hex commit)
 endif
+AIENOS_R7_DEFAULT = $(OUT_DIR)/aienos-authority/$(AIENOS_LOCK)
+AIENOS_R7_DIR ?= $(AIENOS_R7_DEFAULT)
 -include mk/*.mk
 PHYSICS_LOCK_CHECK ?= 1
 
@@ -482,11 +485,10 @@ aienos-authority-capability:
 
 # Pure seeded OM-2 capability authority (seed/authority/cap_table_om2.om via
 # src/runtime/aienos_cap_om2.c). Severs the external libaienos_capability.a / aienos.lock dependency.
-AIENOS_CAP_LIB ?= $(OUT_DIR)/aienos-cap/libaienos_capability_om2.a
 $(AIENOS_CAP_LIB): src/runtime/aienos_cap_om2.c src/runtime/aienos_cap.h src/runtime/rx_caproot.h src/omega_native.h | $(OUT_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $(dir $@)/aienos_cap_om2.o src/runtime/aienos_cap_om2.c
-	$(AR) rcs $@ $(dir $@)/aienos_cap_om2.o
+	rm -f $@ && $(AR) rcs $@ $(dir $@)/aienos_cap_om2.o
 
 # OMEGA_EFFECT_CAP64 (spec/effect-cap64-migration.md): effect objects carry the
 # full 64-bit Aienux capability generation. Physics-free: the Omega core, the
@@ -500,7 +502,7 @@ EFFECT_CAP64_OBJS = $(addprefix $(OUT_DIR)/,omega_om_units.o omega_canonical.o o
 
 $(EFFECT_CAP64_TEST): tests/effect/test_effect_cap64.c $(EFFECT_CAP64_OBJS) \
 		$(OUT_DIR)/visor/visor_effect_request.o src/visor/visor_effect_request.h \
-		src/omega_core.h src/omega_canonical.h src/omega_types.h $(EFFECT_CAP64_CAP_LIB)
+		src/omega_core.h src/omega_canonical.h src/omega_types.h $(EFFECT_CAP64_CAP_LIB) | aienos-authority-capability
 	mkdir -p $(dir $@)
 	$(CC) $(VISOR_CFLAGS) -I$(EFFECT_CAP64_CAP_INC) -pthread -o $@ tests/effect/test_effect_cap64.c \
 		$(OUT_DIR)/visor/visor_effect_request.o $(EFFECT_CAP64_OBJS) $(EFFECT_CAP64_CAP_LIB) -lm
@@ -966,7 +968,7 @@ $(RX_R15_PERF_SILICON_ND): $(RX_R15_PERF_SRCS) $(RX_R15_PERF_HDRS) $(RX_R15_GPU_
 		$(RX_R15_PERF_SRCS) $(RX_R15_GPU_SRCS) $(AIENOS_CAP_LIB) -ldl -lm
 
 $(R15_REDUCE): tools/r15_reduce.om seed/out/omc | $(OUT_DIR)
-	seed/out/omc < tools/r15_reduce.om > $@ && chmod +x $@
+	seed/out/omc < tools/r15_reduce.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 r15-perf-host: $(RX_R15_PERF_HOST) $(RX_R15_PERF_HOST_ND) $(R15_REDUCE)
 r15-perf-silicon: $(RX_R15_PERF_SILICON) $(RX_R15_PERF_SILICON_ND) $(R15_REDUCE)
@@ -1007,7 +1009,7 @@ test-r15-g15-diag: $(R15_REDUCE) | $(OUT_DIR)
 # still under a production name, and all five repos were scanned.
 R16_INVENTORY = $(OUT_DIR)/r16_loop_inventory
 $(R16_INVENTORY): tools/r16_loop_inventory.om seed/out/omc | $(OUT_DIR)
-	seed/out/omc < tools/r16_loop_inventory.om > $@ && chmod +x $@
+	seed/out/omc < tools/r16_loop_inventory.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: r16-inventory test-r16-inventory
 r16-inventory: $(R16_INVENTORY)
@@ -1082,7 +1084,7 @@ test-r16-negative: $(RX_R16_NEGATIVE)
 
 # "Removing any one guard turns the test red": rebuilds the G4 test against
 # scratch copies with one guard removed at a time; each must FAIL. Minutes.
-test-r16-negative-mutants: $(RX_R16_NEGATIVE)
+test-r16-negative-mutants: $(RX_R16_NEGATIVE) $(AIENOS_CAP_LIB)
 	R16_CAP_LIB="$(AIENOS_CAP_LIB)" sh tests/r16_negative/mutate.sh "$(CC)" "$(CFLAGS)" "$(AIENOS_R7_DIR)" \
 		$(RX_R15_RIG_SRCS) tests/runtime/rx_r16_negative.c
 
@@ -1319,11 +1321,16 @@ $(DS_UNIT): $(DS_LIB) tests/dagsim/dagsim_unit.om seed/out/omc | $(OUT_DIR)
 $(DS_CLI): $(DS_LIB) tools/dagsim/dagsim_cli.om seed/out/omc | $(OUT_DIR)
 	cat $(DS_LIB) tools/dagsim/dagsim_cli.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
+ifeq ($(shell uname -s)-$(shell uname -m),Linux-aarch64)
 test-dagsim: $(DS_UNIT) $(DS_CLI)
 	./$(DS_UNIT)
 	sh tests/dagsim/run_cli.sh $(DS_CLI) $(OUT_DIR)/dagsim-cli-out
 	OMC="$(CURDIR)/seed/out/omc" sh tests/dagsim/mutant_lifetime.sh
 	OMC="$(CURDIR)/seed/out/omc" sh tests/dagsim/mutant_predict.sh
+else
+test-dagsim:
+	@echo "test-dagsim: NOT_RUN (requires Linux aarch64 for seed/out/omc)"
+endif
 
 # AArch64 hosts: the gate. Real realizations, training, promotion through the
 # R9 barrier on the native authority, held-out workloads.
@@ -1540,7 +1547,7 @@ test-prod-refuses-test-pieces: $(ARGUS_STAMP) $(AIENOS_CAP_LIB) $(RX_R13_HOST)
 # from mutated copies; the test must fail against each.
 RX_OPERATOR_CLI = $(OUT_DIR)/rx_operator
 $(RX_OPERATOR_CLI): tools/rx_operator.om seed/out/omc | $(OUT_DIR)
-	seed/out/omc < tools/rx_operator.om > $@ && chmod +x $@
+	seed/out/omc < tools/rx_operator.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: test-r16-operator-host test-r16-operator-silicon test-r16-operator-mutants
 test-r16-operator-host: $(RX_R13_HOST) $(RX_OPERATOR_CLI)
@@ -1617,11 +1624,9 @@ argus-replay: $(ARGUS_REPLAY)
 # test-algebra-asan reruns the same suite under address+undefined sanitizers.
 .PHONY: test-algebra test-algebra-asan
 OMA_BIND = $(OUT_DIR)/tests-algebra/native.o
-OMA_BIND_ASAN = $(OUT_DIR)/tests-algebra/native_asan.o
-$(OMA_BIND) $(OMA_BIND_ASAN): src/omega_om_units.c src/omega_native.h src/omega_api_decl.h
+$(OMA_BIND): src/omega_om_units.c src/omega_native.h src/omega_api_decl.h
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_CFLAGS) -Wno-pedantic $(OMA_BIND_FLAGS) -c $< -o $@
-$(OMA_BIND_ASAN): OMA_BIND_FLAGS = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
+	$(CC) $(OMA_CFLAGS) -Wno-pedantic -c $< -o $@
 
 OMA_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -Isrc
 OMA_OM_LIB = src/algebra/oma_lib.om
@@ -1630,11 +1635,11 @@ OMA_FAILURE_TEST = $(OUT_DIR)/tests-algebra/test_oma_native_failure
 
 $(OMA_TEST): $(OMA_OM_LIB) tests/algebra/test_oma.om seed/out/omc
 	@mkdir -p $(dir $@)
-	cat $(OMA_OM_LIB) tests/algebra/test_oma.om | seed/out/omc > $@ && chmod +x $@
+	cat $(OMA_OM_LIB) tests/algebra/test_oma.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(OMA_FAILURE_TEST): $(OMA_OM_LIB) tests/algebra/test_oma_native_failure.om seed/out/omc
 	@mkdir -p $(dir $@)
-	cat $(OMA_OM_LIB) tests/algebra/test_oma_native_failure.om | seed/out/omc > $@ && chmod +x $@
+	cat $(OMA_OM_LIB) tests/algebra/test_oma_native_failure.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-algebra: $(OMA_TEST) $(OMA_FAILURE_TEST)
 	./$(OMA_TEST)
@@ -1668,7 +1673,6 @@ OMA_RZ_HDRS = src/algebra/realize_common.h
 OMA_SEL_SRCS = src/algebra/oma_select.c
 OMA_SEL_HDRS = src/algebra/oma_select.h
 OMA_RZ_TEST = $(OUT_DIR)/tests-algebra/test_realize
-OMA_RZ_TEST_ASAN = $(OUT_DIR)/tests-algebra/test_realize_asan
 OMA_RZ_BENCH = $(OUT_DIR)/tests-algebra/bench_mixed_algebra
 OMA_RZ_SELECT = $(OUT_DIR)/tests-algebra/bench_select
 MA2_EVIDENCE = evidence/MIXED_ALGEBRA
@@ -1678,7 +1682,7 @@ MA2_RUN_DIR = $(MA2_EVIDENCE)/runs/$(MA2_RUN_ID)
 
 $(OMA_RZ_TEST): $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_realize.om seed/out/omc
 	@mkdir -p $(dir $@)
-	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_realize.om | seed/out/omc > $@ && chmod +x $@
+	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_realize.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(OMA_RZ_BENCH): tests/algebra/bench_mixed_algebra.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS)
 	@mkdir -p $(dir $@)
@@ -1733,7 +1737,7 @@ PT_TEST = $(PT_OUT)/test_phase_twin
 
 $(PT_TEST): $(OMA_OM_LIB) src/algebra/phase_twin.om tests/algebra/test_phase_twin.om seed/out/omc
 	@mkdir -p $(dir $@)
-	cat $(OMA_OM_LIB) src/algebra/phase_twin.om tests/algebra/test_phase_twin.om | seed/out/omc > $@ && chmod +x $@
+	cat $(OMA_OM_LIB) src/algebra/phase_twin.om tests/algebra/test_phase_twin.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-phase-twin: $(PT_TEST)
 	./$(PT_TEST) $(PT_OUT)/phase_twin_receipt.json
@@ -1814,7 +1818,7 @@ DV1_GATE_BIN_ASAN = $(OUT_DIR)/tests-algebra/ma_digital_v1_gate_asan
 
 $(DV1_BOTTOM): $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_ma_digital_bottom.om seed/out/omc
 	@mkdir -p $(dir $@)
-	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_ma_digital_bottom.om | seed/out/omc > $@ && chmod +x $@
+	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_ma_digital_bottom.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(DV1_GATE_BIN): tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) $(TURING_HDRS)
 	@mkdir -p $(dir $@)
@@ -1844,8 +1848,7 @@ PATH1_TEST_BIN := $(OUT_DIR)/tests-path/test_path_identity
 .PHONY: test-path
 $(PATH1_TEST_BIN): src/path/rx_path.om tests/path/test_path_identity.om seed/out/omc
 	mkdir -p $(dir $@)
-	cat src/path/rx_path.om tests/path/test_path_identity.om | seed/out/omc > $@
-	chmod +x $@
+	cat src/path/rx_path.om tests/path/test_path_identity.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-path: $(PATH1_TEST_BIN)
 	sh tests/path/check_path_boundary.sh
@@ -2445,8 +2448,6 @@ test-vcstore-genesis: test-vcstore
 # prerequisite rules below make sure the new objects are built first.
 VC_BRIDGE_CORE = omega_program_ir omega_vc_bridge omega_resolve omega_receipt omega_blake3 omega_vcstore
 VC_BRIDGE_OBJS = $(addprefix $(OUT_DIR)/,$(addsuffix .o,$(VC_BRIDGE_CORE)))
-LEARNER_CORE += $(VC_BRIDGE_CORE)
-$(LEARNER): $(VC_BRIDGE_OBJS)
 SRCS += $(patsubst %,src/%.c,$(VC_BRIDGE_CORE))
 $(TARGET): $(VC_BRIDGE_OBJS)
 -include $(VC_BRIDGE_OBJS:.o=.d)

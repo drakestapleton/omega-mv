@@ -15,11 +15,11 @@ TY_FIX_B = tests/turing/fixtures/ctr1_seed1_crumbs10-12.ctr
 
 $(TY_TEST): tests/turing/test_ty_math.om $(TY_OM_LIB) seed/out/omc
 	@mkdir -p $(TY_DIR)
-	cat $(TY_OM_LIB) tests/turing/test_ty_math.om | seed/out/omc > $@ && chmod +x $@
+	cat $(TY_OM_LIB) tests/turing/test_ty_math.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(TY_TOOL): tools/turing_yield.om $(TY_OM_LIB) seed/out/omc
 	@mkdir -p $(TY_DIR)
-	cat $(TY_OM_LIB) tools/turing_yield.om | seed/out/omc > $@ && chmod +x $@
+	cat $(TY_OM_LIB) tools/turing_yield.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 turing-yield: $(TY_TOOL)
 

@@ -21,8 +21,7 @@ ans-purity: src/ans/ans.om src/ans/ans_core.om
 
 $(ANS_DIR)/test_ans: src/ans/ans.om tests/ans/test_ans.om seed/out/omc
 	@mkdir -p $(ANS_DIR)
-	cat src/ans/ans.om tests/ans/test_ans.om | seed/out/omc > $@
-	chmod +x $@
+	cat src/ans/ans.om tests/ans/test_ans.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-ans: $(ANS_DIR)/test_ans
 	./$(ANS_DIR)/test_ans

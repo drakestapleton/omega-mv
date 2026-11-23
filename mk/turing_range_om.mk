@@ -4,8 +4,8 @@
 # (mk/turing_exp001_b.mk) by tests/turing/tc_range_om.sh. Picked up by `-include mk/*.mk`.
 # Spec and bound: docs/turing/TURING_YIELD_RANGE_CODER_OM.md.
 .PHONY: test-turing-range-om
-TCO_DIR = $(OUT_DIR)/tests-turing-range-om
+TROM_DIR = $(OUT_DIR)/tests-turing-range-om
 
 test-turing-range-om: $(TC_TOOL)
-	@mkdir -p $(TCO_DIR)
-	sh tests/turing/tc_range_om.sh ./$(TC_TOOL) $(TCO_DIR)
+	@mkdir -p $(TROM_DIR)
+	sh tests/turing/tc_range_om.sh ./$(TC_TOOL) $(TROM_DIR)

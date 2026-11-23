@@ -1,12 +1,12 @@
 # M20 canonical machine identity (src/runtime/aien_machine_id.h). Host-only, no
 # Physics or Aienux sources needed. Run from the repo root.
+SEED_OMC ?= seed/out/omc
 AIEN_MID_TEST = $(OUT_DIR)/aien_machine_id_test
 
 $(AIEN_MID_TEST): tests/runtime/aien_machine_id_test.om src/runtime/aien_machine_id.om \
-		seed/ng/sha256.om
+		seed/ng/sha256.om $(SEED_OMC)
 	mkdir -p $(dir $@)
-	( echo om2; cat seed/ng/sha256.om src/runtime/aien_machine_id.om tests/runtime/aien_machine_id_test.om ) | $(SEED_OMC) > $@
-	chmod +x $@
+	( echo om2; cat seed/ng/sha256.om src/runtime/aien_machine_id.om tests/runtime/aien_machine_id_test.om ) | $(SEED_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: test-machine-identity
 test-machine-identity: $(AIEN_MID_TEST)

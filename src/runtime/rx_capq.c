@@ -782,8 +782,8 @@ int cq_wire_decode(const uint8_t *in, size_t len, uint32_t *kind, AienMachineId 
     if (memcmp(chk, in + 184, 4) != 0) return CQ_E_WIRE;
     uint64_t hdr[4] = { 0 }, fields[17] = { 0 }, ok = 0;
     uint8_t sdig[32] = { 0 };
-    (void)omega2_rx_cq_wire_decode_body(&ok, in, CQ_WIRE_BYTES, hdr, 4, fields, 17, sdig, 32);
-    if (!ok) return CQ_E_WIRE;
+    if (omega2_rx_cq_wire_decode_body(&ok, in, CQ_WIRE_BYTES, hdr, 4, fields, 17, sdig, 32) != OMEGA_OK || !ok)
+        return CQ_E_WIRE;
     if (aien_mid_decode(in + 8, AIEN_MID_RECORD_BYTES, machine) != AIEN_MID_OK) return CQ_E_WIRE;
     memset(out, 0, sizeof *out);
     out->source = (uint8_t)hdr[1];
@@ -832,11 +832,13 @@ int cq_wire_apply(CqCatalog *c, const uint8_t *in, size_t len, CqKey *key_out) {
     e.source = CQ_SRC_FABRIC;                               /* local source was provenance only */
     CqKey k = cq_key_of(&e);
     const CqEntry *old = cq_lookup(c, &k);
-    uint64_t chk = 0;
-    (void)omega2_rx_cq_wire_apply_check(&chk, old ? 1ull : 0ull, old ? old->generation : 0ull,
-                                        old ? (uint64_t)old->live : 0ull, e.generation,
-                                        (uint64_t)kind);
+    uint64_t chk = (uint64_t)(int64_t)CQ_E_WIRE;
+    if (omega2_rx_cq_wire_apply_check(&chk, old ? 1ull : 0ull, old ? old->generation : 0ull,
+                                      old ? (uint64_t)old->live : 0ull, e.generation,
+                                      (uint64_t)kind) != OMEGA_OK)
+        return CQ_E_WIRE;
     if ((int64_t)chk != 0) return (int)(int64_t)chk;
+    if (kind != CQ_WIRE_ADVERTISE && !old) return CQ_E_WIRE;
     if (kind == CQ_WIRE_ADVERTISE) {
         rc = cq_register(c, &e, NULL, 0);
     } else {

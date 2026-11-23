@@ -20,15 +20,15 @@ TC_DATA ?= $(HOME)/aien-data/crumbline/exp-20260927-rep10
 
 $(TC_DIR)/test_tc: tests/turing/test_tc.om $(TC_CODER_OM) seed/out/omc
 	@mkdir -p $(TC_DIR)
-	(printf 'om2\n'; cat $(TC_CODER_OM) tests/turing/test_tc.om) | seed/out/omc > $@ && chmod +x $@
+	(printf 'om2\n'; cat $(TC_CODER_OM) tests/turing/test_tc.om) | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(TC_DIR)/test_tc_produce: tests/turing/test_tc_produce.om $(TC_PROD_OM) seed/out/omc
 	@mkdir -p $(TC_DIR)
-	(printf 'om2\n'; cat $(TC_PROD_OM) tests/turing/test_tc_produce.om) | seed/out/omc > $@ && chmod +x $@
+	(printf 'om2\n'; cat $(TC_PROD_OM) tests/turing/test_tc_produce.om) | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(TC_TOOL): src/turing/tc_tool.om $(TC_PROD_OM) seed/out/omc
 	@mkdir -p $(TC_DIR)
-	(printf 'om2\n'; cat $(TC_PROD_OM) src/turing/tc_tool.om) | seed/out/omc > $@ && chmod +x $@
+	(printf 'om2\n'; cat $(TC_PROD_OM) src/turing/tc_tool.om) | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 turing-coder: $(TC_TOOL)
 
