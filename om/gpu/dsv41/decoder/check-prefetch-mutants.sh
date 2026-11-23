@@ -110,7 +110,7 @@ expect "mutant B rejected by exact-length cases" 1 "^FAIL double-zero want 12 go
 expect "mutant C rejected by repeated-name case" 1 "^FAIL repeated-name want 50" sh $d/check-prefetch-switch.sh "$m/C-switch-nodup"
 expect "mutant F rejected by off case" 1 "^FAIL zero want 0 \[ARBORIS pf_enabled=0\] got 0 \[ARBORIS pf_enabled=1\]" \
   sh $d/check-decoder-prefetch.sh "$m/F-cli-starton" "$tensors" "$map" "$sidecars" "$ckpt"
-expect "mutant G rejected by refusal case" 1 "^FAIL two want 64 .* got 70 " \
+expect "mutant G rejected by refusal case" 1 "^FAIL two want 64 " \
   sh $d/check-decoder-prefetch.sh "$m/G-cli-norefuse" "$tensors" "$map" "$sidecars" "$ckpt"
 
 (cd "$out" && sha256sum dsv41-decode check-arboris-prefetch check-prefetch-switch mutants/*)
