@@ -25,7 +25,8 @@
  * omega#323 (2026-10-07): GB10 Xid 31, GPCCLIENT_GCC FAULT_PTE read on a page boundary while the
  * head_dim 128 attention kernel (2688 B) ran; that this tail is the cause is INFERRED until the
  * padded build turns the fault off on the chip. Every code upload sizes its buffer here so no site
- * can drop the tail (tests/test_omega_gpu_code_alloc.c also scans src/ for page-rounded code sizes).
+ * can drop the tail (mk/omega-gpu-code-alloc.mk also scans src/ for page-rounded code sizes; the rule is
+ * tested on its OM-2 port src/omega_gpu_code_alloc.om).
  */
 #ifndef OMEGA_GPU_CODE_ALLOC_H
 #define OMEGA_GPU_CODE_ALLOC_H

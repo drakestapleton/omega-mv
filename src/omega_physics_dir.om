@@ -1,0 +1,644 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note Run-time resolution and pin verification of the physics checkout: pure OM-2 port of
+note src/omega_physics_dir.h (which stays the implementation the C gate runners include).
+note
+note omega_physics_dir_resolve: the PHYSICS_DIR environment variable if set and non-empty, otherwise
+note the project default "../physics" relative to the current directory. The chosen directory must
+note contain m16/m16_native.h; its real path (symlinks resolved) is returned in g_pd_out/g_pd_out_len.
+note On failure nothing is guessed: it returns 0 and g_pd_err/g_pd_err_len hold the same message as
+note the C header, naming the value tried, where it came from, and how to fix it.
+note
+note omega_physics_dir_verify: lock_path's first line, trailing newline/CR/space/tab trimmed, must be
+note one full 40-hex commit; `git -C <pd> rev-parse HEAD` must equal it (case-insensitive) and, when
+note require_clean, `git -C <pd> status --porcelain` must succeed and print nothing (stdout and stderr
+note together, as the C 2>&1). Any git failure is a refusal.
+note
+note Differences from the C header, all on the failure side: the real path is taken by chdir + cwd,
+note so a PHYSICS_DIR naming a file (not a directory) reports "not found" instead of "not a physics
+note checkout"; git is /usr/bin/git, run without a shell, with PATH=/usr/bin:/bin and the caller's
+note HOME (OM-2 exec takes an explicit environment), instead of the caller's PATH and environment.
+
+const PD_PATH_MAX ulong 4096
+const PD_ENV_CAP ulong 131072
+
+global g_pd_save uchar 4096
+global g_pd_real uchar 4096
+global g_pd_probe uchar 4200
+global g_pd_val uchar 131072
+global g_pd_val_len ulong 1
+global g_pd_env uchar 131072
+global g_pd_home uchar 4096
+global g_pd_home_len ulong 1
+global g_pd_want uchar 128
+global g_pd_got uchar 512
+global g_pd_got_len ulong 1
+global g_pd_out uchar 4096
+global g_pd_out_len ulong 1
+global g_pd_err uchar 8448
+global g_pd_err_len ulong 1
+
+text t_pd_env_name "PHYSICS_DIR="
+text t_pd_home_name "HOME="
+text t_pd_src_env "PHYSICS_DIR environment variable"
+text t_pd_src_def "default ../physics"
+text t_pd_def_path "../physics"
+text t_pd_probe_suf "/m16/m16_native.h"
+text t_pd_e1a "physics checkout not found: "
+text t_pd_e1b " ("
+text t_pd_e1c ") does not resolve; set PHYSICS_DIR to the physics checkout"
+text t_pd_e2a "physics checkout path unusable (quote or too long): "
+text t_pd_e2b ")"
+text t_pd_e3a "not a physics checkout: "
+text t_pd_e3b ") has no m16/m16_native.h; set PHYSICS_DIR to the physics checkout"
+text t_pd_v1a "cannot read "
+text t_pd_v1b " (cwd-relative; run from the omega root): physics commit pin unknown"
+text t_pd_v2a " is malformed: first line must be one full 40-hex commit"
+text t_pd_v3a "physics dir "
+text t_pd_v3b " is not the pinned checkout: expected commit "
+text t_pd_v3c ", observed "
+text t_pd_v3d "(not a git checkout or git failed)"
+text t_pd_v4a " at pinned commit "
+text t_pd_v4b " is "
+text t_pd_v4c "unreadable by git status"
+text t_pd_v4d "dirty (git status --porcelain not empty)"
+text t_pd_git "/usr/bin/git"
+text t_pd_dashc "-C"
+text t_pd_revparse "rev-parse"
+text t_pd_head "HEAD"
+text t_pd_status "status"
+text t_pd_porc "--porcelain"
+text t_pd_epath "PATH=/usr/bin:/bin"
+text t_pd_lock "physics.lock"
+
+fn pd_err_reset to void
+put g_pd_err_len 0 ulong 0
+end
+
+fn pd_err_add s view uchar * to void
+p = get g_pd_err_len 0
+sn = len s
+i = ulong 0
+while lt i sn bound 131072
+if lt p ulong 8448
+put g_pd_err p get s i
+p = add p ulong 1
+end
+i = add i ulong 1
+end
+put g_pd_err_len 0 p
+end
+
+note which 0: g_pd_real[0..n)  1: g_pd_val[0..n)  2: g_pd_got[0..n)
+fn pd_err_add_g which int n ulong to void
+p = get g_pd_err_len 0
+i = ulong 0
+while lt i n bound 131072
+if lt p ulong 8448
+if eq which 0
+put g_pd_err p get g_pd_real i
+end
+if eq which 1
+put g_pd_err p get g_pd_val i
+end
+if eq which 2
+put g_pd_err p get g_pd_got i
+end
+p = add p ulong 1
+end
+i = add i ulong 1
+end
+put g_pd_err_len 0 p
+end
+
+note Finds NAME= (name includes the '=') in the process environment. Returns the value length and
+note copies the value to g_pd_env[0..), or -1 when the variable is unset.
+fn pd_env_match name view uchar * to bool
+nn = len name
+j = ulong 0
+while lt j nn bound 64
+if ne get g_pd_env j get name j
+ret false
+end
+j = add j ulong 1
+end
+ret true
+end
+
+note moves g_pd_env[off..off+n) to g_pd_env[0..n)
+fn pd_env_shift off ulong n ulong to void
+k = ulong 0
+while lt k n bound 131072
+put g_pd_env k get g_pd_env add k off
+k = add k ulong 1
+end
+end
+
+fn pd_env_find name view uchar * to long
+nn = len name
+cnt = envcnt
+i = long 0
+while lt i cnt bound 100000
+n = envread ulong i g_pd_env ulong 0 PD_ENV_CAP
+if ge n long nn
+if pd_env_match name
+vn = sub ulong n nn
+pd_env_shift nn vn
+ret long vn
+end
+end
+i = add i long 1
+end
+ret long -1
+end
+
+note HOME for the git child, copied to g_pd_home (empty when unset or too long).
+fn pd_load_home to void
+put g_pd_home_len 0 ulong 0
+hn = pd_env_find t_pd_home_name
+if lt hn long 0
+ret
+end
+if ge ulong hn ulong 4000
+ret
+end
+k = ulong 0
+while lt k ulong hn bound 4096
+put g_pd_home k get g_pd_env k
+k = add k ulong 1
+end
+put g_pd_home_len 0 ulong hn
+end
+
+note Real path of the directory g_pd_val[0..n) into g_pd_real; returns its length or a negative error.
+fn pd_realpath_dir n ulong to long
+if eq n ulong 0
+ret long -2
+end
+sl = cwd g_pd_save ulong 0 PD_PATH_MAX
+if le sl long 1
+ret long -1
+end
+slen = sub ulong sl ulong 1
+rc = chdir g_pd_val ulong 0 n
+if ne rc long 0
+ret rc
+end
+rl = cwd g_pd_real ulong 0 PD_PATH_MAX
+ign = chdir g_pd_save ulong 0 slen
+if le rl long 1
+ret long -1
+end
+ret sub rl long 1
+end
+
+fn pd_add_src use_env bool to void
+if use_env
+pd_err_add t_pd_src_env
+else
+pd_err_add t_pd_src_def
+end
+end
+
+fn pd_has_quote rlen ulong to bool
+i = ulong 0
+while lt i rlen bound 4096
+if eq get g_pd_real i uchar 39
+ret true
+end
+i = add i ulong 1
+end
+ret false
+end
+
+note 0 when <real>/m16/m16_native.h is readable.
+fn pd_probe rlen ulong to long
+i = ulong 0
+while lt i rlen bound 4096
+put g_pd_probe i get g_pd_real i
+i = add i ulong 1
+end
+slen = len t_pd_probe_suf
+j = ulong 0
+while lt j slen bound 32
+put g_pd_probe add rlen j get t_pd_probe_suf j
+j = add j ulong 1
+end
+ret faccess g_pd_probe ulong 0 add rlen slen 4
+end
+
+note Resolves the candidate in g_pd_val[0..vn) (use_env: it came from PHYSICS_DIR).
+fn pd_resolve_val use_env bool vn ulong to int
+rl = pd_realpath_dir vn
+if lt rl long 0
+pd_err_reset
+pd_err_add t_pd_e1a
+pd_err_add_g 1 vn
+pd_err_add t_pd_e1b
+pd_add_src use_env
+pd_err_add t_pd_e1c
+ret 0
+end
+rlen = ulong rl
+bad = pd_has_quote rlen
+if ge add rlen ulong 1 ulong 4096
+bad = true
+end
+if bad
+pd_err_reset
+pd_err_add t_pd_e2a
+pd_err_add_g 0 rlen
+pd_err_add t_pd_e1b
+pd_add_src use_env
+pd_err_add t_pd_e2b
+ret 0
+end
+if ne pd_probe rlen long 0
+pd_err_reset
+pd_err_add t_pd_e3a
+pd_err_add_g 0 rlen
+pd_err_add t_pd_e1b
+pd_add_src use_env
+pd_err_add t_pd_e3b
+ret 0
+end
+i = ulong 0
+while lt i rlen bound 4096
+put g_pd_out i get g_pd_real i
+i = add i ulong 1
+end
+put g_pd_out_len 0 rlen
+ret 1
+end
+
+fn omega_physics_dir_resolve to int
+en = pd_env_find t_pd_env_name
+use_env = gt en long 0
+vn = ulong 0
+if use_env
+vn = ulong en
+k = ulong 0
+while lt k vn bound 131072
+put g_pd_val k get g_pd_env k
+k = add k ulong 1
+end
+else
+vn = len t_pd_def_path
+k = ulong 0
+while lt k vn bound 64
+put g_pd_val k get t_pd_def_path k
+k = add k ulong 1
+end
+end
+put g_pd_val_len 0 vn
+ret pd_resolve_val use_env vn
+end
+
+fn pd_is_hex c uchar to bool
+if and ge c uchar 48 le c uchar 57
+ret true
+end
+if and ge c uchar 97 le c uchar 102
+ret true
+end
+if and ge c uchar 65 le c uchar 70
+ret true
+end
+ret false
+end
+
+fn pd_tolower c uchar to uchar
+if and ge c uchar 65 le c uchar 90
+ret add c uchar 32
+end
+ret c
+end
+
+fn pd_read_u32le b view uchar * off ulong to int
+v0 = ulong get b off
+v1 = shl ulong get b add off ulong 1 ulong 8
+v2 = shl ulong get b add off ulong 2 ulong 16
+v3 = shl ulong get b add off ulong 3 ulong 24
+ret int or or v0 v1 or v2 v3
+end
+
+fn pd_pkt_init buf edit uchar * to ulong
+put buf 0 uchar 0
+put buf 1 uchar 0
+ret ulong 2
+end
+
+fn pd_pkt_count buf edit uchar * to void
+cnt = or ulong get buf 0 shl ulong get buf 1 ulong 8
+cnt = add cnt ulong 1
+put buf 0 uchar and cnt ulong 255
+put buf 1 uchar and shr cnt ulong 8 ulong 255
+end
+
+fn pd_pkt_add buf edit uchar * pos ulong s view uchar * to ulong
+sn = len s
+pd_pkt_count buf
+put buf pos uchar and sn ulong 255
+put buf add pos ulong 1 uchar and shr sn ulong 8 ulong 255
+p = add pos ulong 2
+i = ulong 0
+while lt i sn bound 65536
+put buf p get s i
+p = add p ulong 1
+i = add i ulong 1
+end
+ret p
+end
+
+note Appends the record "HOME=<g_pd_home>" when HOME was found.
+fn pd_pkt_add_home buf edit uchar * pos ulong to ulong
+hn = get g_pd_home_len 0
+if eq hn ulong 0
+ret pos
+end
+nn = len t_pd_home_name
+sn = add nn hn
+pd_pkt_count buf
+put buf pos uchar and sn ulong 255
+put buf add pos ulong 1 uchar and shr sn ulong 8 ulong 255
+p = add pos ulong 2
+i = ulong 0
+while lt i nn bound 16
+put buf p get t_pd_home_name i
+p = add p ulong 1
+i = add i ulong 1
+end
+i = ulong 0
+while lt i hn bound 4096
+put buf p get g_pd_home i
+p = add p ulong 1
+i = add i ulong 1
+end
+ret p
+end
+
+note g_pd_fd: [0] read end of the last spawn's pipe, [1] 1 when the child's stderr also goes to it
+global g_pd_fd int 2
+
+note Forks and runs the program packet pkt[0..pn) with environment env[0..en), its stdout (and its
+note stderr when g_pd_fd[1] is 1) into a pipe whose read end is left in g_pd_fd[0]. Returns the pid,
+note or -1 when it could not start.
+fn pd_spawn pkt view uchar * pn ulong env view uchar * en ulong to long
+pfd = new uchar 8 0
+if lt pipefds pfd ulong 0 ulong 8 0 long 0
+ret long -1
+end
+rfd = pd_read_u32le pfd ulong 0
+wfd = pd_read_u32le pfd ulong 4
+pid = fork
+if lt pid long 0
+ig = fclose rfd
+ig = fclose wfd
+ret long -1
+end
+if eq pid long 0
+ig = fclose rfd
+ig = dupfd wfd 1 0
+if ne get g_pd_fd 1 0
+ig = dupfd wfd 2 0
+end
+ig = fclose wfd
+ig = execenv pkt ulong 0 pn env ulong 0 en
+exit 127
+end
+ig = fclose wfd
+put g_pd_fd 0 rfd
+ret pid
+end
+
+note Reads at most cap bytes of fd into dst (which 0: g_pd_got) then closes fd, as pclose does
+note after the first line: a writer that keeps going gets EPIPE. Returns the bytes read.
+fn pd_drain fd int cap ulong to ulong
+gotn = ulong 0
+while lt gotn cap bound 100000
+k = read fd g_pd_got gotn sub cap gotn
+if le k long 0
+break
+end
+gotn = add gotn ulong k
+end
+ig = fclose fd
+ret gotn
+end
+
+note Runs pkt with env, stdout and stderr into a pipe; keeps the first 512 output bytes in
+note g_pd_got/g_pd_got_len and returns the exit code (128 when killed by a signal, -1 when it
+note could not run).
+fn pd_run pkt view uchar * pn ulong env view uchar * en ulong to int
+put g_pd_got_len 0 ulong 0
+put g_pd_fd 1 1
+pid = pd_spawn pkt pn env en
+if lt pid long 0
+ret -1
+end
+put g_pd_got_len 0 pd_drain get g_pd_fd 0 ulong 512
+ret pd_wait pid
+end
+
+fn pd_wait pid long to int
+st = new uchar 4 0
+wr = waitpid int pid st ulong 0 ulong 4 0
+if lt wr long 0
+ret -1
+end
+sv = or ulong get st 0 shl ulong get st 1 ulong 8
+if ne and sv ulong 127 ulong 0
+ret 128
+end
+ret int and shr sv ulong 8 ulong 255
+end
+
+note /usr/bin/git -C <pd> <subcmd> <arg>
+fn pd_run_git pd view uchar * subcmd view uchar * arg view uchar * to int
+pkt = new uchar 8400 0
+pp = pd_pkt_init pkt
+pp = pd_pkt_add pkt pp t_pd_git
+pp = pd_pkt_add pkt pp t_pd_dashc
+pp = pd_pkt_add pkt pp pd
+pp = pd_pkt_add pkt pp subcmd
+pp = pd_pkt_add pkt pp arg
+pd_load_home
+epkt = new uchar 4200 0
+ep = pd_pkt_init epkt
+ep = pd_pkt_add epkt ep t_pd_epath
+ep = pd_pkt_add_home epkt ep
+ret pd_run pkt pp epkt ep
+end
+
+note fgets: the first line of buf[0..n) up to and including its newline, at most cap - 1 bytes,
+note stopping at a NUL (strlen).
+fn pd_fgets_len buf view uchar * n ulong cap ulong to ulong
+lim = n
+if gt lim sub cap ulong 1
+lim = sub cap ulong 1
+end
+k = ulong 0
+while lt k lim bound 512
+b = get buf k
+if eq b uchar 0
+ret k
+end
+k = add k ulong 1
+if eq b uchar 10
+ret k
+end
+end
+ret k
+end
+
+note Drops trailing bytes of buf[0..n): newline and CR, and when ws also space and tab.
+fn pd_rtrim buf view uchar * n ulong ws bool to ulong
+k = n
+while gt k ulong 0 bound 512
+b = get buf sub k ulong 1
+drop = or eq b uchar 10 eq b uchar 13
+if ws
+if or eq b uchar 32 eq b uchar 9
+drop = true
+end
+end
+if not drop
+ret k
+end
+k = sub k ulong 1
+end
+ret k
+end
+
+fn pd_eq_ci a view uchar * b view uchar * n ulong to bool
+i = ulong 0
+while lt i n bound 256
+if ne pd_tolower get a i pd_tolower get b i
+ret false
+end
+i = add i ulong 1
+end
+ret true
+end
+
+note Reads and validates the pin into wbuf[0..40); returns 1, or 0 with the message set.
+fn pd_read_pin lock_path view uchar * wbuf edit uchar * to int
+fd = fopen lock_path ulong 0 len lock_path 0 0
+if lt fd long 0
+pd_err_reset
+pd_err_add t_pd_v1a
+pd_err_add lock_path
+pd_err_add t_pd_v1b
+ret 0
+end
+rn = read int fd wbuf ulong 0 ulong 127
+ignf = fclose int fd
+if lt rn long 0
+rn = long 0
+end
+wn = pd_fgets_len wbuf ulong rn ulong 128
+wn = pd_rtrim wbuf wn true
+ok = eq wn ulong 40
+if ok
+i = ulong 0
+while lt i ulong 40 bound 64
+if not pd_is_hex get wbuf i
+ok = false
+break
+end
+i = add i ulong 1
+end
+end
+if not ok
+pd_err_reset
+pd_err_add lock_path
+pd_err_add t_pd_v2a
+ret 0
+end
+ret 1
+end
+
+note gl: length of the observed line, the first bytes of g_pd_got
+fn pd_err_mismatch pd view uchar * wbuf view uchar * rc int gl ulong to void
+pd_err_reset
+pd_err_add t_pd_v3a
+pd_err_add pd
+pd_err_add t_pd_v3b
+pd_err_add part wbuf ulong 0 ulong 40
+pd_err_add t_pd_v3c
+if ne rc 0
+pd_err_add t_pd_v3d
+else
+pd_err_add_g 2 gl
+end
+end
+
+fn pd_check_clean pd view uchar * wbuf view uchar * to int
+rc2 = pd_run_git pd t_pd_status t_pd_porc
+dirty = gt get g_pd_got_len 0 ulong 0
+if eq rc2 0
+if not dirty
+ret 1
+end
+end
+pd_err_reset
+pd_err_add t_pd_v3a
+pd_err_add pd
+pd_err_add t_pd_v4a
+pd_err_add part wbuf ulong 0 ulong 40
+pd_err_add t_pd_v4b
+if ne rc2 0
+pd_err_add t_pd_v4c
+else
+pd_err_add t_pd_v4d
+end
+ret 0
+end
+
+fn omega_physics_dir_verify pd view uchar * lock_path view uchar * require_clean int to int
+wbuf = new uchar 128 0
+if eq pd_read_pin lock_path wbuf 0
+ret 0
+end
+rc = pd_run_git pd t_pd_revparse t_pd_head
+gbuf = new uchar 512 0
+gn = get g_pd_got_len 0
+i = ulong 0
+while lt i gn bound 512
+put gbuf i get g_pd_got i
+i = add i ulong 1
+end
+gl = pd_fgets_len gbuf gn ulong 256
+gl = pd_rtrim gbuf gl false
+matched = false
+if eq rc 0
+if eq gl ulong 40
+matched = pd_eq_ci gbuf wbuf ulong 40
+end
+end
+if not matched
+pd_err_mismatch pd wbuf rc gl
+ret 0
+end
+if ne require_clean 0
+ret pd_check_clean pd wbuf
+end
+ret 1
+end
+
+note resolve + verify against ./physics.lock (cwd-relative, like the C header).
+fn omega_physics_dir_resolve_pinned require_clean int to int
+if eq omega_physics_dir_resolve 0
+ret 0
+end
+pdb = new uchar 4096 0
+n = get g_pd_out_len 0
+i = ulong 0
+while lt i n bound 4096
+put pdb i get g_pd_out i
+i = add i ulong 1
+end
+ret omega_physics_dir_verify part pdb ulong 0 n t_pd_lock require_clean
+end

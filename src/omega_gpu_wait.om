@@ -1,0 +1,242 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note Shared completion wait for words the GPU writes to host-visible memory: pure OM-2 port of
+note src/omega_gpu_wait.c (which stays the implementation the C GPU paths link). Same two kinds
+note (FIXED: exact value, overshoot is not success; SEQUENCE: serial-number >= across the u32 wrap),
+note same two bounds (hard total deadline never extended; stall deadline restarted only by a change
+note of a watched word), same report fields and results.
+note
+note The unit that composes this file defines the word source and the test clock:
+note   gw_hook_read_word gw_hook_read_marker2 gw_hook_snapshot gw_hook_valid gw_hook_abort
+note   gw_hook_now_ns gw_hook_barrier gw_hook_relax
+note (the link-time form of the C cfg callbacks). cfg use_hooks 0 uses the real ones instead:
+note monons, cpufence (DSB SY on AArch64, before every read and after the PASS observation) and
+note cpurelax (YIELD). has_word 0 is the C NULL word and has_clock 0 the freestanding build
+note without a clock: both are INVALID_STATE. The poll loop is bounded at 10^12 polls.
+note
+note Compile-time mutants (mk/omega-gpu-wait.mk sets each to 1 in a copy; each must fail the test):
+const OMEGA_GPU_WAIT_MUTANT_STALL_NO_RESET int 0
+const OMEGA_GPU_WAIT_MUTANT_PROGRESS_EXTENDS_HARD int 0
+const OMEGA_GPU_WAIT_MUTANT_NO_READ_BARRIER int 0
+
+const OMEGA_GPU_WAIT_FIXED int 1
+const OMEGA_GPU_WAIT_SEQUENCE int 2
+
+const OMEGA_GPU_WAIT_PASS int 0
+const OMEGA_GPU_WAIT_TIMEOUT int 1
+const OMEGA_GPU_WAIT_STALLED int 2
+const OMEGA_GPU_WAIT_INVALID_STATE int 3
+const OMEGA_GPU_WAIT_ABORTED int 4
+
+const OMEGA_GPU_WAIT_DEFAULT_TOTAL_MS ulong 600000
+const OMEGA_GPU_WAIT_DEFAULT_PROGRESS_MS ulong 5000
+
+struct OmegaGpuWaitReport wait_kind int result int expected uint last_observed uint last_marker2 uint snap0 uint snap1 uint start_ns ulong elapsed_ns ulong last_progress_ns ulong progress_count ulong polls ulong end
+
+struct OmegaGpuWaitCfg total_timeout_ms uint progress_timeout_ms uint has_word int has_marker2 int marker2_want uint use_snapshot int use_valid int use_abort int use_hooks int has_clock int end
+
+fn gw_seq_reached observed uint target uint to bool
+diff = sub observed target
+ret lt diff uint 0x80000000
+end
+
+fn gw_now_ns use_hooks int to ulong
+if ne use_hooks 0
+ret gw_hook_now_ns
+end
+t = monons
+if lt t long 0
+ret ulong 0
+end
+ret ulong t
+end
+
+fn gw_barrier use_hooks int to void
+if ne use_hooks 0
+gw_hook_barrier
+ret
+end
+cpufence
+end
+
+fn gw_relax use_hooks int to void
+if ne use_hooks 0
+gw_hook_relax
+ret
+end
+cpurelax
+end
+
+fn gw_reset_rpt rpt edit OmegaGpuWaitReport kind int expected uint to void
+put rpt wait_kind kind
+put rpt result OMEGA_GPU_WAIT_PASS
+put rpt expected expected
+put rpt last_observed uint 0
+put rpt last_marker2 uint 0
+put rpt snap0 uint 0
+put rpt snap1 uint 0
+put rpt start_ns ulong 0
+put rpt elapsed_ns ulong 0
+put rpt last_progress_ns ulong 0
+put rpt progress_count ulong 0
+put rpt polls ulong 0
+end
+
+fn gw_changed m uint m2 uint s0 uint s1 uint rpt view OmegaGpuWaitReport to bool
+if ne m get rpt last_observed
+ret true
+end
+if ne m2 get rpt last_marker2
+ret true
+end
+if ne s0 get rpt snap0
+ret true
+end
+if ne s1 get rpt snap1
+ret true
+end
+ret false
+end
+
+fn gw_init_dl cfg view OmegaGpuWaitCfg rpt edit OmegaGpuWaitReport dl edit ulong 6 to void
+tot_ms = ulong get cfg total_timeout_ms
+if eq tot_ms ulong 0
+tot_ms = OMEGA_GPU_WAIT_DEFAULT_TOTAL_MS
+end
+prog_ms = ulong get cfg progress_timeout_ms
+if eq prog_ms ulong 0
+prog_ms = OMEGA_GPU_WAIT_DEFAULT_PROGRESS_MS
+end
+total_ns = mul ulong 1000000 tot_ms
+stall_ns = mul ulong 1000000 prog_ms
+start = gw_now_ns get cfg use_hooks
+put dl 0 total_ns
+put dl 1 stall_ns
+put dl 2 add start total_ns
+put dl 3 add start stall_ns
+put dl 4 start
+put dl 5 start
+put rpt start_ns start
+put rpt last_progress_ns start
+end
+
+fn gw_poll_once kind int expected uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg dl edit ulong 6 st edit int 2 to int
+note dl: [0]=total_ns [1]=stall_ns [2]=hard deadline [3]=stall deadline [4]=start [5]=now at loop top.
+note st[0]=first (1/0); returns: 0=continue, 1=PASS, 2=fail_done
+uh = get cfg use_hooks
+if ne get cfg use_abort 0
+if gw_hook_abort
+put rpt result OMEGA_GPU_WAIT_ABORTED
+put rpt elapsed_ns sub get dl 5 get dl 4
+ret 2
+end
+end
+if eq OMEGA_GPU_WAIT_MUTANT_NO_READ_BARRIER 0
+gw_barrier uh
+end
+m = gw_hook_read_word
+m2 = uint 0
+if ne get cfg has_marker2 0
+m2 = gw_hook_read_marker2
+end
+snap = new uint 2 0
+if ne get cfg use_snapshot 0
+gw_hook_snapshot snap
+end
+put rpt polls add get rpt polls ulong 1
+now = gw_now_ns uh
+
+chg = gw_changed m m2 get snap 0 get snap 1 rpt
+put rpt last_observed m
+put rpt last_marker2 m2
+put rpt snap0 get snap 0
+put rpt snap1 get snap 1
+put rpt elapsed_ns sub now get dl 4
+
+if chg
+if eq get st 0 0
+put rpt progress_count add get rpt progress_count ulong 1
+put rpt last_progress_ns now
+if eq OMEGA_GPU_WAIT_MUTANT_STALL_NO_RESET 0
+put dl 3 add now get dl 1
+end
+if ne OMEGA_GPU_WAIT_MUTANT_PROGRESS_EXTENDS_HARD 0
+put dl 2 add now get dl 0
+end
+end
+end
+
+ok = false
+if eq kind OMEGA_GPU_WAIT_FIXED
+ok = eq m expected
+else
+ok = gw_seq_reached m expected
+end
+if ok
+m2_ok = true
+if ne get cfg has_marker2 0
+m2_ok = eq m2 get cfg marker2_want
+end
+if m2_ok
+gw_barrier uh
+put rpt result OMEGA_GPU_WAIT_PASS
+ret 1
+end
+end
+
+if ne get cfg use_valid 0
+if not gw_hook_valid m
+put rpt result OMEGA_GPU_WAIT_INVALID_STATE
+ret 2
+end
+end
+
+put st 0 0
+if ge now get dl 3
+put rpt result OMEGA_GPU_WAIT_STALLED
+ret 2
+end
+gw_relax uh
+ret 0
+end
+
+fn omega_gpu_wait_core kind int expected uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg to bool
+gw_reset_rpt rpt kind expected
+if eq get cfg has_clock 0
+put rpt result OMEGA_GPU_WAIT_INVALID_STATE
+ret false
+end
+dl = new ulong 6 0
+gw_init_dl cfg rpt dl
+if eq get cfg has_word 0
+put rpt result OMEGA_GPU_WAIT_INVALID_STATE
+ret false
+end
+st = new int 2 0
+put st 0 1
+now = get dl 4
+while lt now get dl 2 bound 1000000000000
+put dl 5 now
+res = gw_poll_once kind expected rpt cfg dl st
+if eq res 1
+ret true
+end
+if eq res 2
+ret false
+end
+now = gw_now_ns get cfg use_hooks
+end
+put rpt elapsed_ns sub now get dl 4
+put rpt result OMEGA_GPU_WAIT_TIMEOUT
+ret false
+end
+
+fn omega_gpu_wait_fixed expected uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg to bool
+ret omega_gpu_wait_core OMEGA_GPU_WAIT_FIXED expected rpt cfg
+end
+
+fn omega_gpu_wait_sequence target uint rpt edit OmegaGpuWaitReport cfg view OmegaGpuWaitCfg to bool
+ret omega_gpu_wait_core OMEGA_GPU_WAIT_SEQUENCE target rpt cfg
+end
