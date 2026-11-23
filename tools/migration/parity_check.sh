@@ -105,11 +105,40 @@ for c in $(cat "$W/deleted"); do
     | grep -E "(^|[^A-Za-z0-9_])$stem\.(c|o)([^A-Za-z0-9_]|$)" > "$W/hits" || true
   while IFS= read -r h; do
     file=${h%%:*}
+    rest=${h#*:}
+    lineno=${rest%%:*}
     nck=$((nck + 1))
-    # scans OM: the file names an existing .om source, or an *OM_SRCS* source list
-    if grep -q 'OM_SRCS' "$file"; then continue; fi
+    # Scope the OM-scan exemption to the enclosing target/recipe block (for Makefiles) or the
+    # hit line's command block, rather than skipping an entire .mk file on any unrelated OM_SRCS/.om.
+    case "$file" in
+      Makefile|*/Makefile|*.mk)
+        awk -v ln="$lineno" '
+          { lines[NR] = $0 }
+          END {
+            s = ln
+            while (s > 1 && lines[s] ~ /^\t/) s--
+            e = ln
+            while (e < NR && lines[e + 1] ~ /^\t/) e++
+            for (i = s; i <= e; i++) print lines[i]
+          }
+        ' "$file" > "$W/block"
+        ;;
+      *)
+        awk -v ln="$lineno" '
+          { lines[NR] = $0 }
+          END {
+            s = ln
+            while (s > 1 && lines[s - 1] ~ /\\$/) s--
+            e = ln
+            while (e < NR && lines[e] ~ /\\$/) e++
+            for (i = s; i <= e; i++) print lines[i]
+          }
+        ' "$file" > "$W/block"
+        ;;
+    esac
+    if grep -q 'OM_SRCS' "$W/block"; then continue; fi
     scans=0
-    for om in $(grep -oE '[A-Za-z0-9_./-]+\.om([^A-Za-z0-9_]|$)' "$file" | sed -E 's/[^A-Za-z0-9_]$//' | sort -u); do
+    for om in $(grep -oE '[A-Za-z0-9_./-]+\.om([^A-Za-z0-9_]|$)' "$W/block" | sed -E 's/[^A-Za-z0-9_]$//' | sort -u); do
       [ -f "$om" ] && { scans=1; break; }
     done
     [ "$scans" -eq 1 ] && continue

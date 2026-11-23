@@ -39,16 +39,16 @@ $(TYE_WINDOW): tests/turing/ty_energy_window.c tests/runtime/r15_measure.c tests
 
 $(TYE_REDUCE): $(TYE_OM_LIB) tools/ty_energy_reduce.om seed/out/omc
 	@mkdir -p $(dir $@)
-	cat $(TYE_OM_LIB) tools/ty_energy_reduce.om | seed/out/omc > $@ && chmod +x $@
+	cat $(TYE_OM_LIB) tools/ty_energy_reduce.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(TYE_TEST): $(TYE_OM_LIB) tests/turing/test_ty_energy.om seed/out/omc
 	@mkdir -p $(dir $@)
-	cat $(TYE_OM_LIB) tests/turing/test_ty_energy.om | seed/out/omc > $@ && chmod +x $@
+	cat $(TYE_OM_LIB) tests/turing/test_ty_energy.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: test-turing-energy ty-energy-tools ty-energy-run
 $(TYE_FIXTURE): tests/turing/ty_energy_fixture.om seed/out/omc
 	@mkdir -p $(dir $@)
-	seed/out/omc < $< > $@ && chmod +x $@
+	seed/out/omc < $< > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 ty-energy-tools: $(TYE_WORKLOAD) $(TYE_WINDOW) $(TYE_REDUCE)
 

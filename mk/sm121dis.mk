@@ -9,10 +9,10 @@ SM121DIS_K = $(OUT_DIR)/sm121dis-kernels
 
 $(SM121DIS): gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om seed/out/omc
 	@mkdir -p $(OUT_DIR)
-	cat gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om | seed/out/omc > $@ && chmod +x $@
+	cat gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(SM121DIS_RED): gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om seed/out/omc
 	@mkdir -p $(OUT_DIR)
-	{ cat gpu/nvidia/om/disasm/sm121_dis.om; sed 's/cli_oc get tbuf i/cli_oc xor get tbuf i 1/' tools/sm121dis/sm121dis.om; } | seed/out/omc > $@ && chmod +x $@
+	{ cat gpu/nvidia/om/disasm/sm121_dis.om; sed 's/cli_oc get tbuf i/cli_oc xor get tbuf i 1/' tools/sm121dis/sm121dis.om; } | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 sm121dis-corpus-bins: $(addprefix $(OUT_DIR)/,gpu_matmul_api_test gpu_elementwise_test gpu_reconv_test gpu_attention_test \
 	gpu_moe_window_test gpu_fp8_api_test gpu_decode_attn_test gpu_router_test gpu_bf16_gemv_test gpu_tern_test gpu_fp8gemm_test \
@@ -42,7 +42,7 @@ test-sm121dis: $(SM121DIS) $(SM121DIS_RED) sm121dis-corpus-bins test-sm121dis-co
 ifneq ($(OUT_DIR),build)
 build/sm121dis: gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om seed/out/omc
 	@mkdir -p build
-	cat gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om | seed/out/omc > $@ && chmod +x $@
+	cat gpu/nvidia/om/disasm/sm121_dis.om tools/sm121dis/sm121dis.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 endif
 
 # ZERO-NVDISASM (bar C6, second half: nothing calls nvdisasm). tools/sm121dis/zero_nvdisasm.sh runs every listing and

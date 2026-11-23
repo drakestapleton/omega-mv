@@ -33,14 +33,14 @@ $(OUT_DIR)/visor/%.o: src/visor/%.c | $(OUT_DIR)/visor
 	$(CC) $(VISOR_CFLAGS) -c $< -o $@
 
 $(OMEGA_BIN): $(OMEGA_OM_SRCS) seed/out/omc | $(OUT_DIR)
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(OMEGA_OM_SRCS)) | seed/out/omc > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(OMEGA_OM_SRCS)) | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: omega
 omega: $(OMEGA_BIN)
 	cp $(OMEGA_BIN) ./omega
 
 $(OUT_DIR)/tests-language/%: tests/language/%.om seed/out/omc | $(OUT_DIR)/tests-language
-	seed/out/omc < $< > $@ && chmod +x $@
+	seed/out/omc < $< > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 # ---- aggregate Visor gates (lead-owned) --------------------------------------
 # Physics-free lane tests (no PHYSICS_DIR needed):

@@ -18,7 +18,7 @@ OMEGA_BRIDGE_DIR ?= ../omega-bridge
 OM_ENC_DIR = $(OUT_DIR)/om-encoder
 OM_ENC_TEST_DEPS = tests/test_omega_codegen_freestanding.c src/omega_blackwell_codegen.h src/omega_blackwell_matmul.h
 OM_ENC_SRCS = src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c
-OM_ENC_BUILD = gcc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Isrc
+OM_ENC_BUILD = $(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Isrc
 # The mutant bindings keep the other units, so sha256_* (src/omega_api_decl.h) still resolves; only the encoder changes.
 OM_ENC_OTHER_UNITS = om/sha256/sha256-om2.om om/blake3/b3unit.om
 

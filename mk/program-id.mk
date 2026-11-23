@@ -3,7 +3,7 @@ PROGRAM_ID_TEST = $(OUT_DIR)/tests-program/test_program_id
 
 $(PROGRAM_ID_TEST): tests/program/test_program_id.om seed/out/omc
 	@mkdir -p $(dir $@)
-	seed/out/omc < tests/program/test_program_id.om > $@ && chmod +x $@
+	seed/out/omc < tests/program/test_program_id.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: test-program-id
 test-program-id: $(PROGRAM_ID_TEST)

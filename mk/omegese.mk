@@ -15,7 +15,7 @@ OMEGESE_DIR = $(OUT_DIR)/omegese
 
 $(OMEGESE_DIR)/omegese: tools/omegese/omegese.om seed/out/omc
 	@mkdir -p $(OMEGESE_DIR)
-	seed/out/omc < tools/omegese/omegese.om > $@ && chmod +x $@
+	seed/out/omc < tools/omegese/omegese.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 omegese: $(OMEGESE_DIR)/omegese
 

@@ -17,19 +17,19 @@ ST_CORPUS_OM = $(ST_HOLDOUT_OM) src/searchtrace/st_corpus.om
 
 $(ST_DIR)/searchtrace: $(ST_CORPUS_OM) src/searchtrace/st_tool.om $(ST_OMC)
 	@mkdir -p $(ST_DIR)
-	cat $(ST_CORPUS_OM) src/searchtrace/st_tool.om | $(ST_OMC) > $@ && chmod +x $@
+	cat $(ST_CORPUS_OM) src/searchtrace/st_tool.om | $(ST_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(ST_DIR)/test_st_corpus: $(ST_CORPUS_OM) tests/searchtrace/test_st_corpus.om $(ST_OMC)
 	@mkdir -p $(ST_DIR)
-	cat $(ST_CORPUS_OM) tests/searchtrace/test_st_corpus.om | $(ST_OMC) > $@ && chmod +x $@
+	cat $(ST_CORPUS_OM) tests/searchtrace/test_st_corpus.om | $(ST_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(ST_DIR)/test_st_holdout: $(ST_HOLDOUT_OM) tests/searchtrace/test_st_holdout.om $(ST_OMC)
 	@mkdir -p $(ST_DIR)
-	cat $(ST_HOLDOUT_OM) tests/searchtrace/test_st_holdout.om | $(ST_OMC) > $@ && chmod +x $@
+	cat $(ST_HOLDOUT_OM) tests/searchtrace/test_st_holdout.om | $(ST_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(ST_DIR)/test_st_holdout_sig: $(ST_HOLDOUT_OM) tests/searchtrace/test_st_holdout_sig.om $(ST_OMC)
 	@mkdir -p $(ST_DIR)
-	cat $(ST_HOLDOUT_OM) tests/searchtrace/test_st_holdout_sig.om | $(ST_OMC) > $@ && chmod +x $@
+	cat $(ST_HOLDOUT_OM) tests/searchtrace/test_st_holdout_sig.om | $(ST_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 searchtrace: $(ST_DIR)/searchtrace
 

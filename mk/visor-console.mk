@@ -16,7 +16,7 @@ VISOR_CONSOLE_LANE_OM_SRCS = src/visor/visor.om src/visor/visor_parse_command.om
 	tests/visor/test_visor_console.om tests/visor/test_visor_console_main.om
 
 $(OUT_DIR)/lane2/test_visor_console: $(VISOR_CONSOLE_LANE_OM_SRCS) $(VISOR_OMC) | $(OUT_DIR)/lane2
-	(printf 'om2\n'; sed '/^om2$$/d' $(VISOR_CONSOLE_LANE_OM_SRCS)) | $(VISOR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed '/^om2$$/d' $(VISOR_CONSOLE_LANE_OM_SRCS)) | $(VISOR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 VISOR_CONSOLE_FULL_OM_SRCS = \
 	$(filter-out tools/omega_wire.om src/visor/visor_console.om tools/omega.om,$(OMEGA_OM_SRCS)) \
@@ -24,7 +24,7 @@ VISOR_CONSOLE_FULL_OM_SRCS = \
 	src/visor/visor_console.om tests/visor/test_visor_console.om tests/visor/test_visor_console_e2e.om
 
 $(OUT_DIR)/lane2/test_visor_console_full: $(VISOR_CONSOLE_FULL_OM_SRCS) $(VISOR_OMC) | $(OUT_DIR)/lane2
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(VISOR_CONSOLE_FULL_OM_SRCS)) | $(VISOR_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(VISOR_CONSOLE_FULL_OM_SRCS)) | $(VISOR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 .PHONY: test-visor-console
 test-visor-console: $(OUT_DIR)/lane2/test_visor_console $(OUT_DIR)/lane2/test_visor_console_full

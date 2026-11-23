@@ -102,17 +102,19 @@ static void store_release_u32(volatile uint32_t *p, uint32_t v) {
     atomic_store_explicit((_Atomic uint32_t *)p, v, memory_order_release);
 }
 
-static uint32_t crc32c(const uint8_t *data, size_t len) {
+static int crc32c(const uint8_t *data, size_t len, uint32_t *out) {
     uint64_t r = 0;
-    (void)omega2_rx_coh_crc32c(&r, data, len, (uint64_t)len);
-    return (uint32_t)r;
+    if (omega2_rx_coh_crc32c(&r, data, len, (uint64_t)len) != OMEGA_OK)
+        return -1;
+    *out = (uint32_t)r;
+    return 0;
 }
 
-static uint32_t desc_checksum(const OmegaSharedWorldDesc *desc) {
+static int desc_checksum(const OmegaSharedWorldDesc *desc, uint32_t *out) {
     uint8_t buf[0x3C + 64];
     memcpy(buf, desc, 0x3C);
     memcpy(buf + 0x3C, desc->payload, 64);
-    return crc32c(buf, sizeof(buf));
+    return crc32c(buf, sizeof(buf), out);
 }
 
 void rx_world_seal_descriptor(OmegaSharedWorldDesc *desc) {
@@ -120,7 +122,13 @@ void rx_world_seal_descriptor(OmegaSharedWorldDesc *desc) {
     desc->abi_version = OMEGA_SW_ABI_VERSION;
     desc->flags = (uint16_t)(desc->flags | OMEGA_SW_FLAG_CHECKSUM | OMEGA_SW_FLAG_OBJECT_REF);
     desc->checksum = 0;
-    desc->checksum = desc_checksum(desc);
+    uint32_t csum = 0;
+    if (desc_checksum(desc, &csum) != 0) {
+        desc->flags = (uint16_t)(desc->flags & ~OMEGA_SW_FLAG_CHECKSUM);
+        desc->checksum = 0;
+        return;
+    }
+    desc->checksum = csum;
 }
 
 static OmegaSharedWorldHeader *hdr_of(RxWorld *w) {
@@ -156,15 +164,15 @@ static uint32_t get_u32(const uint8_t *p) {
 
 static int ring_msg(uint16_t t) {
     uint64_t r = 0;
-    (void)omega2_rx_coh_ring_msg(&r, (uint64_t)t);
+    if (omega2_rx_coh_ring_msg(&r, (uint64_t)t) != OMEGA_OK) return 0;
     return r != 0;
 }
 
 /* A claim names the object the seat reads; the object it writes is named in
  * the payload and its write right is checked at publication. */
 static uint32_t msg_rights(uint16_t t) {
-    uint64_t r = 0;
-    (void)omega2_rx_coh_msg_rights(&r, (uint64_t)t);
+    uint64_t r = UINT32_MAX;
+    if (omega2_rx_coh_msg_rights(&r, (uint64_t)t) != OMEGA_OK) return UINT32_MAX;
     return (uint32_t)r;
 }
 
@@ -178,8 +186,9 @@ static void raise_fault(RxWorld *w, uint32_t code, uint64_t sequence, uint32_t a
 }
 
 static int fault_err(uint32_t fault) {
-    uint64_t r = 0;
-    (void)omega2_rx_coh_fault_err(&r, (uint64_t)fault);
+    uint64_t r = (uint64_t)(int64_t)RX_ERR_BAD_DESC;
+    if (omega2_rx_coh_fault_err(&r, (uint64_t)fault) != OMEGA_OK)
+        return RX_ERR_BAD_DESC;
     return (int)(int64_t)r;
 }
 
@@ -287,9 +296,9 @@ static int check_locked(RxWorld *w, const OmegaSharedWorldDesc *desc,
     else if ((desc->flags & OMEGA_SW_FLAG_CHECKSUM) == 0) fault = OMEGA_SW_FAULT_BAD_CHECKSUM;
     else {
         OmegaSharedWorldDesc tmp = *desc;
-        uint32_t want = tmp.checksum;
+        uint32_t want = tmp.checksum, calc = 0;
         tmp.checksum = 0;
-        if (desc_checksum(&tmp) != want) fault = OMEGA_SW_FAULT_BAD_CHECKSUM;
+        if (desc_checksum(&tmp, &calc) != 0 || calc != want) fault = OMEGA_SW_FAULT_BAD_CHECKSUM;
     }
 
     if (fault == OMEGA_SW_FAULT_NONE) {
@@ -703,9 +712,9 @@ static int notice_intact(const OmegaSharedWorldDesc *d, uint32_t epoch) {
     if (d->world_epoch != epoch) return RX_ERR_STALE_GEN;
     if ((d->flags & OMEGA_SW_FLAG_CHECKSUM) == 0) return RX_ERR_TORN;
     OmegaSharedWorldDesc tmp = *d;
-    uint32_t got = tmp.checksum;
+    uint32_t got = tmp.checksum, calc = 0;
     tmp.checksum = 0;
-    if (desc_checksum(&tmp) != got) return RX_ERR_TORN;
+    if (desc_checksum(&tmp, &calc) != 0 || calc != got) return RX_ERR_TORN;
     return RX_OK;
 }
 

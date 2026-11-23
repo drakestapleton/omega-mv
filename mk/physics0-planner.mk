@@ -29,13 +29,13 @@ P0P_OM_HOST = 'fork|execprog|execpure|socknew|connect|bind|listen|accept|mapnew|
 
 $(P0P_DIR)/test_pd0_planner: $(P0P_OM_TEST) $(P0P_OMC)
 	@mkdir -p $(P0P_DIR)
-	{ echo "om2"; cat $(P0P_OM_TEST); } | $(P0P_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0P_OM_TEST); } | $(P0P_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(P0P_DIR)/pd0_plan_eff: $(P0P_OM_EFF) $(P0P_OMC)
 	@mkdir -p $(P0P_DIR)
-	{ echo "om2"; cat $(P0P_OM_EFF); } | $(P0P_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0P_OM_EFF); } | $(P0P_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(P0P_DIR)/pd0_plan_eff2: $(P0P_OM_EFF2) $(P0P_OMC)
 	@mkdir -p $(P0P_DIR)
-	{ echo "om2"; cat $(P0P_OM_EFF2); } | $(P0P_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0P_OM_EFF2); } | $(P0P_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 # purity: the planner units (code lines; notes excluded) carry no generator, world or authority name and
 # use no host process/socket/map/file word; both checks are shown to bite on the harness side

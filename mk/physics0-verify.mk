@@ -35,13 +35,13 @@ P0V_HDRS = src/physics0/ladder/pd0_fmt.h src/physics0/ladder/pd0_codes.h src/phy
 P0V_FORBIDDEN = 'truth_|oracle_rel|rx_|aienos_|argus_|forge_|mmap|fork|exec|socket'
 $(P0V_DIR)/test_pd0_fmt: $(P0V_OM_FMT) $(P0V_OMC)
 	@mkdir -p $(P0V_DIR)/receipts
-	{ echo "om2"; $(P0V_OM_COMMIT); cat $(P0V_OM_FMT); } | $(P0V_OMC) > $@ && chmod +x $@
+	{ echo "om2"; $(P0V_OM_COMMIT); cat $(P0V_OM_FMT); } | $(P0V_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(P0V_DIR)/test_pd0_ladder: $(P0V_OM_LADDER) $(P0V_OMC)
 	@mkdir -p $(P0V_DIR)/receipts
-	{ echo "om2"; $(P0V_OM_COMMIT); cat $(P0V_OM_LADDER); } | $(P0V_OMC) > $@ && chmod +x $@
+	{ echo "om2"; $(P0V_OM_COMMIT); cat $(P0V_OM_LADDER); } | $(P0V_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(P0V_DIR)/test_pd0_score: $(P0V_OM_SCORE) $(P0V_OMC)
 	@mkdir -p $(P0V_DIR)/receipts
-	{ echo "om2"; $(P0V_OM_COMMIT); cat $(P0V_OM_SCORE); } | $(P0V_OMC) > $@ && chmod +x $@
+	{ echo "om2"; $(P0V_OM_COMMIT); cat $(P0V_OM_SCORE); } | $(P0V_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(P0V_DIR)/c/%: tests/physics0/verify/%.c $(P0V_SRCS) $(P0V_HDRS)
 	@mkdir -p $(P0V_DIR)/c $(P0V_DIR)/receipts
 	$(CC) $(P0V_CFLAGS) -o $@ $< $(P0V_SRCS) -lm

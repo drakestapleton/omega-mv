@@ -104,7 +104,8 @@ static int fill_token(uint8_t token[RX_CAP_TOKEN_LEN]) {
 
 static int token_ok(const uint8_t *a, const uint8_t *b) {
     uint64_t eq = 0;
-    (void)omega2_cap_token_eq(&eq, a, RX_CAP_TOKEN_LEN, b, RX_CAP_TOKEN_LEN);
+    if (omega2_cap_token_eq(&eq, a, RX_CAP_TOKEN_LEN, b, RX_CAP_TOKEN_LEN) != OMEGA_OK)
+        return 0;
     return eq != 0;
 }
 
@@ -184,29 +185,35 @@ static void om2_unpack_entry(const uint64_t s[13], RxCapEntry *e) {
 
 static int auth_use(RxCapTable *t, const uint8_t *delivered, RxCapRef a,
                     uint32_t need, const RxCapEntry **out) {
-    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
     table_to_om2(t, hdr, slots);
     uint64_t args[3] = { a.cap_id, a.generation, need };
-    (void)omega2_cap_table_auth_use(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
-                                    args, 3);
+    if (omega2_cap_table_auth_use(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                                  args, 3) != OMEGA_OK)
+        return RX_CAP_ERR_IO;
     int res = (int)(int64_t)rc;
-    if (res == RX_CAP_OK && out) *out = &t->entries[a.cap_id];
+    if (res == RX_CAP_OK) {
+        if (a.cap_id >= RX_CAP_MAX) return RX_CAP_ERR_BOUNDS;
+        if (out) *out = &t->entries[a.cap_id];
+    }
     return res;
 }
 
 static int root_mint(RxCapTable *t, const uint8_t *delivered, uint8_t *delivered_mut,
                      const RxCapMint *m, RxCapRef *out) {
     (void)delivered;
-    uint64_t hdr[4], slots[RX_CAP_MAX * 13], ref[2] = { 0, 0 }, rc = 0;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], ref[2] = { 0, 0 }, rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
     table_to_om2(t, hdr, slots);
     uint64_t req[9] = {
         m->issuer, m->subject, m->resource, m->rights, m->lease_ticks,
         m->parent.cap_id, m->parent.generation, m->authority.cap_id, m->authority.generation
     };
-    (void)omega2_cap_table_mint(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered_mut, RX_CAP_MAX,
-                                req, 9, ref, 2);
+    if (omega2_cap_table_mint(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered_mut, RX_CAP_MAX,
+                              req, 9, ref, 2) != OMEGA_OK)
+        return RX_CAP_ERR_IO;
     int res = (int)(int64_t)rc;
     if (res == RX_CAP_OK) {
+        if (ref[0] >= RX_CAP_MAX) return RX_CAP_ERR_BOUNDS;
         root_begin(t);
         om2_to_table(t, hdr, slots);
         root_end(t);
@@ -217,11 +224,12 @@ static int root_mint(RxCapTable *t, const uint8_t *delivered, uint8_t *delivered
 }
 
 static int root_revoke(RxCapTable *t, const uint8_t *delivered, RxCapRef authority, RxCapRef r) {
-    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rev_list[257] = { 0 }, rc = 0;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rev_list[257] = { 0 }, rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
     table_to_om2(t, hdr, slots);
     uint64_t args[4] = { authority.cap_id, authority.generation, r.cap_id, r.generation };
-    (void)omega2_cap_table_revoke(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
-                                  args, 4, rev_list, 257);
+    if (omega2_cap_table_revoke(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                                args, 4, rev_list, 257) != OMEGA_OK)
+        return RX_CAP_ERR_IO;
     int res = (int)(int64_t)rc;
     if (res == RX_CAP_OK) {
         root_begin(t);
@@ -234,11 +242,12 @@ static int root_revoke(RxCapTable *t, const uint8_t *delivered, RxCapRef authori
 static int root_reclaim(RxCapTable *t, const uint8_t *delivered, uint8_t *delivered_mut,
                         RxCapRef authority, uint32_t id) {
     (void)delivered;
-    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
     table_to_om2(t, hdr, slots);
     uint64_t args[3] = { authority.cap_id, authority.generation, id };
-    (void)omega2_cap_table_reclaim(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered_mut, RX_CAP_MAX,
-                                   args, 3);
+    if (omega2_cap_table_reclaim(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered_mut, RX_CAP_MAX,
+                                 args, 3) != OMEGA_OK)
+        return RX_CAP_ERR_IO;
     int res = (int)(int64_t)rc;
     if (res == RX_CAP_OK) {
         root_begin(t);
@@ -249,11 +258,12 @@ static int root_reclaim(RxCapTable *t, const uint8_t *delivered, uint8_t *delive
 }
 
 static int root_clock(RxCapTable *t, const uint8_t *delivered, RxCapRef authority, uint64_t ticks) {
-    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
     table_to_om2(t, hdr, slots);
     uint64_t args[3] = { authority.cap_id, authority.generation, ticks };
-    (void)omega2_cap_table_clock(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
-                                 args, 3);
+    if (omega2_cap_table_clock(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                               args, 3) != OMEGA_OK)
+        return RX_CAP_ERR_IO;
     int res = (int)(int64_t)rc;
     if (res == RX_CAP_OK) {
         root_begin(t);
@@ -264,10 +274,11 @@ static int root_clock(RxCapTable *t, const uint8_t *delivered, RxCapRef authorit
 }
 
 static int root_epoch(RxCapTable *t, const uint8_t *delivered, RxCapRef authority) {
-    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = 0;
+    uint64_t hdr[4], slots[RX_CAP_MAX * 13], rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
     table_to_om2(t, hdr, slots);
-    (void)omega2_cap_table_epoch(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
-                                 authority.cap_id, authority.generation);
+    if (omega2_cap_table_epoch(&rc, hdr, 4, slots, RX_CAP_MAX * 13, delivered, RX_CAP_MAX,
+                               authority.cap_id, authority.generation) != OMEGA_OK)
+        return RX_CAP_ERR_IO;
     int res = (int)(int64_t)rc;
     if (res == RX_CAP_OK) {
         root_begin(t);
@@ -549,9 +560,10 @@ int rx_caproot_inspect(const RxCapRoot *root, RxCapRef ref, RxCapEntry *out) {
         table_to_om2(t, hdr, slots);
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&t->seq, memory_order_relaxed) != s0) continue;
-        uint64_t ent[13] = { 0 }, rc = 0;
-        (void)omega2_cap_table_inspect(&rc, hdr, 4, slots, RX_CAP_MAX * 13,
-                                       ref.cap_id, ref.generation, ent, 13);
+        uint64_t ent[13] = { 0 }, rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
+        if (omega2_cap_table_inspect(&rc, hdr, 4, slots, RX_CAP_MAX * 13,
+                                     ref.cap_id, ref.generation, ent, 13) != OMEGA_OK)
+            return RX_CAP_ERR_IO;
         int res = (int)(int64_t)rc;
         if (res == RX_CAP_OK && out) om2_unpack_entry(ent, out);
         return res;
@@ -574,8 +586,9 @@ int rx_caproot_validate(const RxCapRoot *root, RxCapRef ref,
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&t->seq, memory_order_relaxed) != s0) continue;
         uint64_t args[5] = { ref.cap_id, ref.generation, subject, resource, rights };
-        uint64_t ent[13] = { 0 }, rc = 0;
-        (void)omega2_cap_table_validate(&rc, hdr, 4, slots, RX_CAP_MAX * 13, args, 5, ent, 13);
+        uint64_t ent[13] = { 0 }, rc = (uint64_t)(int64_t)RX_CAP_ERR_IO;
+        if (omega2_cap_table_validate(&rc, hdr, 4, slots, RX_CAP_MAX * 13, args, 5, ent, 13) != OMEGA_OK)
+            return RX_CAP_ERR_IO;
         int res = (int)(int64_t)rc;
         if (res == RX_CAP_OK && out_entry) om2_unpack_entry(ent, out_entry);
         return res;

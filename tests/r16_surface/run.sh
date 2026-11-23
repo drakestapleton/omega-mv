@@ -44,7 +44,7 @@ bad()  { echo "FAIL $*"; fails=$((fails + 1)); }
 
 # 1 ---------------------------------------------------------------------------
 hits=$(git grep -n -e '--demonstrate-' -- tools src tests Makefile README.md \
-        ':!tools/r16_loop_inventory.c' ':!tests/r16_surface/run.sh' \
+        ':!tools/r16_loop_inventory.c' ':!tools/r16_loop_inventory.om' ':!tests/r16_surface/run.sh' \
         ':!tests/r16_inventory/fixture' \
     | grep -v '^tools/omegatool.c:[0-9]*: \* --legacy-oracle-living-matvec; the old --demonstrate-living-matvec mode is$')
 if [ -z "$hits" ]; then ok "old mode names: none in code, scripts, Makefile or README"

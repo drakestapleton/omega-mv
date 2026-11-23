@@ -9,7 +9,7 @@ TYP2_DIR = $(OUT_DIR)/tests-turing-prd2
 
 $(TYP2_DIR)/test_ty_prd2: $(TYP2_OM_LIB) tests/turing/test_ty_prd2.om seed/out/omc
 	@mkdir -p $(TYP2_DIR)
-	cat $(TYP2_OM_LIB) tests/turing/test_ty_prd2.om | seed/out/omc > $@ && chmod +x $@
+	cat $(TYP2_OM_LIB) tests/turing/test_ty_prd2.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-turing-prd2: $(TYP2_DIR)/test_ty_prd2
 	./$(TYP2_DIR)/test_ty_prd2

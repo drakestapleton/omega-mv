@@ -43,7 +43,7 @@ static void set_err(char *err, size_t n, const char *fmt, int line, const char *
 static int op_right(int op)
 {
     uint64_t r = 0;
-    (void)omega2_osh_om_op_right(&r, (uint64_t)op);
+    if (omega2_osh_om_op_right(&r, (uint64_t)op) != OMEGA_OK) return 0;
     return (int)r;
 }
 
@@ -88,8 +88,9 @@ static int under(const char *prefix, const char *p)
 {
     size_t np = strlen(prefix), npath = strlen(p);
     uint64_t ok = 0;
-    (void)omega2_osh_om_path_under(&ok, (const uint8_t *)prefix, np, (uint64_t)np,
-                                   (const uint8_t *)p, npath, (uint64_t)npath);
+    if (omega2_osh_om_path_under(&ok, (const uint8_t *)prefix, np, (uint64_t)np,
+                                 (const uint8_t *)p, npath, (uint64_t)npath) != OMEGA_OK)
+        return 0;
     return ok != 0;
 }
 
@@ -173,8 +174,9 @@ void osh_caps_attach(OshCaps *c, OshSession *s)
 
 static int map_rc(int rc)
 {
-    uint64_t r = 0;
-    (void)omega2_osh_om_map_cap_rc(&r, (uint64_t)(int64_t)rc);
+    uint64_t r = OSH_E_DENIED;
+    if (omega2_osh_om_map_cap_rc(&r, (uint64_t)(int64_t)rc) != OMEGA_OK)
+        return OSH_E_DENIED;
     return (int)(int64_t)r;
 }
 
@@ -183,7 +185,8 @@ int osh_caps_effect(void *ctx, const OshBinding *b, int op, const char *path)
     OshCaps *c = ctx;
     if (!c || !c->started || !b || !b->valid) return OSH_E_DENIED;
     uint64_t chk = 0;
-    (void)omega2_osh_om_check_binding(&chk, (uint64_t)b->domain, b->principal_id, 32);
+    if (omega2_osh_om_check_binding(&chk, (uint64_t)b->domain, b->principal_id, 32) != OMEGA_OK)
+        return OSH_E_DENIED;
     if ((int64_t)chk < 0) return (int)(-(int64_t)chk);
     uint32_t subject = (uint32_t)chk;
     /* 1. the session's own principal capability, with the generation exactly as bound (64 bits) */
@@ -191,13 +194,15 @@ int osh_caps_effect(void *ctx, const OshBinding *b, int op, const char *path)
     int rc = rx_caproot_validate(&c->root, pref, subject, 0, RX_RIGHT_READ, NULL);
     if (rc != RX_CAP_OK) return map_rc(rc);
     /* 2. a grant for this operation whose prefix contains the canonical target, validated at this moment */
+    uint32_t need_right = (uint32_t)op_right(op);
+    if (need_right == 0) return OSH_E_DENIED;
     char canon[PATH_MAX];
     if (canon_target(path, canon, sizeof canon) != 0) return OSH_E_DENIED;
     int result = OSH_E_DENIED;
     for (int i = 0; i < c->ngrants; i++) {
         const OshGrant *g = &c->grants[i];
         if (g->op != op || !under(g->prefix, canon)) continue;
-        int e = map_rc(rx_caproot_validate(&c->root, g->ref, subject, g->resource, (uint32_t)op_right(op), NULL));
+        int e = map_rc(rx_caproot_validate(&c->root, g->ref, subject, g->resource, need_right, NULL));
         if (e == OSH_E_OK) return OSH_E_OK;
         result = e;
     }

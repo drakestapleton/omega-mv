@@ -13,11 +13,11 @@ TYQC_DIR = $(OUT_DIR)/tests-turing-qcont
 
 $(TYQC_DIR)/qcont_kat_gen: $(TYQC_OM_LIB) tests/turing/qcont_kat_gen.om seed/out/omc
 	@mkdir -p $(TYQC_DIR)
-	cat $(TYQC_OM_LIB) tests/turing/qcont_kat_gen.om | seed/out/omc > $@ && chmod +x $@
+	cat $(TYQC_OM_LIB) tests/turing/qcont_kat_gen.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(TYQC_DIR)/test_ty_qcont: $(TYQC_OM_LIB) tests/turing/test_ty_qcont.om seed/out/omc
 	@mkdir -p $(TYQC_DIR)
-	cat $(TYQC_OM_LIB) tests/turing/test_ty_qcont.om | seed/out/omc > $@ && chmod +x $@
+	cat $(TYQC_OM_LIB) tests/turing/test_ty_qcont.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-turing-qcont: $(TYQC_DIR)/qcont_kat_gen $(TYQC_DIR)/test_ty_qcont
 	./$(TYQC_DIR)/qcont_kat_gen > $(TYQC_DIR)/kat_table.txt

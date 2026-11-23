@@ -14,14 +14,12 @@ PR_CORE_OM = $(PR_DIR)/prime_race_impl.om $(PR_DIR)/cpu_base.om
 
 $(PR_BUILD)/cpu_base: $(PR_CORE_OM) $(PR_DIR)/cpu_base_main.om $(PR_OMC)
 	@mkdir -p $(PR_BUILD)
-	cat $(PR_CORE_OM) $(PR_DIR)/cpu_base_main.om | $(PR_OMC) > $@
-	chmod +x $@
+	cat $(PR_CORE_OM) $(PR_DIR)/cpu_base_main.om | $(PR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 prime-race-cpu: $(PR_BUILD)/cpu_base
 
 $(PR_BUILD)/prime_race_host_test: $(PR_CORE_OM) $(PR_DIR)/tests/prime_race_host_test.om $(PR_OMC)
 	@mkdir -p $(PR_BUILD)
-	cat $(PR_CORE_OM) $(PR_DIR)/tests/prime_race_host_test.om | $(PR_OMC) > $@
-	chmod +x $@
+	cat $(PR_CORE_OM) $(PR_DIR)/tests/prime_race_host_test.om | $(PR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 prime-race-host-test: $(PR_BUILD)/prime_race_host_test
 	./$(PR_BUILD)/prime_race_host_test
 endif

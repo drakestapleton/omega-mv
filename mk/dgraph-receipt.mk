@@ -15,12 +15,12 @@ dgraph-receipt: $(DGR_DIR)/dgraph_receipt
 
 $(DGR_DIR)/dgraph_receipt: tools/dgraph_receipt.om seed/out/omc
 	@mkdir -p $(DGR_DIR)
-	seed/out/omc < tools/dgraph_receipt.om > $@ && chmod +x $@
+	seed/out/omc < tools/dgraph_receipt.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 # independent strict-JSON check of the golden receipts (tools/json_canon.om, pure OM-2)
 $(DGR_DIR)/json_canon: tools/json_canon.om seed/out/omc
 	@mkdir -p $(DGR_DIR)
-	seed/out/omc < tools/json_canon.om > $@ && chmod +x $@
+	seed/out/omc < tools/json_canon.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-dgraph-receipt: $(DGR_DIR)/dgraph_receipt $(DGR_DIR)/json_canon
 	sh tests/dgraph_receipt/run.sh $(DGR_DIR)/dgraph_receipt $(DGR_DIR)/json_canon $(DGR_DIR)/work
