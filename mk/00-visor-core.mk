@@ -23,8 +23,8 @@ OMEGA_OM_SRCS = src/visor/visor.om $(VISOR_OM_UNITS) \
 	src/visor/visor_semantic.om src/visor/visor_machine.om src/visor/visor_program.om \
 	src/visor/visor_realization.om \
 	src/visor/visor_verify.om src/visor/visor_evidence.om src/visor/visor_world.om \
-	src/visor/visor_effect_request.om src/visor/visor_parse_command.om src/visor/visor_console.om \
-	tools/omega.om
+	src/visor/visor_effect_request.om src/visor/visor_parse_command.om src/visor/visor_console_hooks.om \
+	tools/omega_ops.om tools/omega_wire.om src/visor/visor_console.om tools/omega.om
 
 $(OUT_DIR)/visor $(OUT_DIR)/language $(OUT_DIR)/tests-visor $(OUT_DIR)/tests-language:
 	mkdir -p $@

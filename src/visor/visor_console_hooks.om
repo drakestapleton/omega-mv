@@ -1,0 +1,362 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 Visor console hook contract (VisorConsoleOps / VisorViewCall
+note of src/visor/visor_console.h). OM-2 has no function pointers, so a hook is a
+note number and the link order supplies the dispatcher:
+note   visor.om .. visor_parse_command.om, visor_console_hooks.om (this file),
+note   the ops (tools/omega_ops.om and/or test stubs), a file defining
+note     fn vcon_hook_wired hid ulong to bool
+note     fn vcon_hook_call hid ulong to long      (0 ok, 1 error, 2 error with output)
+note     fn vcon_hook_classify to long            (0 ok; sets vcall_cls, reason)
+note     fn vcon_hook_eval to long                (0 ok; sets vcall_ev_*, value)
+note   then visor_console.om.
+note A view hook writes its body (the C memstream `out`) with vb_* and its error
+note message (the C `err[512]`) with ve_*; the subject bindings are vcall_a / vcall_b.
+
+const VCON_HK_INSPECT ulong 0
+const VCON_HK_TYPE ulong 1
+const VCON_HK_ID ulong 2
+const VCON_HK_GRAPH ulong 3
+const VCON_HK_EVAL ulong 4
+const VCON_HK_VERIFY ulong 5
+const VCON_HK_MACHINE ulong 6
+const VCON_HK_REALIZE ulong 7
+const VCON_HK_COST ulong 8
+const VCON_HK_RUN ulong 9
+const VCON_HK_EVIDENCE ulong 10
+const VCON_HK_WORLD ulong 11
+const VCON_HK_CLASSIFY ulong 12
+const VCON_HK_EFFECTS ulong 13
+const VCON_HK_ALT ulong 14
+const VCON_HK_COMPARE ulong 15
+const VCON_HK_WHY ulong 16
+
+const VCON_CL_INSP ulong 0
+const VCON_CL_PURE ulong 1
+const VCON_CL_SIM ulong 2
+const VCON_CL_EFF ulong 3
+
+const VCON_BODY_MAX ulong 1048576
+const VCON_ERR_MAX ulong 511
+const VCON_VAL_MAX ulong 1023
+const VCON_RSN_MAX ulong 255
+
+text vcon_hx "0123456789abcdef"
+text vt_u00 "\\u00"
+
+note ---- VisorViewCall ----
+global vcall_json ulong 1
+global vcall_has_a ulong 1
+global vcall_a_kind ulong 1
+global vcall_a_id uchar 32
+global vcall_a_idx long 1
+global vcall_a_name uchar 64
+global vcall_a_nlen ulong 1
+global vcall_has_b ulong 1
+global vcall_b_kind ulong 1
+global vcall_b_id uchar 32
+global vcall_b_idx long 1
+global vcall_b_name uchar 64
+global vcall_b_nlen ulong 1
+global vcall_cls ulong 1
+global vcall_ev_kind ulong 1
+global vcall_ev_id uchar 32
+global vcall_ev_idx long 1
+global vcon_evroot uchar 4096
+global vcon_evlen ulong 1
+global vcon_has_evroot ulong 1
+
+note ---- hook output: body, err, value, reason ----
+global vcon_body uchar 1048576
+global vcon_blen ulong 1
+global vcon_err uchar 512
+global vcon_elen ulong 1
+global vcon_val uchar 1024
+global vcon_vlen ulong 1
+global vcon_rsn uchar 256
+global vcon_rlen ulong 1
+global vcon_dig uchar 24
+
+note Decimal digits of v into vcon_dig (most significant first); returns count.
+fn vcon_digits v ulong to ulong
+  n = ulong 0
+  x = v
+  while true bound 24
+    put vcon_dig n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+    if eq x 0
+      break
+    end
+  end
+  for i ulong div n 2 bound 12
+    t = get vcon_dig i
+    put vcon_dig i get vcon_dig sub sub n 1 i
+    put vcon_dig sub sub n 1 i t
+  end
+  ret n
+end
+
+fn vb_reset to void
+  put vcon_blen 0 0
+end
+
+fn vb_putc c uchar to void
+  n = get vcon_blen 0
+  if lt n VCON_BODY_MAX
+    put vcon_body n c
+    put vcon_blen 0 add n 1
+  end
+end
+
+fn vb_puts s view uchar * to void
+  for i ulong len s bound 65536
+    vb_putc get s i
+  end
+end
+
+fn vb_put_ob to void
+  for i ulong get v_ob_len 0 bound 65536
+    vb_putc get v_ob i
+  end
+end
+
+fn vb_put_u64 v ulong to void
+  n = vcon_digits v
+  for i ulong n bound 24
+    vb_putc get vcon_dig i
+  end
+end
+
+note visor_json_string byte rule.
+fn vb_json_byte c ulong to void
+  if eq c 34
+    vb_putc uchar 92
+    vb_putc uchar 34
+    ret
+  end
+  if eq c 92
+    vb_putc uchar 92
+    vb_putc uchar 92
+    ret
+  end
+  if eq c 10
+    vb_putc uchar 92
+    vb_putc uchar 110
+    ret
+  end
+  if eq c 13
+    vb_putc uchar 92
+    vb_putc uchar 114
+    ret
+  end
+  if eq c 9
+    vb_putc uchar 92
+    vb_putc uchar 116
+    ret
+  end
+  if or lt c 32 eq c 127
+    vb_puts vt_u00
+    vb_putc get vcon_hx shr c 4
+    vb_putc get vcon_hx and c 15
+    ret
+  end
+  vb_putc uchar c
+end
+
+fn vb_json_txt s view uchar * to void
+  vb_putc uchar 34
+  for i ulong len s bound 65536
+    vb_json_byte ulong get s i
+  end
+  vb_putc uchar 34
+end
+
+note The JSON string of the current v_ob contents.
+fn vb_json_ob to void
+  vb_putc uchar 34
+  for i ulong get v_ob_len 0 bound 65536
+    vb_json_byte ulong get v_ob i
+  end
+  vb_putc uchar 34
+end
+
+note visor_format_id of 32 id bytes held in v_tmp_id.
+fn vb_put_id_tmp to void
+  vb_puts vt_sha256_pfx
+  for i ulong 32
+    b = ulong get v_tmp_id i
+    vb_putc get vcon_hx shr b 4
+    vb_putc get vcon_hx and b 15
+  end
+end
+
+fn ve_reset to void
+  put vcon_elen 0 0
+end
+
+fn ve_putc c uchar to void
+  n = get vcon_elen 0
+  if lt n VCON_ERR_MAX
+    put vcon_err n c
+    put vcon_elen 0 add n 1
+  end
+end
+
+fn ve_puts s view uchar * to void
+  for i ulong len s bound 65536
+    ve_putc get s i
+  end
+end
+
+fn ve_put_ob to void
+  for i ulong get v_ob_len 0 bound 65536
+    ve_putc get v_ob i
+  end
+end
+
+fn ve_put_u64 v ulong to void
+  n = vcon_digits v
+  for i ulong n bound 24
+    ve_putc get vcon_dig i
+  end
+end
+
+note Parsed argument idx (vpc_args) into err.
+fn ve_put_arg idx ulong to void
+  base = mul idx 256
+  for i ulong get vpc_alen idx bound 256
+    ve_putc get vpc_args add base i
+  end
+end
+
+fn vv_reset to void
+  put vcon_vlen 0 0
+end
+
+fn vv_putc c uchar to void
+  n = get vcon_vlen 0
+  if lt n VCON_VAL_MAX
+    put vcon_val n c
+    put vcon_vlen 0 add n 1
+  end
+end
+
+fn vv_puts s view uchar * to void
+  for i ulong len s bound 65536
+    vv_putc get s i
+  end
+end
+
+fn vv_put_ob to void
+  for i ulong get v_ob_len 0 bound 65536
+    vv_putc get v_ob i
+  end
+end
+
+fn vv_put_u64 v ulong to void
+  n = vcon_digits v
+  for i ulong n bound 24
+    vv_putc get vcon_dig i
+  end
+end
+
+fn vr_reset to void
+  put vcon_rlen 0 0
+end
+
+fn vr_puts s view uchar * to void
+  for i ulong len s bound 65536
+    n = get vcon_rlen 0
+    if lt n VCON_RSN_MAX
+      put vcon_rsn n get s i
+      put vcon_rlen 0 add n 1
+    end
+  end
+end
+
+fn vr_put_ob to void
+  for i ulong get v_ob_len 0 bound 65536
+    n = get vcon_rlen 0
+    if lt n VCON_RSN_MAX
+      put vcon_rsn n get v_ob i
+      put vcon_rlen 0 add n 1
+    end
+  end
+end
+
+note Is argument idx equal to text s?
+fn vcall_arg_is idx ulong s view uchar * to bool
+  sl = len s
+  if ne get vpc_alen idx sl
+    ret false
+  end
+  base = mul idx 256
+  for i ulong sl bound 256
+    if ne get vpc_args add base i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+note visor_resolve of argument idx: 0 and v_res_* filled, -1 unresolved.
+note The resolved binding's name is the token itself, cut at 63 bytes (C %.63s).
+fn vcall_resolve_arg idx ulong to long
+  al = get vpc_alen idx
+  base = mul idx 256
+  for i ulong al bound 256
+    put v_sbuf i get vpc_args add base i
+  end
+  if lt vs_resolve_sbuf al 0
+    ret -1
+  end
+  nl = al
+  if gt nl 63
+    nl = 63
+  end
+  for i ulong nl bound 64
+    put v_res_name i get vpc_args add base i
+  end
+  put v_res_nlen 0 nl
+  ret 0
+end
+
+fn vcall_take_a to void
+  put vcall_has_a 0 1
+  put vcall_a_kind 0 get v_res_kind 0
+  put vcall_a_idx 0 get v_res_idx 0
+  for i ulong 32
+    put vcall_a_id i get v_res_id i
+  end
+  nl = get v_res_nlen 0
+  for i ulong nl bound 64
+    put vcall_a_name i get v_res_name i
+  end
+  put vcall_a_nlen 0 nl
+end
+
+fn vcall_take_b to void
+  put vcall_has_b 0 1
+  put vcall_b_kind 0 get v_res_kind 0
+  put vcall_b_idx 0 get v_res_idx 0
+  for i ulong 32
+    put vcall_b_id i get v_res_id i
+  end
+  nl = get v_res_nlen 0
+  for i ulong nl bound 64
+    put vcall_b_name i get v_res_name i
+  end
+  put vcall_b_nlen 0 nl
+end
+
+fn vcall_a_to_tmp to void
+  for i ulong 32
+    put v_tmp_id i get vcall_a_id i
+  end
+end
+
+fn vcall_b_to_tmp to void
+  for i ulong 32
+    put v_tmp_id i get vcall_b_id i
+  end
+end

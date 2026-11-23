@@ -1,23 +1,31 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 Omega Visor V1 CLI console (replaces tools/omega.c).
-note Composed with src/visor/*.om and src/language/omega_{lex,parse,lower}.om.
-note Usage: omega [--json] [--command "<line>"]... [--script <file>|-] [--evidence-root <dir>]
+note Pure seeded OM-2 Omega Visor V1 terminal console (replaces main() of tools/omega.c).
+note   omega [--json] [--command "<line>"]... [--script <file>|-] [--evidence-root <dir>]
+note No arguments: interactive REPL on stdin. Exit code: 0 if every command was ok,
+note 1 if any command errored, 2 on usage error.
+note Link: visor lanes, visor_console_hooks.om, tools/omega_ops.om, tools/omega_wire.om,
+note visor_console.om, this file.
 
 text omcli_f_json "--json"
 text omcli_f_cmd "--command"
 text omcli_f_scr "--script"
 text omcli_f_ev "--evidence-root"
-text omcli_f_dash "-"
+text omcli_f_help "--help"
+text omcli_f_h "-h"
 text omcli_usage "usage: omega [--json] [--command \"<line>\"]... [--script <file>|-] [--evidence-root <dir>]\n"
+text omcli_m_pfx "omega: "
+text omcli_m_needs " needs a value\n"
+text omcli_m_one "omega: only one --script allowed\n"
+text omcli_m_unk1 "omega: unknown argument '"
+text omcli_m_unk2 "'\n"
+text omcli_banner "Omega Visor V1 -- type `help` for commands, `quit` to leave.\n"
+text omcli_fd0 "/proc/self/fd/0"
 
-global omcli_arg uchar 4096
-global omcli_sbuf uchar 65536
-global omcli_lbuf uchar 4096
-global omcli_script uchar 256
-global omcli_slen ulong 1
-global omcli_cmds uchar 32768
-global omcli_clen ulong 32
+global omcli_arg uchar 65536
+global omcli_cmdi ulong 4096
 global omcli_ccnt ulong 1
+global omcli_st uchar 128
+global omcli_sink long 1
 
 fn omcli_arg_eq n ulong s view uchar * to bool
   sl = len s
@@ -32,201 +40,164 @@ fn omcli_arg_eq n ulong s view uchar * to bool
   ret true
 end
 
-fn omcli_run_fd fd int to long
-  rc = long 0
-  lpos = ulong 0
-  while eq get vcon_quit 0 0 bound 4096
-    k = read fd omcli_sbuf 0 4096
-    if lt k 0
-      ret 1
-    end
-    if eq k 0
-      if gt lpos 0
-        for j ulong lpos bound 4096
-          put v_sbuf j get omcli_lbuf j
-        end
-        if ne vcon_exec_sbuf lpos 0
-          rc = 1
-        end
-      end
-      break
-    end
-    kn = ulong k
-    for i ulong kn bound 4096
-      if ne get vcon_quit 0 0
-        break
-      end
-      b = get omcli_sbuf i
-      if eq b uchar 10
-        for j ulong lpos bound 4096
-          put v_sbuf j get omcli_lbuf j
-        end
-        if ne vcon_exec_sbuf lpos 0
-          rc = 1
-        end
-        lpos = 0
-      else
-        if lt lpos 4095
-          put omcli_lbuf lpos b
-          lpos = add lpos 1
-        end
-      end
-    end
-  end
-  ret rc
+fn omcli_usage_err fd int to int
+  v_write_all fd omcli_usage
+  ret 2
 end
 
-fn omcli_push_cmd vn ulong to void
-  cc = get omcli_ccnt 0
-  if ge cc 32
-    ret
-  end
-  put omcli_ccnt 0 add cc 1
-  cl = vn
-  if gt cl 1023
-    cl = 1023
-  end
-  put omcli_clen cc cl
-  cb = mul cc 1024
-  for j ulong cl bound 1024
-    put omcli_cmds add cb j get omcli_arg j
-  end
+note "omega: <flag> needs a value" + usage, exit 2.
+fn omcli_needs n ulong to int
+  v_write_all 2 omcli_m_pfx
+  put omcli_sink 0 long write 2 omcli_arg 0 n
+  v_write_all 2 omcli_m_needs
+  ret omcli_usage_err 2
 end
 
-fn omcli_set_script vn ulong to void
-  put omcli_slen 0 vn
-  for j ulong vn bound 256
-    put omcli_script j get omcli_arg j
-  end
+fn omcli_unknown n ulong to int
+  v_write_all 2 omcli_m_unk1
+  put omcli_sink 0 long write 2 omcli_arg 0 n
+  v_write_all 2 omcli_m_unk2
+  ret omcli_usage_err 2
 end
 
-fn omcli_set_evroot vn ulong to void
-  put vcon_evlen 0 vn
-  for j ulong vn bound 256
-    put vcon_evroot j get omcli_arg j
+note isatty(0): stdin is a tty character device (majors 4, 5, 136..143).
+fn omcli_stdin_tty to bool
+  if lt stat omcli_fd0 0 len omcli_fd0 omcli_st 0 128 0
+    ret false
   end
+  mode = or ulong get omcli_st 16 shl ulong get omcli_st 17 8
+  if ne and mode 61440 8192
+    ret false
+  end
+  rdev = or ulong get omcli_st 32 shl ulong get omcli_st 33 8
+  major = and shr rdev 8 4095
+  ret or or eq major 4 eq major 5 and ge major 136 le major 143
 end
 
-fn omcli_run_cmds to long
-  rc = long 0
-  cc = get omcli_ccnt 0
-  for ci ulong cc bound 32
-    if ne get vcon_quit 0 0
-      break
-    end
-    cl = get omcli_clen ci
-    cb = mul ci 1024
-    for j ulong cl bound 1024
-      put v_sbuf j get omcli_cmds add cb j
-    end
-    if ne vcon_exec_sbuf cl 0
-      rc = 1
-    end
+note Run --command line number ci (argv index in omcli_cmdi).
+fn omcli_run_cmd ci ulong to long
+  ai = get omcli_cmdi ci
+  r = argread ai vpc_in 0 65536
+  if lt r 0
+    ve_reset
+    ve_puts vcon_m_line
+    ve_put_u64 65536
+    ve_puts vcon_m_line2
+    u = vcon_emit_err 21 VCON_CL_INSP false
+    vk_flush
+    ret u
   end
-  ret rc
+  ret vcon_exec_in ulong r
 end
 
 fn main to int
   ac_r = argcnt
-  if lt ac_r 0
+  if lt ac_r 1
     ret 2
   end
   ac = ulong ac_r
   isj = ulong 0
-  has_scr = false
-  scr_stdin = false
+  scr = long -1
   put omcli_ccnt 0 0
-  put omcli_slen 0 0
-  vcon_init 0
+  put vcon_has_evroot 0 0
   i = ulong 1
-  while lt i ac bound 256
-    ar = argread i omcli_arg 0 4095
-    if lt ar 0
-      v_write_all 2 omcli_usage
-      ret 2
+  while lt i ac bound 65536
+    ar = argread i omcli_arg 0 65536
+    an = ulong 0
+    if gt ar 0
+      an = ulong ar
     end
-    an = ulong ar
     if omcli_arg_eq an omcli_f_json
       isj = 1
-      i = add i 1
-      continue
-    end
-    if omcli_arg_eq an omcli_f_cmd
-      if ge add i 1 ac
-        v_write_all 2 omcli_usage
-        ret 2
-      end
-      i = add i 1
-      vr = argread i omcli_arg 0 4095
-      if lt vr 0
-        v_write_all 2 omcli_usage
-        ret 2
-      end
-      omcli_push_cmd ulong vr
-      i = add i 1
-      continue
-    end
-    if omcli_arg_eq an omcli_f_scr
-      if ge add i 1 ac
-        v_write_all 2 omcli_usage
-        ret 2
-      end
-      i = add i 1
-      vr = argread i omcli_arg 0 255
-      if lt vr 0
-        v_write_all 2 omcli_usage
-        ret 2
-      end
-      has_scr = true
-      if omcli_arg_eq ulong vr omcli_f_dash
-        scr_stdin = true
-      else
-        omcli_set_script ulong vr
-      end
-      i = add i 1
-      continue
-    end
-    if omcli_arg_eq an omcli_f_ev
-      if ge add i 1 ac
-        v_write_all 2 omcli_usage
-        ret 2
-      end
-      i = add i 1
-      vr = argread i omcli_arg 0 255
-      if lt vr 0
-        v_write_all 2 omcli_usage
-        ret 2
-      end
-      omcli_set_evroot ulong vr
-      i = add i 1
-      continue
-    end
-    v_write_all 2 omcli_usage
-    ret 2
-  end
-  put vcon_json 0 isj
-  rc = omcli_run_cmds
-  if has_scr
-    if scr_stdin
-      if ne omcli_run_fd 0 0
-        rc = 1
-      end
     else
-      fd = fopen omcli_script 0 get omcli_slen 0 0 0
-      if lt fd 0
-        ret 2
+      vflag = or or omcli_arg_eq an omcli_f_cmd omcli_arg_eq an omcli_f_scr omcli_arg_eq an omcli_f_ev
+      if vflag
+        if ge add i 1 ac
+          ret omcli_needs an
+        end
+        if omcli_arg_eq an omcli_f_cmd
+          cc = get omcli_ccnt 0
+          if lt cc 4096
+            put omcli_cmdi cc add i 1
+            put omcli_ccnt 0 add cc 1
+          end
+        else
+          if omcli_arg_eq an omcli_f_scr
+            if ge scr 0
+              v_write_all 2 omcli_m_one
+              ret 2
+            end
+            scr = long add i 1
+          else
+            vr = argread add i 1 vcon_evroot 0 4096
+            if lt vr 0
+              put vcon_evlen 0 0
+            else
+              put vcon_evlen 0 ulong vr
+            end
+            put vcon_has_evroot 0 1
+          end
+        end
+        i = add i 1
+      else
+        if or omcli_arg_eq an omcli_f_help omcli_arg_eq an omcli_f_h
+          v_write_all 1 omcli_usage
+          ret 0
+        end
+        ret omcli_unknown an
       end
-      if ne omcli_run_fd int fd 0
-        rc = 1
-      end
-      u = fclose int fd
     end
-  else
-    if eq get omcli_ccnt 0 0
-      if ne omcli_run_fd 0 0
-        rc = 1
+    i = add i 1
+  end
+  sfd = long -1
+  if ge scr 0
+    pr = argread ulong scr vom_path 0 4096
+    if lt pr 0
+      put vom_plen 0 0
+    else
+      put vom_plen 0 ulong pr
+    end
+    ve_reset
+    sfd = omega_tool_open_script
+    if lt sfd 0
+      for k ulong get vcon_elen 0 bound 512
+        put v_sbuf k get vcon_err k
       end
+      put v_sbuf get vcon_elen 0 uchar 10
+      put omcli_sink 0 long write 2 v_sbuf 0 add get vcon_elen 0 1
+      ret 2
     end
   end
-  ret int rc
+  u0 = omega_tool_session_init
+  vcon_init isj
+  any = long u0
+  for ci ulong get omcli_ccnt 0 bound 4096
+    if ne get vcon_quit 0 0
+      break
+    end
+    if ne omcli_run_cmd ci 0
+      any = 1
+    end
+  end
+  if and ge sfd 0 eq get vcon_quit 0 0
+    if ne vcon_run_fd int sfd eq isj 0 false 0
+      any = 1
+    end
+  end
+  if and lt scr 0 eq get omcli_ccnt 0 0
+    tty = omcli_stdin_tty
+    if and eq isj 0 tty
+      v_write_all 1 omcli_banner
+    end
+    if ne vcon_run_fd 0 false and eq isj 0 tty 0
+      any = 1
+    end
+  end
+  if gt sfd 0
+    put omcli_sink 0 long fclose int sfd
+  end
+  if ne any 0
+    ret 1
+  end
+  ret 0
 end

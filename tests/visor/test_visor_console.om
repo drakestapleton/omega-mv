@@ -1,0 +1,1240 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/visor/test_visor_console.c, the checks that run
+note in the lane-only build (parser, human, stubs, JSON, script): 134 checks.
+note Link: visor.om, visor_parse_command.om, visor_console_hooks.om,
+note test_visor_console_hooks.om, a vcon_hook_* dispatcher, visor_console.om,
+note this file, then a main (test_visor_console_main.om or test_visor_console_e2e.om).
+
+text tc_t_fail "FAIL "
+text tc_t_pass "PASS "
+text tc_t_failh "FAIL "
+text tc_t_nl "\n"
+text tc_t_slash "/"
+text tc_t_gotpfx "--- got:\n"
+text tc_t_wantpfx "--- want:\n"
+text tc_t_pcase "parse case "
+text tc_zero_hex "0000000000000000000000000000000000000000000000000000000000000000"
+text tc_sha "sha256:"
+
+global tc_pass ulong 1
+global tc_total ulong 1
+global tl_buf uchar 8192
+global tl_n ulong 1
+global tw_buf uchar 65536
+global tw_n ulong 1
+global tg_off ulong 1
+global tg_len ulong 1
+global tg_rc long 1
+global tsn_a uchar 6400
+global tsn_b uchar 6400
+global texp uchar 65536
+global texp_n ulong 1
+
+fn tc_check ok bool name view uchar * to void
+  put tc_total 0 add get tc_total 0 1
+  if ok
+    put tc_pass 0 add get tc_pass 0 1
+  else
+    v_write_all 2 tc_t_fail
+    v_write_all 2 name
+    v_write_all 2 tc_t_nl
+  end
+end
+
+note ---- line builder (tl) and expected-output builder (tw) ----
+
+fn tl_reset to void
+  put tl_n 0 0
+end
+
+fn tl_b c ulong to void
+  n = get tl_n 0
+  if lt n 8192
+    put tl_buf n uchar c
+    put tl_n 0 add n 1
+  end
+end
+
+fn tl_txt s view uchar * to void
+  for i ulong len s bound 4096
+    tl_b ulong get s i
+  end
+end
+
+fn tl_set s view uchar * to void
+  tl_reset
+  tl_txt s
+end
+
+fn tl_rep c ulong k ulong to void
+  for i ulong k bound 8192
+    tl_b c
+  end
+end
+
+fn tw_reset to void
+  put tw_n 0 0
+end
+
+fn tw_b c ulong to void
+  n = get tw_n 0
+  if lt n 65536
+    put tw_buf n uchar c
+    put tw_n 0 add n 1
+  end
+end
+
+fn tw_txt s view uchar * to void
+  for i ulong len s bound 65536
+    tw_b ulong get s i
+  end
+end
+
+fn tw_set s view uchar * to void
+  tw_reset
+  tw_txt s
+end
+
+note visor_format_id of v_tmp_id.
+fn tw_id_tmp to void
+  tw_txt tc_sha
+  for i ulong 32
+    b = ulong get v_tmp_id i
+    tw_b ulong get vcon_hx shr b 4
+    tw_b ulong get vcon_hx and b 15
+  end
+end
+
+fn tl_id_tmp to void
+  tl_txt tc_sha
+  for i ulong 32
+    b = ulong get v_tmp_id i
+    tl_b ulong get vcon_hx shr b 4
+    tl_b ulong get vcon_hx and b 15
+  end
+end
+
+note ---- harness ----
+
+fn h_open json ulong to void
+  vs_init
+  vcon_init json
+  vcon_capture 1
+  put tst_ops 0 0
+end
+
+note h_exec of the tl line: output region tg_off/tg_len, rc tg_rc.
+fn h_exec to void
+  n = get tl_n 0
+  for i ulong n bound 8192
+    put vpc_in i get tl_buf i
+  end
+  before = get vcon_caplen 0
+  rc = vcon_exec_in n
+  put tg_rc 0 rc
+  put tg_off 0 before
+  put tg_len 0 sub get vcon_caplen 0 before
+end
+
+fn tg_eq_tw to bool
+  n = get tg_len 0
+  if ne n get tw_n 0
+    ret false
+  end
+  o = get tg_off 0
+  for i ulong n bound 65536
+    if ne get vcon_cap add o i get tw_buf i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tg_match_at pos ulong to bool
+  for j ulong get tw_n 0 bound 65536
+    if ne get vcon_cap add pos j get tw_buf j
+      ret false
+    end
+  end
+  ret true
+end
+
+note Does the output region contain tw as a substring?
+fn tg_has_tw to bool
+  n = get tg_len 0
+  m = get tw_n 0
+  if gt m n
+    ret false
+  end
+  o = get tg_off 0
+  for s ulong add sub n m 1 bound 65536
+    if tg_match_at add o s
+      ret true
+    end
+  end
+  ret false
+end
+
+fn tg_dump to void
+  o = get tg_off 0
+  n = get tg_len 0
+  v_write_all 2 tc_t_gotpfx
+  u = write 2 vcon_cap o n
+  v_write_all 2 tc_t_wantpfx
+  w = write 2 tw_buf 0 get tw_n 0
+  if lt add u w -2
+    v_write_all 2 tc_t_nl
+  end
+end
+
+note expect(): run the tl line; rc and output must equal want_rc and tw.
+fn ex_tw want_rc long name view uchar * to void
+  h_exec
+  ok = and eq get tg_rc 0 want_rc tg_eq_tw
+  if not ok
+    tg_dump
+  end
+  tc_check ok name
+end
+
+fn exs line view uchar * want view uchar * to void
+  tl_set line
+  tw_set want
+end
+
+note ---------------- parser ----------------
+
+global tpc_ok ulong 1
+global tpc_rc long 1
+
+fn tpc_run want_rc long want_cmd ulong argc ulong fc ulong to void
+  rc = vpc_parse_in get tl_n 0
+  put tpc_rc 0 rc
+  ok = and eq rc want_rc eq get vpc_cmd 0 want_cmd
+  if and ok eq rc 0
+    ok = and eq get vpc_argc 0 argc eq get vpc_for_cur 0 fc
+  end
+  if and ok ne rc 0
+    ok = gt get vpc_elen 0 0
+  end
+  if ok
+    put tpc_ok 0 1
+  else
+    put tpc_ok 0 0
+  end
+end
+
+fn tpc_arg idx ulong s view uchar * to void
+  if and ne get tpc_ok 0 0 eq get tpc_rc 0 0
+    if not vcall_arg_is idx s
+      put tpc_ok 0 0
+    end
+  end
+end
+
+fn tpc_end k ulong to void
+  ok = ne get tpc_ok 0 0
+  put tc_total 0 add get tc_total 0 1
+  if ok
+    put tc_pass 0 add get tc_pass 0 1
+  else
+    ob_reset 65535
+    ob_puts tc_t_failh
+    ob_puts tc_t_pcase
+    ob_put_u64 k
+    ob_putc uchar 10
+    ob_write_fd 2
+  end
+end
+
+fn tline_to_in to void
+  for i ulong get tl_n 0 bound 8192
+    put vpc_in i get tl_buf i
+  end
+end
+
+text tp_help "help"
+text tp_help_id "help id\n"
+text tp_id "id"
+text tp_quit "quit"
+text tp_insp "  inspect   x  "
+text tp_x "x"
+text tp_type_ "type _"
+text tp__ "_"
+text tp_id_ "id _"
+text tp_graph "graph"
+text tp_graph_y "graph y"
+text tp_y "y"
+text tp_verify_f "verify f"
+text tp_f "f"
+text tp_machine "machine"
+text tp_real_x "realize x"
+text tp_real_cur "realize x for current.machine"
+text tp_cost_x "cost x"
+text tp_run_f34 "run f 3 4"
+text tp_3 "3"
+text tp_ev "evidence"
+text tp_ev_v "evidence VISOR"
+text tp_visor "VISOR"
+text tp_bind "bindings"
+text tp_clear "clear"
+text tp_world "world"
+text tp_eff_x "effects x"
+text tp_alt_x "alternatives x"
+text tp_cmp_ab "compare a b"
+text tp_a "a"
+text tp_b "b"
+text tp_why "why\tx"
+text tp_let "let x = 3 * 6"
+text tp_fn "fn f(x) = x + 1"
+text tp_x1 "x + 1"
+text tp_helpp "helpp"
+text tp_let_pfx "let "
+text tp_eq1 " = 1"
+text tp_blank "   \t "
+text tp_comment "# comment"
+text tp_id_ab "id a b"
+text tp_quit_now "quit now"
+text tp_run5 "run a b c d e"
+text tp_run7 "run a b c d e f g"
+text tp_mars "realize x for mars"
+text tp_insp_x "inspect x"
+text tp_let_x1 "let x = 1"
+text tp_2j "[2J"
+text tp_let_x "let x = "
+text tp_id_sp "id "
+text tp_kept_in "  let x = 3 * 6  \n"
+text tp_toolong "too long"
+text tp_linetl "line too long"
+text tp_runf12 "run f 1 2"
+text tp_n_srckept "source line kept"
+text tp_n_bigtok "oversized token rejected"
+text tp_n_255 "255-byte token accepted"
+text tp_n_bigline "oversized line rejected"
+text tp_n_det "parser deterministic"
+text tp_n_names "cmd names"
+text tp_alternatives "alternatives"
+text tp_source "source"
+
+note One parse case: line in tl, then expectations.
+fn tpc_case want_rc long want_cmd ulong argc ulong fc ulong to void
+  tline_to_in
+  tpc_run want_rc want_cmd argc fc
+end
+
+fn vcon_ob_eq_tw to bool
+  n = get v_ob_len 0
+  if ne n get tw_n 0
+    ret false
+  end
+  for i ulong n bound 65536
+    if ne get v_ob i get tw_buf i
+      ret false
+    end
+  end
+  ret true
+end
+
+note Does vpc_err contain text s?
+fn tpe_has s view uchar * to bool
+  n = get vpc_elen 0
+  m = len s
+  if gt m n
+    ret false
+  end
+  for st ulong add sub n m 1 bound 512
+    hit = true
+    for j ulong m bound 64
+      if ne get vpc_err add st j get s j
+        hit = false
+        break
+      end
+    end
+    if hit
+      ret true
+    end
+  end
+  ret false
+end
+
+note Snapshot of the parsed VisorCommand fields (the C memcmp of the struct).
+fn tpc_snap to_b bool to void
+  if to_b
+    put tsn_b 0 uchar get vpc_cmd 0
+    put tsn_b 1 uchar get vpc_argc 0
+    put tsn_b 2 uchar get vpc_for_cur 0
+    put tsn_b 3 uchar get vpc_llen 0
+    for i ulong 4
+      put tsn_b add 4 i uchar get vpc_alen i
+    end
+    for i ulong 1024
+      put tsn_b add 8 i get vpc_args i
+    end
+    for i ulong 4096
+      put tsn_b add 1032 i get vpc_line i
+    end
+  else
+    put tsn_a 0 uchar get vpc_cmd 0
+    put tsn_a 1 uchar get vpc_argc 0
+    put tsn_a 2 uchar get vpc_for_cur 0
+    put tsn_a 3 uchar get vpc_llen 0
+    for i ulong 4
+      put tsn_a add 4 i uchar get vpc_alen i
+    end
+    for i ulong 1024
+      put tsn_a add 8 i get vpc_args i
+    end
+    for i ulong 4096
+      put tsn_a add 1032 i get vpc_line i
+    end
+  end
+end
+
+fn test_parser_a to void
+  tl_set tp_help
+  tpc_case 0 0 0 0
+  tpc_end 0
+  tl_set tp_help_id
+  tpc_case 0 0 1 0
+  tpc_arg 0 tp_id
+  tpc_end 1
+  tl_set tp_quit
+  tl_b 13
+  tl_b 10
+  tpc_case 0 1 0 0
+  tpc_end 2
+  tl_set tp_insp
+  tpc_case 0 2 1 0
+  tpc_arg 0 tp_x
+  tpc_end 3
+  tl_set tp_type_
+  tpc_case 0 3 1 0
+  tpc_arg 0 tp__
+  tpc_end 4
+  tl_set tp_id_
+  tpc_case 0 4 1 0
+  tpc_arg 0 tp__
+  tpc_end 5
+  tl_set tp_graph
+  tpc_case -1 5 0 0
+  tpc_end 6
+  tl_set tp_graph_y
+  tpc_case 0 5 1 0
+  tpc_arg 0 tp_y
+  tpc_end 7
+  tl_set tp_verify_f
+  tpc_case 0 6 1 0
+  tpc_arg 0 tp_f
+  tpc_end 8
+  tl_set tp_machine
+  tpc_case 0 7 0 0
+  tpc_end 9
+  tl_set tp_real_x
+  tpc_case 0 8 1 0
+  tpc_arg 0 tp_x
+  tpc_end 10
+  tl_set tp_real_cur
+  tpc_case 0 8 1 1
+  tpc_arg 0 tp_x
+  tpc_end 11
+  tl_set tp_cost_x
+  tpc_case 0 9 1 0
+  tpc_arg 0 tp_x
+  tpc_end 12
+  tl_set tp_run_f34
+  tpc_case 0 10 3 0
+  tpc_arg 0 tp_f
+  tpc_arg 1 tp_3
+  tpc_end 13
+  tl_set tp_ev
+  tpc_case 0 11 0 0
+  tpc_end 14
+  tl_set tp_ev_v
+  tpc_case 0 11 1 0
+  tpc_arg 0 tp_visor
+  tpc_end 15
+end
+
+fn test_parser_b to void
+  tl_set tp_bind
+  tpc_case 0 12 0 0
+  tpc_end 16
+  tl_set tp_clear
+  tpc_case 0 13 0 0
+  tpc_end 17
+  tl_set tp_world
+  tpc_case 0 14 0 0
+  tpc_end 18
+  tl_set tp_eff_x
+  tpc_case 0 15 1 0
+  tpc_arg 0 tp_x
+  tpc_end 19
+  tl_set tp_alt_x
+  tpc_case 0 16 1 0
+  tpc_arg 0 tp_x
+  tpc_end 20
+  tl_set tp_cmp_ab
+  tpc_case 0 17 2 0
+  tpc_arg 0 tp_a
+  tpc_arg 1 tp_b
+  tpc_end 21
+  tl_set tp_why
+  tpc_case 0 18 1 0
+  tpc_arg 0 tp_x
+  tpc_end 22
+  tl_set tp_let
+  tpc_case 0 19 0 0
+  tpc_end 23
+  tl_set tp_fn
+  tpc_case 0 19 0 0
+  tpc_end 24
+  tl_set tp_x1
+  tpc_case 0 19 0 0
+  tpc_end 25
+  tl_set tp_helpp
+  tpc_case 0 19 0 0
+  tpc_end 26
+  tl_set tp_let_pfx
+  tl_b 206
+  tl_b 169
+  tl_txt tp_eq1
+  tpc_case 0 19 0 0
+  tpc_end 27
+  tl_reset
+  tpc_case 0 20 0 0
+  tpc_end 28
+  tl_set tp_blank
+  tpc_case 0 20 0 0
+  tpc_end 29
+  tl_set tp_comment
+  tpc_case 0 20 0 0
+  tpc_end 30
+end
+
+fn test_parser_c to void
+  tl_set tp_id
+  tpc_case -1 4 0 0
+  tpc_end 31
+  tl_set tp_id_ab
+  tpc_case -1 4 0 0
+  tpc_end 32
+  tl_set tp_quit_now
+  tpc_case -1 1 0 0
+  tpc_end 33
+  tl_set tp_run5
+  tpc_case -1 10 0 0
+  tpc_end 34
+  tl_set tp_run7
+  tpc_case -1 10 0 0
+  tpc_end 35
+  tl_set tp_mars
+  tpc_case -1 8 0 0
+  tpc_end 36
+  tl_set tp_insp_x
+  tl_b 1
+  tpc_case -1 21 0 0
+  tpc_end 37
+  tl_set tp_let_x1
+  tl_b 27
+  tl_txt tp_2j
+  tpc_case -1 21 0 0
+  tpc_end 38
+  tl_set tp_let_x
+  tl_b 127
+  tpc_case -1 21 0 0
+  tpc_end 39
+  tl_set tp_id_sp
+  tl_b 255
+  tpc_case -1 21 0 0
+  tpc_end 40
+  tl_set tp_id_sp
+  tl_b 192
+  tl_b 175
+  tpc_case -1 21 0 0
+  tpc_end 41
+  tl_set tp_id_sp
+  tl_b 237
+  tl_b 160
+  tl_b 128
+  tpc_case -1 21 0 0
+  tpc_end 42
+  tl_set tp_id_sp
+  tl_b 206
+  tpc_case -1 21 0 0
+  tpc_end 43
+end
+
+fn test_parser_d to void
+  tl_set tp_kept_in
+  tline_to_in
+  rc = vpc_parse_in get tl_n 0
+  tl_set tp_let
+  ok = and eq rc 0 eq get vpc_argc 0 0
+  if ok
+    ok = eq get vpc_llen 0 get tl_n 0
+  end
+  if ok
+    for i ulong get tl_n 0 bound 64
+      if ne get vpc_line i get tl_buf i
+        ok = false
+      end
+    end
+  end
+  tc_check ok tp_n_srckept
+  tl_set tp_id_sp
+  tl_rep 97 256
+  tline_to_in
+  r2 = vpc_parse_in get tl_n 0
+  tc_check and eq r2 -1 tpe_has tp_toolong tp_n_bigtok
+  put tl_n 0 sub get tl_n 0 1
+  tline_to_in
+  r3 = vpc_parse_in get tl_n 0
+  tc_check and eq r3 0 eq get vpc_alen 0 255 tp_n_255
+  tl_reset
+  tl_rep 120 4100
+  tline_to_in
+  r4 = vpc_parse_in get tl_n 0
+  tc_check and eq r4 -1 tpe_has tp_linetl tp_n_bigline
+  tl_set tp_runf12
+  tline_to_in
+  r5 = vpc_parse_in get tl_n 0
+  tpc_snap false
+  tline_to_in
+  r6 = vpc_parse_in get tl_n 0
+  tpc_snap true
+  same = eq r5 r6
+  for i ulong 5128 bound 6400
+    if ne get tsn_a i get tsn_b i
+      same = false
+    end
+  end
+  tc_check same tp_n_det
+  vcon_name_ob 16
+  tw_set tp_alternatives
+  n1 = vcon_ob_eq_tw
+  vcon_name_ob 19
+  tw_set tp_source
+  tc_check and n1 vcon_ob_eq_tw tp_n_names
+end
+
+note ---------------- console (human) ----------------
+
+text th_help_hdr "Omega Visor commands (classes: inspection, pure-execution, simulation, effect-request):\n"
+text th_w0 "help"
+text th_w1 "quit"
+text th_w2 "inspect"
+text th_w3 "type"
+text th_w4 "id"
+text th_w5 "graph"
+text th_w6 "verify"
+text th_w7 "machine"
+text th_w8 "realize"
+text th_w9 "cost"
+text th_w10 "run"
+text th_w11 "evidence"
+text th_w12 "bindings"
+text th_w13 "clear"
+text th_w14 "world"
+text th_w15 "effects"
+text th_w16 "alternatives"
+text th_w17 "compare"
+text th_w18 "why"
+text th_w19 "let x"
+text th_nl2 "\n  "
+text th_row_run "  run <x> [args...]                    pure-execution  run x if pure; effects become an effect request\n"
+text th_help_id "help id"
+text th_help_id_o "  id <x>                               inspection      show the semantic id of a name, _ or hex id\n"
+text th_help_nope "help nope"
+text th_help_nope_o "error: help: no such command 'nope'\n"
+text th_bind "bindings"
+text th_nobind "(no bindings)\n"
+text th_zeta "zeta"
+text th_alpha "alpha"
+text th_zeta_obj "zeta  object  "
+text th_alpha_prog "alpha  program  "
+text th_id_zeta "id zeta"
+text th_id_nope "id nope"
+text th_id_nope_o "error: id: unknown name or id 'nope'\n"
+text th_src_notw "error: source: not wired in this build\n"
+text th_id_unk_pfx "error: id: unknown name or id '"
+text th_q_nl "'\n"
+text th_id_sp "id "
+text th_id__ "id _"
+text th_id___o "error: id: unknown name or id '_'\n"
+text th_insp_zeta "inspect zeta"
+text th_insp_notw "error: inspect: not wired in this build\n"
+text th_let_y "let y = 1"
+text th_run_zeta "run zeta"
+text th_run_notw "error: run: not wired in this build\n"
+text th_machine "machine"
+text th_mach_notw "error: machine: not wired in this build\n"
+text th_note "# note"
+text th_cmp_a "compare a"
+text th_cmp_a_o "error: compare: expected 2 arguments, got 1\n"
+text th_ctrl_o "error: unknown: control character 0x01 at byte 3 is not allowed\n"
+text th_clear "clear"
+text th_cleared "session cleared\n"
+text th_quit "quit"
+text th_bye "bye\n"
+text thn_hdr "help header"
+text thn_lines "help line count"
+text thn_lists "help lists command"
+text thn_row "help row exact"
+text thn_one "help one"
+text thn_unk "help unknown"
+text thn_bempty "bindings empty"
+text thn_bzeta "bind zeta"
+text thn_balpha "bind alpha"
+text thn_border "bindings insertion order"
+text thn_idb "id binding"
+text thn_idu "id unknown"
+text thn_bare "bare hex is source"
+text thn_idhex "id hex not in graph"
+text thn_id_ "id _ unset"
+text thn_btype "build type"
+text thn_idhexg "id hex in graph"
+text thn_insp "inspect not wired"
+text thn_src "source not wired"
+text thn_run "run not wired"
+text thn_mach "machine not wired"
+text thn_empty "empty line"
+text thn_comment "comment line"
+text thn_arity "arity error"
+text thn_ctrl "control char"
+text thn_clear "clear"
+text thn_bclear "bindings after clear"
+text thn_noquit "not quit yet"
+text thn_quit "quit"
+text thn_qflag "quit sets flag"
+
+fn th_help_word i ulong to void
+  tw_set th_nl2
+  if eq i 0
+    tw_txt th_w0
+  end
+  if eq i 1
+    tw_txt th_w1
+  end
+  if eq i 2
+    tw_txt th_w2
+  end
+  if eq i 3
+    tw_txt th_w3
+  end
+  if eq i 4
+    tw_txt th_w4
+  end
+  if eq i 5
+    tw_txt th_w5
+  end
+  if eq i 6
+    tw_txt th_w6
+  end
+  if eq i 7
+    tw_txt th_w7
+  end
+  if eq i 8
+    tw_txt th_w8
+  end
+  if eq i 9
+    tw_txt th_w9
+  end
+  if eq i 10
+    tw_txt th_w10
+  end
+  if eq i 11
+    tw_txt th_w11
+  end
+  if eq i 12
+    tw_txt th_w12
+  end
+  if eq i 13
+    tw_txt th_w13
+  end
+  if eq i 14
+    tw_txt th_w14
+  end
+  if eq i 15
+    tw_txt th_w15
+  end
+  if eq i 16
+    tw_txt th_w16
+  end
+  if eq i 17
+    tw_txt th_w17
+  end
+  if eq i 18
+    tw_txt th_w18
+  end
+  if eq i 19
+    tw_txt th_w19
+  end
+end
+
+note Bind name s (into v_sbuf) to v_tmp_id.
+fn th_bind_set s view uchar * kind ulong pidx long to long
+  sl = len s
+  for i ulong sl bound 64
+    put v_sbuf i get s i
+  end
+  ret vs_bind_set_sbuf sl kind pidx
+end
+
+fn test_console_help to void
+  tl_set th_w0
+  h_exec
+  tw_set th_help_hdr
+  hdr = eq get tg_rc 0 0
+  if lt get tg_len 0 87
+    hdr = false
+  else
+    o = get tg_off 0
+    for i ulong 87
+      if ne get vcon_cap add o i get tw_buf i
+        hdr = false
+      end
+    end
+  end
+  tc_check hdr thn_hdr
+  lines = ulong 0
+  o2 = get tg_off 0
+  for i ulong get tg_len 0 bound 65536
+    if eq get vcon_cap add o2 i 10
+      lines = add lines 1
+    end
+  end
+  tc_check eq lines 22 thn_lines
+  for w ulong 20
+    th_help_word w
+    tc_check tg_has_tw thn_lists
+  end
+  tw_set th_row_run
+  tc_check tg_has_tw thn_row
+  exs th_help_id th_help_id_o
+  ex_tw 0 thn_one
+  exs th_help_nope th_help_nope_o
+  ex_tw 1 thn_unk
+end
+
+fn test_console_human to void
+  h_open 0
+  test_console_help
+  exs th_bind th_nobind
+  ex_tw 0 thn_bempty
+  tst_fake_id 16
+  tc_check eq th_bind_set th_zeta V_BIND_OBJECT -1 0 thn_bzeta
+  tst_fake_id 160
+  tc_check eq th_bind_set th_alpha V_BIND_PROGRAM 0 1 thn_balpha
+  tw_set th_zeta_obj
+  tst_fake_id 16
+  tw_id_tmp
+  tw_b 10
+  tw_txt th_alpha_prog
+  tst_fake_id 160
+  tw_id_tmp
+  tw_b 10
+  tl_set th_bind
+  ex_tw 0 thn_border
+  tst_fake_id 16
+  tw_reset
+  tw_id_tmp
+  tw_b 10
+  tl_set th_id_zeta
+  ex_tw 0 thn_idb
+  exs th_id_nope th_id_nope_o
+  ex_tw 1 thn_idu
+  tl_set tc_sha
+  tl_txt tc_zero_hex
+  tw_set th_src_notw
+  ex_tw 1 thn_bare
+  tl_set th_id_sp
+  tl_txt tc_sha
+  tl_txt tc_zero_hex
+  tw_set th_id_unk_pfx
+  tw_txt tc_sha
+  tw_txt tc_zero_hex
+  tw_txt th_q_nl
+  ex_tw 1 thn_idhex
+  exs th_id__ th_id___o
+  ex_tw 1 thn_id_
+  t = og_build_type_uint 64
+  tc_check ge t 0 thn_btype
+  if ge t 0
+    tb = mul ulong t 32
+    for i ulong 32
+      put v_tmp_id i get v_og_id add tb i
+    end
+    tl_set th_id_sp
+    tl_id_tmp
+    tw_reset
+    tw_id_tmp
+    tw_b 10
+    ex_tw 0 thn_idhexg
+  end
+  exs th_insp_zeta th_insp_notw
+  ex_tw 1 thn_insp
+  exs th_let_y th_src_notw
+  ex_tw 1 thn_src
+  exs th_run_zeta th_run_notw
+  ex_tw 1 thn_run
+  exs th_machine th_mach_notw
+  ex_tw 1 thn_mach
+  tl_reset
+  tw_reset
+  ex_tw 0 thn_empty
+  tl_set th_note
+  tw_reset
+  ex_tw 0 thn_comment
+  exs th_cmp_a th_cmp_a_o
+  ex_tw 1 thn_arity
+  tl_set th_id_sp
+  tl_b 1
+  tw_set th_ctrl_o
+  ex_tw 1 thn_ctrl
+  exs th_clear th_cleared
+  ex_tw 0 thn_clear
+  exs th_bind th_nobind
+  ex_tw 0 thn_bclear
+  tc_check eq get vcon_quit 0 0 thn_noquit
+  exs th_quit th_bye
+  ex_tw 0 thn_quit
+  tc_check ne get vcon_quit 0 0 thn_qflag
+end
+
+note ---------------- stub ops ----------------
+
+text ts_let "let x = 3 * 6"
+text ts_18 "18\n"
+text ts_bad "bad"
+text ts_bad_o "error: source: parse error at 1:1\n"
+text ts_x_obj "x  object  "
+text ts__obj "_  object  "
+text ts_run_x "run x"
+text ts_run_x_o "[pure-execution]\n18\n"
+text ts_w "w"
+text ts_run_w "run w"
+text ts_run_w_o "EFFECT REQUEST: requires authority; routed via EffectIntent -> AEGIS/PHYSICS (not executed); reason: writes a file\n"
+text ts_run_nope "run nope"
+text ts_run_nope_o "error: run: unknown name or id 'nope'\n"
+text ts_effects "effects"
+text ts_effects_o "[effect-request]\nno effects\n"
+text ts_verify_x "verify x"
+text ts_verify_x_o "V0 FAIL\nerror: verify: verification failed: V0\n"
+text ts_cost_x "cost x"
+text ts_cost_x_o "error: cost: no \"estimate\"\n"
+text ts_run__ "run _"
+text tsn_src "source ok"
+text tsn_last "source sets _"
+text tsn_id_ "id _ after source"
+text tsn_bind "bindings shows _ last"
+text tsn_err "source error"
+text tsn_run "run pure"
+text tsn_once "run_pure called once"
+text tsn_eff "run effect request"
+text tsn_never "effect request never executed"
+text tsn_unres "run unresolved"
+text tsn_unres2 "unresolved never executed"
+text tsn_effv "effects view"
+text tsn_ewo "error with output (human)"
+text tsn_hook "hook error"
+text tsn_nocls "run without classifier"
+text tsn_nocls2 "run without classifier not executed"
+
+fn test_console_stubs to void
+  h_open 0
+  tst_install_stubs
+  exs ts_let ts_18
+  ex_tw 0 tsn_src
+  tc_check ne get v_has_last 0 0 tsn_last
+  tst_fake_id 51
+  tw_reset
+  tw_id_tmp
+  tw_b 10
+  tl_set th_id__
+  ex_tw 0 tsn_id_
+  tw_set ts_x_obj
+  tw_id_tmp
+  tw_b 10
+  tw_txt ts__obj
+  tw_id_tmp
+  tw_b 10
+  tl_set th_bind
+  ex_tw 0 tsn_bind
+  exs ts_bad ts_bad_o
+  ex_tw 1 tsn_err
+  put tst_run_calls 0 0
+  exs ts_run_x ts_run_x_o
+  ex_tw 0 tsn_run
+  tc_check eq get tst_run_calls 0 1 tsn_once
+  tst_fake_id 68
+  u = th_bind_set ts_w V_BIND_OBJECT -1
+  exs ts_run_w ts_run_w_o
+  ex_tw 1 tsn_eff
+  tc_check and ge u 0 eq get tst_run_calls 0 1 tsn_never
+  exs ts_run_nope ts_run_nope_o
+  ex_tw 1 tsn_unres
+  tc_check eq get tst_run_calls 0 1 tsn_unres2
+  exs ts_effects ts_effects_o
+  ex_tw 0 tsn_effv
+  exs ts_verify_x ts_verify_x_o
+  ex_tw 1 tsn_ewo
+  exs ts_cost_x ts_cost_x_o
+  ex_tw 1 tsn_hook
+  h_open 0
+  put tst_ops 0 shl ulong 1 VCON_HK_RUN
+  put tst_run_calls 0 0
+  exs ts_run__ th_run_notw
+  ex_tw 1 tsn_nocls
+  tc_check eq get tst_run_calls 0 0 tsn_nocls2
+end
+
+note ---------------- JSON ----------------
+
+text tj_bind_e "{\"command\":\"bindings\",\"status\":\"ok\",\"class\":\"inspection\",\"result\":[],\"error\":null}\n"
+text tj_help_quit "help quit"
+text tj_help_quit_o "{\"command\":\"help\",\"status\":\"ok\",\"class\":\"inspection\",\"result\":[{\"command\":\"quit\",\"usage\":\"quit\",\"class\":\"inspection\",\"meaning\":\"leave the console\"}],\"error\":null}\n"
+text tj_src1 "{\"command\":\"source\",\"status\":\"ok\",\"class\":\"pure-execution\",\"result\":{\"value\":\"18\",\"kind\":\"object\",\"id\":\""
+text tj_tail "\"},\"error\":null}\n"
+text tj_id_x "id x"
+text tj_id1 "{\"command\":\"id\",\"status\":\"ok\",\"class\":\"inspection\",\"result\":{\"name\":\"x\",\"kind\":\"object\",\"id\":\""
+text tj_bind1 "{\"command\":\"bindings\",\"status\":\"ok\",\"class\":\"inspection\",\"result\":[{\"name\":\"x\",\"kind\":\"object\",\"id\":\""
+text tj_bind2 "\"},{\"name\":\"_\",\"kind\":\"object\",\"id\":\""
+text tj_bind3 "\"}],\"error\":null}\n"
+text tj_idnope_o "{\"command\":\"id\",\"status\":\"error\",\"class\":\"inspection\",\"result\":null,\"error\":\"unknown name or id 'nope'\"}\n"
+text tj_insp_x "inspect x"
+text tj_insp_o "{\"command\":\"inspect\",\"status\":\"error\",\"class\":\"inspection\",\"result\":null,\"error\":\"not wired in this build\"}\n"
+text tj_run_x_o "{\"command\":\"run\",\"status\":\"ok\",\"class\":\"pure-execution\",\"result\":{\"value\":\"18\"},\"error\":null}\n"
+text tj_run_w_o "{\"command\":\"run\",\"status\":\"error\",\"class\":\"effect-request\",\"result\":null,\"error\":\"EFFECT REQUEST: requires authority; routed via EffectIntent -> AEGIS/PHYSICS (not executed); reason: writes a file\"}\n"
+text tj_cost_o "{\"command\":\"cost\",\"status\":\"error\",\"class\":\"simulation\",\"result\":null,\"error\":\"no \\\"estimate\\\"\"}\n"
+text tj_verify_o "{\"command\":\"verify\",\"status\":\"error\",\"class\":\"pure-execution\",\"result\":{\"passed\":false},\"error\":\"verification failed: V0\"}\n"
+text tj_effects_o "{\"command\":\"effects\",\"status\":\"ok\",\"class\":\"effect-request\",\"result\":[],\"error\":null}\n"
+text tj_quit_o "{\"command\":\"quit\",\"status\":\"ok\",\"class\":\"inspection\",\"result\":\"bye\",\"error\":null}\n"
+text tjn_bind_e "json bindings empty"
+text tjn_help "json help one"
+text tjn_src "json source"
+text tjn_id "json id"
+text tjn_bind "json bindings"
+text tjn_iderr "json id error"
+text tjn_notw "json not wired"
+text tjn_run "json run pure"
+text tjn_eff "json effect request"
+text tjn_esc "json escaping"
+text tjn_ewo "json error with output"
+text tjn_effects "json effects"
+text tjn_quit "json quit"
+
+fn test_console_json to void
+  h_open 1
+  tst_install_stubs
+  exs th_bind tj_bind_e
+  ex_tw 0 tjn_bind_e
+  exs tj_help_quit tj_help_quit_o
+  ex_tw 0 tjn_help
+  tst_fake_id 51
+  tw_set tj_src1
+  tw_id_tmp
+  tw_txt tj_tail
+  tl_set ts_let
+  ex_tw 0 tjn_src
+  tw_set tj_id1
+  tw_id_tmp
+  tw_txt tj_tail
+  tl_set tj_id_x
+  ex_tw 0 tjn_id
+  tw_set tj_bind1
+  tw_id_tmp
+  tw_txt tj_bind2
+  tw_id_tmp
+  tw_txt tj_bind3
+  tl_set th_bind
+  ex_tw 0 tjn_bind
+  exs th_id_nope tj_idnope_o
+  ex_tw 1 tjn_iderr
+  exs tj_insp_x tj_insp_o
+  ex_tw 1 tjn_notw
+  exs ts_run_x tj_run_x_o
+  ex_tw 0 tjn_run
+  tst_fake_id 68
+  u = th_bind_set ts_w V_BIND_OBJECT -1
+  exs ts_run_w tj_run_w_o
+  ex_tw 1 tjn_eff
+  exs ts_cost_x tj_cost_o
+  ex_tw 1 tjn_esc
+  exs ts_verify_x tj_verify_o
+  ex_tw 1 tjn_ewo
+  exs ts_effects tj_effects_o
+  ex_tw 0 tjn_effects
+  tl_set th_quit
+  tw_set tj_quit_o
+  if lt u 0
+    tw_reset
+  end
+  ex_tw 0 tjn_quit
+end
+
+note ---------------- script mode ----------------
+
+text tsc_spath "tests/visor/sessions/basic.omega-session"
+text tsc_epath "tests/visor/sessions/basic.expected"
+text tscn_files "session files present (run from repo root)"
+text tscn_same "basic.omega-session matches basic.expected exactly"
+text tscn_rc "script with errors returns 1"
+text tscn_quit "script stopped at quit"
+text tscn_shape "json script: one object per line"
+text tscn_echo "json script: no echo"
+text tsc_got "--- script got:\n"
+text tsc_cmd "{\"command\":\""
+
+fn tsc_open_script to long
+  ret fopen tsc_spath 0 len tsc_spath 0 0
+end
+
+global tsc_objs ulong 1
+global tsc_sink long 1
+
+note Read basic.expected into texp; returns the open result (fd or < 0).
+fn tsc_read_expected to long
+  put texp_n 0 0
+  efd = fopen tsc_epath 0 len tsc_epath 0 0
+  if lt efd 0
+    ret efd
+  end
+  en = ulong 0
+  while lt en 65536 bound 4096
+    k = read int efd texp en sub 65536 en
+    if le k 0
+      break
+    end
+    en = add en ulong k
+  end
+  put texp_n 0 en
+  ret long fclose int efd
+end
+
+fn tsc_cap_is_expected to bool
+  en = get texp_n 0
+  if ne get vcon_caplen 0 en
+    ret false
+  end
+  for i ulong en bound 65536
+    if ne get vcon_cap i get texp i
+      ret false
+    end
+  end
+  ret true
+end
+
+note Line [p, e) of the capture is one JSON object line.
+fn tsc_obj_line p ulong e ulong to bool
+  if lt sub e p 12
+    ret false
+  end
+  for j ulong 12
+    if ne get vcon_cap add p j get tsc_cmd j
+      ret false
+    end
+  end
+  ret eq get vcon_cap sub e 1 125
+end
+
+note Every capture line is one object; count in tsc_objs.
+fn tsc_json_shape to bool
+  n = get vcon_caplen 0
+  put tsc_objs 0 0
+  shape = true
+  p = ulong 0
+  while lt p n bound 65536
+    e = p
+    while lt e n bound 65536
+      if eq get vcon_cap e 10
+        break
+      end
+      e = add e 1
+    end
+    if ge e n
+      ret false
+    end
+    if not tsc_obj_line p e
+      shape = false
+    end
+    put tsc_objs 0 add get tsc_objs 0 1
+    p = add e 1
+  end
+  ret shape
+end
+
+note Does the capture contain the prompt bytes CE A9 '>'?
+fn tsc_has_echo to bool
+  n = get vcon_caplen 0
+  if lt n 3
+    ret false
+  end
+  for i ulong sub n 2 bound 65536
+    if eq get vcon_cap i 206
+      if and eq get vcon_cap add i 1 169 eq get vcon_cap add i 2 62
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn test_script to void
+  er = tsc_read_expected
+  sfd = tsc_open_script
+  tc_check and ge er 0 ge sfd 0 tscn_files
+  if lt sfd 0
+    ret
+  end
+  if lt er 0
+    put tsc_sink 0 long fclose int sfd
+    ret
+  end
+  h_open 0
+  rc = vcon_run_fd int sfd true false
+  put tsc_sink 0 long fclose int sfd
+  same = tsc_cap_is_expected
+  if not same
+    v_write_all 2 tsc_got
+    put tsc_sink 0 long write 2 vcon_cap 0 get vcon_caplen 0
+  end
+  tc_check same tscn_same
+  tc_check eq rc 1 tscn_rc
+  tc_check ne get vcon_quit 0 0 tscn_quit
+  sfd2 = tsc_open_script
+  h_open 1
+  put tsc_sink 0 vcon_run_fd int sfd2 false false
+  put tsc_sink 0 long fclose int sfd2
+  shape = tsc_json_shape
+  tc_check and shape eq get tsc_objs 0 12 tscn_shape
+  tc_check not tsc_has_echo tscn_echo
+end
+
+fn tc_report to int
+  ob_reset 65535
+  if eq get tc_pass 0 get tc_total 0
+    ob_puts tc_t_pass
+  else
+    ob_puts tc_t_fail
+  end
+  ob_put_u64 get tc_pass 0
+  ob_puts tc_t_slash
+  ob_put_u64 get tc_total 0
+  ob_putc uchar 10
+  ob_write_fd 1
+  if eq get tc_pass 0 get tc_total 0
+    ret 0
+  end
+  ret 1
+end
+
+fn test_console_lane to void
+  test_parser_a
+  test_parser_b
+  test_parser_c
+  test_parser_d
+  test_console_human
+  test_console_stubs
+  test_console_json
+  test_script
+end
