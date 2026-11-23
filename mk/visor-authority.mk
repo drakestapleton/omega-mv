@@ -39,5 +39,7 @@ $(VISOR_AUTH_TEST): tests/visor/test_visor_authority.c $(VISOR_AUTH_RX_SRCS) \
 test-visor-authority: $(VISOR_AUTH_TEST)
 	./$(VISOR_AUTH_TEST)
 
-visor-authority-check: $(OUT_DIR)/visor/visor_effect_request.o
+# The omega binary is a prerequisite so the check always covers it (it is pure OM-2 and has no
+# symbol table; its isolation is that it is built only from $(OMEGA_OM_SRCS)).
+visor-authority-check: $(OUT_DIR)/visor/visor_effect_request.o $(OMEGA_BIN)
 	sh tests/visor/check_authority_link.sh $(OUT_DIR)
