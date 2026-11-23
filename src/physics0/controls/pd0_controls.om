@@ -1,0 +1,396 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/physics0/controls/pd0_controls.om: PD-0 negative-control toolkit (spec 9.1).
+note Test infrastructure; never part of a learner. Pure OM-2, no file I/O.
+note Records live in the cr_* staging arrays (the C pd0_rec arrays): NC-1 null world, NC-2 outcome
+note shuffle and rechain. NC-3 mutants act on relation slots; the M3 memoriser is pd0_score mode 1.
+
+text CTRL_TAG_NULL "null"
+text CTRL_TAG_SCORE "score"
+text CTRL_TAG_SHUF "shuffle"
+
+const CTRL_MAX_REC ulong 65536
+global cr_n ulong 1
+global cr_nobs uchar 65536
+global cr_st uchar 65536
+global cr_kind uchar 65536
+global cr_ch uchar 65536
+global cr_seq ulong 65536
+global cr_ep uint 65536
+global cr_step uint 65536
+global cr_time long 65536
+global cr_req long 65536
+global cr_app long 65536
+global cr_bef long 262144
+global cr_aft long 262144
+global cr_prev uchar 2097152
+global cr_hash uchar 2097152
+global cr_shuf_idx uint 65536
+
+fn cr_to_rec idx ulong r edit Pd0Rec to void
+put r n_obs get cr_nobs idx
+put r status get cr_st idx
+put r kind get cr_kind idx
+put r channel get cr_ch idx
+put r seq get cr_seq idx
+put r episode get cr_ep idx
+put r step_in_episode get cr_step idx
+put r time_micro get cr_time idx
+put r requested get cr_req idx
+put r applied get cr_app idx
+rb = mul idx ulong 4
+for j ulong 4
+put r before j get cr_bef add rb j
+put r after j get cr_aft add rb j
+end
+ret
+end
+
+fn cr_from_rec idx ulong r view Pd0Rec to void
+put cr_nobs idx get r n_obs
+put cr_st idx get r status
+put cr_kind idx get r kind
+put cr_ch idx get r channel
+put cr_seq idx get r seq
+put cr_ep idx get r episode
+put cr_step idx get r step_in_episode
+put cr_time idx get r time_micro
+put cr_req idx get r requested
+put cr_app idx get r applied
+rb = mul idx ulong 4
+for j ulong 4
+put cr_bef add rb j get r before j
+put cr_aft add rb j get r after j
+end
+ret
+end
+
+note encode staged record idx with prev_hash cr_prev[idx] into dst; stores its record hash in cr_hash[idx]
+fn cr_encode_one idx ulong dst edit uchar 256 to ulong
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+cr_to_rec idx edit r
+hb = mul idx PD0_HASH
+pb = new uchar 32 0
+for k ulong 32
+put pb k get cr_prev add hb k
+end
+for i ulong 8
+put r prev_hash i pd0_get_be32 view pb mul i 4
+end
+n = pd0_rec_encode edit r dst
+for i ulong 8
+pd0_put_be32 edit pb mul i 4 get r hash i
+end
+for k ulong 32
+put cr_hash add hb k get pb k
+end
+ret n
+end
+
+fn cr_set_prev idx ulong prev view uchar 32 to void
+hb = mul idx PD0_HASH
+for k ulong 32
+put cr_prev add hb k get prev k
+end
+ret
+end
+
+fn cr_get_hash idx ulong h edit uchar 32 to void
+hb = mul idx PD0_HASH
+for k ulong 32
+put h k get cr_hash add hb k
+end
+ret
+end
+
+note one null-world record n: s = 0 a reset to st, else a step whose outcome is fresh Irwin-Hall noise (sd 0.5)
+fn ctrl_null_rec n ulong es ulong st edit long 4 rng edit ulong 2 box view long 4 to void
+note es = episode * 65536 + step * 256 + n_obs; rng = [null stream, score stream]; box = rmin rmax cmin cmax
+no = and es ulong 255
+s = and shr es 8 ulong 255
+put cr_nobs n uchar no
+put cr_st n PD0_OK
+put cr_seq n n
+put cr_ep n uint shr es 16
+put cr_step n uint s
+put cr_time n mul long s long 50000
+put cr_req n long 0
+put cr_app n long 0
+rb = mul n ulong 4
+for j ulong 4
+put cr_bef add rb j long 0
+put cr_aft add rb j long 0
+end
+if eq s ulong 0
+put cr_kind n PD0_KIND_RESET
+put cr_ch n PD0_CH_NONE
+for j ulong no bound 4
+put cr_bef add rb j get st j
+put cr_aft add rb j get st j
+end
+ret
+end
+put cr_kind n PD0_KIND_STEP
+put cr_ch n uchar 0
+ctrl_null_step n no st rng box
+ret
+end
+
+fn ctrl_null_step n ulong no ulong st edit long 4 rng edit ulong 2 box view long 4 to void
+sch = new ulong 1 0
+nz = new ulong 1 0
+put sch 0 get rng 1
+put nz 0 get rng 0
+u = add get box 2 pd0_mul sub get box 3 get box 2 pd0_uniform edit sch
+put cr_req n u
+put cr_app n u
+rb = mul n ulong 4
+for j ulong no bound 4
+put cr_bef add rb j get st j
+nv = pd0_noise edit nz long 500000
+put st j nv
+put cr_aft add rb j nv
+end
+put rng 0 get nz 0
+put rng 1 get sch 0
+ret
+end
+
+note NC-1 (C pd0_null_world): records into cr_*, chained; returns how many (at most cap)
+note chain staged record n to record n-1 (zero hash for the first) and encode it
+fn cr_chain_encode n ulong to void
+hb = mul n PD0_HASH
+for k ulong 32
+put cr_prev add hb k uchar 0
+end
+if gt n ulong 0
+pb = mul sub n 1 PD0_HASH
+for k ulong 32
+put cr_prev add hb k get cr_hash add pb k
+end
+end
+buf = new uchar 256 0
+rn = cr_encode_one n edit buf
+ret
+end
+
+note one null-world episode from record cr_n; eb = episode * 65536 + n_obs, sc = steps * 65536 + cap
+fn ctrl_null_episode eb ulong sc ulong st edit long 4 rng edit ulong 2 box view long 4 to void
+for s ulong add shr sc 16 1 bound 256
+n = get cr_n 0
+if ge n and sc ulong 65535
+break
+end
+ctrl_null_rec n add eb shl s 8 st rng box
+if eq s shr sc 16
+put cr_st n PD0_EPISODE_END
+end
+cr_chain_encode n
+put cr_n 0 add n 1
+end
+ret
+end
+
+note NC-1 (C pd0_null_world): records into cr_*, chained; returns how many (at most cap)
+fn ctrl_null_world seed ulong n_obs uchar n_ep uint steps uint box view long 4 cap ulong to uint
+r1 = new ulong 1 0
+r2 = new ulong 1 0
+pd0_stream edit r1 seed CTRL_TAG_NULL
+pd0_stream edit r2 seed CTRL_TAG_SCORE
+rng = new ulong 2 0
+put rng 0 get r1 0
+put rng 1 get r2 0
+put cr_n 0 ulong 0
+st = new long 4 0
+sc = add shl ulong steps 16 cap
+for e ulong ulong n_ep bound 65536
+ctrl_null_reset edit st edit rng box n_obs
+ctrl_null_episode add shl e 16 ulong n_obs sc edit st edit rng box
+end
+ret uint get cr_n 0
+end
+
+fn ctrl_null_reset st edit long 4 rng edit ulong 2 box view long 4 n_obs uchar to void
+sch = new ulong 1 0
+put sch 0 get rng 1
+for j ulong ulong n_obs bound 4
+put st j add get box 0 pd0_mul sub get box 1 get box 0 pd0_uniform edit sch
+end
+put rng 1 get sch 0
+ret
+end
+
+fn cr_swap_after a ulong b ulong to void
+ra = mul a ulong 4
+rb = mul b ulong 4
+for v ulong 4
+t = get cr_aft add ra v
+put cr_aft add ra v get cr_aft add rb v
+put cr_aft add rb v t
+end
+ret
+end
+
+note NC-2 (C pd0_shuffle_outcomes): permute vars_after across OK step records, then before = previous after
+fn ctrl_shuffle_outcomes n ulong seed ulong to void
+rng = new ulong 1 0
+pd0_stream edit rng seed CTRL_TAG_SHUF
+m = ulong 0
+for i ulong n bound 65536
+if eq get cr_kind i PD0_KIND_STEP
+if eq get cr_st i PD0_OK
+put cr_shuf_idx m uint i
+m = add m 1
+end
+end
+end
+i = m
+while gt i ulong 1 bound 65536
+j = rem pd0_splitmix64 edit rng i
+cr_swap_after ulong get cr_shuf_idx sub i 1 ulong get cr_shuf_idx j
+i = sub i 1
+end
+for k ulong n bound 65536
+if gt k ulong 0
+if eq get cr_kind k PD0_KIND_STEP
+if eq get cr_ep k get cr_ep sub k 1
+cr_copy_before k
+end
+end
+end
+end
+ret
+end
+
+fn cr_copy_before k ulong to void
+rb = mul k ulong 4
+pb = mul sub k 1 ulong 4
+for v ulong 4
+put cr_bef add rb v get cr_aft add pb v
+end
+ret
+end
+
+note C pd0_rechain: rebuild prev_hash / record_hash along the staged records
+fn ctrl_rechain n ulong to void
+for i ulong n bound 65536
+cr_chain_encode i
+end
+ret
+end
+
+fn ctrl_expo_eq ti ulong ex view uchar 16 ne_ex ulong to int
+xb = mul ti V_MAX_EX
+for m ulong ne_ex bound 16
+if ne get vr_ex add xb m get ex m
+ret 0
+end
+end
+ret 1
+end
+
+note M1 (C pd0_mut_scale_coef): every term of target with exponents ex gets coef * num / den
+fn ctrl_scale_eq rslot ulong e ulong ex view uchar 16 nd view long 2 to void
+ne_ex = add ulong get vr_nvars rslot ulong get vr_nch rslot
+nt = ulong get vr_eq_nt vr_eq_idx rslot e
+for k ulong nt bound 32
+ti = vr_term_idx rslot e k
+if ne ctrl_expo_eq ti ex ne_ex 0
+c = mul get vr_coef ti get nd 0
+put vr_coef ti div c get nd 1
+end
+end
+ret
+end
+
+note M1 (C pd0_mut_scale_coef): every term of target with exponents ex gets coef * num / den
+fn ctrl_mut_scale_coef rslot ulong tgt uchar ex view uchar 16 num long den long to void
+nd = new long 2 0
+put nd 0 num
+put nd 1 den
+ne_cnt = ulong get vr_neq rslot
+for e ulong ne_cnt bound 12
+if eq get vr_eq_tgt vr_eq_idx rslot e tgt
+ctrl_scale_eq rslot e ex view nd
+end
+end
+put vr_dbits rslot vr_rel_bits rslot
+ret
+end
+
+fn ctrl_has_term rslot ulong e ulong ex view uchar 16 ne_ex ulong to int
+nt = ulong get vr_eq_nt vr_eq_idx rslot e
+for k ulong nt bound 32
+if ne ctrl_expo_eq vr_term_idx rslot e k ex ne_ex 0
+ret 1
+end
+end
+ret 0
+end
+
+note try to add x_i x_j to equation e of rslot; returns 1 when added
+fn ctrl_put_term ti ulong ex view uchar 16 c long to void
+put vr_coef ti c
+xb = mul ti V_MAX_EX
+for m ulong 16
+put vr_ex add xb m get ex m
+end
+ret
+end
+
+note try to add x_i x_j to equation e of rslot; returns 1 when added
+fn ctrl_pad_one rslot ulong e ulong ij ulong ne_ex ulong tiny long to ulong
+ex = new uchar 16 0
+i = shr ij 8
+j = and ij ulong 255
+put ex i add get ex i uchar 1
+put ex j add get ex j uchar 1
+if ne ctrl_has_term rslot e view ex ne_ex 0
+ret ulong 0
+end
+ei = vr_eq_idx rslot e
+nt = ulong get vr_eq_nt ei
+ctrl_put_term vr_term_idx rslot e nt view ex tiny
+put vr_eq_nt ei ushort add nt 1
+ret ulong 1
+end
+
+fn ctrl_eq_full rslot ulong e ulong to int
+if ge ulong get vr_eq_nt vr_eq_idx rslot e V_MAX_TERMS
+ret 1
+end
+ret 0
+end
+
+note M2 (C pd0_mut_pad): add n_extra degree-2 terms x_i x_j (i <= j) not already present, coefficient tiny
+note pad equation e with up to want - added terms; returns the new added count
+fn ctrl_pad_eq rslot ulong e ulong aw ulong tiny long to ulong
+note aw = added * 65536 + want
+ne_ex = add ulong get vr_nvars rslot ulong get vr_nch rslot
+added = shr aw 16
+for i ulong ne_ex bound 16
+for jj ulong sub ne_ex i bound 16
+if lt added and aw ulong 65535
+if eq ctrl_eq_full rslot e 0
+ij = add shl i 8 add i jj
+added = add added ctrl_pad_one rslot e ij ne_ex tiny
+end
+end
+end
+end
+ret added
+end
+
+note M2 (C pd0_mut_pad): add n_extra degree-2 terms x_i x_j (i <= j) not already present, coefficient tiny
+fn ctrl_mut_pad rslot ulong n_extra uint tiny long to void
+ne_cnt = ulong get vr_neq rslot
+added = ulong 0
+for e ulong ne_cnt bound 12
+added = ctrl_pad_eq rslot e add shl added 16 ulong n_extra tiny
+end
+put vr_dbits rslot vr_rel_bits rslot
+ret
+end
+
+fn ctrl_mem_stored_numbers n uint n_obs uchar to uint
+ret mul n add mul uint 2 uint n_obs uint 2
+end
