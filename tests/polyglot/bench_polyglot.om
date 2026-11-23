@@ -3,19 +3,53 @@ note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
 note
 note tests/polyglot/bench_polyglot.om -- pure seeded OM-2 POLYGLOT-0 benchmark harness:
 note   --selftest : verifies in-place x^=1 flip checksum prediction across all 5
-note                pure-OM-2 candidates + deliberately memoising control (must be caught),
-note                and x-state oracle consistency after all flips (no timing).
-note   --spec F --out DIR [--samples N] [--smoke] : timed benchmark writing
-note                OMEGA_POLYGLOT0_RECEIPT_V1 JSON receipts.
+note                candidates + deliberately memoising control (must be caught),
+note                code-size accounting, and x-state oracle consistency (no timing).
+note   --spec F --out DIR [--manifest M] [--samples N] [--sparsity 0,0.33,0.66]
+note                      [--workloads S1,S2,S3,S4] [--cpu C] [--smoke]
+note                honors all CLI flags, pins CPU via cpuset when --cpu is given,
+note                parses manifest TSV when --manifest is given, queries actual
+note                git dirty status & HEAD commit via fork+pipefds+execprog, and
+note                writes OMEGA_POLYGLOT0_RECEIPT_V1 JSON receipts.
 
 const BP_NC ulong 5
+const BP_NW ulong 4
+const BP_NSP ulong 3
 
 global g_bp_arg uchar 512
 global g_bp_spec uchar 512
 global g_bp_out uchar 512
+global g_bp_man_path uchar 512
 note g_bp_cfg: [0]=selftest [1]=smoke [2]=samples [3]=spec_len [4]=out_len [5]=rng
-global g_bp_cfg ulong 8
+note           [6]=man_len [7]=cpu_set [8]=cpu_id [9]=dirty_valid [10]=dirty_cnt [11]=commit_len
+global g_bp_cfg ulong 16
+global g_bp_wsel ulong 4
+global g_bp_spsel ulong 4
+global g_bp_spval f64 4
+global g_bp_wm ulong 4
+global g_bp_wn ulong 4
+global g_bp_wnx ulong 4
 
+note Git & env capture buffers
+global g_bp_commit uchar 64
+global g_bp_runid uchar 96
+global g_bp_runid_len ulong 2
+global g_bp_cmdbuf uchar 4096
+global g_bp_pkt uchar 512
+global g_bp_env uchar 256
+
+note Parsed manifest entries (up to 32 rows)
+global g_bp_nman ulong 2
+global g_bp_msrc uchar 8192
+global g_bp_msrc_l ulong 32
+global g_bp_mobj uchar 8192
+global g_bp_mobj_l ulong 32
+global g_bp_mcmd uchar 8192
+global g_bp_mcmd_l ulong 32
+global g_bp_msha uchar 64
+global g_bp_mtext long 2
+
+note X-mutation state
 global g_bp_x byte 1048576
 global g_bp_colsum long 65536
 global g_bp_pos ulong 65536
@@ -28,10 +62,17 @@ global g_bp_mx16 byte 16
 global g_bp_my int 64
 global g_bp_mvalid ulong 2
 
-global g_bp_samp f64 1024
-global g_bp_stmp f64 1024
-global g_bp_pack f64 8
-global g_bp_shbuf uchar 64
+note Per-cell timing results (up to 3 sparsities for current candidate x workload)
+global g_bp_cmin f64 4
+global g_bp_cmed f64 4
+global g_bp_cmad f64 4
+global g_bp_cpmed f64 4
+global g_bp_cchk ulong 4
+global g_bp_cfail ulong 4
+global g_bp_csk ulong 4
+global g_bp_creps ulong 4
+global g_bp_cpres ulong 4
+global g_bp_contract uchar 64
 global g_bp_path uchar 768
 
 text t_bp_st_flag "--selftest"
@@ -42,6 +83,23 @@ text t_bp_sa_flag "--samples"
 text t_bp_ma_flag "--manifest"
 text t_bp_sr_flag "--sparsity"
 text t_bp_wl_flag "--workloads"
+text t_bp_cp_flag "--cpu"
+text t_bp_env_dirty "POLYGLOT_DIRTY="
+text t_bp_env_commit "POLYGLOT_COMMIT="
+text t_bp_env_cpu "POLYGLOT_BENCH_CPU="
+text t_bp_git "/usr/bin/git"
+text t_bp_gstat "status"
+text t_bp_gporc "--porcelain"
+text t_bp_gdd "--"
+text t_bp_gsrc "src"
+text t_bp_gtst "tests"
+text t_bp_gmk "mk"
+text t_bp_gmf "Makefile"
+text t_bp_gspc "spec"
+text t_bp_grevp "rev-parse"
+text t_bp_ghead "HEAD"
+text t_bp_nocommit "nocommit"
+
 text t_bp_st_hdr "bench_polyglot selftest "
 text t_bp_pass "PASS"
 text t_bp_fail "FAIL"
@@ -49,36 +107,103 @@ text t_bp_s1 ": "
 text t_bp_s2 " checks, "
 text t_bp_s3 " failures (5 candidates + 1 memoising control, no timing, pure OM-2)\n"
 text t_bp_efail "selftest FAIL: candidate/control check failed\n"
-text t_bp_usage "usage: bench_polyglot --selftest | --spec F --out DIR [--samples N] [--smoke]\n"
-text t_bp_done "bench_polyglot DONE: pure OM-2 receipts written to "
+text t_bp_usage "usage: bench_polyglot --selftest | --spec F --out DIR [--manifest M] [--samples N] [--sparsity 0,0.33,0.66] [--workloads S1,S2,S3,S4] [--cpu C] [--smoke]\n"
+text t_bp_ebad_arg "bench_polyglot: invalid or missing argument\n"
+text t_bp_ebad_sp "bench_polyglot: --sparsity values must be among 0, 0.33, 0.66\n"
+text t_bp_ebad_wl "bench_polyglot: --workloads must select at least one of S1,S2,S3,S4\n"
+text t_bp_ebad_sa "bench_polyglot: --samples must be 1..1000 (>= 20 unless --smoke)\n"
+text t_bp_ebad_ma "bench_polyglot: cannot open --manifest file\n"
+text t_bp_ebad_cpu "bench_polyglot: --cpu cpuset failed\n"
+text t_bp_done "bench_polyglot DONE: receipts written to "
+text t_bp_dirty_s " (dirty="
+text t_bp_cpu_s ", cpu="
+text t_bp_man_s ", manifest_rows="
+text t_bp_rp ")\n"
+
 text t_bp_c0 "om_plain"
 text t_bp_c1 "om_sdot"
 text t_bp_c2 "om_crumb"
 text t_bp_c3 "enc_sdot"
 text t_bp_c4 "enc_crumb"
-text t_bp_s1id "S1"
-text t_bp_s2id "S2"
-text t_bp_js1 "{\n  \"schema\": \"OMEGA_POLYGLOT0_RECEIPT_V1\",\n  \"semantic_operation\": \"omega-x\",\n  \"contract\": {\"section\": 1, \"sha256\": \""
-text t_bp_js2 "\"},\n  \"run\": {\"run_id\": \"om2-pure\", \"smoke\": "
+text t_bp_w0 "S1"
+text t_bp_w1 "S2"
+text t_bp_w2 "S3"
+text t_bp_w3 "S4"
+text t_bp_r0 "call overhead"
+text t_bp_r1 "cache-resident (256 KiB int8, L2)"
+text t_bp_r2 "memory bandwidth"
+text t_bp_r3 "compute-bound, 256 different x per packed W, cache-resident"
+text t_bp_true "true"
+text t_bp_false "false"
+text t_bp_null "null"
+text t_bp_bin "binary"
+text t_bp_crm "crumb2"
+
+text t_bp_js1 "{\n  \"schema\": \"OMEGA_POLYGLOT0_RECEIPT_V1\",\n  \"semantic_operation\": \"omega-x\",\n  \"contract\": {\"path\": "
+text t_bp_js1b ", \"section\": 1, \"sha256\": \""
+text t_bp_js2 "\"},\n  \"run\": {\"run_id\": \""
+text t_bp_js2b "\", \"source_commit\": \""
+text t_bp_js2c "\", \"smoke\": "
 text t_bp_js3 ", \"samples_per_cell\": "
 text t_bp_js4 ", \"gate_eligible\": "
-text t_bp_js5 ", \"tree_dirty_files\": 0},\n  \"candidate\": {\"id\": \""
+text t_bp_js5 ", \"tree_dirty_files\": "
+text t_bp_js5b "},\n  \"machine\": {\"core\": "
+text t_bp_js5c "},\n  \"build\": {\"manifest_entries\": "
+text t_bp_js5d ", \"object_text_bytes\": "
+text t_bp_js5e "},\n  \"candidate\": {\"id\": \""
 text t_bp_js6 "\", \"language\": \"omega-om2\", \"toolchain\": \"seed/out/omc\", \"representation\": \""
 text t_bp_js7 "\", \"exact\": 1, \"weak_baseline\": "
 text t_bp_js8 ", \"compiler_derived\": 0, \"toolchain_only\": "
 text t_bp_js9 "},\n  \"workload\": {\"id\": \""
 text t_bp_js10 "\", \"m\": "
 text t_bp_js11 ", \"n\": "
-text t_bp_js12 ", \"regime\": \"pure-om2\"},\n  \"cells\": [\n    {\"sparsity\": 0.00, \"measured\": true, \"short_samples_kept\": 0, \"correctness\": {\"checks\": 1, \"failures\": 0}, \"latency_ns\": {\"min\": "
-text t_bp_js13 ", \"median\": "
-text t_bp_js14 ", \"mad\": "
-text t_bp_js15 "}, \"pack\": {\"ns_median\": "
-text t_bp_js16 ", \"ns_per_weight\": "
-text t_bp_js17 "}}\n  ]\n}\n"
-text t_bp_true "true"
-text t_bp_false "false"
-text t_bp_bin "binary"
-text t_bp_crm "crumb2"
+text t_bp_js11b ", \"x_per_packed_w\": "
+text t_bp_js12 ", \"regime\": "
+text t_bp_js12b "},\n  \"cells\": [\n"
+text t_bp_jc1 "    {\"sparsity\": "
+text t_bp_jc2 ", \"measured\": true, \"calls_per_sample\": "
+text t_bp_jc2b ", \"short_samples_kept\": "
+text t_bp_jc3 ", \"correctness\": {\"checks\": "
+text t_bp_jc4 ", \"failures\": "
+text t_bp_jc5 "}, \"latency_ns\": {\"min\": "
+text t_bp_jc6 ", \"median\": "
+text t_bp_jc7 ", \"mad\": "
+text t_bp_jc8 "}, \"pack\": {\"ns_median\": "
+text t_bp_jc9 ", \"ns_per_weight\": "
+text t_bp_jc10 "}}"
+text t_bp_jcn ",\n"
+text t_bp_jend "\n  ]\n}\n"
+
+fn bp_init to void
+  for i ulong 16
+    put g_bp_cfg i 0
+  end
+  put g_bp_cfg 2 21
+  put g_bp_cfg 5 0x504f4c5942454e43
+  for i ulong 4
+    put g_bp_wsel i 1
+  end
+  for i ulong 3
+    put g_bp_spsel i 1
+  end
+  put g_bp_spval 0 0.0f64
+  put g_bp_spval 1 0.33f64
+  put g_bp_spval 2 0.66f64
+  put g_bp_wm 0 1
+  put g_bp_wn 0 4096
+  put g_bp_wnx 0 1
+  put g_bp_wm 1 256
+  put g_bp_wn 1 1024
+  put g_bp_wnx 1 1
+  put g_bp_wm 2 4096
+  put g_bp_wn 2 4096
+  put g_bp_wnx 2 1
+  put g_bp_wm 3 64
+  put g_bp_wn 3 1024
+  put g_bp_wnx 3 256
+  put g_bp_nman 0 0
+  put g_bp_mtext 0 -1
+end
 
 fn bp_arg_eq alen ulong b view uchar * to bool
   if ne alen len b
@@ -92,17 +217,507 @@ fn bp_arg_eq alen ulong b view uchar * to bool
   ret true
 end
 
-fn bp_parse_arg_u n ulong to ulong
+fn bp_parse_u_slice off ulong n ulong ok edit ulong 1 to ulong
+  put ok 0 0
+  if eq n 0
+    ret 0
+  end
   v = ulong 0
   for i ulong n bound 32
-    c = get g_bp_arg i
+    c = get g_bp_arg add off i
     if or lt c 48 gt c 57
-      break
+      ret 0
     end
     v = add mul v 10 ulong sub c 48
   end
+  put ok 0 1
   ret v
 end
+
+fn bp_parse_arg_u n ulong ok edit ulong 1 to ulong
+  ret bp_parse_u_slice 0 n ok
+end
+
+fn bp_parse_sparsity_tok off ulong tlen ulong to long
+  note Accept 0, 0.0, 0.00 -> 0; 0.33 -> 1; 0.66 -> 2; else -1
+  if eq tlen 0
+    ret -1
+  end
+  intp = ulong 0
+  frac = ulong 0
+  fdig = ulong 0
+  seen_dot = ulong 0
+  for i ulong tlen bound 32
+    c = get g_bp_arg add off i
+    if eq c 46
+      if eq seen_dot 1
+        ret -1
+      end
+      seen_dot = 1
+    else
+      if or lt c 48 gt c 57
+        ret -1
+      end
+      d = ulong sub c 48
+      if eq seen_dot 0
+        intp = add mul intp 10 d
+      else
+        if lt fdig 4
+          frac = add mul frac 10 d
+          fdig = add fdig 1
+        end
+      end
+    end
+  end
+  if ne intp 0
+    ret -1
+  end
+  if eq frac 0
+    ret 0
+  end
+  if and eq fdig 2 eq frac 33
+    ret 1
+  end
+  if and eq fdig 2 eq frac 66
+    ret 2
+  end
+  ret -1
+end
+
+fn bp_parse_sparsity_list n ulong to int
+  for i ulong 3
+    put g_bp_spsel i 0
+  end
+  cnt = ulong 0
+  pos = ulong 0
+  while lt pos n bound 64
+    st = pos
+    while lt pos n bound 64
+      if eq get g_bp_arg pos 44
+        break
+      end
+      pos = add pos 1
+    end
+    idx = bp_parse_sparsity_tok st sub pos st
+    if lt idx 0
+      ret -1
+    end
+    put g_bp_spsel ulong idx 1
+    cnt = add cnt 1
+    if lt pos n
+      pos = add pos 1
+    end
+  end
+  if eq cnt 0
+    ret -1
+  end
+  ret 0
+end
+
+fn bp_parse_workloads_list n ulong to int
+  for i ulong 4
+    put g_bp_wsel i 0
+  end
+  cnt = ulong 0
+  pos = ulong 0
+  while lt pos n bound 64
+    st = pos
+    while lt pos n bound 64
+      if eq get g_bp_arg pos 44
+        break
+      end
+      pos = add pos 1
+    end
+    tlen = sub pos st
+    if ne tlen 2
+      ret -1
+    end
+    c0 = get g_bp_arg st
+    c1 = get g_bp_arg add st 1
+    if ne c0 83
+      ret -1
+    end
+    if or lt c1 49 gt c1 52
+      ret -1
+    end
+    wi = ulong sub c1 49
+    put g_bp_wsel wi 1
+    cnt = add cnt 1
+    if lt pos n
+      pos = add pos 1
+    end
+  end
+  if eq cnt 0
+    ret -1
+  end
+  ret 0
+end
+
+note ---- Environment & subprocess git capture ----
+
+fn bp_env_key_match key view uchar * to bool
+  klen = len key
+  for j ulong klen bound 64
+    if ne get g_bp_env j get key j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn bp_env_find key view uchar * dst edit uchar * cap ulong to long
+  ec = ulong envcnt
+  klen = len key
+  for i ulong ec bound 1024
+    el = envread i g_bp_env 0 256
+    if ge el long klen
+      if bp_env_key_match key
+        vlen = sub ulong el klen
+        if gt vlen cap
+          vlen = cap
+        end
+        for j ulong vlen bound 256
+          put dst j get g_bp_env add klen j
+        end
+        ret long vlen
+      end
+    end
+  end
+  ret -1
+end
+
+fn bp_pkt_u16 pos ulong v ulong to ulong
+  put g_bp_pkt pos uchar and v 255
+  put g_bp_pkt add pos 1 uchar and shr v 8 255
+  ret add pos 2
+end
+
+fn bp_pkt_add pos ulong s view uchar * to ulong
+  n = len s
+  p = bp_pkt_u16 pos n
+  for i ulong n bound 256
+    put g_bp_pkt add p i get s i
+  end
+  ret add p n
+end
+
+note Run packed execprog command in g_bp_pkt[0..plen), capture stdout into g_bp_cmdbuf.
+note Returns byte count >= 0 if child exited 0, else -1.
+fn bp_run_capture plen ulong to long
+  pf = new uchar 8 0
+  if lt pipefds pf 0 8 0 0
+    ret -1
+  end
+  rfd = int or or ulong get pf 0 shl ulong get pf 1 8 or shl ulong get pf 2 16 shl ulong get pf 3 24
+  wfd = int or or ulong get pf 4 shl ulong get pf 5 8 or shl ulong get pf 6 16 shl ulong get pf 7 24
+  pid = fork
+  if lt pid 0
+    _c1 = fclose rfd
+    _c2 = fclose wfd
+    ret -1
+  end
+  if eq pid 0
+    _c1 = fclose rfd
+    _d = dupfd wfd 1 0
+    _c2 = fclose wfd
+    _e = execprog g_bp_pkt 0 plen
+    exit 127
+  end
+  _c3 = fclose wfd
+  tot = ulong 0
+  while lt tot 4096 bound 4096
+    r = read rfd g_bp_cmdbuf tot sub 4096 tot
+    if le r 0
+      break
+    end
+    tot = add tot ulong r
+  end
+  _c4 = fclose rfd
+  wst = new uchar 4 0
+  _w = waitpid int pid wst 0 4 0
+  code = or ulong get wst 0 shl ulong get wst 1 8
+  if ne code 0
+    ret -1
+  end
+  ret long tot
+end
+
+fn bp_probe_git_dirty to void
+  eb = new uchar 32 0
+  el = bp_env_find t_bp_env_dirty eb 32
+  if gt el 0
+    v = ulong 0
+    ok = ulong 1
+    for i ulong ulong el bound 32
+      c = get eb i
+      if or lt c 48 gt c 57
+        ok = 0
+        break
+      end
+      v = add mul v 10 ulong sub c 48
+    end
+    if eq ok 1
+      put g_bp_cfg 9 1
+      put g_bp_cfg 10 v
+      ret
+    end
+  end
+  p = bp_pkt_u16 0 9
+  p = bp_pkt_add p t_bp_git
+  p = bp_pkt_add p t_bp_gstat
+  p = bp_pkt_add p t_bp_gporc
+  p = bp_pkt_add p t_bp_gdd
+  p = bp_pkt_add p t_bp_gsrc
+  p = bp_pkt_add p t_bp_gtst
+  p = bp_pkt_add p t_bp_gmk
+  p = bp_pkt_add p t_bp_gmf
+  p = bp_pkt_add p t_bp_gspc
+  n = bp_run_capture p
+  if lt n 0
+    put g_bp_cfg 9 0
+    put g_bp_cfg 10 0
+    ret
+  end
+  lines = ulong 0
+  for i ulong ulong n bound 4096
+    if eq get g_bp_cmdbuf i 10
+      lines = add lines 1
+    end
+  end
+  put g_bp_cfg 9 1
+  put g_bp_cfg 10 lines
+end
+
+fn bp_probe_git_commit to void
+  eb = new uchar 64 0
+  el = bp_env_find t_bp_env_commit eb 64
+  if gt el 0
+    for i ulong ulong el bound 64
+      put g_bp_commit i get eb i
+    end
+    put g_bp_cfg 11 ulong el
+    ret
+  end
+  p = bp_pkt_u16 0 3
+  p = bp_pkt_add p t_bp_git
+  p = bp_pkt_add p t_bp_grevp
+  p = bp_pkt_add p t_bp_ghead
+  n = bp_run_capture p
+  if gt n 0
+    cl = ulong 0
+    for i ulong ulong n bound 64
+      c = get g_bp_cmdbuf i
+      if or eq c 10 eq c 13
+        break
+      end
+      put g_bp_commit cl c
+      cl = add cl 1
+    end
+    if gt cl 0
+      put g_bp_cfg 11 cl
+      ret
+    end
+  end
+  for i ulong len t_bp_nocommit bound 16
+    put g_bp_commit i get t_bp_nocommit i
+  end
+  put g_bp_cfg 11 len t_bp_nocommit
+end
+
+fn bp_build_runid to void
+  ts = div ulong realns 1000000000
+  pos = ulong 0
+  tmp = new uchar 24 0
+  tp = ulong 24
+  cur = ts
+  if eq cur 0
+    tp = 23
+    put tmp 23 uchar 48
+  else
+    while gt cur 0 bound 24
+      tp = sub tp 1
+      put tmp tp uchar add 48 rem cur 10
+      cur = div cur 10
+    end
+  end
+  while lt tp 24 bound 24
+    put g_bp_runid pos get tmp tp
+    pos = add pos 1
+    tp = add tp 1
+  end
+  put g_bp_runid pos uchar 45
+  pos = add pos 1
+  cl = get g_bp_cfg 11
+  if gt cl 12
+    cl = 12
+  end
+  for i ulong cl bound 12
+    put g_bp_runid pos get g_bp_commit i
+    pos = add pos 1
+  end
+  if eq get g_bp_cfg 1 1
+    put g_bp_runid pos uchar 45
+    pos = add pos 1
+    put g_bp_runid pos uchar 115
+    pos = add pos 1
+    put g_bp_runid pos uchar 109
+    pos = add pos 1
+    put g_bp_runid pos uchar 111
+    pos = add pos 1
+    put g_bp_runid pos uchar 107
+    pos = add pos 1
+    put g_bp_runid pos uchar 101
+    pos = add pos 1
+  end
+  put g_bp_runid_len 0 pos
+end
+
+note ---- Manifest TSV parser (source <TAB> flavor <TAB> object <TAB> cmd) ----
+
+fn bp_find_tab start ulong lim ulong to ulong
+  p = start
+  while lt p lim bound 2048
+    if eq get g_omx_fbuf p 9
+      ret p
+    end
+    p = add p 1
+  end
+  ret lim
+end
+
+fn bp_copy_fbuf_msrc rows ulong src ulong sl ulong to void
+  dst = mul rows 256
+  for k ulong sl bound 256
+    ch = get g_omx_fbuf add src k
+    put g_bp_msrc add dst k ch
+  end
+  put g_bp_msrc_l rows sl
+end
+
+fn bp_copy_fbuf_mobj rows ulong src ulong ol ulong to void
+  dst = mul rows 256
+  for k ulong ol bound 256
+    ch = get g_omx_fbuf add src k
+    put g_bp_mobj add dst k ch
+  end
+  put g_bp_mobj_l rows ol
+end
+
+fn bp_parse_man_row rows ulong ls ulong le_p ulong to ulong
+  t1 = bp_find_tab ls le_p
+  if ge t1 le_p
+    ret 0
+  end
+  t2 = bp_find_tab add t1 1 le_p
+  if ge t2 le_p
+    ret 0
+  end
+  t3 = bp_find_tab add t2 1 le_p
+  sl = sub t1 ls
+  if gt sl 255
+    sl = 255
+  end
+  bp_copy_fbuf_msrc rows ls sl
+  ob = add t2 1
+  ol = sub t3 ob
+  if gt ol 255
+    ol = 255
+  end
+  bp_copy_fbuf_mobj rows ob ol
+  ret 1
+end
+
+fn bp_load_manifest to int
+  ml = get g_bp_cfg 6
+  if eq ml 0
+    ret 0
+  end
+  for i ulong ml bound 512
+    put g_omx_path i get g_bp_man_path i
+  end
+  flen = omx_read_gpath ml
+  if lt flen 0
+    ret -1
+  end
+  n = ulong flen
+  pos = ulong 0
+  rows = ulong 0
+  while lt pos n bound 65536
+    if ge rows 32
+      break
+    end
+    ls = pos
+    while lt pos n bound 65536
+      if eq get g_omx_fbuf pos 10
+        break
+      end
+      pos = add pos 1
+    end
+    le_p = pos
+    if lt pos n
+      pos = add pos 1
+    end
+    if gt le_p ls
+      rows = add rows bp_parse_man_row rows ls le_p
+    end
+  end
+  put g_bp_nman 0 rows
+  if gt rows 0
+    ol0 = get g_bp_mobj_l 0
+    for k ulong ol0 bound 256
+      put g_omx_path k get g_bp_mobj k
+    end
+    put g_bp_mtext 0 omx_elf_text_bytes_gpath ol0
+  end
+  ret 0
+end
+
+note ---- CPU pinning via OM-2 cpuset ----
+
+fn bp_probe_env_cpu to void
+  eb = new uchar 16 0
+  el = bp_env_find t_bp_env_cpu eb 16
+  if le el 0
+    ret
+  end
+  v = ulong 0
+  for i ulong ulong el bound 16
+    c = get eb i
+    if or lt c 48 gt c 57
+      ret
+    end
+    v = add mul v 10 ulong sub c 48
+  end
+  put g_bp_cfg 7 1
+  put g_bp_cfg 8 v
+end
+
+fn bp_pin_cpu to int
+  mask = new uchar 16 0
+  if eq get g_bp_cfg 7 0
+    bp_probe_env_cpu
+  end
+  if eq get g_bp_cfg 7 0
+    cur = cpunow
+    if ge cur 0
+      put g_bp_cfg 8 ulong cur
+    end
+    ret 0
+  end
+  cid = get g_bp_cfg 8
+  if ge cid 128
+    ret -1
+  end
+  bidx = div cid 8
+  bit = shl ulong 1 rem cid 8
+  put mask bidx uchar bit
+  if lt cpuset 0 mask 0 16 0
+    ret -1
+  end
+  ret 0
+end
+
+note ---- RNG, x-mutation & selftest ----
 
 fn bp_rnd to ulong
   st = new ulong 1 0
@@ -261,13 +876,13 @@ fn bp_sample ci ulong reps ulong is_memo ulong to ulong
   ret 0
 end
 
-fn bp_setup_shape m ulong n ulong nx ulong to void
+fn bp_setup_shape m ulong n ulong nx ulong sp f64 to void
   put g_bp_xs 0 n
   put g_bp_xs 1 nx
   put g_bp_xs 3 0
   put g_bp_xs 4 m
-  for i ulong mul m n bound 1048576
-    if lt bp_rnd01 0.33f64
+  for i ulong mul m n bound 16777216
+    if lt bp_rnd01 sp
       put g_omx_w i byte 0
     else
       if eq and bp_rnd 1 1
@@ -289,8 +904,10 @@ fn bp_setup_shape m ulong n ulong nx ulong to void
     put g_bp_colsum j 0
   end
   for i ulong m bound 65536
+    row = mul i n
     for j ulong n bound 65536
-      put g_bp_colsum j add get g_bp_colsum j long int get g_omx_w add mul i n j
+      wv = long int get g_omx_w add row j
+      put g_bp_colsum j add get g_bp_colsum j wv
     end
   end
   npos = ulong 0
@@ -356,7 +973,7 @@ fn bp_selftest_cand ci ulong m ulong n ulong nx ulong res edit ulong 2 to void
 end
 
 fn bp_selftest_shape m ulong n ulong nx ulong res edit ulong 2 to void
-  bp_setup_shape m n nx
+  bp_setup_shape m n nx 0.33f64
   for ci ulong 6
     bp_selftest_cand ci m n nx res
   end
@@ -401,6 +1018,8 @@ fn bp_selftest to int
   ret 0
 end
 
+note ---- JSON receipt writer ----
+
 fn bp_write_cid fd int ci ulong to void
   if eq ci 0
     _r = omx_write_all fd t_bp_c0 0 len t_bp_c0
@@ -421,6 +1040,75 @@ fn bp_write_cid fd int ci ulong to void
   end
 end
 
+fn bp_write_wid fd int wi ulong to void
+  if eq wi 0
+    _r = omx_write_all fd t_bp_w0 0 len t_bp_w0
+  else
+    if eq wi 1
+      _r = omx_write_all fd t_bp_w1 0 len t_bp_w1
+    else
+      if eq wi 2
+        _r = omx_write_all fd t_bp_w2 0 len t_bp_w2
+      else
+        _r = omx_write_all fd t_bp_w3 0 len t_bp_w3
+      end
+    end
+  end
+end
+
+fn bp_write_regime fd int wi ulong to void
+  if eq wi 0
+    omx_json_str_fd fd t_bp_r0 len t_bp_r0
+  else
+    if eq wi 1
+      omx_json_str_fd fd t_bp_r1 len t_bp_r1
+    else
+      if eq wi 2
+        omx_json_str_fd fd t_bp_r2 len t_bp_r2
+      else
+        omx_json_str_fd fd t_bp_r3 len t_bp_r3
+      end
+    end
+  end
+end
+
+fn bp_append_cid_path p ulong ci ulong to ulong
+  q = p
+  if eq ci 0
+    for i ulong len t_bp_c0
+      put g_bp_path q get t_bp_c0 i
+      q = add q 1
+    end
+  else
+    if eq ci 1
+      for i ulong len t_bp_c1
+        put g_bp_path q get t_bp_c1 i
+        q = add q 1
+      end
+    else
+      if eq ci 2
+        for i ulong len t_bp_c2
+          put g_bp_path q get t_bp_c2 i
+          q = add q 1
+        end
+      else
+        if eq ci 3
+          for i ulong len t_bp_c3
+            put g_bp_path q get t_bp_c3 i
+            q = add q 1
+          end
+        else
+          for i ulong len t_bp_c4
+            put g_bp_path q get t_bp_c4 i
+            q = add q 1
+          end
+        end
+      end
+    end
+  end
+  ret q
+end
+
 fn bp_build_rpath ci ulong wi ulong to ulong
   olen = get g_bp_cfg 4
   p = ulong 0
@@ -430,9 +1118,8 @@ fn bp_build_rpath ci ulong wi ulong to ulong
   end
   put g_bp_path p uchar 47
   p = add p 1
-  put g_bp_path p uchar 99
-  p = add p 1
-  put g_bp_path p uchar add 48 ci
+  p = bp_append_cid_path p ci
+  put g_bp_path p uchar 95
   p = add p 1
   put g_bp_path p uchar 95
   p = add p 1
@@ -453,16 +1140,43 @@ fn bp_build_rpath ci ulong wi ulong to ulong
   ret p
 end
 
-fn bp_write_receipt ci ulong wi ulong m ulong n ulong samples ulong st view f64 4 to void
-  plen = bp_build_rpath ci wi
-  fd = fopen g_bp_path 0 plen 577 420
-  if lt fd 0
-    ret
-  end
-  fdi = int fd
+fn bp_write_cell fdi int si ulong m ulong n ulong to void
+  _w = omx_write_all fdi t_bp_jc1 0 len t_bp_jc1
+  omx_putf_fd fdi get g_bp_spval si 2
+  _w = omx_write_all fdi t_bp_jc2 0 len t_bp_jc2
+  omx_putu_fd fdi get g_bp_creps si
+  _w = omx_write_all fdi t_bp_jc2b 0 len t_bp_jc2b
+  omx_putu_fd fdi get g_bp_csk si
+  _w = omx_write_all fdi t_bp_jc3 0 len t_bp_jc3
+  omx_putu_fd fdi get g_bp_cchk si
+  _w = omx_write_all fdi t_bp_jc4 0 len t_bp_jc4
+  omx_putu_fd fdi get g_bp_cfail si
+  _w = omx_write_all fdi t_bp_jc5 0 len t_bp_jc5
+  omx_putf_fd fdi get g_bp_cmin si 3
+  _w = omx_write_all fdi t_bp_jc6 0 len t_bp_jc6
+  omx_putf_fd fdi get g_bp_cmed si 3
+  _w = omx_write_all fdi t_bp_jc7 0 len t_bp_jc7
+  omx_putf_fd fdi get g_bp_cmad si 3
+  _w = omx_write_all fdi t_bp_jc8 0 len t_bp_jc8
+  omx_putf_fd fdi get g_bp_cpmed si 1
+  _w = omx_write_all fdi t_bp_jc9 0 len t_bp_jc9
+  omx_putf_fd fdi div get g_bp_cpmed si f64 mul m n 4
+  _w = omx_write_all fdi t_bp_jc10 0 len t_bp_jc10
+end
+
+fn bp_write_hdr fdi int ci ulong wi ulong samples ulong to void
   _w = omx_write_all fdi t_bp_js1 0 len t_bp_js1
-  _w = write fdi g_omx_shhex 0 64
+  put g_omx_pbuf 0 uchar 34
+  _w = write fdi g_omx_pbuf 0 1
+  _w = write fdi g_bp_spec 0 get g_bp_cfg 3
+  _w = write fdi g_omx_pbuf 0 1
+  _w = omx_write_all fdi t_bp_js1b 0 len t_bp_js1b
+  _w = write fdi g_bp_contract 0 64
   _w = omx_write_all fdi t_bp_js2 0 len t_bp_js2
+  _w = write fdi g_bp_runid 0 get g_bp_runid_len 0
+  _w = omx_write_all fdi t_bp_js2b 0 len t_bp_js2b
+  _w = write fdi g_bp_commit 0 get g_bp_cfg 11
+  _w = omx_write_all fdi t_bp_js2c 0 len t_bp_js2c
   if eq get g_bp_cfg 1 1
     _w = omx_write_all fdi t_bp_true 0 len t_bp_true
   else
@@ -477,6 +1191,18 @@ fn bp_write_receipt ci ulong wi ulong m ulong n ulong samples ulong st view f64 
     _w = omx_write_all fdi t_bp_false 0 len t_bp_false
   end
   _w = omx_write_all fdi t_bp_js5 0 len t_bp_js5
+  if eq get g_bp_cfg 9 1
+    omx_putu_fd fdi get g_bp_cfg 10
+  else
+    _w = omx_write_all fdi t_bp_null 0 len t_bp_null
+  end
+  _w = omx_write_all fdi t_bp_js5b 0 len t_bp_js5b
+  omx_putu_fd fdi get g_bp_cfg 8
+  _w = omx_write_all fdi t_bp_js5c 0 len t_bp_js5c
+  omx_putu_fd fdi get g_bp_nman 0
+  _w = omx_write_all fdi t_bp_js5d 0 len t_bp_js5d
+  omx_puti_fd fdi get g_bp_mtext 0
+  _w = omx_write_all fdi t_bp_js5e 0 len t_bp_js5e
   bp_write_cid fdi ci
   _w = omx_write_all fdi t_bp_js6 0 len t_bp_js6
   if or eq ci 2 eq ci 4
@@ -497,31 +1223,46 @@ fn bp_write_receipt ci ulong wi ulong m ulong n ulong samples ulong st view f64 
     omx_putu_fd fdi 0
   end
   _w = omx_write_all fdi t_bp_js9 0 len t_bp_js9
-  if eq wi 0
-    _w = omx_write_all fdi t_bp_s1id 0 len t_bp_s1id
-  else
-    _w = omx_write_all fdi t_bp_s2id 0 len t_bp_s2id
-  end
+  bp_write_wid fdi wi
   _w = omx_write_all fdi t_bp_js10 0 len t_bp_js10
-  omx_putu_fd fdi m
+  omx_putu_fd fdi get g_bp_wm wi
   _w = omx_write_all fdi t_bp_js11 0 len t_bp_js11
-  omx_putu_fd fdi n
+  omx_putu_fd fdi get g_bp_wn wi
+  _w = omx_write_all fdi t_bp_js11b 0 len t_bp_js11b
+  omx_putu_fd fdi get g_bp_wnx wi
   _w = omx_write_all fdi t_bp_js12 0 len t_bp_js12
-  omx_putf_fd fdi get st 0 3
-  _w = omx_write_all fdi t_bp_js13 0 len t_bp_js13
-  omx_putf_fd fdi get st 1 3
-  _w = omx_write_all fdi t_bp_js14 0 len t_bp_js14
-  omx_putf_fd fdi get st 2 3
-  _w = omx_write_all fdi t_bp_js15 0 len t_bp_js15
-  omx_putf_fd fdi get st 3 1
-  _w = omx_write_all fdi t_bp_js16 0 len t_bp_js16
-  omx_putf_fd fdi div get st 3 f64 mul m n 4
-  _w = omx_write_all fdi t_bp_js17 0 len t_bp_js17
+  bp_write_regime fdi wi
+  _w = omx_write_all fdi t_bp_js12b 0 len t_bp_js12b
+end
+
+fn bp_write_receipt ci ulong wi ulong samples ulong to void
+  plen = bp_build_rpath ci wi
+  fd = fopen g_bp_path 0 plen 577 420
+  if lt fd 0
+    ret
+  end
+  fdi = int fd
+  bp_write_hdr fdi ci wi samples
+  first = ulong 1
+  m = get g_bp_wm wi
+  n = get g_bp_wn wi
+  for si ulong BP_NSP
+    if eq get g_bp_cpres si 1
+      if eq first 0
+        _w = omx_write_all fdi t_bp_jcn 0 len t_bp_jcn
+      end
+      first = 0
+      bp_write_cell fdi si m n
+    end
+  end
+  _w = omx_write_all fdi t_bp_jend 0 len t_bp_jend
   _c = fclose fdi
 end
 
-fn bp_bench_one ci ulong wi ulong m ulong n ulong samples ulong to void
-  bp_setup_shape m n 1
+fn bp_measure_pack ci ulong wi ulong si ulong to void
+  m = get g_bp_wm wi
+  n = get g_bp_wn wi
+  bp_setup_shape m n get g_bp_wnx wi get g_bp_spval si
   for r ulong 5
     omx_plan_zero
     t0 = monons
@@ -530,38 +1271,70 @@ fn bp_bench_one ci ulong wi ulong m ulong n ulong samples ulong to void
     put g_omx_stat r f64 sub t1 t0
   end
   omx_gsort 5
-  pmed = omx_gmedian 5
+  put g_bp_cpmed si omx_gmedian 5
+end
+
+fn bp_calibrate_reps ci ulong si ulong to ulong
+  reps = ulong 1
+  for cal ulong 16
+    t0 = monons
+    ok = bp_sample ci reps 0
+    t1 = monons
+    put g_bp_cchk si add get g_bp_cchk si 1
+    if eq ok 0
+      put g_bp_cfail si add get g_bp_cfail si 1
+    end
+    dt = sub t1 t0
+    if ge dt 1000000
+      ret reps
+    end
+    if ge reps 16384
+      ret reps
+    end
+    reps = mul reps 2
+  end
+  ret reps
+end
+
+fn bp_measure_cell ci ulong wi ulong si ulong samples ulong to void
+  put g_bp_cchk si 0
+  put g_bp_cfail si 0
+  bp_measure_pack ci wi si
+  reps = bp_calibrate_reps ci si
+  sk = ulong 0
   for s ulong samples bound 1024
     t0 = monons
-    _ok = bp_sample ci 8 0
+    ok = bp_sample ci reps 0
     t1 = monons
-    put g_omx_stat s div f64 sub t1 t0 8.0f64
+    put g_bp_cchk si add get g_bp_cchk si 1
+    if eq ok 0
+      put g_bp_cfail si add get g_bp_cfail si 1
+    end
+    dt = sub t1 t0
+    if lt dt 1000000
+      sk = add sk 1
+    end
+    put g_omx_stat s div f64 dt f64 reps
   end
   omx_plan_zero
   omx_gsort samples
-  st = new f64 4 0.0f64
-  put st 0 get g_omx_stat 0
+  put g_bp_cmin si get g_omx_stat 0
   lmed = omx_gmedian samples
-  put st 1 lmed
-  put st 2 omx_gmad samples lmed
-  put st 3 pmed
-  bp_write_receipt ci wi m n samples st
+  put g_bp_cmed si lmed
+  put g_bp_cmad si omx_gmad samples lmed
+  put g_bp_csk si sk
+  put g_bp_creps si reps
+  put g_bp_cpres si 1
 end
 
-fn main to int
-  put g_bp_cfg 0 0
-  put g_bp_cfg 1 0
-  put g_bp_cfg 2 21
-  put g_bp_cfg 3 0
-  put g_bp_cfg 4 0
-  put g_bp_cfg 5 0x504f4c5942454e43
-
+fn bp_parse_args to int
   argc = ulong argcnt
   i = ulong 1
+  ok = new ulong 1 0
   while lt i argc bound 64
     alen = argread i g_bp_arg 0 512
     if le alen 0
-      break
+      ret -1
     end
     au = ulong alen
     if bp_arg_eq au t_bp_st_flag
@@ -572,33 +1345,94 @@ fn main to int
       else
         if bp_arg_eq au t_bp_sp_flag
           i = add i 1
-          if lt i argc
-            sl = argread i g_omx_path 0 512
-            if gt sl 0
-              put g_bp_cfg 3 ulong sl
-            end
+          if ge i argc
+            ret -1
           end
+          sl = argread i g_bp_spec 0 512
+          if le sl 0
+            ret -1
+          end
+          put g_bp_cfg 3 ulong sl
         else
           if bp_arg_eq au t_bp_ou_flag
             i = add i 1
-            if lt i argc
-              ol = argread i g_bp_out 0 512
-              if gt ol 0
-                put g_bp_cfg 4 ulong ol
-              end
+            if ge i argc
+              ret -1
             end
+            ol = argread i g_bp_out 0 512
+            if le ol 0
+              ret -1
+            end
+            put g_bp_cfg 4 ulong ol
           else
             if bp_arg_eq au t_bp_sa_flag
               i = add i 1
-              if lt i argc
-                vl = argread i g_bp_arg 0 512
-                if gt vl 0
-                  put g_bp_cfg 2 bp_parse_arg_u ulong vl
-                end
+              if ge i argc
+                ret -1
               end
+              vl = argread i g_bp_arg 0 512
+              if le vl 0
+                ret -1
+              end
+              sv = bp_parse_arg_u ulong vl ok
+              if eq get ok 0 0
+                ret -1
+              end
+              put g_bp_cfg 2 sv
             else
-              if or bp_arg_eq au t_bp_ma_flag or bp_arg_eq au t_bp_sr_flag bp_arg_eq au t_bp_wl_flag
+              if bp_arg_eq au t_bp_ma_flag
                 i = add i 1
+                if ge i argc
+                  ret -1
+                end
+                ml = argread i g_bp_man_path 0 512
+                if le ml 0
+                  ret -1
+                end
+                put g_bp_cfg 6 ulong ml
+              else
+                if bp_arg_eq au t_bp_sr_flag
+                  i = add i 1
+                  if ge i argc
+                    ret -1
+                  end
+                  rl = argread i g_bp_arg 0 512
+                  if or le rl 0 ne bp_parse_sparsity_list ulong rl 0
+                    omx_eputs t_bp_ebad_sp
+                    ret -2
+                  end
+                else
+                  if bp_arg_eq au t_bp_wl_flag
+                    i = add i 1
+                    if ge i argc
+                      ret -1
+                    end
+                    wl = argread i g_bp_arg 0 512
+                    if or le wl 0 ne bp_parse_workloads_list ulong wl 0
+                      omx_eputs t_bp_ebad_wl
+                      ret -2
+                    end
+                  else
+                    if bp_arg_eq au t_bp_cp_flag
+                      i = add i 1
+                      if ge i argc
+                        ret -1
+                      end
+                      cl = argread i g_bp_arg 0 512
+                      if le cl 0
+                        ret -1
+                      end
+                      cv = bp_parse_arg_u ulong cl ok
+                      if eq get ok 0 0
+                        ret -1
+                      end
+                      put g_bp_cfg 7 1
+                      put g_bp_cfg 8 cv
+                    else
+                      ret -1
+                    end
+                  end
+                end
               end
             end
           end
@@ -607,7 +1441,19 @@ fn main to int
     end
     i = add i 1
   end
+  ret 0
+end
 
+fn main to int
+  bp_init
+  prc = bp_parse_args
+  if eq prc -1
+    omx_eputs t_bp_usage
+    ret 2
+  end
+  if lt prc 0
+    ret 2
+  end
   if eq get g_bp_cfg 0 1
     ret bp_selftest
   end
@@ -615,20 +1461,65 @@ fn main to int
     omx_eputs t_bp_usage
     ret 2
   end
-  if ne omx_contract_digest_gpath get g_bp_cfg 3 0
+  samples = get g_bp_cfg 2
+  if or lt samples 1 gt samples 1000
+    omx_eputs t_bp_ebad_sa
     ret 2
   end
+  if and lt samples 20 eq get g_bp_cfg 1 0
+    omx_eputs t_bp_ebad_sa
+    ret 2
+  end
+  sl = get g_bp_cfg 3
+  for i ulong sl bound 512
+    put g_omx_path i get g_bp_spec i
+  end
+  if ne omx_contract_digest_gpath sl 0
+    omx_eputs t_bp_ebad_arg
+    ret 2
+  end
+  for i ulong 64
+    put g_bp_contract i get g_omx_shhex i
+  end
+  if ne bp_load_manifest 0
+    omx_eputs t_bp_ebad_ma
+    ret 2
+  end
+  if ne bp_pin_cpu 0
+    omx_eputs t_bp_ebad_cpu
+    ret 2
+  end
+  bp_probe_git_dirty
+  bp_probe_git_commit
+  bp_build_runid
   _mk = makedir g_bp_out 0 get g_bp_cfg 4 493
-  samples = get g_bp_cfg 2
-  if gt samples 1024
-    samples = 1024
-  end
+
   for ci ulong BP_NC
-    bp_bench_one ci 0 1 4096 samples
-    bp_bench_one ci 1 256 1024 samples
+    for wi ulong BP_NW
+      if eq get g_bp_wsel wi 1
+        for si ulong BP_NSP
+          put g_bp_cpres si 0
+          if eq get g_bp_spsel si 1
+            bp_measure_cell ci wi si samples
+          end
+        end
+        bp_write_receipt ci wi samples
+      end
+    end
   end
+
   omx_puts t_bp_done
   _r = write 1 g_bp_out 0 get g_bp_cfg 4
-  omx_nl
+  omx_puts t_bp_dirty_s
+  if eq get g_bp_cfg 9 1
+    omx_putu get g_bp_cfg 10
+  else
+    omx_puts t_bp_null
+  end
+  omx_puts t_bp_cpu_s
+  omx_putu get g_bp_cfg 8
+  omx_puts t_bp_man_s
+  omx_putu get g_bp_nman 0
+  omx_puts t_bp_rp
   ret 0
 end

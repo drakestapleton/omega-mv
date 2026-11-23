@@ -3,42 +3,183 @@ note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
 note
 note tests/polyglot/polyglot_explain.om -- pure seeded OM-2 POLYGLOT-0 deterministic
 note receipt explainer (spec/polyglot-0.md section 9).
-note Reads ONLY the contract file (--spec) and receipt directory (--receipts),
-note sorts .json filenames in deterministic byte order, verifies contract digest,
-note and prints deterministic byte-identical explanation output.
+note Supports both:
+note   polyglot_explain --spec spec/polyglot-0.md --receipts DIR [--run RUN_ID]
+note   polyglot_explain --run <receipt.json | receipts_dir> [--spec spec/polyglot-0.md]
+note Implements the full JSON parser and selection/analysis logic from
+note polyglot_explain.c: contract verification, current-run resolution, 11-rule
+note eligibility filtering, lowest-median selection, runner-up margin vs
+note max(3 * max(MAD/median), 5% RUN_FLOOR) CHOSEN/TIE verdict, pack cost &
+note break-even calls, per-language summary, and rejection reasons.
+
+const PE_MAX_REC ulong 128
+const PE_MAX_CELLS ulong 4
 
 global g_pe_arg uchar 512
 global g_pe_spec uchar 512
 global g_pe_dir uchar 512
-global g_pe_run uchar 128
+global g_pe_run uchar 512
 global g_pe_contract uchar 64
-note g_pe_cfg: [0]=spec_len [1]=dir_len [2]=run_len [3]=nfiles [4]=nvalid [5]=nign [6]=nstale [7]=nsmoke
-global g_pe_cfg ulong 8
+note g_pe_cfg: [0]=spec_len [1]=dir_len [2]=run_len [3]=nfiles [4]=nrec [5]=nign
+note           [6]=nstale [7]=nsmoke [8]=nnotgate [9]=cur_valid [10]=nruns [11]=nfull
+global g_pe_cfg ulong 16
+global g_pe_cur uchar 128
+global g_pe_cur_l ulong 2
 
 global g_pe_dbuf uchar 65536
-note Up to 256 receipt filenames, 128 bytes each
 global g_pe_names uchar 32768
 global g_pe_nlens ulong 256
 global g_pe_order ulong 256
-global g_pe_path uchar 768
+
+note Parsed receipt records (up to 128)
+global g_pe_rid uchar 8192
+global g_pe_rid_l ulong 128
+global g_pe_lang uchar 4096
+global g_pe_lang_l ulong 128
+global g_pe_fam uchar 4096
+global g_pe_fam_l ulong 128
+global g_pe_runid uchar 16384
+global g_pe_runid_l ulong 128
+global g_pe_ct uchar 8192
+global g_pe_ct_l ulong 128
+global g_pe_wid uchar 1024
+global g_pe_wid_l ulong 128
+global g_pe_reg uchar 12288
+global g_pe_reg_l ulong 128
+note g_pe_rflags: bit0=weak bit1=derived bit2=tonly bit3=smoke bit4=gate_ok
+global g_pe_rflags ulong 128
+global g_pe_rdirty long 128
+global g_pe_rm ulong 128
+global g_pe_rn ulong 128
+global g_pe_rnc ulong 128
+
+note Parsed cells (rec * 4 + cell_idx, total 512)
+global g_pe_csp f64 512
+global g_pe_cmed f64 512
+global g_pe_cmad f64 512
+global g_pe_cmin f64 512
+global g_pe_cpmed f64 512
+global g_pe_cppw f64 512
+global g_pe_cchk ulong 512
+global g_pe_cfail ulong 512
+global g_pe_csk long 512
+global g_pe_cmeas ulong 512
+global g_pe_coklat ulong 512
+
+note Unique runs (up to 64) & unique workloads (up to 16)
+global g_pe_runs uchar 8192
+global g_pe_runs_l ulong 64
+global g_pe_wids uchar 128
+global g_pe_wids_l ulong 16
+global g_pe_nw ulong 2
+global g_pe_sps f64 8
+
+note Selection entries for current (workload, sparsity)
+global g_pe_erec ulong 128
+global g_pe_ecell ulong 128
+global g_pe_eelig ulong 128
+global g_pe_ewhy ulong 128
+global g_pe_eord ulong 128
+global g_pe_seen_l uchar 512
+global g_pe_seen_ll ulong 16
+
+note JSON scratch
+global g_pe_tmp uchar 128
 
 text t_pe_sp_flag "--spec"
 text t_pe_rc_flag "--receipts"
 text t_pe_rn_flag "--run"
-text t_pe_usage "usage: polyglot_explain --spec spec/polyglot-0.md --receipts DIR [--run RUN_ID]\n"
+text t_pe_def_spec "spec/polyglot-0.md"
+text t_pe_usage "usage: polyglot_explain --spec spec/polyglot-0.md --receipts DIR [--run RUN_ID] | --run PATH\n"
+text t_pe_err_spec "polyglot_explain: cannot read contract section 1\n"
+text t_pe_err_run "polyglot_explain: cannot read or parse --run target\n"
+text t_pe_err_dir "polyglot_explain: cannot open receipts directory\n"
 text t_pe_schema "OMEGA_POLYGLOT0_RECEIPT_V1"
-text t_pe_hdr "POLYGLOT-0 explanation (spec/polyglot-0.md section 9, pure OM-2)\ncontract section 1 sha256: "
+
+text t_pe_k_schema "schema"
+text t_pe_k_cand "candidate"
+text t_pe_k_wl "workload"
+text t_pe_k_run "run"
+text t_pe_k_ct "contract"
+text t_pe_k_cells "cells"
+text t_pe_k_id "id"
+text t_pe_k_lang "language"
+text t_pe_k_rep "representation"
+text t_pe_k_weak "weak_baseline"
+text t_pe_k_der "compiler_derived"
+text t_pe_k_tonly "toolchain_only"
+text t_pe_k_runid "run_id"
+text t_pe_k_smoke "smoke"
+text t_pe_k_gate "gate_eligible"
+text t_pe_k_dirty "tree_dirty_files"
+text t_pe_k_sha "sha256"
+text t_pe_k_reg "regime"
+text t_pe_k_m "m"
+text t_pe_k_n "n"
+text t_pe_k_sp "sparsity"
+text t_pe_k_meas "measured"
+text t_pe_k_cor "correctness"
+text t_pe_k_lat "latency_ns"
+text t_pe_k_pk "pack"
+text t_pe_k_chk "checks"
+text t_pe_k_fail "failures"
+text t_pe_k_med "median"
+text t_pe_k_mad "mad"
+text t_pe_k_min "min"
+text t_pe_k_sk "short_samples_kept"
+text t_pe_k_pmed "ns_median"
+text t_pe_k_ppw "ns_per_weight"
+
+text t_pe_hdr "POLYGLOT-0 explanation (spec/polyglot-0.md section 9)\ncontract section 1 sha256: "
 text t_pe_rec1 "\nreceipts: "
 text t_pe_rec2 " read, "
 text t_pe_rec3 " ignored (not OMEGA_POLYGLOT0_RECEIPT_V1), "
-text t_pe_rec4 " stale contract, "
-text t_pe_rec5 " smoke\n"
-text t_pe_file "  receipt: "
-text t_pe_ok " [contract=MATCH"
-text t_pe_stale " [contract=STALE"
-text t_pe_smk " smoke=true]\n"
-text t_pe_nsmk " smoke=false]\n"
-text t_pe_ksmoke "\"smoke\": true"
+text t_pe_rec4 " with a stale contract digest, "
+text t_pe_rec5 " smoke, "
+text t_pe_rec6 " not gate-eligible\n"
+text t_pe_run_l "run: "
+text t_pe_cur_l "current run: "
+text t_pe_none "none"
+text t_pe_pol "policy: eligible = contract digest matches, not smoke, from the current run, gate-eligible (N >= 20),\n        built from a clean tree, measured, checks > 0 and 0 failures, 0 < min <= median, no kept\n        sample under 1 ms, not toolchain-only, not a weak baseline; select lowest median ns/call\n        (pack once, amortized); CHOSEN if the runner-up is slower by more than the band\n        max(3 x max(MAD/median) of the two, 5% run-to-run floor), else TIE.\n"
+text t_pe_nsmk "NOTE: smoke or N<20 receipts present: they are never selected.\n"
+text t_pe_nmult "NOTE: multiple non-smoke runs present and no --run given: nothing is selected (pass --run RUN_ID).\n"
+text t_pe_nnone "NOTE: no non-smoke run present: nothing is selected.\n"
+text t_pe_sp_h "  sparsity "
+text t_pe_col ":\n"
+text t_pe_noel "    no eligible candidate\n"
+text t_pe_sel "    SELECT    "
+text t_pe_rup "    runner-up "
+text t_pe_rup0 "    runner-up none eligible -> CHOSEN by default\n"
+text t_pe_rej "    rejected  "
+text t_pe_med " median "
+text t_pe_nsc " ns/call  MAD "
+text t_pe_min "  min "
+text t_pe_mrg " ns/call  margin "
+text t_pe_bnd "%  band "
+text t_pe_ch "%  -> CHOSEN\n"
+text t_pe_tie "%  -> TIE (within noise)\n"
+text t_pe_pk1 "    pack      "
+text t_pe_pk2 " ns/weight ("
+text t_pe_pk3 " ns); cheapest to pack "
+text t_pe_pk4 " ns/weight; break-even "
+text t_pe_be0 "0 calls\n"
+text t_pe_benev "never\n"
+text t_pe_bec " calls\n"
+text t_pe_byl "    by language:"
+text t_pe_der " (compiler-derived)"
+text t_pe_slower "slower: "
+text t_pe_pct_vs "% median vs selected\n"
+text t_pe_w1 "stale receipt: contract digest differs"
+text t_pe_w2 "smoke receipt (never gate evidence)"
+text t_pe_w3 "not from the current run"
+text t_pe_w4 "not gate-eligible (N < 20 samples)"
+text t_pe_w5 "built from a dirty tree"
+text t_pe_w6 "not measured"
+text t_pe_w7 "not bit-exact (correctness failures)"
+text t_pe_w8 "inconsistent latency (min/median)"
+text t_pe_w9 "kept samples shorter than 1 ms (or missing record)"
+text t_pe_w10 "toolchain-only (own-encoder rule, spec section 4)"
+text t_pe_w11 "labelled weak baseline (reference only)"
 
 fn pe_arg_eq alen ulong b view uchar * to bool
   if ne alen len b
@@ -51,6 +192,514 @@ fn pe_arg_eq alen ulong b view uchar * to bool
   end
   ret true
 end
+
+note ---- Minimal structural JSON scanner over g_omx_fbuf[0..flen) ----
+
+fn jp_ws pos ulong flen ulong to ulong
+  p = pos
+  while lt p flen bound 262144
+    c = get g_omx_fbuf p
+    if or eq c 32 or eq c 10 or eq c 13 eq c 9
+      p = add p 1
+    else
+      break
+    end
+  end
+  ret p
+end
+
+fn jp_skip_str pos ulong flen ulong to ulong
+  p = add pos 1
+  while lt p flen bound 262144
+    c = get g_omx_fbuf p
+    p = add p 1
+    if eq c 92
+      if lt p flen
+        p = add p 1
+      end
+    else
+      if eq c 34
+        ret p
+      end
+    end
+  end
+  ret flen
+end
+
+fn jp_is_delim ch uchar to bool
+  if eq ch 44
+    ret true
+  end
+  if eq ch 125
+    ret true
+  end
+  if eq ch 93
+    ret true
+  end
+  if eq ch 32
+    ret true
+  end
+  if eq ch 10
+    ret true
+  end
+  if eq ch 13
+    ret true
+  end
+  ret eq ch 9
+end
+
+fn jp_skip_val pos ulong flen ulong to ulong
+  p = jp_ws pos flen
+  if ge p flen
+    ret flen
+  end
+  c = get g_omx_fbuf p
+  if eq c 34
+    ret jp_skip_str p flen
+  end
+  if or eq c 123 eq c 91
+    depth = ulong 0
+    while lt p flen bound 262144
+      ch = get g_omx_fbuf p
+      if eq ch 34
+        p = jp_skip_str p flen
+        continue
+      end
+      if or eq ch 123 eq ch 91
+        depth = add depth 1
+      else
+        if or eq ch 125 eq ch 93
+          if eq depth 0
+            ret p
+          end
+          depth = sub depth 1
+          if eq depth 0
+            ret add p 1
+          end
+        end
+      end
+      p = add p 1
+    end
+    ret flen
+  end
+  while lt p flen bound 262144
+    if jp_is_delim get g_omx_fbuf p
+      ret p
+    end
+    p = add p 1
+  end
+  ret flen
+end
+
+fn jp_str_eq pos ulong flen ulong pat view uchar * to bool
+  if ge pos flen
+    ret false
+  end
+  if ne get g_omx_fbuf pos 34
+    ret false
+  end
+  p = add pos 1
+  plen = len pat
+  for i ulong plen bound 64
+    if ge p flen
+      ret false
+    end
+    if ne get g_omx_fbuf p get pat i
+      ret false
+    end
+    p = add p 1
+  end
+  if ge p flen
+    ret false
+  end
+  ret eq get g_omx_fbuf p 34
+end
+
+note Find top-level key inside JSON object starting at obj_pos ('{').
+note Returns offset of value (> 0) or 0 if not found.
+fn jp_find_key obj_pos ulong flen ulong key view uchar * to ulong
+  p = jp_ws obj_pos flen
+  if ge p flen
+    ret 0
+  end
+  if ne get g_omx_fbuf p 123
+    ret 0
+  end
+  p = jp_ws add p 1 flen
+  while lt p flen bound 65536
+    if eq get g_omx_fbuf p 125
+      ret 0
+    end
+    if ne get g_omx_fbuf p 34
+      ret 0
+    end
+    hit = jp_str_eq p flen key
+    p = jp_skip_str p flen
+    p = jp_ws p flen
+    if ge p flen
+      ret 0
+    end
+    if ne get g_omx_fbuf p 58
+      ret 0
+    end
+    vpos = jp_ws add p 1 flen
+    if hit
+      ret vpos
+    end
+    p = jp_skip_val vpos flen
+    p = jp_ws p flen
+    if ge p flen
+      ret 0
+    end
+    if eq get g_omx_fbuf p 44
+      p = jp_ws add p 1 flen
+    else
+      ret 0
+    end
+  end
+  ret 0
+end
+
+note Read JSON string at vpos into g_pe_tmp[0..cap), returning length (or 0).
+fn jp_read_tmp vpos ulong flen ulong cap ulong to ulong
+  if or eq vpos 0 ge vpos flen
+    ret 0
+  end
+  if ne get g_omx_fbuf vpos 34
+    ret 0
+  end
+  p = add vpos 1
+  n = ulong 0
+  while lt p flen bound 2048
+    c = get g_omx_fbuf p
+    p = add p 1
+    if eq c 34
+      ret n
+    end
+    if eq c 92
+      if lt p flen
+        d = get g_omx_fbuf p
+        p = add p 1
+        if eq d 110
+          c = uchar 10
+        else
+          if eq d 116
+            c = uchar 9
+          else
+            c = d
+          end
+        end
+      end
+    end
+    if lt n cap
+      put g_pe_tmp n c
+      n = add n 1
+    end
+  end
+  ret n
+end
+
+fn jp_read_bool vpos ulong flen ulong to long
+  if or eq vpos 0 ge vpos flen
+    ret -1
+  end
+  c = get g_omx_fbuf vpos
+  if eq c 116
+    ret 1
+  end
+  if eq c 102
+    ret 0
+  end
+  ret -1
+end
+
+fn jp_read_f64 vpos ulong flen ulong ok edit ulong 1 to f64
+  put ok 0 0
+  if or eq vpos 0 ge vpos flen
+    ret 0.0f64
+  end
+  p = vpos
+  negv = ulong 0
+  if eq get g_omx_fbuf p 45
+    negv = 1
+    p = add p 1
+  end
+  if ge p flen
+    ret 0.0f64
+  end
+  c0 = get g_omx_fbuf p
+  if or lt c0 48 gt c0 57
+    ret 0.0f64
+  end
+  val = f64 0.0f64
+  while lt p flen bound 64
+    c = get g_omx_fbuf p
+    if or lt c 48 gt c 57
+      break
+    end
+    val = add mul val 10.0f64 f64 ulong sub c 48
+    p = add p 1
+  end
+  if lt p flen
+    if eq get g_omx_fbuf p 46
+      p = add p 1
+      scale = f64 0.1f64
+      while lt p flen bound 64
+        c = get g_omx_fbuf p
+        if or lt c 48 gt c 57
+          break
+        end
+        val = add val mul f64 ulong sub c 48 scale
+        scale = mul scale 0.1f64
+        p = add p 1
+      end
+    end
+  end
+  if lt p flen
+    ec = get g_omx_fbuf p
+    if or eq ec 101 eq ec 69
+      p = add p 1
+      eneg = ulong 0
+      if lt p flen
+        sc = get g_omx_fbuf p
+        if eq sc 45
+          eneg = 1
+          p = add p 1
+        else
+          if eq sc 43
+            p = add p 1
+          end
+        end
+      end
+      ev = ulong 0
+      while lt p flen bound 16
+        c = get g_omx_fbuf p
+        if or lt c 48 gt c 57
+          break
+        end
+        ev = add mul ev 10 ulong sub c 48
+        p = add p 1
+      end
+      for ei ulong ev bound 64
+        if eq eneg 1
+          val = div val 10.0f64
+        else
+          val = mul val 10.0f64
+        end
+      end
+    end
+  end
+  if eq negv 1
+    val = sub 0.0f64 val
+  end
+  put ok 0 1
+  ret val
+end
+
+note ---- Receipt parsing into global arrays ----
+
+fn pe_copy_tmp_rid r ulong n ulong to void
+  b = mul r 64
+  for i ulong n bound 64
+    put g_pe_rid add b i get g_pe_tmp i
+  end
+  put g_pe_rid_l r n
+end
+
+fn pe_copy_tmp_lang r ulong n ulong to void
+  b = mul r 32
+  for i ulong n bound 32
+    put g_pe_lang add b i get g_pe_tmp i
+  end
+  put g_pe_lang_l r n
+end
+
+fn pe_copy_tmp_fam r ulong n ulong to void
+  b = mul r 32
+  for i ulong n bound 32
+    put g_pe_fam add b i get g_pe_tmp i
+  end
+  put g_pe_fam_l r n
+end
+
+fn pe_copy_tmp_runid r ulong n ulong to void
+  b = mul r 128
+  for i ulong n bound 128
+    put g_pe_runid add b i get g_pe_tmp i
+  end
+  put g_pe_runid_l r n
+end
+
+fn pe_copy_tmp_ct r ulong n ulong to void
+  b = mul r 64
+  for i ulong n bound 64
+    put g_pe_ct add b i get g_pe_tmp i
+  end
+  put g_pe_ct_l r n
+end
+
+fn pe_copy_tmp_wid r ulong n ulong to void
+  b = mul r 8
+  for i ulong n bound 8
+    put g_pe_wid add b i get g_pe_tmp i
+  end
+  put g_pe_wid_l r n
+end
+
+fn pe_copy_tmp_reg r ulong n ulong to void
+  b = mul r 96
+  for i ulong n bound 96
+    put g_pe_reg add b i get g_pe_tmp i
+  end
+  put g_pe_reg_l r n
+end
+
+fn pe_parse_cell_lat idx ulong cpos ulong flen ulong to void
+  ok = new ulong 1 0
+  lat = jp_find_key cpos flen t_pe_k_lat
+  med = jp_read_f64 jp_find_key lat flen t_pe_k_med flen ok
+  okm = get ok 0
+  mad = jp_read_f64 jp_find_key lat flen t_pe_k_mad flen ok
+  mnv = jp_read_f64 jp_find_key lat flen t_pe_k_min flen ok
+  okn = get ok 0
+  put g_pe_cmed idx med
+  put g_pe_cmad idx mad
+  put g_pe_cmin idx mnv
+  if and eq okm 1 eq okn 1
+    put g_pe_coklat idx 1
+  else
+    put g_pe_coklat idx 0
+  end
+  pk = jp_find_key cpos flen t_pe_k_pk
+  put g_pe_cpmed idx jp_read_f64 jp_find_key pk flen t_pe_k_pmed flen ok
+  put g_pe_cppw idx jp_read_f64 jp_find_key pk flen t_pe_k_ppw flen ok
+end
+
+fn pe_parse_cell r ulong ci ulong cpos ulong flen ulong to void
+  idx = add mul r 4 ci
+  ok = new ulong 1 0
+  v = jp_read_f64 jp_find_key cpos flen t_pe_k_sp flen ok
+  if eq get ok 0 1
+    put g_pe_csp idx v
+  else
+    put g_pe_csp idx -1.0f64
+  end
+  mb = jp_read_bool jp_find_key cpos flen t_pe_k_meas flen
+  if eq mb 1
+    put g_pe_cmeas idx 1
+  else
+    put g_pe_cmeas idx 0
+  end
+  skv = jp_read_f64 jp_find_key cpos flen t_pe_k_sk flen ok
+  if eq get ok 0 1
+    put g_pe_csk idx long skv
+  else
+    put g_pe_csk idx -1
+  end
+  cor = jp_find_key cpos flen t_pe_k_cor
+  chk = jp_read_f64 jp_find_key cor flen t_pe_k_chk flen ok
+  if eq get ok 0 1
+    put g_pe_cchk idx ulong chk
+  else
+    put g_pe_cchk idx 0
+  end
+  fls = jp_read_f64 jp_find_key cor flen t_pe_k_fail flen ok
+  if eq get ok 0 1
+    put g_pe_cfail idx ulong fls
+  else
+    put g_pe_cfail idx 0
+  end
+  pe_parse_cell_lat idx cpos flen
+end
+
+fn pe_parse_rec_cand r ulong cand ulong flen ulong to void
+  pe_copy_tmp_rid r jp_read_tmp jp_find_key cand flen t_pe_k_id flen 63
+  pe_copy_tmp_lang r jp_read_tmp jp_find_key cand flen t_pe_k_lang flen 31
+  pe_copy_tmp_fam r jp_read_tmp jp_find_key cand flen t_pe_k_rep flen 31
+  ok = new ulong 1 0
+  fl = get g_pe_rflags r
+  if gt jp_read_f64 jp_find_key cand flen t_pe_k_weak flen ok 0.5f64
+    fl = or fl 1
+  end
+  if gt jp_read_f64 jp_find_key cand flen t_pe_k_der flen ok 0.5f64
+    fl = or fl 2
+  end
+  if gt jp_read_f64 jp_find_key cand flen t_pe_k_tonly flen ok 0.5f64
+    fl = or fl 4
+  end
+  put g_pe_rflags r fl
+end
+
+fn pe_parse_rec_run r ulong ro ulong flen ulong to void
+  pe_copy_tmp_runid r jp_read_tmp jp_find_key ro flen t_pe_k_runid flen 127
+  fl = get g_pe_rflags r
+  if eq jp_read_bool jp_find_key ro flen t_pe_k_smoke flen 1
+    fl = or fl 8
+  end
+  if eq jp_read_bool jp_find_key ro flen t_pe_k_gate flen 1
+    fl = or fl 16
+  end
+  put g_pe_rflags r fl
+  ok = new ulong 1 0
+  dv = jp_read_f64 jp_find_key ro flen t_pe_k_dirty flen ok
+  if eq get ok 0 1
+    put g_pe_rdirty r long dv
+  else
+    put g_pe_rdirty r -1
+  end
+end
+
+fn pe_parse_fbuf_rec flen ulong to int
+  r = get g_pe_cfg 4
+  if ge r PE_MAX_REC
+    ret -1
+  end
+  sv = jp_find_key 0 flen t_pe_k_schema
+  if not jp_str_eq sv flen t_pe_schema
+    ret -1
+  end
+  put g_pe_rflags r 0
+  put g_pe_rdirty r -1
+  put g_pe_rnc r 0
+  pe_parse_rec_cand r jp_find_key 0 flen t_pe_k_cand flen
+  pe_parse_rec_run r jp_find_key 0 flen t_pe_k_run flen
+  ct = jp_find_key 0 flen t_pe_k_ct
+  pe_copy_tmp_ct r jp_read_tmp jp_find_key ct flen t_pe_k_sha flen 64
+  wl = jp_find_key 0 flen t_pe_k_wl
+  pe_copy_tmp_wid r jp_read_tmp jp_find_key wl flen t_pe_k_id flen 7
+  pe_copy_tmp_reg r jp_read_tmp jp_find_key wl flen t_pe_k_reg flen 95
+  ok = new ulong 1 0
+  put g_pe_rm r ulong jp_read_f64 jp_find_key wl flen t_pe_k_m flen ok
+  put g_pe_rn r ulong jp_read_f64 jp_find_key wl flen t_pe_k_n flen ok
+  ca = jp_find_key 0 flen t_pe_k_cells
+  nc = ulong 0
+  if and gt ca 0 lt ca flen
+    if eq get g_omx_fbuf ca 91
+      p = jp_ws add ca 1 flen
+      while and lt p flen lt nc PE_MAX_CELLS bound 16
+        if eq get g_omx_fbuf p 93
+          break
+        end
+        pe_parse_cell r nc p flen
+        nc = add nc 1
+        p = jp_skip_val p flen
+        p = jp_ws p flen
+        if lt p flen
+          if eq get g_omx_fbuf p 44
+            p = jp_ws add p 1 flen
+          else
+            break
+          end
+        end
+      end
+    end
+  end
+  put g_pe_rnc r nc
+  put g_pe_cfg 4 add r 1
+  ret 0
+end
+
+note ---- Directory scanning & sorting ----
 
 fn pe_dbuf_ends_json off ulong n ulong to bool
   if le n 5
@@ -73,47 +722,6 @@ fn pe_dbuf_ends_json off ulong n ulong to bool
     ret false
   end
   ret true
-end
-
-fn pe_fbuf_contains pat view uchar * flen ulong to bool
-  plen = len pat
-  if gt plen flen
-    ret false
-  end
-  lim = add sub flen plen 1
-  for i ulong lim bound 262144
-    ok = ulong 1
-    for j ulong plen bound 128
-      if ne get g_omx_fbuf add i j get pat j
-        ok = 0
-        break
-      end
-    end
-    if eq ok 1
-      ret true
-    end
-  end
-  ret false
-end
-
-fn pe_fbuf_contains_contract flen ulong to bool
-  if lt flen 64
-    ret false
-  end
-  lim = add sub flen 64 1
-  for i ulong lim bound 262144
-    ok = ulong 1
-    for j ulong 64
-      if ne get g_omx_fbuf add i j get g_pe_contract j
-        ok = 0
-        break
-      end
-    end
-    if eq ok 1
-      ret true
-    end
-  end
-  ret false
 end
 
 fn pe_cmp_names ia ulong ib ulong to long
@@ -202,24 +810,7 @@ fn pe_scan_buf nu ulong to void
   end
 end
 
-fn pe_scan_dir to int
-  fd = fopen g_pe_dir 0 get g_pe_cfg 1 0 0
-  if lt fd 0
-    ret -1
-  end
-  fdi = int fd
-  while true bound 1024
-    nread = getdnts fdi g_pe_dbuf 0 65536
-    if le nread 0
-      break
-    end
-    pe_scan_buf ulong nread
-  end
-  _c = fclose fdi
-  ret 0
-end
-
-fn pe_build_path idx ulong to ulong
+fn pe_load_one_idx idx ulong to void
   dlen = get g_pe_cfg 1
   p = ulong 0
   for i ulong dlen bound 512
@@ -231,49 +822,764 @@ fn pe_build_path idx ulong to ulong
   nlen = get g_pe_nlens idx
   base = mul idx 128
   for i ulong nlen bound 128
-    put g_omx_path p get g_pe_names add base i
+    ch = get g_pe_names add base i
+    put g_omx_path p ch
     p = add p 1
   end
-  ret p
-end
-
-fn pe_process_one idx ulong to void
-  plen = pe_build_path idx
-  flen = omx_read_gpath plen
+  flen = omx_read_gpath p
   if lt flen 0
     put g_pe_cfg 5 add get g_pe_cfg 5 1
     ret
   end
-  fu = ulong flen
-  if not pe_fbuf_contains t_pe_schema fu
+  if ne pe_parse_fbuf_rec ulong flen 0
     put g_pe_cfg 5 add get g_pe_cfg 5 1
+  end
+end
+
+fn pe_load_dir to int
+  fd = fopen g_pe_dir 0 get g_pe_cfg 1 0 0
+  if lt fd 0
+    ret -1
+  end
+  fdi = int fd
+  nread = getdnts fdi g_pe_dbuf 0 65536
+  if lt nread 0
+    _c = fclose fdi
+    ret -2
+  end
+  while gt nread 0 bound 1024
+    pe_scan_buf ulong nread
+    nread = getdnts fdi g_pe_dbuf 0 65536
+  end
+  _c = fclose fdi
+  nf = get g_pe_cfg 3
+  pe_sort_names nf
+  for k ulong nf bound 256
+    pe_load_one_idx get g_pe_order k
+  end
+  ret 0
+end
+
+note ---- Comparisons & Selection Engine ----
+
+fn pe_ct_matches r ulong to bool
+  if ne get g_pe_ct_l r 64
+    ret false
+  end
+  b = mul r 64
+  for i ulong 64
+    if ne get g_pe_ct add b i get g_pe_contract i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pe_run_eq_cur r ulong to bool
+  if eq get g_pe_cfg 9 0
+    ret false
+  end
+  l = get g_pe_runid_l r
+  if ne l get g_pe_cur_l 0
+    ret false
+  end
+  b = mul r 128
+  for i ulong l bound 128
+    if ne get g_pe_runid add b i get g_pe_cur i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pe_run_eq_slot r ulong slot ulong to bool
+  l = get g_pe_runid_l r
+  if ne l get g_pe_runs_l slot
+    ret false
+  end
+  br = mul r 128
+  bs = mul slot 128
+  for i ulong l bound 128
+    if ne get g_pe_runid add br i get g_pe_runs add bs i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pe_wid_eq_slot r ulong slot ulong to bool
+  l = get g_pe_wid_l r
+  if ne l get g_pe_wids_l slot
+    ret false
+  end
+  br = mul r 8
+  bs = mul slot 8
+  for i ulong l bound 8
+    if ne get g_pe_wid add br i get g_pe_wids add bs i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pe_cmp_rid ra ulong rb ulong to long
+  la = get g_pe_rid_l ra
+  lb = get g_pe_rid_l rb
+  mn = la
+  if lt lb mn
+    mn = lb
+  end
+  ba = mul ra 64
+  bb = mul rb 64
+  for i ulong mn bound 64
+    ca = ulong get g_pe_rid add ba i
+    cb = ulong get g_pe_rid add bb i
+    if lt ca cb
+      ret -1
+    end
+    if gt ca cb
+      ret 1
+    end
+  end
+  if lt la lb
+    ret -1
+  end
+  if gt la lb
+    ret 1
+  end
+  ret 0
+end
+
+fn pe_cmp_wslot sa ulong sb ulong to long
+  la = get g_pe_wids_l sa
+  lb = get g_pe_wids_l sb
+  mn = la
+  if lt lb mn
+    mn = lb
+  end
+  ba = mul sa 8
+  bb = mul sb 8
+  for i ulong mn bound 8
+    ca = ulong get g_pe_wids add ba i
+    cb = ulong get g_pe_wids add bb i
+    if lt ca cb
+      ret -1
+    end
+    if gt ca cb
+      ret 1
+    end
+  end
+  if lt la lb
+    ret -1
+  end
+  if gt la lb
+    ret 1
+  end
+  ret 0
+end
+
+fn pe_cmp_entry ea ulong eb ulong to long
+  el_a = get g_pe_eelig ea
+  el_b = get g_pe_eelig eb
+  if ne el_a el_b
+    if gt el_a el_b
+      ret -1
+    end
+    ret 1
+  end
+  if eq el_a 1
+    ia = add mul get g_pe_erec ea 4 get g_pe_ecell ea
+    ib = add mul get g_pe_erec eb 4 get g_pe_ecell eb
+    ma = get g_pe_cmed ia
+    mb = get g_pe_cmed ib
+    if lt ma mb
+      ret -1
+    end
+    if gt ma mb
+      ret 1
+    end
+  end
+  ret pe_cmp_rid get g_pe_erec ea get g_pe_erec eb
+end
+
+fn pe_sort_entries nent ulong to void
+  for i ulong nent bound 128
+    put g_pe_eord i i
+  end
+  for i ulong nent bound 128
+    j = add i 1
+    while lt j nent bound 128
+      oi = get g_pe_eord i
+      oj = get g_pe_eord j
+      if gt pe_cmp_entry oi oj 0
+        put g_pe_eord i oj
+        put g_pe_eord j oi
+      end
+      j = add j 1
+    end
+  end
+end
+
+fn pe_eval_elig r ulong k ulong to ulong
+  if not pe_ct_matches r
+    ret 1
+  end
+  fl = get g_pe_rflags r
+  if ne and fl 8 0
+    ret 2
+  end
+  if not pe_run_eq_cur r
+    ret 3
+  end
+  if eq and fl 16 0
+    ret 4
+  end
+  if ne get g_pe_rdirty r 0
+    ret 5
+  end
+  idx = add mul r 4 k
+  if eq get g_pe_cmeas idx 0
+    ret 6
+  end
+  if or eq get g_pe_cchk idx 0 gt get g_pe_cfail idx 0
+    ret 7
+  end
+  if eq get g_pe_coklat idx 0
+    ret 8
+  end
+  cmin = get g_pe_cmin idx
+  cmed = get g_pe_cmed idx
+  if or le cmin 0.0f64 gt cmin cmed
+    ret 8
+  end
+  if ne get g_pe_csk idx 0
+    ret 9
+  end
+  if ne and fl 4 0
+    ret 10
+  end
+  if ne and fl 1 0
+    ret 11
+  end
+  ret 0
+end
+
+fn pe_print_why code ulong to void
+  if eq code 1
+    omx_puts t_pe_w1
+  else
+    if eq code 2
+      omx_puts t_pe_w2
+    else
+      if eq code 3
+        omx_puts t_pe_w3
+      else
+        if eq code 4
+          omx_puts t_pe_w4
+        else
+          if eq code 5
+            omx_puts t_pe_w5
+          else
+            if eq code 6
+              omx_puts t_pe_w6
+            else
+              if eq code 7
+                omx_puts t_pe_w7
+              else
+                if eq code 8
+                  omx_puts t_pe_w8
+                else
+                  if eq code 9
+                    omx_puts t_pe_w9
+                  else
+                    if eq code 10
+                      omx_puts t_pe_w10
+                    else
+                      omx_puts t_pe_w11
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+fn pe_put_pad_rid r ulong to void
+  l = get g_pe_rid_l r
+  _w = write 1 g_pe_rid mul r 64 l
+  pad = ulong 1
+  if lt l 16
+    pad = sub 17 l
+  end
+  for i ulong pad bound 20
+    omx_putc uchar 32
+  end
+end
+
+fn pe_put_pad_lang r ulong to void
+  l = get g_pe_lang_l r
+  _w = write 1 g_pe_lang mul r 32 l
+  pad = ulong 1
+  if lt l 12
+    pad = sub 13 l
+  end
+  for i ulong pad bound 16
+    omx_putc uchar 32
+  end
+end
+
+fn pe_put_pad_fam r ulong to void
+  l = get g_pe_fam_l r
+  _w = write 1 g_pe_fam mul r 32 l
+  pad = ulong 1
+  if lt l 9
+    pad = sub 10 l
+  end
+  for i ulong pad bound 12
+    omx_putc uchar 32
+  end
+end
+
+fn pe_relmad idx ulong to f64
+  med = get g_pe_cmed idx
+  if gt med 0.0f64
+    ret div get g_pe_cmad idx med
+  end
+  ret 0.0f64
+end
+
+fn pe_print_signed_pct pct f64 to void
+  if ge pct 0.0f64
+    omx_putc uchar 43
+  end
+  omx_putf pct 1
+end
+
+fn pe_lang_eq_seen r ulong j ulong to bool
+  ll = get g_pe_lang_l r
+  if ne ll get g_pe_seen_ll j
+    ret false
+  end
+  lb = mul r 32
+  sb = mul j 32
+  for k ulong ll bound 32
+    if ne get g_pe_lang add lb k get g_pe_seen_l add sb k
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pe_lang_add_seen r ulong nseen ulong to ulong
+  for j ulong nseen bound 16
+    if pe_lang_eq_seen r j
+      ret 0
+    end
+  end
+  if ge nseen 16
+    ret 0
+  end
+  ll = get g_pe_lang_l r
+  lb = mul r 32
+  sb = mul nseen 32
+  for k ulong ll bound 32
+    ch = get g_pe_lang add lb k
+    put g_pe_seen_l add sb k ch
+  end
+  put g_pe_seen_ll nseen ll
+  ret 1
+end
+
+fn pe_print_by_lang nent ulong to void
+  omx_puts t_pe_byl
+  nseen = ulong 0
+  for i ulong nent bound 128
+    eo = get g_pe_eord i
+    if eq get g_pe_eelig eo 0
+      continue
+    end
+    r = get g_pe_erec eo
+    if eq pe_lang_add_seen r nseen 0
+      continue
+    end
+    nseen = add nseen 1
+    omx_putc uchar 32
+    _w = write 1 g_pe_lang mul r 32 get g_pe_lang_l r
+    omx_putc uchar 61
+    _w2 = write 1 g_pe_rid mul r 64 get g_pe_rid_l r
+    omx_putc uchar 32
+    idx = add mul r 4 get g_pe_ecell eo
+    omx_putf get g_pe_cmed idx 1
+    omx_putc uchar 32
+    omx_putc uchar 110
+    omx_putc uchar 115
+    if ne and get g_pe_rflags r 2 0
+      omx_puts t_pe_der
+    end
+    omx_putc uchar 59
+  end
+  omx_nl
+end
+
+fn pe_print_rup nent ulong i0 ulong to void
+  has_rup = ulong 0
+  if gt nent 1
+    if eq get g_pe_eelig get g_pe_eord 1 1
+      has_rup = 1
+    end
+  end
+  if eq has_rup 0
+    omx_puts t_pe_rup0
     ret
   end
-  put g_pe_cfg 4 add get g_pe_cfg 4 1
-  cmatch = pe_fbuf_contains_contract fu
-  if not cmatch
-    put g_pe_cfg 6 add get g_pe_cfg 6 1
+  e1 = get g_pe_eord 1
+  r1 = get g_pe_erec e1
+  i1 = add mul r1 4 get g_pe_ecell e1
+  margin = sub div get g_pe_cmed i1 get g_pe_cmed i0 1.0f64
+  rm0 = pe_relmad i0
+  rm1 = pe_relmad i1
+  rm = rm0
+  if gt rm1 rm
+    rm = rm1
   end
-  ismoke = pe_fbuf_contains t_pe_ksmoke fu
-  if ismoke
-    put g_pe_cfg 7 add get g_pe_cfg 7 1
+  band = mul 3.0f64 rm
+  if lt band 0.05f64
+    band = 0.05f64
   end
-  omx_puts t_pe_file
-  _w = write 1 g_pe_names mul idx 128 get g_pe_nlens idx
-  if cmatch
-    omx_puts t_pe_ok
+  omx_puts t_pe_rup
+  pe_put_pad_rid r1
+  pe_put_pad_lang r1
+  pe_put_pad_fam r1
+  omx_puts t_pe_med
+  omx_putf get g_pe_cmed i1 1
+  omx_puts t_pe_mrg
+  pe_print_signed_pct mul margin 100.0f64
+  omx_puts t_pe_bnd
+  omx_putf mul band 100.0f64 1
+  if gt margin band
+    omx_puts t_pe_ch
   else
-    omx_puts t_pe_stale
+    omx_puts t_pe_tie
   end
-  if ismoke
-    omx_puts t_pe_smk
+end
+
+fn pe_print_pack nent ulong e0 ulong i0 ulong to void
+  cheap = e0
+  ci0 = i0
+  for i ulong nent bound 128
+    eo = get g_pe_eord i
+    if eq get g_pe_eelig eo 1
+      ic = add mul get g_pe_erec eo 4 get g_pe_ecell eo
+      if lt get g_pe_cpmed ic get g_pe_cpmed ci0
+        cheap = eo
+        ci0 = ic
+      end
+    end
+  end
+  rc_ch = get g_pe_erec cheap
+  omx_puts t_pe_pk1
+  omx_putf get g_pe_cppw i0 4
+  omx_puts t_pe_pk2
+  omx_putf get g_pe_cpmed i0 0
+  omx_puts t_pe_pk3
+  _w = write 1 g_pe_rid mul rc_ch 64 get g_pe_rid_l rc_ch
+  omx_putc uchar 32
+  omx_putf get g_pe_cppw ci0 4
+  omx_puts t_pe_pk4
+  pp = get g_pe_cpmed i0
+  cp = get g_pe_cpmed ci0
+  dt = sub get g_pe_cmed ci0 get g_pe_cmed i0
+  if or eq cheap e0 le pp cp
+    omx_puts t_pe_be0
   else
-    omx_puts t_pe_nsmk
+    if le dt 0.0f64
+      omx_puts t_pe_benev
+    else
+      be = div sub pp cp dt
+      be_u = ulong be
+      if gt be f64 be_u
+        be_u = add be_u 1
+      end
+      omx_putu be_u
+      omx_puts t_pe_bec
+    end
+  end
+end
+
+fn pe_print_rejected nent ulong has_sel ulong to void
+  start_i = ulong 0
+  if eq has_sel 1
+    start_i = 1
+  end
+  i = start_i
+  while lt i nent bound 128
+    eo = get g_pe_eord i
+    r = get g_pe_erec eo
+    ic = add mul r 4 get g_pe_ecell eo
+    if eq get g_pe_eelig eo 1
+      if ne i 1
+        e0 = get g_pe_eord 0
+        i0 = add mul get g_pe_erec e0 4 get g_pe_ecell e0
+        margin = sub div get g_pe_cmed ic get g_pe_cmed i0 1.0f64
+        omx_puts t_pe_rej
+        pe_put_pad_rid r
+        pe_put_pad_lang r
+        omx_puts t_pe_slower
+        pe_print_signed_pct mul margin 100.0f64
+        omx_puts t_pe_pct_vs
+      end
+    else
+      omx_puts t_pe_rej
+      pe_put_pad_rid r
+      pe_put_pad_lang r
+      pe_print_why get g_pe_ewhy eo
+      omx_nl
+    end
+    i = add i 1
+  end
+end
+
+fn pe_explain_cell wi ulong sp f64 to void
+  nrec = get g_pe_cfg 4
+  nent = ulong 0
+  for r ulong nrec bound 128
+    if not pe_wid_eq_slot r wi
+      continue
+    end
+    nc = get g_pe_rnc r
+    for k ulong nc bound 4
+      idx = add mul r 4 k
+      d = sub get g_pe_csp idx sp
+      if lt d 0.0f64
+        d = sub 0.0f64 d
+      end
+      if lt d 0.0001f64
+        put g_pe_erec nent r
+        put g_pe_ecell nent k
+        why = pe_eval_elig r k
+        put g_pe_ewhy nent why
+        if eq why 0
+          put g_pe_eelig nent 1
+        else
+          put g_pe_eelig nent 0
+        end
+        nent = add nent 1
+        break
+      end
+    end
+  end
+  pe_sort_entries nent
+  omx_puts t_pe_sp_h
+  omx_putf sp 2
+  omx_puts t_pe_col
+  has_sel = ulong 0
+  if gt nent 0
+    if eq get g_pe_eelig get g_pe_eord 0 1
+      has_sel = 1
+    end
+  end
+  if eq has_sel 0
+    omx_puts t_pe_noel
+  else
+    e0 = get g_pe_eord 0
+    r0 = get g_pe_erec e0
+    i0 = add mul r0 4 get g_pe_ecell e0
+    omx_puts t_pe_sel
+    pe_put_pad_rid r0
+    pe_put_pad_lang r0
+    pe_put_pad_fam r0
+    omx_puts t_pe_med
+    omx_putf get g_pe_cmed i0 1
+    omx_puts t_pe_nsc
+    omx_putf get g_pe_cmad i0 1
+    omx_puts t_pe_min
+    omx_putf get g_pe_cmin i0 1
+    omx_nl
+    pe_print_rup nent i0
+    pe_print_pack nent e0 i0
+    pe_print_by_lang nent
+  end
+  pe_print_rejected nent has_sel
+end
+
+fn pe_add_run_slot r ulong nruns ulong to ulong
+  for j ulong nruns bound 64
+    if pe_run_eq_slot r j
+      ret 0
+    end
+  end
+  if ge nruns 64
+    ret 0
+  end
+  l = get g_pe_runid_l r
+  br = mul r 128
+  bs = mul nruns 128
+  for k ulong l bound 128
+    ch = get g_pe_runid add br k
+    put g_pe_runs add bs k ch
+  end
+  put g_pe_runs_l nruns l
+  ret 1
+end
+
+fn pe_set_cur_from_slot j ulong to void
+  l = get g_pe_runs_l j
+  bs = mul j 128
+  for k ulong l bound 128
+    put g_pe_cur k get g_pe_runs add bs k
+  end
+  put g_pe_cur_l 0 l
+  put g_pe_cfg 9 1
+end
+
+fn pe_resolve_runs to void
+  nrec = get g_pe_cfg 4
+  nruns = ulong 0
+  for r ulong nrec bound 128
+    if not pe_ct_matches r
+      put g_pe_cfg 6 add get g_pe_cfg 6 1
+    end
+    fl = get g_pe_rflags r
+    if ne and fl 8 0
+      put g_pe_cfg 7 add get g_pe_cfg 7 1
+    end
+    if eq and fl 16 0
+      put g_pe_cfg 8 add get g_pe_cfg 8 1
+    end
+    nruns = add nruns pe_add_run_slot r nruns
+  end
+  put g_pe_cfg 10 nruns
+  nfull = ulong 0
+  for j ulong nruns bound 64
+    full = ulong 0
+    for r ulong nrec bound 128
+      if pe_run_eq_slot r j
+        if eq and get g_pe_rflags r 8 0
+          full = 1
+          break
+        end
+      end
+    end
+    if eq full 1
+      nfull = add nfull 1
+      if and eq get g_pe_cfg 9 0 eq nfull 1
+        pe_set_cur_from_slot j
+      end
+    end
+  end
+  put g_pe_cfg 11 nfull
+  if and eq get g_pe_cfg 2 0 gt nfull 1
+    put g_pe_cfg 9 0
+  end
+end
+
+fn pe_add_wid_slot r ulong nw ulong to ulong
+  for j ulong nw bound 16
+    if pe_wid_eq_slot r j
+      ret 0
+    end
+  end
+  if ge nw 16
+    ret 0
+  end
+  l = get g_pe_wid_l r
+  br = mul r 8
+  bs = mul nw 8
+  for k ulong l bound 8
+    ch = get g_pe_wid add br k
+    put g_pe_wids add bs k ch
+  end
+  put g_pe_wids_l nw l
+  ret 1
+end
+
+fn pe_collect_wids to void
+  nrec = get g_pe_cfg 4
+  nw = ulong 0
+  for r ulong nrec bound 128
+    nw = add nw pe_add_wid_slot r nw
+  end
+  put g_pe_nw 0 nw
+end
+
+fn pe_add_sp sp f64 nsp ulong to ulong
+  for j ulong nsp bound 8
+    d = sub get g_pe_sps j sp
+    if lt d 0.0f64
+      d = sub 0.0f64 d
+    end
+    if lt d 0.0001f64
+      ret 0
+    end
+  end
+  if ge nsp 8
+    ret 0
+  end
+  put g_pe_sps nsp sp
+  ret 1
+end
+
+fn pe_explain_workload wi ulong to void
+  nrec = get g_pe_cfg 4
+  any = ulong 0
+  has_any = ulong 0
+  nsp = ulong 0
+  for r ulong nrec bound 128
+    if not pe_wid_eq_slot r wi
+      continue
+    end
+    if eq has_any 0
+      any = r
+      has_any = 1
+    end
+    nc = get g_pe_rnc r
+    for k ulong nc bound 4
+      sp = get g_pe_csp add mul r 4 k
+      nsp = add nsp pe_add_sp sp nsp
+    end
+  end
+  if eq has_any 0
+    ret
+  end
+  for a ulong nsp bound 8
+    b = add a 1
+    while lt b nsp bound 8
+      if lt get g_pe_sps b get g_pe_sps a
+        t = get g_pe_sps a
+        put g_pe_sps a get g_pe_sps b
+        put g_pe_sps b t
+      end
+      b = add b 1
+    end
+  end
+  omx_nl
+  _w = write 1 g_pe_wids mul wi 8 get g_pe_wids_l wi
+  omx_putc uchar 32
+  omx_putc uchar 32
+  omx_putc uchar 109
+  omx_putc uchar 61
+  omx_putu get g_pe_rm any
+  omx_putc uchar 32
+  omx_putc uchar 110
+  omx_putc uchar 61
+  omx_putu get g_pe_rn any
+  omx_putc uchar 32
+  omx_putc uchar 32
+  omx_putc uchar 40
+  _w2 = write 1 g_pe_reg mul any 96 get g_pe_reg_l any
+  omx_putc uchar 41
+  omx_nl
+  for si ulong nsp bound 8
+    pe_explain_cell wi get g_pe_sps si
   end
 end
 
 fn main to int
-  for i ulong 8
+  for i ulong 16
     put g_pe_cfg i 0
   end
   argc = ulong argcnt
@@ -287,7 +1593,7 @@ fn main to int
     if pe_arg_eq au t_pe_sp_flag
       i = add i 1
       if lt i argc
-        sl = argread i g_omx_path 0 512
+        sl = argread i g_pe_spec 0 512
         if gt sl 0
           put g_pe_cfg 0 ulong sl
         end
@@ -305,7 +1611,7 @@ fn main to int
         if pe_arg_eq au t_pe_rn_flag
           i = add i 1
           if lt i argc
-            rl = argread i g_pe_run 0 128
+            rl = argread i g_pe_run 0 512
             if gt rl 0
               put g_pe_cfg 2 ulong rl
             end
@@ -315,27 +1621,95 @@ fn main to int
     end
     i = add i 1
   end
-  if or eq get g_pe_cfg 0 0 eq get g_pe_cfg 1 0
+
+  if and eq get g_pe_cfg 1 0 eq get g_pe_cfg 2 0
     omx_eputs t_pe_usage
     ret 2
   end
-  if ne omx_contract_digest_gpath get g_pe_cfg 0 0
+
+  note Default --spec to spec/polyglot-0.md when invoked as --run <path>
+  if eq get g_pe_cfg 0 0
+    for k ulong len t_pe_def_spec
+      put g_pe_spec k get t_pe_def_spec k
+    end
+    put g_pe_cfg 0 len t_pe_def_spec
+  end
+  sl = get g_pe_cfg 0
+  for k ulong sl bound 512
+    put g_omx_path k get g_pe_spec k
+  end
+  if ne omx_contract_digest_gpath sl 0
+    omx_eputs t_pe_err_spec
     ret 2
   end
   for k ulong 64
     put g_pe_contract k get g_omx_shhex k
   end
-  if ne pe_scan_dir 0
-    ret 2
+
+  note Mode A: --receipts DIR [--run RUN_ID]
+  if gt get g_pe_cfg 1 0
+    if gt get g_pe_cfg 2 0
+      rl = get g_pe_cfg 2
+      if gt rl 127
+        rl = 127
+      end
+      for k ulong rl bound 128
+        put g_pe_cur k get g_pe_run k
+      end
+      put g_pe_cur_l 0 rl
+      put g_pe_cfg 9 1
+    end
+    if ne pe_load_dir 0
+      omx_eputs t_pe_err_dir
+      ret 2
+    end
+  else
+    note Mode B: --run <receipt.json | receipts_dir> (no --receipts)
+    rl = get g_pe_cfg 2
+    for k ulong rl bound 512
+      put g_pe_dir k get g_pe_run k
+    end
+    put g_pe_cfg 1 rl
+    drc = pe_load_dir
+    if eq drc -1
+      omx_eputs t_pe_err_run
+      ret 2
+    end
+    if eq drc -2
+      note Regular file path: read and parse single receipt JSON
+      for k ulong rl bound 512
+        put g_omx_path k get g_pe_run k
+      end
+      flen = omx_read_gpath rl
+      if le flen 0
+        omx_eputs t_pe_err_run
+        ret 2
+      end
+      if ne pe_parse_fbuf_rec ulong flen 0
+        omx_eputs t_pe_err_run
+        ret 2
+      end
+      note Use this receipt's run_id as current run
+      r0l = get g_pe_runid_l 0
+      for k ulong r0l bound 128
+        put g_pe_cur k get g_pe_runid k
+      end
+      put g_pe_cur_l 0 r0l
+      put g_pe_cfg 9 1
+    else
+      if eq get g_pe_cfg 4 0
+        omx_eputs t_pe_err_run
+        ret 2
+      end
+      put g_pe_cfg 2 0
+    end
   end
-  nf = get g_pe_cfg 3
-  pe_sort_names nf
+
+  pe_resolve_runs
+  pe_collect_wids
+
   omx_puts t_pe_hdr
   _w = write 1 g_pe_contract 0 64
-  omx_nl
-  for k ulong nf bound 256
-    pe_process_one get g_pe_order k
-  end
   omx_puts t_pe_rec1
   omx_putu get g_pe_cfg 4
   omx_puts t_pe_rec2
@@ -345,5 +1719,52 @@ fn main to int
   omx_puts t_pe_rec4
   omx_putu get g_pe_cfg 7
   omx_puts t_pe_rec5
+  omx_putu get g_pe_cfg 8
+  omx_puts t_pe_rec6
+  nruns = get g_pe_cfg 10
+  for j ulong nruns bound 64
+    omx_puts t_pe_run_l
+    _w = write 1 g_pe_runs mul j 128 get g_pe_runs_l j
+    omx_nl
+  end
+  omx_puts t_pe_cur_l
+  if eq get g_pe_cfg 9 1
+    _w = write 1 g_pe_cur 0 get g_pe_cur_l 0
+  else
+    omx_puts t_pe_none
+  end
+  omx_nl
+  omx_puts t_pe_pol
+  if or gt get g_pe_cfg 7 0 gt get g_pe_cfg 8 0
+    omx_puts t_pe_nsmk
+  end
+  if eq get g_pe_cfg 9 0
+    if gt get g_pe_cfg 11 1
+      omx_puts t_pe_nmult
+    else
+      omx_puts t_pe_nnone
+    end
+  end
+
+  nw = get g_pe_nw 0
+  worder = new ulong 16 0
+  for w ulong nw bound 16
+    put worder w w
+  end
+  for a ulong nw bound 16
+    b = add a 1
+    while lt b nw bound 16
+      oa = get worder a
+      ob = get worder b
+      if gt pe_cmp_wslot oa ob 0
+        put worder a ob
+        put worder b oa
+      end
+      b = add b 1
+    end
+  end
+  for w ulong nw bound 16
+    pe_explain_workload get worder w
+  end
   ret 0
 end

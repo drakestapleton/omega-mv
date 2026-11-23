@@ -25,9 +25,9 @@ $(PGE_DIR)/gnu_%.o: src/polyglot/asm/omx_%.S
 $(PGE_DIR)/gnu_%.text.bin: $(PGE_DIR)/gnu_%.o
 	$(OBJCOPY) -O binary --only-section=.text $< $@
 
-$(PGE_TEST): $(PGE_SRCS)
+$(PGE_TEST): $(PGE_SRCS) $(PGE_OMC)
 	@mkdir -p $(dir $@)
-	cat $(PGE_SRCS) | $(PGE_OMC) > $@ && chmod +x $@
+	cat $(PGE_SRCS) | $(PGE_OMC) > $@.tmp && chmod +x $@.tmp && mv $@.tmp $@
 
 .PHONY: test-polyglot-encoder
 test-polyglot-encoder: $(PGE_TEST) $(PGE_BINS)
