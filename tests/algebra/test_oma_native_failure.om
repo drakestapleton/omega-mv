@@ -1,55 +1,367 @@
 note SPDX-License-Identifier: Apache-2.0
-note Pure seeded OM-2 native failure / error-preservation invariant test.
+note Pure seeded OM-2 native failure, fault-injection, and output-preservation invariant test.
 note Replaces tests/algebra/test_oma_native_failure.c.
 note Concatenated after src/algebra/oma_lib.om.
 
-text nf_pass "PASS test_oma_native_failure (error paths preserve outputs untouched)\n"
-text nf_fail "FAIL test_oma_native_failure\n"
+const NF_OMEGA_OK ulong 0
+const NF_OMEGA_REENTRY ulong 1
+const NF_OMEGA_NO_STACK ulong 2
 
-fn main to int
-  bad_ser = new uchar 16 0
-  put bad_ser 0 uchar 1
-  put bad_ser 8 uchar 1
+global nf_c ulong 2
+note nf_c: 0=checks, 1=fails
+global nf_inj ulong 2
+note nf_inj: 0=deserialize_fault, 1=pack_byte_fault
+
+text nf_pass_a "PASS test_oma_native_failure ("
+text nf_pass_b " checks, 0 failures; bridge-fault injection and error paths preserve outputs untouched)\n"
+text nf_fail_a "FAIL test_oma_native_failure (check #"
+text nf_fail_b ")\n"
+
+fn nf_chk cond bool to void
+  n = add get nf_c 0 1
+  put nf_c 0 n
+  if not cond
+    put nf_c 1 add get nf_c 1 1
+    oma_put_err nf_fail_a
+    oma_put_u64 2 n
+    oma_put_err nf_fail_b
+  end
+end
+
+note ---- Part A: Bridge fault-injection wrappers (mirrors __wrap_omega2_oma_om_* in C) ----
+
+fn nf_bridge_deserialize src view uchar 16 dst edit ulong 2 to ulong
+  mode = get nf_inj 0
+  if ne mode NF_OMEGA_OK
+    ret mode
+  end
+  rc = oma_block_deserialize src dst
+  if ne rc OMA_OK
+    ret NF_OMEGA_REENTRY
+  end
+  ret NF_OMEGA_OK
+end
+
+fn nf_wrapped_deserialize src view uchar 16 dst edit ulong 2 to int
+  tmp = new ulong 2 0
+  st = nf_bridge_deserialize src tmp
+  if ne st NF_OMEGA_OK
+    ret OMA_E_NATIVE
+  end
+  put dst 0 get tmp 0
+  put dst 1 get tmp 1
+  ret OMA_OK
+end
+
+fn nf_bridge_pack_dense_byte t view byte * start ulong n ulong byte_out edit uchar 1 to ulong
+  mode = get nf_inj 1
+  if and ne mode NF_OMEGA_OK gt start 0
+    ret mode
+  end
+  put byte_out 0 oma_pack_dense_one t start n
+  ret NF_OMEGA_OK
+end
+
+fn nf_wrapped_pack_dense t view byte * n ulong dst edit uchar * out_len edit ulong 1 to int
+  nbytes = oma_dense_bytes n
+  if lt len t n
+    ret OMA_E_ARG
+  end
+  if lt len dst nbytes
+    ret OMA_E_OVERFLOW
+  end
+  for i ulong n bound 64
+    v = int get t i
+    if or lt v -1 gt v 1
+      ret OMA_E_INVALID_TRIT
+    end
+  end
+  stage = new uchar 16 0
+  if gt nbytes 16
+    ret OMA_E_OVERFLOW
+  end
+  b1 = new uchar 1 0
+  for k ulong nbytes bound 16
+    st = nf_bridge_pack_dense_byte t mul k 5 n b1
+    if ne st NF_OMEGA_OK
+      ret OMA_E_NATIVE
+    end
+    put stage k get b1 0
+  end
+  for k ulong nbytes bound 16
+    put dst k get stage k
+  end
+  put out_len 0 nbytes
+  ret OMA_OK
+end
+
+fn test_bridge_fault_injection to void
+  ser = new uchar 16 0
+  put ser 0 uchar 5
+  put ser 8 uchar 2
   blk = new ulong 2 0
   put blk 0 ulong 123
   put blk 1 ulong 456
-  rc1 = oma_block_deserialize bad_ser blk
-  if ne rc1 OMA_E_INVALID_PLANES
-    oma_put_err nf_fail
-    ret 1
-  end
-  if or ne get blk 0 123 ne get blk 1 456
-    oma_put_err nf_fail
-    ret 1
-  end
+  note 1. Inject OMEGA_REENTRY on deserialize: must return OMA_E_NATIVE and preserve blk
+  put nf_inj 0 NF_OMEGA_REENTRY
+  nf_chk eq nf_wrapped_deserialize ser blk OMA_E_NATIVE
+  nf_chk and eq get blk 0 123 eq get blk 1 456
+  note Control: disabling fault lets valid deserialize succeed
+  put nf_inj 0 NF_OMEGA_OK
+  nf_chk eq nf_wrapped_deserialize ser blk OMA_OK
+  nf_chk and eq get blk 0 5 eq get blk 1 2
 
+  note 2. Inject mid-stream OMEGA_NO_STACK on pack_dense (start == 0 succeeds, start == 5 fails)
   trits = new byte 6 0
+  put trits 0 byte 1
+  put trits 5 byte -1
+  packed = new uchar 2 0
+  put packed 0 uchar 12
+  put packed 1 uchar 34
+  sz = new ulong 1 42
+  put nf_inj 1 NF_OMEGA_NO_STACK
+  nf_chk eq nf_wrapped_pack_dense trits 6 packed sz OMA_E_NATIVE
+  nf_chk and eq get packed 0 12 and eq get packed 1 34 eq get sz 0 42
+  note Control: disabling fault lets valid pack_dense succeed and update both bytes + sz
+  put nf_inj 1 NF_OMEGA_OK
+  nf_chk eq nf_wrapped_pack_dense trits 6 packed sz OMA_OK
+  nf_chk eq get sz 0 2
+  nf_chk and eq get packed 0 uchar 122 eq get packed 1 uchar 120
+end
+
+note ---- Part B: Direct oma_lib.om error paths & mid-stream atomicity ----
+
+fn test_scalar_and_z3_preserve to void
+  tb = new byte 1 77
+  uc = new uchar 1 99
+  tb2 = new byte 2 55
+  uc2 = new uchar 2 88
+  nf_chk eq oma_trit_make 2 tb OMA_E_INVALID_TRIT
+  nf_chk eq int get tb 0 77
+  nf_chk eq oma_trit_make -2 tb OMA_E_INVALID_TRIT
+  nf_chk eq int get tb 0 77
+  nf_chk eq oma_trit_to_code 3 uc OMA_E_INVALID_TRIT
+  nf_chk eq get uc 0 uchar 99
+  nf_chk eq oma_code_to_trit 3 tb OMA_E_INVALID_CODE
+  nf_chk eq int get tb 0 77
+  nf_chk eq oma_code_neg 3 uc OMA_E_INVALID_CODE
+  nf_chk eq get uc 0 uchar 99
+  nf_chk eq oma_code_add 1 3 uc2 OMA_E_INVALID_CODE
+  nf_chk and eq get uc2 0 uchar 88 eq get uc2 1 uchar 88
+  nf_chk eq oma_code_mul 3 1 uc OMA_E_INVALID_CODE
+  nf_chk eq get uc 0 uchar 99
+  nf_chk eq oma_trit_neg 2 tb OMA_E_INVALID_TRIT
+  nf_chk eq int get tb 0 77
+  nf_chk eq oma_trit_add 1 2 tb2 OMA_E_INVALID_TRIT
+  nf_chk and eq int get tb2 0 55 eq int get tb2 1 55
+  nf_chk eq oma_trit_mul -2 1 tb OMA_E_INVALID_TRIT
+  nf_chk eq int get tb 0 77
+  nf_chk eq oma_z3_make 3 uc OMA_E_INVALID_Z3
+  nf_chk eq get uc 0 uchar 99
+  nf_chk eq oma_z3_add 0 -1 uc OMA_E_INVALID_Z3
+  nf_chk eq get uc 0 uchar 99
+  nf_chk eq oma_z3_mul 2 3 uc OMA_E_INVALID_Z3
+  nf_chk eq get uc 0 uchar 99
+  nf_chk eq oma_z3_neg 3 uc OMA_E_INVALID_Z3
+  nf_chk eq get uc 0 uchar 99
+  nf_chk eq oma_z3_to_trit 3 tb OMA_E_INVALID_Z3
+  nf_chk eq int get tb 0 77
+  nf_chk eq oma_trit_to_z3 2 uc OMA_E_INVALID_TRIT
+  nf_chk eq get uc 0 uchar 99
+end
+
+fn test_block_ops_preserve to void
+  bad_b = new ulong 2 0
+  put bad_b 0 ulong 0x10
+  put bad_b 1 ulong 0x10
+  ok_b = new ulong 2 0
+  put ok_b 0 ulong 1
+  put ok_b 1 ulong 2
+  dst_b = new ulong 2 0
+  put dst_b 0 ulong 123
+  put dst_b 1 ulong 456
+  cy_b = new ulong 2 0
+  put cy_b 0 ulong 789
+  put cy_b 1 ulong 321
+  nf_chk eq oma_block_neg bad_b dst_b OMA_E_INVALID_PLANES
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+  nf_chk eq oma_block_add ok_b bad_b dst_b cy_b OMA_E_INVALID_PLANES
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+  nf_chk and eq get cy_b 0 789 eq get cy_b 1 321
+  nf_chk eq oma_block_mul bad_b ok_b dst_b OMA_E_INVALID_PLANES
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+  dot_o = new int 1 777
+  nf_chk eq oma_block_dot ok_b bad_b dot_o OMA_E_INVALID_PLANES
+  nf_chk eq get dot_o 0 777
+  ser_o = new uchar 16 0xaa
+  nf_chk eq oma_block_serialize bad_b ser_o OMA_E_INVALID_PLANES
+  nf_chk and eq get ser_o 0 uchar 0xaa eq get ser_o 15 uchar 0xaa
+  bad_ser = new uchar 16 0
+  put bad_ser 0 uchar 1
+  put bad_ser 8 uchar 1
+  nf_chk eq oma_block_deserialize bad_ser dst_b OMA_E_INVALID_PLANES
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+  note Mid-stream block_encode failure at last lane (lane 63)
+  src64 = new byte 64 1
+  put src64 63 byte 2
+  nf_chk eq oma_block_encode src64 dst_b OMA_E_INVALID_TRIT
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+  dec64 = new byte 64 55
+  nf_chk eq oma_block_decode bad_b dec64 OMA_E_INVALID_PLANES
+  nf_chk and eq int get dec64 0 55 eq int get dec64 63 55
+  zsrc64 = new uchar 64 1
+  put zsrc64 63 uchar 3
+  nf_chk eq oma_z3_block_encode zsrc64 dst_b OMA_E_INVALID_Z3
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+  zdec64 = new uchar 64 88
+  nf_chk eq oma_z3_block_decode bad_b zdec64 OMA_E_INVALID_PLANES
+  nf_chk and eq get zdec64 0 uchar 88 eq get zdec64 63 uchar 88
+  nf_chk eq oma_z3_block_from_trits bad_b dst_b OMA_E_INVALID_PLANES
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+  nf_chk eq oma_z3_block_to_trits bad_b dst_b OMA_E_INVALID_PLANES
+  nf_chk and eq get dst_b 0 123 eq get dst_b 1 456
+end
+
+fn test_dense_pack_unpack_preserve to void
+  note Mid-stream pack_dense failure on byte 1 (trit 5 invalid, trits 0..4 valid)
+  trits = new byte 6 1
   put trits 5 byte 2
   packed = new uchar 2 0
   put packed 0 uchar 12
   put packed 1 uchar 34
   sz = new ulong 1 42
-  rc2 = oma_pack_dense trits 6 packed sz
-  if ne rc2 OMA_E_INVALID_TRIT
-    oma_put_err nf_fail
-    ret 2
-  end
-  if or ne get packed 0 12 or ne get packed 1 34 ne get sz 0 42
-    oma_put_err nf_fail
-    ret 2
-  end
-
+  nf_chk eq oma_pack_dense trits 6 packed sz OMA_E_INVALID_TRIT
+  nf_chk and eq get packed 0 12 and eq get packed 1 34 eq get sz 0 42
+  note Overflow when output slice too short
   put trits 5 byte 0
-  rc3 = oma_pack_dense trits 6 part packed 0 1 sz
-  if ne rc3 OMA_E_OVERFLOW
-    oma_put_err nf_fail
-    ret 3
+  nf_chk eq oma_pack_dense trits 6 part packed 0 1 sz OMA_E_OVERFLOW
+  nf_chk and eq get packed 0 12 and eq get packed 1 34 eq get sz 0 42
+  note Short input slice -> OMA_E_ARG
+  nf_chk eq oma_pack_dense part trits 0 5 6 packed sz OMA_E_ARG
+  nf_chk and eq get packed 0 12 and eq get packed 1 34 eq get sz 0 42
+  note Mid-stream unpack_dense failure: byte 0 valid (121), byte 1 invalid (243)
+  in_d = new uchar 2 0
+  put in_d 0 uchar 121
+  put in_d 1 uchar 243
+  out_t = new byte 6 77
+  nf_chk eq oma_unpack_dense in_d 2 6 out_t OMA_E_INVALID_BYTE
+  for i ulong 6
+    nf_chk eq int get out_t i 77
   end
-  if or ne get packed 0 12 or ne get packed 1 34 ne get sz 0 42
-    oma_put_err nf_fail
-    ret 3
+  note Non-zero padding trit in final byte (byte 1 = 124 has trit 1 != 0 for n=6)
+  put in_d 1 uchar 124
+  nf_chk eq oma_unpack_dense in_d 2 6 out_t OMA_E_INVALID_BYTE
+  for i ulong 6
+    nf_chk eq int get out_t i 77
   end
+  note Short in_len -> OMA_E_ARG
+  put in_d 1 uchar 121
+  nf_chk eq oma_unpack_dense in_d 1 6 out_t OMA_E_ARG
+  nf_chk eq int get out_t 0 77
+end
 
-  oma_put_str nf_pass
+fn test_bitplane_and_dot_preserve to void
+  note Mid-stream pack_bitplane failure in block 1 (trit 64 invalid)
+  t66 = new byte 66 1
+  put t66 64 byte -2
+  bp = new ulong 4 0
+  put bp 0 11
+  put bp 1 22
+  put bp 2 33
+  put bp 3 44
+  nf_chk eq oma_pack_bitplane t66 66 bp 2 OMA_E_INVALID_TRIT
+  nf_chk and eq get bp 0 11 and eq get bp 1 22 and eq get bp 2 33 eq get bp 3 44
+  put t66 64 byte 0
+  nf_chk eq oma_pack_bitplane t66 66 bp 1 OMA_E_OVERFLOW
+  nf_chk and eq get bp 0 11 eq get bp 2 33
+  note Mid-stream unpack_bitplane failure: block 0 valid, block 1 invalid planes
+  put bp 0 1
+  put bp 1 2
+  put bp 2 4
+  put bp 3 4
+  ub = new byte 66 66
+  nf_chk eq oma_unpack_bitplane bp 2 66 ub OMA_E_INVALID_PLANES
+  nf_chk and eq int get ub 0 66 eq int get ub 65 66
+  note Mid-stream unpack_bitplane stray bit in block 1 (bit 2 set when only 2 live lanes)
+  put bp 2 4
+  put bp 3 0
+  nf_chk eq oma_unpack_bitplane bp 2 66 ub OMA_E_ARG
+  nf_chk and eq int get ub 0 66 eq int get ub 65 66
+  note dot_tw_i8 errors preserve dst
+  x66 = new byte 66 3
+  dot_o = new int 1 999
+  nf_chk eq oma_dot_tw_i8 bp x66 add OMA_DOT_I8_MAX_N 1 dot_o OMA_E_OVERFLOW
+  nf_chk eq get dot_o 0 999
+  nf_chk eq oma_dot_tw_i8 bp x66 66 dot_o OMA_E_ARG
+  nf_chk eq get dot_o 0 999
+  put bp 2 1
+  put bp 3 1
+  nf_chk eq oma_dot_tw_i8 bp x66 66 dot_o OMA_E_INVALID_PLANES
+  nf_chk eq get dot_o 0 999
+end
+
+fn test_bt_and_quant_preserve to void
+  note int_to_bt overflow preserves dst and ndigits
+  bt = new byte 4 55
+  nd = new ulong 1 88
+  nf_chk eq oma_int_to_bt long 1000 bt 4 nd OMA_E_OVERFLOW
+  nf_chk and eq int get bt 0 55 eq get nd 0 88
+  nf_chk eq oma_int_to_bt_fixed long 1000 bt 4 OMA_E_OVERFLOW
+  nf_chk eq int get bt 0 55
+  note bt_to_int mid-stream invalid trit and i64 overflow preserve dst
+  d41 = new byte 41 1
+  out_i = new long 1 12345
+  nf_chk eq oma_bt_to_int d41 41 out_i OMA_E_OVERFLOW
+  nf_chk eq get out_i 0 12345
+  put d41 3 byte 2
+  nf_chk eq oma_bt_to_int part d41 0 4 4 out_i OMA_E_INVALID_TRIT
+  nf_chk eq get out_i 0 12345
+  note quant_absmean mid-stream NaN and underflow preserve q and scale
+  w = new f32 4 1.0f32
+  put w 3 bitcast f32 uint 0x7fc00000
+  q = new byte 4 33
+  sc = new f32 1 9.5f32
+  nf_chk eq oma_quant_absmean w 4 q sc OMA_E_ARG
+  nf_chk and eq int get q 0 33 and eq int get q 3 33 eq get sc 0 9.5f32
+  for i ulong 4
+    put w i bitcast f32 uint 0x00000001
+  end
+  nf_chk eq oma_quant_absmean w 4 q sc OMA_E_UNDERFLOW
+  nf_chk and eq int get q 0 33 eq get sc 0 9.5f32
+  note quant_rel_l2 errors preserve err
+  er = new f64 1 12.25f64
+  for i ulong 4
+    put w i 1.0f32
+    put q i byte 1
+  end
+  nf_chk eq oma_quant_rel_l2 w q -1.0f32 er OMA_E_ARG
+  nf_chk eq get er 0 12.25f64
+  put q 3 byte 2
+  nf_chk eq oma_quant_rel_l2 w q 1.0f32 er OMA_E_INVALID_TRIT
+  nf_chk eq get er 0 12.25f64
+  put q 3 byte 1
+  put w 3 bitcast f32 uint 0x7f800000
+  nf_chk eq oma_quant_rel_l2 w q 1.0f32 er OMA_E_ARG
+  nf_chk eq get er 0 12.25f64
+  for i ulong 4
+    put w i 0.0f32
+  end
+  nf_chk eq oma_quant_rel_l2 w q 1.0f32 er OMA_E_ARG
+  nf_chk eq get er 0 12.25f64
+end
+
+fn main to int
+  test_bridge_fault_injection
+  test_scalar_and_z3_preserve
+  test_block_ops_preserve
+  test_dense_pack_unpack_preserve
+  test_bitplane_and_dot_preserve
+  test_bt_and_quant_preserve
+  if ne get nf_c 1 0
+    ret 1
+  end
+  oma_put_str nf_pass_a
+  oma_put_u64 1 get nf_c 0
+  oma_put_str nf_pass_b
   ret 0
 end

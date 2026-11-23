@@ -1,185 +1,1718 @@
 note SPDX-License-Identifier: Apache-2.0
 note test_autodiff.om -- Pure seeded OM-2 M21 OMEGA_AUTODIFF reverse-mode tape tests.
+note Comprehensive coverage ported from tests/test_omega_autodiff.c:
+note   1. All 21 OpCases (ADD, SUB, MUL, DIV, MAX, SQRT, MATMUL 2D & batched 3D,
+note      TRANSPOSE, BROADCAST, SUM, MEAN with keepdims 0/1) verified 3 ways:
+note        - Layer 1: exact f64 calculus reference within per-op gamma(k) bound
+note        - Layer 2: bit-exact raw-u32 replay via direct M20 tensor ops (+ 1-bit flip control)
+note        - Layer 3: central finite differences (h=2^-6, pure 1e-3 relative tolerance)
+note   2. Comparator counterexamples (contract & FD reject wrong gradients)
+note   3. MAX ties routing to b (ReLU gradient 0 at 0, +0/-0 ties)
+note   4. Composite linear + squared-error fan-out graph (d*d) vs closed form & central FD
+note   5. Determinism: two fresh runs produce bit-identical gradients & loss value_id
+note   6. Error paths, tape capacity limits, scratch limits, shape/axis/state/dtype/flatten/leak checks
+
+const TAD_FD_H f64 0.015625
+const TAD_FD_RTOL f64 0.001
+const TAD_U32 f64 0.000000059604644775390625
 
 global tad_c ulong 2
+global tad_rng uint 1
+note tad_cm: 0=op, 1=ra, 2=rb, 3=has_b, 4=axis, 5=kp, 6=rt, 7=data_mode, 8=ry, 9=na, 10=nb, 11=ny
+global tad_cm ulong 12
+global tad_sa ulong 8
+global tad_sb ulong 8
+global tad_st ulong 8
+global tad_sy ulong 8
+global tad_lim f32 4
+global tad_h ulong 24
+global tad_ids ulong 16
+global tad_a f32 128
+global tad_b f32 128
+global tad_r f32 128
+global tad_ga f32 128
+global tad_gb f32 128
+global tad_ea f32 128
+global tad_eb f32 128
+global tad_ra f64 128
+global tad_aa f64 128
+global tad_rb f64 128
+global tad_ab f64 128
+global tad_ka ulong 128
+global tad_kb ulong 128
+global tad_lx f32 12
+global tad_lw f32 6
+global tad_lb f32 2
+global tad_ly f32 8
+global tad_fg1 f32 8
+global tad_fg2 f32 8
+global tad_ee f64 8
+global tad_id1 uchar 32
+global tad_id2 uchar 32
 
 text tad_pass "M21_OMEGA_AUTODIFF_TESTS_PASS\n"
 text tad_fail "M21_OMEGA_AUTODIFF_TESTS_FAIL\n"
+text tad_sum1 "M21 OMEGA_AUTODIFF CPU tests: "
+text tad_sum2 " pass, "
+text tad_sum3 " fail\n"
+text tad_fc "FAIL autodiff check #"
+text tad_nl "\n"
+
+fn ad_w_u64 fd int v ulong to void
+  buf = new uchar 24 0
+  tmp = new uchar 24 0
+  if eq v 0
+    put buf 0 uchar 48
+    w = write fd buf 0 1
+    ret
+  end
+  cnt = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp cnt uchar add 48 rem x 10
+    cnt = add cnt 1
+    x = div x 10
+  end
+  for i ulong cnt bound 24
+    put buf i get tmp sub sub cnt 1 i
+  end
+  w = write fd buf 0 cnt
+end
 
 fn ad_chk cond bool to void
-  put tad_c 0 add get tad_c 0 1
+  n = add get tad_c 0 1
+  put tad_c 0 n
   if not cond
     put tad_c 1 add get tad_c 1 1
+    w1 = write 2 tad_fc 0 len tad_fc
+    ad_w_u64 2 n
+    w2 = write 2 tad_nl 0 1
   end
 end
 
-fn ad_near a f32 b f32 tol f32 to bool
-  ret le fabs sub a b tol
+fn ad_save_h idx ulong h view ulong 2 to void
+  put tad_h mul idx 2 get h 0
+  put tad_h add mul idx 2 1 get h 1
 end
 
-fn test_basic_ops_verify ia ulong ib ulong to void
-  ga = new f32 3 0.0f32
-  gb = new f32 3 0.0f32
-  ad_chk eq ad_grad_read_f32 ia ga AD_OK
-  ad_chk eq ad_grad_read_f32 ib gb AD_OK
-  ad_chk ad_near get ga 1 1.75f32 0.0001f32
-  ad_chk ad_near get gb 1 5.0f32 0.0001f32
-  ad_chk ad_near get ga 2 2.8333333f32 0.0001f32
-  ad_chk ad_near get gb 2 10.0f32 0.0001f32
-  ids = new ulong 2 0
-  put ids 0 ia
-  put ids 1 ib
-  flat = new f32 6 0.0f32
-  ad_chk eq ad_grads_flatten ids flat AD_OK
-  ad_chk ad_near get flat 1 1.75f32 0.0001f32
-  ad_chk ad_near get flat 4 5.0f32 0.0001f32
+fn ad_rel_h idx ulong to void
+  r = ot_release get tad_h mul idx 2 get tad_h add mul idx 2 1
 end
 
-fn test_basic_ops to void
-  ad_chk eq ot_ctx_init 128 OT_OK
-  ad_chk eq ad_tape_init 64 1024 AD_OK
-  sh = new ulong 8 0
-  put sh 0 3
-  da = new f32 3 0.0f32
-  db = new f32 3 0.0f32
-  put da 0 2.0f32
-  put da 1 4.0f32
-  put da 2 9.0f32
-  put db 0 3.0f32
-  put db 1 2.0f32
-  put db 2 3.0f32
-  ha = new ulong 2 0
-  hb = new ulong 2 0
-  ad_chk eq ot_from_f32 1 sh da ha OT_OK
-  ad_chk eq ot_from_f32 1 sh db hb OT_OK
-  ids = new ulong 8 0
-  tmp = new ulong 1 0
-  ad_chk eq ad_leaf get ha 0 get ha 1 1 tmp AD_OK
-  put ids 0 get tmp 0
-  ad_chk eq ad_leaf get hb 0 get hb 1 1 tmp AD_OK
-  put ids 1 get tmp 0
-  ad_chk eq ad_binary AD_MUL get ids 0 get ids 1 tmp AD_OK
-  put ids 2 get tmp 0
-  ad_chk eq ad_sqrt get ids 0 tmp AD_OK
-  put ids 3 get tmp 0
-  ad_chk eq ad_binary AD_ADD get ids 3 get ids 2 tmp AD_OK
-  put ids 4 get tmp 0
-  ad_chk eq ad_binary AD_DIV get ids 0 get ids 1 tmp AD_OK
-  put ids 5 get tmp 0
-  ad_chk eq ad_binary AD_SUB get ids 4 get ids 5 tmp AD_OK
-  put ids 6 get tmp 0
-  ad_chk eq ad_reduce AD_SUM get ids 6 0 0 tmp AD_OK
-  put ids 7 get tmp 0
-  ad_chk eq ad_backward get ids 7 AD_OK
-  ad_chk eq ad_backward get ids 7 AD_ERR_STATE
-  test_basic_ops_verify get ids 0 get ids 1
-  ad_tape_release
-  r1 = ot_release get ha 0 get ha 1
-  r1 = ot_release get hb 0 get hb 1
+fn ad_urand lo f32 hi f32 to f32
+  s = add mul get tad_rng 0 uint 1664525 uint 1013904223
+  put tad_rng 0 s
+  r = div f64 shr s 8 16777216.0f64
+  ret f32 add f64 lo mul sub f64 hi f64 lo r
+end
+
+fn ad_fd_ok an f64 fd f64 to bool
+  ret le fabs sub an fd mul TAD_FD_RTOL fabs fd
+end
+
+fn ad_gamma k ulong to f64
+  ku = mul f64 k TAD_U32
+  ret div ku sub 1.0f64 ku
+end
+
+fn ad_levels m ulong to ulong
+  l = ulong 1
+  cap = ulong 32
+  while lt cap m bound 16
+    cap = mul cap 32
+    l = add l 1
+  end
+  ret l
+end
+
+fn ad_numel r ulong which ulong to ulong
+  n = ulong 1
+  for d ulong r bound 8
+    if eq which 0
+      n = mul n get tad_sa d
+    else
+      if eq which 1
+        n = mul n get tad_sb d
+      else
+        n = mul n get tad_sy d
+      end
+    end
+  end
+  ret n
+end
+
+fn ad_unravel_y flat ulong oc edit ulong 8 to void
+  ry = get tad_cm 8
+  f = flat
+  for di ulong ry bound 8
+    d = sub sub ry 1 di
+    sd = get tad_sy d
+    put oc d rem f sd
+    f = div f sd
+  end
+end
+
+fn ad_bmap oc view ulong 8 which ulong to ulong
+  ry = get tad_cm 8
+  ri = get tad_cm 1
+  if eq which 1
+    ri = get tad_cm 2
+  end
+  idx = ulong 0
+  lead = sub ry ri
+  for d ulong ri bound 8
+    sd = get tad_sa d
+    if eq which 1
+      sd = get tad_sb d
+    end
+    c = get oc add d lead
+    if eq sd 1
+      c = 0
+    end
+    idx = add mul idx sd c
+  end
+  ret idx
+end
+
+fn ad_unb_depth which ulong to ulong
+  ry = get tad_cm 8
+  ri = get tad_cm 1
+  if eq which 1
+    ri = get tad_cm 2
+  end
+  tot = ulong 0
+  lead = sub ry ri
+  for d ulong lead bound 8
+    if gt get tad_sy d 1
+      tot = add tot mul 5 ad_levels get tad_sy d
+    end
+  end
+  for d ulong ri bound 8
+    sd = get tad_sa d
+    if eq which 1
+      sd = get tad_sb d
+    end
+    if and eq sd 1 gt get tad_sy add d lead 1
+      tot = add tot mul 5 ad_levels get tad_sy add d lead
+    end
+  end
+  ret tot
+end
+
+fn ad_chk_leaks to void
   lc = new ulong 2 0
   ot_live_counts lc
   ad_chk and eq get lc 0 0 eq get lc 1 0
 end
 
-fn test_matmul_max_mean_bcast to void
-  ad_chk eq ot_ctx_init 128 OT_OK
-  ad_chk eq ad_tape_init 64 1024 AD_OK
-  sha = new ulong 8 0
-  shb = new ulong 8 0
-  shc = new ulong 8 0
-  put sha 0 2
-  put sha 1 2
-  put shb 0 2
-  put shb 1 2
-  put shc 0 2
-  da = new f32 4 0.0f32
-  db = new f32 4 0.0f32
-  dc = new f32 2 0.0f32
-  put da 0 1.0f32
-  put da 1 2.0f32
-  put da 2 3.0f32
-  put da 3 4.0f32
-  put db 0 2.0f32
-  put db 1 -1.0f32
-  put db 2 0.0f32
-  put db 3 3.0f32
-  put dc 0 0.0f32
-  put dc 1 5.0f32
-  ha = new ulong 2 0
-  hb = new ulong 2 0
-  hc = new ulong 2 0
-  ad_chk eq ot_from_f32 2 sha da ha OT_OK
-  ad_chk eq ot_from_f32 2 shb db hb OT_OK
-  ad_chk eq ot_from_f32 1 shc dc hc OT_OK
-  ids = new ulong 8 0
+fn ad_mk_g which ulong out_idx ulong to long
+  sh = new ulong 8 0
+  buf = new f32 128 0.0f32
+  h = new ulong 2 0
+  r = get tad_cm 1
+  n = get tad_cm 9
+  if eq which 1
+    r = get tad_cm 2
+    n = get tad_cm 10
+  else
+    if eq which 2
+      r = get tad_cm 8
+      n = get tad_cm 11
+    end
+  end
+  for d ulong r bound 8
+    if eq which 0
+      put sh d get tad_sa d
+    else
+      if eq which 1
+        put sh d get tad_sb d
+      else
+        put sh d get tad_sy d
+      end
+    end
+  end
+  for i ulong n bound 128
+    if eq which 0
+      put buf i get tad_a i
+    else
+      if eq which 1
+        put buf i get tad_b i
+      else
+        put buf i get tad_r i
+      end
+    end
+  end
+  rc = ot_from_f32 r sh part buf 0 n h
+  if eq rc OT_OK
+    ad_save_h out_idx h
+  end
+  ret rc
+end
+
+fn ad_build_case to long
   tmp = new ulong 1 0
-  ad_chk eq ad_leaf get ha 0 get ha 1 1 tmp AD_OK
-  put ids 0 get tmp 0
-  ad_chk eq ad_leaf get hb 0 get hb 1 1 tmp AD_OK
-  put ids 1 get tmp 0
-  ad_chk eq ad_leaf get hc 0 get hc 1 1 tmp AD_OK
-  put ids 2 get tmp 0
-  ad_chk eq ad_matmul get ids 0 get ids 1 tmp AD_OK
-  put ids 3 get tmp 0
-  ad_chk eq ad_binary AD_MAX get ids 3 get ids 2 tmp AD_OK
-  put ids 4 get tmp 0
-  ad_chk eq ad_reduce AD_MEAN get ids 4 1 0 tmp AD_OK
-  put ids 5 get tmp 0
-  ad_chk eq ad_reduce AD_MEAN get ids 5 0 0 tmp AD_OK
-  put ids 6 get tmp 0
-  ad_chk eq ad_backward get ids 6 AD_OK
-  gc = new f32 2 0.0f32
-  ad_chk eq ad_grad_read_f32 get ids 2 gc AD_OK
-  ad_chk ad_near get gc 0 0.0f32 0.0001f32
-  ad_chk ad_near get gc 1 0.25f32 0.0001f32
+  st = new ulong 8 0
+  rc = ad_leaf get tad_h 0 get tad_h 1 1 tmp
+  if ne rc AD_OK
+    ret rc
+  end
+  put tad_ids 0 get tmp 0
+  put tad_ids 1 AD_NONE
+  if ne get tad_cm 3 0
+    rc = ad_leaf get tad_h 2 get tad_h 3 1 tmp
+    if ne rc AD_OK
+      ret rc
+    end
+    put tad_ids 1 get tmp 0
+  end
+  op = get tad_cm 0
+  if le op AD_MAX
+    rc = ad_binary op get tad_ids 0 get tad_ids 1 tmp
+  else
+    if eq op AD_SQRT
+      rc = ad_sqrt get tad_ids 0 tmp
+    else
+      if eq op AD_MATMUL
+        rc = ad_matmul get tad_ids 0 get tad_ids 1 tmp
+      else
+        if eq op AD_TRANSPOSE
+          rc = ad_transpose get tad_ids 0 tmp
+        else
+          if eq op AD_BROADCAST
+            rt = get tad_cm 6
+            for d ulong rt bound 8
+              put st d get tad_st d
+            end
+            rc = ad_broadcast get tad_ids 0 rt st tmp
+          else
+            rc = ad_reduce op get tad_ids 0 get tad_cm 4 get tad_cm 5 tmp
+          end
+        end
+      end
+    end
+  end
+  put tad_ids 2 get tmp 0
+  ret rc
+end
+
+note ---- Layer 1: exact f64 calculus reference ----
+
+fn ad_ref_ew_a j ulong oc view ulong 8 da ulong to void
+  xa = ad_bmap oc 0
+  op = get tad_cm 0
+  gv = f64 get tad_r j
+  bv = 0.0f64
+  if ne get tad_cm 3 0
+    bv = f64 get tad_b ad_bmap oc 1
+  end
+  ta_v = gv
+  ea = da
+  if eq op AD_MUL
+    ta_v = mul gv bv
+    ea = add ea 1
+  else
+    if eq op AD_DIV
+      ta_v = div gv bv
+      ea = add ea 1
+    else
+      if eq op AD_MAX
+        if not gt f64 get tad_a xa bv
+          ta_v = 0.0f64
+        end
+      end
+    end
+  end
+  put tad_ra xa add get tad_ra xa ta_v
+  put tad_aa xa add get tad_aa xa fabs ta_v
+  put tad_ka xa ea
+end
+
+fn ad_ref_ew_b j ulong oc view ulong 8 db ulong to void
+  xb = ad_bmap oc 1
+  op = get tad_cm 0
+  gv = f64 get tad_r j
+  av = f64 get tad_a ad_bmap oc 0
+  bv = f64 get tad_b xb
+  tb_v = gv
+  eb = db
+  if eq op AD_SUB
+    tb_v = sub 0.0f64 gv
+  else
+    if eq op AD_MUL
+      tb_v = mul gv av
+      eb = add eb 1
+    else
+      if eq op AD_DIV
+        tb_v = div sub 0.0f64 mul gv av mul bv bv
+        eb = add eb 3
+      else
+        if eq op AD_MAX
+          if gt av bv
+            tb_v = 0.0f64
+          end
+        end
+      end
+    end
+  end
+  put tad_rb xb add get tad_rb xb tb_v
+  put tad_ab xb add get tad_ab xb fabs tb_v
+  put tad_kb xb eb
+end
+
+fn ad_ref_elemwise to void
+  ny = get tad_cm 11
+  da = ad_unb_depth 0
+  db = ulong 0
+  has_b = get tad_cm 3
+  if ne has_b 0
+    db = ad_unb_depth 1
+  end
+  oc = new ulong 8 0
+  for j ulong ny bound 128
+    ad_unravel_y j oc
+    ad_ref_ew_a j oc da
+    if ne has_b 0
+      ad_ref_ew_b j oc db
+    end
+  end
+end
+
+fn ad_mm_prod_rb rbase ulong bbase ulong j ulong to f64
+  rv = f64 get tad_r add rbase j
+  bv = f64 get tad_b add bbase j
+  ret mul rv bv
+end
+
+fn ad_mm_prod_ar row ulong k ulong j ulong to f64
+  ra = get tad_cm 1
+  k_d = get tad_sa sub ra 1
+  n_d = get tad_sb 1
+  av = f64 get tad_a add mul row k_d k
+  rv = f64 get tad_r add mul row n_d j
+  ret mul av rv
+end
+
+fn ad_ref_mm_a_one row ulong k ulong k_d ulong n_d ulong to void
+  s = 0.0f64
+  sa_v = 0.0f64
+  rbase = mul row n_d
+  bbase = mul k n_d
+  for j ulong n_d bound 16
+    p = ad_mm_prod_rb rbase bbase j
+    s = add s p
+    sa_v = add sa_v fabs p
+  end
+  x = add mul row k_d k
+  put tad_ra x s
+  put tad_aa x sa_v
+  put tad_ka x add 1 mul 5 ad_levels n_d
+end
+
+fn ad_ref_mm_b_one k ulong j ulong bt ulong m ulong to void
+  n_d = get tad_sb 1
+  s = 0.0f64
+  sa_v = 0.0f64
+  tot_rows = mul bt m
+  for row ulong tot_rows bound 64
+    p = ad_mm_prod_ar row k j
+    s = add s p
+    sa_v = add sa_v fabs p
+  end
+  kb = add 1 mul 5 ad_levels m
+  if gt bt 1
+    kb = add kb mul 5 ad_levels bt
+  end
+  x = add mul k n_d j
+  put tad_rb x s
+  put tad_ab x sa_v
+  put tad_kb x kb
+end
+
+fn ad_ref_matmul to void
+  ra = get tad_cm 1
+  bt = ulong 1
+  if eq ra 3
+    bt = get tad_sa 0
+  end
+  m = get tad_sa sub ra 2
+  k_d = get tad_sa sub ra 1
+  n_d = get tad_sb 1
+  tot_rows = mul bt m
+  for row ulong tot_rows bound 64
+    for k ulong k_d bound 16
+      ad_ref_mm_a_one row k k_d n_d
+    end
+  end
+  for k ulong k_d bound 16
+    for j ulong n_d bound 16
+      ad_ref_mm_b_one k j bt m
+    end
+  end
+end
+
+fn ad_ref_reduce to void
+  op = get tad_cm 0
+  ra = get tad_cm 1
+  na = get tad_cm 9
+  ax = get tad_cm 4
+  n_ax = f64 get tad_sa ax
+  ic = new ulong 8 0
+  for i ulong na bound 128
+    f = i
+    for di ulong ra bound 8
+      d = sub sub ra 1 di
+      sd = get tad_sa d
+      put ic d rem f sd
+      f = div f sd
+    end
+    j = ulong 0
+    for d ulong ra bound 8
+      if ne d ax
+        j = add mul j get tad_sa d get ic d
+      end
+    end
+    rv = f64 get tad_r j
+    if eq op AD_MEAN
+      rv = div rv n_ax
+      put tad_ka i 1
+    else
+      put tad_ka i 0
+    end
+    put tad_ra i rv
+    put tad_aa i fabs rv
+  end
+end
+
+fn ad_compute_ref to void
+  na = get tad_cm 9
+  nb = get tad_cm 10
+  for i ulong na bound 128
+    put tad_ra i 0.0f64
+    put tad_aa i 0.0f64
+    put tad_ka i 0
+  end
+  for i ulong nb bound 128
+    put tad_rb i 0.0f64
+    put tad_ab i 0.0f64
+    put tad_kb i 0
+  end
+  op = get tad_cm 0
+  if or le op AD_MAX eq op AD_BROADCAST
+    ad_ref_elemwise
+    ret
+  end
+  if eq op AD_SQRT
+    for i ulong na bound 128
+      v = div f64 get tad_r i mul 2.0f64 fsqrt f64 get tad_a i
+      put tad_ra i v
+      put tad_aa i fabs v
+      put tad_ka i 2
+    end
+    ret
+  end
+  if eq op AD_MATMUL
+    ad_ref_matmul
+    ret
+  end
+  if eq op AD_TRANSPOSE
+    m = get tad_sa 0
+    n_d = get tad_sa 1
+    for i ulong m bound 16
+      for j ulong n_d bound 16
+        rv = f64 get tad_r add mul j m i
+        put tad_ra add mul i n_d j rv
+        put tad_aa add mul i n_d j fabs rv
+      end
+    end
+    ret
+  end
+  ad_ref_reduce
+end
+
+fn ad_bound_viols which ulong to ulong
+  n = get tad_cm 9
+  if eq which 1
+    n = get tad_cm 10
+  end
+  bad = ulong 0
+  for i ulong n bound 128
+    an = f64 get tad_ga i
+    rf = get tad_ra i
+    ab = get tad_aa i
+    kv = get tad_ka i
+    if eq which 1
+      an = f64 get tad_gb i
+      rf = get tad_rb i
+      ab = get tad_ab i
+      kv = get tad_kb i
+    end
+    lim = add add mul ad_gamma kv ab mul 0.000000000001f64 ab 0.000000000000000000000000000001f64
+    if not le fabs sub an rf lim
+      bad = add bad 1
+    end
+  end
+  ret bad
+end
+
+note ---- Layer 2: bit-exact M20 replay ----
+
+fn ad_rp_take cs ulong cg ulong which ulong to long
+  nt = get tad_cm 9
+  if eq which 1
+    nt = get tad_cm 10
+  end
+  buf = new f32 128 0.0f32
+  rc = ot_read_f32 cs cg part buf 0 nt
+  rr = ot_release cs cg
+  if ne rc OT_OK
+    ret rc
+  end
+  for i ulong nt bound 128
+    if eq which 0
+      put tad_ea i get buf i
+    else
+      put tad_eb i get buf i
+    end
+  end
+  ret OT_OK
+end
+
+fn ad_rp_out fs ulong fg ulong which ulong to long
+  rt = get tad_cm 1
+  if eq which 1
+    rt = get tad_cm 2
+  end
+  cs = fs
+  cg = fg
+  nh = new ulong 2 0
+  while gt get ot_ts_meta add mul cs 10 4 rt bound 8
+    rc = ot_reduce OT_TR_SUM cs cg 0 0 nh
+    rr = ot_release cs cg
+    if ne rc OT_OK
+      ret rc
+    end
+    cs = get nh 0
+    cg = get nh 1
+  end
+  for d ulong rt bound 8
+    want = get tad_sa d
+    if eq which 1
+      want = get tad_sb d
+    end
+    if eq want 1
+      cur_d = get ot_ts_shape add mul cs 8 d
+      if ne cur_d 1
+        rc = ot_reduce OT_TR_SUM cs cg d 1 nh
+        rr = ot_release cs cg
+        if ne rc OT_OK
+          ret rc
+        end
+        cs = get nh 0
+        cg = get nh 1
+      end
+    end
+  end
+  ret ad_rp_take cs cg which
+end
+
+fn ad_rp_max_load h_idx ulong ry ulong sy view ulong 8 dst edit f32 128 to long
+  ny = get tad_cm 11
+  x = new ulong 2 0
+  rc = ot_broadcast_to get tad_h mul h_idx 2 get tad_h add mul h_idx 2 1 ry sy x
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_read_f32 get x 0 get x 1 part dst 0 ny
+  rr = ot_release get x 0 get x 1
+  ret rc
+end
+
+fn ad_rp_max to long
+  ry = get tad_cm 8
+  ny = get tad_cm 11
+  sy = new ulong 8 0
+  x = new ulong 2 0
+  va = new f32 128 0.0f32
+  vb = new f32 128 0.0f32
+  for d ulong ry bound 8
+    put sy d get tad_sy d
+  end
+  rc = ad_rp_max_load 0 ry sy va
+  if eq rc OT_OK
+    rc = ad_rp_max_load 1 ry sy vb
+  end
+  if ne rc OT_OK
+    ret rc
+  end
+  for i ulong ny bound 128
+    gvi = get tad_r i
+    if ad_max_routes_a get va i get vb i
+      put va i gvi
+      put vb i 0.0f32
+    else
+      put va i 0.0f32
+      put vb i gvi
+    end
+  end
+  rc = ot_from_f32 ry sy part va 0 ny x
+  if eq rc OT_OK
+    rc = ad_rp_out get x 0 get x 1 0
+  end
+  if eq rc OT_OK
+    rc = ot_from_f32 ry sy part vb 0 ny x
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 1
+    end
+  end
+  ret rc
+end
+
+fn ad_rp_div to long
+  x = new ulong 2 0
+  y = new ulong 2 0
+  x2 = new ulong 2 0
+  k = new ulong 2 0
+  rc = ot_binary OT_TB_DIV get tad_h 4 get tad_h 5 get tad_h 2 get tad_h 3 x
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ad_rp_out get x 0 get x 1 0
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_binary OT_TB_DIV get tad_h 0 get tad_h 1 get tad_h 2 get tad_h 3 y
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_binary OT_TB_DIV get y 0 get y 1 get tad_h 2 get tad_h 3 x2
+  rr = ot_release get y 0 get y 1
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_binary OT_TB_MUL get tad_h 4 get tad_h 5 get x2 0 get x2 1 x
+  rr = ot_release get x2 0 get x2 1
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ad_scalar -1.0f32 k
+  if ne rc OT_OK
+    rr = ot_release get x 0 get x 1
+    ret rc
+  end
+  rc = ot_binary OT_TB_MUL get x 0 get x 1 get k 0 get k 1 x2
+  rr = ot_release get k 0 get k 1
+  rr = ot_release get x 0 get x 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_rp_out get x2 0 get x2 1 1
+end
+
+fn ad_rp_reduce to long
+  ra = get tad_cm 1
+  ax = get tad_cm 4
+  ks = new ulong 8 0
+  sa = new ulong 8 0
+  r = new ulong 2 0
+  bc = new ulong 2 0
+  x2 = new ulong 2 0
+  for d ulong ra bound 8
+    put sa d get tad_sa d
+    if eq d ax
+      put ks d 1
+    else
+      put ks d get tad_sa d
+    end
+  end
+  rc = ot_reshape get tad_h 4 get tad_h 5 ra ks r
+  if ne rc OT_OK
+    ret rc
+  end
+  rc = ot_broadcast_to get r 0 get r 1 ra sa bc
+  if ne rc OT_OK
+    rr = ot_release get r 0 get r 1
+    ret rc
+  end
+  rc = ot_contiguous get bc 0 get bc 1 x2
+  rr = ot_release get bc 0 get bc 1
+  rr = ot_release get r 0 get r 1
+  if ne rc OT_OK
+    ret rc
+  end
+  if eq get tad_cm 0 AD_SUM
+    ret ad_rp_out get x2 0 get x2 1 0
+  end
+  rc = ad_scalar f32 get tad_sa ax r
+  if ne rc OT_OK
+    rr = ot_release get x2 0 get x2 1
+    ret rc
+  end
+  rc = ot_binary OT_TB_DIV get x2 0 get x2 1 get r 0 get r 1 bc
+  rr = ot_release get r 0 get r 1
+  rr = ot_release get x2 0 get x2 1
+  if ne rc OT_OK
+    ret rc
+  end
+  ret ad_rp_out get bc 0 get bc 1 0
+end
+
+fn ad_replay_case to long
+  op = get tad_cm 0
+  x = new ulong 2 0
+  x2 = new ulong 2 0
+  k = new ulong 2 0
+  if or eq op AD_ADD eq op AD_SUB
+    rc = ot_contiguous get tad_h 4 get tad_h 5 x
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 0
+    end
+    if ne rc OT_OK
+      ret rc
+    end
+    if eq op AD_ADD
+      rc = ot_contiguous get tad_h 4 get tad_h 5 x
+    else
+      rc = ad_scalar -1.0f32 k
+      if eq rc OT_OK
+        rc = ot_binary OT_TB_MUL get tad_h 4 get tad_h 5 get k 0 get k 1 x
+        rr = ot_release get k 0 get k 1
+      end
+    end
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 1
+    end
+    ret rc
+  end
+  if eq op AD_MUL
+    rc = ot_binary OT_TB_MUL get tad_h 4 get tad_h 5 get tad_h 2 get tad_h 3 x
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 0
+    end
+    if eq rc OT_OK
+      rc = ot_binary OT_TB_MUL get tad_h 4 get tad_h 5 get tad_h 0 get tad_h 1 x
+    end
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 1
+    end
+    ret rc
+  end
+  if eq op AD_DIV
+    ret ad_rp_div
+  end
+  if eq op AD_MAX
+    ret ad_rp_max
+  end
+  if eq op AD_SQRT
+    rc = ot_unary OT_TU_SQRT get tad_h 0 get tad_h 1 x
+    if eq rc OT_OK
+      rc = ot_binary OT_TB_ADD get x 0 get x 1 get x 0 get x 1 x2
+      rr = ot_release get x 0 get x 1
+    end
+    if eq rc OT_OK
+      rc = ot_binary OT_TB_DIV get tad_h 4 get tad_h 5 get x2 0 get x2 1 x
+      rr = ot_release get x2 0 get x2 1
+    end
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 0
+    end
+    ret rc
+  end
+  if eq op AD_MATMUL
+    rc = ot_transpose get tad_h 2 get tad_h 3 x2
+    if eq rc OT_OK
+      rc = ot_matmul get tad_h 4 get tad_h 5 get x2 0 get x2 1 x
+      rr = ot_release get x2 0 get x2 1
+    end
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 0
+    end
+    if ne rc OT_OK
+      ret rc
+    end
+    rc = ot_transpose get tad_h 0 get tad_h 1 x2
+    if eq rc OT_OK
+      rc = ot_matmul get x2 0 get x2 1 get tad_h 4 get tad_h 5 x
+      rr = ot_release get x2 0 get x2 1
+    end
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 1
+    end
+    ret rc
+  end
+  if eq op AD_TRANSPOSE
+    rc = ot_transpose get tad_h 4 get tad_h 5 x2
+    if eq rc OT_OK
+      rc = ot_contiguous get x2 0 get x2 1 x
+      rr = ot_release get x2 0 get x2 1
+    end
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 0
+    end
+    ret rc
+  end
+  if eq op AD_BROADCAST
+    rc = ot_contiguous get tad_h 4 get tad_h 5 x
+    if eq rc OT_OK
+      rc = ad_rp_out get x 0 get x 1 0
+    end
+    ret rc
+  end
+  ret ad_rp_reduce
+end
+
+note ---- Layer 3: central finite differences ----
+
+fn ad_gen_data fd_mode ulong to void
+  na = get tad_cm 9
+  nb = get tad_cm 10
+  dm = get tad_cm 7
+  op = get tad_cm 0
+  for i ulong nb bound 128
+    put tad_b i ad_urand get tad_lim 2 get tad_lim 3
+  end
+  for i ulong na bound 128
+    if eq dm 1
+      m = ad_urand 0.1f32 1.0f32
+      if lt ad_urand 0.0f32 1.0f32 0.5f32
+        put tad_a i neg m
+      else
+        put tad_a i m
+      end
+    else
+      if eq dm 2
+        m = ad_urand 0.1f32 0.6f32
+        if lt ad_urand 0.0f32 1.0f32 0.5f32
+          put tad_a i sub get tad_b i m
+        else
+          put tad_a i add get tad_b i m
+        end
+      else
+        put tad_a i ad_urand get tad_lim 0 get tad_lim 1
+      end
+    end
+  end
+  if ne fd_mode 0
+    if or eq op AD_MUL eq op AD_MATMUL
+      for i ulong na bound 128
+        put tad_a i ad_urand 0.5f32 1.0f32
+      end
+      for i ulong nb bound 128
+        put tad_b i ad_urand 0.5f32 1.0f32
+      end
+    else
+      if eq op AD_DIV
+        for i ulong na bound 128
+          put tad_a i ad_urand 1.0f32 2.0f32
+        end
+      end
+    end
+  end
+end
+
+fn ad_fwd_loss to f64
+  ybuf = new f32 128 0.0f32
+  rc = ad_mk_g 0 0
+  if ne get tad_cm 3 0
+    rc = ad_mk_g 1 1
+  end
+  rc = ad_tape_init 8 1024
+  rc = ad_build_case
+  iy = get tad_ids 2
+  ny = get tad_cm 11
+  ys = get ad_nodes add mul iy 12 8
+  yg = get ad_nodes add mul iy 12 9
+  rc = ot_read_f32 ys yg part ybuf 0 ny
+  s = 0.0f64
+  for i ulong ny bound 128
+    s = add s mul f64 get ybuf i f64 get tad_r i
+  end
+  ad_tape_release
+  ad_rel_h 0
+  if ne get tad_cm 3 0
+    ad_rel_h 1
+  end
+  ret s
+end
+
+fn ad_run_tape_grads rlo f32 rhi f32 do_replay ulong to void
+  gb = new f32 128 0.0f32
+  ad_chk eq ad_mk_g 0 0 OT_OK
+  if ne get tad_cm 3 0
+    ad_chk eq ad_mk_g 1 1 OT_OK
+  end
+  ad_chk eq ad_tape_init 8 1024 AD_OK
+  ad_chk eq ad_build_case AD_OK
+  iy = get tad_ids 2
+  ys = get ad_nodes add mul iy 12 8
+  ry = get ot_ts_meta add mul ys 10 4
+  ny = get ot_ts_meta add mul ys 10 6
+  put tad_cm 8 ry
+  put tad_cm 11 ny
+  for d ulong ry bound 8
+    put tad_sy d get ot_ts_shape add mul ys 8 d
+  end
+  for i ulong ny bound 128
+    put tad_r i ad_urand rlo rhi
+  end
+  ad_chk eq ad_mk_g 2 2 OT_OK
+  ad_chk eq ad_backward_seed iy get tad_h 4 get tad_h 5 AD_OK
+  na = get tad_cm 9
+  nb = get tad_cm 10
+  ad_chk eq ad_grad_read_f32 get tad_ids 0 part gb 0 na AD_OK
+  for i ulong na bound 128
+    put tad_ga i get gb i
+  end
+  if ne get tad_cm 3 0
+    ad_chk eq ad_grad_read_f32 get tad_ids 1 part gb 0 nb AD_OK
+    for i ulong nb bound 128
+      put tad_gb i get gb i
+    end
+  end
+  ad_tape_release
+  if ne do_replay 0
+    ad_chk eq ad_replay_case OT_OK
+  end
+  ad_rel_h 2
+  ad_rel_h 0
+  if ne get tad_cm 3 0
+    ad_rel_h 1
+  end
+end
+
+fn ad_fd_one which ulong i ulong to bool
+  x0 = get tad_a i
+  an = f64 get tad_ga i
+  if eq which 1
+    x0 = get tad_b i
+    an = f64 get tad_gb i
+  end
+  xp = f32 add f64 x0 TAD_FD_H
+  xm = f32 sub f64 x0 TAD_FD_H
+  if eq which 0
+    put tad_a i xp
+  else
+    put tad_b i xp
+  end
+  lp = ad_fwd_loss
+  if eq which 0
+    put tad_a i xm
+  else
+    put tad_b i xm
+  end
+  lm = ad_fwd_loss
+  if eq which 0
+    put tad_a i x0
+  else
+    put tad_b i x0
+  end
+  fd = div sub lp lm sub f64 xp f64 xm
+  ret ad_fd_ok an fd
+end
+
+fn ad_check_fd_side which ulong to void
+  nx = get tad_cm 9
+  if eq which 1
+    nx = get tad_cm 10
+  end
+  bad = ulong 0
+  for i ulong nx bound 128
+    if not ad_fd_one which i
+      bad = add bad 1
+    end
+  end
+  ad_chk eq bad 0
+end
+
+fn ad_run_one_case chk_flip ulong to void
+  put tad_cm 9 ad_numel get tad_cm 1 0
+  if ne get tad_cm 3 0
+    put tad_cm 10 ad_numel get tad_cm 2 1
+  else
+    put tad_cm 10 0
+  end
+  ad_gen_data 0
+  ad_run_tape_grads -1.0f32 1.0f32 1
+  na = get tad_cm 9
+  nb = get tad_cm 10
+  mm_a = ulong 0
+  for i ulong na bound 128
+    if ne bitcast uint get tad_ga i bitcast uint get tad_ea i
+      mm_a = add mm_a 1
+    end
+  end
+  ad_chk eq mm_a 0
+  if ne get tad_cm 3 0
+    mm_b = ulong 0
+    for i ulong nb bound 128
+      if ne bitcast uint get tad_gb i bitcast uint get tad_eb i
+        mm_b = add mm_b 1
+      end
+    end
+    ad_chk eq mm_b 0
+  end
+  if ne chk_flip 0
+    b0 = xor bitcast uint get tad_ea 0 uint 1
+    ad_chk ne bitcast uint get tad_ga 0 b0
+  end
+  ad_compute_ref
+  ad_chk eq ad_bound_viols 0 0
+  if ne get tad_cm 3 0
+    ad_chk eq ad_bound_viols 1 0
+  end
+  ad_gen_data 1
+  ad_run_tape_grads 0.5f32 1.0f32 0
+  ad_check_fd_side 0
+  if ne get tad_cm 3 0
+    ad_check_fd_side 1
+  end
+end
+
+fn ad_set_lim alo f32 ahi f32 blo f32 bhi f32 to void
+  put tad_lim 0 alo
+  put tad_lim 1 ahi
+  put tad_lim 2 blo
+  put tad_lim 3 bhi
+end
+
+fn ad_set_bin op ulong ra ulong rb ulong dm ulong to void
+  put tad_cm 0 op
+  put tad_cm 1 ra
+  put tad_cm 2 rb
+  put tad_cm 3 1
+  put tad_cm 4 0
+  put tad_cm 5 0
+  put tad_cm 6 0
+  put tad_cm 7 dm
+end
+
+fn ad_set_un op ulong ra ulong ax ulong kp ulong rt ulong to void
+  put tad_cm 0 op
+  put tad_cm 1 ra
+  put tad_cm 2 0
+  put tad_cm 3 0
+  put tad_cm 4 ax
+  put tad_cm 5 kp
+  put tad_cm 6 rt
+  put tad_cm 7 0
+end
+
+fn test_all_21_cases_a to void
+  ad_set_lim -2.0f32 2.0f32 -2.0f32 2.0f32
+  put tad_sa 0 3
+  put tad_sa 1 4
+  put tad_sb 0 4
+  ad_set_bin AD_ADD 2 1 0
+  ad_run_one_case 1
+  put tad_sa 0 2
+  put tad_sa 1 1
+  put tad_sa 2 3
+  put tad_sb 0 4
+  put tad_sb 1 1
+  ad_set_bin AD_ADD 3 2 0
+  ad_run_one_case 0
+  put tad_sa 0 3
+  put tad_sa 1 4
+  put tad_sb 0 3
+  put tad_sb 1 4
+  ad_set_bin AD_ADD 2 2 0
+  ad_run_one_case 0
+  put tad_sb 0 3
+  put tad_sb 1 1
+  ad_set_bin AD_SUB 2 2 0
+  ad_run_one_case 0
+  put tad_sb 0 3
+  put tad_sb 1 4
+  ad_set_bin AD_SUB 2 2 0
+  ad_run_one_case 0
+  put tad_sb 0 1
+  put tad_sb 1 4
+  ad_set_bin AD_MUL 2 2 0
+  ad_run_one_case 0
+  put tad_sa 0 2
+  put tad_sa 1 3
+  put tad_sb 0 1
+  ad_set_bin AD_MUL 2 1 0
+  ad_run_one_case 0
+  ad_set_lim -2.0f32 2.0f32 1.0f32 2.0f32
+  put tad_sa 0 3
+  put tad_sa 1 4
+  put tad_sb 0 4
+  ad_set_bin AD_DIV 2 1 0
+  ad_run_one_case 0
+  put tad_sb 0 3
+  put tad_sb 1 4
+  ad_set_bin AD_DIV 2 2 0
+  ad_run_one_case 0
+  ad_set_lim -1.0f32 1.0f32 0.0f32 0.0f32
+  put tad_sb 0 1
+  ad_set_bin AD_MAX 2 1 1
+  ad_run_one_case 0
+  ad_set_lim -1.0f32 1.0f32 -1.0f32 1.0f32
+  put tad_sb 0 3
+  put tad_sb 1 4
+  ad_set_bin AD_MAX 2 2 2
+  ad_run_one_case 0
+end
+
+fn test_all_21_cases_b to void
+  ad_set_lim 1.0f32 4.0f32 0.0f32 0.0f32
+  put tad_sa 0 3
+  put tad_sa 1 4
+  ad_set_un AD_SQRT 2 0 0 0
+  ad_run_one_case 0
+  ad_set_lim -1.0f32 1.0f32 -1.0f32 1.0f32
+  put tad_sa 0 3
+  put tad_sa 1 5
+  put tad_sb 0 5
+  put tad_sb 1 4
+  ad_set_bin AD_MATMUL 2 2 0
+  ad_run_one_case 0
+  put tad_sa 0 2
+  put tad_sa 1 3
+  put tad_sa 2 5
+  put tad_sb 0 5
+  put tad_sb 1 4
+  ad_set_bin AD_MATMUL 3 2 0
+  ad_run_one_case 0
+  ad_set_lim -2.0f32 2.0f32 0.0f32 0.0f32
+  put tad_sa 0 3
+  put tad_sa 1 4
+  ad_set_un AD_TRANSPOSE 2 0 0 0
+  ad_run_one_case 0
+  put tad_sa 0 4
+  put tad_st 0 3
+  put tad_st 1 4
+  ad_set_un AD_BROADCAST 1 0 0 2
+  ad_run_one_case 0
+  put tad_sa 0 3
+  put tad_sa 1 1
+  put tad_st 0 2
+  put tad_st 1 3
+  put tad_st 2 4
+  ad_set_un AD_BROADCAST 2 0 0 3
+  ad_run_one_case 0
+  put tad_sa 0 3
+  put tad_sa 1 4
+  ad_set_un AD_SUM 2 1 0 0
+  ad_run_one_case 0
+  ad_set_un AD_SUM 2 0 1 0
+  ad_run_one_case 0
+  ad_set_un AD_MEAN 2 1 0 0
+  ad_run_one_case 0
+  ad_set_un AD_MEAN 2 0 1 0
+  ad_run_one_case 0
+end
+
+note ---- 2. comparator counterexamples ----
+
+fn test_comparators_reject to void
+  ad_set_lim -2.0f32 2.0f32 -2.0f32 2.0f32
+  put tad_sa 0 3
+  put tad_sa 1 4
+  put tad_sb 0 1
+  put tad_sb 1 4
+  ad_set_bin AD_MUL 2 2 0
+  put tad_cm 9 12
+  put tad_cm 10 4
+  put tad_cm 8 2
+  put tad_cm 11 12
+  put tad_sy 0 3
+  put tad_sy 1 4
+  ad_gen_data 0
+  for i ulong 12
+    put tad_r i ad_urand -1.0f32 1.0f32
+  end
+  ad_compute_ref
+  for i ulong 12
+    put tad_ga i f32 mul get tad_ra i 1.0000009536743164f64
+  end
+  ad_chk gt ad_bound_viols 0 0
+  for i ulong 12
+    put tad_ga i f32 get tad_ra i
+  end
+  ad_chk eq ad_bound_viols 0 0
+  ad_gen_data 1
+  for i ulong 12
+    put tad_r i ad_urand 0.5f32 1.0f32
+  end
+  ad_compute_ref
+  facc = ulong 0
+  fneg = ulong 0
+  fbig = ulong 0
+  for i ulong 12
+    x0 = get tad_a i
+    xp = f32 add f64 x0 TAD_FD_H
+    xm = f32 sub f64 x0 TAD_FD_H
+    put tad_a i xp
+    lp = ad_fwd_loss
+    put tad_a i xm
+    lm = ad_fwd_loss
+    put tad_a i x0
+    fd = div sub lp lm sub f64 xp f64 xm
+    rf = get tad_ra i
+    if ad_fd_ok rf fd
+      facc = add facc 1
+    end
+    if not ad_fd_ok sub 0.0f64 rf fd
+      fneg = add fneg 1
+    end
+    if not ad_fd_ok mul rf 1.002f64 fd
+      fbig = add fbig 1
+    end
+  end
+  ad_chk eq facc 12
+  ad_chk gt fneg 0
+  ad_chk eq fbig 12
+end
+
+note ---- 3. MAX ties go to b ----
+
+fn test_max_ties to void
+  sh = new ulong 8 0
+  buf = new f32 4 0.0f32
+  h = new ulong 2 0
+  tmp = new ulong 1 0
+  put sh 0 4
+  put buf 0 0.5f32
+  put buf 1 -0.25f32
+  put buf 2 0.0f32
+  put buf 3 bitcast f32 OT_NEG0_BITS
+  ad_chk eq ot_from_f32 1 sh buf h OT_OK
+  ad_save_h 0 h
+  put buf 2 bitcast f32 OT_NEG0_BITS
+  put buf 3 0.0f32
+  ad_chk eq ot_from_f32 1 sh buf h OT_OK
+  ad_save_h 1 h
+  put buf 0 1.0f32
+  put buf 1 2.0f32
+  put buf 2 3.0f32
+  put buf 3 4.0f32
+  ad_chk eq ot_from_f32 1 sh buf h OT_OK
+  ad_save_h 2 h
+  ad_chk eq ad_tape_init 4 12 AD_OK
+  ad_chk eq ad_leaf get tad_h 0 get tad_h 1 1 tmp AD_OK
+  put tad_ids 0 get tmp 0
+  ad_chk eq ad_leaf get tad_h 2 get tad_h 3 1 tmp AD_OK
+  put tad_ids 1 get tmp 0
+  ad_chk eq ad_binary AD_MAX get tad_ids 0 get tad_ids 1 tmp AD_OK
+  ad_chk eq ad_backward_seed get tmp 0 get tad_h 4 get tad_h 5 AD_OK
+  ad_chk eq ad_grad_read_f32 get tad_ids 0 buf AD_OK
+  for i ulong 4
+    ad_chk eq get buf i 0.0f32
+  end
+  ad_chk eq ad_grad_read_f32 get tad_ids 1 buf AD_OK
+  for i ulong 4
+    ad_chk eq get buf i f32 add i 1
+  end
+  ad_tape_release
+  ad_rel_h 0
+  ad_rel_h 1
+  ad_rel_h 2
+  ad_chk_leaks
+end
+
+note ---- 4. composite linear + MSE fan-out graph & 5. determinism ----
+
+fn ad_lin_setup to void
+  sh = new ulong 8 0
+  buf = new f32 12 0.0f32
+  h = new ulong 2 0
+  put sh 0 4
+  put sh 1 3
+  for i ulong 12
+    put buf i get tad_lx i
+  end
+  ad_chk eq ot_from_f32 2 sh buf h OT_OK
+  ad_save_h 0 h
+  put sh 0 3
+  put sh 1 2
+  for i ulong 6
+    put buf i get tad_lw i
+  end
+  ad_chk eq ot_from_f32 2 sh part buf 0 6 h OT_OK
+  ad_save_h 1 h
+  put sh 0 2
+  put buf 0 get tad_lb 0
+  put buf 1 get tad_lb 1
+  ad_chk eq ot_from_f32 1 sh part buf 0 2 h OT_OK
+  ad_save_h 2 h
+  put sh 0 4
+  put sh 1 2
+  for i ulong 8
+    put buf i get tad_ly i
+  end
+  ad_chk eq ot_from_f32 2 sh part buf 0 8 h OT_OK
+  ad_save_h 3 h
+end
+
+fn ad_lin_bwd_and_lid do_bwd ulong fg_slot ulong lid_slot ulong to void
+  dv = new f32 8 0.0f32
+  pids = new ulong 2 0
+  gx = new ulong 2 0
+  lid = new uchar 32 0
+  if ne lid_slot 0
+    ls = get ad_nodes add mul get tad_ids 9 12 8
+    lg = get ad_nodes add mul get tad_ids 9 12 9
+    ad_chk eq ot_value_id ls lg lid OT_OK
+    for i ulong 32
+      if eq lid_slot 1
+        put tad_id1 i get lid i
+      else
+        put tad_id2 i get lid i
+      end
+    end
+  end
+  if ne do_bwd 0
+    ad_chk eq ad_backward get tad_ids 9 AD_OK
+    put pids 0 get tad_ids 1
+    put pids 1 get tad_ids 2
+    ad_chk eq ad_grads_flatten pids dv AD_OK
+    for i ulong 8
+      if eq fg_slot 0
+        put tad_fg1 i get dv i
+      else
+        put tad_fg2 i get dv i
+      end
+    end
+    ad_chk eq ad_grad get tad_ids 0 gx AD_ERR_NO_GRAD
+    ad_chk eq ad_grad get tad_ids 3 gx AD_ERR_NO_GRAD
+    ad_chk eq ad_grad get tad_ids 1 gx AD_OK
+  end
+end
+
+fn ad_lin_run do_bwd ulong fg_slot ulong lid_slot ulong to f64
+  tmp = new ulong 1 0
+  dv = new f32 8 0.0f32
+  ad_lin_setup
+  ad_chk eq ad_tape_init 16 0 AD_OK
+  ad_chk eq ad_leaf get tad_h 0 get tad_h 1 0 tmp AD_OK
+  put tad_ids 0 get tmp 0
+  ad_chk eq ad_leaf get tad_h 2 get tad_h 3 1 tmp AD_OK
+  put tad_ids 1 get tmp 0
+  ad_chk eq ad_leaf get tad_h 4 get tad_h 5 1 tmp AD_OK
+  put tad_ids 2 get tmp 0
+  ad_chk eq ad_leaf get tad_h 6 get tad_h 7 0 tmp AD_OK
+  put tad_ids 3 get tmp 0
+  ad_chk eq ad_matmul get tad_ids 0 get tad_ids 1 tmp AD_OK
+  put tad_ids 4 get tmp 0
+  ad_chk eq ad_binary AD_ADD get tad_ids 4 get tad_ids 2 tmp AD_OK
+  put tad_ids 5 get tmp 0
+  ad_chk eq ad_binary AD_SUB get tad_ids 5 get tad_ids 3 tmp AD_OK
+  put tad_ids 6 get tmp 0
+  ad_chk eq ad_binary AD_MUL get tad_ids 6 get tad_ids 6 tmp AD_OK
+  put tad_ids 7 get tmp 0
+  ad_chk eq ad_reduce AD_SUM get tad_ids 7 1 0 tmp AD_OK
+  put tad_ids 8 get tmp 0
+  ad_chk eq ad_reduce AD_MEAN get tad_ids 8 0 0 tmp AD_OK
+  put tad_ids 9 get tmp 0
+  ds = get ad_nodes add mul get tad_ids 6 12 8
+  dg = get ad_nodes add mul get tad_ids 6 12 9
+  ad_chk eq ot_read_f32 ds dg dv OT_OK
+  acc = 0.0f64
+  for i ulong 8
+    dvi = f64 get dv i
+    acc = add acc mul dvi dvi
+  end
+  loss_d = div acc 4.0f64
+  ad_lin_bwd_and_lid do_bwd fg_slot lid_slot
+  ad_tape_release
+  ad_rel_h 0
+  ad_rel_h 1
+  ad_rel_h 2
+  ad_rel_h 3
+  ret loss_d
+end
+
+fn test_comp_lin_err to void
+  for i ulong 4
+    for j ulong 2
+      s = f64 get tad_lb j
+      for k ulong 3
+        xv = f64 get tad_lx add mul i 3 k
+        wv = f64 get tad_lw add mul k 2 j
+        s = add s mul xv wv
+      end
+      ij = add mul i 2 j
+      put tad_ee ij sub s f64 get tad_ly ij
+    end
+  end
+end
+
+fn test_composite_closed_form to void
+  test_comp_lin_err
+  bad_ref = ulong 0
+  for k ulong 3
+    for j ulong 2
+      s = 0.0f64
+      for i ulong 4
+        xv = f64 get tad_lx add mul i 3 k
+        ev = get tad_ee add mul i 2 j
+        s = add s mul xv ev
+      end
+      s = mul s 0.5f64
+      gv = f64 get tad_fg1 add mul k 2 j
+      lim = add 0.00001f64 mul 0.00001f64 fabs s
+      if not le fabs sub gv s lim
+        bad_ref = add bad_ref 1
+      end
+    end
+  end
+  for j ulong 2
+    s = 0.0f64
+    for i ulong 4
+      s = add s get tad_ee add mul i 2 j
+    end
+    s = mul s 0.5f64
+    gv = f64 get tad_fg1 add 6 j
+    lim = add 0.00001f64 mul 0.00001f64 fabs s
+    if not le fabs sub gv s lim
+      bad_ref = add bad_ref 1
+    end
+  end
+  ad_chk eq bad_ref 0
+end
+
+fn test_comp_lin_fd_one is_b ulong idx ulong to bool
+  x0 = get tad_lw idx
+  gv = f64 get tad_fg1 idx
+  if ne is_b 0
+    x0 = get tad_lb idx
+    gv = f64 get tad_fg1 add 6 idx
+  end
+  xp = f32 add f64 x0 TAD_FD_H
+  xm = f32 sub f64 x0 TAD_FD_H
+  if eq is_b 0
+    put tad_lw idx xp
+  else
+    put tad_lb idx xp
+  end
+  lp = ad_lin_run 0 1 0
+  if eq is_b 0
+    put tad_lw idx xm
+  else
+    put tad_lb idx xm
+  end
+  lm = ad_lin_run 0 1 0
+  if eq is_b 0
+    put tad_lw idx x0
+  else
+    put tad_lb idx x0
+  end
+  fd = div sub lp lm sub f64 xp f64 xm
+  ret ad_fd_ok gv fd
+end
+
+fn test_composite_and_det to void
+  for i ulong 12
+    put tad_lx i ad_urand -1.0f32 1.0f32
+  end
+  for i ulong 6
+    put tad_lw i ad_urand -1.0f32 1.0f32
+  end
+  for i ulong 2
+    put tad_lb i ad_urand -1.0f32 1.0f32
+  end
+  for i ulong 8
+    put tad_ly i ad_urand -1.0f32 1.0f32
+  end
+  l1 = ad_lin_run 1 0 1
+  test_composite_closed_form
+  l2 = ad_lin_run 1 1 2
+  for i ulong 8
+    ad_chk eq bitcast uint get tad_fg1 i bitcast uint get tad_fg2 i
+  end
+  for i ulong 32
+    ad_chk eq get tad_id1 i get tad_id2 i
+  end
+  ad_chk ne bitcast uint get tad_fg1 3 xor bitcast uint get tad_fg2 3 uint 1
+  for i ulong 12
+    put tad_lx i ad_urand 0.5f32 1.0f32
+  end
+  for i ulong 6
+    put tad_lw i ad_urand 0.5f32 1.0f32
+  end
+  for i ulong 2
+    put tad_lb i ad_urand 0.5f32 1.0f32
+  end
+  for i ulong 8
+    put tad_ly i ad_urand -0.5f32 0.0f32
+  end
+  l3 = ad_lin_run 1 0 0
+  fbad = ulong 0
+  for i ulong 6
+    if not test_comp_lin_fd_one 0 i
+      fbad = add fbad 1
+    end
+  end
+  for i ulong 2
+    if not test_comp_lin_fd_one 1 i
+      fbad = add fbad 1
+    end
+  end
+  ad_chk eq fbad 0
+  ad_chk_leaks
+end
+
+note ---- 6. error paths, arena/tape/scratch limits, flatten untouched, leaks ----
+
+fn test_errors_cap to void
+  tmp = new ulong 1 77
+  lc = new ulong 2 0
+  ad_chk eq ad_tape_init 0 0 AD_ERR_BAD_ARGS
+  ad_chk eq ad_tape_init add AD_MAX_NODES 1 0 AD_ERR_BAD_ARGS
+  ad_chk eq ad_tape_init 4 add AD_SCRATCH_MAX 1 AD_ERR_BAD_ARGS
+  ad_chk eq ad_tape_init 3 0 AD_OK
+  ad_chk eq ad_leaf get tad_h 0 get tad_h 1 1 tmp AD_OK
+  put tad_ids 0 get tmp 0
+  ad_chk eq ad_leaf get tad_h 2 get tad_h 3 1 tmp AD_OK
+  put tad_ids 1 get tmp 0
+  ad_chk eq ad_binary AD_ADD get tad_ids 0 get tad_ids 1 tmp AD_OK
+  put tad_ids 2 get tmp 0
+  ad_chk eq get ad_tape_meta 1 3
+  ot_live_counts lc
+  t0 = get lc 0
+  s0 = get lc 1
+  put tmp 0 77
+  ad_chk eq ad_binary AD_ADD get tad_ids 2 get tad_ids 1 tmp AD_ERR_TAPE_FULL
+  ot_live_counts lc
+  ad_chk and eq get ad_tape_meta 1 3 eq get tmp 0 77
+  ad_chk and eq get lc 0 t0 eq get lc 1 s0
+  ad_chk eq ad_leaf get tad_h 0 get tad_h 1 1 tmp AD_ERR_TAPE_FULL
   ad_tape_release
 end
 
-fn test_transpose_and_seed to void
-  ad_chk eq ot_ctx_init 128 OT_OK
-  ad_chk eq ad_tape_init 64 1024 AD_OK
-  sh = new ulong 8 0
-  put sh 0 2
-  put sh 1 3
-  dat = new f32 6 0.0f32
-  for i ulong 6
-    put dat i f32 add i 1
+fn test_errors_shapes_scratch to void
+  tmp = new ulong 1 0
+  lc = new ulong 2 0
+  s4 = new ulong 8 0
+  put s4 0 4
+  ad_chk eq ad_tape_init 8 6 AD_OK
+  ad_chk eq ad_leaf get tad_h 0 get tad_h 1 1 tmp AD_OK
+  put tad_ids 0 get tmp 0
+  ad_chk eq ad_leaf get tad_h 4 get tad_h 5 1 tmp AD_OK
+  put tad_ids 1 get tmp 0
+  ad_chk eq ad_leaf get tad_h 6 get tad_h 7 1 tmp AD_OK
+  put tad_ids 2 get tmp 0
+  ad_chk eq ad_leaf get tad_h 8 get tad_h 9 1 tmp AD_OK
+  put tad_ids 3 get tmp 0
+  ad_chk eq ad_sqrt 99 tmp AD_ERR_BAD_ARGS
+  ot_live_counts lc
+  t0 = get lc 0
+  s0 = get lc 1
+  cnt0 = get ad_tape_meta 1
+  ad_chk eq ad_binary AD_ADD get tad_ids 0 get tad_ids 1 tmp OT_ERR_SHAPE
+  ad_chk eq ad_matmul get tad_ids 2 get tad_ids 3 tmp OT_ERR_SHAPE
+  ad_chk eq ad_matmul get tad_ids 2 get tad_ids 2 tmp OT_ERR_SHAPE
+  ad_chk eq ad_broadcast get tad_ids 1 1 s4 tmp OT_ERR_SHAPE
+  ad_chk eq ad_reduce AD_SUM get tad_ids 0 2 0 tmp OT_ERR_AXIS
+  ad_chk eq ad_binary AD_MATMUL get tad_ids 0 get tad_ids 0 tmp AD_ERR_BAD_ARGS
+  ot_live_counts lc
+  ad_chk eq get ad_tape_meta 1 cnt0
+  ad_chk eq get lc 0 t0
+  ad_chk eq get lc 1 s0
+  ad_chk eq ad_binary AD_MAX get tad_ids 0 get tad_ids 0 tmp AD_OK
+  imax = get tmp 0
+  ad_chk eq ad_scratch_need 36
+  put ad_tape_meta 2 36
+  ad_chk eq ad_backward imax AD_ERR_SHAPE
+  ad_chk eq ad_backward_seed imax get tad_h 2 get tad_h 3 AD_ERR_SHAPE
+  put ad_tape_meta 2 6
+  ad_chk eq ad_backward_seed imax get tad_h 0 get tad_h 1 AD_ERR_SCRATCH
+  ad_chk eq get ad_tape_meta 3 0
+  put ad_tape_meta 2 36
+  ad_chk eq ad_backward_seed imax get tad_h 0 get tad_h 1 AD_OK
+  ad_chk eq ad_backward_seed imax get tad_h 0 get tad_h 1 AD_ERR_STATE
+  ad_chk eq ad_sqrt get tad_ids 0 tmp AD_ERR_STATE
+end
+
+fn test_errors_flatten_and_leaves to void
+  gx = new ulong 2 0
+  flat13 = new f32 13 7.0f32
+  dir12 = new f32 12 0.0f32
+  one_id = new ulong 1 0
+  put one_id 0 get tad_ids 0
+  ad_chk eq ad_grad get tad_ids 0 gx AD_OK
+  ad_chk eq ad_grad get tad_ids 2 gx AD_ERR_NO_GRAD
+  ad_chk eq ad_grad_read_f32 get tad_ids 0 part dir12 0 11 AD_ERR_COUNT
+  ad_chk eq ad_grads_flatten one_id flat13 AD_ERR_COUNT
+  for i ulong 13
+    ad_chk eq get flat13 i 7.0f32
   end
-  ha = new ulong 2 0
-  ad_chk eq ot_from_f32 2 sh dat ha OT_OK
-  ia = new ulong 1 0
-  it = new ulong 1 0
-  ad_chk eq ad_leaf get ha 0 get ha 1 1 ia AD_OK
-  ad_chk eq ad_transpose get ia 0 it AD_OK
-  shs = new ulong 8 0
-  put shs 0 3
-  put shs 1 2
-  sd = new f32 6 0.0f32
-  for i ulong 6
-    put sd i f32 add i 10
+  ad_chk eq ad_grads_flatten one_id part flat13 0 12 AD_OK
+  ad_chk eq ad_grad_read_f32 get tad_ids 0 dir12 AD_OK
+  for i ulong 12
+    ad_chk eq bitcast uint get flat13 i bitcast uint get dir12 i
   end
-  hs = new ulong 2 0
-  ad_chk eq ot_from_f32 2 shs sd hs OT_OK
-  ad_chk eq ad_backward_seed get it 0 get hs 0 get hs 1 AD_OK
-  ga = new f32 6 0.0f32
-  ad_chk eq ad_grad_read_f32 get ia 0 ga AD_OK
-  ad_chk eq get ga 0 10.0f32
-  ad_chk eq get ga 1 12.0f32
-  ad_chk eq get ga 2 14.0f32
-  ad_chk eq get ga 3 11.0f32
-  ad_chk eq get ga 4 13.0f32
-  ad_chk eq get ga 5 15.0f32
   ad_tape_release
+  note Root without req_grad, F16 leaf, stale leaf
+  ad_chk eq ad_tape_init 4 0 AD_OK
+  ad_chk eq ad_leaf get tad_h 0 get tad_h 1 0 one_id AD_OK
+  ia = get one_id 0
+  ad_chk eq ad_binary AD_ADD ia ia one_id AD_OK
+  ad_chk eq ad_backward_seed get one_id 0 get tad_h 0 get tad_h 1 AD_ERR_NO_GRAD
+  ad_chk eq ad_leaf get tad_h 10 get tad_h 11 1 one_id OT_ERR_DTYPE
+  ad_rel_h 5
+  ad_chk eq ad_leaf get tad_h 10 get tad_h 11 1 one_id OT_ERR_STALE
+  ad_tape_release
+end
+
+fn test_errors to void
+  note tad_h: 0=ha[3,4], 1=hb4[4], 2=hb5[5], 3=hm35[3,5], 4=hm42[4,2], 5=hf16[4]
+  s = new ulong 8 0
+  d = new f32 20 1.0f32
+  hb8 = new uchar 8 0
+  h = new ulong 2 0
+  put s 0 3
+  put s 1 4
+  ad_chk eq ot_from_f32 2 s part d 0 12 h OT_OK
+  ad_save_h 0 h
+  put s 0 4
+  ad_chk eq ot_from_f32 1 s part d 0 4 h OT_OK
+  ad_save_h 1 h
+  put s 0 5
+  ad_chk eq ot_from_f32 1 s part d 0 5 h OT_OK
+  ad_save_h 2 h
+  put s 0 3
+  put s 1 5
+  ad_chk eq ot_from_f32 2 s part d 0 15 h OT_OK
+  ad_save_h 3 h
+  put s 0 4
+  put s 1 2
+  ad_chk eq ot_from_f32 2 s part d 0 8 h OT_OK
+  ad_save_h 4 h
+  put s 0 4
+  ad_chk eq ot_from_bytes OT_DT_F16 1 s hb8 h OT_OK
+  ad_save_h 5 h
+  test_errors_cap
+  test_errors_shapes_scratch
+  test_errors_flatten_and_leaves
+  for i ulong 5
+    ad_rel_h i
+  end
+  ad_chk_leaks
 end
 
 fn main to int
-  test_basic_ops
-  test_matmul_max_mean_bcast
-  test_transpose_and_seed
-  if ne get tad_c 1 0
-    w = write 1 tad_fail 0 len tad_fail
+  put tad_rng 0 uint 0x2545f491
+  ad_chk eq ot_ctx_init 256 OT_OK
+  test_all_21_cases_a
+  test_all_21_cases_b
+  test_comparators_reject
+  test_max_ties
+  test_composite_and_det
+  test_errors
+  ad_chk_leaks
+  tot = get tad_c 0
+  fails = get tad_c 1
+  w1 = write 1 tad_sum1 0 len tad_sum1
+  ad_w_u64 1 sub tot fails
+  w2 = write 1 tad_sum2 0 len tad_sum2
+  ad_w_u64 1 fails
+  w3 = write 1 tad_sum3 0 len tad_sum3
+  if ne fails 0
+    w4 = write 1 tad_fail 0 len tad_fail
     ret 1
   end
-  w = write 1 tad_pass 0 len tad_pass
+  w4 = write 1 tad_pass 0 len tad_pass
   ret 0
 end

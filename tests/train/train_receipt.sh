@@ -15,13 +15,15 @@
 # limitations under the License.
 
 # train_receipt.sh -- receipt for the M22 optimizer substrate + E5 provenance
-# tests (mk/train.mk).
+# tests (mk/train.mk, pure seeded OM-2).
 #
 #   tests/train/train_receipt.sh [out-dir]     (default: evidence/M22/receipts)
 #
 # Refuses a dirty tree. Runs `make test-train` twice from a clean build dir;
-# both runs (plain + ASan/UBSan builds each) must print the same replay digest.
-# Writes a NEW file named by the SHA-256 of its own bytes; never rewrites one.
+# both runs must compile bit-identical pure-OM binaries, pass train-purity,
+# pass all test_train sub-runs, and print identical replay digests and
+# replay dispatch heads. Writes a NEW file named by the SHA-256 of its own
+# bytes; never rewrites one.
 # Verdict vocabulary: the SUBSTRATE tests PASS or FAIL; M22 itself is always
 # NOT QUALIFIED here (no tensor/autodiff integration; waits M20/M21).
 # Host-only, single core. Shell + coreutils only.
@@ -29,6 +31,8 @@ set -u
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$HERE" || exit 2
 OUTDIR=${1:-evidence/M22/receipts}
+BUILD_OUT=${OUT_DIR:-build}
+TRAIN_OMC=${TRAIN_OMC:-seed/out/omc}
 
 if [ -n "$(git status --porcelain)" ]; then
     echo "train_receipt: refusing: working tree is dirty (commit first)" >&2
@@ -41,62 +45,76 @@ W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 
 run() {   # $1 = label
-    rm -rf build/train
-    make --no-print-directory test-train > "$W/$1.log" 2>&1
+    rm -rf "$BUILD_OUT/train"
+    make --no-print-directory OUT_DIR="$BUILD_OUT" TRAIN_OMC="$TRAIN_OMC" \
+        PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-train > "$W/$1.log" 2>&1
     local rc=$?
-    cp build/train/plain.log "$W/$1.plain.log" 2>/dev/null
+    if [ -f "$BUILD_OUT/train/test_train" ]; then
+        sha256sum "$BUILD_OUT/train/test_train" | awk '{print $1}' > "$W/$1.bin.sha256"
+    fi
     echo $rc
 }
 rc1=$(run run1)
 rc2=$(run run2)
-dig() { awk -v k="$2" '$1 == k {print $2}' "$W/$1" | tail -n 1; }
-d1=$(dig run1.log replay_digest); d2=$(dig run2.log replay_digest)
-h1=$(dig run1.log replay_dispatch_head)
-pass1=$(grep -c '^M22_SUBSTRATE_TESTS_PASS$' "$W/run1.log"); pass2=$(grep -c '^M22_SUBSTRATE_TESTS_PASS$' "$W/run2.log")
-both=$(grep -c '^test-train: plain and ASan/UBSan PASS, replay digest equal across builds$' "$W/run1.log")
-checks=$(awk '$1 == "checks" {print $2; exit}' "$W/run1.log")
-reverified=$(dig run1.log replay_steps_reverified)
-race=$(grep '^reader_race ' "$W/run1.plain.log" | head -n 1)
-crash_old=$(grep -c '^crash .*recovered=OLD' "$W/run1.plain.log")
-crash_new=$(grep -c '^crash .*recovered=NEW' "$W/run1.plain.log")
-cost=$(grep '^cost ' "$W/run1.plain.log" | sed 's/"//g' | tr '\n' ';')
+dig_first() { awk -v k="$2" '$1 == k {print $2; exit}' "$W/$1"; }
+dig_last() { awk -v k="$2" '$1 == k {print $2}' "$W/$1" | tail -n 1; }
+is_hex64() { case "$1" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;; *) return 1 ;; esac; }
+
+d1a=$(dig_first run1.log replay_digest); d1b=$(dig_last run1.log replay_digest)
+d2a=$(dig_first run2.log replay_digest); d2b=$(dig_last run2.log replay_digest)
+h1a=$(dig_first run1.log replay_dispatch_head); h1b=$(dig_last run1.log replay_dispatch_head)
+h2a=$(dig_first run2.log replay_dispatch_head); h2b=$(dig_last run2.log replay_dispatch_head)
+pass1=$(grep -c '^M22_SUBSTRATE_TESTS_PASS$' "$W/run1.log")
+pass2=$(grep -c '^M22_SUBSTRATE_TESTS_PASS$' "$W/run2.log")
+fail_lines=$(grep -c '^M22_SUBSTRATE_TESTS_FAIL$' "$W/run1.log" "$W/run2.log" | awk -F: '{s+=$2} END{print s+0}')
+both1=$(grep -c '^test-train: pure OM-2 PASS, replay digest equal across runs (' "$W/run1.log")
+both2=$(grep -c '^test-train: pure OM-2 PASS, replay digest equal across runs (' "$W/run2.log")
+purity1=$(grep -c '^train-purity: src/train is 100% pure seeded OM-2 (0 C/H files)$' "$W/run1.log")
+purity2=$(grep -c '^train-purity: src/train is 100% pure seeded OM-2 (0 C/H files)$' "$W/run2.log")
+bin1=$(cat "$W/run1.bin.sha256" 2>/dev/null || true)
+bin2=$(cat "$W/run2.bin.sha256" 2>/dev/null || true)
 head1=$(git rev-parse HEAD)
-dirty1=$(git status --porcelain | grep -v '^?? build/' || true)
+dirty1=$(git status --porcelain | grep -v "^?? ${BUILD_OUT}/" || true)
 
 reasons=""
 [ "$rc1" = 0 ] && [ "$rc2" = 0 ] || reasons="$reasons make-failed($rc1,$rc2)"
-[ "$pass1" = 2 ] && [ "$pass2" = 2 ] || reasons="$reasons verdict-line-missing"
-[ "$both" = 1 ] || reasons="$reasons cross-build-replay-missing"
-[ -n "$d1" ] && [ "$d1" = "$d2" ] || reasons="$reasons replay-digest-differs"
-[ "$crash_old" = 9 ] && [ "$crash_new" = 2 ] || reasons="$reasons crash-matrix($crash_old,$crash_new)"
+[ "$pass1" = 2 ] && [ "$pass2" = 2 ] && [ "$fail_lines" = 0 ] || reasons="$reasons verdict-line-missing($pass1,$pass2,fail=$fail_lines)"
+[ "$both1" = 1 ] && [ "$both2" = 1 ] || reasons="$reasons cross-run-replay-missing($both1,$both2)"
+[ "$purity1" = 1 ] && [ "$purity2" = 1 ] || reasons="$reasons purity-missing($purity1,$purity2)"
+is_hex64 "$d1a" && [ "$d1a" = "$d1b" ] && [ "$d1a" = "$d2a" ] && [ "$d2a" = "$d2b" ] || reasons="$reasons replay-digest-differs"
+is_hex64 "$h1a" && [ "$h1a" = "$h1b" ] && [ "$h1a" = "$h2a" ] && [ "$h2a" = "$h2b" ] || reasons="$reasons replay-dispatch-head-differs"
+is_hex64 "$bin1" && [ "$bin1" = "$bin2" ] || reasons="$reasons binary-digest-differs"
 [ "$head0" = "$head1" ] || reasons="$reasons head-moved"
 [ -z "$dirty1" ] || reasons="$reasons tree-dirty-after"
 verdict=PASS; [ -z "$reasons" ] || verdict=FAIL
 
 log_sha=$(cat "$W/run1.log" "$W/run2.log" | sha256sum | awk '{print $1}')
-src_sha=$(cat src/train/*.om tests/train/test_train.om mk/train.mk | sha256sum | awk '{print $1}')
+src_sha=$(cat src/train/generation.om src/train/sgd_update.om src/train/tg_sha256.om src/train/tg_store.om src/train/tg_sgd.om tests/train/test_train.om mk/train.mk | sha256sum | awk '{print $1}')
+omc_sha=$(sha256sum "$TRAIN_OMC" 2>/dev/null | awk '{print $1}')
 mkdir -p "$OUTDIR"
 cat > "$W/receipt.json" <<JSON
 {
-  "schema": "omega.m22.train-substrate.receipt.v1",
+  "schema": "omega.m22.train-substrate.receipt.v2",
   "gate": "M22_SUBSTRATE",
+  "build_mode": "pure-om2",
   "m22_status": "M22 NOT QUALIFIED: optimizer substrate + SGD path only; no tensor/autodiff integration (waits M20/M21)",
   "substrate_tests_verdict": "$verdict",
   "reasons": "$(echo $reasons)",
-  "scope": "host-only, single core; process-crash fault injection (fork + _exit at 8 points, plus torn-file simulation of not-yet-current files); NOT a power-loss test, NOT a GPU or hardware qualification; SGD with caller-supplied gradients (hand-written quadratic), Adam/AdamW deferred",
+  "scope": "host-only, single core, pure seeded OM-2 binary compiled by seed/out/omc; process-crash fault injection (fork + exit at commit points, plus torn/corrupt file and reader-race tests); NOT a power-loss test, NOT a GPU or hardware qualification; SGD with caller-supplied gradients (hand-written quadratic), Adam/AdamW deferred",
   "commit": "$head0",
   "tree": "$tree0",
   "tree_clean": true,
   "run_id": "$run_id",
-  "command": "make test-train (twice, clean build/train each time; each run = plain -O2 build + ASan/UBSan -O1 build)",
-  "checks_per_binary_run": "${checks:-null}",
-  "replay_digest_run1": "${d1:-null}",
-  "replay_digest_run2": "${d2:-null}",
-  "replay_dispatch_head": "${h1:-null}",
-  "replay_steps_reverified": "${reverified:-null}",
-  "crash_matrix": {"recovered_old": $crash_old, "recovered_new": $crash_new},
-  "reader_race": "$race",
-  "provenance_cost": "$cost",
+  "command": "make test-train (twice, clean OUT_DIR/train each time; each make runs train-purity + 2 independent pure OM-2 test_train invocations)",
+  "subruns_passed_run1": $pass1,
+  "subruns_passed_run2": $pass2,
+  "replay_digest_run1": "${d1a:-null}",
+  "replay_digest_run2": "${d2a:-null}",
+  "replay_dispatch_head_run1": "${h1a:-null}",
+  "replay_dispatch_head_run2": "${h2a:-null}",
+  "binary_sha256_run1": "${bin1:-null}",
+  "binary_sha256_run2": "${bin2:-null}",
+  "omc_sha256": "${omc_sha:-null}",
   "train_sources_sha256": "$src_sha",
   "logs_sha256": "$log_sha",
   "host": "$(uname -srm)"

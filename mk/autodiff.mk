@@ -34,10 +34,10 @@ AUTODIFF_OM_SRCS = src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train
 
 $(OUT_DIR)/test_omega_autodiff: src/autodiff/test_autodiff.om $(AUTODIFF_OM_SRCS) $(AUTODIFF_OMC)
 	@mkdir -p $(OUT_DIR)
-	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(AUTODIFF_OM_SRCS) src/autodiff/test_autodiff.om) | $(AUTODIFF_OMC) > $@ && chmod +x $@
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(AUTODIFF_OM_SRCS) src/autodiff/test_autodiff.om) | $(AUTODIFF_OMC) > $@.tmp && chmod +x $@.tmp && mv $@.tmp $@
 
 test-autodiff: $(OUT_DIR)/test_omega_autodiff
-	./$(OUT_DIR)/test_omega_autodiff
+	$(abspath $(OUT_DIR)/test_omega_autodiff)
 
 $(OUT_DIR)/test_omega_ad_fixture: tests/test_omega_ad_fixture.c $(AUTODIFF_SRCS) $(AUTODIFF_TENSOR_SRCS) \
 		$(AUTODIFF_DEPS) $(AUTODIFF_HDRS)

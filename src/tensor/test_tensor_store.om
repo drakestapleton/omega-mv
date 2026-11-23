@@ -1,161 +1,894 @@
 note SPDX-License-Identifier: Apache-2.0
 note test_tensor_store.om -- Pure seeded OM-2 M20 crash-safe tensor store test suite.
+note Comprehensive coverage ported from tests/test_omega_tensor_store.c:
+note   1. round-trip & lifecycle: bad-arg refusals, busy lock, F32/F16/rank0/transposed view,
+note      NaN canonicalization + -0/subnormal preservation, reopen wrong/right cap, release &
+note      stale across recovery, slot reuse with gen+1, dedup shared payload, capacity exhaustion,
+note      orphan payload + temp file sweep, lost journal refused & restored
+note   2. crash matrix: fork + ots_set_crash_step at every phase for variant 0 (put new, steps 1..8),
+note      variant 1 (put shared, steps 1..8), and variant 2 (release, steps 5..8), plus post-recovery
+note      usability & no generation reuse
+note   3. torn writes & corruption: journal truncated at ALL 656 byte lengths, +1B, +200B,
+note      bit-flipped at ALL 656 bytes; payload truncated at ALL 12 lengths, +1B, bit-flipped at
+note      ALL 96 bits, missing payload; post-open payload corruption refused by ots_get with 0 leaks
+note   4. crafted journals (independent binary encoder): byte-exact match against on-disk journal,
+note      bad header magic, bad header version, bad record magic, all 7 semantic replay cases + control,
+note      crafted zero dim, non-zero trailing shape, unknown dtype, rank > 8
 
 global tss_c ulong 2
 global tss_base uchar 256
 global tss_blen ulong 1
 global tss_dn ulong 1
+global tss_jcopy uchar 1024
+global tss_pcopy uchar 64
+global tss_craft uchar 1024
+global tss_path uchar 600
+global tss_path2 uchar 600
+global tss_cur_dir uchar 512
+global tss_cur_dlen ulong 1
+global tss_h ulong 32
+note tss_h: pairs (slot, gen) for tensors & store handles
+global tss_vid uchar 32
+global tss_psha uchar 32
+global tss_pnm uchar 68
+global tss_sh ulong 8
 
 text tss_pass "M20_TENSOR_STORE_TESTS_PASS\n"
 text tss_fail "M20_TENSOR_STORE_TESTS_FAIL\n"
+text tss_sum1 "M20 OMEGA_TENSOR store tests: "
+text tss_sum2 " pass, "
+text tss_sum3 " fail\n"
+text tss_fc "FAIL store check #"
+text tss_nl "\n"
 text tss_usage "usage: test_tensor_store <scratch-dir>\n"
 text tss_t_rt "rt"
 text tss_t_cr "cr"
-text tss_t_ng "ng"
+text tss_t_tn "tn"
+text tss_t_cf "cf"
+text tss_jrn "journal"
+text tss_jmv "journal.moved"
+text tss_ptmp "payload.tmp"
+text tss_jtmp "journal.tmp"
+
+fn ts_w_u64 fd int v ulong to void
+  buf = new uchar 24 0
+  tmp = new uchar 24 0
+  if eq v 0
+    put buf 0 uchar 48
+    w = write fd buf 0 1
+    ret
+  end
+  cnt = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp cnt uchar add 48 rem x 10
+    cnt = add cnt 1
+    x = div x 10
+  end
+  for i ulong cnt bound 24
+    put buf i get tmp sub sub cnt 1 i
+  end
+  w = write fd buf 0 cnt
+end
 
 fn ts_chk cond bool to void
-  put tss_c 0 add get tss_c 0 1
+  n = add get tss_c 0 1
+  put tss_c 0 n
   if not cond
     put tss_c 1 add get tss_c 1 1
+    w1 = write 2 tss_fc 0 len tss_fc
+    ts_w_u64 2 n
+    w2 = write 2 tss_nl 0 1
   end
 end
 
-fn ts_newdir dst edit uchar 512 tag view uchar * to ulong
+fn ts_save_h idx ulong h view ulong 2 to void
+  put tss_h mul idx 2 get h 0
+  put tss_h add mul idx 2 1 get h 1
+end
+
+fn ts_rel_t idx ulong to void
+  r = ot_release get tss_h mul idx 2 get tss_h add mul idx 2 1
+end
+
+fn ts_newdir tag view uchar * to ulong
   bl = get tss_blen 0
   dn = get tss_dn 0
   put tss_dn 0 add dn 1
-  for i ulong bl
-    put dst i get tss_base i
+  for i ulong bl bound 256
+    put tss_cur_dir i get tss_base i
   end
-  put dst bl 47
+  put tss_cur_dir bl 47
   p = add bl 1
-  put dst p uchar add 48 rem div dn 10 10
-  put dst add p 1 uchar add 48 rem dn 10
-  put dst add p 2 45
-  p = add p 3
+  put tss_cur_dir p uchar add 48 rem div dn 100 10
+  put tss_cur_dir add p 1 uchar add 48 rem div dn 10 10
+  put tss_cur_dir add p 2 uchar add 48 rem dn 10
+  put tss_cur_dir add p 3 45
+  p = add p 4
   tl = len tag
-  for i ulong tl
-    put dst add p i get tag i
+  for i ulong tl bound 32
+    put tss_cur_dir add p i get tag i
   end
-  ret add p tl
+  tot = add p tl
+  put tss_cur_dlen 0 tot
+  ret tot
 end
 
-fn test_roundtrip_and_lock to void
+fn ts_open_cur cap ulong to long
+  dl = get tss_cur_dlen 0
   d = new uchar 512 0
-  dl = ts_newdir d tss_t_rt
-  ts_chk eq ot_ctx_init 32 OT_OK
-  ts_chk eq ots_open part d 0 dl dl 8 OT_OK
+  for i ulong dl bound 512
+    put d i get tss_cur_dir i
+  end
+  ret ots_open part d 0 dl dl cap
+end
+
+fn ts_join_path slot ulong name view uchar * to ulong
+  dl = get tss_cur_dlen 0
+  nl = len name
+  if eq slot 0
+    for i ulong dl bound 512
+      put tss_path i get tss_cur_dir i
+    end
+    put tss_path dl 47
+    for i ulong nl bound 80
+      put tss_path add add dl 1 i get name i
+    end
+  else
+    for i ulong dl bound 512
+      put tss_path2 i get tss_cur_dir i
+    end
+    put tss_path2 dl 47
+    for i ulong nl bound 80
+      put tss_path2 add add dl 1 i get name i
+    end
+  end
+  ret add add dl 1 nl
+end
+
+fn ts_exists name view uchar * to bool
+  pl = ts_join_path 0 name
+  ret eq faccess tss_path 0 pl 0 0
+end
+
+fn ts_exists_pnm to bool
+  nm = new uchar 68 0
+  for i ulong 68
+    put nm i get tss_pnm i
+  end
+  ret ts_exists nm
+end
+
+fn ts_write_file_from which ulong n ulong pl ulong to long
+  fd = fopen tss_path 0 pl or or OTS_O_WRONLY OTS_O_CREAT OTS_O_TRUNC 420
+  if lt fd 0
+    ret -1
+  end
+  off = ulong 0
+  while lt off n bound 1024
+    w = long 0
+    if eq which 0
+      w = write int fd tss_jcopy off sub n off
+    else
+      if eq which 1
+        w = write int fd tss_pcopy off sub n off
+      else
+        w = write int fd tss_craft off sub n off
+      end
+    end
+    if le w 0
+      cc = fclose int fd
+      ret -1
+    end
+    off = add off ulong w
+  end
+  cc = fclose int fd
+  ret 0
+end
+
+fn ts_read_file_to which ulong pl ulong to long
+  fd = fopen tss_path 0 pl OTS_O_RDONLY 0
+  if lt fd 0
+    ret -1
+  end
+  got = ulong 0
+  while lt got 1024 bound 1024
+    r = long 0
+    if eq which 0
+      r = read int fd tss_jcopy got sub 1024 got
+    else
+      r = read int fd tss_pcopy got sub 64 got
+    end
+    if lt r 0
+      cc = fclose int fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    got = add got ulong r
+  end
+  cc = fclose int fd
+  ret long got
+end
+
+fn ts_rename_cur a view uchar * b view uchar * to long
+  ol = ts_join_path 0 a
+  nl = ts_join_path 1 b
+  pkt = new uchar 1216 0
+  put pkt 0 2
+  put pkt 1 0
+  put pkt 2 uchar and ol 255
+  put pkt 3 uchar and shr ol 8 255
+  for i ulong ol bound 600
+    put pkt add 4 i get tss_path i
+  end
+  o2 = add 4 ol
+  put pkt o2 uchar and nl 255
+  put pkt add o2 1 uchar and shr nl 8 255
+  for i ulong nl bound 600
+    put pkt add add o2 2 i get tss_path2 i
+  end
+  ret renames pkt 0 add add o2 2 nl 0
+end
+
+fn ts_got_eq_idx hs_i ulong exp_i ulong to bool
+  hg = new ulong 2 0
+  eq_f = new ulong 1 0
+  if ne ots_get get tss_h mul hs_i 2 get tss_h add mul hs_i 2 1 hg OT_OK
+    ret false
+  end
+  rc = ot_value_equal get hg 0 get hg 1 get tss_h mul exp_i 2 get tss_h add mul exp_i 2 1 eq_f
+  rr = ot_release get hg 0 get hg 1
+  ret and eq rc OT_OK eq get eq_f 0 1
+end
+
+fn ts_mk_vals seed uint out_idx ulong to long
   sh = new ulong 8 0
-  put sh 0 4
-  dat = new f32 4 0.0f32
-  put dat 0 1.5f32
-  put dat 1 -0.0f32
-  put dat 2 3.25f32
-  put dat 3 42.0f32
-  ht = new ulong 2 0
-  ts_chk eq ot_from_f32 1 sh dat ht OT_OK
-  hs = new ulong 2 0
-  ts_chk eq ots_put get ht 0 get ht 1 hs OT_OK
-  ts_chk eq ots_live_count 1
-  note Busy lock check via child process
+  dat = new f32 3 0.0f32
+  h = new ulong 2 0
+  put sh 0 3
+  for i ulong 3
+    bits = add add uint 0x3f800000 mul seed uint 0x10000 mul uint i uint 0x100
+    put dat i bitcast f32 bits
+  end
+  rc = ot_from_f32 1 sh dat h
+  if eq rc OT_OK
+    ts_save_h out_idx h
+  end
+  ret rc
+end
+
+fn ts_chk_leaks to void
+  lc = new ulong 2 0
+  ot_live_counts lc
+  ts_chk and eq get lc 0 0 eq get lc 1 0
+end
+
+note ---- 1. round-trip, views, F16, rank 0, NaN canon, dedup, capacity, orphan sweep, lost journal ----
+
+fn test_rt_setup to void
+  note Creates tensors at tss_h indices 0=ta, 1=tb, 2=tc, 3=tat
+  sh = new ulong 8 0
+  af = new f32 6 0.0f32
+  hb = new uchar 10 0
+  h = new ulong 2 0
+  put sh 0 2
+  put sh 1 3
+  put af 0 bitcast f32 uint 0x3f800000
+  put af 1 bitcast f32 uint 0x80000000
+  put af 2 bitcast f32 uint 0x7fa00001
+  put af 3 bitcast f32 uint 0xff800000
+  put af 4 bitcast f32 uint 0x00000001
+  put af 5 bitcast f32 uint 0x40490fdb
+  ts_chk eq ot_from_f32 2 sh af h OT_OK
+  ts_save_h 0 h
+  put sh 0 5
+  put hb 0 uchar 0x00
+  put hb 1 uchar 0x3c
+  put hb 2 uchar 0x00
+  put hb 3 uchar 0x80
+  put hb 4 uchar 0x01
+  put hb 5 uchar 0x7d
+  put hb 6 uchar 0x00
+  put hb 7 uchar 0xfc
+  put hb 8 uchar 0x01
+  put hb 9 uchar 0x00
+  ts_chk eq ot_from_bytes OT_DT_F16 1 sh hb h OT_OK
+  ts_save_h 1 h
+  put af 0 bitcast f32 uint 0xc0000000
+  ts_chk eq ot_from_f32 0 sh part af 0 1 h OT_OK
+  ts_save_h 2 h
+  ts_chk eq ot_transpose get tss_h 0 get tss_h 1 h OT_OK
+  ts_save_h 3 h
+end
+
+fn test_rt_busy_lock to void
+  sb = new uchar 4 0
   pid = fork
   if eq pid 0
-    if eq ots_open part d 0 dl dl 8 OTS_ERR_BUSY
+    if eq ts_open_cur 8 OTS_ERR_BUSY
       exit 0
     end
     exit 1
   end
-  sb = new uchar 4 0
   wp = waitpid int pid sb 0 4 0
   ws = or uint get sb 0 shl uint get sb 1 8
   ts_chk eq and shr ws 8 255 0
-  ots_close
-  note Reopen and verify data + release generation stays stale
-  ts_chk eq ots_open part d 0 dl dl 8 OT_OK
-  ts_chk eq ots_live_count 1
-  hg = new ulong 2 0
-  ts_chk eq ots_get get hs 0 get hs 1 hg OT_OK
-  obuf = new f32 4 0.0f32
-  ts_chk eq ot_read_f32 get hg 0 get hg 1 obuf OT_OK
-  ts_chk eq get obuf 0 1.5f32
+end
+
+fn test_rt_put_and_check to void
+  note Store handles saved at indices 4=ha, 5=hb, 6=hc, 7=hat
+  h = new ulong 2 0
+  obuf = new f32 6 0.0f32
+  vid = new uchar 32 0
+  pnm = new uchar 68 0
+  for i ulong 4
+    ts_chk eq ots_put get tss_h mul i 2 get tss_h add mul i 2 1 h OT_OK
+    ts_save_h add 4 i h
+  end
+  ts_chk and eq get tss_h 8 0 eq get tss_h 9 1
+  ts_chk and eq get tss_h 14 3 eq get tss_h 15 1
+  for i ulong 4
+    ts_chk ts_got_eq_idx add 4 i i
+  end
+  ts_chk eq ots_get get tss_h 8 get tss_h 9 h OT_OK
+  ts_chk eq ot_read_f32 get h 0 get h 1 obuf OT_OK
   ts_chk eq bitcast uint get obuf 1 OT_NEG0_BITS
-  ts_chk eq get obuf 3 42.0f32
-  ts_chk eq ots_release get hs 0 get hs 1 OT_OK
-  ts_chk eq ots_release get hs 0 get hs 1 OT_ERR_STALE
-  ots_close
-  ts_chk eq ots_open part d 0 dl dl 8 OT_OK
-  ts_chk eq ots_live_count 0
-  ts_chk not ots_valid get hs 0 get hs 1
+  ts_chk eq bitcast uint get obuf 2 OT_QNAN_BITS
+  ts_chk eq bitcast uint get obuf 4 uint 0x00000001
+  r1 = ot_release get h 0 get h 1
+  ts_chk eq ot_value_id get tss_h 0 get tss_h 1 vid OT_OK
+  tstore_hex_name vid pnm
+  for i ulong 68
+    put tss_pnm i get pnm i
+  end
+  ts_chk ts_exists_pnm
   ots_close
 end
 
-fn test_crash_child step ulong d view uchar 512 dl ulong sh view ulong 8 dat view f32 4 to void
-  ht = new ulong 2 0
+fn test_rt_reopen_dedup_cap to void
+  note Uses tss_h: 0..3 tensors, 4..7 store handles, 8=td, 9=hd, 10=hd2
+  h = new ulong 2 0
+  ts_chk eq ts_open_cur 9 OT_ERR_BAD_ARGS
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk eq ots_live_count 4
+  for i ulong 4
+    ts_chk ts_got_eq_idx add 4 i i
+  end
+  ts_chk eq ots_release get tss_h 8 get tss_h 9 OT_OK
+  ts_chk eq ots_get get tss_h 8 get tss_h 9 h OT_ERR_STALE
+  ts_chk eq ots_release get tss_h 8 get tss_h 9 OT_ERR_STALE
+  ts_chk not ots_valid get tss_h 8 get tss_h 9
+  ts_chk not ts_exists_pnm
+  ts_chk eq ots_get get tss_h 10 add get tss_h 11 1 h OT_ERR_STALE
+  ots_close
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk eq ots_get get tss_h 8 get tss_h 9 h OT_ERR_STALE
+  ts_chk eq ts_mk_vals 7 8 OT_OK
+  ts_chk eq ots_put get tss_h 16 get tss_h 17 h OT_OK
+  ts_save_h 9 h
+  ts_chk and eq get h 0 get tss_h 8 eq get h 1 add get tss_h 9 1
+  ts_chk eq ots_get get tss_h 8 get tss_h 9 h OT_ERR_STALE
+  ts_chk ts_got_eq_idx 9 8
+  ts_chk eq ots_put get tss_h 16 get tss_h 17 h OT_OK
+  ts_save_h 10 h
+  ts_chk ne get h 0 get tss_h 18
+  ts_chk eq ots_release get tss_h 18 get tss_h 19 OT_OK
+  ts_chk ts_got_eq_idx 10 8
+  filled = ulong 0
+  while lt filled 20 bound 24
+    if ne ots_put get tss_h 16 get tss_h 17 h OT_OK
+      break
+    end
+    filled = add filled 1
+  end
+  ts_chk and gt filled 0 eq ots_live_count 8
+  ts_chk eq ots_put get tss_h 16 get tss_h 17 h OT_ERR_CAPACITY
+  ots_close
+end
+
+fn test_rt_orphan_and_lost_jrn to void
+  zid = new uchar 32 0xab
+  onm = new uchar 68 0
+  tmp = new ulong 2 0
+  tstore_hex_name zid onm
+  pl = ts_join_path 0 onm
+  put tss_pcopy 0 uchar 120
+  ts_chk eq ts_write_file_from 1 1 pl 0
+  pl = ts_join_path 0 tss_ptmp
+  ts_chk eq ts_write_file_from 1 1 pl 0
+  pl = ts_join_path 0 tss_jtmp
+  ts_chk eq ts_write_file_from 1 1 pl 0
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk not ts_exists onm
+  ts_chk not ts_exists tss_ptmp
+  ts_chk not ts_exists tss_jtmp
+  ts_chk ts_got_eq_idx 10 8
+  ts_chk ts_got_eq_idx 5 1
+  ots_close
+  ts_chk eq ts_rename_cur tss_jrn tss_jmv 0
+  ts_chk eq ts_open_cur 8 OTS_ERR_TORN
+  ts_chk eq ts_rename_cur tss_jmv tss_jrn 0
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk eq ots_get get tss_h 8 get tss_h 9 tmp OT_ERR_STALE
+  ts_chk ts_got_eq_idx 10 8
+  ots_close
+end
+
+fn test_roundtrip_and_lifecycle to void
+  dl = ts_newdir tss_t_rt
+  ts_chk eq ot_ctx_init 64 OT_OK
+  empty_d = new uchar 4 0
+  ts_chk eq ots_open part empty_d 0 0 0 8 OT_ERR_BAD_ARGS
+  ts_chk eq ts_open_cur 0 OT_ERR_BAD_ARGS
+  ts_chk eq ts_open_cur 65 OT_ERR_BAD_ARGS
+  ts_chk eq ts_open_cur 8 OT_OK
+  test_rt_busy_lock
+  test_rt_setup
+  test_rt_put_and_check
+  test_rt_reopen_dedup_cap
+  test_rt_orphan_and_lost_jrn
+  ts_rel_t 3
+  ts_rel_t 0
+  ts_rel_t 1
+  ts_rel_t 2
+  ts_rel_t 8
+  ts_chk_leaks
+end
+
+note ---- 2. crash matrix: variants 0 (put new), 1 (put shared), 2 (release) ----
+
+fn test_crash_child variant ulong step ulong to void
   hs = new ulong 2 0
-  if ne ots_open part d 0 dl dl 4 OT_OK
+  if ne ts_open_cur 8 OT_OK
     exit 2
   end
-  rc = ot_from_f32 1 sh dat ht
-  rc = ots_set_crash_step step
-  rc = ots_put get ht 0 get ht 1 hs
-  exit 3
+  if ne ots_set_crash_step step OT_OK
+    exit 4
+  end
+  if eq variant 2
+    rc = ots_release get tss_h 6 get tss_h 7
+  else
+    tv_i = ulong 2
+    if eq variant 1
+      tv_i = 1
+    end
+    rc = ots_put get tss_h mul tv_i 2 get tss_h add mul tv_i 2 1 hs
+  end
+  exit 5
 end
 
-fn test_crash_one step ulong sh view ulong 8 dat view f32 4 to void
-  d = new uchar 512 0
+fn test_crash_verify variant ulong step ulong to void
+  tmp = new ulong 2 0
+  hn = new ulong 2 0
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk ts_got_eq_idx 4 1
+  ts_chk not ts_exists tss_ptmp
+  ts_chk not ts_exists tss_jtmp
+  committed = ge step OTS_CRASH_JOURNAL_RENAMED
+  if eq variant 2
+    if committed
+      ts_chk and eq ots_get get tss_h 6 get tss_h 7 tmp OT_ERR_STALE eq ots_live_count 1
+    else
+      ts_chk and ts_got_eq_idx 3 0 eq ots_live_count 2
+    end
+  else
+    put tss_h 10 0
+    put tss_h 11 2
+    tv_i = ulong 2
+    if eq variant 1
+      tv_i = 1
+    end
+    ts_chk eq ots_get get tss_h 6 get tss_h 7 tmp OT_ERR_STALE
+    if committed
+      ts_chk and ts_got_eq_idx 5 tv_i eq ots_live_count 2
+    else
+      ts_chk and not ots_valid 0 2 eq ots_live_count 1
+    end
+  end
+  ts_chk eq ots_put get tss_h 4 get tss_h 5 hn OT_OK
+  ts_save_h 6 hn
+  ts_chk ts_got_eq_idx 6 2
+  ts_chk not and eq get hn 0 get tss_h 6 le get hn 1 get tss_h 7
+  ots_close
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk ts_got_eq_idx 6 2
+  ts_chk ts_got_eq_idx 4 1
+  ots_close
+end
+
+fn test_crash_one variant ulong step ulong to void
+  note tss_h: 0=ta, 1=tb, 2=tc, 3=ha, 4=hb, 5=hv, 6=hn
+  dl = ts_newdir tss_t_cr
+  ts_chk eq ot_ctx_init 64 OT_OK
+  h = new ulong 2 0
   sb = new uchar 4 0
-  dl = ts_newdir d tss_t_cr
-  ts_chk eq ot_ctx_init 32 OT_OK
-  ts_chk eq ots_open part d 0 dl dl 4 OT_OK
+  ts_chk eq ts_mk_vals 1 0 OT_OK
+  ts_chk eq ts_mk_vals 2 1 OT_OK
+  ts_chk eq ts_mk_vals 3 2 OT_OK
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk eq ots_put get tss_h 0 get tss_h 1 h OT_OK
+  ts_save_h 3 h
+  ts_chk eq ots_put get tss_h 2 get tss_h 3 h OT_OK
+  ts_save_h 4 h
+  if ne variant 2
+    ts_chk eq ots_release get tss_h 6 get tss_h 7 OT_OK
+  end
   ots_close
   pid = fork
   if eq pid 0
-    test_crash_child step d dl sh dat
+    test_crash_child variant step
   end
   wp = waitpid int pid sb 0 4 0
   ws = or uint get sb 0 shl uint get sb 1 8
   ts_chk eq and shr ws 8 255 uint OTS_CRASH_EXIT
-  ts_chk eq ots_open part d 0 dl dl 4 OT_OK
-  if ge step OTS_CRASH_JOURNAL_RENAMED
-    ts_chk eq ots_live_count 1
-  else
-    ts_chk eq ots_live_count 0
-  end
-  ots_close
+  test_crash_verify variant step
+  ts_rel_t 0
+  ts_rel_t 1
+  ts_rel_t 2
 end
 
 fn test_crash_matrix to void
-  sh = new ulong 8 0
-  put sh 0 4
-  dat = new f32 4 0.0f32
-  put dat 0 7.0f32
-  put dat 1 8.0f32
-  put dat 2 9.0f32
-  put dat 3 10.0f32
   for si ulong 8
-    test_crash_one add si 1 sh dat
+    test_crash_one 0 add si 1
+    test_crash_one 1 add si 1
+  end
+  for si ulong 4
+    test_crash_one 2 add si OTS_CRASH_JOURNAL_PARTIAL
+  end
+  ts_chk_leaks
+end
+
+note ---- 3. torn writes & payload/journal corruption ----
+
+fn test_torn_journal_sweep jp_len ulong jn ulong to void
+  bad = ulong 0
+  for l ulong jn bound 700
+    w = ts_write_file_from 0 l jp_len
+    if ne ts_open_cur 8 OTS_ERR_TORN
+      bad = add bad 1
+      ots_close
+    end
+  end
+  ts_chk eq bad 0
+  for i ulong 200
+    put tss_jcopy add jn i 0
+  end
+  w = ts_write_file_from 0 add jn 1 jp_len
+  ts_chk eq ts_open_cur 8 OTS_ERR_TORN
+  w = ts_write_file_from 0 add jn 200 jp_len
+  ts_chk eq ts_open_cur 8 OTS_ERR_TORN
+  bad = ulong 0
+  for i ulong jn bound 700
+    orig = get tss_jcopy i
+    put tss_jcopy i xor orig uchar shl uint 1 uint rem i 8
+    w = ts_write_file_from 0 jn jp_len
+    put tss_jcopy i orig
+    rc = ts_open_cur 8
+    if and ne rc OTS_ERR_TORN ne rc OTS_ERR_CORRUPT
+      bad = add bad 1
+      ots_close
+    end
+  end
+  ts_chk eq bad 0
+  w = ts_write_file_from 0 jn jp_len
+end
+
+fn test_torn_payload_bits pp_len ulong pn ulong to void
+  bad = ulong 0
+  nbits = mul pn 8
+  for b ulong nbits bound 128
+    bi = div b 8
+    orig = get tss_pcopy bi
+    m = uchar shl uint 1 uint rem b 8
+    put tss_pcopy bi xor orig m
+    w = ts_write_file_from 1 pn pp_len
+    put tss_pcopy bi orig
+    if ne ts_open_cur 8 OTS_ERR_CORRUPT
+      bad = add bad 1
+      ots_close
+    end
+  end
+  ts_chk eq bad 0
+end
+
+fn test_torn_payload_sweep pp_len ulong pn ulong to void
+  bad = ulong 0
+  for l ulong pn bound 32
+    w = ts_write_file_from 1 l pp_len
+    if ne ts_open_cur 8 OTS_ERR_CORRUPT
+      bad = add bad 1
+      ots_close
+    end
+  end
+  ts_chk eq bad 0
+  put tss_pcopy pn 0
+  w = ts_write_file_from 1 add pn 1 pp_len
+  ts_chk eq ts_open_cur 8 OTS_ERR_CORRUPT
+  test_torn_payload_bits pp_len pn
+  u = unlink tss_path 0 pp_len
+  ts_chk eq ts_open_cur 8 OTS_ERR_CORRUPT
+  w = ts_write_file_from 1 pn pp_len
+end
+
+fn test_torn_post_open pn ulong to void
+  pnm = new uchar 68 0
+  tmp = new ulong 2 0
+  lc0 = new ulong 2 0
+  for i ulong 68
+    put pnm i get tss_pnm i
+  end
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk eq ots_get get tss_h 4 get tss_h 5 tmp OT_ERR_STALE
+  ts_chk ts_got_eq_idx 3 1
+  orig5 = get tss_pcopy 5
+  put tss_pcopy 5 xor orig5 uchar 0x10
+  pp_len = ts_join_path 0 pnm
+  w = ts_write_file_from 1 pn pp_len
+  put tss_pcopy 5 orig5
+  ot_live_counts lc0
+  t0 = get lc0 0
+  s0 = get lc0 1
+  put tmp 0 999999
+  ts_chk eq ots_get get tss_h 6 get tss_h 7 tmp OTS_ERR_CORRUPT
+  ot_live_counts lc0
+  ts_chk eq get lc0 0 t0
+  ts_chk eq get lc0 1 s0
+  ts_chk eq get tmp 0 999999
+  ots_close
+end
+
+fn test_torn_and_corrupt to void
+  note tss_h: 0=ta, 1=tb, 2=ha, 3=hb
+  dl = ts_newdir tss_t_tn
+  ts_chk eq ot_ctx_init 64 OT_OK
+  h = new ulong 2 0
+  vid = new uchar 32 0
+  pnm = new uchar 68 0
+  ts_chk eq ts_mk_vals 4 0 OT_OK
+  ts_chk eq ts_mk_vals 5 1 OT_OK
+  ts_chk eq ts_open_cur 8 OT_OK
+  ts_chk eq ots_put get tss_h 0 get tss_h 1 h OT_OK
+  ts_save_h 2 h
+  ts_chk eq ots_put get tss_h 2 get tss_h 3 h OT_OK
+  ts_save_h 3 h
+  ts_chk eq ots_release get tss_h 4 get tss_h 5 OT_OK
+  ots_close
+  jp_len = ts_join_path 0 tss_jrn
+  jn = ts_read_file_to 0 jp_len
+  ts_chk eq jn 656
+  ts_chk eq ot_value_id get tss_h 2 get tss_h 3 vid OT_OK
+  tstore_hex_name vid pnm
+  for i ulong 68
+    put tss_pnm i get pnm i
+  end
+  pp_len = ts_join_path 0 pnm
+  pn = ts_read_file_to 1 pp_len
+  ts_chk eq pn 12
+  jp_len = ts_join_path 0 tss_jrn
+  test_torn_journal_sweep jp_len ulong jn
+  pp_len = ts_join_path 0 pnm
+  test_torn_payload_sweep pp_len ulong pn
+  test_torn_post_open ulong pn
+  ts_rel_t 0
+  ts_rel_t 1
+  ts_chk_leaks
+end
+
+note ---- 4. crafted journals (independent binary encoder) ----
+
+fn ts_craft_le32 off ulong v ulong to void
+  for i ulong 4
+    put tss_craft add off i uchar and shr v mul i 8 255
   end
 end
 
-fn test_corrupt_and_torn to void
-  d = new uchar 512 0
-  dl = ts_newdir d tss_t_ng
-  ts_chk eq ot_ctx_init 32 OT_OK
-  ts_chk eq ots_open part d 0 dl dl 4 OT_OK
-  sh = new ulong 8 0
-  put sh 0 2
-  dat = new f32 2 1.0f32
-  ht = new ulong 2 0
-  hs = new ulong 2 0
-  ts_chk eq ot_from_f32 1 sh dat ht OT_OK
-  ts_chk eq ots_put get ht 0 get ht 1 hs OT_OK
+fn ts_craft_le64 off ulong v ulong to void
+  for i ulong 8
+    put tss_craft add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn ts_craft_hdr cap ulong count ulong ver ulong bad_magic ulong to void
+  h24 = new uchar 24 0
+  dig = new uchar 32 0
+  for i ulong 56
+    put tss_craft i 0
+  end
+  put tss_craft 0 uchar 79
+  put tss_craft 1 uchar 84
+  put tss_craft 2 uchar 83
+  put tss_craft 3 uchar 74
+  put tss_craft 4 uchar 82
+  put tss_craft 5 uchar 78
+  put tss_craft 6 uchar 49
+  if ne bad_magic 0
+    put tss_craft 6 uchar 50
+  end
+  ts_craft_le32 8 ver
+  ts_craft_le32 12 cap
+  ts_craft_le64 16 count
+  for i ulong 24
+    put h24 i get tss_craft i
+  end
+  tg_sha_hash h24 24 dig
+  for i ulong 32
+    put tss_craft add 24 i get dig i
+  end
+end
+
+fn ts_craft_rec off ulong meta view ulong 6 bad_magic ulong to void
+  r168 = new uchar 168 0
+  dig = new uchar 32 0
+  for i ulong 200
+    put tss_craft add off i 0
+  end
+  put tss_craft off uchar 79
+  put tss_craft add off 1 uchar 84
+  put tss_craft add off 2 uchar 83
+  put tss_craft add off 3 uchar 82
+  put tss_craft add off 4 uchar 69
+  put tss_craft add off 5 uchar 67
+  put tss_craft add off 6 uchar 49
+  if ne bad_magic 0
+    put tss_craft add off 6 uchar 50
+  end
+  ts_craft_le32 add off 8 get meta 0
+  ts_craft_le32 add off 12 get meta 1
+  ts_craft_le64 add off 16 get meta 2
+  ts_craft_le64 add off 24 get meta 3
+  ts_craft_le32 add off 32 get meta 4
+  ts_craft_le32 add off 36 get meta 5
+  for d ulong 8
+    ts_craft_le64 add add off 40 mul d 8 get tss_sh d
+  end
+  for i ulong 32
+    put tss_craft add add off 104 i get tss_vid i
+    put tss_craft add add off 136 i get tss_psha i
+  end
+  for i ulong 168
+    put r168 i get tss_craft add off i
+  end
+  tg_sha_hash r168 168 dig
+  for i ulong 32
+    put tss_craft add add off 168 i get dig i
+  end
+end
+
+fn test_crafted_case kind ulong sl ulong gen ulong seq ulong expect long to void
+  m = new ulong 6 0
+  tmp = new ulong 2 0
+  put m 0 kind
+  put m 1 sl
+  put m 2 gen
+  put m 3 seq
+  put m 4 OT_DT_F32
+  put m 5 1
+  ts_craft_hdr 4 2 1 0
+  ts_craft_rec 256 m 0
+  jp_len = ts_join_path 0 tss_jrn
+  w = ts_write_file_from 2 456 jp_len
+  rc = ts_open_cur 4
+  ts_chk eq rc expect
+  if eq rc OT_OK
+    ts_chk eq ots_get 0 1 tmp OT_ERR_STALE
+    ots_close
+  end
+end
+
+fn test_crafted_semantic jp_len ulong to void
+  m0 = new ulong 6 0
+  put m0 0 1
+  put m0 1 0
+  put m0 2 1
+  put m0 3 0
+  put m0 4 OT_DT_F32
+  put m0 5 1
+  note Bad header magic, bad header version, bad record magic (with valid SHA-256!)
+  ts_craft_hdr 4 1 1 1
+  w = ts_write_file_from 2 256 jp_len
+  ts_chk eq ts_open_cur 4 OTS_ERR_TORN
+  ts_craft_hdr 4 1 2 0
+  w = ts_write_file_from 2 256 jp_len
+  ts_chk eq ts_open_cur 4 OTS_ERR_TORN
+  ts_craft_hdr 4 1 1 0
+  ts_craft_rec 56 m0 1
+  w = ts_write_file_from 2 256 jp_len
+  ts_chk eq ts_open_cur 4 OTS_ERR_TORN
+  note Restore valid rec 0, then all 7 semantic replay cases + valid release control
+  ts_craft_rec 56 m0 0
+  test_crafted_case 2 1 1 1 OTS_ERR_TORN
+  test_crafted_case 2 0 2 1 OTS_ERR_TORN
+  test_crafted_case 2 0 1 5 OTS_ERR_TORN
+  test_crafted_case 1 0 1 1 OTS_ERR_TORN
+  test_crafted_case 2 4 1 1 OTS_ERR_TORN
+  test_crafted_case 3 0 1 1 OTS_ERR_TORN
+  test_crafted_case 2 0 1 1 OT_OK
+  note Crafted zero dim, non-zero trailing shape, unknown dtype, rank 9
+  put tss_sh 0 0
+  ts_craft_hdr 4 1 1 0
+  ts_craft_rec 56 m0 0
+  w = ts_write_file_from 2 256 jp_len
+  ts_chk eq ts_open_cur 4 OTS_ERR_TORN
+  put tss_sh 0 3
+  put tss_sh 1 5
+  ts_craft_rec 56 m0 0
+  w = ts_write_file_from 2 256 jp_len
+  ts_chk eq ts_open_cur 4 OTS_ERR_TORN
+  put tss_sh 1 0
+  put m0 4 9
+  ts_craft_rec 56 m0 0
+  w = ts_write_file_from 2 256 jp_len
+  ts_chk eq ts_open_cur 4 OTS_ERR_TORN
+  put m0 4 OT_DT_F32
+  put m0 5 9
+  ts_craft_rec 56 m0 0
+  w = ts_write_file_from 2 256 jp_len
+  ts_chk eq ts_open_cur 4 OTS_ERR_TORN
+end
+
+fn test_crafted_prep_hashes to void
+  vid = new uchar 32 0
+  psha = new uchar 32 0
+  canon = new uchar 12 0
+  ts_chk eq ot_value_id get tss_h 0 get tss_h 1 vid OT_OK
+  for i ulong 32
+    put tss_vid i get vid i
+  end
+  put canon 2 uchar 0x80
+  put canon 3 uchar 0x3f
+  put canon 6 uchar 0xc0
+  put canon 7 uchar 0x7f
+  put canon 11 uchar 0x80
+  tg_sha_hash canon 12 psha
+  for i ulong 32
+    put tss_psha i get psha i
+  end
+  for d ulong 8
+    put tss_sh d 0
+  end
+  put tss_sh 0 3
+end
+
+fn test_crafted_journals to void
+  dl = ts_newdir tss_t_cf
+  ts_chk eq ot_ctx_init 64 OT_OK
+  s3 = new ulong 8 0
+  af = new f32 3 0.0f32
+  h = new ulong 2 0
+  m0 = new ulong 6 0
+  put s3 0 3
+  put af 0 bitcast f32 uint 0x3f800000
+  put af 1 bitcast f32 uint 0x7fa00001
+  put af 2 bitcast f32 uint 0x80000000
+  ts_chk eq ot_from_f32 1 s3 af h OT_OK
+  ts_save_h 0 h
+  ts_chk eq ts_open_cur 4 OT_OK
+  ts_chk eq ots_put get tss_h 0 get tss_h 1 h OT_OK
   ots_close
-  note Wrong capacity refused
-  ts_chk eq ots_open part d 0 dl dl 8 OT_ERR_BAD_ARGS
-  note Torn journal refused
-  pl = ots_mk_path 0 ots_txt_jrn
-  tr = truncate ots_pa 0 pl 40
-  ts_chk eq ots_open part d 0 dl dl 4 OTS_ERR_TORN
+  test_crafted_prep_hashes
+  put m0 0 1
+  put m0 1 0
+  put m0 2 1
+  put m0 3 0
+  put m0 4 OT_DT_F32
+  put m0 5 1
+  ts_craft_hdr 4 1 1 0
+  ts_craft_rec 56 m0 0
+  jp_len = ts_join_path 0 tss_jrn
+  jn = ts_read_file_to 0 jp_len
+  ts_chk eq jn 256
+  same_j = true
+  for i ulong 256
+    if ne get tss_jcopy i get tss_craft i
+      same_j = false
+    end
+  end
+  ts_chk same_j
+  test_crafted_semantic jp_len
+  ts_rel_t 0
+  ts_chk_leaks
 end
 
 fn main to int
@@ -172,13 +905,21 @@ fn main to int
   if and lt mr 0 ne mr -17
     ret 2
   end
-  test_roundtrip_and_lock
+  test_roundtrip_and_lifecycle
   test_crash_matrix
-  test_corrupt_and_torn
-  if ne get tss_c 1 0
-    w = write 1 tss_fail 0 len tss_fail
+  test_torn_and_corrupt
+  test_crafted_journals
+  tot = get tss_c 0
+  fails = get tss_c 1
+  w1 = write 1 tss_sum1 0 len tss_sum1
+  ts_w_u64 1 sub tot fails
+  w2 = write 1 tss_sum2 0 len tss_sum2
+  ts_w_u64 1 fails
+  w3 = write 1 tss_sum3 0 len tss_sum3
+  if ne fails 0
+    w4 = write 1 tss_fail 0 len tss_fail
     ret 1
   end
-  w = write 1 tss_pass 0 len tss_pass
+  w4 = write 1 tss_pass 0 len tss_pass
   ret 0
 end
