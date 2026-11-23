@@ -7,7 +7,7 @@
 ifndef ESTIMATION_TOOLS_MK
 ESTIMATION_TOOLS_MK := 1
 include mk/estimation.mk
-.PHONY: test-est-tools est-tools-purity est-tools test-est-replay-parity
+.PHONY: test-est-tools est-tools-purity est-tools test-est-replay-parity test-est-eval-tmpdir
 ESTT_DIR = $(OUT_DIR)/est-tools
 ESTT_CFLAGS = $(EST_CFLAGS) -Itools/estimation
 ESTT_LIB = tools/estimation/est_replay.c src/estimation/est_mix.c $(EST_KF_SRCS)
@@ -68,14 +68,29 @@ est-tools-purity: est-purity $(ESTT_DIR)/est_replay.o
 		echo "est_replay.o references an authority, World or process operation"; exit 1; fi
 	@awk -v re='$(ESTT_OM_FORBIDDEN)' '$$1 != "note" && $$1 != "text" && $$0 ~ re { print FILENAME ":" FNR ": " $$0; bad = 1 } END { exit bad }' \
 		$(ESTT_OM_LIB) $(ESTT_OM_MAINS) || { echo "an OM-2 estimation tool uses a process, socket, mapping or device word"; exit 1; }
-	@echo "est-tools-purity: est_replay.o and the OM-2 tool sources use no authority/process operation; est_types.o and est_kf.o pure"
+	@# bite control: the same scan must catch each word class planted in a copy of a shipped tool,
+	@# and must not trip on the unplanted copy or on the words in a note or text line
+	@mkdir -p $(ESTT_DIR)/purity-bite
+	@for p in '  pid = fork' '  s = socknew 2 1 0' '  m = mapnew 4096' '  devctl 3 0 0' '  rx_world_init 0' '  argus_open 1'; do \
+		{ cat tools/estimation/est_replay_main.om; printf '%s\n' "$$p"; } > $(ESTT_DIR)/purity-bite/plant.om; \
+		if awk -v re='$(ESTT_OM_FORBIDDEN)' '$$1 != "note" && $$1 != "text" && $$0 ~ re { bad = 1 } END { exit bad }' $(ESTT_DIR)/purity-bite/plant.om; then \
+			echo "est-tools-purity: the OM scan does not bite on planted '$$p'"; exit 1; fi; \
+	done
+	@{ cat tools/estimation/est_replay_main.om; printf '%s\n' 'note fork socknew rx_world_init' 'text t_bite "mapnew devctl aegis"'; } > $(ESTT_DIR)/purity-bite/plant.om; \
+		awk -v re='$(ESTT_OM_FORBIDDEN)' '$$1 != "note" && $$1 != "text" && $$0 ~ re { bad = 1 } END { exit bad }' $(ESTT_DIR)/purity-bite/plant.om \
+		|| { echo "est-tools-purity: the OM scan trips on a note or text line (bite control baseline)"; exit 1; }
+	@echo "est-tools-purity: est_replay.o and the OM-2 tool sources use no authority/process operation (the OM scan bites on 6 planted words); est_types.o and est_kf.o pure"
 
 # no input-size cap: more than 8192 steps, 16384 lines, 2 MiB, 8 KiB lines and 64 KiB SHA256SUMS,
 # byte for byte as the C est_replay
 test-est-replay-parity: $(ESTT_DIR)/est_replay $(ESTT_DIR)/est_replay_c
 	sh tools/estimation/test_est_replay_parity.sh ./$(ESTT_DIR)/est_replay_c ./$(ESTT_DIR)/est_replay $(ESTT_DIR)/work-parity
 
-test-est-tools: est-tools-purity test-est-replay-parity $(ESTT_DIR)/est_fit $(ESTT_DIR)/est_eval $(ESTT_DIR)/est_eval_t $(ESTT_DIR)/test_est_tools
+# est_eval's prefix temp directory under a 576, 577, 5000-byte and empty TMPDIR, as the C est_eval
+test-est-eval-tmpdir: $(ESTT_DIR)/est_fit $(ESTT_DIR)/est_eval
+	sh tools/estimation/test_est_eval_tmpdir.sh ./$(ESTT_DIR)/est_fit ./$(ESTT_DIR)/est_eval $(ESTT_DIR)/work-tmpdir
+
+test-est-tools: est-tools-purity test-est-replay-parity test-est-eval-tmpdir $(ESTT_DIR)/est_fit $(ESTT_DIR)/est_eval $(ESTT_DIR)/est_eval_t $(ESTT_DIR)/test_est_tools
 	rm -rf $(ESTT_DIR)/work
 	./$(ESTT_DIR)/test_est_tools ./$(ESTT_DIR)/est_fit ./$(ESTT_DIR)/est_eval ./$(ESTT_DIR)/est_eval_t $(ESTT_DIR)/work
 	@echo "test-est-tools: replay, fit and evaluation tools pass on run A and synthetic data"

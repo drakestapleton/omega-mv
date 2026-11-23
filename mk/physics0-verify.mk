@@ -47,11 +47,18 @@ $(P0V_DIR)/c/%_asan: tests/physics0/verify/%.c $(P0V_SRCS) $(P0V_HDRS)
 	$(CC) $(P0V_CFLAGS) $(P0V_ASAN) -o $@ $< $(P0V_SRCS) -lm
 # purity: the OM verifier sources (code lines; notes excluded) and the live C verifier objects carry no generator or authority name
 p0v-purity:
-	@if grep -v '^note' $(P0V_OM_VERIFY) | grep -E $(P0V_FORBIDDEN); then echo "verifier OM source references generator or authority names"; exit 1; fi
+	@if grep -hv '^[[:space:]]*note' $(P0V_OM_VERIFY) | grep -E $(P0V_FORBIDDEN); then echo "verifier OM source references generator or authority names"; exit 1; fi
+	@# bite control: the same scan must catch each forbidden name planted in a copy of a verifier unit
+	@mkdir -p $(P0V_DIR)/purity
+	@for p in '  x = truth_get 0' '  oracle_rel_read 1' '  rx_world_init 0' '  aienos_cap_mint 0' '  pid = fork'; do \
+		{ cat src/physics0/score/pd0_score.om; printf '%s\n' "$$p"; } > $(P0V_DIR)/purity/plant.om; \
+		grep -hv '^[[:space:]]*note' $(P0V_DIR)/purity/plant.om | grep -qE $(P0V_FORBIDDEN) \
+			|| { echo "p0v-purity: the OM scan does not bite on planted '$$p'"; exit 1; }; \
+	done
 	@mkdir -p $(P0V_DIR)/purity
 	@for f in $(filter-out src/omega_om_units.c,$(P0V_SRCS)); do $(CC) $(P0V_CFLAGS) -c -o $(P0V_DIR)/purity/$$(basename $$f .c).o $$f || exit 1; done
 	@if nm $(P0V_DIR)/purity/*.o | grep -E $(P0V_FORBIDDEN); then echo "verifier object references generator or authority symbols"; exit 1; fi
-	@echo "p0v-purity: verifier OM sources and C library objects carry no generator or authority symbol"
+	@echo "p0v-purity: verifier OM sources and C library objects carry no generator or authority symbol (the OM scan bites on 5 planted names)"
 P0V_C_TESTS = $(P0V_DIR)/c/test_pd0_ladder $(P0V_DIR)/c/test_pd0_ladder_asan $(P0V_DIR)/c/test_pd0_score $(P0V_DIR)/c/test_pd0_score_asan
 test-physics0-verify: p0v-purity $(P0V_DIR)/test_pd0_fmt $(P0V_DIR)/test_pd0_ladder $(P0V_DIR)/test_pd0_score $(P0V_C_TESTS)
 	./$(P0V_DIR)/test_pd0_fmt
