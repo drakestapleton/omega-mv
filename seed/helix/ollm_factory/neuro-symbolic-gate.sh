@@ -36,6 +36,19 @@ chmod +x "$B/bin/bench"
 
 printf '\n=== [2/6] MODULE SELF-CHECKS & SM121 SASS KERNEL DUMP ===\n'
 "$B/bin/om_synth" selfcheck || bad "om_synth selfcheck failed"
+F=seed/helix/ollm_factory
+{ sed '/^fn main to int$/,$d' "$F/om_synth.om"; cat "$F/frontier-check.om"; } | "$OMC" > "$B/bin/frontier-check"
+chmod +x "$B/bin/frontier-check"
+"$B/bin/frontier-check" || bad "wide BFS frontier or full-pool closure"
+"$B/bin/om_synth" solve "$F/frontier-min.spec" "$B/work/min.om" || bad "wide-frontier CLI regression"
+{ cat "$B/work/min.om"; echo 'fn main to int'
+  awk '$1=="case" {print "if ne solve ulong " $2 " ulong " $3 " ulong " $4 "\nret 1\nend"}' "$F/frontier-min.spec"
+  echo 'ret 0'; echo 'end'
+} | "$OMC" > "$B/bin/frontier-result"
+chmod +x "$B/bin/frontier-result"
+"$B/bin/frontier-result" || bad "wide-frontier program disagrees with supplied cases"
+echo "PASS wide BFS frontiers, full-pool closure and compiled CLI result"
+
 "$B/bin/om_synth_sm121" layout || bad "om_synth_sm121 layout failed"
 "$B/bin/om_synth_sm121" selfcheck || bad "om_synth_sm121 selfcheck failed"
 "$B/bin/om_synth_gb10" dump "$B/sass" || bad "om_synth_gb10 dump failed"
