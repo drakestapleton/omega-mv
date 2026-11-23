@@ -76,23 +76,42 @@ cmp -s "$ob/dsv41-decode" "$out/dsv41-decode" && echo "PASS official build ident
 rm -rf "$ob"
 
 L1=$sidecars/layer1.bin S4=$ckpt/model-00004-of-00048.safetensors
-expect_rc() { # label want cmd...
-  label=$1 want=$2; shift 2
-  "$@" > /dev/null 2>&1
+# expect LABEL WANT_RC PATTERN CMD...: CMD must exit WANT_RC and print a line matching the extended regex PATTERN
+# (empty PATTERN: no output check). A mutant counts as rejected only through the exact case it targets.
+expect() {
+  label=$1 want=$2 pat=$3; shift 3
+  res=$("$@" 2>&1)
   got=$?
-  [ "$got" = "$want" ] && echo "PASS $label (exit $got)" || note_fail "$label want exit $want got $got"
+  if [ "$got" = "$want" ] && { [ -z "$pat" ] || printf '%s\n' "$res" | grep -q -E "$pat"; }; then
+    echo "PASS $label (exit $got)"
+  else
+    note_fail "$label want exit $want${pat:+ and /$pat/} got $got"
+    printf '%s\n' "$res" | sed 's/^/    /'
+  fi
 }
-expect_rc "switch control" 0 sh $d/check-prefetch-switch.sh "$out/check-prefetch-switch"
-expect_rc "decoder control" 0 sh $d/check-decoder-prefetch.sh "$out/dsv41-decode" "$tensors" "$map" "$sidecars" "$ckpt"
-expect_rc "off-arm and on-arm control" 0 "$out/check-arboris-prefetch" "$L1" "$S4"
-expect_rc "mutant A rejected by off-arm dispatch check" 38 "$m/A-forward-nogate" "$L1" "$S4"
-expect_rc "mutant D rejected by worker-reply check" 39 "$m/D-forward-silent" "$L1" "$S4"
-expect_rc "mutant E rejected by start-setting check" 40 "$m/E-forward-starton" "$L1" "$S4"
-expect_rc "mutant H rejected by setting-range check" 43 "$m/H-forward-anyarg" "$L1" "$S4"
-expect_rc "mutant B rejected by switch control" 1 sh $d/check-prefetch-switch.sh "$m/B-switch-nolen"
-expect_rc "mutant C rejected by switch control" 1 sh $d/check-prefetch-switch.sh "$m/C-switch-nodup"
-expect_rc "mutant F rejected by decoder control" 1 sh $d/check-decoder-prefetch.sh "$m/F-cli-starton" "$tensors" "$map" "$sidecars" "$ckpt"
-expect_rc "mutant G rejected by decoder control" 1 sh $d/check-decoder-prefetch.sh "$m/G-cli-norefuse" "$tensors" "$map" "$sidecars" "$ckpt"
+# The decoder and the Arboris controls claim the shared host lock /tmp/omega-arboris-compute-v1.lock;
+# a running dsv41-decode holds it, and the controls would then fail for that reason alone.
+if ps -eo comm= | grep -q -x -F dsv41-decode; then
+  echo "PREFETCH-MUTANTS FAIL: another dsv41-decode is running and holds the Arboris compute lock; rerun when it exits"
+  exit 1
+fi
+expect "switch control" 0 "^PREFETCH-SWITCH PASS$" sh $d/check-prefetch-switch.sh "$out/check-prefetch-switch"
+expect "decoder control" 0 "^DECODER-PREFETCH PASS$" sh $d/check-decoder-prefetch.sh "$out/dsv41-decode" "$tensors" "$map" "$sidecars" "$ckpt"
+expect "off-arm and on-arm control" 0 "" "$out/check-arboris-prefetch" "$L1" "$S4"
+if [ "$fail" != 0 ]; then
+  echo "PREFETCH-MUTANTS FAIL: a control failed on the real code, so no mutant result is meaningful"
+  exit 1
+fi
+expect "mutant A rejected by off-arm dispatch check" 38 "" "$m/A-forward-nogate" "$L1" "$S4"
+expect "mutant D rejected by worker-reply check" 39 "" "$m/D-forward-silent" "$L1" "$S4"
+expect "mutant E rejected by start-setting check" 40 "" "$m/E-forward-starton" "$L1" "$S4"
+expect "mutant H rejected by setting-range check" 43 "" "$m/H-forward-anyarg" "$L1" "$S4"
+expect "mutant B rejected by exact-length cases" 1 "^FAIL double-zero want 12 got 11" sh $d/check-prefetch-switch.sh "$m/B-switch-nolen"
+expect "mutant C rejected by repeated-name case" 1 "^FAIL repeated-name want 50" sh $d/check-prefetch-switch.sh "$m/C-switch-nodup"
+expect "mutant F rejected by off case" 1 "^FAIL zero want 0 \[ARBORIS pf_enabled=0\] got 0 \[ARBORIS pf_enabled=1\]" \
+  sh $d/check-decoder-prefetch.sh "$m/F-cli-starton" "$tensors" "$map" "$sidecars" "$ckpt"
+expect "mutant G rejected by refusal case" 1 "^FAIL two want 64 .* got 70 " \
+  sh $d/check-decoder-prefetch.sh "$m/G-cli-norefuse" "$tensors" "$map" "$sidecars" "$ckpt"
 
 (cd "$out" && sha256sum dsv41-decode check-arboris-prefetch check-prefetch-switch mutants/*)
 if [ "$fail" = 0 ]; then echo "PREFETCH-MUTANTS PASS"; else echo "PREFETCH-MUTANTS FAIL"; fi
