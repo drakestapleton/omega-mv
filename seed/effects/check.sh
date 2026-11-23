@@ -98,6 +98,10 @@ for f in plain clock files net; do build $C/$f.om "$B/$f" || bad "fixture $f doe
 "$E" src allow=io,fd,path < $C/net.om > "$B/net.txt"; want "NEGATIVE net under allow=io,fd,path" 1 $?
 grep -qx 'EFFECTS REFUSED word=socknew class=net line=3' "$B/net.txt" && ok "net refusal names word, class and line" || bad "net refusal text"
 "$E" src allow=io,nosuch < $C/plain.om > /dev/null; want "NEGATIVE unknown class" 2 $?
+"$E" src allow=mem < $C/probe-enlarge.om > "$B/mem.txt"; want "enlarge allow=mem" 0 $?
+grep -qx 'EFFECTS 1 words=1 classes=mem syscalls=93,216,222' "$B/mem.txt" && ok "enlarge manifest uses mem class" || bad "enlarge manifest: $(tail -1 "$B/mem.txt")"
+"$E" src allow=io,device < $C/probe-enlarge.om > "$B/mem_dev.txt"; want "NEGATIVE enlarge refused under allow=io,device" 1 $?
+grep -qx 'EFFECTS REFUSED word=enlarge class=mem line=6' "$B/mem_dev.txt" && ok "enlarge refusal names class=mem" || bad "enlarge refusal text: $(cat "$B/mem_dev.txt")"
 for f in plain clock files net; do "$E" verify $C/$f.om "$B/$f" > /dev/null; want "verify $f" 0 $?; done
 "$E" verify $C/plain.om "$B/net" > "$B/undecl.txt"; want "NEGATIVE verify plain source vs net binary" 1 $?
 grep -q '^VERIFY FAIL undeclared=57,198' "$B/undecl.txt" && ok "undeclared syscalls named (57,198)" || bad "undeclared text: $(tail -1 "$B/undecl.txt")"

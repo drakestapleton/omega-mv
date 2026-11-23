@@ -231,6 +231,98 @@ theorem antibody_valid_launch_admitted : launchGateAccept validLaunchEnv := by
   refine ⟨rfl, rfl, rfl, rfl, ?_⟩
   decide
 
+-- ==================== SILICON-VERIFIED SM121 SCHEDULING ANTIBODIES #13-#16 ====================
+-- Formalizes the 4 SM121 microarchitectural & boundary laws enforced in lockstep across
+-- `seed/helix/helix_jit.om`, `seed/helix/monk_check.om`, `seed/helix/arboris_predator.om`,
+-- and probed by attacks 9..12 of `seed/helix/immune.om`:
+--   13. `antibody_bb_leader_escape`: basic-block leaders (pc=0, BRA targets, BRA fall-throughs) are pinned.
+--   14. `antibody_raw_floor_6`: fixed-latency ALU RAW spans (distance <= 16) enforce rawFloor = 6.
+--   15. `antibody_i2fp_stall_shave`: I2FP/I2F (op 581, nm=29) stalls are never shaved below min(ref, 6).
+--   16. `antibody_anchor_consumer_raw`: fixed-latency RAW spans terminating at an anchor consumer
+--       (LDG/STG/LDS/STS/ISETP/FSETP/BRA/EXIT) cannot violate the 6-cycle RAW floor.
+
+structure Sm121Schedule where
+  n           : Nat
+  perm        : List Nat
+  isBBLeader  : Nat → Bool      -- pc=0, BRA target, or BRA fall-through
+  isAnchor    : Nat → Bool      -- all non-swappable anchors (includes all BB leaders)
+  isI2fp      : Nat → Bool      -- true iff instruction is I2FP/I2F (op 581, nm == 29)
+  refStall    : Nat → Nat       -- reference stall cycles at ref pc
+  candStall   : Nat → Nat       -- candidate stall cycles at inv[ref pc]
+  rawSpan     : Nat → Nat → Bool -- fixed-latency RAW consumer or block boundary within distance 16
+  refSpanCyc  : Nat → Nat → Nat -- cumulative ref stall cycles across [u, v) or [u, v+1)
+  candSpanCyc : Nat → Nat → Nat -- cumulative cand stall cycles across mapped span
+
+def sm121Accept (s : Sm121Schedule) : Prop :=
+  (∀ i, i < s.n → s.isBBLeader i = true → s.isAnchor i = true) ∧
+  (∀ i, i < s.n → s.isAnchor i = true → s.perm[i]? = some i) ∧
+  (∀ u v, u < s.n → v < s.n → u < v → v - u ≤ 16 → s.rawSpan u v = true →
+    s.candSpanCyc u v ≥ min (s.refSpanCyc u v) 6) ∧
+  (∀ u, u < s.n → s.isI2fp u = true → s.candStall u ≥ min (s.refStall u) 6)
+
+/-- Antibody 13: Moving any basic-block leader (pc=0, BRA target, BRA fall-through) is always rejected. -/
+theorem antibody_bb_leader_escape (s : Sm121Schedule) (i r : Nat)
+    (hi : i < s.n) (hbb : s.isBBLeader i = true)
+    (hp : s.perm[i]? = some r) (hne : r ≠ i) :
+    ¬ sm121Accept s := by
+  intro ha
+  have hanc : s.isAnchor i = true := ha.1 i hi hbb
+  have hfix : s.perm[i]? = some i := ha.2.1 i hi hanc
+  rw [hp] at hfix
+  exact hne (Option.some.inj hfix)
+
+/-- Antibody 14: Shaving any fixed-latency RAW span within distance 16 below rawFloor=6 is always rejected. -/
+theorem antibody_raw_floor_6 (s : Sm121Schedule) (u v : Nat)
+    (hu : u < s.n) (hv : v < s.n) (huv : u < v) (hdist : v - u ≤ 16)
+    (hraw : s.rawSpan u v = true)
+    (hshave : s.candSpanCyc u v < min (s.refSpanCyc u v) 6) :
+    ¬ sm121Accept s := by
+  intro ha
+  have hge := ha.2.2.1 u v hu hv huv hdist hraw
+  omega
+
+/-- Antibody 15: Shaving any I2FP/I2F (op 581, nm=29) stall below min(ref_stall, 6) is always rejected. -/
+theorem antibody_i2fp_stall_shave (s : Sm121Schedule) (u : Nat)
+    (hu : u < s.n) (hi2f : s.isI2fp u = true)
+    (hshave : s.candStall u < min (s.refStall u) 6) :
+    ¬ sm121Accept s := by
+  intro ha
+  have hge := ha.2.2.2 u hu hi2f
+  omega
+
+/-- Antibody 16: Violating a fixed-latency RAW span into an anchor consumer (LDG/STG/ISETP/BRA/EXIT) is rejected. -/
+theorem antibody_anchor_consumer_raw (s : Sm121Schedule) (u v : Nat)
+    (hu : u < s.n) (hv : v < s.n) (huv : u < v) (hdist : v - u ≤ 16)
+    (_hanc : s.isAnchor v = true) (hraw : s.rawSpan u v = true)
+    (hshave : s.candSpanCyc u v < min (s.refSpanCyc u v) 6) :
+    ¬ sm121Accept s := by
+  intro ha
+  have hge := ha.2.2.1 u v hu hv huv hdist hraw
+  omega
+
+/-- Positive non-vacuity witness for Antibodies #13-#16 (`sm121Accept`). -/
+def validSm121Sched : Sm121Schedule :=
+  { n := 2,
+    perm := [0, 1],
+    isBBLeader := fun i => i == 0,
+    isAnchor := fun _ => true,
+    isI2fp := fun i => i == 0,
+    refStall := fun _ => 4,
+    candStall := fun _ => 4,
+    rawSpan := fun u v => u == 0 && v == 1,
+    refSpanCyc := fun _ _ => 6,
+    candSpanCyc := fun _ _ => 6 }
+
+theorem antibody_sm121_valid_admitted : sm121Accept validSm121Sched := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro i _ _; rfl
+  · intro i hi _
+    match i, hi with
+    | 0, _ => rfl
+    | 1, _ => rfl
+  · intro u v _ _ _ _ _; decide
+  · intro u _ _; decide
+
 #print axioms antibody_digest_spoof
 #print axioms antibody_non_bijection
 #print axioms antibody_opcode_smuggle
@@ -244,5 +336,10 @@ theorem antibody_valid_launch_admitted : launchGateAccept validLaunchEnv := by
 #print axioms antibody_misaligned_qmd
 #print axioms antibody_zero_gen_cap
 #print axioms antibody_valid_launch_admitted
+#print axioms antibody_bb_leader_escape
+#print axioms antibody_raw_floor_6
+#print axioms antibody_i2fp_stall_shave
+#print axioms antibody_anchor_consumer_raw
+#print axioms antibody_sm121_valid_admitted
 
 end HelixAntibodies

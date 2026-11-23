@@ -1,32 +1,59 @@
 note SPDX-License-Identifier: Apache-2.0
 note seed/helix/extract_q36_kernels.om: Extracts real production SM121 SASS binaries
-note directly from om/gpu/q36/emit_fast.om so Strand B Predator + Strand A Monk +
-note 11-Antibody Immune System verify production Qwen 3.6 35B GB10 kernels!
+note directly from om/gpu/q36/emit_fast.om (31 kernels, modes 97..127) and
+note om/gpu/q36/head/emit_head.om (5 kernels, modes 97..101) so Strand B Predator +
+note Strand A Monk + 12-Antibody Immune System verify all 36 production Qwen 3.6 35B GB10 kernels!
 note Compose after:
 note   om/encoder/bw_enc_sm121.om
 note   om/gpu/q36/emit_fast.om
+note   om/gpu/q36/head/emit_head.om
 note
-note Usage: extract_q36_kernels MODE_CHAR OUT_BIN
-note   Examples: 'e' (swiglu8_q36_fast), 'f' (moe_combine_rms_fast), 'a' (bf16_gemv_fast), 'j' (w4_lmhead_screen_fast)
+note Usage:
+note   extract_q36_kernels MODE OUT_BIN
+note     MODE: single ASCII char ('a'..'~'), decimal numeric ID (97..127, fixing ASCII 127=DEL
+note           on qBf16Gemv1R), or head mode ('h97'..'h101' / 'ha'..'he').
+note   extract_q36_kernels --all OUT_DIR
+note     Extracts all 31 emit_fast (fast_097.bin..fast_127.bin) + 5 emit_head (head_097.bin..head_101.bin).
 
-global exOut uchar 32768
-global exLen ulong 1
+global exOut uchar 65536
 global exPath uchar 1024
-global exMode uchar 4
+global exDir uchar 1024
+global exMode uchar 32
 
-text exUse "usage: extract_q36_kernels MODE_CHAR OUT_BIN\n"
+text exUse "usage: extract_q36_kernels MODE OUT_BIN | --all OUT_DIR\n"
 text exOk "EXTRACTED q36_kernel mode="
 text exBy " bytes="
 text exIn " insns="
 text exNl "\n"
+text exAllOk "EXTRACTED_ALL fast=31 head=5 total=36\n"
+text exFastPfx "/fast_"
+text exHeadPfx "/head_"
+text exBinSfx ".bin"
 
 fn q36Write w view ulong 4 to void
 end
 
-fn exDumpBuf cnt ulong to ulong
+fn qhWrite w view ulong 4 to void
+end
+
+fn exDumpFast cnt ulong to ulong
 for pc ulong cnt bound 2048
 for k ulong 4
 exWd = get q36Buf add mul pc 4 k
+base = add mul pc 16 mul k 4
+put exOut base uchar and exWd 255
+put exOut add base 1 uchar and shr exWd 8 255
+put exOut add base 2 uchar and shr exWd 16 255
+put exOut add base 3 uchar and shr exWd 24 255
+end
+end
+ret mul cnt 16
+end
+
+fn exDumpHead cnt ulong to ulong
+for pc ulong cnt bound 2048
+for k ulong 4
+exWd = get qhBuf add mul pc 4 k
 base = add mul pc 16 mul k 4
 put exOut base uchar and exWd 255
 put exOut add base 1 uchar and shr exWd 8 255
@@ -52,42 +79,192 @@ end
 r = write 1 b p sub 24 p
 end
 
-fn main to int
-if ne argcnt 3
-r = write 1 exUse 0 len exUse
-ret 90
+fn exWritePath plen ulong n ulong to bool
+fd = fopen exPath 0 plen 577 420
+if lt fd 0
+ret false
 end
-m = argread 1 exMode 0 4
-k = argread 2 exPath 0 1023
-if or lt m 1 lt k 1
-ret 90
+pos = ulong 0
+while lt pos n bound 256
+ch = sub n pos
+if gt ch 4096
+ch = ulong 4096
 end
-put exLen 0 0
+w = write int fd exOut pos ch
+if ne w long ch
+z = fclose int fd
+ret false
+end
+pos = add pos ch
+end
+z = fclose int fd
+ret true
+end
+
+fn exParseDec off ulong m ulong to ulong
+v = ulong 0
+if ge off m
+ret 0
+end
+for i ulong sub m off bound 16
+c = get exMode add off i
+if or lt c 48 gt c 57
+ret 0
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn exEmitOne isHead bool id ulong plen ulong to bool
+n = ulong 0
+if isHead
+put qhPc 0 0
+put qhGuard 0 0
+if not qhKernel uchar id
+ret false
+end
+qhDone
+cnt = get qhPc 0
+if or eq cnt 0 gt cnt 2048
+ret false
+end
+n = exDumpHead cnt
+else
 put q36Pc 0 0
 put q36Guard 0 0
-if not q36Kernel get exMode 0
-ret 2
+if not q36Kernel uchar id
+ret false
 end
+q36Done
 cnt = get q36Pc 0
 if or eq cnt 0 gt cnt 2048
-ret 2
+ret false
 end
-n = exDumpBuf cnt
-fd = fopen exPath 0 ulong k 577 420
-if lt fd 0
-ret 3
+n = exDumpFast cnt
 end
-w = write int fd exOut 0 n
-z = fclose int fd
-if ne w long n
-ret 3
+if not exWritePath plen n
+ret false
 end
 r = write 1 exOk 0 len exOk
-r = write 1 exMode 0 1
+if isHead
+hb = new uchar 1 104
+r = write 1 hb 0 1
+end
+exNum id
 r = write 1 exBy 0 len exBy
 exNum n
 r = write 1 exIn 0 len exIn
 exNum div n 16
 r = write 1 exNl 0 len exNl
+ret true
+end
+
+fn exBuildName dlen ulong isHead bool id ulong to ulong
+p = ulong 0
+for i ulong dlen bound 900
+put exPath p get exDir i
+p = add p 1
+end
+if isHead
+for i ulong len exHeadPfx bound 16
+put exPath p get exHeadPfx i
+p = add p 1
+end
+else
+for i ulong len exFastPfx bound 16
+put exPath p get exFastPfx i
+p = add p 1
+end
+end
+put exPath p uchar add 48 div id 100
+p = add p 1
+put exPath p uchar add 48 rem div id 10 10
+p = add p 1
+put exPath p uchar add 48 rem id 10
+p = add p 1
+for i ulong len exBinSfx bound 8
+put exPath p get exBinSfx i
+p = add p 1
+end
+ret p
+end
+
+fn exIsAll m ulong to bool
+if ne m 5
+ret false
+end
+if ne get exMode 0 45
+ret false
+end
+if ne get exMode 1 45
+ret false
+end
+if ne get exMode 2 97
+ret false
+end
+if ne get exMode 3 108
+ret false
+end
+ret eq get exMode 4 108
+end
+
+fn main to int
+if ne argcnt 3
+r = write 1 exUse 0 len exUse
+ret 90
+end
+m = argread 1 exMode 0 31
+k = argread 2 exPath 0 1023
+if or lt m 1 lt k 1
+ret 90
+end
+um = ulong m
+uk = ulong k
+if exIsAll um
+for i ulong uk bound 1024
+put exDir i get exPath i
+end
+for id ulong 31
+mid = add 97 id
+pl = exBuildName uk false mid
+if not exEmitOne false mid pl
+ret 2
+end
+end
+for id ulong 5
+mid = add 97 id
+pl = exBuildName uk true mid
+if not exEmitOne true mid pl
+ret 2
+end
+end
+r = write 1 exAllOk 0 len exAllOk
+ret 0
+end
+isHead = false
+mid = ulong 0
+c0 = get exMode 0
+if and eq c0 104 gt um 1
+isHead = true
+c1 = get exMode 1
+if and eq um 2 or lt c1 48 gt c1 57
+mid = ulong c1
+else
+mid = exParseDec 1 um
+end
+else
+if and eq um 1 or lt c0 48 gt c0 57
+mid = ulong c0
+else
+mid = exParseDec 0 um
+end
+end
+if or lt mid 97 gt mid 127
+ret 2
+end
+if not exEmitOne isHead mid uk
+ret 3
+end
 ret 0
 end

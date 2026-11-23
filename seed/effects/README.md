@@ -17,7 +17,8 @@ effects table                           word, class and syscalls, one per line
 ```
 
 Classes: `io` (read, write), `fd`, `path`, `net`, `proc`, `ident`, `time`, `env`,
-`random`, `device`. `exit`/traps (syscall 93) are always allowed.
+`random`, `device`, `mem` (`enlarge`: anonymous memory growth via mremap 216 / mmap 222,
+separated from `device` so verifiers need not allow GPU ioctl 29). `exit`/traps (syscall 93) are always allowed.
 
 Exit status: 0 pass, 1 refused or undeclared syscall, 2 usage, 3 invalid or
 unresolvable input, 4 read error.
@@ -54,8 +55,8 @@ sequence the compiler emits is relied on for that, as it was before this rule wa
   which lower to `DSB SY`/`YIELD`, and `fma` (fused multiply-add, one `FMADD`); a probe shows
   they add no syscall beyond exit (93). The VFIO words are `device` (`vfioctl`, `vfioirq`:
   ioctl 29; `vfiomap`, `vfiomapw`: mmap 222) and `eventfd` is `fd` (eventfd2 19). `enlarge` (run-time
-  pools) maps the process's own anonymous memory and is `device` like `mapnew`/`maphold` (mmap 222 at the
-  first growth, mremap 216 past the capacity).
+  pools) maps the process's own anonymous memory and is in the dedicated `mem` class (mmap 222 at the
+  first growth, mremap 216 past the capacity) so verifiers can grow pools without allowing `device` ioctl 29.
   `omc.om` has exactly 7 SVC emit sites (a new site means the table needs review); `fn en_help` holds
   two of them, the omc_enlarge helper's mremap and mmap
 - probe parity: one compiled probe per word; the ELF syscalls equal the table row. A row
