@@ -303,8 +303,9 @@ global g_ee_mk_sha uchar 65
 global g_ee_sq_t f64 195
 global g_ee_sq_have ulong 65
 global g_ee_sq_beyond ulong 1
-global g_ee_w f64 8192
-global g_ee_nu f64 8192
+note per-sample innovation and whitened innovation of the model being scored (pools, grown per step)
+global g_ee_w f64 *
+global g_ee_nu f64 *
 global g_ee_sf f64 78
 global g_ee_su ulong 72
 global g_ee_sl long 6
@@ -544,13 +545,13 @@ fn ee_mk_line i ulong st edit long 2 to long
   t_o = new long 1 0
   u_o = new ulong 1 0
   ln = new uchar 4096 0
-  loff = get g_ef_off add EF_MAX_LINES i
-  ll = get g_ef_llen add EF_MAX_LINES i
+  ap = er_line_at 1 i
+  ll = get g_ef_llen add er_ef_lb 1 i
   if gt ll 4096
     ll = 4096
   end
   for j ulong ll
-    put ln j get g_ef_data add add EF_MAX_BYTES loff j
+    put ln j get g_ef_data add ap j
   end
   if ne est_parse_time_prefix view ln 0 ll t_o u_o 0
     ret 0
@@ -597,7 +598,7 @@ fn ee_load_marks path view uchar 1024 plen ulong to long
     put g_ee_mk_sha i get sh i
   end
   nl = get g_ef_nlines 1
-  for i ulong nl
+  for i ulong nl bound ER_UNB
     if ne ee_mk_line i st 0
       ret 1
     end
@@ -748,8 +749,8 @@ fn ee_tspan rslot ulong m ulong to void
   tmin = long 0
   tmax = long 0
   first = ulong 1
-  for i ulong ns
-    idx = add mul rslot RP_MAX_STEPS i
+  for i ulong ns bound ER_UNB
+    idx = add mul i RP_SLOTS rslot
     if ne and get g_rps_flags idx 3 0
       continue
     end
@@ -885,10 +886,14 @@ fn ee_include idx ulong m ulong use_mx ulong acc edit f64 5 cnt edit ulong 12 to
   ee_include_bins idx m h95 cnt
 end
 
+note g_ee_w and g_ee_nu get room for every step, as est_eval.c's malloc(nsteps); a refusal traps 3
+note at the first put (est_eval.c does not check its malloc either)
 fn ee_pass1 rslot ulong m ulong use_mx ulong acc edit f64 5 cnt edit ulong 12 to void
   ns = get g_rp_meta mul rslot 16
-  for i ulong ns
-    idx = add mul rslot RP_MAX_STEPS i
+  rw = enlarge g_ee_w ns
+  rn = enlarge g_ee_nu ns
+  for i ulong ns bound ER_UNB
+    idx = add mul i RP_SLOTS rslot
     fl = get g_rps_flags idx
     if ne and fl 1 0
       put acc 4 get g_rps_z idx
@@ -909,12 +914,12 @@ end
 fn ee_mean_bias m ulong n ulong to void
   dn = f64 n
   mn = f64 0.0
-  for i ulong n
+  for i ulong n bound ER_UNB
     mn = add mn get g_ee_nu i
   end
   mn = div mn dn
   v = f64 0.0
-  for i ulong n
+  for i ulong n bound ER_UNB
     d = sub get g_ee_nu i mn
     v = add v mul d d
   end
@@ -928,7 +933,7 @@ end
 
 fn ee_acf_lag k ulong n ulong wm f64 to f64
   num = f64 0.0
-  for i ulong sub n k
+  for i ulong sub n k bound ER_UNB
     a = sub get g_ee_w i wm
     b = sub get g_ee_w add i k wm
     num = add num mul a b
@@ -939,12 +944,12 @@ end
 fn ee_acf m ulong n ulong to void
   dn = f64 n
   wm = f64 0.0
-  for i ulong n
+  for i ulong n bound ER_UNB
     wm = add wm get g_ee_w i
   end
   wm = div wm dn
   den = f64 0.0
-  for i ulong n
+  for i ulong n bound ER_UNB
     d = sub get g_ee_w i wm
     den = add den mul d d
   end
@@ -1014,15 +1019,14 @@ note Ten-step target of step i: the first step j > i at t_ns == target that is n
 note scanning while t_ns <= target. Returns j + 1, or 0 when there is none.
 fn ee_ten_target rslot ulong i ulong target long to ulong
   ns = get g_rp_meta mul rslot 16
-  base = mul rslot RP_MAX_STEPS
   j = add i 1
-  while lt j ns bound 8192
-    tj = get g_rps_tns add base j
+  while lt j ns bound ER_UNB
+    tj = get g_rps_tns add mul j RP_SLOTS rslot
     if gt tj target
       ret 0
     end
     if eq tj target
-      if eq and get g_rps_flags add base j 2 0
+      if eq and get g_rps_flags add mul j RP_SLOTS rslot 2 0
         ret add j 1
       end
     end
@@ -1068,7 +1072,7 @@ fn ee_ten_hit rslot ulong i ulong jt ulong use_mx ulong to long
     ret -1
   end
   t10 = ee_ten_thr get pr 0 use_mx
-  zt = get g_rps_z add mul rslot RP_MAX_STEPS jt
+  zt = get g_rps_z add mul jt RP_SLOTS rslot
   if le fabs sub zt get pr 1 t10
     ret 1
   end
@@ -1077,11 +1081,10 @@ end
 
 fn ee_ten rslot ulong m ulong use_mx ulong to void
   ns = get g_rp_meta mul rslot 16
-  base = mul rslot RP_MAX_STEPS
   tn = ulong 0
   th = ulong 0
-  for i ulong ns
-    idx = add base i
+  for i ulong ns bound ER_UNB
+    idx = add mul i RP_SLOTS rslot
     if ne and get g_rps_flags idx 3 0
       continue
     end
@@ -1701,9 +1704,9 @@ fn ee_write_prefix pl ulong k ulong to long
     ret 1
   end
   ob_init int fd
-  for i ulong k
-    o = get g_ef_off i
-    for j ulong get g_ef_llen i
+  for i ulong k bound ER_UNB
+    o = er_line_at 0 i
+    for j ulong get g_ef_llen i bound ER_UNB
       ob_c get g_ef_data add o j
     end
     ob_nl
@@ -1719,15 +1722,15 @@ end
 
 note replay the prefix file (slot 1) into replay slot 3 for model m and compare with slot m
 fn ee_prefix_model m ulong to ulong
-  if ne est_replay_run 1 ulong 999999999 m get g_ee_q m get g_ee_r m 3 0
+  if ne est_replay_run 1 ER_ALL_LINES m get g_ee_q m get g_ee_r m 3 0
     ret 0
   end
   nn = get g_rp_meta 48
   if or eq nn 0 gt nn get g_rp_meta mul m 16
     ret 0
   end
-  for i ulong nn
-    if not ee_step_equal add mul 3 RP_MAX_STEPS i add mul m RP_MAX_STEPS i
+  for i ulong nn bound ER_UNB
+    if not ee_step_equal add mul i RP_SLOTS 3 add mul i RP_SLOTS m
       ret 0
     end
   end
@@ -1897,7 +1900,7 @@ fn ee_replay_models nm ulong to void
   put g_ee_res 0 1
   put g_ee_res 1 1
   for m ulong nm
-    if ne est_replay_run 0 ulong 999999999 m get g_ee_q m get g_ee_r m m 0
+    if ne est_replay_run 0 ER_ALL_LINES m get g_ee_q m get g_ee_r m m 0
       put g_ee_res 0 0
       ob_init 2
       ob_t t_ee_e_replay
@@ -1915,8 +1918,8 @@ fn ee_replay_models nm ulong to void
       put g_ee_res 0 0
     end
     ns = get g_rp_meta mb
-    for i ulong ns
-      if eq and get g_rps_flags add mul m RP_MAX_STEPS i 8 0
+    for i ulong ns bound ER_UNB
+      if eq and get g_rps_flags add mul i RP_SLOTS m 8 0
         put g_ee_res 1 0
       end
     end
