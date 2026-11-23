@@ -13,7 +13,10 @@ P0V_DIR = $(OUT_DIR)/tests-physics0-verify
 P0V_OMC ?= seed/out/omc
 # Pure OM-2 (wave 36): formats, codes, receipts, ladder checker, scorer and negative controls, built
 # from .om by the seed omc. The receipt commit string is prepended as an OM text constant, the way the
-# C build passed -DPD0_VERIFIER_COMMIT. OM-2 arrays are bounds checked (an out-of-range get traps).
+# C build passed -DPD0_VERIFIER_COMMIT. The OM tests run without sanitizers; OM-2 itself traps an
+# out-of-range array get or put (3), signed overflow (1), div or rem by 0 (2), a shift amount
+# outside 0..width-1 (7) and an out-of-range conversion (5) (docs/one_layer/OMEGESE.md 9.3);
+# unsigned arithmetic wraps as in C. Alignment, use-after-free and leak checks are not replaced.
 P0V_OM_BASE = src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_wire.om src/physics0/ladder/pd0_codes.om src/physics0/ladder/pd0_fmt.om src/physics0/controls/pd0_receipt.om
 P0V_OM_VERIFY = $(P0V_OM_BASE) src/physics0/ladder/pd0_ladder.om src/physics0/score/pd0_score.om src/physics0/controls/pd0_controls.om
 P0V_OM_FMT = $(P0V_OM_BASE) tests/physics0/verify/test_pd0_fmt.om

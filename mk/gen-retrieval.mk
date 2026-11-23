@@ -8,6 +8,10 @@
 #
 # genret is pure OM-2 (tools/gen/retrieval/genret.om), built by the seeded compiler GENRET_OMC as one unit:
 # seed/ng/sha256.om, a binding unit generated in this make run, then genret.om.
+# The ASan/UBSan pass of the C build is gone. OM-2 traps at run time an out-of-range array get or put
+# (3), signed overflow (1), div or rem by 0 (2), a shift amount outside 0..width-1 (7) and an
+# out-of-range conversion (5) (docs/one_layer/OMEGESE.md 9.3); unsigned arithmetic wraps as in C.
+# Sanitizer checks with no OM-2 counterpart (alignment, use after free, leaks) are not replaced.
 #
 # genret validates records with Agent D's recheck (tools/gen/abstract/recheck.c). Its source must hash to
 # GENRET_RECHECK_SHA256; that is checked every time make runs a gen-retrieval target, whether the source is in

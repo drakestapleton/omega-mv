@@ -1,8 +1,12 @@
 # PD-0 experiment planner (Direction 5): contract tests, purity check, passive baseline
 # and the information-efficiency comparison (development evidence, not EXP-003).
 # Pure OM-2 (wave 36b): the planner, its contract tests, the test-only world bridge and both
-# efficiency comparisons are built from .om by the seed omc. OM-2 arrays are bounds checked
-# (an out-of-range get or put traps), the check the C build's ASan/UBSan run gave.
+# efficiency comparisons are built from .om by the seed omc. The ASan/UBSan run of the C build is
+# gone. What OM-2 checks at run time instead (docs/one_layer/OMEGESE.md 9.3; exit 100 + trap): an
+# out-of-range array get or put traps 3; signed add, sub, mul, neg, div and shl outside the type
+# trap 1; div or rem by 0 traps 2; a shift amount outside 0..width-1 traps 7; an out-of-range
+# conversion traps 5. Unsigned arithmetic wraps by definition, as in C. Sanitizer checks with no
+# OM-2 run-time counterpart (alignment, use after free, leaks) are not replaced and not claimed.
 ifndef PHYSICS0_PLANNER_MK
 PHYSICS0_PLANNER_MK := 1
 .PHONY: test-physics0-planner p0p-purity physics0-planner-eff physics0-planner-eff2

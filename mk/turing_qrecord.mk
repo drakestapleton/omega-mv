@@ -7,6 +7,10 @@
 #
 # test-turing-qrecord: builds the test with the seeded omc and runs it (pinned
 # record and sidecar KATs, refusals, bindings, write-once files and manifests).
+# The ASan/UBSan build of the C test is gone. OM-2 traps at run time an out-of-range array get or
+# put (3), signed overflow (1), div or rem by 0 (2), a shift amount outside 0..width-1 (7) and an
+# out-of-range conversion (5) (docs/one_layer/OMEGESE.md 9.3); unsigned arithmetic wraps as in C.
+# Sanitizer checks with no OM-2 counterpart (alignment, use after free, leaks) are not replaced.
 ifndef TURING_QRECORD_MK
 TURING_QRECORD_MK := 1
 .PHONY: test-turing-qrecord
