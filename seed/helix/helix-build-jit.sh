@@ -99,6 +99,9 @@ awk '
 { print }
 ' om/gpu/q36/decode/decode_run.om > "$OUT/decode_run_hx.om"
 
+awk '/^fn main / { exit } { print }' "$OUT/decode_run_hx.om" > "$OUT/decode_run_hx_pre.om"
+awk '/^fn main / { p=1 } p { print }' "$OUT/decode_run_hx.om" > "$OUT/decode_run_hx_main.om"
+
 {
   printf 'om2\n'
   cat gpu/nvidia/native/nvrm/context.om \
@@ -108,11 +111,14 @@ awk '
       om/encoder/bw_enc_sm121.om \
       "$OUT/bw_hazard_clean.om" \
       "$OUT/emit_fast_dec.om" \
+      om/gpu/q36/emit_prefill.om \
       "$OUT/emit_head_dec.om" \
       seed/helix/helix_jit.om \
       "$OUT/helix_jit_head_ext.om" \
       om/gpu/q36/arboris/prefetch.om \
-      "$OUT/decode_run_hx.om"
+      "$OUT/decode_run_hx_pre.om" \
+      om/gpu/q36/decode/prefill_host.om \
+      "$OUT/decode_run_hx_main.om"
 } > "$OUT/q36_helix_decode.om"
 
 "$OMC_A" < "$OUT/q36_helix_decode.om" > "$OUT/q36-helix-decode.A"
