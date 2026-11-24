@@ -1,0 +1,635 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_numeric_transc.c (E1 WP-B frozen FP32
+note transcendental sequences: exp2, log2, sigmoid, tanh, rsqrt, erf, gelu,
+note sin, cos). Every arithmetic step is one explicit IEEE binary32 op
+note (add, sub, mul, div, fsqrt, fma), matching the C AArch64 inline-asm
+note oracle bit-for-bit.
+om2
+
+const TR_QNAN uint 0x7fc00000
+const TR_PINF uint 0x7f800000
+const TR_NINF uint 0xff800000
+const TR_MAGIC uint 0x4b400000
+const TR_TRIG_MAX uint 0x4a800000
+
+note Shared scratch globals for multi-output internal helpers
+global g_tr_k int 1
+global g_tr_ml f32 1
+global g_tr_cl f32 1
+global g_tr_s f32 1
+global g_tr_e f32 1
+
+note Frozen erfcx(y) tables (17 intervals, degree-10 Taylor polynomials)
+global g_erfcx_init ulong 1
+global g_erfcx_lo uint 17
+global g_erfcx_c uint 17
+global g_erfcx_a0lo uint 17
+global g_erfcx_a uint 187
+
+fn tr_tf u uint to f32
+  ret bitcast f32 u
+end
+
+fn tr_tb f f32 to uint
+  ret bitcast uint f
+end
+
+fn tr_fneg a f32 to f32
+  ret tr_tf xor tr_tb a uint 0x80000000
+end
+
+fn tr_fabs a f32 to f32
+  ret tr_tf and tr_tb a uint 0x7fffffff
+end
+
+fn tr_isnan a f32 to bool
+  ret gt and tr_tb a uint 0x7fffffff TR_PINF
+end
+
+fn tr_pow2i n int to f32
+  ret tr_tf shl uint add n int 127 23
+end
+
+fn tr_scale2 m f32 k int to f32
+  if gt k int 127
+    ret mul mul m tr_pow2i int 127 tr_pow2i sub k int 127
+  end
+  if lt k int -126
+    ret mul mul m tr_pow2i add k int 126 tr_pow2i int -126
+  end
+  ret mul m tr_pow2i k
+end
+
+fn tr_two_sum a f32 b f32 to void
+  x = add a b
+  bv = sub x a
+  av = sub x bv
+  put g_tr_s 0 x
+  put g_tr_e 0 add sub a av sub b bv
+end
+
+note ---- Shared exp core ----
+
+fn tr_exp_core2 ah f32 al f32 to f32
+  t = add mul ah tr_tf uint 0x3fb8aa3b tr_tf TR_MAGIC
+  kf = sub t tr_tf TR_MAGIC
+  k = sub bitcast int tr_tb t bitcast int TR_MAGIC
+  nkf = tr_fneg kf
+  r = fma nkf tr_tf uint 0x3f317218 ah
+  r = fma nkf tr_tf uint 0xb102e308 r
+  r = add r al
+  p = tr_tf uint 0x37d00d01
+  p = fma p r tr_tf uint 0x39500d01
+  p = fma p r tr_tf uint 0x3ab60b61
+  p = fma p r tr_tf uint 0x3c088889
+  p = fma p r tr_tf uint 0x3d2aaaab
+  p = fma p r tr_tf uint 0x3e2aaaab
+  p = fma p r tr_tf uint 0x3f000000
+  p = fma p r tr_tf uint 0x3f800000
+  put g_tr_k 0 k
+  m = fma p r tr_tf uint 0x3f800000
+  put g_tr_ml 0 fma p r sub tr_tf uint 0x3f800000 m
+  ret m
+end
+
+note ---- EXP2 ----
+
+fn omega_math_exp2 xu uint to uint
+  x = tr_tf xu
+  if tr_isnan x
+    ret TR_QNAN
+  end
+  if ge x tr_tf uint 0x43000000
+    ret TR_PINF
+  end
+  if lt x tr_tf uint 0xc3170000
+    ret uint 0
+  end
+  t = add x tr_tf TR_MAGIC
+  kf = sub t tr_tf TR_MAGIC
+  k = sub bitcast int tr_tb t bitcast int TR_MAGIC
+  fv = sub x kf
+  p = tr_tf uint 0x35b16011
+  p = fma p fv tr_tf uint 0x377fe5fe
+  p = fma p fv tr_tf uint 0x39218489
+  p = fma p fv tr_tf uint 0x3aaec3ff
+  p = fma p fv tr_tf uint 0x3c1d955b
+  p = fma p fv tr_tf uint 0x3d635847
+  p = fma p fv tr_tf uint 0x3e75fdf0
+  p = fma p fv tr_tf uint 0x3f317218
+  m = fma p fv tr_tf uint 0x3f800000
+  ret tr_tb tr_scale2 m k
+end
+
+note ---- LOG2 ----
+
+fn tr_log2_poly z f32 zl f32 e int to uint
+  z2 = mul z z
+  p = tr_tf uint 0x3e864d42
+  p = fma p z2 tr_tf uint 0x3ea4258a
+  p = fma p z2 tr_tf uint 0x3ed30bb1
+  p = fma p z2 tr_tf uint 0x3f13bb63
+  p = fma p z2 tr_tf uint 0x3f76384f
+  z3 = mul z z2
+  chi = tr_tf uint 0x4038aa3b
+  ph = mul z chi
+  pl = fma z chi tr_fneg ph
+  lo = fma z3 p fma z tr_tf uint 0x33257060 mul zl chi
+  tr_two_sum f32 e ph
+  s = get g_tr_s 0
+  se = get g_tr_e 0
+  ret tr_tb add s add se add pl lo
+end
+
+fn omega_math_log2 xu uint to uint
+  u = xu
+  if tr_isnan tr_tf u
+    ret TR_QNAN
+  end
+  if eq and u uint 0x7fffffff uint 0
+    ret TR_NINF
+  end
+  if ne and u uint 0x80000000 uint 0
+    ret TR_QNAN
+  end
+  if eq u TR_PINF
+    ret TR_PINF
+  end
+  eadj = int 0
+  if eq and u TR_PINF uint 0
+    u = tr_tb mul tr_tf u tr_tf uint 0x4b000000
+    eadj = int -23
+  end
+  e = add sub int and shr u 23 uint 0xff int 127 eadj
+  m = tr_tf or and u uint 0x007fffff uint 0x3f800000
+  if gt m tr_tf uint 0x3fb504f3
+    m = mul m tr_tf uint 0x3f000000
+    e = add e int 1
+  end
+  num = sub m tr_tf uint 0x3f800000
+  tr_two_sum m tr_tf uint 0x3f800000
+  den = get g_tr_s 0
+  dl = get g_tr_e 0
+  z = div num den
+  rz = fma tr_fneg z den num
+  rz = fma tr_fneg z dl rz
+  zl = div rz den
+  ret tr_log2_poly z zl e
+end
+
+note ---- SIGMOID ----
+
+fn omega_math_sigmoid xu uint to uint
+  x = tr_tf xu
+  if tr_isnan x
+    ret TR_QNAN
+  end
+  if ge x tr_tf uint 0x41900000
+    ret uint 0x3f800000
+  end
+  if le x tr_tf uint 0xc2d00000
+    ret uint 0
+  end
+  m = tr_exp_core2 tr_fneg tr_fabs x tr_tf uint 0
+  k = get g_tr_k 0
+  t = tr_scale2 m k
+  d = add tr_tf uint 0x3f800000 t
+  if eq and xu uint 0x80000000 uint 0
+    ret tr_tb div tr_tf uint 0x3f800000 d
+  end
+  ret tr_tb tr_scale2 div m d k
+end
+
+note ---- TANH ----
+
+fn tr_tanh_small ax f32 to f32
+  x2 = mul ax ax
+  p = tr_tf uint 0x38cb3f0c
+  p = fma p x2 tr_tf uint 0xb97abebc
+  p = fma p x2 tr_tf uint 0x3a1aac12
+  p = fma p x2 tr_tf uint 0xbabed1b2
+  p = fma p x2 tr_tf uint 0x3b6b69e8
+  p = fma p x2 tr_tf uint 0xbc11371b
+  p = fma p x2 tr_tf uint 0x3cb327a4
+  p = fma p x2 tr_tf uint 0xbd5d0dd1
+  p = fma p x2 tr_tf uint 0x3e088889
+  p = fma p x2 tr_tf uint 0xbeaaaaab
+  ret fma mul ax x2 p ax
+end
+
+fn omega_math_tanh xu uint to uint
+  x = tr_tf xu
+  if tr_isnan x
+    ret TR_QNAN
+  end
+  sign = and xu uint 0x80000000
+  ax = tr_fabs x
+  r = tr_tf uint 0
+  if ge ax tr_tf uint 0x41180000
+    r = tr_tf uint 0x3f800000
+  else
+    if lt ax tr_tf uint 0x3f100000
+      r = tr_tanh_small ax
+    else
+      m = tr_exp_core2 add ax ax tr_tf uint 0
+      e2 = tr_scale2 m get g_tr_k 0
+      r = sub tr_tf uint 0x3f800000 div tr_tf uint 0x40000000 add e2 tr_tf uint 0x3f800000
+    end
+  end
+  ret or tr_tb r sign
+end
+
+note ---- RSQRT (correctly rounded) ----
+
+fn tr_mul_lt_pow2 nv ulong xv ulong ns ulong to bool
+  if ge ns 127
+    ret true
+  end
+  n2 = mul nv nv
+  p_lo = mul and n2 0xffffffff xv
+  p_hi = mul shr n2 32 xv
+  mid = add shr p_lo 32 p_hi
+  l_lo = or and p_lo 0xffffffff shl and mid 0xffffffff 32
+  l_hi = shr mid 32
+  if ge ns 64
+    ret lt l_hi shl ulong 1 sub ns 64
+  end
+  if ne l_hi 0
+    ret false
+  end
+  ret lt l_lo shl ulong 1 ns
+end
+
+fn tr_mid_below w1 uint w2 uint xv ulong ex long to bool
+  m1 = ulong or and w1 uint 0x7fffff uint 0x800000
+  m2 = ulong or and w2 uint 0x7fffff uint 0x800000
+  e1 = sub long shr w1 23 150
+  e2 = sub long shr w2 23 150
+  el = e2
+  if lt e1 e2
+    el = e1
+  end
+  nv = add shl m1 ulong sub e1 el shl m2 ulong sub e2 el
+  s = add sub mul 2 el 2 ex
+  if ge s 0
+    ret false
+  end
+  ret tr_mul_lt_pow2 nv xv ulong sub 0 s
+end
+
+fn omega_math_rsqrt xu uint to uint
+  u = xu
+  if tr_isnan tr_tf u
+    ret TR_QNAN
+  end
+  if eq u uint 0
+    ret TR_PINF
+  end
+  if eq u uint 0x80000000
+    ret TR_NINF
+  end
+  if ne and u uint 0x80000000 uint 0
+    ret TR_QNAN
+  end
+  if eq u TR_PINF
+    ret uint 0
+  end
+  post = int 0
+  if eq and u TR_PINF uint 0
+    u = tr_tb mul tr_tf u tr_tf uint 0x4b800000
+    post = int 12
+  end
+  y = div tr_tf uint 0x3f800000 fsqrt tr_tf u
+  xv = ulong or and u uint 0x7fffff uint 0x800000
+  ex = sub long shr u 23 150
+  w = tr_tb y
+  while tr_mid_below w add w uint 1 xv ex bound 4
+    w = add w uint 1
+  end
+  while not tr_mid_below sub w uint 1 w xv ex bound 4
+    w = sub w uint 1
+  end
+  ret tr_tb mul tr_tf w tr_pow2i post
+end
+
+note ---- ERFCX tables & ERF / GELU ----
+
+fn erfcx_set_row i ulong a0 uint a1 uint a2 uint a3 uint a4 uint to void
+  b = mul i 11
+  put g_erfcx_a b a0
+  put g_erfcx_a add b 1 a1
+  put g_erfcx_a add b 2 a2
+  put g_erfcx_a add b 3 a3
+  put g_erfcx_a add b 4 a4
+end
+
+fn erfcx_set_row2 i ulong a5 uint a6 uint a7 uint a8 uint a9 uint to void
+  b = mul i 11
+  put g_erfcx_a add b 5 a5
+  put g_erfcx_a add b 6 a6
+  put g_erfcx_a add b 7 a7
+  put g_erfcx_a add b 8 a8
+  put g_erfcx_a add b 9 a9
+end
+
+fn erfcx_set_meta i ulong lo uint c uint a0lo uint a10 uint to void
+  put g_erfcx_lo i lo
+  put g_erfcx_c i c
+  put g_erfcx_a0lo i a0lo
+  put g_erfcx_a add mul i 11 10 a10
+end
+
+fn erfcx_init_p1 to void
+  erfcx_set_meta 0 uint 0x3f000000 uint 0x3f200000 uint 0xb27ec2a1 uint 0x3a153558
+  erfcx_set_row 0 uint 0x3f0e8b5b uint 0xbedd5e87 uint 0x3e92bba1 uint 0xbe2ce1ae uint 0x3db96a35
+  erfcx_set_row2 0 uint 0xbd37e72f uint 0x3caa97f4 uint 0xbc153fa8 uint 0x3b77e81e uint 0xbac477cd
+  erfcx_set_meta 1 uint 0x3f400000 uint 0x3f600000 uint 0x326409ac uint 0x396059be
+  erfcx_set_row 1 uint 0x3eedba3f uint 0xbea1b4fb uint 0x3e4077c8 uint 0xbdceac34 uint 0x3d4c18e1
+  erfcx_set_row2 1 uint 0xbcbbcee9 uint 0x3c229324 uint 0xbb8559c2 uint 0x3ad077bf uint 0xba1bff38
+  erfcx_set_meta 2 uint 0x3f800000 uint 0x3f900000 uint 0x321b149b uint 0x38b13a1e
+  erfcx_set_row 2 uint 0x3eca98f0 uint 0xbe73c59b uint 0x3e02f393 uint 0xbd809a1d uint 0x3cea7389
+  erfcx_set_row2 2 uint 0xbc48852f uint 0x3ba23629 uint 0xbaf9c637 uint 0x3a37ecd3 uint 0xb9820f1c
+  erfcx_set_meta 3 uint 0x3fa00000 uint 0x3fb00000 uint 0xb250c389 uint 0x3812a769
+  erfcx_set_row 3 uint 0x3eafc47b uint 0xbe3cbd32 uint 0x3db809a1 uint 0xbd25e6dd uint 0x3c8bf5d3
+  erfcx_set_row2 3 uint 0xbbdef926 uint 0x3b28d5d0 uint 0xba745734 uint 0x39a9afac uint 0xb8e2fd36
+  erfcx_set_meta 4 uint 0x3fc00000 uint 0x3fd00000 uint 0x31c8864f uint 0x377d7e48
+  erfcx_set_row 4 uint 0x3e9ac1fb uint 0xbe1588f3 uint 0x3d850ad6 uint 0xbcdd00c7 uint 0x3c2d0a15
+  erfcx_set_row2 4 uint 0xbb80a757 uint 0x3ab6b050 uint 0xb9f8da1f uint 0x39232f67 uint 0xb84eb114
+  erfcx_set_meta 5 uint 0x3fe00000 uint 0x3ff00000 uint 0x316d8120 uint 0x36e42ca4
+  erfcx_set_row 5 uint 0x3e89f2ba uint 0xbdf1b2c0 uint 0x3d45377f uint 0xbc977c98 uint 0x3bdccac5
+  erfcx_set_row2 5 uint 0xbb1991be uint 0x3a4cdb07 uint 0xb9838706 uint 0x38a318e2 uint 0xb7c3d30f
+  erfcx_set_meta 6 uint 0x40000000 uint 0x40100000 uint 0x31d62793 uint 0x3613d7a1
+  erfcx_set_row 6 uint 0x3e6ca223 uint 0xbdb53869 uint 0x3d030ab4 uint 0xbc3441fd uint 0x3b6d2cab
+  erfcx_set_row2 6 uint 0xba95e929 uint 0x39b6bba2 uint 0xb8d76bf6 uint 0x37f63b9e uint 0xb708bd33
+  erfcx_set_meta 7 uint 0x40200000 uint 0x40300000 uint 0x318ff27d uint 0x35142b7d
+  erfcx_set_row 7 uint 0x3e464f5b uint 0xbd8182bc uint 0x3ca1dcc6 uint 0xbbc274d6 uint 0x3ae16398
+  erfcx_set_row2 7 uint 0xb9fccf21 uint 0x39098dd9 uint 0xb8118959 uint 0x3715fdae uint 0xb616d195
+  erfcx_set_meta 8 uint 0x40400000 uint 0x40500000 uint 0x318d4bb4 uint 0x34276049
+  erfcx_set_row 8 uint 0x3e2a53d0 uint 0xbd415429 uint 0x3c53f6ee uint 0xbb6125a5 uint 0x3a6842c3
+  erfcx_set_row2 8 uint 0xb9692f5e uint 0x38644178 uint 0xb75a2e81 uint 0x364beebc uint 0xb53a9e56
+end
+
+fn erfcx_init_p2 to void
+  erfcx_set_meta 9 uint 0x40600000 uint 0x40700000 uint 0xb147d6da uint 0x3351df72
+  erfcx_set_row 9 uint 0x3e151579 uint 0xbd155328 uint 0x3c117833 uint 0xbb0a1a57 uint 0x39fff819
+  erfcx_set_row2 9 uint 0xb8e7e6f5 uint 0x37cda868 uint 0xb6b2bbc5 uint 0x3598617e uint 0xb47f1f19
+  erfcx_set_meta 10 uint 0x40800000 uint 0x40900000 uint 0x30939e99 uint 0x322e325a
+  erfcx_set_row 10 uint 0x3dfad950 uint 0xbcd51f5b uint 0x3bb16096 uint 0xba90c76d uint 0x396803c3
+  erfcx_set_row2 10 uint 0xb836aa59 uint 0x370d6b52 uint 0xb5d77c75 uint 0x34a1aa7e uint 0xb36f04aa
+  erfcx_set_meta 11 uint 0x40a00000 uint 0x40b00000 uint 0xb15d7b0d uint 0x30dd84dd
+  erfcx_set_row 11 uint 0x3dcec548 uint 0xbc91c654 uint 0x3b4a9296 uint 0xba0acbb7 uint 0x38bba7a4
+  erfcx_set_row2 11 uint 0xb77a7237 uint 0x36250bf1 uint 0xb4d6ebd6 uint 0x338a4e6c uint 0xb230000f
+  erfcx_set_meta 12 uint 0x40c00000 uint 0x40d00000 uint 0x303a5c5c uint 0x2fb2285e
+  erfcx_set_row 12 uint 0x3dafbae2 uint 0xbc537168 uint 0x3afbaf7c uint 0xb9943c40 uint 0x382cd949
+  erfcx_set_row2 12 uint 0xb6c791ff uint 0x356438d1 uint 0xb40147a3 uint 0x3291233d uint 0xb121801a
+  erfcx_set_meta 13 uint 0x40e00000 uint 0x40f00000 uint 0xb13272b3 uint 0x2eaca33b
+  erfcx_set_row 13 uint 0x3d98ba18 uint 0xbc20222b uint 0x3aa683de uint 0xb92bc1d1 uint 0x37afc535
+  erfcx_set_row2 13 uint 0xb6327e5e uint 0x34b3e516 uint 0xb333f8a7 uint 0x31b2bf9d uint 0xb0304751
+  erfcx_set_meta 14 uint 0x41000000 uint 0x41080000 uint 0x30a3e924 uint 0x2dc26cbb
+  erfcx_set_row 14 uint 0x3d8703c0 uint 0xbbfabe57 uint 0x3a675118 uint 0xb8d40795 uint 0x37412136
+  erfcx_set_row2 14 uint 0xb5aed44c uint 0x341d4dc1 uint 0xb28cb120 uint 0x30fa31dd uint 0xaf5d2e77
+  erfcx_set_meta 15 uint 0x41100000 uint 0x41180000 uint 0xb008206c uint 0x2cf7ab79
+  erfcx_set_row 15 uint 0x3d71edce uint 0xbbc98846 uint 0x3a26fe9a uint 0xb889a7fa uint 0x36e1c826
+  erfcx_set_row2 15 uint 0xb5383a53 uint 0x339592f6 uint 0xb1f1afd8 uint 0x304251b4 uint 0xae9b7d7a
+  erfcx_set_meta 16 uint 0x41200000 uint 0x41280000 uint 0xb0ff9a64 uint 0x2c2ec450
+  erfcx_set_row 16 uint 0x3d5b1a53 uint 0xbba5745e uint 0x39f8cb98 uint 0xb83a40ac uint 0x368ad6e6
+  erfcx_set_row2 16 uint 0xb4ce1f7e uint 0x33185f41 uint 0xb1605a4c uint 0x2fa47ff1 uint 0xadf04377
+end
+
+fn erfcx_ensure_init to void
+  if eq get g_erfcx_init 0 0
+    erfcx_init_p1
+    erfcx_init_p2
+    put g_erfcx_init 0 1
+  end
+end
+
+fn tr_erf_small y f32 to f32
+  y2 = mul y y
+  q = tr_tf uint 0xb75debbd
+  q = fma q y2 tr_tf uint 0x38e00e01
+  q = fma q y2 tr_tf uint 0xba46980c
+  q = fma q y2 tr_tf uint 0x3b97b426
+  q = fma q y2 tr_tf uint 0xbcc30c31
+  q = fma q y2 tr_tf uint 0x3dcccccd
+  q = fma q y2 tr_tf uint 0xbeaaaaab
+  w = mul y2 q
+  tsp_hi = tr_tf uint 0x3f906ebb
+  aa = mul y tsp_hi
+  al = fma y tsp_hi tr_fneg aa
+  bb = fma y tr_tf uint 0xb37bd649 al
+  ret add aa fma aa w bb
+end
+
+fn tr_erfcx_eval2 y f32 to f32
+  erfcx_ensure_init
+  i = ulong 0
+  while and lt add i 1 17 ge y tr_tf get g_erfcx_lo add i 1 bound 17
+    i = add i 1
+  end
+  t = sub y tr_tf get g_erfcx_c i
+  base = mul i 11
+  p = tr_tf get g_erfcx_a add base 10
+  n = ulong 9
+  while ge n 1 bound 10
+    p = fma p t tr_tf get g_erfcx_a add base n
+    n = sub n 1
+  end
+  a0 = tr_tf get g_erfcx_a base
+  cv = fma p t a0
+  put g_tr_cl 0 add fma p t sub a0 cv tr_tf get g_erfcx_a0lo i
+  ret cv
+end
+
+fn omega_math_erf xu uint to uint
+  x = tr_tf xu
+  if tr_isnan x
+    ret TR_QNAN
+  end
+  sign = and xu uint 0x80000000
+  ax = tr_fabs x
+  r = tr_tf uint 0
+  if ge ax tr_tf uint 0x40800000
+    r = tr_tf uint 0x3f800000
+  else
+    if lt ax tr_tf uint 0x3f000000
+      r = tr_erf_small ax
+    else
+      h = mul ax ax
+      hl = fma ax ax tr_fneg h
+      m = tr_exp_core2 tr_fneg h tr_fneg hl
+      k = get g_tr_k 0
+      ev = tr_erfcx_eval2 ax
+      r = sub tr_tf uint 0x3f800000 tr_scale2 mul m ev k
+    end
+  end
+  ret or tr_tb r sign
+end
+
+note ---- GELU (erf form) ----
+
+fn tr_gelu_combine xu uint hx f32 me f32 cv f32 cl f32 to uint
+  k = get g_tr_k 0
+  mel = get g_tr_ml 0
+  p = mul me cv
+  pl = fma me cv tr_fneg p
+  pl = fma me cl pl
+  pl = fma mel cv pl
+  if eq and xu uint 0x80000000 uint 0
+    ret tr_tb fma tr_fneg hx tr_scale2 p k tr_tf xu
+  end
+  ret tr_tb tr_scale2 fma hx p mul hx pl k
+end
+
+fn tr_gelu_exp x f32 to f32
+  pp = mul x x
+  pl0 = fma x x tr_fneg pp
+  h = mul pp tr_tf uint 0x3f000000
+  hl = mul pl0 tr_tf uint 0x3f000000
+  ret tr_exp_core2 tr_fneg h tr_fneg hl
+end
+
+fn tr_gelu_large xu uint y f32 to uint
+  x = tr_tf xu
+  ay = tr_fabs y
+  yl = fma x tr_tf uint 0x3f3504f3 tr_fneg y
+  yl = fma x tr_tf uint 0x324fe77a yl
+  ayl = yl
+  if ne and xu uint 0x80000000 uint 0
+    ayl = tr_fneg yl
+  end
+  me = tr_gelu_exp x
+  cv = tr_erfcx_eval2 ay
+  dc = fma mul ay tr_tf uint 0x40000000 cv tr_tf uint 0xbf906ebb
+  cl = fma ayl dc get g_tr_cl 0
+  ret tr_gelu_combine xu mul x tr_tf uint 0x3f000000 me cv cl
+end
+
+fn omega_math_gelu xu uint to uint
+  x = tr_tf xu
+  if tr_isnan x
+    ret TR_QNAN
+  end
+  if ge x tr_tf uint 0x41000000
+    ret xu
+  end
+  if lt x tr_tf uint 0xc1780000
+    ret uint 0x80000000
+  end
+  mag = and xu uint 0x7fffffff
+  if eq mag uint 0
+    ret xu
+  end
+  if lt mag uint 0x01000000
+    sv = and xu uint 0x80000000
+    if ne sv uint 0
+      ret or sv shr mag 1
+    end
+    ret or sv shr add mag uint 1 1
+  end
+  y = mul x tr_tf uint 0x3f3504f3
+  ay = tr_fabs y
+  hx = mul x tr_tf uint 0x3f000000
+  if lt ay tr_tf uint 0x3f000000
+    ev = tr_erf_small ay
+    ev = tr_tf or tr_tb ev and tr_tb y uint 0x80000000
+    r = fma hx ev hx
+    ret or tr_tb r and xu uint 0x80000000
+  end
+  ret tr_gelu_large xu y
+end
+
+note ---- SIN / COS ----
+
+fn tr_sin_poly rh f32 rl f32 to f32
+  r2 = mul rh rh
+  sv = tr_tf uint 0x2f309231
+  sv = fma sv r2 tr_tf uint 0xb2d7322b
+  sv = fma sv r2 tr_tf uint 0x3638ef1d
+  sv = fma sv r2 tr_tf uint 0xb9500d01
+  sv = fma sv r2 tr_tf uint 0x3c088889
+  sv = fma sv r2 tr_tf uint 0xbe2aaaab
+  t = mul rh r2
+  rlc = fma mul r2 tr_tf uint 0xbf000000 rl rl
+  ret add rh fma t sv rlc
+end
+
+fn tr_cos_poly rh f32 rl f32 to f32
+  r2 = mul rh rh
+  r2l = fma rh rh tr_fneg r2
+  cv = tr_tf uint 0xad49cba5
+  cv = fma cv r2 tr_tf uint 0x310f76c7
+  cv = fma cv r2 tr_tf uint 0xb493f27e
+  cv = fma cv r2 tr_tf uint 0x37d00d01
+  cv = fma cv r2 tr_tf uint 0xbab60b61
+  cv = fma cv r2 tr_tf uint 0x3d2aaaab
+  hr = mul r2 tr_tf uint 0x3f000000
+  h = sub tr_tf uint 0x3f800000 hr
+  eh = sub sub tr_tf uint 0x3f800000 h hr
+  c1 = fma r2l tr_tf uint 0xbf000000 eh
+  c2 = fma tr_fneg rl rh c1
+  r4 = mul r2 r2
+  ret add h fma r4 cv c2
+end
+
+fn tr_sincos_reduce x f32 to int
+  t = add mul x tr_tf uint 0x3f22f983 tr_tf TR_MAGIC
+  kf = sub t tr_tf TR_MAGIC
+  k = sub bitcast int tr_tb t bitcast int TR_MAGIC
+  r1 = fma tr_fneg kf tr_tf uint 0x3fc90fdb x
+  p2 = tr_tf uint 0xb33bbd2e
+  th = mul kf p2
+  tl = fma kf p2 tr_fneg th
+  tr_two_sum r1 tr_fneg th
+  s1 = get g_tr_s 0
+  e1 = get g_tr_e 0
+  tr_two_sum s1 tr_fneg tl
+  s2 = get g_tr_s 0
+  e2 = get g_tr_e 0
+  lo = sub add e1 e2 mul kf tr_tf uint 0xa6f72ced
+  rh = add s2 lo
+  put g_tr_s 0 rh
+  put g_tr_e 0 sub lo sub rh s2
+  ret k
+end
+
+fn tr_sincos_core xu uint qoff int to uint
+  x = tr_tf xu
+  if tr_isnan x
+    ret TR_QNAN
+  end
+  ax = tr_fabs x
+  if not le ax tr_tf TR_TRIG_MAX
+    ret TR_QNAN
+  end
+  rh = x
+  rl = tr_tf uint 0
+  k = int 0
+  if gt ax tr_tf uint 0x3f490fdb
+    k = tr_sincos_reduce x
+    rh = get g_tr_s 0
+    rl = get g_tr_e 0
+  end
+  q = and bitcast uint add k qoff uint 3
+  r = tr_tf uint 0
+  if ne and q uint 1 uint 0
+    r = tr_cos_poly rh rl
+  else
+    r = tr_sin_poly rh rl
+  end
+  if ne and q uint 2 uint 0
+    ret tr_tb tr_fneg r
+  end
+  ret tr_tb r
+end
+
+fn omega_math_sin xu uint to uint
+  if eq and xu uint 0x7fffffff uint 0
+    ret xu
+  end
+  ret tr_sincos_core xu int 0
+end
+
+fn omega_math_cos xu uint to uint
+  ret tr_sincos_core xu int 1
+end

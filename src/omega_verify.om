@@ -1,0 +1,352 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_verify.c (V0 structural, V1 differential,
+note V2 algebraic property verification, and master pipeline).
+note Composes on seed/ng/sha256.om, om/aarch64/aarch64_om2.om, om/visor/verify_om2.om.
+om2
+
+const VERIFY_TIER_V0 ulong 0
+const VERIFY_TIER_V1 ulong 1
+const VERIFY_TIER_V2 ulong 2
+const VERIFY_TIER_V3 ulong 3
+const VERIFY_TIER_V4 ulong 4
+const VERIFY_TIER_V5 ulong 5
+
+const VER_MAX_CODE_BYTES ulong 4096
+
+note Input graph / realization state (mirrors OmegaGraph & RealizationObject)
+global g_ver_has_graph ulong 1
+global g_ver_graph_ok ulong 1
+global g_ver_graph_objs ulong 1
+
+global g_ver_has_real ulong 1
+global g_ver_real_prof ulong 1
+global g_ver_real_clen ulong 1
+global g_ver_real_has_id ulong 1
+global g_ver_real_has_mach ulong 1
+global g_ver_real_sem_id uchar 32
+global g_ver_real_mach_id uchar 32
+global g_ver_real_id uchar 32
+global g_ver_real_code uchar 4096
+
+note Report state (mirrors VerifyReport)
+global g_ver_passed ulong 1
+global g_ver_tier ulong 1
+global g_ver_checks ulong 1
+global g_ver_fails ulong 1
+global g_ver_err_code ulong 1
+
+const VER_ERR_NONE ulong 0
+const VER_ERR_GRAPH_INVALID ulong 1
+const VER_ERR_GRAPH_EMPTY ulong 2
+const VER_ERR_REAL_PROFILE ulong 3
+const VER_ERR_REAL_BOUNDS ulong 4
+const VER_ERR_REAL_INSN ulong 5
+const VER_ERR_REAL_NO_ID ulong 6
+const VER_ERR_REAL_ID_MISMATCH ulong 7
+const VER_ERR_V1_EXEC ulong 8
+const VER_ERR_V1_MISMATCH ulong 9
+const VER_ERR_V2_PROP ulong 10
+
+fn ver_reset_report tier ulong to void
+  put g_ver_passed 0 1
+  put g_ver_tier 0 tier
+  put g_ver_checks 0 0
+  put g_ver_fails 0 0
+  put g_ver_err_code 0 VER_ERR_NONE
+end
+
+fn ver_fail code ulong to long
+  put g_ver_passed 0 0
+  put g_ver_fails 0 add get g_ver_fails 0 1
+  put g_ver_err_code 0 code
+  ret -1
+end
+
+fn ver_inc_check to void
+  put g_ver_checks 0 add get g_ver_checks 0 1
+end
+
+fn ver_hash_real_id_g out_id edit uchar 32 to long
+  clen = get g_ver_real_clen 0
+  if gt clen VER_MAX_CODE_BYTES
+    ret -1
+  end
+  put sh_dat 0 uchar 0x4f
+  put sh_dat 1 uchar 0x4d
+  put sh_dat 2 uchar 0x47
+  put sh_dat 3 uchar 0x5f
+  put sh_dat 4 uchar 0x52
+  put sh_dat 5 uchar 0x30
+  put sh_dat 6 uchar and get g_ver_real_prof 0 255
+  for i ulong 32
+    put sh_dat add 7 i get g_ver_real_sem_id i
+  end
+  put sh_dat 39 uchar and shr clen 24 255
+  put sh_dat 40 uchar and shr clen 16 255
+  put sh_dat 41 uchar and shr clen 8 255
+  put sh_dat 42 uchar and clen 255
+  for i ulong clen bound 4096
+    put sh_dat add 43 i get g_ver_real_code i
+  end
+  sh_all add 43 clen
+  for i ulong 32
+    put out_id i get sh_dig i
+  end
+  ret 0
+end
+
+fn ver_hash_triple_id_g out_id edit uchar 32 to long
+  clen = get g_ver_real_clen 0
+  if gt clen VER_MAX_CODE_BYTES
+    ret -1
+  end
+  put sh_dat 0 uchar 0x4f
+  put sh_dat 1 uchar 0x4d
+  put sh_dat 2 uchar 0x47
+  put sh_dat 3 uchar 0x5f
+  put sh_dat 4 uchar 0x54
+  put sh_dat 5 uchar 0x30
+  for i ulong 32
+    put sh_dat add 6 i get g_ver_real_sem_id i
+  end
+  for i ulong 32
+    put sh_dat add 38 i get g_ver_real_mach_id i
+  end
+  put sh_dat 70 uchar and get g_ver_real_prof 0 255
+  put sh_dat 71 uchar and shr clen 24 255
+  put sh_dat 72 uchar and shr clen 16 255
+  put sh_dat 73 uchar and shr clen 8 255
+  put sh_dat 74 uchar and clen 255
+  for i ulong clen bound 4096
+    put sh_dat add 75 i get g_ver_real_code i
+  end
+  sh_all add 75 clen
+  for i ulong 32
+    put out_id i get sh_dig i
+  end
+  ret 0
+end
+
+fn ver_eq_real_id calc_id view uchar 32 to bool
+  for i ulong 32
+    if ne get calc_id i get g_ver_real_id i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ver_validate_code_g to long
+  clen = get g_ver_real_clen 0
+  if gt clen VER_MAX_CODE_BYTES
+    ret -1
+  end
+  cbuf = new uchar 4096 0
+  for i ulong clen bound 4096
+    put cbuf i get g_ver_real_code i
+  end
+  msg = new uchar 256 0
+  ret a64validate cbuf clen msg 256
+end
+
+note V0: Structural verification (mirrors omega_verify_v0_structural)
+fn omega_verify_v0_structural to long
+  calc_id = new uchar 32 0
+  ver_reset_report VERIFY_TIER_V0
+  if ne get g_ver_has_graph 0 0
+    ver_inc_check
+    if eq get g_ver_graph_ok 0 0
+      ret ver_fail VER_ERR_GRAPH_INVALID
+    end
+    ver_inc_check
+    if eq get g_ver_graph_objs 0 0
+      ret ver_fail VER_ERR_GRAPH_EMPTY
+    end
+  end
+  if ne get g_ver_has_real 0 0
+    prof = get g_ver_real_prof 0
+    clen = get g_ver_real_clen 0
+    has_id = get g_ver_real_has_id 0
+    r = om_ver_v0_real prof clen VER_MAX_CODE_BYTES has_id
+    ver_inc_check
+    if eq r 1
+      ret ver_fail VER_ERR_REAL_PROFILE
+    end
+    ver_inc_check
+    if eq r 2
+      ret ver_fail VER_ERR_REAL_BOUNDS
+    end
+    ver_inc_check
+    if ne ver_validate_code_g 0
+      ret ver_fail VER_ERR_REAL_INSN
+    end
+    ver_inc_check
+    if eq r 3
+      ret ver_fail VER_ERR_REAL_NO_ID
+    end
+    hrc = long -1
+    if ne get g_ver_real_has_mach 0 0
+      hrc = ver_hash_triple_id_g calc_id
+    else
+      hrc = ver_hash_real_id_g calc_id
+    end
+    if or ne hrc 0 not ver_eq_real_id calc_id
+      ret ver_fail VER_ERR_REAL_ID_MISMATCH
+    end
+  end
+  ret 0
+end
+
+fn ver_read_code_u32_le off ulong to ulong
+  b0 = ulong get g_ver_real_code off
+  b1 = ulong get g_ver_real_code add off 1
+  b2 = ulong get g_ver_real_code add off 2
+  b3 = ulong get g_ver_real_code add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn ver_exec_step w ulong regs edit ulong 32 to long
+  if eq w ulong 0xd65f03c0
+    ret 1
+  end
+  rd = and w 31
+  vn = get regs and shr w 5 31
+  vm = get regs and shr w 16 31
+  op_hi = and w ulong 0xffe0fc00
+  if eq op_hi ulong 0x8b000000
+    if lt rd 31
+      put regs rd add vn vm
+    end
+    ret 0
+  end
+  if eq op_hi ulong 0xcb000000
+    if lt rd 31
+      put regs rd sub vn vm
+    end
+    ret 0
+  end
+  if eq op_hi ulong 0x8a000000
+    if lt rd 31
+      put regs rd and vn vm
+    end
+    ret 0
+  end
+  if eq op_hi ulong 0xaa000000
+    if lt rd 31
+      put regs rd or vn vm
+    end
+    ret 0
+  end
+  if eq op_hi ulong 0x9b007c00
+    if lt rd 31
+      put regs rd mul vn vm
+    end
+    ret 0
+  end
+  ret -2
+end
+
+fn ver_exec_f3 a ulong b ulong c ulong res edit ulong 1 to long
+  clen = get g_ver_real_clen 0
+  if or lt clen 4 ne rem clen 4 0
+    ret -1
+  end
+  regs = new ulong 32 0
+  put regs 0 a
+  put regs 1 b
+  put regs 2 c
+  nins = div clen 4
+  for pc ulong nins bound 1024
+    w = ver_read_code_u32_le mul pc 4
+    st = ver_exec_step w regs
+    if eq st 1
+      put res 0 get regs 0
+      ret 0
+    end
+    if lt st 0
+      ret st
+    end
+  end
+  ret -3
+end
+
+note V1: Differential verification (mirrors omega_verify_v1_differential)
+fn omega_verify_v1_differential has_custom ulong inputs view ulong * ntriplets ulong to long
+  if eq get g_ver_has_real 0 0
+    ret -1
+  end
+  rc0 = omega_verify_v0_structural
+  if ne rc0 0
+    ret -1
+  end
+  put g_ver_tier 0 VERIFY_TIER_V1
+  cnt = ulong 7
+  if ne has_custom 0
+    cnt = ntriplets
+  end
+  vec = new ulong 3 0
+  obs = new ulong 1 0
+  for i ulong cnt bound 1024
+    a = ulong 0
+    b = ulong 0
+    c = ulong 0
+    if ne has_custom 0
+      base = mul i 3
+      a = get inputs base
+      b = get inputs add base 1
+      c = get inputs add base 2
+    else
+      vr = om_ver_v1_defvec i vec
+      if ne vr 0
+        ret ver_fail VER_ERR_V1_EXEC
+      end
+      a = get vec 0
+      b = get vec 1
+      c = get vec 2
+    end
+    expected = om_ver_v1_ref a b c
+    ver_inc_check
+    erc = ver_exec_f3 a b c obs
+    if ne erc 0
+      ret ver_fail VER_ERR_V1_EXEC
+    end
+    if ne get obs 0 expected
+      ret ver_fail VER_ERR_V1_MISMATCH
+    end
+  end
+  ret 0
+end
+
+note V2: Property / invariant verification (mirrors omega_verify_v2_properties)
+fn omega_verify_v2_properties to long
+  ver_reset_report VERIFY_TIER_V2
+  info = new ulong 4 0
+  r = om_ver_v2_props info
+  if lt r 0
+    ret ver_fail VER_ERR_V2_PROP
+  end
+  put g_ver_checks 0 ulong r
+  ret 0
+end
+
+note Master verification pipeline running V0 up to max_tier
+fn omega_verify_pipeline max_tier ulong to long
+  dummy = new ulong 3 0
+  rc = omega_verify_v0_structural
+  if ne rc 0
+    ret -1
+  end
+  if ge max_tier VERIFY_TIER_V1
+    rc = omega_verify_v1_differential 0 dummy 0
+    if ne rc 0
+      ret -1
+    end
+  end
+  if ge max_tier VERIFY_TIER_V2
+    rc = omega_verify_v2_properties
+    if ne rc 0
+      ret -1
+    end
+  end
+  ret 0
+end

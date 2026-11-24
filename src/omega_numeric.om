@@ -1,0 +1,2514 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_numeric.c (OMEGA-NUMERIC-0 host-pure
+note module: semantic reference tier, E1 scalar contract integer references,
+note Omega div/sqrt/exp/log sequences, warp reduction, op registry, kernel
+note patch words, structural patch checker, submit check, CPU realization,
+note parity, seed bound, and FTZ model).
+note Composes on om/gpu/bw_vecadd.om and om/gpu/bw_qmd.om.
+om2
+
+const OMEGA_INF_POS uint 0x7f800000
+const OMEGA_INF_NEG uint 0xff800000
+const OMEGA_QNAN_BITS uint 0x7fc00000
+
+const OMEGA_NUMERIC_FPCR_REQUIRED_CLEAR ulong 0x07c80007
+
+const OMEGA_NUMERIC_OK long 0
+const OMEGA_NUMERIC_ERR_BAD_ARGS long -1
+const OMEGA_NUMERIC_ERR_NOT_ENCODED long -2
+const OMEGA_NUMERIC_ERR_OPERANDS long -3
+const OMEGA_NUMERIC_ERR_DEVICE long -4
+const OMEGA_NUMERIC_ERR_FPENV long -5
+
+const OMEGA_NUMERIC_MAX_COUNT ulong 65536
+const OMEGA_NUMERIC_CTA_THREADS ulong 64
+const OMEGA_NUMERIC_PATCH_OFFSET ulong 0x110
+const OMEGA_NUMERIC_PATCH_MAX ulong 15
+
+note Op enum (0..40, count = 41)
+const OMEGA_NOP_FADD ulong 0
+const OMEGA_NOP_FSUB ulong 1
+const OMEGA_NOP_FMUL ulong 2
+const OMEGA_NOP_FFMA ulong 3
+const OMEGA_NOP_FSETP_SEL ulong 4
+const OMEGA_NOP_FSEL ulong 5
+const OMEGA_NOP_FMNMX_MIN ulong 6
+const OMEGA_NOP_FMNMX_MAX ulong 7
+const OMEGA_NOP_I2FP ulong 8
+const OMEGA_NOP_F2I ulong 9
+const OMEGA_NOP_MUFU_RCP ulong 10
+const OMEGA_NOP_MUFU_RSQ ulong 11
+const OMEGA_NOP_LDS_STS ulong 12
+const OMEGA_NOP_SHFL_DOWN ulong 13
+const OMEGA_NOP_DIV ulong 14
+const OMEGA_NOP_SQRT ulong 15
+const OMEGA_NOP_EXP ulong 16
+const OMEGA_NOP_LOG ulong 17
+const OMEGA_NOP_REDUCE_SUM ulong 18
+const OMEGA_NOP_FSETP_LT_SEL ulong 19
+const OMEGA_NOP_FSETP_LE_SEL ulong 20
+const OMEGA_NOP_FSETP_GT_SEL ulong 21
+const OMEGA_NOP_FSETP_EQ_SEL ulong 22
+const OMEGA_NOP_FSETP_NE_SEL ulong 23
+const OMEGA_NOP_FSETP_NUM_SEL ulong 24
+const OMEGA_NOP_FSETP_NAN_SEL ulong 25
+const OMEGA_NOP_FSETP_LTU_SEL ulong 26
+const OMEGA_NOP_FSETP_LEU_SEL ulong 27
+const OMEGA_NOP_FSETP_GTU_SEL ulong 28
+const OMEGA_NOP_FSETP_GEU_SEL ulong 29
+const OMEGA_NOP_FSETP_EQU_SEL ulong 30
+const OMEGA_NOP_FSETP_NEU_SEL ulong 31
+const OMEGA_NOP_F2I_FLOOR ulong 32
+const OMEGA_NOP_F2I_CEIL ulong 33
+const OMEGA_NOP_F2I_RNI ulong 34
+const OMEGA_NOP_F2U ulong 35
+const OMEGA_NOP_I2FP_U32 ulong 36
+const OMEGA_NOP_F32_TO_F16 ulong 37
+const OMEGA_NOP_F32_TO_BF16 ulong 38
+const OMEGA_NOP_F16_TO_F32 ulong 39
+const OMEGA_NOP_BF16_TO_F32 ulong 40
+const OMEGA_NOP_FFMA_V ulong 41
+const OMEGA_NOP_COUNT ulong 42
+
+note Compare modes
+const OMEGA_CMP_BIT_EXACT ulong 0
+const OMEGA_CMP_INT_EXACT ulong 1
+const OMEGA_CMP_SEED_BOUND ulong 2
+const OMEGA_CMP_F16_BITS ulong 3
+const OMEGA_CMP_BF16_BITS ulong 4
+
+note Shared state buffers for batch reference/cpu/parity/patch/launch APIs
+global g_num_fpcr ulong 1
+global g_num_has_bf16 ulong 1
+global g_num_launch_tpb uint 1
+global g_num_launch_grid uint 1
+
+note Patch buffer: 15 instructions * 4 uint words = 60 uints, plus provenance ID (0 = none/STG/EXIT, 1..52 = table row+1)
+global g_num_patch_w uint 60
+global g_num_patch_prov ulong 15
+
+note Batch vector buffers (up to 4096 elements for host tests)
+global g_num_a uint 4096
+global g_num_b uint 4096
+global g_num_c uint 4096
+global g_num_dst uint 4096
+global g_num_exp uint 4096
+global g_num_got uint 4096
+
+note Parity trace state (mirrors OmegaParityTrace)
+global g_num_tr_checked ulong 1
+global g_num_tr_mismatches ulong 1
+global g_num_tr_first_idx long 1
+global g_num_tr_first_exp uint 1
+global g_num_tr_first_got uint 1
+global g_num_tr_subnorm ulong 1
+global g_num_tr_oob ulong 1
+global g_num_tr_skipped ulong 1
+
+note ---- Bit-level IEEE-754 helpers ----
+
+fn num_isnan u uint to bool
+  ret gt and u uint 0x7fffffff OMEGA_INF_POS
+end
+
+fn num_isinf u uint to bool
+  ret eq and u uint 0x7fffffff OMEGA_INF_POS
+end
+
+fn num_iszero u uint to bool
+  ret eq and u uint 0x7fffffff uint 0
+end
+
+fn num_signbit u uint to bool
+  ret ne and u uint 0x80000000 uint 0
+end
+
+fn num_issubnormal u uint to bool
+  ex = and u uint 0x7f800000
+  fr = and u uint 0x007fffff
+  ret and eq ex uint 0 ne fr uint 0
+end
+
+fn num_is_finite_normal u uint to bool
+  ex = and shr u 23 uint 0xff
+  ret and ne ex uint 0 ne ex uint 0xff
+end
+
+fn omega_numeric_bits_equal a uint b uint to bool
+  if and num_isnan a num_isnan b
+    ret true
+  end
+  ret eq a b
+end
+
+fn omega_numeric_read_fpcr to ulong
+  ret get g_num_fpcr 0
+end
+
+fn omega_numeric_fpenv_ok to bool
+  ret eq and omega_numeric_read_fpcr OMEGA_NUMERIC_FPCR_REQUIRED_CLEAR 0
+end
+
+fn omega_numeric_cpu_has_bf16 to bool
+  ret ne get g_num_has_bf16 0 0
+end
+
+note ---- Semantic Reference Tier ----
+
+fn omega_ref_fadd a uint b uint to uint
+  ret bitcast uint add bitcast f32 a bitcast f32 b
+end
+
+fn omega_ref_fsub a uint b uint to uint
+  ret bitcast uint sub bitcast f32 a bitcast f32 b
+end
+
+fn omega_ref_fmul a uint b uint to uint
+  ret bitcast uint mul bitcast f32 a bitcast f32 b
+end
+
+fn omega_ref_ffma a uint b uint c uint to uint
+  ret bitcast uint fma bitcast f32 a bitcast f32 b bitcast f32 c
+end
+
+fn omega_ref_fmin a uint b uint to uint
+  if num_isnan a
+    ret b
+  end
+  if num_isnan b
+    ret a
+  end
+  if and num_iszero a num_iszero b
+    if or num_signbit a num_signbit b
+      ret uint 0x80000000
+    end
+    ret uint 0
+  end
+  if lt bitcast f32 a bitcast f32 b
+    ret a
+  end
+  ret b
+end
+
+fn omega_ref_fmax a uint b uint to uint
+  if num_isnan a
+    ret b
+  end
+  if num_isnan b
+    ret a
+  end
+  if and num_iszero a num_iszero b
+    if or not num_signbit a not num_signbit b
+      ret uint 0
+    end
+    ret uint 0x80000000
+  end
+  if gt bitcast f32 a bitcast f32 b
+    ret a
+  end
+  ret b
+end
+
+fn omega_ref_fsetp_ge a uint b uint to bool
+  if or num_isnan a num_isnan b
+    ret false
+  end
+  ret ge bitcast f32 a bitcast f32 b
+end
+
+fn omega_ref_i2f a int to uint
+  ret bitcast uint f32 a
+end
+
+fn omega_ref_f2i a uint to int
+  if num_isnan a
+    ret int 0
+  end
+  fa = bitcast f32 a
+  if ge fa bitcast f32 uint 0x4f000000
+    ret int 2147483647
+  end
+  if le fa bitcast f32 uint 0xcf000000
+    ret int -2147483648
+  end
+  ret int fa
+end
+
+note ---- E1 scalar contract: pure integer bit-pattern reference definitions ----
+
+const REF_RTZ ulong 0
+const REF_FLOOR ulong 1
+const REF_CEIL ulong 2
+const REF_RNE ulong 3
+
+fn ref_to_int_frac m ulong sh ulong to ulong
+  remv = and m sub shl ulong 1 sh 1
+  if eq remv 0
+    ret 0
+  end
+  half = shl ulong 1 sub sh 1
+  if lt remv half
+    ret 1
+  end
+  if eq remv half
+    ret 2
+  end
+  ret 3
+end
+
+fn ref_to_int_apply ip ulong frac ulong mode ulong is_neg bool to long
+  mag = ip
+  if eq mode REF_FLOOR
+    if and is_neg ne frac 0
+      mag = add mag 1
+    end
+  else
+    if eq mode REF_CEIL
+      if and not is_neg ne frac 0
+        mag = add mag 1
+      end
+    else
+      if eq mode REF_RNE
+        if or eq frac 3 and eq frac 2 ne and ip 1 0
+          mag = add mag 1
+        end
+      end
+    end
+  end
+  if is_neg
+    ret sub 0 long mag
+  end
+  ret long mag
+end
+
+fn ref_to_int u uint mode ulong lo long hi long to long
+  be = ulong and shr u 23 uint 0xff
+  f = ulong and u uint 0x007fffff
+  is_neg = ne and u uint 0x80000000 uint 0
+  if eq be 255
+    if ne f 0
+      ret 0
+    end
+    if is_neg
+      ret lo
+    end
+    ret hi
+  end
+  if and eq be 0 eq f 0
+    ret 0
+  end
+  m = f
+  e = long -149
+  if ne be 0
+    m = or f 0x00800000
+    e = sub long be 150
+  end
+  ip = ulong 0
+  frac = ulong 0
+  if ge e 0
+    if gt e 16
+      if is_neg
+        ret lo
+      end
+      ret hi
+    end
+    ip = shl m ulong e
+  else
+    if ge sub 0 e 40
+      frac = 1
+    else
+      sh = ulong sub 0 e
+      ip = shr m sh
+      frac = ref_to_int_frac m sh
+    end
+  end
+  v = ref_to_int_apply ip frac mode is_neg
+  if lt v lo
+    ret lo
+  end
+  if gt v hi
+    ret hi
+  end
+  ret v
+end
+
+fn omega_ref_f2i_floor a uint to int
+  ret int ref_to_int a REF_FLOOR -2147483648 2147483647
+end
+
+fn omega_ref_f2i_ceil a uint to int
+  ret int ref_to_int a REF_CEIL -2147483648 2147483647
+end
+
+fn omega_ref_f2i_rni a uint to int
+  ret int ref_to_int a REF_RNE -2147483648 2147483647
+end
+
+fn omega_ref_f2u a uint to uint
+  ret uint ref_to_int a REF_RTZ 0 4294967295
+end
+
+note 128-bit unsigned helpers (hi, lo)
+fn u128_msb hi ulong lo ulong to long
+  if ne hi 0
+    p = long 63
+    while and ge p 0 eq and shr hi ulong p 1 0 bound 65
+      p = sub p 1
+    end
+    ret add p 64
+  end
+  p = long 63
+  while and ge p 0 eq and shr lo ulong p 1 0 bound 65
+    p = sub p 1
+  end
+  ret p
+end
+
+fn u128_bit hi ulong lo ulong pos ulong to bool
+  if ge pos 128
+    ret false
+  end
+  if ge pos 64
+    ret ne and shr hi sub pos 64 1 0
+  end
+  ret ne and shr lo pos 1 0
+end
+
+fn u128_any_below hi ulong lo ulong k ulong to bool
+  if eq k 0
+    ret false
+  end
+  if ge k 128
+    ret or ne hi 0 ne lo 0
+  end
+  if ge k 64
+    if ne lo 0
+      ret true
+    end
+    hk = sub k 64
+    if eq hk 0
+      ret false
+    end
+    ret ne and hi sub shl ulong 1 hk 1 0
+  end
+  ret ne and lo sub shl ulong 1 k 1 0
+end
+
+fn u128_shr_lo hi ulong lo ulong s ulong to ulong
+  if ge s 128
+    ret 0
+  end
+  if eq s 0
+    ret lo
+  end
+  if ge s 64
+    ret shr hi sub s 64
+  end
+  ret or shr lo s shl hi sub 64 s
+end
+
+fn u128_round_shift hi ulong lo ulong su ulong to ulong
+  mant = u128_shr_lo hi lo su
+  if u128_bit hi lo sub su 1
+    if or u128_any_below hi lo sub su 1 ne and mant 1 0
+      mant = add mant 1
+    end
+  end
+  ret mant
+end
+
+fn ref_fmt_man fmt ulong to long
+  if eq fmt 1
+    ret 10
+  end
+  if eq fmt 2
+    ret 7
+  end
+  ret 23
+end
+
+fn ref_fmt_bias fmt ulong to long
+  if eq fmt 1
+    ret 15
+  end
+  ret 127
+end
+
+fn ref_fmt_emax fmt ulong to ulong
+  if eq fmt 1
+    ret 0x1f
+  end
+  ret 0xff
+end
+
+fn ref_round_small_128 hi ulong lo ulong exp2 long fmt ulong to uint
+  p = u128_msb hi lo
+  be = add add p exp2 ref_fmt_bias fmt
+  if ge be long ref_fmt_emax fmt
+    ret uint shl ref_fmt_emax fmt ulong ref_fmt_man fmt
+  end
+  lsb = sub sub 1 ref_fmt_bias fmt ref_fmt_man fmt
+  if ge be 1
+    lsb = sub add p exp2 ref_fmt_man fmt
+  end
+  s = sub lsb exp2
+  mant = ulong 0
+  if le s 0
+    mant = shl lo ulong sub 0 s
+  else
+    if gt s add p 1
+      ret uint 0
+    end
+    mant = u128_round_shift hi lo ulong s
+  end
+  bits = mant
+  if ge be 1
+    bits = add shl ulong sub be 1 ulong ref_fmt_man fmt mant
+  end
+  inf_bits = shl ref_fmt_emax fmt ulong ref_fmt_man fmt
+  if ge bits inf_bits
+    ret uint inf_bits
+  end
+  ret uint bits
+end
+
+fn omega_ref_u2f a uint to uint
+  if eq a uint 0
+    ret uint 0
+  end
+  ret ref_round_small_128 0 ulong a 0 0
+end
+
+fn ref_narrow a uint fmt ulong to uint
+  man = ref_fmt_man fmt
+  emax_f = ref_fmt_emax fmt
+  sign = and shr a 16 uint 0x8000
+  be = ulong and shr a 23 uint 0xff
+  f = ulong and a uint 0x007fffff
+  inf = shl emax_f ulong man
+  if eq be 0xff
+    if eq f 0
+      ret or sign uint inf
+    end
+    qbit = shl ulong 1 ulong sub man 1
+    pay = shr f ulong sub 23 man
+    ret or sign uint or or inf qbit pay
+  end
+  if and eq be 0 eq f 0
+    ret sign
+  end
+  m = f
+  e = long -149
+  if ne be 0
+    m = or f 0x00800000
+    e = sub long be 150
+  end
+  ret or sign ref_round_small_128 0 m e fmt
+end
+
+fn omega_ref_f32_to_f16 a uint to uint
+  ret ref_narrow a 1
+end
+
+fn omega_ref_f32_to_bf16 a uint to uint
+  ret ref_narrow a 2
+end
+
+fn omega_ref_f16_to_f32 h uint to uint
+  sign = shl and h uint 0x8000 16
+  be = and shr h 10 uint 0x1f
+  f = and h uint 0x3ff
+  if eq be uint 0x1f
+    if ne f uint 0
+      ret or or sign uint 0x7fc00000 shl f 13
+    end
+    ret or sign OMEGA_INF_POS
+  end
+  if eq be uint 0
+    if eq f uint 0
+      ret sign
+    end
+    e = long -14
+    while eq and f uint 0x400 uint 0 bound 16
+      f = shl f 1
+      e = sub e 1
+    end
+    eb = shl uint add e 127 23
+    ret or or sign eb shl and f uint 0x3ff 13
+  end
+  eb = shl add sub be uint 15 uint 127 23
+  ret or or sign eb shl f 13
+end
+
+fn omega_ref_bf16_to_f32 h uint to uint
+  ret shl and h uint 0xffff 16
+end
+
+fn ref_split_m u uint to ulong
+  be = and shr u 23 uint 0xff
+  f = ulong and u uint 0x007fffff
+  if ne be uint 0
+    ret or f 0x00800000
+  end
+  ret f
+end
+
+fn ref_split_e u uint to long
+  be = and shr u 23 uint 0xff
+  if ne be uint 0
+    ret sub long be 150
+  end
+  ret -149
+end
+
+note 128-bit shift left of a 64-bit value v by sh (0..125) into dst[0]=hi, dst[1]=lo
+fn u128_shl64 v ulong sh ulong dst edit ulong 2 to void
+  if eq sh 0
+    put dst 0 0
+    put dst 1 v
+    ret
+  end
+  if ge sh 64
+    put dst 0 shl v sub sh 64
+    put dst 1 0
+    ret
+  end
+  put dst 0 shr v sub 64 sh
+  put dst 1 shl v sh
+end
+
+note 128-bit shift right with sticky bit into dst[0]=hi, dst[1]=lo
+fn u128_shr_sticky v ulong d long dst edit ulong 2 to void
+  if lt d 0
+    u128_shl64 v ulong sub 0 d dst
+    ret
+  end
+  if eq d 0
+    put dst 0 0
+    put dst 1 v
+    ret
+  end
+  if ge d 64
+    put dst 0 0
+    if ne v 0
+      put dst 1 1
+    else
+      put dst 1 0
+    end
+    ret
+  end
+  du = ulong d
+  lost = ne and v sub shl ulong 1 du 1 0
+  r = shr v du
+  if lost
+    r = or r 1
+  end
+  put dst 0 0
+  put dst 1 r
+end
+
+fn ffma_combine xv view ulong 2 yv view ulong 2 sx uint sy uint ex long to uint
+  xhi = get xv 0
+  xlo = get xv 1
+  yhi = get yv 0
+  ylo = get yv 1
+  if eq sx sy
+    mlo = add xlo ylo
+    mhi = add xhi yhi
+    if lt mlo xlo
+      mhi = add mhi 1
+    end
+    if and eq mhi 0 eq mlo 0
+      ret uint 0
+    end
+    ret or sx ref_round_small_128 mhi mlo ex 0
+  end
+  if or gt xhi yhi and eq xhi yhi ge xlo ylo
+    mlo = sub xlo ylo
+    mhi = sub xhi yhi
+    if lt xlo ylo
+      mhi = sub mhi 1
+    end
+    if and eq mhi 0 eq mlo 0
+      ret uint 0
+    end
+    ret or sx ref_round_small_128 mhi mlo ex 0
+  end
+  mlo = sub ylo xlo
+  mhi = sub yhi xhi
+  if lt ylo xlo
+    mhi = sub mhi 1
+  end
+  if and eq mhi 0 eq mlo 0
+    ret uint 0
+  end
+  ret or sy ref_round_small_128 mhi mlo ex 0
+end
+
+fn ffma_align_and_sum x64 ulong ex long sx uint y64 ulong ey long sy uint to uint
+  xv = new ulong 2 0
+  yv = new ulong 2 0
+  up = sub 125 u128_msb 0 x64
+  u128_shl64 x64 ulong up xv
+  nex = sub ex up
+  u128_shr_sticky y64 sub nex ey yv
+  ret ffma_combine xv yv sx sy nex
+end
+
+fn ffma_finite xa uint xb uint xc uint ps uint cs uint to uint
+  mp = mul ref_split_m xa ref_split_m xb
+  ep = add ref_split_e xa ref_split_e xb
+  if eq xc uint 0
+    ret or ps ref_round_small_128 0 mp ep 0
+  end
+  mc = ref_split_m xc
+  ec = ref_split_e xc
+  lc = add u128_msb 0 mc ec
+  lp = add u128_msb 0 mp ep
+  if gt lc lp
+    ret ffma_align_and_sum mc ec cs mp ep ps
+  end
+  ret ffma_align_and_sum mp ep ps mc ec cs
+end
+
+fn omega_ref_ffma_int ua uint ub uint uc uint to uint
+  ps = and xor ua ub uint 0x80000000
+  cs = and uc uint 0x80000000
+  xa = and ua uint 0x7fffffff
+  xb = and ub uint 0x7fffffff
+  xc = and uc uint 0x7fffffff
+  if or gt xa OMEGA_INF_POS or gt xb OMEGA_INF_POS gt xc OMEGA_INF_POS
+    ret OMEGA_QNAN_BITS
+  end
+  pinf = or eq xa OMEGA_INF_POS eq xb OMEGA_INF_POS
+  pzero = or eq xa uint 0 eq xb uint 0
+  if and pinf pzero
+    ret OMEGA_QNAN_BITS
+  end
+  if pinf
+    if and eq xc OMEGA_INF_POS ne cs ps
+      ret OMEGA_QNAN_BITS
+    end
+    ret or ps OMEGA_INF_POS
+  end
+  if eq xc OMEGA_INF_POS
+    ret uc
+  end
+  if pzero
+    if ne xc uint 0
+      ret uc
+    end
+    ret and ps cs
+  end
+  ret ffma_finite xa xb xc ps cs
+end
+
+note Predicate truth mask: bit 0 less (1), bit 1 equal (2), bit 2 greater (4), bit 3 unordered (8)
+fn fsetp_mask op ulong to ulong
+  if eq op OMEGA_NOP_FSETP_SEL
+    ret 6
+  end
+  if eq op OMEGA_NOP_FSETP_LT_SEL
+    ret 1
+  end
+  if eq op OMEGA_NOP_FSETP_LE_SEL
+    ret 3
+  end
+  if eq op OMEGA_NOP_FSETP_GT_SEL
+    ret 4
+  end
+  if eq op OMEGA_NOP_FSETP_EQ_SEL
+    ret 2
+  end
+  if eq op OMEGA_NOP_FSETP_NE_SEL
+    ret 5
+  end
+  if eq op OMEGA_NOP_FSETP_NUM_SEL
+    ret 7
+  end
+  if eq op OMEGA_NOP_FSETP_NAN_SEL
+    ret 8
+  end
+  if eq op OMEGA_NOP_FSETP_LTU_SEL
+    ret 9
+  end
+  if eq op OMEGA_NOP_FSETP_LEU_SEL
+    ret 11
+  end
+  if eq op OMEGA_NOP_FSETP_GTU_SEL
+    ret 12
+  end
+  if eq op OMEGA_NOP_FSETP_GEU_SEL
+    ret 14
+  end
+  if eq op OMEGA_NOP_FSETP_EQU_SEL
+    ret 10
+  end
+  if eq op OMEGA_NOP_FSETP_NEU_SEL
+    ret 13
+  end
+  ret 0
+end
+
+fn ref_order ua uint ub uint to ulong
+  if or gt and ua uint 0x7fffffff OMEGA_INF_POS gt and ub uint 0x7fffffff OMEGA_INF_POS
+    ret 8
+  end
+  ka = long ua
+  if ne and ua uint 0x80000000 uint 0
+    ka = sub 0 long and ua uint 0x7fffffff
+  end
+  kb = long ub
+  if ne and ub uint 0x80000000 uint 0
+    kb = sub 0 long and ub uint 0x7fffffff
+  end
+  if lt ka kb
+    ret 1
+  end
+  if gt ka kb
+    ret 4
+  end
+  ret 2
+end
+
+fn omega_ref_fsetp_pred op ulong a uint b uint to long
+  m = fsetp_mask op
+  if eq m 0
+    ret -1
+  end
+  if ne and m ref_order a b 0
+    ret 1
+  end
+  ret 0
+end
+
+note ---- IEEE div/sqrt, host rcp seed, integer div/sqrt, exp/log, warp sum ----
+
+fn omega_ieee_div x uint y uint to uint
+  ret bitcast uint div bitcast f32 x bitcast f32 y
+end
+
+fn omega_ieee_sqrt x uint to uint
+  ret bitcast uint fsqrt bitcast f32 x
+end
+
+fn omega_numeric_host_rcp_seed y uint to uint
+  ret sub uint 0x7ef311c0 y
+end
+
+fn omega_unpack_m u uint to uint
+  be = and shr u 23 uint 0xff
+  f = and u uint 0x007fffff
+  if ne be uint 0
+    ret or f uint 0x00800000
+  end
+  while eq and f uint 0x00800000 uint 0 bound 32
+    f = shl f 1
+  end
+  ret f
+end
+
+fn omega_unpack_e u uint to long
+  be = and shr u 23 uint 0xff
+  if ne be uint 0
+    ret sub long be 150
+  end
+  f = and u uint 0x007fffff
+  ex = long -149
+  while eq and f uint 0x00800000 uint 0 bound 32
+    f = shl f 1
+    ex = sub ex 1
+  end
+  ret ex
+end
+
+fn rp_round_shift sig ulong su ulong sticky bool to ulong
+  mant = shr sig su
+  if ne and shr sig sub su 1 1 0
+    if or sticky or ne and sig sub shl ulong 1 sub su 1 1 0 ne and mant 1 0
+      mant = add mant 1
+    end
+  end
+  ret mant
+end
+
+fn omega_round_pack sign uint sig ulong exp2 long sticky bool to uint
+  p = u128_msb 0 sig
+  be = add add p exp2 127
+  if ge be 255
+    ret or sign OMEGA_INF_POS
+  end
+  lsb = long -149
+  if ge be 1
+    lsb = sub add p exp2 23
+  end
+  s = sub lsb exp2
+  if gt s add p 1
+    ret sign
+  end
+  mant = rp_round_shift sig ulong s sticky
+  bits = mant
+  if ge be 1
+    bits = add shl ulong sub be 1 23 mant
+  end
+  if ge bits ulong OMEGA_INF_POS
+    ret or sign OMEGA_INF_POS
+  end
+  ret or sign uint bits
+end
+
+fn omega_math_div x uint y uint to uint
+  if or num_isnan x num_isnan y
+    ret OMEGA_QNAN_BITS
+  end
+  sign = and xor x y uint 0x80000000
+  if num_iszero y
+    if num_iszero x
+      ret OMEGA_QNAN_BITS
+    end
+    ret or sign OMEGA_INF_POS
+  end
+  if num_iszero x
+    ret sign
+  end
+  if num_isinf x
+    if num_isinf y
+      ret OMEGA_QNAN_BITS
+    end
+    ret or sign OMEGA_INF_POS
+  end
+  if num_isinf y
+    ret sign
+  end
+  mx = omega_unpack_m x
+  my = omega_unpack_m y
+  ex = omega_unpack_e x
+  ey = omega_unpack_e y
+  rm = mx
+  q = uint 0
+  for i ulong 27
+    q = shl q 1
+    if ge rm my
+      rm = sub rm my
+      q = or q uint 1
+    end
+    rm = shl rm 1
+  end
+  ret omega_round_pack sign ulong q sub sub ex ey 26 ne rm uint 0
+end
+
+fn omega_math_sqrt x uint to uint
+  if num_isnan x
+    ret OMEGA_QNAN_BITS
+  end
+  if num_iszero x
+    ret x
+  end
+  if num_signbit x
+    ret OMEGA_QNAN_BITS
+  end
+  if num_isinf x
+    ret OMEGA_INF_POS
+  end
+  mm = ulong omega_unpack_m x
+  e = omega_unpack_e x
+  if ne and e 1 0
+    mm = shl mm 1
+    e = sub e 1
+  end
+  opv = shl mm 28
+  sv = ulong 0
+  one = shl ulong 1 62
+  while gt one opv bound 32
+    one = shr one 2
+  end
+  while ne one 0 bound 32
+    t = add sv one
+    if ge opv t
+      opv = sub opv t
+      sv = add shr sv 1 one
+    else
+      sv = shr sv 1
+    end
+    one = shr one 2
+  end
+  ret omega_round_pack uint 0 sv sub div e 2 14 ne opv 0
+end
+
+fn omega_math_exp x uint to uint
+  if num_isnan x
+    ret OMEGA_QNAN_BITS
+  end
+  fx = bitcast f32 x
+  if lt fx bitcast f32 uint 0xc2d00000
+    ret uint 0
+  end
+  if gt fx bitcast f32 uint 0x42b17218
+    ret OMEGA_INF_POS
+  end
+  prod = mul fx bitcast f32 uint 0x3fb8aa3b
+  k = int 0
+  if ge prod bitcast f32 uint 0
+    k = int add prod bitcast f32 uint 0x3f000000
+  else
+    k = int sub prod bitcast f32 uint 0x3f000000
+  end
+  fk = f32 k
+  r = sub sub fx mul fk bitcast f32 uint 0x3f317200 mul fk bitcast f32 uint 0x35bfbe8e
+  p = mul r add bitcast f32 uint 0x3d2aaaab mul r bitcast f32 uint 0x3c088889
+  p = mul r add bitcast f32 uint 0x3e2aaaab p
+  p = mul r add bitcast f32 uint 0x3f000000 p
+  poly = add bitcast f32 uint 0x3f800000 mul r add bitcast f32 uint 0x3f800000 p
+  if gt k int 127
+    s1 = mul poly bitcast f32 shl uint 254 23
+    s2 = bitcast f32 shl uint k 23
+    ret bitcast uint mul s1 s2
+  end
+  if lt k int -126
+    s1 = mul poly bitcast f32 shl uint add k int 227 23
+    s2 = bitcast f32 shl uint 27 23
+    ret bitcast uint mul s1 s2
+  end
+  ret bitcast uint mul poly bitcast f32 shl uint add k int 127 23
+end
+
+fn log_poly_eval m f32 e int to uint
+  zu = omega_math_div bitcast uint sub m bitcast f32 uint 0x3f800000 bitcast uint add m bitcast f32 uint 0x3f800000
+  z = bitcast f32 zu
+  z2 = mul z z
+  poly = add bitcast f32 uint 0x3e4ccccd mul z2 bitcast f32 uint 0x3e124925
+  poly = add bitcast f32 uint 0x3eaaaaab mul z2 poly
+  poly = add bitcast f32 uint 0x3f800000 mul z2 poly
+  ln_m = mul mul bitcast f32 uint 0x40000000 z poly
+  ret bitcast uint add mul f32 e bitcast f32 uint 0x3f317218 ln_m
+end
+
+fn omega_math_log x uint to uint
+  if num_isnan x
+    ret OMEGA_QNAN_BITS
+  end
+  fx = bitcast f32 x
+  if lt fx bitcast f32 uint 0
+    ret OMEGA_QNAN_BITS
+  end
+  if num_iszero x
+    ret OMEGA_INF_NEG
+  end
+  if num_isinf x
+    ret OMEGA_INF_POS
+  end
+  e_adj = int 0
+  u = x
+  if num_issubnormal x
+    fx = mul fx bitcast f32 uint 0x4b000000
+    u = bitcast uint fx
+    e_adj = int -23
+  end
+  e = add sub int and shr u 23 uint 0xff int 127 e_adj
+  m = bitcast f32 or and u uint 0x007fffff uint 0x3f800000
+  if gt m bitcast f32 uint 0x3fb504f3
+    m = mul m bitcast f32 uint 0x3f000000
+    e = add e int 1
+  end
+  ret log_poly_eval m e
+end
+
+fn omega_warp_reduce_sum warr view uint 32 to uint
+  val = new uint 32 0
+  for i ulong 32
+    put val i get warr i
+  end
+  d = ulong 16
+  for s ulong 5
+    for i ulong 32
+      if lt add i d 32
+        va = bitcast f32 get val i
+        vb = bitcast f32 get val add i d
+        put val i bitcast uint add va vb
+      end
+    end
+    d = shr d 1
+  end
+  ret get val 0
+end
+
+note ---- Op registry & metadata ----
+
+fn omega_numeric_op_count to ulong
+  ret OMEGA_NOP_COUNT
+end
+
+fn omega_numeric_op_whole_kernel op ulong to bool
+  if or eq op OMEGA_NOP_DIV eq op OMEGA_NOP_SQRT
+    ret true
+  end
+  ret or eq op OMEGA_NOP_EXP eq op OMEGA_NOP_LOG
+end
+
+fn omega_numeric_op_at idx ulong to long
+  if lt idx OMEGA_NOP_COUNT
+    ret long idx
+  end
+  ret -1
+end
+
+fn omega_numeric_op_arity op ulong to ulong
+  if or eq op OMEGA_NOP_FFMA eq op OMEGA_NOP_FFMA_V
+    ret 3
+  end
+  if or eq op OMEGA_NOP_FADD or eq op OMEGA_NOP_FSUB eq op OMEGA_NOP_FMUL
+    ret 2
+  end
+  if or eq op OMEGA_NOP_FSETP_SEL or eq op OMEGA_NOP_FSEL or eq op OMEGA_NOP_FMNMX_MIN eq op OMEGA_NOP_FMNMX_MAX
+    ret 2
+  end
+  if eq op OMEGA_NOP_DIV
+    ret 2
+  end
+  if and ge op OMEGA_NOP_FSETP_LT_SEL le op OMEGA_NOP_FSETP_NEU_SEL
+    ret 2
+  end
+  ret 1
+end
+
+fn omega_numeric_op_compare op ulong to ulong
+  if or eq op OMEGA_NOP_MUFU_RCP eq op OMEGA_NOP_MUFU_RSQ
+    ret OMEGA_CMP_SEED_BOUND
+  end
+  if eq op OMEGA_NOP_F32_TO_F16
+    ret OMEGA_CMP_F16_BITS
+  end
+  if eq op OMEGA_NOP_F32_TO_BF16
+    ret OMEGA_CMP_BF16_BITS
+  end
+  if or eq op OMEGA_NOP_FSETP_SEL or eq op OMEGA_NOP_FSEL or eq op OMEGA_NOP_F2I or eq op OMEGA_NOP_LDS_STS eq op OMEGA_NOP_SHFL_DOWN
+    ret OMEGA_CMP_INT_EXACT
+  end
+  if and ge op OMEGA_NOP_FSETP_LT_SEL le op OMEGA_NOP_F2U
+    ret OMEGA_CMP_INT_EXACT
+  end
+  ret OMEGA_CMP_BIT_EXACT
+end
+
+fn num_streq s view uchar * slen ulong t view uchar * to bool
+  if ne slen len t
+    ret false
+  end
+  for i ulong slen bound 64
+    if ne get s i get t i
+      ret false
+    end
+  end
+  ret true
+end
+
+text t_op_fadd "FADD"
+text t_op_fsub "FSUB"
+text t_op_fmul "FMUL"
+text t_op_ffma "FFMA"
+text t_op_fsetp "FSETP"
+text t_op_fsetp_sel "FSETP_SEL"
+text t_op_fsel "FSEL"
+text t_op_fmin "FMNMX_MIN"
+text t_op_fmax "FMNMX_MAX"
+text t_op_i2fp "I2FP"
+text t_op_f2i "F2I"
+text t_op_rcp "MUFU_RCP"
+text t_op_rsq "MUFU_RSQ"
+text t_op_lds "LDS"
+text t_op_sts "STS"
+text t_op_lds_sts "LDS_STS"
+text t_op_shfl "SHFL_DOWN"
+text t_op_div "DIV"
+text t_op_sqrt "SQRT"
+text t_op_exp "EXP"
+text t_op_log "LOG"
+text t_op_red "REDUCE_SUM"
+text t_op_ffmav "FFMA_V"
+text t_op_f2i_fl "F2I_FLOOR"
+text t_op_f2i_cl "F2I_CEIL"
+text t_op_f2i_rn "F2I_RNI"
+text t_op_f2u "F2U"
+text t_op_i2u "I2FP_U32"
+text t_op_f32_f16 "F32_TO_F16"
+text t_op_f32_bf16 "F32_TO_BF16"
+text t_op_f16_f32 "F16_TO_F32"
+text t_op_bf16_f32 "BF16_TO_F32"
+
+fn num_find_e1_fsetp s view uchar * n ulong to long
+  if lt n 13
+    ret -1
+  end
+  if or ne get s 0 uchar 70 ne get s 5 uchar 95
+    ret -1
+  end
+  c6 = get s 6
+  c7 = get s 7
+  c8 = get s 8
+  if eq n 12
+    ret -1
+  end
+  if eq n 13
+    if and eq c6 uchar 76 eq c7 uchar 84
+      ret long OMEGA_NOP_FSETP_LT_SEL
+    end
+    if and eq c6 uchar 76 eq c7 uchar 69
+      ret long OMEGA_NOP_FSETP_LE_SEL
+    end
+    if and eq c6 uchar 71 eq c7 uchar 84
+      ret long OMEGA_NOP_FSETP_GT_SEL
+    end
+    if and eq c6 uchar 69 eq c7 uchar 81
+      ret long OMEGA_NOP_FSETP_EQ_SEL
+    end
+    if and eq c6 uchar 78 eq c7 uchar 69
+      ret long OMEGA_NOP_FSETP_NE_SEL
+    end
+  end
+  if eq n 14
+    if and eq c6 uchar 78 eq c7 uchar 85
+      ret long OMEGA_NOP_FSETP_NUM_SEL
+    end
+    if and eq c6 uchar 78 eq c7 uchar 65
+      ret long OMEGA_NOP_FSETP_NAN_SEL
+    end
+    if and eq c8 uchar 85 and eq c6 uchar 76 eq c7 uchar 84
+      ret long OMEGA_NOP_FSETP_LTU_SEL
+    end
+    if and eq c8 uchar 85 and eq c6 uchar 76 eq c7 uchar 69
+      ret long OMEGA_NOP_FSETP_LEU_SEL
+    end
+    if and eq c8 uchar 85 and eq c6 uchar 71 eq c7 uchar 84
+      ret long OMEGA_NOP_FSETP_GTU_SEL
+    end
+    if and eq c8 uchar 85 and eq c6 uchar 71 eq c7 uchar 69
+      ret long OMEGA_NOP_FSETP_GEU_SEL
+    end
+    if and eq c8 uchar 85 and eq c6 uchar 69 eq c7 uchar 81
+      ret long OMEGA_NOP_FSETP_EQU_SEL
+    end
+    if and eq c8 uchar 85 and eq c6 uchar 78 eq c7 uchar 69
+      ret long OMEGA_NOP_FSETP_NEU_SEL
+    end
+  end
+  ret -1
+end
+
+fn omega_numeric_op_find s view uchar * n ulong to long
+  if num_streq s n t_op_fadd
+    ret long OMEGA_NOP_FADD
+  end
+  if num_streq s n t_op_fsub
+    ret long OMEGA_NOP_FSUB
+  end
+  if num_streq s n t_op_fmul
+    ret long OMEGA_NOP_FMUL
+  end
+  if num_streq s n t_op_ffma
+    ret long OMEGA_NOP_FFMA
+  end
+  if or num_streq s n t_op_fsetp num_streq s n t_op_fsetp_sel
+    ret long OMEGA_NOP_FSETP_SEL
+  end
+  if num_streq s n t_op_fsel
+    ret long OMEGA_NOP_FSEL
+  end
+  if num_streq s n t_op_fmin
+    ret long OMEGA_NOP_FMNMX_MIN
+  end
+  if num_streq s n t_op_fmax
+    ret long OMEGA_NOP_FMNMX_MAX
+  end
+  if num_streq s n t_op_i2fp
+    ret long OMEGA_NOP_I2FP
+  end
+  if num_streq s n t_op_f2i
+    ret long OMEGA_NOP_F2I
+  end
+  if num_streq s n t_op_rcp
+    ret long OMEGA_NOP_MUFU_RCP
+  end
+  if num_streq s n t_op_rsq
+    ret long OMEGA_NOP_MUFU_RSQ
+  end
+  if or num_streq s n t_op_lds or num_streq s n t_op_sts num_streq s n t_op_lds_sts
+    ret long OMEGA_NOP_LDS_STS
+  end
+  if num_streq s n t_op_shfl
+    ret long OMEGA_NOP_SHFL_DOWN
+  end
+  if num_streq s n t_op_div
+    ret long OMEGA_NOP_DIV
+  end
+  if num_streq s n t_op_sqrt
+    ret long OMEGA_NOP_SQRT
+  end
+  if num_streq s n t_op_exp
+    ret long OMEGA_NOP_EXP
+  end
+  if num_streq s n t_op_log
+    ret long OMEGA_NOP_LOG
+  end
+  if num_streq s n t_op_red
+    ret long OMEGA_NOP_REDUCE_SUM
+  end
+  if num_streq s n t_op_ffmav
+    ret long OMEGA_NOP_FFMA_V
+  end
+  if num_streq s n t_op_f2i_fl
+    ret long OMEGA_NOP_F2I_FLOOR
+  end
+  if num_streq s n t_op_f2i_cl
+    ret long OMEGA_NOP_F2I_CEIL
+  end
+  if num_streq s n t_op_f2i_rn
+    ret long OMEGA_NOP_F2I_RNI
+  end
+  if num_streq s n t_op_f2u
+    ret long OMEGA_NOP_F2U
+  end
+  if num_streq s n t_op_i2u
+    ret long OMEGA_NOP_I2FP_U32
+  end
+  if num_streq s n t_op_f32_f16
+    ret long OMEGA_NOP_F32_TO_F16
+  end
+  if num_streq s n t_op_f32_bf16
+    ret long OMEGA_NOP_F32_TO_BF16
+  end
+  if num_streq s n t_op_f16_f32
+    ret long OMEGA_NOP_F16_TO_F32
+  end
+  if num_streq s n t_op_bf16_f32
+    ret long OMEGA_NOP_BF16_TO_F32
+  end
+  ret num_find_e1_fsetp s n
+end
+
+text t_cmp_bit "BIT_EXACT"
+text t_cmp_int "INT_EXACT"
+text t_cmp_seed "SEED_BOUND"
+text t_cmp_f16 "F16_BITS"
+text t_cmp_bf16 "BF16_BITS"
+text t_cmp_unk "UNKNOWN"
+
+fn omega_numeric_compare_name c ulong dst edit uchar * to ulong
+  if eq c OMEGA_CMP_BIT_EXACT
+    for i ulong len t_cmp_bit bound 16
+      put dst i get t_cmp_bit i
+    end
+    ret len t_cmp_bit
+  end
+  if eq c OMEGA_CMP_INT_EXACT
+    for i ulong len t_cmp_int bound 16
+      put dst i get t_cmp_int i
+    end
+    ret len t_cmp_int
+  end
+  if eq c OMEGA_CMP_SEED_BOUND
+    for i ulong len t_cmp_seed bound 16
+      put dst i get t_cmp_seed i
+    end
+    ret len t_cmp_seed
+  end
+  if eq c OMEGA_CMP_F16_BITS
+    for i ulong len t_cmp_f16 bound 16
+      put dst i get t_cmp_f16 i
+    end
+    ret len t_cmp_f16
+  end
+  if eq c OMEGA_CMP_BF16_BITS
+    for i ulong len t_cmp_bf16 bound 16
+      put dst i get t_cmp_bf16 i
+    end
+    ret len t_cmp_bf16
+  end
+  for i ulong len t_cmp_unk bound 16
+    put dst i get t_cmp_unk i
+  end
+  ret len t_cmp_unk
+end
+
+fn omega_numeric_compare_equal mode ulong expect uint got uint to bool
+  if eq mode OMEGA_CMP_BIT_EXACT
+    ret omega_numeric_bits_equal expect got
+  end
+  if eq mode OMEGA_CMP_INT_EXACT
+    ret eq expect got
+  end
+  if or eq mode OMEGA_CMP_F16_BITS eq mode OMEGA_CMP_BF16_BITS
+    if or ne shr expect 16 uint 0 ne shr got 16 uint 0
+      ret false
+    end
+    inf = uint 0x7f80
+    if eq mode OMEGA_CMP_F16_BITS
+      inf = uint 0x7c00
+    end
+    en = gt and expect uint 0x7fff inf
+    gn = gt and got uint 0x7fff inf
+    if or en gn
+      ret and en gn
+    end
+    ret eq expect got
+  end
+  ret false
+end
+
+note Refused variants (15 entries)
+text t_rv0 "LDS.U8"
+text t_rv1 "STS.U8"
+text t_rv2 "LDS.S8"
+text t_rv3 "LDS.U16"
+text t_rv4 "STS.U16"
+text t_rv5 "LDS.64"
+text t_rv6 "STS.64"
+text t_rv7 "LDS.128"
+text t_rv8 "STS.128"
+text t_rv9 "SHFL_UP"
+text t_rv10 "SHFL_BFLY"
+text t_rv11 "SHFL_IDX"
+text t_rv12 "REDUCE_MAX"
+text t_rv13 "REDUCE_MIN"
+text t_rv14 "REDUCE_SUM_BLOCK"
+
+fn omega_numeric_refused_variant_count to ulong
+  ret 15
+end
+
+fn omega_numeric_refused_variant_at idx ulong dst edit uchar * to long
+  if ge idx 15
+    ret -1
+  end
+  if eq idx 0
+    for i ulong len t_rv0 bound 32
+      put dst i get t_rv0 i
+    end
+    ret long len t_rv0
+  end
+  if eq idx 1
+    for i ulong len t_rv1 bound 32
+      put dst i get t_rv1 i
+    end
+    ret long len t_rv1
+  end
+  if eq idx 9
+    for i ulong len t_rv9 bound 32
+      put dst i get t_rv9 i
+    end
+    ret long len t_rv9
+  end
+  if eq idx 14
+    for i ulong len t_rv14 bound 32
+      put dst i get t_rv14 i
+    end
+    ret long len t_rv14
+  end
+  ret 0
+end
+
+fn num_is_refused_variant s view uchar * n ulong to bool
+  if or num_streq s n t_rv0 or num_streq s n t_rv1 num_streq s n t_rv2
+    ret true
+  end
+  if or num_streq s n t_rv3 or num_streq s n t_rv4 num_streq s n t_rv5
+    ret true
+  end
+  if or num_streq s n t_rv6 or num_streq s n t_rv7 num_streq s n t_rv8
+    ret true
+  end
+  if or num_streq s n t_rv9 or num_streq s n t_rv10 num_streq s n t_rv11
+    ret true
+  end
+  ret or num_streq s n t_rv12 or num_streq s n t_rv13 num_streq s n t_rv14
+end
+
+fn omega_numeric_launch_shape count ulong to void
+  g = div sub add count OMEGA_NUMERIC_CTA_THREADS 1 OMEGA_NUMERIC_CTA_THREADS
+  if eq g 0
+    g = 1
+  end
+  put g_num_launch_tpb 0 uint OMEGA_NUMERIC_CTA_THREADS
+  put g_num_launch_grid 0 uint g
+end
+
+note ---- Kernel patch words (provenance IDs 1..52 match PROVENANCE_TABLE index+1) ----
+
+const CTRL_FIXED uint 0x010fca00
+const CTRL_VAR uint 0x010e2800
+const CTRL_SHFL_NEXT uint 0x000e2400
+const CTRL_FADD_SB0 uint 0x001fca00
+
+fn patch_put idx ulong w0 uint w1 uint w2 uint w3 uint pid ulong to void
+  b = mul idx 4
+  put g_num_patch_w b w0
+  put g_num_patch_w add b 1 w1
+  put g_num_patch_w add b 2 w2
+  put g_num_patch_w add b 3 w3
+  put g_num_patch_prov idx pid
+end
+
+fn patch_put_tail idx ulong wait_sb0 bool to ulong
+  ctrl = uint 0x000fe200
+  if wait_sb0
+    ctrl = uint 0x001fe200
+  end
+  patch_put idx uint 0x06007986 uint 0x00000009 uint 0x0c101904 ctrl 0
+  patch_put add idx 1 uint 0x0000794d uint 0x00000000 uint 0x03800000 uint 0x000fea00 0
+  ret add idx 2
+end
+
+fn e1_fsetp_code op ulong to long
+  if eq op OMEGA_NOP_FSETP_LT_SEL
+    ret 1
+  end
+  if eq op OMEGA_NOP_FSETP_EQ_SEL
+    ret 2
+  end
+  if eq op OMEGA_NOP_FSETP_LE_SEL
+    ret 3
+  end
+  if eq op OMEGA_NOP_FSETP_GT_SEL
+    ret 4
+  end
+  if eq op OMEGA_NOP_FSETP_NE_SEL
+    ret 5
+  end
+  if eq op OMEGA_NOP_FSETP_NUM_SEL
+    ret 7
+  end
+  if eq op OMEGA_NOP_FSETP_NAN_SEL
+    ret 8
+  end
+  if eq op OMEGA_NOP_FSETP_LTU_SEL
+    ret 9
+  end
+  if eq op OMEGA_NOP_FSETP_EQU_SEL
+    ret 10
+  end
+  if eq op OMEGA_NOP_FSETP_LEU_SEL
+    ret 11
+  end
+  if eq op OMEGA_NOP_FSETP_GTU_SEL
+    ret 12
+  end
+  if eq op OMEGA_NOP_FSETP_NEU_SEL
+    ret 13
+  end
+  if eq op OMEGA_NOP_FSETP_GEU_SEL
+    ret 14
+  end
+  ret -1
+end
+
+fn e1_fsetp_pid op ulong to ulong
+  if eq op OMEGA_NOP_FSETP_LT_SEL
+    ret 27
+  end
+  if eq op OMEGA_NOP_FSETP_EQ_SEL
+    ret 28
+  end
+  if eq op OMEGA_NOP_FSETP_LE_SEL
+    ret 29
+  end
+  if eq op OMEGA_NOP_FSETP_GT_SEL
+    ret 30
+  end
+  if eq op OMEGA_NOP_FSETP_NE_SEL
+    ret 31
+  end
+  if eq op OMEGA_NOP_FSETP_NUM_SEL
+    ret 32
+  end
+  if eq op OMEGA_NOP_FSETP_NAN_SEL
+    ret 33
+  end
+  if eq op OMEGA_NOP_FSETP_LTU_SEL
+    ret 34
+  end
+  if eq op OMEGA_NOP_FSETP_EQU_SEL
+    ret 35
+  end
+  if eq op OMEGA_NOP_FSETP_LEU_SEL
+    ret 36
+  end
+  if eq op OMEGA_NOP_FSETP_GTU_SEL
+    ret 37
+  end
+  if eq op OMEGA_NOP_FSETP_NEU_SEL
+    ret 38
+  end
+  ret 39
+end
+
+fn patch_words_base op ulong to long
+  if eq op OMEGA_NOP_FADD
+    patch_put 0 uint 0x02097221 uint 0x00000005 uint 0x00000000 CTRL_FIXED 1
+    ret 1
+  end
+  if eq op OMEGA_NOP_FSUB
+    patch_put 0 uint 0x02097221 uint 0x80000005 uint 0x00000000 CTRL_FIXED 2
+    ret 1
+  end
+  if eq op OMEGA_NOP_FMUL
+    patch_put 0 uint 0x02097220 uint 0x00000005 uint 0x00400000 CTRL_FIXED 3
+    ret 1
+  end
+  if eq op OMEGA_NOP_FFMA
+    patch_put 0 uint 0x02097223 uint 0x00000005 uint 0x00000001 CTRL_FIXED 4
+    ret 1
+  end
+  if eq op OMEGA_NOP_FSETP_SEL
+    patch_put 0 uint 0x0200720b uint 0x00000005 uint 0x03f06000 CTRL_FIXED 5
+    patch_put 1 uint 0x02097208 uint 0x00000005 uint 0x00000000 uint 0x000fca00 6
+    ret long patch_put_tail 2 false
+  end
+  if eq op OMEGA_NOP_FSEL
+    patch_put 0 uint 0x0200720b uint 0x000000ff uint 0x03f06000 CTRL_FIXED 7
+    patch_put 1 uint 0x05097208 uint 0x00000002 uint 0x00000000 uint 0x000fca00 8
+    ret long patch_put_tail 2 false
+  end
+  if eq op OMEGA_NOP_FMNMX_MIN
+    patch_put 0 uint 0x02097209 uint 0x00000005 uint 0x03800000 CTRL_FIXED 9
+    ret 1
+  end
+  if eq op OMEGA_NOP_FMNMX_MAX
+    patch_put 0 uint 0x02097209 uint 0x00000005 uint 0x07800000 CTRL_FIXED 10
+    ret 1
+  end
+  if eq op OMEGA_NOP_I2FP
+    patch_put 0 uint 0x00097245 uint 0x00000002 uint 0x00201400 CTRL_FIXED 11
+    ret 1
+  end
+  if eq op OMEGA_NOP_F2I
+    patch_put 0 uint 0x00097305 uint 0x00000002 uint 0x0020f100 CTRL_VAR 12
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_MUFU_RCP
+    patch_put 0 uint 0x00097308 uint 0x00000002 uint 0x00001000 CTRL_VAR 13
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_MUFU_RSQ
+    patch_put 0 uint 0x00097308 uint 0x00000002 uint 0x00001400 CTRL_VAR 14
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_SHFL_DOWN
+    patch_put 0 uint 0x02097f89 uint 0x08201f00 uint 0x000e0000 CTRL_VAR 15
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_LDS_STS
+    patch_put 0 uint 0x00087819 uint 0x00000002 uint 0x000006ff CTRL_FIXED 22
+    patch_put 1 uint 0x080a7812 uint 0x000000fc uint 0x078e3cff uint 0x000fca00 23
+    patch_put 2 uint 0x08007988 uint 0x00000002 uint 0x080008ff uint 0x010fe200 24
+    patch_put 3 uint 0x00007b1d uint 0x00000000 uint 0x00010000 uint 0x000fec00 25
+    patch_put 4 uint 0x0a097984 uint 0x000000ff uint 0x08000800 uint 0x000e2800 26
+    ret long patch_put_tail 5 true
+  end
+  if eq op OMEGA_NOP_REDUCE_SUM
+    patch_put 0 uint 0x02097f89 uint 0x0a001f00 uint 0x000e0000 CTRL_VAR 16
+    patch_put 1 uint 0x02027221 uint 0x00000009 uint 0x00000000 CTRL_FADD_SB0 20
+    patch_put 2 uint 0x02097f89 uint 0x09001f00 uint 0x000e0000 CTRL_SHFL_NEXT 17
+    patch_put 3 uint 0x02027221 uint 0x00000009 uint 0x00000000 CTRL_FADD_SB0 20
+    patch_put 4 uint 0x02097f89 uint 0x08801f00 uint 0x000e0000 CTRL_SHFL_NEXT 18
+    patch_put 5 uint 0x02027221 uint 0x00000009 uint 0x00000000 CTRL_FADD_SB0 20
+    patch_put 6 uint 0x02097f89 uint 0x08401f00 uint 0x000e0000 CTRL_SHFL_NEXT 19
+    patch_put 7 uint 0x02027221 uint 0x00000009 uint 0x00000000 CTRL_FADD_SB0 20
+    patch_put 8 uint 0x02097f89 uint 0x08201f00 uint 0x000e0000 CTRL_SHFL_NEXT 15
+    patch_put 9 uint 0x02097221 uint 0x00000009 uint 0x00000000 CTRL_FADD_SB0 21
+    ret long patch_put_tail 10 false
+  end
+  ret -99
+end
+
+fn omega_numeric_patch_words op ulong to long
+  if omega_numeric_op_whole_kernel op
+    ret OMEGA_NUMERIC_ERR_NOT_ENCODED
+  end
+  br = patch_words_base op
+  if ne br -99
+    ret br
+  end
+  ecmp = e1_fsetp_code op
+  if ge ecmp 0
+    w2 = or uint 0x03f00000 shl uint ecmp 12
+    patch_put 0 uint 0x0200720b uint 0x00000005 w2 CTRL_FIXED e1_fsetp_pid op
+    patch_put 1 uint 0x02097208 uint 0x00000005 uint 0x00000000 uint 0x000fca00 6
+    ret long patch_put_tail 2 false
+  end
+  if eq op OMEGA_NOP_F2I_FLOOR
+    patch_put 0 uint 0x00097305 uint 0x00000002 uint 0x00207100 CTRL_VAR 40
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_F2I_CEIL
+    patch_put 0 uint 0x00097305 uint 0x00000002 uint 0x0020b100 CTRL_VAR 41
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_F2I_RNI
+    patch_put 0 uint 0x00097305 uint 0x00000002 uint 0x00203100 CTRL_VAR 42
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_F2U
+    patch_put 0 uint 0x00097305 uint 0x00000002 uint 0x0020f000 CTRL_VAR 43
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_I2FP_U32
+    patch_put 0 uint 0x00097245 uint 0x00000002 uint 0x00201000 CTRL_FIXED 44
+    ret 1
+  end
+  if eq op OMEGA_NOP_F32_TO_F16
+    patch_put 0 uint 0x00097304 uint 0x00000002 uint 0x00200800 CTRL_VAR 45
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_F32_TO_BF16
+    patch_put 0 uint 0x00097304 uint 0x00000002 uint 0x00202000 CTRL_VAR 46
+    ret long patch_put_tail 1 true
+  end
+  if eq op OMEGA_NOP_F16_TO_F32
+    patch_put 0 uint 0xff097230 uint 0x20000002 uint 0x00004100 CTRL_FIXED 47
+    ret 1
+  end
+  if eq op OMEGA_NOP_BF16_TO_F32
+    patch_put 0 uint 0x02097819 uint 0x00000010 uint 0x000006ff CTRL_FIXED 48
+    ret 1
+  end
+  if eq op OMEGA_NOP_FFMA_V
+    patch_put 0 uint 0xff0a7b82 uint 0x0000e800 uint 0x00000a00 CTRL_VAR 49
+    patch_put 1 uint 0x090a7825 uint 0x00000004 uint 0x078e000a uint 0x001fcc00 50
+    patch_put 2 uint 0x0a0b7981 uint 0x00000004 uint 0x0c1e1900 uint 0x000e2800 51
+    patch_put 3 uint 0x02097223 uint 0x00000005 uint 0x0000000b CTRL_FADD_SB0 52
+    ret long patch_put_tail 4 false
+  end
+  ret OMEGA_NUMERIC_ERR_BAD_ARGS
+end
+
+fn num_put_u32_le dst edit uchar 512 off ulong v uint to void
+  put dst off uchar and v uint 255
+  put dst add off 1 uchar and shr v 8 uint 255
+  put dst add off 2 uchar and shr v 16 uint 255
+  put dst add off 3 uchar and shr v 24 uint 255
+end
+
+fn omega_numeric_build_kernel op ulong code edit uchar 512 to long
+  n = omega_numeric_patch_words op
+  if le n 0
+    if lt n 0
+      ret n
+    end
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  blen = bw_encode_vecadd code
+  if lt blen add OMEGA_NUMERIC_PATCH_OFFSET mul ulong n 16
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  for i ulong ulong n bound 15
+    off = add OMEGA_NUMERIC_PATCH_OFFSET mul i 16
+    b = mul i 4
+    num_put_u32_le code off get g_num_patch_w b
+    num_put_u32_le code add off 4 get g_num_patch_w add b 1
+    num_put_u32_le code add off 8 get g_num_patch_w add b 2
+    num_put_u32_le code add off 12 get g_num_patch_w add b 3
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+note ---- Structural patch checker ----
+
+fn fixed_latency_producer o uint to bool
+  lo = and o uint 0x0fff
+  if or eq lo uint 0x986 or eq lo uint 0x988 or eq lo uint 0xb1d eq lo uint 0x94d
+    ret false
+  end
+  if or eq lo uint 0x981 or eq lo uint 0x984 or eq lo uint 0xb82 eq lo uint 0xf89
+    ret false
+  end
+  if or eq lo uint 0x308 or eq lo uint 0x305 eq lo uint 0x304
+    ret false
+  end
+  ret true
+end
+
+fn chk_patch_insn_ctrl t ulong n ulong to long
+  b = mul t 4
+  o = and get g_num_patch_w b uint 0xffff
+  w3 = get g_num_patch_w add b 3
+  wb = and shr w3 14 uint 7
+  st = and shr w3 9 uint 0xf
+  if le wb uint 5
+    if ge add t 1 n
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    nw3 = get g_num_patch_w add b 7
+    if eq and and shr nw3 20 uint 0x3f shl uint 1 wb uint 0
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if lt st uint 2
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    ret OMEGA_NUMERIC_OK
+  end
+  if and fixed_latency_producer o lt st uint 5
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn chk_patch_insn_form t ulong info edit long 9 to long
+  b = mul t 4
+  w0 = get g_num_patch_w b
+  w1 = get g_num_patch_w add b 1
+  w2 = get g_num_patch_w add b 2
+  o = and w0 uint 0xffff
+  if eq o uint 0x7988
+    if ne and w0 uint 0x00ffffff uint 0x00007988
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne and w1 uint 0xffffff00 uint 0
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne w2 uint 0x080008ff
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    put info 0 long t
+    put info 5 add get info 5 1
+    ret OMEGA_NUMERIC_OK
+  end
+  if eq o uint 0x7984
+    if ne w1 uint 0x000000ff
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne w2 uint 0x08000800
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    put info 1 long t
+    put info 6 add get info 6 1
+    ret OMEGA_NUMERIC_OK
+  end
+  if eq o uint 0x7b1d
+    if ne w0 uint 0x00007b1d
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne w1 uint 0
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne w2 uint 0x00010000
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    put info 2 long t
+    put info 7 add get info 7 1
+    ret OMEGA_NUMERIC_OK
+  end
+  if eq and w0 uint 0x0fff uint 0x0986
+    if ne w0 uint 0x06007986
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne w1 uint 0x00000009
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne w2 uint 0x0c101904
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    ret OMEGA_NUMERIC_OK
+  end
+  if eq o uint 0x7819
+    put info 3 long t
+    ret OMEGA_NUMERIC_OK
+  end
+  if eq o uint 0x7812
+    put info 4 long t
+    ret OMEGA_NUMERIC_OK
+  end
+  if eq o uint 0x7f89
+    if ne and w1 uint 0xfc1fe0ff uint 0x08000000
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne w2 uint 0x000e0000
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne and shr w1 8 uint 0x1f uint 0x1f
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    put info 8 add get info 8 1
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn chk_patch_insn_loop n ulong info edit long 9 to long
+  for t ulong n bound 15
+    rc = chk_patch_insn_ctrl t n
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+    rc = chk_patch_insn_form t info
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn chk_patch_shared_regs sts long lds long shf long lop long tx uint to long
+  shfb = mul ulong shf 4
+  if ne and shr get g_num_patch_w shfb 24 uint 0xff uint 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w add shfb 1 uint 2
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w add shfb 2 uint 0x000006ff
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  shf_dst = and shr get g_num_patch_w shfb 16 uint 0xff
+  stsb = mul ulong sts 4
+  if ne and shr get g_num_patch_w stsb 24 uint 0xff shf_dst
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and get g_num_patch_w add stsb 1 uint 0xff uint 2
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  lopb = mul ulong lop 4
+  if ne and shr get g_num_patch_w lopb 24 uint 0xff shf_dst
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w add lopb 2 uint 0x078e3cff
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w add lopb 1 mul sub tx uint 1 uint 4
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ldsb = mul ulong lds 4
+  lop_dst = and shr get g_num_patch_w lopb 16 uint 0xff
+  if ne and shr get g_num_patch_w ldsb 24 uint 0xff lop_dst
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr get g_num_patch_w ldsb 16 uint 0xff uint 9
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn chk_patch_shared info view long 9 qmd1 view uint 96 to long
+  sts = get info 0
+  lds = get info 1
+  bar = get info 2
+  shf = get info 3
+  lop = get info 4
+  if or ne get info 5 1 or ne get info 6 1 ne get info 7 1
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if or ge sts bar ge bar lds
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  tx = and get qmd1 34 uint 0xffff
+  barriers = and shr get qmd1 35 17 uint 0x1f
+  sbytes = shl and get qmd1 36 uint 0x7ff 7
+  if or lt barriers uint 1 ne tx uint OMEGA_NUMERIC_CTA_THREADS
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if gt mul tx uint 4 sbytes
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if lt shf 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if gt shf sts
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if lt lop 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if gt lop lds
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret chk_patch_shared_regs sts lds shf lop tx
+end
+
+fn ctrl_waits w3 uint bar uint to bool
+  wm = and shr w3 20 uint 0x3f
+  ret ne and wm shl uint 1 bar uint 0
+end
+
+fn chk_patch_reduce_step s ulong acc uint d uint to long
+  sb = mul mul s 2 4
+  fb = add sb 4
+  sw0 = get g_num_patch_w sb
+  if ne and sw0 uint 0xffff uint 0x7f89
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr get g_num_patch_w add sb 1 21 uint 0x1f d
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr sw0 24 uint 0xff acc
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  fw0 = get g_num_patch_w fb
+  if ne and fw0 uint 0xffff uint 0x7221
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  fw1 = get g_num_patch_w add fb 1
+  if ne and fw1 uint 0xffffff00 uint 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w add fb 2 uint 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  wb = and shr get g_num_patch_w add sb 3 14 uint 7
+  if gt wb uint 5
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if not ctrl_waits get g_num_patch_w add fb 3 wb
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr fw0 24 uint 0xff acc
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and fw1 uint 0xff and shr sw0 16 uint 0xff
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  exp_dst = acc
+  if eq s 4
+    exp_dst = uint 9
+  end
+  if ne and shr fw0 16 uint 0xff exp_dst
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn chk_patch_reduce n ulong n_shfl long to long
+  if or ne n_shfl 5 ne n 12
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  acc = and shr get g_num_patch_w 0 24 uint 0xff
+  d = uint 16
+  for s ulong 5
+    rc = chk_patch_reduce_step s acc d
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+    d = shr d 1
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn chk_patch_e1 op ulong n ulong to long
+  ecmp = e1_fsetp_code op
+  if ge ecmp 0
+    if ne n 4
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 0 uint 0x0200720b
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 1 uint 5
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    w2 = get g_num_patch_w 2
+    if ne and w2 uint 0xffff0fff uint 0x03f00000
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne long and shr w2 12 uint 0xf ecmp
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 4 uint 0x02097208
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 5 uint 5
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 6 uint 0
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+  end
+  if eq op OMEGA_NOP_FFMA_V
+    if ne n 6
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 0 uint 0xff0a7b82
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 1 uint 0x0000e800
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 2 uint 0x00000a00
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if gt and shr get g_num_patch_w 3 14 uint 7 uint 5
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 4 uint 0x090a7825
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 5 uint 4
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 6 uint 0x078e000a
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 8 uint 0x0a0b7981
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 9 uint 4
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 10 uint 0x0c1e1900
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 12 uint 0x02097223
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 13 uint 5
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w 14 uint 0xb
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_numeric_check_patch op ulong n long qmd1 view uint 96 to long
+  info = new long 9 -1
+  if ge op OMEGA_NOP_COUNT
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if or lt n 1 gt n long OMEGA_NUMERIC_PATCH_MAX
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if eq and and shr get g_num_patch_w 3 20 uint 0x3f uint 16 uint 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  put info 5 0
+  put info 6 0
+  put info 7 0
+  put info 8 0
+  nu = ulong n
+  rc = chk_patch_insn_loop nu info
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  uses_sh = or ne get info 5 0 or ne get info 6 0 ne get info 7 0
+  if and eq op OMEGA_NOP_LDS_STS or eq get info 5 0 eq get info 6 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if uses_sh
+    rc = chk_patch_shared info qmd1
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+  end
+  if eq op OMEGA_NOP_SHFL_DOWN
+    if ne get info 8 1
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne and shr get g_num_patch_w 1 21 uint 0x1f uint 1
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+  end
+  if eq op OMEGA_NOP_REDUCE_SUM
+    rc = chk_patch_reduce nu get info 8
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+  end
+  rc = chk_patch_e1 op nu
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  if gt nu 1
+    sb = mul sub nu 2 4
+    eb = mul sub nu 1 4
+    if ne get g_num_patch_w sb uint 0x06007986
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w add sb 1 uint 9
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w add sb 2 uint 0x0c101904
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w eb uint 0x0000794d
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w add eb 1 uint 0
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+    if ne get g_num_patch_w add eb 2 uint 0x03800000
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn submit_check_qmd op ulong n long count ulong to long
+  mcfg = new ulong 16 0
+  qmd1 = new uint 96 0
+  omega_numeric_launch_shape count
+  put mcfg 5 count
+  put mcfg 6 ulong get g_num_launch_tpb 0
+  put mcfg 7 ulong get g_num_launch_grid 0
+  if ne bw_qmd1 mcfg qmd1 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  ret omega_numeric_check_patch op n qmd1
+end
+
+fn omega_numeric_submit_check op_name view uchar * nlen ulong buf_mask ulong count ulong to long
+  if num_is_refused_variant op_name nlen
+    ret OMEGA_NUMERIC_ERR_NOT_ENCODED
+  end
+  op_l = omega_numeric_op_find op_name nlen
+  if lt op_l 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  op = ulong op_l
+  if eq and buf_mask 1 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if eq and buf_mask 8 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if eq count 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if gt count OMEGA_NUMERIC_MAX_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  ar = omega_numeric_op_arity op
+  if and ge ar 2 eq and buf_mask 2 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if and ge ar 3 eq and buf_mask 4 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if eq op OMEGA_NOP_FFMA
+    c0 = get g_num_c 0
+    for i ulong count bound 4096
+      if ne get g_num_c i c0
+        ret OMEGA_NUMERIC_ERR_OPERANDS
+      end
+    end
+  end
+  if and or eq op OMEGA_NOP_SHFL_DOWN eq op OMEGA_NOP_REDUCE_SUM ne rem count 32 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if and eq op OMEGA_NOP_LDS_STS ne rem count OMEGA_NUMERIC_CTA_THREADS 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if omega_numeric_op_whole_kernel op
+    ret OMEGA_NUMERIC_OK
+  end
+  n = omega_numeric_patch_words op
+  if le n 0
+    ret OMEGA_NUMERIC_ERR_NOT_ENCODED
+  end
+  ret submit_check_qmd op n count
+end
+
+note ---- Reference, CPU realization, Parity, Seed Bound, FTZ ----
+
+fn omega_numeric_element_checked op ulong idx ulong to bool
+  if eq op OMEGA_NOP_REDUCE_SUM
+    ret eq rem idx 32 0
+  end
+  ret true
+end
+
+fn num_eval_one op ulong i ulong is_cpu bool to uint
+  warr = new uint 32 0
+  a = get g_num_a i
+  b = get g_num_b i
+  c = get g_num_c i
+  if eq op OMEGA_NOP_FADD
+    ret omega_ref_fadd a b
+  end
+  if eq op OMEGA_NOP_FSUB
+    ret omega_ref_fsub a b
+  end
+  if eq op OMEGA_NOP_FMUL
+    ret omega_ref_fmul a b
+  end
+  if eq op OMEGA_NOP_FFMA
+    ret omega_ref_ffma a b c
+  end
+  if eq op OMEGA_NOP_FSETP_SEL
+    if omega_ref_fsetp_ge a b
+      ret a
+    end
+    ret b
+  end
+  if eq op OMEGA_NOP_FSEL
+    if omega_ref_fsetp_ge a uint 0
+      ret b
+    end
+    ret a
+  end
+  if eq op OMEGA_NOP_FMNMX_MIN
+    ret omega_ref_fmin a b
+  end
+  if eq op OMEGA_NOP_FMNMX_MAX
+    ret omega_ref_fmax a b
+  end
+  if eq op OMEGA_NOP_I2FP
+    ret omega_ref_i2f bitcast int a
+  end
+  if eq op OMEGA_NOP_F2I
+    ret bitcast uint omega_ref_f2i a
+  end
+  if eq op OMEGA_NOP_MUFU_RCP
+    ret omega_ieee_div uint 0x3f800000 a
+  end
+  if eq op OMEGA_NOP_MUFU_RSQ
+    ret omega_ieee_div uint 0x3f800000 omega_ieee_sqrt a
+  end
+  if eq op OMEGA_NOP_LDS_STS
+    ret get g_num_a xor i 63
+  end
+  if eq op OMEGA_NOP_SHFL_DOWN
+    if eq rem i 32 31
+      ret a
+    end
+    ret get g_num_a add i 1
+  end
+  if eq op OMEGA_NOP_DIV
+    if is_cpu
+      ret omega_math_div a b
+    end
+    ret omega_ieee_div a b
+  end
+  if eq op OMEGA_NOP_SQRT
+    if is_cpu
+      ret omega_math_sqrt a
+    end
+    ret omega_ieee_sqrt a
+  end
+  if eq op OMEGA_NOP_EXP
+    ret omega_math_exp a
+  end
+  if eq op OMEGA_NOP_LOG
+    ret omega_math_log a
+  end
+  if eq op OMEGA_NOP_REDUCE_SUM
+    if ne rem i 32 0
+      ret uint 0
+    end
+    for k ulong 32
+      put warr k get g_num_a add i k
+    end
+    ret omega_warp_reduce_sum warr
+  end
+  if and ge op OMEGA_NOP_FSETP_LT_SEL le op OMEGA_NOP_FSETP_NEU_SEL
+    if eq omega_ref_fsetp_pred op a b 1
+      ret a
+    end
+    ret b
+  end
+  if eq op OMEGA_NOP_F2I_FLOOR
+    ret bitcast uint omega_ref_f2i_floor a
+  end
+  if eq op OMEGA_NOP_F2I_CEIL
+    ret bitcast uint omega_ref_f2i_ceil a
+  end
+  if eq op OMEGA_NOP_F2I_RNI
+    ret bitcast uint omega_ref_f2i_rni a
+  end
+  if eq op OMEGA_NOP_F2U
+    ret omega_ref_f2u a
+  end
+  if eq op OMEGA_NOP_I2FP_U32
+    ret omega_ref_u2f a
+  end
+  if eq op OMEGA_NOP_F32_TO_F16
+    ret omega_ref_f32_to_f16 a
+  end
+  if eq op OMEGA_NOP_F32_TO_BF16
+    ret omega_ref_f32_to_bf16 a
+  end
+  if eq op OMEGA_NOP_F16_TO_F32
+    ret omega_ref_f16_to_f32 and a uint 0xffff
+  end
+  if eq op OMEGA_NOP_BF16_TO_F32
+    ret omega_ref_bf16_to_f32 and a uint 0xffff
+  end
+  if eq op OMEGA_NOP_FFMA_V
+    if is_cpu
+      ret omega_ref_ffma a b c
+    end
+    ret omega_ref_ffma_int a b c
+  end
+  ret uint 0
+end
+
+fn num_tier_checks op ulong count ulong to long
+  if ge op OMEGA_NOP_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if not omega_numeric_fpenv_ok
+    ret OMEGA_NUMERIC_ERR_FPENV
+  end
+  if and or eq op OMEGA_NOP_SHFL_DOWN eq op OMEGA_NOP_REDUCE_SUM ne rem count 32 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if and eq op OMEGA_NOP_LDS_STS ne rem count OMEGA_NUMERIC_CTA_THREADS 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_numeric_reference op ulong count ulong to long
+  rc = num_tier_checks op count
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  for i ulong count bound 4096
+    put g_num_dst i num_eval_one op i false
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_numeric_cpu_realize op ulong count ulong to long
+  rc = num_tier_checks op count
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  if and eq op OMEGA_NOP_F32_TO_BF16 not omega_numeric_cpu_has_bf16
+    ret OMEGA_NUMERIC_ERR_NOT_ENCODED
+  end
+  for i ulong count bound 4096
+    put g_num_dst i num_eval_one op i true
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn num_reset_trace to void
+  put g_num_tr_checked 0 0
+  put g_num_tr_mismatches 0 0
+  put g_num_tr_first_idx 0 -1
+  put g_num_tr_first_exp 0 uint 0
+  put g_num_tr_first_got 0 uint 0
+  put g_num_tr_subnorm 0 0
+  put g_num_tr_oob 0 0
+  put g_num_tr_skipped 0 0
+end
+
+fn omega_numeric_parity op ulong count ulong to long
+  if ge op OMEGA_NOP_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  num_reset_trace
+  mode = omega_numeric_op_compare op
+  if eq mode OMEGA_CMP_SEED_BOUND
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  for i ulong count bound 4096
+    if omega_numeric_element_checked op i
+      put g_num_tr_checked 0 add get g_num_tr_checked 0 1
+      ue = get g_num_exp i
+      ug = get g_num_got i
+      if and eq mode OMEGA_CMP_BIT_EXACT num_issubnormal ue
+        put g_num_tr_subnorm 0 add get g_num_tr_subnorm 0 1
+      end
+      if not omega_numeric_compare_equal mode ue ug
+        if eq get g_num_tr_mismatches 0 0
+          put g_num_tr_first_idx 0 long i
+          put g_num_tr_first_exp 0 ue
+          put g_num_tr_first_got 0 ug
+        end
+        put g_num_tr_mismatches 0 add get g_num_tr_mismatches 0 1
+      end
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_numeric_seed_bound op ulong count ulong to long
+  if ge op OMEGA_NOP_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if ne omega_numeric_op_compare op OMEGA_CMP_SEED_BOUND
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if not omega_numeric_fpenv_ok
+    ret OMEGA_NUMERIC_ERR_FPENV
+  end
+  num_reset_trace
+  bnd = div f64 1.0 f64 1048576.0
+  for i ulong count bound 4096
+    x = get g_num_a i
+    if or not num_is_finite_normal x and eq op OMEGA_NOP_MUFU_RSQ num_signbit x
+      put g_num_tr_skipped 0 add get g_num_tr_skipped 0 1
+    else
+      eu = omega_ieee_div uint 0x3f800000 x
+      if eq op OMEGA_NOP_MUFU_RSQ
+        eu = omega_ieee_div uint 0x3f800000 omega_ieee_sqrt x
+      end
+      if not num_is_finite_normal eu
+        put g_num_tr_skipped 0 add get g_num_tr_skipped 0 1
+      else
+        put g_num_tr_checked 0 add get g_num_tr_checked 0 1
+        gu = get g_num_got i
+        df = fabs sub f64 bitcast f32 gu f64 bitcast f32 eu
+        mf = fabs f64 bitcast f32 eu
+        if or num_isnan gu not le df mul mf bnd
+          if eq get g_num_tr_oob 0 0
+            put g_num_tr_first_idx 0 long i
+            put g_num_tr_first_exp 0 eu
+            put g_num_tr_first_got 0 gu
+          end
+          put g_num_tr_oob 0 add get g_num_tr_oob 0 1
+        end
+      end
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn num_ftz x uint to uint
+  if num_issubnormal x
+    ret and x uint 0x80000000
+  end
+  ret x
+end
+
+fn omega_numeric_reference_ftz op ulong count ulong to long
+  if ge op OMEGA_NOP_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if not omega_numeric_fpenv_ok
+    ret OMEGA_NUMERIC_ERR_FPENV
+  end
+  for i ulong count bound 4096
+    x = num_ftz get g_num_a i
+    y = num_ftz get g_num_b i
+    r = uint 0
+    if eq op OMEGA_NOP_FADD
+      r = omega_ref_fadd x y
+    else
+      if eq op OMEGA_NOP_FSUB
+        r = omega_ref_fsub x y
+      else
+        if eq op OMEGA_NOP_FMUL
+          r = omega_ref_fmul x y
+        else
+          if eq op OMEGA_NOP_FFMA
+            r = omega_ref_ffma x y num_ftz get g_num_c i
+          else
+            if eq op OMEGA_NOP_FFMA_V
+              r = omega_ref_ffma_int x y num_ftz get g_num_c i
+            else
+              if eq op OMEGA_NOP_FMNMX_MIN
+                r = omega_ref_fmin x y
+              else
+                if eq op OMEGA_NOP_FMNMX_MAX
+                  r = omega_ref_fmax x y
+                else
+                  ret OMEGA_NUMERIC_ERR_OPERANDS
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    put g_num_dst i num_ftz r
+  end
+  ret OMEGA_NUMERIC_OK
+end
