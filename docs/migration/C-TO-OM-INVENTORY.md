@@ -8,6 +8,8 @@ Rechecked 2026-11-19 at main `100a9a914`: the tree now tracks **910 `.c` + 362 `
 
 Updated 2026-11-22 with the OM waves 29 to 36 change: the 48 CSV rows of C/H paths that change deletes (it deletes 49; `tools/gen/retrieval/genret.c` postdates the snapshot and has no row) (the Visor and language lanes, `tools/omega.c`, c2sat, the PD-0 planner, the TURING qrecord/qcont/PRD readers, `est_fit`/`est_eval` and their tests) now carry category `retired`, no build mention, and the pure OM-2 file that replaced each. They are no longer part of what is left. The role-triage totals below are still the 2026-10-24 snapshot and count them.
 
+Updated 2026-11-23 with Wave 37 (EXP-001 lane A): cut over `mk/turing_exp001_a.mk` (`turing-cal-candidates` and `power-simulation`) to pure seeded OM-2 (`tools/turing_cal_dev.om`, `tools/turing_cal_candidates.om`, `calibration/scripts/power_simulation.om`), retiring and deleting 5 C/H files (`src/turing/ty_profile.c`, `src/turing/ty_record.c`, `src/turing/ty_record.h`, `tools/turing_cal_candidates.c`, `tools/turing_cal_dev.h`; `calibration/scripts/power_simulation.c` stays on disk as `migration_reference` solely because frozen EXP-001/EXP-001R `candidate_manifest.json` pins its SHA-256).
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage

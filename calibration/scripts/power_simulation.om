@@ -1,0 +1,731 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note calibration/scripts/power_simulation.om -- Pure seeded OM-2 port of
+note calibration/scripts/power_simulation.c (EXP-001 lane A power simulation).
+note Concatenated with tools/turing_cal_dev.om.
+
+const PS_SEED ulong 0x4558503030315053
+const PS_WORLDS ulong 500
+const PS_BOOT ulong 1000
+const PS_NMAX ulong 10
+const PS_CRUMBS_PER_SEED ulong 185
+const PS_NFRAC ulong 8
+const PS_F_MIN_IDX ulong 3
+const PS_MAX_CRUMBS ulong 4096
+
+const LM_B2 long 1156
+const LM_MC long 180834
+const LM_MEM long 607838516
+const LM_MEMS1 long 356335496
+
+global g_sm ulong 1
+global g_frac f64 8
+
+note Per-crumb arrays for dev seed 7
+global g_pb long 4096
+global g_pc long 4096
+global g_pm long 4096
+global g_ps long 4096
+global g_gmc f64 4096
+global g_gmem f64 4096
+global g_gms1 f64 4096
+global g_cn f64 4096
+
+note Bootstrap buffers
+global g_world ulong 2048
+global g_tv f64 8000
+global g_tvs f64 8000
+global g_tvi f64 8000
+global g_tmem f64 1000
+global g_tms1 f64 1000
+global g_tv0 f64 1000
+global g_sort f64 1000
+
+note Result tables (flattened [NFRAC][PS_NMAX+1] and [PS_NMAX+1])
+global g_pw_shift ulong 88
+global g_pw_scale ulong 88
+global g_pw_infl ulong 88
+global g_pos_shift ulong 88
+global g_memok ulong 11
+global g_ms1ok ulong 11
+global g_fp0 ulong 11
+global g_fn_min ulong 11
+global g_inc_min ulong 11
+global g_width_min f64 11
+global g_f0n f64 11
+global g_ps_c f64 8
+global g_ps_t long 4
+
+fn ps_init_frac to void
+  put g_frac 0 f64 1.0
+  put g_frac 1 f64 0.5
+  put g_frac 2 f64 0.25
+  put g_frac 3 f64 0.1
+  put g_frac 4 f64 0.05
+  put g_frac 5 f64 0.02
+  put g_frac 6 f64 0.01
+  put g_frac 7 f64 0.001
+end
+
+fn sm_next to ulong
+  s = add get g_sm 0 ulong 0x9e3779b97f4a7c15
+  put g_sm 0 s
+  z = mul xor s shr s 30 ulong 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 ulong 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+fn sm_index n ulong to ulong
+  umax = ulong 0xffffffffffffffff
+  lim = sub umax rem add rem umax n 1 n
+  r = sm_next
+  while gt r lim bound 1000
+    r = sm_next
+  end
+  ret rem r n
+end
+
+note Heapsort g_sort[0..n-1] ascending
+fn sort_sift start ulong end_n ulong to void
+  root = start
+  while lt add mul root 2 1 end_n bound 32
+    ch = add mul root 2 1
+    sw = root
+    if lt get g_sort sw get g_sort ch
+      sw = ch
+    end
+    ch2 = add ch 1
+    if lt ch2 end_n
+      if lt get g_sort sw get g_sort ch2
+        sw = ch2
+      end
+    end
+    if eq sw root
+      ret
+    end
+    t = get g_sort root
+    put g_sort root get g_sort sw
+    put g_sort sw t
+    root = sw
+  end
+end
+
+fn sort_boot n ulong to void
+  i = div n 2
+  while gt i 0 bound 1000
+    i = sub i 1
+    sort_sift i n
+  end
+  e = n
+  while gt e 1 bound 1000
+    e = sub e 1
+    t = get g_sort 0
+    put g_sort 0 get g_sort e
+    put g_sort e t
+    sort_sift 0 e
+  end
+end
+
+fn ps_roundtrip to long
+  rc = ty_model_encode
+  if ne rc TY_OK
+    ret rc
+  end
+  ret ty_model_decode get g_mclen 0
+end
+
+fn ps_sharpen to void
+  nr = get g_md_nr 0
+  k = get g_md_k 0
+  hi_q = uint sub TY_QONE sub k 1
+  for i ulong nr bound 4194304
+    ro = mul i 16
+    best = ulong 0
+    bestv = get g_md_rq ro
+    for x ulong k bound 16
+      if gt get g_md_rq add ro x bestv
+        best = x
+        bestv = get g_md_rq add ro x
+      end
+    end
+    for x ulong k bound 16
+      if eq x best
+        put g_md_rq add ro x hi_q
+      else
+        put g_md_rq add ro x uint 1
+      end
+    end
+  end
+end
+
+note Score active model per crumb on seed 7 (sid=6), storing into per_sel (0=pb,1=pc,2=pm,3=ps)
+fn ps_score_crumbs per_sel ulong nc ulong to long
+  so = get g_st_off 6
+  sn = get g_st_n 6
+  c = ulong 0
+  start = ulong 0
+  sum = long 0
+  t = ulong 1
+  while le t sn bound 4194304
+    is_end = eq t sn
+    if not is_end
+      if ne ev_first get g_ev add so t 0
+        is_end = true
+      end
+    end
+    if is_end
+      if ge c nc
+        ret TY_E_RANGE
+      end
+      rc = ty_model_score_range add so start sub t start
+      if ne rc TY_OK
+        ret rc
+      end
+      ub = get g_ty_ret_i 0
+      if eq per_sel 0
+        put g_pb c ub
+      else
+        if eq per_sel 1
+          put g_pc c ub
+        else
+          if eq per_sel 2
+            put g_pm c ub
+          else
+            put g_ps c ub
+          end
+        end
+      end
+      sum = add sum ub
+      c = add c 1
+      start = t
+    end
+    t = add t 1
+  end
+  rc2 = ty_model_score 6
+  if ne rc2 TY_OK
+    ret rc2
+  end
+  whole = get g_ty_ret_i 0
+  if or ne whole sum ne c nc
+    ret TY_E_FORMAT
+  end
+  put g_ty_ret_i 1 whole
+  ret TY_OK
+end
+
+fn ps_sim_boot_fracs b ulong g f64 n f64 f0 f64 to void
+  gn = mul get g_ps_c 0 n
+  dl_mc = get g_ps_c 1
+  for f ulong PS_NFRAC
+    fr = get g_frac f
+    idx = add mul f PS_BOOT b
+    put g_tv idx sub sub g mul sub f64 1.0 fr gn dl_mc
+    put g_tvs idx sub mul fr g dl_mc
+    put g_tvi idx sub add mul fr gn mul f64 2.04 sub g gn dl_mc
+  end
+  put g_tv0 b sub sub g mul sub f64 1.0 f0 gn dl_mc
+end
+
+fn ps_sim_boot b ulong w_n ulong f0 f64 to void
+  g = f64 0.0
+  n = f64 0.0
+  gm = f64 0.0
+  gs = f64 0.0
+  for k ulong w_n bound 2048
+    j = get g_world sm_index w_n
+    g = add g get g_gmc j
+    n = add n get g_cn j
+    gm = add gm get g_gmem j
+    gs = add gs get g_gms1 j
+  end
+  put g_tmem b sub gm get g_ps_c 2
+  put g_tms1 b sub gs get g_ps_c 3
+  ps_sim_boot_fracs b g n f0
+end
+
+fn ps_sim_world ns ulong nc ulong to void
+  w_n = mul PS_CRUMBS_PER_SEED ns
+  for k ulong w_n bound 2048
+    put g_world k sm_index nc
+  end
+  f0 = get g_f0n ns
+  for b ulong PS_BOOT bound 1000
+    ps_sim_boot b w_n f0
+  end
+end
+
+fn ps_score_frac ns ulong f ulong lo ulong hi ulong both_ok bool to void
+  cell = add mul f 11 ns
+  base = mul f PS_BOOT
+  for b ulong PS_BOOT
+    put g_sort b get g_tv add base b
+  end
+  sort_boot PS_BOOT
+  v_lo = get g_sort lo
+  v_hi = get g_sort hi
+  if gt v_lo f64 0.0
+    put g_pos_shift cell add get g_pos_shift cell 1
+    if both_ok
+      put g_pw_shift cell add get g_pw_shift cell 1
+    end
+  end
+  if eq f PS_F_MIN_IDX
+    if lt v_hi f64 0.0
+      put g_fn_min ns add get g_fn_min ns 1
+    end
+    if and le v_lo f64 0.0 ge v_hi f64 0.0
+      put g_inc_min ns add get g_inc_min ns 1
+    end
+    put g_width_min ns add get g_width_min ns sub v_hi v_lo
+  end
+  for b ulong PS_BOOT
+    put g_sort b get g_tvs add base b
+  end
+  sort_boot PS_BOOT
+  if and gt get g_sort lo f64 0.0 both_ok
+    put g_pw_scale cell add get g_pw_scale cell 1
+  end
+  for b ulong PS_BOOT
+    put g_sort b get g_tvi add base b
+  end
+  sort_boot PS_BOOT
+  if and gt get g_sort lo f64 0.0 both_ok
+    put g_pw_infl cell add get g_pw_infl cell 1
+  end
+end
+
+fn ps_score_world ns ulong lo ulong hi ulong to void
+  for b ulong PS_BOOT
+    put g_sort b get g_tmem b
+  end
+  sort_boot PS_BOOT
+  mem_ok = lt get g_sort hi f64 0.0
+  for b ulong PS_BOOT
+    put g_sort b get g_tms1 b
+  end
+  sort_boot PS_BOOT
+  ms1_ok = lt get g_sort hi f64 0.0
+  for b ulong PS_BOOT
+    put g_sort b get g_tv0 b
+  end
+  sort_boot PS_BOOT
+  if gt get g_sort lo f64 0.0
+    put g_fp0 ns add get g_fp0 ns 1
+  end
+  if mem_ok
+    put g_memok ns add get g_memok ns 1
+  end
+  if ms1_ok
+    put g_ms1ok ns add get g_ms1ok ns 1
+  end
+  both_ok = and mem_ok ms1_ok
+  for f ulong PS_NFRAC
+    ps_score_frac ns f lo hi both_ok
+  end
+end
+
+text t_ps_usage "usage: power-simulation MANIFEST ROOT\n"
+text t_ps_h1 "# EXP-001 power simulation (Turing-profile-v1.0). Stand-in: fit dev seeds 1-6, score dev seed 7 per crumb.\n"
+text t_ps_s7c "seed7_crumbs="
+text t_ps_s7e " seed7_events="
+text t_ps_s7b "seed7_bits B2="
+text t_ps_mc " M_candidate="
+text t_ps_mm " M_mem="
+text t_ps_ms1 " M_mem_seed1="
+text t_ps_lm "fit1-6 L(M) bits: B2 recomputed below is not charged; charged (frozen 1-7): B2="
+text t_ps_obs "observed gain per event gbar="
+text t_ps_obs2 " bits/event; data gain on seed 7="
+text t_ps_obs3 " bits; T_seed7(M_candidate)="
+text t_ps_bits " bits\n"
+text t_ps_dg "data gain on seed 7: M_mem="
+text t_ps_dg2 " bits (T="
+text t_ps_dg3 "), M_mem_seed1="
+text t_ps_a3 "A3 check: bootstrap sd of gain/event for one seed = "
+text t_ps_a32 " bits/event; LOSO sd across dev seeds = 0.00316 bits/event (ratio "
+text t_ps_w1 "worlds_per_cell="
+text t_ps_w2 " bootstrap_resamples="
+text t_ps_w3 " crumbs_per_seed="
+text t_ps_w4 " rng=splitmix64 seed=0x"
+text t_ps_w5 " ci_index=["
+text t_ps_mem "memorizer interval below 0 (fraction of worlds) by n: "
+text t_ps_t1 "# power (joint criterion), primary shift model; rows = effect fraction f (gain/event = f*gbar), cols = seeds n\nf\tgain/event\tbreakeven_n"
+text t_ps_t2 "# power (joint criterion), secondary scale model\n"
+text t_ps_t3 "# power (joint criterion), sensitivity: shift model with per-crumb spread inflated x2.04 (A3 ratio)\n"
+text t_ps_t4 "# S6 alone, shift model, by n: false-positive rate at true T = 0 (effect fraction f0 below); at f_min: FAIL rate (hi < 0), INCONCLUSIVE rate (interval contains 0), mean 95% interval width in bits\nn\tf0\tfalse_positive\tfail_at_fmin\tinconclusive_at_fmin\tmean_width_bits_at_fmin\n"
+text t_ps_code "simulation_code: calibration/scripts/power_simulation.c; its SHA-256 is pinned in candidate_manifest.json shared_background_sha256\n"
+text t_ps_min1 "declared_min_effect_f="
+text t_ps_min2 " declared_min_gain_per_event="
+text t_ps_ch1 "CHOSEN_SEEDS_PER_GROUP="
+text t_ps_ch2 " (smallest n with joint power >= 0.95 at f_min, shift model)\n"
+text t_ps_chn "CHOSEN_SEEDS_PER_GROUP=none within n<=10\n"
+text t_ps_rt1 "runtime_seconds="
+text t_ps_rt2 " (wall clock; stderr only, so the pinned output stays byte-deterministic)\n"
+
+fn ps_print_shift_head f ulong nc ulong to void
+  fr = get g_frac f
+  gev = mul fr get g_ps_c 0
+  per_seed = mul div get g_ps_c 4 f64 nc f64 PS_CRUMBS_PER_SEED
+  be = div get g_ps_c 1 mul gev per_seed
+  ob_f64_fixed fr 3
+  ob_b uchar 9
+  ob_f64_fixed gev 6
+  ob_b uchar 9
+  ob_f64_fixed be 2
+end
+
+fn ps_print_shift_row f ulong nc ulong to void
+  ps_print_shift_head f nc
+  ns = ulong 1
+  while le ns PS_NMAX bound 12
+    ob_b uchar 9
+    v = div f64 get g_pw_shift add mul f 11 ns f64 PS_WORLDS
+    ob_f64_fixed v 3
+    ns = add ns 1
+  end
+  ob_b uchar 10
+end
+
+fn ps_print_tables_tail to void
+  ob_txt t_ps_t4
+  ns = ulong 1
+  while le ns PS_NMAX bound 12
+    ob_u64 ns
+    ob_b uchar 9
+    ob_f64_fixed get g_f0n ns 4
+    ob_b uchar 9
+    ob_f64_fixed div f64 get g_fp0 ns f64 PS_WORLDS 3
+    ob_b uchar 9
+    ob_f64_fixed div f64 get g_fn_min ns f64 PS_WORLDS 3
+    ob_b uchar 9
+    ob_f64_fixed div f64 get g_inc_min ns f64 PS_WORLDS 3
+    ob_b uchar 9
+    ob_f64_fixed div get g_width_min ns f64 PS_WORLDS 1
+    ob_b uchar 10
+    ns = add ns 1
+  end
+  ob_txt t_ps_code
+  ob_txt t_ps_min1
+  ob_f64_fixed get g_frac PS_F_MIN_IDX 3
+  ob_txt t_ps_min2
+  ob_f64_fixed mul get g_frac PS_F_MIN_IDX get g_ps_c 0 6
+  ob_txt t_ps_bits
+  chosen = long -1
+  ns = ulong 1
+  while le ns PS_NMAX bound 12
+    if lt chosen 0
+      pw = get g_pw_shift add mul PS_F_MIN_IDX 11 ns
+      if ge mul pw 100 mul 95 PS_WORLDS
+        chosen = long ns
+      end
+    end
+    ns = add ns 1
+  end
+  if gt chosen 0
+    ob_txt t_ps_ch1
+    ob_i64 chosen
+    ob_txt t_ps_ch2
+  else
+    ob_txt t_ps_chn
+  end
+  ob_flush int 1
+end
+
+fn ps_print_tables nc ulong lo ulong hi ulong to void
+  ob_clr
+  ob_txt t_ps_w1
+  ob_u64 PS_WORLDS
+  ob_txt t_ps_w2
+  ob_u64 PS_BOOT
+  ob_txt t_ps_w3
+  ob_u64 PS_CRUMBS_PER_SEED
+  ob_txt t_ps_w4
+  ob_hex16 PS_SEED
+  ob_txt t_ps_w5
+  ob_u64 lo
+  ob_b uchar 44
+  ob_u64 hi
+  ob_b uchar 93
+  ob_b uchar 10
+  ob_txt t_ps_mem
+  ns = ulong 1
+  while le ns PS_NMAX bound 12
+    ob_b uchar 110
+    ob_u64 ns
+    ob_txt t_ps_mm
+    ob_f64_fixed div f64 get g_memok ns f64 PS_WORLDS 3
+    ob_txt t_ps_ms1
+    ob_f64_fixed div f64 get g_ms1ok ns f64 PS_WORLDS 3
+    ob_b uchar 32
+    ns = add ns 1
+  end
+  ob_b uchar 10
+  ob_txt t_ps_t1
+  ns = ulong 1
+  while le ns PS_NMAX bound 12
+    ob_b uchar 9
+    ob_b uchar 110
+    ob_b uchar 61
+    ob_u64 ns
+    ns = add ns 1
+  end
+  ob_b uchar 10
+  ob_flush int 1
+  for f ulong PS_NFRAC
+    ps_print_shift_row f nc
+  end
+  ob_txt t_ps_t2
+  for f ulong PS_NFRAC
+    ob_f64_fixed get g_frac f 3
+    ns = ulong 1
+    while le ns PS_NMAX bound 12
+      ob_b uchar 9
+      ob_f64_fixed div f64 get g_pw_scale add mul f 11 ns f64 PS_WORLDS 3
+      ns = add ns 1
+    end
+    ob_b uchar 10
+  end
+  ob_txt t_ps_t3
+  for f ulong PS_NFRAC
+    ob_f64_fixed get g_frac f 3
+    ns = ulong 1
+    while le ns PS_NMAX bound 12
+      ob_b uchar 9
+      ob_f64_fixed div f64 get g_pw_infl add mul f 11 ns f64 PS_WORLDS 3
+      ns = add ns 1
+    end
+    ob_b uchar 10
+  end
+  ps_print_tables_tail
+end
+
+fn ps_fit_all nc ulong to long
+  for i ulong 6
+    put g_fit_sids i i
+  end
+  if or ne ty_model_fit 6 TY_F_PREV1 TY_OUT_K TY_FIT_MDL_PRUNE TY_OK ne ps_roundtrip TY_OK
+    ret TY_E_IO
+  end
+  if ne ps_score_crumbs 0 nc TY_OK
+    ret TY_E_IO
+  end
+  put g_ps_t 0 get g_ty_ret_i 1
+  if or ne ty_model_fit 6 93 TY_OUT_K TY_FIT_MDL_PRUNE TY_OK ne ps_roundtrip TY_OK
+    ret TY_E_IO
+  end
+  if ne ps_score_crumbs 1 nc TY_OK
+    ret TY_E_IO
+  end
+  put g_ps_t 1 get g_ty_ret_i 1
+  if or ne ty_model_fit 6 TY_F_POS TY_OUT_K TY_FIT_KEEP_ALL TY_OK ne ps_roundtrip TY_OK
+    ret TY_E_IO
+  end
+  if ne ps_score_crumbs 2 nc TY_OK
+    ret TY_E_IO
+  end
+  put g_ps_t 2 get g_ty_ret_i 1
+  put g_fit_sids 0 0
+  if ne ty_model_fit 1 TY_F_POS TY_OUT_K TY_FIT_KEEP_ALL TY_OK
+    ret TY_E_IO
+  end
+  ps_sharpen
+  if or ne ps_roundtrip TY_OK ne ps_score_crumbs 3 nc TY_OK
+    ret TY_E_IO
+  end
+  put g_ps_t 3 get g_ty_ret_i 1
+  ret TY_OK
+end
+
+fn ps_prep_cn to void
+  so = get g_st_off 6
+  sn = get g_st_n 6
+  c = ulong 0
+  start = ulong 0
+  t = ulong 1
+  while le t sn bound 4194304
+    is_end = eq t sn
+    if not is_end
+      if ne ev_first get g_ev add so t 0
+        is_end = true
+      end
+    end
+    if is_end
+      put g_cn c f64 sub t start
+      c = add c 1
+      start = t
+    end
+    t = add t 1
+  end
+end
+
+fn ps_prep_crumbs nc ulong to void
+  ps_prep_cn
+  sum_g = f64 0.0
+  sum_n = f64 0.0
+  sgm = f64 0.0
+  sgs = f64 0.0
+  for i ulong nc bound 4096
+    v = div f64 sub get g_pb i get g_pc i f64 1000000.0
+    put g_gmc i v
+    sum_g = add sum_g v
+    v = div f64 sub get g_pb i get g_pm i f64 1000000.0
+    put g_gmem i v
+    sgm = add sgm v
+    v = div f64 sub get g_pb i get g_ps i f64 1000000.0
+    put g_gms1 i v
+    sgs = add sgs v
+    sum_n = add sum_n get g_cn i
+  end
+  put g_ps_c 0 div sum_g sum_n
+  put g_ps_c 1 f64 sub LM_MC LM_B2
+  put g_ps_c 2 f64 sub LM_MEM LM_B2
+  put g_ps_c 3 f64 sub LM_MEMS1 LM_B2
+  put g_ps_c 4 sum_n
+  put g_ps_c 5 sum_g
+  put g_ps_c 6 sgm
+  put g_ps_c 7 sgs
+end
+
+fn ps_print_head nc ulong to void
+  ob_clr
+  ob_txt t_ps_h1
+  ob_txt t_ps_s7c
+  ob_u64 nc
+  ob_txt t_ps_s7e
+  ob_f64_fixed get g_ps_c 4 0
+  ob_b uchar 10
+  ob_txt t_ps_s7b
+  ob_f64_fixed div f64 get g_ps_t 0 f64 1000000.0 3
+  ob_txt t_ps_mc
+  ob_f64_fixed div f64 get g_ps_t 1 f64 1000000.0 3
+  ob_txt t_ps_mm
+  ob_f64_fixed div f64 get g_ps_t 2 f64 1000000.0 3
+  ob_txt t_ps_ms1
+  ob_f64_fixed div f64 get g_ps_t 3 f64 1000000.0 3
+  ob_b uchar 10
+  ob_txt t_ps_lm
+  ob_i64 LM_B2
+  ob_txt t_ps_mc
+  ob_i64 LM_MC
+  ob_txt t_ps_mm
+  ob_i64 LM_MEM
+  ob_txt t_ps_ms1
+  ob_i64 LM_MEMS1
+  ob_b uchar 10
+  ob_txt t_ps_obs
+  ob_f64_fixed get g_ps_c 0 6
+  ob_txt t_ps_obs2
+  ob_f64_fixed get g_ps_c 5 3
+  ob_txt t_ps_obs3
+  ob_f64_fixed sub get g_ps_c 5 get g_ps_c 1 3
+  ob_txt t_ps_bits
+  ob_txt t_ps_dg
+  ob_f64_fixed get g_ps_c 6 3
+  ob_txt t_ps_dg2
+  ob_f64_fixed sub get g_ps_c 6 get g_ps_c 2 3
+  ob_txt t_ps_dg3
+  ob_f64_fixed get g_ps_c 7 3
+  ob_txt t_ps_dg2
+  ob_f64_fixed sub get g_ps_c 7 get g_ps_c 3 3
+  ob_b uchar 41
+  ob_b uchar 10
+  ob_flush int 1
+end
+
+fn ps_a3_check nc ulong to void
+  put g_sm 0 PS_SEED
+  s1s = f64 0.0
+  s2s = f64 0.0
+  for b ulong 2000
+    g = f64 0.0
+    n = f64 0.0
+    for k ulong nc bound 4096
+      j = sm_index nc
+      g = add g get g_gmc j
+      n = add n get g_cn j
+    end
+    r = div g n
+    s1s = add s1s r
+    s2s = add s2s mul r r
+  end
+  m_a3 = div s1s f64 2000.0
+  sd_a3 = tcd_sqrt sub div s2s f64 2000.0 mul m_a3 m_a3
+  ob_clr
+  ob_txt t_ps_a3
+  ob_f64_fixed sd_a3 5
+  ob_txt t_ps_a32
+  ob_f64_fixed div sd_a3 f64 0.00316 2
+  ob_b uchar 41
+  ob_b uchar 10
+  ob_flush int 1
+end
+
+fn ps_set_f0n ns ulong nc ulong w_n ulong to void
+  avg_ev = div get g_ps_c 4 f64 nc
+  denom = mul mul get g_ps_c 0 avg_ev f64 w_n
+  put g_f0n ns div get g_ps_c 1 denom
+end
+
+fn run_power_sim t0_ns long to int
+  ps_init_frac
+  nc = get g_st_ncr 6
+  if gt nc PS_MAX_CRUMBS
+    ret int 2
+  end
+  if ne ps_fit_all nc TY_OK
+    ret int 2
+  end
+  ps_prep_crumbs nc
+  ps_print_head nc
+  ps_a3_check nc
+  lo = div mul PS_BOOT 25 1000
+  hi = sub sub PS_BOOT 1 lo
+  ns = ulong 1
+  while le ns PS_NMAX bound 12
+    w_n = mul PS_CRUMBS_PER_SEED ns
+    ps_set_f0n ns nc w_n
+    for w ulong PS_WORLDS bound 500
+      ps_sim_world ns nc
+      ps_score_world ns lo hi
+    end
+    ns = add ns 1
+  end
+  ps_print_tables nc lo hi
+  t1_ns = monons
+  dt = div ulong sub t1_ns t0_ns 1000000000
+  ob_clr
+  ob_txt t_ps_rt1
+  ob_u64 dt
+  ob_txt t_ps_rt2
+  ob_flush int 2
+  ret int 0
+end
+
+fn main to int
+  if ne argcnt 3
+    ob_clr
+    ob_txt t_ps_usage
+    ob_flush int 2
+    ret int 2
+  end
+  t0_ns = monons
+  mp = new uchar 1024 0
+  rt = new uchar 1024 0
+  mpl = tcd_read_arg 1 mp 1024
+  rtl = tcd_read_arg 2 rt 1024
+  if or lt mpl 0 lt rtl 0
+    ret int 2
+  end
+  if ne tcd_load_manifest mp ulong mpl rt ulong rtl TY_OK
+    ret int 2
+  end
+  s = ulong 1
+  while le s TCD_NDEV bound 8
+    if ne tcd_load_seed s TY_OK
+      ret int 2
+    end
+    s = add s 1
+  end
+  ret run_power_sim t0_ns
+end
