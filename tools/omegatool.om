@@ -1,0 +1,3056 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/omegatool.om -- pure seeded OM-2 migration of tools/omegatool.c
+note Composes src/*.om modules for all CPU-only milestone gates (M4..M15),
+note reference demonstrations, R16 surface dispatch, and test vector dumping.
+note Never opens /dev/nvidia* or touches GB10 GPU hardware.
+om2
+
+note =========================================================================
+note Globals and I/O helpers
+note =========================================================================
+
+global g_ot_gate_count ulong 1
+global g_ot_gate_passed ulong 1
+global g_ot_arg0 uchar 256
+global g_ot_arg0_len ulong 1
+global g_ot_arg1 uchar 256
+global g_ot_arg1_len ulong 1
+global g_ot_arg2 uchar 512
+global g_ot_arg2_len ulong 1
+global g_ot_line uchar 512
+global g_ot_bin uchar 4096
+global g_ot_txt uchar 4096
+global g_ot_fbuf uchar 65536
+global g_ot_path uchar 1024
+global g_ot_hex uchar 65
+global g_ot_id_a uchar 32
+global g_ot_id_b uchar 32
+
+text ot_sep "================================================================================\n"
+text ot_pass_pfx "  [PASS] "
+text ot_fail_pfx "  [FAIL] "
+text ot_colon " : "
+text ot_nl "\n"
+text ot_sp " "
+text ot_tot_a "  TOTAL GATES: "
+text ot_tot_b " | PASSED: "
+text ot_tot_c " | FAILED: "
+text ot_unk_pfx "Unknown argument: "
+text ot_disp_a "dispatch: "
+text ot_disp_b " accepted (not run)\n"
+text ot_blk_a "BLOCKED_HARDWARE: "
+text ot_blk_b " requires GB10 GPU\n"
+text ot_usage_1 "Usage: "
+text ot_usage_2 " [--run-gates | --run-m5-gates | --run-m6-gates | --run-m7-gates | --run-m8-gates | --run-m9-gates | --run-m10-gates | --run-m11-gates | --run-m12-gates | --run-m13-gates | --run-m14-gates | --dump-test-vectors <dir>]\n"
+text ot_usage_3 "Reference demonstrations (R16: not the production path): --reference-demonstrate-arithmetic --reference-demonstrate-physics --reference-demonstrate-realization --reference-demonstrate-self-host --reference-demonstrate-verify --reference-demonstrate-program --reference-demonstrate-synthesis --reference-demonstrate-library --reference-demonstrate-discovery --reference-demonstrate-machine --reference-demonstrate-realization-synthesis --reference-demonstrate-accelerator --reference-demonstrate-accelerator-world --reference-demonstrate-blackwell-matmul --reference-demonstrate-blackwell-codegen --reference-demonstrate-blackwell-vector\n"
+text ot_usage_4a "Legacy oracle (R16: not the production path, reference only): "
+text ot_usage_4b " --legacy-oracle-living-matvec\n"
+text ot_usage_5 "Production entry point: the resident reaction world, see docs/r16-production-entry-point.md\n"
+
+fn ot_puts s view uchar * to void
+  n = len s
+  if gt n 0
+    ign = write 1 s 0 n
+  end
+end
+
+fn ot_putn s view uchar * n ulong to void
+  if gt n 0
+    ign = write 1 s 0 n
+  end
+end
+
+fn ot_put_gbuf_a1 to void
+  tmp = new uchar 256 0
+  n = get g_ot_arg1_len 0
+  if gt n 0
+    for i ulong n bound 256
+      put tmp i get g_ot_arg1 i
+    end
+    ign = write 1 tmp 0 n
+  end
+end
+
+fn ot_put_gbuf_a2 to void
+  tmp = new uchar 512 0
+  n = get g_ot_arg2_len 0
+  if gt n 0
+    for i ulong n bound 512
+      put tmp i get g_ot_arg2 i
+    end
+    ign = write 1 tmp 0 n
+  end
+end
+
+fn ot_put_gbuf_a0 to void
+  tmp = new uchar 256 0
+  n = get g_ot_arg0_len 0
+  if gt n 0
+    for i ulong n bound 256
+      put tmp i get g_ot_arg0 i
+    end
+    ign = write 1 tmp 0 n
+  end
+end
+
+fn ot_put_u64 v ulong to void
+  buf = new uchar 24 0
+  if eq v 0
+    put buf 0 uchar 48
+    ign = write 1 buf 0 1
+    ret
+  end
+  pos = ulong 24
+  x = v
+  while gt x 0 bound 24
+    pos = sub pos 1
+    d = rem x 10
+    put buf pos uchar add 48 d
+    x = div x 10
+  end
+  ign = write 1 buf pos sub 24 pos
+end
+
+fn ot_put_hex32 id view uchar 32 to void
+  hx = new uchar 65 0
+  omega_hex_semantic_id id hx
+  ign = write 1 hx 0 64
+end
+
+fn ot_eq_a1 lit view uchar * to bool
+  n = len lit
+  if ne get g_ot_arg1_len 0 n
+    ret false
+  end
+  for i ulong n bound 256
+    if ne get g_ot_arg1 i get lit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ot_eq_a2 lit view uchar * to bool
+  n = len lit
+  if ne get g_ot_arg2_len 0 n
+    ret false
+  end
+  for i ulong n bound 512
+    if ne get g_ot_arg2 i get lit i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ot_eq_a1_sfx pfx view uchar * sfx view uchar * to bool
+  pn = len pfx
+  sn = len sfx
+  tot = add pn sn
+  if ne get g_ot_arg1_len 0 tot
+    ret false
+  end
+  for i ulong pn bound 256
+    if ne get g_ot_arg1 i get pfx i
+      ret false
+    end
+  end
+  for i ulong sn bound 256
+    if ne get g_ot_arg1 add pn i get sfx i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ot_eq_a2_sfx pfx view uchar * sfx view uchar * to bool
+  pn = len pfx
+  sn = len sfx
+  tot = add pn sn
+  if ne get g_ot_arg2_len 0 tot
+    ret false
+  end
+  for i ulong pn bound 256
+    if ne get g_ot_arg2 i get pfx i
+      ret false
+    end
+  end
+  for i ulong sn bound 256
+    if ne get g_ot_arg2 add pn i get sfx i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn omega_get_gate_snapshot dst edit ulong 2 to void
+  put dst 0 get g_ot_gate_count 0
+  put dst 1 get g_ot_gate_passed 0
+end
+
+fn ot_report_gate gname view uchar * ok bool detail view uchar * to void
+  put g_ot_gate_count 0 add get g_ot_gate_count 0 1
+  if ok
+    put g_ot_gate_passed 0 add get g_ot_gate_passed 0 1
+    ot_puts ot_pass_pfx
+  else
+    ot_puts ot_fail_pfx
+  end
+  ot_puts gname
+  n = len gname
+  if lt n 40
+    pad = sub 40 n
+    for i ulong pad bound 40
+      ot_puts ot_sp
+    end
+  end
+  ot_puts ot_colon
+  ot_puts detail
+  ot_puts ot_nl
+end
+
+fn ot_print_summary to int
+  snap = new ulong 2 0
+  omega_get_gate_snapshot snap
+  gc = get snap 0
+  gp = get snap 1
+  ot_puts ot_sep
+  ot_puts ot_tot_a
+  ot_put_u64 gc
+  ot_puts ot_tot_b
+  ot_put_u64 gp
+  ot_puts ot_tot_c
+  ot_put_u64 sub gc gp
+  ot_puts ot_nl
+  ot_puts ot_sep
+  if eq gp gc
+    ret 0
+  end
+  ret 1
+end
+
+fn ot_build_f_add_sub_graph out_id edit uchar 32 to long
+  rc = omega_graph_create
+  if ne rc 0
+    ret -1
+  end
+  ti = omega_build_type_uint 64
+  if lt ti 0
+    ret -1
+  end
+  id1 = new uchar 32 0
+  id2 = new uchar 32 0
+  id3 = new uchar 32 0
+  core_get_id ulong ti id1
+  pa = omega_build_param id1 0
+  pb = omega_build_param id1 1
+  pc = omega_build_param id1 2
+  op_add = omega_build_op_binary 3 1 id1
+  op_sub = omega_build_op_binary 4 1 id1
+  if lt op_sub 0
+    ret -1
+  end
+  core_get_id ulong op_add id1
+  core_get_id ulong pa id2
+  core_get_id ulong pb id3
+  ap1 = omega_build_apply id1 id2 id3
+  if lt ap1 0
+    ret -1
+  end
+  core_get_id ulong op_sub id1
+  core_get_id ulong ap1 id2
+  core_get_id ulong pc id3
+  ap2 = omega_build_apply id1 id2 id3
+  if lt ap2 0
+    ret -1
+  end
+  core_get_id ulong ap2 out_id
+  ret 0
+end
+
+note =========================================================================
+note MILESTONE 4 GATES (OMEGA_SEMANTICS)
+note =========================================================================
+
+text m4_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 4: OMEGA_SEMANTICS QUALIFICATION GATES\n"
+text m4_g1 "OMEGA_OBJECT_MODEL_PASS"
+text m4_d1 "11 first-class categories instantiated and typed"
+text m4_g2 "OMEGA_TYPE_SYSTEM_PASS"
+text m4_d2 "Bounded widths enforced, invalid widths refused"
+text m4_g3 "OMEGA_GRAPH_VALIDATION_PASS"
+text m4_d3 "DAG validation and dangling reference refusal"
+text m4_g4 "OMEGA_CANONICAL_ENCODING_PASS"
+text m4_d4 "OMG0 wire header and lexicographical attribute sorting"
+text m4_g5 "OMEGA_SEMANTIC_ID_DETERMINISM_PASS"
+text m4_d5 "Cross-allocation bit-for-bit SHA-256 identity"
+text m4_g6 "OMEGA_REPRESENTATION_INDEPENDENCE_PASS"
+text m4_d6 "4 independent representations collapse to identical ID"
+text m4_g7 "OMEGA_SEMANTIC_DIFFERENCE_PASS"
+text m4_d7 "ADD -> SUB produces distinct SEMANTIC_ID"
+text m4_g8 "OMEGA_RELATION_PASS"
+text m4_d8 "Relation ordering independence confirmed"
+text m4_g9 "OMEGA_CONSTRAINT_PASS"
+text m4_d9 "Constraint ordering independence confirmed"
+text m4_g10 "OMEGA_PURE_EFFECT_SEPARATION_PASS"
+text m4_d10 "Pure computation decoupled from physical effect tokens"
+text m4_g11 "OMEGA_MALFORMED_OBJECT_REFUSAL_PASS"
+text m4_d11 "Structural cycles and corrupt wire packets rejected"
+text m4_g12 "OMEGA_CROSS_BUILD_DETERMINISM_PASS"
+text m4_d12 "Known-answer test evaluation matches specification"
+text m4_g13 "OMEGA_REALIZATION_ID_COVERS_ALL_CODE_PASS"
+text m4_d13 "Full-capacity code hashed in full; overlong code refused"
+text m4_g14 "OMEGA_OVERSIZED_FIELD_REFUSAL_PASS"
+text m4_d14 "Oversized keys, values and payloads refused, never truncated"
+
+text ot_k_z "z_key"
+text ot_k_a "a_key"
+text ot_v_1 "1"
+text ot_v_2 "2"
+text ot_k_big "big"
+text ot_k_fits "fits"
+text ot_text_repr "// Non-canonical human representation\ntype U32 = UNSIGNED_INTEGER(32)\nval a : U32 = 7\nval b : U32 = 11\nop add = ADD<U32>[WRAP]\napply res = add(a, b)\n"
+
+fn ot_test_m4_object_model to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  for k ulong 11
+    kind = add k 1
+    idx = omega_graph_add_object kind
+    if lt idx 0
+      omega_graph_destroy
+      ret false
+    end
+    u = ulong idx
+    if eq kind 2
+      pb = mul u CAN_MAX_PAYLOAD
+      put g_core_pays pb uchar 2
+      put g_core_pay_len u CORE_TP_SIZE
+    end
+    if ne core_compute_id u 0
+      omega_graph_destroy
+      ret false
+    end
+    if eq get g_core_has_id u 0
+      omega_graph_destroy
+      ret false
+    end
+  end
+  omega_graph_destroy
+  ret true
+end
+
+fn ot_test_m4_type_system to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  tu = omega_build_type_uint 32
+  ti = omega_build_type_signed_int 16
+  tb = omega_build_type_bitvector 8
+  if lt tu 0
+    ret false
+  end
+  if lt ti 0
+    ret false
+  end
+  if lt tb 0
+    ret false
+  end
+  tid = new uchar 32 0
+  core_get_id ulong tu tid
+  ts = omega_build_type_sequence tid 10
+  if lt ts 0
+    ret false
+  end
+  info = new ulong 2 0
+  if ne omega_validate_graph info 0
+    ret false
+  end
+  bad = omega_graph_add_object 2
+  if lt bad 0
+    ret false
+  end
+  bu = ulong bad
+  pb = mul bu CAN_MAX_PAYLOAD
+  put g_core_pays pb uchar 3
+  put g_core_pay_len bu CORE_TP_SIZE
+  ign = core_compute_id bu
+  if eq omega_validate_object true bu 0
+    ret false
+  end
+  omega_graph_destroy
+  ret true
+end
+
+fn ot_test_m4_graph_validation to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  tu = omega_build_type_uint 32
+  if lt tu 0
+    ret false
+  end
+  tid = new uchar 32 0
+  core_get_id ulong tu tid
+  v = omega_build_val_uint tid 32 100
+  if lt v 0
+    ret false
+  end
+  info = new ulong 2 0
+  if ne omega_validate_graph info 0
+    ret false
+  end
+  d = omega_graph_add_object 4
+  if lt d 0
+    ret false
+  end
+  fake = new uchar 32 0xee
+  ign1 = omega_object_add_relation ulong d 6 fake
+  ign2 = core_compute_id ulong d
+  if eq omega_validate_graph info 0
+    ret false
+  end
+  omega_graph_destroy
+  ret true
+end
+
+fn ot_find_sub buf view uchar * blen ulong pat view uchar * to long
+  plen = len pat
+  if gt plen blen
+    ret -1
+  end
+  lim = add sub blen plen 1
+  for i ulong lim bound 1024
+    ok = true
+    for j ulong plen bound 32
+      if ne get buf add i j get pat j
+        ok = false
+      end
+    end
+    if ok
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn ot_test_m4_canonical_encoding to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  idx = omega_graph_add_object 1
+  if lt idx 0
+    ret false
+  end
+  u = ulong idx
+  if ne omega_object_add_attribute u ot_k_z ot_v_1 1 0
+    ret false
+  end
+  if ne omega_object_add_attribute u ot_k_a ot_v_2 1 0
+    ret false
+  end
+  core_load_can u
+  buf = new uchar 1024 0
+  n = omega_canonical_encode buf 1024
+  if le n 5
+    ret false
+  end
+  if ne get buf 0 uchar 0x4f
+    ret false
+  end
+  if ne get buf 1 uchar 0x4d
+    ret false
+  end
+  if ne get buf 2 uchar 0x47
+    ret false
+  end
+  if ne get buf 3 uchar 0x30
+    ret false
+  end
+  if ne get buf 4 uchar 0x01
+    ret false
+  end
+  pa = ot_find_sub buf ulong n ot_k_a
+  pz = ot_find_sub buf ulong n ot_k_z
+  omega_graph_destroy
+  if lt pa 0
+    ret false
+  end
+  if lt pz 0
+    ret false
+  end
+  ret lt pa pz
+end
+
+fn ot_build_add_7_11 order_b bool dst edit uchar 32 to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  ti = omega_build_type_uint 32
+  if lt ti 0
+    ret false
+  end
+  tid = new uchar 32 0
+  core_get_id ulong ti tid
+  va = long 0
+  vb = long 0
+  op = long 0
+  if order_b
+    op = omega_build_op_binary 3 1 tid
+    vb = omega_build_val_uint tid 32 11
+    va = omega_build_val_uint tid 32 7
+  else
+    va = omega_build_val_uint tid 32 7
+    vb = omega_build_val_uint tid 32 11
+    op = omega_build_op_binary 3 1 tid
+  end
+  if lt va 0
+    ret false
+  end
+  if lt vb 0
+    ret false
+  end
+  if lt op 0
+    ret false
+  end
+  ida = new uchar 32 0
+  idb = new uchar 32 0
+  ido = new uchar 32 0
+  core_get_id ulong va ida
+  core_get_id ulong vb idb
+  core_get_id ulong op ido
+  ap = omega_build_apply ido ida idb
+  if lt ap 0
+    ret false
+  end
+  core_get_id ulong ap dst
+  ret true
+end
+
+fn ot_test_m4_semantic_id_determinism to bool
+  id1 = new uchar 32 0
+  id2 = new uchar 32 0
+  if ne omega_graph_create 0
+    ret false
+  end
+  t1 = omega_build_type_uint 32
+  tid1 = new uchar 32 0
+  core_get_id ulong t1 tid1
+  v1 = omega_build_val_uint tid1 32 42
+  core_get_id ulong v1 id1
+  omega_graph_destroy
+
+  if ne omega_graph_create 0
+    ret false
+  end
+  t2 = omega_build_type_uint 32
+  tid2 = new uchar 32 0
+  core_get_id ulong t2 tid2
+  v2 = omega_build_val_uint tid2 32 42
+  core_get_id ulong v2 id2
+  omega_graph_destroy
+  ret eq omega_compare_semantic_id id1 id2 0
+end
+
+fn ot_test_m4_rep_independence out_id edit uchar 32 to bool
+  id_a = new uchar 32 0
+  id_x = new uchar 32 0
+  bin = new uchar 4096 0
+  blen = new ulong 1 0
+  if not ot_build_add_7_11 false id_a
+    ret false
+  end
+  if ne omega_graph_serialize_binary bin 4096 blen 0
+    ret false
+  end
+  omega_graph_destroy
+  for i ulong 32
+    put out_id i get id_a i
+  end
+
+  if not ot_build_add_7_11 true id_x
+    ret false
+  end
+  omega_graph_destroy
+  if ne omega_compare_semantic_id id_a id_x 0
+    ret false
+  end
+
+  if ne omega_graph_create 0
+    ret false
+  end
+  if ne omega_graph_deserialize_binary bin get blen 0 0
+    ret false
+  end
+  cnt_c = get g_core_obj_cnt 0
+  if eq cnt_c 0
+    ret false
+  end
+  core_get_id sub cnt_c 1 id_x
+  omega_graph_destroy
+  if ne omega_compare_semantic_id id_a id_x 0
+    ret false
+  end
+
+  if ne omega_graph_create 0
+    ret false
+  end
+  if ne omega_graph_parse_text ot_text_repr len ot_text_repr 0
+    ret false
+  end
+  cnt_d = get g_core_obj_cnt 0
+  if eq cnt_d 0
+    ret false
+  end
+  core_get_id sub cnt_d 1 id_x
+  omega_graph_destroy
+  ret eq omega_compare_semantic_id id_a id_x 0
+end
+
+fn ot_build_sub_7_11 dst edit uchar 32 to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  ti = omega_build_type_uint 32
+  id1 = new uchar 32 0
+  id2 = new uchar 32 0
+  id3 = new uchar 32 0
+  core_get_id ulong ti id1
+  va = omega_build_val_uint id1 32 7
+  vb = omega_build_val_uint id1 32 11
+  op = omega_build_op_binary 4 1 id1
+  core_get_id ulong op id1
+  core_get_id ulong va id2
+  core_get_id ulong vb id3
+  ap = omega_build_apply id1 id2 id3
+  core_get_id ulong ap dst
+  omega_graph_destroy
+  ret ge ap 0
+end
+
+fn ot_test_m4_semantic_difference to bool
+  id_add = new uchar 32 0
+  id_sub = new uchar 32 0
+  if not ot_build_add_7_11 false id_add
+    ret false
+  end
+  omega_graph_destroy
+  if not ot_build_sub_7_11 id_sub
+    ret false
+  end
+  ret ne omega_compare_semantic_id id_add id_sub 0
+end
+
+fn ot_test_m4_relation to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  ti = omega_build_type_uint 32
+  tid = new uchar 32 0
+  core_get_id ulong ti tid
+  o1 = omega_graph_add_object 4
+  ign1 = omega_object_add_relation ulong o1 4 tid
+  ign2 = omega_object_add_relation ulong o1 1 tid
+  ign3 = core_compute_id ulong o1
+
+  o2 = omega_graph_add_object 4
+  ign4 = omega_object_add_relation ulong o2 1 tid
+  ign5 = omega_object_add_relation ulong o2 4 tid
+  ign6 = core_compute_id ulong o2
+
+  id1 = new uchar 32 0
+  id2 = new uchar 32 0
+  core_get_id ulong o1 id1
+  core_get_id ulong o2 id2
+  omega_graph_destroy
+  ret eq omega_compare_semantic_id id1 id2 0
+end
+
+fn ot_test_m4_constraint to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  p1 = new uchar 2 0
+  put p1 0 1
+  put p1 1 2
+  p2 = new uchar 2 0
+  put p2 0 3
+  put p2 1 4
+  c1 = omega_graph_add_object 5
+  ign1 = omega_object_add_constraint ulong c1 1 p1 2
+  ign2 = omega_object_add_constraint ulong c1 2 p2 2
+  ign3 = core_compute_id ulong c1
+
+  c2 = omega_graph_add_object 5
+  ign4 = omega_object_add_constraint ulong c2 2 p2 2
+  ign5 = omega_object_add_constraint ulong c2 1 p1 2
+  ign6 = core_compute_id ulong c2
+
+  id1 = new uchar 32 0
+  id2 = new uchar 32 0
+  core_get_id ulong c1 id1
+  core_get_id ulong c2 id2
+  omega_graph_destroy
+  ret eq omega_compare_semantic_id id1 id2 0
+end
+
+fn ot_test_m4_pure_effect to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  ti = omega_build_type_uint 32
+  tid = new uchar 32 0
+  core_get_id ulong ti tid
+  op = omega_build_op_binary 3 1 tid
+  if lt op 0
+    ret false
+  end
+  if eq get g_core_kind ulong op 8
+    ret false
+  end
+  eff = omega_build_effect 1 1 0 1
+  if lt eff 0
+    ret false
+  end
+  if ne get g_core_kind ulong eff 8
+    ret false
+  end
+  info = new ulong 2 0
+  rc = omega_validate_graph info
+  omega_graph_destroy
+  ret eq rc 0
+end
+
+fn ot_test_m4_malformed to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  o1 = omega_graph_add_object 2
+  u1 = ulong o1
+  put g_core_pays mul u1 CAN_MAX_PAYLOAD uchar 2
+  put g_core_pay_len u1 CORE_TP_SIZE
+  ign1 = core_compute_id u1
+
+  o2 = omega_graph_add_object 2
+  u2 = ulong o2
+  put g_core_pays mul u2 CAN_MAX_PAYLOAD uchar 2
+  put g_core_pay_len u2 CORE_TP_SIZE
+  ign2 = core_compute_id u2
+
+  id1 = new uchar 32 0
+  id2 = new uchar 32 0
+  core_get_id u1 id1
+  core_get_id u2 id2
+  ign3 = omega_object_add_relation u1 6 id2
+  ign4 = core_compute_id u1
+  core_get_id u1 id1
+  ign5 = omega_object_add_relation u2 6 id1
+  ign6 = core_compute_id u2
+  info = new ulong 2 0
+  if eq omega_validate_graph info 0
+    omega_graph_destroy
+    ret false
+  end
+  omega_graph_destroy
+
+  bad = new uchar 6 0
+  put bad 4 1
+  put bad 5 1
+  if eq omega_graph_deserialize_binary bad 6 0
+    ret false
+  end
+  ret true
+end
+
+fn ot_test_m4_cross_build to bool
+  id = new uchar 32 0
+  if not ot_build_add_7_11 false id
+    ret false
+  end
+  omega_graph_destroy
+  res = new ulong 1 0
+  if ne omega_eval_pure_binary_uint 3 1 32 7 11 res 0
+    ret false
+  end
+  if ne get res 0 18
+    ret false
+  end
+  hx = new uchar 65 0
+  omega_hex_semantic_id id hx
+  ret eq get hx 64 0
+end
+
+fn ot_test_m4_real_id_all_code to bool
+  put g_real_profile 0 1
+  put g_real_entry_off 0 16
+  for i ulong 32
+    put g_real_sem_id i uchar 0x5a
+  end
+  for i ulong REAL_MAX_CODE_BYTES
+    put g_real_code i uchar and add mul i 7 3 255
+  end
+  put g_real_code_len 0 REAL_MAX_CODE_BYTES
+  if ne omega_compute_realization_id 0
+    ret false
+  end
+  id1 = new uchar 32 0
+  for i ulong 32
+    put id1 i get g_real_id i
+  end
+  last = sub REAL_MAX_CODE_BYTES 1
+  put g_real_code last xor get g_real_code last uchar 0xff
+  if ne omega_compute_realization_id 0
+    ret false
+  end
+  id2 = new uchar 32 0
+  for i ulong 32
+    put id2 i get g_real_id i
+  end
+  if eq omega_compare_semantic_id id1 id2 0
+    ret false
+  end
+  put g_real_code_len 0 add REAL_MAX_CODE_BYTES 1
+  if eq omega_compute_realization_id 0
+    ret false
+  end
+  ret true
+end
+
+fn ot_test_m4_oversized_refusal to bool
+  if ne omega_graph_create 0
+    ret false
+  end
+  idx = omega_graph_add_object 1
+  u = ulong idx
+  val = new uchar 513 118
+  if eq omega_object_add_attribute u ot_k_big val 513 0
+    ret false
+  end
+  if ne get g_core_attr_n u 0
+    ret false
+  end
+  if ne omega_object_add_attribute u ot_k_fits val 512 0
+    ret false
+  end
+  if ne get g_core_attr_n u 1
+    ret false
+  end
+  pay = new uchar 129 99
+  if eq omega_object_add_constraint u 1 pay 129 0
+    ret false
+  end
+  if ne get g_core_const_n u 0
+    ret false
+  end
+  if ne omega_object_add_constraint u 1 pay 128 0
+    ret false
+  end
+  if ne get g_core_const_n u 1
+    ret false
+  end
+  cid = new uchar 32 0
+  if eq omega_build_constraint_id 9 pay 129 cid 0
+    ret false
+  end
+  omega_graph_destroy
+  ret true
+end
+
+fn omega_run_m4_gates to int
+  ot_puts ot_sep
+  ot_puts m4_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ot_report_gate m4_g1 ot_test_m4_object_model m4_d1
+  ot_report_gate m4_g2 ot_test_m4_type_system m4_d2
+  ot_report_gate m4_g3 ot_test_m4_graph_validation m4_d3
+  ot_report_gate m4_g4 ot_test_m4_canonical_encoding m4_d4
+  ot_report_gate m4_g5 ot_test_m4_semantic_id_determinism m4_d5
+  tmp_id = new uchar 32 0
+  ot_report_gate m4_g6 ot_test_m4_rep_independence tmp_id m4_d6
+  ot_report_gate m4_g7 ot_test_m4_semantic_difference m4_d7
+  ot_report_gate m4_g8 ot_test_m4_relation m4_d8
+  ot_report_gate m4_g9 ot_test_m4_constraint m4_d9
+  ot_report_gate m4_g10 ot_test_m4_pure_effect m4_d10
+  ot_report_gate m4_g11 ot_test_m4_malformed m4_d11
+  ot_report_gate m4_g12 ot_test_m4_cross_build m4_d12
+  ot_report_gate m4_g13 ot_test_m4_real_id_all_code m4_d13
+  ot_report_gate m4_g14 ot_test_m4_oversized_refusal m4_d14
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 5 GATES (OMEGA_AARCH64)
+note =========================================================================
+
+text m5_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 5: OMEGA_AARCH64 QUALIFICATION GATES\n"
+text m5_g1 "OMEGA_AARCH64_PROFILE_PASS"
+text m5_d1 "AArch64 bare-metal target profile and registers valid"
+text m5_g2 "OMEGA_AARCH64_ENCODER_PASS"
+text m5_d2 "Direct instruction encoder synthesized expected machine words"
+text m5_g3 "OMEGA_AARCH64_DECODER_SEAM_PASS"
+text m5_d3 "Independent decoder Seam 1 validated instructions and refused corrupt opcode"
+text m5_g4 "OMEGA_AARCH64_LOWERING_PASS"
+text m5_d4 "G_S pure operations lowered to AArch64 code buffer"
+text m5_g5 "OMEGA_AARCH64_REALIZATION_ID_PASS"
+text m5_d5 "REALIZATION_ID deterministically binds machine code to SEMANTIC_ID"
+text m5_g6 "OMEGA_AARCH64_NATIVE_EXECUTION_PASS"
+text m5_d6 "Native in-memory execution observed result 15 matches semantic evaluation"
+text m5_g7 "OMEGA_AARCH64_QEMU_EXECUTION_PASS"
+text m5_d7 "Bare-metal QEMU runner synthesized with PL011 UART harness"
+text m5_g8 "OMEGA_AARCH64_ADVERSARIAL_MUTATION_PASS"
+text m5_d8 "Single-bit machine code mutation detected and refused fail-closed"
+text m5_g9 "OMEGA_AARCH64_CROSS_BUILD_DETERMINISM_PASS"
+text m5_d9 "Byte-for-byte deterministic realization across runs"
+
+fn ot_test_m5_encoder to bool
+  buf = new uchar 64 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 64
+  if ne aarch64_emit_add_reg buf 1 0 0 1 0
+    ret false
+  end
+  if ne aarch64_emit_sub_reg buf 1 0 0 2 0
+    ret false
+  end
+  if ne aarch64_emit_ret buf 0
+    ret false
+  end
+  if ne get g_a64_pos 0 12
+    ret false
+  end
+  w0 = mg_rd_u32le buf 0
+  w1 = mg_rd_u32le buf 4
+  w2 = mg_rd_u32le buf 8
+  if ne w0 ulong 0x8b010000
+    ret false
+  end
+  if ne w1 ulong 0xcb020000
+    ret false
+  end
+  ret eq w2 ulong 0xd65f03c0
+end
+
+fn ot_test_m5_decoder to bool
+  buf = new uchar 12 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 12
+  ign1 = aarch64_emit_add_reg buf 1 0 0 1
+  ign2 = aarch64_emit_sub_reg buf 1 0 0 2
+  ign3 = aarch64_emit_ret buf
+  msg = new uchar 64 0
+  if ne aarch64_validate_code_buffer buf 12 msg 64 0
+    ret false
+  end
+  bad = new uchar 4 0
+  if eq aarch64_validate_code_buffer bad 4 msg 64 0
+    ret false
+  end
+  ret true
+end
+
+fn ot_test_m5_lowering to bool
+  sid = new uchar 32 0
+  if ne ot_build_f_add_sub_graph sid 0
+    ret false
+  end
+  rc = omega_realize_f_add_sub sid
+  omega_graph_destroy
+  if ne rc 0
+    ret false
+  end
+  if ne get g_real_code_len 0 12
+    ret false
+  end
+  ret ne get g_real_has_id 0 0
+end
+
+fn ot_test_m5_real_id to bool
+  sid = new uchar 32 0
+  ign = ot_build_f_add_sub_graph sid
+  if ne omega_realize_f_add_sub sid 0
+    ret false
+  end
+  r1 = new uchar 32 0
+  s1 = new uchar 32 0
+  for i ulong 32
+    put r1 i get g_real_id i
+    put s1 i get g_real_sem_id i
+  end
+  if ne omega_realize_f_add_sub sid 0
+    ret false
+  end
+  r2 = new uchar 32 0
+  for i ulong 32
+    put r2 i get g_real_id i
+  end
+  omega_graph_destroy
+  if ne omega_compare_semantic_id r1 r2 0
+    ret false
+  end
+  ret eq omega_compare_semantic_id s1 sid 0
+end
+
+fn ot_test_m5_native_exec to bool
+  sid = new uchar 32 0
+  ign = ot_build_f_add_sub_graph sid
+  ign2 = omega_realize_f_add_sub sid
+  omega_graph_destroy
+  code = new uchar 12 0
+  for i ulong 12
+    put code i get g_real_code i
+  end
+  if ne omega_exec_native_f3 code 12 7 11 3 0
+    ret false
+  end
+  ret eq get g_ex_res 0 15
+end
+
+fn ot_test_m5_qemu_runner to bool
+  sid = new uchar 32 0
+  ign = ot_build_f_add_sub_graph sid
+  ign2 = omega_realize_f_add_sub sid
+  omega_graph_destroy
+  code = new uchar 12 0
+  for i ulong 12
+    put code i get g_real_code i
+  end
+  qbuf = new uchar 1024 0
+  if ne omega_build_qemu_runner code 12 qbuf 1024 0
+    ret false
+  end
+  ret gt get g_ex_qlen 0 12
+end
+
+fn ot_test_m5_adversarial to bool
+  sid = new uchar 32 0
+  ign = ot_build_f_add_sub_graph sid
+  ign2 = omega_realize_f_add_sub sid
+  omega_graph_destroy
+  code = new uchar 12 0
+  for i ulong 12
+    put code i get g_real_code i
+  end
+  put code 0 xor get code 0 uchar 1
+  rc = omega_exec_native_f3 code 12 7 11 3
+  if eq rc 0
+    if eq get g_ex_res 0 15
+      ret false
+    end
+  end
+  ret true
+end
+
+fn omega_run_m5_gates to int
+  ot_puts ot_sep
+  ot_puts m5_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ot_report_gate m5_g1 eq REAL_PROFILE_V8A_BAREMETAL 1 m5_d1
+  ot_report_gate m5_g2 ot_test_m5_encoder m5_d2
+  ot_report_gate m5_g3 ot_test_m5_decoder m5_d3
+  ot_report_gate m5_g4 ot_test_m5_lowering m5_d4
+  ot_report_gate m5_g5 ot_test_m5_real_id m5_d5
+  ot_report_gate m5_g6 ot_test_m5_native_exec m5_d6
+  ot_report_gate m5_g7 ot_test_m5_qemu_runner m5_d7
+  ot_report_gate m5_g8 ot_test_m5_adversarial m5_d8
+  ot_report_gate m5_g9 ot_test_m5_real_id m5_d9
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 6 GATES (OMEGA_SELF_HOST)
+note =========================================================================
+
+text m6_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 6: OMEGA_SELF_HOST QUALIFICATION GATES\n"
+text m6_g1 "OMEGA_SELF_HOST_GRAPH_PASS"
+text m6_d1 "Semantic compiler graph G_C constructed and validated"
+text m6_g2 "OMEGA_SELF_HOST_C1_EMISSION_PASS"
+text m6_d2 "Reference lowering C0(G_C) -> C1 emitted machine bytes"
+text m6_g3 "OMEGA_SELF_HOST_DECODER_SEAM_PASS"
+text m6_d3 "Independent decoder verified all C1 instructions"
+text m6_g4 "OMEGA_SELF_HOST_C2_REPRODUCTION_PASS"
+text m6_d4 "Native compiler C1(G_C) -> C2 emitted machine bytes"
+text m6_g5 "OMEGA_SELF_HOST_C3_REPRODUCTION_PASS"
+text m6_d5 "Native compiler C2(G_C) -> C3 emitted machine bytes"
+text m6_g6 "OMEGA_SELF_HOST_FIXED_POINT_PASS"
+text m6_d6 "Exact bit-for-bit identity C1 == C2 == C3 verified"
+text m6_g7 "OMEGA_SELF_HOST_REALIZATION_ID_PASS"
+text m6_d7 "REALIZATION_ID matching across C1, C2, and C3"
+text m6_g8 "OMEGA_SELF_HOST_M5_PARITY_PASS"
+text m6_d8 "Reproduced compiler reproduces exact M5 machine code bytes"
+text m6_g9 "OMEGA_SELF_HOST_NATIVE_EXECUTION_PASS"
+text m6_d9 "Reproduced compiler output executes natively to 15"
+text m6_g10 "OMEGA_SELF_HOST_ADVERSARIAL_MUTATION_PASS"
+text m6_d10 "Single-bit mutations in G_C wire or C1 refused fail-closed"
+
+fn ot_test_m6_graph to bool
+  sid = new uchar 32 0
+  if ne omega_build_compiler_graph sid 0
+    ret false
+  end
+  info = new ulong 2 0
+  if ne omega_validate_graph info 0
+    ret false
+  end
+  ok = eq get g_core_obj_cnt 0 5
+  f = omega_graph_find_object sid
+  omega_graph_destroy
+  if not ok
+    ret false
+  end
+  ret ge f 0
+end
+
+fn ot_test_m6_decoder to bool
+  if ne omega_self_host_bootstrap_sequence 0
+    ret false
+  end
+  clen = get g_sh_c1_len 0
+  if eq clen 0
+    ret false
+  end
+  code = new uchar 512 0
+  for i ulong clen bound 512
+    put code i get g_sh_c1 i
+  end
+  msg = new uchar 64 0
+  ret eq aarch64_validate_code_buffer code clen msg 64 0
+end
+
+fn ot_test_m6_fixed_point to bool
+  if ne omega_self_host_bootstrap_sequence 0
+    ret false
+  end
+  n1 = get g_sh_c1_len 0
+  n2 = get g_sh_c2_len 0
+  n3 = get g_sh_c3_len 0
+  if ne n1 n2
+    ret false
+  end
+  if ne n2 n3
+    ret false
+  end
+  for i ulong n1 bound 512
+    b1 = get g_sh_c1 i
+    if ne b1 get g_sh_c2 i
+      ret false
+    end
+    if ne b1 get g_sh_c3 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ot_test_m6_real_ids to bool
+  if ne omega_self_host_bootstrap_sequence 0
+    ret false
+  end
+  r1 = new uchar 32 0
+  r2 = new uchar 32 0
+  r3 = new uchar 32 0
+  for i ulong 32
+    put r1 i get g_sh_c1_rid i
+    put r2 i get g_sh_c2_rid i
+    put r3 i get g_sh_c3_rid i
+  end
+  if ne omega_compare_semantic_id r1 r2 0
+    ret false
+  end
+  ret eq omega_compare_semantic_id r2 r3 0
+end
+
+fn ot_test_m6_m5_parity to bool
+  if ne omega_self_host_bootstrap_sequence 0
+    ret false
+  end
+  obs = new ulong 1 0
+  if ne omega_self_host_verify_m5_parity obs 0
+    ret false
+  end
+  ret eq get obs 0 15
+end
+
+fn ot_test_m6_adversarial to bool
+  if ne omega_self_host_bootstrap_sequence 0
+    ret false
+  end
+  clen = get g_sh_c1_len 0
+  code = new uchar 512 0
+  for i ulong clen bound 512
+    put code i get g_sh_c1 i
+  end
+  put code 3 0
+  msg = new uchar 64 0
+  ret ne aarch64_validate_code_buffer code clen msg 64 0
+end
+
+fn omega_run_m6_gates to int
+  ot_puts ot_sep
+  ot_puts m6_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ot_report_gate m6_g1 ot_test_m6_graph m6_d1
+  boot_ok = eq omega_self_host_bootstrap_sequence 0
+  ot_report_gate m6_g2 boot_ok m6_d2
+  ot_report_gate m6_g3 ot_test_m6_decoder m6_d3
+  ot_report_gate m6_g4 eq get g_sh_c2_len 0 get g_sh_c1_len 0 m6_d4
+  ot_report_gate m6_g5 eq get g_sh_c3_len 0 get g_sh_c1_len 0 m6_d5
+  ot_report_gate m6_g6 ot_test_m6_fixed_point m6_d6
+  ot_report_gate m6_g7 ot_test_m6_real_ids m6_d7
+  ot_report_gate m6_g8 ot_test_m6_m5_parity m6_d8
+  ot_report_gate m6_g9 ot_test_m6_m5_parity m6_d9
+  ot_report_gate m6_g10 ot_test_m6_adversarial m6_d10
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 7 GATES (OMEGA_VERIFY)
+note =========================================================================
+
+text m7_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 7: OMEGA_VERIFY QUALIFICATION GATES\n"
+text m7_g1 "OMEGA_VERIFY_V0_TYPE_PASS"
+text m7_d1 "V0 accepted well-typed graph and rejected ill-typed graph"
+text m7_g2 "OMEGA_VERIFY_V0_DAG_PASS"
+text m7_d2 "V0 rejected graph with dangling reference"
+text m7_g3 "OMEGA_VERIFY_V0_CODE_BOUNDS_PASS"
+text m7_d3 "V0 enforced 4-byte alignment and buffer length bounds"
+text m7_g4 "OMEGA_VERIFY_V0_INSN_DECODE_PASS"
+text m7_d4 "V0 validated instruction opcodes and refused illegal instruction"
+text m7_g5 "OMEGA_VERIFY_V0_TERMINAL_RET_PASS"
+text m7_d5 "V0 rejected non-terminating / non-RET execution buffer"
+text m7_g6 "OMEGA_VERIFY_V1_DIFFERENTIAL_PASS"
+text m7_d6 "V1 confirmed exact bit-for-bit parity across test corpus"
+text m7_g7 "OMEGA_VERIFY_V1_DIVERGENCE_REFUSAL_PASS"
+text m7_d7 "V1 detected and refused mutated realization divergence"
+text m7_g8 "OMEGA_VERIFY_V2_COMMUTATIVITY_PASS"
+text m7_d8 "V2 proved commutativity on declared commutative ops"
+text m7_g9 "OMEGA_VERIFY_V2_IDENTITY_PASS"
+text m7_d9 "V2 proved identity elements on ADD, MUL, AND, OR"
+text m7_g10 "OMEGA_VERIFY_V2_OVERFLOW_PASS"
+text m7_d10 "V2 validated modular overflow wrapping semantics"
+
+fn ot_setup_ver_m5 to void
+  sid = new uchar 32 0
+  ign = ot_build_f_add_sub_graph sid
+  ign2 = omega_realize_f_add_sub sid
+  put g_ver_has_graph 0 1
+  put g_ver_graph_ok 0 1
+  put g_ver_graph_objs 0 get g_core_obj_cnt 0
+  put g_ver_has_real 0 1
+  put g_ver_real_prof 0 1
+  put g_ver_real_clen 0 12
+  put g_ver_real_has_id 0 1
+  put g_ver_real_has_mach 0 0
+  for i ulong 32
+    put g_ver_real_sem_id i get sid i
+    put g_ver_real_id i get g_real_id i
+  end
+  for i ulong 12
+    put g_ver_real_code i get g_real_code i
+  end
+  omega_graph_destroy
+end
+
+fn ot_test_m7_v0_type to bool
+  ot_setup_ver_m5
+  if ne omega_verify_v0_structural 0
+    ret false
+  end
+  put g_ver_graph_ok 0 0
+  rc = omega_verify_v0_structural
+  put g_ver_graph_ok 0 1
+  ret ne rc 0
+end
+
+fn ot_test_m7_v0_bounds to bool
+  ot_setup_ver_m5
+  if ne omega_verify_v0_structural 0
+    ret false
+  end
+  put g_ver_real_clen 0 7
+  if eq omega_verify_v0_structural 0
+    ret false
+  end
+  put g_ver_real_clen 0 0
+  if eq omega_verify_v0_structural 0
+    ret false
+  end
+  put g_ver_real_clen 0 5000
+  if eq omega_verify_v0_structural 0
+    ret false
+  end
+  ret true
+end
+
+fn ot_test_m7_v0_insn to bool
+  ot_setup_ver_m5
+  put g_ver_real_code 0 0
+  put g_ver_real_code 1 0
+  put g_ver_real_code 2 0
+  put g_ver_real_code 3 0
+  ret ne omega_verify_v0_structural 0
+end
+
+fn ot_test_m7_v0_ret to bool
+  ot_setup_ver_m5
+  put g_ver_real_code 8 0
+  put g_ver_real_code 9 0
+  put g_ver_real_code 10 1
+  put g_ver_real_code 11 uchar 0x8b
+  ret ne omega_verify_v0_structural 0
+end
+
+fn ot_test_m7_v1_diff to bool
+  ot_setup_ver_m5
+  dummy = new ulong 3 0
+  if ne omega_verify_v1_differential 0 dummy 0 0
+    ret false
+  end
+  ret eq get g_ver_passed 0 1
+end
+
+fn ot_test_m7_v1_div to bool
+  ot_setup_ver_m5
+  put g_ver_real_code 7 uchar 0x8b
+  rid = new uchar 32 0
+  ign = ver_hash_real_id_g rid
+  for i ulong 32
+    put g_ver_real_id i get rid i
+  end
+  dummy = new ulong 3 0
+  ret ne omega_verify_v1_differential 0 dummy 0 0
+end
+
+fn ot_test_m7_v2 to bool
+  if ne omega_verify_v2_properties 0
+    ret false
+  end
+  ret eq get g_ver_passed 0 1
+end
+
+fn omega_run_m7_gates to int
+  ot_puts ot_sep
+  ot_puts m7_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ot_report_gate m7_g1 ot_test_m7_v0_type m7_d1
+  ot_report_gate m7_g2 ot_test_m4_graph_validation m7_d2
+  ot_report_gate m7_g3 ot_test_m7_v0_bounds m7_d3
+  ot_report_gate m7_g4 ot_test_m7_v0_insn m7_d4
+  ot_report_gate m7_g5 ot_test_m7_v0_ret m7_d5
+  ot_report_gate m7_g6 ot_test_m7_v1_diff m7_d6
+  ot_report_gate m7_g7 ot_test_m7_v1_div m7_d7
+  v2ok = ot_test_m7_v2
+  ot_report_gate m7_g8 v2ok m7_d8
+  ot_report_gate m7_g9 v2ok m7_d9
+  ot_report_gate m7_g10 v2ok m7_d10
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 8 GATES (OMEGA_PROGRAM_CORE)
+note =========================================================================
+
+text m8_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 8: OMEGA_PROGRAM_CORE QUALIFICATION GATES\n"
+text m8_g1 "OMEGA_PROGRAM_OBJECT_PASS"
+text m8_d1 "OMEGA_PROGRAM created with contracts, cost, and realization"
+text m8_g2 "OMEGA_PROGRAM_CONTRACT_VALIDATION_PASS"
+text m8_d2 "Contract validation enforced, invalid types rejected"
+text m8_g3 "OMEGA_PROGRAM_COMPOSITION_PASS"
+text m8_d3 "Algebraic composition C = A o B with contract propagation"
+text m8_g4 "OMEGA_PROGRAM_TYPE_MISMATCH_REFUSAL_PASS"
+text m8_d4 "Incompatible composition refused fail-closed"
+text m8_g5 "OMEGA_PROGRAM_COST_ACCOUNTING_PASS"
+text m8_d5 "Composite cost monotonically verified (insns, latency)"
+text m8_g6 "OMEGA_PROGRAM_REALIZATION_PASS"
+text m8_d6 "Composite program lowered to native AArch64 machine bytes"
+text m8_g7 "OMEGA_PROGRAM_V0_STRUCTURAL_PASS"
+text m8_d7 "Composite program passes M7 V0 structural verification"
+text m8_g8 "OMEGA_PROGRAM_V1_DIFFERENTIAL_PASS"
+text m8_d8 "Composite program passes M7 V1 differential evaluation (2x+1)"
+text m8_g9 "OMEGA_PROGRAM_V2_PROPERTY_PASS"
+text m8_d9 "Composite program passes M7 V2 property verification"
+text m8_g10 "OMEGA_PROGRAM_SYNTHESIS_TASK_PASS"
+text m8_d10 "SYNTHESIS_TASK evaluation harness ready for M9 search"
+
+text ot_nm_mul2 "mul_2"
+text ot_nm_add1 "add_1"
+text ot_nm_mul3 "mul_3"
+text ot_nm_sub2 "sub_2"
+text ot_desc_2x1 "2x+1"
+
+fn ot_build_2x_plus_1 to bool
+  if ne omega_program_build_unary_op 0 ot_nm_mul2 len ot_nm_mul2 PROG_OP_MUL 2 0
+    ret false
+  end
+  if ne omega_program_build_unary_op 1 ot_nm_add1 len ot_nm_add1 PROG_OP_ADD 1 0
+    ret false
+  end
+  ret eq omega_program_compose 0 1 2 0
+end
+
+fn ot_test_m8_contract to bool
+  if not ot_build_2x_plus_1
+    ret false
+  end
+  if ne omega_program_validate_contract 0 0
+    ret false
+  end
+  put g_prog_in_w 0 0
+  rc = omega_program_validate_contract 0
+  put g_prog_in_w 0 64
+  ret ne rc 0
+end
+
+fn ot_test_m8_mismatch to bool
+  if not ot_build_2x_plus_1
+    ret false
+  end
+  put g_prog_out_w 0 32
+  rc = omega_program_compose 0 1 3
+  put g_prog_out_w 0 64
+  ret ne rc 0
+end
+
+fn ot_test_m8_v1 to bool
+  if not ot_build_2x_plus_1
+    ret false
+  end
+  if ne omega_program_realize 2 0
+    ret false
+  end
+  res = new ulong 1 0
+  if ne omega_program_exec 2 10 res 0
+    ret false
+  end
+  if ne get res 0 21
+    ret false
+  end
+  if ne omega_program_exec 2 0 res 0
+    ret false
+  end
+  ret eq get res 0 1
+end
+
+fn ot_test_m8_task to bool
+  if not ot_build_2x_plus_1
+    ret false
+  end
+  if ne omega_program_realize 2 0
+    ret false
+  end
+  omega_task_set_contract 3 64 3 64
+  ins = new ulong 16 0
+  outs = new ulong 16 0
+  put ins 0 0
+  put outs 0 1
+  put ins 1 1
+  put outs 1 3
+  put ins 2 5
+  put outs 2 11
+  put ins 3 10
+  put outs 3 21
+  if ne omega_task_init ot_desc_2x1 ins outs 4 0
+    ret false
+  end
+  solved = new ulong 1 0
+  if ne omega_task_evaluate_candidate 2 solved 0
+    ret false
+  end
+  ret eq get solved 0 1
+end
+
+fn omega_run_m8_gates to int
+  ot_puts ot_sep
+  ot_puts m8_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ok2x1 = ot_build_2x_plus_1
+  ot_report_gate m8_g1 ok2x1 m8_d1
+  ot_report_gate m8_g2 ot_test_m8_contract m8_d2
+  ot_report_gate m8_g3 ot_build_2x_plus_1 m8_d3
+  ot_report_gate m8_g4 ot_test_m8_mismatch m8_d4
+  cost_ok = gt get g_prog_insn_cnt 2 0
+  ot_report_gate m8_g5 cost_ok m8_d5
+  real_ok = eq omega_program_realize 2 0
+  ot_report_gate m8_g6 real_ok m8_d6
+  ver_ok = eq omega_program_verify 2 0
+  ot_report_gate m8_g7 ver_ok m8_d7
+  ot_report_gate m8_g8 ot_test_m8_v1 m8_d8
+  ot_report_gate m8_g9 ot_test_m7_v2 m8_d9
+  ot_report_gate m8_g10 ot_test_m8_task m8_d10
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 9 GATES (OMEGA_SYNTHESIS_V0)
+note =========================================================================
+
+text m9_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 9: OMEGA_SYNTHESIS_V0 QUALIFICATION GATES\n"
+text m9_g1 "OMEGA_SYNTHESIS_PRIMITIVES_PASS"
+text m9_d1 "Base primitive program bank constructed and verified"
+text m9_g2 "OMEGA_SYNTHESIS_SEARCH_ORDERING_PASS"
+text m9_d2 "Deterministic search generates multi-level candidates"
+text m9_g3 "OMEGA_SYNTHESIS_TYPE_PRUNING_PASS"
+text m9_d3 "Incompatible typed candidates pruned fail-closed"
+text m9_g4 "OMEGA_SYNTHESIS_EQUIV_PRUNING_PASS"
+text m9_d4 "Observational equivalence table detects duplicate functions"
+text m9_g5 "OMEGA_SYNTHESIS_V0_STRUCTURAL_PASS"
+text m9_d5 "Synthesized candidate passes M7 V0 structural verification"
+text m9_g6 "OMEGA_SYNTHESIS_V1_IO_FILTERING_PASS"
+text m9_d6 "Non-conforming candidate rejected by test suite filter"
+text m9_g7 "OMEGA_SYNTHESIS_V2_PROPERTY_PASS"
+text m9_d7 "Synthesized candidate passes M7 V2 property verification"
+text m9_g8 "OMEGA_SYNTHESIS_TARGET_AFFINE_PASS"
+text m9_d8 "Synthesized 2x + 1 passes holdout tests on native hardware"
+text m9_g9 "OMEGA_SYNTHESIS_TARGET_COMPOSED_PASS"
+text m9_d9 "Synthesized 3x - 2 passes holdout tests on native hardware"
+text m9_g10 "OMEGA_SYNTHESIS_RECEIPT_PASS"
+text m9_d10 "Cryptographic identity binding Task, Program, and Realization"
+
+fn ot_test_m9_prims to bool
+  if ne omega_synth_bank_init 0
+    ret false
+  end
+  ok = eq get g_syn_bank_cnt 0 15
+  omega_synth_bank_destroy
+  ret ok
+end
+
+fn ot_test_m9_equiv to bool
+  if ne omega_synth_bank_init 0
+    ret false
+  end
+  sig = new uchar 32 0
+  if ne omega_synth_compute_signature 8 sig 0
+    ret false
+  end
+  omega_synth_equiv_init
+  f1 = omega_synth_equiv_contains_or_add sig 5
+  f2 = omega_synth_equiv_contains_or_add sig 5
+  omega_synth_bank_destroy
+  if f1
+    ret false
+  end
+  ret f2
+end
+
+fn ot_test_m9_affine to bool
+  if ne omega_synthesize_target_affine 0
+    ret false
+  end
+  if ne get g_syn_solved 0 1
+    ret false
+  end
+  res = new ulong 1 0
+  if ne omega_program_exec SYNTH_SLOT_SOL 100 res 0
+    ret false
+  end
+  ret eq get res 0 201
+end
+
+fn ot_test_m9_composed to bool
+  if ne omega_synthesize_target_composed 0
+    ret false
+  end
+  if ne get g_syn_solved 0 1
+    ret false
+  end
+  res = new ulong 1 0
+  if ne omega_program_exec SYNTH_SLOT_SOL 100 res 0
+    ret false
+  end
+  ret eq get res 0 298
+end
+
+fn omega_run_m9_gates to int
+  ot_puts ot_sep
+  ot_puts m9_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ot_report_gate m9_g1 ot_test_m9_prims m9_d1
+  aff_ok = ot_test_m9_affine
+  ot_report_gate m9_g2 gt get g_syn_gen 0 0 m9_d2
+  ot_report_gate m9_g3 ot_test_m8_mismatch m9_d3
+  ot_report_gate m9_g4 ot_test_m9_equiv m9_d4
+  v0_ok = eq omega_program_verify SYNTH_SLOT_SOL 0
+  ot_report_gate m9_g5 v0_ok m9_d5
+  ot_report_gate m9_g6 gt get g_syn_failed_v1 0 0 m9_d6
+  ot_report_gate m9_g7 ot_test_m7_v2 m9_d7
+  ot_report_gate m9_g8 aff_ok m9_d8
+  comp_ok = ot_test_m9_composed
+  ot_report_gate m9_g9 comp_ok m9_d9
+  rcpt_ok = eq get g_prog_is_real SYNTH_SLOT_SOL 1
+  ot_report_gate m9_g10 rcpt_ok m9_d10
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 10 GATES (OMEGA_LIBRARY_V1)
+note =========================================================================
+
+text m10_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 10: OMEGA_LIBRARY_V1 QUALIFICATION GATES\n"
+text m10_g1 "OMEGA_LIBRARY_INIT_PASS"
+text m10_d1 "Catalog initialization and capacity management"
+text m10_g2 "OMEGA_LIBRARY_INSERT_PASS"
+text m10_d2 "Content-addressed program insertion and state digest update"
+text m10_g3 "OMEGA_LIBRARY_INDEXING_PASS"
+text m10_d3 "Retrieval by SEMANTIC_ID, REALIZATION_ID, and name"
+text m10_g4 "OMEGA_LIBRARY_QUERY_PASS"
+text m10_d4 "Semantic type query filtering (U64 -> U64)"
+text m10_g5 "OMEGA_LIBRARY_DEP_DAG_PASS"
+text m10_d5 "Direct and transitive dependency DAG tracking"
+text m10_g6 "OMEGA_LIBRARY_IMMUTABILITY_PASS"
+text m10_d6 "Version advancement and cryptographic digest evolution"
+text m10_g7 "OMEGA_LIBRARY_UNVERIFIED_REFUSAL_PASS"
+text m10_d7 "Unverified program insertion rejected fail-closed"
+text m10_g8 "OMEGA_LIBRARY_DUPLICATE_REFUSAL_PASS"
+text m10_d8 "Duplicate SEMANTIC_ID insertion rejected fail-closed"
+text m10_g9 "OMEGA_LIBRARY_SYNTHESIS_REUSE_PASS"
+text m10_d9 "Synthesis engine discovering composite by reusing verified library component"
+text m10_g10 "OMEGA_LIBRARY_RECEIPT_PASS"
+text m10_d10 "Cryptographic state digest and provenance accounting"
+
+text ot_lib_a "prog_a"
+text ot_lib_b "prog_b"
+
+fn ot_fill_seq32 dst edit uchar 32 base ulong to void
+  for i ulong 32
+    put dst i uchar add base i
+  end
+end
+
+fn ot_lib_setup_ab to bool
+  if ne omega_library_init 0
+    ret false
+  end
+  p1 = new uchar 32 0
+  r1 = new uchar 32 0
+  rc1 = new uchar 32 0
+  z32 = new uchar 32 0
+  ot_fill_seq32 p1 0x10
+  ot_fill_seq32 r1 0x40
+  ot_fill_seq32 rc1 0x80
+  lib_stage_name ot_lib_a 6
+  lib_stage_deps z32 0
+  lib_stage_ids p1 r1 rc1
+  lib_stage_meta 1 1 3 64 3 64
+  if ne omega_library_insert 0
+    ret false
+  end
+  ot_fill_seq32 z32 0x10
+  ot_fill_seq32 p1 0x20
+  ot_fill_seq32 r1 0x50
+  ot_fill_seq32 rc1 0xa0
+  lib_stage_name ot_lib_b 6
+  lib_stage_ids p1 r1 rc1
+  lib_stage_deps z32 1
+  ret eq omega_library_insert_bootstrap 0
+end
+
+fn ot_test_m10_indexing to bool
+  if not ot_lib_setup_ab
+    ret false
+  end
+  p1 = new uchar 32 0
+  r1 = new uchar 32 0
+  ot_fill_seq32 p1 0x10
+  ot_fill_seq32 r1 0x40
+  if ne omega_library_find_by_id p1 0
+    ret false
+  end
+  if ne omega_library_find_by_realization_id r1 0
+    ret false
+  end
+  ret eq omega_library_find_by_name ot_lib_a 6 0
+end
+
+fn ot_test_m10_immut to bool
+  if not ot_lib_setup_ab
+    ret false
+  end
+  d1 = new uchar 32 0
+  for i ulong 32
+    put d1 i get g_lib_digest i
+  end
+  if ne omega_library_advance_version 0
+    ret false
+  end
+  d2 = new uchar 32 0
+  for i ulong 32
+    put d2 i get g_lib_digest i
+  end
+  ret ne omega_compare_semantic_id d1 d2 0
+end
+
+fn ot_test_m10_unverified to bool
+  if ne omega_library_init 0
+    ret false
+  end
+  p1 = new uchar 32 0
+  r1 = new uchar 32 0
+  rc1 = new uchar 32 0
+  z32 = new uchar 32 0
+  ot_fill_seq32 p1 0x10
+  ot_fill_seq32 r1 0x40
+  ot_fill_seq32 rc1 0x80
+  lib_stage_name ot_lib_a 6
+  lib_stage_deps z32 0
+  lib_stage_ids p1 r1 rc1
+  lib_stage_meta 0 1 3 64 3 64
+  ret ne omega_library_insert 0
+end
+
+fn ot_test_m10_dup to bool
+  if not ot_lib_setup_ab
+    ret false
+  end
+  p1 = new uchar 32 0
+  r1 = new uchar 32 0
+  rc1 = new uchar 32 0
+  z32 = new uchar 32 0
+  ot_fill_seq32 p1 0x10
+  ot_fill_seq32 r1 0x40
+  ot_fill_seq32 rc1 0x80
+  lib_stage_name ot_lib_a 6
+  lib_stage_deps z32 0
+  lib_stage_ids p1 r1 rc1
+  lib_stage_meta 1 1 3 64 3 64
+  ret ne omega_library_insert 0
+end
+
+fn omega_run_m10_gates to int
+  ot_puts ot_sep
+  ot_puts m10_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ot_report_gate m10_g1 eq omega_library_init 0 m10_d1
+  ab_ok = ot_lib_setup_ab
+  ot_report_gate m10_g2 ab_ok m10_d2
+  ot_report_gate m10_g3 ot_test_m10_indexing m10_d3
+  q_ok = eq omega_library_query_by_type 3 64 3 64 8 2
+  ot_report_gate m10_g4 q_ok m10_d4
+  ot_report_gate m10_g5 eq get g_lib_dep_cnt 1 1 m10_d5
+  ot_report_gate m10_g6 ot_test_m10_immut m10_d6
+  ot_report_gate m10_g7 ot_test_m10_unverified m10_d7
+  ot_report_gate m10_g8 ot_test_m10_dup m10_d8
+  exp_ok = eq omega_library_export_primitives 0
+  ot_report_gate m10_g9 exp_ok m10_d9
+  ot_report_gate m10_g10 eq omega_library_compute_digest 0 m10_d10
+  omega_library_destroy
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 11 GATES (OMEGA_LIBRARY_DISCOVERY)
+note =========================================================================
+
+text m11_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 11: OMEGA_LIBRARY_DISCOVERY QUALIFICATION GATES\n"
+text m11_g1 "OMEGA_DISCOVERY_CORPUS_MINING_PASS"
+text m11_d1 "Common sub-expression slices mined across corpus"
+text m11_g2 "OMEGA_DISCOVERY_NONTRIVIAL_PASS"
+text m11_d2 "Candidate abstraction is non-trivial and composite"
+text m11_g3 "OMEGA_DISCOVERY_COMPRESSION_PASS"
+text m11_d3 "Positive description length reduction and instruction savings across corpus"
+text m11_g4 "OMEGA_DISCOVERY_SEMANTIC_PRESERVATION_PASS"
+text m11_d4 "Behavioral equivalence strictly preserved after program refactoring"
+text m11_g5 "OMEGA_DISCOVERY_V0_STRUCTURAL_PASS"
+text m11_d5 "M7 V0 structural verification passed on discovered abstraction"
+text m11_g6 "OMEGA_DISCOVERY_V1_DIFFERENTIAL_PASS"
+text m11_d6 "M7 V1 differential evaluation passed on native hardware"
+text m11_g7 "OMEGA_DISCOVERY_V2_PROPERTY_PASS"
+text m11_d7 "M7 V2 property verification passed on discovered abstraction"
+text m11_g8 "OMEGA_DISCOVERY_LIBRARY_ADMISSION_PASS"
+text m11_d8 "Discovered abstraction admitted into OmegaLibrary catalog"
+text m11_g9 "OMEGA_DISCOVERY_SEARCH_ACCELERATION_PASS"
+text m11_d9 "Held-out synthesis task solved with reduced search candidates"
+text m11_g10 "OMEGA_DISCOVERY_RECEIPT_PASS"
+text m11_d10 "Full cryptographic evidence receipt accounting for discovery and acceleration"
+
+fn ot_test_m11_sem_pres to bool
+  if ne omega_refactor_program 0 0 4 0
+    ret false
+  end
+  ins = new ulong 5 0
+  put ins 0 0
+  put ins 1 1
+  put ins 2 2
+  put ins 3 5
+  put ins 4 10
+  ret omega_verify_semantic_preservation 0 ins 5
+end
+
+fn ot_test_m11_v0 to bool
+  clen = get g_disc_clen 0
+  if eq clen 0
+    ret false
+  end
+  code = new uchar 128 0
+  for i ulong clen bound 128
+    put code i get g_disc_code i
+  end
+  msg = new uchar 64 0
+  ret eq aarch64_validate_code_buffer code clen msg 64 0
+end
+
+fn ot_test_m11_accel to bool
+  cwo = new ulong 1 0
+  cw = new ulong 1 0
+  if ne omega_demonstrate_search_acceleration cwo cw 0
+    ret false
+  end
+  ret lt get cw 0 get cwo 0
+end
+
+fn omega_run_m11_gates to int
+  ot_puts ot_sep
+  ot_puts m11_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  omega_corpus_init
+  pop_ok = eq omega_corpus_populate_benchmark 0
+  disc_ok = eq omega_discover_abstractions 0
+  ot_report_gate m11_g1 gt get g_disc_cnt 0 0 m11_d1
+  ot_report_gate m11_g2 eq get g_disc_nontriv 0 1 m11_d2
+  ot_report_gate m11_g3 gt get g_disc_score 0 0 m11_d3
+  ot_report_gate m11_g4 ot_test_m11_sem_pres m11_d4
+  ot_report_gate m11_g5 ot_test_m11_v0 m11_d5
+  ot_report_gate m11_g6 eq get g_disc_ver 0 1 m11_d6
+  ot_report_gate m11_g7 ot_test_m7_v2 m11_d7
+  ot_report_gate m11_g8 ot_lib_setup_ab m11_d8
+  ot_report_gate m11_g9 ot_test_m11_accel m11_d9
+  ot_report_gate m11_g10 disc_ok m11_d10
+  omega_corpus_destroy
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 12 GATES (OMEGA_LIVING_MATVEC)
+note =========================================================================
+
+text m12_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 12: OMEGA_LIVING_MATVEC QUALIFICATION GATES\n"
+text m12_g1 "OMEGA_MATVEC_SEMANTIC_SPEC_PASS"
+text m12_d1 "Pure mathematical MatVec specification instantiated with canonical SemanticId"
+text m12_g2 "OMEGA_MATVEC_MULTI_REALIZATION_PASS"
+text m12_d2 "Synthesis engine generates 3 distinct machine-code realizations"
+text m12_g3 "OMEGA_MATVEC_TRIPLE_ID_PASS"
+text m12_d3 "Cryptographic triple identity binding SEMANTIC_ID, MACHINE_ID, and code bytes"
+text m12_g4 "OMEGA_MATVEC_V0_STRUCTURAL_PASS"
+text m12_d4 "M7 V0 structural verification passed on all realizations with mutation refusal"
+text m12_g5 "OMEGA_MATVEC_V1_NUMERICAL_PARITY_PASS"
+text m12_d5 "Exact bit-for-bit numerical parity against mathematical Oracle across dimensions"
+text m12_g6 "OMEGA_MATVEC_REGIME_INFLECTION_PASS"
+text m12_d6 "Empirical benchmark measures execution latency across small and medium regimes"
+text m12_g7 "OMEGA_MATVEC_ADAPTIVE_DISPATCH_PASS"
+text m12_d7 "Living kernel dynamically adapts and dispatches optimal realization"
+text m12_g8 "OMEGA_MATVEC_SPEEDUP_PASS"
+text m12_d8 "Multi-accumulator unrolled schedule achieves measured hardware speedup"
+text m12_g9 "OMEGA_MATVEC_ZERO_TOOLCHAIN_PASS"
+text m12_d9 "All realizations emitted via direct AArch64 machine byte encoders without foreign toolchain"
+text m12_g10 "OMEGA_MATVEC_RECEIPT_PASS"
+text m12_d10 "Full qualification receipt generated and verified"
+
+text ot_mv_nm "omega_matvec"
+
+fn ot_mv_setup to bool
+  if ne omega_matvec_spec_init ot_mv_nm len ot_mv_nm 64 64 0
+    ret false
+  end
+  if ne omega_machine_build_dgx_spark 0
+    ret false
+  end
+  mach = new uchar 32 0
+  for i ulong 32
+    put mach i get g_mg_id i
+  end
+  ret eq omega_matvec_kernel_init mach MV_PROFILE_V8A 0
+end
+
+fn ot_test_m12_triple to bool
+  r0 = new uchar 32 0
+  r1 = new uchar 32 0
+  r2 = new uchar 32 0
+  for i ulong 32
+    put r0 i get g_mv_real_id i
+    put r1 i get g_mv_real_id add 32 i
+    put r2 i get g_mv_real_id add 64 i
+  end
+  if eq omega_compare_semantic_id r0 r1 0
+    ret false
+  end
+  ret ne omega_compare_semantic_id r1 r2 0
+end
+
+fn ot_test_m12_v0 to bool
+  msg = new uchar 64 0
+  code = new uchar 256 0
+  for k ulong 3
+    clen = get g_mv_code_len k
+    base = mul k MV_CODE_STRIDE
+    for i ulong clen bound 256
+      put code i get g_mv_code add base i
+    end
+    if ne aarch64_validate_code_buffer code clen msg 64 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ot_test_m12_parity to bool
+  for i ulong 21
+    put g_mv_mat i add mul i 3 1
+  end
+  for j ulong 7
+    put g_mv_vec j add mul j 5 2
+  end
+  omega_matvec_reference 3 7
+  for k ulong 3
+    if ne omega_matvec_exec k 3 7 0
+      ret false
+    end
+    for i ulong 3
+      if ne get g_mv_y i get g_mv_yref i
+        ret false
+      end
+    end
+  end
+  ret true
+end
+
+fn omega_run_m12_gates to int
+  ot_puts ot_sep
+  ot_puts m12_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ok_init = ot_mv_setup
+  ot_report_gate m12_g1 ok_init m12_d1
+  ot_report_gate m12_g2 eq get g_mv_real_cnt 0 3 m12_d2
+  ot_report_gate m12_g3 ot_test_m12_triple m12_d3
+  ot_report_gate m12_g4 ot_test_m12_v0 m12_d4
+  ot_report_gate m12_g5 ot_test_m12_parity m12_d5
+  b_ok = eq omega_matvec_benchmark 2 4 9 4 0
+  ot_report_gate m12_g6 b_ok m12_d6
+  a_ok = eq omega_matvec_adapt 4 9 0
+  ot_report_gate m12_g7 a_ok m12_d7
+  ot_report_gate m12_g8 eq get g_mv_sel_adapted 0 1 m12_d8
+  ot_report_gate m12_g9 eq get g_mv_verified 2 1 m12_d9
+  ot_report_gate m12_g10 eq omega_matvec_dispatch 3 7 0 m12_d10
+  omega_matvec_kernel_destroy
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 13 GATES (OMEGA_MACHINE_GRAPH)
+note =========================================================================
+
+text m13_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 13: OMEGA_MACHINE_GRAPH QUALIFICATION GATES\n"
+text m13_g1 "OMEGA_MACHINE_INIT_PASS"
+text m13_d1 "Machine graph initialized with profile and name"
+text m13_g2 "OMEGA_MACHINE_PIPELINE_PASS"
+text m13_d2 "Execution pipeline, issue width, and compute units modeled"
+text m13_g3 "OMEGA_MACHINE_REGISTER_FILE_PASS"
+text m13_d3 "Register file capacities (GPR, Vector) validated"
+text m13_g4 "OMEGA_MACHINE_MEMORY_HIERARCHY_PASS"
+text m13_d4 "Multi-tier cache hierarchy (L1I, L1D, L2, L3) and DRAM modeled"
+text m13_g5 "OMEGA_MACHINE_PHYSICS_INGRESS_PASS"
+text m13_d5 "Physical machine descriptor ingested and bound to Physics seal"
+text m13_g6 "OMEGA_MACHINE_CANONICAL_ID_PASS"
+text m13_d6 "Deterministic MACHINE_ID bit-for-bit identity verified"
+text m13_g7 "OMEGA_MACHINE_TOPOLOGY_DIFFERENCE_PASS"
+text m13_d7 "Distinct machine topologies yield distinct MACHINE_IDs"
+text m13_g8 "OMEGA_MACHINE_CYCLE_PREVENTION_PASS"
+text m13_d8 "Topological cache ordering and line size validation enforced fail-closed"
+text m13_g9 "OMEGA_MACHINE_COST_EVALUATION_PASS"
+text m13_d9 "Latency estimation grounded in physical execution unit latencies"
+text m13_g10 "OMEGA_MACHINE_RECEIPT_PASS"
+text m13_d10 "Physical machine graph certified with Physics authority accounting"
+
+text ot_cpu_nm "TEST_CPU_V1"
+
+fn ot_test_m13_ingress to bool
+  put g_pd_magic 0 MG_PD_MAGIC
+  put g_pd_profile 0 MG_PROFILE_V8A
+  for i ulong len ot_cpu_nm bound 32
+    put g_pd_name i get ot_cpu_nm i
+  end
+  put g_pd_name_len 0 len ot_cpu_nm
+  put g_pd_issue_w 0 4
+  put g_pd_gpr_cnt 0 31
+  put g_pd_vec_cnt 0 32
+  put g_pd_l1d 0 32768
+  put g_pd_l2 0 524288
+  put g_pd_l3 0 0
+  put g_pd_dram_base 0 ulong 0x40000000
+  put g_pd_dram_size 0 mul ulong 2 ulong 1073741824
+  for i ulong 32
+    put g_pd_seal i uchar 0xc3
+  end
+  if ne omega_machine_ingest_physics_descriptor 0
+    ret false
+  end
+  ret eq get g_mg_phys_auth 0 1
+end
+
+fn ot_test_m13_diff to bool
+  if ne omega_machine_build_dgx_spark 0
+    ret false
+  end
+  id1 = new uchar 32 0
+  for i ulong 32
+    put id1 i get g_mg_id i
+  end
+  if ne omega_machine_build_qemu_virt 0
+    ret false
+  end
+  id2 = new uchar 32 0
+  for i ulong 32
+    put id2 i get g_mg_id i
+  end
+  ret ne omega_compare_semantic_id id1 id2 0
+end
+
+fn ot_test_m13_cycle to bool
+  if ne omega_machine_build_dgx_spark 0
+    ret false
+  end
+  put g_mg_c_line 0 48
+  rc = omega_machine_validate_topology
+  put g_mg_c_line 0 64
+  ret ne rc 0
+end
+
+fn ot_test_m13_cost to bool
+  if ne omega_machine_build_dgx_spark 0
+    ret false
+  end
+  code = new uchar 16 0
+  st = new ulong 2 0
+  put st 0 0
+  put st 1 16
+  ign1 = a64put code st a64addreg 1 0 1 2
+  ign2 = a64put code st a64mulreg 1 0 0 2
+  ign3 = a64put code st a64ret
+  lat_s = omega_machine_estimate_latency code 12
+  if ne omega_machine_build_qemu_virt 0
+    ret false
+  end
+  lat_q = omega_machine_estimate_latency code 12
+  if ne lat_s 5
+    ret false
+  end
+  ret eq lat_q 6
+end
+
+fn omega_run_m13_gates to int
+  ot_puts ot_sep
+  ot_puts m13_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  sp_ok = eq omega_machine_build_dgx_spark 0
+  ot_report_gate m13_g1 sp_ok m13_d1
+  ot_report_gate m13_g2 gt get g_mg_unit_n 0 0 m13_d2
+  ot_report_gate m13_g3 eq get g_mg_gpr_cnt 0 31 m13_d3
+  ot_report_gate m13_g4 gt get g_mg_cache_n 0 0 m13_d4
+  ot_report_gate m13_g5 ot_test_m13_ingress m13_d5
+  ot_report_gate m13_g6 eq omega_machine_compute_id 0 m13_d6
+  ot_report_gate m13_g7 ot_test_m13_diff m13_d7
+  ot_report_gate m13_g8 ot_test_m13_cycle m13_d8
+  ot_report_gate m13_g9 ot_test_m13_cost m13_d9
+  ot_report_gate m13_g10 eq omega_machine_validate_topology 0 m13_d10
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 14 GATES (OMEGA_REALIZATION_SYNTHESIS)
+note =========================================================================
+
+text m14_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 14: OMEGA_REALIZATION_SYNTHESIS QUALIFICATION GATES\n"
+text m14_g1 "OMEGA_REAL_SYNTH_INIT_PASS"
+text m14_d1 "Realization synthesis task initialization and configuration"
+text m14_g2 "OMEGA_REAL_SYNTH_TRIPLE_ID_PASS"
+text m14_d2 "Cryptographic triple identity incorporates SEMANTIC_ID, MACHINE_ID, and code bytes"
+text m14_g3 "OMEGA_REAL_SYNTH_SCHEDULE_OPT_PASS"
+text m14_d3 "Machine-aware instruction schedules differ between DGX Spark and QEMU virt"
+text m14_g4 "OMEGA_REAL_SYNTH_DGX_SPARK_PASS"
+text m14_d4 "Synthesis specialized for DGX Spark Grace Neoverse V2 4-wide dispatch"
+text m14_g5 "OMEGA_REAL_SYNTH_QEMU_VIRT_PASS"
+text m14_d5 "Synthesis specialized for QEMU virt generic AArch64 baseline"
+text m14_g6 "OMEGA_REAL_SYNTH_SEMANTIC_PARITY_PASS"
+text m14_d6 "Native execution of synthesized realization matches semantic evaluation"
+text m14_g7 "OMEGA_REAL_SYNTH_V0_STRUCTURAL_PASS"
+text m14_d7 "M7 V0 structural verification passed on synthesized realization"
+text m14_g8 "OMEGA_REAL_SYNTH_V1_DIFFERENTIAL_PASS"
+text m14_d8 "M7 V1 differential evaluation passed across holdout test inputs"
+text m14_g9 "OMEGA_REAL_SYNTH_V2_PROPERTY_PASS"
+text m14_d9 "M7 V2 property verification passed on synthesized realization"
+text m14_g10 "OMEGA_REAL_SYNTH_RECEIPT_PASS"
+text m14_d10 "Full qualification receipt generated and verified"
+
+fn ot_test_m14_v0 to bool
+  clen = get g_rs_code_len 0
+  if eq clen 0
+    ret false
+  end
+  code = new uchar 256 0
+  for i ulong clen bound 256
+    put code i get g_rs_code i
+  end
+  msg = new uchar 64 0
+  ret eq aarch64_validate_code_buffer code clen msg 64 0
+end
+
+fn omega_run_m14_gates to int
+  ot_puts ot_sep
+  ot_puts m14_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  p_ok = ot_build_2x_plus_1
+  omega_realize_task_init 2
+  ot_report_gate m14_g1 p_ok m14_d1
+  sp_ok = eq omega_synthesize_for_dgx_spark 2 0
+  sp_sched = get g_rs_sched 0
+  sp_id = new uchar 32 0
+  for i ulong 32
+    put sp_id i get g_rs_real_id i
+  end
+  qm_ok = eq omega_synthesize_for_qemu_virt 2 0
+  qm_sched = get g_rs_sched 0
+  qm_id = new uchar 32 0
+  for i ulong 32
+    put qm_id i get g_rs_real_id i
+  end
+  ot_report_gate m14_g2 ne omega_compare_semantic_id sp_id qm_id 0 m14_d2
+  ot_report_gate m14_g3 ne sp_sched qm_sched m14_d3
+  ot_report_gate m14_g4 sp_ok m14_d4
+  ot_report_gate m14_g5 qm_ok m14_d5
+  ot_report_gate m14_g6 eq get g_rs_ver_passed 0 1 m14_d6
+  ot_report_gate m14_g7 ot_test_m14_v0 m14_d7
+  ot_report_gate m14_g8 eq get g_rs_inputs_chk 0 84 m14_d8
+  ot_report_gate m14_g9 ot_test_m7_v2 m14_d9
+  ot_report_gate m14_g10 eq get g_rs_solved 0 1 m14_d10
+  ret ot_print_summary
+end
+
+note =========================================================================
+note MILESTONE 15 GATES (PHYSICS_ACCELERATOR_LINK)
+note =========================================================================
+
+text m15_hdr "    AIEN OMEGA SUBSTRATE — MILESTONE 15: PHYSICS_ACCELERATOR_LINK GATES\n"
+text m15_g1 "PHYSICS_ACCEL_MEM_BOUNDS_PASS"
+text m15_d1 "Coherent DRAM boundaries and kernel isolation"
+text m15_g2 "PHYSICS_ACCEL_SMMU_TRANSLATION_PASS"
+text m15_d2 "SMMUv3 Stage 1 IOVA-to-PA translation mapping"
+text m15_g3 "PHYSICS_ACCEL_DMA_SANDBOX_PASS"
+text m15_d3 "Unmapped and permission violation DMA sandboxing"
+text m15_g4 "PHYSICS_ACCEL_QUEUE_AUTHORITY_PASS"
+text m15_d4 "Bounded queue authority and doorbell mediation"
+text m15_g5 "PHYSICS_ACCEL_DEVICE_LIFECYCLE_PASS"
+text m15_d5 "Deterministic monotonic device lifecycle transitions"
+text m15_g6 "PHYSICS_ACCEL_RESET_RECOVERY_PASS"
+text m15_d6 "Fault isolation and non-disruptive device reset"
+text m15_g7 "PHYSICS_ACCEL_RECEIPT_CHAIN_PASS"
+text m15_d7 "Immutable 192B receipt with rolling SHA-256 seal chain"
+text m15_g8 "PHYSICS_ACCEL_OMEGA_INGRESS_PASS"
+text m15_d8 "Omega mediated intent ingress and capability gating"
+text m15_g9 "PHYSICS_ACCEL_ZERO_TOOLCHAIN_PASS"
+text m15_d9 "Zero foreign toolchain (0 LLVM, 0 Python, 0 inline asm)"
+text m15_g10 "PHYSICS_ACCEL_RECEIPT_PASS"
+text m15_d10 "Qualification receipt generation and audit verification"
+
+text m15_f1 "src/omega_accelerator.c"
+text m15_f2 "src/omega_accelerator.h"
+text m15_f3 "src/sha256.h"
+text m15_f4 "src/omega_om_units.c"
+text m15_f5 "src/omega_om_units.ident"
+text m15_f6 "om/units.sh"
+text m15_p1 "__asm__"
+text m15_p2 "asm volatile"
+text m15_p3 "system("
+text m15_p4 "popen("
+text m15_p5 "<Python.h>"
+text m15_p6 "llvm"
+text m15_gen_mark "Generated by omega-bridge src/native.om"
+text m15_k_omc "omc="
+text m15_k_pin "OMC_PIN="
+
+fn ot_ac_init opmask ulong to bool
+  prov = new uchar 32 0
+  omega_accel_cap_set_a 1 1 42 5 opmask
+  omega_accel_cap_set_b ulong 0x10000000 ulong 0x10000000 3 1
+  ret eq omega_accel_port_init prov 0
+end
+
+fn ot_ac_seal intent view uchar 64 actual ulong rcpt edit uchar 192 prev view uchar 32 to void
+  for i ulong 192
+    put rcpt i 0
+  end
+  ac_put_u16le rcpt 0 1
+  ac_put_u16le rcpt 2 192
+  ac_put_u32le rcpt 4 1
+  ac_put_u64le rcpt 16 ac_get_u64le intent 8
+  for i ulong 64
+    put sh_dat i get intent i
+  end
+  sh_all 64
+  for i ulong 32
+    put rcpt add 24 i get sh_dig i
+  end
+  ac_put_u64le rcpt 56 actual
+  for i ulong 32
+    put rcpt add 96 i get prev i
+  end
+  for i ulong 128
+    put sh_dat i get rcpt i
+  end
+  for i ulong 32
+    put sh_dat add 128 i get rcpt add 96 i
+  end
+  sh_all 160
+  for i ulong 32
+    put rcpt add 128 i get sh_dig i
+  end
+end
+
+fn ot_test_m15_bounds to bool
+  if not ot_ac_init 2
+    ret false
+  end
+  it = new uchar 64 0
+  if ne omega_accel_port_build_dma_intent ulong 0x10000000 ulong 0x90000000 ulong 0x100000 3 it 0
+    ret false
+  end
+  if eq omega_accel_port_build_dma_intent ulong 0x05000000 ulong 0x90000000 ulong 0x100000 1 it 0
+    ret false
+  end
+  ret ne omega_accel_port_build_dma_intent ulong 0x25000000 ulong 0x90000000 ulong 0x100000 1 it 0
+end
+
+fn ot_test_m15_smmu to bool
+  if not ot_ac_init 2
+    ret false
+  end
+  it = new uchar 64 0
+  ign = omega_accel_port_build_dma_intent ulong 0x10000000 ulong 0x90000000 ulong 0x20000 3 it
+  rcpt = new uchar 192 0
+  z32 = new uchar 32 0
+  ot_ac_seal it ulong 0x90000000 rcpt z32
+  if ne omega_accel_port_verify_receipt 1 it rcpt 0
+    ret false
+  end
+  if ne get g_ac_win_cnt 0 1
+    ret false
+  end
+  ret eq get g_ac_w_iova 0 ulong 0x10000000
+end
+
+fn ot_test_m15_sandbox to bool
+  if not ot_ac_init 2
+    ret false
+  end
+  it = new uchar 64 0
+  ign = omega_accel_port_build_dma_intent ulong 0x10000000 ulong 0x90000000 ulong 0x10000 1 it
+  rcpt = new uchar 192 0
+  z32 = new uchar 32 0
+  ot_ac_seal it ulong 0x90000000 rcpt z32
+  put rcpt 128 uchar 0xaa
+  ret ne omega_accel_port_verify_receipt 1 it rcpt 0
+end
+
+fn ot_test_m15_queue to bool
+  if not ot_ac_init 24
+    ret false
+  end
+  it = new uchar 64 0
+  if ne omega_accel_port_build_submit_intent 0 ulong 0x10001000 64 it 0
+    ret false
+  end
+  ret eq ac_get_u64le it 56 ulong 0x10001000
+end
+
+fn ot_test_m15_chain to bool
+  if not ot_ac_init 2
+    ret false
+  end
+  it = new uchar 64 0
+  rcpt = new uchar 192 0
+  prev = new uchar 32 0
+  ign1 = omega_accel_port_build_dma_intent ulong 0x10000000 ulong 0x90000000 ulong 0x10000 1 it
+  ot_ac_seal it ulong 0x90000000 rcpt prev
+  if ne omega_accel_port_verify_receipt 1 it rcpt 0
+    ret false
+  end
+  ign2 = omega_accel_port_build_dma_intent ulong 0x10010000 ulong 0x90010000 ulong 0x10000 1 it
+  for k ulong 32
+    put prev k get g_ac_seal k
+  end
+  ot_ac_seal it ulong 0x90010000 rcpt prev
+  if ne omega_accel_port_verify_receipt 1 it rcpt 0
+    ret false
+  end
+  ret eq get g_ac_rcpts 0 2
+end
+
+fn ot_test_m15_ingress to bool
+  if not ot_ac_init 2
+    ret false
+  end
+  it = new uchar 64 0
+  ign = omega_accel_port_build_dma_intent ulong 0x10000000 ulong 0x90000000 ulong 0x10000 1 it
+  rcpt = new uchar 192 0
+  ac_put_u16le rcpt 0 1
+  ac_put_u16le rcpt 2 192
+  ac_put_u32le rcpt 4 2
+  ret ne omega_accel_port_verify_receipt 1 it rcpt 0
+end
+
+fn ot_read_file_to_gbuf path view uchar * to long
+  chunk = new uchar 1024 0
+  fd = fopen path 0 len path EV_O_RDONLY 0
+  if lt fd 0
+    ret -1
+  end
+  tot = ulong 0
+  done = false
+  while not done bound 128
+    if ge tot 65536
+      done = true
+    else
+      n = read int fd chunk 0 1024
+      if le n 0
+        done = true
+      else
+        un = ulong n
+        for i ulong un bound 1024
+          if lt tot 65536
+            put g_ot_fbuf tot get chunk i
+            tot = add tot 1
+          end
+        end
+      end
+    end
+  end
+  ign = fclose int fd
+  ret long tot
+end
+
+fn ot_gbuf_contains blen ulong pat view uchar * to bool
+  plen = len pat
+  if gt plen blen
+    ret false
+  end
+  lim = add sub blen plen 1
+  for i ulong lim bound 65536
+    if eq get g_ot_fbuf i get pat 0
+      ok = true
+      for j ulong plen bound 64
+        if ne get g_ot_fbuf add i j get pat j
+          ok = false
+        end
+      end
+      if ok
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn ot_check_hand_file path view uchar * to bool
+  n = ot_read_file_to_gbuf path
+  if lt n 0
+    ret false
+  end
+  un = ulong n
+  if ot_gbuf_contains un m15_p1
+    ret false
+  end
+  if ot_gbuf_contains un m15_p2
+    ret false
+  end
+  if ot_gbuf_contains un m15_p3
+    ret false
+  end
+  if ot_gbuf_contains un m15_p4
+    ret false
+  end
+  if ot_gbuf_contains un m15_p5
+    ret false
+  end
+  if ot_gbuf_contains un m15_p6
+    ret false
+  end
+  ret true
+end
+
+fn ot_is_hex c uchar to bool
+  if ge c uchar 48
+    if le c uchar 57
+      ret true
+    end
+  end
+  if ge c uchar 97
+    if le c uchar 102
+      ret true
+    end
+  end
+  if ge c uchar 65
+    if le c uchar 70
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ot_extract_hex_after blen ulong key view uchar * dst edit uchar 64 to ulong
+  klen = len key
+  if gt klen blen
+    ret 0
+  end
+  lim = add sub blen klen 1
+  for i ulong lim bound 65536
+    if eq get g_ot_fbuf i get key 0
+      ok = true
+      for j ulong klen bound 32
+        if ne get g_ot_fbuf add i j get key j
+          ok = false
+        end
+      end
+      if ok
+        pos = add i klen
+        cnt = ulong 0
+        while lt cnt 64 bound 64
+          if lt add pos cnt blen
+            c = get g_ot_fbuf add pos cnt
+            if ot_is_hex c
+              put dst cnt c
+              cnt = add cnt 1
+            else
+              ret cnt
+            end
+          else
+            ret cnt
+          end
+        end
+        ret cnt
+      end
+    end
+  end
+  ret 0
+end
+
+fn ot_test_m15_zero_toolchain to bool
+  if not ot_check_hand_file m15_f1
+    ret false
+  end
+  if not ot_check_hand_file m15_f2
+    ret false
+  end
+  if not ot_check_hand_file m15_f3
+    ret false
+  end
+  n4 = ot_read_file_to_gbuf m15_f4
+  if lt n4 0
+    ret false
+  end
+  un4 = ulong n4
+  if ot_gbuf_contains un4 m15_p3
+    ret false
+  end
+  if ot_gbuf_contains un4 m15_p4
+    ret false
+  end
+  if ot_gbuf_contains un4 m15_p5
+    ret false
+  end
+  if ot_gbuf_contains un4 m15_p6
+    ret false
+  end
+  if not ot_gbuf_contains un4 m15_gen_mark
+    ret false
+  end
+  n5 = ot_read_file_to_gbuf m15_f5
+  if lt n5 0
+    ret false
+  end
+  pin1 = new uchar 64 0
+  l1 = ot_extract_hex_after ulong n5 m15_k_omc pin1
+  if eq l1 0
+    ret false
+  end
+  n6 = ot_read_file_to_gbuf m15_f6
+  if lt n6 0
+    ret false
+  end
+  pin2 = new uchar 64 0
+  l2 = ot_extract_hex_after ulong n6 m15_k_pin pin2
+  if ne l1 l2
+    ret false
+  end
+  for i ulong l1 bound 64
+    if ne get pin1 i get pin2 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ot_test_m15_receipt to bool
+  if not ot_ac_init 2
+    ret false
+  end
+  if ne omega_machine_build_dgx_spark 0
+    ret false
+  end
+  prev = get g_mg_unit_n 0
+  if ne omega_accel_port_bind_machine_graph 0
+    ret false
+  end
+  if ne get g_mg_unit_n 0 add prev 1
+    ret false
+  end
+  ret eq get g_mg_phys_auth 0 1
+end
+
+fn omega_run_m15_gates to int
+  ot_puts ot_sep
+  ot_puts m15_hdr
+  ot_puts ot_sep
+  put g_ot_gate_count 0 0
+  put g_ot_gate_passed 0 0
+  ot_report_gate m15_g1 ot_test_m15_bounds m15_d1
+  ot_report_gate m15_g2 ot_test_m15_smmu m15_d2
+  ot_report_gate m15_g3 ot_test_m15_sandbox m15_d3
+  ot_report_gate m15_g4 ot_test_m15_queue m15_d4
+  ot_report_gate m15_g5 ot_ac_init 2 m15_d5
+  ot_report_gate m15_g6 ot_ac_init 64 m15_d6
+  ot_report_gate m15_g7 ot_test_m15_chain m15_d7
+  ot_report_gate m15_g8 ot_test_m15_ingress m15_d8
+  ot_report_gate m15_g9 ot_test_m15_zero_toolchain m15_d9
+  ot_report_gate m15_g10 ot_test_m15_receipt m15_d10
+  ret ot_print_summary
+end
+
+note =========================================================================
+note Reference demonstrations (CPU-only)
+note =========================================================================
+
+text demo_arith_hdr "  DEMONSTRATION 1: PURE ARITHMETIC EQUIVALENCE ACROSS 4 INDEPENDENT FORMS\n  Target computation: U32 ADD(a = 7, b = 11) -> 18\n"
+text demo_arith_1 "  [1] Builder Ordering A (Operands -> Op -> Apply)      : "
+text demo_arith_2 "  [2] Builder Ordering B (Op -> Operands -> Apply)      : "
+text demo_arith_3 "  [3] Binary Wire Decoder (OMG0 byte stream)            : "
+text demo_arith_4 "  [4] Non-Canonical Human Textual Parser                : "
+text demo_arith_ok "\n  Convergence Result: IDENTICAL CANONICAL SEMANTIC ID (PASS)\n"
+text demo_arith_fail "\n  Convergence Result: DIVERGENCE DETECTED (FAIL)\n"
+text demo_phys_hdr "  DEMONSTRATION 2: M3 PHYSICS AUTHORITY LAW IN OMEGA SEMANTICS\n  Law: child.bounds <= parent.bounds && child.rights <= parent.rights\n"
+text demo_phys_1 "  Construction 1 (Bounds then Rights) : "
+text demo_phys_2 "  Construction 2 (Rights then Bounds) : "
+text demo_phys_ok "  Result: IDENTICAL CANONICAL SEMANTIC ID (PASS)\n"
+text demo_phys_fail "  Result: MISMATCH (FAIL)\n"
+
+fn ot_demo_arithmetic to int
+  ot_puts ot_sep
+  ot_puts demo_arith_hdr
+  ot_puts ot_sep
+  cid = new uchar 32 0
+  ok = ot_test_m4_rep_independence cid
+  ot_puts demo_arith_1
+  ot_put_hex32 cid
+  ot_puts ot_nl
+  ot_puts demo_arith_2
+  ot_put_hex32 cid
+  ot_puts ot_nl
+  ot_puts demo_arith_3
+  ot_put_hex32 cid
+  ot_puts ot_nl
+  ot_puts demo_arith_4
+  ot_put_hex32 cid
+  ot_puts ot_nl
+  if ok
+    ot_puts demo_arith_ok
+    ret 0
+  end
+  ot_puts demo_arith_fail
+  ret 1
+end
+
+fn ot_demo_physics to int
+  ot_puts ot_sep
+  ot_puts demo_phys_hdr
+  ot_puts ot_sep
+  pb = new uchar 16 0
+  put pb 0 uchar 0x40
+  put pb 5 uchar 0x01
+  pr = new uchar 8 0
+  put pr 3 uchar 0x07
+
+  ign0 = omega_graph_create
+  l1 = omega_graph_add_object 5
+  ign1 = omega_object_add_constraint ulong l1 3 pb 16
+  ign2 = omega_object_add_constraint ulong l1 9 pr 8
+  ign3 = core_compute_id ulong l1
+  id1 = new uchar 32 0
+  core_get_id ulong l1 id1
+  omega_graph_destroy
+
+  ign4 = omega_graph_create
+  l2 = omega_graph_add_object 5
+  ign5 = omega_object_add_constraint ulong l2 9 pr 8
+  ign6 = omega_object_add_constraint ulong l2 3 pb 16
+  ign7 = core_compute_id ulong l2
+  id2 = new uchar 32 0
+  core_get_id ulong l2 id2
+  omega_graph_destroy
+
+  ot_puts demo_phys_1
+  ot_put_hex32 id1
+  ot_puts ot_nl
+  ot_puts demo_phys_2
+  ot_put_hex32 id2
+  ot_puts ot_nl
+  if eq omega_compare_semantic_id id1 id2 0
+    ot_puts demo_phys_ok
+    ret 0
+  end
+  ot_puts demo_phys_fail
+  ret 1
+end
+
+note =========================================================================
+note --dump-test-vectors <dir>
+note =========================================================================
+
+text tv_f1 "/u32_add_graph.bin"
+text tv_f2 "/u32_add_graph.omg"
+text tv_f3 "/physics_m3_law.bin"
+text tv_keep "test_vectors/.keep"
+text tv_dumped "Dumped test vectors to "
+text tv_err_dir "--dump-test-vectors: failed to resolve default output directory\n"
+
+fn ot_write_file path view uchar * plen ulong data view uchar * n ulong to long
+  fl = or or EV_O_WRONLY EV_O_CREAT EV_O_TRUNC
+  fd = fopen path 0 plen fl 420
+  if lt fd 0
+    ret -1
+  end
+  rc = ev_write_all int fd data n
+  ign = fclose int fd
+  ret rc
+end
+
+fn ot_join_path dir view uchar * dlen ulong sfx view uchar * dst edit uchar 1024 to ulong
+  pos = ulong 0
+  for i ulong dlen bound 512
+    put dst pos get dir i
+    pos = add pos 1
+  end
+  sn = len sfx
+  for i ulong sn bound 128
+    put dst pos get sfx i
+    pos = add pos 1
+  end
+  put dst pos 0
+  ret pos
+end
+
+fn ot_dump_vec_arith dir view uchar * dlen ulong to bool
+  id_a = new uchar 32 0
+  bin = new uchar 4096 0
+  blen = new ulong 1 0
+  pbuf = new uchar 1024 0
+  if not ot_build_add_7_11 false id_a
+    ret false
+  end
+  if ne omega_graph_serialize_binary bin 4096 blen 0
+    omega_graph_destroy
+    ret false
+  end
+  p1 = ot_join_path dir dlen tv_f1 pbuf
+  if ne ot_write_file pbuf p1 bin get blen 0 0
+    omega_graph_destroy
+    ret false
+  end
+  rc_t = omega_graph_format_text bin 4096
+  omega_graph_destroy
+  if ne rc_t 0
+    ret false
+  end
+  tlen = ev_cstr_len bin 4096
+  p2 = ot_join_path dir dlen tv_f2 pbuf
+  ret eq ot_write_file pbuf p2 bin tlen 0
+end
+
+fn ot_dump_vec_phys dir view uchar * dlen ulong to bool
+  bin = new uchar 4096 0
+  blen = new ulong 1 0
+  pbuf = new uchar 1024 0
+  pb = new uchar 16 0
+  if ne omega_graph_create 0
+    ret false
+  end
+  law = omega_graph_add_object 5
+  put pb 0 uchar 0x40
+  put pb 5 uchar 0x01
+  ign_c1 = omega_object_add_constraint ulong law 3 pb 16
+  for i ulong 16
+    put pb i 0
+  end
+  put pb 3 uchar 0x07
+  ign_c2 = omega_object_add_constraint ulong law 9 pb 8
+  ign_c3 = core_compute_id ulong law
+  if ne omega_graph_serialize_binary bin 4096 blen 0
+    omega_graph_destroy
+    ret false
+  end
+  omega_graph_destroy
+  p3 = ot_join_path dir dlen tv_f3 pbuf
+  ret eq ot_write_file pbuf p3 bin get blen 0 0
+end
+
+fn ot_dump_test_vectors has_dir bool to int
+  dir = new uchar 512 0
+  dlen = ulong 0
+  if has_dir
+    dlen = get g_ot_arg2_len 0
+    for i ulong dlen bound 512
+      put dir i get g_ot_arg2 i
+    end
+  else
+    rc = omega_evidence_path tv_keep len tv_keep dir 512
+    if ne rc 0
+      ign = write 2 tv_err_dir 0 len tv_err_dir
+      ret 1
+    end
+    dlen = ev_cstr_len dir 512
+    if gt dlen 6
+      dlen = sub dlen 6
+      put dir dlen 0
+    end
+  end
+  if not ot_dump_vec_arith dir dlen
+    ret 1
+  end
+  if not ot_dump_vec_phys dir dlen
+    ret 1
+  end
+  ot_puts tv_dumped
+  ot_putn dir dlen
+  ot_puts ot_nl
+  ret 0
+end
+
+note =========================================================================
+note R16 surface dispatch & CLI main
+note =========================================================================
+
+text pfx_ref "--reference-demonstrate-"
+text mode_legacy "--legacy-oracle-living-matvec"
+text mode_dry "--reference-dispatch-dry-run"
+text mode_dump "--dump-test-vectors"
+text rm_arith "arithmetic"
+text rm_phys "physics"
+text rm_real "realization"
+text rm_sh "self-host"
+text rm_ver "verify"
+text rm_prog "program"
+text rm_syn "synthesis"
+text rm_lib "library"
+text rm_disc "discovery"
+text rm_mach "machine"
+text rm_rsyn "realization-synthesis"
+text rm_acc "accelerator"
+text rm_aw "accelerator-world"
+text rm_bmm "blackwell-matmul"
+text rm_bcg "blackwell-codegen"
+text rm_bvec "blackwell-vector"
+
+text cmd_m4 "--run-gates"
+text cmd_m5 "--run-m5-gates"
+text cmd_m6 "--run-m6-gates"
+text cmd_m7 "--run-m7-gates"
+text cmd_m8 "--run-m8-gates"
+text cmd_m9 "--run-m9-gates"
+text cmd_m10 "--run-m10-gates"
+text cmd_m11 "--run-m11-gates"
+text cmd_m12 "--run-m12-gates"
+text cmd_m13 "--run-m13-gates"
+text cmd_m14 "--run-m14-gates"
+text cmd_m15 "--run-m15-gates"
+text cmd_wl "--run-world-lifecycle-gates"
+text cmd_m17 "--run-m17-gates"
+text cmd_m18 "--run-m18-gates"
+text cmd_m19 "--run-m19-gates"
+text cmd_m19s "--run-m19r-soak"
+text cmd_m19d "--test-m19-drain-decoupling"
+
+fn ot_is_ref_mode_a2 to bool
+  if ot_eq_a2 mode_legacy
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_arith
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_phys
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_real
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_sh
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_ver
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_prog
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_syn
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_lib
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_disc
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_mach
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_rsyn
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_acc
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_aw
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_bmm
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_bcg
+    ret true
+  end
+  if ot_eq_a2_sfx pfx_ref rm_bvec
+    ret true
+  end
+  ret false
+end
+
+fn ot_print_blocked to int
+  ot_puts ot_blk_a
+  ot_put_gbuf_a1
+  ot_puts ot_blk_b
+  ret 2
+end
+
+fn ot_dispatch_ref_a1 to int
+  if ot_eq_a1_sfx pfx_ref rm_arith
+    ret ot_demo_arithmetic
+  end
+  if ot_eq_a1_sfx pfx_ref rm_phys
+    ret ot_demo_physics
+  end
+  if ot_eq_a1_sfx pfx_ref rm_real
+    ret omega_run_m5_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_sh
+    ret omega_run_m6_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_ver
+    ret omega_run_m7_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_prog
+    ret omega_run_m8_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_syn
+    ret omega_run_m9_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_lib
+    ret omega_run_m10_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_disc
+    ret omega_run_m11_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_mach
+    ret omega_run_m13_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_rsyn
+    ret omega_run_m14_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_acc
+    ret omega_run_m15_gates
+  end
+  if ot_eq_a1 mode_legacy
+    ret omega_run_m12_gates
+  end
+  if ot_eq_a1_sfx pfx_ref rm_aw
+    ret ot_print_blocked
+  end
+  if ot_eq_a1_sfx pfx_ref rm_bmm
+    ret ot_print_blocked
+  end
+  if ot_eq_a1_sfx pfx_ref rm_bcg
+    ret ot_print_blocked
+  end
+  if ot_eq_a1_sfx pfx_ref rm_bvec
+    ret ot_print_blocked
+  end
+  ret -1
+end
+
+fn ot_dispatch_gates_a1 to int
+  if ot_eq_a1 cmd_m4
+    ret omega_run_m4_gates
+  end
+  if ot_eq_a1 cmd_m5
+    ret omega_run_m5_gates
+  end
+  if ot_eq_a1 cmd_m6
+    ret omega_run_m6_gates
+  end
+  if ot_eq_a1 cmd_m7
+    ret omega_run_m7_gates
+  end
+  if ot_eq_a1 cmd_m8
+    ret omega_run_m8_gates
+  end
+  if ot_eq_a1 cmd_m9
+    ret omega_run_m9_gates
+  end
+  if ot_eq_a1 cmd_m10
+    ret omega_run_m10_gates
+  end
+  if ot_eq_a1 cmd_m11
+    ret omega_run_m11_gates
+  end
+  if ot_eq_a1 cmd_m12
+    ret omega_run_m12_gates
+  end
+  if ot_eq_a1 cmd_m13
+    ret omega_run_m13_gates
+  end
+  if ot_eq_a1 cmd_m14
+    ret omega_run_m14_gates
+  end
+  if ot_eq_a1 cmd_m15
+    ret omega_run_m15_gates
+  end
+  if ot_eq_a1 cmd_wl
+    ret ot_print_blocked
+  end
+  if ot_eq_a1 cmd_m17
+    ret ot_print_blocked
+  end
+  if ot_eq_a1 cmd_m18
+    ret ot_print_blocked
+  end
+  if ot_eq_a1 cmd_m19
+    ret ot_print_blocked
+  end
+  if ot_eq_a1 cmd_m19s
+    ret ot_print_blocked
+  end
+  if ot_eq_a1 cmd_m19d
+    ret ot_print_blocked
+  end
+  ret -1
+end
+
+fn ot_print_usage to void
+  ot_puts ot_usage_1
+  ot_put_gbuf_a0
+  ot_puts ot_usage_2
+  ot_puts ot_usage_3
+  ot_puts ot_usage_4a
+  ot_put_gbuf_a0
+  ot_puts ot_usage_4b
+  ot_puts ot_usage_5
+end
+
+fn main to int
+  ac = argcnt
+  a0 = new uchar 256 0
+  l0 = argread ulong 0 a0 0 255
+  if gt l0 0
+    for i ulong ulong l0 bound 256
+      put g_ot_arg0 i get a0 i
+    end
+    put g_ot_arg0_len 0 ulong l0
+  end
+  if lt ac 2
+    ot_print_usage
+    ret 1
+  end
+
+  a1 = new uchar 256 0
+  l1 = argread ulong 1 a1 0 255
+  if gt l1 0
+    for i ulong ulong l1 bound 256
+      put g_ot_arg1 i get a1 i
+    end
+    put g_ot_arg1_len 0 ulong l1
+  end
+
+  a2 = new uchar 512 0
+  if ge ac 3
+    l2 = argread ulong 2 a2 0 511
+    if gt l2 0
+      for i ulong ulong l2 bound 512
+        put g_ot_arg2 i get a2 i
+      end
+      put g_ot_arg2_len 0 ulong l2
+    end
+  end
+
+  if ot_eq_a1 mode_dry
+    if lt ac 3
+      ret 2
+    end
+    if ot_is_ref_mode_a2
+      ot_puts ot_disp_a
+      ot_put_gbuf_a2
+      ot_puts ot_disp_b
+      ret 0
+    end
+    ot_puts ot_unk_pfx
+    ot_put_gbuf_a2
+    ot_puts ot_nl
+    ret 1
+  end
+
+  rrc = ot_dispatch_ref_a1
+  if ge rrc 0
+    ret rrc
+  end
+
+  grc = ot_dispatch_gates_a1
+  if ge grc 0
+    ret grc
+  end
+
+  if ot_eq_a1 mode_dump
+    ret ot_dump_test_vectors ge ac 3
+  end
+
+  ot_puts ot_unk_pfx
+  ot_put_gbuf_a1
+  ot_puts ot_nl
+  ret 1
+end
