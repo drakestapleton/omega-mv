@@ -1,0 +1,480 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_prefill.c
+note Device-resident prefill buffers (GPU-cached dev + GPU-uncached host),
+note 64-slot kernel cache, launch & cmdlist record helpers, and staging upload/download.
+note Composes on src/omega_gpu_session.om, src/omega_gpu_cmdlist.om, and om/gpu/cg_pf.om.
+om2
+
+const OMEGA_GPU_PF_OK long 0
+const OMEGA_GPU_PF_BAD_ARGS long -1
+const OMEGA_GPU_PF_TOO_LARGE long -2
+const OMEGA_GPU_PF_CODEGEN_FAIL long -3
+const OMEGA_GPU_PF_CHIP_FAIL long -4
+
+const PF_SLOTS ulong 64
+const PF_STAGE_BYTES ulong 67108864
+const PF_TIMEOUT_MS ulong 20000
+const PF_SPIN_US ulong 200000
+const PF_COPY_THREADS ulong 256
+const PF_KIND_COPY ulong 1
+const PF_HOOK_ID ulong 101
+
+note Slot table (64 slots):
+note   g_pf_slot_valid[64]
+note   g_pf_slot_key[64 * 16]   (kind + 15 spec words)
+note   g_pf_slot_kern[64 * 3]   (code_va, gpr_declared, gpr_peak)
+note   g_pf_slot_code[64 * 6]   (OmegaGpuMem 6 ulongs)
+global g_pf_hooked ulong 1
+global g_pf_slot_valid ulong 64
+global g_pf_slot_key uint 1024
+global g_pf_slot_kern ulong 192
+global g_pf_slot_code ulong 384
+global g_pf_stage ulong 9
+global g_pf_chip_ns ulong 1
+global g_pf_launches ulong 1
+
+text pf_rc_ok "OK"
+text pf_rc_bad "BAD_ARGS"
+text pf_rc_big "TOO_LARGE"
+text pf_rc_cg "CODEGEN_FAIL"
+text pf_rc_chip "CHIP_FAIL"
+text pf_rc_unk "UNKNOWN"
+text pf_err_hook "prefill: no session hook slot left"
+text pf_err_full "prefill kernel cache full"
+text pf_err_reg "prefill launch: registers x threads exceed the file"
+text pf_err_decl "declared registers below peak + 2: refusing to launch"
+
+fn pf_copy_txt src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n bound 32
+    put dst i get src i
+  end
+  ret n
+end
+
+fn omega_gpu_pf_rc_name rc long dst edit uchar * to ulong
+  if eq rc OMEGA_GPU_PF_OK
+    ret pf_copy_txt pf_rc_ok dst
+  end
+  if eq rc OMEGA_GPU_PF_BAD_ARGS
+    ret pf_copy_txt pf_rc_bad dst
+  end
+  if eq rc OMEGA_GPU_PF_TOO_LARGE
+    ret pf_copy_txt pf_rc_big dst
+  end
+  if eq rc OMEGA_GPU_PF_CODEGEN_FAIL
+    ret pf_copy_txt pf_rc_cg dst
+  end
+  if eq rc OMEGA_GPU_PF_CHIP_FAIL
+    ret pf_copy_txt pf_rc_chip dst
+  end
+  ret pf_copy_txt pf_rc_unk dst
+end
+
+fn pf_on_close to void
+  m = new ulong 6 0
+  for i ulong PF_SLOTS
+    if ne get g_pf_slot_valid i 0
+      b = mul i 6
+      for k ulong 6
+        put m k get g_pf_slot_code add b k
+        put g_pf_slot_code add b k 0
+      end
+      ogps_free m
+      put g_pf_slot_valid i 0
+    end
+  end
+  sc = new ulong 9 0
+  for k ulong 9
+    put sc k get g_pf_stage k
+  end
+  ogps_scratch_free sc
+  for k ulong 9
+    put g_pf_stage k get sc k
+  end
+end
+
+fn omega_gpu_pf_open_locked to long
+  if eq get g_pf_hooked 0 0
+    if ne ogps_on_close PF_HOOK_ID OGPS_OK
+      ogps_set_error pf_err_hook
+      ret OMEGA_GPU_PF_CHIP_FAIL
+    end
+    put g_pf_hooked 0 1
+  end
+  if eq ogps_open 0
+    ret OMEGA_GPU_PF_CHIP_FAIL
+  end
+  ret OMEGA_GPU_PF_OK
+end
+
+fn omega_gpu_pf_stats chip_ns edit ulong 1 launches edit ulong 1 to void
+  put chip_ns 0 get g_pf_chip_ns 0
+  put launches 0 get g_pf_launches 0
+end
+
+fn omega_gpu_pf_stats_reset to void
+  put g_pf_chip_ns 0 0
+  put g_pf_launches 0 0
+end
+
+fn omega_gpu_pf_alloc_dev nbytes ulong dst edit ulong 6 to long
+  ogps_mem_zero dst
+  if eq nbytes 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  desc = new ulong 5 0
+  h = new ulong 2 0
+  inf = new ulong 3 0
+  ogps_lock
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    want = ogps_page_up nbytes
+    put desc 0 OGP_HANDLE_BUF_DATA
+    put desc 1 or OGP_RIGHT_GPU_READ OGP_RIGHT_GPU_WRITE
+    put desc 2 OGP_CACHE_GPU_CACHED
+    put desc 3 OGPS_PAGE
+    put desc 4 want
+    prc = ogpl_dma_alloc get ogps_dev 0 get ogps_dev 1 desc h inf
+    if or ne prc OGP_OK lt get inf 2 want
+      if eq prc OGP_OK
+        ign = ogpl_dma_free get h 0 get h 1
+      end
+      ogps_mem_zero dst
+      rc = OMEGA_GPU_PF_CHIP_FAIL
+    else
+      put dst 0 get h 0
+      put dst 1 get h 1
+      put dst 2 OGP_HANDLE_BUF_DATA
+      put dst 3 get inf 0
+      put dst 4 get inf 1
+      put dst 5 get inf 2
+    end
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn omega_gpu_pf_alloc_host nbytes ulong dst edit ulong 6 to long
+  ogps_mem_zero dst
+  if eq nbytes 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  ogps_lock
+  rc = omega_gpu_pf_open_locked
+  if and eq rc OMEGA_GPU_PF_OK ne ogps_alloc nbytes dst OGPS_OK
+    rc = OMEGA_GPU_PF_CHIP_FAIL
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn omega_gpu_pf_free m edit ulong 6 to void
+  ogps_lock
+  ogps_free m
+  ogps_unlock
+end
+
+fn pf_gpr_declared peak ulong to ulong
+  need = add peak 2
+  if lt need 64
+    ret 64
+  end
+  ret mul div add need 7 8 8
+end
+
+fn pf_gpr_declared_ok decl ulong peak ulong to bool
+  ret and ge decl add peak 2 le decl 128
+end
+
+fn pf_key_eq slot ulong key view uint 16 to bool
+  base = mul slot 16
+  for i ulong 16
+    if ne get g_pf_slot_key add base i get key i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pf_codegen_info key view uint 16 info edit ulong 2 to long
+  kind = ulong get key 0
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  sp = new ulong 8 0
+  for i ulong 7
+    put sp i ulong get key add i 1
+  end
+  cg_rc = ulong 1
+  if eq kind PF_KIND_COPY
+    cg_rc = cg_pf_copy ins meta
+  else
+    if eq kind 0x50
+      cg_rc = cg_rl_emit sp ins meta
+    else
+      if eq kind 0x51
+        cg_rc = cg_mc_emit sp ins meta
+      else
+        ret OMEGA_GPU_PF_CODEGEN_FAIL
+      end
+    end
+  end
+  nins = get meta 0
+  if or ne cg_rc 0 eq nins 0
+    ret OMEGA_GPU_PF_CODEGEN_FAIL
+  end
+  peak = get meta 1
+  if eq peak 0
+    peak = ulong 32
+  end
+  put info 0 mul nins 16
+  put info 1 peak
+  ret OMEGA_GPU_PF_OK
+end
+
+fn pf_store_slot slot ulong key view uint 16 cm view ulong 6 decl ulong peak ulong to void
+  put g_pf_slot_valid slot 1
+  key_b = mul slot 16
+  for i ulong 16
+    put g_pf_slot_key add key_b i get key i
+  end
+  cm_b = mul slot 6
+  for i ulong 6
+    put g_pf_slot_code add cm_b i get cm i
+  end
+  kb = mul slot 3
+  put g_pf_slot_kern kb get cm 4
+  put g_pf_slot_kern add kb 1 decl
+  put g_pf_slot_kern add kb 2 peak
+end
+
+note Look up or build & cache a prefill kernel for key (kind + 15 spec words).
+note kout = [code_va, gpr_declared, gpr_peak]
+fn omega_gpu_pf_kernel_locked key view uint 16 kout edit ulong 3 to long
+  for i ulong PF_SLOTS
+    if ne get g_pf_slot_valid i 0
+      if pf_key_eq i key
+        kb = mul i 3
+        put kout 0 get g_pf_slot_kern kb
+        put kout 1 get g_pf_slot_kern add kb 1
+        put kout 2 get g_pf_slot_kern add kb 2
+        ret OMEGA_GPU_PF_OK
+      end
+    end
+  end
+  slot = PF_SLOTS
+  for i ulong PF_SLOTS
+    if and eq slot PF_SLOTS eq get g_pf_slot_valid i 0
+      slot = i
+    end
+  end
+  if eq slot PF_SLOTS
+    ogps_set_error pf_err_full
+    ret OMEGA_GPU_PF_TOO_LARGE
+  end
+  info = new ulong 2 0
+  crc = pf_codegen_info key info
+  if ne crc OMEGA_GPU_PF_OK
+    ret crc
+  end
+  decl = pf_gpr_declared get info 1
+  if gt decl 128
+    ret OMEGA_GPU_PF_TOO_LARGE
+  end
+  cm = new ulong 6 0
+  if ne ogps_alloc_code get info 0 cm OGPS_OK
+    ret OMEGA_GPU_PF_CHIP_FAIL
+  end
+  if ne ogps_sync_to_gpu cm OGPS_OK
+    ogps_free cm
+    ret OMEGA_GPU_PF_CHIP_FAIL
+  end
+  pf_store_slot slot key cm decl get info 1
+  put kout 0 get cm 4
+  put kout 1 decl
+  put kout 2 get info 1
+  ret OMEGA_GPU_PF_OK
+end
+
+fn pf_fill_launch kern view ulong 3 dims view ulong 5 L edit ulong 12 to long
+  threads = get dims 0
+  gx = get dims 1
+  gy = get dims 2
+  if or eq threads 0 or eq gx 0 eq gy 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  decl = get kern 1
+  if gt mul threads decl 65536
+    ogps_set_error pf_err_reg
+    ret OMEGA_GPU_PF_TOO_LARGE
+  end
+  if not pf_gpr_declared_ok decl get kern 2
+    ogps_set_error pf_err_decl
+    ret OMEGA_GPU_PF_CHIP_FAIL
+  end
+  put L 0 get kern 0
+  put L 1 decl
+  put L 2 threads
+  put L 3 1
+  put L 4 gx
+  put L 5 gy
+  put L 6 mul mul threads gx gy
+  put L 7 get dims 4
+  put L 8 PF_TIMEOUT_MS
+  put L 9 get dims 3
+  put L 10 PF_SPIN_US
+  ret OMEGA_GPU_PF_OK
+end
+
+note dims = [threads, gx, gy, shbytes, nargs]
+fn omega_gpu_pf_launch_locked kern view ulong 3 dims view ulong 5 args view uint * ns edit ulong 1 to long
+  L = new ulong 12 0
+  frc = pf_fill_launch kern dims L
+  if ne frc OMEGA_GPU_PF_OK
+    ret frc
+  end
+  el = new ulong 1 0
+  mk = new uint 1 0
+  if ne ogps_launch L args el mk OGPS_OK
+    ret OMEGA_GPU_PF_CHIP_FAIL
+  end
+  t = get el 0
+  put g_pf_chip_ns 0 add get g_pf_chip_ns 0 t
+  put g_pf_launches 0 add get g_pf_launches 0 1
+  put ns 0 add get ns 0 t
+  ret OMEGA_GPU_PF_OK
+end
+
+fn omega_gpu_pf_record_locked cid ulong kern view ulong 3 dims view ulong 5 args view uint * to long
+  if eq cid 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  L = new ulong 12 0
+  frc = pf_fill_launch kern dims L
+  if ne frc OMEGA_GPU_PF_OK
+    ret frc
+  end
+  if lt ogcl_add cid L args 0
+    ret OMEGA_GPU_PF_CHIP_FAIL
+  end
+  ret OMEGA_GPU_PF_OK
+end
+
+fn pf_copy_locked dst_va ulong src_va ulong nbytes ulong to long
+  if or ne and nbytes 15 0 or ne and dst_va 15 0 ne and src_va 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if eq nbytes 0
+    ret OMEGA_GPU_PF_OK
+  end
+  key = new uint 16 0
+  put key 0 uint PF_KIND_COPY
+  kern = new ulong 3 0
+  rc = omega_gpu_pf_kernel_locked key kern
+  if ne rc OMEGA_GPU_PF_OK
+    ret rc
+  end
+  units = div nbytes 16
+  grid = div add units sub PF_COPY_THREADS 1 PF_COPY_THREADS
+  args = new uint 5 0
+  put args 0 uint and dst_va 0xffffffff
+  put args 1 uint shr dst_va 32
+  put args 2 uint and src_va 0xffffffff
+  put args 3 uint shr src_va 32
+  put args 4 uint units
+  dims = new ulong 5 0
+  put dims 0 PF_COPY_THREADS
+  put dims 1 grid
+  put dims 2 1
+  put dims 3 0
+  put dims 4 5
+  ns = new ulong 1 0
+  ret omega_gpu_pf_launch_locked kern dims args ns
+end
+
+fn omega_gpu_pf_copy_va dst_va ulong src_va ulong nbytes ulong to long
+  ogps_lock
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    rc = pf_copy_locked dst_va src_va nbytes
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn pf_ensure_stage nbytes ulong sm edit ulong 6 to long
+  sc = new ulong 9 0
+  for k ulong 9
+    put sc k get g_pf_stage k
+  end
+  if ne ogps_scratch sc nbytes OGPS_OK
+    ret OMEGA_GPU_PF_CHIP_FAIL
+  end
+  for k ulong 9
+    put g_pf_stage k get sc k
+  end
+  for k ulong 6
+    put sm k get sc k
+  end
+  ret OMEGA_GPU_PF_OK
+end
+
+fn omega_gpu_pf_upload dev view ulong 6 off ulong src view uchar * nbytes ulong to long
+  if or ne and off 15 0 ne and nbytes 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if or gt add off nbytes get dev 5 lt len src nbytes
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  sm = new ulong 6 0
+  ogps_lock
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    rc = pf_ensure_stage nbytes sm
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    if not ldst_map_copy_in long get sm 3 src nbytes
+      rc = OMEGA_GPU_PF_CHIP_FAIL
+    end
+  end
+  if and eq rc OMEGA_GPU_PF_OK ne ogps_sync_to_gpu sm OGPS_OK
+    rc = OMEGA_GPU_PF_CHIP_FAIL
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    rc = pf_copy_locked add get dev 4 off get sm 4 nbytes
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn omega_gpu_pf_download dev view ulong 6 off ulong dst edit uchar * nbytes ulong to long
+  if or ne and off 15 0 ne and nbytes 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if or gt add off nbytes get dev 5 lt len dst nbytes
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  sm = new ulong 6 0
+  ogps_lock
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    rc = pf_ensure_stage nbytes sm
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    rc = pf_copy_locked get sm 4 add get dev 4 off nbytes
+  end
+  if and eq rc OMEGA_GPU_PF_OK ne ogps_sync_to_cpu sm OGPS_OK
+    rc = OMEGA_GPU_PF_CHIP_FAIL
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    if not ldst_map_copy_out long get sm 3 dst nbytes
+      rc = OMEGA_GPU_PF_CHIP_FAIL
+    end
+  end
+  ogps_unlock
+  ret rc
+end

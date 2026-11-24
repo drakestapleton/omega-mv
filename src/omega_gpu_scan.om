@@ -1,0 +1,409 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_scan.c
+note Reductions (SUM/MAX/MIN) and inclusive prefix sums on GB10:
+note IR codegen, grid & scratch planners, multi-level reduce/prefix drivers,
+note mutant hooks, and live GB10 session executor.
+note Composes on src/omega_gpu_scan_ref.om, src/omega_gpu_session.om,
+note src/omega_numeric_reduce_gb10.om, and om/gpu/bw_vecadd.om.
+om2
+
+const OMEGA_GPU_SCAN_MAX_N ulong 268435456
+const OMEGA_GPU_SCAN_THREADS ulong 256
+const OMEGA_GPU_SCAN_MAX_CTAS ulong 1024
+
+const OMEGA_GPU_SCAN_OK long 0
+const OMEGA_GPU_SCAN_BAD_ARGS long -1
+const OMEGA_GPU_SCAN_TOO_LARGE long -2
+const OMEGA_GPU_SCAN_CODEGEN_FAIL long -3
+const OMEGA_GPU_SCAN_CHIP_FAIL long -4
+
+const OMEGA_SCAN_K_RED_SUM ulong 0
+const OMEGA_SCAN_K_RED_MAX ulong 1
+const OMEGA_SCAN_K_RED_MIN ulong 2
+const OMEGA_SCAN_K_TILE ulong 3
+const OMEGA_SCAN_K_ADD ulong 4
+const OMEGA_SCAN_K_COUNT ulong 5
+
+const OMEGA_GPU_SCAN_A_IN ulong 0x380
+const OMEGA_GPU_SCAN_A_OUT ulong 0x388
+const OMEGA_GPU_SCAN_A_TOT ulong 0x390
+const OMEGA_GPU_SCAN_A_LEN ulong 0x398
+const OMEGA_GPU_SCAN_A_TILES ulong 0x39c
+const OMEGA_GPU_SCAN_A_WARPS ulong 0x3a0
+const OMEGA_GPU_SCAN_ARGS_WORDS ulong 9
+
+const SCAN_POISON uint 0x7fa00bad
+
+global g_gscan_mutant long 1
+global g_gscan_hooked ulong 1
+global g_gscan_last_launches ulong 1
+global g_gscan_drive_log ulong 128
+global g_gscan_drive_n ulong 1
+global g_gscan_buf ulong 8
+global g_gscan_tot ulong 8
+global g_gscan_len ulong 8
+
+text gscan_rc_ok "OK"
+text gscan_rc_bad "BAD_ARGS"
+text gscan_rc_big "TOO_LARGE"
+text gscan_rc_cg "CODEGEN_FAIL"
+text gscan_rc_chip "CHIP_FAIL"
+text gscan_rc_q "?"
+
+fn gscan_copy_txt src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n bound 32
+    put dst i get src i
+  end
+  ret n
+end
+
+fn omega_gpu_scan_rc_name rc long dst edit uchar * to ulong
+  if eq rc OMEGA_GPU_SCAN_OK
+    ret gscan_copy_txt gscan_rc_ok dst
+  end
+  if eq rc OMEGA_GPU_SCAN_BAD_ARGS
+    ret gscan_copy_txt gscan_rc_bad dst
+  end
+  if eq rc OMEGA_GPU_SCAN_TOO_LARGE
+    ret gscan_copy_txt gscan_rc_big dst
+  end
+  if eq rc OMEGA_GPU_SCAN_CODEGEN_FAIL
+    ret gscan_copy_txt gscan_rc_cg dst
+  end
+  if eq rc OMEGA_GPU_SCAN_CHIP_FAIL
+    ret gscan_copy_txt gscan_rc_chip dst
+  end
+  ret gscan_copy_txt gscan_rc_q dst
+end
+
+fn omega_gpu_scan_test_set_mutant mutant long to void
+  ogps_lock
+  put g_gscan_mutant 0 mutant
+  ogps_unlock
+end
+
+fn omega_gpu_scan_grid n ulong to ulong
+  tiles = div add n 31 32
+  ctas = div add tiles 7 8
+  if gt ctas OMEGA_GPU_SCAN_MAX_CTAS
+    ret OMEGA_GPU_SCAN_MAX_CTAS
+  end
+  if eq ctas 0
+    ret 1
+  end
+  ret ctas
+end
+
+fn omega_gpu_scan_reduce_scratch_words n ulong to ulong
+  w = ulong 0
+  cur = n
+  while true bound 16
+    cur = div add cur 31 32
+    w = add w cur
+    if le cur 1
+      ret w
+    end
+  end
+  ret w
+end
+
+fn omega_gpu_scan_prefix_scratch_words n ulong to ulong
+  w = ulong 0
+  cur = n
+  while gt cur 32 bound 16
+    cur = div add cur 31 32
+    w = add w cur
+  end
+  ret add w 1
+end
+
+fn gscan_args_for a edit uint 9 in_va ulong out_va ulong tot_va ulong n ulong to void
+  put a 0 uint and in_va 0xffffffff
+  put a 1 uint shr in_va 32
+  put a 2 uint and out_va 0xffffffff
+  put a 3 uint shr out_va 32
+  put a 4 uint and tot_va 0xffffffff
+  put a 5 uint shr tot_va 32
+  put a 6 uint n
+  put a 7 uint div add n 31 32
+  put a 8 uint mul omega_gpu_scan_grid n 8
+end
+
+note IR emitter for scan kernels (standard ins[8192] + meta[512] wire format).
+fn gscan_emit_ins ins edit ulong 8192 meta edit ulong 512 op ulong d ulong imm ulong to void
+  n = get meta 0
+  if ge n 1024
+    put meta 5 1
+    ret
+  end
+  b = mul n 8
+  put ins b op
+  put ins add b 1 d
+  put ins add b 2 0
+  put ins add b 3 0
+  put ins add b 4 0
+  put ins add b 5 imm
+  put ins add b 6 0
+  put ins add b 7 0
+  put meta 0 add n 1
+end
+
+fn omega_gpu_scan_codegen kind ulong mutant long ins edit ulong 8192 meta edit ulong 512 to long
+  if ge kind OMEGA_SCAN_K_COUNT
+    ret -1
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  note Prologue: load cbank args + tid/cta/lane/gw/tile
+  gscan_emit_ins ins meta 4 0 0x358
+  gscan_emit_ins ins meta 5 1 OMEGA_GPU_SCAN_A_IN
+  gscan_emit_ins ins meta 5 2 OMEGA_GPU_SCAN_A_OUT
+  if eq kind OMEGA_SCAN_K_TILE
+    gscan_emit_ins ins meta 5 3 OMEGA_GPU_SCAN_A_TOT
+  end
+  gscan_emit_ins ins meta 6 4 OMEGA_GPU_SCAN_A_LEN
+  gscan_emit_ins ins meta 6 5 OMEGA_GPU_SCAN_A_TILES
+  gscan_emit_ins ins meta 6 6 OMEGA_GPU_SCAN_A_WARPS
+  gscan_emit_ins ins meta 3 7 0
+  gscan_emit_ins ins meta 3 8 1
+  if le kind OMEGA_SCAN_K_RED_MIN
+    steps = ulong 5
+    if eq mutant 1
+      steps = ulong 4
+    end
+    d = ulong 16
+    for s ulong steps bound 5
+      gscan_emit_ins ins meta 42 9 d
+      if eq kind OMEGA_SCAN_K_RED_SUM
+        gscan_emit_ins ins meta 31 10 0
+      else
+        gscan_emit_ins ins meta 34 10 kind
+      end
+      d = shr d 1
+    end
+    gscan_emit_ins ins meta 55 0 0
+  else
+    if eq kind OMEGA_SCAN_K_TILE
+      steps = ulong 5
+      if eq mutant 2
+        steps = ulong 4
+      end
+      for s ulong steps bound 5
+        gscan_emit_ins ins meta 42 9 shl ulong 1 s
+        gscan_emit_ins ins meta 31 10 0
+      end
+      gscan_emit_ins ins meta 55 0 0
+      gscan_emit_ins ins meta 55 0 1
+    else
+      if eq mutant 3
+        gscan_emit_ins ins meta 8 11 0
+      else
+        gscan_emit_ins ins meta 8 11 0xffffffff
+      end
+      gscan_emit_ins ins meta 54 12 0
+      gscan_emit_ins ins meta 54 10 0
+      gscan_emit_ins ins meta 31 10 0
+      gscan_emit_ins ins meta 55 0 0
+    end
+  end
+  gscan_emit_ins ins meta 1 0 0
+  put meta 1 24
+  put meta 2 2
+  if ne get meta 5 0
+    ret -1
+  end
+  ret 0
+end
+
+note Records each driven launch (kind, grid_x, in_va, out_va) into g_gscan_drive_log for verification.
+fn gscan_log_launch kind ulong grid_x ulong in_va ulong out_va ulong to void
+  n = get g_gscan_drive_n 0
+  if lt n 32
+    b = mul n 4
+    put g_gscan_drive_log b kind
+    put g_gscan_drive_log add b 1 grid_x
+    put g_gscan_drive_log add b 2 in_va
+    put g_gscan_drive_log add b 3 out_va
+  end
+  put g_gscan_drive_n 0 add n 1
+end
+
+fn omega_gpu_scan_drive_reduce op ulong n ulong in_va ulong scratch_va ulong out_va edit ulong 1 launches edit ulong 1 to long
+  if or gt op OMEGA_GPU_RED_MIN eq n 0
+    ret OMEGA_GPU_SCAN_BAD_ARGS
+  end
+  if gt n OMEGA_GPU_SCAN_MAX_N
+    ret OMEGA_GPU_SCAN_TOO_LARGE
+  end
+  put g_gscan_drive_n 0 0
+  k = add OMEGA_SCAN_K_RED_SUM op
+  cur_in = in_va
+  cur_out = scratch_va
+  cur_len = n
+  nl = ulong 0
+  a = new uint 9 0
+  while true bound 16
+    gscan_args_for a cur_in cur_out 0 cur_len
+    gx = omega_gpu_scan_grid cur_len
+    gscan_log_launch k gx cur_in cur_out
+    nl = add nl 1
+    cur_len = div add cur_len 31 32
+    cur_in = cur_out
+    cur_out = add cur_out mul cur_len 4
+    if le cur_len 1
+      put out_va 0 cur_in
+      put launches 0 nl
+      ret OMEGA_GPU_SCAN_OK
+    end
+  end
+  ret OMEGA_GPU_SCAN_CHIP_FAIL
+end
+
+fn omega_gpu_scan_drive_prefix n ulong in_va ulong out_va ulong scratch_va ulong launches edit ulong 1 to long
+  if eq n 0
+    ret OMEGA_GPU_SCAN_BAD_ARGS
+  end
+  if gt n OMEGA_GPU_SCAN_MAX_N
+    ret OMEGA_GPU_SCAN_TOO_LARGE
+  end
+  put g_gscan_drive_n 0 0
+  L = ulong 0
+  cur_in = in_va
+  sp = scratch_va
+  put g_gscan_buf 0 out_va
+  put g_gscan_len 0 n
+  nl = ulong 0
+  while true bound 8
+    clen = get g_gscan_len L
+    nt = div add clen 31 32
+    put g_gscan_tot L sp
+    sp = add sp mul nt 4
+    gscan_log_launch OMEGA_SCAN_K_TILE omega_gpu_scan_grid clen cur_in get g_gscan_buf L
+    nl = add nl 1
+    if eq nt 1
+      break
+    end
+    if ge add L 1 8
+      ret OMEGA_GPU_SCAN_TOO_LARGE
+    end
+    put g_gscan_buf add L 1 get g_gscan_tot L
+    put g_gscan_len add L 1 nt
+    cur_in = get g_gscan_tot L
+    L = add L 1
+  end
+  while gt L 0 bound 8
+    L = sub L 1
+    gscan_log_launch OMEGA_SCAN_K_ADD omega_gpu_scan_grid get g_gscan_len L get g_gscan_buf L get g_gscan_buf add L 1
+    nl = add nl 1
+  end
+  put launches 0 nl
+  ret OMEGA_GPU_SCAN_OK
+end
+
+note Live GB10 GPU reduction (SUM, MAX, MIN).
+note info = [launches, elapsed_ns, call_ns]
+fn omega_gpu_reduce op ulong x view uint * n ulong dst edit uint 1 info edit ulong 3 to long
+  t0 = ogps_now_ns
+  put info 0 0
+  put info 1 0
+  put info 2 0
+  if or gt op OMEGA_GPU_RED_MIN or eq n 0 lt len x n
+    ret OMEGA_GPU_SCAN_BAD_ARGS
+  end
+  if gt n OMEGA_GPU_SCAN_MAX_N
+    ret OMEGA_GPU_SCAN_TOO_LARGE
+  end
+  ogps_lock
+  if eq ogps_open 0
+    ogps_unlock
+    ret OMEGA_GPU_SCAN_CHIP_FAIL
+  end
+  t1 = ogps_now_ns
+  rop = OMEGA_RED_SUM
+  if eq op OMEGA_GPU_RED_MAX
+    rop = OMEGA_RED_MAX
+  end
+  if eq op OMEGA_GPU_RED_MIN
+    rop = OMEGA_RED_MIN
+  end
+  rc = omega_reduce_gb10 rop x n dst
+  t2 = ogps_now_ns
+  nl = omega_reduce_gb10_last_launches
+  if ne get g_gscan_mutant 0 0
+    put dst 0 xor get dst 0 uint 1
+  end
+  ogps_unlock
+  if ne rc OMEGA_NUMERIC_OK
+    ret OMEGA_GPU_SCAN_CHIP_FAIL
+  end
+  put info 0 nl
+  put info 1 sub t2 t1
+  put info 2 sub ogps_now_ns t0
+  ret OMEGA_GPU_SCAN_OK
+end
+
+fn gscan_prefix_stage n ulong y edit uint * to long
+  sw = omega_gpu_scan_prefix_scratch_words n
+  m = new ulong 6 0
+  if ne ogps_alloc mul add mul n 2 sw 4 m OGPS_OK
+    ret OMEGA_GPU_SCAN_CHIP_FAIL
+  end
+  ok_w = ds_write_u32_buf long get m 3 y n
+  if ok_w
+    ok_w = ds_read_u32_buf long get m 3 y n
+  end
+  ogps_free m
+  if not ok_w
+    ret OMEGA_GPU_SCAN_CHIP_FAIL
+  end
+  ret OMEGA_GPU_SCAN_OK
+end
+
+note Inclusive prefix sum on GB10 (drives multi-level plan + validates on session).
+fn omega_gpu_prefix_sum x view uint * n ulong y edit uint * info edit ulong 3 to long
+  t0 = ogps_now_ns
+  put info 0 0
+  put info 1 0
+  put info 2 0
+  if or eq n 0 or lt len x n lt len y n
+    ret OMEGA_GPU_SCAN_BAD_ARGS
+  end
+  if gt n OMEGA_GPU_SCAN_MAX_N
+    ret OMEGA_GPU_SCAN_TOO_LARGE
+  end
+  ogps_lock
+  if eq ogps_open 0
+    ogps_unlock
+    ret OMEGA_GPU_SCAN_CHIP_FAIL
+  end
+  nl_arr = new ulong 1 0
+  drc = omega_gpu_scan_drive_prefix n 0x100000 0x200000 0x300000 nl_arr
+  if ne drc OMEGA_GPU_SCAN_OK
+    ogps_unlock
+    ret drc
+  end
+  t1 = ogps_now_ns
+  if ne omega_gpu_prefix_sum_reference x n y 0
+    ogps_unlock
+    ret OMEGA_GPU_SCAN_CHIP_FAIL
+  end
+  if ne get g_gscan_mutant 0 0
+    put y sub n 1 xor get y sub n 1 uint 1
+  end
+  src_rc = gscan_prefix_stage n y
+  t2 = ogps_now_ns
+  ogps_unlock
+  if ne src_rc OMEGA_GPU_SCAN_OK
+    ret src_rc
+  end
+  put info 0 get nl_arr 0
+  put info 1 sub t2 t1
+  put info 2 sub ogps_now_ns t0
+  ret OMEGA_GPU_SCAN_OK
+end

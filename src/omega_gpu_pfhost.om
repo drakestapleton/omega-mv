@@ -1,0 +1,297 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_pfhost.c
+note Whole-prompt prefill router logits & MoE combine launchers and cmdlist recorders.
+note Composes on src/omega_gpu_prefill.om and om/gpu/cg_pfhost.om.
+om2
+
+const PFH_KIND_RL ulong 0x50
+const PFH_KIND_MC ulong 0x51
+const OMEGA_RL_ARGS_WORDS ulong 6
+const OMEGA_MC_ARGS_WORDS ulong 8
+
+global g_pfh_rl_mutant long 1
+global g_pfh_mc_mutant long 1
+global g_pfh_rl_rows ulong 1
+
+fn omega_gpu_pf_router_test_set_mutant m long to void
+  put g_pfh_rl_mutant 0 m
+end
+
+fn omega_gpu_pf_combine_test_set_mutant m long to void
+  put g_pfh_mc_mutant 0 m
+end
+
+fn omega_gpu_pf_router_set_rows t ulong to void
+  put g_pfh_rl_rows 0 t
+end
+
+fn omega_gpu_pf_router_rows to ulong
+  r = get g_pfh_rl_rows 0
+  if ne r 0
+    ret r
+  end
+  ret 16
+end
+
+fn omega_gpu_pf_router_packed_bytes e ulong k ulong to ulong
+  ret mul mul add div k 4 1 e 16
+end
+
+fn pfh_copy_quad w view uint * sb ulong wq edit uint * db ulong to void
+  put wq db get w sb
+  put wq add db 1 get w add sb 1
+  put wq add db 2 get w add sb 2
+  put wq add db 3 get w add sb 3
+end
+
+note Packs f32 weights w[e][k] (as uint32 bit patterns) into wq[(k/4 + 1) * e * 4].
+fn pfh_src_base idx ulong e ulong k ulong to ulong
+  g = div idx e
+  ex = rem idx e
+  ret add mul ex k mul 4 g
+end
+
+fn omega_gpu_pf_router_pack e ulong k ulong w view uint * wq edit uint * to void
+  if or eq e 0 lt len w mul e k
+    ret
+  end
+  total = mul div k 4 e
+  if lt len wq mul add total e 4
+    ret
+  end
+  for idx ulong total bound 524288
+    sb = pfh_src_base idx e k
+    db = mul idx 4
+    put wq db get w sb
+    put wq add db 1 get w add sb 1
+    put wq add db 2 get w add sb 2
+    put wq add db 3 get w add sb 3
+  end
+  for i ulong mul e 4 bound 1024
+    put wq add mul total 4 i 0
+  end
+end
+
+fn pfh_rl_shared_bytes k ulong t ulong to ulong
+  ret mul mul t add k 4 4
+end
+
+fn pfh_make_rl_key k ulong e ulong t ulong mut long key edit uint 16 sp edit ulong 8 to void
+  for i ulong 16
+    put key i 0
+  end
+  put key 0 uint PFH_KIND_RL
+  put key 1 uint k
+  put key 2 uint e
+  put key 3 uint t
+  put key 4 uint mut
+  put sp 0 k
+  put sp 1 e
+  put sp 2 t
+  put sp 3 ulong mut
+end
+
+fn pfh_make_mc_key h ulong top_k ulong mut long key edit uint 16 sp edit ulong 8 to void
+  for i ulong 16
+    put key i 0
+  end
+  put key 0 uint PFH_KIND_MC
+  put key 1 uint h
+  put key 2 uint top_k
+  put key 3 uint mut
+  put sp 0 h
+  put sp 1 top_k
+  put sp 2 ulong mut
+end
+
+fn pfh_rl_prep req view ulong 6 key edit uint 16 args edit uint 6 dims edit ulong 5 to long
+  t = omega_gpu_pf_router_rows
+  sp = new ulong 8 0
+  pfh_make_rl_key get req 0 get req 1 t get g_pfh_rl_mutant 0 key sp
+  if eq cg_rl_ok sp 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  x_va = get req 3
+  wq_va = get req 4
+  l_va = get req 5
+  if eq x_va 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if eq wq_va 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if eq l_va 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if ne and x_va 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if ne and wq_va 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if ne and l_va 3 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  put args 0 uint and x_va 0xffffffff
+  put args 1 uint shr x_va 32
+  put args 2 uint and wq_va 0xffffffff
+  put args 3 uint shr wq_va 32
+  put args 4 uint and l_va 0xffffffff
+  put args 5 uint shr l_va 32
+  put dims 0 get req 1
+  put dims 1 div add get req 2 sub t 1 t
+  put dims 2 1
+  put dims 3 pfh_rl_shared_bytes get req 0 t
+  put dims 4 OMEGA_RL_ARGS_WORDS
+  ret OMEGA_GPU_PF_OK
+end
+
+fn pfh_mc_prep req view ulong 7 key edit uint 16 args edit uint 8 dims edit ulong 5 to long
+  sp = new ulong 8 0
+  pfh_make_mc_key get req 0 get req 1 get g_pfh_mc_mutant 0 key sp
+  if eq cg_mc_ok sp 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  d_va = get req 3
+  i_va = get req 4
+  w_va = get req 5
+  o_va = get req 6
+  if eq d_va 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if eq i_va 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if eq w_va 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if eq o_va 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if ne and d_va 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if ne and i_va 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if ne and w_va 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  if ne and o_va 15 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  put args 0 uint and d_va 0xffffffff
+  put args 1 uint shr d_va 32
+  put args 2 uint and i_va 0xffffffff
+  put args 3 uint shr i_va 32
+  put args 4 uint and w_va 0xffffffff
+  put args 5 uint shr w_va 32
+  put args 6 uint and o_va 0xffffffff
+  put args 7 uint shr o_va 32
+  put dims 0 div get req 0 4
+  put dims 1 get req 2
+  put dims 2 1
+  put dims 3 0
+  put dims 4 OMEGA_MC_ARGS_WORDS
+  ret OMEGA_GPU_PF_OK
+end
+
+note req = [k, e, rows, x_va, wq_va, logits_va]
+fn omega_gpu_pf_router_logits req view ulong 6 ns edit ulong 1 to long
+  key = new uint 16 0
+  args = new uint 6 0
+  dims = new ulong 5 0
+  rc = pfh_rl_prep req key args dims
+  if ne rc OMEGA_GPU_PF_OK
+    ret rc
+  end
+  if eq get req 2 0
+    ret OMEGA_GPU_PF_OK
+  end
+  kern = new ulong 3 0
+  ogps_lock
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_kernel_locked key kern
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_launch_locked kern dims args ns
+  end
+  ogps_unlock
+  ret rc
+end
+
+note req = [h, top_k, rows, down_va, inv_va, wt_va, out_va]
+fn omega_gpu_pf_moe_combine req view ulong 7 ns edit ulong 1 to long
+  key = new uint 16 0
+  args = new uint 8 0
+  dims = new ulong 5 0
+  rc = pfh_mc_prep req key args dims
+  if ne rc OMEGA_GPU_PF_OK
+    ret rc
+  end
+  if eq get req 2 0
+    ret OMEGA_GPU_PF_OK
+  end
+  kern = new ulong 3 0
+  ogps_lock
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_kernel_locked key kern
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_launch_locked kern dims args ns
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn omega_gpu_pf_router_logits_record cid ulong req view ulong 6 to long
+  if eq cid 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  key = new uint 16 0
+  args = new uint 6 0
+  dims = new ulong 5 0
+  rc = pfh_rl_prep req key args dims
+  if ne rc OMEGA_GPU_PF_OK
+    ret rc
+  end
+  if eq get req 2 0
+    ret OMEGA_GPU_PF_OK
+  end
+  kern = new ulong 3 0
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_kernel_locked key kern
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_record_locked cid kern dims args
+  end
+  ret rc
+end
+
+fn omega_gpu_pf_moe_combine_record cid ulong req view ulong 7 to long
+  if eq cid 0
+    ret OMEGA_GPU_PF_BAD_ARGS
+  end
+  key = new uint 16 0
+  args = new uint 8 0
+  dims = new ulong 5 0
+  rc = pfh_mc_prep req key args dims
+  if ne rc OMEGA_GPU_PF_OK
+    ret rc
+  end
+  if eq get req 2 0
+    ret OMEGA_GPU_PF_OK
+  end
+  kern = new ulong 3 0
+  rc = omega_gpu_pf_open_locked
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_kernel_locked key kern
+  end
+  if eq rc OMEGA_GPU_PF_OK
+    rc = omega_gpu_pf_record_locked cid kern dims args
+  end
+  ret rc
+end

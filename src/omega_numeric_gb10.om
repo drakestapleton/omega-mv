@@ -1,0 +1,246 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_numeric_gb10.c
+note OMEGA-NUMERIC-0 GB10 SIMT executor (dispatches whole-kernel DIV/SQRT/EXP/LOG
+note to omega_ds_gb10_run, and patched vecadd ops via omega_gpu_session.om with
+note C3 L2_FLUSH_DIRTY + dual-marker + QMD release semaphore).
+om2
+
+global g_ngb_code uchar 512
+global g_ngb_mems ulong 30
+global g_ngb_stage ulong 1
+
+fn ngb_store_mem idx ulong m view ulong 6 to void
+  b = mul idx 6
+  for i ulong 6
+    put g_ngb_mems add b i get m i
+  end
+end
+
+fn ngb_free_mem idx ulong to void
+  m = new ulong 6 0
+  b = mul idx 6
+  for i ulong 6
+    put m i get g_ngb_mems add b i
+    put g_ngb_mems add b i 0
+  end
+  ogps_free m
+end
+
+fn ngb_free_all to void
+  for idx ulong 5
+    ngb_free_mem idx
+  end
+end
+
+fn ngb_launch_custom_c L view ulong 12 args view uint 10 c223 uint to long
+  q0 = new uint 96 0
+  q1 = new uint 96 0
+  put g_ngb_stage 0 11
+  if ne ogps_build_launch_qmds L q0 q1 OGPS_OK
+    ret OGPS_ERR
+  end
+  cb = new uint 224 0
+  ty = get L 3
+  if eq ty 0
+    ty = ulong 1
+  end
+  ogps_fill_cbank_2d cb get ogps_cbank 4 get L 2 ty get L 4 get L 5
+  put cb 223 c223
+  ogps_write_u32_map long get ogps_cbank 3 0 cb 224
+  ogps_write_u32_map long get ogps_cbank 3 896 args 10
+  ogps_write_u32_map long get ogps_qmd 3 0 q0 96
+  ogps_write_u32_map long get ogps_qmd 3 4096 q1 96
+  if eq get ogpl_mock 0 0
+    r0 = mapset long get ogps_qmd 3 8192 4 0
+    r1 = mapset long get ogps_marker 3 0 4 0
+    r2 = mapset long get ogps_marker 3 16 4 0
+  end
+  put ogps_pb_n 0 0
+  ogps_emit_setup
+  ogps_pb_put ogps_mthd 1 OGPS_MTHD_INVAL_CACHES 1
+  ogps_pb_put OGPS_INVAL_ALL
+  ogps_emit_dma get ogps_cbank 4 224
+  for i ulong 224
+    ogps_pb_put get cb i
+  end
+  ogps_emit_dma add get ogps_cbank 4 896 10
+  for i ulong 10
+    ogps_pb_put get args i
+  end
+  ogps_emit_inline get ogps_qmd 4 q0
+  ogps_emit_dma add get ogps_qmd 4 8192 1
+  ogps_pb_put OGPS_SEM_INIT
+  ogps_emit_inline add get ogps_qmd 4 4096 q1
+  ogps_emit_c3_tail get ogps_marker 4
+  ign = ogpl_sync_to_gpu get ogps_cbank 0 get ogps_cbank 1 0 OGPS_PAGE
+  ign = ogpl_sync_to_gpu get ogps_qmd 0 get ogps_qmd 1 0 12288
+  ign = ogpl_sync_to_gpu get ogps_marker 0 get ogps_marker 1 0 32
+  put g_ngb_stage 0 12
+  if ne ogps_submit_pb 0
+    ret OGPS_ERR
+  end
+  put g_ngb_stage 0 13
+  if ne ogps_wait_marker 0 OGPS_MARKER1_PAYLOAD 10000 0
+    ret OGPS_ERR
+  end
+  put g_ngb_stage 0 14
+  if ne ogps_wait_marker2 16 OGPS_MARKER2_PAYLOAD 10000 0
+    ret OGPS_ERR
+  end
+  ign = ogpl_sync_to_cpu get ogps_marker 0 get ogps_marker 1 0 32
+  ign = ogpl_sync_to_cpu get ogps_qmd 0 get ogps_qmd 1 8192 4
+  put g_ngb_stage 0 15
+  if eq get ogpl_mock 0 0
+    if not obwe_poll_word long get ogps_qmd 3 8192 OGPS_SEM_DONE 10000
+      ret OGPS_ERR
+    end
+  end
+  put g_ngb_stage 0 16
+  ret OGPS_OK
+end
+
+fn ngb_check_qmd_patch op ulong np long cm_va ulong count ulong to long
+  tpb = ulong get g_num_launch_tpb 0
+  gx = ulong get g_num_launch_grid 0
+  qcfg = new ulong 16 0
+  q1 = new uint 96 0
+  put qcfg 0 cm_va
+  put qcfg 1 get ogps_cbank 4
+  put qcfg 2 add get ogps_qmd 4 16384
+  put qcfg 3 add get ogps_qmd 4 8192
+  put qcfg 4 get ogps_qmd 4
+  put qcfg 5 count
+  put qcfg 6 tpb
+  put qcfg 7 gx
+  put qcfg 8 tpb
+  put qcfg 9 1
+  put qcfg 10 gx
+  put qcfg 11 1
+  put qcfg 12 64
+  if ne bw_qmd1 qcfg q1 0
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  if ne omega_numeric_check_patch op np q1 OMEGA_NUMERIC_OK
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn ngb_build_and_run op ulong count ulong to long
+  tpb = ulong get g_num_launch_tpb 0
+  gx = ulong get g_num_launch_grid 0
+  L = new ulong 12 0
+  put L 0 get g_ngb_mems 4
+  put L 1 64
+  put L 2 tpb
+  put L 3 1
+  put L 4 gx
+  put L 5 1
+  put L 6 count
+  put L 7 10
+  put L 8 10000
+  args = new uint 10 0
+  put args 0 uint and get g_ngb_mems 10 0xffffffff
+  put args 1 uint shr get g_ngb_mems 10 32
+  put args 2 uint and get g_ngb_mems 16 0xffffffff
+  put args 3 uint shr get g_ngb_mems 16 32
+  put args 4 uint and get g_ngb_mems 28 0xffffffff
+  put args 5 uint shr get g_ngb_mems 28 32
+  put args 6 uint count
+  put args 8 uint and get g_ngb_mems 22 0xffffffff
+  put args 9 uint shr get g_ngb_mems 22 32
+  c223 = uint 0x3f800000
+  if eq op OMEGA_NOP_FFMA
+    c223 = get g_num_c 0
+  end
+  ret ngb_launch_custom_c L args c223
+end
+
+fn ngb_upload_code code view uchar 512 clen ulong to void
+  if eq get ogpl_mock 0 0
+    wr = mapwrite long get g_ngb_mems 3 0 code 0 clen
+  end
+end
+
+fn ngb_exec_simt op ulong count ulong to long
+  code = new uchar 512 0
+  put g_ngb_stage 0 1
+  if ne omega_numeric_build_kernel op code OMEGA_NUMERIC_OK
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  omega_numeric_launch_shape count
+  np = omega_numeric_patch_words op
+  put g_ngb_stage 0 2
+  if le np 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  put g_ngb_stage 0 3
+  if eq ogps_open 0
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  m = new ulong 6 0
+  nbytes = mul count 4
+  put g_ngb_stage 0 4
+  if ne ogps_alloc_code 512 m OGPS_OK
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ngb_store_mem 0 m
+  put g_ngb_stage 0 5
+  for idx ulong 4
+    if ne ogps_alloc nbytes m OGPS_OK
+      ngb_free_all
+      ret OMEGA_NUMERIC_ERR_DEVICE
+    end
+    ngb_store_mem add idx 1 m
+  end
+  put g_ngb_stage 0 6
+  qrc = ngb_check_qmd_patch op np get g_ngb_mems 4 count
+  if ne qrc OMEGA_NUMERIC_OK
+    ngb_free_all
+    ret qrc
+  end
+  put g_ngb_stage 0 7
+  ngb_upload_code code 512
+  ok_up = ds_write_gnum_a long get g_ngb_mems 9 count
+  if ok_up
+    ok_up = ds_write_gnum_b long get g_ngb_mems 15 count
+  end
+  if ok_up
+    ok_up = ds_write_gnum_c long get g_ngb_mems 21 count
+  end
+  lrc = OGPS_ERR
+  if ok_up
+    put g_ngb_stage 0 8
+    lrc = ngb_build_and_run op count
+  end
+  ok_rd = false
+  if eq lrc OGPS_OK
+    put g_ngb_stage 0 9
+    ok_rd = ds_read_gnum_dst long get g_ngb_mems 27 count
+  end
+  ngb_free_all
+  if not ok_rd
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_gb10_execute_simt_op op_name view uchar * nlen ulong bmask ulong count ulong to long
+  chk = omega_numeric_submit_check op_name nlen bmask count
+  if ne chk OMEGA_NUMERIC_OK
+    ret chk
+  end
+  if gt count 4096
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  op_l = omega_numeric_op_find op_name nlen
+  if lt op_l 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  op = ulong op_l
+  if omega_numeric_op_whole_kernel op
+    dop = omega_ds_op_for_numeric op
+    ret omega_ds_gb10_run dop ne and bmask 2 0 count
+  end
+  ret ngb_exec_simt op count
+end

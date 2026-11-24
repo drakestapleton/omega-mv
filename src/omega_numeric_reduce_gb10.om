@@ -1,0 +1,464 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_numeric_reduce_gb10.c
+note E1 WP-D GB10 realization of the frozen reduction order: SUM, MAX, MIN, MEAN.
+note Composes on src/omega_numeric.om, src/omega_numeric_reduce.om,
+note src/omega_numeric_divsqrt_gb10.om, and src/omega_gpu_session.om.
+om2
+
+const OMEGA_RED_SUM ulong 0
+const OMEGA_RED_MAX ulong 1
+const OMEGA_RED_MIN ulong 2
+const OMEGA_RED_MEAN ulong 3
+const OMEGA_RED_COUNT ulong 4
+
+const RED_CTRL_SHFL_FIRST uint 0x010e2800
+const RED_CTRL_SHFL_NEXT uint 0x000e2400
+const RED_CTRL_FMNMX_SB0 uint 0x001fca00
+const RED_FMNMX_W2_MIN uint 0x03800000
+const RED_FMNMX_W2_MAX uint 0x07800000
+const OMEGA_REDUCE_GB10_MAX_N ulong 16777216
+const OMEGA_REDUCE_MEAN_MAX_N ulong 16777216
+
+global g_red_last_launches ulong 1
+global g_red_cur uint 4096
+global g_red_res uint 4096
+
+fn red_gb10_identity op ulong to uint
+  if or eq op OMEGA_RED_SUM eq op OMEGA_RED_MEAN
+    ret uint 0x80000000
+  end
+  ret uint 0x7fc00000
+end
+
+fn red_gb10_empty_result op ulong to uint
+  if eq op OMEGA_RED_SUM
+    ret uint 0x00000000
+  end
+  ret uint 0x7fc00000
+end
+
+fn omega_reduce_gb10_last_launches to ulong
+  ret get g_red_last_launches 0
+end
+
+fn red_shfl_w1 s ulong to uint
+  if eq s 0
+    ret uint 0x0a001f00
+  end
+  if eq s 1
+    ret uint 0x09001f00
+  end
+  if eq s 2
+    ret uint 0x08801f00
+  end
+  if eq s 3
+    ret uint 0x08401f00
+  end
+  ret uint 0x08201f00
+end
+
+fn red_delta s ulong to uint
+  if eq s 0
+    ret uint 16
+  end
+  if eq s 1
+    ret uint 8
+  end
+  if eq s 2
+    ret uint 4
+  end
+  if eq s 3
+    ret uint 2
+  end
+  ret uint 1
+end
+
+note Writes MAX/MIN 12-instruction warp patch into g_num_patch_w (48 uints).
+fn omega_reduce_gb10_minmax_patch op ulong to long
+  if and ne op OMEGA_RED_MAX ne op OMEGA_RED_MIN
+    ret OMEGA_NUMERIC_ERR_NOT_ENCODED
+  end
+  w2 = RED_FMNMX_W2_MIN
+  if eq op OMEGA_RED_MAX
+    w2 = RED_FMNMX_W2_MAX
+  end
+  idx = ulong 0
+  for s ulong 5
+    ctrl = RED_CTRL_SHFL_NEXT
+    if eq s 0
+      ctrl = RED_CTRL_SHFL_FIRST
+    end
+    patch_put idx uint 0x02097f89 red_shfl_w1 s uint 0x000e0000 ctrl 0
+    idx = add idx 1
+    mw0 = uint 0x02027209
+    if eq s 4
+      mw0 = uint 0x02097209
+    end
+    patch_put idx mw0 uint 0x00000009 w2 RED_CTRL_FMNMX_SB0 0
+    idx = add idx 1
+  end
+  patch_put idx uint 0x06007986 uint 0x00000009 uint 0x0c101904 uint 0x000fe200 0
+  idx = add idx 1
+  patch_put idx uint 0x0000794d uint 0 uint 0x03800000 uint 0x000fea00 0
+  idx = add idx 1
+  ret long idx
+end
+
+fn red_check_shfl_step s ulong to long
+  sh_b = mul s 8
+  sh_w0 = get g_num_patch_w sh_b
+  if ne and sh_w0 uint 0xffff uint 0x7f89
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr get g_num_patch_w add sh_b 1 21 uint 31 red_delta s
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr sh_w0 24 uint 255 uint 2
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr sh_w0 16 uint 255 uint 9
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if eq s 0
+    if eq and shr get g_num_patch_w add sh_b 3 20 uint 16 uint 0
+      ret OMEGA_NUMERIC_ERR_OPERANDS
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn red_check_mm_step s ulong want_w2 uint to long
+  if ne red_check_shfl_step s OMEGA_NUMERIC_OK
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  mm_b = add mul s 8 4
+  mm_w0 = get g_num_patch_w mm_b
+  mm_w1 = get g_num_patch_w add mm_b 1
+  if ne and mm_w0 uint 0xffff uint 0x7209
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and mm_w1 uint 0xffffff00 uint 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w add mm_b 2 want_w2
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  mm_w3 = get g_num_patch_w add mm_b 3
+  wbar = and shr get g_num_patch_w add mul s 8 3 14 uint 7
+  if gt wbar uint 5
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if eq and shr mm_w3 20 shl uint 1 wbar uint 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and shr mm_w0 24 uint 255 uint 2
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and mm_w1 uint 255 uint 9
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  want_dst = uint 2
+  if eq s 4
+    want_dst = uint 9
+  end
+  if ne and shr mm_w0 16 uint 255 want_dst
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if lt and shr mm_w3 9 uint 15 uint 5
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_reduce_gb10_check_minmax_patch op ulong n long qmd1 view uint 96 to long
+  if and ne op OMEGA_RED_MAX ne op OMEGA_RED_MIN
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  nop = OMEGA_NOP_FMNMX_MIN
+  want_w2 = RED_FMNMX_W2_MIN
+  if eq op OMEGA_RED_MAX
+    nop = OMEGA_NOP_FMNMX_MAX
+    want_w2 = RED_FMNMX_W2_MAX
+  end
+  rc = omega_numeric_check_patch nop n qmd1
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  if ne n 12
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  for s ulong 5
+    src_rc = red_check_mm_step s want_w2
+    if ne src_rc OMEGA_NUMERIC_OK
+      ret src_rc
+    end
+  end
+  if ne get g_num_patch_w 40 uint 0x06007986
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w 41 uint 9
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne get g_num_patch_w 42 uint 0x0c101904
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne and get g_num_patch_w 44 uint 0xffff uint 0x794d
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_reduce_gb10_build_minmax_kernel op ulong code edit uchar 512 to long
+  np = omega_reduce_gb10_minmax_patch op
+  if le np 0
+    ret np
+  end
+  if ne bw_encode_vecadd code 512
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  for i ulong ulong np bound 15
+    base = add OMEGA_NUMERIC_PATCH_OFFSET mul i 16
+    num_put_u32_le code base get g_num_patch_w mul i 4
+    num_put_u32_le code add base 4 get g_num_patch_w add mul i 4 1
+    num_put_u32_le code add base 8 get g_num_patch_w add mul i 4 2
+    num_put_u32_le code add base 12 get g_num_patch_w add mul i 4 3
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn red_launch_qmd count ulong qmd1 edit uint 96 to long
+  omega_numeric_launch_shape count
+  cfg = new ulong 16 0
+  put cfg 5 count
+  put cfg 6 ulong get g_num_launch_tpb 0
+  put cfg 7 ulong get g_num_launch_grid 0
+  put cfg 8 ulong get g_num_launch_tpb 0
+  put cfg 9 1
+  put cfg 10 ulong get g_num_launch_grid 0
+  put cfg 11 1
+  put cfg 12 64
+  if ne bw_qmd1 cfg qmd1 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+text red_sum_name "REDUCE_SUM"
+
+fn red_check_one_sz op ulong sz ulong to long
+  if eq sz 0
+    ret OMEGA_NUMERIC_OK
+  end
+  if or eq op OMEGA_RED_SUM eq op OMEGA_RED_MEAN
+    ret omega_numeric_submit_check red_sum_name 10 11 sz
+  end
+  if or ne rem sz 32 0 gt sz OMEGA_NUMERIC_MAX_COUNT
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  np = omega_reduce_gb10_minmax_patch op
+  qmd1 = new uint 96 0
+  if ne red_launch_qmd sz qmd1 OMEGA_NUMERIC_OK
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  ret omega_reduce_gb10_check_minmax_patch op np qmd1
+end
+
+fn omega_reduce_gb10_check op ulong has_x bool n ulong has_out bool to long
+  if ge op OMEGA_RED_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if or not has_out and gt n 0 not has_x
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if gt n OMEGA_REDUCE_GB10_MAX_N
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if and eq op OMEGA_RED_MEAN gt n OMEGA_REDUCE_MEAN_MAX_N
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if eq n 0
+    ret OMEGA_NUMERIC_OK
+  end
+  cur_len = n
+  while gt cur_len 0 bound 8
+    padded = and add cur_len 31 xor ulong 31 ulong 0xffffffffffffffff
+    full = div padded OMEGA_NUMERIC_MAX_COUNT
+    if gt full 0
+      rc = red_check_one_sz op OMEGA_NUMERIC_MAX_COUNT
+      if ne rc OMEGA_NUMERIC_OK
+        ret rc
+      end
+    end
+    rc2 = red_check_one_sz op rem padded OMEGA_NUMERIC_MAX_COUNT
+    if ne rc2 OMEGA_NUMERIC_OK
+      ret rc2
+    end
+    if eq padded 32
+      ret OMEGA_NUMERIC_OK
+    end
+    cur_len = div padded 32
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn red_write_cur mh long count ulong to bool
+  in_local = new uint 4096 0
+  for i ulong count bound 4096
+    put in_local i get g_red_cur i
+  end
+  ret ds_write_u32_buf mh part in_local 0 count count
+end
+
+fn red_read_res mh long count ulong to bool
+  out_local = new uint 4096 0
+  if not ds_read_u32_buf mh part out_local 0 count count
+    ret false
+  end
+  for i ulong count bound 4096
+    put g_red_res i get out_local i
+  end
+  ret true
+end
+
+fn red_launch_exec cm_va ulong ma_va ulong mb_va ulong mo_va ulong count ulong to long
+  tpb = ulong get g_num_launch_tpb 0
+  gx = ulong get g_num_launch_grid 0
+  L = new ulong 12 0
+  put L 0 cm_va
+  put L 1 64
+  put L 2 tpb
+  put L 3 1
+  put L 4 gx
+  put L 5 1
+  put L 6 count
+  put L 7 10
+  put L 8 10000
+  args = new uint 10 0
+  put args 0 uint and ma_va 0xffffffff
+  put args 1 uint shr ma_va 32
+  put args 2 uint and mb_va 0xffffffff
+  put args 3 uint shr mb_va 32
+  put args 4 uint and mo_va 0xffffffff
+  put args 5 uint shr mo_va 32
+  put args 6 uint count
+  el = new ulong 1 0
+  mk = new uint 1 0
+  ret ogps_launch L args el mk
+end
+
+fn red_run_chunk op ulong count ulong to long
+  code = new uchar 512 0
+  if or eq op OMEGA_RED_MAX eq op OMEGA_RED_MIN
+    if ne omega_reduce_gb10_build_minmax_kernel op code OMEGA_NUMERIC_OK
+      ret OMEGA_NUMERIC_ERR_DEVICE
+    end
+  else
+    if ne omega_numeric_build_kernel OMEGA_NOP_REDUCE_SUM code OMEGA_NUMERIC_OK
+      ret OMEGA_NUMERIC_ERR_DEVICE
+    end
+  end
+  if eq ogps_open 0
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  omega_numeric_launch_shape count
+  m = new ulong 6 0
+  nbytes = mul count 4
+  if ne ogps_alloc_code 512 m OGPS_OK
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ngb_store_mem 0 m
+  for idx ulong 3
+    if ne ogps_alloc nbytes m OGPS_OK
+      ngb_free_all
+      ret OMEGA_NUMERIC_ERR_DEVICE
+    end
+    ngb_store_mem add idx 1 m
+  end
+  if eq get ogpl_mock 0 0
+    wr = mapwrite long get g_ngb_mems 3 0 code 0 512
+  end
+  ok_up = red_write_cur long get g_ngb_mems 9 count
+  lrc = OGPS_ERR
+  if ok_up
+    lrc = red_launch_exec get g_ngb_mems 4 get g_ngb_mems 10 get g_ngb_mems 16 get g_ngb_mems 22 count
+  end
+  ok_rd = false
+  if eq lrc OGPS_OK
+    ok_rd = red_read_res long get g_ngb_mems 21 count
+  end
+  ngb_free_all
+  if not ok_rd
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn red_pad_level cur_len ulong padded ulong pad uint to void
+  i = cur_len
+  while lt i padded bound 32
+    put g_red_cur i pad
+    i = add i 1
+  end
+end
+
+fn red_gather_warps nw ulong to void
+  for w ulong nw bound 128
+    put g_red_cur w get g_red_res mul w 32
+  end
+end
+
+fn red_run_levels op ulong n ulong to long
+  pad = red_gb10_identity op
+  cur_len = n
+  while true bound 8
+    padded = mul div add cur_len 31 32 32
+    red_pad_level cur_len padded pad
+    rc = red_run_chunk op padded
+    put g_red_last_launches 0 add get g_red_last_launches 0 1
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+    nw = div padded 32
+    red_gather_warps nw
+    cur_len = nw
+    if eq cur_len 1
+      ret OMEGA_NUMERIC_OK
+    end
+  end
+  ret OMEGA_NUMERIC_ERR_DEVICE
+end
+
+fn omega_reduce_gb10 op ulong x view uint * n ulong dst edit uint 1 to long
+  put g_red_last_launches 0 0
+  rc = omega_reduce_gb10_check op gt len x 0 n true
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  if eq n 0
+    put dst 0 red_gb10_empty_result op
+    ret OMEGA_NUMERIC_OK
+  end
+  if or lt len x n gt n 4064
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  for i ulong n bound 4096
+    put g_red_cur i get x i
+  end
+  lrc = red_run_levels op n
+  if ne lrc OMEGA_NUMERIC_OK
+    ret lrc
+  end
+  s = get g_red_cur 0
+  if eq op OMEGA_RED_MEAN
+    put g_num_a 0 s
+    put g_num_b 0 omega_ref_u2f uint n
+    drc = omega_ds_gb10_run OMEGA_DS_DIV true 1
+    if ne drc OMEGA_NUMERIC_OK
+      ret drc
+    end
+    put dst 0 get g_num_dst 0
+    ret OMEGA_NUMERIC_OK
+  end
+  put dst 0 s
+  ret OMEGA_NUMERIC_OK
+end

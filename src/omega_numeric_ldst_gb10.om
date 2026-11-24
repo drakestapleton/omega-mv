@@ -1,0 +1,589 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_numeric_ldst_gb10.c
+note E1 row 2: general global load/store kernels for GB10 (U8/S8/U16/S16/B32/B64/B128
+note -> B8/B16/B32/B64/B128 with arbitrary stride and signed 24-bit byte offset).
+om2
+
+const OMEGA_LD_U8 ulong 0
+const OMEGA_LD_S8 ulong 1
+const OMEGA_LD_U16 ulong 2
+const OMEGA_LD_S16 ulong 3
+const OMEGA_LD_B32 ulong 4
+const OMEGA_LD_B64 ulong 5
+const OMEGA_LD_B128 ulong 6
+const OMEGA_LD_COUNT ulong 7
+
+const OMEGA_ST_B8 ulong 0
+const OMEGA_ST_B16 ulong 1
+const OMEGA_ST_B32 ulong 2
+const OMEGA_ST_B64 ulong 3
+const OMEGA_ST_B128 ulong 4
+const OMEGA_ST_COUNT ulong 5
+
+const OMEGA_LDST_CODE_BYTES ulong 384
+const OMEGA_LDST_PAD ulong 65536
+const LDST_NINSN ulong 24
+const LDST_I_DST ulong 12
+const LDST_I_IMAD_IN ulong 12
+const LDST_I_LDG_A ulong 13
+const LDST_I_IMAD_OUT ulong 16
+const LDST_I_IADD3 ulong 17
+const LDST_I_STG ulong 18
+const LDST_I_EXIT ulong 19
+const LDST_I_BRA ulong 20
+const LDST_I_NOP ulong 21
+
+note Spec layout: long[6] = [ld, st, in_stride, out_stride, in_off, out_off]
+global g_ldst_spec_id long 1
+global g_ldst_reg uchar 16
+
+fn omega_ld_bytes k ulong to ulong
+  if or eq k OMEGA_LD_U8 eq k OMEGA_LD_S8
+    ret 1
+  end
+  if or eq k OMEGA_LD_U16 eq k OMEGA_LD_S16
+    ret 2
+  end
+  if eq k OMEGA_LD_B32
+    ret 4
+  end
+  if eq k OMEGA_LD_B64
+    ret 8
+  end
+  if eq k OMEGA_LD_B128
+    ret 16
+  end
+  ret 0
+end
+
+fn omega_st_bytes k ulong to ulong
+  if eq k OMEGA_ST_B8
+    ret 1
+  end
+  if eq k OMEGA_ST_B16
+    ret 2
+  end
+  if eq k OMEGA_ST_B32
+    ret 4
+  end
+  if eq k OMEGA_ST_B64
+    ret 8
+  end
+  if eq k OMEGA_ST_B128
+    ret 16
+  end
+  ret 0
+end
+
+fn ldst_ld_size k ulong to uint
+  ret uint k
+end
+
+fn ldst_st_size k ulong to uint
+  if eq k OMEGA_ST_B8
+    ret uint 0
+  end
+  if eq k OMEGA_ST_B16
+    ret uint 2
+  end
+  if eq k OMEGA_ST_B32
+    ret uint 4
+  end
+  if eq k OMEGA_ST_B64
+    ret uint 5
+  end
+  ret uint 6
+end
+
+fn omega_ldst_gb10_set_spec_id sid long to void
+  put g_ldst_spec_id 0 sid
+end
+
+fn omega_ldst_check_spec spec view long 6 count ulong to long
+  ld = get spec 0
+  st = get spec 1
+  if or lt ld 0 ge ld long OMEGA_LD_COUNT
+    ret -1
+  end
+  if or lt st 0 ge st long OMEGA_ST_COUNT
+    ret -1
+  end
+  lb = long omega_ld_bytes ulong ld
+  sb = long omega_st_bytes ulong st
+  fill = lb
+  if lt fill 4
+    fill = long 4
+  end
+  if gt sb fill
+    ret -1
+  end
+  s_in = get spec 2
+  if lt s_in lb
+    ret -1
+  end
+  if ne rem s_in lb 0
+    ret -1
+  end
+  if ge s_in 16777216
+    ret -1
+  end
+  s_out = get spec 3
+  if lt s_out sb
+    ret -1
+  end
+  if ne rem s_out sb 0
+    ret -1
+  end
+  if ge s_out 16777216
+    ret -1
+  end
+  o_in = get spec 4
+  if lt o_in -8388608
+    ret -1
+  end
+  if ge o_in 8388608
+    ret -1
+  end
+  if ne rem o_in lb 0
+    ret -1
+  end
+  o_out = get spec 5
+  if lt o_out -8388608
+    ret -1
+  end
+  if ge o_out 8388608
+    ret -1
+  end
+  if ne rem o_out sb 0
+    ret -1
+  end
+  if or eq count 0 gt count OMEGA_DS_MAX_BATCH
+    ret -1
+  end
+  ret 0
+end
+
+note extent_out = [in_lo, in_hi, out_lo, out_hi]
+fn omega_ldst_extent spec view long 6 count ulong ext edit long 4 to long
+  if ne omega_ldst_check_spec spec count 0
+    ret -1
+  end
+  n1 = sub long count 1
+  lb = long omega_ld_bytes ulong get spec 0
+  sb = long omega_st_bytes ulong get spec 1
+  put ext 0 get spec 4
+  put ext 1 add add get spec 4 mul n1 get spec 2 lb
+  put ext 2 get spec 5
+  put ext 3 add add get spec 5 mul n1 get spec 3 sb
+  ret 0
+end
+
+fn omega_ldst_describe spec view long 6 dst edit uchar * to ulong
+  if lt len dst 8
+    ret 0
+  end
+  put dst 0 uchar 76
+  put dst 1 uchar add 48 rem ulong get spec 0 10
+  put dst 2 uchar 45
+  put dst 3 uchar 62
+  put dst 4 uchar 83
+  put dst 5 uchar add 48 rem ulong get spec 1 10
+  put dst 6 uchar 0
+  ret 6
+end
+
+fn ldst_put_w code edit uchar 384 insn_k ulong w view uint 4 to void
+  base = mul insn_k 16
+  for i ulong 4
+    v = get w i
+    o = add base mul i 4
+    put code o uchar and v 255
+    put code add o 1 uchar and shr v 8 255
+    put code add o 2 uchar and shr v 16 255
+    put code add o 3 uchar and shr v 24 255
+  end
+end
+
+fn ldst_get_w code view uchar 384 insn_k ulong w edit uint 4 to void
+  base = mul insn_k 16
+  for i ulong 4
+    o = add base mul i 4
+    v = uint get code o
+    v = or v shl uint get code add o 1 8
+    v = or v shl uint get code add o 2 16
+    v = or v shl uint get code add o 3 24
+    put w i v
+  end
+end
+
+fn ldst_get_va_w va view uchar 512 insn_k ulong w edit uint 4 to void
+  base = mul insn_k 16
+  for i ulong 4
+    o = add base mul i 4
+    v = uint get va o
+    v = or v shl uint get va add o 1 8
+    v = or v shl uint get va add o 2 16
+    v = or v shl uint get va add o 3 24
+    put w i v
+  end
+end
+
+fn omega_ldst_build_kernel spec view long 6 code edit uchar 384 to long
+  if ne omega_ldst_check_spec spec 1 0
+    ret -1
+  end
+  va = new uchar 512 0
+  if ne bw_encode_vecadd va 512
+    ret -1
+  end
+  for i ulong 384
+    put code i 0
+  end
+  for k ulong 17
+    base = mul k 16
+    for b ulong 16
+      put code add base b get va add base b
+    end
+  end
+  for b ulong 16
+    put code add 304 b get va add 304 b
+    put code add 320 b get va add 320 b
+  end
+  for k ulong 3
+    base = mul add LDST_I_NOP k 16
+    for b ulong 16
+      put code add base b get va add 336 b
+    end
+  end
+  w = new uint 4 0
+  ldst_get_va_w va LDST_I_IMAD_IN w
+  put w 1 uint get spec 2
+  ldst_put_w code LDST_I_IMAD_IN w
+
+  ioff_u = uint and get spec 4 0xffffff
+  put w 0 or uint 0x7981 or shl uint LDST_I_DST 16 shl uint 2 24
+  put w 1 or uint 4 shl ioff_u 8
+  put w 2 or uint 0x0c1e1100 shl ldst_ld_size ulong get spec 0 9
+  put w 3 uint 0x002f2200
+  ldst_put_w code LDST_I_LDG_A w
+
+  ldst_get_va_w va LDST_I_IMAD_OUT w
+  put w 1 uint get spec 3
+  ldst_put_w code LDST_I_IMAD_OUT w
+
+  put w 0 or uint 0x7210 or shl uint 9 16 shl uint LDST_I_DST 24
+  put w 1 uint 5
+  put w 2 uint 0x07ffe0ff
+  put w 3 uint 0x010fca00
+  ldst_put_w code LDST_I_IADD3 w
+
+  ooff_u = uint and get spec 5 0xffffff
+  put w 0 or uint 0x7986 shl uint 6 24
+  put w 1 or uint LDST_I_DST shl ooff_u 8
+  put w 2 or uint 0x0c101104 shl ldst_st_size ulong get spec 1 9
+  put w 3 uint 0x000fe200
+  ldst_put_w code LDST_I_STG w
+  ret 0
+end
+
+fn omega_ldst_listing spec view long 6 dst edit uchar * to long
+  if ne omega_ldst_check_spec spec 1 0
+    ret -1
+  end
+  if eq omega_ldst_describe spec dst 0
+    ret -1
+  end
+  ret 0
+end
+
+fn ldst_sext24 v uint to long
+  raw = ulong and v 0xffffff
+  if ge raw 0x800000
+    ret sub long raw 0x1000000
+  end
+  ret long raw
+end
+
+fn omega_ldst_check_kernel spec view long 6 code view uchar 384 to long
+  w = new uint 4 0
+  dec = new long 6 0
+  ldst_get_w code LDST_I_LDG_A w
+  lsz = and shr get w 2 9 uint 7
+  found_l = false
+  for k ulong OMEGA_LD_COUNT
+    if eq ldst_ld_size k lsz
+      put dec 0 long k
+      found_l = true
+    end
+  end
+  if not found_l
+    ret -1
+  end
+  put dec 4 ldst_sext24 shr get w 1 8
+
+  ldst_get_w code LDST_I_STG w
+  ssz = and shr get w 2 9 uint 7
+  found_s = false
+  for k ulong OMEGA_ST_COUNT
+    if eq ldst_st_size k ssz
+      put dec 1 long k
+      found_s = true
+    end
+  end
+  if not found_s
+    ret -1
+  end
+  put dec 5 ldst_sext24 shr get w 1 8
+
+  ldst_get_w code LDST_I_IMAD_IN w
+  put dec 2 long get w 1
+  ldst_get_w code LDST_I_IMAD_OUT w
+  put dec 3 long get w 1
+
+  if ne omega_ldst_check_spec dec 1 0
+    ret -1
+  end
+  for i ulong 6
+    if ne get dec i get spec i
+      ret -1
+    end
+  end
+  want = new uchar 384 0
+  if ne omega_ldst_build_kernel dec want 0
+    ret -1
+  end
+  for i ulong 384
+    if ne get want i get code i
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn ldst_check_bounds spec view long 6 slen ulong dlen ulong pad ulong count ulong to bool
+  ext = new long 4 0
+  if ne omega_ldst_extent spec count ext 0
+    ret false
+  end
+  p_l = long pad
+  if lt get ext 0 sub 0 p_l
+    ret false
+  end
+  if gt get ext 1 sub long slen p_l
+    ret false
+  end
+  if lt get ext 2 sub 0 p_l
+    ret false
+  end
+  if gt get ext 3 sub long dlen p_l
+    ret false
+  end
+  ret true
+end
+
+fn ldst_host_load ld ulong src view uchar * so ulong to void
+  for b ulong 16
+    put g_ldst_reg b 0
+  end
+  if eq ld OMEGA_LD_S8
+    b0 = get src so
+    put g_ldst_reg 0 b0
+    fill = uchar 0
+    if ge b0 uchar 128
+      fill = uchar 255
+    end
+    put g_ldst_reg 1 fill
+    put g_ldst_reg 2 fill
+    put g_ldst_reg 3 fill
+    ret
+  end
+  if eq ld OMEGA_LD_S16
+    b0 = get src so
+    b1 = get src add so 1
+    put g_ldst_reg 0 b0
+    put g_ldst_reg 1 b1
+    fill = uchar 0
+    if ge b1 uchar 128
+      fill = uchar 255
+    end
+    put g_ldst_reg 2 fill
+    put g_ldst_reg 3 fill
+    ret
+  end
+  lb = omega_ld_bytes ld
+  for b ulong lb bound 16
+    put g_ldst_reg b get src add so b
+  end
+end
+
+fn ldst_host_store sb ulong dst edit uchar * doff ulong to void
+  for b ulong sb bound 16
+    put dst add doff b get g_ldst_reg b
+  end
+end
+
+fn ldst_elem_off spec view long 6 pad ulong i ulong is_out ulong to ulong
+  off = add long pad get spec add 4 is_out
+  st = mul long i get spec add 2 is_out
+  ret ulong add off st
+end
+
+note cfg = [pad, count]
+fn omega_ldst_host_run spec view long 6 src view uchar * dst edit uchar * cfg view ulong 2 to long
+  if not ldst_check_bounds spec len src len dst get cfg 0 get cfg 1
+    ret -1
+  end
+  for i ulong get cfg 1 bound 4096
+    so = ldst_elem_off spec get cfg 0 i 0
+    ldst_host_load ulong get spec 0 src so
+    doff = ldst_elem_off spec get cfg 0 i 1
+    ldst_host_store omega_st_bytes ulong get spec 1 dst doff
+  end
+  ret 0
+end
+
+fn ldst_map_copy_in mh long src view uchar * nbytes ulong to bool
+  if ne get ogpl_mock 0 0
+    ret true
+  end
+  buf = new uchar 256 0
+  pos = ulong 0
+  while lt pos nbytes bound 256
+    take = sub nbytes pos
+    if gt take 256
+      take = ulong 256
+    end
+    for i ulong take bound 256
+      put buf i get src add pos i
+    end
+    if ne mapwrite mh pos buf 0 take long take
+      ret false
+    end
+    pos = add pos take
+  end
+  ret true
+end
+
+fn ldst_map_copy_out mh long dst edit uchar * nbytes ulong to bool
+  if ne get ogpl_mock 0 0
+    ret true
+  end
+  buf = new uchar 256 0
+  pos = ulong 0
+  while lt pos nbytes bound 256
+    take = sub nbytes pos
+    if gt take 256
+      take = ulong 256
+    end
+    if ne mapread mh pos buf 0 take long take
+      ret false
+    end
+    for i ulong take bound 256
+      put dst add pos i get buf i
+    end
+    pos = add pos take
+  end
+  ret true
+end
+
+fn ldst_upload_code code view uchar 384 to void
+  if eq get ogpl_mock 0 0
+    wr = mapwrite long get g_ngb_mems 3 0 code 0 OMEGA_LDST_CODE_BYTES
+  end
+end
+
+fn ldst_launch_exec pad ulong count ulong to long
+  tpb = ulong get g_num_launch_tpb 0
+  gx = ulong get g_num_launch_grid 0
+  ain = add get g_ngb_mems 10 pad
+  aout = add get g_ngb_mems 16 pad
+  L = new ulong 12 0
+  put L 0 get g_ngb_mems 4
+  put L 1 OMEGA_DS_GPR_COUNT
+  put L 2 tpb
+  put L 3 1
+  put L 4 gx
+  put L 5 1
+  put L 6 count
+  put L 7 10
+  put L 8 10000
+  args = new uint 10 0
+  put args 0 uint and ain 0xffffffff
+  put args 1 uint shr ain 32
+  put args 2 uint and get g_ngb_mems 10 0xffffffff
+  put args 3 uint shr get g_ngb_mems 10 32
+  put args 4 uint and aout 0xffffffff
+  put args 5 uint shr aout 32
+  put args 6 uint count
+  el = new ulong 1 0
+  mk = new uint 1 0
+  ret ogps_launch L args el mk
+end
+
+fn ldst_prep_and_alloc spec view long 6 in_dev ulong dlen ulong count ulong to long
+  code = new uchar 384 0
+  if or ne omega_ldst_build_kernel spec code 0 ne omega_ldst_check_kernel spec code 0
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if ne ds_precheck_qmd count OMEGA_NUMERIC_OK
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if eq ogps_open 0
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  m = new ulong 6 0
+  if ne ogps_alloc_code OMEGA_LDST_CODE_BYTES m OGPS_OK
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ngb_store_mem 0 m
+  if ne ogps_alloc in_dev m OGPS_OK
+    ngb_free_all
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ngb_store_mem 1 m
+  if ne ogps_alloc dlen m OGPS_OK
+    ngb_free_all
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ngb_store_mem 2 m
+  ldst_upload_code code
+  ret OMEGA_NUMERIC_OK
+end
+
+note cfg = [pad, count]
+fn omega_ldst_gb10_run spec view long 6 src view uchar * dst edit uchar * cfg view ulong 2 to long
+  if or eq len src 0 or eq len dst 0 ne omega_ldst_check_spec spec get cfg 1 0
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if gt get cfg 0 OMEGA_LDST_PAD
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if not ldst_check_bounds spec len src len dst get cfg 0 get cfg 1
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  in_dev = len src
+  if lt in_dev mul get cfg 1 4
+    in_dev = mul get cfg 1 4
+  end
+  prc = ldst_prep_and_alloc spec in_dev len dst get cfg 1
+  if ne prc OMEGA_NUMERIC_OK
+    ret prc
+  end
+  ok_up = ldst_map_copy_in long get g_ngb_mems 9 src len src
+  if ok_up
+    ok_up = ldst_map_copy_in long get g_ngb_mems 15 dst len dst
+  end
+  lrc = OGPS_ERR
+  if ok_up
+    lrc = ldst_launch_exec get cfg 0 get cfg 1
+  end
+  ok_rd = false
+  if eq lrc OGPS_OK
+    ok_rd = ldst_map_copy_out long get g_ngb_mems 15 dst len dst
+  end
+  ngb_free_all
+  if not ok_rd
+    ret OMEGA_NUMERIC_ERR_DEVICE
+  end
+  ret OMEGA_NUMERIC_OK
+end

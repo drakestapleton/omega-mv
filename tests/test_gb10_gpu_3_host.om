@@ -1,0 +1,577 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/test_gb10_gpu_3_host.om: CPU-only structural/API/negative-control test
+note for wave gb10-gpu-3 (zero /dev/nvidia* access; uses mock platform).
+om2
+
+text h3_hdr "=== HOST TEST: wave gb10-gpu-3 (CPU-only, zero /dev/nvidia*) ===\n"
+text h3_t1 "  [1] omega_numeric_divsqrt_gb10.om (13 digests + encode/decode + host_exec): "
+text h3_t2 "  [2] omega_numeric_gb10.om (submit check + mock dispatch): "
+text h3_t3 "  [3] omega_numeric_ldst_gb10.om (spec/extent/kernel/host_run/mock): "
+text h3_t4 "  [4] omega_numeric_reduce_gb10.om (minmax patch/check/empty/mock): "
+text h3_t5 "  [5] omega_gpu_scan.om (codegen/grid/scratch/drivers/mutants/mock): "
+text h3_t6 "  [6] omega_gpu_prefill.om (dev+host alloc/cache/record/upload/download): "
+text h3_t7 "  [7] omega_gpu_pfhost.om (router pack/logits/moe combine/record): "
+text h3_ok "PASS\n"
+text h3_fail "FAIL step="
+text h3_nl "\n"
+text h3_done "PASS test-gb10-gpu-3-host (all 7 modules verified on CPU, zero /dev/nvidia*)\n"
+
+text h3_op_fadd "FADD"
+text h3_op_ffma "FFMA"
+text h3_op_div "DIV"
+text h3_op_bad "BOGUS_OP"
+
+fn h3_print s view uchar * to void
+  r = write 1 s 0 len s
+end
+
+fn h3_print_u x ulong to void
+  b = new uchar 24 0
+  pos = ulong 24
+  v = x
+  while true
+    pos = sub pos 1
+    put b pos uchar add 48 rem v 10
+    v = div v 10
+    if eq v 0
+      r = write 1 b pos sub 24 pos
+      ret
+    end
+  end
+end
+
+fn h3_fail_msg code ulong to int
+  h3_print h3_fail
+  h3_print_u code
+  h3_print h3_nl
+  ret 1
+end
+
+fn h3_setup_mock to void
+  ogps_reset_all
+  put ogpl_mock 0 1
+  ogps_install_default
+end
+
+fn h3_test_divsqrt to ulong
+  nm = new uchar 16 0
+  if ne omega_ds_op_name OMEGA_DS_DIV nm 3
+    ret 101
+  end
+  if ne omega_ds_op_for_numeric OMEGA_NOP_DIV OMEGA_DS_DIV
+    ret 102
+  end
+  if ne omega_ds_op_for_numeric OMEGA_NOP_SQRT OMEGA_DS_SQRT
+    ret 103
+  end
+  if ne omega_ds_op_for_numeric OMEGA_NOP_EXP OMEGA_DS_EXP
+    ret 104
+  end
+  if ne omega_ds_op_for_numeric OMEGA_NOP_LOG OMEGA_DS_LOG
+    ret 105
+  end
+  if ne omega_ds_op_for_numeric OMEGA_NOP_FADD OMEGA_DS_OP_COUNT
+    ret 106
+  end
+  note Encode/decode round-trip + invalid kind negative control
+  w = new uint 4 0
+  dec = new ulong 2 0
+  p0 = or DSK_IADD3_R or shl ulong 9 8 or shl ulong 2 16 or shl ulong 5 24 shl ulong 255 32
+  if ne omega_ds_encode p0 0 w 0
+    ret 107
+  end
+  if ne omega_ds_decode w dec 0
+    ret 108
+  end
+  if ne get dec 0 p0
+    ret 109
+  end
+  if eq omega_ds_encode DSK_COUNT 0 w 0
+    ret 110
+  end
+  note Verify ALL 13 ops build, pass structural check, and match recorded nvdisasm SHA-256!
+  for op ulong OMEGA_DS_OP_COUNT
+    clen = omega_ds_build_kernel op
+    if eq clen 0
+      ret add 120 op
+    end
+    if ne omega_ds_check_kernel op clen OMEGA_DS_GPR_COUNT OMEGA_NUMERIC_OK
+      ret add 140 op
+    end
+    if ne omega_ds_check_digest op clen OMEGA_NUMERIC_OK
+      ret add 160 op
+    end
+  end
+  note Negative control: flip 1 byte in DIV kernel -> digest check MUST refuse
+  clen_d = omega_ds_build_kernel OMEGA_DS_DIV
+  old_b = get g_ds_code 272
+  put g_ds_code 272 xor old_b uchar 1
+  if eq omega_ds_check_digest OMEGA_DS_DIV clen_d OMEGA_NUMERIC_OK
+    ret 180
+  end
+  put g_ds_code 272 old_b
+  note Host exec vs CPU semantic parity for DIV, SQRT, EXP, LOG
+  va = new uint 6 0
+  vb = new uint 6 0
+  put va 0 uint 0x40400000
+  put vb 0 uint 0x40000000
+  put va 1 uint 0x3f800000
+  put vb 1 uint 0x40400000
+  put va 2 uint 0x00000001
+  put vb 2 uint 0x40000000
+  put va 3 uint 0x00000000
+  put vb 3 uint 0x00000000
+  put va 4 uint 0x40800000
+  put vb 4 uint 0x3f800000
+  put va 5 uint 0x7f800000
+  put vb 5 uint 0x3f800000
+  for i ulong 6
+    a = get va i
+    b = get vb i
+    if ne omega_ds_host_exec OMEGA_DS_DIV a b omega_ds_cpu_semantic OMEGA_DS_DIV a b
+      ret add 190 i
+    end
+    if ne omega_ds_host_exec OMEGA_DS_SQRT a 0 omega_ds_cpu_semantic OMEGA_DS_SQRT a 0
+      ret add 200 i
+    end
+    if ne omega_ds_host_exec OMEGA_DS_EXP a 0 omega_ds_cpu_semantic OMEGA_DS_EXP a 0
+      ret add 210 i
+    end
+    if ne omega_ds_host_exec OMEGA_DS_LOG a 0 omega_ds_cpu_semantic OMEGA_DS_LOG a 0
+      ret add 220 i
+    end
+  end
+  note Negative arg/QMD controls + mock run
+  if eq omega_ds_check_args OMEGA_DS_DIV true false true 4 OMEGA_NUMERIC_OK
+    ret 230
+  end
+  if eq omega_ds_check_args OMEGA_DS_DIV true true true 0 OMEGA_NUMERIC_OK
+    ret 231
+  end
+  fmt = new uchar 32 0
+  if eq omega_ds_format p0 fmt 0
+    ret 232
+  end
+  if ne omega_ds_listing OMEGA_DS_DIV fmt 0
+    ret 233
+  end
+  for i ulong 4
+    put g_num_a i get va i
+    put g_num_b i get vb i
+  end
+  if ne omega_ds_gb10_run OMEGA_DS_DIV true 4 OMEGA_NUMERIC_OK
+    ret 234
+  end
+  ret 0
+end
+
+fn h3_test_numeric_gb10 to ulong
+  for i ulong 4
+    put g_num_a i uint 0x3f800000
+    put g_num_b i uint 0x40000000
+    put g_num_c i uint 0x40400000
+  end
+  note Unknown op must be refused before device open
+  if eq omega_gb10_execute_simt_op h3_op_bad 8 15 4 OMEGA_NUMERIC_OK
+    ret 301
+  end
+  note Count 0 must be refused
+  if eq omega_gb10_execute_simt_op h3_op_fadd 4 15 0 OMEGA_NUMERIC_OK
+    ret 302
+  end
+  note Valid FADD, FFMA, DIV in mock mode
+  if ne omega_gb10_execute_simt_op h3_op_fadd 4 15 4 OMEGA_NUMERIC_OK
+    ret 303
+  end
+  if ne omega_gb10_execute_simt_op h3_op_ffma 4 15 4 OMEGA_NUMERIC_OK
+    ret 304
+  end
+  if ne omega_gb10_execute_simt_op h3_op_div 3 15 4 OMEGA_NUMERIC_OK
+    ret 305
+  end
+  ret 0
+end
+
+fn h3_test_ldst to ulong
+  if or ne omega_ld_bytes OMEGA_LD_S8 1 ne omega_ld_bytes OMEGA_LD_B128 16
+    ret 401
+  end
+  if or ne omega_st_bytes OMEGA_ST_B8 1 ne omega_st_bytes OMEGA_ST_B128 16
+    ret 402
+  end
+  spec = new long 6 0
+  put spec 0 long OMEGA_LD_S8
+  put spec 1 long OMEGA_ST_B32
+  put spec 2 1
+  put spec 3 4
+  put spec 4 -4
+  put spec 5 0
+  if ne omega_ldst_check_spec spec 4 0
+    ret 403
+  end
+  note Negative control: store wider than load fill (U8 -> B64 must fail)
+  bad = new long 6 0
+  put bad 0 long OMEGA_LD_U8
+  put bad 1 long OMEGA_ST_B64
+  put bad 2 1
+  put bad 3 8
+  if eq omega_ldst_check_spec bad 4 0
+    ret 404
+  end
+  ext = new long 4 0
+  if ne omega_ldst_extent spec 4 ext 0
+    ret 405
+  end
+  if or ne get ext 0 -4 or ne get ext 1 0 or ne get ext 2 0 ne get ext 3 16
+    ret 406
+  end
+  desc = new uchar 32 0
+  if eq omega_ldst_describe spec desc 0
+    ret 407
+  end
+  if ne omega_ldst_listing spec desc 0
+    ret 408
+  end
+  code = new uchar 384 0
+  if ne omega_ldst_build_kernel spec code 0
+    ret 409
+  end
+  if ne omega_ldst_check_kernel spec code 0
+    ret 410
+  end
+  note Tamper 1 byte -> check_kernel must refuse
+  put code 216 xor get code 216 uchar 1
+  if eq omega_ldst_check_kernel spec code 0
+    ret 411
+  end
+  note Host run S8 sign extension with negative offset
+  src = new uchar 64 0
+  dst = new uchar 64 0
+  put src 12 uchar 0xfe
+  put src 13 uchar 0x7f
+  put src 14 uchar 0x80
+  put src 15 uchar 0x01
+  lcfg = new ulong 2 0
+  put lcfg 0 16
+  put lcfg 1 4
+  if ne omega_ldst_host_run spec src dst lcfg 0
+    ret 412
+  end
+  note 0xfe sign-extended -> 0xfe 0xff 0xff 0xff
+  if or ne get dst 16 uchar 0xfe ne get dst 17 uchar 0xff
+    ret 413
+  end
+  note 0x7f sign-extended -> 0x7f 0x00 0x00 0x00
+  if or ne get dst 20 uchar 0x7f ne get dst 21 uchar 0x00
+    ret 414
+  end
+  omega_ldst_gb10_set_spec_id 7
+  if ne omega_ldst_gb10_run spec src dst lcfg OMEGA_NUMERIC_OK
+    ret 415
+  end
+  ret 0
+end
+
+fn h3_test_reduce_gb10 to ulong
+  np = omega_reduce_gb10_minmax_patch OMEGA_RED_MAX
+  if ne np 12
+    ret 501
+  end
+  qmd1 = new uint 96 0
+  if ne red_launch_qmd 64 qmd1 OMEGA_NUMERIC_OK
+    ret 502
+  end
+  if ne omega_reduce_gb10_check_minmax_patch OMEGA_RED_MAX np qmd1 OMEGA_NUMERIC_OK
+    ret 503
+  end
+  note Tamper FMNMX stall below 5 -> must refuse
+  old_w3 = get g_num_patch_w 7
+  put g_num_patch_w 7 and old_w3 uint 0xffffe1ff
+  if eq omega_reduce_gb10_check_minmax_patch OMEGA_RED_MAX np qmd1 OMEGA_NUMERIC_OK
+    ret 504
+  end
+  put g_num_patch_w 7 old_w3
+  code = new uchar 512 0
+  if ne omega_reduce_gb10_build_minmax_kernel OMEGA_RED_MIN code OMEGA_NUMERIC_OK
+    ret 505
+  end
+  if ne omega_reduce_gb10_check OMEGA_RED_SUM true 100 true OMEGA_NUMERIC_OK
+    ret 506
+  end
+  if ne omega_reduce_gb10_check OMEGA_RED_MAX true 100 true OMEGA_NUMERIC_OK
+    ret 507
+  end
+  if ne omega_reduce_gb10_check OMEGA_RED_MEAN true 100 true OMEGA_NUMERIC_OK
+    ret 508
+  end
+  if eq omega_reduce_gb10_check OMEGA_RED_COUNT true 100 true OMEGA_NUMERIC_OK
+    ret 509
+  end
+  x = new uint 4 0
+  res = new uint 1 0
+  if ne omega_reduce_gb10 OMEGA_RED_SUM x 0 res OMEGA_NUMERIC_OK
+    ret 510
+  end
+  if ne get res 0 uint 0
+    ret 511
+  end
+  if ne omega_reduce_gb10 OMEGA_RED_MAX x 4 res OMEGA_NUMERIC_OK
+    ret 512
+  end
+  if ne omega_reduce_gb10_last_launches 1
+    ret 513
+  end
+  ret 0
+end
+
+fn h3_test_scan to ulong
+  rcn = new uchar 16 0
+  if ne omega_gpu_scan_rc_name OMEGA_GPU_SCAN_OK rcn 2
+    ret 601
+  end
+  if ne omega_gpu_scan_grid 256 1
+    ret 602
+  end
+  if ne omega_gpu_scan_reduce_scratch_words 100 5
+    ret 603
+  end
+  if ne omega_gpu_scan_prefix_scratch_words 100 5
+    ret 604
+  end
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  for k ulong OMEGA_SCAN_K_COUNT
+    if ne omega_gpu_scan_codegen k 0 ins meta 0
+      ret add 610 k
+    end
+    if eq get meta 0 0
+      ret add 620 k
+    end
+  end
+  if eq omega_gpu_scan_codegen OMEGA_SCAN_K_COUNT 0 ins meta 0
+    ret 625
+  end
+  out_va = new ulong 1 0
+  nl = new ulong 1 0
+  if ne omega_gpu_scan_drive_reduce OMEGA_GPU_RED_SUM 100 0x1000 0x2000 out_va nl OMEGA_GPU_SCAN_OK
+    ret 626
+  end
+  if ne get nl 0 2
+    ret 627
+  end
+  if ne omega_gpu_scan_drive_prefix 100 0x1000 0x2000 0x3000 nl OMEGA_GPU_SCAN_OK
+    ret 628
+  end
+  if ne get nl 0 3
+    ret 629
+  end
+  x = new uint 40 0
+  y = new uint 40 0
+  yref = new uint 40 0
+  for i ulong 40
+    put x i uint 0x3f800000
+  end
+  info = new ulong 3 0
+  omega_gpu_scan_test_set_mutant 0
+  if ne omega_gpu_prefix_sum x 40 y info OMEGA_GPU_SCAN_OK
+    ret 630
+  end
+  if ne omega_gpu_prefix_sum_reference x 40 yref 0
+    ret 631
+  end
+  for i ulong 40
+    if ne get y i get yref i
+      ret 632
+    end
+  end
+  note Negative control: mutant=1 must change output
+  omega_gpu_scan_test_set_mutant 1
+  if ne omega_gpu_prefix_sum x 40 y info OMEGA_GPU_SCAN_OK
+    ret 633
+  end
+  if eq get y 39 get yref 39
+    ret 634
+  end
+  omega_gpu_scan_test_set_mutant 0
+  r_out = new uint 1 0
+  if ne omega_gpu_reduce OMEGA_GPU_RED_SUM x 40 r_out info OMEGA_GPU_SCAN_OK
+    ret 635
+  end
+  ret 0
+end
+
+fn h3_test_prefill to ulong
+  rcn = new uchar 16 0
+  if ne omega_gpu_pf_rc_name OMEGA_GPU_PF_OK rcn 2
+    ret 701
+  end
+  omega_gpu_pf_stats_reset
+  cns = new ulong 1 0
+  nl = new ulong 1 0
+  omega_gpu_pf_stats cns nl
+  if or ne get cns 0 0 ne get nl 0 0
+    ret 702
+  end
+  devm = new ulong 6 0
+  hostm = new ulong 6 0
+  if eq omega_gpu_pf_alloc_dev 0 devm OMEGA_GPU_PF_OK
+    ret 703
+  end
+  if ne omega_gpu_pf_alloc_dev 4096 devm OMEGA_GPU_PF_OK
+    ret 704
+  end
+  if ne omega_gpu_pf_alloc_host 4096 hostm OMEGA_GPU_PF_OK
+    ret 705
+  end
+  buf = new uchar 64 0
+  if ne omega_gpu_pf_upload devm 0 buf 64 OMEGA_GPU_PF_OK
+    ret 706
+  end
+  if ne omega_gpu_pf_download devm 0 buf 64 OMEGA_GPU_PF_OK
+    ret 707
+  end
+  if ne omega_gpu_pf_copy_va get devm 4 get hostm 4 64 OMEGA_GPU_PF_OK
+    ret 708
+  end
+  note Negative control: unaligned upload offset must be refused
+  if eq omega_gpu_pf_upload devm 4 buf 64 OMEGA_GPU_PF_OK
+    ret 709
+  end
+  omega_gpu_pf_stats cns nl
+  if lt get nl 0 3
+    ret 710
+  end
+  omega_gpu_pf_free devm
+  omega_gpu_pf_free hostm
+  ret 0
+end
+
+fn h3_test_pfhost to ulong
+  omega_gpu_pf_router_set_rows 0
+  if ne omega_gpu_pf_router_rows 16
+    ret 801
+  end
+  omega_gpu_pf_router_set_rows 8
+  if ne omega_gpu_pf_router_rows 8
+    ret 802
+  end
+  omega_gpu_pf_router_set_rows 16
+  omega_gpu_pf_router_test_set_mutant 0
+  omega_gpu_pf_combine_test_set_mutant 0
+  if ne omega_gpu_pf_router_packed_bytes 4 8 192
+    ret 803
+  end
+  w = new uint 32 0
+  wq = new uint 48 0
+  for i ulong 32
+    put w i uint add 0x3f800000 i
+  end
+  omega_gpu_pf_router_pack 4 8 w wq
+  note Check group 0 expert 1 quad 2 == w[1*8 + 2]
+  if ne get wq 6 get w 10
+    ret 804
+  end
+  note Check pad group is zeroed
+  if ne get wq 32 uint 0
+    ret 805
+  end
+  ns = new ulong 1 0
+  rreq = new ulong 6 0
+  put rreq 0 128
+  put rreq 1 32
+  put rreq 2 16
+  put rreq 3 0x1004
+  put rreq 4 0x2000
+  put rreq 5 0x3000
+  note Unaligned VA must be refused
+  if eq omega_gpu_pf_router_logits rreq ns OMEGA_GPU_PF_OK
+    ret 806
+  end
+  put rreq 3 0x1000
+  if ne omega_gpu_pf_router_logits rreq ns OMEGA_GPU_PF_OK
+    ret 807
+  end
+  mreq = new ulong 7 0
+  put mreq 0 128
+  put mreq 1 4
+  put mreq 2 8
+  put mreq 3 0x1000
+  put mreq 4 0x2000
+  put mreq 5 0x3000
+  put mreq 6 0x4000
+  if ne omega_gpu_pf_moe_combine mreq ns OMEGA_GPU_PF_OK
+    ret 808
+  end
+  cid = new ulong 1 0
+  if ne ogcl_create 8 cid OGPS_OK
+    ret 809
+  end
+  if ne omega_gpu_pf_router_logits_record get cid 0 rreq OMEGA_GPU_PF_OK
+    ret 810
+  end
+  if ne omega_gpu_pf_moe_combine_record get cid 0 mreq OMEGA_GPU_PF_OK
+    ret 811
+  end
+  if ne ogcl_count get cid 0 2
+    ret 812
+  end
+  ogcl_free get cid 0
+  ret 0
+end
+
+fn main to int
+  h3_print h3_hdr
+  h3_setup_mock
+
+  h3_print h3_t1
+  rc = h3_test_divsqrt
+  if ne rc 0
+    ret h3_fail_msg rc
+  end
+  h3_print h3_ok
+
+  h3_print h3_t2
+  rc = h3_test_numeric_gb10
+  if ne rc 0
+    ret h3_fail_msg rc
+  end
+  h3_print h3_ok
+
+  h3_print h3_t3
+  rc = h3_test_ldst
+  if ne rc 0
+    ret h3_fail_msg rc
+  end
+  h3_print h3_ok
+
+  h3_print h3_t4
+  rc = h3_test_reduce_gb10
+  if ne rc 0
+    ret h3_fail_msg rc
+  end
+  h3_print h3_ok
+
+  h3_print h3_t5
+  rc = h3_test_scan
+  if ne rc 0
+    ret h3_fail_msg rc
+  end
+  h3_print h3_ok
+
+  h3_print h3_t6
+  rc = h3_test_prefill
+  if ne rc 0
+    ret h3_fail_msg rc
+  end
+  h3_print h3_ok
+
+  h3_print h3_t7
+  rc = h3_test_pfhost
+  if ne rc 0
+    ret h3_fail_msg rc
+  end
+  h3_print h3_ok
+
+  h3_print h3_done
+  ret 0
+end
