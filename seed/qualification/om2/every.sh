@@ -92,12 +92,11 @@ done
 # Qualification files that pass on the committed compiler (the four sec/leak candidate files skip only
 # their declared notrun cases). The other files under
 # seed/qualification are left out on purpose: pinned.cases run against the OM-1 reference omc 734f0a39,
-# mutant and selftest fail/controls files are designed failures run by their own drivers, and security673 bindings.cases
-# stays out until derive-wrong-image's stored evidence/run3/embed.bin (2184 bytes, 2026-10-30) is
-# re-derived by its owner: today's omc emits 2308 bytes for embed.om, so that pin is stale.
+# and mutant and selftest fail/controls files are designed failures run by their own drivers.
 for c in seed/qualification/om2/baseline/guard.cases seed/qualification/om2/baseline/language.cases \
     seed/qualification/om2/baseline/sha256.cases seed/qualification/om2/baseline/transform.cases \
     seed/qualification/om2/sec/s4fuel/candidate.cases seed/qualification/om2/selftest/pass.cases \
+    seed/qualification/security673/relational/bindings.cases \
     seed/qualification/security673/relational/consumer.cases \
     seed/qualification/security673/relational/l4-tripwire.cases \
     seed/qualification/security673/relational/qualification.cases \
