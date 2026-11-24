@@ -1,0 +1,319 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_exec.c (64-slot byte-identity LRU
+note realization exec cache, AArch64 f3 execution, bare-metal QEMU runner
+note binary builder).
+note Composes on om/aarch64/aarch64_om2.om.
+om2
+
+const EXEC_CACHE_SLOTS ulong 64
+const EXEC_MAX_CODE ulong 256
+const EXEC_BUF_SIZE ulong 16384
+
+text exec_pass_msg "OMEGA_QEMU_EXEC: PASS (observed=15)\n"
+text exec_fail_msg "OMEGA_QEMU_EXEC: FAIL (mismatch)\n"
+
+global g_ex_used ulong 64
+global g_ex_clen ulong 64
+global g_ex_luse ulong 64
+global g_ex_code uchar 16384
+
+global g_ex_hits ulong 1
+global g_ex_misses ulong 1
+global g_ex_evictions ulong 1
+global g_ex_resident ulong 1
+global g_ex_tick ulong 1
+global g_ex_res ulong 1
+global g_ex_qlen ulong 1
+
+fn omega_exec_native_cache_reset to void
+  for i ulong EXEC_CACHE_SLOTS
+    put g_ex_used i 0
+    put g_ex_clen i 0
+    put g_ex_luse i 0
+  end
+  put g_ex_hits 0 0
+  put g_ex_misses 0 0
+  put g_ex_evictions 0 0
+  put g_ex_resident 0 0
+  put g_ex_tick 0 0
+end
+
+fn omega_exec_native_cache_stats dst edit ulong 4 to void
+  put dst 0 get g_ex_hits 0
+  put dst 1 get g_ex_misses 0
+  put dst 2 get g_ex_evictions 0
+  put dst 3 get g_ex_resident 0
+end
+
+fn ex_slot_match slot ulong code view uchar * clen ulong to bool
+  if eq get g_ex_used slot 0
+    ret false
+  end
+  if ne get g_ex_clen slot clen
+    ret false
+  end
+  base = mul slot EXEC_MAX_CODE
+  for i ulong clen bound 256
+    if ne get g_ex_code add base i get code i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ex_slot_acquire code view uchar * clen ulong to long
+  empty = long -1
+  lru = long -1
+  lru_t = ulong 0
+  for i ulong EXEC_CACHE_SLOTS
+    if ex_slot_match i code clen
+      tk = add get g_ex_tick 0 1
+      put g_ex_tick 0 tk
+      put g_ex_luse i tk
+      put g_ex_hits 0 add get g_ex_hits 0 1
+      ret long i
+    end
+    if eq get g_ex_used i 0
+      if lt empty 0
+        empty = long i
+      end
+    else
+      t = get g_ex_luse i
+      if lt lru 0
+        lru = long i
+        lru_t = t
+      else
+        if lt t lru_t
+          lru = long i
+          lru_t = t
+        end
+      end
+    end
+  end
+  vic = ulong 0
+  if ge empty 0
+    vic = ulong empty
+  else
+    vic = ulong lru
+    put g_ex_evictions 0 add get g_ex_evictions 0 1
+    put g_ex_resident 0 sub get g_ex_resident 0 1
+  end
+  base = mul vic EXEC_MAX_CODE
+  for i ulong clen bound 256
+    put g_ex_code add base i get code i
+  end
+  put g_ex_used vic 1
+  put g_ex_clen vic clen
+  tk = add get g_ex_tick 0 1
+  put g_ex_tick 0 tk
+  put g_ex_luse vic tk
+  put g_ex_misses 0 add get g_ex_misses 0 1
+  put g_ex_resident 0 add get g_ex_resident 0 1
+  ret long vic
+end
+
+fn ex_rget regs view ulong 32 r ulong to ulong
+  if eq r 31
+    ret 0
+  end
+  ret get regs r
+end
+
+fn ex_rput regs edit ulong 32 r ulong v ulong to void
+  if lt r 31
+    put regs r v
+  end
+end
+
+fn ex_rd32 off ulong to ulong
+  w0 = ulong get g_ex_code off
+  w1 = ulong get g_ex_code add off 1
+  w2 = ulong get g_ex_code add off 2
+  w3 = ulong get g_ex_code add off 3
+  ret or w0 or shl w1 8 or shl w2 16 shl w3 24
+end
+
+fn ex_step w ulong regs edit ulong 32 to long
+  if eq w 0xd65f03c0
+    ret 1
+  end
+  rd = and w 31
+  rn = and shr w 5 31
+  rm = and shr w 16 31
+  if eq and w 0xffe0fc00 0x8b000000
+    ex_rput regs rd add ex_rget regs rn ex_rget regs rm
+    ret 0
+  end
+  if eq and w 0xffe0fc00 0xcb000000
+    ex_rput regs rd sub ex_rget regs rn ex_rget regs rm
+    ret 0
+  end
+  if eq and w 0xffe0fc00 0x9b007c00
+    ex_rput regs rd mul ex_rget regs rn ex_rget regs rm
+    ret 0
+  end
+  if eq and w 0xffe0fc00 0x8a000000
+    ex_rput regs rd and ex_rget regs rn ex_rget regs rm
+    ret 0
+  end
+  if eq and w 0xffe0fc00 0xaa000000
+    ex_rput regs rd or ex_rget regs rn ex_rget regs rm
+    ret 0
+  end
+  if eq and w 0xffe0fc00 0xca000000
+    ex_rput regs rd xor ex_rget regs rn ex_rget regs rm
+    ret 0
+  end
+  if eq and w 0xffe00000 0xd2800000
+    imm = and shr w 5 0xffff
+    hw = and shr w 21 3
+    ex_rput regs rd shl imm mul hw 16
+    ret 0
+  end
+  if eq and w 0xffe00000 0xf2800000
+    imm = and shr w 5 0xffff
+    hw = and shr w 21 3
+    sh = mul hw 16
+    cur = ex_rget regs rd
+    msk = xor ulong 0xffffffffffffffff shl ulong 0xffff sh
+    ex_rput regs rd or and cur msk shl imm sh
+    ret 0
+  end
+  ret -1
+end
+
+fn ex_run_slot slot ulong a ulong b ulong c ulong to long
+  clen = get g_ex_clen slot
+  if ne rem clen 4 0
+    ret -1
+  end
+  ninsns = div clen 4
+  base = mul slot EXEC_MAX_CODE
+  regs = new ulong 32 0
+  put regs 0 a
+  put regs 1 b
+  put regs 2 c
+  for pc ulong ninsns bound 64
+    w = ex_rd32 add base mul pc 4
+    rc = ex_step w regs
+    if eq rc 1
+      put g_ex_res 0 get regs 0
+      ret 0
+    end
+    if lt rc 0
+      ret -1
+    end
+  end
+  ret -1
+end
+
+fn omega_exec_native_f3 code view uchar * clen ulong a ulong b ulong c ulong to long
+  if eq clen 0
+    ret -1
+  end
+  if gt clen EXEC_MAX_CODE
+    ret -1
+  end
+  slot = ex_slot_acquire code clen
+  if lt slot 0
+    ret -1
+  end
+  ret ex_run_slot ulong slot a b c
+end
+
+fn ex_put_u32le dst edit uchar * pos ulong w ulong to ulong
+  put dst pos uchar and w 255
+  put dst add pos 1 uchar and shr w 8 255
+  put dst add pos 2 uchar and shr w 16 255
+  put dst add pos 3 uchar and shr w 24 255
+  ret add pos 4
+end
+
+fn ex_emit_uart_msg dst edit uchar * st edit ulong 2 msg view uchar * to long
+  mlen = len msg
+  for i ulong mlen bound 64
+    ch = ulong get msg i
+    if ne a64put dst st a64movz 0 5 ch 0 0
+      ret -1
+    end
+    p = get st 0
+    if gt add p 4 get st 1
+      ret -1
+    end
+    put st 0 ex_put_u32le dst p 0x39000085
+  end
+  ret 0
+end
+
+fn ex_emit_semihost_exit dst edit uchar * st edit ulong 2 to long
+  p = get st 0
+  if gt add p 32 get st 1
+    ret -1
+  end
+  p = ex_put_u32le dst p 0x52800300
+  p = ex_put_u32le dst p 0x10000061
+  p = ex_put_u32le dst p 0xd45e0000
+  p = ex_put_u32le dst p 0x14000000
+  p = ex_put_u32le dst p 0x00020026
+  p = ex_put_u32le dst p 0x00000000
+  p = ex_put_u32le dst p 0x00000000
+  p = ex_put_u32le dst p 0x00000000
+  put st 0 p
+  ret 0
+end
+
+fn omega_build_qemu_runner code view uchar * clen ulong dst edit uchar * dmax ulong to long
+  if eq clen 0
+    ret -1
+  end
+  if ne rem clen 4 0
+    ret -1
+  end
+  st = new ulong 2 0
+  put st 0 0
+  put st 1 dmax
+  rc = a64put dst st a64movz 1 0 7 0
+  rc = or rc a64put dst st a64movz 1 1 11 0
+  rc = or rc a64put dst st a64movz 1 2 3 0
+  if ne rc 0
+    ret -1
+  end
+  p = get st 0
+  if gt add p 4 dmax
+    ret -1
+  end
+  put st 0 ex_put_u32le dst p 0x94000002
+  fn_words = div clen 4
+  if ne a64put dst st a64b add long fn_words 1 0
+    ret -1
+  end
+  p = get st 0
+  if gt add p clen dmax
+    ret -1
+  end
+  for i ulong clen bound 256
+    put dst add p i get code i
+  end
+  put st 0 add p clen
+  rc = a64put dst st a64movz 1 4 0x0900 16
+  rc = or rc a64put dst st a64movz 1 7 15 0
+  rc = or rc a64put dst st a64subreg 1 6 0 7
+  rc = or rc a64put dst st a64cbnz 1 6 74
+  if ne rc 0
+    ret -1
+  end
+  if ne ex_emit_uart_msg dst st exec_pass_msg 0
+    ret -1
+  end
+  if ne a64put dst st a64b 67 0
+    ret -1
+  end
+  if ne ex_emit_uart_msg dst st exec_fail_msg 0
+    ret -1
+  end
+  if ne ex_emit_semihost_exit dst st 0
+    ret -1
+  end
+  put g_ex_qlen 0 get st 0
+  ret 0
+end

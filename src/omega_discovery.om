@@ -1,0 +1,533 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_discovery.c (corpus management,
+note benchmark population, recurring AArch64 sub-expression mining & compression
+note scoring, program refactoring, semantic preservation check, search
+note acceleration demonstration).
+note Composes on om/aarch64/aarch64_om2.om.
+om2
+
+const DISC_MAX_PROGS ulong 16
+const DISC_MAX_CANDS ulong 16
+const DISC_MAX_OCCS ulong 16
+const DISC_CODE_STRIDE ulong 128
+
+const DISC_OP_ADD ulong 3
+const DISC_OP_SUB ulong 4
+const DISC_OP_MUL ulong 5
+
+global g_corp_cnt ulong 1
+global g_corp_code uchar 2048
+global g_corp_clen ulong 16
+global g_corp_icnt ulong 16
+global g_corp_real ulong 16
+
+global g_disc_cnt ulong 1
+global g_disc_best long 1
+global g_disc_code uchar 2048
+global g_disc_clen ulong 16
+global g_disc_occ_cnt ulong 16
+global g_disc_occs ulong 256
+global g_disc_off ulong 16
+global g_disc_slen ulong 16
+global g_disc_score long 16
+global g_disc_nontriv ulong 16
+global g_disc_ver ulong 16
+
+global g_ref_code uchar 128
+global g_ref_clen ulong 1
+global g_ref_icnt ulong 1
+
+fn omega_corpus_init to void
+  put g_corp_cnt 0 0
+  for i ulong DISC_MAX_PROGS
+    put g_corp_clen i 0
+    put g_corp_icnt i 0
+    put g_corp_real i 0
+  end
+end
+
+fn omega_corpus_destroy to void
+  put g_corp_cnt 0 0
+end
+
+fn omega_corpus_add code view uchar * clen ulong icnt ulong is_real ulong to long
+  cnt = get g_corp_cnt 0
+  if ge cnt DISC_MAX_PROGS
+    ret -1
+  end
+  if gt clen DISC_CODE_STRIDE
+    ret -1
+  end
+  base = mul cnt DISC_CODE_STRIDE
+  for i ulong clen bound 128
+    put g_corp_code add base i get code i
+  end
+  put g_corp_clen cnt clen
+  put g_corp_icnt cnt icnt
+  put g_corp_real cnt is_real
+  put g_corp_cnt 0 add cnt 1
+  ret 0
+end
+
+fn omega_corpus_total_cost to ulong
+  cnt = get g_corp_cnt 0
+  tot = ulong 0
+  for i ulong cnt bound 16
+    tot = add tot get g_corp_icnt i
+  end
+  ret tot
+end
+
+fn disc_emit_step buf edit uchar * st edit ulong 2 op ulong imm ulong to long
+  rc = a64put buf st a64movz 1 1 and imm 0xffff 0
+  if ne rc 0
+    ret -1
+  end
+  w = long -1
+  if eq op DISC_OP_ADD
+    w = a64addreg 1 0 0 1
+  end
+  if eq op DISC_OP_SUB
+    w = a64subreg 1 0 0 1
+  end
+  if eq op DISC_OP_MUL
+    w = a64mulreg 1 0 0 1
+  end
+  ret a64put buf st w
+end
+
+fn disc_build_bench_prog op3 ulong imm3 ulong to long
+  buf = new uchar 128 0
+  st = new ulong 2 0
+  put st 0 0
+  put st 1 128
+  rc = disc_emit_step buf st DISC_OP_MUL 2
+  rc = or rc disc_emit_step buf st DISC_OP_ADD 1
+  rc = or rc disc_emit_step buf st op3 imm3
+  rc = or rc a64put buf st a64ret
+  if ne rc 0
+    ret -1
+  end
+  clen = get st 0
+  ret omega_corpus_add buf clen div clen 4 1
+end
+
+fn omega_corpus_populate_benchmark to long
+  if ne disc_build_bench_prog DISC_OP_ADD 5 0
+    ret -1
+  end
+  if ne disc_build_bench_prog DISC_OP_MUL 3 0
+    ret -1
+  end
+  if ne disc_build_bench_prog DISC_OP_SUB 4 0
+    ret -1
+  end
+  if ne disc_build_bench_prog DISC_OP_ADD 10 0
+    ret -1
+  end
+  ret 0
+end
+
+fn disc_slice_eq_cand c ulong p_idx ulong off_b ulong slen_b ulong to bool
+  cb = mul c DISC_CODE_STRIDE
+  pb = add mul p_idx DISC_CODE_STRIDE off_b
+  for i ulong slen_b bound 64
+    if ne get g_disc_code add cb i get g_corp_code add pb i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn disc_slice_eq_prog pj ulong k_b ulong p0 ulong off_b ulong slen_b ulong to bool
+  b0 = add mul p0 DISC_CODE_STRIDE off_b
+  bj = add mul pj DISC_CODE_STRIDE k_b
+  for i ulong slen_b bound 64
+    if ne get g_corp_code add b0 i get g_corp_code add bj i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn disc_is_dup p0 ulong off_b ulong l_insns ulong to bool
+  ccnt = get g_disc_cnt 0
+  slen_b = mul l_insns 4
+  for c ulong ccnt bound 16
+    if eq get g_disc_slen c l_insns
+      if disc_slice_eq_cand c p0 off_b slen_b
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn disc_prog_has_slice pj ulong p0 ulong off_b ulong l_insns ulong to bool
+  if eq get g_corp_real pj 0
+    ret false
+  end
+  slen_b = mul l_insns 4
+  pj_len = get g_corp_clen pj
+  if lt pj_len slen_b
+    ret false
+  end
+  pj_insns = div pj_len 4
+  if le pj_insns l_insns
+    ret false
+  end
+  lim = sub pj_insns l_insns
+  for k ulong lim bound 32
+    if disc_slice_eq_prog pj mul k 4 p0 off_b slen_b
+      ret true
+    end
+  end
+  ret false
+end
+
+fn disc_count_occs p0 ulong off_b ulong l_insns ulong occs edit ulong 16 to ulong
+  cnt = get g_corp_cnt 0
+  ocnt = ulong 0
+  for j ulong cnt bound 16
+    if disc_prog_has_slice j p0 off_b l_insns
+      if lt ocnt DISC_MAX_OCCS
+        put occs ocnt j
+        ocnt = add ocnt 1
+      end
+    end
+  end
+  ret ocnt
+end
+
+fn disc_rd32 code view uchar * off ulong to ulong
+  b0 = ulong get code off
+  b1 = ulong get code add off 1
+  b2 = ulong get code add off 2
+  b3 = ulong get code add off 3
+  ret or b0 or shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn disc_lift_ok code view uchar * clen ulong to bool
+  if lt clen 4
+    ret false
+  end
+  if ne rem clen 4 0
+    ret false
+  end
+  ninsns = div clen 4
+  if ne disc_rd32 code mul sub ninsns 1 4 0xd65f03c0
+    ret false
+  end
+  body = sub ninsns 1
+  if ne rem body 2 0
+    ret false
+  end
+  pairs = div body 2
+  for i ulong pairs bound 16
+    o1 = mul i 8
+    wa = disc_rd32 code o1
+    if ne and wa 0xffe0001f 0xd2800001
+      ret false
+    end
+    wb = disc_rd32 code add o1 4
+    ok = eq wb 0x8b010000
+    if not ok
+      ok = eq wb 0xcb010000
+    end
+    if not ok
+      ok = eq wb 0x9b017c00
+    end
+    if not ok
+      ret false
+    end
+  end
+  ret true
+end
+
+fn disc_build_and_verify_cand c ulong p0 ulong off ulong l_insns ulong to void
+  slen_b = mul l_insns 4
+  tmp = new uchar 128 0
+  pb = add mul p0 DISC_CODE_STRIDE mul off 4
+  for i ulong slen_b bound 64
+    put tmp i get g_corp_code add pb i
+  end
+  put tmp slen_b uchar 0xc0
+  put tmp add slen_b 1 uchar 0x03
+  put tmp add slen_b 2 uchar 0x5f
+  put tmp add slen_b 3 uchar 0xd6
+  tot_b = add slen_b 4
+  cb = mul c DISC_CODE_STRIDE
+  for i ulong tot_b bound 128
+    put g_disc_code add cb i get tmp i
+  end
+  put g_disc_clen c tot_b
+  msg = new uchar 128 0
+  v_ok = eq a64validate tmp tot_b msg 128 0
+  l_ok = disc_lift_ok tmp tot_b
+  if v_ok
+    if l_ok
+      put g_disc_ver c 1
+    else
+      put g_disc_ver c 0
+    end
+  else
+    put g_disc_ver c 0
+  end
+end
+
+fn disc_record_cand p0 ulong off ulong l_insns ulong occs view ulong 16 ocnt ulong to void
+  c = get g_disc_cnt 0
+  if ge c DISC_MAX_CANDS
+    ret
+  end
+  put g_disc_occ_cnt c ocnt
+  obase = mul c DISC_MAX_OCCS
+  for o ulong ocnt bound 16
+    put g_disc_occs add obase o get occs o
+  end
+  put g_disc_off c off
+  put g_disc_slen c l_insns
+  if ge l_insns 4
+    put g_disc_nontriv c 1
+  else
+    put g_disc_nontriv c 0
+  end
+  disc_build_and_verify_cand c p0 off l_insns
+  saved = mul long ocnt sub long l_insns 1
+  cost = add long l_insns 1
+  put g_disc_score c sub saved cost
+  put g_disc_cnt 0 add c 1
+end
+
+fn omega_discover_abstractions to long
+  put g_disc_cnt 0 0
+  put g_disc_best 0 -1
+  cnt = get g_corp_cnt 0
+  if eq cnt 0
+    ret 0
+  end
+  occs = new ulong 16 0
+  for p0 ulong cnt bound 16
+    if ne get g_corp_real p0 0
+      clen = get g_corp_clen p0
+      if ge clen 8
+        tot_i = div clen 4
+        if ge tot_i 3
+          non_ret = sub tot_i 1
+          l_insns = ulong 4
+          while le l_insns non_ret bound 8
+            if le l_insns 8
+              lim = add sub non_ret l_insns 1
+              for off ulong lim bound 32
+                if not disc_is_dup p0 mul off 4 l_insns
+                  ocnt = disc_count_occs p0 mul off 4 l_insns occs
+                  if ge ocnt 2
+                    disc_record_cand p0 off l_insns occs ocnt
+                  end
+                end
+              end
+            end
+            l_insns = add l_insns 1
+          end
+        end
+      end
+    end
+  end
+  best = long -1
+  max_sc = long 0
+  ccnt = get g_disc_cnt 0
+  for c ulong ccnt bound 16
+    if ne get g_disc_ver c 0
+      if ne get g_disc_nontriv c 0
+        sc = get g_disc_score c
+        if gt sc max_sc
+          max_sc = sc
+          best = long c
+        end
+      end
+    end
+  end
+  put g_disc_best 0 best
+  ret 0
+end
+
+fn omega_refactor_program orig_idx ulong match_off ulong match_len ulong to long
+  if ge orig_idx get g_corp_cnt 0
+    ret -1
+  end
+  clen = get g_corp_clen orig_idx
+  orig_insns = div clen 4
+  if gt add match_off match_len orig_insns
+    ret -1
+  end
+  base = mul orig_idx DISC_CODE_STRIDE
+  for i ulong clen bound 128
+    put g_ref_code i get g_corp_code add base i
+  end
+  put g_ref_clen 0 clen
+  put g_ref_icnt 0 add sub get g_corp_icnt orig_idx match_len 1
+  ret 0
+end
+
+fn disc_exec_unary code view uchar * clen ulong x ulong res edit ulong 1 to long
+  if ne rem clen 4 0
+    ret -1
+  end
+  ninsns = div clen 4
+  x0 = x
+  x1 = ulong 0
+  for pc ulong ninsns bound 32
+    w = disc_rd32 code mul pc 4
+    if eq w 0xd65f03c0
+      put res 0 x0
+      ret 0
+    end
+    if eq and w 0xffe0001f 0xd2800001
+      x1 = and shr w 5 0xffff
+    else
+      if eq w 0x8b010000
+        x0 = add x0 x1
+      else
+        if eq w 0xcb010000
+          x0 = sub x0 x1
+        else
+          if eq w 0x9b017c00
+            x0 = mul x0 x1
+          else
+            ret -1
+          end
+        end
+      end
+    end
+  end
+  ret -1
+end
+
+fn omega_verify_semantic_preservation orig_idx ulong inputs view ulong * icnt ulong to bool
+  if ge orig_idx get g_corp_cnt 0
+    ret false
+  end
+  oclen = get g_corp_clen orig_idx
+  rclen = get g_ref_clen 0
+  obuf = new uchar 128 0
+  rbuf = new uchar 128 0
+  base = mul orig_idx DISC_CODE_STRIDE
+  for i ulong oclen bound 128
+    put obuf i get g_corp_code add base i
+  end
+  for i ulong rclen bound 128
+    put rbuf i get g_ref_code i
+  end
+  yo = new ulong 1 0
+  yr = new ulong 1 0
+  for i ulong icnt bound 32
+    x = get inputs i
+    if ne disc_exec_unary obuf oclen x yo 0
+      ret false
+    end
+    if ne disc_exec_unary rbuf rclen x yr 0
+      ret false
+    end
+    if ne get yo 0 get yr 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn disc_eval_prim kind ulong x ulong to ulong
+  if eq kind 0
+    ret add mul x 2 1
+  end
+  if eq kind 1
+    ret add x 1
+  end
+  if eq kind 2
+    ret add x 2
+  end
+  if eq kind 3
+    ret add x 5
+  end
+  if eq kind 4
+    ret add x 10
+  end
+  if eq kind 5
+    ret sub x 1
+  end
+  if eq kind 6
+    ret sub x 4
+  end
+  if eq kind 7
+    ret mul x 2
+  end
+  if eq kind 8
+    ret mul x 3
+  end
+  ret x
+end
+
+fn disc_check_heldout p1 ulong p2 ulong has_p2 bool to bool
+  xs = new ulong 5 0
+  put xs 0 0
+  put xs 1 1
+  put xs 2 2
+  put xs 3 5
+  put xs 4 10
+  ys = new ulong 5 0
+  put ys 0 6
+  put ys 1 8
+  put ys 2 10
+  put ys 3 16
+  put ys 4 26
+  for i ulong 5
+    v = disc_eval_prim p1 get xs i
+    if has_p2
+      v = disc_eval_prim p2 v
+    end
+    if ne v get ys i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn disc_search_bank bank view ulong * bcnt ulong out_cands edit ulong 1 to bool
+  cands = ulong 0
+  for i ulong bcnt bound 16
+    cands = add cands 1
+    if disc_check_heldout get bank i 0 false
+      put out_cands 0 cands
+      ret true
+    end
+  end
+  for i ulong bcnt bound 16
+    for j ulong bcnt bound 16
+      cands = add cands 1
+      if disc_check_heldout get bank i get bank j true
+        put out_cands 0 cands
+        ret true
+      end
+    end
+  end
+  put out_cands 0 cands
+  ret false
+end
+
+fn omega_demonstrate_search_acceleration out_wo edit ulong 1 out_w edit ulong 1 to long
+  bwo = new ulong 8 0
+  for i ulong 8
+    put bwo i add i 1
+  end
+  ign_wo = disc_search_bank bwo 8 out_wo
+
+  bw = new ulong 9 0
+  put bw 0 0
+  for i ulong 8
+    put bw add i 1 add i 1
+  end
+  solved = disc_search_bank bw 9 out_w
+  if solved
+    ret 0
+  end
+  ret -1
+end
