@@ -1,0 +1,787 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_codec.c (binary & text graph codec).
+note Composes on seed/ng/sha256.om, om/visor/canonical_om2.om, src/omega_canonical.om,
+note src/omega_core.om, om/visor/codec_om2.om.
+om2
+
+text cdc_hdr1 "// OMEGA NON-CANONICAL TEXTUAL FORM\n// Objects: "
+text cdc_hdr2 "\n\n"
+text cdc_tu1 "type U"
+text cdc_tu2 " = UNSIGNED_INTEGER("
+text cdc_tu3 "); // id="
+text cdc_tbool "type Bool = BOOL; // id="
+text cdc_ttag "type Tag"
+text cdc_tsemi "; // id="
+text cdc_val1 "val v_"
+text cdc_val2 " = "
+text cdc_op1 "op "
+text cdc_op2 " = "
+text cdc_op3 "[WRAP]; // id="
+text cdc_add "ADD"
+text cdc_sub "SUB"
+text cdc_op "OP"
+text cdc_app "apply app_"
+text cdc_obj "object kind="
+text cdc_kw_type "type"
+text cdc_kw_u32 "UNSIGNED_INTEGER(32)"
+text cdc_kw_val "val"
+text cdc_kw_op "op"
+text cdc_kw_apply "apply"
+
+note --- Binary serialization ---
+
+fn cdc_ser_one_obj idx ulong dst edit uchar * pos ulong mlen ulong to long
+  cbuf = new uchar 4096 0
+  core_load_can idx
+  cl = omega_canonical_encode cbuf 4096
+  if lt cl 0
+    ret -1
+  end
+  clu = ulong cl
+  if gt add add pos 4 clu mlen
+    ret -1
+  end
+  np = om_canon_write_u32be clu dst pos mlen
+  if lt np 0
+    ret -1
+  end
+  p = ulong np
+  for k ulong clu bound 4096
+    put dst add p k get cbuf k
+  end
+  ret long add p clu
+end
+
+fn omega_graph_serialize_binary dst edit uchar * mlen ulong out_len edit ulong 1 to long
+  if eq mlen 0
+    ret -1
+  end
+  cnt = get g_core_obj_cnt 0
+  r = om_codec_hdr_enc cnt dst mlen
+  if lt r 0
+    ret -1
+  end
+  pos = ulong r
+  for i ulong cnt bound 256
+    np = cdc_ser_one_obj i dst pos mlen
+    if lt np 0
+      ret -1
+    end
+    pos = ulong np
+  end
+  put out_len 0 pos
+  ret 0
+end
+
+note --- Binary deserialization helpers ---
+
+fn cdc_dec_attr_val idx ulong a ulong buf view uchar * pos ulong vl ulong to void
+  put g_core_attr_vlen add mul idx 32 a vl
+  vb = add mul idx 16384 mul a 512
+  for k ulong vl bound 512
+    put g_core_attr_vals add vb k get buf add pos k
+  end
+end
+
+fn cdc_dec_one_attr idx ulong a ulong buf view uchar * pos ulong clen ulong to long
+  if gt add pos 1 clen
+    ret -1
+  end
+  kl = ulong get buf pos
+  p = add pos 1
+  if ge kl CAN_MAX_KEY_LEN
+    ret -1
+  end
+  if gt add add p kl 2 clen
+    ret -1
+  end
+  kb = add mul idx 2048 mul a 64
+  for k ulong 64
+    put g_core_attr_keys add kb k 0
+  end
+  for k ulong kl bound 63
+    put g_core_attr_keys add kb k get buf add p k
+  end
+  p = add p kl
+  vl = om_codec_u16_rd buf p
+  p = add p 2
+  if gt vl CAN_MAX_VAL_LEN
+    ret -1
+  end
+  if gt add p vl clen
+    ret -1
+  end
+  cdc_dec_attr_val idx a buf p vl
+  ret long add p vl
+end
+
+fn cdc_dec_attrs idx ulong buf view uchar * base ulong clen ulong cpos ulong to long
+  if gt add cpos 2 clen
+    ret -1
+  end
+  ac = om_codec_u16_rd buf add base cpos
+  p = add base add cpos 2
+  lim = add base clen
+  if gt ac CAN_MAX_ATTRS
+    ret -1
+  end
+  put g_core_attr_n idx ac
+  for a ulong ac bound 32
+    np = cdc_dec_one_attr idx a buf p lim
+    if lt np 0
+      ret -1
+    end
+    p = ulong np
+  end
+  ret long sub p base
+end
+
+fn cdc_dec_one_rel idx ulong r ulong buf view uchar * pos ulong lim ulong to long
+  if gt add pos 34 lim
+    ret -1
+  end
+  rk = om_codec_u16_rd buf pos
+  p = add pos 2
+  put g_core_rel_kinds add mul idx 64 r ushort rk
+  tb = add mul idx 2048 mul r 32
+  for k ulong 32
+    put g_core_rel_tgts add tb k get buf add p k
+  end
+  ret long add p 32
+end
+
+fn cdc_dec_rels idx ulong buf view uchar * base ulong clen ulong cpos ulong to long
+  if gt add cpos 2 clen
+    ret -1
+  end
+  rc = om_codec_u16_rd buf add base cpos
+  p = add base add cpos 2
+  lim = add base clen
+  if gt rc CAN_MAX_RELS
+    ret -1
+  end
+  put g_core_rel_n idx rc
+  for r ulong rc bound 64
+    np = cdc_dec_one_rel idx r buf p lim
+    if lt np 0
+      ret -1
+    end
+    p = ulong np
+  end
+  ret long sub p base
+end
+
+fn cdc_dec_const_pay idx ulong c ulong buf view uchar * pos ulong cpl ulong to void
+  pb = add mul idx 4096 mul c 128
+  for k ulong cpl bound 128
+    put g_core_const_pays add pb k get buf add pos k
+  end
+end
+
+fn cdc_dec_one_const idx ulong c ulong buf view uchar * pos ulong lim ulong to long
+  if gt add pos 4 lim
+    ret -1
+  end
+  ck = om_codec_u16_rd buf pos
+  cpl = om_codec_u16_rd buf add pos 2
+  p = add pos 4
+  if gt cpl CAN_MAX_CONST_PAY
+    ret -1
+  end
+  if gt add p cpl lim
+    ret -1
+  end
+  mb = add mul idx 64 mul c 2
+  put g_core_const_meta mb ushort ck
+  put g_core_const_meta add mb 1 ushort cpl
+  cdc_dec_const_pay idx c buf p cpl
+  ret long add p cpl
+end
+
+fn cdc_dec_consts idx ulong buf view uchar * base ulong clen ulong cpos ulong to long
+  if gt add cpos 2 clen
+    ret -1
+  end
+  cc = om_codec_u16_rd buf add base cpos
+  p = add base add cpos 2
+  lim = add base clen
+  if gt cc CAN_MAX_CONSTS
+    ret -1
+  end
+  put g_core_const_n idx cc
+  for c ulong cc bound 32
+    np = cdc_dec_one_const idx c buf p lim
+    if lt np 0
+      ret -1
+    end
+    p = ulong np
+  end
+  ret long sub p base
+end
+
+fn cdc_chk_effect idx ulong to long
+  meta = new ulong 5 0
+  cref = new uchar 32 0
+  pbytes = new uchar 128 0
+  if ne omega_effect_read idx meta cref pbytes CORE_EFF_OK
+    ret -1
+  end
+  ret 0
+end
+
+fn cdc_copy_pay_bytes idx ulong buf view uchar * pos ulong pl ulong to void
+  pb = mul idx CAN_MAX_PAYLOAD
+  for k ulong pl bound 1024
+    put g_core_pays add pb k get buf add pos k
+  end
+end
+
+fn cdc_dec_payload idx ulong buf view uchar * base ulong clen ulong cpos ulong to long
+  if gt add cpos 4 clen
+    ret -1
+  end
+  pl = om_codec_u32_rd buf add base cpos
+  p = add cpos 4
+  if gt pl CAN_MAX_PAYLOAD
+    ret -1
+  end
+  if gt add p pl clen
+    ret -1
+  end
+  put g_core_pay_len idx pl
+  cdc_copy_pay_bytes idx buf add base p pl
+  if eq get g_core_kind idx CORE_KIND_EFFECT
+    if ne cdc_chk_effect idx 0
+      ret -1
+    end
+  end
+  if ne core_compute_id idx 0
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_graph_deserialize_binary src view uchar * slen ulong to long
+  if lt slen 6
+    ret -1
+  end
+  cnt_l = om_codec_hdr_dec src slen CORE_MAX_OBJS
+  if lt cnt_l 0
+    ret -1
+  end
+  cnt = ulong cnt_l
+  pos = ulong 6
+  put g_core_obj_cnt 0 0
+  for i ulong cnt bound 256
+    if gt add pos 4 slen
+      ret -1
+    end
+    clen = om_codec_u32_rd src pos
+    pos = add pos 4
+    if or gt add pos clen slen lt clen 6
+      ret -1
+    end
+    kind_l = om_codec_obj_hdr_chk src pos clen
+    if lt kind_l 0
+      ret -1
+    end
+    idx_l = omega_graph_add_object ulong kind_l
+    if lt idx_l 0
+      ret -1
+    end
+    idx = ulong idx_l
+    p = cdc_dec_attrs idx src pos clen 6
+    if lt p 0
+      ret -1
+    end
+    p = cdc_dec_rels idx src pos clen ulong p
+    if lt p 0
+      ret -1
+    end
+    p = cdc_dec_consts idx src pos clen ulong p
+    if lt p 0
+      ret -1
+    end
+    if ne cdc_dec_payload idx src pos clen ulong p 0
+      ret -1
+    end
+    pos = add pos clen
+  end
+  ret 0
+end
+
+note --- Non-canonical text formatter ---
+
+fn cdc_put_str dst edit uchar * pos ulong mlen ulong s view uchar * to long
+  n = len s
+  if ge add pos n mlen
+    ret -1
+  end
+  for i ulong n bound 256
+    put dst add pos i get s i
+  end
+  ret long add pos n
+end
+
+fn cdc_put_hex64 dst edit uchar * pos ulong mlen ulong hx view uchar 65 to long
+  if ge add pos 64 mlen
+    ret -1
+  end
+  for i ulong 64
+    put dst add pos i get hx i
+  end
+  ret long add pos 64
+end
+
+fn cdc_put_u64 dst edit uchar * pos ulong mlen ulong v ulong to long
+  tmp = new uchar 24 0
+  n = ulong 0
+  x = v
+  if eq x 0
+    put tmp 0 48
+    n = 1
+  else
+    while gt x 0 bound 24
+      d = rem x 10
+      put tmp n uchar add 48 d
+      n = add n 1
+      x = div x 10
+    end
+  end
+  if ge add pos n mlen
+    ret -1
+  end
+  for i ulong n bound 24
+    put dst add pos i get tmp sub sub n 1 i
+  end
+  ret long add pos n
+end
+
+fn cdc_put_nl dst edit uchar * pos ulong mlen ulong to long
+  if ge add pos 1 mlen
+    ret -1
+  end
+  put dst pos 10
+  ret long add pos 1
+end
+
+fn cdc_fmt_type idx ulong hx view uchar 65 dst edit uchar * pos ulong mlen ulong to long
+  pb = mul idx CAN_MAX_PAYLOAD
+  tag = core_pay_get_u32le pb 0
+  w = core_pay_get_u16le pb 4
+  p = long pos
+  if eq tag CORE_TYPE_UINT
+    p = cdc_put_str dst ulong p mlen cdc_tu1
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_u64 dst ulong p mlen w
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_str dst ulong p mlen cdc_tu2
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_u64 dst ulong p mlen w
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_str dst ulong p mlen cdc_tu3
+  else
+    if eq tag CORE_TYPE_BOOL
+      p = cdc_put_str dst ulong p mlen cdc_tbool
+    else
+      p = cdc_put_str dst ulong p mlen cdc_ttag
+      if lt p 0
+        ret -1
+      end
+      p = cdc_put_u64 dst ulong p mlen tag
+      if lt p 0
+        ret -1
+      end
+      p = cdc_put_str dst ulong p mlen cdc_tsemi
+    end
+  end
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_hex64 dst ulong p mlen hx
+  if lt p 0
+    ret -1
+  end
+  ret cdc_put_nl dst ulong p mlen
+end
+
+fn cdc_read_val_u64 idx ulong to ulong
+  pb = mul idx CAN_MAX_PAYLOAD
+  bl = core_pay_get_u16le pb 32
+  base = add pb 34
+  v = ulong 0
+  for b ulong bl bound 64
+    v = or shl v 8 ulong get g_core_pays add base b
+  end
+  ret v
+end
+
+fn cdc_fmt_val idx ulong hx view uchar 65 dst edit uchar * pos ulong mlen ulong to long
+  v = cdc_read_val_u64 idx
+  p = cdc_put_str dst pos mlen cdc_val1
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_u64 dst ulong p mlen idx
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_str dst ulong p mlen cdc_val2
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_u64 dst ulong p mlen v
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_str dst ulong p mlen cdc_tsemi
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_hex64 dst ulong p mlen hx
+  if lt p 0
+    ret -1
+  end
+  ret cdc_put_nl dst ulong p mlen
+end
+
+fn cdc_fmt_op idx ulong hx view uchar 65 dst edit uchar * pos ulong mlen ulong to long
+  pl = get g_core_pay_len idx
+  pb = mul idx CAN_MAX_PAYLOAD
+  if ge pl CORE_OP_SIZE
+    opc = core_pay_get_u32le pb 0
+    p = cdc_put_str dst pos mlen cdc_op1
+    if lt p 0
+      ret -1
+    end
+    if eq opc 3
+      p = cdc_put_str dst ulong p mlen cdc_add
+    else
+      if eq opc 4
+        p = cdc_put_str dst ulong p mlen cdc_sub
+      else
+        p = cdc_put_str dst ulong p mlen cdc_op
+      end
+    end
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_str dst ulong p mlen cdc_op2
+    if lt p 0
+      ret -1
+    end
+    if eq opc 3
+      p = cdc_put_str dst ulong p mlen cdc_add
+    else
+      if eq opc 4
+        p = cdc_put_str dst ulong p mlen cdc_sub
+      else
+        p = cdc_put_str dst ulong p mlen cdc_op
+      end
+    end
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_str dst ulong p mlen cdc_op3
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_hex64 dst ulong p mlen hx
+    if lt p 0
+      ret -1
+    end
+    ret cdc_put_nl dst ulong p mlen
+  end
+  if ge pl CORE_APP_SIZE
+    p = cdc_put_str dst pos mlen cdc_app
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_u64 dst ulong p mlen idx
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_str dst ulong p mlen cdc_tsemi
+    if lt p 0
+      ret -1
+    end
+    p = cdc_put_hex64 dst ulong p mlen hx
+    if lt p 0
+      ret -1
+    end
+    ret cdc_put_nl dst ulong p mlen
+  end
+  ret long pos
+end
+
+fn cdc_fmt_other idx ulong hx view uchar 65 dst edit uchar * pos ulong mlen ulong to long
+  p = cdc_put_str dst pos mlen cdc_obj
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_u64 dst ulong p mlen get g_core_kind idx
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_str dst ulong p mlen cdc_tsemi
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_hex64 dst ulong p mlen hx
+  if lt p 0
+    ret -1
+  end
+  ret cdc_put_nl dst ulong p mlen
+end
+
+fn omega_graph_format_text dst edit uchar * mlen ulong to long
+  if eq mlen 0
+    ret -1
+  end
+  cnt = get g_core_obj_cnt 0
+  p = cdc_put_str dst 0 mlen cdc_hdr1
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_u64 dst ulong p mlen cnt
+  if lt p 0
+    ret -1
+  end
+  p = cdc_put_str dst ulong p mlen cdc_hdr2
+  if lt p 0
+    ret -1
+  end
+  idb = new uchar 32 0
+  hx = new uchar 65 0
+  for i ulong cnt bound 256
+    core_get_id i idb
+    omega_hex_semantic_id idb hx
+    kd = get g_core_kind i
+    if eq kd CORE_KIND_TYPE
+      p = cdc_fmt_type i hx dst ulong p mlen
+    else
+      if eq kd CORE_KIND_VALUE
+        p = cdc_fmt_val i hx dst ulong p mlen
+      else
+        if eq kd CORE_KIND_OP
+          p = cdc_fmt_op i hx dst ulong p mlen
+        else
+          p = cdc_fmt_other i hx dst ulong p mlen
+        end
+      end
+    end
+    if lt p 0
+      ret -1
+    end
+  end
+  put dst ulong p 0
+  ret 0
+end
+
+note --- Non-canonical text parser ---
+
+fn cdc_is_space c uchar to bool
+  if eq c 32
+    ret true
+  end
+  if eq c 9
+    ret true
+  end
+  if eq c 10
+    ret true
+  end
+  if eq c 13
+    ret true
+  end
+  ret false
+end
+
+fn cdc_starts src view uchar * slen ulong pos ulong pat view uchar * to bool
+  pn = len pat
+  if gt add pos pn slen
+    ret false
+  end
+  for i ulong pn bound 64
+    if ne get src add pos i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn cdc_has_in_line src view uchar * pos ulong lend ulong pat view uchar * to bool
+  pn = len pat
+  if gt pn sub lend pos
+    ret false
+  end
+  lim = add sub sub lend pos pn 1
+  for i ulong lim bound 4096
+    if cdc_starts src lend add pos i pat
+      ret true
+    end
+  end
+  ret false
+end
+
+fn cdc_parse_u64 src view uchar * pos ulong lend ulong to ulong
+  p = pos
+  while lt p lend bound 4096
+    if not cdc_is_space get src p
+      break
+    end
+    p = add p 1
+  end
+  if lt add p 1 lend
+    if eq get src p 48
+      c1 = get src add p 1
+      if or eq c1 120 eq c1 88
+        p = add p 2
+        v = ulong 0
+        while lt p lend bound 64
+          c = ulong get src p
+          d = long -1
+          if and ge c 48 le c 57
+            d = long sub c 48
+          end
+          if and ge c 97 le c 102
+            d = long add sub c 97 10
+          end
+          if and ge c 65 le c 70
+            d = long add sub c 65 10
+          end
+          if lt d 0
+            break
+          end
+          v = or shl v 4 ulong d
+          p = add p 1
+        end
+        ret v
+      end
+    end
+  end
+  v = ulong 0
+  while lt p lend bound 64
+    c = ulong get src p
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 sub c 48
+    p = add p 1
+  end
+  ret v
+end
+
+fn cdc_apply_by_idx opi ulong ai ulong bi ulong to void
+  id0 = new uchar 32 0
+  id1 = new uchar 32 0
+  id2 = new uchar 32 0
+  core_get_id opi id0
+  core_get_id ai id1
+  core_get_id bi id2
+  ign = omega_build_apply id0 id1 id2
+end
+
+fn cdc_find_eq src view uchar * pos ulong lend ulong to ulong
+  p = pos
+  while lt p lend bound 4096
+    if eq get src p 61
+      ret p
+    end
+    p = add p 1
+  end
+  ret lend
+end
+
+fn cdc_is_comment src view uchar * p ulong lend ulong to bool
+  if ge add p 1 lend
+    ret false
+  end
+  if ne get src p 47
+    ret false
+  end
+  ret eq get src add p 1 47
+end
+
+fn omega_graph_parse_text src view uchar * slen ulong to long
+  put g_core_obj_cnt 0 0
+  st = new long 5 -1
+  p = ulong 0
+  id0 = new uchar 32 0
+  while lt p slen bound 65536
+    while lt p slen bound 65536
+      if not cdc_is_space get src p
+        break
+      end
+      p = add p 1
+    end
+    if ge p slen
+      break
+    end
+    lend = p
+    while lt lend slen bound 4096
+      if eq get src lend 10
+        break
+      end
+      lend = add lend 1
+    end
+    if cdc_is_comment src p lend
+      p = lend
+      continue
+    end
+    if cdc_starts src slen p cdc_kw_type
+      if cdc_has_in_line src p lend cdc_kw_u32
+        put st 0 omega_build_type_uint 32
+      end
+    else
+      if cdc_starts src slen p cdc_kw_val
+        eqp = cdc_find_eq src p lend
+        if and lt eqp lend ge get st 0 0
+          v = cdc_parse_u64 src add eqp 1 lend
+          core_get_id ulong get st 0 id0
+          if lt get st 1 0
+            put st 1 omega_build_val_uint id0 32 v
+          else
+            if lt get st 2 0
+              put st 2 omega_build_val_uint id0 32 v
+            end
+          end
+        end
+      else
+        if cdc_starts src slen p cdc_kw_op
+          if ge get st 0 0
+            core_get_id ulong get st 0 id0
+            if cdc_has_in_line src p lend cdc_add
+              put st 3 omega_build_op_binary 3 1 id0
+            else
+              if cdc_has_in_line src p lend cdc_sub
+                put st 4 omega_build_op_binary 4 1 id0
+              end
+            end
+          end
+        else
+          if cdc_starts src slen p cdc_kw_apply
+            if and ge get st 1 0 ge get st 2 0
+              if ge get st 3 0
+                cdc_apply_by_idx ulong get st 3 ulong get st 1 ulong get st 2
+              else
+                if ge get st 4 0
+                  cdc_apply_by_idx ulong get st 4 ulong get st 1 ulong get st 2
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    p = lend
+  end
+  ret 0
+end

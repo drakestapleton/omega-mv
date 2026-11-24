@@ -1,0 +1,595 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_evidence.c (run_id, paths, content-addressed writes,
+note git commit/dirty identity, physics.lock, hardware identity, self binary).
+note Composes on seed/ng/sha256.om.
+om2
+
+const EV_O_RDONLY int 0
+const EV_O_WRONLY int 1
+const EV_O_CREAT int 64
+const EV_O_EXCL int 128
+const EV_O_TRUNC int 512
+const EV_O_CLOEXEC int 524288
+const EV_EEXIST long -17
+const EV_EINTR long -4
+
+text ev_pfx_qual "build/qual-runs/"
+text ev_unk "unknown"
+text ev_phys_lock "physics.lock"
+text ev_sm121 "sm_121"
+text ev_proc_exe "/proc/self/exe"
+text ev_env_outdir "OUT_DIR="
+text ev_def_build "build"
+text ev_devnull "/dev/null"
+text ev_git_bin "/usr/bin/git"
+text ev_git_rp "rev-parse"
+text ev_git_s12 "--short=12"
+text ev_git_head "HEAD"
+text ev_git_st "status"
+text ev_git_porc "--porcelain"
+text ev_git_untr "--untracked-files=normal"
+
+global g_ev_run_id uchar 96
+global g_ev_run_id_len ulong 1
+global g_ev_run_id_ready ulong 1
+global g_ev_last_path uchar 1024
+global g_ev_last_path_len ulong 1
+
+note --- Helper: pack execprog argv packet ---
+
+fn ev_pkt_init dst edit uchar * cnt ulong to ulong
+  put dst 0 uchar and cnt 255
+  put dst 1 uchar and shr cnt 8 255
+  ret 2
+end
+
+fn ev_pkt_add dst edit uchar * pos ulong s view uchar * to ulong
+  n = len s
+  put dst pos uchar and n 255
+  put dst add pos 1 uchar and shr n 8 255
+  p = add pos 2
+  for i ulong n bound 256
+    put dst p get s i
+    p = add p 1
+  end
+  ret p
+end
+
+fn ev_u32_le_get buf view uchar * pos ulong to int
+  b0 = ulong get buf pos
+  b1 = shl ulong get buf add pos 1 8
+  b2 = shl ulong get buf add pos 2 16
+  b3 = shl ulong get buf add pos 3 24
+  ret int or or b0 b1 or b2 b3
+end
+
+note Run command in packed execprog pkt[0..plen], read stdout into dst[0..cap].
+note Returns byte count (>= 0) on success, or -1 on error.
+fn ev_exec_read pkt view uchar * plen ulong dst edit uchar * cap ulong to long
+  pfd = new uchar 8 0
+  if lt pipefds pfd 0 8 0 0
+    ret -1
+  end
+  rfd = ev_u32_le_get pfd 0
+  wfd = ev_u32_le_get pfd 4
+  ign = long 0
+  pid = fork
+  if lt pid 0
+    ign = fclose rfd
+    ign = fclose wfd
+    ret -1
+  end
+  if eq pid 0
+    ign = fclose rfd
+    ign = dupfd wfd 1 0
+    ign = fclose wfd
+    nfd = fopen ev_devnull 0 len ev_devnull EV_O_WRONLY 0
+    if ge nfd 0
+      ign = dupfd int nfd 2 0
+      ign = fclose int nfd
+    end
+    ign = execprog pkt 0 plen
+    exit 127
+  end
+  ign = fclose wfd
+  tot = ulong 0
+  while lt tot cap bound 1024
+    r = read rfd dst tot sub cap tot
+    if eq r EV_EINTR
+      continue
+    end
+    if le r 0
+      break
+    end
+    tot = add tot ulong r
+  end
+  ign = fclose rfd
+  ign = waitpid int pid pfd 0 4 0
+  ret long tot
+end
+
+fn ev_trim_line buf edit uchar * n ulong to ulong
+  k = n
+  for i ulong n bound 256
+    if eq get buf i 10
+      k = i
+      break
+    end
+  end
+  while gt k 0 bound 256
+    c = get buf sub k 1
+    if or eq c 10 or eq c 13 eq c 32
+      k = sub k 1
+    else
+      break
+    end
+  end
+  ret k
+end
+
+fn ev_is_lower_hex c uchar to bool
+  if and ge c 48 le c 57
+    ret true
+  end
+  if and ge c 97 le c 102
+    ret true
+  end
+  ret false
+end
+
+note --- UTC timestamp formatter YYYYMMDDTHHMMSSZ ---
+
+fn ev_put_2d dst edit uchar * pos ulong v ulong to void
+  put dst pos uchar add 48 rem div v 10 10
+  put dst add pos 1 uchar add 48 rem v 10
+end
+
+fn ev_put_4d dst edit uchar * pos ulong v ulong to void
+  put dst pos uchar add 48 rem div v 1000 10
+  put dst add pos 1 uchar add 48 rem div v 100 10
+  put dst add pos 2 uchar add 48 rem div v 10 10
+  put dst add pos 3 uchar add 48 rem v 10
+end
+
+fn ev_format_utc_date days ulong dst edit uchar 20 to void
+  z = add days 719468
+  era = div z 146097
+  doe = sub z mul era 146097
+  yoe = div sub add sub doe div doe 1460 div doe 36524 div doe 146096 365
+  y = add yoe mul era 400
+  doy = sub doe add mul 365 yoe sub div yoe 4 div yoe 100
+  mp = div add mul 5 doy 2 153
+  dd = add sub doy div add mul 153 mp 2 5 1
+  mo = add mp 3
+  if ge mp 10
+    mo = sub mp 9
+  end
+  if le mo 2
+    y = add y 1
+  end
+  ev_put_4d dst 0 y
+  ev_put_2d dst 4 mo
+  ev_put_2d dst 6 dd
+end
+
+fn ev_format_utc_sec secs ulong dst edit uchar 20 to ulong
+  ev_format_utc_date div secs 86400 dst
+  rsec = rem secs 86400
+  put dst 8 84
+  ev_put_2d dst 9 div rsec 3600
+  ev_put_2d dst 11 div rem rsec 3600 60
+  ev_put_2d dst 13 rem rsec 60
+  put dst 15 90
+  put dst 16 0
+  ret 16
+end
+
+note --- omega_evidence_run_id ---
+
+fn ev_init_run_id to void
+  ns = realns
+  secs = div ulong ns 1000000000
+  ts = new uchar 20 0
+  tsl = ev_format_utc_sec secs ts
+
+  pkt = new uchar 256 0
+  pp = ev_pkt_init pkt 4
+  pp = ev_pkt_add pkt pp ev_git_bin
+  pp = ev_pkt_add pkt pp ev_git_rp
+  pp = ev_pkt_add pkt pp ev_git_s12
+  pp = ev_pkt_add pkt pp ev_git_head
+
+  line = new uchar 64 0
+  rn = ev_exec_read pkt pp line 63
+  sha = new uchar 64 0
+  sl = ulong 0
+  if gt rn 0
+    tl = ev_trim_line line ulong rn
+    ok = true
+    for i ulong tl bound 63
+      if not ev_is_lower_hex get line i
+        ok = false
+        break
+      end
+      put sha i get line i
+    end
+    if ok
+      sl = tl
+    end
+  end
+  if eq sl 0
+    for i ulong len ev_unk bound 16
+      put sha i get ev_unk i
+    end
+    sl = len ev_unk
+  end
+
+  pos = ulong 0
+  for i ulong tsl bound 20
+    put g_ev_run_id pos get ts i
+    pos = add pos 1
+  end
+  put g_ev_run_id pos 45
+  pos = add pos 1
+  for i ulong sl bound 64
+    put g_ev_run_id pos get sha i
+    pos = add pos 1
+  end
+  put g_ev_run_id pos 0
+  put g_ev_run_id_len 0 pos
+  put g_ev_run_id_ready 0 1
+end
+
+fn omega_evidence_run_id dst edit uchar * cap ulong to ulong
+  if eq get g_ev_run_id_ready 0 0
+    ev_init_run_id
+  end
+  n = get g_ev_run_id_len 0
+  if ge n cap
+    n = sub cap 1
+  end
+  for i ulong n bound 96
+    put dst i get g_ev_run_id i
+  end
+  put dst n 0
+  ret n
+end
+
+note --- omega_evidence_path ---
+
+fn ev_mkdir_p_for_file path view uchar * plen ulong to void
+  for i ulong plen bound 1024
+    if and gt i 0 eq get path i 47
+      ign = makedir path 0 i 493
+    end
+  end
+end
+
+fn omega_evidence_path rel view uchar * rlen ulong dst edit uchar * cap ulong to long
+  if or eq rlen 0 eq cap 0
+    ret -1
+  end
+  rid = new uchar 96 0
+  ridl = omega_evidence_run_id rid 96
+  cand = new uchar 1024 0
+  pl = len ev_pfx_qual
+  tot = add add add pl ridl 1 rlen
+  if ge tot 1024
+    ret -1
+  end
+  pos = ulong 0
+  for i ulong pl bound 32
+    put cand pos get ev_pfx_qual i
+    pos = add pos 1
+  end
+  for i ulong ridl bound 96
+    put cand pos get rid i
+    pos = add pos 1
+  end
+  put cand pos 47
+  pos = add pos 1
+  for i ulong rlen bound 768
+    put cand pos get rel i
+    pos = add pos 1
+  end
+  put cand pos 0
+  ev_mkdir_p_for_file cand pos
+  if ge pos cap
+    ret -1
+  end
+  for i ulong pos bound 1024
+    put dst i get cand i
+  end
+  put dst pos 0
+  ret 0
+end
+
+note --- omega_evidence_write_digest ---
+
+fn ev_cstr_len buf view uchar * cap ulong to ulong
+  for i ulong cap bound 1024
+    if eq get buf i 0
+      ret i
+    end
+  end
+  ret cap
+end
+
+fn ev_write_all fd int buf view uchar * blen ulong to long
+  off = ulong 0
+  while lt off blen bound 65536
+    w = write fd buf off sub blen off
+    if eq w EV_EINTR
+      continue
+    end
+    if le w 0
+      ret -1
+    end
+    off = add off ulong w
+  end
+  ret 0
+end
+
+fn ev_build_digest_rel relstem view uchar * ext view uchar * rel edit uchar 768 to long
+  rslen = len relstem
+  elen = len ext
+  if or eq rslen 0 eq elen 0
+    ret -1
+  end
+  if ge add add rslen 66 elen 768
+    ret -1
+  end
+  pos = ulong 0
+  for i ulong rslen bound 512
+    put rel pos get relstem i
+    pos = add pos 1
+  end
+  put rel pos 46
+  pos = add pos 1
+  for i ulong 32
+    b = uint get sh_dig i
+    put rel pos sh_hexd shr b 4
+    put rel add pos 1 sh_hexd and b 15
+    pos = add pos 2
+  end
+  put rel pos 46
+  pos = add pos 1
+  for i ulong elen bound 64
+    put rel pos get ext i
+    pos = add pos 1
+  end
+  put rel pos 0
+  ret long pos
+end
+
+fn ev_open_excl_write dst view uchar * plen ulong buf view uchar * to long
+  fl = or or EV_O_WRONLY EV_O_CREAT or EV_O_EXCL EV_O_CLOEXEC
+  fd = fopen dst 0 plen fl 292
+  if lt fd 0
+    if eq fd EV_EEXIST
+      ret 1
+    end
+    ret -1
+  end
+  ign = long 0
+  if ne ev_write_all int fd buf len buf 0
+    ign = fclose int fd
+    ign = unlink dst 0 plen
+    ret -1
+  end
+  if ne fclose int fd 0
+    ign = unlink dst 0 plen
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_evidence_write_digest relstem view uchar * ext view uchar * buf view uchar * to long
+  blen = len buf
+  for i ulong blen bound 65536
+    put sh_dat i get buf i
+  end
+  sh_all blen
+  rel = new uchar 768 0
+  rlen = ev_build_digest_rel relstem ext rel
+  if lt rlen 0
+    ret -1
+  end
+  dst = new uchar 1024 0
+  if ne omega_evidence_path rel ulong rlen dst 1024 0
+    ret -1
+  end
+  plen = ev_cstr_len dst 1024
+  for i ulong plen bound 1024
+    put g_ev_last_path i get dst i
+  end
+  put g_ev_last_path plen 0
+  put g_ev_last_path_len 0 plen
+  ret ev_open_excl_write dst plen buf
+end
+
+note --- omega_evidence_create ---
+
+fn omega_evidence_create path view uchar * plen ulong to long
+  if eq plen 0
+    ret -1
+  end
+  fl = or or EV_O_WRONLY EV_O_CREAT or EV_O_TRUNC EV_O_CLOEXEC
+  fd = fopen path 0 plen fl 420
+  if lt fd 0
+    ret -1
+  end
+  ret fd
+end
+
+note --- omega_evidence_run_commit & omega_evidence_tree_dirty ---
+
+fn omega_evidence_run_commit dst edit uchar 41 to bool
+  pkt = new uchar 256 0
+  pp = ev_pkt_init pkt 3
+  pp = ev_pkt_add pkt pp ev_git_bin
+  pp = ev_pkt_add pkt pp ev_git_rp
+  pp = ev_pkt_add pkt pp ev_git_head
+  buf = new uchar 64 0
+  rn = ev_exec_read pkt pp buf 63
+  if le rn 0
+    ret false
+  end
+  tl = ev_trim_line buf ulong rn
+  if ne tl 40
+    ret false
+  end
+  for i ulong 40
+    put dst i get buf i
+  end
+  put dst 40 0
+  ret true
+end
+
+fn omega_evidence_tree_dirty to bool
+  pkt = new uchar 256 0
+  pp = ev_pkt_init pkt 4
+  pp = ev_pkt_add pkt pp ev_git_bin
+  pp = ev_pkt_add pkt pp ev_git_st
+  pp = ev_pkt_add pkt pp ev_git_porc
+  pp = ev_pkt_add pkt pp ev_git_untr
+  buf = new uchar 64 0
+  rn = ev_exec_read pkt pp buf 63
+  if lt rn 0
+    ret true
+  end
+  if gt rn 0
+    ret true
+  end
+  ret false
+end
+
+note --- omega_evidence_physics_commit ---
+
+fn omega_evidence_physics_commit dst edit uchar * cap ulong to bool
+  if eq cap 0
+    ret false
+  end
+  fd = fopen ev_phys_lock 0 len ev_phys_lock or EV_O_RDONLY EV_O_CLOEXEC 0
+  if lt fd 0
+    ret false
+  end
+  buf = new uchar 256 0
+  rn = read int fd buf 0 255
+  ign = fclose int fd
+  if le rn 0
+    ret false
+  end
+  tl = ev_trim_line buf ulong rn
+  if or eq tl 0 ge tl cap
+    ret false
+  end
+  for i ulong tl bound 255
+    put dst i get buf i
+  end
+  put dst tl 0
+  ret true
+end
+
+note --- omega_evidence_hardware_from_nvrm ---
+
+fn omega_evidence_hardware_from_nvrm cc ulong sm ulong uuid view uchar 16 out_meta edit ulong 2 out_hex edit uchar 33 out_alias edit uchar 8 to void
+  put out_meta 0 cc
+  put out_meta 1 sm
+  for i ulong 16
+    b = uint get uuid i
+    put out_hex mul i 2 sh_hexd shr b 4
+    put out_hex add mul i 2 1 sh_hexd and b 15
+  end
+  put out_hex 32 0
+  for i ulong len ev_sm121 bound 7
+    put out_alias i get ev_sm121 i
+  end
+  put out_alias len ev_sm121 0
+end
+
+note --- omega_evidence_self_binary ---
+
+fn ev_find_outdir dst edit uchar 256 to ulong
+  ec = envcnt
+  ebuf = new uchar 512 0
+  plen = len ev_env_outdir
+  for i ulong ulong ec bound 512
+    n = envread i ebuf 0 512
+    if gt n long plen
+      ok = true
+      for k ulong plen bound 16
+        if ne get ebuf k get ev_env_outdir k
+          ok = false
+          break
+        end
+      end
+      if ok
+        vl = sub ulong n plen
+        if gt vl 255
+          vl = 255
+        end
+        for k ulong vl bound 255
+          put dst k get ebuf add plen k
+        end
+        ret vl
+      end
+    end
+  end
+  ret 0
+end
+
+fn omega_evidence_self_binary dst edit uchar * cap ulong to bool
+  if eq cap 0
+    ret false
+  end
+  self = new uchar 1024 0
+  rn = readlnk ev_proc_exe 0 len ev_proc_exe self 0 1023
+  if le rn 0
+    put dst 0 0
+    ret false
+  end
+  sl = ulong rn
+  ns = ulong 0
+  for i ulong sl bound 1024
+    if eq get self i 47
+      ns = add i 1
+    end
+  end
+  nl = sub sl ns
+  od = new uchar 256 0
+  odl = ev_find_outdir od
+  if eq odl 0
+    odl = len ev_def_build
+    for i ulong odl bound 16
+      put od i get ev_def_build i
+    end
+  end
+  cl = add add odl 1 nl
+  if lt cl cap
+    pos = ulong 0
+    for i ulong odl bound 256
+      put dst pos get od i
+      pos = add pos 1
+    end
+    put dst pos 47
+    pos = add pos 1
+    for i ulong nl bound 512
+      put dst pos get self add ns i
+      pos = add pos 1
+    end
+    put dst pos 0
+    if eq faccess dst 0 pos 4 0
+      ret true
+    end
+  end
+  if ge sl cap
+    put dst 0 0
+    ret false
+  end
+  for i ulong sl bound 1024
+    put dst i get self i
+  end
+  put dst sl 0
+  ret eq faccess dst 0 sl 4 0
+end

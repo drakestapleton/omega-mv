@@ -1,0 +1,2088 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_receipt.c (EvidenceReceiptV1 JSON parser,
+note validator, canonical wire encoder, BLAKE3 identity verifier, tier rank/satisfies).
+note Composes on om/blake3/b3unit.om and src/omega_blake3.om.
+om2
+
+const RC_MAX_BYTES ulong 262144
+const RC_J_NULL uchar 0
+const RC_J_BOOL uchar 1
+const RC_J_NUM uchar 2
+const RC_J_STR uchar 3
+const RC_J_ARR uchar 4
+const RC_J_OBJ uchar 5
+
+text rc_domain "AIEN_EVIDENCE_RECEIPT_V1"
+text rc_schema_v1 "EvidenceReceiptV1"
+text rc_feat_v1 "v1-base"
+
+text rc_t0 "TEST_ONLY_TRUST"
+text rc_t1 "HOST_TEST"
+text rc_t2 "QEMU"
+text rc_t3 "QEMU_SECURITY"
+text rc_t4 "MACHINE1_READ_ONLY"
+text rc_t5 "MACHINE1_ATTENDED"
+text rc_t6 "MACHINE1_MUTATING"
+text rc_t7 "PRODUCTION"
+
+text rc_v0 "PASS"
+text rc_v1 "FAIL"
+text rc_v2 "BLOCKED"
+text rc_v3 "INCOMPLETE"
+text rc_v4 "SKIPPED"
+
+text rc_m0 "NONE"
+text rc_m1 "VOLATILE_ONLY"
+text rc_m2 "REMOVABLE_MEDIA_ONLY"
+text rc_m3 "ONE_TIME_BOOT_SELECTION"
+text rc_m4 "BOUNDED_TEST_REGION_WRITE"
+text rc_m5 "BOOT_CONFIGURATION_CHANGE"
+text rc_m6 "TRUST_ROOT_CHANGE"
+text rc_m7 "TPM_POLICY_CHANGE"
+text rc_m8 "DESTRUCTIVE_STORAGE"
+
+text rc_k_schema "schema"
+text rc_k_version "version"
+text rc_k_id "id"
+text rc_k_kind "kind"
+text rc_k_tier "tier"
+text rc_k_result "result"
+text rc_k_timestamp "timestamp"
+text rc_k_repo "repo"
+text rc_k_commit "commit"
+text rc_k_dirty "dirty"
+text rc_k_toolchain "toolchain"
+text rc_k_procedure "procedure"
+text rc_k_machine "machine"
+text rc_k_env_class "env_class"
+text rc_k_in_art "input_artifacts"
+text rc_k_out_art "output_artifacts"
+text rc_k_assertions "assertions"
+text rc_k_deps "dependencies"
+text rc_k_decl_mut "declared_mutation"
+text rc_k_obs_mut "observed_mutation"
+text rc_k_authority "authority"
+text rc_k_out_dig "output_digest"
+text rc_k_ext_refs "external_refs"
+text rc_k_ledger "ledger"
+text rc_k_lease "lease"
+text rc_k_req_feat "required_features"
+text rc_k_reserved "reserved"
+
+text rc_ak_expected "expected"
+text rc_ak_observed "observed"
+text rc_ak_pass "pass"
+text rc_ak_source "source"
+text rc_ak_note "note"
+text rc_lk_index "index"
+text rc_lk_hash "hash"
+text rc_lsk_hold "hold_id"
+text rc_lsk_res "resource"
+
+text rc_alg_b3 "blake3"
+text rc_alg_s256 "sha256"
+text rc_alg_s512 "sha512"
+text rc_bad_to1 "test-only"
+text rc_bad_to2 "test_only"
+text rc_bad_to3 "testonly"
+text rc_lit_null "null"
+text rc_lit_true "true"
+text rc_lit_false "false"
+
+note --- Arenas & parser state ---
+
+global g_rc_src uchar 262144
+global g_rc_slen ulong 1
+global g_rc_pos ulong 1
+global g_rc_depth ulong 1
+
+global g_rc_str uchar 65536
+global g_rc_str_len ulong 1
+
+global g_rc_jn_k uchar 1024
+global g_rc_jn_b uchar 1024
+global g_rc_jn_u ulong 1024
+global g_rc_jn_n ulong 1024
+global g_rc_jn_cnt ulong 1
+
+global g_rc_jc_koff ulong 2048
+global g_rc_jc_klen ulong 2048
+global g_rc_jc_val ulong 2048
+global g_rc_jc_next ulong 2048
+global g_rc_jc_cnt ulong 1
+
+note --- Parsed receipt fields ---
+
+global g_rc_version ulong 1
+global g_rc_id uchar 32
+global g_rc_result ulong 1
+global g_rc_tier_rank long 1
+global g_rc_dirty ulong 1
+global g_rc_timestamp ulong 1
+global g_rc_decl_mut ulong 1
+global g_rc_obs_mut ulong 1
+global g_rc_out_digest uchar 32
+global g_rc_has_ledger ulong 1
+global g_rc_ledger_idx ulong 1
+global g_rc_ledger_hash uchar 32
+global g_rc_has_lease ulong 1
+global g_rc_lease_hold uchar 32
+
+global g_rc_s_off ulong 16
+global g_rc_s_len ulong 16
+global g_rc_l_cnt ulong 5
+global g_rc_l_off ulong 1280
+global g_rc_l_len ulong 1280
+global g_rc_as_cnt ulong 1
+global g_rc_as_off ulong 640
+global g_rc_as_len ulong 640
+global g_rc_as_pass uchar 128
+
+note Scratch for canonicalization / sorting
+global g_rc_ord ulong 256
+global g_rc_can uchar 65536
+
+note --- String & hex helpers ---
+
+fn rc_hexval c ulong to long
+  if and ge c 48 le c 57
+    ret long sub c 48
+  end
+  if and ge c 97 le c 102
+    ret long add sub c 97 10
+  end
+  if and ge c 65 le c 70
+    ret long add sub c 65 10
+  end
+  ret -1
+end
+
+fn rc_str_eq_txt off ulong slen ulong pat view uchar * to bool
+  if ne slen len pat
+    ret false
+  end
+  for i ulong slen bound 256
+    if ne get g_rc_str add off i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn rc_str_eq_str off1 ulong len1 ulong off2 ulong len2 ulong to bool
+  if ne len1 len2
+    ret false
+  end
+  for i ulong len1 bound 4096
+    if ne get g_rc_str add off1 i get g_rc_str add off2 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn rc_str_cmp_str off1 ulong len1 ulong off2 ulong len2 ulong to long
+  mn = len1
+  if lt len2 mn
+    mn = len2
+  end
+  for i ulong mn bound 4096
+    a = ulong get g_rc_str add off1 i
+    b = ulong get g_rc_str add off2 i
+    if lt a b
+      ret -1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  if lt len1 len2
+    ret -1
+  end
+  if gt len1 len2
+    ret 1
+  end
+  ret 0
+end
+
+fn rc_is_hex off ulong slen ulong to bool
+  if eq slen 0
+    ret false
+  end
+  for i ulong slen bound 1024
+    if lt rc_hexval ulong get g_rc_str add off i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn rc_is_lower_hex off ulong slen ulong to bool
+  if eq slen 0
+    ret false
+  end
+  for i ulong slen bound 1024
+    c = ulong get g_rc_str add off i
+    ok = false
+    if and ge c 48 le c 57
+      ok = true
+    end
+    if and ge c 97 le c 102
+      ok = true
+    end
+    if not ok
+      ret false
+    end
+  end
+  ret true
+end
+
+fn rc_hex32 off ulong slen ulong dst edit uchar 32 to long
+  if ne slen 64
+    ret -1
+  end
+  for i ulong 32
+    hi = rc_hexval ulong get g_rc_str add off mul i 2
+    lo = rc_hexval ulong get g_rc_str add off add mul i 2 1
+    if or lt hi 0 lt lo 0
+      ret -1
+    end
+    put dst i uchar or shl ulong hi 4 ulong lo
+  end
+  ret 0
+end
+
+note --- Tiers, verdicts, mutations ---
+
+fn rc_buf_eq_txt buf view uchar * blen ulong pat view uchar * to bool
+  if ne blen len pat
+    ret false
+  end
+  for i ulong blen bound 64
+    if ne get buf i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn omega_tier_rank tier view uchar * tlen ulong to long
+  if rc_buf_eq_txt tier tlen rc_t0
+    ret 0
+  end
+  if rc_buf_eq_txt tier tlen rc_t1
+    ret 1
+  end
+  if rc_buf_eq_txt tier tlen rc_t2
+    ret 2
+  end
+  if rc_buf_eq_txt tier tlen rc_t3
+    ret 3
+  end
+  if rc_buf_eq_txt tier tlen rc_t4
+    ret 4
+  end
+  if rc_buf_eq_txt tier tlen rc_t5
+    ret 5
+  end
+  if rc_buf_eq_txt tier tlen rc_t6
+    ret 6
+  end
+  if rc_buf_eq_txt tier tlen rc_t7
+    ret 7
+  end
+  ret -1
+end
+
+fn rc_tier_rank_str off ulong slen ulong to long
+  if gt slen 32
+    ret -1
+  end
+  tmp = new uchar 32 0
+  for i ulong slen bound 32
+    put tmp i get g_rc_str add off i
+  end
+  ret omega_tier_rank tmp slen
+end
+
+fn omega_tier_satisfies need long have long to long
+  if or lt need 0 lt have 0
+    ret 0
+  end
+  if eq have 0
+    if eq need 0
+      ret 1
+    end
+    ret 0
+  end
+  if and ge need 4 lt have 4
+    ret 0
+  end
+  if ge have need
+    ret 1
+  end
+  ret 0
+end
+
+fn rc_verdict_idx off ulong slen ulong to long
+  if rc_str_eq_txt off slen rc_v0
+    ret 0
+  end
+  if rc_str_eq_txt off slen rc_v1
+    ret 1
+  end
+  if rc_str_eq_txt off slen rc_v2
+    ret 2
+  end
+  if rc_str_eq_txt off slen rc_v3
+    ret 3
+  end
+  if rc_str_eq_txt off slen rc_v4
+    ret 4
+  end
+  ret -1
+end
+
+fn rc_mut_idx off ulong slen ulong to long
+  if rc_str_eq_txt off slen rc_m0
+    ret 0
+  end
+  if rc_str_eq_txt off slen rc_m1
+    ret 1
+  end
+  if rc_str_eq_txt off slen rc_m2
+    ret 2
+  end
+  if rc_str_eq_txt off slen rc_m3
+    ret 3
+  end
+  if rc_str_eq_txt off slen rc_m4
+    ret 4
+  end
+  if rc_str_eq_txt off slen rc_m5
+    ret 5
+  end
+  if rc_str_eq_txt off slen rc_m6
+    ret 6
+  end
+  if rc_str_eq_txt off slen rc_m7
+    ret 7
+  end
+  if rc_str_eq_txt off slen rc_m8
+    ret 8
+  end
+  ret -1
+end
+
+fn rc_mut_sev idx ulong to ulong
+  if eq idx 7
+    ret 6
+  end
+  if eq idx 8
+    ret 7
+  end
+  ret idx
+end
+
+note --- JSON DOM parser ---
+
+fn rc_jnew k uchar to long
+  c = get g_rc_jn_cnt 0
+  if ge c 1024
+    ret -1
+  end
+  put g_rc_jn_k c k
+  put g_rc_jn_b c 0
+  put g_rc_jn_u c 0
+  put g_rc_jn_n c 0
+  put g_rc_jn_cnt 0 add c 1
+  ret long c
+end
+
+fn rc_jws to void
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  while lt p n bound 262144
+    c = get g_rc_src p
+    if or eq c 32 or eq c 9 or eq c 10 eq c 13
+      p = add p 1
+    else
+      break
+    end
+  end
+  put g_rc_pos 0 p
+end
+
+fn rc_utf8_len3 p ulong b0 ulong to ulong
+  b1 = ulong get g_rc_src add p 1
+  if ne and b1 0xc0 0x80
+    ret 0
+  end
+  b2 = ulong get g_rc_src add p 2
+  if ne and b2 0xc0 0x80
+    ret 0
+  end
+  cp = or or shl and b0 15 12 shl and b1 63 6 and b2 63
+  if lt cp 0x800
+    ret 0
+  end
+  if and ge cp 0xd800 le cp 0xdfff
+    ret 0
+  end
+  ret 3
+end
+
+fn rc_utf8_len4 p ulong b0 ulong to ulong
+  b1 = ulong get g_rc_src add p 1
+  if ne and b1 0xc0 0x80
+    ret 0
+  end
+  b2 = ulong get g_rc_src add p 2
+  if ne and b2 0xc0 0x80
+    ret 0
+  end
+  b3 = ulong get g_rc_src add p 3
+  if ne and b3 0xc0 0x80
+    ret 0
+  end
+  cp = shl and b0 7 18
+  cp = or cp shl and b1 63 12
+  cp = or cp shl and b2 63 6
+  cp = or cp and b3 63
+  if lt cp 0x10000
+    ret 0
+  end
+  if gt cp 0x10ffff
+    ret 0
+  end
+  ret 4
+end
+
+fn rc_utf8_len p ulong n ulong to ulong
+  b0 = ulong get g_rc_src p
+  if lt b0 128
+    ret 1
+  end
+  av = sub n p
+  if and ge b0 0xc2 le b0 0xdf
+    if and ge av 2 eq and ulong get g_rc_src add p 1 0xc0 0x80
+      ret 2
+    end
+    ret 0
+  end
+  if and ge b0 0xe0 le b0 0xef
+    if ge av 3
+      ret rc_utf8_len3 p b0
+    end
+    ret 0
+  end
+  if and ge b0 0xf0 le b0 0xf4
+    if ge av 4
+      ret rc_utf8_len4 p b0
+    end
+  end
+  ret 0
+end
+
+fn rc_str_push b uchar to long
+  sp = get g_rc_str_len 0
+  if ge sp 65535
+    ret -1
+  end
+  put g_rc_str sp b
+  put g_rc_str_len 0 add sp 1
+  ret 0
+end
+
+fn rc_put_utf8 cp ulong to long
+  if lt cp 0x80
+    ret rc_str_push uchar cp
+  end
+  if lt cp 0x800
+    if lt rc_str_push uchar or 0xc0 shr cp 6 0
+      ret -1
+    end
+    ret rc_str_push uchar or 0x80 and cp 63
+  end
+  if lt cp 0x10000
+    if lt rc_str_push uchar or 0xe0 shr cp 12 0
+      ret -1
+    end
+    if lt rc_str_push uchar or 0x80 and shr cp 6 63 0
+      ret -1
+    end
+    ret rc_str_push uchar or 0x80 and cp 63
+  end
+  if lt rc_str_push uchar or 0xf0 shr cp 18 0
+    ret -1
+  end
+  if lt rc_str_push uchar or 0x80 and shr cp 12 63 0
+    ret -1
+  end
+  if lt rc_str_push uchar or 0x80 and shr cp 6 63 0
+    ret -1
+  end
+  ret rc_str_push uchar or 0x80 and cp 63
+end
+
+fn rc_hex4 to long
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  if gt add p 4 n
+    ret -1
+  end
+  v = ulong 0
+  for k ulong 4
+    h = rc_hexval ulong get g_rc_src add p k
+    if lt h 0
+      ret -1
+    end
+    v = or shl v 4 ulong h
+  end
+  put g_rc_pos 0 add p 4
+  ret long v
+end
+
+fn rc_jstr_u_esc to long
+  cp_l = rc_hex4
+  if lt cp_l 0
+    ret -1
+  end
+  cp = ulong cp_l
+  if and ge cp 0xd800 le cp 0xdbff
+    p2 = get g_rc_pos 0
+    n = get g_rc_slen 0
+    if gt add p2 2 n
+      ret -1
+    end
+    if ne get g_rc_src p2 92
+      ret -1
+    end
+    if ne get g_rc_src add p2 1 117
+      ret -1
+    end
+    put g_rc_pos 0 add p2 2
+    lo_l = rc_hex4
+    if lt lo_l 0xdc00
+      ret -1
+    end
+    if gt lo_l 0xdfff
+      ret -1
+    end
+    cp = add 0x10000 add shl sub cp 0xd800 10 sub ulong lo_l 0xdc00
+  else
+    if and ge cp 0xdc00 le cp 0xdfff
+      ret -1
+    end
+  end
+  if eq cp 0
+    ret -1
+  end
+  ret rc_put_utf8 cp
+end
+
+fn rc_jstr_esc to long
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  if ge p n
+    ret -1
+  end
+  e = get g_rc_src p
+  put g_rc_pos 0 add p 1
+  if eq e 34
+    ret rc_str_push 34
+  end
+  if eq e 92
+    ret rc_str_push 92
+  end
+  if eq e 47
+    ret rc_str_push 47
+  end
+  if eq e 98
+    ret rc_str_push 8
+  end
+  if eq e 102
+    ret rc_str_push 12
+  end
+  if eq e 110
+    ret rc_str_push 10
+  end
+  if eq e 114
+    ret rc_str_push 13
+  end
+  if eq e 116
+    ret rc_str_push 9
+  end
+  if eq e 117
+    ret rc_jstr_u_esc
+  end
+  ret -1
+end
+
+note Parse JSON string after opening quote. Stores (off, len) in dst[0..1]. Returns 0 or -1.
+fn rc_jstring dst edit ulong 2 to long
+  start = get g_rc_str_len 0
+  n = get g_rc_slen 0
+  while true bound 65536
+    p = get g_rc_pos 0
+    if ge p n
+      ret -1
+    end
+    c = get g_rc_src p
+    if eq c 34
+      put g_rc_pos 0 add p 1
+      slen = sub get g_rc_str_len 0 start
+      if lt rc_str_push 0 0
+        ret -1
+      end
+      put dst 0 start
+      put dst 1 slen
+      ret 0
+    end
+    if lt c 32
+      ret -1
+    end
+    if eq c 92
+      put g_rc_pos 0 add p 1
+      if lt rc_jstr_esc 0
+        ret -1
+      end
+      continue
+    end
+    ul = rc_utf8_len p n
+    if eq ul 0
+      ret -1
+    end
+    for k ulong ul bound 4
+      if lt rc_str_push get g_rc_src add p k 0
+        ret -1
+      end
+    end
+    put g_rc_pos 0 add p ul
+  end
+  ret -1
+end
+
+fn rc_match_lit pat view uchar * to bool
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  pl = len pat
+  if gt add p pl n
+    ret false
+  end
+  for i ulong pl bound 8
+    if ne get g_rc_src add p i get pat i
+      ret false
+    end
+  end
+  put g_rc_pos 0 add p pl
+  ret true
+end
+
+fn rc_is_num_tail c uchar to bool
+  if and ge c 48 le c 57
+    ret true
+  end
+  if or eq c 43 eq c 45
+    ret true
+  end
+  if or eq c 101 eq c 69
+    ret true
+  end
+  ret eq c 46
+end
+
+fn rc_parse_u64_span s ulong e ulong j ulong to void
+  cnt = sub e s
+  if gt cnt 20
+    ret
+  end
+  v = ulong 0
+  all1 = ulong 0xffffffffffffffff
+  for k ulong cnt bound 24
+    dgt = sub ulong get g_rc_src add s k 48
+    if gt v div sub all1 dgt 10
+      ret
+    end
+    v = add mul v 10 dgt
+  end
+  put g_rc_jn_b j 1
+  put g_rc_jn_u j v
+end
+
+fn rc_jnum to long
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  s = p
+  neg_f = false
+  if eq get g_rc_src p 45
+    neg_f = true
+    p = add p 1
+  end
+  d0 = p
+  while lt p n bound 64
+    c = get g_rc_src p
+    if and ge c 48 le c 57
+      p = add p 1
+    else
+      break
+    end
+  end
+  if eq p d0
+    ret -1
+  end
+  if and eq get g_rc_src d0 48 gt sub p d0 1
+    ret -1
+  end
+  plain = not neg_f
+  if lt p n
+    c = get g_rc_src p
+    if or eq c 46 or eq c 101 eq c 69
+      plain = false
+      p = add p 1
+      while lt p n bound 64
+        if rc_is_num_tail get g_rc_src p
+          p = add p 1
+        else
+          break
+        end
+      end
+    end
+  end
+  put g_rc_pos 0 p
+  j = rc_jnew RC_J_NUM
+  if lt j 0
+    ret -1
+  end
+  if plain
+    rc_parse_u64_span s p ulong j
+  end
+  ret j
+end
+
+fn rc_obj_has_key j ulong koff ulong klen ulong to bool
+  cur = get g_rc_jn_u j
+  while gt cur 0 bound 2048
+    ci = sub cur 1
+    if rc_str_eq_str get g_rc_jc_koff ci get g_rc_jc_klen ci koff klen
+      ret true
+    end
+    cur = get g_rc_jc_next ci
+  end
+  ret false
+end
+
+fn rc_container_append j ulong koff ulong klen ulong val ulong to long
+  ci = get g_rc_jc_cnt 0
+  if ge ci 2048
+    ret -1
+  end
+  put g_rc_jc_koff ci koff
+  put g_rc_jc_klen ci klen
+  put g_rc_jc_val ci val
+  put g_rc_jc_next ci 0
+  put g_rc_jc_cnt 0 add ci 1
+  head = get g_rc_jn_u j
+  if eq head 0
+    put g_rc_jn_u j add ci 1
+  else
+    cur = sub head 1
+    while gt get g_rc_jc_next cur 0 bound 2048
+      cur = sub get g_rc_jc_next cur 1
+    end
+    put g_rc_jc_next cur add ci 1
+  end
+  put g_rc_jn_n j add get g_rc_jn_n j 1
+  ret 0
+end
+
+fn rc_parse_obj_key j ulong ks edit ulong 2 to long
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  if or ge p n ne get g_rc_src p 34
+    ret -1
+  end
+  put g_rc_pos 0 add p 1
+  if lt rc_jstring ks 0
+    ret -1
+  end
+  if rc_obj_has_key j get ks 0 get ks 1
+    ret -1
+  end
+  rc_jws
+  p2 = get g_rc_pos 0
+  if or ge p2 n ne get g_rc_src p2 58
+    ret -1
+  end
+  put g_rc_pos 0 add p2 1
+  ret 0
+end
+
+fn rc_jcontainer_step j ulong is_obj bool cls uchar to long
+  ks = new ulong 2 0
+  rc_jws
+  if is_obj
+    if lt rc_parse_obj_key j ks 0
+      ret -1
+    end
+  end
+  vl = rc_jvalue
+  if lt vl 0
+    ret -1
+  end
+  if lt rc_container_append j get ks 0 get ks 1 ulong vl 0
+    ret -1
+  end
+  rc_jws
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  if ge p n
+    ret -1
+  end
+  c = get g_rc_src p
+  if eq c 44
+    put g_rc_pos 0 add p 1
+    ret 1
+  end
+  if eq c cls
+    put g_rc_pos 0 add p 1
+    ret 0
+  end
+  ret -1
+end
+
+fn rc_jcontainer is_obj bool to long
+  d = add get g_rc_depth 0 1
+  if gt d 6
+    ret -1
+  end
+  put g_rc_depth 0 d
+  cls = uchar 93
+  j_l = long -1
+  if is_obj
+    cls = 125
+    j_l = rc_jnew RC_J_OBJ
+  else
+    j_l = rc_jnew RC_J_ARR
+  end
+  if lt j_l 0
+    ret -1
+  end
+  rc_jws
+  p = get g_rc_pos 0
+  if and lt p get g_rc_slen 0 eq get g_rc_src p cls
+    put g_rc_pos 0 add p 1
+    put g_rc_depth 0 sub d 1
+    ret j_l
+  end
+  while true bound 2048
+    st = rc_jcontainer_step ulong j_l is_obj cls
+    if lt st 0
+      ret -1
+    end
+    if eq st 0
+      break
+    end
+  end
+  put g_rc_depth 0 sub d 1
+  ret j_l
+end
+
+fn rc_jvalue to long
+  sv = new ulong 2 0
+  rc_jws
+  p = get g_rc_pos 0
+  n = get g_rc_slen 0
+  if ge p n
+    ret -1
+  end
+  c = get g_rc_src p
+  if eq c 123
+    put g_rc_pos 0 add p 1
+    ret rc_jcontainer true
+  end
+  if eq c 91
+    put g_rc_pos 0 add p 1
+    ret rc_jcontainer false
+  end
+  if eq c 34
+    put g_rc_pos 0 add p 1
+    if lt rc_jstring sv 0
+      ret -1
+    end
+    j = rc_jnew RC_J_STR
+    if lt j 0
+      ret -1
+    end
+    put g_rc_jn_u ulong j get sv 0
+    put g_rc_jn_n ulong j get sv 1
+    ret j
+  end
+  if rc_match_lit rc_lit_null
+    ret rc_jnew RC_J_NULL
+  end
+  if rc_match_lit rc_lit_true
+    j = rc_jnew RC_J_BOOL
+    if ge j 0
+      put g_rc_jn_b ulong j 1
+    end
+    ret j
+  end
+  if rc_match_lit rc_lit_false
+    ret rc_jnew RC_J_BOOL
+  end
+  if or eq c 45 and ge c 48 le c 57
+    ret rc_jnum
+  end
+  ret -1
+end
+
+fn rc_oget obj ulong key view uchar * to long
+  cur = get g_rc_jn_u obj
+  while gt cur 0 bound 2048
+    ci = sub cur 1
+    if rc_str_eq_txt get g_rc_jc_koff ci get g_rc_jc_klen ci key
+      ret long get g_rc_jc_val ci
+    end
+    cur = get g_rc_jc_next ci
+  end
+  ret -1
+end
+
+note --- Field extractors ---
+
+fn rc_want_str obj ulong key view uchar * req bool dst edit ulong 2 to long
+  v = rc_oget obj key
+  if lt v 0
+    if req
+      ret -1
+    end
+    put dst 0 0
+    put dst 1 0
+    ret 0
+  end
+  if ne get g_rc_jn_k ulong v RC_J_STR
+    ret -1
+  end
+  put dst 0 get g_rc_jn_u ulong v
+  put dst 1 get g_rc_jn_n ulong v
+  ret 0
+end
+
+fn rc_want_sfield obj ulong key view uchar * req bool slot ulong to long
+  sv = new ulong 2 0
+  if lt rc_want_str obj key req sv 0
+    ret -1
+  end
+  put g_rc_s_off slot get sv 0
+  put g_rc_s_len slot get sv 1
+  ret 0
+end
+
+fn rc_want_bool obj ulong key view uchar * dst edit ulong 1 to long
+  v = rc_oget obj key
+  if lt v 0
+    ret -1
+  end
+  if ne get g_rc_jn_k ulong v RC_J_BOOL
+    ret -1
+  end
+  put dst 0 ulong get g_rc_jn_b ulong v
+  ret 0
+end
+
+fn rc_want_u64 obj ulong key view uchar * dst edit ulong 1 to long
+  v = rc_oget obj key
+  if lt v 0
+    ret -1
+  end
+  if ne get g_rc_jn_k ulong v RC_J_NUM
+    ret -1
+  end
+  if eq get g_rc_jn_b ulong v 0
+    ret -1
+  end
+  put dst 0 get g_rc_jn_u ulong v
+  ret 0
+end
+
+fn rc_want_mut obj ulong key view uchar * dst edit ulong 1 to long
+  sv = new ulong 2 0
+  if lt rc_want_str obj key true sv 0
+    ret -1
+  end
+  mi = rc_mut_idx get sv 0 get sv 1
+  if lt mi 0
+    ret -1
+  end
+  put dst 0 ulong mi
+  ret 0
+end
+
+fn rc_copy_strlist v ulong lidx ulong to long
+  base = mul lidx 256
+  cur = get g_rc_jn_u v
+  i = ulong 0
+  while gt cur 0 bound 256
+    ci = sub cur 1
+    elem = get g_rc_jc_val ci
+    if ne get g_rc_jn_k elem RC_J_STR
+      ret -1
+    end
+    put g_rc_l_off add base i get g_rc_jn_u elem
+    put g_rc_l_len add base i get g_rc_jn_n elem
+    i = add i 1
+    cur = get g_rc_jc_next ci
+  end
+  put g_rc_l_cnt lidx i
+  ret 0
+end
+
+fn rc_want_strlist obj ulong key view uchar * req bool lidx ulong to long
+  put g_rc_l_cnt lidx 0
+  v = rc_oget obj key
+  if lt v 0
+    if req
+      ret -1
+    end
+    ret 0
+  end
+  if ne get g_rc_jn_k ulong v RC_J_ARR
+    ret -1
+  end
+  if gt get g_rc_jn_n ulong v 256
+    ret -1
+  end
+  ret rc_copy_strlist ulong v lidx
+end
+
+note --- Validation helpers ---
+
+fn rc_is_known_root_key1 koff ulong klen ulong to bool
+  if rc_str_eq_txt koff klen rc_k_schema
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_version
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_id
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_kind
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_tier
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_result
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_timestamp
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_repo
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_commit
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_dirty
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_toolchain
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_procedure
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_machine
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_env_class
+    ret true
+  end
+  ret false
+end
+
+fn rc_is_known_root_key2 koff ulong klen ulong to bool
+  if rc_str_eq_txt koff klen rc_k_in_art
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_out_art
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_assertions
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_deps
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_decl_mut
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_obs_mut
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_authority
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_out_dig
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_ext_refs
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_ledger
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_lease
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_req_feat
+    ret true
+  end
+  if rc_str_eq_txt koff klen rc_k_reserved
+    ret true
+  end
+  ret false
+end
+
+fn rc_all_known_root obj ulong to bool
+  cur = get g_rc_jn_u obj
+  while gt cur 0 bound 2048
+    ci = sub cur 1
+    ko = get g_rc_jc_koff ci
+    kl = get g_rc_jc_klen ci
+    if not rc_is_known_root_key1 ko kl
+      if not rc_is_known_root_key2 ko kl
+        ret false
+      end
+    end
+    cur = get g_rc_jc_next ci
+  end
+  ret true
+end
+
+fn rc_check_digest_list lidx ulong to long
+  cnt = get g_rc_l_cnt lidx
+  base = mul lidx 256
+  for i ulong cnt bound 256
+    off = get g_rc_l_off add base i
+    sl = get g_rc_l_len add base i
+    col = sl
+    for k ulong sl bound 512
+      if eq get g_rc_str add off k 58
+        col = k
+        break
+      end
+    end
+    if lt col sl
+      ok = false
+      if rc_str_eq_txt off col rc_alg_b3
+        ok = true
+      end
+      if rc_str_eq_txt off col rc_alg_s256
+        ok = true
+      end
+      if rc_str_eq_txt off col rc_alg_s512
+        ok = true
+      end
+      if not ok
+        ret -1
+      end
+      hl = sub sub sl col 1
+      if or lt hl 32 ne rem hl 2 0
+        ret -1
+      end
+      if not rc_is_hex add add off col 1 hl
+        ret -1
+      end
+    else
+      if or ne sl 64 not rc_is_hex off sl
+        ret -1
+      end
+    end
+  end
+  ret 0
+end
+
+fn rc_is_known_assert_key ko ulong kl ulong to bool
+  if rc_str_eq_txt ko kl rc_k_id
+    ret true
+  end
+  if rc_str_eq_txt ko kl rc_ak_expected
+    ret true
+  end
+  if rc_str_eq_txt ko kl rc_ak_observed
+    ret true
+  end
+  if rc_str_eq_txt ko kl rc_ak_pass
+    ret true
+  end
+  if rc_str_eq_txt ko kl rc_ak_source
+    ret true
+  end
+  if rc_str_eq_txt ko kl rc_ak_note
+    ret true
+  end
+  ret false
+end
+
+fn rc_parse_one_assertion idx ulong a ulong to long
+  if ne get g_rc_jn_k a RC_J_OBJ
+    ret -1
+  end
+  cur = get g_rc_jn_u a
+  while gt cur 0 bound 64
+    ci = sub cur 1
+    if not rc_is_known_assert_key get g_rc_jc_koff ci get g_rc_jc_klen ci
+      ret -1
+    end
+    cur = get g_rc_jc_next ci
+  end
+  sv = new ulong 2 0
+  bv = new ulong 1 0
+  base = mul idx 5
+  if lt rc_want_str a rc_k_id true sv 0
+    ret -1
+  end
+  put g_rc_as_off base get sv 0
+  put g_rc_as_len base get sv 1
+  if lt rc_want_str a rc_ak_expected false sv 0
+    ret -1
+  end
+  put g_rc_as_off add base 1 get sv 0
+  put g_rc_as_len add base 1 get sv 1
+  if lt rc_want_str a rc_ak_observed false sv 0
+    ret -1
+  end
+  put g_rc_as_off add base 2 get sv 0
+  put g_rc_as_len add base 2 get sv 1
+  if lt rc_want_bool a rc_ak_pass bv 0
+    ret -1
+  end
+  put g_rc_as_pass idx uchar get bv 0
+  if lt rc_want_str a rc_ak_source false sv 0
+    ret -1
+  end
+  put g_rc_as_off add base 3 get sv 0
+  put g_rc_as_len add base 3 get sv 1
+  if lt rc_want_str a rc_ak_note false sv 0
+    ret -1
+  end
+  put g_rc_as_off add base 4 get sv 0
+  put g_rc_as_len add base 4 get sv 1
+  ret 0
+end
+
+fn rc_check_assertions_unique cnt ulong to long
+  for a ulong cnt bound 128
+    ao = get g_rc_as_off mul a 5
+    al = get g_rc_as_len mul a 5
+    if eq al 0
+      ret -1
+    end
+    for k ulong a bound 128
+      if rc_str_eq_str get g_rc_as_off mul k 5 get g_rc_as_len mul k 5 ao al
+        ret -1
+      end
+    end
+  end
+  ret 0
+end
+
+fn rc_parse_assertions root ulong to long
+  av = rc_oget root rc_k_assertions
+  if lt av 0
+    ret -1
+  end
+  if ne get g_rc_jn_k ulong av RC_J_ARR
+    ret -1
+  end
+  cnt = get g_rc_jn_n ulong av
+  if gt cnt 128
+    ret -1
+  end
+  cur = get g_rc_jn_u ulong av
+  i = ulong 0
+  while gt cur 0 bound 128
+    ci = sub cur 1
+    if lt rc_parse_one_assertion i get g_rc_jc_val ci 0
+      ret -1
+    end
+    i = add i 1
+    cur = get g_rc_jc_next ci
+  end
+  put g_rc_as_cnt 0 i
+  if and eq i 0 eq get g_rc_result 0 0
+    ret -1
+  end
+  ret rc_check_assertions_unique i
+end
+
+fn rc_contains_ci off ulong slen ulong pat view uchar * to bool
+  pl = len pat
+  if gt pl slen
+    ret false
+  end
+  lim = add sub slen pl 1
+  for i ulong lim bound 1024
+    ok = true
+    for j ulong pl bound 16
+      c = get g_rc_str add add off i j
+      if and ge c 65 le c 90
+        c = add c 32
+      end
+      if ne c get pat j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+fn rc_has_non_ws off ulong slen ulong to bool
+  for i ulong slen bound 1024
+    c = get g_rc_str add off i
+    if and ne c 32 and ne c 9 and ne c 10 ne c 13
+      ret true
+    end
+  end
+  ret false
+end
+
+fn rc_parse_ledger_lease root ulong to long
+  uv = new ulong 1 0
+  sv = new ulong 2 0
+  hb = new uchar 32 0
+  lg = rc_oget root rc_k_ledger
+  if and ge lg 0 ne get g_rc_jn_k ulong lg RC_J_NULL
+    if ne get g_rc_jn_k ulong lg RC_J_OBJ
+      ret -1
+    end
+    cur = get g_rc_jn_u ulong lg
+    while gt cur 0 bound 32
+      ci = sub cur 1
+      ko = get g_rc_jc_koff ci
+      kl = get g_rc_jc_klen ci
+      if and not rc_str_eq_txt ko kl rc_lk_index not rc_str_eq_txt ko kl rc_lk_hash
+        ret -1
+      end
+      cur = get g_rc_jc_next ci
+    end
+    if lt rc_want_u64 ulong lg rc_lk_index uv 0
+      ret -1
+    end
+    if lt rc_want_str ulong lg rc_lk_hash true sv 0
+      ret -1
+    end
+    if lt rc_hex32 get sv 0 get sv 1 hb 0
+      ret -1
+    end
+    put g_rc_ledger_idx 0 get uv 0
+    for k ulong 32
+      put g_rc_ledger_hash k get hb k
+    end
+    put g_rc_has_ledger 0 1
+  end
+  ls = rc_oget root rc_k_lease
+  if and ge ls 0 ne get g_rc_jn_k ulong ls RC_J_NULL
+    if ne get g_rc_jn_k ulong ls RC_J_OBJ
+      ret -1
+    end
+    cur = get g_rc_jn_u ulong ls
+    while gt cur 0 bound 32
+      ci = sub cur 1
+      ko = get g_rc_jc_koff ci
+      kl = get g_rc_jc_klen ci
+      if and not rc_str_eq_txt ko kl rc_lsk_hold not rc_str_eq_txt ko kl rc_lsk_res
+        ret -1
+      end
+      cur = get g_rc_jc_next ci
+    end
+    if lt rc_want_str ulong ls rc_lsk_hold true sv 0
+      ret -1
+    end
+    if lt rc_hex32 get sv 0 get sv 1 hb 0
+      ret -1
+    end
+    if lt rc_want_sfield ulong ls rc_lsk_res true 9 0
+      ret -1
+    end
+    if not rc_has_non_ws get g_rc_s_off 9 get g_rc_s_len 9
+      ret -1
+    end
+    for k ulong 32
+      put g_rc_lease_hold k get hb k
+    end
+    put g_rc_has_lease 0 1
+  end
+  ret 0
+end
+
+note --- omega_receipt_free & omega_receipt_parse ---
+
+fn omega_receipt_free to void
+  put g_rc_version 0 0
+  put g_rc_result 0 0
+  put g_rc_tier_rank 0 -1
+  put g_rc_dirty 0 0
+  put g_rc_timestamp 0 0
+  put g_rc_decl_mut 0 0
+  put g_rc_obs_mut 0 0
+  put g_rc_has_ledger 0 0
+  put g_rc_has_lease 0 0
+  put g_rc_as_cnt 0 0
+  for i ulong 5
+    put g_rc_l_cnt i 0
+  end
+  for i ulong 16
+    put g_rc_s_off i 0
+    put g_rc_s_len i 0
+  end
+end
+
+fn rc_extract_core root ulong to long
+  sv = new ulong 2 0
+  uv = new ulong 1 0
+  if lt rc_want_str root rc_k_schema true sv 0
+    ret -1
+  end
+  if not rc_str_eq_txt get sv 0 get sv 1 rc_schema_v1
+    ret -1
+  end
+  if lt rc_want_u64 root rc_k_version uv 0
+    ret -1
+  end
+  if ne get uv 0 1
+    ret -1
+  end
+  put g_rc_version 0 1
+  if lt rc_want_str root rc_k_id true sv 0
+    ret -1
+  end
+  idb = new uchar 32 0
+  if lt rc_hex32 get sv 0 get sv 1 idb 0
+    ret -1
+  end
+  for k ulong 32
+    put g_rc_id k get idb k
+  end
+  if lt rc_want_sfield root rc_k_kind true 0 0
+    ret -1
+  end
+  if lt rc_want_sfield root rc_k_tier true 1 0
+    ret -1
+  end
+  if lt rc_want_str root rc_k_result true sv 0
+    ret -1
+  end
+  vr = rc_verdict_idx get sv 0 get sv 1
+  if lt vr 0
+    ret -1
+  end
+  put g_rc_result 0 ulong vr
+  if lt rc_want_u64 root rc_k_timestamp uv 0
+    ret -1
+  end
+  put g_rc_timestamp 0 get uv 0
+  if lt rc_want_sfield root rc_k_repo true 2 0
+    ret -1
+  end
+  if lt rc_want_sfield root rc_k_commit true 3 0
+    ret -1
+  end
+  if lt rc_want_bool root rc_k_dirty uv 0
+    ret -1
+  end
+  put g_rc_dirty 0 get uv 0
+  if lt rc_want_sfield root rc_k_toolchain true 4 0
+    ret -1
+  end
+  if lt rc_want_sfield root rc_k_procedure true 5 0
+    ret -1
+  end
+  if lt rc_want_sfield root rc_k_machine true 6 0
+    ret -1
+  end
+  if lt rc_want_sfield root rc_k_env_class true 7 0
+    ret -1
+  end
+  if lt rc_want_sfield root rc_k_authority false 8 0
+    ret -1
+  end
+  ret 0
+end
+
+fn rc_extract_lists_and_mut root ulong to long
+  uv = new ulong 1 0
+  sv = new ulong 2 0
+  if lt rc_want_strlist root rc_k_in_art true 0 0
+    ret -1
+  end
+  if lt rc_want_strlist root rc_k_out_art true 1 0
+    ret -1
+  end
+  if lt rc_want_strlist root rc_k_deps true 2 0
+    ret -1
+  end
+  if lt rc_want_strlist root rc_k_ext_refs false 3 0
+    ret -1
+  end
+  if lt rc_want_strlist root rc_k_req_feat false 4 0
+    ret -1
+  end
+  if lt rc_want_mut root rc_k_decl_mut uv 0
+    ret -1
+  end
+  put g_rc_decl_mut 0 get uv 0
+  if lt rc_want_mut root rc_k_obs_mut uv 0
+    ret -1
+  end
+  put g_rc_obs_mut 0 get uv 0
+  if lt rc_want_str root rc_k_out_dig true sv 0
+    ret -1
+  end
+  od = new uchar 32 0
+  if lt rc_hex32 get sv 0 get sv 1 od 0
+    ret -1
+  end
+  for k ulong 32
+    put g_rc_out_digest k get od k
+  end
+  if lt rc_want_str root rc_k_reserved false sv 0
+    ret -1
+  end
+  if ne get sv 1 0
+    ret -1
+  end
+  ret 0
+end
+
+fn rc_validate_fields to long
+  fc = get g_rc_l_cnt 4
+  for i ulong fc bound 256
+    if not rc_str_eq_txt get g_rc_l_off add 1024 i get g_rc_l_len add 1024 i rc_feat_v1
+      ret -1
+    end
+  end
+  if or eq get g_rc_s_len 0 0 or eq get g_rc_s_len 2 0 or eq get g_rc_s_len 5 0 eq get g_rc_s_len 6 0
+    ret -1
+  end
+  cl = get g_rc_s_len 3
+  if and ne cl 40 ne cl 64
+    ret -1
+  end
+  if not rc_is_lower_hex get g_rc_s_off 3 cl
+    ret -1
+  end
+  tr = rc_tier_rank_str get g_rc_s_off 1 get g_rc_s_len 1
+  if lt tr 0
+    ret -1
+  end
+  put g_rc_tier_rank 0 tr
+  if not rc_str_eq_str get g_rc_s_off 7 get g_rc_s_len 7 get g_rc_s_off 1 get g_rc_s_len 1
+    ret -1
+  end
+  if or lt rc_check_digest_list 0 0 lt rc_check_digest_list 1 0
+    ret -1
+  end
+  dc = get g_rc_l_cnt 2
+  tmp = new uchar 32 0
+  for i ulong dc bound 256
+    if lt rc_hex32 get g_rc_l_off add 512 i get g_rc_l_len add 512 i tmp 0
+      ret -1
+    end
+  end
+  os = rc_mut_sev get g_rc_obs_mut 0
+  ds = rc_mut_sev get g_rc_decl_mut 0
+  if gt os ds
+    ret -1
+  end
+  mx = ulong 4
+  if eq tr 4
+    mx = 2
+  else
+    if eq tr 5
+      mx = 5
+    else
+      if ge tr 6
+        mx = 255
+      end
+    end
+  end
+  if gt os mx
+    ret -1
+  end
+  if and eq tr 4 ge get g_rc_obs_mut 0 4
+    ret -1
+  end
+  if eq tr 7
+    ao = get g_rc_s_off 8
+    al = get g_rc_s_len 8
+    if not rc_has_non_ws ao al
+      ret -1
+    end
+    if or rc_contains_ci ao al rc_bad_to1 or rc_contains_ci ao al rc_bad_to2 rc_contains_ci ao al rc_bad_to3
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn omega_receipt_parse src view uchar * slen ulong to long
+  omega_receipt_free
+  if or eq slen 0 gt slen RC_MAX_BYTES
+    ret -1
+  end
+  for i ulong slen bound 262144
+    put g_rc_src i get src i
+  end
+  put g_rc_slen 0 slen
+  put g_rc_pos 0 0
+  put g_rc_depth 0 0
+  put g_rc_str_len 0 1
+  put g_rc_str 0 0
+  put g_rc_jn_cnt 0 0
+  put g_rc_jc_cnt 0 0
+  root_l = rc_jvalue
+  if lt root_l 0
+    ret -1
+  end
+  rc_jws
+  if ne get g_rc_pos 0 slen
+    ret -1
+  end
+  root = ulong root_l
+  if ne get g_rc_jn_k root RC_J_OBJ
+    ret -1
+  end
+  if not rc_all_known_root root
+    ret -1
+  end
+  if lt rc_extract_core root 0
+    omega_receipt_free
+    ret -1
+  end
+  if lt rc_extract_lists_and_mut root 0
+    omega_receipt_free
+    ret -1
+  end
+  if lt rc_parse_assertions root 0
+    omega_receipt_free
+    ret -1
+  end
+  if lt rc_validate_fields 0
+    omega_receipt_free
+    ret -1
+  end
+  if lt rc_parse_ledger_lease root 0
+    omega_receipt_free
+    ret -1
+  end
+  ret 0
+end
+
+note --- Canonical wire encoding ---
+
+fn rc_b_u8 dst edit uchar * pos ulong cap ulong v ulong to long
+  if ge pos cap
+    ret -1
+  end
+  put dst pos uchar and v 255
+  ret long add pos 1
+end
+
+fn rc_b_u32 dst edit uchar * pos ulong cap ulong v ulong to long
+  if gt add pos 4 cap
+    ret -1
+  end
+  put dst pos uchar and shr v 24 255
+  put dst add pos 1 uchar and shr v 16 255
+  put dst add pos 2 uchar and shr v 8 255
+  put dst add pos 3 uchar and v 255
+  ret long add pos 4
+end
+
+fn rc_b_u64 dst edit uchar * pos ulong cap ulong v ulong to long
+  p = rc_b_u32 dst pos cap shr v 32
+  if lt p 0
+    ret -1
+  end
+  ret rc_b_u32 dst ulong p cap and v 0xffffffff
+end
+
+fn rc_b_str dst edit uchar * pos ulong cap ulong off ulong slen ulong to long
+  p = rc_b_u64 dst pos cap slen
+  if lt p 0
+    ret -1
+  end
+  pu = ulong p
+  if gt add pu slen cap
+    ret -1
+  end
+  for i ulong slen bound 4096
+    put dst add pu i get g_rc_str add off i
+  end
+  ret long add pu slen
+end
+
+fn rc_list_item_eq base ulong a ulong b ulong to bool
+  oa = get g_rc_l_off add base a
+  la = get g_rc_l_len add base a
+  ob = get g_rc_l_off add base b
+  lb = get g_rc_l_len add base b
+  ret rc_str_eq_str oa la ob lb
+end
+
+fn rc_dedup_ord base ulong cnt ulong to ulong
+  m = ulong 0
+  for i ulong cnt bound 256
+    cur = get g_rc_ord i
+    if eq m 0
+      put g_rc_ord m cur
+      m = add m 1
+    else
+      pr = get g_rc_ord sub m 1
+      if not rc_list_item_eq base pr cur
+        put g_rc_ord m cur
+        m = add m 1
+      end
+    end
+  end
+  ret m
+end
+
+fn rc_sort_unique_list lidx ulong to ulong
+  cnt = get g_rc_l_cnt lidx
+  base = mul lidx 256
+  for i ulong cnt bound 256
+    put g_rc_ord i i
+  end
+  for i ulong cnt bound 256
+    if gt i 0
+      key = get g_rc_ord i
+      ko = get g_rc_l_off add base key
+      kl = get g_rc_l_len add base key
+      j = i
+      while gt j 0 bound 256
+        prev = get g_rc_ord sub j 1
+        po = get g_rc_l_off add base prev
+        pl = get g_rc_l_len add base prev
+        if gt rc_str_cmp_str po pl ko kl 0
+          put g_rc_ord j prev
+          j = sub j 1
+        else
+          break
+        end
+      end
+      put g_rc_ord j key
+    end
+  end
+  ret rc_dedup_ord base cnt
+end
+
+fn rc_b_strlist dst edit uchar * pos ulong cap ulong lidx ulong to long
+  m = rc_sort_unique_list lidx
+  base = mul lidx 256
+  p = rc_b_u32 dst pos cap m
+  if lt p 0
+    ret -1
+  end
+  for i ulong m bound 256
+    slot = add base get g_rc_ord i
+    p = rc_b_str dst ulong p cap get g_rc_l_off slot get g_rc_l_len slot
+    if lt p 0
+      ret -1
+    end
+  end
+  ret p
+end
+
+fn rc_sort_assertions cnt ulong to void
+  for i ulong cnt bound 128
+    put g_rc_ord i i
+  end
+  for i ulong cnt bound 128
+    if gt i 0
+      key = get g_rc_ord i
+      ko = get g_rc_as_off mul key 5
+      kl = get g_rc_as_len mul key 5
+      j = i
+      while gt j 0 bound 128
+        prev = get g_rc_ord sub j 1
+        po = get g_rc_as_off mul prev 5
+        pl = get g_rc_as_len mul prev 5
+        if gt rc_str_cmp_str po pl ko kl 0
+          put g_rc_ord j prev
+          j = sub j 1
+        else
+          break
+        end
+      end
+      put g_rc_ord j key
+    end
+  end
+end
+
+fn rc_b_one_assertion dst edit uchar * pos ulong cap ulong aidx ulong to long
+  b = mul aidx 5
+  p = rc_b_str dst pos cap get g_rc_as_off b get g_rc_as_len b
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_as_off add b 1 get g_rc_as_len add b 1
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_as_off add b 2 get g_rc_as_len add b 2
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_u8 dst ulong p cap ulong get g_rc_as_pass aidx
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_as_off add b 3 get g_rc_as_len add b 3
+  if lt p 0
+    ret -1
+  end
+  ret rc_b_str dst ulong p cap get g_rc_as_off add b 4 get g_rc_as_len add b 4
+end
+
+fn rc_b_assertions dst edit uchar * pos ulong cap ulong to long
+  cnt = get g_rc_as_cnt 0
+  rc_sort_assertions cnt
+  p = rc_b_u32 dst pos cap cnt
+  if lt p 0
+    ret -1
+  end
+  for i ulong cnt bound 128
+    p = rc_b_one_assertion dst ulong p cap get g_rc_ord i
+    if lt p 0
+      ret -1
+    end
+  end
+  ret p
+end
+
+fn rc_b_one_dep dst edit uchar * pos ulong cap ulong idx ulong to long
+  raw = new uchar 32 0
+  slot = add 512 idx
+  if lt rc_hex32 get g_rc_l_off slot get g_rc_l_len slot raw 0
+    ret -1
+  end
+  if gt add pos 32 cap
+    ret -1
+  end
+  for k ulong 32
+    put dst add pos k get raw k
+  end
+  ret long add pos 32
+end
+
+fn rc_b_deps dst edit uchar * pos ulong cap ulong to long
+  m = rc_sort_unique_list 2
+  p = rc_b_u32 dst pos cap m
+  if lt p 0
+    ret -1
+  end
+  for i ulong m bound 256
+    p = rc_b_one_dep dst ulong p cap get g_rc_ord i
+    if lt p 0
+      ret -1
+    end
+  end
+  ret p
+end
+
+fn rc_canon_head dst edit uchar * cap ulong to long
+  dl = len rc_domain
+  if gt dl cap
+    ret -1
+  end
+  for i ulong dl bound 32
+    put dst i get rc_domain i
+  end
+  p = rc_b_u32 dst dl cap 1
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 0 get g_rc_s_len 0
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 1 get g_rc_s_len 1
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_u8 dst ulong p cap get g_rc_result 0
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 2 get g_rc_s_len 2
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 3 get g_rc_s_len 3
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_u8 dst ulong p cap get g_rc_dirty 0
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 4 get g_rc_s_len 4
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 5 get g_rc_s_len 5
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 6 get g_rc_s_len 6
+  if lt p 0
+    ret -1
+  end
+  ret rc_b_str dst ulong p cap get g_rc_s_off 7 get g_rc_s_len 7
+end
+
+fn rc_canon_tail dst edit uchar * pos ulong cap ulong to long
+  p = rc_b_u8 dst pos cap get g_rc_decl_mut 0
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_u8 dst ulong p cap get g_rc_obs_mut 0
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_str dst ulong p cap get g_rc_s_off 8 get g_rc_s_len 8
+  if lt p 0
+    ret -1
+  end
+  pu = ulong p
+  if gt add pu 32 cap
+    ret -1
+  end
+  for k ulong 32
+    put dst add pu k get g_rc_out_digest k
+  end
+  p = rc_b_strlist dst add pu 32 cap 3
+  if lt p 0
+    ret -1
+  end
+  if ne get g_rc_has_ledger 0 0
+    p = rc_b_u8 dst ulong p cap 1
+    if lt p 0
+      ret -1
+    end
+    p = rc_b_u64 dst ulong p cap get g_rc_ledger_idx 0
+    if lt p 0
+      ret -1
+    end
+    pu2 = ulong p
+    if gt add pu2 32 cap
+      ret -1
+    end
+    for k ulong 32
+      put dst add pu2 k get g_rc_ledger_hash k
+    end
+    p = long add pu2 32
+  else
+    p = rc_b_u8 dst ulong p cap 0
+    if lt p 0
+      ret -1
+    end
+  end
+  if ne get g_rc_has_lease 0 0
+    p = rc_b_u8 dst ulong p cap 1
+    if lt p 0
+      ret -1
+    end
+    pu3 = ulong p
+    if gt add pu3 32 cap
+      ret -1
+    end
+    for k ulong 32
+      put dst add pu3 k get g_rc_lease_hold k
+    end
+    p = rc_b_str dst add pu3 32 cap get g_rc_s_off 9 get g_rc_s_len 9
+    if lt p 0
+      ret -1
+    end
+  else
+    p = rc_b_u8 dst ulong p cap 0
+    if lt p 0
+      ret -1
+    end
+  end
+  p = rc_b_u64 dst ulong p cap get g_rc_timestamp 0
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_strlist dst ulong p cap 4
+  if lt p 0
+    ret -1
+  end
+  ret rc_b_u32 dst ulong p cap 0
+end
+
+fn omega_receipt_canonical dst edit uchar * cap ulong out_len edit ulong 1 to long
+  p = rc_canon_head dst cap
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_strlist dst ulong p cap 0
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_strlist dst ulong p cap 1
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_assertions dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  p = rc_b_deps dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  p = rc_canon_tail dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  put out_len 0 ulong p
+  ret 0
+end
+
+fn omega_receipt_compute_id dst edit uchar 32 to long
+  cbuf = new uchar 16384 0
+  clen = new ulong 1 0
+  if lt omega_receipt_canonical cbuf 16384 clen 0
+    ret -1
+  end
+  omega_blake3_hash cbuf get clen 0 dst
+  ret 0
+end
+
+fn omega_receipt_verify_bytes src view uchar * slen ulong dst edit uchar 32 to long
+  if lt omega_receipt_parse src slen 0
+    ret -1
+  end
+  if lt omega_receipt_compute_id dst 0
+    omega_receipt_free
+    ret -1
+  end
+  for i ulong 32
+    if ne get dst i get g_rc_id i
+      omega_receipt_free
+      ret -1
+    end
+  end
+  ret 0
+end

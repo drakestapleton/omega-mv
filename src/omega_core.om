@@ -1,0 +1,824 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_core.c (graph, builders, effect v2, pure eval).
+note Composes on seed/ng/sha256.om, om/visor/canonical_om2.om, src/omega_canonical.om.
+om2
+
+const CORE_MAX_OBJS ulong 256
+const CORE_EFF_PARAM_MAX ulong 128
+const CORE_EFF_PAY_LEN ulong 178
+const CORE_EFF_V1_LEN ulong 176
+
+const CORE_EFF_OK long 0
+const CORE_EFF_ERR_ARG long -1
+const CORE_EFF_ERR_LEN long -2
+const CORE_EFF_ERR_V1 long -3
+const CORE_EFF_ERR_RES long -4
+const CORE_EFF_ERR_PLEN long -5
+const CORE_EFF_ERR_PAD long -6
+
+const CORE_KIND_VALUE ulong 1
+const CORE_KIND_TYPE ulong 2
+const CORE_KIND_OP ulong 3
+const CORE_KIND_EFFECT ulong 8
+
+const CORE_TYPE_UNIT ulong 1
+const CORE_TYPE_BOOL ulong 2
+const CORE_TYPE_UINT ulong 3
+const CORE_TYPE_SINT ulong 4
+const CORE_TYPE_BV ulong 5
+const CORE_TYPE_BYTE ulong 6
+const CORE_TYPE_SEQ ulong 7
+const CORE_TYPE_CAP_REF ulong 11
+const CORE_TYPE_FP32 ulong 14
+
+const CORE_TP_SIZE ulong 44
+const CORE_VP_SIZE ulong 98
+const CORE_OP_SIZE ulong 204
+const CORE_APP_SIZE ulong 161
+
+text core_k_param "omega.param"
+text core_es_ok "ok"
+text core_es_arg "not an effect object"
+text core_es_len "effect payload length is not 178 bytes"
+text core_es_v1 "legacy v1 effect payload (32-bit generation) refused"
+text core_es_res "effect resource class is 0 (invalid resource)"
+text core_es_plen "effect param_len exceeds 128"
+text core_es_pad "effect parameter padding is not zero"
+text core_es_unk "unknown effect error"
+
+global g_core_obj_cnt ulong 1
+global g_core_kind ulong 256
+global g_core_has_id ulong 256
+global g_core_ids uchar 8192
+
+global g_core_attr_n ulong 256
+global g_core_attr_keys uchar 524288
+global g_core_attr_vlen ulong 8192
+global g_core_attr_vals uchar 4194304
+
+global g_core_rel_n ulong 256
+global g_core_rel_kinds ushort 16384
+global g_core_rel_tgts uchar 524288
+
+global g_core_const_n ulong 256
+global g_core_const_meta ushort 16384
+global g_core_const_pays uchar 1048576
+
+global g_core_pay_len ulong 256
+global g_core_pays uchar 262144
+
+note --- Graph lifecycle ---
+
+fn omega_graph_create to long
+  put g_core_obj_cnt 0 0
+  ret 0
+end
+
+fn omega_graph_destroy to void
+  put g_core_obj_cnt 0 0
+end
+
+fn core_clear_obj idx ulong to void
+  put g_core_kind idx 0
+  put g_core_has_id idx 0
+  put g_core_attr_n idx 0
+  put g_core_rel_n idx 0
+  put g_core_const_n idx 0
+  put g_core_pay_len idx 0
+  ib = mul idx 32
+  for i ulong 32
+    put g_core_ids add ib i 0
+  end
+  pb = mul idx CAN_MAX_PAYLOAD
+  for i ulong CAN_MAX_PAYLOAD
+    put g_core_pays add pb i 0
+  end
+end
+
+fn omega_graph_add_object kind ulong to long
+  cnt = get g_core_obj_cnt 0
+  if ge cnt CORE_MAX_OBJS
+    ret -1
+  end
+  core_clear_obj cnt
+  put g_core_kind cnt kind
+  put g_core_obj_cnt 0 add cnt 1
+  ret long cnt
+end
+
+fn core_id_eq_slot idx ulong target view uchar 32 to bool
+  if eq get g_core_has_id idx 0
+    ret false
+  end
+  ib = mul idx 32
+  for k ulong 32
+    if ne get g_core_ids add ib k get target k
+      ret false
+    end
+  end
+  ret true
+end
+
+fn omega_graph_find_object target view uchar 32 to long
+  cnt = get g_core_obj_cnt 0
+  for i ulong cnt bound 256
+    if core_id_eq_slot i target
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn omega_graph_find_object_const target view uchar 32 to long
+  ret omega_graph_find_object target
+end
+
+note --- Copy between g_core_*[idx] and g_can_* ---
+
+fn core_sync_one_attr idx ulong a ulong to void
+  vl = get g_core_attr_vlen add mul idx 32 a
+  put g_can_attr_vlen a vl
+  ka = mul a 64
+  ksrc = add mul idx 2048 ka
+  for k ulong 64
+    put g_can_attr_keys add ka k get g_core_attr_keys add ksrc k
+  end
+  va = mul a 512
+  vsrc = add mul idx 16384 va
+  for k ulong vl bound 512
+    put g_can_attr_vals add va k get g_core_attr_vals add vsrc k
+  end
+end
+
+fn core_sync_attrs_to_can idx ulong to void
+  na = get g_core_attr_n idx
+  put g_can_attr_n 0 na
+  for a ulong na bound 32
+    core_sync_one_attr idx a
+  end
+end
+
+fn core_sync_rels_to_can idx ulong to void
+  nr = get g_core_rel_n idx
+  put g_can_rel_n 0 nr
+  rk_o = mul idx 64
+  rt_o = mul idx 2048
+  for r ulong nr bound 64
+    put g_can_rel_kinds r get g_core_rel_kinds add rk_o r
+    rb = mul r 32
+    for k ulong 32
+      put g_can_rel_tgts add rb k get g_core_rel_tgts add add rt_o rb k
+    end
+  end
+end
+
+fn core_sync_one_const idx ulong c ulong to void
+  c2 = mul c 2
+  msrc = add mul idx 64 c2
+  put g_can_const_meta c2 get g_core_const_meta msrc
+  cl = get g_core_const_meta add msrc 1
+  put g_can_const_meta add c2 1 cl
+  cb = mul c 128
+  psrc = add mul idx 4096 cb
+  for k ulong ulong cl bound 128
+    put g_can_const_pays add cb k get g_core_const_pays add psrc k
+  end
+end
+
+fn core_sync_consts_to_can idx ulong to void
+  nc = get g_core_const_n idx
+  put g_can_const_n 0 nc
+  for c ulong nc bound 32
+    core_sync_one_const idx c
+  end
+end
+
+fn core_load_can idx ulong to void
+  put g_can_kind 0 get g_core_kind idx
+  put g_can_has_id 0 get g_core_has_id idx
+  ib = mul idx 32
+  for k ulong 32
+    put g_can_id k get g_core_ids add ib k
+  end
+  core_sync_attrs_to_can idx
+  core_sync_rels_to_can idx
+  core_sync_consts_to_can idx
+  pl = get g_core_pay_len idx
+  put g_can_pay_len 0 pl
+  pb = mul idx CAN_MAX_PAYLOAD
+  for k ulong pl bound 1024
+    put g_can_pay k get g_core_pays add pb k
+  end
+end
+
+fn core_compute_id idx ulong to long
+  core_load_can idx
+  rc = omega_compute_semantic_id
+  if ne rc 0
+    ret rc
+  end
+  ib = mul idx 32
+  for k ulong 32
+    put g_core_ids add ib k get g_can_id k
+  end
+  put g_core_has_id idx 1
+  ret 0
+end
+
+fn core_get_id idx ulong dst edit uchar 32 to void
+  ib = mul idx 32
+  for k ulong 32
+    put dst k get g_core_ids add ib k
+  end
+end
+
+note --- Attribute / Relation / Constraint attachers ---
+
+fn omega_object_add_attribute idx ulong key view uchar * val view uchar * vlen ulong to long
+  if ge idx get g_core_obj_cnt 0
+    ret -1
+  end
+  na = get g_core_attr_n idx
+  if ge na CAN_MAX_ATTRS
+    ret -1
+  end
+  kl = ulong 0
+  for i ulong len key bound 64
+    if eq get key i 0
+      break
+    end
+    kl = add kl 1
+  end
+  if or ge kl CAN_MAX_KEY_LEN gt vlen CAN_MAX_VAL_LEN
+    ret -1
+  end
+  kbase = add mul idx 2048 mul na 64
+  for i ulong 64
+    put g_core_attr_keys add kbase i 0
+  end
+  for i ulong kl bound 63
+    put g_core_attr_keys add kbase i get key i
+  end
+  vbase = add mul idx 16384 mul na 512
+  for i ulong vlen bound 512
+    put g_core_attr_vals add vbase i get val i
+  end
+  put g_core_attr_vlen add mul idx 32 na vlen
+  put g_core_attr_n idx add na 1
+  ret 0
+end
+
+fn omega_object_add_relation idx ulong rkind ulong target view uchar 32 to long
+  if ge idx get g_core_obj_cnt 0
+    ret -1
+  end
+  nr = get g_core_rel_n idx
+  if ge nr CAN_MAX_RELS
+    ret -1
+  end
+  put g_core_rel_kinds add mul idx 64 nr ushort rkind
+  tbase = add mul idx 2048 mul nr 32
+  for k ulong 32
+    put g_core_rel_tgts add tbase k get target k
+  end
+  put g_core_rel_n idx add nr 1
+  ret 0
+end
+
+fn omega_object_add_constraint idx ulong ckind ulong pay view uchar * plen ulong to long
+  if ge idx get g_core_obj_cnt 0
+    ret -1
+  end
+  nc = get g_core_const_n idx
+  if or ge nc CAN_MAX_CONSTS gt plen CAN_MAX_CONST_PAY
+    ret -1
+  end
+  mb = add mul idx 64 mul nc 2
+  put g_core_const_meta mb ushort ckind
+  put g_core_const_meta add mb 1 ushort plen
+  pb = add mul idx 4096 mul nc 128
+  for k ulong plen bound 128
+    put g_core_const_pays add pb k get pay k
+  end
+  put g_core_const_n idx add nc 1
+  ret 0
+end
+
+note --- Little-endian payload writers matching AArch64 C structs ---
+
+fn core_pay_put_u16le pb ulong off ulong v ulong to void
+  put g_core_pays add pb off uchar and v 255
+  put g_core_pays add add pb off 1 uchar and shr v 8 255
+end
+
+fn core_pay_put_u32le pb ulong off ulong v ulong to void
+  put g_core_pays add pb off uchar and v 255
+  put g_core_pays add add pb off 1 uchar and shr v 8 255
+  put g_core_pays add add pb off 2 uchar and shr v 16 255
+  put g_core_pays add add pb off 3 uchar and shr v 24 255
+end
+
+fn core_pay_put_id pb ulong off ulong id view uchar 32 to void
+  for k ulong 32
+    put g_core_pays add add pb off k get id k
+  end
+end
+
+fn core_pay_get_u16le pb ulong off ulong to ulong
+  b0 = ulong get g_core_pays add pb off
+  b1 = shl ulong get g_core_pays add add pb off 1 8
+  ret or b0 b1
+end
+
+fn core_pay_get_u32le pb ulong off ulong to ulong
+  b0 = ulong get g_core_pays add pb off
+  b1 = shl ulong get g_core_pays add add pb off 1 8
+  b2 = shl ulong get g_core_pays add add pb off 2 16
+  b3 = shl ulong get g_core_pays add add pb off 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+note --- Type builders (TypePayload: 44 bytes: tag@0 u32, width@4 u16, length@8 u32, elem@12 [32]) ---
+
+fn core_build_type_simple tag ulong width ulong to long
+  idx = omega_graph_add_object CORE_KIND_TYPE
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  pb = mul ui CAN_MAX_PAYLOAD
+  core_pay_put_u32le pb 0 tag
+  core_pay_put_u16le pb 4 width
+  put g_core_pay_len ui CORE_TP_SIZE
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+fn omega_build_type_unit to long
+  ret core_build_type_simple CORE_TYPE_UNIT 0
+end
+
+fn omega_build_type_bool to long
+  ret core_build_type_simple CORE_TYPE_BOOL 0
+end
+
+fn omega_build_type_uint width ulong to long
+  ret core_build_type_simple CORE_TYPE_UINT width
+end
+
+fn omega_build_type_signed_int width ulong to long
+  ret core_build_type_simple CORE_TYPE_SINT width
+end
+
+fn omega_build_type_fp32 to long
+  ret core_build_type_simple CORE_TYPE_FP32 32
+end
+
+fn omega_build_type_bitvector width ulong to long
+  ret core_build_type_simple CORE_TYPE_BV width
+end
+
+fn omega_build_type_byte to long
+  ret core_build_type_simple CORE_TYPE_BYTE 8
+end
+
+fn omega_build_type_cap_ref to long
+  ret core_build_type_simple CORE_TYPE_CAP_REF 0
+end
+
+fn omega_build_type_sequence elem view uchar 32 slen ulong to long
+  idx = omega_graph_add_object CORE_KIND_TYPE
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  pb = mul ui CAN_MAX_PAYLOAD
+  core_pay_put_u32le pb 0 CORE_TYPE_SEQ
+  core_pay_put_u32le pb 8 slen
+  core_pay_put_id pb 12 elem
+  put g_core_pay_len ui CORE_TP_SIZE
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+note --- Value builders (ValuePayload: 98 bytes: type_id@0 [32], byte_len@32 u16, bytes@34 [64]) ---
+
+fn omega_build_val_bool tid view uchar 32 v bool to long
+  idx = omega_graph_add_object CORE_KIND_VALUE
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  pb = mul ui CAN_MAX_PAYLOAD
+  core_pay_put_id pb 0 tid
+  core_pay_put_u16le pb 32 1
+  if v
+    put g_core_pays add pb 34 1
+  end
+  put g_core_pay_len ui CORE_VP_SIZE
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+fn core_write_val_be pb ulong nb ulong val ulong to void
+  base = add pb 34
+  for i ulong nb bound 64
+    sh = mul sub sub nb 1 i 8
+    if lt sh 64
+      put g_core_pays add base i uchar and shr val sh 255
+    else
+      put g_core_pays add base i 0
+    end
+  end
+end
+
+fn omega_build_val_uint tid view uchar 32 width ulong val ulong to long
+  idx = omega_graph_add_object CORE_KIND_VALUE
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  pb = mul ui CAN_MAX_PAYLOAD
+  core_pay_put_id pb 0 tid
+  nb = div add width 7 8
+  if eq nb 0
+    nb = 1
+  end
+  if gt nb 64
+    nb = 64
+  end
+  core_pay_put_u16le pb 32 nb
+  core_write_val_be pb nb val
+  put g_core_pay_len ui CORE_VP_SIZE
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+fn omega_build_param tid view uchar 32 pidx ulong to long
+  idx = omega_graph_add_object CORE_KIND_VALUE
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  ibuf = new uchar 2 0
+  put ibuf 0 uchar and shr pidx 8 255
+  put ibuf 1 uchar and pidx 255
+  if ne omega_object_add_attribute ui core_k_param ibuf 2 0
+    ret -1
+  end
+  pb = mul ui CAN_MAX_PAYLOAD
+  core_pay_put_id pb 0 tid
+  core_pay_put_u16le pb 32 0
+  put g_core_pay_len ui CORE_VP_SIZE
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+note --- Operation and Apply builders ---
+
+fn omega_build_op_binary opcode ulong ov ulong tid view uchar 32 to long
+  idx = omega_graph_add_object CORE_KIND_OP
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  pb = mul ui CAN_MAX_PAYLOAD
+  core_pay_put_u32le pb 0 opcode
+  core_pay_put_u32le pb 4 ov
+  core_pay_put_id pb 8 tid
+  put g_core_pays add pb 40 2
+  core_pay_put_id pb 41 tid
+  core_pay_put_id pb 73 tid
+  core_pay_put_id pb 169 tid
+  put g_core_pay_len ui CORE_OP_SIZE
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+fn omega_build_apply opid view uchar 32 arg1 view uchar 32 arg2 view uchar 32 to long
+  idx = omega_graph_add_object CORE_KIND_OP
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  pb = mul ui CAN_MAX_PAYLOAD
+  core_pay_put_id pb 0 opid
+  put g_core_pays add pb 32 2
+  core_pay_put_id pb 33 arg1
+  core_pay_put_id pb 65 arg2
+  put g_core_pay_len ui CORE_APP_SIZE
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+note --- Effect payload v2 (178-byte big-endian) ---
+
+fn eff_put_u16be dst edit uchar * pos ulong v ulong to void
+  put dst pos uchar and shr v 8 255
+  put dst add pos 1 uchar and v 255
+end
+
+fn eff_put_u32be dst edit uchar * pos ulong v ulong to void
+  put dst pos uchar and shr v 24 255
+  put dst add pos 1 uchar and shr v 16 255
+  put dst add pos 2 uchar and shr v 8 255
+  put dst add pos 3 uchar and v 255
+end
+
+fn eff_put_u64be dst edit uchar * pos ulong v ulong to void
+  eff_put_u32be dst pos shr v 32
+  eff_put_u32be dst add pos 4 and v 0xffffffff
+end
+
+fn eff_get_u16be src view uchar * pos ulong to ulong
+  ret or shl ulong get src pos 8 ulong get src add pos 1
+end
+
+fn eff_get_u32be src view uchar * pos ulong to ulong
+  b0 = shl ulong get src pos 24
+  b1 = shl ulong get src add pos 1 16
+  b2 = shl ulong get src add pos 2 8
+  b3 = ulong get src add pos 3
+  ret or or b0 b1 or b2 b3
+end
+
+fn eff_get_u64be src view uchar * pos ulong to ulong
+  hi = eff_get_u32be src pos
+  lo = eff_get_u32be src add pos 4
+  ret or shl hi 32 lo
+end
+
+note Effect struct passed as: meta[5] = {res_class, op_code, cap_slot, cap_gen, param_len},
+note cref[32], pbytes[128].
+
+fn omega_effect_payload_encode meta view ulong 5 cref view uchar 32 pbytes view uchar 128 dst edit uchar 178 to long
+  eff_put_u16be dst 0 get meta 0
+  eff_put_u16be dst 2 get meta 1
+  eff_put_u32be dst 4 get meta 2
+  eff_put_u64be dst 8 get meta 3
+  for k ulong 32
+    put dst add 16 k get cref k
+  end
+  eff_put_u16be dst 48 get meta 4
+  for k ulong 128
+    put dst add 50 k get pbytes k
+  end
+  ret CORE_EFF_OK
+end
+
+fn omega_effect_payload_decode src view uchar * slen ulong meta edit ulong 5 cref edit uchar 32 pbytes edit uchar 128 to long
+  for i ulong 5
+    put meta i 0
+  end
+  for i ulong 32
+    put cref i 0
+  end
+  for i ulong 128
+    put pbytes i 0
+  end
+  if eq slen CORE_EFF_V1_LEN
+    ret CORE_EFF_ERR_V1
+  end
+  if ne slen CORE_EFF_PAY_LEN
+    ret CORE_EFF_ERR_LEN
+  end
+  rc_v = eff_get_u16be src 0
+  if eq rc_v 0
+    ret CORE_EFF_ERR_RES
+  end
+  plen = eff_get_u16be src 48
+  if gt plen CORE_EFF_PARAM_MAX
+    ret CORE_EFF_ERR_PLEN
+  end
+  for i ulong sub CORE_EFF_PARAM_MAX plen bound 128
+    if ne get src add add 50 plen i 0
+      ret CORE_EFF_ERR_PAD
+    end
+  end
+  put meta 0 rc_v
+  put meta 1 eff_get_u16be src 2
+  put meta 2 eff_get_u32be src 4
+  put meta 3 eff_get_u64be src 8
+  put meta 4 plen
+  for k ulong 32
+    put cref k get src add 16 k
+  end
+  for k ulong plen bound 128
+    put pbytes k get src add 50 k
+  end
+  ret CORE_EFF_OK
+end
+
+fn omega_effect_write idx ulong meta view ulong 5 cref view uchar 32 pbytes view uchar 128 to long
+  if ge idx get g_core_obj_cnt 0
+    ret CORE_EFF_ERR_ARG
+  end
+  if ne get g_core_kind idx CORE_KIND_EFFECT
+    ret CORE_EFF_ERR_ARG
+  end
+  ebuf = new uchar 178 0
+  rc = omega_effect_payload_encode meta cref pbytes ebuf
+  if ne rc CORE_EFF_OK
+    ret rc
+  end
+  pb = mul idx CAN_MAX_PAYLOAD
+  for k ulong 178
+    put g_core_pays add pb k get ebuf k
+  end
+  put g_core_pay_len idx CORE_EFF_PAY_LEN
+  ret CORE_EFF_OK
+end
+
+fn omega_effect_read idx ulong meta edit ulong 5 cref edit uchar 32 pbytes edit uchar 128 to long
+  if ge idx get g_core_obj_cnt 0
+    ret CORE_EFF_ERR_ARG
+  end
+  if ne get g_core_kind idx CORE_KIND_EFFECT
+    ret CORE_EFF_ERR_ARG
+  end
+  pl = get g_core_pay_len idx
+  if gt pl CAN_MAX_PAYLOAD
+    ret CORE_EFF_ERR_LEN
+  end
+  ebuf = new uchar 1024 0
+  pb = mul idx CAN_MAX_PAYLOAD
+  for k ulong pl bound 1024
+    put ebuf k get g_core_pays add pb k
+  end
+  ret omega_effect_payload_decode ebuf pl meta cref pbytes
+end
+
+fn core_copy_txt src view uchar * dst edit uchar * cap ulong to ulong
+  n = len src
+  if ge n cap
+    n = sub cap 1
+  end
+  for i ulong n bound 128
+    put dst i get src i
+  end
+  put dst n 0
+  ret n
+end
+
+fn omega_effect_strerror code long dst edit uchar * cap ulong to ulong
+  if eq code CORE_EFF_OK
+    ret core_copy_txt core_es_ok dst cap
+  end
+  if eq code CORE_EFF_ERR_ARG
+    ret core_copy_txt core_es_arg dst cap
+  end
+  if eq code CORE_EFF_ERR_LEN
+    ret core_copy_txt core_es_len dst cap
+  end
+  if eq code CORE_EFF_ERR_V1
+    ret core_copy_txt core_es_v1 dst cap
+  end
+  if eq code CORE_EFF_ERR_RES
+    ret core_copy_txt core_es_res dst cap
+  end
+  if eq code CORE_EFF_ERR_PLEN
+    ret core_copy_txt core_es_plen dst cap
+  end
+  if eq code CORE_EFF_ERR_PAD
+    ret core_copy_txt core_es_pad dst cap
+  end
+  ret core_copy_txt core_es_unk dst cap
+end
+
+fn omega_build_effect res_class ulong op_code ulong cap_slot ulong cap_gen ulong to long
+  idx = omega_graph_add_object CORE_KIND_EFFECT
+  if lt idx 0
+    ret -1
+  end
+  ui = ulong idx
+  meta = new ulong 5 0
+  put meta 0 res_class
+  put meta 1 op_code
+  put meta 2 cap_slot
+  put meta 3 cap_gen
+  put meta 4 0
+  cref = new uchar 32 0
+  pbytes = new uchar 128 0
+  ign = omega_effect_write ui meta cref pbytes
+  if ne core_compute_id ui 0
+    ret -1
+  end
+  ret idx
+end
+
+note --- Pure unsigned binary evaluation (exact 1..64 bit width with 128-bit mul check) ---
+
+fn core_mul128_hi a ulong b ulong to ulong
+  al = and a 0xffffffff
+  ah = shr a 32
+  bl = and b 0xffffffff
+  bh = shr b 32
+  p1 = mul al bh
+  p2 = mul ah bl
+  m = add shr mul al bl 32 and p1 0xffffffff
+  m = add m and p2 0xffffffff
+  hi = add mul ah bh shr p1 32
+  hi = add hi shr p2 32
+  ret add hi shr m 32
+end
+
+fn omega_eval_pure_binary_uint op ulong ov ulong width ulong a_in ulong b_in ulong dst edit ulong 1 to long
+  all1 = ulong 0xffffffffffffffff
+  mask = all1
+  if lt width 64
+    mask = sub shl ulong 1 width 1
+  end
+  a = and a_in mask
+  b = and b_in mask
+  res = ulong 0
+  ovf = false
+  if eq op 3
+    res = add a b
+    if lt res a
+      ovf = true
+    end
+    if ne and res xor mask all1 0
+      ovf = true
+    end
+  else
+    if eq op 4
+      if lt a b
+        ovf = true
+      end
+      res = sub a b
+    else
+      if eq op 5
+        hi = core_mul128_hi a b
+        lo = mul a b
+        if ne hi 0
+          ovf = true
+        end
+        if lt width 64
+          if ne shr lo width 0
+            ovf = true
+          end
+        end
+        res = and lo mask
+      else
+        if eq op 6
+          if eq b 0
+            ret -1
+          end
+          res = div a b
+        else
+          if eq op 7
+            if eq a b
+              put dst 0 1
+            else
+              put dst 0 0
+            end
+            ret 0
+          else
+            if eq op 8
+              if lt a b
+                put dst 0 1
+              else
+                put dst 0 0
+              end
+              ret 0
+            else
+              if eq op 9
+                res = and a b
+              else
+                if eq op 10
+                  res = or a b
+                else
+                  ret -1
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  if ovf
+    if eq ov 3
+      ret -2
+    end
+    if eq ov 2
+      res = mask
+    end
+  end
+  put dst 0 and res mask
+  ret 0
+end
