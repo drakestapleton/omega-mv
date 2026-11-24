@@ -21,7 +21,7 @@
 #                     same scenario runs inside the R13 test-build variant.
 ifndef FABRIC_MK
 FABRIC_MK := 1
-.PHONY: test-fabric test-fabric-living fabric-purity fabric-receipt
+.PHONY: test-fabric test-fab-dispatch test-fabric-living fabric-purity fabric-receipt
 FAB_DIR = $(OUT_DIR)/fabric
 FAB_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc -Isrc/runtime -Isrc/fabric \
 	-DAIEN_TEST_BUILD=1
@@ -55,8 +55,16 @@ $(FAB_DIR)/fabric_test: tests/fabric/fabric_test.om $(FAB_OM_SRCS) $(FAB_OMC)
 	@mkdir -p $(FAB_DIR)
 	(printf 'om2\n'; sed '/^om2$$/d' $(FAB_OM_SRCS) tests/fabric/fabric_test.om) | $(FAB_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-test-fabric: fabric-purity $(FAB_DIR)/fabric_test
+$(FAB_DIR)/test_fab_dispatch: tests/fabric/test_fab_dispatch.om $(FAB_OM_SRCS) src/fabric/fab_dispatch.om $(FAB_OMC)
+	@mkdir -p $(FAB_DIR)
+	(printf 'om2\n'; sed '/^om2$$/d' $(FAB_OM_SRCS) src/fabric/fab_dispatch.om tests/fabric/test_fab_dispatch.om) | $(FAB_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+
+test-fab-dispatch: $(FAB_DIR)/test_fab_dispatch
+	$(abspath $(FAB_DIR)/test_fab_dispatch)
+
+test-fabric: fabric-purity $(FAB_DIR)/fabric_test $(FAB_DIR)/test_fab_dispatch
 	$(abspath $(FAB_DIR)/fabric_test)
+	$(abspath $(FAB_DIR)/test_fab_dispatch)
 
 test-fabric-living: fabric-purity
 	@$(MAKE) --no-print-directory $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) $(RX_SKILLROUTE_OBJ) $(OUT_DIR)/rx_cortex.o $(AIENOS_CAP_LIB)

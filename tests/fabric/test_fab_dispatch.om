@@ -1,0 +1,626 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/fabric/test_fab_dispatch.om -- Pure seeded OM-2 test suite for
+note src/fabric/fab_dispatch.om on top of fab_hmac.om + fab_loopback.om + fabric.om.
+note Exercises all 9 FAB_DX_* refusal/ok codes, pump/tick, lease loss, forgery,
+note wrong machine, digest mismatch, unpinned zero digest, and remote dispatch.
+
+const FD_MS     ulong 1000
+const FD_T0     ulong 1000000
+const FD_LEASE  ulong 500000
+
+const FD_OP_SCALE       ulong 1
+const FD_OP_REMOTE_ONLY ulong 2
+
+const FD_SKILL_LOCAL    ulong 7
+const FD_SKILL_REMOTE   ulong 9
+const FD_SKILL_ONLY     ulong 10
+const FD_SKILL_NULLFN   ulong 11
+const FD_SKILL_FAILING  ulong 12
+const FD_SKILL_ZERO     ulong 13
+const FD_SKILL_MISSING  ulong 14
+
+const CQ_SRC_SKILL      ulong 2
+
+text t_fd_mach  "fl-mach-"
+text t_fd_key   "fl-key-"
+text t_fd_fail  "FAIL fd_check "
+text t_fd_pass  "FAB_DISPATCH_OM_PASS\n"
+text t_fd_bad   "FAB_DISPATCH_OM_FAIL\n"
+text t_fd_sum1  "checks "
+text t_fd_sum2  " failures "
+text t_fd_sum3  " dispatched "
+
+global g_td_checks   ulong 1
+global g_td_failures ulong 1
+global g_td_out      uchar 512
+global g_td_olen     ulong 1
+global g_td_tmpd     uchar 24
+
+note 4 machines: A=0, B=1, X=2 (not enrolled), Z=3 (unregistered on loopback)
+global g_td_mid      uchar 132
+global g_td_key      uchar 128
+global g_td_gen1_msg uchar 372
+global g_td_gen1_len ulong 1
+global g_td_b_es     ulong 6
+
+note ---- Output & check helpers ----
+
+fn td_out_c c uchar to void
+  n = get g_td_olen 0
+  if lt n 512
+    put g_td_out n c
+    put g_td_olen 0 add n 1
+  end
+end
+
+fn td_out_flush fd int to void
+  n = get g_td_olen 0
+  if gt n 0
+    ign = write fd g_td_out 0 n
+    put g_td_olen 0 0
+  end
+end
+
+fn td_out_u v ulong to void
+  if eq v 0
+    td_out_c uchar 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put g_td_tmpd n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+  end
+  while gt n 0 bound 24
+    n = sub n 1
+    td_out_c get g_td_tmpd n
+  end
+end
+
+fn td_chk cond bool cid ulong to void
+  put g_td_checks 0 add get g_td_checks 0 1
+  if not cond
+    put g_td_failures 0 add get g_td_failures 0 1
+    put g_td_olen 0 0
+    for i ulong 14
+      td_out_c get t_fd_fail i
+    end
+    td_out_u cid
+    td_out_c uchar 10
+    td_out_flush 2
+  end
+end
+
+fn td_get_mid idx ulong dst edit uchar 33 to void
+  base = mul idx 33
+  for i ulong 33
+    put dst i get g_td_mid add base i
+  end
+end
+
+fn td_get_key idx ulong dst edit uchar 32 to void
+  base = mul idx 32
+  for i ulong 32
+    put dst i get g_td_key add base i
+  end
+end
+
+fn td_make_dig tag uchar dst edit uchar 32 to void
+  for i ulong 32
+    put dst i uchar 0
+  end
+  if ne tag uchar 0
+    put dst 0 uchar 249
+    put dst 1 uchar 176
+    put dst 2 tag
+  end
+end
+
+note ---- Setup helpers ----
+
+fn td_derive_machines to void
+  root = new uchar 4096 0
+  mid = new uchar 33 0
+  for i ulong 4
+    for j ulong 8
+      put root j get t_fd_mach j
+    end
+    put root 8 uchar add 65 i
+    rc = aien_mid_derive 1 view root 9 edit mid
+    td_chk eq rc 0 10
+    base = mul i 33
+    for j ulong 33
+      put g_td_mid add base j get mid j
+    end
+    for j ulong 7
+      put sh_dat j get t_fd_key j
+    end
+    put sh_dat 7 uchar add 65 i
+    sh_all 8
+    kbase = mul i 32
+    for j ulong 32
+      put g_td_key add kbase j get sh_dig j
+    end
+  end
+end
+
+fn td_init_node nid ulong to void
+  mid = new uchar 33 0
+  key = new uchar 32 0
+  pmid = new uchar 33 0
+  pkey = new uchar 32 0
+  cfg = new ulong 6 0
+  td_get_mid nid edit mid
+  td_get_key nid edit key
+  td_chk eq cq_catalog_init nid view mid CQ_OK 11
+  dom = ulong 21
+  td_chk eq cq_op_define nid FD_OP_SCALE 0 dom CQ_OK 12
+  td_chk eq cq_op_define nid FD_OP_REMOTE_ONLY 0 dom CQ_OK 13
+  td_chk eq fab_hmac_auth_init nid view mid view key 2 FAB_OK 14
+  for p ulong 2
+    td_get_mid p edit pmid
+    td_get_key p edit pkey
+    fab_hmac_auth_set_peer nid p view pmid view pkey
+    fab_node_set_roster nid p view pmid
+  end
+  put cfg 0 2
+  put cfg 1 nid
+  put cfg 2 FD_LEASE
+  put cfg 3 1
+  put cfg 4 0
+  put cfg 5 0
+  td_chk eq fab_node_init nid view mid view cfg FAB_OK 15
+end
+
+fn td_reg_skill nid ulong cap ulong op ulong skill_id ulong gen ulong sdig view uchar 32 to int
+  f = new ulong 21 0
+  put f 0 cap
+  put f 1 add 80 cap
+  put f 2 get g_cq_self_m nid
+  put f 3 skill_id
+  put f 4 1
+  put f 5 op
+  put f 6 CQ_SRC_SKILL
+  put f 7 1
+  put f 8 1
+  put f 9 CQ_LIVE_AVAILABLE
+  put f 10 add 20480 cap
+  put f 11 1
+  put f 12 5
+  put f 20 gen
+  td_chk eq cq_register_arr nid view f view sdig CQ_OK 20
+  ret cq_lookup nid cap add 80 cap get g_cq_self_m nid skill_id
+end
+
+fn td_pump_b now_us ulong to void
+  cont = int 1
+  while ne cont 0 bound 64
+    if ne fab_poll 1 now_us 1
+      cont = int 0
+    end
+  end
+end
+
+fn td_deliver_a msg view uchar * now_us ulong to int
+  mid_a = new uchar 33 0
+  td_get_mid 0 edit mid_a
+  td_chk eq fab_loop_inject view mid_a view msg FAB_OK 25
+  td_chk eq fab_poll 0 now_us 1 26
+  ret get g_fv_code 0
+end
+
+note ---- Test 1: init, destroy, add, capacity limits ----
+
+fn test_init_and_add to void
+  mid_a = new uchar 33 0
+  mid_b = new uchar 33 0
+  td_get_mid 0 edit mid_a
+  td_get_mid 1 edit mid_b
+
+  td_chk eq fab_dispatch_init 4 0 FAB_E_ARG 100
+  td_chk eq fab_dispatch_init 0 4 FAB_E_ARG 101
+  td_chk eq fab_dispatch_init 0 3 FAB_E_ARG 102
+  td_chk eq fab_dispatch_init 0 0 FAB_OK 103
+  td_chk eq fab_dispatch_add 0 view mid_a FAB_E_ARG 104
+  td_chk eq fab_dispatch_add 0 view mid_b FAB_OK 105
+  td_chk eq fab_dispatch_add 0 view mid_b FAB_E_ARG 106
+end
+
+fn test_capacity_and_destroy to void
+  td_chk eq fab_dispatch_init 1 0 FAB_OK 107
+  m = new uchar 33 0
+  root = new uchar 4096 0
+  for i ulong 9
+    put root 0 uchar 120
+    put root 1 uchar add 48 i
+    ign = aien_mid_derive 1 view root 2 edit m
+    rc = fab_dispatch_add 1 view m
+    if lt i 8
+      td_chk eq rc FAB_OK 108
+    else
+      td_chk eq rc FAB_E_FULL 109
+    end
+  end
+  fab_dispatch_destroy 1
+
+  rt = new ulong 12 0
+  sdig = new uchar 32 0
+  td_chk eq fab_dispatch_run 1 view rt view m view sdig 5 FD_T0 FAB_DX_ARG 110
+  td_chk eq fab_dispatch_pump 1 FD_T0 FAB_E_ARG 111
+end
+
+note ---- Test 2: B joins & advertises, happy remote dispatch (FAB_DX_OK) ----
+
+fn td_setup_b_skills to void
+  mid_b = new uchar 33 0
+  dig = new uchar 32 0
+  td_get_mid 1 edit mid_b
+  gen1 = fab_entry_generation 1 1
+
+  td_make_dig uchar 1 edit dig
+  es = td_reg_skill 1 2 FD_OP_SCALE FD_SKILL_REMOTE gen1 view dig
+  td_chk ge es 0 200
+  put g_td_b_es 0 ulong es
+  td_chk eq fab_dispatch_set_skill 0 view mid_b FD_SKILL_REMOTE FAB_PROC_SCALE_OK view dig FAB_OK 206
+
+  td_make_dig uchar 2 edit dig
+  es = td_reg_skill 1 3 FD_OP_REMOTE_ONLY FD_SKILL_ONLY gen1 view dig
+  td_chk ge es 0 201
+  put g_td_b_es 1 ulong es
+  td_chk eq fab_dispatch_set_skill 0 view mid_b FD_SKILL_ONLY FAB_PROC_ADD_10 view dig FAB_OK 207
+
+  td_make_dig uchar 3 edit dig
+  es = td_reg_skill 1 4 FD_OP_SCALE FD_SKILL_NULLFN gen1 view dig
+  td_chk ge es 0 202
+  put g_td_b_es 2 ulong es
+  td_chk eq fab_dispatch_set_skill 0 view mid_b FD_SKILL_NULLFN FAB_PROC_NONE view dig FAB_OK 208
+
+  td_make_dig uchar 4 edit dig
+  es = td_reg_skill 1 5 FD_OP_SCALE FD_SKILL_FAILING gen1 view dig
+  td_chk ge es 0 203
+  put g_td_b_es 3 ulong es
+  td_chk eq fab_dispatch_set_skill 0 view mid_b FD_SKILL_FAILING FAB_PROC_FAIL view dig FAB_OK 209
+
+  td_make_dig uchar 0 edit dig
+  es = td_reg_skill 1 6 FD_OP_SCALE FD_SKILL_ZERO gen1 view dig
+  td_chk ge es 0 204
+  put g_td_b_es 4 ulong es
+  td_chk eq fab_dispatch_set_skill 0 view mid_b FD_SKILL_ZERO FAB_PROC_SCALE_OK view dig FAB_OK 210
+
+  td_make_dig uchar 1 edit dig
+  es = td_reg_skill 1 7 FD_OP_SCALE FD_SKILL_MISSING gen1 view dig
+  td_chk ge es 0 205
+  put g_td_b_es 5 ulong es
+end
+
+fn test_happy_dispatch to void
+  td_setup_b_skills
+  mid_b = new uchar 33 0
+  td_get_mid 1 edit mid_b
+
+  td_chk eq fab_join 0 FD_LEASE FD_T0 FAB_OK 211
+  td_chk eq fab_join 1 FD_LEASE FD_T0 FAB_OK 212
+  td_pump_b FD_T0
+  td_chk ge fab_dispatch_pump 0 FD_T0 1 213
+
+  for i ulong 6
+    td_chk eq fab_advertise 1 get g_td_b_es i CQ_WIRE_ADVERTISE FD_T0 FAB_OK 214
+  end
+  td_chk eq fab_dispatch_pump 0 FD_T0 6 220
+  td_chk eq get g_fd_ref_msgs 0 0 221
+  td_chk eq fab_member_live 0 view mid_b FD_T0 1 222
+
+  bm = cq_m_find 0 view mid_b
+  td_chk gt bm 0 223
+  a_es = cq_lookup 0 2 82 bm FD_SKILL_REMOTE
+  td_chk ge a_es 0 224
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 225
+  t1 = add FD_T0 mul 10 FD_MS
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_OK 226
+  td_chk eq get g_fd_result 0 16 227
+  td_chk eq get g_fd_dispatched 0 1 228
+
+  a_es2 = cq_lookup 0 3 83 bm FD_SKILL_ONLY
+  td_chk ge a_es2 0 229
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es2 3 edit rt edit rt_t edit rt_d SR_OK 230
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 7 t1 FAB_DX_OK 231
+  td_chk eq get g_fd_result 0 17 232
+  td_chk eq get g_fd_dispatched 0 2 233
+end
+
+note ---- Test 3: All refusal codes ----
+
+fn test_refusal_codes_a to void
+  mid_b = new uchar 33 0
+  td_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  t1 = add FD_T0 mul 15 FD_MS
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+
+  note 3a: FAB_DX_ARG (router graph != node catalog)
+  a_es = cq_lookup 0 2 82 bm FD_SKILL_REMOTE
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 300
+  put rt 0 1
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_ARG 301
+  td_chk eq get g_fd_last_ref 0 FAB_DX_ARG 302
+  td_chk eq get g_fd_refused ulong FAB_DX_ARG 1 303
+
+  note 3b: FAB_DX_TARGET (route has target_known = 0)
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es 1 edit rt edit rt_t edit rt_d SR_OK 304
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_TARGET 305
+  td_chk eq get g_fd_last_ref 0 FAB_DX_TARGET 306
+  td_chk eq get g_fd_refused ulong FAB_DX_TARGET 1 307
+
+  note 3c: FAB_DX_NOT_MEMBER (route targets local self machine)
+  td_make_dig uchar 9 edit rt_d
+  loc_es = td_reg_skill 0 1 FD_OP_SCALE FD_SKILL_LOCAL 1 view rt_d
+  td_chk ge loc_es 0 308
+  td_chk eq fab_dispatch_route_from_slot 0 ulong loc_es 3 edit rt edit rt_t edit rt_d SR_OK 309
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_NOT_MEMBER 310
+  td_chk eq get g_fd_last_ref 0 FAB_DX_NOT_MEMBER 311
+  td_chk eq get g_fd_refused ulong FAB_DX_NOT_MEMBER 1 312
+
+  note 3d: FAB_DX_NO_EXECUTOR (missing skill id and null proc_id)
+  es_miss = cq_lookup 0 7 87 bm FD_SKILL_MISSING
+  td_chk ge es_miss 0 313
+  td_chk eq fab_dispatch_route_from_slot 0 ulong es_miss 3 edit rt edit rt_t edit rt_d SR_OK 314
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_NO_EXECUTOR 315
+  es_null = cq_lookup 0 4 84 bm FD_SKILL_NULLFN
+  td_chk ge es_null 0 316
+  td_chk eq fab_dispatch_route_from_slot 0 ulong es_null 3 edit rt edit rt_t edit rt_d SR_OK 317
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_NO_EXECUTOR 318
+  td_chk eq get g_fd_refused ulong FAB_DX_NO_EXECUTOR 2 319
+end
+
+fn test_refusal_codes_b to void
+  mid_b = new uchar 33 0
+  td_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  t1 = add FD_T0 mul 15 FD_MS
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+
+  note 3e: FAB_DX_DIGEST (1-bit mismatch on executor digest, AND unpinned all-zero digest)
+  a_es = cq_lookup 0 2 82 bm FD_SKILL_REMOTE
+  td_make_dig uchar 1 edit rt_d
+  put rt_d 31 uchar 1
+  td_chk eq fab_dispatch_set_skill 0 view mid_b FD_SKILL_REMOTE FAB_PROC_SCALE_OK view rt_d FAB_OK 320
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 321
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_DIGEST 322
+  td_make_dig uchar 1 edit rt_d
+  td_chk eq fab_dispatch_set_skill 0 view mid_b FD_SKILL_REMOTE FAB_PROC_SCALE_OK view rt_d FAB_OK 323
+
+  es_zero = cq_lookup 0 6 86 bm FD_SKILL_ZERO
+  td_chk ge es_zero 0 324
+  td_chk eq fab_dispatch_route_from_slot 0 ulong es_zero 3 edit rt edit rt_t edit rt_d SR_OK 325
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_DIGEST 326
+  td_chk eq get g_fd_refused ulong FAB_DX_DIGEST 2 327
+
+  note 3f: FAB_DX_FAILED (executor procedure sets failed=1)
+  es_fail = cq_lookup 0 5 85 bm FD_SKILL_FAILING
+  td_chk ge es_fail 0 328
+  td_chk eq fab_dispatch_route_from_slot 0 ulong es_fail 3 edit rt edit rt_t edit rt_d SR_OK 329
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_FAILED 330
+  td_chk eq get g_fd_last_ref 0 FAB_DX_FAILED 331
+  td_chk eq get g_fd_refused ulong FAB_DX_FAILED 1 332
+
+  note 3g: FAB_DX_ROUTE (retargeted route to X)
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 333
+  td_get_mid 2 edit rt_t
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t1 FAB_DX_ROUTE 334
+  td_chk eq get g_fd_last_ref 0 FAB_DX_ROUTE 335
+end
+
+note ---- Test 4: FAB_DX_TRANSPORT (node not registered on loopback) ----
+
+fn test_transport_refusal to void
+  mid_z = new uchar 33 0
+  td_get_mid 3 edit mid_z
+  cfg = new ulong 6 0
+  td_chk eq cq_catalog_init 3 view mid_z CQ_OK 400
+  put cfg 0 0
+  put cfg 1 0
+  put cfg 2 FD_LEASE
+  put cfg 3 1
+  put cfg 4 0
+  put cfg 5 0
+  td_chk eq fab_node_init 3 view mid_z view cfg FAB_OK 401
+  td_chk eq fab_dispatch_init 3 3 FAB_OK 402
+  rt = new ulong 12 0
+  put rt 0 3
+  sdig = new uchar 32 0
+  td_chk eq fab_dispatch_run 3 view rt view mid_z view sdig 5 FD_T0 FAB_DX_TRANSPORT 403
+  td_chk eq get g_fd_last_ref 3 FAB_DX_TRANSPORT 404
+  td_chk eq get g_fd_refused add mul 3 FAB_DX_N ulong FAB_DX_TRANSPORT 1 405
+  fab_dispatch_destroy 3
+end
+
+note ---- Test 5: Forgery & wrong machine ----
+
+fn test_forged_ads to void
+  mid_a = new uchar 33 0
+  key_x = new uchar 32 0
+  td_get_mid 0 edit mid_a
+  td_get_key 2 edit key_x
+  t1 = add FD_T0 mul 20 FD_MS
+
+  rec = new uchar 188 0
+  msg = new uchar 372 0
+  sig = new uchar 64 0
+  b_es = cq_lookup 1 2 82 get g_cq_self_m 1 FD_SKILL_REMOTE
+  td_chk ge b_es 0 500
+  td_chk eq cq_wire_encode 1 ulong b_es CQ_WIRE_ADVERTISE edit rec CQ_OK 501
+  mlen = fab_seal add ulong 16 FAB_MSG_ADVERTISE view mid_a part rec 0 188 t1 edit msg
+  td_chk eq mlen int 372 502
+  ign = fab_hmac_sig64 view key_x part msg 0 308 edit sig
+  for i ulong 64
+    put msg add 308 i get sig i
+  end
+  td_chk eq td_deliver_a part msg 0 372 t1 FAB_E_AUTH 503
+
+  td_chk eq fab_advertise 1 ulong b_es CQ_WIRE_ADVERTISE t1 FAB_OK 504
+  td_get_mid 1 edit mid_a
+  got = fab_loop_peek 0 view mid_a FAB_MSG_ADVERTISE edit msg
+  td_chk eq got 372 505
+  put g_td_gen1_len 0 got
+  for i ulong 372
+    put g_td_gen1_msg i get msg i
+  end
+  put g_fl_box_count 0 0
+  put msg 264 uchar xor ulong get msg 264 127
+  td_chk eq td_deliver_a part msg 0 372 t1 FAB_E_AUTH 506
+end
+
+fn test_wrong_machine to void
+  mid_dst = new uchar 33 0
+  rec = new uchar 188 0
+  msg = new uchar 372 0
+  dig_x = new uchar 32 0
+  t1 = add FD_T0 mul 20 FD_MS
+
+  td_get_mid 2 edit mid_dst
+  td_chk eq cq_catalog_init 2 view mid_dst CQ_OK 507
+  td_chk eq cq_op_define 2 FD_OP_SCALE 0 21 CQ_OK 508
+  td_make_dig uchar 99 edit dig_x
+  x_es = td_reg_skill 2 4 FD_OP_SCALE 19 1 view dig_x
+  td_chk ge x_es 0 509
+  td_chk eq cq_wire_encode 2 ulong x_es CQ_WIRE_ADVERTISE edit rec CQ_OK 510
+  td_get_mid 0 edit mid_dst
+  mlen = fab_seal add ulong 16 FAB_MSG_ADVERTISE view mid_dst part rec 0 188 t1 edit msg
+  td_chk eq mlen int 372 511
+  td_chk eq td_deliver_a part msg 0 372 t1 FAB_E_MISMATCH 512
+
+  rbody = new uchar 8 0
+  fab_put_u64 part rbody 0 8 0 FD_LEASE
+  td_get_mid 2 edit mid_dst
+  mlen = fab_seal add ulong 16 FAB_MSG_RENEW view mid_dst part rbody 0 8 t1 edit msg
+  td_chk eq mlen int 192 513
+  td_chk eq td_deliver_a part msg 0 192 t1 FAB_E_MISMATCH 514
+end
+
+note ---- Test 6-8: Mid-run LEAVE, gen-2 rejoin + replay, lease loss ----
+
+fn test_leave_and_rejoin to void
+  mid_b = new uchar 33 0
+  td_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  a_es = cq_lookup 0 2 82 bm FD_SKILL_REMOTE
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 600
+  t2 = add FD_T0 mul 30 FD_MS
+  td_chk eq fab_leave 1 t2 FAB_OK 601
+  ref0 = get g_fd_refused ulong FAB_DX_ROUTE
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 9 t2 FAB_DX_ROUTE 602
+  td_chk eq get g_fd_refused ulong FAB_DX_ROUTE add ref0 1 603
+  td_chk eq fab_member_live 0 view mid_b t2 0 604
+
+  t3 = add FD_T0 mul 40 FD_MS
+  td_chk eq fab_node_set_generation 1 2 FAB_OK 605
+  td_make_dig uchar 1 edit rt_d
+  gen2 = fab_entry_generation 1 1
+  b_es = td_reg_skill 1 2 FD_OP_SCALE FD_SKILL_REMOTE gen2 view rt_d
+  td_chk ge b_es 0 606
+  put g_td_b_es 0 ulong b_es
+  td_chk eq fab_join 1 FD_LEASE t3 FAB_OK 607
+  td_chk ge fab_dispatch_pump 0 t3 1 608
+  td_chk eq fab_advertise 1 ulong b_es CQ_WIRE_ADVERTISE t3 FAB_OK 609
+  td_chk eq fab_dispatch_pump 0 t3 1 610
+  td_chk eq fab_member_live 0 view mid_b t3 1 611
+end
+
+fn test_replay_and_lease_loss to void
+  t3 = add FD_T0 mul 40 FD_MS
+  replay = new uchar 372 0
+  for i ulong 372
+    put replay i get g_td_gen1_msg i
+  end
+  mid_a = new uchar 33 0
+  td_get_mid 0 edit mid_a
+  rm0 = get g_fd_ref_msgs 0
+  td_chk eq fab_loop_inject view mid_a part replay 0 372 FAB_OK 612
+  td_chk eq fab_dispatch_pump 0 t3 1 613
+  td_chk eq get g_fv_code 0 FAB_E_STALE_GEN 614
+  td_chk eq get g_fd_ref_msgs 0 add rm0 1 615
+
+  td_get_mid 1 edit mid_a
+  bm = cq_m_find 0 view mid_a
+  a_es = cq_lookup 0 2 82 bm FD_SKILL_REMOTE
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+  td_chk eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 616
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 10 t3 FAB_DX_OK 617
+  td_chk eq get g_fd_result 0 31 618
+
+  t4 = add add t3 FD_LEASE 1
+  td_chk eq fab_dispatch_run 0 view rt view rt_t view rt_d 11 t4 FAB_DX_ROUTE 619
+  td_chk eq fab_member_live 0 view mid_a t4 0 620
+  midx = fab_member_find 0 view mid_a
+  td_chk ge midx 0 621
+  td_chk eq get g_fm_state ulong midx FAB_ST_LOST 622
+
+  td_chk eq fab_advertise 1 get g_td_b_es 0 CQ_WIRE_ADVERTISE t4 FAB_OK 623
+  td_chk eq fab_dispatch_pump 0 t4 1 624
+  td_chk eq get g_fv_code 0 FAB_E_LEASE_EXPIRED 625
+end
+
+fn main to int
+  td_derive_machines
+  fab_loop_init
+  mid = new uchar 33 0
+  for i ulong 3
+    td_get_mid i edit mid
+    td_chk eq fab_loop_add view mid FAB_OK 1
+  end
+  td_init_node 0
+  td_init_node 1
+
+  test_init_and_add
+  test_capacity_and_destroy
+  test_happy_dispatch
+  test_refusal_codes_a
+  test_refusal_codes_b
+  test_transport_refusal
+  test_forged_ads
+  test_wrong_machine
+  test_leave_and_rejoin
+  test_replay_and_lease_loss
+
+  fab_dispatch_destroy 0
+
+  put g_td_olen 0 0
+  for i ulong 7
+    td_out_c get t_fd_sum1 i
+  end
+  td_out_u get g_td_checks 0
+  for i ulong 10
+    td_out_c get t_fd_sum2 i
+  end
+  td_out_u get g_td_failures 0
+  for i ulong 12
+    td_out_c get t_fd_sum3 i
+  end
+  td_out_u get g_fd_dispatched 0
+  td_out_c uchar 10
+  td_out_flush 1
+
+  if eq get g_td_failures 0 0
+    ign = write 1 t_fd_pass 0 21
+    ret 0
+  end
+  ign = write 1 t_fd_bad 0 21
+  ret 1
+end

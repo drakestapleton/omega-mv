@@ -1,0 +1,480 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/fabric/fab_dispatch.om -- Fabric F5-0 simulated-machine dispatcher.
+note Pure seeded OM-2 port of src/fabric/fab_dispatch.c (test and simulation only).
+note Composed after seed/ng/sha256.om, src/runtime/aien_machine_id.om,
+note src/fabric/fab_hmac.om, src/fabric/fab_loopback.om, and src/fabric/fabric.om.
+
+const FAB_DISPATCH_MAX   ulong 8
+const FAB_DX_MAX_SKILLS  ulong 16
+
+note Refusal reasons (FabDispatch.refused[...], last_refusal)
+const FAB_DX_OK          int 0
+const FAB_DX_ARG         int 1
+const FAB_DX_ROUTE       int 2
+const FAB_DX_TARGET      int 3
+const FAB_DX_NOT_MEMBER  int 4
+const FAB_DX_NO_EXECUTOR int 5
+const FAB_DX_DIGEST      int 6
+const FAB_DX_FAILED      int 7
+const FAB_DX_TRANSPORT   int 8
+const FAB_DX_N           ulong 9
+
+note Skill Router revalidation verdicts (matching src/runtime/rx_skillroute.h)
+const SR_OK              int 0
+const SR_E_ARG           int -40
+const SR_E_NO_CANDIDATE  int -41
+const SR_E_REMOTE        int -42
+const SR_E_STALE         int -45
+const SR_E_WITHDRAWN     int -46
+const SR_E_UNAVAILABLE   int -47
+const SR_E_MACHINE       int -48
+
+note Route verdict encodings in rt_u64[1]
+const FAB_RT_VERDICT_OK     ulong 1
+const FAB_RT_VERDICT_REMOTE ulong 2
+
+note Simulated executor procedure ids (0 = unbound / null fn)
+const FAB_PROC_NONE      ulong 0
+const FAB_PROC_SCALE_OK  ulong 1
+const FAB_PROC_SCALE_BAD ulong 2
+const FAB_PROC_FAIL      ulong 3
+const FAB_PROC_ADD_10    ulong 4
+
+note ---- Dispatcher state (up to 4 dispatchers: did 0..3) ----
+global g_fd_init       int   4
+global g_fd_nid        ulong 4
+global g_fd_n_exec     ulong 4
+global g_fd_ex_mid     uchar 1056
+global g_fd_ex_nsk     ulong 32
+global g_fd_sk_id      ulong 512
+global g_fd_sk_proc    ulong 512
+global g_fd_sk_dig     uchar 16384
+global g_fd_dispatched ulong 4
+global g_fd_refused    ulong 36
+global g_fd_last_ref   int   4
+global g_fd_polled     ulong 4
+global g_fd_ref_msgs   ulong 4
+global g_fd_result     ulong 4
+
+note ---- Helpers ----
+
+fn fab_dx_digest_nonzero_eq a view uchar 32 b view uchar 32 to ulong
+  any = ulong 0
+  diff = ulong 0
+  for i ulong 32
+    ai = ulong get a i
+    bi = ulong get b i
+    any = or any bi
+    diff = or diff xor ai bi
+  end
+  if eq any 0
+    ret 0
+  end
+  if ne diff 0
+    ret 0
+  end
+  ret 1
+end
+
+fn fab_dx_refuse did ulong why int to int
+  idx = add mul did FAB_DX_N ulong why
+  put g_fd_refused idx add get g_fd_refused idx 1
+  put g_fd_last_ref did why
+  ret why
+end
+
+fn fab_dx_ex_mid_eq ex_slot ulong mid view uchar 33 to int
+  base = add mul ex_slot 33 1
+  for j ulong 32
+    if ne get g_fd_ex_mid add base j get mid add 1 j
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fab_dx_ex_find did ulong mid view uchar 33 to int
+  ne_cnt = get g_fd_n_exec did
+  for i ulong ne_cnt bound 8
+    ex_slot = add mul did 8 i
+    if ne fab_dx_ex_mid_eq ex_slot view mid 0
+      ret int i
+    end
+  end
+  ret int -1
+end
+
+fn fab_dx_sk_find ex_slot ulong skill_id ulong to int
+  nsk = get g_fd_ex_nsk ex_slot
+  for i ulong nsk bound 16
+    sk_slot = add mul ex_slot 16 i
+    if eq get g_fd_sk_id sk_slot skill_id
+      ret int i
+    end
+  end
+  ret int -1
+end
+
+fn fab_dx_exec_proc proc_id ulong inp ulong failed_out edit int 1 to ulong
+  put failed_out 0 0
+  if eq proc_id FAB_PROC_SCALE_OK
+    ret add mul inp 3 1
+  end
+  if eq proc_id FAB_PROC_SCALE_BAD
+    ret add mul inp 3 3
+  end
+  if eq proc_id FAB_PROC_ADD_10
+    ret add inp 10
+  end
+  put failed_out 0 1
+  ret 0
+end
+
+note ---- Route revalidation (sr_route_check parity) ----
+
+fn fab_sr_lease_live nid ulong mach_id ulong now_us ulong to int
+  if eq mach_id get g_cq_self_m nid
+    ret 1
+  end
+  if eq mach_id 0
+    ret 0
+  end
+  if gt mach_id get g_cq_m_n nid
+    ret 0
+  end
+  slot = add mul nid 8 sub mach_id 1
+  if gt get g_cq_m_lease slot now_us
+    ret 1
+  end
+  ret 0
+end
+
+fn fab_sr_check_fields gslot ulong rt_u64 view ulong 12 rt_sdig view uchar 32 to int
+  ebase = mul gslot 22
+  if ne get g_cq_e_u64 add ebase 20 get rt_u64 8
+    ret SR_E_STALE
+  end
+  if ne get g_cq_e_u64 add ebase 4 get rt_u64 9
+    ret SR_E_STALE
+  end
+  if ne get g_cq_e_u64 add ebase 3 get rt_u64 7
+    ret SR_E_STALE
+  end
+  if ne get g_cq_e_u64 add ebase 10 get rt_u64 10
+    ret SR_E_STALE
+  end
+  if ne get g_cq_e_u64 add ebase 11 get rt_u64 11
+    ret SR_E_STALE
+  end
+  dbase = mul gslot 32
+  for i ulong 32
+    if ne get g_cq_e_sdig add dbase i get rt_sdig i
+      ret SR_E_STALE
+    end
+  end
+  ret SR_OK
+end
+
+fn fab_sr_route_check nid ulong rt_u64 view ulong 12 rt_target view uchar 33 rt_sdig view uchar 32 now_us ulong to int
+  if ge nid 4
+    ret SR_E_ARG
+  end
+  verd = get rt_u64 1
+  if and ne verd FAB_RT_VERDICT_OK ne verd FAB_RT_VERDICT_REMOTE
+    ret SR_E_ARG
+  end
+  es = cq_lookup nid get rt_u64 4 get rt_u64 5 get rt_u64 6 get rt_u64 7
+  if lt es 0
+    ret SR_E_WITHDRAWN
+  end
+  gslot = add mul nid 64 ulong es
+  ebase = mul gslot 22
+  live = get g_cq_e_u64 add ebase 9
+  if eq live CQ_LIVE_WITHDRAWN
+    ret SR_E_WITHDRAWN
+  end
+  if ne live CQ_LIVE_AVAILABLE
+    ret SR_E_UNAVAILABLE
+  end
+  if ne fab_sr_check_fields gslot view rt_u64 view rt_sdig SR_OK
+    ret SR_E_STALE
+  end
+  mach_id = get g_cq_e_u64 add ebase 2
+  m = new uchar 33 0
+  if ne cq_machine_identity nid mach_id edit m CQ_OK
+    ret SR_E_MACHINE
+  end
+  if ne get rt_u64 3 0
+    if eq aien_mid_equal view m view rt_target 0
+      ret SR_E_MACHINE
+    end
+  end
+  if eq fab_sr_lease_live nid mach_id now_us 0
+    ret SR_E_MACHINE
+  end
+  if ne get rt_u64 2 0
+    ret SR_E_REMOTE
+  end
+  if ne mach_id get g_cq_self_m nid
+    ret SR_E_MACHINE
+  end
+  ret SR_OK
+end
+
+note Helper: construct a route tuple from catalog entry slot `eslot` of node `nid`.
+note flags: bit 0 = remote, bit 1 = target_known.
+fn fab_dispatch_route_from_slot nid ulong eslot ulong flags ulong rt_u64 edit ulong 12 rt_target edit uchar 33 rt_sdig edit uchar 32 to int
+  if or ge nid 4 ge eslot 64
+    ret SR_E_ARG
+  end
+  gslot = add mul nid 64 eslot
+  ebase = mul gslot 22
+  if eq get g_cq_e_u64 add ebase 21 0
+    ret SR_E_WITHDRAWN
+  end
+  is_rem = and flags 1
+  tknown = and shr flags 1 1
+  put rt_u64 0 nid
+  if ne is_rem 0
+    put rt_u64 1 FAB_RT_VERDICT_REMOTE
+  else
+    put rt_u64 1 FAB_RT_VERDICT_OK
+  end
+  put rt_u64 2 is_rem
+  put rt_u64 3 tknown
+  put rt_u64 4 get g_cq_e_u64 ebase
+  put rt_u64 5 get g_cq_e_u64 add ebase 1
+  put rt_u64 6 get g_cq_e_u64 add ebase 2
+  put rt_u64 7 get g_cq_e_u64 add ebase 3
+  put rt_u64 8 get g_cq_e_u64 add ebase 20
+  put rt_u64 9 get g_cq_e_u64 add ebase 4
+  put rt_u64 10 get g_cq_e_u64 add ebase 10
+  put rt_u64 11 get g_cq_e_u64 add ebase 11
+  dbase = mul gslot 32
+  for i ulong 32
+    put rt_sdig i get g_cq_e_sdig add dbase i
+  end
+  mach_id = get g_cq_e_u64 add ebase 2
+  if ne cq_machine_identity nid mach_id edit rt_target CQ_OK
+    for i ulong 33
+      put rt_target i uchar 0
+    end
+  end
+  ret SR_OK
+end
+
+note ---- Public Dispatcher API (fab_dispatch.h parity) ----
+
+fn fab_dispatch_init did ulong nid ulong to int
+  if or ge did 4 ge nid 4
+    ret FAB_E_ARG
+  end
+  if eq get g_cq_self_m nid 0
+    ret FAB_E_ARG
+  end
+  put g_fd_init did 0
+  put g_fd_nid did nid
+  put g_fd_n_exec did 0
+  put g_fd_dispatched did 0
+  put g_fd_last_ref did FAB_DX_OK
+  put g_fd_polled did 0
+  put g_fd_ref_msgs did 0
+  for i ulong FAB_DX_N
+    put g_fd_refused add mul did FAB_DX_N i 0
+  end
+  for i ulong FAB_DISPATCH_MAX
+    ex_slot = add mul did 8 i
+    put g_fd_ex_nsk ex_slot 0
+  end
+  put g_fd_init did 1
+  ret FAB_OK
+end
+
+fn fab_dispatch_destroy did ulong to void
+  if ge did 4
+    ret
+  end
+  put g_fd_init did 0
+end
+
+fn fab_dispatch_add did ulong mid view uchar 33 to int
+  if ge did 4
+    ret FAB_E_ARG
+  end
+  if eq get g_fd_init did 0
+    ret FAB_E_ARG
+  end
+  nid = get g_fd_nid did
+  smid = new uchar 33 0
+  fab_node_self nid edit smid
+  if ne aien_mid_equal view mid view smid 0
+    ret FAB_E_ARG
+  end
+  ne_cnt = get g_fd_n_exec did
+  if ge ne_cnt FAB_DISPATCH_MAX
+    ret FAB_E_FULL
+  end
+  if ge fab_dx_ex_find did view mid 0
+    ret FAB_E_ARG
+  end
+  ex_slot = add mul did 8 ne_cnt
+  base = mul ex_slot 33
+  for i ulong 33
+    put g_fd_ex_mid add base i get mid i
+  end
+  put g_fd_ex_nsk ex_slot 0
+  put g_fd_n_exec did add ne_cnt 1
+  ret FAB_OK
+end
+
+note Register or update a simulated skill on an already-added remote machine.
+fn fab_dispatch_set_skill did ulong mid view uchar 33 skill_id ulong proc_id ulong dig view uchar 32 to int
+  if ge did 4
+    ret FAB_E_ARG
+  end
+  if eq get g_fd_init did 0
+    ret FAB_E_ARG
+  end
+  eidx = fab_dx_ex_find did view mid
+  if lt eidx 0
+    ret FAB_E_ARG
+  end
+  ex_slot = add mul did 8 ulong eidx
+  sidx = fab_dx_sk_find ex_slot skill_id
+  sk_i = ulong 0
+  if ge sidx 0
+    sk_i = ulong sidx
+  else
+    nsk = get g_fd_ex_nsk ex_slot
+    if ge nsk FAB_DX_MAX_SKILLS
+      ret FAB_E_FULL
+    end
+    sk_i = nsk
+    put g_fd_ex_nsk ex_slot add nsk 1
+  end
+  sk_slot = add mul ex_slot 16 sk_i
+  put g_fd_sk_id sk_slot skill_id
+  put g_fd_sk_proc sk_slot proc_id
+  dbase = mul sk_slot 32
+  for i ulong 32
+    put g_fd_sk_dig add dbase i get dig i
+  end
+  ret FAB_OK
+end
+
+fn fab_dispatch_pump did ulong now_us ulong to int
+  if ge did 4
+    ret FAB_E_ARG
+  end
+  if eq get g_fd_init did 0
+    ret FAB_E_ARG
+  end
+  nid = get g_fd_nid did
+  n = int 0
+  cont = int 1
+  while ne cont 0 bound 256
+    rc = fab_poll nid now_us
+    if lt rc 0
+      ret rc
+    end
+    if eq rc 0
+      cont = int 0
+    else
+      n = add n 1
+      put g_fd_polled did add get g_fd_polled did 1
+      if ne get g_fv_code 0 FAB_OK
+        put g_fd_ref_msgs did add get g_fd_ref_msgs did 1
+      end
+    end
+  end
+  ign = fab_tick nid now_us
+  ret n
+end
+
+fn fab_dx_check_slot_digest sk_slot ulong rt_sdig view uchar 32 to ulong
+  dbase = mul sk_slot 32
+  any = ulong 0
+  diff = ulong 0
+  for i ulong 32
+    ai = ulong get g_fd_sk_dig add dbase i
+    bi = ulong get rt_sdig i
+    any = or any bi
+    diff = or diff xor ai bi
+  end
+  if eq any 0
+    ret 0
+  end
+  if ne diff 0
+    ret 0
+  end
+  ret 1
+end
+
+fn fab_dx_is_remote_member nid ulong rt_target view uchar 33 now_us ulong to int
+  loc = new ulong 1 0
+  mslot_b = new uchar 32 0
+  hrc = fab_home nid view rt_target now_us edit loc edit mslot_b
+  if ne hrc FAB_OK
+    ret 0
+  end
+  if ne get loc 0 JS_HOME_REMOTE_OWNED
+    ret 0
+  end
+  ret 1
+end
+
+fn fab_dx_run_exec did ulong rt_target view uchar 33 skill_id ulong rt_sdig view uchar 32 inp ulong to int
+  eidx = fab_dx_ex_find did view rt_target
+  if lt eidx 0
+    ret fab_dx_refuse did FAB_DX_NO_EXECUTOR
+  end
+  ex_slot = add mul did 8 ulong eidx
+  sidx = fab_dx_sk_find ex_slot skill_id
+  if lt sidx 0
+    ret fab_dx_refuse did FAB_DX_NO_EXECUTOR
+  end
+  sk_slot = add mul ex_slot 16 ulong sidx
+  proc_id = get g_fd_sk_proc sk_slot
+  if eq proc_id FAB_PROC_NONE
+    ret fab_dx_refuse did FAB_DX_NO_EXECUTOR
+  end
+  if eq fab_dx_check_slot_digest sk_slot view rt_sdig 0
+    ret fab_dx_refuse did FAB_DX_DIGEST
+  end
+  failed = new int 1 0
+  r = fab_dx_exec_proc proc_id inp edit failed
+  if ne get failed 0 0
+    ret fab_dx_refuse did FAB_DX_FAILED
+  end
+  put g_fd_result did r
+  put g_fd_dispatched did add get g_fd_dispatched did 1
+  ret FAB_DX_OK
+end
+
+fn fab_dispatch_run did ulong rt_u64 view ulong 12 rt_target view uchar 33 rt_sdig view uchar 32 inp ulong now_us ulong to int
+  if ge did 4
+    ret FAB_DX_ARG
+  end
+  if eq get g_fd_init did 0
+    ret FAB_DX_ARG
+  end
+  nid = get g_fd_nid did
+  if ne get rt_u64 0 nid
+    ret fab_dx_refuse did FAB_DX_ARG
+  end
+  if lt fab_dispatch_pump did now_us 0
+    ret fab_dx_refuse did FAB_DX_TRANSPORT
+  end
+  if ne fab_sr_route_check nid view rt_u64 view rt_target view rt_sdig now_us SR_E_REMOTE
+    ret fab_dx_refuse did FAB_DX_ROUTE
+  end
+  if eq get rt_u64 3 0
+    ret fab_dx_refuse did FAB_DX_TARGET
+  end
+  if eq fab_dx_is_remote_member nid view rt_target now_us 0
+    ret fab_dx_refuse did FAB_DX_NOT_MEMBER
+  end
+  ret fab_dx_run_exec did view rt_target get rt_u64 7 view rt_sdig inp
+end
