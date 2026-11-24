@@ -481,7 +481,7 @@ uint32_t omega2_rx_pj_summarize(uint64_t *result, const uint64_t *o_w, uint64_t 
 uint32_t omega2_rx_pj_section_of(uint64_t *result, uint64_t o_protect, uint64_t o_cls, uint64_t o_treatment, uint64_t o_temporal);
 /* export fn rx_pj_form_of treatment ulong to ulong */
 uint32_t omega2_rx_pj_form_of(uint64_t *result, uint64_t o_treatment);
-#define OMEGA2_IDENT_rx_capq_core "omega-ident 1 unit=rx_capq_core abi=2 profile=OM-2 src=6f0014d66caae68532b9f1bb11a445089a87e94abc7b68c1c9956fec17c3c953 omc=28fca13d44054e26f78c33d1753fd5c005d08e9144d95985c90bd75b60885072"
+#define OMEGA2_IDENT_rx_capq_core "omega-ident 1 unit=rx_capq_core abi=2 profile=OM-2 src=a3c2ad124e977f6c03c61ef5c0a220d7a16efa873da00435a557b628c23c64f4 omc=28fca13d44054e26f78c33d1753fd5c005d08e9144d95985c90bd75b60885072"
 const char *omega2_ident_rx_capq_core(void);
 /* export fn rx_cq_key_hash cap_id ulong real_id ulong mach_id ulong skill_id ulong to ulong */
 uint32_t omega2_rx_cq_key_hash(uint64_t *result, uint64_t o_cap_id, uint64_t o_real_id, uint64_t o_mach_id, uint64_t o_skill_id);
