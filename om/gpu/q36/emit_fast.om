@@ -3735,9 +3735,22 @@ note Args: X[2048] (R0:1), eout[9,2048] (R2:3), wts[9] (R4:5), next_norm[2048] (
 note Grid: (1, 1, 1), Block: 256 (8 warps, 8 elems/thread), SMEM: 64.
 note Eliminates 40 inter-layer RMSNorm launches + 40 WFIs + 40 round-trips of X!
 note =========================================================================
-fn qMoeCombine9RmsFast to void
+fn qMoeCombine9RmsBody useWtbl bool to void
 qStart 5
 qParam 20 40
+if useWtbl
+qParam 21 44
+qMad 22 21 2 QZ
+qicImm 9 16 22 6 4 qW1
+qic 11 24 16 QZ 0 qLd
+qLit 23 1
+qIadd 22 22 23
+qicImm 9 16 22 6 4 qW1
+qic 11 25 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qicImm 8 6 24 QZ 1 qAlu1
+qicImm 8 7 25 QZ 1 qAlu4
+end
 for e ulong 9
 qLit 52 e
 qicImm 9 16 52 4 4 qW1
@@ -3807,6 +3820,531 @@ qicImm 9 16 24 8 4 qAlu4
 qic 12 QZ 16 53 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
+end
+
+fn qMoeCombine9RmsFast to void
+qMoeCombine9RmsBody false
+end
+
+fn qMoeCombine9RmsWtbl to void
+qMoeCombine9RmsBody true
+end
+
+note =========================================================================
+note G (32): wtbl_patch -- GPU-side 64-bit indirect pointer patcher (zero CPU hops!)
+note Args: wtbl[64] u64 (R0:1), src_ptrs[N] u64 (R2:3), sel_ptr[1] u32 (R4:5), dst_slot (24).
+note Grid: (1, 1, 1), Block: 32, SMEM: 0.
+note =========================================================================
+fn qWtblPatch to void
+qStart 3
+qParam 20 24
+qLit 57 1
+qic 28 QZ 14 57 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qLit 21 0
+qicImm 9 16 21 4 4 qW1
+qic 11 22 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 23 22 2 QZ
+qicImm 9 16 23 2 4 qW1
+qic 11 24 16 QZ 0 qLd
+qIadd 23 23 57
+qicImm 9 16 23 2 4 qW1
+qic 11 25 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 26 20 2 QZ
+qicImm 9 16 26 0 4 qAlu4
+qic 12 QZ 16 24 0 qSt
+qIadd 26 26 57
+qicImm 9 16 26 0 4 qAlu4
+qic 12 QZ 16 25 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note H (33): fastw_fold -- Mutable fast-weight rank-8 forward fold: k = A@x / sqrt(2048), x += B@k
+note Args: x[2048] (R0:1), A[8,2048] (R2:3), B[2048,8] (R4:5), diag[16] (R6:7).
+note Grid: (1, 1, 1), Block: 256, SMEM: 64.
+note =========================================================================
+fn qFastWFold to void
+qStart 4
+for k ulong 8
+qLit 24 mul k 256
+qIadd 24 24 14
+qicImm 9 16 24 0 4 qW1
+qic 11 add 40 k 16 QZ 0 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 57 1
+qNum 58 0.0220970869f32
+for r ulong 8
+qNum 48 0.0f32
+for k ulong 8
+qLit 24 add mul r 2048 mul k 256
+qIadd 24 24 14
+qicImm 9 16 24 2 4 qW1
+qic 11 49 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic4 33 48 49 add 40 k 48 qAlu4
+end
+qWarpRedSum 48 54 16
+bFw = qBssy
+qic 28 QZ 52 57 0 qCmp
+skFw = qBraFwd 1
+qMad 55 53 4 QZ
+qic 50 QZ 55 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skFw 1
+qBsync bFw
+qBar
+qNum 48 0.0f32
+for w ulong 8
+qLit 55 mul w 4
+qic 49 54 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 54 0 qAlu4
+end
+qic 32 add 30 r 48 58 0 qAlu4
+bStK = qBssy
+qic 28 QZ 14 57 0 qCmp
+skStK = qBraFwd 1
+qLit 24 add 2 r
+qicImm 9 16 24 6 4 qAlu4
+qic 12 QZ 16 add 30 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skStK 1
+qBsync bStK
+qBar
+end
+for k ulong 8
+qLit 24 mul k 256
+qIadd 24 24 14
+qMad 25 24 8 QZ
+qNum 48 0.0f32
+for r ulong 8
+qLit 26 r
+qIadd 26 25 26
+qicImm 9 16 26 4 4 qW1
+qic 11 49 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic4 33 48 49 add 30 r 48 qAlu4
+end
+qic 30 48 add 40 k 48 0 qAlu4
+qicImm 9 16 24 0 4 qAlu4
+qic 12 QZ 16 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+note =========================================================================
+note I (34): fastw_update_alarm -- Bounded delta-rule B_{t+1} = (1-lam)*B + eta*(v - B@k)*k^T
+note   + exact Frobenius norm^2 (diag[0]) & NaN alarm flag (diag[1]) with NO hard clamps!
+note Args: v[2048] (R0:1), B[2048,8] (R2:3), diag[16] (R4:5).
+note Grid: (1, 1, 1), Block: 256, SMEM: 64.
+note =========================================================================
+fn qFastWUpdateAlarm to void
+qStart 3
+for r ulong 8
+qLit 24 add 2 r
+qicImm 9 16 24 4 4 qW1
+qic 11 add 30 r 16 QZ 0 qLd
+end
+qLit 24 10
+qicImm 9 16 24 4 4 qW1
+qic 11 28 16 QZ 0 qLd
+qLit 24 11
+qicImm 9 16 24 4 4 qW1
+qic 11 29 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qNum 48 0.0f32
+qNum 49 0.0f32
+qNum 58 1.0f32
+for j ulong 8
+qLit 24 mul j 256
+qIadd 24 24 14
+qicImm 9 16 24 0 4 qW1
+qic 11 20 16 QZ 0 qLd
+qMad 25 24 8 QZ
+for r ulong 8
+qLit 26 r
+qIadd 26 25 26
+qicImm 9 16 26 2 4 qW1
+qic 11 add 50 r 16 QZ 0 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+qNum 21 0.0f32
+for r ulong 8
+qic4 33 21 add 50 r add 30 r 21 qAlu4
+end
+qic 31 22 20 21 0 qAlu4
+qic 32 22 22 29 0 qAlu4
+for r ulong 8
+qic 32 23 add 50 r 28 0 qAlu4
+qic4 33 23 22 add 30 r 23 qAlu4
+qLit 26 r
+qIadd 26 25 26
+qicImm 9 16 26 2 4 qAlu4
+qic 12 QZ 16 23 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qic4 33 48 23 23 48 qAlu4
+qic 18 26 23 QZ 0x7fffffff qAlu4
+qLit 27 0x7f800001
+qic 28 QZ 26 27 0 qCmp
+put q36Guard 0 1
+qic 30 49 49 58 0 qAlu4
+end
+end
+qWarpRedSum 48 54 16
+qWarpRedSum 49 54 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 57 1
+bN = qBssy
+qic 28 QZ 52 57 0 qCmp
+skN = qBraFwd 1
+qMad 55 53 4 QZ
+qic 50 QZ 55 48 0 qSt
+qLit 56 32
+qIadd 55 55 56
+qic 50 QZ 55 49 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skN 1
+qBsync bN
+qBar
+bW0 = qBssy
+qic 28 QZ 14 57 0 qCmp
+skW0 = qBraFwd 1
+qNum 48 0.0f32
+qNum 49 0.0f32
+for w ulong 8
+qLit 55 mul w 4
+qic 49 54 55 QZ 0 qLd
+qLit 56 add 32 mul w 4
+qic 49 55 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 54 0 qAlu4
+qic 30 49 49 55 0 qAlu4
+end
+qLit 24 0
+qicImm 9 16 24 4 4 qAlu4
+qic 12 QZ 16 48 0 qSt
+qLit 24 1
+qicImm 9 16 24 4 4 qAlu4
+qic 12 QZ 16 49 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skW0 1
+qBsync bW0
+end
+
+note =========================================================================
+note J (35): fa_prep_kv_int8 -- Per-head k_norm + partial RoPE + symmetric INT8 128K KV append
+note   Slab layout (130 MiB/layer vs 512 MiB FP32 = 3.94x lighter!):
+note     K_i8 (+0, 64 MiB), V_i8 (+67108864, 64 MiB), K_sc (+134217728, 1 MiB), V_sc (+135266304, 1 MiB)
+note Args: K_in[2,256] (R0:1), V_in[2,256] (R2:3), k_norm[256] (R4:5),
+note       rope[131072,64] (R6:7), kv_slab (R8:9), pos_ptr[1] (R10:11).
+note Grid: (2, 1, 1), Block: 256, SMEM: 1088.
+note =========================================================================
+fn qFaQuantPack4 valReg ulong isV ulong to void
+note Compute per-head max_abs across 256 threads -> R48
+qic 18 48 valReg QZ 0x7fffffff qAlu4
+qWarpBflyMax 48 52
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 55 1024
+qLit 57 1
+bMx = qBssy
+qic 28 QZ 52 57 0 qCmp
+skMx = qBraFwd 1
+qMad 53 53 4 55
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skMx 1
+qBsync bMx
+qBar
+qNum 48 0.000001f32
+for w ulong 8
+qLit 56 add 1024 mul w 4
+qic 49 49 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 37 48 48 49 0 qAlu4
+end
+note scale = max_abs / 127.0 -> R49, inv = 127.0 / max_abs -> R50
+qNum 50 127.0f32
+qic 40 49 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 50 50 49 0 qAlu4
+qNum 51 0.00787401575f32
+qic 32 49 48 51 0 qAlu4
+note q = clamp(val * inv + 128.5, 1.0, 255.0) -> u32 in R51
+qNum 52 128.5f32
+qic4 33 51 valReg 50 52 qAlu4
+qNum 52 1.0f32
+qNum 53 255.0f32
+qic 37 51 51 52 0 qAlu4
+qic 36 51 51 53 0 qAlu4
+qic 39 51 51 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 18 51 51 QZ 255 qAlu4
+note Pack 4 consecutive lanes into 1 u32 in lane (d & 3) == 0 via SHFL.BFLY
+qic 60 52 51 QZ 1 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qMad 51 52 256 51
+qic 60 52 51 QZ 2 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qMad 51 52 65536 51
+note Store packed u32 by (d & 3) == 0 at base + (pos*128 + kh*64 + (d>>2))*4
+qic 18 53 14 QZ 3 qAlu4
+bSt4 = qBssy
+qic 28 QZ 53 57 0 qCmp
+skSt4 = qBraFwd 1
+qic 17 54 14 QZ 2 qAlu4
+qMad 55 20 128 QZ
+qMad 55 15 64 55
+qIadd 55 55 54
+if eq isV 1
+qLit 56 16777216
+qIadd 55 55 56
+end
+qicImm 9 16 55 8 4 qAlu4
+qic 12 QZ 16 51 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSt4 1
+qBsync bSt4
+note Store scale by d == 0 at base + (scOff + pos*2 + kh)*4
+bStS = qBssy
+qic 28 QZ 14 57 0 qCmp
+skStS = qBraFwd 1
+qMad 55 20 2 15
+if eq isV 1
+qLit 56 33816576
+else
+qLit 56 33554432
+end
+qIadd 55 55 56
+qicImm 9 16 55 8 4 qAlu4
+qic 12 QZ 16 49 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skStS 1
+qBsync bStS
+end
+
+fn qFaPrepKvInt8 to void
+qStart 6
+qLit 52 0
+qicImm 9 16 52 10 4 qW1
+qic 11 20 16 QZ 0 qLd
+qMad 24 15 256 14
+qicImm 9 16 24 0 4 qW1
+qic 11 21 16 QZ 0 qLd
+qicImm 9 16 24 2 4 qW1
+qic 11 22 16 QZ 0 qLd
+qicImm 9 16 14 4 4 qW1
+qic 11 23 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 48 21 21 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 55 1024
+qLit 57 1
+bKw = qBssy
+qic 28 QZ 52 57 0 qCmp
+skKw = qBraFwd 1
+qMad 53 53 4 55
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skKw 1
+qBsync bKw
+qBar
+qNum 48 0.0f32
+for w ulong 8
+qLit 56 add 1024 mul w 4
+qic 49 49 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 49 0 qAlu4
+end
+qNum 49 0.00390625f32
+qNum 50 0.000001f32
+qic4 33 48 48 49 50 qAlu4
+qic 41 49 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qNum 50 1.0f32
+qic 30 23 23 50 0 qAlu4
+qic 32 21 21 49 0 qAlu4
+qic 32 21 21 23 0 qAlu4
+qMad 53 14 4 QZ
+qic 50 QZ 53 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qLit 57 64
+bRp = qBssy
+qic 28 QZ 14 57 0 qCmp
+skRp = qBraFwd 1
+qic 18 25 14 QZ 31 qAlu4
+qMad 26 20 64 25
+qicImm 9 16 26 6 4 qW1
+qic 11 27 16 QZ 0 qLd
+qLit 52 32
+qIadd 28 26 52
+qicImm 9 16 28 6 4 qW1
+qic 11 29 16 QZ 0 qLd
+qMad 53 25 4 QZ
+qic 49 30 53 QZ 0 qLd
+qIadd 54 25 52
+qMad 54 54 4 QZ
+qic 49 31 54 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 32 30 27 0 qAlu4
+qic 32 33 31 29 0 qAlu4
+qic 31 32 32 33 0 qAlu4
+qic 32 34 31 27 0 qAlu4
+qic4 33 34 30 29 34 qAlu4
+qic 28 QZ 14 52 0 qCmp
+qicImm 8 21 32 QZ 1 qAlu4
+put q36Guard 0 1
+qicImm 8 21 34 QZ 1 qAlu4
+qPatch skRp 1
+qBsync bRp
+qFaQuantPack4 21 0
+qBar
+qFaQuantPack4 22 1
+end
+
+note =========================================================================
+note K (36): fa_attend_split_int8 -- Split-K INT8 dequantized GQA attention (4x lighter KV!)
+note Args: Q_rot[16,256] (R0:1), kv_slab (R2:3), O_part[16,8,256] (R4:5),
+note       ml_part[16,8,2] (R6:7), pos_ptr[1] (R8:9).
+note Grid: (16, 8, 1), Block: 32, SMEM: 0.
+note =========================================================================
+fn qUnpack4U8ToF32 srcReg ulong dst0 ulong neg128Reg ulong to void
+qic 18 dst0 srcReg QZ 255 qAlu1
+qic 17 add dst0 1 srcReg QZ 8 qAlu1
+qic 17 add dst0 2 srcReg QZ 16 qAlu1
+qic 17 add dst0 3 srcReg QZ 24 qAlu4
+qic 18 add dst0 1 add dst0 1 QZ 255 qAlu1
+qic 18 add dst0 2 add dst0 2 QZ 255 qAlu1
+qic 18 add dst0 3 add dst0 3 QZ 255 qAlu4
+qic 38 dst0 dst0 QZ 0 qAlu1
+qic 38 add dst0 1 add dst0 1 QZ 0 qAlu1
+qic 38 add dst0 2 add dst0 2 QZ 0 qAlu1
+qic 38 add dst0 3 add dst0 3 QZ 0 qAlu4
+qic 30 dst0 dst0 neg128Reg 0 qAlu1
+qic 30 add dst0 1 add dst0 1 neg128Reg 0 qAlu1
+qic 30 add dst0 2 add dst0 2 neg128Reg 0 qAlu1
+qic 30 add dst0 3 add dst0 3 neg128Reg 0 qAlu4
+end
+
+fn qFaAttendSplitInt8 to void
+qStart 5
+qic 17 12 15 QZ 3 qAlu4
+qLit 52 0
+qicImm 9 16 52 8 4 qW1
+qic 11 13 16 QZ 0 qLd
+qMad 52 15 256 QZ
+qMad 52 14 8 52
+qicImm 9 16 52 0 4 qW1
+qic 57 20 16 QZ 0 qLd
+qic 57 24 16 QZ 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+note Preserve kv_slab (R2:3 -> R10:11) and O_part (R4:5 -> R8:9) before loop uses R0..R5
+qicImm 8 10 2 QZ 1 qAlu1
+qicImm 8 11 3 QZ 1 qAlu1
+qicImm 8 8 4 QZ 1 qAlu1
+qicImm 8 9 5 QZ 1 qAlu4
+qLit 52 1
+qIadd 13 13 52
+for j ulong 8
+qNum add 28 j 0.0f32
+end
+qNum 36 -1000000000.0f32
+qNum 37 0.0f32
+qNum 38 1.4426950408889634f32
+qNum 39 -128.0f32
+qicImm 8 0 18 QZ 1 qAlu4
+qLit 1 8
+bSkip = qBssy
+qic 28 QZ 0 13 0 qCmp
+skSkip = qBraFwd 1
+mTok = get q36Pc 0
+note Load K_i8 (2 u32 -> R40:41), V_i8 (2 u32 -> R42:43), K_sc (R44), V_sc (R45) via R10:11
+qMad 54 0 128 QZ
+qMad 54 12 64 54
+qMad 54 14 2 54
+qicImm 9 16 54 10 4 qW1
+qic 56 40 16 QZ 0 qLd
+qLit 55 16777216
+qIadd 54 54 55
+qicImm 9 16 54 10 4 qW1
+qic 56 42 16 QZ 0 qLd
+qMad 54 0 2 12
+qLit 55 33554432
+qIadd 54 54 55
+qicImm 9 16 54 10 4 qW1
+qic 11 44 16 QZ 0 qLd
+qLit 55 262144
+qIadd 54 54 55
+qicImm 9 16 54 10 4 qW1
+qic 11 45 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+note Unpack K_i8 (R40 -> R48..51, R41 -> R52..55) and dot with Q[0..7] (R20..27)
+qUnpack4U8ToF32 40 48 39
+qUnpack4U8ToF32 41 52 39
+qic 32 2 20 48 0 qAlu4
+for j ulong 7
+qic4 33 2 add 21 j add 49 j 2 qAlu4
+end
+qWarpBflySum 2 3
+qic 32 2 2 44 0 qAlu4
+qic 37 3 36 2 0 qAlu4
+qic 31 4 36 3 0 qAlu4
+qExp 4 4 38
+qic 31 5 2 3 0 qAlu4
+qExp 5 5 38
+qic 32 37 37 4 0 qAlu4
+qic 30 37 37 5 0 qAlu4
+qicImm 8 36 3 QZ 1 qAlu4
+for j ulong 7
+qic 32 add 28 j add 28 j 4 0 qAlu1
+end
+qic 32 35 35 4 0 qAlu4
+qic 32 5 5 45 0 qAlu4
+qUnpack4U8ToF32 42 48 39
+qUnpack4U8ToF32 43 52 39
+for j ulong 7
+qic4 33 add 28 j 5 add 48 j add 28 j qAlu1
+end
+qic4 33 35 5 55 35 qAlu4
+qIadd 0 0 1
+qic 28 QZ 0 13 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mTok get q36Pc 0 qAlu4
+qPatch skSkip 1
+qBsync bSkip
+qMad 52 15 8 18
+qMad 53 52 256 QZ
+qMad 53 14 8 53
+for j ulong 8
+qLit 54 j
+qIadd 54 53 54
+qicImm 9 16 54 8 4 qAlu4
+qic 12 QZ 16 add 28 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+qLit 57 1
+qic 28 QZ 14 57 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qMad 53 52 2 QZ
+qicImm 9 16 53 6 4 qAlu4
+qic 12 QZ 16 36 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 53 53 57
+qicImm 9 16 53 6 4 qAlu4
+qic 12 QZ 16 37 0 qSt
+qic 0 QZ QZ QZ 0 qW1
 end
 
 note =========================================================================
@@ -4169,6 +4707,30 @@ ret true
 end
 if eq mode 131
 qGdnStepRealBf16Packed
+ret true
+end
+if eq mode 132
+qWtblPatch
+ret true
+end
+if eq mode 133
+qMoeCombine9RmsWtbl
+ret true
+end
+if eq mode 134
+qFastWFold
+ret true
+end
+if eq mode 135
+qFastWUpdateAlarm
+ret true
+end
+if eq mode 136
+qFaPrepKvInt8
+ret true
+end
+if eq mode 137
+qFaAttendSplitInt8
 ret true
 end
 ret false

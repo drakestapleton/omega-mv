@@ -51,6 +51,15 @@ text qpMsgSpecParOk ") PARITY=EXACT steps="
 text qpMsgSpecParBad ") PARITY=MISMATCH steps="
 text qpMsgSpecAcc " acc_x100="
 text qpMsgSpecSpd " speedup_x100="
+text qpMsgP2Hdr "\n=== PHASE 2 EXIT GATE: QDI_WTBL + QDI_FASTW 1000-SOAK + 128K INT8 KV ===\n"
+text qpMsgP2WtblOk "WTBL_GATE: PASS (identity_tok="
+text qpMsgP2WtblNeg " negctrl_tok="
+text qpMsgP2WtblBad "WTBL_GATE: FAIL (identity_tok="
+text qpMsgP2FwOk "FASTW_1000_SOAK: PASS norm_sq_x100="
+text qpMsgP2FwNeg " negctrl_alarm_tripped="
+text qpMsgP2FwBad "FASTW_1000_SOAK: FAIL\n"
+text qpMsgP2KvOk "KV_INT8_128K: PASS (1.30 GB slabs, pos=131071 tok="
+text qpMsgP2KvBad "KV_INT8_128K: FAIL\n"
 
 fn qdPreEmitKernels to void
 for ki ulong 17
@@ -904,6 +913,181 @@ ok2 = qdSpecBenchVerify genN M n1Avg
 if or not ok1 not ok2
 ret 22
 end
+ret 0
+end
+
+note =========================================================================
+note Phase 2 Exit Gate: QDI_WTBL + QDI_FASTW 1000-soak + 128K INT8 KV
+note =========================================================================
+fn qdP2SetU64 off ulong val ulong to void
+wm = get qdWork 0
+r0 = mapset wm off 4 ulong gblo val
+r1 = mapset wm add off 4 4 ulong gbhi val
+end
+
+fn qdP2TestWtbl to bool
+note Source table: [0] = real QDI_FNORM, [1] = perturbed QDI_AB (negative control)
+qdP2SetU64 qdO QDI_WTBL_SRC qdW QDI_FNORM
+qdP2SetU64 add qdO QDI_WTBL_SRC 8 qdW QDI_AB
+note Fill perturbed norm buffer (QDI_ROPE) with -2.0f32 so (1 + w) = -1.0f32 flips all logits!
+for i ulong 2048
+qdPutF32Io mul i 4 -2.0f32
+end
+r0 = mapwrite get qdWork 0 qdO QDI_ROPE qdIoBuf 0 8192
+qdP2SetU64 add qdO QDI_WTBL_SRC 8 qdW QDI_ROPE
+note Run identity control (sel = 0 -> real QDI_FNORM)
+r1 = mapset get qdWork 0 qdO QDI_WTBL_SEL 4 0
+tokId = qdSpecPrefill17 false
+note Flip ONLY QDI_WTBL_SEL = 1 on GPU (ZERO packet re-recording!) -> negative control
+r2 = mapset get qdWork 0 qdO QDI_WTBL_SEL 4 1
+tokNeg = qdSpecPrefill17 false
+r3 = mapset get qdWork 0 qdO QDI_WTBL_SEL 4 0
+ok = and ne tokId 999999 and ne tokNeg 999999 ne tokId tokNeg
+if ok
+qdPrint qpMsgP2WtblOk
+else
+qdPrint qpMsgP2WtblBad
+end
+qdPrintU tokId
+qdPrint qpMsgP2WtblNeg
+qdPrintU tokNeg
+qdPrint qdMsgRp
+ret ok
+end
+
+fn qdP2InitFastW to void
+note Initialize A[8, 2048] deterministically with non-zero projection onto x so k_t = A@x/sqrt(2048) != 0
+for i ulong 16384
+v = f32 0.1f32
+if eq rem i 3 1
+v = f32 -0.02f32
+end
+qdPutF32Io mul i 4 v
+end
+r0 = mapwrite get qdWork 0 qdO QDI_FASTW qdIoBuf 0 65536
+for i ulong 65536
+put qdIoBuf i 0
+end
+r1 = mapwrite get qdWork 0 add qdO QDI_FASTW 65536 qdIoBuf 0 65536
+note Seed bounded activation template in QDI_Y (0.5f32) so each of 1,000 soak steps gets fresh x_t
+for i ulong 2048
+qdPutF32Io mul i 4 0.5f32
+end
+r2 = mapwrite get qdWork 0 qdO QDI_Y qdIoBuf 0 8192
+end
+
+fn qdP2SetFastWHypers oneMinusLam f32 eta f32 to void
+wm = get qdWork 0
+dOff = qdO QDI_FASTW_DIAG
+r0 = mapset wm add dOff 40 4 ulong bitcast uint oneMinusLam
+r1 = mapset wm add dOff 44 4 ulong bitcast uint eta
+end
+
+fn qdP2RunFastWStep to bool
+qdPktStart
+qdPtr qdW QDI_X
+qdPtr qdW QDI_FASTW
+qdPtr add qdW QDI_FASTW 65536
+qdPtr qdW QDI_FASTW_DIAG
+if not qdPktEmitGy 51 1 1 256
+ret false
+end
+qdPtr qdW QDI_X
+qdPtr add qdW QDI_FASTW 65536
+qdPtr qdW QDI_FASTW_DIAG
+if not qdPktEmitGy 52 1 1 256
+ret false
+end
+ret qdPktRun
+end
+
+fn qdP2TestFastWSoak to bool
+qdP2InitFastW
+qdP2SetFastWHypers 0.99f32 0.001f32
+note Record 1-step fresh-x + fold + delta-update packet once into slot 5 and replay 1,000 times!
+qdPktStart
+if not qdEmitCopyU32 qdW QDI_Y qdW QDI_X 8192
+ret false
+end
+qdPtr qdW QDI_X
+qdPtr qdW QDI_FASTW
+qdPtr add qdW QDI_FASTW 65536
+qdPtr qdW QDI_FASTW_DIAG
+if not qdPktEmitGy 51 1 1 256
+ret false
+end
+qdPtr qdW QDI_Y
+qdPtr add qdW QDI_FASTW 65536
+qdPtr qdW QDI_FASTW_DIAG
+if not qdPktEmitGy 52 1 1 256
+ret false
+end
+if not qdPktFinish 5
+ret false
+end
+ok = true
+normSq = f32 0.0f32
+for st ulong 1000
+if not qdReplayPre 5
+qdPrint qpMsgP2FwBad
+ret false
+end
+if eq rem st 100 99
+if ne mapread get qdWork 0 qdO QDI_FASTW_DIAG qdIoBuf 0 8 8
+qdPrint qpMsgP2FwBad
+ret false
+end
+normSq = qdGetF32Io 0
+nanFlg = qdGetF32Io 4
+if or ne nanFlg 0.0f32 or ne normSq normSq gt normSq 10000.0f32
+ok = false
+end
+end
+end
+note Negative-control alarm test: inject unstable eta=1e20f32 -> alarm MUST trip!
+qdP2SetFastWHypers 0.99f32 1.0e20f32
+tripped = ulong 0
+for st ulong 4
+if qdReplayPre 5
+if eq mapread get qdWork 0 qdO QDI_FASTW_DIAG qdIoBuf 0 8 8
+ns2 = qdGetF32Io 0
+nf2 = qdGetF32Io 4
+if or ne nf2 0.0f32 or ne ns2 ns2 gt ns2 10000.0f32
+tripped = ulong 1
+end
+end
+end
+end
+if and ok eq tripped 1
+qdPrint qpMsgP2FwOk
+qdPrintU ulong mul normSq 100.0f32
+qdPrint qpMsgP2FwNeg
+qdPrintU tripped
+qdPrint qdMsgNl
+ret true
+end
+qdPrint qpMsgP2FwBad
+ret false
+end
+
+fn qdRunPhase2Gate to int
+qdPrint qpMsgP2Hdr
+if not qdP2TestWtbl
+ret 31
+end
+if not qdP2TestFastWSoak
+ret 32
+end
+note Test 3: 128K INT8 KV boundary check at pos = 131071
+qdResetState
+edgeTok = qdForwardToken 271 131071 true false
+if eq edgeTok 999999
+qdPrint qpMsgP2KvBad
+ret 33
+end
+qdPrint qpMsgP2KvOk
+qdPrintU edgeTok
+qdPrint qdMsgRp
 ret 0
 end
 
