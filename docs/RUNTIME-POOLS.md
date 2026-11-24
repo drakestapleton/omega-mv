@@ -102,7 +102,8 @@ The sites (omc.om at 3537baad; line numbers approximate, they move with each lan
 | the struct-argument reader (14549; `if lt k 6 fail 7` lets 10 through) | error 7 for kind 10 |
 | `vs_arr` (6889, the read/write array path; `ge k 6` gives 7) | kind-10 test first: `read`/`write` take a pool |
 | `harray`, `basearg` (6201), `vs_chk`, `vs_call` | `read`/`write`: slot loaded after every operand (below); any other host word: error 7 |
-| `xhb` (16455), `xelem` (18614, 18695), x86 and x86efi targets | error 25 |
+| `xhb` (16455), x86efi target | error 25 |
+| `xelem` / `xepool`, `pl_len`, `vs_chk` / `xio`, `s_enlarge` / `xenlarge` under `target x86linux` (since 2026-11-23) | the same rules as AArch64: slot read after every operand, LEA + MOV + CMP + JAE trap 3, `enlarge` inline with mmap 9 / mremap 25; gate-pools.sh section X |
 | contract folding (OMEGESE 12, "Purity, proofs and failure") | `len` of a pool is never constant: `requires eq len P 0` is checked at run time and reported `kept rule=runtime` in om2 diag, never `erased rule=constant-true` |
 | unroll and inline folding, check elimination (om2 spec 4) | a pool index is never constant-checked |
 | IR mode (`ir_*`) | error 9 |
@@ -308,7 +309,8 @@ holds a pool; the ng lane (NgNoCaps2) chooses between a pinned pre-pool omc.om a
    result (expected: killed, 137), so the documented behaviour cannot drift.
 9. **Untouched pages (S1).** A pool enlarged to 2 GiB with one page touched shows VmRSS of about one page
    (`/proc/self/status`).
-10. **Refusals (S4).** Function mode (9), IR mode (9), `target x86linux` (25), passing or slicing a pool
+10. **Refusals (S4).** Function mode (9), IR mode (9), `target x86efi` (25; `target x86linux` compiles pools
+    since 2026-11-23, section X), passing or slicing a pool
     (19), `enlarge` not as a whole assignment (9), `enlarge` on a sized global, a local or a view (7), a
     `bool` pool (9), n not ulong or r not long (7), a pool given to a device or mapping word (7).
 11. **Byte identity.** Every tracked `.om` that compiled before compiles to the same bytes, except the

@@ -201,6 +201,22 @@ Rules:
 
 Seeded-Omega SPIR-V and Intel Xe GPU units: `gpu/spirv/` holds the pure-Omega SPIR-V emitter (`emit.om`), validator (`val.om`), compute executor (`run.om`), bit-exact 0-ulp reference/checker with SHA-256 (`conform.om`), and `omega-run.sh` / `check.sh` (replacing Vulkan/lavapipe, external `spirv-val`, and Python OpenCL/Level Zero runners). `gpu/intel/` holds the pure-Omega Intel Xe2/Xe3 (Panther Lake) direct `drm/xe` backend (`xe/requests.tsv`, `records.om`, `batch.om`, `isa.om`, `plan.om`, `launch.om`, and `gate.sh`). `gpu/hw/` holds `hwman`, the hardware capability manifest (`gpu/hw/*.om` with `gpu/hw/manifest.tsv`).
 
+## `gpu/kernels/`
+
+The model-kernel registry of the `omega` package (docs/OMEGA-PACKAGE.md "Kernels"): `registry.tsv` maps (op, shape, target) to how `omega kernels` builds the kernel with this repository's own emitters and how it checks it, and `models/*.ops` lists the ops of a model.
+
+- only tables; a row names files that exist in the tree and a BUILD/CHECK kind that `tools/omega/kernels.om` implements
+- a GPU row's check is a host check; device execution stays NOT_RUN until that device has a receipt
+- an op a device cannot get has no row for that target: `select` names the skip, it never borrows another target's row
+
+## `tools/omega/` and `bin/`
+
+The `omega` package: `bin/omega` (the one shell file, choosing lib/<cpu> by `uname -m`), the seeded-Omega command (`driver.om`, `kernels.om`, `main.om`, `arch-<cpu>.om`), its builder (`build.om` with `package.tsv`) and its gate (`gate.sh`).
+
+- every program in the package is seeded Omega compiled by the pinned `seed/out/omc`; `bin/omega` only picks a directory
+- `package.tsv` lists every program and shared file; the builder records every hash in MANIFEST.tsv
+- a kernel enters the cache only after its check passed, under a key that covers the compiler and every file the build reads
+
 ## `native/`
 
 Handwritten .om units of omega-mv that are not part of the seed ladder: the ORIG-4 shadow advisor (native/orig4).

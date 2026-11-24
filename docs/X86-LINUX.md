@@ -9,6 +9,34 @@ at `7bce2a4fddc43268ac2af09cddc4a5a67d78312d`; the historical backend is
 execution evidence. The dated baseline below is immutable history; resumed
 qualification records supersede it only for their exact source/tool pins.
 
+## The x86-64 compiler (2026-11-23)
+
+`seed/omc/omc.om` compiles itself for x86-64: `cat si/directives/target-x86linux.om seed/omc/omc.om |
+seed/out/omc` is a static x86-64 ELF compiler. omc's own arena is a run-time pool (`global a_ar ulong *`),
+so this needed run-time pools on x86linux (OMEGESE 9.15): `xepool` (slot read after the operands, LEA, MOV,
+CMP, JAE trap 3), `pl_len`, the pool path of `vs_chk` / `xio`, and `xenlarge` (inline mmap 9 / mremap 25).
+An x86 element access of a global now loads the global's address into RDX at the access (`xbase`, ea_b
+254) instead of holding it in an operand slot, so an OM-2 unit that the AArch64 path compiles with pinned
+globals keeps the same operand budget on x86 (the Visor console needed it). Every byte is emitted by the
+handwritten `x*` emitters, each instruction with its Intel SDM volume 2 form in the source notes.
+
+Measured on Linux AArch64 (Lima VM) with the x86-64 programs under qemu-x86_64 (EMULATED; no physical
+x86-64 run is recorded):
+
+- `seed/out/omc` 6d8ed6ed15c05a0bb41df3aac19dacdf979a422f73d714bdde552a9032cf1f82, born from
+  `seed/rung0/seed0.hex` (`sh seed/omega-from-seed.sh` with no prebuilt compiler) and reproduced bit for
+  bit from the independent Strand B seed (`sh seed/helix/helix-from-seeds.sh`).
+- The x86-64 compiler rebuilds itself byte for byte, and from `seed/omc/omc.om` builds `seed/out/omc` byte
+  for byte (`seed/omc/gate-pools.sh` section X); every pool case gives its `.want` on x86, and the mutants
+  x86cmp (no bounds check) and x86base (base not stored after mremap) are caught.
+- An independent decoder (Apple LLVM 17 `objdump`, through `seed/omc/qualify-x86.py`'s `disassemble`)
+  accounts for every byte of the x86-64 compiler: a 512-byte header, the instructions, and the literal
+  islands the code branches around, with no undecoded byte and every direct branch on an instruction
+  boundary.
+- The whole `omega` package runs as x86-64 (docs/OMEGA-PACKAGE.md).
+
+Native x86 execution remains NOT_RUN until a run on an x86-64 machine is recorded.
+
 ## Selection and implementation boundary
 
 The required opt-in is the exact first line `target x86linux`. Inputs without
