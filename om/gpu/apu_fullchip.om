@@ -1,0 +1,653 @@
+note SPDX-License-Identifier: Apache-2.0
+note om/gpu/apu_fullchip.om: Pure Seeded-OM-2 Zero-CUDA Full-Chip GB10 APU Engine!
+note Fires ALL 20 physical CPU cores (10x Cortex-X925 @ 3.900 GHz + 10x Cortex-A725 @ 2.808 GHz)
+note AND ALL 48 Blackwell SM121 SMs (6,144 GPU cores @ 3.003 GHz) SIMULTANEOUSLY over coherent NVLink-C2C!
+note
+note Compose after:
+note   gpu/nvidia/native/nvrm/context.om
+note   gpu/nvidia/native/blackwell/vector.om
+note   gpu/nvidia/native/blackwell/launch.om
+note   gpu/nvidia/native/blackwell/batch.om
+note   om/encoder/bw_enc_sm121.om
+note   om/gpu/q36/emit_fast.om
+
+const APU_GX ulong 192
+const APU_BX ulong 256
+const APU_NTHR ulong 49152
+const APU_CPU_SEED_BASE ulong 1000000000
+
+global apuCodePos ulong 1
+global apuCodeFail uint 1
+global apuOutMap long 1
+global apuCmdLen uint 1
+global apuOutBuf uchar 4096
+global apuDig uchar 24
+global apuPids long 24
+global apuGoFds int 24
+global apuResFds int 24
+global apuWStart ulong 24
+global apuWLen ulong 24
+global apuBuf uchar 32
+
+text apuHdr "=== OMEGA PURE-OM2 FULL-CHIP GB10 APU ENGINE (20 CPU CORES + 48 BLACKWELL SMs = 6,164 CORES SIMULTANEOUSLY) ===\n"
+text apuMsgGpu2B "GPU_48SM_ONLY_2B_SLICE: steps="
+text apuMsgApu2B "FULLCHIP_APU_20CPU_48SM_2B: steps="
+text apuMsgApu20B "FULLCHIP_APU_20CPU_48SM_20B: steps="
+text apuMsgChk " checksum="
+text apuMsgUs " wall_us="
+text apuMsgGops " gops_x10="
+text apuMsgOk " BIT_EXACT=PASS\n"
+text apuMsgBad " BIT_EXACT=FAIL\n"
+text apuMsgErr "APU_ERR stage="
+text apuMsgNl "\n"
+
+fn apuPrint s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn apuPrintU v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put apuDig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+w = write 1 apuDig p sub 24 p
+ret
+end
+end
+end
+
+fn q36Write w view ulong 4 to void
+p = get apuCodePos 0
+b = new uchar 16 0
+if gt get gbmem 4 0
+for i ulong 16
+put b i uchar and shr get w div i 4 mul rem i 4 8 255
+end
+if ne mapwrite get gbmem 4 p b 0 16 16
+put apuCodeFail 0 1
+end
+end
+put apuCodePos 0 add p 16
+end
+
+note =========================================================================
+note SM121 Blackwell 4-Way Interleaved 64-bit LCG + XOR Reduction Kernel
+note 100% exact 64-bit arithmetic in 5 SASS ops/step (1x IMAD.WIDE.U32 + 2x IMAD + 2x LOP3_XOR)!
+note Args: out_u32[gx*2] (R0:1), halfIters (8).
+note Grid: (192, 1, 1) [4 waves x 48 SMs], Block: 256, SMEM: 64 bytes.
+note =========================================================================
+fn apuEmitLcgHalf srcBase ulong dstBase ulong to void
+cSt = qcw 1 7 7 0 0
+for c ulong 4
+sLo = add srcBase mul c 4
+dLo = add dstBase mul c 4
+qicImm 9 dLo sLo 6 1284865837 cSt
+end
+for c ulong 4
+sLo = add srcBase mul c 4
+dHi = add add dstBase mul c 4 1
+qic4 8 dHi sLo 9 dHi cSt
+end
+for c ulong 4
+sHi = add add srcBase mul c 4 1
+dHi = add add dstBase mul c 4 1
+qic4 8 dHi sHi 8 dHi cSt
+end
+for c ulong 4
+dLo = add dstBase mul c 4
+aLo = add 52 mul c 2
+qic 29 aLo aLo dLo 0 cSt
+end
+for c ulong 4
+dHi = add add dstBase mul c 4 1
+aHi = add 53 mul c 2
+qic 29 aHi aHi dHi 0 cSt
+end
+end
+
+fn apuEmitLcgKernel to void
+put apuCodePos 0 0
+put q36Pc 0 0
+put q36Guard 0 0
+qStart 1
+qParam 10 8
+note C = 1442695040888963407 = (335903614 << 32) | 4150755663 in even pair R6:7
+qLit 6 4150755663
+qLit 7 335903614
+note M = 6364136223846793005 = (1481765933 << 32) | 1284865837 in R8, R9
+qLit 8 1284865837
+qLit 9 1481765933
+qLit 11 0
+qLit 12 1
+note g = blockIdx.x * 256 + tid (R13); 4 seeds: g*4 + 1..4 in R20:21, R24:25, R28:29, R32:33
+qMad 13 15 256 14
+qMad 20 13 4 12
+qLit 21 0
+qIadd 24 20 12
+qLit 25 0
+qIadd 28 24 12
+qLit 29 0
+qIadd 32 28 12
+qLit 33 0
+for j ulong 8
+qLit add 52 j 0
+end
+note Hot 2x ping-pong x 4-chain interleaved loop (8 full 64-bit LCG+XOR steps = 24 u64 ops/iter!)
+mLcg = get q36Pc 0
+apuEmitLcgHalf 20 36
+apuEmitLcgHalf 36 20
+qIadd 11 11 12
+qic 28 QZ 11 10 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLcg get q36Pc 0 qAlu4
+note Fold 4 chain accumulators into R52:53
+qic 29 52 52 54 0 qAlu4
+qic 29 53 53 55 0 qAlu4
+qic 29 56 56 58 0 qAlu4
+qic 29 57 57 59 0 qAlu4
+qic 29 52 52 56 0 qAlu4
+qic 29 53 53 57 0 qAlu4
+note Warp 64-bit XOR reduction via SHFL.BFLY
+d = ulong 16
+while ge d 1 bound 5
+qic 60 54 52 QZ d qShfl
+qic 60 55 53 QZ d qShfl
+qic 0 QZ QZ QZ 0 qW0
+qic 29 52 52 54 0 qAlu4
+qic 29 53 53 55 0 qAlu4
+d = shr d 1
+end
+note Lane 0 of each warp stores 64-bit warp XOR to SMEM[warp*8 .. +4]
+qic 18 20 14 QZ 31 qAlu4
+qic 17 21 14 QZ 5 qAlu4
+bW = qBssy
+qic 28 QZ 20 12 0 qCmp
+skW = qBraFwd 1
+qMad 23 21 8 QZ
+qic 50 QZ 23 52 0 qSt
+qLit 24 4
+qIadd 23 23 24
+qic 50 QZ 23 53 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skW 1
+qBsync bW
+qBar
+note Thread 0 XORs all 8 warps and stores u64 result to out[blockIdx.x * 2 .. +1]
+qic 28 QZ 14 12 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qLit 52 0
+qLit 53 0
+for w ulong 8
+qLit 23 mul w 8
+qic 49 54 23 QZ 0 qLd
+qLit 24 add mul w 8 4
+qic 49 55 24 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 29 52 52 54 0 qAlu4
+qic 29 53 53 55 0 qAlu4
+end
+qMad 25 15 2 QZ
+qicImm 9 16 25 0 4 qAlu4
+qic 12 QZ 16 52 0 qSt
+qIadd 25 25 12
+qicImm 9 16 25 0 4 qAlu4
+qic 12 QZ 16 53 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+q36Done
+end
+
+note =========================================================================
+note GPU Channel Setup, Command-Buffer Builder, Non-Blocking Kick & Fast Spin-Wait
+note =========================================================================
+fn apuGpuInit to bool
+if not nvfull
+ret false
+end
+if not nvchan
+ret false
+end
+for i ulong 5
+sz = ulong 65536
+if eq i 4
+sz = ulong 65536
+end
+m = nvalloc sz false
+if le m 0
+ret false
+end
+put gbmem i m
+end
+om = nvalloc 65536 true
+if le om 0
+ret false
+end
+put apuOutMap 0 om
+put gbmem 5 om
+put gbmem 6 om
+put gbmem 7 om
+put apuCodeFail 0 0
+apuEmitLcgKernel
+ret eq get apuCodeFail 0 0
+end
+
+fn apuGpuBuildCmd halfIters uint to bool
+gbqmd 1
+a = mapaddr get gbmem 4
+put gbq1 32 gblo shr a 4
+put gbq1 33 or uint and shr a 36 2097151 20971520
+put gbq1 59 gblo shr a 8
+put gbq1 34 or uint 65536 uint APU_BX
+put gbq1 35 or uint 131073 shl uint 64 8
+put gbq1 36 78923784
+put gbq1 37 0
+put gbq1 39 uint APU_GX
+put gbq1 40 1
+put gbq1 41 1
+put gbcb 216 uint APU_BX
+put gbcb 220 uint APU_GX
+put gbcb 221 1
+put gbcb 222 1
+cb = mapaddr get gbmem 1
+endva = add cb 908
+put gbcb 212 gbhi endva
+put gbcb 213 gblo endva
+put gbused 0 0
+gbsetup
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
+gbdma cb 224
+for j ulong 224
+gbemit get gbcb j
+end
+outVa = mapaddr get apuOutMap 0
+gbdma add cb 896 3
+gbemit gblo outVa
+gbemit gbhi outVa
+gbemit halfIters
+q = mapaddr get gbmem 2
+gbinline q false
+gbdma add q 8192 1
+gbemit 1
+gbinline add q 4096 true
+gbrel add mapaddr get gbmem 3 32 6
+gbtail
+nb = get gbused 0
+if ne mapwrite get gbmem 0 0 gbcmd 0 nb long nb
+ret false
+end
+put apuCmdLen 0 uint div nb 4
+ret true
+end
+
+fn apuGpuKick to bool
+r = mapset get gbmem 2 8192 4 0
+r = mapset get gbmem 3 0 4 0
+r = mapset get gbmem 3 16 4 0
+ret nvsend get gbmem 0 0 get apuCmdLen 0
+end
+
+fn apuGpuWait to bool
+for sp ulong 5000000
+if eq mapget get gbmem 3 16 4 1179010630
+put nvret 0 get nvput 0
+ret eq mapget get gbmem 3 0 4 1145324612
+end
+end
+t0 = monons
+while lt ulong sub monons t0 10000000000 bound 5000000
+if eq mapget get gbmem 3 16 4 1179010630
+put nvret 0 get nvput 0
+ret eq mapget get gbmem 3 0 4 1145324612
+end
+r = sleepns long 5000
+end
+ret false
+end
+
+fn apuGpuReadXor to ulong
+nb = mul APU_GX 8
+r = mapread get apuOutMap 0 0 apuOutBuf 0 nb
+tot = ulong 0
+for g ulong APU_GX
+base = mul g 8
+v = ulong 0
+for j ulong 8
+v = or v shl ulong get apuOutBuf add base j mul j 8
+end
+tot = xor tot v
+end
+ret tot
+end
+
+note =========================================================================
+note Pre-Pinned Persistent 20-Core Heterogeneous CPU Pool (10x X925 + 10x A725)
+note =========================================================================
+fn apuPinCore cpu ulong to void
+m = new uchar 8 0
+put m div cpu 8 uchar shl ulong 1 rem cpu 8
+r = cpuset 0 m 0 8
+end
+
+fn apuWorkX925 start ulong cnt ulong to ulong
+cMul = ulong 6364136223846793005
+cAdd = ulong 1442695040888963407
+x0 = add start 1
+x1 = add start 2
+x2 = add start 3
+x3 = add start 4
+x4 = add start 5
+x5 = add start 6
+a0 = ulong 0
+n6 = div cnt 6
+for i ulong n6 bound 200000000
+x0 = add mul x0 cMul cAdd
+x1 = add mul x1 cMul cAdd
+x2 = add mul x2 cMul cAdd
+x3 = add mul x3 cMul cAdd
+x4 = add mul x4 cMul cAdd
+x5 = add mul x5 cMul cAdd
+a0 = xor a0 x0
+a0 = xor a0 x1
+a0 = xor a0 x2
+a0 = xor a0 x3
+a0 = xor a0 x4
+a0 = xor a0 x5
+end
+ret a0
+end
+
+fn apuWorkA725 start ulong cnt ulong to ulong
+cMul = ulong 6364136223846793005
+cAdd = ulong 1442695040888963407
+x0 = add start 1
+x1 = add start 2
+x2 = add start 3
+x3 = add start 4
+a0 = ulong 0
+n4 = div cnt 4
+for i ulong n4 bound 200000000
+x0 = add mul x0 cMul cAdd
+x1 = add mul x1 cMul cAdd
+x2 = add mul x2 cMul cAdd
+x3 = add mul x3 cMul cAdd
+a0 = xor a0 x0
+a0 = xor a0 x1
+a0 = xor a0 x2
+a0 = xor a0 x3
+end
+ret a0
+end
+
+note Verify GPU thread range [g0 .. g0 + gCnt - 1], each 4 chains x itersPerChain steps
+fn apuVerifyGpuRange g0 ulong gCnt ulong itersPerChain ulong to ulong
+tot = ulong 0
+stepsPerThr = mul itersPerChain 4
+for k ulong gCnt bound 65536
+g = add g0 k
+v = apuWorkA725 mul g 4 stepsPerThr
+tot = xor tot v
+end
+ret tot
+end
+
+fn apuGetI32 b view uchar * off ulong to int
+b0 = uint get b off
+b1 = shl uint get b add off 1 8
+b2 = shl uint get b add off 2 16
+b3 = shl uint get b add off 3 24
+ret int or or b0 b1 or b2 b3
+end
+
+fn apuWriteU64 fd int v ulong to void
+for i ulong 8
+put apuBuf i uchar and shr v mul i 8 255
+end
+w = write fd apuBuf 0 8
+end
+
+fn apuReadU64 fd int to ulong
+r = read fd apuBuf 0 8
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get apuBuf i mul i 8
+end
+ret v
+end
+
+fn apuWorkerExec w ulong cmd ulong a ulong b ulong c ulong to ulong
+if eq cmd 1
+isX = ge rem w 10 5
+is6 = eq rem b 6 0
+if and isX is6
+ret apuWorkX925 a b
+end
+ret apuWorkA725 a b
+end
+ret apuVerifyGpuRange a b c
+end
+
+fn apuPutBuf64 off ulong v ulong to void
+for i ulong 8
+put apuBuf add off i uchar and shr v mul i 8 255
+end
+end
+
+fn apuGetBuf64 off ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get apuBuf add off i mul i 8
+end
+ret v
+end
+
+fn apuSendCmd fd int cmd ulong a ulong b ulong c ulong to void
+apuPutBuf64 0 cmd
+apuPutBuf64 8 a
+apuPutBuf64 16 b
+apuPutBuf64 24 c
+w = write fd apuBuf 0 32
+end
+
+fn apuWorkerLoop w ulong goFd int resFd int to void
+apuPinCore w
+apuWriteU64 resFd add w 1
+for round ulong 32
+r = read goFd apuBuf 0 32
+cmd = apuGetBuf64 0
+if eq cmd 0
+exit 0
+end
+a = apuGetBuf64 8
+b = apuGetBuf64 16
+c = apuGetBuf64 24
+res = apuWorkerExec w cmd a b c
+apuWriteU64 resFd res
+end
+exit 0
+end
+
+fn apuPoolInit to void
+pGo = new uchar 8 0
+pRes = new uchar 8 0
+for w ulong 20
+r1 = pipefds pGo 0 8 0
+r2 = pipefds pRes 0 8 0
+goRd = apuGetI32 pGo 0
+goWr = apuGetI32 pGo 4
+resRd = apuGetI32 pRes 0
+resWr = apuGetI32 pRes 4
+pid = fork
+if eq pid 0
+c1 = fclose goWr
+c2 = fclose resRd
+apuWorkerLoop w goRd resWr
+end
+c3 = fclose goRd
+c4 = fclose resWr
+put apuPids w pid
+put apuGoFds w goWr
+put apuResFds w resRd
+end
+for w ulong 20
+ack = apuReadU64 get apuResFds w
+end
+end
+
+fn apuPoolStop to void
+st = new uchar 4 0
+for w ulong 20
+apuSendCmd get apuGoFds w 0 0 0 0
+c1 = fclose get apuGoFds w
+c2 = fclose get apuResFds w
+wp = waitpid int get apuPids w st 0 4 0
+end
+end
+
+fn apuFillCpuHet cpuSteps ulong to void
+unit = div cpuSteps 3000
+cur = ulong 0
+for w ulong 20
+wt = ulong 200
+if lt rem w 10 5
+wt = ulong 100
+end
+lenW = mul div mul unit wt 12 12
+if eq w 19
+lenW = sub cpuSteps cur
+end
+put apuWStart w add APU_CPU_SEED_BASE cur
+put apuWLen w lenW
+cur = add cur lenW
+end
+end
+
+fn apuCpuRunSlice to ulong
+for w ulong 20
+apuSendCmd get apuGoFds w 1 get apuWStart w get apuWLen w 0
+end
+tot = ulong 0
+for w ulong 20
+tot = xor tot apuReadU64 get apuResFds w
+end
+ret tot
+end
+
+fn apuCpuVerifyGpu itersPerChain ulong to ulong
+per = div APU_NTHR 20
+cur = ulong 0
+for w ulong 20
+cnt = per
+if eq w 19
+cnt = sub APU_NTHR cur
+end
+apuSendCmd get apuGoFds w 2 cur cnt itersPerChain
+cur = add cur cnt
+end
+tot = ulong 0
+for w ulong 20
+tot = xor tot apuReadU64 get apuResFds w
+end
+ret tot
+end
+
+fn apuBenchGpuOnly gpuSteps ulong to int
+tg0 = monons
+if not apuGpuKick
+ret 24
+end
+if not apuGpuWait
+ret 25
+end
+gpuChk = apuGpuReadXor
+tg1 = monons
+gpuUs = div ulong sub tg1 tg0 1000
+apuPrint apuMsgGpu2B
+apuPrintU gpuSteps
+apuPrint apuMsgChk
+apuPrintU gpuChk
+apuPrint apuMsgUs
+apuPrintU gpuUs
+apuPrint apuMsgGops
+apuPrintU div mul gpuSteps 30 gpuUs
+apuPrint apuMsgNl
+ret 0
+end
+
+fn apuRunCase totSteps ulong itersPerChain ulong is20B bool to int
+gpuSteps = mul mul APU_NTHR 4 itersPerChain
+cpuSteps = sub totSteps gpuSteps
+apuFillCpuHet cpuSteps
+if not apuGpuBuildCmd uint div itersPerChain 2
+ret 21
+end
+if not apuGpuKick
+ret 22
+end
+if not apuGpuWait
+ret 23
+end
+if not is20B
+rg = apuBenchGpuOnly gpuSteps
+if ne rg 0
+ret rg
+end
+end
+t0 = monons
+if not apuGpuKick
+ret 26
+end
+cpuChk = apuCpuRunSlice
+if not apuGpuWait
+ret 27
+end
+apuChk = xor cpuChk apuGpuReadXor
+t1 = monons
+apuUs = div ulong sub t1 t0 1000
+refChk = xor apuCpuVerifyGpu itersPerChain apuCpuRunSlice
+if is20B
+apuPrint apuMsgApu20B
+else
+apuPrint apuMsgApu2B
+end
+apuPrintU totSteps
+apuPrint apuMsgChk
+apuPrintU apuChk
+apuPrint apuMsgUs
+apuPrintU apuUs
+apuPrint apuMsgGops
+apuPrintU div mul totSteps 30 apuUs
+if eq apuChk refChk
+apuPrint apuMsgOk
+ret 0
+end
+apuPrint apuMsgBad
+ret 30
+end
+
+fn main to int
+apuPrint apuHdr
+apuPinCore 5
+apuPoolInit
+if not apuGpuInit
+apuPoolStop
+apuPrint apuMsgErr
+apuPrintU 1
+apuPrint apuMsgNl
+ret 1
+end
+r1 = apuRunCase 2000000000 10120 false
+if ne r1 0
+apuPoolStop
+ret r1
+end
+r2 = apuRunCase 20000000000 100800 true
+apuPoolStop
+ret r2
+end

@@ -3532,9 +3532,9 @@ qic 28 QZ 37 61 0 qCmp
 qMad 61 37 512 58
 put q36Guard 0 2
 qic 50 QZ 61 40 0 qSt
-qic 32 40 40 28 0 qAlu4
+qic 32 44 40 28 0 qAlu4
 qic 32 41 41 28 0 qAlu4
-qic4 33 36 40 42 36 qAlu4
+qic4 33 36 44 42 36 qAlu4
 qic4 33 36 41 43 36 qAlu4
 qic 0 QZ QZ QZ 0 qW1
 qIadd 37 37 39
@@ -4597,11 +4597,11 @@ qic 0 QZ QZ QZ 0 qW1
 end
 
 note =========================================================================
-note K (36): qW4B32GemmM4 -- Register-Tiled 1-row/warp x 4-token W4-B32 GEMM (K == 2048, N % 8 == 0, B == 4)
-note Zero 16-row HMMA padding waste; reads W & S ONCE for all 4 tokens; 100% SM saturation (gx = N/8)!
+note K (36): qW4B32GemmM4 -- Register-Tiled 1-row/warp x 4-token W4-B32 GEMM (K % 2048 == 0, N % 8 == 0, B % 4 == 0)
+note Zero 16-row HMMA padding waste; reads W & S ONCE per 4-token group; 100% SM saturation (gx = N/8, gy = B/4)!
 note Args: X_bf16 (R0:1), W_w4 (R2:3), S_bf16 (R4:5), Y_f32 (R6:7),
 note       K (32), N (36), xStrideU32 (40), xOffU32 (44), yStrideF32 (48), yOffF32 (52).
-note Grid: (N/8, 1, 1), Block: 256 (8 warps), SMEM: 16384 B (4 x 2048 BF16).
+note Grid: (N/8, B/4, 1), Block: 256 (8 warps), SMEM: 16384 B (4 x 2048 BF16 streaming chunks).
 note =========================================================================
 fn qW4M4UnpackWave wr ulong baseR ulong baseNib ulong to void
 for j ulong 4
@@ -4663,12 +4663,48 @@ end
 
 fn qW4B32GemmM4 to void
 qStart 4
-qParam 19 36
+qParam 19 32
 qParam 22 40
 qParam 23 44
 qParam 60 48
 qParam 61 52
-note Stage all 4 token BF16 vectors (4 x 1024 u32 = 16384 B) into SMEM[0..16383]
+note Apply token-group base offset from blockIdx.y (R18 * 4) to xOffU32 (R23) and yOffF32 (R61)
+qMad 52 18 4 QZ
+qMadReg 23 52 22 23
+qMadReg 61 52 60 61
+note Relocate pointers: Y_f32 (R6:7 -> R8:9), X_bf16 (R0:1 -> R6:7), W_w4 (R2:3 -> R0:1), S_bf16 (R4:5 -> R16:17)
+qicImm 8 8 6 QZ 1 qAlu1
+qicImm 8 9 7 QZ 1 qAlu1
+qicImm 8 6 0 QZ 1 qAlu1
+qicImm 8 7 1 QZ 1 qAlu1
+qicImm 8 0 2 QZ 1 qAlu1
+qicImm 8 1 3 QZ 1 qAlu1
+qicImm 8 16 4 QZ 1 qAlu1
+qicImm 8 17 5 QZ 1 qAlu4
+note warp = tid >> 5 (R52), lane = tid & 31 (R10), row = blockIdx.x * 8 + warp (R18)
+qic 17 52 14 QZ 5 qAlu1
+qic 18 10 14 QZ 31 qAlu4
+qMad 18 15 8 52
+note rowWBase = W_w4 + (row * (K >> 3) + lane * 4) * 4 -> R0:1
+qic 17 53 19 QZ 3 qAlu4
+qMad 54 10 4 QZ
+qMadReg 52 18 53 54
+qicImm 9 0 52 0 4 qAlu4
+note rowSBase = S_bf16 + (row * (K >> 6) + (lane >> 1)) * 4 -> R16:17
+qic 17 53 19 QZ 6 qAlu1
+qic 17 54 10 QZ 1 qAlu4
+qMadReg 52 18 53 54
+qicImm 9 16 52 16 4 qAlu4
+qic 18 11 10 QZ 1 qAlu4
+qLit 13 1
+note nChunks = K >> 11 (R2), chunkIdx = 0 (R3), zero accumulators R48..R51
+qic 17 2 19 QZ 11 qAlu4
+qLit 3 0
+for t ulong 4
+qNum add 48 t 0.0f32
+end
+note Stream K in 2048-element chunks (1 chunk for K=2048, 2 chunks for K=4096) through 16 KiB SMEM!
+mChunk = get q36Pc 0
 for t ulong 4
 qLit 52 t
 qMadReg 53 52 22 23
@@ -4678,7 +4714,7 @@ qLit 57 256
 mSt = get q36Pc 0
 qIadd 58 54 14
 qIadd 59 53 58
-qicImm 9 20 59 0 4 qW1
+qicImm 9 20 59 6 4 qW1
 qic 11 55 20 QZ 0 qLd
 qLit 52 mul t 4096
 qMad 58 58 4 52
@@ -4691,33 +4727,8 @@ put q36Guard 0 2
 qic 46 QZ QZ QZ sub mSt get q36Pc 0 qAlu4
 end
 qBar
-note Save Y_f32 (R6:7 -> R8:9), S_bf16 (R4:5 -> R16:17), W_w4 (R2:3 -> R0:1)
-qicImm 8 8 6 QZ 1 qAlu1
-qicImm 8 9 7 QZ 1 qAlu1
-qicImm 8 16 4 QZ 1 qAlu1
-qicImm 8 17 5 QZ 1 qAlu1
-qicImm 8 0 2 QZ 1 qAlu1
-qicImm 8 1 3 QZ 1 qAlu4
-note warp = tid >> 5 (R52), lane = tid & 31 (R10), row = blockIdx.x * 8 + warp (R18)
-qic 17 52 14 QZ 5 qAlu1
-qic 18 10 14 QZ 31 qAlu4
-qMad 18 15 8 52
-note rowWBase = W_w4 + (row * 256 + lane * 4) * 4 -> R0:1 (K=2048 -> 256 u32/row = 1024 B/row)
-qMad 52 18 256 QZ
-qMad 52 10 4 52
-qicImm 9 0 52 0 4 qAlu4
-note rowSBase = S_bf16 + (row * 32 + (lane >> 1)) * 4 -> R16:17 (K=2048 -> 64 bf16 = 32 u32/row = 128 B/row)
-qic 17 53 10 QZ 1 qAlu4
-qMad 52 18 32 53
-qicImm 9 16 52 16 4 qAlu4
-qic 18 11 10 QZ 1 qAlu4
-qLit 13 1
 qMad 4 10 64 QZ
 qNum 55 -8.0f32
-for t ulong 4
-qNum add 48 t 0.0f32
-end
-note 2 K-passes (b = 0: K=0..1023, b = 1: K=1024..2047)
 for b ulong 2
 qic 57 24 0 QZ 0 qcw 2 0 7 0 1
 qic 11 12 16 QZ 0 qcw 2 0 7 0 1
@@ -4731,13 +4742,20 @@ qicImm 8 12 52 QZ 1 qAlu4
 for w ulong 4
 qW4M4AccumWord w
 end
-if eq b 0
 qicImm 9 0 13 0 512 qAlu1
 qicImm 9 16 13 16 64 qAlu1
+if eq b 0
 qLit 52 2048
 qIadd 4 4 52
 end
 end
+qBar
+qLit 52 1024
+qIadd 23 23 52
+qIadd 3 3 13
+qic 28 QZ 3 2 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mChunk get q36Pc 0 qAlu4
 for t ulong 4
 qWarpRedSum add 48 t 52 16
 end
@@ -4750,6 +4768,213 @@ qMadReg 53 52 60 61
 qIadd 53 53 18
 qicImm 9 20 53 8 4 qAlu4
 qic 12 QZ 20 add 48 t 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+note =========================================================================
+note L (37): qW4B32GroupedM4Gu -- 1-launch 4-row/warp Batched (B<=8) 9-Expert W4 Gate+Up GEMV!
+note Replaces qPreMoeBuildGroups + shared_gu + qPreW4MoeHmma(GU) in ONE launch (L2-coalesced)!
+note Args: QP_XN[B,2048] f32 (R0:1), W_pool[257,1024,256] (R2:3), S_pool[257,1024,32] (R4:5),
+note       QP_IDS[B,8] u32 (R6:7), QP_EMID[B,9,1024] f32 (R8:9).
+note Grid: (32, B*9, 1), Block: 256, SMEM: 8192.
+note =========================================================================
+fn qW4B32GroupedM4Gu to void
+qStart 5
+note Preserve y = blockIdx.y in R23; decode t = (y * 7282) >> 16 -> xOff = t * 2048 (R22)
+qicImm 8 23 18 QZ 1 qAlu4
+qMad 22 23 7282 QZ
+qic 17 22 22 QZ 16 qAlu4
+qMad 22 22 2048 QZ
+qLit 20 2048
+qStageX128 0 20 22
+note Restore y -> R18, decode t (R25) and s = y - t*9 (R26)
+qicImm 8 18 23 QZ 1 qAlu4
+qMad 25 18 7282 QZ
+qic 17 25 25 QZ 16 qAlu4
+qMad 26 25 0xfffffff7 18
+note Load expert_id -> R23 (QP_IDS[t*8 + s] for s < 8, 256 for shared slot s == 8)
+qLit 23 256
+qLit 57 8
+bId = qBssy
+qic 28 QZ 26 57 0 qCmp
+skId = qBraFwd 1
+qMad 52 25 8 26
+qicImm 9 16 52 6 4 qW1
+qic 11 23 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qPatch skId 1
+qBsync bId
+note Output C pointer R8:9 += y * 1024 * 4
+qMad 52 18 1024 QZ
+qicImm 9 8 52 8 4 qAlu4
+note Set up K=2048, N=1024 geometry for qW4Loop4R
+qLit 24 256
+qLit 25 32
+qLit 26 2
+qMad 54 23 1024 QZ
+qMad 53 54 32 QZ
+qicImm 9 16 53 4 4 qAlu4
+qicImm 8 12 2 QZ 1 qAlu1
+qicImm 8 13 3 QZ 1 qAlu4
+qic 17 52 14 QZ 5 qAlu4
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+qLit 19 1024
+qLit 20 32
+qLit 22 2
+qMad 58 11 4 QZ
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qIadd 53 54 52
+qMadReg 53 53 24 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qMad 10 11 128 QZ
+qLit 21 0
+qLit 23 1
+qW4Loop4R
+end
+
+note =========================================================================
+note M (38): qW4B32GroupedM4Dn -- FUSED SwiGLU*weight + zero-loop 4-row/half-warp Batched (B<=8) W4 Down_proj!
+note Replaces qPreSwiglu9Bf16 + shared_dn + qPreW4MoeHmma(DN) in ONE launch (ZERO QP_ESWB DRAM traffic)!
+note Args: QP_EMID[B,9,1024] (R0:1), W_pool[257,2048,64] (R2:3), S_pool[257,2048,8] (R4:5),
+note       QP_IDS[B,8] (R6:7), QP_EOUT[B,9,2048] (R8:9), QP_WTS[B,8] (R10:11), QP_SHG[B] (R12:13).
+note Grid: (32, B*9, 1), Block: 256, SMEM: 2048.
+note =========================================================================
+fn qW4B32GroupedM4Dn to void
+qStart 7
+note Decode t (R25) and s (R26) from y = blockIdx.y (R18)
+qMad 25 18 7282 QZ
+qic 17 25 25 QZ 16 qAlu4
+qMad 26 25 0xfffffff7 18
+note Load expert_id (R23) and weight w (R27 = WTS[t*8+s] if s<8 else sigmoid(SHG[t]))
+qNum 59 -1.4426950408889634f32
+qNum 60 1.0f32
+qLit 57 8
+bId = qBssy
+qic 28 QZ 26 57 0 qCmp
+skId = qBraFwd 1
+qMad 52 25 8 26
+qicImm 9 16 52 6 4 qW1
+qic 11 23 16 QZ 0 qLd
+qicImm 9 16 52 10 4 qW1
+qic 11 27 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qPatch skId 1
+qBsync bId
+bSh = qBssy
+qic 28 QZ 26 57 0 qCmp
+skSh = qBraFwd 2
+qLit 23 256
+qicImm 9 16 25 12 4 qW1
+qic 11 27 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qSig 27 27 59 60
+qPatch skSh 2
+qBsync bSh
+note Fused SwiGLU * w staging into SMEM[0..2047]
+qMad 55 18 1024 QZ
+qIadd 53 55 14
+qicImm 9 16 53 0 4 qW1
+qic 11 54 16 QZ 0 qLd
+qLit 52 512
+qIadd 53 53 52
+qicImm 9 16 53 0 4 qW1
+qic 11 56 16 QZ 0 qLd
+qLit 52 256
+qIadd 53 55 14
+qIadd 53 53 52
+qicImm 9 16 53 0 4 qW1
+qic 11 57 16 QZ 0 qLd
+qLit 52 512
+qIadd 53 53 52
+qicImm 9 16 53 0 4 qW1
+qic 11 58 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qSig 52 54 59 60
+qic 32 54 54 52 0 qAlu4
+qic 32 54 54 56 0 qAlu4
+qSig 52 57 59 60
+qic 32 57 57 52 0 qAlu4
+qic 32 57 57 58 0 qAlu4
+qicImm 8 20 27 QZ 1 qAlu4
+qMad 53 14 4 QZ
+qLit 52 1024
+qIadd 55 53 52
+qic 50 QZ 53 54 0 qSt
+qic 50 QZ 55 57 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+note Offset QP_EOUT (R8:9) += y * 2048 * 4
+qMad 52 18 2048 QZ
+qicImm 9 8 52 8 4 qAlu4
+note Save S_pool (R4:5) -> R16:17, W_pool (R2:3) -> R12:13
+qicImm 8 16 4 QZ 1 qAlu1
+qicImm 8 17 5 QZ 1 qAlu1
+qicImm 8 12 2 QZ 1 qAlu1
+qicImm 8 13 3 QZ 1 qAlu4
+note hw = tid >> 4, lane = tid & 15 (R11), row0 = blockIdx.x*64 + hw*4 (R18)
+qic 17 52 14 QZ 4 qAlu4
+qic 18 11 14 QZ 15 qAlu4
+qMad 18 15 64 QZ
+qMad 18 52 4 18
+qMad 19 23 2048 QZ
+qMad 58 11 4 QZ
+qic 17 56 11 QZ 1 qAlu4
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qIadd 53 19 52
+qMad 53 53 64 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qic 57 24 0 QZ 0 qcw 2 0 7 0 1
+qic 57 28 2 QZ 0 qcw 2 0 7 0 1
+qic 57 32 4 QZ 0 qcw 2 0 7 0 1
+qic 57 36 6 QZ 0 qcw 2 0 7 0 1
+qIadd 53 19 18
+qMad 53 53 8 56
+qLit 59 8
+qicImm 9 52 53 16 4 qAlu4
+qicImm 9 54 59 52 4 qAlu4
+qicImm 9 56 59 54 4 qAlu4
+qicImm 9 58 59 56 4 qAlu4
+qic 11 12 52 QZ 0 qcw 2 0 7 0 1
+qic 11 13 54 QZ 0 qcw 2 0 7 0 1
+qic 11 14 56 QZ 0 qcw 2 0 7 0 1
+qic 11 15 58 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0
+qic 18 56 11 QZ 1 qAlu4
+qLit 23 1
+qic 28 QZ 56 23 0 qCmp
+for r ulong 4
+qicImm 8 52 add 12 r QZ 65536 qAlu1
+qic 18 53 add 12 r QZ 0xffff0000 qAlu4
+put q36Guard 0 1
+qicImm 8 52 53 QZ 1 qAlu4
+qicImm 8 add 12 r 52 QZ 1 qAlu4
+end
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+qMad 10 11 128 QZ
+qW4MacBlock 10 12 13 14 15
+for r ulong 4
+qWarpRedSum add 48 r 52 8
+end
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for r ulong 4
+qic 32 add 48 r add 48 r 20 0 qAlu4
+qLit 52 r
+qIadd 52 18 52
+qicImm 9 54 52 8 4 qAlu4
+qic 12 QZ 54 add 48 r 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
 end
@@ -4921,6 +5146,14 @@ ret true
 end
 if eq mode 138
 qW4B32GemmM4
+ret true
+end
+if eq mode 139
+qW4B32GroupedM4Gu
+ret true
+end
+if eq mode 140
+qW4B32GroupedM4Dn
 ret true
 end
 ret false
