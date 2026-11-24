@@ -1,0 +1,159 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_r10_omega.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_r10_omega.c (R10 Omega continuous realization faculty).
+note Verifies the full reactive realization pipeline (request -> serve ->
+note demand -> watch -> search -> synthesize -> verify -> measure -> select ->
+note serve on selected realization), reference digest parity, defect refusals
+note (SKIP_REMAINDER, TAMPER, CRASH), readmit structural check, and reconsider.
+
+global r10_checks ulong 1
+global r10_fail ulong 1
+
+text r10_pass "RX_R10_OMEGA_OM: PASS\n"
+text r10_fail_m "RX_R10_OMEGA_OM: FAIL\n"
+
+fn r10_chk cond bool to void
+  put r10_checks 0 add get r10_checks 0 1
+  if not cond
+    if eq get r10_fail 0 0
+      put r10_fail 0 get r10_checks 0
+    end
+  end
+end
+
+fn r10_test_continuous_pipeline to void
+  rx_omega_default_config
+  put rxo_cfg 2 16
+  put rxo_cfg 3 100
+  r10_chk eq rx_omega_create_objects 0
+  r10_chk eq rx_omega_register 0
+
+  note Serve 16 requests of shape (4, 8) on reference realization
+  for s ulong 16
+    put rxo_request 0 add s 1
+    put rxo_request 1 4
+    put rxo_request 2 8
+    put rxo_request 3 add s 500
+    r10_chk eq rx_omega_fn_serve 0
+  end
+  r10_chk eq get rxo_demand 0 16
+  r10_chk eq get rxo_st 3 16
+  r10_chk eq get rxo_st 4 0
+
+  note Watch opens search epoch 1 for hot regime (4, 8)
+  r10_chk eq rx_omega_fn_watch 0
+  r10_chk eq get rxo_search 0 1
+  r10_chk eq get rxo_search 1 4
+  r10_chk eq get rxo_search 2 8
+
+  note Synthesize, verify, and measure all 4 candidate slots
+  for k ulong 4
+    r10_chk eq rx_omega_fn_synthesize k 0
+    r10_chk eq get rxo_candidate add mul k 8 7 RX_OMEGA_SYNTHESIZED
+    r10_chk eq rx_omega_fn_verify k 0
+    r10_chk eq get rxo_verdict add mul k 8 1 RX_OMEGA_PASSED
+    r10_chk eq rx_omega_fn_measure k 0
+    r10_chk eq get rxo_measure add mul k 8 1 RX_OMEGA_MEASURED
+  end
+
+  note Select installs winning realization; next serve uses it and matches reference digest
+  r10_chk eq rx_omega_fn_select 0
+  r10_chk eq get rxo_selection 0 1
+  r10_chk ne get rxo_selection 1 0
+  r10_chk eq get rxo_selection 6 rx_omega_regime 4 8
+  r10_chk lt get rxo_selection 5 get rxo_selection 7
+
+  put rxo_request 0 17
+  put rxo_request 1 4
+  put rxo_request 2 8
+  put rxo_request 3 999
+  r10_chk eq rx_omega_fn_serve 0
+  r10_chk eq get rxo_result 2 get rxo_selection 1
+  r10_chk eq get rxo_st 4 1
+
+  note Independent semantic reference digest check for (4, 8, seed=999)
+  a = new ulong 32 0
+  x = new ulong 8 0
+  y = new ulong 4 0
+  rx_omega_fill 999 a x rx_omega_regime 4 8
+  rx_omega_matvec_ref a x y
+  want_d = rx_omega_digest y 4
+  r10_chk eq get rxo_result 1 want_d
+end
+
+fn r10_test_defects_and_readmit to void
+  note Defect 1: SKIP_REMAINDER refused by differential verifier
+  rx_omega_default_config
+  put rxo_cfg 1 RX_OMEGA_DEFECT_SKIP_REMAINDER
+  r10_chk eq rx_omega_create_objects 0
+  put rxo_search 0 1
+  put rxo_search 1 4
+  put rxo_search 2 7
+  r10_chk eq rx_omega_fn_synthesize 4 0
+  r10_chk eq rx_omega_fn_verify 4 0
+  r10_chk eq get rxo_verdict 33 RX_OMEGA_REFUSED
+  r10_chk eq get rxo_verdict 37 RX_OMEGA_WHY_DIFFERENTIAL
+
+  note Defect 2: TAMPER refused by identity verifier
+  rx_omega_default_config
+  put rxo_cfg 1 RX_OMEGA_DEFECT_TAMPER
+  r10_chk eq rx_omega_create_objects 0
+  put rxo_search 0 1
+  put rxo_search 1 4
+  put rxo_search 2 8
+  r10_chk eq rx_omega_fn_synthesize 4 0
+  r10_chk eq rx_omega_fn_verify 4 0
+  r10_chk eq get rxo_verdict 33 RX_OMEGA_REFUSED
+  r10_chk eq get rxo_verdict 37 RX_OMEGA_WHY_IDENTITY
+
+  note Defect 3: CRASH caught and refused
+  rx_omega_default_config
+  put rxo_cfg 1 RX_OMEGA_DEFECT_CRASH
+  r10_chk eq rx_omega_create_objects 0
+  put rxo_search 0 1
+  put rxo_search 1 4
+  put rxo_search 2 8
+  r10_chk eq rx_omega_fn_synthesize 4 0
+  r10_chk eq rx_omega_fn_verify 4 0
+  r10_chk eq get rxo_verdict 33 RX_OMEGA_REFUSED
+  r10_chk eq get rxo_verdict 37 RX_OMEGA_WHY_CRASHED
+
+  note Readmit accepts valid code and rejects corrupted header
+  rx_omega_default_config
+  r10_chk eq rx_omega_create_objects 0
+  code = new uchar 256 0
+  clen = rxo_synth_code 2 0 code
+  id_out = new uchar 32 0
+  r10_chk eq rx_omega_readmit code or shl ulong 2 32 clen rx_omega_regime 4 8 id_out 0
+  put code 0 0
+  r10_chk eq rx_omega_readmit code or shl ulong 2 32 clen rx_omega_regime 4 8 id_out 1
+  r10_chk eq get rxo_readmit_why 0 RX_OMEGA_WHY_STRUCTURE
+end
+
+fn r10_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len r10_pass
+    for i ulong n bound 64
+      put buf i get r10_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len r10_fail_m
+  for i ulong n bound 64
+    put buf i get r10_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  r10_test_continuous_pipeline
+  r10_test_defects_and_readmit
+  if eq get r10_fail 0 0
+    r10_put_msg 1
+    ret 0
+  end
+  r10_put_msg 0
+  ret 1
+end

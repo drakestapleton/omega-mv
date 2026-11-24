@@ -1,0 +1,213 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_r9_barrier.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_r9_barrier.c (R9 generation barrier qualification).
+note Verifies capability authority for promotion right, genesis store open,
+note proposal/work/evidence tracking, self-promotion refusal, promotion barrier,
+note recovery coherence and idempotency, external-work replay rejection,
+note bound-authority identity refusals, and durable executor promotion.
+
+const R9_SUBJ_PROPOSER ulong 8
+const R9_SUBJ_AUTHORITY ulong 4
+
+global r9_checks ulong 1
+global r9_fail ulong 1
+
+text r9_dir "/tmp/rx_r9_barrier_om"
+text r9_ev1 "GEN2_EVIDENCE_OK"
+text r9_ev2 "GEN3_EVIDENCE_OK"
+text r9_pass "RX_R9_BARRIER_OM: PASS\n"
+text r9_fail_m "RX_R9_BARRIER_OM: FAIL\n"
+
+fn r9_chk cond bool to void
+  put r9_checks 0 add get r9_checks 0 1
+  if not cond
+    if eq get r9_fail 0 0
+      put r9_fail 0 get r9_checks 0
+    end
+  end
+end
+
+fn r9_test_promo_cap_authority to void
+  hdr = new ulong 4 0
+  slots = new ulong 3328 0
+  deliv = new uchar 256 0
+  tok = new uchar 32 0
+  r9_chk eq rx_caproot_start hdr slots deliv tok ERR_OK
+
+  note Mint promotion right for R9_SUBJ_AUTHORITY on RX_GEN_RES_PROMOTION
+  req = new ulong 9 0
+  put req 0 3
+  put req 1 R9_SUBJ_AUTHORITY
+  put req 2 RX_GEN_RES_PROMOTION
+  put req 3 RX_GEN_RIGHT_PROMOTE
+  put req 4 0
+  put req 5 CAP_NONE
+  put req 6 0
+  put req 7 get rx_cap_office 0
+  put req 8 get rx_cap_office 1
+  cap_ok = new ulong 2 0
+  r9_chk eq rx_capadmin_mint hdr slots deliv tok req cap_ok ERR_OK
+
+  vargs = new ulong 5 0
+  put vargs 0 get cap_ok 0
+  put vargs 1 get cap_ok 1
+  put vargs 2 R9_SUBJ_AUTHORITY
+  put vargs 3 RX_GEN_RES_PROMOTION
+  put vargs 4 RX_GEN_RIGHT_PROMOTE
+  ent = new ulong 13 0
+  r9_chk eq rx_caproot_validate hdr slots vargs ent ERR_OK
+
+  note Wrong subject (proposer) refused
+  put vargs 2 R9_SUBJ_PROPOSER
+  r9_chk eq rx_caproot_validate hdr slots vargs ent ERR_SUBJECT
+
+  note Revoke promotion cap -> refused
+  rargs = new ulong 4 0
+  put rargs 0 get rx_cap_office 0
+  put rargs 1 get rx_cap_office 1
+  put rargs 2 get cap_ok 0
+  put rargs 3 get cap_ok 1
+  rlist = new ulong 257 0
+  r9_chk eq rx_capadmin_revoke hdr slots deliv tok rargs rlist ERR_OK
+  put vargs 2 R9_SUBJ_AUTHORITY
+  r9_chk eq rx_caproot_validate hdr slots vargs ent ERR_REVOKED
+  r9_chk eq rx_caproot_stop hdr slots deliv tok ERR_OK
+end
+
+fn r9_test_barrier_and_recovery to void
+  dbuf = new uchar 128 0
+  dl = len r9_dir
+  for i ulong dl bound 128
+    put dbuf i get r9_dir i
+  end
+  r9_chk eq rx_gen_open dbuf dl RX_GEN_OK
+  act = new ulong 2 0
+  r9_chk eq rx_gen_active act RX_GEN_OK
+  r9_chk eq get act 0 1
+  r9_chk eq get act 1 1
+
+  ev = new uchar 256 0
+  el = len r9_ev1
+  for i ulong el bound 256
+    put ev i get r9_ev1 i
+  end
+  pm = new ulong 6 0
+  put pm 0 R9_SUBJ_PROPOSER
+  put pm 2 1
+  put pm 3 1
+  put pm 4 1
+  put pm 5 2
+  cid = new ulong 1 0
+  r9_chk eq rx_gen_propose pm ev el cid RX_GEN_OK
+  c2 = get cid 0
+  r9_chk eq c2 2
+
+  note Add required evidence work and external issued work
+  r9_chk eq rx_gen_add_work c2 101 RX_WORK_EVIDENCE RX_WORK_PENDING 1 RX_GEN_OK
+  r9_chk eq rx_gen_add_work c2 202 RX_WORK_EXTERNAL RX_WORK_ISSUED 0 RX_GEN_OK
+  r9_chk eq rx_gen_finish_work c2 101 RX_GEN_OK
+
+  note Self-promotion (proposer == subject) refused
+  preq = new ulong 7 0
+  put preq 0 c2
+  put preq 1 R9_SUBJ_PROPOSER
+  put preq 3 1
+  put preq 4 1
+  put preq 5 RX_GEN_RES_PROMOTION
+  put preq 6 RX_GEN_RIGHT_PROMOTE
+  r9_chk eq rx_gen_promote preq RX_GEN_ERR_AUTHORITY
+
+  note Authorized subject promotes candidate 2 -> active gen 2, lineage 2
+  put preq 1 R9_SUBJ_AUTHORITY
+  r9_chk eq rx_gen_promote preq RX_GEN_OK
+  r9_chk eq rx_gen_active act RX_GEN_OK
+  r9_chk eq get act 0 2
+  r9_chk eq get act 1 2
+
+  note Recovery coherent and idempotent; external work 202 replay refused
+  r9_chk eq rx_gen_recover RX_GEN_OK
+  r9_chk eq get rg_rec_meta 0 1
+  r9_chk eq get rg_rec_meta 1 2
+  r9_chk eq rx_gen_recover RX_GEN_OK
+  r9_chk eq get rg_rec_meta 1 2
+  r9_chk eq rx_gen_reject_replay 202 RX_GEN_ERR_REPLAY
+  r9_chk eq rx_gen_reject_replay 203 RX_GEN_OK
+end
+
+fn r9_test_bound_and_exec to void
+  r9_chk eq rx_gen_bind_authority RX_GEN_OK
+  ev = new uchar 256 0
+  el = len r9_ev2
+  for i ulong el bound 256
+    put ev i get r9_ev2 i
+  end
+  pm = new ulong 6 0
+  put pm 0 R9_SUBJ_PROPOSER
+  put pm 1 0
+  put pm 2 1
+  put pm 3 1
+  put pm 4 1
+  put pm 5 1
+  cid = new ulong 1 0
+  note Bare propose refused on bound store
+  r9_chk eq rx_gen_propose pm ev el cid RX_GEN_ERR_IDENTITY
+  put pm 1 1
+  r9_chk eq rx_gen_propose_as pm ev el cid RX_GEN_OK
+  c3 = get cid 0
+
+  preq = new ulong 7 0
+  put preq 0 c3
+  put preq 1 R9_SUBJ_AUTHORITY
+  put preq 2 1
+  put preq 3 1
+  put preq 4 1
+  put preq 5 RX_GEN_RES_PROMOTION
+  put preq 6 RX_GEN_RIGHT_PROMOTE
+  note Held barrier blocks promotion
+  r9_chk eq rx_gen_hold_barrier RX_GEN_OK
+  r9_chk eq rx_gen_promote preq RX_GEN_ERR_BUSY
+  r9_chk eq rx_gen_release_barrier RX_GEN_OK
+
+  note Executor promotes candidate 3 cleanly
+  r9_chk eq rx_gen_exec_start RX_GEN_OK
+  r9_chk eq rx_gen_post_promote 77 preq RX_GEN_OK
+  jout = new ulong 6 0
+  jrc = new long 1 0
+  r9_chk eq rx_gen_job_state RX_GEN_JOB_PROMOTE jout jrc long RX_GEN_JOB_DONE
+  r9_chk eq get jrc 0 RX_GEN_OK
+  rx_gen_job_take RX_GEN_JOB_PROMOTE
+  act = new ulong 2 0
+  r9_chk eq rx_gen_active act RX_GEN_OK
+  r9_chk eq get act 0 3
+  r9_chk eq get act 1 3
+  rx_gen_close
+end
+
+fn r9_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len r9_pass
+    for i ulong n bound 64
+      put buf i get r9_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len r9_fail_m
+  for i ulong n bound 64
+    put buf i get r9_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  r9_test_promo_cap_authority
+  r9_test_barrier_and_recovery
+  r9_test_bound_and_exec
+  if eq get r9_fail 0 0
+    r9_put_msg 1
+    ret 0
+  end
+  r9_put_msg 0
+  ret 1
+end

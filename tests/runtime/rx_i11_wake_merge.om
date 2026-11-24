@@ -1,0 +1,181 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_i11_wake_merge.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_i11_wake_merge.c (I11 wake-merge & causal replay parity).
+note World: sensor{temp, humidity} -> aien.hypothesis -> belief, and omega.risk
+note triggered by sensor humidity and belief. Runs 24 deterministic stimuli across
+note two passes and verifies identical crumb signatures, zero INVALIDATED crumbs,
+note and verifiable causal crumb chains.
+
+const I11_STIMULI ulong 24
+const I11_RES_SENSOR ulong 16
+const I11_RES_BELIEF ulong 32
+const I11_RES_RISK ulong 64
+
+global i11_checks ulong 1
+global i11_fail ulong 1
+global i11_sig0 ulong 96
+global i11_sig1 ulong 96
+global i11_nsig ulong 2
+
+text i11_pass "RX_I11_WAKE_MERGE_OM: PASS\n"
+text i11_fail_m "RX_I11_WAKE_MERGE_OM: FAIL\n"
+
+fn i11_chk cond bool to void
+  put i11_checks 0 add get i11_checks 0 1
+  if not cond
+    if eq get i11_fail 0 0
+      put i11_fail 0 get i11_checks 0
+    end
+  end
+end
+
+fn i11_setup_world to void
+  i11_chk eq rx_world_init 128 0
+  rx_world_set_resources 4 2 1024 1024
+  meta = new ulong 3 0
+  init_f = new ulong 8 0
+  ref = new ulong 2 0
+  note Object 0 = sensor, 1 = belief, 2 = risk
+  put meta 0 1
+  put meta 1 1
+  put meta 2 I11_RES_SENSOR
+  i11_chk eq rx_world_create meta init_f ref 0
+  put meta 2 I11_RES_BELIEF
+  i11_chk eq rx_world_create meta init_f ref 0
+  put meta 2 I11_RES_RISK
+  i11_chk eq rx_world_create meta init_f ref 0
+  note Caps: 0=ext WRITE sensor, 1=hyp READ sensor, 2=risk READ sensor, 3=risk READ belief
+  rw_cap_install 0 1 1 0 I11_RES_SENSOR 3
+  rw_cap_install 1 2 1 1 I11_RES_SENSOR 1
+  rw_cap_install 2 3 1 2 I11_RES_SENSOR 1
+  rw_cap_install 3 4 1 2 I11_RES_BELIEF 1
+
+  note Reaction 0 (aien.hypothesis): trigger sensor.f0, writes belief.f0
+  spec = new ulong 16 0
+  put spec 0 1
+  put spec 1 1
+  put spec 2 1
+  put spec 3 0
+  put spec 4 1
+  put spec 5 0
+  put spec 6 0
+  put spec 7 0
+  put spec 8 1
+  put spec 9 1
+  put spec 10 0
+  put spec 11 1
+  put spec 12 2
+  put spec 13 1
+  put spec 14 I11_RES_SENSOR
+  put spec 15 1
+  rid = new ulong 1 0
+  i11_chk eq rx_world_add_reaction spec rid 0
+  i11_chk eq get rid 0 0
+
+  note Reaction 1 (omega.risk): trigger belief.f0, writes risk.f0
+  put spec 0 2
+  put spec 1 2
+  put spec 3 1
+  put spec 4 1
+  put spec 5 1
+  put spec 9 2
+  put spec 12 4
+  put spec 14 I11_RES_BELIEF
+  i11_chk eq rx_world_add_reaction spec rid 0
+  i11_chk eq get rid 0 1
+end
+
+fn i11_pick k ulong to ulong
+  ret rem add mul k 7 2 3
+end
+
+fn i11_run_pass slot ulong to void
+  i11_setup_world
+  put i11_nsig slot 0
+  obuf = new ulong 8 0
+  chk = new ulong 1 0
+  for k ulong I11_STIMULI
+    kind = i11_pick k
+    i11_chk eq rx_world_read 0 0 obuf 0
+    t_val = get obuf 0
+    h_val = get obuf 1
+    if ne kind 1
+      nt = rem add add t_val 1 rem k 7 8
+      cid1 = rx_world_publish_external 1 1 0 0 0 nt
+      i11_chk gt cid1 0
+    end
+    if ne kind 0
+      nh = rem add add h_val 1 rem k 5 8
+      cid2 = rx_world_publish_external 1 1 0 0 1 nh
+      i11_chk gt cid2 0
+    end
+    note Drain ready reactions until quiescent
+    for step ulong 8
+      rc = rx_world_step_one
+      if eq rc 0
+        break
+      end
+      i11_chk eq rc 1
+    end
+    note No INVALIDATED crumbs
+    i11_chk eq get rw_stats 6 0
+    note Record deterministic state signature per stimulus
+    i11_chk eq rx_world_read 1 0 obuf 0
+    b0 = get obuf 0
+    i11_chk eq rx_world_read 2 0 obuf 0
+    r0 = get obuf 0
+    idx = get i11_nsig slot
+    if lt idx 96
+      sig = xor shl b0 16 r0
+      if eq slot 0
+        put i11_sig0 idx sig
+      else
+        put i11_sig1 idx sig
+      end
+      put i11_nsig slot add idx 1
+    end
+    note Reset crumb log before capacity fills while keeping chain verified
+    if ge get rw_w 3 100
+      i11_chk eq rx_world_verify_crumbs chk 0
+      i11_chk gt get chk 0 0
+      i11_setup_world
+    end
+  end
+  i11_chk eq rx_world_verify_crumbs chk 0
+  i11_chk gt get chk 0 0
+end
+
+fn i11_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len i11_pass
+    for i ulong n bound 64
+      put buf i get i11_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len i11_fail_m
+  for i ulong n bound 64
+    put buf i get i11_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  i11_run_pass 0
+  i11_run_pass 1
+  n0 = get i11_nsig 0
+  n1 = get i11_nsig 1
+  i11_chk eq n0 I11_STIMULI
+  i11_chk eq n0 n1
+  for i ulong n0 bound 96
+    i11_chk eq get i11_sig0 i get i11_sig1 i
+  end
+  if eq get i11_fail 0 0
+    i11_put_msg 1
+    ret 0
+  end
+  i11_put_msg 0
+  ret 1
+end

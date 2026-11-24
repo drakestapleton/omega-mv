@@ -1,0 +1,248 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_r15_instr.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_r15_instr.c (R15 instrumentation checks).
+note Verifies propagation fanout counters, blocked-wave slot limiting, timing
+note buffer overflow detection, small crumb-log overflow refusal, scoped R9
+note store I/O counters, and SEQ stale-plan quiescence refusal.
+
+const R15I_RES_SRC ulong 80
+
+global r15i_checks ulong 1
+global r15i_fail ulong 1
+
+text r15i_dir_a "/tmp/rx_r15_instr_om_a"
+text r15i_dir_b "/tmp/rx_r15_instr_om_b"
+text r15i_pass "RX_R15_INSTR_OM: PASS\n"
+text r15i_fail_m "RX_R15_INSTR_OM: FAIL\n"
+
+fn r15i_chk cond bool to void
+  put r15i_checks 0 add get r15i_checks 0 1
+  if not cond
+    if eq get r15i_fail 0 0
+      put r15i_fail 0 get r15i_checks 0
+    end
+  end
+end
+
+fn r15i_add_listener mask ulong to void
+  spec = new ulong 16 0
+  put spec 0 1
+  put spec 1 2
+  put spec 2 1
+  put spec 3 0
+  put spec 4 1
+  put spec 5 0
+  put spec 6 0
+  put spec 7 0
+  put spec 8 mask
+  put spec 9 1
+  put spec 10 0
+  put spec 11 1
+  put spec 12 2
+  put spec 13 1
+  put spec 14 R15I_RES_SRC
+  put spec 15 1
+  rid = new ulong 1 0
+  r15i_chk eq rx_world_add_reaction spec rid 0
+end
+
+fn r15i_setup_src to void
+  r15i_chk eq rx_world_init 128 0
+  meta = new ulong 3 0
+  put meta 0 1
+  put meta 1 1
+  put meta 2 R15I_RES_SRC
+  init_f = new ulong 8 0
+  ref = new ulong 2 0
+  r15i_chk eq rx_world_create meta init_f ref 0
+  r15i_chk eq rx_world_create meta init_f ref 0
+  rw_cap_install 0 1 1 0 R15I_RES_SRC 3
+  rw_cap_install 1 2 1 2 R15I_RES_SRC 1
+end
+
+fn r15i_test_fanout fanout ulong to void
+  r15i_setup_src
+  for i ulong fanout bound 32
+    r15i_add_listener 1
+  end
+  note Extra listener on field 1: inspected, never matched
+  r15i_add_listener 2
+  rx_world_set_timing 1 64
+  cid = rx_world_publish_external 1 1 0 0 0 7
+  r15i_chk gt cid 0
+  for step ulong 32
+    rc = rx_world_step_one
+    if eq rc 0
+      break
+    end
+    r15i_chk eq rc 1
+    put rw_time 2 add get rw_time 2 1
+  end
+  r15i_chk eq get rw_stats 3 add fanout 1
+  r15i_chk eq get rw_stats 4 fanout
+  r15i_chk eq get rw_stats 1 fanout
+  r15i_chk eq get rw_stats 5 fanout
+  tstat = new ulong 2 0
+  r15i_chk eq rx_world_timing_status tstat 0
+  r15i_chk eq get tstat 0 fanout
+  r15i_chk eq get tstat 1 fanout
+  rx_world_set_timing 0 0
+end
+
+fn r15i_test_blocked_wave to void
+  r15i_setup_src
+  rx_world_set_resources 1 2 4096 4096
+  for i ulong 8
+    r15i_add_listener 1
+  end
+  cid = rx_world_publish_external 1 1 0 0 0 3
+  r15i_chk gt cid 0
+  r15i_chk eq get rw_stats 4 8
+  r15i_chk eq get rw_stats 1 8
+  for step ulong 16
+    rc = rx_world_step_one
+    if eq rc 0
+      break
+    end
+    r15i_chk eq rc 1
+  end
+  r15i_chk eq get rw_stats 5 8
+end
+
+fn r15i_test_timing_overflow to void
+  r15i_setup_src
+  for i ulong 10
+    r15i_add_listener 1
+  end
+  rx_world_set_timing 1 4
+  cid = rx_world_publish_external 1 1 0 0 0 1
+  r15i_chk gt cid 0
+  for step ulong 16
+    rc = rx_world_step_one
+    if eq rc 0
+      break
+    end
+    put rw_time 2 add get rw_time 2 1
+  end
+  tstat = new ulong 2 0
+  r15i_chk eq rx_world_timing_status tstat RW_ERR_FULL
+  r15i_chk eq get tstat 0 4
+  r15i_chk eq get tstat 1 10
+  rx_world_set_timing 0 0
+end
+
+fn r15i_test_small_log_overflow to void
+  r15i_chk eq rx_world_init 16 0
+  meta = new ulong 3 0
+  put meta 0 1
+  put meta 1 1
+  put meta 2 R15I_RES_SRC
+  init_f = new ulong 8 0
+  ref = new ulong 2 0
+  r15i_chk eq rx_world_create meta init_f ref 0
+  rw_cap_install 0 1 1 0 R15I_RES_SRC 3
+  last = long 1
+  for i ulong 40
+    if le last 0
+      break
+    end
+    last = rx_world_publish_external 1 1 0 0 0 add i 2
+  end
+  r15i_chk le last 0
+  r15i_chk gt get rw_stats 12 0
+  chk = new ulong 1 0
+  r15i_chk eq rx_world_verify_crumbs chk 0
+end
+
+fn r15i_test_store_io_scoped to void
+  gio0 = new ulong 2 0
+  rx_gen_io_counters gio0
+  da = new uchar 128 0
+  la = len r15i_dir_a
+  for i ulong la bound 128
+    put da i get r15i_dir_a i
+  end
+  r15i_chk eq rx_gen_open da la RX_GEN_OK
+  ioa = new ulong 2 0
+  r15i_chk eq rx_gen_store_io ioa RX_GEN_OK
+  r15i_chk gt get ioa 0 0
+  r15i_chk gt get ioa 1 0
+  rx_gen_close
+  db = new uchar 128 0
+  lb = len r15i_dir_b
+  for i ulong lb bound 128
+    put db i get r15i_dir_b i
+  end
+  r15i_chk eq rx_gen_open db lb RX_GEN_OK
+  iob = new ulong 2 0
+  r15i_chk eq rx_gen_store_io iob RX_GEN_OK
+  r15i_chk gt get iob 0 0
+  r15i_chk gt get iob 1 0
+  gio1 = new ulong 2 0
+  rx_gen_io_counters gio1
+  r15i_chk eq sub get gio1 0 get gio0 0 add get ioa 0 get iob 0
+  r15i_chk eq sub get gio1 1 get gio0 1 add get ioa 1 get iob 1
+  rx_gen_close
+end
+
+fn r15i_test_seq_stale_plan to void
+  r15i_chk eq rx_world_init_sequential_reference 64 0
+  r15i_chk eq get rw_w 1 1
+  meta = new ulong 3 0
+  put meta 0 1
+  put meta 1 1
+  put meta 2 R15I_RES_SRC
+  init_f = new ulong 8 0
+  ref = new ulong 2 0
+  r15i_chk eq rx_world_create meta init_f ref 0
+  r15i_chk eq rx_world_create meta init_f ref 0
+  rw_cap_install 0 1 1 0 R15I_RES_SRC 3
+  rw_cap_install 1 2 1 2 R15I_RES_SRC 1
+  r15i_add_listener 1
+  r15i_add_listener 1
+  cid = rx_world_publish_external 1 1 0 0 0 7
+  r15i_chk gt cid 0
+  note Sequential reference activates registered reactions explicitly by ID
+  r15i_chk eq rx_world_seq_activate_locked 0 ulong cid 1
+  r15i_chk eq rx_world_seq_activate_locked 1 ulong cid 1
+  r15i_chk eq get rw_stats 5 2
+  chk = new ulong 1 0
+  r15i_chk eq rx_world_verify_crumbs chk 0
+  r15i_chk eq get chk 0 5
+end
+
+fn r15i_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len r15i_pass
+    for i ulong n bound 64
+      put buf i get r15i_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len r15i_fail_m
+  for i ulong n bound 64
+    put buf i get r15i_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  r15i_test_fanout 1
+  r15i_test_fanout 2
+  r15i_test_fanout 4
+  r15i_test_fanout 8
+  r15i_test_fanout 16
+  r15i_test_blocked_wave
+  r15i_test_timing_overflow
+  r15i_test_small_log_overflow
+  r15i_test_store_io_scoped
+  r15i_test_seq_stale_plan
+  if eq get r15i_fail 0 0
+    r15i_put_msg 1
+    ret 0
+  end
+  r15i_put_msg 0
+  ret int get r15i_fail 0
+end
