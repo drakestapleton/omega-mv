@@ -26,15 +26,45 @@ global dfSlabCfg ulong 5
 global dfPhysical ulong 4800
 global dfLruPrev long 4800
 global dfLruNext long 4800
-global dfArbEdges uint 239616
-global dfArbPrev uint 6
-global dfArbPfKey ulong 6
+const dfSpecN ulong 3
+const dfSpecRowBytes ulong 7864320
+global dfSpecIds uint 18
+global dfSpecHist uint 720
+global dfSpecStat ulong 6
 global dfArbPfMeta ulong 5
-global dfArbPfDesc uchar 384
+global dfPfStat ulong 5
+global dfPfReq int 6
+global dfPfRep int 6
+global dfPfPid long 6
+global dfPfBusy long 6
+global dfPfActive ulong 1
+global dfPfStage long 1
+global dfPfSlotKey long 64
+global dfPfSlotState uchar 64
+global dfPfSlotSeq ulong 64
+global dfPfOfKey uchar 15360
+global dfPfPoll uchar 8
+const dfPfSlots ulong 64
 note dfStats: 0=hits, 1=misses, 2=nvme_ns, 3=gpu_ns, 4=engram_ns, 5=tokens
 note dfSlabCfg: 0=totalSlots, 1=lruTail, 2=recordTrace, 3=unpublished physical slot, 4=lruHead
-note dfArbEdges: 39 * 384 * 16 packed (count<<16 | target_eid) online cross-layer sum graph
-note dfArbPfMeta: 0=inFlightCount, 1=inFlightLayer, 2=pfHits, 3=pfDispatched, 4=pfEnabled
+note Look-ahead routing (prefetch on only). In the batch that routes layer L, the routers of dfSpecN
+note later layers are also applied to layer L's FFN input, which is already on the GPU. Their top-6
+note picks are guesses for those layers and feed the prefetch workers. The guesses never reach the
+note model's arithmetic: routing, weights and outputs come from the true router of each layer.
+note dfSpecIds: this step's guesses, 6 per depth index, 0xffffffff when the layer does not exist.
+note dfSpecHist: [depth index][target layer][6], the guess made for that layer in this token.
+note dfSpecStat: per depth index, guesses compared and guesses that the true router confirmed.
+note dfArbPfMeta: 0=prefetches in flight, 1=prefetches the decoder had to wait for, 2=prefetched experts
+note used (pf_hits), 3=prefetches dispatched, 4=pfEnabled
+note dfPfStat: 0=staged experts dropped unused, 1=prefetches that failed verification or lost their
+note worker, 2=nanoseconds spent waiting for an in-flight prefetch, 3=guesses skipped because no prefetch
+note worker was idle, 4=dispatch sequence number
+note dfPfBusy: per prefetch worker, the staging slot it is filling, -1 idle, -2 gone
+note Staging: dfPfSlots payload-sized slots of shared anonymous memory, created before the prefetch
+note workers fork. A prefetch worker reads one expert payload into its slot and checks the digest of
+note exactly those bytes. dfPfSlotState: 0 free, 1 in flight, 2 verified. dfPfOfKey: staging slot + 1
+note of a (layer, expert) key, 0 when the key is not staged. The decoder never waits for a prefetch it
+note does not need: replies are collected with a zero-interval poll.
 
 fn dfMonoNs to ulong
   ret ulong monons
@@ -834,7 +864,7 @@ fn dfAttnPost layer ulong pos ulong to bool
     ropeBase = wsRopeComp
   end
   ropeOff = add ropeBase mul pos 256
-  if not gbbegin 69
+  if not gbbegin add 69 dfSpecRecords layer
     ret false
   end
   if not dwBind 3 wsQ 131072
@@ -886,6 +916,9 @@ fn dfAttnPost layer ulong pos ulong to bool
     ret false
   end
   if not dfFfnPreRouteBody layer
+    ret false
+  end
+  if not dfSpecRouteBody layer
     ret false
   end
   ret dfSubmit
@@ -1039,6 +1072,22 @@ fn dfPickVictim layer ulong to ulong
   ret get dfSlabCfg 1
 end
 
+note The spare physical slot now holds key's verified payload: give it to logical slot `slot`, whose
+note old physical slot becomes the spare.
+fn dfSwapSpareIn slot ulong key ulong to long
+  spare = get dfSlabCfg 3
+  oldKey = get dfSlotKey slot
+  if ge oldKey 0
+    put dfSlotOf ulong oldKey -1
+  end
+  put dfSlabCfg 3 get dfPhysical slot
+  put dfPhysical slot spare
+  put dfSlotKey slot long key
+  put dfSlotOf key long slot
+  dfLruTouch slot
+  ret long slot
+end
+
 fn dfLoadMiss layer ulong key ulong desc view uchar 64 to long
   if or ne ulong get desc 0 add layer 3 ne ulong get desc 1 layer
     ret -1
@@ -1051,40 +1100,29 @@ fn dfLoadMiss layer ulong key ulong desc view uchar 64 to long
   if not deVerifyAt get dfShardFD layer desc get dwSlabMaps div spare 800 mul rem spare 800 deBytes
     ret -1
   end
-  oldKey = get dfSlotKey slot
-  if ge oldKey 0
-    put dfSlotOf ulong oldKey -1
-  end
-  put dfSlabCfg 3 get dfPhysical slot
-  put dfPhysical slot spare
-  put dfSlotKey slot long key
-  put dfSlotOf key long slot
-  dfLruTouch slot
-  ret long slot
+  ret dfSwapSpareIn slot key
 end
 
-fn dfResolveOne layer ulong k ulong to long
+note Load gate position k's absent expert inline: read, hash and write it into the spare slab slot.
+note timed adds the load time to nvme_ns; pass false inside an interval that is already being timed.
+fn dfGateDemand layer ulong k ulong timed bool to bool
   desc = new uchar 64 0
   eid = ulong get dfCurIds k
   key = add mul layer 384 eid
-  cur = get dfSlotOf key
-  if ge cur 0
-    put dfCurSlots k cur
-    put dfStats 0 add get dfStats 0 1
-    ret 0
-  end
   if not diRead get dfSidecarFD layer desc mul eid 64 64
-    ret -1
+    ret false
   end
   tN0 = dfMonoNs
   slot = dfLoadMiss layer key desc
   if lt slot 0
-    ret -1
+    ret false
   end
-  put dfStats 2 add get dfStats 2 sub dfMonoNs tN0
+  if timed
+    put dfStats 2 add get dfStats 2 sub dfMonoNs tN0
+  end
   put dfCurSlots k slot
   put dfStats 1 add get dfStats 1 1
-  ret 1
+  ret true
 end
 
 fn dfPublishVerified layer ulong key ulong desc view uchar 64 to long
@@ -1095,16 +1133,7 @@ fn dfPublishVerified layer ulong key ulong desc view uchar 64 to long
   if not deWriteVerifiedAt get dfShardFD layer desc dMap dOff
     ret -1
   end
-  oldKey = get dfSlotKey slot
-  if ge oldKey 0
-    put dfSlotOf ulong oldKey -1
-  end
-  put dfSlabCfg 3 get dfPhysical slot
-  put dfPhysical slot spare
-  put dfSlotKey slot long key
-  put dfSlotOf key long slot
-  dfLruTouch slot
-  ret long slot
+  ret dfSwapSpareIn slot key
 end
 
 fn dfPipeRead fd int buf edit uchar * n ulong to bool
@@ -1157,243 +1186,463 @@ fn dfWorkerLoop idx ulong reqFd int repFd int to void
   exit 0
 end
 
-fn dfArbDrainDiscard to void
-  cnt = get dfArbPfMeta 0
-  if eq cnt 0
-    ret
-  end
+fn dfPfWorkerLoop reqFd int repFd int to void
+  req = new uchar 80 0
+  desc = new uchar 64 0
   rep = new uchar 1 0
-  for m ulong cnt bound 6
-    u = dfPipeRead get dfWrRep m rep 1
+  while dfPipeRead reqFd req 80
+    layer = diGet req 0 8
+    slot = diGet req 72 8
+    for j ulong 64
+      put desc j get req add 8 j
+    end
+    put rep 0 1
+    if and lt layer 40 lt slot dfPfSlots
+      if deVerifyAt get dfShardFD layer desc get dfPfStage 0 mul slot deBytes
+        put rep 0 0
+      end
+    end
+    if not dfPipeWrite repFd rep 1
+      exit 1
+    end
   end
-  put dfArbPfMeta 0 0
+  exit 0
 end
 
-fn dfArbPublishOne layer ulong m ulong to long
-  desc = new uchar 64 0
-  key = get dfArbPfKey m
-  if or ge get dfSlotOf key 0 not dfGateNeedsKey long key layer
-    ret 0
+fn dfPfFree slot ulong to void
+  key = get dfPfSlotKey slot
+  if ge key 0
+    put dfPfOfKey ulong key 0
   end
-  base = mul m 64
-  for j ulong 64
-    put desc j get dfArbPfDesc add base j
-  end
-  slot = dfPublishVerified layer key desc
+  put dfPfSlotKey slot -1
+  put dfPfSlotState slot 0
+end
+
+note Read worker w's reply (blocking) and record whether its staging slot holds verified bytes.
+fn dfPfFinish w ulong to void
+  rep = new uchar 1 1
+  slot = get dfPfBusy w
   if lt slot 0
+    ret
+  end
+  ok = dfPipeRead get dfPfRep w rep 1
+  put dfArbPfMeta 0 sub get dfArbPfMeta 0 1
+  if not ok
+    put dfPfBusy w -2
+    dfPfFree ulong slot
+    put dfPfStat 1 add get dfPfStat 1 1
+    ret
+  end
+  put dfPfBusy w -1
+  if eq get rep 0 0
+    put dfPfSlotState ulong slot 2
+  else
+    dfPfFree ulong slot
+    put dfPfStat 1 add get dfPfStat 1 1
+  end
+end
+
+fn dfPfReplyReady w ulong to bool
+  fd = get dfPfRep w
+  put dfPfPoll 0 uchar and fd 255
+  put dfPfPoll 1 uchar and shr fd 8 255
+  put dfPfPoll 2 uchar and shr fd 16 255
+  put dfPfPoll 3 uchar and shr fd 24 255
+  put dfPfPoll 4 1
+  put dfPfPoll 5 0
+  put dfPfPoll 6 0
+  put dfPfPoll 7 0
+  ret gt pollfds dfPfPoll 0 8 0 0
+end
+
+note Collect the replies that have already arrived. Never waits.
+fn dfPfHarvest to void
+  n = get dfPfActive 0
+  for w ulong n bound 6
+    if ge get dfPfBusy w 0
+      if dfPfReplyReady w
+        dfPfFinish w
+      end
+    end
+  end
+end
+
+note Staging slot assigned to key (being read or verified), or -1.
+fn dfPfLookup key ulong to long
+  v = ulong get dfPfOfKey key
+  if eq v 0
     ret -1
   end
+  ret long sub v 1
+end
+
+note True when staging slot `slot` holds key's verified payload. Waits only when that payload, which
+note the decoder needs now, is still being read by a prefetch worker. timed adds the wait to nvme_ns.
+fn dfPfAwait slot ulong key ulong timed bool to bool
+  if eq get dfPfSlotState slot 1
+    tN0 = dfMonoNs
+    n = get dfPfActive 0
+    for w ulong n bound 6
+      if eq get dfPfBusy w long slot
+        dfPfFinish w
+      end
+    end
+    waited = sub dfMonoNs tN0
+    put dfArbPfMeta 1 add get dfArbPfMeta 1 1
+    put dfPfStat 2 add get dfPfStat 2 waited
+    if timed
+      put dfStats 2 add get dfStats 2 waited
+    end
+  end
+  ret and eq get dfPfSlotState slot 2 eq get dfPfSlotKey slot long key
+end
+
+note Copy a verified staged payload into the spare slab slot and publish it. The bytes published are
+note the bytes the worker hashed.
+fn dfPfPublish layer ulong key ulong stage ulong to long
+  buf = new uchar 1048576 0
+  slot = dfPickVictim layer
+  spare = get dfSlabCfg 3
+  dMap = get dwSlabMaps div spare 800
+  dOff = mul rem spare 800 deBytes
+  sMap = get dfPfStage 0
+  sOff = mul stage deBytes
+  pos = ulong 0
+  while lt pos deBytes
+    n = sub deBytes pos
+    if gt n len buf
+      n = len buf
+    end
+    if ne mapread sMap add sOff pos buf 0 n long n
+      ret -1
+    end
+    if ne mapwrite dMap add dOff pos buf 0 n long n
+      ret -1
+    end
+    pos = add pos n
+  end
+  dfPfFree stage
   put dfArbPfMeta 2 add get dfArbPfMeta 2 1
-  ret 1
+  ret dfSwapSpareIn slot key
 end
 
-fn dfArbDrainAndPublish layer ulong to long
-  cnt = get dfArbPfMeta 0
-  if eq cnt 0
-    ret 0
-  end
-  pfLayer = get dfArbPfMeta 1
-  rep = new uchar 1 0
-  okMask = new uchar 6 0
-  tN0 = dfMonoNs
-  for m ulong cnt bound 6
-    if and dfPipeRead get dfWrRep m rep 1 eq get rep 0 0
-      put okMask m 1
+note A free staging slot, else the verified slot that has waited longest (its payload is dropped), else -1.
+fn dfPfPickSlot to long
+  best = long -1
+  bestSeq = ulong 0
+  for s ulong dfPfSlots
+    st = get dfPfSlotState s
+    if eq st 0
+      ret long s
     end
-  end
-  put dfArbPfMeta 0 0
-  published = long 0
-  if eq pfLayer layer
-    for m ulong cnt bound 6
-      if eq get okMask m 1
-        r = dfArbPublishOne layer m
-        if lt r 0
-          published = long -1
-          break
-        end
-        if eq r 1
-          published = long 1
-        end
+    if eq st 2
+      if or lt best 0 lt get dfPfSlotSeq s bestSeq
+        best = long s
+        bestSeq = get dfPfSlotSeq s
       end
     end
   end
-  tN1 = dfMonoNs
-  put dfStats 2 add get dfStats 2 sub tN1 tN0
-  ret published
-end
-
-fn dfArbPack cnt ulong tgt ulong to uint
-  ret or shl uint cnt 16 uint tgt
-end
-
-fn dfArbHalveRow rowBase ulong to void
-  for h ulong 16
-    e2 = get dfArbEdges add rowBase h
-    c2 = ulong shr e2 16
-    if gt c2 1
-      put dfArbEdges add rowBase h dfArbPack shr c2 1 ulong and e2 65535
-    else
-      put dfArbEdges add rowBase h 0
-    end
-  end
-end
-
-fn dfArbBumpEdge prevLayer ulong src ulong tgt ulong to void
-  rowBase = mul add mul prevLayer 384 src 16
-  emptySlot = ulong 16
-  minSlot = ulong 0
-  minCnt = ulong 65536
-  for j ulong 16
-    ent = get dfArbEdges add rowBase j
-    c = ulong shr ent 16
-    if eq c 0
-      if eq emptySlot 16
-        emptySlot = j
-      end
-    else
-      if eq ulong and ent 65535 tgt
-        nc = add c 1
-        if ge nc 60000
-          dfArbHalveRow rowBase
-          nc = ulong 30000
-        end
-        put dfArbEdges add rowBase j dfArbPack nc tgt
-        ret
-      end
-      if lt c minCnt
-        minCnt = c
-        minSlot = j
-      end
-    end
-  end
-  if lt emptySlot 16
-    put dfArbEdges add rowBase emptySlot dfArbPack 1 tgt
-    ret
-  end
-  if le minCnt 1
-    put dfArbEdges add rowBase minSlot dfArbPack 1 tgt
-  else
-    oldTgt = ulong and get dfArbEdges add rowBase minSlot 65535
-    put dfArbEdges add rowBase minSlot dfArbPack sub minCnt 1 oldTgt
-  end
-end
-
-fn dfArbUpdate layer ulong to void
-  if and gt layer 0 lt layer 40
-    prevLayer = sub layer 1
-    for s ulong 6
-      src = ulong get dfArbPrev s
-      if lt src 384
-        for d ulong 6
-          tgt = ulong get dfCurIds d
-          if lt tgt 384
-            dfArbBumpEdge prevLayer src tgt
-          end
-        end
-      end
-    end
-  end
-  for k ulong 6
-    put dfArbPrev k get dfCurIds k
-  end
-end
-
-fn dfArbScoreNext layer ulong scores edit ulong 384 to void
-  for s ulong 6
-    src = ulong get dfCurIds s
-    if lt src 384
-      rowBase = mul add mul layer 384 src 16
-      for j ulong 16
-        ent = get dfArbEdges add rowBase j
-        c = ulong shr ent 16
-        if gt c 0
-          tgt = ulong and ent 65535
-          if lt tgt 384
-            put scores tgt add get scores tgt c
-          end
-        end
-      end
-    end
-  end
-end
-
-fn dfArbPickBest nextLayer ulong scores view ulong 384 to ulong
-  best = ulong 384
-  bestScore = ulong 0
-  for e ulong 384
-    sc = get scores e
-    if gt sc bestScore
-      key = add mul nextLayer 384 e
-      if lt get dfSlotOf key 0
-        bestScore = sc
-        best = e
-      end
-    end
+  if ge best 0
+    dfPfFree ulong best
+    put dfPfStat 0 add get dfPfStat 0 1
   end
   ret best
 end
 
-fn dfArbSendPrefetch nextLayer ulong pfCount ulong best ulong to long
+fn dfPfIdleWorker to long
+  n = get dfPfActive 0
+  for w ulong n bound 6
+    if eq get dfPfBusy w -1
+      ret long w
+    end
+  end
+  ret -1
+end
+
+note Ask an idle prefetch worker to stage expert eid of layer. 1 sent, 0 not sent. Never waits.
+fn dfPfDispatch layer ulong eid ulong to long
   desc = new uchar 64 0
-  req = new uchar 72 0
-  if not diRead get dfSidecarFD nextLayer desc mul best 64 64
-    ret -1
-  end
-  if or ne ulong get desc 0 add nextLayer 3 ne ulong get desc 1 nextLayer
+  req = new uchar 80 0
+  if or ge layer 40 ge eid 384
     ret 0
   end
-  if ne best diGet desc 4 4
+  key = add mul layer 384 eid
+  if or ge get dfSlotOf key 0 ne get dfPfOfKey key 0
     ret 0
   end
-  diPut req 0 8 nextLayer
-  base = mul pfCount 64
+  w = dfPfIdleWorker
+  if lt w 0
+    put dfPfStat 3 add get dfPfStat 3 1
+    ret 0
+  end
+  if not diRead get dfSidecarFD layer desc mul eid 64 64
+    ret 0
+  end
+  if or ne ulong get desc 0 add layer 3 ne ulong get desc 1 layer
+    ret 0
+  end
+  if ne eid diGet desc 4 4
+    ret 0
+  end
+  slot = dfPfPickSlot
+  if lt slot 0
+    ret 0
+  end
+  diPut req 0 8 layer
   for j ulong 64
-    b = get desc j
-    put req add 8 j b
-    put dfArbPfDesc add base j b
+    put req add 8 j get desc j
   end
-  if not dfPipeWrite get dfWrReq pfCount req 72
-    ret -1
+  diPut req 72 8 ulong slot
+  if not dfPipeWrite get dfPfReq ulong w req 80
+    put dfPfBusy ulong w -2
+    put dfPfStat 1 add get dfPfStat 1 1
+    ret 0
   end
-  put dfArbPfKey pfCount add mul nextLayer 384 best
+  seq = add get dfPfStat 4 1
+  put dfPfStat 4 seq
+  put dfPfBusy ulong w slot
+  put dfPfSlotKey ulong slot long key
+  put dfPfSlotState ulong slot 1
+  put dfPfSlotSeq ulong slot seq
+  put dfPfOfKey key uchar add ulong slot 1
+  put dfArbPfMeta 0 add get dfArbPfMeta 0 1
+  put dfArbPfMeta 3 add get dfArbPfMeta 3 1
   ret 1
 end
 
+note How many layers ahead depth index i looks.
+fn dfSpecDepthAt i ulong to ulong
+  ret add i 2
+end
+
+note Number of leading depth indexes whose target layer exists (0 with prefetch off).
+fn dfSpecDepths layer ulong to ulong
+  if eq get dfArbPfMeta 4 0
+    ret 0
+  end
+  n = ulong 0
+  for i ulong dfSpecN
+    if le add layer dfSpecDepthAt i 39
+      n = add n 1
+    end
+  end
+  ret n
+end
+
+note Launches the look-ahead adds to the batch that routes `layer`.
+fn dfSpecRecords layer ulong to ulong
+  n = dfSpecDepths layer
+  if eq n 0
+    ret 0
+  end
+  ret add 2 mul 2 n
+end
+
+fn dfSpecMulRow wb view uchar 10240 gb view uchar 10240 ob edit uchar 20480 to void
+  for j ulong 5120
+    p = mul j 2
+    wu = or shl uint get wb p 16 shl uint get wb add p 1 24
+    gu = or shl uint get gb p 16 shl uint get gb add p 1 24
+    pv = bitcast uint mul bitcast f32 wu bitcast f32 gu
+    q = mul j 4
+    put ob q uchar and pv 255
+    put ob add q 1 uchar and shr pv 8 255
+    put ob add q 2 uchar and shr pv 16 255
+    put ob add q 3 uchar and shr pv 24 255
+  end
+end
+
+note Table for one layer: its router matrix (384 x 5120, BF16 in zone 1) as f32, each column multiplied
+note by that layer's FFN norm gain. One dense launch on the unit-RMS input then gives its router logits.
+fn dfSpecFoldLayer layer ulong to bool
+  wb = new uchar 10240 0
+  gb = new uchar 10240 0
+  ob = new uchar 20480 0
+  woff = dfSlot layer 21
+  goff = dfSlot layer 1
+  if or eq woff lmMissing eq goff lmMissing
+    ret false
+  end
+  if ne mapread get dwMaps 0 goff gb 0 10240 10240
+    ret false
+  end
+  dst = mul sub layer 1 dfSpecRowBytes
+  for e ulong 384
+    if ne mapread get dwMaps 0 add woff mul e 10240 wb 0 10240 10240
+      ret false
+    end
+    dfSpecMulRow wb gb ob
+    if ne mapwrite get dwMaps 5 add dst mul e 20480 ob 0 20480 20480
+      ret false
+    end
+  end
+  ret true
+end
+
+note Build the look-ahead tables for layers 1 to 39. Call after zone 1 is populated, prefetch on only.
+fn dfSpecInit to bool
+  for i ulong 18
+    put dfSpecIds i 0xffffffff
+  end
+  for i ulong 6
+    put dfSpecStat i 0
+  end
+  size = mul 39 dfSpecRowBytes
+  m = nvalloc size true
+  if le m 0
+    ret false
+  end
+  put dwMaps 5 m
+  put dwSizes 5 size
+  for layer ulong 39
+    if not dfSpecFoldLayer add layer 1
+      ret false
+    end
+  end
+  ret true
+end
+
+note Record the look-ahead launches. wsX is the FFN input the true router of `layer` has just used.
+fn dfSpecRouteBody layer ulong to bool
+  n = dfSpecDepths layer
+  if eq n 0
+    ret true
+  end
+  if not dwBind 3 wsX 20480
+    ret false
+  end
+  if not dwBind 3 wsSpecStat 4
+    ret false
+  end
+  headArg 5120
+  if not dnRecord 30 1 1 1 32
+    ret false
+  end
+  if not dwBind 3 wsX 20480
+    ret false
+  end
+  if not dwBind 3 wsOnes 20480
+    ret false
+  end
+  if not dwBind 3 wsSpecStat 4
+    ret false
+  end
+  if not dwBind 3 wsSpecNorm 20480
+    ret false
+  end
+  headArg 5120
+  if not dnRecord 13 40 1 1 128
+    ret false
+  end
+  for i ulong n bound 3
+    tl = add layer dfSpecDepthAt i
+    if not dwDense wsSpecNorm 5 mul sub tl 1 dfSpecRowBytes wsSpecLogits 5120 384
+      ret false
+    end
+    if not dwBind 3 wsSpecLogits 1536
+      ret false
+    end
+    if not dwBind 0 dfSlot tl 22 1536
+      ret false
+    end
+    if not dwBind 4 add ioSpecIds mul i 32 24
+      ret false
+    end
+    if not dwBind 4 add ioSpecWeights mul i 32 24
+      ret false
+    end
+    if not dnRecord 16 1 1 1 1
+      ret false
+    end
+  end
+  ret true
+end
+
+note Score the guesses made earlier in this token for `layer` against its true routing (dfCurIds).
+fn dfSpecScore layer ulong to void
+  for i ulong dfSpecN
+    if ge layer dfSpecDepthAt i
+      base = mul add mul i 40 layer 6
+      right = ulong 0
+      for j ulong 6
+        g = get dfSpecHist add base j
+        for k ulong 6
+          if eq g get dfCurIds k
+            right = add right 1
+          end
+        end
+      end
+      put dfSpecStat mul i 2 add get dfSpecStat mul i 2 6
+      put dfSpecStat add mul i 2 1 add get dfSpecStat add mul i 2 1 right
+    end
+  end
+end
+
+note Read this step's guesses from the I/O map into dfSpecIds and dfSpecHist.
+fn dfSpecRead layer ulong to bool
+  raw = new uchar 24 0
+  n = dfSpecDepths layer
+  for i ulong dfSpecN
+    if lt i n
+      if ne mapread get dwMaps 4 add ioSpecIds mul i 32 raw 0 24 24
+        ret false
+      end
+      base = mul add mul i 40 add layer dfSpecDepthAt i 6
+      for j ulong 6
+        e = uint diGet raw mul j 4 4
+        if ge e 384
+          e = 0xffffffff
+        end
+        put dfSpecIds add mul i 6 j e
+        put dfSpecHist add base j e
+      end
+    else
+      for j ulong 6
+        put dfSpecIds add mul i 6 j 0xffffffff
+      end
+    end
+  end
+  ret true
+end
+
+note After a layer's experts are resolved: collect finished prefetches, then hand this step's guesses
+note to idle prefetch workers, nearest layer first. Nothing here waits.
 fn dfArbDispatchPrefetch layer ulong to void
-  if or eq get dfArbPfMeta 4 0 ne get dfWrActive 0 6
+  if or eq get dfArbPfMeta 4 0 eq get dfPfActive 0 0
     ret
   end
-  if ge layer 39
-    ret
-  end
-  nextLayer = add layer 1
-  scores = new ulong 384 0
-  dfArbScoreNext layer scores
-  pfCount = ulong 0
-  for pick ulong 2
-    best = dfArbPickBest nextLayer scores
-    if eq best 384
-      break
-    end
-    if lt get scores best 2
-      break
-    end
-    put scores best 0
-    sr = dfArbSendPrefetch nextLayer pfCount best
-    if lt sr 0
-      break
-    end
-    if eq sr 1
-      pfCount = add pfCount 1
+  dfPfHarvest
+  for i ulong dfSpecN
+    tl = add layer dfSpecDepthAt i
+    if le tl 39
+      for j ulong 6
+        e = ulong get dfSpecIds add mul i 6 j
+        if lt e 384
+          sent = dfPfDispatch tl e
+        end
+      end
     end
   end
-  put dfArbPfMeta 0 pfCount
-  put dfArbPfMeta 1 nextLayer
-  put dfArbPfMeta 3 add get dfArbPfMeta 3 pfCount
+end
+
+fn dfPfStop to void
+  wbuf = new uchar 4 0
+  n = get dfPfActive 0
+  put dfPfActive 0 0
+  for i ulong n bound 6
+    u1 = fclose get dfPfReq i
+    u2 = fclose get dfPfRep i
+    u3 = waitpid int get dfPfPid i wbuf 0 4 0
+  end
+  if gt get dfPfStage 0 0
+    u4 = mapdrop get dfPfStage 0
+    put dfPfStage 0 0
+  end
+  put dfArbPfMeta 0 0
 end
 
 fn dfStopWorkers to void
-  dfArbDrainDiscard
+  dfPfStop
   wbuf = new uchar 4 0
   n = get dfWrActive 0
   put dfWrActive 0 0
@@ -1449,14 +1698,98 @@ fn dfStartOneWorker w ulong to bool
   ret true
 end
 
-fn dfStartWorkers to bool
+fn dfPfClosePrev w ulong to void
+  for prev ulong w bound 6
+    u3 = fclose get dfPfReq prev
+    u4 = fclose get dfPfRep prev
+  end
+end
+
+fn dfPfStartOne w ulong to bool
+  p1 = new uchar 8 0
+  p2 = new uchar 8 0
+  if ne pipefds p1 0 8 0 0
+    ret false
+  end
+  if ne pipefds p2 0 8 0 0
+    u1 = fclose int diGet p1 0 4
+    u2 = fclose int diGet p1 4 4
+    ret false
+  end
+  r1 = int diGet p1 0 4
+  w1 = int diGet p1 4 4
+  r2 = int diGet p2 0 4
+  w2 = int diGet p2 4 4
+  p = fork
+  if lt p 0
+    u1 = fclose r1
+    u2 = fclose w1
+    u3 = fclose r2
+    u4 = fclose w2
+    ret false
+  end
+  if eq p 0
+    u1 = fclose w1
+    u2 = fclose r2
+    dfClosePrevWorkers get dfWrActive 0
+    dfPfClosePrev w
+    dfPfWorkerLoop r1 w2
+  end
+  u1 = fclose r1
+  u2 = fclose w2
+  put dfPfReq w w1
+  put dfPfRep w r2
+  put dfPfPid w p
+  put dfPfBusy w -1
+  put dfPfActive 0 add w 1
+  ret true
+end
+
+note The staging memory is shared and is created before the prefetch workers fork.
+fn dfPfStart to bool
+  for s ulong dfPfSlots
+    put dfPfSlotKey s -1
+    put dfPfSlotState s 0
+    put dfPfSlotSeq s 0
+  end
+  for i ulong 15360
+    put dfPfOfKey i 0
+  end
+  for i ulong 5
+    put dfPfStat i 0
+  end
+  m = mapnew -1 0 mul dfPfSlots deBytes 3 33
+  if le m 0
+    ret false
+  end
+  put dfPfStage 0 m
+  for w ulong 6
+    if not dfPfStartOne w
+      ret false
+    end
+  end
+  ret true
+end
+
+note dfStartWorkers starts the six payload workers and sets the Arboris prefetch switch in the same
+note place (pfOn 1 = prefetch on, 0 = off), so no later step can leave the wrong arm running.
+fn dfStartWorkers pfOn ulong to bool
+  if gt pfOn 1
+    ret false
+  end
   for w ulong 6
     if not dfStartOneWorker w
       dfStopWorkers
       ret false
     end
   end
-  put dfArbPfMeta 4 1
+  if eq pfOn 1
+    if not dfPfStart
+      dfStopWorkers
+      ret false
+    end
+  end
+  put dfArbPfMeta 4 pfOn
   ret true
 end
 
@@ -1482,9 +1815,8 @@ fn dfReadMissDescs layer ulong mIdx view ulong 6 mCount ulong descs edit uchar 3
   ret true
 end
 
-fn dfDispatchWorkers layer ulong mCount ulong descs view uchar 384 to bool
+fn dfSendMisses layer ulong mCount ulong descs view uchar 384 to bool
   req = new uchar 72 0
-  rep = new uchar 1 0
   for m ulong mCount bound 6
     diPut req 0 8 layer
     base = mul m 64
@@ -1495,6 +1827,11 @@ fn dfDispatchWorkers layer ulong mCount ulong descs view uchar 384 to bool
       ret false
     end
   end
+  ret true
+end
+
+fn dfCollectMisses mCount ulong to bool
+  rep = new uchar 1 0
   allOk = true
   for m ulong mCount bound 6
     if or not dfPipeRead get dfWrRep m rep 1 ne get rep 0 0
@@ -1504,63 +1841,144 @@ fn dfDispatchWorkers layer ulong mCount ulong descs view uchar 384 to bool
   ret allOk
 end
 
-fn dfResolveMissesParallel layer ulong mIdx view ulong 6 mCount ulong to bool
-  descs = new uchar 384 0
-  desc = new uchar 64 0
-  if not dfReadMissDescs layer mIdx mCount descs
-    ret false
-  end
-  tN0 = dfMonoNs
-  if not dfDispatchWorkers layer mCount descs
-    ret false
-  end
-  for m ulong mCount bound 6
-    k = get mIdx m
-    key = add mul layer 384 ulong get dfCurIds k
-    base = mul m 64
-    for j ulong 64
-      put desc j get descs add base j
-    end
-    slot = dfPublishVerified layer key desc
-    if lt slot 0
-      ret false
-    end
-    put dfCurSlots k slot
-    put dfStats 1 add get dfStats 1 1
-  end
-  put dfStats 2 add get dfStats 2 sub dfMonoNs tN0
-  ret true
-end
-
-fn dfResolveGate layer ulong to long
-  mIdx = new ulong 6 0
+note Resolve the six routed experts of a layer. Each is resident (a hit), staged by a prefetch worker
+note (copied in from staging), or absent (loaded on demand: by the six payload workers when two or more
+note are absent, inline when one is). On-demand reads are started before the decoder waits for a
+note staged payload that is still being read, so the two overlap. Slab slots are assigned in gate order
+note whatever the source, so the slot table evolves exactly as it does with prefetch off.
+note dfGateScan fills src per gate position (-1 resident, -2 absent, else the staging slot) and mIdx with
+note the absent positions. It returns the absent count plus 8 for each staged position.
+fn dfGateScan layer ulong src edit long 6 mIdx edit ulong 6 to ulong
   mCount = ulong 0
+  staged = ulong 0
   for k ulong 6
     key = add mul layer 384 ulong get dfCurIds k
     cur = get dfSlotOf key
+    put src k -1
     if ge cur 0
       put dfCurSlots k cur
       dfLruTouch ulong cur
       put dfStats 0 add get dfStats 0 1
     else
-      put mIdx mCount k
-      mCount = add mCount 1
+      st = dfPfLookup key
+      if ge st 0
+        put src k st
+        staged = add staged 1
+      else
+        put src k -2
+        put mIdx mCount k
+        mCount = add mCount 1
+      end
     end
   end
-  if eq mCount 0
+  ret add mCount mul staged 8
+end
+
+note Wait for the staged payloads this gate needs. A prefetch that failed verification turns its
+note position into -3: that expert is then loaded inline, where a bad payload stops the decoder.
+fn dfGateAwait layer ulong src edit long 6 timed bool to void
+  for k ulong 6
+    s = get src k
+    if ge s 0
+      key = add mul layer 384 ulong get dfCurIds k
+      if not dfPfAwait ulong s key timed
+        put src k -3
+      end
+    end
+  end
+end
+
+fn dfGateStaged layer ulong k ulong stage ulong timed bool to bool
+  key = add mul layer 384 ulong get dfCurIds k
+  tS0 = dfMonoNs
+  slot = dfPfPublish layer key stage
+  if lt slot 0
+    ret false
+  end
+  put dfCurSlots k slot
+  if timed
+    put dfStats 2 add get dfStats 2 sub dfMonoNs tS0
+  end
+  ret true
+end
+
+fn dfGateVerified layer ulong k ulong m ulong descs view uchar 384 to bool
+  desc = new uchar 64 0
+  key = add mul layer 384 ulong get dfCurIds k
+  base = mul m 64
+  for j ulong 64
+    put desc j get descs add base j
+  end
+  slot = dfPublishVerified layer key desc
+  if lt slot 0
+    ret false
+  end
+  put dfCurSlots k slot
+  put dfStats 1 add get dfStats 1 1
+  ret true
+end
+
+fn dfGatePublish layer ulong src view long 6 descs view uchar 384 par bool to bool
+  m = ulong 0
+  for k ulong 6
+    s = get src k
+    if ge s 0
+      if not dfGateStaged layer k ulong s not par
+        ret false
+      end
+    end
+    if eq s -3
+      if not dfGateDemand layer k not par
+        ret false
+      end
+    end
+    if eq s -2
+      if par
+        if not dfGateVerified layer k m descs
+          ret false
+        end
+      else
+        if not dfGateDemand layer k true
+          ret false
+        end
+      end
+      m = add m 1
+    end
+  end
+  ret true
+end
+
+fn dfResolveGate layer ulong to long
+  mIdx = new ulong 6 0
+  src = new long 6 0
+  descs = new uchar 384 0
+  got = dfGateScan layer src mIdx
+  if eq got 0
     ret 0
   end
-  if and ge mCount 2 eq get dfWrActive 0 6
-    if not dfResolveMissesParallel layer mIdx mCount
+  mCount = rem got 8
+  par = and ge mCount 2 eq get dfWrActive 0 6
+  tN0 = ulong 0
+  if par
+    if not dfReadMissDescs layer mIdx mCount descs
       ret -1
     end
-    ret 1
+    tN0 = dfMonoNs
+    if not dfSendMisses layer mCount descs
+      ret -1
+    end
   end
-  for m ulong mCount bound 6
-    r = dfResolveOne layer get mIdx m
-    if lt r 0
+  dfGateAwait layer src not par
+  if par
+    if not dfCollectMisses mCount
       ret -1
     end
+  end
+  if not dfGatePublish layer src descs par
+    ret -1
+  end
+  if par
+    put dfStats 2 add get dfStats 2 sub dfMonoNs tN0
   end
   ret 1
 end
@@ -1586,17 +2004,18 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
     put lIds k eid
     put lWts k ewt
   end
-  put times 0 dfMonoNs
-  pfr = dfArbDrainAndPublish layer
-  if lt pfr 0
-    ret false
+  if eq get dfArbPfMeta 4 1
+    dfSpecScore layer
+    if not dfSpecRead layer
+      ret false
+    end
   end
+  put times 0 dfMonoNs
   gr = dfResolveGate layer
   if lt gr 0
     ret false
   end
   put times 1 dfMonoNs
-  dfArbUpdate layer
   dfArbDispatchPrefetch layer
   if ne get dfSlabCfg 2 0
     put coord 0 uint get dfCoord 0
@@ -1606,7 +2025,7 @@ fn dfResolveExperts h edit zonehdr slots edit uchar * layer ulong to bool
       ret false
     end
   end
-  if or eq gr 1 eq pfr 1
+  if eq gr 1
     put frameDirty 0 1
   end
   ret true

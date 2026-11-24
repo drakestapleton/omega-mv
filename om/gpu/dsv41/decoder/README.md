@@ -90,10 +90,40 @@ chmod +x "$out"/check-*
      om/encoder/bw_enc_sm121.om om/gpu/dsv41/emit.om om/gpu/dsv41/head/launch.om \
      "$d/checkpoint.om" "$d/io.om" "$d/core.om" "$d/kv.om" "$d/lease.om" "$d/resolve.om" \
      "$d/engram-layout.om" "$d/engram.om" "$d/trace.om" "$d/native.om" \
-     "$d/layer-map.om" "$d/rope.om" "$d/workspace.om" "$d/forward.om" "$d/decode-cli.om") |
+     "$d/layer-map.om" "$d/rope.om" "$d/workspace.om" "$d/forward.om" "$d/prefetch-switch.om" "$d/decode-cli.om") |
     seed/out/omc > "$out/dsv41-decode"
 chmod +x "$out/dsv41-decode"
 ```
+
+### Arboris look-ahead prefetcher and switch
+
+`gen` and `chat` run the look-ahead Arboris prefetcher by default. Set `DSV41_ARBORIS_PREFETCH=0` to turn it off for a matched A/B run; unset or `1` keeps it on. `spark-window run` passes the caller's environment through (verified in `evidence/DSV41-ARBORIS-PF-AB-20261123/envcheck.txt`), so set the variable on that command.
+
+The decoder reads the variable once, before it opens any input. It refuses any other value, a repeated entry, or an environment entry it cannot read whole with exit 64 and the line `dsv41-decode: DSV41_ARBORIS_PREFETCH must be unset, 0 or 1`. `dfStartWorkers` sets the switch when it starts the payload workers; `layer0` always starts them with the prefetcher off.
+
+With prefetch on:
+- **Look-ahead routing (GPU, `BLOCKED_OPERATOR` / `NOT_RUN` on GB10 until an authorized window is run):** in the batch that routes layer `L`, the routers of `dfSpecN` (3) later layers (`L+2`, `L+3`, `L+4`) are applied to layer `L`'s FFN input through folded FP32 tables (`dwMaps[5]`, allocated only when prefetch is on). The guesses never reach the model's arithmetic: routing, weights, and outputs come only from each layer's true router.
+- **Never-wait staging pipeline (host-qualified by `check-arboris-prefetch.om`):** six prefetch workers stage SHA-256-verified expert payloads in 64 shared-memory slots (`dfPfSlots`). With prefetch off, no prefetch workers are forked and no staging memory is mapped. The decoder harvests completed prefetches with a zero-interval poll, never waits for a guess the current gate does not need, starts on-demand reads before waiting for any needed in-flight prefetch, and drops any payload that fails digest verification without publishing it.
+
+The final stats lines of `gen` and `chat` on stderr are:
+- `ARBORIS pf_dispatched=N pf_hits=N pf_enabled=0|1` (`pf_enabled` reports the setting, not that anything was prefetched; a valid off arm has `pf_dispatched=0 pf_hits=0`).
+- `ARBORIS-PF waited=N wait_ns=N dropped_unused=N failed=N no_idle_worker=N` (all zero with prefetch off).
+- When `pf_enabled=1`, one `ARBORIS-LOOKAHEAD depth=D right=N of=N` line per look-ahead depth.
+
+`pfcheck <tensors> <engram_map> <sidecar_dir> <ckpt_dir>` is a host preflight that opens no GPU. It parses the variable, loads the inputs, and starts and stops the payload workers as `gen` does. It prints `ARBORIS pf_enabled=0|1` on stderr. Run it before a timed arm to confirm which arm the binary will run. Like every decoder mode it claims the host lock `/tmp/omega-arboris-compute-v1.lock`, so it exits 74 while another `dsv41-decode` is running.
+
+Qualification, host only (no GPU), from a clean tree:
+
+```sh
+bash "$d/check-prefetch-mutants.sh" "$out/pf" "$out/tensors.bin" "$sidecars" "$checkpoint"
+```
+
+It builds the decoder from the composition above and through `om/gpu/dsv41/build.sh`, which must agree byte for byte. It runs three controls:
+- `check-prefetch-switch.sh` checks 18 environment cases, including names that share the prefix, malformed values, a maximum-size entry, 70,000 entries, and repeated names delivered through `execenv`.
+- `check-decoder-prefetch.sh` runs the real binary in `pfcheck` mode.
+- `check-arboris-prefetch.om` replaces `decode-cli.om` in the composition and takes the layer-3 sidecar, shard 06, and a bad-digest copy of the layer-3 sidecar. It checks staging-slot selection (free first, else longest-waiting verified, never in-flight), look-ahead bookkeeping (depth counts, launch counts, guess scoring, guess reading), the off arm (no prefetch workers, no staging memory, no dispatch), and the on arm (worker staging, never waiting for unneeded guesses, byte-exact publication from staging without polluting the slot table, and rejection of bad-digest payloads).
+
+The driver also builds 36 mutants (25 pipeline mutants, 8 switch mutants, and 3 decoder-CLI mutants) and requires each to be rejected by the exact check or case named for it. Its header lists the switch cases and pipeline exits that have no mutant of their own. It prints the compiler digest and every binary digest, and passes only on `PREFETCH-MUTANTS PASS`. No gate under `tests/gates` runs it; run it before any review of a change to these files. What requires a physical GB10 (the look-ahead GPU launches, folded FP32 tables, and off-vs-on timing) is not exercised by this host driver.
 
 Inside an authorized Spark GB10 window:
 
