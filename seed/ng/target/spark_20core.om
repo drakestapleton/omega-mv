@@ -1,0 +1,311 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/spark_20core.om: Full 20-Core Heterogeneous DGX Spark CPU Engine (10x Cortex-X925 @ 3.9 GHz + 10x Cortex-A725 @ 2.8 GHz)
+note + Algebraic Linear-Recurrence Collapse (O(log N) matrix exponentiation mod 2^64).
+note Pure seeded OM-2 (zero C, zero libc, zero pthreads -- uses native OM-2 fork/pipefds/waitpid + monons).
+
+global sDig uchar 24
+global sPids long 24
+global sRdFds int 24
+global sWStart ulong 24
+global sWLen ulong 24
+global sBuf uchar 16
+global sMat ulong 4
+global sRes ulong 4
+global sTmp ulong 4
+
+text sMsgHdr "=== OMEGA ALL-20-CORE HETEROGENEOUS SPARK CPU + ALGEBRAIC COLLAPSE BENCH ===\n"
+text sMsgAlg "ALGEBRAIC_FIB_50M: result_mod128="
+text sMsgNs " compute_ns="
+text sMsgSeq "SEQ_1CORE_X925_2B: checksum="
+text sMsgUni "ALL20_PINNED_UNIFORM_2B: checksum="
+text sMsgHet "ALL20_PINNED_TARGETDESC_HET_2B: checksum="
+text sMsgUs " wall_us="
+text sMsgSpd " speedup_x100="
+text sMsgMatch " BIT_EXACT=PASS\n"
+text sMsgFail " BIT_EXACT=FAIL\n"
+text sMsgNl "\n"
+
+fn sPrint s view uchar * to void
+w = write 1 s 0 len s
+end
+
+fn sPrintU v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put sDig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+w = write 1 sDig p sub 24 p
+ret
+end
+end
+end
+
+note 2x2 matrix multiply mod 2^64: dst = A * B (in-place safe via sTmp)
+fn sMatMul dstA bool to void
+a0 = get sMat 0
+a1 = get sMat 1
+a2 = get sMat 2
+a3 = get sMat 3
+if dstA
+a0 = get sRes 0
+a1 = get sRes 1
+a2 = get sRes 2
+a3 = get sRes 3
+end
+b0 = get sMat 0
+b1 = get sMat 1
+b2 = get sMat 2
+b3 = get sMat 3
+put sTmp 0 add mul a0 b0 mul a1 b2
+put sTmp 1 add mul a0 b1 mul a1 b3
+put sTmp 2 add mul a2 b0 mul a3 b2
+put sTmp 3 add mul a2 b1 mul a3 b3
+if dstA
+for k ulong 4
+put sRes k get sTmp k
+end
+else
+for k ulong 4
+put sMat k get sTmp k
+end
+end
+end
+
+note Algebraic Linear-Recurrence Collapse: exact F(n) mod 2^64 in O(log2 n) = 26 steps!
+fn sFibLog n ulong to ulong
+put sRes 0 1
+put sRes 1 0
+put sRes 2 0
+put sRes 3 1
+put sMat 0 1
+put sMat 1 1
+put sMat 2 1
+put sMat 3 0
+e = n
+for bit ulong 64
+if eq e 0
+break
+end
+if eq and e 1 1
+sMatMul true
+end
+sMatMul false
+e = shr e 1
+end
+ret get sRes 1
+end
+
+fn sPinCore cpu ulong to void
+m = new uchar 8 0
+byteIdx = div cpu 8
+bitIdx = rem cpu 8
+put m byteIdx uchar shl ulong 1 bitIdx
+r = cpuset 0 m 0 8
+end
+
+note 4-way ILP saturated kernel (lights up X925's multi-issue ALU/MUL pipes across all 20 cores!)
+fn sWorkChunk start ulong cnt ulong to ulong
+x0 = add start 1
+x1 = add start 2
+x2 = add start 3
+x3 = add start 4
+a0 = ulong 0
+a1 = ulong 0
+a2 = ulong 0
+a3 = ulong 0
+i = ulong 0
+while lt i cnt bound 2500000000
+x0 = add mul x0 6364136223846793005 1442695040888963407
+x1 = add mul x1 6364136223846793005 1442695040888963407
+x2 = add mul x2 6364136223846793005 1442695040888963407
+x3 = add mul x3 6364136223846793005 1442695040888963407
+a0 = xor a0 x0
+a1 = xor a1 x1
+a2 = xor a2 x2
+a3 = xor a3 x3
+i = add i 4
+end
+ret xor xor a0 a1 xor a2 a3
+end
+
+fn sWriteU64 fd int v ulong to void
+for i ulong 8
+put sBuf i uchar and shr v mul i 8 255
+end
+w = write fd sBuf 0 8
+end
+
+fn sReadU64 fd int to ulong
+r = read fd sBuf 0 8
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get sBuf i mul i 8
+end
+ret v
+end
+
+fn sGetI32 b view uchar * off ulong to int
+b0 = uint get b off
+b1 = shl uint get b add off 1 8
+b2 = shl uint get b add off 2 16
+b3 = shl uint get b add off 3 24
+ret int or or b0 b1 or b2 b3
+end
+
+note Launch 20 worker processes across ALL 20 physical Spark cores (10x X925 + 10x A725) and XOR-reduce exact checksum!
+fn sRun20Workers to ulong
+pf = new uchar 8 0
+st = new uchar 4 0
+for w ulong 20
+rc = pipefds pf 0 8 0
+rfd = sGetI32 pf 0
+wfd = sGetI32 pf 4
+pid = fork
+if eq pid 0
+c = fclose rfd
+sPinCore w
+res = sWorkChunk get sWStart w get sWLen w
+sWriteU64 wfd res
+c2 = fclose wfd
+exit 0
+end
+c3 = fclose wfd
+put sPids w pid
+put sRdFds w rfd
+end
+tot = ulong 0
+for w ulong 20
+v = sReadU64 get sRdFds w
+tot = xor tot v
+c4 = fclose get sRdFds w
+wp = waitpid int get sPids w st 0 4 0
+end
+ret tot
+end
+
+note Run exact same 20 chunks sequentially on 1 core so checksum is 100% bit-identical to 20-core parallel run!
+fn sRunSeqChunks to ulong
+tot = ulong 0
+for w ulong 20
+v = sWorkChunk get sWStart w get sWLen w
+tot = xor tot v
+end
+ret tot
+end
+
+fn sFillUniform totN ulong to void
+per = div totN 20
+for w ulong 20
+put sWStart w mul w per
+put sWLen w per
+end
+end
+
+note TargetDesc-weighted heterogeneous split for exact DGX Spark sysfs core map:
+note A725 (2.808 GHz, 5-wide, weight 100): cpu 0..4, 10..14 (rem w 10 < 5)
+note X925 (3.900 GHz, 10-wide, weight 240): cpu 5..9, 15..19 (rem w 10 >= 5) -> total weight 3400!
+fn sFillHet totN ulong to void
+unit = div totN 3400
+cur = ulong 0
+for w ulong 20
+wt = ulong 240
+if lt rem w 10 5
+wt = ulong 100
+end
+lenW = mul unit wt
+lenW = mul div lenW 4 4
+if eq w 19
+lenW = sub totN cur
+end
+put sWStart w cur
+put sWLen w lenW
+cur = add cur lenW
+end
+end
+
+fn sBenchAlg to int
+t0 = monons
+fib50m = sFibLog 50000000
+t1 = monons
+sPrint sMsgAlg
+sPrintU and fib50m 127
+sPrint sMsgNs
+sPrintU ulong sub t1 t0
+sPrint sMsgNl
+if ne and fib50m 127 69
+ret 10
+end
+ret 0
+end
+
+fn sBenchUniform totN ulong to int
+sFillUniform totN
+ta0 = monons
+chkSeq = sRunSeqChunks
+ta1 = monons
+seqUs = div ulong sub ta1 ta0 1000
+sPrint sMsgSeq
+sPrintU chkSeq
+sPrint sMsgUs
+sPrintU seqUs
+sPrint sMsgNl
+tb0 = monons
+chkUni = sRun20Workers
+tb1 = monons
+uniUs = div ulong sub tb1 tb0 1000
+sPrint sMsgUni
+sPrintU chkUni
+sPrint sMsgUs
+sPrintU uniUs
+sPrint sMsgSpd
+sPrintU div mul seqUs 100 uniUs
+if eq chkUni chkSeq
+sPrint sMsgMatch
+ret 0
+end
+sPrint sMsgFail
+ret 11
+end
+
+fn sBenchHet totN ulong to int
+sFillHet totN
+tc0 = monons
+chkHetSeq = sRunSeqChunks
+tc1 = monons
+hetSeqUs = div ulong sub tc1 tc0 1000
+td0 = monons
+chkHet = sRun20Workers
+td1 = monons
+hetUs = div ulong sub td1 td0 1000
+sPrint sMsgHet
+sPrintU chkHet
+sPrint sMsgUs
+sPrintU hetUs
+sPrint sMsgSpd
+sPrintU div mul hetSeqUs 100 hetUs
+if eq chkHet chkHetSeq
+sPrint sMsgMatch
+ret 0
+end
+sPrint sMsgFail
+ret 12
+end
+
+fn main to int
+sPrint sMsgHdr
+sPinCore 5
+r = sBenchAlg
+if ne r 0
+ret r
+end
+totN = ulong 2000000000
+r = sBenchUniform totN
+if ne r 0
+ret r
+end
+ret sBenchHet totN
+end
