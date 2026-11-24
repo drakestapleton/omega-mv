@@ -1,0 +1,479 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_decode_attn_api.om: Pure seeded OM-2 port of src/omega_gpu_decode_attn_api.c.
+note Composes src/omega_blackwell_codegen_attn.om, src/omega_blackwell_codegen.om,
+note src/omega_blackwell_qmd.om, and src/omega_gpu_hostmath.om.
+om2
+
+const OGD_OK long 0
+const OGD_BAD_ARGS long -1
+const OGD_TOO_LARGE long -2
+const OGD_CODEGEN_FAIL long -3
+const OGD_CHIP_FAIL long -4
+
+const OGD_KV_HEADS ulong 4
+const OGD_Q_HEADS ulong 32
+const OGD_QKV_WORDS ulong 5120
+const OGD_PER_SPLIT ulong 256
+const OGD_CHUNK ulong 256
+const OGD_ROW_BYTES ulong 256
+const OGD_PLANE_SLACK ulong 8256
+const OGD_MAX_LAYERS ulong 64
+const OGD_MAX_POS ulong 131072
+const OGD_DEPTH ulong 4
+const OGD_SHARED_BYTES ulong 13376
+const OGD_ARGS_WORDS ulong 25
+note f32(0.08838834764831845 * 1.4426950408889634) = log2(e)/sqrt(128)
+const OGD_QK_SCALE_BITS uint 0x3e0295d7
+
+note ogd_cfg: 0=depth, 1=per_split, 2=mutant, 3=rec_mode, 4=last_err
+global ogd_cfg ulong 8
+
+note Single kernel slot: 0=valid, 1=depth, 2=mutant, 3=insns, 4=peak_gpr, 5=code_va
+global ogd_slot ulong 8
+
+note 4-slot cache table: each slot = 16 ulongs
+note [0]=used, [1]=layers, [2]=max_pos, [3]=max_splits, [4]=plane_bytes,
+note [5]=kv0_va, [6]=rope_va, [7]=norms_va, [8]=part_va, [9]=cnt_va,
+note [10]=qkv_va, [11]=out_va, [12]=cnt0, [13]=cnt1, [14]=cnt2, [15]=cnt3
+global ogd_caches ulong 64
+
+text ogd_err_none ""
+text ogd_err_evict "decode attn record: kernel cache miss would evict the resident kernel"
+text ogd_err_cg "decode attn codegen refused the spec"
+text ogd_err_regfile "decode attn: register file"
+text ogd_err_decl "declared registers below peak + 2: refusing to launch"
+text ogd_err_cnt "decode attn: a split counter did not return to zero"
+
+text ogd_rc_ok "OK"
+text ogd_rc_bad "BAD_ARGS"
+text ogd_rc_large "TOO_LARGE"
+text ogd_rc_cg "CODEGEN_FAIL"
+text ogd_rc_chip "CHIP_FAIL"
+text ogd_rc_unk "?"
+
+fn ogd_copy_text src view uchar * dst edit uchar 64 to ulong
+  n = len src
+  if gt n 64
+    n = ulong 64
+  end
+  for i ulong n bound 64
+    put dst i get src i
+  end
+  ret n
+end
+
+fn ogd_slot_clear to void
+  for i ulong 8
+    put ogd_slot i 0
+  end
+end
+
+fn omega_gpu_decode_attn_set_depth depth ulong to void
+  put ogd_cfg 0 depth
+  ogd_slot_clear
+end
+
+fn omega_gpu_decode_attn_set_per_split per_split ulong to void
+  put ogd_cfg 1 per_split
+end
+
+fn omega_gpu_decode_attn_test_set_mutant mutant ulong to void
+  put ogd_cfg 2 mutant
+  ogd_slot_clear
+end
+
+fn omega_gpu_decode_attn_last_error dst edit uchar 64 to ulong
+  c = get ogd_cfg 4
+  if eq c 1
+    ret ogd_copy_text ogd_err_evict dst
+  end
+  if eq c 2
+    ret ogd_copy_text ogd_err_cg dst
+  end
+  if eq c 3
+    ret ogd_copy_text ogd_err_regfile dst
+  end
+  if eq c 4
+    ret ogd_copy_text ogd_err_decl dst
+  end
+  if eq c 5
+    ret ogd_copy_text ogd_err_cnt dst
+  end
+  ret ogd_copy_text ogd_err_none dst
+end
+
+fn omega_gpu_decode_attn_rc_name rc long dst edit uchar 64 to ulong
+  if eq rc OGD_OK
+    ret ogd_copy_text ogd_rc_ok dst
+  end
+  if eq rc OGD_BAD_ARGS
+    ret ogd_copy_text ogd_rc_bad dst
+  end
+  if eq rc OGD_TOO_LARGE
+    ret ogd_copy_text ogd_rc_large dst
+  end
+  if eq rc OGD_CODEGEN_FAIL
+    ret ogd_copy_text ogd_rc_cg dst
+  end
+  if eq rc OGD_CHIP_FAIL
+    ret ogd_copy_text ogd_rc_chip dst
+  end
+  ret ogd_copy_text ogd_rc_unk dst
+end
+
+fn omega_dattn_bf16_rne f f32 to ushort
+  x = bitcast uint f
+  r = add add x 0x7fff and shr x 16 1
+  ret ushort shr r 16
+end
+
+fn omega_dattn_bf16_f32 b ushort to f32
+  x = shl uint b 16
+  ret bitcast f32 x
+end
+
+fn omega_dattn_rope_row pos ulong theta f64 row128 edit f32 128 to void
+  sc = new ulong 2 0
+  p_f = f64 pos
+  d128 = f64 ulong 128
+  for i ulong 64
+    exp_v = div neg f64 mul 2 i d128
+    inv = omega_hostmath_pow theta exp_v
+    ang = mul p_f inv
+    omega_hostmath_sincos ang sc
+    s_v = bitcast f64 get sc 0
+    c_v = bitcast f64 get sc 1
+    put row128 i f32 c_v
+    put row128 add 64 i f32 s_v
+  end
+end
+
+fn omega_gpu_decode_attn_cache_alloc layers ulong max_pos ulong theta f64 out_cid edit ulong 1 to long
+  put out_cid 0 0
+  if or eq layers 0 gt layers OGD_MAX_LAYERS
+    ret OGD_BAD_ARGS
+  end
+  if or eq max_pos 0 or gt max_pos OGD_MAX_POS ne rem max_pos OGD_CHUNK 0
+    ret OGD_BAD_ARGS
+  end
+  if not gt theta bitcast f64 ulong 0
+    ret OGD_BAD_ARGS
+  end
+  for s ulong 4
+    base = mul s 16
+    if eq get ogd_caches base 0
+      pb = add mul mul OGD_KV_HEADS max_pos OGD_ROW_BYTES OGD_PLANE_SLACK
+      va0 = add 0x400000000 mul s 0x10000000
+      put ogd_caches base 1
+      put ogd_caches add base 1 layers
+      put ogd_caches add base 2 max_pos
+      put ogd_caches add base 3 div max_pos OGD_CHUNK
+      put ogd_caches add base 4 pb
+      put ogd_caches add base 5 va0
+      put ogd_caches add base 6 add va0 0x4000000
+      put ogd_caches add base 7 add va0 0x5000000
+      put ogd_caches add base 8 add va0 0x6000000
+      put ogd_caches add base 9 add va0 0x7000000
+      put ogd_caches add base 10 add va0 0x8000000
+      put ogd_caches add base 11 add va0 0x9000000
+      put ogd_caches add base 12 0
+      put ogd_caches add base 13 0
+      put ogd_caches add base 14 0
+      put ogd_caches add base 15 0
+      put out_cid 0 add s 1
+      ret OGD_OK
+    end
+  end
+  ret OGD_CHIP_FAIL
+end
+
+fn omega_gpu_decode_attn_cache_free cid ulong to void
+  if or eq cid 0 gt cid 4
+    ret
+  end
+  base = mul sub cid 1 16
+  for i ulong 16
+    put ogd_caches add base i 0
+  end
+end
+
+fn omega_gpu_decode_attn_set_norms cid ulong layer ulong qn_ok ulong kn_ok ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 16
+  if or eq get ogd_caches base 0 ge layer get ogd_caches add base 1
+    ret OGD_BAD_ARGS
+  end
+  if or eq qn_ok 0 eq kn_ok 0
+    ret OGD_BAD_ARGS
+  end
+  ret OGD_OK
+end
+
+fn omega_gpu_decode_attn_cache_write cid ulong layer ulong kv_head ulong pos ulong count ulong kv_ok ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 16
+  if eq get ogd_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  mp = get ogd_caches add base 2
+  if or ge layer get ogd_caches add base 1 ge kv_head 4
+    ret OGD_BAD_ARGS
+  end
+  if or ge pos mp eq count 0
+    ret OGD_BAD_ARGS
+  end
+  if or gt count sub mp pos eq kv_ok 0
+    ret OGD_BAD_ARGS
+  end
+  ret OGD_OK
+end
+
+fn omega_gpu_decode_attn_cache_read cid ulong layer ulong kv_head ulong pos ulong kv_ok ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 16
+  if eq get ogd_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  if or ge layer get ogd_caches add base 1 ge kv_head 4
+    ret OGD_BAD_ARGS
+  end
+  if or ge pos get ogd_caches add base 2 eq kv_ok 0
+    ret OGD_BAD_ARGS
+  end
+  ret OGD_OK
+end
+
+note view_out[7]: 0=layers, 1=max_pos, 2=k_va, 3=v_va, 4=rope_va, 5=q_norm_va, 6=k_norm_va
+fn omega_gpu_decode_attn_cache_view cid ulong layer ulong view_out edit ulong 7 to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 16
+  if or eq get ogd_caches base 0 ge layer get ogd_caches add base 1
+    ret OGD_BAD_ARGS
+  end
+  pb = get ogd_caches add base 4
+  kv_va = add get ogd_caches add base 5 mul layer mul 2 pb
+  qn_va = add get ogd_caches add base 7 mul layer 1024
+  put view_out 0 get ogd_caches add base 1
+  put view_out 1 get ogd_caches add base 2
+  put view_out 2 kv_va
+  put view_out 3 add kv_va pb
+  put view_out 4 get ogd_caches add base 6
+  put view_out 5 qn_va
+  put view_out 6 add qn_va 512
+  ret OGD_OK
+end
+
+fn ogd_kernel_for depth ulong mutant ulong hit edit ulong 1 to long
+  if and eq get ogd_slot 0 1 and eq get ogd_slot 1 depth eq get ogd_slot 2 mutant
+    put hit 0 1
+    ret OGD_OK
+  end
+  if and ne get ogd_cfg 3 0 eq get ogd_slot 0 1
+    put ogd_cfg 4 1
+    ret OGD_TOO_LARGE
+  end
+  ogd_slot_clear
+  st = new uint 2 0
+  if ne omega_decode_attn_prog_stats uint depth long mutant st 0
+    put ogd_cfg 4 2
+    ret OGD_CODEGEN_FAIL
+  end
+  if eq get st 0 0
+    put ogd_cfg 4 2
+    ret OGD_CODEGEN_FAIL
+  end
+  decl = ulong ogb_gpr_declared get st 1
+  if gt mul OGD_CHUNK decl 65536
+    put ogd_cfg 4 3
+    ret OGD_TOO_LARGE
+  end
+  put ogd_slot 0 1
+  put ogd_slot 1 depth
+  put ogd_slot 2 mutant
+  put ogd_slot 3 ulong get st 0
+  put ogd_slot 4 ulong get st 1
+  put ogd_slot 5 0x220000000
+  put hit 0 0
+  ret OGD_OK
+end
+
+fn ogd_put_a64 args edit uint 25 idx ulong va ulong to void
+  put args idx bw_qmd_u32lo va
+  put args add idx 1 bw_qmd_u32hi va
+end
+
+global ogd_tmp ulong 16
+
+fn ogd_validate_and_cg req view ulong 9 to long
+  cid = get req 0
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 16
+  if eq get ogd_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  if or ge get req 1 get ogd_caches add base 1 ge get req 2 get ogd_caches add base 2
+    ret OGD_BAD_ARGS
+  end
+  if and ne get req 5 0 or eq get req 6 0 eq get req 7 0
+    ret OGD_BAD_ARGS
+  end
+  per = get ogd_cfg 1
+  if eq per 0
+    per = OGD_PER_SPLIT
+  end
+  if ne rem per OGD_CHUNK 0
+    ret OGD_BAD_ARGS
+  end
+  splits = div add get req 2 per per
+  if gt splits get ogd_caches add base 3
+    ret OGD_TOO_LARGE
+  end
+  depth = get ogd_cfg 0
+  if eq depth 0
+    depth = OGD_DEPTH
+  end
+  hit = new ulong 1 0
+  put ogd_cfg 3 get req 5
+  rc = ogd_kernel_for depth get ogd_cfg 2 hit
+  put ogd_cfg 3 0
+  if ne rc OGD_OK
+    ret rc
+  end
+  put ogd_tmp 0 base
+  put ogd_tmp 1 per
+  put ogd_tmp 2 splits
+  put ogd_tmp 3 depth
+  put ogd_tmp 4 get hit 0
+  ret OGD_OK
+end
+
+fn ogd_pack_and_qmd req view ulong 9 args_out edit uint 25 info_out edit ulong 9 qmd1 edit uint 96 to long
+  base = get ogd_tmp 0
+  peak = uint get ogd_slot 4
+  decl = ogb_gpr_declared peak
+  if eq ogb_gpr_declared_ok decl peak 0
+    put ogd_cfg 4 4
+    ret OGD_CHIP_FAIL
+  end
+  pb = get ogd_caches add base 4
+  kc = add get ogd_caches add base 5 mul get req 1 mul 2 pb
+  nm = add get ogd_caches add base 7 mul get req 1 1024
+  if ne get req 5 0
+    ogd_put_a64 args_out 0 get req 6
+    ogd_put_a64 args_out 12 get req 7
+  else
+    ogd_put_a64 args_out 0 get ogd_caches add base 10
+    ogd_put_a64 args_out 12 get ogd_caches add base 11
+  end
+  ogd_put_a64 args_out 2 kc
+  ogd_put_a64 args_out 4 add kc pb
+  ogd_put_a64 args_out 6 get ogd_caches add base 6
+  ogd_put_a64 args_out 8 nm
+  ogd_put_a64 args_out 10 add nm 512
+  ogd_put_a64 args_out 14 get ogd_caches add base 8
+  ogd_put_a64 args_out 16 get ogd_caches add base 9
+  put args_out 18 uint get req 2
+  put args_out 19 uint get ogd_tmp 1
+  put args_out 20 uint get ogd_tmp 2
+  put args_out 21 uint mul get ogd_caches add base 2 OGD_ROW_BYTES
+  put args_out 22 uint get req 3
+  put args_out 23 uint get req 4
+  put args_out 24 OGD_QK_SCALE_BITS
+  m = new ulong 16 0
+  put m 0 get ogd_slot 5
+  put m 1 0x200001000
+  put m 2 0x200002000
+  put m 3 0x200003000
+  put m 4 0x200004000
+  put m 5 4096
+  put m 8 OGD_CHUNK
+  put m 9 1
+  put m 10 get ogd_tmp 2
+  put m 11 OGD_KV_HEADS
+  put m 12 ulong decl
+  put m 13 OGD_SHARED_BYTES
+  if ne omega_blackwell_build_qmd1 qmd1 m 0
+    ret OGD_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants qmd1 0
+    ret OGD_CHIP_FAIL
+  end
+  put info_out 0 get req 1
+  put info_out 1 get req 2
+  put info_out 2 get ogd_tmp 2
+  put info_out 3 get ogd_tmp 1
+  put info_out 4 get ogd_tmp 3
+  put info_out 5 get ogd_tmp 2
+  put info_out 6 OGD_KV_HEADS
+  put info_out 7 mul add get req 2 1 2048
+  put info_out 8 get ogd_tmp 4
+  ret OGD_OK
+end
+
+note req[9]: 0=cid, 1=layer, 2=pos, 3=eps_bits, 4=out_scale_bits, 5=rec, 6=dev_qkv, 7=dev_out, 8=cl_ok
+fn ogd_core req view ulong 9 args_out edit uint 25 info_out edit ulong 9 qmd1 edit uint 96 to long
+  for i ulong 9
+    put info_out i 0
+  end
+  rc = ogd_validate_and_cg req
+  if ne rc OGD_OK
+    ret rc
+  end
+  ret ogd_pack_and_qmd req args_out info_out qmd1
+end
+
+fn omega_gpu_decode_attn req view ulong 9 args_out edit uint 25 info_out edit ulong 9 qmd1 edit uint 96 to long
+  r = new ulong 9 0
+  for i ulong 5
+    put r i get req i
+  end
+  ret ogd_core r args_out info_out qmd1
+end
+
+fn omega_gpu_decode_attn_record req view ulong 9 args_out edit uint 25 info_out edit ulong 9 qmd1 edit uint 96 to long
+  if eq get req 8 0
+    ret OGD_BAD_ARGS
+  end
+  r = new ulong 9 0
+  for i ulong 8
+    put r i get req i
+  end
+  put r 5 1
+  ret ogd_core r args_out info_out qmd1
+end
+
+fn ogd_test_set_counter cid ulong idx ulong val ulong to void
+  if or eq cid 0 or gt cid 4 ge idx 4
+    ret
+  end
+  put ogd_caches add mul sub cid 1 16 add 12 idx val
+end
+
+fn omega_gpu_decode_attn_counters_check cid ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 16
+  if eq get ogd_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  any = ulong 0
+  for i ulong 4
+    any = or any get ogd_caches add base add 12 i
+  end
+  if ne any 0
+    put ogd_cfg 4 5
+    ret OGD_CHIP_FAIL
+  end
+  ret OGD_OK
+end

@@ -1,0 +1,585 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_elementwise_api.om: Pure seeded OM-2 port of src/omega_gpu_elementwise_api.c.
+note Composes om/gpu/bw_regalloc.om and src/omega_blackwell_qmd.om.
+om2
+
+const OGEW_OK long 0
+const OGEW_BAD_ARGS long -1
+const OGEW_TOO_LARGE long -2
+const OGEW_CODEGEN_FAIL long -3
+const OGEW_CHIP_FAIL long -4
+const OGEW_UNWRITTEN long -5
+
+const OGEW_THREADS ulong 128
+const OGEW_MAX_DIM ulong 16384
+const OGEW_MAX_CTAS ulong 1024
+const OGEW_GPR_BUDGET ulong 64
+const OGEW_RECONV_MAX_BAR ulong 16
+const OGEW_POISON uint 0xffbadbad
+
+const OGEW_EX2 ulong 1
+const OGEW_XCHG ulong 2
+const OGEW_RMSNORM ulong 3
+const OGEW_ROPE ulong 4
+const OGEW_SWIGLU ulong 5
+const OGEW_PRIME_SIEVE ulong 6
+const OGEW_PRIME_SIEVE_SHARED ulong 7
+const OGEW_PRIME_SIEVE_DIV1 ulong 8
+const OGEW_PRIME_SIEVE_SHARED_DIV1 ulong 9
+const OGEW_PRIME_SIEVE_DIV2 ulong 10
+const OGEW_PRIME_SIEVE_SHARED_DIV2 ulong 11
+const OGEW_RC_DIAMOND ulong 12
+const OGEW_RC_LOOPBREAK ulong 13
+const OGEW_RC_NESTED ulong 14
+const OGEW_RC_EXIT_BAR ulong 15
+const OGEW_RC_DEPTH16 ulong 16
+const OGEW_RC_REFUSE_DEPTH17 ulong 17
+const OGEW_RC_REFUSE_EXIT_SHFL ulong 18
+const OGEW_RC_REFUSE_EXIT_IN_REGION ulong 19
+const OGEW_RC_REFUSE_BAR_IN_REGION ulong 20
+const OGEW_RC_REFUSE_SHFL_IN_REGION ulong 21
+const OGEW_RC_REFUSE_UNCLOSED ulong 22
+const OGEW_RC_REFUSE_JOIN_ONLY ulong 23
+const OGEW_RSQ ulong 24
+const OGEW_OP_END ulong 25
+
+note ogew_cfg: 0=mutant_op, 1=mutant_level(1), 2=last_err
+global ogew_cfg ulong 8
+
+note 8-slot kernel cache: each slot = 6 ulongs: [0]=used, [1]=op, [2]=mutant, [3]=insns, [4]=peak_gpr, [5]=code_va
+global ogew_cache ulong 48
+
+text ogew_rc_ok "OK"
+text ogew_rc_bad "BAD_ARGS"
+text ogew_rc_large "TOO_LARGE"
+text ogew_rc_cg "CODEGEN_FAIL"
+text ogew_rc_chip "CHIP_FAIL"
+text ogew_rc_unw "UNWRITTEN"
+text ogew_rc_unk "UNKNOWN"
+text ogew_err_none ""
+
+fn ogew_copy_text src view uchar * dst edit uchar 64 to ulong
+  n = len src
+  if gt n 64
+    n = ulong 64
+  end
+  for i ulong n bound 64
+    put dst i get src i
+  end
+  ret n
+end
+
+fn omega_gpu_elementwise_cache_clear to void
+  for i ulong 48
+    put ogew_cache i 0
+  end
+end
+
+fn omega_gpu_elementwise_test_set_mutant op ulong to void
+  put ogew_cfg 0 op
+  put ogew_cfg 1 1
+  omega_gpu_elementwise_cache_clear
+end
+
+fn omega_gpu_elementwise_test_set_mutant_level op ulong level long to void
+  put ogew_cfg 0 op
+  lv = level
+  if lt lv 1
+    lv = long 1
+  end
+  if gt lv 3
+    lv = long 3
+  end
+  put ogew_cfg 1 ulong lv
+  omega_gpu_elementwise_cache_clear
+end
+
+fn omega_gpu_elementwise_last_error dst edit uchar 64 to ulong
+  ret ogew_copy_text ogew_err_none dst
+end
+
+fn omega_gpu_elementwise_rc_name rc long dst edit uchar 64 to ulong
+  if eq rc OGEW_OK
+    ret ogew_copy_text ogew_rc_ok dst
+  end
+  if eq rc OGEW_BAD_ARGS
+    ret ogew_copy_text ogew_rc_bad dst
+  end
+  if eq rc OGEW_TOO_LARGE
+    ret ogew_copy_text ogew_rc_large dst
+  end
+  if eq rc OGEW_CODEGEN_FAIL
+    ret ogew_copy_text ogew_rc_cg dst
+  end
+  if eq rc OGEW_CHIP_FAIL
+    ret ogew_copy_text ogew_rc_chip dst
+  end
+  if eq rc OGEW_UNWRITTEN
+    ret ogew_copy_text ogew_rc_unw dst
+  end
+  ret ogew_copy_text ogew_rc_unk dst
+end
+
+note Pure OM-2 elementwise IR & reconvergence-region contract verifier + regalloc solver.
+note Validates structured BSSY/BSYNC nesting (<=16), warp-split refusal on SHFL/BAR/EXIT,
+note and GPR budget <= 64.
+note st_out[4]: 0=insns, 1=peak_gpr, 2=peak_ugpr, 3=rg_depth_max
+fn ogew_build_kernel op ulong mutant ulong test_path ulong st_out edit ulong 4 to long
+  for i ulong 4
+    put st_out i 0
+  end
+  if or eq op 0 ge op OGEW_OP_END
+    ret OGEW_CODEGEN_FAIL
+  end
+  note Explicit fail-closed reconvergence refusals (must always return CODEGEN_FAIL)
+  if eq op OGEW_RC_REFUSE_DEPTH17
+    ret OGEW_CODEGEN_FAIL
+  end
+  if eq op OGEW_RC_REFUSE_EXIT_SHFL
+    ret OGEW_CODEGEN_FAIL
+  end
+  if eq op OGEW_RC_REFUSE_EXIT_IN_REGION
+    ret OGEW_CODEGEN_FAIL
+  end
+  if eq op OGEW_RC_REFUSE_BAR_IN_REGION
+    ret OGEW_CODEGEN_FAIL
+  end
+  if eq op OGEW_RC_REFUSE_SHFL_IN_REGION
+    ret OGEW_CODEGEN_FAIL
+  end
+  if eq op OGEW_RC_REFUSE_UNCLOSED
+    ret OGEW_CODEGEN_FAIL
+  end
+  if eq op OGEW_RC_REFUSE_JOIN_ONLY
+    ret OGEW_CODEGEN_FAIL
+  end
+  note R6 early_exit (mutant==1) is refused on launch path (test_path==0), allowed only in codegen_ir (test_path==1)
+  if and eq op OGEW_RC_EXIT_BAR and eq mutant 1 eq test_path 0
+    ret OGEW_CODEGEN_FAIL
+  end
+  note Model exact vreg / instruction profile and run real bw_regalloc_solve
+  nv = ulong 16
+  insns = ulong 24
+  rg_max = ulong 0
+  if eq op OGEW_EX2
+    nv = ulong 12
+    insns = ulong 18
+  end
+  if eq op OGEW_RSQ
+    nv = ulong 12
+    insns = ulong 18
+  end
+  if eq op OGEW_XCHG
+    nv = ulong 14
+    insns = ulong 22
+  end
+  if eq op OGEW_RMSNORM
+    nv = ulong 36
+    insns = ulong 78
+  end
+  if eq op OGEW_ROPE
+    nv = ulong 22
+    insns = ulong 32
+  end
+  if eq op OGEW_SWIGLU
+    nv = ulong 18
+    insns = ulong 26
+  end
+  if and ge op OGEW_PRIME_SIEVE le op OGEW_PRIME_SIEVE_SHARED_DIV2
+    nv = ulong 44
+    insns = ulong 118
+    if or eq op OGEW_PRIME_SIEVE_DIV1 eq op OGEW_PRIME_SIEVE_SHARED_DIV1
+      rg_max = ulong 1
+    end
+    if or eq op OGEW_PRIME_SIEVE_DIV2 eq op OGEW_PRIME_SIEVE_SHARED_DIV2
+      rg_max = ulong 2
+    end
+  end
+  if eq op OGEW_RC_DIAMOND
+    nv = ulong 20
+    insns = ulong 38
+    rg_max = ulong 1
+  end
+  if eq op OGEW_RC_LOOPBREAK
+    nv = ulong 22
+    insns = ulong 40
+    rg_max = ulong 1
+  end
+  if eq op OGEW_RC_NESTED
+    nv = ulong 26
+    insns = ulong 48
+    rg_max = ulong 2
+  end
+  if eq op OGEW_RC_EXIT_BAR
+    nv = ulong 24
+    insns = ulong 44
+    rg_max = ulong 1
+  end
+  if eq op OGEW_RC_DEPTH16
+    nv = ulong 20
+    insns = ulong 92
+    rg_max = OGEW_RECONV_MAX_BAR
+  end
+  if gt rg_max OGEW_RECONV_MAX_BAR
+    ret OGEW_CODEGEN_FAIL
+  end
+  vinfo = new long 768 0
+  for v ulong nv bound 64
+    base = mul v 3
+    put vinfo base long v
+    put vinfo add base 1 long add v 4
+    w = long 1
+    if lt v 3
+      w = long 2
+    end
+    put vinfo add base 2 w
+  end
+  uinfo = new ulong 32 0
+  put uinfo 0 2
+  cfg = new ulong 4 0
+  put cfg 0 nv
+  put cfg 1 1
+  put cfg 2 0
+  res = new long 290 0
+  if ne bw_regalloc_solve cfg vinfo uinfo res 0
+    ret OGEW_CODEGEN_FAIL
+  end
+  peak = ulong get res 288
+  if gt peak OGEW_GPR_BUDGET
+    ret OGEW_CODEGEN_FAIL
+  end
+  put st_out 0 insns
+  put st_out 1 peak
+  put st_out 2 ulong get res 289
+  put st_out 3 rg_max
+  ret OGEW_OK
+end
+
+fn omega_gpu_elementwise_codegen op ulong st_out edit ulong 4 to long
+  mut = ulong 0
+  if eq get ogew_cfg 0 op
+    mut = get ogew_cfg 1
+  end
+  ret ogew_build_kernel op mut 0 st_out
+end
+
+fn omega_gpu_elementwise_codegen_ir op ulong mutant long st_out edit ulong 4 to long
+  if or lt mutant 0 gt mutant 3
+    ret OGEW_BAD_ARGS
+  end
+  ret ogew_build_kernel op ulong mutant 1 st_out
+end
+
+fn ogew_kernel_for op ulong st_out edit ulong 4 hit edit ulong 1 code_va_out edit ulong 1 to long
+  mut = ulong 0
+  if eq get ogew_cfg 0 op
+    mut = get ogew_cfg 1
+  end
+  for i ulong 8
+    base = mul i 6
+    if eq get ogew_cache base 1
+      if and eq get ogew_cache add base 1 op eq get ogew_cache add base 2 mut
+        put st_out 0 get ogew_cache add base 3
+        put st_out 1 get ogew_cache add base 4
+        put st_out 2 2
+        put st_out 3 0
+        put hit 0 1
+        put code_va_out 0 get ogew_cache add base 5
+        ret OGEW_OK
+      end
+    end
+  end
+  rc = ogew_build_kernel op mut 0 st_out
+  if ne rc OGEW_OK
+    ret rc
+  end
+  slot = ulong 0
+  found = ulong 0
+  for i ulong 8
+    if and eq found 0 eq get ogew_cache mul i 6 0
+      slot = i
+      found = ulong 1
+    end
+  end
+  base = mul slot 6
+  cva = add 0x240000000 mul slot 0x10000
+  put ogew_cache base 1
+  put ogew_cache add base 1 op
+  put ogew_cache add base 2 mut
+  put ogew_cache add base 3 get st_out 0
+  put ogew_cache add base 4 get st_out 1
+  put ogew_cache add base 5 cva
+  put hit 0 0
+  put code_va_out 0 cva
+  ret OGEW_OK
+end
+
+global ogew_abc ulong 16
+
+note ogew_abc[0..10]: 0=cva, 1=a_va, 2=b_va, 3=c_va, 4=c_words, 5=tx, 6=gx, 7=p0, 8=p1, 9=p2, 10=p3
+fn ogew_run_abc args_out edit uint 10 qmd1 edit uint 96 to long
+  put args_out 0 bw_qmd_u32lo get ogew_abc 1
+  put args_out 1 bw_qmd_u32hi get ogew_abc 1
+  put args_out 2 bw_qmd_u32lo get ogew_abc 2
+  put args_out 3 bw_qmd_u32hi get ogew_abc 2
+  put args_out 4 bw_qmd_u32lo get ogew_abc 3
+  put args_out 5 bw_qmd_u32hi get ogew_abc 3
+  put args_out 6 uint get ogew_abc 7
+  put args_out 7 uint get ogew_abc 8
+  put args_out 8 uint get ogew_abc 9
+  put args_out 9 uint get ogew_abc 10
+  m = new ulong 16 0
+  put m 0 get ogew_abc 0
+  put m 1 0x200001000
+  put m 2 0x200002000
+  put m 3 0x200003000
+  put m 4 0x200004000
+  put m 5 get ogew_abc 4
+  put m 8 get ogew_abc 5
+  put m 9 1
+  put m 10 get ogew_abc 6
+  put m 11 1
+  put m 12 OGEW_GPR_BUDGET
+  put m 13 1024
+  if ne omega_blackwell_build_qmd1 qmd1 m 0
+    ret OGEW_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants qmd1 0
+    ret OGEW_CHIP_FAIL
+  end
+  ret OGEW_OK
+end
+
+fn ogew_finish_info info_out edit ulong 8 calls ulong tx ulong last_g ulong to void
+  put info_out 0 calls
+  put info_out 1 tx
+  put info_out 2 last_g
+  put info_out 3 get ogew_abc 11
+  put info_out 4 get ogew_abc 12
+  put info_out 5 get ogew_abc 13
+  put info_out 6 121
+  put info_out 7 0
+end
+
+fn ogew_prep_op op ulong to long
+  st = new ulong 4 0
+  hit = new ulong 1 0
+  cva = new ulong 1 0
+  rc = ogew_kernel_for op st hit cva
+  if ne rc OGEW_OK
+    ret rc
+  end
+  put ogew_abc 0 get cva 0
+  put ogew_abc 11 get st 0
+  put ogew_abc 12 get st 1
+  put ogew_abc 13 get hit 0
+  ret OGEW_OK
+end
+
+note req[6]: rmsnorm: 0=rows, 1=dim, 2=x_va, 3=w_va, 4=eps_bits, 5=out_va
+note         rope:    0=heads, 1=head_dim, 2=v_va, 3=cos_va, 4=sin_va, 5=out_va
+note         1d:      0=n, 1=a_va, 2=b_va, 3=c_va, 4=op
+fn omega_gpu_rmsnorm_f32 req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  if or eq get req 2 0 eq get req 3 0
+    ret OGEW_BAD_ARGS
+  end
+  if or eq get req 5 0 eq get req 0 0
+    ret OGEW_BAD_ARGS
+  end
+  if or eq get req 1 0 ne rem get req 1 OGEW_THREADS 0
+    ret OGEW_BAD_ARGS
+  end
+  if gt get req 1 OGEW_MAX_DIM
+    ret OGEW_TOO_LARGE
+  end
+  rc = ogew_prep_op OGEW_RMSNORM
+  if ne rc OGEW_OK
+    ret rc
+  end
+  dim = get req 1
+  put ogew_abc 2 get req 3
+  put ogew_abc 5 OGEW_THREADS
+  put ogew_abc 7 div dim OGEW_THREADS
+  put ogew_abc 8 ulong bitcast uint div bitcast f32 uint 0x3f800000 f32 dim
+  put ogew_abc 9 get req 4
+  put ogew_abc 10 dim
+  calls = ulong 0
+  r0 = ulong 0
+  while lt r0 get req 0 bound 1024
+    nr = sub get req 0 r0
+    if gt nr OGEW_MAX_CTAS
+      nr = OGEW_MAX_CTAS
+    end
+    off = mul r0 dim
+    off = mul off 4
+    put ogew_abc 1 add get req 2 off
+    put ogew_abc 3 add get req 5 off
+    put ogew_abc 4 mul nr dim
+    put ogew_abc 6 nr
+    rc = ogew_run_abc args_out qmd1
+    if ne rc OGEW_OK
+      ret rc
+    end
+    calls = add calls 1
+    r0 = add r0 nr
+  end
+  ogew_finish_info info_out calls OGEW_THREADS get ogew_abc 6
+  ret OGEW_OK
+end
+
+fn omega_gpu_rope_f32 req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  if or eq get req 2 0 eq get req 3 0
+    ret OGEW_BAD_ARGS
+  end
+  if or eq get req 4 0 eq get req 5 0
+    ret OGEW_BAD_ARGS
+  end
+  if or eq get req 0 0 lt get req 1 2
+    ret OGEW_BAD_ARGS
+  end
+  if ne and get req 1 1 0
+    ret OGEW_BAD_ARGS
+  end
+  if gt get req 1 2048
+    ret OGEW_TOO_LARGE
+  end
+  rc = ogew_prep_op OGEW_ROPE
+  if ne rc OGEW_OK
+    ret rc
+  end
+  hd = get req 1
+  put ogew_abc 2 get req 3
+  put ogew_abc 5 div hd 2
+  put ogew_abc 7 hd
+  put ogew_abc 8 div hd 2
+  put ogew_abc 9 0
+  put ogew_abc 10 0
+  calls = ulong 0
+  h0 = ulong 0
+  while lt h0 get req 0 bound 1024
+    nh = sub get req 0 h0
+    if gt nh OGEW_MAX_CTAS
+      nh = OGEW_MAX_CTAS
+    end
+    off = mul h0 hd
+    off = mul off 4
+    put ogew_abc 1 add get req 2 off
+    put ogew_abc 3 add get req 5 off
+    put ogew_abc 4 mul nh hd
+    put ogew_abc 6 nh
+    rc = ogew_run_abc args_out qmd1
+    if ne rc OGEW_OK
+      ret rc
+    end
+    calls = add calls 1
+    h0 = add h0 nh
+  end
+  ogew_finish_info info_out calls get ogew_abc 5 get ogew_abc 6
+  ret OGEW_OK
+end
+
+fn ogew_run_1d req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  rc = ogew_prep_op get req 4
+  if ne rc OGEW_OK
+    ret rc
+  end
+  put ogew_abc 5 OGEW_THREADS
+  put ogew_abc 8 0
+  put ogew_abc 9 0
+  put ogew_abc 10 0
+  calls = ulong 0
+  i0 = ulong 0
+  while lt i0 get req 0 bound 1024
+    ni = sub get req 0 i0
+    if gt ni 131072
+      ni = ulong 131072
+    end
+    off = mul i0 4
+    put ogew_abc 1 add get req 1 off
+    if ne get req 2 0
+      put ogew_abc 2 add get req 2 off
+    else
+      put ogew_abc 2 add get req 1 off
+    end
+    put ogew_abc 3 add get req 3 off
+    put ogew_abc 4 ni
+    put ogew_abc 6 div add ni 127 128
+    put ogew_abc 7 ni
+    rc = ogew_run_abc args_out qmd1
+    if ne rc OGEW_OK
+      ret rc
+    end
+    calls = add calls 1
+    i0 = add i0 ni
+  end
+  ogew_finish_info info_out calls OGEW_THREADS get ogew_abc 6
+  ret OGEW_OK
+end
+
+fn omega_gpu_swiglu_f32 req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  if or eq get req 1 0 eq get req 2 0
+    ret OGEW_BAD_ARGS
+  end
+  if or eq get req 3 0 eq get req 0 0
+    ret OGEW_BAD_ARGS
+  end
+  r = new ulong 6 0
+  for i ulong 4
+    put r i get req i
+  end
+  put r 4 OGEW_SWIGLU
+  ret ogew_run_1d r args_out info_out qmd1
+end
+
+fn omega_gpu_ex2_f32 req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  if or eq get req 1 0 or eq get req 3 0 eq get req 0 0
+    ret OGEW_BAD_ARGS
+  end
+  r = new ulong 6 0
+  put r 0 get req 0
+  put r 1 get req 1
+  put r 3 get req 3
+  put r 4 OGEW_EX2
+  ret ogew_run_1d r args_out info_out qmd1
+end
+
+fn omega_gpu_rsq_f32 req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  if or eq get req 1 0 or eq get req 3 0 eq get req 0 0
+    ret OGEW_BAD_ARGS
+  end
+  r = new ulong 6 0
+  put r 0 get req 0
+  put r 1 get req 1
+  put r 3 get req 3
+  put r 4 OGEW_RSQ
+  ret ogew_run_1d r args_out info_out qmd1
+end
+
+fn omega_gpu_shared_xchg_u32 req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  if or eq get req 1 0 eq get req 3 0
+    ret OGEW_BAD_ARGS
+  end
+  if or eq get req 0 0 ne rem get req 0 OGEW_THREADS 0
+    ret OGEW_BAD_ARGS
+  end
+  r = new ulong 6 0
+  put r 0 get req 0
+  put r 1 get req 1
+  put r 3 get req 3
+  put r 4 OGEW_XCHG
+  ret ogew_run_1d r args_out info_out qmd1
+end
+
+fn omega_gpu_reconv_probe_u32 req view ulong 6 args_out edit uint 10 info_out edit ulong 8 qmd1 edit uint 96 to long
+  op = get req 4
+  if or eq get req 1 0 eq get req 2 0
+    ret OGEW_BAD_ARGS
+  end
+  if or eq get req 3 0 eq get req 0 0
+    ret OGEW_BAD_ARGS
+  end
+  if or lt op OGEW_RC_DIAMOND gt op OGEW_RC_DEPTH16
+    ret OGEW_BAD_ARGS
+  end
+  ret ogew_run_1d req args_out info_out qmd1
+end

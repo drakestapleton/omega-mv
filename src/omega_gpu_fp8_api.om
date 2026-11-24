@@ -1,0 +1,1085 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_fp8_api.om: Pure seeded OM-2 port of src/omega_gpu_fp8_api.c.
+note Composes src/omega_blackwell_codegen_moe.om, src/omega_blackwell_codegen_moe2.om,
+note src/omega_blackwell_codegen.om, src/omega_blackwell_qmd.om, and src/omega_gpu_fp8_pack.om.
+om2
+
+const OGF_OK long 0
+const OGF_BAD_ARGS long -1
+const OGF_TOO_LARGE long -2
+const OGF_CODEGEN_FAIL long -3
+const OGF_CHIP_FAIL long -4
+const OGF_NAN_WEIGHT long -5
+
+const OGF_BLOCK ulong 128
+const OGF_MAX_K ulong 32768
+const OGF_MAX_GROUPS ulong 64
+const OGF_MAX_CTAS ulong 256
+const OGF_BIGK_CTAS ulong 384
+const OGF_GROUPED_CTAS ulong 6
+const OGF_SM_COUNT ulong 48
+const OGF_DEEP_MAX_SHARED ulong 16384
+const OGF_QMD_MAX_SHARED ulong 98304
+const OGF_V2_WARPS ulong 16
+const OGF_V2_GROUPED_CTAS ulong 12
+const OGF_ARGS_WORDS ulong 10
+const OGF_CACHE_SLOTS ulong 16
+
+note ogf_cfg:
+note 0=cta_budget, 1=cta_budget_set, 2=lane_bytes, 3=rows, 4=warps,
+note 5=depth_set, 6=depth, 7=gpr_pad, 8=mutant, 9=no_fold, 10=sealed,
+note 11=variant, 12=variant_set, 13=weights_cached, 14=weights_cached_set,
+note 15=sched, 16=sched_set, 17=coal, 18=coal_set, 19=wfirst, 20=wfirst_set,
+note 21=deep, 22=deep_set, 23=bigk, 24=bigk_set, 25=next_slot, 26=rec_mode, 27=last_err,
+note 28=inited
+global ogf_cfg ulong 32
+
+note 16-slot kernel cache: each slot = 15 ulongs
+note [0]=valid, [1]=pinned, [2]=variant, [3..10]=spec[0..7], [11]=insns, [12]=peak_gpr, [13]=code_va, [14]=smem
+global ogf_cache ulong 240
+
+note 16-slot tensor table: each slot = 6 ulongs
+note [0]=used, [1]=experts, [2]=n, [3]=k, [4]=w_va, [5]=s_va
+global ogf_tensors ulong 96
+
+text ogf_err_none ""
+text ogf_err_regfile "fp8 kernel: declared registers exceed 65536-register file"
+text ogf_err_cg "fp8 codegen refused the shape"
+text ogf_err_sealed "serving reservation exceeded: fp8 kernel not prepared"
+text ogf_err_full "fp8 kernel cache: every slot holds a prepared kernel"
+text ogf_err_evict "fp8 record: kernel cache miss would evict a resident kernel"
+text ogf_err_nan "fp8 upload: e4m3 NaN code"
+text ogf_err_scale "fp8 upload: NaN, inf or overflowing scale"
+text ogf_err_decl "declared registers below peak + 2: refusing to launch"
+
+text ogf_rc_ok "OK"
+text ogf_rc_bad "BAD_ARGS"
+text ogf_rc_large "TOO_LARGE"
+text ogf_rc_cg "CODEGEN_FAIL"
+text ogf_rc_chip "CHIP_FAIL"
+text ogf_rc_nan "NAN_WEIGHT"
+text ogf_rc_unk "UNKNOWN"
+
+fn ogf_init_defaults to void
+  if eq get ogf_cfg 28 0
+    put ogf_cfg 0 OGF_MAX_CTAS
+    put ogf_cfg 11 1
+    put ogf_cfg 17 1
+    put ogf_cfg 21 1
+    put ogf_cfg 23 1
+    put ogf_cfg 28 1
+  end
+end
+
+fn ogf_copy_text src view uchar * dst edit uchar 64 to ulong
+  n = len src
+  if gt n 64
+    n = ulong 64
+  end
+  for i ulong n bound 64
+    put dst i get src i
+  end
+  ret n
+end
+
+fn omega_gpu_fp8_last_error dst edit uchar 64 to ulong
+  c = get ogf_cfg 27
+  if eq c 1
+    ret ogf_copy_text ogf_err_regfile dst
+  end
+  if eq c 2
+    ret ogf_copy_text ogf_err_cg dst
+  end
+  if eq c 3
+    ret ogf_copy_text ogf_err_sealed dst
+  end
+  if eq c 4
+    ret ogf_copy_text ogf_err_full dst
+  end
+  if eq c 5
+    ret ogf_copy_text ogf_err_evict dst
+  end
+  if eq c 6
+    ret ogf_copy_text ogf_err_nan dst
+  end
+  if eq c 7
+    ret ogf_copy_text ogf_err_scale dst
+  end
+  if eq c 8
+    ret ogf_copy_text ogf_err_decl dst
+  end
+  ret ogf_copy_text ogf_err_none dst
+end
+
+fn omega_gpu_fp8_rc_name rc long dst edit uchar 64 to ulong
+  if eq rc OGF_OK
+    ret ogf_copy_text ogf_rc_ok dst
+  end
+  if eq rc OGF_BAD_ARGS
+    ret ogf_copy_text ogf_rc_bad dst
+  end
+  if eq rc OGF_TOO_LARGE
+    ret ogf_copy_text ogf_rc_large dst
+  end
+  if eq rc OGF_CODEGEN_FAIL
+    ret ogf_copy_text ogf_rc_cg dst
+  end
+  if eq rc OGF_CHIP_FAIL
+    ret ogf_copy_text ogf_rc_chip dst
+  end
+  if eq rc OGF_NAN_WEIGHT
+    ret ogf_copy_text ogf_rc_nan dst
+  end
+  ret ogf_copy_text ogf_rc_unk dst
+end
+
+fn omega_gpu_fp8_cache_clear to void
+  for i ulong 240
+    put ogf_cache i 0
+  end
+  put ogf_cfg 25 0
+end
+
+fn omega_gpu_fp8_set_shape lb ulong rows ulong warps ulong to void
+  ogf_init_defaults
+  put ogf_cfg 2 lb
+  put ogf_cfg 3 rows
+  put ogf_cfg 4 warps
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_set_depth is_set ulong depth ulong to void
+  ogf_init_defaults
+  put ogf_cfg 5 is_set
+  put ogf_cfg 6 depth
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_set_gpr_pad pad ulong to void
+  ogf_init_defaults
+  put ogf_cfg 7 pad
+end
+
+fn omega_gpu_fp8_set_cta_budget ctas ulong to void
+  ogf_init_defaults
+  if ne ctas 0
+    put ogf_cfg 1 1
+    put ogf_cfg 0 ctas
+  else
+    put ogf_cfg 1 0
+    put ogf_cfg 0 OGF_MAX_CTAS
+  end
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_test_set_mutant m ulong to void
+  ogf_init_defaults
+  put ogf_cfg 8 m
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_test_set_no_fold on ulong to void
+  ogf_init_defaults
+  if ne on 0
+    put ogf_cfg 9 1
+  else
+    put ogf_cfg 9 0
+  end
+end
+
+fn omega_gpu_fp8_seal on ulong to void
+  ogf_init_defaults
+  if ne on 0
+    put ogf_cfg 10 1
+  else
+    put ogf_cfg 10 0
+  end
+end
+
+fn omega_gpu_fp8_set_variant v ulong to void
+  ogf_init_defaults
+  if eq v 2
+    put ogf_cfg 11 2
+  else
+    put ogf_cfg 11 1
+  end
+  put ogf_cfg 12 1
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_variant to ulong
+  ogf_init_defaults
+  ret get ogf_cfg 11
+end
+
+fn omega_gpu_fp8_set_sched s ulong to void
+  ogf_init_defaults
+  if eq s 1
+    put ogf_cfg 15 1
+  else
+    put ogf_cfg 15 0
+  end
+  put ogf_cfg 16 1
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_sched to ulong
+  ogf_init_defaults
+  ret get ogf_cfg 15
+end
+
+fn omega_gpu_fp8_set_coal on ulong to void
+  ogf_init_defaults
+  if eq on 1
+    put ogf_cfg 17 1
+  else
+    put ogf_cfg 17 0
+  end
+  put ogf_cfg 18 1
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_coal to ulong
+  ogf_init_defaults
+  ret get ogf_cfg 17
+end
+
+fn omega_gpu_fp8_set_wfirst on ulong to void
+  ogf_init_defaults
+  if eq on 1
+    put ogf_cfg 19 1
+  else
+    put ogf_cfg 19 0
+  end
+  put ogf_cfg 20 1
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_wfirst to ulong
+  ogf_init_defaults
+  ret get ogf_cfg 19
+end
+
+fn omega_gpu_fp8_set_deep on ulong to void
+  ogf_init_defaults
+  if eq on 1
+    put ogf_cfg 21 1
+  else
+    put ogf_cfg 21 0
+  end
+  put ogf_cfg 22 1
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_deep to ulong
+  ogf_init_defaults
+  ret get ogf_cfg 21
+end
+
+fn omega_gpu_fp8_set_bigk on ulong to void
+  ogf_init_defaults
+  if eq on 1
+    put ogf_cfg 23 1
+  else
+    put ogf_cfg 23 0
+  end
+  put ogf_cfg 24 1
+  omega_gpu_fp8_cache_clear
+end
+
+fn omega_gpu_fp8_bigk to ulong
+  ogf_init_defaults
+  ret get ogf_cfg 23
+end
+
+fn omega_gpu_fp8_set_weight_cache on ulong to void
+  ogf_init_defaults
+  if ne on 0
+    put ogf_cfg 13 1
+  else
+    put ogf_cfg 13 0
+  end
+  put ogf_cfg 14 1
+end
+
+fn omega_gpu_fp8_weight_cache to ulong
+  ogf_init_defaults
+  ret get ogf_cfg 13
+end
+
+fn ogf_stats_for variant ulong sp view ulong 8 st edit uint 2 to long
+  if eq variant 2
+    ret omega_fp8_gemv2_prog_stats sp st
+  end
+  ret omega_fp8_gemv_prog_stats sp st
+end
+
+fn ogf_shared_for variant ulong sp view ulong 8 to uint
+  if eq variant 2
+    ret omega_fp8_gemv2_shared_bytes sp
+  end
+  ret omega_fp8_gemv_shared_bytes sp
+end
+
+note out3: 0=lane_bytes, 1=rows, 2=warps
+fn omega_gpu_fp8_shape_for k ulong n ulong out3 edit ulong 3 to void
+  ogf_init_defaults
+  ign = n
+  lb = ulong 8
+  if eq rem k 512 0
+    lb = ulong 16
+  end
+  r = ulong 1
+  w = ulong 8
+  if ne get ogf_cfg 2 0
+    lb = get ogf_cfg 2
+  end
+  if ne get ogf_cfg 3 0
+    r = get ogf_cfg 3
+  end
+  if ne get ogf_cfg 4 0
+    w = get ogf_cfg 4
+  end
+  put out3 0 lb
+  put out3 1 r
+  put out3 2 w
+end
+
+fn ogf_regfile_fits warps ulong peak uint to bool
+  decl = ulong ogb_gpr_declared peak
+  if le mul mul 32 warps decl 65536
+    ret true
+  end
+  put ogf_cfg 27 1
+  ret false
+end
+
+fn omega_gpu_fp8_kernel_fits sp view ulong 8 out_decl edit uint 1 to long
+  ogf_init_defaults
+  st = new uint 2 0
+  if ne ogf_stats_for omega_gpu_fp8_variant sp st 0
+    put ogf_cfg 27 2
+    ret OGF_CODEGEN_FAIL
+  end
+  peak = get st 1
+  put out_decl 0 ogb_gpr_declared peak
+  if ogf_regfile_fits get sp 3 peak
+    ret OGF_OK
+  end
+  ret OGF_TOO_LARGE
+end
+
+fn ogf_depth_fits sp view ulong 8 ks ulong max_sb ulong to bool
+  deep = new ulong 8 0
+  for i ulong 8
+    put deep i get sp i
+  end
+  put deep 4 0
+  put deep 5 ks
+  if gt ulong omega_fp8_gemv_shared_bytes deep max_sb
+    ret false
+  end
+  st = new uint 2 0
+  if ne omega_fp8_gemv_prog_stats deep st 0
+    ret false
+  end
+  decl = ulong ogb_gpr_declared get st 1
+  if gt mul mul 32 get sp 3 decl 65536
+    ret false
+  end
+  ret true
+end
+
+fn ogf_find_partial_ks ks_full ulong rows_lb ulong to ulong
+  d = sub ks_full 1
+  while gt d 1 bound 256
+    if eq rem ks_full d 0
+      if le mul d rows_lb 128
+        ret d
+      end
+    end
+    d = sub d 1
+  end
+  ret 0
+end
+
+fn omega_gpu_fp8_depth_for sp view ulong 8 n ulong groups ulong to ulong
+  ogf_init_defaults
+  if ne get ogf_cfg 5 0
+    ret get ogf_cfg 6
+  end
+  if or eq get sp 1 0 eq get sp 3 0
+    ret 0
+  end
+  ks = div get sp 0 mul 32 get sp 1
+  rl = mul get sp 2 get sp 1
+  max_sb = OGF_DEEP_MAX_SHARED
+  if gt mul ks rl 128
+    if and gt get sp 0 4096 eq groups 1
+      if ne omega_gpu_fp8_bigk 0
+        max_sb = OGF_QMD_MAX_SHARED
+        ks = ogf_find_partial_ks ks rl
+        if lt ks 2
+          ret 0
+        end
+      end
+    end
+  end
+  if gt mul ks rl 128
+    ret 0
+  end
+  if ne rem get sp 0 mul 32 get sp 3 0
+    ret 0
+  end
+  if gt get sp 0 mul 2048 get sp 3
+    ret 0
+  end
+  if or ne groups 1 eq omega_gpu_fp8_deep 0
+    ret 0
+  end
+  if not ogf_depth_fits sp ks max_sb
+    ret 0
+  end
+  ret ks
+end
+
+fn omega_gpu_fp8_spec_for k ulong n ulong groups ulong sp edit ulong 8 to void
+  ogf_init_defaults
+  for i ulong 8
+    put sp i 0
+  end
+  put sp 0 k
+  sh = new ulong 3 0
+  omega_gpu_fp8_shape_for k n sh
+  put sp 1 get sh 0
+  put sp 2 get sh 1
+  w = get sh 2
+  if and gt groups 1 eq get ogf_cfg 4 0
+    w = ulong 32
+  end
+  if and eq groups 1 gt k 4096
+    if and eq get ogf_cfg 4 0 ne omega_gpu_fp8_bigk 0
+      w = ulong 16
+    end
+  end
+  if eq omega_gpu_fp8_variant 2
+    if eq get ogf_cfg 4 0
+      w = OGF_V2_WARPS
+    end
+    put sp 3 w
+    if ne get sp 1 0
+      put sp 5 div k mul 32 get sp 1
+    end
+  else
+    put sp 3 w
+    put sp 6 omega_gpu_fp8_sched
+    flags = ulong 0
+    if and ne omega_gpu_fp8_coal 0 le mul w get sp 2 32
+      flags = or flags 1
+    end
+    if ne omega_gpu_fp8_wfirst 0
+      flags = or flags 2
+    end
+    put sp 7 flags
+    put sp 5 omega_gpu_fp8_depth_for sp n groups
+  end
+  put sp 4 get ogf_cfg 8
+end
+
+fn ogf_slot_match base ulong variant ulong sp view ulong 8 to bool
+  if eq get ogf_cache base 0
+    ret false
+  end
+  if ne get ogf_cache add base 2 variant
+    ret false
+  end
+  for j ulong 8
+    if ne get ogf_cache add base add 3 j get sp j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ogf_pick_slot to ulong
+  nxt = get ogf_cfg 25
+  for i ulong OGF_CACHE_SLOTS
+    idx = rem add nxt i OGF_CACHE_SLOTS
+    base = mul idx 15
+    if or eq get ogf_cache base 0 eq get ogf_cache add base 1 0
+      put ogf_cfg 25 rem add idx 1 OGF_CACHE_SLOTS
+      ret idx
+    end
+  end
+  ret 99
+end
+
+fn ogf_kernel_for sp view ulong 8 out_slot edit ulong 1 hit edit ulong 1 to long
+  v = omega_gpu_fp8_variant
+  for i ulong OGF_CACHE_SLOTS
+    if ogf_slot_match mul i 15 v sp
+      put out_slot 0 i
+      put hit 0 1
+      ret OGF_OK
+    end
+  end
+  if ne get ogf_cfg 10 0
+    put ogf_cfg 27 3
+    ret OGF_TOO_LARGE
+  end
+  chosen = ogf_pick_slot
+  if eq chosen 99
+    put ogf_cfg 27 4
+    ret OGF_TOO_LARGE
+  end
+  base = mul chosen 15
+  if and ne get ogf_cfg 26 0 ne get ogf_cache base 0
+    put ogf_cfg 27 5
+    ret OGF_TOO_LARGE
+  end
+  st = new uint 2 0
+  if ne ogf_stats_for v sp st 0
+    put ogf_cfg 27 2
+    ret OGF_CODEGEN_FAIL
+  end
+  if eq get st 0 0
+    put ogf_cfg 27 2
+    ret OGF_CODEGEN_FAIL
+  end
+  if not ogf_regfile_fits get sp 3 get st 1
+    ret OGF_TOO_LARGE
+  end
+  put ogf_cache base 1
+  put ogf_cache add base 1 0
+  put ogf_cache add base 2 v
+  for j ulong 8
+    put ogf_cache add base add 3 j get sp j
+  end
+  put ogf_cache add base 11 ulong get st 0
+  put ogf_cache add base 12 ulong get st 1
+  put ogf_cache add base 13 add 0x250000000 mul chosen 0x10000
+  put ogf_cache add base 14 ulong ogf_shared_for v sp
+  put out_slot 0 chosen
+  put hit 0 0
+  ret OGF_OK
+end
+
+fn omega_gpu_fp8_prepare k ulong to long
+  sp = new ulong 8 0
+  omega_gpu_fp8_spec_for k shl ulong 1 20 1 sp
+  sl = new ulong 1 0
+  hit = new ulong 1 0
+  rc = ogf_kernel_for sp sl hit
+  if eq rc OGF_OK
+    put ogf_cache add mul get sl 0 15 1 1
+  end
+  ret rc
+end
+
+fn omega_gpu_fp8_tensor_shape tid ulong out3 edit ulong 3 to void
+  if or eq tid 0 gt tid 16
+    put out3 0 0
+    put out3 1 0
+    put out3 2 0
+    ret
+  end
+  base = mul sub tid 1 6
+  if eq get ogf_tensors base 0
+    put out3 0 0
+    put out3 1 0
+    put out3 2 0
+    ret
+  end
+  put out3 0 get ogf_tensors add base 1
+  put out3 1 get ogf_tensors add base 2
+  put out3 2 get ogf_tensors add base 3
+end
+
+fn ogf_upload_check w view uchar * sc view ushort * to long
+  first = new ulong 1 0
+  if ne omega_fp8_pack_scan_nan w len w first 0
+    put ogf_cfg 27 6
+    ret OGF_NAN_WEIGHT
+  end
+  sc_tmp = new f32 256 0.0
+  check_n = len sc
+  if gt check_n 256
+    check_n = ulong 256
+  end
+  if ne omega_fp8_pack_scales sc check_n sc_tmp long get ogf_cfg 9 0
+    put ogf_cfg 27 7
+    ret OGF_BAD_ARGS
+  end
+  ret OGF_OK
+end
+
+note shape3[3]: 0=experts, 1=n, 2=k
+fn omega_gpu_fp8_tensor_upload shape3 view ulong 3 w view uchar * sc view ushort * out_tid edit ulong 1 to long
+  ogf_init_defaults
+  put out_tid 0 0
+  if eq get shape3 0 0
+    ret OGF_BAD_ARGS
+  end
+  if eq get shape3 1 0
+    ret OGF_BAD_ARGS
+  end
+  if eq get shape3 2 0
+    ret OGF_BAD_ARGS
+  end
+  if ne rem get shape3 1 OGF_BLOCK 0
+    ret OGF_BAD_ARGS
+  end
+  if ne rem get shape3 2 OGF_BLOCK 0
+    ret OGF_BAD_ARGS
+  end
+  if gt get shape3 2 OGF_MAX_K
+    ret OGF_TOO_LARGE
+  end
+  rc = ogf_upload_check w sc
+  if ne rc OGF_OK
+    ret rc
+  end
+  for s ulong 16
+    base = mul s 6
+    if eq get ogf_tensors base 0
+      put ogf_tensors base 1
+      put ogf_tensors add base 1 get shape3 0
+      put ogf_tensors add base 2 get shape3 1
+      put ogf_tensors add base 3 get shape3 2
+      put ogf_tensors add base 4 add 0x350000000 mul s 0x1000000
+      put ogf_tensors add base 5 add 0x360000000 mul s 0x100000
+      put out_tid 0 add s 1
+      ret OGF_OK
+    end
+  end
+  ret OGF_CHIP_FAIL
+end
+
+fn omega_gpu_fp8_tensor_alloc_uncached experts ulong n ulong k ulong out_tid edit ulong 1 to long
+  ogf_init_defaults
+  put out_tid 0 0
+  if or eq experts 0 or eq n 0 eq k 0
+    ret OGF_BAD_ARGS
+  end
+  if or ne rem n OGF_BLOCK 0 ne rem k OGF_BLOCK 0
+    ret OGF_BAD_ARGS
+  end
+  if gt k OGF_MAX_K
+    ret OGF_TOO_LARGE
+  end
+  for s ulong 16
+    base = mul s 6
+    if eq get ogf_tensors base 0
+      put ogf_tensors base 1
+      put ogf_tensors add base 1 experts
+      put ogf_tensors add base 2 n
+      put ogf_tensors add base 3 k
+      put ogf_tensors add base 4 add 0x370000000 mul s 0x1000000
+      put ogf_tensors add base 5 add 0x380000000 mul s 0x100000
+      put out_tid 0 add s 1
+      ret OGF_OK
+    end
+  end
+  ret OGF_CHIP_FAIL
+end
+
+fn omega_gpu_fp8_tensor_free tid ulong to void
+  if or eq tid 0 gt tid 16
+    ret
+  end
+  base = mul sub tid 1 6
+  for i ulong 6
+    put ogf_tensors add base i 0
+  end
+end
+
+fn omega_gpu_fp8_tensor_entry tid ulong expert ulong out2 edit ulong 2 to long
+  if or eq tid 0 gt tid 16
+    ret OGF_BAD_ARGS
+  end
+  base = mul sub tid 1 6
+  if or eq get ogf_tensors base 0 ge expert get ogf_tensors add base 1
+    ret OGF_BAD_ARGS
+  end
+  n = get ogf_tensors add base 2
+  k = get ogf_tensors add base 3
+  woff = mul expert mul n k
+  put out2 0 add get ogf_tensors add base 4 woff
+  soff = mul div n OGF_BLOCK div k OGF_BLOCK
+  soff = mul soff mul expert 4
+  put out2 1 add get ogf_tensors add base 5 soff
+  ret OGF_OK
+end
+
+fn omega_gpu_fp8_tensor_cpu_view tid ulong expert ulong out2 edit ulong 2 to long
+  ret omega_gpu_fp8_tensor_entry tid expert out2
+end
+
+fn omega_gpu_fp8_tensor_sync_to_gpu tid ulong to long
+  if or eq tid 0 gt tid 16
+    ret -1
+  end
+  if eq get ogf_tensors mul sub tid 1 6 0
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_gpu_fp8_grouped_ctas_rule groups ulong forced ulong wave ulong to ulong
+  if and ge forced 1 le forced OGF_MAX_CTAS
+    ret forced
+  end
+  if or eq wave 0 eq groups 0
+    ret OGF_GROUPED_CTAS
+  end
+  ow = div OGF_SM_COUNT groups
+  if eq ow 0
+    ow = ulong 1
+  end
+  if lt ow OGF_GROUPED_CTAS
+    ret ow
+  end
+  ret OGF_GROUPED_CTAS
+end
+
+fn omega_gpu_fp8_grouped_ctas_auto groups ulong to ulong
+  ret omega_gpu_fp8_grouped_ctas_rule groups 0 0
+end
+
+global ogf_tmp ulong 24
+
+fn ogf_validate_and_spec req view ulong 9 sp edit ulong 8 to long
+  tid = get req 7
+  if or eq tid 0 gt tid 16
+    ret OGF_BAD_ARGS
+  end
+  tbase = mul sub tid 1 6
+  if eq get ogf_tensors tbase 0
+    ret OGF_BAD_ARGS
+  end
+  groups = get req 0
+  x_rows = get req 1
+  if ne get req 4 0
+    if or eq get req 2 0 or eq get req 3 0 eq get req 5 0
+      ret OGF_BAD_ARGS
+    end
+  end
+  if or eq groups 0 and ne x_rows 1 ne x_rows groups
+    ret OGF_BAD_ARGS
+  end
+  if gt groups OGF_MAX_GROUPS
+    ret OGF_TOO_LARGE
+  end
+  if and eq get req 2 0 ge get req 6 get ogf_tensors add tbase 1
+    ret OGF_BAD_ARGS
+  end
+  n = get ogf_tensors add tbase 2
+  k = get ogf_tensors add tbase 3
+  omega_gpu_fp8_spec_for k n groups sp
+  if ne rem n get sp 2 0
+    ret OGF_CODEGEN_FAIL
+  end
+  rg = div n get sp 2
+  gx = div add rg sub get sp 3 1 get sp 3
+  budget = OGF_MAX_CTAS
+  if ne get ogf_cfg 1 0
+    budget = get ogf_cfg 0
+  else
+    if gt groups 1
+      if eq omega_gpu_fp8_variant 2
+        budget = OGF_V2_GROUPED_CTAS
+      else
+        budget = omega_gpu_fp8_grouped_ctas_auto groups
+      end
+    end
+  end
+  if and eq get ogf_cfg 1 0 eq groups 1
+    if and gt k 4096 ne omega_gpu_fp8_bigk 0
+      waves = div add gx sub OGF_BIGK_CTAS 1 OGF_BIGK_CTAS
+      if lt waves 2
+        waves = ulong 2
+      end
+      gx = div add gx sub waves 1 waves
+      budget = gx
+    end
+  end
+  if gt gx budget
+    gx = budget
+  end
+  if eq gx 0
+    gx = ulong 1
+  end
+  put ogf_tmp 0 n
+  put ogf_tmp 1 k
+  put ogf_tmp 2 rg
+  put ogf_tmp 3 gx
+  ret OGF_OK
+end
+
+fn ogf_pack_args req view ulong 9 sp view ulong 8 args_out edit uint 10 to void
+  va = get req 2
+  if eq va 0
+    va = ulong 0x390000000
+  end
+  put args_out 0 bw_qmd_u32lo va
+  put args_out 1 bw_qmd_u32hi va
+  va = get req 3
+  if eq va 0
+    va = ulong 0x391000000
+  end
+  put args_out 2 bw_qmd_u32lo va
+  put args_out 3 bw_qmd_u32hi va
+  va = get req 5
+  if eq va 0
+    va = ulong 0x392000000
+  end
+  put args_out 4 bw_qmd_u32lo va
+  put args_out 5 bw_qmd_u32hi va
+  put args_out 6 uint get ogf_tmp 2
+  if eq get req 1 1
+    put args_out 7 0
+  else
+    put args_out 7 uint mul get ogf_tmp 1 4
+  end
+  put args_out 8 uint mul get ogf_tmp 0 4
+  put args_out 9 uint mul get ogf_tmp 3 get sp 3
+end
+
+fn ogf_pack_and_qmd req view ulong 9 sp view ulong 8 args_out edit uint 10 info_out edit ulong 10 qmd1 edit uint 96 to long
+  cbase = mul get ogf_tmp 4 15
+  peak = uint get ogf_cache add cbase 12
+  decl = add ulong ogb_gpr_declared peak get ogf_cfg 7
+  if lt decl add ulong peak 2
+    put ogf_cfg 27 8
+    ret OGF_CHIP_FAIL
+  end
+  ogf_pack_args req sp args_out
+  m = new ulong 16 0
+  put m 0 get ogf_cache add cbase 13
+  put m 1 0x200001000
+  put m 2 0x200002000
+  put m 3 0x200003000
+  put m 4 0x200004000
+  put m 5 mul get req 0 get ogf_tmp 0
+  put m 8 mul 32 get sp 3
+  put m 9 1
+  put m 10 get ogf_tmp 3
+  put m 11 get req 0
+  put m 12 decl
+  put m 13 get ogf_cache add cbase 14
+  if ne omega_blackwell_build_qmd1 qmd1 m 0
+    ret OGF_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants qmd1 0
+    ret OGF_CHIP_FAIL
+  end
+  put info_out 0 get sp 1
+  put info_out 1 get sp 2
+  put info_out 2 get sp 3
+  put info_out 3 get sp 5
+  put info_out 4 get ogf_tmp 3
+  put info_out 5 get req 0
+  put info_out 6 ulong omega_fp8_gemv_steps sp
+  put info_out 7 get ogf_tmp 5
+  put info_out 8 decl
+  put info_out 9 get ogf_cache add cbase 14
+  ret OGF_OK
+end
+
+note req[9]: 0=groups, 1=x_rows, 2=dev_tab, 3=dev_x, 4=rec, 5=dev_y, 6=expert_id, 7=tid, 8=cl_ok
+fn ogf_gemv_core req view ulong 9 args_out edit uint 10 info_out edit ulong 10 qmd1 edit uint 96 to long
+  ogf_init_defaults
+  for i ulong 10
+    put info_out i 0
+  end
+  sp = new ulong 8 0
+  rc = ogf_validate_and_spec req sp
+  if ne rc OGF_OK
+    ret rc
+  end
+  sl = new ulong 1 0
+  hit = new ulong 1 0
+  put ogf_cfg 26 get req 4
+  rc = ogf_kernel_for sp sl hit
+  put ogf_cfg 26 0
+  if ne rc OGF_OK
+    ret rc
+  end
+  put ogf_tmp 4 get sl 0
+  put ogf_tmp 5 get hit 0
+  ret ogf_pack_and_qmd req sp args_out info_out qmd1
+end
+
+fn omega_gpu_fp8_gemv_f32 req view ulong 9 args_out edit uint 10 info_out edit ulong 10 qmd1 edit uint 96 to long
+  r = new ulong 9 0
+  put r 0 1
+  put r 1 1
+  put r 6 get req 6
+  put r 7 get req 7
+  ret ogf_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_fp8_gemv_bf16 req view ulong 9 args_out edit uint 10 info_out edit ulong 10 qmd1 edit uint 96 to long
+  r = new ulong 9 0
+  put r 0 1
+  put r 1 1
+  put r 6 get req 6
+  put r 7 get req 7
+  ret ogf_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_fp8_gemv_grouped_f32 req view ulong 9 args_out edit uint 10 info_out edit ulong 10 qmd1 edit uint 96 to long
+  r = new ulong 9 0
+  put r 0 get req 0
+  put r 1 get req 1
+  put r 6 get req 6
+  put r 7 get req 7
+  ret ogf_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_fp8_gemv_grouped_dev req view ulong 9 args_out edit uint 10 info_out edit ulong 10 qmd1 edit uint 96 to long
+  if or eq get req 2 0 eq get req 3 0
+    ret OGF_BAD_ARGS
+  end
+  r = new ulong 9 0
+  put r 0 get req 0
+  put r 1 1
+  put r 2 get req 2
+  put r 3 get req 3
+  put r 7 get req 7
+  ret ogf_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_fp8_gemv_grouped_record req view ulong 9 args_out edit uint 10 info_out edit ulong 10 qmd1 edit uint 96 to long
+  if eq get req 8 0
+    ret OGF_BAD_ARGS
+  end
+  r = new ulong 9 0
+  for i ulong 8
+    put r i get req i
+  end
+  put r 4 1
+  ret ogf_gemv_core r args_out info_out qmd1
+end
+
+fn ogf_e4m3_subnormal a f32 s uint to uchar
+  x = mul a bitcast f32 uint 0x44000000
+  xi = uint x
+  fr = sub x f32 xi
+  half = bitcast f32 uint 0x3f000000
+  if gt fr half
+    xi = add xi 1
+  else
+    if and eq fr half ne and xi 1 0
+      xi = add xi 1
+    end
+  end
+  ret uchar or s xi
+end
+
+note Exact f32 -> e4m3fn round-to-nearest-even, saturating at 448 (never 0x7F/0xFF NaN).
+fn omega_gpu_fp8_e4m3_rne v f32 to uchar
+  u0 = bitcast uint v
+  s = and shr u0 24 0x80
+  u = and u0 0x7fffffff
+  a = bitcast f32 u
+  if not lt a bitcast f32 uint 0x43e00000
+    ret uchar or s 0x7e
+  end
+  ex = sub long shr u 23 127
+  if lt ex -6
+    ret ogf_e4m3_subnormal a s
+  end
+  m = and u 0x7fffff
+  q = shr m 20
+  e = uint add ex 7
+  if ne and shr m 19 1 0
+    if or ne and m 0x7ffff 0 ne and q 1 0
+      q = add q 1
+    end
+  end
+  if eq q 8
+    q = uint 0
+    e = add e 1
+  end
+  code = or shl e 3 q
+  if gt code 0x7e
+    code = uint 0x7e
+  end
+  ret uchar or s code
+end
+
+fn ogf_quant_scale amax f32 to ushort
+  if not gt amax bitcast f32 uint 0
+    ret 0x3f80
+  end
+  qb = bitcast uint div amax bitcast f32 uint 0x43e00000
+  add1 = uint 0
+  if ne and qb 0xffff 0
+    add1 = uint 1
+  end
+  ret ushort add shr qb 16 add1
+end
+
+fn ogf_quant_blk_amax w view ushort 16384 k ulong bn ulong bk ulong amax_out edit f32 1 to long
+  lim = bitcast f32 uint 0x7f61b1e6
+  amax = bitcast f32 uint 0
+  for r ulong OGF_BLOCK
+    row_off = add mul add mul bn OGF_BLOCK r k mul bk OGF_BLOCK
+    for c ulong OGF_BLOCK
+      b = shl and uint get w add row_off c 0x7fff 16
+      f = bitcast f32 b
+      if not le f lim
+        ret OGF_BAD_ARGS
+      end
+      if gt f amax
+        amax = f
+      end
+    end
+  end
+  put amax_out 0 amax
+  ret OGF_OK
+end
+
+fn ogf_quant_blk_store w view ushort 16384 w8 edit uchar 16384 k ulong bn ulong bk ulong sc f32 to void
+  for r ulong OGF_BLOCK
+    row_off = add mul add mul bn OGF_BLOCK r k mul bk OGF_BLOCK
+    for c ulong OGF_BLOCK
+      at_idx = add row_off c
+      f = bitcast f32 shl uint get w at_idx 16
+      put w8 at_idx omega_gpu_fp8_e4m3_rne div f sc
+    end
+  end
+end
+
+note nk[2]: 0=n, 1=k (up to 16384 elements = 128x128 block in host quantize buffer)
+fn omega_gpu_fp8_quantize_bf16 nk view ulong 2 w view ushort 16384 w8 edit uchar 16384 sc_out edit ushort 64 to long
+  n = get nk 0
+  k = get nk 1
+  if eq n 0
+    ret OGF_BAD_ARGS
+  end
+  if eq k 0
+    ret OGF_BAD_ARGS
+  end
+  if ne rem n OGF_BLOCK 0
+    ret OGF_BAD_ARGS
+  end
+  if ne rem k OGF_BLOCK 0
+    ret OGF_BAD_ARGS
+  end
+  kb = div k OGF_BLOCK
+  nb = div n OGF_BLOCK
+  amax_a = new f32 1 0.0
+  for bn ulong nb bound 64
+    for bk ulong kb bound 64
+      if ne ogf_quant_blk_amax w k bn bk amax_a OGF_OK
+        ret OGF_BAD_ARGS
+      end
+      sb = ogf_quant_scale get amax_a 0
+      put sc_out add mul bn kb bk sb
+      ogf_quant_blk_store w w8 k bn bk bitcast f32 shl uint sb 16
+    end
+  end
+  ret OGF_OK
+end

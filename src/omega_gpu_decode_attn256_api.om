@@ -1,0 +1,723 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_decode_attn256_api.om: Pure seeded OM-2 port of src/omega_gpu_decode_attn256_api.c.
+note Composes src/omega_blackwell_codegen_attn256.om, om/gpu/bw_qmd.om, om/gpu/q38_plan.om,
+note src/omega_blackwell_codegen.om, src/omega_blackwell_qmd.om, and src/omega_gpu_hostmath.om.
+om2
+
+const OGD256_HD ulong 256
+const OGD256_RB ulong 512
+const OGD256_CHUNK ulong 256
+const OGD256_PER_SPLIT ulong 256
+const OGD256_MAX_LAYERS ulong 64
+const OGD256_MAX_POS ulong 131072
+const OGD256_DEPTH ulong 4
+const OGD256_PLANE_SLACK ulong 8256
+const OGD256_SHARED_BYTES ulong 14896
+const OGD256_ARGS_WORDS ulong 25
+const OGD256_MULTI_ARGS_WORDS ulong 28
+const OGD256_MULTI_PART_BYTES ulong 67108864
+const OGD256_MULTI_MAX_TOKENS ulong 128
+const OGD256_PARTIAL_BYTES ulong 6192
+note f32(0.0625 * 1.4426950408889634) = log2(e)/sqrt(256)
+const OGD256_QK_SCALE_BITS uint 0x3db8aa3b
+
+note ogd256_cfg: 0=depth, 1=per_split, 2=mutant, 3=multi_mut, 4=rec_mode, 5=mpart_va, 6=mcnt_va, 7=last_err
+global ogd256_cfg ulong 16
+
+note 3-slot kernel cache: each slot = 12 ulongs
+note [0]=valid, [1..8]=spec[0..7], [9]=insns, [10]=peak_gpr, [11]=code_va
+global ogd256_slots ulong 36
+
+note 4-slot cache table: each slot = 32 ulongs
+note [0]=used, [1]=layers, [2]=max_pos, [3]=max_splits, [4]=rotary_dim,
+note [5]=req_qh, [6]=req_kvh, [7]=req_qpc,
+note [8]=sh_qh, [9]=sh_kvh, [10]=sh_h, [11]=sh_vy, [12]=sh_g, [13]=sh_qkv_w, [14]=sh_out_w,
+note [15]=plane_bytes, [16]=kv0_va, [17]=rope_va, [18]=norms_va, [19]=part_va,
+note [20]=cnt_va, [21]=qkv_va, [22]=out_va, [23]=cpol, [24]=theta_bits
+global ogd256_caches ulong 128
+
+note Per-cache counters: 4 caches x 16 counters
+global ogd256_cnts ulong 64
+
+fn ogd256_slot_clear to void
+  for i ulong 36
+    put ogd256_slots i 0
+  end
+end
+
+fn omega_gpu_decode_attn256_set_depth depth ulong to void
+  put ogd256_cfg 0 depth
+  ogd256_slot_clear
+end
+
+fn omega_gpu_decode_attn256_set_per_split per_split ulong to void
+  put ogd256_cfg 1 per_split
+end
+
+fn omega_gpu_decode_attn256_test_set_mutant mutant ulong to void
+  put ogd256_cfg 2 mutant
+  ogd256_slot_clear
+end
+
+fn omega_gpu_decode_attn256_test_set_multi_mutant mutant ulong to void
+  put ogd256_cfg 3 mutant
+end
+
+fn omega_dattn256_rope_row pos ulong theta f64 rotary_dim ulong row256 edit f32 256 to void
+  p_half = div rotary_dim 2
+  sc = new ulong 2 0
+  p_f = f64 pos
+  rd_f = f64 rotary_dim
+  for i ulong 128
+    if lt i p_half
+      ang = mul p_f omega_hostmath_pow theta div neg f64 mul 2 i rd_f
+      omega_hostmath_sincos ang sc
+      put row256 i f32 bitcast f64 get sc 1
+      put row256 add 128 i f32 bitcast f64 get sc 0
+    else
+      put row256 i bitcast f32 uint 0x3f800000
+      put row256 add 128 i bitcast f32 uint 0
+    end
+  end
+end
+
+global ogd256_tmp ulong 24
+
+fn ogd256_alloc_slot cfg view ulong 8 sh view uint 7 cpol ulong out_cid edit ulong 1 to long
+  for s ulong 4
+    base = mul s 32
+    if eq get ogd256_caches base 0
+      pb = add mul mul ulong get sh 1 get cfg 1 OGD256_RB OGD256_PLANE_SLACK
+      va0 = add 0x500000000 mul s 0x10000000
+      put ogd256_caches base 1
+      put ogd256_caches add base 1 get cfg 0
+      put ogd256_caches add base 2 get cfg 1
+      put ogd256_caches add base 3 div get cfg 1 OGD256_CHUNK
+      put ogd256_caches add base 4 get cfg 2
+      put ogd256_caches add base 5 get cfg 3
+      put ogd256_caches add base 6 get cfg 4
+      put ogd256_caches add base 7 get cfg 5
+      for j ulong 7
+        put ogd256_caches add base add 8 j ulong get sh j
+      end
+      put ogd256_caches add base 15 pb
+      put ogd256_caches add base 16 va0
+      put ogd256_caches add base 17 add va0 0x4000000
+      put ogd256_caches add base 18 add va0 0x5000000
+      put ogd256_caches add base 19 add va0 0x6000000
+      put ogd256_caches add base 20 add va0 0x7000000
+      put ogd256_caches add base 21 add va0 0x8000000
+      put ogd256_caches add base 22 add va0 0x9000000
+      put ogd256_caches add base 23 cpol
+      put ogd256_caches add base 24 get cfg 7
+      for j ulong 16
+        put ogd256_cnts add mul s 16 j 0
+      end
+      put out_cid 0 add s 1
+      ret OGD_OK
+    end
+  end
+  ret OGD_CHIP_FAIL
+end
+
+note alloc_cfg[8]: 0=layers, 1=max_pos, 2=rotary_dim, 3=qh, 4=kvh, 5=qpc, 6=env_mode, 7=theta_bits
+fn omega_gpu_decode_attn256_cache_alloc_shape cfg view ulong 8 out_cid edit ulong 1 to long
+  put out_cid 0 0
+  sp = new ulong 8 0
+  put sp 3 get cfg 3
+  put sp 4 get cfg 4
+  put sp 5 get cfg 5
+  sh = new uint 7 0
+  if ne omega_dattn256_shape sp sh 0
+    ret OGD_BAD_ARGS
+  end
+  if gt ulong get sh 3 16
+    ret OGD_BAD_ARGS
+  end
+  if or eq get cfg 0 0 gt get cfg 0 OGD256_MAX_LAYERS
+    ret OGD_BAD_ARGS
+  end
+  if or eq get cfg 1 0 or gt get cfg 1 OGD256_MAX_POS ne rem get cfg 1 OGD256_CHUNK 0
+    ret OGD_BAD_ARGS
+  end
+  if not gt bitcast f64 get cfg 7 bitcast f64 ulong 0
+    ret OGD_BAD_ARGS
+  end
+  if or lt get cfg 2 2 or gt get cfg 2 OGD256_HD ne rem get cfg 2 2 0
+    ret OGD_BAD_ARGS
+  end
+  cpol = q38_attn256_cache_policy get cfg 6
+  ret ogd256_alloc_slot cfg sh cpol out_cid
+end
+
+fn omega_gpu_decode_attn256_cache_alloc layers ulong max_pos ulong theta f64 rotary_dim ulong out_cid edit ulong 1 to long
+  cfg = new ulong 8 0
+  put cfg 0 layers
+  put cfg 1 max_pos
+  put cfg 2 rotary_dim
+  put cfg 7 bitcast ulong theta
+  ret omega_gpu_decode_attn256_cache_alloc_shape cfg out_cid
+end
+
+fn omega_gpu_decode_attn256_cache_free cid ulong to void
+  if or eq cid 0 gt cid 4
+    ret
+  end
+  base = mul sub cid 1 32
+  for i ulong 32
+    put ogd256_caches add base i 0
+  end
+end
+
+fn omega_gpu_decode_attn256_set_norms cid ulong layer ulong qn_ok ulong kn_ok ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if or eq get ogd256_caches base 0 ge layer get ogd256_caches add base 1
+    ret OGD_BAD_ARGS
+  end
+  if or eq qn_ok 0 eq kn_ok 0
+    ret OGD_BAD_ARGS
+  end
+  ret OGD_OK
+end
+
+fn omega_gpu_decode_attn256_cache_write cid ulong layer ulong kv_head ulong pos ulong count ulong kv_ok ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if eq get ogd256_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  mp = get ogd256_caches add base 2
+  if ge layer get ogd256_caches add base 1
+    ret OGD_BAD_ARGS
+  end
+  if ge kv_head get ogd256_caches add base 9
+    ret OGD_BAD_ARGS
+  end
+  if or ge pos mp eq count 0
+    ret OGD_BAD_ARGS
+  end
+  if or gt count sub mp pos eq kv_ok 0
+    ret OGD_BAD_ARGS
+  end
+  ret OGD_OK
+end
+
+fn omega_gpu_decode_attn256_cache_read cid ulong layer ulong kv_head ulong pos ulong kv_ok ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if eq get ogd256_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  if ge layer get ogd256_caches add base 1
+    ret OGD_BAD_ARGS
+  end
+  if ge kv_head get ogd256_caches add base 9
+    ret OGD_BAD_ARGS
+  end
+  if or ge pos get ogd256_caches add base 2 eq kv_ok 0
+    ret OGD_BAD_ARGS
+  end
+  ret OGD_OK
+end
+
+note view_out[16]: 0=layers, 1=max_pos, 2=rotary_dim, 3=theta_bits, 4=k_va, 5=v_va, 6=rope_va,
+note               7=q_norm_va, 8=k_norm_va, 9=part_va, 10=cnt_va, 11=q_heads, 12=kv_heads, 13=q_per_cta, 14=qkv_w, 15=out_w
+fn omega_gpu_decode_attn256_cache_view cid ulong layer ulong view_out edit ulong 16 to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if or eq get ogd256_caches base 0 ge layer get ogd256_caches add base 1
+    ret OGD_BAD_ARGS
+  end
+  pb = get ogd256_caches add base 15
+  kv_va = add get ogd256_caches add base 16 mul layer mul 2 pb
+  qn_va = add get ogd256_caches add base 18 mul layer 2048
+  put view_out 0 get ogd256_caches add base 1
+  put view_out 1 get ogd256_caches add base 2
+  put view_out 2 get ogd256_caches add base 4
+  put view_out 3 get ogd256_caches add base 24
+  put view_out 4 kv_va
+  put view_out 5 add kv_va pb
+  put view_out 6 get ogd256_caches add base 17
+  put view_out 7 qn_va
+  put view_out 8 add qn_va 1024
+  put view_out 9 get ogd256_caches add base 19
+  put view_out 10 get ogd256_caches add base 20
+  put view_out 11 get ogd256_caches add base 8
+  put view_out 12 get ogd256_caches add base 9
+  put view_out 13 get ogd256_caches add base 10
+  put view_out 14 get ogd256_caches add base 13
+  put view_out 15 get ogd256_caches add base 14
+  ret OGD_OK
+end
+
+fn ogd256_slot_match base ulong sp view ulong 8 to bool
+  if eq get ogd256_slots base 0
+    ret false
+  end
+  for j ulong 8
+    if ne get ogd256_slots add base add 1 j get sp j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ogd256_kernel_for sp view ulong 8 out_slot edit ulong 1 hit edit ulong 1 to long
+  for i ulong 3
+    base = mul i 12
+    if ogd256_slot_match base sp
+      put out_slot 0 i
+      put hit 0 1
+      ret OGD_OK
+    end
+  end
+  chosen = ulong 99
+  for i ulong 3
+    if and eq chosen 99 eq get ogd256_slots mul i 12 0
+      chosen = i
+    end
+  end
+  if and eq chosen 99 ne get ogd256_cfg 4 0
+    ret OGD_TOO_LARGE
+  end
+  if eq chosen 99
+    ogd256_slot_clear
+    chosen = ulong 0
+  end
+  st = new uint 2 0
+  if ne omega_decode_attn256_prog_stats sp st 0
+    ret OGD_CODEGEN_FAIL
+  end
+  if eq get st 0 0
+    ret OGD_CODEGEN_FAIL
+  end
+  decl = ulong ogb_gpr_declared get st 1
+  if gt mul OGD256_CHUNK decl 65536
+    ret OGD_TOO_LARGE
+  end
+  base = mul chosen 12
+  put ogd256_slots base 1
+  for j ulong 8
+    put ogd256_slots add base add 1 j get sp j
+  end
+  put ogd256_slots add base 9 ulong get st 0
+  put ogd256_slots add base 10 ulong get st 1
+  put ogd256_slots add base 11 add 0x230000000 mul chosen 0x10000
+  put out_slot 0 chosen
+  put hit 0 0
+  ret OGD_OK
+end
+
+fn ogd256_validate_and_cg req view ulong 9 to long
+  cid = get req 0
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if eq get ogd256_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  if or ge get req 1 get ogd256_caches add base 1 ge get req 2 get ogd256_caches add base 2
+    ret OGD_BAD_ARGS
+  end
+  if and ne get req 5 0 or eq get req 6 0 eq get req 7 0
+    ret OGD_BAD_ARGS
+  end
+  per = get ogd256_cfg 1
+  if eq per 0
+    per = OGD256_PER_SPLIT
+  end
+  if ne rem per OGD256_CHUNK 0
+    ret OGD_BAD_ARGS
+  end
+  splits = div add get req 2 per per
+  if gt splits get ogd256_caches add base 3
+    ret OGD_TOO_LARGE
+  end
+  depth = get ogd256_cfg 0
+  if eq depth 0
+    depth = OGD256_DEPTH
+  end
+  sp = new ulong 8 0
+  put sp 0 depth
+  put sp 1 get ogd256_cfg 2
+  put sp 3 get ogd256_caches add base 5
+  put sp 4 get ogd256_caches add base 6
+  put sp 5 get ogd256_caches add base 7
+  sl = new ulong 1 0
+  hit = new ulong 1 0
+  put ogd256_cfg 4 get req 5
+  rc = ogd256_kernel_for sp sl hit
+  put ogd256_cfg 4 0
+  if ne rc OGD_OK
+    ret rc
+  end
+  put ogd256_tmp 0 base
+  put ogd256_tmp 1 per
+  put ogd256_tmp 2 splits
+  put ogd256_tmp 3 depth
+  put ogd256_tmp 4 get sl 0
+  put ogd256_tmp 5 get hit 0
+  ret OGD_OK
+end
+
+fn ogd256_pack_args req view ulong 9 args_out edit uint 25 to long
+  base = get ogd256_tmp 0
+  pb = get ogd256_caches add base 15
+  ls = new ulong 16 0
+  if ne get req 5 0
+    put ls 0 get req 6
+    put ls 5 get req 7
+  else
+    put ls 0 get ogd256_caches add base 21
+    put ls 5 get ogd256_caches add base 22
+  end
+  put ls 1 add get ogd256_caches add base 16 mul get req 1 mul 2 pb
+  put ls 2 pb
+  put ls 3 get ogd256_caches add base 17
+  put ls 4 get ogd256_caches add base 18
+  put ls 6 get ogd256_caches add base 19
+  put ls 7 get ogd256_caches add base 20
+  put ls 8 get req 1
+  put ls 9 get req 2
+  put ls 10 get ogd256_tmp 1
+  put ls 11 get ogd256_tmp 2
+  put ls 12 get ogd256_caches add base 2
+  put ls 13 get req 3
+  put ls 14 get req 4
+  put ls 15 ulong OGD256_QK_SCALE_BITS
+  if ne bw_attn256_args ls args_out 0
+    ret OGD_CHIP_FAIL
+  end
+  ret OGD_OK
+end
+
+fn ogd256_pack_qmd req view ulong 9 info_out edit ulong 9 qmd1 edit uint 96 to long
+  base = get ogd256_tmp 0
+  sbase = mul get ogd256_tmp 4 12
+  peak = uint get ogd256_slots add sbase 10
+  decl = ogb_gpr_declared peak
+  if eq ogb_gpr_declared_ok decl peak 0
+    ret OGD_CHIP_FAIL
+  end
+  m = new ulong 16 0
+  put m 0 get ogd256_slots add sbase 11
+  put m 1 0x200001000
+  put m 2 0x200002000
+  put m 3 0x200003000
+  put m 4 0x200004000
+  put m 5 get ogd256_caches add base 14
+  put m 8 OGD256_CHUNK
+  put m 9 1
+  put m 10 get ogd256_tmp 2
+  put m 11 get ogd256_caches add base 11
+  put m 12 ulong decl
+  put m 13 OGD256_SHARED_BYTES
+  if ne omega_blackwell_build_qmd1 qmd1 m 0
+    ret OGD_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants qmd1 0
+    ret OGD_CHIP_FAIL
+  end
+  put info_out 0 get req 1
+  put info_out 1 get req 2
+  put info_out 2 get ogd256_tmp 2
+  put info_out 3 get ogd256_tmp 1
+  put info_out 4 get ogd256_tmp 3
+  put info_out 5 get ogd256_tmp 2
+  put info_out 6 get ogd256_caches add base 11
+  put info_out 7 mul mul get ogd256_caches add base 9 add get req 2 1 1024
+  put info_out 8 get ogd256_tmp 5
+  ret OGD_OK
+end
+
+note req[9]: 0=cid, 1=layer, 2=pos, 3=eps_bits, 4=out_scale_bits, 5=rec, 6=dev_qkv, 7=dev_out, 8=cl_ok
+fn ogd256_core req view ulong 9 args_out edit uint 25 info_out edit ulong 9 qmd1 edit uint 96 to long
+  for i ulong 9
+    put info_out i 0
+  end
+  rc = ogd256_validate_and_cg req
+  if ne rc OGD_OK
+    ret rc
+  end
+  rc = ogd256_pack_args req args_out
+  if ne rc OGD_OK
+    ret rc
+  end
+  ret ogd256_pack_qmd req info_out qmd1
+end
+
+fn omega_gpu_decode_attn256 req view ulong 9 args_out edit uint 25 info_out edit ulong 9 qmd1 edit uint 96 to long
+  r = new ulong 9 0
+  for i ulong 5
+    put r i get req i
+  end
+  ret ogd256_core r args_out info_out qmd1
+end
+
+fn omega_gpu_decode_attn256_record req view ulong 9 args_out edit uint 25 info_out edit ulong 9 qmd1 edit uint 96 to long
+  if eq get req 8 0
+    ret OGD_BAD_ARGS
+  end
+  r = new ulong 9 0
+  for i ulong 8
+    put r i get req i
+  end
+  put r 5 1
+  ret ogd256_core r args_out info_out qmd1
+end
+
+fn ogd256_test_set_counter cid ulong idx ulong val ulong to void
+  if or eq cid 0 or gt cid 4 ge idx 16
+    ret
+  end
+  put ogd256_cnts add mul sub cid 1 16 idx val
+end
+
+fn omega_gpu_decode_attn256_counters_check cid ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if eq get ogd256_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  vy = get ogd256_caches add base 11
+  cbase = mul sub cid 1 16
+  any = ulong 0
+  for i ulong vy bound 16
+    any = or any get ogd256_cnts add cbase i
+  end
+  if ne any 0
+    ret OGD_CHIP_FAIL
+  end
+  ret OGD_OK
+end
+
+fn ogd256_multi_spec base ulong prep ulong sp edit ulong 8 to void
+  for i ulong 8
+    put sp i 0
+  end
+  depth = get ogd256_cfg 0
+  if eq depth 0
+    depth = OGD256_DEPTH
+  end
+  put sp 0 depth
+  put sp 1 get ogd256_cfg 2
+  put sp 3 get ogd256_caches add base 5
+  put sp 4 get ogd256_caches add base 6
+  put sp 5 get ogd256_caches add base 7
+  put sp 6 prep
+  put sp 7 1
+end
+
+fn omega_gpu_decode_attn256_multi_prepare cid ulong to long
+  if or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if eq get ogd256_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  vy = get ogd256_caches add base 11
+  if ne and vy sub vy 1 0
+    ret OGD_BAD_ARGS
+  end
+  if eq get ogd256_cfg 5 0
+    put ogd256_cfg 5 0x600000000
+    put ogd256_cfg 6 0x610000000
+  end
+  sp = new ulong 8 0
+  sl = new ulong 1 0
+  hit = new ulong 1 0
+  for prep ulong 2
+    ogd256_multi_spec base prep sp
+    rc = ogd256_kernel_for sp sl hit
+    if ne rc OGD_OK
+      ret rc
+    end
+  end
+  ret OGD_OK
+end
+
+fn ogd256_put_a64 args edit uint 28 idx ulong va ulong to void
+  put args idx bw_qmd_u32lo va
+  put args add idx 1 bw_qmd_u32hi va
+end
+
+fn ogd256_multi_validate mreq view ulong 11 to long
+  cid = get mreq 1
+  if or eq get mreq 0 0 or eq cid 0 gt cid 4
+    ret OGD_BAD_ARGS
+  end
+  base = mul sub cid 1 32
+  if eq get ogd256_caches base 0
+    ret OGD_BAD_ARGS
+  end
+  mp = get ogd256_caches add base 2
+  if or ge get mreq 2 get ogd256_caches add base 1 eq get mreq 4 0
+    ret OGD_BAD_ARGS
+  end
+  if or ge get mreq 3 mp gt get mreq 4 sub mp get mreq 3
+    ret OGD_BAD_ARGS
+  end
+  if or eq get mreq 5 0 or eq get mreq 9 0 eq get ogd256_cfg 5 0
+    ret OGD_BAD_ARGS
+  end
+  if lt get mreq 6 mul get ogd256_caches add base 13 4
+    ret OGD_BAD_ARGS
+  end
+  if or ne rem get mreq 6 16 0 ne rem get mreq 5 16 0
+    ret OGD_BAD_ARGS
+  end
+  if lt get mreq 10 mul get ogd256_caches add base 14 4
+    ret OGD_BAD_ARGS
+  end
+  if ne rem get mreq 10 4 0
+    ret OGD_BAD_ARGS
+  end
+  vy = get ogd256_caches add base 11
+  if and ne get ogd256_cfg 1 0 ne get ogd256_cfg 1 OGD256_CHUNK
+    ret OGD_BAD_ARGS
+  end
+  if ne and vy sub vy 1 0
+    ret OGD_BAD_ARGS
+  end
+  sp = new ulong 8 0
+  sl = new ulong 1 0
+  hit = new ulong 1 0
+  put ogd256_cfg 4 1
+  ogd256_multi_spec base 1 sp
+  rc = ogd256_kernel_for sp sl hit
+  if eq rc OGD_OK
+    ogd256_multi_spec base 0 sp
+    rc = ogd256_kernel_for sp sl hit
+  end
+  put ogd256_cfg 4 0
+  if ne rc OGD_OK
+    ret rc
+  end
+  put ogd256_tmp 0 base
+  put ogd256_tmp 1 get sl 0
+  ret OGD_OK
+end
+
+fn ogd256_multi_init_args mreq view ulong 11 args_out edit uint 28 to void
+  base = get ogd256_tmp 0
+  for i ulong 28
+    put args_out i 0
+  end
+  pb = get ogd256_caches add base 15
+  kc = add get ogd256_caches add base 16 mul get mreq 2 mul 2 pb
+  nm = add get ogd256_caches add base 18 mul get mreq 2 2048
+  ogd256_put_a64 args_out 2 kc
+  ogd256_put_a64 args_out 4 add kc pb
+  ogd256_put_a64 args_out 6 get ogd256_caches add base 17
+  ogd256_put_a64 args_out 8 nm
+  ogd256_put_a64 args_out 10 add nm 1024
+  ogd256_put_a64 args_out 14 get ogd256_cfg 5
+  ogd256_put_a64 args_out 16 get ogd256_cfg 6
+  put args_out 19 uint OGD256_CHUNK
+  put args_out 21 uint mul get ogd256_caches add base 2 OGD256_RB
+  put args_out 22 uint get mreq 7
+  put args_out 23 uint get mreq 8
+  put args_out 24 OGD256_QK_SCALE_BITS
+  put args_out 25 uint get mreq 6
+  put args_out 26 uint get mreq 10
+end
+
+fn ogd256_multi_fit_n pos0 ulong t0 ulong n_init ulong vy ulong to ulong
+  n = n_init
+  while gt n 1 bound 128
+    end_p = sub add add pos0 t0 n 1
+    smax_t = add div end_p OGD256_CHUNK 1
+    need = mul mul mul n vy smax_t OGD256_PARTIAL_BYTES
+    if le need OGD256_MULTI_PART_BYTES
+      ret n
+    end
+    n = sub n 1
+  end
+  ret n
+end
+
+fn ogd256_multi_loop mreq view ulong 11 args_out edit uint 28 multi_out edit ulong 6 to long
+  vy = get ogd256_caches add get ogd256_tmp 0 11
+  if ne get ogd256_cfg 3 1
+    put multi_out 0 1
+    put multi_out 1 1
+  end
+  t0 = ulong 0
+  while lt t0 get mreq 4 bound 1024
+    n = sub get mreq 4 t0
+    if gt n OGD256_MULTI_MAX_TOKENS
+      n = OGD256_MULTI_MAX_TOKENS
+    end
+    n = ogd256_multi_fit_n get mreq 3 t0 n vy
+    smax = add div sub add add get mreq 3 t0 n 1 OGD256_CHUNK 1
+    ps = mul mul vy smax OGD256_PARTIAL_BYTES
+    if gt mul n ps OGD256_MULTI_PART_BYTES
+      ret OGD_TOO_LARGE
+    end
+    ogd256_put_a64 args_out 0 add get mreq 5 mul t0 get mreq 6
+    ogd256_put_a64 args_out 12 add get mreq 9 mul t0 get mreq 10
+    put args_out 18 uint add get mreq 3 t0
+    put args_out 20 uint smax
+    put args_out 27 uint ps
+    put multi_out 3 smax
+    put multi_out 4 mul n vy
+    put multi_out 5 ps
+    put multi_out 0 add get multi_out 0 1
+    put multi_out 2 add get multi_out 2 1
+    t0 = add t0 n
+  end
+  ret OGD_OK
+end
+
+note mreq[11]: 0=cl_ok, 1=cid, 2=layer, 3=pos0, 4=tokens, 5=qkv_va, 6=xstride, 7=eps_bits, 8=out_scale_bits, 9=out_va, 10=ostride
+note multi_out[6]: 0=launches_recorded, 1=prep_recorded, 2=attend_groups, 3=last_grid_x, 4=last_grid_y, 5=last_pstride
+fn omega_gpu_decode_attn256_multi_record mreq view ulong 11 args_out edit uint 28 multi_out edit ulong 6 qmd1 edit uint 96 to long
+  for i ulong 6
+    put multi_out i 0
+  end
+  rc = ogd256_multi_validate mreq
+  if ne rc OGD_OK
+    ret rc
+  end
+  ogd256_multi_init_args mreq args_out
+  rc = ogd256_multi_loop mreq args_out multi_out
+  if ne rc OGD_OK
+    ret rc
+  end
+  base = get ogd256_tmp 0
+  sbase = mul get ogd256_tmp 1 12
+  decl = ogb_gpr_declared uint get ogd256_slots add sbase 10
+  m = new ulong 16 0
+  put m 0 get ogd256_slots add sbase 11
+  put m 1 0x200001000
+  put m 2 0x200002000
+  put m 3 0x200003000
+  put m 4 0x200004000
+  put m 5 mul get mreq 4 get ogd256_caches add base 14
+  put m 8 OGD256_CHUNK
+  put m 9 1
+  put m 10 get multi_out 3
+  put m 11 get multi_out 4
+  put m 12 ulong decl
+  put m 13 OGD256_SHARED_BYTES
+  if ne omega_blackwell_build_qmd1 qmd1 m 0
+    ret OGD_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants qmd1 0
+    ret OGD_CHIP_FAIL
+  end
+  ret OGD_OK
+end

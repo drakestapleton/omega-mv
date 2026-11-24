@@ -1,0 +1,1135 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_attention_api.om: Pure seeded OM-2 port of src/omega_gpu_attention_api.c.
+note Composes om/gpu/cg_gpu_attn.om, om/gpu/bw_regalloc.om, and src/omega_blackwell_qmd.om.
+om2
+
+const OGA_OK long 0
+const OGA_BAD_ARGS long -1
+const OGA_TOO_LARGE long -2
+const OGA_CODEGEN_FAIL long -3
+const OGA_CHIP_FAIL long -4
+const OGA_UNWRITTEN long -5
+
+const OGA_HEAD_DIM ulong 64
+const OGA_HEAD_DIM_128 ulong 128
+const OGA_MAX_CTAS ulong 64
+const OGA_ROWS_MAX_CTAS ulong 1024
+const OGA_MAX_LOG2SPLIT ulong 4
+const OGA_SPLIT_MAX_CTAS ulong 1024
+const OGA_MAX_Q_HEADS ulong 64
+const OGA_MAX_GQA_CTX ulong 4096
+const OGA_GPR_BUDGET ulong 96
+const OGA_KV_STAGED ulong 0
+const OGA_KV_RESIDENT ulong 1
+const OGA_MUTANT_COUNT ulong 7
+const OGA_POISON uint 0xffbadbad
+
+note Global state for attention API (CPU-only host/contract + mock/sim mode, zero /dev/nvidia*)
+note oga_cfg: 0=mutant, 1=divergent, 2=dedupe(1), 3=split_set(0), 4=split_val(0),
+note          5=sim_on(0), 6=sim_shared_bytes, 7=resident_va, 8=resident_size,
+note          9=res_active, 10=res_pool, 11=res_q, 12=res_out, 13=res_tab, 14=last_err_code
+global oga_cfg ulong 16
+
+note 16-slot kernel cache: each slot = 12 ulongs
+note [0]=used, [1]=f32, [2]=log2bs, [3]=log2gqa, [4]=mutant, [5]=divergent,
+note [6]=hd, [7]=split_flag, [8]=split_val, [9]=insns, [10]=peak_gpr, [11]=peak_ugpr
+global oga_cache ulong 192
+
+note Scratch workspace for codegen (avoid stack overflow and error 19 by reading globals directly)
+global oga_cg_ins ulong 8192
+global oga_cg_meta ulong 512
+
+text oga_err_none ""
+text oga_err_pool_dup "attention pool: already allocated"
+text oga_err_res_zero "attention reserve: zero bound"
+text oga_err_res_bs "attention reserve: block size not a power of two"
+text oga_err_res_head "attention reserve: bad head shape"
+text oga_err_res_rows "attention reserve rows: bad bound"
+text oga_err_res_exceed "serving reservation exceeded"
+
+text oga_rc_ok "OK"
+text oga_rc_bad "BAD_ARGS"
+text oga_rc_large "TOO_LARGE"
+text oga_rc_cg "CODEGEN_FAIL"
+text oga_rc_chip "CHIP_FAIL"
+text oga_rc_unw "UNWRITTEN"
+text oga_rc_unk "UNKNOWN"
+
+text oga_mut_0 "none"
+text oga_mut_1 "NO_MAX"
+text oga_mut_2 "KV_HEAD"
+text oga_mut_3 "SLOT"
+text oga_mut_4 "NO_RESCALE"
+text oga_mut_5 "Q_ROW"
+text oga_mut_6 "OUT_ROW"
+text oga_mut_q "?"
+
+fn oga_copy_text src view uchar * dst edit uchar 64 to ulong
+  n = len src
+  if gt n 64
+    n = ulong 64
+  end
+  for i ulong n bound 64
+    put dst i get src i
+  end
+  ret n
+end
+
+fn oga_init_defaults to void
+  if eq get oga_cfg 2 0
+    if eq get oga_cfg 15 0
+      put oga_cfg 2 1
+      put oga_cfg 15 1
+    end
+  end
+end
+
+fn omega_gpu_attention_heads_per_cta hd ulong log2gqa ulong to ulong
+  if ne hd 128
+    ret 1
+  end
+  sh = log2gqa
+  if gt sh 2
+    sh = ulong 2
+  end
+  ret shl ulong 1 sh
+end
+
+fn oga_shared_bytes_for hd ulong log2gqa ulong to ulong
+  gc = omega_gpu_attention_heads_per_cta hd log2gqa
+  ret mul mul add mul 3 gc 1 hd 4
+end
+
+fn oga_log2_exact v ulong to long
+  if eq v 0
+    ret -1
+  end
+  if ne and v sub v 1 0
+    ret -1
+  end
+  l = ulong 0
+  while ne shl ulong 1 l v bound 32
+    l = add l 1
+  end
+  ret long l
+end
+
+fn oga_score_scale_bits hd ulong to uint
+  if eq hd 128
+    note f32(1.4426950408889634 / 11.313708498984761) = 0.12751743
+    ret uint 0x3e0295d7
+  end
+  note f32(1.4426950408889634 / 8.0) = 0.18033688
+  ret uint 0x3e38aa3b
+end
+
+fn oga_check_heads nqh ulong nkvh ulong hd ulong out_l2 edit ulong 1 to long
+  if or eq nqh 0 or eq nkvh 0 eq hd 0
+    ret OGA_BAD_ARGS
+  end
+  if and ne hd 64 ne hd 128
+    ret OGA_TOO_LARGE
+  end
+  if gt nqh OGA_MAX_Q_HEADS
+    ret OGA_TOO_LARGE
+  end
+  if ne rem nqh nkvh 0
+    ret OGA_BAD_ARGS
+  end
+  l2 = oga_log2_exact div nqh nkvh
+  if lt l2 0
+    ret OGA_BAD_ARGS
+  end
+  put out_l2 0 ulong l2
+  ret OGA_OK
+end
+
+fn oga_own_log2split ctx ulong hd ulong to ulong
+  x = div add ctx sub hd 1 hd
+  l = ulong 0
+  while lt l OGA_MAX_LOG2SPLIT bound 8
+    if gt shl ulong 2 l x
+      ret l
+    end
+    l = add l 1
+  end
+  ret l
+end
+
+fn omega_gpu_attention_test_set_simulator on ulong to void
+  oga_init_defaults
+  put oga_cfg 5 on
+end
+
+fn omega_gpu_attention_test_shared_bytes to ulong
+  ret get oga_cfg 6
+end
+
+fn omega_gpu_attention_test_set_dedupe on ulong to void
+  put oga_cfg 15 1
+  if ne on 0
+    put oga_cfg 2 1
+  else
+    put oga_cfg 2 0
+  end
+end
+
+fn omega_gpu_attention_test_set_split log2split long to void
+  if and ge log2split 0 le log2split long OGA_MAX_LOG2SPLIT
+    put oga_cfg 3 1
+    put oga_cfg 4 ulong log2split
+  else
+    put oga_cfg 3 0
+    put oga_cfg 4 0
+  end
+end
+
+fn omega_gpu_attention_test_resident_fits block_stride ulong layer_stride ulong block_id ulong to bool
+  if gt block_stride 0xffffffff
+    ret false
+  end
+  if gt block_id 0xffffffff
+    ret false
+  end
+  end_off = add mul block_id block_stride layer_stride
+  if gt end_off 0xffffffff
+    ret false
+  end
+  ret true
+end
+
+fn omega_gpu_attention_pool_alloc bytes ulong out_va edit ulong 1 to long
+  put out_va 0 0
+  if eq bytes 0
+    ret OGA_BAD_ARGS
+  end
+  if ne get oga_cfg 7 0
+    put oga_cfg 14 1
+    ret OGA_BAD_ARGS
+  end
+  va = ulong 0x300000000
+  put oga_cfg 7 va
+  put oga_cfg 8 bytes
+  put out_va 0 va
+  ret OGA_OK
+end
+
+fn omega_gpu_attention_pool_free to void
+  put oga_cfg 7 0
+  put oga_cfg 8 0
+end
+
+fn omega_gpu_attention_cache_clear to void
+  for i ulong 192
+    put oga_cache i 0
+  end
+end
+
+fn omega_gpu_attention_test_set_mutant m ulong to void
+  put oga_cfg 0 m
+  omega_gpu_attention_cache_clear
+end
+
+fn omega_gpu_attention_test_set_divergent mode long to void
+  if or lt mode 0 gt mode 2
+    put oga_cfg 1 0
+  else
+    put oga_cfg 1 ulong mode
+  end
+  omega_gpu_attention_cache_clear
+end
+
+fn oga_touch_vreg vinfo edit long 768 r64 ulong pos long is_def ulong nv ulong to void
+  if ge r64 nv
+    ret
+  end
+  base = mul r64 3
+  fd = get vinfo base
+  lu = get vinfo add base 1
+  if and ne is_def 0 lt fd 0
+    put vinfo base pos
+  end
+  if gt pos lu
+    put vinfo add base 1 pos
+  end
+end
+
+fn oga_build_vinfo ins view ulong 8192 meta view ulong 512 vinfo edit long 768 to void
+  n = get meta 0
+  nv = get meta 1
+  nl = get meta 3
+  for v ulong nv bound 256
+    base = mul v 3
+    put vinfo base -1
+    put vinfo add base 1 -1
+    put vinfo add base 2 long get meta add 64 v
+  end
+  for i ulong n bound 1024
+    off = mul i 8
+    flags = get ins add off 7
+    if eq and flags 1 0
+      pos = long i
+      oga_touch_vreg vinfo get ins add off 1 pos 1 nv
+      oga_touch_vreg vinfo get ins add off 2 pos 0 nv
+      oga_touch_vreg vinfo get ins add off 3 pos 0 nv
+      oga_touch_vreg vinfo get ins add off 4 pos 0 nv
+    end
+  end
+  for l ulong nl bound 16
+    ls = long get meta add 320 mul l 2
+    le_idx = long get meta add 321 mul l 2
+    for v ulong nv bound 256
+      base = mul v 3
+      fd = get vinfo base
+      lu = get vinfo add base 1
+      if ge fd 0
+        if lt fd ls
+          if ge lu ls
+            if lt lu le_idx
+              put vinfo add base 1 le_idx
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+fn oga_check_vreg_after ins view ulong 8192 v ulong start_i ulong n ulong to long
+  i = start_i
+  while lt i n bound 1024
+    off = mul i 8
+    if eq get ins add off 2 v
+      ret -1
+    end
+    if eq get ins add off 3 v
+      ret -1
+    end
+    if eq get ins add off 4 v
+      ret -1
+    end
+    if eq get ins add off 1 v
+      fl = get ins add off 7
+      if eq and fl 1 0
+        ret 0
+      end
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn oga_check_loop_inv ins view ulong 8192 meta view ulong 512 vinfo view long 768 to long
+  n = get meta 0
+  nv = get meta 1
+  nl = get meta 3
+  for l ulong nl bound 16
+    ls = long get meta add 320 mul l 2
+    le_idx = long get meta add 321 mul l 2
+    for v ulong nv bound 256
+      fd = get vinfo mul v 3
+      if and ge fd ls le fd le_idx
+        if ne oga_check_vreg_after ins v add ulong le_idx 1 n 0
+          ret -1
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn oga_solve_cg ins view ulong 8192 meta view ulong 512 st edit ulong 4 to long
+  n = get meta 0
+  nv = get meta 1
+  nu = get meta 2
+  nl = get meta 3
+  if or eq n 0 gt n 1024
+    ret OGA_CODEGEN_FAIL
+  end
+  if or gt nv 256 or gt nu 32 gt nl 16
+    ret OGA_CODEGEN_FAIL
+  end
+  vinfo = new long 768 0
+  oga_build_vinfo ins meta vinfo
+  if ne oga_check_loop_inv ins meta vinfo 0
+    ret OGA_CODEGEN_FAIL
+  end
+  uinfo = new ulong 32 0
+  for u ulong nu bound 32
+    put uinfo u get meta add 352 u
+  end
+  cfg = new ulong 4 0
+  put cfg 0 nv
+  put cfg 1 nu
+  put cfg 2 0
+  res = new long 290 0
+  if ne bw_regalloc_solve cfg vinfo uinfo res 0
+    ret OGA_CODEGEN_FAIL
+  end
+  peak = ulong get res 288
+  if gt peak OGA_GPR_BUDGET
+    ret OGA_CODEGEN_FAIL
+  end
+  put st 0 n
+  put st 1 peak
+  put st 2 ulong get res 289
+  ret OGA_OK
+end
+
+fn oga_build_kernel sp view ulong 8 st edit ulong 4 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  rc = cg_gpu_attn_emit sp ins meta
+  if ne rc 0
+    ret OGA_CODEGEN_FAIL
+  end
+  if ne get meta 15 0
+    ret OGA_CODEGEN_FAIL
+  end
+  if ne get meta 5 0
+    ret OGA_CODEGEN_FAIL
+  end
+  s = oga_solve_cg ins meta st
+  if ne s OGA_OK
+    ret s
+  end
+  put st 3 oga_shared_bytes_for get sp 5 get sp 2
+  ret OGA_OK
+end
+
+fn oga_slot_match base ulong sp view ulong 8 to bool
+  if eq get oga_cache base 0
+    ret false
+  end
+  for j ulong 8
+    if ne get oga_cache add base add 1 j get sp j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn oga_kernel_for sp view ulong 8 st edit ulong 4 hit edit ulong 1 to long
+  for i ulong 16
+    base = mul i 12
+    if oga_slot_match base sp
+      put st 0 get oga_cache add base 9
+      put st 1 get oga_cache add base 10
+      put st 2 get oga_cache add base 11
+      put st 3 oga_shared_bytes_for get sp 5 get sp 2
+      put hit 0 1
+      ret OGA_OK
+    end
+  end
+  rc = oga_build_kernel sp st
+  if ne rc OGA_OK
+    ret rc
+  end
+  slot = ulong 0
+  found_free = ulong 0
+  for i ulong 16
+    if and eq found_free 0 eq get oga_cache mul i 12 0
+      slot = i
+      found_free = ulong 1
+    end
+  end
+  base = mul slot 12
+  put oga_cache base 1
+  for j ulong 8
+    put oga_cache add base add 1 j get sp j
+  end
+  put oga_cache add base 9 get st 0
+  put oga_cache add base 10 get st 1
+  put oga_cache add base 11 get st 2
+  put hit 0 0
+  ret OGA_OK
+end
+
+fn oga_make_spec kv_f32 ulong log2bs ulong log2gqa ulong hd ulong split_enc long sp edit ulong 8 to void
+  put sp 0 kv_f32
+  put sp 1 log2bs
+  put sp 2 log2gqa
+  put sp 3 get oga_cfg 0
+  put sp 4 get oga_cfg 1
+  put sp 5 hd
+  if gt split_enc 0
+    put sp 6 1
+    put sp 7 ulong split_enc
+  else
+    put sp 6 0
+    put sp 7 0
+  end
+end
+
+fn omega_gpu_attention_codegen_hd kv_f32 ulong log2bs ulong log2gqa ulong hd ulong st edit ulong 4 to long
+  if or gt log2bs 16 gt log2gqa 6
+    ret OGA_BAD_ARGS
+  end
+  if and ne hd 64 ne hd 128
+    ret OGA_TOO_LARGE
+  end
+  sp = new ulong 8 0
+  put sp 0 kv_f32
+  put sp 1 log2bs
+  put sp 2 log2gqa
+  put sp 3 get oga_cfg 0
+  put sp 4 get oga_cfg 1
+  put sp 5 hd
+  put sp 6 0
+  put sp 7 0
+  ret oga_build_kernel sp st
+end
+
+fn omega_gpu_attention_codegen kv_f32 ulong log2bs ulong log2gqa ulong st edit ulong 4 to long
+  ret omega_gpu_attention_codegen_hd kv_f32 log2bs log2gqa OGA_HEAD_DIM st
+end
+
+fn omega_gpu_attention_last_error dst edit uchar 64 to ulong
+  c = get oga_cfg 14
+  if eq c 1
+    ret oga_copy_text oga_err_pool_dup dst
+  end
+  if eq c 2
+    ret oga_copy_text oga_err_res_zero dst
+  end
+  if eq c 3
+    ret oga_copy_text oga_err_res_bs dst
+  end
+  if eq c 4
+    ret oga_copy_text oga_err_res_head dst
+  end
+  if eq c 5
+    ret oga_copy_text oga_err_res_rows dst
+  end
+  if eq c 6
+    ret oga_copy_text oga_err_res_exceed dst
+  end
+  ret oga_copy_text oga_err_none dst
+end
+
+global oga_tmp ulong 32
+
+fn oga_reserve_commit max_ctx ulong max_seqs ulong nqh ulong nkvh ulong hd ulong kv_bs ulong to void
+  per_seq = mul mul mul mul 2 max_ctx nkvh hd 4
+  if ne kv_bs 0
+    nblk = div add max_ctx sub kv_bs 1 kv_bs
+    paged = mul mul mul mul nblk kv_bs nkvh hd 4
+    if gt paged per_seq
+      per_seq = paged
+    end
+  end
+  put oga_cfg 10 mul per_seq max_seqs
+  put oga_cfg 11 mul mul mul max_seqs nqh hd 4
+  lseqs = div OGA_MAX_CTAS nqh
+  if eq lseqs 0
+    lseqs = ulong 1
+  end
+  if gt lseqs max_seqs
+    lseqs = max_seqs
+  end
+  put oga_tmp 0 mul lseqs nqh
+  put oga_tmp 0 mul get oga_tmp 0 16
+  put oga_tmp 0 mul get oga_tmp 0 mul add hd 2 4
+  qo = get oga_cfg 11
+  if gt get oga_tmp 0 qo
+    qo = get oga_tmp 0
+  end
+  put oga_cfg 12 qo
+  tab = mul add mul max_seqs max_ctx max_seqs 4
+  if lt tab 8
+    tab = ulong 8
+  end
+  put oga_cfg 13 tab
+  put oga_cfg 9 1
+end
+
+fn omega_gpu_attention_reserve max_ctx ulong max_seqs ulong nqh ulong nkvh ulong hd ulong kv_bs ulong to long
+  if or eq max_ctx 0 eq max_seqs 0
+    put oga_cfg 14 2
+    ret OGA_BAD_ARGS
+  end
+  if ne kv_bs 0
+    if lt oga_log2_exact kv_bs 0
+      put oga_cfg 14 3
+      ret OGA_BAD_ARGS
+    end
+  end
+  l2 = new ulong 1 0
+  rc = oga_check_heads nqh nkvh hd l2
+  if ne rc OGA_OK
+    put oga_cfg 14 4
+    ret rc
+  end
+  oga_reserve_commit max_ctx max_seqs nqh nkvh hd kv_bs
+  ret OGA_OK
+end
+
+fn omega_gpu_attention_reserve_rows max_rows ulong nqh ulong hd ulong to long
+  if or eq max_rows 0 or eq nqh 0 gt nqh OGA_MAX_Q_HEADS
+    put oga_cfg 14 5
+    ret OGA_BAD_ARGS
+  end
+  if and ne hd 64 ne hd 128
+    put oga_cfg 14 5
+    ret OGA_BAD_ARGS
+  end
+  per = div OGA_ROWS_MAX_CTAS nqh
+  if eq per 0
+    per = ulong 1
+  end
+  if gt per max_rows
+    per = max_rows
+  end
+  qo = mul mul mul per nqh hd 4
+  tab = mul per 8
+  put oga_cfg 9 1
+  if gt qo get oga_cfg 11
+    put oga_cfg 11 qo
+  end
+  if gt qo get oga_cfg 12
+    put oga_cfg 12 qo
+  end
+  if gt tab get oga_cfg 13
+    put oga_cfg 13 tab
+  end
+  ret OGA_OK
+end
+
+fn omega_gpu_attention_unreserve to void
+  put oga_cfg 9 0
+  put oga_cfg 10 0
+  put oga_cfg 11 0
+  put oga_cfg 12 0
+  put oga_cfg 13 0
+end
+
+fn oga_check_reservation q_b ulong pool_b ulong tab_b ulong out_b ulong to long
+  if eq get oga_cfg 9 0
+    ret OGA_OK
+  end
+  if or gt q_b get oga_cfg 11 gt out_b get oga_cfg 12
+    put oga_cfg 14 6
+    ret OGA_TOO_LARGE
+  end
+  if or gt tab_b get oga_cfg 13 gt pool_b get oga_cfg 10
+    put oga_cfg 14 6
+    ret OGA_TOO_LARGE
+  end
+  ret OGA_OK
+end
+
+fn oga_build_qmd tx ulong gx ulong gy ulong smem ulong out_words ulong qmd1 edit uint 96 to long
+  m = new ulong 16 0
+  put m 0 0x200010000
+  put m 1 0x200001000
+  put m 2 0x200002000
+  put m 3 0x200003000
+  put m 4 0x200004000
+  put m 5 out_words
+  put m 8 tx
+  put m 9 1
+  put m 10 gx
+  put m 11 gy
+  put m 12 OGA_GPR_BUDGET
+  put m 13 smem
+  if ne omega_blackwell_build_qmd1 qmd1 m 0
+    ret OGA_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants qmd1 0
+    ret OGA_CHIP_FAIL
+  end
+  ret OGA_OK
+end
+
+note oga_tmp[0..3]=vas, [4..11]=params(8), [12]=tx, [13]=gx, [14]=gy, [15]=smem, [16]=out_words,
+note [17]=insns, [18]=gpr, [19]=hit, [20]=kv_staged, [21]=kv_naive, [22]=blk_log, [23]=blk_uniq, [24]=kv_src
+fn oga_emit_launch args_out edit uint 16 info_out edit ulong 12 qmd1 edit uint 96 to long
+  put args_out 0 bw_qmd_u32lo get oga_tmp 0
+  put args_out 1 bw_qmd_u32hi get oga_tmp 0
+  put args_out 2 bw_qmd_u32lo get oga_tmp 1
+  put args_out 3 bw_qmd_u32hi get oga_tmp 1
+  put args_out 4 bw_qmd_u32lo get oga_tmp 2
+  put args_out 5 bw_qmd_u32hi get oga_tmp 2
+  put args_out 6 bw_qmd_u32lo get oga_tmp 3
+  put args_out 7 bw_qmd_u32hi get oga_tmp 3
+  for i ulong 8
+    put args_out add 8 i uint get oga_tmp add 4 i
+  end
+  put oga_cfg 6 get oga_tmp 15
+  rc = oga_build_qmd get oga_tmp 12 get oga_tmp 13 get oga_tmp 14 get oga_tmp 15 get oga_tmp 16 qmd1
+  if ne rc OGA_OK
+    ret rc
+  end
+  put info_out 0 get oga_tmp 13
+  put info_out 1 get oga_tmp 14
+  put info_out 2 get oga_tmp 12
+  put info_out 3 get oga_tmp 15
+  put info_out 4 get oga_tmp 17
+  put info_out 5 get oga_tmp 18
+  put info_out 6 get oga_tmp 19
+  put info_out 7 get oga_tmp 20
+  put info_out 8 get oga_tmp 21
+  put info_out 9 get oga_tmp 22
+  put info_out 10 get oga_tmp 23
+  put info_out 11 get oga_tmp 24
+  ret OGA_OK
+end
+
+fn oga_run_cg kv_f32 ulong l2bs ulong l2gqa ulong hd ulong sp_enc long to long
+  sp = new ulong 8 0
+  oga_make_spec kv_f32 l2bs l2gqa hd sp_enc sp
+  st = new ulong 4 0
+  hit = new ulong 1 0
+  rc = oga_kernel_for sp st hit
+  if ne rc OGA_OK
+    ret rc
+  end
+  put oga_tmp 15 get st 3
+  put oga_tmp 17 get st 0
+  put oga_tmp 18 get st 1
+  put oga_tmp 19 get hit 0
+  ret OGA_OK
+end
+
+note req[10]:
+note   gqa_f32:  0=seq_len, 1=nqh, 2=nkvh, 3=hd, 4=q_va, 5=pool_va, 6=out_va, 7=tab_va
+note   rows_f32: 0=base_len, 1=num_rows, 2=nqh, 3=nkvh, 4=hd, 5=q_va, 6=pool_va, 7=out_va, 8=tab_va
+note   paged:    0=n_bids, 1=ctx_len, 2=layer_idx, 3=nqh, 4=nkvh, 5=hd, 6=q_va, 7=pool_va, 8=out_va, 9=tab_va
+note   batch:    0=max_b, 1=num_seqs, 2=layer_idx, 3=nqh, 4=nkvh, 5=hd, 6=q_va, 7=pool_va, 8=out_va, 9=tab_va
+fn omega_gpu_gqa_attention_f32 req view ulong 10 args_out edit uint 16 info_out edit ulong 12 qmd1 edit uint 96 to long
+  oga_init_defaults
+  if or eq get req 4 0 or eq get req 5 0 eq get req 6 0
+    ret OGA_BAD_ARGS
+  end
+  l2 = new ulong 1 0
+  rc = oga_check_heads get req 1 get req 2 get req 3 l2
+  if ne rc OGA_OK
+    ret rc
+  end
+  if gt get req 0 OGA_MAX_GQA_CTX
+    ret OGA_TOO_LARGE
+  end
+  for i ulong 12
+    put info_out i 0
+  end
+  if eq get req 0 0
+    ret OGA_OK
+  end
+  rc = oga_run_cg 1 12 get l2 0 get req 3 -1
+  if ne rc OGA_OK
+    ret rc
+  end
+  plane = mul mul mul get req 0 get req 2 get req 3 4
+  n_out = mul get req 1 get req 3
+  rc = oga_check_reservation mul n_out 4 mul 2 plane 8 mul n_out 4
+  if ne rc OGA_OK
+    ret rc
+  end
+  put oga_tmp 0 get req 4
+  put oga_tmp 1 get req 5
+  put oga_tmp 2 get req 6
+  put oga_tmp 3 get req 7
+  put oga_tmp 4 1
+  put oga_tmp 5 ulong oga_score_scale_bits get req 3
+  put oga_tmp 6 mul 2 plane
+  put oga_tmp 7 mul mul get req 2 get req 3 4
+  put oga_tmp 8 plane
+  put oga_tmp 9 mul get req 3 4
+  put oga_tmp 10 get req 1
+  put oga_tmp 11 4
+  put oga_tmp 12 get req 3
+  put oga_tmp 13 div get req 1 omega_gpu_attention_heads_per_cta get req 3 get l2 0
+  put oga_tmp 14 1
+  put oga_tmp 16 n_out
+  put oga_tmp 20 mul 2 plane
+  put oga_tmp 21 mul 2 plane
+  put oga_tmp 22 1
+  put oga_tmp 23 1
+  put oga_tmp 24 OGA_KV_STAGED
+  ret oga_emit_launch args_out info_out qmd1
+end
+
+fn omega_gpu_gqa_attention_rows_f32 req view ulong 10 args_out edit uint 16 info_out edit ulong 12 qmd1 edit uint 96 to long
+  oga_init_defaults
+  if or eq get req 5 0 eq get req 6 0
+    ret OGA_BAD_ARGS
+  end
+  if or eq get req 7 0 eq get req 1 0
+    ret OGA_BAD_ARGS
+  end
+  l2 = new ulong 1 0
+  rc = oga_check_heads get req 2 get req 3 get req 4 l2
+  if ne rc OGA_OK
+    ret rc
+  end
+  if gt add get req 0 get req 1 OGA_MAX_GQA_CTX
+    ret OGA_TOO_LARGE
+  end
+  rc = oga_run_cg 1 12 get l2 0 get req 4 -1
+  if ne rc OGA_OK
+    ret rc
+  end
+  plane = mul mul mul add get req 0 get req 1 get req 3 get req 4 4
+  row_b = mul mul get req 2 get req 4 4
+  per = div OGA_ROWS_MAX_CTAS get req 2
+  if eq per 0
+    per = ulong 1
+  end
+  if gt per get req 1
+    per = get req 1
+  end
+  if and ne get oga_cfg 9 0 ge get oga_cfg 11 row_b
+    fit = div get oga_cfg 11 row_b
+    if lt fit per
+      per = fit
+    end
+  end
+  rc = oga_check_reservation mul per row_b mul 2 plane mul per 8 mul per row_b
+  if ne rc OGA_OK
+    ret rc
+  end
+  put oga_tmp 0 get req 5
+  put oga_tmp 1 get req 6
+  put oga_tmp 2 get req 7
+  put oga_tmp 3 get req 8
+  put oga_tmp 4 1
+  put oga_tmp 5 ulong oga_score_scale_bits get req 4
+  put oga_tmp 6 mul 2 plane
+  put oga_tmp 7 mul mul get req 3 get req 4 4
+  put oga_tmp 8 plane
+  put oga_tmp 9 mul get req 4 4
+  put oga_tmp 10 get req 2
+  put oga_tmp 11 mul per 4
+  put oga_tmp 12 get req 4
+  put oga_tmp 13 div get req 2 omega_gpu_attention_heads_per_cta get req 4 get l2 0
+  put oga_tmp 14 per
+  put oga_tmp 16 mul mul per get req 2 get req 4
+  put oga_tmp 20 mul 2 plane
+  put oga_tmp 21 mul mul get req 1 2 plane
+  put oga_tmp 22 get req 1
+  put oga_tmp 23 1
+  put oga_tmp 24 OGA_KV_STAGED
+  ret oga_emit_launch args_out info_out qmd1
+end
+
+note ly[9]: 0=block_stride, 1=layer_stride, 2=kv_plane_stride, 3=token_stride, 4=head_stride, 5=pool_bytes, 6=num_blocks, 7=num_layers, 8=block_size
+fn oga_validate_kv_layout ly view ulong 9 layer_idx ulong nkvh ulong hd ulong out_l2bs edit ulong 1 to long
+  if ge layer_idx get ly 7
+    ret OGA_BAD_ARGS
+  end
+  bs = get ly 8
+  l2bs = oga_log2_exact bs
+  if lt l2bs 0
+    ret OGA_BAD_ARGS
+  end
+  if ne get ly 4 mul hd 2
+    ret OGA_BAD_ARGS
+  end
+  if ne get ly 3 mul mul nkvh hd 2
+    ret OGA_BAD_ARGS
+  end
+  if ne get ly 2 mul bs get ly 3
+    ret OGA_BAD_ARGS
+  end
+  if ne get ly 1 mul 2 get ly 2
+    ret OGA_BAD_ARGS
+  end
+  if lt get ly 0 mul get ly 7 get ly 1
+    ret OGA_BAD_ARGS
+  end
+  put out_l2bs 0 ulong l2bs
+  ret OGA_OK
+end
+
+note Shared buffers for paged/batch tables (avoids >6 params in OM-2)
+global oga_paged_bids uint 64
+global oga_batch_tabs int 64
+global oga_batch_ctxs int 16
+
+fn oga_paged_check_bids ly view ulong 9 n_bids ulong layer_idx ulong to long
+  if gt n_bids 64
+    ret OGA_TOO_LARGE
+  end
+  for b ulong n_bids bound 64
+    id = ulong get oga_paged_bids b
+    if ge id get ly 6
+      ret OGA_BAD_ARGS
+    end
+    need_end = add mul id get ly 0 mul add layer_idx 1 get ly 1
+    if gt need_end get ly 5
+      ret OGA_BAD_ARGS
+    end
+  end
+  ret OGA_OK
+end
+
+fn oga_paged_is_res ly view ulong 9 pool_va ulong need_b ulong to bool
+  if eq get oga_cfg 7 0
+    ret false
+  end
+  if ne pool_va get oga_cfg 7
+    ret false
+  end
+  if gt get ly 5 get oga_cfg 8
+    ret false
+  end
+  for b ulong need_b bound 64
+    if not omega_gpu_attention_test_resident_fits get ly 0 get ly 1 ulong get oga_paged_bids b
+      ret false
+    end
+  end
+  ret true
+end
+
+fn oga_paged_prep ly view ulong 9 req view ulong 10 to long
+  oga_init_defaults
+  if or eq get req 6 0 or eq get req 7 0 eq get req 8 0
+    ret OGA_BAD_ARGS
+  end
+  l2g = new ulong 1 0
+  rc = oga_check_heads get req 3 get req 4 get req 5 l2g
+  if ne rc OGA_OK
+    ret rc
+  end
+  put oga_tmp 27 get l2g 0
+  if ne oga_validate_kv_layout ly get req 2 get req 4 get req 5 l2g OGA_OK
+    ret OGA_BAD_ARGS
+  end
+  put oga_tmp 28 get l2g 0
+  rc = oga_paged_check_bids ly get req 0 get req 2
+  if ne rc OGA_OK
+    ret rc
+  end
+  eff = get req 1
+  if gt eff mul get req 0 get ly 8
+    eff = mul get req 0 get ly 8
+  end
+  l2sp = oga_own_log2split eff get req 5
+  if eq get oga_cfg 3 1
+    l2sp = get oga_cfg 4
+  end
+  rc = oga_run_cg 0 get oga_tmp 28 get oga_tmp 27 get req 5 long l2sp
+  if ne rc OGA_OK
+    ret rc
+  end
+  need_b = ulong 0
+  if gt eff 0
+    need_b = div add eff sub get ly 8 1 get ly 8
+  end
+  put oga_tmp 0 get req 6
+  put oga_tmp 1 get req 7
+  put oga_tmp 2 get req 8
+  put oga_tmp 3 get req 9
+  put oga_tmp 4 get req 0
+  if eq get oga_tmp 4 0
+    put oga_tmp 4 1
+  end
+  put oga_tmp 5 ulong oga_score_scale_bits get req 5
+  put oga_tmp 6 get ly 1
+  put oga_tmp 7 get ly 3
+  put oga_tmp 8 get ly 2
+  put oga_tmp 9 get ly 4
+  put oga_tmp 10 get req 3
+  put oga_tmp 11 mul get oga_tmp 4 4
+  put oga_tmp 12 get req 5
+  put oga_tmp 13 div get req 3 omega_gpu_attention_heads_per_cta get req 5 get oga_tmp 27
+  put oga_tmp 14 shl ulong 1 l2sp
+  put oga_tmp 16 mul get req 3 get oga_tmp 14
+  put oga_tmp 16 mul get oga_tmp 16 add get req 5 2
+  put oga_tmp 21 mul need_b get ly 1
+  put oga_tmp 22 need_b
+  if oga_paged_is_res ly get req 7 need_b
+    put oga_tmp 1 add get oga_cfg 7 mul get req 2 get ly 1
+    put oga_tmp 6 get ly 0
+    put oga_tmp 20 0
+    put oga_tmp 23 0
+    put oga_tmp 24 OGA_KV_RESIDENT
+  else
+    put oga_tmp 20 mul need_b get ly 1
+    put oga_tmp 23 need_b
+    put oga_tmp 24 OGA_KV_STAGED
+  end
+  ret OGA_OK
+end
+
+fn omega_gpu_paged_attention_bf16 ly view ulong 9 req view ulong 10 args_out edit uint 16 info_out edit ulong 12 qmd1 edit uint 96 to long
+  rc = oga_paged_prep ly req
+  if ne rc OGA_OK
+    ret rc
+  end
+  ret oga_emit_launch args_out info_out qmd1
+end
+
+global oga_seen ulong 64
+
+fn oga_seen_add id ulong to void
+  if eq get oga_cfg 2 0
+    put oga_tmp 23 add get oga_tmp 23 1
+    ret
+  end
+  u_n = get oga_tmp 23
+  for u ulong u_n bound 64
+    if eq get oga_seen u id
+      ret
+    end
+  end
+  if lt u_n 64
+    put oga_seen u_n id
+    put oga_tmp 23 add u_n 1
+  end
+end
+
+fn oga_batch_scan_seq ly view ulong 9 s ulong max_b ulong hd ulong to long
+  cv = get oga_batch_ctxs s
+  cu = ulong 0
+  if gt cv 0
+    cu = ulong cv
+  end
+  nb = ulong 0
+  for b ulong max_b bound 64
+    v = get oga_batch_tabs add mul s max_b b
+    if ge v 0
+      if ge ulong v get ly 6
+        ret OGA_BAD_ARGS
+      end
+      nb = add nb 1
+    end
+  end
+  if gt cu mul nb get ly 8
+    cu = mul nb get ly 8
+  end
+  l2s = oga_own_log2split cu hd
+  if gt l2s get oga_tmp 26
+    put oga_tmp 26 l2s
+  end
+  need = ulong 0
+  if gt cu 0
+    need = div add cu sub get ly 8 1 get ly 8
+  end
+  put oga_tmp 22 add get oga_tmp 22 need
+  kept = ulong 0
+  for b ulong max_b bound 64
+    v = get oga_batch_tabs add mul s max_b b
+    if ge v 0
+      if lt kept need
+        oga_seen_add ulong v
+        kept = add kept 1
+      end
+    end
+  end
+  ret OGA_OK
+end
+
+fn oga_batch_prep ly view ulong 9 req view ulong 10 to long
+  oga_init_defaults
+  if or eq get req 1 0 or gt get req 1 16 gt mul get req 1 get req 0 64
+    ret OGA_BAD_ARGS
+  end
+  if or eq get req 6 0 or eq get req 7 0 eq get req 8 0
+    ret OGA_BAD_ARGS
+  end
+  l2g = new ulong 1 0
+  rc = oga_check_heads get req 3 get req 4 get req 5 l2g
+  if ne rc OGA_OK
+    ret rc
+  end
+  put oga_tmp 27 get l2g 0
+  if ne oga_validate_kv_layout ly get req 2 get req 4 get req 5 l2g OGA_OK
+    ret OGA_BAD_ARGS
+  end
+  put oga_tmp 28 get l2g 0
+  put oga_tmp 22 0
+  put oga_tmp 23 0
+  put oga_tmp 26 0
+  for s ulong get req 1 bound 16
+    if ne oga_batch_scan_seq ly s get req 0 get req 5 OGA_OK
+      ret OGA_BAD_ARGS
+    end
+  end
+  if eq get oga_cfg 3 1
+    put oga_tmp 26 get oga_cfg 4
+  end
+  rc = oga_run_cg 0 get oga_tmp 28 get oga_tmp 27 get req 5 long get oga_tmp 26
+  if ne rc OGA_OK
+    ret rc
+  end
+  put oga_tmp 0 get req 6
+  put oga_tmp 1 get req 7
+  put oga_tmp 2 get req 8
+  put oga_tmp 3 get req 9
+  put oga_tmp 4 get req 0
+  if eq get oga_tmp 4 0
+    put oga_tmp 4 1
+  end
+  put oga_tmp 5 ulong oga_score_scale_bits get req 5
+  put oga_tmp 6 get ly 1
+  put oga_tmp 7 get ly 3
+  put oga_tmp 8 get ly 2
+  put oga_tmp 9 get ly 4
+  put oga_tmp 10 get req 3
+  put oga_tmp 11 mul mul get req 1 get oga_tmp 4 4
+  put oga_tmp 12 get req 5
+  put oga_tmp 13 div get req 3 omega_gpu_attention_heads_per_cta get req 5 get oga_tmp 27
+  put oga_tmp 14 mul get req 1 shl ulong 1 get oga_tmp 26
+  put oga_tmp 16 mul get req 3 get oga_tmp 14
+  put oga_tmp 16 mul get oga_tmp 16 add get req 5 2
+  put oga_tmp 20 mul get oga_tmp 23 get ly 1
+  put oga_tmp 21 mul get oga_tmp 22 get ly 1
+  put oga_tmp 24 OGA_KV_STAGED
+  ret OGA_OK
+end
+
+fn omega_gpu_paged_attention_batch_bf16 ly view ulong 9 req view ulong 10 args_out edit uint 16 info_out edit ulong 12 qmd1 edit uint 96 to long
+  rc = oga_batch_prep ly req
+  if ne rc OGA_OK
+    ret rc
+  end
+  ret oga_emit_launch args_out info_out qmd1
+end
+
+fn omega_gpu_attention_mutant_name m ulong dst edit uchar 64 to ulong
+  if eq m 0
+    ret oga_copy_text oga_mut_0 dst
+  end
+  if eq m 1
+    ret oga_copy_text oga_mut_1 dst
+  end
+  if eq m 2
+    ret oga_copy_text oga_mut_2 dst
+  end
+  if eq m 3
+    ret oga_copy_text oga_mut_3 dst
+  end
+  if eq m 4
+    ret oga_copy_text oga_mut_4 dst
+  end
+  if eq m 5
+    ret oga_copy_text oga_mut_5 dst
+  end
+  if eq m 6
+    ret oga_copy_text oga_mut_6 dst
+  end
+  ret oga_copy_text oga_mut_q dst
+end
+
+fn omega_gpu_attention_rc_name rc long dst edit uchar 64 to ulong
+  if eq rc OGA_OK
+    ret oga_copy_text oga_rc_ok dst
+  end
+  if eq rc OGA_BAD_ARGS
+    ret oga_copy_text oga_rc_bad dst
+  end
+  if eq rc OGA_TOO_LARGE
+    ret oga_copy_text oga_rc_large dst
+  end
+  if eq rc OGA_CODEGEN_FAIL
+    ret oga_copy_text oga_rc_cg dst
+  end
+  if eq rc OGA_CHIP_FAIL
+    ret oga_copy_text oga_rc_chip dst
+  end
+  if eq rc OGA_UNWRITTEN
+    ret oga_copy_text oga_rc_unw dst
+  end
+  ret oga_copy_text oga_rc_unk dst
+end

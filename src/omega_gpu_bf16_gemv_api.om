@@ -1,0 +1,629 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_bf16_gemv_api.om: Pure seeded OM-2 port of src/omega_gpu_bf16_gemv_api.c.
+note Composes src/omega_blackwell_codegen_bf16.om, src/omega_blackwell_codegen.om, and src/omega_blackwell_qmd.om.
+om2
+
+const OGB_OK long 0
+const OGB_BAD_ARGS long -1
+const OGB_TOO_LARGE long -2
+const OGB_CODEGEN_FAIL long -3
+const OGB_CHIP_FAIL long -4
+const OGB_NAN_WEIGHT long -5
+
+const OGB_MAX_K ulong 16384
+const OGB_MAX_XBATCH ulong 4
+const OGB_DEFAULT_CTAS ulong 96
+const OGB_CACHE_SLOTS ulong 8
+const OGB_ARGS_WORDS ulong 8
+const OGB_MASK_ARGS_WORDS ulong 12
+
+note ogb_cfg: 0=rows_ov, 1=warps_ov, 2=depth_ov, 3=ctas_ov, 4=mutant, 5=mask_mutant, 6=next_slot, 7=rec_mode, 8=last_err
+global ogb_cfg ulong 16
+
+note 8-slot kernel cache: each slot = 14 ulongs
+note [0]=valid, [1]=pinned, [2..9]=spec[0..7], [10]=insns, [11]=peak_gpr, [12]=code_va, [13]=smem
+global ogb_cache ulong 112
+
+note 16-slot tensor table: each slot = 4 ulongs: [0]=used, [1]=n, [2]=k, [3]=w_va
+global ogb_tensors ulong 64
+
+text ogb_err_none ""
+text ogb_err_regfile "bf16 kernel: declared registers exceed 65536-register file"
+text ogb_err_cg "bf16 codegen refused the shape"
+text ogb_err_full "bf16 kernel cache: every slot holds a prepared kernel"
+text ogb_err_evict "bf16 record: kernel cache miss would evict a resident kernel"
+text ogb_err_nan "bf16 upload: NaN or infinity weight"
+text ogb_err_decl "declared registers below peak + 2: refusing to launch"
+
+text ogb_rc_ok "OK"
+text ogb_rc_bad "BAD_ARGS"
+text ogb_rc_large "TOO_LARGE"
+text ogb_rc_cg "CODEGEN_FAIL"
+text ogb_rc_chip "CHIP_FAIL"
+text ogb_rc_nan "NAN_WEIGHT"
+text ogb_rc_unk "UNKNOWN"
+
+fn ogb_copy_text src view uchar * dst edit uchar 64 to ulong
+  n = len src
+  if gt n 64
+    n = ulong 64
+  end
+  for i ulong n bound 64
+    put dst i get src i
+  end
+  ret n
+end
+
+fn omega_gpu_bf16_last_error dst edit uchar 64 to ulong
+  c = get ogb_cfg 8
+  if eq c 1
+    ret ogb_copy_text ogb_err_regfile dst
+  end
+  if eq c 2
+    ret ogb_copy_text ogb_err_cg dst
+  end
+  if eq c 3
+    ret ogb_copy_text ogb_err_full dst
+  end
+  if eq c 4
+    ret ogb_copy_text ogb_err_evict dst
+  end
+  if eq c 5
+    ret ogb_copy_text ogb_err_nan dst
+  end
+  if eq c 6
+    ret ogb_copy_text ogb_err_decl dst
+  end
+  ret ogb_copy_text ogb_err_none dst
+end
+
+fn omega_gpu_bf16_rc_name rc long dst edit uchar 64 to ulong
+  if eq rc OGB_OK
+    ret ogb_copy_text ogb_rc_ok dst
+  end
+  if eq rc OGB_BAD_ARGS
+    ret ogb_copy_text ogb_rc_bad dst
+  end
+  if eq rc OGB_TOO_LARGE
+    ret ogb_copy_text ogb_rc_large dst
+  end
+  if eq rc OGB_CODEGEN_FAIL
+    ret ogb_copy_text ogb_rc_cg dst
+  end
+  if eq rc OGB_CHIP_FAIL
+    ret ogb_copy_text ogb_rc_chip dst
+  end
+  if eq rc OGB_NAN_WEIGHT
+    ret ogb_copy_text ogb_rc_nan dst
+  end
+  ret ogb_copy_text ogb_rc_unk dst
+end
+
+fn omega_gpu_bf16_cache_clear to void
+  for i ulong 112
+    put ogb_cache i 0
+  end
+  put ogb_cfg 6 0
+end
+
+fn omega_gpu_bf16_set_shape rows ulong warps ulong depth ulong to void
+  put ogb_cfg 0 rows
+  put ogb_cfg 1 warps
+  put ogb_cfg 2 depth
+  omega_gpu_bf16_cache_clear
+end
+
+fn omega_gpu_bf16_set_cta_budget ctas ulong to void
+  put ogb_cfg 3 ctas
+end
+
+fn omega_gpu_bf16_test_set_mutant m ulong to void
+  put ogb_cfg 4 m
+  omega_gpu_bf16_cache_clear
+end
+
+fn omega_gpu_bf16_test_set_mask_mutant m ulong to void
+  put ogb_cfg 5 m
+end
+
+fn ogb_gpr_declared peak uint to uint
+  ret mul div add add peak 2 7 8 8
+end
+
+fn ogb_gpr_declared_ok decl uint peak uint to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn ogb_regfile_fits warps ulong peak uint to bool
+  decl = ulong ogb_gpr_declared peak
+  if le mul mul 32 warps decl 65536
+    ret true
+  end
+  put ogb_cfg 8 1
+  ret false
+end
+
+fn omega_gpu_bf16_kernel_fits sp view ulong 8 out_decl edit uint 1 to long
+  st = new uint 2 0
+  if ne omega_bf16_gemv_prog_stats sp st 0
+    put ogb_cfg 8 2
+    ret OGB_CODEGEN_FAIL
+  end
+  peak = get st 1
+  put out_decl 0 ogb_gpr_declared peak
+  if ogb_regfile_fits get sp 2 peak
+    ret OGB_OK
+  end
+  ret OGB_TOO_LARGE
+end
+
+note out4: 0=rows, 1=warps, 2=depth, 3=ctas
+fn omega_gpu_bf16_shape_for k ulong out4 edit ulong 4 to void
+  ks = div k 256
+  w = ulong 16
+  r = ulong 1
+  d = ks
+  while gt d 0 bound 64
+    if and le d 16 and eq rem ks d 0 le mul r d 16
+      put out4 2 d
+      d = ulong 0
+    else
+      d = sub d 1
+    end
+  end
+  if eq ks 0
+    put out4 2 0
+  end
+  if or ne rem k mul 32 w 0 gt k mul 512 w
+    w = ulong 32
+  end
+  if ne get ogb_cfg 0 0
+    r = get ogb_cfg 0
+  end
+  if ne get ogb_cfg 1 0
+    w = get ogb_cfg 1
+  end
+  if ne get ogb_cfg 2 0
+    put out4 2 get ogb_cfg 2
+  end
+  ctas = OGB_DEFAULT_CTAS
+  if ne get ogb_cfg 3 0
+    ctas = get ogb_cfg 3
+  end
+  put out4 0 r
+  put out4 1 w
+  put out4 3 ctas
+end
+
+fn ogb_spec_for k ulong sp edit ulong 8 out_ctas edit ulong 1 to void
+  for i ulong 8
+    put sp i 0
+  end
+  sh = new ulong 4 0
+  omega_gpu_bf16_shape_for k sh
+  put sp 0 k
+  put sp 1 get sh 0
+  put sp 2 get sh 1
+  put sp 3 get sh 2
+  put sp 4 get ogb_cfg 4
+  put out_ctas 0 get sh 3
+end
+
+fn ogb_xbatch_fit_depth sp edit ulong 8 to void
+  if or ne get ogb_cfg 2 0 le get sp 6 1
+    ret
+  end
+  ks = div get sp 0 256
+  st = new uint 2 0
+  while gt get sp 3 1 bound 64
+    if eq omega_bf16_gemv_prog_stats sp st 0
+      decl = ulong ogb_gpr_declared get st 1
+      if le mul mul 32 get sp 2 decl 65536
+        ret
+      end
+    end
+    d = sub get sp 3 1
+    while and gt d 1 ne rem ks d 0 bound 64
+      d = sub d 1
+    end
+    put sp 3 d
+  end
+end
+
+fn ogb_slot_match base ulong sp view ulong 8 to bool
+  if eq get ogb_cache base 0
+    ret false
+  end
+  for j ulong 8
+    if ne get ogb_cache add base add 2 j get sp j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ogb_kernel_for sp view ulong 8 out_slot edit ulong 1 hit edit ulong 1 to long
+  for i ulong OGB_CACHE_SLOTS
+    base = mul i 14
+    if ogb_slot_match base sp
+      put out_slot 0 i
+      put hit 0 1
+      ret OGB_OK
+    end
+  end
+  chosen = ulong 99
+  nxt = get ogb_cfg 6
+  for i ulong OGB_CACHE_SLOTS
+    idx = rem add nxt i OGB_CACHE_SLOTS
+    base = mul idx 14
+    if eq chosen 99
+      if or eq get ogb_cache base 0 eq get ogb_cache add base 1 0
+        chosen = idx
+        put ogb_cfg 6 rem add idx 1 OGB_CACHE_SLOTS
+      end
+    end
+  end
+  if eq chosen 99
+    put ogb_cfg 8 3
+    ret OGB_TOO_LARGE
+  end
+  base = mul chosen 14
+  if and ne get ogb_cfg 7 0 ne get ogb_cache base 0
+    put ogb_cfg 8 4
+    ret OGB_TOO_LARGE
+  end
+  st = new uint 2 0
+  if ne omega_bf16_gemv_prog_stats sp st 0
+    put ogb_cfg 8 2
+    ret OGB_CODEGEN_FAIL
+  end
+  if eq get st 0 0
+    put ogb_cfg 8 2
+    ret OGB_CODEGEN_FAIL
+  end
+  if not ogb_regfile_fits get sp 2 get st 1
+    ret OGB_TOO_LARGE
+  end
+  put ogb_cache base 1
+  put ogb_cache add base 1 0
+  for j ulong 8
+    put ogb_cache add base add 2 j get sp j
+  end
+  put ogb_cache add base 10 ulong get st 0
+  put ogb_cache add base 11 ulong get st 1
+  put ogb_cache add base 12 add 0x210000000 mul chosen 0x10000
+  put ogb_cache add base 13 ulong omega_bf16_gemv_shared_bytes sp
+  put out_slot 0 chosen
+  put hit 0 0
+  ret OGB_OK
+end
+
+fn ogb_prepare_spec sp view ulong 8 to long
+  sl = new ulong 1 0
+  hit = new ulong 1 0
+  rc = ogb_kernel_for sp sl hit
+  if eq rc OGB_OK
+    put ogb_cache add mul get sl 0 14 1 1
+  end
+  ret rc
+end
+
+fn omega_gpu_bf16_prepare k ulong to long
+  sp = new ulong 8 0
+  ctas = new ulong 1 0
+  ogb_spec_for k sp ctas
+  ret ogb_prepare_spec sp
+end
+
+fn omega_gpu_bf16_prepare_xbatch k ulong xbatch ulong ystride ulong to long
+  if le xbatch 1
+    ret omega_gpu_bf16_prepare k
+  end
+  if or gt xbatch OGB_MAX_XBATCH eq ystride 0
+    ret OGB_BAD_ARGS
+  end
+  sp = new ulong 8 0
+  ctas = new ulong 1 0
+  ogb_spec_for k sp ctas
+  put sp 6 xbatch
+  put sp 5 ystride
+  ogb_xbatch_fit_depth sp
+  ret ogb_prepare_spec sp
+end
+
+fn omega_gpu_bf16_prepare_mask k ulong to long
+  sp = new ulong 8 0
+  ctas = new ulong 1 0
+  ogb_spec_for k sp ctas
+  put sp 1 1
+  put sp 7 1
+  ret ogb_prepare_spec sp
+end
+
+fn omega_gpu_bf16_tensor_shape tid ulong out_nk edit ulong 2 to void
+  if or eq tid 0 gt tid 16
+    put out_nk 0 0
+    put out_nk 1 0
+    ret
+  end
+  base = mul sub tid 1 4
+  if eq get ogb_tensors base 0
+    put out_nk 0 0
+    put out_nk 1 0
+    ret
+  end
+  put out_nk 0 get ogb_tensors add base 1
+  put out_nk 1 get ogb_tensors add base 2
+end
+
+fn omega_gpu_bf16_tensor_upload n ulong k ulong w view ushort * w_len ulong out_tid edit ulong 1 to long
+  put out_tid 0 0
+  if or eq n 0 or eq k 0 ne rem k 256 0
+    ret OGB_BAD_ARGS
+  end
+  if gt k OGB_MAX_K
+    ret OGB_TOO_LARGE
+  end
+  for i ulong w_len bound 1048576
+    if eq and uint get w i 0x7f80 0x7f80
+      put ogb_cfg 8 5
+      ret OGB_NAN_WEIGHT
+    end
+  end
+  for s ulong 16
+    base = mul s 4
+    if eq get ogb_tensors base 0
+      put ogb_tensors base 1
+      put ogb_tensors add base 1 n
+      put ogb_tensors add base 2 k
+      put ogb_tensors add base 3 add 0x310000000 mul s 0x1000000
+      put out_tid 0 add s 1
+      ret OGB_OK
+    end
+  end
+  ret OGB_CHIP_FAIL
+end
+
+fn omega_gpu_bf16_tensor_free tid ulong to void
+  if or eq tid 0 gt tid 16
+    ret
+  end
+  base = mul sub tid 1 4
+  put ogb_tensors base 0
+  put ogb_tensors add base 1 0
+  put ogb_tensors add base 2 0
+  put ogb_tensors add base 3 0
+end
+
+global ogb_tmp ulong 24
+
+fn ogb_validate_spec req view ulong 10 sp edit ulong 8 to long
+  tid = get req 8
+  if or eq tid 0 gt tid 16
+    ret OGB_BAD_ARGS
+  end
+  tbase = mul sub tid 1 4
+  if eq get ogb_tensors tbase 0
+    ret OGB_BAD_ARGS
+  end
+  if or eq get req 1 0 eq get req 2 0
+    ret OGB_BAD_ARGS
+  end
+  if and ne get req 3 0 or eq get req 0 0 gt get req 3 65535
+    ret OGB_BAD_ARGS
+  end
+  n = get ogb_tensors add tbase 1
+  k = get ogb_tensors add tbase 2
+  ctas_a = new ulong 1 0
+  ogb_spec_for k sp ctas_a
+  if ne get req 3 0
+    put sp 5 n
+  end
+  if ne get req 6 0
+    if or eq get req 0 0 ne get req 3 0
+      ret OGB_BAD_ARGS
+    end
+    if or gt get req 4 1 eq get req 7 0
+      ret OGB_BAD_ARGS
+    end
+    put sp 1 1
+    put sp 7 1
+    if ne get ogb_cfg 5 0
+      put sp 4 get ogb_cfg 5
+    end
+  end
+  if gt get req 4 1
+    if or eq get req 0 0 ne get req 3 0
+      ret OGB_BAD_ARGS
+    end
+    if or gt get req 4 OGB_MAX_XBATCH lt get req 5 n
+      ret OGB_BAD_ARGS
+    end
+    put sp 6 get req 4
+    put sp 5 get req 5
+    ogb_xbatch_fit_depth sp
+  end
+  if ne rem n get sp 1 0
+    ret OGB_CODEGEN_FAIL
+  end
+  rg = div n get sp 1
+  gx = div add rg sub get sp 2 1 get sp 2
+  if gt gx get ctas_a 0
+    gx = get ctas_a 0
+  end
+  if eq gx 0
+    gx = ulong 1
+  end
+  put ogb_tmp 0 n
+  put ogb_tmp 1 k
+  put ogb_tmp 2 get ogb_tensors add tbase 3
+  put ogb_tmp 3 rg
+  put ogb_tmp 4 gx
+  ret OGB_OK
+end
+
+fn ogb_pack_and_qmd req view ulong 10 sp view ulong 8 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  cbase = mul get ogb_tmp 5 14
+  peak = uint get ogb_cache add cbase 11
+  decl = ogb_gpr_declared peak
+  if eq ogb_gpr_declared_ok decl peak 0
+    put ogb_cfg 8 6
+    ret OGB_CHIP_FAIL
+  end
+  put args_out 0 bw_qmd_u32lo get ogb_tmp 2
+  put args_out 1 bw_qmd_u32hi get ogb_tmp 2
+  put args_out 2 bw_qmd_u32lo get req 1
+  put args_out 3 bw_qmd_u32hi get req 1
+  put args_out 4 bw_qmd_u32lo get req 2
+  put args_out 5 bw_qmd_u32hi get req 2
+  put args_out 6 uint get ogb_tmp 3
+  put args_out 7 uint mul get ogb_tmp 4 get sp 2
+  put args_out 8 bw_qmd_u32lo get req 6
+  put args_out 9 bw_qmd_u32hi get req 6
+  put args_out 10 bw_qmd_u32lo get req 7
+  put args_out 11 bw_qmd_u32hi get req 7
+  gy = ulong 1
+  nel = get ogb_tmp 0
+  if ne get req 3 0
+    gy = get req 3
+    nel = mul nel gy
+  else
+    if gt get req 4 1
+      nel = mul nel get req 4
+    end
+  end
+  m = new ulong 16 0
+  put m 0 get ogb_cache add cbase 12
+  put m 1 0x200001000
+  put m 2 0x200002000
+  put m 3 0x200003000
+  put m 4 0x200004000
+  put m 5 nel
+  put m 8 mul 32 get sp 2
+  put m 9 1
+  put m 10 get ogb_tmp 4
+  put m 11 gy
+  put m 12 ulong decl
+  put m 13 get ogb_cache add cbase 13
+  if ne omega_blackwell_build_qmd1 qmd1 m 0
+    ret OGB_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants qmd1 0
+    ret OGB_CHIP_FAIL
+  end
+  put info_out 0 get ogb_tmp 0
+  put info_out 1 get ogb_tmp 1
+  put info_out 2 get sp 1
+  put info_out 3 get sp 2
+  put info_out 4 get sp 3
+  put info_out 5 get ogb_tmp 4
+  put info_out 6 gy
+  put info_out 7 ulong omega_bf16_gemv_steps sp
+  put info_out 8 get ogb_tmp 6
+  if ne get req 6 0
+    put info_out 9 OGB_MASK_ARGS_WORDS
+  else
+    put info_out 9 OGB_ARGS_WORDS
+  end
+  ret OGB_OK
+end
+
+note req[10]: 0=rec, 1=dev_x, 2=dev_y, 3=xrows, 4=xbatch, 5=ystride, 6=mask_hi, 7=mask_tau, 8=tid, 9=cl_ok
+fn ogb_gemv_core req view ulong 10 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  for i ulong 10
+    put info_out i 0
+  end
+  sp = new ulong 8 0
+  rc = ogb_validate_spec req sp
+  if ne rc OGB_OK
+    ret rc
+  end
+  sl = new ulong 1 0
+  hit = new ulong 1 0
+  put ogb_cfg 7 get req 0
+  rc = ogb_kernel_for sp sl hit
+  put ogb_cfg 7 0
+  if ne rc OGB_OK
+    ret rc
+  end
+  put ogb_tmp 5 get sl 0
+  put ogb_tmp 6 get hit 0
+  ret ogb_pack_and_qmd req sp args_out info_out qmd1
+end
+
+fn omega_gpu_bf16_gemv_f32 req view ulong 10 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  r = new ulong 10 0
+  put r 1 get req 1
+  put r 2 get req 2
+  put r 8 get req 8
+  ret ogb_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_bf16_gemv_bf16 req view ulong 10 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  r = new ulong 10 0
+  put r 1 get req 1
+  put r 2 get req 2
+  put r 8 get req 8
+  ret ogb_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_bf16_gemv_record req view ulong 10 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  if eq get req 9 0
+    ret OGB_BAD_ARGS
+  end
+  r = new ulong 10 0
+  put r 0 1
+  put r 1 get req 1
+  put r 2 get req 2
+  put r 8 get req 8
+  ret ogb_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_bf16_gemv_rows_record req view ulong 10 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  if or eq get req 9 0 eq get req 3 0
+    ret OGB_BAD_ARGS
+  end
+  r = new ulong 10 0
+  put r 0 1
+  put r 1 get req 1
+  put r 2 get req 2
+  put r 3 get req 3
+  put r 8 get req 8
+  ret ogb_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_bf16_gemv_mask_record req view ulong 10 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  if or eq get req 9 0 or eq get req 6 0 eq get req 7 0
+    ret OGB_BAD_ARGS
+  end
+  r = new ulong 10 0
+  put r 0 1
+  put r 1 get req 1
+  put r 2 get req 2
+  put r 6 get req 6
+  put r 7 get req 7
+  put r 8 get req 8
+  ret ogb_gemv_core r args_out info_out qmd1
+end
+
+fn omega_gpu_bf16_gemv_xbatch_record req view ulong 10 args_out edit uint 12 info_out edit ulong 10 qmd1 edit uint 96 to long
+  if or eq get req 9 0 eq get req 4 0
+    ret OGB_BAD_ARGS
+  end
+  r = new ulong 10 0
+  put r 0 1
+  put r 1 get req 1
+  put r 2 get req 2
+  put r 8 get req 8
+  if gt get req 4 1
+    put r 4 get req 4
+    put r 5 get req 5
+  end
+  ret ogb_gemv_core r args_out info_out qmd1
+end
