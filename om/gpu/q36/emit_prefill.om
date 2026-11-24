@@ -103,9 +103,13 @@ end
 note Helper: load W4 scales (R56, R57) + neg8*scale (R58, R59) + 2x LDG.E.128 weights (R48..55)
 note Expects rA in R46, kb in R60, K in R20, W_w4 in R2:3, S_w4 in R4:5.
 note Optional weight base offsets in u32s: wExpOffReg (QZ if 0), sExpOffReg (QZ if 0).
-fn qPreLoadW4Tile wExpOffReg ulong sExpOffReg ulong to void
-note bp = kb >> 1 (R18), kDiv64 = K >> 6 (R19), sIdxA = rA * kDiv64 + bp
+fn qPreLoadW4Tile wExpOffReg ulong sExpOffReg ulong isLmHead bool to void
+note bp = kb >> 1 (dense) or kb & 31 (lm_head), kDiv64 = K >> 6 (R19), sIdxA = rA * kDiv64 + bp
+if isLmHead
+qic 18 18 60 QZ 31 qAlu4
+else
 qic 17 18 60 QZ 1 qAlu4
+end
 qic 17 19 20 QZ 6 qAlu4
 qMadReg 16 46 19 18
 if ne sExpOffReg QZ
@@ -142,8 +146,12 @@ end
 qicImm 9 16 16 2 4 qW1
 qic 57 52 16 QZ 0 qLd
 qic 0 QZ QZ QZ 0 qW0
-note Extract BF16 scale for even (lo16 << 16) vs odd (hi16 & 0xffff0000) kb
+note Extract BF16 scale for even/low (lo16 << 16) vs odd/high (hi16 & 0xffff0000) kb
+if isLmHead
+qic 17 16 60 QZ 5 qAlu4
+else
 qic 18 16 60 QZ 1 qAlu4
+end
 qLit 17 1
 qic 28 QZ 16 17 0 qCmp
 put q36Guard 0 2
@@ -300,7 +308,7 @@ note Args: X_bf16 (R0:1), W_w4 (R2:3), S_w4 (R4:5), Y_f32 (R6:7),
 note       K (32), N (36), B (40), xStride (44), xOff (48), outStride (52), outOff (56).
 note Grid: (N/64, ceil(B/32), 1), Block: 128 (4 warps), SMEM: 2048.
 note =========================================================================
-fn qPreW4GemmHmma to void
+fn qPreW4GemmHmmaBody isLmHead bool to void
 qStart 4
 qParam 20 32
 qParam 21 36
@@ -379,7 +387,7 @@ qic 50 QZ 19 51 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 qBar
 note Load W4 scales + weights for rA and rB = rA+8
-qPreLoadW4Tile QZ QZ
+qPreLoadW4Tile QZ QZ isLmHead
 note Run 2x 16-K HMMA sub-tiles (unconditional 4-tc fast path, 0 BSSY, 2x fewer qW0!)
 qPreHmmaW4SubDense 48 49 52 53 0
 qPreHmmaW4SubDense 50 51 54 55 32
@@ -429,6 +437,41 @@ qic 0 QZ QZ QZ 0 qW1
 qPatch skEb 1
 qBsync bEb
 end
+end
+
+fn qPreW4GemmHmma to void
+qPreW4GemmHmmaBody false
+end
+
+fn qPreLmHeadW4Hmma to void
+qPreW4GemmHmmaBody true
+end
+
+note =========================================================================
+note Mode 148 (kid 48): qPreCopyU32 -- Coalesced GPU-to-GPU copy (128-bit read, 4x32-bit write)
+note Args: src (R0:1), dst (R2:3), nVec4 (16: number of 16-byte chunks).
+note Grid: (256, 1, 1), Block: 256, SMEM: 0.
+note =========================================================================
+fn qPreCopyU32 to void
+qStart 2
+qParam 20 16
+qMad 21 15 256 14
+qLit 22 65536
+mCp = get q36Pc 0
+qic 28 QZ 21 20 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 16 21 0 16 qAlu4
+qic 57 24 16 QZ 0 qLd
+qicImm 9 18 21 2 16 qAlu4
+qic 0 QZ QZ QZ 0 qW0
+qic 12 QZ 18 24 0 qSt
+qic 12 QZ 18 25 4 qSt
+qic 12 QZ 18 26 8 qSt
+qic 12 QZ 18 27 12 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 21 21 22
+qic 46 QZ QZ QZ sub mCp get q36Pc 0 qAlu4
 end
 
 note =========================================================================
@@ -2031,7 +2074,7 @@ qParam 44 52
 qParam 45 56
 qMadReg 44 47 44 QZ
 qMadReg 45 47 45 QZ
-qPreLoadW4Tile 44 45
+qPreLoadW4Tile 44 45 false
 qPreHmmaW4Sub 48 49 52 53 0
 qPreHmmaW4Sub 50 51 54 55 32
 qBar
@@ -2375,6 +2418,14 @@ ret true
 end
 if eq mode 146
 qPreFaPrepQBatch
+ret true
+end
+if eq mode 147
+qPreLmHeadW4Hmma
+ret true
+end
+if eq mode 148
+qPreCopyU32
 ret true
 end
 ret false

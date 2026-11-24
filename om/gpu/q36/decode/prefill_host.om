@@ -21,8 +21,17 @@ const QP_EMID ulong 54308864
 const QP_ESWB ulong 73183232
 const QP_EOUT ulong 77901824
 const QP_TRACE ulong 115650560
+const QP_SPEC_LOG ulong 117760000
+const QP_SPEC_CIDS ulong 125829120
+const QP_SPEC_CLOG ulong 125833216
 const QP_POS0 ulong 0
 const QP_TOKS ulong 64
+
+note Speculative decode backup & GDN replay arena (qdSpecMap, 80 MB UVM):
+const QSP_GDN_STATE ulong 0
+const QSP_GDN_TAIL ulong 62914560
+const QSP_QKV ulong 66060288
+const QSP_AB ulong 77856768
 
 global qdPreEmbRaw uchar 4096
 global qdPreStr uint 8
@@ -34,6 +43,14 @@ text qpMsgMs " prefill_ms="
 text qpMsgTps " prefill_tok_s="
 text qpMsgArb " arboris_hit_pct="
 text qpMsgArbMs " arb_cpu_ms="
+text qpMsgSpecHdr "\n=== PHASE 1 SPECULATIVE MULTI-TOKEN TENSOR CORE BENCH (M="
+text qpMsgSpecN1 "N=1 BASELINE: gen_tokens="
+text qpMsgSpecNg "SPEC_NGRAM (M="
+text qpMsgSpecVf "SPEC_VERIFY (M="
+text qpMsgSpecParOk ") PARITY=EXACT steps="
+text qpMsgSpecParBad ") PARITY=MISMATCH steps="
+text qpMsgSpecAcc " acc_x100="
+text qpMsgSpecSpd " speedup_x100="
 
 fn qdPreEmitKernels to void
 for ki ulong 17
@@ -65,6 +82,28 @@ put qdSmem 39 0
 put qdSmem 40 32
 put qdSmem 41 0
 put qdSmem 42 1088
+note 47: qPreLmHeadW4Hmma (mode 147), 48: qPreCopyU32 (mode 148)
+for sk ulong 2
+p = mul div add get qdCodePos 0 255 256 256
+put qdEntry add 47 sk p
+put qdCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+ok = q36PreKernel uchar add 147 sk
+if not ok
+exit 4
+end
+q36Done
+end
+put qdSmem 47 2048
+put qdSmem 48 0
+end
+
+fn qdEmitCopyU32 srcVa ulong dstVa ulong nBytes ulong to bool
+qdPtr srcVa
+qdPtr dstVa
+qdArg uint div nBytes 16
+ret qdPktEmitGy 48 256 1 256
 end
 
 fn qdPreEmitGatherEmbeds B ulong to bool
@@ -240,6 +279,17 @@ end
 ret qdPreEmitMoeDnW4 L w4 B
 end
 
+fn qdSpecSaveGdnInputs gdnIdx ulong B ulong to bool
+pva = get qdPreVa 0
+sva = get qdSpecVa 0
+dstQkv = add sva add QSP_QKV mul gdnIdx 393216
+if not qdEmitCopyU32 add pva QP_QKV dstQkv mul B 49152
+ret false
+end
+dstAb = add sva add QSP_AB mul gdnIdx 2048
+ret qdEmitCopyU32 add pva QP_AB dstAb mul B 256
+end
+
 fn qdPreEmitGdnLayerW4 L ulong gdnIdx ulong B ulong to bool
 pva = get qdPreVa 0
 wva = get qdWorkVa 0
@@ -260,6 +310,11 @@ ret false
 end
 if not qdPreEmitBf16Gemm add pva QP_XNB add d4 19927040 add pva QP_AB 64 B 64
 ret false
+end
+if eq get qdSpecMode 0 1
+if not qdSpecSaveGdnInputs gdnIdx B
+ret false
+end
 end
 note Register-stationary causal conv1d + SiLU across all B tokens
 qdPtr add pva QP_QKV
@@ -410,6 +465,446 @@ qdPtr qdW QDI_CIDS
 qdPtr qdW QDI_CLOG
 qdArg 128
 ret qdPktEmitGy 4 128 1 32
+end
+
+fn qdPreEmitFinalHeadSpec M ulong to bool
+pva = get qdPreVa 0
+note 1. Single-read Tensor Core W4 lm_head screen across ALL M tokens [M, 248320]
+qdPtr add pva QP_XNB
+qdPtr get qdLmW4Va 0
+qdPtr add get qdLmW4Va 0 254279680
+qdPtr add pva QP_SPEC_LOG
+qdArg 2048
+qdArg uint QD_VOCAB
+qdArg uint M
+qdArg 1024
+qdArg 0
+qdArg uint QD_VOCAB
+qdArg 0
+if not qdPktEmitGy 47 3880 1 128
+ret false
+end
+note 2. Exact top-128 BF16 rescore for each t = 0..M-1
+for t ulong M bound 16
+logVa = add pva add QP_SPEC_LOG mul t 993280
+cidsVa = add pva add QP_SPEC_CIDS mul t 512
+clogVa = add pva add QP_SPEC_CLOG mul t 512
+xnVa = add pva add QP_XN mul t 8192
+qdPtr logVa
+qdPtr cidsVa
+if not qdPktEmitGy 7 64 1 256
+ret false
+end
+qdPtr mapaddr get qdLmBf16 0
+qdPtr xnVa
+qdPtr cidsVa
+qdPtr clogVa
+qdArg 128
+if not qdPktEmitGy 4 128 1 32
+ret false
+end
+end
+ret true
+end
+
+fn qdSpecEmitVerifyPkt M ulong to bool
+sva = get qdSpecVa 0
+qdPktStartAt add qdO QDI_PKT 16777216
+if not qdEmitCopyU32 get qdGdnStateVa 0 add sva QSP_GDN_STATE 62914560
+ret false
+end
+if not qdEmitCopyU32 get qdGdnTailVa 0 add sva QSP_GDN_TAIL 2949120
+ret false
+end
+put qdSpecMode 0 1
+ok = qdPreEmitAll40W4 M
+put qdSpecMode 0 0
+if not ok
+ret false
+end
+if not qdPreEmitFinalHeadSpec M
+ret false
+end
+ret qdPktFinish 6
+end
+
+fn qdSpecRollbackGdn acc ulong to bool
+pva = get qdPreVa 0
+sva = get qdSpecVa 0
+qdPktStart
+if not qdEmitCopyU32 add sva QSP_GDN_STATE get qdGdnStateVa 0 62914560
+ret false
+end
+if not qdEmitCopyU32 add sva QSP_GDN_TAIL get qdGdnTailVa 0 2949120
+ret false
+end
+gdnIdx = ulong 0
+for L ulong QD_LAYERS
+if ne rem L 4 3
+sbase = qdLayerSVa L
+qkvSrc = add sva add QSP_QKV mul gdnIdx 393216
+abSrc = add sva add QSP_AB mul gdnIdx 2048
+if not qdEmitCopyU32 qkvSrc add pva QP_QKV mul acc 49152
+ret false
+end
+qdPtr add pva QP_QKV
+qdPtr add sbase mul GDN_CONV 2
+qdPtr add get qdGdnTailVa 0 mul gdnIdx 98304
+qdArg uint acc
+if not qdPktEmitGy 30 32 1 256
+ret false
+end
+alogVa = add qdW QDI_ALOG mul gdnIdx 256
+qdPtr add pva QP_QKV
+qdPtr abSrc
+qdPtr alogVa
+qdPtr add alogVa 128
+qdPtr add pva QP_DB
+if not qdPktEmitGy 31 32 uint acc 128
+ret false
+end
+qdPtr add pva QP_QKV
+qdPtr add pva QP_DB
+qdPtr add get qdGdnStateVa 0 mul gdnIdx 2097152
+qdPtr add pva QP_Y
+qdArg uint acc
+if not qdPktEmitGy 32 32 4 256
+ret false
+end
+gdnIdx = add gdnIdx 1
+end
+end
+ret qdPktRun
+end
+
+fn qdSpecReadPreds M ulong to bool
+nb = mul M 512
+if ne mapread get qdPreMap 0 QP_SPEC_CIDS qdIoBuf 0 nb long nb
+ret false
+end
+for t ulong M bound 16
+base = mul t 512
+for j ulong 128
+p = add base mul j 4
+b0 = uint get qdIoBuf p
+b1 = shl uint get qdIoBuf add p 1 8
+b2 = shl uint get qdIoBuf add p 2 16
+b3 = shl uint get qdIoBuf add p 3 24
+put qdCandIds j or or b0 b1 or b2 b3
+end
+if not qdReadF32 get qdPreMap 0 add QP_SPEC_CLOG base 12 128
+ret false
+end
+bestId = ulong get qdCandIds 0
+bestLog = get qdCandLog 0
+for j ulong 128
+if gt get qdCandLog j bestLog
+bestLog = get qdCandLog j
+bestId = ulong get qdCandIds j
+end
+end
+put qdSpecPred t bestId
+end
+ret true
+end
+
+fn qdSpecVerifyStep M ulong pos0 ulong to ulong
+for t ulong M bound 16
+put qdPreTokIds t uint get qdSpecDraft t
+end
+if not qdPreUploadToks M pos0
+ret 0
+end
+if not qdKickPre 6
+ret 0
+end
+if not qdWaitPre
+ret 0
+end
+if not qdSpecReadPreds M
+ret 0
+end
+acc = ulong 1
+for k ulong sub M 1 bound 16
+if eq get qdSpecPred k get qdSpecDraft add k 1
+acc = add k 2
+else
+break
+end
+end
+if lt acc M
+if not qdSpecRollbackGdn acc
+ret 0
+end
+end
+if qdPreSnapTrace M
+qdPreUpdateArborisSnap acc
+end
+ret acc
+end
+
+fn qdSpecMatchNgram pos ulong nLen ulong hlen ulong to bool
+tail = sub hlen nLen
+for j ulong nLen bound 4
+if ne get qdHistToks add pos j get qdHistToks add tail j
+ret false
+end
+end
+ret true
+end
+
+fn qdSpecFindNgram nLen ulong hlen ulong to ulong
+lim = sub hlen nLen
+for idx ulong lim bound 131072
+pos = sub sub lim 1 idx
+if qdSpecMatchNgram pos nLen hlen
+ret add pos nLen
+end
+end
+ret 0
+end
+
+fn qdSpecDraftNgram curTok ulong M ulong to void
+put qdSpecDraft 0 curTok
+hlen = get qdHistLen 0
+for s ulong sub M 1 bound 16
+put qdSpecDraft add s 1 curTok
+end
+if lt hlen 2
+ret
+end
+for ng ulong 4
+nLen = sub 4 ng
+if ge hlen nLen
+bestPos = qdSpecFindNgram nLen hlen
+if gt bestPos 0
+for s ulong sub M 1 bound 16
+if lt add bestPos s hlen
+put qdSpecDraft add s 1 get qdHistToks add bestPos s
+end
+end
+ret
+end
+end
+end
+end
+
+fn qdSpecFillPrompt p edit ulong 19 to void
+put p 0 248045
+put p 1 846
+put p 2 198
+put p 3 3710
+put p 4 369
+put p 5 279
+put p 6 3712
+put p 7 314
+put p 8 11751
+put p 9 303
+put p 10 7472
+put p 11 13
+put p 12 248046
+put p 13 198
+put p 14 248045
+put p 15 74455
+put p 16 198
+put p 17 248068
+put p 18 248069
+end
+
+fn qdSpecPrefill17 saveHist bool to ulong
+prompt = new ulong 19 0
+qdSpecFillPrompt prompt
+qdResetState
+if saveHist
+for p ulong 19
+put qdHistToks p get prompt p
+end
+put qdHistLen 0 19
+end
+nextTok = ulong 0
+for p ulong 19
+isLast = eq p 18
+nextTok = qdForwardToken get prompt p p isLast false
+if eq nextTok 999999
+ret 999999
+end
+end
+ret nextTok
+end
+
+fn qdSpecBenchN1 genN ulong to ulong
+nextTok = qdSpecPrefill17 false
+if eq nextTok 999999
+ret 0
+end
+put qdRefOut 0 nextTok
+t0 = monons
+pos = ulong 19
+for g ulong sub genN 1 bound 64
+nextTok = qdForwardToken nextTok pos true false
+if eq nextTok 999999
+ret 0
+end
+put qdRefOut add g 1 nextTok
+pos = add pos 1
+end
+n1Us = div ulong sub monons t0 1000
+n1Avg = div n1Us sub genN 1
+n1Tps = div 100000000 n1Avg
+qdPrint qpMsgSpecN1
+qdPrintU genN
+qdPrint qdMsgAvgMs
+qdPrintU n1Avg
+qdPrint qdMsgTps
+qdPrintU n1Tps
+qdPrint qdMsgNl
+ret n1Avg
+end
+
+global qdSpecSt ulong 4
+
+fn qdSpecCommitAcc acc ulong genN ulong saveHist bool to void
+prod = get qdSpecSt 0
+ex = get qdSpecSt 1
+for k ulong acc bound 16
+tokK = get qdSpecPred k
+if lt prod genN
+if ne tokK get qdRefOut prod
+ex = ulong 0
+end
+if saveHist
+hl = get qdHistLen 0
+put qdHistToks hl tokK
+put qdHistLen 0 add hl 1
+end
+prod = add prod 1
+end
+end
+put qdSpecSt 0 prod
+put qdSpecSt 1 ex
+end
+
+fn qdSpecBenchNgram genN ulong M ulong to bool
+nextTok = qdSpecPrefill17 true
+if eq nextTok 999999
+ret false
+end
+put qdHistToks 19 nextTok
+put qdHistLen 0 20
+put qdSpecSt 0 1
+put qdSpecSt 1 1
+if ne nextTok get qdRefOut 0
+put qdSpecSt 1 0
+end
+steps = ulong 0
+pos = ulong 19
+t1 = monons
+while lt get qdSpecSt 0 genN bound 64
+qdSpecDraftNgram nextTok M
+acc = qdSpecVerifyStep M pos
+if eq acc 0
+ret false
+end
+steps = add steps 1
+qdSpecCommitAcc acc genN true
+nextTok = get qdSpecPred sub acc 1
+pos = add pos acc
+end
+ngUs = div ulong sub monons t1 1000
+ngAvg = div ngUs sub get qdSpecSt 0 1
+qdPrint qpMsgSpecNg
+qdPrintU M
+if eq get qdSpecSt 1 1
+qdPrint qpMsgSpecParOk
+else
+qdPrint qpMsgSpecParBad
+end
+qdPrintU steps
+qdPrint qpMsgSpecAcc
+qdPrintU div mul sub get qdSpecSt 0 1 100 steps
+qdPrint qdMsgAvgMs
+qdPrintU ngAvg
+qdPrint qdMsgTps
+qdPrintU div 100000000 ngAvg
+qdPrint qdMsgNl
+ret eq get qdSpecSt 1 1
+end
+
+fn qdSpecFillOracle nextTok ulong prod ulong genN ulong M ulong to void
+put qdSpecDraft 0 nextTok
+for s ulong sub M 1 bound 16
+idx = add prod s
+if lt idx genN
+put qdSpecDraft add s 1 get qdRefOut idx
+else
+put qdSpecDraft add s 1 nextTok
+end
+end
+end
+
+fn qdSpecBenchVerify genN ulong M ulong n1Avg ulong to bool
+nextTok = qdSpecPrefill17 false
+if eq nextTok 999999
+ret false
+end
+put qdSpecSt 0 1
+put qdSpecSt 1 1
+if ne nextTok get qdRefOut 0
+put qdSpecSt 1 0
+end
+steps = ulong 0
+pos = ulong 19
+t2 = monons
+while lt get qdSpecSt 0 genN bound 64
+qdSpecFillOracle nextTok get qdSpecSt 0 genN M
+acc = qdSpecVerifyStep M pos
+if eq acc 0
+ret false
+end
+steps = add steps 1
+qdSpecCommitAcc acc genN false
+nextTok = get qdSpecPred sub acc 1
+pos = add pos acc
+end
+vfUs = div ulong sub monons t2 1000
+vfAvg = div vfUs sub get qdSpecSt 0 1
+qdPrint qpMsgSpecVf
+qdPrintU M
+if eq get qdSpecSt 1 1
+qdPrint qpMsgSpecParOk
+else
+qdPrint qpMsgSpecParBad
+end
+qdPrintU steps
+qdPrint qpMsgSpecAcc
+qdPrintU div mul sub get qdSpecSt 0 1 100 steps
+qdPrint qdMsgAvgMs
+qdPrintU vfAvg
+qdPrint qdMsgTps
+qdPrintU div 100000000 vfAvg
+qdPrint qpMsgSpecSpd
+qdPrintU div mul n1Avg 100 vfAvg
+qdPrint qdMsgNl
+ret eq get qdSpecSt 1 1
+end
+
+fn qdRunSpecBench genN ulong M ulong to int
+qdPrint qpMsgSpecHdr
+qdPrintU M
+qdPrint qdMsgRp
+n1Avg = qdSpecBenchN1 genN
+if eq n1Avg 0
+ret 15
+end
+if not qdSpecEmitVerifyPkt M
+ret 17
+end
+ok1 = qdSpecBenchNgram genN M
+ok2 = qdSpecBenchVerify genN M n1Avg
+if or not ok1 not ok2
+ret 22
+end
+ret 0
 end
 
 fn qdPreUploadToks B ulong pos0 ulong to bool
