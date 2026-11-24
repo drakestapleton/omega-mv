@@ -1,0 +1,1727 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_q38_graph.om: Pure seeded OM-2 twin of src/omega_gpu_q38_graph.c.
+note One Qwen3.8-27B (and 9B) dense decode token / multi-head stroke as command lists:
+note exact 256-byte aligned buf/dbuf split layout, variable shape resolution (27B/9B),
+note FP8 and split-K BF16 layers, exact two-pass head with admission byte reserve,
+note om/gpu/q38_plan.om batched layer/final planning, timeline stamps, and read_buf.
+om2
+
+const OGQ38_HIDDEN ulong 5120
+const OGQ38_INTER ulong 17408
+const OGQ38_GDN_MIX ulong 16384
+const OGQ38_GDN_QKV ulong 10240
+const OGQ38_AB ulong 96
+const OGQ38_ATT_MIX ulong 14336
+const OGQ38_ATT_QKV ulong 8192
+const OGQ38_MIXER_OUT ulong 6144
+const OGQ38_ROTARY ulong 64
+const OGQ38_MAX_LAYERS ulong 64
+const OGQ38_MAX_HEADS ulong 8
+const OGQ38_TOKEN_STRIDE ulong 256
+const OGQ38_SEGD_ROWS ulong 4
+const OGQ38_SEG_BYTES ulong 32
+const OGQ38_COPY_ROW ulong 256
+const OGQ38_QMD_MAX_SHARED ulong 32768
+const OGQ38_BF16_X_MAX_K ulong 8192
+
+const OGQ38_K_NORM ulong 0
+const OGQ38_K_MIX ulong 1
+const OGQ38_K_AB ulong 2
+const OGQ38_K_GDN ulong 3
+const OGQ38_K_GATHER ulong 4
+const OGQ38_K_ATTN ulong 5
+const OGQ38_K_GATE ulong 6
+const OGQ38_K_O ulong 7
+const OGQ38_K_RES ulong 8
+const OGQ38_K_GATE_UP ulong 9
+const OGQ38_K_SWIGLU ulong 10
+const OGQ38_K_DOWN ulong 11
+const OGQ38_K_LM_HEAD ulong 12
+const OGQ38_K_ARGMAX ulong 13
+const OGQ38_K_PERM ulong 14
+const OGQ38_K_COUNT ulong 15
+
+const OGQ38_BUF_X ulong 0
+const OGQ38_BUF_XQ ulong 1
+const OGQ38_BUF_MIX ulong 2
+const OGQ38_BUF_AB ulong 3
+const OGQ38_BUF_AGG ulong 4
+const OGQ38_BUF_ATT ulong 5
+const OGQ38_BUF_O ulong 6
+const OGQ38_BUF_GU ulong 7
+const OGQ38_BUF_ACT ulong 8
+const OGQ38_BUF_HIDDEN ulong 9
+const OGQ38_BUF_COUNT ulong 10
+
+note ogq38_st[32]: 0=live, 1=layers, 2=attn_mask, 3=vocab, 4=am_ctas, 5=heads, 6=cl,
+note   7=final_set, 8=head8, 9=xh_screen, 10=xh_roundings, 11=in_token, 12=failed,
+note   13=stroke_heads, 14=t_begin, 15=flush_each, 16=mutant, 17=batch,
+note   18=overlap_ab_init, 19=overlap_ab_val, 20=stamps_on, 21=n_kind, 22=tagged, 23=n_stamp
+global ogq38_st ulong 32
+
+note ogq38_sh[11]: 0=hd, 1=in, 2=qh, 3=kvh, 4=gh, 5=gqkv, 6=gmix, 7=ab, 8=amix, 9=aqkv, 10=mout
+global ogq38_sh ulong 11
+
+note ogq38_lo[35]: 0=x..15=ptab, 16=split, 17=xq..33=actp, 34=bytes
+global ogq38_lo ulong 35
+
+note ogq38_mem[48]: 0..5=buf, 6..11=dbuf, 12..17=code, 18..23=xh_mem, 24..30=xh_vas, 31..36=acc
+global ogq38_mem ulong 48
+
+note ogq38_lmeta[320]: 0..63=attn, 64..127=kind_idx, 128..191=set, 192..255=bf16, 256..319=bdn2
+global ogq38_lmeta ulong 320
+
+note ogq38_hmeta[40]: 0..7=gdn_h, 8..15=attn_h, 16..23=xh_on, 24..31=hidden_ready, 32..39=xq_layer+1
+global ogq38_hmeta ulong 40
+
+note ogq38_tl[129]: 0..63=kinds, 64..128=stamps_buf
+global ogq38_tl ulong 129
+
+text ogq38_kn_0 "norm"
+text ogq38_kn_1 "mix"
+text ogq38_kn_2 "ab"
+text ogq38_kn_3 "gdn"
+text ogq38_kn_4 "gather"
+text ogq38_kn_5 "attn"
+text ogq38_kn_6 "gate"
+text ogq38_kn_7 "o_proj"
+text ogq38_kn_8 "res"
+text ogq38_kn_9 "gate_up"
+text ogq38_kn_10 "swiglu"
+text ogq38_kn_11 "down"
+text ogq38_kn_12 "lm_head"
+text ogq38_kn_13 "argmax"
+text ogq38_kn_14 "perm"
+text ogq38_kn_unk "?"
+
+text ogq38_e_layer "q38 graph: layer not set, out of order, or final norm missing"
+text ogq38_e_head "q38 graph: head not in the stroke"
+text ogq38_e_fnorm "q38 graph: final norm not set"
+text ogq38_e_batch "q38 graph: record_layer_heads needs set_batch"
+text ogq38_e_step "q38 graph: heads out of step"
+text ogq38_e_bf16k "q38 graph: a bf16 projection's K exceeds the GEMV x stage (8192)"
+text ogq38_e_timeline "q38 graph: no timeline for the last token"
+text ogq38_e_tl_small "q38 graph: timeline buffers too small"
+
+fn ogq38_al v ulong to ulong
+  ret and add v 255 not ulong 255
+end
+
+fn ogq38_gather_slot n ulong q_heads ulong kv_heads ulong to ulong
+  qn = mul q_heads 256
+  if lt n qn
+    ret add mul div n 256 512 ogq36_perm_slot rem n 256 OGQ38_ROTARY
+  end
+  kn = mul kv_heads 256
+  qp = mul q_heads 512
+  if lt n add qn kn
+    d = sub n qn
+    ret add add qp mul div d 256 256 ogq36_perm_slot rem d 256 OGQ38_ROTARY
+  end
+  qkv = add qn mul 2 kn
+  if lt n qkv
+    kp = add qp kn
+    ret add kp sub sub n qn kn
+  end
+  d = sub n qkv
+  ret add add mul div d 256 512 256 rem d 256
+end
+
+fn ogq38_gather_table q_heads ulong kv_heads ulong tab edit uint * to long
+  if or eq q_heads 0 gt q_heads 24
+    ret -1
+  end
+  if or eq kv_heads 0 ne rem q_heads kv_heads 0
+    ret -1
+  end
+  mix = mul add q_heads kv_heads 512
+  if lt len tab mix
+    ret -1
+  end
+  for n ulong mix bound 16384
+    put tab n uint ogq38_gather_slot n q_heads kv_heads
+  end
+  ret 0
+end
+
+fn ogq38_perm_src i ulong lb ulong to ulong
+  step = mul 32 lb
+  s0 = mul div i step step
+  idx = rem i step
+  e = rem idx 4
+  t = div idx 4
+  L = rem t 32
+  w = div t 32
+  r = add s0 mul L lb
+  r = add r mul w 4
+  ret add r e
+end
+
+fn ogq38_perm_table tab edit uint * k ulong to void
+  if or eq k 0 ne rem k 256 0
+    ret
+  end
+  lb = ulong 8
+  if eq rem k 512 0
+    lb = ulong 16
+  end
+  for i ulong k bound 65536
+    put tab i uint ogq38_perm_src i lb
+  end
+end
+
+fn ogq38_exact_extra_bytes to ulong
+  v = ulong 248320
+  hd = OGQ38_HIDDEN
+  screen_w = mul v hd
+  screen_s = mul mul div add v 127 128 div add hd 127 128 2
+  p = mul div add v sub OGDG_ARGMAX_SPAN 1 OGDG_ARGMAX_SPAN OGDG_ARGMAX_SPAN
+  sc = add ogq38_al mul hd 4 mul ogq38_al mul v 4 3
+  sc = add add sc ogq38_al mul p 4 mul ogq38_al 16 2
+  host_coef = mul v 4
+  ret add add add screen_w screen_s sc host_coef
+end
+
+fn ogq38_kind_name kind ulong dst edit uchar * to ulong
+  if eq kind 0
+    ret ogdg_copy_str ogq38_kn_0 dst
+  end
+  if eq kind 1
+    ret ogdg_copy_str ogq38_kn_1 dst
+  end
+  if eq kind 2
+    ret ogdg_copy_str ogq38_kn_2 dst
+  end
+  if eq kind 3
+    ret ogdg_copy_str ogq38_kn_3 dst
+  end
+  if eq kind 4
+    ret ogdg_copy_str ogq38_kn_4 dst
+  end
+  if eq kind 5
+    ret ogdg_copy_str ogq38_kn_5 dst
+  end
+  if eq kind 6
+    ret ogdg_copy_str ogq38_kn_6 dst
+  end
+  if eq kind 7
+    ret ogdg_copy_str ogq38_kn_7 dst
+  end
+  if eq kind 8
+    ret ogdg_copy_str ogq38_kn_8 dst
+  end
+  if eq kind 9
+    ret ogdg_copy_str ogq38_kn_9 dst
+  end
+  if eq kind 10
+    ret ogdg_copy_str ogq38_kn_10 dst
+  end
+  if eq kind 11
+    ret ogdg_copy_str ogq38_kn_11 dst
+  end
+  if eq kind 12
+    ret ogdg_copy_str ogq38_kn_12 dst
+  end
+  if eq kind 13
+    ret ogdg_copy_str ogq38_kn_13 dst
+  end
+  if eq kind 14
+    ret ogdg_copy_str ogq38_kn_14 dst
+  end
+  ret ogdg_copy_str ogq38_kn_unk dst
+end
+
+fn ogq38_set_overlap_ab on ulong to void
+  put ogq38_st 18 1
+  if ne on 0
+    put ogq38_st 19 1
+  else
+    put ogq38_st 19 0
+  end
+end
+
+fn ogq38_overlap_ab to ulong
+  if eq get ogq38_st 18 0
+    put ogq38_st 18 1
+    put ogq38_st 19 1
+  end
+  ret get ogq38_st 19
+end
+
+fn ogq38_compute_layout_host layers ulong heads ulong am_ctas ulong to ulong
+  hd = get ogq38_sh 0
+  inw = get ogq38_sh 1
+  abw = get ogq38_sh 7
+  amix = get ogq38_sh 8
+  mout = get ogq38_sh 10
+  o = ulong 0
+  put ogq38_lo 0 o
+  o = ogq38_al add o mul mul hd 4 heads
+  put ogq38_lo 1 o
+  o = ogq38_al add o mul abw 4
+  put ogq38_lo 2 o
+  o = ogq38_al add o mul mul hd 4 heads
+  put ogq38_lo 3 o
+  o = ogq38_al add o mul mul mul am_ctas OGDG_ARGMAX_SPAN 4 heads
+  put ogq38_lo 4 o
+  o = ogq38_al add o mul mul OGDG_ARGMAX_SPAN 4 heads
+  put ogq38_lo 5 o
+  o = ogq38_al add o mul mul OGDG_ARGMAX_SPAN 4 heads
+  put ogq38_lo 6 o
+  o = ogq38_al add o mul OGQ38_TOKEN_STRIDE heads
+  put ogq38_lo 7 o
+  o = ogq38_al add o mul mul mul layers 2 hd 4
+  put ogq38_lo 8 o
+  o = ogq38_al add o mul hd 4
+  put ogq38_lo 9 o
+  o = ogq38_al add o add mul mul layers 4 16 16
+  put ogq38_lo 10 o
+  o = ogq38_al add o mul amix 4
+  put ogq38_lo 11 o
+  o = ogq38_al add o mul OGQ38_COPY_ROW 4
+  put ogq38_lo 12 o
+  o = ogq38_al add o mul mul 2 inw 4
+  put ogq38_lo 13 o
+  o = ogq38_al add o mul mul layers OGQ38_SEGD_ROWS OGQ38_SEG_BYTES
+  put ogq38_lo 14 o
+  o = ogq38_al add o OGQ38_SEG_BYTES
+  put ogq38_lo 15 o
+  o = ogq38_al add o mul add add hd mout inw 4
+  put ogq38_lo 16 o
+  ret o
+end
+
+fn ogq38_compute_layout_dev o0 ulong heads ulong to ulong
+  hd = get ogq38_sh 0
+  inw = get ogq38_sh 1
+  gmix = get ogq38_sh 6
+  abw = get ogq38_sh 7
+  amix = get ogq38_sh 8
+  mout = get ogq38_sh 10
+  o = o0
+  put ogq38_lo 17 o
+  o = ogq38_al add o mul mul hd 4 heads
+  put ogq38_lo 18 o
+  o = ogq38_al add o mul gmix 4
+  put ogq38_lo 19 o
+  o = ogq38_al add o mul amix 4
+  put ogq38_lo 20 o
+  o = ogq38_al add o mul mout 4
+  put ogq38_lo 21 o
+  o = ogq38_al add o mul hd 4
+  put ogq38_lo 22 o
+  o = ogq38_al add o mul mul 2 inw 4
+  put ogq38_lo 23 o
+  o = ogq38_al add o mul inw 4
+  np = add heads OGQ38_MAX_HEADS
+  put ogq38_lo 24 o
+  o = ogq38_al add o mul mul np hd 4
+  put ogq38_lo 25 o
+  o = ogq38_al add o mul mul heads gmix 4
+  put ogq38_lo 26 o
+  o = ogq38_al add o mul mul heads abw 4
+  put ogq38_lo 27 o
+  o = ogq38_al add o mul mul heads amix 4
+  put ogq38_lo 28 o
+  o = ogq38_al add o mul mul heads mout 4
+  put ogq38_lo 29 o
+  o = ogq38_al add o mul mul np mout 4
+  put ogq38_lo 30 o
+  o = ogq38_al add o mul mul heads hd 4
+  put ogq38_lo 31 o
+  o = ogq38_al add o mul mul mul heads 2 inw 4
+  put ogq38_lo 32 o
+  o = ogq38_al add o mul mul heads inw 4
+  put ogq38_lo 33 o
+  o = ogq38_al add o mul mul np inw 4
+  put ogq38_lo 34 o
+  ret o
+end
+
+fn ogq38_free_mem_slot base ulong to void
+  tmp = new ulong 6 0
+  for i ulong 6
+    put tmp i get ogq38_mem add base i
+    put ogq38_mem add base i 0
+  end
+  ogps_free tmp
+end
+
+fn ogq38_free to void
+  if eq get ogq38_st 0 0
+    ret
+  end
+  if ne get ogq38_st 6 0
+    ogcl_free get ogq38_st 6
+    put ogq38_st 6 0
+  end
+  ogps_lock
+  for w ulong 4
+    ogq38_free_mem_slot mul w 6
+  end
+  ogps_unlock
+  ov_init = get ogq38_st 18
+  ov_val = get ogq38_st 19
+  for i ulong 32
+    put ogq38_st i 0
+  end
+  put ogq38_st 18 ov_init
+  put ogq38_st 19 ov_val
+end
+
+fn ogq38_validate_shape cfg view ulong 16 to bool
+  hd = get cfg 9
+  if eq hd 0
+    hd = OGQ38_HIDDEN
+  end
+  inw = get cfg 10
+  if eq inw 0
+    inw = OGQ38_INTER
+  end
+  qh = get cfg 11
+  if eq qh 0
+    qh = ulong 24
+  end
+  kvh = get cfg 12
+  if eq kvh 0
+    kvh = ulong 4
+  end
+  gh = get cfg 13
+  if eq gh 0
+    gh = ulong 48
+  end
+  if or ne rem hd 1024 0 gt hd OGQ38_HIDDEN
+    ret false
+  end
+  if or eq inw 0 or ne rem inw 256 0 gt inw OGQ38_INTER
+    ret false
+  end
+  if or gt qh 24 or eq kvh 0 ne rem qh kvh 0
+    ret false
+  end
+  if gt div qh kvh 8
+    ret false
+  end
+  if and ne gh 32 ne gh 48
+    ret false
+  end
+  if ne mul qh 256 mul gh 128
+    ret false
+  end
+  if or ne get cfg 14 qh ne get cfg 15 kvh
+    ret false
+  end
+  if or ne get cfg 7 get cfg 2 ne get cfg 8 hd
+    ret false
+  end
+  put ogq38_sh 0 hd
+  put ogq38_sh 1 inw
+  put ogq38_sh 2 qh
+  put ogq38_sh 3 kvh
+  put ogq38_sh 4 gh
+  gqkv = mul add 32 gh 128
+  put ogq38_sh 5 gqkv
+  put ogq38_sh 6 add gqkv mul gh 128
+  put ogq38_sh 7 mul 2 gh
+  put ogq38_sh 8 mul add qh kvh 512
+  put ogq38_sh 9 add mul qh 256 mul kvh 512
+  put ogq38_sh 10 mul qh 256
+  ret true
+end
+
+fn ogq38_alloc_device sp ulong tot ulong to bool
+  ogps_lock
+  ok = ne ogps_open 0
+  bm = new ulong 6 0
+  dm = new ulong 6 0
+  cm = new ulong 6 0
+  if ok
+    if ne ogps_alloc sp bm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if ne ogps_alloc sub tot sp dm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if ne ogps_alloc_code 512 cm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if or ne ogps_sync_to_gpu bm OGPS_OK ne ogps_sync_to_gpu dm OGPS_OK
+      ok = false
+    end
+  end
+  if not ok
+    ogps_free bm
+    ogps_free dm
+    ogps_free cm
+    ogps_unlock
+    ret false
+  end
+  ogps_unlock
+  for i ulong 48
+    put ogq38_mem i 0
+  end
+  for i ulong 6
+    put ogq38_mem i get bm i
+    put ogq38_mem add 6 i get dm i
+    put ogq38_mem add 12 i get cm i
+  end
+  ret true
+end
+
+fn ogq38_init_state cfg view ulong 16 am_ctas ulong heads ulong cl_id ulong to void
+  layers = get cfg 0
+  amask = get cfg 1
+  na = ulong 0
+  ng = ulong 0
+  for l ulong 64
+    put ogq38_lmeta add 128 l 0
+    put ogq38_lmeta add 192 l 0
+    put ogq38_lmeta add 256 l 0
+    if lt l layers
+      is_a = and shr amask l 1
+      put ogq38_lmeta l is_a
+      if ne is_a 0
+        put ogq38_lmeta add 64 l na
+        na = add na 1
+      else
+        put ogq38_lmeta add 64 l ng
+        ng = add ng 1
+      end
+    end
+  end
+  for i ulong 40
+    put ogq38_hmeta i 0
+  end
+  put ogq38_hmeta 0 get cfg 5
+  put ogq38_hmeta 8 get cfg 6
+  ov_init = get ogq38_st 18
+  ov_val = get ogq38_st 19
+  for i ulong 32
+    put ogq38_st i 0
+  end
+  put ogq38_st 0 1
+  put ogq38_st 1 layers
+  put ogq38_st 2 amask
+  put ogq38_st 3 get cfg 2
+  put ogq38_st 4 am_ctas
+  put ogq38_st 5 heads
+  put ogq38_st 6 cl_id
+  put ogq38_st 18 ov_init
+  put ogq38_st 19 ov_val
+end
+
+fn ogq38_create_heads cfg view ulong 16 heads ulong to long
+  if or eq heads 0 gt heads OGQ38_MAX_HEADS
+    ret OGDG_BAD_ARGS
+  end
+  layers = get cfg 0
+  amask = get cfg 1
+  vocab = get cfg 2
+  max_vocab = mul OGDG_ARGMAX_SPAN OGDG_ARGMAX_SPAN
+  if or eq layers 0 gt layers OGQ38_MAX_LAYERS
+    ret OGDG_BAD_ARGS
+  end
+  if or eq get cfg 5 0 eq get cfg 6 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq vocab 0 gt vocab max_vocab
+    ret OGDG_BAD_ARGS
+  end
+  if lt layers 64
+    if ne shr amask layers 0
+      ret OGDG_BAD_ARGS
+    end
+  end
+  if not ogq38_validate_shape cfg
+    ret OGDG_BAD_ARGS
+  end
+  am_ctas = div add vocab sub OGDG_ARGMAX_SPAN 1 OGDG_ARGMAX_SPAN
+  sp = ogq38_compute_layout_host layers heads am_ctas
+  tot = ogq38_compute_layout_dev sp heads
+  cid = new ulong 1 0
+  if ne ogcl_create OGCL_SLOTS_PER_LIST cid 0
+    ret OGDG_CHIP_FAIL
+  end
+  if not ogq38_alloc_device sp tot
+    ogcl_free get cid 0
+    ret OGDG_CHIP_FAIL
+  end
+  ogq38_init_state cfg am_ctas heads get cid 0
+  ret OGDG_OK
+end
+
+fn ogq38_create cfg view ulong 16 to long
+  ret ogq38_create_heads cfg 1
+end
+
+fn ogq38_set_head_state head ulong gdn_id ulong attn_id ulong aq ulong akv ulong to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ge head get ogq38_st 5 or eq gdn_id 0 eq attn_id 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ne aq get ogq38_sh 2 ne akv get ogq38_sh 3
+    ret OGDG_BAD_ARGS
+  end
+  put ogq38_hmeta head gdn_id
+  put ogq38_hmeta add 8 head attn_id
+  ret OGDG_OK
+end
+
+fn ogq38_set_layer layer ulong shapes view ulong 12 to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ge layer get ogq38_st 1 eq get shapes 11 0
+    ret OGDG_BAD_ARGS
+  end
+  hd = get ogq38_sh 0
+  inw = get ogq38_sh 1
+  mout = get ogq38_sh 10
+  is_a = get ogq38_lmeta layer
+  want_mix = get ogq38_sh 6
+  if ne is_a 0
+    want_mix = get ogq38_sh 8
+  end
+  if or ne get shapes 0 want_mix ne get shapes 1 hd
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 4 hd ne get shapes 5 mout
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 6 mul 2 inw ne get shapes 7 hd
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 8 hd ne get shapes 9 inw
+    ret OGDG_BAD_ARGS
+  end
+  if ne is_a 0
+    if ne get shapes 10 0
+      ret OGDG_BAD_ARGS
+    end
+  else
+    if eq get shapes 10 0
+      ret OGDG_BAD_ARGS
+    end
+    if or ne get shapes 2 get ogq38_sh 7 ne get shapes 3 hd
+      ret OGDG_BAD_ARGS
+    end
+  end
+  put ogq38_lmeta add 192 layer 0
+  put ogq38_lmeta add 256 layer 0
+  put ogq38_lmeta add 128 layer 1
+  ret OGDG_OK
+end
+
+fn ogq38_set_layer_bf16 layer ulong shapes view ulong 12 has_down2 ulong to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ge layer get ogq38_st 1 eq get shapes 11 0
+    ret OGDG_BAD_ARGS
+  end
+  hd = get ogq38_sh 0
+  inw = get ogq38_sh 1
+  mout = get ogq38_sh 10
+  is_a = get ogq38_lmeta layer
+  want_mix = get ogq38_sh 6
+  if ne is_a 0
+    want_mix = get ogq38_sh 8
+  end
+  kd = inw
+  if ne has_down2 0
+    kd = div inw 2
+  end
+  if or ne get shapes 0 want_mix ne get shapes 1 hd
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 4 hd ne get shapes 5 mout
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 6 mul 2 inw ne get shapes 7 hd
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 8 hd ne get shapes 9 kd
+    ret OGDG_BAD_ARGS
+  end
+  if ne is_a 0
+    if ne get shapes 10 0
+      ret OGDG_BAD_ARGS
+    end
+  else
+    if eq get shapes 10 0
+      ret OGDG_BAD_ARGS
+    end
+    if or ne get shapes 2 get ogq38_sh 7 ne get shapes 3 hd
+      ret OGDG_BAD_ARGS
+    end
+  end
+  if gt hd OGQ38_BF16_X_MAX_K
+    ogps_set_error ogq38_e_bf16k
+    ret OGDG_BAD_ARGS
+  end
+  if gt mout OGQ38_BF16_X_MAX_K
+    ogps_set_error ogq38_e_bf16k
+    ret OGDG_BAD_ARGS
+  end
+  if gt kd OGQ38_BF16_X_MAX_K
+    ogps_set_error ogq38_e_bf16k
+    ret OGDG_BAD_ARGS
+  end
+  if and ne has_down2 0 ne rem inw 512 0
+    ogps_set_error ogq38_e_bf16k
+    ret OGDG_BAD_ARGS
+  end
+  put ogq38_lmeta add 192 layer 1
+  if ne has_down2 0
+    put ogq38_lmeta add 256 layer 1
+  else
+    put ogq38_lmeta add 256 layer 0
+  end
+  put ogq38_lmeta add 128 layer 1
+  ret OGDG_OK
+end
+
+fn ogq38_set_final_norm has_norm ulong to long
+  if or eq get ogq38_st 0 0 or ne get ogq38_st 11 0 eq has_norm 0
+    ret OGDG_BAD_ARGS
+  end
+  put ogq38_st 7 1
+  ret OGDG_OK
+end
+
+fn ogq38_set_lm_head_fp8 present ulong n ulong k ulong to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if eq present 0
+    put ogq38_st 8 0
+    ret OGDG_OK
+  end
+  if or ne n get ogq38_st 3 ne k get ogq38_sh 0
+    ret OGDG_BAD_ARGS
+  end
+  put ogq38_st 8 1
+  ret OGDG_OK
+end
+
+fn ogq38_xh_layout n ulong to ulong
+  hd = get ogq38_sh 0
+  nh = get ogq38_st 5
+  p = mul get ogq38_st 4 OGDG_ARGMAX_SPAN
+  o = ulong 0
+  put ogq38_mem 24 o
+  o = ogq38_al add o mul mul nh hd 4
+  put ogq38_mem 25 o
+  o = ogq38_al add o mul mul nh n 4
+  put ogq38_mem 26 o
+  o = ogq38_al add o mul n 4
+  put ogq38_mem 27 o
+  o = ogq38_al add o mul mul nh n 4
+  put ogq38_mem 28 o
+  o = ogq38_al add o mul mul nh p 4
+  put ogq38_mem 29 o
+  o = ogq38_al add o mul nh 16
+  put ogq38_mem 30 o
+  ret ogq38_al add o 16
+end
+
+fn ogq38_alloc_exact_head roundings ulong n ulong to long
+  tot = ogq38_xh_layout n
+  xm = new ulong 6 0
+  ogps_lock
+  rc = ogps_alloc tot xm
+  if eq rc OGPS_OK
+    rc = ogps_sync_to_gpu xm
+  end
+  if ne rc OGPS_OK
+    ogps_free xm
+    ogps_unlock
+    ret OGDG_CHIP_FAIL
+  end
+  ogps_unlock
+  for i ulong 6
+    put ogq38_mem add 18 i get xm i
+  end
+  base = get xm 4
+  for i ulong 7
+    put ogq38_mem add 24 i add base get ogq38_mem add 24 i
+  end
+  put ogq38_st 9 1
+  put ogq38_st 10 roundings
+  for h ulong OGQ38_MAX_HEADS
+    put ogq38_hmeta add 16 h 1
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_set_exact_head present ulong has_coef ulong roundings ulong n ulong k ulong to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if eq present 0
+    ogps_lock
+    ogq38_free_mem_slot 18
+    ogps_unlock
+    put ogq38_st 9 0
+    put ogq38_st 10 0
+    for h ulong OGQ38_MAX_HEADS
+      put ogq38_hmeta add 16 h 0
+    end
+    ret OGDG_OK
+  end
+  if or eq has_coef 0 or eq roundings 0 ne get ogq38_st 9 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ne n get ogq38_st 3 ne k get ogq38_sh 0
+    ret OGDG_BAD_ARGS
+  end
+  ret ogq38_alloc_exact_head roundings n
+end
+
+fn ogq38_set_exact_head_on on ulong to void
+  if and ne get ogq38_st 0 0 eq get ogq38_st 11 0
+    v = ulong 0
+    if ne on 0
+      v = ulong 1
+    end
+    for h ulong OGQ38_MAX_HEADS
+      put ogq38_hmeta add 16 h v
+    end
+  end
+end
+
+fn ogq38_set_head_exact_head_on head ulong on ulong to void
+  if and ne get ogq38_st 0 0 and eq get ogq38_st 11 0 lt head OGQ38_MAX_HEADS
+    v = ulong 0
+    if ne on 0
+      v = ulong 1
+    end
+    put ogq38_hmeta add 16 head v
+  end
+end
+
+fn ogq38_exact_head_active_head head ulong to ulong
+  if or eq get ogq38_st 0 0 ge head OGQ38_MAX_HEADS
+    ret 0
+  end
+  if and ne get ogq38_st 9 0 and ne get ogq38_hmeta add 16 head 0 eq get ogq38_st 8 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ogq38_exact_head_active to ulong
+  ret ogq38_exact_head_active_head 0
+end
+
+fn ogq38_set_flush_each on ulong to void
+  if ne get ogq38_st 0 0
+    if ne on 0
+      put ogq38_st 15 1
+    else
+      put ogq38_st 15 0
+    end
+  end
+end
+
+fn ogq38_test_set_mutant mutant ulong to void
+  if ne get ogq38_st 0 0
+    put ogq38_st 16 mutant
+  end
+end
+
+fn ogq38_set_batch on ulong to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if eq on 0
+    put ogq38_st 17 0
+    ret OGDG_OK
+  end
+  max_xb = q38_bf16_xbatch_max get ogq38_sh 0 OGQ38_QMD_MAX_SHARED
+  if eq max_xb 0
+    ret OGDG_CHIP_FAIL
+  end
+  put ogq38_st 17 1
+  ret OGDG_OK
+end
+
+fn ogq38_batch to ulong
+  if eq get ogq38_st 0 0
+    ret 0
+  end
+  ret get ogq38_st 17
+end
+
+fn ogq38_submit_now to long
+  cid = get ogq38_st 6
+  n = ogcl_count cid
+  if eq n 0
+    ret OGDG_OK
+  end
+  opts = new ulong 7 0
+  put opts 0 OGCL_MODE_PCAS
+  put opts 1 ogdg_barrier
+  put opts 2 20000
+  put opts 4 get ogq38_st 20
+  st = new ulong 7 0
+  rc = ogcl_submit cid opts st
+  put ogq38_mem 31 add get ogq38_mem 31 get st 0
+  put ogq38_mem 32 add get ogq38_mem 32 get st 1
+  put ogq38_mem 33 add get ogq38_mem 33 get st 3
+  put ogq38_mem 36 add get ogq38_mem 36 get st 5
+  tmp = new ulong 65 0
+  if and eq rc 0 ne get ogq38_st 20 0
+    cnt = ogcl_stamps cid tmp 65
+    if lt cnt 0
+      rc = long -1
+    else
+      from = ulong 0
+      if ne get ogq38_st 23 0
+        from = ulong 1
+      end
+      i = from
+      while lt i ulong cnt bound 65
+        ns = get ogq38_st 23
+        if lt ns 65
+          put ogq38_tl add 64 ns get tmp i
+          put ogq38_st 23 add ns 1
+        end
+        i = add i 1
+      end
+    end
+  end
+  put ogq38_st 22 0
+  ogcl_reset cid
+  if or ne rc 0 ne get st 5 get st 0
+    put ogq38_st 12 1
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_ensure_room need ulong to long
+  if ge add ogcl_count get ogq38_st 6 need OGCL_SLOTS_PER_LIST
+    ret ogq38_submit_now
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_tag kind ulong to void
+  n = ogcl_count get ogq38_st 6
+  t = get ogq38_st 22
+  while and lt t n lt get ogq38_st 21 64 bound 64
+    nk = get ogq38_st 21
+    put ogq38_tl nk kind
+    put ogq38_st 21 add nk 1
+    t = add t 1
+  end
+  put ogq38_st 22 t
+end
+
+fn ogq38_add_op kind ulong gx ulong gy ulong elems ulong to long
+  erc = ogq38_ensure_room 1
+  if ne erc OGDG_OK
+    ret erc
+  end
+  L = new ulong 12 0
+  put L 0 get ogq38_mem 16
+  put L 1 64
+  put L 2 256
+  put L 3 1
+  put L 4 gx
+  put L 5 gy
+  put L 6 elems
+  put L 7 4
+  put L 8 20000
+  args = new uint 4 0
+  put args 0 uint kind
+  put args 1 uint gx
+  put args 2 uint gy
+  put args 3 uint elems
+  rc = ogcl_add get ogq38_st 6 L args
+  if lt rc 0
+    put ogq38_st 12 1
+    ret OGDG_CHIP_FAIL
+  end
+  ogq38_tag kind
+  if ne get ogq38_st 15 0
+    ret ogq38_submit_now
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_mark_indep_if ind ulong to long
+  if or eq ind 0 ne get ogq38_st 15 0
+    ret OGDG_OK
+  end
+  if ne ogcl_mark_independent get ogq38_st 6 0
+    put ogq38_st 12 1
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_begin_stroke heads ulong to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq heads 0 gt heads get ogq38_st 5
+    ret OGDG_BAD_ARGS
+  end
+  h = ulong 1
+  while lt h heads bound 8
+    if or eq get ogq38_hmeta h 0 eq get ogq38_hmeta add 8 h 0
+      ret OGDG_BAD_ARGS
+    end
+    h = add h 1
+  end
+  ogps_lock
+  put ogq38_st 14 ogps_now_ns
+  put ogq38_st 11 1
+  put ogq38_st 12 0
+  put ogq38_st 13 heads
+  for j ulong heads bound 8
+    put ogq38_hmeta add 32 j 0
+    put ogq38_hmeta add 24 j 0
+  end
+  for i ulong 6
+    put ogq38_mem add 31 i 0
+  end
+  put ogq38_st 21 0
+  put ogq38_st 22 0
+  put ogq38_st 23 0
+  ogcl_reset get ogq38_st 6
+  if eq ogps_open 0
+    put ogq38_st 12 1
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_begin_token to long
+  ret ogq38_begin_stroke 1
+end
+
+fn ogq38_record_head_mlp h ulong l ulong last bool to long
+  hd = get ogq38_sh 0
+  inw = get ogq38_sh 1
+  rc = ogq38_add_op OGQ38_K_O 1 1 hd
+  if eq rc OGDG_OK
+    rc = ogq38_add_op OGQ38_K_RES 1 1 hd
+  end
+  if eq rc OGDG_OK
+    rc = ogq38_add_op OGQ38_K_GATE_UP 1 1 mul 2 inw
+  end
+  if eq rc OGDG_OK
+    rc = ogq38_add_op OGQ38_K_SWIGLU div inw 256 1 inw
+  end
+  if eq rc OGDG_OK
+    if ne get ogq38_lmeta add 256 l 0
+      rc = ogq38_add_op OGQ38_K_DOWN 1 1 hd
+      if eq rc OGDG_OK
+        rc = ogq38_add_op OGQ38_K_RES 1 1 hd
+      end
+      if eq rc OGDG_OK
+        rc = ogq38_add_op OGQ38_K_DOWN 1 1 hd
+      end
+    else
+      rc = ogq38_add_op OGQ38_K_DOWN 1 1 hd
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogq38_add_op OGQ38_K_RES 1 1 hd
+    if eq rc OGDG_OK
+      if last
+        put ogq38_hmeta add 24 h 1
+      else
+        put ogq38_hmeta add 32 h add l 2
+      end
+    end
+  end
+  ret rc
+end
+
+fn ogq38_record_head_layer h ulong l ulong pos ulong to long
+  if or eq get ogq38_st 0 0 eq get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq38_st 12 0
+    ret OGDG_CHIP_FAIL
+  end
+  if ge h get ogq38_st 13
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_head
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq38_st 1
+  last = eq add l 1 layers
+  if ge l layers
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if eq get ogq38_lmeta add 128 l 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq38_hmeta add 24 h 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if and last eq get ogq38_st 7 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  rc = ogq38_ensure_room 20
+  if ne rc OGDG_OK
+    ret rc
+  end
+  if ne get ogq38_hmeta add 32 h add l 1
+    rc = ogq38_add_op OGQ38_K_NORM 1 1 get ogq38_sh 0
+  end
+  is_a = get ogq38_lmeta l
+  ov = and eq is_a 0 ne ogq38_overlap_ab 0
+  if and ov eq rc OGDG_OK
+    rc = ogq38_add_op OGQ38_K_AB 1 1 get ogq38_sh 7
+  end
+  if eq rc OGDG_OK
+    mw = get ogq38_sh 6
+    if ne is_a 0
+      mw = get ogq38_sh 8
+    end
+    rc = ogq38_add_op OGQ38_K_MIX 1 1 mw
+    if and eq rc OGDG_OK ov
+      rc = ogq38_mark_indep_if 1
+    end
+  end
+  if eq is_a 0
+    if and not ov eq rc OGDG_OK
+      rc = ogq38_add_op OGQ38_K_AB 1 1 get ogq38_sh 7
+    end
+    if eq rc OGDG_OK
+      rc = ogq38_add_op OGQ38_K_GDN 1 1 get ogq38_sh 10
+    end
+  else
+    if eq rc OGDG_OK
+      amix = get ogq38_sh 8
+      rc = ogq38_add_op OGQ38_K_GATHER div add amix 255 256 1 amix
+    end
+    if eq rc OGDG_OK
+      rc = ogq38_add_op OGQ38_K_ATTN 1 1 get ogq38_sh 10
+    end
+    if eq rc OGDG_OK
+      mout = get ogq38_sh 10
+      rc = ogq38_add_op OGQ38_K_GATE div mout 256 1 mout
+    end
+  end
+  if ne rc OGDG_OK
+    ret rc
+  end
+  ret ogq38_record_head_mlp h l last
+end
+
+fn ogq38_record_layer l ulong pos ulong to long
+  ret ogq38_record_head_layer 0 l pos
+end
+
+fn ogq38_exec_plan_op op_id ulong n ulong l ulong to long
+  hd = get ogq38_sh 0
+  inw = get ogq38_sh 1
+  mout = get ogq38_sh 10
+  if eq op_id 1
+    ret ogq38_add_op OGQ38_K_NORM 1 n mul hd n
+  end
+  if eq op_id 2
+    ret ogq38_add_op OGQ38_K_PERM div hd 256 n mul hd n
+  end
+  if eq op_id 3
+    ret ogq38_add_op OGQ38_K_AB 1 n mul get ogq38_sh 7 n
+  end
+  if eq op_id 4
+    ret ogq38_add_op OGQ38_K_MIX 1 n mul get ogq38_sh 6 n
+  end
+  if eq op_id 5
+    ret ogq38_add_op OGQ38_K_GDN 1 1 mout
+  end
+  if eq op_id 6
+    ret ogq38_add_op OGQ38_K_PERM div mout 256 1 mout
+  end
+  if eq op_id 7
+    amix = get ogq38_sh 8
+    ret ogq38_add_op OGQ38_K_GATHER div add amix 255 256 n mul amix n
+  end
+  if eq op_id 8
+    ret ogq38_add_op OGQ38_K_ATTN 1 1 mout
+  end
+  if eq op_id 9
+    ret ogq38_add_op OGQ38_K_GATE div mout 256 1 mout
+  end
+  if eq op_id 10
+    ret ogq38_add_op OGQ38_K_PERM div mout 256 n mul mout n
+  end
+  if eq op_id 11
+    ret ogq38_add_op OGQ38_K_O 1 n mul hd n
+  end
+  if eq op_id 12
+    ret ogq38_add_op OGQ38_K_RES 1 n mul hd n
+  end
+  if eq op_id 13
+    ret ogq38_add_op OGQ38_K_GATE_UP 1 n mul mul 2 inw n
+  end
+  if eq op_id 14
+    ret ogq38_add_op OGQ38_K_SWIGLU div inw 256 n mul inw n
+  end
+  if eq op_id 15
+    ret ogq38_add_op OGQ38_K_PERM div inw 256 n mul inw n
+  end
+  if eq op_id 16
+    ret ogq38_add_op OGQ38_K_DOWN 1 n mul hd n
+  end
+  if eq op_id 17
+    rc = ogq38_add_op OGQ38_K_RES 1 n mul hd n
+    if eq rc OGDG_OK
+      last = eq add l 1 get ogq38_st 1
+      for h ulong n bound 8
+        if last
+          put ogq38_hmeta add 24 h 1
+        else
+          put ogq38_hmeta add 32 h add l 2
+        end
+      end
+    end
+    ret rc
+  end
+  ret OGDG_CHIP_FAIL
+end
+
+fn ogq38_run_layer_plan n ulong l ulong need_norm ulong to long
+  pcfg = new ulong 8 0
+  put pcfg 0 n
+  put pcfg 1 get ogq38_lmeta l
+  put pcfg 2 ogq38_overlap_ab
+  put pcfg 3 need_norm
+  plan = new uint 384 0
+  nops = q38_plan_layer pcfg plan
+  if eq nops 0
+    put ogq38_st 12 1
+    ret OGDG_CHIP_FAIL
+  end
+  rc = ogq38_ensure_room add nops 4
+  for k ulong nops bound 96
+    if eq rc OGDG_OK
+      b = mul k 4
+      op_id = ulong get plan b
+      ind = ulong get plan add b 1
+      rc = ogq38_exec_plan_op op_id n l
+      if eq rc OGDG_OK
+        rc = ogq38_mark_indep_if ind
+      end
+    end
+  end
+  ret rc
+end
+
+fn ogq38_record_layer_heads l ulong pos view uint * to long
+  if or eq get ogq38_st 0 0 eq get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq38_st 12 0
+    ret OGDG_CHIP_FAIL
+  end
+  if eq get ogq38_st 17 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_batch
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq38_st 1
+  last = eq add l 1 layers
+  if or ge l layers eq get ogq38_lmeta add 128 l 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if and last eq get ogq38_st 7 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  n = get ogq38_st 13
+  if ne get ogq38_lmeta add 192 l 0
+    rc = OGDG_OK
+    for h ulong n bound 8
+      if eq rc OGDG_OK
+        rc = ogq38_record_head_layer h l ulong get pos h
+      end
+    end
+    ret rc
+  end
+  xl0 = get ogq38_hmeta 32
+  for h ulong n bound 8
+    if ne get ogq38_hmeta add 24 h 0
+      put ogq38_st 12 1
+      ogps_set_error ogq38_e_step
+      ret OGDG_BAD_ARGS
+    end
+    if ne get ogq38_hmeta add 32 h xl0
+      put ogq38_st 12 1
+      ogps_set_error ogq38_e_step
+      ret OGDG_BAD_ARGS
+    end
+  end
+  need_norm = ulong 0
+  if ne xl0 add l 1
+    need_norm = ulong 1
+  end
+  ret ogq38_run_layer_plan n l need_norm
+end
+
+fn ogq38_rec_argmax to long
+  ctas = get ogq38_st 4
+  rc = ogq38_add_op OGQ38_K_ARGMAX ctas 1 mul ctas OGDG_ARGMAX_SPAN
+  if eq rc OGDG_OK
+    rc = ogq38_add_op OGQ38_K_ARGMAX 1 1 OGDG_ARGMAX_SPAN
+  end
+  ret rc
+end
+
+fn ogq38_record_head_final h ulong to long
+  if or eq get ogq38_st 0 0 eq get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq38_st 12 0
+    ret OGDG_CHIP_FAIL
+  end
+  if ge h get ogq38_st 13
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_head
+    ret OGDG_BAD_ARGS
+  end
+  if eq get ogq38_st 7 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_fnorm
+    ret OGDG_BAD_ARGS
+  end
+  rc = ogq38_ensure_room 12
+  if ne rc OGDG_OK
+    ret rc
+  end
+  hd = get ogq38_sh 0
+  if eq get ogq38_hmeta add 24 h 0
+    rc = ogq38_add_op OGQ38_K_NORM 1 1 hd
+  end
+  if and eq rc OGDG_OK ne ogq38_exact_head_active_head h 0
+    v = get ogq38_st 3
+    rc = ogq38_add_op OGQ38_K_LM_HEAD div hd 256 1 hd
+    if eq rc OGDG_OK
+      rc = ogq38_add_op OGQ38_K_LM_HEAD 1 1 v
+    end
+    if eq rc OGDG_OK
+      rc = ogq38_add_op OGQ38_K_LM_HEAD div add v 255 256 1 v
+    end
+    if eq rc OGDG_OK
+      rc = ogq38_rec_argmax
+    end
+    if eq rc OGDG_OK
+      rc = ogq38_add_op OGQ38_K_LM_HEAD 1 1 v
+    end
+  else
+    if eq rc OGDG_OK
+      rc = ogq38_add_op OGQ38_K_LM_HEAD 1 1 get ogq38_st 3
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogq38_rec_argmax
+  end
+  ret rc
+end
+
+fn ogq38_record_final to long
+  ret ogq38_record_head_final 0
+end
+
+fn ogq38_exec_final_op op_id ulong a0 ulong a1 ulong n ulong to long
+  hd = get ogq38_sh 0
+  v = get ogq38_st 3
+  ctas = get ogq38_st 4
+  if eq op_id 101
+    ret ogq38_add_op OGQ38_K_LM_HEAD div mul n hd 256 1 mul n hd
+  end
+  if eq op_id 102
+    ret ogq38_add_op OGQ38_K_PERM div hd 256 n mul hd n
+  end
+  if eq op_id 103
+    ret ogq38_add_op OGQ38_K_LM_HEAD 1 n mul v n
+  end
+  if eq op_id 104
+    ret ogq38_add_op OGQ38_K_LM_HEAD div add v 255 256 1 v
+  end
+  if eq op_id 105
+    ret ogq38_add_op OGQ38_K_ARGMAX ctas 1 mul ctas OGDG_ARGMAX_SPAN
+  end
+  if eq op_id 106
+    ret ogq38_add_op OGQ38_K_ARGMAX 1 1 OGDG_ARGMAX_SPAN
+  end
+  if eq op_id 107
+    ret ogq38_add_op OGQ38_K_LM_HEAD 1 1 v
+  end
+  if eq op_id 108
+    ret ogq38_add_op OGQ38_K_LM_HEAD 1 a1 mul v a1
+  end
+  if eq op_id 109
+    ret ogq38_add_op OGQ38_K_ARGMAX ctas 1 mul ctas OGDG_ARGMAX_SPAN
+  end
+  if eq op_id 110
+    ret ogq38_add_op OGQ38_K_ARGMAX 1 1 OGDG_ARGMAX_SPAN
+  end
+  if eq op_id 111
+    ret ogq38_record_head_final a0
+  end
+  ret OGDG_CHIP_FAIL
+end
+
+fn ogq38_run_final_plan n ulong all_ex ulong any_ex ulong to long
+  pcfg = new ulong 8 0
+  put pcfg 0 n
+  put pcfg 1 get ogq38_sh 0
+  put pcfg 2 OGQ38_QMD_MAX_SHARED
+  put pcfg 3 all_ex
+  put pcfg 4 any_ex
+  put pcfg 5 get ogq38_st 8
+  plan = new uint 384 0
+  nops = q38_plan_final pcfg plan
+  if eq nops 0
+    put ogq38_st 12 1
+    ret OGDG_CHIP_FAIL
+  end
+  rc = ogq38_ensure_room add nops 4
+  for k ulong nops bound 96
+    if eq rc OGDG_OK
+      b = mul k 4
+      op_id = ulong get plan b
+      ind = ulong get plan add b 1
+      a0 = ulong get plan add b 2
+      a1 = ulong get plan add b 3
+      rc = ogq38_exec_final_op op_id a0 a1 n
+      if eq rc OGDG_OK
+        rc = ogq38_mark_indep_if ind
+      end
+    end
+  end
+  ret rc
+end
+
+fn ogq38_record_final_heads to long
+  if eq get ogq38_st 7 0
+    put ogq38_st 12 1
+    ogps_set_error ogq38_e_fnorm
+    ret OGDG_BAD_ARGS
+  end
+  n = get ogq38_st 13
+  all_ex = ulong 1
+  any_ex = ulong 0
+  for h ulong n bound 8
+    if eq get ogq38_hmeta add 24 h 0
+      put ogq38_st 12 1
+      ret OGDG_BAD_ARGS
+    end
+    ex = ogq38_exact_head_active_head h
+    if eq ex 0
+      all_ex = ulong 0
+    else
+      any_ex = ulong 1
+    end
+  end
+  ret ogq38_run_final_plan n all_ex any_ex
+end
+
+fn ogq38_sync_buf_to_cpu to long
+  bm = new ulong 6 0
+  for i ulong 6
+    put bm i get ogq38_mem i
+  end
+  if ne ogps_sync_to_cpu bm OGPS_OK
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_end_stroke toks edit uint * st_out edit ulong 6 to long
+  if or eq get ogq38_st 0 0 eq get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  rc = OGDG_OK
+  if ne get ogq38_st 12 0
+    rc = OGDG_CHIP_FAIL
+  end
+  t_rec = ogps_now_ns
+  if eq rc OGDG_OK
+    rc = ogq38_submit_now
+  end
+  if eq rc OGDG_OK
+    rc = ogq38_sync_buf_to_cpu
+  end
+  if eq rc OGDG_OK
+    n = get ogq38_st 13
+    if ge len toks n
+      for h ulong n bound 8
+        put toks h 0
+      end
+    end
+  end
+  ogcl_reset get ogq38_st 6
+  put ogq38_st 11 0
+  t_end = ogps_now_ns
+  t0 = get ogq38_st 14
+  for i ulong 6
+    put st_out i get ogq38_mem add 31 i
+  end
+  if ne get ogq38_st 15 0
+    if ge t_end t0
+      put st_out 3 sub t_end t0
+    end
+  else
+    if ge t_rec t0
+      put st_out 3 sub t_rec t0
+    end
+  end
+  if ge t_end t0
+    put st_out 4 sub t_end t0
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn ogq38_end_token tok edit uint 1 st_out edit ulong 6 to long
+  ret ogq38_end_stroke tok st_out
+end
+
+fn ogq38_token pos ulong tok edit uint 1 st_out edit ulong 6 to long
+  if eq get ogq38_st 0 0
+    ret OGDG_BAD_ARGS
+  end
+  brc = ogq38_begin_token
+  if eq brc OGDG_BAD_ARGS
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq38_st 1
+  for l ulong layers bound 64
+    if eq get ogq38_st 12 0
+      ign = ogq38_record_layer l pos
+    end
+  end
+  if eq get ogq38_st 12 0
+    ign2 = ogq38_record_final
+  end
+  ret ogq38_end_token tok st_out
+end
+
+fn ogq38_stroke pos view uint * heads ulong toks edit uint * st_out edit ulong 6 to long
+  if eq get ogq38_st 0 0
+    ret OGDG_BAD_ARGS
+  end
+  brc = ogq38_begin_stroke heads
+  if eq brc OGDG_BAD_ARGS
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq38_st 1
+  for l ulong layers bound 64
+    if eq get ogq38_st 12 0
+      if ne get ogq38_st 17 0
+        ign = ogq38_record_layer_heads l pos
+      else
+        for h ulong heads bound 8
+          if eq get ogq38_st 12 0
+            ign2 = ogq38_record_head_layer h l ulong get pos h
+          end
+        end
+      end
+    end
+  end
+  if and ne get ogq38_st 17 0 eq get ogq38_st 8 0
+    if eq get ogq38_st 12 0
+      ign3 = ogq38_record_final_heads
+    end
+  else
+    for h ulong heads bound 8
+      if eq get ogq38_st 12 0
+        ign4 = ogq38_record_head_final h
+      end
+    end
+  end
+  ret ogq38_end_stroke toks st_out
+end
+
+fn ogq38_read_head h ulong to long
+  if or eq get ogq38_st 0 0 or ne get ogq38_st 11 0 ge h get ogq38_st 5
+    ret OGDG_BAD_ARGS
+  end
+  ogps_lock
+  bm = new ulong 6 0
+  for i ulong 6
+    put bm i get ogq38_mem i
+  end
+  rc = ogps_sync_to_cpu bm
+  ogps_unlock
+  if ne rc OGPS_OK
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_read to long
+  ret ogq38_read_head 0
+end
+
+fn ogq38_buf_cap which ulong to ulong
+  if eq which OGQ38_BUF_X
+    ret get ogq38_sh 0
+  end
+  if eq which OGQ38_BUF_XQ
+    ret get ogq38_sh 0
+  end
+  if eq which OGQ38_BUF_MIX
+    ret get ogq38_sh 6
+  end
+  if eq which OGQ38_BUF_AB
+    ret get ogq38_sh 7
+  end
+  if eq which OGQ38_BUF_AGG
+    ret get ogq38_sh 8
+  end
+  if eq which OGQ38_BUF_ATT
+    ret get ogq38_sh 10
+  end
+  if eq which OGQ38_BUF_O
+    ret get ogq38_sh 0
+  end
+  if eq which OGQ38_BUF_GU
+    ret mul 2 get ogq38_sh 1
+  end
+  if eq which OGQ38_BUF_ACT
+    ret get ogq38_sh 1
+  end
+  if eq which OGQ38_BUF_HIDDEN
+    ret get ogq38_sh 0
+  end
+  ret 0
+end
+
+fn ogq38_buf_off which ulong to ulong
+  if eq which OGQ38_BUF_X
+    ret get ogq38_lo 0
+  end
+  if eq which OGQ38_BUF_XQ
+    ret get ogq38_lo 17
+  end
+  if eq which OGQ38_BUF_MIX
+    ret get ogq38_lo 18
+  end
+  if eq which OGQ38_BUF_AB
+    ret get ogq38_lo 1
+  end
+  if eq which OGQ38_BUF_AGG
+    ret get ogq38_lo 19
+  end
+  if eq which OGQ38_BUF_ATT
+    ret get ogq38_lo 20
+  end
+  if eq which OGQ38_BUF_O
+    ret get ogq38_lo 21
+  end
+  if eq which OGQ38_BUF_GU
+    ret get ogq38_lo 22
+  end
+  if eq which OGQ38_BUF_ACT
+    ret get ogq38_lo 23
+  end
+  if eq which OGQ38_BUF_HIDDEN
+    ret get ogq38_lo 2
+  end
+  ret 0
+end
+
+fn ogq38_launch_kcopy n ulong to long
+  gy = div add n sub OGQ38_COPY_ROW 1 OGQ38_COPY_ROW
+  L = new ulong 12 0
+  put L 0 get ogq38_mem 16
+  put L 1 64
+  put L 2 256
+  put L 3 1
+  put L 4 1
+  put L 5 gy
+  put L 6 mul gy OGQ38_COPY_ROW
+  put L 7 4
+  put L 8 20000
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  if or eq ogps_open 0 ne ogps_launch L args el mk OGPS_OK
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq38_read_buf which ulong n ulong to long
+  if or eq get ogq38_st 0 0 or ne get ogq38_st 11 0 ge which OGQ38_BUF_COUNT
+    ret OGDG_BAD_ARGS
+  end
+  if gt n ogq38_buf_cap which
+    ret OGDG_BAD_ARGS
+  end
+  ogps_lock
+  rc = OGDG_OK
+  from = ogq38_buf_off which
+  if and ge from get ogq38_lo 16 ne n 0
+    rc = ogq38_launch_kcopy n
+  end
+  if eq rc OGDG_OK
+    rc = ogq38_sync_buf_to_cpu
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn ogq38_set_stamps on ulong to void
+  if and ne get ogq38_st 0 0 eq get ogq38_st 11 0
+    if ne on 0
+      put ogq38_st 20 1
+    else
+      put ogq38_st 20 0
+    end
+  end
+end
+
+fn ogq38_stamps stamps_out edit ulong * kinds_out edit uchar * cap ulong to long
+  if or eq get ogq38_st 0 0 ne get ogq38_st 11 0
+    ret OGDG_BAD_ARGS
+  end
+  nk = get ogq38_st 21
+  ns = get ogq38_st 23
+  if or eq get ogq38_st 20 0 ne ns add nk 1
+    ogps_set_error ogq38_e_timeline
+    ret OGDG_BAD_ARGS
+  end
+  if lt cap ns
+    ogps_set_error ogq38_e_tl_small
+    ret OGDG_BAD_ARGS
+  end
+  for i ulong ns bound 65
+    put stamps_out i get ogq38_tl add 64 i
+  end
+  for i ulong nk bound 64
+    put kinds_out i uchar get ogq38_tl i
+  end
+  ret long nk
+end

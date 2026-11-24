@@ -1,0 +1,1699 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_q36_graph.om: Pure seeded OM-2 twin of src/omega_gpu_q36_graph.c.
+note One Qwen3.6-35B-A3B decode token / multi-head stroke / prefill chunk as command lists:
+note exact 256-byte aligned buf/dbuf split layout, gather/perm tables, exact two-pass head,
+note batched v2 stroke recording, host-grouped MoE prefill, timeline stamps, and read_buf.
+om2
+
+const OGQ36_HIDDEN ulong 2048
+const OGQ36_EXPERT_INTER ulong 512
+const OGQ36_GROUPS ulong 9
+const OGQ36_GDN_MIX ulong 12288
+const OGQ36_GDN_QKV ulong 8192
+const OGQ36_AB ulong 64
+const OGQ36_ATT_MIX ulong 9216
+const OGQ36_ATT_QKV ulong 5120
+const OGQ36_MIXER_OUT ulong 4096
+const OGQ36_ROTARY ulong 64
+const OGQ36_MAX_LAYERS ulong 64
+const OGQ36_MAX_HEADS ulong 8
+const OGQ36_N_EXPERTS ulong 257
+const OGQ36_TOKEN_STRIDE ulong 256
+const OGQ36_SEGD_ROWS ulong 2
+const OGQ36_SEG_BYTES ulong 32
+const OGQ36_COPY_ROW ulong 256
+const OGQ36_GR_PAD ulong 8
+const OGQ36_PF_MAX_ROWS ulong 128
+const OGQ36_PF_PAD ulong 8
+const OGQ36_PF_EXPERT_BYTES ulong 3145728
+const OGQ36_BF16_MAX_XBATCH ulong 4
+
+const OGQ36_K_NORM ulong 0
+const OGQ36_K_MIX ulong 1
+const OGQ36_K_AB ulong 2
+const OGQ36_K_GDN ulong 3
+const OGQ36_K_GATHER ulong 4
+const OGQ36_K_ATTN ulong 5
+const OGQ36_K_GATE ulong 6
+const OGQ36_K_O ulong 7
+const OGQ36_K_RES ulong 8
+const OGQ36_K_ROUTER ulong 9
+const OGQ36_K_GATE_UP ulong 10
+const OGQ36_K_SWIGLU ulong 11
+const OGQ36_K_DOWN ulong 12
+const OGQ36_K_LM_HEAD ulong 13
+const OGQ36_K_ARGMAX ulong 14
+const OGQ36_K_PERM ulong 15
+const OGQ36_K_GROUP ulong 16
+const OGQ36_K_COUNT ulong 17
+
+const OGQ36_BUF_X ulong 0
+const OGQ36_BUF_XQ ulong 1
+const OGQ36_BUF_MIX ulong 2
+const OGQ36_BUF_AB ulong 3
+const OGQ36_BUF_AGG ulong 4
+const OGQ36_BUF_ATT ulong 5
+const OGQ36_BUF_O ulong 6
+const OGQ36_BUF_GU ulong 7
+const OGQ36_BUF_ACT ulong 8
+const OGQ36_BUF_HIDDEN ulong 9
+const OGQ36_BUF_DN ulong 10
+const OGQ36_BUF_COUNT ulong 11
+
+note ogq36_st[32]: 0=live, 1=layers, 2=attn_mask, 3=vocab, 4=am_ctas, 5=heads, 6=cl,
+note   7=final_set, 8=head8, 9=xh_screen, 10=in_token, 11=failed, 12=stroke_heads,
+note   13=t_begin, 14=flush_each, 15=mutant, 16=batch, 17=pf_cap, 18=pf_ho, 19=pf_dof,
+note   20=pf_streamed, 21=pf_mutant, 22=pf_gdn_multi, 23=pf_attn_multi,
+note   24=stamps_on, 25=n_kind, 26=tagged, 27=n_stamp
+global ogq36_st ulong 32
+
+note ogq36_lo[43]: 0=x..14=ptab, 15=split, 16=xq..40=dnN, 41=bytes, 42=lb_stride
+global ogq36_lo ulong 43
+
+note ogq36_mem[64]: 0..5=buf, 6..11=dbuf, 12..17=code, 18..23=pf_hb, 24..29=pf_db,
+note   30..35=xh_mem, 36..42=xh_vas, 43..48=acc
+global ogq36_mem ulong 64
+
+note ogq36_lmeta[192]: 0..63=attn, 64..127=kind_idx, 128..191=set
+global ogq36_lmeta ulong 192
+
+note ogq36_hmeta[40]: 0..7=gdn_h, 8..15=attn_h, 16..23=xh_on, 24..31=hidden_ready, 32..39=xq_layer+1
+global ogq36_hmeta ulong 40
+
+note ogq36_tl[129]: 0..63=kinds, 64..128=stamps_buf
+global ogq36_tl ulong 129
+
+text ogq36_kn_0 "norm"
+text ogq36_kn_1 "mix"
+text ogq36_kn_2 "ab"
+text ogq36_kn_3 "gdn"
+text ogq36_kn_4 "gather"
+text ogq36_kn_5 "attn"
+text ogq36_kn_6 "gate"
+text ogq36_kn_7 "o_proj"
+text ogq36_kn_8 "res"
+text ogq36_kn_9 "router"
+text ogq36_kn_10 "gate_up"
+text ogq36_kn_11 "swiglu"
+text ogq36_kn_12 "down"
+text ogq36_kn_13 "lm_head"
+text ogq36_kn_14 "argmax"
+text ogq36_kn_15 "perm"
+text ogq36_kn_16 "group"
+text ogq36_kn_unk "?"
+
+text ogq36_e_layer "q36 graph: layer not set, out of order, or final norm missing"
+text ogq36_e_head "q36 graph: head not in the stroke"
+text ogq36_e_fnorm "q36 graph: final norm not set"
+text ogq36_e_batch "q36 graph: record_layer_heads needs set_batch"
+text ogq36_e_step "q36 graph: heads out of step"
+text ogq36_e_timeline "q36 graph: no timeline for the last token"
+text ogq36_e_tl_small "q36 graph: timeline buffers too small"
+
+fn ogq36_al v ulong to ulong
+  ret and add v 255 not ulong 255
+end
+
+fn ogq36_perm_slot idx ulong rotary ulong to ulong
+  half = div rotary 2
+  if lt idx 128
+    if lt idx half
+      ret idx
+    end
+    ret add rotary sub idx half
+  end
+  j = sub idx 128
+  if lt j half
+    ret add half j
+  end
+  ret idx
+end
+
+fn ogq36_gather_table tab edit uint 9216 to void
+  qp = ulong 8192
+  kp = ulong 8704
+  for n ulong OGQ36_ATT_MIX bound 9216
+    s = ulong 0
+    if lt n 4096
+      s = add mul div n 256 512 ogq36_perm_slot rem n 256 OGQ36_ROTARY
+    else
+      if lt n 4608
+        d = sub n 4096
+        s = add add qp mul div d 256 256 ogq36_perm_slot rem d 256 OGQ36_ROTARY
+      else
+        if lt n 5120
+          s = add kp sub n 4608
+        else
+          d = sub n 5120
+          s = add add mul div d 256 512 256 rem d 256
+        end
+      end
+    end
+    put tab n uint s
+  end
+end
+
+fn ogq36_perm_src i ulong to ulong
+  s0 = mul div i 512 512
+  idx = rem i 512
+  e = rem idx 4
+  t = div idx 4
+  L = rem t 32
+  w = div t 32
+  r = add s0 mul L 16
+  r = add r mul w 4
+  ret add r e
+end
+
+fn ogq36_perm_table tab edit uint * k ulong to void
+  if or eq k 0 ne rem k 512 0
+    ret
+  end
+  for i ulong k bound 65536
+    put tab i uint ogq36_perm_src i
+  end
+end
+
+fn ogq36_kind_name kind ulong dst edit uchar * to ulong
+  if eq kind 0
+    ret ogdg_copy_str ogq36_kn_0 dst
+  end
+  if eq kind 1
+    ret ogdg_copy_str ogq36_kn_1 dst
+  end
+  if eq kind 2
+    ret ogdg_copy_str ogq36_kn_2 dst
+  end
+  if eq kind 3
+    ret ogdg_copy_str ogq36_kn_3 dst
+  end
+  if eq kind 4
+    ret ogdg_copy_str ogq36_kn_4 dst
+  end
+  if eq kind 5
+    ret ogdg_copy_str ogq36_kn_5 dst
+  end
+  if eq kind 6
+    ret ogdg_copy_str ogq36_kn_6 dst
+  end
+  if eq kind 7
+    ret ogdg_copy_str ogq36_kn_7 dst
+  end
+  if eq kind 8
+    ret ogdg_copy_str ogq36_kn_8 dst
+  end
+  if eq kind 9
+    ret ogdg_copy_str ogq36_kn_9 dst
+  end
+  if eq kind 10
+    ret ogdg_copy_str ogq36_kn_10 dst
+  end
+  if eq kind 11
+    ret ogdg_copy_str ogq36_kn_11 dst
+  end
+  if eq kind 12
+    ret ogdg_copy_str ogq36_kn_12 dst
+  end
+  if eq kind 13
+    ret ogdg_copy_str ogq36_kn_13 dst
+  end
+  if eq kind 14
+    ret ogdg_copy_str ogq36_kn_14 dst
+  end
+  if eq kind 15
+    ret ogdg_copy_str ogq36_kn_15 dst
+  end
+  if eq kind 16
+    ret ogdg_copy_str ogq36_kn_16 dst
+  end
+  ret ogdg_copy_str ogq36_kn_unk dst
+end
+
+fn ogq36_va_of off ulong to ulong
+  sp = get ogq36_lo 15
+  if lt off sp
+    ret add get ogq36_mem 4 off
+  end
+  ret add get ogq36_mem 10 sub off sp
+end
+
+fn ogq36_compute_layout_host layers ulong heads ulong am_ctas ulong to ulong
+  o = ulong 0
+  put ogq36_lo 0 o
+  o = ogq36_al add o mul mul OGQ36_HIDDEN 4 heads
+  put ogq36_lo 1 o
+  o = ogq36_al add o mul OGQ36_AB 4
+  put ogq36_lo 2 o
+  o = ogq36_al add o mul mul OGQ36_HIDDEN 4 heads
+  put ogq36_lo 3 o
+  o = ogq36_al add o mul mul mul am_ctas OGDG_ARGMAX_SPAN 4 heads
+  put ogq36_lo 4 o
+  o = ogq36_al add o mul OGDG_ARGMAX_SPAN 4
+  put ogq36_lo 5 o
+  o = ogq36_al add o mul OGDG_ARGMAX_SPAN 4
+  put ogq36_lo 6 o
+  o = ogq36_al add o mul OGQ36_TOKEN_STRIDE heads
+  put ogq36_lo 7 o
+  o = ogq36_al add o mul mul layers OGQ36_HIDDEN 4
+  put ogq36_lo 8 o
+  o = ogq36_al add o mul OGQ36_HIDDEN 4
+  put ogq36_lo 9 o
+  o = ogq36_al add o add mul mul layers 4 16 16
+  put ogq36_lo 10 o
+  o = ogq36_al add o mul OGQ36_ATT_MIX 4
+  put ogq36_lo 11 o
+  o = ogq36_al add o mul OGQ36_COPY_ROW 4
+  put ogq36_lo 12 o
+  o = ogq36_al add o mul mul OGQ36_GROUPS OGQ36_HIDDEN 4
+  put ogq36_lo 13 o
+  o = ogq36_al add o mul mul layers OGQ36_SEGD_ROWS OGQ36_SEG_BYTES
+  put ogq36_lo 14 o
+  o = ogq36_al add o mul add add OGQ36_HIDDEN OGQ36_MIXER_OUT OGQ36_EXPERT_INTER 4
+  put ogq36_lo 15 o
+  ret o
+end
+
+fn ogq36_compute_layout_dev o0 ulong heads ulong lb_bytes ulong to ulong
+  o = o0
+  put ogq36_lo 16 o
+  o = ogq36_al add o mul mul OGQ36_HIDDEN 4 heads
+  put ogq36_lo 17 o
+  o = ogq36_al add o mul OGQ36_GDN_MIX 4
+  put ogq36_lo 18 o
+  o = ogq36_al add o mul OGQ36_ATT_MIX 4
+  put ogq36_lo 19 o
+  o = ogq36_al add o mul OGQ36_MIXER_OUT 4
+  put ogq36_lo 20 o
+  o = ogq36_al add o mul OGQ36_HIDDEN 4
+  put ogq36_lo 21 o
+  o = ogq36_al add o mul mul OGQ36_GROUPS mul 2 OGQ36_EXPERT_INTER 4
+  put ogq36_lo 22 o
+  o = ogq36_al add o mul mul OGQ36_GROUPS OGQ36_EXPERT_INTER 4
+  put ogq36_lo 23 o
+  o = ogq36_al add o mul mul OGQ36_GROUPS OGQ36_HIDDEN 4
+  lbs = ogq36_al lb_bytes
+  put ogq36_lo 42 lbs
+  r = mul heads OGQ36_GROUPS
+  m8 = OGQ36_MAX_HEADS
+  put ogq36_lo 24 o
+  o = ogq36_al add o mul mul m8 OGQ36_HIDDEN 4
+  put ogq36_lo 25 o
+  o = ogq36_al add o mul mul heads OGQ36_GDN_MIX 4
+  put ogq36_lo 26 o
+  o = ogq36_al add o mul mul heads OGQ36_AB 4
+  put ogq36_lo 27 o
+  o = ogq36_al add o mul mul heads OGQ36_ATT_MIX 4
+  put ogq36_lo 28 o
+  o = ogq36_al add o mul mul heads OGQ36_MIXER_OUT 4
+  put ogq36_lo 29 o
+  o = ogq36_al add o mul mul m8 OGQ36_MIXER_OUT 4
+  put ogq36_lo 30 o
+  o = ogq36_al add o mul mul heads OGQ36_HIDDEN 4
+  put ogq36_lo 31 o
+  o = ogq36_al add o mul heads lbs
+  put ogq36_lo 32 o
+  o = ogq36_al add o mul r OGQ36_SEG_BYTES
+  put ogq36_lo 33 o
+  o = ogq36_al add o mul r OGQ36_SEG_BYTES
+  put ogq36_lo 34 o
+  o = ogq36_al add o mul add r OGQ36_GR_PAD 4
+  put ogq36_lo 35 o
+  o = ogq36_al add o mul add r OGQ36_GR_PAD 4
+  put ogq36_lo 36 o
+  o = ogq36_al add o mul mul m8 OGQ36_HIDDEN 4
+  put ogq36_lo 37 o
+  o = ogq36_al add o mul mul r mul 2 OGQ36_EXPERT_INTER 4
+  put ogq36_lo 38 o
+  o = ogq36_al add o mul mul r OGQ36_EXPERT_INTER 4
+  put ogq36_lo 39 o
+  o = ogq36_al add o mul mul r OGQ36_EXPERT_INTER 4
+  put ogq36_lo 40 o
+  o = ogq36_al add o mul mul r OGQ36_HIDDEN 4
+  put ogq36_lo 41 o
+  ret o
+end
+
+fn ogq36_free_mem_slot base ulong to void
+  tmp = new ulong 6 0
+  for i ulong 6
+    put tmp i get ogq36_mem add base i
+    put ogq36_mem add base i 0
+  end
+  ogps_free tmp
+end
+
+fn ogq36_free to void
+  if eq get ogq36_st 0 0
+    ret
+  end
+  if ne get ogq36_st 6 0
+    ogcl_free get ogq36_st 6
+    put ogq36_st 6 0
+  end
+  ogps_lock
+  for w ulong 6
+    ogq36_free_mem_slot mul w 6
+  end
+  ogps_unlock
+  for i ulong 32
+    put ogq36_st i 0
+  end
+end
+
+fn ogq36_alloc_device sp ulong tot ulong to bool
+  ogps_lock
+  ok = ne ogps_open 0
+  bm = new ulong 6 0
+  dm = new ulong 6 0
+  cm = new ulong 6 0
+  if ok
+    if ne ogps_alloc sp bm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if ne ogps_alloc sub tot sp dm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if ne ogps_alloc_code 512 cm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if or ne ogps_sync_to_gpu bm OGPS_OK ne ogps_sync_to_gpu dm OGPS_OK
+      ok = false
+    end
+  end
+  if not ok
+    ogps_free bm
+    ogps_free dm
+    ogps_free cm
+    ogps_unlock
+    ret false
+  end
+  ogps_unlock
+  for i ulong 64
+    put ogq36_mem i 0
+  end
+  for i ulong 6
+    put ogq36_mem i get bm i
+    put ogq36_mem add 6 i get dm i
+    put ogq36_mem add 12 i get cm i
+  end
+  ret true
+end
+
+fn ogq36_init_state cfg view ulong 10 am_ctas ulong heads ulong cl_id ulong to void
+  layers = get cfg 0
+  amask = get cfg 1
+  na = ulong 0
+  ng = ulong 0
+  for l ulong 64
+    put ogq36_lmeta add 128 l 0
+    if lt l layers
+      is_a = and shr amask l 1
+      put ogq36_lmeta l is_a
+      if ne is_a 0
+        put ogq36_lmeta add 64 l na
+        na = add na 1
+      else
+        put ogq36_lmeta add 64 l ng
+        ng = add ng 1
+      end
+    end
+  end
+  for i ulong 40
+    put ogq36_hmeta i 0
+  end
+  put ogq36_hmeta 0 get cfg 5
+  put ogq36_hmeta 8 get cfg 6
+  for i ulong 32
+    put ogq36_st i 0
+  end
+  put ogq36_st 0 1
+  put ogq36_st 1 layers
+  put ogq36_st 2 amask
+  put ogq36_st 3 get cfg 2
+  put ogq36_st 4 am_ctas
+  put ogq36_st 5 heads
+  put ogq36_st 6 cl_id
+  put ogq36_st 22 1
+  put ogq36_st 23 1
+end
+
+fn ogq36_create_heads cfg view ulong 10 heads ulong to long
+  if or eq heads 0 gt heads OGQ36_MAX_HEADS
+    ret OGDG_BAD_ARGS
+  end
+  layers = get cfg 0
+  amask = get cfg 1
+  vocab = get cfg 2
+  max_vocab = mul OGDG_ARGMAX_SPAN OGDG_ARGMAX_SPAN
+  if or eq layers 0 gt layers OGQ36_MAX_LAYERS
+    ret OGDG_BAD_ARGS
+  end
+  if or eq get cfg 5 0 eq get cfg 6 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq get cfg 7 0 eq vocab 0
+    ret OGDG_BAD_ARGS
+  end
+  if gt vocab max_vocab
+    ret OGDG_BAD_ARGS
+  end
+  if lt layers 64
+    if ne shr amask layers 0
+      ret OGDG_BAD_ARGS
+    end
+  end
+  if or ne get cfg 8 vocab ne get cfg 9 OGQ36_HIDDEN
+    ret OGDG_BAD_ARGS
+  end
+  am_ctas = div add vocab sub OGDG_ARGMAX_SPAN 1 OGDG_ARGMAX_SPAN
+  sp = ogq36_compute_layout_host layers heads am_ctas
+  tot = ogq36_compute_layout_dev sp heads get cfg 7
+  cid = new ulong 1 0
+  if ne ogcl_create OGCL_SLOTS_PER_LIST cid 0
+    ret OGDG_CHIP_FAIL
+  end
+  if not ogq36_alloc_device sp tot
+    ogcl_free get cid 0
+    ret OGDG_CHIP_FAIL
+  end
+  ogq36_init_state cfg am_ctas heads get cid 0
+  ret OGDG_OK
+end
+
+fn ogq36_create cfg view ulong 10 to long
+  ret ogq36_create_heads cfg 1
+end
+
+fn ogq36_set_head_state head ulong gdn_id ulong attn_id ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ge head get ogq36_st 5 or eq gdn_id 0 eq attn_id 0
+    ret OGDG_BAD_ARGS
+  end
+  put ogq36_hmeta head gdn_id
+  put ogq36_hmeta add 8 head attn_id
+  ret OGDG_OK
+end
+
+fn ogq36_set_layer layer ulong shapes view ulong 12 has_ab ulong has_norm ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ge layer get ogq36_st 1 eq has_norm 0
+    ret OGDG_BAD_ARGS
+  end
+  is_a = get ogq36_lmeta layer
+  want_mix = OGQ36_GDN_MIX
+  if ne is_a 0
+    want_mix = OGQ36_ATT_MIX
+  end
+  if or ne get shapes 0 1 or ne get shapes 1 want_mix ne get shapes 2 OGQ36_HIDDEN
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 5 1 or ne get shapes 6 OGQ36_HIDDEN ne get shapes 7 OGQ36_MIXER_OUT
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 8 OGQ36_N_EXPERTS ne get shapes 9 mul 2 OGQ36_EXPERT_INTER
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get shapes 10 OGQ36_N_EXPERTS ne get shapes 11 OGQ36_HIDDEN
+    ret OGDG_BAD_ARGS
+  end
+  if ne is_a 0
+    if ne has_ab 0
+      ret OGDG_BAD_ARGS
+    end
+  else
+    if eq has_ab 0
+      ret OGDG_BAD_ARGS
+    end
+    if or ne get shapes 3 OGQ36_AB ne get shapes 4 OGQ36_HIDDEN
+      ret OGDG_BAD_ARGS
+    end
+  end
+  put ogq36_lmeta add 128 layer 1
+  ret OGDG_OK
+end
+
+fn ogq36_set_final_norm has_norm ulong to long
+  if or eq get ogq36_st 0 0 or ne get ogq36_st 10 0 eq has_norm 0
+    ret OGDG_BAD_ARGS
+  end
+  put ogq36_st 7 1
+  ret OGDG_OK
+end
+
+fn ogq36_set_lm_head_fp8 present ulong n ulong k ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if eq present 0
+    put ogq36_st 8 0
+    ret OGDG_OK
+  end
+  if or ne n get ogq36_st 3 ne k OGQ36_HIDDEN
+    ret OGDG_BAD_ARGS
+  end
+  put ogq36_st 8 1
+  ret OGDG_OK
+end
+
+fn ogq36_alloc_exact_head n ulong to long
+  p = mul get ogq36_st 4 OGDG_ARGMAX_SPAN
+  o = ulong 0
+  put ogq36_mem 36 o
+  o = ogq36_al add o mul OGQ36_HIDDEN 4
+  put ogq36_mem 37 o
+  o = ogq36_al add o mul n 4
+  put ogq36_mem 38 o
+  o = ogq36_al add o mul n 4
+  put ogq36_mem 39 o
+  o = ogq36_al add o mul n 4
+  put ogq36_mem 40 o
+  o = ogq36_al add o mul p 4
+  put ogq36_mem 41 o
+  o = ogq36_al add o 16
+  put ogq36_mem 42 o
+  tot = ogq36_al add o 16
+  xm = new ulong 6 0
+  ogps_lock
+  rc = ogps_alloc tot xm
+  if eq rc OGPS_OK
+    rc = ogps_sync_to_gpu xm
+  end
+  if ne rc OGPS_OK
+    ogps_free xm
+    ogps_unlock
+    ret OGDG_CHIP_FAIL
+  end
+  ogps_unlock
+  for i ulong 6
+    put ogq36_mem add 30 i get xm i
+  end
+  base = get xm 4
+  for i ulong 7
+    put ogq36_mem add 36 i add base get ogq36_mem add 36 i
+  end
+  put ogq36_st 9 1
+  for h ulong OGQ36_MAX_HEADS
+    put ogq36_hmeta add 16 h 1
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_set_exact_head present ulong has_coef ulong n ulong k ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if eq present 0
+    ogps_lock
+    ogq36_free_mem_slot 30
+    ogps_unlock
+    put ogq36_st 9 0
+    for h ulong OGQ36_MAX_HEADS
+      put ogq36_hmeta add 16 h 0
+    end
+    ret OGDG_OK
+  end
+  if or eq has_coef 0 ne get ogq36_st 9 0
+    ret OGDG_BAD_ARGS
+  end
+  if or ne n get ogq36_st 3 ne k OGQ36_HIDDEN
+    ret OGDG_BAD_ARGS
+  end
+  ret ogq36_alloc_exact_head n
+end
+
+fn ogq36_set_exact_head_on on ulong to void
+  if and ne get ogq36_st 0 0 eq get ogq36_st 10 0
+    v = ulong 0
+    if ne on 0
+      v = ulong 1
+    end
+    for h ulong OGQ36_MAX_HEADS
+      put ogq36_hmeta add 16 h v
+    end
+  end
+end
+
+fn ogq36_set_head_exact_head_on head ulong on ulong to void
+  if and ne get ogq36_st 0 0 and eq get ogq36_st 10 0 lt head OGQ36_MAX_HEADS
+    v = ulong 0
+    if ne on 0
+      v = ulong 1
+    end
+    put ogq36_hmeta add 16 head v
+  end
+end
+
+fn ogq36_exact_head_active_head head ulong to ulong
+  if or eq get ogq36_st 0 0 ge head OGQ36_MAX_HEADS
+    ret 0
+  end
+  if and ne get ogq36_st 9 0 and ne get ogq36_hmeta add 16 head 0 eq get ogq36_st 8 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ogq36_exact_head_active to ulong
+  ret ogq36_exact_head_active_head 0
+end
+
+fn ogq36_set_flush_each on ulong to void
+  if ne get ogq36_st 0 0
+    if ne on 0
+      put ogq36_st 14 1
+    else
+      put ogq36_st 14 0
+    end
+  end
+end
+
+fn ogq36_test_set_mutant mutant ulong to void
+  if ne get ogq36_st 0 0
+    put ogq36_st 15 mutant
+  end
+end
+
+fn ogq36_set_batch on ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if eq on 0
+    put ogq36_st 16 0
+    ret OGDG_OK
+  end
+  put ogq36_st 16 1
+  ret OGDG_OK
+end
+
+fn ogq36_batch to ulong
+  if eq get ogq36_st 0 0
+    ret 0
+  end
+  ret get ogq36_st 16
+end
+
+fn ogq36_submit_now to long
+  cid = get ogq36_st 6
+  n = ogcl_count cid
+  if eq n 0
+    ret OGDG_OK
+  end
+  opts = new ulong 7 0
+  put opts 0 OGCL_MODE_PCAS
+  put opts 1 ogdg_barrier
+  put opts 2 20000
+  put opts 4 get ogq36_st 24
+  st = new ulong 7 0
+  rc = ogcl_submit cid opts st
+  put ogq36_mem 43 add get ogq36_mem 43 get st 0
+  put ogq36_mem 44 add get ogq36_mem 44 get st 1
+  put ogq36_mem 45 add get ogq36_mem 45 get st 3
+  put ogq36_mem 48 add get ogq36_mem 48 get st 5
+  tmp = new ulong 65 0
+  if and eq rc 0 ne get ogq36_st 24 0
+    cnt = ogcl_stamps cid tmp 65
+    if lt cnt 0
+      rc = long -1
+    else
+      from = ulong 0
+      if ne get ogq36_st 27 0
+        from = ulong 1
+      end
+      i = from
+      while lt i ulong cnt bound 65
+        ns = get ogq36_st 27
+        if lt ns 65
+          put ogq36_tl add 64 ns get tmp i
+          put ogq36_st 27 add ns 1
+        end
+        i = add i 1
+      end
+    end
+  end
+  put ogq36_st 26 0
+  ogcl_reset cid
+  if or ne rc 0 ne get st 5 get st 0
+    put ogq36_st 11 1
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_ensure_room need ulong to long
+  if ge add ogcl_count get ogq36_st 6 need OGCL_SLOTS_PER_LIST
+    ret ogq36_submit_now
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_tag kind ulong to void
+  n = ogcl_count get ogq36_st 6
+  t = get ogq36_st 26
+  while and lt t n lt get ogq36_st 25 64 bound 64
+    nk = get ogq36_st 25
+    put ogq36_tl nk kind
+    put ogq36_st 25 add nk 1
+    t = add t 1
+  end
+  put ogq36_st 26 t
+end
+
+fn ogq36_add_op kind ulong gx ulong gy ulong elems ulong to long
+  erc = ogq36_ensure_room 1
+  if ne erc OGDG_OK
+    ret erc
+  end
+  L = new ulong 12 0
+  put L 0 get ogq36_mem 16
+  put L 1 64
+  put L 2 256
+  put L 3 1
+  put L 4 gx
+  put L 5 gy
+  put L 6 elems
+  put L 7 4
+  put L 8 20000
+  args = new uint 4 0
+  put args 0 uint kind
+  put args 1 uint gx
+  put args 2 uint gy
+  put args 3 uint elems
+  rc = ogcl_add get ogq36_st 6 L args
+  if lt rc 0
+    put ogq36_st 11 1
+    ret OGDG_CHIP_FAIL
+  end
+  ogq36_tag kind
+  if ne get ogq36_st 14 0
+    ret ogq36_submit_now
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_begin_stroke heads ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq heads 0 gt heads get ogq36_st 5
+    ret OGDG_BAD_ARGS
+  end
+  h = ulong 1
+  while lt h heads bound 8
+    if or eq get ogq36_hmeta h 0 eq get ogq36_hmeta add 8 h 0
+      ret OGDG_BAD_ARGS
+    end
+    h = add h 1
+  end
+  ogps_lock
+  put ogq36_st 13 ogps_now_ns
+  put ogq36_st 10 1
+  put ogq36_st 11 0
+  put ogq36_st 12 heads
+  for j ulong heads bound 8
+    put ogq36_hmeta add 32 j 0
+    put ogq36_hmeta add 24 j 0
+  end
+  for i ulong 6
+    put ogq36_mem add 43 i 0
+  end
+  put ogq36_st 25 0
+  put ogq36_st 26 0
+  put ogq36_st 27 0
+  ogcl_reset get ogq36_st 6
+  if eq ogps_open 0
+    put ogq36_st 11 1
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_begin_token to long
+  ret ogq36_begin_stroke 1
+end
+
+fn ogq36_record_head_layer h ulong l ulong pos ulong to long
+  if or eq get ogq36_st 0 0 eq get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq36_st 11 0
+    ret OGDG_CHIP_FAIL
+  end
+  if ge h get ogq36_st 12
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_head
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq36_st 1
+  last = eq add l 1 layers
+  if ge l layers
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if eq get ogq36_lmeta add 128 l 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq36_hmeta add 24 h 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if and last eq get ogq36_st 7 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  rc = OGDG_OK
+  if ne get ogq36_hmeta add 32 h add l 1
+    rc = ogq36_add_op OGQ36_K_NORM 1 1 OGQ36_HIDDEN
+  end
+  is_a = get ogq36_lmeta l
+  if eq is_a 0
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_MIX 1 1 OGQ36_GDN_MIX
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_AB 1 1 OGQ36_AB
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_GDN 1 1 OGQ36_MIXER_OUT
+    end
+  else
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_MIX 1 1 OGQ36_ATT_MIX
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_GATHER div OGQ36_ATT_MIX 256 1 OGQ36_ATT_MIX
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_ATTN 1 1 OGQ36_MIXER_OUT
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_GATE div OGQ36_MIXER_OUT 256 1 OGQ36_MIXER_OUT
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_O 1 1 OGQ36_HIDDEN
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_RES 1 1 OGQ36_HIDDEN
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_ROUTER 1 1 OGQ36_GROUPS
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_GATE_UP 1 OGQ36_GROUPS mul OGQ36_GROUPS mul 2 OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_SWIGLU div OGQ36_EXPERT_INTER 256 OGQ36_GROUPS mul OGQ36_GROUPS OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_DOWN 1 OGQ36_GROUPS mul OGQ36_GROUPS OGQ36_HIDDEN
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_RES 1 1 OGQ36_HIDDEN
+    if eq rc OGDG_OK
+      if last
+        put ogq36_hmeta add 24 h 1
+      else
+        put ogq36_hmeta add 32 h add l 2
+      end
+    end
+  end
+  ret rc
+end
+
+fn ogq36_record_layer l ulong pos ulong to long
+  ret ogq36_record_head_layer 0 l pos
+end
+
+fn ogq36_record_layer_heads l ulong pos view uint * to long
+  if or eq get ogq36_st 0 0 eq get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq36_st 11 0
+    ret OGDG_CHIP_FAIL
+  end
+  if eq get ogq36_st 16 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_batch
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq36_st 1
+  last = eq add l 1 layers
+  if or ge l layers eq get ogq36_lmeta add 128 l 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if and last eq get ogq36_st 7 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  n = get ogq36_st 12
+  r = mul n OGQ36_GROUPS
+  xl0 = get ogq36_hmeta 32
+  for h ulong n bound 8
+    if ne get ogq36_hmeta add 24 h 0
+      put ogq36_st 11 1
+      ogps_set_error ogq36_e_step
+      ret OGDG_BAD_ARGS
+    end
+    if ne get ogq36_hmeta add 32 h xl0
+      put ogq36_st 11 1
+      ogps_set_error ogq36_e_step
+      ret OGDG_BAD_ARGS
+    end
+  end
+  rc = OGDG_OK
+  if ne xl0 add l 1
+    rc = ogq36_add_op OGQ36_K_NORM 1 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_PERM div OGQ36_HIDDEN 256 n mul OGQ36_HIDDEN n
+  end
+  is_a = get ogq36_lmeta l
+  if eq is_a 0
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_AB 1 n mul OGQ36_AB n
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_MIX 1 n mul OGQ36_GDN_MIX n
+    end
+    for h ulong n bound 8
+      if eq rc OGDG_OK
+        rc = ogq36_add_op OGQ36_K_GDN 1 1 OGQ36_MIXER_OUT
+      end
+      if eq rc OGDG_OK
+        rc = ogq36_add_op OGQ36_K_PERM div OGQ36_MIXER_OUT 256 1 OGQ36_MIXER_OUT
+      end
+    end
+  else
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_MIX 1 n mul OGQ36_ATT_MIX n
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_GATHER div OGQ36_ATT_MIX 256 n mul OGQ36_ATT_MIX n
+    end
+    for h ulong n bound 8
+      if eq rc OGDG_OK
+        rc = ogq36_add_op OGQ36_K_ATTN 1 1 OGQ36_MIXER_OUT
+      end
+      if eq rc OGDG_OK
+        rc = ogq36_add_op OGQ36_K_GATE div OGQ36_MIXER_OUT 256 1 OGQ36_MIXER_OUT
+      end
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_PERM div OGQ36_MIXER_OUT 256 n mul OGQ36_MIXER_OUT n
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_O 1 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_RES 1 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_ROUTER 1 n r
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_GROUP 1 1 r
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_PERM div OGQ36_HIDDEN 256 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_GATE_UP 1 r mul r mul 2 OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_SWIGLU div OGQ36_EXPERT_INTER 256 r mul r OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_PERM div OGQ36_EXPERT_INTER 256 r mul r OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_DOWN 1 r mul r OGQ36_HIDDEN
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_RES 1 n mul OGQ36_HIDDEN n
+    if eq rc OGDG_OK
+      for h ulong n bound 8
+        if last
+          put ogq36_hmeta add 24 h 1
+        else
+          put ogq36_hmeta add 32 h add l 2
+        end
+      end
+    end
+  end
+  ret rc
+end
+
+fn ogq36_rec_argmax to long
+  ctas = get ogq36_st 4
+  rc = ogq36_add_op OGQ36_K_ARGMAX ctas 1 mul ctas OGDG_ARGMAX_SPAN
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_ARGMAX 1 1 OGDG_ARGMAX_SPAN
+  end
+  ret rc
+end
+
+fn ogq36_record_head_final h ulong to long
+  if or eq get ogq36_st 0 0 eq get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogq36_st 11 0
+    ret OGDG_CHIP_FAIL
+  end
+  if ge h get ogq36_st 12
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_head
+    ret OGDG_BAD_ARGS
+  end
+  if eq get ogq36_st 7 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_fnorm
+    ret OGDG_BAD_ARGS
+  end
+  rc = OGDG_OK
+  if eq get ogq36_hmeta add 24 h 0
+    rc = ogq36_add_op OGQ36_K_NORM 1 1 OGQ36_HIDDEN
+  end
+  if and eq rc OGDG_OK ne ogq36_exact_head_active_head h 0
+    v = get ogq36_st 3
+    rc = ogq36_add_op OGQ36_K_LM_HEAD div OGQ36_HIDDEN 256 1 OGQ36_HIDDEN
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_LM_HEAD 1 1 v
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_LM_HEAD div add v 255 256 1 v
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_rec_argmax
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_LM_HEAD 1 1 v
+    end
+  else
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_LM_HEAD 1 1 get ogq36_st 3
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_rec_argmax
+  end
+  ret rc
+end
+
+fn ogq36_record_final to long
+  ret ogq36_record_head_final 0
+end
+
+fn ogq36_record_final_heads to long
+  if eq get ogq36_st 7 0
+    put ogq36_st 11 1
+    ogps_set_error ogq36_e_fnorm
+    ret OGDG_BAD_ARGS
+  end
+  n = get ogq36_st 12
+  for h ulong n bound 8
+    if eq get ogq36_hmeta add 24 h 0
+      put ogq36_st 11 1
+      ret OGDG_BAD_ARGS
+    end
+  end
+  rc = OGDG_OK
+  h0 = ulong 0
+  while and lt h0 n eq rc OGDG_OK bound 8
+    xb = sub n h0
+    if gt xb OGQ36_BF16_MAX_XBATCH
+      xb = OGQ36_BF16_MAX_XBATCH
+    end
+    rc = ogq36_add_op OGQ36_K_LM_HEAD 1 xb mul get ogq36_st 3 xb
+    h0 = add h0 xb
+  end
+  for h ulong n bound 8
+    if eq rc OGDG_OK
+      rc = ogq36_rec_argmax
+    end
+  end
+  ret rc
+end
+
+fn ogq36_sync_buf_to_cpu to long
+  bm = new ulong 6 0
+  for i ulong 6
+    put bm i get ogq36_mem i
+  end
+  if ne ogps_sync_to_cpu bm OGPS_OK
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_end_stroke toks edit uint * st_out edit ulong 6 to long
+  if or eq get ogq36_st 0 0 eq get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  rc = OGDG_OK
+  if ne get ogq36_st 11 0
+    rc = OGDG_CHIP_FAIL
+  end
+  t_rec = ogps_now_ns
+  if eq rc OGDG_OK
+    rc = ogq36_submit_now
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_sync_buf_to_cpu
+  end
+  if eq rc OGDG_OK
+    n = get ogq36_st 12
+    if ge len toks n
+      for h ulong n bound 8
+        put toks h 0
+      end
+    end
+  end
+  ogcl_reset get ogq36_st 6
+  put ogq36_st 10 0
+  t_end = ogps_now_ns
+  t0 = get ogq36_st 13
+  for i ulong 6
+    put st_out i get ogq36_mem add 43 i
+  end
+  if ne get ogq36_st 14 0
+    if ge t_end t0
+      put st_out 3 sub t_end t0
+    end
+  else
+    if ge t_rec t0
+      put st_out 3 sub t_rec t0
+    end
+  end
+  if ge t_end t0
+    put st_out 4 sub t_end t0
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn ogq36_end_token tok edit uint 1 st_out edit ulong 6 to long
+  ret ogq36_end_stroke tok st_out
+end
+
+fn ogq36_token pos ulong tok edit uint 1 st_out edit ulong 6 to long
+  if eq get ogq36_st 0 0
+    ret OGDG_BAD_ARGS
+  end
+  brc = ogq36_begin_token
+  if eq brc OGDG_BAD_ARGS
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq36_st 1
+  for l ulong layers bound 64
+    if eq get ogq36_st 11 0
+      ign = ogq36_record_layer l pos
+    end
+  end
+  if eq get ogq36_st 11 0
+    ign2 = ogq36_record_final
+  end
+  ret ogq36_end_token tok st_out
+end
+
+fn ogq36_stroke pos view uint * heads ulong toks edit uint * st_out edit ulong 6 to long
+  if eq get ogq36_st 0 0
+    ret OGDG_BAD_ARGS
+  end
+  brc = ogq36_begin_stroke heads
+  if eq brc OGDG_BAD_ARGS
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq36_st 1
+  for l ulong layers bound 64
+    if eq get ogq36_st 11 0
+      if ne get ogq36_st 16 0
+        ign = ogq36_record_layer_heads l pos
+      else
+        for h ulong heads bound 8
+          if eq get ogq36_st 11 0
+            ign2 = ogq36_record_head_layer h l ulong get pos h
+          end
+        end
+      end
+    end
+  end
+  if and ne get ogq36_st 16 0 eq get ogq36_st 8 0
+    if eq get ogq36_st 11 0
+      ign3 = ogq36_record_final_heads
+    end
+  else
+    for h ulong heads bound 8
+      if eq get ogq36_st 11 0
+        ign4 = ogq36_record_head_final h
+      end
+    end
+  end
+  ret ogq36_end_stroke toks st_out
+end
+
+fn ogq36_read_head h ulong to long
+  if or eq get ogq36_st 0 0 or ne get ogq36_st 10 0 ge h get ogq36_st 5
+    ret OGDG_BAD_ARGS
+  end
+  ogps_lock
+  bm = new ulong 6 0
+  for i ulong 6
+    put bm i get ogq36_mem i
+  end
+  rc = ogps_sync_to_cpu bm
+  ogps_unlock
+  if ne rc OGPS_OK
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_read to long
+  ret ogq36_read_head 0
+end
+
+fn ogq36_buf_cap which ulong to ulong
+  if eq which OGQ36_BUF_X
+    ret OGQ36_HIDDEN
+  end
+  if eq which OGQ36_BUF_XQ
+    ret OGQ36_HIDDEN
+  end
+  if eq which OGQ36_BUF_MIX
+    ret OGQ36_GDN_MIX
+  end
+  if eq which OGQ36_BUF_AB
+    ret OGQ36_AB
+  end
+  if eq which OGQ36_BUF_AGG
+    ret OGQ36_ATT_MIX
+  end
+  if eq which OGQ36_BUF_ATT
+    ret OGQ36_MIXER_OUT
+  end
+  if eq which OGQ36_BUF_O
+    ret OGQ36_HIDDEN
+  end
+  if eq which OGQ36_BUF_GU
+    ret mul OGQ36_GROUPS mul 2 OGQ36_EXPERT_INTER
+  end
+  if eq which OGQ36_BUF_ACT
+    ret mul OGQ36_GROUPS OGQ36_EXPERT_INTER
+  end
+  if eq which OGQ36_BUF_HIDDEN
+    ret OGQ36_HIDDEN
+  end
+  if eq which OGQ36_BUF_DN
+    ret mul OGQ36_GROUPS OGQ36_HIDDEN
+  end
+  ret 0
+end
+
+fn ogq36_buf_off which ulong to ulong
+  if eq which OGQ36_BUF_X
+    ret get ogq36_lo 0
+  end
+  if eq which OGQ36_BUF_XQ
+    ret get ogq36_lo 16
+  end
+  if eq which OGQ36_BUF_MIX
+    ret get ogq36_lo 17
+  end
+  if eq which OGQ36_BUF_AB
+    ret get ogq36_lo 1
+  end
+  if eq which OGQ36_BUF_AGG
+    ret get ogq36_lo 18
+  end
+  if eq which OGQ36_BUF_ATT
+    ret get ogq36_lo 19
+  end
+  if eq which OGQ36_BUF_O
+    ret get ogq36_lo 20
+  end
+  if eq which OGQ36_BUF_GU
+    ret get ogq36_lo 21
+  end
+  if eq which OGQ36_BUF_ACT
+    ret get ogq36_lo 22
+  end
+  if eq which OGQ36_BUF_HIDDEN
+    ret get ogq36_lo 2
+  end
+  if eq which OGQ36_BUF_DN
+    ret get ogq36_lo 23
+  end
+  ret 0
+end
+
+fn ogq36_launch_kcopy n ulong to long
+  gy = div add n sub OGQ36_COPY_ROW 1 OGQ36_COPY_ROW
+  L = new ulong 12 0
+  put L 0 get ogq36_mem 16
+  put L 1 64
+  put L 2 256
+  put L 3 1
+  put L 4 1
+  put L 5 gy
+  put L 6 mul gy OGQ36_COPY_ROW
+  put L 7 4
+  put L 8 20000
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  if or eq ogps_open 0 ne ogps_launch L args el mk OGPS_OK
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogq36_read_buf which ulong n ulong to long
+  if or eq get ogq36_st 0 0 or ne get ogq36_st 10 0 ge which OGQ36_BUF_COUNT
+    ret OGDG_BAD_ARGS
+  end
+  if gt n ogq36_buf_cap which
+    ret OGDG_BAD_ARGS
+  end
+  ogps_lock
+  rc = OGDG_OK
+  from = ogq36_buf_off which
+  if and ge from get ogq36_lo 15 ne n 0
+    rc = ogq36_launch_kcopy n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_sync_buf_to_cpu
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn ogq36_set_stamps on ulong to void
+  if and ne get ogq36_st 0 0 eq get ogq36_st 10 0
+    if ne on 0
+      put ogq36_st 24 1
+    else
+      put ogq36_st 24 0
+    end
+  end
+end
+
+fn ogq36_stamps stamps_out edit ulong * kinds_out edit uchar * cap ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  nk = get ogq36_st 25
+  ns = get ogq36_st 27
+  if or eq get ogq36_st 24 0 ne ns add nk 1
+    ogps_set_error ogq36_e_timeline
+    ret OGDG_BAD_ARGS
+  end
+  if lt cap ns
+    ogps_set_error ogq36_e_tl_small
+    ret OGDG_BAD_ARGS
+  end
+  for i ulong ns bound 65
+    put stamps_out i get ogq36_tl add 64 i
+  end
+  for i ulong nk bound 64
+    put kinds_out i uchar get ogq36_tl i
+  end
+  ret long nk
+end
+
+fn ogq36_prefill_alloc cap ulong to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq cap 0 gt cap OGQ36_PF_MAX_ROWS
+    ret OGDG_BAD_ARGS
+  end
+  if ge get ogq36_st 17 cap
+    ret OGDG_OK
+  end
+  r = mul cap OGQ36_GROUPS
+  rr = mul cap sub OGQ36_GROUPS 1
+  lbs = get ogq36_lo 42
+  ho = ogq36_al mul mul cap OGQ36_HIDDEN 4
+  ho = add ho ogq36_al mul cap lbs
+  ho = add ho ogq36_al mul 256 OGQ36_SEG_BYTES
+  ho = add ho ogq36_al mul 256 OGQ36_SEG_BYTES
+  ho = add ho ogq36_al OGQ36_SEG_BYTES
+  ho = add ho ogq36_al OGQ36_SEG_BYTES
+  ho = add ho ogq36_al mul add rr OGQ36_PF_PAD 4
+  ho = add ho ogq36_al mul add rr OGQ36_PF_PAD 4
+  ho = add ho ogq36_al mul add cap OGQ36_PF_PAD 4
+  ho = add ho ogq36_al mul add cap OGQ36_PF_PAD 4
+  dof = ogq36_al mul mul cap OGQ36_HIDDEN 4
+  dof = add dof ogq36_al mul mul add cap OGQ36_PF_PAD OGQ36_HIDDEN 4
+  dof = add dof ogq36_al mul mul cap OGQ36_GDN_MIX 4
+  dof = add dof ogq36_al mul mul cap OGQ36_AB 4
+  dof = add dof ogq36_al mul mul cap OGQ36_ATT_MIX 4
+  dof = add dof ogq36_al mul mul cap OGQ36_MIXER_OUT 4
+  dof = add dof ogq36_al mul mul add cap OGQ36_PF_PAD OGQ36_MIXER_OUT 4
+  dof = add dof ogq36_al mul mul cap OGQ36_HIDDEN 4
+  dof = add dof ogq36_al mul mul add cap OGQ36_PF_PAD OGQ36_HIDDEN 4
+  dof = add dof ogq36_al mul mul r mul 2 OGQ36_EXPERT_INTER 4
+  dof = add dof ogq36_al mul mul r OGQ36_EXPERT_INTER 4
+  dof = add dof ogq36_al mul mul add r OGQ36_PF_PAD OGQ36_EXPERT_INTER 4
+  dof = add dof ogq36_al mul mul r OGQ36_HIDDEN 4
+  ogps_lock
+  ogq36_free_mem_slot 18
+  ogq36_free_mem_slot 24
+  put ogq36_st 17 0
+  hb = new ulong 6 0
+  db = new ulong 6 0
+  ok = ne ogps_open 0
+  if ok
+    if or ne ogps_alloc ho hb OGPS_OK ne ogps_alloc dof db OGPS_OK
+      ok = false
+    end
+  end
+  ogps_unlock
+  if not ok
+    ogps_lock
+    ogps_free hb
+    ogps_free db
+    ogps_unlock
+    ret OGDG_CHIP_FAIL
+  end
+  for i ulong 6
+    put ogq36_mem add 18 i get hb i
+    put ogq36_mem add 24 i get db i
+  end
+  put ogq36_st 18 ho
+  put ogq36_st 19 dof
+  put ogq36_st 17 cap
+  ret OGDG_OK
+end
+
+fn ogq36_prefill_cap to ulong
+  if eq get ogq36_st 0 0
+    ret 0
+  end
+  ret get ogq36_st 17
+end
+
+fn ogq36_prefill_streamed to ulong
+  if eq get ogq36_st 0 0
+    ret 0
+  end
+  ret get ogq36_st 20
+end
+
+fn ogq36_pf_group_sim n ulong to ulong
+  s = sub OGQ36_GROUPS 1
+  cnt = new ulong 256 0
+  for t ulong n bound 128
+    for k ulong s bound 8
+      e = rem add mul t 7 k 256
+      put cnt e add get cnt e 1
+    end
+  end
+  segs = ulong 0
+  for e ulong 256 bound 256
+    c = get cnt e
+    if ne c 0
+      passes = div add c 3 4
+      put ogq36_st 20 add get ogq36_st 20 mul passes OGQ36_PF_EXPERT_BYTES
+      segs = add segs 1
+    end
+  end
+  spasses = div add n 3 4
+  put ogq36_st 20 add get ogq36_st 20 mul spasses OGQ36_PF_EXPERT_BYTES
+  ret segs
+end
+
+fn ogq36_pf_layer head ulong l ulong n ulong to long
+  rc = OGDG_OK
+  if eq l 0
+    rc = ogq36_add_op OGQ36_K_NORM 1 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_PERM div OGQ36_HIDDEN 256 n mul OGQ36_HIDDEN n
+  end
+  is_a = get ogq36_lmeta l
+  mix_w = OGQ36_GDN_MIX
+  if ne is_a 0
+    mix_w = OGQ36_ATT_MIX
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_MIX 1 n mul OGQ36_ATT_MIX n
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_GATHER div OGQ36_ATT_MIX 256 n mul OGQ36_ATT_MIX n
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_ATTN 1 n mul OGQ36_MIXER_OUT n
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_GATE div OGQ36_MIXER_OUT 256 n mul OGQ36_MIXER_OUT n
+    end
+  else
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_AB 1 n mul OGQ36_AB n
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_MIX 1 n mul OGQ36_GDN_MIX n
+    end
+    if eq rc OGDG_OK
+      rc = ogq36_add_op OGQ36_K_GDN 1 n mul OGQ36_MIXER_OUT n
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_PERM div OGQ36_MIXER_OUT 256 n mul OGQ36_MIXER_OUT n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_O 1 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_RES 1 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_ROUTER 1 n mul n OGQ36_GROUPS
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_submit_now
+  end
+  if eq rc OGDG_OK
+    dpasses = div add n 7 8
+    dbytes = mul mul dpasses OGQ36_HIDDEN add mix_w OGQ36_MIXER_OUT
+    put ogq36_st 20 add get ogq36_st 20 dbytes
+    segs = ogq36_pf_group_sim n
+    if or eq segs 0 gt segs 256
+      ret OGDG_BAD_ARGS
+    end
+  end
+  r = mul n OGQ36_GROUPS
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_PERM div OGQ36_HIDDEN 256 n mul OGQ36_HIDDEN n
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_GATE_UP 1 r mul r mul 2 OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_SWIGLU div OGQ36_EXPERT_INTER 256 r mul r OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_PERM div OGQ36_EXPERT_INTER 256 r mul r OGQ36_EXPERT_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_DOWN 1 r mul r OGQ36_HIDDEN
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_add_op OGQ36_K_RES 1 n mul OGQ36_HIDDEN n
+  end
+  if and eq rc OGDG_OK lt add l 1 get ogq36_st 1
+    rc = ogq36_submit_now
+  end
+  ret rc
+end
+
+fn ogq36_prefill head ulong n ulong pos0 ulong want_token ulong tok edit uint 1 st_out edit ulong 6 to long
+  if or eq get ogq36_st 0 0 ne get ogq36_st 10 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq n 0 or ge head get ogq36_st 5 gt n get ogq36_st 17
+    ret OGDG_BAD_ARGS
+  end
+  if or eq get ogq36_hmeta head 0 eq get ogq36_hmeta add 8 head 0
+    ret OGDG_BAD_ARGS
+  end
+  layers = get ogq36_st 1
+  for l ulong layers bound 64
+    if eq get ogq36_lmeta add 128 l 0
+      ret OGDG_BAD_ARGS
+    end
+  end
+  if eq get ogq36_st 7 0
+    ret OGDG_BAD_ARGS
+  end
+  ogps_lock
+  put ogq36_st 13 ogps_now_ns
+  put ogq36_st 10 1
+  put ogq36_st 11 0
+  put ogq36_st 12 add head 1
+  for h ulong add head 1 bound 8
+    put ogq36_hmeta add 32 h 0
+    put ogq36_hmeta add 24 h 0
+  end
+  for i ulong 6
+    put ogq36_mem add 43 i 0
+  end
+  put ogq36_st 25 0
+  put ogq36_st 26 0
+  put ogq36_st 27 0
+  ogcl_reset get ogq36_st 6
+  rc = OGDG_OK
+  if eq ogps_open 0
+    put ogq36_st 11 1
+    rc = OGDG_CHIP_FAIL
+  end
+  for l ulong layers bound 64
+    if eq rc OGDG_OK
+      rc = ogq36_pf_layer head l n
+    end
+  end
+  if eq rc OGDG_OK
+    put ogq36_hmeta add 24 head 1
+    if ne want_token 0
+      rc = ogq36_record_head_final head
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogq36_submit_now
+  end
+  if and eq rc OGDG_OK ne want_token 0
+    put tok 0 0
+  end
+  ogcl_reset get ogq36_st 6
+  put ogq36_st 10 0
+  t_end = ogps_now_ns
+  t0 = get ogq36_st 13
+  for i ulong 6
+    put st_out i get ogq36_mem add 43 i
+  end
+  if ge t_end t0
+    put st_out 3 sub t_end t0
+    put st_out 4 sub t_end t0
+  end
+  ogps_unlock
+  ret rc
+end
