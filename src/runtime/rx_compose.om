@@ -1,0 +1,769 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_compose.om -- Pure seeded OM-2 port of src/runtime/rx_compose.c.
+note COMPOSITION-2: one World, one causal path:
+note deterministic realizer (rxc_mix / rxc_derive), instance subject & resource scoping,
+note candidate/verify/commit causal flow, World commit binder (check/seal/abort),
+note Cortex composition records (claims, evidence, promotion, loser/rollback/recovered admissions),
+note OLD-or-NEW recovery, and content-stable rx_compose_record_digest.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const RXC_OK long 0
+const RXC_ERR_ARG long -1
+const RXC_ERR_NOT_FOUND long -2
+const RXC_ERR_EXISTS long -3
+const RXC_ERR_FULL long -4
+const RXC_ERR_IDENTITY long -5
+const RXC_ERR_REPLAY long -6
+const RXC_ERR_BINDING long -7
+const RXC_ERR_AUTHORITY long -8
+
+const RXC_K ulong 2
+const RXC_NONE ulong 4294967295
+const RXC_MAX_ACTIVE ulong 2
+const RXC_SUBJ_STRIDE ulong 8
+const RXC_RES_STRIDE ulong 256
+const RXC_WAIT_MS_DEFAULT ulong 30000
+const RXC_WAIT_MS_MAX ulong 600000
+
+const RXC_SLOT_GOAL ulong 0
+const RXC_SLOT_CAND0 ulong 1
+const RXC_SLOT_CAND1 ulong 2
+const RXC_SLOT_VERDICT ulong 3
+const RXC_SLOT_STATE ulong 4
+
+const RXC_SUBJ_EXTERNAL ulong 200
+const RXC_SUBJ_CAND0 ulong 201
+const RXC_SUBJ_CAND1 ulong 202
+const RXC_SUBJ_AEGIS ulong 203
+const RXC_SUBJ_COMMIT ulong 204
+
+const RXC_RES_GOAL ulong 3254779905
+const RXC_RES_CAND0 ulong 3254779906
+const RXC_RES_CAND1 ulong 3254779907
+const RXC_RES_VERDICT ulong 3254779908
+const RXC_RES_STATE ulong 3254779909
+
+const RXC_ADMIT_LOSER ulong 1
+const RXC_ADMIT_ROLLBACK ulong 2
+const RXC_ADMIT_RECOVERED ulong 3
+
+const RXC_HOME_LOCAL ulong 0
+const RXC_HOME_FABRIC ulong 1
+
+const RXC_OUT_COMMITTED ulong 1
+const RXC_OUT_NO_WINNER ulong 2
+const RXC_OUT_NOT_COMMITTED ulong 3
+const RXC_OUT_NOT_DURABLE ulong 4
+const RXC_OUT_RECORD_FAILED ulong 5
+
+note Cortex record classes and kinds (matching rx_cortex.h)
+const RXC_CX_OBSERVATION ulong 1
+const RXC_CX_EXECUTION ulong 2
+const RXC_CX_CLAIM ulong 3
+const RXC_CX_EVIDENCE ulong 4
+
+const RXC_CX_K_ENTITY_CREATED ulong 1
+const RXC_CX_K_WORK_ACCEPTED ulong 2
+const RXC_CX_K_EXEC_COMMIT ulong 3
+const RXC_CX_K_EXEC_FAILED ulong 4
+const RXC_CX_K_CANDIDATE ulong 10
+const RXC_CX_K_EVIDENCE_REF ulong 11
+const RXC_CX_K_PROMOTION ulong 12
+const RXC_CX_K_ADMISSION ulong 13
+
+const RXC_WREC_DIGEST0 ulong 4
+const RXC_WREC_T_START_NS ulong 8
+const RXC_WREC_T_END_NS ulong 9
+
+const RXC_MIX_A ulong 13787848793156543929
+const RXC_MIX_B ulong 10723151780598845931
+const RXC_DERIVE_SEED ulong 3231835598
+
+note Composition instance state:
+note   0:open, 1:owns_world, 2:inst, 3:session, 4:wait_ms, 5:seq,
+note   6:state_branch_id, 7:state_branch_gen, 8:state_result, 9:state_goal,
+note   10:pending, 11:has_remote, 12:remote_ran, 13:remote_refused,
+note   14:rolled_back, 15:recovered_completed, 16:next_branch_id,
+note   17:ext_subject, 18:world_bound, 19:n_enrolled
+global rxc_st ulong 24
+global rxc_dir uchar 128
+global rxc_dir_len ulong 1
+global rxc_mid ulong 4
+
+note Instance subjects (cand0, cand1, aegis, commit) and resources (5)
+global rxc_subj ulong 4
+global rxc_res ulong 5
+
+note Enrolled keyring subjects (up to 8: 2 instances x 4 roles)
+global rxc_keyring ulong 8
+
+note Attached instance occupancy bitmask and dirs (2 instances)
+global rxc_taken ulong 1
+global rxc_inst_dir uchar 256
+global rxc_inst_dlen ulong 2
+
+note J-Space branch table (up to 32 branches x 8 ulongs):
+note   0:live, 1:id, 2:gen, 3:staged, 4:locality, 5:owner, 6:parent_id, 7:parent_gen
+global rxc_br ulong 256
+note Branch derived token/digest (32 branches x 8 ulongs)
+global rxc_br_val ulong 256
+
+note Cortex log (up to 64 records):
+note   header: 64 x 13 ulongs:
+note     0:cls, 1:kind, 2:subject, 3:t, 4:gen, 5:branch, 6:protect, 7:tag,
+note     8..11:links[0..3], 12:n_words
+global rxc_cx_hdr ulong 832
+note   payload: 64 x 20 ulongs
+global rxc_cx_pay ulong 1280
+global rxc_cx_n ulong 1
+
+note Last run result (12 ulongs):
+note   0:outcome, 1:winner, 2:old_id, 3:old_gen, 4:new_id, 5:new_gen,
+note   6:result, 7:reclaimed, 8:cx_cand0, 9:cx_cand1, 10:cx_evidence, 11:cx_promotion
+global rxc_last_res ulong 12
+
+fn rxc_mix x ulong to ulong
+  v = xor x shr x 30
+  v = mul v RXC_MIX_A
+  v = xor v shr v 27
+  v = mul v RXC_MIX_B
+  ret xor v shr v 31
+end
+
+note Deterministic realizer of state unit: derives 64 bytes (8 ulongs) from prev + token.
+fn rxc_derive prev view ulong 8 has_prev ulong token ulong dst edit ulong 8 to void
+  h = rxc_mix xor token RXC_DERIVE_SEED
+  for i ulong 8
+    p = ulong 0
+    if ne has_prev 0
+      p = get prev i
+    end
+    h = rxc_mix add add h p mul i 8
+    put dst i h
+  end
+end
+
+fn rxc_subj_of inst ulong role ulong to ulong
+  ret add role mul inst RXC_SUBJ_STRIDE
+end
+
+fn rxc_res_of inst ulong res ulong to ulong
+  ret add res mul inst RXC_RES_STRIDE
+end
+
+fn rxc_set_instance inst ulong to void
+  put rxc_st 2 inst
+  put rxc_subj 0 rxc_subj_of inst RXC_SUBJ_CAND0
+  put rxc_subj 1 rxc_subj_of inst RXC_SUBJ_CAND1
+  put rxc_subj 2 rxc_subj_of inst RXC_SUBJ_AEGIS
+  put rxc_subj 3 rxc_subj_of inst RXC_SUBJ_COMMIT
+  put rxc_res 0 rxc_res_of inst RXC_RES_GOAL
+  put rxc_res 1 rxc_res_of inst RXC_RES_CAND0
+  put rxc_res 2 rxc_res_of inst RXC_RES_CAND1
+  put rxc_res 3 rxc_res_of inst RXC_RES_VERDICT
+  put rxc_res 4 rxc_res_of inst RXC_RES_STATE
+end
+
+fn rxc_br_alloc parent_id ulong parent_gen ulong staged ulong owner ulong to long
+  for i ulong 32
+    bb = mul i 8
+    if eq get rxc_br bb 0
+      bid = get rxc_st 16
+      put rxc_st 16 add bid 1
+      put rxc_br bb 1
+      put rxc_br add bb 1 bid
+      put rxc_br add bb 2 1
+      put rxc_br add bb 3 staged
+      put rxc_br add bb 4 1
+      put rxc_br add bb 5 owner
+      put rxc_br add bb 6 parent_id
+      put rxc_br add bb 7 parent_gen
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn rxc_br_find bid ulong bgen ulong to long
+  for i ulong 32
+    bb = mul i 8
+    if ne get rxc_br bb 0
+      if eq get rxc_br add bb 1 bid
+        if eq get rxc_br add bb 2 bgen
+          ret long i
+        end
+      end
+    end
+  end
+  ret -1
+end
+
+fn rxc_reclaim_staged to ulong
+  cnt = ulong 0
+  for i ulong 32
+    bb = mul i 8
+    if ne get rxc_br bb 0
+      if ne get rxc_br add bb 3 0
+        put rxc_br bb 0
+        cnt = add cnt 1
+      end
+    end
+  end
+  ret cnt
+end
+
+note hdr[0..7]: cls, kind, subj, tag, l0, l1, l2, l3
+fn rxc_cx_append hdr view ulong 8 pay view ulong 20 nw ulong to ulong
+  idx = get rxc_cx_n 0
+  if ge idx 64
+    ret 0
+  end
+  hb = mul idx 13
+  put rxc_cx_hdr hb get hdr 0
+  put rxc_cx_hdr add hb 1 get hdr 1
+  put rxc_cx_hdr add hb 2 get hdr 2
+  put rxc_cx_hdr add hb 3 add idx 1
+  put rxc_cx_hdr add hb 4 1
+  put rxc_cx_hdr add hb 5 0
+  put rxc_cx_hdr add hb 6 0
+  put rxc_cx_hdr add hb 7 get hdr 3
+  put rxc_cx_hdr add hb 8 get hdr 4
+  put rxc_cx_hdr add hb 9 get hdr 5
+  put rxc_cx_hdr add hb 10 get hdr 6
+  put rxc_cx_hdr add hb 11 get hdr 7
+  put rxc_cx_hdr add hb 12 nw
+  pb = mul idx 20
+  for i ulong nw bound 20
+    put rxc_cx_pay add pb i get pay i
+  end
+  put rxc_cx_n 0 add idx 1
+  ret add idx 1
+end
+
+fn rx_compose_open dir_buf view uchar 128 dlen ulong session ulong mid0 ulong to long
+  if eq dlen 0
+    ret RXC_ERR_ARG
+  end
+  if gt dlen 120
+    ret RXC_ERR_ARG
+  end
+  for i ulong 24
+    put rxc_st i 0
+  end
+  for i ulong dlen bound 128
+    put rxc_dir i get dir_buf i
+  end
+  put rxc_dir_len 0 dlen
+  put rxc_mid 0 mid0
+  put rxc_st 0 1
+  put rxc_st 1 1
+  put rxc_st 3 session
+  put rxc_st 4 RXC_WAIT_MS_DEFAULT
+  put rxc_st 16 1
+  put rxc_st 17 RXC_SUBJ_EXTERNAL
+  for i ulong 256
+    put rxc_br i 0
+    put rxc_br_val i 0
+  end
+  put rxc_cx_n 0 0
+  rxc_set_instance 0
+  note Create genesis root branch
+  rslot = rxc_br_alloc 0 0 0 0
+  if lt rslot 0
+    ret RXC_ERR_FULL
+  end
+  rb = mul ulong rslot 8
+  bid = get rxc_br add rb 1
+  bgen = get rxc_br add rb 2
+  put rxc_st 6 bid
+  put rxc_st 7 bgen
+  zero_in = new ulong 8 0
+  out_v = new ulong 8 0
+  rxc_derive zero_in 0 mid0 out_v
+  for i ulong 8
+    put rxc_br_val add rb i get out_v i
+  end
+  note Record genesis ENTITY_CREATED on state subject (slot 4 + 1 = 5)
+  hdr = new ulong 8 0
+  put hdr 0 RXC_CX_EXECUTION
+  put hdr 1 RXC_CX_K_ENTITY_CREATED
+  put hdr 2 5
+  pay = new ulong 20 0
+  put pay 0 bid
+  put pay 1 bgen
+  ign_c = rxc_cx_append hdr pay 4
+  ret RXC_OK
+end
+
+fn rx_compose_enroll_callers to long
+  if ne get rxc_st 18 0
+    ret RXC_ERR_IDENTITY
+  end
+  n = ulong 0
+  for inst ulong RXC_MAX_ACTIVE
+    put rxc_keyring n rxc_subj_of inst RXC_SUBJ_CAND0
+    n = add n 1
+    put rxc_keyring n rxc_subj_of inst RXC_SUBJ_CAND1
+    n = add n 1
+    put rxc_keyring n rxc_subj_of inst RXC_SUBJ_AEGIS
+    n = add n 1
+    put rxc_keyring n rxc_subj_of inst RXC_SUBJ_COMMIT
+    n = add n 1
+  end
+  put rxc_st 19 n
+  ret RXC_OK
+end
+
+fn rxc_same_dir inst ulong dir_buf view uchar 128 dlen ulong to ulong
+  if ne get rxc_inst_dlen inst dlen
+    ret 0
+  end
+  base = mul inst 128
+  for i ulong dlen bound 128
+    if ne get rxc_inst_dir add base i get dir_buf i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rx_compose_attach ext_subj ulong dir_buf view uchar 128 dlen ulong session ulong mid0 ulong to long
+  if eq dlen 0
+    ret RXC_ERR_ARG
+  end
+  if gt dlen 120
+    ret RXC_ERR_ARG
+  end
+  if ge ext_subj RXC_SUBJ_EXTERNAL
+    if lt ext_subj rxc_subj_of RXC_MAX_ACTIVE RXC_SUBJ_EXTERNAL
+      ret RXC_ERR_ARG
+    end
+  end
+  taken = get rxc_taken 0
+  for i ulong RXC_MAX_ACTIVE
+    if ne and taken shl ulong 1 i 0
+      if ne rxc_same_dir i dir_buf dlen 0
+        ret RXC_ERR_EXISTS
+      end
+    end
+  end
+  inst = RXC_MAX_ACTIVE
+  for i ulong RXC_MAX_ACTIVE
+    if eq and taken shl ulong 1 i 0
+      inst = i
+      break
+    end
+  end
+  if ge inst RXC_MAX_ACTIVE
+    ret RXC_ERR_EXISTS
+  end
+  rc = rx_compose_open dir_buf dlen session mid0
+  if ne rc RXC_OK
+    ret rc
+  end
+  put rxc_st 1 0
+  put rxc_st 17 ext_subj
+  rxc_set_instance inst
+  put rxc_taken 0 or taken shl ulong 1 inst
+  base = mul inst 128
+  for i ulong dlen bound 128
+    put rxc_inst_dir add base i get dir_buf i
+  end
+  put rxc_inst_dlen inst dlen
+  ret RXC_OK
+end
+
+fn rx_compose_set_remote enabled ulong to long
+  if eq get rxc_st 0 0
+    ret RXC_ERR_ARG
+  end
+  put rxc_st 11 enabled
+  ret RXC_OK
+end
+
+fn rx_compose_set_wait_ms wait_ms ulong to long
+  if eq get rxc_st 0 0
+    ret RXC_ERR_ARG
+  end
+  if eq wait_ms 0
+    ret RXC_ERR_ARG
+  end
+  if gt wait_ms RXC_WAIT_MS_MAX
+    ret RXC_ERR_ARG
+  end
+  put rxc_st 4 wait_ms
+  ret RXC_OK
+end
+
+fn rx_compose_state dst edit ulong 2 to long
+  if eq get rxc_st 0 0
+    put dst 0 RXC_NONE
+    put dst 1 0
+    ret RXC_ERR_NOT_FOUND
+  end
+  put dst 0 get rxc_st 6
+  put dst 1 get rxc_st 7
+  ret RXC_OK
+end
+
+note World commit binder check: live, staged, local, owned by cand0/cand1, child of old.
+fn rxc_bind_check subj ulong old_id ulong old_gen ulong nw_id ulong nw_gen ulong to long
+  if ne subj get rxc_subj 3
+    ret RXC_ERR_BINDING
+  end
+  sl = rxc_br_find nw_id nw_gen
+  if lt sl 0
+    ret RXC_ERR_BINDING
+  end
+  bb = mul ulong sl 8
+  if eq get rxc_br add bb 3 0
+    ret RXC_ERR_BINDING
+  end
+  if ne get rxc_br add bb 4 1
+    ret RXC_ERR_BINDING
+  end
+  br_owner = get rxc_br add bb 5
+  ok_own = ulong 0
+  if eq br_owner get rxc_subj 0
+    ok_own = ulong 1
+  end
+  if eq br_owner get rxc_subj 1
+    ok_own = ulong 1
+  end
+  if eq ok_own 0
+    ret RXC_ERR_BINDING
+  end
+  if ne get rxc_br add bb 6 old_id
+    ret RXC_ERR_BINDING
+  end
+  if ne get rxc_br add bb 7 old_gen
+    ret RXC_ERR_BINDING
+  end
+  ret RXC_OK
+end
+
+note Scratch for rx_compose_run: 0:s0, 1:s1, 2:c0_id, 3:c0_gen, 4:c1_id, 5:c1_gen, 6:oslot, 7:g_rec, 8:passmask, 9:winner
+global rxc_run_sc ulong 12
+
+fn rxc_derive_cand oslot long cslot ulong res_tok ulong to void
+  prev_v = new ulong 8 0
+  if ge oslot 0
+    ob = mul ulong oslot 8
+    for i ulong 8
+      put prev_v i get rxc_br_val add ob i
+    end
+  end
+  dv = new ulong 8 0
+  rxc_derive prev_v 1 res_tok dv
+  cb = mul cslot 8
+  for i ulong 8
+    put rxc_br_val add cb i get dv i
+  end
+end
+
+global rxc_th ulong 8
+global rxc_tp ulong 20
+
+fn rxc_cx_append_tmp nw ulong to ulong
+  idx = get rxc_cx_n 0
+  if ge idx 64
+    ret 0
+  end
+  hb = mul idx 13
+  put rxc_cx_hdr hb get rxc_th 0
+  put rxc_cx_hdr add hb 1 get rxc_th 1
+  put rxc_cx_hdr add hb 2 get rxc_th 2
+  put rxc_cx_hdr add hb 3 add idx 1
+  put rxc_cx_hdr add hb 4 1
+  put rxc_cx_hdr add hb 5 0
+  put rxc_cx_hdr add hb 6 0
+  put rxc_cx_hdr add hb 7 get rxc_th 3
+  put rxc_cx_hdr add hb 8 get rxc_th 4
+  put rxc_cx_hdr add hb 9 get rxc_th 5
+  put rxc_cx_hdr add hb 10 get rxc_th 6
+  put rxc_cx_hdr add hb 11 get rxc_th 7
+  put rxc_cx_hdr add hb 12 nw
+  pb = mul idx 20
+  for i ulong nw bound 20
+    put rxc_cx_pay add pb i get rxc_tp i
+  end
+  put rxc_cx_n 0 add idx 1
+  ret add idx 1
+end
+
+fn rxc_write_commit_recs input ulong c0_res ulong c0_ok ulong c1_res ulong c1_ok ulong to void
+  for i ulong 8
+    put rxc_th i 0
+  end
+  for i ulong 20
+    put rxc_tp i 0
+  end
+  put rxc_th 0 RXC_CX_CLAIM
+  put rxc_th 1 RXC_CX_K_CANDIDATE
+  put rxc_th 2 5
+  put rxc_th 3 get rxc_run_sc 7
+  put rxc_th 5 get rxc_run_sc 7
+  put rxc_tp 0 0
+  put rxc_tp 1 get rxc_run_sc 2
+  put rxc_tp 2 c0_res
+  put rxc_tp 4 input
+  put rxc_tp 5 get rxc_st 5
+  put rxc_tp 6 c0_ok
+  cl0 = rxc_cx_append_tmp 7
+  put rxc_tp 0 1
+  put rxc_tp 1 get rxc_run_sc 4
+  put rxc_tp 2 c1_res
+  put rxc_tp 6 c1_ok
+  cl1 = rxc_cx_append_tmp 7
+  put rxc_th 0 RXC_CX_EVIDENCE
+  put rxc_th 1 RXC_CX_K_EVIDENCE_REF
+  put rxc_th 5 cl0
+  put rxc_th 6 cl1
+  put rxc_tp 0 get rxc_run_sc 9
+  put rxc_tp 1 get rxc_st 6
+  put rxc_tp 3 get rxc_run_sc 8
+  put rxc_tp 4 get rxc_st 8
+  put rxc_tp 5 get rxc_st 5
+  put rxc_tp 6 get rxc_subj 2
+  ev_id = rxc_cx_append_tmp 7
+  w_cl = cl0
+  l_cl = cl1
+  if eq get rxc_run_sc 9 1
+    w_cl = cl1
+    l_cl = cl0
+  end
+  put rxc_th 1 RXC_CX_K_PROMOTION
+  put rxc_th 3 0
+  put rxc_th 4 w_cl
+  put rxc_th 5 ev_id
+  put rxc_th 6 0
+  prom_id = rxc_cx_append_tmp 2
+  put rxc_th 1 RXC_CX_K_ADMISSION
+  put rxc_th 3 RXC_ADMIT_LOSER
+  put rxc_th 4 l_cl
+  put rxc_th 5 ev_id
+  ign_ad = rxc_cx_append_tmp 3
+  put rxc_last_res 8 cl0
+  put rxc_last_res 9 cl1
+  put rxc_last_res 10 ev_id
+  put rxc_last_res 11 prom_id
+end
+
+fn rxc_run_fork_and_derive c0_res ulong c1_res ulong to long
+  old_id = get rxc_st 6
+  old_gen = get rxc_st 7
+  s0 = rxc_br_alloc old_id old_gen 1 get rxc_subj 0
+  if lt s0 0
+    ret RXC_ERR_FULL
+  end
+  s1 = rxc_br_alloc old_id old_gen 1 get rxc_subj 1
+  if lt s1 0
+    ret RXC_ERR_FULL
+  end
+  put rxc_run_sc 0 ulong s0
+  put rxc_run_sc 1 ulong s1
+  put rxc_run_sc 2 get rxc_br add mul ulong s0 8 1
+  put rxc_run_sc 3 get rxc_br add mul ulong s0 8 2
+  put rxc_run_sc 4 get rxc_br add mul ulong s1 8 1
+  put rxc_run_sc 5 get rxc_br add mul ulong s1 8 2
+  oslot = rxc_br_find old_id old_gen
+  put rxc_run_sc 6 ulong oslot
+  rxc_derive_cand oslot ulong s0 c0_res
+  rxc_derive_cand oslot ulong s1 c1_res
+  ret RXC_OK
+end
+
+fn rxc_run_log_goal input ulong seq ulong to ulong
+  for i ulong 8
+    put rxc_th i 0
+  end
+  for i ulong 20
+    put rxc_tp i 0
+  end
+  put rxc_th 0 RXC_CX_OBSERVATION
+  put rxc_th 1 RXC_CX_K_WORK_ACCEPTED
+  put rxc_th 2 1
+  put rxc_tp 0 input
+  put rxc_tp 4 seq
+  ret rxc_cx_append_tmp 5
+end
+
+fn rxc_run_log_nowinner g_rec ulong passmask ulong seq ulong to ulong
+  for i ulong 8
+    put rxc_th i 0
+  end
+  for i ulong 20
+    put rxc_tp i 0
+  end
+  put rxc_th 0 RXC_CX_EVIDENCE
+  put rxc_th 1 RXC_CX_K_EVIDENCE_REF
+  put rxc_th 2 5
+  put rxc_th 3 g_rec
+  put rxc_tp 0 RXC_NONE
+  put rxc_tp 3 passmask
+  put rxc_tp 5 seq
+  ret rxc_cx_append_tmp 7
+end
+
+fn rxc_run_seal_winner w_res ulong to long
+  winner = get rxc_run_sc 9
+  w_id = get rxc_run_sc 2
+  w_gen = get rxc_run_sc 3
+  w_slot = get rxc_run_sc 0
+  if eq winner 1
+    w_id = get rxc_run_sc 4
+    w_gen = get rxc_run_sc 5
+    w_slot = get rxc_run_sc 1
+  end
+  if ne rxc_bind_check get rxc_subj 3 get rxc_st 6 get rxc_st 7 w_id w_gen RXC_OK
+    put rxc_last_res 4 get rxc_st 6
+    put rxc_last_res 5 get rxc_st 7
+    put rxc_last_res 7 rxc_reclaim_staged
+    put rxc_last_res 0 RXC_OUT_NOT_COMMITTED
+    ret 0
+  end
+  wb = mul w_slot 8
+  put rxc_br add wb 3 0
+  put rxc_br add wb 5 0
+  put rxc_st 6 w_id
+  put rxc_st 7 w_gen
+  put rxc_st 8 w_res
+  put rxc_st 9 get rxc_st 5
+  put rxc_last_res 7 rxc_reclaim_staged
+  put rxc_br mul get rxc_run_sc 6 8 0
+  put rxc_last_res 0 RXC_OUT_COMMITTED
+  put rxc_last_res 4 w_id
+  put rxc_last_res 5 w_gen
+  put rxc_last_res 6 w_res
+  ret 1
+end
+
+fn rxc_run_commit_winner input ulong c0_res ulong c0_ok ulong c1_res ulong c1_ok ulong to long
+  w_res = c0_res
+  if eq get rxc_run_sc 9 1
+    w_res = c1_res
+  end
+  if eq rxc_run_seal_winner w_res 0
+    ret RXC_OK
+  end
+  rxc_write_commit_recs input c0_res c0_ok c1_res c1_ok
+  ret RXC_OK
+end
+
+note Run one goal through candidate 0/1 -> AEGIS contract -> commit binder -> settle -> Cortex records.
+note c0_res/c1_res are candidate outputs; c0_ok/c1_ok indicate AEGIS contract pass (1=pass, 0=fail).
+fn rx_compose_run input ulong c0_res ulong c0_ok ulong c1_res ulong c1_ok ulong to long
+  if eq get rxc_st 0 0
+    ret RXC_ERR_ARG
+  end
+  if eq get rxc_st 10 2
+    ret RXC_ERR_REPLAY
+  end
+  for i ulong 12
+    put rxc_last_res i 0
+  end
+  put rxc_last_res 1 RXC_NONE
+  put rxc_last_res 2 get rxc_st 6
+  put rxc_last_res 3 get rxc_st 7
+  seq = add get rxc_st 5 1
+  put rxc_st 5 seq
+  frc = rxc_run_fork_and_derive c0_res c1_res
+  if ne frc RXC_OK
+    ret frc
+  end
+  winner = RXC_NONE
+  passmask = ulong 0
+  if ne c0_ok 0
+    passmask = or passmask 1
+    winner = ulong 0
+  end
+  if ne c1_ok 0
+    passmask = or passmask 2
+    if eq winner RXC_NONE
+      winner = ulong 1
+    end
+  end
+  put rxc_run_sc 8 passmask
+  put rxc_run_sc 9 winner
+  put rxc_last_res 1 winner
+  g_rec = rxc_run_log_goal input seq
+  put rxc_run_sc 7 g_rec
+  if eq winner RXC_NONE
+    put rxc_last_res 4 get rxc_st 6
+    put rxc_last_res 5 get rxc_st 7
+    put rxc_last_res 7 rxc_reclaim_staged
+    put rxc_last_res 0 RXC_OUT_NO_WINNER
+    put rxc_last_res 10 rxc_run_log_nowinner g_rec passmask seq
+    ret RXC_OK
+  end
+  ret rxc_run_commit_winner input c0_res c0_ok c1_res c1_ok
+end
+
+fn rx_compose_close to void
+  if eq get rxc_st 0 0
+    ret
+  end
+  if eq get rxc_st 1 0
+    inst = get rxc_st 2
+    mask = shl ulong 1 inst
+    put rxc_taken 0 and get rxc_taken 0 xor mask ulong 18446744073709551615
+  end
+  put rxc_st 0 0
+end
+
+fn rxc_dig_put64 pos ulong v ulong to ulong
+  p = pos
+  for b ulong 8
+    put sh_dat p uchar and shr v mul b 8 255
+    p = add p 1
+  end
+  ret p
+end
+
+fn rxc_dig_one_rec i ulong pos_in ulong to ulong
+  pos = pos_in
+  hb = mul i 13
+  for k ulong 13
+    pos = rxc_dig_put64 pos get rxc_cx_hdr add hb k
+  end
+  kind = get rxc_cx_hdr add hb 1
+  is_w = ulong 0
+  if ge kind RXC_CX_K_WORK_ACCEPTED
+    if le kind RXC_CX_K_EXEC_FAILED
+      is_w = ulong 1
+    end
+  end
+  nw = get rxc_cx_hdr add hb 12
+  pb = mul i 20
+  for k ulong nw bound 20
+    v = get rxc_cx_pay add pb k
+    if ne is_w 0
+      if ge k RXC_WREC_DIGEST0
+        if lt k add RXC_WREC_DIGEST0 4
+          v = ulong 0
+        end
+      end
+      if eq k RXC_WREC_T_START_NS
+        v = ulong 0
+      end
+      if eq k RXC_WREC_T_END_NS
+        v = ulong 0
+      end
+    end
+    pos = rxc_dig_put64 pos v
+  end
+  ret pos
+end
+
+note Content digest of Cortex composition records (zeroing timing & crumb digest words for world records).
+fn rx_compose_record_digest dst edit uchar 32 to void
+  n = get rxc_cx_n 0
+  pos = ulong 0
+  for i ulong n bound 64
+    pos = rxc_dig_one_rec i pos
+  end
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end

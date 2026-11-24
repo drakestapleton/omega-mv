@@ -1,0 +1,185 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_generation_unit.om -- Pure seeded OM-2 unit test for rx_generation.om.
+
+global rgt_checks ulong 1
+global rgt_fail ulong 1
+
+text rgt_dir "/tmp/gen_test"
+text rgt_ev "EV_OK_V1"
+text rgt_msg_pass "RX_GENERATION_OM: PASS\n"
+text rgt_msg_fail "RX_GENERATION_OM: FAIL\n"
+
+fn rgt_chk cond bool to void
+  put rgt_checks 0 add get rgt_checks 0 1
+  if not cond
+    put rgt_fail 0 add get rgt_fail 0 1
+  end
+end
+
+fn test_genesis_and_propose to void
+  dbuf = new uchar 128 0
+  dl = len rgt_dir
+  for i ulong dl bound 128
+    put dbuf i get rgt_dir i
+  end
+  rgt_chk eq rx_gen_open dbuf dl RX_GEN_OK
+  act = new ulong 2 0
+  rgt_chk eq rx_gen_active act RX_GEN_OK
+  rgt_chk eq get act 0 1
+  rgt_chk eq get act 1 1
+  note Read genesis evidence blob
+  bbuf = new uchar 1024 0
+  blen = new ulong 1 0
+  rgt_chk eq rx_gen_read_blob 1 RG_DIG_EVIDENCE bbuf 1024 blen RX_GEN_OK
+  rgt_chk eq get blen 0 7
+  rgt_chk eq get bbuf 0 71
+  note IO counters positive
+  io = new ulong 2 0
+  rgt_chk eq rx_gen_store_io io RX_GEN_OK
+  rgt_chk gt get io 0 0
+  rgt_chk gt get io 1 0
+  gio = new ulong 2 0
+  rx_gen_io_counters gio
+  rgt_chk ge get gio 0 get io 0
+end
+
+fn test_promote_work_and_replay to void
+  ev = new uchar 256 0
+  el = len rgt_ev
+  for i ulong el bound 256
+    put ev i get rgt_ev i
+  end
+  pm = new ulong 6 0
+  put pm 0 10
+  put pm 2 1
+  put pm 3 1
+  put pm 4 1
+  put pm 5 2
+  cid = new ulong 1 0
+  rgt_chk eq rx_gen_propose pm ev el cid RX_GEN_OK
+  c1 = get cid 0
+  rgt_chk eq c1 2
+  note Mutate and observe object 0
+  dig = new uchar 32 7
+  rgt_chk eq rx_gen_mutate_object c1 0 3 dig RX_GEN_OK
+  rgt_chk eq rx_gen_observe_object c1 0 3 RX_GEN_OK
+  note Work resource deterministic and nonzero
+  wres = new ulong 1 0
+  rgt_chk eq rx_gen_work_resource c1 55 wres RX_GEN_OK
+  rgt_chk ne get wres 0 0
+  note Add ephemeral, required evidence, and issued external work
+  rgt_chk eq rx_gen_add_work c1 10 RX_WORK_EPHEMERAL RX_WORK_PENDING 0 RX_GEN_OK
+  rgt_chk eq rx_gen_add_work c1 20 RX_WORK_EVIDENCE RX_WORK_PENDING 1 RX_GEN_OK
+  rgt_chk eq rx_gen_add_work c1 55 RX_WORK_EXTERNAL RX_WORK_ISSUED 0 RX_GEN_OK
+  rgt_chk eq rx_gen_finish_work c1 20 RX_GEN_OK
+  note Self-promotion refused (subject == proposer)
+  req = new ulong 7 0
+  put req 0 c1
+  put req 1 10
+  put req 3 1
+  put req 4 1
+  put req 5 RX_GEN_RES_PROMOTION
+  put req 6 RX_GEN_RIGHT_PROMOTE
+  rgt_chk eq rx_gen_promote req RX_GEN_ERR_AUTHORITY
+  note Promote as subject 20
+  put req 1 20
+  rgt_chk eq rx_gen_promote req RX_GEN_OK
+  act = new ulong 2 0
+  rgt_chk eq rx_gen_active act RX_GEN_OK
+  rgt_chk eq get act 0 2
+  rgt_chk eq get act 1 2
+  note Phases populated
+  ph = new ulong 14 0
+  pres = new long 1 0
+  rgt_chk eq rx_gen_last_phases ph pres RX_GEN_OK
+  rgt_chk eq get pres 0 RX_GEN_OK
+  rgt_chk gt get ph 3 0
+  note Recovery and replay rejection for external work 55
+  rgt_chk eq rx_gen_recover RX_GEN_OK
+  rgt_chk eq get rg_rec_meta 0 1
+  rgt_chk eq get rg_rec_meta 1 2
+  rgt_chk eq get rg_rec_meta 6 1
+  rgt_chk eq rx_gen_reject_replay 55 RX_GEN_ERR_REPLAY
+  rgt_chk eq rx_gen_reject_replay 56 RX_GEN_OK
+end
+
+fn test_bound_authority_and_exec to void
+  rgt_chk eq rx_gen_bind_authority RX_GEN_OK
+  rgt_chk eq rx_gen_bind_authority RX_GEN_ERR_BUSY
+  ev = new uchar 256 0
+  el = len rgt_ev
+  for i ulong el bound 256
+    put ev i get rgt_ev i
+  end
+  pm = new ulong 6 0
+  put pm 0 10
+  put pm 1 0
+  put pm 2 1
+  put pm 3 1
+  put pm 4 1
+  put pm 5 1
+  cid = new ulong 1 0
+  note Bare propose refused on bound store
+  rgt_chk eq rx_gen_propose pm ev el cid RX_GEN_ERR_IDENTITY
+  note Credentialed propose succeeds
+  put pm 1 1
+  rgt_chk eq rx_gen_propose_as pm ev el cid RX_GEN_OK
+  c2 = get cid 0
+  note Bare mutate/set_evidence refused on bound store
+  dig = new uchar 32 9
+  rgt_chk eq rx_gen_mutate_object c2 0 2 dig RX_GEN_ERR_IDENTITY
+  rgt_chk eq rx_gen_set_evidence c2 ev el RX_GEN_ERR_IDENTITY
+  note Barrier hold blocks promotion
+  req = new ulong 7 0
+  put req 0 c2
+  put req 1 20
+  put req 2 1
+  put req 3 1
+  put req 4 1
+  put req 5 RX_GEN_RES_PROMOTION
+  put req 6 RX_GEN_RIGHT_PROMOTE
+  rgt_chk eq rx_gen_hold_barrier RX_GEN_OK
+  rgt_chk eq rx_gen_promote req RX_GEN_ERR_BUSY
+  rgt_chk eq rx_gen_release_barrier RX_GEN_OK
+  note Executor jobs
+  rgt_chk eq rx_gen_exec_start RX_GEN_OK
+  rgt_chk eq rx_gen_exec_running 1
+  rgt_chk eq rx_gen_post_promote 999 req RX_GEN_OK
+  jout = new ulong 6 0
+  jrc = new long 1 0
+  rgt_chk eq rx_gen_job_state RX_GEN_JOB_PROMOTE jout jrc long RX_GEN_JOB_DONE
+  rgt_chk eq get jout 0 999
+  rgt_chk eq get jrc 0 RX_GEN_OK
+  rx_gen_job_take RX_GEN_JOB_PROMOTE
+  rgt_chk eq rx_gen_job_state RX_GEN_JOB_PROMOTE jout jrc long RX_GEN_JOB_IDLE
+  rx_gen_close
+end
+
+fn rgt_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len rgt_msg_pass
+    for i ulong n bound 64
+      put buf i get rgt_msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len rgt_msg_fail
+  for i ulong n bound 64
+    put buf i get rgt_msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  test_genesis_and_propose
+  test_promote_work_and_replay
+  test_bound_authority_and_exec
+  if eq get rgt_fail 0 0
+    rgt_put_msg 1
+    ret 0
+  end
+  rgt_put_msg 0
+  ret 1
+end

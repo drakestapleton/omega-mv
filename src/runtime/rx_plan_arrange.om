@@ -1,0 +1,1607 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_plan_arrange.om -- Pure seeded OM-2 port of src/runtime/rx_plan_arrange.c.
+note Arrangement ("blocks world") planning domain:
+note pla_fact, pla_goal_read, pla_bind, pla_target_from_goal, pla_target_from_template,
+note pla_plan (A* with admissible heuristic + binary min-heap + open-addressed hash table),
+note pla_apply, pla_legal, pla_generalize, pla_template_moves.
+note Requires seed/ng/sha256.om, src/runtime/rx_graph.om, src/runtime/rx_plan.om concatenated before this file.
+
+const PLA_MAX_UNITS ulong 14
+const PLA_MAX_FACTS ulong 8
+const PLA_MAX_MOVES ulong 24
+const PLA_MOVE_ENERGY ulong 5
+const PLA_GOAL_ARRANGE ulong 1
+const PLA_F_SUPPORT ulong 0
+const PLA_F_LABEL ulong 1
+const PLA_F_SELF ulong 2
+const PLA_FLOOR ulong 15
+const PLA_NONE ulong 255
+
+const PLA_OT_UNIT ulong 23297
+const PLA_OT_GOAL ulong 23301
+const PLA_OT_GOALFACTS ulong 23304
+const PLA_ROLE_GOAL ulong 1
+const PLA_ROLE_INVOLVED ulong 2
+const PLA_BIND_FROM_GOAL ulong 0
+const PLA_BIND_RESTS_ON ulong 1
+const PLA_RIGHT_READ ulong 1
+const PLA_RIGHT_WRITE ulong 2
+const PLA_FAIL_ALL ulong 15
+const PLA_GRAPH_RX_GRAPH ulong 1
+
+const PLA_ASTAR_MAX_NODES ulong 1024
+const PLA_ASTAR_HTAB ulong 2048
+const PLA_ASTAR_HMASK ulong 2047
+const PLA_U32_MAX ulong 4294967295
+const PLA_HMIX_A ulong 18397679294719823053
+const PLA_HMIX_B ulong 14181476777654086739
+
+text pla_shape_domain "OMEGA_PLAN_SHAPE_ARRANGE_V1"
+
+note Goal storage (single active PlaGoal):
+note   meta: 0:seq, 1:kind, 2:max_steps, 3:energy, 4:n_facts, 5:n_obj, 6:n_chains
+global pla_g_meta ulong 8
+note   facts: 8 x 5 ulongs (x_id, x_gen, t_id, t_gen, is_floor)
+global pla_g_facts ulong 40
+note   canonical obj order: 16 x 2 ulongs (id, gen)
+global pla_g_obj ulong 32
+note   chains: 16 x 3 ulongs (start, len, grounded)
+global pla_g_chain ulong 48
+global pla_g_shape uchar 32
+
+note Target storage (single active PlaTarget):
+note   meta: 0:n_facts, 1:n_insiders, 2:n_protect
+global pla_tg_meta ulong 4
+note   facts: 16 x 5 ulongs (x_id, x_gen, t_id, t_gen, is_floor)
+global pla_tg_facts ulong 80
+note   insiders: 16 x 2 ulongs
+global pla_tg_ins ulong 32
+note   protect: 16 x 2 ulongs
+global pla_tg_prot ulong 32
+
+note Plan storage (single active PlaPlan):
+note   meta: 0:n
+global pla_p_n ulong 1
+note   moves: 24 x 5 ulongs (mover_id, mover_gen, dest_id, dest_gen, to_floor)
+global pla_p_moves ulong 120
+
+note A* tables in static BSS
+global pla_as_unit ulong 28
+global pla_as_want ulong 14
+global pla_as_state ulong 1024
+global pla_as_g ulong 1024
+global pla_as_par ulong 1024
+global pla_as_mov ulong 1024
+global pla_as_dst ulong 1024
+global pla_as_hf ulong 1024
+global pla_as_hh ulong 1024
+global pla_as_hn ulong 1024
+global pla_as_hs ulong 1024
+global pla_as_htab ulong 2048
+
+note Pack arrangement fact: bit 63=1, x.id(0..7), x.gen(8..31), floor(62), t.id(32..39), t.gen(40..61).
+fn pla_fact xid ulong xgen ulong is_floor ulong tid ulong tgen ulong to ulong
+  v = or shl ulong 1 63 and xid 255
+  v = or v shl and xgen 16777215 8
+  if ne is_floor 0
+    ret or v shl ulong 1 62
+  end
+  v = or v shl and tid 255 32
+  v = or v shl and tgen 4194303 40
+  ret v
+end
+
+fn pla_fact_unpack f ulong dst edit ulong 5 to void
+  put dst 0 and f 255
+  put dst 1 and shr f 8 16777215
+  put dst 2 and shr f 62 1
+  put dst 3 and shr f 32 255
+  put dst 4 and shr f 40 4194303
+end
+
+fn pla_same aid ulong agen ulong bid ulong bgen ulong to ulong
+  if eq aid bid
+    if eq agen bgen
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn pla_view_live oid ulong ogen ulong to ulong
+  if ge oid get pl_view_n 0
+    ret 0
+  end
+  if ge oid PL_MAX_OBJECTS
+    ret 0
+  end
+  ob = mul oid 12
+  if eq get pl_view_obj ob 0
+    ret 0
+  end
+  if ne get pl_view_obj add ob 2 ogen
+    ret 0
+  end
+  ret 1
+end
+
+note Scratch arrays for goal forest construction
+global pla_gf_nid ulong 16
+global pla_gf_ngen ulong 16
+global pla_gf_par long 16
+global pla_gf_chd long 16
+global pla_gf_ch_bot ulong 16
+global pla_gf_ch_len ulong 16
+global pla_gf_ch_gnd ulong 16
+global pla_gf_cnt ulong 2
+
+fn pla_gf_add_node oid ulong ogen ulong to ulong
+  nn = get pla_gf_cnt 0
+  for k ulong nn bound 16
+    if ne pla_same get pla_gf_nid k get pla_gf_ngen k oid ogen 0
+      ret k
+    end
+  end
+  put pla_gf_nid nn oid
+  put pla_gf_ngen nn ogen
+  put pla_gf_cnt 0 add nn 1
+  ret nn
+end
+
+fn pla_goal_load_facts to long
+  for i ulong 8
+    put pla_g_meta i 0
+  end
+  gid = get pl_env_refs 0
+  ggen = get pl_env_refs 1
+  if eq pla_view_live gid ggen 0
+    ret -1
+  end
+  gb = mul gid 12
+  if ne get pl_view_obj add gb 1 PLA_OT_GOAL
+    ret -1
+  end
+  put pla_g_meta 0 get pl_view_obj add gb 4
+  put pla_g_meta 1 get pl_view_obj add gb 5
+  put pla_g_meta 2 get pl_view_obj add gb 6
+  put pla_g_meta 3 get pl_view_obj add gb 7
+  fref = get pl_view_obj add gb 8
+  if eq fref 0
+    ret -1
+  end
+  fid = pl_ref_id fref
+  fgen = pl_ref_gen fref
+  if eq pla_view_live fid fgen 0
+    ret -1
+  end
+  fb = mul fid 12
+  if ne get pl_view_obj add fb 1 PLA_OT_GOALFACTS
+    ret -1
+  end
+  nf = ulong 0
+  uf = new ulong 5 0
+  for i ulong PLA_MAX_FACTS
+    fw = get pl_view_obj add fb add 4 i
+    if ne shr fw 63 0
+      pla_fact_unpack fw uf
+      pb = mul nf 5
+      put pla_g_facts pb get uf 0
+      put pla_g_facts add pb 1 get uf 1
+      put pla_g_facts add pb 2 get uf 3
+      put pla_g_facts add pb 3 get uf 4
+      put pla_g_facts add pb 4 get uf 2
+      nf = add nf 1
+    end
+  end
+  if eq nf 0
+    ret -1
+  end
+  put pla_g_meta 4 nf
+  ret 0
+end
+
+fn pla_goal_build_forest to long
+  put pla_gf_cnt 0 0
+  put pla_gf_cnt 1 0
+  nf = get pla_g_meta 4
+  for i ulong nf bound 8
+    pb = mul i 5
+    ign1 = pla_gf_add_node get pla_g_facts pb get pla_g_facts add pb 1
+    if eq get pla_g_facts add pb 4 0
+      ign2 = pla_gf_add_node get pla_g_facts add pb 2 get pla_g_facts add pb 3
+    end
+  end
+  nn = get pla_gf_cnt 0
+  for k ulong nn bound 16
+    put pla_gf_par k -2
+    put pla_gf_chd k -1
+  end
+  for i ulong nf bound 8
+    pb = mul i 5
+    a = pla_gf_add_node get pla_g_facts pb get pla_g_facts add pb 1
+    if ne get pla_gf_par a -2
+      ret -2
+    end
+    if ne get pla_g_facts add pb 4 0
+      put pla_gf_par a -1
+    else
+      b = pla_gf_add_node get pla_g_facts add pb 2 get pla_g_facts add pb 3
+      if eq a b
+        ret -2
+      end
+      if ge get pla_gf_chd b 0
+        ret -2
+      end
+      put pla_gf_par a long b
+      put pla_gf_chd b long a
+    end
+  end
+  nc = ulong 0
+  seen = ulong 0
+  for k ulong nn bound 16
+    if lt get pla_gf_par k 0
+      cl = ulong 0
+      u = long k
+      while ge u 0 bound 16
+        cl = add cl 1
+        seen = add seen 1
+        u = get pla_gf_chd ulong u
+      end
+      put pla_gf_ch_bot nc k
+      put pla_gf_ch_len nc cl
+      gnd = ulong 0
+      if eq get pla_gf_par k -1
+        gnd = ulong 1
+      end
+      put pla_gf_ch_gnd nc gnd
+      nc = add nc 1
+    end
+  end
+  if ne seen nn
+    ret -3
+  end
+  put pla_gf_cnt 1 nc
+  i = ulong 1
+  while lt i nc bound 16
+    j = i
+    while gt j 0 bound 16
+      jm = sub j 1
+      sw = ulong 0
+      if gt get pla_gf_ch_gnd j get pla_gf_ch_gnd jm
+        sw = ulong 1
+      end
+      if eq get pla_gf_ch_gnd j get pla_gf_ch_gnd jm
+        if gt get pla_gf_ch_len j get pla_gf_ch_len jm
+          sw = ulong 1
+        end
+      end
+      if eq sw 0
+        break
+      end
+      tb = get pla_gf_ch_bot j
+      tl = get pla_gf_ch_len j
+      tg = get pla_gf_ch_gnd j
+      put pla_gf_ch_bot j get pla_gf_ch_bot jm
+      put pla_gf_ch_len j get pla_gf_ch_len jm
+      put pla_gf_ch_gnd j get pla_gf_ch_gnd jm
+      put pla_gf_ch_bot jm tb
+      put pla_gf_ch_len jm tl
+      put pla_gf_ch_gnd jm tg
+      j = jm
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn pla_goal_emit_shape to void
+  nc = get pla_gf_cnt 1
+  pos = ulong 0
+  dlen = len pla_shape_domain
+  for d ulong dlen bound 32
+    put sh_dat pos get pla_shape_domain d
+    pos = add pos 1
+  end
+  put sh_dat pos uchar and get pla_g_meta 1 255
+  pos = add pos 1
+  put sh_dat pos uchar and nc 255
+  pos = add pos 1
+  nobj = ulong 0
+  for ci ulong nc bound 16
+    cb = mul ci 3
+    put pla_g_chain cb nobj
+    put pla_g_chain add cb 1 get pla_gf_ch_len ci
+    put pla_g_chain add cb 2 get pla_gf_ch_gnd ci
+    u = long get pla_gf_ch_bot ci
+    while ge u 0 bound 16
+      ob = mul nobj 2
+      put pla_g_obj ob get pla_gf_nid ulong u
+      put pla_g_obj add ob 1 get pla_gf_ngen ulong u
+      nobj = add nobj 1
+      u = get pla_gf_chd ulong u
+    end
+    put sh_dat pos uchar and get pla_gf_ch_gnd ci 255
+    pos = add pos 1
+    put sh_dat pos uchar and get pla_gf_ch_len ci 255
+    pos = add pos 1
+  end
+  put pla_g_meta 5 nobj
+  put pla_g_meta 6 nc
+  sh_all pos
+  for si ulong 32
+    put pla_g_shape si get sh_dig si
+  end
+end
+
+fn pla_goal_read to long
+  rc = pla_goal_load_facts
+  if ne rc 0
+    ret rc
+  end
+  rc2 = pla_goal_build_forest
+  if ne rc2 0
+    ret rc2
+  end
+  pla_goal_emit_shape
+  ret 0
+end
+
+fn pla_fact_n n ulong to ulong
+  f = ulong 1
+  k = n
+  while gt k 1 bound 16
+    f = mul f k
+    k = sub k 1
+  end
+  ret f
+end
+
+global pla_b_ord ulong 16
+global pla_b_pool ulong 16
+
+fn pla_bind_group i ulong m ulong code_in ulong to void
+  code = code_in
+  for k ulong m bound 16
+    put pla_b_pool k add i k
+  end
+  np = m
+  for k ulong m bound 16
+    f = pla_fact_n sub sub m 1 k
+    pick = div code f
+    code = rem code f
+    put pla_b_ord add i k get pla_b_pool pick
+    q = pick
+    while lt add q 1 np bound 16
+      put pla_b_pool q get pla_b_pool add q 1
+      q = add q 1
+    end
+    np = sub np 1
+  end
+end
+
+fn pla_bind_chains attempt ulong to ulong
+  nc = get pla_g_meta 6
+  rest = attempt
+  total = ulong 1
+  i = ulong 0
+  while lt i nc bound 16
+    ci = mul i 3
+    j = i
+    while lt j nc bound 16
+      cj = mul j 3
+      if ne get pla_g_chain add cj 1 get pla_g_chain add ci 1
+        break
+      end
+      if ne get pla_g_chain add cj 2 get pla_g_chain add ci 2
+        break
+      end
+      j = add j 1
+    end
+    m = sub j i
+    radix = pla_fact_n m
+    total = mul total radix
+    pla_bind_group i m rem rest radix
+    rest = div rest radix
+    i = j
+  end
+  if ge attempt total
+    ret 0
+  end
+  if gt total 720
+    ret 0
+  end
+  ret 1
+end
+
+fn pla_find_unique_obj sl_type ulong sl_fld ulong want ulong to long
+  found = long -1
+  vn = get pl_view_n 0
+  f_off = add 4 sl_fld
+  for oi ulong vn bound 64
+    ob = mul oi 12
+    if ne get pl_view_obj ob 0
+      if eq get pl_view_obj add ob 1 sl_type
+        if eq get pl_view_obj add ob f_off want
+          if ge found 0
+            ret -1
+          end
+          found = long oi
+        end
+      end
+    end
+  end
+  ret found
+end
+
+fn pla_bind_one_inv tid ulong s ulong dst_slots edit ulong 16 to long
+  slb = add mul tid 48 mul s 6
+  if ne get pl_slots add slb 3 PLA_BIND_RESTS_ON
+    ret -1
+  end
+  sfrom = get pl_slots add slb 4
+  if ge sfrom s
+    ret -1
+  end
+  want = pl_ref_pack get dst_slots mul sfrom 2 get dst_slots add mul sfrom 2 1
+  found = pla_find_unique_obj get pl_slots slb and get pl_slots add slb 5 7 want
+  if lt found 0
+    ret -1
+  end
+  put dst_slots mul s 2 ulong found
+  put dst_slots add mul s 2 1 get pl_view_obj add mul ulong found 12 2
+  ret 0
+end
+
+fn pla_bind_copy_chain ci ulong s_in ulong dst_slots edit ulong 16 to ulong
+  s = s_in
+  cb = mul get pla_b_ord ci 3
+  st = get pla_g_chain cb
+  ln = get pla_g_chain add cb 1
+  for k ulong ln bound 16
+    ob = mul add st k 2
+    put dst_slots mul s 2 get pla_g_obj ob
+    put dst_slots add mul s 2 1 get pla_g_obj add ob 1
+    s = add s 1
+  end
+  ret s
+end
+
+note Bind template tid slots under attempt into dst_slots[0..15] (id, gen pairs).
+note Returns 1 bound, 0 no such attempt, -1 involved slot unbound.
+fn pla_bind tid ulong attempt ulong dst_slots edit ulong 16 to long
+  hb = mul tid 32
+  if ne get pl_hdr add hb 1 get pla_g_meta 5
+    ret 0
+  end
+  ns = get pl_hdr add hb 2
+  if gt ns PL_MAX_SLOTS
+    ret 0
+  end
+  if eq pla_bind_chains attempt 0
+    ret 0
+  end
+  s = ulong 0
+  nc = get pla_g_meta 6
+  for ci ulong nc bound 16
+    s = pla_bind_copy_chain ci s dst_slots
+  end
+  while lt s ns bound 8
+    if lt pla_bind_one_inv tid s dst_slots 0
+      ret -1
+    end
+    s = add s 1
+  end
+  ret 1
+end
+
+fn pla_target_from_goal to void
+  for i ulong 4
+    put pla_tg_meta i 0
+  end
+  nf = get pla_g_meta 4
+  for i ulong nf bound 8
+    pb = mul i 5
+    for k ulong 5
+      put pla_tg_facts add pb k get pla_g_facts add pb k
+    end
+  end
+  put pla_tg_meta 0 nf
+  nobj = get pla_g_meta 5
+  for i ulong nobj bound 16
+    ob = mul i 2
+    put pla_tg_ins ob get pla_g_obj ob
+    put pla_tg_ins add ob 1 get pla_g_obj add ob 1
+  end
+  put pla_tg_meta 1 nobj
+end
+
+fn pla_tg_one_pred pb ulong slots view ulong 16 to long
+  if ne get pl_preds add pb 2 PLA_F_SUPPORT
+    ret 0
+  end
+  pk = get pl_preds pb
+  if eq pk PL_P_NOT_SLOT
+    ret -1
+  end
+  ps = get pl_preds add pb 1
+  nf = get pla_tg_meta 0
+  fb = mul nf 5
+  if eq pk PL_P_EQ_CONST
+    if eq get pl_preds add pb 5 0
+      put pla_tg_facts fb get slots mul ps 2
+      put pla_tg_facts add fb 1 get slots add mul ps 2 1
+      put pla_tg_facts add fb 2 0
+      put pla_tg_facts add fb 3 0
+      put pla_tg_facts add fb 4 1
+      put pla_tg_meta 0 add nf 1
+    end
+    ret 0
+  end
+  if eq pk PL_P_EQ_SLOT
+    ps2 = get pl_preds add pb 3
+    put pla_tg_facts fb get slots mul ps 2
+    put pla_tg_facts add fb 1 get slots add mul ps 2 1
+    put pla_tg_facts add fb 2 get slots mul ps2 2
+    put pla_tg_facts add fb 3 get slots add mul ps2 2 1
+    put pla_tg_facts add fb 4 0
+    put pla_tg_meta 0 add nf 1
+  end
+  ret 0
+end
+
+fn pla_tg_push_prot ps ulong slots view ulong 16 to void
+  np = get pla_tg_meta 2
+  put pla_tg_prot mul np 2 get slots mul ps 2
+  put pla_tg_prot add mul np 2 1 get slots add mul ps 2 1
+  put pla_tg_meta 2 add np 1
+end
+
+fn pla_tg_fill_prot tid ulong slots view ulong 16 to void
+  n_inv = get pl_hdr add mul tid 32 26
+  ibase = pl_pred_base tid 3
+  for i ulong n_inv bound 48
+    pb = add ibase mul i 6
+    if eq get pl_preds pb PL_P_UNREFERENCED
+      pla_tg_push_prot get pl_preds add pb 1 slots
+    end
+  end
+end
+
+fn pla_target_from_template tid ulong slots view ulong 16 to long
+  for i ulong 4
+    put pla_tg_meta i 0
+  end
+  hb = mul tid 32
+  n_st = get pl_hdr add hb 24
+  pbase = pl_pred_base tid 1
+  for i ulong n_st bound 48
+    if lt pla_tg_one_pred add pbase mul i 6 slots 0
+      ret -1
+    end
+  end
+  pla_tg_fill_prot tid slots
+  ns = get pl_hdr add hb 2
+  for s ulong ns bound 8
+    put pla_tg_ins mul s 2 get slots mul s 2
+    put pla_tg_ins add mul s 2 1 get slots add mul s 2 1
+  end
+  put pla_tg_meta 1 ns
+  ret 0
+end
+
+note ---- A* planner helpers ----
+
+fn pla_sup s ulong u ulong to ulong
+  ret and shr s mul u 4 15
+end
+
+fn pla_set_sup s ulong u ulong v ulong to ulong
+  sh = mul u 4
+  mask = xor shl ulong 15 sh ulong 18446744073709551615
+  ret or and s mask shl and v 15 sh
+end
+
+fn pla_hmix x ulong to ulong
+  v = xor x shr x 33
+  v = mul v PLA_HMIX_A
+  v = xor v shr v 33
+  v = mul v PLA_HMIX_B
+  ret xor v shr v 33
+end
+
+global pla_h_wp ulong 14
+global pla_h_path ulong 14
+
+fn pla_heur_walk n ulong s ulong u ulong to ulong
+  np = ulong 0
+  x = u
+  ok = ulong 1
+  while lt np 15 bound 16
+    wx = get pla_h_wp x
+    if ne wx 2
+      ok = wx
+      break
+    end
+    put pla_h_path np x
+    np = add np 1
+    w = get pla_as_want x
+    if ne pla_sup s x w
+      ok = ulong 0
+      break
+    end
+    if eq w PLA_FLOOR
+      break
+    end
+    x = w
+    if eq get pla_as_want x PLA_NONE
+      break
+    end
+    if gt np n
+      ok = ulong 0
+      break
+    end
+  end
+  for i ulong np bound 14
+    put pla_h_wp get pla_h_path i ok
+  end
+  ret get pla_h_wp u
+end
+
+fn pla_heur n ulong ins_mask ulong prot_mask ulong s ulong to ulong
+  for u ulong PLA_MAX_UNITS
+    put pla_h_wp u 2
+  end
+  h = ulong 0
+  for u ulong n bound 14
+    if ne get pla_as_want u PLA_NONE
+      if eq pla_heur_walk n s u 0
+        h = add h 1
+      end
+    end
+  end
+  for u ulong n bound 14
+    if eq and ins_mask shl ulong 1 u 0
+      d = pla_sup s u
+      if ne d PLA_FLOOR
+        if ne and prot_mask shl ulong 1 d 0
+          h = add h 1
+        end
+      end
+    end
+  end
+  ret h
+end
+
+fn pla_heap_less a ulong b ulong to ulong
+  fa = get pla_as_hf a
+  fb = get pla_as_hf b
+  if lt fa fb
+    ret 1
+  end
+  if gt fa fb
+    ret 0
+  end
+  ha = get pla_as_hh a
+  hb = get pla_as_hh b
+  if lt ha hb
+    ret 1
+  end
+  if gt ha hb
+    ret 0
+  end
+  if lt get pla_as_hs a get pla_as_hs b
+    ret 1
+  end
+  ret 0
+end
+
+fn pla_heap_swap a ulong b ulong to void
+  tf = get pla_as_hf a
+  th = get pla_as_hh a
+  tn = get pla_as_hn a
+  ts = get pla_as_hs a
+  put pla_as_hf a get pla_as_hf b
+  put pla_as_hh a get pla_as_hh b
+  put pla_as_hn a get pla_as_hn b
+  put pla_as_hs a get pla_as_hs b
+  put pla_as_hf b tf
+  put pla_as_hh b th
+  put pla_as_hn b tn
+  put pla_as_hs b ts
+end
+
+fn pla_heap_push nh ulong f ulong h ulong nid ulong seq ulong to ulong
+  i = nh
+  put pla_as_hf i f
+  put pla_as_hh i h
+  put pla_as_hn i nid
+  put pla_as_hs i seq
+  while gt i 0 bound 16
+    p = div sub i 1 2
+    if eq pla_heap_less i p 0
+      break
+    end
+    pla_heap_swap i p
+    i = p
+  end
+  ret add nh 1
+end
+
+fn pla_heap_pop nh ulong dst edit ulong 3 to ulong
+  put dst 0 get pla_as_hf 0
+  put dst 1 get pla_as_hh 0
+  put dst 2 get pla_as_hn 0
+  nn = sub nh 1
+  if eq nn 0
+    ret 0
+  end
+  put pla_as_hf 0 get pla_as_hf nn
+  put pla_as_hh 0 get pla_as_hh nn
+  put pla_as_hn 0 get pla_as_hn nn
+  put pla_as_hs 0 get pla_as_hs nn
+  i = ulong 0
+  while lt i nn bound 16
+    l = add mul 2 i 1
+    r = add l 1
+    m = i
+    if lt l nn
+      if ne pla_heap_less l m 0
+        m = l
+      end
+    end
+    if lt r nn
+      if ne pla_heap_less r m 0
+        m = r
+      end
+    end
+    if eq m i
+      break
+    end
+    pla_heap_swap i m
+    i = m
+  end
+  ret nn
+end
+
+fn pla_find_unit n ulong oid ulong ogen ulong to ulong
+  for q ulong n bound 14
+    ub = mul q 2
+    if ne pla_same get pla_as_unit ub get pla_as_unit add ub 1 oid ogen 0
+      ret q
+    end
+  end
+  ret PLA_NONE
+end
+
+fn pla_htab_find ns ulong to ulong
+  hi = and pla_hmix ns PLA_ASTAR_HMASK
+  for step ulong PLA_ASTAR_HTAB
+    cur = get pla_as_htab hi
+    if eq cur PLA_U32_MAX
+      ret PLA_U32_MAX
+    end
+    if eq get pla_as_state cur ns
+      ret cur
+    end
+    hi = and add hi 1 PLA_ASTAR_HMASK
+  end
+  ret PLA_U32_MAX
+end
+
+fn pla_htab_put ns ulong id ulong to void
+  hi = and pla_hmix ns PLA_ASTAR_HMASK
+  for step ulong PLA_ASTAR_HTAB
+    cur = get pla_as_htab hi
+    if eq cur PLA_U32_MAX
+      put pla_as_htab hi id
+      ret
+    end
+    hi = and add hi 1 PLA_ASTAR_HMASK
+  end
+end
+
+note A* search context: 0:n, 1:ins_mask, 2:prot_mask, 3:s0, 4:nh, 5:nn, 6:seq, 7:expanded
+global pla_as_ctx ulong 8
+
+fn pla_plan_collect_units to long
+  n = ulong 0
+  n_ins = get pla_tg_meta 1
+  for i ulong n_ins bound 16
+    oid = get pla_tg_ins mul i 2
+    ogen = get pla_tg_ins add mul i 2 1
+    if eq pla_view_live oid ogen 0
+      ret -1
+    end
+    if ne get pl_view_obj add mul oid 12 1 PLA_OT_UNIT
+      ret -1
+    end
+    if eq pla_find_unit n oid ogen PLA_NONE
+      if ge n PLA_MAX_UNITS
+        ret -2
+      end
+      put pla_as_unit mul n 2 oid
+      put pla_as_unit add mul n 2 1 ogen
+      n = add n 1
+    end
+  end
+  ins_mask = ulong 0
+  for k ulong n bound 14
+    ins_mask = or ins_mask shl ulong 1 k
+  end
+  put pla_as_ctx 1 ins_mask
+  vn = get pl_view_n 0
+  for i ulong vn bound 64
+    ob = mul i 12
+    if ne get pl_view_obj ob 0
+      if eq get pl_view_obj add ob 1 PLA_OT_UNIT
+        ogen = get pl_view_obj add ob 2
+        if eq pla_find_unit n i ogen PLA_NONE
+          if ge n PLA_MAX_UNITS
+            ret -2
+          end
+          put pla_as_unit mul n 2 i
+          put pla_as_unit add mul n 2 1 ogen
+          n = add n 1
+        end
+      end
+    end
+  end
+  put pla_as_ctx 0 n
+  ret 0
+end
+
+fn pla_plan_build_model to long
+  n = get pla_as_ctx 0
+  for u ulong PLA_MAX_UNITS
+    put pla_as_want u PLA_NONE
+  end
+  nf = get pla_tg_meta 0
+  for i ulong nf bound 16
+    fb = mul i 5
+    a = pla_find_unit n get pla_tg_facts fb get pla_tg_facts add fb 1
+    if eq a PLA_NONE
+      ret -1
+    end
+    b = PLA_FLOOR
+    if eq get pla_tg_facts add fb 4 0
+      b = pla_find_unit n get pla_tg_facts add fb 2 get pla_tg_facts add fb 3
+      if eq b PLA_NONE
+        ret -1
+      end
+    end
+    put pla_as_want a b
+  end
+  prot_mask = ulong 0
+  np = get pla_tg_meta 2
+  for i ulong np bound 16
+    a = pla_find_unit n get pla_tg_prot mul i 2 get pla_tg_prot add mul i 2 1
+    if eq a PLA_NONE
+      ret -1
+    end
+    prot_mask = or prot_mask shl ulong 1 a
+  end
+  put pla_as_ctx 2 prot_mask
+  s0 = ulong 0
+  for u ulong n bound 14
+    oid = get pla_as_unit mul u 2
+    f = get pl_view_obj add mul oid 12 4
+    d = PLA_FLOOR
+    if ne f 0
+      d = pla_find_unit n pl_ref_id f pl_ref_gen f
+      if eq d PLA_NONE
+        ret -3
+      end
+    end
+    s0 = pla_set_sup s0 u d
+  end
+  put pla_as_ctx 3 s0
+  ret 0
+end
+
+fn pla_plan_reconstruct en ulong cg ulong to long
+  if gt cg PLA_MAX_MOVES
+    ret -6
+  end
+  put pla_p_n 0 cg
+  cur_at = en
+  k = cg
+  while gt k 0 bound 24
+    km = sub k 1
+    mb = mul km 5
+    mu = get pla_as_mov cur_at
+    du = get pla_as_dst cur_at
+    put pla_p_moves mb get pla_as_unit mul mu 2
+    put pla_p_moves add mb 1 get pla_as_unit add mul mu 2 1
+    if eq du PLA_FLOOR
+      put pla_p_moves add mb 2 0
+      put pla_p_moves add mb 3 0
+      put pla_p_moves add mb 4 1
+    else
+      put pla_p_moves add mb 2 get pla_as_unit mul du 2
+      put pla_p_moves add mb 3 get pla_as_unit add mul du 2 1
+      put pla_p_moves add mb 4 0
+    end
+    cur_at = get pla_as_par cur_at
+    k = km
+  end
+  ret 0
+end
+
+fn pla_plan_try_move en ulong u ulong d ulong to long
+  cs = get pla_as_state en
+  ns = pla_set_sup cs u d
+  ng = add get pla_as_g en 1
+  found = pla_htab_find ns
+  if ne found PLA_U32_MAX
+    if le get pla_as_g found ng
+      ret 0
+    end
+  end
+  id = found
+  if eq found PLA_U32_MAX
+    nn = get pla_as_ctx 5
+    if ge nn PLA_ASTAR_MAX_NODES
+      ret -4
+    end
+    id = nn
+    put pla_as_ctx 5 add nn 1
+    pla_htab_put ns id
+  end
+  put pla_as_state id ns
+  put pla_as_g id ng
+  put pla_as_par id en
+  put pla_as_mov id u
+  put pla_as_dst id d
+  nh = get pla_as_ctx 4
+  if ge nh PLA_ASTAR_MAX_NODES
+    ret -4
+  end
+  hh = pla_heur get pla_as_ctx 0 get pla_as_ctx 1 get pla_as_ctx 2 ns
+  seq = get pla_as_ctx 6
+  put pla_as_ctx 4 pla_heap_push nh add ng hh hh id seq
+  put pla_as_ctx 6 add seq 1
+  ret 0
+end
+
+fn pla_plan_expand_u en ulong cov ulong u ulong to long
+  n = get pla_as_ctx 0
+  ins_mask = get pla_as_ctx 1
+  frm = pla_sup get pla_as_state en u
+  for dd ulong add n 1 bound 15
+    d = dd
+    if eq dd n
+      d = PLA_FLOOR
+    end
+    ok = ulong 1
+    if eq d frm
+      ok = ulong 0
+    end
+    if eq d u
+      ok = ulong 0
+    end
+    if ne ok 0
+      if ne d PLA_FLOOR
+        if eq and ins_mask shl ulong 1 d 0
+          ok = ulong 0
+        end
+        if ne and cov shl ulong 1 d 0
+          ok = ulong 0
+        end
+        if eq and ins_mask shl ulong 1 u 0
+          ok = ulong 0
+        end
+      end
+    end
+    if ne ok 0
+      rc = pla_plan_try_move en u d
+      if ne rc 0
+        ret rc
+      end
+    end
+  end
+  ret 0
+end
+
+fn pla_plan_expand_node en ulong to long
+  n = get pla_as_ctx 0
+  cov = ulong 0
+  cs = get pla_as_state en
+  for u ulong n bound 14
+    du = pla_sup cs u
+    if ne du PLA_FLOOR
+      cov = or cov shl ulong 1 du
+    end
+  end
+  for u ulong n bound 14
+    if eq and cov shl ulong 1 u 0
+      erc = pla_plan_expand_u en cov u
+      if ne erc 0
+        ret erc
+      end
+    end
+  end
+  ret 0
+end
+
+fn pla_plan max_expand ulong to long
+  put pla_p_n 0 0
+  rc1 = pla_plan_collect_units
+  if ne rc1 0
+    ret rc1
+  end
+  rc2 = pla_plan_build_model
+  if ne rc2 0
+    ret rc2
+  end
+  for i ulong PLA_ASTAR_HTAB
+    put pla_as_htab i PLA_U32_MAX
+  end
+  s0 = get pla_as_ctx 3
+  put pla_as_state 0 s0
+  put pla_as_g 0 0
+  put pla_as_par 0 PLA_U32_MAX
+  put pla_as_mov 0 0
+  put pla_as_dst 0 0
+  pla_htab_put s0 0
+  h0 = pla_heur get pla_as_ctx 0 get pla_as_ctx 1 get pla_as_ctx 2 s0
+  put pla_as_ctx 4 pla_heap_push 0 h0 h0 0 0
+  put pla_as_ctx 5 1
+  put pla_as_ctx 6 1
+  put pla_as_ctx 7 0
+  top = new ulong 3 0
+  while gt get pla_as_ctx 4 0 bound 2048
+    put pla_as_ctx 4 pla_heap_pop get pla_as_ctx 4 top
+    en = get top 2
+    cg = get pla_as_g en
+    if eq get top 0 add cg get top 1
+      if eq get top 1 0
+        ret pla_plan_reconstruct en cg
+      end
+      exp = add get pla_as_ctx 7 1
+      put pla_as_ctx 7 exp
+      if gt exp max_expand
+        ret -5
+      end
+      erc = pla_plan_expand_node en
+      if ne erc 0
+        ret erc
+      end
+    end
+  end
+  ret -5
+end
+
+fn pla_check_clear me ulong to_v ulong to long
+  vn = get pl_view_n 0
+  for i ulong vn bound 64
+    ob = mul i 12
+    if ne get pl_view_obj ob 0
+      if eq get pl_view_obj add ob 1 PLA_OT_UNIT
+        sf = get pl_view_obj add ob 4
+        if eq sf me
+          ret -2
+        end
+        if ne to_v 0
+          if eq sf to_v
+            ret -3
+          end
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn pla_apply_one k ulong to long
+  mb = mul k 5
+  mid = get pla_p_moves mb
+  mgen = get pla_p_moves add mb 1
+  if eq pla_view_live mid mgen 0
+    ret -1
+  end
+  me = pl_ref_pack mid mgen
+  to_v = ulong 0
+  if eq get pla_p_moves add mb 4 0
+    did = get pla_p_moves add mb 2
+    dgen = get pla_p_moves add mb 3
+    if eq pla_view_live did dgen 0
+      ret -1
+    end
+    to_v = pl_ref_pack did dgen
+  end
+  crc = pla_check_clear me to_v
+  if ne crc 0
+    ret crc
+  end
+  put pl_view_obj add mul mid 12 4 to_v
+  ret 0
+end
+
+fn pla_apply to long
+  np = get pla_p_n 0
+  for k ulong np bound 24
+    rc = pla_apply_one k
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret 0
+end
+
+fn pla_legal to ulong
+  vn = get pl_view_n 0
+  for i ulong vn bound 64
+    ob = mul i 12
+    if ne get pl_view_obj ob 0
+      if eq get pl_view_obj add ob 1 PLA_OT_UNIT
+        me = pl_ref_pack i get pl_view_obj add ob 2
+        if ne get pl_view_obj add ob 6 me
+          ret 0
+        end
+        s = get pl_view_obj add ob 4
+        steps = ulong 0
+        while ne s 0 bound 65
+          sid = pl_ref_id s
+          sgen = pl_ref_gen s
+          if eq pla_view_live sid sgen 0
+            ret 0
+          end
+          sob = mul sid 12
+          if ne get pl_view_obj add sob 1 PLA_OT_UNIT
+            ret 0
+          end
+          steps = add steps 1
+          if gt steps vn
+            ret 0
+          end
+          s = get pl_view_obj add sob 4
+        end
+        mysup = get pl_view_obj add ob 4
+        if ne mysup 0
+          j = add i 1
+          while lt j vn bound 64
+            job = mul j 12
+            if ne get pl_view_obj job 0
+              if eq get pl_view_obj add job 1 PLA_OT_UNIT
+                if eq get pl_view_obj add job 4 mysup
+                  ret 0
+                end
+              end
+            end
+            j = add j 1
+          end
+        end
+      end
+    end
+  end
+  ret 1
+end
+
+fn pla_slot_of slots view ulong 16 n ulong oid ulong ogen ulong to long
+  for s ulong n bound 8
+    if ne pla_same get slots mul s 2 get slots add mul s 2 1 oid ogen 0
+      ret long s
+    end
+  end
+  ret -1
+end
+
+fn pla_add_pred tid ulong lidx ulong pv view ulong 6 to void
+  hb = mul tid 32
+  cnt = get pl_hdr add hb add 23 lidx
+  if ge cnt PL_MAX_PREDS
+    ret
+  end
+  pb = add pl_pred_base tid lidx mul cnt 6
+  for k ulong 6
+    put pl_preds add pb k get pv k
+  end
+  put pl_hdr add hb add 23 lidx add cnt 1
+end
+
+fn pla_put_pred tid ulong lidx ulong kind ulong sl ulong fld ulong val ulong to void
+  pv = new ulong 6 0
+  put pv 0 kind
+  put pv 1 sl
+  put pv 2 fld
+  put pv 5 val
+  pla_add_pred tid lidx pv
+end
+
+fn pla_put_pred2 tid ulong lidx ulong kind ulong sl ulong sl2 ulong tp ulong to void
+  pv = new ulong 6 0
+  put pv 0 kind
+  put pv 1 sl
+  put pv 2 PLA_F_SUPPORT
+  put pv 3 sl2
+  put pv 4 tp
+  pla_add_pred tid lidx pv
+end
+
+fn pla_gen_close_step tid ulong s ulong n_in ulong slots_out edit ulong 16 to long
+  n = n_in
+  me = pl_ref_pack get slots_out mul s 2 get slots_out add mul s 2 1
+  sb = mul tid 48
+  vn = get pl_view_n 0
+  for i ulong vn bound 64
+    ob = mul i 12
+    if ne get pl_view_obj ob 0
+      if eq get pl_view_obj add ob 1 PLA_OT_UNIT
+        if eq get pl_view_obj add ob 4 me
+          ogen = get pl_view_obj add ob 2
+          if lt pla_slot_of slots_out n i ogen 0
+            if ge n PL_MAX_SLOTS
+              ret -1
+            end
+            put slots_out mul n 2 i
+            put slots_out add mul n 2 1 ogen
+            slb = add sb mul n 6
+            put pl_slots slb PLA_OT_UNIT
+            put pl_slots add slb 1 PLA_ROLE_INVOLVED
+            put pl_slots add slb 2 0
+            put pl_slots add slb 3 PLA_BIND_RESTS_ON
+            put pl_slots add slb 4 s
+            put pl_slots add slb 5 PLA_F_SUPPORT
+            n = add n 1
+          end
+        end
+      end
+    end
+  end
+  ret long n
+end
+
+fn pla_gen_collect_slots tid ulong slots_out edit ulong 16 to long
+  nobj = get pla_g_meta 5
+  if gt nobj PL_MAX_SLOTS
+    ret -1
+  end
+  sb = mul tid 48
+  n = ulong 0
+  for i ulong nobj bound 8
+    put slots_out mul n 2 get pla_g_obj mul i 2
+    put slots_out add mul n 2 1 get pla_g_obj add mul i 2 1
+    slb = add sb mul n 6
+    put pl_slots slb PLA_OT_UNIT
+    put pl_slots add slb 1 PLA_ROLE_GOAL
+    put pl_slots add slb 2 0
+    put pl_slots add slb 3 PLA_BIND_FROM_GOAL
+    put pl_slots add slb 4 0
+    put pl_slots add slb 5 0
+    n = add n 1
+  end
+  put pl_hdr add mul tid 32 1 n
+  s = ulong 0
+  while lt s n bound 8
+    nn = pla_gen_close_step tid s n slots_out
+    if lt nn 0
+      ret nn
+    end
+    n = ulong nn
+    s = add s 1
+  end
+  put pl_hdr add mul tid 32 2 n
+  ret long n
+end
+
+fn pla_gen_add_succ tid ulong n ulong slots_out view ulong 16 to long
+  nf = get pla_g_meta 4
+  for i ulong nf bound 8
+    fb = mul i 5
+    a = pla_slot_of slots_out n get pla_g_facts fb get pla_g_facts add fb 1
+    if lt a 0
+      ret -3
+    end
+    if ne get pla_g_facts add fb 4 0
+      pla_put_pred tid 4 PL_P_EQ_CONST ulong a PLA_F_SUPPORT 0
+    else
+      b = pla_slot_of slots_out n get pla_g_facts add fb 2 get pla_g_facts add fb 3
+      if lt b 0
+        ret -3
+      end
+      pla_put_pred2 tid 4 PL_P_EQ_SLOT ulong a ulong b 0
+    end
+  end
+  ret 0
+end
+
+fn pla_gen_add_preds tid ulong n ulong slots_out view ulong 16 to long
+  np = get pla_p_n 0
+  for k ulong np bound 24
+    mb = mul k 5
+    if lt pla_slot_of slots_out n get pla_p_moves mb get pla_p_moves add mb 1 0
+      ret -2
+    end
+    if eq get pla_p_moves add mb 4 0
+      if lt pla_slot_of slots_out n get pla_p_moves add mb 2 get pla_p_moves add mb 3 0
+        ret -2
+      end
+    end
+  end
+  for si ulong n bound 8
+    oid = get slots_out mul si 2
+    f = get pl_view_obj add mul oid 12 4
+    if eq f 0
+      pla_put_pred tid 1 PL_P_EQ_CONST si PLA_F_SUPPORT 0
+    else
+      jj = pla_slot_of slots_out n pl_ref_id f pl_ref_gen f
+      if ge jj 0
+        pla_put_pred2 tid 1 PL_P_EQ_SLOT si ulong jj 0
+      else
+        pla_put_pred tid 1 PL_P_NOT_SLOT si PLA_F_SUPPORT 0
+      end
+    end
+    pla_put_pred2 tid 3 PL_P_UNREFERENCED si 0 PLA_OT_UNIT
+    pla_put_pred tid 3 PL_P_SELF_REF si PLA_F_SELF 0
+  end
+  hb = mul tid 32
+  etot = mul np PLA_MOVE_ENERGY
+  put pl_hdr add hb 10 PLA_MOVE_ENERGY
+  put pl_hdr add hb 11 np
+  put pl_hdr add hb 12 etot
+  pla_put_pred tid 0 PL_P_ENV_EQ 0 1 PLA_GOAL_ARRANGE
+  pla_put_pred tid 0 PL_P_ENV_GE 0 2 np
+  pla_put_pred tid 0 PL_P_ENV_GE 0 3 etot
+  pla_put_pred tid 2 PL_P_ENV_EQ 3 0 1
+  src = pla_gen_add_succ tid n slots_out
+  if ne src 0
+    ret src
+  end
+  put pl_hdr add hb 3 PLA_FAIL_ALL
+  ret 0
+end
+
+global pla_gen_sl ulong 16
+
+fn pla_gslot_of n ulong oid ulong ogen ulong to long
+  for s ulong n bound 8
+    if ne pla_same get pla_gen_sl mul s 2 get pla_gen_sl add mul s 2 1 oid ogen 0
+      ret long s
+    end
+  end
+  ret -1
+end
+
+fn pla_slot_add_right tid ulong s ulong rt ulong to void
+  slb = add mul tid 48 mul s 6
+  put pl_slots add slb 2 or get pl_slots add slb 2 rt
+end
+
+fn pla_gen_move_src tid ulong gslot ulong mb ulong prev long to long
+  if ne get pla_p_moves add mb 4 0
+    src = rx_graph_node gslot AG_CONST AG_T_U64
+    if lt src 0
+      ret -4
+    end
+    rx_graph_set_node gslot ulong src 3 0
+    ret src
+  end
+  n = get pl_hdr add mul tid 32 2
+  ds = ulong pla_gslot_of n get pla_p_moves add mb 2 get pla_p_moves add mb 3
+  src = rx_graph_node gslot AG_WORLD_READ AG_T_U64
+  if lt src 0
+    ret -4
+  end
+  rx_graph_set_node gslot ulong src 5 add ds 1
+  rx_graph_set_node gslot ulong src 8 PLA_F_SELF
+  pla_slot_add_right tid ds PLA_RIGHT_READ
+  if ge prev 0
+    ign_o1 = rx_graph_order gslot ulong prev ulong src
+  end
+  ret src
+end
+
+fn pla_gen_graph_move tid ulong gslot ulong k ulong prev long to long
+  mb = mul k 5
+  src = pla_gen_move_src tid gslot mb prev
+  if lt src 0
+    ret src
+  end
+  n = get pl_hdr add mul tid 32 2
+  xs = ulong pla_gslot_of n get pla_p_moves mb get pla_p_moves add mb 1
+  pub = rx_graph_node gslot AG_WORLD_PUBLISH AG_T_RECEIPT
+  if lt pub 0
+    ret -4
+  end
+  rx_graph_set_node gslot ulong pub 5 add xs 1
+  rx_graph_set_node gslot ulong pub 8 PLA_F_SUPPORT
+  pla_slot_add_right tid xs PLA_RIGHT_WRITE
+  ign_d1 = rx_graph_data gslot ulong src ulong pub 0 AG_EDGE_DATA
+  if ge prev 0
+    ign_o2 = rx_graph_order gslot ulong prev ulong pub
+  end
+  need_buf = new ulong 7 0
+  put need_buf 6 PLA_MOVE_ENERGY
+  ign_r1 = rx_graph_need_resource gslot ulong pub need_buf
+  ret pub
+end
+
+fn pla_gen_ver_eq tid ulong gslot ulong fb ulong rxn ulong ver ulong to long
+  n = get pl_hdr add mul tid 32 2
+  b = ulong pla_gslot_of n get pla_g_facts add fb 2 get pla_g_facts add fb 3
+  rtn = rx_graph_node gslot AG_WORLD_READ AG_T_U64
+  if lt rtn 0
+    ret -4
+  end
+  rx_graph_set_node gslot ulong rtn 5 add b 1
+  rx_graph_set_node gslot ulong rtn 8 PLA_F_SELF
+  pla_slot_add_right tid b PLA_RIGHT_READ
+  eqn = rx_graph_node gslot AG_PURE AG_T_U64
+  if lt eqn 0
+    ret -4
+  end
+  rx_graph_set_node gslot ulong eqn 2 AG_OP_EQ
+  ign_d3 = rx_graph_data gslot rxn ulong eqn 0 AG_EDGE_DATA
+  ign_d4 = rx_graph_data gslot ulong rtn ulong eqn 1 AG_EDGE_DATA
+  ign_d5 = rx_graph_data gslot ulong eqn ver 0 AG_EDGE_DATA
+  rx_graph_set_node gslot ver 3 1
+  rx_graph_set_node gslot ver 4 1
+  ret rtn
+end
+
+fn pla_gen_graph_ver tid ulong gslot ulong i ulong prev long to long
+  n = get pl_hdr add mul tid 32 2
+  fb = mul i 5
+  a = ulong pla_gslot_of n get pla_g_facts fb get pla_g_facts add fb 1
+  rxn = rx_graph_node gslot AG_WORLD_READ AG_T_U64
+  if lt rxn 0
+    ret -4
+  end
+  rx_graph_set_node gslot ulong rxn 5 add a 1
+  rx_graph_set_node gslot ulong rxn 8 PLA_F_SUPPORT
+  pla_slot_add_right tid a PLA_RIGHT_READ
+  if ge prev 0
+    ign_o3 = rx_graph_order gslot ulong prev ulong rxn
+  end
+  ver = rx_graph_node gslot AG_VERIFY AG_T_VERDICT
+  if lt ver 0
+    ret -4
+  end
+  if ne get pla_g_facts add fb 4 0
+    ign_d2 = rx_graph_data gslot ulong rxn ulong ver 0 AG_EDGE_DATA
+    rx_graph_set_node gslot ulong ver 3 0
+    rx_graph_set_node gslot ulong ver 4 0
+  else
+    rtn = pla_gen_ver_eq tid gslot fb ulong rxn ulong ver
+    if lt rtn 0
+      ret rtn
+    end
+    if ge prev 0
+      ign_o4 = rx_graph_order gslot ulong prev ulong rtn
+    end
+  end
+  ign_s1 = rx_graph_success gslot ulong ver AG_OK
+  ret 0
+end
+
+fn pla_gen_finish tid ulong gslot ulong to void
+  rx_graph_identify gslot
+  db = add mul tid 96 32
+  gb = mul gslot 32
+  for i ulong 32
+    put pl_digs add db i get ag_digest add gb i
+  end
+  hb = mul tid 32
+  put pl_hdr add hb 13 add get pla_p_n 0 get pla_g_meta 4
+  put pl_hdr add hb 14 PLA_GRAPH_RX_GRAPH
+  rx_plan_identify tid
+end
+
+note Generalize pla_p_moves / pla_g_* on current pl_view into template tid + graph slot gslot.
+fn pla_generalize tid ulong gslot ulong slots_out edit ulong 16 to long
+  pl_clear_tpl tid
+  put pl_hdr mul tid 32 PLA_GOAL_ARRANGE
+  for i ulong 32
+    put pl_digs add mul tid 96 i get pla_g_shape i
+  end
+  n = pla_gen_collect_slots tid slots_out
+  if lt n 0
+    ret n
+  end
+  for i ulong 16
+    put pla_gen_sl i get slots_out i
+  end
+  prc = pla_gen_add_preds tid ulong n slots_out
+  if ne prc 0
+    ret prc
+  end
+  rx_graph_init gslot 0
+  prev = long -1
+  np = get pla_p_n 0
+  for k ulong np bound 24
+    prev = pla_gen_graph_move tid gslot k prev
+    if lt prev 0
+      ret prev
+    end
+  end
+  nf = get pla_g_meta 4
+  for i ulong nf bound 8
+    vrc = pla_gen_graph_ver tid gslot i prev
+    if ne vrc 0
+      ret vrc
+    end
+  end
+  pla_gen_finish tid gslot
+  ret 0
+end
+
+fn pla_tm_find_src gslot ulong ni ulong to long
+  src = long -1
+  nd = get ag_n_data gslot
+  for e ulong nd bound 256
+    eb = ag_doff gslot e
+    if eq get ag_data add eb 1 ni
+      src = long get ag_data eb
+    end
+  end
+  ret src
+end
+
+fn pla_tm_set_dest gslot ulong su ulong mb ulong slots view ulong 16 to long
+  skind = rx_graph_get_node gslot su 0
+  if eq skind AG_CONST
+    if ne rx_graph_get_node gslot su 3 0
+      ret -1
+    end
+    put pla_p_moves add mb 2 0
+    put pla_p_moves add mb 3 0
+    put pla_p_moves add mb 4 1
+    ret 0
+  end
+  if eq skind AG_WORLD_READ
+    sprm = rx_graph_get_node gslot su 5
+    if eq sprm 0
+      ret -1
+    end
+    ds = sub sprm 1
+    put pla_p_moves add mb 2 get slots mul ds 2
+    put pla_p_moves add mb 3 get slots add mul ds 2 1
+    put pla_p_moves add mb 4 0
+    ret 0
+  end
+  ret -1
+end
+
+fn pla_tm_one gslot ulong ni ulong slots view ulong 16 to long
+  if eq rx_graph_get_node gslot ni 12 0
+    ret 0
+  end
+  if ne rx_graph_get_node gslot ni 0 AG_WORLD_PUBLISH
+    ret 0
+  end
+  prm = rx_graph_get_node gslot ni 5
+  if eq prm 0
+    ret 0
+  end
+  src = pla_tm_find_src gslot ni
+  if lt src 0
+    ret -1
+  end
+  cnt = get pla_p_n 0
+  if ge cnt PLA_MAX_MOVES
+    ret -1
+  end
+  mb = mul cnt 5
+  ms = sub prm 1
+  put pla_p_moves mb get slots mul ms 2
+  put pla_p_moves add mb 1 get slots add mul ms 2 1
+  rc = pla_tm_set_dest gslot ulong src mb slots
+  if ne rc 0
+    ret rc
+  end
+  put pla_p_n 0 add cnt 1
+  ret 0
+end
+
+note Extract moves from graph gslot under binding slots into pla_p_moves.
+fn pla_template_moves gslot ulong slots view ulong 16 to long
+  put pla_p_n 0 0
+  nn = get ag_n_nodes gslot
+  for ni ulong nn bound 64
+    rc = pla_tm_one gslot ni slots
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret 0
+end

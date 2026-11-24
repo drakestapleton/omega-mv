@@ -1,0 +1,922 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_fusion.om -- Pure seeded OM-2 port of src/runtime/rx_fusion.c.
+note Omega verified workflow fusion: observe verified runs, mine repeated fragments,
+note judge & rank candidates, build MetaSkill with OMEGA_METASKILL_V1 SHA-256 identity,
+note verify against reference fragment, accept measurement, canary gate,
+note promote & publish, find sites, trial & apply published MetaSkills.
+note Requires seed/ng/sha256.om and src/runtime/rx_graph.om concatenated before this file.
+
+const AG_FUSION_MAX_PATTERNS ulong 16
+const AG_FUSION_MAX_ANCESTRY ulong 8
+const AG_FUSION_MAX_GRAPHS ulong 8
+const AG_FUSION_MAX_LIBRARY ulong 8
+const AG_FUSION_MAX_APPLIED ulong 8
+const AG_FUSION_MAX_SITES ulong 8
+
+const AG_FUSION_E_STATE long -20
+const AG_FUSION_E_GENERATION long -21
+const AG_FUSION_E_IDENTITY long -22
+const AG_FUSION_E_AUTHORITY long -23
+
+const AG_FUSE_ELIGIBLE ulong 0
+const AG_FUSE_TOO_SMALL ulong 1
+const AG_FUSE_TOO_FEW ulong 2
+const AG_FUSE_TOO_FEW_GRAPHS ulong 3
+const AG_FUSE_FAILURE_RATE ulong 4
+const AG_FUSE_UNSTABLE ulong 5
+
+const AG_MS_CANDIDATE ulong 1
+const AG_MS_VERIFIED ulong 2
+const AG_MS_REJECTED ulong 3
+const AG_MS_MEASURED ulong 4
+const AG_MS_SLOWER ulong 5
+const AG_MS_CANARY_PASSED ulong 6
+const AG_MS_QUARANTINED ulong 7
+const AG_MS_PROMOTED ulong 8
+const AG_MS_PUBLISHED ulong 9
+
+const AG_VR_OK ulong 0
+const AG_VR_IDENTITY ulong 1
+const AG_VR_CONTRACT ulong 2
+const AG_VR_AUTHORITY ulong 3
+const AG_VR_EFFECT ulong 4
+const AG_VR_RESOURCE ulong 5
+const AG_VR_NOT_RUNNABLE ulong 6
+const AG_VR_SEMANTIC ulong 7
+const AG_VR_FAILURE ulong 8
+const AG_VR_EVIDENCE ulong 9
+
+const AG_REAL_COMPILED ulong 1
+const AG_REAL_LEARNED ulong 2
+const AG_REAL_HYBRID ulong 3
+const AG_REAL_HARDWARE ulong 4
+
+text fus_tag_ms "OMEGA_METASKILL_V1"
+text fus_tag_prog "OMEGA_META_PROG_V1"
+text fus_tag_real "OMEGA_META_REAL_V1"
+
+note Observer state:
+note   meta: 0:n, 1:runs_observed, 2:runs_refused, 3:fragments_seen, 4:fragments_over_budget, 5:patterns_dropped
+global fus_obs_meta ulong 8
+note   patterns (16 x 16 ulongs):
+note     0:n_steps, 1:n_in, 2:n_obj, 3:out_type, 4:occurrences, 5:n_graphs,
+note     6:ok, 7:failed, 8:skipped, 9:evidence_stable, 10:evidence_unstable,
+note     11:n_ancestry, 12:may_fail, 13:eff_performs, 14:eff_publishes, 15:eff_proposals
+global fus_pat_meta ulong 256
+note   pattern signatures (16 x 32 bytes)
+global fus_pat_sig uchar 512
+note   pattern step nodes (16 x 8 x 4 ulongs: kind, out_type, op, imm)
+global fus_pat_steps ulong 512
+note   pattern step local_ids (16 x 8 x 32 bytes)
+global fus_pat_lid uchar 4096
+note   pattern input contract (16 x 4 x 2 ulongs: type, mode)
+global fus_pat_in ulong 128
+note   pattern obj rights (16 x 2 ulongs)
+global fus_pat_rights ulong 32
+note   pattern resource need (16 x 7 ulongs)
+global fus_pat_need ulong 112
+note   pattern seen graph digests (16 x 8 x 32 bytes)
+global fus_pat_graphs uchar 4096
+note   pattern ancestry (16 x 8 x 2 ulongs: run, exit_origin) + graph digests (16 x 8 x 32)
+global fus_pat_anc ulong 256
+global fus_pat_anc_g uchar 4096
+
+note MetaSkill library (up to 8 MetaSkills):
+note   meta (8 x 24 ulongs):
+note     0:id, 1:state, 2:real_kind, 3:n_steps, 4:n_in, 5:n_obj, 6:out_type, 7:may_fail,
+note     8:eff_performs, 9:eff_publishes, 10:eff_proposals, 11:n_ancestry,
+note     12:verdict_pass, 13:verdict_reason, 14:canary_runs, 15:canary_div,
+note     16:generation, 17:published_in_skills, 18:tol_permille, 19:pat_idx
+global fus_ms_meta ulong 192
+global fus_ms_id uchar 256
+global fus_ms_real_id uchar 256
+global fus_ms_ref_sig uchar 256
+global fus_ms_in ulong 64
+global fus_ms_rights ulong 16
+global fus_ms_need ulong 56
+global fus_ms_anc ulong 128
+global fus_ms_anc_g uchar 2048
+
+note Site scratch (up to 8 sites x 16 ulongs: 0:members, 1:exit, 2:n_steps, 3:n_ext, 4:n_obj, 5..12:node[0..7])
+global fus_sites ulong 128
+note Report scratch: 0:verdict_ok, 1:applied, 2:refused_unpublished
+global fus_rep ulong 4
+note Promoted active generation tracker (simulating RxGenStore for standalone fusion gate)
+global fus_gen_active ulong 1
+global fus_gen_next ulong 1
+
+fn fus_word64 d view uchar 8 to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or shl v 8 ulong get d i
+  end
+  ret v
+end
+
+fn fus_eligible_kind k ulong to ulong
+  if eq k AG_CONST
+    ret 1
+  end
+  if eq k AG_PURE
+    ret 1
+  end
+  if eq k AG_WORLD_READ
+    ret 1
+  end
+  if eq k AG_RECALL
+    ret 1
+  end
+  if eq k AG_PHYSICAL
+    ret 1
+  end
+  if eq k AG_SKILL
+    ret 1
+  end
+  if eq k AG_EFFECT_PROPOSE
+    ret 1
+  end
+  if eq k AG_VERIFY
+    ret 1
+  end
+  if eq k AG_RETRY
+    ret 1
+  end
+  ret 0
+end
+
+fn fus_put8 pos ulong v ulong to ulong
+  put sh_dat pos uchar and v 255
+  ret add pos 1
+end
+
+fn fus_put32 pos ulong v ulong to ulong
+  p = pos
+  put sh_dat p uchar and shr v 24 255
+  p = add p 1
+  put sh_dat p uchar and shr v 16 255
+  p = add p 1
+  put sh_dat p uchar and shr v 8 255
+  p = add p 1
+  put sh_dat p uchar and v 255
+  ret add p 1
+end
+
+fn fus_put64 pos ulong v ulong to ulong
+  p = fus_put32 pos shr v 32
+  ret fus_put32 p and v 4294967295
+end
+
+fn rx_fusion_observer_init to void
+  for i ulong 8
+    put fus_obs_meta i 0
+  end
+  for i ulong 256
+    put fus_pat_meta i 0
+  end
+  put fus_gen_active 0 1
+  put fus_gen_next 0 2
+end
+
+fn fus_site_step_one g ulong n ulong p_idx ulong j ulong acc ulong to ulong
+  el = new ulong 4 0
+  k = ag_inputs_by_port g n el
+  in_v = new ulong 4 0
+  for i ulong k bound 4
+    eb = ag_doff g get el i
+    put in_v i get ag_ref_value get ag_data eb
+  end
+  lid = new uchar 32 0
+  lb = mul add mul p_idx 8 j 32
+  for b ulong 32
+    put lid b get fus_pat_lid add lb b
+  end
+  meta = new ulong 3 0
+  put meta 0 get ag_ref_status n
+  put meta 1 get ag_ref_value n
+  put meta 2 k
+  ret rx_graph_step_record acc lid meta in_v
+end
+
+note Compute step evidence chain for a site of p_idx on graph g using ag_ref_status/ag_ref_value.
+fn rx_fusion_site_steps g ulong site_idx ulong p_idx ulong to ulong
+  sb = mul site_idx 16
+  ns = get fus_sites add sb 2
+  acc = ulong 0
+  for j ulong ns bound 8
+    n = get fus_sites add sb add 5 j
+    acc = fus_site_step_one g n p_idx j acc
+  end
+  ret acc
+end
+
+fn fus_pinned g ulong n ulong to ulong
+  nev = get ag_n_ev g
+  for i ulong nev bound 64
+    if eq get ag_ev add mul g 64 i n
+      ret 1
+    end
+  end
+  nsu = get ag_n_succ g
+  for i ulong nsu bound 8
+    if eq get ag_succ add mul g 16 mul i 2 n
+      ret 1
+    end
+  end
+  nfa = get ag_n_fail g
+  for i ulong nfa bound 8
+    if eq get ag_fail add mul g 16 mul i 2 n
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn fus_can_add_step g ulong set_m ulong frm ulong to ulong
+  if ne and set_m shl ulong 1 frm 0
+    ret 0
+  end
+  fk = rx_graph_get_node g frm 0
+  if eq fus_eligible_kind fk 0
+    ret 0
+  end
+  if eq fk AG_VERIFY
+    ret 0
+  end
+  if ne fus_pinned g frm 0
+    ret 0
+  end
+  ndata = get ag_n_data g
+  for e2 ulong ndata bound 256
+    eb2 = ag_doff g e2
+    if eq get ag_data eb2 frm
+      if eq and set_m shl ulong 1 get ag_data add eb2 1 0
+        ret 0
+      end
+    end
+  end
+  nd = get ag_n_deps g
+  for d2 ulong nd bound 128
+    db2 = ag_peoff g d2
+    if eq get ag_deps db2 frm
+      ret 0
+    end
+    if eq get ag_deps add db2 1 frm
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fus_hash_site g ulong site_idx ulong dst_sig edit uchar 32 to void
+  sb = mul site_idx 16
+  cnt = get fus_sites add sb 2
+  pos = ulong 0
+  tlen = len fus_tag_prog
+  for i ulong tlen bound 32
+    pos = fus_put8 pos ulong get fus_tag_prog i
+  end
+  pos = fus_put32 pos cnt
+  for j ulong cnt bound 8
+    n = get fus_sites add sb add 5 j
+    pos = fus_put32 pos rx_graph_get_node g n 0
+    pos = fus_put32 pos rx_graph_get_node g n 1
+    pos = fus_put32 pos rx_graph_get_node g n 2
+    pos = fus_put64 pos rx_graph_get_node g n 3
+    pos = fus_put64 pos rx_graph_get_node g n 4
+  end
+  sh_all pos
+  for i ulong 32
+    put dst_sig i get sh_dig i
+  end
+end
+
+global fus_ext_ord ulong 8
+global fus_ext_st ulong 2
+
+fn fus_extract_step g ulong cur ulong to void
+  el = new ulong 4 0
+  k = ag_inputs_by_port g cur el
+  for i ulong k bound 4
+    eb = ag_doff g get el i
+    if eq get ag_data add eb 3 AG_EDGE_DATA
+      frm = get ag_data eb
+      cnt = get fus_ext_st 1
+      if lt cnt 8
+        set_m = get fus_ext_st 0
+        if ne fus_can_add_step g set_m frm 0
+          put fus_ext_st 0 or set_m shl ulong 1 frm
+          put fus_ext_ord cnt frm
+          put fus_ext_st 1 add cnt 1
+        end
+      end
+    end
+  end
+end
+
+fn fus_store_site exit_n ulong site_idx ulong cnt ulong to void
+  sb = mul site_idx 16
+  put fus_sites sb get fus_ext_st 0
+  put fus_sites add sb 1 exit_n
+  put fus_sites add sb 2 cnt
+  put fus_sites add sb 3 0
+  put fus_sites add sb 4 0
+  for j ulong cnt bound 8
+    src_i = sub sub cnt 1 j
+    v = get fus_ext_ord src_i
+    put fus_sites add add sb 5 j v
+  end
+end
+
+note Extract a maximal linear/convex eligible chain ending at exit_n on graph g into site_idx.
+note Writes signature into dst_sig[0..31]. Returns n_steps (>=2) or 0 if not extractable.
+fn fus_extract_at g ulong exit_n ulong site_idx ulong dst_sig edit uchar 32 to ulong
+  if eq rx_graph_get_node g exit_n 12 0
+    ret 0
+  end
+  if eq fus_eligible_kind rx_graph_get_node g exit_n 0 0
+    ret 0
+  end
+  nd = get ag_n_deps g
+  for d ulong nd bound 128
+    if eq get ag_deps add ag_peoff g d 1 exit_n
+      ret 0
+    end
+  end
+  put fus_ext_st 0 shl ulong 1 exit_n
+  put fus_ext_ord 0 exit_n
+  put fus_ext_st 1 1
+  idx = ulong 0
+  while lt idx get fus_ext_st 1 bound 8
+    fus_extract_step g get fus_ext_ord idx
+    idx = add idx 1
+  end
+  cnt = get fus_ext_st 1
+  if lt cnt 2
+    ret 0
+  end
+  fus_store_site exit_n site_idx cnt
+  fus_hash_site g site_idx dst_sig
+  ret cnt
+end
+
+fn fus_sig_eq_pat p_idx ulong sig view uchar 32 to ulong
+  base = mul p_idx 32
+  for i ulong 32
+    if ne get fus_pat_sig add base i get sig i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fus_pat_find_or_add g ulong x ulong cnt ulong sig view uchar 32 to long
+  np = get fus_obs_meta 0
+  for i ulong np bound 16
+    if ne fus_sig_eq_pat i sig 0
+      ret long i
+    end
+  end
+  if ge np AG_FUSION_MAX_PATTERNS
+    put fus_obs_meta 5 add get fus_obs_meta 5 1
+    ret -1
+  end
+  put fus_obs_meta 0 add np 1
+  pm = mul np 16
+  for k ulong 16
+    put fus_pat_meta add pm k 0
+  end
+  put fus_pat_meta pm cnt
+  put fus_pat_meta add pm 3 rx_graph_get_node g x 1
+  put fus_pat_meta add pm 12 1
+  sb = mul np 32
+  for b ulong 32
+    put fus_pat_sig add sb b get sig b
+  end
+  ret long np
+end
+
+fn fus_pat_g_eq gb ulong gdig ulong to ulong
+  for b ulong 32
+    if ne get fus_pat_graphs add gb b get ag_digest add gdig b
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn fus_pat_add_graph pu ulong g ulong to void
+  pm = mul pu 16
+  ng = get fus_pat_meta add pm 5
+  gdig = mul g 32
+  for gi ulong ng bound 8
+    gb = mul add mul pu 8 gi 32
+    if ne fus_pat_g_eq gb gdig 0
+      ret
+    end
+  end
+  if lt ng AG_FUSION_MAX_GRAPHS
+    gb = mul add mul pu 8 ng 32
+    for b ulong 32
+      put fus_pat_graphs add gb b get ag_digest add gdig b
+    end
+    put fus_pat_meta add pm 5 add ng 1
+  end
+end
+
+fn fus_pat_add_anc pu ulong g ulong x ulong run_id ulong to void
+  pm = mul pu 16
+  na = get fus_pat_meta add pm 11
+  if ge na AG_FUSION_MAX_ANCESTRY
+    ret
+  end
+  ab = mul add mul pu 8 na 2
+  put fus_pat_anc ab run_id
+  put fus_pat_anc add ab 1 rx_graph_get_node g x 11
+  agb = mul add mul pu 8 na 32
+  gdig = mul g 32
+  for b ulong 32
+    put fus_pat_anc_g add agb b get ag_digest add gdig b
+  end
+  put fus_pat_meta add pm 11 add na 1
+end
+
+fn fus_observe_one g ulong x ulong run_id ulong to void
+  sig = new uchar 32 0
+  cnt = fus_extract_at g x 0 sig
+  if lt cnt 2
+    ret
+  end
+  put fus_obs_meta 3 add get fus_obs_meta 3 1
+  pi = fus_pat_find_or_add g x cnt sig
+  if lt pi 0
+    ret
+  end
+  pu = ulong pi
+  pm = mul pu 16
+  put fus_pat_meta add pm 4 add get fus_pat_meta add pm 4 1
+  fus_pat_add_graph pu g
+  fus_pat_add_anc pu g x run_id
+  st = get ag_ref_status x
+  if eq st AG_OK
+    put fus_pat_meta add pm 6 add get fus_pat_meta add pm 6 1
+    ret
+  end
+  if eq st AG_FAILED
+    put fus_pat_meta add pm 7 add get fus_pat_meta add pm 7 1
+    ret
+  end
+  if eq st AG_SKIPPED
+    put fus_pat_meta add pm 8 add get fus_pat_meta add pm 8 1
+  end
+end
+
+note Observe one verified run of graph g (requires ag_ref_outcome != INCOMPLETE and verified_ok == 1).
+fn rx_fusion_observe g ulong run_id ulong verified_ok ulong to ulong
+  if eq verified_ok 0
+    put fus_obs_meta 2 add get fus_obs_meta 2 1
+    ret 0
+  end
+  if eq get ag_ref_outcome 0 AG_RUN_INCOMPLETE
+    put fus_obs_meta 2 add get fus_obs_meta 2 1
+    ret 0
+  end
+  put fus_obs_meta 1 add get fus_obs_meta 1 1
+  nn = get ag_n_nodes g
+  for x ulong nn bound 64
+    fus_observe_one g x run_id
+  end
+  ret 1
+end
+
+fn rx_fusion_judge pat_idx ulong pol view ulong 4 to ulong
+  pm = mul pat_idx 16
+  min_occ = get pol 0
+  min_graphs = get pol 1
+  max_fail_pm = get pol 2
+  ms = get pol 3
+  if lt ms 2
+    ms = ulong 2
+  end
+  if lt get fus_pat_meta pm ms
+    ret AG_FUSE_TOO_SMALL
+  end
+  if ne get fus_pat_meta add pm 10 0
+    ret AG_FUSE_UNSTABLE
+  end
+  ok_c = get fus_pat_meta add pm 6
+  fl_c = get fus_pat_meta add pm 7
+  dec = add ok_c fl_c
+  if eq dec 0
+    ret AG_FUSE_FAILURE_RATE
+  end
+  if gt mul fl_c 1000 mul max_fail_pm dec
+    ret AG_FUSE_FAILURE_RATE
+  end
+  if lt get fus_pat_meta add pm 4 min_occ
+    ret AG_FUSE_TOO_FEW
+  end
+  if lt get fus_pat_meta add pm 5 min_graphs
+    ret AG_FUSE_TOO_FEW_GRAPHS
+  end
+  ret AG_FUSE_ELIGIBLE
+end
+
+fn fus_cand_gt ix ulong iy ulong to ulong
+  sx = get fus_pat_meta mul ix 16
+  sy = get fus_pat_meta mul iy 16
+  if gt sy sx
+    ret 1
+  end
+  if eq sy sx
+    if gt get fus_pat_meta add mul iy 16 4 get fus_pat_meta add mul ix 16 4
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn rx_fusion_candidates pol view ulong 4 dst edit ulong 16 max_n ulong to ulong
+  np = get fus_obs_meta 0
+  k = ulong 0
+  for i ulong np bound 16
+    if lt k max_n
+      if eq rx_fusion_judge i pol AG_FUSE_ELIGIBLE
+        put dst k i
+        k = add k 1
+      end
+    end
+  end
+  a = ulong 1
+  while lt a k bound 16
+    b = a
+    while gt b 0 bound 16
+      bm = sub b 1
+      ix = get dst bm
+      iy = get dst b
+      if eq fus_cand_gt ix iy 0
+        break
+      end
+      put dst bm iy
+      put dst b ix
+      b = bm
+    end
+    a = add a 1
+  end
+  ret k
+end
+
+fn fus_id_hash_anc ms_idx ulong pos_in ulong to ulong
+  pos = pos_in
+  na = get fus_ms_meta add mul ms_idx 24 11
+  pos = fus_put32 pos na
+  for i ulong na bound 8
+    agb = mul add mul ms_idx 8 i 32
+    for b ulong 32
+      pos = fus_put8 pos ulong get fus_ms_anc_g add agb b
+    end
+    ab = mul add mul ms_idx 8 i 2
+    pos = fus_put64 pos get fus_ms_anc ab
+    pos = fus_put32 pos get fus_ms_anc add ab 1
+  end
+  ret pos
+end
+
+note Compute OMEGA_METASKILL_V1 SHA-256 identity of MetaSkill slot ms_idx into dst[0..31].
+fn rx_fusion_identity ms_idx ulong dst edit uchar 32 to void
+  mb = mul ms_idx 24
+  pos = ulong 0
+  for i ulong len fus_tag_ms bound 32
+    pos = fus_put8 pos ulong get fus_tag_ms i
+  end
+  pos = fus_put32 pos get fus_ms_meta mb
+  pos = fus_put32 pos get fus_ms_meta add mb 4
+  inb = mul ms_idx 8
+  for i ulong 4
+    pos = fus_put32 pos get fus_ms_in add inb mul i 2
+    pos = fus_put8 pos get fus_ms_in add inb add mul i 2 1
+  end
+  pos = fus_put32 pos get fus_ms_meta add mb 6
+  pos = fus_put8 pos get fus_ms_meta add mb 7
+  pos = fus_put32 pos get fus_ms_meta add mb 5
+  rb = mul ms_idx 2
+  for i ulong 2
+    pos = fus_put32 pos get fus_ms_rights add rb i
+  end
+  nb = mul ms_idx 7
+  for i ulong 4
+    pos = fus_put32 pos get fus_ms_need add nb i
+  end
+  for i ulong 3
+    pos = fus_put64 pos get fus_ms_need add nb add 4 i
+  end
+  pos = fus_put32 pos get fus_ms_meta add mb 8
+  pos = fus_put32 pos get fus_ms_meta add mb 9
+  pos = fus_put32 pos get fus_ms_meta add mb 10
+  for i ulong 32
+    pos = fus_put8 pos ulong get fus_ms_real_id add mul ms_idx 32 i
+  end
+  for i ulong 32
+    pos = fus_put8 pos ulong get fus_ms_ref_sig add mul ms_idx 32 i
+  end
+  pos = fus_id_hash_anc ms_idx pos
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn fus_copy_one_anc pat_idx ulong ms_idx ulong i ulong to void
+  ab_s = mul add mul pat_idx 8 i 2
+  ab_d = mul add mul ms_idx 8 i 2
+  put fus_ms_anc ab_d get fus_pat_anc ab_s
+  put fus_ms_anc add ab_d 1 get fus_pat_anc add ab_s 1
+  ag_s = mul add mul pat_idx 8 i 32
+  ag_d = mul add mul ms_idx 8 i 32
+  for b ulong 32
+    put fus_ms_anc_g add ag_d b get fus_pat_anc_g add ag_s b
+  end
+end
+
+fn fus_build_copy_anc pat_idx ulong ms_idx ulong na ulong to void
+  ds = mul ms_idx 32
+  ss = mul pat_idx 32
+  for b ulong 32
+    put fus_ms_ref_sig add ds b get fus_pat_sig add ss b
+  end
+  for i ulong na bound 8
+    fus_copy_one_anc pat_idx ms_idx i
+  end
+end
+
+fn fus_build_ids ms_idx ulong kind ulong to void
+  pos = ulong 0
+  for i ulong len fus_tag_real bound 32
+    pos = fus_put8 pos ulong get fus_tag_real i
+  end
+  pos = fus_put32 pos kind
+  sb = mul ms_idx 32
+  for b ulong 32
+    pos = fus_put8 pos ulong get fus_ms_ref_sig add sb b
+  end
+  sh_all pos
+  for b ulong 32
+    put fus_ms_real_id add sb b get sh_dig b
+  end
+  id_buf = new uchar 32 0
+  rx_fusion_identity ms_idx id_buf
+  for b ulong 32
+    put fus_ms_id add sb b get id_buf b
+  end
+end
+
+fn rx_fusion_build pat_idx ulong kind ulong skill_id ulong ms_idx ulong to long
+  pm = mul pat_idx 16
+  if lt get fus_pat_meta pm 2
+    ret AG_E_ARG
+  end
+  if lt kind AG_REAL_COMPILED
+    ret AG_E_ARG
+  end
+  if gt kind AG_REAL_HARDWARE
+    ret AG_E_ARG
+  end
+  mb = mul ms_idx 24
+  for k ulong 24
+    put fus_ms_meta add mb k 0
+  end
+  put fus_ms_meta mb skill_id
+  put fus_ms_meta add mb 1 AG_MS_CANDIDATE
+  put fus_ms_meta add mb 2 kind
+  put fus_ms_meta add mb 3 get fus_pat_meta pm
+  put fus_ms_meta add mb 4 get fus_pat_meta add pm 1
+  put fus_ms_meta add mb 5 get fus_pat_meta add pm 2
+  put fus_ms_meta add mb 6 get fus_pat_meta add pm 3
+  put fus_ms_meta add mb 7 get fus_pat_meta add pm 12
+  put fus_ms_meta add mb 8 get fus_pat_meta add pm 13
+  put fus_ms_meta add mb 9 get fus_pat_meta add pm 14
+  put fus_ms_meta add mb 10 get fus_pat_meta add pm 15
+  na = get fus_pat_meta add pm 11
+  put fus_ms_meta add mb 11 na
+  put fus_ms_meta add mb 19 pat_idx
+  fus_build_copy_anc pat_idx ms_idx na
+  fus_build_ids ms_idx kind
+  ret 0
+end
+
+fn rx_fusion_verify ms_idx ulong to long
+  mb = mul ms_idx 24
+  if ne get fus_ms_meta add mb 1 AG_MS_CANDIDATE
+    ret AG_FUSION_E_STATE
+  end
+  id_buf = new uchar 32 0
+  rx_fusion_identity ms_idx id_buf
+  id_ok = ulong 1
+  for b ulong 32
+    if ne get id_buf b get fus_ms_id add mul ms_idx 32 b
+      id_ok = ulong 0
+    end
+  end
+  if eq id_ok 0
+    put fus_ms_meta add mb 12 0
+    put fus_ms_meta add mb 13 AG_VR_IDENTITY
+    put fus_ms_meta add mb 1 AG_MS_REJECTED
+    ret 0
+  end
+  if lt get fus_ms_meta add mb 3 2
+    put fus_ms_meta add mb 12 0
+    put fus_ms_meta add mb 13 AG_VR_CONTRACT
+    put fus_ms_meta add mb 1 AG_MS_REJECTED
+    ret 0
+  end
+  if ne get fus_ms_meta add mb 8 0
+    put fus_ms_meta add mb 12 0
+    put fus_ms_meta add mb 13 AG_VR_EFFECT
+    put fus_ms_meta add mb 1 AG_MS_REJECTED
+    ret 0
+  end
+  if ne get fus_ms_meta add mb 9 0
+    put fus_ms_meta add mb 12 0
+    put fus_ms_meta add mb 13 AG_VR_EFFECT
+    put fus_ms_meta add mb 1 AG_MS_REJECTED
+    ret 0
+  end
+  if eq get fus_ms_meta add mb 2 AG_REAL_HARDWARE
+    put fus_ms_meta add mb 12 0
+    put fus_ms_meta add mb 13 AG_VR_NOT_RUNNABLE
+    put fus_ms_meta add mb 1 AG_MS_REJECTED
+    ret 0
+  end
+  put fus_ms_meta add mb 12 1
+  put fus_ms_meta add mb 13 AG_VR_OK
+  put fus_ms_meta add mb 1 AG_MS_VERIFIED
+  ret 0
+end
+
+note ms[0..10]: commits_b, commits_a, crumbs_b, crumbs_a, med_b, med_a, spread_pm, ok_b, ok_a, fail_b, fail_a
+fn rx_fusion_accept_measure ms_idx ulong ms view ulong 11 tol_pm ulong to long
+  mb = mul ms_idx 24
+  if ne get fus_ms_meta add mb 1 AG_MS_VERIFIED
+    ret AG_FUSION_E_STATE
+  end
+  tol = tol_pm
+  if gt get ms 6 tol
+    tol = get ms 6
+  end
+  put fus_ms_meta add mb 18 tol
+  ok = ulong 1
+  if ge get ms 1 get ms 0
+    ok = ulong 0
+  end
+  if ge get ms 3 get ms 2
+    ok = ulong 0
+  end
+  if gt mul get ms 5 1000 mul get ms 4 add 1000 tol
+    ok = ulong 0
+  end
+  if ne get ms 7 get ms 8
+    ok = ulong 0
+  end
+  if ne get ms 9 get ms 10
+    ok = ulong 0
+  end
+  if ne ok 0
+    put fus_ms_meta add mb 1 AG_MS_MEASURED
+    ret 0
+  end
+  put fus_ms_meta add mb 1 AG_MS_SLOWER
+  ret -1
+end
+
+fn rx_fusion_canary ms_idx ulong diverged ulong required ulong to long
+  mb = mul ms_idx 24
+  if ne get fus_ms_meta add mb 1 AG_MS_MEASURED
+    ret AG_FUSION_E_STATE
+  end
+  runs = add get fus_ms_meta add mb 14 1
+  put fus_ms_meta add mb 14 runs
+  if ne diverged 0
+    put fus_ms_meta add mb 15 add get fus_ms_meta add mb 15 1
+    put fus_ms_meta add mb 1 AG_MS_QUARANTINED
+    ret -1
+  end
+  if ge runs required
+    if eq get fus_ms_meta add mb 15 0
+      put fus_ms_meta add mb 1 AG_MS_CANARY_PASSED
+    end
+  end
+  ret 0
+end
+
+fn rx_fusion_promote ms_idx ulong auth_ok ulong to long
+  mb = mul ms_idx 24
+  if ne get fus_ms_meta add mb 1 AG_MS_CANARY_PASSED
+    ret AG_FUSION_E_STATE
+  end
+  if eq auth_ok 0
+    ret AG_FUSION_E_AUTHORITY
+  end
+  gid = get fus_gen_next 0
+  put fus_gen_next 0 add gid 1
+  put fus_gen_active 0 gid
+  put fus_ms_meta add mb 16 gid
+  put fus_ms_meta add mb 1 AG_MS_PROMOTED
+  ret 0
+end
+
+fn rx_fusion_publish ms_idx ulong to long
+  mb = mul ms_idx 24
+  if ne get fus_ms_meta add mb 1 AG_MS_PROMOTED
+    ret AG_FUSION_E_STATE
+  end
+  if ne get fus_ms_meta add mb 16 get fus_gen_active 0
+    ret AG_FUSION_E_GENERATION
+  end
+  id_buf = new uchar 32 0
+  rx_fusion_identity ms_idx id_buf
+  for b ulong 32
+    if ne get id_buf b get fus_ms_id add mul ms_idx 32 b
+      ret AG_FUSION_E_IDENTITY
+    end
+  end
+  put fus_ms_meta add mb 17 1
+  put fus_ms_meta add mb 1 AG_MS_PUBLISHED
+  ret 0
+end
+
+fn rx_fusion_find g ulong sig view uchar 32 max_sites ulong to ulong
+  nn = get ag_n_nodes g
+  found = ulong 0
+  taken = ulong 0
+  tmp = new uchar 32 0
+  for x ulong nn bound 64
+    if ge found max_sites
+      break
+    end
+    cnt = fus_extract_at g x found tmp
+    if ge cnt 2
+      sb = mul found 16
+      sm = get fus_sites sb
+      if eq and sm taken 0
+        eqs = ulong 1
+        for b ulong 32
+          if ne get tmp b get sig b
+            eqs = ulong 0
+          end
+        end
+        if ne eqs 0
+          taken = or taken sm
+          found = add found 1
+        end
+      end
+    end
+  end
+  ret found
+end
+
+fn rx_fusion_trial g ulong ms_idx ulong dst_applied edit ulong 1 to long
+  mb = mul ms_idx 24
+  st = get fus_ms_meta add mb 1
+  ok_st = ulong 0
+  if eq st AG_MS_VERIFIED
+    ok_st = ulong 1
+  end
+  if eq st AG_MS_MEASURED
+    ok_st = ulong 1
+  end
+  if eq ok_st 0
+    ret AG_FUSION_E_STATE
+  end
+  sig = new uchar 32 0
+  for b ulong 32
+    put sig b get fus_ms_ref_sig add mul ms_idx 32 b
+  end
+  n = rx_fusion_find g sig AG_FUSION_MAX_SITES
+  put dst_applied 0 n
+  ret 0
+end
+
+fn rx_fusion_apply g ulong n_lib ulong to long
+  put fus_rep 0 0
+  put fus_rep 1 0
+  put fus_rep 2 0
+  sig = new uchar 32 0
+  for i ulong n_lib bound 8
+    mb = mul i 24
+    st = get fus_ms_meta add mb 1
+    pub = get fus_ms_meta add mb 17
+    if ne st AG_MS_PUBLISHED
+      put fus_rep 2 add get fus_rep 2 1
+    else
+      if eq pub 0
+        put fus_rep 2 add get fus_rep 2 1
+      else
+        for b ulong 32
+          put sig b get fus_ms_ref_sig add mul i 32 b
+        end
+        n = rx_fusion_find g sig AG_FUSION_MAX_SITES
+        put fus_rep 1 add get fus_rep 1 n
+      end
+    end
+  end
+  ret 0
+end

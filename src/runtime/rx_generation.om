@@ -1,0 +1,1840 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_generation.om -- Pure seeded OM-2 port of src/runtime/rx_generation.c.
+note One active generation, candidate proposal/mutation/work accounting,
+note R9ROOT3/R9PTR01/R9JRN01/R9RCT03/R9WORK1 binary encoding with SHA-256 checksums,
+note length-prefixed SHA-256 work resource derivation, promotion barrier,
+note crash-point modeling, recovery, replay rejection, and durable executor job slots.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const RX_GEN_OK long 0
+const RX_GEN_ERR_ARG long -40
+const RX_GEN_ERR_STALE long -41
+const RX_GEN_ERR_AUTHORITY long -42
+const RX_GEN_ERR_CLOSING long -43
+const RX_GEN_ERR_TORN long -44
+const RX_GEN_ERR_MISSING long -45
+const RX_GEN_ERR_REPLAY long -46
+const RX_GEN_ERR_BUSY long -47
+const RX_GEN_ERR_VERIFY long -48
+const RX_GEN_ERR_IO long -49
+const RX_GEN_ERR_IDENTITY long -50
+const RX_GEN_ERR_HALTED long -51
+
+const RX_GEN_MAX_OBJECTS ulong 32
+const RX_GEN_MAX_WORK ulong 16
+const RX_GEN_MAX_EXTERNAL ulong 8
+const RX_GEN_MAX_EXCLUDED ulong 8
+const RX_GEN_MAX_CAND ulong 4
+const RX_GEN_MAX_BLOB ulong 1024
+const RX_GEN_MAX_COMMITTED ulong 8
+
+const RX_GEN_RES_PROMOTION ulong 2309
+const RX_GEN_RIGHT_PROMOTE ulong 512
+const RX_GEN_RIGHT_FINISH ulong 2
+
+const RX_WORK_EPHEMERAL ulong 1
+const RX_WORK_EVIDENCE ulong 2
+const RX_WORK_EXTERNAL ulong 3
+
+const RX_WORK_PENDING ulong 0
+const RX_WORK_ISSUED ulong 1
+const RX_WORK_DONE ulong 2
+const RX_WORK_CANCELLED ulong 3
+
+const RX_CRASH_NONE ulong 0
+const RX_CRASH_BEFORE_CANDIDATE_WRITE ulong 1
+const RX_CRASH_DURING_CANDIDATE_WRITE ulong 2
+const RX_CRASH_AFTER_CANDIDATE_WRITE ulong 3
+const RX_CRASH_BEFORE_ROOT_FLIP ulong 4
+const RX_CRASH_DURING_ROOT_FLIP ulong 5
+const RX_CRASH_AFTER_ROOT_FLIP ulong 6
+const RX_CRASH_BEFORE_RECEIPT ulong 7
+const RX_CRASH_AFTER_RECEIPT ulong 8
+
+const RG_PHASE_NONE ulong 0
+const RG_PHASE_CANDIDATE ulong 1
+const RG_PHASE_FLIPPED ulong 2
+const RG_PHASE_RECEIPT ulong 3
+
+const RG_DIG_OBJECT ulong 0
+const RG_DIG_EVIDENCE ulong 1
+const RG_DIG_MODEL ulong 2
+const RG_DIG_REALIZATION ulong 3
+const RG_DIG_CONFIG ulong 4
+const RG_DIG_PROVENANCE ulong 5
+const RG_DIG_COUNT ulong 6
+
+const RG_ROOT_BYTES ulong 512
+const RG_ROOT_SUM ulong 480
+const RG_PTR_BYTES ulong 128
+const RG_PTR_SUM ulong 96
+const RG_JRN_BYTES ulong 128
+const RG_JRN_SUM ulong 96
+const RG_RCT_BYTES ulong 256
+const RG_RCT_SUM ulong 224
+const RG_WORK_HDR ulong 16
+const RG_WORK_ROW ulong 80
+
+const RX_GEN_JOB_PROPOSE ulong 0
+const RX_GEN_JOB_PROMOTE ulong 1
+const RX_GEN_JOB_IDLE ulong 0
+const RX_GEN_JOB_PENDING ulong 1
+const RX_GEN_JOB_DONE ulong 2
+
+text rg_domain_work "omega.rx.generation.work.finish.v1"
+text rg_magic_root3 "R9ROOT3"
+text rg_magic_root2 "R9ROOT2"
+text rg_magic_root1 "R9ROOT1"
+text rg_magic_ptr "R9PTR01"
+text rg_magic_jrn "R9JRN01"
+text rg_magic_rct "R9RCT03"
+text rg_magic_work "R9WORK1"
+text rg_genesis_ev "GENESIS"
+
+note Global process-wide IO counters: 0:bytes, 1:syncs
+global rg_global_io ulong 2
+
+note Store state:
+note   0:open, 1:active_id, 2:active_lineage, 3:next_id, 4:crash_step,
+note   5:barrier_held, 6:bound, 7:halt_marked, 8:io_bytes, 9:io_syncs,
+note   10:sim_clock_ns, 11:exec_running, 12:exec_seq, 13:dir_len,
+note   14:auth_caller_ok, 15:auth_promote_ok, 16:auth_finish_ok, 17:auth_hold_ok,
+note   18:drain_auto_finish
+global rg_st ulong 24
+global rg_dir uchar 128
+
+note Phases of last promotion (13 ulongs + result long)
+global rg_phases ulong 14
+global rg_phase_res long 1
+
+note Active pointer (128B), journal (128B), events (16 entries: id, lineage)
+global rg_ptr_raw uchar 128
+global rg_ptr_valid ulong 1
+global rg_jrn_raw uchar 128
+global rg_jrn_valid ulong 1
+global rg_events_id ulong 16
+global rg_events_lin ulong 16
+global rg_n_events ulong 1
+
+note Committed generations on disk (up to 8 slots, indexed by slot 0..7):
+note   rg_disk_id[8], rg_disk_has_rct[8], rg_disk_root[8 * 512], rg_disk_rct[8 * 256]
+note   rg_disk_blobs[8 * 7 * 1024] (0..5 = DIG_*, 6 = work), rg_disk_blen[8 * 7]
+global rg_disk_id ulong 8
+global rg_disk_has_rct ulong 8
+global rg_disk_root uchar 4096
+global rg_disk_rct uchar 2048
+global rg_disk_blobs uchar 57344
+global rg_disk_blen ulong 56
+
+note Candidates (up to 4 slots):
+note   meta: 4 * 12 ulongs:
+note     0:used, 1:id, 2:parent_id, 3:proposer, 4:closing, 5:draining,
+note     6:proofs_ok, 7:auth_epoch, 8:auth_gen, 9:n_objects, 10:n_work
+global rg_cand_meta ulong 48
+note   objects: 4 * 32 * 4 ulongs (0:id, 1:gen, 2:obs_set, 3:obs_gen)
+global rg_cand_obj ulong 512
+note   object digests: 4 * 32 * 32 bytes
+global rg_cand_odig uchar 4096
+note   blobs: 4 * 6 * 1024 bytes, lengths 4 * 6
+global rg_cand_blob uchar 24576
+global rg_cand_blen ulong 24
+note   work: 4 * 16 * 10 ulongs:
+note     0:id, 1:class, 2:state, 3:required, 4:worker, 5:worker_set,
+note     6:finish_cap_id, 7:finish_cap_gen, 8:completer, 9:finish_resource
+global rg_cand_work ulong 640
+note   work evidence digests: 4 * 16 * 32 bytes
+global rg_cand_wdig uchar 2048
+
+note Scratch buffers for root/work/recovery encoding
+global rg_tmp_root uchar 512
+global rg_tmp_work uchar 1408
+global rg_rec_meta ulong 8
+global rg_rec_ext ulong 8
+global rg_rec_exc ulong 8
+
+note Executor job slots (2 kinds: 0=PROPOSE, 1=PROMOTE):
+note   0:state, 1:seq, 2:key, 3:res_id, 4:res_active, 5:res_lineage, 6:res_ns
+global rg_job_meta ulong 16
+global rg_job_rc long 2
+
+fn rg_put_u32_buf buf edit uchar 512 off ulong v ulong to void
+  put buf off uchar and v 255
+  put buf add off 1 uchar and shr v 8 255
+  put buf add off 2 uchar and shr v 16 255
+  put buf add off 3 uchar and shr v 24 255
+end
+
+fn rg_put_u64_buf buf edit uchar 512 off ulong v ulong to void
+  for i ulong 8
+    put buf add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn rg_get_u32_buf buf view uchar 512 off ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    b = ulong get buf add off i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn rg_get_u64_buf buf view uchar 512 off ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    b = ulong get buf add off i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn rg_clock to ulong
+  t = get rg_st 10
+  put rg_st 10 add t 1000
+  ret t
+end
+
+fn rg_charge_io nbytes ulong nsyncs ulong to void
+  put rg_global_io 0 add get rg_global_io 0 nbytes
+  put rg_global_io 1 add get rg_global_io 1 nsyncs
+  put rg_st 8 add get rg_st 8 nbytes
+  put rg_st 9 add get rg_st 9 nsyncs
+end
+
+fn rx_gen_io_counters dst edit ulong 2 to void
+  put dst 0 get rg_global_io 0
+  put dst 1 get rg_global_io 1
+end
+
+fn rx_gen_store_io dst edit ulong 2 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  put dst 0 get rg_st 8
+  put dst 1 get rg_st 9
+  ret RX_GEN_OK
+end
+
+fn rx_gen_last_phases dst edit ulong 14 dst_res edit long 1 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  for i ulong 14
+    put dst i get rg_phases i
+  end
+  put dst_res 0 get rg_phase_res 0
+  if eq get rg_phases 1 0
+    ret RX_GEN_ERR_MISSING
+  end
+  ret RX_GEN_OK
+end
+
+fn rg_find_cand cid ulong to long
+  for i ulong RX_GEN_MAX_CAND
+    mb = mul i 12
+    if ne get rg_cand_meta mb 0
+      if eq get rg_cand_meta add mb 1 cid
+        ret long i
+      end
+    end
+  end
+  ret -1
+end
+
+fn rg_find_disk gid ulong to long
+  for i ulong RX_GEN_MAX_COMMITTED
+    if eq get rg_disk_id i gid
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn rg_alloc_disk gid ulong to long
+  ex = rg_find_disk gid
+  if ge ex 0
+    ret ex
+  end
+  for i ulong RX_GEN_MAX_COMMITTED
+    if eq get rg_disk_id i 0
+      put rg_disk_id i gid
+      put rg_disk_has_rct i 0
+      ret long i
+    end
+  end
+  ret -1
+end
+
+note Compute work_resource_value = SHA256("omega.rx.generation.work.finish.v1" || le64(dir_len) || dir || le64(parent) || le64(cid) || le64(wid))[0..7]
+fn rx_gen_work_resource cid ulong work_id ulong dst edit ulong 1 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  ci = rg_find_cand cid
+  if lt ci 0
+    ret RX_GEN_ERR_ARG
+  end
+  mb = mul ulong ci 12
+  parent_id = get rg_cand_meta add mb 2
+  pos = ulong 0
+  dlen = len rg_domain_work
+  for i ulong dlen bound 64
+    put sh_dat pos get rg_domain_work i
+    pos = add pos 1
+  end
+  dirl = get rg_st 13
+  for i ulong 8
+    put sh_dat pos uchar and shr dirl mul i 8 255
+    pos = add pos 1
+  end
+  for i ulong dirl bound 128
+    put sh_dat pos get rg_dir i
+    pos = add pos 1
+  end
+  for i ulong 8
+    put sh_dat pos uchar and shr parent_id mul i 8 255
+    pos = add pos 1
+  end
+  for i ulong 8
+    put sh_dat pos uchar and shr cid mul i 8 255
+    pos = add pos 1
+  end
+  for i ulong 8
+    put sh_dat pos uchar and shr work_id mul i 8 255
+    pos = add pos 1
+  end
+  sh_all pos
+  res = ulong 0
+  for i ulong 8
+    b = ulong get sh_dig i
+    res = or res shl b mul i 8
+  end
+  if eq res 0
+    res = ulong 18446744073709551615
+  end
+  put dst 0 res
+  ret RX_GEN_OK
+end
+
+fn rg_hash_ptr_buf to void
+  for i ulong RG_PTR_SUM
+    put sh_dat i get rg_ptr_raw i
+  end
+  sh_all RG_PTR_SUM
+  for i ulong 32
+    put rg_ptr_raw add RG_PTR_SUM i get sh_dig i
+  end
+end
+
+fn rg_encode_ptr gid ulong lin ulong dig view uchar 32 to void
+  for i ulong RG_PTR_BYTES
+    put rg_ptr_raw i 0
+  end
+  for i ulong 7
+    put rg_ptr_raw i get rg_magic_ptr i
+  end
+  for i ulong 8
+    put rg_ptr_raw add 8 i uchar and shr gid mul i 8 255
+    put rg_ptr_raw add 16 i uchar and shr lin mul i 8 255
+  end
+  for i ulong 32
+    put rg_ptr_raw add 24 i get dig i
+  end
+  rg_hash_ptr_buf
+  put rg_ptr_valid 0 1
+  rg_charge_io RG_PTR_BYTES 2
+end
+
+fn rg_decode_ptr dst_id edit ulong 2 dst_dig edit uchar 32 to long
+  if eq get rg_ptr_valid 0 0
+    ret RX_GEN_ERR_MISSING
+  end
+  for i ulong 7
+    if ne get rg_ptr_raw i get rg_magic_ptr i
+      ret RX_GEN_ERR_TORN
+    end
+  end
+  for i ulong RG_PTR_SUM
+    put sh_dat i get rg_ptr_raw i
+  end
+  sh_all RG_PTR_SUM
+  for i ulong 32
+    if ne get sh_dig i get rg_ptr_raw add RG_PTR_SUM i
+      ret RX_GEN_ERR_TORN
+    end
+  end
+  gid = ulong 0
+  lin = ulong 0
+  for i ulong 8
+    gid = or gid shl ulong get rg_ptr_raw add 8 i mul i 8
+    lin = or lin shl ulong get rg_ptr_raw add 16 i mul i 8
+  end
+  put dst_id 0 gid
+  put dst_id 1 lin
+  for i ulong 32
+    put dst_dig i get rg_ptr_raw add 24 i
+  end
+  ret RX_GEN_OK
+end
+
+fn rg_encode_jrn phase ulong parent ulong cand ulong plin ulong dig view uchar 32 to void
+  for i ulong RG_JRN_BYTES
+    put rg_jrn_raw i 0
+  end
+  for i ulong 7
+    put rg_jrn_raw i get rg_magic_jrn i
+  end
+  for i ulong 4
+    put rg_jrn_raw add 8 i uchar and shr phase mul i 8 255
+  end
+  for i ulong 8
+    put rg_jrn_raw add 16 i uchar and shr parent mul i 8 255
+    put rg_jrn_raw add 24 i uchar and shr cand mul i 8 255
+    put rg_jrn_raw add 32 i uchar and shr plin mul i 8 255
+  end
+  for i ulong 32
+    put rg_jrn_raw add 40 i get dig i
+  end
+  for i ulong RG_JRN_SUM
+    put sh_dat i get rg_jrn_raw i
+  end
+  sh_all RG_JRN_SUM
+  for i ulong 32
+    put rg_jrn_raw add RG_JRN_SUM i get sh_dig i
+  end
+  put rg_jrn_valid 0 1
+  rg_charge_io RG_JRN_BYTES 2
+end
+
+fn rg_decode_jrn dst_meta edit ulong 4 dst_dig edit uchar 32 to long
+  if eq get rg_jrn_valid 0 0
+    ret RX_GEN_ERR_MISSING
+  end
+  for i ulong 7
+    if ne get rg_jrn_raw i get rg_magic_jrn i
+      ret RX_GEN_ERR_TORN
+    end
+  end
+  for i ulong RG_JRN_SUM
+    put sh_dat i get rg_jrn_raw i
+  end
+  sh_all RG_JRN_SUM
+  for i ulong 32
+    if ne get sh_dig i get rg_jrn_raw add RG_JRN_SUM i
+      ret RX_GEN_ERR_TORN
+    end
+  end
+  ph = ulong 0
+  for i ulong 4
+    ph = or ph shl ulong get rg_jrn_raw add 8 i mul i 8
+  end
+  pa = ulong 0
+  ca = ulong 0
+  pl = ulong 0
+  for i ulong 8
+    pa = or pa shl ulong get rg_jrn_raw add 16 i mul i 8
+    ca = or ca shl ulong get rg_jrn_raw add 24 i mul i 8
+    pl = or pl shl ulong get rg_jrn_raw add 32 i mul i 8
+  end
+  put dst_meta 0 ph
+  put dst_meta 1 pa
+  put dst_meta 2 ca
+  put dst_meta 3 pl
+  for i ulong 32
+    put dst_dig i get rg_jrn_raw add 40 i
+  end
+  ret RX_GEN_OK
+end
+
+fn rg_event_has gid ulong to ulong
+  n = get rg_n_events 0
+  for i ulong n bound 16
+    if eq get rg_events_id i gid
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn rg_event_append gid ulong lin ulong to void
+  if ne rg_event_has gid 0
+    ret
+  end
+  n = get rg_n_events 0
+  if lt n 16
+    put rg_events_id n gid
+    put rg_events_lin n lin
+    put rg_n_events 0 add n 1
+    rg_charge_io 8 2
+  end
+end
+
+fn rg_put_disk_u32 base ulong off ulong v ulong to void
+  for i ulong 4
+    put rg_disk_root add base add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn rg_put_disk_u64 base ulong off ulong v ulong to void
+  for i ulong 8
+    put rg_disk_root add base add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn rg_get_disk_u32 base ulong off ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    v = or v shl ulong get rg_disk_root add base add off i mul i 8
+  end
+  ret v
+end
+
+fn rg_get_disk_u64 base ulong off ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or v shl ulong get rg_disk_root add base add off i mul i 8
+  end
+  ret v
+end
+
+fn rg_finalize_disk_root dslot ulong dst_dig edit uchar 32 to void
+  base = mul dslot RG_ROOT_BYTES
+  for i ulong RG_ROOT_SUM
+    put sh_dat i get rg_disk_root add base i
+  end
+  sh_all RG_ROOT_SUM
+  for i ulong 32
+    put rg_disk_root add base add RG_ROOT_SUM i get sh_dig i
+  end
+  for i ulong RG_ROOT_BYTES
+    put sh_dat i get rg_disk_root add base i
+  end
+  sh_all RG_ROOT_BYTES
+  for i ulong 32
+    put dst_dig i get sh_dig i
+  end
+  rg_charge_io RG_ROOT_BYTES 2
+end
+
+note rm[0..8]: dslot, gid, lin, parent, subj, cap_id, cap_gen, wlen, nwork
+fn rg_write_receipt rm view ulong 9 rdig view uchar 32 to void
+  dslot = get rm 0
+  base = mul dslot RG_RCT_BYTES
+  for i ulong RG_RCT_BYTES
+    put rg_disk_rct add base i 0
+  end
+  for i ulong 7
+    put rg_disk_rct add base i get rg_magic_rct i
+  end
+  for i ulong 8
+    sh = mul i 8
+    put rg_disk_rct add base add 8 i uchar and shr get rm 1 sh 255
+    put rg_disk_rct add base add 16 i uchar and shr get rm 2 sh 255
+    put rg_disk_rct add base add 24 i uchar and shr get rm 3 sh 255
+    put rg_disk_rct add base add 80 i uchar and shr get rm 7 sh 255
+  end
+  for i ulong 32
+    put rg_disk_rct add base add 32 i get rdig i
+  end
+  for i ulong 4
+    sh = mul i 8
+    put rg_disk_rct add base add 64 i uchar and shr get rm 4 sh 255
+    put rg_disk_rct add base add 68 i uchar and shr get rm 5 sh 255
+    put rg_disk_rct add base add 72 i uchar and shr get rm 6 sh 255
+    put rg_disk_rct add base add 76 i uchar and shr shr get rm 6 32 sh 255
+    put rg_disk_rct add base add 120 i uchar and shr get rm 8 sh 255
+  end
+  for i ulong RG_RCT_SUM
+    put sh_dat i get rg_disk_rct add base i
+  end
+  sh_all RG_RCT_SUM
+  for i ulong 32
+    put rg_disk_rct add base add RG_RCT_SUM i get sh_dig i
+  end
+  put rg_disk_has_rct dslot 1
+  rg_charge_io RG_RCT_BYTES 2
+end
+
+fn rg_genesis_blobs du ulong rb ulong to void
+  b0 = mul mul du 7 RX_GEN_MAX_BLOB
+  for i ulong 4
+    put rg_disk_blobs add b0 i 0
+    put sh_dat i 0
+  end
+  put rg_disk_blen mul du 7 4
+  sh_all 4
+  rg_put_disk_u64 rb 64 4
+  for i ulong 32
+    put rg_disk_root add rb add 112 i get sh_dig i
+  end
+  b1 = add b0 RX_GEN_MAX_BLOB
+  for i ulong 7
+    c = get rg_genesis_ev i
+    put rg_disk_blobs add b1 i c
+    put sh_dat i c
+  end
+  put rg_disk_blen add mul du 7 1 7
+  sh_all 7
+  rg_put_disk_u64 rb 72 7
+  for i ulong 32
+    put rg_disk_root add rb add 144 i get sh_dig i
+  end
+  sh_all 0
+  for bi ulong 4
+    k = add bi 2
+    put rg_disk_blen add mul du 7 k 0
+    rg_put_disk_u64 rb add 64 mul k 8 0
+    doff = add 112 mul k 32
+    for i ulong 32
+      put rg_disk_root add rb add doff i get sh_dig i
+    end
+  end
+end
+
+fn rg_install_genesis to long
+  ds = rg_alloc_disk 1
+  if lt ds 0
+    ret RX_GEN_ERR_IO
+  end
+  du = ulong ds
+  rb = mul du RG_ROOT_BYTES
+  for i ulong RG_ROOT_BYTES
+    put rg_disk_root add rb i 0
+  end
+  for i ulong 7
+    put rg_disk_root add rb i get rg_magic_root3 i
+  end
+  rg_put_disk_u64 rb 8 1
+  rg_put_disk_u64 rb 16 0
+  rg_put_disk_u64 rb 24 1
+  rg_put_disk_u32 rb 32 1
+  rg_put_disk_u32 rb 60 1
+  rg_genesis_blobs du rb
+  bw = mul add mul du 7 6 RX_GEN_MAX_BLOB
+  for i ulong 16
+    put rg_disk_blobs add bw i 0
+  end
+  for i ulong 7
+    put rg_disk_blobs add bw i get rg_magic_work i
+  end
+  put rg_disk_blobs add bw 12 80
+  for i ulong 16
+    put sh_dat i get rg_disk_blobs add bw i
+  end
+  sh_all 16
+  put rg_disk_blen add mul du 7 6 16
+  rg_put_disk_u64 rb 436 16
+  for i ulong 32
+    put rg_disk_root add rb add 444 i get sh_dig i
+  end
+  rg_put_disk_u32 rb 476 0
+  rdig = new uchar 32 0
+  rg_finalize_disk_root du rdig
+  rg_encode_ptr 1 1 rdig
+  rg_encode_jrn RG_PHASE_RECEIPT 0 1 0 rdig
+  put rg_st 1 1
+  put rg_st 2 1
+  put rg_st 3 2
+  ret RX_GEN_OK
+end
+
+fn rx_gen_open dir_buf view uchar 128 dir_len ulong to long
+  if eq dir_len 0
+    ret RX_GEN_ERR_ARG
+  end
+  if gt dir_len 120
+    ret RX_GEN_ERR_ARG
+  end
+  for i ulong 24
+    put rg_st i 0
+  end
+  for i ulong dir_len bound 128
+    put rg_dir i get dir_buf i
+  end
+  put rg_st 0 1
+  put rg_st 10 1000
+  put rg_st 13 dir_len
+  put rg_st 14 1
+  put rg_st 15 1
+  put rg_st 16 1
+  put rg_st 17 1
+  put rg_ptr_valid 0 0
+  put rg_jrn_valid 0 0
+  put rg_n_events 0 0
+  for i ulong 8
+    put rg_disk_id i 0
+    put rg_disk_has_rct i 0
+  end
+  for i ulong 48
+    put rg_cand_meta i 0
+  end
+  for i ulong 14
+    put rg_phases i 0
+  end
+  put rg_phase_res 0 0
+  for i ulong 16
+    put rg_job_meta i 0
+  end
+  ret rg_install_genesis
+end
+
+fn rx_gen_close to void
+  put rg_st 0 0
+  put rg_st 11 0
+  put rg_st 5 0
+end
+
+fn rx_gen_active dst edit ulong 2 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  put dst 0 get rg_st 1
+  put dst 1 get rg_st 2
+  ret RX_GEN_OK
+end
+
+fn rg_copy_and_hash_blob du ulong blob_idx ulong blen ulong dst edit uchar 1024 to void
+  bbase = mul add mul du 7 blob_idx RX_GEN_MAX_BLOB
+  for i ulong blen bound 1024
+    b = get rg_disk_blobs add bbase i
+    put sh_dat i b
+    put dst i b
+  end
+  sh_all blen
+end
+
+fn rg_check_disk_dig rb ulong doff ulong to ulong
+  base = add rb doff
+  for i ulong 32
+    if ne get sh_dig i get rg_disk_root add base i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+note Read blob_idx (0..5 = DIG_*, 6 = work) of committed generation gid.
+fn rx_gen_read_blob gid ulong blob_idx ulong dst edit uchar 1024 cap ulong dst_len edit ulong 1 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if gt blob_idx 6
+    ret RX_GEN_ERR_ARG
+  end
+  ds = rg_find_disk gid
+  if lt ds 0
+    ret RX_GEN_ERR_MISSING
+  end
+  du = ulong ds
+  rb = mul du RG_ROOT_BYTES
+  if ne rg_get_disk_u64 rb 8 gid
+    ret RX_GEN_ERR_TORN
+  end
+  blen = ulong 0
+  doff = ulong 0
+  if eq blob_idx 6
+    blen = rg_get_disk_u64 rb 436
+    doff = ulong 444
+  else
+    blen = rg_get_disk_u64 rb add 64 mul blob_idx 8
+    doff = add 112 mul blob_idx 32
+  end
+  if gt blen cap
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_disk_blen add mul du 7 blob_idx blen
+    ret RX_GEN_ERR_TORN
+  end
+  rg_copy_and_hash_blob du blob_idx blen dst
+  if eq rg_check_disk_dig rb doff 0
+    ret RX_GEN_ERR_TORN
+  end
+  put dst_len 0 blen
+  ret RX_GEN_OK
+end
+
+fn rx_gen_bind_authority to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 6 0
+    ret RX_GEN_ERR_BUSY
+  end
+  put rg_st 6 1
+  ret RX_GEN_OK
+end
+
+fn rg_put_cand_u32 off ulong v ulong to void
+  for i ulong 4
+    put rg_cand_blob add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn rg_rebuild_one_obj cslot ulong bbase ulong k ulong to void
+  ob = mul add mul cslot RX_GEN_MAX_OBJECTS k 4
+  row = add bbase add 4 mul k 40
+  rg_put_cand_u32 row get rg_cand_obj ob
+  rg_put_cand_u32 add row 4 get rg_cand_obj add ob 1
+  odb = mul add mul cslot RX_GEN_MAX_OBJECTS k 32
+  drow = add row 8
+  for i ulong 32
+    put rg_cand_blob add drow i get rg_cand_odig add odb i
+  end
+end
+
+fn rg_rebuild_obj_blob cslot ulong to void
+  mb = mul cslot 12
+  no = get rg_cand_meta add mb 9
+  bbase = mul mul cslot 6 RX_GEN_MAX_BLOB
+  for i ulong 4
+    put rg_cand_blob add bbase i uchar and shr no mul i 8 255
+  end
+  for k ulong no bound 32
+    rg_rebuild_one_obj cslot bbase k
+  end
+  put rg_cand_blen mul cslot 6 add 4 mul no 40
+end
+
+fn rg_find_free_cand to long
+  for i ulong RX_GEN_MAX_CAND
+    if eq get rg_cand_meta mul i 12 0
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn rg_init_cand_slot su ulong pm view ulong 6 cid ulong to void
+  mb = mul su 12
+  for k ulong 12
+    put rg_cand_meta add mb k 0
+  end
+  put rg_cand_meta mb 1
+  put rg_cand_meta add mb 1 cid
+  put rg_cand_meta add mb 2 get rg_st 1
+  put rg_cand_meta add mb 3 get pm 0
+  put rg_cand_meta add mb 6 get pm 4
+  put rg_cand_meta add mb 7 get pm 2
+  put rg_cand_meta add mb 8 get pm 3
+  n_obj = get pm 5
+  put rg_cand_meta add mb 9 n_obj
+  for k ulong n_obj bound 32
+    ob = mul add mul su RX_GEN_MAX_OBJECTS k 4
+    put rg_cand_obj ob k
+    put rg_cand_obj add ob 1 1
+    put rg_cand_obj add ob 2 0
+    put rg_cand_obj add ob 3 0
+  end
+  for bi ulong 6
+    put rg_cand_blen add mul su 6 bi 0
+  end
+  rg_rebuild_obj_blob su
+end
+
+note pm[0..5]: proposer, has_cred, auth_epoch, auth_gen, proofs_ok, n_obj
+fn rx_gen_propose_as pm view ulong 6 ev_buf view uchar 256 ev_len ulong dst_id edit ulong 1 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 6 0
+    if eq get pm 1 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+    if eq get rg_st 14 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+  end
+  if gt get pm 5 RX_GEN_MAX_OBJECTS
+    ret RX_GEN_ERR_ARG
+  end
+  if gt ev_len 256
+    ret RX_GEN_ERR_ARG
+  end
+  slot = rg_find_free_cand
+  if lt slot 0
+    ret RX_GEN_ERR_BUSY
+  end
+  su = ulong slot
+  cid = get rg_st 3
+  put rg_st 3 add cid 1
+  rg_init_cand_slot su pm cid
+  ebase = mul add mul su 6 1 RX_GEN_MAX_BLOB
+  for i ulong ev_len bound 256
+    put rg_cand_blob add ebase i get ev_buf i
+  end
+  put rg_cand_blen add mul su 6 1 ev_len
+  rg_charge_io 4 2
+  put dst_id 0 cid
+  ret RX_GEN_OK
+end
+
+fn rx_gen_propose pm view ulong 6 ev_buf view uchar 256 ev_len ulong dst_id edit ulong 1 to long
+  pm2 = new ulong 6 0
+  for i ulong 6
+    put pm2 i get pm i
+  end
+  put pm2 1 0
+  ret rx_gen_propose_as pm2 ev_buf ev_len dst_id
+end
+
+fn rx_gen_mutate_object cid ulong idx ulong gen ulong dig view uchar 32 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 6 0
+    ret RX_GEN_ERR_IDENTITY
+  end
+  ci = rg_find_cand cid
+  if lt ci 0
+    ret RX_GEN_ERR_ARG
+  end
+  cu = ulong ci
+  mb = mul cu 12
+  if ge idx get rg_cand_meta add mb 9
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_cand_meta add mb 4 0
+    ret RX_GEN_ERR_CLOSING
+  end
+  ob = mul add mul cu RX_GEN_MAX_OBJECTS idx 4
+  put rg_cand_obj add ob 1 gen
+  odb = mul add mul cu RX_GEN_MAX_OBJECTS idx 32
+  for i ulong 32
+    put rg_cand_odig add odb i get dig i
+  end
+  rg_rebuild_obj_blob cu
+  ret RX_GEN_OK
+end
+
+fn rx_gen_set_evidence cid ulong ev_buf view uchar 256 ev_len ulong to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 6 0
+    ret RX_GEN_ERR_IDENTITY
+  end
+  ci = rg_find_cand cid
+  if lt ci 0
+    ret RX_GEN_ERR_ARG
+  end
+  cu = ulong ci
+  mb = mul cu 12
+  if ne get rg_cand_meta add mb 4 0
+    if eq get rg_cand_meta add mb 5 0
+      ret RX_GEN_ERR_CLOSING
+    end
+  end
+  if gt ev_len 256
+    ret RX_GEN_ERR_ARG
+  end
+  ebase = mul add mul cu 6 1 RX_GEN_MAX_BLOB
+  for i ulong ev_len bound 256
+    put rg_cand_blob add ebase i get ev_buf i
+  end
+  put rg_cand_blen add mul cu 6 1 ev_len
+  ret RX_GEN_OK
+end
+
+fn rx_gen_observe_object cid ulong idx ulong gen ulong to long
+  ci = rg_find_cand cid
+  if lt ci 0
+    ret RX_GEN_ERR_ARG
+  end
+  cu = ulong ci
+  mb = mul cu 12
+  if ge idx get rg_cand_meta add mb 9
+    ret RX_GEN_ERR_ARG
+  end
+  ob = mul add mul cu RX_GEN_MAX_OBJECTS idx 4
+  put rg_cand_obj add ob 2 1
+  put rg_cand_obj add ob 3 gen
+  ret RX_GEN_OK
+end
+
+fn rg_add_work_check wm view ulong 11 cu ulong to long
+  mb = mul cu 12
+  if ne get rg_cand_meta add mb 4 0
+    ret RX_GEN_ERR_CLOSING
+  end
+  nw = get rg_cand_meta add mb 10
+  if ge nw RX_GEN_MAX_WORK
+    ret RX_GEN_ERR_BUSY
+  end
+  wc = get wm 4
+  if ne wc RX_WORK_EPHEMERAL
+    if ne wc RX_WORK_EVIDENCE
+      if ne wc RX_WORK_EXTERNAL
+        ret RX_GEN_ERR_ARG
+      end
+    end
+  end
+  ws = get wm 5
+  if ne ws RX_WORK_PENDING
+    if ne ws RX_WORK_ISSUED
+      ret RX_GEN_ERR_ARG
+    end
+  end
+  wid = get wm 3
+  for i ulong nw bound 16
+    wb = mul add mul cu RX_GEN_MAX_WORK i 10
+    if eq get rg_cand_work wb wid
+      ret RX_GEN_ERR_ARG
+    end
+  end
+  ret RX_GEN_OK
+end
+
+fn rg_add_work_bind wm view ulong 11 mb ulong wb ulong to long
+  if ne get wm 0 get rg_cand_meta add mb 3
+    ret RX_GEN_ERR_AUTHORITY
+  end
+  if ne get wm 8 0
+    put rg_cand_work add wb 4 get wm 7
+  else
+    put rg_cand_work add wb 4 get rg_cand_meta add mb 3
+  end
+  put rg_cand_work add wb 5 1
+  put rg_cand_work add wb 6 get wm 9
+  put rg_cand_work add wb 7 get wm 10
+  rbuf = new ulong 1 0
+  ign_r = rx_gen_work_resource get wm 2 get wm 3 rbuf
+  put rg_cand_work add wb 9 get rbuf 0
+  if eq get rg_st 16 0
+    ret RX_GEN_ERR_AUTHORITY
+  end
+  ret RX_GEN_OK
+end
+
+note wm[0..10]: subject, has_cred, cid, wid, wclass, wstate, req, worker, wset, cap_id, cap_gen
+fn rx_gen_add_work_as wm view ulong 11 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 6 0
+    if eq get wm 1 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+    if eq get rg_st 14 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+  end
+  ci = rg_find_cand get wm 2
+  if lt ci 0
+    ret RX_GEN_ERR_ARG
+  end
+  cu = ulong ci
+  crc = rg_add_work_check wm cu
+  if ne crc RX_GEN_OK
+    ret crc
+  end
+  mb = mul cu 12
+  nw = get rg_cand_meta add mb 10
+  wb = mul add mul cu RX_GEN_MAX_WORK nw 10
+  put rg_cand_work wb get wm 3
+  put rg_cand_work add wb 1 get wm 4
+  put rg_cand_work add wb 2 get wm 5
+  put rg_cand_work add wb 3 get wm 6
+  put rg_cand_work add wb 4 0
+  put rg_cand_work add wb 5 0
+  put rg_cand_work add wb 6 0
+  put rg_cand_work add wb 7 0
+  put rg_cand_work add wb 8 0
+  put rg_cand_work add wb 9 0
+  if ne get rg_st 6 0
+    brc = rg_add_work_bind wm mb wb
+    if ne brc RX_GEN_OK
+      ret brc
+    end
+  end
+  wdb = mul add mul cu RX_GEN_MAX_WORK nw 32
+  for i ulong 32
+    put rg_cand_wdig add wdb i 0
+  end
+  put rg_cand_meta add mb 10 add nw 1
+  ret RX_GEN_OK
+end
+
+fn rx_gen_add_work cid ulong wid ulong wclass ulong wstate ulong req ulong to long
+  wm = new ulong 11 0
+  put wm 2 cid
+  put wm 3 wid
+  put wm 4 wclass
+  put wm 5 wstate
+  put wm 6 req
+  ret rx_gen_add_work_as wm
+end
+
+fn rg_finish_one_work cu ulong i ulong subject ulong cid ulong wid ulong to long
+  wb = mul add mul cu RX_GEN_MAX_WORK i 10
+  rbuf = new ulong 1 0
+  if ne get rg_st 6 0
+    ign_r = rx_gen_work_resource cid wid rbuf
+    if ne get rg_cand_work add wb 4 subject
+      ret RX_GEN_ERR_AUTHORITY
+    end
+    if ne get rg_cand_work add wb 9 get rbuf 0
+      ret RX_GEN_ERR_AUTHORITY
+    end
+    if eq get rg_st 16 0
+      ret RX_GEN_ERR_AUTHORITY
+    end
+  end
+  put rg_cand_work add wb 2 RX_WORK_DONE
+  put rg_cand_work add wb 8 subject
+  elen = get rg_cand_blen add mul cu 6 1
+  ebase = mul add mul cu 6 1 RX_GEN_MAX_BLOB
+  for k ulong elen bound 1024
+    put sh_dat k get rg_cand_blob add ebase k
+  end
+  sh_all elen
+  wdb = mul add mul cu RX_GEN_MAX_WORK i 32
+  for k ulong 32
+    put rg_cand_wdig add wdb k get sh_dig k
+  end
+  ret RX_GEN_OK
+end
+
+fn rx_gen_finish_work_as subject ulong has_cred ulong cid ulong wid ulong to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 6 0
+    if eq has_cred 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+    if eq get rg_st 14 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+  end
+  ci = rg_find_cand cid
+  if lt ci 0
+    ret RX_GEN_ERR_ARG
+  end
+  cu = ulong ci
+  nw = get rg_cand_meta add mul cu 12 10
+  for i ulong nw bound 16
+    wb = mul add mul cu RX_GEN_MAX_WORK i 10
+    if eq get rg_cand_work wb wid
+      ret rg_finish_one_work cu i subject cid wid
+    end
+  end
+  ret RX_GEN_ERR_MISSING
+end
+
+fn rx_gen_finish_work cid ulong wid ulong to long
+  ret rx_gen_finish_work_as 0 0 cid wid
+end
+
+fn rx_gen_set_crash step ulong to void
+  put rg_st 4 step
+end
+
+fn rx_gen_hold_barrier to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 5 0
+    ret RX_GEN_OK
+  end
+  put rg_st 5 1
+  ret RX_GEN_OK
+end
+
+fn rx_gen_release_barrier to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  put rg_st 5 0
+  ret RX_GEN_OK
+end
+
+fn rg_sort_u64 arr edit ulong 8 n ulong to void
+  if le n 1
+    ret
+  end
+  i = ulong 1
+  while lt i n bound 8
+    j = i
+    while gt j 0 bound 8
+      jm = sub j 1
+      va = get arr jm
+      vb = get arr j
+      if le va vb
+        break
+      end
+      put arr jm vb
+      put arr j va
+      j = jm
+    end
+    i = add i 1
+  end
+end
+
+global rg_cls_ev uchar 32
+global rg_cls_ext ulong 8
+global rg_cls_exc ulong 8
+global rg_cls_cnt ulong 2
+
+fn rg_classify_ev cu ulong i ulong wb ulong elen ulong to long
+  wst = get rg_cand_work add wb 2
+  if ne wst RX_WORK_DONE
+    if ne get rg_cand_work add wb 3 0
+      if ne get rg_st 18 0
+        put rg_cand_work add wb 2 RX_WORK_DONE
+        wdb = mul add mul cu RX_GEN_MAX_WORK i 32
+        for k ulong 32
+          put rg_cand_wdig add wdb k get rg_cls_ev k
+        end
+        wst = RX_WORK_DONE
+      else
+        ret RX_GEN_ERR_VERIFY
+      end
+    end
+  end
+  if ne wst RX_WORK_DONE
+    nx = get rg_cls_cnt 1
+    if ge nx RX_GEN_MAX_EXCLUDED
+      ret RX_GEN_ERR_VERIFY
+    end
+    put rg_cls_exc nx get rg_cand_work wb
+    put rg_cls_cnt 1 add nx 1
+    ret RX_GEN_OK
+  end
+  if eq elen 0
+    ret RX_GEN_ERR_VERIFY
+  end
+  wdb = mul add mul cu RX_GEN_MAX_WORK i 32
+  for k ulong 32
+    if ne get rg_cls_ev k get rg_cand_wdig add wdb k
+      ret RX_GEN_ERR_VERIFY
+    end
+  end
+  ret RX_GEN_OK
+end
+
+fn rg_classify_one cu ulong i ulong elen ulong to long
+  wb = mul add mul cu RX_GEN_MAX_WORK i 10
+  wcls = get rg_cand_work add wb 1
+  wst = get rg_cand_work add wb 2
+  if eq wcls RX_WORK_EPHEMERAL
+    if ne wst RX_WORK_DONE
+      put rg_cand_work add wb 2 RX_WORK_CANCELLED
+    end
+    ret RX_GEN_OK
+  end
+  if eq wcls RX_WORK_EVIDENCE
+    ret rg_classify_ev cu i wb elen
+  end
+  if eq wst RX_WORK_PENDING
+    put rg_cand_work add wb 2 RX_WORK_CANCELLED
+    ret RX_GEN_OK
+  end
+  ne_c = get rg_cls_cnt 0
+  if ge ne_c RX_GEN_MAX_EXTERNAL
+    ret RX_GEN_ERR_VERIFY
+  end
+  put rg_cls_ext ne_c get rg_cand_work wb
+  put rg_cls_cnt 0 add ne_c 1
+  ret RX_GEN_OK
+end
+
+fn rg_sort_cls_arr which ulong n ulong to void
+  if le n 1
+    ret
+  end
+  i = ulong 1
+  while lt i n bound 8
+    j = i
+    while gt j 0 bound 8
+      jm = sub j 1
+      va = ulong 0
+      vb = ulong 0
+      if eq which 0
+        va = get rg_cls_ext jm
+        vb = get rg_cls_ext j
+      else
+        va = get rg_cls_exc jm
+        vb = get rg_cls_exc j
+      end
+      if le va vb
+        break
+      end
+      if eq which 0
+        put rg_cls_ext jm vb
+        put rg_cls_ext j va
+      else
+        put rg_cls_exc jm vb
+        put rg_cls_exc j va
+      end
+      j = jm
+    end
+    i = add i 1
+  end
+end
+
+fn rg_classify cu ulong to long
+  mb = mul cu 12
+  nw = get rg_cand_meta add mb 10
+  put rg_cls_cnt 0 0
+  put rg_cls_cnt 1 0
+  put rg_cand_meta add mb 5 1
+  elen = get rg_cand_blen add mul cu 6 1
+  ebase = mul add mul cu 6 1 RX_GEN_MAX_BLOB
+  for k ulong elen bound 1024
+    put sh_dat k get rg_cand_blob add ebase k
+  end
+  sh_all elen
+  for k ulong 32
+    put rg_cls_ev k get sh_dig k
+  end
+  for i ulong nw bound 16
+    rc = rg_classify_one cu i elen
+    if ne rc RX_GEN_OK
+      put rg_cand_meta add mb 5 0
+      ret rc
+    end
+  end
+  put rg_cand_meta add mb 5 0
+  rg_sort_cls_arr 0 get rg_cls_cnt 0
+  rg_sort_cls_arr 1 get rg_cls_cnt 1
+  ret RX_GEN_OK
+end
+
+fn rg_put_disk_blob_u32 off ulong v ulong to void
+  for k ulong 4
+    put rg_disk_blobs add off k uchar and shr v mul k 8 255
+  end
+end
+
+fn rg_put_disk_blob_u64 off ulong v ulong to void
+  for k ulong 8
+    put rg_disk_blobs add off k uchar and shr v mul k 8 255
+  end
+end
+
+fn rg_encode_one_work_row cu ulong bw ulong i ulong to void
+  wb = mul add mul cu RX_GEN_MAX_WORK i 10
+  row = add bw add RG_WORK_HDR mul i RG_WORK_ROW
+  rg_put_disk_blob_u64 row get rg_cand_work wb
+  for f ulong 6
+    rg_put_disk_blob_u32 add row add 8 mul f 4 get rg_cand_work add wb add 1 f
+  end
+  rg_put_disk_blob_u64 add row 32 get rg_cand_work add wb 7
+  rg_put_disk_blob_u64 add row 40 get rg_cand_work add wb 9
+  wdb = mul add mul cu RX_GEN_MAX_WORK i 32
+  drow = add row 48
+  for k ulong 32
+    put rg_disk_blobs add drow k get rg_cand_wdig add wdb k
+  end
+end
+
+fn rg_encode_work_to_disk cu ulong du ulong to ulong
+  nw = get rg_cand_meta add mul cu 12 10
+  bw = mul add mul du 7 6 RX_GEN_MAX_BLOB
+  tlen = add RG_WORK_HDR mul nw RG_WORK_ROW
+  for i ulong tlen bound 1024
+    put rg_disk_blobs add bw i 0
+  end
+  for i ulong 7
+    put rg_disk_blobs add bw i get rg_magic_work i
+  end
+  rg_put_disk_blob_u32 add bw 8 nw
+  rg_put_disk_blob_u32 add bw 12 RG_WORK_ROW
+  for i ulong nw bound 12
+    rg_encode_one_work_row cu bw i
+  end
+  put rg_disk_blen add mul du 7 6 tlen
+  ret tlen
+end
+
+fn rg_copy_cand_blob_to_disk cu ulong du ulong bi ulong to void
+  blen = get rg_cand_blen add mul cu 6 bi
+  sbase = mul add mul cu 6 bi RX_GEN_MAX_BLOB
+  dbase = mul add mul du 7 bi RX_GEN_MAX_BLOB
+  for k ulong blen bound 1024
+    b = get rg_cand_blob add sbase k
+    put rg_disk_blobs add dbase k b
+    put sh_dat k b
+  end
+  put rg_disk_blen add mul du 7 bi blen
+  sh_all blen
+  rb = mul du RG_ROOT_BYTES
+  rg_put_disk_u64 rb add 64 mul bi 8 blen
+  doff = add 112 mul bi 32
+  for k ulong 32
+    put rg_disk_root add rb add doff k get sh_dig k
+  end
+  rg_charge_io blen 2
+end
+
+fn rg_write_cand_hdr cu ulong rb ulong lin ulong to void
+  mb = mul cu 12
+  for i ulong RG_ROOT_BYTES
+    put rg_disk_root add rb i 0
+  end
+  for i ulong 7
+    put rg_disk_root add rb i get rg_magic_root3 i
+  end
+  rg_put_disk_u64 rb 8 get rg_cand_meta add mb 1
+  rg_put_disk_u64 rb 16 get rg_cand_meta add mb 2
+  rg_put_disk_u64 rb 24 lin
+  rg_put_disk_u32 rb 32 2
+  rg_put_disk_u32 rb 36 get rg_cand_meta add mb 9
+  rg_put_disk_u64 rb 40 get rg_cand_meta add mb 7
+  agen = get rg_cand_meta add mb 8
+  rg_put_disk_u32 rb 48 and agen 4294967295
+  rg_put_disk_u32 rb 432 shr agen 32
+  rg_put_disk_u32 rb 52 get rg_cls_cnt 0
+  rg_put_disk_u32 rb 56 get rg_cls_cnt 1
+  rg_put_disk_u32 rb 60 1
+end
+
+fn rg_write_cand_ids rb ulong to void
+  ne_c = get rg_cls_cnt 0
+  for i ulong ne_c bound 8
+    rg_put_disk_u64 rb add 304 mul i 8 get rg_cls_ext i
+  end
+  nx_c = get rg_cls_cnt 1
+  for i ulong nx_c bound 8
+    rg_put_disk_u64 rb add 368 mul i 8 get rg_cls_exc i
+  end
+end
+
+fn rg_write_cand_disk cu ulong du ulong lin ulong rdig edit uchar 32 to long
+  rb = mul du RG_ROOT_BYTES
+  rg_write_cand_hdr cu rb lin
+  rg_write_cand_ids rb
+  for bi ulong 6
+    rg_copy_cand_blob_to_disk cu du bi
+  end
+  wlen = rg_encode_work_to_disk cu du
+  bw = mul add mul du 7 6 RX_GEN_MAX_BLOB
+  for k ulong wlen bound 1024
+    put sh_dat k get rg_disk_blobs add bw k
+  end
+  sh_all wlen
+  rg_put_disk_u64 rb 436 wlen
+  for k ulong 32
+    put rg_disk_root add rb add 444 k get sh_dig k
+  end
+  rg_put_disk_u32 rb 476 get rg_cand_meta add mul cu 12 10
+  rg_charge_io wlen 2
+  rg_finalize_disk_root du rdig
+  ret RX_GEN_OK
+end
+
+fn rg_promote_check_auth req view ulong 7 cu ulong to long
+  mb = mul cu 12
+  ptr_id = new ulong 2 0
+  ptr_dig = new uchar 32 0
+  rc = rg_decode_ptr ptr_id ptr_dig
+  if ne rc RX_GEN_OK
+    ret rc
+  end
+  put rg_st 1 get ptr_id 0
+  put rg_st 2 get ptr_id 1
+  if ne get rg_cand_meta add mb 2 get rg_st 1
+    put rg_cand_meta mb 0
+    ret RX_GEN_ERR_STALE
+  end
+  if eq get req 1 get rg_cand_meta add mb 3
+    ret RX_GEN_ERR_AUTHORITY
+  end
+  if ne get req 5 RX_GEN_RES_PROMOTION
+    ret RX_GEN_ERR_AUTHORITY
+  end
+  if ne get req 6 RX_GEN_RIGHT_PROMOTE
+    ret RX_GEN_ERR_AUTHORITY
+  end
+  if eq get rg_st 15 0
+    ret RX_GEN_ERR_AUTHORITY
+  end
+  ret RX_GEN_OK
+end
+
+fn rg_promote_check_obs cu ulong to long
+  mb = mul cu 12
+  no = get rg_cand_meta add mb 9
+  for i ulong no bound 32
+    ob = mul add mul cu RX_GEN_MAX_OBJECTS i 4
+    if ne get rg_cand_obj add ob 2 0
+      if ne get rg_cand_obj add ob 3 get rg_cand_obj add ob 1
+        put rg_cand_meta mb 0
+        ret RX_GEN_ERR_STALE
+      end
+    end
+  end
+  if eq get rg_cand_meta add mb 6 0
+    ret RX_GEN_ERR_VERIFY
+  end
+  ret RX_GEN_OK
+end
+
+fn rg_promote_commit_disk req view ulong 7 cu ulong to long
+  mb = mul cu 12
+  cid = get req 0
+  cstep = get rg_st 4
+  if eq cstep RX_CRASH_BEFORE_CANDIDATE_WRITE
+    ret RX_GEN_ERR_IO
+  end
+  ds = rg_alloc_disk cid
+  if lt ds 0
+    ret RX_GEN_ERR_IO
+  end
+  du = ulong ds
+  new_lin = add get rg_st 2 1
+  rdig = new uchar 32 0
+  ign_w = rg_write_cand_disk cu du new_lin rdig
+  put rg_phases 6 rg_clock
+  rg_encode_jrn RG_PHASE_CANDIDATE get rg_cand_meta add mb 2 cid get rg_st 2 rdig
+  if eq cstep RX_CRASH_AFTER_CANDIDATE_WRITE
+    ret RX_GEN_ERR_IO
+  end
+  put rg_phases 7 rg_clock
+  put rg_phases 8 rg_clock
+  if eq cstep RX_CRASH_BEFORE_ROOT_FLIP
+    ret RX_GEN_ERR_IO
+  end
+  if ne get rg_st 6 0
+    if eq get rg_st 17 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+  end
+  if ne get rg_st 7 0
+    ret RX_GEN_ERR_HALTED
+  end
+  rg_encode_ptr cid new_lin rdig
+  put rg_phases 3 rg_clock
+  put rg_st 1 cid
+  put rg_st 2 new_lin
+  if eq cstep RX_CRASH_AFTER_ROOT_FLIP
+    put rg_cand_meta mb 0
+    ret RX_GEN_ERR_IO
+  end
+  rg_encode_jrn RG_PHASE_FLIPPED get rg_cand_meta add mb 2 cid sub new_lin 1 rdig
+  put rg_phases 9 rg_clock
+  if eq cstep RX_CRASH_BEFORE_RECEIPT
+    put rg_cand_meta mb 0
+    ret RX_GEN_ERR_IO
+  end
+  rm = new ulong 9 0
+  put rm 0 du
+  put rm 1 cid
+  put rm 2 new_lin
+  put rm 3 get rg_cand_meta add mb 2
+  put rm 4 get req 1
+  put rm 5 get req 3
+  put rm 6 get req 4
+  put rm 7 get rg_disk_blen add mul du 7 6
+  put rm 8 get rg_cand_meta add mb 10
+  rg_write_receipt rm rdig
+  put rg_phases 10 rg_clock
+  rg_event_append cid new_lin
+  put rg_phases 11 rg_clock
+  rg_encode_jrn RG_PHASE_RECEIPT get rg_cand_meta add mb 2 cid sub new_lin 1 rdig
+  put rg_phases 4 rg_clock
+  put rg_cand_meta mb 0
+  ret RX_GEN_OK
+end
+
+note req[0..6]: cid, subject, has_cred, cap_id, cap_gen, res, rights
+fn rx_gen_promote req view ulong 7 to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 6 0
+    if eq get req 2 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+    if eq get rg_st 14 0
+      ret RX_GEN_ERR_IDENTITY
+    end
+  end
+  if ne get rg_st 7 0
+    ret RX_GEN_ERR_HALTED
+  end
+  ci = rg_find_cand get req 0
+  if lt ci 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_st 5 0
+    ret RX_GEN_ERR_BUSY
+  end
+  put rg_st 5 1
+  for i ulong 14
+    put rg_phases i 0
+  end
+  put rg_phases 0 get req 0
+  put rg_phases 1 rg_clock
+  cu = ulong ci
+  rc = rg_promote_check_auth req cu
+  if ne rc RX_GEN_OK
+    put rg_phase_res 0 rc
+    put rg_st 5 0
+    ret rc
+  end
+  put rg_cand_meta add mul cu 12 4 1
+  put rg_phases 2 rg_clock
+  rc = rg_classify cu
+  if ne rc RX_GEN_OK
+    put rg_phase_res 0 rc
+    put rg_st 5 0
+    ret rc
+  end
+  rc = rg_promote_check_obs cu
+  if ne rc RX_GEN_OK
+    put rg_phase_res 0 rc
+    put rg_st 5 0
+    ret rc
+  end
+  put rg_phases 5 rg_clock
+  rc = rg_promote_commit_disk req cu
+  put rg_phase_res 0 rc
+  put rg_st 5 0
+  ret rc
+end
+
+fn rg_recover_write_rct du ulong gid ulong lin ulong parent ulong ptr_dig view uchar 32 to void
+  rb = mul du RG_ROOT_BYTES
+  rm = new ulong 9 0
+  put rm 0 du
+  put rm 1 gid
+  put rm 2 lin
+  put rm 3 parent
+  put rm 7 rg_get_disk_u64 rb 436
+  put rm 8 rg_get_disk_u32 rb 476
+  rg_write_receipt rm ptr_dig
+  rg_event_append gid lin
+end
+
+fn rg_recover_fill rb ulong gid ulong lin ulong rct ulong to void
+  parent = rg_get_disk_u64 rb 16
+  evp = rg_event_has gid
+  if eq parent 0
+    evp = ulong 1
+  end
+  if ne parent 0
+    if eq evp 0
+      rg_event_append gid lin
+      evp = ulong 1
+    end
+  end
+  ne_cnt = rg_get_disk_u32 rb 52
+  nx_cnt = rg_get_disk_u32 rb 56
+  put rg_rec_meta 0 1
+  put rg_rec_meta 1 gid
+  put rg_rec_meta 2 lin
+  put rg_rec_meta 3 parent
+  put rg_rec_meta 4 rct
+  put rg_rec_meta 5 evp
+  put rg_rec_meta 6 ne_cnt
+  put rg_rec_meta 7 nx_cnt
+  for i ulong ne_cnt bound 8
+    put rg_rec_ext i rg_get_disk_u64 rb add 304 mul i 8
+  end
+  for i ulong nx_cnt bound 8
+    put rg_rec_exc i rg_get_disk_u64 rb add 368 mul i 8
+  end
+end
+
+fn rx_gen_recover to long
+  put rg_st 5 0
+  for i ulong 8
+    put rg_rec_meta i 0
+    put rg_rec_ext i 0
+    put rg_rec_exc i 0
+  end
+  ptr_id = new ulong 2 0
+  ptr_dig = new uchar 32 0
+  prc = rg_decode_ptr ptr_id ptr_dig
+  jmeta = new ulong 4 0
+  jdig = new uchar 32 0
+  jrc = rg_decode_jrn jmeta jdig
+  if ne prc RX_GEN_OK
+    if eq jrc RX_GEN_OK
+      if ge get jmeta 0 RG_PHASE_FLIPPED
+        cand_id = get jmeta 2
+        ds = rg_find_disk cand_id
+        if lt ds 0
+          ret RX_GEN_ERR_MISSING
+        end
+        du = ulong ds
+        rb = mul du RG_ROOT_BYTES
+        for i ulong RG_ROOT_BYTES
+          put sh_dat i get rg_disk_root add rb i
+        end
+        sh_all RG_ROOT_BYTES
+        for i ulong 32
+          if ne get sh_dig i get jdig i
+            ret RX_GEN_ERR_TORN
+          end
+        end
+        lin = rg_get_disk_u64 rb 24
+        rg_encode_ptr cand_id lin jdig
+        put ptr_id 0 cand_id
+        put ptr_id 1 lin
+        for i ulong 32
+          put ptr_dig i get jdig i
+        end
+        prc = RX_GEN_OK
+      end
+    end
+  end
+  if ne prc RX_GEN_OK
+    ret prc
+  end
+  gid = get ptr_id 0
+  lin = get ptr_id 1
+  ds = rg_find_disk gid
+  if lt ds 0
+    ret RX_GEN_ERR_MISSING
+  end
+  du = ulong ds
+  rb = mul du RG_ROOT_BYTES
+  for i ulong RG_ROOT_BYTES
+    put sh_dat i get rg_disk_root add rb i
+  end
+  sh_all RG_ROOT_BYTES
+  for i ulong 32
+    if ne get sh_dig i get ptr_dig i
+      ret RX_GEN_ERR_TORN
+    end
+  end
+  if ne rg_get_disk_u64 rb 8 gid
+    ret RX_GEN_ERR_TORN
+  end
+  if ne rg_get_disk_u64 rb 24 lin
+    ret RX_GEN_ERR_TORN
+  end
+  parent = rg_get_disk_u64 rb 16
+  rct = get rg_disk_has_rct du
+  if ne parent 0
+    if eq rct 0
+      if eq jrc RX_GEN_OK
+        if eq get jmeta 2 gid
+          rg_recover_write_rct du gid lin parent ptr_dig
+          rct = ulong 1
+        end
+      end
+    end
+  end
+  rg_recover_fill rb gid lin rct
+  ret RX_GEN_OK
+end
+
+fn rx_gen_reject_replay effect_id ulong to long
+  rc = rx_gen_recover
+  if ne rc RX_GEN_OK
+    ret rc
+  end
+  ne_cnt = get rg_rec_meta 6
+  for i ulong ne_cnt bound 8
+    if eq get rg_rec_ext i effect_id
+      ret RX_GEN_ERR_REPLAY
+    end
+  end
+  ret RX_GEN_OK
+end
+
+note Durable executor job slots (synchronous completion in single-threaded OM-2)
+fn rx_gen_exec_start to long
+  if eq get rg_st 0 0
+    ret RX_GEN_ERR_ARG
+  end
+  put rg_st 11 1
+  ret RX_GEN_OK
+end
+
+fn rx_gen_exec_running to ulong
+  if eq get rg_st 0 0
+    ret 0
+  end
+  ret get rg_st 11
+end
+
+fn rx_gen_post_propose_as key ulong pm view ulong 6 ev_buf view uchar 256 ev_len ulong to long
+  if eq get rg_st 11 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_job_meta 0 RX_GEN_JOB_IDLE
+    ret RX_GEN_ERR_BUSY
+  end
+  id_buf = new ulong 1 0
+  t0 = rg_clock
+  rc = rx_gen_propose_as pm ev_buf ev_len id_buf
+  t1 = rg_clock
+  put rg_job_meta 0 RX_GEN_JOB_DONE
+  put rg_job_meta 1 add get rg_st 12 1
+  put rg_st 12 get rg_job_meta 1
+  put rg_job_meta 2 key
+  put rg_job_meta 3 get id_buf 0
+  put rg_job_meta 4 get rg_st 1
+  put rg_job_meta 5 get rg_st 2
+  put rg_job_meta 6 sub t1 t0
+  put rg_job_rc 0 rc
+  ret RX_GEN_OK
+end
+
+fn rx_gen_post_propose key ulong pm view ulong 6 ev_buf view uchar 256 ev_len ulong to long
+  pm2 = new ulong 6 0
+  for i ulong 6
+    put pm2 i get pm i
+  end
+  put pm2 1 0
+  ret rx_gen_post_propose_as key pm2 ev_buf ev_len
+end
+
+fn rx_gen_post_promote key ulong req view ulong 7 to long
+  if eq get rg_st 11 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ne get rg_job_meta 8 RX_GEN_JOB_IDLE
+    ret RX_GEN_ERR_BUSY
+  end
+  t0 = rg_clock
+  rc = rx_gen_promote req
+  t1 = rg_clock
+  put rg_job_meta 8 RX_GEN_JOB_DONE
+  put rg_job_meta 9 add get rg_st 12 1
+  put rg_st 12 get rg_job_meta 9
+  put rg_job_meta 10 key
+  put rg_job_meta 11 get req 0
+  put rg_job_meta 12 get rg_st 1
+  put rg_job_meta 13 get rg_st 2
+  put rg_job_meta 14 sub t1 t0
+  put rg_job_rc 1 rc
+  ret RX_GEN_OK
+end
+
+fn rx_gen_job_state kind ulong dst edit ulong 6 dst_rc edit long 1 to long
+  if eq get rg_st 11 0
+    ret RX_GEN_ERR_ARG
+  end
+  if ge kind 2
+    ret RX_GEN_ERR_ARG
+  end
+  jb = mul kind 8
+  st = get rg_job_meta jb
+  if eq st RX_GEN_JOB_DONE
+    put dst 0 get rg_job_meta add jb 2
+    put dst 1 get rg_job_meta add jb 3
+    put dst 2 get rg_job_meta add jb 4
+    put dst 3 get rg_job_meta add jb 5
+    put dst 4 get rg_job_meta add jb 6
+    put dst_rc 0 get rg_job_rc kind
+  end
+  ret long st
+end
+
+fn rx_gen_job_take kind ulong to void
+  if eq get rg_st 11 0
+    ret
+  end
+  if ge kind 2
+    ret
+  end
+  jb = mul kind 8
+  if eq get rg_job_meta jb RX_GEN_JOB_DONE
+    put rg_job_meta jb RX_GEN_JOB_IDLE
+  end
+end

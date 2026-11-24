@@ -1,0 +1,365 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_seq_reference.om -- Pure seeded OM-2 port of src/runtime/rx_seq_reference.c.
+note R15 sequential control reference oracle: fixed faculty order polling,
+note deterministic field-version readiness detection, timed activation,
+note GPU completion wait loop with timeout, and quiescence marking.
+
+const SEQ_OK long 0
+const SEQ_ERR_ARG long -1
+const SEQ_ERR_NOT_FOUND long -2
+const SEQ_ERR_TIMEOUT long -3
+
+const SEQ_DORMANT ulong 0
+const SEQ_RUNNING ulong 1
+
+const SEQ_MAX_OBJECTS ulong 32
+const SEQ_MAX_FIELDS ulong 8
+const SEQ_MAX_REACTIONS ulong 32
+const SEQ_MAX_TRIGGERS ulong 8
+const SEQ_MAX_PLAN ulong 32
+
+note World metadata:
+note   0:sequential, 1:n_reactions, 2:timing, 3:seq_pulse_started, 4:seq_idle_start,
+note   5:stat_seq_pulses, 6:stat_seq_polls, 7:stat_seq_runs, 8:stat_gpu_host_waits,
+note   9:stat_sched_wall_ns, 10:stat_sched_cpu_ns, 11:sim_clock_ns, 12:sim_cpu_ns,
+note   13:idle_broadcasts
+global seq_w_meta ulong 16
+
+note Objects: 32 objects x 20 ulongs:
+note   0:live, 1:generation, 2..9:field_version[0..7], 10..17:field_writer[0..7]
+global seq_objs ulong 640
+
+note Reactions: 32 reactions x 16 ulongs:
+note   0:removed, 1:state, 2:seq_pending, 3:wake_cause, 4:n_triggers,
+note   5:resident_seat, 6:act_ok, 7:last_cause, 8:last_poll_start,
+note   9:last_poll_wall, 10:last_poll_cpu, 11:gpu_wait_steps, 12:gpu_err_code
+global seq_rx ulong 512
+
+note Triggers: 32 reactions x 8 triggers x 4 ulongs:
+note   0:obj_id, 1:obj_gen, 2:field_mask, 3:seq_seen
+global seq_trig ulong 1024
+
+note Plan: order[32] and meta (0:n, 1:gpu_timeout_ms, 2:has_gpu_step, 3:gpu_step_mode)
+global seq_plan_ord ulong 32
+global seq_plan_meta ulong 4
+
+note Activation trace buffer (up to 64 activations: rid, cause)
+global seq_trace_rid ulong 64
+global seq_trace_cause ulong 64
+global seq_trace_n ulong 1
+
+fn seq_world_init sequential ulong timing ulong to void
+  for i ulong 16
+    put seq_w_meta i 0
+  end
+  put seq_w_meta 0 sequential
+  put seq_w_meta 2 timing
+  put seq_w_meta 11 1000
+  put seq_w_meta 12 100
+  for i ulong 640
+    put seq_objs i 0
+  end
+  for i ulong 512
+    put seq_rx i 0
+  end
+  for i ulong 1024
+    put seq_trig i 0
+  end
+  put seq_trace_n 0 0
+end
+
+fn seq_obj_set oid ulong live ulong gen ulong to void
+  if ge oid SEQ_MAX_OBJECTS
+    ret
+  end
+  base = mul oid 20
+  put seq_objs base live
+  put seq_objs add base 1 gen
+end
+
+fn seq_obj_write oid ulong fld ulong ver ulong writer ulong to void
+  if ge oid SEQ_MAX_OBJECTS
+    ret
+  end
+  if ge fld SEQ_MAX_FIELDS
+    ret
+  end
+  base = mul oid 20
+  put seq_objs add base add 2 fld ver
+  put seq_objs add base add 10 fld writer
+end
+
+fn seq_add_reaction rid ulong resident ulong act_ok ulong to void
+  if ge rid SEQ_MAX_REACTIONS
+    ret
+  end
+  base = mul rid 16
+  for k ulong 16
+    put seq_rx add base k 0
+  end
+  put seq_rx add base 5 resident
+  put seq_rx add base 6 act_ok
+  n = get seq_w_meta 1
+  if ge rid n
+    put seq_w_meta 1 add rid 1
+  end
+end
+
+fn seq_set_trigger rid ulong tidx ulong oid ulong ogen ulong mask ulong to void
+  if ge rid SEQ_MAX_REACTIONS
+    ret
+  end
+  if ge tidx SEQ_MAX_TRIGGERS
+    ret
+  end
+  tb = mul add mul rid SEQ_MAX_TRIGGERS tidx 4
+  put seq_trig tb oid
+  put seq_trig add tb 1 ogen
+  put seq_trig add tb 2 mask
+  put seq_trig add tb 3 0
+  rb = mul rid 16
+  nt = get seq_rx add rb 4
+  if ge tidx nt
+    put seq_rx add rb 4 add tidx 1
+  end
+end
+
+fn seq_now_ns to ulong
+  t = get seq_w_meta 11
+  put seq_w_meta 11 add t 1000000
+  ret t
+end
+
+fn seq_cpu_ns to ulong
+  c = get seq_w_meta 12
+  put seq_w_meta 12 add c 250000
+  ret c
+end
+
+fn seq_poll_one_trig rid ulong t ulong st edit ulong 3 to void
+  tb = mul add mul rid SEQ_MAX_TRIGGERS t 4
+  oid = get seq_trig tb
+  ogen = get seq_trig add tb 1
+  mask = get seq_trig add tb 2
+  if ge oid SEQ_MAX_OBJECTS
+    ret
+  end
+  ob = mul oid 20
+  if eq get seq_objs ob 0
+    ret
+  end
+  if ne get seq_objs add ob 1 ogen
+    ret
+  end
+  seen = get seq_trig add tb 3
+  for f ulong SEQ_MAX_FIELDS
+    bit = shl ulong 1 f
+    if ne and mask bit 0
+      v = get seq_objs add ob add 2 f
+      if gt v get seq_trig add tb 3
+        put seq_trig add tb 3 v
+      end
+      if gt v seen
+        put st 0 1
+        if gt v get st 1
+          put st 1 v
+          put st 2 get seq_objs add ob add 10 f
+        end
+      end
+    end
+  end
+end
+
+note Poll one stage: returns 1 if ready, writes cause into dst_cause[0].
+fn seq_poll_ready rid ulong dst_cause edit ulong 1 to ulong
+  rb = mul rid 16
+  st = new ulong 3 0
+  pend = get seq_rx add rb 2
+  put st 0 pend
+  put st 1 0
+  if ne pend 0
+    put st 2 get seq_rx add rb 3
+  else
+    put st 2 0
+  end
+  nt = get seq_rx add rb 4
+  for t ulong nt bound 8
+    seq_poll_one_trig rid t st
+  end
+  put dst_cause 0 get st 2
+  ret get st 0
+end
+
+note Simulated rx_world_seq_activate_timed_locked: returns 1 if activated, 0 otherwise.
+fn seq_activate_timed rid ulong cause ulong pstart ulong pwall ulong pcpu ulong to ulong
+  rb = mul rid 16
+  if eq get seq_rx add rb 6 0
+    ret 0
+  end
+  put seq_rx add rb 2 0
+  put seq_rx add rb 7 cause
+  put seq_rx add rb 8 pstart
+  put seq_rx add rb 9 pwall
+  put seq_rx add rb 10 pcpu
+  tn = get seq_trace_n 0
+  if lt tn 64
+    put seq_trace_rid tn rid
+    put seq_trace_cause tn cause
+    put seq_trace_n 0 add tn 1
+  end
+  if ne get seq_rx add rb 5 0
+    put seq_rx add rb 1 SEQ_RUNNING
+  end
+  ret 1
+end
+
+note Simulated GPU step for resident stage: decrements gpu_wait_steps or returns error.
+fn seq_gpu_step rid ulong to long
+  if eq get seq_plan_meta 2 0
+    ret SEQ_ERR_ARG
+  end
+  rb = mul rid 16
+  err_c = get seq_rx add rb 12
+  if ne err_c 0
+    ret sub long 0 long err_c
+  end
+  rem_s = get seq_rx add rb 11
+  if eq rem_s 0
+    put seq_rx add rb 1 SEQ_DORMANT
+    ret 1
+  end
+  put seq_rx add rb 11 sub rem_s 1
+  if eq sub rem_s 1 0
+    put seq_rx add rb 1 SEQ_DORMANT
+    ret 1
+  end
+  ret 0
+end
+
+fn seq_wait_gpu rid ulong to long
+  rb = mul rid 16
+  put seq_w_meta 8 add get seq_w_meta 8 1
+  tms = get seq_plan_meta 1
+  if eq tms 0
+    tms = ulong 5000
+  end
+  lim = add seq_now_ns mul tms 1000000
+  while ne get seq_rx add rb 1 SEQ_DORMANT bound 1024
+    g = seq_gpu_step rid
+    if lt g 0
+      if ne g SEQ_ERR_NOT_FOUND
+        ret g
+      end
+    end
+    if gt seq_now_ns lim
+      ret SEQ_ERR_TIMEOUT
+    end
+  end
+  ret SEQ_OK
+end
+
+note Poll and run one stage. Returns 1 if ran OK, 0 if not ready/skipped, <0 on error.
+fn seq_pulse_one rid ulong timing ulong to long
+  rb = mul rid 16
+  if ne get seq_rx rb 0
+    ret 0
+  end
+  c0 = ulong 0
+  t0 = ulong 0
+  if ne timing 0
+    c0 = seq_cpu_ns
+    t0 = seq_now_ns
+  end
+  put seq_w_meta 6 add get seq_w_meta 6 1
+  cause_buf = new ulong 1 0
+  ready = ulong 0
+  if eq get seq_rx add rb 1 SEQ_DORMANT
+    ready = seq_poll_ready rid cause_buf
+  end
+  pwall = ulong 0
+  pcpu = ulong 0
+  if ne timing 0
+    pwall = sub seq_now_ns t0
+    pcpu = sub seq_cpu_ns c0
+    put seq_w_meta 9 add get seq_w_meta 9 pwall
+    put seq_w_meta 10 add get seq_w_meta 10 pcpu
+  end
+  if eq ready 0
+    ret 0
+  end
+  if ne seq_activate_timed rid get cause_buf 0 t0 pwall pcpu 1
+    ret 0
+  end
+  put seq_w_meta 7 add get seq_w_meta 7 1
+  if ne get seq_rx add rb 5 0
+    if eq get seq_rx add rb 1 SEQ_RUNNING
+      grc = seq_wait_gpu rid
+      if ne grc SEQ_OK
+        ret grc
+      end
+    end
+  end
+  ret 1
+end
+
+note One pulse over seq_plan_ord[0..plan_n). Writes stages run to dst_ran[0].
+fn rx_seq_pulse dst_ran edit ulong 1 to long
+  if eq get seq_w_meta 0 0
+    ret SEQ_ERR_ARG
+  end
+  n_ran = ulong 0
+  rc = SEQ_OK
+  pulse = add get seq_w_meta 3 1
+  put seq_w_meta 3 pulse
+  put seq_w_meta 5 add get seq_w_meta 5 1
+  pn = get seq_plan_meta 0
+  nrx = get seq_w_meta 1
+  timing = get seq_w_meta 2
+  for i ulong pn bound 32
+    if ne rc SEQ_OK
+      break
+    end
+    rid = get seq_plan_ord i
+    if lt rid nrx
+      st = seq_pulse_one rid timing
+      if eq st 1
+        n_ran = add n_ran 1
+      else
+        if lt st 0
+          n_ran = add n_ran 1
+          rc = st
+        end
+      end
+    end
+  end
+  if eq n_ran 0
+    if eq rc SEQ_OK
+      if ge pn nrx
+        put seq_w_meta 4 pulse
+        put seq_w_meta 13 add get seq_w_meta 13 1
+      end
+    end
+  end
+  put dst_ran 0 n_ran
+  ret rc
+end
+
+note Pulse until a pulse runs nothing or max_pulses. Writes pulses run to dst_pulses[0].
+fn rx_seq_run_until_complete max_pulses ulong dst_pulses edit ulong 1 to long
+  p = ulong 0
+  rc = SEQ_OK
+  ran_buf = new ulong 1 0
+  while lt p max_pulses bound 256
+    put ran_buf 0 0
+    rc = rx_seq_pulse ran_buf
+    p = add p 1
+    if ne rc SEQ_OK
+      break
+    end
+    if eq get ran_buf 0 0
+      break
+    end
+  end
+  put dst_pulses 0 p
+  ret rc
+end
