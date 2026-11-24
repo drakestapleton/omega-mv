@@ -1,0 +1,182 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_dual_jspace_tap.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_dual_jspace_tap.c (DUAL-3a observation tap on
+note jspace.residency: silent vs observed determinism, chooser rule across
+note SOFT/CAPACITY/SPILL/KEEP, and 302-byte canonical observation encoding).
+
+global djt_checks ulong 1
+global djt_fail ulong 1
+
+text djt_pass "RX_DUAL_JSPACE_TAP_OM: PASS\n"
+text djt_fail_m "RX_DUAL_JSPACE_TAP_OM: FAIL\n"
+
+fn djt_chk cond bool to void
+  put djt_checks 0 add get djt_checks 0 1
+  if not cond
+    if eq get djt_fail 0 0
+      put djt_fail 0 get djt_checks 0
+    end
+  end
+end
+
+fn djt_build_tree fanout ulong depth ulong dst_root edit ulong 1 to void
+  djt_chk eq js_space_init JS_OK
+  root = new ulong 1 0
+  djt_chk eq js_branch_root 1 7 root JS_OK
+  r = get root 0
+  for i ulong depth bound 16
+    djt_chk eq js_branch_derive r add 100 i JS_OK
+  end
+  ch = new ulong 1 0
+  for k ulong fanout bound 16
+    djt_chk eq js_branch_fork r ch JS_OK
+    djt_chk eq js_branch_derive get ch 0 add 1000 k JS_OK
+  end
+  put dst_root 0 r
+end
+
+fn djt_read_u32 buf view uchar 302 off ulong to ulong
+  v = ulong 0
+  for k ulong 4
+    v = or v shl ulong get buf add off k mul k 8
+  end
+  ret v
+end
+
+fn djt_read_u64 buf view uchar 302 off ulong to ulong
+  v = ulong 0
+  for k ulong 8
+    v = or v shl ulong get buf add off k mul k 8
+  end
+  ret v
+end
+
+fn djt_check_obs bud ulong to void
+  obs1 = new uchar 302 0
+  obs2 = new uchar 302 0
+  dm = new ulong 5 0
+  put dm 0 1
+  put dm 1 bitcast ulong 1000000000.0f64
+  put dm 2 js_forge_choose 0 1000000000.0f64 0
+  put dm 3 0
+  put dm 4 bud
+  djt_chk eq js_dual_observation_encode dm obs1 JS_DUAL_OBS_BYTES
+  djt_chk eq js_dual_observation_encode dm obs2 JS_DUAL_OBS_BYTES
+  for i ulong JS_DUAL_OBS_BYTES
+    djt_chk eq get obs1 i get obs2 i
+  end
+end
+
+fn djt_run_leg observe ulong stats_out edit ulong 6 sem_out edit uchar 32 to void
+  r = new ulong 1 0
+  djt_build_tree 6 3 r
+  res0 = get js_stats 12
+  djt_chk gt res0 0
+  bud = div res0 2
+  if ne observe 0
+    djt_check_obs bud
+  end
+  djt_chk eq js_forge_enforce bud JS_OK
+  put stats_out 0 res0
+  put stats_out 1 get js_rep_cons 0
+  put stats_out 2 get js_rep_kept 0
+  put stats_out 3 get js_rep_chosen JS_ACT_COMPRESS
+  put stats_out 4 get js_rep_chosen JS_ACT_EVICT
+  put stats_out 5 get js_stats 12
+  djt_chk eq js_branch_semantic_id get r 0 sem_out JS_OK
+end
+
+fn djt_test_silent_vs_observed to void
+  st_a = new ulong 6 0
+  st_b = new ulong 6 0
+  sem_a = new uchar 32 0
+  sem_b = new uchar 32 0
+  djt_run_leg 0 st_a sem_a
+  djt_run_leg 1 st_b sem_b
+  for i ulong 6
+    djt_chk eq get st_a i get st_b i
+  end
+  for i ulong 32
+    djt_chk eq get sem_a i get sem_b i
+  end
+end
+
+fn djt_test_chooser_and_encoding to void
+  r = new ulong 1 0
+  djt_build_tree 2 2 r
+  rslot = get js_br_units mul get r 0 JS_MAX_UNITS
+
+  note Case 1: SOFT pressure with allow_move=1 selects JS_ACT_MOVE
+  put js_costs 6 0.125f64
+  put js_costs 7 0.001f64
+  a_soft = js_forge_choose rslot 1000.0f64 1
+  djt_chk eq a_soft JS_ACT_MOVE
+
+  note Case 2: CAPACITY pressure with allow_move=0 selects JS_ACT_COMPRESS on hot unit
+  a_cap = js_forge_choose rslot 1000000000.0f64 0
+  djt_chk eq a_cap JS_ACT_COMPRESS
+
+  note Case 3: High retain cost keeps unit (JS_ACT_COUNT) under tiny pressure
+  a_keep = js_forge_choose rslot 0.0001f64 0
+  djt_chk eq a_keep JS_ACT_COUNT
+
+  note Case 4: Cheap spill costs make JS_ACT_SPILL win over compress/evict
+  put js_costs 0 100000.0f64
+  put js_costs 2 500.0f64
+  put js_costs 3 500.0f64
+  put js_costs 4 0.1f64
+  put js_costs 5 0.1f64
+  a_spill = js_forge_choose rslot 1000000000.0f64 0
+  djt_chk eq a_spill JS_ACT_SPILL
+
+  note Verify 302-byte observation header and payload fields
+  dm = new ulong 5 0
+  put dm 0 42
+  put dm 1 bitcast ulong 1000000000.0f64
+  put dm 2 a_spill
+  put dm 3 rslot
+  put dm 4 128
+  obs = new uchar 302 0
+  n = js_dual_observation_encode dm obs
+  djt_chk eq n JS_DUAL_OBS_BYTES
+  djt_chk eq get obs 0 uchar JS_DUAL_OBS_KIND
+  djt_chk eq get obs 1 uchar JS_DUAL_OBS_VERSION
+  djt_chk eq get obs 2 uchar 16
+  for i ulong 16
+    djt_chk eq get obs add 3 i get js_dual_site i
+  end
+  djt_chk eq djt_read_u64 obs 19 42
+  djt_chk eq get obs 35 uchar JS_DUAL_PRESSURE_CAPACITY
+  djt_chk eq get obs 37 uchar and a_spill 255
+  djt_chk eq djt_read_u32 obs 199 rslot
+  djt_chk eq djt_read_u64 obs 214 JS_UNIT_BYTES
+  djt_chk eq djt_read_u64 obs 278 128
+end
+
+fn djt_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len djt_pass
+    for i ulong n bound 64
+      put buf i get djt_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len djt_fail_m
+  for i ulong n bound 64
+    put buf i get djt_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  djt_test_silent_vs_observed
+  djt_test_chooser_and_encoding
+  if ne get djt_fail 0 0
+    djt_put_msg 0
+    ret int get djt_fail 0
+  end
+  djt_put_msg 1
+  ret 0
+end

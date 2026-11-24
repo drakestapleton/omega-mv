@@ -1,0 +1,119 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rxc_host_abi_test.om -- Pure seeded OM-2 port of
+note tests/runtime/rxc_host_abi_test.c (composition host ABI lifecycle,
+note argument validation, wait_ms/remote config, multi-run state & replay
+note refusal, and deterministic record digest).
+
+global habi_checks ulong 1
+global habi_fail ulong 1
+
+text habi_dir "/tmp/rxc_host_abi_om"
+text habi_pass "RXC_HOST_ABI_TEST_OM: PASS\n"
+text habi_fail_m "RXC_HOST_ABI_TEST_OM: FAIL\n"
+
+fn habi_chk cond bool to void
+  put habi_checks 0 add get habi_checks 0 1
+  if not cond
+    if eq get habi_fail 0 0
+      put habi_fail 0 get habi_checks 0
+    end
+  end
+end
+
+fn habi_load_dir dst edit uchar 128 to ulong
+  n = len habi_dir
+  for i ulong n bound 128
+    put dst i get habi_dir i
+  end
+  ret n
+end
+
+fn habi_test_lifecycle_and_validation to void
+  dbuf = new uchar 128 0
+  dl = habi_load_dir dbuf
+
+  note Closed instance refuses state, config, and run
+  st = new ulong 2 0
+  habi_chk eq rx_compose_state st RXC_ERR_NOT_FOUND
+  habi_chk eq get st 0 RXC_NONE
+  habi_chk eq rx_compose_set_wait_ms 1000 RXC_ERR_ARG
+  habi_chk eq rx_compose_set_remote 1 RXC_ERR_ARG
+  habi_chk eq rx_compose_run 1 10 1 20 1 RXC_ERR_ARG
+
+  note Invalid directory lengths refused
+  habi_chk eq rx_compose_open dbuf 0 1 100 RXC_ERR_ARG
+  habi_chk eq rx_compose_open dbuf 121 1 100 RXC_ERR_ARG
+
+  note Valid open establishes genesis state (id=1, gen=1)
+  habi_chk eq rx_compose_open dbuf dl 7 1234 RXC_OK
+  habi_chk eq rx_compose_state st RXC_OK
+  habi_chk eq get st 0 1
+  habi_chk eq get st 1 1
+
+  note wait_ms bounds and remote toggle
+  habi_chk eq rx_compose_set_wait_ms 0 RXC_ERR_ARG
+  habi_chk eq rx_compose_set_wait_ms add RXC_WAIT_MS_MAX 1 RXC_ERR_ARG
+  habi_chk eq rx_compose_set_wait_ms 1 RXC_OK
+  habi_chk eq rx_compose_set_wait_ms RXC_WAIT_MS_MAX RXC_OK
+  habi_chk eq rx_compose_set_remote 1 RXC_OK
+  habi_chk eq rx_compose_set_remote 0 RXC_OK
+
+  note Multi-goal sequence advances branch id and preserves state on NO_WINNER
+  habi_chk eq rx_compose_run 10 1000 1 2000 1 RXC_OK
+  habi_chk eq get rxc_last_res 0 RXC_OUT_COMMITTED
+  habi_chk eq get rxc_last_res 1 0
+  habi_chk eq get rxc_last_res 6 1000
+  habi_chk eq rx_compose_state st RXC_OK
+  b_after_1 = get st 0
+  habi_chk eq b_after_1 get rxc_last_res 4
+
+  habi_chk eq rx_compose_run 11 3000 0 4000 0 RXC_OK
+  habi_chk eq get rxc_last_res 0 RXC_OUT_NO_WINNER
+  habi_chk eq get rxc_last_res 1 RXC_NONE
+  habi_chk eq rx_compose_state st RXC_OK
+  habi_chk eq get st 0 b_after_1
+
+  note Pending state 2 triggers RXC_ERR_REPLAY
+  put rxc_st 10 2
+  habi_chk eq rx_compose_run 12 5000 1 6000 1 RXC_ERR_REPLAY
+  put rxc_st 10 0
+
+  note Deterministic digest across two calls
+  d1 = new uchar 32 0
+  d2 = new uchar 32 0
+  rx_compose_record_digest d1
+  rx_compose_record_digest d2
+  for i ulong 32
+    habi_chk eq get d1 i get d2 i
+  end
+
+  rx_compose_close
+  habi_chk eq rx_compose_state st RXC_ERR_NOT_FOUND
+end
+
+fn habi_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len habi_pass
+    for i ulong n bound 64
+      put buf i get habi_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len habi_fail_m
+  for i ulong n bound 64
+    put buf i get habi_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  habi_test_lifecycle_and_validation
+  if ne get habi_fail 0 0
+    habi_put_msg 0
+    ret int get habi_fail 0
+  end
+  habi_put_msg 1
+  ret 0
+end

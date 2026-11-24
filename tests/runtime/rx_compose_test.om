@@ -1,0 +1,142 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_compose_test.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_compose_test.c (COMPOSITION-2 causal path: candidate
+note derivation, tie-breaking, Cortex claim/evidence/promotion/admission
+note provenance, and commit binder authorization checks).
+
+global cmp_checks ulong 1
+global cmp_fail ulong 1
+
+text cmp_dir "/tmp/rx_compose_test_om"
+text cmp_pass "RX_COMPOSE_TEST_OM: PASS\n"
+text cmp_fail_m "RX_COMPOSE_TEST_OM: FAIL\n"
+
+fn cmp_chk cond bool to void
+  put cmp_checks 0 add get cmp_checks 0 1
+  if not cond
+    if eq get cmp_fail 0 0
+      put cmp_fail 0 get cmp_checks 0
+    end
+  end
+end
+
+fn cmp_test_causal_path_and_provenance to void
+  dbuf = new uchar 128 0
+  dl = len cmp_dir
+  for i ulong dl bound 128
+    put dbuf i get cmp_dir i
+  end
+  cmp_chk eq rx_compose_open dbuf dl 1 9001 RXC_OK
+  note Genesis wrote ENTITY_CREATED at record 0
+  cmp_chk eq get rxc_cx_n 0 1
+  cmp_chk eq get rxc_cx_hdr 1 RXC_CX_K_ENTITY_CREATED
+
+  note Run 1: both pass -> candidate 0 wins by deterministic tie-break
+  cmp_chk eq rx_compose_run 50 1111 1 2222 1 RXC_OK
+  cmp_chk eq get rxc_last_res 0 RXC_OUT_COMMITTED
+  cmp_chk eq get rxc_last_res 1 0
+  cmp_chk eq get rxc_last_res 6 1111
+  cmp_chk eq get rxc_last_res 7 1
+  cl0 = get rxc_last_res 8
+  cl1 = get rxc_last_res 9
+  ev = get rxc_last_res 10
+  pr = get rxc_last_res 11
+  cmp_chk gt cl0 0
+  cmp_chk gt cl1 cl0
+  cmp_chk gt ev cl1
+  cmp_chk gt pr ev
+
+  note Verify promotion record links {winner=cl0, evidence=ev}
+  phb = mul sub pr 1 13
+  cmp_chk eq get rxc_cx_hdr add phb 1 RXC_CX_K_PROMOTION
+  cmp_chk eq get rxc_cx_hdr add phb 8 cl0
+  cmp_chk eq get rxc_cx_hdr add phb 9 ev
+
+  note Verify loser admission record links {loser=cl1, evidence=ev} with tag RXC_ADMIT_LOSER
+  ahb = mul pr 13
+  cmp_chk eq get rxc_cx_hdr add ahb 1 RXC_CX_K_ADMISSION
+  cmp_chk eq get rxc_cx_hdr add ahb 7 RXC_ADMIT_LOSER
+  cmp_chk eq get rxc_cx_hdr add ahb 8 cl1
+  cmp_chk eq get rxc_cx_hdr add ahb 9 ev
+
+  note Run 2: cand0 fails, cand1 passes -> candidate 1 wins
+  cmp_chk eq rx_compose_run 51 3333 0 4444 1 RXC_OK
+  cmp_chk eq get rxc_last_res 0 RXC_OUT_COMMITTED
+  cmp_chk eq get rxc_last_res 1 1
+  cmp_chk eq get rxc_last_res 6 4444
+
+  note Run 3: neither passes -> NO_WINNER, both staged candidates reclaimed
+  st_before = get rxc_st 6
+  cmp_chk eq rx_compose_run 52 5555 0 6666 0 RXC_OK
+  cmp_chk eq get rxc_last_res 0 RXC_OUT_NO_WINNER
+  cmp_chk eq get rxc_last_res 1 RXC_NONE
+  cmp_chk eq get rxc_last_res 7 2
+  cmp_chk eq get rxc_st 6 st_before
+
+  rx_compose_close
+end
+
+fn cmp_test_binder_refusals to void
+  dbuf = new uchar 128 0
+  dl = len cmp_dir
+  for i ulong dl bound 128
+    put dbuf i get cmp_dir i
+  end
+  cmp_chk eq rx_compose_open dbuf dl 2 9002 RXC_OK
+
+  old_id = get rxc_st 6
+  old_gen = get rxc_st 7
+  sl = rxc_br_alloc old_id old_gen 1 get rxc_subj 0
+  cmp_chk ge sl 0
+  bb = mul ulong sl 8
+  cid = get rxc_br add bb 1
+  cgen = get rxc_br add bb 2
+
+  note Valid commit binder check passes
+  cmp_chk eq rxc_bind_check get rxc_subj 3 old_id old_gen cid cgen RXC_OK
+  note Wrong caller subject refused
+  cmp_chk eq rxc_bind_check get rxc_subj 0 old_id old_gen cid cgen RXC_ERR_BINDING
+  note Wrong parent refused
+  cmp_chk eq rxc_bind_check get rxc_subj 3 add old_id 9 old_gen cid cgen RXC_ERR_BINDING
+  note Non-staged branch refused
+  put rxc_br add bb 3 0
+  cmp_chk eq rxc_bind_check get rxc_subj 3 old_id old_gen cid cgen RXC_ERR_BINDING
+  put rxc_br add bb 3 1
+  note Non-local branch refused
+  put rxc_br add bb 4 0
+  cmp_chk eq rxc_bind_check get rxc_subj 3 old_id old_gen cid cgen RXC_ERR_BINDING
+  put rxc_br add bb 4 1
+  note Unauthorized owner refused
+  put rxc_br add bb 5 999
+  cmp_chk eq rxc_bind_check get rxc_subj 3 old_id old_gen cid cgen RXC_ERR_BINDING
+
+  rx_compose_close
+end
+
+fn cmp_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len cmp_pass
+    for i ulong n bound 64
+      put buf i get cmp_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len cmp_fail_m
+  for i ulong n bound 64
+    put buf i get cmp_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  cmp_test_causal_path_and_provenance
+  cmp_test_binder_refusals
+  if ne get cmp_fail 0 0
+    cmp_put_msg 0
+    ret int get cmp_fail 0
+  end
+  cmp_put_msg 1
+  ret 0
+end

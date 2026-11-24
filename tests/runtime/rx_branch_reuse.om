@@ -1,0 +1,157 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_branch_reuse.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_branch_reuse.c (branch-aware state reuse: zero-copy
+note fork sharing, semantic deduplication on derive, copy-on-edit isolation,
+note frozen parent enforcement, and eviction/spill/compress byte-exact restore).
+
+global brr_checks ulong 1
+global brr_fail ulong 1
+
+text brr_pass "RX_BRANCH_REUSE_OM: PASS\n"
+text brr_fail_m "RX_BRANCH_REUSE_OM: FAIL\n"
+
+fn brr_chk cond bool to void
+  put brr_checks 0 add get brr_checks 0 1
+  if not cond
+    if eq get brr_fail 0 0
+      put brr_fail 0 get brr_checks 0
+    end
+  end
+end
+
+fn brr_test_fanout_sharing_and_dedup to void
+  brr_chk eq js_space_init JS_OK
+  root = new ulong 1 0
+  brr_chk eq js_branch_root 1 11 root JS_OK
+  r = get root 0
+  for i ulong 4
+    brr_chk eq js_branch_derive r add 50 i JS_OK
+  end
+  note 5 units in root -> 320 resident bytes
+  brr_chk eq get js_stats 12 mul 5 JS_UNIT_BYTES
+
+  note Fork 8 branches from root: all 5 prefix units are shared by reference (zero extra bytes)
+  children = new ulong 8 0
+  ch = new ulong 1 0
+  for k ulong 8
+    brr_chk eq js_branch_fork r ch JS_OK
+    put children k get ch 0
+  end
+  brr_chk eq get js_stats 12 mul 5 JS_UNIT_BYTES
+  brr_chk eq get js_stats JS_ACT_REFERENCE 40
+
+  note Frozen parent refuses further derive and edit
+  brr_chk eq js_branch_derive r 999 JS_ERR_FROZEN
+  patch = new uchar 64 0
+  put patch 0 uchar 1
+  brr_chk eq js_branch_edit r 0 0 patch 1 JS_ERR_FROZEN
+
+  note Derive identical token 777 on branches 0..3 -> 1 realization allocated, 3 reused
+  for k ulong 4
+    brr_chk eq js_branch_derive get children k 777 JS_OK
+  end
+  brr_chk eq get js_stats JS_ACT_REUSE 3
+  brr_chk eq get js_stats 12 mul 6 JS_UNIT_BYTES
+
+  note Semantic IDs of branches 0 and 3 must match identically
+  s0 = new uchar 32 0
+  s3 = new uchar 32 0
+  brr_chk eq js_branch_semantic_id get children 0 s0 JS_OK
+  brr_chk eq js_branch_semantic_id get children 3 s3 JS_OK
+  for i ulong 32
+    brr_chk eq get s0 i get s3 i
+  end
+
+  note Derive distinct tokens on branches 4..7 -> 4 new units (10 total < 48 naive)
+  for k ulong 4
+    brr_chk eq js_branch_derive get children add 4 k add 800 k JS_OK
+  end
+  brr_chk eq get js_stats 12 mul 10 JS_UNIT_BYTES
+  brr_chk lt get js_stats 12 mul 48 JS_UNIT_BYTES
+end
+
+fn brr_test_edit_isolation_and_tiers to void
+  brr_chk eq js_space_init JS_OK
+  root = new ulong 1 0
+  brr_chk eq js_branch_root 2 22 root JS_OK
+  r = get root 0
+  brr_chk eq js_branch_derive r 101 JS_OK
+  brr_chk eq js_branch_derive r 102 JS_OK
+
+  b1 = new ulong 1 0
+  b2 = new ulong 1 0
+  brr_chk eq js_branch_fork r b1 JS_OK
+  brr_chk eq js_branch_fork r b2 JS_OK
+
+  orig = new uchar 64 0
+  brr_chk eq js_branch_read get b2 0 1 orig JS_OK
+
+  note Edit unit 1 of b1 at offset 8 with 4 bytes
+  patch = new uchar 64 0
+  put patch 0 uchar 0xde
+  put patch 1 uchar 0xad
+  put patch 2 uchar 0xbe
+  put patch 3 uchar 0xef
+  brr_chk eq js_branch_edit get b1 0 1 8 patch 4 JS_OK
+  brr_chk eq get js_stats JS_ACT_COPY 1
+
+  note b2 must still see original bytes; b1 sees patched bytes
+  buf = new uchar 64 0
+  brr_chk eq js_branch_read get b2 0 1 buf JS_OK
+  for i ulong 64
+    brr_chk eq get buf i get orig i
+  end
+  brr_chk eq js_branch_read get b1 0 1 buf JS_OK
+  brr_chk eq get buf 8 uchar 0xde
+  brr_chk eq get buf 9 uchar 0xad
+  brr_chk eq get buf 10 uchar 0xbe
+  brr_chk eq get buf 11 uchar 0xef
+  brr_chk eq get buf 0 get orig 0
+
+  note Compress, spill, and evict b1's edited unit -> read restores exact bytes each time
+  rs = get js_br_units add mul get b1 0 JS_MAX_UNITS 1
+  brr_chk eq js_real_compress rs JS_OK
+  brr_chk eq js_branch_read get b1 0 1 buf JS_OK
+  brr_chk eq get buf 8 uchar 0xde
+  brr_chk eq get buf 11 uchar 0xef
+
+  brr_chk eq js_real_spill rs JS_OK
+  brr_chk eq js_branch_read get b1 0 1 buf JS_OK
+  brr_chk eq get buf 8 uchar 0xde
+  brr_chk eq get buf 11 uchar 0xef
+
+  brr_chk eq js_real_evict rs JS_OK
+  brr_chk eq js_branch_read get b1 0 1 buf JS_OK
+  brr_chk eq get buf 8 uchar 0xde
+  brr_chk eq get buf 9 uchar 0xad
+  brr_chk eq get buf 10 uchar 0xbe
+  brr_chk eq get buf 11 uchar 0xef
+end
+
+fn brr_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len brr_pass
+    for i ulong n bound 64
+      put buf i get brr_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len brr_fail_m
+  for i ulong n bound 64
+    put buf i get brr_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  brr_test_fanout_sharing_and_dedup
+  brr_test_edit_isolation_and_tiers
+  if ne get brr_fail 0 0
+    brr_put_msg 0
+    ret int get brr_fail 0
+  end
+  brr_put_msg 1
+  ret 0
+end

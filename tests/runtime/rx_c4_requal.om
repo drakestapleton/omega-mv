@@ -1,0 +1,146 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_c4_requal.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_c4_requal.c (C4 requalification: deterministic
+note multi-goal digest replay, zero leaked staged branches, OLD-state
+note rollback on binder refusal, and world-record timing/digest masking).
+
+global c4_checks ulong 1
+global c4_fail ulong 1
+
+text c4_dir_1 "/tmp/rxc_c4_run1"
+text c4_dir_2 "/tmp/rxc_c4_run2"
+text c4_pass "RX_C4_REQUAL_OM: PASS\n"
+text c4_fail_m "RX_C4_REQUAL_OM: FAIL\n"
+
+fn c4_chk cond bool to void
+  put c4_checks 0 add get c4_checks 0 1
+  if not cond
+    if eq get c4_fail 0 0
+      put c4_fail 0 get c4_checks 0
+    end
+  end
+end
+
+fn c4_count_staged to ulong
+  cnt = ulong 0
+  for i ulong 32
+    bb = mul i 8
+    if ne get rxc_br bb 0
+      if ne get rxc_br add bb 3 0
+        cnt = add cnt 1
+      end
+    end
+  end
+  ret cnt
+end
+
+fn c4_run_workload use_dir2 ulong dst_dig edit uchar 32 to void
+  dbuf = new uchar 128 0
+  dl = ulong 0
+  if eq use_dir2 0
+    dl = len c4_dir_1
+    for i ulong dl bound 128
+      put dbuf i get c4_dir_1 i
+    end
+  else
+    dl = len c4_dir_2
+    for i ulong dl bound 128
+      put dbuf i get c4_dir_2 i
+    end
+  end
+  c4_chk eq rx_compose_open dbuf dl 4 7777 RXC_OK
+  c4_chk eq c4_count_staged 0
+
+  note Goal 1: cand0 wins
+  c4_chk eq rx_compose_run 100 1001 1 1002 0 RXC_OK
+  c4_chk eq get rxc_last_res 0 RXC_OUT_COMMITTED
+  c4_chk eq c4_count_staged 0
+
+  note Goal 2: cand1 wins
+  c4_chk eq rx_compose_run 200 2001 0 2002 1 RXC_OK
+  c4_chk eq get rxc_last_res 0 RXC_OUT_COMMITTED
+  c4_chk eq c4_count_staged 0
+
+  note Goal 3: neither passes -> NO_WINNER, zero leaked staged branches
+  c4_chk eq rx_compose_run 300 3001 0 3002 0 RXC_OK
+  c4_chk eq get rxc_last_res 0 RXC_OUT_NO_WINNER
+  c4_chk eq c4_count_staged 0
+
+  note Goal 4: both pass -> cand0 wins
+  c4_chk eq rx_compose_run 400 4001 1 4002 1 RXC_OK
+  c4_chk eq get rxc_last_res 0 RXC_OUT_COMMITTED
+  c4_chk eq c4_count_staged 0
+
+  rx_compose_record_digest dst_dig
+  rx_compose_close
+end
+
+fn c4_test_deterministic_replay_and_masking to void
+  d1 = new uchar 32 0
+  d2 = new uchar 32 0
+  c4_run_workload 0 d1
+  c4_run_workload 1 d2
+  for i ulong 32
+    c4_chk eq get d1 i get d2 i
+  end
+
+  note Verify timing & crumb digest masking on WORK_ACCEPTED record
+  dbuf = new uchar 128 0
+  dl = len c4_dir_1
+  for i ulong dl bound 128
+    put dbuf i get c4_dir_1 i
+  end
+  c4_chk eq rx_compose_open dbuf dl 5 8888 RXC_OK
+  c4_chk eq rx_compose_run 10 11 1 22 0 RXC_OK
+  rx_compose_record_digest d1
+  note Mutate timing words (8, 9) and digest words (4..7) of WORK_ACCEPTED record (idx 1)
+  pb = ulong 20
+  put rxc_cx_pay add pb RXC_WREC_T_START_NS 999999
+  put rxc_cx_pay add pb RXC_WREC_T_END_NS 888888
+  put rxc_cx_pay add pb RXC_WREC_DIGEST0 12345678
+  rx_compose_record_digest d2
+  for i ulong 32
+    c4_chk eq get d1 i get d2 i
+  end
+
+  note Verify OLD-state preservation on binder refusal (NOT_COMMITTED)
+  old_id = get rxc_st 6
+  old_gen = get rxc_st 7
+  c4_chk eq rxc_run_fork_and_derive 33 44 RXC_OK
+  put rxc_br add mul get rxc_run_sc 0 8 4 0
+  put rxc_run_sc 9 0
+  c4_chk eq rxc_run_seal_winner 33 0
+  c4_chk eq get rxc_last_res 0 RXC_OUT_NOT_COMMITTED
+  c4_chk eq get rxc_st 6 old_id
+  c4_chk eq get rxc_st 7 old_gen
+  c4_chk eq c4_count_staged 0
+
+  rx_compose_close
+end
+
+fn c4_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len c4_pass
+    for i ulong n bound 64
+      put buf i get c4_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len c4_fail_m
+  for i ulong n bound 64
+    put buf i get c4_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  c4_test_deterministic_replay_and_masking
+  if ne get c4_fail 0 0
+    c4_put_msg 0
+    ret int get c4_fail 0
+  end
+  c4_put_msg 1
+  ret 0
+end

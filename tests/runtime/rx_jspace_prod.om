@@ -1,0 +1,161 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_jspace_prod.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_jspace_prod.c (J-Space production contracts: limits,
+note generation-checked refs, staged forks, owner enforcement, reclaim,
+note remote-owned locality refusal, and 48-byte anchor persistence).
+
+global jsp_checks ulong 1
+global jsp_fail ulong 1
+
+text jsp_pass "RX_JSPACE_PROD_OM: PASS\n"
+text jsp_fail_m "RX_JSPACE_PROD_OM: FAIL\n"
+
+fn jsp_chk cond bool to void
+  put jsp_checks 0 add get jsp_checks 0 1
+  if not cond
+    if eq get jsp_fail 0 0
+      put jsp_fail 0 get jsp_checks 0
+    end
+  end
+end
+
+fn jsp_test_limits_and_stale_refs to void
+  lim = new ulong 4 0
+  put lim 0 16
+  put lim 1 3
+  put lim 2 4096
+  put lim 3 0
+  jsp_chk eq js_space_init_limits lim JS_OK
+
+  b0 = new ulong 1 0
+  b1 = new ulong 1 0
+  b2 = new ulong 1 0
+  b3 = new ulong 1 0
+  jsp_chk eq js_branch_root 1 10 b0 JS_OK
+  jsp_chk eq js_branch_fork get b0 0 b1 JS_OK
+  jsp_chk eq js_branch_fork get b0 0 b2 JS_OK
+  note 4th branch exceeds max_branches=3 -> JS_ERR_FULL
+  jsp_chk eq js_branch_fork get b0 0 b3 JS_ERR_FULL
+
+  note Generation-checked ref becomes stale after release and slot reuse
+  ref1 = new ulong 2 0
+  jsp_chk eq js_branch_ref get b1 0 ref1 JS_OK
+  jsp_chk eq js_branch_check get ref1 0 get ref1 1 JS_OK
+  jsp_chk eq js_branch_release get b1 0 JS_OK
+  jsp_chk eq js_branch_check get ref1 0 get ref1 1 JS_ERR_STALE
+
+  note Re-allocating reuses slot with bumped generation; old ref stays stale
+  jsp_chk eq js_branch_fork get b0 0 b3 JS_OK
+  ref3 = new ulong 2 0
+  jsp_chk eq js_branch_ref get b3 0 ref3 JS_OK
+  jsp_chk eq get ref3 0 get ref1 0
+  jsp_chk gt get ref3 1 get ref1 1
+  jsp_chk eq js_branch_check get ref1 0 get ref1 1 JS_ERR_STALE
+  jsp_chk eq js_branch_check get ref3 0 get ref3 1 JS_OK
+end
+
+fn jsp_test_staging_owner_and_seal to void
+  jsp_chk eq js_space_init JS_OK
+  b0 = new ulong 1 0
+  jsp_chk eq js_branch_root 1 55 b0 JS_OK
+  ref0 = new ulong 2 0
+  jsp_chk eq js_branch_ref get b0 0 ref0 JS_OK
+
+  note Fork two staged branches with distinct owners
+  s1 = new ulong 2 0
+  s2 = new ulong 2 0
+  jsp_chk eq js_branch_fork_staged get ref0 0 get ref0 1 101 s1 JS_OK
+  jsp_chk eq js_branch_fork_staged get ref0 0 get ref0 1 202 s2 JS_OK
+
+  info = new ulong 5 0
+  jsp_chk eq js_branch_info get s1 0 get s1 1 info JS_OK
+  jsp_chk eq get info 0 101
+  jsp_chk eq get info 1 get ref0 0
+  jsp_chk eq get info 2 get ref0 1
+  jsp_chk eq get info 3 1
+  jsp_chk eq get info 4 JS_HOME_LOCAL
+
+  note Wrong subject refused; seal clears staged flag; owner transfer works
+  jsp_chk eq js_branch_release_ref get s1 0 get s1 1 202 JS_ERR_OWNER
+  jsp_chk eq js_branch_seal get s1 0 get s1 1 JS_OK
+  jsp_chk eq js_branch_info get s1 0 get s1 1 info JS_OK
+  jsp_chk eq get info 3 0
+  jsp_chk eq js_branch_set_owner get s1 0 get s1 1 303 JS_OK
+  jsp_chk eq js_branch_release_ref get s1 0 get s1 1 101 JS_ERR_OWNER
+
+  note Reclaim only reclaims s2 (still staged), leaving sealed s1 live
+  jsp_chk eq js_space_reclaim_staged 1
+  jsp_chk eq js_branch_check get s1 0 get s1 1 JS_OK
+  jsp_chk eq js_branch_check get s2 0 get s2 1 JS_ERR_STALE
+
+  note Correct new owner 303 can release s1
+  jsp_chk eq js_branch_release_ref get s1 0 get s1 1 303 JS_OK
+  jsp_chk eq js_branch_check get s1 0 get s1 1 JS_ERR_STALE
+end
+
+fn jsp_test_locality_and_anchor to void
+  jsp_chk eq js_space_init JS_OK
+  b0 = new ulong 1 0
+  jsp_chk eq js_branch_root 1 88 b0 JS_OK
+  ref0 = new ulong 2 0
+  jsp_chk eq js_branch_ref get b0 0 ref0 JS_OK
+
+  mach = new uchar 32 0
+  put mach 0 uchar 0x5a
+  put mach 31 uchar 0xa5
+  jsp_chk eq js_branch_set_home get ref0 0 get ref0 1 JS_HOME_REMOTE_OWNED mach JS_OK
+
+  note Remote-owned branch refuses derive and edit
+  jsp_chk eq js_branch_derive get b0 0 123 JS_ERR_REMOTE
+  patch = new uchar 64 0
+  jsp_chk eq js_branch_edit get b0 0 0 0 patch 1 JS_ERR_REMOTE
+
+  note Remote-owned branch can still read while HOT, but refuses read once EVICTED
+  buf = new uchar 64 0
+  jsp_chk eq js_branch_read get b0 0 0 buf JS_OK
+  rs = get js_br_units mul get b0 0 JS_MAX_UNITS
+  jsp_chk eq js_real_evict rs JS_OK
+  jsp_chk eq js_branch_read get b0 0 0 buf JS_ERR_REMOTE
+
+  note 48-byte anchor unset initially, roundtrips once set
+  anc_out = new uchar 48 0
+  jsp_chk eq js_space_anchor anc_out 0
+  anc_in = new uchar 48 0
+  for i ulong 48
+    put anc_in i uchar and add i 17 255
+  end
+  js_space_set_anchor anc_in
+  jsp_chk eq js_space_anchor anc_out 1
+  for i ulong 48
+    jsp_chk eq get anc_out i get anc_in i
+  end
+end
+
+fn jsp_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len jsp_pass
+    for i ulong n bound 64
+      put buf i get jsp_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len jsp_fail_m
+  for i ulong n bound 64
+    put buf i get jsp_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  jsp_test_limits_and_stale_refs
+  jsp_test_staging_owner_and_seal
+  jsp_test_locality_and_anchor
+  if ne get jsp_fail 0 0
+    jsp_put_msg 0
+    ret int get jsp_fail 0
+  end
+  jsp_put_msg 1
+  ret 0
+end
