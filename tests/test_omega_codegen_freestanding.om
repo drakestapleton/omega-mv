@@ -1,0 +1,350 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_codegen_freestanding.c.
+note Verifies all 14 matmul codegen fixtures (i32, tensor, loop, frag, block), the bounded-buffer
+note encode contract (padded multiple of 128B >= 512B, short buffer refused without writing,
+note exact-size vs roomy encode byte- and digest-identical with trailing sentinel untouched),
+note all 8 SM121 golden-word / regalloc-bounds verifiers, and omega_fp32_to_bf16 rounding edges.
+note Host-only, CPU-only, zero GPU access.
+om2
+
+text t_cgfs_pass "PASS test_omega_codegen_freestanding\n"
+text t_cgfs_fail "FAIL test_omega_codegen_freestanding\n"
+
+fn cgfs_all_bytes buf view uchar 16384 off ulong n ulong v uchar to long
+  for i ulong n bound 16384
+    if ne get buf add off i v
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn cgfs_unroll kind ulong kp uint rt uint ct uint mut ulong to uint
+  if eq kind 4
+    ret omega_matmul_frag_block_unroll kp rt ct
+  end
+  u = omega_matmul_frag_unroll kp
+  if ne mut 0
+    ks = div kp 16
+    while and gt u 1 lt div ks u 2 bound 8
+      u = div u 2
+    end
+  end
+  ret u
+end
+
+global g_cgfs_first uchar 16384
+global g_cgfs_d1 uchar 32
+
+fn cgfs_check_spec cfg view ulong 9 to long
+  spec_id = new uchar 32 0
+  ret omega_matmul_spec_init uint get cfg 1 uint get cfg 2 uint get cfg 3 uint get cfg 4 spec_id
+end
+
+fn cgfs_emit_fx cfg view ulong 9 ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 ra_out edit ulong 4 to long
+  if ne cgfs_check_spec cfg 0
+    ret -1
+  end
+  sp = new ulong 12 0
+  put sp 0 get cfg 1
+  put sp 1 get cfg 2
+  put sp 2 get cfg 3
+  put sp 3 get cfg 4
+  kind = get cfg 0
+  if eq kind 0
+    ret omega_blackwell_codegen_matmul_i32_prog sp ins meta vinfo phys ra_out
+  end
+  if eq kind 1
+    ret omega_blackwell_codegen_matmul_tensor_prog sp ins meta vinfo phys ra_out
+  end
+  if eq kind 2
+    put sp 4 get cfg 5
+    put sp 5 get cfg 8
+    ret omega_blackwell_codegen_matmul_tensor_loop_prog sp ins meta vinfo phys ra_out
+  end
+  u = ulong cgfs_unroll kind uint get cfg 2 uint get cfg 6 uint get cfg 7 get cfg 8
+  if eq kind 3
+    put sp 4 get cfg 5
+    put sp 5 u
+    put sp 6 get cfg 8
+    ret omega_blackwell_codegen_matmul_frag_prog sp ins meta vinfo phys ra_out
+  end
+  put sp 4 get cfg 5
+  put sp 5 u
+  put sp 6 get cfg 6
+  put sp 7 get cfg 7
+  put sp 8 get cfg 8
+  ret omega_blackwell_codegen_matmul_frag_block_prog sp ins meta vinfo phys ra_out
+end
+
+fn cgfs_check_short ins view ulong 8192 cnt ulong need ulong phys view ulong 288 ra_out view ulong 4 to long
+  code = new uchar 16384 0xa5
+  kmeta = new ulong 4 0
+  d1 = new uchar 32 0
+  put kmeta 0 cnt
+  put kmeta 1 sub need 1
+  if ne omega_blackwell_kernel_encode_into ins phys ra_out code kmeta d1 -2
+    ret -3
+  end
+  if ne cgfs_all_bytes code 0 16384 0xa5 1
+    ret -4
+  end
+  put kmeta 0 cnt
+  put kmeta 1 0
+  if ne omega_blackwell_kernel_encode_into ins phys ra_out code kmeta d1 -2
+    ret -5
+  end
+  ret 0
+end
+
+fn cgfs_check_roomy ins view ulong 8192 cnt ulong need ulong phys view ulong 288 ra_out view ulong 4 to long
+  code = new uchar 16384 0xa5
+  kmeta = new ulong 4 0
+  d1 = new uchar 32 0
+  roomy = add need 64
+  if gt roomy 16384
+    roomy = need
+  end
+  put kmeta 0 cnt
+  put kmeta 1 roomy
+  if ne omega_blackwell_kernel_encode_into ins phys ra_out code kmeta d1 0
+    ret -6
+  end
+  if ne get kmeta 0 need
+    ret -7
+  end
+  if ne get kmeta 1 div need 16
+    ret -8
+  end
+  tail_n = sub roomy need
+  if gt tail_n 0
+    if ne cgfs_all_bytes code need tail_n 0xa5 1
+      ret -9
+    end
+  end
+  for i ulong need bound 16384
+    put g_cgfs_first i get code i
+  end
+  for i ulong 32
+    put g_cgfs_d1 i get d1 i
+  end
+  ret 0
+end
+
+fn cgfs_check_exact ins view ulong 8192 cnt ulong need ulong phys view ulong 288 ra_out view ulong 4 to long
+  code = new uchar 16384 0
+  kmeta = new ulong 4 0
+  d2 = new uchar 32 0
+  put kmeta 0 cnt
+  put kmeta 1 need
+  if ne omega_blackwell_kernel_encode_into ins phys ra_out code kmeta d2 0
+    ret -10
+  end
+  for i ulong need bound 16384
+    if ne get g_cgfs_first i get code i
+      ret -11
+    end
+  end
+  for i ulong 32
+    if ne get g_cgfs_d1 i get d2 i
+      ret -12
+    end
+  end
+  ret 0
+end
+
+fn cgfs_check_contract ins view ulong 8192 cnt ulong phys view ulong 288 ra_out view ulong 4 to long
+  need = omega_bw_program_code_bytes cnt
+  if or lt need 512 ne rem need 128 0
+    ret -1
+  end
+  if gt need 16384
+    ret -2
+  end
+  rc = cgfs_check_short ins cnt need phys ra_out
+  if ne rc 0
+    ret rc
+  end
+  rc = cgfs_check_roomy ins cnt need phys ra_out
+  if ne rc 0
+    ret rc
+  end
+  ret cgfs_check_exact ins cnt need phys ra_out
+end
+
+fn cgfs_run_one cfg view ulong 9 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  vinfo = new long 768 0
+  phys = new ulong 288 0
+  ra_out = new ulong 4 0
+  if ne cgfs_emit_fx cfg ins meta vinfo phys ra_out 0
+    ret -1
+  end
+  ret cgfs_check_contract ins get meta 0 phys ra_out
+end
+
+fn cgfs_set_a cfg edit ulong 9 kind ulong m ulong k ulong n ulong prec ulong to void
+  put cfg 0 kind
+  put cfg 1 m
+  put cfg 2 k
+  put cfg 3 n
+  put cfg 4 prec
+  put cfg 5 0
+  put cfg 6 0
+  put cfg 7 0
+  put cfg 8 0
+end
+
+fn cgfs_set_b cfg edit ulong 9 gx ulong rt ulong ct ulong mut ulong to void
+  put cfg 5 gx
+  put cfg 6 rt
+  put cfg 7 ct
+  put cfg 8 mut
+end
+
+fn cgfs_run_all_fx to long
+  cfg = new ulong 9 0
+  cgfs_set_a cfg 0 16 16 16 0
+  if ne cgfs_run_one cfg 0
+    ret 10
+  end
+  cgfs_set_a cfg 0 32 16 64 0
+  if ne cgfs_run_one cfg 0
+    ret 11
+  end
+  cgfs_set_a cfg 0 16 32 8 0
+  if ne cgfs_run_one cfg 0
+    ret 12
+  end
+  cgfs_set_a cfg 1 16 16 8 1
+  if ne cgfs_run_one cfg 0
+    ret 13
+  end
+  cgfs_set_a cfg 1 32 16 16 2
+  if ne cgfs_run_one cfg 0
+    ret 14
+  end
+  cgfs_set_a cfg 2 16 64 32 2
+  cgfs_set_b cfg 2 0 0 0
+  if ne cgfs_run_one cfg 0
+    ret 15
+  end
+  cgfs_set_a cfg 2 32 128 64 1
+  cgfs_set_b cfg 4 0 0 0
+  if ne cgfs_run_one cfg 0
+    ret 16
+  end
+  cgfs_set_a cfg 3 16 128 64 2
+  cgfs_set_b cfg 1 0 0 0
+  if ne cgfs_run_one cfg 0
+    ret 17
+  end
+  cgfs_set_a cfg 3 16 1024 3072 2
+  cgfs_set_b cfg 64 0 0 0
+  if ne cgfs_run_one cfg 0
+    ret 18
+  end
+  cgfs_set_a cfg 3 16 4096 4096 2
+  cgfs_set_b cfg 48 0 0 0
+  if ne cgfs_run_one cfg 0
+    ret 19
+  end
+  cgfs_set_a cfg 3 16 4096 4096 2
+  cgfs_set_b cfg 48 0 0 1
+  if ne cgfs_run_one cfg 0
+    ret 20
+  end
+  cgfs_set_a cfg 4 16 256 128 2
+  cgfs_set_b cfg 1 4 2 0
+  if ne cgfs_run_one cfg 0
+    ret 21
+  end
+  cgfs_set_a cfg 4 16 1024 3072 2
+  cgfs_set_b cfg 8 2 2 0
+  if ne cgfs_run_one cfg 0
+    ret 22
+  end
+  cgfs_set_a cfg 4 16 4096 4096 2
+  cgfs_set_b cfg 16 4 4 0
+  if ne cgfs_run_one cfg 0
+    ret 23
+  end
+  ret 0
+end
+
+fn cgfs_golden_fixtures to long
+  if ne omega_blackwell_verify_codegen_fixtures 0
+    ret 30
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_fb1cut4 0
+    ret 31
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_intops 0
+    ret 32
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_fragmm 0
+    ret 33
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_reconv 0
+    ret 34
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_bfly_f2fp 0
+    ret 35
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_atomf32 0
+    ret 36
+  end
+  if ne omega_blackwell_test_regalloc_bounds 0
+    ret 37
+  end
+  ret 0
+end
+
+fn cgfs_bf16_edges to long
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x00000000 0x0000
+    ret 40
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x80000000 0x8000
+    ret 41
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x3f800000 0x3f80
+    ret 42
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x3f808000 0x3f80
+    ret 43
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x3f818000 0x3f82
+    ret 44
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x3f808001 0x3f81
+    ret 45
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x7f800000 0x7f80
+    ret 46
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0xff800000 0xff80
+    ret 47
+  end
+  if ne omega_fp32_to_bf16 bitcast f32 uint 0x7fc00000 0x7fc0
+    ret 48
+  end
+  ret 0
+end
+
+fn main to int
+  if ne cgfs_run_all_fx 0
+    ign = write 1 t_cgfs_fail 0 len t_cgfs_fail
+    ret 1
+  end
+  if ne cgfs_golden_fixtures 0
+    ign = write 1 t_cgfs_fail 0 len t_cgfs_fail
+    ret 2
+  end
+  if ne cgfs_bf16_edges 0
+    ign = write 1 t_cgfs_fail 0 len t_cgfs_fail
+    ret 3
+  end
+  ign = write 1 t_cgfs_pass 0 len t_cgfs_pass
+  ret 0
+end
