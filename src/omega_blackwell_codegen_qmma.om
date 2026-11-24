@@ -1,0 +1,466 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_blackwell_codegen_qmma.c.
+note Composes on om/gpu/cg_qmma.om and om/gpu/bw_regalloc.om.
+om2
+
+const OMEGA_QMMA_MARK ulong 0x51303832
+const OMEGA_QMMA_MARK_F2E4 ulong 0x46453433
+
+fn qmma_om_touch_vreg vinfo edit long 768 r64 ulong pos long is_def ulong nv ulong to void
+  if ge r64 nv
+    ret
+  end
+  base = mul r64 3
+  fd = get vinfo base
+  lu = get vinfo add base 1
+  if and ne is_def 0 lt fd 0
+    put vinfo base pos
+  end
+  if gt pos lu
+    put vinfo add base 1 pos
+  end
+end
+
+fn qmma_om_build_vinfo ins view ulong 8192 meta view ulong 512 vinfo edit long 768 to void
+  n = get meta 0
+  nv = get meta 1
+  nl = get meta 3
+  for v ulong nv bound 256
+    base = mul v 3
+    put vinfo base -1
+    put vinfo add base 1 -1
+    put vinfo add base 2 long get meta add 64 v
+  end
+  for i ulong n bound 1024
+    off = mul i 8
+    flags = get ins add off 7
+    if eq and flags 1 0
+      pos = long i
+      qmma_om_touch_vreg vinfo get ins add off 1 pos 1 nv
+      qmma_om_touch_vreg vinfo get ins add off 2 pos 0 nv
+      qmma_om_touch_vreg vinfo get ins add off 3 pos 0 nv
+      qmma_om_touch_vreg vinfo get ins add off 4 pos 0 nv
+    end
+  end
+  for l ulong nl bound 16
+    ls = long get meta add 320 mul l 2
+    le_idx = long get meta add 321 mul l 2
+    for v ulong nv bound 256
+      base = mul v 3
+      fd = get vinfo base
+      lu = get vinfo add base 1
+      if ge fd 0
+        if lt fd ls
+          if ge lu ls
+            if lt lu le_idx
+              put vinfo add base 1 le_idx
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+fn qmma_om_solve ins view ulong 8192 meta view ulong 512 res edit long 290 to long
+  n = get meta 0
+  nv = get meta 1
+  nu = get meta 2
+  nl = get meta 3
+  if or eq n 0 gt n 1024
+    ret -1
+  end
+  if gt nv 256
+    ret -1
+  end
+  if gt nu 32
+    ret -1
+  end
+  if gt nl 16
+    ret -1
+  end
+  vinfo = new long 768 0
+  qmma_om_build_vinfo ins meta vinfo
+  uinfo = new ulong 32 0
+  for u ulong nu bound 32
+    put uinfo u get meta add 352 u
+  end
+  cfg = new ulong 4 0
+  put cfg 0 nv
+  put cfg 1 nu
+  put cfg 2 0
+  if ne bw_regalloc_solve cfg vinfo uinfo res 0
+    ret -1
+  end
+  ret 0
+end
+
+fn qmma_rd32 code view uchar * off ulong to uint
+  b0 = uint get code off
+  b1 = shl uint get code add off 1 8
+  b2 = shl uint get code add off 2 16
+  b3 = shl uint get code add off 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn qmma_wr32 code edit uchar * off ulong v uint to void
+  put code off uchar and v 255
+  put code add off 1 uchar and shr v 8 255
+  put code add off 2 uchar and shr v 16 255
+  put code add off 3 uchar and shr v 24 255
+end
+
+fn omega_qmma_is_mark op ulong imm ulong to long
+  if and eq op 16 eq imm OMEGA_QMMA_MARK
+    ret 1
+  end
+  ret 0
+end
+
+fn qmma_patch_f2e4 code edit uchar * off ulong to long
+  w0 = qmma_rd32 code off
+  w1 = qmma_rd32 code add off 4
+  w2 = qmma_rd32 code add off 8
+  if ne and w0 uint 0xffff uint 0x7209
+    ret -1
+  end
+  if ne and w1 uint 0xffffff00 0
+    ret -1
+  end
+  if ne w2 uint 0x07800000
+    ret -1
+  end
+  qmma_wr32 code off or and w0 uint 0xffff0000 uint 0x723e
+  qmma_wr32 code add off 8 uint 0x048070ff
+  ret 0
+end
+
+fn qmma_patch_qmma code edit uchar * off ulong to long
+  w0 = qmma_rd32 code off
+  w1 = qmma_rd32 code add off 4
+  w2 = qmma_rd32 code add off 8
+  if ne and w0 uint 0xffff uint 0x723c
+    ret -1
+  end
+  if ne and w1 uint 0xffffff00 0
+    ret -1
+  end
+  if ne and w2 uint 0xffffff00 uint 0x00041800
+    ret -1
+  end
+  qmma_wr32 code off or and w0 uint 0xffff0000 uint 0x727a
+  qmma_wr32 code add off 8 or and w2 uint 0xff uint 0x00002c00
+  ret 0
+end
+
+fn omega_qmma_patch_code ins view ulong 8192 count ulong code edit uchar * code_len ulong to long
+  if gt count 1024
+    ret -1
+  end
+  if lt code_len mul count 16
+    ret -1
+  end
+  if lt len code mul count 16
+    ret -1
+  end
+  n = long 0
+  for i ulong count bound 1024
+    op = get ins mul i 8
+    imm = and get ins add mul i 8 6 0xffffffff
+    if and eq op 37 eq imm OMEGA_QMMA_MARK_F2E4
+      if ne qmma_patch_f2e4 code mul i 16 0
+        ret -1
+      end
+      n = add n 1
+    else
+      if ne omega_qmma_is_mark op imm 0
+        if ne qmma_patch_qmma code mul i 16 0
+          ret -1
+        end
+        n = add n 1
+      end
+    end
+  end
+  ret n
+end
+
+fn qmma_phys_reg r64 ulong sub_off ulong nv ulong res view long 290 to uint
+  if ge r64 nv
+    ret 255
+  end
+  p = get res r64
+  if lt p 0
+    ret 255
+  end
+  ret uint and add ulong p sub_off 255
+end
+
+fn qmma_decode_regs ins view ulong 8192 nv ulong res view long 290 base ulong regs edit uint 4 to void
+  flags = get ins add base 7
+  put regs 0 qmma_phys_reg get ins add base 1 and shr flags 16 15 nv res
+  put regs 1 qmma_phys_reg get ins add base 2 and shr flags 24 15 nv res
+  put regs 2 qmma_phys_reg get ins add base 3 and shr flags 32 15 nv res
+  put regs 3 qmma_phys_reg get ins add base 4 and shr flags 40 15 nv res
+end
+
+fn qmma_wr_selftest_insn op ulong code edit uchar 1024 off ulong regs view uint 4 ctrl uint to void
+  r0 = get regs 0
+  r1 = get regs 1
+  r2 = get regs 2
+  r3 = get regs 3
+  if eq op 16
+    c = ctrl
+    if eq c 0
+      c = uint 0x000fe200
+    end
+    w0 = or or uint 0x723c shl r0 16 shl r1 24
+    qmma_wr32 code off w0
+    qmma_wr32 code add off 4 r2
+    qmma_wr32 code add off 8 or r3 uint 0x00041800
+    qmma_wr32 code add off 12 c
+    ret
+  end
+  c = ctrl
+  if eq c 0
+    c = uint 0x004fc400
+  end
+  w0 = or or uint 0x7209 shl r0 16 shl r1 24
+  qmma_wr32 code off w0
+  qmma_wr32 code add off 4 r2
+  qmma_wr32 code add off 8 uint 0x07800000
+  qmma_wr32 code add off 12 c
+end
+
+fn qmma_selftest_encode_one ins view ulong 8192 nv ulong res view long 290 code edit uchar 1024 i ulong to void
+  base = mul i 8
+  op = get ins base
+  if and ne op 16 ne op 37
+    ret
+  end
+  regs = new uint 4 0
+  qmma_decode_regs ins nv res base regs
+  qmma_wr_selftest_insn op code mul i 16 regs uint shr get ins add base 6 32
+end
+
+fn qmma_selftest_encode ins view ulong 8192 meta view ulong 512 res view long 290 code edit uchar 1024 to void
+  n = get meta 0
+  nv = get meta 1
+  for i ulong n bound 64
+    qmma_selftest_encode_one ins nv res code i
+  end
+end
+
+fn qmma_selftest_build ins edit ulong 8192 meta edit ulong 512 to void
+  put meta 384 qm_uv meta 2
+  put meta 385 qm_v meta 2
+  put meta 386 qm_v meta 4
+  put meta 387 qm_v meta 2
+  put meta 388 qm_v meta 4
+  qm_op1 ins meta 7 get meta 384 0x358 4
+  qm_op1 ins meta 5 get meta 385 0x380 2
+  put meta 12 2
+  qm_ldg ins meta 57 get meta 386 get meta 385 0
+  put meta 12 3
+  qm_ldg ins meta 56 get meta 387 get meta 385 16
+  qm_ldg ins meta 57 get meta 388 get meta 385 32
+  put meta 13 15
+  qm_qmma ins meta get meta 388 get meta 386 get meta 387 get meta 388
+  qm_nop ins meta 15
+  f = qm_v meta 1
+  r = new ulong 8 0
+  qm_r0 r 37
+  put r 1 f
+  put r 2 get meta 388
+  put r 3 get meta 388
+  put r 6 OMEGA_QMMA_MARK_F2E4
+  put r 7 shl ulong 1 32
+  qm_emit ins meta r 0
+  qm_r0 r 12
+  put r 2 get meta 385
+  put r 3 f
+  put r 5 get meta 384
+  put r 6 64
+  qm_emit ins meta r 5
+  qm_r0 r 16
+  put r 1 get meta 388
+  put r 2 get meta 386
+  put r 3 get meta 387
+  put r 4 get meta 388
+  qm_emit_raw ins meta r 15
+  qm_nop ins meta 15
+  for q ulong 4
+    qm_r0 r 12
+    put r 2 get meta 385
+    put r 3 get meta 388
+    put r 5 get meta 384
+    put r 6 mul 4 q
+    put r 7 shl q 32
+    qm_emit ins meta r 5
+  end
+  qm_tail ins meta
+end
+
+fn qmma_selftest_check_one ins view ulong 8192 code view uchar 1024 i ulong to long
+  op = get ins mul i 8
+  imm = and get ins add mul i 8 6 0xffffffff
+  off = mul i 16
+  if eq op 37
+    w0 = qmma_rd32 code off
+    w1 = qmma_rd32 code add off 4
+    w2 = qmma_rd32 code add off 8
+    if ne and w0 uint 0xffff uint 0x723e
+      ret -1
+    end
+    if ne and w1 uint 0xffffff00 0
+      ret -1
+    end
+    if ne w2 uint 0x048070ff
+      ret -1
+    end
+    ret 3
+  end
+  if eq op 16
+    w0 = qmma_rd32 code off
+    w1 = qmma_rd32 code add off 4
+    w2 = qmma_rd32 code add off 8
+    if ne omega_qmma_is_mark op imm 0
+      if ne and w0 uint 0xffff uint 0x727a
+        ret -1
+      end
+      if ne and w1 uint 0xffffff00 0
+        ret -1
+      end
+      if ne and w2 uint 0xffffff00 uint 0x00002c00
+        ret -1
+      end
+      ret 1
+    end
+    if ne and w0 uint 0xffff uint 0x723c
+      ret -1
+    end
+    if ne and w2 uint 0xffffff00 uint 0x00041800
+      ret -1
+    end
+    ret 2
+  end
+  ret 0
+end
+
+fn omega_qmma_patch_selftest to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  res = new long 290 0
+  code = new uchar 1024 0
+  qmma_selftest_build ins meta
+  if ne get meta 5 0
+    ret -1
+  end
+  if ne qmma_om_solve ins meta res 0
+    ret -1
+  end
+  n = get meta 0
+  if gt n 64
+    ret -1
+  end
+  qmma_selftest_encode ins meta res code
+  np = omega_qmma_patch_code ins n code mul n 16
+  if ne np 2
+    ret -1
+  end
+  seenq = long 0
+  seenh = long 0
+  seenf = long 0
+  for i ulong n bound 64
+    kind = qmma_selftest_check_one ins code i
+    if lt kind 0
+      ret -1
+    end
+    if eq kind 1
+      seenq = add seenq 1
+    end
+    if eq kind 2
+      seenh = add seenh 1
+    end
+    if eq kind 3
+      seenf = add seenf 1
+    end
+  end
+  if ne seenq 1
+    ret -1
+  end
+  if ne seenh 1
+    ret -1
+  end
+  if ne seenf 1
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_blackwell_codegen_qmma_probe_prog mutant ulong wait_nops ulong ins edit ulong 8192 meta edit ulong 512 to long
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  sp = new ulong 8 0
+  put sp 0 mutant
+  put sp 1 wait_nops
+  if ne cg_qmma_probe sp ins meta 0
+    ret -1
+  end
+  if or ne get meta 5 0 eq get meta 0 0
+    ret -1
+  end
+  res = new long 290 0
+  if ne qmma_om_solve ins meta res 0
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_blackwell_codegen_qmma_peak_prog iters ulong chains ulong stall ulong threads ulong ins edit ulong 8192 meta edit ulong 512 to long
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  sp = new ulong 8 0
+  put sp 0 iters
+  put sp 1 chains
+  put sp 2 stall
+  put sp 3 threads
+  if ne cg_qmma_peak sp ins meta 0
+    ret -1
+  end
+  if or ne get meta 5 0 eq get meta 0 0
+    ret -1
+  end
+  res = new long 290 0
+  if ne qmma_om_solve ins meta res 0
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_blackwell_codegen_f2e4_probe_prog ins edit ulong 8192 meta edit ulong 512 to long
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  if ne cg_f2e4_probe ins meta 0
+    ret -1
+  end
+  if or ne get meta 5 0 eq get meta 0 0
+    ret -1
+  end
+  res = new long 290 0
+  if ne qmma_om_solve ins meta res 0
+    ret -1
+  end
+  ret 0
+end

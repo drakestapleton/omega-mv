@@ -1,0 +1,232 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_blackwell_codegen_tern.c.
+note Composes on om/gpu/cg_tern.om and om/gpu/bw_regalloc.om.
+om2
+
+const OMEGA_TERN_CHUNK_MAX ulong 8192
+const OMEGA_TERN_SHARED_MAX ulong 16384
+
+fn tern_om_touch_vreg vinfo edit long 768 r64 ulong pos long is_def ulong nv ulong to void
+  if ge r64 nv
+    ret
+  end
+  base = mul r64 3
+  fd = get vinfo base
+  lu = get vinfo add base 1
+  if and ne is_def 0 lt fd 0
+    put vinfo base pos
+  end
+  if gt pos lu
+    put vinfo add base 1 pos
+  end
+end
+
+fn tern_om_build_vinfo ins view ulong 8192 meta view ulong 512 vinfo edit long 768 to void
+  n = get meta 0
+  nv = get meta 1
+  nl = get meta 3
+  for v ulong nv bound 256
+    base = mul v 3
+    put vinfo base -1
+    put vinfo add base 1 -1
+    put vinfo add base 2 long get meta add 64 v
+  end
+  for i ulong n bound 1024
+    off = mul i 8
+    flags = get ins add off 7
+    if eq and flags 1 0
+      pos = long i
+      tern_om_touch_vreg vinfo get ins add off 1 pos 1 nv
+      tern_om_touch_vreg vinfo get ins add off 2 pos 0 nv
+      tern_om_touch_vreg vinfo get ins add off 3 pos 0 nv
+      tern_om_touch_vreg vinfo get ins add off 4 pos 0 nv
+    end
+  end
+  for l ulong nl bound 16
+    ls = long get meta add 320 mul l 2
+    le_idx = long get meta add 321 mul l 2
+    for v ulong nv bound 256
+      base = mul v 3
+      fd = get vinfo base
+      lu = get vinfo add base 1
+      if ge fd 0
+        if lt fd ls
+          if ge lu ls
+            if lt lu le_idx
+              put vinfo add base 1 le_idx
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+fn tern_om_run_sched ins edit ulong 8192 meta view ulong 512 res view long 290 to long
+  n = get meta 0
+  nv = get meta 1
+  v2p = new ulong 256 0
+  bsz = new ulong 256 0
+  for v ulong 256
+    if lt v nv
+      p = get res v
+      if ge p 0
+        put v2p v ulong p
+        w = get meta add 64 v
+        if eq w 0
+          w = 1
+        end
+        put bsz v w
+      else
+        put v2p v ulong 0xffffffffffffffff
+        put bsz v 0
+      end
+    else
+      put v2p v ulong 0xffffffffffffffff
+      put bsz v 0
+    end
+  end
+  if ne cg_tern_sched_stalls ins n v2p bsz 0
+    ret -1
+  end
+  ret 0
+end
+
+fn tern_om_solve ins edit ulong 8192 meta view ulong 512 out_stats edit uint 2 to long
+  n = get meta 0
+  nv = get meta 1
+  nu = get meta 2
+  nl = get meta 3
+  if or eq n 0 gt n 1024
+    ret -1
+  end
+  if gt nv 256
+    ret -1
+  end
+  if gt nu 32
+    ret -1
+  end
+  if gt nl 16
+    ret -1
+  end
+  vinfo = new long 768 0
+  tern_om_build_vinfo ins meta vinfo
+  uinfo = new ulong 32 0
+  for u ulong nu bound 32
+    put uinfo u get meta add 352 u
+  end
+  cfg = new ulong 4 0
+  put cfg 0 nv
+  put cfg 1 nu
+  put cfg 2 0
+  res = new long 290 0
+  if ne bw_regalloc_solve cfg vinfo uinfo res 0
+    ret -1
+  end
+  if ne tern_om_run_sched ins meta res 0
+    ret -1
+  end
+  put out_stats 0 uint n
+  put out_stats 1 uint get res 288
+  ret 0
+end
+
+fn omega_tern_gemv_chunks sp view ulong 8 to uint
+  k = get sp 0
+  if eq k 0
+    ret 0
+  end
+  ret uint div sub add k OMEGA_TERN_CHUNK_MAX 1 OMEGA_TERN_CHUNK_MAX
+end
+
+fn omega_tern_gemv_spec_ok sp view ulong 8 to long
+  if ne cg_tern_spec_ok sp 0
+    ret 1
+  end
+  ret 0
+end
+
+fn omega_tern_gemv_steps sp view ulong 8 to uint
+  if eq omega_tern_gemv_spec_ok sp 0
+    ret 0
+  end
+  ret uint div get sp 0 256
+end
+
+fn omega_tern_gemv_out_slot_bytes sp view ulong 8 to uint
+  ret uint mul mul mul 2 get sp 2 get sp 3 4
+end
+
+fn omega_tern_gemv_coalesced_out sp view ulong 8 to long
+  if eq omega_tern_gemv_spec_ok sp 0
+    ret 0
+  end
+  if ne omega_tern_gemv_chunks sp 1
+    ret 0
+  end
+  if gt mul mul 2 get sp 2 get sp 3 32
+    ret 0
+  end
+  tot = add mul get sp 0 2 mul 2 ulong omega_tern_gemv_out_slot_bytes sp
+  if le tot OMEGA_TERN_SHARED_MAX
+    ret 1
+  end
+  ret 0
+end
+
+fn omega_tern_gemv_shared_bytes sp view ulong 8 to uint
+  if eq omega_tern_gemv_spec_ok sp 0
+    ret 0
+  end
+  ch = ulong omega_tern_gemv_chunks sp
+  xb = mul div get sp 0 ch 2
+  if ne omega_tern_gemv_coalesced_out sp 0
+    ret uint add xb mul 2 ulong omega_tern_gemv_out_slot_bytes sp
+  end
+  ret uint xb
+end
+
+fn omega_tern_word_offset lay ulong r_blk ulong k ulong r ulong c ulong to ulong
+  kw = div k 16
+  if eq lay 0
+    ret mul add mul r kw c 4
+  end
+  two_r = mul 2 r_blk
+  blk = div r two_r
+  j = rem r two_r
+  t0 = mul mul mul blk two_r kw 4
+  t1 = mul mul c two_r 4
+  ret add add t0 t1 mul j 4
+end
+
+fn omega_blackwell_codegen_tern_gemv_prog sp view ulong 8 ins edit ulong 8192 meta edit ulong 512 to long
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  if ne cg_tern_emit sp ins meta 0
+    ret -1
+  end
+  if or ne get meta 5 0 eq get meta 0 0
+    ret -1
+  end
+  stats = new uint 2 0
+  if ne tern_om_solve ins meta stats 0
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_tern_gemv_prog_stats sp view ulong 8 out_stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  if ne cg_tern_emit sp ins meta 0
+    ret -1
+  end
+  if or ne get meta 5 0 eq get meta 0 0
+    ret -1
+  end
+  ret tern_om_solve ins meta out_stats
+end
