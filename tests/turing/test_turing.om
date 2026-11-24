@@ -1,0 +1,956 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/turing/test_turing.om -- Pure seeded OM-2 port of tests/turing/test_turing.c.
+note Runs all 85 checks across digests, rebuild stability, refusals, decision
+note verification, receipt tampering, history control arm, compare/online replay,
+note recorded K.6 FAIL reproduction, and Field v1 == control arm parity.
+note Composed after src/turing/field.om and src/turing/select.om.
+
+text t_tt_r1 "evidence/MIXED_ALGEBRA/ma3_bench_run1.json"
+text t_tt_r2 "evidence/MIXED_ALGEBRA/ma3_bench_run2.json"
+
+text t_tt_gold_con "75772afe8a98f73064f2933d76bc58f7bfe5b9353eb40b703e173b4cd3f22b5f"
+text t_tt_gold_crumb "d785f5ba7b7cae43f84f71e01fa279d7bff9fbdd0f9604e5b55f6b692b5e00f7"
+text t_tt_gold_plain "272d7bdfd34514286b303857c98beb3c10b0ffada5e1d38dfb9fa94eaef17f99"
+
+text t_tt_omg0 "OMG0"
+text t_tt_proposed "PROPOSED"
+text t_tt_notrec "not recorded"
+text t_tt_bad_json "{\n  \"schema\": \"SOMETHING_ELSE\",\n  \"run_id\": \"x\"\n}\n"
+text t_tt_nonex "/nonexistent/receipt.json"
+text t_tt_tmp_bad "/tmp/turing_om_refuse_bad.json"
+text t_tt_tmp_maxn "/tmp/turing_om_refuse_maxn.json"
+text t_tt_tmp_r1 "/tmp/turing_om_tamper_run1.json"
+text t_tt_tmp_r2 "/tmp/turing_om_tamper_run2.json"
+text t_tt_find_r3 "\"id\": \"R3_sparse\""
+text t_tt_find_mx "\"max_n\": 65536"
+text t_tt_r1_pre "R1_"
+
+text t_tt_l0 "RETIRED v0 S1-S4 x2 in-sample"
+text t_tt_l1 "S1-S4 x2 pack leave-one-out"
+text t_tt_l2 "72 cells in-sample"
+text t_tt_l3 "72 cells leave-one-out"
+text t_tt_lon "72 cells cold online x10"
+
+text t_tt_p1 "  regret "
+text t_tt_p2 " Field mean "
+text t_tt_p3 "% max "
+text t_tt_p4 "% | control mean "
+text t_tt_p5 "% max "
+text t_tt_p6 "% | same pick "
+text t_tt_fail_pre "FAIL check #"
+text t_tt_sum1 "test-turing: "
+text t_tt_sum2 " passed, "
+text t_tt_sum3 " failed\n"
+
+global g_tt_pass ulong 1
+global g_tt_fail ulong 1
+global g_tt_chk_id ulong 1
+global g_tt_d1 uchar 32
+global g_tt_d2 uchar 32
+global g_tt_d3 uchar 32
+global g_tt_buf1 uchar 8192
+global g_tt_buf2 uchar 8192
+global g_tt_seen ulong 32
+global g_tt_ord1 long 10
+global g_tt_ord2 long 10
+global g_tt_copy uchar 524288
+global g_tt_clen ulong 1
+
+fn tt_chk cond bool to void
+  id = add get g_tt_chk_id 0 1
+  put g_tt_chk_id 0 id
+  if cond
+    put g_tt_pass 0 add get g_tt_pass 0 1
+  else
+    put g_tt_fail 0 add get g_tt_fail 0 1
+    tf_out_txt t_tt_fail_pre
+    tf_out_u64 id
+    tf_out_b uchar 10
+    tf_out_flush
+  end
+end
+
+fn tt_dig_eq_d1d2 to bool
+  for i ulong 32
+    if ne get g_tt_d1 i get g_tt_d2 i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tt_hex_eq_gold s view uchar * to bool
+  tf_dig_to_hex_tmp
+  for i ulong 64
+    if ne get g_tf_tmp_hex i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tt_out_txt_pad s view uchar * w ulong to void
+  n = len s
+  tf_out_txt s
+  if lt n w
+    tf_out_sp sub w n
+  end
+end
+
+fn tt_ev96_get arr_id ulong off ulong pos ulong to uchar
+  if eq arr_id 0
+    ret get g_ev_tsrc add off pos
+  end
+  if eq arr_id 1
+    ret get g_ev_cpuf add off pos
+  end
+  ret get g_ev_qflag add off pos
+end
+
+fn tt_cstr_contains_96 arr_id ulong idx ulong pat view uchar * to bool
+  off = mul idx TF_TEXT
+  pn = len pat
+  sl = ulong 0
+  for i ulong TF_TEXT
+    if eq tt_ev96_get arr_id off i uchar 0
+      break
+    end
+    sl = add sl 1
+  end
+  if lt sl pn
+    ret false
+  end
+  lim = sub sl pn
+  p = ulong 0
+  while le p lim bound 96
+    ok = true
+    for i ulong pn bound 32
+      if ne tt_ev96_get arr_id off add p i get pat i
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret true
+    end
+    p = add p 1
+  end
+  ret false
+end
+
+fn tt_write_file path view uchar * data view uchar * n ulong to long
+  tf_set_path_txt path
+  fd = fopen g_tf_path 0 get g_tf_plen 0 int 577 int 420
+  if lt fd 0
+    ret -1
+  end
+  w = write int fd data 0 n
+  dc = fclose int fd
+  if or ne w long n ne dc 0
+    ret -1
+  end
+  ret 0
+end
+
+fn tt_copy_to_tmp src view uchar * dst view uchar * to long
+  tf_set_path_txt src
+  if ne tf_read_file_gp 0
+    ret -1
+  end
+  fl = get g_tf_flen 0
+  for i ulong fl bound 524288
+    put g_tt_copy i get g_tf_file i
+  end
+  put g_tt_clen 0 fl
+  tf_set_path_txt dst
+  fd = fopen g_tf_path 0 get g_tf_plen 0 int 577 int 420
+  if lt fd 0
+    ret -1
+  end
+  w = write int fd g_tt_copy 0 fl
+  dc = fclose int fd
+  if or ne w long fl ne dc 0
+    ret -1
+  end
+  ret 0
+end
+
+fn tt_flip_byte path view uchar * off ulong to long
+  tf_set_path_txt path
+  if ne tf_read_file_gp 0
+    ret -1
+  end
+  fl = get g_tf_flen 0
+  if ge off fl
+    ret -1
+  end
+  c = get g_tf_file off
+  if eq c uchar 49
+    put g_tf_file off uchar 50
+  else
+    put g_tf_file off uchar 49
+  end
+  fd = fopen g_tf_path 0 get g_tf_plen 0 int 577 int 420
+  if lt fd 0
+    ret -1
+  end
+  w = write int fd g_tf_file 0 fl
+  dc = fclose int fd
+  if or ne w long fl ne dc 0
+    ret -1
+  end
+  ret 0
+end
+
+fn tt_unlink path view uchar * to void
+  tf_set_path_txt path
+  ign = unlink g_tf_path 0 get g_tf_plen 0
+end
+
+fn tt_load2 sid ulong p1 view uchar * p2 view uchar * to bool
+  if ne tf_store_init sid 0
+    ret false
+  end
+  if lt tf_ingest_registry sid 0
+    ret false
+  end
+  if le tf_ingest_receipt_txt sid p1 0
+    ret false
+  end
+  if le tf_ingest_receipt_txt sid p2 0
+    ret false
+  end
+  ret true
+end
+
+note ---- Test 1: test_digests (14 checks) ----
+
+fn tt_sp_id_eq ao ulong bo ulong to bool
+  for j ulong 32
+    if ne get g_sp_id add ao j get g_sp_id add bo j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn test_digests_specs to void
+  ns = get g_st_nspec 0
+  same = ulong 0
+  for k ulong ns bound 32
+    if tf_sp_cdig_eq_st mul k 32 0
+      same = add same 1
+    end
+  end
+  tt_chk and eq same 10 eq ns 10
+  distinct = true
+  for a ulong ns bound 32
+    b = add a 1
+    while lt b ns bound 32
+      if tt_sp_id_eq mul a 32 mul b 32
+        distinct = false
+      end
+      b = add b 1
+    end
+  end
+  tt_chk distinct
+end
+
+fn test_digests_bytes crumb ulong to void
+  coff = mul crumb 32
+  rcb = tf_spec_bytes crumb
+  blen = get g_tf_clen 0
+  tt_chk and eq rcb 0 gt blen 6
+  for i ulong blen bound 8192
+    put g_tt_buf1 i get g_tf_cbuf i
+  end
+  omg_ok = true
+  for i ulong 4
+    if ne get g_tt_buf1 i get t_tt_omg0 i
+      omg_ok = false
+    end
+  end
+  tt_chk omg_ok
+  tf_sh_init
+  for i ulong blen bound 8192
+    tf_sh_byte get g_tt_buf1 i
+  end
+  tf_sh_final
+  for i ulong 32
+    put g_tt_d1 i get g_tf_sh_out i
+    put g_tt_d2 i get g_sp_id add coff i
+  end
+  tt_chk not tt_dig_eq_d1d2
+  rcb2 = tf_spec_bytes crumb
+  blen2 = get g_tf_clen 0
+  beq = and eq rcb2 0 eq blen blen2
+  if beq
+    for i ulong blen bound 8192
+      if ne get g_tt_buf1 i get g_tf_cbuf i
+        beq = false
+        break
+      end
+    end
+  end
+  tt_chk beq
+end
+
+fn test_digests to void
+  tf_contract_omega_x 0
+  tf_contract_omega_x 1
+  rc1 = tf_contract_digest 0
+  for i ulong 32
+    put g_tt_d1 i get g_tf_sh_out i
+  end
+  rc2 = tf_contract_digest 1
+  for i ulong 32
+    put g_tt_d2 i get g_tf_sh_out i
+  end
+  tt_chk and eq rc1 0 eq rc2 0
+  tt_chk tt_dig_eq_d1d2
+  for i ulong 32
+    put g_tf_tmp_dig i get g_tt_d1 i
+  end
+  tt_chk tt_hex_eq_gold t_tt_gold_con
+  put g_st_c_maxn 1 sub get g_st_c_maxn 1 1
+  rc3 = tf_contract_digest 1
+  for i ulong 32
+    put g_tt_d2 i get g_tf_sh_out i
+  end
+  tt_chk and eq rc3 0 not tt_dig_eq_d1d2
+
+  ok_init = eq tf_store_init 0 0
+  tt_chk and ok_init eq tf_ingest_registry 0 10
+  crumb = tf_find_spec_txt 0 t_tf_rz6
+  plain = tf_find_spec_txt 0 t_tf_rz0
+  tt_chk and ge crumb 0 ge plain 0
+  coff = mul ulong crumb 32
+  for i ulong 32
+    put g_tf_tmp_dig i get g_sp_id add coff i
+  end
+  tt_chk tt_hex_eq_gold t_tt_gold_crumb
+  poff = mul ulong plain 32
+  for i ulong 32
+    put g_tf_tmp_dig i get g_sp_id add poff i
+  end
+  tt_chk tt_hex_eq_gold t_tt_gold_plain
+  test_digests_specs
+  test_digests_bytes ulong crumb
+end
+
+note ---- Test 2: test_rebuild_stable (9 checks) ----
+
+fn tt_ev_dig_eq_sh doff ulong to bool
+  for j ulong 32
+    if ne get g_tf_sh_out j get g_ev_id add doff j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn test_rebuild_ev_digs to void
+  e0 = mul 1 TF_MAX_EV
+  ne1 = get g_st_nev 1
+  ok = ulong 0
+  for i ulong ne1 bound 1024
+    idx = add e0 i
+    if eq tf_evidence_digest idx 0
+      if tt_ev_dig_eq_sh mul idx 32
+        ok = add ok 1
+      end
+    end
+  end
+  tt_chk eq ok ne1
+end
+
+fn test_rebuild_meta to void
+  e0 = mul 1 TF_MAX_EV
+  bdl = ulong 0
+  bo = mul e0 72
+  for i ulong 72
+    if eq get g_ev_bdig add bo i uchar 0
+      break
+    end
+    bdl = add bdl 1
+  end
+  gcl = ulong 0
+  go = mul e0 48
+  for i ulong 48
+    if eq get g_ev_gcom add go i uchar 0
+      break
+    end
+    gcl = add gcl 1
+  end
+  tco = mul e0 TF_TEXT
+  tt_chk and eq bdl 64 and eq gcl 40 ne get g_ev_tc tco uchar 0
+  t_e2 = tf_ev_tier_eq e0 t_tf_e2
+  t_pr = tt_cstr_contains_96 0 e0 t_tt_proposed
+  tt_chk and t_e2 t_pr
+  c_nr = tt_cstr_contains_96 1 e0 t_tt_notrec
+  q_nr = tt_cstr_contains_96 2 e0 t_tt_notrec
+  tt_chk and c_nr q_nr
+  test_rebuild_ev_digs
+end
+
+fn test_rebuild_stable to void
+  r0 = tf_store_init 0
+  r1 = tf_store_init 1
+  tt_chk and eq r0 0 eq r1 0
+  tt_chk eq tf_ingest_registry 0 10
+  tt_chk eq tf_ingest_receipt_txt 1 t_tt_r1 360
+  tt_chk eq get g_st_nspec 1 10
+  match = ulong 0
+  ns0 = get g_st_nspec 0
+  sbase1 = mul 1 TF_MAX_SPECS
+  for k ulong ns0 bound 32
+    ko = mul k 32
+    for j ulong 32
+      put g_tf_tmp_id j get g_sp_rz add ko j
+    end
+    jidx = tf_find_spec_tmp 1
+    if ge jidx 0
+      jo = mul add sbase1 ulong jidx 32
+      if tt_sp_id_eq ko jo
+        match = add match 1
+      end
+    end
+  end
+  tt_chk eq match 10
+  test_rebuild_meta
+end
+
+note ---- Test 3: test_refusals (8 checks) ----
+
+fn test_refusals to void
+  tt_chk eq tt_write_file t_tt_tmp_bad t_tt_bad_json len t_tt_bad_json 0
+  ok0 = eq tf_store_init 0 0
+  tt_chk and ok0 eq tf_ingest_registry 0 10
+  tt_chk and lt tf_ingest_receipt_txt 0 t_tt_tmp_bad 0 eq get g_st_nev 0 0
+  tt_chk lt tf_ingest_receipt_txt 0 t_tt_nonex 0
+  tt_chk eq tt_copy_to_tmp t_tt_r1 t_tt_tmp_maxn 0
+  tf_set_path_txt t_tt_tmp_maxn
+  ign = tf_read_file_gp
+  fl = get g_tf_flen 0
+  off = long -1
+  pos = ulong 0
+  while lt pos fl bound 50000
+    ls = pos
+    while lt pos fl bound 4096
+      if eq get g_tf_file pos uchar 10
+        break
+      end
+      pos = add pos 1
+    end
+    le_pos = pos
+    if lt pos fl
+      pos = add pos 1
+    end
+    if tf_line_contains ls le_pos t_tt_find_r3
+      mp = tf_jfind ls le_pos t_tf_k_max_n
+      if ge mp 0
+        off = mp
+        break
+      end
+    end
+  end
+  tt_chk and gt off 0 eq tt_flip_byte t_tt_tmp_maxn ulong off 0
+  tt_chk lt tf_ingest_receipt_txt 0 t_tt_tmp_maxn 0
+  tt_chk eq get g_st_nev 0 0
+  tt_unlink t_tt_tmp_bad
+  tt_unlink t_tt_tmp_maxn
+end
+
+note ---- Test 4: test_decisions_verify (17 checks) ----
+
+fn test_decisions_extra to void
+  tf_set_q 4096 64 300 TF_PACK_ONCE 0
+  r_a = tf_field_select 0 0 0
+  ch_a = get g_dc_chosen 0
+  a_pre = false
+  if and eq r_a 0 ge ch_a 0
+    ao = mul ulong ch_a 32
+    a_pre = and eq get g_dc_crz ao uchar 82 and eq get g_dc_crz add ao 1 uchar 49 eq get g_dc_crz add ao 2 uchar 95
+  end
+  tt_chk a_pre
+
+  tf_set_q 16384 4096 300 TF_PACK_ONCE 0
+  r_b = tf_field_select 0 1 0
+  ch_b = get g_dc_chosen 1
+  b_cr = false
+  if and eq r_b 0 ge ch_b 0
+    b_cr = tf_dc_crz_eq 1 ulong ch_b t_tf_rz6
+  end
+  tt_chk b_cr
+
+  ri1 = tf_decision_digest 1
+  for j ulong 32
+    put g_tt_d1 j get g_tf_sh_out j
+  end
+  ri2 = tf_decision_digest 1
+  for j ulong 32
+    put g_tt_d2 j get g_tf_sh_out j
+  end
+  tt_chk and eq ri1 0 and eq ri2 0 tt_dig_eq_d1d2
+
+  for j ulong 32
+    put g_tf_tmp_dig j get g_tt_d1 j
+  end
+  tf_set_q 16384 4096 300 TF_PACK_ONCE 0
+  r_b2 = tf_field_select 0 2 1
+  ri3 = tf_decision_digest 2
+  for j ulong 32
+    put g_tt_d2 j get g_tf_sh_out j
+  end
+  ok_sup = and eq r_b2 0 ne get g_dc_hsup 2 0
+  if ok_sup
+    ok_sup = and eq ri3 0 not tt_dig_eq_d1d2
+  end
+  tt_chk ok_sup
+end
+
+fn test_decisions_tail to void
+  tf_set_q 100000 64 300 TF_PACK_ONCE 0
+  r_o = tf_field_select 0 2 0
+  tt_chk and eq r_o 0 eq get g_dc_exc 2 0
+  r3 = tf_find_spec_txt 0 t_tf_rz7
+  r4 = tf_find_spec_txt 0 t_tf_rz8
+  rb2 = mul 2 TF_MAX_CAND
+  tt_chk and eq get g_dc_reas add rb2 ulong r3 TF_R_MAX_N eq get g_dc_reas add rb2 ulong r4 TF_R_MAX_N
+  tt_chk and eq get g_dc_cn 2 16384 eq get g_dc_cm 2 64
+
+  tf_set_q 4096 64 300 TF_PACK_PER_CALL 0
+  rt0 = tf_field_select_v0_retired 0 2 -1 0
+  tt_chk and eq rt0 0 tf_dc_verd_eq 2 t_tf_v_tie
+  other = long -1
+  nc2 = get g_dc_ncand 2
+  for k ulong nc2 bound 16
+    if eq get g_dc_reas add rb2 k TF_R_TIED
+      other = long k
+    end
+  end
+  if ge other 0
+    tf_set_q 4096 64 300 TF_PACK_PER_CALL 0
+    rt1 = tf_field_select_v0_retired 0 3 other 0
+    tt_chk and eq rt1 0 and eq get g_dc_chosen 3 other tf_dc_tres_eq 3 t_tf_tr_inc
+  end
+
+  c1base = mul 1 mul TF_MAX_CITE 32
+  for j ulong 32
+    put g_tf_tmp_dig j get g_dc_cite add c1base j
+  end
+  ke = tf_find_evidence_tmp 0
+  if ge ke 0
+    keep = get g_ev_med ulong ke
+    put g_ev_med ulong ke add keep 1
+    tt_chk eq tf_decision_verify 0 1 -5
+    put g_ev_med ulong ke keep
+    tt_chk eq tf_decision_verify 0 1 0
+  end
+end
+
+fn test_decisions_cites_match cn ulong cm ulong to bool
+  nci = get g_dc_ncite 0
+  for c ulong nci bound 128
+    co = mul c 32
+    for j ulong 32
+      put g_tf_tmp_dig j get g_dc_cite add co j
+    end
+    k = tf_find_evidence_tmp 0
+    if lt k 0
+      ret false
+    end
+    if or ne get g_ev_n ulong k cn ne get g_ev_m ulong k cm
+      ret false
+    end
+  end
+  ret true
+end
+
+fn test_decisions_verify to void
+  ok_l = tt_load2 0 t_tt_r1 t_tt_r2
+  tt_chk ok_l
+  if not ok_l
+    ret
+  end
+  tt_chk and eq get g_st_nev 0 720 eq get g_st_nrec 0 2
+  nc = tf_cells 0 80
+  tt_chk eq nc 36
+  ok = ulong 0
+  tot = ulong 0
+  exc = ulong 0
+  ccell = ulong 0
+  for pk ulong 2
+    for i ulong nc bound 80
+      tf_set_q get g_c_n i get g_c_m i get g_c_sp i pk 0
+      if ne tf_field_select 0 0 0 0
+        continue
+      end
+      tot = add tot 1
+      if eq tf_decision_verify 0 0 0
+        if eq get g_dc_ncite 0 80
+          ok = add ok 1
+        end
+      end
+      exc = add exc get g_dc_exc 0
+      if test_decisions_cites_match get g_c_n i get g_c_m i
+        ccell = add ccell 1
+      end
+    end
+  end
+  tt_chk and eq tot 72 eq ok 72
+  tt_chk and eq exc 72 eq ccell 72
+  test_decisions_extra
+  test_decisions_tail
+end
+
+note ---- Test 5: test_receipt_tamper (8 checks) ----
+
+fn test_receipt_tamper to void
+  c1 = tt_copy_to_tmp t_tt_r1 t_tt_tmp_r1
+  c2 = tt_copy_to_tmp t_tt_r2 t_tt_tmp_r2
+  tt_chk and eq c1 0 eq c2 0
+  ok_l = tt_load2 0 t_tt_tmp_r1 t_tt_tmp_r2
+  tt_chk ok_l
+  if not ok_l
+    tt_unlink t_tt_tmp_r1
+    tt_unlink t_tt_tmp_r2
+    ret
+  end
+  tf_set_q 16384 4096 300 TF_PACK_ONCE 0
+  tt_chk and eq tf_field_select 0 0 0 0 eq tf_decision_verify 0 0 0
+  tt_chk eq tt_flip_byte t_tt_tmp_r1 5000 0
+  tt_chk eq tf_decision_verify 0 0 -8
+  tf_set_q 16384 4096 300 TF_PACK_ONCE 0
+  r_d2 = tf_field_select 0 1 0
+  ok2 = and eq r_d2 0 eq get g_dc_ncite 1 40
+  if ok2
+    ok2 = eq tf_decision_verify 0 1 0
+  end
+  tt_chk ok2
+  tt_chk eq tt_flip_byte t_tt_tmp_r2 5000 0
+  tf_set_q 16384 4096 300 TF_PACK_ONCE 0
+  r_d3 = tf_field_select 0 2 0
+  cr = tf_find_spec_txt 0 t_tf_rz6
+  rb2 = mul 2 TF_MAX_CAND
+  ok3 = and eq r_d3 1 lt get g_dc_chosen 2 0
+  if ok3
+    ok3 = eq get g_dc_reas add rb2 ulong cr TF_R_RECEIPT_UNVERIFIED
+  end
+  tt_chk ok3
+  tt_unlink t_tt_tmp_r1
+  tt_unlink t_tt_tmp_r2
+end
+
+note ---- Test 6: test_history (4 checks) ----
+
+fn test_history to void
+  if not tt_load2 0 t_tt_r1 t_tt_r2
+    ret
+  end
+  tf_history_init 0 42
+  tf_history_init 1 43
+  for k ulong 32
+    put g_tt_seen k 0
+  end
+  explore = true
+  for t ulong 10
+    tf_set_q 4096 64 300 TF_PACK_ONCE 0
+    k = tf_history_select 0 0 0
+    if or lt k 0 not tf_dc_verd_eq 0 t_tf_v_explore
+      explore = false
+    end
+    if ge k 0
+      put g_tt_seen ulong k add get g_tt_seen ulong k 1
+      put g_tt_ord1 t k
+      ign = tf_history_observe 0 0 ulong k add 1000 mul 10 ulong k
+    end
+    k2 = tf_history_select 1 0 0
+    put g_tt_ord2 t k2
+    if ge k2 0
+      ign = tf_history_observe 1 0 ulong k2 5
+    end
+  end
+  once = true
+  for k ulong 10
+    if ne get g_tt_seen k 1
+      once = false
+    end
+  end
+  tt_chk and explore once
+  diff = false
+  for t ulong 10
+    if ne get g_tt_ord1 t get g_tt_ord2 t
+      diff = true
+    end
+  end
+  tt_chk diff
+  tf_set_q 4096 64 300 TF_PACK_ONCE 0
+  k = tf_history_select 0 0 0
+  tt_chk and eq k 0 tf_dc_verd_eq 0 t_tf_v_chosen
+  tt_chk eq tf_decision_verify 0 0 -3
+end
+
+note ---- Test 7: test_compare (15 checks) ----
+
+fn tt_setup_queries to ulong
+  nn = ulong 0
+  for pk ulong 2
+    put g_q_n nn 4096
+    put g_q_m nn 64
+    put g_q_sp nn 300
+    put g_q_pack nn pk
+    nn = add nn 1
+    put g_q_n nn 16384
+    put g_q_m nn 64
+    put g_q_sp nn 300
+    put g_q_pack nn pk
+    nn = add nn 1
+    put g_q_n nn 4096
+    put g_q_m nn 4096
+    put g_q_sp nn 300
+    put g_q_pack nn pk
+    nn = add nn 1
+    put g_q_n nn 16384
+    put g_q_m nn 4096
+    put g_q_sp nn 300
+    put g_q_pack nn pk
+    nn = add nn 1
+  end
+  nc = tf_cells 0 80
+  na = ulong 0
+  for pk ulong 2
+    for i ulong nc bound 80
+      qi = add 8 na
+      put g_q_n qi get g_c_n i
+      put g_q_m qi get g_c_m i
+      put g_q_sp qi get g_c_sp i
+      put g_q_pack qi pk
+      na = add na 1
+    end
+  end
+  ret na
+end
+
+fn tt_print_regret_row i ulong to void
+  tf_out_txt t_tt_p1
+  if eq i 0
+    tt_out_txt_pad t_tt_l0 28
+  end
+  if eq i 1
+    tt_out_txt_pad t_tt_l1 28
+  end
+  if eq i 2
+    tt_out_txt_pad t_tt_l2 28
+  end
+  if eq i 3
+    tt_out_txt_pad t_tt_l3 28
+  end
+  tf_out_txt t_tt_p2
+  tf_out_f64_fix mul 100.0 get g_reg_fmean 0 2 6
+  tf_out_txt t_tt_p3
+  tf_out_f64_fix mul 100.0 get g_reg_fmax 0 2 6
+  tf_out_txt t_tt_p4
+  tf_out_f64_fix mul 100.0 get g_reg_hmean 0 2 6
+  tf_out_txt t_tt_p5
+  tf_out_f64_fix mul 100.0 get g_reg_hmax 0 2 6
+  tf_out_txt t_tt_p6
+  tf_out_u64 get g_reg_agree 0
+  tf_out_b uchar 47
+  tf_out_u64 get g_reg_dec 0
+  tf_out_b uchar 10
+end
+
+fn test_compare_one i ulong na ulong seed ulong to void
+  qoff = ulong 0
+  nq = ulong 8
+  exp = ulong 8
+  if ge i 2
+    qoff = 8
+    nq = na
+    exp = 72
+  end
+  rc = tf_compare 0 TF_RULE_V0_RETIRED qoff nq and i 1 seed
+  tt_chk and eq rc 0 eq get g_reg_dec 0 exp
+  tt_chk and eq get g_reg_fcok 0 get g_reg_dec 0 eq get g_reg_hcok 0 0
+  tt_chk and ge get g_reg_fmean 0 0.0 ge get g_reg_hmean 0 0.0
+  tt_print_regret_row i
+end
+
+fn test_compare to void
+  if not tt_load2 0 t_tt_r1 t_tt_r2
+    ret
+  end
+  na = tt_setup_queries
+  seed = ulong 0x7475726967303031
+  for i ulong 4
+    test_compare_one i na seed
+  end
+  rcp = tf_compare 0 TF_RULE_V0_RETIRED 0 4 0 seed
+  ok_p = and eq rcp 0 eq get g_reg_fmax 0 0.0
+  if ok_p
+    ok_p = eq get g_reg_hmax 0 0.0
+  end
+  tt_chk ok_p
+  rcon = tf_compare_online 0 TF_RULE_V0_RETIRED 8 na 10 seed
+  tt_chk and eq rcon 0 eq get g_reg_dec 0 720
+  hm1 = get g_reg_hmean 0
+  tf_out_txt t_tt_p1
+  tt_out_txt_pad t_tt_lon 28
+  tf_out_txt t_tt_p2
+  tf_out_f64_fix mul 100.0 get g_reg_fmean 0 2 6
+  tf_out_txt t_tt_p3
+  tf_out_f64_fix mul 100.0 get g_reg_fmax 0 2 6
+  tf_out_txt t_tt_p4
+  tf_out_f64_fix mul 100.0 hm1 2 6
+  tf_out_txt t_tt_p5
+  tf_out_f64_fix mul 100.0 get g_reg_hmax 0 2 6
+  tf_out_b uchar 37
+  tf_out_b uchar 10
+  rcon2 = tf_compare_online 0 TF_RULE_V0_RETIRED 8 na 10 seed
+  tt_chk and eq rcon2 0 eq get g_reg_hmean 0 hm1
+end
+
+note ---- Test 8: test_recorded_fail (3 checks) ----
+
+fn tt_reg_q1 to bool
+  if gt get g_reg_fmean 0 add get g_reg_hmean 0 0.02
+    ret false
+  end
+  ret le get g_reg_fmax 0 0.10
+end
+
+fn test_recorded_fail to void
+  if not tt_load2 0 t_tt_r1 t_tt_r2
+    ret
+  end
+  ign = tt_setup_queries
+  seed = ulong 0x7475726967303031
+  rc1 = tf_compare 0 TF_RULE_V0_RETIRED 0 8 0 seed
+  r_ok = and eq tf_llround mul get g_reg_fmean 0 1.0e4 358 eq tf_llround mul get g_reg_fmax 0 1.0e4 2551
+  if r_ok
+    r_ok = and eq tf_llround mul get g_reg_hmean 0 1.0e4 1 eq tf_llround mul get g_reg_hmax 0 1.0e4 7
+  end
+  q1 = tt_reg_q1
+  q2a = eq get g_reg_fcok 0 get g_reg_dec 0
+  rc2 = tf_compare 0 TF_RULE_V0_RETIRED 0 8 1 seed
+  q1l = tt_reg_q1
+  q2 = and q2a eq get g_reg_fcok 0 get g_reg_dec 0
+  tt_chk and eq rc1 0 eq rc2 0
+  tt_chk r_ok
+  tt_chk and not q1 and not q1l q2
+end
+
+note ---- Test 9: test_v1_matches_control (7 checks) ----
+
+fn test_v1_tail to void
+  na = tt_setup_queries
+  seed = ulong 0x7475726967303031
+  for loo ulong 2
+    rc = tf_compare 0 TF_RULE_V1 8 na loo seed
+    ok_r = and eq rc 0 eq get g_reg_agree 0 get g_reg_dec 0
+    if ok_r
+      ok_r = and eq get g_reg_fmean 0 get g_reg_hmean 0 eq get g_reg_fmax 0 get g_reg_hmax 0
+    end
+    if ok_r
+      ok_r = eq get g_reg_fcok 0 get g_reg_dec 0
+    end
+    tt_chk ok_r
+  end
+  tf_set_q 16384 4096 300 TF_PACK_ONCE 0
+  if eq tf_field_select 0 0 0 0
+    if eq tf_decision_digest 0 0
+      for j ulong 32
+        put g_tt_d1 j get g_tf_sh_out j
+      end
+      put g_dc_ncite 0 sub get g_dc_ncite 0 1
+      rb = tf_decision_digest 0
+      for j ulong 32
+        put g_tt_d2 j get g_tf_sh_out j
+      end
+      tt_chk and eq rb 0 not tt_dig_eq_d1d2
+    end
+  end
+end
+
+global g_tt_v1_tot ulong 1
+global g_tt_v1_same ulong 1
+global g_tt_v1_ver ulong 1
+global g_tt_v1_sel ulong 1
+
+fn test_v1_one_cell loo ulong pk ulong i ulong seed ulong to void
+  tf_set_q get g_c_n i get g_c_m i get g_c_sp i pk loo
+  tf_history_init 0 seed
+  if ne tf_history_load 0 0 loo 0
+    ret
+  end
+  hk = tf_history_select 0 0 1
+  if ne tf_field_select 0 0 0 0
+    ret
+  end
+  put g_tt_v1_tot 0 add get g_tt_v1_tot 0 1
+  ch = get g_dc_chosen 0
+  if ge hk 0
+    if eq ch hk
+      if tf_sp_eq_dc_cand mul ulong hk 32 mul ulong ch 32
+        put g_tt_v1_same 0 add get g_tt_v1_same 0 1
+      end
+    end
+  end
+  if eq tf_decision_verify 0 0 0
+    put g_tt_v1_ver 0 add get g_tt_v1_ver 0 1
+  end
+  if tf_dc_sel_eq 0 t_tf_sel_v1
+    put g_tt_v1_sel 0 add get g_tt_v1_sel 0 1
+  end
+end
+
+fn test_v1_matches_control to void
+  if not tt_load2 0 t_tt_r1 t_tt_r2
+    ret
+  end
+  nc = tf_cells 0 80
+  seed = ulong 0x7475726967303031
+  put g_tt_v1_tot 0 0
+  put g_tt_v1_same 0 0
+  put g_tt_v1_ver 0 0
+  put g_tt_v1_sel 0 0
+  for loo ulong 2
+    for pk ulong 2
+      for i ulong nc bound 80
+        test_v1_one_cell loo pk i seed
+      end
+    end
+  end
+  tot = get g_tt_v1_tot 0
+  tt_chk eq tot 144
+  tt_chk eq get g_tt_v1_same 0 tot
+  tt_chk eq get g_tt_v1_ver 0 tot
+  tt_chk eq get g_tt_v1_sel 0 tot
+  test_v1_tail
+end
+
+fn main to int
+  test_digests
+  test_rebuild_stable
+  test_refusals
+  test_decisions_verify
+  test_receipt_tamper
+  test_history
+  test_compare
+  test_recorded_fail
+  test_v1_matches_control
+  tf_out_txt t_tt_sum1
+  tf_out_u64 get g_tt_pass 0
+  tf_out_txt t_tt_sum2
+  tf_out_u64 get g_tt_fail 0
+  tf_out_txt t_tt_sum3
+  tf_out_flush
+  if gt get g_tt_fail 0 0
+    ret 1
+  end
+  ret 0
+end

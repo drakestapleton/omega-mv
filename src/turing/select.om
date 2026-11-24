@@ -1,0 +1,1579 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/turing/select.om -- Pure seeded OM-2 implementation of TURING ranking
+note core, StarPU-style history control arm, Field selector v1, RETIRED Field
+note selector v0, and post-hoc replay/regret comparison.
+note Composed after src/turing/field.om.
+
+const TF_HIST_BUCKETS ulong 64
+const TF_HISTS ulong 2
+const TF_TOT_BUCKETS ulong 129
+const TF_SCRATCH_BKT ulong 128
+
+const TF_RULE_V1 ulong 0
+const TF_RULE_V0_RETIRED ulong 1
+
+text t_tf_sel_v1 "turing.field.v1"
+text t_tf_sel_v0 "turing.field.v0"
+text t_tf_sel_hist "turing.history.v0"
+text t_tf_cons_v1 "exact contract; tier in {E2,E3,E4}; receipts verify; rank = min mean cost per (n,m,pack)"
+text t_tf_cons_v0 "exact contract; tier in {E2,E3,E4}; receipts verify"
+text t_tf_cons_h "can_execute (n <= max_n)"
+
+text t_tf_v_chosen "CHOSEN"
+text t_tf_v_tie "TIE"
+text t_tf_v_none "NONE"
+text t_tf_v_explore "EXPLORE"
+
+text t_tf_tr_none "none"
+text t_tf_tr_inc "incumbent"
+text t_tf_tr_ref "reference"
+text t_tf_tr_cheap "cheapest"
+
+note ---- Active query register (keeps all selector/replay fns <= 6 params) ----
+global g_cur_qn ulong 1
+global g_cur_qm ulong 1
+global g_cur_qsp ulong 1
+global g_cur_qpk ulong 1
+global g_cur_qexc ulong 1
+
+note ---- Bucket & History globals ----
+global g_bk_n ulong 129
+global g_bk_m ulong 129
+global g_bk_pack ulong 129
+global g_bk_cur ulong 129
+global g_bk_cnt ulong 4128
+global g_bk_mean f64 4128
+global g_bk_ord ulong 4128
+
+global g_hi_seed ulong 2
+global g_hi_nbkt ulong 2
+
+note Scratch for selectors
+global g_sel_rec_ok ulong 8
+global g_sel_elig ulong 16
+global g_sel_usable uchar 1024
+global g_sel_rspec long 1024
+global g_sel_unrec ulong 16
+global g_sel_rows ulong 16
+global g_sel_bad long 16
+global g_sel_ranked ulong 16
+global g_sel_cost f64 16
+global g_sel_spread f64 16
+global g_sel_meas ulong 16
+global g_sel_tied ulong 16
+global g_sel_can ulong 16
+
+note Query arrays and regret output
+global g_q_n ulong 256
+global g_q_m ulong 256
+global g_q_sp ulong 256
+global g_q_pack ulong 256
+global g_q_exc ulong 256
+
+global g_c_n ulong 80
+global g_c_m ulong 80
+global g_c_sp ulong 80
+
+global g_reg_dec ulong 1
+global g_reg_fmean f64 1
+global g_reg_fmax f64 1
+global g_reg_hmean f64 1
+global g_reg_hmax f64 1
+global g_reg_fcok ulong 1
+global g_reg_hcok ulong 1
+global g_reg_agree ulong 1
+
+global g_on_ord ulong 256
+global g_on_seen ulong 8192
+global g_on_rows ulong 8
+global g_ora_best f64 1
+global g_sm_state ulong 1
+
+fn tf_set_q n ulong m ulong sp ulong pk ulong exc ulong to void
+  put g_cur_qn 0 n
+  put g_cur_qm 0 m
+  put g_cur_qsp 0 sp
+  put g_cur_qpk 0 pk
+  put g_cur_qexc 0 exc
+end
+
+note ---- SplitMix64 ----
+
+fn tf_splitmix64 to ulong
+  z = add get g_sm_state 0 ulong 0x9e3779b97f4a7c15
+  put g_sm_state 0 z
+  z = mul xor z shr z 30 ulong 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 ulong 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+note ---- Ranking core ----
+
+fn tf_bucket_reset bid ulong n ulong m ulong pack ulong to void
+  put g_bk_n bid n
+  put g_bk_m bid m
+  put g_bk_pack bid pack
+  put g_bk_cur bid 0
+  base = mul bid TF_MAX_SPECS
+  for k ulong TF_MAX_SPECS
+    put g_bk_cnt add base k 0
+    put g_bk_mean add base k 0.0
+    put g_bk_ord add base k k
+  end
+end
+
+fn tf_bucket_observe bid ulong k ulong cost_ps ulong to void
+  idx = add mul bid TF_MAX_SPECS k
+  c = add get g_bk_cnt idx 1
+  put g_bk_cnt idx c
+  m = get g_bk_mean idx
+  m = add m div sub f64 cost_ps m f64 c
+  put g_bk_mean idx m
+end
+
+fn tf_rank_min_cost_ranked bid ulong nspec ulong use_can ulong to long
+  base = mul bid TF_MAX_SPECS
+  best = long -1
+  best_m = f64 0.0
+  for k ulong nspec bound 32
+    alw = ulong 0
+    if eq use_can 0
+      alw = get g_sel_ranked k
+    else
+      alw = get g_sel_can k
+    end
+    if ne alw 0
+      if gt get g_bk_cnt add base k 0
+        mk = get g_bk_mean add base k
+        if lt best 0
+          best = long k
+          best_m = mk
+        else
+          if lt mk best_m
+            best = long k
+            best_m = mk
+          end
+        end
+      end
+    end
+  end
+  ret best
+end
+
+note ---- Decision init helper ----
+
+fn tf_dc_clear did ulong sid ulong has_sup ulong to void
+  scoff = mul sid 32
+  dcoff = mul did 32
+  for i ulong 32
+    put g_dc_cdig add dcoff i get g_st_cdig add scoff i
+    put g_dc_sel add dcoff i uchar 0
+    if ne has_sup 0
+      put g_dc_sup add dcoff i get g_tf_tmp_dig i
+    else
+      put g_dc_sup add dcoff i uchar 0
+    end
+  end
+  coff = mul did TF_TEXT
+  for i ulong TF_TEXT
+    put g_dc_cons add coff i uchar 0
+  end
+  voff = mul did 16
+  for i ulong 16
+    put g_dc_verd add voff i uchar 0
+    put g_dc_tres add voff i uchar 0
+  end
+  put g_dc_n did get g_cur_qn 0
+  put g_dc_m did get g_cur_qm 0
+  put g_dc_spm did get g_cur_qsp 0
+  put g_dc_pack did get g_cur_qpk 0
+  put g_dc_cn did 0
+  put g_dc_cm did 0
+  put g_dc_cspm did 0
+  put g_dc_exc did 0
+  put g_dc_ncand did 0
+  put g_dc_chosen did -1
+  put g_dc_mppm did 0
+  put g_dc_bppm did 0
+  put g_dc_ncite did 0
+  put g_dc_hsup did has_sup
+  rbase = mul did TF_MAX_CAND
+  for i ulong TF_MAX_CAND
+    put g_dc_reas add rbase i 0
+    put g_dc_cost add rbase i 0
+  end
+  n = len t_tf_tr_none
+  for i ulong n bound 16
+    put g_dc_tres add voff i get t_tf_tr_none i
+  end
+end
+
+fn tf_dc_set_sel did ulong s view uchar * to void
+  off = mul did 32
+  n = len s
+  for i ulong n bound 31
+    put g_dc_sel add off i get s i
+  end
+  put g_dc_sel add off n uchar 0
+end
+
+fn tf_dc_set_cons did ulong s view uchar * to void
+  off = mul did TF_TEXT
+  n = len s
+  for i ulong n bound 95
+    put g_dc_cons add off i get s i
+  end
+  put g_dc_cons add off n uchar 0
+end
+
+fn tf_dc_set_verd did ulong s view uchar * to void
+  off = mul did 16
+  n = len s
+  for i ulong n bound 15
+    put g_dc_verd add off i get s i
+  end
+  put g_dc_verd add off n uchar 0
+end
+
+fn tf_dc_set_tres did ulong s view uchar * to void
+  off = mul did 16
+  n = len s
+  for i ulong n bound 15
+    put g_dc_tres add off i get s i
+  end
+  put g_dc_tres add off n uchar 0
+end
+
+note ---- Shared selector helpers ----
+
+fn tf_tier_ok idx ulong to bool
+  off = mul idx 8
+  if ne get g_ev_tier off uchar 69
+    ret false
+  end
+  if ne get g_ev_tier add off 2 uchar 0
+    ret false
+  end
+  c1 = get g_ev_tier add off 1
+  if eq c1 uchar 50
+    ret true
+  end
+  if eq c1 uchar 51
+    ret true
+  end
+  if eq c1 uchar 52
+    ret true
+  end
+  ret false
+end
+
+fn tf_row_noise idx ulong pack ulong to f64
+  c = f64 tf_ev_cost idx pack
+  if eq pack TF_PACK_PER_CALL
+    if gt c 0.0
+      t1 = mul div f64 get g_ev_nppm idx 1.0e6 f64 get g_ev_med idx
+      t2 = mul div f64 get g_ev_pnppm idx 1.0e6 f64 get g_ev_pack idx
+      ret div add t1 t2 c
+    end
+  end
+  ret div f64 get g_ev_nppm idx 1.0e6
+end
+
+fn tf_sp_dig_eq_ev sp_idx ulong ev_idx ulong to bool
+  so = mul sp_idx 32
+  eo = mul ev_idx 32
+  for i ulong 32
+    if ne get g_sp_id add so i get g_ev_spid add eo i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tf_rc_dig_eq_ev rc_idx ulong ev_idx ulong to bool
+  ro = mul rc_idx 32
+  eo = mul ev_idx 32
+  for i ulong 32
+    if ne get g_rc_dig add ro i get g_ev_rdig add eo i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tf_check_receipts sid ulong to void
+  nr = get g_st_nrec sid
+  rbase = mul sid TF_MAX_REC
+  for r ulong nr bound 8
+    ridx = add rbase r
+    tf_set_path_cstr_rc ridx
+    ok = ulong 0
+    if eq tf_file_digest_gp 0
+      ro = mul ridx 32
+      eqd = true
+      for j ulong 32
+        if ne get g_tf_sh_out j get g_rc_dig add ro j
+          eqd = false
+          break
+        end
+      end
+      if eqd
+        ok = 1
+      end
+    end
+    put g_sel_rec_ok r ok
+  end
+end
+
+fn tf_copy_cand_spec co ulong so ulong to void
+  for j ulong 32
+    put g_dc_cand add co j get g_sp_id add so j
+    put g_dc_crz add co j get g_sp_rz add so j
+  end
+end
+
+fn tf_sp_cdig_eq_st so ulong scoff ulong to bool
+  for j ulong 32
+    if ne get g_sp_cdig add so j get g_st_cdig add scoff j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tf_filter_cands sid ulong did ulong to void
+  qn = get g_cur_qn 0
+  ns = get g_st_nspec sid
+  put g_dc_ncand did ns
+  sbase = mul sid TF_MAX_SPECS
+  scoff = mul sid 32
+  cand_base = mul did mul TF_MAX_CAND 32
+  rbase = mul did TF_MAX_CAND
+  for k ulong ns bound 16
+    sidx = add sbase k
+    put g_sel_elig k 0
+    so = mul sidx 32
+    tf_copy_cand_spec add cand_base mul k 32 so
+    if not tf_sp_cdig_eq_st so scoff
+      put g_dc_reas add rbase k TF_R_CONTRACT_MISMATCH
+    else
+      if ne get g_sp_exact sidx 1
+        put g_dc_reas add rbase k TF_R_NOT_EXACT
+      else
+        if gt qn get g_sp_maxn sidx
+          put g_dc_reas add rbase k TF_R_MAX_N
+        else
+          put g_dc_reas add rbase k TF_R_NO_EVIDENCE
+          put g_sel_elig k 1
+        end
+      end
+    end
+  end
+end
+
+fn tf_mark_one_ev sid ulong i ulong to void
+  eidx = add mul sid TF_MAX_EV i
+  put g_sel_usable i uchar 0
+  ns = get g_st_nspec sid
+  sbase = mul sid TF_MAX_SPECS
+  rs = long -1
+  for k ulong ns bound 16
+    if tf_sp_dig_eq_ev add sbase k eidx
+      rs = long k
+    end
+  end
+  put g_sel_rspec i rs
+  if lt rs 0
+    ret
+  end
+  if ne get g_cur_qexc 0 0
+    if eq get g_ev_n eidx get g_cur_qn 0
+      if eq get g_ev_m eidx get g_cur_qm 0
+        if eq get g_ev_spm eidx get g_cur_qsp 0
+          ret
+        end
+      end
+    end
+  end
+  nr = get g_st_nrec sid
+  rbase = mul sid TF_MAX_REC
+  ok = ulong 0
+  for r ulong nr bound 8
+    if tf_rc_dig_eq_ev add rbase r eidx
+      ok = get g_sel_rec_ok r
+    end
+  end
+  rsu = ulong rs
+  if eq ok 0
+    put g_sel_unrec rsu 1
+  else
+    if ne get g_sel_elig rsu 0
+      put g_sel_usable i uchar 1
+    end
+  end
+end
+
+fn tf_mark_usable sid ulong to void
+  ns = get g_st_nspec sid
+  for k ulong ns bound 16
+    put g_sel_unrec k 0
+  end
+  ne_n = get g_st_nev sid
+  for i ulong ne_n bound 1024
+    tf_mark_one_ev sid i
+  end
+end
+
+note ---- Field selector v1 ----
+
+fn tf_foot_dist en ulong em ulong to f64
+  dn = tf_fabs tf_log2 div f64 en f64 get g_cur_qn 0
+  dm = tf_fabs tf_log2 div f64 em f64 get g_cur_qm 0
+  ret add dn dm
+end
+
+fn tf_v1_pick_foot sid ulong did ulong to bool
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  have = false
+  best = f64 0.0
+  put g_dc_cn did 0
+  put g_dc_cm did 0
+  put g_dc_cspm did TF_SPARSITY_ANY
+  for i ulong ne_n bound 1024
+    if eq get g_sel_usable i uchar 0
+      continue
+    end
+    eidx = add ebase i
+    en = get g_ev_n eidx
+    em = get g_ev_m eidx
+    dd = tf_foot_dist en em
+    take = false
+    if not have
+      take = true
+    else
+      if lt dd sub best 1.0e-12
+        take = true
+      else
+        if le tf_fabs sub dd best 1.0e-12
+          if lt en get g_dc_cn did
+            take = true
+          else
+            if eq en get g_dc_cn did
+              if lt em get g_dc_cm did
+                take = true
+              end
+            end
+          end
+        end
+      end
+    end
+    if take
+      have = true
+      best = dd
+      put g_dc_cn did en
+      put g_dc_cm did em
+    end
+  end
+  ret have
+end
+
+fn tf_v1_scan_rows sid ulong did ulong to void
+  cn = get g_dc_cn did
+  cm = get g_dc_cm did
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  for i ulong ne_n bound 1024
+    if eq get g_sel_usable i uchar 0
+      continue
+    end
+    eidx = add ebase i
+    if ne get g_ev_n eidx cn
+      continue
+    end
+    if ne get g_ev_m eidx cm
+      continue
+    end
+    ku = ulong get g_sel_rspec i
+    put g_sel_rows ku add get g_sel_rows ku 1
+    if eq get g_ev_ver eidx 0
+      put g_sel_bad ku long TF_R_UNVERIFIED_RUN
+    else
+      if ne get g_ev_forced eidx 0
+        put g_sel_bad ku long TF_R_CONTENTION_FORCED
+      else
+        if not tf_tier_ok eidx
+          put g_sel_bad ku long TF_R_TIER
+        end
+      end
+    end
+  end
+end
+
+fn tf_v1_filter_rows sid ulong did ulong to void
+  ns = get g_st_nspec sid
+  for k ulong ns bound 16
+    put g_sel_rows k 0
+    put g_sel_bad k -1
+    put g_sel_ranked k 0
+  end
+  tf_v1_scan_rows sid did
+  rbase = mul did TF_MAX_CAND
+  for k ulong ns bound 16
+    if eq get g_sel_elig k 0
+      continue
+    end
+    if eq get g_sel_rows k 0
+      if ne get g_sel_unrec k 0
+        put g_dc_reas add rbase k TF_R_RECEIPT_UNVERIFIED
+      else
+        put g_dc_reas add rbase k TF_R_NO_EVIDENCE
+      end
+    else
+      bk = get g_sel_bad k
+      if ge bk 0
+        put g_dc_reas add rbase k ulong bk
+      else
+        put g_sel_ranked k 1
+        put g_dc_reas add rbase k TF_R_RANKED
+      end
+    end
+  end
+end
+
+fn tf_dc_push_cite did ulong eidx ulong to long
+  ncite = get g_dc_ncite did
+  if ge ncite TF_MAX_CITE
+    ret -1
+  end
+  eo = mul eidx 32
+  co = add mul did mul TF_MAX_CITE 32 mul ncite 32
+  for j ulong 32
+    put g_dc_cite add co j get g_ev_id add eo j
+  end
+  put g_dc_ncite did add ncite 1
+  ret 0
+end
+
+fn tf_v1_feed_bucket sid ulong did ulong to long
+  cn = get g_dc_cn did
+  cm = get g_dc_cm did
+  qpack = get g_cur_qpk 0
+  tf_bucket_reset TF_SCRATCH_BKT cn cm qpack
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  for i ulong ne_n bound 1024
+    if eq get g_sel_usable i uchar 0
+      continue
+    end
+    eidx = add ebase i
+    if ne get g_ev_n eidx cn
+      continue
+    end
+    if ne get g_ev_m eidx cm
+      continue
+    end
+    ku = ulong get g_sel_rspec i
+    if eq get g_sel_ranked ku 0
+      continue
+    end
+    tf_bucket_observe TF_SCRATCH_BKT ku tf_ev_cost eidx qpack
+    if ne tf_dc_push_cite did eidx 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn tf_v1_calc_band sid ulong did ulong chosen long runner long to f64
+  band = f64 0.0
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  for i ulong ne_n bound 1024
+    if eq get g_sel_usable i uchar 0
+      continue
+    end
+    eidx = add ebase i
+    if ne get g_ev_n eidx get g_dc_cn did
+      continue
+    end
+    if ne get g_ev_m eidx get g_dc_cm did
+      continue
+    end
+    rs = get g_sel_rspec i
+    if or eq rs chosen eq rs runner
+      w = tf_row_noise eidx get g_cur_qpk 0
+      if gt w band
+        band = w
+      end
+    end
+  end
+  ret band
+end
+
+fn tf_v1_find_runner sid ulong chosen long to long
+  ns = get g_st_nspec sid
+  bbase = mul TF_SCRATCH_BKT TF_MAX_SPECS
+  runner = long -1
+  for k ulong ns bound 16
+    if ne get g_sel_ranked k 0
+      if ne long k chosen
+        if lt runner 0
+          runner = long k
+        else
+          if lt get g_bk_mean add bbase k get g_bk_mean add bbase ulong runner
+            runner = long k
+          end
+        end
+      end
+    end
+  end
+  ret runner
+end
+
+fn tf_v1_finish_band sid ulong did ulong chosen long to void
+  ns = get g_st_nspec sid
+  bbase = mul TF_SCRATCH_BKT TF_MAX_SPECS
+  rbase = mul did TF_MAX_CAND
+  for k ulong ns bound 16
+    if ne get g_sel_ranked k 0
+      put g_dc_cost add rbase k ulong tf_llround get g_bk_mean add bbase k
+    end
+  end
+  runner = tf_v1_find_runner sid chosen
+  band = tf_v1_calc_band sid did chosen runner
+  put g_dc_bppm did ulong tf_llround mul band 1.0e6
+  if ge runner 0
+    rm = get g_bk_mean add bbase ulong runner
+    cm_v = get g_bk_mean add bbase ulong chosen
+    put g_dc_mppm did ulong tf_llround mul sub div rm cm_v 1.0 1.0e6
+  else
+    put g_dc_mppm did 0
+  end
+  put g_dc_chosen did chosen
+  put g_dc_reas add rbase ulong chosen TF_R_CHOSEN
+  tf_dc_set_verd did t_tf_v_chosen
+end
+
+fn tf_field_select sid ulong did ulong has_sup ulong to long
+  qn = get g_cur_qn 0
+  qm = get g_cur_qm 0
+  ns = get g_st_nspec sid
+  if or eq qn 0 or eq qm 0 gt ns TF_MAX_CAND
+    ret -1
+  end
+  tf_dc_clear did sid has_sup
+  tf_dc_set_sel did t_tf_sel_v1
+  tf_dc_set_cons did t_tf_cons_v1
+  tf_check_receipts sid
+  tf_filter_cands sid did
+  tf_mark_usable sid
+  if not tf_v1_pick_foot sid did
+    rbase = mul did TF_MAX_CAND
+    for k ulong ns bound 16
+      if ne get g_sel_elig k 0
+        if ne get g_sel_unrec k 0
+          put g_dc_reas add rbase k TF_R_RECEIPT_UNVERIFIED
+        end
+      end
+    end
+    tf_dc_set_verd did t_tf_v_none
+    ret 1
+  end
+  if and eq get g_dc_cn did qn eq get g_dc_cm did qm
+    put g_dc_exc did 1
+  end
+  tf_v1_filter_rows sid did
+  if ne tf_v1_feed_bucket sid did 0
+    ret -1
+  end
+  chosen = tf_rank_min_cost_ranked TF_SCRATCH_BKT ns 0
+  if lt chosen 0
+    tf_dc_set_verd did t_tf_v_none
+    put g_dc_ncite did 0
+    ret 1
+  end
+  tf_v1_finish_band sid did chosen
+  ret 0
+end
+
+note ---- RETIRED Field selector v0 ----
+
+fn tf_cell_dist en ulong em ulong esp ulong to f64
+  dn = tf_fabs tf_log2 div f64 en f64 get g_cur_qn 0
+  dm = tf_fabs tf_log2 div f64 em f64 get g_cur_qm 0
+  ds = div tf_fabs sub f64 esp f64 get g_cur_qsp 0 1000.0
+  ret add add dn dm mul 4.0 ds
+end
+
+fn tf_cell_less n1 ulong m1 ulong s1 ulong n2 ulong m2 ulong s2 ulong to bool
+  if ne n1 n2
+    ret lt n1 n2
+  end
+  if ne m1 m2
+    ret lt m1 m2
+  end
+  ret lt s1 s2
+end
+
+global g_v0_sum f64 1
+global g_v0_lo f64 1
+global g_v0_hi f64 1
+global g_v0_win f64 1
+global g_v0_rows ulong 1
+global g_v0_bad long 1
+
+fn tf_cell_less_dc did ulong en ulong em ulong es ulong to bool
+  bn = get g_dc_cn did
+  if ne en bn
+    ret lt en bn
+  end
+  bm = get g_dc_cm did
+  if ne em bm
+    ret lt em bm
+  end
+  ret lt es get g_dc_cspm did
+end
+
+fn tf_v0_pick_cell sid ulong did ulong to bool
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  have = false
+  best = f64 0.0
+  put g_dc_cn did 0
+  put g_dc_cm did 0
+  put g_dc_cspm did 0
+  for i ulong ne_n bound 1024
+    if eq get g_sel_usable i uchar 0
+      continue
+    end
+    eidx = add ebase i
+    en = get g_ev_n eidx
+    em = get g_ev_m eidx
+    es = get g_ev_spm eidx
+    dd = tf_cell_dist en em es
+    take = false
+    if not have
+      take = true
+    else
+      if lt dd sub best 1.0e-12
+        take = true
+      else
+        if le tf_fabs sub dd best 1.0e-12
+          if tf_cell_less_dc did en em es
+            take = true
+          end
+        end
+      end
+    end
+    if take
+      have = true
+      best = dd
+      put g_dc_cn did en
+      put g_dc_cm did em
+      put g_dc_cspm did es
+    end
+  end
+  ret have
+end
+
+fn tf_v0_acc_row did ulong eidx ulong to long
+  if eq get g_ev_ver eidx 0
+    put g_v0_bad 0 long TF_R_UNVERIFIED_RUN
+  else
+    if ne get g_ev_forced eidx 0
+      put g_v0_bad 0 long TF_R_CONTENTION_FORCED
+    else
+      if not tf_tier_ok eidx
+        put g_v0_bad 0 long TF_R_TIER
+      end
+    end
+  end
+  c = f64 tf_ev_cost eidx get g_cur_qpk 0
+  w = tf_row_noise eidx get g_cur_qpk 0
+  rows = get g_v0_rows 0
+  if or eq rows 0 lt c get g_v0_lo 0
+    put g_v0_lo 0 c
+  end
+  if or eq rows 0 gt c get g_v0_hi 0
+    put g_v0_hi 0 c
+  end
+  if gt w get g_v0_win 0
+    put g_v0_win 0 w
+  end
+  put g_v0_sum 0 add get g_v0_sum 0 c
+  put g_v0_rows 0 add rows 1
+  ret tf_dc_push_cite did eidx
+end
+
+fn tf_v0_finish_cand did ulong k ulong cite0 ulong to void
+  rbase = mul did TF_MAX_CAND
+  rows = get g_v0_rows 0
+  if eq rows 0
+    if ne get g_sel_unrec k 0
+      put g_dc_reas add rbase k TF_R_RECEIPT_UNVERIFIED
+    else
+      put g_dc_reas add rbase k TF_R_NO_EVIDENCE
+    end
+    ret
+  end
+  bad = get g_v0_bad 0
+  if ge bad 0
+    put g_dc_reas add rbase k ulong bad
+    put g_dc_ncite did cite0
+    ret
+  end
+  ck = div get g_v0_sum 0 f64 rows
+  across = f64 0.0
+  if gt ck 0.0
+    across = div sub get g_v0_hi 0 get g_v0_lo 0 ck
+  end
+  sp = get g_v0_win 0
+  if gt across sp
+    sp = across
+  end
+  put g_sel_cost k ck
+  put g_sel_spread k sp
+  put g_sel_meas k 1
+  put g_dc_reas add rbase k TF_R_RANKED
+  put g_dc_cost add rbase k ulong tf_llround ck
+end
+
+fn tf_v0_score_cand sid ulong did ulong k ulong to long
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  sidx = add mul sid TF_MAX_SPECS k
+  put g_v0_sum 0 0.0
+  put g_v0_lo 0 0.0
+  put g_v0_hi 0 0.0
+  put g_v0_win 0 0.0
+  put g_v0_rows 0 0
+  put g_v0_bad 0 -1
+  cite0 = get g_dc_ncite did
+  for i ulong ne_n bound 1024
+    if eq get g_sel_usable i uchar 0
+      continue
+    end
+    eidx = add ebase i
+    if ne get g_ev_n eidx get g_dc_cn did
+      continue
+    end
+    if ne get g_ev_m eidx get g_dc_cm did
+      continue
+    end
+    if ne get g_ev_spm eidx get g_dc_cspm did
+      continue
+    end
+    if not tf_sp_dig_eq_ev sidx eidx
+      continue
+    end
+    if ne tf_v0_acc_row did eidx 0
+      ret -1
+    end
+  end
+  tf_v0_finish_cand did k cite0
+  ret 0
+end
+
+fn tf_v0_resolve_tie sid ulong did ulong cheap long inc_idx long ntied ulong to void
+  ns = get g_st_nspec sid
+  rbase = mul did TF_MAX_CAND
+  chosen = cheap
+  if gt ntied 1
+    tf_dc_set_verd did t_tf_v_tie
+    ref = tf_find_spec_txt sid t_tf_rz0
+    inc_ok = false
+    if ge inc_idx 0
+      if ne get g_sel_tied ulong inc_idx 0
+        inc_ok = true
+      end
+    end
+    ref_ok = false
+    if ge ref 0
+      if ne get g_sel_tied ulong ref 0
+        ref_ok = true
+      end
+    end
+    if inc_ok
+      chosen = inc_idx
+      tf_dc_set_tres did t_tf_tr_inc
+    else
+      if ref_ok
+        chosen = ref
+        tf_dc_set_tres did t_tf_tr_ref
+      else
+        tf_dc_set_tres did t_tf_tr_cheap
+      end
+    end
+    for k ulong ns bound 16
+      if ne get g_sel_tied k 0
+        put g_dc_reas add rbase k TF_R_TIED
+      end
+    end
+  else
+    tf_dc_set_verd did t_tf_v_chosen
+  end
+  put g_dc_chosen did chosen
+  put g_dc_reas add rbase ulong chosen TF_R_CHOSEN
+end
+
+fn tf_v0_pick_winner sid ulong did ulong inc_idx long to long
+  ns = get g_st_nspec sid
+  cheap = long -1
+  runner = long -1
+  for k ulong ns bound 16
+    if eq get g_sel_meas k 0
+      continue
+    end
+    ck = get g_sel_cost k
+    is_ch = false
+    if lt cheap 0
+      is_ch = true
+    else
+      if lt ck get g_sel_cost ulong cheap
+        is_ch = true
+      end
+    end
+    if is_ch
+      runner = cheap
+      cheap = long k
+    else
+      is_rn = false
+      if lt runner 0
+        is_rn = true
+      else
+        if lt ck get g_sel_cost ulong runner
+          is_rn = true
+        end
+      end
+      if is_rn
+        runner = long k
+      end
+    end
+  end
+  if lt cheap 0
+    tf_dc_set_verd did t_tf_v_none
+    put g_dc_ncite did 0
+    ret 1
+  end
+  band = get g_sel_spread ulong cheap
+  if ge runner 0
+    sr = get g_sel_spread ulong runner
+    if gt sr band
+      band = sr
+    end
+  end
+  put g_dc_bppm did ulong tf_llround mul band 1.0e6
+  if ge runner 0
+    put g_dc_mppm did ulong tf_llround mul sub div get g_sel_cost ulong runner get g_sel_cost ulong cheap 1.0 1.0e6
+  else
+    put g_dc_mppm did 0
+  end
+  ntied = ulong 0
+  lim_c = mul get g_sel_cost ulong cheap add 1.0 band
+  for k ulong ns bound 16
+    if ne get g_sel_meas k 0
+      if le get g_sel_cost k lim_c
+        put g_sel_tied k 1
+        ntied = add ntied 1
+      end
+    end
+  end
+  tf_v0_resolve_tie sid did cheap inc_idx ntied
+  ret 0
+end
+
+fn tf_field_select_v0_retired sid ulong did ulong inc_idx long has_sup ulong to long
+  qn = get g_cur_qn 0
+  qm = get g_cur_qm 0
+  qsp = get g_cur_qsp 0
+  ns = get g_st_nspec sid
+  if or eq qn 0 or eq qm 0 gt ns TF_MAX_CAND
+    ret -1
+  end
+  tf_dc_clear did sid has_sup
+  tf_dc_set_sel did t_tf_sel_v0
+  tf_dc_set_cons did t_tf_cons_v0
+  tf_check_receipts sid
+  tf_filter_cands sid did
+  tf_mark_usable sid
+  if not tf_v0_pick_cell sid did
+    rbase = mul did TF_MAX_CAND
+    for k ulong ns bound 16
+      if ne get g_sel_elig k 0
+        if ne get g_sel_unrec k 0
+          put g_dc_reas add rbase k TF_R_RECEIPT_UNVERIFIED
+        end
+      end
+    end
+    tf_dc_set_verd did t_tf_v_none
+    ret 1
+  end
+  if eq get g_dc_cn did qn
+    if eq get g_dc_cm did qm
+      if eq get g_dc_cspm did qsp
+        put g_dc_exc did 1
+      end
+    end
+  end
+  for k ulong ns bound 16
+    put g_sel_cost k 0.0
+    put g_sel_spread k 0.0
+    put g_sel_meas k 0
+    put g_sel_tied k 0
+  end
+  for k ulong ns bound 16
+    if ne get g_sel_elig k 0
+      if ne tf_v0_score_cand sid did k 0
+        ret -1
+      end
+    end
+  end
+  ret tf_v0_pick_winner sid did inc_idx
+end
+
+note ---- Control arm (history selector) ----
+
+fn tf_history_init hid ulong seed ulong to void
+  put g_hi_seed hid seed
+  put g_hi_nbkt hid 0
+end
+
+fn tf_bucket_shuffle bid ulong ns ulong seed ulong to void
+  put g_sm_state 0 seed
+  bbase = mul bid TF_MAX_SPECS
+  k = ns
+  while gt k 1 bound 32
+    j = rem tf_splitmix64 k
+    k = sub k 1
+    t = get g_bk_ord add bbase k
+    v = get g_bk_ord add bbase j
+    put g_bk_ord add bbase k v
+    put g_bk_ord add bbase j t
+  end
+end
+
+fn tf_history_bucket_get hid ulong sid ulong n ulong m ulong pack ulong to long
+  nb = get g_hi_nbkt hid
+  hbase = mul hid TF_HIST_BUCKETS
+  for i ulong nb bound 64
+    bid = add hbase i
+    if eq get g_bk_n bid n
+      if eq get g_bk_m bid m
+        if eq get g_bk_pack bid pack
+          ret long bid
+        end
+      end
+    end
+  end
+  if ge nb TF_HIST_BUCKETS
+    ret -1
+  end
+  bid = add hbase nb
+  put g_hi_nbkt hid add nb 1
+  tf_bucket_reset bid n m pack
+  s = xor get g_hi_seed hid xor mul n ulong 0x100000001b3 xor shl m 20 pack
+  tf_bucket_shuffle bid get g_st_nspec sid s
+  ret long bid
+end
+
+fn tf_history_observe hid ulong sid ulong k ulong cost_ps ulong to long
+  if ge k get g_st_nspec sid
+    ret -1
+  end
+  bid = tf_history_bucket_get hid sid get g_cur_qn 0 get g_cur_qm 0 get g_cur_qpk 0
+  if lt bid 0
+    ret -1
+  end
+  tf_bucket_observe ulong bid k cost_ps
+  ret 0
+end
+
+fn tf_history_load_one hid ulong sid ulong eidx ulong has_skip ulong to long
+  en = get g_ev_n eidx
+  em = get g_ev_m eidx
+  if ne has_skip 0
+    if eq en get g_cur_qn 0
+      if eq em get g_cur_qm 0
+        if eq get g_ev_spm eidx get g_cur_qsp 0
+          ret 0
+        end
+      end
+    end
+  end
+  ns = get g_st_nspec sid
+  sbase = mul sid TF_MAX_SPECS
+  k = long -1
+  for j ulong ns bound 32
+    if tf_sp_dig_eq_ev add sbase j eidx
+      k = long j
+    end
+  end
+  if lt k 0
+    ret -1
+  end
+  bid0 = tf_history_bucket_get hid sid en em 0
+  if lt bid0 0
+    ret -1
+  end
+  tf_bucket_observe ulong bid0 ulong k tf_ev_cost eidx 0
+  bid1 = tf_history_bucket_get hid sid en em 1
+  if lt bid1 0
+    ret -1
+  end
+  tf_bucket_observe ulong bid1 ulong k tf_ev_cost eidx 1
+  ret 0
+end
+
+fn tf_history_load hid ulong sid ulong has_skip ulong to long
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  for i ulong ne_n bound 1024
+    if ne tf_history_load_one hid sid add ebase i has_skip 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn tf_hist_fill_cands sid ulong did ulong bid ulong to void
+  ns = get g_st_nspec sid
+  for k ulong ns bound 16
+    sidx = add mul sid TF_MAX_SPECS k
+    co = add mul did mul TF_MAX_CAND 32 mul k 32
+    tf_copy_cand_spec co mul sidx 32
+    rk = add mul did TF_MAX_CAND k
+    if le get g_cur_qn 0 get g_sp_maxn sidx
+      put g_sel_can k 1
+      put g_dc_reas rk TF_R_RANKED
+      bk = add mul bid TF_MAX_SPECS k
+      if gt get g_bk_cnt bk 0
+        put g_dc_cost rk ulong tf_llround get g_bk_mean bk
+      end
+    else
+      put g_sel_can k 0
+      put g_dc_reas rk TF_R_MAX_N
+    end
+  end
+end
+
+fn tf_hist_explore did ulong bid ulong ns ulong to long
+  bbase = mul bid TF_MAX_SPECS
+  rbase = mul did TF_MAX_CAND
+  cur = get g_bk_cur bid
+  for t ulong ns bound 16
+    k = get g_bk_ord add bbase rem add cur t ns
+    if ne get g_sel_can k 0
+      if eq get g_bk_cnt add bbase k 0
+        put g_bk_cur bid rem add add cur t 1 ns
+        put g_dc_chosen did long k
+        put g_dc_reas add rbase k TF_R_EXPLORE
+        tf_dc_set_verd did t_tf_v_explore
+        ret long k
+      end
+    end
+  end
+  ret -1
+end
+
+fn tf_history_select hid ulong sid ulong did ulong to long
+  ns = get g_st_nspec sid
+  if gt ns TF_MAX_CAND
+    ret -1
+  end
+  bid_l = tf_history_bucket_get hid sid get g_cur_qn 0 get g_cur_qm 0 get g_cur_qpk 0
+  if lt bid_l 0
+    ret -1
+  end
+  bid = ulong bid_l
+  tf_dc_clear did sid 0
+  tf_dc_set_sel did t_tf_sel_hist
+  tf_dc_set_cons did t_tf_cons_h
+  put g_dc_cn did get g_cur_qn 0
+  put g_dc_cm did get g_cur_qm 0
+  put g_dc_cspm did get g_cur_qsp 0
+  put g_dc_ncand did ns
+  tf_hist_fill_cands sid did bid
+  ex = tf_hist_explore did bid ns
+  if ge ex 0
+    ret ex
+  end
+  best = tf_rank_min_cost_ranked bid ns 1
+  if lt best 0
+    tf_dc_set_verd did t_tf_v_none
+    ret -1
+  end
+  put g_dc_chosen did best
+  put g_dc_reas add mul did TF_MAX_CAND ulong best TF_R_CHOSEN
+  tf_dc_set_verd did t_tf_v_chosen
+  ret best
+end
+
+note ---- Replay & Regret ----
+
+fn tf_cell_cost sid ulong k ulong to f64
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  sidx = add mul sid TF_MAX_SPECS k
+  sum = f64 0.0
+  rows = ulong 0
+  for i ulong ne_n bound 1024
+    eidx = add ebase i
+    if ne get g_ev_n eidx get g_cur_qn 0
+      continue
+    end
+    if ne get g_ev_m eidx get g_cur_qm 0
+      continue
+    end
+    if ne get g_ev_spm eidx get g_cur_qsp 0
+      continue
+    end
+    if not tf_sp_dig_eq_ev sidx eidx
+      continue
+    end
+    if eq get g_ev_ver eidx 0
+      ret -1.0
+    end
+    sum = add sum f64 tf_ev_cost eidx get g_cur_qpk 0
+    rows = add rows 1
+  end
+  if eq rows 0
+    ret -1.0
+  end
+  ret div sum f64 rows
+end
+
+fn tf_oracle sid ulong to long
+  qn = get g_cur_qn 0
+  ns = get g_st_nspec sid
+  sbase = mul sid TF_MAX_SPECS
+  best = long -1
+  bc = f64 0.0
+  for k ulong ns bound 32
+    sidx = add sbase k
+    if eq get g_sp_exact sidx 0
+      continue
+    end
+    if gt qn get g_sp_maxn sidx
+      continue
+    end
+    c = tf_cell_cost sid k
+    if lt c 0.0
+      continue
+    end
+    if or lt best 0 lt c bc
+      best = long k
+      bc = c
+    end
+  end
+  if ge best 0
+    put g_ora_best 0 bc
+  end
+  ret best
+end
+
+fn tf_cells_has nc ulong en ulong em ulong es ulong to bool
+  for j ulong nc bound 80
+    if eq get g_c_n j en
+      if eq get g_c_m j em
+        if eq get g_c_sp j es
+          ret true
+        end
+      end
+    end
+  end
+  ret false
+end
+
+fn tf_cells_gt a ulong tn ulong tm ulong ts ulong to bool
+  pm = get g_c_m a
+  if ne pm tm
+    ret gt pm tm
+  end
+  pn = get g_c_n a
+  if ne pn tn
+    ret gt pn tn
+  end
+  ret gt get g_c_sp a ts
+end
+
+fn tf_cells_sort nc ulong to void
+  i = ulong 1
+  while lt i nc bound 80
+    tn = get g_c_n i
+    tm = get g_c_m i
+    ts = get g_c_sp i
+    j = i
+    while gt j 0 bound 80
+      jm1 = sub j 1
+      if tf_cells_gt jm1 tn tm ts
+        put g_c_n j get g_c_n jm1
+        put g_c_m j get g_c_m jm1
+        put g_c_sp j get g_c_sp jm1
+        j = jm1
+      else
+        break
+      end
+    end
+    put g_c_n j tn
+    put g_c_m j tm
+    put g_c_sp j ts
+    i = add i 1
+  end
+end
+
+fn tf_cells sid ulong cap ulong to ulong
+  ne_n = get g_st_nev sid
+  ebase = mul sid TF_MAX_EV
+  nc = ulong 0
+  for i ulong ne_n bound 1024
+    eidx = add ebase i
+    en = get g_ev_n eidx
+    em = get g_ev_m eidx
+    es = get g_ev_spm eidx
+    if tf_cells_has nc en em es
+      continue
+    end
+    if ge nc cap
+      ret nc
+    end
+    put g_c_n nc en
+    put g_c_m nc em
+    put g_c_sp nc es
+    nc = add nc 1
+  end
+  tf_cells_sort nc
+  ret nc
+end
+
+fn tf_regret_of sid ulong k long ora f64 to f64
+  if lt k 0
+    ret 1.0e9
+  end
+  c = tf_cell_cost sid ulong k
+  if lt c 0.0
+    ret 1.0e9
+  end
+  ret sub div c ora 1.0
+end
+
+fn tf_sp_eq_dc_cand so ulong co ulong to bool
+  for j ulong 32
+    if ne get g_sp_id add so j get g_dc_cand add co j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tf_dc_chosen_spec sid ulong did ulong to long
+  ch = get g_dc_chosen did
+  if lt ch 0
+    ret -1
+  end
+  ns = get g_st_nspec sid
+  sbase = mul sid TF_MAX_SPECS
+  co = add mul did mul TF_MAX_CAND 32 mul ulong ch 32
+  for k ulong ns bound 32
+    if tf_sp_eq_dc_cand mul add sbase k 32 co
+      ret long k
+    end
+  end
+  ret -1
+end
+
+fn tf_reg_reset to void
+  put g_reg_dec 0 0
+  put g_reg_fmean 0 0.0
+  put g_reg_fmax 0 0.0
+  put g_reg_hmean 0 0.0
+  put g_reg_hmax 0 0.0
+  put g_reg_fcok 0 0
+  put g_reg_hcok 0 0
+  put g_reg_agree 0 0
+end
+
+fn tf_compare_one sid ulong rule ulong qi ulong loo ulong seed ulong to long
+  tf_set_q get g_q_n qi get g_q_m qi get g_q_sp qi get g_q_pack qi loo
+  if lt tf_oracle sid 0
+    ret -1
+  end
+  ora = get g_ora_best 0
+  if ne loo 0
+    tf_history_init 0 seed
+    if ne tf_history_load 0 sid 1 0
+      ret -1
+    end
+  end
+  frc = long 0
+  if eq rule TF_RULE_V0_RETIRED
+    frc = tf_field_select_v0_retired sid 2 -1 0
+  else
+    frc = tf_field_select sid 2 0
+  end
+  if ne frc 0
+    ret -1
+  end
+  hk = tf_history_select 0 sid 3
+  fk = tf_dc_chosen_spec sid 2
+  fr = tf_regret_of sid fk ora
+  hr = tf_regret_of sid hk ora
+  put g_reg_fmean 0 add get g_reg_fmean 0 fr
+  if gt fr get g_reg_fmax 0
+    put g_reg_fmax 0 fr
+  end
+  put g_reg_hmean 0 add get g_reg_hmean 0 hr
+  if gt hr get g_reg_hmax 0
+    put g_reg_hmax 0 hr
+  end
+  if eq tf_decision_verify sid 2 0
+    put g_reg_fcok 0 add get g_reg_fcok 0 1
+  end
+  if eq tf_decision_verify sid 3 0
+    put g_reg_hcok 0 add get g_reg_hcok 0 1
+  end
+  if eq fk hk
+    put g_reg_agree 0 add get g_reg_agree 0 1
+  end
+  put g_reg_dec 0 add get g_reg_dec 0 1
+  ret 0
+end
+
+fn tf_compare sid ulong rule ulong qoff ulong nq ulong loo ulong seed ulong to long
+  tf_reg_reset
+  if eq loo 0
+    tf_history_init 0 seed
+    if ne tf_history_load 0 sid 0 0
+      ret -1
+    end
+  end
+  for i ulong nq bound 256
+    if ne tf_compare_one sid rule add qoff i loo seed 0
+      ret -1
+    end
+  end
+  nd = get g_reg_dec 0
+  if gt nd 0
+    put g_reg_fmean 0 div get g_reg_fmean 0 f64 nd
+    put g_reg_hmean 0 div get g_reg_hmean 0 f64 nd
+  end
+  ret 0
+end
+
+fn tf_online_collect sid ulong hk ulong to ulong
+  nrows = ulong 0
+  hsidx = add mul sid TF_MAX_SPECS hk
+  ebase = mul sid TF_MAX_EV
+  ne_n = get g_st_nev sid
+  for ei ulong ne_n bound 1024
+    if ge nrows TF_MAX_REC
+      break
+    end
+    eidx = add ebase ei
+    if ne get g_ev_n eidx get g_cur_qn 0
+      continue
+    end
+    if ne get g_ev_m eidx get g_cur_qm 0
+      continue
+    end
+    if ne get g_ev_spm eidx get g_cur_qsp 0
+      continue
+    end
+    if tf_sp_dig_eq_ev hsidx eidx
+      put g_on_rows nrows tf_ev_cost eidx get g_cur_qpk 0
+      nrows = add nrows 1
+    end
+  end
+  ret nrows
+end
+
+fn tf_reg_acc sid ulong fk long hk long ora f64 to void
+  fr = tf_regret_of sid fk ora
+  hr = tf_regret_of sid hk ora
+  put g_reg_fmean 0 add get g_reg_fmean 0 fr
+  if gt fr get g_reg_fmax 0
+    put g_reg_fmax 0 fr
+  end
+  put g_reg_hmean 0 add get g_reg_hmean 0 hr
+  if gt hr get g_reg_hmax 0
+    put g_reg_hmax 0 hr
+  end
+  if eq fk hk
+    put g_reg_agree 0 add get g_reg_agree 0 1
+  end
+  put g_reg_dec 0 add get g_reg_dec 0 1
+end
+
+fn tf_online_step sid ulong rule ulong qoff ulong oi ulong to long
+  qi = add qoff oi
+  tf_set_q get g_q_n qi get g_q_m qi get g_q_sp qi get g_q_pack qi 0
+  if lt tf_oracle sid 0
+    ret -1
+  end
+  ora = get g_ora_best 0
+  frc = long 0
+  if eq rule TF_RULE_V0_RETIRED
+    frc = tf_field_select_v0_retired sid 2 -1 0
+  else
+    frc = tf_field_select sid 2 0
+  end
+  if ne frc 0
+    ret -1
+  end
+  hk = tf_history_select 0 sid 3
+  if lt hk 0
+    ret -1
+  end
+  nrows = tf_online_collect sid ulong hk
+  if eq nrows 0
+    ret -1
+  end
+  sidx_seen = add mul ulong hk 256 oi
+  sc = get g_on_seen sidx_seen
+  put g_on_seen sidx_seen add sc 1
+  if ne tf_history_observe 0 sid ulong hk get g_on_rows rem sc nrows 0
+    ret -1
+  end
+  tf_reg_acc sid tf_dc_chosen_spec sid 2 hk ora
+  ret 0
+end
+
+fn tf_compare_online sid ulong rule ulong qoff ulong nq ulong rounds ulong seed ulong to long
+  tf_reg_reset
+  if or eq nq 0 or gt nq 256 eq get g_st_nrec sid 0
+    ret -1
+  end
+  tf_history_init 0 seed
+  for i ulong 8192
+    put g_on_seen i 0
+  end
+  s_cur = seed
+  for r ulong rounds bound 64
+    for i ulong nq bound 256
+      put g_on_ord i i
+    end
+    put g_sm_state 0 s_cur
+    k = nq
+    while gt k 1 bound 256
+      j = rem tf_splitmix64 k
+      k = sub k 1
+      t = get g_on_ord k
+      v = get g_on_ord j
+      put g_on_ord k v
+      put g_on_ord j t
+    end
+    s_cur = get g_sm_state 0
+    for t ulong nq bound 256
+      if ne tf_online_step sid rule qoff get g_on_ord t 0
+        ret -1
+      end
+    end
+  end
+  nd = get g_reg_dec 0
+  put g_reg_fmean 0 div get g_reg_fmean 0 f64 nd
+  put g_reg_hmean 0 div get g_reg_hmean 0 f64 nd
+  ret 0
+end

@@ -1756,52 +1756,33 @@ phase-twin-receipt: test-phase-twin
 
 # ---------------------------------------------------------------------------
 # TURING Wave 1 (docs/turing/TURING_W0_PROPOSAL.md): Field v1 records (K.7) +
-# control-arm selector, post hoc over evidence/MIXED_ALGEBRA receipts.
-# Reads src/algebra (registry) without modifying it; no runtime, no timed runs.
-# test-turing: plain + ASan/UBSan suites, then a rebuild check (spec ids from
-# two different builds must be byte-identical).
+# control-arm selector, post hoc over evidence/MIXED_ALGEBRA receipts, in pure
+# seeded OM-2 (src/turing/field.om, src/turing/select.om, tools/turing_field.om,
+# tests/turing/test_turing.om). No C, no runtime, no timed runs.
 .PHONY: test-turing turing-field
-TURING_SRCS = src/turing/field.c src/turing/field_select.c src/turing/field_select_v0_retired.c src/turing/history_selector.c \
-	src/turing/replay.c src/omega_canonical.c src/omega_om_units.c $(OMA_RZ_SRCS)
-TURING_HDRS = src/turing/field.h src/turing/select.h src/omega_canonical.h src/omega_types.h src/sha256.h $(OMA_RZ_HDRS)
-TURING_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-# -Wno-pedantic: these rules link the generated binding src/omega_om_units.c, whose runtime entry
-# table uses GNU range designators, which ISO C forbids (-Werror=pedantic). Only that one diagnostic
-# is waived; the handwritten sources in the same commands stay under the strict set. See
-# mk/estimation.mk for the same waiver on the other suites. Generator fix: omega-bridge #17.
-TURING_CFLAGS = $(OMA_RZ_CFLAGS) -Wno-pedantic
+TURING_OMC ?= seed/out/omc
+TURING_OM_SRCS = src/turing/field.om src/turing/select.om
 TURING_TEST = $(OUT_DIR)/tests-turing/test_turing
-TURING_TEST_ASAN = $(OUT_DIR)/tests-turing/test_turing_asan
 TURING_TOOL = $(OUT_DIR)/tests-turing/turing-field
-TURING_TOOL_ASAN = $(OUT_DIR)/tests-turing/turing-field_asan
 
-$(TURING_TEST): tests/turing/test_turing.c $(TURING_SRCS) $(TURING_HDRS)
+$(TURING_TEST): tests/turing/test_turing.om $(TURING_OM_SRCS) $(TURING_OMC)
 	@mkdir -p $(dir $@)
-	$(CC) $(TURING_CFLAGS) -o $@ tests/turing/test_turing.c $(TURING_SRCS) -lm
+	(printf 'om2\n'; sed '/^om2$$/d' $(TURING_OM_SRCS) tests/turing/test_turing.om) | $(TURING_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(TURING_TEST_ASAN): tests/turing/test_turing.c $(TURING_SRCS) $(TURING_HDRS)
+$(TURING_TOOL): tools/turing_field.om $(TURING_OM_SRCS) $(TURING_OMC)
 	@mkdir -p $(dir $@)
-	$(CC) $(TURING_CFLAGS) $(TURING_ASAN) -o $@ tests/turing/test_turing.c $(TURING_SRCS) -lm
-
-$(TURING_TOOL): tools/turing_field.c $(TURING_SRCS) $(TURING_HDRS)
-	@mkdir -p $(dir $@)
-	$(CC) $(TURING_CFLAGS) -o $@ tools/turing_field.c $(TURING_SRCS) -lm
-
-$(TURING_TOOL_ASAN): tools/turing_field.c $(TURING_SRCS) $(TURING_HDRS)
-	@mkdir -p $(dir $@)
-	$(CC) $(TURING_CFLAGS) $(TURING_ASAN) -o $@ tools/turing_field.c $(TURING_SRCS) -lm
+	(printf 'om2\n'; sed '/^om2$$/d' $(TURING_OM_SRCS) tools/turing_field.om) | $(TURING_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 turing-field: $(TURING_TOOL)
 	./$(TURING_TOOL)
 
-test-turing: $(TURING_TEST) $(TURING_TEST_ASAN) $(TURING_TOOL) $(TURING_TOOL_ASAN)
+test-turing: $(TURING_TEST) $(TURING_TOOL)
 	./$(TURING_TEST)
-	./$(TURING_TEST_ASAN)
-	./$(TURING_TOOL) --spec-ids > $(OUT_DIR)/tests-turing/spec_ids_plain.txt
-	./$(TURING_TOOL_ASAN) --spec-ids > $(OUT_DIR)/tests-turing/spec_ids_asan.txt
-	cmp $(OUT_DIR)/tests-turing/spec_ids_plain.txt $(OUT_DIR)/tests-turing/spec_ids_asan.txt
-	./$(TURING_TOOL_ASAN) > $(OUT_DIR)/tests-turing/turing_field_asan.txt
-	@echo "test-turing: spec ids identical across plain and ASan builds; turing-field runs clean under ASan/UBSan"
+	./$(TURING_TOOL) --spec-ids > $(OUT_DIR)/tests-turing/spec_ids_1.txt
+	./$(TURING_TOOL) --spec-ids > $(OUT_DIR)/tests-turing/spec_ids_2.txt
+	cmp $(OUT_DIR)/tests-turing/spec_ids_1.txt $(OUT_DIR)/tests-turing/spec_ids_2.txt
+	./$(TURING_TOOL) > $(OUT_DIR)/tests-turing/turing_field.txt
+	@echo "test-turing: pure OM-2 test_turing and turing-field pass; spec ids byte-identical"
 
 # ---------------------------------------------------------------------------
 # MIXED_ALGEBRA_DIGITAL_V1 closure gate (spec/mixed-algebra-digital-v1.md,
