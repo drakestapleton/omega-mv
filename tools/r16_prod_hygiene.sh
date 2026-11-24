@@ -49,7 +49,8 @@ trap 'rm -rf "$tmp"' EXIT
 nm "$bin" > "$tmp/nm" 2>&1 || fail "nm failed on $bin"
 awk '{print $NF}' "$tmp/nm" > "$tmp/syms"
 grep -qx 'main' "$tmp/syms" || fail "$n has no symbol table (stripped?); cannot check its link map"
-if grep -E '^(aien_test_build_|fab_|fl_|fx_)' "$tmp/syms" > "$tmp/bad-syms"; then
+# fab_om_* are pure-OM-2 unit helpers compiled into src/omega_om_units.c (not src/fabric/ test-build pieces).
+if grep -E '^(aien_test_build_|fab_|fl_|fx_)' "$tmp/syms" | grep -vE '^fab_om_' > "$tmp/bad-syms"; then
     fail "$n links test-build pieces: $(head -5 "$tmp/bad-syms" | tr '\n' ' ')"
 fi
 

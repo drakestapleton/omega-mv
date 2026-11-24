@@ -76,7 +76,7 @@ for s in "$@"; do
         *rx_seq_reference.c) fail "source list links the SEQ reference loop: $s" ;;
         *.rs|*sovereign*|*aegis-runtime*|*aegis_runtime*) fail "source list has a legacy Rust source: $s" ;;
         src/*.c|src/runtime/*.c|tests/runtime/*.c) ;;
-        *libaienos_capability.a) ;;
+        *libaienos_capability.a|*libaienos_capability_om2.a) ;;
         */m16/m16_native.c|*/nvrm/nvrm.c) [ "$mode" = silicon ] || fail "physical seat source in a host build: $s" ;;
         $argus_dir/argus_*.c) ;;  # ARGUS pinned by argus.lock (git archive extract; pattern unquoted on purpose)
         *) fail "source outside omega src/ and tests/runtime/: $s" ;;
