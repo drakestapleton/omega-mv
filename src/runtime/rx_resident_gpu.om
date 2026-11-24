@@ -1,0 +1,431 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_resident_gpu.om -- Pure seeded OM-2 port of src/runtime/rx_resident_gpu.c.
+note CPU-only resident GPU seat contract:
+note   - Castagnoli CRC32C bitwise verifier & sealer parity check
+note   - SM121 instruction scoreboard patcher & lane-check validator
+note   - GPR rounding, SeatArgs packing, QMD0/QMD1 invariant checks, lease budget calculation
+note   - Full resident seat lifecycle (rx_gpu_seat_begin, rx_gpu_seat_kill, rx_gpu_seat_relaunch,
+note     rx_gpu_seat_finish, rx_gpu_seat_finish_ex) and CPU-only ring/claim/publish/fault simulation
+note     WITHOUT opening /dev/nvidia*.
+note Composes after src/runtime/rx_coherent.om.
+
+const RX_GPU_CODE_CAP ulong 16384
+const RX_GPU_LDG_CTL ulong 2009088
+const RX_GPU_CRC_POLY ulong 2197175160
+const RX_GPU_GIVEUP ulong 200000000
+
+const RX_GPU_LEASE_TICK_US ulong 5000
+const RX_GPU_LEASE_WINDOW_MS ulong 2000
+const RX_GPU_LEASE_SAMPLE_MS ulong 50
+const RX_GPU_LEASE_MIN_BUDGET ulong 20000
+
+const RX_SEAT_HB_HOLD ulong 8
+const RX_SEAT_HB_HELD ulong 12
+const RX_SEAT_HB_LIVE ulong 16
+const RX_SEAT_HB_T_PICK ulong 20
+const RX_SEAT_HB_T_DONE ulong 24
+const RX_SEAT_HB_CLAIM ulong 28
+const RX_SEAT_HB_LEASE ulong 32
+const RX_SEAT_HB_BUDGET ulong 36
+const RX_SEAT_LEASE_QUIT ulong 4294967295
+
+note SM121 low-12-bit instruction opcodes
+const RX_OPC_MASK ulong 4095
+const RX_OPC_S2R ulong 2329
+const RX_OPC_LDC ulong 2946
+const RX_OPC_LDCU ulong 1964
+const RX_OPC_LDG ulong 2433
+const RX_OPC_STG ulong 2438
+const RX_OPC_ISETP_I ulong 2060
+const RX_OPC_ISETP_R ulong 524
+const RX_OPC_BRA ulong 2375
+
+note Word 3 control field mask and precomputed scoreboard values:
+note CTL_MASK = 0x3ffffe00
+note READ  (stall=2, wb=0, rb=7, wait=3) = 0x003e0400
+note STORE (stall=2, wb=7, rb=1, wait=3) = 0x0033c400
+note FIXED (stall=13, wb=7, rb=7, wait=3) = 0x003fda00
+const RX_CTL_MASK ulong 1073741312
+const RX_CTL_READ ulong 4064256
+const RX_CTL_STORE ulong 3392512
+const RX_CTL_FIXED ulong 4184576
+
+const RX_MARKER_DONE ulong 3735928559
+const RX_SEM_DONE ulong 1
+
+note Seat state (16 ulongs):
+note   0:opened, 1:killed, 2:image_bound, 3:marker_ok, 4:sem_ok,
+note   5:marker_val, 6:sem_val, 7:budget, 8:seat_gen, 9:epoch,
+note   10:giveup, 11:lseen, 12:insns, 13:gpr_rounded, 14:code_bytes, 15:lease_live
+global rg_seat ulong 16
+
+note Heartbeat block (16 u32 words = 64 bytes, indexed by word = offset / 4):
+note   [0]=hb_count, [1]=status, [2]=HOLD(8), [3]=HELD(12), [4]=LIVE(16),
+note   [5]=T_PICK(20), [6]=T_DONE(24), [7]=CLAIM(28), [8]=LEASE(32), [9]=BUDGET(36)
+global rg_hb ulong 16
+
+note SeatArgs packed as 9 u32 words:
+note   [0]=region_lo, [1]=region_hi, [2]=seat_gen, [3]=epoch,
+note   [4]=off_c2g, [5]=off_g2c, [6]=off_hb, [7]=off_tbl, [8]=giveup
+global rg_args ulong 9
+
+note QMD config summary (8 ulongs):
+note   [0]=code_va, [1]=cbank_va, [2]=scratch_va, [3]=sem_va,
+note   [4]=qmd0_va, [5]=qmd1_va, [6]=threads_x, [7]=gpr_count
+global rg_qmd ulong 8
+
+note Scratch buffer for CRC sealer parity check (124 bytes = 0x3C + 64)
+global rg_crc_tmp uchar 128
+
+fn rx_gpu_crc_bitwise buf view uchar * n ulong to ulong
+  c = COH_U32_MASK
+  for i ulong n bound 256
+    c = xor c ulong get buf i
+    for b ulong 8
+      if ne and c 1 0
+        c = xor RX_GPU_CRC_POLY shr c 1
+      else
+        c = shr c 1
+      end
+    end
+  end
+  ret xor c COH_U32_MASK
+end
+
+fn rx_gpu_crc_matches_sealer to ulong
+  d = new uchar 128 0
+  coh_put_u32 d 0 COH_MAGIC
+  coh_put_u16 d 4 COH_ABI_VER
+  coh_put_u16 d 6 COH_RING_CLAIM
+  coh_put_u32 d 24 3
+  coh_put_u32 d 28 1
+  coh_put_u32 d 32 64
+  coh_put_u32 d 36 24
+  coh_put_u32 d 44 9
+  put d 64 4
+  put d 67 1
+  put d 80 7
+  rx_world_seal_descriptor d
+  want = coh_get_u32 d 60
+  tmp = new uchar 124 0
+  for i ulong 60
+    put tmp i get d i
+  end
+  for i ulong 64
+    put tmp add 60 i get d add 64 i
+  end
+  got = rx_gpu_crc_bitwise tmp 124
+  if eq got want
+    ret 1
+  end
+  ret 0
+end
+
+fn rx_gpu_gpr_round peak ulong to ulong
+  g = and add add peak 2 15 not ulong 15
+  if lt g 32
+    g = 32
+  end
+  ret g
+end
+
+fn rx_gpu_lease_budget live_a ulong live_b ulong to ulong
+  passes = ulong 0
+  if gt live_a live_b
+    passes = sub live_a live_b
+  end
+  b = mul passes div RX_GPU_LEASE_WINDOW_MS RX_GPU_LEASE_SAMPLE_MS
+  if lt b RX_GPU_LEASE_MIN_BUDGET
+    b = RX_GPU_LEASE_MIN_BUDGET
+  end
+  if gt b RX_GPU_GIVEUP
+    b = RX_GPU_GIVEUP
+  end
+  ret b
+end
+
+fn rx_gpu_u32_le_get buf view uchar * off ulong to ulong
+  b0 = ulong get buf off
+  b1 = ulong get buf add off 1
+  b2 = ulong get buf add off 2
+  b3 = ulong get buf add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn rx_gpu_u32_le_put buf edit uchar * off ulong v ulong to void
+  put buf off uchar and v 255
+  put buf add off 1 uchar and shr v 8 255
+  put buf add off 2 uchar and shr v 16 255
+  put buf add off 3 uchar and shr v 24 255
+end
+
+fn rx_gpu_ctl_for_opc opc ulong to ulong
+  if eq opc RX_OPC_S2R
+    ret RX_CTL_READ
+  end
+  if eq opc RX_OPC_LDC
+    ret RX_CTL_READ
+  end
+  if eq opc RX_OPC_LDCU
+    ret RX_CTL_READ
+  end
+  if eq opc RX_OPC_LDG
+    ret RX_CTL_READ
+  end
+  if eq opc RX_OPC_STG
+    ret RX_CTL_STORE
+  end
+  ret RX_CTL_FIXED
+end
+
+fn rx_gpu_seat_scoreboard code edit uchar * bytes ulong to void
+  n_ins = div bytes 16
+  for i ulong n_ins bound 1024
+    base = mul i 16
+    w0 = rx_gpu_u32_le_get code base
+    w3 = rx_gpu_u32_le_get code add base 12
+    ctl = rx_gpu_ctl_for_opc and w0 RX_OPC_MASK
+    nw3 = or and w3 not RX_CTL_MASK ctl
+    rx_gpu_u32_le_put code add base 12 nw3
+  end
+end
+
+fn rx_gpu_first_is_lane_check code view uchar * bytes ulong to ulong
+  if lt bytes 48
+    ret 0
+  end
+  o0 = and rx_gpu_u32_le_get code 0 RX_OPC_MASK
+  o1 = and rx_gpu_u32_le_get code 16 RX_OPC_MASK
+  o2 = and rx_gpu_u32_le_get code 32 RX_OPC_MASK
+  if ne o0 RX_OPC_S2R
+    ret 0
+  end
+  if and ne o1 RX_OPC_ISETP_I ne o1 RX_OPC_ISETP_R
+    ret 0
+  end
+  if ne o2 RX_OPC_BRA
+    ret 0
+  end
+  ret 1
+end
+
+fn rx_gpu_pack_seat_args region ulong sgen ulong epoch ulong to void
+  put rg_args 0 and region COH_U32_MASK
+  put rg_args 1 and shr region 32 COH_U32_MASK
+  put rg_args 2 sgen
+  put rg_args 3 epoch
+  put rg_args 4 rx_world_off_c2g
+  put rg_args 5 rx_world_off_g2c
+  put rg_args 6 rx_world_off_heartbeat
+  put rg_args 7 rx_world_off_object_table
+  put rg_args 8 RX_GPU_GIVEUP
+end
+
+fn rx_gpu_qmd_check code_va ulong cbank_va ulong qmd0_va ulong qmd1_va ulong gpr ulong to long
+  if or eq code_va 0 eq cbank_va 0
+    ret -1
+  end
+  if or ne and code_va 255 0 ne and qmd0_va 255 0
+    ret -1
+  end
+  if or ne and qmd1_va 255 0 ne and cbank_va 255 0
+    ret -1
+  end
+  if or lt gpr 32 gt gpr 256
+    ret -1
+  end
+  put rg_qmd 0 code_va
+  put rg_qmd 1 cbank_va
+  put rg_qmd 2 add qmd0_va 16384
+  put rg_qmd 3 add cbank_va 4128
+  put rg_qmd 4 qmd0_va
+  put rg_qmd 5 qmd1_va
+  put rg_qmd 6 1
+  put rg_qmd 7 gpr
+  ret 0
+end
+
+note ---- Public lifecycle API (CPU-only host model, never opens /dev/nvidia*) ----
+
+fn rx_gpu_seat_begin code edit uchar * code_bytes ulong peak_gpr ulong to long
+  if eq get coh_w 0 0
+    ret -1
+  end
+  if eq get coh_w 2 0
+    ret -1
+  end
+  if eq rx_gpu_crc_matches_sealer 0
+    ret -1
+  end
+  if or lt code_bytes 48 gt code_bytes RX_GPU_CODE_CAP
+    ret -1
+  end
+  rx_gpu_seat_scoreboard code code_bytes
+  if eq rx_gpu_first_is_lane_check code code_bytes 0
+    ret -1
+  end
+  gpr = rx_gpu_gpr_round peak_gpr
+  if ne rx_gpu_qmd_check 4096 8192 16384 20480 gpr 0
+    ret -1
+  end
+  for i ulong 16
+    put rg_seat i 0
+    put rg_hb i 0
+  end
+  sgen = get coh_w 3
+  ep = get coh_w 1
+  rx_gpu_pack_seat_args 1048576 sgen ep
+  put rg_seat 0 1
+  put rg_seat 2 1
+  put rg_seat 7 RX_GPU_LEASE_MIN_BUDGET
+  put rg_seat 8 sgen
+  put rg_seat 9 ep
+  put rg_seat 10 RX_GPU_GIVEUP
+  put rg_seat 12 div code_bytes 16
+  put rg_seat 13 gpr
+  put rg_seat 14 code_bytes
+  put rg_seat 15 1
+  put rg_hb 0 1
+  put rg_hb 4 RX_GPU_GIVEUP
+  put rg_hb 9 RX_GPU_LEASE_MIN_BUDGET
+  ret 0
+end
+
+note Simulate one pass of the resident GPU seat polling loop (CPU-only).
+note Returns: 0=idle/held, 1=processed claim (publish or fault), 2=clean exit (shutdown/lease quit/giveup), -1=not live
+fn rx_gpu_seat_step tick_ns ulong to long
+  if or eq get rg_seat 0 0 ne get rg_seat 1 0
+    ret -1
+  end
+  if ne get rg_seat 3 0
+    ret 2
+  end
+  g = get rg_seat 10
+  if eq g 0
+    put rg_seat 3 1
+    put rg_seat 4 1
+    put rg_seat 5 RX_MARKER_DONE
+    put rg_seat 6 RX_SEM_DONE
+    ret 2
+  end
+  g = sub g 1
+  put rg_seat 10 g
+  put rg_hb 4 g
+  note Lease check
+  ls = get rg_hb 8
+  if ne ls get rg_seat 11
+    put rg_seat 11 ls
+    if eq ls RX_SEAT_LEASE_QUIT
+      put rg_seat 3 1
+      put rg_seat 4 1
+      put rg_seat 5 RX_MARKER_DONE
+      put rg_seat 6 RX_SEM_DONE
+      ret 2
+    end
+    bd = get rg_hb 9
+    if gt bd 0
+      put rg_seat 10 bd
+    else
+      put rg_seat 10 RX_GPU_GIVEUP
+    end
+  end
+  note Poll c2g ring
+  head = get coh_w 5
+  tail = get coh_w 6
+  put rg_hb 0 add tail 1
+  if ge head tail
+    ret 0
+  end
+  note Hold check
+  if ne get rg_hb 2 0
+    put rg_hb 3 add head 1
+    ret 0
+  end
+  put rg_hb 1 9
+  put rg_hb 7 head
+  put rg_hb 5 and tick_ns COH_U32_MASK
+  note Delegate claim/shutdown processing to rx_coherent.om resident step
+  d = new uchar 128 0
+  coh_ring_read_c2g and head COH_RING_MASK d
+  mt = coh_get_u16 d 6
+  if eq mt COH_RING_SHUTDOWN
+    put coh_w 5 add head 1
+    put rg_seat 3 1
+    put rg_seat 4 1
+    put rg_seat 5 RX_MARKER_DONE
+    put rg_seat 6 RX_SEM_DONE
+    ret 2
+  end
+  ign_s = rx_resident_seat_step
+  put rg_hb 6 and add tick_ns 100 COH_U32_MASK
+  ret 1
+end
+
+fn rx_gpu_seat_kill to long
+  if or eq get rg_seat 0 0 ne get rg_seat 1 0
+    ret -1
+  end
+  put rg_seat 15 0
+  if ne get rg_seat 2 0
+    put rg_hb 8 RX_SEAT_LEASE_QUIT
+  end
+  put rg_seat 1 1
+  ret 0
+end
+
+fn rx_gpu_seat_relaunch to long
+  if or eq get rg_seat 0 0 eq get rg_seat 1 0
+    ret -1
+  end
+  if eq get rg_seat 2 0
+    ret -1
+  end
+  put rg_seat 1 0
+  put rg_seat 3 0
+  put rg_seat 4 0
+  put rg_seat 5 0
+  put rg_seat 6 0
+  put rg_seat 11 0
+  put rg_seat 10 RX_GPU_GIVEUP
+  sgen = get coh_w 3
+  put rg_seat 8 sgen
+  put rg_args 2 sgen
+  for i ulong 16
+    put rg_hb i 0
+  end
+  put rg_hb 0 1
+  put rg_hb 4 RX_GPU_GIVEUP
+  put rg_hb 9 get rg_seat 7
+  put rg_seat 15 1
+  ret 0
+end
+
+fn rx_gpu_seat_finish_ex leave edit ulong 4 has_leave ulong to long
+  if eq get rg_seat 0 0
+    ret -1
+  end
+  put rg_seat 15 0
+  mok = get rg_seat 3
+  sok = get rg_seat 4
+  if ne has_leave 0
+    put leave 0 mok
+    put leave 1 sok
+    put leave 2 get rg_seat 5
+    put leave 3 get rg_seat 6
+  end
+  ok = ulong 0
+  if or ne get rg_seat 1 0 and ne mok 0 ne sok 0
+    ok = 1
+  end
+  put rg_seat 2 0
+  put rg_seat 0 0
+  if ne ok 0
+    ret 0
+  end
+  ret -1
+end
+
+fn rx_gpu_seat_finish to long
+  dummy = new ulong 4 0
+  ret rx_gpu_seat_finish_ex dummy 0
+end

@@ -1,0 +1,169 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_resident_gpu_unit.om -- CPU-only pure seeded OM-2 unit/contract test
+note for src/runtime/rx_resident_gpu.om (ZERO /dev/nvidia* access).
+note Verifies CRC32C sealer parity, SM121 scoreboard patching, lane-check validation,
+note GPR rounding, lease budget math, QMD invariants, claim/publish/hold/shutdown step,
+note kill/relaunch/finish_ex lifecycle.
+
+global rgu_checks ulong 1
+global rgu_fail ulong 1
+
+text rgu_pass "RX_RESIDENT_GPU_OM: PASS\n"
+text rgu_fail_m "RX_RESIDENT_GPU_OM: FAIL\n"
+
+fn rgu_chk cond bool to void
+  put rgu_checks 0 add get rgu_checks 0 1
+  if not cond
+    if eq get rgu_fail 0 0
+      put rgu_fail 0 get rgu_checks 0
+    end
+  end
+end
+
+fn rgu_build_valid_code dst edit uchar 64 to void
+  for i ulong 64
+    put dst i 0
+  end
+  note Insn 0: S2R (0x919), Insn 1: ISETP_I (0x80c), Insn 2: BRA (0x947), Insn 3: STG (0x986)
+  rx_gpu_u32_le_put dst 0 RX_OPC_S2R
+  rx_gpu_u32_le_put dst 16 RX_OPC_ISETP_I
+  rx_gpu_u32_le_put dst 32 RX_OPC_BRA
+  rx_gpu_u32_le_put dst 48 RX_OPC_STG
+end
+
+fn rgu_test_helpers to void
+  rgu_chk eq rx_gpu_crc_matches_sealer 1
+  rgu_chk eq rx_gpu_gpr_round 10 32
+  rgu_chk eq rx_gpu_gpr_round 30 32
+  rgu_chk eq rx_gpu_gpr_round 31 48
+  rgu_chk eq rx_gpu_gpr_round 46 48
+  rgu_chk eq rx_gpu_gpr_round 47 64
+
+  note Lease budget clamping and scaling (2000 / 50 = 40x)
+  rgu_chk eq rx_gpu_lease_budget 1000 1000 RX_GPU_LEASE_MIN_BUDGET
+  rgu_chk eq rx_gpu_lease_budget 5000 4000 40000
+  rgu_chk eq rx_gpu_lease_budget 200000000 0 RX_GPU_GIVEUP
+
+  note Scoreboard & lane-check validation
+  code = new uchar 64 0
+  rgu_build_valid_code code
+  rgu_chk eq rx_gpu_first_is_lane_check code 64 1
+  rgu_chk eq rx_gpu_first_is_lane_check code 32 0
+  rx_gpu_seat_scoreboard code 64
+  rgu_chk eq and rx_gpu_u32_le_get code 12 RX_CTL_MASK RX_CTL_READ
+  rgu_chk eq and rx_gpu_u32_le_get code 28 RX_CTL_MASK RX_CTL_FIXED
+  rgu_chk eq and rx_gpu_u32_le_get code 44 RX_CTL_MASK RX_CTL_FIXED
+  rgu_chk eq and rx_gpu_u32_le_get code 60 RX_CTL_MASK RX_CTL_STORE
+
+  note Negative control: corrupt insn 0 opcode -> lane check fails
+  rx_gpu_u32_le_put code 0 RX_OPC_STG
+  rgu_chk eq rx_gpu_first_is_lane_check code 64 0
+end
+
+fn rgu_test_lifecycle_and_ring to void
+  code = new uchar 64 0
+  rgu_build_valid_code code
+
+  note World not formatted -> begin refused
+  put coh_w 0 0
+  rgu_chk eq rx_gpu_seat_begin code 64 40 -1
+
+  note Initialize coherent world, enable resident seat, place objects 1 (input) and 2 (output)
+  rgu_chk eq rx_coherent_format COH_OK
+  rgu_chk eq rx_world_enable_resident COH_OK
+  note Set up canonical objects 1 and 2 (live=1, gen=1, cap_valid=1) and attach physical windows
+  ob1 = ulong 12
+  put coh_obj ob1 1
+  put coh_obj add ob1 1 1
+  put coh_obj add ob1 9 1
+  put coh_fld add mul 1 COH_MAX_FIELDS 0 17
+  put coh_fld add mul 1 COH_MAX_FIELDS 1 25
+  rgu_chk eq rx_world_attach_physical 1 1 COH_OK
+  ob2 = ulong 24
+  put coh_obj ob2 1
+  put coh_obj add ob2 1 1
+  put coh_obj add ob2 9 1
+  rgu_chk eq rx_world_attach_physical 2 1 COH_OK
+
+  note Begin seat
+  rgu_chk eq rx_gpu_seat_begin code 64 40 0
+  rgu_chk eq get rg_seat 0 1
+  rgu_chk eq get rg_seat 2 1
+  rgu_chk eq get rg_seat 13 48
+  rgu_chk eq get rg_args 4 rx_world_off_c2g
+  rgu_chk eq get rg_args 5 rx_world_off_g2c
+  rgu_chk eq get rg_args 6 rx_world_off_heartbeat
+  rgu_chk eq get rg_args 7 rx_world_off_object_table
+
+  note Idle step with empty ring returns 0 and decrements LIVE
+  rgu_chk eq rx_gpu_seat_step 1000 0
+  rgu_chk eq get rg_hb 4 sub RX_GPU_GIVEUP 1
+
+  note Enqueue a claim (A=1 -> B=2), test HOLD then release and verify sum 17+25=42
+  rgu_chk eq rx_resident_post_claim 1 2 0 COH_OK
+  put rg_hb 2 1
+  rgu_chk eq rx_gpu_seat_step 2000 0
+  rgu_chk eq get rg_hb 3 1
+  put rg_hb 2 0
+  rgu_chk eq rx_gpu_seat_step 3000 1
+  rgu_chk eq get rg_hb 5 3000
+  rgu_chk eq get rg_hb 6 3100
+  resd = new uchar 128 0
+  rgu_chk eq rx_resident_take_result resd COH_OK
+  rgu_chk eq get coh_fld add mul 2 COH_MAX_FIELDS 0 42
+
+  note Kill and relaunch with bumped seat_generation
+  rgu_chk eq rx_gpu_seat_kill 0
+  rgu_chk eq get rg_seat 1 1
+  rgu_chk eq get rg_hb 8 RX_SEAT_LEASE_QUIT
+  rgu_chk eq rx_gpu_seat_kill -1
+  put coh_w 3 add get coh_w 3 1
+  rgu_chk eq rx_gpu_seat_relaunch 0
+  rgu_chk eq get rg_seat 1 0
+  rgu_chk eq get rg_seat 8 get coh_w 3
+  rgu_chk eq get rg_args 2 get coh_w 3
+
+  note Lease quit causes clean marker+sem completion, verified by finish_ex
+  put rg_hb 8 RX_SEAT_LEASE_QUIT
+  rgu_chk eq rx_gpu_seat_step 4000 2
+  lv = new ulong 4 0
+  rgu_chk eq rx_gpu_seat_finish_ex lv 1 0
+  rgu_chk eq get lv 0 1
+  rgu_chk eq get lv 1 1
+  rgu_chk eq get lv 2 RX_MARKER_DONE
+  rgu_chk eq get lv 3 RX_SEM_DONE
+  rgu_chk eq get rg_seat 0 0
+
+  note Second begin + kill + finish (killed seat still finishes cleanly)
+  rgu_chk eq rx_gpu_seat_begin code 64 30 0
+  rgu_chk eq rx_gpu_seat_kill 0
+  rgu_chk eq rx_gpu_seat_finish 0
+end
+
+fn rgu_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len rgu_pass
+    for i ulong n bound 64
+      put buf i get rgu_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len rgu_fail_m
+  for i ulong n bound 64
+    put buf i get rgu_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  rgu_test_helpers
+  rgu_test_lifecycle_and_ring
+  if ne get rgu_fail 0 0
+    rgu_put_msg 0
+    ret int get rgu_fail 0
+  end
+  rgu_put_msg 1
+  ret 0
+end

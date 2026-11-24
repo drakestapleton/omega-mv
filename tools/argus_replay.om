@@ -1,0 +1,447 @@
+note SPDX-License-Identifier: Apache-2.0
+note tools/argus_replay.om -- Pure seeded OM-2 port of tools/argus_replay.c.
+note Composes seed/ng/sha256.om + src/runtime/rx_argus.om.
+note Replays a raw 128-byte-record ARGUS runtime stream into a fresh rx_argus.om
+note core twice, computes per-kind counts, findings, SHA-256 chain & state digests,
+note and verifies deterministic replay.
+note
+note Usage:
+note   argus_replay_om --self-test    run built-in end-to-end replay & determinism verification
+note   argus_replay_om FILE           replay raw 128-byte record stream FILE twice
+
+const ARP_EVENT_SIZE ulong 128
+const ARP_ABI_VERSION ulong 1
+const ARP_F_MAX ulong 16
+const ARP_MAX_RECS ulong 512
+const ARP_STREAM_CAP ulong 65536
+
+note Raw stream buffer (up to 64 KiB = 512 records)
+global arp_stream uchar 65536
+global arp_slen ulong 1
+
+note Decoded event scratch (12 ulongs):
+note   0:kind, 1:class, 2:outcome, 3:flags, 4:code, 5:seq,
+note   6:principal, 7:cap_id, 8:cap_gen, 9:resource, 10:world_gen, 11:tick
+global arp_ev ulong 12
+
+note Replay pass A and B summaries:
+note   0:events, 1:decode_fail, 2:findings, 3:received, 4:late_events
+global arp_sum_a ulong 8
+global arp_sum_b ulong 8
+global arp_kind_a ulong 16
+global arp_kind_b ulong 16
+global arp_code_a ulong 16
+global arp_code_b ulong 16
+global arp_state_a uchar 32
+global arp_state_b uchar 32
+global arp_chain_a uchar 32
+global arp_chain_b uchar 32
+global arp_chain_cur uchar 32
+
+text arp_run_tag "argus-replay-om2"
+text arp_flag_st "--self-test"
+text arp_msg_pass "ARGUS_REPLAY_OM: PASS\n"
+text arp_msg_fail "ARGUS_REPLAY_OM: FAIL\n"
+text arp_msg_det_yes "deterministic replay: yes\n"
+text arp_msg_det_no "deterministic replay: NO\n"
+text arp_msg_usage "usage: argus_replay FILE | --self-test\n"
+
+fn arp_get_u16 off ulong to ulong
+  b0 = ulong get arp_stream off
+  b1 = ulong get arp_stream add off 1
+  ret or b0 shl b1 8
+end
+
+fn arp_get_u32 off ulong to ulong
+  b0 = ulong get arp_stream off
+  b1 = ulong get arp_stream add off 1
+  b2 = ulong get arp_stream add off 2
+  b3 = ulong get arp_stream add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn arp_get_u64 off ulong to ulong
+  lo = arp_get_u32 off
+  hi = arp_get_u32 add off 4
+  ret or lo shl hi 32
+end
+
+fn arp_put_u16 off ulong v ulong to void
+  put arp_stream off uchar and v 255
+  put arp_stream add off 1 uchar and shr v 8 255
+end
+
+fn arp_put_u32 off ulong v ulong to void
+  put arp_stream off uchar and v 255
+  put arp_stream add off 1 uchar and shr v 8 255
+  put arp_stream add off 2 uchar and shr v 16 255
+  put arp_stream add off 3 uchar and shr v 24 255
+end
+
+fn arp_put_u64 off ulong v ulong to void
+  arp_put_u32 off and v 4294967295
+  arp_put_u32 add off 4 and shr v 32 4294967295
+end
+
+fn arp_encode_hdr idx ulong kind ulong outc ulong code ulong seq ulong subj ulong to void
+  base = mul idx ARP_EVENT_SIZE
+  for i ulong ARP_EVENT_SIZE
+    put arp_stream add base i 0
+  end
+  arp_put_u32 base ARP_ABI_VERSION
+  arp_put_u16 add base 4 kind
+  arp_put_u16 add base 6 1
+  arp_put_u16 add base 8 outc
+  arp_put_u16 add base 10 4
+  arp_put_u32 add base 12 code
+  arp_put_u64 add base 16 seq
+  arp_put_u32 add base 24 subj
+end
+
+fn arp_encode_body idx ulong cap_id ulong cap_gen ulong res ulong wgen ulong tick ulong to void
+  base = mul idx ARP_EVENT_SIZE
+  arp_put_u32 add base 28 cap_id
+  arp_put_u64 add base 32 cap_gen
+  arp_put_u64 add base 40 res
+  arp_put_u64 add base 48 wgen
+  arp_put_u64 add base 64 tick
+end
+
+fn arp_decode_rec base ulong to long
+  ver = arp_get_u32 base
+  if ne ver ARP_ABI_VERSION
+    ret -1
+  end
+  knd = arp_get_u16 add base 4
+  if or eq knd 0 gt knd AR_EV_KIND_MAX
+    ret -1
+  end
+  outc = arp_get_u16 add base 8
+  if gt outc AR_OUTCOME_ERROR
+    ret -1
+  end
+  rsv = arp_get_u32 add base 60
+  if ne rsv 0
+    ret -1
+  end
+  put arp_ev 0 knd
+  put arp_ev 1 arp_get_u16 add base 6
+  put arp_ev 2 outc
+  put arp_ev 3 arp_get_u16 add base 10
+  put arp_ev 4 arp_get_u32 add base 12
+  put arp_ev 5 arp_get_u64 add base 16
+  put arp_ev 6 arp_get_u32 add base 24
+  put arp_ev 7 arp_get_u32 add base 28
+  put arp_ev 8 arp_get_u64 add base 32
+  put arp_ev 9 arp_get_u64 add base 40
+  put arp_ev 10 arp_get_u64 add base 48
+  put arp_ev 11 arp_get_u64 add base 64
+  ret 0
+end
+
+fn arp_chain_step base ulong to void
+  for i ulong 32
+    put sh_dat i get arp_chain_cur i
+  end
+  for i ulong ARP_EVENT_SIZE
+    put sh_dat add 32 i get arp_stream add base i
+  end
+  sh_all 160
+  for i ulong 32
+    put arp_chain_cur i get sh_dig i
+  end
+end
+
+fn arp_ingest_decoded to void
+  knd = get arp_ev 0
+  code = get arp_ev 4
+  subj = get arp_ev 6
+  cap_id = get arp_ev 7
+  cap_gen = get arp_ev 8
+  res = get arp_ev 9
+  wgen = get arp_ev 10
+  tick = get arp_ev 11
+  if eq knd AR_EV_GRANTED
+    rx_argus_emit_cap_granted subj cap_id cap_gen res 3 code
+    ign_m = rx_argus_merge 0
+    ret
+  end
+  if eq knd AR_EV_REVOKED
+    rx_argus_emit_cap_revoked tick subj cap_id cap_gen code
+    ign_m = rx_argus_merge 0
+    ret
+  end
+  if eq knd AR_EV_DENIED
+    rx_argus_emit_cap_denied subj cap_id cap_gen res 0 code
+    ign_m = rx_argus_merge 0
+    ret
+  end
+  if eq knd AR_EV_WORLD_COMMITTED
+    rx_argus_emit_world_committed 1 subj cap_id cap_gen wgen code
+    ign_m = rx_argus_merge 0
+    ret
+  end
+  if or eq knd AR_EV_USED eq knd AR_EV_USE_SUMMARY
+    k = rx_argus_use_begin
+    rx_argus_use_end k subj cap_id cap_gen res code
+    rx_argus_idle
+    ign_m = rx_argus_merge 0
+  end
+end
+
+fn arp_put_sh64 pos ulong v ulong to ulong
+  for b ulong 8
+    put sh_dat add pos b uchar and shr v mul b 8 255
+  end
+  ret add pos 8
+end
+
+fn arp_compute_state_digest evs ulong dfail ulong fnds ulong to void
+  pos = ulong 0
+  pos = arp_put_sh64 pos evs
+  pos = arp_put_sh64 pos dfail
+  pos = arp_put_sh64 pos fnds
+  for k ulong 9
+    pos = arp_put_sh64 pos get ar_recv_by_kind k
+  end
+  for c ulong 256
+    pos = arp_put_sh64 pos get ar_cap_state c
+  end
+  for i ulong 32
+    put sh_dat add pos i get arp_chain_cur i
+  end
+  pos = add pos 32
+  sh_all pos
+end
+
+fn arp_replay_pass nbytes ulong pass_idx ulong to long
+  ign_s = rx_argus_start AR_CONS_INGEST arp_run_tag len arp_run_tag
+  for i ulong 32
+    put arp_chain_cur i 0
+  end
+  for i ulong 16
+    if eq pass_idx 0
+      put arp_kind_a i 0
+      put arp_code_a i 0
+    else
+      put arp_kind_b i 0
+      put arp_code_b i 0
+    end
+  end
+  evs = ulong 0
+  dfail = ulong 0
+  nrecs = div nbytes ARP_EVENT_SIZE
+  for r ulong nrecs bound 512
+    base = mul r ARP_EVENT_SIZE
+    if ne arp_decode_rec base 0
+      dfail = add dfail 1
+    else
+      evs = add evs 1
+      knd = get arp_ev 0
+      if eq pass_idx 0
+        put arp_kind_a knd add get arp_kind_a knd 1
+      else
+        put arp_kind_b knd add get arp_kind_b knd 1
+      end
+      arp_chain_step base
+      arp_ingest_decoded
+    end
+  end
+  rx_argus_shutdown
+  rx_argus_stats
+  fnds = get ar_stats_buf 10
+  for i ulong fnds bound 64
+    fc = get ar_findings mul i 6
+    if lt fc ARP_F_MAX
+      if eq pass_idx 0
+        put arp_code_a fc add get arp_code_a fc 1
+      else
+        put arp_code_b fc add get arp_code_b fc 1
+      end
+    end
+  end
+  arp_compute_state_digest evs dfail fnds
+  if eq pass_idx 0
+    put arp_sum_a 0 evs
+    put arp_sum_a 1 dfail
+    put arp_sum_a 2 fnds
+    put arp_sum_a 3 get ar_stats_buf 9
+    put arp_sum_a 4 get ar_stats_buf 11
+    for i ulong 32
+      put arp_state_a i get sh_dig i
+      put arp_chain_a i get arp_chain_cur i
+    end
+  else
+    put arp_sum_b 0 evs
+    put arp_sum_b 1 dfail
+    put arp_sum_b 2 fnds
+    put arp_sum_b 3 get ar_stats_buf 9
+    put arp_sum_b 4 get ar_stats_buf 11
+    for i ulong 32
+      put arp_state_b i get sh_dig i
+      put arp_chain_b i get arp_chain_cur i
+    end
+  end
+  ret 0
+end
+
+fn arp_check_deterministic to ulong
+  if ne get arp_sum_a 2 get arp_sum_b 2
+    ret 0
+  end
+  for i ulong 32
+    if ne get arp_state_a i get arp_state_b i
+      ret 0
+    end
+    if ne get arp_chain_a i get arp_chain_b i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn arp_write_text s view uchar * to void
+  n = len s
+  buf = new uchar 64 0
+  for i ulong n bound 64
+    put buf i get s i
+  end
+  ign_w = write 1 buf 0 n
+end
+
+fn arp_write_hex32 to void
+  buf = new uchar 66 0
+  for i ulong 32
+    b = uint get arp_state_a i
+    put buf mul i 2 sh_hexd shr b 4
+    put buf add mul i 2 1 sh_hexd and b 15
+  end
+  put buf 64 10
+  ign_w = write 1 buf 0 65
+end
+
+fn arp_run_self_test to int
+  note Build a 6-record stream (768 bytes):
+  note   0: GRANTED cap 5 gen 10
+  note   1: USED cap 5 gen 10 (ok)
+  note   2: WORLD_COMMITTED cap 5 wgen 2
+  note   3: REVOKED cap 5 gen 10
+  note   4: USED cap 5 gen 10 (use-after-revoke -> finding code 1)
+  note   5: malformed record (version=99 -> decode_fail)
+  arp_encode_hdr 0 AR_EV_GRANTED AR_OUTCOME_OK 0 1 7
+  arp_encode_body 0 5 10 999 0 100
+  arp_encode_hdr 1 AR_EV_USED AR_OUTCOME_OK 0 2 7
+  arp_encode_body 1 5 10 999 0 110
+  arp_encode_hdr 2 AR_EV_WORLD_COMMITTED AR_OUTCOME_OK 0 3 7
+  arp_encode_body 2 5 10 999 2 120
+  arp_encode_hdr 3 AR_EV_REVOKED AR_OUTCOME_OK 0 4 7
+  arp_encode_body 3 5 10 999 0 130
+  arp_encode_hdr 4 AR_EV_USED AR_OUTCOME_OK 0 5 7
+  arp_encode_body 4 5 10 999 0 140
+  arp_encode_hdr 5 AR_EV_USED AR_OUTCOME_OK 0 6 7
+  arp_encode_body 5 5 10 999 0 150
+  arp_put_u32 mul 5 ARP_EVENT_SIZE 99
+
+  nbytes = mul 6 ARP_EVENT_SIZE
+  ign_a = arp_replay_pass nbytes 0
+  ign_b = arp_replay_pass nbytes 1
+  if ne get arp_sum_a 0 5
+    arp_write_text arp_msg_fail
+    ret 1
+  end
+  if ne get arp_sum_a 1 1
+    arp_write_text arp_msg_fail
+    ret 2
+  end
+  if ne get arp_sum_a 2 1
+    arp_write_text arp_msg_fail
+    ret 3
+  end
+  if ne get arp_code_a 1 1
+    arp_write_text arp_msg_fail
+    ret 4
+  end
+  if ne arp_check_deterministic 1
+    arp_write_text arp_msg_fail
+    ret 5
+  end
+  note Negative control: mutate 1 byte of state_b -> determinism check must fail
+  put arp_state_b 0 xor get arp_state_b 0 1
+  if ne arp_check_deterministic 0
+    arp_write_text arp_msg_fail
+    ret 6
+  end
+  arp_write_text arp_msg_pass
+  ret 0
+end
+
+fn arp_eq_self_test buf view uchar * n ulong to ulong
+  m = len arp_flag_st
+  if ne n m
+    ret 0
+  end
+  for i ulong m bound 32
+    if ne get buf i get arp_flag_st i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn arp_append_chunk tmp view uchar 4096 rn ulong to void
+  tot = get arp_slen 0
+  for i ulong rn bound 4096
+    if lt tot ARP_STREAM_CAP
+      put arp_stream tot get tmp i
+      tot = add tot 1
+    end
+  end
+  put arp_slen 0 tot
+end
+
+fn arp_read_file path view uchar * plen ulong to long
+  fdl = fopen path 0 plen 0 0
+  if lt fdl 0
+    ret -1
+  end
+  fd = int fdl
+  put arp_slen 0 0
+  tmp = new uchar 4096 0
+  keep = ulong 1
+  while ne keep 0 bound 64
+    rd = read fd tmp 0 4096
+    if le rd 0
+      keep = 0
+    else
+      arp_append_chunk tmp ulong rd
+    end
+  end
+  ign_c = fclose fd
+  ret 0
+end
+
+fn main to int
+  arg1 = new uchar 256 0
+  al = argread ulong 1 arg1 0 256
+  if le al 0
+    arp_write_text arp_msg_usage
+    ret 2
+  end
+  if eq arp_eq_self_test arg1 ulong al 1
+    ret arp_run_self_test
+  end
+  if ne arp_read_file arg1 ulong al 0
+    arp_write_text arp_msg_usage
+    ret 2
+  end
+  nbytes = get arp_slen 0
+  ign_a = arp_replay_pass nbytes 0
+  ign_b = arp_replay_pass nbytes 1
+  arp_write_hex32
+  if eq arp_check_deterministic 1
+    arp_write_text arp_msg_det_yes
+    ret 0
+  end
+  arp_write_text arp_msg_det_no
+  ret 1
+end
