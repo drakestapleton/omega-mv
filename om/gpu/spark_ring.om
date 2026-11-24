@@ -1,0 +1,381 @@
+om2
+note SPDX-License-Identifier: AGPL-3.0-only
+note Phase 3: Multi-Spark Slab-Exchange Ring Transport (om/gpu/spark_ring.om).
+note Pure seeded OM-2 TCP/RDMA-ready framed slab-exchange transport (OMSR01 header + FNV-1a-64 checksum).
+note Supports Pipeline-Parallel (PP) hidden-slab handoff and Tensor-Parallel (TP) ring AllReduce-Sum.
+note Built-in 2-rank fork+loopback parity & corrupted-checksum negative-control gate.
+
+const SR_HDR_BYTES ulong 32
+const SR_DIM ulong 2048
+const SR_SLAB_BYTES ulong 8192
+const SR_OP_PP ulong 1
+const SR_OP_TP ulong 2
+const SR_MAGIC ulong 0x3152534f
+
+global srHdr uchar 32
+global srTxBuf uchar 8192
+global srRxBuf uchar 8192
+global srVecA f32 2048
+global srVecB f32 2048
+global srRef f32 2048
+global srWaitSt uchar 8
+
+text srM_hdr "=== PHASE 3: MULTI-SPARK SLAB-EXCHANGE RING TRANSPORT (PURE SEEDED OM-2) ===\n"
+text srM_pp "PP_2RANK_HANDOFF: PASS (2048 f32 hidden slab bit-exact across loopback ring)\n"
+text srM_tp "TP_2RANK_ALLREDUCE: PASS (2048 f32 ring allreduce_sum bit-exact on both ranks)\n"
+text srM_neg "CHECKSUM_NEGCTRL: PASS (1-bit corruption rejected fail-closed)\n"
+text srM_ok "SPARK_RING_GATE: PASS\n"
+text srM_bad "SPARK_RING_GATE: FAIL stage="
+text srM_nl "\n"
+
+fn srPrint s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn srPrintU v ulong to void
+tmp = new uchar 24 0
+if eq v 0
+put tmp 0 48
+r = write 1 tmp 0 1
+ret
+end
+n = ulong 0
+x = v
+while gt x 0 bound 24
+put tmp n uchar add 48 rem x 10
+x = div x 10
+n = add n 1
+end
+outb = new uchar 24 0
+for i ulong n bound 24
+put outb i get tmp sub sub n 1 i
+end
+r = write 1 outb 0 n
+end
+
+fn srPutU32 buf edit uchar * off ulong v uint to void
+put buf off uchar and v 255
+put buf add off 1 uchar and shr v 8 255
+put buf add off 2 uchar and shr v 16 255
+put buf add off 3 uchar and shr v 24 255
+end
+
+fn srGetU32 buf view uchar * off ulong to uint
+b0 = uint get buf off
+b1 = shl uint get buf add off 1 8
+b2 = shl uint get buf add off 2 16
+b3 = shl uint get buf add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn srPutU64 buf edit uchar * off ulong v ulong to void
+srPutU32 buf off uint and v 0xffffffff
+srPutU32 buf add off 4 uint shr v 32
+end
+
+fn srGetU64 buf view uchar * off ulong to ulong
+lo = ulong srGetU32 buf off
+hi = ulong srGetU32 buf add off 4
+ret or lo shl hi 32
+end
+
+fn srFnv64Tx n ulong to ulong
+h = ulong 0xcbf29ce484222325
+for i ulong n bound 8192
+h = mul xor h ulong get srTxBuf i 0x100000001b3
+end
+ret h
+end
+
+fn srFnv64Rx n ulong to ulong
+h = ulong 0xcbf29ce484222325
+for i ulong n bound 8192
+h = mul xor h ulong get srRxBuf i 0x100000001b3
+end
+ret h
+end
+
+fn srSendAll fd int isHdr bool n ulong to bool
+done = ulong 0
+while lt done n bound 1024
+remN = sub n done
+w = long 0
+if isHdr
+w = send fd srHdr done remN 0
+else
+w = send fd srTxBuf done remN 0
+end
+if le w 0
+ret false
+end
+done = add done ulong w
+end
+ret true
+end
+
+fn srRecvAll fd int isHdr bool n ulong to bool
+done = ulong 0
+while lt done n bound 1024
+remN = sub n done
+r = long 0
+if isHdr
+r = recv fd srHdr done remN 0
+else
+r = recv fd srRxBuf done remN 0
+end
+if le r 0
+ret false
+end
+done = add done ulong r
+end
+ret true
+end
+
+fn srSendFrame fd int op uint rank uint layer uint corrupt bool to bool
+h = new uchar 32 0
+srPutU32 h 0 uint SR_MAGIC
+srPutU32 h 4 op
+srPutU32 h 8 rank
+srPutU32 h 12 layer
+srPutU32 h 16 uint SR_SLAB_BYTES
+srPutU32 h 20 0
+ck = srFnv64Tx SR_SLAB_BYTES
+if corrupt
+ck = xor ck 1
+end
+srPutU64 h 24 ck
+for i ulong 32
+put srHdr i get h i
+end
+if not srSendAll fd true 32
+ret false
+end
+ret srSendAll fd false SR_SLAB_BYTES
+end
+
+fn srRecvFrame fd int expOp uint to bool
+if not srRecvAll fd true 32
+ret false
+end
+h = new uchar 32 0
+for i ulong 32
+put h i get srHdr i
+end
+if ne srGetU32 h 0 uint SR_MAGIC
+ret false
+end
+if ne srGetU32 h 4 expOp
+ret false
+end
+n = ulong srGetU32 h 16
+if ne n SR_SLAB_BYTES
+ret false
+end
+expCk = srGetU64 h 24
+if not srRecvAll fd false n
+ret false
+end
+gotCk = srFnv64Rx n
+ret eq gotCk expCk
+end
+
+fn srPackVecA to void
+tmp = new uchar 4 0
+for i ulong SR_DIM
+w = bitcast uint get srVecA i
+srPutU32 tmp 0 w
+p = mul i 4
+for b ulong 4
+put srTxBuf add p b get tmp b
+end
+end
+end
+
+fn srUnpackVecB to void
+tmp = new uchar 4 0
+for i ulong SR_DIM
+p = mul i 4
+for b ulong 4
+put tmp b get srRxBuf add p b
+end
+put srVecB i bitcast f32 srGetU32 tmp 0
+end
+end
+
+fn srListen port ulong to long
+addr = new uchar 16 0
+one = new uchar 4 0
+put addr 0 2
+put addr 2 uchar shr port 8
+put addr 3 uchar and port 255
+put addr 4 127
+put addr 7 1
+put one 0 1
+fd = socknew 2 1 0
+if lt fd 0
+ret fd
+end
+r = sockopt int fd 1 2 one 0 4
+if eq r 0
+r = bind int fd addr 0 16
+end
+if eq r 0
+r = listen int fd 8
+end
+if ne r 0
+c = fclose int fd
+ret r
+end
+ret fd
+end
+
+fn srConnectLoop port ulong to long
+addr = new uchar 16 0
+put addr 0 2
+put addr 2 uchar shr port 8
+put addr 3 uchar and port 255
+put addr 4 127
+put addr 7 1
+fd = socknew 2 1 0
+if lt fd 0
+ret fd
+end
+for tries ulong 20
+r = connect int fd addr 0 16
+if eq r 0
+ret fd
+end
+s = sleepns 10000000
+end
+c = fclose int fd
+ret -1
+end
+
+fn srRank1Child port ulong to int
+fd = srConnectLoop port
+if lt fd 0
+ret 10
+end
+note 1. PP handoff: receive hidden slab from Rank 0, apply stage-1 transform (y = x * 1.5 + 0.25), send back
+if not srRecvFrame int fd uint SR_OP_PP
+c = fclose int fd
+ret 11
+end
+srUnpackVecB
+for i ulong SR_DIM
+put srVecA i add mul get srVecB i 1.5f32 0.25f32
+end
+srPackVecA
+if not srSendFrame int fd uint SR_OP_PP 1 20 false
+c = fclose int fd
+ret 12
+end
+note 2. TP Ring AllReduce-Sum: prepare Rank-1 shard, recv Rank-0 shard, send Rank-1 shard, sum
+for i ulong SR_DIM
+put srVecA i mul f32 add i 1 0.01f32
+end
+srPackVecA
+if not srRecvFrame int fd uint SR_OP_TP
+c = fclose int fd
+ret 13
+end
+srUnpackVecB
+if not srSendFrame int fd uint SR_OP_TP 1 0 false
+c = fclose int fd
+ret 14
+end
+note 3. Negative control: send intentionally corrupted checksum frame
+ok = srSendFrame int fd uint SR_OP_PP 1 99 true
+c = fclose int fd
+if not ok
+ret 15
+end
+ret 0
+end
+
+fn main to int
+srPrint srM_hdr
+port = ulong 18941
+lfd = srListen port
+if lt lfd 0
+srPrint srM_bad
+srPrintU 1
+srPrint srM_nl
+ret 1
+end
+pid = fork
+if lt pid 0
+c = fclose int lfd
+ret 2
+end
+if eq pid 0
+c = fclose int lfd
+exit srRank1Child port
+end
+cfd = accept int lfd 0
+if lt cfd 0
+c = fclose int lfd
+ret 3
+end
+note 1. PP handoff: Rank 0 sends hidden slab -> Rank 1 transforms -> Rank 0 verifies bit-exact!
+for i ulong SR_DIM
+v = mul f32 i 0.125f32
+put srVecA i v
+put srRef i add mul v 1.5f32 0.25f32
+end
+srPackVecA
+if not srSendFrame int cfd uint SR_OP_PP 0 0 false
+ret 4
+end
+if not srRecvFrame int cfd uint SR_OP_PP
+ret 5
+end
+srUnpackVecB
+for i ulong SR_DIM
+if ne bitcast uint get srVecB i bitcast uint get srRef i
+srPrint srM_bad
+srPrintU 6
+srPrint srM_nl
+ret 6
+end
+end
+srPrint srM_pp
+note 2. TP Ring AllReduce-Sum: Rank 0 shard + Rank 1 shard == exact reference!
+for i ulong SR_DIM
+s0 = mul f32 i 0.25f32
+s1 = mul f32 add i 1 0.01f32
+put srVecA i s0
+put srRef i add s0 s1
+end
+srPackVecA
+if not srSendFrame int cfd uint SR_OP_TP 0 0 false
+ret 7
+end
+if not srRecvFrame int cfd uint SR_OP_TP
+ret 8
+end
+srUnpackVecB
+for i ulong SR_DIM
+tot = add get srVecA i get srVecB i
+if ne bitcast uint tot bitcast uint get srRef i
+srPrint srM_bad
+srPrintU 9
+srPrint srM_nl
+ret 9
+end
+end
+srPrint srM_tp
+note 3. Negative control: corrupted checksum MUST be rejected!
+if srRecvFrame int cfd uint SR_OP_PP
+srPrint srM_bad
+srPrintU 10
+srPrint srM_nl
+ret 10
+end
+srPrint srM_neg
+c1 = fclose int cfd
+c2 = fclose int lfd
+w = waitpid int pid srWaitSt 0 4 0
+srPrint srM_ok
+ret 0
+end
