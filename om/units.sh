@@ -3,7 +3,7 @@
 # Keeps OMC_PIN and NATIVE_PIN at top level for legacy pin-reading scripts (seed/effects/check.sh, om/tls/test/*).
 # Regenerates or checks (--check) src/{omega_om_units.c,omega_native.h,omega_api_decl.h,omega_om_units.ident,omega_om_units_fs.c}.
 set -eu
-OMC_PIN=708fdc0f81866594ed6df2f492b7a8a6bc7456f2d733a838b7f840549ebba6c3
+OMC_PIN=21a8f628f25465a10bd38473fabf95b5c8f5067c7e04127c339f3c776566abb9
 NATIVE_PIN=9788b27a92c8dd365de7052439653de62f89634189a34cb6b3f582cae65dda83
 
 # Check required env vars and host architecture BEFORE invoking any AArch64 binary.
