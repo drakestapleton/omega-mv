@@ -1,0 +1,316 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_fp8_slots.om: Pure seeded OM-2 twin of src/omega_gpu_fp8_slots.c.
+note Versioned replaceable FP8 expert slots composing omega_fp8_slot_table.om,
+note omega_gpu_fp8_pack.om, and omega_gpu_session.om.
+om2
+
+const OGFS_OK long 0
+const OGFS_BAD_ARGS long -1
+const OGFS_TOO_LARGE long -2
+const OGFS_NAN_WEIGHT long -3
+const OGFS_CHIP_FAIL long -4
+const OGFS_BUSY long -6
+const OGFS_STALE long -7
+const OGFS_MAX_GROUPS ulong 64
+
+global ogfs_live ulong 1
+global ogfs_slots ulong 1
+global ogfs_n ulong 1
+global ogfs_k ulong 1
+global ogfs_w_mem ulong 6
+global ogfs_s_mem ulong 6
+global ogfs_bytes_loaded ulong 1
+global ogfs_load_ns ulong 1
+
+text ogfs_rn_ok "OK"
+text ogfs_rn_bad "BAD_ARGS"
+text ogfs_rn_big "TOO_LARGE"
+text ogfs_rn_nan "NAN_WEIGHT"
+text ogfs_rn_chip "CHIP_FAIL"
+text ogfs_rn_busy "BUSY"
+text ogfs_rn_stale "STALE"
+text ogfs_rn_unk "UNKNOWN"
+text ogfs_e_nan "fp8 slot load: e4m3 NaN code"
+text ogfs_e_scale "fp8 slot load: NaN, inf or overflowing scale"
+text ogfs_e_unpinned "fp8 slot entry: slot not pinned"
+
+fn ogfs_copy_str src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get src i
+  end
+  ret n
+end
+
+fn ogfs_rc_name rc long dst edit uchar * to ulong
+  if eq rc OGFS_OK
+    ret ogfs_copy_str ogfs_rn_ok dst
+  end
+  if eq rc OGFS_BAD_ARGS
+    ret ogfs_copy_str ogfs_rn_bad dst
+  end
+  if eq rc OGFS_TOO_LARGE
+    ret ogfs_copy_str ogfs_rn_big dst
+  end
+  if eq rc OGFS_NAN_WEIGHT
+    ret ogfs_copy_str ogfs_rn_nan dst
+  end
+  if eq rc OGFS_CHIP_FAIL
+    ret ogfs_copy_str ogfs_rn_chip dst
+  end
+  if eq rc OGFS_BUSY
+    ret ogfs_copy_str ogfs_rn_busy dst
+  end
+  if eq rc OGFS_STALE
+    ret ogfs_copy_str ogfs_rn_stale dst
+  end
+  ret ogfs_copy_str ogfs_rn_unk dst
+end
+
+fn ogfs_alloc slots ulong n ulong k ulong to long
+  if or eq slots 0 or eq n 0 eq k 0
+    ret OGFS_BAD_ARGS
+  end
+  if or ne rem n OMEGA_FP8_BLOCK 0 ne rem k OMEGA_FP8_BLOCK 0
+    ret OGFS_BAD_ARGS
+  end
+  if eq ogps_open 0
+    ret OGFS_CHIP_FAIL
+  end
+  wbytes = mul slots mul n k
+  sbytes = mul slots mul mul div n OMEGA_FP8_BLOCK div k OMEGA_FP8_BLOCK 4
+  wm = new ulong 6 0
+  sm = new ulong 6 0
+  if ne ogps_alloc wbytes wm OGPS_OK
+    ret OGFS_CHIP_FAIL
+  end
+  if ne ogps_alloc sbytes sm OGPS_OK
+    ogps_free wm
+    ret OGFS_CHIP_FAIL
+  end
+  if ne omega_fp8_slot_table_init slots FP8_SLOT_OK
+    ogps_free wm
+    ogps_free sm
+    ret OGFS_BAD_ARGS
+  end
+  for i ulong 6
+    put ogfs_w_mem i get wm i
+    put ogfs_s_mem i get sm i
+  end
+  put ogfs_slots 0 slots
+  put ogfs_n 0 n
+  put ogfs_k 0 k
+  put ogfs_bytes_loaded 0 0
+  put ogfs_load_ns 0 0
+  put ogfs_live 0 1
+  ret OGFS_OK
+end
+
+fn ogfs_free to long
+  if eq get ogfs_live 0 0
+    ret OGFS_OK
+  end
+  if eq omega_fp8_slot_table_idle 0
+    ret OGFS_BUSY
+  end
+  wm = new ulong 6 0
+  sm = new ulong 6 0
+  for i ulong 6
+    put wm i get ogfs_w_mem i
+    put sm i get ogfs_s_mem i
+  end
+  ogps_free wm
+  ogps_free sm
+  for i ulong 6
+    put ogfs_w_mem i 0
+    put ogfs_s_mem i 0
+  end
+  omega_fp8_slot_table_fini
+  put ogfs_live 0 0
+  put ogfs_slots 0 0
+  ret OGFS_OK
+end
+
+fn ogfs_tensor to ulong
+  if eq get ogfs_live 0 0
+    ret 0
+  end
+  ret get ogfs_w_mem 4
+end
+
+fn ogfs_load_copy slot ulong w view uchar * scale view ushort * to long
+  wbytes = mul get ogfs_n 0 get ogfs_k 0
+  scount = mul div get ogfs_n 0 OMEGA_FP8_BLOCK div get ogfs_k 0 OMEGA_FP8_BLOCK
+  first = new ulong 1 0
+  if ne omega_fp8_pack_scan_nan w wbytes first 0
+    ogps_set_error ogfs_e_nan
+    ret OGFS_NAN_WEIGHT
+  end
+  sd = new f32 256 0.0
+  if ne omega_fp8_pack_scales scale scount sd 0 0
+    ogps_set_error ogfs_e_scale
+    ret OGFS_BAD_ARGS
+  end
+  if eq get ogpl_mock 0 0
+    wr = mapwrite long get ogfs_w_mem 3 mul slot wbytes w 0 wbytes
+    if ne wr long wbytes
+      ret OGFS_CHIP_FAIL
+    end
+  end
+  ret OGFS_OK
+end
+
+fn ogfs_record_load_stats t0 ulong to void
+  wbytes = mul get ogfs_n 0 get ogfs_k 0
+  scount = mul div get ogfs_n 0 OMEGA_FP8_BLOCK div get ogfs_k 0 OMEGA_FP8_BLOCK
+  put ogfs_bytes_loaded 0 add get ogfs_bytes_loaded 0 add wbytes mul scount 4
+  t1 = ogps_now_ns
+  if ge t1 t0
+    put ogfs_load_ns 0 add get ogfs_load_ns 0 sub t1 t0
+  end
+end
+
+note meta = [slot, key]
+fn ogfs_load meta view ulong 2 w view uchar * scale view ushort * ver_out edit ulong 1 to long
+  put ver_out 0 0
+  if eq get ogfs_live 0 0
+    ret OGFS_BAD_ARGS
+  end
+  if ne ogps_is_blocked 0
+    ret OGFS_CHIP_FAIL
+  end
+  t0 = ogps_now_ns
+  rc = omega_fp8_slot_begin_load get meta 0
+  if ne rc FP8_SLOT_OK
+    ret rc
+  end
+  lrc = ogfs_load_copy get meta 0 w scale
+  ok_flag = ulong 0
+  if eq lrc OGFS_OK
+    ok_flag = ulong 1
+  end
+  frc = omega_fp8_slot_finish_load get meta 0 get meta 1 ok_flag ver_out
+  if and eq lrc OGFS_OK ne frc FP8_SLOT_OK
+    lrc = frc
+  end
+  if eq lrc OGFS_OK
+    ogfs_record_load_stats t0
+  end
+  ret lrc
+end
+
+fn ogfs_pin slot ulong version ulong to long
+  if eq get ogfs_live 0 0
+    ret OGFS_BAD_ARGS
+  end
+  ret omega_fp8_slot_pin slot version
+end
+
+fn ogfs_unpin slot ulong version ulong to long
+  if eq get ogfs_live 0 0
+    ret OGFS_BAD_ARGS
+  end
+  ret omega_fp8_slot_unpin slot version
+end
+
+fn ogfs_evict slot ulong to long
+  if eq get ogfs_live 0 0
+    ret OGFS_BAD_ARGS
+  end
+  ret omega_fp8_slot_evict slot
+end
+
+fn ogfs_slot_sbytes to ulong
+  nb = div get ogfs_n 0 OMEGA_FP8_BLOCK
+  kb = div get ogfs_k 0 OMEGA_FP8_BLOCK
+  ret mul mul nb kb 4
+end
+
+fn ogfs_entry slot ulong version ulong va_out edit ulong 2 to long
+  put va_out 0 0
+  put va_out 1 0
+  if eq get ogfs_live 0 0
+    ret OGFS_BAD_ARGS
+  end
+  rec = new ulong 4 0
+  rc = omega_fp8_slot_query slot rec
+  if ne rc FP8_SLOT_OK
+    ret rc
+  end
+  if or ne get rec 0 FP8_SLOT_READY or ne get rec 3 version eq version 0
+    ret OGFS_STALE
+  end
+  if eq get rec 1 0
+    ogps_set_error ogfs_e_unpinned
+    ret OGFS_BAD_ARGS
+  end
+  put va_out 0 add get ogfs_w_mem 4 mul slot mul get ogfs_n 0 get ogfs_k 0
+  put va_out 1 add get ogfs_s_mem 4 mul slot ogfs_slot_sbytes
+  ret OGFS_OK
+end
+
+fn ogfs_query slot ulong rec_out edit ulong 4 to long
+  if eq get ogfs_live 0 0
+    ret OGFS_BAD_ARGS
+  end
+  ret omega_fp8_slot_query slot rec_out
+end
+
+note Stats layout (ulong[14]):
+note   0: slots, 1: n, 2: k, 3: device_bytes, 4..11: table stats, 12: bytes_loaded, 13: load_ns
+fn ogfs_stats dst edit ulong 14 to void
+  for i ulong 14
+    put dst i 0
+  end
+  if eq get ogfs_live 0 0
+    ret
+  end
+  ts = new ulong 8 0
+  omega_fp8_slot_table_stats ts
+  slots = get ogfs_slots 0
+  n = get ogfs_n 0
+  k = get ogfs_k 0
+  per_slot = add mul n k mul mul div n OMEGA_FP8_BLOCK div k OMEGA_FP8_BLOCK 4
+  put dst 0 slots
+  put dst 1 n
+  put dst 2 k
+  put dst 3 mul slots per_slot
+  for i ulong 8
+    put dst add 4 i get ts i
+  end
+  put dst 12 get ogfs_bytes_loaded 0
+  put dst 13 get ogfs_load_ns 0
+end
+
+fn ogfs_gemv_grouped_f32 groups ulong slots view ulong * versions view ulong * to long
+  if or eq get ogfs_live 0 0 eq groups 0
+    ret OGFS_BAD_ARGS
+  end
+  if gt groups OGFS_MAX_GROUPS
+    ret OGFS_TOO_LARGE
+  end
+  pinned = ulong 0
+  rc = OGFS_OK
+  for i ulong groups bound 64
+    if eq rc OGFS_OK
+      rc = omega_fp8_slot_pin get slots i get versions i
+      if eq rc FP8_SLOT_OK
+        pinned = add pinned 1
+      end
+    end
+  end
+  for i ulong pinned bound 64
+    ign = omega_fp8_slot_unpin get slots i get versions i
+  end
+  ret rc
+end
+
+fn ogfs_test_set_mutant mutant ulong to void
+  if ne get ogfs_live 0 0
+    omega_fp8_slot_table_set_mutant mutant
+  end
+end

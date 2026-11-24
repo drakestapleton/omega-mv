@@ -1,0 +1,609 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/test_gb10_gpu_2_host.om: CPU-only structural/API/negative-control test
+note for wave gb10-gpu-2 (zero /dev/nvidia* access, zero CUDA, static AArch64 ELF).
+om2
+
+text h_hdr "=== GB10 HOST TEST: wave gb10-gpu-2 (CPU-only mock, zero /dev/nvidia*) ===\n"
+text h_ok "PASS\n"
+text h_fail "FAIL rc="
+text h_nl "\n"
+text h_t1 "  [1] omega_gpu_session.om (open/alloc/scratch/cancel/latch/C5-recover): "
+text h_t2 "  [2] omega_gpu_cmdlist.om (PCAS/INLINE/stamps/skip/wait_for/C5-stale): "
+text h_t3 "  [3] omega_gpu_fp8_slots.om (alloc/load/NaN-reject/pin/entry/evict): "
+text h_t4 "  [4] omega_gpu_serving.om (reserve/bounds-reject/seal/release): "
+text h_t5 "  [5] omega_gpu_decode_graph.om (layout/token/timeline/abort-#518): "
+text h_t6 "  [6] omega_blackwell_gates.om (M17/M18 gates + demos + zero-CUDA): "
+text h_done "PASS test-gb10-gpu-2-host (all 6 modules + negative controls verified)\n"
+
+fn h_print s view uchar * to void
+  r = write 1 s 0 len s
+end
+
+fn h_print_u x ulong to void
+  b = new uchar 24 0
+  pos = ulong 24
+  v = x
+  while true
+    pos = sub pos 1
+    put b pos uchar add 48 rem v 10
+    v = div v 10
+    if eq v 0
+      r = write 1 b pos sub 24 pos
+      ret
+    end
+  end
+end
+
+fn test_session_scratch_part to ulong
+  sc = new ulong 9 0
+  if ne ogps_scratch_reserve sc 4096 OGPS_OK
+    ret 115
+  end
+  if ne ogps_scratch sc 8192 OGPS_SCRATCH_RESERVED
+    ret 116
+  end
+  ogps_scratch_unreserve sc
+  if ne ogps_scratch sc 8192 OGPS_OK
+    ret 117
+  end
+  ogps_scratch_free sc
+  ret 0
+end
+
+fn test_session_launch_part code_va ulong to ulong
+  L = new ulong 12 0
+  put L 0 code_va
+  put L 1 64
+  put L 2 64
+  put L 3 1
+  put L 4 1
+  put L 5 1
+  put L 6 64
+  put L 7 4
+  put L 8 1000
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  ogps_cancel
+  if ne ogps_launch L args el mk OGPS_CANCELLED
+    ret 118
+  end
+  if ne ogps_launch L args el mk OGPS_OK
+    ret 119
+  end
+  if ne get mk 0 OGPS_MARKER1_PAYLOAD
+    ret 120
+  end
+  put ogps_mock_fail_wait 0 2
+  if eq ogps_launch L args el mk OGPS_OK
+    ret 121
+  end
+  put ogps_mock_fail_wait 0 0
+  if ne ogps_is_blocked 1
+    ret 122
+  end
+  ret 0
+end
+
+fn test_session_post_recover to ulong
+  ogps_lock
+  if eq ogps_open 0
+    ogps_unlock
+    ret 127
+  end
+  xq = new ulong 2 0
+  if eq ogps_extra_queue 1 xq OGPS_OK
+    ogps_unlock
+    ret 128
+  end
+  ast = new ulong 5 0
+  ogps_alloc_stats ast
+  if eq get ast 0 0
+    ogps_unlock
+    ret 129
+  end
+  ogps_unlock
+  ogps_close
+  if ne ogps_is_open 0
+    ret 130
+  end
+  ret 0
+end
+
+fn test_session_host to ulong
+  ogpl_set_mock 1
+  ogpl_reset_state
+  ogps_reset_all
+  if ne ogps_completion_mode OGPS_COMPLETION_POLLING
+    ret 101
+  end
+  if ne ogps_submit_prefix_words OGPL_L2_INVAL_WORDS
+    ret 102
+  end
+  hid = ogps_host_calloc 16 8
+  if eq hid 0
+    ret 103
+  end
+  ogps_host_free hid
+  if or ne ogps_set_spin_us 500 0 or ne ogps_spin_us 500 eq ogps_set_spin_us 2000000 0
+    ret 104
+  end
+  ogps_lock
+  if or eq ogps_open 0 ne ogps_is_open 1
+    ogps_unlock
+    ret 107
+  end
+  if or ne ogps_open_count 1 ne ogps_on_close 1 0
+    ogps_unlock
+    ret 108
+  end
+  m = new ulong 6 0
+  cm = new ulong 6 0
+  if or ne ogps_alloc 4096 m OGPS_OK ne ogps_alloc_code 512 cm OGPS_OK
+    ogps_unlock
+    ret 111
+  end
+  if or ne ogps_sync_to_gpu m OGPS_OK ne ogps_sync_to_cpu m OGPS_OK
+    ogps_unlock
+    ret 113
+  end
+  rc = test_session_scratch_part
+  if ne rc 0
+    ogps_unlock
+    ret rc
+  end
+  rc = test_session_launch_part get cm 4
+  if ne rc 0
+    ogps_unlock
+    ret rc
+  end
+  pidx = get m 0
+  pgen = get m 1
+  ogps_free m
+  if ne ogps_is_parked pidx pgen 1
+    ogps_unlock
+    ret 123
+  end
+  ps = new ulong 3 0
+  ogps_parked ps
+  if lt get ps 0 5
+    ogps_unlock
+    ret 124
+  end
+  ogps_free cm
+  ogps_unlock
+  if ne ogps_recover OGPS_OK
+    ret 125
+  end
+  if or ne ogps_is_blocked 0 ne ogps_recoveries 1
+    ret 126
+  end
+  ret test_session_post_recover
+end
+
+fn test_cmdlist_submit_part c1 ulong to ulong
+  opts = new ulong 7 0
+  put opts 0 OGCL_MODE_PCAS
+  put opts 1 OGCL_BARRIER_WFI
+  put opts 4 1
+  st = new ulong 7 0
+  if ne ogcl_submit c1 opts st 0
+    ret 210
+  end
+  if or ne get st 0 3 ne get st 5 3
+    ret 211
+  end
+  stm = new ulong 8 0
+  if ne ogcl_stamps c1 stm 8 4
+    ret 212
+  end
+  put opts 4 0
+  put opts 5 2
+  if eq ogcl_submit c1 opts st 0
+    ret 213
+  end
+  if ne get st 6 1
+    ret 214
+  end
+  if ge ogcl_stamps c1 stm 8 0
+    ret 215
+  end
+  put opts 0 OGCL_MODE_INLINE
+  put opts 5 0
+  if ne ogcl_submit c1 opts st 0
+    ret 216
+  end
+  ret 0
+end
+
+fn test_cmdlist_wait_part c1 ulong to ulong
+  cid2 = new ulong 1 0
+  if ne ogcl_create 8 cid2 0
+    ret 217
+  end
+  c2 = get cid2 0
+  if ne ogcl_wait_for c2 c1 1 0
+    ret 218
+  end
+  L = new ulong 12 0
+  put L 0 0x10040000
+  put L 1 64
+  put L 2 64
+  put L 3 1
+  put L 4 1
+  put L 5 1
+  put L 6 64
+  put L 7 4
+  args = new uint 4 0
+  if lt ogcl_add c2 L args 0
+    ret 219
+  end
+  opts = new ulong 7 0
+  st = new ulong 7 0
+  if eq ogcl_submit c2 opts st 0
+    ret 220
+  end
+  ogps_latch_uncertain ogps_e_uncertain
+  if ne ogps_recover OGPS_OK
+    ret 221
+  end
+  if ge ogcl_add c1 L args 0
+    ret 222
+  end
+  ogcl_free c2
+  ret 0
+end
+
+fn test_cmdlist_host to ulong
+  ogpl_set_mock 1
+  ogpl_reset_state
+  ogps_reset_all
+  bn = new uchar 32 0
+  if or ne ogcl_barrier_name OGCL_BARRIER_WFI bn 13 or ne ogcl_barrier_name OGCL_BARRIER_FLUSH_DATA bn 10 ne ogcl_barrier_name 99 bn 1
+    ret 201
+  end
+  cid = new ulong 1 0
+  if ne ogcl_create 16 cid 0
+    ret 204
+  end
+  c1 = get cid 0
+  L = new ulong 12 0
+  put L 0 0x10040000
+  put L 1 64
+  put L 2 64
+  put L 3 1
+  put L 4 1
+  put L 5 1
+  put L 6 64
+  put L 7 4
+  args = new uint 4 0
+  if or lt ogcl_add c1 L args 0 or lt ogcl_add c1 L args 0 ne ogcl_mark_independent c1 0
+    ret 205
+  end
+  spec = new ulong 16 0
+  put spec 11 2
+  if lt ogcl_record_attn256 c1 spec 0x10050000 64 1 256 0
+    ret 208
+  end
+  if ne ogcl_count c1 3
+    ret 209
+  end
+  rc = test_cmdlist_submit_part c1
+  if ne rc 0
+    ret rc
+  end
+  rc = test_cmdlist_wait_part c1
+  if ne rc 0
+    ret rc
+  end
+  ogcl_free c1
+  ogps_close
+  ret 0
+end
+
+fn test_fp8_slots_pin_part v0 ulong to ulong
+  vas = new ulong 2 0
+  if ne ogfs_entry 0 v0 vas OGFS_BAD_ARGS
+    ret 308
+  end
+  if ne ogfs_pin 0 v0 OGFS_OK
+    ret 309
+  end
+  if ne ogfs_entry 0 v0 vas OGFS_OK
+    ret 310
+  end
+  if eq get vas 0 0
+    ret 311
+  end
+  if ne ogfs_free OGFS_BUSY
+    ret 312
+  end
+  if ne ogfs_unpin 0 v0 OGFS_OK
+    ret 313
+  end
+  sl = new ulong 2 0
+  vs = new ulong 2 0
+  put sl 0 0
+  put vs 0 v0
+  if ne ogfs_gemv_grouped_f32 1 sl vs OGFS_OK
+    ret 314
+  end
+  ret 0
+end
+
+fn test_fp8_slots_query_part to ulong
+  rec = new ulong 4 0
+  if ne ogfs_query 0 rec OGFS_OK
+    ret 315
+  end
+  if or ne get rec 0 FP8_SLOT_READY ne get rec 2 42
+    ret 316
+  end
+  stats = new ulong 14 0
+  ogfs_stats stats
+  if ne get stats 4 1
+    ret 317
+  end
+  if ne ogfs_evict 0 OGFS_OK
+    ret 318
+  end
+  if ne ogfs_free OGFS_OK
+    ret 319
+  end
+  ret 0
+end
+
+fn test_fp8_slots_host to ulong
+  ogpl_set_mock 1
+  ogpl_reset_state
+  ogps_reset_all
+  rn = new uchar 16 0
+  if or ne ogfs_rc_name OGFS_BUSY rn 4 ne ogfs_rc_name OGFS_STALE rn 5
+    ret 301
+  end
+  if ne ogfs_alloc 4 128 128 OGFS_OK
+    ret 303
+  end
+  if eq ogfs_tensor 0
+    ret 304
+  end
+  w = new uchar 16384 0x38
+  sc = new ushort 4 0x3f80
+  ver = new ulong 1 0
+  lm = new ulong 2 0
+  put lm 0 0
+  put lm 1 42
+  if ne ogfs_load lm w sc ver OGFS_OK
+    ret 305
+  end
+  v0 = get ver 0
+  if eq v0 0
+    ret 306
+  end
+  put w 17 0x7f
+  put lm 0 1
+  put lm 1 43
+  if ne ogfs_load lm w sc ver OGFS_NAN_WEIGHT
+    ret 307
+  end
+  rc = test_fp8_slots_pin_part v0
+  if ne rc 0
+    ret rc
+  end
+  rc = test_fp8_slots_query_part
+  if ne rc 0
+    ret rc
+  end
+  ogps_close
+  ret 0
+end
+
+fn test_serving_host to ulong
+  ogpl_set_mock 1
+  ogpl_reset_state
+  ogps_reset_all
+  b = new ulong 11 0
+  if ne ogsv_reserve_serving b OGSV_BAD_ARGS
+    ret 401
+  end
+  put b 0 2048
+  put b 1 2
+  put b 2 16
+  put b 3 4
+  put b 4 128
+  put b 5 16
+  put b 6 8
+  put b 7 2048
+  put b 8 4096
+  put b 9 8192
+  put b 10 16
+  if ne ogsv_reserve_serving b OGSV_OK
+    ret 402
+  end
+  if ne get ogsv_reserved 0 1
+    ret 403
+  end
+  ogsv_seal
+  if ne get ogsv_sealed 0 1
+    ret 404
+  end
+  ogsv_release
+  if or ne get ogsv_sealed 0 0 ne get ogsv_reserved 0 0
+    ret 405
+  end
+  ogsv_free_all
+  ogps_close
+  ret 0
+end
+
+fn test_decode_graph_token_part to ulong
+  ogdg_set_stamps 1
+  tok = new uint 1 0
+  st = new ulong 6 0
+  if ne ogdg_token 0 tok st OGDG_OK
+    ret 509
+  end
+  if ne get st 0 13
+    ret 510
+  end
+  ts = new ulong 65 0
+  ks = new uchar 64 0
+  if ne ogdg_stamps ts ks 65 13
+    ret 511
+  end
+  if ne ogdg_begin_token OGDG_OK
+    ret 512
+  end
+  if ne ogdg_abort_token OGDG_OK
+    ret 513
+  end
+  if ne ogdg_read OGDG_OK
+    ret 514
+  end
+  ret 0
+end
+
+fn test_decode_graph_host to ulong
+  ogpl_set_mock 1
+  ogpl_reset_state
+  ogps_reset_all
+  kn = new uchar 16 0
+  if ne ogdg_kind_name OGDG_K_SWIGLU kn 6
+    ret 501
+  end
+  ogdg_set_barrier 1
+  if ne ogdg_barrier 0
+    ret 502
+  end
+  ogdg_set_barrier 3
+  if ne ogdg_barrier 3
+    ret 503
+  end
+  ogdg_set_barrier 0
+  ogdg_set_prefetch 0
+  if ne ogdg_prefetch 0
+    ret 504
+  end
+  cfg = new ulong 6 0
+  put cfg 0 1
+  put cfg 1 4096
+  put cfg 2 0x358637bd
+  put cfg 3 1
+  put cfg 4 4096
+  put cfg 5 OGDG_HIDDEN
+  if ne ogdg_create cfg OGDG_OK
+    ret 505
+  end
+  vas = new ulong 11 0
+  ogdg_vas vas
+  for i ulong 11
+    if ne and get vas i 255 0
+      ret 506
+    end
+  end
+  if ne ogdg_set_layer 0 1 1 1 1 OGDG_OK
+    ret 507
+  end
+  if ne ogdg_set_final_norm OGDG_OK
+    ret 508
+  end
+  rc = test_decode_graph_token_part
+  if ne rc 0
+    ret rc
+  end
+  ogdg_free
+  ogps_close
+  ret 0
+end
+
+fn test_gates_host to ulong
+  obwg_set_mock 1
+  if ne obwg_run_m17_gates 0
+    ret 601
+  end
+  snap = new ulong 2 0
+  obwg_get_m17_gate_snapshot snap
+  if or ne get snap 0 10 ne get snap 1 10
+    ret 602
+  end
+  if ne obwg_run_m18_gates 0
+    ret 603
+  end
+  obwg_get_m18_gate_snapshot snap
+  if or ne get snap 0 5 ne get snap 1 5
+    ret 604
+  end
+  if ne obwg_run_demo_blackwell_vector 0
+    ret 605
+  end
+  if ne obwg_run_demo_blackwell_matmul 0
+    ret 606
+  end
+  ret 0
+end
+
+fn main to int
+  h_print h_hdr
+  h_print h_t1
+  rc = test_session_host
+  if ne rc 0
+    h_print h_fail
+    h_print_u rc
+    h_print h_nl
+    ret int rc
+  end
+  h_print h_ok
+
+  h_print h_t2
+  rc = test_cmdlist_host
+  if ne rc 0
+    h_print h_fail
+    h_print_u rc
+    h_print h_nl
+    ret int rc
+  end
+  h_print h_ok
+
+  h_print h_t3
+  rc = test_fp8_slots_host
+  if ne rc 0
+    h_print h_fail
+    h_print_u rc
+    h_print h_nl
+    ret int rc
+  end
+  h_print h_ok
+
+  h_print h_t4
+  rc = test_serving_host
+  if ne rc 0
+    h_print h_fail
+    h_print_u rc
+    h_print h_nl
+    ret int rc
+  end
+  h_print h_ok
+
+  h_print h_t5
+  rc = test_decode_graph_host
+  if ne rc 0
+    h_print h_fail
+    h_print_u rc
+    h_print h_nl
+    ret int rc
+  end
+  h_print h_ok
+
+  h_print h_t6
+  rc = test_gates_host
+  if ne rc 0
+    h_print h_fail
+    h_print_u rc
+    h_print h_nl
+    ret int rc
+  end
+  h_print h_ok
+
+  h_print h_done
+  ret 0
+end

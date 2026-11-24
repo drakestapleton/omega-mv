@@ -1,0 +1,204 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_serving.om: Pure seeded OM-2 twin of src/omega_gpu_serving.c.
+note Up-front GB10 serving buffer reservation with all-or-nothing rollback,
+note kernel-cache sealing, and clean release.
+om2
+
+const OGSV_OK long 0
+const OGSV_BAD_ARGS long -1
+const OGSV_CHIP_FAIL long -4
+const OGSV_MAX_KERNEL_SLOTS ulong 128
+
+note ServingBounds layout (ulong[11]):
+note   0: max_context, 1: max_seqs, 2: num_q_heads, 3: num_kv_heads, 4: head_dim,
+note   5: kv_block_size, 6: max_rows, 7: max_k, 8: max_n, 9: max_n_one_row, 10: kernel_slots
+
+global ogsv_attn_sc ulong 9
+global ogsv_rows_sc ulong 9
+global ogsv_mm_sc ulong 9
+global ogsv_sealed ulong 1
+global ogsv_reserved ulong 1
+global ogsv_kslots ulong 1
+
+fn ogsv_is_pow2 v ulong to bool
+  if eq v 0
+    ret false
+  end
+  ret eq and v sub v 1 0
+end
+
+fn ogsv_attn_bytes ctx ulong seqs ulong nqh ulong nkvh ulong hd ulong blk ulong to ulong
+  q_bytes = mul mul seqs mul nqh hd 4
+  kv_bytes = mul mul ctx mul nkvh mul hd 2 2
+  total = add q_bytes kv_bytes
+  if ne blk 0
+    pages = div add ctx sub blk 1 blk
+    total = add total mul mul seqs pages 8
+  end
+  ret total
+end
+
+fn ogsv_mm_bytes rows ulong k ulong n ulong n1 ulong to ulong
+  act = mul mul rows k 4
+  res = mul mul rows n 4
+  res1 = mul mul 16 n1 4
+  if gt res1 res
+    res = res1
+  end
+  ret add act res
+end
+
+fn ogsv_unreserve_attn to void
+  sc = new ulong 9 0
+  for i ulong 9
+    put sc i get ogsv_attn_sc i
+  end
+  ogps_scratch_unreserve sc
+  for i ulong 9
+    put ogsv_attn_sc i get sc i
+    put sc i get ogsv_rows_sc i
+  end
+  ogps_scratch_unreserve sc
+  for i ulong 9
+    put ogsv_rows_sc i get sc i
+  end
+end
+
+fn ogsv_unreserve_mm to void
+  sc = new ulong 9 0
+  for i ulong 9
+    put sc i get ogsv_mm_sc i
+  end
+  ogps_scratch_unreserve sc
+  for i ulong 9
+    put ogsv_mm_sc i get sc i
+  end
+end
+
+fn ogsv_validate_bounds b view ulong 11 to bool
+  if or eq get b 0 0 or eq get b 2 0 eq get b 3 0
+    ret false
+  end
+  if or eq get b 4 0 or eq get b 6 0 eq get b 7 0
+    ret false
+  end
+  if or eq get b 8 0 gt get b 10 OGSV_MAX_KERNEL_SLOTS
+    ret false
+  end
+  blk = get b 5
+  if and ne blk 0 not ogsv_is_pow2 blk
+    ret false
+  end
+  ret true
+end
+
+fn ogsv_reserve_sc sc_id ulong nbytes ulong to long
+  sc = new ulong 9 0
+  for i ulong 9
+    if eq sc_id 0
+      put sc i get ogsv_attn_sc i
+    end
+    if eq sc_id 1
+      put sc i get ogsv_rows_sc i
+    end
+    if eq sc_id 2
+      put sc i get ogsv_mm_sc i
+    end
+  end
+  if ne ogps_scratch_reserve sc nbytes OGPS_OK
+    ret OGSV_CHIP_FAIL
+  end
+  for i ulong 9
+    if eq sc_id 0
+      put ogsv_attn_sc i get sc i
+    end
+    if eq sc_id 1
+      put ogsv_rows_sc i get sc i
+    end
+    if eq sc_id 2
+      put ogsv_mm_sc i get sc i
+    end
+  end
+  ret OGSV_OK
+end
+
+fn ogsv_reserve_serving b view ulong 11 to long
+  if not ogsv_validate_bounds b
+    ret OGSV_BAD_ARGS
+  end
+  seqs = get b 1
+  if eq seqs 0
+    seqs = ulong 1
+  end
+  n1 = get b 9
+  if eq n1 0
+    n1 = get b 8
+  end
+  ks = get b 10
+  if eq ks 0
+    ks = ulong 8
+  end
+  ogps_lock
+  if eq ogps_open 0
+    ogps_unlock
+    ret OGSV_CHIP_FAIL
+  end
+  ab = ogsv_attn_bytes get b 0 seqs get b 2 get b 3 get b 4 get b 5
+  if ne ogsv_reserve_sc 0 ab OGSV_OK
+    ogps_unlock
+    ret OGSV_CHIP_FAIL
+  end
+  if gt get b 6 1
+    rb = mul mul get b 6 mul get b 2 get b 4 8
+    if ne ogsv_reserve_sc 1 rb OGSV_OK
+      ogsv_unreserve_attn
+      ogps_unlock
+      ret OGSV_CHIP_FAIL
+    end
+  end
+  mb = ogsv_mm_bytes get b 6 get b 7 get b 8 n1
+  if ne ogsv_reserve_sc 2 mb OGSV_OK
+    ogsv_unreserve_attn
+    ogps_unlock
+    ret OGSV_CHIP_FAIL
+  end
+  put ogsv_kslots 0 ks
+  put ogsv_reserved 0 1
+  ogps_unlock
+  ret OGSV_OK
+end
+
+fn ogsv_seal to void
+  put ogsv_sealed 0 1
+end
+
+fn ogsv_release to void
+  put ogsv_sealed 0 0
+  ogsv_unreserve_attn
+  ogsv_unreserve_mm
+  put ogsv_reserved 0 0
+end
+
+fn ogsv_free_all to void
+  ogsv_release
+  ogps_lock
+  sc = new ulong 9 0
+  for i ulong 9
+    put sc i get ogsv_attn_sc i
+  end
+  ogps_scratch_free sc
+  for i ulong 9
+    put ogsv_attn_sc i get sc i
+    put sc i get ogsv_rows_sc i
+  end
+  ogps_scratch_free sc
+  for i ulong 9
+    put ogsv_rows_sc i get sc i
+    put sc i get ogsv_mm_sc i
+  end
+  ogps_scratch_free sc
+  for i ulong 9
+    put ogsv_mm_sc i get sc i
+  end
+  ogps_unlock
+end

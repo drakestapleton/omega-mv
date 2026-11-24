@@ -1,0 +1,922 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_cmdlist.om: Pure seeded OM-2 twin of src/omega_gpu_cmdlist.c.
+note Multi-launch GB10 command lists (PCAS and INLINE), barriers (WFI/NONE/WFI_ONLY/
+note WFI_DATA/FLUSH_DATA), independent overlap, cross-list wait_for, PTIMER stamps,
+note per-launch semaphore verification, and C5 recovery generation checks.
+om2
+
+const OGCL_MAX_LAUNCHES ulong 4096
+const OGCL_POOL_MAX ulong 4
+const OGCL_SLOTS_PER_LIST ulong 64
+const OGCL_BANK_BYTES ulong 1024
+const OGCL_QMD_BYTES ulong 1024
+const OGCL_RING_WORDS ulong 16384
+const OGCL_MARKER_OFF ulong 256
+const OGCL_PAIR_B_MARKER ulong 128
+const OGCL_DEFAULT_TIMEOUT_MS ulong 20000
+
+const OGCL_MODE_PCAS ulong 0
+const OGCL_MODE_INLINE ulong 1
+
+const OGCL_BARRIER_WFI ulong 0
+const OGCL_BARRIER_NONE ulong 1
+const OGCL_BARRIER_WFI_ONLY ulong 2
+const OGCL_BARRIER_WFI_DATA ulong 3
+const OGCL_BARRIER_FLUSH_DATA ulong 4
+
+const OGCL_MTHD_WFI uint 0x0110
+const OGCL_MTHD_STAMP uint 0x0158
+const OGCL_MTHD_PCAS_A uint 0x02b4
+const OGCL_MTHD_PCAS2_B uint 0x02c0
+const OGCL_PCAS_ACTION uint 3
+const OGCL_INVAL_DATA uint 16
+const OGCL_INVAL_FLUSH_DATA uint 4
+
+note Opts layout (ulong[7]):
+note   0: mode, 1: barrier, 2: timeout_ms, 3: spin_us, 4: stamps, 5: skip_launch, 6: first_barrier_none
+note Stats layout (ulong[7]):
+note   0: launches, 1: submits, 2: words, 3: elapsed_ns, 4: host_ns, 5: sems_done, 6: first_missing (ulong 0xffffffffffffffff if none)
+
+global ogcl_latched ulong 1
+global ogcl_live uchar 4
+global ogcl_cap ulong 4
+global ogcl_n ulong 4
+global ogcl_gen ulong 4
+global ogcl_stamped ulong 4
+global ogcl_pending_wait ulong 4
+global ogcl_nwaits ulong 4
+global ogcl_wait_other ulong 4
+global ogcl_wait_max ulong 4
+
+note Per-list DMA buffers (4 lists x 6 ulongs each = 24 ulongs)
+global ogcl_banks ulong 24
+global ogcl_qmds ulong 24
+global ogcl_sems ulong 24
+global ogcl_stamps_mem ulong 24
+global ogcl_scratch ulong 24
+
+note Per-launch flags (4 lists x 64 slots = 256)
+global ogcl_indep uchar 256
+global ogcl_wait_va ulong 256
+global ogcl_q1_cache uint 24576
+global ogcl_q0_cache uint 24576
+
+note Pushbuffer staging for one submission (up to 4096 words)
+global ogcl_pb uint 4096
+global ogcl_pb_n ulong 1
+
+text ogcl_bn_0 "wfi+inval_all"
+text ogcl_bn_1 "none"
+text ogcl_bn_2 "wfi_only"
+text ogcl_bn_3 "wfi+inval_data"
+text ogcl_bn_4 "flush_data"
+text ogcl_bn_unk "?"
+
+text ogcl_e_stale "cmdlist: made before a session recovery"
+text ogcl_e_args "cmdlist: bad arguments"
+text ogcl_e_full "cmdlist add: list full"
+text ogcl_e_qmd "cmdlist add: qmd"
+text ogcl_e_indep "cmdlist mark_independent: no launch recorded"
+text ogcl_e_wait "cmdlist wait_for: invalid peer or index"
+text ogcl_e_wait_one "cmdlist wait_for: waits on one other list only"
+text ogcl_e_sub_empty "cmdlist submit: empty list or no platform"
+text ogcl_e_sub_wait "cmdlist submit: list with waits runs only in submit_pair"
+text ogcl_e_latched "cmdlist submit: latched"
+text ogcl_e_sem "cmdlist: a launch semaphore is not DONE"
+text ogcl_e_timeout "cmdlist: marker wait timed out (latched)"
+text ogcl_e_stamps_off "cmdlist stamps: last submit had stamps off"
+text ogcl_e_stamps_cap "cmdlist stamps: out too small"
+text ogcl_e_stamps_unw "cmdlist stamps: a slot was not written"
+text ogcl_e_pair_mode "cmdlist pair: PCAS mode only, no stamps, no skip"
+text ogcl_e_pair_wait "cmdlist pair: wait_for points outside peer"
+
+fn ogcl_copy_str src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get src i
+  end
+  ret n
+end
+
+fn ogcl_barrier_name b ulong dst edit uchar * to ulong
+  if eq b OGCL_BARRIER_WFI
+    ret ogcl_copy_str ogcl_bn_0 dst
+  end
+  if eq b OGCL_BARRIER_NONE
+    ret ogcl_copy_str ogcl_bn_1 dst
+  end
+  if eq b OGCL_BARRIER_WFI_ONLY
+    ret ogcl_copy_str ogcl_bn_2 dst
+  end
+  if eq b OGCL_BARRIER_WFI_DATA
+    ret ogcl_copy_str ogcl_bn_3 dst
+  end
+  if eq b OGCL_BARRIER_FLUSH_DATA
+    ret ogcl_copy_str ogcl_bn_4 dst
+  end
+  ret ogcl_copy_str ogcl_bn_unk dst
+end
+
+fn ogcl_is_latched to ulong
+  if eq get ogcl_latched 0 add ogps_recoveries 1
+    ret 1
+  end
+  ret 0
+end
+
+fn ogcl_valid_id cid ulong to bool
+  if or eq cid 0 gt cid OGCL_POOL_MAX
+    ret false
+  end
+  ret ne get ogcl_live sub cid 1 0
+end
+
+fn ogcl_stale cid ulong to bool
+  idx = sub cid 1
+  if eq get ogcl_gen idx ogps_recoveries
+    ret false
+  end
+  ogps_set_error ogcl_e_stale
+  ret true
+end
+
+fn ogcl_count cid ulong to ulong
+  if not ogcl_valid_id cid
+    ret 0
+  end
+  ret get ogcl_n sub cid 1
+end
+
+fn ogcl_reset cid ulong to void
+  if not ogcl_valid_id cid
+    ret
+  end
+  idx = sub cid 1
+  put ogcl_n idx 0
+  put ogcl_pending_wait idx 0
+  put ogcl_nwaits idx 0
+  put ogcl_wait_other idx 0
+  put ogcl_wait_max idx 0
+end
+
+fn ogcl_mark_independent cid ulong to long
+  if not ogcl_valid_id cid
+    ogps_set_error ogcl_e_indep
+    ret -1
+  end
+  idx = sub cid 1
+  n = get ogcl_n idx
+  if eq n 0
+    ogps_set_error ogcl_e_indep
+    ret -1
+  end
+  put ogcl_indep add mul idx OGCL_SLOTS_PER_LIST sub n 1 1
+  ret 0
+end
+
+fn ogcl_wait_for cid ulong other ulong launch_idx ulong to long
+  if or not ogcl_valid_id cid or not ogcl_valid_id other eq cid other
+    ogps_set_error ogcl_e_wait
+    ret -1
+  end
+  if or ogcl_stale cid ogcl_stale other
+    ret -1
+  end
+  oidx = sub other 1
+  if ge launch_idx get ogcl_n oidx
+    ogps_set_error ogcl_e_wait
+    ret -1
+  end
+  idx = sub cid 1
+  cur_other = get ogcl_wait_other idx
+  if and ne cur_other 0 ne cur_other other
+    ogps_set_error ogcl_e_wait_one
+    ret -1
+  end
+  put ogcl_wait_other idx other
+  if gt launch_idx get ogcl_wait_max idx
+    put ogcl_wait_max idx launch_idx
+  end
+  sems_va = get ogcl_sems add mul oidx 6 4
+  put ogcl_pending_wait idx add sems_va mul launch_idx 16
+  ret 0
+end
+
+fn ogcl_store_mem base ulong src view ulong 6 dst_id ulong to void
+  for i ulong 6
+    off = add base i
+    if eq dst_id 0
+      put ogcl_banks off get src i
+    end
+    if eq dst_id 1
+      put ogcl_qmds off get src i
+    end
+    if eq dst_id 2
+      put ogcl_sems off get src i
+    end
+    if eq dst_id 3
+      put ogcl_stamps_mem off get src i
+    end
+    if eq dst_id 4
+      put ogcl_scratch off get src i
+    end
+  end
+end
+
+fn ogcl_load_mem base ulong dst edit ulong 6 src_id ulong to void
+  for i ulong 6
+    off = add base i
+    if eq src_id 0
+      put dst i get ogcl_banks off
+    end
+    if eq src_id 1
+      put dst i get ogcl_qmds off
+    end
+    if eq src_id 2
+      put dst i get ogcl_sems off
+    end
+    if eq src_id 3
+      put dst i get ogcl_stamps_mem off
+    end
+    if eq src_id 4
+      put dst i get ogcl_scratch off
+    end
+  end
+end
+
+fn ogcl_free cid ulong to void
+  if not ogcl_valid_id cid
+    ret
+  end
+  idx = sub cid 1
+  base = mul idx 6
+  ogps_lock
+  tmp = new ulong 6 0
+  for k ulong 5
+    ogcl_load_mem base tmp k
+    ogps_free tmp
+    ogcl_store_mem base tmp k
+  end
+  ogps_unlock
+  put ogcl_live idx 0
+  put ogcl_cap idx 0
+  put ogcl_n idx 0
+  put ogcl_stamped idx 0
+end
+
+fn ogcl_create cap ulong cid_out edit ulong 1 to long
+  put cid_out 0 0
+  if or eq cap 0 gt cap OGCL_SLOTS_PER_LIST
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  slot = ulong OGCL_POOL_MAX
+  for i ulong OGCL_POOL_MAX
+    if and eq slot OGCL_POOL_MAX eq get ogcl_live i 0
+      slot = i
+    end
+  end
+  if eq slot OGCL_POOL_MAX
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  ogps_lock
+  ok = ne ogps_open 0
+  base = mul slot 6
+  m = new ulong 6 0
+  for k ulong 5
+    ogps_mem_zero m
+    ogcl_store_mem base m k
+  end
+  if ok
+    if ne ogps_alloc mul cap OGCL_BANK_BYTES m OGPS_OK
+      ok = false
+    else
+      ogcl_store_mem base m 0
+    end
+  end
+  if ok
+    if ne ogps_alloc mul cap OGCL_QMD_BYTES m OGPS_OK
+      ok = false
+    else
+      ogcl_store_mem base m 1
+    end
+  end
+  if ok
+    if ne ogps_alloc mul cap 16 m OGPS_OK
+      ok = false
+    else
+      ogcl_store_mem base m 2
+    end
+  end
+  if ok
+    if ne ogps_alloc mul add cap 1 16 m OGPS_OK
+      ok = false
+    else
+      ogcl_store_mem base m 3
+    end
+  end
+  if ok
+    if ne ogps_alloc 16384 m OGPS_OK
+      ok = false
+    else
+      ogcl_store_mem base m 4
+    end
+  end
+  ogps_unlock
+  put ogcl_live slot 1
+  put ogcl_cap slot cap
+  put ogcl_n slot 0
+  put ogcl_gen slot ogps_recoveries
+  put ogcl_stamped slot 0
+  put ogcl_pending_wait slot 0
+  put ogcl_nwaits slot 0
+  put ogcl_wait_other slot 0
+  put ogcl_wait_max slot 0
+  if not ok
+    ogcl_free add slot 1
+    ret -1
+  end
+  put cid_out 0 add slot 1
+  ret 0
+end
+
+fn ogcl_publish idx ulong slot_i ulong to long
+  flat = add mul idx OGCL_SLOTS_PER_LIST slot_i
+  put ogcl_indep flat 0
+  pw = get ogcl_pending_wait idx
+  put ogcl_wait_va flat pw
+  if ne pw 0
+    put ogcl_nwaits idx add get ogcl_nwaits idx 1
+  end
+  put ogcl_pending_wait idx 0
+  put ogcl_n idx add slot_i 1
+  ret long slot_i
+end
+
+fn ogcl_cache_qmd idx ulong slot_i ulong q1 view uint 96 q0 view uint 96 to void
+  qbase = mul add mul idx OGCL_SLOTS_PER_LIST slot_i 96
+  for k ulong 96
+    put ogcl_q1_cache add qbase k get q1 k
+    put ogcl_q0_cache add qbase k get q0 k
+  end
+end
+
+fn ogcl_add_qmds idx ulong i ulong launch view ulong 12 q1 edit uint 96 q0 edit uint 96 to long
+  base = mul idx 6
+  addrs = new ulong 4 0
+  q1_va = add get ogcl_qmds add base 4 mul i OGCL_QMD_BYTES
+  put addrs 0 add get ogcl_banks add base 4 mul i OGCL_BANK_BYTES
+  put addrs 1 get ogcl_scratch add base 4
+  put addrs 2 add get ogcl_sems add base 4 mul i 16
+  put addrs 3 add q1_va 512
+  cfg = new ulong 16 0
+  ogps_make_qmd_cfg launch addrs cfg
+  if ne bw_qmd1 cfg q1 0
+    ogps_set_error ogcl_e_qmd
+    ret -1
+  end
+  if ne bw_qmd_verify q1 0
+    ogps_set_error ogcl_e_qmd
+    ret -1
+  end
+  ign0 = bw_qmd0 q0 q1_va
+  ret 0
+end
+
+fn ogcl_add_write_cbank idx ulong i ulong launch view ulong 12 args view uint * to void
+  base = mul idx 6
+  bank_off = mul i OGCL_BANK_BYTES
+  ty = get launch 3
+  if eq ty 0
+    ty = ulong 1
+  end
+  cb = new uint 224 0
+  ogps_fill_cbank_2d cb add get ogcl_banks add base 4 bank_off get launch 2 ty get launch 4 get launch 5
+  ogps_write_u32_map long get ogcl_banks add base 3 bank_off cb 224
+  ogps_write_u32_map long get ogcl_banks add base 3 add bank_off 896 args get launch 7
+end
+
+fn ogcl_add cid ulong launch view ulong 12 args view uint * to long
+  if not ogcl_valid_id cid
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  if ogcl_stale cid
+    ret -1
+  end
+  n_args = get launch 7
+  if or eq n_args 0 gt n_args OGPS_MAX_ARGS
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  if or eq get launch 2 0 eq get launch 4 0
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  if or eq get launch 5 0 eq get launch 0 0
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  idx = sub cid 1
+  i = get ogcl_n idx
+  if ge i get ogcl_cap idx
+    ogps_set_error ogcl_e_full
+    ret -1
+  end
+  q1 = new uint 96 0
+  q0 = new uint 96 0
+  if ne ogcl_add_qmds idx i launch q1 q0 0
+    ret -1
+  end
+  ogcl_add_write_cbank idx i launch args
+  base = mul idx 6
+  qmd_off = mul i OGCL_QMD_BYTES
+  ogps_write_u32_map long get ogcl_qmds add base 3 qmd_off q1 96
+  ogps_write_u32_map long get ogcl_qmds add base 3 add qmd_off 512 q0 96
+  ogcl_cache_qmd idx i q1 q0
+  ret ogcl_publish idx i
+end
+
+fn ogcl_attn256_emit idx ulong i ulong spec view ulong 16 slot view ulong 8 to long
+  base = mul idx 6
+  bank_off = mul i OGCL_BANK_BYTES
+  qmd_off = mul i OGCL_QMD_BYTES
+  drv = new uint 224 0
+  obwe_fill_cbank drv get slot 1
+  bank = new uint 249 0
+  q1 = new uint 96 0
+  q0 = new uint 96 0
+  if ne bw_attn256_record spec slot drv bank q1 q0 0
+    ogps_set_error ogcl_e_qmd
+    ret -1
+  end
+  ogps_write_u32_map long get ogcl_banks add base 3 bank_off bank 249
+  ogps_write_u32_map long get ogcl_qmds add base 3 qmd_off q1 96
+  ogps_write_u32_map long get ogcl_qmds add base 3 add qmd_off 512 q0 96
+  ogcl_cache_qmd idx i q1 q0
+  ret ogcl_publish idx i
+end
+
+fn ogcl_fill_attn256_slot idx ulong i ulong slot edit ulong 8 to void
+  base = mul idx 6
+  put slot 1 add get ogcl_banks add base 4 mul i OGCL_BANK_BYTES
+  put slot 2 get ogcl_scratch add base 4
+  put slot 3 add get ogcl_sems add base 4 mul i 16
+  put slot 4 add get ogcl_qmds add base 4 mul i OGCL_QMD_BYTES
+end
+
+fn ogcl_record_attn256 cid ulong spec view ulong 16 code_va ulong gprs ulong gy ulong out_words ulong to long
+  if not ogcl_valid_id cid
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  if ogcl_stale cid
+    ret -1
+  end
+  idx = sub cid 1
+  i = get ogcl_n idx
+  if ge i get ogcl_cap idx
+    ogps_set_error ogcl_e_full
+    ret -1
+  end
+  slot = new ulong 8 0
+  put slot 0 code_va
+  put slot 5 gprs
+  put slot 6 gy
+  put slot 7 out_words
+  ogcl_fill_attn256_slot idx i slot
+  ret ogcl_attn256_emit idx i spec slot
+end
+
+fn ogcl_pb_put w uint to void
+  pos = get ogcl_pb_n 0
+  if lt pos 4096
+    put ogcl_pb pos w
+    put ogcl_pb_n 0 add pos 1
+  end
+end
+
+fn ogcl_emit_setup to void
+  ogcl_pb_put 0x20012061
+  ogcl_pb_put 0x0000cec0
+  ogcl_pb_put 0x20012092
+  ogcl_pb_put 0x00000001
+  ogcl_pb_put 0x200120a8
+  ogcl_pb_put 0x0000000f
+  ogcl_pb_put 0x2001255d
+  ogcl_pb_put 0x00000003
+  ogcl_pb_put 0x2001255e
+  ogcl_pb_put 0x20000000
+  ogcl_pb_put 0x2001255f
+  ogcl_pb_put 0x000fffff
+  ogcl_pb_put 0x20012557
+  ogcl_pb_put 0x00000003
+  ogcl_pb_put 0x20012558
+  ogcl_pb_put 0x22000000
+  ogcl_pb_put 0x20012559
+  ogcl_pb_put 0x00000000
+end
+
+fn ogcl_emit_stamp stamps_va ulong slot ulong to void
+  va = add stamps_va mul slot 16
+  ogcl_pb_put ogps_mthd 1 OGCL_MTHD_STAMP 5
+  ogcl_pb_put uint slot
+  ogcl_pb_put 0
+  ogcl_pb_put uint and va 0xffffffff
+  ogcl_pb_put uint shr va 32
+  ogcl_pb_put 0
+end
+
+fn ogcl_emit_tail mark_va ulong to void
+  ogcl_pb_put ogps_mthd 0 0x005c 5
+  ogcl_pb_put uint and mark_va 0xffffffff
+  ogcl_pb_put uint shr mark_va 32
+  ogcl_pb_put OGPS_MARKER1_PAYLOAD
+  ogcl_pb_put 0
+  ogcl_pb_put 0x00100001
+  ogcl_pb_put ogps_mthd 0 0x0028 4
+  ogcl_pb_put 0
+  ogcl_pb_put 0
+  ogcl_pb_put 0
+  ogcl_pb_put 0x80000000
+  m2 = add mark_va 16
+  ogcl_pb_put ogps_mthd 0 0x005c 5
+  ogcl_pb_put uint and m2 0xffffffff
+  ogcl_pb_put uint shr m2 32
+  ogcl_pb_put OGPS_MARKER2_PAYLOAD
+  ogcl_pb_put 0
+  ogcl_pb_put 0x00100001
+end
+
+fn ogcl_emit_inline_cached qbase ulong va ulong is_q0 ulong to void
+  ogcl_pb_put ogps_mthd 1 0x0318 98
+  ogcl_pb_put or uint 0x40000000 uint and shr va 40 0x1ff
+  ogcl_pb_put uint and shr va 8 0xffffffff
+  for k ulong 96
+    if ne is_q0 0
+      ogcl_pb_put get ogcl_q0_cache add qbase k
+    else
+      ogcl_pb_put get ogcl_q1_cache add qbase k
+    end
+  end
+end
+
+fn ogcl_emit_barrier b ulong stamps_on bool stamps_va ulong i ulong to void
+  if ne b OGCL_BARRIER_NONE
+    if ne b OGCL_BARRIER_FLUSH_DATA
+      ogcl_pb_put ogps_mthd 1 OGCL_MTHD_WFI 1
+      ogcl_pb_put 0
+    else
+      ogcl_pb_put ogps_mthd 1 OGPS_MTHD_INVAL_CACHES 1
+      ogcl_pb_put or OGCL_INVAL_DATA OGCL_INVAL_FLUSH_DATA
+    end
+    if stamps_on
+      ogcl_emit_stamp stamps_va i
+    end
+    if eq b OGCL_BARRIER_WFI
+      ogcl_pb_put ogps_mthd 1 OGPS_MTHD_INVAL_CACHES 1
+      ogcl_pb_put OGPS_INVAL_ALL
+    end
+    if eq b OGCL_BARRIER_WFI_DATA
+      ogcl_pb_put ogps_mthd 1 OGPS_MTHD_INVAL_CACHES 1
+      ogcl_pb_put OGCL_INVAL_DATA
+    end
+  end
+end
+
+fn ogcl_emit_dispatch idx ulong i ulong mode ulong to void
+  base = mul idx 6
+  flat = add mul idx OGCL_SLOTS_PER_LIST i
+  q1_va = add get ogcl_qmds add base 4 mul i OGCL_QMD_BYTES
+  qbase = mul flat 96
+  if eq mode OGCL_MODE_INLINE
+    put ogcl_q1_cache add qbase 10 0x00190000
+    put ogcl_q1_cache add qbase 12 uint and shr add q1_va 512 8 0xffffffff
+    ogcl_emit_inline_cached qbase add q1_va 512 1
+    ogcl_emit_inline_cached qbase q1_va 0
+  else
+    put ogcl_q1_cache add qbase 10 0
+    put ogcl_q1_cache add qbase 12 0
+    if eq get ogpl_mock 0 0
+      qm = long get ogcl_qmds add base 3
+      qoff = mul i OGCL_QMD_BYTES
+      r1 = mapset qm add qoff 40 4 0
+      r2 = mapset qm add qoff 48 4 0
+    end
+    ogcl_pb_put ogps_mthd 1 OGCL_MTHD_PCAS_A 1
+    ogcl_pb_put uint and shr q1_va 8 0xffffffff
+    ogcl_pb_put ogps_mthd 1 OGCL_MTHD_PCAS2_B 1
+    ogcl_pb_put OGCL_PCAS_ACTION
+  end
+end
+
+fn ogcl_emit_one_launch idx ulong i ulong done ulong opts view ulong 7 to void
+  base = mul idx 6
+  flat = add mul idx OGCL_SLOTS_PER_LIST i
+  wva = get ogcl_wait_va flat
+  if ne wva 0
+    ogcl_pb_put ogps_mthd 0 0x005c 5
+    ogcl_pb_put uint and wva 0xffffffff
+    ogcl_pb_put uint shr wva 32
+    ogcl_pb_put OGPS_SEM_DONE
+    ogcl_pb_put 0
+    ogcl_pb_put 0
+  end
+  skip = get opts 5
+  if and ne skip 0 eq i sub skip 1
+    ret
+  end
+  indep = and ne i done ne get ogcl_indep flat 0
+  b = get opts 1
+  if ne wva 0
+    b = OGCL_BARRIER_WFI
+  else
+    if eq i done
+      if and eq i 0 ne get opts 6 0
+        b = OGCL_BARRIER_NONE
+      else
+        b = OGCL_BARRIER_WFI
+      end
+    else
+      if indep
+        b = OGCL_BARRIER_NONE
+      end
+    end
+  end
+  stamps_on = ne get opts 4 0
+  stamps_va = get ogcl_stamps_mem add base 4
+  if and indep stamps_on
+    ogcl_emit_stamp stamps_va i
+  end
+  ogcl_emit_barrier b stamps_on stamps_va i
+  ogcl_emit_dispatch idx i get opts 0
+end
+
+fn ogcl_emit_chunk idx ulong done ulong end_i ulong opts view ulong 7 mark_va ulong to ulong
+  put ogcl_pb_n 0 0
+  ogcl_emit_setup
+  i = done
+  while lt i end_i bound 64
+    ogcl_emit_one_launch idx i done opts
+    i = add i 1
+  end
+  if ne get opts 4 0
+    ogcl_pb_put ogps_mthd 1 OGCL_MTHD_WFI 1
+    ogcl_pb_put 0
+    base = mul idx 6
+    ogcl_emit_stamp get ogcl_stamps_mem add base 4 end_i
+  end
+  ogcl_emit_tail mark_va
+  ret get ogcl_pb_n 0
+end
+
+fn ogcl_prep_sems_and_stamps idx ulong n ulong stamps_on bool to void
+  base = mul idx 6
+  if eq get ogpl_mock 0 0
+    sm = long get ogcl_sems add base 3
+    for i ulong n bound 64
+      r = mapset sm mul i 16 4 ulong OGPS_SEM_INIT
+    end
+    if stamps_on
+      stm = long get ogcl_stamps_mem add base 3
+      cnt = add n 1
+      for i ulong cnt bound 65
+        off = mul i 16
+        r1 = mapset stm off 8 ulong 0xffffffffffffffff
+        r2 = mapset stm add off 8 8 ulong 0xffffffffffffffff
+      end
+    end
+  end
+end
+
+fn ogcl_check_sems idx ulong n ulong skip ulong stats edit ulong 7 to long
+  base = mul idx 6
+  ok = ulong 0
+  missing = ulong 0xffffffffffffffff
+  if eq get ogpl_mock 0 0
+    sm = long get ogcl_sems add base 3
+    for i ulong n bound 64
+      v = uint mapget sm mul i 16 4
+      if eq v OGPS_SEM_DONE
+        ok = add ok 1
+      else
+        if eq missing ulong 0xffffffffffffffff
+          missing = i
+        end
+      end
+    end
+  else
+    for i ulong n bound 64
+      if and ne skip 0 eq i sub skip 1
+        if eq missing ulong 0xffffffffffffffff
+          missing = i
+        end
+      else
+        ok = add ok 1
+      end
+    end
+  end
+  put stats 5 ok
+  put stats 6 missing
+  if ne missing ulong 0xffffffffffffffff
+    ogps_set_error ogcl_e_sem
+    ret -1
+  end
+  ret 0
+end
+
+fn ogcl_submit_pb nw ulong to ulong
+  pb_copy = new uint 4096 0
+  for i ulong nw bound 4096
+    put pb_copy i get ogcl_pb i
+  end
+  ret ogpl_queue_submit get ogps_q 0 get ogps_q 1 pb_copy nw
+end
+
+fn ogcl_submit cid ulong opts view ulong 7 stats edit ulong 7 to long
+  for k ulong 6
+    put stats k 0
+  end
+  put stats 6 ulong 0xffffffffffffffff
+  if or not ogcl_valid_id cid eq ogps_platform_installed 0
+    ogps_set_error ogcl_e_sub_empty
+    ret -1
+  end
+  if ogcl_stale cid
+    ret -1
+  end
+  idx = sub cid 1
+  n = get ogcl_n idx
+  if eq n 0
+    ogps_set_error ogcl_e_sub_empty
+    ret -1
+  end
+  if ne get ogcl_nwaits idx 0
+    ogps_set_error ogcl_e_sub_wait
+    ret -1
+  end
+  if or ne ogcl_is_latched 0 ne ogps_is_blocked 0
+    ogps_set_error ogcl_e_latched
+    ret -1
+  end
+  if eq ogps_open 0
+    ret -1
+  end
+  tmo = get opts 2
+  if eq tmo 0
+    tmo = OGCL_DEFAULT_TIMEOUT_MS
+  end
+  stamps_on = ne get opts 4 0
+  if stamps_on
+    put ogcl_stamped idx 1
+  else
+    put ogcl_stamped idx 0
+  end
+  th0 = ogps_now_ns
+  ogcl_prep_sems_and_stamps idx n stamps_on
+  mark_va = add get ogps_marker 4 OGCL_MARKER_OFF
+  nw = ogcl_emit_chunk idx 0 n opts mark_va
+  if eq get ogpl_mock 0 0
+    mm = long get ogps_marker 3
+    r0 = mapset mm OGCL_MARKER_OFF 4 0
+    r1 = mapset mm add OGCL_MARKER_OFF 16 4 0
+  end
+  t0 = ogps_now_ns
+  host_ns = ulong 0
+  if ge t0 th0
+    host_ns = sub t0 th0
+  end
+  if ne ogcl_submit_pb nw OGP_OK
+    ret -1
+  end
+  w = ogps_wait_marker OGCL_MARKER_OFF OGPS_MARKER1_PAYLOAD tmo
+  if eq w 0
+    w = ogps_wait_marker2 add OGCL_MARKER_OFF 16 OGPS_MARKER2_PAYLOAD tmo
+  end
+  if ne w 0
+    put ogcl_latched 0 add ogps_recoveries 1
+    ogps_note_module_latch
+    ogps_latch_uncertain ogcl_e_timeout
+    ret -1
+  end
+  t1 = ogps_now_ns
+  elapsed = ulong 0
+  if ge t1 t0
+    elapsed = sub t1 t0
+  end
+  put stats 0 n
+  put stats 1 1
+  put stats 2 nw
+  put stats 3 elapsed
+  put stats 4 host_ns
+  ret ogcl_check_sems idx n get opts 5 stats
+end
+
+fn ogcl_pair_emit_one idx ulong opts view ulong 7 mark_off ulong st edit ulong 7 to void
+  put ogcl_stamped idx 0
+  nw = ogcl_emit_chunk idx 0 get ogcl_n idx opts add get ogps_marker 4 mark_off
+  put st 0 get ogcl_n idx
+  put st 1 1
+  put st 2 nw
+  put st 5 get ogcl_n idx
+end
+
+fn ogcl_submit_pair a ulong b ulong opts view ulong 7 sa edit ulong 7 sb edit ulong 7 to long
+  for k ulong 6
+    put sa k 0
+    put sb k 0
+  end
+  put sa 6 ulong 0xffffffffffffffff
+  put sb 6 ulong 0xffffffffffffffff
+  if or not ogcl_valid_id a or not ogcl_valid_id b eq a b
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  if or ogcl_stale a ogcl_stale b
+    ret -1
+  end
+  ia = sub a 1
+  ib = sub b 1
+  if or eq get ogcl_n ia 0 eq get ogcl_n ib 0
+    ogps_set_error ogcl_e_sub_empty
+    ret -1
+  end
+  if ne get ogcl_nwaits ia 0
+    if or ne get ogcl_wait_other ia b ge get ogcl_wait_max ia get ogcl_n ib
+      ogps_set_error ogcl_e_pair_wait
+      ret -1
+    end
+  end
+  if ne get ogcl_nwaits ib 0
+    if or ne get ogcl_wait_other ib a ge get ogcl_wait_max ib get ogcl_n ia
+      ogps_set_error ogcl_e_pair_wait
+      ret -1
+    end
+  end
+  if or ne get opts 0 OGCL_MODE_PCAS or ne get opts 4 0 ne get opts 5 0
+    ogps_set_error ogcl_e_pair_mode
+    ret -1
+  end
+  if or ne ogcl_is_latched 0 ne ogps_is_blocked 0
+    ogps_set_error ogcl_e_latched
+    ret -1
+  end
+  if eq ogps_open 0
+    ret -1
+  end
+  q1 = new ulong 2 0
+  if ne ogps_extra_queue 1 q1 OGPS_OK
+    ret -1
+  end
+  ogcl_pair_emit_one ia opts OGCL_MARKER_OFF sa
+  ogcl_pair_emit_one ib opts add OGCL_MARKER_OFF OGCL_PAIR_B_MARKER sb
+  ret 0
+end
+
+fn ogcl_read_stamps_live stm long want ulong dst edit ulong * to long
+  for i ulong want bound 65
+    off = mul i 16
+    pay = mapget stm off 8
+    ts = mapget stm add off 8 8
+    if ne pay i
+      ogps_set_error ogcl_e_stamps_unw
+      ret -1
+    end
+    if eq ts ulong 0xffffffffffffffff
+      ogps_set_error ogcl_e_stamps_unw
+      ret -1
+    end
+    put dst i ts
+  end
+  ret long want
+end
+
+fn ogcl_stamps cid ulong dst edit ulong * cap ulong to long
+  if not ogcl_valid_id cid
+    ogps_set_error ogcl_e_args
+    ret -1
+  end
+  idx = sub cid 1
+  if eq get ogcl_stamped idx 0
+    ogps_set_error ogcl_e_stamps_off
+    ret -1
+  end
+  want = add get ogcl_n idx 1
+  if lt cap want
+    ogps_set_error ogcl_e_stamps_cap
+    ret -1
+  end
+  if eq get ogpl_mock 0 0
+    stm = long get ogcl_stamps_mem add mul idx 6 3
+    ret ogcl_read_stamps_live stm want dst
+  end
+  for i ulong want bound 65
+    put dst i mul add i 1 1000
+  end
+  ret long want
+end

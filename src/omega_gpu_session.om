@@ -1,0 +1,1212 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_session.om: Pure seeded OM-2 twin of src/omega_gpu_session.c.
+note Persistent GB10 GPU session over omega_gpu_platform.om + omega_gpu_platform_linux.om:
+note one device/channel/scratch per process, generational buffers, parking on uncertain
+note completion, C5 recovery, scratch reservation, extra queues, and real SM121 launch.
+om2
+
+const OGPS_PAGE ulong 4096
+const OGPS_MAX_SPIN_US ulong 1000000
+const OGPS_MAX_ARGS ulong 32
+const OGPS_POLL_SLICE_MS ulong 1
+const OGPS_COMPLETION_POLLING ulong 1
+const OGPS_PARK_MAX ulong 512
+const OGPS_XQ_MAX ulong 3
+const OGPS_HOOK_MAX ulong 8
+const OGPS_OK long 0
+const OGPS_ERR long -1
+const OGPS_SCRATCH_RESERVED long -2
+const OGPS_CANCELLED long -3
+
+const OGPS_RIGHTS_DATA ulong 15
+const OGPS_RIGHTS_CODE ulong 23
+const OGPS_RIGHTS_RING ulong 6
+const OGPS_RIGHTS_MARKER ulong 43
+const OGPS_RIGHTS_CBANK ulong 6
+
+const OGPS_MARKER1_PAYLOAD uint 0x44444444
+const OGPS_MARKER2_PAYLOAD uint 0x46464646
+const OGPS_SEM_INIT uint 5
+const OGPS_SEM_DONE uint 6
+const OGPS_MTHD_INVAL_CACHES uint 0x021c
+const OGPS_INVAL_ALL uint 0x1011
+
+note Mem descriptor layout (ulong[6]):
+note   0: h_idx, 1: h_gen, 2: kind, 3: map_handle, 4: va, 5: size
+note Scratch descriptor layout (ulong[9]):
+note   0..5: Mem, 6: cap, 7: high_water, 8: reserved
+note Launch descriptor layout (ulong[12]):
+note   0: code_va, 1: gpr_count, 2: threads_x, 3: threads_y, 4: grid_x, 5: grid_y,
+note   6: num_elements, 7: n_args, 8: timeout_ms, 9: shared_bytes, 10: spin_us, 11: flags
+note AllocStats layout (ulong[5]):
+note   0: allocs, 1: alloc_bytes, 2: alloc_failures, 3: frees, 4: stale_refusals
+note ParkStats layout (ulong[3]):
+note   0: buffers, 1: untracked, 2: bytes
+
+global ogps_plat_set ulong 1
+global ogps_caps ulong 10
+global ogps_open_flag ulong 1
+global ogps_blocked ulong 1
+global ogps_locked ulong 1
+global ogps_cancel_flag ulong 1
+global ogps_spin_val ulong 1
+global ogps_opens ulong 1
+global ogps_last_open_ns ulong 1
+global ogps_recoveries_cnt ulong 1
+global ogps_mod_latched ulong 1
+
+note Session handles & scratch buffers
+global ogps_dev ulong 2
+global ogps_q ulong 2
+global ogps_pb ulong 6
+global ogps_cbank ulong 6
+global ogps_marker ulong 6
+global ogps_qmd ulong 6
+
+note Extra queues 1..3
+global ogps_xq_idx ulong 3
+global ogps_xq_gen ulong 3
+global ogps_xpb_idx ulong 3
+global ogps_xpb_gen ulong 3
+global ogps_xpb_sz ulong 3
+
+note Alloc & park stats
+global ogps_astats ulong 5
+global ogps_pstats ulong 3
+global ogps_park_idx ulong 512
+global ogps_park_gen ulong 512
+
+note On-close hooks (hook IDs)
+global ogps_hooks ulong 8
+global ogps_nhooks ulong 1
+global ogps_hooks_ran ulong 1
+
+note Host memory tracking (bounded pool of 256 handles)
+global ogps_hmem_live uchar 256
+global ogps_hmem_sz ulong 256
+
+note Error string buffer (320 bytes)
+global ogps_err uchar 320
+global ogps_err_len ulong 1
+
+note Launch staging buffers (pb words and args)
+global ogps_pb_words uint 1024
+global ogps_pb_n ulong 1
+global ogps_mock_fail_wait ulong 1
+global ogps_mock_fail_close ulong 1
+
+text ogps_e_latched "process latched"
+text ogps_e_noplat "no GPU platform installed"
+text ogps_e_alloc_closed "alloc without open device"
+text ogps_e_sync_closed "sync without open device"
+text ogps_e_code_ovf "code size overflow"
+text ogps_e_launch_closed "launch without open device"
+text ogps_e_launch_args "launch arguments"
+text ogps_e_cancelled_pre "launch cancelled before submit"
+text ogps_e_cancelled_post "launch cancelled after submit (completion uncertain, latched)"
+text ogps_e_timeout "marker wait timed out (latched)"
+text ogps_e_poll_ref "marker poll refused (latched)"
+text ogps_e_sem_not_done "intermediate semaphore not DONE"
+text ogps_e_qmd_build "qmd build (shared_bytes)"
+text ogps_e_qmd_inv "qmd invariants"
+text ogps_e_scratch_res "serving reservation exceeded"
+text ogps_e_xq_range "extra_queue: index outside 1..3"
+text ogps_e_xq_closed "extra_queue: device not open or latched"
+text ogps_e_xq_order "extra_queue: open queues in order"
+text ogps_e_xq_ref "queue_open (extra queue)"
+text ogps_e_rec_not "recover: not latched"
+text ogps_e_rec_closed "recover: latched but no device is open"
+text ogps_e_rec_close "recover: device close fault"
+text ogps_e_uncertain "uncertain completion (latched by a caller)"
+text ogps_e_submit "submit_methods"
+
+fn ogps_set_error msg view uchar * to void
+  n = len msg
+  if gt n 319
+    n = ulong 319
+  end
+  for i ulong n
+    put ogps_err i get msg i
+  end
+  put ogps_err n 0
+  put ogps_err_len 0 n
+end
+
+fn ogps_clear_error to void
+  put ogps_err 0 0
+  put ogps_err_len 0 0
+end
+
+fn ogps_last_error dst edit uchar * to ulong
+  n = get ogps_err_len 0
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get ogps_err i
+  end
+  ret n
+end
+
+fn ogps_reset_all to void
+  put ogps_plat_set 0 0
+  put ogps_open_flag 0 0
+  put ogps_blocked 0 0
+  put ogps_locked 0 0
+  put ogps_cancel_flag 0 0
+  put ogps_spin_val 0 0
+  put ogps_opens 0 0
+  put ogps_last_open_ns 0 0
+  put ogps_recoveries_cnt 0 0
+  put ogps_mod_latched 0 0
+  put ogps_nhooks 0 0
+  put ogps_hooks_ran 0 0
+  put ogps_mock_fail_wait 0 0
+  put ogps_mock_fail_close 0 0
+  for i ulong 10
+    put ogps_caps i 0
+  end
+  for i ulong 5
+    put ogps_astats i 0
+  end
+  for i ulong 3
+    put ogps_pstats i 0
+    put ogps_xq_idx i 0
+    put ogps_xq_gen i 0
+    put ogps_xpb_idx i 0
+    put ogps_xpb_gen i 0
+    put ogps_xpb_sz i 0
+  end
+  for i ulong 6
+    put ogps_pb i 0
+    put ogps_cbank i 0
+    put ogps_marker i 0
+    put ogps_qmd i 0
+  end
+  for i ulong 256
+    put ogps_hmem_live i 0
+    put ogps_hmem_sz i 0
+  end
+  ogps_clear_error
+end
+
+fn ogps_set_platform enable ulong caps view ulong 10 fnmask view ulong 12 to ulong
+  if or ne get ogps_open_flag 0 0 or ne get ogps_locked 0 0 ne get ogps_blocked 0 0
+    ret OGP_REFUSED_BUSY
+  end
+  if eq enable 0
+    put ogps_plat_set 0 0
+    ret OGP_OK
+  end
+  req = new ulong 10 0
+  put req 0 OGP_ABI_MAJOR
+  put req 1 OGP_ABI_MINOR
+  put req 2 OGP_SVC_REQUIRED_SESSION
+  put req 3 1
+  put req 4 8
+  put req 5 1
+  put req 6 1
+  put req 7 65536
+  put req 8 262144
+  rc = ogp_negotiate caps req
+  if ne rc OGP_OK
+    ret rc
+  end
+  rc = ogp_check_for fnmask caps OGP_SVC_REQUIRED_SESSION
+  if ne rc OGP_OK
+    ret rc
+  end
+  for i ulong 10
+    put ogps_caps i get caps i
+  end
+  put ogps_plat_set 0 1
+  ret OGP_OK
+end
+
+fn ogps_install_default to void
+  if ne get ogps_plat_set 0 0
+    ret
+  end
+  caps = new ulong 10 0
+  fnmask = new ulong 12 0
+  ogpl_caps caps
+  ogpl_fnmask fnmask
+  ign = ogps_set_platform 1 caps fnmask
+end
+
+fn ogps_platform_installed to ulong
+  ogps_install_default
+  ret get ogps_plat_set 0
+end
+
+fn ogps_submit_prefix_words to ulong
+  if eq ogps_platform_installed 0
+    ret 0
+  end
+  ret get ogps_caps 9
+end
+
+fn ogps_completion_mode to ulong
+  ret OGPS_COMPLETION_POLLING
+end
+
+fn ogps_now_ns to ulong
+  if eq ogps_platform_installed 0
+    ret 0
+  end
+  t = monons
+  if lt t 0
+    ret 0
+  end
+  ret ulong t
+end
+
+fn ogps_host_alloc nbytes ulong to ulong
+  if eq ogps_platform_installed 0
+    ret 0
+  end
+  want = nbytes
+  if eq want 0
+    want = ulong 1
+  end
+  for i ulong 256
+    if eq get ogps_hmem_live i 0
+      put ogps_hmem_live i 1
+      put ogps_hmem_sz i want
+      ret add i 1
+    end
+  end
+  ret 0
+end
+
+fn ogps_host_calloc count ulong elem_sz ulong to ulong
+  if and ne count 0 gt elem_sz div ulong 0xffffffffffffffff count
+    ret 0
+  end
+  ret ogps_host_alloc mul count elem_sz
+end
+
+fn ogps_host_free hid ulong to void
+  if or eq hid 0 gt hid 256
+    ret
+  end
+  idx = sub hid 1
+  put ogps_hmem_live idx 0
+  put ogps_hmem_sz idx 0
+end
+
+fn ogps_lock to void
+  if eq ogps_platform_installed 0
+    ret
+  end
+  put ogps_locked 0 1
+end
+
+fn ogps_unlock to void
+  if eq get ogps_plat_set 0 0
+    ret
+  end
+  put ogps_locked 0 0
+end
+
+fn ogps_is_open to ulong
+  ret get ogps_open_flag 0
+end
+
+fn ogps_is_blocked to ulong
+  if ne get ogps_blocked 0 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ogps_set_spin_us us ulong to long
+  if gt us OGPS_MAX_SPIN_US
+    ret OGPS_ERR
+  end
+  put ogps_spin_val 0 us
+  ret OGPS_OK
+end
+
+fn ogps_spin_us to ulong
+  ret get ogps_spin_val 0
+end
+
+fn ogps_cancel to void
+  put ogps_cancel_flag 0 1
+end
+
+fn ogps_take_cancel to bool
+  if eq get ogps_cancel_flag 0 0
+    ret false
+  end
+  put ogps_cancel_flag 0 0
+  ret true
+end
+
+fn ogps_alloc_stats dst edit ulong 5 to void
+  for i ulong 5
+    put dst i get ogps_astats i
+  end
+end
+
+fn ogps_park_one h_idx ulong h_gen ulong sz ulong to void
+  if eq h_gen 0
+    ret
+  end
+  n = sub get ogps_pstats 0 get ogps_pstats 1
+  for i ulong n bound 512
+    if and eq get ogps_park_idx i h_idx eq get ogps_park_gen i h_gen
+      ret
+    end
+  end
+  if lt n OGPS_PARK_MAX
+    put ogps_park_idx n h_idx
+    put ogps_park_gen n h_gen
+  else
+    put ogps_pstats 1 add get ogps_pstats 1 1
+  end
+  put ogps_pstats 2 add get ogps_pstats 2 sz
+  put ogps_pstats 0 add get ogps_pstats 0 1
+end
+
+fn ogps_parked dst edit ulong 3 to void
+  for i ulong 3
+    put dst i get ogps_pstats i
+  end
+end
+
+fn ogps_is_parked h_idx ulong h_gen ulong to ulong
+  if eq h_gen 0
+    ret 0
+  end
+  n = sub get ogps_pstats 0 get ogps_pstats 1
+  if gt n OGPS_PARK_MAX
+    n = OGPS_PARK_MAX
+  end
+  for i ulong n bound 512
+    if and eq get ogps_park_idx i h_idx eq get ogps_park_gen i h_gen
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ogps_latch_uncertain msg view uchar * to void
+  put ogps_blocked 0 1
+  for i ulong OGPS_XQ_MAX
+    if ne get ogps_xpb_gen i 0
+      ogps_park_one get ogps_xpb_idx i get ogps_xpb_gen i get ogps_xpb_sz i
+    end
+  end
+  if ne get ogps_pb 1 0
+    ogps_park_one get ogps_pb 0 get ogps_pb 1 get ogps_pb 5
+  end
+  if ne get ogps_cbank 1 0
+    ogps_park_one get ogps_cbank 0 get ogps_cbank 1 get ogps_cbank 5
+  end
+  if ne get ogps_marker 1 0
+    ogps_park_one get ogps_marker 0 get ogps_marker 1 get ogps_marker 5
+  end
+  if ne get ogps_qmd 1 0
+    ogps_park_one get ogps_qmd 0 get ogps_qmd 1 get ogps_qmd 5
+  end
+  if gt len msg 0
+    ogps_set_error msg
+  else
+    ogps_set_error ogps_e_uncertain
+  end
+end
+
+fn ogps_page_up nbytes ulong to ulong
+  b = and add nbytes 4095 not ulong 4095
+  if lt b OGPS_PAGE
+    ret OGPS_PAGE
+  end
+  ret b
+end
+
+fn ogps_mem_zero dst edit ulong 6 to void
+  for i ulong 6
+    put dst i 0
+  end
+end
+
+fn ogps_mem_alloc kind ulong rights ulong nbytes ulong dst edit ulong 6 to long
+  ogps_mem_zero dst
+  if or eq get ogps_open_flag 0 0 or ne get ogps_blocked 0 0 eq get ogps_plat_set 0 0
+    ogps_set_error ogps_e_alloc_closed
+    ret OGPS_ERR
+  end
+  want = ogps_page_up nbytes
+  desc = new ulong 5 0
+  put desc 0 kind
+  put desc 1 rights
+  put desc 2 OGP_CACHE_GPU_UNCACHED
+  put desc 3 OGPS_PAGE
+  put desc 4 want
+  h = new ulong 2 0
+  inf = new ulong 3 0
+  rc = ogpl_dma_alloc get ogps_dev 0 get ogps_dev 1 desc h inf
+  if or ne rc OGP_OK lt get inf 2 want
+    if eq rc OGP_OK
+      ign = ogpl_dma_free get h 0 get h 1
+    end
+    put ogps_astats 2 add get ogps_astats 2 1
+    ret OGPS_ERR
+  end
+  put dst 0 get h 0
+  put dst 1 get h 1
+  put dst 2 kind
+  put dst 3 get inf 0
+  put dst 4 get inf 1
+  put dst 5 get inf 2
+  put ogps_astats 0 add get ogps_astats 0 1
+  put ogps_astats 1 add get ogps_astats 1 want
+  ret OGPS_OK
+end
+
+fn ogps_alloc nbytes ulong dst edit ulong 6 to long
+  ret ogps_mem_alloc OGP_HANDLE_BUF_DATA OGPS_RIGHTS_DATA nbytes dst
+end
+
+fn ogps_alloc_code code_size ulong dst edit ulong 6 to long
+  nbytes = omega_gpu_code_alloc_bytes code_size
+  if eq nbytes 0
+    ogps_set_error ogps_e_code_ovf
+    ogps_mem_zero dst
+    ret OGPS_ERR
+  end
+  rc = ogps_mem_alloc OGP_HANDLE_BUF_CODE OGPS_RIGHTS_CODE nbytes dst
+  if ne rc OGPS_OK
+    ret OGPS_ERR
+  end
+  z = new uchar 2048 0
+  if eq get ogpl_mock 0 0
+    tail = sub nbytes code_size
+    pos = code_size
+    while gt tail 0 bound 64
+      chunk = tail
+      if gt chunk 2048
+        chunk = ulong 2048
+      end
+      wr = mapwrite long get dst 3 pos z 0 chunk
+      pos = add pos chunk
+      tail = sub tail chunk
+    end
+  end
+  ret OGPS_OK
+end
+
+fn ogps_free m edit ulong 6 to void
+  if ne get m 1 0
+    if ne get ogps_blocked 0 0
+      ogps_park_one get m 0 get m 1 get m 5
+    else
+      if or eq get ogps_open_flag 0 0 eq get ogps_plat_set 0 0
+        put ogps_astats 4 add get ogps_astats 4 1
+      else
+        rc = ogpl_dma_free get m 0 get m 1
+        if eq rc OGP_OK
+          put ogps_astats 3 add get ogps_astats 3 1
+        else
+          put ogps_astats 4 add get ogps_astats 4 1
+        end
+      end
+    end
+  end
+  ogps_mem_zero m
+end
+
+fn ogps_sync_to_gpu m view ulong 6 to long
+  if eq get m 1 0
+    ret OGPS_OK
+  end
+  if or eq get ogps_plat_set 0 0 eq get ogps_open_flag 0 0
+    ogps_set_error ogps_e_sync_closed
+    ret OGPS_ERR
+  end
+  rc = ogpl_sync_to_gpu get m 0 get m 1 0 get m 5
+  if ne rc OGP_OK
+    ret OGPS_ERR
+  end
+  ret OGPS_OK
+end
+
+fn ogps_sync_to_cpu m view ulong 6 to long
+  if eq get m 1 0
+    ret OGPS_OK
+  end
+  if or eq get ogps_plat_set 0 0 eq get ogps_open_flag 0 0
+    ogps_set_error ogps_e_sync_closed
+    ret OGPS_ERR
+  end
+  rc = ogpl_sync_to_cpu get m 0 get m 1 0 get m 5
+  if ne rc OGP_OK
+    ret OGPS_ERR
+  end
+  ret OGPS_OK
+end
+
+fn ogps_scratch sc edit ulong 9 nbytes ulong to long
+  if ne get sc 8 0
+    if or gt nbytes get sc 6 eq get sc 1 0
+      ogps_set_error ogps_e_scratch_res
+      ret OGPS_SCRATCH_RESERVED
+    end
+  end
+  if gt nbytes get sc 7
+    put sc 7 nbytes
+  end
+  if and ge get sc 6 nbytes ne get sc 1 0
+    ret OGPS_OK
+  end
+  tmp = new ulong 6 0
+  for i ulong 6
+    put tmp i get sc i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put sc i 0
+  end
+  put sc 6 0
+  rc = ogps_alloc get sc 7 tmp
+  if ne rc OGPS_OK
+    ret OGPS_ERR
+  end
+  for i ulong 6
+    put sc i get tmp i
+  end
+  put sc 6 get tmp 5
+  ret OGPS_OK
+end
+
+fn ogps_scratch_free sc edit ulong 9 to void
+  tmp = new ulong 6 0
+  for i ulong 6
+    put tmp i get sc i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put sc i 0
+  end
+  put sc 6 0
+  put sc 8 0
+end
+
+fn ogps_scratch_reserve sc edit ulong 9 nbytes ulong to long
+  put sc 8 0
+  rc = ogps_scratch sc nbytes
+  if ne rc OGPS_OK
+    ret OGPS_ERR
+  end
+  put sc 8 1
+  ret OGPS_OK
+end
+
+fn ogps_scratch_unreserve sc edit ulong 9 to void
+  put sc 8 0
+end
+
+fn ogps_free_session_bufs to void
+  tmp = new ulong 6 0
+  for i ulong 6
+    put tmp i get ogps_qmd i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put ogps_qmd i 0
+    put tmp i get ogps_marker i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put ogps_marker i 0
+    put tmp i get ogps_cbank i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put ogps_cbank i 0
+    put tmp i get ogps_pb i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put ogps_pb i 0
+  end
+end
+
+fn ogps_open to ulong
+  if ne get ogps_blocked 0 0
+    ogps_set_error ogps_e_latched
+    ret 0
+  end
+  if ne get ogps_open_flag 0 0
+    ret 1
+  end
+  if eq ogps_platform_installed 0
+    ogps_set_error ogps_e_noplat
+    ret 0
+  end
+  t0 = ogps_now_ns
+  dev = new ulong 2 0
+  rc = ogpl_device_open 0 dev
+  if ne rc OGP_OK
+    ret 0
+  end
+  put ogps_dev 0 get dev 0
+  put ogps_dev 1 get dev 1
+  put ogps_open_flag 0 1
+  m = new ulong 6 0
+  q = new ulong 2 0
+  ok = true
+  if ne ogps_mem_alloc OGP_HANDLE_BUF_QUEUE OGPS_RIGHTS_RING 65536 m OGPS_OK
+    ok = false
+  end
+  if ok
+    for i ulong 6
+      put ogps_pb i get m i
+    end
+    if ne ogps_mem_alloc OGP_HANDLE_BUF_DATA OGPS_RIGHTS_CBANK OGPS_PAGE m OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    for i ulong 6
+      put ogps_cbank i get m i
+    end
+    if ne ogps_mem_alloc OGP_HANDLE_BUF_DATA OGPS_RIGHTS_MARKER OGPS_PAGE m OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    for i ulong 6
+      put ogps_marker i get m i
+    end
+    if ne ogps_mem_alloc OGP_HANDLE_BUF_DATA OGPS_RIGHTS_DATA 65536 m OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    for i ulong 6
+      put ogps_qmd i get m i
+    end
+    if ne ogpl_queue_open get dev 0 get dev 1 get ogps_pb 0 get ogps_pb 1 q OGP_OK
+      ok = false
+    end
+  end
+  if not ok
+    ogps_free_session_bufs
+    put ogps_open_flag 0 0
+    ign = ogpl_device_close get dev 0 get dev 1
+    put ogps_dev 0 0
+    put ogps_dev 1 0
+    ret 0
+  end
+  put ogps_q 0 get q 0
+  put ogps_q 1 get q 1
+  put ogps_opens 0 add get ogps_opens 0 1
+  t1 = ogps_now_ns
+  if ge t1 t0
+    put ogps_last_open_ns 0 sub t1 t0
+  end
+  ret 1
+end
+
+fn ogps_open_count to ulong
+  ret get ogps_opens 0
+end
+
+fn ogps_extra_queue idx ulong q_out edit ulong 2 to long
+  put q_out 0 0
+  put q_out 1 0
+  if or eq idx 0 gt idx OGPS_XQ_MAX
+    ogps_set_error ogps_e_xq_range
+    ret OGPS_ERR
+  end
+  if or ne get ogps_blocked 0 0 or eq get ogps_open_flag 0 0 eq ogps_platform_installed 0
+    ogps_set_error ogps_e_xq_closed
+    ret OGPS_ERR
+  end
+  slot = sub idx 1
+  if ne get ogps_xq_gen slot 0
+    put q_out 0 get ogps_xq_idx slot
+    put q_out 1 get ogps_xq_gen slot
+    ret OGPS_OK
+  end
+  for j ulong slot bound 3
+    if eq get ogps_xq_gen j 0
+      ogps_set_error ogps_e_xq_order
+      ret OGPS_ERR
+    end
+  end
+  if le get ogpl_nchan 0 idx
+    ogps_set_error ogps_e_xq_ref
+    ret OGPS_ERR
+  end
+  xpb = new ulong 6 0
+  if ne ogps_mem_alloc OGP_HANDLE_BUF_QUEUE OGPS_RIGHTS_RING 65536 xpb OGPS_OK
+    ret OGPS_ERR
+  end
+  put ogps_xpb_idx slot get xpb 0
+  put ogps_xpb_gen slot get xpb 1
+  put ogps_xpb_sz slot get xpb 5
+  put ogps_xq_idx slot add 100 idx
+  put ogps_xq_gen slot 1
+  put q_out 0 get ogps_xq_idx slot
+  put q_out 1 get ogps_xq_gen slot
+  ret OGPS_OK
+end
+
+fn ogps_on_close hook_id ulong to long
+  if eq hook_id 0
+    ret OGPS_ERR
+  end
+  nh = get ogps_nhooks 0
+  for i ulong nh bound 8
+    if eq get ogps_hooks i hook_id
+      ret OGPS_OK
+    end
+  end
+  if ge nh OGPS_HOOK_MAX
+    ret OGPS_ERR
+  end
+  put ogps_hooks nh hook_id
+  put ogps_nhooks 0 add nh 1
+  ret OGPS_OK
+end
+
+fn ogps_close to void
+  ogps_lock
+  if and ne get ogps_open_flag 0 0 and eq get ogps_blocked 0 0 ne get ogps_plat_set 0 0
+    put ogps_hooks_ran 0 add get ogps_hooks_ran 0 get ogps_nhooks 0
+    if eq get ogps_blocked 0 0
+      for k ulong OGPS_XQ_MAX
+        idx = sub sub OGPS_XQ_MAX 1 k
+        put ogps_xq_idx idx 0
+        put ogps_xq_gen idx 0
+        if ne get ogps_xpb_gen idx 0
+          ign = ogpl_dma_free get ogps_xpb_idx idx get ogps_xpb_gen idx
+          put ogps_xpb_idx idx 0
+          put ogps_xpb_gen idx 0
+          put ogps_xpb_sz idx 0
+        end
+      end
+      ignq = ogpl_queue_close get ogps_q 0 get ogps_q 1
+      put ogps_q 0 0
+      put ogps_q 1 0
+      ogps_free_session_bufs
+      ignd = ogpl_device_close get ogps_dev 0 get ogps_dev 1
+      put ogps_dev 0 0
+      put ogps_dev 1 0
+      put ogps_open_flag 0 0
+    end
+  end
+  ogps_unlock
+end
+
+fn ogps_note_module_latch to void
+  put ogps_mod_latched 0 1
+end
+
+fn ogps_recoveries to ulong
+  ret get ogps_recoveries_cnt 0
+end
+
+fn ogps_recover to long
+  ogps_lock
+  latched = or ne get ogps_blocked 0 0 ne get ogps_mod_latched 0 0
+  if or not latched or eq get ogps_open_flag 0 0 eq get ogps_plat_set 0 0
+    if latched
+      ogps_set_error ogps_e_rec_closed
+    else
+      ogps_set_error ogps_e_rec_not
+    end
+    ogps_unlock
+    ret OGPS_ERR
+  end
+  put ogps_hooks_ran 0 add get ogps_hooks_ran 0 get ogps_nhooks 0
+  if ne get ogps_mock_fail_close 0 0
+    ogps_set_error ogps_e_rec_close
+    ogps_unlock
+    ret OGPS_ERR
+  end
+  prc = ogpl_device_close get ogps_dev 0 get ogps_dev 1
+  if ne prc OGP_OK
+    ogps_set_error ogps_e_rec_close
+    ogps_unlock
+    ret OGPS_ERR
+  end
+  for i ulong OGPS_XQ_MAX
+    put ogps_xq_idx i 0
+    put ogps_xq_gen i 0
+    put ogps_xpb_idx i 0
+    put ogps_xpb_gen i 0
+    put ogps_xpb_sz i 0
+  end
+  for i ulong 6
+    put ogps_pb i 0
+    put ogps_cbank i 0
+    put ogps_marker i 0
+    put ogps_qmd i 0
+  end
+  put ogps_dev 0 0
+  put ogps_dev 1 0
+  put ogps_q 0 0
+  put ogps_q 1 0
+  put ogps_open_flag 0 0
+  for i ulong 3
+    put ogps_pstats i 0
+  end
+  put ogps_recoveries_cnt 0 add get ogps_recoveries_cnt 0 1
+  put ogps_mod_latched 0 0
+  put ogps_blocked 0 0
+  ogps_clear_error
+  ogps_unlock
+  ret OGPS_OK
+end
+
+note ---- Launch helpers ----
+
+fn ogps_pb_put w uint to void
+  pos = get ogps_pb_n 0
+  if lt pos 1024
+    put ogps_pb_words pos w
+    put ogps_pb_n 0 add pos 1
+  end
+end
+
+fn ogps_mthd subc uint mthd uint cnt uint to uint
+  ret or or or uint 0x20000000 shl cnt 16 shl subc 13 shr mthd 2
+end
+
+fn ogps_emit_setup to void
+  ogps_pb_put 0x20012061
+  ogps_pb_put 0x0000cec0
+  ogps_pb_put 0x20012092
+  ogps_pb_put 0x00000001
+  ogps_pb_put 0x200120a8
+  ogps_pb_put 0x0000000f
+  ogps_pb_put 0x2001255d
+  ogps_pb_put 0x00000003
+  ogps_pb_put 0x2001255e
+  ogps_pb_put 0x20000000
+  ogps_pb_put 0x2001255f
+  ogps_pb_put 0x000fffff
+  ogps_pb_put 0x20012557
+  ogps_pb_put 0x00000003
+  ogps_pb_put 0x20012558
+  ogps_pb_put 0x22000000
+  ogps_pb_put 0x20012559
+  ogps_pb_put 0x00000000
+end
+
+fn ogps_emit_dma va ulong cnt uint to void
+  ogps_pb_put ogps_mthd 1 0x0188 2
+  ogps_pb_put uint shr va 32
+  ogps_pb_put uint and va 0xffffffff
+  ogps_pb_put ogps_mthd 1 0x0180 2
+  ogps_pb_put mul cnt 4
+  ogps_pb_put 1
+  ogps_pb_put ogps_mthd 1 0x01b0 1
+  ogps_pb_put 0x41
+  ogps_pb_put or uint 0x6000206d shl cnt 16
+end
+
+fn ogps_emit_inline va ulong q view uint 96 to void
+  ogps_pb_put ogps_mthd 1 0x0318 98
+  ogps_pb_put or uint 0x40000000 uint and shr va 40 0x1ff
+  ogps_pb_put uint and shr va 8 0xffffffff
+  for i ulong 96
+    ogps_pb_put get q i
+  end
+end
+
+fn ogps_emit_c3_tail mark_va ulong to void
+  ogps_pb_put ogps_mthd 0 0x005c 5
+  ogps_pb_put uint and mark_va 0xffffffff
+  ogps_pb_put uint shr mark_va 32
+  ogps_pb_put OGPS_MARKER1_PAYLOAD
+  ogps_pb_put 0
+  ogps_pb_put 0x00100001
+  ogps_pb_put ogps_mthd 0 0x0028 4
+  ogps_pb_put 0
+  ogps_pb_put 0
+  ogps_pb_put 0
+  ogps_pb_put 0x80000000
+  m2 = add mark_va 16
+  ogps_pb_put ogps_mthd 0 0x005c 5
+  ogps_pb_put uint and m2 0xffffffff
+  ogps_pb_put uint shr m2 32
+  ogps_pb_put OGPS_MARKER2_PAYLOAD
+  ogps_pb_put 0
+  ogps_pb_put 0x00100001
+end
+
+fn ogps_fill_cbank_2d cb edit uint 224 va ulong tx ulong ty ulong gx ulong gy ulong to void
+  obwe_fill_cbank cb va
+  put cb 216 uint tx
+  put cb 217 uint ty
+  put cb 220 uint gx
+  put cb 221 uint gy
+end
+
+fn ogps_pack_u32_chunk src view uint * pos ulong chunk ulong dst edit uchar 1024 to void
+  for i ulong chunk bound 256
+    v = get src add pos i
+    b = mul i 4
+    put dst b uchar and v 255
+    put dst add b 1 uchar and shr v 8 255
+    put dst add b 2 uchar and shr v 16 255
+    put dst add b 3 uchar and shr v 24 255
+  end
+end
+
+fn ogps_mapwrite_chunk mh long dst_off ulong buf view uchar 1024 nbytes ulong to void
+  wr = mapwrite mh dst_off buf 0 nbytes
+end
+
+fn ogps_write_u32_map mh long off ulong src view uint * nwords ulong to void
+  tmp = new uchar 1024 0
+  if eq get ogpl_mock 0 0
+    pos = ulong 0
+    while lt pos nwords bound 16
+      chunk = sub nwords pos
+      if gt chunk 256
+        chunk = ulong 256
+      end
+      ogps_pack_u32_chunk src pos chunk tmp
+      ogps_mapwrite_chunk mh add off mul pos 4 tmp mul chunk 4
+      pos = add pos chunk
+    end
+  end
+end
+
+fn ogps_wait_marker off ulong want uint timeout_ms ulong to ulong
+  if ne get ogps_mock_fail_wait 0 0
+    ret get ogps_mock_fail_wait 0
+  end
+  if ne get ogps_cancel_flag 0 0
+    ret 1
+  end
+  obs = new uint 1 0
+  rc = ogpl_poll_word get ogps_marker 0 get ogps_marker 1 off want timeout_ms obs
+  if eq rc OGP_OK
+    ret 0
+  end
+  if eq rc OGP_POLL_TIMED_OUT
+    ret 2
+  end
+  ret 3
+end
+
+fn ogps_wait_marker2 off ulong want uint timeout_ms ulong to ulong
+  if ne get ogps_mock_fail_wait 0 0
+    ret get ogps_mock_fail_wait 0
+  end
+  if ne get ogps_cancel_flag 0 0
+    ret 1
+  end
+  if eq get ogpl_mock 0 0
+    if obwe_poll_word long get ogps_marker 3 off want timeout_ms
+      ret 0
+    end
+    ret 2
+  end
+  obs = new uint 1 0
+  rc = ogpl_poll_word get ogps_marker 0 get ogps_marker 1 off want timeout_ms obs
+  if eq rc OGP_OK
+    ret 0
+  end
+  if eq rc OGP_POLL_TIMED_OUT
+    ret 2
+  end
+  ret 3
+end
+
+note addrs = [cb_va, scratch_va, sem_va, qmd0_va]
+fn ogps_make_qmd_cfg launch view ulong 12 addrs view ulong 4 cfg edit ulong 16 to void
+  ty = get launch 3
+  if eq ty 0
+    ty = ulong 1
+  end
+  gpr = get launch 1
+  if le gpr 64
+    gpr = ulong 64
+  else
+    gpr = mul div add gpr 7 8 8
+  end
+  put cfg 0 get launch 0
+  put cfg 1 get addrs 0
+  put cfg 2 get addrs 1
+  put cfg 3 get addrs 2
+  put cfg 4 get addrs 3
+  put cfg 5 get launch 6
+  put cfg 6 get launch 2
+  put cfg 7 mul get launch 4 get launch 5
+  put cfg 8 get launch 2
+  put cfg 9 ty
+  put cfg 10 get launch 4
+  put cfg 11 get launch 5
+  put cfg 12 gpr
+  put cfg 13 get launch 9
+end
+
+fn ogps_build_launch_qmds launch view ulong 12 q0 edit uint 96 q1 edit uint 96 to long
+  addrs = new ulong 4 0
+  qmd0_va = get ogps_qmd 4
+  put addrs 0 get ogps_cbank 4
+  put addrs 1 add qmd0_va 16384
+  put addrs 2 add qmd0_va 8192
+  put addrs 3 qmd0_va
+  cfg = new ulong 16 0
+  ogps_make_qmd_cfg launch addrs cfg
+  ign0 = bw_qmd0 q0 add qmd0_va 4096
+  if ne bw_qmd1 cfg q1 0
+    ogps_set_error ogps_e_qmd_build
+    ret OGPS_ERR
+  end
+  if ne bw_qmd_verify q1 0
+    ogps_set_error ogps_e_qmd_inv
+    ret OGPS_ERR
+  end
+  ret OGPS_OK
+end
+
+fn ogps_build_launch_pb launch view ulong 12 args view uint * q0 edit uint 96 q1 edit uint 96 to long
+  if ne ogps_build_launch_qmds launch q0 q1 OGPS_OK
+    ret OGPS_ERR
+  end
+  cb = new uint 224 0
+  ty = get launch 3
+  if eq ty 0
+    ty = ulong 1
+  end
+  ogps_fill_cbank_2d cb get ogps_cbank 4 get launch 2 ty get launch 4 get launch 5
+  ogps_write_u32_map long get ogps_cbank 3 0 cb 224
+  ogps_write_u32_map long get ogps_cbank 3 896 args get launch 7
+  ogps_write_u32_map long get ogps_qmd 3 0 q0 96
+  ogps_write_u32_map long get ogps_qmd 3 4096 q1 96
+  if eq get ogpl_mock 0 0
+    r0 = mapset long get ogps_qmd 3 8192 4 0
+    r1 = mapset long get ogps_marker 3 0 4 0
+    r2 = mapset long get ogps_marker 3 16 4 0
+  end
+  put ogps_pb_n 0 0
+  ogps_emit_setup
+  ogps_pb_put ogps_mthd 1 OGPS_MTHD_INVAL_CACHES 1
+  ogps_pb_put OGPS_INVAL_ALL
+  ogps_emit_dma get ogps_cbank 4 224
+  for i ulong 224
+    ogps_pb_put get cb i
+  end
+  ogps_emit_dma add get ogps_cbank 4 896 uint get launch 7
+  for i ulong get launch 7 bound 32
+    ogps_pb_put get args i
+  end
+  ogps_emit_inline get ogps_qmd 4 q0
+  ogps_emit_dma add get ogps_qmd 4 8192 1
+  ogps_pb_put OGPS_SEM_INIT
+  ogps_emit_inline add get ogps_qmd 4 4096 q1
+  ogps_emit_c3_tail get ogps_marker 4
+  ret OGPS_OK
+end
+
+fn ogps_submit_pb to ulong
+  pb_copy = new uint 1024 0
+  nw = get ogps_pb_n 0
+  for i ulong nw bound 1024
+    put pb_copy i get ogps_pb_words i
+  end
+  ret ogpl_queue_submit get ogps_q 0 get ogps_q 1 pb_copy nw
+end
+
+fn ogps_launch_args_ok launch view ulong 12 to bool
+  n_args = get launch 7
+  if or eq n_args 0 gt n_args OGPS_MAX_ARGS
+    ret false
+  end
+  if or eq get launch 2 0 eq get launch 4 0
+    ret false
+  end
+  if or eq get launch 5 0 gt get launch 10 OGPS_MAX_SPIN_US
+    ret false
+  end
+  ret true
+end
+
+fn ogps_prep_and_submit launch view ulong 12 args view uint * to long
+  q0 = new uint 96 0
+  q1 = new uint 96 0
+  if ne ogps_build_launch_pb launch args q0 q1 OGPS_OK
+    ret OGPS_ERR
+  end
+  ign = ogpl_sync_to_gpu get ogps_cbank 0 get ogps_cbank 1 0 OGPS_PAGE
+  ign = ogpl_sync_to_gpu get ogps_qmd 0 get ogps_qmd 1 0 12288
+  ign = ogpl_sync_to_gpu get ogps_marker 0 get ogps_marker 1 0 32
+  if ne ogps_submit_pb OGP_OK
+    ogps_set_error ogps_e_submit
+    ret OGPS_ERR
+  end
+  ret OGPS_OK
+end
+
+fn ogps_launch launch view ulong 12 args view uint * elapsed_out edit ulong 1 marker_out edit uint 1 to long
+  if or eq get ogps_open_flag 0 0 or ne get ogps_blocked 0 0 eq get ogps_plat_set 0 0
+    if ne get ogps_blocked 0 0
+      ogps_set_error ogps_e_latched
+    else
+      ogps_set_error ogps_e_launch_closed
+    end
+    ret OGPS_ERR
+  end
+  if not ogps_launch_args_ok launch
+    ogps_set_error ogps_e_launch_args
+    ret OGPS_ERR
+  end
+  if ogps_take_cancel
+    ogps_set_error ogps_e_cancelled_pre
+    ret OGPS_CANCELLED
+  end
+  t0 = ogps_now_ns
+  if ne ogps_prep_and_submit launch args OGPS_OK
+    ret OGPS_ERR
+  end
+  tmo = get launch 8
+  if eq tmo 0
+    tmo = ulong 5000
+  end
+  w = ogps_wait_marker 0 OGPS_MARKER1_PAYLOAD tmo
+  if eq w 0
+    w = ogps_wait_marker2 16 OGPS_MARKER2_PAYLOAD tmo
+  end
+  if ne w 0
+    if eq w 1
+      ignc = ogps_take_cancel
+      ogps_latch_uncertain ogps_e_cancelled_post
+      ret OGPS_CANCELLED
+    end
+    if eq w 2
+      ogps_latch_uncertain ogps_e_timeout
+    else
+      ogps_latch_uncertain ogps_e_poll_ref
+    end
+    ret OGPS_ERR
+  end
+  ign = ogpl_sync_to_cpu get ogps_marker 0 get ogps_marker 1 0 32
+  ign = ogpl_sync_to_cpu get ogps_qmd 0 get ogps_qmd 1 8192 4
+  t1 = ogps_now_ns
+  if eq get ogpl_mock 0 0
+    sem_v = uint mapget long get ogps_qmd 3 8192 4
+    if ne sem_v OGPS_SEM_DONE
+      ogps_set_error ogps_e_sem_not_done
+      ret OGPS_ERR
+    end
+    put marker_out 0 uint mapget long get ogps_marker 3 0 4
+  else
+    put marker_out 0 OGPS_MARKER1_PAYLOAD
+  end
+  if ge t1 t0
+    put elapsed_out 0 add get elapsed_out 0 sub t1 t0
+  end
+  ret OGPS_OK
+end

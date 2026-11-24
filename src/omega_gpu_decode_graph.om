@@ -1,0 +1,791 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_decode_graph.om: Pure seeded OM-2 twin of src/omega_gpu_decode_graph.c.
+note One Qwen3-30B-A3B decode token as one command list: exact 256-byte aligned buffer
+note layout, barrier/prefetch policy, omega #518 lock/abort token lifecycle, timeline
+note kind/stamp tracking, and RES/SWIGLU/layer/final glue recording.
+om2
+
+const OGDG_OK long 0
+const OGDG_BAD_ARGS long -1
+const OGDG_CODEGEN_FAIL long -3
+const OGDG_CHIP_FAIL long -4
+
+const OGDG_HIDDEN ulong 2048
+const OGDG_QKV ulong 5120
+const OGDG_ATTN ulong 4096
+const OGDG_TOPK ulong 8
+const OGDG_INTER ulong 768
+const OGDG_MAX_LAYERS ulong 64
+const OGDG_ARGMAX_SPAN ulong 2048
+const OGDG_TOKEN_POISON uint 0xffffffff
+
+const OGDG_RES_ADD ulong 1
+const OGDG_RES_COMBINE ulong 2
+const OGDG_RES_NORM ulong 4
+
+const OGDG_K_NORM ulong 0
+const OGDG_K_QKV ulong 1
+const OGDG_K_ATTN ulong 2
+const OGDG_K_O ulong 3
+const OGDG_K_ADD ulong 4
+const OGDG_K_ROUTER ulong 5
+const OGDG_K_GATE_UP ulong 6
+const OGDG_K_SWIGLU ulong 7
+const OGDG_K_DOWN ulong 8
+const OGDG_K_COMBINE ulong 9
+const OGDG_K_LM_HEAD ulong 10
+const OGDG_K_ARGMAX ulong 11
+const OGDG_K_COUNT ulong 12
+
+note Config layout (ulong[6]):
+note   0: layers, 1: vocab, 2: eps_bits, 3: norm_topk, 4: lm_n, 5: lm_k
+note Vas layout (ulong[11]):
+note   0: x, 1: xq, 2: qkv, 3: attn, 4: o, 5: gu, 6: act, 7: dn, 8: hidden, 9: logits, 10: token
+note Stats layout (ulong[6]):
+note   0: launches, 1: submits, 2: chip_ns, 3: record_ns, 4: total_ns, 5: sems_done
+
+global ogdg_live ulong 1
+global ogdg_layers ulong 1
+global ogdg_vocab ulong 1
+global ogdg_eps_bits ulong 1
+global ogdg_norm_topk ulong 1
+global ogdg_am_ctas ulong 1
+global ogdg_cl ulong 1
+global ogdg_buf ulong 6
+global ogdg_code ulong 6
+
+note 19 layout offsets: 0=x,1=xq,2=qkv,3=attn,4=o,5=gu,6=act,7=dn,8=hidden,
+note   9=logits,10=am_v,11=am_i,12=token,13=norms,14=fnorm,15=tabs,16=pf_x,17=pf_y,18=bytes
+global ogdg_lo ulong 19
+
+global ogdg_layer_set uchar 64
+global ogdg_final_set ulong 1
+global ogdg_in_token ulong 1
+global ogdg_failed ulong 1
+global ogdg_xq_layer long 1
+global ogdg_hidden_ready ulong 1
+global ogdg_t_begin ulong 1
+global ogdg_acc ulong 6
+global ogdg_flush_each ulong 1
+global ogdg_mutant ulong 1
+
+note Process-wide barrier & prefetch settings
+global ogdg_barrier_init ulong 1
+global ogdg_barrier_val ulong 1
+global ogdg_prefetch_init ulong 1
+global ogdg_prefetch_val ulong 1
+global ogdg_prefetch_red ulong 1
+
+note Timeline state
+global ogdg_stamps_on ulong 1
+global ogdg_n_kind ulong 1
+global ogdg_tagged ulong 1
+global ogdg_n_stamp ulong 1
+global ogdg_kinds uchar 64
+global ogdg_stamps_buf ulong 65
+
+text ogdg_kn_0 "norm"
+text ogdg_kn_1 "qkv"
+text ogdg_kn_2 "attn"
+text ogdg_kn_3 "o_proj"
+text ogdg_kn_4 "res_add"
+text ogdg_kn_5 "router"
+text ogdg_kn_6 "gate_up"
+text ogdg_kn_7 "swiglu"
+text ogdg_kn_8 "down"
+text ogdg_kn_9 "combine_norm"
+text ogdg_kn_10 "lm_head"
+text ogdg_kn_11 "argmax"
+text ogdg_kn_unk "?"
+
+text ogdg_e_layer "decode graph: layer not set, out of order, or final norm missing"
+text ogdg_e_fnorm "decode graph: final norm not set"
+text ogdg_e_res_mode "decode graph: RES mode not built"
+text ogdg_e_timeline "decode graph: no timeline for last token"
+text ogdg_e_tl_small "decode graph: timeline buffers too small"
+
+fn ogdg_copy_str src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get src i
+  end
+  ret n
+end
+
+fn ogdg_kind_name kind ulong dst edit uchar * to ulong
+  if eq kind 0
+    ret ogdg_copy_str ogdg_kn_0 dst
+  end
+  if eq kind 1
+    ret ogdg_copy_str ogdg_kn_1 dst
+  end
+  if eq kind 2
+    ret ogdg_copy_str ogdg_kn_2 dst
+  end
+  if eq kind 3
+    ret ogdg_copy_str ogdg_kn_3 dst
+  end
+  if eq kind 4
+    ret ogdg_copy_str ogdg_kn_4 dst
+  end
+  if eq kind 5
+    ret ogdg_copy_str ogdg_kn_5 dst
+  end
+  if eq kind 6
+    ret ogdg_copy_str ogdg_kn_6 dst
+  end
+  if eq kind 7
+    ret ogdg_copy_str ogdg_kn_7 dst
+  end
+  if eq kind 8
+    ret ogdg_copy_str ogdg_kn_8 dst
+  end
+  if eq kind 9
+    ret ogdg_copy_str ogdg_kn_9 dst
+  end
+  if eq kind 10
+    ret ogdg_copy_str ogdg_kn_10 dst
+  end
+  if eq kind 11
+    ret ogdg_copy_str ogdg_kn_11 dst
+  end
+  ret ogdg_copy_str ogdg_kn_unk dst
+end
+
+fn ogdg_al v ulong to ulong
+  ret and add v 255 not ulong 255
+end
+
+fn ogdg_set_barrier b ulong to void
+  put ogdg_barrier_init 0 1
+  if and le b 4 ne b 1
+    put ogdg_barrier_val 0 b
+  else
+    put ogdg_barrier_val 0 0
+  end
+end
+
+fn ogdg_barrier to ulong
+  if eq get ogdg_barrier_init 0 0
+    put ogdg_barrier_init 0 1
+    put ogdg_barrier_val 0 0
+  end
+  ret get ogdg_barrier_val 0
+end
+
+fn ogdg_test_set_barrier_none to void
+  put ogdg_barrier_init 0 1
+  put ogdg_barrier_val 0 1
+end
+
+fn ogdg_set_prefetch on ulong to void
+  put ogdg_prefetch_init 0 1
+  if ne on 0
+    put ogdg_prefetch_val 0 1
+  else
+    put ogdg_prefetch_val 0 0
+  end
+end
+
+fn ogdg_prefetch to ulong
+  if eq get ogdg_prefetch_init 0 0
+    put ogdg_prefetch_init 0 1
+    put ogdg_prefetch_val 0 0
+  end
+  ret get ogdg_prefetch_val 0
+end
+
+fn ogdg_test_set_prefetch_red on ulong to void
+  if ne on 0
+    put ogdg_prefetch_red 0 1
+  else
+    put ogdg_prefetch_red 0 0
+  end
+end
+
+fn ogdg_compute_layout layers ulong am_ctas ulong to ulong
+  o = ulong 0
+  put ogdg_lo 0 o
+  o = ogdg_al add o mul OGDG_HIDDEN 4
+  put ogdg_lo 1 o
+  o = ogdg_al add o mul OGDG_HIDDEN 4
+  put ogdg_lo 2 o
+  o = ogdg_al add o mul OGDG_QKV 4
+  put ogdg_lo 3 o
+  o = ogdg_al add o mul OGDG_ATTN 4
+  put ogdg_lo 4 o
+  o = ogdg_al add o mul OGDG_HIDDEN 4
+  put ogdg_lo 5 o
+  o = ogdg_al add o mul mul OGDG_TOPK mul 2 OGDG_INTER 4
+  put ogdg_lo 6 o
+  o = ogdg_al add o mul mul OGDG_TOPK OGDG_INTER 4
+  put ogdg_lo 7 o
+  o = ogdg_al add o mul mul OGDG_TOPK OGDG_HIDDEN 4
+  put ogdg_lo 8 o
+  o = ogdg_al add o mul OGDG_HIDDEN 4
+  put ogdg_lo 9 o
+  o = ogdg_al add o mul mul am_ctas OGDG_ARGMAX_SPAN 4
+  put ogdg_lo 10 o
+  o = ogdg_al add o mul OGDG_ARGMAX_SPAN 4
+  put ogdg_lo 11 o
+  o = ogdg_al add o mul OGDG_ARGMAX_SPAN 4
+  put ogdg_lo 12 o
+  o = ogdg_al add o 16
+  put ogdg_lo 13 o
+  o = ogdg_al add o mul mul layers OGDG_HIDDEN 4
+  put ogdg_lo 14 o
+  o = ogdg_al add o mul OGDG_HIDDEN 4
+  put ogdg_lo 15 o
+  o = ogdg_al add o mul mul layers 2 16
+  put ogdg_lo 16 o
+  o = ogdg_al add o mul OGDG_ATTN 4
+  put ogdg_lo 17 o
+  o = ogdg_al add o mul OGDG_HIDDEN 4
+  put ogdg_lo 18 o
+  ret o
+end
+
+fn ogdg_free to void
+  if eq get ogdg_live 0 0
+    ret
+  end
+  if ne get ogdg_cl 0 0
+    ogcl_free get ogdg_cl 0
+    put ogdg_cl 0 0
+  end
+  ogps_lock
+  tmp = new ulong 6 0
+  for i ulong 6
+    put tmp i get ogdg_buf i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put ogdg_buf i 0
+    put tmp i get ogdg_code i
+  end
+  ogps_free tmp
+  for i ulong 6
+    put ogdg_code i 0
+  end
+  ogps_unlock
+  put ogdg_live 0 0
+  put ogdg_in_token 0 0
+  put ogdg_final_set 0 0
+end
+
+fn ogdg_create cfg view ulong 6 to long
+  layers = get cfg 0
+  vocab = get cfg 1
+  lm_n = get cfg 4
+  lm_k = get cfg 5
+  max_vocab = mul OGDG_ARGMAX_SPAN OGDG_ARGMAX_SPAN
+  if or eq layers 0 gt layers OGDG_MAX_LAYERS
+    ret OGDG_BAD_ARGS
+  end
+  if or eq vocab 0 gt vocab max_vocab
+    ret OGDG_BAD_ARGS
+  end
+  if or ne lm_n vocab ne lm_k OGDG_HIDDEN
+    ret OGDG_BAD_ARGS
+  end
+  am_ctas = div add vocab sub OGDG_ARGMAX_SPAN 1 OGDG_ARGMAX_SPAN
+  total_bytes = ogdg_compute_layout layers am_ctas
+  cid = new ulong 1 0
+  if ne ogcl_create 64 cid 0
+    ret OGDG_CHIP_FAIL
+  end
+  ogps_lock
+  ok = ne ogps_open 0
+  bm = new ulong 6 0
+  cm = new ulong 6 0
+  if ok
+    if ne ogps_alloc total_bytes bm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if ne ogps_alloc_code 512 cm OGPS_OK
+      ok = false
+    end
+  end
+  if ok
+    if ne ogps_sync_to_gpu bm OGPS_OK
+      ok = false
+    end
+  end
+  ogps_unlock
+  if not ok
+    ogps_lock
+    ogps_free bm
+    ogps_free cm
+    ogps_unlock
+    ogcl_free get cid 0
+    ret OGDG_CHIP_FAIL
+  end
+  for i ulong 6
+    put ogdg_buf i get bm i
+    put ogdg_code i get cm i
+  end
+  for i ulong 64
+    put ogdg_layer_set i 0
+  end
+  put ogdg_cl 0 get cid 0
+  put ogdg_layers 0 layers
+  put ogdg_vocab 0 vocab
+  put ogdg_eps_bits 0 get cfg 2
+  put ogdg_norm_topk 0 get cfg 3
+  put ogdg_am_ctas 0 am_ctas
+  put ogdg_final_set 0 0
+  put ogdg_in_token 0 0
+  put ogdg_failed 0 0
+  put ogdg_xq_layer 0 -1
+  put ogdg_hidden_ready 0 0
+  put ogdg_flush_each 0 0
+  put ogdg_mutant 0 0
+  put ogdg_stamps_on 0 0
+  put ogdg_n_kind 0 0
+  put ogdg_tagged 0 0
+  put ogdg_n_stamp 0 0
+  put ogdg_live 0 1
+  ret OGDG_OK
+end
+
+fn ogdg_set_layer layer ulong qkv_ok ulong o_ok ulong gu_ok ulong dn_ok ulong to long
+  if or eq get ogdg_live 0 0 or ge layer get ogdg_layers 0 ne get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq qkv_ok 0 eq o_ok 0
+    ret OGDG_BAD_ARGS
+  end
+  if or eq gu_ok 0 eq dn_ok 0
+    ret OGDG_BAD_ARGS
+  end
+  put ogdg_layer_set layer 1
+  ret OGDG_OK
+end
+
+fn ogdg_set_final_norm to long
+  if or eq get ogdg_live 0 0 ne get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  put ogdg_final_set 0 1
+  ret OGDG_OK
+end
+
+fn ogdg_list to ulong
+  if eq get ogdg_live 0 0
+    ret 0
+  end
+  ret get ogdg_cl 0
+end
+
+fn ogdg_set_flush_each on ulong to void
+  if ne get ogdg_live 0 0
+    if ne on 0
+      put ogdg_flush_each 0 1
+    else
+      put ogdg_flush_each 0 0
+    end
+  end
+end
+
+fn ogdg_test_set_mutant mutant ulong to void
+  if ne get ogdg_live 0 0
+    put ogdg_mutant 0 mutant
+  end
+end
+
+fn ogdg_vas dst edit ulong 11 to void
+  for i ulong 11
+    put dst i 0
+  end
+  if eq get ogdg_live 0 0
+    ret
+  end
+  base_va = get ogdg_buf 4
+  put dst 0 add base_va get ogdg_lo 0
+  put dst 1 add base_va get ogdg_lo 1
+  put dst 2 add base_va get ogdg_lo 2
+  put dst 3 add base_va get ogdg_lo 3
+  put dst 4 add base_va get ogdg_lo 4
+  put dst 5 add base_va get ogdg_lo 5
+  put dst 6 add base_va get ogdg_lo 6
+  put dst 7 add base_va get ogdg_lo 7
+  put dst 8 add base_va get ogdg_lo 8
+  put dst 9 add base_va get ogdg_lo 9
+  put dst 10 add base_va get ogdg_lo 12
+end
+
+fn ogdg_submit_now to long
+  cid = get ogdg_cl 0
+  n = ogcl_count cid
+  if eq n 0
+    ret OGDG_OK
+  end
+  opts = new ulong 7 0
+  put opts 0 OGCL_MODE_PCAS
+  put opts 1 ogdg_barrier
+  put opts 2 20000
+  put opts 4 get ogdg_stamps_on 0
+  st = new ulong 7 0
+  rc = ogcl_submit cid opts st
+  put ogdg_acc 0 add get ogdg_acc 0 get st 0
+  put ogdg_acc 1 add get ogdg_acc 1 get st 1
+  put ogdg_acc 2 add get ogdg_acc 2 get st 3
+  put ogdg_acc 5 add get ogdg_acc 5 get st 5
+  tmp = new ulong 65 0
+  if and eq rc 0 ne get ogdg_stamps_on 0 0
+    cnt = ogcl_stamps cid tmp 65
+    if lt cnt 0
+      rc = long -1
+    else
+      from = ulong 0
+      if ne get ogdg_n_stamp 0 0
+        from = ulong 1
+      end
+      i = from
+      while lt i ulong cnt bound 65
+        ns = get ogdg_n_stamp 0
+        if lt ns 65
+          put ogdg_stamps_buf ns get tmp i
+          put ogdg_n_stamp 0 add ns 1
+        end
+        i = add i 1
+      end
+    end
+  end
+  put ogdg_tagged 0 0
+  ogcl_reset cid
+  if ne rc 0
+    put ogdg_failed 0 1
+    ret OGDG_CHIP_FAIL
+  end
+  if ne get st 5 get st 0
+    put ogdg_failed 0 1
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogdg_tag kind ulong to void
+  n = ogcl_count get ogdg_cl 0
+  t = get ogdg_tagged 0
+  while and lt t n lt get ogdg_n_kind 0 64 bound 64
+    nk = get ogdg_n_kind 0
+    put ogdg_kinds nk uchar kind
+    put ogdg_n_kind 0 add nk 1
+    t = add t 1
+  end
+  put ogdg_tagged 0 t
+end
+
+fn ogdg_add_op kind ulong gx ulong gy ulong elems ulong to long
+  L = new ulong 12 0
+  put L 0 get ogdg_code 4
+  put L 1 64
+  put L 2 256
+  put L 3 1
+  put L 4 gx
+  put L 5 gy
+  put L 6 elems
+  put L 7 4
+  put L 8 20000
+  args = new uint 4 0
+  put args 0 uint kind
+  put args 1 uint gx
+  put args 2 uint gy
+  put args 3 uint elems
+  rc = ogcl_add get ogdg_cl 0 L args
+  if lt rc 0
+    put ogdg_failed 0 1
+    ret OGDG_CHIP_FAIL
+  end
+  ogdg_tag kind
+  if ne get ogdg_flush_each 0 0
+    ret ogdg_submit_now
+  end
+  ret OGDG_OK
+end
+
+fn ogdg_record_res mode ulong to long
+  if or eq get ogdg_live 0 0 eq get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  kind = ulong 99
+  if eq mode OGDG_RES_NORM
+    kind = OGDG_K_NORM
+  end
+  if eq mode OGDG_RES_ADD
+    kind = OGDG_K_ADD
+  end
+  if eq mode or OGDG_RES_COMBINE OGDG_RES_NORM
+    kind = OGDG_K_COMBINE
+  end
+  if eq kind 99
+    put ogdg_failed 0 1
+    ogps_set_error ogdg_e_res_mode
+    ret OGDG_BAD_ARGS
+  end
+  ret ogdg_add_op kind 1 1 OGDG_HIDDEN
+end
+
+fn ogdg_record_swiglu to long
+  if or eq get ogdg_live 0 0 eq get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  ret ogdg_add_op OGDG_K_SWIGLU 3 OGDG_TOPK mul OGDG_TOPK OGDG_INTER
+end
+
+fn ogdg_begin_token to long
+  if or eq get ogdg_live 0 0 ne get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  ogps_lock
+  put ogdg_t_begin 0 ogps_now_ns
+  put ogdg_in_token 0 1
+  put ogdg_failed 0 0
+  put ogdg_xq_layer 0 -1
+  put ogdg_hidden_ready 0 0
+  for i ulong 6
+    put ogdg_acc i 0
+  end
+  put ogdg_n_kind 0 0
+  put ogdg_tagged 0 0
+  put ogdg_n_stamp 0 0
+  ogcl_reset get ogdg_cl 0
+  if eq ogps_open 0
+    ogcl_reset get ogdg_cl 0
+    put ogdg_in_token 0 0
+    put ogdg_failed 0 1
+    ogps_unlock
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogdg_record_layer layer ulong pos ulong to long
+  if or eq get ogdg_live 0 0 eq get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogdg_failed 0 0
+    ret OGDG_CHIP_FAIL
+  end
+  layers = get ogdg_layers 0
+  last = eq add layer 1 layers
+  if or ge layer layers eq get ogdg_layer_set layer 0
+    put ogdg_failed 0 1
+    ogps_set_error ogdg_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  if or ne get ogdg_hidden_ready 0 0 and last eq get ogdg_final_set 0 0
+    put ogdg_failed 0 1
+    ogps_set_error ogdg_e_layer
+    ret OGDG_BAD_ARGS
+  end
+  rc = OGDG_OK
+  if ne get ogdg_xq_layer 0 long layer
+    rc = ogdg_record_res OGDG_RES_NORM
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_QKV 1 1 OGDG_QKV
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_ATTN 1 1 OGDG_ATTN
+  end
+  if and eq rc OGDG_OK ne ogdg_prefetch 0
+    rc = ogdg_add_op OGDG_K_ATTN 1 1 OGDG_HIDDEN
+    if eq rc OGDG_OK
+      if ne ogcl_mark_independent get ogdg_cl 0 0
+        rc = OGDG_CHIP_FAIL
+      end
+    end
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_O 1 1 OGDG_HIDDEN
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_record_res OGDG_RES_ADD
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_ROUTER 1 1 OGDG_TOPK
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_GATE_UP 1 OGDG_TOPK mul OGDG_TOPK mul 2 OGDG_INTER
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_record_swiglu
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_DOWN 1 OGDG_TOPK mul OGDG_TOPK OGDG_HIDDEN
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_record_res or OGDG_RES_COMBINE OGDG_RES_NORM
+    if eq rc OGDG_OK
+      if last
+        put ogdg_hidden_ready 0 1
+      else
+        put ogdg_xq_layer 0 long add layer 1
+      end
+    end
+  end
+  ret rc
+end
+
+fn ogdg_record_final to long
+  if or eq get ogdg_live 0 0 eq get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  if ne get ogdg_failed 0 0
+    ret OGDG_CHIP_FAIL
+  end
+  if eq get ogdg_final_set 0 0
+    put ogdg_failed 0 1
+    ogps_set_error ogdg_e_fnorm
+    ret OGDG_BAD_ARGS
+  end
+  rc = OGDG_OK
+  if eq get ogdg_hidden_ready 0 0
+    rc = ogdg_record_res OGDG_RES_NORM
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_LM_HEAD 1 1 get ogdg_vocab 0
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_ARGMAX get ogdg_am_ctas 0 1 mul get ogdg_am_ctas 0 OGDG_ARGMAX_SPAN
+  end
+  if eq rc OGDG_OK
+    rc = ogdg_add_op OGDG_K_ARGMAX 1 1 OGDG_ARGMAX_SPAN
+  end
+  ret rc
+end
+
+fn ogdg_end_token tok_out edit uint 1 st_out edit ulong 6 to long
+  if or eq get ogdg_live 0 0 eq get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  rc = OGDG_OK
+  if ne get ogdg_failed 0 0
+    rc = OGDG_CHIP_FAIL
+  end
+  t_rec = ogps_now_ns
+  if eq rc OGDG_OK
+    rc = ogdg_submit_now
+  end
+  if eq rc OGDG_OK
+    put tok_out 0 0
+  end
+  ogcl_reset get ogdg_cl 0
+  put ogdg_in_token 0 0
+  t_end = ogps_now_ns
+  t0 = get ogdg_t_begin 0
+  for i ulong 6
+    put st_out i get ogdg_acc i
+  end
+  if ne get ogdg_flush_each 0 0
+    if ge t_end t0
+      put st_out 3 sub t_end t0
+    end
+  else
+    if ge t_rec t0
+      put st_out 3 sub t_rec t0
+    end
+  end
+  if ge t_end t0
+    put st_out 4 sub t_end t0
+  end
+  ogps_unlock
+  ret rc
+end
+
+fn ogdg_abort_token to long
+  if or eq get ogdg_live 0 0 eq get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  ogcl_reset get ogdg_cl 0
+  put ogdg_in_token 0 0
+  put ogdg_tagged 0 0
+  put ogdg_n_stamp 0 0
+  ogps_unlock
+  ret OGDG_OK
+end
+
+fn ogdg_token pos ulong tok_out edit uint 1 st_out edit ulong 6 to long
+  if eq get ogdg_live 0 0
+    ret OGDG_BAD_ARGS
+  end
+  brc = ogdg_begin_token
+  if ne brc OGDG_OK
+    for i ulong 6
+      put st_out i 0
+    end
+    ret brc
+  end
+  layers = get ogdg_layers 0
+  for l ulong layers bound 64
+    if eq get ogdg_failed 0 0
+      ign = ogdg_record_layer l pos
+    end
+  end
+  if eq get ogdg_failed 0 0
+    ign2 = ogdg_record_final
+  end
+  ret ogdg_end_token tok_out st_out
+end
+
+fn ogdg_read to long
+  if or eq get ogdg_live 0 0 ne get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  ogps_lock
+  bm = new ulong 6 0
+  for i ulong 6
+    put bm i get ogdg_buf i
+  end
+  rc = ogps_sync_to_cpu bm
+  ogps_unlock
+  if ne rc OGPS_OK
+    ret OGDG_CHIP_FAIL
+  end
+  ret OGDG_OK
+end
+
+fn ogdg_set_stamps on ulong to void
+  if and ne get ogdg_live 0 0 eq get ogdg_in_token 0 0
+    if ne on 0
+      put ogdg_stamps_on 0 1
+    else
+      put ogdg_stamps_on 0 0
+    end
+  end
+end
+
+fn ogdg_stamps stamps_out edit ulong * kinds_out edit uchar * cap ulong to long
+  if or eq get ogdg_live 0 0 ne get ogdg_in_token 0 0
+    ret OGDG_BAD_ARGS
+  end
+  nk = get ogdg_n_kind 0
+  ns = get ogdg_n_stamp 0
+  if or eq get ogdg_stamps_on 0 0 ne get ogdg_failed 0 0
+    ogps_set_error ogdg_e_timeline
+    ret OGDG_BAD_ARGS
+  end
+  if ne ns add nk 1
+    ogps_set_error ogdg_e_timeline
+    ret OGDG_BAD_ARGS
+  end
+  if lt cap ns
+    ogps_set_error ogdg_e_tl_small
+    ret OGDG_BAD_ARGS
+  end
+  for i ulong ns bound 65
+    put stamps_out i get ogdg_stamps_buf i
+  end
+  for i ulong nk bound 64
+    put kinds_out i get ogdg_kinds i
+  end
+  ret long nk
+end
