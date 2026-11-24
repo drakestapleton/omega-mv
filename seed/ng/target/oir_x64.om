@@ -1,0 +1,270 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/oir_x64.om: Real ΩIR binary (seed/ng/src/ir.om + opt.om) -> Register-Allocated x86-64 ELF64 compiler!
+note Composes directly with seed/ng/src/ir.om, seed/ng/src/opt.om, and seed/ng/target/{target_desc,regalloc,isel,sm121_pe}.om.
+note Reads canonical OSC1IR v9 ΩIR bytes on stdin, runs op_run (seed/ng/src/opt.om), allocates physical x86-64 registers
+note via our shared target-parameterized regalloc.om (TID_X64_AVX2), and writes a standalone static x86-64 ELF64 to stdout.
+
+global oxValIdx ulong 256
+global oxValCnt ulong 1
+global oxOpPos ulong 256
+
+fn oxFindOrAddVal vid ulong to ulong
+n = get oxValCnt 0
+for i ulong n bound 256
+if eq get oxValIdx i vid
+ret i
+end
+end
+put oxValIdx n vid
+put oxValCnt 0 add n 1
+ret n
+end
+
+note Physical x86-64 register map for allocator slots 0..14 (avoids RSP=4):
+note 0=RAX(0), 1=RDI(7), 2=RSI(6), 3=RDX(2), 4=RCX(1), 5=RBX(3), 6=RBP(5), 7..14=R8..R15(8..15)
+fn oxX64Reg slot ulong to ulong
+if eq slot 0
+ret 0
+end
+if eq slot 1
+ret 7
+end
+if eq slot 2
+ret 6
+end
+if eq slot 3
+ret 2
+end
+if eq slot 4
+ret 1
+end
+if eq slot 5
+ret 3
+end
+if eq slot 6
+ret 5
+end
+ret add slot 1
+end
+
+note Emit x86-64 movabs r64, imm64 (REX.W + (0xB8 + (r&7)) + imm64)
+fn oxEmitImm64 pr ulong imm ulong to void
+rex = ulong 72
+if ge pr 8
+rex = or rex 1
+end
+isEmitU8 rex
+isEmitU8 add 184 and pr 7
+isEmitU64 imm
+end
+
+note Emit x86-64 mov dst, src (if dst != src)
+fn oxEmitMov prDst ulong prSrc ulong to void
+if eq prDst prSrc
+ret
+end
+isEmitU8 isX64Rex prSrc prDst
+isEmitU8 137
+isEmitU8 isX64ModRm prSrc prDst
+end
+
+note Emit x86-64 ALU reg-reg: op = 1(add), 41(sub), 33(and), 9(or), 49(xor)
+fn oxEmitAlu opc ulong pd ulong pn ulong pm ulong to void
+oxEmitMov pd pn
+isEmitU8 isX64Rex pm pd
+isEmitU8 opc
+isEmitU8 isX64ModRm pm pd
+end
+
+note Emit x86-64 imul pd, pm (with 2-addr mov if pd != pn)
+fn oxEmitMul pd ulong pn ulong pm ulong to void
+oxEmitMov pd pn
+isEmitU8 isX64Rex pd pm
+isEmitU8 15
+isEmitU8 175
+isEmitU8 isX64ModRm pd pm
+end
+
+note Emit x86-64 neg pd (REX.W 0xF7 /3)
+fn oxEmitNeg pd ulong pn ulong to void
+oxEmitMov pd pn
+rex = ulong 72
+if ge pd 8
+rex = or rex 1
+end
+isEmitU8 rex
+isEmitU8 247
+isEmitU8 or 216 and pd 7
+end
+
+note Emit Linux x86-64 SYS_exit(prVal): mov rdi, prVal; mov eax, 60; syscall
+fn oxEmitExit prVal ulong to void
+oxEmitMov 7 prVal
+isEmitU8 184
+isEmitU32 60
+isEmitU8 15
+isEmitU8 5
+end
+
+fn oxPhysOfVal vid ulong to ulong
+n = get oxValCnt 0
+for i ulong n bound 256
+if eq get oxValIdx i vid
+ret oxX64Reg get raPhys i
+end
+end
+ret 0
+end
+
+note Build live intervals for all SSA values in export function f, then run shared regalloc.om (TID_X64_AVX2)!
+fn oxAllocFunc f uint to bool
+put oxValCnt 0 0
+raReset
+b = get i_fb1 f
+pos = ulong 0
+while ne b 0 bound 64
+o = get i_bo1 b
+while ne o 0 bound 256
+res = ulong get i_ors o
+if ne res 0
+idx = oxFindOrAddVal res
+if ge idx get raNVal 0
+id = raAddInterval pos pos RA_SPILL
+end
+end
+na = ulong get i_ona o
+a0 = ulong get i_oa0 o
+for k ulong na bound 16
+av = ulong get i_arg add a0 k
+if ne av 0
+vi = oxFindOrAddVal av
+if lt vi get raNVal 0
+if gt pos get raEnd vi
+put raEnd vi pos
+end
+end
+end
+end
+pos = add pos 1
+o = get i_onx o
+end
+b = get i_bnx b
+end
+sp = raRunForTarget TID_X64_AVX2
+if ne raVerifyColoring 0
+ret false
+end
+ret eq sp 0
+end
+
+fn oxLowerOneOp o uint to bool
+op = ulong get i_oop o
+res = ulong get i_ors o
+a0 = ulong get i_oa0 o
+if eq op 1
+pd = oxPhysOfVal res
+oxEmitImm64 pd get i_oim o
+ret true
+end
+if eq op 10
+oxEmitAlu 1 oxPhysOfVal res oxPhysOfVal ulong get i_arg a0 oxPhysOfVal ulong get i_arg add a0 1
+ret true
+end
+if eq op 11
+oxEmitAlu 41 oxPhysOfVal res oxPhysOfVal ulong get i_arg a0 oxPhysOfVal ulong get i_arg add a0 1
+ret true
+end
+if eq op 12
+oxEmitMul oxPhysOfVal res oxPhysOfVal ulong get i_arg a0 oxPhysOfVal ulong get i_arg add a0 1
+ret true
+end
+if eq op 15
+oxEmitNeg oxPhysOfVal res oxPhysOfVal ulong get i_arg a0
+ret true
+end
+if eq op 16
+oxEmitAlu 33 oxPhysOfVal res oxPhysOfVal ulong get i_arg a0 oxPhysOfVal ulong get i_arg add a0 1
+ret true
+end
+if eq op 17
+oxEmitAlu 9 oxPhysOfVal res oxPhysOfVal ulong get i_arg a0 oxPhysOfVal ulong get i_arg add a0 1
+ret true
+end
+if eq op 18
+oxEmitAlu 49 oxPhysOfVal res oxPhysOfVal ulong get i_arg a0 oxPhysOfVal ulong get i_arg add a0 1
+ret true
+end
+if eq op 36
+oxEmitMov oxPhysOfVal res oxPhysOfVal ulong get i_arg a0
+ret true
+end
+if or eq op 63 eq op 66
+oxEmitExit oxPhysOfVal ulong get i_arg a0
+ret true
+end
+if eq op 62
+oxEmitExit 0
+ret true
+end
+note Ignore pure facts (90..93) and checks (70..82) that op_run left on token chain
+if and ge op 70 le op 93
+ret true
+end
+ret false
+end
+
+fn oxCompileExport to ulong
+nf = get i_n 3
+expF = uint 0
+for fi ulong nf bound 64
+f = uint add fi 1
+if eq get i_fk f 2
+expF = f
+end
+end
+if eq expF 0
+ret 0
+end
+if not oxAllocFunc expF
+ret 0
+end
+isBufReset
+b = get i_fb1 expF
+while ne b 0 bound 64
+o = get i_bo1 b
+while ne o 0 bound 256
+if not oxLowerOneOp o
+ret 0
+end
+o = get i_onx o
+end
+b = get i_bnx b
+end
+ret elfEmitStatic TID_X64_AVX2
+end
+
+fn main to int
+tdInitAll
+isInitRules
+tdCacheInit
+r = ar_rdin 0
+if ne r 0
+ret 2
+end
+ar_init
+n = get ar_inl 0
+rr = ir_read 0 n
+if ne rr 0
+ret int rr
+end
+op_run
+eln = oxCompileExport
+if eq eln 0
+ret 3
+end
+w = write 1 elfBuf 0 eln
+if ne w long eln
+ret 4
+end
+ret 0
+end
