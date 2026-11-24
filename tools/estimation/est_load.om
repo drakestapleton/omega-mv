@@ -1,0 +1,439 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tools/estimation/est_load.om -- EST-3c (protocol v3) declared CPU load
+note schedule in pure seeded OM-2 (standalone).
+note
+note Usage: est_load <seed> <seconds> <marks-file>
+
+const EL_MAX_SEGS ulong 4096
+const EL_MAX_WORKERS ulong 18
+const EL_NS long 1000000000
+const EL_NAP long 100000000
+
+text t_el_usage "usage: est_load <seed> <seconds> <marks-file>\n"
+text t_el_badsec "est_load: seconds must be > 0\n"
+text t_el_hdr1 "est_load seed "
+text t_el_hdr2 " seconds "
+text t_el_hdr3 " segments "
+text t_el_sched "schedule "
+text t_el_err_marks "est_load: marks: cannot open\n"
+text t_el_err_fork "est_load: fork failed\n"
+text t_el_begin " begin load-L"
+text t_el_end " end load-L"
+text t_el_exit0 " exit 0\n"
+text t_el_done "est_load done\n"
+
+global g_el_arg uchar 4096
+global g_el_mpath uchar 4096
+global g_el_mlen ulong 1
+global g_el_level ulong 4096
+global g_el_secs long 4096
+global g_el_pids int 18
+global g_el_ob uchar 65536
+global g_el_olen ulong 1
+global g_el_ofd int 1
+
+fn el_flush to void
+  n = get g_el_olen 0
+  if eq n 0
+    ret
+  end
+  fd = get g_el_ofd 0
+  off = ulong 0
+  while lt off n bound 65536
+    k = write fd g_el_ob off sub n off
+    if le k 0
+      break
+    end
+    off = add off ulong k
+  end
+  put g_el_olen 0 0
+end
+
+fn el_init fd int to void
+  put g_el_ofd 0 fd
+  put g_el_olen 0 0
+end
+
+fn el_c c uchar to void
+  n = get g_el_olen 0
+  if ge n 65536
+    el_flush
+    n = get g_el_olen 0
+  end
+  put g_el_ob n c
+  put g_el_olen 0 add n 1
+end
+
+fn el_t s view uchar * to void
+  for i ulong len s
+    el_c get s i
+  end
+end
+
+fn el_u v ulong to void
+  if eq v 0
+    el_c 48
+    ret
+  end
+  buf = new uchar 24 0
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put buf n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  i = n
+  while gt i 0 bound 24
+    i = sub i 1
+    el_c get buf i
+  end
+end
+
+fn el_i v long to void
+  if lt v 0
+    el_c 45
+    if eq v long -9223372036854775808
+      el_u ulong 9223372036854775808
+      ret
+    end
+    el_u ulong sub 0 v
+    ret
+  end
+  el_u ulong v
+end
+
+fn el_u_pad v ulong width ulong to void
+  buf = new uchar 24 0
+  n = ulong 0
+  x = v
+  if eq x 0
+    put buf 0 48
+    n = 1
+  else
+    while gt x 0 bound 24
+      put buf n uchar add 48 rem x 10
+      x = div x 10
+      n = add n 1
+    end
+  end
+  while lt n width bound 24
+    put buf n 48
+    n = add n 1
+  end
+  i = n
+  while gt i 0 bound 24
+    i = sub i 1
+    el_c get buf i
+  end
+end
+
+fn el_write_err s view uchar * to void
+  el_init 2
+  el_t s
+  el_flush
+end
+
+fn el_skip_ws n ulong to ulong
+  i = ulong 0
+  while lt i n bound 4096
+    c = get g_el_arg i
+    if and ne c 32 and ne c 9 and ne c 10 ne c 13
+      break
+    end
+    i = add i 1
+  end
+  ret i
+end
+
+fn el_hex_digit c uchar to long
+  if and ge c 48 le c 57
+    ret sub long c 48
+  end
+  if and ge c 97 le c 102
+    ret add 10 sub long c 97
+  end
+  if and ge c 65 le c 70
+    ret add 10 sub long c 65
+  end
+  ret -1
+end
+
+fn el_parse_u64_base0 n ulong to ulong
+  i = el_skip_ws n
+  if ge i n
+    ret 0
+  end
+  neg_flag = ulong 0
+  if eq get g_el_arg i 45
+    neg_flag = 1
+    i = add i 1
+  else
+    if eq get g_el_arg i 43
+      i = add i 1
+    end
+  end
+  base = ulong 10
+  if and lt i n eq get g_el_arg i 48
+    if lt add i 1 n
+      c1 = get g_el_arg add i 1
+      if or eq c1 120 eq c1 88
+        base = 16
+        i = add i 2
+      else
+        base = 8
+        i = add i 1
+      end
+    end
+  end
+  v = ulong 0
+  while lt i n bound 4096
+    c = get g_el_arg i
+    d = el_hex_digit c
+    if or lt d 0 ge ulong d base
+      break
+    end
+    v = add mul v base ulong d
+    i = add i 1
+  end
+  if eq neg_flag 1
+    ret sub ulong 0 v
+  end
+  ret v
+end
+
+fn el_parse_i64_dec n ulong to long
+  i = el_skip_ws n
+  if ge i n
+    ret 0
+  end
+  neg_flag = ulong 0
+  if eq get g_el_arg i 45
+    neg_flag = 1
+    i = add i 1
+  else
+    if eq get g_el_arg i 43
+      i = add i 1
+    end
+  end
+  v = ulong 0
+  while lt i n bound 4096
+    c = get g_el_arg i
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 ulong sub c 48
+    i = add i 1
+  end
+  if eq neg_flag 1
+    ret sub long 0 long v
+  end
+  ret long v
+end
+
+fn el_splitmix64 st edit ulong 1 to ulong
+  s = add get st 0 ulong 0x9e3779b97f4a7c15
+  put st 0 s
+  z = mul xor s shr s 30 ulong 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 ulong 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+fn el_level_of idx ulong to ulong
+  if eq idx 0
+    ret 0
+  end
+  if eq idx 1
+    ret 6
+  end
+  if eq idx 2
+    ret 12
+  end
+  ret 18
+end
+
+fn el_spin_child idx ulong to void
+  x = add idx 1
+  while true bound 9223372036854775807
+    x = add mul x ulong 6364136223846793005 ulong 1442695040888963407
+  end
+end
+
+fn el_emit_now to void
+  ns = realns
+  sec = div ns EL_NS
+  rem_ns = rem ns EL_NS
+  if lt rem_ns 0
+    sec = sub sec 1
+    rem_ns = add rem_ns EL_NS
+  end
+  el_i sec
+  el_c 46
+  el_u_pad ulong rem_ns 9
+end
+
+fn el_write_mark fd int is_begin ulong lv ulong idx ulong to void
+  el_init fd
+  el_emit_now
+  if eq is_begin 1
+    el_t t_el_begin
+    el_u lv
+    el_c 45
+    el_u_pad idx 3
+    el_c 10
+  else
+    el_t t_el_end
+    el_u lv
+    el_c 45
+    el_u_pad idx 3
+    el_t t_el_exit0
+  end
+  el_flush
+end
+
+fn el_spawn_workers lv ulong to long
+  for k ulong lv
+    pid = fork
+    if lt pid 0
+      ret -1
+    end
+    if eq pid 0
+      el_spin_child k
+      exit 0
+    end
+    put g_el_pids k int pid
+  end
+  ret 0
+end
+
+fn el_stop_workers lv ulong to void
+  st = new uchar 4 0
+  for k ulong lv
+    pid = get g_el_pids k
+    ign = killpid pid 9
+    ign = waitpid pid st 0 4 0
+  end
+end
+
+fn el_wait_secs secs long to void
+  end_ns = add monons mul secs EL_NS
+  while true bound 9223372036854775807
+    cur = monons
+    if ge cur end_ns
+      break
+    end
+    ign = sleepns EL_NAP
+  end
+end
+
+fn el_build_schedule seed ulong total long to ulong
+  st = new ulong 1 seed
+  nseg = ulong 0
+  acc = long 0
+  while and lt acc total lt nseg EL_MAX_SEGS bound 4096
+    r1 = el_splitmix64 st
+    r2 = el_splitmix64 st
+    lv = el_level_of rem r1 4
+    d = add 20 long rem r2 101
+    if gt add acc d total
+      d = sub total acc
+    end
+    put g_el_level nseg lv
+    put g_el_secs nseg d
+    acc = add acc d
+    nseg = add nseg 1
+  end
+  ret nseg
+end
+
+fn el_print_schedule seed ulong total long nseg ulong to void
+  el_init 1
+  el_t t_el_hdr1
+  el_u seed
+  el_t t_el_hdr2
+  el_i total
+  el_t t_el_hdr3
+  el_u nseg
+  el_c 10
+  for i ulong nseg
+    el_t t_el_sched
+    el_u i
+    el_c 32
+    el_u get g_el_level i
+    el_c 32
+    el_i get g_el_secs i
+    el_c 10
+  end
+  el_flush
+end
+
+fn el_run_schedule mfd int nseg ulong to int
+  for i ulong nseg
+    lv = get g_el_level i
+    secs = get g_el_secs i
+    if gt lv 0
+      el_write_mark mfd 1 lv i
+      if lt el_spawn_workers lv 0
+        el_write_err t_el_err_fork
+        ret 1
+      end
+    end
+    el_wait_secs secs
+    if gt lv 0
+      el_stop_workers lv
+      el_write_mark mfd 0 lv i
+    end
+  end
+  ret 0
+end
+
+fn main to int
+  if ne argcnt 4
+    el_write_err t_el_usage
+    ret 2
+  end
+  n1 = argread 1 g_el_arg 0 4096
+  if lt n1 0
+    el_write_err t_el_usage
+    ret 2
+  end
+  seed = el_parse_u64_base0 ulong n1
+  n2 = argread 2 g_el_arg 0 4096
+  if lt n2 0
+    el_write_err t_el_badsec
+    ret 2
+  end
+  total = el_parse_i64_dec ulong n2
+  if le total 0
+    el_write_err t_el_badsec
+    ret 2
+  end
+  n3 = argread 3 g_el_mpath 0 4096
+  if le n3 0
+    el_write_err t_el_err_marks
+    ret 1
+  end
+  put g_el_mlen 0 ulong n3
+
+  nseg = el_build_schedule seed total
+  el_print_schedule seed total nseg
+
+  mfd = fopen g_el_mpath 0 get g_el_mlen 0 1089 438
+  if lt mfd 0
+    el_write_err t_el_err_marks
+    ret 1
+  end
+
+  rc = el_run_schedule int mfd nseg
+  ign = fclose int mfd
+  if ne rc 0
+    ret rc
+  end
+  el_init 1
+  el_t t_el_done
+  el_flush
+  ret 0
+end
