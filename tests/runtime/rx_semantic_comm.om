@@ -1,0 +1,210 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_semantic_comm.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_semantic_comm.c (OMEGA_SEMANTIC_COMM).
+note Verifies authority-gated projection, privacy masking, uncertainty
+note filtering, incremental deltas, invalidation propagation, digest
+note determinism, and derived SUM/MAX aggregation.
+
+global sct_checks ulong 1
+global sct_fail ulong 1
+
+text sct_pass "RX_SEMANTIC_COMM_OM: PASS\n"
+text sct_fail_m "RX_SEMANTIC_COMM_OM: FAIL\n"
+
+fn sct_chk cond bool to void
+  put sct_checks 0 add get sct_checks 0 1
+  if not cond
+    if eq get sct_fail 0 0
+      put sct_fail 0 get sct_checks 0
+    end
+  end
+end
+
+fn sct_setup_world to void
+  for i ulong 256
+    put sc_w_meta i 0
+  end
+  note obj 0: type 10, res 100, f0=100, f1=50 (private), f2=150 (low unc)
+  put sc_w_meta 0 1
+  put sc_w_meta 1 1
+  put sc_w_meta 2 10
+  put sc_w_meta 3 100
+  put sc_w_val 0 100
+  put sc_w_ver 0 1
+  put sc_w_wrt 0 5
+  put sc_w_val 1 50
+  put sc_w_ver 1 1
+  put sc_w_wrt 1 5
+  put sc_w_val 2 150
+  put sc_w_ver 2 1
+  put sc_w_wrt 2 5
+
+  note obj 1: type 10, res 101, f0=250, f2=900 (high unc)
+  put sc_w_meta 4 1
+  put sc_w_meta 5 1
+  put sc_w_meta 6 10
+  put sc_w_meta 7 101
+  put sc_w_val 8 250
+  put sc_w_ver 8 1
+  put sc_w_wrt 8 6
+  put sc_w_val 10 900
+  put sc_w_ver 10 1
+  put sc_w_wrt 10 6
+
+  note obj 2: type 10, res 102 (unauthorized)
+  put sc_w_meta 8 1
+  put sc_w_meta 9 1
+  put sc_w_meta 10 10
+  put sc_w_meta 11 102
+  put sc_w_val 16 999
+  put sc_w_ver 16 1
+  put sc_w_wrt 16 7
+
+  note obj 3: type 10, res 103, f0=400, f2=100 (low unc, authorized)
+  put sc_w_meta 12 1
+  put sc_w_meta 13 1
+  put sc_w_meta 14 10
+  put sc_w_meta 15 103
+  put sc_w_val 24 400
+  put sc_w_ver 24 1
+  put sc_w_wrt 24 8
+  put sc_w_val 26 100
+  put sc_w_ver 26 1
+  put sc_w_wrt 26 8
+
+  note Schema for type 10: priv_mask=2 (f1), has_unc=1, unc_field=2, conclusion=1
+  put sc_sch_n 0 1
+  put sc_sch 0 10
+  put sc_sch 1 2
+  put sc_sch 2 1
+  put sc_sch 3 or 2 shl ulong 1 8
+
+  note Receiver subject=7 holds READ on res 100, 101, 103 (NOT 102)
+  put sc_cap_hdr 0 7
+  put sc_cap_hdr 1 3
+  put sc_caps 0 100
+  put sc_caps 1 1
+  put sc_caps 2 1
+  put sc_caps 3 101
+  put sc_caps 4 1
+  put sc_caps 5 1
+  put sc_caps 6 103
+  put sc_caps 7 1
+  put sc_caps 8 1
+end
+
+fn sct_test_delta_and_invalidation to void
+  sct_setup_world
+  sc_cursor_init
+  rx_sem_view_init
+  for i ulong 12
+    put sc_need i 0
+  end
+  put sc_need 0 7
+  put sc_need 1 SC_OP_INSPECT
+  put sc_need 2 3
+  put sc_need 8 SC_EV_WRITER
+  put sc_need 9 500
+  sct_chk eq rx_sem_project SC_OK
+  note obj 0 and obj 3 included; obj 1 excluded uncertain; obj 2 withheld authority
+  sct_chk eq get sc_p_meta 0 2
+  sct_chk eq get sc_p_meta 5 1
+  sct_chk eq get sc_p_meta 6 2
+  sct_chk eq get sc_p_meta 7 1
+
+  st = new ulong 7 0
+  sct_chk eq rx_sem_delta 7 1 st SC_OK
+  sct_chk eq get st 4 2
+  sct_chk eq get st 0 2
+  sct_chk eq rx_sem_view_apply get sc_wlen 0 SC_OK
+  sct_chk eq get sc_v_pres 0 1
+  sct_chk eq get sc_v_pres 3 1
+  sct_chk eq get sc_v_val 0 100
+  sct_chk eq get sc_v_val 24 400
+  d1 = new uchar 32 0
+  rx_sem_view_digest d1
+
+  note Single-field mutation on obj 0 -> compact delta (not full state)
+  put sc_w_val 0 175
+  put sc_w_ver 0 2
+  put sc_w_wrt 0 12
+  sct_chk eq rx_sem_project SC_OK
+  sct_chk eq rx_sem_delta 7 2 st SC_OK
+  sct_chk eq get st 4 0
+  sct_chk eq get st 0 1
+  sct_chk eq rx_sem_view_apply get sc_wlen 0 SC_OK
+  sct_chk eq get sc_v_val 0 175
+  sct_chk eq get sc_v_ver 0 2
+  sct_chk eq get sc_v_val 24 400
+  d2 = new uchar 32 0
+  rx_sem_view_digest d2
+  diff = ulong 0
+  for i ulong 32
+    if ne get d1 i get d2 i
+      diff = ulong 1
+    end
+  end
+  sct_chk eq diff 1
+
+  note Retire obj 0 -> invalidation removes obj 0 while preserving obj 3
+  put sc_w_meta 0 0
+  sct_chk eq rx_sem_project SC_OK
+  sct_chk eq rx_sem_delta 7 3 st SC_OK
+  sct_chk eq get st 2 1
+  sct_chk eq rx_sem_view_apply get sc_wlen 0 SC_OK
+  sct_chk eq get sc_v_pres 0 0
+  sct_chk eq get sc_v_pres 3 1
+end
+
+fn sct_test_derived_aggregations to void
+  sct_setup_world
+  put sc_need 0 7
+  put sc_need 1 SC_OP_SUM
+  put sc_need 3 0
+  put sc_need 8 SC_EV_NONE
+  put sc_need 9 0
+  sct_chk eq rx_sem_project SC_OK
+  note Sum of authorized objs 0(100) + 1(250) + 3(400) = 750; obj 2(999) withheld
+  sct_chk eq get sc_p_meta 2 1
+  sct_chk eq get sc_p_der 2 750
+  sct_chk eq get sc_p_der 5 3
+
+  put sc_need 1 SC_OP_MAX
+  sct_chk eq rx_sem_project SC_OK
+  sct_chk eq get sc_p_der 2 400
+  sct_chk eq get sc_p_der 3 3
+  sct_chk eq rx_sem_encode_projection 7 42 SC_OK
+  rx_sem_view_init
+  sct_chk eq rx_sem_view_apply get sc_wlen 0 SC_OK
+  sct_chk eq get sc_v_nder 0 1
+  sct_chk eq get sc_v_der 2 400
+  sct_chk eq get sc_v_der 3 3
+end
+
+fn sct_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len sct_pass
+    for i ulong n bound 64
+      put buf i get sct_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len sct_fail_m
+  for i ulong n bound 64
+    put buf i get sct_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  sct_test_delta_and_invalidation
+  sct_test_derived_aggregations
+  if ne get sct_fail 0 0
+    sct_put_msg 0
+    ret int get sct_fail 0
+  end
+  sct_put_msg 1
+  ret 0
+end

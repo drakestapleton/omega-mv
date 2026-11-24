@@ -1,0 +1,202 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_cognitive_routing.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_cognitive_routing.c (OMEGA_COGNITIVE_ROUTING).
+note Verifies engine registry & digest, zero-evidence reference fallback,
+note ledger calibration over 240+ trials, model load & tamper refusal,
+note escalation ladder energy savings, plan caching, and budget UNSAT.
+
+global crt_checks ulong 1
+global crt_fail ulong 1
+
+text crt_pass "RX_COGNITIVE_ROUTING_OM: PASS\n"
+text crt_fail_m "RX_COGNITIVE_ROUTING_OM: FAIL\n"
+
+fn crt_chk cond bool to void
+  put crt_checks 0 add get crt_checks 0 1
+  if not cond
+    if eq get crt_fail 0 0
+      put crt_fail 0 get crt_checks 0
+    end
+  end
+end
+
+fn crt_setup_three_engines to void
+  crt_chk eq rx_route_create RT_OK
+  d = new ulong 9 0
+  note Engine 1: cheap small policy (nj=10)
+  put d 0 1
+  put d 1 2
+  put d 2 1
+  put d 3 1
+  put d 4 1024
+  put d 5 10
+  put d 6 4
+  put d 7 RT_PREC_APPROX
+  put d 8 0
+  crt_chk eq rx_route_register d 0 RT_OK
+
+  note Engine 2: mid-tier specialist (nj=40)
+  put d 0 2
+  put d 1 3
+  put d 2 1
+  put d 3 1
+  put d 4 4096
+  put d 5 40
+  put d 6 8
+  put d 7 RT_PREC_APPROX
+  put d 8 0
+  crt_chk eq rx_route_register d 0 RT_OK
+
+  note Engine 3: expensive exact reference (nj=100)
+  put d 0 3
+  put d 1 4
+  put d 2 1
+  put d 3 1
+  put d 4 8192
+  put d 5 100
+  put d 6 16
+  put d 7 RT_PREC_EXACT
+  put d 8 0
+  crt_chk eq rx_route_register d 1 RT_OK
+
+  note Duplicate engine id refused
+  crt_chk eq rx_route_register d 0 RT_ERR_ARG
+end
+
+fn crt_set_req min_q ulong uncert ulong esc ulong max_nj ulong to void
+  for i ulong 11
+    put rt_req_in i 0
+  end
+  put rt_req_in 0 0
+  put rt_req_in 1 min_q
+  put rt_req_in 2 uncert
+  put rt_req_in 3 512
+  put rt_req_in 4 4
+  put rt_req_in 5 2
+  put rt_req_in 6 RT_PREC_APPROX
+  put rt_req_in 7 100000
+  put rt_req_in 8 max_nj
+  put rt_req_in 9 7
+  put rt_req_in 10 esc
+end
+
+fn crt_test_no_evidence_and_digest to void
+  crt_setup_three_engines
+  rx_route_registry_digest
+  nz = ulong 0
+  for i ulong 32
+    nz = or nz ulong get rt_reg_dig i
+  end
+  crt_chk ne nz 0
+
+  crt_set_req 900000 50000 1 0
+  crt_chk eq rx_route_plan RT_OK
+  crt_chk eq get rt_lad_out 0 1
+  crt_chk eq get rt_lad_out 1 3
+  crt_chk eq get rt_lad_out 13 RT_WHY_NO_EVIDENCE
+
+  me = new ulong 1 0
+  crt_chk eq rx_route_most_expensive me RT_OK
+  crt_chk eq get me 0 3
+end
+
+fn crt_test_calibrated_routing_and_tamper to void
+  crt_setup_three_engines
+  crt_chk eq rx_route_ledger_create RT_OK
+  put rt_obs_engs 0 1
+  put rt_obs_engs 1 2
+  put rt_obs_engs 2 3
+
+  for t ulong 240
+    if lt t 180
+      put rt_obs_conf 0 980000
+      put rt_obs_corr 0 1
+    else
+      put rt_obs_conf 0 200000
+      put rt_obs_corr 0 0
+    end
+    put rt_obs_ns 0 100
+
+    if lt t 210
+      put rt_obs_conf 1 970000
+      put rt_obs_corr 1 1
+    else
+      put rt_obs_conf 1 300000
+      put rt_obs_corr 1 0
+    end
+    put rt_obs_ns 1 400
+
+    put rt_obs_conf 2 990000
+    put rt_obs_corr 2 1
+    put rt_obs_ns 2 1000
+    crt_chk eq rx_route_observe 0 3 RT_OK
+  end
+
+  crt_chk eq rx_route_observe_batch 1 0 240 24000 1 2400 RT_OK
+  crt_chk eq rx_route_observe_batch 2 0 240 96000 1 9600 RT_OK
+  crt_chk eq rx_route_observe_batch 3 0 240 240000 1 24000 RT_OK
+  crt_chk eq rx_route_ledger_model RT_OK
+  mlen = get rt_model_len 0
+  crt_chk gt mlen 500
+
+  crt_chk eq rx_route_load_model 9 mlen RT_OK
+  crt_chk eq rx_route_generation 9
+
+  note Tampered model rejected without disturbing generation 9
+  orig = get rt_model_buf 0
+  put rt_model_buf 0 xor orig 255
+  crt_chk eq rx_route_load_model 10 mlen RT_ERR_MODEL
+  crt_chk eq rx_route_generation 9
+  put rt_model_buf 0 orig
+
+  note Escalation ladder saves energy compared to reference (100 nJ)
+  crt_set_req 950000 50000 1 0
+  crt_chk eq rx_route_plan RT_OK
+  crt_chk ge get rt_lad_out 0 2
+  crt_chk lt get rt_lad_out 9 100
+  crt_chk eq get rt_lad_out 13 RT_WHY_EVIDENCE
+  saved_nj = get rt_lad_out 9
+
+  note Cached second call returns identical expected energy
+  crt_chk eq rx_route_plan RT_OK
+  crt_chk eq get rt_lad_out 9 saved_nj
+
+  note Without escalation, must pick standalone reference engine 3 (100 nJ)
+  crt_set_req 950000 50000 0 0
+  crt_chk eq rx_route_plan RT_OK
+  crt_chk eq get rt_lad_out 0 1
+  crt_chk eq get rt_lad_out 1 3
+  crt_chk eq get rt_lad_out 9 100
+
+  note Impossible energy cap returns RT_ERR_UNSAT
+  crt_set_req 950000 50000 1 15
+  crt_chk eq rx_route_plan RT_ERR_UNSAT
+end
+
+fn crt_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len crt_pass
+    for i ulong n bound 64
+      put buf i get crt_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len crt_fail_m
+  for i ulong n bound 64
+    put buf i get crt_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  crt_test_no_evidence_and_digest
+  crt_test_calibrated_routing_and_tamper
+  if ne get crt_fail 0 0
+    crt_put_msg 0
+    ret int get crt_fail 0
+  end
+  crt_put_msg 1
+  ret 0
+end

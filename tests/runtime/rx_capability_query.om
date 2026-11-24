@@ -1,0 +1,211 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_capability_query.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_capability_query.c (OMEGA_CAPABILITY_QUERY).
+note Verifies canonical machine identity, multi-source ontology & aliases,
+note need compilation, Pareto frontier ranking, locality filtering,
+note availability failover, withdrawal refusal, skill-node binding,
+note and wire protocol roundtrip/replay/tamper protection.
+
+global cqt_checks ulong 1
+global cqt_fail ulong 1
+
+text cqt_pass "RX_CAPABILITY_QUERY_OM: PASS\n"
+text cqt_fail_m "RX_CAPABILITY_QUERY_OM: FAIL\n"
+
+fn cqt_chk cond bool to void
+  put cqt_checks 0 add get cqt_checks 0 1
+  if not cond
+    if eq get cqt_fail 0 0
+      put cqt_fail 0 get cqt_checks 0
+    end
+  end
+end
+
+fn cqt_make_ent ent edit ulong 21 cap ulong real ulong mach ulong skill ulong to void
+  for i ulong 21
+    put ent i 0
+  end
+  put ent 0 cap
+  put ent 1 real
+  put ent 2 mach
+  put ent 3 skill
+  put ent 4 2
+  put ent 5 CQ_SRC_SKILL
+  put ent 6 2
+  put ent 7 1
+  put ent 8 1
+  put ent 9 1
+  put ent 12 900000
+  put ent 13 960000
+  put ent 14 80
+  put ent 15 60
+  put ent 16 10
+  put ent 17 77
+  put ent 18 CQ_LIVE_AVAILABLE
+  put ent 19 1
+  put ent 20 1
+end
+
+fn cqt_test_multi_source_pareto_and_failover to void
+  mid_self = new uchar 32 0
+  put mid_self 0 uchar 1
+  put mid_self 31 uchar 9
+  cqt_chk eq cq_catalog_init_canonical 1 mid_self CQ_OK
+  mid_rem = new uchar 32 0
+  put mid_rem 0 uchar 2
+  put mid_rem 31 uchar 8
+  rem_idx = new ulong 1 0
+  cqt_chk eq cq_machine_advertise_id 1 mid_rem 1000000 rem_idx CQ_OK
+  cqt_chk ne get rem_idx 0 1
+  cqt_chk eq cq_op_define 1 0 CQ_SRC_ALL CQ_OK
+  cqt_chk eq cq_op_define 2 1 CQ_SRC_ALL CQ_OK
+  cqt_chk eq cq_op_define 3 0 CQ_SRC_ALL CQ_OK
+  cqt_chk eq cq_alias 100 1 CQ_OK
+  cqt_chk eq cq_resolve 100 1
+  cqt_chk eq cq_resolve 2 2
+  cqt_chk eq cq_resolve 888 0
+
+  d1 = new uchar 32 0
+  cq_ontology_digest d1
+  nz = ulong 0
+  for i ulong 32
+    nz = or nz ulong get d1 i
+  end
+  cqt_chk ne nz 0
+
+  ent = new ulong 21 0
+  sdig = new uchar 32 0
+  put sdig 0 uchar 0xa5
+  note Candidate 10: local skill, cheapest cost=80, lat=60
+  cqt_make_ent ent 10 1 1 5
+  cqt_chk eq cq_register ent sdig CQ_OK
+  note Candidate 11: local graph, higher cost=180, fastest lat=15
+  cqt_make_ent ent 11 2 1 6
+  put ent 5 CQ_SRC_GRAPH
+  put ent 14 180
+  put ent 15 15
+  cqt_chk eq cq_register ent sdig CQ_OK
+  note Candidate 12: dominated local mcp, cost=350, lat=120
+  cqt_make_ent ent 12 3 1 7
+  put ent 5 CQ_SRC_MCP
+  put ent 14 350
+  put ent 15 120
+  cqt_chk eq cq_register ent sdig CQ_OK
+  note Candidate 13: remote fabric, cost=40, lat=40
+  cqt_make_ent ent 13 4 get rem_idx 0 8
+  put ent 5 CQ_SRC_FABRIC
+  put ent 14 40
+  put ent 15 40
+  cqt_chk eq cq_register ent sdig CQ_OK
+  cqt_chk eq cq_catalog_build CQ_OK
+
+  note Compile alias 100 -> op 1 + specialization op 2, local only
+  need = new ulong 15 0
+  put need 0 100
+  put need 1 1
+  put need 2 1
+  put need 3 1
+  put need 7 CQ_LOC_LOCAL
+  cqt_chk eq cq_compile need CQ_OK
+  cqt_chk eq get cq_plan_op 0 1
+  cqt_chk eq get cq_plan_n_ops 0 2
+
+  tr = new ulong 19 0
+  put tr 0 2
+  put tr 1 0
+  put tr 2 1
+  put tr 17 16
+  cqt_chk eq cq_query need tr 0 CQ_OK
+  cqt_chk eq get cq_res_n_feas 0 3
+  cqt_chk eq get cq_res_n_front 0 2
+  cqt_chk eq get cq_res_n 0 2
+  cqt_chk eq get cq_res_cand 0 10
+
+  note Flip tradeoff preference to latency first -> winner is 11
+  put tr 1 1
+  put tr 2 0
+  cqt_chk eq cq_query need tr 0 CQ_OK
+  cqt_chk eq get cq_res_cand 0 11
+
+  note Restore cost-first, toggle candidate 10 unavailable -> failover to 11
+  put tr 1 0
+  put tr 2 1
+  cqt_chk eq cq_set_availability 10 1 1 5 CQ_LIVE_UNAVAILABLE CQ_OK
+  cqt_chk eq cq_query need tr 0 CQ_OK
+  cqt_chk eq get cq_res_n 0 1
+  cqt_chk eq get cq_res_cand 0 11
+  note Withdraw candidate 10 -> revive must fail with CQ_E_WITHDRAWN
+  cqt_chk eq cq_withdraw 10 1 1 5 CQ_OK
+  cqt_chk eq cq_set_availability 10 1 1 5 CQ_LIVE_AVAILABLE CQ_E_WITHDRAWN
+
+  note Allow fabric locality -> recompile need, remote candidate 13 (cost=40) wins
+  put need 7 or CQ_LOC_LOCAL CQ_LOC_FABRIC
+  cqt_chk eq cq_compile need CQ_OK
+  cqt_chk eq cq_query need tr 1000 CQ_OK
+  cqt_chk eq get cq_res_cand 0 13
+
+  note Bind top candidate into action graph node
+  rx_graph_init 0 1
+  skn = rx_graph_node 0 AG_SKILL AG_T_U64
+  cqt_chk eq cq_bind_skill_node 0 ulong skn 0 CQ_OK
+  cqt_chk eq rx_graph_get_node 0 ulong skn 2 8
+end
+
+fn cqt_test_wire_and_tamper to void
+  mid_a = new uchar 32 0
+  put mid_a 0 uchar 0x11
+  cqt_chk eq cq_catalog_init_canonical 1 mid_a CQ_OK
+  cqt_chk eq cq_op_define 1 0 CQ_SRC_ALL CQ_OK
+  ent = new ulong 21 0
+  sdig = new uchar 32 0
+  put sdig 0 uchar 0x55
+  cqt_make_ent ent 20 1 1 9
+  put ent 14 90
+  put ent 15 30
+  put ent 4 1
+  put ent 20 4
+  cqt_chk eq cq_register ent sdig CQ_OK
+  rec = new uchar 188 0
+  cqt_chk eq cq_wire_encode 0 CQ_WIRE_ADVERTISE rec CQ_OK
+
+  note Self-originated record refused
+  cqt_chk eq cq_wire_apply rec CQ_E_WIRE
+
+  note Remote machine B accepts advertise, refuses stale replay and tampered bytes
+  mid_b = new uchar 32 0
+  put mid_b 0 uchar 0x22
+  cqt_chk eq cq_catalog_init_canonical 1 mid_b CQ_OK
+  cqt_chk eq cq_op_define 1 0 CQ_SRC_ALL CQ_OK
+  cqt_chk eq cq_wire_apply rec CQ_OK
+  cqt_chk eq cq_wire_apply rec CQ_E_STALE
+  put rec 64 xor get rec 64 uchar 1
+  cqt_chk eq cq_wire_apply rec CQ_E_WIRE
+end
+
+fn cqt_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len cqt_pass
+    for i ulong n bound 64
+      put buf i get cqt_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len cqt_fail_m
+  for i ulong n bound 64
+    put buf i get cqt_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  cqt_test_multi_source_pareto_and_failover
+  cqt_test_wire_and_tamper
+  if ne get cqt_fail 0 0
+    cqt_put_msg 0
+    ret int get cqt_fail 0
+  end
+  cqt_put_msg 1
+  ret 0
+end

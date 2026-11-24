@@ -1,0 +1,166 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_sem_incremental.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_sem_incremental.c (OMEGA_SEM_INCREMENTAL).
+note Verifies 3-layer incremental semantic engine: field-grain CLEAN
+note memoization, same-value dedup, early cutoff on invariant derived
+note output, cross-branch content-addressed cache reuse, provenance
+note verification, and stale-source refusal.
+
+global sit_checks ulong 1
+global sit_fail ulong 1
+global sit_ids ulong 8
+
+text sit_pass "RX_SEM_INCREMENTAL_OM: PASS\n"
+text sit_fail_m "RX_SEM_INCREMENTAL_OM: FAIL\n"
+text sit_impl_sum "inc_sum_v1"
+text sit_impl_mod "inc_mod_v1"
+text sit_impl_dbl "inc_dbl_v1"
+
+fn sit_chk cond bool to void
+  put sit_checks 0 add get sit_checks 0 1
+  if not cond
+    if eq get sit_fail 0 0
+      put sit_fail 0 get sit_checks 0
+    end
+  end
+end
+
+fn sit_setup_graph to void
+  sit_chk eq rx_sem_init SM_OK
+  d = new uchar 32 0
+  rx_sem_digest_impl sit_impl_sum len sit_impl_sum d
+  f_sum = rx_sem_add_fn SM_OP_SUM 1 1 0 d
+  rx_sem_digest_impl sit_impl_mod len sit_impl_mod d
+  f_mod = rx_sem_add_fn SM_OP_CONST_MOD 1 1 10 d
+  rx_sem_digest_impl sit_impl_dbl len sit_impl_dbl d
+  f_dbl = rx_sem_add_fn SM_OP_DOUBLE 1 1 0 d
+  sit_chk eq f_sum 0
+  sit_chk eq f_mod 1
+  sit_chk eq f_dbl 2
+
+  s0 = rx_sem_add_source 1 0 1
+  s1 = rx_sem_add_source 1 1 1
+  s2 = rx_sem_add_source 2 0 1
+  put sit_ids 0 s0
+  put sit_ids 1 s1
+  put sit_ids 2 s2
+
+  ins = new ulong 4 0
+  put ins 0 s0
+  n_mod = rx_sem_add_node ulong f_mod ins 1
+  put ins 0 n_mod
+  put ins 1 s1
+  n_sum = rx_sem_add_node ulong f_sum ins 2
+  put ins 0 n_sum
+  n_dbl = rx_sem_add_node ulong f_dbl ins 1
+  put sit_ids 3 n_mod
+  put sit_ids 4 n_sum
+  put sit_ids 5 n_dbl
+  sit_chk ne n_mod 0
+  sit_chk ne n_sum 0
+  sit_chk ne n_dbl 0
+end
+
+fn sit_test_incremental_layers to void
+  sit_setup_graph
+  s0 = get sit_ids 0
+  s1 = get sit_ids 1
+  s2 = get sit_ids 2
+  n_mod = get sit_ids 3
+  n_dbl = get sit_ids 5
+
+  b0 = rx_sem_branch_root 1 100
+  sit_chk eq b0 0
+  w = new ulong 4 0
+  put w 0 17
+  sit_chk eq rx_sem_set_source 0 s0 1 w 1 SM_OK
+  put w 0 8
+  sit_chk eq rx_sem_set_source 0 s1 1 w 1 SM_OK
+  put w 0 55
+  sit_chk eq rx_sem_set_source 0 s2 1 w 1 SM_OK
+
+  note Cold eval: mod(17,10)=7, sum(7,8)=15, dbl(15)=30
+  outv = new ulong 4 0
+  sit_chk eq rx_sem_get 0 n_dbl outv SM_OK
+  sit_chk eq get outv 0 30
+  sit_chk eq get sm_last_served 0 SM_SERVED_COMPUTED
+  sit_chk eq get sm_stats 8 3
+
+  note Layer 1: CLEAN memo hit -> 0 extra computes
+  sit_chk eq rx_sem_get 0 n_dbl outv SM_OK
+  sit_chk eq get outv 0 30
+  sit_chk eq get sm_last_served 0 SM_SERVED_MEMO
+  sit_chk eq get sm_stats 8 3
+
+  note Field-granularity isolation: mutating unrelated s2 leaves n_dbl CLEAN
+  put w 0 66
+  sit_chk eq rx_sem_set_source 0 s2 1 w 1 SM_OK
+  sit_chk eq rx_sem_state 0 n_dbl long SM_CLEAN
+
+  note Same-content write to s0 deduplicated
+  put w 0 17
+  sit_chk eq rx_sem_set_source 0 s0 1 w 1 SM_OK
+  sit_chk eq rx_sem_state 0 n_mod long SM_CLEAN
+  sit_chk eq get sm_stats 11 1
+
+  note Layer 2: Early cutoff (17 -> 27, mod 10 still 7)
+  put w 0 27
+  sit_chk eq rx_sem_set_source 0 s0 1 w 1 SM_OK
+  sit_chk eq rx_sem_state 0 n_mod long SM_DIRTY
+  sit_chk eq rx_sem_state 0 n_dbl long SM_DIRTY
+  sit_chk eq rx_sem_get 0 n_dbl outv SM_OK
+  sit_chk eq get outv 0 30
+  sit_chk eq get sm_last_served 0 SM_SERVED_CUTOFF
+  sit_chk eq get sm_stats 8 4
+  sit_chk ge get sm_stats 2 2
+
+  note True value change (27 -> 29, mod 10 = 9 -> sum=17 -> dbl=34)
+  put w 0 29
+  sit_chk eq rx_sem_set_source 0 s0 1 w 1 SM_OK
+  sit_chk eq rx_sem_get 0 n_dbl outv SM_OK
+  sit_chk eq get outv 0 34
+  sit_chk eq get sm_last_served 0 SM_SERVED_COMPUTED
+
+  note Layer 3: Cross-branch content-addressed cache hit
+  b1 = rx_sem_branch_fork 0 2 200 7
+  sit_chk eq b1 1
+  put w 0 17
+  sit_chk eq rx_sem_set_source 1 s0 1 w 1 SM_OK
+  sit_chk eq rx_sem_get 1 n_mod outv SM_OK
+  sit_chk eq get outv 0 7
+  sit_chk eq get sm_last_served 0 SM_SERVED_CACHE
+  sit_chk ge get sm_stats 3 1
+
+  note Provenance & digest verification + stale-source refusal
+  sit_chk eq rx_sem_verify SM_OK
+  sit_chk eq rx_sem_mark_stale 1 s0 SM_OK
+  sit_chk eq rx_sem_get 1 n_mod outv SM_ERR_STALE
+  sit_chk eq rx_sem_branch_drop 1 SM_OK
+end
+
+fn sit_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len sit_pass
+    for i ulong n bound 64
+      put buf i get sit_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len sit_fail_m
+  for i ulong n bound 64
+    put buf i get sit_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  sit_test_incremental_layers
+  if ne get sit_fail 0 0
+    sit_put_msg 0
+    ret int get sit_fail 0
+  end
+  sit_put_msg 1
+  ret 0
+end

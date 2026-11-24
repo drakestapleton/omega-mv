@@ -1,0 +1,178 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_empirical_optimizer.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_empirical_optimizer.c (OMEGA_EMPIRICAL_OPTIMIZER).
+note Verifies feature basis & cell mapping, Bayesian linear cost model
+note training over 3 arms with crossover by problem size, decision &
+note exploration budget enforcement, unsupported-op refusal, and
+note serialized model digest + tamper rejection.
+
+global eot_checks ulong 1
+global eot_fail ulong 1
+global eot_train_m ulong 4
+global eot_train_n ulong 6
+
+text eot_pass "RX_EMPIRICAL_OPTIMIZER_OM: PASS\n"
+text eot_fail_m "RX_EMPIRICAL_OPTIMIZER_OM: FAIL\n"
+
+fn eot_chk cond bool to void
+  put eot_checks 0 add get eot_checks 0 1
+  if not cond
+    if eq get eot_fail 0 0
+      put eot_fail 0 get eot_checks 0
+    end
+  end
+end
+
+fn eot_feat f edit ulong 14 mv ulong nv ulong core ulong pr ulong to void
+  for i ulong 14
+    put f i 0
+  end
+  put f 0 RX_CM_OP_MATVEC
+  put f 1 mv
+  put f 2 nv
+  put f 3 mul add add mul mv nv mv nv 8
+  put f 4 2097152
+  put f 5 core
+  put f 6 pr
+  put f 9 7
+  put f 10 1
+end
+
+fn eot_truth arm ulong mv ulong nv ulong to f64
+  w = add cm_log2 f64 mv cm_log2 f64 nv
+  base = add 10.0f64 mul 0.95f64 w
+  if eq arm 1
+    base = add base 0.35f64
+  end
+  if eq arm 2
+    if le nv 3
+      base = add base 0.9f64
+    else
+      base = sub base 0.8f64
+    end
+  end
+  ret base
+end
+
+fn eot_init_tables to void
+  put eot_train_m 0 2
+  put eot_train_m 1 8
+  put eot_train_m 2 32
+  put eot_train_m 3 128
+  put eot_train_n 0 1
+  put eot_train_n 1 2
+  put eot_train_n 2 3
+  put eot_train_n 3 16
+  put eot_train_n 4 64
+  put eot_train_n 5 256
+end
+
+fn eot_train_cell sl ulong core ulong pr ulong to void
+  f = new ulong 14 0
+  for i ulong 4
+    mv = get eot_train_m i
+    for j ulong 6
+      nv = get eot_train_n j
+      eot_feat f mv nv core pr
+      for a ulong 3
+        y = eot_truth a mv nv
+        ign = rx_cm_observe sl f a ulong cm_exp2 y 0
+      end
+    end
+  end
+end
+
+fn eot_test_basis_and_refusal to void
+  f = new ulong 14 0
+  phi = new f64 8 0.0f64
+  eot_feat f 16 4 RX_CM_CORE_X925 0
+  rx_cm_basis f phi
+  eot_chk eq get phi 0 1.0f64
+  eot_chk eq get phi 1 4.0f64
+  eot_chk eq get phi 2 2.0f64
+  eot_chk eq rx_cm_cell f 0
+
+  put f 0 RX_CM_OPS
+  eot_chk eq rx_cm_cell f RX_CM_CELL_NONE
+  rx_cm_init 0 3
+  pol = new ulong 5 0
+  rx_cm_default_policy pol
+  rx_cm_decide 0 pol f 1
+  eot_chk eq get cm_dec 0 RX_CM_REFUSE
+  eot_chk eq get cm_dec 4 RX_CM_WHY_UNSUPPORTED_OP
+end
+
+fn eot_test_optimize_and_wire to void
+  eot_init_tables
+  rx_cm_init 0 3
+  eot_train_cell 0 RX_CM_CORE_X925 0
+  pol = new ulong 5 0
+  rx_cm_default_policy pol
+  rx_cm_charge 0 1000000 0
+
+  note Large N=64: arm 2 is faster -> optimizer selects arm 2
+  f = new ulong 14 0
+  eot_feat f 32 64 RX_CM_CORE_X925 0
+  rx_cm_decide 0 pol f 0
+  eot_chk eq get cm_dec 0 RX_CM_SELECT
+  eot_chk eq get cm_dec 1 2
+
+  note Small N=2: arm 0 is faster than arm 2 -> optimizer selects arm 0
+  eot_feat f 32 2 RX_CM_CORE_X925 0
+  rx_cm_decide 0 pol f 0
+  eot_chk eq get cm_dec 0 RX_CM_SELECT
+  eot_chk eq get cm_dec 1 0
+
+  note Serialize, digest, deserialize into slot 1, verify identical decision
+  eot_chk eq rx_cm_serialize 0 0 RX_CM_OK
+  d0 = new uchar 32 0
+  rx_cm_digest 0 d0
+  blen = rx_cm_blob_size
+  eot_chk eq rx_cm_deserialize 1 0 blen RX_CM_OK
+  d1 = new uchar 32 0
+  rx_cm_digest 1 d1
+  same = ulong 1
+  for i ulong 32
+    if ne get d0 i get d1 i
+      same = ulong 0
+    end
+  end
+  eot_chk eq same 1
+
+  eot_feat f 32 64 RX_CM_CORE_X925 0
+  rx_cm_decide 1 pol f 0
+  eot_chk eq get cm_dec 0 RX_CM_SELECT
+  eot_chk eq get cm_dec 1 2
+
+  note Tampered wire blob rejected with RX_CM_ERR_DIGEST
+  put cm_blob_a 100 xor get cm_blob_a 100 uchar 1
+  eot_chk eq rx_cm_deserialize 2 0 blen RX_CM_ERR_DIGEST
+end
+
+fn eot_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len eot_pass
+    for i ulong n bound 64
+      put buf i get eot_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len eot_fail_m
+  for i ulong n bound 64
+    put buf i get eot_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  eot_test_basis_and_refusal
+  eot_test_optimize_and_wire
+  if ne get eot_fail 0 0
+    eot_put_msg 0
+    ret int get eot_fail 0
+  end
+  eot_put_msg 1
+  ret 0
+end
