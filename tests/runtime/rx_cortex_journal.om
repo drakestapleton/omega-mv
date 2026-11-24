@@ -1,0 +1,178 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_cortex_journal.om -- Pure seeded OM-2 port of tests/runtime/rx_cortex_journal.c.
+
+global g_checks ulong 1
+global g_fail ulong 1
+
+text msg_pass "M20 CORTEX JOURNAL SEAM: PASS\n"
+text msg_fail "M20 CORTEX JOURNAL SEAM: FAIL\n"
+
+fn chk cond bool to void
+  put g_checks 0 add get g_checks 0 1
+  if not cond
+    put g_fail 0 add get g_fail 0 1
+  end
+end
+
+fn chain_eq st ulong ref view uchar 32 to bool
+  cb = mul st 32
+  for i ulong 32
+    if ne get cx_chain add cb i get ref i
+      ret eq ulong 1 0
+    end
+  end
+  ret eq ulong 1 1
+end
+
+fn save_chain st ulong dst edit uchar 32 to void
+  cb = mul st 32
+  for i ulong 32
+    put dst i get cx_chain add cb i
+  end
+end
+
+fn make_hdr hdr edit ulong 12 cls ulong kind ulong subj ulong t ulong to void
+  for i ulong 12
+    put hdr i 0
+  end
+  put hdr 0 cls
+  put hdr 1 kind
+  put hdr 2 subj
+  put hdr 3 t
+end
+
+fn run_part1 chain5 edit uchar 32 chain6 edit uchar 32 to ulong
+  cx_mj_reset 0
+  note 1. create: ro open of empty refused, create writes 32B header synced
+  chk eq cx_open_with 1 0 16 CX_OPEN_READONLY CX_ERR_FORMAT
+  chk eq cx_open_with 0 0 16 CX_OPEN_SYNC CX_OK
+  chk eq get cx_mj_meta 0 32
+  chk eq get cx_mj_meta 7 1
+  chk eq get cx_mj_meta 1 1
+  chk eq cx_open_with 1 0 16 0 CX_ERR_WRITER
+  chk eq cx_open_with 1 0 0 CX_OPEN_READONLY CX_OK
+  chk eq get cx_meta 16 0
+  cx_close 1
+  chk eq get cx_mj_meta 1 1
+
+  note 2. append 5 records
+  hdr = new ulong 12 0
+  pay = new ulong 3 0
+  for k ulong 5
+    kv = add k 1
+    make_hdr hdr CX_CLAIM CX_K_CLAIM rem kv 3 kv
+    put pay 0 kv
+    put pay 1 add kv 100
+    put pay 2 add kv 200
+    chk eq cx_append 0 hdr pay 3 CX_OK
+  end
+  chk eq get cx_meta 0 5
+  chk eq get cx_mj_meta 5 6
+  chk eq get cx_mj_meta 7 6
+  len5 = get cx_mj_meta 0
+  save_chain 0 chain5
+
+  note 3. failed append leaves memory and journal unchanged
+  put cx_mj_meta 2 1
+  make_hdr hdr CX_OBSERVATION CX_K_EVIDENCE_REF 1 6
+  pay1 = new ulong 1 42
+  chk eq cx_append 0 hdr pay1 1 CX_ERR_IO
+  chk eq get cx_meta 0 5
+  chk eq get cx_mj_meta 0 len5
+  chk chain_eq 0 chain5
+  chk eq cx_append 0 hdr pay1 1 CX_OK
+  chk eq get cx_meta 0 6
+  save_chain 0 chain6
+  cx_close 0
+  chk eq get cx_mj_meta 1 0
+  ret len5
+end
+
+fn run_part2 chain5 view uchar 32 chain6 view uchar 32 to void
+  note 4. reopen replays every record; chain rebuilt
+  chk eq cx_open_with 0 0 0 0 CX_OK
+  chk eq get cx_meta 0 6
+  chk eq get cx_meta 2 16
+  chk chain_eq 0 chain6
+  chk eq cx_verify_chain 0 CX_OK
+  chk eq cx_verify 0 4 CX_OK
+  chk eq cx_payload_word 0 4 2 204
+  chk eq cx_open_with 1 0 17 CX_OPEN_READONLY CX_ERR_FORMAT
+  cx_close 0
+
+  note 5. torn tail refused, repaired only on request
+  full = get cx_mj_meta 0
+  put cx_mj_meta 0 sub full 5
+  chk eq cx_open_with 0 0 16 0 CX_ERR_TORN
+  chk eq get cx_mj_meta 1 0
+  chk eq cx_open_with 0 0 16 CX_OPEN_READONLY CX_ERR_TORN
+  put cx_mj_meta 3 1
+  chk eq cx_open_with 0 0 16 CX_OPEN_REPAIR_TAIL CX_ERR_IO
+  put cx_mj_meta 3 0
+  chk eq cx_open_with 0 0 16 CX_OPEN_REPAIR_TAIL CX_OK
+  chk eq get cx_meta 0 5
+  chk eq get cx_mj_meta 6 2
+  chk lt get cx_mj_meta 0 sub full 5
+  chk chain_eq 0 chain5
+  cx_close 0
+
+  note 6. tampered complete record is never repaired
+  pos = ulong 144
+  put cx_mj_buf pos xor get cx_mj_buf pos 1
+  chk eq cx_open_with 0 0 16 CX_OPEN_REPAIR_TAIL CX_ERR_DIGEST
+  put cx_mj_buf pos xor get cx_mj_buf pos 1
+
+  note 7. memory-only store never touches backend
+  app_before = get cx_mj_meta 5
+  chk eq cx_init 0 4 CX_OK
+  chk eq get cx_meta 6 0
+  hdr = new ulong 12 0
+  pay1 = new ulong 1 42
+  make_hdr hdr CX_CLAIM CX_K_CLAIM 1 1
+  chk eq cx_append 0 hdr pay1 1 CX_OK
+  chk eq get cx_mj_meta 5 app_before
+  cx_close 0
+
+  note 8. oversized / hostile subject counts refused
+  chk eq cx_init 1 CX_U64_MAX CX_ERR_NOMEM
+  chk eq cx_init 1 1000000 CX_ERR_NOMEM
+  saved = new uchar 8 0
+  for i ulong 8
+    put saved i get cx_mj_buf add 16 i
+    put cx_mj_buf add 16 i 255
+  end
+  chk eq cx_open_with 1 0 0 CX_OPEN_READONLY CX_ERR_FORMAT
+  for i ulong 8
+    put cx_mj_buf add 16 i get saved i
+  end
+end
+
+fn cxj_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len msg_pass
+    for i ulong n bound 64
+      put buf i get msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len msg_fail
+  for i ulong n bound 64
+    put buf i get msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  chain5 = new uchar 32 0
+  chain6 = new uchar 32 0
+  ign = run_part1 chain5 chain6
+  run_part2 chain5 chain6
+  if ne get g_fail 0 0
+    cxj_msg 0
+    ret 1
+  end
+  cxj_msg 1
+  ret 0
+end

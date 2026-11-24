@@ -1,0 +1,158 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_regulate_unit.om -- Pure seeded OM-2 unit test for rx_regulate.om.
+
+global reg_checks ulong 1
+global reg_fail ulong 1
+
+text msg_pass "RX_REGULATE_OM: PASS\n"
+text msg_fail "RX_REGULATE_OM: FAIL\n"
+
+fn reg_chk cond bool to void
+  put reg_checks 0 add get reg_checks 0 1
+  if not cond
+    put reg_fail 0 add get reg_fail 0 1
+  end
+end
+
+fn make_env env edit ulong 16 to void
+  put env 0 2
+  put env 1 16
+  put env 2 1024
+  put env 3 65536
+  put env 4 100
+  put env 5 1000
+  put env 6 8
+  put env 7 16384
+  put env 8 500
+  put env 9 10
+  put env 10 3
+  put env 11 80
+  put env 12 40
+  put env 13 3
+end
+
+fn test_envelope to void
+  env = new ulong 16 0
+  make_env env
+  reg_chk eq rx_regulate_envelope_ok env 0
+  put env 0 0
+  reg_chk eq rx_regulate_envelope_ok env -1
+  make_env env
+  put env 6 1
+  reg_chk eq rx_regulate_envelope_ok env -1
+  make_env env
+  put env 10 10
+  reg_chk eq rx_regulate_envelope_ok env -1
+  make_env env
+  put env 11 101
+  reg_chk eq rx_regulate_envelope_ok env -1
+  make_env env
+  put env 13 0
+  reg_chk eq rx_regulate_envelope_ok env -1
+end
+
+fn test_hysteresis to void
+  env = new ulong 16 0
+  make_env env
+  note NOMINAL -> EXPAND on contention >= 10
+  reg_chk eq rx_regulate_decide env RX_REG_NOMINAL 0 9 10 RX_REG_NOMINAL
+  reg_chk eq rx_regulate_decide env RX_REG_NOMINAL 0 10 10 RX_REG_EXPAND
+  note PROTECT takes precedence over EXPAND on pressure >= 80
+  reg_chk eq rx_regulate_decide env RX_REG_NOMINAL 0 20 80 RX_REG_PROTECT
+  reg_chk eq rx_regulate_decide env RX_REG_EXPAND 5 20 80 RX_REG_PROTECT
+  note Dwell prevents premature exit from EXPAND
+  reg_chk eq rx_regulate_decide env RX_REG_EXPAND 2 0 0 RX_REG_EXPAND
+  note Dead band prevents exit from EXPAND (contention > 3)
+  reg_chk eq rx_regulate_decide env RX_REG_EXPAND 3 4 0 RX_REG_EXPAND
+  note Settled and <= contention_lo leaves EXPAND -> NOMINAL
+  reg_chk eq rx_regulate_decide env RX_REG_EXPAND 3 3 0 RX_REG_NOMINAL
+  note PROTECT dwell and dead band
+  reg_chk eq rx_regulate_decide env RX_REG_PROTECT 2 0 10 RX_REG_PROTECT
+  reg_chk eq rx_regulate_decide env RX_REG_PROTECT 3 0 41 RX_REG_PROTECT
+  note Settled and <= pressure_lo leaves PROTECT -> NOMINAL or EXPAND
+  reg_chk eq rx_regulate_decide env RX_REG_PROTECT 3 0 40 RX_REG_NOMINAL
+  reg_chk eq rx_regulate_decide env RX_REG_PROTECT 3 10 40 RX_REG_EXPAND
+end
+
+fn test_step_and_apply to void
+  env = new ulong 16 0
+  make_env env
+  pol = new ulong 8 0
+  put pol 0 1
+  put pol 1 8
+  put pol 2 16384
+  put pol 3 500
+  put pol 4 RX_REG_NOMINAL
+  put pol 5 0
+  put pol 6 0
+  put pol 7 0
+  state = new ulong 8 0
+  reg_chk eq rx_regulate_apply env pol 0 state 0
+  reg_chk eq get state 0 1
+  reg_chk eq get state 1 8
+  note Same version returns 1 (nothing new)
+  reg_chk eq rx_regulate_apply env pol 0 state 1
+  note Halted returns RX_ERR_HALTED and increments refused
+  reg_chk eq rx_regulate_apply env pol 1 state -21
+  reg_chk eq get state 4 1
+  note Step with same seq is no-op
+  cond = new ulong 8 0
+  dst = new ulong 8 0
+  reg_chk eq rx_regulate_step env cond pol dst 0
+  note Step with seq=1, contention=12 flips to EXPAND
+  put cond 0 1
+  put cond 1 12
+  put cond 3 20
+  reg_chk eq rx_regulate_step env cond pol dst 2
+  reg_chk eq get dst 0 2
+  reg_chk eq get dst 1 16
+  reg_chk eq get dst 2 65536
+  reg_chk eq get dst 3 1000
+  reg_chk eq get dst 4 RX_REG_EXPAND
+  reg_chk eq get dst 5 1
+  reg_chk eq get dst 6 1
+  reg_chk eq get dst 7 1
+  note Apply the new EXPAND policy
+  reg_chk eq rx_regulate_apply env dst 0 state 0
+  reg_chk eq get state 0 2
+  reg_chk eq get state 1 16
+  note Tampered out-of-envelope policy is refused
+  bad = new ulong 8 0
+  put bad 0 3
+  put bad 1 32
+  put bad 2 65536
+  put bad 3 1000
+  put bad 4 RX_REG_EXPAND
+  reg_chk eq rx_regulate_apply env bad 0 state -20
+  reg_chk eq get state 0 2
+  reg_chk eq get state 4 2
+end
+
+fn put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len msg_pass
+    for i ulong n bound 64
+      put buf i get msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len msg_fail
+  for i ulong n bound 64
+    put buf i get msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  test_envelope
+  test_hysteresis
+  test_step_and_apply
+  if ne get reg_fail 0 0
+    put_msg 0
+    ret 1
+  end
+  put_msg 1
+  ret 0
+end

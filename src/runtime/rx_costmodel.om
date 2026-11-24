@@ -1,0 +1,1383 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_costmodel.om -- Pure seeded OM-2 port of src/runtime/rx_costmodel.c.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const RX_CM_ARMS ulong 8
+const RX_CM_OPS ulong 1
+const RX_CM_CORES ulong 3
+const RX_CM_PRESSURE ulong 3
+const RX_CM_CELLS ulong 9
+const RX_CM_D ulong 8
+const RX_CM_TRI ulong 36
+const RX_CM_MIN_OBS ulong 12
+const RX_CM_RES_MIN_OBS ulong 4
+const RX_CM_UNSEEN_SHIFT f64 1.0
+
+const RX_CM_OK long 0
+const RX_CM_ERR_ARG long -1
+const RX_CM_ERR_FORMAT long -2
+const RX_CM_ERR_DIGEST long -3
+const RX_CM_ERR_UNSUPPORTED long -4
+const RX_CM_SKIPPED long 1
+const RX_CM_CELL_NONE ulong 4294967295
+const RX_CM_OP_MATVEC ulong 0
+const RX_CM_CORE_X925 ulong 0
+const RX_CM_CORE_A725 ulong 1
+const RX_CM_CORE_OTHER ulong 2
+
+const RX_CM_SELECT ulong 1
+const RX_CM_MEASURE ulong 2
+const RX_CM_FALLBACK ulong 3
+const RX_CM_REFUSE ulong 4
+
+const RX_CM_WHY_CONFIDENT ulong 0
+const RX_CM_WHY_UNKNOWN_ARM ulong 1
+const RX_CM_WHY_WORTH_MEASURING ulong 2
+const RX_CM_WHY_BUDGET_SPENT ulong 3
+const RX_CM_WHY_NO_ELIGIBLE ulong 4
+const RX_CM_WHY_OVER_BUDGET ulong 5
+const RX_CM_WHY_UNSUPPORTED_OP ulong 6
+
+const CM_PRIOR_A f64 1.0
+const CM_PRIOR_B f64 0.01
+const CM_NOISE_FLOOR f64 0.0009
+const CM_FAIL_PRIOR f64 0.05
+const CM_WIRE_BYTES ulong 28080
+const CM_DIGEST_BYTES ulong 32
+const CM_BLOB_BYTES ulong 28112
+const CM_OGCM_MAGIC ulong 1296254799
+const CM_MAX_MODELS ulong 4
+
+note Model storage (CM_MAX_MODELS = 4 slots)
+global cm_n_arms ulong 4
+global cm_lambda f64 4
+global cm_sd_scale f64 4
+global cm_explore_ps ulong 4
+global cm_work_ps ulong 4
+
+note Cell x Arm stats: slot * 72 + cell * 8 + arm
+global cm_tri f64 10368
+global cm_xty f64 2304
+global cm_yty f64 288
+global cm_n ulong 288
+global cm_trials ulong 288
+global cm_failures ulong 288
+
+note Power/cost tables: slot * 24 + core * 8 + arm; slot * 8 + arm
+global cm_power_mw f64 96
+global cm_verify_ns ulong 32
+global cm_synth_ns ulong 32
+global cm_code_bytes ulong 32
+
+note Scratch for Cholesky, calibration, and wire serialization
+global cm_chol_a f64 64
+global cm_chol_l f64 64
+global cm_cal_r f64 1024
+global cm_blob_a uchar 28112
+global cm_blob_b uchar 28112
+
+note ---- pure OM-2 f64 math (no libm) ----
+
+fn cm_fabs x f64 to f64
+  if lt x 0.0f64
+    ret sub 0.0f64 x
+  end
+  ret x
+end
+
+fn cm_ln x f64 to f64
+  if not gt x 0.0f64
+    ret -1.0e300f64
+  end
+  bits = bitcast ulong x
+  exp_i = sub long and shr bits 52 2047 1023
+  mbits = or and bits ulong 4503599627370495 shl ulong 1023 52
+  m = bitcast f64 mbits
+  if gt m 1.4142135623730951f64
+    m = mul m 0.5f64
+    exp_i = add exp_i 1
+  end
+  t = div sub m 1.0f64 add m 1.0f64
+  t2 = mul t t
+  s = f64 0.0f64
+  p = t
+  for k ulong 12
+    denom = f64 add mul k 2 1
+    s = add s div p denom
+    p = mul p t2
+  end
+  ret add mul f64 exp_i 0.6931471805599453f64 mul 2.0f64 s
+end
+
+fn cm_log2 x f64 to f64
+  if not gt x 0.0f64
+    ret -1.0e300f64
+  end
+  bits = bitcast ulong x
+  exp_i = sub long and shr bits 52 2047 1023
+  mbits = or and bits ulong 4503599627370495 shl ulong 1023 52
+  m = bitcast f64 mbits
+  if gt m 1.4142135623730951f64
+    m = mul m 0.5f64
+    exp_i = add exp_i 1
+  end
+  t = div sub m 1.0f64 add m 1.0f64
+  t2 = mul t t
+  s = f64 0.0f64
+  p = t
+  for k ulong 12
+    denom = f64 add mul k 2 1
+    s = add s div p denom
+    p = mul p t2
+  end
+  ret add f64 exp_i mul mul 2.0f64 s 1.4426950408889634f64
+end
+
+fn cm_exp2 x f64 to f64
+  if lt x -1000.0f64
+    ret 0.0f64
+  end
+  if gt x 1000.0f64
+    ret 1.0e300f64
+  end
+  ki = long x
+  kf = f64 ki
+  if gt sub x kf 0.5f64
+    ki = add ki 1
+    kf = f64 ki
+  else
+    if lt sub x kf -0.5f64
+      ki = sub ki 1
+      kf = f64 ki
+    end
+  end
+  u = mul sub x kf 0.6931471805599453f64
+  s = f64 1.0f64
+  term = f64 1.0f64
+  for k ulong 14
+    term = div mul term u f64 add k 1
+    s = add s term
+  end
+  ebits = shl ulong add ki 1023 52
+  ret mul s bitcast f64 ebits
+end
+
+fn cm_exp x f64 to f64
+  ret cm_exp2 mul x 1.4426950408889634f64
+end
+
+note Abramowitz & Stegun 7.1.26 erfc(x), max error < 1.5e-7
+fn cm_erfc x f64 to f64
+  ax = cm_fabs x
+  t = div 1.0f64 add 1.0f64 mul 0.3275911f64 ax
+  p = mul t add 1.061405429f64 0.0f64
+  p = mul t add -1.453152027f64 p
+  p = mul t add 1.421413741f64 p
+  p = mul t add -0.284496736f64 p
+  p = mul t add 0.254829592f64 p
+  res = mul p cm_exp sub 0.0f64 mul ax ax
+  if lt x 0.0f64
+    ret sub 2.0f64 res
+  end
+  ret res
+end
+
+fn cm_norm_cdf x f64 to f64
+  ret mul 0.5f64 cm_erfc div sub 0.0f64 x 1.4142135623730951f64
+end
+
+fn cm_norm_inv_tail q f64 to f64
+  num = add mul add mul add mul add mul add mul -7.784894002430293e-3f64 q -3.223964580411365e-1f64 q -2.400758277161838f64 q -2.549732539343734f64 q 4.374664141464968f64 q 2.938163982698783f64
+  den = add mul add mul add mul add mul 7.784695709041462e-3f64 q 3.224671290700398e-1f64 q 2.445134137142996f64 q 3.754408661907416f64 q 1.0f64
+  ret div num den
+end
+
+fn cm_norm_inv_mid p f64 to f64
+  q = sub p 0.5f64
+  r = mul q q
+  num = mul add mul add mul add mul add mul add mul -3.969683028665376e1f64 r 2.209460984245205e2f64 r -2.759285104469687e2f64 r 1.383577518672690e2f64 r -3.066479806614716e1f64 r 2.506628277459239f64 q
+  den = add mul add mul add mul add mul add mul -5.447609879822406e1f64 r 1.615858368580409e2f64 r -1.556989798598866e2f64 r 6.680131188771972e1f64 r -1.328068155288572e1f64 r 1.0f64
+  ret div num den
+end
+
+fn cm_norm_inv p f64 to f64
+  if not gt p 0.0f64
+    ret -1.0e300f64
+  end
+  if not lt p 1.0f64
+    ret 1.0e300f64
+  end
+  if lt p 0.02425f64
+    q = fsqrt mul -2.0f64 cm_ln p
+    ret cm_norm_inv_tail q
+  end
+  if gt p 0.97575f64
+    q = fsqrt mul -2.0f64 cm_ln sub 1.0f64 p
+    ret sub 0.0f64 cm_norm_inv_tail q
+  end
+  ret cm_norm_inv_mid p
+end
+
+fn rx_cm_t_quantile q f64 dof f64 to f64
+  z = cm_norm_inv add 0.5f64 mul 0.5f64 q
+  if not gt dof 0.0f64
+    ret z
+  end
+  z3 = mul mul z z z
+  z5 = mul mul z3 z z
+  t1 = div add z3 z mul 4.0f64 dof
+  t2 = div add add mul 5.0f64 z5 mul 16.0f64 z3 mul 3.0f64 z mul mul 96.0f64 dof dof
+  ret add add z t1 t2
+end
+
+fn cm_ceil_u x f64 to ulong
+  u = ulong x
+  if gt x f64 u
+    ret add u 1
+  end
+  ret u
+end
+
+note ---- model helpers ----
+
+fn cm_ca_idx sl ulong cell ulong arm ulong to ulong
+  ret add add mul sl 72 mul cell 8 arm
+end
+
+note Policy array pol[5] (bitcast ulong for f64):
+note   0:ei_min(f64) 1:max_fail_p(f64) 2:fallback_arm 3:explore_frac(f64) 4:explore_allow_ps
+fn rx_cm_default_policy pol edit ulong 5 to void
+  put pol 0 bitcast ulong 0.08f64
+  put pol 1 bitcast ulong 0.0f64
+  put pol 2 0
+  put pol 3 bitcast ulong 0.05f64
+  put pol 4 500000000
+end
+
+fn cm_init_tri_one ca ulong lam f64 to void
+  tb = mul ca 36
+  k = ulong 0
+  for i ulong 8
+    j = i
+    while lt j 8 bound 8
+      if eq i j
+        put cm_tri add tb k lam
+      else
+        put cm_tri add tb k 0.0f64
+      end
+      k = add k 1
+      j = add j 1
+    end
+  end
+  xb = mul ca 8
+  for i ulong 8
+    put cm_xty add xb i 0.0f64
+  end
+  put cm_yty ca 0.0f64
+  put cm_n ca 0
+  put cm_trials ca 0
+  put cm_failures ca 0
+end
+
+fn rx_cm_init sl ulong n_arms ulong to void
+  na = n_arms
+  if gt na RX_CM_ARMS
+    na = RX_CM_ARMS
+  end
+  put cm_n_arms sl na
+  put cm_lambda sl 0.001f64
+  put cm_sd_scale sl 1.0f64
+  put cm_explore_ps sl 0
+  put cm_work_ps sl 0
+  for c ulong RX_CM_CELLS
+    for a ulong RX_CM_ARMS
+      cm_init_tri_one cm_ca_idx sl c a 0.001f64
+    end
+  end
+  pb = mul sl 24
+  for i ulong 24
+    put cm_power_mw add pb i 0.0f64
+  end
+  ab = mul sl 8
+  for i ulong 8
+    put cm_verify_ns add ab i 0
+    put cm_synth_ns add ab i 0
+    put cm_code_bytes add ab i 0
+  end
+end
+
+fn cm_copy_ca dca ulong sca ulong to void
+  put cm_yty dca get cm_yty sca
+  put cm_n dca get cm_n sca
+  put cm_trials dca get cm_trials sca
+  put cm_failures dca get cm_failures sca
+  dtb = mul dca 36
+  stb = mul sca 36
+  for k ulong 36
+    put cm_tri add dtb k get cm_tri add stb k
+  end
+  dxb = mul dca 8
+  sxb = mul sca 8
+  for k ulong 8
+    put cm_xty add dxb k get cm_xty add sxb k
+  end
+end
+
+fn rx_cm_copy dst_sl ulong src_sl ulong to void
+  put cm_n_arms dst_sl get cm_n_arms src_sl
+  put cm_lambda dst_sl get cm_lambda src_sl
+  put cm_sd_scale dst_sl get cm_sd_scale src_sl
+  put cm_explore_ps dst_sl get cm_explore_ps src_sl
+  put cm_work_ps dst_sl get cm_work_ps src_sl
+  for i ulong 72
+    cm_copy_ca add mul dst_sl 72 i add mul src_sl 72 i
+  end
+  for i ulong 24
+    put cm_power_mw add mul dst_sl 24 i get cm_power_mw add mul src_sl 24 i
+  end
+  for i ulong 8
+    put cm_verify_ns add mul dst_sl 8 i get cm_verify_ns add mul src_sl 8 i
+    put cm_synth_ns add mul dst_sl 8 i get cm_synth_ns add mul src_sl 8 i
+    put cm_code_bytes add mul dst_sl 8 i get cm_code_bytes add mul src_sl 8 i
+  end
+end
+
+note Features array f[14] (ulong):
+note   0:op 1:M 2:N 3:state_bytes 4:cache_bytes 5:core 6:pressure 7:thermal_c
+note   8:current_arm 9:eligible 10:need_evidence 11:cognitive 12:lat_budget 13:eng_budget
+fn rx_cm_cell f view ulong 14 to ulong
+  op = get f 0
+  note CM704:refuse-unsupported-op
+  if ge op RX_CM_OPS
+    ret RX_CM_CELL_NONE
+  end
+  core = get f 5
+  if ge core RX_CM_CORES
+    core = RX_CM_CORE_OTHER
+  end
+  pr = get f 6
+  if ge pr RX_CM_PRESSURE
+    pr = sub RX_CM_PRESSURE 1
+  end
+  ret add mul add mul op RX_CM_CORES core RX_CM_PRESSURE pr
+end
+
+fn rx_cm_basis f view ulong 14 phi edit f64 8 to void
+  mv = get f 1
+  if eq mv 0
+    mv = 1
+  end
+  nv = get f 2
+  if eq nv 0
+    nv = 1
+  end
+  lm = cm_log2 f64 mv
+  ln = cm_log2 f64 nv
+  ov = f64 0.0f64
+  cb = get f 4
+  if ne cb 0
+    sb = get f 3
+    if gt sb cb
+      ov = cm_log2 div f64 sb f64 cb
+    end
+  end
+  put phi 0 1.0f64
+  put phi 1 lm
+  put phi 2 ln
+  put phi 3 mul lm ln
+  put phi 4 mul ln ln
+  if le get f 2 3
+    put phi 5 1.0f64
+  else
+    put phi 5 0.0f64
+  end
+  if ne rem get f 2 4 0
+    put phi 6 1.0f64
+  else
+    put phi 6 0.0f64
+  end
+  put phi 7 ov
+end
+
+fn cm_residual_basis f view ulong 14 phi edit f64 8 to void
+  full = new f64 8 0.0f64
+  rx_cm_basis f full
+  for i ulong 8
+    put phi i 0.0f64
+  end
+  put phi 0 1.0f64
+  put phi 1 get full 7
+end
+
+note ---- Cholesky + Bayesian NIG fit/predict ----
+
+fn cm_chol_unpack ca ulong to void
+  tb = mul ca 36
+  k = ulong 0
+  for i ulong 8
+    j = i
+    while lt j 8 bound 8
+      v = get cm_tri add tb k
+      put cm_chol_a add mul i 8 j v
+      put cm_chol_a add mul j 8 i v
+      k = add k 1
+      j = add j 1
+    end
+  end
+  for z ulong 64
+    put cm_chol_l z 0.0f64
+  end
+end
+
+fn cm_chol_diag j ulong to f64
+  s = get cm_chol_a add mul j 8 j
+  for k ulong j bound 8
+    lk = get cm_chol_l add mul j 8 k
+    s = sub s mul lk lk
+  end
+  ret s
+end
+
+fn cm_chol_off i ulong j ulong to f64
+  t = get cm_chol_a add mul i 8 j
+  for k ulong j bound 8
+    t = sub t mul get cm_chol_l add mul i 8 k get cm_chol_l add mul j 8 k
+  end
+  ret t
+end
+
+fn cm_cholesky ca ulong to long
+  cm_chol_unpack ca
+  for j ulong 8
+    s = cm_chol_diag j
+    if not gt s 0.0f64
+      ret -1
+    end
+    ljj = fsqrt s
+    put cm_chol_l add mul j 8 j ljj
+    i = add j 1
+    while lt i 8 bound 8
+      t = cm_chol_off i j
+      put cm_chol_l add mul i 8 j div t ljj
+      i = add i 1
+    end
+  end
+  ret 0
+end
+
+fn cm_fwd b view f64 8 v edit f64 8 to void
+  for i ulong 8
+    s = get b i
+    for k ulong i bound 8
+      s = sub s mul get cm_chol_l add mul i 8 k get v k
+    end
+    put v i div s get cm_chol_l add mul i 8 i
+  end
+end
+
+fn cm_bwd v view f64 8 x edit f64 8 to void
+  for r ulong 8
+    i = sub 7 r
+    s = get v i
+    k = add i 1
+    while lt k 8 bound 8
+      s = sub s mul get cm_chol_l add mul k 8 i get x k
+      k = add k 1
+    end
+    put x i div s get cm_chol_l add mul i 8 i
+  end
+end
+
+fn cm_dot8 a view f64 8 b view f64 8 to f64
+  s = f64 0.0f64
+  for i ulong 8
+    s = add s mul get a i get b i
+  end
+  ret s
+end
+
+fn cm_norm2_8 a view f64 8 to f64
+  s = f64 0.0f64
+  for i ulong 8
+    x = get a i
+    s = add s mul x x
+  end
+  ret s
+end
+
+fn cm_post_sd n ulong yty f64 quad f64 lev f64 dst edit f64 3 to void
+  a = add CM_PRIOR_A mul 0.5f64 f64 n
+  b = add CM_PRIOR_B mul 0.5f64 sub yty quad
+  if lt b CM_PRIOR_B
+    b = CM_PRIOR_B
+  end
+  s2 = div b a
+  if lt s2 CM_NOISE_FLOOR
+    s2 = CM_NOISE_FLOOR
+  end
+  put dst 1 fsqrt mul s2 add 1.0f64 lev
+  put dst 2 mul 2.0f64 a
+end
+
+fn cm_fit_predict ca ulong phi view f64 8 dst edit f64 3 to ulong
+  xty = new f64 8 0.0f64
+  v = new f64 8 0.0f64
+  mu = new f64 8 0.0f64
+  w = new f64 8 0.0f64
+  n = get cm_n ca
+  if eq n 0
+    ret 0
+  end
+  if ne cm_cholesky ca 0
+    ret 0
+  end
+  xb = mul ca 8
+  for i ulong 8
+    put xty i get cm_xty add xb i
+  end
+  cm_fwd xty v
+  cm_bwd v mu
+  cm_fwd phi w
+  put dst 0 cm_dot8 mu phi
+  cm_post_sd n get cm_yty ca cm_norm2_8 v cm_norm2_8 w dst
+  ret 1
+end
+
+fn cm_failures_of sl ulong arm ulong to ulong
+  f = ulong 0
+  for c ulong RX_CM_CELLS
+    f = add f get cm_failures cm_ca_idx sl c arm
+  end
+  ret f
+end
+
+fn cm_fail_p sl ulong arm ulong to f64
+  t = ulong 0
+  f = ulong 0
+  for c ulong RX_CM_CELLS
+    ca = cm_ca_idx sl c arm
+    t = add t get cm_trials ca
+    f = add f get cm_failures ca
+  end
+  ret div add f64 f CM_FAIL_PRIOR add f64 t 1.0f64
+end
+
+fn cm_quiet_predict sl ulong f view ulong 14 arm ulong dst edit f64 4 to ulong
+  g = new ulong 14 0
+  phi = new f64 8 0.0f64
+  res = new f64 3 0.0f64
+  for i ulong 14
+    put g i get f i
+  end
+  put g 6 0
+  cell = rx_cm_cell g
+  if ge cell RX_CM_CELLS
+    ret 0
+  end
+  ca = cm_ca_idx sl cell arm
+  if lt get cm_n ca RX_CM_MIN_OBS
+    ret 0
+  end
+  rx_cm_basis f phi
+  if eq cm_fit_predict ca phi res 0
+    ret 0
+  end
+  put dst 0 get res 0
+  put dst 1 get res 1
+  put dst 2 get res 2
+  put dst 3 f64 get cm_n ca
+  ret 1
+end
+
+fn cm_predict_pressure sl ulong cell ulong arm ulong f view ulong 14 q edit f64 4 to ulong
+  phi = new f64 8 0.0f64
+  rres = new f64 3 0.0f64
+  rca = cm_ca_idx sl cell arm
+  cm_residual_basis f phi
+  if ge get cm_n rca RX_CM_RES_MIN_OBS
+    if ne cm_fit_predict rca phi rres 0
+      put q 0 add get q 0 get rres 0
+      sd = get q 1
+      rsd = get rres 1
+      put q 1 fsqrt add mul sd sd mul rsd rsd
+      if lt get rres 2 get q 2
+        put q 2 get rres 2
+      end
+      put q 3 f64 get cm_n rca
+      ret 1
+    end
+  end
+  sd = get q 1
+  put q 1 fsqrt add mul sd sd mul RX_CM_UNSEEN_SHIFT RX_CM_UNSEEN_SHIFT
+  ret 0
+end
+
+fn cm_predict_energy sl ulong core ulong arm ulong mean f64 to f64
+  c = core
+  if ge c RX_CM_CORES
+    c = RX_CM_CORE_OTHER
+  end
+  mw = get cm_power_mw add add mul sl 24 mul c 8 arm
+  if gt mw 0.0f64
+    ret mul mul cm_exp2 mean mw 0.001f64
+  end
+  ret 0.0f64
+end
+
+note Prediction array pr[9] (ulong, f64 bitcast where noted):
+note   0:mean(f64) 1:sd(f64) 2:dof(f64) 3:n 4:known 5:borrowed 6:energy_pj(f64) 7:fail_p(f64) 8:refused
+fn rx_cm_predict sl ulong f view ulong 14 arm ulong pr edit ulong 9 to long
+  q = new f64 4 0.0f64
+  for i ulong 9
+    put pr i 0
+  end
+  if ge arm get cm_n_arms sl
+    ret RX_CM_ERR_ARG
+  end
+  cell = rx_cm_cell f
+  if ge cell RX_CM_CELLS
+    put pr 8 1
+    ret RX_CM_ERR_UNSUPPORTED
+  end
+  put pr 7 bitcast ulong cm_fail_p sl arm
+  if eq cm_quiet_predict sl f arm q 0
+    ret RX_CM_OK
+  end
+  if eq get f 6 0
+    put pr 4 1
+  else
+    if ne cm_predict_pressure sl cell arm f q 0
+      put pr 4 1
+    else
+      put pr 5 1
+    end
+  end
+  sc = get cm_sd_scale sl
+  if lt sc 1.0f64
+    sc = 1.0f64
+  end
+  put pr 0 bitcast ulong get q 0
+  put pr 1 bitcast ulong mul get q 1 sc
+  put pr 2 bitcast ulong get q 2
+  put pr 3 ulong get q 3
+  put pr 6 bitcast ulong cm_predict_energy sl get f 5 arm get q 0
+  ret RX_CM_OK
+end
+
+fn cm_add_tri idx ulong v f64 to void
+  put cm_tri idx add get cm_tri idx v
+end
+
+fn cm_rank1_update ca ulong phi view f64 8 y f64 to void
+  tb = mul ca 36
+  k = ulong 0
+  for i ulong 8
+    pi = get phi i
+    j = i
+    while lt j 8 bound 8
+      cm_add_tri add tb k mul pi get phi j
+      k = add k 1
+      j = add j 1
+    end
+    xidx = add mul ca 8 i
+    put cm_xty xidx add get cm_xty xidx mul pi y
+  end
+  put cm_yty ca add get cm_yty ca mul y y
+  put cm_n ca add get cm_n ca 1
+end
+
+fn rx_cm_observe sl ulong f view ulong 14 arm ulong ps ulong failed ulong to long
+  phi = new f64 8 0.0f64
+  q = new f64 4 0.0f64
+  if ge arm get cm_n_arms sl
+    ret RX_CM_ERR_ARG
+  end
+  cell = rx_cm_cell f
+  if ge cell RX_CM_CELLS
+    ret RX_CM_ERR_UNSUPPORTED
+  end
+  ca = cm_ca_idx sl cell arm
+  put cm_trials ca add get cm_trials ca 1
+  if ne failed 0
+    put cm_failures ca add get cm_failures ca 1
+    ret RX_CM_OK
+  end
+  if eq ps 0
+    ret RX_CM_ERR_ARG
+  end
+  y = cm_log2 f64 ps
+  bkt = get f 6
+  if ge bkt RX_CM_PRESSURE
+    bkt = sub RX_CM_PRESSURE 1
+  end
+  if eq bkt 0
+    rx_cm_basis f phi
+  else
+    if eq cm_quiet_predict sl f arm q 0
+      ret RX_CM_SKIPPED
+    end
+    cm_residual_basis f phi
+    y = sub y get q 0
+  end
+  cm_rank1_update ca phi y
+  ret RX_CM_OK
+end
+
+fn cm_expected_improvement d f64 s f64 to f64
+  if not gt s 0.0f64
+    if gt d 0.0f64
+      ret d
+    end
+    ret 0.0f64
+  end
+  u = div d s
+  t1 = div mul s cm_exp mul -0.5f64 mul u u 2.5066282746310002f64
+  ret add t1 mul d cm_norm_cdf u
+end
+
+fn cm_explore_allowed sl ulong pol view ulong 5 to bool
+  ef = bitcast f64 get pol 3
+  cap = add mul ef f64 get cm_work_ps sl f64 get pol 4
+  ret lt f64 get cm_explore_ps sl cap
+end
+
+note Decision output stored in global cm_dec[7] + cm_dec_pred[72]:
+note cm_dec: 0:action 1:arm 2:m0 3:m1 4:why 5:p_runner_up(f64) 6:ei(f64)
+global cm_dec ulong 8
+global cm_dec_pred ulong 72
+global cm_dec_have ulong 8
+
+fn cm_dec_store_pred a ulong pr view ulong 9 to void
+  base = mul a 9
+  for i ulong 9
+    put cm_dec_pred add base i get pr i
+  end
+end
+
+fn cm_dec_fits f view ulong 14 a ulong to bool
+  base = mul a 9
+  mean = bitcast f64 get cm_dec_pred add base 0
+  sd = bitcast f64 get cm_dec_pred add base 1
+  epj = bitcast f64 get cm_dec_pred add base 6
+  lb = get f 12
+  if ne lb 0
+    hi = cm_exp2 add mean mul 1.2816f64 sd
+    if gt hi f64 lb
+      ret eq ulong 1 0
+    end
+  end
+  eb = get f 13
+  if ne eb 0
+    if ne epj 0.0f64
+      if gt epj f64 eb
+        ret eq ulong 1 0
+      end
+    end
+  end
+  ret eq ulong 1 1
+end
+
+fn cm_dec_pick_best na ulong elig ulong f view ulong 14 dst edit long 3 to void
+  best = long -1
+  bfit = long -1
+  for a ulong na bound 8
+    if eq get cm_dec_have a 0
+      continue
+    end
+    if eq and elig shl ulong 1 a 0
+      continue
+    end
+    ma = bitcast f64 get cm_dec_pred mul a 9
+    if lt best 0
+      best = long a
+    else
+      if lt ma bitcast f64 get cm_dec_pred mul ulong best 9
+        best = long a
+      end
+    end
+    if cm_dec_fits f a
+      if lt bfit 0
+        bfit = long a
+      else
+        if lt ma bitcast f64 get cm_dec_pred mul ulong bfit 9
+          bfit = long a
+        end
+      end
+    end
+  end
+  over = long 0
+  if ge bfit 0
+    best = bfit
+  else
+    if ge best 0
+      over = 1
+    end
+  end
+  put dst 0 best
+  put dst 1 over
+end
+
+fn cm_comp_score a ulong best ulong dst edit f64 2 to void
+  xa = mul a 9
+  xb = mul best 9
+  sx = bitcast f64 get cm_dec_pred add xa 1
+  sb = bitcast f64 get cm_dec_pred add xb 1
+  s = fsqrt add mul sx sx mul sb sb
+  d = sub bitcast f64 get cm_dec_pred add xb 0 bitcast f64 get cm_dec_pred add xa 0
+  put dst 0 cm_expected_improvement d s
+  sd_d = s
+  if not gt sd_d 0.0f64
+    sd_d = 1.0e-9f64
+  end
+  put dst 1 cm_norm_cdf div d sd_d
+end
+
+fn cm_dec_pick_comp na ulong elig ulong best long dst edit ulong 4 to void
+  sc = new f64 2 0.0f64
+  comp = long -1
+  c_unk = ulong 0
+  ei = f64 0.0f64
+  pc = f64 0.0f64
+  for a ulong na bound 8
+    if eq and elig shl ulong 1 a 0
+      continue
+    end
+    if eq long a best
+      continue
+    end
+    unk = ulong 0
+    if eq get cm_dec_have a 0
+      unk = 1
+    end
+    if lt best 0
+      unk = 1
+    end
+    e = f64 0.0f64
+    pa = f64 0.5f64
+    if ne unk 0
+      e = 1.0e300f64
+    else
+      cm_comp_score a ulong best sc
+      e = get sc 0
+      pa = get sc 1
+    end
+    take = ulong 0
+    if lt comp 0
+      take = 1
+    else
+      if gt e ei
+        take = 1
+      end
+    end
+    if ne take 0
+      comp = long a
+      ei = e
+      pc = pa
+      c_unk = unk
+    end
+  end
+  put dst 0 ulong comp
+  put dst 1 c_unk
+  put dst 2 bitcast ulong pc
+  if gt ei 1.0e299f64
+    put dst 3 bitcast ulong -1.0f64
+  else
+    put dst 3 bitcast ulong ei
+  end
+end
+
+fn cm_dec_refuse na ulong to void
+  put cm_dec 0 RX_CM_REFUSE
+  put cm_dec 1 na
+  put cm_dec 2 na
+  put cm_dec 3 na
+  put cm_dec 4 RX_CM_WHY_UNSUPPORTED_OP
+  for a ulong RX_CM_ARMS
+    put cm_dec_pred add mul a 9 8 1
+  end
+end
+
+fn cm_dec_eval_one sl ulong a ulong fb ulong mfp f64 f view ulong 14 to ulong
+  pr = new ulong 9 0
+  ign = rx_cm_predict sl f a pr
+  cm_dec_store_pred a pr
+  if ne a fb
+    if gt cm_failures_of sl a 0
+      if gt bitcast f64 get pr 7 mfp
+        ret 2
+      end
+    end
+  end
+  if ne or get pr 4 get pr 5 0
+    put cm_dec_have a 1
+  end
+  ret 1
+end
+
+fn cm_dec_eval_arms sl ulong pol view ulong 5 f view ulong 14 dst edit ulong 2 to void
+  na = get cm_n_arms sl
+  fb = get pol 2
+  if ge fb na
+    fb = 0
+  end
+  elig = and or get f 9 shl ulong 1 fb sub shl ulong 1 na 1
+  n_elig = ulong 0
+  for a ulong na bound 8
+    bit = shl ulong 1 a
+    st = cm_dec_eval_one sl a fb bitcast f64 get pol 1 f
+    if eq and elig bit 0
+      continue
+    end
+    if eq st 2
+      elig = and elig not bit
+      continue
+    end
+    n_elig = add n_elig 1
+  end
+  put dst 0 elig
+  put dst 1 n_elig
+end
+
+fn cm_dec_finish sl ulong pol view ulong 5 best long over long allow_m ulong to void
+  na = get cm_n_arms sl
+  fb = get pol 2
+  if ge fb na
+    fb = 0
+  end
+  comp = long get cm_dec 7
+  c_unk = get cm_dec 2
+  why = RX_CM_WHY_CONFIDENT
+  if lt best 0
+    why = RX_CM_WHY_UNKNOWN_ARM
+  else
+    if ne c_unk 0
+      why = RX_CM_WHY_UNKNOWN_ARM
+    else
+      if gt bitcast f64 get cm_dec 6 bitcast f64 get pol 0
+        why = RX_CM_WHY_WORTH_MEASURING
+      end
+    end
+  end
+  put cm_dec 2 0
+  put cm_dec 7 0
+  if ne why RX_CM_WHY_CONFIDENT
+    if ne allow_m 0
+      if cm_explore_allowed sl pol
+        if ge comp 0
+          put cm_dec 0 RX_CM_MEASURE
+          m0 = fb
+          if ge best 0
+            m0 = ulong best
+          end
+          m1 = ulong comp
+          if eq m0 m1
+            m1 = fb
+          end
+          put cm_dec 2 m0
+          put cm_dec 3 m1
+          put cm_dec 4 why
+          put cm_dec 1 m0
+          ret
+        end
+      end
+    end
+  end
+  if lt best 0
+    if ne allow_m 0
+      if not cm_explore_allowed sl pol
+        put cm_dec 4 RX_CM_WHY_BUDGET_SPENT
+        ret
+      end
+    end
+    put cm_dec 4 RX_CM_WHY_UNKNOWN_ARM
+    ret
+  end
+  put cm_dec 0 RX_CM_SELECT
+  put cm_dec 1 ulong best
+  if ne over 0
+    put cm_dec 4 RX_CM_WHY_OVER_BUDGET
+    ret
+  end
+  if ne why RX_CM_WHY_CONFIDENT
+    if ne allow_m 0
+      put cm_dec 4 RX_CM_WHY_BUDGET_SPENT
+      ret
+    end
+  end
+  put cm_dec 4 RX_CM_WHY_CONFIDENT
+end
+
+fn rx_cm_decide sl ulong pol view ulong 5 f view ulong 14 allow_m ulong to void
+  el = new ulong 2 0
+  bo = new long 3 0
+  co = new ulong 4 0
+  for i ulong 8
+    put cm_dec i 0
+    put cm_dec_have i 0
+  end
+  for i ulong 72
+    put cm_dec_pred i 0
+  end
+  na = get cm_n_arms sl
+  if ge rx_cm_cell f RX_CM_CELLS
+    cm_dec_refuse na
+    ret
+  end
+  fb = get pol 2
+  if ge fb na
+    fb = 0
+  end
+  cm_dec_eval_arms sl pol f el
+  put cm_dec 0 RX_CM_FALLBACK
+  put cm_dec 1 fb
+  if le get el 1 1
+    put cm_dec 4 RX_CM_WHY_NO_ELIGIBLE
+    ret
+  end
+  cm_dec_pick_best na get el 0 f bo
+  cm_dec_pick_comp na get el 0 get bo 0 co
+  put cm_dec 7 get co 0
+  put cm_dec 2 get co 1
+  put cm_dec 5 get co 2
+  put cm_dec 6 get co 3
+  cm_dec_finish sl pol get bo 0 get bo 1 allow_m
+end
+
+fn rx_cm_charge sl ulong work_ps ulong explore_ps ulong to void
+  put cm_work_ps sl add get cm_work_ps sl work_ps
+  put cm_explore_ps sl add get cm_explore_ps sl explore_ps
+end
+
+fn cm_sort_cal k ulong to void
+  if lt k 2
+    ret
+  end
+  for i ulong sub k 1 bound 1024
+    j = add i 1
+    while lt j k bound 1024
+      vi = get cm_cal_r i
+      vj = get cm_cal_r j
+      if gt vi vj
+        put cm_cal_r i vj
+        put cm_cal_r j vi
+      end
+      j = add j 1
+    end
+  end
+end
+
+note Calibration over global cal arrays:
+global cm_cal_f ulong 14336
+global cm_cal_a ulong 1024
+global cm_cal_ps ulong 1024
+
+fn cm_cal_one sl ulong i ulong q f64 k ulong to ulong
+  f = new ulong 14 0
+  pr = new ulong 9 0
+  fb = mul i 14
+  for j ulong 14
+    put f j get cm_cal_f add fb j
+  end
+  ign = rx_cm_predict sl f get cm_cal_a i pr
+  if eq or get pr 4 get pr 5 0
+    ret k
+  end
+  psi = get cm_cal_ps i
+  if eq psi 0
+    ret k
+  end
+  sd = bitcast f64 get pr 1
+  if not gt sd 0.0f64
+    ret k
+  end
+  z = div cm_fabs sub cm_log2 f64 psi bitcast f64 get pr 0 sd
+  put cm_cal_r k div z rx_cm_t_quantile q bitcast f64 get pr 2
+  ret add k 1
+end
+
+fn rx_cm_calibrate sl ulong n ulong q f64 to f64
+  if eq n 0
+    ret 0.0f64
+  end
+  if not gt q 0.0f64
+    ret 0.0f64
+  end
+  if not lt q 1.0f64
+    ret 0.0f64
+  end
+  saved = get cm_sd_scale sl
+  put cm_sd_scale sl 1.0f64
+  k = ulong 0
+  for i ulong n bound 1024
+    k = cm_cal_one sl i q k
+  end
+  if ge k 10
+    cm_sort_cal k
+    idx = sub cm_ceil_u mul q f64 k 1
+    if ge idx k
+      idx = sub k 1
+    end
+    sc = get cm_cal_r idx
+    if lt sc 1.0f64
+      sc = 1.0f64
+    end
+    put cm_sd_scale sl sc
+    ret sc
+  end
+  put cm_sd_scale sl saved
+  ret 0.0f64
+end
+
+note ---- OGCM v1 canonical bytes (28080 wire + 32 SHA-256 = 28112 bytes) ----
+
+fn rx_cm_blob_size to ulong
+  ret CM_BLOB_BYTES
+end
+
+fn cm_put32_sh off ulong v ulong to void
+  for i ulong 4
+    put sh_dat add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn cm_put64_sh off ulong v ulong to void
+  for i ulong 8
+    put sh_dat add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn cm_get32_buf is_b ulong off ulong to ulong
+  v = ulong 0
+  for i ulong 4
+    b = ulong 0
+    if eq is_b 0
+      b = ulong get cm_blob_a add off i
+    else
+      b = ulong get cm_blob_b add off i
+    end
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn cm_get64_buf is_b ulong off ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    b = ulong 0
+    if eq is_b 0
+      b = ulong get cm_blob_a add off i
+    else
+      b = ulong get cm_blob_b add off i
+    end
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn cm_pack_cell_sh sl ulong c ulong a ulong off ulong to ulong
+  ca = cm_ca_idx sl c a
+  pos = off
+  tb = mul ca 36
+  for k ulong 36
+    cm_put64_sh pos bitcast ulong get cm_tri add tb k
+    pos = add pos 8
+  end
+  xb = mul ca 8
+  for k ulong 8
+    cm_put64_sh pos bitcast ulong get cm_xty add xb k
+    pos = add pos 8
+  end
+  cm_put64_sh pos bitcast ulong get cm_yty ca
+  pos = add pos 8
+  cm_put64_sh pos get cm_n ca
+  pos = add pos 8
+  cm_put64_sh pos get cm_trials ca
+  pos = add pos 8
+  cm_put64_sh pos get cm_failures ca
+  ret add pos 8
+end
+
+fn cm_pack_wire_sh sl ulong to void
+  cm_put32_sh 0 CM_OGCM_MAGIC
+  cm_put32_sh 4 1
+  cm_put32_sh 8 get cm_n_arms sl
+  cm_put32_sh 12 8
+  cm_put32_sh 16 9
+  cm_put32_sh 20 8
+  cm_put32_sh 24 3
+  cm_put32_sh 28 0
+  cm_put64_sh 32 bitcast ulong get cm_lambda sl
+  pos = ulong 40
+  for c ulong RX_CM_CELLS
+    for a ulong RX_CM_ARMS
+      pos = cm_pack_cell_sh sl c a pos
+    end
+  end
+  pb = mul sl 24
+  for i ulong 24
+    cm_put64_sh pos bitcast ulong get cm_power_mw add pb i
+    pos = add pos 8
+  end
+  ab = mul sl 8
+  for i ulong 8
+    cm_put64_sh pos get cm_verify_ns add ab i
+    pos = add pos 8
+  end
+  for i ulong 8
+    cm_put64_sh pos get cm_synth_ns add ab i
+    pos = add pos 8
+  end
+  for i ulong 8
+    cm_put64_sh pos get cm_code_bytes add ab i
+    pos = add pos 8
+  end
+  cm_put64_sh pos bitcast ulong get cm_sd_scale sl
+end
+
+fn rx_cm_serialize sl ulong is_b ulong to long
+  cm_pack_wire_sh sl
+  sh_all CM_WIRE_BYTES
+  if eq is_b 0
+    for i ulong CM_WIRE_BYTES
+      put cm_blob_a i get sh_dat i
+    end
+    for i ulong 32
+      put cm_blob_a add CM_WIRE_BYTES i get sh_dig i
+    end
+  else
+    for i ulong CM_WIRE_BYTES
+      put cm_blob_b i get sh_dat i
+    end
+    for i ulong 32
+      put cm_blob_b add CM_WIRE_BYTES i get sh_dig i
+    end
+  end
+  ret RX_CM_OK
+end
+
+fn rx_cm_digest sl ulong dst edit uchar 32 to void
+  cm_pack_wire_sh sl
+  sh_all CM_WIRE_BYTES
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn cm_unpack_cell sl ulong is_b ulong c ulong a ulong off ulong to ulong
+  ca = cm_ca_idx sl c a
+  pos = off
+  tb = mul ca 36
+  for k ulong 36
+    put cm_tri add tb k bitcast f64 cm_get64_buf is_b pos
+    pos = add pos 8
+  end
+  xb = mul ca 8
+  for k ulong 8
+    put cm_xty add xb k bitcast f64 cm_get64_buf is_b pos
+    pos = add pos 8
+  end
+  put cm_yty ca bitcast f64 cm_get64_buf is_b pos
+  pos = add pos 8
+  put cm_n ca cm_get64_buf is_b pos
+  pos = add pos 8
+  put cm_trials ca cm_get64_buf is_b pos
+  pos = add pos 8
+  put cm_failures ca cm_get64_buf is_b pos
+  ret add pos 8
+end
+
+fn cm_check_blob_hdr is_b ulong to long
+  if ne cm_get32_buf is_b 0 CM_OGCM_MAGIC
+    ret RX_CM_ERR_FORMAT
+  end
+  if ne cm_get32_buf is_b 4 1
+    ret RX_CM_ERR_FORMAT
+  end
+  arms = cm_get32_buf is_b 8
+  if eq arms 0
+    ret RX_CM_ERR_FORMAT
+  end
+  if gt arms 8
+    ret RX_CM_ERR_FORMAT
+  end
+  if ne cm_get32_buf is_b 12 8
+    ret RX_CM_ERR_FORMAT
+  end
+  if ne cm_get32_buf is_b 16 9
+    ret RX_CM_ERR_FORMAT
+  end
+  if ne cm_get32_buf is_b 20 8
+    ret RX_CM_ERR_FORMAT
+  end
+  if ne cm_get32_buf is_b 24 3
+    ret RX_CM_ERR_FORMAT
+  end
+  sc = bitcast f64 cm_get64_buf is_b 28072
+  if lt sc 1.0f64
+    ret RX_CM_ERR_FORMAT
+  end
+  if ge sc 1000000.0f64
+    ret RX_CM_ERR_FORMAT
+  end
+  ret RX_CM_OK
+end
+
+fn rx_cm_deserialize sl ulong is_b ulong blen ulong to long
+  if ne blen CM_BLOB_BYTES
+    ret RX_CM_ERR_FORMAT
+  end
+  if eq is_b 0
+    for i ulong CM_WIRE_BYTES
+      put sh_dat i get cm_blob_a i
+    end
+  else
+    for i ulong CM_WIRE_BYTES
+      put sh_dat i get cm_blob_b i
+    end
+  end
+  sh_all CM_WIRE_BYTES
+  for i ulong 32
+    b = uchar 0
+    if eq is_b 0
+      b = get cm_blob_a add CM_WIRE_BYTES i
+    else
+      b = get cm_blob_b add CM_WIRE_BYTES i
+    end
+    if ne b get sh_dig i
+      ret RX_CM_ERR_DIGEST
+    end
+  end
+  if ne cm_check_blob_hdr is_b RX_CM_OK
+    ret RX_CM_ERR_FORMAT
+  end
+  put cm_n_arms sl cm_get32_buf is_b 8
+  put cm_lambda sl bitcast f64 cm_get64_buf is_b 32
+  pos = ulong 40
+  for c ulong RX_CM_CELLS
+    for a ulong RX_CM_ARMS
+      pos = cm_unpack_cell sl is_b c a pos
+    end
+  end
+  pb = mul sl 24
+  for i ulong 24
+    put cm_power_mw add pb i bitcast f64 cm_get64_buf is_b pos
+    pos = add pos 8
+  end
+  ab = mul sl 8
+  for i ulong 8
+    put cm_verify_ns add ab i cm_get64_buf is_b pos
+    pos = add pos 8
+  end
+  for i ulong 8
+    put cm_synth_ns add ab i cm_get64_buf is_b pos
+    pos = add pos 8
+  end
+  for i ulong 8
+    put cm_code_bytes add ab i cm_get64_buf is_b pos
+    pos = add pos 8
+  end
+  put cm_sd_scale sl bitcast f64 cm_get64_buf is_b pos
+  put cm_explore_ps sl 0
+  put cm_work_ps sl 0
+  ret RX_CM_OK
+end

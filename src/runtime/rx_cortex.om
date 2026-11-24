@@ -1,0 +1,1030 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_cortex.om -- Pure seeded OM-2 port of src/runtime/rx_cortex.c.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const CX_ENTITY ulong 1
+const CX_CLAIM ulong 2
+const CX_OBSERVATION ulong 3
+const CX_EXECUTION ulong 4
+const CX_FAILURE ulong 5
+const CX_EVIDENCE ulong 6
+const CX_PLAN ulong 7
+const CX_REALIZATION ulong 8
+const CX_RELATIONSHIP ulong 9
+const CX_CLASS_END ulong 10
+
+const CX_PROT_AUTHORITY ulong 1
+const CX_PROT_COMMIT_RECEIPT ulong 2
+const CX_PROT_VERIFY_EVIDENCE ulong 4
+const CX_PROT_GENERATION_ID ulong 8
+const CX_PROT_EFFECT_RECEIPT ulong 16
+const CX_PROT_ALL ulong 31
+
+const CX_K_BASE ulong 65536
+const CX_K_WORK_ACCEPTED ulong 65537
+const CX_K_ENTITY_CREATED ulong 65538
+const CX_K_ENTITY_RETIRED ulong 65539
+const CX_K_EXEC_COMMIT ulong 65540
+const CX_K_EXEC_NOOP ulong 65541
+const CX_K_EXEC_FAILED ulong 65542
+const CX_K_CLAIM ulong 65552
+const CX_K_CANDIDATE ulong 65553
+const CX_K_EVIDENCE_REF ulong 65554
+const CX_K_PROMOTION ulong 65555
+const CX_K_ADMISSION ulong 65556
+const CX_K_IMPORTED ulong 65568
+
+const CX_LINKS ulong 4
+
+const CX_OK long 0
+const CX_ERR_ARG long -1
+const CX_ERR_NOMEM long -2
+const CX_ERR_ORDER long -3
+const CX_ERR_DIGEST long -4
+const CX_ERR_WRITER long -5
+const CX_ERR_IO long -6
+const CX_ERR_FORMAT long -7
+const CX_ERR_TORN long -8
+
+const CX_OPEN_READONLY ulong 1
+const CX_OPEN_SYNC ulong 2
+const CX_OPEN_REPAIR_TAIL ulong 4
+
+const CX_J_MAGIC ulong 85947260459385153
+const CX_J_VERSION ulong 1
+const CX_J_HDR_WORDS ulong 4
+const CX_R_MAGIC ulong 4918868516143088469
+const CX_R_FIXED ulong 13
+const CX_R_DIGEST ulong 4
+
+const CX_WREC_WORDS ulong 26
+
+const CX_MAX_STORES ulong 4
+const CX_MAX_OBJS ulong 2048
+const CX_OBJ_WORDS ulong 16
+const CX_MAX_ARENA ulong 32768
+const CX_MAX_SUBJ ulong 128
+const CX_SUBJ_CAP ulong 512
+const CX_MJ_MAX ulong 4
+const CX_MJ_CAP ulong 262144
+const CX_U32_MAX ulong 4294967295
+const CX_U64_MAX ulong 18446744073709551615
+
+text cx_domain "AIEN.CORTEX.OBJECT.V1"
+
+note Per-store metadata (16 ulongs per store):
+note   0:n, 1:arena_n, 2:n_subjects, 3:examined, 4:writer, 5:open_flags,
+note   6:j_kind (0=none, 1=mem), 7:j_slot, 8:j_ro
+global cx_meta ulong 64
+global cx_chain uchar 128
+
+note Objects: 4 * 2048 * 16 = 131072 ulongs
+note Field offsets: 0:id 1:cls 2:kind 3:subject 4:t 5:gen 6:branch 7:protect
+note                8:tag 9..12:links[0..3] 13:n 14:off 15:reserved
+global cx_objs ulong 131072
+global cx_digs uchar 262144
+
+note Payload arena: 4 * 32768 = 131072 ulongs
+global cx_arena ulong 131072
+
+note Per-subject index: 4 * 128 = 512 counts; 4 * 128 * 512 = 262144 ids
+global cx_subj_n ulong 512
+global cx_subj_ids ulong 262144
+
+note Memory journal backend: 4 slots x 262144 bytes
+note cx_mj_meta (8 ulongs per slot):
+note   0:len, 1:writer, 2:fail_append, 3:fail_truncate,
+note   4:opens, 5:appends, 6:truncates, 7:syncs
+global cx_mj_meta ulong 32
+global cx_mj_buf uchar 1048576
+
+note Scratch for replay payload (up to 1024 words)
+global cx_replay_pay ulong 1024
+global cx_rec_buf uchar 8192
+
+fn cx_le_put_sh off ulong v ulong to void
+  for i ulong 8
+    put sh_dat add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn cx_le_put_rec off ulong v ulong to void
+  for i ulong 8
+    put cx_rec_buf add off i uchar and shr v mul i 8 255
+  end
+end
+
+fn cx_le_get_mj jslot ulong off ulong to ulong
+  base = add mul jslot CX_MJ_CAP off
+  v = ulong 0
+  for i ulong 8
+    b = ulong get cx_mj_buf add base i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn cx_obj_base st ulong idx ulong to ulong
+  ret mul add mul st CX_MAX_OBJS idx CX_OBJ_WORDS
+end
+
+fn cx_dig_base st ulong idx ulong to ulong
+  ret mul add mul st CX_MAX_OBJS idx 32
+end
+
+fn cx_digest_obj st ulong idx ulong to void
+  ob = cx_obj_base st idx
+  for i ulong 21
+    put sh_dat i get cx_domain i
+  end
+  pos = ulong 21
+  cx_le_put_sh pos get cx_objs add ob 0
+  pos = add pos 8
+  ck = or shl get cx_objs add ob 1 32 get cx_objs add ob 2
+  cx_le_put_sh pos ck
+  pos = add pos 8
+  cx_le_put_sh pos get cx_objs add ob 3
+  pos = add pos 8
+  cx_le_put_sh pos get cx_objs add ob 4
+  pos = add pos 8
+  cx_le_put_sh pos get cx_objs add ob 5
+  pos = add pos 8
+  bp = or shl get cx_objs add ob 6 32 get cx_objs add ob 7
+  cx_le_put_sh pos bp
+  pos = add pos 8
+  cx_le_put_sh pos get cx_objs add ob 8
+  pos = add pos 8
+  for k ulong 4
+    cx_le_put_sh pos get cx_objs add ob add 9 k
+    pos = add pos 8
+  end
+  nw = get cx_objs add ob 13
+  cx_le_put_sh pos nw
+  pos = add pos 8
+  ab = add mul st CX_MAX_ARENA get cx_objs add ob 14
+  for k ulong nw bound 1024
+    cx_le_put_sh pos get cx_arena add ab k
+    pos = add pos 8
+  end
+  sh_all pos
+end
+
+fn cx_chain_step st ulong idx ulong to void
+  cb = mul st 32
+  db = cx_dig_base st idx
+  for i ulong 32
+    put sh_dat i get cx_chain add cb i
+    put sh_dat add 32 i get cx_digs add db i
+  end
+  sh_all 64
+  for i ulong 32
+    put cx_chain add cb i get sh_dig i
+  end
+end
+
+fn cx_init st ulong n_subjects ulong to long
+  if ge st CX_MAX_STORES
+    ret CX_ERR_ARG
+  end
+  if gt n_subjects CX_MAX_SUBJ
+    ret CX_ERR_NOMEM
+  end
+  mb = mul st 16
+  for i ulong 16
+    put cx_meta add mb i 0
+  end
+  put cx_meta add mb 2 n_subjects
+  cb = mul st 32
+  for i ulong 32
+    put cx_chain add cb i 0
+  end
+  sb = mul st CX_MAX_SUBJ
+  for i ulong CX_MAX_SUBJ
+    put cx_subj_n add sb i 0
+  end
+  ret CX_OK
+end
+
+fn cx_mj_close jslot ulong is_ro ulong to void
+  if eq is_ro 0
+    put cx_mj_meta add mul jslot 8 1 0
+  end
+end
+
+fn cx_free st ulong to void
+  if ge st CX_MAX_STORES
+    ret
+  end
+  mb = mul st 16
+  jk = get cx_meta add mb 6
+  if eq jk 1
+    cx_mj_close get cx_meta add mb 7 get cx_meta add mb 8
+  end
+  for i ulong 16
+    put cx_meta add mb i 0
+  end
+  cb = mul st 32
+  for i ulong 32
+    put cx_chain add cb i 0
+  end
+  sb = mul st CX_MAX_SUBJ
+  for i ulong CX_MAX_SUBJ
+    put cx_subj_n add sb i 0
+  end
+end
+
+fn cx_close st ulong to void
+  cx_free st
+end
+
+fn cx_claim_writer st ulong token ulong to long
+  if ge st CX_MAX_STORES
+    ret CX_ERR_ARG
+  end
+  if eq token 0
+    ret CX_ERR_ARG
+  end
+  mb = mul st 16
+  if ne and get cx_meta add mb 5 CX_OPEN_READONLY 0
+    ret CX_ERR_WRITER
+  end
+  cur = get cx_meta add mb 4
+  if ne cur 0
+    if ne cur token
+      ret CX_ERR_WRITER
+    end
+  end
+  put cx_meta add mb 4 token
+  ret CX_OK
+end
+
+fn cx_release_writer st ulong token ulong to void
+  if ge st CX_MAX_STORES
+    ret
+  end
+  if eq token 0
+    ret
+  end
+  mb = mul st 16
+  if eq get cx_meta add mb 4 token
+    put cx_meta add mb 4 0
+  end
+end
+
+note Memory journal helpers
+fn cx_mj_reset jslot ulong to void
+  mb = mul jslot 8
+  for i ulong 8
+    put cx_mj_meta add mb i 0
+  end
+end
+
+fn cx_mj_open jslot ulong ro ulong to long
+  mb = mul jslot 8
+  put cx_mj_meta add mb 4 add get cx_mj_meta add mb 4 1
+  if eq ro 0
+    if ne get cx_mj_meta add mb 1 0
+      ret CX_ERR_WRITER
+    end
+    put cx_mj_meta add mb 1 1
+  end
+  ret CX_OK
+end
+
+fn cx_mj_append jslot ulong is_ro ulong nbytes ulong sync ulong to long
+  if ne is_ro 0
+    ret CX_ERR_IO
+  end
+  mb = mul jslot 8
+  put cx_mj_meta add mb 5 add get cx_mj_meta add mb 5 1
+  jlen = get cx_mj_meta add mb 0
+  if gt add jlen nbytes CX_MJ_CAP
+    ret CX_ERR_IO
+  end
+  if ne get cx_mj_meta add mb 2 0
+    put cx_mj_meta add mb 2 0
+    ret CX_ERR_IO
+  end
+  base = add mul jslot CX_MJ_CAP jlen
+  for i ulong nbytes bound 8192
+    put cx_mj_buf add base i get cx_rec_buf i
+  end
+  put cx_mj_meta add mb 0 add jlen nbytes
+  if ne sync 0
+    put cx_mj_meta add mb 7 add get cx_mj_meta add mb 7 1
+  end
+  ret CX_OK
+end
+
+fn cx_mj_truncate jslot ulong is_ro ulong newlen ulong to long
+  if ne is_ro 0
+    ret CX_ERR_IO
+  end
+  mb = mul jslot 8
+  put cx_mj_meta add mb 6 add get cx_mj_meta add mb 6 1
+  if ne get cx_mj_meta add mb 3 0
+    ret CX_ERR_IO
+  end
+  if gt newlen get cx_mj_meta add mb 0
+    ret CX_ERR_IO
+  end
+  put cx_mj_meta add mb 0 newlen
+  ret CX_OK
+end
+
+note Encode object idx of store st into cx_rec_buf, returns byte length.
+fn cx_encode_rec st ulong idx ulong to ulong
+  ob = cx_obj_base st idx
+  nw = get cx_objs add ob 13
+  cx_le_put_rec 0 CX_R_MAGIC
+  cx_le_put_rec 8 get cx_objs add ob 0
+  cx_le_put_rec 16 or shl get cx_objs add ob 1 32 get cx_objs add ob 2
+  cx_le_put_rec 24 get cx_objs add ob 3
+  cx_le_put_rec 32 get cx_objs add ob 4
+  cx_le_put_rec 40 get cx_objs add ob 5
+  cx_le_put_rec 48 or shl get cx_objs add ob 6 32 get cx_objs add ob 7
+  cx_le_put_rec 56 get cx_objs add ob 8
+  for k ulong 4
+    cx_le_put_rec add 64 mul k 8 get cx_objs add ob add 9 k
+  end
+  cx_le_put_rec 96 nw
+  pos = ulong 104
+  ab = add mul st CX_MAX_ARENA get cx_objs add ob 14
+  for k ulong nw bound 1024
+    cx_le_put_rec pos get cx_arena add ab k
+    pos = add pos 8
+  end
+  db = cx_dig_base st idx
+  for i ulong 32
+    put cx_rec_buf add pos i get cx_digs add db i
+  end
+  ret add pos 32
+end
+
+fn cx_check_order st ulong subj ulong t ulong to long
+  sn_idx = add mul st CX_MAX_SUBJ subj
+  sn = get cx_subj_n sn_idx
+  if ge sn CX_SUBJ_CAP
+    ret CX_ERR_NOMEM
+  end
+  if gt sn 0
+    pos = add mul sn_idx CX_SUBJ_CAP sub sn 1
+    last_id = get cx_subj_ids pos
+    ob = cx_obj_base st sub last_id 1
+    if gt get cx_objs add ob 4 t
+      ret CX_ERR_ORDER
+    end
+  end
+  ret CX_OK
+end
+
+fn cx_append_check st ulong hdr view ulong 12 nw ulong expect_id ulong to long
+  mb = mul st 16
+  cls = get hdr 0
+  if eq cls 0
+    ret CX_ERR_ARG
+  end
+  if ge cls CX_CLASS_END
+    ret CX_ERR_ARG
+  end
+  subj = get hdr 2
+  if ge subj get cx_meta add mb 2
+    ret CX_ERR_ARG
+  end
+  nobj = get cx_meta add mb 0
+  if ne expect_id 0
+    if ne expect_id add nobj 1
+      ret CX_ERR_FORMAT
+    end
+  end
+  if ge nobj CX_MAX_OBJS
+    ret CX_ERR_NOMEM
+  end
+  if gt add get cx_meta add mb 1 nw CX_MAX_ARENA
+    ret CX_ERR_NOMEM
+  end
+  ret cx_check_order st subj get hdr 3
+end
+
+fn cx_write_hdr st ulong nobj ulong hdr view ulong 12 nw ulong an ulong to void
+  ob = cx_obj_base st nobj
+  put cx_objs add ob 0 add nobj 1
+  put cx_objs add ob 1 get hdr 0
+  put cx_objs add ob 2 get hdr 1
+  put cx_objs add ob 3 get hdr 2
+  put cx_objs add ob 4 get hdr 3
+  put cx_objs add ob 5 get hdr 4
+  put cx_objs add ob 6 get hdr 5
+  put cx_objs add ob 7 and get hdr 6 CX_PROT_ALL
+  put cx_objs add ob 8 get hdr 7
+  for k ulong 4
+    put cx_objs add ob add 9 k get hdr add 8 k
+  end
+  put cx_objs add ob 13 nw
+  put cx_objs add ob 14 an
+  put cx_objs add ob 15 0
+end
+
+fn cx_commit_obj st ulong nobj ulong subj ulong to void
+  cx_digest_obj st nobj
+  db = cx_dig_base st nobj
+  for i ulong 32
+    put cx_digs add db i get sh_dig i
+  end
+  cx_chain_step st nobj
+  sn_idx = add mul st CX_MAX_SUBJ subj
+  sn = get cx_subj_n sn_idx
+  oid = add nobj 1
+  put cx_subj_ids add mul sn_idx CX_SUBJ_CAP sn oid
+  put cx_subj_n sn_idx add sn 1
+  put cx_meta mul st 16 oid
+end
+
+fn cx_copy_pay st ulong an ulong pay view ulong * nw ulong to void
+  ab = add mul st CX_MAX_ARENA an
+  for k ulong nw bound 1024
+    put cx_arena add ab k get pay k
+  end
+  put cx_meta add mul st 16 1 add an nw
+end
+
+note Header array hdr[12]:
+note   0:cls 1:kind 2:subject 3:t 4:generation 5:branch 6:protect 7:tag 8..11:links[0..3]
+fn cx_append_mem st ulong hdr view ulong 12 pay view ulong * nw ulong expect_id ulong to long
+  rc = cx_append_check st hdr nw expect_id
+  if ne rc CX_OK
+    ret rc
+  end
+  mb = mul st 16
+  nobj = get cx_meta add mb 0
+  an = get cx_meta add mb 1
+  cx_write_hdr st nobj hdr nw an
+  cx_copy_pay st an pay nw
+  cx_commit_obj st nobj get hdr 2
+  ret CX_OK
+end
+
+fn cx_unappend_mem st ulong prev view uchar 32 to void
+  mb = mul st 16
+  nobj = sub get cx_meta add mb 0 1
+  ob = cx_obj_base st nobj
+  subj = get cx_objs add ob 3
+  sn_idx = add mul st CX_MAX_SUBJ subj
+  put cx_subj_n sn_idx sub get cx_subj_n sn_idx 1
+  put cx_meta add mb 1 get cx_objs add ob 14
+  put cx_meta add mb 0 nobj
+  cb = mul st 32
+  for i ulong 32
+    put cx_chain add cb i get prev i
+  end
+end
+
+fn cx_flush_journal st ulong prev view uchar 32 to long
+  mb = mul st 16
+  if ne get cx_meta add mb 6 1
+    ret CX_OK
+  end
+  idx = sub get cx_meta add mb 0 1
+  rlen = cx_encode_rec st idx
+  sync = ulong 0
+  if ne and get cx_meta add mb 5 CX_OPEN_SYNC 0
+    sync = 1
+  end
+  rc2 = cx_mj_append get cx_meta add mb 7 get cx_meta add mb 8 rlen sync
+  if ne rc2 CX_OK
+    cx_unappend_mem st prev
+    ret rc2
+  end
+  ret CX_OK
+end
+
+fn cx_append_as st ulong token ulong hdr view ulong 12 pay view ulong * nw ulong to long
+  if ge st CX_MAX_STORES
+    ret CX_ERR_ARG
+  end
+  mb = mul st 16
+  if ne get cx_meta add mb 4 token
+    ret CX_ERR_WRITER
+  end
+  if ne and get cx_meta add mb 5 CX_OPEN_READONLY 0
+    ret CX_ERR_WRITER
+  end
+  prev = new uchar 32 0
+  cb = mul st 32
+  for i ulong 32
+    put prev i get cx_chain add cb i
+  end
+  rc = cx_append_mem st hdr pay nw 0
+  if ne rc CX_OK
+    ret rc
+  end
+  ret cx_flush_journal st prev
+end
+
+fn cx_append st ulong hdr view ulong 12 pay view ulong * nw ulong to long
+  ret cx_append_as st 0 hdr pay nw
+end
+
+fn cx_read_hdr_mj jslot ulong p ulong hdr edit ulong 12 to void
+  w2 = cx_le_get_mj jslot add p 16
+  put hdr 0 shr w2 32
+  put hdr 1 and w2 CX_U32_MAX
+  put hdr 2 cx_le_get_mj jslot add p 24
+  put hdr 3 cx_le_get_mj jslot add p 32
+  put hdr 4 cx_le_get_mj jslot add p 40
+  w6 = cx_le_get_mj jslot add p 48
+  put hdr 5 shr w6 32
+  put hdr 6 and w6 CX_U32_MAX
+  put hdr 7 cx_le_get_mj jslot add p 56
+  for k ulong 4
+    put hdr add 8 k cx_le_get_mj jslot add p add 64 mul k 8
+  end
+end
+
+fn cx_check_dig_mj st ulong jslot ulong doff ulong to long
+  idx = sub get cx_meta mul st 16 1
+  db = cx_dig_base st idx
+  for i ulong 32
+    if ne get cx_digs add db i get cx_mj_buf add doff i
+      ret CX_ERR_DIGEST
+    end
+  end
+  ret CX_OK
+end
+
+fn cx_replay_apply st ulong jslot ulong p ulong nw ulong to long
+  hdr = new ulong 12 0
+  cx_read_hdr_mj jslot p hdr
+  pay = new ulong 1024 0
+  for k ulong nw bound 1024
+    put pay k cx_le_get_mj jslot add p add 104 mul k 8
+  end
+  ret cx_append_mem st hdr pay nw cx_le_get_mj jslot add p 8
+end
+
+fn cx_replay_one st ulong jslot ulong p ulong jlen ulong to long
+  if lt sub jlen p 104
+    ret CX_ERR_TORN
+  end
+  if ne cx_le_get_mj jslot p CX_R_MAGIC
+    ret CX_ERR_FORMAT
+  end
+  nw = cx_le_get_mj jslot add p 96
+  if gt nw 1024
+    ret CX_ERR_FORMAT
+  end
+  rec = mul add add CX_R_FIXED nw CX_R_DIGEST 8
+  if lt sub jlen p rec
+    ret CX_ERR_TORN
+  end
+  rc = cx_replay_apply st jslot p nw
+  if ne rc CX_OK
+    ret rc
+  end
+  doff = add mul jslot CX_MJ_CAP add p add 104 mul nw 8
+  if ne cx_check_dig_mj st jslot doff CX_OK
+    ret CX_ERR_DIGEST
+  end
+  ret long rec
+end
+
+fn cx_replay_all st ulong jslot ulong jlen ulong ro ulong flags ulong to long
+  p = ulong 32
+  good = ulong 32
+  rrc = long CX_OK
+  while lt p jlen bound 2048
+    step = cx_replay_one st jslot p jlen
+    if lt step 0
+      rrc = step
+      break
+    end
+    p = add p ulong step
+    good = p
+  end
+  if eq rrc CX_ERR_TORN
+    if eq ro 0
+      if ne and flags CX_OPEN_REPAIR_TAIL 0
+        rrc = cx_mj_truncate jslot ro good
+      end
+    end
+  end
+  ret rrc
+end
+
+fn cx_open_with st ulong jslot ulong n_subjects ulong flags ulong to long
+  if ge st CX_MAX_STORES
+    ret CX_ERR_ARG
+  end
+  if ge jslot CX_MJ_MAX
+    ret CX_ERR_ARG
+  end
+  ro = ulong 0
+  if ne and flags CX_OPEN_READONLY 0
+    ro = 1
+  end
+  rc = cx_mj_open jslot ro
+  if ne rc CX_OK
+    ret rc
+  end
+  jlen = get cx_mj_meta add mul jslot 8 0
+  ns = n_subjects
+  if eq jlen 0
+    if ne ro 0
+      cx_mj_close jslot ro
+      ret CX_ERR_FORMAT
+    end
+    if eq ns 0
+      cx_mj_close jslot ro
+      ret CX_ERR_FORMAT
+    end
+    if gt ns CX_MAX_SUBJ
+      cx_mj_close jslot ro
+      ret CX_ERR_NOMEM
+    end
+    cx_le_put_rec 0 CX_J_MAGIC
+    cx_le_put_rec 8 CX_J_VERSION
+    cx_le_put_rec 16 ns
+    cx_le_put_rec 24 0
+    rc = cx_mj_append jslot ro 32 1
+    if ne rc CX_OK
+      cx_mj_close jslot ro
+      ret rc
+    end
+  else
+    if lt jlen 32
+      cx_mj_close jslot ro
+      ret CX_ERR_FORMAT
+    end
+    if ne cx_le_get_mj jslot 0 CX_J_MAGIC
+      cx_mj_close jslot ro
+      ret CX_ERR_FORMAT
+    end
+    if ne cx_le_get_mj jslot 8 CX_J_VERSION
+      cx_mj_close jslot ro
+      ret CX_ERR_FORMAT
+    end
+    fs = cx_le_get_mj jslot 16
+    if gt fs CX_MAX_SUBJ
+      cx_mj_close jslot ro
+      ret CX_ERR_FORMAT
+    end
+    if ne ns 0
+      if ne ns fs
+        cx_mj_close jslot ro
+        ret CX_ERR_FORMAT
+      end
+    end
+    ns = fs
+  end
+  rc = cx_init st ns
+  if ne rc CX_OK
+    cx_mj_close jslot ro
+    ret rc
+  end
+  if gt jlen 0
+    rrc = cx_replay_all st jslot jlen ro flags
+    if ne rrc CX_OK
+      cx_mj_close jslot ro
+      cx_free st
+      ret rrc
+    end
+  end
+  mb = mul st 16
+  put cx_meta add mb 5 flags
+  put cx_meta add mb 6 1
+  put cx_meta add mb 7 jslot
+  put cx_meta add mb 8 ro
+  ret CX_OK
+end
+
+fn cx_verify st ulong id ulong to long
+  mb = mul st 16
+  if eq id 0
+    ret CX_ERR_ARG
+  end
+  if gt id get cx_meta add mb 0
+    ret CX_ERR_ARG
+  end
+  idx = sub id 1
+  cx_digest_obj st idx
+  db = cx_dig_base st idx
+  for i ulong 32
+    if ne get sh_dig i get cx_digs add db i
+      ret CX_ERR_DIGEST
+    end
+  end
+  ret CX_OK
+end
+
+fn cx_verify_chain st ulong to long
+  mb = mul st 16
+  nobj = get cx_meta add mb 0
+  ch = new uchar 32 0
+  for i ulong nobj bound 2048
+    cx_digest_obj st i
+    db = cx_dig_base st i
+    for b ulong 32
+      if ne get sh_dig b get cx_digs add db b
+        ret CX_ERR_DIGEST
+      end
+    end
+    for b ulong 32
+      put sh_dat b get ch b
+      put sh_dat add 32 b get cx_digs add db b
+    end
+    sh_all 64
+    for b ulong 32
+      put ch b get sh_dig b
+    end
+  end
+  cb = mul st 32
+  for b ulong 32
+    if ne get ch b get cx_chain add cb b
+      ret CX_ERR_DIGEST
+    end
+  end
+  ret CX_OK
+end
+
+fn cx_pack_dig4 st ulong idx ulong dst edit ulong 8 off ulong to void
+  db = cx_dig_base st idx
+  for i ulong 4
+    v = ulong 0
+    base = add db mul i 8
+    for b ulong 8
+      bv = ulong get cx_digs add base b
+      v = or v shl bv mul b 8
+    end
+    put dst add off i v
+  end
+end
+
+fn cx_promote_check st ulong cand ulong evid ulong to long
+  nobj = get cx_meta mul st 16
+  if eq cand 0
+    ret CX_ERR_ARG
+  end
+  if gt cand nobj
+    ret CX_ERR_ARG
+  end
+  if eq evid 0
+    ret CX_ERR_ARG
+  end
+  if gt evid nobj
+    ret CX_ERR_ARG
+  end
+  cb = cx_obj_base st sub cand 1
+  if ne get cx_objs add cb 1 CX_CLAIM
+    ret CX_ERR_ARG
+  end
+  if ne get cx_objs add cb 2 CX_K_CANDIDATE
+    ret CX_ERR_ARG
+  end
+  eb = cx_obj_base st sub evid 1
+  if ne get cx_objs add eb 1 CX_EVIDENCE
+    ret CX_ERR_ARG
+  end
+  if ne cx_verify st cand CX_OK
+    ret CX_ERR_DIGEST
+  end
+  if ne cx_verify st evid CX_OK
+    ret CX_ERR_DIGEST
+  end
+  ret CX_OK
+end
+
+fn cx_promote st ulong token ulong cand ulong evid ulong t ulong to long
+  rc = cx_promote_check st cand evid
+  if ne rc CX_OK
+    ret rc
+  end
+  cb = cx_obj_base st sub cand 1
+  hdr = new ulong 12 0
+  put hdr 0 CX_EVIDENCE
+  put hdr 1 CX_K_PROMOTION
+  put hdr 2 get cx_objs add cb 3
+  put hdr 3 t
+  put hdr 4 get cx_objs add cb 5
+  put hdr 5 get cx_objs add cb 6
+  put hdr 6 CX_PROT_VERIFY_EVIDENCE
+  put hdr 8 cand
+  put hdr 9 evid
+  words = new ulong 8 0
+  cx_pack_dig4 st sub cand 1 words 0
+  cx_pack_dig4 st sub evid 1 words 4
+  ret cx_append_as st token hdr words 8
+end
+
+note Filter array flt[4]: 0:cls, 1:kind, 2:branch, 3:branch_any (1=any)
+fn cx_matches st ulong idx ulong flt view ulong 4 to bool
+  ob = cx_obj_base st idx
+  fcls = get flt 0
+  if ne fcls 0
+    if ne get cx_objs add ob 1 fcls
+      ret eq ulong 1 0
+    end
+  end
+  fkind = get flt 1
+  if ne fkind 0
+    if ne get cx_objs add ob 2 fkind
+      ret eq ulong 1 0
+    end
+  end
+  if eq get flt 3 0
+    if ne get cx_objs add ob 6 get flt 2
+      ret eq ulong 1 0
+    end
+  end
+  ret eq ulong 1 1
+end
+
+fn cx_lower_bound st ulong subj ulong t0 ulong to ulong
+  sn_idx = add mul st CX_MAX_SUBJ subj
+  lo = ulong 0
+  hi = get cx_subj_n sn_idx
+  sbase = mul sn_idx CX_SUBJ_CAP
+  while lt lo hi bound 12
+    mid = add lo div sub hi lo 2
+    oid = get cx_subj_ids add sbase mid
+    ot = get cx_objs add cx_obj_base st sub oid 1 4
+    if lt ot t0
+      lo = add mid 1
+    else
+      hi = mid
+    end
+  end
+  ret lo
+end
+
+fn cx_count_before st ulong subj ulong t0 ulong to ulong
+  if ge subj get cx_meta add mul st 16 2
+    ret 0
+  end
+  ret cx_lower_bound st subj t0
+end
+
+fn cx_count_subject st ulong subj ulong to ulong
+  if ge subj get cx_meta add mul st 16 2
+    ret 0
+  end
+  ret get cx_subj_n add mul st CX_MAX_SUBJ subj
+end
+
+fn cx_inc_exam st ulong to void
+  pos = add mul st 16 3
+  put cx_meta pos add get cx_meta pos 1
+end
+
+fn cx_matches_q st ulong idx ulong q view ulong 8 to bool
+  ob = cx_obj_base st idx
+  fcls = get q 3
+  if ne fcls 0
+    if ne get cx_objs add ob 1 fcls
+      ret eq ulong 1 0
+    end
+  end
+  fkind = get q 4
+  if ne fkind 0
+    if ne get cx_objs add ob 2 fkind
+      ret eq ulong 1 0
+    end
+  end
+  if eq get q 6 0
+    if ne get cx_objs add ob 6 get q 5
+      ret eq ulong 1 0
+    end
+  end
+  ret eq ulong 1 1
+end
+
+fn cx_latest st ulong subj ulong t_max ulong flt view ulong 4 to ulong
+  if ge subj get cx_meta add mul st 16 2
+    ret 0
+  end
+  tlim = t_max
+  if lt t_max CX_U64_MAX
+    tlim = add t_max 1
+  end
+  i = cx_lower_bound st subj tlim
+  sbase = mul add mul st CX_MAX_SUBJ subj CX_SUBJ_CAP
+  while gt i 0 bound 512
+    i = sub i 1
+    oid = get cx_subj_ids add sbase i
+    cx_inc_exam st
+    if cx_matches st sub oid 1 flt
+      ret oid
+    end
+  end
+  ret 0
+end
+
+fn cx_obj_t st ulong oid ulong to ulong
+  ret get cx_objs add cx_obj_base st sub oid 1 4
+end
+
+note Query array q[8]: 0:subj 1:t0 2:t1 3:fcls 4:fkind 5:fbranch 6:branch_any
+fn cx_range_ids st ulong q view ulong 8 dst edit ulong * to ulong
+  if ge get q 0 get cx_meta add mul st 16 2
+    ret 0
+  end
+  sn = get cx_subj_n add mul st CX_MAX_SUBJ get q 0
+  sbase = mul add mul st CX_MAX_SUBJ get q 0 CX_SUBJ_CAP
+  i = cx_lower_bound st get q 0 get q 1
+  cnt = ulong 0
+  while lt i sn bound 512
+    oid = get cx_subj_ids add sbase i
+    if gt cx_obj_t st oid get q 2
+      break
+    end
+    cx_inc_exam st
+    if cx_matches_q st sub oid 1 q
+      if lt cnt len dst
+        put dst cnt oid
+        cnt = add cnt 1
+      end
+      if ge cnt len dst
+        break
+      end
+    end
+    i = add i 1
+  end
+  ret cnt
+end
+
+fn cx_in_list dst view ulong * n ulong v ulong to ulong
+  for j ulong n bound 2048
+    if eq get dst j v
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn cx_prov_push st ulong cur ulong id ulong dst edit ulong * n ulong to ulong
+  ob = cx_obj_base st sub cur 1
+  for i ulong 4
+    if ge n len dst
+      break
+    end
+    lnk = get cx_objs add ob add 9 i
+    if eq lnk 0
+      continue
+    end
+    if ge lnk cur
+      continue
+    end
+    if eq lnk id
+      continue
+    end
+    if eq cx_in_list dst n lnk 0
+      put dst n lnk
+      n = add n 1
+    end
+  end
+  ret n
+end
+
+fn cx_provenance st ulong id ulong dst edit ulong * to ulong
+  if eq id 0
+    ret 0
+  end
+  if gt id get cx_meta mul st 16
+    ret 0
+  end
+  n = ulong 0
+  head = ulong 0
+  cur = id
+  while eq ulong 1 1 bound 2048
+    n = cx_prov_push st cur id dst n
+    if ge head n
+      break
+    end
+    if ge n len dst
+      break
+    end
+    cur = get dst head
+    head = add head 1
+  end
+  ret n
+end
+
+fn cx_tamper st ulong id ulong word ulong val ulong to void
+  mb = mul st 16
+  if eq id 0
+    ret
+  end
+  if gt id get cx_meta add mb 0
+    ret
+  end
+  ob = cx_obj_base st sub id 1
+  if lt word get cx_objs add ob 13
+    off = get cx_objs add ob 14
+    put cx_arena add mul st CX_MAX_ARENA add off word val
+  end
+end
+
+fn cx_payload_word st ulong id ulong word ulong to ulong
+  ob = cx_obj_base st sub id 1
+  off = get cx_objs add ob 14
+  ret get cx_arena add mul st CX_MAX_ARENA add off word
+end

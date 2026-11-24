@@ -1,0 +1,1149 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_projection.om -- Pure seeded OM-2 port of src/runtime/rx_projection.c.
+note Requires seed/ng/sha256.om and src/runtime/rx_cortex.om concatenated before this file.
+
+const PJ_PINNED ulong 1
+const PJ_LIVE ulong 2
+const PJ_DERIVED ulong 3
+const PJ_RECALLABLE ulong 4
+const PJ_COMPRESSIBLE ulong 5
+const PJ_REFERENCE_ONLY ulong 6
+const PJ_EPHEMERAL ulong 7
+const PJ_BRANCH_LOCAL ulong 8
+const PJ_PROTECTED_EVIDENCE ulong 9
+const PJ_STATE_CLASS_END ulong 10
+
+const PJ_FORM_FULL ulong 1
+const PJ_FORM_SUMMARY ulong 2
+const PJ_FORM_REF ulong 3
+
+const PJ_OP_EXPLAIN ulong 1
+const PJ_OP_VERIFY ulong 2
+const PJ_OP_PLAN ulong 3
+const PJ_OP_ASSESS ulong 4
+const PJ_OP_PREDICT ulong 5
+
+const PJ_T_WINDOW ulong 1
+const PJ_T_LATEST ulong 2
+const PJ_T_CARRY_IN ulong 3
+const PJ_T_ALL ulong 4
+const PJ_T_MEMORY ulong 5
+
+const PJ_A_FIXED ulong 1
+const PJ_A_SINCE_VERIFIED ulong 2
+const PJ_A_GENERATION ulong 3
+
+const PJ_W_SELF ulong 1
+const PJ_W_DEPENDENCIES ulong 2
+const PJ_W_MACHINE ulong 3
+
+const PJ_U_NONE ulong 1
+const PJ_U_POINT ulong 2
+const PJ_U_INTERVAL ulong 3
+
+const PJ_E_NONE ulong 1
+const PJ_E_REFS ulong 2
+const PJ_E_FULL ulong 3
+
+const PJ_M_WORKING ulong 1
+const PJ_M_EPISODIC ulong 2
+
+const PJ_SEC_WORLD ulong 1
+const PJ_SEC_CORTEX ulong 2
+const PJ_SEC_HYPOTHESIS ulong 3
+const PJ_SEC_EVIDENCE ulong 4
+
+const PJ_FEAT_DERIVED ulong 1
+const PJ_FEAT_UNCERTAINTY ulong 2
+
+const PJ_VERIFIED ulong 1
+const PJ_MAX_FACTS ulong 16
+const PJ_HEADER_BYTES ulong 96
+const PJ_WORD_BYTES ulong 8
+const PJ_DIGEST_BYTES ulong 32
+const PJ_FEATURE_BYTES ulong 96
+const PJ_SUMMARY_WORDS ulong 5
+
+const PJ_X_OTHER_SUBJECTS ulong 1
+const PJ_X_IN_SCOPE_SUBJECT ulong 2
+
+const PJ_WHY_INCLUDED ulong 0
+const PJ_WHY_SUBJECT ulong 1
+const PJ_WHY_TYPE ulong 2
+const PJ_WHY_TIME ulong 3
+const PJ_WHY_BRANCH ulong 4
+const PJ_WHY_SUPERSEDED ulong 5
+const PJ_WHY_DERIVED_SOURCE ulong 6
+
+const PJ_OK long 0
+const PJ_ERR_ARG long -1
+const PJ_ERR_NOMEM long -2
+const PJ_ERR_PROTECTED long -3
+const PJ_ERR_BUDGET long -4
+const PJ_ERR_NO_ANCHOR long -5
+const PJ_ERR_BRANCH long -6
+const PJ_ERR_RECOVER long -7
+
+const PJ_MAX_ENT ulong 1024
+const PJ_MAX_FEAT ulong 64
+const PJ_MAX_ARENA ulong 8192
+
+note CognitiveNeed state:
+note pj_need[0..15]:
+note   0:goal 1:operation_class 2:subject 3:focus 4:branch 5:n_fact_types
+note   6:anchor 7:t0 8:t_now 9:realization_kind 10:generation_kind
+note   11:dependency_kind 12:uncertainty_req 13:evidence_req 14:memory_scope
+note   15:max_bytes, pj_need[16]:max_objects
+global pj_need ulong 20
+note pj_nfacts[i*5 + 0..4]: cls, kind, treatment, world, temporal
+global pj_nfacts ulong 80
+
+note StateProjection state:
+note pj_meta[0..15]:
+note   0:n 1:nf 2:nr 3:arena_n 4:nw 5:nx 6:store_count 7:bytes
+note   8:objects 9:examined 10:w0 11:anchor_id 12:n_scope 13:n_deps
+global pj_meta ulong 16
+global pj_store_chain uchar 32
+note pj_ent[i*6 + 0..5]: id, section, treatment, form, n, off
+global pj_ent ulong 6144
+global pj_ent_dig uchar 32768
+note pj_feat[i*13 + 0..12]: section, cls, kind, branch, subject, t0, t1, n_src, count, sum, sumsq, min, max
+global pj_feat ulong 832
+global pj_feat_dig uchar 2048
+note pj_rec[i*2 + 0..1]: id, form
+global pj_rec ulong 2048
+global pj_rec_dig uchar 32768
+global pj_arena ulong 8192
+global pj_scope ulong 64
+global pj_deps ulong 64
+note pj_excl[i*3 + 0..2]: reason, subject, count
+global pj_excl ulong 216
+note pj_audit_out[0..15]:
+note   0:included 1:excluded 2:excluded_intact 3:overlap 4:other_branch_included 5:counts_match
+note   6..12:by_why[0..6]
+global pj_audit_out ulong 16
+global pj_tmp_ids ulong 512
+global pj_per_scope ulong 64
+
+fn pj_need_init op ulong subj ulong t_now ulong to void
+  for i ulong 20
+    put pj_need i 0
+  end
+  put pj_need 1 op
+  put pj_need 2 subj
+  put pj_need 6 PJ_A_FIXED
+  put pj_need 8 t_now
+  put pj_need 12 PJ_U_NONE
+  put pj_need 13 PJ_E_NONE
+  put pj_need 14 PJ_M_WORKING
+end
+
+fn pj_need_add cls ulong kind ulong treat ulong world ulong temp ulong to long
+  nf = get pj_need 5
+  if ge nf PJ_MAX_FACTS
+    ret PJ_ERR_ARG
+  end
+  base = mul nf 5
+  put pj_nfacts add base 0 cls
+  put pj_nfacts add base 1 kind
+  put pj_nfacts add base 2 treat
+  put pj_nfacts add base 3 world
+  put pj_nfacts add base 4 temp
+  put pj_need 5 add nf 1
+  ret PJ_OK
+end
+
+fn pj_summarize st ulong oid ulong dst edit ulong 5 to void
+  ob = cx_obj_base st sub oid 1
+  nw = get cx_objs add ob 13
+  ab = add mul st CX_MAX_ARENA get cx_objs add ob 14
+  s = ulong 0
+  sq = ulong 0
+  mn = CX_U64_MAX
+  mx = ulong 0
+  for i ulong nw bound 1024
+    v = get cx_arena add ab i
+    s = add s v
+    sq = add sq mul v v
+    if lt v mn
+      mn = v
+    end
+    if gt v mx
+      mx = v
+    end
+  end
+  put dst 0 nw
+  put dst 1 s
+  put dst 2 sq
+  if eq nw 0
+    put dst 3 0
+  else
+    put dst 3 mn
+  end
+  put dst 4 mx
+end
+
+fn pj_is_protected st ulong oid ulong to bool
+  ob = cx_obj_base st sub oid 1
+  if ne get cx_objs add ob 7 0
+    ret eq ulong 1 1
+  end
+  if eq get cx_objs add ob 1 CX_EVIDENCE
+    ret eq ulong 1 1
+  end
+  ret eq ulong 1 0
+end
+
+fn pj_section_of st ulong oid ulong treat ulong temp ulong to ulong
+  if eq treat PJ_LIVE
+    if eq temp PJ_T_LATEST
+      ret PJ_SEC_WORLD
+    end
+  end
+  if pj_is_protected st oid
+    ret PJ_SEC_EVIDENCE
+  end
+  ob = cx_obj_base st sub oid 1
+  if eq get cx_objs add ob 1 CX_CLAIM
+    ret PJ_SEC_HYPOTHESIS
+  end
+  ret PJ_SEC_CORTEX
+end
+
+fn pj_form_of treat ulong to ulong
+  if eq treat PJ_COMPRESSIBLE
+    ret PJ_FORM_SUMMARY
+  end
+  if eq treat PJ_RECALLABLE
+    ret PJ_FORM_REF
+  end
+  if eq treat PJ_REFERENCE_ONLY
+    ret PJ_FORM_REF
+  end
+  ret PJ_FORM_FULL
+end
+
+fn pj_add_scope subj ulong to void
+  ns = get pj_meta 12
+  for i ulong ns bound 64
+    if eq get pj_scope i subj
+      ret
+    end
+  end
+  if lt ns 64
+    put pj_scope ns subj
+    put pj_meta 12 add ns 1
+  end
+end
+
+fn pj_add_dep subj ulong to void
+  nd = get pj_meta 13
+  for i ulong nd bound 64
+    if eq get pj_deps i subj
+      ret
+    end
+  end
+  if lt nd 63
+    put pj_deps nd subj
+    put pj_meta 13 add nd 1
+  end
+end
+
+fn pj_has_entry oid ulong to bool
+  n = get pj_meta 0
+  for i ulong n bound 1024
+    if eq get pj_ent mul i 6 oid
+      ret eq ulong 1 1
+    end
+  end
+  ret eq ulong 1 0
+end
+
+fn pj_add_recover st ulong oid ulong form ulong to long
+  nr = get pj_meta 2
+  if ge nr PJ_MAX_ENT
+    ret PJ_ERR_NOMEM
+  end
+  put pj_rec mul nr 2 oid
+  put pj_rec add mul nr 2 1 form
+  db = cx_dig_base st sub oid 1
+  rb = mul nr 32
+  for i ulong 32
+    put pj_rec_dig add rb i get cx_digs add db i
+  end
+  put pj_meta 2 add nr 1
+  ret PJ_OK
+end
+
+fn pj_copy_ent_dig st ulong oid ulong n ulong to void
+  db = cx_dig_base st sub oid 1
+  edb = mul n 32
+  for i ulong 32
+    put pj_ent_dig add edb i get cx_digs add db i
+  end
+end
+
+fn pj_add_entry_body st ulong oid ulong eb ulong form ulong to long
+  sm = new ulong 5 0
+  ob = cx_obj_base st sub oid 1
+  if eq form PJ_FORM_FULL
+    nw = get cx_objs add ob 13
+    put pj_meta 7 add get pj_meta 7 mul nw PJ_WORD_BYTES
+    ret PJ_OK
+  end
+  if eq form PJ_FORM_SUMMARY
+    an = get pj_meta 3
+    if gt add an PJ_SUMMARY_WORDS PJ_MAX_ARENA
+      ret PJ_ERR_NOMEM
+    end
+    put pj_ent add eb 4 PJ_SUMMARY_WORDS
+    put pj_ent add eb 5 an
+    pj_summarize st oid sm
+    for k ulong 5
+      put pj_arena add an k get sm k
+    end
+    put pj_meta 3 add an PJ_SUMMARY_WORDS
+    put pj_meta 7 add get pj_meta 7 mul PJ_SUMMARY_WORDS PJ_WORD_BYTES
+    ret PJ_OK
+  end
+  put pj_meta 7 add get pj_meta 7 PJ_DIGEST_BYTES
+  ret PJ_OK
+end
+
+fn pj_add_entry st ulong oid ulong sec ulong treat ulong form ulong to long
+  if pj_has_entry oid
+    ret PJ_OK
+  end
+  if pj_is_protected st oid
+    if eq form PJ_FORM_SUMMARY
+      ret PJ_ERR_PROTECTED
+    end
+    if eq treat PJ_EPHEMERAL
+      ret PJ_ERR_PROTECTED
+    end
+  end
+  n = get pj_meta 0
+  if ge n PJ_MAX_ENT
+    ret PJ_ERR_NOMEM
+  end
+  eb = mul n 6
+  put pj_ent add eb 0 oid
+  put pj_ent add eb 1 sec
+  put pj_ent add eb 2 treat
+  put pj_ent add eb 3 form
+  put pj_ent add eb 4 0
+  put pj_ent add eb 5 0
+  pj_copy_ent_dig st oid n
+  put pj_meta 0 add n 1
+  put pj_meta 7 add get pj_meta 7 PJ_HEADER_BYTES
+  rc = pj_add_entry_body st oid eb form
+  if ne rc PJ_OK
+    ret rc
+  end
+  if ne form PJ_FORM_FULL
+    if ne treat PJ_EPHEMERAL
+      rc = pj_add_recover st oid form
+      if ne rc PJ_OK
+        ret rc
+      end
+    end
+  end
+  pj_add_scope get cx_objs add cx_obj_base st sub oid 1 3
+  ret PJ_OK
+end
+
+fn pj_follow_evidence st ulong oid ulong to long
+  req = get pj_need 13
+  if ne req PJ_E_REFS
+    if ne req PJ_E_FULL
+      ret PJ_OK
+    end
+  end
+  ob = cx_obj_base st sub oid 1
+  form = PJ_FORM_REF
+  if eq req PJ_E_FULL
+    form = PJ_FORM_FULL
+  end
+  for i ulong 4
+    lid = get cx_objs add ob add 9 i
+    if eq lid 0
+      continue
+    end
+    if gt lid get cx_meta mul st 16
+      continue
+    end
+    if not pj_is_protected st lid
+      continue
+    end
+    lob = cx_obj_base st sub lid 1
+    lbr = get cx_objs add lob 6
+    if ne lbr 0
+      if ne lbr get pj_need 4
+        continue
+      end
+    end
+    cx_inc_exam st
+    rc = pj_add_entry st lid PJ_SEC_EVIDENCE PJ_PROTECTED_EVIDENCE form
+    if ne rc PJ_OK
+      ret rc
+    end
+  end
+  ret PJ_OK
+end
+
+fn pj_include st ulong oid ulong treat ulong temp ulong to long
+  if pj_is_protected st oid
+    if eq treat PJ_COMPRESSIBLE
+      ret PJ_ERR_PROTECTED
+    end
+    if eq treat PJ_DERIVED
+      ret PJ_ERR_PROTECTED
+    end
+    if eq treat PJ_EPHEMERAL
+      ret PJ_ERR_PROTECTED
+    end
+  end
+  sec = pj_section_of st oid treat temp
+  form = pj_form_of treat
+  rc = pj_add_entry st oid sec treat form
+  if ne rc PJ_OK
+    ret rc
+  end
+  ret pj_follow_evidence st oid
+end
+
+note Compute derived feature into slot fidx (using query spec in q[6]: subj, cls, kind, branch, t0, t1).
+fn pj_feat_word fbase ulong v ulong to void
+  put pj_feat add fbase 9 add get pj_feat add fbase 9 v
+  put pj_feat add fbase 10 add get pj_feat add fbase 10 mul v v
+  if lt v get pj_feat add fbase 11
+    put pj_feat add fbase 11 v
+  end
+  if gt v get pj_feat add fbase 12
+    put pj_feat add fbase 12 v
+  end
+end
+
+fn pj_feat_accum st ulong oid ulong fbase ulong sh_pos ulong to ulong
+  ob = cx_obj_base st sub oid 1
+  nw = get cx_objs add ob 13
+  ab = add mul st CX_MAX_ARENA get cx_objs add ob 14
+  for k ulong nw bound 1024
+    pj_feat_word fbase get cx_arena add ab k
+  end
+  put pj_feat add fbase 8 add get pj_feat add fbase 8 nw
+  put pj_feat add fbase 7 add get pj_feat add fbase 7 1
+  db = cx_dig_base st sub oid 1
+  for b ulong 32
+    put sh_dat add sh_pos b get cx_digs add db b
+  end
+  ret add sh_pos 32
+end
+
+fn pj_feat_match st ulong oid ulong q view ulong 6 to long
+  ob = cx_obj_base st sub oid 1
+  if ne get cx_objs add ob 1 get q 1
+    ret 0
+  end
+  if ne get cx_objs add ob 2 get q 2
+    ret 0
+  end
+  if ne get cx_objs add ob 6 get q 3
+    ret 0
+  end
+  if pj_is_protected st oid
+    ret PJ_ERR_PROTECTED
+  end
+  ret 1
+end
+
+fn pj_feature_compute st ulong fidx ulong q view ulong 6 to long
+  if ge get q 0 get cx_meta add mul st 16 2
+    ret PJ_ERR_ARG
+  end
+  fb = mul fidx 13
+  for i ulong 13
+    put pj_feat add fb i 0
+  end
+  put pj_feat add fb 1 get q 1
+  put pj_feat add fb 2 get q 2
+  put pj_feat add fb 3 get q 3
+  put pj_feat add fb 4 get q 0
+  put pj_feat add fb 5 get q 4
+  put pj_feat add fb 6 get q 5
+  put pj_feat add fb 11 CX_U64_MAX
+  sn = get cx_subj_n add mul st CX_MAX_SUBJ get q 0
+  sbase = mul add mul st CX_MAX_SUBJ get q 0 CX_SUBJ_CAP
+  sh_pos = ulong 0
+  for i ulong sn bound 512
+    oid = get cx_subj_ids add sbase i
+    ot = cx_obj_t st oid
+    if lt ot get q 4
+      continue
+    end
+    if gt ot get q 5
+      break
+    end
+    cx_inc_exam st
+    m = pj_feat_match st oid q
+    if eq m PJ_ERR_PROTECTED
+      ret PJ_ERR_PROTECTED
+    end
+    if eq m 1
+      sh_pos = pj_feat_accum st oid fb sh_pos
+    end
+  end
+  if eq get pj_feat add fb 8 0
+    put pj_feat add fb 11 0
+  end
+  sh_all sh_pos
+  fdb = mul fidx 32
+  for b ulong 32
+    put pj_feat_dig add fdb b get sh_dig b
+  end
+  ret PJ_OK
+end
+
+fn pj_check_anchor st ulong oid ulong to bool
+  ob = cx_obj_base st sub oid 1
+  if gt get cx_objs add ob 4 get pj_need 8
+    ret eq ulong 1 0
+  end
+  if ne get cx_objs add ob 6 0
+    ret eq ulong 1 0
+  end
+  if ne get cx_objs add ob 1 CX_REALIZATION
+    ret eq ulong 1 0
+  end
+  if ne get cx_objs add ob 2 get pj_need 9
+    ret eq ulong 1 0
+  end
+  ev = get cx_objs add ob 9
+  if eq ev 0
+    ret eq ulong 1 0
+  end
+  if gt ev get cx_meta mul st 16
+    ret eq ulong 1 0
+  end
+  eob = cx_obj_base st sub ev 1
+  if eq and get cx_objs add eob 7 CX_PROT_VERIFY_EVIDENCE 0
+    ret eq ulong 1 0
+  end
+  if ne get cx_objs add eob 8 PJ_VERIFIED
+    ret eq ulong 1 0
+  end
+  ret eq cx_verify st ev CX_OK
+end
+
+fn pj_verified_anchor st ulong to ulong
+  subj = get pj_need 2
+  sn_idx = add mul st CX_MAX_SUBJ subj
+  i = get cx_subj_n sn_idx
+  sbase = mul sn_idx CX_SUBJ_CAP
+  while gt i 0 bound 512
+    i = sub i 1
+    oid = get cx_subj_ids add sbase i
+    cx_inc_exam st
+    if pj_check_anchor st oid
+      ret oid
+    end
+  end
+  ret 0
+end
+
+fn pj_resolve_window st ulong to long
+  flt = new ulong 4 0
+  anc = get pj_need 6
+  put pj_meta 4 1
+  if eq anc PJ_A_FIXED
+    put pj_meta 10 get pj_need 7
+    put pj_meta 11 0
+    ret PJ_OK
+  end
+  if eq anc PJ_A_SINCE_VERIFIED
+    aid = pj_verified_anchor st
+    if eq aid 0
+      ret PJ_ERR_NO_ANCHOR
+    end
+    put pj_meta 10 cx_obj_t st aid
+    put pj_meta 11 aid
+    rc = pj_add_entry st aid PJ_SEC_CORTEX PJ_PINNED PJ_FORM_FULL
+    if ne rc PJ_OK
+      ret rc
+    end
+    ev = get cx_objs add cx_obj_base st sub aid 1 9
+    evf = PJ_FORM_REF
+    if eq get pj_need 13 PJ_E_FULL
+      evf = PJ_FORM_FULL
+    end
+    ret pj_add_entry st ev PJ_SEC_EVIDENCE PJ_PROTECTED_EVIDENCE evf
+  end
+  if eq anc PJ_A_GENERATION
+    put flt 0 CX_ENTITY
+    put flt 1 get pj_need 10
+    put flt 2 0
+    put flt 3 0
+    gid = cx_latest st 0 get pj_need 8 flt
+    if eq gid 0
+      ret PJ_ERR_NO_ANCHOR
+    end
+    put pj_meta 10 cx_obj_t st gid
+    put pj_meta 11 gid
+    ret pj_add_entry st gid PJ_SEC_WORLD PJ_PINNED PJ_FORM_FULL
+  end
+  ret PJ_ERR_ARG
+end
+
+fn pj_run_derived st ulong subj ulong cls ulong kind ulong br ulong t0 ulong to long
+  nf = get pj_meta 1
+  if ge nf PJ_MAX_FEAT
+    ret PJ_ERR_ARG
+  end
+  fq = new ulong 6 0
+  put fq 0 subj
+  put fq 1 cls
+  put fq 2 kind
+  put fq 3 br
+  put fq 4 t0
+  put fq 5 get pj_need 8
+  rc = pj_feature_compute st nf fq
+  if ne rc PJ_OK
+    ret rc
+  end
+  fsec = PJ_FEAT_DERIVED
+  if eq get pj_need 12 PJ_U_INTERVAL
+    fsec = PJ_FEAT_UNCERTAINTY
+  end
+  put pj_feat mul nf 13 fsec
+  put pj_meta 1 add nf 1
+  put pj_meta 7 add get pj_meta 7 PJ_FEATURE_BYTES
+  pj_add_scope subj
+  ret PJ_OK
+end
+
+fn pj_run_range st ulong subj ulong fidx ulong br ulong t0 ulong temp ulong to long
+  fb = mul fidx 5
+  q = new ulong 8 0
+  put q 0 subj
+  put q 1 t0
+  put q 2 get pj_need 8
+  put q 3 get pj_nfacts add fb 0
+  put q 4 get pj_nfacts add fb 1
+  put q 5 br
+  put q 6 0
+  ids = new ulong 512 0
+  cnt = cx_range_ids st q ids
+  treat = get pj_nfacts add fb 2
+  for k ulong cnt bound 512
+    rc = pj_include st get ids k treat temp
+    if ne rc PJ_OK
+      ret rc
+    end
+  end
+  ret PJ_OK
+end
+
+fn pj_run_fact_subj st ulong fidx ulong subj ulong to long
+  fb = mul fidx 5
+  treat = get pj_nfacts add fb 2
+  temp = get pj_nfacts add fb 4
+  if eq temp PJ_T_MEMORY
+    if eq get pj_need 14 PJ_M_EPISODIC
+      temp = PJ_T_ALL
+    else
+      temp = PJ_T_WINDOW
+    end
+  end
+  br = ulong 0
+  if eq treat PJ_BRANCH_LOCAL
+    if eq get pj_need 4 0
+      ret PJ_ERR_BRANCH
+    end
+    br = get pj_need 4
+  end
+  t0 = get pj_meta 10
+  if eq temp PJ_T_ALL
+    t0 = 0
+  end
+  if eq treat PJ_DERIVED
+    if ne temp PJ_T_WINDOW
+      if ne temp PJ_T_ALL
+        ret PJ_ERR_ARG
+      end
+    end
+    ret pj_run_derived st subj get pj_nfacts add fb 0 get pj_nfacts add fb 1 br t0
+  end
+  flt = new ulong 4 0
+  put flt 0 get pj_nfacts add fb 0
+  put flt 1 get pj_nfacts add fb 1
+  put flt 2 br
+  put flt 3 0
+  if eq temp PJ_T_LATEST
+    oid = cx_latest st subj get pj_need 8 flt
+    if ne oid 0
+      ret pj_include st oid treat temp
+    end
+    ret PJ_OK
+  end
+  if eq temp PJ_T_CARRY_IN
+    if gt get pj_meta 10 0
+      cid = cx_latest st subj sub get pj_meta 10 1 flt
+      if ne cid 0
+        rc = pj_include st cid treat temp
+        if ne rc PJ_OK
+          ret rc
+        end
+      end
+    end
+  end
+  ret pj_run_range st subj fidx br t0 temp
+end
+
+fn pj_run_fact st ulong fidx ulong to long
+  w = get pj_nfacts add mul fidx 5 3
+  if eq w PJ_W_MACHINE
+    ret pj_run_fact_subj st fidx 0
+  end
+  rc = pj_run_fact_subj st fidx get pj_need 2
+  if ne rc PJ_OK
+    ret rc
+  end
+  if eq w PJ_W_DEPENDENCIES
+    nd = get pj_meta 13
+    for i ulong nd bound 64
+      rc = pj_run_fact_subj st fidx get pj_deps i
+      if ne rc PJ_OK
+        ret rc
+      end
+    end
+  end
+  ret PJ_OK
+end
+
+fn pj_swap_ent i ulong j ulong to void
+  bi = mul i 6
+  bj = mul j 6
+  for k ulong 6
+    tmp = get pj_ent add bi k
+    put pj_ent add bi k get pj_ent add bj k
+    put pj_ent add bj k tmp
+  end
+  di = mul i 32
+  dj = mul j 32
+  for b ulong 32
+    tb = get pj_ent_dig add di b
+    put pj_ent_dig add di b get pj_ent_dig add dj b
+    put pj_ent_dig add dj b tb
+  end
+end
+
+fn pj_sort_entries to void
+  n = get pj_meta 0
+  if lt n 2
+    ret
+  end
+  for i ulong sub n 1 bound 1024
+    j = add i 1
+    while lt j n bound 1024
+      if gt get pj_ent mul i 6 get pj_ent mul j 6
+        pj_swap_ent i j
+      end
+      j = add j 1
+    end
+  end
+end
+
+fn pj_collect_deps st ulong to long
+  need_d = ulong 0
+  nf = get pj_need 5
+  for i ulong nf bound 16
+    if eq get pj_nfacts add mul i 5 3 PJ_W_DEPENDENCIES
+      need_d = 1
+      break
+    end
+  end
+  if eq need_d 0
+    ret PJ_OK
+  end
+  q = new ulong 8 0
+  put q 0 get pj_need 2
+  put q 1 0
+  put q 2 get pj_need 8
+  put q 3 CX_RELATIONSHIP
+  put q 4 get pj_need 11
+  put q 5 0
+  put q 6 0
+  ids = new ulong 512 0
+  cnt = cx_range_ids st q ids
+  for i ulong cnt bound 512
+    oid = get ids i
+    rc = pj_add_entry st oid PJ_SEC_CORTEX PJ_REFERENCE_ONLY PJ_FORM_REF
+    if ne rc PJ_OK
+      ret rc
+    end
+    tg = get cx_objs add cx_obj_base st sub oid 1 8
+    if lt tg get cx_meta add mul st 16 2
+      if ne tg get pj_need 2
+        pj_add_dep tg
+      end
+    end
+  end
+  ret PJ_OK
+end
+
+fn pj_count_in_ent st ulong sj ulong to ulong
+  n = get pj_meta 0
+  mine = ulong 0
+  for k ulong n bound 1024
+    oid = get pj_ent mul k 6
+    ob = cx_obj_base st sub oid 1
+    if eq get cx_objs add ob 3 sj
+      mine = add mine 1
+    end
+  end
+  ret mine
+end
+
+fn pj_finish_exclusions st ulong to void
+  ns = get pj_meta 12
+  in_scope = ulong 0
+  nx = ulong 0
+  for i ulong ns bound 64
+    sj = get pj_scope i
+    mine = pj_count_in_ent st sj
+    sc = cx_count_subject st sj
+    in_scope = add in_scope sc
+    xb = mul nx 3
+    put pj_excl add xb 0 PJ_X_IN_SCOPE_SUBJECT
+    put pj_excl add xb 1 sj
+    put pj_excl add xb 2 sub sc mine
+    nx = add nx 1
+  end
+  xb = mul nx 3
+  put pj_excl add xb 0 PJ_X_OTHER_SUBJECTS
+  put pj_excl add xb 1 CX_U64_MAX
+  put pj_excl add xb 2 sub get cx_meta mul st 16 in_scope
+  put pj_meta 5 add nx 1
+end
+
+fn pj_free to void
+  for i ulong 16
+    put pj_meta i 0
+  end
+end
+
+fn pj_compile st ulong to long
+  pj_free
+  if ge get pj_need 2 get cx_meta add mul st 16 2
+    ret PJ_ERR_ARG
+  end
+  if gt get pj_need 5 PJ_MAX_FACTS
+    ret PJ_ERR_ARG
+  end
+  ex0 = get cx_meta add mul st 16 3
+  put pj_meta 6 get cx_meta mul st 16
+  cb = mul st 32
+  for i ulong 32
+    put pj_store_chain i get cx_chain add cb i
+  end
+  rc = pj_resolve_window st
+  if eq rc PJ_OK
+    rc = pj_collect_deps st
+  end
+  if eq rc PJ_OK
+    foc = get pj_need 3
+    if ne foc 0
+      if gt foc get cx_meta mul st 16
+        rc = PJ_ERR_ARG
+      else
+        rc = pj_add_entry st foc pj_section_of st foc PJ_PINNED 0 PJ_PINNED PJ_FORM_FULL
+        if eq rc PJ_OK
+          rc = pj_follow_evidence st foc
+        end
+      end
+    end
+  end
+  nf = get pj_need 5
+  for i ulong nf bound 16
+    if ne rc PJ_OK
+      break
+    end
+    rc = pj_run_fact st i
+  end
+  if eq rc PJ_OK
+    objs = add get pj_meta 0 get pj_meta 1
+    put pj_meta 8 objs
+    mb = get pj_need 15
+    mo = get pj_need 16
+    if ne mb 0
+      if gt get pj_meta 7 mb
+        rc = PJ_ERR_BUDGET
+      end
+    end
+    if ne mo 0
+      if gt objs mo
+        rc = PJ_ERR_BUDGET
+      end
+    end
+  end
+  put pj_meta 9 sub get cx_meta add mul st 16 3 ex0
+  if ne rc PJ_OK
+    pj_free
+    ret rc
+  end
+  pj_sort_entries
+  pj_finish_exclusions st
+  ret PJ_OK
+end
+
+fn pj_full_bytes st ulong to ulong
+  mb = mul st 16
+  ret add mul get cx_meta add mb 0 PJ_HEADER_BYTES mul get cx_meta add mb 1 PJ_WORD_BYTES
+end
+
+fn pj_view_find oid ulong to long
+  lo = ulong 0
+  hi = get pj_meta 0
+  while lt lo hi bound 12
+    mid = add lo div sub hi lo 2
+    if lt get pj_ent mul mid 6 oid
+      lo = add mid 1
+    else
+      hi = mid
+    end
+  end
+  if lt lo get pj_meta 0
+    if eq get pj_ent mul lo 6 oid
+      ret long lo
+    end
+  end
+  ret -1
+end
+
+fn pj_recall st ulong oid ulong to long
+  nr = get pj_meta 2
+  for i ulong nr bound 1024
+    if ne get pj_rec mul i 2 oid
+      continue
+    end
+    if eq oid 0
+      ret -1
+    end
+    if gt oid get cx_meta mul st 16
+      ret -1
+    end
+    db = cx_dig_base st sub oid 1
+    rb = mul i 32
+    for b ulong 32
+      if ne get cx_digs add db b get pj_rec_dig add rb b
+        ret -1
+      end
+    end
+    if ne cx_verify st oid CX_OK
+      ret -1
+    end
+    ret long get cx_objs add cx_obj_base st sub oid 1 13
+  end
+  ret -1
+end
+
+fn pj_recover_ent st ulong i ulong to ulong
+  oid = get pj_ent mul i 6
+  if ne cx_verify st oid CX_OK
+    ret 1
+  end
+  db = cx_dig_base st sub oid 1
+  eb = mul i 32
+  for b ulong 32
+    if ne get cx_digs add db b get pj_ent_dig add eb b
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn pj_recover_rec st ulong i ulong to ulong
+  sm = new ulong 5 0
+  oid = get pj_rec mul i 2
+  if ne cx_verify st oid CX_OK
+    ret 1
+  end
+  if eq get pj_rec add mul i 2 1 PJ_FORM_SUMMARY
+    idx = pj_view_find oid
+    if lt idx 0
+      ret 1
+    end
+    pj_summarize st oid sm
+    off = get pj_ent add mul ulong idx 6 5
+    for k ulong 5
+      if ne get sm k get pj_arena add off k
+        ret 1
+      end
+    end
+  end
+  ret 0
+end
+
+fn pj_recover_all st ulong to long
+  bad = ulong 0
+  n = get pj_meta 0
+  for i ulong n bound 1024
+    bad = add bad pj_recover_ent st i
+  end
+  nr = get pj_meta 2
+  for i ulong nr bound 1024
+    bad = add bad pj_recover_rec st i
+  end
+  if ne bad 0
+    ret PJ_ERR_RECOVER
+  end
+  ret PJ_OK
+end
+
+fn pj_in_scope subj ulong to long
+  ns = get pj_meta 12
+  for k ulong ns bound 64
+    if eq get pj_scope k subj
+      ret long k
+    end
+  end
+  ret -1
+end
+
+fn pj_classify_one st ulong ob ulong k ulong cur_why ulong to ulong
+  fb = mul k 5
+  if ne get pj_nfacts add fb 0 get cx_objs add ob 1
+    ret cur_why
+  end
+  fk = get pj_nfacts add fb 1
+  if ne fk 0
+    if ne fk get cx_objs add ob 2
+      ret cur_why
+    end
+  end
+  tr = get pj_nfacts add fb 2
+  br = ulong 0
+  if eq tr PJ_BRANCH_LOCAL
+    br = get pj_need 4
+  end
+  if ne get cx_objs add ob 6 br
+    if eq cur_why PJ_WHY_TYPE
+      ret PJ_WHY_BRANCH
+    end
+    ret cur_why
+  end
+  tp = get pj_nfacts add fb 4
+  if eq tp PJ_T_MEMORY
+    if eq get pj_need 14 PJ_M_EPISODIC
+      tp = PJ_T_ALL
+    else
+      tp = PJ_T_WINDOW
+    end
+  end
+  t0 = get pj_meta 10
+  if eq tp PJ_T_ALL
+    t0 = 0
+  end
+  ot = get cx_objs add ob 4
+  now = get pj_need 8
+  if eq tr PJ_DERIVED
+    if ge ot t0
+      if le ot now
+        ret PJ_WHY_DERIVED_SOURCE
+      end
+    end
+  end
+  if le ot now
+    if eq tp PJ_T_LATEST
+      ret PJ_WHY_SUPERSEDED
+    end
+    if eq tp PJ_T_CARRY_IN
+      ret PJ_WHY_SUPERSEDED
+    end
+  end
+  if eq cur_why PJ_WHY_TYPE
+    ret PJ_WHY_TIME
+  end
+  if eq cur_why PJ_WHY_BRANCH
+    ret PJ_WHY_TIME
+  end
+  ret cur_why
+end
+
+fn pj_classify_excl st ulong oid ulong to ulong
+  ob = cx_obj_base st sub oid 1
+  why = PJ_WHY_TYPE
+  nf = get pj_need 5
+  for k ulong nf bound 16
+    why = pj_classify_one st ob k why
+    if eq why PJ_WHY_DERIVED_SOURCE
+      ret why
+    end
+  end
+  ret why
+end
+
+fn pj_audit_obj st ulong k ulong to ulong
+  oid = add k 1
+  if ge pj_view_find oid 0
+    put pj_audit_out 0 add get pj_audit_out 0 1
+    put pj_audit_out 6 add get pj_audit_out 6 1
+    ob = cx_obj_base st k
+    obr = get cx_objs add ob 6
+    if ne obr 0
+      if ne obr get pj_need 4
+        put pj_audit_out 4 add get pj_audit_out 4 1
+      end
+    end
+    ret 0
+  end
+  put pj_audit_out 1 add get pj_audit_out 1 1
+  if eq cx_verify st oid CX_OK
+    put pj_audit_out 2 add get pj_audit_out 2 1
+  end
+  subj = get cx_objs add cx_obj_base st k 3
+  si = pj_in_scope subj
+  if lt si 0
+    put pj_audit_out add 6 PJ_WHY_SUBJECT add get pj_audit_out add 6 PJ_WHY_SUBJECT 1
+    ret 1
+  end
+  put pj_per_scope ulong si add get pj_per_scope ulong si 1
+  why = pj_classify_excl st oid
+  put pj_audit_out add 6 why add get pj_audit_out add 6 why 1
+  ret 0
+end
+
+fn pj_audit st ulong to long
+  for i ulong 16
+    put pj_audit_out i 0
+  end
+  for i ulong 64
+    put pj_per_scope i 0
+  end
+  other = ulong 0
+  nobj = get cx_meta mul st 16
+  for k ulong nobj bound 2048
+    other = add other pj_audit_obj st k
+  end
+  match = ulong 1
+  nx = get pj_meta 5
+  for i ulong nx bound 72
+    xb = mul i 3
+    if eq get pj_excl xb PJ_X_OTHER_SUBJECTS
+      if ne get pj_excl add xb 2 other
+        match = 0
+      end
+    else
+      si = pj_in_scope get pj_excl add xb 1
+      got = ulong 0
+      if ge si 0
+        got = get pj_per_scope ulong si
+      end
+      if ne get pj_excl add xb 2 got
+        match = 0
+      end
+    end
+  end
+  put pj_audit_out 5 match
+  ret PJ_OK
+end

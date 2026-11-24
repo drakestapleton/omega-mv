@@ -705,10 +705,10 @@ $(RX_CX_FS_OBJ): src/runtime/rx_cortex.c src/runtime/rx_cortex.h tests/runtime/c
 	if [ -n "$$bad" ]; then echo "rx_cortex.c (CX_NO_POSIX) still needs: $$bad"; rm -f $@; exit 1; fi
 	@echo "rx_cortex.c (CX_NO_POSIX): no file, lock or libc allocation symbols"
 
-$(RX_CXJ_TEST): tests/runtime/rx_cortex_journal.c $(RX_CX_FS_OBJ) src/omega_om_units.c src/runtime/rx_cortex.h | $(OUT_DIR)
-	$(CC) $(CFLAGS) -o $@ tests/runtime/rx_cortex_journal.c $(RX_CX_FS_OBJ) src/omega_om_units.c
+$(RX_CXJ_TEST): $(RT_OM_CXJ_SRCS) $(RT_OM_OMC) | $(OUT_DIR)
+	( echo om2; cat $(RT_OM_CXJ_SRCS) ) | $(RT_OM_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-test-cortex: $(RX_CX_TEST) $(RX_CXJ_TEST)
+test-cortex: $(RX_CX_TEST) $(RX_CX_FS_OBJ) $(RX_CXJ_TEST)
 	./$(RX_CX_TEST)
 	./$(RX_CXJ_TEST)
 
@@ -1283,20 +1283,20 @@ $(RX_CM_OBJ): src/runtime/rx_costmodel.c src/runtime/rx_costmodel.h | $(OUT_DIR)
 		echo "rx_costmodel.o references an operation a cost model must not have"; \
 		rm -f $@; exit 1; fi
 
-# Any host: synthetic measurements; fit, calibration, decisions, blob.
+# Pure seeded OM-2 cost model unit test: synthetic measurements; fit, calibration, decisions, blob.
 RX_CM_UNIT = $(OUT_DIR)/rx_costmodel_unit
-$(RX_CM_UNIT): tests/runtime/rx_costmodel_unit.c $(RX_CM_OBJ) src/omega_om_units.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) -o $@ tests/runtime/rx_costmodel_unit.c $(RX_CM_OBJ) src/omega_om_units.c -lm
+$(RX_CM_UNIT): $(RT_OM_CM_SRCS) $(RT_OM_OMC) | $(OUT_DIR)
+	( echo om2; cat $(RT_OM_CM_SRCS) ) | $(RT_OM_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-costmodel: $(RX_CM_UNIT)
 	./$(RX_CM_UNIT)
 	@set -eu; dir=$(OUT_DIR)/costmodel-mutant; rm -rf $$dir; mkdir -p $$dir; \
-	  sed "/CM704:refuse-unsupported-op/c\\    uint32_t op = f && f->op < RX_CM_OPS ? f->op : RX_CM_OPS - 1u; /* CM704:refuse-unsupported-op */" \
-	    src/runtime/rx_costmodel.c > $$dir/rx_costmodel.c; \
-	  if cmp -s src/runtime/rx_costmodel.c $$dir/rx_costmodel.c; then \
+	  sed '/CM704:refuse-unsupported-op/{N;N;s/ret RX_CM_CELL_NONE/op = sub RX_CM_OPS 1/;}' \
+	    src/runtime/rx_costmodel.om > $$dir/rx_costmodel.om; \
+	  if cmp -s src/runtime/rx_costmodel.om $$dir/rx_costmodel.om; then \
 	    echo "mutant restore-op-clamp: sed changed nothing"; exit 1; fi; \
-	  $(CC) $(CFLAGS) -c -o $$dir/rx_costmodel.o $$dir/rx_costmodel.c; \
-	  $(CC) $(CFLAGS) -o $$dir/unit tests/runtime/rx_costmodel_unit.c $$dir/rx_costmodel.o src/omega_om_units.c -lm; \
+	  ( echo om2; cat seed/ng/sha256.om $$dir/rx_costmodel.om tests/runtime/rx_costmodel_unit.om ) \
+	    | $(RT_OM_OMC) > $$dir/unit && chmod +x $$dir/unit; \
 	  rc=0; $$dir/unit refuse > $$dir/out.txt 2> $$dir/err.txt || rc=$$?; \
 	  if [ $$rc -eq 0 ] || ! grep -q unsupported-op-not-aliased-to-matvec $$dir/err.txt; then \
 	    echo "mutant restore-op-clamp was not killed by unsupported-op-not-aliased-to-matvec (exit $$rc)"; \
