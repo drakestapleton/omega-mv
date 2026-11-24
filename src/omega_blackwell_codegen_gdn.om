@@ -1,0 +1,210 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_blackwell_codegen_gdn.c.
+note Composes on om/gpu/cg_gdn.om and om/gpu/bw_regalloc.om.
+om2
+
+const GDN_OM_KEY_HEADS uint 16
+const GDN_OM_HEAD_DIM uint 128
+const GDN_OM_TAPS uint 4
+const GDN_OM_TAIL_HEAD_BYTES uint 6144
+const GDN_OM_STATE_HEAD_BYTES uint 65536
+const GDN_OM_GPR_HW_LIMIT ulong 246
+
+fn omega_gdn_shape ratio uint state_bf16 uint out_shape edit uint 10 to long
+  r = ratio
+  if eq r 0
+    r = 3
+  end
+  if or lt r 1 gt r 3
+    ret -1
+  end
+  vh = mul GDN_OM_KEY_HEADS r
+  vdim = mul vh GDN_OM_HEAD_DIM
+  conv = add mul mul 2 GDN_OM_KEY_HEADS GDN_OM_HEAD_DIM vdim
+  par_scal = mul mul conv GDN_OM_TAPS 4
+  par_norm = add par_scal mul vh 8
+  par_bytes = add par_norm mul GDN_OM_HEAD_DIM 4
+  tail_bytes = mul vh GDN_OM_TAIL_HEAD_BYTES
+  state_bytes = mul vh GDN_OM_STATE_HEAD_BYTES
+  if ne state_bf16 0
+    state_bytes = mul vh div GDN_OM_STATE_HEAD_BYTES 2
+  end
+  post_grid_y = div vh 8
+  put out_shape 0 r
+  put out_shape 1 vh
+  put out_shape 2 conv
+  put out_shape 3 vdim
+  put out_shape 4 par_scal
+  put out_shape 5 par_norm
+  put out_shape 6 par_bytes
+  put out_shape 7 tail_bytes
+  put out_shape 8 state_bytes
+  put out_shape 9 post_grid_y
+  ret 0
+end
+
+fn gdn_om_touch_vreg vinfo edit long 768 r64 ulong pos long is_def ulong nv ulong to void
+  if ge r64 nv
+    ret
+  end
+  base = mul r64 3
+  fd = get vinfo base
+  lu = get vinfo add base 1
+  if and ne is_def 0 lt fd 0
+    put vinfo base pos
+  end
+  if gt pos lu
+    put vinfo add base 1 pos
+  end
+end
+
+fn gdn_om_build_vinfo ins view ulong 8192 meta view ulong 512 vinfo edit long 768 to void
+  n = get meta 0
+  nv = get meta 1
+  nl = get meta 3
+  for v ulong nv bound 256
+    base = mul v 3
+    put vinfo base -1
+    put vinfo add base 1 -1
+    put vinfo add base 2 long get meta add 64 v
+  end
+  for i ulong n bound 1024
+    off = mul i 8
+    flags = get ins add off 7
+    if eq and flags 1 0
+      pos = long i
+      gdn_om_touch_vreg vinfo get ins add off 1 pos 1 nv
+      gdn_om_touch_vreg vinfo get ins add off 2 pos 0 nv
+      gdn_om_touch_vreg vinfo get ins add off 3 pos 0 nv
+      gdn_om_touch_vreg vinfo get ins add off 4 pos 0 nv
+    end
+  end
+  for l ulong nl bound 16
+    ls = long get meta add 320 mul l 2
+    le_idx = long get meta add 321 mul l 2
+    for v ulong nv bound 256
+      base = mul v 3
+      fd = get vinfo base
+      lu = get vinfo add base 1
+      if ge fd 0
+        if lt fd ls
+          if ge lu ls
+            if lt lu le_idx
+              put vinfo add base 1 le_idx
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+fn gdn_om_solve ins view ulong 8192 meta view ulong 512 gpr_lim ulong out_stats edit uint 2 to long
+  n = get meta 0
+  nv = get meta 1
+  nu = get meta 2
+  nl = get meta 3
+  if or eq n 0 gt n 1024
+    ret -1
+  end
+  if gt nv 256
+    ret -1
+  end
+  if gt nu 32
+    ret -1
+  end
+  if gt nl 16
+    ret -1
+  end
+  vinfo = new long 768 0
+  gdn_om_build_vinfo ins meta vinfo
+  uinfo = new ulong 32 0
+  for u ulong nu bound 32
+    put uinfo u get meta add 352 u
+  end
+  cfg = new ulong 4 0
+  put cfg 0 nv
+  put cfg 1 nu
+  put cfg 2 gpr_lim
+  res = new long 290 0
+  if ne bw_regalloc_solve cfg vinfo uinfo res 0
+    ret -1
+  end
+  put out_stats 0 uint n
+  put out_stats 1 uint get res 288
+  ret 0
+end
+
+fn gdn_om_emit_kind kind ulong spec view ulong 4 ins edit ulong 8192 meta edit ulong 512 gpr_lim ulong out_stats edit uint 2 to long
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  sp = new ulong 8 0
+  put sp 0 kind
+  put sp 1 get spec 0
+  put sp 2 get spec 1
+  put sp 3 get spec 2
+  put sp 4 get spec 3
+  rc = cg_gdn_emit sp ins meta
+  if ne rc 0
+    ret -1
+  end
+  if or ne get meta 5 0 eq get meta 0 0
+    ret -1
+  end
+  ret gdn_om_solve ins meta gpr_lim out_stats
+end
+
+fn omega_blackwell_codegen_gdn_prog spec view ulong 4 ins edit ulong 8192 meta edit ulong 512 to long
+  stats = new uint 2 0
+  ret gdn_om_emit_kind 0 spec ins meta 0 stats
+end
+
+fn omega_gdn_prog_stats spec view ulong 4 out_stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  ret gdn_om_emit_kind 0 spec ins meta 0 out_stats
+end
+
+fn omega_blackwell_codegen_gdn_copy_prog spec view ulong 4 ins edit ulong 8192 meta edit ulong 512 to long
+  stats = new uint 2 0
+  ret gdn_om_emit_kind 1 spec ins meta 0 stats
+end
+
+fn omega_blackwell_codegen_gdn_prep_prog spec view ulong 4 ins edit ulong 8192 meta edit ulong 512 to long
+  stats = new uint 2 0
+  ret gdn_om_emit_kind 2 spec ins meta 0 stats
+end
+
+fn omega_blackwell_codegen_gdn_scan_prog spec view ulong 4 ins edit ulong 8192 meta edit ulong 512 to long
+  stats = new uint 2 0
+  ret gdn_om_emit_kind 3 spec ins meta 0 stats
+end
+
+fn omega_blackwell_codegen_gdn_post_prog spec view ulong 4 ins edit ulong 8192 meta edit ulong 512 to long
+  stats = new uint 2 0
+  ret gdn_om_emit_kind 4 spec ins meta 0 stats
+end
+
+fn omega_gdn_pf_prog_stats kind uint spec view ulong 4 out_stats edit uint 2 to long
+  if gt kind 2
+    ret -1
+  end
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  ret gdn_om_emit_kind add ulong kind 2 spec ins meta 0 out_stats
+end
+
+fn omega_blackwell_codegen_gdn_multi_prog spec view ulong 4 ins edit ulong 8192 meta edit ulong 512 to long
+  stats = new uint 2 0
+  ret gdn_om_emit_kind 5 spec ins meta GDN_OM_GPR_HW_LIMIT stats
+end
+
+fn omega_gdn_multi_prog_stats spec view ulong 4 out_stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  ret gdn_om_emit_kind 5 spec ins meta GDN_OM_GPR_HW_LIMIT out_stats
+end
