@@ -1,0 +1,516 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/omega_vc_bridge.om -- pure seeded OM-2 port of src/omega_vc_bridge.c
+note Composes with seed/ng/sha256.om and src/omega_vcstore.om.
+note Mints EvidenceReceiptV1 (host-v1, HOST_TEST) and canonical VerifiedCrumbV1
+note carrying OMEGA_BRIDGE_SELFMINTED_CAPABILITY ("omega-bridge.selfminted"),
+note stores receipt & IR blob in bridge tables, and admits into omega_vcstore.
+
+const VCB_MAX_RECS ulong 32
+const VCB_MAX_BLOBS ulong 32
+const VCB_MAX_DEPS ulong 16
+const VCB_JSON_POOL ulong 131072
+const VCB_BLOB_POOL ulong 131072
+
+text vcb_profile "host-v1"
+text vcb_profver "1.0.0"
+text vcb_selfcap "omega-bridge.selfminted"
+text vcb_evdom "aien.vc1.bridge.evidence.v1"
+text vcb_vctag "AIEN_VERIFIED_CRUMB_V1"
+
+text vcb_j1 "{\n\"schema\": \"EvidenceReceiptV1\",\n\"version\": 1,\n\"id\": \""
+text vcb_j2 "\",\n\"kind\": \"host-v1\",\n\"tier\": \"HOST_TEST\",\n\"result\": \"PASS\",\n\"timestamp\": 1,\n\"repo\": \"omega-vc-bridge\",\n\"commit\": \"0000000000000000000000000000000000000000\",\n\"dirty\": false,\n\"toolchain\": \"omega-vc-bridge\",\n\"procedure\": \"in-process omega_program_verify and program id recompute (self-minted HOST_TEST receipt, not an independent run)\",\n\"machine\": \"host\",\n\"env_class\": \"HOST_TEST\",\n\"input_artifacts\": [\"sha256:"
+text vcb_j3 "\", \"sha256:"
+text vcb_j4 "\"],\n\"output_artifacts\": [],\n\"assertions\": [{\"id\": \"omega_program_verify\", \"expected\": \"pass\", \"observed\": \"pass\", \"pass\": true, \"source\": \"omega_vc_bridge\", \"note\": \"\"}],\n\"dependencies\": ["
+text vcb_j5 "],\n\"declared_mutation\": \"NONE\",\n\"observed_mutation\": \"NONE\",\n\"authority\": \"\",\n\"output_digest\": \""
+text vcb_j6 "\",\n\"external_refs\": [],\n\"ledger\": null,\n\"lease\": null,\n\"required_features\": [],\n\"reserved\": \"\"\n}\n"
+text vcb_comma ", "
+text vcb_zero64 "0000000000000000000000000000000000000000000000000000000000000000"
+
+note Bridge receipt table
+global g_vcb_rcnt ulong 1
+global g_vcb_rid uchar 1024
+global g_vcb_roff ulong 32
+global g_vcb_rlen ulong 32
+global g_vcb_rpool uchar 131072
+global g_vcb_rused ulong 1
+
+note Bridge IR blob table
+global g_vcb_bcnt ulong 1
+global g_vcb_bdig uchar 1024
+global g_vcb_boff ulong 32
+global g_vcb_blen ulong 32
+global g_vcb_bpool uchar 131072
+global g_vcb_bused ulong 1
+
+note Scratch buffers for admit
+global g_vcb_deps uchar 512
+global g_vcb_dcon uchar 512
+global g_vcb_drcpt uchar 512
+global g_vcb_json uchar 8192
+global g_vcb_jlen ulong 1
+global g_vcb_vc uchar 8192
+global g_vcb_vclen ulong 1
+global g_vcb_sid uchar 32
+global g_vcb_con uchar 32
+global g_vcb_dig uchar 32
+global g_vcb_root uchar 32
+global g_vcb_new_rid uchar 32
+global g_vcb_vcid uchar 32
+global g_vcb_hx64 uchar 64
+
+fn omega_vc_bridge_init to long
+  put g_vcb_rcnt 0 0
+  put g_vcb_rused 0 0
+  put g_vcb_bcnt 0 0
+  put g_vcb_bused 0 0
+  if ne omega_vcstore_init VCS_OK
+    ret neg long 1
+  end
+  ret 0
+end
+
+fn omega_vc_bridge_destroy to void
+  put g_vcb_rcnt 0 0
+  put g_vcb_rused 0 0
+  put g_vcb_bcnt 0 0
+  put g_vcb_bused 0 0
+  omega_vcstore_destroy
+end
+
+fn omega_vc_bridge_fetch_receipt id view uchar 32 dst edit uchar * to long
+  cnt = get g_vcb_rcnt 0
+  for i ulong cnt bound 32
+    base = mul i 32
+    eq_ok = ulong 1
+    for j ulong 32
+      if ne get g_vcb_rid add base j get id j
+        eq_ok = 0
+      end
+    end
+    if eq eq_ok 1
+      rlen = get g_vcb_rlen i
+      if gt rlen len dst
+        ret neg long 2
+      end
+      roff = get g_vcb_roff i
+      for j ulong rlen bound 8192
+        put dst j get g_vcb_rpool add roff j
+      end
+      ret long rlen
+    end
+  end
+  ret neg long 1
+end
+
+fn omega_vc_bridge_fetch_blob dig view uchar 32 dst edit uchar * to long
+  cnt = get g_vcb_bcnt 0
+  for i ulong cnt bound 32
+    base = mul i 32
+    eq_ok = ulong 1
+    for j ulong 32
+      if ne get g_vcb_bdig add base j get dig j
+        eq_ok = 0
+      end
+    end
+    if eq eq_ok 1
+      blen = get g_vcb_blen i
+      if gt blen len dst
+        ret neg long 2
+      end
+      boff = get g_vcb_boff i
+      for j ulong blen bound 8192
+        put dst j get g_vcb_bpool add boff j
+      end
+      ret long blen
+    end
+  end
+  ret neg long 1
+end
+
+fn vcb_jput pos ulong s view uchar * to ulong
+  n = len s
+  for i ulong n bound 512
+    put g_vcb_json add pos i get s i
+  end
+  ret add pos n
+end
+
+fn vcb_jput_hex32 pos ulong src_kind ulong off ulong to ulong
+  note src_kind: 0=g_vcb_new_rid, 1=g_vcb_sid, 2=g_vcb_dig, 3=g_vcb_root, 4=g_vcb_drcpt+off
+  p = pos
+  for i ulong 32
+    b = ulong 0
+    if eq src_kind 0
+      b = ulong get g_vcb_new_rid i
+    end
+    if eq src_kind 1
+      b = ulong get g_vcb_sid i
+    end
+    if eq src_kind 2
+      b = ulong get g_vcb_dig i
+    end
+    if eq src_kind 3
+      b = ulong get g_vcb_root i
+    end
+    if eq src_kind 4
+      b = ulong get g_vcb_drcpt add off i
+    end
+    put g_vcb_json p sh_hexd uint shr b 4
+    put g_vcb_json add p 1 sh_hexd uint and b 15
+    p = add p 2
+  end
+  ret p
+end
+
+fn vcb_emit_receipt use_real_id ulong nd ulong to ulong
+  p = ulong 0
+  p = vcb_jput p vcb_j1
+  if eq use_real_id 0
+    p = vcb_jput p vcb_zero64
+  else
+    p = vcb_jput_hex32 p 0 0
+  end
+  p = vcb_jput p vcb_j2
+  p = vcb_jput_hex32 p 1 0
+  p = vcb_jput p vcb_j3
+  p = vcb_jput_hex32 p 2 0
+  p = vcb_jput p vcb_j4
+  for i ulong nd bound 16
+    if gt i 0
+      p = vcb_jput p vcb_comma
+    end
+    put g_vcb_json p 34
+    p = add p 1
+    p = vcb_jput_hex32 p 4 mul i 32
+    put g_vcb_json p 34
+    p = add p 1
+  end
+  p = vcb_jput p vcb_j5
+  p = vcb_jput_hex32 p 3 0
+  p = vcb_jput p vcb_j6
+  put g_vcb_jlen 0 p
+  ret p
+end
+
+fn vcb_vc_u32be pos ulong v ulong to ulong
+  put g_vcb_vc pos uchar and shr v 24 255
+  put g_vcb_vc add pos 1 uchar and shr v 16 255
+  put g_vcb_vc add pos 2 uchar and shr v 8 255
+  put g_vcb_vc add pos 3 uchar and v 255
+  ret add pos 4
+end
+
+fn vcb_vc_str pos ulong s view uchar * to ulong
+  n = len s
+  p = vcb_vc_u32be pos 0
+  p = vcb_vc_u32be p n
+  for i ulong n bound 128
+    put g_vcb_vc add p i get s i
+  end
+  ret add p n
+end
+
+fn vcb_build_vc nd ulong to ulong
+  p = ulong 0
+  for i ulong 22
+    put g_vcb_vc p get vcb_vctag i
+    p = add p 1
+  end
+  p = vcb_vc_u32be p 1
+  for i ulong 32
+    put g_vcb_vc p get g_vcb_sid i
+    p = add p 1
+  end
+  for i ulong 32
+    put g_vcb_vc p get g_vcb_con i
+    p = add p 1
+  end
+  put g_vcb_vc p 2
+  p = add p 1
+  for i ulong 32
+    put g_vcb_vc p get g_vcb_dig i
+    p = add p 1
+  end
+  p = vcb_vc_u32be p 0
+  p = vcb_vc_u32be p nd
+  for i ulong nd bound 16
+    b = mul i 32
+    for j ulong 32
+      put g_vcb_vc p get g_vcb_deps add b j
+      p = add p 1
+    end
+    for j ulong 32
+      put g_vcb_vc p get g_vcb_dcon add b j
+      p = add p 1
+    end
+  end
+  for i ulong 32
+    put g_vcb_vc p get g_vcb_new_rid i
+    p = add p 1
+  end
+  p = vcb_vc_str p vcb_profile
+  p = vcb_vc_str p vcb_profver
+  for i ulong 32
+    put g_vcb_vc p get g_vcb_root i
+    p = add p 1
+  end
+  p = vcb_vc_u32be p 0
+  p = vcb_vc_u32be p 1
+  p = vcb_vc_str p vcb_selfcap
+  put g_vcb_vclen 0 p
+  ret p
+end
+
+fn vcb_put_receipt_table to long
+  cnt = get g_vcb_rcnt 0
+  for i ulong cnt bound 32
+    base = mul i 32
+    same = ulong 1
+    for j ulong 32
+      if ne get g_vcb_rid add base j get g_vcb_new_rid j
+        same = 0
+      end
+    end
+    if eq same 1
+      ret 0
+    end
+  end
+  jlen = get g_vcb_jlen 0
+  rused = get g_vcb_rused 0
+  if or ge cnt VCB_MAX_RECS gt add rused jlen VCB_JSON_POOL
+    ret neg long 1
+  end
+  for j ulong jlen bound 8192
+    put g_vcb_rpool add rused j get g_vcb_json j
+  end
+  base = mul cnt 32
+  for j ulong 32
+    put g_vcb_rid add base j get g_vcb_new_rid j
+  end
+  put g_vcb_roff cnt rused
+  put g_vcb_rlen cnt jlen
+  put g_vcb_rused 0 add rused jlen
+  put g_vcb_rcnt 0 add cnt 1
+  ret 0
+end
+
+fn vcb_put_blob_table ir view uchar * ir_len ulong to long
+  cnt = get g_vcb_bcnt 0
+  for i ulong cnt bound 32
+    base = mul i 32
+    same = ulong 1
+    for j ulong 32
+      if ne get g_vcb_bdig add base j get g_vcb_dig j
+        same = 0
+      end
+    end
+    if eq same 1
+      ret 0
+    end
+  end
+  bused = get g_vcb_bused 0
+  if or ge cnt VCB_MAX_BLOBS gt add bused ir_len VCB_BLOB_POOL
+    ret neg long 1
+  end
+  for j ulong ir_len bound 8192
+    put g_vcb_bpool add bused j get ir j
+  end
+  base = mul cnt 32
+  for j ulong 32
+    put g_vcb_bdig add base j get g_vcb_dig j
+  end
+  put g_vcb_boff cnt bused
+  put g_vcb_blen cnt ir_len
+  put g_vcb_bused 0 add bused ir_len
+  put g_vcb_bcnt 0 add cnt 1
+  ret 0
+end
+
+fn vcb_sort_and_fetch_deps nd ulong to long
+  note Insertion sort g_vcb_deps[0..nd) ascending by 32-byte semantic_id
+  for i ulong nd bound 16
+    if gt i 0
+      k = i
+      done = ulong 0
+      while and gt k 0 eq done 0 bound 16
+        a = mul sub k 1 32
+        b = mul k 32
+        cmp = long 0
+        for j ulong 32
+          if eq cmp 0
+            va = ulong get g_vcb_deps add a j
+            vb = ulong get g_vcb_deps add b j
+            if lt va vb
+              cmp = neg long 1
+            end
+            if gt va vb
+              cmp = 1
+            end
+          end
+        end
+        if gt cmp 0
+          for j ulong 32
+            tmp = get g_vcb_deps add a j
+            put g_vcb_deps add a j get g_vcb_deps add b j
+            put g_vcb_deps add b j tmp
+          end
+          k = sub k 1
+        else
+          done = 1
+        end
+      end
+    end
+  end
+  note Reject duplicate deps and fetch each dep from omega_vcstore
+  dsid = new uchar 32 0
+  for i ulong nd bound 16
+    b = mul i 32
+    if gt i 0
+      prev = mul sub i 1 32
+      dup = ulong 1
+      for j ulong 32
+        if ne get g_vcb_deps add prev j get g_vcb_deps add b j
+          dup = 0
+        end
+      end
+      if eq dup 1
+        ret neg long 1
+      end
+    end
+    for j ulong 32
+      put dsid j get g_vcb_deps add b j
+    end
+    if ne omega_vcstore_get dsid VCS_OK
+      ret neg long 1
+    end
+    coff = get g_vcv_cid_off 0
+    roff = get g_vcv_rcpt_off 0
+    for j ulong 32
+      put g_vcb_dcon add b j get g_vcs_decbuf add coff j
+      put g_vcb_drcpt add b j get g_vcs_decbuf add roff j
+    end
+  end
+  ret 0
+end
+
+fn vcb_is_zero32 buf view uchar 32 to bool
+  acc = ulong 0
+  for i ulong 32
+    acc = or acc ulong get buf i
+  end
+  ret eq acc 0
+end
+
+fn vcb_compute_ev_root ev view uchar 32 to void
+  note Exact C domain string with NUL terminator: "aien.vc1.bridge.evidence.v1\0" (28 bytes) || ev(32) || sid(32)
+  p = ulong 0
+  for i ulong len vcb_evdom bound 32
+    put sh_dat p get vcb_evdom i
+    p = add p 1
+  end
+  put sh_dat p 0
+  p = add p 1
+  for i ulong 32
+    put sh_dat p get ev i
+    p = add p 1
+  end
+  for i ulong 32
+    put sh_dat p get g_vcb_sid i
+    p = add p 1
+  end
+  sh_all p
+  for i ulong 32
+    put g_vcb_root i get sh_dig i
+  end
+end
+
+fn vcb_finalize_admit nd ulong ir view uchar * ir_len ulong to long
+  vcb_buf = new uchar 8192 0
+  vcid = new uchar 32 0
+  n0 = vcb_emit_receipt 0 nd
+  for i ulong n0 bound 8192
+    put sh_dat i get g_vcb_json i
+  end
+  sh_all n0
+  for i ulong 32
+    put g_vcb_new_rid i get sh_dig i
+  end
+  ign_n1 = vcb_emit_receipt 1 nd
+  vclen = vcb_build_vc nd
+  for i ulong vclen bound 8192
+    put vcb_buf i get g_vcb_vc i
+  end
+  omega_vc_compute_id vcb_buf vclen vcid
+  for i ulong 32
+    put g_vcb_vcid i get vcid i
+  end
+  if ne vcb_put_receipt_table 0
+    ret neg long 1
+  end
+  if ne vcb_put_blob_table ir ir_len 0
+    ret neg long 1
+  end
+  if ne omega_vcstore_insert vcb_buf vclen vcid VCS_OK
+    ret neg long 1
+  end
+  ret 0
+end
+
+note Set program metadata (semantic_id, contract_id) before calling omega_vc_bridge_admit
+fn omega_vc_bridge_set_prog sid view uchar 32 con view uchar 32 to void
+  for i ulong 32
+    put g_vcb_sid i get sid i
+    put g_vcb_con i get con i
+  end
+end
+
+fn omega_vc_bridge_set_dep idx ulong dep_sid view uchar 32 to void
+  if ge idx VCB_MAX_DEPS
+    ret
+  end
+  b = mul idx 32
+  for i ulong 32
+    put g_vcb_deps add b i get dep_sid i
+  end
+end
+
+fn omega_vc_bridge_admit is_realized ulong has_body ulong nd ulong ir view uchar * ev view uchar 32 to long
+  ir_len = len ir
+  if or eq is_realized 0 or eq has_body 0 or eq ir_len 0 gt nd VCB_MAX_DEPS
+    ret neg long 1
+  end
+  if vcb_is_zero32 ev
+    ret neg long 1
+  end
+  acc_s = ulong 0
+  acc_c = ulong 0
+  for i ulong 32
+    acc_s = or acc_s ulong get g_vcb_sid i
+    acc_c = or acc_c ulong get g_vcb_con i
+  end
+  if or eq acc_s 0 eq acc_c 0
+    ret neg long 1
+  end
+  for i ulong ir_len bound 8192
+    put sh_dat i get ir i
+  end
+  sh_all ir_len
+  for i ulong 32
+    put g_vcb_dig i get sh_dig i
+  end
+  vcb_compute_ev_root ev
+  if ne vcb_sort_and_fetch_deps nd 0
+    ret neg long 1
+  end
+  ret vcb_finalize_admit nd ir ir_len
+end
+
+fn omega_vc_bridge_admit_abstraction is_verified ulong is_nontrivial ulong comp_score long ir view uchar * ev view uchar 32 to long
+  if or eq is_verified 0 or eq is_nontrivial 0 le comp_score 0
+    ret neg long 1
+  end
+  ret omega_vc_bridge_admit 1 1 0 ir ev
+end

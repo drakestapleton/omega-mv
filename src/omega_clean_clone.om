@@ -1,0 +1,499 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/omega_clean_clone.om -- pure seeded OM-2 port of src/omega_clean_clone.c
+note Plain-path check, subprocess execution, single-line stdout capture, and
+note safe non-symlink-following recursive tree removal on Linux ARM64.
+
+global g_cc_status uchar 4
+global g_cc_fds uchar 8
+global g_cc_stat uchar 128
+global g_cc_env uchar 64
+global g_cc_pkt uchar 4096
+global g_cc_plen ulong 1
+global g_cc_readbuf uchar 256
+global g_cc_dent uchar 4096
+global g_cc_stack uchar 65536
+global g_cc_slen ulong 64
+global g_cc_sopen uchar 64
+global g_cc_child uchar 4096
+global g_cc_sp ulong 1
+global g_cc_root_dev ulong 1
+
+text cc_devnull "/dev/null"
+text cc_env_in_clone "OMEGA_IN_CLEAN_CLONE=1"
+
+fn omega_cc_path_is_plain s view uchar * n ulong to bool
+  if eq n 0
+    ret false
+  end
+  for i ulong n bound 4096
+    c = ulong get s i
+    ok = false
+    if and ge c 65 le c 90
+      ok = true
+    end
+    if and ge c 97 le c 122
+      ok = true
+    end
+    if and ge c 48 le c 57
+      ok = true
+    end
+    if or eq c 47 eq c 46
+      ok = true
+    end
+    if or eq c 95 or eq c 43 eq c 45
+      ok = true
+    end
+    if not ok
+      ret false
+    end
+  end
+  ret true
+end
+
+fn cc_status_u32 to ulong
+  b0 = ulong get g_cc_status 0
+  b1 = ulong get g_cc_status 1
+  b2 = ulong get g_cc_status 2
+  b3 = ulong get g_cc_status 3
+  r = or b0 shl b1 8
+  r = or r shl b2 16
+  ret or r shl b3 24
+end
+
+fn cc_fds_u32 off ulong to ulong
+  b0 = ulong get g_cc_fds off
+  b1 = ulong get g_cc_fds add off 1
+  b2 = ulong get g_cc_fds add off 2
+  b3 = ulong get g_cc_fds add off 3
+  r = or b0 shl b1 8
+  r = or r shl b2 16
+  ret or r shl b3 24
+end
+
+fn cc_stat_u32 off ulong to ulong
+  b0 = ulong get g_cc_stat off
+  b1 = ulong get g_cc_stat add off 1
+  b2 = ulong get g_cc_stat add off 2
+  b3 = ulong get g_cc_stat add off 3
+  r = or b0 shl b1 8
+  r = or r shl b2 16
+  ret or r shl b3 24
+end
+
+fn cc_stat_u64 off ulong to ulong
+  lo = cc_stat_u32 off
+  hi = cc_stat_u32 add off 4
+  ret or lo shl hi 32
+end
+
+fn cc_dent_u16 off ulong to ulong
+  b0 = ulong get g_cc_dent off
+  b1 = ulong get g_cc_dent add off 1
+  ret or b0 shl b1 8
+end
+
+fn cc_wait_decode pid int to long
+  rc = long 0
+  done = ulong 0
+  while eq done 0 bound 64
+    r = waitpid pid g_cc_status 0 4 0
+    if ge r 0
+      rc = r
+      done = 1
+    else
+      if ne r neg long 4
+        ret neg long 1
+      end
+    end
+  end
+  if ne rc long pid
+    ret neg long 1
+  end
+  st = cc_status_u32
+  sig = and st 127
+  if eq sig 0
+    ret long and shr st 8 255
+  end
+  if ne sig 127
+    ret long add 128 sig
+  end
+  ret neg long 1
+end
+
+fn cc_build_env_clone to ulong
+  put g_cc_env 0 1
+  put g_cc_env 1 0
+  n = len cc_env_in_clone
+  put g_cc_env 2 uchar and n 255
+  put g_cc_env 3 uchar and shr n 8 255
+  for i ulong n bound 64
+    put g_cc_env add 4 i get cc_env_in_clone i
+  end
+  ret add 4 n
+end
+
+fn omega_cc_pkt_set src view uchar * n ulong to void
+  lim = n
+  if gt lim 4096
+    lim = 4096
+  end
+  for i ulong lim bound 4096
+    put g_cc_pkt i get src i
+  end
+  put g_cc_plen 0 lim
+end
+
+fn cc_child_exec plen ulong in_clean_clone ulong to void
+  if ne in_clean_clone 0
+    elen = cc_build_env_clone
+    ign2 = execenv g_cc_pkt 0 plen g_cc_env 0 elen
+  else
+    ign3 = execprog g_cc_pkt 0 plen
+  end
+  exit 127
+end
+
+note omega_cc_run: dir (len 0 means no chdir), uses g_cc_pkt[0..g_cc_plen),
+note out_rel (len 0 means /dev/null), in_clean_clone (0 or 1).
+fn omega_cc_run dir view uchar * out_rel view uchar * in_clean_clone ulong to long
+  plen = get g_cc_plen 0
+  if lt plen 4
+    ret neg long 1
+  end
+  pid = fork
+  if lt pid 0
+    ret neg long 1
+  end
+  if eq pid 0
+    if gt len dir 0
+      cr = chdir dir 0 len dir
+      if ne cr 0
+        exit 127
+      end
+    end
+    fd = long 0
+    if gt len out_rel 0
+      note O_WRONLY(1)|O_CREAT(64)|O_TRUNC(512)|O_CLOEXEC(524288)|O_NOFOLLOW(32768)=557633, mode 0644=420
+      fd = fopen out_rel 0 len out_rel 557633 420
+    else
+      note O_WRONLY(1)|O_CLOEXEC(524288)=524289
+      fd = fopen cc_devnull 0 len cc_devnull 524289 0
+    end
+    if lt fd 0
+      exit 126
+    end
+    dr1 = dupfd int fd 1 0
+    if lt dr1 0
+      exit 127
+    end
+    dr2 = dupfd int fd 2 0
+    if lt dr2 0
+      exit 127
+    end
+    if and ne fd 1 ne fd 2
+      ign = fclose int fd
+    end
+    cc_child_exec plen in_clean_clone
+  end
+  ret cc_wait_decode int pid
+end
+
+fn cc_find_nl dst view uchar * used ulong to ulong
+  for i ulong used bound 4096
+    c = get dst i
+    if eq c 10
+      ret i
+    end
+    if eq c 13
+      ret i
+    end
+  end
+  ret used
+end
+
+fn cc_read_pipe_line rfd int dst edit uchar * to long
+  cap = len dst
+  used = ulong 0
+  overflow = ulong 0
+  rdone = ulong 0
+  while eq rdone 0 bound 4096
+    nr = read rfd g_cc_readbuf 0 256
+    if lt nr 0
+      if ne nr neg long 4
+        rdone = 1
+      end
+    else
+      if eq nr 0
+        rdone = 1
+      else
+        cnt = ulong nr
+        for i ulong cnt bound 256
+          if lt used cap
+            put dst used get g_cc_readbuf i
+            used = add used 1
+          else
+            overflow = 1
+          end
+        end
+      end
+    end
+  end
+  ign9 = fclose rfd
+  nl_pos = cc_find_nl dst used
+  if lt nl_pos used
+    ret long nl_pos
+  end
+  if ne overflow 0
+    ret neg long 1
+  end
+  ret long used
+end
+
+note omega_cc_capture_line: runs g_cc_pkt[0..g_cc_plen), captures first line of stdout into
+note dst[0..len dst) (without CR/LF), returns captured byte length (>0) on success or -1 on failure.
+fn omega_cc_capture_line dir view uchar * dst edit uchar * to long
+  plen = get g_cc_plen 0
+  if or lt plen 4 eq len dst 0
+    ret neg long 1
+  end
+  ign = pipefds g_cc_fds 0 8 524288
+  if ne ign 0
+    ret neg long 1
+  end
+  rfd = int cc_fds_u32 0
+  wfd = int cc_fds_u32 4
+  efd = fopen cc_devnull 0 len cc_devnull 524289 0
+  if lt efd 0
+    ign = fclose rfd
+    ign = fclose wfd
+    ret neg long 1
+  end
+  pid = fork
+  if lt pid 0
+    ign = fclose rfd
+    ign = fclose wfd
+    ign = fclose int efd
+    ret neg long 1
+  end
+  if eq pid 0
+    if gt len dir 0
+      ign = chdir dir 0 len dir
+      if ne ign 0
+        exit 127
+      end
+    end
+    ign = dupfd wfd 1 0
+    if lt ign 0
+      exit 127
+    end
+    ign = dupfd int efd 2 0
+    if lt ign 0
+      exit 127
+    end
+    cc_child_exec plen 0
+  end
+  ign = fclose wfd
+  ign = fclose int efd
+  got = cc_read_pipe_line rfd dst
+  rc = cc_wait_decode int pid
+  if ne rc 0
+    ret neg long 1
+  end
+  if gt got 0
+    ret got
+  end
+  ret neg long 1
+end
+
+fn cc_stack_push src view uchar * n ulong to bool
+  sp = get g_cc_sp 0
+  if or ge sp 64 gt n 1024
+    ret false
+  end
+  base = mul sp 1024
+  for i ulong n bound 1024
+    put g_cc_stack add base i get src i
+  end
+  put g_cc_slen sp n
+  put g_cc_sopen sp 0
+  put g_cc_sp 0 add sp 1
+  ret true
+end
+
+fn cc_stack_push_child n ulong to bool
+  sp = get g_cc_sp 0
+  if or ge sp 64 gt n 1024
+    ret false
+  end
+  base = mul sp 1024
+  for i ulong n bound 1024
+    put g_cc_stack add base i get g_cc_child i
+  end
+  put g_cc_slen sp n
+  put g_cc_sopen sp 0
+  put g_cc_sp 0 add sp 1
+  ret true
+end
+
+fn cc_name_is_dots off ulong n ulong to bool
+  if and eq n 1 eq get g_cc_dent off 46
+    ret true
+  end
+  if and eq n 2 and eq get g_cc_dent off 46 eq get g_cc_dent add off 1 46
+    ret true
+  end
+  ret false
+end
+
+fn cc_dent_name_len noff ulong lim ulong to ulong
+  nlen = ulong 0
+  while lt add noff nlen lim bound 256
+    if eq get g_cc_dent add noff nlen 0
+      ret nlen
+    end
+    nlen = add nlen 1
+  end
+  ret nlen
+end
+
+fn cc_handle_dent_entry base ulong plen ulong noff ulong nlen ulong to long
+  if cc_name_is_dots noff nlen
+    ret 0
+  end
+  clen = add add plen 1 nlen
+  if gt clen 1024
+    ret neg long 1
+  end
+  for i ulong plen bound 1024
+    put g_cc_child i get g_cc_stack add base i
+  end
+  put g_cc_child plen 47
+  for i ulong nlen bound 256
+    put g_cc_child add add plen 1 i get g_cc_dent add noff i
+  end
+  lr = lstat g_cc_child 0 clen g_cc_stat 0 128
+  if ne lr 0
+    if eq lr neg long 2
+      ret 0
+    end
+    ret neg long 1
+  end
+  mode = cc_stat_u32 16
+  ftype = and mode 61440
+  if eq ftype 16384
+    if eq cc_stat_u64 0 get g_cc_root_dev 0
+      if not cc_stack_push_child clen
+        ret neg long 1
+      end
+    end
+    ret 0
+  end
+  ur = unlink g_cc_child 0 clen
+  if or eq ur 0 eq ur neg long 2
+    ret 0
+  end
+  ret neg long 1
+end
+
+fn cc_scan_dir_slot slot ulong to long
+  base = mul slot 1024
+  plen = get g_cc_slen slot
+  note O_RDONLY(0)|O_DIRECTORY(16384)|O_NOFOLLOW(32768)|O_CLOEXEC(524288)=573440
+  dfd = fopen g_cc_stack base plen 573440 0
+  if lt dfd 0
+    ret neg long 1
+  end
+  ddone = ulong 0
+  while eq ddone 0 bound 256
+    nr = getdnts int dfd g_cc_dent 0 4096
+    if lt nr 0
+      ign = fclose int dfd
+      ret neg long 1
+    end
+    if eq nr 0
+      ddone = 1
+    else
+      pos = ulong 0
+      lim = ulong nr
+      while lt pos lim bound 512
+        reclen = cc_dent_u16 add pos 16
+        if eq reclen 0
+          ign = fclose int dfd
+          ret neg long 1
+        end
+        noff = add pos 19
+        nlen = cc_dent_name_len noff lim
+        hr = cc_handle_dent_entry base plen noff nlen
+        if ne hr 0
+          ign = fclose int dfd
+          ret neg long 1
+        end
+        pos = add pos reclen
+      end
+    end
+  end
+  ign = fclose int dfd
+  ret 0
+end
+
+fn cc_remove_tree_walk to long
+  while gt get g_cc_sp 0 0 bound 4096
+    top = sub get g_cc_sp 0 1
+    if eq get g_cc_sopen top 0
+      put g_cc_sopen top 1
+      sr = cc_scan_dir_slot top
+      if ne sr 0
+        ret neg long 1
+      end
+    else
+      base = mul top 1024
+      plen = get g_cc_slen top
+      rr = rmdir g_cc_stack base plen
+      if ne rr 0
+        if ne rr neg long 2
+          ret neg long 1
+        end
+      end
+      put g_cc_sp 0 top
+    end
+  end
+  ret 0
+end
+
+fn omega_cc_remove_tree path view uchar * n ulong to long
+  if not omega_cc_path_is_plain path n
+    ret neg long 1
+  end
+  if ne get path 0 47
+    ret neg long 1
+  end
+  if eq n 1
+    ret neg long 1
+  end
+  lr = lstat path 0 n g_cc_stat 0 128
+  if ne lr 0
+    if eq lr neg long 2
+      ret 0
+    end
+    ret neg long 1
+  end
+  mode = cc_stat_u32 16
+  ftype = and mode 61440
+  if ne ftype 16384
+    ur = unlink path 0 n
+    if or eq ur 0 eq ur neg long 2
+      ret 0
+    end
+    ret neg long 1
+  end
+  put g_cc_root_dev 0 cc_stat_u64 0
+  put g_cc_sp 0 0
+  ok = cc_stack_push path n
+  if not ok
+    ret neg long 1
+  end
+  ret cc_remove_tree_walk
+end

@@ -1,0 +1,1444 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/omega_vcstore.om -- pure seeded OM-2 port of src/omega_vcstore.c
+note Verified Crumb Store (VC1 stage 3, ADR 0029): canonical SPEC 3 decoder,
+note content-addressed immutable object store, post-order dependency closure,
+note object & name-index SHA-256 digests, name index, and binary save/load.
+note Composes with seed/ng/sha256.om.
+
+const VCS_OK ulong 0
+const VCS_UNVERIFIED_DEPENDENCY ulong 1
+const VCS_MISSING_RECEIPT ulong 2
+const VCS_RECEIPT_HASH_MISMATCH ulong 3
+const VCS_DEPENDENCY_NOT_PINNED ulong 4
+const VCS_DEPENDENCY_CYCLE ulong 5
+const VCS_STALE_RECEIPT ulong 6
+const VCS_UNDECLARED_IMPORT ulong 7
+const VCS_TAINTED_ARTIFACT ulong 8
+const VCS_UNKNOWN_VERIFIER_PROFILE ulong 9
+const VCS_BAD_DOMAIN_TAG ulong 20
+const VCS_UNKNOWN_FORMAT_VERSION ulong 21
+const VCS_TRUNCATED ulong 22
+const VCS_TRAILING_BYTES ulong 23
+const VCS_DUPLICATE_DEPENDENCY ulong 24
+const VCS_UNSORTED_DEPENDENCIES ulong 25
+const VCS_NONCANONICAL_SET ulong 26
+const VCS_BAD_STRING ulong 27
+const VCS_ZERO_ID ulong 28
+const VCS_TOO_MANY_ENTRIES ulong 29
+const VCS_BAD_DIGEST_KIND ulong 30
+const VCS_ID_MISMATCH ulong 40
+const VCS_IMMUTABLE_CONFLICT ulong 41
+const VCS_MALFORMED ulong 42
+const VCS_NOT_FOUND ulong 43
+const VCS_NAME_EXISTS ulong 44
+const VCS_CAPACITY ulong 45
+const VCS_NOMEM ulong 46
+const VCS_IO ulong 47
+const VCS_GENESIS_NOT_LISTED ulong 48
+
+const VCS_ADMISSION_VERIFIED ulong 1
+const VCS_ADMISSION_BOOTSTRAP ulong 2
+const VCS_MAX_OBJS ulong 128
+const VCS_MAX_NAMES ulong 128
+const VCS_MAX_BLOB ulong 524288
+const VCS_MAX_FILE ulong 1048576
+
+text vcs_tag "AIEN_VERIFIED_CRUMB_V1"
+text vcs_fmagic "AIEN_VCSTORE_V1"
+text vcs_dmagic "VCS1"
+text vcs_nmagic "VCN1"
+text vcs_tmp_suf ".tmp"
+
+note Decoded view globals (offsets into current decode buffer g_vcs_decbuf)
+global g_vcs_decbuf uchar 65536
+global g_vcs_declen ulong 1
+global g_vcs_dpos ulong 1
+global g_vcs_derr ulong 1
+
+global g_vcv_ver ulong 1
+global g_vcv_sid_off ulong 1
+global g_vcv_cid_off ulong 1
+global g_vcv_dkind ulong 1
+global g_vcv_sdig_off ulong 1
+global g_vcv_nreal ulong 1
+global g_vcv_real_off ulong 1
+global g_vcv_ndep ulong 1
+global g_vcv_dep_off ulong 1
+global g_vcv_rcpt_off ulong 1
+global g_vcv_prof_off ulong 1
+global g_vcv_prof_len ulong 1
+global g_vcv_pver_off ulong 1
+global g_vcv_pver_len ulong 1
+global g_vcv_ev_off ulong 1
+global g_vcv_nexp ulong 1
+global g_vcv_exp_off ulong 256
+global g_vcv_exp_len ulong 256
+global g_vcv_ncap ulong 1
+global g_vcv_cap_off ulong 256
+global g_vcv_cap_len ulong 256
+
+note Live store state (sorted ascending by semantic_id)
+global g_vcs_cnt ulong 1
+global g_vcs_sid uchar 4096
+global g_vcs_vcid uchar 4096
+global g_vcs_kind uchar 128
+global g_vcs_boff ulong 128
+global g_vcs_blen ulong 128
+global g_vcs_pool uchar 524288
+global g_vcs_pused ulong 1
+
+note Name index (sorted ascending by name)
+global g_vcs_ncnt ulong 1
+global g_vcs_nstr uchar 16384
+global g_vcs_nlen ulong 128
+global g_vcs_nid uchar 4096
+
+note Walk / closure scratch
+global g_vcs_wstate uchar 128
+global g_vcs_ws_idx ulong 128
+global g_vcs_ws_ndep ulong 128
+global g_vcs_ws_next ulong 128
+global g_vcs_ws_doff ulong 128
+global g_vcs_out_ids uchar 4096
+global g_vcs_out_n ulong 1
+
+note Save / load I/O buffer & staging
+global g_vcs_io uchar 1048576
+global g_vcs_iolen ulong 1
+global g_vcs_pathbuf uchar 1024
+global g_vcs_rnpkt uchar 2100
+global g_vcs_tmp32 uchar 32
+global g_vcs_tmp32b uchar 32
+global g_vcs_tmp_sid uchar 32
+global g_vcs_tmp_cid uchar 32
+global g_vcs_tmp_name uchar 128
+global g_vcs_cur_idx ulong 1
+
+note ---- helpers ----
+
+fn vcs_is_zero_dec off ulong to bool
+  acc = ulong 0
+  for i ulong 32
+    acc = or acc ulong get g_vcs_decbuf add off i
+  end
+  ret eq acc 0
+end
+
+fn vcs_cmp32_dec a_off ulong b_off ulong to long
+  for i ulong 32
+    a = ulong get g_vcs_decbuf add a_off i
+    b = ulong get g_vcs_decbuf add b_off i
+    if lt a b
+      ret neg long 1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn vcs_cmp_str_dec a_off ulong a_len ulong b_off ulong b_len ulong to long
+  m = a_len
+  if lt b_len m
+    m = b_len
+  end
+  for i ulong m bound 256
+    a = ulong get g_vcs_decbuf add a_off i
+    b = ulong get g_vcs_decbuf add b_off i
+    if lt a b
+      ret neg long 1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  if lt a_len b_len
+    ret neg long 1
+  end
+  if gt a_len b_len
+    ret 1
+  end
+  ret 0
+end
+
+fn vcs_cfail code ulong to void
+  if eq get g_vcs_derr 0 0
+    put g_vcs_derr 0 code
+  end
+end
+
+fn vcs_need k ulong to bool
+  if ne get g_vcs_derr 0 0
+    ret false
+  end
+  n = get g_vcs_declen 0
+  p = get g_vcs_dpos 0
+  if lt sub n p k
+    vcs_cfail VCS_TRUNCATED
+    ret false
+  end
+  ret true
+end
+
+fn vcs_rd32 to ulong
+  if not vcs_need 4
+    ret 0
+  end
+  p = get g_vcs_dpos 0
+  b0 = ulong get g_vcs_decbuf p
+  b1 = ulong get g_vcs_decbuf add p 1
+  b2 = ulong get g_vcs_decbuf add p 2
+  b3 = ulong get g_vcs_decbuf add p 3
+  put g_vcs_dpos 0 add p 4
+  r = or shl b0 24 shl b1 16
+  r = or r shl b2 8
+  ret or r b3
+end
+
+fn vcs_rd64 to ulong
+  hi = vcs_rd32
+  lo = vcs_rd32
+  ret or shl hi 32 lo
+end
+
+fn vcs_rd_id to ulong
+  if not vcs_need 32
+    ret 0
+  end
+  p = get g_vcs_dpos 0
+  put g_vcs_dpos 0 add p 32
+  ret p
+end
+
+fn vcs_rd_count to ulong
+  n = vcs_rd32
+  if and eq get g_vcs_derr 0 0 gt n 256
+    vcs_cfail VCS_TOO_MANY_ENTRIES
+    ret 0
+  end
+  ret n
+end
+
+fn vcs_rd_str_check to ulong
+  slen = vcs_rd64
+  if ne get g_vcs_derr 0 0
+    ret 0
+  end
+  if or eq slen 0 gt slen 256
+    vcs_cfail VCS_BAD_STRING
+    ret 0
+  end
+  if not vcs_need slen
+    ret 0
+  end
+  p = get g_vcs_dpos 0
+  for i ulong slen bound 256
+    ch = ulong get g_vcs_decbuf add p i
+    if or lt ch 33 gt ch 126
+      vcs_cfail VCS_BAD_STRING
+      ret 0
+    end
+  end
+  put g_vcs_dpos 0 add p slen
+  ret slen
+end
+
+fn vcs_dec_reals to void
+  nr = vcs_rd_count
+  put g_vcv_nreal 0 nr
+  put g_vcv_real_off 0 get g_vcs_dpos 0
+  prev = ulong 0
+  has_prev = ulong 0
+  for i ulong nr bound 256
+    if eq get g_vcs_derr 0 0
+      id_off = vcs_rd_id
+      if and eq get g_vcs_derr 0 0 ne has_prev 0
+        if ge vcs_cmp32_dec prev id_off 0
+          vcs_cfail VCS_NONCANONICAL_SET
+        end
+      end
+      prev = id_off
+      has_prev = 1
+    end
+  end
+end
+
+fn vcs_dec_deps to void
+  nd = vcs_rd_count
+  put g_vcv_ndep 0 nd
+  put g_vcv_dep_off 0 get g_vcs_dpos 0
+  prev = ulong 0
+  has_prev = ulong 0
+  sid_self = get g_vcv_sid_off 0
+  for i ulong nd bound 256
+    if eq get g_vcs_derr 0 0
+      dsid = vcs_rd_id
+      dreq = vcs_rd_id
+      if eq get g_vcs_derr 0 0
+        if eq vcs_cmp32_dec dsid sid_self 0
+          vcs_cfail VCS_DEPENDENCY_CYCLE
+        else
+          if or vcs_is_zero_dec dsid vcs_is_zero_dec dreq
+            vcs_cfail VCS_ZERO_ID
+          else
+            if ne has_prev 0
+              c = vcs_cmp32_dec prev dsid
+              if eq c 0
+                vcs_cfail VCS_DUPLICATE_DEPENDENCY
+              else
+                if gt c 0
+                  vcs_cfail VCS_UNSORTED_DEPENDENCIES
+                end
+              end
+            end
+          end
+        end
+        prev = dsid
+        has_prev = 1
+      end
+    end
+  end
+end
+
+fn vcs_dec_exports to void
+  ne_cnt = vcs_rd_count
+  put g_vcv_nexp 0 ne_cnt
+  for i ulong ne_cnt bound 256
+    if eq get g_vcs_derr 0 0
+      off = add get g_vcs_dpos 0 8
+      slen = vcs_rd_str_check
+      put g_vcv_exp_off i off
+      put g_vcv_exp_len i slen
+      if and eq get g_vcs_derr 0 0 gt i 0
+        po = get g_vcv_exp_off sub i 1
+        pl = get g_vcv_exp_len sub i 1
+        if ge vcs_cmp_str_dec po pl off slen 0
+          vcs_cfail VCS_NONCANONICAL_SET
+        end
+      end
+    end
+  end
+end
+
+fn vcs_dec_caps to void
+  nc_cnt = vcs_rd_count
+  put g_vcv_ncap 0 nc_cnt
+  for i ulong nc_cnt bound 256
+    if eq get g_vcs_derr 0 0
+      off = add get g_vcs_dpos 0 8
+      slen = vcs_rd_str_check
+      put g_vcv_cap_off i off
+      put g_vcv_cap_len i slen
+      if and eq get g_vcs_derr 0 0 gt i 0
+        po = get g_vcv_cap_off sub i 1
+        pl = get g_vcv_cap_len sub i 1
+        if ge vcs_cmp_str_dec po pl off slen 0
+          vcs_cfail VCS_NONCANONICAL_SET
+        end
+      end
+    end
+  end
+end
+
+note Decode bytes currently loaded in g_vcs_decbuf[0..n)
+fn vcs_decode_loaded n ulong to ulong
+  put g_vcs_declen 0 n
+  put g_vcs_dpos 0 0
+  put g_vcs_derr 0 0
+  if not vcs_need 22
+    ret get g_vcs_derr 0
+  end
+  for i ulong 22
+    if ne get g_vcs_decbuf i get vcs_tag i
+      ret VCS_BAD_DOMAIN_TAG
+    end
+  end
+  put g_vcs_dpos 0 22
+  ver = vcs_rd32
+  put g_vcv_ver 0 ver
+  if and eq get g_vcs_derr 0 0 ne ver 1
+    vcs_cfail VCS_UNKNOWN_FORMAT_VERSION
+  end
+  put g_vcv_sid_off 0 vcs_rd_id
+  put g_vcv_cid_off 0 vcs_rd_id
+  if vcs_need 1
+    p = get g_vcs_dpos 0
+    dk = ulong get g_vcs_decbuf p
+    put g_vcs_dpos 0 add p 1
+    put g_vcv_dkind 0 dk
+    if and ne dk 1 ne dk 2
+      vcs_cfail VCS_BAD_DIGEST_KIND
+    end
+  end
+  put g_vcv_sdig_off 0 vcs_rd_id
+  if eq get g_vcs_derr 0 0
+    if or vcs_is_zero_dec get g_vcv_sid_off 0 or vcs_is_zero_dec get g_vcv_cid_off 0 vcs_is_zero_dec get g_vcv_sdig_off 0
+      vcs_cfail VCS_ZERO_ID
+    end
+  end
+  vcs_dec_reals
+  vcs_dec_deps
+  put g_vcv_rcpt_off 0 vcs_rd_id
+  if and eq get g_vcs_derr 0 0 vcs_is_zero_dec get g_vcv_rcpt_off 0
+    vcs_cfail VCS_MISSING_RECEIPT
+  end
+  poff = add get g_vcs_dpos 0 8
+  plen = vcs_rd_str_check
+  put g_vcv_prof_off 0 poff
+  put g_vcv_prof_len 0 plen
+  voff = add get g_vcs_dpos 0 8
+  vlen = vcs_rd_str_check
+  put g_vcv_pver_off 0 voff
+  put g_vcv_pver_len 0 vlen
+  put g_vcv_ev_off 0 vcs_rd_id
+  if and eq get g_vcs_derr 0 0 vcs_is_zero_dec get g_vcv_ev_off 0
+    vcs_cfail VCS_ZERO_ID
+  end
+  vcs_dec_exports
+  vcs_dec_caps
+  if and eq get g_vcs_derr 0 0 ne get g_vcs_dpos 0 n
+    vcs_cfail VCS_TRAILING_BYTES
+  end
+  ret get g_vcs_derr 0
+end
+
+fn omega_vc_decode bytes view uchar * n ulong to ulong
+  if gt n 65536
+    ret VCS_MALFORMED
+  end
+  for i ulong n bound 65536
+    put g_vcs_decbuf i get bytes i
+  end
+  ret vcs_decode_loaded n
+end
+
+fn omega_vc_compute_id bytes view uchar * n ulong out_id edit uchar 32 to void
+  for i ulong n bound 65536
+    put sh_dat i get bytes i
+  end
+  sh_all n
+  for i ulong 32
+    put out_id i get sh_dig i
+  end
+end
+
+fn vcs_hash_decbuf n ulong to void
+  for i ulong n bound 65536
+    put sh_dat i get g_vcs_decbuf i
+  end
+  sh_all n
+end
+
+note ---- store lifecycle & lookup ----
+
+fn omega_vcstore_init to ulong
+  put g_vcs_cnt 0 0
+  put g_vcs_pused 0 0
+  put g_vcs_ncnt 0 0
+  ret VCS_OK
+end
+
+fn omega_vcstore_destroy to void
+  put g_vcs_cnt 0 0
+  put g_vcs_pused 0 0
+  put g_vcs_ncnt 0 0
+end
+
+fn omega_vcstore_count to ulong
+  ret get g_vcs_cnt 0
+end
+
+fn vcs_cmp_sid_slot idx ulong id_buf view uchar 32 to long
+  base = mul idx 32
+  for i ulong 32
+    a = ulong get g_vcs_sid add base i
+    b = ulong get id_buf i
+    if lt a b
+      ret neg long 1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn vcs_cmp_sid_tmp idx ulong to long
+  base = mul idx 32
+  for i ulong 32
+    a = ulong get g_vcs_sid add base i
+    b = ulong get g_vcs_tmp_sid i
+    if lt a b
+      ret neg long 1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  ret 0
+end
+
+note Binary search in g_vcs_sid for g_vcs_tmp_sid; returns index if found, else 999999 and sets g_vcs_cur_idx to insert pos
+fn vcs_find_tmp to ulong
+  lo = ulong 0
+  hi = get g_vcs_cnt 0
+  while lt lo hi bound 128
+    mid = add lo shr sub hi lo 1
+    c = vcs_cmp_sid_tmp mid
+    if eq c 0
+      put g_vcs_cur_idx 0 mid
+      ret mid
+    end
+    if lt c 0
+      lo = add mid 1
+    else
+      hi = mid
+    end
+  end
+  put g_vcs_cur_idx 0 lo
+  ret 999999
+end
+
+note Fetch object idx into g_vcs_decbuf and re-verify VC id, decode, and key
+fn vcs_fetch_idx idx ulong to ulong
+  boff = get g_vcs_boff idx
+  blen = get g_vcs_blen idx
+  for i ulong blen bound 65536
+    put g_vcs_decbuf i get g_vcs_pool add boff i
+  end
+  vcs_hash_decbuf blen
+  vbase = mul idx 32
+  for i ulong 32
+    if ne get sh_dig i get g_vcs_vcid add vbase i
+      ret VCS_ID_MISMATCH
+    end
+  end
+  rc = vcs_decode_loaded blen
+  if ne rc 0
+    ret rc
+  end
+  soff = get g_vcv_sid_off 0
+  sbase = mul idx 32
+  for i ulong 32
+    if ne get g_vcs_decbuf add soff i get g_vcs_sid add sbase i
+      ret VCS_ID_MISMATCH
+    end
+  end
+  ret VCS_OK
+end
+
+note VC-GENESIS-1 count is 0 (empty audited set): always returns false
+fn vcs_genesis_contains to bool
+  ret false
+end
+
+fn vcs_check_deps_in_decbuf to ulong
+  nd = get g_vcv_ndep 0
+  doff = get g_vcv_dep_off 0
+  for i ulong nd bound 256
+    base = add doff mul i 64
+    for j ulong 32
+      put g_vcs_tmp_sid j get g_vcs_decbuf add base j
+      put g_vcs_tmp_cid j get g_vcs_decbuf add add base 32 j
+    end
+    di = vcs_find_tmp
+    if eq di 999999
+      ret VCS_UNVERIFIED_DEPENDENCY
+    end
+    note Save current decbuf? Caller already saved sid/id; we only need to check contract of di
+    rc = vcs_fetch_idx di
+    if ne rc 0
+      ret rc
+    end
+    coff = get g_vcv_cid_off 0
+    for j ulong 32
+      if ne get g_vcs_decbuf add coff j get g_vcs_tmp_cid j
+        ret VCS_UNVERIFIED_DEPENDENCY
+      end
+    end
+    note Restore parent bytes from g_vcs_io[0..iolen) after checking dep
+    plen = get g_vcs_iolen 0
+    for j ulong plen bound 65536
+      put g_vcs_decbuf j get g_vcs_io j
+    end
+    rc2 = vcs_decode_loaded plen
+    if ne rc2 0
+      ret rc2
+    end
+  end
+  ret VCS_OK
+end
+
+fn vcs_shift_objs_up pos ulong to void
+  cnt = get g_vcs_cnt 0
+  if ge pos cnt
+    ret
+  end
+  k = cnt
+  while gt k pos bound 128
+    src = sub k 1
+    put g_vcs_kind k get g_vcs_kind src
+    put g_vcs_boff k get g_vcs_boff src
+    put g_vcs_blen k get g_vcs_blen src
+    db = mul k 32
+    sb = mul src 32
+    for j ulong 32
+      put g_vcs_sid add db j get g_vcs_sid add sb j
+      put g_vcs_vcid add db j get g_vcs_vcid add sb j
+    end
+    k = src
+  end
+end
+
+fn vcs_same_stored found ulong n ulong kind ulong to bool
+  if ne get g_vcs_blen found n
+    ret false
+  end
+  if ne ulong get g_vcs_kind found kind
+    ret false
+  end
+  boff = get g_vcs_boff found
+  for i ulong n bound 65536
+    if ne get g_vcs_pool add boff i get g_vcs_io i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn vcs_commit_insert n ulong kind ulong to ulong
+  cnt = get g_vcs_cnt 0
+  pused = get g_vcs_pused 0
+  if or ge cnt VCS_MAX_OBJS gt add pused n VCS_MAX_BLOB
+    ret VCS_NOMEM
+  end
+  for i ulong 32
+    put g_vcs_tmp_sid i get g_vcs_tmp32b i
+  end
+  ign_f = vcs_find_tmp
+  pos = get g_vcs_cur_idx 0
+  vcs_shift_objs_up pos
+  for i ulong n bound 65536
+    put g_vcs_pool add pused i get g_vcs_io i
+  end
+  put g_vcs_boff pos pused
+  put g_vcs_blen pos n
+  put g_vcs_pused 0 add pused n
+  put g_vcs_kind pos uchar kind
+  sbase = mul pos 32
+  for i ulong 32
+    put g_vcs_sid add sbase i get g_vcs_tmp32b i
+    put g_vcs_vcid add sbase i get g_vcs_tmp32 i
+  end
+  put g_vcs_cnt 0 add cnt 1
+  ret VCS_OK
+end
+
+fn vcs_insert_common canon view uchar * n ulong claimed view uchar 32 kind ulong to ulong
+  if or eq n 0 gt n 65536
+    ret VCS_MALFORMED
+  end
+  for i ulong n bound 65536
+    put g_vcs_decbuf i get canon i
+    put g_vcs_io i get canon i
+  end
+  put g_vcs_iolen 0 n
+  rc = vcs_decode_loaded n
+  if ne rc 0
+    ret rc
+  end
+  vcs_hash_decbuf n
+  for i ulong 32
+    put g_vcs_tmp32 i get sh_dig i
+    if ne get sh_dig i get claimed i
+      ret VCS_ID_MISMATCH
+    end
+  end
+  soff = get g_vcv_sid_off 0
+  for i ulong 32
+    put g_vcs_tmp_sid i get g_vcs_decbuf add soff i
+    put g_vcs_tmp32b i get g_vcs_decbuf add soff i
+  end
+  if and eq kind VCS_ADMISSION_BOOTSTRAP not vcs_genesis_contains
+    ret VCS_GENESIS_NOT_LISTED
+  end
+  found = vcs_find_tmp
+  if ne found 999999
+    if vcs_same_stored found n kind
+      ret VCS_OK
+    end
+    ret VCS_IMMUTABLE_CONFLICT
+  end
+  rc = vcs_check_deps_in_decbuf
+  if ne rc 0
+    ret rc
+  end
+  ret vcs_commit_insert n kind
+end
+
+fn omega_vcstore_insert canon view uchar * n ulong claimed view uchar 32 to ulong
+  ret vcs_insert_common canon n claimed VCS_ADMISSION_VERIFIED
+end
+
+fn omega_vcstore_insert_bootstrap canon view uchar * n ulong claimed view uchar 32 to ulong
+  ret vcs_insert_common canon n claimed VCS_ADMISSION_BOOTSTRAP
+end
+
+fn omega_vcstore_get sid view uchar 32 to ulong
+  for i ulong 32
+    put g_vcs_tmp_sid i get sid i
+  end
+  idx = vcs_find_tmp
+  if eq idx 999999
+    ret VCS_UNVERIFIED_DEPENDENCY
+  end
+  ret vcs_fetch_idx idx
+end
+
+fn omega_vcstore_receipt_of sid view uchar 32 out_rcpt edit uchar 32 to ulong
+  rc = omega_vcstore_get sid
+  if ne rc 0
+    ret rc
+  end
+  roff = get g_vcv_rcpt_off 0
+  for i ulong 32
+    put out_rcpt i get g_vcs_decbuf add roff i
+  end
+  ret VCS_OK
+end
+
+fn omega_vcstore_admission_kind sid view uchar 32 to long
+  for i ulong 32
+    put g_vcs_tmp_sid i get sid i
+  end
+  idx = vcs_find_tmp
+  if eq idx 999999
+    ret neg long VCS_UNVERIFIED_DEPENDENCY
+  end
+  rc = vcs_fetch_idx idx
+  if ne rc 0
+    ret neg long rc
+  end
+  ret long get g_vcs_kind idx
+end
+
+note ---- dependency walk & closure ----
+
+fn vcs_walk_push_dep top ulong nx ulong sp ulong to long
+  base = add get g_vcs_ws_doff top mul nx 64
+  put g_vcs_ws_next top add nx 1
+  for j ulong 32
+    put g_vcs_tmp_sid j get g_vcs_pool add base j
+    put g_vcs_tmp_cid j get g_vcs_pool add add base 32 j
+  end
+  di = vcs_find_tmp
+  if eq di 999999
+    ret neg long VCS_UNVERIFIED_DEPENDENCY
+  end
+  rc2 = vcs_fetch_idx di
+  if ne rc2 0
+    ret neg long rc2
+  end
+  coff = get g_vcv_cid_off 0
+  for j ulong 32
+    if ne get g_vcs_decbuf add coff j get g_vcs_tmp_cid j
+      ret neg long VCS_UNVERIFIED_DEPENDENCY
+    end
+  end
+  st = ulong get g_vcs_wstate di
+  if eq st 1
+    ret neg long VCS_DEPENDENCY_CYCLE
+  end
+  if eq st 0
+    put g_vcs_wstate di 1
+    put g_vcs_ws_idx sp di
+    put g_vcs_ws_ndep sp get g_vcv_ndep 0
+    put g_vcs_ws_next sp 0
+    put g_vcs_ws_doff sp add get g_vcs_boff di get g_vcv_dep_off 0
+    ret long add sp 1
+  end
+  ret long sp
+end
+
+fn vcs_walk_emit fidx ulong cap ulong to void
+  put g_vcs_wstate fidx 2
+  em = get g_vcs_out_n 0
+  if lt em cap
+    db = mul em 32
+    sb = mul fidx 32
+    for j ulong 32
+      put g_vcs_out_ids add db j get g_vcs_sid add sb j
+    end
+  end
+  put g_vcs_out_n 0 add em 1
+end
+
+fn vcs_walk_from root ulong cap ulong to ulong
+  if eq get g_vcs_wstate root 2
+    ret VCS_OK
+  end
+  rc = vcs_fetch_idx root
+  if ne rc 0
+    ret rc
+  end
+  sp = ulong 1
+  put g_vcs_wstate root 1
+  put g_vcs_ws_idx 0 root
+  put g_vcs_ws_ndep 0 get g_vcv_ndep 0
+  put g_vcs_ws_next 0 0
+  put g_vcs_ws_doff 0 add get g_vcs_boff root get g_vcv_dep_off 0
+  while gt sp 0 bound 4096
+    top = sub sp 1
+    nx = get g_vcs_ws_next top
+    nd = get g_vcs_ws_ndep top
+    if lt nx nd
+      nsp = vcs_walk_push_dep top nx sp
+      if lt nsp 0
+        ret ulong neg nsp
+      end
+      sp = ulong nsp
+    else
+      vcs_walk_emit get g_vcs_ws_idx top cap
+      sp = top
+    end
+  end
+  ret VCS_OK
+end
+
+fn omega_vcstore_closure sid view uchar 32 cap ulong to ulong
+  put g_vcs_out_n 0 0
+  for i ulong 32
+    put g_vcs_tmp_sid i get sid i
+  end
+  root = vcs_find_tmp
+  if eq root 999999
+    ret VCS_UNVERIFIED_DEPENDENCY
+  end
+  cnt = get g_vcs_cnt 0
+  for i ulong cnt bound 128
+    put g_vcs_wstate i 0
+  end
+  rc = vcs_walk_from root cap
+  if ne rc 0
+    put g_vcs_out_n 0 0
+    ret rc
+  end
+  if gt get g_vcs_out_n 0 cap
+    ret VCS_CAPACITY
+  end
+  ret VCS_OK
+end
+
+fn vcs_graph_check to ulong
+  cnt = get g_vcs_cnt 0
+  if eq cnt 0
+    ret VCS_OK
+  end
+  for i ulong cnt bound 128
+    put g_vcs_wstate i 0
+  end
+  put g_vcs_out_n 0 0
+  for i ulong cnt bound 128
+    rc = vcs_walk_from i 0
+    if ne rc 0
+      ret rc
+    end
+  end
+  ret VCS_OK
+end
+
+note ---- digests ----
+
+fn vcs_sh_u64be pos ulong v ulong to ulong
+  for i ulong 8
+    sh = mul sub 7 i 8
+    put sh_dat add pos i uchar and shr v sh 255
+  end
+  ret add pos 8
+end
+
+fn omega_vcstore_digest out_dig edit uchar 32 to ulong
+  p = ulong 0
+  for i ulong 4
+    put sh_dat p get vcs_dmagic i
+    p = add p 1
+  end
+  cnt = get g_vcs_cnt 0
+  p = vcs_sh_u64be p cnt
+  for i ulong cnt bound 128
+    sb = mul i 32
+    for j ulong 32
+      put sh_dat p get g_vcs_sid add sb j
+      p = add p 1
+    end
+    put sh_dat p get g_vcs_kind i
+    p = add p 1
+    blen = get g_vcs_blen i
+    boff = get g_vcs_boff i
+    p = vcs_sh_u64be p blen
+    for j ulong blen bound 65536
+      put sh_dat p get g_vcs_pool add boff j
+      p = add p 1
+    end
+  end
+  sh_all p
+  for i ulong 32
+    put out_dig i get sh_dig i
+  end
+  ret VCS_OK
+end
+
+fn omega_vcstore_name_index_digest out_dig edit uchar 32 to ulong
+  p = ulong 0
+  for i ulong 4
+    put sh_dat p get vcs_nmagic i
+    p = add p 1
+  end
+  nc = get g_vcs_ncnt 0
+  p = vcs_sh_u64be p nc
+  for i ulong nc bound 128
+    nl = get g_vcs_nlen i
+    nb = mul i 128
+    ib = mul i 32
+    p = vcs_sh_u64be p nl
+    for j ulong nl bound 128
+      put sh_dat p get g_vcs_nstr add nb j
+      p = add p 1
+    end
+    for j ulong 32
+      put sh_dat p get g_vcs_nid add ib j
+      p = add p 1
+    end
+  end
+  sh_all p
+  for i ulong 32
+    put out_dig i get sh_dig i
+  end
+  ret VCS_OK
+end
+
+note ---- name index ----
+
+fn vcs_name_valid nm view uchar * n ulong to bool
+  if or eq n 0 gt n 128
+    ret false
+  end
+  for i ulong n bound 128
+    ch = ulong get nm i
+    alpha = false
+    if and ge ch 65 le ch 90
+      alpha = true
+    end
+    if and ge ch 97 le ch 122
+      alpha = true
+    end
+    if eq ch 95
+      alpha = true
+    end
+    if eq i 0
+      if not alpha
+        ret false
+      end
+    else
+      rest = alpha
+      if and ge ch 48 le ch 57
+        rest = true
+      end
+      if or eq ch 46 eq ch 45
+        rest = true
+      end
+      if not rest
+        ret false
+      end
+    end
+  end
+  ret true
+end
+
+fn vcs_cmp_name_slot idx ulong nm view uchar * n ulong to long
+  sl = get g_vcs_nlen idx
+  sb = mul idx 128
+  m = sl
+  if lt n m
+    m = n
+  end
+  for i ulong m bound 128
+    a = ulong get g_vcs_nstr add sb i
+    b = ulong get nm i
+    if lt a b
+      ret neg long 1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  if lt sl n
+    ret neg long 1
+  end
+  if gt sl n
+    ret 1
+  end
+  ret 0
+end
+
+fn vcs_name_find nm view uchar * n ulong to ulong
+  lo = ulong 0
+  hi = get g_vcs_ncnt 0
+  while lt lo hi bound 128
+    mid = add lo shr sub hi lo 1
+    c = vcs_cmp_name_slot mid nm n
+    if eq c 0
+      put g_vcs_cur_idx 0 mid
+      ret mid
+    end
+    if lt c 0
+      lo = add mid 1
+    else
+      hi = mid
+    end
+  end
+  put g_vcs_cur_idx 0 lo
+  ret 999999
+end
+
+fn vcs_name_shift_up pos ulong to void
+  k = get g_vcs_ncnt 0
+  while gt k pos bound 128
+    src = sub k 1
+    put g_vcs_nlen k get g_vcs_nlen src
+    dn = mul k 128
+    sn = mul src 128
+    for j ulong 128
+      put g_vcs_nstr add dn j get g_vcs_nstr add sn j
+    end
+    di = mul k 32
+    si = mul src 32
+    for j ulong 32
+      put g_vcs_nid add di j get g_vcs_nid add si j
+    end
+    k = src
+  end
+end
+
+fn vcs_name_insert_at pos ulong nm view uchar * n ulong id view uchar 32 to ulong
+  nc = get g_vcs_ncnt 0
+  if ge nc VCS_MAX_NAMES
+    ret VCS_NOMEM
+  end
+  vcs_name_shift_up pos
+  put g_vcs_nlen pos n
+  dn = mul pos 128
+  for j ulong n bound 128
+    put g_vcs_nstr add dn j get nm j
+  end
+  di = mul pos 32
+  for j ulong 32
+    put g_vcs_nid add di j get id j
+  end
+  put g_vcs_ncnt 0 add nc 1
+  ret VCS_OK
+end
+
+fn omega_vcstore_name_bind nm view uchar * n ulong id view uchar 32 to ulong
+  if not vcs_name_valid nm n
+    ret VCS_MALFORMED
+  end
+  for i ulong 32
+    put g_vcs_tmp_sid i get id i
+  end
+  if eq vcs_find_tmp 999999
+    ret VCS_UNVERIFIED_DEPENDENCY
+  end
+  np = vcs_name_find nm n
+  if ne np 999999
+    ib = mul np 32
+    same = ulong 1
+    for i ulong 32
+      if ne get g_vcs_nid add ib i get id i
+        same = 0
+      end
+    end
+    if eq same 1
+      ret VCS_OK
+    end
+    ret VCS_NAME_EXISTS
+  end
+  ret vcs_name_insert_at get g_vcs_cur_idx 0 nm n id
+end
+
+fn omega_vcstore_name_rebind nm view uchar * n ulong id view uchar 32 to ulong
+  for i ulong 32
+    put g_vcs_tmp_sid i get id i
+  end
+  if eq vcs_find_tmp 999999
+    ret VCS_UNVERIFIED_DEPENDENCY
+  end
+  np = vcs_name_find nm n
+  if eq np 999999
+    ret VCS_NOT_FOUND
+  end
+  ib = mul np 32
+  for i ulong 32
+    put g_vcs_nid add ib i get id i
+  end
+  ret VCS_OK
+end
+
+fn omega_vcstore_resolve_name nm view uchar * n ulong out_id edit uchar 32 to ulong
+  np = vcs_name_find nm n
+  if eq np 999999
+    ret VCS_NOT_FOUND
+  end
+  ib = mul np 32
+  for i ulong 32
+    put out_id i get g_vcs_nid add ib i
+  end
+  ret VCS_OK
+end
+
+note ---- persistence (save / load) ----
+
+fn vcs_io_u64be pos ulong v ulong to ulong
+  for i ulong 8
+    sh = mul sub 7 i 8
+    put g_vcs_io add pos i uchar and shr v sh 255
+  end
+  ret add pos 8
+end
+
+fn vcs_io_rd64 pos ulong to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or shl v 8 ulong get g_vcs_io add pos i
+  end
+  ret v
+end
+
+fn vcs_save_digests p_in ulong to ulong
+  d1 = new uchar 32 0
+  p = p_in
+  ign = omega_vcstore_digest d1
+  for i ulong 32
+    put g_vcs_io p get d1 i
+    p = add p 1
+  end
+  ign = omega_vcstore_name_index_digest d1
+  for i ulong 32
+    put g_vcs_io p get d1 i
+    p = add p 1
+  end
+  put g_vcs_iolen 0 p
+  ret VCS_OK
+end
+
+fn vcs_save_names_and_digests p_in ulong to ulong
+  p = p_in
+  nc = get g_vcs_ncnt 0
+  p = vcs_io_u64be p nc
+  for i ulong nc bound 128
+    nl = get g_vcs_nlen i
+    nb = mul i 128
+    p = vcs_io_u64be p nl
+    for j ulong nl bound 128
+      put g_vcs_io p get g_vcs_nstr add nb j
+      p = add p 1
+    end
+    ib = mul i 32
+    for j ulong 32
+      put g_vcs_io p get g_vcs_nid add ib j
+      p = add p 1
+    end
+  end
+  ret vcs_save_digests p
+end
+
+fn vcs_build_save_bytes to ulong
+  cnt = get g_vcs_cnt 0
+  for i ulong cnt bound 128
+    rc = vcs_fetch_idx i
+    if ne rc 0
+      ret rc
+    end
+  end
+  p = ulong 0
+  for i ulong 15
+    put g_vcs_io p get vcs_fmagic i
+    p = add p 1
+  end
+  p = vcs_io_u64be p cnt
+  for i ulong cnt bound 128
+    put g_vcs_io p get g_vcs_kind i
+    p = add p 1
+    blen = get g_vcs_blen i
+    boff = get g_vcs_boff i
+    p = vcs_io_u64be p blen
+    for j ulong blen bound 65536
+      put g_vcs_io p get g_vcs_pool add boff j
+      p = add p 1
+    end
+  end
+  ret vcs_save_names_and_digests p
+end
+
+fn vcs_rename_tmp path view uchar * plen ulong tlen ulong to ulong
+  put g_vcs_rnpkt 0 2
+  put g_vcs_rnpkt 1 0
+  put g_vcs_rnpkt 2 uchar and tlen 255
+  put g_vcs_rnpkt 3 uchar and shr tlen 8 255
+  rp = ulong 4
+  for i ulong tlen bound 1004
+    put g_vcs_rnpkt rp get g_vcs_pathbuf i
+    rp = add rp 1
+  end
+  put g_vcs_rnpkt rp uchar and plen 255
+  put g_vcs_rnpkt add rp 1 uchar and shr plen 8 255
+  rp = add rp 2
+  for i ulong plen bound 1000
+    put g_vcs_rnpkt rp get path i
+    rp = add rp 1
+  end
+  rr = renames g_vcs_rnpkt 0 rp 0
+  if ne rr 0
+    ign_u2 = unlink g_vcs_pathbuf 0 tlen
+    ret VCS_IO
+  end
+  ret VCS_OK
+end
+
+fn omega_vcstore_save path view uchar * plen ulong to ulong
+  if or eq plen 0 gt plen 1000
+    ret VCS_MALFORMED
+  end
+  rc = vcs_build_save_bytes
+  if ne rc 0
+    ret rc
+  end
+  for i ulong plen bound 1000
+    put g_vcs_pathbuf i get path i
+  end
+  for i ulong 4
+    put g_vcs_pathbuf add plen i get vcs_tmp_suf i
+  end
+  tlen = add plen 4
+  note O_WRONLY(1)|O_CREAT(64)|O_TRUNC(512)=577, mode 0644=420
+  fd = fopen g_vcs_pathbuf 0 tlen 577 420
+  if lt fd 0
+    ret VCS_IO
+  end
+  tot = get g_vcs_iolen 0
+  wr = write int fd g_vcs_io 0 tot
+  sr = fsync int fd
+  cr = fclose int fd
+  if or ne wr long tot or ne sr 0 ne cr 0
+    ign_u = unlink g_vcs_pathbuf 0 tlen
+    ret VCS_IO
+  end
+  ret vcs_rename_tmp path plen tlen
+end
+
+fn vcs_parse_io_verify_tail pos ulong to ulong
+  d = new uchar 32 0
+  rcg = vcs_graph_check
+  if ne rcg 0
+    ret rcg
+  end
+  ign = omega_vcstore_digest d
+  for i ulong 32
+    if ne get d i get g_vcs_io add pos i
+      ret VCS_ID_MISMATCH
+    end
+  end
+  ign = omega_vcstore_name_index_digest d
+  for i ulong 32
+    if ne get d i get g_vcs_io add add pos 32 i
+      ret VCS_ID_MISMATCH
+    end
+  end
+  ret VCS_OK
+end
+
+fn vcs_parse_one_name pos ulong nl ulong to ulong
+  nm = new uchar 128 0
+  nid = new uchar 32 0
+  for j ulong nl bound 128
+    put nm j get g_vcs_io add pos j
+  end
+  id_pos = add pos nl
+  for j ulong 32
+    put nid j get g_vcs_io add id_pos j
+    put g_vcs_tmp_sid j get nid j
+  end
+  if not vcs_name_valid nm nl
+    ret VCS_MALFORMED
+  end
+  if eq vcs_find_tmp 999999
+    ret VCS_UNVERIFIED_DEPENDENCY
+  end
+  cur_n = get g_vcs_ncnt 0
+  if gt cur_n 0
+    if ge vcs_cmp_name_slot sub cur_n 1 nm nl 0
+      ret VCS_MALFORMED
+    end
+  end
+  ret vcs_name_insert_at cur_n nm nl nid
+end
+
+fn vcs_parse_io_names pos_in ulong n ulong to ulong
+  pos = pos_in
+  if lt sub n pos 8
+    ret VCS_MALFORMED
+  end
+  nn = vcs_io_rd64 pos
+  pos = add pos 8
+  if or gt nn VCS_MAX_NAMES gt mul nn 41 sub n pos
+    ret VCS_MALFORMED
+  end
+  for i ulong nn bound 128
+    if lt sub n pos 8
+      ret VCS_MALFORMED
+    end
+    nl = vcs_io_rd64 pos
+    pos = add pos 8
+    if or eq nl 0 or gt nl 128 lt sub n pos add nl 32
+      ret VCS_MALFORMED
+    end
+    rcn = vcs_parse_one_name pos nl
+    if ne rcn 0
+      ret rcn
+    end
+    pos = add add pos nl 32
+  end
+  if ne sub n pos 64
+    ret VCS_MALFORMED
+  end
+  ret vcs_parse_io_verify_tail pos
+end
+
+fn vcs_parse_one_obj pos ulong olen ulong kind ulong to ulong
+  for j ulong olen bound 65536
+    put g_vcs_decbuf j get g_vcs_io add pos j
+  end
+  rc = vcs_decode_loaded olen
+  if ne rc 0
+    ret rc
+  end
+  if and eq kind VCS_ADMISSION_BOOTSTRAP not vcs_genesis_contains
+    ret VCS_GENESIS_NOT_LISTED
+  end
+  soff = get g_vcv_sid_off 0
+  for j ulong 32
+    put g_vcs_tmp_sid j get g_vcs_decbuf add soff j
+  end
+  cur = get g_vcs_cnt 0
+  if gt cur 0
+    if ge vcs_cmp_sid_tmp sub cur 1 0
+      ret VCS_MALFORMED
+    end
+  end
+  vcs_hash_decbuf olen
+  pused = get g_vcs_pused 0
+  if gt add pused olen VCS_MAX_BLOB
+    ret VCS_NOMEM
+  end
+  for j ulong olen bound 65536
+    put g_vcs_pool add pused j get g_vcs_decbuf j
+  end
+  put g_vcs_boff cur pused
+  put g_vcs_blen cur olen
+  put g_vcs_pused 0 add pused olen
+  put g_vcs_kind cur uchar kind
+  sb = mul cur 32
+  for j ulong 32
+    put g_vcs_sid add sb j get g_vcs_tmp_sid j
+    put g_vcs_vcid add sb j get sh_dig j
+  end
+  put g_vcs_cnt 0 add cur 1
+  ret VCS_OK
+end
+
+fn vcs_parse_io n ulong to ulong
+  if lt n 15
+    ret VCS_MALFORMED
+  end
+  for i ulong 15
+    if ne get g_vcs_io i get vcs_fmagic i
+      ret VCS_MALFORMED
+    end
+  end
+  pos = ulong 15
+  if lt sub n pos 8
+    ret VCS_MALFORMED
+  end
+  cnt = vcs_io_rd64 pos
+  pos = add pos 8
+  if or gt cnt VCS_MAX_OBJS gt mul cnt 9 sub n pos
+    ret VCS_MALFORMED
+  end
+  ign_i = omega_vcstore_init
+  for i ulong cnt bound 128
+    if lt sub n pos 9
+      ret VCS_MALFORMED
+    end
+    kind = ulong get g_vcs_io pos
+    pos = add pos 1
+    olen = vcs_io_rd64 pos
+    pos = add pos 8
+    if or gt olen 65536 gt olen sub n pos
+      ret VCS_MALFORMED
+    end
+    if and ne kind VCS_ADMISSION_VERIFIED ne kind VCS_ADMISSION_BOOTSTRAP
+      ret VCS_MALFORMED
+    end
+    rc = vcs_parse_one_obj pos olen kind
+    if ne rc 0
+      ret rc
+    end
+    pos = add pos olen
+  end
+  ret vcs_parse_io_names pos n
+end
+
+fn omega_vcstore_load path view uchar * plen ulong to ulong
+  if or eq plen 0 gt plen 1000
+    ret VCS_MALFORMED
+  end
+  fd = fopen path 0 plen 0 0
+  if lt fd 0
+    ret VCS_IO
+  end
+  tot = ulong 0
+  done = ulong 0
+  while eq done 0 bound 4096
+    left = sub VCS_MAX_FILE tot
+    if eq left 0
+      ign_c1 = fclose int fd
+      ret VCS_NOMEM
+    end
+    chunk = left
+    if gt chunk 65536
+      chunk = 65536
+    end
+    nr = read int fd g_vcs_io tot chunk
+    if lt nr 0
+      ign_c2 = fclose int fd
+      ret VCS_IO
+    end
+    if eq nr 0
+      done = 1
+    else
+      tot = add tot ulong nr
+    end
+  end
+  ign_c3 = fclose int fd
+  put g_vcs_iolen 0 tot
+  rc = vcs_parse_io tot
+  if ne rc 0
+    omega_vcstore_destroy
+    ret rc
+  end
+  ret VCS_OK
+end

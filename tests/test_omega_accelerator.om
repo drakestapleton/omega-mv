@@ -1,0 +1,176 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/test_omega_accelerator.om -- standalone pure OM-2 test for src/omega_accelerator.om
+note Verifies exact 64-byte EffectIntent, 192-byte EffectReceipt SHA-256 seal chain,
+note DMA window tracking, error codes (-1..-5), and machine graph binding.
+
+text t_pass "PASS test_omega_accelerator\n"
+global t_prov uchar 32
+global t_dma_int uchar 64
+global t_sub_int uchar 64
+global t_rcpt uchar 192
+global t_rcpt2 uchar 192
+global t_id_before uchar 32
+
+fn seal_receipt intent view uchar 64 actual ulong rcpt edit uchar 192 prev view uchar 32 to void
+  for i ulong 192
+    put rcpt i 0
+  end
+  ac_put_u16le rcpt 0 1
+  ac_put_u16le rcpt 2 192
+  ac_put_u32le rcpt 4 1
+  ac_put_u64le rcpt 16 ac_get_u64le intent 8
+  for i ulong 64
+    put sh_dat i get intent i
+  end
+  sh_all 64
+  for i ulong 32
+    put rcpt add 24 i get sh_dig i
+  end
+  ac_put_u64le rcpt 56 actual
+  for i ulong 32
+    put rcpt add 96 i get prev i
+  end
+  for i ulong 128
+    put sh_dat i get rcpt i
+  end
+  for i ulong 32
+    put sh_dat add 128 i get rcpt add 96 i
+  end
+  sh_all 160
+  for i ulong 32
+    put rcpt add 128 i get sh_dig i
+  end
+end
+
+fn main to int
+  prov = new uchar 32 0
+  for i ulong 32
+    put prov i uchar add i 1
+  end
+  omega_accel_cap_set_a 3 7 42 5 18
+  omega_accel_cap_set_b 4096 65536 3 1
+  if ne omega_accel_port_init prov 0
+    ret 1
+  end
+  dma_int = new uchar 64 0
+  sub_int = new uchar 64 0
+  rcpt = new uchar 192 0
+  note Out-of-bounds DMA intent must return -2; zero size returns -1
+  if ne omega_accel_port_build_dma_intent 4096 8192 0 7 dma_int neg long 1
+    ret 2
+  end
+  if ne omega_accel_port_build_dma_intent 2048 8192 4096 7 dma_int neg long 2
+    ret 3
+  end
+  if ne omega_accel_port_build_dma_intent 65536 8192 8192 7 dma_int neg long 2
+    ret 4
+  end
+  note Valid DMA intent
+  if ne omega_accel_port_build_dma_intent 8192 1048576 4096 7 dma_int 0
+    ret 5
+  end
+  if ne ac_get_u64le dma_int 8 1001
+    ret 6
+  end
+  if ne ac_get_u32le dma_int 32 5
+    ret 7
+  end
+  if ne ac_get_u32le dma_int 36 2
+    ret 8
+  end
+  if ne ac_get_u64le dma_int 56 1048576
+    ret 9
+  end
+
+  note Build valid receipt #1 and test error paths first
+  zero = new uchar 32 0
+  seal_receipt dma_int 2097152 rcpt zero
+  note Reject decision != 1 -> -2
+  put rcpt 4 2
+  if ne omega_accel_port_verify_receipt 1 dma_int rcpt neg long 2
+    ret 10
+  end
+  put rcpt 4 1
+  note Tampered intent digest -> -3
+  put rcpt 24 xor get rcpt 24 1
+  if ne omega_accel_port_verify_receipt 1 dma_int rcpt neg long 3
+    ret 11
+  end
+  put rcpt 24 xor get rcpt 24 1
+  note Tampered prev seal -> -4
+  put rcpt 96 99
+  if ne omega_accel_port_verify_receipt 1 dma_int rcpt neg long 4
+    ret 12
+  end
+  put rcpt 96 0
+  note Tampered receipt digest -> -5
+  put rcpt 128 xor get rcpt 128 1
+  if ne omega_accel_port_verify_receipt 1 dma_int rcpt neg long 5
+    ret 13
+  end
+  put rcpt 128 xor get rcpt 128 1
+
+  note Valid receipt #1 succeeds and records DMA window
+  if ne omega_accel_port_verify_receipt 1 dma_int rcpt 0
+    ret 14
+  end
+  if ne get g_ac_rcpts 0 1
+    ret 15
+  end
+  if ne get g_ac_win_cnt 0 1
+    ret 16
+  end
+  if ne get g_ac_w_phys 0 2097152
+    ret 17
+  end
+
+  note Build submit intent and chained receipt #2
+  if ne omega_accel_port_build_submit_intent 1 8192 256 sub_int 0
+    ret 18
+  end
+  if ne ac_get_u64le sub_int 8 2001
+    ret 19
+  end
+  for i ulong 32
+    put zero i get g_ac_seal i
+  end
+  seal_receipt sub_int 1 rcpt zero
+  if ne omega_accel_port_verify_receipt 1 sub_int rcpt 0
+    ret 20
+  end
+  if ne get g_ac_rcpts 0 2
+    ret 21
+  end
+
+  note Bind to DGX Spark machine graph and verify ID changes and seal is bound
+  if ne omega_machine_build_dgx_spark 0
+    ret 22
+  end
+  for i ulong 32
+    put t_id_before i get g_mg_id i
+  end
+  if ne omega_accel_port_bind_machine_graph 0
+    ret 23
+  end
+  if ne get g_mg_phys_auth 0 1
+    ret 24
+  end
+  diff = ulong 0
+  for i ulong 32
+    if ne get t_id_before i get g_mg_id i
+      diff = 1
+    end
+    if ne get g_mg_phys_seal i get g_ac_seal i
+      ret 25
+    end
+  end
+  if eq diff 0
+    ret 26
+  end
+
+  ign = write 1 t_pass 0 len t_pass
+  ret 0
+end
