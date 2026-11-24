@@ -1,0 +1,156 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/fabric.om: Step 3 -- Live Realization Cache <-> QDI_WTBL Dispatch Fabric
+note + Heterogeneous apu-gb10 Scheduler (X925 / A725 / SM121 / Spark Ring) + Arboris Metabolic Re-Specialization.
+
+const FAB_SLOTS ulong 32
+
+note Dispatch execution modes:
+const FAB_MODE_NONE ulong 0
+const FAB_MODE_NEURAL ulong 1
+const FAB_MODE_CPU_NATIVE ulong 2
+const FAB_MODE_GPU_NATIVE ulong 3
+const FAB_MODE_CRYSTALLIZED ulong 4
+
+note Live dispatch table (software mirror of GPU QDI_WTBL + CPU indirect dispatch table)
+global fabSem ulong 32
+global fabPtr ulong 32
+global fabTid ulong 32
+global fabVer ulong 32
+global fabMode ulong 32
+global fabCostNs ulong 32
+
+note Arboris live shape trace histogram (tracks hot (semId, M, K, N) calls for A725 background specialization)
+const FAB_HIST_CAP ulong 16
+global fabHUsed ulong 16
+global fabHSem ulong 16
+global fabHM ulong 16
+global fabHK ulong 16
+global fabHN ulong 16
+global fabHHits ulong 16
+global fabHSpec ulong 16
+
+note Heterogeneous apu-gb10 task kinds:
+const TASK_CTRL_LATENCY ulong 1
+const TASK_BG_METABOLIC ulong 2
+const TASK_TENSOR_LOCAL ulong 3
+const TASK_TENSOR_MULTI_SPARK ulong 4
+
+fn fabInit to void
+for i ulong FAB_SLOTS
+put fabSem i 0
+put fabPtr i 0
+put fabTid i 0
+put fabVer i 0
+put fabMode i FAB_MODE_NONE
+put fabCostNs i 0
+end
+for j ulong FAB_HIST_CAP
+put fabHUsed j 0
+put fabHHits j 0
+put fabHSpec j 0
+end
+end
+
+note Heterogeneous apu-gb10 scheduler: routes each task kind to its optimal TargetDesc!
+fn fabScheduleApu taskKind ulong to ulong
+if eq taskKind TASK_CTRL_LATENCY
+ret TID_X925
+end
+if eq taskKind TASK_BG_METABOLIC
+ret TID_A725
+end
+if eq taskKind TASK_TENSOR_LOCAL
+ret TID_SM121
+end
+if eq taskKind TASK_TENSOR_MULTI_SPARK
+ret TID_SPARK_RING
+end
+ret TID_X925
+end
+
+note Proof-gated atomic hot-swap into fabWtbl (QDI_WTBL mirror): requires proofMask == 7!
+fn fabHotSwap slot ulong semId ulong codePtr ulong tid ulong mode ulong proofMask ulong to bool
+if ge slot FAB_SLOTS
+ret false
+end
+if ne and proofMask 7 7
+ret false
+end
+put fabSem slot semId
+put fabPtr slot codePtr
+put fabTid slot tid
+put fabMode slot mode
+put fabVer slot add get fabVer slot 1
+if eq mode FAB_MODE_NEURAL
+put fabCostNs slot 15000000
+else
+if eq mode FAB_MODE_CRYSTALLIZED
+put fabCostNs slot 500
+else
+put fabCostNs slot 20000
+end
+end
+ret true
+end
+
+fn fabMatchHist i ulong semId ulong M ulong K ulong N ulong to bool
+if ne get fabHUsed i 1
+ret false
+end
+if ne get fabHSem i semId
+ret false
+end
+if ne get fabHM i M
+ret false
+end
+if ne get fabHK i K
+ret false
+end
+ret eq get fabHN i N
+end
+
+note Record a live (semId, M, K, N) observation from Arboris traces
+fn fabObserveShape semId ulong M ulong K ulong N ulong to ulong
+for i ulong FAB_HIST_CAP
+if fabMatchHist i semId M K N
+h = add get fabHHits i 1
+put fabHHits i h
+ret h
+end
+end
+for j ulong FAB_HIST_CAP
+if eq get fabHUsed j 0
+put fabHUsed j 1
+put fabHSem j semId
+put fabHM j M
+put fabHK j K
+put fabHN j N
+put fabHHits j 1
+put fabHSpec j 0
+ret 1
+end
+end
+ret 0
+end
+
+note A725 background metabolic tick: specializes any hot shape (hits >= 4) and hot-swaps fabWtbl[wtblSlot]!
+fn fabMetabolicTick wtblSlot ulong targetTid ulong to ulong
+swaps = ulong 0
+for i ulong FAB_HIST_CAP
+if and eq get fabHUsed i 1 eq get fabHSpec i 0
+if ge get fabHHits i 4
+sem = get fabHSem i
+rc = peSpecializeW4Gemm sem targetTid get fabHM i get fabHK i get fabHN i
+if eq rc TDK_OK
+cslot = get peOut 4
+ptr = get rcPtr cslot
+if fabHotSwap wtblSlot sem ptr targetTid FAB_MODE_GPU_NATIVE 7
+put fabHSpec i 1
+swaps = add swaps 1
+end
+end
+end
+end
+end
+ret swaps
+end

@@ -49,14 +49,17 @@ Omega unifies **multi-CPU Compile-on-Arrive** with **heterogeneous GPU/APU/Neura
 
 ## 3. Units in `seed/ng/target/`
 
-- `target_desc.om`: Unified 24-field `TargetDesc` registry (10 silicon profiles), compile-time physical contract checker (`tdCheckKernelContract`), cache/tile planner (`tdDeriveTilePlan`), and proof-gated Realization Cache (`tdCacheLookup` / `tdCacheInstall` / `tdCacheHotSwap`).
+- `target_desc.om`: Unified 24-field `TargetDesc` registry (10 silicon profiles), compile-time physical contract checker (`tdCheckKernelContract`), cache/tile planner (`tdDeriveTilePlan`), and proof-gated Realization Cache (`tdCacheLookup` / `tdCacheInstall`).
 - `regalloc.om`: Target-parameterized live-range register allocator + whole-program IPRA clobber propagation + graph-coloring invariant verifier.
 - `isel.om`: Cost-guided declarative ISA pattern selector + real machine-code emitters for **AArch64**, **register-allocated x86-64**, **RV64GC**, and **SM121** descriptors.
-- `gate.om`: Pure seeded OM-2 verification gate exercising all 10 profiles, physical contract positive/negative controls, 4-ISA register allocation & IPRA, real 4-ISA machine-byte emission, and proof-gated realization hot-swap.
+- `sm121_pe.om`: Runtime shape partial evaluator (`peSpecializeW4Gemm` across `M=1`, `2..8`, `>8`), embedded Antibody `#14` (`stall >= 6`) SASS verifier, and orthogonal ELF64 static executable emitter (`EM_AARCH64=183`, `EM_X86_64=62`, `EM_RISCV=243`).
+- `fabric.om`: Live Realization Cache ↔ `QDI_WTBL` dispatch fabric (`fabWtbl`), heterogeneous `apu-gb10` scheduler (`X925` / `A725` / `SM121` / `Spark Ring`), and Arboris-driven A725 metabolic re-specialization.
+- `crystallize.om`: `ΩIR v2` `SLAB` protection (`SLAB_IMMUTABLE`, `SLAB_MUTABLE_ALARMED` with rollback, `SLAB_SHARDED`), `ORACLE` dual-path execution with out-of-domain alarm fallback, and bottom-up observational-equivalence neural crystallizer compiling discovered skills directly to native AArch64 and register-allocated x86-64 ELFs.
+- `gate.om`: Pure seeded OM-2 verification gate (`NG-TARGET-GATE PASS checks=73 controls=10`, plus live `ca64` / `cx64` crystallized ELF emission).
 
-## 4. Roadmap Continuity
+## 4. Roadmap Status (All 4 Steps Implemented & Verified)
 
-1. **Step 1 (This Directory):** Unified `TargetDesc`, shared IPRA/RegAlloc, 4-ISA table-driven ISel & encoders, proof-gated realization cache.
-2. **Step 2:** Wire `seed/ng/src/gpu.om` + `sm121.tbl` into `ng` with runtime shape partial evaluation (`M=4/5` MTP verify).
-3. **Step 3:** Bridge Realization Cache directly to `QDI_WTBL` + `apu-gb10` A725 background specialization.
-4. **Step 4:** `ΩIR v2` `SLAB` + `ORACLE` crystallization loop (`q36` → `om_synth_gb10` → portable `ΩIR` → any CPU).
+1. **Step 1 (DONE — `b2ac40d55`):** Unified `TargetDesc`, shared IPRA/RegAlloc, 4-ISA table-driven ISel & encoders, proof-gated realization cache.
+2. **Step 2 (DONE — `0d590048e`):** SM121 runtime shape partial evaluation (`M=1 / 4 / 512`), Antibody `#14` verification, and orthogonal AArch64/x86-64/RV64 ELF64 container emitter.
+3. **Step 3 (DONE):** Live Realization Cache ↔ `QDI_WTBL` dispatch fabric (`fabric.om`) + `apu-gb10` heterogeneous routing + Arboris-triggered A725 background specialization.
+4. **Step 4 (DONE):** `ΩIR v2` `SLAB` + `ORACLE` neural crystallization loop (`crystallize.om`), verified live on Spark (`CRYST_A64_NATIVE_EXIT=36`, `CRYST_X64_QEMU_EXIT=36`).

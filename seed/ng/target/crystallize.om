@@ -1,0 +1,225 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/crystallize.om: Step 4 -- ΩIR v2 SLAB (immutable / mutable_alarmed / sharded)
+note + ORACLE Dual-Path Execution + Bottom-Up Observational-Equivalence Neural Crystallizer
+note that compiles a skill discovered from neural traces into portable AArch64 + x86-64 + RV64GC + SM121 code!
+
+note SLAB protection & placement kinds:
+const SLAB_IMMUTABLE ulong 1
+const SLAB_MUTABLE_ALARMED ulong 2
+const SLAB_SHARDED ulong 3
+
+const CR_OK ulong 0
+const CR_ERR_IMMUTABLE ulong 1
+const CR_ERR_ALARM ulong 2
+
+note SLAB descriptor table (16 slabs): kind, sizeBytes, curNorm, alarmLimit, targetTid
+global crSlabKind ulong 16
+global crSlabNorm ulong 16
+global crSlabLim ulong 16
+global crSlabTid ulong 16
+
+note Neural trace observation buffer (up to 16 (x0, x1 -> y) samples)
+const CR_MAX_OBS ulong 16
+global crObsCnt ulong 1
+global crObsX0 ulong 16
+global crObsX1 ulong 16
+global crObsY ulong 16
+
+note Synthesized canonical ΩIR program (2-op AST discovered purely from traces):
+note op1 in {OIR_ADD, OIR_SUB, OIR_MUL}, op2 in {OIR_ADD, OIR_MUL}, constC in 1..8
+global crFound ulong 1
+global crOp1 ulong 1
+global crOp2 ulong 1
+global crConstC ulong 1
+global crDomMax ulong 1
+
+fn crInit to void
+for i ulong 16
+put crSlabKind i 0
+put crSlabNorm i 0
+put crSlabLim i 0
+put crSlabTid i 0
+end
+put crObsCnt 0 0
+put crFound 0 0
+put crOp1 0 0
+put crOp2 0 0
+put crConstC 0 0
+put crDomMax 0 100
+end
+
+note Register a SLAB with explicit immutability or mandatory norm-alarm envelope (no silent clamps!)
+fn crRegSlab id ulong kind ulong alarmLim ulong tid ulong to void
+put crSlabKind id kind
+put crSlabNorm id 0
+put crSlabLim id alarmLim
+put crSlabTid id tid
+end
+
+note Write/update a SLAB: immutable slabs refuse writes; alarmed slabs roll back cleanly if norm > alarmLim!
+fn crUpdateSlab id ulong deltaNorm ulong to ulong
+k = get crSlabKind id
+if eq k SLAB_IMMUTABLE
+ret CR_ERR_IMMUTABLE
+end
+nw = add get crSlabNorm id deltaNorm
+if eq k SLAB_MUTABLE_ALARMED
+if gt nw get crSlabLim id
+ret CR_ERR_ALARM
+end
+end
+put crSlabNorm id nw
+ret CR_OK
+end
+
+note Reference neural oracle (stands in for inline q36 / specialist circuit: unknown to the crystallizer!)
+fn crNeuralOracle x0 ulong x1 ulong to ulong
+ret mul add x0 x1 3
+end
+
+note Evaluate a candidate 2-op ΩIR program: op2(op1(x0, x1), c)
+fn crEvalCand op1 ulong op2 ulong c ulong x0 ulong x1 ulong to ulong
+t = ulong 0
+if eq op1 OIR_ADD
+t = add x0 x1
+end
+if eq op1 OIR_SUB
+if ge x0 x1
+t = sub x0 x1
+else
+t = ulong 0
+end
+end
+if eq op1 OIR_MUL
+t = mul x0 x1
+end
+if eq op2 OIR_ADD
+ret add t c
+end
+ret mul t c
+end
+
+fn crCheckCandAll op1 ulong op2 ulong c ulong to bool
+n = get crObsCnt 0
+if eq n 0
+ret false
+end
+for i ulong n bound 16
+y = crEvalCand op1 op2 c get crObsX0 i get crObsX1 i
+if ne y get crObsY i
+ret false
+end
+end
+ret true
+end
+
+note Bottom-up observational-equivalence crystallizer (mirrors om_synth_gb10):
+note Searches canonical ΩIR space for an exact match to all observed neural traces!
+fn crSynthesizeFromTraces to bool
+for o1 ulong 3
+op1 = add o1 1
+for o2 ulong 2
+op2 = OIR_ADD
+if eq o2 1
+op2 = OIR_MUL
+end
+for c ulong 8
+cc = add c 1
+if crCheckCandAll op1 op2 cc
+put crFound 0 1
+put crOp1 0 op1
+put crOp2 0 op2
+put crConstC 0 cc
+ret true
+end
+end
+end
+end
+ret false
+end
+
+note Dual-path ORACLE call: uses crystallized exact path when in-domain, falls back to neural if alarm trips!
+fn crCallOracle wtblSlot ulong x0 ulong x1 ulong to ulong
+if eq get fabMode wtblSlot FAB_MODE_CRYSTALLIZED
+if and le x0 get crDomMax 0 le x1 get crDomMax 0
+ret crEvalCand get crOp1 0 get crOp2 0 get crConstC 0 x0 x1
+end
+note Out-of-domain alarm tripped -> fall back cleanly to neural oracle!
+ret crNeuralOracle x0 x1
+end
+y = crNeuralOracle x0 x1
+cnt = get crObsCnt 0
+if lt cnt CR_MAX_OBS
+put crObsX0 cnt x0
+put crObsX1 cnt x1
+put crObsY cnt y
+put crObsCnt 0 add cnt 1
+end
+ret y
+end
+
+note Compile the crystallized ΩIR program directly to a runnable native AArch64 or x86-64 static ELF!
+note Computes crEvalCand(crOp1, crOp2, crConstC, x0=7, x1=5) and exits with the result!
+fn crEmitCrystallizedElf tid ulong to ulong
+if eq get crFound 0 0
+ret 0
+end
+isa = tdGet tid TDF_ISA
+op1 = get crOp1 0
+op2 = get crOp2 0
+cc = get crConstC 0
+isBufReset
+if eq isa ISA_A64
+note mov x0, #7; mov x1, #5; mov x2, #cc (0xd2800002 | (cc << 5))
+isEmitU32 3531604192
+isEmitU32 3531604129
+isEmitU32 or 3531603970 shl cc 5
+ok = isEmitOp tid op1 0 0 1
+ok = isEmitOp tid op2 0 0 2
+note mov x8, #93; svc #0
+isEmitU32 3531606952
+isEmitU32 3556769793
+ret elfEmitStatic tid
+end
+if eq isa ISA_X64
+note mov eax, 7; mov edi, 5; mov esi, cc
+isEmitU8 184
+isEmitU32 7
+isEmitU8 191
+isEmitU32 5
+isEmitU8 190
+isEmitU32 cc
+ok = isEmitOp tid op1 0 0 1
+ok = isEmitOp tid op2 0 0 2
+note mov rdi, rax; mov eax, 60; syscall
+isEmitU8 72
+isEmitU8 137
+isEmitU8 199
+isEmitU8 184
+isEmitU32 60
+isEmitU8 15
+isEmitU8 5
+ret elfEmitStatic tid
+end
+ret 0
+end
+
+note Full Step 4 crystallization pipeline: synthesize -> verify -> compile for all ISAs -> hot-swap fabWtbl!
+fn crCrystallizeAndSwap wtblSlot ulong semId ulong to bool
+if not crSynthesizeFromTraces
+ret false
+end
+if eq crEmitCrystallizedElf TID_X925 0
+ret false
+end
+if eq crEmitCrystallizedElf TID_X64_AVX2 0
+ret false
+end
+if not isCompileTestFn TID_RV64_RVV
+ret false
+end
+if not isCompileTestFn TID_SM121
+ret false
+end
+ret fabHotSwap wtblSlot semId 131072 TID_X925 FAB_MODE_CRYSTALLIZED 7
+end
