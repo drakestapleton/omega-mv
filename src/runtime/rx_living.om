@@ -1,0 +1,705 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_living.om -- Pure seeded OM-2 port of src/runtime/rx_living.c.
+note R13/R14/R16 living resident causal system:
+note   - rx_living_object_digest (bit-exact SHA-256 over "AIEN_RX_OBJECT_V1", type, 8 fields)
+note   - trial_a / trial_b + living.experiment.prepare / living.blackwell.add / living.experiment.evidence
+note   - generation.prepare (authorship, store, chain, grant checks, idempotent proposal)
+note   - generation.promote (separate promoter authority, caller credential, inforce update)
+note   - generation.restore (genesis reference, blob/magic/readmit/identity checks)
+note   - rx_living_enroll_callers (9 production subjects across 5 component keyrings)
+note   - rx_living_lesson_evidence_ok / rx_living_lesson_promote / rx_living_explored_keys
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const RXL_OK long 0
+const RXL_ERR_ARG long -1
+const RXL_ERR_FULL long -2
+const RXL_ERR_AUTHORITY long -4
+const RXL_ERR_NOT_FOUND long -6
+const RXL_ERR_IDENTITY long -27
+const RXL_ERR_HALTED long -31
+const RXL_FN_DEFER long 1145390674
+
+const RXL_GEN_OK long 0
+const RXL_GEN_ERR_IDENTITY long -50
+const RXL_GEN_ERR_HALTED long -51
+
+const RX_LIVING_TRIALS ulong 16
+const RX_LIVING_RES_BASE ulong 101908480
+const RX_LIVING_SUBJ ulong 61
+const RX_LIVING_SEAT_SUBJ ulong 62
+const RX_LIVING_PREPARE_SUBJ ulong 63
+const RX_LIVING_PROMOTE_SUBJ ulong 64
+
+const RX_OMEGA_SUBJ_SERVE ulong 21
+const RX_OMEGA_SUBJ_OMEGA ulong 22
+const RX_AIEN_SUBJ ulong 31
+const RX_AEGIS_SUBJ ulong 41
+const RX_AEGIS_ROOT_SUBJ ulong 42
+
+const RX_LIVING_RESTORE_REFERENCE ulong 1
+const RX_LIVING_RESTORE_RESTORED ulong 2
+const RX_LIVING_RESTORE_REFUSED ulong 3
+
+const RX_LIVING_RESTORE_WHY_CONFIG ulong 1
+const RX_LIVING_RESTORE_WHY_IDENTITY ulong 2
+
+const RX_LIVING_WHY_AUTHOR ulong 1
+const RX_LIVING_WHY_STORE ulong 2
+const RX_LIVING_WHY_CHAIN ulong 3
+const RX_LIVING_WHY_GRANT ulong 4
+const RX_LIVING_WHY_PROPOSE ulong 5
+
+const RX_LIVING_EV_DIGEST0 ulong 0
+const RX_LIVING_EV_CRUMB ulong 4
+const RX_LIVING_EV_WORDS ulong 5
+
+const RX_LIVING_LESSON_REALIZATION ulong 7
+const RX_LIVING_LESSON_REGIME ulong 11
+const RX_LIVING_LESSON_KEY ulong 12
+const RX_LIVING_LESSON_WORDS ulong 13
+
+const RXL_CX_K_EVIDENCE_REF ulong 10
+const RXL_CX_K_CANDIDATE ulong 11
+const RXL_CX_K_PROMOTION ulong 12
+
+text rxl_obj_tag "AIEN_RX_OBJECT_V1"
+
+note Living state:
+note   0:created, 1:registered, 2:restore_reg, 3:proposed_epoch, 4:candidate_id,
+note   5:refusals, 6:last_refusal, 7:next_cand_id, 8:active_gen, 9:active_lineage,
+note   10:halted, 11:promoter_result, 12:promoter_has_keys, 13:promoter_has_cred,
+note   14:auth_ok, 15:store_ok, 16:chain_ok, 17:grant_ok
+global rxl_st ulong 24
+
+note World object fields (8 ulongs each):
+global rxl_search ulong 8
+global rxl_plan ulong 8
+global rxl_goal ulong 8
+global rxl_selection ulong 8
+global rxl_belief ulong 8
+global rxl_input ulong 8
+global rxl_output ulong 8
+global rxl_evidence ulong 8
+global rxl_candidate ulong 8
+global rxl_promotion ulong 8
+global rxl_inforce ulong 8
+global rxl_restore ulong 8
+
+note Native authority cap table (16 entries x 6 ulongs):
+note   0:live, 1:cap_id, 2:gen, 3:subject, 4:resource, 5:rights
+global rxl_caps ulong 96
+
+note Enrolled production keyrings (9 slots: subject, generation)
+global rxl_kr_subj ulong 16
+global rxl_kr_gen ulong 16
+global rxl_kr_counts ulong 5
+
+note Cortex lesson store (32 records):
+note   rxl_cx_meta: 32 x 7 ulongs (0:valid, 1:verified, 2:kind, 3:subject, 4:n_words, 5:link0, 6:link1)
+note   rxl_cx_pay:  32 x 16 ulongs = 512 ulongs
+global rxl_cx_meta ulong 224
+global rxl_cx_pay ulong 512
+global rxl_cx_n ulong 1
+
+note Active durable generation blob metadata for restore:
+note   0:code_len, 1:cfg_magic_ok, 2:ev_magic_ok, 3:readmit_ok, 4:readmit_why,
+note   5:cfg_kind, 6:cfg_regime, 7:ev_epoch, 8:ev_sel_ps
+global rxl_blob_meta ulong 12
+global rxl_blob_cfg_id uchar 32
+global rxl_blob_act_id uchar 32
+
+fn rxl_sh_put32 pos ulong v ulong to ulong
+  for k ulong 4
+    put sh_dat add pos k uchar and shr v mul k 8 255
+  end
+  ret add pos 4
+end
+
+fn rxl_sh_put64 pos ulong v ulong to ulong
+  for k ulong 8
+    put sh_dat add pos k uchar and shr v mul k 8 255
+  end
+  ret add pos 8
+end
+
+fn rx_living_object_digest otype ulong flds view ulong * dst edit uchar * to void
+  tlen = len rxl_obj_tag
+  for i ulong tlen bound 32
+    put sh_dat i get rxl_obj_tag i
+  end
+  pos = rxl_sh_put32 tlen otype
+  for f ulong 8
+    pos = rxl_sh_put64 pos get flds f
+  end
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn rx_living_trial_a plan_seq ulong t ulong to ulong
+  base = ulong 4294967040
+  sum = add add base mul plan_seq 16 t
+  ret and sum 4294967295
+end
+
+fn rx_living_trial_b epoch ulong t ulong to ulong
+  sum = add mul epoch 256 t
+  ret and sum 4294967295
+end
+
+fn rxl_cap_set slot ulong cap_id ulong gen ulong subj ulong res ulong rights ulong to void
+  if ge slot 16
+    ret
+  end
+  b = mul slot 6
+  put rxl_caps b 1
+  put rxl_caps add b 1 cap_id
+  put rxl_caps add b 2 gen
+  put rxl_caps add b 3 subj
+  put rxl_caps add b 4 res
+  put rxl_caps add b 5 rights
+end
+
+fn rx_living_native_authority cap_id ulong gen ulong subj ulong res ulong rights ulong to long
+  for i ulong 16
+    b = mul i 6
+    if eq get rxl_caps b 0
+      continue
+    end
+    if eq get rxl_caps add b 1 cap_id
+      if ne get rxl_caps add b 2 gen
+        ret RXL_ERR_AUTHORITY
+      end
+      if ne get rxl_caps add b 3 subj
+        ret RXL_ERR_AUTHORITY
+      end
+      if ne get rxl_caps add b 4 res
+        ret RXL_ERR_AUTHORITY
+      end
+      if ne and get rxl_caps add b 5 rights rights
+        ret RXL_ERR_AUTHORITY
+      end
+      ret RXL_OK
+    end
+  end
+  ret RXL_ERR_NOT_FOUND
+end
+
+fn rx_living_create to long
+  for i ulong 24
+    put rxl_st i 0
+  end
+  put rxl_st 0 1
+  put rxl_st 7 1
+  put rxl_st 14 1
+  put rxl_st 15 1
+  put rxl_st 16 1
+  put rxl_st 17 1
+  for i ulong 8
+    put rxl_search i 0
+    put rxl_plan i 0
+    put rxl_goal i 0
+    put rxl_selection i 0
+    put rxl_belief i 0
+    put rxl_input i 0
+    put rxl_output i 0
+    put rxl_evidence i 0
+    put rxl_candidate i 0
+    put rxl_promotion i 0
+    put rxl_inforce i 0
+    put rxl_restore i 0
+  end
+  for i ulong 96
+    put rxl_caps i 0
+  end
+  for i ulong 224
+    put rxl_cx_meta i 0
+  end
+  for i ulong 512
+    put rxl_cx_pay i 0
+  end
+  put rxl_cx_n 0 0
+  for i ulong 12
+    put rxl_blob_meta i 0
+  end
+  for i ulong 32
+    put rxl_blob_cfg_id i 0
+    put rxl_blob_act_id i 0
+  end
+  ret RXL_OK
+end
+
+fn rx_living_register prom_ok ulong to long
+  if eq get rxl_st 0 0
+    ret RXL_ERR_ARG
+  end
+  if eq prom_ok 0
+    ret RXL_ERR_ARG
+  end
+  put rxl_st 1 1
+  ret RXL_OK
+end
+
+fn rx_living_register_restore prom_ok ulong to long
+  if eq get rxl_st 1 0
+    ret RXL_ERR_ARG
+  end
+  if eq prom_ok 0
+    ret RXL_ERR_ARG
+  end
+  put rxl_st 2 1
+  ret RXL_OK
+end
+
+fn rx_living_enroll_callers closed ulong to long
+  for i ulong 16
+    put rxl_kr_subj i 0
+    put rxl_kr_gen i 0
+  end
+  for i ulong 5
+    put rxl_kr_counts i 0
+  end
+  if ne closed 0
+    ret RXL_ERR_IDENTITY
+  end
+  note omega: 21, 22
+  put rxl_kr_subj 0 RX_OMEGA_SUBJ_SERVE
+  put rxl_kr_gen 0 1
+  put rxl_kr_subj 1 RX_OMEGA_SUBJ_OMEGA
+  put rxl_kr_gen 1 2
+  put rxl_kr_counts 0 2
+  note aien: 31
+  put rxl_kr_subj 2 RX_AIEN_SUBJ
+  put rxl_kr_gen 2 3
+  put rxl_kr_counts 1 1
+  note aegis: 41, 42
+  put rxl_kr_subj 3 RX_AEGIS_SUBJ
+  put rxl_kr_gen 3 4
+  put rxl_kr_subj 4 RX_AEGIS_ROOT_SUBJ
+  put rxl_kr_gen 4 5
+  put rxl_kr_counts 2 2
+  note living: 61, 62, 63
+  put rxl_kr_subj 5 RX_LIVING_SUBJ
+  put rxl_kr_gen 5 6
+  put rxl_kr_subj 6 RX_LIVING_SEAT_SUBJ
+  put rxl_kr_gen 6 7
+  put rxl_kr_subj 7 RX_LIVING_PREPARE_SUBJ
+  put rxl_kr_gen 7 8
+  put rxl_kr_counts 3 3
+  note promoter: 64
+  put rxl_kr_subj 8 RX_LIVING_PROMOTE_SUBJ
+  put rxl_kr_gen 8 9
+  put rxl_kr_counts 4 1
+  ret RXL_OK
+end
+
+fn rx_living_fn_prepare to long
+  ep = get rxl_search 0
+  pseq = get rxl_plan 0
+  if lt ep 2
+    ret 0
+  end
+  if eq pseq 0
+    ret 0
+  end
+  if ne get rxl_search 6 pseq
+    ret 0
+  end
+  if eq get rxl_input 2 ep
+    ret 0
+  end
+  put rxl_input 0 rx_living_trial_a pseq 0
+  put rxl_input 1 rx_living_trial_b ep 0
+  put rxl_input 2 ep
+  put rxl_input 3 0
+  put rxl_input 4 pseq
+  ret 0
+end
+
+fn rx_living_fn_seat_step to long
+  sum = and add get rxl_input 0 get rxl_input 1 4294967295
+  put rxl_output 0 sum
+  ret 0
+end
+
+fn rx_living_fn_evidence to long
+  ep = get rxl_input 2
+  t = get rxl_input 3
+  if lt ep 2
+    ret 0
+  end
+  if le ep get rxl_evidence 0
+    ret 0
+  end
+  expected = and add get rxl_input 0 get rxl_input 1 4294967295
+  obs = get rxl_output 0
+  matched = t
+  ok = ulong 0
+  if eq obs expected
+    ok = ulong 1
+    matched = add matched 1
+  end
+  put rxl_evidence 1 expected
+  put rxl_evidence 2 obs
+  put rxl_evidence 4 matched
+  if ne ok 0
+    if lt matched RX_LIVING_TRIALS
+      put rxl_input 0 rx_living_trial_a get rxl_input 4 matched
+      put rxl_input 1 rx_living_trial_b ep matched
+      put rxl_input 3 matched
+      ret 0
+    end
+  end
+  put rxl_evidence 0 ep
+  put rxl_evidence 3 ok
+  ret 0
+end
+
+fn rxl_decline why ulong to long
+  put rxl_st 5 add get rxl_st 5 1
+  put rxl_st 6 why
+  ret 0
+end
+
+fn rx_living_fn_candidate to long
+  ep = get rxl_selection 0
+  if lt ep 2
+    ret 0
+  end
+  if eq get rxl_candidate 1 ep
+    ret 0
+  end
+  if eq get rxl_selection 1 0
+    ret 0
+  end
+  if ne get rxl_belief 0 ep
+    ret 0
+  end
+  if ne get rxl_belief 2 1
+    ret 0
+  end
+  if ne get rxl_evidence 0 ep
+    ret 0
+  end
+  if ne get rxl_evidence 3 1
+    ret 0
+  end
+  if ne get rxl_evidence 4 RX_LIVING_TRIALS
+    ret 0
+  end
+  if ne get rxl_search 0 ep
+    ret 0
+  end
+  if eq get rxl_st 14 0
+    ret rxl_decline RX_LIVING_WHY_AUTHOR
+  end
+  if eq get rxl_st 15 0
+    ret rxl_decline RX_LIVING_WHY_STORE
+  end
+  if eq get rxl_st 16 0
+    ret rxl_decline RX_LIVING_WHY_CHAIN
+  end
+  if eq get rxl_st 17 0
+    ret rxl_decline RX_LIVING_WHY_GRANT
+  end
+  if ne get rxl_st 10 0
+    ret RXL_FN_DEFER
+  end
+  cid = ulong 0
+  if eq get rxl_st 3 ep
+    cid = get rxl_st 4
+  else
+    cid = get rxl_st 7
+    put rxl_st 7 add cid 1
+    put rxl_st 3 ep
+    put rxl_st 4 cid
+  end
+  put rxl_candidate 0 cid
+  put rxl_candidate 1 ep
+  for j ulong 4
+    put rxl_candidate add 2 j get rxl_selection add 1 j
+  end
+  put rxl_candidate 6 get rxl_selection 6
+  put rxl_candidate 7 get rxl_selection 5
+  ret 0
+end
+
+fn rxl_rc_u64 rc long to ulong
+  if ge rc 0
+    ret ulong rc
+  end
+  mag = ulong sub 0 rc
+  ret sub ulong 0 mag
+end
+
+fn rx_living_fn_promote cap_id ulong cap_gen ulong to long
+  cid = get rxl_candidate 0
+  if eq cid 0
+    ret 0
+  end
+  if eq get rxl_promotion 0 cid
+    ret 0
+  end
+  if ne get rxl_st 10 0
+    ret RXL_FN_DEFER
+  end
+  rc = RXL_GEN_OK
+  if ne get rxl_st 12 0
+    if eq get rxl_st 13 0
+      rc = RXL_GEN_ERR_IDENTITY
+    end
+  end
+  if eq rc RXL_GEN_OK
+    arc = rx_living_native_authority cap_id cap_gen RX_LIVING_PROMOTE_SUBJ 2309 512
+    if ne arc RXL_OK
+      rc = arc
+    end
+  end
+  if eq rc RXL_GEN_OK
+    put rxl_st 8 cid
+    put rxl_st 9 add get rxl_st 9 1
+  end
+  rc_u = rxl_rc_u64 rc
+  put rxl_st 11 rc_u
+  put rxl_promotion 0 cid
+  put rxl_promotion 1 rc_u
+  put rxl_promotion 2 100
+  put rxl_promotion 3 get rxl_st 8
+  if ne rc RXL_GEN_OK
+    ret 0
+  end
+  put rxl_inforce 0 get rxl_candidate 1
+  for j ulong 4
+    put rxl_inforce add 1 j get rxl_candidate add 2 j
+  end
+  put rxl_inforce 5 get rxl_candidate 7
+  put rxl_inforce 6 get rxl_candidate 6
+  put rxl_inforce 7 get rxl_st 8
+  ret 0
+end
+
+fn rxl_restore_refuse why ulong to long
+  put rxl_restore 2 RX_LIVING_RESTORE_REFUSED
+  put rxl_restore 5 why
+  ret 0
+end
+
+fn rx_living_fn_restore to long
+  boot = get rxl_restore 0
+  if eq boot 0
+    ret 0
+  end
+  if eq get rxl_restore 1 boot
+    ret 0
+  end
+  active = get rxl_st 8
+  lineage = get rxl_st 9
+  put rxl_restore 1 boot
+  put rxl_restore 3 active
+  put rxl_restore 6 lineage
+  put rxl_restore 4 0
+  put rxl_restore 5 0
+  clen = get rxl_blob_meta 0
+  if eq clen 0
+    put rxl_restore 2 RX_LIVING_RESTORE_REFERENCE
+    ret 0
+  end
+  if eq get rxl_blob_meta 1 0
+    ret rxl_restore_refuse RX_LIVING_RESTORE_WHY_CONFIG
+  end
+  if eq get rxl_blob_meta 2 0
+    ret rxl_restore_refuse RX_LIVING_RESTORE_WHY_CONFIG
+  end
+  if eq get rxl_blob_meta 3 0
+    ret rxl_restore_refuse get rxl_blob_meta 4
+  end
+  for i ulong 32
+    if ne get rxl_blob_act_id i get rxl_blob_cfg_id i
+      ret rxl_restore_refuse RX_LIVING_RESTORE_WHY_IDENTITY
+    end
+  end
+  put rxl_inforce 0 get rxl_blob_meta 7
+  for k ulong 4
+    w = ulong 0
+    for j ulong 8
+      w = or w shl ulong get rxl_blob_act_id add mul k 8 j mul j 8
+    end
+    put rxl_inforce add 1 k w
+  end
+  put rxl_inforce 5 get rxl_blob_meta 8
+  put rxl_inforce 6 get rxl_blob_meta 6
+  put rxl_inforce 7 active
+  put rxl_restore 2 RX_LIVING_RESTORE_RESTORED
+  put rxl_restore 4 get rxl_inforce 1
+  ret 0
+end
+
+fn rxl_cx_append hdr view ulong * pay view ulong * to ulong
+  n = get rxl_cx_n 0
+  if ge n 32
+    ret 0
+  end
+  mb = mul n 7
+  put rxl_cx_meta mb 1
+  put rxl_cx_meta add mb 1 1
+  put rxl_cx_meta add mb 2 get hdr 0
+  put rxl_cx_meta add mb 3 get hdr 1
+  put rxl_cx_meta add mb 4 get hdr 2
+  put rxl_cx_meta add mb 5 get hdr 3
+  put rxl_cx_meta add mb 6 get hdr 4
+  for i ulong get hdr 2 bound 16
+    put rxl_cx_pay add mul n 16 i get pay i
+  end
+  put rxl_cx_n 0 add n 1
+  ret add n 1
+end
+
+fn rxl_get_u64_le buf view uchar * off ulong to ulong
+  v = ulong 0
+  for b ulong 8
+    sh = mul b 8
+    v = or v shl ulong get buf add off b sh
+  end
+  ret v
+end
+
+fn rx_living_lesson_evidence_ok ev_id ulong obj_digest view uchar * to long
+  if eq ev_id 0
+    ret RXL_ERR_NOT_FOUND
+  end
+  if gt ev_id get rxl_cx_n 0
+    ret RXL_ERR_NOT_FOUND
+  end
+  idx = sub ev_id 1
+  mb = mul idx 7
+  if eq get rxl_cx_meta add mb 1 0
+    ret RXL_ERR_IDENTITY
+  end
+  if ne get rxl_cx_meta add mb 2 RXL_CX_K_EVIDENCE_REF
+    ret RXL_ERR_ARG
+  end
+  if lt get rxl_cx_meta add mb 4 RX_LIVING_EV_WORDS
+    ret RXL_ERR_ARG
+  end
+  pb = mul idx 16
+  for i ulong 4
+    v = rxl_get_u64_le obj_digest mul i 8
+    if ne get rxl_cx_pay add pb add RX_LIVING_EV_DIGEST0 i v
+      ret RXL_ERR_ARG
+    end
+  end
+  ret RXL_OK
+end
+
+fn rxl_cx_append_promo subj ulong cand_id ulong ev_id ulong to ulong
+  hdr = new ulong 5 0
+  put hdr 0 RXL_CX_K_PROMOTION
+  put hdr 1 subj
+  put hdr 2 8
+  put hdr 3 cand_id
+  put hdr 4 ev_id
+  pay = new ulong 8 0
+  put pay 0 cand_id
+  put pay 1 ev_id
+  ret rxl_cx_append hdr pay
+end
+
+fn rx_living_lesson_promote cand_id ulong ev_id ulong obj_digest view uchar * out_id edit ulong * to long
+  rc = rx_living_lesson_evidence_ok ev_id obj_digest
+  if ne rc RXL_OK
+    ret rc
+  end
+  if eq cand_id 0
+    ret RXL_ERR_NOT_FOUND
+  end
+  if gt cand_id get rxl_cx_n 0
+    ret RXL_ERR_NOT_FOUND
+  end
+  cmb = mul sub cand_id 1 7
+  if eq get rxl_cx_meta add cmb 1 0
+    ret RXL_ERR_IDENTITY
+  end
+  if ne get rxl_cx_meta add cmb 2 RXL_CX_K_CANDIDATE
+    ret RXL_ERR_ARG
+  end
+  pid = rxl_cx_append_promo get rxl_cx_meta add cmb 3 cand_id ev_id
+  if eq pid 0
+    ret RXL_ERR_FULL
+  end
+  put out_id 0 pid
+  ret RXL_OK
+end
+
+fn rxl_promo_key idx ulong subj ulong n ulong to ulong
+  mb = mul idx 7
+  if eq get rxl_cx_meta add mb 1 0
+    ret 0
+  end
+  if ne get rxl_cx_meta add mb 2 RXL_CX_K_PROMOTION
+    ret 0
+  end
+  if ne get rxl_cx_meta add mb 3 subj
+    ret 0
+  end
+  if lt get rxl_cx_meta add mb 4 8
+    ret 0
+  end
+  cid = get rxl_cx_meta add mb 5
+  eid = get rxl_cx_meta add mb 6
+  if eq cid 0
+    ret 0
+  end
+  if gt cid n
+    ret 0
+  end
+  if eq eid 0
+    ret 0
+  end
+  if gt eid n
+    ret 0
+  end
+  cmb = mul sub cid 1 7
+  emb = mul sub eid 1 7
+  if eq get rxl_cx_meta add cmb 1 0
+    ret 0
+  end
+  if eq get rxl_cx_meta add emb 1 0
+    ret 0
+  end
+  if ne get rxl_cx_meta add cmb 2 RXL_CX_K_CANDIDATE
+    ret 0
+  end
+  if lt get rxl_cx_meta add cmb 4 RX_LIVING_LESSON_WORDS
+    ret 0
+  end
+  if ne get rxl_cx_meta add emb 2 RXL_CX_K_EVIDENCE_REF
+    ret 0
+  end
+  ret get rxl_cx_pay add mul sub cid 1 16 RX_LIVING_LESSON_KEY
+end
+
+fn rx_living_explored_keys subj ulong keys edit ulong * max_k ulong to ulong
+  n = get rxl_cx_n 0
+  out_n = ulong 0
+  for i ulong n bound 32
+    if ge out_n max_k
+      ret out_n
+    end
+    k = rxl_promo_key i subj n
+    if eq k 0
+      continue
+    end
+    dup = ulong 0
+    for j ulong out_n bound 32
+      if eq get keys j k
+        dup = ulong 1
+      end
+    end
+    if eq dup 0
+      put keys out_n k
+      out_n = add out_n 1
+    end
+  end
+  ret out_n
+end

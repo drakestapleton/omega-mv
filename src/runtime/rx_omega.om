@@ -1,0 +1,997 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_omega.om -- Pure seeded OM-2 port of src/runtime/rx_omega.c.
+note Omega resident realization faculty (ADR 0016 s.43, R10/R11/R13/R14):
+note SplitMix64 matvec fill, SHA-256 vector digest, content-addressed
+note realization store, workload.serve, omega.watch, omega.synthesize,
+note omega.verify (identity + structural + differential + defect checks),
+note omega.measure, omega.select (with experiment evidence barrier and
+note margin), omega.reconsider, and R14 rx_omega_readmit.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const RX_OMEGA_OK long 0
+const RX_OMEGA_ERR long -1
+const RX_OMEGA_REFUSED_RC long 1
+
+const RX_OMEGA_SLOTS ulong 5
+const RX_OMEGA_STORE ulong 16
+const RX_OMEGA_WINDOW ulong 16
+const RX_OMEGA_MAX_ELEMS ulong 65536
+const RX_OMEGA_MAX_CODE ulong 256
+
+const RX_OMEGA_SYNTHESIZED ulong 1
+const RX_OMEGA_PASSED ulong 1
+const RX_OMEGA_REFUSED ulong 2
+const RX_OMEGA_MEASURED ulong 1
+const RX_OMEGA_DECLINED ulong 2
+
+const RX_OMEGA_WHY_NONE ulong 0
+const RX_OMEGA_WHY_UNKNOWN ulong 1
+const RX_OMEGA_WHY_IDENTITY ulong 2
+const RX_OMEGA_WHY_STRUCTURE ulong 3
+const RX_OMEGA_WHY_DIFFERENTIAL ulong 4
+const RX_OMEGA_WHY_CRASHED ulong 5
+const RX_OMEGA_WHY_HUNG ulong 6
+const RX_OMEGA_WHY_BOUNDS ulong 7
+
+const RX_OMEGA_DEFECT_NONE ulong 0
+const RX_OMEGA_DEFECT_SKIP_REMAINDER ulong 1
+const RX_OMEGA_DEFECT_CRASH ulong 2
+const RX_OMEGA_DEFECT_TAMPER ulong 3
+
+const RX_OMEGA_INQ_RESEARCH ulong 1
+const RX_OMEGA_COST_REFERENCE ulong 4294967295
+const RX_OMEGA_KIND_DEFECT ulong 4
+
+text rxo_id_tag "AIEN_RX_OMEGA_ID_V1"
+
+note Config: 0:n_slots, 1:defect, 2:hot_calls, 3:hot_ns, 4:margin_pct, 5:sandbox_ms
+global rxo_cfg ulong 6
+
+note Faculty state:
+note   0:n_store, 1:require_ev, 2:serve_from_rec, 3:served_ref, 4:served_real,
+note   5:sandbox_runs, 6:sandbox_crashes, 7:registered, 8:reconsider_reg
+global rxo_st ulong 16
+
+note World objects (8 fields each):
+global rxo_request ulong 8
+global rxo_demand ulong 8
+global rxo_result ulong 8
+global rxo_search ulong 8
+global rxo_selection ulong 8
+global rxo_serve_rec ulong 8
+global rxo_exp_ev ulong 8
+global rxo_inquiry ulong 8
+note Per-slot objects: 5 slots x 8 fields = 40 ulongs
+global rxo_candidate ulong 40
+global rxo_verdict ulong 40
+global rxo_measure ulong 40
+
+note Cost model override (for deterministic testing):
+note   0:enabled, 1..5:cost_per_call_ns for kind 0..4, 6:cost_ref_ns
+global rxo_cost_ov ulong 8
+
+note Content-addressed realization store (16 slots):
+note   rxo_store_id:   16 x 32 uchar = 512
+note   rxo_store_code: 16 x 256 uchar = 4096
+note   rxo_store_meta: 16 x 5 ulong = 80 (0:kind, 1:code_len, 2:verified, 3:parent_runs, 4:defect_mode)
+global rxo_store_id uchar 512
+global rxo_store_code uchar 4096
+global rxo_store_meta ulong 80
+
+note Scratch buffers for matvec (up to 64x64 = 4096 elems for pure OM-2 execution)
+global rxo_mat_a ulong 4096
+global rxo_vec_x ulong 256
+global rxo_vec_y ulong 256
+global rxo_vec_yref ulong 256
+global rxo_readmit_why ulong 1
+global rxo_vstat ulong 2
+
+fn rxo_mix s ulong to ulong
+  z = add s ulong 11400714819323198485
+  z = mul xor z shr z 30 ulong 13787848793156543929
+  z = mul xor z shr z 27 ulong 10723151780598845931
+  ret xor z shr z 31
+end
+
+fn rxo_step_state s ulong to ulong
+  ret add s ulong 11400714819323198485
+end
+
+fn rx_omega_regime m ulong n ulong to ulong
+  ret or shl m 32 n
+end
+
+fn rx_omega_shape_ok m ulong n ulong to ulong
+  if eq m 0
+    ret 0
+  end
+  if eq n 0
+    ret 0
+  end
+  if gt m RX_OMEGA_MAX_ELEMS
+    ret 0
+  end
+  if gt n RX_OMEGA_MAX_ELEMS
+    ret 0
+  end
+  if gt mul m n RX_OMEGA_MAX_ELEMS
+    ret 0
+  end
+  ret 1
+end
+
+fn rx_omega_fill seed ulong a_buf edit ulong * x_buf edit ulong * regime ulong to void
+  m = shr regime 32
+  n = and regime 4294967295
+  s = seed
+  total = mul m n
+  for i ulong total bound 65536
+    v = rxo_mix s
+    s = rxo_step_state s
+    put a_buf i v
+  end
+  for j ulong n bound 65536
+    v = rxo_mix s
+    s = rxo_step_state s
+    put x_buf j v
+  end
+end
+
+fn rx_omega_digest y_buf view ulong * m ulong to ulong
+  pos = ulong 0
+  for i ulong m bound 65536
+    v = get y_buf i
+    for k ulong 8
+      put sh_dat add pos k uchar and shr v mul k 8 255
+    end
+    pos = add pos 8
+  end
+  sh_all pos
+  res = ulong 0
+  for k ulong 8
+    b = ulong get sh_dig k
+    res = or res shl b mul k 8
+  end
+  ret res
+end
+
+fn rxo_dot_row a_buf view ulong * x_buf view ulong * row ulong nlim ulong to ulong
+  acc = ulong 0
+  for j ulong nlim bound 4096
+    acc = add acc mul get a_buf add row j get x_buf j
+  end
+  ret acc
+end
+
+fn rx_omega_matvec_ref a_buf view ulong * x_buf view ulong * y_buf edit ulong * to void
+  m = len y_buf
+  n = len x_buf
+  for i ulong m bound 4096
+    put y_buf i rxo_dot_row a_buf x_buf mul i n n
+  end
+end
+
+fn rx_omega_matvec_skip_rem a_buf view ulong * x_buf view ulong * y_buf edit ulong * to void
+  m = len y_buf
+  n = len x_buf
+  n4 = mul div n 4 4
+  for i ulong m bound 4096
+    put y_buf i rxo_dot_row a_buf x_buf mul i n n4
+  end
+end
+
+fn rxo_id_word_from_store slot ulong widx ulong to ulong
+  base = add mul slot 32 mul widx 8
+  v = ulong 0
+  for b ulong 8
+    v = or v shl ulong get rxo_store_id add base b mul b 8
+  end
+  ret v
+end
+
+fn rxo_id_word_from_buf id_buf view uchar * widx ulong to ulong
+  base = mul widx 8
+  v = ulong 0
+  for b ulong 8
+    v = or v shl ulong get id_buf add base b mul b 8
+  end
+  ret v
+end
+
+fn rxo_put_u64_le dst edit uchar * base ulong w ulong to void
+  for b ulong 8
+    sh = mul b 8
+    val = and shr w sh 255
+    put dst add base b uchar val
+  end
+end
+
+fn rxo_id_from_words words view ulong * off ulong dst edit uchar * to void
+  for i ulong 4
+    w = get words add off i
+    rxo_put_u64_le dst mul i 8 w
+  end
+end
+
+fn rx_omega_default_config to void
+  put rxo_cfg 0 4
+  put rxo_cfg 1 RX_OMEGA_DEFECT_NONE
+  put rxo_cfg 2 64
+  put rxo_cfg 3 1000000
+  put rxo_cfg 4 5
+  put rxo_cfg 5 5000
+end
+
+fn rx_omega_destroy to void
+  for i ulong 16
+    put rxo_st i 0
+  end
+  for i ulong 80
+    put rxo_store_meta i 0
+  end
+  for i ulong 512
+    put rxo_store_id i 0
+  end
+  for i ulong 4096
+    put rxo_store_code i 0
+  end
+  for i ulong 8
+    put rxo_cost_ov i 0
+  end
+end
+
+fn rx_omega_create_objects to long
+  ns = get rxo_cfg 0
+  def = get rxo_cfg 1
+  if ne def RX_OMEGA_DEFECT_NONE
+    ns = RX_OMEGA_SLOTS
+    put rxo_cfg 0 ns
+  end
+  if eq ns 0
+    ret RX_OMEGA_ERR
+  end
+  if gt ns RX_OMEGA_SLOTS
+    ret RX_OMEGA_ERR
+  end
+  rx_omega_destroy
+  for i ulong 8
+    put rxo_request i 0
+    put rxo_demand i 0
+    put rxo_result i 0
+    put rxo_search i 0
+    put rxo_selection i 0
+    put rxo_serve_rec i 0
+    put rxo_exp_ev i 0
+    put rxo_inquiry i 0
+  end
+  for i ulong 40
+    put rxo_candidate i 0
+    put rxo_verdict i 0
+    put rxo_measure i 0
+  end
+  ret RX_OMEGA_OK
+end
+
+fn rx_omega_register to long
+  put rxo_st 7 1
+  ret RX_OMEGA_OK
+end
+
+fn rx_omega_require_evidence cap_id ulong to long
+  if eq cap_id 4294967295
+    ret RX_OMEGA_ERR
+  end
+  put rxo_st 1 1
+  ret RX_OMEGA_OK
+end
+
+fn rx_omega_serve_from cap_id ulong to long
+  if eq cap_id 4294967295
+    ret RX_OMEGA_ERR
+  end
+  put rxo_st 2 1
+  ret RX_OMEGA_OK
+end
+
+fn rx_omega_register_reconsider to long
+  put rxo_st 8 1
+  ret RX_OMEGA_OK
+end
+
+fn rx_omega_identity_of code view uchar * clen ulong dst_id edit uchar * to long
+  if eq clen 0
+    ret RX_OMEGA_ERR
+  end
+  if gt clen RX_OMEGA_MAX_CODE
+    ret RX_OMEGA_ERR
+  end
+  if gt clen len code
+    ret RX_OMEGA_ERR
+  end
+  tlen = len rxo_id_tag
+  for i ulong tlen bound 32
+    put sh_dat i get rxo_id_tag i
+  end
+  pos = tlen
+  for k ulong 8
+    put sh_dat add pos k uchar and shr clen mul k 8 255
+  end
+  pos = add pos 8
+  for i ulong clen bound 256
+    put sh_dat add pos i get code i
+  end
+  pos = add pos clen
+  sh_all pos
+  for i ulong 32
+    put dst_id i get sh_dig i
+  end
+  ret RX_OMEGA_OK
+end
+
+fn rxo_store_find_id id_buf view uchar * to long
+  n = get rxo_st 0
+  for i ulong n bound 16
+    base = mul i 32
+    same = ulong 1
+    for b ulong 32
+      if ne get rxo_store_id add base b get id_buf b
+        same = ulong 0
+      end
+    end
+    if ne same 0
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn rx_omega_store_find w0 ulong to long
+  n = get rxo_st 0
+  for i ulong n bound 16
+    if eq rxo_id_word_from_store i 0 w0
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn rxo_store_eq_slot slot ulong code view uchar * clen ulong to ulong
+  if ne get rxo_store_meta add mul slot 5 1 clen
+    ret 0
+  end
+  cb = mul slot 256
+  for i ulong clen bound 256
+    if ne get rxo_store_code add cb i get code i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rxo_store_put id_buf view uchar * code view uchar * meta_kd ulong clen ulong to long
+  if eq clen 0
+    ret -1
+  end
+  if gt clen RX_OMEGA_MAX_CODE
+    ret -1
+  end
+  existing = rxo_store_find_id id_buf
+  if ge existing 0
+    if eq rxo_store_eq_slot ulong existing code clen 0
+      ret -1
+    end
+    ret 0
+  end
+  n = get rxo_st 0
+  if ge n RX_OMEGA_STORE
+    ret -1
+  end
+  for b ulong 32
+    put rxo_store_id add mul n 32 b get id_buf b
+  end
+  for i ulong clen bound 256
+    put rxo_store_code add mul n 256 i get code i
+  end
+  put rxo_store_meta mul n 5 shr meta_kd 32
+  put rxo_store_meta add mul n 5 1 clen
+  put rxo_store_meta add mul n 5 2 0
+  put rxo_store_meta add mul n 5 3 0
+  put rxo_store_meta add mul n 5 4 and meta_kd 4294967295
+  put rxo_st 0 add n 1
+  ret 0
+end
+
+fn rxo_cost_for kind ulong m ulong n ulong calls ulong to ulong
+  if ne get rxo_cost_ov 0 0
+    if eq kind RX_OMEGA_COST_REFERENCE
+      ret mul get rxo_cost_ov 6 calls
+    end
+    if lt kind RX_OMEGA_SLOTS
+      ret mul get rxo_cost_ov add 1 kind calls
+    end
+  end
+  note Default deterministic synthetic cost model proportional to M*N*calls
+  base_c = add mul m n 10
+  if eq kind RX_OMEGA_COST_REFERENCE
+    ret mul mul base_c 4 calls
+  end
+  if eq kind 0
+    ret mul mul base_c 3 calls
+  end
+  if eq kind 1
+    ret mul mul base_c 2 calls
+  end
+  ret mul base_c calls
+end
+
+fn rxo_synth_code kind ulong defect ulong dst edit uchar * to ulong
+  note Deterministic 16-byte AArch64-shaped realization template per kind
+  note Magic header 0x4F 0x4D 0x56 0x31 ("OMV1"), kind byte, ret sentinel 0xC0 0x03 0x5F 0xD6
+  put dst 0 79
+  put dst 1 77
+  put dst 2 86
+  put dst 3 49
+  put dst 4 uchar and kind 255
+  put dst 5 uchar and defect 255
+  put dst 6 0
+  put dst 7 0
+  put dst 8 0
+  put dst 9 0
+  put dst 10 0
+  put dst 11 0
+  put dst 12 192
+  put dst 13 3
+  put dst 14 95
+  put dst 15 214
+  ret 16
+end
+
+fn rxo_struct_ok code view uchar * clen ulong to ulong
+  if lt clen 16
+    ret 0
+  end
+  if ne rem clen 4 0
+    ret 0
+  end
+  if ne get code 0 79
+    ret 0
+  end
+  if ne get code 1 77
+    ret 0
+  end
+  if ne get code sub clen 4 192
+    ret 0
+  end
+  if ne get code sub clen 1 214
+    ret 0
+  end
+  ret 1
+end
+
+fn rxo_fill_local seed ulong m ulong n ulong to void
+  s = seed
+  total = mul m n
+  for i ulong total bound 4096
+    v = rxo_mix s
+    s = rxo_step_state s
+    put rxo_mat_a i v
+  end
+  for j ulong n bound 256
+    v = rxo_mix s
+    s = rxo_step_state s
+    put rxo_vec_x j v
+  end
+end
+
+fn rxo_dot_local row ulong nlim ulong to ulong
+  acc = ulong 0
+  for j ulong nlim bound 256
+    acc = add acc mul get rxo_mat_a add row j get rxo_vec_x j
+  end
+  ret acc
+end
+
+fn rxo_run_matvec_local skip_rem ulong m ulong n ulong dst_ref ulong to void
+  nlim = n
+  if ne skip_rem 0
+    nlim = mul div n 4 4
+  end
+  for i ulong m bound 256
+    acc = rxo_dot_local mul i n nlim
+    if ne dst_ref 0
+      put rxo_vec_yref i acc
+    else
+      put rxo_vec_y i acc
+    end
+  end
+end
+
+fn rxo_digest_local_y m ulong to ulong
+  pos = ulong 0
+  for i ulong m bound 256
+    v = get rxo_vec_y i
+    for k ulong 8
+      put sh_dat add pos k uchar and shr v mul k 8 255
+    end
+    pos = add pos 8
+  end
+  sh_all pos
+  res = ulong 0
+  for k ulong 8
+    b = ulong get sh_dig k
+    res = or res shl b mul k 8
+  end
+  ret res
+end
+
+fn rxo_verify_code_and_struct slot ulong id_buf view uchar * to ulong
+  clen = get rxo_store_meta add mul slot 5 1
+  code = new uchar 256 0
+  for i ulong clen bound 256
+    put code i get rxo_store_code add mul slot 256 i
+  end
+  again = new uchar 32 0
+  if ne rx_omega_identity_of code clen again 0
+    ret RX_OMEGA_WHY_IDENTITY
+  end
+  for b ulong 32
+    if ne get again b get id_buf b
+      ret RX_OMEGA_WHY_IDENTITY
+    end
+  end
+  if eq rxo_struct_ok code clen 0
+    ret RX_OMEGA_WHY_STRUCTURE
+  end
+  ret RX_OMEGA_WHY_NONE
+end
+
+fn rxo_diff_one seed ulong skip_r ulong m ulong n ulong to ulong
+  rxo_fill_local seed m n
+  rxo_run_matvec_local 0 m n 1
+  rxo_run_matvec_local skip_r m n 0
+  fails = ulong 0
+  for i ulong m bound 256
+    if ne get rxo_vec_y i get rxo_vec_yref i
+      fails = add fails 1
+    end
+  end
+  ret fails
+end
+
+fn rxo_verify_stored id_buf view uchar * m ulong n ulong to ulong
+  slot_i = rxo_store_find_id id_buf
+  if lt slot_i 0
+    put rxo_vstat 0 0
+    put rxo_vstat 1 0
+    ret RX_OMEGA_WHY_UNKNOWN
+  end
+  slot = ulong slot_i
+  w1 = rxo_verify_code_and_struct slot id_buf
+  if ne w1 RX_OMEGA_WHY_NONE
+    put rxo_vstat 0 2
+    put rxo_vstat 1 1
+    ret w1
+  end
+  put rxo_st 5 add get rxo_st 5 1
+  dmode = get rxo_store_meta add mul slot 5 4
+  if eq dmode RX_OMEGA_DEFECT_CRASH
+    put rxo_st 6 add get rxo_st 6 1
+    put rxo_vstat 0 2
+    put rxo_vstat 1 1
+    ret RX_OMEGA_WHY_CRASHED
+  end
+  skip_r = ulong 0
+  if eq dmode RX_OMEGA_DEFECT_SKIP_REMAINDER
+    skip_r = ulong 1
+  end
+  w0 = rxo_id_word_from_buf id_buf 0
+  if gt rxo_diff_one w0 skip_r 5 7 0
+    put rxo_vstat 0 3
+    put rxo_vstat 1 1
+    ret RX_OMEGA_WHY_DIFFERENTIAL
+  end
+  if le mul m n 4096
+    if le m 256
+      if le n 256
+        if gt rxo_diff_one add w0 1 skip_r m n 0
+          put rxo_vstat 0 4
+          put rxo_vstat 1 1
+          ret RX_OMEGA_WHY_DIFFERENTIAL
+        end
+      end
+    end
+  end
+  put rxo_store_meta add mul slot 5 2 1
+  put rxo_vstat 0 4
+  put rxo_vstat 1 0
+  ret RX_OMEGA_WHY_NONE
+end
+
+fn rxo_serve_update_demand m ulong n ulong used ulong ns ulong to void
+  same = ulong 0
+  if eq get rxo_demand 4 m
+    if eq get rxo_demand 5 n
+      same = ulong 1
+    end
+  end
+  calls = ulong 1
+  spent = ns
+  if ne same 0
+    calls = add get rxo_demand 0 1
+    spent = add get rxo_demand 1 ns
+  end
+  put rxo_demand 0 calls
+  put rxo_demand 1 spent
+  if eq rem calls RX_OMEGA_WINDOW 0
+    put rxo_demand 2 add get rxo_demand 2 1
+    put rxo_demand 3 div spent calls
+  end
+  if eq same 0
+    put rxo_demand 4 m
+    put rxo_demand 5 n
+  end
+  put rxo_demand 6 used
+  put rxo_demand 7 add get rxo_demand 7 1
+end
+
+global rxo_serve_used ulong 1
+
+fn rxo_serve_lookup m ulong n ulong to ulong
+  put rxo_serve_used 0 0
+  sel_ep = get rxo_selection 0
+  sel_w0 = get rxo_selection 1
+  sel_reg = get rxo_selection 6
+  if ne get rxo_st 2 0
+    sel_ep = get rxo_serve_rec 0
+    sel_w0 = get rxo_serve_rec 1
+    sel_reg = get rxo_serve_rec 6
+  end
+  if eq sel_ep 0
+    ret RX_OMEGA_COST_REFERENCE
+  end
+  if ne sel_reg rx_omega_regime m n
+    ret RX_OMEGA_COST_REFERENCE
+  end
+  if eq sel_w0 0
+    ret RX_OMEGA_COST_REFERENCE
+  end
+  si = rx_omega_store_find sel_w0
+  if lt si 0
+    ret RX_OMEGA_COST_REFERENCE
+  end
+  mb = mul ulong si 5
+  if eq get rxo_store_meta add mb 2 0
+    ret RX_OMEGA_COST_REFERENCE
+  end
+  put rxo_serve_used 0 sel_w0
+  put rxo_store_meta add mb 3 add get rxo_store_meta add mb 3 1
+  ret get rxo_store_meta mb
+end
+
+fn rx_omega_fn_serve to long
+  seq = get rxo_request 0
+  m = get rxo_request 1
+  n = get rxo_request 2
+  if eq seq 0
+    ret 0
+  end
+  if eq rx_omega_shape_ok m n 0
+    ret -1
+  end
+  if gt mul m n 4096
+    ret -1
+  end
+  if gt m 256
+    ret -1
+  end
+  if gt n 256
+    ret -1
+  end
+  rxo_fill_local get rxo_request 3 m n
+  kind = rxo_serve_lookup m n
+  used = get rxo_serve_used 0
+  rxo_run_matvec_local 0 m n 0
+  ns = rxo_cost_for kind m n 1
+  if ne used 0
+    put rxo_st 4 add get rxo_st 4 1
+  else
+    put rxo_st 3 add get rxo_st 3 1
+  end
+  put rxo_result 0 seq
+  put rxo_result 1 rxo_digest_local_y m
+  put rxo_result 2 used
+  put rxo_result 3 ns
+  rxo_serve_update_demand m n used ns
+  ret 0
+end
+
+fn rx_omega_fn_watch to long
+  m = get rxo_demand 4
+  n = get rxo_demand 5
+  if eq m 0
+    ret 0
+  end
+  if eq n 0
+    ret 0
+  end
+  if ne get rxo_search 0 0
+    if eq get rxo_search 1 m
+      if eq get rxo_search 2 n
+        ret 0
+      end
+    end
+  end
+  if lt get rxo_demand 0 get rxo_cfg 2
+    ret 0
+  end
+  if lt get rxo_demand 1 get rxo_cfg 3
+    ret 0
+  end
+  put rxo_search 0 add get rxo_search 0 1
+  put rxo_search 1 m
+  put rxo_search 2 n
+  put rxo_search 3 get rxo_demand 3
+  put rxo_search 4 get rxo_demand 0
+  put rxo_search 5 get rxo_demand 1
+  ret 0
+end
+
+fn rx_omega_fn_synthesize k ulong to long
+  if ge k get rxo_cfg 0
+    ret -1
+  end
+  epoch = get rxo_search 0
+  cb = mul k 8
+  if eq epoch 0
+    ret 0
+  end
+  if eq get rxo_candidate cb epoch
+    ret 0
+  end
+  code = new uchar 256 0
+  id_buf = new uchar 32 0
+  dmode = ulong 0
+  if eq k RX_OMEGA_KIND_DEFECT
+    dmode = get rxo_cfg 1
+  end
+  clen = rxo_synth_code k dmode code
+  if ne rx_omega_identity_of code clen id_buf 0
+    ret -1
+  end
+  if eq dmode RX_OMEGA_DEFECT_TAMPER
+    note Keep claimed identity of original bytes, but store tampered bytes
+    put code 8 255
+  end
+  if ne rxo_store_put id_buf code or shl k 32 dmode clen 0
+    ret -1
+  end
+  put rxo_candidate cb epoch
+  put rxo_candidate add cb 1 k
+  for i ulong 4
+    put rxo_candidate add cb add 2 i rxo_id_word_from_buf id_buf i
+  end
+  put rxo_candidate add cb 6 clen
+  put rxo_candidate add cb 7 RX_OMEGA_SYNTHESIZED
+  ret 0
+end
+
+fn rx_omega_fn_verify k ulong to long
+  if ge k get rxo_cfg 0
+    ret -1
+  end
+  cb = mul k 8
+  epoch = get rxo_candidate cb
+  if ne get rxo_candidate add cb 7 RX_OMEGA_SYNTHESIZED
+    ret 0
+  end
+  if eq epoch 0
+    ret 0
+  end
+  if eq get rxo_verdict cb epoch
+    ret 0
+  end
+  words = new ulong 4 0
+  for i ulong 4
+    put words i get rxo_candidate add cb add 2 i
+  end
+  id_buf = new uchar 32 0
+  rxo_id_from_words words 0 id_buf
+  why = rxo_verify_stored id_buf get rxo_search 1 get rxo_search 2
+  put rxo_verdict cb epoch
+  if eq why RX_OMEGA_WHY_NONE
+    put rxo_verdict add cb 1 RX_OMEGA_PASSED
+  else
+    put rxo_verdict add cb 1 RX_OMEGA_REFUSED
+  end
+  put rxo_verdict add cb 2 get rxo_vstat 0
+  put rxo_verdict add cb 3 get rxo_vstat 1
+  put rxo_verdict add cb 4 get words 0
+  put rxo_verdict add cb 5 why
+  ret 0
+end
+
+fn rx_omega_fn_measure k ulong to long
+  if ge k get rxo_cfg 0
+    ret -1
+  end
+  cb = mul k 8
+  epoch = get rxo_verdict cb
+  if eq epoch 0
+    ret 0
+  end
+  if ne epoch get rxo_candidate cb
+    ret 0
+  end
+  if ne epoch get rxo_search 0
+    ret 0
+  end
+  if eq get rxo_measure cb epoch
+    ret 0
+  end
+  cps = ulong 0
+  rps = ulong 0
+  state = RX_OMEGA_DECLINED
+  if eq get rxo_verdict add cb 1 RX_OMEGA_PASSED
+    si = rx_omega_store_find get rxo_candidate add cb 2
+    if ge si 0
+      mb = mul ulong si 5
+      if ne get rxo_store_meta add mb 2 0
+        if ne rx_omega_shape_ok get rxo_search 1 get rxo_search 2 0
+          cps = mul rxo_cost_for get rxo_store_meta mb get rxo_search 1 get rxo_search 2 1 1000
+          rps = mul rxo_cost_for RX_OMEGA_COST_REFERENCE get rxo_search 1 get rxo_search 2 1 1000
+          state = RX_OMEGA_MEASURED
+          put rxo_store_meta add mb 3 add get rxo_store_meta add mb 3 70
+        end
+      end
+    end
+  end
+  put rxo_measure cb epoch
+  put rxo_measure add cb 1 state
+  put rxo_measure add cb 2 cps
+  put rxo_measure add cb 3 rps
+  for i ulong 4
+    put rxo_measure add cb add 4 i get rxo_candidate add cb add 2 i
+  end
+  ret 0
+end
+
+fn rxo_select_write epoch ulong best_k long best_cps ulong best_rps ulong ref_ps ulong to void
+  put rxo_selection 0 epoch
+  if ge best_k 0
+    bb = mul ulong best_k 8
+    for i ulong 4
+      put rxo_selection add 1 i get rxo_measure add bb add 4 i
+    end
+    put rxo_selection 5 best_cps
+    put rxo_selection 7 best_rps
+  else
+    for i ulong 4
+      put rxo_selection add 1 i 0
+    end
+    put rxo_selection 5 ref_ps
+    put rxo_selection 7 ref_ps
+  end
+  put rxo_selection 6 rx_omega_regime get rxo_search 1 get rxo_search 2
+end
+
+fn rxo_beats_margin cps ulong rps ulong to ulong
+  lhs = mul cps 100
+  rhs = mul rps sub 100 get rxo_cfg 4
+  if gt lhs rhs
+    ret 0
+  end
+  ret 1
+end
+
+fn rx_omega_fn_select to long
+  epoch = get rxo_search 0
+  if eq epoch 0
+    ret 0
+  end
+  if eq get rxo_selection 0 epoch
+    ret 0
+  end
+  if ne get rxo_st 1 0
+    if gt epoch 1
+      if ne get rxo_exp_ev 0 epoch
+        ret 0
+      end
+      if ne get rxo_exp_ev 2 1
+        ret 0
+      end
+    end
+  end
+  best_k = long -1
+  best_cps = ulong 0
+  best_rps = ulong 0
+  ref_ps = ulong 0
+  for k ulong get rxo_cfg 0 bound 5
+    mb = mul k 8
+    if ne get rxo_measure mb epoch
+      ret 0
+    end
+    if ne get rxo_measure add mb 1 RX_OMEGA_MEASURED
+      continue
+    end
+    cps = get rxo_measure add mb 2
+    rps = get rxo_measure add mb 3
+    if eq ref_ps 0
+      ref_ps = rps
+    else
+      if lt rps ref_ps
+        ref_ps = rps
+      end
+    end
+    if eq rxo_beats_margin cps rps 0
+      continue
+    end
+    if lt best_k 0
+      best_k = long k
+      best_cps = cps
+      best_rps = rps
+    else
+      if lt cps best_cps
+        best_k = long k
+        best_cps = cps
+        best_rps = rps
+      end
+    end
+  end
+  rxo_select_write epoch best_k best_cps best_rps ref_ps
+  ret 0
+end
+
+fn rx_omega_fn_reconsider to long
+  seq = get rxo_inquiry 0
+  if eq seq 0
+    ret 0
+  end
+  if eq seq get rxo_search 6
+    ret 0
+  end
+  if ne get rxo_search 0 get rxo_selection 0
+    ret 0
+  end
+  reg = get rxo_inquiry 2
+  m = shr reg 32
+  n = and reg 4294967295
+  if ne get rxo_inquiry 1 RX_OMEGA_INQ_RESEARCH
+    put rxo_search 6 seq
+    ret 0
+  end
+  if eq rx_omega_shape_ok m n 0
+    put rxo_search 6 seq
+    ret 0
+  end
+  put rxo_search 0 add get rxo_search 0 1
+  put rxo_search 1 m
+  put rxo_search 2 n
+  put rxo_search 6 seq
+  ret 0
+end
+
+fn rx_omega_readmit code view uchar * meta_kcl ulong regime ulong out_id edit uchar * to long
+  kind = shr meta_kcl 32
+  clen = and meta_kcl 4294967295
+  if ge kind get rxo_cfg 0
+    ret -1
+  end
+  m = shr regime 32
+  n = and regime 4294967295
+  if eq rx_omega_shape_ok m n 0
+    ret -1
+  end
+  if ne rx_omega_identity_of code clen out_id 0
+    ret -1
+  end
+  if ne rxo_store_put out_id code shl kind 32 clen 0
+    put rxo_readmit_why 0 RX_OMEGA_WHY_IDENTITY
+    ret 1
+  end
+  why = rxo_verify_stored out_id m n
+  put rxo_readmit_why 0 why
+  if eq why RX_OMEGA_WHY_NONE
+    ret 0
+  end
+  ret 1
+end

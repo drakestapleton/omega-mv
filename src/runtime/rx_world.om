@@ -1,0 +1,2209 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_world.om -- Pure seeded OM-2 port of src/runtime/rx_world.c.
+note Resident reaction runtime (ADR 0016):
+note   - Lifecycle FSM (rx_state_transition_legal), resource admission (res_fits,
+note     better_admit, starvation-bounded pick_admit / pop_ready)
+note   - Object lifecycle (create, retire, read, explain, AIEN_RX_OBJECT_V1 and
+note     AIEN_RX_WORLD_V1 SHA-256 digests)
+note   - Content-addressed causal crumb log (AIEN_RX_CAUSAL_V1 SHA-256 with sorted
+note     parents and parent digest chaining, verify_crumbs, crumb_origin, recorder)
+note   - Capability validation (built-in cap table + slotted cap refs)
+note   - R16 C5/C7 caller credentials (AIEN_RX_CALLER_V1 SHA-256, enroll, bind,
+note     revoke, constant-time check, caller_check_fn with HOLD/RELEASE/HALTED)
+note   - R16 G6 operator emergency stop (authorize, stop, resume, halt_status,
+note     halt_dir path check)
+note   - COMPOSITION-2 commit binders (set_binder, bind_field, clear_binder,
+note     binder_count, two-phase check/bind/abort)
+note   - Reactions, dependency index, remove_reaction + slot reuse, footprint,
+note     external publication, fan-out deferral, R6 stability containment
+note     (budget, oscillation, livelock, conflict, backoff), HD-09 deadlines,
+note     defer/resume, sequential activation, and resident seat accept/seat_lost.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const RW_OK long 0
+const RW_ERR_ARG long -1
+const RW_ERR_FULL long -2
+const RW_ERR_STALE_GEN long -3
+const RW_ERR_AUTHORITY long -4
+const RW_ERR_WRITE_SET long -5
+const RW_ERR_NOT_FOUND long -6
+const RW_ERR_TIMEOUT long -7
+const RW_ERR_TORN long -22
+const RW_ERR_UNPLACED long -24
+const RW_ERR_EXISTS long -25
+const RW_ERR_SEAT_LOST long -26
+const RW_ERR_IDENTITY long -27
+const RW_ERR_BINDING long -28
+const RW_ERR_BUSY long -29
+const RW_ERR_DEADLINE long -30
+const RW_ERR_HALTED long -31
+
+const RW_CALLER_OK long 0
+const RW_CALLER_ERR_ABSENT long -1
+const RW_CALLER_ERR_UNKNOWN long -2
+const RW_CALLER_ERR_REVOKED long -3
+const RW_CALLER_ERR_STALE long -4
+const RW_CALLER_ERR_FORGED long -5
+const RW_CALLER_ERR_EXISTS long -6
+const RW_CALLER_ERR_CLOSED long -7
+const RW_CALLER_ERR_FULL long -8
+const RW_CALLER_ERR_HALTED long -10
+
+const RW_CALLER_OP_CHECK ulong 0
+const RW_CALLER_OP_HOLD ulong 1
+const RW_CALLER_OP_RELEASE ulong 2
+
+const RW_CAP_OK long 0
+const RW_CAP_ERR_STATE long -1
+const RW_CAP_ERR_DENIED long -2
+
+const RW_HALT_ALREADY long 1
+const RW_HALT_NOT_STOPPED long 2
+
+const RW_WORLD_RES_CONTROL ulong 2310
+const RW_RIGHT_READ ulong 1
+const RW_RIGHT_WRITE ulong 2
+const RW_RIGHT_EPOCH ulong 16
+const RW_WORLD_RIGHT_HALT ulong 16
+
+const RW_MAX_OBJECTS ulong 32
+const RW_MAX_FIELDS ulong 8
+const RW_MAX_REACTIONS ulong 32
+const RW_MAX_DEPS ulong 8
+const RW_MAX_WRITES ulong 8
+const RW_MAX_CAPS_PER_RX ulong 8
+const RW_MAX_SUBS ulong 32
+const RW_MAX_CRUMBS ulong 128
+const RW_MAX_PARENTS ulong 16
+const RW_PRIORITY_CLASSES ulong 7
+const RW_MAX_CALLERS ulong 32
+const RW_MAX_CAP_TABLE ulong 64
+const RW_MAX_BINDERS ulong 4
+const RW_MAX_DEFERRED ulong 64
+const RW_MAX_TIMING ulong 64
+const RW_ALL_FIELDS ulong 255
+const RW_NO_REACTION ulong 4294967295
+
+const RW_ST_DORMANT ulong 0
+const RW_ST_READY ulong 1
+const RW_ST_BLOCKED_AUTH ulong 2
+const RW_ST_BLOCKED_RES ulong 3
+const RW_ST_RUNNING ulong 4
+const RW_ST_PUBLISHING ulong 5
+const RW_ST_COMMITTED ulong 6
+const RW_ST_INVALIDATED ulong 7
+const RW_ST_FAILED ulong 8
+const RW_ST_CANCELLED ulong 9
+const RW_ST_CONFLICT ulong 10
+const RW_ST_REJECTED ulong 11
+
+const RW_CRUMB_CREATE ulong 1
+const RW_CRUMB_EXTERNAL ulong 2
+const RW_CRUMB_COMMIT ulong 3
+const RW_CRUMB_INVALIDATED ulong 4
+const RW_CRUMB_BLOCKED_AUTH ulong 5
+const RW_CRUMB_REJECTED ulong 6
+const RW_CRUMB_FAILED ulong 7
+const RW_CRUMB_NOOP ulong 8
+const RW_CRUMB_RETIRE ulong 9
+const RW_CRUMB_QUARANTINE ulong 10
+const RW_CRUMB_CANCELLED ulong 11
+const RW_CRUMB_OPERATOR_STOP ulong 12
+const RW_CRUMB_OPERATOR_RESUME ulong 13
+
+const RW_CONTAIN_BUDGET ulong 1
+const RW_CONTAIN_OSCILLATION ulong 2
+const RW_CONTAIN_LIVELOCK ulong 3
+const RW_CONTAIN_CONFLICT ulong 4
+
+const RW_LOOP_ORDINARY ulong 0
+const RW_LOOP_PERIODIC ulong 1
+const RW_ACCEL_BLACKWELL ulong 2
+const RW_FACULTY_EXTERNAL ulong 0
+
+text rw_tag_obj "AIEN_RX_OBJECT_V1"
+text rw_tag_world "AIEN_RX_WORLD_V1"
+text rw_tag_causal "AIEN_RX_CAUSAL_V1"
+text rw_tag_caller "AIEN_RX_CALLER_V1"
+
+note World core scalars (32 ulongs):
+note   0:init, 1:sequential, 2:n_reactions, 3:n_crumbs, 4:crumb_cap,
+note   5:in_flight, 6:used_slots, 7:used_memory, 8:used_energy, 9:admit_seq,
+note   10:peak_slots, 11:peak_blocked, 12:external_subject, 13:n_callers,
+note   14:caller_gen, 15:callers_bound, 16:halted, 17:halt_seq, 18:halt_subj,
+note   19:halt_cap_id, 20:halt_cap_gen, 21:halt_reason, 22:halt_crumb,
+note   23:halt_refused, 24:halt_cancelled, 25:n_binders, 26:n_deferred,
+note   27:deferred_head, 28:deferred_len, 29:seat_gen, 30:rec_active, 31:rec_count
+global rw_w ulong 32
+
+note Resource budget (8 ulongs):
+note   0:slots, 1:starvation_bound, 2:offered_loc, 3:offered_accel,
+note   4:compute_mask, 5:memory_bytes, 6:energy_budget, 7:logical_tick
+global rw_budget ulong 8
+
+note Stability budget (5 ulongs):
+note   0:activation_budget, 1:fanout_limit, 2:oscillation_limit,
+note   3:livelock_limit, 4:conflict_limit
+global rw_stab ulong 5
+
+note Timing status: 0:enabled, 1:cap, 2:n_timing, 3:sim_clock
+global rw_time ulong 4
+
+note World stats (24 ulongs):
+note   0:illegal_trans, 1:wakes, 2:coalesced, 3:subs_checked, 4:subs_matched,
+note   5:commits, 6:invalidations, 7:blocked_auth, 8:blocked_res, 9:rejected,
+note   10:failed, 11:noops, 12:crumb_overflow, 13:suppressed, 14:deferred_wakes,
+note   15:quarantines, 16:osc_trips, 17:livelock_trips, 18:backoffs,
+note   19:periodic_commits, 20:useful_commits, 21:deadline_cancelled, 22:seat_losses,
+note   23:externals
+global rw_stats ulong 24
+
+note Priority queues & fairness debts (7 classes):
+global rw_ready_q ulong 224
+global rw_ready_head ulong 7
+global rw_ready_len ulong 7
+global rw_admit_debt ulong 7
+global rw_run_debt ulong 7
+
+note Deferred wake queue (64 entries: reaction, cause)
+global rw_def_rx ulong 64
+global rw_def_cause ulong 64
+
+note Objects (32 objects):
+note   rw_obj_meta: 32 x 8 (0:live, 1:gen, 2:type, 3:persist, 4:resource, 5:version, 6:placed, 7:bind_mask)
+note   rw_obj_owner: 32 (binder owner index)
+note   rw_obj_fld:   32 x 8 = 256
+note   rw_obj_fver:  32 x 8 = 256
+note   rw_obj_fwr:   32 x 8 = 256
+note   rw_obj_dig:   32 x 32 = 1024 uchar
+global rw_obj_meta ulong 256
+global rw_obj_owner ulong 32
+global rw_obj_fld ulong 256
+global rw_obj_fver ulong 256
+global rw_obj_fwr ulong 256
+global rw_obj_dig uchar 1024
+
+note Subscriptions per object: 32 objects x 32 subs x 3 ulongs (rx, gen, mask) = 3072
+global rw_subs ulong 3072
+global rw_n_subs ulong 32
+
+note Capability table (64 entries x 7 ulongs):
+note   0:live, 1:cap_id, 2:gen, 3:subject, 4:resource, 5:rights, 6:issuer
+global rw_caps ulong 448
+
+note Callers (32 entries):
+note   rw_cal_meta: 32 x 3 (0:subject, 1:live, 2:gen)
+note   rw_cal_dig:  32 x 32 = 1024 uchar
+global rw_cal_meta ulong 96
+global rw_cal_dig uchar 1024
+
+note Commit binders (4 entries x 4 ulongs):
+note   0:active, 1:ctx_id, 2:check_mode (0=ok, 1=fail_check, 2=fail_bind), 3:abort_count
+global rw_binders ulong 16
+
+note Reactions (32 entries):
+note   rw_rx_desc: 32 x 16 (0:faculty, 1:subject, 2:priority, 3:caller_gen, 4:loop_kind,
+note     5:n_trig, 6:n_read, 7:n_write, 8:n_caps, 9:need_mem, 10:need_eng, 11:need_loc,
+note     12:need_acc, 13:need_cc, 14:need_deadline, 15:fn_kind)
+note   rw_rx_st:   32 x 24 (0:state, 1:rearm, 2:quarantined, 3:parked, 4:holding,
+note     5:wake_cause, 6:coalesced, 7:activations, 8:ep_acts, 9:episode, 10:last_crumb,
+note     11:contain_pend, 12:commits, 13:wait_seq, 14:service, 15:noop_streak, 16:osc_streak,
+note     17:conflict_streak, 18:yield_left, 19:last_out, 20:prev_out, 21:have_flags,
+note     22:removed, 23:deferred_or_seat)
+global rw_rx_desc ulong 512
+global rw_rx_st ulong 768
+note Per-reaction deps: 32 x 8 x 3 (obj_id, gen, mask) = 768 for triggers, reads, writes
+global rw_rx_trig ulong 768
+global rw_rx_read ulong 768
+global rw_rx_write ulong 768
+note Per-reaction caps: 32 x 8 x 4 (cap_id, cap_gen, resource, rights) = 1024
+global rw_rx_caps ulong 1024
+
+note Causal crumbs (128 entries):
+note   rw_cr_meta: 128 x 12 (0:id, 1:kind, 2:reaction, 3:faculty, 4:wake_cause, 5:coalesced,
+note     6:n_in, 7:n_caps, 8:n_out, 9:reason, 10:n_parents, 11:episode)
+note   rw_cr_par:  128 x 16 = 2048 ulongs
+note   rw_cr_dig:  128 x 32 = 4096 uchar
+note   rw_cr_in:   128 x 8 x 4 = 4096 (id, gen, ver, mask)
+note   rw_cr_cap:  128 x 8 x 3 = 3072 (cap_id, cap_gen, issuer)
+note   rw_cr_out:  128 x 8 x 4 = 4096 (id, gen, ver, mask)
+global rw_cr_meta ulong 1536
+global rw_cr_par ulong 2048
+global rw_cr_dig uchar 4096
+global rw_cr_in ulong 4096
+global rw_cr_cap ulong 3072
+global rw_cr_out ulong 4096
+
+note ---- SHA-256 byte-packing helpers ----
+
+fn rw_sh_put32 pos ulong v ulong to ulong
+  for k ulong 4
+    put sh_dat add pos k uchar and shr v mul k 8 255
+  end
+  ret add pos 4
+end
+
+fn rw_sh_put64 pos ulong v ulong to ulong
+  for k ulong 8
+    put sh_dat add pos k uchar and shr v mul k 8 255
+  end
+  ret add pos 8
+end
+
+fn rw_obj_digest_recompute oid ulong to void
+  tlen = len rw_tag_obj
+  for i ulong tlen bound 32
+    put sh_dat i get rw_tag_obj i
+  end
+  pos = rw_sh_put32 tlen get rw_obj_meta add mul oid 8 2
+  fb = mul oid 8
+  for f ulong 8
+    pos = rw_sh_put64 pos get rw_obj_fld add fb f
+  end
+  sh_all pos
+  db = mul oid 32
+  for i ulong 32
+    put rw_obj_dig add db i get sh_dig i
+  end
+end
+
+fn rx_world_digest dst edit uchar * to void
+  tlen = len rw_tag_world
+  for i ulong tlen bound 32
+    put sh_dat i get rw_tag_world i
+  end
+  pos = tlen
+  for i ulong RW_MAX_OBJECTS
+    mb = mul i 8
+    if eq get rw_obj_meta mb 0
+      continue
+    end
+    pos = rw_sh_put32 pos i
+    pos = rw_sh_put32 pos get rw_obj_meta add mb 1
+    db = mul i 32
+    for b ulong 32
+      put sh_dat add pos b get rw_obj_dig add db b
+    end
+    pos = add pos 32
+  end
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+note ---- Lifecycle FSM & Admission (exact parity with om/runtime/rx_world_core.om) ----
+
+fn rx_state_transition_legal from_s ulong to_s ulong to ulong
+  if eq from_s RW_ST_DORMANT
+    if eq to_s RW_ST_READY
+      ret 1
+    end
+    if eq to_s RW_ST_BLOCKED_RES
+      ret 1
+    end
+    ret 0
+  end
+  if eq from_s RW_ST_READY
+    if eq to_s RW_ST_RUNNING
+      ret 1
+    end
+    if eq to_s RW_ST_BLOCKED_AUTH
+      ret 1
+    end
+    if eq to_s RW_ST_BLOCKED_RES
+      ret 1
+    end
+    if eq to_s RW_ST_INVALIDATED
+      ret 1
+    end
+    ret 0
+  end
+  if eq from_s RW_ST_RUNNING
+    if eq to_s RW_ST_PUBLISHING
+      ret 1
+    end
+    if eq to_s RW_ST_FAILED
+      ret 1
+    end
+    if eq to_s RW_ST_CANCELLED
+      ret 1
+    end
+    if eq to_s RW_ST_INVALIDATED
+      ret 1
+    end
+    if eq to_s RW_ST_READY
+      ret 1
+    end
+    ret 0
+  end
+  if eq from_s RW_ST_PUBLISHING
+    if eq to_s RW_ST_COMMITTED
+      ret 1
+    end
+    if eq to_s RW_ST_CONFLICT
+      ret 1
+    end
+    if eq to_s RW_ST_REJECTED
+      ret 1
+    end
+    if eq to_s RW_ST_INVALIDATED
+      ret 1
+    end
+    ret 0
+  end
+  if eq from_s RW_ST_BLOCKED_RES
+    if eq to_s RW_ST_DORMANT
+      ret 1
+    end
+    if eq to_s RW_ST_READY
+      ret 1
+    end
+    ret 0
+  end
+  if ge from_s RW_ST_COMMITTED
+    if le from_s RW_ST_REJECTED
+      if eq to_s RW_ST_DORMANT
+        ret 1
+      end
+      ret 0
+    end
+  end
+  if eq from_s RW_ST_BLOCKED_AUTH
+    if eq to_s RW_ST_DORMANT
+      ret 1
+    end
+    ret 0
+  end
+  ret 0
+end
+
+fn rw_set_state rid ulong to_s ulong to void
+  sb = mul rid 24
+  cur = get rw_rx_st sb
+  if eq rx_state_transition_legal cur to_s 0
+    put rw_stats 0 add get rw_stats 0 1
+  end
+  put rw_rx_st sb to_s
+end
+
+fn rw_res_fits rid ulong to ulong
+  if ge get rw_w 6 get rw_budget 0
+    ret 0
+  end
+  umem = get rw_w 7
+  bmem = get rw_budget 5
+  if gt umem bmem
+    ret 0
+  end
+  ueng = get rw_w 8
+  beng = get rw_budget 6
+  if gt ueng beng
+    ret 0
+  end
+  db = mul rid 16
+  if gt get rw_rx_desc add db 9 sub bmem umem
+    ret 0
+  end
+  if gt get rw_rx_desc add db 10 sub beng ueng
+    ret 0
+  end
+  nloc = get rw_rx_desc add db 11
+  if ne nloc 0
+    if ne and nloc get rw_budget 2 nloc
+      ret 0
+    end
+  end
+  nacc = get rw_rx_desc add db 12
+  if ne nacc 0
+    if ne and nacc get rw_budget 3 nacc
+      ret 0
+    end
+  end
+  ncc = get rw_rx_desc add db 13
+  if ne ncc 0
+    bit = shl ulong 1 and ncc 31
+    if eq and get rw_budget 4 bit 0
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rw_better_admit a ulong b ulong to ulong
+  pa = get rw_rx_desc add mul a 16 2
+  pb = get rw_rx_desc add mul b 16 2
+  if ne pa pb
+    if lt pa pb
+      ret 1
+    end
+    ret 0
+  end
+  wa = get rw_rx_st add mul a 24 13
+  wb = get rw_rx_st add mul b 24 13
+  if ne wa wb
+    if lt wa wb
+      ret 1
+    end
+    ret 0
+  end
+  if lt get rw_rx_st add mul a 24 14 get rw_rx_st add mul b 24 14
+    ret 1
+  end
+  ret 0
+end
+
+note ---- Causal Crumb Digest & Verification ----
+
+fn rw_crumb_hash_hdr cidx ulong to ulong
+  tlen = len rw_tag_causal
+  for i ulong tlen bound 32
+    put sh_dat i get rw_tag_causal i
+  end
+  mb = mul cidx 12
+  pos = rw_sh_put64 tlen get rw_cr_meta mb
+  pos = rw_sh_put32 pos get rw_cr_meta add mb 1
+  pos = rw_sh_put32 pos get rw_cr_meta add mb 2
+  pos = rw_sh_put32 pos get rw_cr_meta add mb 3
+  pos = rw_sh_put64 pos get rw_cr_meta add mb 4
+  pos = rw_sh_put64 pos get rw_cr_meta add mb 5
+  ret pos
+end
+
+fn rw_crumb_hash_io cidx ulong pos0 ulong to ulong
+  mb = mul cidx 12
+  ni = get rw_cr_meta add mb 6
+  pos = rw_sh_put32 pos0 ni
+  ib = mul cidx 32
+  for i ulong ni bound 8
+    eb = add ib mul i 4
+    pos = rw_sh_put32 pos get rw_cr_in eb
+    pos = rw_sh_put32 pos get rw_cr_in add eb 1
+    pos = rw_sh_put64 pos get rw_cr_in add eb 2
+    pos = rw_sh_put64 pos get rw_cr_in add eb 3
+  end
+  nc = get rw_cr_meta add mb 7
+  pos = rw_sh_put32 pos nc
+  cb = mul cidx 24
+  for i ulong nc bound 8
+    eb = add cb mul i 3
+    pos = rw_sh_put32 pos get rw_cr_cap eb
+    pos = rw_sh_put64 pos get rw_cr_cap add eb 1
+    pos = rw_sh_put32 pos get rw_cr_cap add eb 2
+  end
+  ret pos
+end
+
+fn rw_crumb_hash_out cidx ulong pos0 ulong to ulong
+  mb = mul cidx 12
+  no = get rw_cr_meta add mb 8
+  pos = rw_sh_put32 pos0 no
+  ob = mul cidx 32
+  for i ulong no bound 8
+    eb = add ob mul i 4
+    pos = rw_sh_put32 pos get rw_cr_out eb
+    pos = rw_sh_put32 pos get rw_cr_out add eb 1
+    pos = rw_sh_put64 pos get rw_cr_out add eb 2
+    pos = rw_sh_put64 pos get rw_cr_out add eb 3
+  end
+  ret rw_sh_put32 pos get rw_cr_meta add mb 9
+end
+
+fn rw_sh_append_cr_dig pos ulong p ulong to ulong
+  base = mul sub p 1 32
+  for b ulong 32
+    put sh_dat add pos b get rw_cr_dig add base b
+  end
+  ret add pos 32
+end
+
+fn rw_crumb_hash_par cidx ulong pos0 ulong to ulong
+  mb = mul cidx 12
+  np = get rw_cr_meta add mb 10
+  pos = rw_sh_put32 pos0 np
+  cid = get rw_cr_meta mb
+  ncr = get rw_w 3
+  for i ulong np bound 16
+    p = get rw_cr_par add mul cidx 16 i
+    pos = rw_sh_put64 pos p
+    if ge p 1
+      if le p ncr
+        if lt p cid
+          pos = rw_sh_append_cr_dig pos p
+        end
+      end
+    end
+  end
+  ret pos
+end
+
+fn rx_world_crumb_digest cidx ulong dst edit uchar * to void
+  p1 = rw_crumb_hash_hdr cidx
+  p2 = rw_crumb_hash_io cidx p1
+  p3 = rw_crumb_hash_out cidx p2
+  p4 = rw_crumb_hash_par cidx p3
+  sh_all p4
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn rw_crumb_add_parent cidx ulong p ulong to void
+  if eq p 0
+    ret
+  end
+  mb = mul cidx 12
+  np = get rw_cr_meta add mb 10
+  pb = mul cidx 16
+  for i ulong np bound 16
+    if eq get rw_cr_par add pb i p
+      ret
+    end
+  end
+  if lt np RW_MAX_PARENTS
+    put rw_cr_par add pb np p
+    put rw_cr_meta add mb 10 add np 1
+  end
+end
+
+fn rw_crumb_sort_parents cidx ulong to void
+  np = get rw_cr_meta add mul cidx 12 10
+  pb = mul cidx 16
+  if le np 1
+    ret
+  end
+  for i ulong sub np 1 bound 16
+    v = get rw_cr_par add pb add i 1
+    j = add i 1
+    while gt j 0 bound 16
+      prev = get rw_cr_par add pb sub j 1
+      if le prev v
+        break
+      end
+      put rw_cr_par add pb j prev
+      j = sub j 1
+    end
+    put rw_cr_par add pb j v
+  end
+end
+
+fn rw_crumb_episode_of cidx ulong cid ulong to ulong
+  mb = mul cidx 12
+  if eq get rw_cr_meta add mb 1 RW_CRUMB_EXTERNAL
+    ret cid
+  end
+  wc = get rw_cr_meta add mb 4
+  if ge wc 1
+    if lt wc cid
+      ret get rw_cr_meta add mul sub wc 1 12 11
+    end
+  end
+  ret 0
+end
+
+fn rw_crumb_finalize cidx ulong to ulong
+  ncr = get rw_w 3
+  if ge ncr get rw_w 4
+    put rw_stats 12 add get rw_stats 12 1
+    ret 0
+  end
+  if ge cidx RW_MAX_CRUMBS
+    put rw_stats 12 add get rw_stats 12 1
+    ret 0
+  end
+  cid = add ncr 1
+  put rw_cr_meta mul cidx 12 cid
+  rw_crumb_sort_parents cidx
+  d = new uchar 32 0
+  rx_world_crumb_digest cidx d
+  for b ulong 32
+    put rw_cr_dig add mul cidx 32 b get d b
+  end
+  put rw_cr_meta add mul cidx 12 11 rw_crumb_episode_of cidx cid
+  put rw_w 3 cid
+  rid = get rw_cr_meta add mul cidx 12 2
+  if lt rid get rw_w 2
+    put rw_rx_st add mul rid 24 10 cid
+  end
+  if ne get rw_w 30 0
+    put rw_w 31 add get rw_w 31 1
+  end
+  ret cid
+end
+
+fn rx_world_crumb cid ulong to long
+  if eq cid 0
+    ret -1
+  end
+  if gt cid get rw_w 3
+    ret -1
+  end
+  ret long sub cid 1
+end
+
+fn rx_world_crumb_origin cid ulong out_info edit ulong * to long
+  if eq cid 0
+    ret RW_ERR_NOT_FOUND
+  end
+  if gt cid get rw_w 3
+    ret RW_ERR_NOT_FOUND
+  end
+  cidx = sub cid 1
+  mb = mul cidx 12
+  rid = get rw_cr_meta add mb 2
+  fac = get rw_cr_meta add mb 3
+  subj = get rw_w 12
+  if lt rid get rw_w 2
+    subj = get rw_rx_desc add mul rid 16 1
+  end
+  put out_info 0 rid
+  put out_info 1 subj
+  put out_info 2 fac
+  kind = get rw_cr_meta add mb 1
+  if eq kind RW_CRUMB_COMMIT
+    ret RW_OK
+  end
+  if eq kind RW_CRUMB_EXTERNAL
+    ret RW_OK
+  end
+  if eq kind RW_CRUMB_CREATE
+    ret 1
+  end
+  ret RW_ERR_ARG
+end
+
+fn rw_verify_one_crumb i ulong to long
+  mb = mul i 12
+  cid = get rw_cr_meta mb
+  if ne cid add i 1
+    ret -1
+  end
+  np = get rw_cr_meta add mb 10
+  for p ulong np bound 16
+    pv = get rw_cr_par add mul i 16 p
+    if eq pv 0
+      ret -2
+    end
+    if ge pv cid
+      ret -2
+    end
+  end
+  d = new uchar 32 0
+  rx_world_crumb_digest i d
+  for b ulong 32
+    if ne get d b get rw_cr_dig add mul i 32 b
+      ret -3
+    end
+  end
+  if ne get rw_cr_meta add mb 11 rw_crumb_episode_of i cid
+    ret -4
+  end
+  ret 0
+end
+
+fn rx_world_verify_crumbs out_checked edit ulong * to long
+  ncr = get rw_w 3
+  checked = ulong 0
+  for i ulong ncr bound 128
+    rc = rw_verify_one_crumb i
+    if ne rc 0
+      put out_checked 0 checked
+      ret rc
+    end
+    checked = add checked 1
+  end
+  put out_checked 0 checked
+  ret 0
+end
+
+fn rx_world_set_recorder replay ulong to long
+  if ne get rw_w 30 0
+    ret RW_ERR_EXISTS
+  end
+  if ne replay 0
+    put rw_w 31 add get rw_w 31 get rw_w 3
+  end
+  put rw_w 30 1
+  ret RW_OK
+end
+
+fn rx_world_clear_recorder to long
+  if eq get rw_w 30 0
+    ret RW_ERR_NOT_FOUND
+  end
+  put rw_w 30 0
+  ret RW_OK
+end
+
+note ---- Capability Validation ----
+
+fn rw_cap_install slot ulong cap_id ulong gen ulong subj ulong res ulong rights ulong to void
+  if ge slot RW_MAX_CAP_TABLE
+    ret
+  end
+  b = mul slot 7
+  put rw_caps b 1
+  put rw_caps add b 1 cap_id
+  put rw_caps add b 2 gen
+  put rw_caps add b 3 subj
+  put rw_caps add b 4 res
+  put rw_caps add b 5 rights
+  put rw_caps add b 6 1
+end
+
+fn rx_world_inspect_cap cap_id ulong gen ulong out_issuer edit ulong * to long
+  for i ulong RW_MAX_CAP_TABLE
+    b = mul i 7
+    if eq get rw_caps b 0
+      continue
+    end
+    if eq get rw_caps add b 1 cap_id
+      if eq get rw_caps add b 2 gen
+        put out_issuer 0 get rw_caps add b 6
+        ret RW_CAP_OK
+      end
+    end
+  end
+  put out_issuer 0 0
+  ret RW_CAP_ERR_DENIED
+end
+
+fn rx_world_validate_cap cap_id ulong gen ulong subj ulong res ulong rights ulong to long
+  for i ulong RW_MAX_CAP_TABLE
+    b = mul i 7
+    if eq get rw_caps b 0
+      continue
+    end
+    if eq get rw_caps add b 1 cap_id
+      if ne get rw_caps add b 2 gen
+        ret RW_CAP_ERR_DENIED
+      end
+      if ne get rw_caps add b 3 subj
+        ret RW_CAP_ERR_DENIED
+      end
+      if ne get rw_caps add b 4 res
+        ret RW_CAP_ERR_DENIED
+      end
+      if ne and get rw_caps add b 5 rights rights
+        ret RW_CAP_ERR_DENIED
+      end
+      ret RW_CAP_OK
+    end
+  end
+  ret RW_CAP_ERR_DENIED
+end
+
+note ---- R16 C5/C7 Caller Credentials ----
+
+fn rw_caller_digest subj ulong gen ulong secret view uchar * dst edit uchar * to void
+  tlen = len rw_tag_caller
+  for i ulong tlen bound 32
+    put sh_dat i get rw_tag_caller i
+  end
+  pos = rw_sh_put32 tlen subj
+  pos = rw_sh_put64 pos gen
+  for i ulong 32
+    put sh_dat add pos i get secret i
+  end
+  pos = add pos 32
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn rw_caller_slot subj ulong to long
+  nc = get rw_w 13
+  for i ulong nc bound 32
+    if eq get rw_cal_meta mul i 3 subj
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn rx_world_enroll_caller subj ulong secret view uchar * out_gen edit ulong * to long
+  if ne get rw_w 15 0
+    ret RW_CALLER_ERR_CLOSED
+  end
+  if ge rw_caller_slot subj 0
+    ret RW_CALLER_ERR_EXISTS
+  end
+  nc = get rw_w 13
+  if ge nc RW_MAX_CALLERS
+    ret RW_CALLER_ERR_FULL
+  end
+  gen = add get rw_w 14 1
+  put rw_w 14 gen
+  mb = mul nc 3
+  put rw_cal_meta mb subj
+  put rw_cal_meta add mb 1 1
+  put rw_cal_meta add mb 2 gen
+  d = new uchar 32 0
+  rw_caller_digest subj gen secret d
+  db = mul nc 32
+  for i ulong 32
+    put rw_cal_dig add db i get d i
+  end
+  put rw_w 13 add nc 1
+  put out_gen 0 gen
+  ret RW_CALLER_OK
+end
+
+fn rx_world_check_caller subj ulong gen ulong secret view uchar * to long
+  if eq gen 0
+    ret RW_CALLER_ERR_ABSENT
+  end
+  si = rw_caller_slot subj
+  if lt si 0
+    ret RW_CALLER_ERR_UNKNOWN
+  end
+  s = ulong si
+  mb = mul s 3
+  if eq get rw_cal_meta add mb 1 0
+    ret RW_CALLER_ERR_REVOKED
+  end
+  if ne get rw_cal_meta add mb 2 gen
+    ret RW_CALLER_ERR_STALE
+  end
+  d = new uchar 32 0
+  rw_caller_digest subj gen secret d
+  db = mul s 32
+  diff = ulong 0
+  for i ulong 32
+    diff = or diff xor ulong get d i ulong get rw_cal_dig add db i
+  end
+  if ne diff 0
+    ret RW_CALLER_ERR_FORGED
+  end
+  ret RW_CALLER_OK
+end
+
+fn rx_world_bind_callers to long
+  nr = get rw_w 2
+  for i ulong nr bound 32
+    if eq get rw_rx_st add mul i 24 22 0
+      if eq get rw_rx_desc add mul i 16 3 0
+        ret RW_ERR_IDENTITY
+      end
+    end
+  end
+  put rw_w 15 1
+  ret RW_OK
+end
+
+fn rx_world_revoke_caller subj ulong gen ulong secret view uchar * to long
+  rc = rx_world_check_caller subj gen secret
+  if ne rc RW_CALLER_OK
+    ret rc
+  end
+  s = ulong rw_caller_slot subj
+  put rw_cal_meta add mul s 3 1 0
+  db = mul s 32
+  for i ulong 32
+    put rw_cal_dig add db i 0
+  end
+  ret RW_CALLER_OK
+end
+
+fn rx_world_caller_check_fn subj ulong gen ulong secret view uchar * op ulong to long
+  if eq op RW_CALLER_OP_RELEASE
+    ret RW_CALLER_OK
+  end
+  if ne get rw_w 16 0
+    ret RW_CALLER_ERR_HALTED
+  end
+  ret rx_world_check_caller subj gen secret
+end
+
+note ---- R16 G6 Operator Emergency Stop ----
+
+fn rx_world_operator_authorize subj ulong gen ulong secret view uchar * cap_id ulong cap_gen ulong to long
+  if ne rx_world_check_caller subj gen secret RW_CALLER_OK
+    ret RW_ERR_IDENTITY
+  end
+  nr = get rw_w 2
+  for i ulong nr bound 32
+    if eq get rw_rx_desc add mul i 16 1 subj
+      ret RW_ERR_AUTHORITY
+    end
+  end
+  if ne rx_world_validate_cap cap_id cap_gen subj RW_WORLD_RES_CONTROL RW_WORLD_RIGHT_HALT RW_CAP_OK
+    ret RW_ERR_AUTHORITY
+  end
+  ret RW_OK
+end
+
+fn rw_halt_crumb kind ulong cap_id ulong cap_gen ulong reason ulong parent ulong to ulong
+  cidx = get rw_w 3
+  if ge cidx RW_MAX_CRUMBS
+    ret 0
+  end
+  mb = mul cidx 12
+  for k ulong 12
+    put rw_cr_meta add mb k 0
+  end
+  put rw_cr_meta add mb 1 kind
+  put rw_cr_meta add mb 2 RW_NO_REACTION
+  put rw_cr_meta add mb 3 RW_FACULTY_EXTERNAL
+  put rw_cr_meta add mb 7 1
+  put rw_cr_meta add mb 9 reason
+  cb = mul cidx 24
+  put rw_cr_cap cb cap_id
+  put rw_cr_cap add cb 1 cap_gen
+  iss = new ulong 1 0
+  ign_i = rx_world_inspect_cap cap_id cap_gen iss
+  put rw_cr_cap add cb 2 get iss 0
+  rw_crumb_add_parent cidx parent
+  ret rw_crumb_finalize cidx
+end
+
+fn rx_world_emergency_stop auth view ulong * secret view uchar * reason ulong to long
+  subj = get auth 0
+  gen = get auth 1
+  cap_id = get auth 2
+  cap_gen = get auth 3
+  rc = rx_world_operator_authorize subj gen secret cap_id cap_gen
+  if ne rc RW_OK
+    ret rc
+  end
+  if ne get rw_w 16 0
+    ret RW_HALT_ALREADY
+  end
+  put rw_w 17 add get rw_w 17 1
+  put rw_w 18 subj
+  put rw_w 19 cap_id
+  put rw_w 20 cap_gen
+  put rw_w 21 reason
+  cid = rw_halt_crumb RW_CRUMB_OPERATOR_STOP cap_id cap_gen reason 0
+  put rw_w 22 cid
+  put rw_w 16 1
+  ret RW_OK
+end
+
+fn rx_world_emergency_resume subj ulong gen ulong secret view uchar * cap_id ulong cap_gen ulong to long
+  rc = rx_world_operator_authorize subj gen secret cap_id cap_gen
+  if ne rc RW_OK
+    ret rc
+  end
+  if eq get rw_w 16 0
+    ret RW_HALT_NOT_STOPPED
+  end
+  ign_c = rw_halt_crumb RW_CRUMB_OPERATOR_RESUME cap_id cap_gen 0 get rw_w 22
+  put rw_w 16 0
+  ret RW_OK
+end
+
+fn rx_world_halt_status dst edit ulong * to void
+  put dst 0 get rw_w 16
+  put dst 1 get rw_w 17
+  put dst 2 get rw_w 18
+  put dst 3 get rw_w 21
+  put dst 4 get rw_w 22
+  put dst 5 get rw_w 23
+  put dst 6 get rw_w 24
+end
+
+fn rx_world_set_halt_dir path view uchar * plen ulong to long
+  if eq plen 0
+    ret RW_ERR_ARG
+  end
+  if gt plen 380
+    ret RW_ERR_ARG
+  end
+  note Reject ".." path traversal component
+  for i ulong plen bound 384
+    c = get path i
+    if eq c 0
+      ret RW_ERR_ARG
+    end
+    if eq c 46
+      if lt add i 1 plen
+        if eq get path add i 1 46
+          ret RW_ERR_ARG
+        end
+      end
+    end
+  end
+  ret RW_OK
+end
+
+note ---- COMPOSITION-2 Commit Binders ----
+
+fn rx_world_set_binder ctx_id ulong check_mode ulong to long
+  if eq ctx_id 0
+    ret RW_ERR_ARG
+  end
+  free_i = long -1
+  for i ulong RW_MAX_BINDERS
+    b = mul i 4
+    if ne get rw_binders b 0
+      if eq get rw_binders add b 1 ctx_id
+        ret RW_ERR_EXISTS
+      end
+    else
+      if lt free_i 0
+        free_i = long i
+      end
+    end
+  end
+  if lt free_i 0
+    ret RW_ERR_FULL
+  end
+  b = mul ulong free_i 4
+  put rw_binders b 1
+  put rw_binders add b 1 ctx_id
+  put rw_binders add b 2 check_mode
+  put rw_binders add b 3 0
+  put rw_w 25 add get rw_w 25 1
+  ret RW_OK
+end
+
+fn rw_binder_of ctx_id ulong to long
+  for i ulong RW_MAX_BINDERS
+    b = mul i 4
+    if ne get rw_binders b 0
+      if eq get rw_binders add b 1 ctx_id
+        ret long i
+      end
+    end
+  end
+  ret -1
+end
+
+fn rw_ref_live oid ulong ogen ulong to ulong
+  if ge oid RW_MAX_OBJECTS
+    ret 0
+  end
+  mb = mul oid 8
+  if eq get rw_obj_meta mb 0
+    ret 0
+  end
+  if ne get rw_obj_meta add mb 1 ogen
+    ret 0
+  end
+  ret 1
+end
+
+fn rx_world_bind_field ctx_id ulong oid ulong ogen ulong fld ulong to long
+  if ge fld RW_MAX_FIELDS
+    ret RW_ERR_ARG
+  end
+  bi = rw_binder_of ctx_id
+  if lt bi 0
+    ret RW_ERR_NOT_FOUND
+  end
+  if eq rw_ref_live oid ogen 0
+    ret RW_ERR_STALE_GEN
+  end
+  mb = mul oid 8
+  bmask = get rw_obj_meta add mb 7
+  if ne bmask 0
+    if ne get rw_obj_owner oid ulong bi
+      ret RW_ERR_EXISTS
+    end
+  end
+  put rw_obj_meta add mb 7 or bmask shl ulong 1 fld
+  put rw_obj_owner oid ulong bi
+  ret RW_OK
+end
+
+fn rx_world_clear_binder ctx_id ulong to long
+  bi = rw_binder_of ctx_id
+  if lt bi 0
+    ret RW_ERR_NOT_FOUND
+  end
+  b = mul ulong bi 4
+  put rw_binders b 0
+  put rw_binders add b 1 0
+  put rw_binders add b 2 0
+  put rw_binders add b 3 0
+  put rw_w 25 sub get rw_w 25 1
+  for i ulong RW_MAX_OBJECTS
+    mb = mul i 8
+    if ne get rw_obj_meta add mb 7 0
+      if eq get rw_obj_owner i ulong bi
+        put rw_obj_meta add mb 7 0
+        put rw_obj_owner i 0
+      end
+    end
+  end
+  ret RW_OK
+end
+
+fn rx_world_binder_count to ulong
+  ret get rw_w 25
+end
+
+note ---- Init, Resources, Stability, Timing, Destroy ----
+
+fn rx_world_init_common seq_mode ulong crumb_cap ulong to long
+  if eq crumb_cap 0
+    ret RW_ERR_ARG
+  end
+  for i ulong 32
+    put rw_w i 0
+    put rw_n_subs i 0
+    put rw_obj_owner i 0
+  end
+  for i ulong 24
+    put rw_stats i 0
+  end
+  for i ulong 7
+    put rw_ready_head i 0
+    put rw_ready_len i 0
+    put rw_admit_debt i 0
+    put rw_run_debt i 0
+  end
+  for i ulong 256
+    put rw_obj_meta i 0
+    put rw_obj_fld i 0
+    put rw_obj_fver i 0
+    put rw_obj_fwr i 0
+  end
+  for i ulong 448
+    put rw_caps i 0
+  end
+  for i ulong 96
+    put rw_cal_meta i 0
+  end
+  for i ulong 16
+    put rw_binders i 0
+  end
+  for i ulong 512
+    put rw_rx_desc i 0
+  end
+  for i ulong 768
+    put rw_rx_st i 0
+  end
+  put rw_w 0 1
+  put rw_w 1 seq_mode
+  cc = crumb_cap
+  if gt cc RW_MAX_CRUMBS
+    cc = RW_MAX_CRUMBS
+  end
+  put rw_w 4 cc
+  put rw_budget 0 RW_MAX_REACTIONS
+  put rw_budget 1 0
+  put rw_budget 2 4294967295
+  put rw_budget 3 4294967295
+  put rw_budget 4 4294967295
+  put rw_budget 5 ulong 18446744073709551615
+  put rw_budget 6 ulong 18446744073709551615
+  put rw_budget 7 0
+  for i ulong 5
+    put rw_stab i 0
+  end
+  for i ulong 4
+    put rw_time i 0
+  end
+  ret RW_OK
+end
+
+fn rx_world_init crumb_cap ulong to long
+  ret rx_world_init_common 0 crumb_cap
+end
+
+fn rx_world_init_with_auth crumb_cap ulong to long
+  ret rx_world_init_common 0 crumb_cap
+end
+
+fn rx_world_init_sequential_reference crumb_cap ulong to long
+  ret rx_world_init_common 1 crumb_cap
+end
+
+fn rx_world_destroy to void
+  put rw_w 0 0
+  put rw_w 30 0
+end
+
+fn rx_world_set_resources slots ulong sb ulong mem ulong eng ulong to void
+  put rw_budget 0 slots
+  put rw_budget 1 sb
+  put rw_budget 5 mem
+  put rw_budget 6 eng
+end
+
+fn rx_world_set_stability act_b ulong fan_l ulong osc_l ulong live_l ulong conf_l ulong to void
+  put rw_stab 0 act_b
+  put rw_stab 1 fan_l
+  put rw_stab 2 osc_l
+  put rw_stab 3 live_l
+  put rw_stab 4 conf_l
+end
+
+fn rx_world_set_timing enabled ulong cap ulong to void
+  put rw_time 0 enabled
+  if ne enabled 0
+    put rw_time 1 cap
+  else
+    put rw_time 1 0
+  end
+  put rw_time 2 0
+end
+
+fn rx_world_timing_status dst edit ulong * to long
+  n = get rw_time 2
+  cap = get rw_time 1
+  stored = n
+  if gt stored cap
+    stored = cap
+  end
+  put dst 0 stored
+  put dst 1 n
+  if gt n cap
+    ret RW_ERR_FULL
+  end
+  ret RW_OK
+end
+
+note ---- Object Create, Retire, Read, Explain ----
+
+fn rw_create_crumb oid ulong ogen ulong to ulong
+  cidx = get rw_w 3
+  if ge cidx RW_MAX_CRUMBS
+    ret 0
+  end
+  cmb = mul cidx 12
+  for k ulong 12
+    put rw_cr_meta add cmb k 0
+  end
+  put rw_cr_meta add cmb 1 RW_CRUMB_CREATE
+  put rw_cr_meta add cmb 2 RW_NO_REACTION
+  put rw_cr_meta add cmb 3 RW_FACULTY_EXTERNAL
+  put rw_cr_meta add cmb 8 1
+  ob = mul cidx 32
+  put rw_cr_out ob oid
+  put rw_cr_out add ob 1 ogen
+  put rw_cr_out add ob 2 1
+  put rw_cr_out add ob 3 RW_ALL_FIELDS
+  ret rw_crumb_finalize cidx
+end
+
+fn rx_world_create meta view ulong * init_f view ulong * out_ref edit ulong * to long
+  if ne get rw_w 16 0
+    put rw_w 23 add get rw_w 23 1
+    ret RW_ERR_HALTED
+  end
+  for i ulong RW_MAX_OBJECTS
+    mb = mul i 8
+    if ne get rw_obj_meta mb 0
+      continue
+    end
+    put rw_obj_meta mb 1
+    put rw_obj_meta add mb 2 get meta 0
+    put rw_obj_meta add mb 3 get meta 1
+    put rw_obj_meta add mb 4 get meta 2
+    put rw_obj_meta add mb 5 1
+    put rw_obj_meta add mb 6 0
+    put rw_obj_meta add mb 7 0
+    put rw_obj_owner i 0
+    for f ulong 8
+      put rw_obj_fld add mul i 8 f get init_f f
+      put rw_obj_fver add mul i 8 f 1
+    end
+    rw_obj_digest_recompute i
+    cid = rw_create_crumb i get rw_obj_meta add mb 1
+    for f ulong 8
+      put rw_obj_fwr add mul i 8 f cid
+    end
+    put out_ref 0 i
+    put out_ref 1 get rw_obj_meta add mb 1
+    ret RW_OK
+  end
+  ret RW_ERR_FULL
+end
+
+fn rx_world_retire oid ulong ogen ulong to long
+  if ne get rw_w 16 0
+    put rw_w 23 add get rw_w 23 1
+    ret RW_ERR_HALTED
+  end
+  if eq rw_ref_live oid ogen 0
+    ret RW_ERR_STALE_GEN
+  end
+  mb = mul oid 8
+  cur_gen = get rw_obj_meta add mb 1
+  if eq cur_gen 4294967295
+    ret RW_ERR_FULL
+  end
+  ver = get rw_obj_meta add mb 5
+  put rw_obj_meta mb 0
+  put rw_obj_meta add mb 1 add cur_gen 1
+  cidx = get rw_w 3
+  if lt cidx RW_MAX_CRUMBS
+    cmb = mul cidx 12
+    for k ulong 12
+      put rw_cr_meta add cmb k 0
+    end
+    put rw_cr_meta add cmb 1 RW_CRUMB_RETIRE
+    put rw_cr_meta add cmb 2 RW_NO_REACTION
+    put rw_cr_meta add cmb 6 1
+    ib = mul cidx 32
+    put rw_cr_in ib oid
+    put rw_cr_in add ib 1 ogen
+    put rw_cr_in add ib 2 ver
+    put rw_cr_in add ib 3 RW_ALL_FIELDS
+    ign_c = rw_crumb_finalize cidx
+  end
+  ret RW_OK
+end
+
+fn rx_world_read oid ulong ogen ulong dst_f edit ulong * to long
+  if eq rw_ref_live oid ogen 0
+    ret RW_ERR_STALE_GEN
+  end
+  fb = mul oid 8
+  for f ulong 8
+    put dst_f f get rw_obj_fld add fb f
+  end
+  ret RW_OK
+end
+
+fn rx_world_explain oid ulong ogen ulong fld ulong to ulong
+  if eq rw_ref_live oid ogen 0
+    ret 0
+  end
+  if ge fld RW_MAX_FIELDS
+    ret 0
+  end
+  ret get rw_obj_fwr add mul oid 8 fld
+end
+
+note ---- Reactions, Remove, Footprint ----
+
+fn rw_find_reuse_slot subj ulong fac ulong to long
+  nr = get rw_w 2
+  for i ulong nr bound 32
+    if ne get rw_rx_st add mul i 24 22 0
+      if eq get rw_rx_desc add mul i 16 1 subj
+        if eq get rw_rx_desc mul i 16 fac
+          ret long i
+        end
+      end
+    end
+  end
+  ret -1
+end
+
+fn rw_write_rx_slot rid ulong spec view ulong * to void
+  db = mul rid 16
+  for k ulong 16
+    put rw_rx_desc add db k 0
+  end
+  put rw_rx_desc db get spec 0
+  put rw_rx_desc add db 1 get spec 1
+  put rw_rx_desc add db 2 get spec 2
+  put rw_rx_desc add db 3 get spec 3
+  put rw_rx_desc add db 5 1
+  if ne get spec 11 0
+    put rw_rx_desc add db 7 1
+  end
+  put rw_rx_desc add db 8 1
+  put rw_rx_desc add db 12 get spec 5
+  put rw_rx_desc add db 15 get spec 4
+  sb = mul rid 24
+  for k ulong 24
+    put rw_rx_st add sb k 0
+  end
+  put rw_rx_trig sb get spec 6
+  put rw_rx_trig add sb 1 get spec 7
+  put rw_rx_trig add sb 2 get spec 8
+  put rw_rx_write sb get spec 9
+  put rw_rx_write add sb 1 get spec 10
+  put rw_rx_write add sb 2 get spec 11
+  for k ulong 4
+    put rw_rx_caps add mul rid 32 k get spec add 12 k
+  end
+end
+
+fn rx_world_add_reaction spec view ulong * out_id edit ulong * to long
+  if ge get spec 2 RW_PRIORITY_CLASSES
+    ret RW_ERR_ARG
+  end
+  toid = get spec 6
+  if eq rw_ref_live toid get spec 7 0
+    ret RW_ERR_STALE_GEN
+  end
+  if ne get spec 11 0
+    if eq rw_ref_live get spec 9 get spec 10 0
+      ret RW_ERR_STALE_GEN
+    end
+  end
+  reuse = rw_find_reuse_slot get spec 1 get spec 0
+  nr = get rw_w 2
+  if lt reuse 0
+    if ge nr RW_MAX_REACTIONS
+      ret RW_ERR_FULL
+    end
+  end
+  ns = get rw_n_subs toid
+  if ge ns RW_MAX_SUBS
+    ret RW_ERR_FULL
+  end
+  rid = nr
+  if ge reuse 0
+    rid = ulong reuse
+  else
+    put rw_w 2 add nr 1
+  end
+  rw_write_rx_slot rid spec
+  subb = add mul toid 96 mul ns 3
+  put rw_subs subb rid
+  put rw_subs add subb 1 get spec 7
+  put rw_subs add subb 2 get spec 8
+  put rw_n_subs toid add ns 1
+  put out_id 0 rid
+  ret RW_OK
+end
+
+fn rx_world_remove_reaction rid ulong to long
+  if ge rid get rw_w 2
+    ret RW_ERR_NOT_FOUND
+  end
+  sb = mul rid 24
+  if ne get rw_rx_st add sb 22 0
+    ret RW_ERR_NOT_FOUND
+  end
+  if ne get rw_rx_st sb RW_ST_DORMANT
+    ret RW_ERR_BUSY
+  end
+  if ne get rw_rx_st add sb 1 0
+    ret RW_ERR_BUSY
+  end
+  if ne get rw_rx_st add sb 3 0
+    ret RW_ERR_BUSY
+  end
+  if ne get rw_rx_st add sb 4 0
+    ret RW_ERR_BUSY
+  end
+  if ne get rw_rx_st add sb 23 0
+    ret RW_ERR_BUSY
+  end
+  dlen = get rw_w 28
+  dhead = get rw_w 27
+  for j ulong dlen bound 64
+    if eq get rw_def_rx add dhead j rid
+      ret RW_ERR_BUSY
+    end
+  end
+  toid = get rw_rx_trig mul rid 24
+  ns = get rw_n_subs toid
+  k = ulong 0
+  for s ulong ns bound 32
+    srcb = add mul toid 96 mul s 3
+    if ne get rw_subs srcb rid
+      dstb = add mul toid 96 mul k 3
+      put rw_subs dstb get rw_subs srcb
+      put rw_subs add dstb 1 get rw_subs add srcb 1
+      put rw_subs add dstb 2 get rw_subs add srcb 2
+      k = add k 1
+    end
+  end
+  put rw_n_subs toid k
+  put rw_rx_st add sb 22 1
+  put rw_rx_st add sb 2 0
+  ret RW_OK
+end
+
+fn rx_world_footprint dst edit ulong * to void
+  nr = get rw_w 2
+  active = ulong 0
+  removed = ulong 0
+  for i ulong nr bound 32
+    if ne get rw_rx_st add mul i 24 22 0
+      removed = add removed 1
+    else
+      active = add active 1
+    end
+  end
+  subs = ulong 0
+  live = ulong 0
+  bflds = ulong 0
+  for o ulong RW_MAX_OBJECTS
+    subs = add subs get rw_n_subs o
+    mb = mul o 8
+    if ne get rw_obj_meta mb 0
+      live = add live 1
+    end
+    bm = get rw_obj_meta add mb 7
+    for f ulong 8
+      if ne and bm shl ulong 1 f 0
+        bflds = add bflds 1
+      end
+    end
+  end
+  put dst 0 nr
+  put dst 1 active
+  put dst 2 removed
+  put dst 3 subs
+  put dst 4 live
+  put dst 5 get rw_w 25
+  put dst 6 bflds
+  put dst 7 get rw_w 5
+  put dst 8 get rw_w 28
+  put dst 9 get rw_w 26
+  put dst 10 get rw_w 6
+end
+
+note ---- Admission, Ready Queue, Demand, Propagation, External Publish ----
+
+fn rw_enqueue rid ulong to void
+  p = get rw_rx_desc add mul rid 16 2
+  if ge p RW_PRIORITY_CLASSES
+    p = 6
+  end
+  qlen = get rw_ready_len p
+  if ge qlen RW_MAX_REACTIONS
+    put rw_stats 13 add get rw_stats 13 1
+    ret
+  end
+  tail = rem add get rw_ready_head p qlen RW_MAX_REACTIONS
+  put rw_ready_q add mul p RW_MAX_REACTIONS tail rid
+  put rw_ready_len p add qlen 1
+  put rw_w 5 add get rw_w 5 1
+end
+
+fn rw_charge rid ulong to void
+  sb = mul rid 24
+  db = mul rid 16
+  put rw_rx_st add sb 4 1
+  put rw_w 6 add get rw_w 6 1
+  put rw_w 7 add get rw_w 7 get rw_rx_desc add db 9
+  put rw_w 8 add get rw_w 8 get rw_rx_desc add db 10
+  put rw_rx_st add sb 14 add get rw_rx_st add sb 14 1
+  if gt get rw_w 6 get rw_w 10
+    put rw_w 10 get rw_w 6
+  end
+end
+
+fn rw_uncharge rid ulong to void
+  sb = mul rid 24
+  if eq get rw_rx_st add sb 4 0
+    ret
+  end
+  db = mul rid 16
+  if gt get rw_w 6 0
+    put rw_w 6 sub get rw_w 6 1
+  end
+  m = get rw_rx_desc add db 9
+  if ge get rw_w 7 m
+    put rw_w 7 sub get rw_w 7 m
+  else
+    put rw_w 7 0
+  end
+  e = get rw_rx_desc add db 10
+  if ge get rw_w 8 e
+    put rw_w 8 sub get rw_w 8 e
+  else
+    put rw_w 8 0
+  end
+  put rw_rx_st add sb 4 0
+end
+
+fn rw_class_blocked prio ulong to ulong
+  nr = get rw_w 2
+  for i ulong nr bound 32
+    if ne get rw_rx_desc add mul i 16 2 prio
+      continue
+    end
+    sb = mul i 24
+    if ne get rw_rx_st add sb 2 0
+      continue
+    end
+    if ne get rw_rx_st add sb 3 0
+      continue
+    end
+    if eq get rw_rx_st sb RW_ST_BLOCKED_RES
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn rw_best_waiting only_cls long to long
+  best = long -1
+  nr = get rw_w 2
+  for i ulong nr bound 32
+    if ge only_cls 0
+      if ne get rw_rx_desc add mul i 16 2 ulong only_cls
+        continue
+      end
+    end
+    sb = mul i 24
+    if ne get rw_rx_st sb RW_ST_BLOCKED_RES
+      continue
+    end
+    if ne get rw_rx_st add sb 2 0
+      continue
+    end
+    if ne get rw_rx_st add sb 3 0
+      continue
+    end
+    if eq rw_res_fits i 0
+      continue
+    end
+    if lt best 0
+      best = long i
+    else
+      if ne rw_better_admit i ulong best 0
+        best = long i
+      end
+    end
+  end
+  ret best
+end
+
+fn rw_pick_admit to long
+  sb = get rw_budget 1
+  chosen = long -1
+  if ne sb 0
+    for p ulong RW_PRIORITY_CLASSES
+      if eq rw_class_blocked p 0
+        continue
+      end
+      if lt get rw_admit_debt p sb
+        continue
+      end
+      chosen = rw_best_waiting long p
+      if ge chosen 0
+        break
+      end
+    end
+  end
+  if lt chosen 0
+    chosen = rw_best_waiting -1
+  end
+  if lt chosen 0
+    ret -1
+  end
+  served = get rw_rx_desc add mul ulong chosen 16 2
+  put rw_admit_debt served 0
+  if ne sb 0
+    for p ulong RW_PRIORITY_CLASSES
+      if le p served
+        continue
+      end
+      if eq rw_class_blocked p 0
+        put rw_admit_debt p 0
+      else
+        put rw_admit_debt p add get rw_admit_debt p 1
+      end
+    end
+  end
+  ret chosen
+end
+
+fn rw_try_admit to void
+  for step ulong 32
+    id = rw_pick_admit
+    if lt id 0
+      ret
+    end
+    rid = ulong id
+    rw_set_state rid RW_ST_READY
+    rw_charge rid
+    rw_enqueue rid
+  end
+end
+
+fn rw_pop_ready out_rid edit ulong * to ulong
+  high = long -1
+  for p ulong RW_PRIORITY_CLASSES
+    if eq get rw_ready_len p 0
+      put rw_run_debt p 0
+    else
+      if lt high 0
+        high = long p
+      end
+    end
+  end
+  if lt high 0
+    ret 0
+  end
+  chosen = ulong high
+  sb = get rw_budget 1
+  if ne sb 0
+    for p ulong RW_PRIORITY_CLASSES
+      if le p chosen
+        continue
+      end
+      if ne get rw_ready_len p 0
+        if ge get rw_run_debt p sb
+          chosen = p
+          break
+        end
+      end
+    end
+  end
+  hd = get rw_ready_head chosen
+  rid = get rw_ready_q add mul chosen RW_MAX_REACTIONS hd
+  put rw_ready_head chosen rem add hd 1 RW_MAX_REACTIONS
+  put rw_ready_len chosen sub get rw_ready_len chosen 1
+  put rw_run_debt chosen 0
+  if ne sb 0
+    for p ulong RW_PRIORITY_CLASSES
+      if le p chosen
+        continue
+      end
+      if ne get rw_ready_len p 0
+        put rw_run_debt p add get rw_run_debt p 1
+      end
+    end
+  end
+  put out_rid 0 rid
+  ret 1
+end
+
+fn rw_demand rid ulong cause ulong to void
+  sb = mul rid 24
+  if ne get rw_rx_st add sb 22 0
+    ret
+  end
+  put rw_stats 1 add get rw_stats 1 1
+  is_ext = ulong 0
+  if ge cause 1
+    if le cause get rw_w 3
+      if eq get rw_cr_meta add mul sub cause 1 12 1 RW_CRUMB_EXTERNAL
+        is_ext = ulong 1
+      end
+    end
+  end
+  if ne get rw_rx_st add sb 2 0
+    if eq is_ext 0
+      put rw_stats 13 add get rw_stats 13 1
+      ret
+    end
+  end
+  if ne is_ext 0
+    put rw_rx_st add sb 2 0
+    put rw_rx_st add sb 3 0
+    put rw_rx_st add sb 18 0
+    put rw_rx_st add sb 16 0
+    put rw_rx_st add sb 15 0
+    put rw_rx_st add sb 17 0
+    put rw_rx_st add sb 8 0
+  end
+  ab = get rw_stab 0
+  if ne ab 0
+    if ge get rw_rx_st add sb 8 ab
+      if eq get rw_rx_st add sb 2 0
+        put rw_rx_st add sb 2 1
+        put rw_stats 15 add get rw_stats 15 1
+      end
+      put rw_stats 13 add get rw_stats 13 1
+      ret
+    end
+  end
+  st = get rw_rx_st sb
+  if eq st RW_ST_DORMANT
+    rw_set_state rid RW_ST_BLOCKED_RES
+    put rw_rx_st add sb 5 cause
+    put rw_rx_st add sb 6 0
+    aseq = add get rw_w 9 1
+    put rw_w 9 aseq
+    put rw_rx_st add sb 13 aseq
+    put rw_stats 8 add get rw_stats 8 1
+    rw_try_admit
+    ret
+  end
+  if eq st RW_ST_BLOCKED_RES
+    put rw_rx_st add sb 5 cause
+    put rw_rx_st add sb 6 add get rw_rx_st add sb 6 1
+    put rw_stats 2 add get rw_stats 2 1
+    ret
+  end
+  if eq st RW_ST_READY
+    put rw_rx_st add sb 5 cause
+    put rw_rx_st add sb 6 add get rw_rx_st add sb 6 1
+    put rw_stats 2 add get rw_stats 2 1
+    ret
+  end
+  put rw_rx_st add sb 5 cause
+  put rw_rx_st add sb 1 1
+  put rw_stats 2 add get rw_stats 2 1
+end
+
+fn rw_defer_one rid ulong cause ulong to void
+  dlen = get rw_w 28
+  dhead = get rw_w 27
+  if lt add dhead dlen RW_MAX_DEFERRED
+    put rw_def_rx add dhead dlen rid
+    put rw_def_cause add dhead dlen cause
+    put rw_w 28 add dlen 1
+    put rw_stats 14 add get rw_stats 14 1
+  else
+    rw_demand rid cause
+  end
+end
+
+fn rw_propagate oid ulong changed ulong cause ulong to void
+  if ne get rw_w 1 0
+    ret
+  end
+  if eq get rw_obj_meta mul oid 8 0
+    ret
+  end
+  gen = get rw_obj_meta add mul oid 8 1
+  hits = new ulong 32 0
+  nh = ulong 0
+  for i ulong get rw_n_subs oid bound 32
+    subb = add mul oid 96 mul i 3
+    put rw_stats 3 add get rw_stats 3 1
+    if ne get rw_subs add subb 1 gen
+      continue
+    end
+    if eq and get rw_subs add subb 2 changed 0
+      continue
+    end
+    put rw_stats 4 add get rw_stats 4 1
+    if lt nh 32
+      put hits nh get rw_subs subb
+      nh = add nh 1
+    end
+  end
+  allow = nh
+  if ne get rw_stab 1 0
+    if gt allow get rw_stab 1
+      allow = get rw_stab 1
+    end
+  end
+  for i ulong allow bound 32
+    rw_demand get hits i cause
+  end
+  if lt allow nh
+    for i ulong sub nh allow bound 32
+      rw_defer_one get hits add allow i cause
+    end
+  end
+end
+
+fn rw_check_binders oid ulong changed ulong to long
+  if eq get rw_w 25 0
+    ret RW_OK
+  end
+  bmask = and changed get rw_obj_meta add mul oid 8 7
+  if eq bmask 0
+    ret RW_OK
+  end
+  owner = get rw_obj_owner oid
+  b = mul owner 4
+  cmode = get rw_binders add b 2
+  if ne cmode 0
+    put rw_binders add b 3 add get rw_binders add b 3 1
+    ret RW_ERR_BINDING
+  end
+  ret RW_OK
+end
+
+fn rw_cap_issuer_of cap_id ulong gen ulong to ulong
+  for i ulong RW_MAX_CAP_TABLE
+    b = mul i 7
+    if eq get rw_caps b 0
+      continue
+    end
+    if eq get rw_caps add b 1 cap_id
+      if eq get rw_caps add b 2 gen
+        ret get rw_caps add b 6
+      end
+    end
+  end
+  ret 0
+end
+
+fn rw_ext_crumb cap_id ulong cap_gen ulong oid ulong ogen ulong changed ulong to ulong
+  cidx = get rw_w 3
+  if ge cidx RW_MAX_CRUMBS
+    ret 0
+  end
+  for k ulong 12
+    put rw_cr_meta add mul cidx 12 k 0
+  end
+  put rw_cr_meta add mul cidx 12 1 RW_CRUMB_EXTERNAL
+  put rw_cr_meta add mul cidx 12 2 RW_NO_REACTION
+  put rw_cr_meta add mul cidx 12 3 RW_FACULTY_EXTERNAL
+  put rw_cr_meta add mul cidx 12 7 1
+  put rw_cr_cap mul cidx 24 cap_id
+  put rw_cr_cap add mul cidx 24 1 cap_gen
+  put rw_cr_cap add mul cidx 24 2 rw_cap_issuer_of cap_id cap_gen
+  if ne changed 0
+    put rw_cr_meta add mul cidx 12 8 1
+    put rw_cr_out mul cidx 32 oid
+    put rw_cr_out add mul cidx 32 1 ogen
+    put rw_cr_out add mul cidx 32 2 get rw_obj_meta add mul oid 8 5
+    put rw_cr_out add mul cidx 32 3 changed
+  end
+  ret rw_crumb_finalize cidx
+end
+
+fn rx_world_publish_external cap_id ulong cap_gen ulong oid ulong ogen ulong fld ulong val ulong to long
+  if ne get rw_w 16 0
+    put rw_w 23 add get rw_w 23 1
+    ret RW_ERR_HALTED
+  end
+  if ge fld RW_MAX_FIELDS
+    ret RW_ERR_WRITE_SET
+  end
+  if eq rw_ref_live oid ogen 0
+    ret RW_ERR_STALE_GEN
+  end
+  if ne rx_world_validate_cap cap_id cap_gen get rw_w 12 get rw_obj_meta add mul oid 8 4 RW_RIGHT_WRITE RW_CAP_OK
+    ret RW_ERR_AUTHORITY
+  end
+  changed = ulong 0
+  if ne get rw_obj_fld add mul oid 8 fld val
+    changed = shl ulong 1 fld
+  end
+  if ne changed 0
+    brc = rw_check_binders oid changed
+    if ne brc RW_OK
+      ret brc
+    end
+    put rw_obj_fld add mul oid 8 fld val
+    ver = add get rw_obj_meta add mul oid 8 5 1
+    put rw_obj_meta add mul oid 8 5 ver
+    put rw_obj_fver add mul oid 8 fld ver
+    rw_obj_digest_recompute oid
+  end
+  put rw_stats 23 add get rw_stats 23 1
+  cid = rw_ext_crumb cap_id cap_gen oid ogen changed
+  if ne changed 0
+    put rw_obj_fwr add mul oid 8 fld cid
+    rw_propagate oid changed cid
+  end
+  ret long cid
+end
+
+fn rx_world_resume rid ulong to long
+  if ge rid get rw_w 2
+    ret RW_ERR_ARG
+  end
+  sb = mul rid 24
+  if eq get rw_rx_st add sb 23 1
+    put rw_rx_st add sb 23 0
+    if gt get rw_w 26 0
+      put rw_w 26 sub get rw_w 26 1
+    end
+    rw_set_state rid RW_ST_READY
+    rw_enqueue rid
+  end
+  ret RW_OK
+end
+
+fn rx_world_note_value rid ulong progressed ulong val ulong to void
+  sb = mul rid 24
+  if eq progressed 0
+    ns = add get rw_rx_st add sb 15 1
+    put rw_rx_st add sb 15 ns
+    ll = get rw_stab 3
+    if ne ll 0
+      if ge ns ll
+        if eq get rw_rx_st add sb 2 0
+          put rw_rx_st add sb 2 1
+          put rw_stats 15 add get rw_stats 15 1
+          put rw_stats 17 add get rw_stats 17 1
+        end
+      end
+    end
+    ret
+  end
+  put rw_rx_st add sb 15 0
+  put rw_rx_st add sb 17 0
+  hf = get rw_rx_st add sb 21
+  flipped = ulong 0
+  if ge hf 2
+    if eq val get rw_rx_st add sb 20
+      if ne val get rw_rx_st add sb 19
+        flipped = ulong 1
+      end
+    end
+  end
+  if ne flipped 0
+    if eq get rw_rx_desc add mul rid 16 4 RW_LOOP_PERIODIC
+      put rw_rx_st add sb 16 0
+      put rw_stats 19 add get rw_stats 19 1
+      put rw_stats 20 add get rw_stats 20 1
+    else
+      os = add get rw_rx_st add sb 16 1
+      put rw_rx_st add sb 16 os
+      ol = get rw_stab 2
+      if ne ol 0
+        if ge os ol
+          if eq get rw_rx_st add sb 2 0
+            put rw_rx_st add sb 2 1
+            put rw_stats 15 add get rw_stats 15 1
+            put rw_stats 16 add get rw_stats 16 1
+          end
+        end
+      end
+    end
+  else
+    put rw_rx_st add sb 16 0
+    put rw_stats 20 add get rw_stats 20 1
+  end
+  if ge hf 1
+    put rw_rx_st add sb 20 get rw_rx_st add sb 19
+    put rw_rx_st add sb 21 2
+  else
+    put rw_rx_st add sb 21 1
+  end
+  put rw_rx_st add sb 19 val
+end
+
+fn rw_step_commit rid ulong toid ulong woid ulong wgen ulong to void
+  sb = mul rid 24
+  v = add get rw_obj_fld mul toid 8 1
+  put rw_obj_fld mul woid 8 v
+  ver = add get rw_obj_meta add mul woid 8 5 1
+  put rw_obj_meta add mul woid 8 5 ver
+  put rw_obj_fver mul woid 8 ver
+  rw_obj_digest_recompute woid
+  rx_world_note_value rid 1 v
+  cidx = get rw_w 3
+  cid = ulong 0
+  if lt cidx RW_MAX_CRUMBS
+    cmb = mul cidx 12
+    for k ulong 12
+      put rw_cr_meta add cmb k 0
+    end
+    put rw_cr_meta add cmb 1 RW_CRUMB_COMMIT
+    put rw_cr_meta add cmb 2 rid
+    put rw_cr_meta add cmb 3 get rw_rx_desc mul rid 16
+    put rw_cr_meta add cmb 4 get rw_rx_st add sb 5
+    put rw_cr_meta add cmb 8 1
+    ob = mul cidx 32
+    put rw_cr_out ob woid
+    put rw_cr_out add ob 1 wgen
+    put rw_cr_out add ob 2 ver
+    put rw_cr_out add ob 3 1
+    rw_crumb_add_parent cidx get rw_rx_st add sb 5
+    cid = rw_crumb_finalize cidx
+  end
+  put rw_obj_fwr mul woid 8 cid
+  rw_set_state rid RW_ST_COMMITTED
+  put rw_stats 5 add get rw_stats 5 1
+  put rw_rx_st add sb 12 add get rw_rx_st add sb 12 1
+  rw_propagate woid 1 cid
+end
+
+fn rw_step_finish rid ulong to void
+  rw_uncharge rid
+  rw_set_state rid RW_ST_DORMANT
+  if gt get rw_w 5 0
+    put rw_w 5 sub get rw_w 5 1
+  end
+  rw_try_admit
+end
+
+fn rw_validate_rx_cap rid ulong to long
+  cb = mul rid 32
+  subj = get rw_rx_desc add mul rid 16 1
+  ret rx_world_validate_cap get rw_rx_caps cb get rw_rx_caps add cb 1 subj get rw_rx_caps add cb 2 get rw_rx_caps add cb 3
+end
+
+fn rx_world_step_one to long
+  if ne get rw_w 16 0
+    ret 0
+  end
+  rid_buf = new ulong 1 0
+  if eq rw_pop_ready rid_buf 0
+    ret 0
+  end
+  rid = get rid_buf 0
+  sb = mul rid 24
+  db = mul rid 16
+  put rw_rx_st add sb 7 add get rw_rx_st add sb 7 1
+  put rw_rx_st add sb 8 add get rw_rx_st add sb 8 1
+  toid = get rw_rx_trig sb
+  if eq rw_ref_live toid get rw_rx_trig add sb 1 0
+    rw_set_state rid RW_ST_INVALIDATED
+    put rw_stats 6 add get rw_stats 6 1
+    rw_step_finish rid
+    ret 1
+  end
+  if ne rw_validate_rx_cap rid RW_CAP_OK
+    rw_set_state rid RW_ST_BLOCKED_AUTH
+    put rw_stats 7 add get rw_stats 7 1
+    rw_step_finish rid
+    ret 1
+  end
+  rw_set_state rid RW_ST_RUNNING
+  dl = get rw_rx_desc add db 14
+  if ne dl 0
+    if gt get rw_budget 7 dl
+      rw_set_state rid RW_ST_CANCELLED
+      put rw_stats 21 add get rw_stats 21 1
+      rw_step_finish rid
+      ret 1
+    end
+  end
+  rw_set_state rid RW_ST_PUBLISHING
+  if eq get rw_rx_desc add db 15 1
+    rw_step_commit rid toid get rw_rx_write sb get rw_rx_write add sb 1
+  else
+    rx_world_note_value rid 0 0
+    rw_set_state rid RW_ST_COMMITTED
+    put rw_stats 11 add get rw_stats 11 1
+  end
+  rw_step_finish rid
+  ret 1
+end
+
+fn rx_world_seq_activate_locked rid ulong cause ulong to long
+  if eq get rw_w 1 0
+    ret RW_ERR_ARG
+  end
+  if ge rid get rw_w 2
+    ret RW_ERR_ARG
+  end
+  sb = mul rid 24
+  if ne get rw_rx_st sb RW_ST_DORMANT
+    ret RW_ERR_ARG
+  end
+  if ne get rw_rx_st add sb 22 0
+    ret RW_ERR_ARG
+  end
+  if ne get rw_w 16 0
+    ret RW_ERR_HALTED
+  end
+  if ne get rw_rx_st add sb 2 0
+    ret 0
+  end
+  if eq rw_res_fits rid 0
+    ret 0
+  end
+  rw_set_state rid RW_ST_BLOCKED_RES
+  put rw_rx_st add sb 5 cause
+  rw_set_state rid RW_ST_READY
+  rw_charge rid
+  rw_enqueue rid
+  ign_s = rx_world_step_one
+  ret 1
+end
+
+fn rx_resident_seat_lost retry ulong to long
+  put rw_w 29 add get rw_w 29 1
+  put rw_stats 22 add get rw_stats 22 1
+  lost = ulong 0
+  nr = get rw_w 2
+  for rid ulong nr bound 32
+    sb = mul rid 24
+    if eq get rw_rx_st add sb 23 2
+      if eq get rw_rx_st sb RW_ST_RUNNING
+        rw_set_state rid RW_ST_FAILED
+        put rw_rx_st add sb 23 0
+        put rw_stats 10 add get rw_stats 10 1
+        rw_uncharge rid
+        rw_set_state rid RW_ST_DORMANT
+        if gt get rw_w 5 0
+          put rw_w 5 sub get rw_w 5 1
+        end
+        if ne retry 0
+          rw_demand rid 0
+        end
+        lost = add lost 1
+      end
+    end
+  end
+  ret long lost
+end
