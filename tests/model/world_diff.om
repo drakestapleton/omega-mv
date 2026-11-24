@@ -1,0 +1,1168 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/model/world_diff.om -- Pure seeded OM-2 port of
+note tests/model/{world_model,world_explore,world_diff}.c (hardening lane LG).
+note Concatenate: seed/ng/sha256.om + src/runtime/rx_world.om + this file.
+
+const WD_N        ulong 4
+const WD_SLOTS    ulong 2
+const WD_MEM      ulong 8
+const WD_EXT_MAX  ulong 3
+const WD_TICK_MAX ulong 3
+
+const WD_IDLE     uchar 0
+const WD_WAITING  uchar 1
+const WD_RUN      uchar 2
+const WD_ENDING   uchar 3
+
+const WD_OP_EXT    uchar 0
+const WD_OP_FIN    uchar 1
+const WD_OP_FAIL   uchar 2
+const WD_OP_TICK   uchar 3
+const WD_OP_CANCEL uchar 4
+
+const WD_V_LEAK         uint 1
+const WD_V_CANCEL_CHILD uint 2
+const WD_V_DOUBLE       uint 4
+const WD_V_DEADLINE     uint 8
+const WD_V_CANCEL_SELF  uint 16
+
+const WD_CAP   ulong 16384
+const WD_TSZ   ulong 32768
+const WD_TMASK ulong 32767
+
+note Compact WmState layout (64 bytes):
+note   0..3 st, 4..7 rearm, 8..11 stale, 12..15 parked, 16..19 yield,
+note   20..23 surfaced, 24..27 act_committed, 28 ext, 29 tick,
+note   30 used_slots, 31 in_flight, 32..35 used_mem (u32),
+note   36..51 wait_seq[0..3] (u32), 52..55 seq (u32), 56..59 commits[0..3] (u8),
+note   60 overdue, 61 invalidations, 62 failures, 63 cancels
+global wd_cur     uchar 64
+global wd_alt     uchar 64
+global wd_keybuf  uchar 40
+global wd_prof    int   4
+global wd_kids    uchar 4
+global wd_ops_k   uchar 16
+global wd_ops_r   uchar 16
+
+global wd_states  uchar 1048576
+global wd_keys    uchar 655360
+global wd_parent  uint  16384
+global wd_op_kind uchar 16384
+global wd_op_r    uchar 16384
+global wd_table   uint  32768
+global wd_tlen    int   5
+global wd_tk      uchar 320
+global wd_tr      uchar 320
+global wd_rev_k   uchar 64
+global wd_rev_r   uchar 64
+global wd_viol    uint  1
+
+note Real world handles
+global wd_e_ref   ulong 2
+global wd_out_id  ulong 4
+global wd_out_gen ulong 4
+global wd_ext_val ulong 1
+global wd_tick    ulong 1
+global wd_leak_sh ulong 1
+global wd_bad     ulong 1
+global wd_runs    ulong 1
+global wd_steps   ulong 1
+global wd_mism    ulong 1
+
+note Commit-uniqueness scratch
+global wd_cr_rx   ulong 128
+global wd_cr_cau  ulong 128
+
+global wd_obuf    uchar 1024
+global wd_olen    ulong 1
+global wd_tmpd    uchar 24
+
+text t_wd_p1    "[*] differential AS_BUILT vs rx_world.om: runs="
+text t_wd_st    " steps="
+text t_wd_mm    " mismatches="
+text t_wd_r_dv  "RESULT diff.verdict="
+text t_wd_r_m1  "RESULT diff.DIFF_MUT_LEAK_ON_FAIL="
+text t_wd_r_m2  "RESULT diff.DIFF_MUT_COMMIT_KEEPS_ACTIVATION="
+text t_wd_r_s1  "RESULT shim.real_leak_check="
+text t_wd_r_s2  "RESULT shim.commit_unique_check="
+text t_wd_r_i2  "RESULT real.I2.directed="
+text t_wd_r_i4  "RESULT real.I4.directed="
+text t_wd_r_v   "RESULT world_diff.verdict="
+text t_wd_fin   "WORLD DIFF: "
+text t_wd_pass  "PASS\n"
+text t_wd_fail  "FAIL\n"
+text t_wd_kill  "KILLED\n"
+text t_wd_surv  "SURVIVED\n"
+text t_wd_kf    "KNOWN_FAIL\n"
+text t_wd_nr    "NOT_REPRODUCED\n"
+
+fn wd_flush to void
+  n = get wd_olen 0
+  if gt n 0
+    ign = write 1 wd_obuf 0 n
+    put wd_olen 0 0
+  end
+end
+
+fn wd_oc c uchar to void
+  n = get wd_olen 0
+  if ge n 1024
+    wd_flush
+    n = ulong 0
+  end
+  put wd_obuf n c
+  put wd_olen 0 add n 1
+end
+
+fn wd_ot src view uchar * n ulong to void
+  for i ulong n bound 128
+    wd_oc get src i
+  end
+end
+
+fn wd_ou v ulong to void
+  if eq v 0
+    wd_oc uchar 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put wd_tmpd n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+  end
+  while gt n 0 bound 24
+    n = sub n 1
+    wd_oc get wd_tmpd n
+  end
+end
+
+note ---- Lifecycle model (world_model.c) ----
+
+fn wd_wm_parent r ulong to int
+  if eq r 0
+    ret -1
+  end
+  if eq r 1
+    ret 0
+  end
+  if eq r 2
+    ret 0
+  end
+  ret 1
+end
+
+fn wd_wm_mem r ulong to ulong
+  if lt r 2
+    ret 4
+  end
+  ret 2
+end
+
+fn wd_wm_deadline r ulong to ulong
+  if eq r 0
+    ret 1
+  end
+  if eq r 1
+    ret 2
+  end
+  if eq r 2
+    ret 0
+  end
+  ret 1
+end
+
+fn wd_wm_is_desc d ulong r ulong to bool
+  a = wd_wm_parent d
+  for step ulong 4
+    if lt a 0
+      ret false
+    end
+    if eq ulong a r
+      ret true
+    end
+    a = wd_wm_parent ulong a
+  end
+  ret false
+end
+
+fn wd_u32_get off ulong to ulong
+  b0 = ulong get wd_cur off
+  b1 = ulong get wd_cur add off 1
+  b2 = ulong get wd_cur add off 2
+  b3 = ulong get wd_cur add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn wd_u32_put off ulong v ulong to void
+  put wd_cur off uchar and v 255
+  put wd_cur add off 1 uchar and shr v 8 255
+  put wd_cur add off 2 uchar and shr v 16 255
+  put wd_cur add off 3 uchar and shr v 24 255
+end
+
+fn wd_wm_init to void
+  for i ulong 64
+    put wd_cur i uchar 0
+  end
+end
+
+fn wd_wm_fits r ulong to bool
+  if ge ulong get wd_cur 30 WD_SLOTS
+    ret false
+  end
+  um = wd_u32_get 32
+  if gt um WD_MEM
+    ret false
+  end
+  if gt wd_wm_mem r sub WD_MEM um
+    ret false
+  end
+  ret true
+end
+
+fn wd_wm_admit r ulong to void
+  put wd_cur r WD_RUN
+  put wd_cur 30 uchar add ulong get wd_cur 30 1
+  wd_u32_put 32 add wd_u32_get 32 wd_wm_mem r
+  put wd_cur 31 uchar add ulong get wd_cur 31 1
+  put wd_cur add 8 r uchar 0
+  put wd_cur add 24 r uchar 0
+  put wd_cur add 20 r uchar 0
+  dl = wd_wm_deadline r
+  if ne dl 0
+    if gt ulong get wd_cur 29 dl
+      put wd_cur 60 uchar add ulong get wd_cur 60 1
+      put wd_cur add 20 r uchar 1
+    end
+  end
+end
+
+fn wd_wm_try_admit to void
+  for iter ulong 8
+    best = int -1
+    bseq = ulong 0
+    for r ulong 4
+      if eq get wd_cur r WD_WAITING
+        if wd_wm_fits r
+          ws = wd_u32_get add 36 mul r 4
+          if lt best 0
+            best = int r
+            bseq = ws
+          else
+            if lt ws bseq
+              best = int r
+              bseq = ws
+            end
+          end
+        end
+      end
+    end
+    if lt best 0
+      ret
+    end
+    wd_wm_admit ulong best
+  end
+end
+
+fn wd_wm_demand r ulong ext ulong to void
+  if ne ext 0
+    put wd_cur add 16 r uchar 0
+  end
+  put wd_cur add 12 r uchar 0
+  st = get wd_cur r
+  if eq st WD_IDLE
+    put wd_cur r WD_WAITING
+    ns = add wd_u32_get 52 1
+    wd_u32_put 52 ns
+    wd_u32_put add 36 mul r 4 ns
+    wd_wm_try_admit
+    ret
+  end
+  if eq st WD_WAITING
+    ret
+  end
+  put wd_cur add 4 r uchar 1
+end
+
+fn wd_wm_others_busy self ulong to bool
+  for i ulong 4
+    if ne i self
+      st = get wd_cur i
+      if or eq st WD_WAITING eq st WD_RUN
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn wd_wm_release_parked to void
+  for i ulong 4
+    if ne get wd_cur add 12 i uchar 0
+      skip = false
+      if ne get wd_cur add 16 i uchar 0
+        if wd_wm_others_busy i
+          skip = true
+        end
+      end
+      if not skip
+        put wd_cur add 12 i uchar 0
+        put wd_cur add 16 i uchar 0
+        is_p = ulong 0
+        if eq i 0
+          is_p = ulong 1
+        end
+        wd_wm_demand i is_p
+      end
+    end
+  end
+end
+
+fn wd_wm_uncharge r ulong to void
+  us = ulong get wd_cur 30
+  if gt us 0
+    put wd_cur 30 uchar sub us 1
+  end
+  um = wd_u32_get 32
+  need = wd_wm_mem r
+  if ge um need
+    wd_u32_put 32 sub um need
+  else
+    wd_u32_put 32 0
+  end
+end
+
+fn wd_wm_end_act r ulong failed ulong to void
+  for i ulong 4
+    if ne get wd_cur add 12 i uchar 0
+      y = ulong get wd_cur add 16 i
+      if gt y 0
+        put wd_cur add 16 i uchar sub y 1
+      end
+    end
+  end
+  wd_wm_release_parked
+  leak = false
+  if ne failed 0
+    if ne get wd_prof 2 0
+      leak = true
+    end
+  end
+  if not leak
+    wd_wm_uncharge r
+  end
+  put wd_cur r WD_IDLE
+  inf = ulong get wd_cur 31
+  if gt inf 0
+    put wd_cur 31 uchar sub inf 1
+  end
+  rearm = ulong get wd_cur add 4 r
+  y = ulong get wd_cur add 16 r
+  if ne rearm 0
+    if and gt y 0 wd_wm_others_busy r
+      put wd_cur add 16 r uchar sub y 1
+      put wd_cur add 12 r uchar 1
+      put wd_cur add 4 r uchar 0
+      wd_wm_try_admit
+    else
+      put wd_cur add 4 r uchar 0
+      is_p = ulong 0
+      if eq r 0
+        is_p = ulong 1
+      end
+      wd_wm_demand r is_p
+    end
+  else
+    wd_wm_try_admit
+  end
+  if eq get wd_cur 31 uchar 0
+    wd_wm_release_parked
+  end
+end
+
+fn wd_wm_write_wake writer int to void
+  nk = ulong 0
+  for c ulong 4
+    if eq wd_wm_parent c writer
+      put wd_kids nk uchar c
+      nk = add nk 1
+    end
+  end
+  for i ulong nk bound 4
+    k = ulong get wd_kids i
+    if eq get wd_cur k WD_RUN
+      put wd_cur add 8 k uchar 1
+    end
+  end
+  ext = ulong 0
+  if lt writer 0
+    ext = ulong 1
+  end
+  for i ulong nk bound 4
+    k = ulong get wd_kids i
+    wd_wm_demand k ext
+  end
+end
+
+fn wd_wm_cancel r ulong to void
+  cm = get wd_prof 0
+  if eq cm 0
+    ret
+  end
+  for x ulong 4
+    hit = eq x r
+    if and eq cm 1 wd_wm_is_desc x r
+      hit = true
+    end
+    if hit
+      if eq get wd_cur x WD_RUN
+        wd_wm_uncharge x
+        inf = ulong get wd_cur 31
+        if gt inf 0
+          put wd_cur 31 uchar sub inf 1
+        end
+      end
+      put wd_cur x WD_IDLE
+      put wd_cur add 4 x uchar 0
+      put wd_cur add 12 x uchar 0
+      put wd_cur add 16 x uchar 0
+      put wd_cur add 8 x uchar 0
+      put wd_cur 63 uchar add ulong get wd_cur 63 1
+    end
+  end
+  wd_wm_try_admit
+  if eq get wd_cur 31 uchar 0
+    wd_wm_release_parked
+  end
+end
+
+fn wd_wm_enabled k uchar r ulong to bool
+  if eq k WD_OP_EXT
+    ret lt ulong get wd_cur 28 WD_EXT_MAX
+  end
+  if eq k WD_OP_TICK
+    ret lt ulong get wd_cur 29 WD_TICK_MAX
+  end
+  if or eq k WD_OP_FIN eq k WD_OP_FAIL
+    if lt r 4
+      ret eq get wd_cur r WD_RUN
+    end
+    ret false
+  end
+  if eq k WD_OP_CANCEL
+    ret or eq r 0 eq r 1
+  end
+  ret false
+end
+
+fn wd_wm_check to uint
+  v = uint 0
+  nr = ulong 0
+  mem = ulong 0
+  for r ulong 4
+    if eq get wd_cur r WD_RUN
+      nr = add nr 1
+      mem = add mem wd_wm_mem r
+    end
+  end
+  us = ulong get wd_cur 30
+  um = wd_u32_get 32
+  if or ne us nr ne um mem
+    v = or v WD_V_LEAK
+  end
+  if or gt us WD_SLOTS gt um WD_MEM
+    v = or v WD_V_LEAK
+  end
+  for r ulong 4
+    if eq get wd_cur r WD_RUN
+      dl = wd_wm_deadline r
+      if ne dl 0
+        if gt ulong get wd_cur 29 dl
+          if eq get wd_cur add 20 r uchar 0
+            v = or v WD_V_DEADLINE
+          end
+        end
+      end
+    end
+  end
+  ret v
+end
+
+fn wd_wm_step_fin r ulong to uint
+  v = uint 0
+  dl = wd_wm_deadline r
+  if ne dl 0
+    if gt ulong get wd_cur 29 dl
+      put wd_cur r WD_ENDING
+      wd_wm_end_act r 0
+      ret v
+    end
+  end
+  if ne get wd_cur add 8 r uchar 0
+    put wd_cur 61 uchar add ulong get wd_cur 61 1
+    y = ulong get wd_cur add 16 r
+    ny = ulong 1
+    if gt y 0
+      ny = mul y 2
+    end
+    if gt ny 8
+      ny = ulong 8
+    end
+    put wd_cur add 16 r uchar ny
+    put wd_cur add 4 r uchar 1
+    put wd_cur r WD_ENDING
+    wd_wm_end_act r 0
+    ret v
+  end
+  if ne get wd_cur add 24 r uchar 0
+    v = or v WD_V_DOUBLE
+  end
+  put wd_cur add 24 r uchar 1
+  put wd_cur add 56 r uchar add ulong get wd_cur add 56 r 1
+  put wd_cur add 16 r uchar 0
+  put wd_cur r WD_ENDING
+  wd_wm_write_wake int r
+  if ne get wd_prof 3 0
+    if eq get wd_cur add 4 r uchar 0
+      put wd_cur r WD_RUN
+      ret v
+    end
+  end
+  wd_wm_end_act r 0
+  ret v
+end
+
+fn wd_wm_still_active r ulong to bool
+  if ne get wd_cur r WD_IDLE
+    ret true
+  end
+  if ne get wd_cur add 4 r uchar 0
+    ret true
+  end
+  if ne get wd_cur add 12 r uchar 0
+    ret true
+  end
+  ret false
+end
+
+fn wd_wm_step_cancel r ulong to uint
+  v = uint 0
+  wd_wm_cancel r
+  if wd_wm_still_active r
+    v = or v WD_V_CANCEL_SELF
+  end
+  for x ulong 4
+    if wd_wm_is_desc x r
+      if wd_wm_still_active x
+        v = or v WD_V_CANCEL_CHILD
+      end
+    end
+  end
+  ret v
+end
+
+fn wd_wm_step k uchar r ulong to uint
+  v = uint 0
+  if eq k WD_OP_EXT
+    put wd_cur 28 uchar add ulong get wd_cur 28 1
+    wd_wm_write_wake -1
+  end
+  if eq k WD_OP_TICK
+    put wd_cur 29 uchar add ulong get wd_cur 29 1
+    if ne get wd_prof 1 0
+      for i ulong 4
+        if eq get wd_cur i WD_RUN
+          dl = wd_wm_deadline i
+          if ne dl 0
+            if gt ulong get wd_cur 29 dl
+              if eq get wd_cur add 20 i uchar 0
+                put wd_cur add 20 i uchar 1
+                put wd_cur 60 uchar add ulong get wd_cur 60 1
+              end
+            end
+          end
+        end
+      end
+    end
+    wd_wm_try_admit
+  end
+  if eq k WD_OP_FAIL
+    put wd_cur 62 uchar add ulong get wd_cur 62 1
+    put wd_cur r WD_ENDING
+    wd_wm_end_act r 1
+  end
+  if eq k WD_OP_FIN
+    v = or v wd_wm_step_fin r
+  end
+  if eq k WD_OP_CANCEL
+    v = or v wd_wm_step_cancel r
+  end
+  ret or v wd_wm_check
+end
+
+fn wd_wm_key to ulong
+  n = ulong 0
+  for r ulong 4
+    rk = ulong 0
+    if eq get wd_cur r WD_WAITING
+      wr = wd_u32_get add 36 mul r 4
+      for q ulong 4
+        if eq get wd_cur q WD_WAITING
+          if le wd_u32_get add 36 mul q 4 wr
+            rk = add rk 1
+          end
+        end
+      end
+    end
+    put wd_keybuf n get wd_cur r
+    put wd_keybuf add n 1 get wd_cur add 4 r
+    put wd_keybuf add n 2 get wd_cur add 8 r
+    put wd_keybuf add n 3 get wd_cur add 12 r
+    put wd_keybuf add n 4 get wd_cur add 16 r
+    put wd_keybuf add n 5 get wd_cur add 20 r
+    put wd_keybuf add n 6 get wd_cur add 24 r
+    put wd_keybuf add n 7 uchar rk
+    n = add n 8
+  end
+  put wd_keybuf 32 get wd_cur 28
+  put wd_keybuf 33 get wd_cur 29
+  put wd_keybuf 34 get wd_cur 30
+  put wd_keybuf 35 uchar wd_u32_get 32
+  put wd_keybuf 36 get wd_cur 31
+  ret 37
+end
+
+fn wd_wm_all_ops to ulong
+  put wd_ops_k 0 WD_OP_EXT
+  put wd_ops_r 0 uchar 0
+  put wd_ops_k 1 WD_OP_TICK
+  put wd_ops_r 1 uchar 0
+  for r ulong 4
+    put wd_ops_k add 2 r WD_OP_FIN
+    put wd_ops_r add 2 r uchar r
+    put wd_ops_k add 6 r WD_OP_FAIL
+    put wd_ops_r add 6 r uchar r
+  end
+  put wd_ops_k 10 WD_OP_CANCEL
+  put wd_ops_r 10 uchar 0
+  put wd_ops_k 11 WD_OP_CANCEL
+  put wd_ops_r 11 uchar 1
+  ret 12
+end
+
+note ---- BFS Explorer (world_explore.c) ----
+
+fn wd_fnv_key to ulong
+  h = ulong 1469598103934665603
+  for i ulong 37
+    h = xor h ulong get wd_keybuf i
+    h = mul h ulong 1099511628211
+  end
+  ret h
+end
+
+fn wd_key_eq idx ulong to bool
+  base = mul idx 40
+  for i ulong 37
+    if ne get wd_keys add base i get wd_keybuf i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn wd_store_state idx ulong par ulong ok uchar orr uchar to void
+  sb = mul idx 64
+  for i ulong 64
+    put wd_states add sb i get wd_cur i
+  end
+  kb = mul idx 40
+  for i ulong 37
+    put wd_keys add kb i get wd_keybuf i
+  end
+  put wd_parent idx uint par
+  put wd_op_kind idx ok
+  put wd_op_r idx orr
+end
+
+fn wd_load_state idx ulong to void
+  sb = mul idx 64
+  for i ulong 64
+    put wd_cur i get wd_states add sb i
+  end
+end
+
+fn wd_record_trace b ulong head ulong ok uchar orr uchar to void
+  cur = head
+  n = ulong 0
+  while and ne cur 0 lt n 63 bound 64
+    put wd_rev_k n get wd_op_kind cur
+    put wd_rev_r n get wd_op_r cur
+    n = add n 1
+    cur = ulong get wd_parent cur
+  end
+  tb = mul b 64
+  for i ulong n bound 64
+    rev_i = sub sub n 1 i
+    put wd_tk add tb i get wd_rev_k rev_i
+    put wd_tr add tb i get wd_rev_r rev_i
+  end
+  put wd_tk add tb n ok
+  put wd_tr add tb n orr
+  put wd_tlen b int add n 1
+end
+
+fn wd_wx_insert head ulong ok uchar orr uchar n ulong to ulong
+  ign = wd_wm_key
+  slot = and wd_fnv_key WD_TMASK
+  for probe ulong 64
+    ent = get wd_table slot
+    if eq ent uint 0xffffffff
+      if lt n WD_CAP
+        wd_store_state n head ok orr
+        put wd_table slot uint n
+        ret add n 1
+      end
+      ret n
+    end
+    if wd_key_eq ulong ent
+      ret n
+    end
+    slot = and add slot 1 WD_TMASK
+  end
+  ret n
+end
+
+fn wd_wx_mark_viol v uint head ulong ok uchar orr uchar to void
+  if eq v 0
+    ret
+  end
+  put wd_viol 0 or get wd_viol 0 v
+  for b ulong 5
+    bit = shl uint 1 uint b
+    if ne and v bit 0
+      if lt get wd_tlen b 0
+        wd_record_trace b head ok orr
+      end
+    end
+  end
+end
+
+fn wd_wx_explore to void
+  for i ulong 5
+    put wd_tlen i -1
+  end
+  put wd_viol 0 0
+  for i ulong WD_TSZ
+    put wd_table i uint 0xffffffff
+  end
+  wd_wm_init
+  ign = wd_wm_key
+  wd_store_state 0 0 uchar 0 uchar 0
+  put wd_table and wd_fnv_key WD_TMASK uint 0
+  n = ulong 1
+  nops = wd_wm_all_ops
+  head = ulong 0
+  while lt head n bound 20000
+    for o ulong nops bound 16
+      wd_load_state head
+      ok = get wd_ops_k o
+      orr = get wd_ops_r o
+      if wd_wm_enabled ok ulong orr
+        v = wd_wm_step ok ulong orr
+        n = wd_wx_insert head ok orr n
+        wd_wx_mark_viol v head ok orr
+      end
+    end
+    head = add head 1
+  end
+end
+
+note ---- Real rx_world.om harness ----
+
+fn wd_real_add_rxs to int
+  spec = new ulong 16 0
+  rid_out = new ulong 1 0
+  for i ulong 4
+    put spec 0 add i 1
+    put spec 1 1
+    put spec 2 0
+    put spec 3 0
+    put spec 4 1
+    put spec 5 wd_wm_mem i
+    p = wd_wm_parent i
+    if lt p 0
+      put spec 6 get wd_e_ref 0
+      put spec 7 get wd_e_ref 1
+    else
+      put spec 6 get wd_out_id ulong p
+      put spec 7 get wd_out_gen ulong p
+    end
+    put spec 8 1
+    put spec 9 get wd_out_id i
+    put spec 10 get wd_out_gen i
+    put spec 11 1
+    put spec 12 1
+    put spec 13 1
+    put spec 14 1
+    put spec 15 3
+    if ne rx_world_add_reaction spec rid_out RW_OK
+      ret -1
+    end
+    put rw_rx_desc add mul i 16 14 wd_wm_deadline i
+  end
+  ret 0
+end
+
+fn wd_real_start to int
+  if ne rx_world_init_with_auth 128 RW_OK
+    ret -1
+  end
+  put wd_tick 0 0
+  rx_world_set_resources WD_SLOTS 0 WD_MEM ulong 0xffffffffffffffff
+  put rw_budget 7 0
+  rw_cap_install 0 1 1 1 1 3
+  rw_cap_install 1 2 1 get rw_w 12 1 3
+  meta = new ulong 3 0
+  initf = new ulong 8 0
+  oref = new ulong 2 0
+  put meta 0 1
+  put meta 1 1
+  put meta 2 1
+  if ne rx_world_create meta initf oref RW_OK
+    ret -1
+  end
+  put wd_e_ref 0 get oref 0
+  put wd_e_ref 1 get oref 1
+  for i ulong 4
+    if ne rx_world_create meta initf oref RW_OK
+      ret -1
+    end
+    put wd_out_id i get oref 0
+    put wd_out_gen i get oref 1
+  end
+  ret wd_real_add_rxs
+end
+
+fn wd_real_ext to int
+  v = add get wd_ext_val 0 1
+  put wd_ext_val 0 v
+  rc = rx_world_publish_external 2 1 get wd_e_ref 0 get wd_e_ref 1 0 v
+  if le rc 0
+    ret -1
+  end
+  ret 0
+end
+
+fn wd_commit_unique dup_shim ulong out_k edit ulong 1 to int
+  nc = get rw_w 3
+  k = ulong 0
+  for i ulong nc bound 128
+    cmb = mul i 12
+    if eq get rw_cr_meta add cmb 1 RW_CRUMB_COMMIT
+      put wd_cr_rx k get rw_cr_meta add cmb 2
+      put wd_cr_cau k get rw_cr_meta add cmb 4
+      k = add k 1
+    end
+  end
+  if and ne dup_shim 0 gt k 0
+    if lt k 128
+      put wd_cr_rx k get wd_cr_rx 0
+      put wd_cr_cau k get wd_cr_cau 0
+      k = add k 1
+    end
+  end
+  put out_k 0 k
+  for i ulong k bound 128
+    j = add i 1
+    while lt j k bound 128
+      if eq get wd_cr_rx i get wd_cr_rx j
+        if eq get wd_cr_cau i get wd_cr_cau j
+          ret -1
+        end
+      end
+      j = add j 1
+    end
+  end
+  ret 0
+end
+
+fn wd_check_quiescent to int
+  fp = new ulong 12 0
+  rx_world_footprint fp
+  slots_used = add get rw_w 6 get wd_leak_sh 0
+  if ne slots_used 0
+    ret -1
+  end
+  if ne get fp 7 0
+    ret -1
+  end
+  if ne get rw_w 7 0
+    ret -1
+  end
+  cnt = new ulong 1 0
+  if ne wd_commit_unique 0 cnt 0
+    ret -1
+  end
+  chk = new ulong 1 0
+  if ne rx_world_verify_crumbs chk 0
+    ret -1
+  end
+  ret 0
+end
+
+fn wd_drain_model to void
+  for iter ulong 32
+    found = false
+    for r ulong 4
+      if eq get wd_cur r WD_RUN
+        ign = wd_wm_step WD_OP_FIN r
+        found = true
+        break
+      end
+    end
+    if not found
+      ret
+    end
+  end
+end
+
+fn wd_replay_sched ext_n ulong tick_before ulong to int
+  if ne wd_real_start 0
+    ret 1
+  end
+  put wd_prof 0 0
+  put wd_prof 1 0
+  put wd_prof 2 0
+  put wd_prof 3 0
+  wd_wm_init
+  for t ulong tick_before bound 4
+    put wd_tick 0 add get wd_tick 0 1
+    put rw_budget 7 get wd_tick 0
+    ign = wd_wm_step WD_OP_TICK 0
+    put wd_steps 0 add get wd_steps 0 1
+  end
+  for e ulong ext_n bound 4
+    if ne wd_real_ext 0
+      rx_world_destroy
+      ret 1
+    end
+    ign = wd_wm_step WD_OP_EXT 0
+    for st ulong 32
+      rc = rx_world_step_one
+      if le rc 0
+        break
+      end
+      put wd_steps 0 add get wd_steps 0 1
+    end
+    wd_drain_model
+  end
+  mism = int 0
+  for r ulong 4
+    mc = ulong get wd_cur add 56 r
+    rc_cnt = get rw_rx_st add mul r 24 12
+    if ne mc rc_cnt
+      mism = int 1
+    end
+  end
+  if ne wd_check_quiescent 0
+    mism = int 1
+  end
+  rx_world_destroy
+  put wd_runs 0 add get wd_runs 0 1
+  if ne mism 0
+    put wd_mism 0 add get wd_mism 0 1
+  end
+  ret mism
+end
+
+fn wd_test_mutants to int
+  bad = int 0
+  note Mutant 1: DIFF_MUT_LEAK_ON_FAIL
+  put wd_prof 0 0
+  put wd_prof 1 0
+  put wd_prof 2 1
+  put wd_prof 3 0
+  wd_wm_init
+  v1 = wd_wm_step WD_OP_EXT 0
+  v2 = wd_wm_step WD_OP_FAIL 0
+  k1 = ne and or v1 v2 WD_V_LEAK 0
+  wd_ot t_wd_r_m1 34
+  if k1
+    wd_ot t_wd_kill 7
+  else
+    wd_ot t_wd_surv 9
+    bad = add bad 1
+  end
+
+  note Mutant 2: DIFF_MUT_COMMIT_KEEPS_ACTIVATION
+  put wd_prof 0 0
+  put wd_prof 1 0
+  put wd_prof 2 0
+  put wd_prof 3 1
+  wd_wm_init
+  v1 = wd_wm_step WD_OP_EXT 0
+  v2 = wd_wm_step WD_OP_FIN 0
+  v3 = wd_wm_step WD_OP_FIN 0
+  k2 = ne and or v2 v3 WD_V_DOUBLE 0
+  wd_ot t_wd_r_m2 45
+  if k2
+    wd_ot t_wd_kill 7
+  else
+    wd_ot t_wd_surv 9
+    bad = add bad 1
+  end
+  ret bad
+end
+
+fn wd_test_shims to int
+  bad = int 0
+  cnt = new ulong 1 0
+  note Shim 1: real_leak_check
+  put wd_leak_sh 0 1
+  r_lk = wd_replay_sched 1 0
+  put wd_leak_sh 0 0
+  wd_ot t_wd_r_s1 28
+  if ne r_lk 0
+    wd_ot t_wd_kill 7
+  else
+    wd_ot t_wd_surv 9
+    bad = add bad 1
+  end
+
+  note Shim 2: commit_unique_check
+  dup_ok = false
+  if eq wd_real_start 0
+    if eq wd_real_ext 0
+      ign = rx_world_step_one
+      c0 = wd_commit_unique 0 cnt
+      c1 = wd_commit_unique 1 cnt
+      if and eq c0 0 and gt get cnt 0 0 ne c1 0
+        dup_ok = true
+      end
+    end
+    rx_world_destroy
+  end
+  wd_ot t_wd_r_s2 32
+  if dup_ok
+    wd_ot t_wd_kill 7
+  else
+    wd_ot t_wd_surv 9
+    bad = add bad 1
+  end
+  ret bad
+end
+
+fn wd_test_directed to int
+  bad = int 0
+  put wd_prof 0 0
+  put wd_prof 1 0
+  put wd_prof 2 0
+  put wd_prof 3 0
+  wd_wx_explore
+
+  note Directed I2 (cancel does not reach children; remove_reaction returns RW_ERR_BUSY)
+  i2_ok = false
+  if ge get wd_tlen 1 0
+    if eq wd_real_start 0
+      if eq wd_real_ext 0
+        ign = rx_world_step_one
+        rc_rem = rx_world_remove_reaction 1
+        if eq rc_rem RW_ERR_BUSY
+          i2_ok = true
+        end
+      end
+      rx_world_destroy
+    end
+  end
+  wd_ot t_wd_r_i2 24
+  if i2_ok
+    wd_ot t_wd_kf 11
+  else
+    wd_ot t_wd_nr 15
+    bad = add bad 1
+  end
+
+  note Directed I4 (deadline overrun not surfaced on tick; cancelled at return)
+  i4_ok = false
+  if ge get wd_tlen 3 0
+    if eq wd_real_start 0
+      if eq wd_real_ext 0
+        put rw_budget 7 2
+        ign = rx_world_step_one
+        if gt get rw_stats 21 0
+          i4_ok = true
+        end
+      end
+      rx_world_destroy
+    end
+  end
+  wd_ot t_wd_r_i4 24
+  if i4_ok
+    wd_ot t_wd_kf 11
+  else
+    wd_ot t_wd_nr 15
+    bad = add bad 1
+  end
+  ret bad
+end
+
+fn main to int
+  put wd_olen 0 0
+  put wd_bad 0 0
+  put wd_runs 0 0
+  put wd_steps 0 0
+  put wd_mism 0 0
+  put wd_leak_sh 0 0
+
+  for tb ulong 4
+    for en ulong 3
+      ign = wd_replay_sched add en 1 tb
+    end
+  end
+
+  wd_ot t_wd_p1 47
+  wd_ou get wd_runs 0
+  wd_ot t_wd_st 7
+  wd_ou get wd_steps 0
+  wd_ot t_wd_mm 12
+  wd_ou get wd_mism 0
+  wd_oc uchar 10
+
+  diff_ok = and gt get wd_runs 0 0 eq get wd_mism 0 0
+  wd_ot t_wd_r_dv 20
+  if diff_ok
+    wd_ot t_wd_pass 5
+  else
+    wd_ot t_wd_fail 5
+    put wd_bad 0 add get wd_bad 0 1
+  end
+
+  put wd_bad 0 add get wd_bad 0 ulong wd_test_mutants
+  put wd_bad 0 add get wd_bad 0 ulong wd_test_shims
+  put wd_bad 0 add get wd_bad 0 ulong wd_test_directed
+
+  bad = get wd_bad 0
+  wd_ot t_wd_r_v 26
+  if eq bad 0
+    wd_ot t_wd_pass 5
+  else
+    wd_ot t_wd_fail 5
+  end
+  wd_ot t_wd_fin 12
+  if eq bad 0
+    wd_ot t_wd_pass 5
+  else
+    wd_ot t_wd_fail 5
+  end
+  wd_flush
+  if ne bad 0
+    ret 1
+  end
+  ret 0
+end

@@ -1,0 +1,618 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/fabric/fabric_living_test.om -- Pure seeded OM-2 port of
+note tests/fabric/fabric_living_test.c + fab_living_phase.h (Lane 13).
+note Runs the 8-step Fabric F5-0 living scenario twice from fresh state
+note (A + B + X on loopback + HMAC + fab_dispatch + rx_compose) and
+note verifies deterministic Cortex record digest, Fabric state digest,
+note 6 goal results, and 6 winners across both runs.
+note
+note Concatenate: sha256.om + aien_machine_id.om + fab_hmac.om +
+note   fab_loopback.om + fabric.om + fab_dispatch.om + rx_compose.om + this file.
+
+const FL_MS             ulong 1000
+const FL_T0             ulong 1000000
+const FL_LEASE          ulong 500000
+const FL_OP_SCALE       ulong 1
+const FL_OP_REMOTE_ONLY ulong 2
+const FL_SKILL_LOCAL    ulong 7
+const FL_SKILL_REMOTE   ulong 9
+const FL_SKILL_ONLY     ulong 10
+const FL_CQ_SRC_SKILL   ulong 2
+
+text t_fl_mach  "fl-mach-"
+text t_fl_key   "fl-key-"
+text t_fl_dir   "/tmp/fl-om-run"
+text t_fl_fail  "FABRIC-LIVING FAIL check "
+text t_fl_diff  "FABRIC-LIVING FAIL: the two runs differ\n"
+text t_fl_run   "run "
+text t_fl_pass1 ": PASS ("
+text t_fl_fail1 ": FAIL ("
+text t_fl_chks  " checks, "
+text t_fl_flds  " failed; remote wins "
+text t_fl_disp  ", dispatched "
+text t_fl_endp  ")\n"
+text t_fl_tot1  "checks "
+text t_fl_tot2  ", failures "
+text t_fl_ok    "FABRIC_LIVING_PASS\n"
+text t_fl_bad   "FABRIC_LIVING_FAIL\n"
+
+global g_fl_checks    ulong 2
+global g_fl_failures  ulong 2
+global g_fl_rem_wins  ulong 2
+global g_fl_disped    ulong 2
+global g_fl_results   ulong 12
+global g_fl_winners   ulong 12
+global g_fl_rec_dig   uchar 64
+global g_fl_fab_dig   uchar 64
+
+global g_fl_mid       uchar 99
+global g_fl_key       uchar 96
+global g_fl_gen1_msg  uchar 372
+global g_fl_b_es      ulong 2
+global g_fl_reg_cost  ulong 1
+global g_fl_cur_run   ulong 1
+
+global g_fl_out       uchar 512
+global g_fl_olen      ulong 1
+global g_fl_tmpd      uchar 24
+
+fn fl_out_c c uchar to void
+  n = get g_fl_olen 0
+  if lt n 512
+    put g_fl_out n c
+    put g_fl_olen 0 add n 1
+  end
+end
+
+fn fl_out_flush fd int to void
+  n = get g_fl_olen 0
+  if gt n 0
+    ign = write fd g_fl_out 0 n
+    put g_fl_olen 0 0
+  end
+end
+
+fn fl_out_u v ulong to void
+  if eq v 0
+    fl_out_c uchar 48
+    ret
+  end
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put g_fl_tmpd n uchar add 48 rem x 10
+    n = add n 1
+    x = div x 10
+  end
+  while gt n 0 bound 24
+    n = sub n 1
+    fl_out_c get g_fl_tmpd n
+  end
+end
+
+fn fl_chk run ulong cond bool cid ulong to void
+  put g_fl_checks run add get g_fl_checks run 1
+  if not cond
+    put g_fl_failures run add get g_fl_failures run 1
+    put g_fl_olen 0 0
+    for i ulong 25
+      fl_out_c get t_fl_fail i
+    end
+    fl_out_u cid
+    fl_out_c uchar 10
+    fl_out_flush 2
+  end
+end
+
+fn fl_get_mid idx ulong dst edit uchar 33 to void
+  base = mul idx 33
+  for i ulong 33
+    put dst i get g_fl_mid add base i
+  end
+end
+
+fn fl_get_key idx ulong dst edit uchar 32 to void
+  base = mul idx 32
+  for i ulong 32
+    put dst i get g_fl_key add base i
+  end
+end
+
+fn fl_make_dig tag uchar dst edit uchar 32 to void
+  for i ulong 32
+    put dst i uchar 0
+  end
+  put dst 0 uchar 249
+  put dst 1 uchar 176
+  put dst 2 tag
+end
+
+fn fl_derive_machines run ulong to void
+  root = new uchar 4096 0
+  mid = new uchar 33 0
+  for i ulong 3
+    for j ulong 8
+      put root j get t_fl_mach j
+    end
+    put root 8 uchar add 65 i
+    rc = aien_mid_derive 1 view root 9 edit mid
+    fl_chk run eq rc 0 10
+    base = mul i 33
+    for j ulong 33
+      put g_fl_mid add base j get mid j
+    end
+    for j ulong 7
+      put sh_dat j get t_fl_key j
+    end
+    put sh_dat 7 uchar add 65 i
+    sh_all 8
+    kbase = mul i 32
+    for j ulong 32
+      put g_fl_key add kbase j get sh_dig j
+    end
+  end
+end
+
+fn fl_init_node run ulong nid ulong to void
+  mid = new uchar 33 0
+  key = new uchar 32 0
+  pmid = new uchar 33 0
+  pkey = new uchar 32 0
+  cfg = new ulong 6 0
+  fl_get_mid nid edit mid
+  fl_get_key nid edit key
+  fl_chk run eq cq_catalog_init nid view mid CQ_OK 11
+  fl_chk run eq cq_op_define nid FL_OP_SCALE 0 21 CQ_OK 12
+  fl_chk run eq cq_op_define nid FL_OP_REMOTE_ONLY 0 21 CQ_OK 13
+  fl_chk run eq fab_hmac_auth_init nid view mid view key 2 FAB_OK 14
+  for p ulong 2
+    fl_get_mid p edit pmid
+    fl_get_key p edit pkey
+    fab_hmac_auth_set_peer nid p view pmid view pkey
+    fab_node_set_roster nid p view pmid
+  end
+  put cfg 0 2
+  put cfg 1 nid
+  put cfg 2 FL_LEASE
+  put cfg 3 1
+  put cfg 4 0
+  put cfg 5 0
+  fl_chk run eq fab_node_init nid view mid view cfg FAB_OK 15
+end
+
+fn fl_reg_skill nid ulong cap ulong op ulong skill_id ulong gen ulong sdig view uchar 32 to int
+  f = new ulong 21 0
+  put f 0 cap
+  put f 1 add 80 cap
+  put f 2 get g_cq_self_m nid
+  put f 3 skill_id
+  put f 4 1
+  put f 5 op
+  put f 6 FL_CQ_SRC_SKILL
+  put f 7 1
+  put f 8 1
+  put f 9 CQ_LIVE_AVAILABLE
+  put f 10 add 20480 cap
+  put f 11 1
+  put f 12 get g_fl_reg_cost 0
+  put f 20 gen
+  rc = cq_register_arr nid view f view sdig
+  if ne rc CQ_OK
+    ret -1
+  end
+  ret cq_lookup nid cap add 80 cap get g_cq_self_m nid skill_id
+end
+
+fn fl_pump_b now_us ulong to void
+  cont = int 1
+  while ne cont 0 bound 64
+    if ne fab_poll 1 now_us 1
+      cont = int 0
+    end
+  end
+end
+
+fn fl_deliver_a run ulong msg view uchar * now_us ulong to int
+  mid_a = new uchar 33 0
+  fl_get_mid 0 edit mid_a
+  fl_chk run eq fab_loop_inject view mid_a view msg FAB_OK 25
+  fl_chk run eq fab_poll 0 now_us 1 26
+  ret get g_fv_code 0
+end
+
+fn fl_setup_run run ulong to void
+  fl_derive_machines run
+  fab_loop_init
+  mid = new uchar 33 0
+  for i ulong 3
+    fl_get_mid i edit mid
+    fl_chk run eq fab_loop_add view mid FAB_OK 30
+  end
+  fl_init_node run 0
+  fl_init_node run 1
+
+  dig = new uchar 32 0
+  fl_make_dig uchar 7 edit dig
+  put g_fl_reg_cost 0 10
+  a_loc = fl_reg_skill 0 1 FL_OP_SCALE FL_SKILL_LOCAL 1 view dig
+  fl_chk run ge a_loc 0 31
+
+  gen1 = fab_entry_generation 1 1
+  fl_make_dig uchar 1 edit dig
+  put g_fl_reg_cost 0 5
+  b_es0 = fl_reg_skill 1 2 FL_OP_SCALE FL_SKILL_REMOTE gen1 view dig
+  fl_chk run ge b_es0 0 32
+  put g_fl_b_es 0 ulong b_es0
+
+  fl_make_dig uchar 2 edit dig
+  put g_fl_reg_cost 0 5
+  b_es1 = fl_reg_skill 1 3 FL_OP_REMOTE_ONLY FL_SKILL_ONLY gen1 view dig
+  fl_chk run ge b_es1 0 33
+  put g_fl_b_es 1 ulong b_es1
+
+  fl_chk run eq fab_dispatch_init 0 0 FAB_OK 34
+  fl_get_mid 1 edit mid
+  fl_chk run eq fab_dispatch_add 0 view mid FAB_OK 35
+  fl_make_dig uchar 1 edit dig
+  fl_chk run eq fab_dispatch_set_skill 0 view mid FL_SKILL_REMOTE FAB_PROC_SCALE_OK view dig FAB_OK 36
+  fl_make_dig uchar 2 edit dig
+  fl_chk run eq fab_dispatch_set_skill 0 view mid FL_SKILL_ONLY FAB_PROC_ADD_10 view dig FAB_OK 37
+
+  dir = new uchar 128 0
+  for i ulong 14
+    put dir i get t_fl_dir i
+  end
+  put dir 14 uchar add 48 run
+  fl_chk run eq rx_compose_open view dir 15 1 1 RXC_OK 38
+  fl_chk run eq rx_compose_set_remote 1 RXC_OK 39
+end
+
+fn fl_b_online run ulong now_us ulong a_joins ulong to void
+  if ne a_joins 0
+    fl_chk run eq fab_join 0 FL_LEASE now_us FAB_OK 40
+  end
+  fl_chk run eq fab_join 1 FL_LEASE now_us FAB_OK 41
+  fl_pump_b now_us
+  fl_chk run ge fab_dispatch_pump 0 now_us 1 42
+  fl_chk run eq fab_advertise 1 get g_fl_b_es 0 CQ_WIRE_ADVERTISE now_us FAB_OK 43
+  fl_chk run eq fab_advertise 1 get g_fl_b_es 1 CQ_WIRE_ADVERTISE now_us FAB_OK 44
+  fl_chk run eq fab_dispatch_pump 0 now_us 2 45
+  fl_chk run eq get g_fd_ref_msgs 0 0 46
+  mid_b = new uchar 33 0
+  fl_get_mid 1 edit mid_b
+  fl_chk run eq fab_member_live 0 view mid_b now_us 1 47
+end
+
+fn fl_record_goal gi ulong inp ulong want_win ulong want_rem ulong c0_res ulong c0_ok ulong to void
+  run = get g_fl_cur_run 0
+  loc_res = add mul inp 3 1
+  rc = rx_compose_run inp c0_res c0_ok loc_res 1
+  fl_chk run eq rc RXC_OK add 100 gi
+  fl_chk run eq get rxc_last_res 0 RXC_OUT_COMMITTED add 110 gi
+  fl_chk run eq get rxc_last_res 6 loc_res add 120 gi
+  fl_chk run eq get rxc_last_res 1 want_win add 130 gi
+  idx = add mul run 6 gi
+  put g_fl_results idx get rxc_last_res 6
+  put g_fl_winners idx get rxc_last_res 1
+  if ne want_rem 0
+    put g_fl_rem_wins run add get g_fl_rem_wins run 1
+  end
+end
+
+fn fl_step_forged run ulong t ulong to void
+  mid_a = new uchar 33 0
+  key_x = new uchar 32 0
+  fl_get_mid 0 edit mid_a
+  fl_get_key 2 edit key_x
+  rec = new uchar 188 0
+  msg = new uchar 372 0
+  sig = new uchar 64 0
+  b_es = get g_fl_b_es 0
+  fl_chk run eq cq_wire_encode 1 b_es CQ_WIRE_ADVERTISE edit rec CQ_OK 300
+  mlen = fab_seal add ulong 16 FAB_MSG_ADVERTISE view mid_a part rec 0 188 t edit msg
+  fl_chk run eq mlen int 372 301
+  ign = fab_hmac_sig64 view key_x part msg 0 308 edit sig
+  for i ulong 64
+    put msg add 308 i get sig i
+  end
+  fl_chk run eq fl_deliver_a run part msg 0 372 t FAB_E_AUTH 302
+
+  fl_chk run eq fab_advertise 1 b_es CQ_WIRE_ADVERTISE t FAB_OK 303
+  fl_get_mid 1 edit mid_a
+  got = fab_loop_peek 0 view mid_a FAB_MSG_ADVERTISE edit msg
+  fl_chk run eq got 372 304
+  for i ulong 372
+    put g_fl_gen1_msg i get msg i
+  end
+  put g_fl_box_count 0 0
+  put msg 264 uchar xor ulong get msg 264 127
+  fl_chk run eq fl_deliver_a run part msg 0 372 t FAB_E_AUTH 305
+end
+
+fn fl_step_wrong_mid run ulong t ulong to void
+  mid_dst = new uchar 33 0
+  rec = new uchar 188 0
+  msg = new uchar 372 0
+  dig_x = new uchar 32 0
+  fl_get_mid 2 edit mid_dst
+  fl_chk run eq cq_catalog_init 2 view mid_dst CQ_OK 400
+  fl_chk run eq cq_op_define 2 FL_OP_SCALE 0 21 CQ_OK 401
+  fl_make_dig uchar 99 edit dig_x
+  put g_fl_reg_cost 0 1
+  x_es = fl_reg_skill 2 4 FL_OP_SCALE 19 1 view dig_x
+  fl_chk run ge x_es 0 402
+  fl_chk run eq cq_wire_encode 2 ulong x_es CQ_WIRE_ADVERTISE edit rec CQ_OK 403
+  fl_get_mid 0 edit mid_dst
+  mlen = fab_seal add ulong 16 FAB_MSG_ADVERTISE view mid_dst part rec 0 188 t edit msg
+  fl_chk run eq mlen int 372 404
+  fl_chk run eq fl_deliver_a run part msg 0 372 t FAB_E_MISMATCH 405
+
+  rbody = new uchar 8 0
+  fab_put_u64 part rbody 0 8 0 FL_LEASE
+  fl_get_mid 2 edit mid_dst
+  mlen = fab_seal add ulong 16 FAB_MSG_RENEW view mid_dst part rbody 0 8 t edit msg
+  fl_chk run eq mlen int 192 406
+  fl_chk run eq fl_deliver_a run part msg 0 192 t FAB_E_MISMATCH 407
+end
+
+fn fl_step_retarget run ulong t ulong to void
+  mid_b = new uchar 33 0
+  fl_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  a_es = cq_lookup 0 2 82 bm FL_SKILL_REMOTE
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+  fl_chk run eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 408
+  fl_get_mid 2 edit rt_t
+  d0 = get g_fd_dispatched 0
+  fl_chk run eq fab_dispatch_run 0 view rt view rt_t view rt_d 6 t FAB_DX_ROUTE 409
+  fl_chk run eq get g_fd_dispatched 0 d0 410
+end
+
+fn fl_step_bad_b run ulong t5 ulong to void
+  mid_b = new uchar 33 0
+  fl_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  a_es = cq_lookup 0 2 82 bm FL_SKILL_REMOTE
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+  dig = new uchar 32 0
+
+  note Step 5a: tampered digest -> FAB_DX_DIGEST -> local wins goal 1
+  fl_make_dig uchar 1 edit dig
+  put dig 31 uchar 1
+  fl_chk run eq fab_dispatch_set_skill 0 view mid_b FL_SKILL_REMOTE FAB_PROC_SCALE_OK view dig FAB_OK 500
+  fl_chk run eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 501
+  fl_chk run eq fab_dispatch_run 0 view rt view rt_t view rt_d 7 t5 FAB_DX_DIGEST 502
+  fl_record_goal 1 7 1 0 0 0
+
+  note Step 5b: wrong result under right digest -> contract rejects -> local wins goal 2
+  fl_make_dig uchar 1 edit dig
+  fl_chk run eq fab_dispatch_set_skill 0 view mid_b FL_SKILL_REMOTE FAB_PROC_SCALE_BAD view dig FAB_OK 503
+  d0 = get g_fd_dispatched 0
+  fl_chk run eq fab_dispatch_run 0 view rt view rt_t view rt_d 8 t5 FAB_DX_OK 504
+  fl_chk run eq get g_fd_dispatched 0 add d0 1 505
+  bad_res = get g_fd_result 0
+  fl_chk run ne bad_res 25 506
+  fl_record_goal 2 8 1 0 bad_res 0
+  fl_chk run eq fab_dispatch_set_skill 0 view mid_b FL_SKILL_REMOTE FAB_PROC_SCALE_OK view dig FAB_OK 507
+end
+
+fn fl_step_leave run ulong t6 ulong to void
+  mid_b = new uchar 33 0
+  fl_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  a_es = cq_lookup 0 2 82 bm FL_SKILL_REMOTE
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+
+  note Step 6: mid-run LEAVE -> FAB_DX_ROUTE -> local wins goal 3
+  fl_chk run eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 599
+  fl_chk run eq fab_leave 1 t6 FAB_OK 600
+  ref0 = get g_fd_refused ulong FAB_DX_ROUTE
+  fl_chk run eq fab_dispatch_run 0 view rt view rt_t view rt_d 9 t6 FAB_DX_ROUTE 601
+  fl_chk run eq get g_fd_refused ulong FAB_DX_ROUTE add ref0 1 602
+  fl_chk run eq fab_member_live 0 view mid_b t6 0 603
+  fl_record_goal 3 9 1 0 0 0
+end
+
+fn fl_step_rejoin run ulong t7 ulong to void
+  mid_a = new uchar 33 0
+  dig = new uchar 32 0
+  fl_get_mid 0 edit mid_a
+
+  note Step 7: B rejoins gen 2, replay gen 1 -> FAB_E_STALE_GEN
+  fl_chk run eq fab_node_set_generation 1 2 FAB_OK 700
+  gen2 = fab_entry_generation 1 1
+  fl_make_dig uchar 1 edit dig
+  put g_fl_reg_cost 0 5
+  b_es0 = fl_reg_skill 1 2 FL_OP_SCALE FL_SKILL_REMOTE gen2 view dig
+  fl_chk run ge b_es0 0 701
+  put g_fl_b_es 0 ulong b_es0
+  fl_make_dig uchar 2 edit dig
+  b_es1 = fl_reg_skill 1 3 FL_OP_REMOTE_ONLY FL_SKILL_ONLY gen2 view dig
+  fl_chk run ge b_es1 0 702
+  put g_fl_b_es 1 ulong b_es1
+  fl_b_online run t7 0
+
+  replay = new uchar 372 0
+  for i ulong 372
+    put replay i get g_fl_gen1_msg i
+  end
+  fl_chk run eq fab_loop_inject view mid_a part replay 0 372 FAB_OK 703
+  fl_chk run eq fab_dispatch_pump 0 t7 1 704
+  fl_chk run eq get g_fv_code 0 FAB_E_STALE_GEN 705
+end
+
+fn fl_step_expiry run ulong t7 ulong t8 ulong to void
+  mid_b = new uchar 33 0
+  fl_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  a_es = cq_lookup 0 2 82 bm FL_SKILL_REMOTE
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+  fl_chk run eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 706
+  fl_chk run eq fab_dispatch_run 0 view rt view rt_t view rt_d 10 t7 FAB_DX_OK 707
+  res4 = get g_fd_result 0
+  fl_chk run eq res4 31 708
+  fl_record_goal 4 10 0 1 res4 1
+
+  note Step 8: lease expired -> fallback local goal 5, late ad -> FAB_E_LEASE_EXPIRED, B LOST
+  fl_chk run eq fab_dispatch_run 0 view rt view rt_t view rt_d 11 t8 FAB_DX_ROUTE 800
+  fl_record_goal 5 11 1 0 0 0
+  fl_chk run eq fab_member_live 0 view mid_b t8 0 801
+  midx = fab_member_find 0 view mid_b
+  fl_chk run ge midx 0 802
+  fl_chk run eq get g_fm_state ulong midx FAB_ST_LOST 803
+  fl_chk run eq fab_advertise 1 get g_fl_b_es 0 CQ_WIRE_ADVERTISE t8 FAB_OK 804
+  fl_chk run eq fab_dispatch_pump 0 t8 1 805
+  fl_chk run eq get g_fv_code 0 FAB_E_LEASE_EXPIRED 806
+end
+
+fn fl_step_goal0 run ulong t ulong to void
+  mid_b = new uchar 33 0
+  fl_get_mid 1 edit mid_b
+  bm = cq_m_find 0 view mid_b
+  a_es = cq_lookup 0 2 82 bm FL_SKILL_REMOTE
+  rt = new ulong 12 0
+  rt_t = new uchar 33 0
+  rt_d = new uchar 32 0
+  fl_chk run eq fab_dispatch_route_from_slot 0 ulong a_es 3 edit rt edit rt_t edit rt_d SR_OK 200
+  fl_chk run eq fab_dispatch_run 0 view rt view rt_t view rt_d 5 t FAB_DX_OK 201
+  res0 = get g_fd_result 0
+  fl_chk run eq res0 16 202
+  fl_record_goal 0 5 0 1 res0 1
+end
+
+fn fl_capture_digests run ulong to void
+  rd = new uchar 32 0
+  fd = new uchar 32 0
+  rx_compose_record_digest edit rd
+  fab_state_digest 0 edit fd
+  base = mul run 32
+  for i ulong 32
+    put g_fl_rec_dig add base i get rd i
+    put g_fl_fab_dig add base i get fd i
+  end
+end
+
+fn fl_run_once run ulong to void
+  put g_fl_cur_run 0 run
+  fl_setup_run run
+  t = FL_T0
+  fl_b_online run t 1
+
+  t = add t mul 10 FL_MS
+  fl_step_goal0 run t
+
+  fl_step_forged run t
+  fl_step_wrong_mid run t
+  fl_step_retarget run t
+  t5 = add t mul 10 FL_MS
+  t6 = add t5 mul 10 FL_MS
+  fl_step_bad_b run t5
+  fl_step_leave run t6
+  t7 = add t6 mul 10 FL_MS
+  t8 = add add t7 FL_LEASE 1
+  fl_step_rejoin run t7
+  fl_step_expiry run t7 t8
+
+  fl_chk run eq get g_fl_rem_wins run 2 900
+  put g_fl_disped run get g_fd_dispatched 0
+  fl_capture_digests run
+
+  fl_chk run eq rx_compose_set_remote 0 RXC_OK 901
+  rx_compose_close
+  fab_dispatch_destroy 0
+end
+
+fn fl_print_run run ulong to void
+  put g_fl_olen 0 0
+  for i ulong 4
+    fl_out_c get t_fl_run i
+  end
+  fl_out_u run
+  if eq get g_fl_failures run 0
+    for i ulong 8
+      fl_out_c get t_fl_pass1 i
+    end
+  else
+    for i ulong 8
+      fl_out_c get t_fl_fail1 i
+    end
+  end
+  fl_out_u get g_fl_checks run
+  for i ulong 9
+    fl_out_c get t_fl_chks i
+  end
+  fl_out_u get g_fl_failures run
+  for i ulong 21
+    fl_out_c get t_fl_flds i
+  end
+  fl_out_u get g_fl_rem_wins run
+  for i ulong 13
+    fl_out_c get t_fl_disp i
+  end
+  fl_out_u get g_fl_disped run
+  for i ulong 2
+    fl_out_c get t_fl_endp i
+  end
+  fl_out_flush 1
+end
+
+fn main to int
+  fl_run_once 0
+  fl_print_run 0
+  fl_run_once 1
+  fl_print_run 1
+
+  same = true
+  for i ulong 32
+    if ne get g_fl_rec_dig i get g_fl_rec_dig add 32 i
+      same = false
+    end
+    if ne get g_fl_fab_dig i get g_fl_fab_dig add 32 i
+      same = false
+    end
+  end
+  for i ulong 6
+    if ne get g_fl_results i get g_fl_results add 6 i
+      same = false
+    end
+    if ne get g_fl_winners i get g_fl_winners add 6 i
+      same = false
+    end
+  end
+  tot_chk = add add get g_fl_checks 0 get g_fl_checks 1 1
+  tot_fail = add get g_fl_failures 0 get g_fl_failures 1
+  if not same
+    tot_fail = add tot_fail 1
+    ign_d = write 2 t_fl_diff 0 40
+  end
+
+  put g_fl_olen 0 0
+  for i ulong 7
+    fl_out_c get t_fl_tot1 i
+  end
+  fl_out_u tot_chk
+  for i ulong 11
+    fl_out_c get t_fl_tot2 i
+  end
+  fl_out_u tot_fail
+  fl_out_c uchar 10
+  fl_out_flush 1
+
+  if eq tot_fail 0
+    ign_ok = write 1 t_fl_ok 0 19
+    ret 0
+  end
+  ign_bad = write 1 t_fl_bad 0 19
+  ret 1
+end
