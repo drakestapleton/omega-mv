@@ -1,0 +1,287 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_blackwell_matmul.c.
+note Composes on seed/ng/sha256.om.
+om2
+
+const OMEGA_BW_MATMUL_MAX_M uint 8192
+const OMEGA_BW_MATMUL_MAX_K uint 16384
+const OMEGA_BW_MATMUL_MAX_N uint 262144
+const OMEGA_MATMUL_PREC_INT32 uint 0
+const OMEGA_MATMUL_PREC_FP16 uint 1
+const OMEGA_MATMUL_PREC_BF16 uint 2
+
+text bw_mm_machine_str "NVIDIA_DGX_SPARK_GB10_SM121"
+
+fn omega_matmul_spec_init m uint k uint n uint prec uint spec_id edit uchar 32 to long
+  if or eq m 0 or eq k 0 eq n 0
+    ret -1
+  end
+  if or gt m OMEGA_BW_MATMUL_MAX_M or gt k OMEGA_BW_MATMUL_MAX_K gt n OMEGA_BW_MATMUL_MAX_N
+    ret -1
+  end
+  put sh_dat 0 uchar and m 255
+  put sh_dat 1 uchar and shr m 8 255
+  put sh_dat 2 uchar and shr m 16 255
+  put sh_dat 3 uchar and shr m 24 255
+  put sh_dat 4 uchar and k 255
+  put sh_dat 5 uchar and shr k 8 255
+  put sh_dat 6 uchar and shr k 16 255
+  put sh_dat 7 uchar and shr k 24 255
+  put sh_dat 8 uchar and n 255
+  put sh_dat 9 uchar and shr n 8 255
+  put sh_dat 10 uchar and shr n 16 255
+  put sh_dat 11 uchar and shr n 24 255
+  put sh_dat 12 uchar and prec 255
+  put sh_dat 13 0
+  put sh_dat 14 0
+  put sh_dat 15 0
+  sh_all 16
+  for i ulong 32
+    put spec_id i get sh_dig i
+  end
+  ret 0
+end
+
+fn mm_dot_i32 a view uint 4096 b view uint 4096 arow ulong j ulong k ulong n ulong to uint
+  acc = ulong 0
+  for p ulong k bound 16384
+    av = ulong get a add arow p
+    bv = ulong get b add mul p n j
+    acc = and add acc mul av bv 0xffffffff
+  end
+  ret uint acc
+end
+
+fn omega_matmul_cpu_oracle_i32 a view uint 4096 b view uint 4096 c edit uint 4096 m ulong k ulong n ulong to long
+  if eq m 0
+    ret -1
+  end
+  if eq k 0
+    ret -1
+  end
+  if eq n 0
+    ret -1
+  end
+  if gt mul m k 4096
+    ret -1
+  end
+  if gt mul k n 4096
+    ret -1
+  end
+  if gt mul m n 4096
+    ret -1
+  end
+  for i ulong m bound 8192
+    arow = mul i k
+    crow = mul i n
+    for j ulong n bound 262144
+      put c add crow j mm_dot_i32 a b arow j k n
+    end
+  end
+  ret 0
+end
+
+fn omega_fp16_to_fp32 h ushort to f32
+  hu = uint h
+  sign = shl and hu 0x8000 16
+  ex = shr and hu 0x7c00 10
+  mant = and hu 0x03ff
+  val = uint 0
+  if eq ex 0
+    if eq mant 0
+      val = sign
+    else
+      ex = 1
+      while eq and mant 0x0400 0 bound 16
+        mant = shl mant 1
+        ex = sub ex 1
+      end
+      mant = and mant 0x03ff
+      val = or or sign shl add ex 112 23 shl mant 13
+    end
+  else
+    if eq ex 31
+      val = or or sign uint 0x7f800000 shl mant 13
+    else
+      val = or or sign shl add ex 112 23 shl mant 13
+    end
+  end
+  ret bitcast f32 val
+end
+
+fn omega_bf16_to_fp32 b ushort to f32
+  val = shl uint b 16
+  ret bitcast f32 val
+end
+
+fn omega_fp32_to_fp16 f f32 to ushort
+  u = bitcast uint f
+  sign = and shr u 16 0x8000
+  ex = and shr u 23 0xff
+  mant = and u 0x7fffff
+  if eq ex 255
+    if eq mant 0
+      ret ushort or sign 0x7c00
+    end
+    ret ushort or or sign 0x7e00 shr mant 13
+  end
+  if gt ex 142
+    ret ushort or sign 0x7c00
+  end
+  if lt ex 113
+    if lt ex 102
+      ret ushort sign
+    end
+    full = or mant 0x800000
+    sh = sub 126 ex
+    res = shr full sh
+    half = shl uint 1 sub sh 1
+    rem_bits = and full sub shl uint 1 sh 1
+    inc = uint 0
+    if gt rem_bits half
+      inc = 1
+    end
+    if eq rem_bits half
+      if ne and res 1 0
+        inc = 1
+      end
+    end
+    res = add res inc
+    ret ushort or sign res
+  end
+  hexp = sub ex 112
+  hmant = shr mant 13
+  rem_bits = and mant 0x1fff
+  inc2 = uint 0
+  if gt rem_bits 0x1000
+    inc2 = 1
+  end
+  if eq rem_bits 0x1000
+    if ne and hmant 1 0
+      inc2 = 1
+    end
+  end
+  if ne inc2 0
+    hmant = add hmant 1
+    if eq hmant 0x0400
+      hmant = 0
+      hexp = add hexp 1
+    end
+  end
+  if ge hexp 31
+    ret ushort or sign 0x7c00
+  end
+  ret ushort or or sign shl hexp 10 hmant
+end
+
+fn omega_fp32_to_bf16 f f32 to ushort
+  u = bitcast uint f
+  if and eq and u 0x7f800000 0x7f800000 ne and u 0x007fffff 0
+    ret ushort or shr u 16 0x0040
+  end
+  round_bias = add uint 0x7fff and shr u 16 1
+  ret ushort shr add u round_bias 16
+end
+
+fn mm_dot_f16 a view ushort 4096 b view ushort 4096 arow ulong j ulong k ulong n ulong to f32
+  sum = bitcast f32 uint 0
+  for p ulong k bound 16384
+    af = omega_fp16_to_fp32 get a add arow p
+    bf = omega_fp16_to_fp32 get b add mul p n j
+    sum = add sum mul af bf
+  end
+  ret sum
+end
+
+fn omega_matmul_cpu_oracle_f16 a view ushort 4096 b view ushort 4096 c edit f32 4096 m ulong k ulong n ulong to long
+  if eq m 0
+    ret -1
+  end
+  if eq k 0
+    ret -1
+  end
+  if eq n 0
+    ret -1
+  end
+  if gt mul m k 4096
+    ret -1
+  end
+  if gt mul k n 4096
+    ret -1
+  end
+  if gt mul m n 4096
+    ret -1
+  end
+  for i ulong m bound 8192
+    arow = mul i k
+    crow = mul i n
+    for j ulong n bound 262144
+      put c add crow j mm_dot_f16 a b arow j k n
+    end
+  end
+  ret 0
+end
+
+fn mm_dot_bf16 a view ushort 4096 b view ushort 4096 arow ulong j ulong k ulong n ulong to f32
+  sum = bitcast f32 uint 0
+  for p ulong k bound 16384
+    af = omega_bf16_to_fp32 get a add arow p
+    bf = omega_bf16_to_fp32 get b add mul p n j
+    sum = add sum mul af bf
+  end
+  ret sum
+end
+
+fn omega_matmul_cpu_oracle_bf16 a view ushort 4096 b view ushort 4096 c edit f32 4096 m ulong k ulong n ulong to long
+  if eq m 0
+    ret -1
+  end
+  if eq k 0
+    ret -1
+  end
+  if eq n 0
+    ret -1
+  end
+  if gt mul m k 4096
+    ret -1
+  end
+  if gt mul k n 4096
+    ret -1
+  end
+  if gt mul m n 4096
+    ret -1
+  end
+  for i ulong m bound 8192
+    arow = mul i k
+    crow = mul i n
+    for j ulong n bound 262144
+      put c add crow j mm_dot_bf16 a b arow j k n
+    end
+  end
+  ret 0
+end
+
+fn omega_blackwell_bind_matmul_realization spec_id view uchar 32 code_digest view uchar 32 machine_id edit uchar 32 real_id edit uchar 32 to long
+  mn = len bw_mm_machine_str
+  for i ulong mn bound 64
+    put sh_dat i get bw_mm_machine_str i
+  end
+  sh_all mn
+  for i ulong 32
+    put machine_id i get sh_dig i
+  end
+  for i ulong 32
+    put sh_dat i get spec_id i
+    put sh_dat add 32 i get machine_id i
+    put sh_dat add 64 i get code_digest i
+  end
+  put sh_dat 96 121
+  put sh_dat 97 0
+  put sh_dat 98 0
+  put sh_dat 99 0
+  sh_all 100
+  for i ulong 32
+    put real_id i get sh_dig i
+  end
+  ret 0
+end
