@@ -1,0 +1,255 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/visor/test_visor_authority.c (lane 7 hostile authority tests).
+note Invariant: THE VISOR CAN ASK. THE VISOR CANNOT GRANT.
+note Composes src/visor/visor.om, visor_machine.om, om/aarch64/aarch64_om2.om,
+note om/visor/verify_om2.om, om/visor/validate_om2.om, src/visor/visor_verify.om,
+note src/visor/visor_effect_request.om, seed/authority/cap_table_om2.om,
+note src/runtime/rx_caproot.om, src/runtime/rx_aegis.om.
+om2
+
+const VA_SUBJ_CLIENT ulong 7
+const VA_SUBJ_OTHER ulong 9
+const VA_ISSUER ulong 3
+const VA_RES_BASE ulong 0x7100
+
+const VA_OPC_READ ulong 1
+const VA_OPC_WRITE ulong 2
+const VA_OPC_EFFECT ulong 3
+const VA_OPC_MINT ulong 16
+
+const VA_RIGHT_READ ulong 1
+const VA_RIGHT_WRITE ulong 2
+const VA_RIGHT_EFFECT ulong 4
+const VA_RIGHT_MINT ulong 16
+
+text va_pass "PASS test_visor_authority (pure OM-2: Visor can ask, cannot grant)\n"
+text va_fail "FAIL test_visor_authority (pure OM-2)\n"
+text va_t_unauth "UNAUTHORIZED_REQUEST"
+text va_t_auth_f "authorized: false"
+text va_j_auth_f "\"authorized\":false"
+
+global g_va_fail ulong 1
+
+fn va_chk cond bool to void
+  if not cond
+    put g_va_fail 0 add get g_va_fail 0 1
+  end
+end
+
+fn va_rights_for_op op ulong to ulong
+  if eq op VA_OPC_READ
+    ret VA_RIGHT_READ
+  end
+  if eq op VA_OPC_WRITE
+    ret VA_RIGHT_WRITE
+  end
+  if eq op VA_OPC_EFFECT
+    ret VA_RIGHT_EFFECT
+  end
+  if eq op VA_OPC_MINT
+    ret VA_RIGHT_MINT
+  end
+  ret 0
+end
+
+fn va_ob_has pat view uchar * to bool
+  blen = get v_ob_len 0
+  plen = len pat
+  if or eq plen 0 gt plen blen
+    ret false
+  end
+  lim = add sub blen plen 1
+  for i ulong lim bound 4096
+    ok = true
+    for j ulong plen bound 64
+      if ne get v_ob add i j get pat j
+        ok = false
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+fn va_val_request hdr view ulong 4 slots view ulong 3328 subj ulong to long
+  vargs = new ulong 5 0
+  put vargs 0 get verq_cap_slot 0
+  put vargs 1 get verq_cap_gen 0
+  put vargs 2 subj
+  put vargs 3 add VA_RES_BASE get verq_res_cls 0
+  put vargs 4 va_rights_for_op get verq_op_code 0
+  ent = new ulong 13 0
+  ret rx_caproot_validate hdr slots vargs ent
+end
+
+fn va_test_bad_tok hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 tok view uchar 32 req view ulong 9 to void
+  bad_tok = new uchar 32 0
+  for i ulong 32
+    put bad_tok i xor get tok i uchar 1
+  end
+  ref_bad = new ulong 2 0
+  va_chk eq rx_capadmin_mint hdr slots delivered bad_tok req ref_bad ERR_UNAUTHORIZED
+end
+
+fn va_test_clock_revoke hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 tok view uchar 32 req edit ulong 9 to void
+  off = new ulong 2 0
+  rx_capadmin_office off
+  note Hostile 6: expired lease refused after advancing clock
+  va_chk eq verq_build 0 0
+  va_chk eq va_val_request hdr slots VA_SUBJ_CLIENT ERR_OK
+  cargs = new ulong 3 0
+  put cargs 0 get off 0
+  put cargs 1 get off 1
+  put cargs 2 10
+  va_chk eq rx_capadmin_advance_clock hdr slots delivered tok cargs ERR_OK
+  va_chk ne va_val_request hdr slots VA_SUBJ_CLIENT ERR_OK
+
+  note Hostile 7: revoked capability refused (fresh mint + positive control + revoke)
+  ref2 = new ulong 2 0
+  put req 4 100
+  va_chk eq rx_capadmin_mint hdr slots delivered tok req ref2 ERR_OK
+  e2 = og_build_effect 1 VA_OPC_EFFECT get ref2 0 get ref2 1
+  va_chk ge e2 0
+  va_chk eq verq_build ulong e2 0
+  va_chk eq va_val_request hdr slots VA_SUBJ_CLIENT ERR_OK
+  rargs = new ulong 4 0
+  put rargs 0 get off 0
+  put rargs 1 get off 1
+  put rargs 2 get ref2 0
+  put rargs 3 get ref2 1
+  rlist = new ulong 257 0
+  va_chk eq rx_capadmin_revoke hdr slots delivered tok rargs rlist ERR_OK
+  va_chk ne va_val_request hdr slots VA_SUBJ_CLIENT ERR_OK
+
+  note Hostile 8: malformed effect (resource_class == 0) fails closed in verq_build
+  ebad = og_build_effect 0 VA_OPC_EFFECT get ref2 0 get ref2 1
+  va_chk ge ebad 0
+  va_chk eq verq_build ulong ebad -1
+  va_chk eq get verq_cap_gen 0 0
+end
+
+fn va_test_cap_and_visor to void
+  hdr = new ulong 4 0
+  slots = new ulong 3328 0
+  delivered = new uchar 256 0
+  tok = new uchar 32 0
+  va_chk eq rx_caproot_start hdr slots delivered tok ERR_OK
+
+  off = new ulong 2 0
+  rx_capadmin_office off
+
+  note Mint honest capability for SUBJ_CLIENT on RES_BASE+1 with EFFECT right, lease=5
+  req = new ulong 9 0
+  put req 0 VA_ISSUER
+  put req 1 VA_SUBJ_CLIENT
+  put req 2 add VA_RES_BASE 1
+  put req 3 VA_RIGHT_EFFECT
+  put req 4 5
+  put req 5 0xffffffff
+  put req 6 0
+  put req 7 get off 0
+  put req 8 get off 1
+  ref_ok = new ulong 2 0
+  va_chk eq rx_capadmin_mint hdr slots delivered tok req ref_ok ERR_OK
+
+  note Build canonical KIND_EFFECT object and VisorEffectRequest
+  og_reset
+  eidx = og_build_effect 1 VA_OPC_EFFECT get ref_ok 0 get ref_ok 1
+  va_chk ge eidx 0
+  va_chk eq verq_build ulong eidx 0
+  va_chk eq get verq_res_cls 0 1
+  va_chk eq get verq_op_code 0 VA_OPC_EFFECT
+  va_chk eq get verq_cap_slot 0 get ref_ok 0
+  va_chk eq get verq_cap_gen 0 get ref_ok 1
+
+  note Visor formatters always declare UNAUTHORIZED_REQUEST and authorized: false
+  va_chk gt verq_format_text 4096 0
+  va_chk va_ob_has va_t_unauth
+  va_chk va_ob_has va_t_auth_f
+  va_chk gt verq_format_json 4096 0
+  va_chk va_ob_has va_j_auth_f
+  va_chk eq verq_format_text 16 -1
+  va_chk eq verq_format_json 16 -1
+
+  note Positive control: honest request validates with ERR_OK
+  va_chk eq va_val_request hdr slots VA_SUBJ_CLIENT ERR_OK
+
+  note Hostile 1: wrong subject refused
+  va_chk eq va_val_request hdr slots VA_SUBJ_OTHER ERR_SUBJECT
+
+  note Hostile 2: forged generation refused
+  eforg = og_build_effect 1 VA_OPC_EFFECT get ref_ok 0 add get ref_ok 1 1
+  va_chk ge eforg 0
+  va_chk eq verq_build ulong eforg 0
+  va_chk ne va_val_request hdr slots VA_SUBJ_CLIENT ERR_OK
+
+  note Hostile 3: wrong resource class refused
+  eres = og_build_effect 2 VA_OPC_EFFECT get ref_ok 0 get ref_ok 1
+  va_chk ge eres 0
+  va_chk eq verq_build ulong eres 0
+  va_chk eq va_val_request hdr slots VA_SUBJ_CLIENT ERR_RESOURCE
+
+  note Hostile 4: escalated privileged right (OPC_MINT) refused
+  emint = og_build_effect 1 VA_OPC_MINT get ref_ok 0 get ref_ok 1
+  va_chk ge emint 0
+  va_chk eq verq_build ulong emint 0
+  va_chk eq va_val_request hdr slots VA_SUBJ_CLIENT ERR_RIGHTS
+
+  note Hostile 5: forged office token on mint refused
+  va_test_bad_tok hdr slots delivered tok req
+
+  note Hostiles 6, 7, 8: expiry, revocation, malformed effect
+  va_test_clock_revoke hdr slots delivered tok req
+
+  va_chk eq rx_caproot_stop hdr slots delivered tok ERR_OK
+end
+
+fn va_test_aegis_policy to void
+  rules = new ulong 112 0
+  note Rule 0: id=1, subj=VA_SUBJ_CLIENT, res=[RES_BASE+1, RES_BASE+2], rights=EFFECT, max_lease=20
+  put rules 0 1
+  put rules 1 VA_SUBJ_CLIENT
+  put rules 2 add VA_RES_BASE 1
+  put rules 3 add VA_RES_BASE 2
+  put rules 4 VA_RIGHT_EFFECT
+  put rules 5 20
+  put rules 6 0
+
+  areq = new ulong 4 0
+  ares = new ulong 3 0
+  note Positive control: honest client request granted
+  put areq 0 VA_SUBJ_CLIENT
+  put areq 1 add VA_RES_BASE 1
+  put areq 2 VA_RIGHT_EFFECT
+  put areq 3 10
+  va_chk eq rx_aegis_evaluate rules 1 areq ares RX_AEGIS_GRANT
+  va_chk eq get ares 0 10
+
+  note Hostile: wrong subject denied
+  put areq 0 VA_SUBJ_OTHER
+  va_chk eq rx_aegis_evaluate rules 1 areq ares RX_AEGIS_DENY
+
+  note Hostile: resource outside rule range denied
+  put areq 0 VA_SUBJ_CLIENT
+  put areq 1 add VA_RES_BASE 9
+  va_chk eq rx_aegis_evaluate rules 1 areq ares RX_AEGIS_DENY
+
+  note Hostile: privilege escalation (MINT right) denied
+  put areq 1 add VA_RES_BASE 1
+  put areq 2 VA_RIGHT_MINT
+  va_chk eq rx_aegis_evaluate rules 1 areq ares RX_AEGIS_DENY
+end
+
+fn main to int
+  put g_va_fail 0 0
+  va_test_cap_and_visor
+  va_test_aegis_policy
+  if eq get g_va_fail 0 0
+    ign = write 1 va_pass 0 len va_pass
+    ret 0
+  end
+  ign = write 1 va_fail 0 len va_fail
+  ret 1
+end

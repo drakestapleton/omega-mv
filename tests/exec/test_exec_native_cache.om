@@ -1,0 +1,169 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/exec/test_exec_native_cache.c.
+note Verifies omega_exec_native_f3 64-slot byte-identity LRU cache contract:
+note hit/miss, same-bytes copy hit, same-length different-bytes invalidation,
+note in-place rewrite invalidation + rewrite-back hit, capacity eviction, LRU victim.
+om2
+
+text enc_pass "EXEC_NATIVE_CACHE: PASS (0 failures)\n"
+text enc_fail "EXEC_NATIVE_CACHE: FAIL\n"
+
+global g_enc_fail ulong 1
+
+fn enc_chk cond bool to void
+  if not cond
+    put g_enc_fail 0 add get g_enc_fail 0 1
+  end
+end
+
+fn enc_put32 dst edit uchar * off ulong w ulong to void
+  put dst off uchar and w 255
+  put dst add off 1 uchar and shr w 8 255
+  put dst add off 2 uchar and shr w 16 255
+  put dst add off 3 uchar and shr w 24 255
+end
+
+fn enc_mk_add dst edit uchar * imm ulong to void
+  enc_put32 dst 0 ulong a64movz 1 9 imm 0
+  enc_put32 dst 4 ulong a64addreg 1 0 0 9
+  enc_put32 dst 8 0xd65f03c0
+end
+
+fn enc_mk_mul dst edit uchar * imm ulong to void
+  enc_put32 dst 0 ulong a64movz 1 9 imm 0
+  enc_put32 dst 4 ulong a64mulreg 1 0 0 9
+  enc_put32 dst 8 0xd65f03c0
+end
+
+fn enc_test_basic to void
+  s0 = new ulong 4 0
+  s1 = new ulong 4 0
+  a = new uchar 12 0
+  b = new uchar 12 0
+  enc_mk_add a 5
+  enc_mk_mul b 7
+
+  omega_exec_native_cache_reset
+  omega_exec_native_cache_stats s0
+  enc_chk eq get s0 0 0
+  enc_chk eq get s0 1 0
+  enc_chk eq get s0 3 0
+
+  enc_chk eq omega_exec_native_f3 a 12 10 0 0 0
+  enc_chk eq get g_ex_res 0 15
+  enc_chk eq omega_exec_native_f3 a 12 11 0 0 0
+  enc_chk eq get g_ex_res 0 16
+  omega_exec_native_cache_stats s1
+  enc_chk eq get s1 1 1
+  enc_chk eq get s1 0 1
+  enc_chk eq get s1 3 1
+
+  enc_chk eq omega_exec_native_f3 b 12 3 0 0 0
+  enc_chk eq get g_ex_res 0 21
+  omega_exec_native_cache_stats s1
+  enc_chk eq get s1 1 2
+  enc_chk eq get s1 3 2
+
+  note Copy with identical bytes at different address still hits
+  cp = new uchar 12 0
+  for i ulong 12
+    put cp i get a i
+  end
+  enc_chk eq omega_exec_native_f3 cp 12 1 0 0 0
+  enc_chk eq get g_ex_res 0 6
+  omega_exec_native_cache_stats s1
+  enc_chk eq get s1 0 2
+
+  note Invalidation: same length, different bytes (ADD #6 vs ADD #5)
+  a6 = new uchar 12 0
+  enc_mk_add a6 6
+  diff = false
+  for i ulong 12
+    if ne get a6 i get a i
+      diff = true
+    end
+  end
+  enc_chk diff
+  omega_exec_native_cache_stats s0
+  enc_chk eq omega_exec_native_f3 a6 12 5 0 0 0
+  enc_chk eq get g_ex_res 0 11
+  omega_exec_native_cache_stats s1
+  enc_chk eq get s1 0 get s0 0
+  enc_chk eq get s1 1 add get s0 1 1
+
+  note Same buffer rewritten in place (ADD #9), then rewritten back (ADD #5)
+  enc_mk_add a 9
+  enc_chk eq omega_exec_native_f3 a 12 5 0 0 0
+  enc_chk eq get g_ex_res 0 14
+  enc_mk_add a 5
+  omega_exec_native_cache_stats s0
+  enc_chk eq omega_exec_native_f3 a 12 5 0 0 0
+  enc_chk eq get g_ex_res 0 10
+  omega_exec_native_cache_stats s1
+  enc_chk eq get s1 0 add get s0 0 1
+  enc_chk eq get s1 1 get s0 1
+end
+
+fn enc_test_evict_lru to void
+  s0 = new ulong 4 0
+  s1 = new ulong 4 0
+  a = new uchar 12 0
+  p = new uchar 12 0
+  enc_mk_add a 5
+
+  note Fill past capacity: 2 * EXEC_CACHE_SLOTS + 3 = 131
+  omega_exec_native_cache_reset
+  for i ulong 131
+    enc_mk_add p add 1000 i
+    enc_chk eq omega_exec_native_f3 p 12 i 0 0 0
+    enc_chk eq get g_ex_res 0 add 1000 mul 2 i
+  end
+  omega_exec_native_cache_stats s1
+  enc_chk eq get s1 3 EXEC_CACHE_SLOTS
+  enc_chk eq omega_exec_native_f3 a 12 10 0 0 0
+  enc_chk eq get g_ex_res 0 15
+
+  note LRU victim: fill every slot, touch oldest (0), add one more (64).
+  note Slot 1 (second oldest) is evicted and slot 0 stays resident.
+  omega_exec_native_cache_reset
+  for i ulong EXEC_CACHE_SLOTS
+    enc_mk_add p add 2000 i
+    enc_chk eq omega_exec_native_f3 p 12 1 0 0 0
+    enc_chk eq get g_ex_res 0 add 2001 i
+  end
+  enc_mk_add p 2000
+  enc_chk eq omega_exec_native_f3 p 12 1 0 0 0
+  enc_chk eq get g_ex_res 0 2001
+  enc_mk_add p add 2000 EXEC_CACHE_SLOTS
+  enc_chk eq omega_exec_native_f3 p 12 1 0 0 0
+  enc_chk eq get g_ex_res 0 add 2001 EXEC_CACHE_SLOTS
+  omega_exec_native_cache_stats s0
+  enc_chk eq get s0 2 1
+  enc_chk eq get s0 3 EXEC_CACHE_SLOTS
+
+  enc_mk_add p 2000
+  enc_chk eq omega_exec_native_f3 p 12 1 0 0 0
+  enc_chk eq get g_ex_res 0 2001
+  omega_exec_native_cache_stats s1
+  enc_chk eq get s1 0 add get s0 0 1
+  enc_chk eq get s1 1 get s0 1
+
+  enc_mk_add p 2001
+  enc_chk eq omega_exec_native_f3 p 12 1 0 0 0
+  enc_chk eq get g_ex_res 0 2002
+  omega_exec_native_cache_stats s0
+  enc_chk eq get s0 1 add get s1 1 1
+  enc_chk eq get s0 0 get s1 0
+end
+
+fn main to int
+  put g_enc_fail 0 0
+  enc_test_basic
+  enc_test_evict_lru
+  if eq get g_enc_fail 0 0
+    ign = write 1 enc_pass 0 len enc_pass
+    ret 0
+  end
+  ign = write 1 enc_fail 0 len enc_fail
+  ret 1
+end
