@@ -1,0 +1,113 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/gpu_moe_plan_test.c (--host-only suite).
+note Verifies om/gpu/moe_plan.om + src/omega_gpu_moe_plan.om: persistent MoE request queue,
+note wrap-around stress, unified layer planner (T=1 GEMV, T=64 GEMM, QMMA+overlap),
+note traffic estimator, and invalid config refusals. Zero /dev/nvidia* access.
+
+text mp_pass "gpu_moe_plan_test (om2): PASS\n"
+text mp_fail "gpu_moe_plan_test (om2): FAIL\n"
+
+global g_mp_pass ulong 1
+global g_mp_fail ulong 1
+
+fn mp_chk cond bool to void
+  if cond
+    put g_mp_pass 0 add get g_mp_pass 0 1
+  else
+    put g_mp_fail 0 add get g_mp_fail 0 1
+  end
+end
+
+fn test_queue_basic to void
+  q = new uint 512 0
+  slot = new uint 1 99
+  slots = new uint 64 0
+  claimed = new uint 1 0
+
+  mp_chk ne omega_moe_queue_init q 0 0
+  mp_chk ne omega_moe_queue_init q 65 0
+  mp_chk eq omega_moe_queue_init q 4 0
+
+  note Invalid enqueue checks
+  mp_chk ne omega_moe_queue_enqueue q 1 0 0 0 slot 0
+  mp_chk ne omega_moe_queue_enqueue q 1 1025 0 0 slot 0
+
+  note Fill to capacity 4, then overflow must fail
+  for i ulong 4
+    rc = omega_moe_queue_enqueue q uint add 100 i 16 uint i 0xf slot
+    mp_chk and eq rc 0 eq ulong get slot 0 i
+  end
+  mp_chk ne omega_moe_queue_enqueue q 104 16 4 0xf slot 0
+
+  note Claim batch with max_tokens=40 -> 2 requests (32 tokens), not 3 (48 > 40)
+  rc = omega_moe_queue_claim_batch q 40 slots claimed
+  mp_chk and eq rc 0 eq get claimed 0 2
+  mp_chk and eq get slots 0 0 eq get slots 1 1
+  mp_chk and eq get q 4 1 eq get q 5 2
+
+  note Complete batch cleanly -> head=2, active=0, done=2, err=0
+  mp_chk eq omega_moe_queue_complete_batch q get claimed 0 slots 0 0
+  mp_chk and eq get q 2 2 eq get q 5 0
+  mp_chk and eq get q 6 2 eq get q 7 0
+
+  note Wrap-around stress: 100 cycles of enqueue + claim + complete
+  for r ulong 100
+    mp_chk eq omega_moe_queue_enqueue q uint add 200 r 8 uint and r 31 0xf slot 0
+    rc2 = omega_moe_queue_claim_batch q 64 slots claimed
+    mp_chk and eq rc2 0 ge get claimed 0 1
+    st = uint 0
+    if eq and r 15 15
+      st = 1
+    end
+    mp_chk eq omega_moe_queue_complete_batch q get claimed 0 slots st 0
+  end
+  mp_chk and eq get q 2 get q 3 eq get q 5 0
+end
+
+fn test_planner_and_traffic to void
+  cfg = new ulong 8 0
+  plan_ops = new uint 128 0
+  nops = new uint 1 0
+  tr = new ulong 8 0
+
+  note T=1 selects GEMV for experts
+  put cfg 0 1
+  put cfg 1 2048
+  put cfg 2 768
+  put cfg 3 128
+  put cfg 4 8
+  put cfg 5 15
+  mp_chk and eq omega_moe_plan_layer cfg plan_ops nops 0 eq get nops 0 4
+  mp_chk and eq ulong get plan_ops 0 MOP_ROUTER_LOGITS eq ulong get plan_ops 4 MOP_EXPERT_GATEUP_GEMV
+  mp_chk and eq ulong get plan_ops 8 MOP_EXPERT_DOWN_GEMV eq ulong get plan_ops 12 MOP_MOE_COMBINE
+
+  note T=64 selects grouped GEMM for experts
+  put cfg 0 64
+  mp_chk and eq omega_moe_plan_layer cfg plan_ops nops 0 eq get nops 0 4
+  mp_chk and eq ulong get plan_ops 4 MOP_EXPERT_GATEUP_GEMM eq ulong get plan_ops 8 MOP_EXPERT_DOWN_GEMM
+
+  note QMMA + overlap marks ACT_QUANT independent beside router
+  put cfg 5 63
+  mp_chk and eq omega_moe_plan_layer cfg plan_ops nops 0 eq get nops 0 5
+  mp_chk and eq ulong get plan_ops 4 MOP_ACT_QUANT eq get plan_ops 5 1
+
+  note Traffic estimator
+  put cfg 5 15
+  mp_chk and eq omega_moe_plan_traffic cfg 126 tr 0 gt get tr 4 500000000
+
+  note Invalid planner config refused (top_k > experts)
+  put cfg 4 200
+  mp_chk ne omega_moe_plan_layer cfg plan_ops nops 0
+end
+
+fn main to int
+  test_queue_basic
+  test_planner_and_traffic
+  if eq get g_mp_fail 0 0
+    ign = write 1 mp_pass 0 len mp_pass
+    ret 0
+  end
+  ign = write 1 mp_fail 0 len mp_fail
+  ret 1
+end

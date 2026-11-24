@@ -1,0 +1,352 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/bw_hazard_test.c (decoder checks, red receipt fixtures,
+note and full negative-control suite against src/omega_bw_hazard.om). Zero /dev/nvidia* access.
+
+text bh_pass "bw_hazard_test (om2): PASS\n"
+text bh_fail "bw_hazard_test (om2): FAIL\n"
+text bh_fchk "FAIL check "
+text bh_nl "\n"
+
+text fx_attend_bad "tests/fixtures/bw_hazard/pattn256_attend_ad5d650b.bin"
+text fx_attend_ok  "tests/fixtures/bw_hazard/pattn256_attend_e3a26848.bin"
+text fx_prep_bad   "tests/fixtures/bw_hazard/pattn256_prep_ad5d650b.bin"
+text fx_prep_ok    "tests/fixtures/bw_hazard/pattn256_prep_e3a26848.bin"
+
+global g_bh_chk ulong 1
+global g_bh_fail ulong 1
+
+fn bh_put_u x ulong to void
+  b = new uchar 24 0
+  pos = ulong 24
+  v = x
+  while true
+    pos = sub pos 1
+    put b pos uchar add 48 rem v 10
+    v = div v 10
+    if eq v 0
+      ign = write 1 b pos sub 24 pos
+      ret
+    end
+  end
+end
+
+fn bh_chk cond bool to void
+  idx = add get g_bh_chk 0 1
+  put g_bh_chk 0 idx
+  if not cond
+    put g_bh_fail 0 add get g_bh_fail 0 1
+    ign = write 1 bh_fchk 0 len bh_fchk
+    bh_put_u idx
+    ign2 = write 1 bh_nl 0 len bh_nl
+  end
+end
+
+fn bh_put32 buf edit uchar * off ulong v ulong to void
+  put buf off uchar and v 255
+  put buf add off 1 uchar and shr v 8 255
+  put buf add off 2 uchar and shr v 16 255
+  put buf add off 3 uchar and shr v 24 255
+end
+
+fn bh_lo buf edit uchar * pc ulong w0 ulong w1 ulong to void
+  off = mul pc 16
+  bh_put32 buf off w0
+  bh_put32 buf add off 4 w1
+end
+
+fn bh_hi buf edit uchar * pc ulong w2 ulong w3 ulong to void
+  off = mul pc 16
+  bh_put32 buf add off 8 w2
+  bh_put32 buf add off 12 w3
+end
+
+fn bh_cw stall ulong wbar ulong rbar ulong wait ulong to ulong
+  ret or or shl stall 9 shl wbar 14 or shl rbar 17 shl wait 20
+end
+
+fn bh_bra16 rel ulong to ulong
+  ret or 0x947 shl and sub rel 1 0x3f 18
+end
+
+fn bh_finding pc ulong kind ulong reg ulong to bool
+  cnt = get g_bwr_count 0
+  if gt cnt OMEGA_BW_HAZARD_MAX
+    cnt = OMEGA_BW_HAZARD_MAX
+  end
+  for i ulong cnt bound 256
+    if eq get g_bwr_f_pc i pc
+      if eq get g_bwr_f_kind i kind
+        if eq get g_bwr_f_reg i reg
+          if eq get g_bwr_f_uni i 0
+            ret true
+          end
+        end
+      end
+    end
+  end
+  ret false
+end
+
+fn bh_set_wait code edit uchar * pc ulong wait ulong to void
+  off = add mul pc 16 12
+  w3 = bw_rd32 code off
+  w3 = or and w3 not shl ulong 0x3f 20 shl and wait 0x3f 20
+  bh_put32 code off w3
+end
+
+fn bh_load path view uchar * buf edit uchar * cap ulong to ulong
+  fd = fopen path 0 len path 0 0
+  if lt fd 0
+    ret 0
+  end
+  tot = ulong 0
+  while lt tot cap bound 64
+    nr = read int fd buf tot sub cap tot
+    if le nr 0
+      break
+    end
+    tot = add tot ulong nr
+  end
+  ign = fclose int fd
+  ret tot
+end
+
+fn test_decoder_controls to void
+  buf = new uchar 64 0
+  note NOP with distinct control fields: stall=3, yield=1 (bit 13), wbar=2, rbar=5, wait=0x29
+  cw = or bh_cw 3 2 5 0x29 0x2000
+  bh_lo buf 0 0x00007918 0
+  bh_hi buf 0 0 cw
+  bh_chk eq omega_bw_decode buf 0 0 0
+  bh_chk eq get g_bwd_stall 0 3
+  bh_chk eq get g_bwd_yield 0 1
+  bh_chk eq get g_bwd_wbar 0 2
+  bh_chk eq get g_bwd_rbar 0 5
+  bh_chk eq get g_bwd_wait 0 0x29
+
+  note LDCU UR6 (op=0x7ac, a=URZ=255, size=0 -> 1 reg) and LDCU.64 UR6 (size=5 -> 2 regs)
+  bh_lo buf 0 0xff0677ac 0
+  bh_hi buf 0 0 bh_cw 1 0 7 0
+  bh_chk eq omega_bw_decode buf 0 0 0
+  bh_chk and eq get g_bwd_nw 0 1 eq get g_bwd_nr 0 0
+  bh_chk and eq get g_bwd_wr_u 0 1 and eq get g_bwd_wr_reg 0 6 eq get g_bwd_wr_n 0 1
+
+  bh_lo buf 0 0xff0677ac 0
+  bh_hi buf 0 0x00000a00 bh_cw 1 0 7 0
+  bh_chk eq omega_bw_decode buf 0 0 0
+  bh_chk and eq get g_bwd_wr_u 0 1 and eq get g_bwd_wr_reg 0 6 eq get g_bwd_wr_n 0 2
+end
+
+fn test_red_receipt to void
+  a = new uchar 16384 0
+
+  note 1. Pre-#553 attend (10112 B): must fail with WAR on R22/R23 at IR 88/89, release=0x3
+  n1 = bh_load fx_attend_bad a 16384
+  bh_chk eq n1 10112
+  if eq n1 10112
+    bh_chk eq omega_bw_hazard_check a n1 0
+    bh_chk eq get g_bwr_count 0 2
+    bh_chk bh_finding 88 OMEGA_BW_HZ_WAR 22
+    bh_chk bh_finding 89 OMEGA_BW_HZ_WAR 23
+    bh_chk and eq get g_bwr_f_rel 0 3 eq get g_bwr_f_rel 1 3
+  end
+
+  note 2. Fixed attend (10112 B): must pass with 0 findings; IR 55 wait mutant fails again
+  n2 = bh_load fx_attend_ok a 16384
+  bh_chk eq n2 10112
+  if eq n2 10112
+    bh_chk eq omega_bw_hazard_check a n2 0
+    bh_chk eq get g_bwr_count 0 0
+    bh_chk eq omega_bw_decode a 880 0 0
+    bh_chk and eq get g_bwd_op 0 0x210 eq get g_bwd_wait 0 3
+    bh_set_wait a 55 0x10
+    bh_chk eq omega_bw_hazard_check a n2 0
+    bh_chk eq get g_bwr_count 0 2
+    bh_chk bh_finding 88 OMEGA_BW_HZ_WAR 22
+    bh_chk bh_finding 89 OMEGA_BW_HZ_WAR 23
+  end
+
+  note 3. Pre-#553 prep (5376 B): RAW R20 at IR 35, release=0x1
+  n3 = bh_load fx_prep_bad a 16384
+  bh_chk eq n3 5376
+  if eq n3 5376
+    bh_chk eq omega_bw_hazard_check a n3 0
+    bh_chk eq get g_bwr_count 0 1
+    bh_chk bh_finding 35 OMEGA_BW_HZ_RAW 20
+    bh_chk eq get g_bwr_f_rel 0 1
+  end
+
+  note 4. Fixed prep (5376 B): 0 findings
+  n4 = bh_load fx_prep_ok a 16384
+  bh_chk eq n4 5376
+  if eq n4 5376
+    bh_chk eq omega_bw_hazard_check a n4 0
+    bh_chk eq get g_bwr_count 0 0
+  end
+end
+
+fn test_controls_raw_war_waw to void
+  c = new uchar 256 0
+  fix = bh_cw 6 7 7 0
+  ld = or bh_cw 4 0 1 0 0x2000
+  st = or bh_cw 4 7 1 0 0x2000
+  endw = bh_cw 5 7 7 0
+
+  note RAW: LDG.E R4, [R2.64] -> FADD R6, R4, R4 -> EXIT
+  bh_lo c 0 0x02047981 0
+  bh_hi c 0 0x100 ld
+  bh_lo c 1 0x04067221 4
+  bh_hi c 1 0 fix
+  bh_lo c 2 0x0000794d 0
+  bh_hi c 2 0 endw
+  bh_chk and eq omega_bw_hazard_check c 48 0 and eq get g_bwr_count 0 1 bh_finding 1 OMEGA_BW_HZ_RAW 4
+
+  note RAW with wait 0x1 passes
+  bh_hi c 1 0 bh_cw 6 7 7 1
+  bh_chk and eq omega_bw_hazard_check c 48 0 eq get g_bwr_count 0 0
+
+  note RAW behind wait on barrier 4 (0x10) caught
+  bh_hi c 1 0 bh_cw 6 7 7 0x10
+  bh_chk and eq omega_bw_hazard_check c 48 0 and eq get g_bwr_count 0 1 bh_finding 1 OMEGA_BW_HZ_RAW 4
+
+  note RAW behind read barrier only (0x2) caught
+  bh_hi c 1 0 bh_cw 6 7 7 2
+  bh_chk and eq omega_bw_hazard_check c 48 0 and eq get g_bwr_count 0 1 bh_finding 1 OMEGA_BW_HZ_RAW 4
+
+  note WAR: STG.E [R2.64], R4 -> MOV R4, 0 -> EXIT
+  bh_lo c 0 0x02007986 4
+  bh_hi c 0 0x100 st
+  bh_lo c 1 0x00047802 0
+  bh_hi c 1 0 fix
+  bh_lo c 2 0x0000794d 0
+  bh_hi c 2 0 endw
+  bh_chk and eq omega_bw_hazard_check c 48 0 and eq get g_bwr_count 0 1 bh_finding 1 OMEGA_BW_HZ_WAR 4
+
+  note WAR on address high half R3 caught
+  bh_lo c 1 0x00037802 0
+  bh_hi c 1 0 fix
+  bh_chk and eq omega_bw_hazard_check c 48 0 and eq get g_bwr_count 0 1 bh_finding 1 OMEGA_BW_HZ_WAR 3
+
+  note WAR with wait 0x2 passes
+  bh_hi c 1 0 bh_cw 6 7 7 2
+  bh_chk and eq omega_bw_hazard_check c 48 0 eq get g_bwr_count 0 0
+
+  note Unrelated register R5 passes
+  bh_lo c 1 0x00057802 0
+  bh_hi c 1 0 fix
+  bh_chk and eq omega_bw_hazard_check c 48 0 eq get g_bwr_count 0 0
+
+  note WAW: LDG.E R4, [R2.64] -> MOV R4, 0 (wait 0x2 only) caught
+  bh_lo c 0 0x02047981 0
+  bh_hi c 0 0x100 ld
+  bh_lo c 1 0x00047802 0
+  bh_hi c 1 0 bh_cw 6 7 7 2
+  bh_lo c 2 0x0000794d 0
+  bh_hi c 2 0 endw
+  bh_chk and eq omega_bw_hazard_check c 48 0 and eq get g_bwr_count 0 1 bh_finding 1 OMEGA_BW_HZ_WAW 4
+
+  note S2R R4 with no write barrier caught even behind wait 0x3f (release=0)
+  bh_lo c 0 0x00047919 0
+  bh_hi c 0 0 bh_cw 4 7 7 0
+  bh_lo c 1 0x04067221 4
+  bh_hi c 1 0 bh_cw 6 7 7 0x3f
+  bh_lo c 2 0x0000794d 0
+  bh_hi c 2 0 endw
+  bh_chk eq omega_bw_hazard_check c 48 0
+  bh_chk eq get g_bwr_count 0 1
+  bh_chk bh_finding 1 OMEGA_BW_HZ_RAW 4
+  bh_chk eq get g_bwr_f_rel 0 0
+end
+
+fn test_controls_cfg_and_refusals to void
+  c = new uchar 256 0
+  fix = bh_cw 6 7 7 0
+  ld = or bh_cw 4 0 1 0 0x2000
+  endw = bh_cw 5 7 7 0
+
+  note Unknown opcode refused with bad_pc=1
+  bh_lo c 0 0x02047981 0
+  bh_hi c 0 0x100 ld
+  bh_lo c 1 0x00007f55 0
+  bh_hi c 1 0 fix
+  bh_lo c 2 0x0000794d 0
+  bh_hi c 2 0 endw
+  bh_chk and eq omega_bw_hazard_check c 48 -1 eq get g_bwr_bad_pc 0 1
+
+  note Branch out of range refused with bad_pc=0
+  bh_lo c 0 or bh_bra16 5 0x7000 0
+  bh_hi c 0 0 endw
+  bh_chk and eq omega_bw_hazard_check c 16 -1 eq get g_bwr_bad_pc 0 0
+
+  note Bad length refused
+  bh_chk eq omega_bw_hazard_check c 15 -1
+  bh_chk eq omega_bw_hazard_check c 0 -1
+
+  note Forged barrier 6 (wbar/rbar = {6,6}, {6,7}, {7,6}) refused
+  bh_lo c 1 0x00027202 1
+  bh_hi c 1 0 fix
+  bh_lo c 2 0x0000794d 0
+  bh_hi c 2 0 endw
+  bh_lo c 0 0x00017919 0
+  bh_hi c 0 0 bh_cw 0 6 6 0
+  bh_chk eq omega_bw_decode c 0 0 -1
+  bh_chk and eq omega_bw_hazard_check c 48 -1 eq get g_bwr_bad_pc 0 0
+  bh_hi c 0 0 bh_cw 0 6 7 0
+  bh_chk eq omega_bw_decode c 0 0 -1
+  bh_chk and eq omega_bw_hazard_check c 48 -1 eq get g_bwr_bad_pc 0 0
+  bh_hi c 0 0 bh_cw 0 7 6 0
+  bh_chk eq omega_bw_decode c 0 0 -1
+  bh_chk and eq omega_bw_hazard_check c 48 -1 eq get g_bwr_bad_pc 0 0
+
+  note Diamond A: RAW R1 at IR 4 names earliest producer IR 1
+  bh_lo c 0 bh_bra16 3 0
+  bh_hi c 0 0 endw
+  bh_lo c 1 0x00017919 0
+  bh_hi c 1 0 bh_cw 1 0 7 0
+  bh_lo c 2 or bh_bra16 2 0x7000 0
+  bh_hi c 2 0 endw
+  bh_lo c 3 0x00017919 0
+  bh_hi c 3 0 bh_cw 1 0 7 0
+  bh_lo c 4 0x00027202 1
+  bh_hi c 4 0 fix
+  bh_lo c 5 0x0000794d 0
+  bh_hi c 5 0 endw
+  bh_chk eq omega_bw_hazard_check c 96 0
+  bh_chk eq get g_bwr_count 0 1
+  bh_chk bh_finding 4 OMEGA_BW_HZ_RAW 1
+  bh_chk eq get g_bwr_f_src 0 1
+
+  note Diamond B: RAW R1 at IR 5 names earliest producer IR 2
+  bh_lo c 0 bh_bra16 2 0
+  bh_hi c 0 0 endw
+  bh_lo c 1 or bh_bra16 3 0x7000 0
+  bh_hi c 1 0 endw
+  bh_lo c 2 0x00017919 0
+  bh_hi c 2 0 bh_cw 1 0 7 0
+  bh_lo c 3 or bh_bra16 2 0x7000 0
+  bh_hi c 3 0 endw
+  bh_lo c 4 0x00017919 0
+  bh_hi c 4 0 bh_cw 1 0 7 0
+  bh_lo c 5 0x00027202 1
+  bh_hi c 5 0 fix
+  bh_lo c 6 0x0000794d 0
+  bh_hi c 6 0 endw
+  bh_chk eq omega_bw_hazard_check c 112 0
+  bh_chk eq get g_bwr_count 0 1
+  bh_chk bh_finding 5 OMEGA_BW_HZ_RAW 1
+  bh_chk eq get g_bwr_f_src 0 2
+end
+
+fn main to int
+  test_decoder_controls
+  test_red_receipt
+  test_controls_raw_war_waw
+  test_controls_cfg_and_refusals
+  if eq get g_bh_fail 0 0
+    ign = write 1 bh_pass 0 len bh_pass
+    ret 0
+  end
+  ign = write 1 bh_fail 0 len bh_fail
+  ret 1
+end

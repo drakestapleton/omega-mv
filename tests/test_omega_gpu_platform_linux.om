@@ -1,0 +1,285 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_platform_linux.c.
+note Tests src/omega_gpu_platform.om, src/omega_gpu_platform_linux.om, src/omega_gpu_mem_cached.om,
+note src/omega_gpu_session.om, and src/omega_gpu_cmdlist.om in mock mode. Zero /dev/nvidia* access.
+
+text pl_pass "test_omega_gpu_platform_linux (om2, mock): PASS\n"
+text pl_fail "test_omega_gpu_platform_linux (om2, mock): FAIL\n"
+
+global g_pl_chk ulong 1
+global g_pl_fail ulong 1
+
+fn pl_chk cond bool to void
+  put g_pl_chk 0 add get g_pl_chk 0 1
+  if not cond
+    put g_pl_fail 0 add get g_pl_fail 0 1
+  end
+end
+
+fn pl_reset to void
+  ogpl_set_mock 1
+  ogpl_reset_state
+  ogps_reset_all
+end
+
+fn pl_make_launch dst edit ulong 12 timeout_ms ulong to void
+  put dst 0 0x200000000
+  put dst 1 64
+  put dst 2 32
+  put dst 3 1
+  put dst 4 1
+  put dst 5 1
+  put dst 6 32
+  put dst 7 4
+  put dst 8 timeout_ms
+  put dst 9 0
+  put dst 10 0
+  put dst 11 0
+end
+
+fn c_caps to void
+  caps = new ulong 10 0
+  fmask = new ulong 12 0
+  ogpl_caps caps
+  ogpl_fnmask fmask
+  pl_chk eq get caps 0 1
+  pl_chk eq get caps 1 2
+  pl_chk eq get caps 2 OGP_SVC_REQUIRED_SESSION
+  pl_chk eq and get caps 2 OGP_SVC_IRQ 0
+  pl_chk eq and get caps 2 OGP_SVC_MMIO 0
+  pl_chk eq get fmask 3 0
+  pl_chk eq get fmask 7 0
+  pl_chk eq ogp_check_for fmask caps OGP_SVC_REQUIRED_SESSION OGP_OK
+  pl_chk eq get caps 9 OGPL_L2_INVAL_WORDS
+end
+
+fn c_default_install to void
+  pl_reset
+  pl_chk eq ogps_platform_installed 1
+  pl_chk eq ogps_completion_mode OGPS_COMPLETION_POLLING
+end
+
+fn c_same_driver_calls to void
+  pl_reset
+  ogps_lock
+  pl_chk eq ogps_open 1
+  note 1 device + 1 queue + 4 session buffers = 6 live handles
+  pl_chk eq get ogp_ht_nlive 0 6
+  pl_chk eq get ogps_pb 5 0x10000
+  pl_chk eq get ogps_cbank 5 0x1000
+  pl_chk eq get ogps_marker 5 0x1000
+  pl_chk eq get ogps_qmd 5 0x10000
+
+  L = new ulong 12 0
+  args = new uint 4 0
+  put args 0 1
+  put args 1 2
+  put args 2 3
+  put args 3 4
+  el = new ulong 1 0
+  mk = new uint 1 0
+  pl_make_launch L 1000
+  pl_chk eq ogps_launch L args el mk OGPS_OK
+  pl_chk eq get ogpl_submit_count 0 1
+  pl_chk eq get mk 0 OGPS_MARKER1_PAYLOAD
+
+  ogps_unlock
+  ogps_close
+  pl_chk eq ogps_is_open 0
+  pl_chk eq get ogp_ht_nlive 0 0
+end
+
+fn c_ref_refusals_part1 d_idx ulong d_gen ulong to void
+  desc = new ulong 5 0
+  h = new ulong 2 0
+  info = new ulong 3 0
+
+  note Refuses GPU-cached with CPU_READ | GPU_WRITE
+  put desc 0 OGP_HANDLE_BUF_DATA
+  put desc 1 or OGP_RIGHT_CPU_READ OGP_RIGHT_GPU_WRITE
+  put desc 2 OGP_CACHE_GPU_CACHED
+  put desc 3 0
+  put desc 4 4096
+  pl_chk eq ogpl_dma_alloc d_idx d_gen desc h info OGP_REFUSED_CACHE_POLICY
+
+  note Refuses GPU-cached + HOST_POLLED
+  put desc 1 or get desc 1 OGP_RIGHT_HOST_POLLED
+  pl_chk eq ogpl_dma_alloc d_idx d_gen desc h info OGP_REFUSED_CACHE_POLICY
+end
+
+fn c_ref_refusals_queue d_idx ulong d_gen ulong h_idx ulong h_gen ulong to void
+  desc = new ulong 5 0
+  rh = new ulong 2 0
+  q = new ulong 2 0
+  info = new ulong 3 0
+  put desc 0 OGP_HANDLE_BUF_QUEUE
+  put desc 1 or OGP_RIGHT_CPU_WRITE OGP_RIGHT_GPU_READ
+  put desc 2 OGP_CACHE_GPU_UNCACHED
+  put desc 3 0
+  put desc 4 4096
+  pl_chk eq ogpl_dma_alloc d_idx d_gen desc rh info OGP_OK
+  pl_chk eq ogpl_queue_open d_idx d_gen h_idx h_gen q OGP_REFUSED_BAD_KIND
+  pl_chk eq ogpl_queue_open d_idx d_gen get rh 0 get rh 1 q OGP_OK
+  pl_chk eq ogpl_dma_free get rh 0 get rh 1 OGP_REFUSED_BUSY
+
+  big_pb = new uint 2048 0
+  pl_chk eq ogpl_queue_submit get q 0 get q 1 big_pb 2048 OGP_REFUSED_BAD_LENGTH
+  pl_chk eq get ogpl_submit_count 0 0
+
+  pl_chk eq ogpl_device_close d_idx d_gen OGP_OK
+  note Stale handle refusals after device close
+  pl_chk eq ogpl_dma_free h_idx h_gen OGP_REFUSED_STALE_HANDLE
+  pl_chk eq ogpl_sync_to_gpu h_idx h_gen 0 4 OGP_REFUSED_STALE_HANDLE
+  pl_chk eq ogpl_queue_submit get q 0 get q 1 big_pb 4 OGP_REFUSED_STALE_HANDLE
+  pl_chk eq ogpl_dma_alloc d_idx d_gen desc rh info OGP_REFUSED_STALE_HANDLE
+end
+
+fn c_reference_refusals to void
+  pl_reset
+  dev = new ulong 2 0
+  dev2 = new ulong 2 0
+  pl_chk eq ogpl_device_open 0 dev OGP_OK
+  pl_chk eq ogpl_device_open 0 dev2 OGP_REFUSED_LIMIT
+  d_idx = get dev 0
+  d_gen = get dev 1
+  c_ref_refusals_part1 d_idx d_gen
+
+  desc = new ulong 5 0
+  h = new ulong 2 0
+  info = new ulong 3 0
+  put desc 0 OGP_HANDLE_BUF_DATA
+  put desc 1 or OGP_RIGHT_CPU_READ OGP_RIGHT_GPU_WRITE
+  put desc 2 OGP_CACHE_GPU_UNCACHED
+  put desc 3 0
+  put desc 4 4096
+  pl_chk eq ogpl_dma_alloc d_idx d_gen desc h info OGP_OK
+  pl_chk ge get info 2 4096
+
+  obs = new uint 1 0
+  pl_chk eq ogpl_poll_word get h 0 get h 1 0 1 1 obs OGP_REFUSED_BAD_RIGHTS
+  c_ref_refusals_queue d_idx d_gen get h 0 get h 1
+end
+
+fn c_marker_never_latches to void
+  pl_reset
+  ogps_lock
+  pl_chk eq ogps_open 1
+  put ogps_mock_fail_wait 0 2
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  pl_make_launch L 5
+  pl_chk eq ogps_launch L args el mk OGPS_ERR
+  put ogps_mock_fail_wait 0 0
+  pl_chk eq ogps_is_blocked 1
+  ogps_unlock
+  ogps_close
+  ps = new ulong 3 0
+  ogps_parked ps
+  pl_chk eq get ps 0 4
+  pl_chk eq get ogp_ht_nlive 0 6
+end
+
+fn c_l2_inval_prefix_once to void
+  pl_reset
+  pl_chk eq ogps_submit_prefix_words 5
+  ogps_lock
+  pl_chk eq ogps_open 1
+
+  ch = new ulong 2 0
+  ci = new ulong 3 0
+  pl_chk eq ogmc_alloc_cached get ogps_dev 0 get ogps_dev 1 4096 ch ci OGP_OK
+
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  pl_make_launch L 1000
+
+  note Plain launch: no host write to cached buffer yet
+  pl_chk eq ogps_launch L args el mk OGPS_OK
+  pl_chk eq get ogpl_last_had_l2_prefix 0 0
+  plain = get ogpl_last_submit_words 0
+
+  note Uncached sync_to_gpu: no prefix
+  pl_chk eq ogpl_sync_to_gpu get ogps_marker 0 get ogps_marker 1 0 4 OGP_OK
+  pl_chk eq ogps_launch L args el mk OGPS_OK
+  pl_chk eq get ogpl_last_had_l2_prefix 0 0
+  pl_chk eq get ogpl_last_submit_words 0 plain
+
+  note Cached sync_to_gpu: exactly one 5-word L2 invalidate prefix on next submit
+  pl_chk eq ogpl_sync_to_gpu get ch 0 get ch 1 0 4096 OGP_OK
+  pl_chk eq ogps_launch L args el mk OGPS_OK
+  pl_chk eq get ogpl_last_had_l2_prefix 0 5
+  pl_chk eq get ogpl_last_submit_words 0 add plain 5
+
+  note Consumed: next launch has no prefix
+  pl_chk eq ogps_launch L args el mk OGPS_OK
+  pl_chk eq get ogpl_last_had_l2_prefix 0 0
+  pl_chk eq get ogpl_last_submit_words 0 plain
+
+  note GPU->CPU sync on cached buffer: no prefix
+  pl_chk eq ogpl_sync_to_cpu get ch 0 get ch 1 0 4096 OGP_OK
+  pl_chk eq ogps_launch L args el mk OGPS_OK
+  pl_chk eq get ogpl_last_had_l2_prefix 0 0
+  pl_chk eq get ogpl_last_submit_words 0 plain
+
+  ign = ogpl_dma_free get ch 0 get ch 1
+  ogps_unlock
+  ogps_close
+end
+
+fn c_cmdlist_with_l2_inval_pending to void
+  pl_reset
+  cid = new ulong 1 0
+  pl_chk eq ogcl_create 64 cid 0
+  cl = get cid 0
+  ogps_lock
+  L = new ulong 12 0
+  args = new uint 4 0
+  pl_make_launch L 1000
+  for i ulong 32
+    pl_chk eq ogcl_add cl L args long i
+  end
+
+  ch = new ulong 2 0
+  ci = new ulong 3 0
+  pl_chk eq ogmc_alloc_cached get ogps_dev 0 get ogps_dev 1 4096 ch ci OGP_OK
+  pl_chk eq ogpl_sync_to_gpu get ch 0 get ch 1 0 4096 OGP_OK
+  pl_chk eq get ogpl_l2_pending 0 1
+
+  opts = new ulong 7 0
+  put opts 0 OGCL_MODE_PCAS
+  put opts 1 OGCL_BARRIER_WFI
+  put opts 2 1000
+  put opts 4 1
+  st = new ulong 7 0
+  pl_chk eq ogcl_submit cl opts st 0
+  pl_chk eq get st 5 32
+  pl_chk eq get ogpl_l2_pending 0 0
+  pl_chk eq ogps_is_blocked 0
+  pl_chk eq ogcl_is_latched 0
+
+  ign = ogpl_dma_free get ch 0 get ch 1
+  ogcl_free cl
+  ogps_unlock
+  ogps_close
+end
+
+fn main to int
+  c_caps
+  c_default_install
+  c_same_driver_calls
+  c_reference_refusals
+  c_marker_never_latches
+  c_l2_inval_prefix_once
+  c_cmdlist_with_l2_inval_pending
+  if eq get g_pl_fail 0 0
+    ign = write 1 pl_pass 0 len pl_pass
+    ret 0
+  end
+  ign = write 1 pl_fail 0 len pl_fail
+  ret 1
+end

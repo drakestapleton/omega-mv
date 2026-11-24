@@ -1,0 +1,375 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_session_platform.c.
+note Tests platform install refusals, open/launch/close typed uncached polling,
+note cancel before/after submit, timeout park/latch rules, C5 recover + teardown fault +
+note module latch, stale handle after reopen, serving reservation refusal, and bounded
+note omega_gpu_fmt parity. Zero /dev/nvidia* access.
+
+text sp_pass "test_omega_gpu_session_platform (om2): PASS\n"
+text sp_fail "test_omega_gpu_session_platform (om2): FAIL\n"
+
+text sp_fmt_full "%s:%c:%d:%u:%x:%ld:%lu:%lld:%llu:%zu:%%"
+text sp_fmt_exp "stage:x:-42:4000000000:beef:-7:9:-9223372036854775808:18446744073709551615:12345:%"
+text sp_fmt_s "%s"
+text sp_fmt_d "%d"
+text sp_stage "stage"
+text sp_trunc_in "truncate me"
+text sp_trunc_exp "trunc"
+
+global g_sp_chk ulong 1
+global g_sp_fail ulong 1
+
+fn sp_chk cond bool to void
+  put g_sp_chk 0 add get g_sp_chk 0 1
+  if not cond
+    put g_sp_fail 0 add get g_sp_fail 0 1
+  end
+end
+
+fn sp_reset to void
+  ogpl_set_mock 1
+  ogpl_reset_state
+  ogps_reset_all
+end
+
+fn sp_make_launch dst edit ulong 12 timeout_ms ulong to void
+  put dst 0 0x200000000
+  put dst 1 64
+  put dst 2 32
+  put dst 3 1
+  put dst 4 1
+  put dst 5 1
+  put dst 6 32
+  put dst 7 4
+  put dst 8 timeout_ms
+  put dst 9 0
+  put dst 10 0
+  put dst 11 0
+end
+
+fn c_install_refusals to void
+  sp_reset
+  caps = new ulong 10 0
+  fmask = new ulong 12 0
+
+  note Missing CLOCK_NS -> REFUSED_MISSING_SERVICE
+  ogpl_caps caps
+  ogpl_fnmask fmask
+  put caps 2 and get caps 2 not OGP_SVC_CLOCK_NS
+  put fmask 10 0
+  sp_chk eq ogps_set_platform 1 caps fmask OGP_REFUSED_MISSING_SERVICE
+
+  note Unclaimed IRQ fn present -> REFUSED_ARGS
+  ogpl_caps caps
+  ogpl_fnmask fmask
+  put fmask 7 3
+  sp_chk ne ogps_set_platform 1 caps fmask OGP_OK
+
+  note ABI 1.1 predates submit_prefix_words -> REFUSED_ABI
+  ogpl_caps caps
+  ogpl_fnmask fmask
+  put caps 1 1
+  sp_chk eq ogps_set_platform 1 caps fmask OGP_REFUSED_ABI
+
+  note Valid install succeeds
+  ogpl_caps caps
+  ogpl_fnmask fmask
+  sp_chk eq ogps_set_platform 1 caps fmask OGP_OK
+  sp_chk eq ogps_completion_mode OGPS_COMPLETION_POLLING
+end
+
+fn c_open_launch_close to void
+  sp_reset
+  ogps_lock
+  sp_chk eq ogps_open 1
+  sp_chk eq ogps_open_count 1
+  sp_chk eq get ogp_ht_nlive 0 6
+  sp_chk eq ulong get ogp_ht_kind get ogps_pb 0 OGP_HANDLE_BUF_QUEUE
+  sp_chk ne and ulong get ogpl_rights get ogps_marker 0 OGP_RIGHT_HOST_POLLED 0
+  sp_chk eq and ulong get ogpl_rights get ogps_cbank 0 OGP_RIGHT_HOST_POLLED 0
+
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  sp_make_launch L 100
+  sp_chk eq ogps_launch L args el mk OGPS_OK
+  sp_chk eq get mk 0 OGPS_MARKER1_PAYLOAD
+  sp_chk eq get ogpl_submit_count 0 1
+  sp_chk eq ogps_is_blocked 0
+
+  code = new ulong 6 0
+  sp_chk eq ogps_alloc_code 100 code OGPS_OK
+  cidx = get code 0
+  sp_chk eq ulong get ogp_ht_kind cidx OGP_HANDLE_BUF_CODE
+  sp_chk ne and ulong get ogpl_rights cidx OGP_RIGHT_GPU_EXEC 0
+  sp_chk eq and ulong get ogpl_rights cidx OGP_RIGHT_GPU_WRITE 0
+  ogps_free code
+  sp_chk eq get code 1 0
+
+  ogps_unlock
+  ogps_close
+  sp_chk eq ogps_is_open 0
+  sp_chk eq get ogp_ht_nlive 0 0
+end
+
+fn c_cancel_before_submit to void
+  sp_reset
+  ogps_lock
+  sp_chk eq ogps_open 1
+  ogps_cancel
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  sp_make_launch L 100
+  sp_chk eq ogps_launch L args el mk OGPS_CANCELLED
+  sp_chk eq get ogpl_submit_count 0 0
+  sp_chk eq ogps_is_blocked 0
+  ps = new ulong 3 0
+  ogps_parked ps
+  sp_chk eq get ps 0 0
+  sp_chk eq ogps_launch L args el mk OGPS_OK
+  ogps_unlock
+  ogps_close
+  sp_chk eq get ogp_ht_nlive 0 0
+end
+
+fn c_timeout_parks_and_latch_rules to void
+  sp_reset
+  ogps_lock
+  sp_chk eq ogps_open 1
+  user = new ulong 6 0
+  sp_chk eq ogps_alloc 4096 user OGPS_OK
+  uidx = get user 0
+  ugen = get user 1
+
+  put ogps_mock_fail_wait 0 2
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  sp_make_launch L 25
+  sp_chk eq ogps_launch L args el mk OGPS_ERR
+  put ogps_mock_fail_wait 0 0
+  sp_chk eq ogps_is_blocked 1
+
+  ogps_free user
+  sp_chk eq ogps_is_parked uidx ugen 1
+  sp_chk eq ogps_is_parked get ogps_marker 0 get ogps_marker 1 1
+  sp_chk eq ogps_is_parked get ogps_pb 0 get ogps_pb 1 1
+
+  m2 = new ulong 6 0
+  sp_chk ne ogps_alloc 64 m2 OGPS_OK
+  ogps_unlock
+
+  ps = new ulong 3 0
+  ogps_parked ps
+  sp_chk eq get ps 0 5
+  ogps_close
+  sp_chk eq ogps_is_blocked 1
+  sp_chk eq get ogp_ht_nlive 0 7
+
+  caps = new ulong 10 0
+  fmask = new ulong 12 0
+  ogpl_caps caps
+  ogpl_fnmask fmask
+  sp_chk eq ogps_set_platform 1 caps fmask OGP_REFUSED_BUSY
+end
+
+fn c_timeout_recover to void
+  sp_reset
+  sp_chk eq ogps_recover OGPS_ERR
+  ogps_lock
+  sp_chk eq ogps_open 1
+  old_gen = get ogps_dev 1
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  sp_make_launch L 5
+  sp_chk eq ogps_launch L args el mk OGPS_OK
+  ogps_unlock
+  sp_chk eq ogps_recover OGPS_ERR
+
+  ogps_lock
+  user = new ulong 6 0
+  sp_chk eq ogps_alloc 4096 user OGPS_OK
+  put ogps_mock_fail_wait 0 2
+  sp_chk eq ogps_launch L args el mk OGPS_ERR
+  put ogps_mock_fail_wait 0 0
+  sp_chk eq ogps_is_blocked 1
+  ogps_free user
+  ogps_unlock
+
+  sp_chk eq ogps_recoveries 0
+  sp_chk eq ogps_recover OGPS_OK
+  sp_chk eq ogps_is_blocked 0
+  sp_chk eq ogps_recoveries 1
+  sp_chk eq get ogp_ht_nlive 0 0
+  ps = new ulong 3 0
+  ogps_parked ps
+  sp_chk eq get ps 0 0
+  sp_chk eq ogps_recover OGPS_ERR
+
+  ogps_lock
+  sp_chk eq ogps_open 1
+  sp_chk ne get ogps_dev 1 old_gen
+  sp_chk eq ogps_open_count 2
+  sp_chk eq ogps_launch L args el mk OGPS_OK
+  ogps_unlock
+  ogps_close
+  sp_chk eq get ogp_ht_nlive 0 0
+end
+
+fn c_recover_teardown_fault to void
+  sp_reset
+  ogps_lock
+  sp_chk eq ogps_open 1
+  put ogps_mock_fail_wait 0 2
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  sp_make_launch L 5
+  sp_chk eq ogps_launch L args el mk OGPS_ERR
+  put ogps_mock_fail_wait 0 0
+  ogps_unlock
+
+  put ogps_mock_fail_close 0 1
+  sp_chk eq ogps_recover OGPS_ERR
+  sp_chk eq ogps_is_blocked 1
+  sp_chk eq ogps_recoveries 0
+  put ogps_mock_fail_close 0 0
+end
+
+fn c_recover_module_latch to void
+  sp_reset
+  ogps_lock
+  sp_chk eq ogps_open 1
+  ogps_unlock
+  ogps_note_module_latch
+  sp_chk eq ogps_is_blocked 0
+  sp_chk eq ogps_recover OGPS_OK
+  sp_chk eq ogps_recoveries 1
+  sp_chk eq ogps_recover OGPS_ERR
+end
+
+fn c_stale_after_reopen to void
+  sp_reset
+  ogps_lock
+  sp_chk eq ogps_open 1
+  d1_gen = get ogps_dev 1
+  oldm = new ulong 6 0
+  sp_chk eq ogps_alloc 8192 oldm OGPS_OK
+  ogps_unlock
+  ogps_close
+
+  ogps_lock
+  sp_chk eq ogps_open 1
+  sp_chk eq ogps_open_count 2
+  sp_chk ne get ogps_dev 1 d1_gen
+
+  st0 = new ulong 5 0
+  st1 = new ulong 5 0
+  ogps_alloc_stats st0
+  ogps_free oldm
+  ogps_alloc_stats st1
+  sp_chk eq get st1 4 add get st0 4 1
+  sp_chk eq get st1 1 get st0 1
+
+  L = new ulong 12 0
+  args = new uint 4 0
+  el = new ulong 1 0
+  mk = new uint 1 0
+  sp_make_launch L 100
+  sp_chk eq ogps_launch L args el mk OGPS_OK
+  ogps_unlock
+  ogps_close
+  sp_chk eq get ogp_ht_nlive 0 0
+end
+
+fn c_reservation_refusal to void
+  sp_reset
+  ogps_lock
+  sp_chk eq ogps_open 1
+  sc = new ulong 9 0
+  sp_chk eq ogps_scratch_reserve sc 10000 OGPS_OK
+  sp_chk eq ogps_scratch sc 9000 OGPS_OK
+  sp_chk eq ogps_scratch sc add get sc 6 1 OGPS_SCRATCH_RESERVED
+  ogps_scratch_free sc
+  ogps_unlock
+  ogps_close
+  sp_chk eq get ogp_ht_nlive 0 0
+end
+
+fn c_fmt_matches_snprintf to void
+  dst = new uchar 128 0
+  meta = new ulong 32 0
+  sbuf = new uchar 256 0
+  for i ulong len sp_stage
+    put sbuf i get sp_stage i
+  end
+  put meta 0 128
+  put meta 1 0
+  put meta 16 len sp_stage
+  put meta 2 120
+  put meta 3 sub ulong 0 42
+  put meta 4 4000000000
+  put meta 5 0xbeef
+  put meta 6 sub ulong 0 7
+  put meta 7 9
+  put meta 8 ulong 0x8000000000000000
+  put meta 9 ulong 0xffffffffffffffff
+  put meta 10 12345
+  nw = omega_gpu_fmt dst sp_fmt_full meta sbuf
+  sp_chk eq nw long len sp_fmt_exp
+  for i ulong len sp_fmt_exp
+    sp_chk eq get dst i get sp_fmt_exp i
+  end
+  sp_chk eq get dst len sp_fmt_exp 0
+
+  note Truncation bounded: cap=6 writes "trunc\0", leaves sentinel 'Z' at [6..7]
+  small = new uchar 8 90
+  for i ulong len sp_trunc_in
+    put sbuf i get sp_trunc_in i
+  end
+  put meta 0 6
+  put meta 1 0
+  put meta 16 len sp_trunc_in
+  nw2 = omega_gpu_fmt small sp_fmt_s meta sbuf
+  sp_chk eq nw2 5
+  for i ulong len sp_trunc_exp
+    sp_chk eq get small i get sp_trunc_exp i
+  end
+  sp_chk eq get small 5 0
+  sp_chk eq get small 6 90
+  sp_chk eq get small 7 90
+
+  note cap=1 writes only NUL
+  put meta 0 1
+  put meta 1 123
+  nw3 = omega_gpu_fmt small sp_fmt_d meta sbuf
+  sp_chk eq nw3 0
+  sp_chk eq get small 0 0
+end
+
+fn main to int
+  c_install_refusals
+  c_open_launch_close
+  c_cancel_before_submit
+  c_timeout_parks_and_latch_rules
+  c_timeout_recover
+  c_recover_teardown_fault
+  c_recover_module_latch
+  c_stale_after_reopen
+  c_reservation_refusal
+  c_fmt_matches_snprintf
+  if eq get g_sp_fail 0 0
+    ign = write 1 sp_pass 0 len sp_pass
+    ret 0
+  end
+  ign = write 1 sp_fail 0 len sp_fail
+  ret 1
+end
