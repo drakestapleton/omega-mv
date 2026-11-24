@@ -138,11 +138,12 @@ plus the error-site fixtures and thirteen qualification files that pass on the c
 guard/language/sha256/transform, the sec s0s2/s3s4/s4fuel/s5s7 and leak candidate files, selftest pass,
 security673 relational consumer, l4-tripwire, qualification); the candidate files may skip only their declared
 `notrun` cases (54, mostly waiting on the omega-bridge ABI v2 generator and the OM-2 SHA unit), and an undeclared
-NOT_RUN is refused (third negative control); host run 2026-11-08 at omc `cfd96b48`: `OM2EVERY PASS files=30
-cases=1554 skipped_declared=54 mutants=75`. Found while adding them: security673 `bindings.cases` `derive-wrong-image` fails (stdout differs
-at byte 96): its stored `evidence/run3/embed.bin` is 2184 bytes from 2026-10-30, today's omc emits 2308 for
-`embed.om`, so that pin is stale and needs re-deriving by its owner; the file stays out of `every.sh` until then. The `OMEGA-SEED` manifest
-item below is still open.
+NOT_RUN is refused (third negative control); host run 2026-11-23 at omc `708fdc0f` (`38e613a9c`): `OM2EVERY PASS files=31
+cases=1637 skipped_declared=54 mutants=77`. Security673 `bindings.cases` `derive-wrong-image` was re-derived into
+`seed/qualification/security673/relational/evidence/run6/embed.bin` (2308 bytes, sha256 `6b48d0a7...`, preserving
+historical `evidence/run3/embed.bin` untouched), passing 16/16 in `tests/gates/run.sh security758` and enabled in
+`seed/qualification/om2/every.sh`. The `OMEGA-SEED` manifest wiring for `gate-irwasm.sh` and `ddc650` remains
+`BLOCKED_OPERATOR` (touches `tests/gates/`).
 
 Gap: a single gate run cannot currently show that every merged compiler path still works.
 
@@ -225,9 +226,11 @@ must preallocate global pools or use mapping copies.
 
 Decision (2026-11-11): run-time growth in its smallest form, recorded as decision 3 of
 `~/handoffs/yourtrained-cortex/briefs/decisions-20261111.md` (the lead, under Drake's delegation of that
-day; Drake can reverse it). This decision is the operator gate this milestone waited for. PROPOSED design,
-independently reviewed: `docs/RUNTIME-POOLS.md` (run-time pools: `global NAME T *`, `enlarge`, `len`; no
-`free`). Nothing built yet; the acceptance items below apply to its landings.
+day; Drake can reverse it). This decision is the operator gate this milestone waited for. Design and status:
+`docs/RUNTIME-POOLS.md` (run-time pools: `global NAME T *`, `enlarge`, `len`; no `free`). Landing 1
+(`seed/omc/omc.om`, `seed/omc/gate-pools.sh`, OMEGESE 9.15), Landing 2 (`seed/rung4/om4.s`, growing compiler
+arena `a_ar`, `OMC_MEMORY_MAX`), and NG runtime pools (`docs/RUNTIME-POOLS.md` §12) are IMPLEMENTED on `main`
+and host-EXERCISED on Spark (`POOLS_ONLY="1 2 4 5 8 9 10" sh seed/omc/gate-pools.sh` PASS, RC=0 at omc `708fdc0f`).
 
 Acceptance:
 - A decided model: the decision above. It settled as: decision 24 kept (no `free`), with run-time growth
@@ -306,10 +309,12 @@ namespace. gate15 refuses 33 minimal programs at their exact `omc: line L: error
 1..25 and 27..30, 24 with its accept side, 30 including IR-mode contract lines from #791) and runs
 `seed/omc/codereg.om`, which fails on a site without a row, a row without a site, an OMEGESE §9.14 /
 §11.1 row that differs from the registry, or a registry case that did not refuse. Machine records
-exist only in OM-2 `diag` mode (#655 owns incremental feedback). `seed/explain` (gate in `seed/host/check.sh`) prints the registry meaning and the refused source line for every code without changing omc's output. Site coverage (2026-11-08): `seed/omc/sitecov.sh`
-changes one `fail N` site at a time to code 97 and replays every refused tracked input; 480 of 584 sites are
-reached at omc `564c5835` (195 before the fixtures in `seed/omc/sites`, now 289), and `seed/host/check.sh` fails if
-that falls below `seed/omc/sitecov.floor`. The 104 unreached sites (list in its `sites.tsv`) are the fixture backlog.
+exist only in OM-2 `diag` mode (#655 owns incremental feedback). `seed/explain` (gate in `seed/host/check.sh`) prints the registry meaning and the refused source line for every code without changing omc's output. Site coverage: `seed/omc/sitecov.sh`
+changes one `fail N` site at a time to code 97 and replays every refused tracked input; 553 of 625 sites are
+reached at omc `708fdc0f` (2026-11-23, up from 480 of 584 at `564c5835` and 494 of 625 before adding 59 RM8
+fixtures in `seed/omc/sites/`), and `seed/host/check.sh` fails if that falls below `seed/omc/sitecov.floor` (553).
+The remaining 72 unreached sites include env/I/O/OOM guards (`OMC_MEMORY_MAX`, `a_rdin`/`mflush`/`writeout`/`obj_write`,
+`a_full`/`a_ogrow`) and internal invariants.
 Finding while writing them: error 4 ("the line ends where a word or value is needed") names the line AFTER
 the short line whenever a newline follows it (`fn main to int` + `x =` + newline reports line 3; without the
 final newline, line 2), in OM-1, OM-2 and IR mode alike; gate15 `e4_line_ends` pins the late number.
