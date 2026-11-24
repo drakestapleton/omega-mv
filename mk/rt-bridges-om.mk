@@ -24,8 +24,8 @@ $(RTBR_ARGUS_REPLAY_BIN): $(RTBR_ARGUS_REPLAY_SRCS) $(RTBR_OMC)
 	@mkdir -p $(OUT_DIR)
 	( echo om2; cat $(RTBR_ARGUS_REPLAY_SRCS) ) | $(RTBR_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-.PHONY: test-rxc-host-abi-om test-rx-resident-gpu-om test-argus-replay-om test-rt-bridges-om
-test-rxc-host-abi-om: $(RTBR_HOST_ABI_BIN)
+.PHONY: test-rxc-host-abi-unit-om test-rx-resident-gpu-om test-argus-replay-om test-rt-bridges-om
+test-rxc-host-abi-unit-om: $(RTBR_HOST_ABI_BIN)
 	./$(RTBR_HOST_ABI_BIN)
 
 test-rx-resident-gpu-om: $(RTBR_RESIDENT_BIN)
@@ -34,4 +34,4 @@ test-rx-resident-gpu-om: $(RTBR_RESIDENT_BIN)
 test-argus-replay-om: $(RTBR_ARGUS_REPLAY_BIN)
 	./$(RTBR_ARGUS_REPLAY_BIN) --self-test
 
-test-rt-bridges-om: test-rxc-host-abi-om test-rx-resident-gpu-om test-argus-replay-om
+test-rt-bridges-om: test-rxc-host-abi-unit-om test-rx-resident-gpu-om test-argus-replay-om
