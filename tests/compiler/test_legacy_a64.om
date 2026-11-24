@@ -1,0 +1,1014 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/compiler/test_legacy_a64.om -- pure seeded OM-2 port of
+note tests/compiler/test_legacy_a64.c (OSC-2 item 4: legacy AArch64 encoder/decoder
+note differential + out-of-range refusal verification).
+note Composes on om/aarch64/aarch64_om2.om, src/aarch64_encoder.om, src/aarch64_decoder.om.
+note Usage: test_legacy_a64_om [quick]
+
+text t_quick "quick"
+text t_full "full"
+text t_diff1 "legacy a64 differential: emitters=25 mode="
+text t_diff2 " words="
+text t_diff3 " decoded="
+text t_diff4 " mismatches="
+text t_ref1 "legacy a64 refusal: cases="
+text t_ref2 " refused_and_no_write="
+text t_chk1 "checks="
+text t_chk2 " failures="
+text t_pass "OSC2_LEGACY_A64_PASS\n"
+text t_fail "OSC2_LEGACY_A64_FAIL\n"
+text t_nl "\n"
+
+global g_checks ulong 1
+global g_fail ulong 1
+global g_words ulong 1
+global g_decoded ulong 1
+global g_ref_cases ulong 1
+global g_ref_ok ulong 1
+global g_ref_id ulong 1
+global g_quick ulong 1
+global g_rng ulong 1
+global g_want long 9
+global g_obuf uchar 1024
+global g_olen ulong 1
+
+fn la_oc c uchar to void
+  n = get g_olen 0
+  if lt n 1020
+    put g_obuf n c
+    put g_olen 0 add n 1
+  end
+end
+
+fn la_os s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n bound 256
+    la_oc get s i
+    i = add i 1
+  end
+end
+
+fn la_ou64 v ulong to void
+  tmp = new uchar 24 0
+  if eq v 0
+    la_oc 48
+    ret
+  end
+  k = ulong 0
+  while gt v 0 bound 24
+    put tmp k uchar add 48 rem v 10
+    v = div v 10
+    k = add k 1
+  end
+  while gt k 0 bound 24
+    k = sub k 1
+    la_oc get tmp k
+  end
+end
+
+fn la_flush to void
+  n = get g_olen 0
+  if gt n 0
+    ign = write 1 g_obuf ulong 0 n
+    put g_olen 0 0
+  end
+end
+
+fn la_chk cond bool to void
+  put g_checks 0 add get g_checks 0 1
+  if not cond
+    put g_fail 0 add get g_fail 0 1
+  end
+end
+
+fn la_rnd to ulong
+  z = add get g_rng 0 ulong 11400714819323198485
+  put g_rng 0 z
+  z = mul xor z shr z 30 ulong 13787848793156543929
+  z = mul xor z shr z 27 ulong 10723151780598845931
+  ret xor z shr z 31
+end
+
+fn la_pick lo long hi long to long
+  r = la_rnd
+  m = and r 15
+  if eq m 0
+    ret lo
+  end
+  if eq m 1
+    ret hi
+  end
+  span = add ulong sub hi lo 1
+  off = rem shr r 4 span
+  ret add lo long off
+end
+
+fn la_word eb view uchar * rc long to ulong
+  la_chk and eq rc 0 eq get g_a64_pos 0 4
+  put g_words 0 add get g_words 0 1
+  b0 = ulong get eb 0
+  b1 = shl ulong get eb 1 8
+  b2 = shl ulong get eb 2 16
+  b3 = shl ulong get eb 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn la_want_reset op long to void
+  put g_want 0 op
+  put g_want 1 -1
+  put g_want 2 -1
+  put g_want 3 -1
+  put g_want 4 -1
+  put g_want 5 -1
+  put g_want 6 -1
+  put g_want 7 -1
+  put g_want 8 -1
+end
+
+fn la_dcheck w ulong to void
+  dec = new ulong 9 0
+  rc = aarch64_decode_instruction w dec
+  put g_decoded 0 add get g_decoded 0 1
+  wop = get g_want 0
+  ok = and eq rc 0 eq long get dec 0 wop
+  la_chk ok
+  if not ok
+    ret
+  end
+  i = ulong 1
+  while lt i 9 bound 9
+    wv = get g_want i
+    if ge wv 0
+      la_chk eq long get dec i wv
+    end
+    i = add i 1
+  end
+end
+
+note ---- pre-OSC-2 oracle formulas ----
+
+fn old_rrr base ulong sf ulong rd ulong rn ulong rm ulong to ulong
+  w = or shl sf 31 base
+  w = or w shl and rm 31 16
+  w = or w shl and rn 31 5
+  ret or w and rd 31
+end
+
+fn old_movzk base ulong sf ulong rd ulong imm16 ulong sh ulong to ulong
+  hw = and div sh 16 3
+  w = or shl sf 31 base
+  w = or w shl hw 21
+  w = or w shl imm16 5
+  ret or w and rd 31
+end
+
+fn old_uoff bx ulong bw ulong sf ulong rt ulong rn ulong uoff ulong to ulong
+  sc = ulong 2
+  base = bw
+  if eq sf 1
+    sc = 3
+    base = bx
+  end
+  imm12 = and shr uoff sc 4095
+  w = or base shl imm12 10
+  w = or w shl and rn 31 5
+  ret or w and rt 31
+end
+
+note ---- differential checks for all 25 emitters ----
+
+fn emit_reg3 id ulong sf ulong rd ulong rn ulong rm ulong to ulong
+  eb = new uchar 8 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = long 0
+  if eq id 0
+    rc = aarch64_emit_add_reg eb sf rd rn rm
+  end
+  if eq id 1
+    rc = aarch64_emit_sub_reg eb sf rd rn rm
+  end
+  if eq id 2
+    rc = aarch64_emit_mul_reg eb sf rd rn rm
+  end
+  if eq id 3
+    rc = aarch64_emit_and_reg eb sf rd rn rm
+  end
+  if eq id 4
+    rc = aarch64_emit_orr_reg eb sf rd rn rm
+  end
+  if eq id 5
+    rc = aarch64_emit_eor_reg eb sf rd rn rm
+  end
+  if eq id 6
+    rc = aarch64_emit_subs_reg eb sf rd rn rm
+  end
+  ret la_word eb rc
+end
+
+fn old_reg3 id ulong sf ulong rd ulong rn ulong rm ulong to ulong
+  if eq id 0
+    ret old_rrr 184549376 sf rd rn rm
+  end
+  if eq id 1
+    ret old_rrr 1258291200 sf rd rn rm
+  end
+  if eq id 2
+    ret old_rrr 453016576 sf rd rn rm
+  end
+  if eq id 3
+    ret old_rrr 167772160 sf rd rn rm
+  end
+  if eq id 4
+    ret old_rrr 704643072 sf rd rn rm
+  end
+  if eq id 5
+    ret old_rrr 1241513984 sf rd rn rm
+  end
+  ret old_rrr 1795162112 sf rd rn rm
+end
+
+fn diff_reg3 id ulong op long to void
+  sf = ulong 0
+  while lt sf 2 bound 2
+    rd = ulong 0
+    while lt rd 32 bound 32
+      rn = ulong 0
+      while lt rn 32 bound 32
+        rm = ulong 0
+        while lt rm 32 bound 32
+          w = emit_reg3 id sf rd rn rm
+          la_chk eq w old_reg3 id sf rd rn rm
+          la_want_reset op
+          put g_want 1 long sf
+          put g_want 2 long rd
+          put g_want 3 long rn
+          put g_want 4 long rm
+          la_dcheck w
+          rm = add rm 1
+        end
+        rn = add rn 1
+      end
+      rd = add rd 1
+    end
+    sf = add sf 1
+  end
+end
+
+fn diff_mov_reg to void
+  eb = new uchar 8 0
+  sf = ulong 0
+  while lt sf 2 bound 2
+    rd = ulong 0
+    while lt rd 32 bound 32
+      rm = ulong 0
+      while lt rm 32 bound 32
+        put g_a64_pos 0 0
+        put g_a64_max 0 4
+        rc = aarch64_emit_mov_reg eb sf rd rm
+        w = la_word eb rc
+        la_chk eq w old_rrr 704643072 sf rd 31 rm
+        la_want_reset 5
+        put g_want 1 long sf
+        put g_want 2 long rd
+        put g_want 3 31
+        put g_want 4 long rm
+        la_dcheck w
+        rm = add rm 1
+      end
+      rd = add rd 1
+    end
+    sf = add sf 1
+  end
+end
+
+fn diff_movzk_one k ulong sf ulong hw ulong rd ulong imm ulong to void
+  eb = new uchar 8 0
+  sh = mul 16 hw
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = long 0
+  ow = ulong 0
+  op = long 7
+  if eq k 1
+    rc = aarch64_emit_movk eb sf rd imm sh
+    ow = old_movzk 1920991232 sf rd imm sh
+    op = 13
+  else
+    rc = aarch64_emit_movz eb sf rd imm sh
+    ow = old_movzk 1384120320 sf rd imm sh
+  end
+  w = la_word eb rc
+  la_chk eq w ow
+  la_want_reset op
+  put g_want 1 long sf
+  put g_want 2 long rd
+  put g_want 5 long imm
+  put g_want 6 long hw
+  la_dcheck w
+end
+
+fn diff_movzk k ulong to void
+  step = ulong 1
+  if eq get g_quick 0 1
+    step = 4093
+  end
+  sf = ulong 0
+  while lt sf 2 bound 2
+    hwlim = ulong 2
+    if eq sf 1
+      hwlim = 4
+    end
+    hw = ulong 0
+    while lt hw hwlim bound 4
+      rd = ulong 0
+      while lt rd 32 bound 32
+        imm = ulong 0
+        while le imm 65535 bound 65536
+          diff_movzk_one k sf hw rd imm
+          imm = add imm step
+        end
+        if eq get g_quick 0 1
+          diff_movzk_one k sf hw rd 65535
+        end
+        rd = add rd 1
+      end
+      hw = add hw 1
+    end
+    sf = add sf 1
+  end
+end
+
+fn diff_ret to void
+  eb = new uchar 8 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = aarch64_emit_ret eb
+  w = la_word eb rc
+  la_chk eq w 3596551104
+  la_want_reset 8
+  put g_want 3 30
+  la_dcheck w
+end
+
+fn diff_b to void
+  eb = new uchar 8 0
+  n = ulong 400000
+  if eq get g_quick 0 1
+    n = 20000
+  end
+  i = ulong 0
+  while lt i n bound 400000
+    imm = la_pick -33554432 33554431
+    put g_a64_pos 0 0
+    put g_a64_max 0 4
+    rc = aarch64_emit_b eb imm
+    w = la_word eb rc
+    u26 = and bitcast ulong imm 67108863
+    la_chk eq w or 335544320 u26
+    la_want_reset 9
+    put g_want 7 long u26
+    la_dcheck w
+    i = add i 1
+  end
+end
+
+fn diff_b_cond_one eb edit uchar * c long imm long to void
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = aarch64_emit_b_cond eb c imm
+  w = la_word eb rc
+  u19 = and bitcast ulong imm 524287
+  ow = or or 1409286144 shl u19 5 and ulong c 15
+  la_chk eq w ow
+  la_want_reset 10
+  put g_want 7 long u19
+  put g_want 8 c
+  la_dcheck w
+end
+
+fn diff_b_cond to void
+  eb = new uchar 8 0
+  step = long 1
+  if eq get g_quick 0 1
+    step = 997
+  end
+  c = long 0
+  while lt c 16 bound 16
+    imm = long -262144
+    while le imm 262143 bound 524288
+      diff_b_cond_one eb c imm
+      imm = add imm step
+    end
+    diff_b_cond_one eb c 262143
+    c = add c 1
+  end
+end
+
+fn old_cbz nz ulong sf ulong rt ulong imm long to ulong
+  base = ulong 872415232
+  if eq nz 1
+    base = 889192448
+  end
+  u19 = and bitcast ulong imm 524287
+  t1 = or shl sf 31 base
+  t2 = or shl u19 5 and rt 31
+  ret or t1 t2
+end
+
+fn diff_cbz_one nz ulong sf ulong rt ulong imm long to void
+  eb = new uchar 8 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = long 0
+  if eq nz 1
+    rc = aarch64_emit_cbnz eb sf rt imm
+  else
+    rc = aarch64_emit_cbz eb sf rt imm
+  end
+  w = la_word eb rc
+  la_chk eq w old_cbz nz sf rt imm
+  if eq nz 1
+    la_want_reset 12
+  else
+    la_want_reset 11
+  end
+  put g_want 1 long sf
+  put g_want 2 long rt
+  put g_want 7 long and bitcast ulong imm 524287
+  la_dcheck w
+end
+
+fn diff_cbz nz ulong to void
+  n = ulong 400000
+  if eq get g_quick 0 1
+    n = 20000
+  end
+  i = ulong 0
+  while lt i n bound 400000
+    sf = and la_rnd 1
+    rt = ulong la_pick 0 31
+    imm = la_pick -262144 262143
+    diff_cbz_one nz sf rt imm
+    i = add i 1
+  end
+end
+
+fn old_adr rd ulong imm long to ulong
+  u21 = bitcast ulong imm
+  ilo = shl and u21 3 29
+  ihi = shl and shr u21 2 524287 5
+  t1 = or 268435456 ilo
+  t2 = or ihi and rd 31
+  ret or t1 t2
+end
+
+fn adr_back w ulong to long
+  lo = and shr w 29 3
+  hi = shl and shr w 5 524287 2
+  b21 = or lo hi
+  ret sub long xor b21 1048576 1048576
+end
+
+fn diff_adr_one rd ulong imm long to void
+  eb = new uchar 8 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = aarch64_emit_adr eb rd imm
+  w = la_word eb rc
+  la_chk eq w old_adr rd imm
+  la_chk eq adr_back w imm
+  la_want_reset 14
+  put g_want 2 long rd
+  la_dcheck w
+end
+
+fn diff_adr to void
+  n = ulong 400000
+  if eq get g_quick 0 1
+    n = 20000
+  end
+  i = ulong 0
+  while lt i n bound 400000
+    rd = ulong la_pick 0 31
+    imm = la_pick -1048576 1048575
+    diff_adr_one rd imm
+    i = add i 1
+  end
+end
+
+fn diff_uoff_one st ulong sf ulong rt ulong rn ulong k ulong to void
+  eb = new uchar 8 0
+  sz = ulong 4
+  if eq sf 1
+    sz = 8
+  end
+  uoff = mul k sz
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = long 0
+  ow = ulong 0
+  op = long 15
+  if eq st 1
+    rc = aarch64_emit_str_uoff eb sf rt rn uoff
+    ow = old_uoff 4177526784 3103784960 sf rt rn uoff
+    op = 16
+  else
+    rc = aarch64_emit_ldr_uoff eb sf rt rn uoff
+    ow = old_uoff 4181721088 3107979264 sf rt rn uoff
+  end
+  w = la_word eb rc
+  la_chk eq w ow
+  la_chk eq and shr w 10 4095 k
+  la_want_reset op
+  put g_want 1 long sf
+  put g_want 2 long rt
+  put g_want 3 long rn
+  la_dcheck w
+end
+
+fn diff_uoff st ulong to void
+  step = ulong 1
+  if eq get g_quick 0 1
+    step = 409
+  end
+  sf = ulong 0
+  while lt sf 2 bound 2
+    rt = ulong 0
+    while lt rt 32 bound 32
+      rn = ulong 0
+      while lt rn 32 bound 32
+        k = ulong 0
+        while le k 4095 bound 4096
+          diff_uoff_one st sf rt rn k
+          k = add k step
+        end
+        rn = add rn 1
+      end
+      rt = add rt 1
+    end
+    sf = add sf 1
+  end
+end
+
+fn diff_byte_one st ulong rt ulong rn ulong uo ulong to void
+  eb = new uchar 8 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = long 0
+  ow = ulong 0
+  op = long 17
+  if eq st 1
+    rc = aarch64_emit_strb_uoff eb rt rn uo
+    ow = or or 956301312 shl uo 10 or shl rn 5 rt
+    op = 18
+  else
+    rc = aarch64_emit_ldrb_uoff eb rt rn uo
+    ow = or or 960495616 shl uo 10 or shl rn 5 rt
+  end
+  w = la_word eb rc
+  la_chk eq w ow
+  la_want_reset op
+  put g_want 2 long rt
+  put g_want 3 long rn
+  la_dcheck w
+end
+
+fn diff_byte st ulong to void
+  step = ulong 1
+  if eq get g_quick 0 1
+    step = 409
+  end
+  rt = ulong 0
+  while lt rt 32 bound 32
+    rn = ulong 0
+    while lt rn 32 bound 32
+      uo = ulong 0
+      while le uo 4095 bound 4096
+        diff_byte_one st rt rn uo
+        uo = add uo step
+      end
+      rn = add rn 1
+    end
+    rt = add rt 1
+  end
+end
+
+fn old_post id ulong rt ulong rn ulong s long to ulong
+  base = ulong 3091203072
+  if eq id 1
+    base = 3087008768
+  end
+  if eq id 2
+    base = 4164944896
+  end
+  if eq id 3
+    base = 4160750592
+  end
+  t1 = or base shl and bitcast ulong s 511 12
+  t2 = or shl rn 5 rt
+  ret or t1 t2
+end
+
+fn diff_post_one id ulong rt ulong rn ulong s long to void
+  eb = new uchar 8 0
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = long 0
+  if eq id 0
+    rc = aarch64_emit_ldr_post eb rt rn s
+  end
+  if eq id 1
+    rc = aarch64_emit_str_post eb rt rn s
+  end
+  if eq id 2
+    rc = aarch64_emit_ldr_x_post eb rt rn s
+  end
+  if eq id 3
+    rc = aarch64_emit_str_x_post eb rt rn s
+  end
+  w = la_word eb rc
+  la_chk eq w old_post id rt rn s
+  if or eq id 1 eq id 3
+    la_want_reset 16
+  else
+    la_want_reset 15
+  end
+  if ge id 2
+    put g_want 1 1
+  else
+    put g_want 1 0
+  end
+  put g_want 2 long rt
+  put g_want 3 long rn
+  la_dcheck w
+end
+
+fn diff_post id ulong to void
+  step = long 1
+  if eq get g_quick 0 1
+    step = 37
+  end
+  rt = ulong 0
+  while lt rt 32 bound 32
+    rn = ulong 0
+    while lt rn 32 bound 32
+      s = long -256
+      while le s 255 bound 512
+        diff_post_one id rt rn s
+        s = add s step
+      end
+      rn = add rn 1
+    end
+    rt = add rt 1
+  end
+end
+
+fn diff_subs_imm_one sf ulong rd ulong rn ulong imm ulong to void
+  eb = new uchar 8 0
+  base = ulong 1895825408
+  if eq sf 1
+    base = 4043309056
+  end
+  put g_a64_pos 0 0
+  put g_a64_max 0 4
+  rc = aarch64_emit_subs_imm eb sf rd rn imm
+  w = la_word eb rc
+  ow = or or base shl imm 10 or shl rn 5 rd
+  la_chk eq w ow
+  la_want_reset 19
+  put g_want 1 long sf
+  put g_want 2 long rd
+  put g_want 3 long rn
+  la_dcheck w
+end
+
+fn diff_subs_imm to void
+  step = ulong 1
+  if eq get g_quick 0 1
+    step = 409
+  end
+  sf = ulong 0
+  while lt sf 2 bound 2
+    rd = ulong 0
+    while lt rd 32 bound 32
+      rn = ulong 0
+      while lt rn 32 bound 32
+        imm = ulong 0
+        while le imm 4095 bound 4096
+          diff_subs_imm_one sf rd rn imm
+          imm = add imm step
+        end
+        rn = add rn 1
+      end
+      rd = add rd 1
+    end
+    sf = add sf 1
+  end
+end
+
+note ---- refusal cases (all 69 from tests/compiler/test_legacy_a64.c) ----
+
+fn ref_call eb edit uchar * a long b long c long d long to long
+  id = get g_ref_id 0
+  if eq id 0
+    ret aarch64_emit_add_reg eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 1
+    ret aarch64_emit_sub_reg eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 2
+    ret aarch64_emit_mul_reg eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 3
+    ret aarch64_emit_and_reg eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 4
+    ret aarch64_emit_orr_reg eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 5
+    ret aarch64_emit_eor_reg eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 6
+    ret aarch64_emit_subs_reg eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 7
+    ret aarch64_emit_mov_reg eb ulong a ulong b ulong c
+  end
+  if eq id 8
+    ret aarch64_emit_movz eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 9
+    ret aarch64_emit_movk eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 10
+    ret aarch64_emit_b eb a
+  end
+  if eq id 11
+    ret aarch64_emit_b_cond eb a b
+  end
+  if eq id 12
+    ret aarch64_emit_cbz eb ulong a ulong b c
+  end
+  if eq id 13
+    ret aarch64_emit_cbnz eb ulong a ulong b c
+  end
+  if eq id 14
+    ret aarch64_emit_adr eb ulong a b
+  end
+  if eq id 15
+    ret aarch64_emit_ldr_uoff eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 16
+    ret aarch64_emit_str_uoff eb ulong a ulong b ulong c ulong d
+  end
+  if eq id 17
+    ret aarch64_emit_ldrb_uoff eb ulong a ulong b ulong c
+  end
+  if eq id 18
+    ret aarch64_emit_strb_uoff eb ulong a ulong b ulong c
+  end
+  if eq id 19
+    ret aarch64_emit_ldr_post eb ulong a ulong b c
+  end
+  if eq id 20
+    ret aarch64_emit_str_post eb ulong a ulong b c
+  end
+  if eq id 21
+    ret aarch64_emit_ldr_x_post eb ulong a ulong b c
+  end
+  if eq id 22
+    ret aarch64_emit_str_x_post eb ulong a ulong b c
+  end
+  ret aarch64_emit_subs_imm eb ulong a ulong b ulong c ulong d
+end
+
+fn ref_case id ulong a long b long c long d long to void
+  eb = new uchar 8 165
+  put g_a64_pos 0 0
+  put g_a64_max 0 8
+  put g_ref_id 0 id
+  rc = ref_call eb a b c d
+  put g_ref_cases 0 add get g_ref_cases 0 1
+  bad_rc = lt rc 0
+  la_chk bad_rc
+  untouched = eq get g_a64_pos 0 0
+  i = ulong 0
+  while lt i 8 bound 8
+    if ne get eb i 165
+      untouched = false
+    end
+    i = add i 1
+  end
+  la_chk untouched
+  if and bad_rc untouched
+    put g_ref_ok 0 add get g_ref_ok 0 1
+  end
+end
+
+fn run_refusals_1 to void
+  ref_case 0 1 32 0 0
+  ref_case 0 1 0 255 0
+  ref_case 0 0 0 0 33
+  ref_case 1 1 40 0 0
+  ref_case 1 1 0 32 0
+  ref_case 1 1 0 0 32
+  ref_case 2 1 32 0 0
+  ref_case 2 1 0 32 0
+  ref_case 2 1 0 0 128
+  ref_case 3 1 32 0 0
+  ref_case 3 1 0 32 0
+  ref_case 3 1 0 0 32
+  ref_case 4 1 32 0 0
+  ref_case 4 1 0 32 0
+  ref_case 4 1 0 0 32
+  ref_case 5 1 32 0 0
+  ref_case 5 1 0 32 0
+  ref_case 5 1 0 0 32
+  ref_case 6 1 32 0 0
+  ref_case 6 1 0 32 0
+  ref_case 6 1 0 0 32
+  ref_case 7 1 32 0 0
+  ref_case 7 1 0 32 0
+  ref_case 8 1 32 0 0
+  ref_case 8 1 0 0 8
+  ref_case 8 1 0 0 17
+  ref_case 8 1 0 0 64
+  ref_case 8 0 0 0 32
+  ref_case 8 0 0 0 48
+  ref_case 9 1 32 0 16
+  ref_case 9 1 0 0 1
+  ref_case 9 1 0 0 80
+  ref_case 9 0 0 0 32
+end
+
+fn run_refusals_2 to void
+  ref_case 10 33554432 0 0 0
+  ref_case 10 -33554433 0 0 0
+  ref_case 10 2147483647 0 0 0
+  ref_case 10 -2147483648 0 0 0
+  ref_case 11 16 0 0 0
+  ref_case 11 -1 0 0 0
+  ref_case 11 0 262144 0 0
+  ref_case 11 1 -262145 0 0
+  ref_case 12 1 32 0 0
+  ref_case 12 1 0 262144 0
+  ref_case 12 0 0 -262145 0
+  ref_case 13 1 32 0 0
+  ref_case 13 1 0 262144 0
+  ref_case 13 0 0 -262145 0
+  ref_case 14 32 0 0 0
+  ref_case 14 0 1048576 0 0
+  ref_case 14 0 -1048577 0 0
+  ref_case 15 1 32 0 0
+  ref_case 15 1 0 32 0
+  ref_case 15 1 0 0 4
+  ref_case 15 1 0 0 32768
+  ref_case 15 0 0 0 2
+  ref_case 15 0 0 0 16384
+  ref_case 15 1 0 0 65535
+  ref_case 16 1 32 0 0
+  ref_case 16 1 0 32 0
+  ref_case 16 1 0 0 12
+  ref_case 16 1 0 0 32768
+  ref_case 16 0 0 0 6
+  ref_case 16 0 0 0 16384
+end
+
+fn run_refusals_3 to void
+  ref_case 17 32 0 0 0
+  ref_case 17 0 32 0 0
+  ref_case 17 0 0 4096 0
+  ref_case 17 0 0 65535 0
+  ref_case 18 32 0 0 0
+  ref_case 18 0 32 0 0
+  ref_case 18 0 0 4096 0
+  ref_case 19 32 0 0 0
+  ref_case 19 0 32 0 0
+  ref_case 19 0 0 256 0
+  ref_case 19 0 0 -257 0
+  ref_case 20 32 0 0 0
+  ref_case 20 0 32 0 0
+  ref_case 20 0 0 256 0
+  ref_case 20 0 0 -32768 0
+  ref_case 21 32 0 0 0
+  ref_case 21 0 32 0 0
+  ref_case 21 0 0 512 0
+  ref_case 21 0 0 -257 0
+  ref_case 22 32 0 0 0
+  ref_case 22 0 32 0 0
+  ref_case 22 0 0 32767 0
+  ref_case 22 0 0 -257 0
+  ref_case 23 1 32 0 0
+  ref_case 23 1 0 32 0
+  ref_case 23 1 0 0 4096
+  ref_case 23 0 0 0 65535
+end
+
+fn check_quick_arg to void
+  if lt argcnt long 2
+    ret
+  end
+  ab = new uchar 16 0
+  n = argread ulong 1 ab ulong 0 ulong 16
+  if ne n long 5
+    ret
+  end
+  ok = true
+  i = ulong 0
+  while lt i 5 bound 5
+    if ne get ab i get t_quick i
+      ok = false
+    end
+    i = add i 1
+  end
+  if ok
+    put g_quick 0 1
+  end
+end
+
+fn check_buf_full to void
+  b = new uchar 4 0
+  put b 0 1
+  put b 1 2
+  put b 2 3
+  put b 3 4
+  put g_a64_pos 0 1
+  put g_a64_max 0 4
+  rc = aarch64_emit_ret b
+  la_chk and eq rc -1 and eq get g_a64_pos 0 1 eq get b 1 2
+end
+
+fn run_all_diffs to void
+  diff_reg3 0 1
+  diff_reg3 1 2
+  diff_reg3 2 3
+  diff_reg3 3 4
+  diff_reg3 4 5
+  diff_reg3 5 6
+  diff_reg3 6 19
+  diff_mov_reg
+  diff_movzk 0
+  diff_movzk 1
+  diff_ret
+  diff_b
+  diff_b_cond
+  diff_cbz 0
+  diff_cbz 1
+  diff_adr
+  diff_uoff 0
+  diff_uoff 1
+  diff_byte 0
+  diff_byte 1
+  diff_post 0
+  diff_post 1
+  diff_post 2
+  diff_post 3
+  diff_subs_imm
+end
+
+fn main to int
+  put g_rng 0 ulong 748935568657743876
+  check_quick_arg
+  run_all_diffs
+  diff_fail = get g_fail 0
+  check_buf_full
+  run_refusals_1
+  run_refusals_2
+  run_refusals_3
+  la_os t_diff1
+  if eq get g_quick 0 1
+    la_os t_quick
+  else
+    la_os t_full
+  end
+  la_os t_diff2
+  la_ou64 get g_words 0
+  la_os t_diff3
+  la_ou64 get g_decoded 0
+  la_os t_diff4
+  la_ou64 diff_fail
+  la_os t_nl
+  la_os t_ref1
+  la_ou64 get g_ref_cases 0
+  la_os t_ref2
+  la_ou64 get g_ref_ok 0
+  la_os t_nl
+  la_os t_chk1
+  la_ou64 get g_checks 0
+  la_os t_chk2
+  la_ou64 get g_fail 0
+  la_os t_nl
+  if eq get g_fail 0 0
+    la_os t_pass
+    la_flush
+    ret 0
+  end
+  la_os t_fail
+  la_flush
+  ret 1
+end
