@@ -1,0 +1,1210 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_semcomm.om -- Pure seeded OM-2 port of src/runtime/rx_semcomm.c.
+note Semantic communication pruning (OMEGA_SEMANTIC_COMMUNICATION):
+note InformationNeed projection, authority/private/uncertainty/time filtering,
+note SUM/MAX derivation, canonical 'SCM1' wire codec, delta cursor & invalidations,
+note and receiver view apply + SHA-256 view digest.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const SC_MAX_OBJECTS ulong 64
+const SC_MAX_FIELDS ulong 8
+const SC_MAX_TYPES ulong 8
+const SC_MAX_RELEVANT ulong 64
+const SC_MAX_CAPS ulong 32
+const SC_MAX_SCHEMA ulong 16
+const SC_MAX_DERIVED ulong 4
+const SC_MAX_PFIELDS ulong 512
+
+const SC_PRIVATE_BIT ulong 4611686018427387904
+const SC_MAGIC ulong 827147091
+const SC_HDR_LEN ulong 21
+
+const SC_OP_INSPECT ulong 1
+const SC_OP_SUM ulong 2
+const SC_OP_MAX ulong 3
+
+const SC_EV_NONE ulong 0
+const SC_EV_WRITER ulong 1
+const SC_EV_DIGEST ulong 2
+
+const SC_INV_RETIRED ulong 1
+const SC_INV_AUTHORITY ulong 2
+const SC_INV_UNCERTAIN ulong 3
+const SC_INV_SCOPE ulong 4
+
+const SC_MSG_FULL_STATE ulong 1
+const SC_MSG_PROJECTION ulong 2
+const SC_MSG_DELTA ulong 3
+
+const SC_REC_OBJ ulong 79
+const SC_REC_FLD ulong 70
+const SC_REC_EV ulong 69
+const SC_REC_EVDIG ulong 68
+const SC_REC_DER ulong 86
+const SC_REC_DROPO ulong 88
+const SC_REC_DROPF ulong 89
+
+const SC_OK long 0
+const SC_E_ARG long -1
+const SC_E_FULL long -2
+const SC_E_DECODE long -3
+const SC_ALL_FIELDS ulong 255
+const SC_U64_MAX ulong 18446744073709551615
+
+text sc_view_domain "AIEN_SEM_VIEW_V1"
+
+note World snapshot (64 objects):
+note sc_w_meta[64*4]: 0:live, 1:gen, 2:type, 3:resource
+global sc_w_meta ulong 256
+note sc_w_val[64*8], sc_w_ver[64*8], sc_w_wrt[64*8]
+global sc_w_val ulong 512
+global sc_w_ver ulong 512
+global sc_w_wrt ulong 512
+
+note Schema: sc_sch_n[1], sc_sch[16*4]: 0:type, 1:priv_mask, 2:has_unc (0=none,1=has), 3:unc_field | (conclusion<<8)
+global sc_sch_n ulong 1
+global sc_sch ulong 64
+
+note Receiver caps: sc_cap_hdr[2]: 0:subject, 1:n; sc_caps[32*3]: 0:resource, 1:rights, 2:valid
+global sc_cap_hdr ulong 2
+global sc_caps ulong 96
+
+note InformationNeed:
+note sc_need[12]: 0:receiver, 1:op_kind, 2:op_fields, 3:op_field, 4:n_types, 5:n_objs,
+note   6:from_crumb, 7:to_crumb, 8:ev_req, 9:max_ppm, 10:deliver_unc
+global sc_need ulong 12
+global sc_need_types ulong 8
+global sc_need_objs ulong 128
+
+note Projection output:
+note sc_p_meta[10]: 0:n_obj, 1:n_fld, 2:n_der, 3:n_ev, 4:ev_mode,
+note   5:withheld_auth, 6:withheld_priv, 7:excl_unc, 8:validations
+global sc_p_meta ulong 10
+note sc_p_obj[64*6]: 0:id, 1:gen, 2:type, 3:resource, 4:mask, 5:conclusion
+global sc_p_obj ulong 384
+note sc_p_fld[512*4]: 0:obj_k, 1:field, 2:value, 3:version
+global sc_p_fld ulong 2048
+note sc_p_ev[512*3]: 0:obj_k, 1:field, 2:crumb
+global sc_p_ev ulong 1536
+note sc_p_der[4*6]: 0:op, 1:field, 2:value, 3:arg_id, 4:arg_gen, 5:n_inputs
+global sc_p_der ulong 24
+
+note Wire buffer: sc_wire[16384], sc_wlen[3]: 0:len, 1:records, 2:err
+global sc_wire uchar 16384
+global sc_wlen ulong 3
+
+note Sender cursor:
+global sc_cur_have ulong 1
+global sc_cur_pres ulong 64
+global sc_cur_gen ulong 64
+global sc_cur_mask ulong 64
+global sc_cur_ver ulong 512
+global sc_cur_crumb ulong 512
+global sc_cur_nder ulong 1
+global sc_cur_der ulong 24
+
+note Receiver view:
+global sc_v_pres ulong 64
+global sc_v_gen ulong 64
+global sc_v_type ulong 64
+global sc_v_res ulong 64
+global sc_v_conc ulong 64
+global sc_v_mask ulong 64
+global sc_v_evmask ulong 64
+global sc_v_val ulong 512
+global sc_v_ver ulong 512
+global sc_v_crumb ulong 512
+global sc_v_nder ulong 1
+global sc_v_der ulong 24
+note sc_v_meta[4]: 0:last_seq, 1:invalidations_seen, 2:conclusions_seen
+global sc_v_meta ulong 4
+
+fn rx_sem_private_resource rsrc ulong to ulong
+  ret or rsrc SC_PRIVATE_BIT
+end
+
+fn sc_schema_find tp ulong to long
+  n = get sc_sch_n 0
+  for i ulong n bound 16
+    if eq get sc_sch mul i 4 tp
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn sc_may_read rsrc ulong to ulong
+  n = get sc_cap_hdr 1
+  for i ulong n bound 32
+    cb = mul i 3
+    if ne get sc_caps cb rsrc
+      continue
+    end
+    if eq and get sc_caps add cb 1 1 0
+      continue
+    end
+    put sc_p_meta 8 add get sc_p_meta 8 1
+    if ne get sc_caps add cb 2 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn sc_in_time crumb ulong to ulong
+  if lt crumb get sc_need 6
+    ret 0
+  end
+  tc = get sc_need 7
+  if ne tc 0
+    if gt crumb tc
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn sc_type_wanted tp ulong to ulong
+  nt = get sc_need 4
+  if eq nt 0
+    ret 1
+  end
+  for i ulong nt bound 8
+    if eq get sc_need_types i tp
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn sc_obj_wanted oid ulong gen ulong to ulong
+  no = get sc_need 5
+  if eq no 0
+    ret 1
+  end
+  for i ulong no bound 64
+    if eq get sc_need_objs mul i 2 oid
+      if eq get sc_need_objs add mul i 2 1 gen
+        ret 1
+      end
+    end
+  end
+  ret 0
+end
+
+fn sc_select_fields oid ulong want ulong to ulong
+  sel = ulong 0
+  wb = mul oid 8
+  for f ulong 8
+    bit = shl ulong 1 f
+    if ne and want bit 0
+      if ne sc_in_time get sc_w_wrt add wb f 0
+        sel = or sel bit
+      end
+    end
+  end
+  ret sel
+end
+
+fn sc_project_emit_obj oid ulong omask ulong used ulong conc ulong to void
+  mb = mul oid 4
+  wb = mul oid 8
+  k = get sc_p_meta 0
+  put sc_p_meta 0 add k 1
+  pob = mul k 6
+  put sc_p_obj pob oid
+  put sc_p_obj add pob 1 get sc_w_meta add mb 1
+  put sc_p_obj add pob 2 get sc_w_meta add mb 2
+  put sc_p_obj add pob 3 get sc_w_meta add mb 3
+  put sc_p_obj add pob 4 omask
+  put sc_p_obj add pob 5 conc
+  for f ulong 8
+    if ne and omask shl ulong 1 f 0
+      fi = get sc_p_meta 1
+      put sc_p_meta 1 add fi 1
+      pfb = mul fi 4
+      put sc_p_fld pfb k
+      put sc_p_fld add pfb 1 f
+      put sc_p_fld add pfb 2 get sc_w_val add wb f
+      put sc_p_fld add pfb 3 get sc_w_ver add wb f
+    end
+  end
+  if ne get sc_need 8 SC_EV_NONE
+    for f ulong 8
+      if ne and used shl ulong 1 f 0
+        ei = get sc_p_meta 3
+        put sc_p_meta 3 add ei 1
+        peb = mul ei 3
+        put sc_p_ev peb k
+        put sc_p_ev add peb 1 f
+        put sc_p_ev add peb 2 get sc_w_wrt add wb f
+      end
+    end
+  end
+end
+
+fn sc_project_schema oid ulong tp ulong dst edit ulong 4 to ulong
+  note dst: 0=priv, 1=unc, 2=conc. Returns 0 if excluded by uncertainty, 1 if ok.
+  put dst 0 0
+  put dst 1 0
+  put dst 2 0
+  si = sc_schema_find tp
+  if lt si 0
+    ret 1
+  end
+  sb = mul ulong si 4
+  put dst 0 get sc_sch add sb 1
+  put dst 2 shr get sc_sch add sb 3 8
+  if ne get sc_sch add sb 2 0
+    uf = and get sc_sch add sb 3 255
+    mppm = get sc_need 9
+    if ne mppm 0
+      if gt get sc_w_val add mul oid 8 uf mppm
+        put sc_p_meta 7 add get sc_p_meta 7 1
+        ret 0
+      end
+    end
+    if ne get sc_need 10 0
+      put dst 1 shl ulong 1 uf
+    end
+  end
+  ret 1
+end
+
+fn sc_project_fold oid ulong gen ulong opk ulong opf ulong to void
+  v = get sc_w_val add mul oid 8 opf
+  nin = get sc_p_der 5
+  if eq opk SC_OP_SUM
+    put sc_p_der 2 add get sc_p_der 2 v
+  else
+    if or eq nin 0 gt v get sc_p_der 2
+      put sc_p_der 2 v
+      put sc_p_der 3 oid
+      put sc_p_der 4 gen
+    end
+  end
+  put sc_p_der 5 add nin 1
+end
+
+fn sc_project_one oid ulong to void
+  mb = mul oid 4
+  if eq get sc_w_meta mb 0
+    ret
+  end
+  tp = get sc_w_meta add mb 2
+  if eq sc_type_wanted tp 0
+    ret
+  end
+  if eq sc_obj_wanted oid get sc_w_meta add mb 1 0
+    ret
+  end
+  opk = get sc_need 1
+  want = and get sc_need 2 SC_ALL_FIELDS
+  if ne opk SC_OP_INSPECT
+    want = shl ulong 1 get sc_need 3
+  end
+  sel = sc_select_fields oid want
+  if eq sel 0
+    ret
+  end
+  rsrc = get sc_w_meta add mb 3
+  if eq sc_may_read rsrc 0
+    put sc_p_meta 5 add get sc_p_meta 5 1
+    ret
+  end
+  sinfo = new ulong 4 0
+  if eq sc_project_schema oid tp sinfo 0
+    ret
+  end
+  priv = get sinfo 0
+  unc = get sinfo 1
+  if ne and or sel unc priv 0
+    if eq sc_may_read rx_sem_private_resource rsrc 0
+      pb = and or sel unc priv
+      for f ulong 8
+        if ne and pb shl ulong 1 f 0
+          put sc_p_meta 6 add get sc_p_meta 6 1
+        end
+      end
+      npriv = xor priv SC_U64_MAX
+      sel = and sel npriv
+      unc = and unc npriv
+      if eq sel 0
+        ret
+      end
+    end
+  end
+  omask = unc
+  if eq opk SC_OP_INSPECT
+    omask = or sel unc
+  end
+  sc_project_emit_obj oid omask or sel unc get sinfo 2
+  if ne opk SC_OP_INSPECT
+    sc_project_fold oid get sc_w_meta add mb 1 opk get sc_need 3
+  end
+end
+
+fn rx_sem_project to long
+  if ne get sc_need 0 get sc_cap_hdr 0
+    ret SC_E_ARG
+  end
+  opk = get sc_need 1
+  if lt opk SC_OP_INSPECT
+    ret SC_E_ARG
+  end
+  if gt opk SC_OP_MAX
+    ret SC_E_ARG
+  end
+  opf = get sc_need 3
+  if ne opk SC_OP_INSPECT
+    if ge opf SC_MAX_FIELDS
+      ret SC_E_ARG
+    end
+  end
+  for i ulong 10
+    put sc_p_meta i 0
+  end
+  put sc_p_meta 4 get sc_need 8
+  for i ulong 6
+    put sc_p_der i 0
+  end
+  put sc_p_der 0 opk
+  put sc_p_der 1 opf
+  for oid ulong SC_MAX_OBJECTS
+    sc_project_one oid
+  end
+  if ne opk SC_OP_INSPECT
+    put sc_p_meta 2 1
+  end
+  ret SC_OK
+end
+
+note ---- Wire Encoder ----
+
+fn sc_put8 v ulong to void
+  p = get sc_wlen 0
+  if ge p 16384
+    put sc_wlen 2 1
+    ret
+  end
+  put sc_wire p uchar and v 255
+  put sc_wlen 0 add p 1
+end
+
+fn sc_put16 v ulong to void
+  sc_put8 v
+  sc_put8 shr v 8
+end
+
+fn sc_put32 v ulong to void
+  sc_put16 v
+  sc_put16 shr v 16
+end
+
+fn sc_put64 v ulong to void
+  sc_put32 v
+  sc_put32 shr v 32
+end
+
+fn sc_enc_begin kind ulong rcv ulong seq ulong to void
+  put sc_wlen 0 0
+  put sc_wlen 1 0
+  put sc_wlen 2 0
+  sc_put32 SC_MAGIC
+  sc_put8 kind
+  sc_put32 rcv
+  sc_put64 seq
+  sc_put32 0
+end
+
+fn sc_enc_end to void
+  if ne get sc_wlen 2 0
+    ret
+  end
+  recs = get sc_wlen 1
+  for i ulong 4
+    put sc_wire add 17 i uchar and shr recs mul i 8 255
+  end
+end
+
+fn sc_rec_obj oid ulong gen ulong tp ulong rsrc ulong conc ulong to void
+  put sc_wlen 1 add get sc_wlen 1 1
+  sc_put8 SC_REC_OBJ
+  sc_put16 oid
+  sc_put32 gen
+  sc_put32 tp
+  sc_put64 rsrc
+  sc_put8 conc
+end
+
+fn sc_rec_fld oid ulong f ulong ver ulong val ulong to void
+  put sc_wlen 1 add get sc_wlen 1 1
+  sc_put8 SC_REC_FLD
+  sc_put16 oid
+  sc_put8 f
+  sc_put64 ver
+  sc_put64 val
+end
+
+fn sc_rec_ev oid ulong f ulong crumb ulong to void
+  put sc_wlen 1 add get sc_wlen 1 1
+  sc_put8 SC_REC_EV
+  sc_put16 oid
+  sc_put8 f
+  sc_put64 crumb
+end
+
+fn sc_rec_der slot ulong to void
+  db = mul slot 6
+  put sc_wlen 1 add get sc_wlen 1 1
+  sc_put8 SC_REC_DER
+  sc_put8 slot
+  sc_put8 get sc_p_der db
+  sc_put8 get sc_p_der add db 1
+  sc_put64 get sc_p_der add db 2
+  sc_put16 get sc_p_der add db 3
+  sc_put32 get sc_p_der add db 4
+  sc_put32 get sc_p_der add db 5
+end
+
+fn sc_rec_drop_obj oid ulong gen ulong reason ulong to void
+  put sc_wlen 1 add get sc_wlen 1 1
+  sc_put8 SC_REC_DROPO
+  sc_put16 oid
+  sc_put32 gen
+  sc_put8 reason
+end
+
+fn sc_rec_drop_fld oid ulong f ulong reason ulong to void
+  put sc_wlen 1 add get sc_wlen 1 1
+  sc_put8 SC_REC_DROPF
+  sc_put16 oid
+  sc_put8 f
+  sc_put8 reason
+end
+
+fn sc_rec_pobj k ulong to void
+  pob = mul k 6
+  sc_rec_obj get sc_p_obj pob get sc_p_obj add pob 1 get sc_p_obj add pob 2 get sc_p_obj add pob 3 get sc_p_obj add pob 5
+end
+
+fn sc_rec_pfld oid ulong fi ulong to void
+  pfb = mul fi 4
+  sc_rec_fld oid get sc_p_fld add pfb 1 get sc_p_fld add pfb 3 get sc_p_fld add pfb 2
+end
+
+fn sc_rec_pev oid ulong ei ulong to void
+  peb = mul ei 3
+  sc_rec_ev oid get sc_p_ev add peb 1 get sc_p_ev add peb 2
+end
+
+fn sc_emit_all to void
+  no = get sc_p_meta 0
+  nf = get sc_p_meta 1
+  ne_c = get sc_p_meta 3
+  fi = ulong 0
+  ei = ulong 0
+  for k ulong no bound 64
+    oid = get sc_p_obj mul k 6
+    sc_rec_pobj k
+    while lt fi nf bound 512
+      if ne get sc_p_fld mul fi 4 k
+        break
+      end
+      sc_rec_pfld oid fi
+      fi = add fi 1
+    end
+    while lt ei ne_c bound 512
+      if ne get sc_p_ev mul ei 3 k
+        break
+      end
+      sc_rec_pev oid ei
+      ei = add ei 1
+    end
+  end
+  nd = get sc_p_meta 2
+  for i ulong nd bound 4
+    sc_rec_der i
+  end
+end
+
+fn rx_sem_encode_projection rcv ulong seq ulong to long
+  sc_enc_begin SC_MSG_PROJECTION rcv seq
+  sc_emit_all
+  sc_enc_end
+  if ne get sc_wlen 2 0
+    ret SC_E_FULL
+  end
+  ret SC_OK
+end
+
+fn rx_sem_encode_full_state rcv ulong seq ulong to long
+  sc_enc_begin SC_MSG_FULL_STATE rcv seq
+  for oid ulong SC_MAX_OBJECTS
+    mb = mul oid 4
+    if eq get sc_w_meta mb 0
+      continue
+    end
+    sc_rec_obj oid get sc_w_meta add mb 1 get sc_w_meta add mb 2 get sc_w_meta add mb 3 0
+    wb = mul oid 8
+    for f ulong 8
+      sc_rec_fld oid f get sc_w_ver add wb f get sc_w_val add wb f
+    end
+    for f ulong 8
+      sc_rec_ev oid f get sc_w_wrt add wb f
+    end
+  end
+  sc_enc_end
+  if ne get sc_wlen 2 0
+    ret SC_E_FULL
+  end
+  ret SC_OK
+end
+
+note ---- Delta Cursor ----
+
+fn sc_cursor_init to void
+  put sc_cur_have 0 0
+  put sc_cur_nder 0 0
+  for i ulong 64
+    put sc_cur_pres i 0
+    put sc_cur_mask i 0
+  end
+  for i ulong 512
+    put sc_cur_crumb i 0
+  end
+end
+
+fn sc_cur_take_fld oid ulong fi ulong to void
+  pfb = mul fi 4
+  f = get sc_p_fld add pfb 1
+  put sc_cur_ver add mul oid 8 f get sc_p_fld add pfb 3
+end
+
+fn sc_cur_take_ev oid ulong ei ulong to void
+  peb = mul ei 3
+  f = get sc_p_ev add peb 1
+  put sc_cur_crumb add mul oid 8 f get sc_p_ev add peb 2
+end
+
+fn sc_cursor_take to void
+  for i ulong 64
+    put sc_cur_pres i 0
+    put sc_cur_mask i 0
+  end
+  for i ulong 512
+    put sc_cur_crumb i 0
+  end
+  no = get sc_p_meta 0
+  fi = ulong 0
+  ei = ulong 0
+  for k ulong no bound 64
+    pob = mul k 6
+    oid = get sc_p_obj pob
+    put sc_cur_pres oid 1
+    put sc_cur_gen oid get sc_p_obj add pob 1
+    put sc_cur_mask oid get sc_p_obj add pob 4
+    while lt fi get sc_p_meta 1 bound 512
+      if ne get sc_p_fld mul fi 4 k
+        break
+      end
+      sc_cur_take_fld oid fi
+      fi = add fi 1
+    end
+    while lt ei get sc_p_meta 3 bound 512
+      if ne get sc_p_ev mul ei 3 k
+        break
+      end
+      sc_cur_take_ev oid ei
+      ei = add ei 1
+    end
+  end
+  nd = get sc_p_meta 2
+  put sc_cur_nder 0 nd
+  for i ulong mul nd 6 bound 24
+    put sc_cur_der i get sc_p_der i
+  end
+  put sc_cur_have 0 1
+end
+
+fn sc_der_eq idx ulong to ulong
+  b = mul idx 6
+  for k ulong 6
+    if ne get sc_cur_der add b k get sc_p_der add b k
+      ret 0
+    end
+  end
+  ret 1
+end
+
+global sc_dstats ulong 7
+
+fn sc_delta_drop_gone to void
+  idx_of = new ulong 64 999
+  no = get sc_p_meta 0
+  for k ulong no bound 64
+    put idx_of get sc_p_obj mul k 6 k
+  end
+  for oid ulong 64
+    if eq get sc_cur_pres oid 0
+      continue
+    end
+    k = get idx_of oid
+    keep = ulong 0
+    if lt k 64
+      if eq get sc_p_obj add mul k 6 1 get sc_cur_gen oid
+        keep = ulong 1
+      end
+    end
+    if eq keep 0
+      sc_rec_drop_obj oid get sc_cur_gen oid SC_INV_SCOPE
+      put sc_dstats 2 add get sc_dstats 2 1
+      put sc_cur_pres oid 0
+    end
+  end
+end
+
+fn sc_delta_new_obj k ulong f0 ulong fi ulong e0 ulong ei ulong to void
+  oid = get sc_p_obj mul k 6
+  sc_rec_pobj k
+  put sc_dstats 4 add get sc_dstats 4 1
+  if ne get sc_p_obj add mul k 6 5 0
+    put sc_dstats 5 add get sc_dstats 5 1
+  end
+  j = f0
+  while lt j fi bound 512
+    sc_rec_pfld oid j
+    put sc_dstats 0 add get sc_dstats 0 1
+    j = add j 1
+  end
+  j = e0
+  while lt j ei bound 512
+    sc_rec_pev oid j
+    put sc_dstats 1 add get sc_dstats 1 1
+    j = add j 1
+  end
+end
+
+fn sc_fld_unchanged oid ulong left ulong j ulong to ulong
+  pfb = mul j 4
+  f = get sc_p_fld add pfb 1
+  bit = shl ulong 1 f
+  if eq and get sc_cur_mask oid bit 0
+    ret 0
+  end
+  if ne and left bit 0
+    ret 0
+  end
+  cv = get sc_cur_ver add mul oid 8 f
+  nv = get sc_p_fld add pfb 3
+  if eq cv nv
+    ret 1
+  end
+  ret 0
+end
+
+fn sc_delta_upd_flds oid ulong left ulong f0 ulong fi ulong to void
+  j = f0
+  while lt j fi bound 512
+    if eq sc_fld_unchanged oid left j 0
+      sc_rec_pfld oid j
+      put sc_dstats 0 add get sc_dstats 0 1
+    end
+    j = add j 1
+  end
+end
+
+fn sc_ev_unchanged oid ulong ev_old ulong left ulong j ulong to ulong
+  peb = mul j 3
+  f = get sc_p_ev add peb 1
+  bit = shl ulong 1 f
+  if eq and ev_old bit 0
+    ret 0
+  end
+  if ne and left bit 0
+    ret 0
+  end
+  cc = get sc_cur_crumb add mul oid 8 f
+  nc = get sc_p_ev add peb 2
+  if eq cc nc
+    ret 1
+  end
+  ret 0
+end
+
+fn sc_delta_upd_evs oid ulong ev_old ulong left ulong e0 ulong ei ulong to void
+  j = e0
+  while lt j ei bound 512
+    if eq sc_ev_unchanged oid ev_old left j 0
+      sc_rec_pev oid j
+      put sc_dstats 1 add get sc_dstats 1 1
+    end
+    j = add j 1
+  end
+end
+
+fn sc_ev_mask_new e0 ulong ei ulong to ulong
+  m = ulong 0
+  j = e0
+  while lt j ei bound 512
+    f = get sc_p_ev add mul j 3 1
+    m = or m shl ulong 1 f
+    j = add j 1
+  end
+  ret m
+end
+
+fn sc_ev_mask_old oid ulong to ulong
+  m = ulong 0
+  wb = mul oid 8
+  for f ulong 8
+    if ne get sc_cur_crumb add wb f 0
+      m = or m shl ulong 1 f
+    end
+  end
+  ret m
+end
+
+fn sc_calc_left oid ulong k ulong ev_old ulong ev_new ulong to ulong
+  cm = get sc_cur_mask oid
+  nm = get sc_p_obj add mul k 6 4
+  m1 = and cm xor nm SC_U64_MAX
+  m2 = and ev_old xor ev_new SC_U64_MAX
+  ret or m1 m2
+end
+
+fn sc_delta_drop_flds oid ulong left ulong to void
+  for f ulong 8
+    if ne and left shl ulong 1 f 0
+      sc_rec_drop_fld oid f SC_INV_SCOPE
+      put sc_dstats 3 add get sc_dstats 3 1
+    end
+  end
+end
+
+fn sc_delta_upd_obj k ulong f0 ulong fi ulong e0 ulong ei ulong to void
+  oid = get sc_p_obj mul k 6
+  ev_new = sc_ev_mask_new e0 ei
+  ev_old = sc_ev_mask_old oid
+  left = sc_calc_left oid k ev_old ev_new
+  sc_delta_drop_flds oid left
+  sc_delta_upd_flds oid left f0 fi
+  sc_delta_upd_evs oid ev_old left e0 ei
+end
+
+note Compute delta into sc_wire and fill stats[7]:
+note 0:changed_fields, 1:new_ev, 2:inv_obj, 3:inv_fld, 4:new_obj, 5:new_conc, 6:der_changed
+fn rx_sem_delta rcv ulong seq ulong stats edit ulong 7 to long
+  for i ulong 7
+    put sc_dstats i 0
+  end
+  if eq get sc_cur_have 0 0
+    sc_enc_begin SC_MSG_PROJECTION rcv seq
+    sc_emit_all
+    sc_enc_end
+    no = get sc_p_meta 0
+    for k ulong no bound 64
+      put sc_dstats 4 add get sc_dstats 4 1
+      if ne get sc_p_obj add mul k 6 5 0
+        put sc_dstats 5 add get sc_dstats 5 1
+      end
+    end
+    put sc_dstats 0 get sc_p_meta 1
+    put sc_dstats 1 get sc_p_meta 3
+    put sc_dstats 6 get sc_p_meta 2
+    sc_cursor_take
+    for i ulong 7
+      put stats i get sc_dstats i
+    end
+    if ne get sc_wlen 2 0
+      ret SC_E_FULL
+    end
+    ret SC_OK
+  end
+  sc_enc_begin SC_MSG_DELTA rcv seq
+  sc_delta_drop_gone
+  no = get sc_p_meta 0
+  fi = ulong 0
+  ei = ulong 0
+  for k ulong no bound 64
+    f0 = fi
+    e0 = ei
+    while lt fi get sc_p_meta 1 bound 512
+      if ne get sc_p_fld mul fi 4 k
+        break
+      end
+      fi = add fi 1
+    end
+    while lt ei get sc_p_meta 3 bound 512
+      if ne get sc_p_ev mul ei 3 k
+        break
+      end
+      ei = add ei 1
+    end
+    if eq get sc_cur_pres get sc_p_obj mul k 6 0
+      sc_delta_new_obj k f0 fi e0 ei
+    else
+      sc_delta_upd_obj k f0 fi e0 ei
+    end
+  end
+  nd = get sc_p_meta 2
+  for i ulong nd bound 4
+    if lt i get sc_cur_nder 0
+      if ne sc_der_eq i 0
+        continue
+      end
+    end
+    sc_rec_der i
+    put sc_dstats 6 add get sc_dstats 6 1
+  end
+  sc_enc_end
+  sc_cursor_take
+  for i ulong 7
+    put stats i get sc_dstats i
+  end
+  if ne get sc_wlen 2 0
+    ret SC_E_FULL
+  end
+  ret SC_OK
+end
+
+fn rx_sem_cursor_bytes to ulong
+  n = ulong 0
+  for oid ulong 64
+    if eq get sc_cur_pres oid 0
+      continue
+    end
+    n = add n 12
+    wb = mul oid 8
+    for f ulong 8
+      if ne and get sc_cur_mask oid shl ulong 1 f 0
+        n = add n 8
+      end
+      if ne get sc_cur_crumb add wb f 0
+        n = add n 8
+      end
+    end
+  end
+  ret add n mul get sc_cur_nder 0 32
+end
+
+note ---- Receiver View ----
+
+fn rx_sem_view_init to void
+  for i ulong 64
+    put sc_v_pres i 0
+    put sc_v_mask i 0
+    put sc_v_evmask i 0
+    put sc_v_conc i 0
+  end
+  for i ulong 512
+    put sc_v_val i 0
+    put sc_v_ver i 0
+    put sc_v_crumb i 0
+  end
+  put sc_v_nder 0 0
+  for i ulong 4
+    put sc_v_meta i 0
+  end
+end
+
+fn sc_v_clear to void
+  inv = get sc_v_meta 1
+  conc = get sc_v_meta 2
+  rx_sem_view_init
+  put sc_v_meta 1 inv
+  put sc_v_meta 2 conc
+end
+
+fn sc_v_drop oid ulong to void
+  put sc_v_pres oid 0
+  put sc_v_mask oid 0
+  put sc_v_evmask oid 0
+  wb = mul oid 8
+  for f ulong 8
+    put sc_v_val add wb f 0
+    put sc_v_ver add wb f 0
+    put sc_v_crumb add wb f 0
+  end
+end
+
+global sc_dec_p ulong 2
+
+fn sc_g8 to ulong
+  p = get sc_dec_p 0
+  put sc_dec_p 0 add p 1
+  ret ulong get sc_wire p
+end
+
+fn sc_g16 to ulong
+  lo = sc_g8
+  hi = sc_g8
+  ret or lo shl hi 8
+end
+
+fn sc_g32 to ulong
+  lo = sc_g16
+  hi = sc_g16
+  ret or lo shl hi 16
+end
+
+fn sc_g64 to ulong
+  lo = sc_g32
+  hi = sc_g32
+  ret or lo shl hi 32
+end
+
+fn sc_left to ulong
+  ret sub get sc_dec_p 1 get sc_dec_p 0
+end
+
+fn sc_apply_obj kind ulong to long
+  if lt sc_left 19
+    ret SC_E_DECODE
+  end
+  oid = sc_g16
+  if ge oid SC_MAX_OBJECTS
+    ret SC_E_DECODE
+  end
+  sc_v_drop oid
+  put sc_v_pres oid 1
+  put sc_v_gen oid sc_g32
+  put sc_v_type oid sc_g32
+  put sc_v_res oid sc_g64
+  cflag = sc_g8
+  if ne cflag 0
+    put sc_v_conc oid 1
+    if eq kind SC_MSG_DELTA
+      put sc_v_meta 2 add get sc_v_meta 2 1
+    end
+  else
+    put sc_v_conc oid 0
+  end
+  ret SC_OK
+end
+
+fn sc_apply_fld to long
+  if lt sc_left 19
+    ret SC_E_DECODE
+  end
+  oid = sc_g16
+  f = sc_g8
+  if or ge oid SC_MAX_OBJECTS ge f SC_MAX_FIELDS
+    ret SC_E_DECODE
+  end
+  if eq get sc_v_pres oid 0
+    ret SC_E_DECODE
+  end
+  wb = mul oid 8
+  put sc_v_ver add wb f sc_g64
+  put sc_v_val add wb f sc_g64
+  put sc_v_mask oid or get sc_v_mask oid shl ulong 1 f
+  ret SC_OK
+end
+
+fn sc_apply_ev to long
+  if lt sc_left 11
+    ret SC_E_DECODE
+  end
+  oid = sc_g16
+  f = sc_g8
+  if or ge oid SC_MAX_OBJECTS ge f SC_MAX_FIELDS
+    ret SC_E_DECODE
+  end
+  if eq get sc_v_pres oid 0
+    ret SC_E_DECODE
+  end
+  put sc_v_crumb add mul oid 8 f sc_g64
+  put sc_v_evmask oid or get sc_v_evmask oid shl ulong 1 f
+  ret SC_OK
+end
+
+fn sc_apply_der to long
+  if lt sc_left 21
+    ret SC_E_DECODE
+  end
+  slot = sc_g8
+  if ge slot SC_MAX_DERIVED
+    ret SC_E_DECODE
+  end
+  db = mul slot 6
+  put sc_v_der db sc_g8
+  put sc_v_der add db 1 sc_g8
+  put sc_v_der add db 2 sc_g64
+  put sc_v_der add db 3 sc_g16
+  put sc_v_der add db 4 sc_g32
+  put sc_v_der add db 5 sc_g32
+  if gt add slot 1 get sc_v_nder 0
+    put sc_v_nder 0 add slot 1
+  end
+  ret SC_OK
+end
+
+fn sc_apply_dropo to long
+  if lt sc_left 7
+    ret SC_E_DECODE
+  end
+  oid = sc_g16
+  gen = sc_g32
+  ign_rs = sc_g8
+  if ge oid SC_MAX_OBJECTS
+    ret SC_E_DECODE
+  end
+  if ne get sc_v_pres oid 0
+    if eq get sc_v_gen oid gen
+      sc_v_drop oid
+    end
+  end
+  put sc_v_meta 1 add get sc_v_meta 1 1
+  ret SC_OK
+end
+
+fn sc_apply_dropf to long
+  if lt sc_left 4
+    ret SC_E_DECODE
+  end
+  oid = sc_g16
+  f = sc_g8
+  ign_rs2 = sc_g8
+  if or ge oid SC_MAX_OBJECTS ge f SC_MAX_FIELDS
+    ret SC_E_DECODE
+  end
+  nbit = xor shl ulong 1 f SC_U64_MAX
+  put sc_v_mask oid and get sc_v_mask oid nbit
+  put sc_v_evmask oid and get sc_v_evmask oid nbit
+  wb = mul oid 8
+  put sc_v_val add wb f 0
+  put sc_v_ver add wb f 0
+  put sc_v_crumb add wb f 0
+  put sc_v_meta 1 add get sc_v_meta 1 1
+  ret SC_OK
+end
+
+fn sc_apply_rec kind ulong tag ulong to long
+  if eq tag SC_REC_OBJ
+    ret sc_apply_obj kind
+  end
+  if eq tag SC_REC_FLD
+    ret sc_apply_fld
+  end
+  if eq tag SC_REC_EV
+    ret sc_apply_ev
+  end
+  if eq tag SC_REC_DER
+    ret sc_apply_der
+  end
+  if eq tag SC_REC_DROPO
+    ret sc_apply_dropo
+  end
+  if eq tag SC_REC_DROPF
+    ret sc_apply_dropf
+  end
+  ret SC_E_DECODE
+end
+
+fn rx_sem_view_apply nlen ulong to long
+  put sc_dec_p 0 0
+  put sc_dec_p 1 nlen
+  if lt sc_left SC_HDR_LEN
+    ret SC_E_DECODE
+  end
+  if ne sc_g32 SC_MAGIC
+    ret SC_E_DECODE
+  end
+  kind = sc_g8
+  ign_r = sc_g32
+  seq = sc_g64
+  nrec = sc_g32
+  if lt kind SC_MSG_FULL_STATE
+    ret SC_E_DECODE
+  end
+  if gt kind SC_MSG_DELTA
+    ret SC_E_DECODE
+  end
+  if ne kind SC_MSG_DELTA
+    sc_v_clear
+  end
+  for r ulong nrec bound 4096
+    if lt sc_left 1
+      ret SC_E_DECODE
+    end
+    tag = sc_g8
+    if ne sc_apply_rec kind tag SC_OK
+      ret SC_E_DECODE
+    end
+  end
+  if ne sc_left 0
+    ret SC_E_DECODE
+  end
+  put sc_v_meta 0 seq
+  ret SC_OK
+end
+
+fn rx_sem_view_bytes to ulong
+  n = ulong 0
+  for oid ulong 64
+    if eq get sc_v_pres oid 0
+      continue
+    end
+    n = add n 17
+    for f ulong 8
+      bit = shl ulong 1 f
+      if ne and get sc_v_mask oid bit 0
+        n = add n 16
+      end
+      if ne and get sc_v_evmask oid bit 0
+        n = add n 8
+      end
+    end
+  end
+  ret add n mul get sc_v_nder 0 32
+end
+
+fn sc_sh_u64 pos ulong v ulong to ulong
+  for i ulong 8
+    put sh_dat add pos i uchar and shr v mul i 8 255
+  end
+  ret add pos 8
+end
+
+fn rx_sem_view_digest dst edit uchar 32 to void
+  p = ulong 0
+  dlen = len sc_view_domain
+  for i ulong dlen bound 32
+    put sh_dat p get sc_view_domain i
+    p = add p 1
+  end
+  for oid ulong 64
+    if eq get sc_v_pres oid 0
+      continue
+    end
+    p = sc_sh_u64 p oid
+    p = sc_sh_u64 p get sc_v_gen oid
+    p = sc_sh_u64 p get sc_v_type oid
+    p = sc_sh_u64 p get sc_v_res oid
+    p = sc_sh_u64 p get sc_v_conc oid
+    p = sc_sh_u64 p or get sc_v_mask oid shl get sc_v_evmask oid 32
+    wb = mul oid 8
+    for f ulong 8
+      bit = shl ulong 1 f
+      if ne and get sc_v_mask oid bit 0
+        p = sc_sh_u64 p get sc_v_val add wb f
+        p = sc_sh_u64 p get sc_v_ver add wb f
+      end
+      if ne and get sc_v_evmask oid bit 0
+        p = sc_sh_u64 p get sc_v_crumb add wb f
+      end
+    end
+  end
+  nd = get sc_v_nder 0
+  for i ulong nd bound 4
+    db = mul i 6
+    for k ulong 6
+      p = sc_sh_u64 p get sc_v_der add db k
+    end
+  end
+  sh_all p
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end

@@ -1,0 +1,361 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_aegis.om -- Pure seeded OM-2 port of src/runtime/rx_aegis.c.
+note AEGIS resident authority (ADR 0016 s.41, R8): policy evaluation,
+note aegis.decide reaction step, root.install origin/domain/echo verification,
+note and per-slot mint/revoke idempotency state machine.
+
+const RX_AEGIS_CLIENTS ulong 4
+const RX_AEGIS_SLOTS ulong 4
+const RX_AEGIS_RULES ulong 16
+
+const RX_AEGIS_RES_BASE ulong 92340224
+const RX_AEGIS_RES_STRIDE ulong 256
+const RX_AEGIS_SUBJ ulong 41
+const RX_AEGIS_ROOT_SUBJ ulong 42
+const RX_FACULTY_AEGIS ulong 4
+
+const RX_AEGIS_RIGHT_PRIVILEGED ulong 1008
+const RX_AEGIS_RIGHT_KNOWN ulong 1023
+const RX_AEGIS_U32_MAX ulong 4294967295
+const RX_AEGIS_U64_MAX ulong 18446744073709551615
+
+const RX_AEGIS_OP_ACQUIRE ulong 1
+const RX_AEGIS_OP_RELEASE ulong 2
+const RX_AEGIS_APPROVE ulong 1
+const RX_AEGIS_REJECT ulong 2
+
+const RX_AEGIS_GRANT ulong 1
+const RX_AEGIS_DENY ulong 2
+const RX_AEGIS_ESCALATE ulong 3
+const RX_AEGIS_REVOKE ulong 4
+
+const RX_AEGIS_SLOT_EMPTY ulong 0
+const RX_AEGIS_SLOT_LIVE ulong 1
+const RX_AEGIS_SLOT_REVOKED ulong 2
+
+const RX_AEGIS_WHY_NO_RULE ulong 1000
+const RX_AEGIS_WHY_PRIVILEGED ulong 1001
+const RX_AEGIS_WHY_HUMAN ulong 1002
+const RX_AEGIS_WHY_BAD_REQUEST ulong 1003
+const RX_AEGIS_WHY_DECISION_ORIGIN ulong 1004
+const RX_AEGIS_WHY_REQUEST_ORIGIN ulong 1005
+const RX_AEGIS_WHY_MISMATCH ulong 1006
+const RX_AEGIS_WHY_DOMAIN ulong 1007
+const RX_AEGIS_WHY_MINT ulong 1008
+
+fn rx_aegis_res client ulong idx ulong to ulong
+  ret add RX_AEGIS_RES_BASE add mul client RX_AEGIS_RES_STRIDE idx
+end
+
+fn rx_aegis_rule_match rules view ulong 112 base ulong req view ulong 4 res edit ulong 3 to ulong
+  if ne get rules add base 1 get req 0
+    ret 0
+  end
+  rsrc = get req 1
+  if lt rsrc get rules add base 2
+    ret 0
+  end
+  if gt rsrc get rules add base 3
+    ret 0
+  end
+  mask = xor get rules add base 4 RX_AEGIS_U64_MAX
+  if ne and get req 2 mask 0
+    ret 0
+  end
+  ml = get rules add base 5
+  gl = get req 3
+  if ne ml 0
+    if or eq gl 0 gt gl ml
+      gl = ml
+    end
+  end
+  put res 0 gl
+  put res 1 get rules base
+  put res 2 get rules add base 6
+  ret 1
+end
+
+note Pure policy evaluation.
+note rules[112]: up to 16 rules x 7 ulongs (id, subject, res_lo, res_hi, rights, max_lease, needs_approval)
+note req[4]: (subject, resource, rights, lease)
+note res[3]: (out_lease, rule_or_why, needs_approval)
+fn rx_aegis_evaluate rules view ulong 112 n_rules ulong req view ulong 4 res edit ulong 3 to ulong
+  put res 0 0
+  put res 2 0
+  rights = get req 2
+  if eq rights 0
+    put res 1 RX_AEGIS_WHY_BAD_REQUEST
+    ret RX_AEGIS_DENY
+  end
+  bad_bits = and rights xor RX_AEGIS_RIGHT_KNOWN RX_AEGIS_U64_MAX
+  if ne bad_bits 0
+    put res 1 RX_AEGIS_WHY_BAD_REQUEST
+    ret RX_AEGIS_DENY
+  end
+  if ne and rights RX_AEGIS_RIGHT_PRIVILEGED 0
+    put res 1 RX_AEGIS_WHY_PRIVILEGED
+    ret RX_AEGIS_DENY
+  end
+  n = n_rules
+  if gt n RX_AEGIS_RULES
+    n = RX_AEGIS_RULES
+  end
+  for i ulong n bound 16
+    if ne rx_aegis_rule_match rules mul i 7 req res 0
+      ret RX_AEGIS_GRANT
+    end
+  end
+  put res 1 RX_AEGIS_WHY_NO_RULE
+  ret RX_AEGIS_DENY
+end
+
+note Pure aegis.decide.k reaction step.
+note in_f[10]: 0..5=req[0..5], 6..7=ap[0..1], 8..9=dec[0..1]
+note dst_dec[8]: decision fields to publish. Returns 1 if publish, 0 if no-op.
+fn rx_aegis_decide rules view ulong 112 n_rules ulong subject ulong in_f view ulong 10 dst_dec edit ulong 8 to ulong
+  ev_req = new ulong 4 0
+  ev_res = new ulong 3 0
+  seq = get in_f 0
+  if eq seq 0
+    ret 0
+  end
+  if eq get in_f 8 seq
+    if ne get in_f 9 RX_AEGIS_ESCALATE
+      ret 0
+    end
+    if ne get in_f 6 seq
+      ret 0
+    end
+  end
+  put dst_dec 0 seq
+  put dst_dec 1 RX_AEGIS_DENY
+  put dst_dec 2 get in_f 1
+  put dst_dec 3 get in_f 2
+  put dst_dec 4 0
+  put dst_dec 5 get in_f 4
+  put dst_dec 6 0
+  put dst_dec 7 get in_f 5
+  op = get in_f 5
+  bad = ulong 0
+  if ge get in_f 4 RX_AEGIS_SLOTS
+    bad = ulong 1
+  end
+  if gt get in_f 2 RX_AEGIS_U32_MAX
+    bad = ulong 1
+  end
+  if ne op RX_AEGIS_OP_ACQUIRE
+    if ne op RX_AEGIS_OP_RELEASE
+      bad = ulong 1
+    end
+  end
+  if ne bad 0
+    put dst_dec 1 RX_AEGIS_DENY
+    put dst_dec 3 0
+    put dst_dec 6 RX_AEGIS_WHY_BAD_REQUEST
+    ret 1
+  end
+  if eq op RX_AEGIS_OP_RELEASE
+    put dst_dec 1 RX_AEGIS_REVOKE
+    put dst_dec 3 0
+    ret 1
+  end
+  put ev_req 0 subject
+  put ev_req 1 get in_f 1
+  put ev_req 2 get in_f 2
+  put ev_req 3 get in_f 3
+  v = rx_aegis_evaluate rules n_rules ev_req ev_res
+  put dst_dec 4 get ev_res 0
+  put dst_dec 6 get ev_res 1
+  if eq v RX_AEGIS_GRANT
+    if ne get ev_res 2 0
+      if ne get in_f 6 seq
+        v = RX_AEGIS_ESCALATE
+      else
+        if ne get in_f 7 RX_AEGIS_APPROVE
+          v = RX_AEGIS_DENY
+          put dst_dec 6 RX_AEGIS_WHY_HUMAN
+        end
+      end
+    end
+  end
+  if ne v RX_AEGIS_GRANT
+    if ne v RX_AEGIS_ESCALATE
+      put dst_dec 3 0
+      put dst_dec 4 0
+    end
+  end
+  put dst_dec 1 v
+  ret 1
+end
+
+note Verify root.install.k decision/request echo and client domain bounds.
+note dec[8], req[6], client[3] = [domain_lo, domain_hi, max_rights].
+note Returns 0 if ok, else RX_AEGIS_WHY_MISMATCH or RX_AEGIS_WHY_DOMAIN.
+fn rx_aegis_install_check dec view ulong 8 req view ulong 6 client view ulong 3 to ulong
+  if ne get dec 0 get req 0
+    ret RX_AEGIS_WHY_MISMATCH
+  end
+  if ne get dec 2 get req 1
+    ret RX_AEGIS_WHY_MISMATCH
+  end
+  if ne get dec 5 get req 4
+    ret RX_AEGIS_WHY_MISMATCH
+  end
+  if ne get dec 7 get req 5
+    ret RX_AEGIS_WHY_MISMATCH
+  end
+  if ne and get dec 3 xor get req 2 RX_AEGIS_U64_MAX 0
+    ret RX_AEGIS_WHY_MISMATCH
+  end
+  if eq get dec 1 RX_AEGIS_REVOKE
+    ret 0
+  end
+  rsrc = get dec 2
+  rights = get dec 3
+  if lt rsrc get client 0
+    ret RX_AEGIS_WHY_DOMAIN
+  end
+  if gt rsrc get client 1
+    ret RX_AEGIS_WHY_DOMAIN
+  end
+  if eq rights 0
+    ret RX_AEGIS_WHY_DOMAIN
+  end
+  if ne and rights xor get client 2 RX_AEGIS_U64_MAX 0
+    ret RX_AEGIS_WHY_DOMAIN
+  end
+  if ne and rights RX_AEGIS_RIGHT_PRIVILEGED 0
+    ret RX_AEGIS_WHY_DOMAIN
+  end
+  ret 0
+end
+
+note Check origin provenance of n_fields (up to 8).
+note origins[24]: 3 ulongs per field: (reaction, subject, faculty).
+note reaction == RX_AEGIS_U32_MAX means never written (allowed).
+note Returns 1 if valid, 0 if forged.
+fn rx_aegis_written_by origins view ulong 24 n_fields ulong exp_r ulong exp_s ulong exp_fa ulong any_r ulong to ulong
+  cnt = n_fields
+  if gt cnt 8
+    cnt = ulong 8
+  end
+  for i ulong cnt bound 8
+    base = mul i 3
+    r = get origins base
+    s = get origins add base 1
+    fa = get origins add base 2
+    if eq r RX_AEGIS_U32_MAX
+      if eq s 0
+        continue
+      end
+      ret 0
+    end
+    if ne s exp_s
+      ret 0
+    end
+    if eq any_r 0
+      if ne r exp_r
+        ret 0
+      end
+      if ne fa exp_fa
+        ret 0
+      end
+    end
+  end
+  ret 1
+end
+
+note Pure root.install.k slot state machine step.
+note in_ctx[18]: 0..7=dec[0..7], 8..13=req[0..5], 14..17=client(subj, dom_lo, dom_hi, max_rights)
+note origin_flags: bit 0 = dec_ok, bit 1 = req_ok (3 = both verified)
+note st[16]: 0..2=minted(seq, cap_id, gen), 3..10=slot[0..7], 11..14=stats(mints, revokes, refusals, next_cap_id)
+note Returns 1 if slot updated, 0 if no-op.
+fn rx_aegis_install_step in_ctx view ulong 18 origin_flags ulong st edit ulong 16 to ulong
+  seq = get in_ctx 0
+  verdict = get in_ctx 1
+  if eq seq 0
+    ret 0
+  end
+  if ne verdict RX_AEGIS_GRANT
+    if ne verdict RX_AEGIS_REVOKE
+      ret 0
+    end
+  end
+  if ge get in_ctx 5 RX_AEGIS_SLOTS
+    ret 0
+  end
+  if eq get st 8 seq
+    ret 0
+  end
+  if eq and origin_flags 1 0
+    put st 8 seq
+    put st 10 RX_AEGIS_WHY_DECISION_ORIGIN
+    put st 13 add get st 13 1
+    ret 1
+  end
+  if eq and origin_flags 2 0
+    put st 8 seq
+    put st 10 RX_AEGIS_WHY_REQUEST_ORIGIN
+    put st 13 add get st 13 1
+    ret 1
+  end
+  dec = new ulong 8 0
+  for i ulong 8
+    put dec i get in_ctx i
+  end
+  req = new ulong 6 0
+  for i ulong 6
+    put req i get in_ctx add 8 i
+  end
+  cvec = new ulong 3 0
+  put cvec 0 get in_ctx 15
+  put cvec 1 get in_ctx 16
+  put cvec 2 get in_ctx 17
+  chk = rx_aegis_install_check dec req cvec
+  if ne chk 0
+    put st 8 seq
+    put st 10 chk
+    put st 13 add get st 13 1
+    ret 1
+  end
+  if eq verdict RX_AEGIS_REVOKE
+    if ne get st 0 seq
+      if ne get st 1 RX_AEGIS_U32_MAX
+        put st 12 add get st 12 1
+        put st 1 RX_AEGIS_U32_MAX
+        put st 2 0
+      end
+      put st 0 seq
+    end
+    put st 5 RX_AEGIS_SLOT_REVOKED
+    put st 8 seq
+    put st 10 0
+    ret 1
+  end
+  cap_id = ulong 0
+  cap_gen = ulong 0
+  if eq get st 0 seq
+    cap_id = get st 1
+    cap_gen = get st 2
+  else
+    if ne get st 1 RX_AEGIS_U32_MAX
+      put st 12 add get st 12 1
+    end
+    cap_id = get st 14
+    put st 14 add cap_id 1
+    cap_gen = ulong 1
+    put st 0 seq
+    put st 1 cap_id
+    put st 2 cap_gen
+    put st 11 add get st 11 1
+  end
+  put st 3 cap_id
+  put st 4 cap_gen
+  put st 5 RX_AEGIS_SLOT_LIVE
+  put st 6 get in_ctx 2
+  put st 7 get in_ctx 3
+  put st 8 seq
+  put st 9 get in_ctx 4
+  put st 10 0
+  ret 1
+end

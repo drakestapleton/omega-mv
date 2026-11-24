@@ -1,0 +1,776 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_plan.om -- Pure seeded OM-2 port of src/runtime/rx_plan.c.
+note Omega plan IR and verified plan cache (OMEGA_PLAN_REUSE):
+note canonical predicate sorting, binary encode/decode, SHA-256 semantic_id,
+note predicate & applicability evaluation, resource budget fit, and PlCache.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const PL_MAX_SLOTS ulong 8
+const PL_MAX_PREDS ulong 48
+const PL_MAX_TEMPLATES ulong 32
+const PL_ENV_COUNT ulong 5
+const PL_MAX_OBJECTS ulong 64
+const PL_MAX_FIELDS ulong 8
+const PL_MAGIC ulong 1280331087
+
+const PL_P_EQ_CONST ulong 1
+const PL_P_EQ_SLOT ulong 2
+const PL_P_NOT_SLOT ulong 3
+const PL_P_UNREFERENCED ulong 4
+const PL_P_SELF_REF ulong 5
+const PL_P_LIVE ulong 6
+const PL_P_ENV_EQ ulong 7
+const PL_P_ENV_GE ulong 8
+
+const PL_STATUS_CANDIDATE ulong 1
+const PL_STATUS_VERIFIED ulong 2
+const PL_STATUS_STALE ulong 3
+
+const PL_AX_OK ulong 0
+const PL_AX_SHAPE ulong 1
+const PL_AX_BINDING ulong 2
+const PL_AX_GOAL ulong 3
+const PL_AX_WORLD_GEN ulong 4
+const PL_AX_COG_GEN ulong 5
+const PL_AX_ENVIRONMENT ulong 6
+const PL_AX_STATE ulong 7
+const PL_AX_AUTHORITY ulong 8
+const PL_AX_RESOURCES ulong 9
+const PL_AX_STALE ulong 10
+
+const PL_U32_MASK ulong 4294967295
+const PL_U64_MAX ulong 18446744073709551615
+
+text pl_tpl_domain "OMEGA_PLAN_TEMPLATE_V1"
+
+note Template storage in flat globals (up to 32 templates in cache + slot 32 as scratch).
+note Per-template scalar header: 32 ulongs per template:
+note   0:goal_kind, 1:n_goal_slots, 2:n_slots, 3:fail_flags,
+note   4:compute_class, 5:locality, 6:accel, 7:latency_class,
+note   8:memory_bytes, 9:deadline, 10:energy_cost,
+note   11:n_steps, 12:energy_total, 13:n_evidence, 14:graph_kind,
+note   15:status, 16:verified_world_gen, 17:verified_cog_gen,
+note   18:uses, 19:successes, 20:failures, 21:promotions, 22:rederivations,
+note   23:n_pre, 24:n_state, 25:n_env, 26:n_inv, 27:n_succ
+global pl_hdr ulong 1056
+note goal_shape[32], graph_digest[32], semantic_id[32] per template (96 bytes each x 33)
+global pl_digs uchar 3168
+note slots: 8 slots x 6 ulongs per template (48 ulongs x 33 = 1584)
+global pl_slots ulong 1584
+note preds: 5 lists x 48 preds x 6 ulongs per template (1440 ulongs x 33 = 47520)
+global pl_preds ulong 47520
+
+note Cache metadata: 0:n, 1:stored, 2:deduplicated
+global pl_cache_meta ulong 4
+
+note World PlView storage (64 objects x 12 ulongs: 0:live, 1:type, 2:gen, 3:resource, 4..11:field[0..7])
+global pl_view_obj ulong 768
+global pl_view_n ulong 1
+
+note Canonical byte encode buffer
+global pl_enc_buf uchar 16384
+global pl_enc_len ulong 2
+
+fn pl_ref_pack oid ulong gen ulong to ulong
+  hi = shl ulong 1 63
+  g = shl and gen 2147483647 32
+  ret or or hi g and oid PL_U32_MASK
+end
+
+fn pl_ref_id v ulong to ulong
+  ret and v PL_U32_MASK
+end
+
+fn pl_ref_gen v ulong to ulong
+  ret and shr v 32 2147483647
+end
+
+fn pl_word dig view uchar 32 k ulong to ulong
+  if ge k 4
+    ret 0
+  end
+  base = mul k 8
+  v = ulong 0
+  for i ulong 8
+    b = ulong get dig add base i
+    v = or v shl b mul i 8
+  end
+  ret v
+end
+
+fn pl_pred_base tid ulong lidx ulong to ulong
+  ret add mul tid 1440 mul lidx 288
+end
+
+fn pl_pred_gt base ulong a ulong b ulong to ulong
+  ia = add base mul a 6
+  ib = add base mul b 6
+  for k ulong 6
+    va = get pl_preds add ia k
+    vb = get pl_preds add ib k
+    if gt va vb
+      ret 1
+    end
+    if lt va vb
+      ret 0
+    end
+  end
+  ret 0
+end
+
+fn pl_pred_swap base ulong a ulong b ulong to void
+  ia = add base mul a 6
+  ib = add base mul b 6
+  for k ulong 6
+    t = get pl_preds add ia k
+    put pl_preds add ia k get pl_preds add ib k
+    put pl_preds add ib k t
+  end
+end
+
+fn pl_sort_list tid ulong lidx ulong to void
+  n = get pl_hdr add mul tid 32 add 23 lidx
+  if le n 1
+    ret
+  end
+  cnt = n
+  if gt cnt PL_MAX_PREDS
+    cnt = PL_MAX_PREDS
+  end
+  base = pl_pred_base tid lidx
+  i = ulong 1
+  while lt i cnt bound 48
+    j = i
+    while gt j 0 bound 48
+      jm = sub j 1
+      if eq pl_pred_gt base jm j 0
+        break
+      end
+      pl_pred_swap base jm j
+      j = jm
+    end
+    i = add i 1
+  end
+end
+
+fn rx_plan_sort tid ulong to void
+  for l ulong 5
+    pl_sort_list tid l
+  end
+end
+
+fn pl_enc_reset to void
+  put pl_enc_len 0 0
+  put pl_enc_len 1 0
+end
+
+fn pl_enc_u8 v ulong to void
+  pos = get pl_enc_len 0
+  if ge pos 16384
+    put pl_enc_len 1 1
+    ret
+  end
+  put pl_enc_buf pos uchar and v 255
+  put pl_enc_len 0 add pos 1
+end
+
+fn pl_enc_u32 v ulong to void
+  for i ulong 4
+    pl_enc_u8 shr v mul i 8
+  end
+end
+
+fn pl_enc_u64 v ulong to void
+  for i ulong 8
+    pl_enc_u8 shr v mul i 8
+  end
+end
+
+fn pl_enc_dig tid ulong off ulong to void
+  base = add mul tid 96 off
+  for i ulong 32
+    pl_enc_u8 ulong get pl_digs add base i
+  end
+end
+
+fn pl_enc_plist tid ulong lidx ulong to void
+  n = get pl_hdr add mul tid 32 add 23 lidx
+  pl_enc_u32 n
+  base = pl_pred_base tid lidx
+  for i ulong n bound 48
+    ib = add base mul i 6
+    pl_enc_u32 get pl_preds ib
+    pl_enc_u32 get pl_preds add ib 1
+    pl_enc_u32 get pl_preds add ib 2
+    pl_enc_u32 get pl_preds add ib 3
+    pl_enc_u32 get pl_preds add ib 4
+    pl_enc_u64 get pl_preds add ib 5
+  end
+end
+
+note Canonical semantic bytes into pl_enc_buf[0..len). Returns length, or 0 on overflow.
+fn rx_plan_encode tid ulong to ulong
+  pl_enc_reset
+  hb = mul tid 32
+  pl_enc_u32 PL_MAGIC
+  pl_enc_u32 1
+  pl_enc_u32 get pl_hdr hb
+  pl_enc_dig tid 0
+  pl_enc_u32 get pl_hdr add hb 1
+  ns = get pl_hdr add hb 2
+  pl_enc_u32 ns
+  sb = mul tid 48
+  for i ulong ns bound 8
+    ib = add sb mul i 6
+    for k ulong 6
+      pl_enc_u32 get pl_slots add ib k
+    end
+  end
+  for l ulong 5
+    pl_enc_plist tid l
+  end
+  pl_enc_u32 get pl_hdr add hb 3
+  pl_enc_u32 get pl_hdr add hb 4
+  pl_enc_u32 get pl_hdr add hb 5
+  pl_enc_u32 get pl_hdr add hb 6
+  pl_enc_u32 get pl_hdr add hb 7
+  pl_enc_u64 get pl_hdr add hb 8
+  pl_enc_u64 get pl_hdr add hb 9
+  pl_enc_u64 get pl_hdr add hb 10
+  pl_enc_u32 get pl_hdr add hb 11
+  pl_enc_u64 get pl_hdr add hb 12
+  pl_enc_u32 get pl_hdr add hb 13
+  pl_enc_u32 get pl_hdr add hb 14
+  pl_enc_dig tid 32
+  if ne get pl_enc_len 1 0
+    ret 0
+  end
+  ret get pl_enc_len 0
+end
+
+note Decoder cursor: 0:pos, 1:limit, 2:bad
+global pl_dec_st ulong 3
+
+fn pl_dec_u32 to ulong
+  pos = get pl_dec_st 0
+  lim = get pl_dec_st 1
+  if gt add pos 4 lim
+    put pl_dec_st 2 1
+    ret 0
+  end
+  v = ulong 0
+  for i ulong 4
+    b = ulong get pl_enc_buf add pos i
+    v = or v shl b mul i 8
+  end
+  put pl_dec_st 0 add pos 4
+  ret v
+end
+
+fn pl_dec_u64 to ulong
+  lo = pl_dec_u32
+  hi = pl_dec_u32
+  ret or lo shl hi 32
+end
+
+fn pl_dec_dig tid ulong off ulong to void
+  pos = get pl_dec_st 0
+  lim = get pl_dec_st 1
+  if gt add pos 32 lim
+    put pl_dec_st 2 1
+    ret
+  end
+  base = add mul tid 96 off
+  for i ulong 32
+    put pl_digs add base i get pl_enc_buf add pos i
+  end
+  put pl_dec_st 0 add pos 32
+end
+
+fn pl_dec_plist tid ulong lidx ulong to void
+  n = pl_dec_u32
+  if gt n PL_MAX_PREDS
+    put pl_dec_st 2 1
+    ret
+  end
+  put pl_hdr add mul tid 32 add 23 lidx n
+  base = pl_pred_base tid lidx
+  for i ulong n bound 48
+    ib = add base mul i 6
+    put pl_preds ib pl_dec_u32
+    put pl_preds add ib 1 pl_dec_u32
+    put pl_preds add ib 2 pl_dec_u32
+    put pl_preds add ib 3 pl_dec_u32
+    put pl_preds add ib 4 pl_dec_u32
+    put pl_preds add ib 5 pl_dec_u64
+  end
+end
+
+fn pl_clear_tpl tid ulong to void
+  hb = mul tid 32
+  for i ulong 32
+    put pl_hdr add hb i 0
+  end
+  db = mul tid 96
+  for i ulong 96
+    put pl_digs add db i 0
+  end
+end
+
+note Decode pl_enc_buf[0..n) into template slot tid. Returns 0 on success, -1 on error.
+fn rx_plan_decode n ulong tid ulong to long
+  pl_clear_tpl tid
+  put pl_dec_st 0 0
+  put pl_dec_st 1 n
+  put pl_dec_st 2 0
+  if ne pl_dec_u32 PL_MAGIC
+    ret -1
+  end
+  if ne pl_dec_u32 1
+    ret -1
+  end
+  hb = mul tid 32
+  put pl_hdr hb pl_dec_u32
+  pl_dec_dig tid 0
+  ngs = pl_dec_u32
+  ns = pl_dec_u32
+  if gt ns PL_MAX_SLOTS
+    ret -1
+  end
+  if gt ngs ns
+    ret -1
+  end
+  put pl_hdr add hb 1 ngs
+  put pl_hdr add hb 2 ns
+  sb = mul tid 48
+  for i ulong ns bound 8
+    ib = add sb mul i 6
+    for k ulong 6
+      put pl_slots add ib k pl_dec_u32
+    end
+  end
+  for l ulong 5
+    pl_dec_plist tid l
+  end
+  put pl_hdr add hb 3 pl_dec_u32
+  put pl_hdr add hb 4 pl_dec_u32
+  put pl_hdr add hb 5 pl_dec_u32
+  put pl_hdr add hb 6 pl_dec_u32
+  put pl_hdr add hb 7 pl_dec_u32
+  put pl_hdr add hb 8 pl_dec_u64
+  put pl_hdr add hb 9 pl_dec_u64
+  put pl_hdr add hb 10 pl_dec_u64
+  put pl_hdr add hb 11 pl_dec_u32
+  put pl_hdr add hb 12 pl_dec_u64
+  put pl_hdr add hb 13 pl_dec_u32
+  put pl_hdr add hb 14 pl_dec_u32
+  pl_dec_dig tid 32
+  if ne get pl_dec_st 2 0
+    ret -1
+  end
+  if ne get pl_dec_st 0 n
+    ret -1
+  end
+  ret 0
+end
+
+note Compute canonical semantic_id = SHA256("OMEGA_PLAN_TEMPLATE_V1" || encode(tid)).
+fn rx_plan_identify tid ulong to void
+  rx_plan_sort tid
+  n = rx_plan_encode tid
+  dlen = len pl_tpl_domain
+  for i ulong dlen bound 32
+    put sh_dat i get pl_tpl_domain i
+  end
+  for i ulong n bound 16384
+    put sh_dat add dlen i get pl_enc_buf i
+  end
+  sh_all add dlen n
+  db = add mul tid 96 64
+  for i ulong 32
+    put pl_digs add db i get sh_dig i
+  end
+end
+
+fn pl_obj_live oid ulong gen ulong to ulong
+  if ge oid get pl_view_n 0
+    ret 0
+  end
+  ob = mul oid 12
+  if eq get pl_view_obj ob 0
+    ret 0
+  end
+  if ne get pl_view_obj add ob 2 gen
+    ret 0
+  end
+  ret 1
+end
+
+global pl_env_refs ulong 10
+global pl_bind_slots ulong 16
+
+fn pl_is_slot oid ulong gen ulong n_slots ulong to ulong
+  for s ulong n_slots bound 8
+    if eq get pl_bind_slots mul s 2 oid
+      if eq get pl_bind_slots add mul s 2 1 gen
+        ret 1
+      end
+    end
+  end
+  ret 0
+end
+
+fn pl_pred_env pbase ulong to ulong
+  kind = get pl_preds pbase
+  sl = get pl_preds add pbase 1
+  if ge sl PL_ENV_COUNT
+    ret 0
+  end
+  oid = get pl_env_refs mul sl 2
+  gen = get pl_env_refs add mul sl 2 1
+  if eq pl_obj_live oid gen 0
+    ret 0
+  end
+  f = and get pl_preds add pbase 2 7
+  fv = get pl_view_obj add mul oid 12 add 4 f
+  val = get pl_preds add pbase 5
+  if eq kind PL_P_ENV_EQ
+    if eq fv val
+      ret 1
+    end
+    ret 0
+  end
+  if ge fv val
+    ret 1
+  end
+  ret 0
+end
+
+fn pl_pred_unreferenced oid ulong gen ulong f ulong tp ulong n_slots ulong to ulong
+  me = pl_ref_pack oid gen
+  vn = get pl_view_n 0
+  for i ulong vn bound 64
+    iob = mul i 12
+    if eq get pl_view_obj iob 0
+      continue
+    end
+    if ne get pl_view_obj add iob 1 tp
+      continue
+    end
+    if ne get pl_view_obj add iob add 4 f me
+      continue
+    end
+    if eq pl_is_slot i get pl_view_obj add iob 2 n_slots 0
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn pl_pred_slot_ref kind ulong fv ulong pbase ulong n_slots ulong to ulong
+  if eq kind PL_P_EQ_SLOT
+    sl2 = get pl_preds add pbase 3
+    if ge sl2 n_slots
+      ret 0
+    end
+    pk = pl_ref_pack get pl_bind_slots mul sl2 2 get pl_bind_slots add mul sl2 2 1
+    if eq fv pk
+      ret 1
+    end
+    ret 0
+  end
+  if eq fv 0
+    ret 0
+  end
+  for s ulong n_slots bound 8
+    pk = pl_ref_pack get pl_bind_slots mul s 2 get pl_bind_slots add mul s 2 1
+    if eq fv pk
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn pl_pred_meta kind ulong oid ulong gen ulong pbase ulong n_slots ulong to ulong
+  f = and get pl_preds add pbase 2 7
+  fv = get pl_view_obj add mul oid 12 add 4 f
+  if eq kind PL_P_SELF_REF
+    if eq fv pl_ref_pack oid gen
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind PL_P_LIVE
+    if eq get pl_view_obj add mul oid 12 1 get pl_preds add pbase 4
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind PL_P_UNREFERENCED
+    ret pl_pred_unreferenced oid gen f get pl_preds add pbase 4 n_slots
+  end
+  ret 0
+end
+
+note Evaluate one predicate at pl_preds[pbase..pbase+5] using pl_env_refs and pl_bind_slots.
+fn rx_plan_pred pbase ulong n_slots ulong to ulong
+  kind = get pl_preds pbase
+  if or eq kind PL_P_ENV_EQ eq kind PL_P_ENV_GE
+    ret pl_pred_env pbase
+  end
+  sl = get pl_preds add pbase 1
+  if ge sl n_slots
+    ret 0
+  end
+  oid = get pl_bind_slots mul sl 2
+  gen = get pl_bind_slots add mul sl 2 1
+  if eq pl_obj_live oid gen 0
+    ret 0
+  end
+  if ge kind PL_P_UNREFERENCED
+    ret pl_pred_meta kind oid gen pbase n_slots
+  end
+  f = and get pl_preds add pbase 2 7
+  fv = get pl_view_obj add mul oid 12 add 4 f
+  if eq kind PL_P_EQ_CONST
+    if eq fv get pl_preds add pbase 5
+      ret 1
+    end
+    ret 0
+  end
+  ret pl_pred_slot_ref kind fv pbase n_slots
+end
+
+note Evaluate predicate list lidx of template tid. Returns -1 if all hold, else first failing index.
+fn rx_plan_preds tid ulong lidx ulong n_slots ulong to long
+  n = get pl_hdr add mul tid 32 add 23 lidx
+  base = pl_pred_base tid lidx
+  for i ulong n bound 48
+    if eq rx_plan_pred add base mul i 6 n_slots 0
+      ret long i
+    end
+  end
+  ret -1
+end
+
+note Check if template step_need fits budget[5]: (memory_bytes, offered_accel, offered_locality, compute_mask, energy_budget).
+fn rx_plan_need_fits tid ulong budget view ulong 5 to ulong
+  hb = mul tid 32
+  if gt get pl_hdr add hb 8 get budget 0
+    ret 0
+  end
+  if ne and get pl_hdr add hb 6 xor get budget 1 PL_U64_MAX 0
+    ret 0
+  end
+  if ne and get pl_hdr add hb 5 xor get budget 2 PL_U64_MAX 0
+    ret 0
+  end
+  cc = get pl_hdr add hb 4
+  if ne cc 0
+    bit = shl ulong 1 and cc 31
+    if eq and get budget 3 bit 0
+      ret 0
+    end
+  end
+  if gt get pl_hdr add hb 10 get budget 4
+    ret 0
+  end
+  ret 1
+end
+
+fn pl_check_one_binding tid ulong s ulong to ulong
+  oid = get pl_bind_slots mul s 2
+  gen = get pl_bind_slots add mul s 2 1
+  if eq pl_obj_live oid gen 0
+    ret 0
+  end
+  ot = get pl_view_obj add mul oid 12 1
+  st = get pl_slots add mul tid 48 mul s 6
+  if ne ot st
+    ret 0
+  end
+  ret 1
+end
+
+fn pl_check_bindings tid ulong ns ulong to ulong
+  for s ulong ns bound 8
+    if eq pl_check_one_binding tid s 0
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn pl_check_gens tid ulong to ulong
+  hb = mul tid 32
+  wg_id = get pl_env_refs 2
+  wg_gen = get pl_env_refs 3
+  if eq pl_obj_live wg_id wg_gen 0
+    ret PL_AX_WORLD_GEN
+  end
+  if ne get pl_view_obj add mul wg_id 12 4 get pl_hdr add hb 16
+    ret PL_AX_WORLD_GEN
+  end
+  cg_id = get pl_env_refs 4
+  cg_gen = get pl_env_refs 5
+  if eq pl_obj_live cg_id cg_gen 0
+    ret PL_AX_COG_GEN
+  end
+  if ne get pl_view_obj add mul cg_id 12 4 get pl_hdr add hb 17
+    ret PL_AX_COG_GEN
+  end
+  ret PL_AX_OK
+end
+
+note Check applicability axes in PlAxis order using pl_env_refs and pl_bind_slots.
+note auth_ok: 1 if all slot capabilities validated, 0 if any missing.
+fn rx_plan_applicable tid ulong auth_ok ulong budget view ulong 5 to ulong
+  hb = mul tid 32
+  if eq get pl_hdr add hb 15 PL_STATUS_STALE
+    ret PL_AX_STALE
+  end
+  ns = get pl_hdr add hb 2
+  if eq pl_check_bindings tid ns 0
+    ret PL_AX_BINDING
+  end
+  if ge rx_plan_preds tid 0 ns 0
+    ret PL_AX_GOAL
+  end
+  grc = pl_check_gens tid
+  if ne grc PL_AX_OK
+    ret grc
+  end
+  if ge rx_plan_preds tid 2 ns 0
+    ret PL_AX_ENVIRONMENT
+  end
+  if ge rx_plan_preds tid 1 ns 0
+    ret PL_AX_STATE
+  end
+  if ge rx_plan_preds tid 3 ns 0
+    ret PL_AX_STATE
+  end
+  if eq auth_ok 0
+    ret PL_AX_AUTHORITY
+  end
+  if eq rx_plan_need_fits tid budget 0
+    ret PL_AX_RESOURCES
+  end
+  ret PL_AX_OK
+end
+
+note ---- PlCache ----
+
+fn rx_plan_cache_init to void
+  put pl_cache_meta 0 0
+  put pl_cache_meta 1 0
+  put pl_cache_meta 2 0
+end
+
+fn pl_dig_eq a_tid ulong a_off ulong b_tid ulong b_off ulong to ulong
+  ba = add mul a_tid 96 a_off
+  bb = add mul b_tid 96 b_off
+  for i ulong 32
+    if ne get pl_digs add ba i get pl_digs add bb i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn pl_copy_tpl dst_tid ulong src_tid ulong to void
+  d = mul dst_tid 32
+  s = mul src_tid 32
+  for i ulong 32
+    put pl_hdr add d i get pl_hdr add s i
+  end
+  d = mul dst_tid 96
+  s = mul src_tid 96
+  for i ulong 96
+    put pl_digs add d i get pl_digs add s i
+  end
+  d = mul dst_tid 48
+  s = mul src_tid 48
+  for i ulong 48
+    put pl_slots add d i get pl_slots add s i
+  end
+  d = mul dst_tid 1440
+  s = mul src_tid 1440
+  for i ulong 1440
+    put pl_preds add d i get pl_preds add s i
+  end
+end
+
+note Find template matching semantic_id of src_tid. Returns index or -1.
+fn rx_plan_cache_find src_tid ulong to long
+  n = get pl_cache_meta 0
+  for i ulong n bound 32
+    if ne pl_dig_eq i 64 src_tid 64 0
+      ret long i
+    end
+  end
+  ret -1
+end
+
+note Store template from src_tid into cache under (world_gen, cog_gen). Returns slot index or -1.
+fn rx_plan_cache_store src_tid ulong world_gen ulong cog_gen ulong to long
+  have = rx_plan_cache_find src_tid
+  if ge have 0
+    idx = ulong have
+    hb = mul idx 32
+    put pl_hdr add hb 16 world_gen
+    put pl_hdr add hb 17 cog_gen
+    put pl_hdr add hb 15 PL_STATUS_CANDIDATE
+    put pl_hdr add hb 22 add get pl_hdr add hb 22 1
+    put pl_cache_meta 2 add get pl_cache_meta 2 1
+    ret have
+  end
+  n = get pl_cache_meta 0
+  if ge n PL_MAX_TEMPLATES
+    ret -1
+  end
+  pl_copy_tpl n src_tid
+  hb = mul n 32
+  put pl_hdr add hb 15 PL_STATUS_CANDIDATE
+  put pl_hdr add hb 16 world_gen
+  put pl_hdr add hb 17 cog_gen
+  put pl_hdr add hb 18 0
+  put pl_hdr add hb 19 0
+  put pl_hdr add hb 20 0
+  put pl_hdr add hb 21 0
+  put pl_hdr add hb 22 0
+  put pl_cache_meta 0 add n 1
+  put pl_cache_meta 1 add get pl_cache_meta 1 1
+  ret long n
+end
+
+note Retrieve templates matching goal_kind and goal_shape of query_tid into dst_ids[32].
+fn rx_plan_cache_retrieve goal_kind ulong query_tid ulong dst_ids edit ulong 32 to ulong
+  n = get pl_cache_meta 0
+  k = ulong 0
+  for i ulong n bound 32
+    if ne get pl_hdr mul i 32 goal_kind
+      continue
+    end
+    if eq pl_dig_eq i 0 query_tid 0 0
+      continue
+    end
+    put dst_ids k i
+    k = add k 1
+  end
+  ret k
+end
+
+fn rx_plan_record_use tid ulong success ulong to void
+  hb = mul tid 32
+  put pl_hdr add hb 18 add get pl_hdr add hb 18 1
+  if ne success 0
+    put pl_hdr add hb 19 add get pl_hdr add hb 19 1
+    if eq get pl_hdr add hb 15 PL_STATUS_CANDIDATE
+      put pl_hdr add hb 15 PL_STATUS_VERIFIED
+      put pl_hdr add hb 21 add get pl_hdr add hb 21 1
+    end
+  else
+    put pl_hdr add hb 20 add get pl_hdr add hb 20 1
+    put pl_hdr add hb 15 PL_STATUS_STALE
+  end
+end

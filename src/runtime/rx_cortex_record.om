@@ -1,0 +1,562 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_cortex_record.om -- Pure seeded OM-2 port of src/runtime/rx_cortex_record.c.
+note World execution recorded into canonical Cortex (M20 & COMPOSITION-2):
+note whole-World and disjoint scoped Cortex links, single-writer claim/release,
+note crumb-to-Cortex mapping, digest packing, parent-link deduplication, and
+note attached append/promote/recall operations.
+note Requires seed/ng/sha256.om and src/runtime/rx_cortex.om concatenated before this file.
+
+const RXCX_MAX_LINKS ulong 8
+const RXCX_SCOPE_MAX ulong 8
+const RXCX_MAX_OBJECTS ulong 64
+const RXCX_CRUMB_CAP ulong 256
+const RXCX_SUBJECTS ulong 65
+
+const RXCX_OK long 0
+const RXCX_ERR_ARG long -1
+const RXCX_ERR_FULL long -2
+const RXCX_ERR_EXISTS long -3
+const RXCX_ERR_NOT_FOUND long -4
+const RXCX_ERR_IDENTITY long -5
+
+const RX_CRUMB_CREATE ulong 1
+const RX_CRUMB_EXTERNAL ulong 2
+const RX_CRUMB_COMMIT ulong 3
+const RX_CRUMB_FAILED ulong 4
+const RX_CRUMB_BLOCKED_AUTH ulong 5
+const RX_CRUMB_NOOP ulong 8
+const RX_CRUMB_RETIRE ulong 9
+const RX_CRUMB_OP_STOP ulong 10
+const RX_CRUMB_OP_RESUME ulong 11
+
+note Hub state:
+note rxcx_hub[2]: 0:n_links, 1:next_token
+global rxcx_hub ulong 2
+note Per-link metadata (8 links x 8 ulongs):
+note   0:store_id, 1:session, 2:token, 3:scoped, 4:n_obj, 5:records, 6:errors, 7:reserved
+global rxcx_link ulong 64
+note Scoped objects per link (8 links x 8 objs x 3 ulongs: id, gen, subject = 192)
+global rxcx_scope ulong 192
+note Crumb id -> Cortex id map (8 links x 256 crumbs = 2048)
+global rxcx_map ulong 2048
+
+fn rx_cx_kind_of ckind ulong dst edit ulong 4 to void
+  put dst 2 0
+  if eq ckind RX_CRUMB_EXTERNAL
+    put dst 0 CX_OBSERVATION
+    put dst 1 CX_K_WORK_ACCEPTED
+    put dst 2 CX_PROT_AUTHORITY
+    ret
+  end
+  if eq ckind RX_CRUMB_CREATE
+    put dst 0 CX_ENTITY
+    put dst 1 CX_K_ENTITY_CREATED
+    ret
+  end
+  if eq ckind RX_CRUMB_RETIRE
+    put dst 0 CX_ENTITY
+    put dst 1 CX_K_ENTITY_RETIRED
+    ret
+  end
+  if eq ckind RX_CRUMB_COMMIT
+    put dst 0 CX_EXECUTION
+    put dst 1 CX_K_EXEC_COMMIT
+    put dst 2 CX_PROT_COMMIT_RECEIPT
+    ret
+  end
+  if eq ckind RX_CRUMB_NOOP
+    put dst 0 CX_EXECUTION
+    put dst 1 CX_K_EXEC_NOOP
+    ret
+  end
+  if eq ckind RX_CRUMB_BLOCKED_AUTH
+    put dst 0 CX_FAILURE
+    put dst 1 CX_K_EXEC_FAILED
+    put dst 2 CX_PROT_AUTHORITY
+    ret
+  end
+  put dst 0 CX_FAILURE
+  put dst 1 CX_K_EXEC_FAILED
+end
+
+fn rx_cx_pack_digest dig view uchar 32 dst edit ulong 4 to void
+  for i ulong 4
+    v = ulong 0
+    base = mul i 8
+    for b ulong 8
+      bv = ulong get dig add base b
+      v = or v shl bv mul b 8
+    end
+    put dst i v
+  end
+end
+
+fn rx_cx_dedup_links cause ulong parents view ulong * np ulong dst edit ulong 4 to ulong
+  nl = ulong 0
+  if ne cause 0
+    put dst nl cause
+    nl = add nl 1
+  end
+  cnt = np
+  if gt cnt len parents
+    cnt = len parents
+  end
+  if gt cnt 16
+    cnt = ulong 16
+  end
+  for i ulong cnt bound 16
+    if ge nl 4
+      break
+    end
+    p = get parents i
+    if eq p 0
+      continue
+    end
+    dup = ulong 0
+    for j ulong nl bound 4
+      if eq get dst j p
+        dup = ulong 1
+        break
+      end
+    end
+    if eq dup 0
+      put dst nl p
+      nl = add nl 1
+    end
+  end
+  ret nl
+end
+
+fn rx_cx_hub_init to void
+  put rxcx_hub 0 0
+  put rxcx_hub 1 100
+  for i ulong 64
+    put rxcx_link i 0
+  end
+  for i ulong 2048
+    put rxcx_map i 0
+  end
+end
+
+fn rx_cx_find_link use_st ulong st ulong to long
+  n = get rxcx_hub 0
+  for i ulong n bound 8
+    lb = mul i 8
+    if ne use_st 0
+      if eq get rxcx_link lb st
+        ret long i
+      end
+    else
+      if eq get rxcx_link add lb 3 0
+        ret long i
+      end
+    end
+  end
+  if eq use_st 0
+    if eq n 1
+      ret 0
+    end
+  end
+  ret -1
+end
+
+fn rx_cx_attach st ulong session ulong to long
+  if ge st CX_MAX_STORES
+    ret RXCX_ERR_ARG
+  end
+  nsub = get cx_meta add mul st 16 2
+  if lt nsub RXCX_SUBJECTS
+    ret RXCX_ERR_ARG
+  end
+  n = get rxcx_hub 0
+  if ge n RXCX_MAX_LINKS
+    ret RXCX_ERR_FULL
+  end
+  for i ulong n bound 8
+    if eq get rxcx_link add mul i 8 3 0
+      ret RXCX_ERR_EXISTS
+    end
+  end
+  tok = get rxcx_hub 1
+  put rxcx_hub 1 add tok 1
+  if ne cx_claim_writer st tok CX_OK
+    ret RXCX_ERR_IDENTITY
+  end
+  lb = mul n 8
+  put rxcx_link lb st
+  put rxcx_link add lb 1 session
+  put rxcx_link add lb 2 tok
+  put rxcx_link add lb 3 0
+  put rxcx_link add lb 4 0
+  put rxcx_link add lb 5 0
+  put rxcx_link add lb 6 0
+  mb = mul n RXCX_CRUMB_CAP
+  for i ulong RXCX_CRUMB_CAP
+    put rxcx_map add mb i 0
+  end
+  put rxcx_hub 0 add n 1
+  ret RXCX_OK
+end
+
+fn rx_cx_scope_link_overlap lidx ulong objs_subj view ulong 24 cnt ulong to ulong
+  lb = mul lidx 8
+  if eq get rxcx_link add lb 3 0
+    ret 0
+  end
+  on = get rxcx_link add lb 4
+  osb = mul lidx 24
+  for a ulong on bound 8
+    aid = get rxcx_scope add osb mul a 3
+    agen = get rxcx_scope add osb add mul a 3 1
+    for b ulong cnt bound 8
+      if eq aid get objs_subj mul b 3
+        if eq agen get objs_subj add mul b 3 1
+          ret 1
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn rx_cx_copy_scope n ulong objs_subj view ulong 24 cnt ulong to void
+  sb = mul n 24
+  for i ulong cnt bound 8
+    put rxcx_scope add sb mul i 3 get objs_subj mul i 3
+    put rxcx_scope add sb add mul i 3 1 get objs_subj add mul i 3 1
+    put rxcx_scope add sb add mul i 3 2 get objs_subj add mul i 3 2
+  end
+  mb = mul n RXCX_CRUMB_CAP
+  for i ulong RXCX_CRUMB_CAP
+    put rxcx_map add mb i 0
+  end
+end
+
+fn rx_cx_check_scope_subjs st ulong objs_subj view ulong 24 cnt ulong to long
+  nsub = get cx_meta add mul st 16 2
+  for i ulong cnt bound 8
+    sj = get objs_subj add mul i 3 2
+    if eq sj 0
+      ret RXCX_ERR_ARG
+    end
+    if ge sj nsub
+      ret RXCX_ERR_ARG
+    end
+  end
+  ret RXCX_OK
+end
+
+note objs_subj[24]: n triples (obj_id, obj_gen, subject)
+fn rx_cx_attach_scoped st ulong session ulong objs_subj view ulong 24 cnt ulong to long
+  if ge st CX_MAX_STORES
+    ret RXCX_ERR_ARG
+  end
+  if eq cnt 0
+    ret RXCX_ERR_ARG
+  end
+  if gt cnt RXCX_SCOPE_MAX
+    ret RXCX_ERR_ARG
+  end
+  if ne rx_cx_check_scope_subjs st objs_subj cnt RXCX_OK
+    ret RXCX_ERR_ARG
+  end
+  n = get rxcx_hub 0
+  if ge n RXCX_MAX_LINKS
+    ret RXCX_ERR_FULL
+  end
+  for i ulong n bound 8
+    if ne rx_cx_scope_link_overlap i objs_subj cnt 0
+      ret RXCX_ERR_EXISTS
+    end
+  end
+  tok = get rxcx_hub 1
+  put rxcx_hub 1 add tok 1
+  if ne cx_claim_writer st tok CX_OK
+    ret RXCX_ERR_IDENTITY
+  end
+  lb = mul n 8
+  put rxcx_link lb st
+  put rxcx_link add lb 1 session
+  put rxcx_link add lb 2 tok
+  put rxcx_link add lb 3 1
+  put rxcx_link add lb 4 cnt
+  put rxcx_link add lb 5 0
+  put rxcx_link add lb 6 0
+  rx_cx_copy_scope n objs_subj cnt
+  put rxcx_hub 0 add n 1
+  ret RXCX_OK
+end
+
+note Input crumb buffers for rx_cx_record_crumb:
+note rxcx_cm[16], rxcx_par[4], rxcx_fld[8], rxcx_dig[32]
+global rxcx_cm ulong 16
+global rxcx_par ulong 4
+global rxcx_fld ulong 8
+global rxcx_dig uchar 32
+
+fn rx_cx_move_link idx ulong last ulong to void
+  lb = mul idx 8
+  nlb = mul last 8
+  for k ulong 8
+    put rxcx_link add lb k get rxcx_link add nlb k
+  end
+  sb = mul idx 24
+  nsb = mul last 24
+  for k ulong 24
+    put rxcx_scope add sb k get rxcx_scope add nsb k
+  end
+  mb = mul idx RXCX_CRUMB_CAP
+  nmb = mul last RXCX_CRUMB_CAP
+  for k ulong RXCX_CRUMB_CAP
+    put rxcx_map add mb k get rxcx_map add nmb k
+  end
+end
+
+fn rx_cx_detach_idx idx ulong to void
+  lb = mul idx 8
+  cx_release_writer get rxcx_link lb get rxcx_link add lb 2
+  last = sub get rxcx_hub 0 1
+  if lt idx last
+    rx_cx_move_link idx last
+  end
+  put rxcx_hub 0 last
+end
+
+fn rx_cx_detach to long
+  li = rx_cx_find_link 0 0
+  if lt li 0
+    ret RXCX_ERR_NOT_FOUND
+  end
+  rx_cx_detach_idx ulong li
+  ret RXCX_OK
+end
+
+fn rx_cx_detach_store st ulong to long
+  li = rx_cx_find_link 1 st
+  if lt li 0
+    ret RXCX_ERR_NOT_FOUND
+  end
+  rx_cx_detach_idx ulong li
+  ret RXCX_OK
+end
+
+fn rx_cx_subject_in lidx ulong has_ref ulong oid ulong gen ulong to ulong
+  lb = mul lidx 8
+  if eq get rxcx_link add lb 3 0
+    if eq has_ref 0
+      ret 0
+    end
+    if lt oid RXCX_MAX_OBJECTS
+      ret add oid 1
+    end
+    ret 0
+  end
+  if eq has_ref 0
+    ret 0
+  end
+  cnt = get rxcx_link add lb 4
+  sb = mul lidx 24
+  for i ulong cnt bound 8
+    if eq get rxcx_scope add sb mul i 3 oid
+      if eq get rxcx_scope add sb add mul i 3 1 gen
+        ret get rxcx_scope add sb add mul i 3 2
+      end
+    end
+  end
+  ret 0
+end
+
+fn rx_cx_of_crumb lidx ulong cid ulong to ulong
+  if eq cid 0
+    ret 0
+  end
+  if ge cid RXCX_CRUMB_CAP
+    ret 0
+  end
+  ret get rxcx_map add mul lidx RXCX_CRUMB_CAP cid
+end
+
+fn rx_cx_build_hdr lidx ulong subj ulong hdr edit ulong 12 to void
+  ckind = get rxcx_cm 1
+  kinfo = new ulong 4 0
+  rx_cx_kind_of ckind kinfo
+  st = get rxcx_link mul lidx 8
+  put hdr 0 get kinfo 0
+  put hdr 1 get kinfo 1
+  put hdr 2 subj
+  put hdr 3 add get cx_meta mul st 16 1
+  put hdr 4 get rxcx_cm 8
+  put hdr 5 ckind
+  put hdr 6 get kinfo 2
+  put hdr 7 0
+  cause_cx = rx_cx_of_crumb lidx get rxcx_cm 10
+  pcx = new ulong 4 0
+  np = get rxcx_cm 11
+  if gt np 4
+    np = ulong 4
+  end
+  for i ulong np bound 4
+    put pcx i rx_cx_of_crumb lidx get rxcx_par i
+  end
+  lout = new ulong 4 0
+  nl = rx_cx_dedup_links cause_cx pcx np lout
+  for i ulong nl bound 4
+    put hdr add 8 i get lout i
+  end
+end
+
+fn rx_cx_build_pay lidx ulong pay edit ulong 26 to void
+  lb = mul lidx 8
+  put pay 0 get rxcx_link add lb 1
+  put pay 1 get rxcx_cm 0
+  put pay 2 get rxcx_cm 1
+  put pay 3 get rxcx_cm 2
+  put pay 4 get rxcx_cm 3
+  put pay 5 get rxcx_cm 4
+  put pay 6 get rxcx_cm 5
+  if ne get rxcx_cm 6 0
+    put pay 7 get rxcx_cm 7
+    put pay 8 get rxcx_cm 8
+  else
+    put pay 7 CX_U64_MAX
+    put pay 8 0
+  end
+  put pay 9 get rxcx_cm 9
+  for f ulong 8
+    put pay add 10 f get rxcx_fld f
+  end
+  dig = new uchar 32 0
+  for i ulong 32
+    put dig i get rxcx_dig i
+  end
+  digw = new ulong 4 0
+  rx_cx_pack_digest dig digw
+  for i ulong 4
+    put pay add 18 i get digw i
+  end
+  put pay 22 get rxcx_cm 12
+  put pay 23 get rxcx_cm 13
+  put pay 24 get rxcx_cm 14
+  put pay 25 get rxcx_cm 15
+end
+
+fn rx_cx_finish_rec lidx ulong st ulong to void
+  lb = mul lidx 8
+  new_id = get cx_meta mul st 16
+  cid = get rxcx_cm 0
+  if lt cid RXCX_CRUMB_CAP
+    put rxcx_map add mul lidx RXCX_CRUMB_CAP cid new_id
+  end
+  cnt = get rxcx_link add lb 5
+  put rxcx_link add lb 5 add cnt 1
+end
+
+fn rx_cx_record_link lidx ulong to void
+  ckind = get rxcx_cm 1
+  if eq ckind RX_CRUMB_OP_STOP
+    ret
+  end
+  if eq ckind RX_CRUMB_OP_RESUME
+    ret
+  end
+  subj = rx_cx_subject_in lidx get rxcx_cm 6 get rxcx_cm 7 get rxcx_cm 8
+  lb = mul lidx 8
+  if ne get rxcx_link add lb 3 0
+    if eq subj 0
+      ret
+    end
+  end
+  hdr = new ulong 12 0
+  rx_cx_build_hdr lidx subj hdr
+  pay = new ulong 26 0
+  rx_cx_build_pay lidx pay
+  st = get rxcx_link lb
+  rc = cx_append_as st get rxcx_link add lb 2 hdr pay 26
+  if ne rc CX_OK
+    errs = get rxcx_link add lb 6
+    put rxcx_link add lb 6 add errs 1
+    ret
+  end
+  rx_cx_finish_rec lidx st
+end
+
+fn rx_cx_record_crumb to void
+  n = get rxcx_hub 0
+  for i ulong n bound 8
+    rx_cx_record_link i
+  end
+end
+
+fn rx_cx_record_in use_st ulong st ulong crumb ulong to ulong
+  li = rx_cx_find_link use_st st
+  if lt li 0
+    ret 0
+  end
+  ret rx_cx_of_crumb ulong li crumb
+end
+
+fn rx_cx_status dst edit ulong 2 to long
+  li = rx_cx_find_link 0 0
+  if lt li 0
+    ret RXCX_ERR_NOT_FOUND
+  end
+  lb = mul ulong li 8
+  put dst 0 get rxcx_link add lb 5
+  put dst 1 get rxcx_link add lb 6
+  ret RXCX_OK
+end
+
+fn rx_cx_inc_err lb ulong to void
+  put rxcx_link add lb 6 add get rxcx_link add lb 6 1
+end
+
+fn rx_cx_append_in use_st ulong st ulong hdr view ulong 12 pay view ulong * nw ulong to long
+  li = rx_cx_find_link use_st st
+  if lt li 0
+    ret RXCX_ERR_NOT_FOUND
+  end
+  lb = mul ulong li 8
+  rc = cx_append_as get rxcx_link lb get rxcx_link add lb 2 hdr pay nw
+  if ne rc CX_OK
+    rx_cx_inc_err lb
+    ret RXCX_ERR_FULL
+  end
+  ret long get cx_meta mul get rxcx_link lb 16
+end
+
+fn rx_cx_promote_in use_st ulong st ulong cand ulong evid ulong to long
+  li = rx_cx_find_link use_st st
+  if lt li 0
+    ret RXCX_ERR_NOT_FOUND
+  end
+  lb = mul ulong li 8
+  lst = get rxcx_link lb
+  tok = get rxcx_link add lb 2
+  nt = add get cx_meta mul lst 16 1
+  rc = cx_promote lst tok cand evid nt
+  if ne rc CX_OK
+    ret RXCX_ERR_ARG
+  end
+  ret long get cx_meta mul lst 16
+end
+
+fn rx_cx_next_t_in use_st ulong st ulong to ulong
+  li = rx_cx_find_link use_st st
+  if lt li 0
+    ret 0
+  end
+  lst = get rxcx_link mul ulong li 8
+  ret add get cx_meta mul lst 16 1
+end
+
+fn rx_cx_recall_result st ulong obj_slot ulong to ulong
+  if ge obj_slot RXCX_MAX_OBJECTS
+    ret 0
+  end
+  flt = new ulong 4 0
+  put flt 0 CX_EXECUTION
+  put flt 1 CX_K_EXEC_COMMIT
+  put flt 2 0
+  put flt 3 1
+  ret cx_latest st add obj_slot 1 sub CX_U64_MAX 1 flt
+end
