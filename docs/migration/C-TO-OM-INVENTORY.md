@@ -10,6 +10,8 @@ Updated 2026-11-22 with the OM waves 29 to 36 change: the 48 CSV rows of C/H pat
 
 Updated 2026-11-23 with Wave 37 (EXP-001 lane A): cut over `mk/turing_exp001_a.mk` (`turing-cal-candidates` and `power-simulation`) to pure seeded OM-2 (`tools/turing_cal_dev.om`, `tools/turing_cal_candidates.om`, `calibration/scripts/power_simulation.om`), retiring and deleting 5 C/H files (`src/turing/ty_profile.c`, `src/turing/ty_record.c`, `src/turing/ty_record.h`, `tools/turing_cal_candidates.c`, `tools/turing_cal_dev.h`; `calibration/scripts/power_simulation.c` stays on disk as `migration_reference` solely because frozen EXP-001/EXP-001R `candidate_manifest.json` pins its SHA-256).
 
+Updated 2026-11-24 with Wave 38 (GEN-3 validator & corpus oracle): cut over `mk/gen-abstract.mk` (`recheck` and `oracle`) to pure seeded OM-2 (`tools/gen/abstract/recheck.om` with `seed/ng/sha256.om`, and `tests/one_layer/generalization/corpus/oracle.om`) and added `test-gen-abstract-parity` (byte-exact vs C across fixtures, all 58 committed records, 35 format/schema/receipt mutants, all 49 corpus tasks, `--bound`, and usage/error cases). `tools/gen/abstract/recheck.c` and `tests/one_layer/generalization/corpus/oracle.c` remain on disk because committed GEN receipts (`tests/one_layer/generalization/records/receipts/*`) and `mk/gen-retrieval.mk` pin their SHA-256 digests.
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage
