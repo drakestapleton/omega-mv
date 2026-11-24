@@ -14,14 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The OM-2 est_replay against the C est_replay (est_replay.c -DEST_REPLAY_MAIN) on
-# inputs with no size cap in the C: more than 8192 steps, more than 16384 lines and
-# 2 MiB, lines longer than 8 KiB with the thermal key past byte 8192, a file without a
-# final newline, and SHA256SUMS files over 64 KiB, with a line fgets splits at 1023
-# bytes, and with an embedded NUL. stdout, stderr and the exit code must be identical.
-#   tools/estimation/test_est_replay_parity.sh <C est_replay> <OM est_replay> <workdir>
+# The OM-2 est_replay against the C est_replay reference goldens (generated from
+# est_replay.c -DEST_REPLAY_MAIN at f744696dd) on inputs with no size cap: more
+# than 8192 steps, more than 16384 lines and 2 MiB, lines longer than 8 KiB with
+# the thermal key past byte 8192, a file without a final newline, and SHA256SUMS
+# files over 64 KiB, with a line fgets splits at 1023 bytes, and with an embedded
+# NUL. stdout SHA-256, normalized stderr SHA-256 and exit code must be identical.
+#   tools/estimation/test_est_replay_parity.sh <gold-file> <OM est_replay> <workdir>
 set -u
-C=${1:?C est_replay}
+GOLD=${1:?gold file}
 OM=${2:?OM est_replay}
 W=${3:?workdir}
 rm -rf "$W"; mkdir -p "$W"
@@ -50,7 +51,6 @@ mkcase() { mkdir -p "$W/$1"; echo "$W/$1/machine-state.ndjson"; }
 f=$(mkcase steps9000); gen "$f" 9000 0 0; echo "$(sum "$f")  machine-state.ndjson" > "$W/steps9000/SHA256SUMS"
 f=$(mkcase lines20000); gen "$f" 20000 1 120; echo "$(sum "$f")  machine-state.ndjson" > "$W/lines20000/SHA256SUMS"
 f=$(mkcase longkey); gen "$f" 120 4 9000 31; echo "$(sum "$f")  machine-state.ndjson" > "$W/longkey/SHA256SUMS"
-# a padded line is 63 + pad bytes: 8192 (the window) and 8193 (one past it, key across the edge)
 f=$(mkcase edgewin); gen "$f" 400 100 8129; echo "$(sum "$f")  machine-state.ndjson" > "$W/edgewin/SHA256SUMS"
 f=$(mkcase edgewin2); gen "$f" 400 100 8130; echo "$(sum "$f")  machine-state.ndjson" > "$W/edgewin2/SHA256SUMS"
 f=$(mkcase nonl); gen "$W/nonl.tmp" 9500 0 0; head -c -1 "$W/nonl.tmp" > "$f"; echo "$(sum "$f")  machine-state.ndjson" > "$W/nonl/SHA256SUMS"
@@ -73,22 +73,20 @@ f=$(mkcase sumsnull2); gen "$f" 300 0 0
 [ "$(awk 'length == 8193' "$W/edgewin2/machine-state.ndjson" | wc -l)" -gt 0 ] || ok=0
 if [ $ok = 1 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL: a generated case is not past its former cap" >&2; fi
 
-one() {
-    "$C" "$@" > "$W/c.out" 2> "$W/c.err"; crc=$?
-    "$OM" "$@" > "$W/o.out" 2> "$W/o.err"; orc=$?
-    if [ $crc = $orc ] && cmp -s "$W/c.out" "$W/o.out" && cmp -s "$W/c.err" "$W/o.err"; then
+while IFS="$(printf '\t')" read -r c m q r crc cout cerr; do
+    case "$c" in ''|'#'*) continue ;; esac
+    "$OM" "$m" "$q" "$r" "$W/$c/machine-state.ndjson" > "$W/o.out" 2> "$W/o.err"
+    orc=$?
+    sed "s|$W|<W>|g" "$W/o.err" > "$W/o.err.norm"
+    oout=$(sum "$W/o.out")
+    oerr=$(sum "$W/o.err.norm")
+    if [ "$orc" = "$crc" ] && [ "$oout" = "$cout" ] && [ "$oerr" = "$cerr" ]; then
         pass=$((pass + 1))
     else
-        fail=$((fail + 1)); echo "FAIL: est_replay $* (exit C $crc, OM $orc)" >&2; head -c 300 "$W/o.err" >&2
+        fail=$((fail + 1)); echo "FAIL: est_replay $m $q $r $c (exit C $crc OM $orc, out $oout vs $cout, err $oerr vs $cerr)" >&2
     fi
-}
-steps=0
-for c in steps9000 lines20000 longkey edgewin edgewin2 nonl bigsums sumschunk sumsnul sumsnull2; do
-    for m in 0 1 2; do
-        one $m 1 100 "$W/$c/machine-state.ndjson"
-        one $m 0.001 1e-12 "$W/$c/machine-state.ndjson"
-    done
-done
+done < "$GOLD"
+
 # the 9000-step case replays every step (C output above 8192 steps)
 n=$("$OM" 0 1 100 "$W/steps9000/machine-state.ndjson" 2>/dev/null | wc -l)
 if [ "$n" -gt 8192 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL: steps9000 streamed $n steps" >&2; fi
