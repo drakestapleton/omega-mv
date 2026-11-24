@@ -1,0 +1,129 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_coherent_unit.om -- Pure seeded OM-2 unit test for rx_coherent.om.
+
+global ch_checks ulong 1
+global ch_fail ulong 1
+
+text ch_msg_pass "RX_COHERENT_OM: PASS\n"
+text ch_msg_fail "RX_COHERENT_OM: FAIL\n"
+
+fn ch_chk cond bool to void
+  put ch_checks 0 add get ch_checks 0 1
+  if not cond
+    put ch_fail 0 add get ch_fail 0 1
+  end
+end
+
+fn setup_obj id ulong v0 ulong v1 ulong cap_id ulong cap_gen ulong to void
+  ob = mul id 12
+  put coh_obj ob 1
+  put coh_obj add ob 1 1
+  put coh_obj add ob 6 1
+  put coh_obj add ob 7 cap_id
+  put coh_obj add ob 8 cap_gen
+  put coh_obj add ob 9 1
+  fb = mul id COH_MAX_FIELDS
+  put coh_fld fb v0
+  put coh_fld add fb 1 v1
+end
+
+fn test_offsets_and_physical_windows to void
+  ch_chk eq rx_world_off_c2g 256
+  ch_chk eq rx_world_off_g2c 131520
+  ch_chk eq rx_world_off_fault 262784
+  ch_chk eq rx_world_off_object_table 262848
+  ch_chk eq rx_world_physical_table_offset 262912
+  ch_chk eq rx_world_off_heartbeat 287552
+  ch_chk eq rx_coherent_format COH_OK
+  setup_obj 1 100 23 11 42
+  ch_chk eq rx_world_attach_physical 1 1 COH_OK
+  note Double attach rejected
+  ch_chk eq rx_world_attach_physical 1 1 COH_ERR_EXISTS
+  w0 = get coh_obj 15
+  note Relocate moves to a different window
+  ch_chk eq rx_world_relocate_physical 1 1 COH_OK
+  w1 = get coh_obj 15
+  ch_chk ne w0 w1
+  note Place at explicit window 5
+  off5 = coh_window_offset 5
+  ch_chk eq rx_world_place_physical 1 1 off5 COH_OBJ_WINDOW COH_OK
+  ch_chk eq get coh_obj 15 5
+  note Misaligned offset rejected
+  ch_chk eq rx_world_place_physical 1 1 add off5 7 COH_OBJ_WINDOW COH_ERR_BOUNDS
+  note Detach clears placement
+  ch_chk eq rx_world_detach_physical 1 1 COH_OK
+  ch_chk eq get coh_obj 14 0
+  ch_chk eq rx_world_detach_physical 1 1 COH_ERR_UNPLACED
+end
+
+fn test_publish_and_tamper_detection to void
+  ch_chk eq rx_coherent_format COH_OK
+  setup_obj 2 77 88 5 99
+  ch_chk eq rx_world_attach_physical 2 1 COH_OK
+  rx_coherent_publish 2 1
+  ch_chk eq get coh_w 11 1
+  d = new uchar 128 0
+  ch_chk eq rx_world_take_publication d COH_OK
+  ch_chk eq get coh_last_fault 0 COH_FAULT_NONE
+  note Flip a bit in sealed descriptor -> BAD_CHECKSUM -> COH_ERR_TORN
+  put d 64 xor get d 64 1
+  ch_chk eq rx_world_check_descriptor d 0 COH_ERR_TORN
+  ch_chk eq get coh_last_fault 0 COH_FAULT_BAD_CHECKSUM
+  note Wrong sequence -> BAD_SEQ -> COH_ERR_REPLAY
+  put d 64 xor get d 64 1
+  ch_chk eq rx_world_check_descriptor d 99 COH_ERR_REPLAY
+  ch_chk eq get coh_last_fault 0 COH_FAULT_BAD_SEQ
+  note Revoked capability -> COH_FAULT_CAP -> COH_ERR_AUTHORITY
+  put coh_obj 33 0
+  ch_chk eq rx_world_check_descriptor d 0 COH_ERR_AUTHORITY
+  ch_chk eq get coh_last_fault 0 COH_FAULT_CAP
+end
+
+fn test_resident_seat_add_and_shutdown to void
+  ch_chk eq rx_coherent_format COH_OK
+  ch_chk eq rx_world_enable_resident COH_OK
+  setup_obj 1 19 23 10 7
+  setup_obj 2 0 0 11 8
+  ch_chk eq rx_world_attach_physical 1 1 COH_OK
+  ch_chk eq rx_world_attach_physical 2 1 COH_OK
+  ch_chk eq rx_resident_post_claim 1 2 1 COH_OK
+  ch_chk eq rx_resident_seat_step 1
+  note Output object 2 field[0] = 19 + 23 = 42
+  ch_chk eq get coh_fld mul 2 COH_MAX_FIELDS 42
+  res = new uchar 128 0
+  ch_chk eq rx_resident_take_result res COH_OK
+  ch_chk eq coh_get_u16 res 6 COH_RING_PUBLISH
+  note Shutdown notice stops resident seat
+  ch_chk eq rx_resident_shutdown COH_OK
+  ch_chk eq rx_resident_seat_step 2
+  ch_chk eq get coh_w 4 1
+end
+
+fn ch_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len ch_msg_pass
+    for i ulong n bound 64
+      put buf i get ch_msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len ch_msg_fail
+  for i ulong n bound 64
+    put buf i get ch_msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  test_offsets_and_physical_windows
+  test_publish_and_tamper_detection
+  test_resident_seat_add_and_shutdown
+  if eq get ch_fail 0 0
+    ch_put_msg 1
+    ret 0
+  end
+  ch_put_msg 0
+  ret 1
+end

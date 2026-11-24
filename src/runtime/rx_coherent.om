@@ -1,0 +1,826 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_coherent.om -- Pure seeded OM-2 port of src/runtime/rx_coherent.c
+note Coherent shared-world ABI (OMEGA_SHARED_WORLD_V1): exact byte layout offsets,
+note Castagnoli CRC32C descriptor sealing & hostile-input verification, c2g/g2c rings,
+note physical window attach/detach/place/relocate, and resident seat claim/step/result.
+
+const COH_MAGIC ulong 0x31575330
+const COH_ABI_VER ulong 1
+const COH_CACHELINE ulong 64
+const COH_CRC32C_POLY ulong 0x82f63b78
+const COH_U32_MASK ulong 0xffffffff
+
+const COH_MAX_OBJECTS ulong 64
+const COH_PHYS_WINDOWS ulong 65
+const COH_MAX_FIELDS ulong 8
+const COH_OBJ_WINDOW ulong 64
+const COH_RING_CAP ulong 32
+const COH_RING_MASK ulong 31
+const COH_DESC_BYTES ulong 128
+
+const COH_FLAG_OBJ_REF ulong 2
+const COH_FLAG_CHECKSUM ulong 4
+
+const COH_OBJ_REVOKED ulong 0
+const COH_OBJ_ACTIVE ulong 1
+
+const COH_RING_KEEPALIVE ulong 3
+const COH_RING_WAKE ulong 16
+const COH_RING_CLAIM ulong 17
+const COH_RING_PUBLISH ulong 18
+const COH_RING_COMPLETE ulong 19
+const COH_RING_FAULT ulong 20
+const COH_RING_SHUTDOWN ulong 21
+
+const COH_FAULT_NONE ulong 0
+const COH_FAULT_BAD_MAGIC ulong 1
+const COH_FAULT_BAD_VERSION ulong 2
+const COH_FAULT_STALE_EPOCH ulong 3
+const COH_FAULT_STALE_GEN ulong 4
+const COH_FAULT_BAD_SEQ ulong 5
+const COH_FAULT_BAD_MSGTYPE ulong 6
+const COH_FAULT_OOB_OBJECT ulong 7
+const COH_FAULT_BAD_CHECKSUM ulong 8
+const COH_FAULT_BOUNDS ulong 257
+const COH_FAULT_CAP ulong 258
+const COH_FAULT_TORN_PUB ulong 259
+const COH_FAULT_OVERLAP ulong 260
+const COH_FAULT_DIVERGED ulong 261
+const COH_FAULT_UNPLACED ulong 262
+
+const COH_CAP_GEN_HI_A ulong 40
+const COH_CAP_GEN_HI_B ulong 44
+const COH_CAP_PAYLOAD ulong 48
+
+const COH_OK long 0
+const COH_ERR_ARG long -1
+const COH_ERR_FULL long -2
+const COH_ERR_STALE_GEN long -3
+const COH_ERR_AUTHORITY long -4
+const COH_ERR_NOT_FOUND long -6
+const COH_ERR_BOUNDS long -20
+const COH_ERR_REPLAY long -21
+const COH_ERR_TORN long -22
+const COH_ERR_BAD_DESC long -23
+const COH_ERR_UNPLACED long -24
+const COH_ERR_EXISTS long -25
+
+note World meta:
+note [0]=formatted, [1]=world_epoch, [2]=resident_enabled, [3]=seat_generation,
+note [4]=resident_stopped, [5]=c2g_head, [6]=c2g_tail, [7]=g2c_head, [8]=g2c_tail,
+note [9]=fault_code, [10]=fault_seq, [11]=desc_published, [12]=desc_rejected,
+note [13]=resident_claims, [14]=gpu_results_taken, [15]=window_move_bytes
+global coh_w ulong 16
+
+note Canonical objects: 12 ulongs per object (64 * 12 = 768)
+note [0]=live, [1]=gen, [2]=placed, [3]=window, [4]=region_offset, [5]=size_bytes,
+note [6]=version, [7]=cap_id, [8]=cap_gen, [9]=cap_valid, [10]=resource, [11]=0
+global coh_obj ulong 768
+note Canonical object fields: 64 * 8 = 512 ulongs
+global coh_fld ulong 512
+
+note Projected object table (mirrors OmegaSharedWorldObject): 6 ulongs per entry (64 * 6 = 384)
+note [0]=object_id, [1]=generation, [2]=state, [3]=permissions, [4]=region_offset, [5]=size_bytes
+global coh_proj ulong 384
+
+note Projected payload windows: 65 * 64 = 4160 bytes
+global coh_win uchar 4160
+
+note c2g and g2c rings: 32 * 128 = 4096 bytes each
+global coh_c2g uchar 4096
+global coh_g2c uchar 4096
+
+note Scratch descriptors (128 bytes each)
+global coh_desc_a uchar 128
+global coh_desc_b uchar 128
+global coh_crc_buf uchar 128
+global coh_last_fault ulong 1
+
+note Exact ABI layout offsets matching src/runtime/rx_coherent.c (256-object full layout)
+fn rx_world_off_c2g to ulong
+  ret 256
+end
+
+fn rx_world_off_g2c to ulong
+  ret 131520
+end
+
+fn rx_world_off_fault to ulong
+  ret 262784
+end
+
+fn rx_world_off_object_table to ulong
+  ret 262848
+end
+
+fn rx_world_physical_table_offset to ulong
+  ret 262912
+end
+
+fn rx_world_off_payload to ulong
+  ret 271104
+end
+
+fn rx_world_off_heartbeat to ulong
+  ret 287552
+end
+
+fn coh_window_offset win ulong to ulong
+  ret add rx_world_off_payload mul win COH_OBJ_WINDOW
+end
+
+fn coh_put_u16 buf edit uchar * off ulong v ulong to void
+  put buf off uchar and v 255
+  put buf add off 1 uchar and shr v 8 255
+end
+
+fn coh_put_u32 buf edit uchar * off ulong v ulong to void
+  put buf off uchar and v 255
+  put buf add off 1 uchar and shr v 8 255
+  put buf add off 2 uchar and shr v 16 255
+  put buf add off 3 uchar and shr v 24 255
+end
+
+fn coh_put_u64 buf edit uchar * off ulong v ulong to void
+  coh_put_u32 buf off and v COH_U32_MASK
+  coh_put_u32 buf add off 4 shr v 32
+end
+
+fn coh_get_u16 buf view uchar * off ulong to ulong
+  b0 = ulong get buf off
+  b1 = ulong get buf add off 1
+  ret or b0 shl b1 8
+end
+
+fn coh_get_u32 buf view uchar * off ulong to ulong
+  b0 = ulong get buf off
+  b1 = ulong get buf add off 1
+  b2 = ulong get buf add off 2
+  b3 = ulong get buf add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn coh_get_u64 buf view uchar * off ulong to ulong
+  lo = coh_get_u32 buf off
+  hi = coh_get_u32 buf add off 4
+  ret or lo shl hi 32
+end
+
+fn coh_crc32c n ulong to ulong
+  c = COH_U32_MASK
+  for i ulong n bound 128
+    b = ulong get coh_crc_buf i
+    c = xor c b
+    for bit ulong 8
+      low = and c 1
+      c = shr c 1
+      if ne low 0
+        c = xor c COH_CRC32C_POLY
+      end
+    end
+  end
+  ret and xor c COH_U32_MASK COH_U32_MASK
+end
+
+fn coh_desc_checksum d view uchar 128 to ulong
+  for i ulong 60
+    put coh_crc_buf i get d i
+  end
+  for i ulong 64
+    put coh_crc_buf add 60 i get d add 64 i
+  end
+  ret coh_crc32c 124
+end
+
+fn rx_world_seal_descriptor d edit uchar 128 to void
+  coh_put_u32 d 0 COH_MAGIC
+  coh_put_u16 d 4 COH_ABI_VER
+  fl = or coh_get_u16 d 44 or COH_FLAG_CHECKSUM COH_FLAG_OBJ_REF
+  coh_put_u16 d 44 fl
+  coh_put_u32 d 60 0
+  cs = coh_desc_checksum d
+  coh_put_u32 d 60 cs
+end
+
+fn coh_ring_msg t ulong to ulong
+  if eq t COH_RING_KEEPALIVE
+    ret 1
+  end
+  if ge t COH_RING_WAKE
+    if le t COH_RING_SHUTDOWN
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn coh_fault_err fault ulong to long
+  if or eq fault COH_FAULT_STALE_GEN eq fault COH_FAULT_DIVERGED
+    ret COH_ERR_STALE_GEN
+  end
+  if eq fault COH_FAULT_BAD_SEQ
+    ret COH_ERR_REPLAY
+  end
+  if or eq fault COH_FAULT_BAD_CHECKSUM eq fault COH_FAULT_TORN_PUB
+    ret COH_ERR_TORN
+  end
+  if or eq fault COH_FAULT_OOB_OBJECT or eq fault COH_FAULT_BOUNDS eq fault COH_FAULT_OVERLAP
+    ret COH_ERR_BOUNDS
+  end
+  if eq fault COH_FAULT_CAP
+    ret COH_ERR_AUTHORITY
+  end
+  if eq fault COH_FAULT_UNPLACED
+    ret COH_ERR_UNPLACED
+  end
+  ret COH_ERR_BAD_DESC
+end
+
+fn coh_put_win_u64 off ulong v ulong to void
+  for b ulong 8
+    put coh_win add off b uchar and shr v mul b 8 255
+  end
+end
+
+fn rx_coherent_project id ulong to void
+  if ge id COH_MAX_OBJECTS
+    ret
+  end
+  ob = mul id 12
+  pb = mul id 6
+  put coh_proj pb id
+  put coh_proj add pb 1 get coh_obj add ob 1
+  put coh_proj add pb 3 0
+  if eq get coh_obj add ob 2 0
+    put coh_proj add pb 2 COH_OBJ_REVOKED
+    put coh_proj add pb 4 0
+    put coh_proj add pb 5 0
+    ret
+  end
+  if ne get coh_obj ob 0
+    put coh_proj add pb 2 COH_OBJ_ACTIVE
+  else
+    put coh_proj add pb 2 COH_OBJ_REVOKED
+  end
+  put coh_proj add pb 4 get coh_obj add ob 4
+  put coh_proj add pb 5 get coh_obj add ob 5
+  win = get coh_obj add ob 3
+  wb = mul win COH_OBJ_WINDOW
+  fb = mul id COH_MAX_FIELDS
+  for f ulong COH_MAX_FIELDS
+    coh_put_win_u64 add wb mul f 8 get coh_fld add fb f
+  end
+end
+
+fn rx_coherent_format to long
+  for i ulong 16
+    put coh_w i 0
+  end
+  for i ulong 768
+    put coh_obj i 0
+  end
+  for i ulong 512
+    put coh_fld i 0
+  end
+  for i ulong 4160
+    put coh_win i 0
+  end
+  put coh_w 0 1
+  put coh_w 1 1
+  for i ulong COH_MAX_OBJECTS
+    put coh_obj add mul i 12 1 1
+    rx_coherent_project i
+  end
+  ret COH_OK
+end
+
+fn coh_window_busy win ulong except_id ulong to ulong
+  for i ulong COH_MAX_OBJECTS
+    if ne i except_id
+      ob = mul i 12
+      if ne get coh_obj add ob 2 0
+        if eq get coh_obj add ob 3 win
+          ret 1
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn coh_adopt_window id ulong win ulong to void
+  ob = mul id 12
+  put coh_obj add ob 2 1
+  put coh_obj add ob 3 win
+  put coh_obj add ob 4 coh_window_offset win
+  put coh_obj add ob 5 COH_OBJ_WINDOW
+  rx_coherent_project id
+end
+
+fn rx_world_attach_physical id ulong gen ulong to long
+  if or eq get coh_w 0 0 ge id COH_MAX_OBJECTS
+    ret COH_ERR_ARG
+  end
+  ob = mul id 12
+  if or eq get coh_obj ob 0 ne get coh_obj add ob 1 gen
+    ret COH_ERR_STALE_GEN
+  end
+  if ne get coh_obj add ob 2 0
+    ret COH_ERR_EXISTS
+  end
+  for w ulong COH_PHYS_WINDOWS
+    if eq coh_window_busy w id 0
+      coh_adopt_window id w
+      ret COH_OK
+    end
+  end
+  ret COH_ERR_FULL
+end
+
+fn rx_world_detach_physical id ulong gen ulong to long
+  if or eq get coh_w 0 0 ge id COH_MAX_OBJECTS
+    ret COH_ERR_ARG
+  end
+  ob = mul id 12
+  if or eq get coh_obj ob 0 ne get coh_obj add ob 1 gen
+    ret COH_ERR_STALE_GEN
+  end
+  if eq get coh_obj add ob 2 0
+    ret COH_ERR_UNPLACED
+  end
+  put coh_obj add ob 2 0
+  put coh_obj add ob 3 0
+  put coh_obj add ob 4 0
+  put coh_obj add ob 5 0
+  rx_coherent_project id
+  ret COH_OK
+end
+
+fn rx_world_place_physical id ulong gen ulong offset ulong length ulong to long
+  if or eq get coh_w 0 0 ge id COH_MAX_OBJECTS
+    ret COH_ERR_ARG
+  end
+  ob = mul id 12
+  if or eq get coh_obj ob 0 ne get coh_obj add ob 1 gen
+    ret COH_ERR_STALE_GEN
+  end
+  if ne length COH_OBJ_WINDOW
+    ret COH_ERR_BOUNDS
+  end
+  pay = rx_world_off_payload
+  lim = add pay mul COH_PHYS_WINDOWS COH_OBJ_WINDOW
+  if or lt offset pay gt add offset length lim
+    ret COH_ERR_BOUNDS
+  end
+  rel = sub offset pay
+  if ne rem rel COH_OBJ_WINDOW 0
+    ret COH_ERR_BOUNDS
+  end
+  win = div rel COH_OBJ_WINDOW
+  if ne coh_window_busy win id 0
+    ret COH_ERR_EXISTS
+  end
+  if ne get coh_obj add ob 2 0
+    if ne get coh_obj add ob 3 win
+      put coh_w 15 add get coh_w 15 mul 2 COH_OBJ_WINDOW
+    end
+  end
+  coh_adopt_window id win
+  ret COH_OK
+end
+
+fn rx_world_relocate_physical id ulong gen ulong to long
+  if or eq get coh_w 0 0 ge id COH_MAX_OBJECTS
+    ret COH_ERR_ARG
+  end
+  ob = mul id 12
+  if or eq get coh_obj ob 0 ne get coh_obj add ob 1 gen
+    ret COH_ERR_STALE_GEN
+  end
+  if eq get coh_obj add ob 2 0
+    ret COH_ERR_UNPLACED
+  end
+  cur_w = get coh_obj add ob 3
+  for w ulong COH_PHYS_WINDOWS
+    if ne w cur_w
+      if eq coh_window_busy w id 0
+        coh_adopt_window id w
+        put coh_w 15 add get coh_w 15 mul 2 COH_OBJ_WINDOW
+        ret COH_OK
+      end
+    end
+  end
+  ret COH_ERR_FULL
+end
+
+fn coh_check_header d view uchar 128 exp_seq ulong to ulong
+  if ne coh_get_u32 d 0 COH_MAGIC
+    ret COH_FAULT_BAD_MAGIC
+  end
+  if ne coh_get_u16 d 4 COH_ABI_VER
+    ret COH_FAULT_BAD_VERSION
+  end
+  if ne coh_get_u32 d 16 get coh_w 1
+    ret COH_FAULT_STALE_EPOCH
+  end
+  if ne coh_get_u64 d 8 exp_seq
+    ret COH_FAULT_BAD_SEQ
+  end
+  if eq coh_ring_msg coh_get_u16 d 6 0
+    ret COH_FAULT_BAD_MSGTYPE
+  end
+  if eq and coh_get_u16 d 44 COH_FLAG_CHECKSUM 0
+    ret COH_FAULT_BAD_CHECKSUM
+  end
+  want = coh_get_u32 d 60
+  calc = coh_desc_checksum d
+  if ne calc want
+    ret COH_FAULT_BAD_CHECKSUM
+  end
+  ret COH_FAULT_NONE
+end
+
+fn coh_check_win_fields id ulong to ulong
+  ob = mul id 12
+  win = get coh_obj add ob 3
+  wb = mul win COH_OBJ_WINDOW
+  fb = mul id COH_MAX_FIELDS
+  for f ulong COH_MAX_FIELDS
+    off = add wb mul f 8
+    v = ulong 0
+    for b ulong 8
+      v = or v shl ulong get coh_win add off b mul b 8
+    end
+    if ne v get coh_fld add fb f
+      ret COH_FAULT_TORN_PUB
+    end
+  end
+  ret COH_FAULT_NONE
+end
+
+fn coh_check_obj d view uchar 128 to ulong
+  id = coh_get_u32 d 24
+  if ge id COH_MAX_OBJECTS
+    ret COH_FAULT_OOB_OBJECT
+  end
+  ob = mul id 12
+  pb = mul id 6
+  gen = coh_get_u32 d 28
+  if or eq gen 0 ne gen get coh_obj add ob 1
+    ret COH_FAULT_STALE_GEN
+  end
+  if or ne get coh_proj pb id ne get coh_proj add pb 1 get coh_obj add ob 1
+    ret COH_FAULT_DIVERGED
+  end
+  if eq get coh_obj add ob 2 0
+    if or eq get coh_proj add pb 2 COH_OBJ_ACTIVE ne get coh_proj add pb 5 0
+      ret COH_FAULT_DIVERGED
+    end
+    ret COH_FAULT_UNPLACED
+  end
+  if or ne get coh_proj add pb 4 get coh_obj add ob 4 ne get coh_proj add pb 5 get coh_obj add ob 5
+    ret COH_FAULT_DIVERGED
+  end
+  if eq get coh_obj ob 0
+    if ne coh_get_u16 d 6 COH_RING_FAULT
+      ret COH_FAULT_OOB_OBJECT
+    end
+  end
+  olen = coh_get_u32 d 36
+  ooff = coh_get_u32 d 32
+  sz = get coh_obj add ob 5
+  if or eq olen 0 or gt ooff sz gt olen sub sz ooff
+    ret COH_FAULT_BOUNDS
+  end
+  if ne get coh_obj ob 0
+    fc = coh_check_win_fields id
+    if ne fc COH_FAULT_NONE
+      ret fc
+    end
+  end
+  mt = coh_get_u16 d 6
+  if eq mt COH_RING_PUBLISH
+    if lt coh_get_u32 d 40 24
+      ret COH_FAULT_TORN_PUB
+    end
+    if ne coh_get_u64 d 72 get coh_obj add ob 6
+      ret COH_FAULT_TORN_PUB
+    end
+  end
+  if lt coh_get_u32 d 40 COH_CAP_PAYLOAD
+    ret COH_FAULT_CAP
+  end
+  cid = coh_get_u32 d 64
+  cg_lo = coh_get_u32 d 68
+  cg_hi = coh_get_u32 d add 64 COH_CAP_GEN_HI_A
+  cgen = or cg_lo shl cg_hi 32
+  if eq get coh_obj add ob 9 0
+    ret COH_FAULT_CAP
+  end
+  if ne cid get coh_obj add ob 7
+    ret COH_FAULT_CAP
+  end
+  if ne cgen get coh_obj add ob 8
+    ret COH_FAULT_CAP
+  end
+  ret COH_FAULT_NONE
+end
+
+fn rx_world_check_descriptor d view uchar 128 exp_seq ulong to long
+  fault = coh_check_header d exp_seq
+  if eq fault COH_FAULT_NONE
+    fault = coh_check_obj d
+  end
+  put coh_last_fault 0 fault
+  if eq fault COH_FAULT_NONE
+    ret COH_OK
+  end
+  ret coh_fault_err fault
+end
+
+fn coh_ring_write_c2g slot ulong d view uchar 128 to void
+  rb = mul and slot COH_RING_MASK COH_DESC_BYTES
+  for i ulong COH_DESC_BYTES
+    put coh_c2g add rb i get d i
+  end
+end
+
+fn coh_ring_write_g2c slot ulong d view uchar 128 to void
+  rb = mul and slot COH_RING_MASK COH_DESC_BYTES
+  for i ulong COH_DESC_BYTES
+    put coh_g2c add rb i get d i
+  end
+end
+
+fn coh_ring_read_c2g slot ulong dst edit uchar 128 to void
+  rb = mul and slot COH_RING_MASK COH_DESC_BYTES
+  for i ulong COH_DESC_BYTES
+    put dst i get coh_c2g add rb i
+  end
+end
+
+fn coh_ring_read_g2c slot ulong dst edit uchar 128 to void
+  rb = mul and slot COH_RING_MASK COH_DESC_BYTES
+  for i ulong COH_DESC_BYTES
+    put dst i get coh_g2c add rb i
+  end
+end
+
+fn rx_coherent_publish id ulong crumb_id ulong to void
+  if or eq get coh_w 0 0 ge id COH_MAX_OBJECTS
+    ret
+  end
+  ob = mul id 12
+  if eq get coh_obj add ob 2 0
+    ret
+  end
+  rx_coherent_project id
+  h = get coh_w 5
+  t = get coh_w 6
+  if ge sub t h COH_RING_CAP
+    put coh_w 12 add get coh_w 12 1
+    ret
+  end
+  d = new uchar 128 0
+  coh_put_u16 d 6 COH_RING_PUBLISH
+  coh_put_u64 d 8 t
+  coh_put_u32 d 16 get coh_w 1
+  coh_put_u32 d 24 id
+  coh_put_u32 d 28 get coh_obj add ob 1
+  coh_put_u32 d 32 0
+  coh_put_u32 d 36 get coh_obj add ob 5
+  coh_put_u32 d 40 COH_CAP_PAYLOAD
+  coh_put_u32 d 64 get coh_obj add ob 7
+  cg = get coh_obj add ob 8
+  coh_put_u32 d 68 and cg COH_U32_MASK
+  coh_put_u32 d add 64 COH_CAP_GEN_HI_A shr cg 32
+  coh_put_u64 d 72 get coh_obj add ob 6
+  coh_put_u64 d 80 crumb_id
+  rx_world_seal_descriptor d
+  coh_ring_write_c2g t d
+  put coh_w 6 add t 1
+  put coh_w 11 add get coh_w 11 1
+end
+
+fn rx_world_take_publication dst edit uchar 128 to long
+  h = get coh_w 5
+  t = get coh_w 6
+  if ge h t
+    ret COH_ERR_NOT_FOUND
+  end
+  coh_ring_read_c2g h dst
+  rc = rx_world_check_descriptor dst h
+  put coh_w 5 add h 1
+  if ne rc COH_OK
+    put coh_w 9 get coh_last_fault 0
+    put coh_w 10 h
+    put coh_w 12 add get coh_w 12 1
+  end
+  ret rc
+end
+
+fn rx_world_enable_resident to long
+  put coh_w 2 1
+  if eq get coh_w 3 0
+    put coh_w 3 1
+  end
+  ret COH_OK
+end
+
+fn rx_resident_post_claim in_id ulong out_id ulong parent ulong to long
+  if ge in_id COH_MAX_OBJECTS
+    ret COH_ERR_ARG
+  end
+  if ge out_id COH_MAX_OBJECTS
+    ret COH_ERR_ARG
+  end
+  if eq in_id out_id
+    ret COH_ERR_ARG
+  end
+  oa = mul in_id 12
+  ob = mul out_id 12
+  if eq get coh_obj oa 0
+    ret COH_ERR_UNPLACED
+  end
+  if eq get coh_obj add oa 2 0
+    ret COH_ERR_UNPLACED
+  end
+  if eq get coh_obj ob 0
+    ret COH_ERR_UNPLACED
+  end
+  if eq get coh_obj add ob 2 0
+    ret COH_ERR_UNPLACED
+  end
+  h = get coh_w 5
+  t = get coh_w 6
+  if ge sub t h COH_RING_CAP
+    ret COH_ERR_FULL
+  end
+  d = new uchar 128 0
+  coh_put_u16 d 6 COH_RING_CLAIM
+  coh_put_u64 d 8 t
+  coh_put_u32 d 16 get coh_w 1
+  coh_put_u32 d 20 get coh_w 3
+  coh_put_u32 d 24 in_id
+  coh_put_u32 d 28 get coh_obj add oa 1
+  coh_put_u32 d 36 get coh_obj add oa 5
+  coh_put_u32 d 40 COH_CAP_PAYLOAD
+  coh_put_u32 d 52 and t COH_U32_MASK
+  coh_put_u32 d 64 get coh_obj add oa 7
+  cga = get coh_obj add oa 8
+  coh_put_u32 d 68 and cga COH_U32_MASK
+  coh_put_u64 d 72 get coh_obj add oa 6
+  coh_put_u64 d 80 parent
+  coh_put_u32 d 88 out_id
+  coh_put_u32 d 92 get coh_obj add ob 1
+  coh_put_u32 d 96 get coh_obj add ob 7
+  cgb = get coh_obj add ob 8
+  coh_put_u32 d 100 and cgb COH_U32_MASK
+  coh_put_u32 d add 64 COH_CAP_GEN_HI_A shr cga 32
+  coh_put_u32 d add 64 COH_CAP_GEN_HI_B shr cgb 32
+  rx_world_seal_descriptor d
+  coh_ring_write_c2g t d
+  put coh_w 6 add t 1
+  put coh_w 13 add get coh_w 13 1
+  ret COH_OK
+end
+
+fn coh_apply_add in_id ulong out_id ulong to void
+  wa = mul get coh_obj add mul in_id 12 3 COH_OBJ_WINDOW
+  wb = mul get coh_obj add mul out_id 12 3 COH_OBJ_WINDOW
+  v0 = ulong 0
+  v1 = ulong 0
+  for b ulong 4
+    v0 = or v0 shl ulong get coh_win add wa b mul b 8
+    v1 = or v1 shl ulong get coh_win add add wa 8 b mul b 8
+  end
+  sum = and add v0 v1 COH_U32_MASK
+  for b ulong 8
+    put coh_win add wb b uchar and shr sum mul b 8 255
+  end
+  put coh_fld mul out_id COH_MAX_FIELDS sum
+end
+
+fn coh_post_g2c msg ulong claim view uchar 128 to long
+  h = get coh_w 7
+  t = get coh_w 8
+  if ge sub t h COH_RING_CAP
+    ret COH_ERR_FULL
+  end
+  r = new uchar 128 0
+  for i ulong COH_DESC_BYTES
+    put r i get claim i
+  end
+  coh_put_u16 r 6 msg
+  coh_put_u64 r 8 t
+  coh_put_u32 r 16 get coh_w 1
+  coh_put_u32 r 52 and coh_get_u64 claim 8 COH_U32_MASK
+  rx_world_seal_descriptor r
+  coh_ring_write_g2c t r
+  put coh_w 8 add t 1
+  ret COH_OK
+end
+
+fn rx_resident_seat_step to long
+  h = get coh_w 5
+  t = get coh_w 6
+  if ge h t
+    ret 0
+  end
+  d = new uchar 128 0
+  coh_ring_read_c2g h d
+  mt = coh_get_u16 d 6
+  if eq mt COH_RING_SHUTDOWN
+    if eq coh_check_header d h COH_FAULT_NONE
+      put coh_w 5 add h 1
+      put coh_w 4 1
+      ret 2
+    end
+  end
+  if ne mt COH_RING_CLAIM
+    put coh_w 5 add h 1
+    ret 0
+  end
+  chk = rx_world_check_descriptor d h
+  if ne chk COH_OK
+    ign_f = coh_post_g2c COH_RING_FAULT d
+    put coh_w 5 add h 1
+    put coh_w 12 add get coh_w 12 1
+    ret chk
+  end
+  if ne coh_get_u32 d 20 get coh_w 3
+    ign_s = coh_post_g2c COH_RING_FAULT d
+    put coh_w 5 add h 1
+    put coh_w 12 add get coh_w 12 1
+    ret COH_ERR_STALE_GEN
+  end
+  in_id = coh_get_u32 d 24
+  out_id = coh_get_u32 d 88
+  out_gen = coh_get_u32 d 92
+  out_bad = ulong 0
+  if ge out_id COH_MAX_OBJECTS
+    out_bad = 1
+  end
+  if eq out_id in_id
+    out_bad = 1
+  end
+  if eq out_bad 0
+    ob = mul out_id 12
+    if eq get coh_obj ob 0
+      out_bad = 1
+    end
+    if eq get coh_obj add ob 2 0
+      out_bad = 1
+    end
+    if ne out_gen get coh_obj add ob 1
+      out_bad = 1
+    end
+  end
+  if ne out_bad 0
+    ign_o = coh_post_g2c COH_RING_FAULT d
+    put coh_w 5 add h 1
+    put coh_w 12 add get coh_w 12 1
+    ret COH_ERR_STALE_GEN
+  end
+  coh_apply_add in_id out_id
+  if ne coh_post_g2c COH_RING_PUBLISH d COH_OK
+    ret COH_ERR_FULL
+  end
+  put coh_w 5 add h 1
+  ret 1
+end
+
+fn rx_resident_take_result dst edit uchar 128 to long
+  h = get coh_w 7
+  t = get coh_w 8
+  if ge h t
+    ret COH_ERR_NOT_FOUND
+  end
+  coh_ring_read_g2c h dst
+  put coh_w 7 add h 1
+  put coh_w 14 add get coh_w 14 1
+  if ne coh_check_header dst h COH_FAULT_NONE
+    ret COH_ERR_TORN
+  end
+  ret COH_OK
+end
+
+fn rx_resident_shutdown to long
+  h = get coh_w 5
+  t = get coh_w 6
+  if ge sub t h COH_RING_CAP
+    ret COH_ERR_FULL
+  end
+  d = new uchar 128 0
+  coh_put_u16 d 6 COH_RING_SHUTDOWN
+  coh_put_u64 d 8 t
+  coh_put_u32 d 16 get coh_w 1
+  coh_put_u32 d 24 0
+  coh_put_u32 d 28 1
+  coh_put_u32 d 36 COH_OBJ_WINDOW
+  coh_put_u32 d 40 8
+  rx_world_seal_descriptor d
+  coh_ring_write_c2g t d
+  put coh_w 6 add t 1
+  ret COH_OK
+end

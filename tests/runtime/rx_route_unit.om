@@ -1,0 +1,171 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_route_unit.om -- Pure seeded OM-2 unit test for rx_route.om.
+
+global rt_checks ulong 1
+global rt_fail ulong 1
+
+text rt_msg_pass "RX_ROUTE_OM: PASS\n"
+text rt_msg_fail "RX_ROUTE_OM: FAIL\n"
+
+fn rt_chk cond bool to void
+  put rt_checks 0 add get rt_checks 0 1
+  if not cond
+    put rt_fail 0 add get rt_fail 0 1
+  end
+end
+
+fn setup_two_engines to void
+  rt_chk eq rx_route_create RT_OK
+  d = new ulong 9 0
+  note Engine 1: cheap small policy (op 0, CPU_P=1, approx, not verifiable)
+  put d 0 1
+  put d 1 2
+  put d 2 1
+  put d 3 1
+  put d 4 1024
+  put d 5 10
+  put d 6 4
+  put d 7 RT_PREC_APPROX
+  put d 8 0
+  rt_chk eq rx_route_register d 0 RT_OK
+  note Engine 2: expensive general reference (op 0, CPU_P=1, exact, not verifiable)
+  put d 0 2
+  put d 1 4
+  put d 2 1
+  put d 3 1
+  put d 4 8192
+  put d 5 100
+  put d 6 16
+  put d 7 RT_PREC_EXACT
+  put d 8 0
+  rt_chk eq rx_route_register d 1 RT_OK
+  note Duplicate engine id rejected
+  rt_chk eq rx_route_register d 0 RT_ERR_ARG
+end
+
+fn set_basic_req min_q ulong uncert ulong esc ulong to void
+  for i ulong 11
+    put rt_req_in i 0
+  end
+  put rt_req_in 0 0
+  put rt_req_in 1 min_q
+  put rt_req_in 2 uncert
+  put rt_req_in 3 512
+  put rt_req_in 4 4
+  put rt_req_in 5 2
+  put rt_req_in 6 RT_PREC_APPROX
+  put rt_req_in 7 100000
+  put rt_req_in 8 0
+  put rt_req_in 9 7
+  put rt_req_in 10 esc
+end
+
+fn test_no_evidence_uses_reference to void
+  setup_two_engines
+  rx_route_registry_digest
+  note Non-zero digest
+  nz = ulong 0
+  for i ulong 32
+    nz = or nz ulong get rt_reg_dig i
+  end
+  rt_chk ne nz 0
+  set_basic_req 900000 50000 1
+  rt_chk eq rx_route_plan RT_OK
+  rt_chk eq get rt_lad_out 0 1
+  rt_chk eq get rt_lad_out 1 2
+  rt_chk eq get rt_lad_out 13 RT_WHY_NO_EVIDENCE
+  me = new ulong 1 0
+  rt_chk eq rx_route_most_expensive me RT_OK
+  rt_chk eq get me 0 2
+end
+
+fn test_ledger_model_and_escalation_ladder to void
+  setup_two_engines
+  rt_chk eq rx_route_ledger_create RT_OK
+  put rt_obs_engs 0 1
+  put rt_obs_engs 1 2
+  note 240 trials: engine 1 is high-confidence & right on 180 (75%), low-confidence & wrong on 60;
+  note engine 2 is always right (100%) and 10x slower.
+  for t ulong 240
+    if lt t 180
+      put rt_obs_conf 0 980000
+      put rt_obs_corr 0 1
+    else
+      put rt_obs_conf 0 200000
+      put rt_obs_corr 0 0
+    end
+    put rt_obs_ns 0 100
+    put rt_obs_conf 1 990000
+    put rt_obs_corr 1 1
+    put rt_obs_ns 1 1000
+    rt_chk eq rx_route_observe 0 2 RT_OK
+  end
+  rt_chk eq rx_route_observe_batch 1 0 240 24000 1 2400 RT_OK
+  rt_chk eq rx_route_observe_batch 2 0 240 240000 1 24000 RT_OK
+  rt_chk eq rx_route_ledger_model RT_OK
+  mlen = get rt_model_len 0
+  rt_chk gt mlen 500
+  note Load model into router at generation 7
+  rt_chk eq rx_route_load_model 7 mlen RT_OK
+  rt_chk eq rx_route_generation 7
+  note Tampered magic rejected without corrupting loaded generation
+  orig = get rt_model_buf 0
+  put rt_model_buf 0 xor orig 255
+  rt_chk eq rx_route_load_model 8 mlen RT_ERR_MODEL
+  rt_chk eq rx_route_generation 7
+  put rt_model_buf 0 orig
+  note With escalation allowed (esc=1), cheapest ladder is [1 -> 2] (expected_nj = 10 + 0.25*100 = 35 < 100)
+  set_basic_req 950000 50000 1
+  rt_chk eq rx_route_plan RT_OK
+  rt_chk eq get rt_lad_out 0 2
+  rt_chk eq get rt_lad_out 1 1
+  rt_chk eq get rt_lad_out 2 2
+  rt_chk eq get rt_lad_out 9 35
+  rt_chk eq get rt_lad_out 13 RT_WHY_EVIDENCE
+  note Plan cache hit returns identical ladder
+  rt_chk eq rx_route_plan RT_OK
+  rt_chk eq get rt_lad_out 0 2
+  rt_chk eq get rt_lad_out 9 35
+  note With escalation disallowed (esc=0), must pick engine 2 alone (nj = 100)
+  set_basic_req 950000 50000 0
+  rt_chk eq rx_route_plan RT_OK
+  rt_chk eq get rt_lad_out 0 1
+  rt_chk eq get rt_lad_out 1 2
+  rt_chk eq get rt_lad_out 9 100
+  note Tight energy budget (nj <= 20) is unsatisfiable
+  put rt_req_in 8 20
+  rt_chk eq rx_route_plan RT_ERR_UNSAT
+  note Most expensive baseline picks engine 2
+  set_basic_req 950000 50000 1
+  me = new ulong 1 0
+  rt_chk eq rx_route_most_expensive me RT_OK
+  rt_chk eq get me 0 2
+end
+
+fn rt_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len rt_msg_pass
+    for i ulong n bound 64
+      put buf i get rt_msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len rt_msg_fail
+  for i ulong n bound 64
+    put buf i get rt_msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  test_no_evidence_uses_reference
+  test_ledger_model_and_escalation_ladder
+  if eq get rt_fail 0 0
+    rt_put_msg 1
+    ret 0
+  end
+  rt_put_msg 0
+  ret 1
+end

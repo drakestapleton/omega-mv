@@ -1,0 +1,597 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_operator.om -- Pure seeded OM-2 port of src/runtime/rx_operator.c
+note R16 G6 operator entry point: control directory validation, credential formatting,
+note strict request parser, hold/release gate, deadline check, and command dispatch.
+
+const RX_OP_SUBJ ulong 70
+const RX_OP_LINE ulong 512
+const RX_OP_SECRET_LEN ulong 32
+const RX_OP_DEADLINE_MAX_NS ulong 120000000000
+
+const RX_OP_OK long 0
+const RX_OP_ERR_IDENTITY long -27
+const RX_OP_ERR_AUTHORITY long -4
+const RX_OP_HALT_ALREADY long 1
+const RX_OP_HALT_NOT_STOPPED long 2
+
+const RX_OP_CMD_NONE ulong 0
+const RX_OP_CMD_STOP ulong 1
+const RX_OP_CMD_RESUME ulong 2
+const RX_OP_CMD_STATUS ulong 3
+const RX_OP_CMD_SHUTDOWN ulong 4
+const RX_OP_CMD_REVOKE ulong 5
+const RX_OP_CMD_REVOKE_CAP ulong 6
+
+const RX_OP_REP_BAD_REQUEST ulong 1
+const RX_OP_REP_EXPIRED ulong 2
+const RX_OP_REP_REFUSED_PEER ulong 3
+const RX_OP_REP_REFUSED_IDENTITY ulong 4
+const RX_OP_REP_REFUSED_AUTHORITY ulong 5
+const RX_OP_REP_OK_STOPPED ulong 6
+const RX_OP_REP_STOPPED_NOT_DURABLE ulong 7
+const RX_OP_REP_ALREADY ulong 8
+const RX_OP_REP_OK_RUNNING ulong 9
+const RX_OP_REP_NOT_STOPPED ulong 10
+const RX_OP_REP_OK_STATUS ulong 11
+const RX_OP_REP_OK_SHUTDOWN ulong 12
+const RX_OP_REP_OK_REVOKED_BOTH ulong 13
+const RX_OP_REP_OK_REVOKED_CAP ulong 14
+const RX_OP_REP_ERROR ulong 15
+
+note Parsed request state:
+note op_req_u[0]=cmd, [1]=subject, [2]=cred_gen, [3]=cap_id, [4]=cap_gen,
+note [5]=reason, [6]=deadline_ns, [7]=flags_mask
+global op_req_u ulong 8
+global op_req_secret uchar 32
+
+note Operator instance & world simulation state:
+note op_st[0]=gate_held, [1]=halted, [2]=durable, [3]=seq, [4]=crumb,
+note [5]=restored, [6]=refused, [7]=cancelled, [8]=n_crumbs, [9]=n_reactions,
+note [10]=auth_subject, [11]=auth_cred_gen, [12]=auth_cap_id, [13]=auth_cap_gen,
+note [14]=cap_live, [15]=cred_live, [16]=shutdown_called, [17]=on_halt_val,
+note [18]=cred_made, [19]=cred_dev, [20]=cred_ino, [21]=sock_made, [22]=sock_dev, [23]=sock_ino
+global op_st ulong 24
+global op_auth_secret uchar 32
+
+note Scratch buffers for formatting credentials and replies
+global op_cred_buf uchar 1024
+global op_cred_len ulong 1
+global op_rep_buf uchar 1024
+global op_rep_len ulong 1
+
+text op_t_prefix "aien-operator v1 "
+text op_t_stop "stop"
+text op_t_resume "resume"
+text op_t_status "status"
+text op_t_shutdown "shutdown"
+text op_t_revoke "revoke"
+text op_t_revoke_cap "revoke-cap"
+text op_t_k_subject "subject"
+text op_t_k_gen "gen"
+text op_t_k_secret "secret"
+text op_t_k_cap "cap"
+text op_t_k_reason "reason"
+text op_t_k_deadline "deadline"
+text op_t_cred_hdr "aien-operator-credential v1\n"
+
+fn rx_operator_init to void
+  for i ulong 24
+    put op_st i 0
+  end
+  for i ulong 32
+    put op_auth_secret i 0
+  end
+  put op_st 0 1
+  put op_st 2 1
+  put op_st 14 1
+  put op_st 15 1
+end
+
+fn rx_operator_hold to void
+  put op_st 0 1
+end
+
+fn rx_operator_release to void
+  put op_st 0 0
+end
+
+fn rx_operator_gate_held to ulong
+  ret get op_st 0
+end
+
+note Validate control directory metadata (matches dir_fd_ok in rx_operator.c).
+note Returns 0 ok, 1 not_dir, 2 wrong_uid, 3 bad_mode (any bit in 077).
+fn rx_operator_dir_check_meta is_dir ulong uid ulong euid ulong mode ulong to long
+  if eq is_dir 0
+    ret 1
+  end
+  if ne uid euid
+    ret 2
+  end
+  if ne and mode 63 0
+    ret 3
+  end
+  ret 0
+end
+
+note Validate lock file metadata (regular file owned by euid).
+fn rx_operator_lock_file_ok is_reg ulong uid ulong euid ulong to ulong
+  if eq is_reg 0
+    ret 0
+  end
+  if ne uid euid
+    ret 0
+  end
+  ret 1
+end
+
+note Check whether unlink_own should unlink (same dev and ino, and flag set).
+fn rx_operator_unlink_own_match made ulong dev ulong ino ulong mdev ulong mino ulong to ulong
+  if eq made 0
+    ret 0
+  end
+  if ne dev mdev
+    ret 0
+  end
+  if ne ino mino
+    ret 0
+  end
+  ret 1
+end
+
+fn rx_op_hexval c ulong to long
+  if and ge c 48 le c 57
+    ret long sub c 48
+  end
+  if and ge c 97 le c 102
+    ret long add sub c 97 10
+  end
+  if and ge c 65 le c 70
+    ret long add sub c 65 10
+  end
+  ret -1
+end
+
+note Parse strict unsigned decimal in buf[off..end_off), <= max_val.
+note Writes result to out_v[0], returns 0 ok or -1 error.
+fn rx_op_udec buf view uchar * off ulong end_off ulong max_val ulong out_v edit ulong 1 to long
+  if ge off end_off
+    ret -1
+  end
+  v = ulong 0
+  i = off
+  while lt i end_off bound 64
+    c = ulong get buf i
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    d = sub c 48
+    if gt v div sub max_val d 10
+      ret -1
+    end
+    v = add mul v 10 d
+    i = add i 1
+  end
+  put out_v 0 v
+  ret 0
+end
+
+fn rx_op_eq_text buf view uchar * off ulong n ulong t view uchar * to ulong
+  if ne n len t
+    ret 0
+  end
+  for i ulong n bound 64
+    if ne get buf add off i get t i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rx_op_cmd_id buf view uchar * off ulong n ulong to ulong
+  if eq rx_op_eq_text buf off n op_t_stop 1
+    ret RX_OP_CMD_STOP
+  end
+  if eq rx_op_eq_text buf off n op_t_resume 1
+    ret RX_OP_CMD_RESUME
+  end
+  if eq rx_op_eq_text buf off n op_t_status 1
+    ret RX_OP_CMD_STATUS
+  end
+  if eq rx_op_eq_text buf off n op_t_shutdown 1
+    ret RX_OP_CMD_SHUTDOWN
+  end
+  if eq rx_op_eq_text buf off n op_t_revoke 1
+    ret RX_OP_CMD_REVOKE
+  end
+  if eq rx_op_eq_text buf off n op_t_revoke_cap 1
+    ret RX_OP_CMD_REVOKE_CAP
+  end
+  ret RX_OP_CMD_NONE
+end
+
+fn rx_op_parse_secret buf view uchar * v_off ulong v_end ulong to long
+  if ne sub v_end v_off mul 2 RX_OP_SECRET_LEN
+    ret -1
+  end
+  for i ulong RX_OP_SECRET_LEN
+    hi = rx_op_hexval ulong get buf add v_off mul 2 i
+    lo = rx_op_hexval ulong get buf add add v_off mul 2 i 1
+    if or lt hi 0 lt lo 0
+      ret -1
+    end
+    put op_req_secret i uchar or shl ulong hi 4 ulong lo
+  end
+  ret 0
+end
+
+fn rx_op_parse_cap buf view uchar * v_off ulong v_end ulong to long
+  colon = v_end
+  i = v_off
+  while lt i v_end bound 64
+    if eq get buf i 58
+      colon = i
+      i = v_end
+    else
+      i = add i 1
+    end
+  end
+  if eq colon v_end
+    ret -1
+  end
+  x = new ulong 1 0
+  y = new ulong 1 0
+  if ne rx_op_udec buf v_off colon 4294967295 x 0
+    ret -1
+  end
+  if ne rx_op_udec buf add colon 1 v_end ulong 0xffffffffffffffff y 0
+    ret -1
+  end
+  put op_req_u 3 get x 0
+  put op_req_u 4 get y 0
+  ret 0
+end
+
+fn rx_op_parse_kv buf view uchar * tok_s ulong tok_e ulong to long
+  eqp = tok_e
+  i = tok_s
+  while lt i tok_e bound 128
+    if eq get buf i 61
+      eqp = i
+      i = tok_e
+    else
+      i = add i 1
+    end
+  end
+  if eq eqp tok_e
+    ret -1
+  end
+  klen = sub eqp tok_s
+  v_off = add eqp 1
+  flags = get op_req_u 7
+  tmp = new ulong 1 0
+  if eq rx_op_eq_text buf tok_s klen op_t_k_subject 1
+    if ne and flags 1 0
+      ret -1
+    end
+    if ne rx_op_udec buf v_off tok_e 4294967295 tmp 0
+      ret -1
+    end
+    put op_req_u 1 get tmp 0
+    put op_req_u 7 or flags 1
+    ret 0
+  end
+  if eq rx_op_eq_text buf tok_s klen op_t_k_gen 1
+    if ne and flags 2 0
+      ret -1
+    end
+    if ne rx_op_udec buf v_off tok_e ulong 0xffffffffffffffff tmp 0
+      ret -1
+    end
+    put op_req_u 2 get tmp 0
+    put op_req_u 7 or flags 2
+    ret 0
+  end
+  if eq rx_op_eq_text buf tok_s klen op_t_k_secret 1
+    if ne and flags 4 0
+      ret -1
+    end
+    if ne rx_op_parse_secret buf v_off tok_e 0
+      ret -1
+    end
+    put op_req_u 7 or flags 4
+    ret 0
+  end
+  if eq rx_op_eq_text buf tok_s klen op_t_k_cap 1
+    if ne and flags 8 0
+      ret -1
+    end
+    if ne rx_op_parse_cap buf v_off tok_e 0
+      ret -1
+    end
+    put op_req_u 7 or flags 8
+    ret 0
+  end
+  if eq rx_op_eq_text buf tok_s klen op_t_k_reason 1
+    if ne and flags 16 0
+      ret -1
+    end
+    if ne rx_op_udec buf v_off tok_e 2147483647 tmp 0
+      ret -1
+    end
+    put op_req_u 5 get tmp 0
+    put op_req_u 7 or flags 16
+    ret 0
+  end
+  if eq rx_op_eq_text buf tok_s klen op_t_k_deadline 1
+    if ne and flags 32 0
+      ret -1
+    end
+    if ne rx_op_udec buf v_off tok_e ulong 0xffffffffffffffff tmp 0
+      ret -1
+    end
+    put op_req_u 6 get tmp 0
+    put op_req_u 7 or flags 32
+    ret 0
+  end
+  ret -1
+end
+
+note Parse a full operator request line (without trailing LF).
+note Checks prefix, command, required k=v tokens, deadline horizon, and reason rule.
+fn rx_operator_parse line view uchar * n ulong now_ns ulong to long
+  for i ulong 8
+    put op_req_u i 0
+  end
+  for i ulong 32
+    put op_req_secret i 0
+  end
+  plen = len op_t_prefix
+  if le n plen
+    ret -1
+  end
+  if eq rx_op_eq_text line 0 plen op_t_prefix 0
+    ret -1
+  end
+  pos = plen
+  done = ulong 0
+  while eq done 0 bound 64
+    if ge pos n
+      done = 1
+    else
+      if eq get line pos 32
+        pos = add pos 1
+      else
+        done = 1
+      end
+    end
+  end
+  cs = pos
+  done = 0
+  while eq done 0 bound 64
+    if ge pos n
+      done = 1
+    else
+      if ne get line pos 32
+        pos = add pos 1
+      else
+        done = 1
+      end
+    end
+  end
+  if or eq cs pos ge sub pos cs 16
+    ret -1
+  end
+  cmd = rx_op_cmd_id line cs sub pos cs
+  put op_req_u 0 cmd
+  while lt pos n bound 32
+    done = 0
+    while eq done 0 bound 64
+      if ge pos n
+        done = 1
+      else
+        if eq get line pos 32
+          pos = add pos 1
+        else
+          done = 1
+        end
+      end
+    end
+    if lt pos n
+      ts = pos
+      done = 0
+      while eq done 0 bound 128
+        if ge pos n
+          done = 1
+        else
+          if ne get line pos 32
+            pos = add pos 1
+          else
+            done = 1
+          end
+        end
+      end
+      if ne rx_op_parse_kv line ts pos 0
+        ret -1
+      end
+    end
+  end
+  flags = get op_req_u 7
+  if ne and flags 47 47
+    ret -1
+  end
+  if gt get op_req_u 6 add now_ns RX_OP_DEADLINE_MAX_NS
+    ret -1
+  end
+  if and ne and flags 16 0 ne cmd RX_OP_CMD_STOP
+    ret -1
+  end
+  ret 0
+end
+
+note Constant-time 32-byte secret comparison.
+fn rx_op_secret_eq to ulong
+  diff = ulong 0
+  for i ulong 32
+    diff = or diff xor ulong get op_req_secret i ulong get op_auth_secret i
+  end
+  if eq diff 0
+    ret 1
+  end
+  ret 0
+end
+
+note Authorize parsed request against op_st and op_auth_secret.
+fn rx_op_authorize to long
+  if eq get op_st 15 0
+    ret RX_OP_ERR_IDENTITY
+  end
+  if ne get op_req_u 1 get op_st 10
+    ret RX_OP_ERR_IDENTITY
+  end
+  if ne get op_req_u 2 get op_st 11
+    ret RX_OP_ERR_IDENTITY
+  end
+  if eq rx_op_secret_eq 0
+    ret RX_OP_ERR_IDENTITY
+  end
+  if eq get op_st 14 0
+    ret RX_OP_ERR_AUTHORITY
+  end
+  if ne get op_req_u 3 get op_st 12
+    ret RX_OP_ERR_AUTHORITY
+  end
+  if ne get op_req_u 4 get op_st 13
+    ret RX_OP_ERR_AUTHORITY
+  end
+  ret RX_OP_OK
+end
+
+note Dispatch an already-parsed request in op_req_u at monotonic time now_ns.
+note Returns RX_OP_REP_* code.
+fn rx_operator_dispatch now_ns ulong to ulong
+  cmd = get op_req_u 0
+  if eq cmd RX_OP_CMD_NONE
+    ret RX_OP_REP_BAD_REQUEST
+  end
+  if and ne cmd RX_OP_CMD_STOP gt now_ns get op_req_u 6
+    ret RX_OP_REP_EXPIRED
+  end
+  arc = rx_op_authorize
+  if eq arc RX_OP_ERR_IDENTITY
+    ret RX_OP_REP_REFUSED_IDENTITY
+  end
+  if eq arc RX_OP_ERR_AUTHORITY
+    ret RX_OP_REP_REFUSED_AUTHORITY
+  end
+  if eq cmd RX_OP_CMD_STOP
+    if ne get op_st 1 0
+      ret RX_OP_REP_ALREADY
+    end
+    put op_st 1 1
+    put op_st 3 add get op_st 3 1
+    put op_st 4 add get op_st 4 1
+    put op_st 17 1
+    if eq get op_st 2 1
+      ret RX_OP_REP_OK_STOPPED
+    end
+    ret RX_OP_REP_STOPPED_NOT_DURABLE
+  end
+  if eq cmd RX_OP_CMD_RESUME
+    if eq get op_st 1 0
+      ret RX_OP_REP_NOT_STOPPED
+    end
+    put op_st 1 0
+    put op_st 3 add get op_st 3 1
+    put op_st 17 0
+    ret RX_OP_REP_OK_RUNNING
+  end
+  if eq cmd RX_OP_CMD_STATUS
+    ret RX_OP_REP_OK_STATUS
+  end
+  if eq cmd RX_OP_CMD_SHUTDOWN
+    if eq get op_st 1 0
+      ret RX_OP_REP_NOT_STOPPED
+    end
+    put op_st 16 1
+    ret RX_OP_REP_OK_SHUTDOWN
+  end
+  if eq cmd RX_OP_CMD_REVOKE
+    put op_st 14 0
+    put op_st 15 0
+    put op_st 18 0
+    ret RX_OP_REP_OK_REVOKED_BOTH
+  end
+  if eq cmd RX_OP_CMD_REVOKE_CAP
+    put op_st 14 0
+    ret RX_OP_REP_OK_REVOKED_CAP
+  end
+  ret RX_OP_REP_BAD_REQUEST
+end
+
+fn rx_op_hex_char v ulong to uchar
+  if lt v 10
+    ret uchar add v 48
+  end
+  ret uchar add sub v 10 97
+end
+
+note Append u64 decimal to op_cred_buf at pos; returns new pos.
+fn rx_op_cred_u64 pos ulong v ulong to ulong
+  dig = new uchar 24 0
+  n = ulong 0
+  if eq v 0
+    put dig 0 48
+    n = 1
+  else
+    x = v
+    while gt x 0 bound 24
+      put dig n uchar add 48 rem x 10
+      x = div x 10
+      n = add n 1
+    end
+  end
+  p = pos
+  for i ulong n bound 24
+    put op_cred_buf p get dig sub sub n 1 i
+    p = add p 1
+  end
+  ret p
+end
+
+note Format credential file header + fields into op_cred_buf, returning length.
+fn rx_operator_format_cred subj ulong cred_gen ulong cap_id ulong cap_gen ulong to ulong
+  p = ulong 0
+  hn = len op_t_cred_hdr
+  for i ulong hn bound 64
+    put op_cred_buf p get op_t_cred_hdr i
+    p = add p 1
+  end
+  put op_cred_buf p 115
+  p = add p 1
+  put op_cred_buf p 32
+  p = add p 1
+  p = rx_op_cred_u64 p subj
+  put op_cred_buf p 10
+  p = add p 1
+  p = rx_op_cred_u64 p cred_gen
+  put op_cred_buf p 32
+  p = add p 1
+  for i ulong 32
+    b = ulong get op_auth_secret i
+    put op_cred_buf p rx_op_hex_char shr b 4
+    p = add p 1
+    put op_cred_buf p rx_op_hex_char and b 15
+    p = add p 1
+  end
+  put op_cred_buf p 10
+  p = add p 1
+  p = rx_op_cred_u64 p cap_id
+  put op_cred_buf p 32
+  p = add p 1
+  p = rx_op_cred_u64 p cap_gen
+  put op_cred_buf p 10
+  p = add p 1
+  put op_cred_len 0 p
+  ret p
+end

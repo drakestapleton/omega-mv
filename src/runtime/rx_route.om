@@ -1,0 +1,1182 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_route.om -- Pure seeded OM-2 port of src/runtime/rx_route.c
+note Cognitive compute routing: engine registry, SHA-256 registry digest,
+note 95% Wilson score bounds, evidence-backed ladder planning & caching,
+note ledger observation/batching, and binary OCRM model serialization/loading.
+note Requires seed/ng/sha256.om concatenated ahead of this unit.
+
+const RT_OK long 0
+const RT_ERR_ARG long -60
+const RT_ERR_UNSAT long -61
+const RT_ERR_EXHAUSTED long -62
+const RT_ERR_MODEL long -63
+const RT_ERR_FULL long -64
+const RT_ERR_ENGINE long -65
+
+const RT_MAX_ENG ulong 8
+const RT_OP_COUNT ulong 2
+const RT_MAX_LADDER ulong 4
+const RT_BINS ulong 16
+const RT_MAX_SAMPLE ulong 512
+const RT_MIN_EVIDENCE ulong 200
+const RT_CONF_ONE ulong 1000000
+const RT_PREC_APPROX ulong 1
+const RT_PREC_EXACT ulong 2
+
+const RT_WHY_EVIDENCE ulong 1
+const RT_WHY_NO_EVIDENCE ulong 2
+
+const RT_MODEL_MAGIC ulong 0x4d52434f
+const RT_MODEL_VER ulong 1
+const RT_MODEL_MAX ulong 32768
+const RT_PLAN_CACHE ulong 64
+const RT_PLAN_PROBES ulong 4
+const RT_NS_KEEP ulong 512
+
+const RT_WILSON_Z f64 1.959964
+
+note Router meta: [0]=n_eng, [1]=sealed, [2]=generation, [3]=have_profile, [4]=cache_next
+global rt_meta ulong 8
+note Engine declarations: 10 ulongs per engine (8 * 10 = 80)
+note [0]=id, [1]=class, [2]=supported_ops, [3]=hw_req, [4]=mem_cap,
+note [5]=temporal_horizon, [6]=max_plan_depth, [7]=precision, [8]=verifiable, [9]=ref_ops
+global rt_decl ulong 80
+
+note Loaded profile per (eng, op): 8*2 = 16 slots
+note Quality: 3 ulongs ([0]=obs, [1]=correct, [2]=failures) -> 48
+global rt_qual ulong 48
+note Calibration: 16*2 = 32 ulongs per (eng,op) ([0..15]=n, [16..31]=correct) -> 512
+global rt_cal ulong 512
+note Cost: 5 ulongs per (eng,op) ([0]=calls, [1]=mean_ns, [2]=p99_ns, [3]=nj_per_call, [4]=energy_measured) -> 80
+global rt_cost ulong 80
+global rt_ev_dig uchar 32
+global rt_reg_dig uchar 32
+
+note Router sample per op: [0]=n_records, [1]=n_eng, [2..9]=eng_idx -> 2 * 10 = 20
+global rt_smp_meta ulong 20
+note Sample bytes: 2 * 512 * 8 = 8192
+global rt_smp_rec uchar 8192
+
+note Plan cache: 64 entries
+note meta: 64 * 4 ([0]=used, [1]=stamp, [2]=gen, [3]=0) = 256
+global rt_pc_meta ulong 256
+global rt_pc_rc long 64
+note req: 64 * 11 = 704
+global rt_pc_req ulong 704
+note ladder: 64 * 14 = 896
+global rt_pc_lad ulong 896
+
+note Active requirement (11 ulongs):
+note [0]=op, [1]=min_qual_ppm, [2]=uncert_budget_ppm, [3]=mem_req, [4]=temp_req,
+note [5]=plan_depth, [6]=prec_req, [7]=lat_budget_ns, [8]=energy_budget_nj,
+note [9]=hw_constraints, [10]=escalation_allowed
+global rt_req_in ulong 11
+
+note Output ladder (14 ulongs):
+note [0]=n, [1..4]=engine[0..3], [5..8]=accept_min_bin[0..3],
+note [9]=expected_nj, [10]=expected_ns, [11]=expected_qual_ppm, [12]=qual_lower_ppm, [13]=reason
+global rt_lad_out ulong 14
+global rt_lad_best ulong 14
+global rt_lad_cur ulong 14
+
+note Ledger state (mirrors router engines)
+global rt_ldg_n ulong 1
+global rt_ldg_decl ulong 80
+global rt_ldg_qual ulong 48
+global rt_ldg_cal ulong 512
+note Ledger cost accum: 7 ulongs per (eng,op): [0]=calls, [1]=sum_ns, [2]=n_ns, [3]=e_calls, [4]=e_nj, [5]=b_calls, [6]=b_ns -> 112
+global rt_ldg_acc ulong 112
+note Ledger per-(eng,op) ns samples for p99: 16 * 512 = 8192
+global rt_ldg_ns ulong 8192
+global rt_ldg_smp_meta ulong 20
+global rt_ldg_smp_rec uchar 8192
+
+note Model serialization buffer
+global rt_model_buf uchar 32768
+global rt_model_len ulong 1
+
+fn rt_conf_bin conf ulong to ulong
+  if ge conf RT_CONF_ONE
+    ret sub RT_BINS 1
+  end
+  ret div mul conf RT_BINS RT_CONF_ONE
+end
+
+fn rt_wilson_lo k ulong n ulong to f64
+  if eq n 0
+    ret 0.0f64
+  end
+  nn = f64 n
+  p = div f64 k nn
+  z2 = mul RT_WILSON_Z RT_WILSON_Z
+  c = add p div z2 mul 2.0f64 nn
+  t1 = div mul p sub 1.0f64 p nn
+  t2 = div z2 mul 4.0f64 mul nn nn
+  r = mul RT_WILSON_Z fsqrt add t1 t2
+  ret div sub c r add 1.0f64 div z2 nn
+end
+
+fn rt_wilson_hi k ulong n ulong to f64
+  if eq n 0
+    ret 1.0f64
+  end
+  if gt k n
+    ret 1.0f64
+  end
+  ret sub 1.0f64 rt_wilson_lo sub n k n
+end
+
+fn rt_put32 pos ulong v ulong to ulong
+  put rt_model_buf pos uchar and v 255
+  put rt_model_buf add pos 1 uchar and shr v 8 255
+  put rt_model_buf add pos 2 uchar and shr v 16 255
+  put rt_model_buf add pos 3 uchar and shr v 24 255
+  ret add pos 4
+end
+
+fn rt_put64 pos ulong v ulong to ulong
+  p = rt_put32 pos and v 4294967295
+  ret rt_put32 p shr v 32
+end
+
+fn rt_get32 pos ulong to ulong
+  b0 = ulong get rt_model_buf pos
+  b1 = ulong get rt_model_buf add pos 1
+  b2 = ulong get rt_model_buf add pos 2
+  b3 = ulong get rt_model_buf add pos 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn rt_get64 pos ulong to ulong
+  lo = rt_get32 pos
+  hi = rt_get32 add pos 4
+  ret or lo shl hi 32
+end
+
+fn rt_sh_put32 pos ulong v ulong to ulong
+  put sh_dat pos uchar and v 255
+  put sh_dat add pos 1 uchar and shr v 8 255
+  put sh_dat add pos 2 uchar and shr v 16 255
+  put sh_dat add pos 3 uchar and shr v 24 255
+  ret add pos 4
+end
+
+fn rt_sh_put64 pos ulong v ulong to ulong
+  p = rt_sh_put32 pos and v 4294967295
+  ret rt_sh_put32 p shr v 32
+end
+
+fn rt_drop_profile to void
+  for i ulong 20
+    put rt_smp_meta i 0
+  end
+  for i ulong 48
+    put rt_qual i 0
+  end
+  for i ulong 512
+    put rt_cal i 0
+  end
+  for i ulong 80
+    put rt_cost i 0
+  end
+  for i ulong 32
+    put rt_ev_dig i 0
+  end
+  put rt_meta 3 0
+end
+
+fn rt_clear_cache to void
+  for i ulong 256
+    put rt_pc_meta i 0
+  end
+end
+
+fn rx_route_create to long
+  for i ulong 8
+    put rt_meta i 0
+  end
+  for i ulong 80
+    put rt_decl i 0
+  end
+  rt_drop_profile
+  rt_clear_cache
+  ret RT_OK
+end
+
+fn rt_index_of id ulong to long
+  n = get rt_meta 0
+  for i ulong n bound 8
+    if eq get rt_decl mul i 10 id
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn rx_route_register d view ulong 9 ref_ops ulong to long
+  if ne get rt_meta 1 0
+    ret RT_ERR_ARG
+  end
+  n = get rt_meta 0
+  if ge n RT_MAX_ENG
+    ret RT_ERR_FULL
+  end
+  if ge rt_index_of get d 0 0
+    ret RT_ERR_ARG
+  end
+  sops = get d 2
+  if or eq sops 0 ne and sops xor 3 ulong 0xffffffffffffffff 0
+    ret RT_ERR_ARG
+  end
+  if ne and ref_ops xor sops ulong 0xffffffffffffffff 0
+    ret RT_ERR_ARG
+  end
+  for i ulong n bound 8
+    if ne and get rt_decl add mul i 10 9 ref_ops 0
+      ret RT_ERR_ARG
+    end
+  end
+  db = mul n 10
+  for k ulong 9
+    put rt_decl add db k get d k
+  end
+  put rt_decl add db 9 ref_ops
+  put rt_meta 0 add n 1
+  ret RT_OK
+end
+
+note Compute SHA-256 of router declarations into rt_reg_dig[0..32).
+fn rx_route_registry_digest to void
+  n = get rt_meta 0
+  p = ulong 0
+  for i ulong n bound 8
+    db = mul i 10
+    p = rt_sh_put32 p get rt_decl db
+    p = rt_sh_put32 p get rt_decl add db 1
+    p = rt_sh_put32 p get rt_decl add db 2
+    p = rt_sh_put32 p get rt_decl add db 3
+    p = rt_sh_put64 p get rt_decl add db 4
+    p = rt_sh_put32 p get rt_decl add db 5
+    p = rt_sh_put32 p get rt_decl add db 6
+    pv = or get rt_decl add db 7 shl get rt_decl add db 8 16
+    p = rt_sh_put32 p pv
+    p = rt_sh_put32 p and get rt_decl add db 9 255
+  end
+  sh_all p
+  for i ulong 32
+    put rt_reg_dig i get sh_dig i
+  end
+end
+
+fn rx_route_generation to ulong
+  ret get rt_meta 2
+end
+
+fn rt_eligible eng ulong to ulong
+  db = mul eng 10
+  op = get rt_req_in 0
+  if eq and shr get rt_decl add db 2 op 1 0
+    ret 0
+  end
+  hw = get rt_decl add db 3
+  hwc = get rt_req_in 9
+  if ne and hw xor hwc ulong 0xffffffffffffffff 0
+    ret 0
+  end
+  if lt get rt_decl add db 4 get rt_req_in 3
+    ret 0
+  end
+  if lt get rt_decl add db 5 get rt_req_in 4
+    ret 0
+  end
+  if lt get rt_decl add db 6 get rt_req_in 5
+    ret 0
+  end
+  if eq get rt_req_in 6 RT_PREC_EXACT
+    if ne get rt_decl add db 7 RT_PREC_EXACT
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rt_sample_slot op ulong ix ulong to long
+  sb = mul op 10
+  ne_cnt = get rt_smp_meta add sb 1
+  for k ulong ne_cnt bound 8
+    if eq get rt_smp_meta add add sb 2 k ix
+      ret long k
+    end
+  end
+  ret -1
+end
+
+fn rt_accept_bin eng ulong op ulong budget_ppm ulong to ulong
+  db = mul eng 10
+  eo = add mul eng RT_OP_COUNT op
+  cb = mul eo 32
+  if ne get rt_decl add db 8 0
+    top = sub RT_BINS 1
+    nt = get rt_cal add cb top
+    ct = get rt_cal add add cb 16 top
+    if and ne nt 0 eq ct nt
+      ret top
+    end
+    ret RT_BINS
+  end
+  n = ulong 0
+  k = ulong 0
+  best = RT_BINS
+  budget = div f64 budget_ppm 1000000.0f64
+  for bi ulong RT_BINS
+    b = sub sub RT_BINS 1 bi
+    n = add n get rt_cal add cb b
+    k = add k get rt_cal add add cb 16 b
+    if ne n 0
+      wu = rt_wilson_hi sub n k n
+      if le wu budget
+        best = b
+      end
+    end
+  end
+  ret best
+end
+
+fn rt_eng_cost_less op ulong a ulong b ulong to ulong
+  ca = mul add mul a RT_OP_COUNT op 5
+  cb = mul add mul b RT_OP_COUNT op 5
+  ema = get rt_cost add ca 4
+  emb = get rt_cost add cb 4
+  if and ne ema 0 ne emb 0
+    nja = get rt_cost add ca 3
+    njb = get rt_cost add cb 3
+    if ne nja njb
+      if lt nja njb
+        ret 1
+      end
+      ret 0
+    end
+  end
+  if lt get rt_cost add ca 1 get rt_cost add cb 1
+    ret 1
+  end
+  ret 0
+end
+
+fn rt_candidates out_ix edit ulong 8 to ulong
+  if eq get rt_meta 3 0
+    ret 0
+  end
+  op = get rt_req_in 0
+  n = ulong 0
+  tot = get rt_meta 0
+  for i ulong tot bound 8
+    ok = rt_eligible i
+    eo = add mul i RT_OP_COUNT op
+    if ne ok 0
+      if ge get rt_qual mul eo 3 RT_MIN_EVIDENCE
+        if ne get rt_cost mul eo 5 0
+          if ge rt_sample_slot op i 0
+            put out_ix n i
+            n = add n 1
+          end
+        end
+      end
+    end
+  end
+  a = ulong 1
+  while lt a n bound 8
+    b = a
+    swapping = ulong 1
+    while and gt b 0 ne swapping 0 bound 8
+      if ne rt_eng_cost_less op get out_ix b get out_ix sub b 1 0
+        t = get out_ix b
+        put out_ix b get out_ix sub b 1
+        put out_ix sub b 1 t
+        b = sub b 1
+      else
+        swapping = 0
+      end
+    end
+    a = add a 1
+  end
+  ret n
+end
+
+global rt_eval_slots ulong 4
+global rt_eval_acc ulong 2
+
+fn rt_eval_init pick view ulong 4 plen ulong op ulong to ulong
+  for i ulong 14
+    put rt_lad_cur i 0
+  end
+  put rt_lad_cur 0 plen
+  all_em = ulong 1
+  for i ulong plen bound 4
+    ix = get pick i
+    put rt_lad_cur add 1 i get rt_decl mul ix 10
+    ab = rt_accept_bin ix op get rt_req_in 2
+    put rt_lad_cur add 5 i ab
+    put rt_eval_slots i ulong rt_sample_slot op ix
+    cb = mul add mul ix RT_OP_COUNT op 5
+    if eq get rt_cost add cb 4 0
+      all_em = 0
+    end
+  end
+  ret all_em
+end
+
+fn rt_eval_step pick view ulong 4 plen ulong op ulong rb ulong to ulong
+  for i ulong plen bound 4
+    ix = get pick i
+    cb = mul add mul ix RT_OP_COUNT op 5
+    put rt_eval_acc 0 add get rt_eval_acc 0 get rt_cost add cb 1
+    put rt_eval_acc 1 add get rt_eval_acc 1 get rt_cost add cb 3
+    v = ulong get rt_smp_rec add rb get rt_eval_slots i
+    is_last = eq add i 1 plen
+    if is_last
+      ret shr v 7
+    end
+    b = and v 15
+    if ge b get rt_lad_cur add 5 i
+      ret shr v 7
+    end
+  end
+  ret 0
+end
+
+fn rt_evaluate pick view ulong 4 plen ulong to void
+  op = get rt_req_in 0
+  all_em = rt_eval_init pick plen op
+  sb = mul op 10
+  nrec = get rt_smp_meta sb
+  neng = get rt_smp_meta add sb 1
+  rec_base = mul op mul RT_MAX_SAMPLE RT_MAX_ENG
+  correct = ulong 0
+  put rt_eval_acc 0 0
+  put rt_eval_acc 1 0
+  for k ulong nrec bound 512
+    rb = add rec_base mul k neng
+    c = rt_eval_step pick plen op rb
+    correct = add correct c
+  end
+  m = nrec
+  if eq m 0
+    m = 1
+  end
+  put rt_lad_cur 10 div get rt_eval_acc 0 m
+  if ne all_em 0
+    put rt_lad_cur 9 div get rt_eval_acc 1 m
+  else
+    put rt_lad_cur 9 0
+  end
+  mf = f64 m
+  put rt_lad_cur 11 ulong div mul 1000000.0f64 f64 correct mf
+  put rt_lad_cur 12 ulong mul 1000000.0f64 rt_wilson_lo correct nrec
+  put rt_lad_cur 13 RT_WHY_EVIDENCE
+end
+
+fn rt_lad_cost_cur to f64
+  nj = get rt_lad_cur 9
+  if ne nj 0
+    ret f64 nj
+  end
+  ret mul f64 get rt_lad_cur 10 0.001f64
+end
+
+fn rt_lad_cost_best to f64
+  nj = get rt_lad_best 9
+  if ne nj 0
+    ret f64 nj
+  end
+  ret mul f64 get rt_lad_best 10 0.001f64
+end
+
+fn rt_ref_ladder to long
+  op = get rt_req_in 0
+  tot = get rt_meta 0
+  for i ulong tot bound 8
+    db = mul i 10
+    if ne and shr get rt_decl add db 9 op 1 0
+      if ne rt_eligible i 0
+        for k ulong 14
+          put rt_lad_out k 0
+        end
+        put rt_lad_out 0 1
+        put rt_lad_out 1 get rt_decl db
+        put rt_lad_out 5 0
+        put rt_lad_out 13 RT_WHY_NO_EVIDENCE
+        ret RT_OK
+      end
+    end
+  end
+  ret RT_ERR_UNSAT
+end
+
+fn rt_popcount x ulong to ulong
+  c = ulong 0
+  v = x
+  while ne v 0 bound 16
+    c = add c and v 1
+    v = shr v 1
+  end
+  ret c
+end
+
+fn rt_cur_admissible to ulong
+  if lt get rt_lad_cur 12 get rt_req_in 1
+    ret 0
+  end
+  lat_b = get rt_req_in 7
+  if ne lat_b 0
+    if gt get rt_lad_cur 10 lat_b
+      ret 0
+    end
+  end
+  en_b = get rt_req_in 8
+  if ne en_b 0
+    nj = get rt_lad_cur 9
+    if eq nj 0
+      ret 0
+    end
+    if gt nj en_b
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rt_cur_better found ulong to ulong
+  if eq found 0
+    ret 1
+  end
+  cc = rt_lad_cost_cur
+  cb = rt_lad_cost_best
+  if lt cc cb
+    ret 1
+  end
+  if eq cc cb
+    if lt get rt_lad_cur 0 get rt_lad_best 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn rt_choose to long
+  ix = new ulong 8 0
+  n = rt_candidates ix
+  op = get rt_req_in 0
+  if eq n 0
+    if ne get rt_meta 3 0
+      if ne get rt_smp_meta mul op 10 0
+        ret RT_ERR_UNSAT
+      end
+    end
+    ret rt_ref_ladder
+  end
+  max_len = add get rt_req_in 10 1
+  if gt max_len RT_MAX_LADDER
+    max_len = RT_MAX_LADDER
+  end
+  found = ulong 0
+  lim = shl 1 n
+  pick = new ulong 4 0
+  mask = ulong 1
+  while lt mask lim bound 256
+    if le rt_popcount mask max_len
+      plen = ulong 0
+      for i ulong n bound 8
+        if ne and shr mask i 1 0
+          put pick plen get ix i
+          plen = add plen 1
+        end
+      end
+      rt_evaluate pick plen
+      if ne rt_cur_admissible 0
+        if ne rt_cur_better found 0
+          for k ulong 14
+            put rt_lad_best k get rt_lad_cur k
+          end
+          found = 1
+        end
+      end
+    end
+    mask = add mask 1
+  end
+  if eq found 0
+    ret RT_ERR_UNSAT
+  end
+  for k ulong 14
+    put rt_lad_out k get rt_lad_best k
+  end
+  ret RT_OK
+end
+
+fn rt_req_hash to ulong
+  h = ulong 2166136261
+  for i ulong 11
+    v = get rt_req_in i
+    for b ulong 8
+      h = and mul xor h and shr v mul b 8 255 16777619 4294967295
+    end
+  end
+  ret h
+end
+
+fn rt_req_eq_slot s ulong to ulong
+  rb = mul s 11
+  for i ulong 11
+    if ne get rt_pc_req add rb i get rt_req_in i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rt_pc_is_live slot ulong gen ulong to ulong
+  mb = mul slot 4
+  if eq get rt_pc_meta mb 0
+    ret 0
+  end
+  if ne get rt_pc_meta add mb 2 gen
+    ret 0
+  end
+  ret 1
+end
+
+fn rt_pc_store victim ulong rc long to void
+  mb = mul victim 4
+  put rt_pc_meta mb 1
+  nxt = add get rt_meta 4 1
+  put rt_meta 4 nxt
+  put rt_pc_meta add mb 1 nxt
+  put rt_pc_meta add mb 2 get rt_meta 2
+  put rt_pc_rc victim rc
+  rb = mul victim 11
+  for i ulong 11
+    put rt_pc_req add rb i get rt_req_in i
+  end
+  lb = mul victim 14
+  for i ulong 14
+    put rt_pc_lad add lb i get rt_lad_out i
+  end
+end
+
+fn rx_route_plan to long
+  if ge get rt_req_in 0 RT_OP_COUNT
+    ret RT_ERR_ARG
+  end
+  put rt_meta 1 1
+  h = rt_req_hash
+  gen = get rt_meta 2
+  victim = RT_PLAN_CACHE
+  vic_live = ulong 0
+  vic_stamp = ulong 0
+  for k ulong RT_PLAN_PROBES
+    slot = and add h k 63
+    live = rt_pc_is_live slot gen
+    if ne live 0
+      if ne rt_req_eq_slot slot 0
+        lb = mul slot 14
+        for i ulong 14
+          put rt_lad_out i get rt_pc_lad add lb i
+        end
+        ret get rt_pc_rc slot
+      end
+    end
+    st = get rt_pc_meta add mul slot 4 1
+    if eq victim RT_PLAN_CACHE
+      victim = slot
+      vic_live = live
+      vic_stamp = st
+    else
+      if ne vic_live 0
+        if eq live 0
+          victim = slot
+          vic_live = 0
+          vic_stamp = st
+        else
+          if lt st vic_stamp
+            victim = slot
+            vic_stamp = st
+          end
+        end
+      end
+    end
+  end
+  rc = rt_choose
+  rt_pc_store victim rc
+  ret rc
+end
+
+fn rx_route_most_expensive out_id edit ulong 1 to long
+  if ge get rt_req_in 0 RT_OP_COUNT
+    ret RT_ERR_ARG
+  end
+  ix = new ulong 8 0
+  n = rt_candidates ix
+  if eq n 0
+    rc = rt_ref_ladder
+    if eq rc RT_OK
+      put out_id 0 get rt_lad_out 1
+    end
+    ret rc
+  end
+  last = get ix sub n 1
+  put out_id 0 get rt_decl mul last 10
+  ret RT_OK
+end
+
+note ---- Ledger & model serialization ----
+
+fn rx_route_ledger_create to long
+  n = get rt_meta 0
+  put rt_ldg_n 0 n
+  for i ulong 80
+    put rt_ldg_decl i get rt_decl i
+  end
+  for i ulong 48
+    put rt_ldg_qual i 0
+  end
+  for i ulong 512
+    put rt_ldg_cal i 0
+  end
+  for i ulong 112
+    put rt_ldg_acc i 0
+  end
+  for i ulong 20
+    put rt_ldg_smp_meta i 0
+  end
+  ret RT_OK
+end
+
+fn rt_ldg_index id ulong to long
+  n = get rt_ldg_n 0
+  for i ulong n bound 8
+    if eq get rt_ldg_decl mul i 10 id
+      ret long i
+    end
+  end
+  ret -1
+end
+
+global rt_obs_engs ulong 8
+global rt_obs_conf ulong 8
+global rt_obs_corr ulong 8
+global rt_obs_ns ulong 8
+global rt_obs_ix ulong 8
+
+fn rt_obs_check_engs op ulong n ulong to long
+  for k ulong n bound 8
+    idx = rt_ldg_index get rt_obs_engs k
+    if lt idx 0
+      ret RT_ERR_ARG
+    end
+    u = ulong idx
+    sops = get rt_ldg_decl add mul u 10 2
+    if eq and shr sops op 1 0
+      ret RT_ERR_ARG
+    end
+    for j ulong k bound 8
+      if eq get rt_obs_ix j u
+        ret RT_ERR_ARG
+      end
+    end
+    put rt_obs_ix k u
+  end
+  ret RT_OK
+end
+
+fn rt_obs_record_qual eo ulong ok ulong b ulong to void
+  qb = mul eo 3
+  put rt_ldg_qual qb add get rt_ldg_qual qb 1
+  q1 = add qb 1
+  put rt_ldg_qual q1 add get rt_ldg_qual q1 ok
+  cb = mul eo 32
+  c0 = add cb b
+  put rt_ldg_cal c0 add get rt_ldg_cal c0 1
+  c1 = add add cb 16 b
+  put rt_ldg_cal c1 add get rt_ldg_cal c1 ok
+end
+
+fn rt_obs_record_acc eo ulong ns_v ulong to void
+  ab = mul eo 7
+  put rt_ldg_acc ab add get rt_ldg_acc ab 1
+  a1 = add ab 1
+  put rt_ldg_acc a1 add get rt_ldg_acc a1 ns_v
+  a2 = add ab 2
+  nns = get rt_ldg_acc a2
+  if lt nns RT_NS_KEEP
+    put rt_ldg_ns add mul eo RT_NS_KEEP nns ns_v
+    put rt_ldg_acc a2 add nns 1
+  end
+end
+
+fn rt_obs_record_one op ulong k ulong to void
+  u = get rt_obs_ix k
+  eo = add mul u RT_OP_COUNT op
+  ok = ulong 0
+  if ne get rt_obs_corr k 0
+    ok = 1
+  end
+  b = rt_conf_bin get rt_obs_conf k
+  rt_obs_record_qual eo ok b
+  rt_obs_record_acc eo get rt_obs_ns k
+end
+
+fn rx_route_observe op ulong n ulong to long
+  if ge op RT_OP_COUNT
+    ret RT_ERR_ARG
+  end
+  if eq n 0
+    ret RT_ERR_ARG
+  end
+  if gt n get rt_ldg_n 0
+    ret RT_ERR_ARG
+  end
+  if ne rt_obs_check_engs op n RT_OK
+    ret RT_ERR_ARG
+  end
+  sb = mul op 10
+  if eq get rt_ldg_smp_meta add sb 1 0
+    put rt_ldg_smp_meta add sb 1 n
+    for k ulong n bound 8
+      put rt_ldg_smp_meta add add sb 2 k get rt_obs_ix k
+    end
+  else
+    if ne get rt_ldg_smp_meta add sb 1 n
+      ret RT_ERR_ARG
+    end
+    for k ulong n bound 8
+      if ne get rt_ldg_smp_meta add add sb 2 k get rt_obs_ix k
+        ret RT_ERR_ARG
+      end
+    end
+  end
+  for k ulong n bound 8
+    rt_obs_record_one op k
+  end
+  nrec = get rt_ldg_smp_meta sb
+  if lt nrec RT_MAX_SAMPLE
+    rb = add mul op mul RT_MAX_SAMPLE RT_MAX_ENG mul nrec n
+    for k ulong n bound 8
+      ok = ulong 0
+      if ne get rt_obs_corr k 0
+        ok = 1
+      end
+      b = rt_conf_bin get rt_obs_conf k
+      put rt_ldg_smp_rec add rb k uchar or b shl ok 7
+    end
+    put rt_ldg_smp_meta sb add nrec 1
+  end
+  ret RT_OK
+end
+
+fn rx_route_observe_batch eng_id ulong op ulong calls ulong cpu_ns ulong em ulong nj ulong to long
+  if or ge op RT_OP_COUNT eq calls 0
+    ret RT_ERR_ARG
+  end
+  idx = rt_ldg_index eng_id
+  if lt idx 0
+    ret RT_ERR_ARG
+  end
+  u = ulong idx
+  if eq and shr get rt_ldg_decl add mul u 10 2 op 1 0
+    ret RT_ERR_ARG
+  end
+  ab = mul add mul u RT_OP_COUNT op 7
+  put rt_ldg_acc add ab 5 add get rt_ldg_acc add ab 5 calls
+  put rt_ldg_acc add ab 6 add get rt_ldg_acc add ab 6 cpu_ns
+  if ne em 0
+    put rt_ldg_acc add ab 3 add get rt_ldg_acc add ab 3 calls
+    put rt_ldg_acc add ab 4 add get rt_ldg_acc add ab 4 nj
+  end
+  ret RT_OK
+end
+
+fn rt_compute_p99 eo ulong nns ulong to ulong
+  if eq nns 0
+    ret 0
+  end
+  tmp = new ulong 512 0
+  base = mul eo RT_NS_KEEP
+  for i ulong nns bound 512
+    put tmp i get rt_ldg_ns add base i
+  end
+  a = ulong 1
+  while lt a nns bound 512
+    v = get tmp a
+    b = a
+    done = ulong 0
+    while and gt b 0 eq done 0 bound 512
+      prev = get tmp sub b 1
+      if gt prev v
+        put tmp b prev
+        b = sub b 1
+      else
+        done = 1
+      end
+    end
+    put tmp b v
+    a = add a 1
+  end
+  idx = div mul nns 99 100
+  if ge idx nns
+    idx = sub nns 1
+  end
+  ret get tmp idx
+end
+
+fn rt_model_emit_eo pos ulong eo ulong to ulong
+  p = pos
+  qb = mul eo 3
+  cb = mul eo 32
+  ab = mul eo 7
+  p = rt_put32 p get rt_ldg_qual qb
+  p = rt_put32 p get rt_ldg_qual add qb 1
+  p = rt_put32 p get rt_ldg_qual add qb 2
+  for b ulong RT_BINS
+    p = rt_put32 p get rt_ldg_cal add cb b
+  end
+  for b ulong RT_BINS
+    p = rt_put32 p get rt_ldg_cal add add cb 16 b
+  end
+  calls = get rt_ldg_acc ab
+  bc = get rt_ldg_acc add ab 5
+  mean = ulong 0
+  if ne bc 0
+    mean = div get rt_ldg_acc add ab 6 bc
+  else
+    if ne calls 0
+      mean = div get rt_ldg_acc add ab 1 calls
+    end
+  end
+  p = rt_put64 p calls
+  p = rt_put64 p mean
+  p = rt_put64 p rt_compute_p99 eo get rt_ldg_acc add ab 2
+  ec = get rt_ldg_acc add ab 3
+  if ne ec 0
+    p = rt_put64 p div get rt_ldg_acc add ab 4 ec
+    p = rt_put32 p 1
+  else
+    p = rt_put64 p 0
+    p = rt_put32 p 0
+  end
+  ret p
+end
+
+fn rt_copy_smp_out p ulong rb ulong bytes ulong to ulong
+  for k ulong bytes bound 4096
+    put rt_model_buf add p k get rt_ldg_smp_rec add rb k
+  end
+  ret add p bytes
+end
+
+fn rt_model_emit_sample pos ulong o ulong to ulong
+  p = pos
+  sb = mul o 10
+  nrec = get rt_ldg_smp_meta sb
+  neng = get rt_ldg_smp_meta add sb 1
+  p = rt_put32 p nrec
+  p = rt_put32 p neng
+  for k ulong neng bound 8
+    u = get rt_ldg_smp_meta add add sb 2 k
+    p = rt_put32 p get rt_ldg_decl mul u 10
+  end
+  bytes = mul nrec neng
+  rb = mul o mul RT_MAX_SAMPLE RT_MAX_ENG
+  ret rt_copy_smp_out p rb bytes
+end
+
+fn rx_route_ledger_model to long
+  n = get rt_ldg_n 0
+  p = rt_put32 0 RT_MODEL_MAGIC
+  p = rt_put32 p RT_MODEL_VER
+  rx_route_registry_digest
+  for i ulong 32
+    put rt_model_buf add p i get rt_reg_dig i
+  end
+  p = add p 32
+  p = rt_put32 p n
+  for i ulong n bound 8
+    p = rt_put32 p get rt_ldg_decl mul i 10
+    for o ulong RT_OP_COUNT
+      p = rt_model_emit_eo p add mul i RT_OP_COUNT o
+    end
+  end
+  for o ulong RT_OP_COUNT
+    p = rt_model_emit_sample p o
+  end
+  put rt_model_len 0 p
+  ret RT_OK
+end
+
+fn rt_model_load_cal pos ulong cb ulong to ulong
+  p = pos
+  for b ulong 32
+    put rt_cal add cb b rt_get32 p
+    p = add p 4
+  end
+  ret p
+end
+
+fn rt_model_load_eo pos ulong i ulong o ulong to long
+  p = pos
+  eo = add mul i RT_OP_COUNT o
+  qb = mul eo 3
+  obs = rt_get32 p
+  cor = rt_get32 add p 4
+  fl = rt_get32 add p 8
+  if gt cor obs
+    ret -1
+  end
+  sops = get rt_decl add mul i 10 2
+  if eq and shr sops o 1 0
+    if ne obs 0
+      ret -1
+    end
+  end
+  put rt_qual qb obs
+  put rt_qual add qb 1 cor
+  put rt_qual add qb 2 fl
+  p = rt_model_load_cal add p 12 mul eo 32
+  costb = mul eo 5
+  put rt_cost costb rt_get64 p
+  put rt_cost add costb 1 rt_get64 add p 8
+  put rt_cost add costb 2 rt_get64 add p 16
+  put rt_cost add costb 3 rt_get64 add p 24
+  put rt_cost add costb 4 rt_get32 add p 32
+  ret long add p 36
+end
+
+fn rt_load_smp_engs pos ulong sb ulong o ulong neng ulong to long
+  p = pos
+  for k ulong neng bound 8
+    idx = rt_index_of rt_get32 p
+    p = add p 4
+    if lt idx 0
+      ret -1
+    end
+    u = ulong idx
+    sops = get rt_decl add mul u 10 2
+    if eq and shr sops o 1 0
+      ret -1
+    end
+    put rt_smp_meta add add sb 2 k u
+  end
+  ret long p
+end
+
+fn rt_load_smp_bytes p ulong rb ulong bytes ulong to long
+  for k ulong bytes bound 4096
+    v = get rt_model_buf add p k
+    if ne and ulong v 112 0
+      ret -1
+    end
+    put rt_smp_rec add rb k v
+  end
+  ret long add p bytes
+end
+
+fn rt_model_load_sample pos ulong o ulong mlen ulong to long
+  p = pos
+  if gt add p 8 mlen
+    ret -1
+  end
+  nrec = rt_get32 p
+  neng = rt_get32 add p 4
+  p = add p 8
+  if gt nrec RT_MAX_SAMPLE
+    ret -1
+  end
+  if gt neng get rt_meta 0
+    ret -1
+  end
+  sb = mul o 10
+  put rt_smp_meta sb nrec
+  put rt_smp_meta add sb 1 neng
+  if gt add p mul neng 4 mlen
+    ret -1
+  end
+  np = rt_load_smp_engs p sb o neng
+  if lt np 0
+    ret -1
+  end
+  p = ulong np
+  bytes = mul nrec neng
+  if gt add p bytes mlen
+    ret -1
+  end
+  rb = mul o mul RT_MAX_SAMPLE RT_MAX_ENG
+  ret rt_load_smp_bytes p rb bytes
+end
+
+fn rx_route_load_model gen ulong mlen ulong to long
+  put rt_meta 1 1
+  if eq mlen 0
+    rt_drop_profile
+    put rt_meta 2 gen
+    rt_clear_cache
+    ret RT_OK
+  end
+  if lt mlen 44
+    ret RT_ERR_MODEL
+  end
+  if or ne rt_get32 0 RT_MODEL_MAGIC ne rt_get32 4 RT_MODEL_VER
+    ret RT_ERR_MODEL
+  end
+  rx_route_registry_digest
+  for i ulong 32
+    if ne get rt_model_buf add 8 i get rt_reg_dig i
+      ret RT_ERR_MODEL
+    end
+  end
+  n = get rt_meta 0
+  if ne rt_get32 40 n
+    ret RT_ERR_MODEL
+  end
+  p = ulong 44
+  for i ulong n bound 8
+    if gt add p 4 mlen
+      ret RT_ERR_MODEL
+    end
+    if ne rt_get32 p get rt_decl mul i 10
+      ret RT_ERR_MODEL
+    end
+    p = add p 4
+    for o ulong RT_OP_COUNT
+      if gt add p 176 mlen
+        ret RT_ERR_MODEL
+      end
+      np = rt_model_load_eo p i o
+      if lt np 0
+        ret RT_ERR_MODEL
+      end
+      p = ulong np
+    end
+  end
+  smp_start = p
+  for o ulong RT_OP_COUNT
+    np = rt_model_load_sample p o mlen
+    if lt np 0
+      ret RT_ERR_MODEL
+    end
+    p = ulong np
+  end
+  if ne p mlen
+    ret RT_ERR_MODEL
+  end
+  elen = sub mlen smp_start
+  for k ulong elen bound 8192
+    put sh_dat k get rt_model_buf add smp_start k
+  end
+  sh_all elen
+  for i ulong 32
+    put rt_ev_dig i get sh_dig i
+  end
+  put rt_meta 3 1
+  put rt_meta 2 gen
+  rt_clear_cache
+  ret RT_OK
+end

@@ -1,0 +1,130 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_argus_unit.om -- Pure seeded OM-2 unit test for rx_argus.om.
+
+global ar_checks ulong 1
+global ar_fail ulong 1
+
+text ar_msg_pass "RX_ARGUS_OM: PASS\n"
+text ar_msg_fail "RX_ARGUS_OM: FAIL\n"
+text ar_run1 "run-42"
+text ar_dir1 "/var/lib/aien/store1"
+text ar_dir2 "/var/lib/aien/store2"
+
+fn ar_chk cond bool to void
+  put ar_checks 0 add get ar_checks 0 1
+  if not cond
+    put ar_fail 0 add get ar_fail 0 1
+  end
+end
+
+fn test_store_id to void
+  id1 = rx_argus_store_id ar_dir1 len ar_dir1
+  id1b = rx_argus_store_id ar_dir1 len ar_dir1
+  id2 = rx_argus_store_id ar_dir2 len ar_dir2
+  ar_chk ne id1 0
+  ar_chk eq id1 id1b
+  ar_chk ne id1 id2
+end
+
+fn test_use_aggregation_and_causal_order to void
+  ar_chk eq rx_argus_start AR_CONS_INGEST ar_run1 len ar_run1 0
+  ar_chk eq rx_argus_active 1
+  note Grant cap 5 gen 10 on producer 0
+  rx_argus_emit_cap_granted 7 5 10 999 3 0
+  note Count 10 uses of cap 5 in the same stamp interval -> folded into use table
+  k = rx_argus_use_begin
+  for i ulong 10
+    rx_argus_use_end k 7 5 add 10 i 999 0
+  end
+  ar_chk eq rx_argus_idle_pending 1
+  note Transition (world_committed) flushes pending use summary BEFORE taking next stamp
+  sid = rx_argus_store_id ar_dir1 len ar_dir1
+  rx_argus_emit_world_committed sid 7 5 10 2 0
+  ar_chk eq rx_argus_idle_pending 0
+  note Merge and verify causal ordering (0 late events, 0 findings)
+  n = rx_argus_merge 0
+  ar_chk eq n 3
+  rx_argus_stats
+  ar_chk eq get ar_stats_buf 0 3
+  ar_chk eq get ar_stats_buf 1 3
+  ar_chk eq get ar_stats_buf 3 10
+  ar_chk eq get ar_stats_buf 4 1
+  ar_chk eq get ar_stats_buf 9 3
+  ar_chk eq get ar_stats_buf 10 0
+  ar_chk eq get ar_stats_buf 11 0
+  note Revoke cap 5, then simulate use-after-revoke -> consumer emits finding
+  rx_argus_emit_cap_revoked 200 7 5 10 0
+  k2 = rx_argus_use_begin
+  rx_argus_use_end k2 7 5 10 999 0
+  rx_argus_idle
+  n2 = rx_argus_merge 0
+  ar_chk eq n2 2
+  rx_argus_stats
+  ar_chk eq get ar_stats_buf 10 1
+  ar_chk eq get ar_findings 0 1
+  ar_chk eq get ar_findings 3 5
+  note Failed validate emits full USED/DENIED event without finding
+  k3 = rx_argus_use_begin
+  rx_argus_use_end k3 7 5 10 999 1
+  rx_argus_shutdown
+  ar_chk eq rx_argus_active 0
+  rx_argus_stats
+  ar_chk eq get ar_stats_buf 10 1
+  ar_chk eq get ar_recv_by_kind AR_EV_USED 1
+  ar_chk eq get ar_recv_by_kind AR_EV_GRANTED 1
+  ar_chk eq get ar_recv_by_kind AR_EV_REVOKED 1
+  ar_chk eq get ar_recv_by_kind AR_EV_WORLD_COMMITTED 1
+  ar_chk eq get ar_recv_by_kind AR_EV_USE_SUMMARY 2
+end
+
+fn test_two_producer_merge_bound to void
+  ar_chk eq rx_argus_start AR_CONS_INGEST ar_run1 len ar_run1 0
+  note Producer 0 claims slot 0, grants cap 2, starts a use at stamp 2
+  rx_argus_emit_cap_granted 1 2 1 500 1 0
+  k0 = rx_argus_use_begin
+  rx_argus_use_end k0 1 2 1 500 0
+  note Producer 1 claims slot 1 and revokes cap 2 at stamp 2 -> key 2*2+1=5
+  rx_argus_set_tls AR_PRODUCERS
+  rx_argus_emit_cap_revoked 20 1 2 1 0
+  note Producer 0 still has pub=2 (bound=4) so merge holds back revoke (key=5) until producer 0 flushes!
+  m1 = rx_argus_merge 0
+  ar_chk eq m1 1
+  note Now producer 0 flushes and goes idle -> summary (key=4) ordered BEFORE revoke (key=5) -> 0 findings!
+  rx_argus_set_tls 0
+  rx_argus_idle
+  m2 = rx_argus_merge 0
+  ar_chk eq m2 2
+  rx_argus_stats
+  ar_chk eq get ar_stats_buf 10 0
+  ar_chk eq get ar_stats_buf 11 0
+  rx_argus_shutdown
+end
+
+fn ar_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len ar_msg_pass
+    for i ulong n bound 64
+      put buf i get ar_msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len ar_msg_fail
+  for i ulong n bound 64
+    put buf i get ar_msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  test_store_id
+  test_use_aggregation_and_causal_order
+  test_two_producer_merge_bound
+  if eq get ar_fail 0 0
+    ar_put_msg 1
+    ret 0
+  end
+  ar_put_msg 0
+  ret 1
+end

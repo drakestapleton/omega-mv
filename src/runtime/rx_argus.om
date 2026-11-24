@@ -1,0 +1,677 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_argus.om -- Pure seeded OM-2 port of src/runtime/rx_argus.c
+note Live ARGUS producer (per-thread SPSC rings + 256-slot use tables + causal stamp
+note ordering 2*e / 2*s+1) and ordered cross-ring merge consumer (ABI v1.1).
+note Requires seed/ng/sha256.om concatenated ahead of this unit.
+
+const AR_PRODUCERS ulong 8
+const AR_RING_CAP ulong 64
+const AR_RING_MASK ulong 63
+const AR_KEYS ulong 128
+const AR_KEYS_MASK ulong 127
+const AR_USE_SLOTS ulong 256
+const AR_USE_FLUSH_OPS ulong 64
+const AR_IDLE ulong 0xffffffffffffffff
+const AR_CAP_NONE ulong 4294967295
+const AR_FINDINGS_MAX ulong 64
+
+const AR_EV_GRANTED ulong 1
+const AR_EV_USED ulong 2
+const AR_EV_DENIED ulong 3
+const AR_EV_REVOKED ulong 4
+const AR_EV_MACHINE_JOINED ulong 5
+const AR_EV_WORLD_COMMITTED ulong 6
+const AR_EV_TELEMETRY_DROPPED ulong 7
+const AR_EV_USE_SUMMARY ulong 8
+const AR_EV_KIND_MAX ulong 8
+
+const AR_OUTCOME_OK ulong 0
+const AR_OUTCOME_DENIED ulong 1
+const AR_OUTCOME_ERROR ulong 2
+
+const AR_CONS_OFF ulong 0
+const AR_CONS_DISCARD ulong 1
+const AR_CONS_INGEST ulong 2
+
+note Event record layout: 12 ulongs per event
+note [0]=kind, [1]=outcome, [2]=code, [3]=sequence, [4]=stream, [5]=principal,
+note [6]=cap_id, [7]=cap_gen, [8]=world_gen, [9]=object_id, [10]=resource, [11]=tick
+const AR_EV_WORDS ulong 12
+
+note Global state:
+note ar_g[0]=active, [1]=mode, [2]=stamp, [3]=tls_slot (AR_PRODUCERS = none),
+note [4]=claimed, [5]=live, [6]=live_max, [7]=unregistered_uses, [8]=lost_transitions,
+note [9]=received, [10]=last_key, [11]=late_events, [12]=stall_breaks,
+note [13]=findings_total, [14]=lag_max, [15]=batches
+global ar_g ulong 16
+global ar_machine_id uchar 32
+global ar_recv_by_kind ulong 16
+
+note Per-producer slot metadata: 16 ulongs per slot (8 * 16 = 128)
+note [0]=owned, [1]=inited, [2]=epoch, [3]=ops, [4]=flush_at, [5]=flush_req,
+note [6]=pub, [7]=seq, [8]=leftover_key, [9]=head, [10]=tail,
+note [11]=emitted, [12]=pushed, [13]=refused, [14]=uses_flushed, [15]=summaries
+global ar_slot ulong 128
+note Extra per-slot counters: 4 ulongs per slot ([0]=summary_refused, [1]=order_slow, [2]=mixed_keys, [3]=stall_pub)
+global ar_slot_ex ulong 32
+global ar_emit_by_kind ulong 128
+
+note Per-slot 256-entry use table: 4 ulongs per entry ([0]=count, [1]=min_gen, [2]=max_gen, [3]=principal)
+note 8 * 256 * 4 = 8192 ulongs
+global ar_use ulong 8192
+
+note Per-slot ring events: 8 * 64 * 12 = 6144 ulongs
+global ar_ring ulong 6144
+note Per-slot side key array: 8 * 128 = 1024 ulongs
+global ar_keys ulong 1024
+
+note Consumer ingest tracking: per-cap live generation (0=not granted, >0=active, 0xffff..=revoked)
+global ar_cap_state ulong 256
+note Findings: 6 ulongs per finding ([0]=code, [1]=seq, [2]=principal, [3]=cap_id, [4]=cap_gen, [5]=key)
+global ar_findings ulong 384
+
+note Scratch event buffer (12 ulongs)
+global ar_ev_tmp ulong 12
+note Aggregated stats snapshot (24 ulongs)
+global ar_stats_buf ulong 24
+
+text ar_tag_store "ARGUS-STORE-v1"
+text ar_tag_prov "ARGUS-PROVISIONAL-MACHINE-v1"
+
+fn ar_reset_use_slot s ulong c ulong to void
+  base = mul add mul s AR_USE_SLOTS c 4
+  put ar_use base 0
+  put ar_use add base 1 AR_IDLE
+  put ar_use add base 2 0
+  put ar_use add base 3 0
+end
+
+fn rx_argus_store_id dir view uchar * n ulong to ulong
+  tlen = len ar_tag_store
+  for i ulong tlen bound 32
+    put sh_dat i get ar_tag_store i
+  end
+  for i ulong n bound 512
+    put sh_dat add tlen i get dir i
+  end
+  sh_all add tlen n
+  b0 = ulong get sh_dig 0
+  b1 = ulong get sh_dig 1
+  b2 = ulong get sh_dig 2
+  b3 = ulong get sh_dig 3
+  id = or or b0 shl b1 8 or shl b2 16 shl b3 24
+  if eq id 0
+    ret 1
+  end
+  ret id
+end
+
+fn rx_argus_start mode ulong run_id view uchar * run_len ulong to long
+  for i ulong 16
+    put ar_g i 0
+    put ar_recv_by_kind i 0
+  end
+  for i ulong 128
+    put ar_slot i 0
+    put ar_emit_by_kind i 0
+  end
+  for i ulong 32
+    put ar_slot_ex i 0
+  end
+  for i ulong 256
+    put ar_cap_state i 0
+  end
+  put ar_g 0 1
+  put ar_g 1 mode
+  put ar_g 2 1
+  put ar_g 3 AR_PRODUCERS
+  note Compute provisional machine_id = SHA-256("ARGUS-PROVISIONAL-MACHINE-v1" || run_id)
+  tlen = len ar_tag_prov
+  for i ulong tlen bound 64
+    put sh_dat i get ar_tag_prov i
+  end
+  for i ulong run_len bound 256
+    put sh_dat add tlen i get run_id i
+  end
+  sh_all add tlen run_len
+  for i ulong 32
+    put ar_machine_id i get sh_dig i
+  end
+  ret 0
+end
+
+fn rx_argus_active to ulong
+  ret get ar_g 0
+end
+
+fn ar_claim_slot to ulong
+  for i ulong AR_PRODUCERS
+    sb = mul i 16
+    if eq get ar_slot sb 0
+      put ar_slot sb 1
+      if eq get ar_slot add sb 1 0
+        put ar_slot add sb 7 1
+        put ar_slot add sb 4 AR_USE_FLUSH_OPS
+        put ar_slot add sb 6 AR_IDLE
+        for c ulong AR_USE_SLOTS
+          ar_reset_use_slot i c
+        end
+        put ar_g 4 add get ar_g 4 1
+        put ar_slot add sb 1 1
+      end
+      put ar_slot add sb 2 0
+      put ar_g 3 i
+      lv = add get ar_g 5 1
+      put ar_g 5 lv
+      if gt lv get ar_g 6
+        put ar_g 6 lv
+      end
+      ret i
+    end
+  end
+  ret AR_PRODUCERS
+end
+
+fn rx_argus_set_tls slot ulong to void
+  put ar_g 3 slot
+end
+
+fn ar_clear_ev kind ulong outcome ulong code ulong to void
+  for i ulong AR_EV_WORDS
+    put ar_ev_tmp i 0
+  end
+  put ar_ev_tmp 0 kind
+  put ar_ev_tmp 1 outcome
+  put ar_ev_tmp 2 code
+  put ar_ev_tmp 6 AR_CAP_NONE
+end
+
+fn ar_ring_push s ulong key ulong to long
+  sb = mul s 16
+  h = get ar_slot add sb 9
+  t = get ar_slot add sb 10
+  seq = get ar_slot add sb 7
+  put ar_ev_tmp 3 seq
+  put ar_ev_tmp 4 add s 1
+  put ar_slot add sb 11 add get ar_slot add sb 11 1
+  knd = get ar_ev_tmp 0
+  if le knd AR_EV_KIND_MAX
+    ki = add mul s 16 knd
+    put ar_emit_by_kind ki add get ar_emit_by_kind ki 1
+  end
+  if ge sub t h AR_RING_CAP
+    put ar_slot add sb 13 add get ar_slot add sb 13 1
+    ret -1
+  end
+  put ar_keys add mul s AR_KEYS and seq AR_KEYS_MASK key
+  rbase = mul add mul s AR_RING_CAP and t AR_RING_MASK AR_EV_WORDS
+  for i ulong AR_EV_WORDS
+    put ar_ring add rbase i get ar_ev_tmp i
+  end
+  put ar_slot add sb 10 add t 1
+  put ar_slot add sb 7 add seq 1
+  put ar_slot add sb 12 add get ar_slot add sb 12 1
+  ret 0
+end
+
+fn ar_flush_all s ulong to void
+  sb = mul s 16
+  exb = mul s 4
+  stamp = get ar_slot add sb 8
+  if eq stamp 0
+    stamp = get ar_slot add sb 2
+  end
+  left = ulong 0
+  for c ulong AR_USE_SLOTS
+    ub = mul add mul s AR_USE_SLOTS c 4
+    cnt = get ar_use ub
+    if ne cnt 0
+      ar_clear_ev AR_EV_USE_SUMMARY AR_OUTCOME_OK 0
+      put ar_ev_tmp 5 get ar_use add ub 3
+      put ar_ev_tmp 6 c
+      put ar_ev_tmp 10 cnt
+      put ar_ev_tmp 7 get ar_use add ub 2
+      put ar_ev_tmp 8 get ar_use add ub 1
+      put ar_slot add sb 15 add get ar_slot add sb 15 1
+      if eq ar_ring_push s mul 2 stamp 0
+        put ar_slot add sb 14 add get ar_slot add sb 14 cnt
+        ar_reset_use_slot s c
+      else
+        put ar_slot_ex exb add get ar_slot_ex exb 1
+        left = 1
+      end
+    end
+  end
+  if ne left 0
+    put ar_slot add sb 8 stamp
+  else
+    put ar_slot add sb 8 0
+  end
+  put ar_slot add sb 4 add get ar_slot add sb 3 AR_USE_FLUSH_OPS
+  put ar_slot add sb 5 0
+end
+
+fn rx_argus_flush_self to void
+  s = get ar_g 3
+  if lt s AR_PRODUCERS
+    ar_flush_all s
+  end
+end
+
+fn ar_go_idle s ulong to void
+  sb = mul s 16
+  put ar_slot add sb 2 0
+  put ar_slot add sb 6 AR_IDLE
+end
+
+fn rx_argus_use_begin_slow e ulong to ulong
+  if eq get ar_g 0 0
+    ret e
+  end
+  s = get ar_g 3
+  if ge s AR_PRODUCERS
+    s = ar_claim_slot
+    if ge s AR_PRODUCERS
+      ret e
+    end
+  end
+  sb = mul s 16
+  exb = mul s 4
+  ar_flush_all s
+  if ne get ar_slot add sb 8 0
+    put ar_slot_ex add exb 2 add get ar_slot_ex add exb 2 1
+  end
+  put ar_slot add sb 6 e
+  e2 = get ar_g 2
+  put ar_slot add sb 2 e2
+  ret e2
+end
+
+fn rx_argus_use_begin to ulong
+  e = get ar_g 2
+  s = get ar_g 3
+  if ge s AR_PRODUCERS
+    ret rx_argus_use_begin_slow e
+  end
+  if ne get ar_slot add mul s 16 2 e
+    ret rx_argus_use_begin_slow e
+  end
+  ret e
+end
+
+fn ar_transition tick ulong to void
+  if eq get ar_g 0 0
+    ret
+  end
+  s = get ar_g 3
+  if ge s AR_PRODUCERS
+    s = ar_claim_slot
+    if ge s AR_PRODUCERS
+      put ar_g 8 add get ar_g 8 1
+      ret
+    end
+  end
+  note Save transition event across flush_all (which reuses ar_ev_tmp)
+  saved = new ulong 12 0
+  for i ulong AR_EV_WORDS
+    put saved i get ar_ev_tmp i
+  end
+  ar_flush_all s
+  for i ulong AR_EV_WORDS
+    put ar_ev_tmp i get saved i
+  end
+  st = get ar_g 2
+  put ar_g 2 add st 1
+  put ar_ev_tmp 11 tick
+  sb = mul s 16
+  put ar_slot add sb 6 st
+  ign_p = ar_ring_push s add mul 2 st 1
+  if eq get ar_slot add sb 8 0
+    ar_go_idle s
+  end
+end
+
+fn rx_argus_use_slow key ulong subj ulong cap_id ulong gen ulong res ulong code ulong to void
+  if eq get ar_g 0 0
+    ret
+  end
+  s = get ar_g 3
+  if ge s AR_PRODUCERS
+    put ar_g 7 add get ar_g 7 1
+    ret
+  end
+  sb = mul s 16
+  exb = mul s 4
+  if eq code 0
+    if eq key get ar_slot add sb 2
+      if lt cap_id AR_USE_SLOTS
+        ar_flush_all s
+        ub = mul add mul s AR_USE_SLOTS cap_id 4
+        if eq get ar_use ub 0
+          put ar_use add ub 3 subj
+          put ar_use ub 1
+          put ar_use add ub 1 gen
+          put ar_use add ub 2 gen
+          put ar_slot add sb 3 add get ar_slot add sb 3 1
+          ret
+        end
+      end
+    else
+      put ar_slot_ex add exb 1 add get ar_slot_ex add exb 1 1
+    end
+  end
+  outc = AR_OUTCOME_DENIED
+  if eq code 0
+    outc = AR_OUTCOME_OK
+  end
+  ar_clear_ev AR_EV_USED outc code
+  put ar_ev_tmp 5 subj
+  put ar_ev_tmp 6 cap_id
+  put ar_ev_tmp 7 gen
+  put ar_ev_tmp 10 res
+  if eq key get ar_slot add sb 2
+    if eq get ar_slot add sb 8 0
+      ign_u = ar_ring_push s mul 2 key
+      ret
+    end
+  end
+  ar_transition 0
+end
+
+fn rx_argus_use_end key ulong subj ulong cap_id ulong gen ulong res ulong code ulong to void
+  s = get ar_g 3
+  if ne code 0
+    rx_argus_use_slow key subj cap_id gen res code
+    ret
+  end
+  if ge cap_id AR_USE_SLOTS
+    rx_argus_use_slow key subj cap_id gen res code
+    ret
+  end
+  if ge s AR_PRODUCERS
+    rx_argus_use_slow key subj cap_id gen res code
+    ret
+  end
+  sb = mul s 16
+  if ne key get ar_slot add sb 2
+    rx_argus_use_slow key subj cap_id gen res code
+    ret
+  end
+  ub = mul add mul s AR_USE_SLOTS cap_id 4
+  cnt = get ar_use ub
+  if ne cnt 0
+    if ne get ar_use add ub 3 subj
+      rx_argus_use_slow key subj cap_id gen res code
+      ret
+    end
+  end
+  put ar_use add ub 3 subj
+  put ar_use ub add cnt 1
+  if lt gen get ar_use add ub 1
+    put ar_use add ub 1 gen
+  end
+  if gt gen get ar_use add ub 2
+    put ar_use add ub 2 gen
+  end
+  nops = add get ar_slot add sb 3 1
+  put ar_slot add sb 3 nops
+  if ge nops get ar_slot add sb 4
+    rx_argus_flush_self
+    ret
+  end
+  if ne get ar_slot add sb 5 0
+    rx_argus_flush_self
+  end
+end
+
+fn rx_argus_idle_pending to ulong
+  s = get ar_g 3
+  if or ge s AR_PRODUCERS eq get ar_g 0 0
+    ret 0
+  end
+  sb = mul s 16
+  if or ne get ar_slot add sb 2 0 ne get ar_slot add sb 8 0
+    ret 1
+  end
+  ret 0
+end
+
+fn rx_argus_idle to void
+  s = get ar_g 3
+  if or ge s AR_PRODUCERS eq get ar_g 0 0
+    ret
+  end
+  sb = mul s 16
+  if and eq get ar_slot add sb 2 0 eq get ar_slot add sb 8 0
+    ret
+  end
+  ar_flush_all s
+  if eq get ar_slot add sb 8 0
+    ar_go_idle s
+  end
+end
+
+fn rx_argus_emit_cap_granted subj ulong cap_id ulong cap_gen ulong res ulong rights ulong code ulong to void
+  outc = AR_OUTCOME_OK
+  if ne code 0
+    outc = AR_OUTCOME_ERROR
+  end
+  ar_clear_ev AR_EV_GRANTED outc code
+  put ar_ev_tmp 5 subj
+  put ar_ev_tmp 6 cap_id
+  put ar_ev_tmp 7 cap_gen
+  put ar_ev_tmp 9 rights
+  put ar_ev_tmp 10 res
+  ar_transition 0
+end
+
+fn rx_argus_emit_cap_denied subj ulong cap_id ulong cap_gen ulong res ulong rights ulong code ulong to void
+  ar_clear_ev AR_EV_DENIED AR_OUTCOME_DENIED code
+  put ar_ev_tmp 5 subj
+  put ar_ev_tmp 6 cap_id
+  put ar_ev_tmp 7 cap_gen
+  put ar_ev_tmp 9 rights
+  put ar_ev_tmp 10 res
+  ar_transition 0
+end
+
+fn rx_argus_emit_cap_revoked tick ulong subj ulong cap_id ulong cap_gen ulong code ulong to void
+  outc = AR_OUTCOME_OK
+  if ne code 0
+    outc = AR_OUTCOME_ERROR
+  end
+  ar_clear_ev AR_EV_REVOKED outc code
+  put ar_ev_tmp 5 subj
+  put ar_ev_tmp 6 cap_id
+  put ar_ev_tmp 7 cap_gen
+  ar_transition tick
+end
+
+fn rx_argus_emit_world_committed store_id ulong subj ulong cap_id ulong cap_gen ulong wgen ulong code ulong to void
+  outc = AR_OUTCOME_OK
+  if ne code 0
+    outc = AR_OUTCOME_ERROR
+  end
+  ar_clear_ev AR_EV_WORLD_COMMITTED outc code
+  put ar_ev_tmp 5 subj
+  put ar_ev_tmp 6 cap_id
+  put ar_ev_tmp 7 cap_gen
+  put ar_ev_tmp 8 wgen
+  put ar_ev_tmp 9 store_id
+  ar_transition 0
+end
+
+fn ar_record_finding fcode ulong seq ulong subj ulong cap_id ulong cap_gen ulong key ulong to void
+  ft = get ar_g 13
+  if lt ft AR_FINDINGS_MAX
+    fb = mul ft 6
+    put ar_findings fb fcode
+    put ar_findings add fb 1 seq
+    put ar_findings add fb 2 subj
+    put ar_findings add fb 3 cap_id
+    put ar_findings add fb 4 cap_gen
+    put ar_findings add fb 5 key
+  end
+  put ar_g 13 add ft 1
+end
+
+fn ar_consume_one rbase ulong key ulong to void
+  put ar_g 9 add get ar_g 9 1
+  if lt key get ar_g 10
+    put ar_g 11 add get ar_g 11 1
+  else
+    put ar_g 10 key
+  end
+  knd = get ar_ring rbase
+  if le knd AR_EV_KIND_MAX
+    put ar_recv_by_kind knd add get ar_recv_by_kind knd 1
+  end
+  if ne get ar_g 1 AR_CONS_INGEST
+    ret
+  end
+  cap_id = get ar_ring add rbase 6
+  if ge cap_id AR_USE_SLOTS
+    ret
+  end
+  outc = get ar_ring add rbase 1
+  gen = get ar_ring add rbase 7
+  seq = get ar_ring add rbase 3
+  subj = get ar_ring add rbase 5
+  if and eq knd AR_EV_GRANTED eq outc AR_OUTCOME_OK
+    put ar_cap_state cap_id gen
+    ret
+  end
+  if and eq knd AR_EV_REVOKED eq outc AR_OUTCOME_OK
+    put ar_cap_state cap_id AR_IDLE
+    ret
+  end
+  if and or eq knd AR_EV_USE_SUMMARY eq knd AR_EV_USED eq outc AR_OUTCOME_OK
+    cur = get ar_cap_state cap_id
+    if eq cur AR_IDLE
+      ar_record_finding 1 seq subj cap_id gen key
+    end
+  end
+end
+
+global ar_merge_tmp ulong 2
+
+fn ar_merge_find_best to void
+  best = AR_PRODUCERS
+  best_key = AR_IDLE
+  for i ulong AR_PRODUCERS
+    sb = mul i 16
+    if ne get ar_slot add sb 1 0
+      h = get ar_slot add sb 9
+      t = get ar_slot add sb 10
+      depth = sub t h
+      if gt depth get ar_g 14
+        put ar_g 14 depth
+      end
+      if lt h t
+        rbase = mul add mul i AR_RING_CAP and h AR_RING_MASK AR_EV_WORDS
+        seq = get ar_ring add rbase 3
+        k = get ar_keys add mul i AR_KEYS and seq AR_KEYS_MASK
+        if lt k best_key
+          best_key = k
+          best = i
+        end
+      end
+    end
+  end
+  put ar_merge_tmp 0 best
+  put ar_merge_tmp 1 best_key
+end
+
+fn ar_merge_bound to ulong
+  bound_k = AR_IDLE
+  for i ulong AR_PRODUCERS
+    sb = mul i 16
+    if ne get ar_slot add sb 1 0
+      if ge get ar_slot add sb 9 get ar_slot add sb 10
+        pub = get ar_slot add sb 6
+        if ne pub AR_IDLE
+          pk = mul 2 pub
+          if lt pk bound_k
+            bound_k = pk
+          end
+        end
+      end
+    end
+  end
+  ret bound_k
+end
+
+note Ordered cross-ring merge pass. final=1 ignores producer pub bounds (shutdown).
+fn rx_argus_merge final ulong to ulong
+  done = ulong 0
+  keep_going = ulong 1
+  while ne keep_going 0 bound 512
+    ar_merge_find_best
+    best = get ar_merge_tmp 0
+    best_key = get ar_merge_tmp 1
+    if ge best AR_PRODUCERS
+      keep_going = 0
+    else
+      bound_k = AR_IDLE
+      if eq final 0
+        bound_k = ar_merge_bound
+      end
+      if le best_key bound_k
+        sb = mul best 16
+        h = get ar_slot add sb 9
+        rbase = mul add mul best AR_RING_CAP and h AR_RING_MASK AR_EV_WORDS
+        ar_consume_one rbase best_key
+        put ar_slot add sb 9 add h 1
+        done = add done 1
+      else
+        keep_going = 0
+      end
+    end
+  end
+  ret done
+end
+
+fn rx_argus_shutdown to void
+  if eq get ar_g 0 0
+    ret
+  end
+  for i ulong AR_PRODUCERS
+    sb = mul i 16
+    if ne get ar_slot add sb 1 0
+      ar_flush_all i
+      ar_go_idle i
+    end
+  end
+  ign_m = rx_argus_merge 1
+  put ar_g 0 0
+end
+
+note Populate ar_stats_buf:
+note [0]=emitted, [1]=pushed, [2]=ring_refused, [3]=uses_counted, [4]=summaries,
+note [5]=summary_refused, [6]=unregistered_uses, [7]=producers_claimed,
+note [8]=producers_max_live, [9]=received, [10]=findings_total, [11]=late_events,
+note [12]=lag_max
+fn rx_argus_stats to void
+  for i ulong 24
+    put ar_stats_buf i 0
+  end
+  for i ulong AR_PRODUCERS
+    sb = mul i 16
+    exb = mul i 4
+    if ne get ar_slot add sb 1 0
+      put ar_stats_buf 0 add get ar_stats_buf 0 get ar_slot add sb 11
+      put ar_stats_buf 1 add get ar_stats_buf 1 get ar_slot add sb 12
+      put ar_stats_buf 2 add get ar_stats_buf 2 get ar_slot add sb 13
+      put ar_stats_buf 3 add get ar_stats_buf 3 get ar_slot add sb 14
+      put ar_stats_buf 4 add get ar_stats_buf 4 get ar_slot add sb 15
+      put ar_stats_buf 5 add get ar_stats_buf 5 get ar_slot_ex exb
+    end
+  end
+  put ar_stats_buf 6 get ar_g 7
+  put ar_stats_buf 7 get ar_g 4
+  put ar_stats_buf 8 get ar_g 6
+  put ar_stats_buf 9 get ar_g 9
+  put ar_stats_buf 10 get ar_g 13
+  put ar_stats_buf 11 get ar_g 11
+  put ar_stats_buf 12 get ar_g 14
+end

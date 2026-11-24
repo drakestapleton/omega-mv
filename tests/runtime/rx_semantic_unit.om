@@ -1,0 +1,153 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_semantic_unit.om -- Pure seeded OM-2 unit test for rx_semantic.om.
+
+global sm_checks ulong 1
+global sm_fail ulong 1
+
+text sm_msg_pass "RX_SEMANTIC_OM: PASS\n"
+text sm_msg_fail "RX_SEMANTIC_OM: FAIL\n"
+text sm_impl1 "sum_v1"
+text sm_impl2 "mod_v1"
+text sm_impl3 "dbl_v1"
+
+fn sm_chk cond bool to void
+  put sm_checks 0 add get sm_checks 0 1
+  if not cond
+    put sm_fail 0 add get sm_fail 0 1
+  end
+end
+
+global sm_ids ulong 8
+
+fn setup_graph to void
+  sm_chk eq rx_sem_init SM_OK
+  d = new uchar 32 0
+  rx_sem_digest_impl sm_impl1 len sm_impl1 d
+  f_sum = rx_sem_add_fn SM_OP_SUM 1 1 0 d
+  rx_sem_digest_impl sm_impl2 len sm_impl2 d
+  f_mod = rx_sem_add_fn SM_OP_CONST_MOD 1 1 10 d
+  rx_sem_digest_impl sm_impl3 len sm_impl3 d
+  f_dbl = rx_sem_add_fn SM_OP_DOUBLE 1 1 0 d
+  sm_chk eq f_sum 0
+  sm_chk eq f_mod 1
+  sm_chk eq f_dbl 2
+  s0 = rx_sem_add_source 1 0 1
+  s1 = rx_sem_add_source 1 1 1
+  s2 = rx_sem_add_source 2 0 1
+  put sm_ids 0 s0
+  put sm_ids 1 s1
+  put sm_ids 2 s2
+  sm_chk ne s0 0
+  sm_chk ne s1 0
+  sm_chk ne s2 0
+  ins = new ulong 4 0
+  put ins 0 s0
+  n_mod = rx_sem_add_node ulong f_mod ins 1
+  put ins 0 n_mod
+  put ins 1 s1
+  n_sum = rx_sem_add_node ulong f_sum ins 2
+  put ins 0 n_sum
+  n_dbl = rx_sem_add_node ulong f_dbl ins 1
+  put sm_ids 3 n_mod
+  put sm_ids 4 n_sum
+  put sm_ids 5 n_dbl
+  sm_chk ne n_mod 0
+  sm_chk ne n_sum 0
+  sm_chk ne n_dbl 0
+end
+
+fn test_three_layers_and_verify to void
+  setup_graph
+  s0 = get sm_ids 0
+  s1 = get sm_ids 1
+  s2 = get sm_ids 2
+  n_mod = get sm_ids 3
+  n_dbl = get sm_ids 5
+  b0 = rx_sem_branch_root 1 100
+  sm_chk eq b0 0
+  w = new ulong 4 0
+  put w 0 13
+  sm_chk eq rx_sem_set_source 0 s0 1 w 1 SM_OK
+  put w 0 5
+  sm_chk eq rx_sem_set_source 0 s1 1 w 1 SM_OK
+  put w 0 99
+  sm_chk eq rx_sem_set_source 0 s2 1 w 1 SM_OK
+  note First get computes n_mod=3, n_sum=8, n_dbl=16
+  outv = new ulong 4 0
+  sm_chk eq rx_sem_get 0 n_dbl outv SM_OK
+  sm_chk eq get outv 0 16
+  sm_chk eq get sm_last_served 0 SM_SERVED_COMPUTED
+  sm_chk eq get sm_stats 8 3
+  note Layer 1: CLEAN memo hit -> no work
+  sm_chk eq rx_sem_get 0 n_dbl outv SM_OK
+  sm_chk eq get outv 0 16
+  sm_chk eq get sm_last_served 0 SM_SERVED_MEMO
+  sm_chk eq get sm_stats 8 3
+  note Unrelated source s2 write does NOT invalidate n_dbl (field granularity)
+  put w 0 100
+  sm_chk eq rx_sem_set_source 0 s2 1 w 1 SM_OK
+  sm_chk eq rx_sem_state 0 n_dbl long SM_CLEAN
+  note Same-content write to s0 does NOT invalidate
+  put w 0 13
+  sm_chk eq rx_sem_set_source 0 s0 1 w 1 SM_OK
+  sm_chk eq rx_sem_state 0 n_mod long SM_CLEAN
+  sm_chk eq get sm_stats 11 1
+  note Layer 2: Early cutoff! s0 changes 13 -> 23 (same mod 10 = 3)
+  put w 0 23
+  sm_chk eq rx_sem_set_source 0 s0 1 w 1 SM_OK
+  sm_chk eq rx_sem_state 0 n_mod long SM_DIRTY
+  sm_chk eq rx_sem_state 0 n_dbl long SM_DIRTY
+  sm_chk eq rx_sem_get 0 n_dbl outv SM_OK
+  sm_chk eq get outv 0 16
+  sm_chk eq get sm_last_served 0 SM_SERVED_CUTOFF
+  note Only n_mod recomputed (computes 3 -> 4); n_sum and n_dbl cut off!
+  sm_chk eq get sm_stats 8 4
+  sm_chk ge get sm_stats 2 2
+  note Layer 3: Cross-branch shared content-addressed cache!
+  b1 = rx_sem_branch_fork 0 2 200 7
+  sm_chk eq b1 1
+  note In b1, change s0 back to 13 -> n_mod hits cache entry produced by b0!
+  put w 0 13
+  sm_chk eq rx_sem_set_source 1 s0 1 w 1 SM_OK
+  sm_chk eq rx_sem_get 1 n_mod outv SM_OK
+  sm_chk eq get outv 0 3
+  sm_chk eq get sm_last_served 0 SM_SERVED_CACHE
+  sm_chk ge get sm_stats 3 1
+  sm_chk ge get sm_stats 4 1
+  sm_chk ge get sm_stats 5 1
+  sm_chk ge get sm_stats 6 1
+  sm_chk ge get sm_stats 7 1
+  note Verify all cache entry digests and provenance event chain
+  sm_chk eq rx_sem_verify SM_OK
+  note Stale source returns SM_ERR_STALE
+  sm_chk eq rx_sem_mark_stale 1 s0 SM_OK
+  sm_chk eq rx_sem_get 1 n_mod outv SM_ERR_STALE
+  sm_chk eq rx_sem_branch_drop 1 SM_OK
+end
+
+fn sm_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len sm_msg_pass
+    for i ulong n bound 64
+      put buf i get sm_msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len sm_msg_fail
+  for i ulong n bound 64
+    put buf i get sm_msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  test_three_layers_and_verify
+  if eq get sm_fail 0 0
+    sm_put_msg 1
+    ret 0
+  end
+  sm_put_msg 0
+  ret 1
+end

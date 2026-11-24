@@ -1,0 +1,1296 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_semantic.om -- Pure seeded OM-2 port of src/runtime/rx_semantic.c
+note Semantic variables and incremental recomputation:
+note   1. Per-branch memo (CLEAN/DIRTY/ABSENT) with field- or object-granular invalidation
+note   2. Early cutoff on unchanged content key
+note   3. Shared content-addressed cache across branches/agents/tasks/candidates
+note   4. Hash-chained PRODUCE/REUSE provenance events + full rx_sem_verify
+note Requires seed/ng/sha256.om concatenated ahead of this unit.
+
+const SM_OK long 0
+const SM_ERR_ARG long -60
+const SM_ERR_FULL long -61
+const SM_ERR_NOT_FOUND long -62
+const SM_ERR_STALE long -63
+const SM_ERR_FN long -64
+const SM_ERR_EXISTS long -66
+const SM_ERR_VERIFY long -67
+
+const SM_MAX_SOURCES ulong 32
+const SM_MAX_NODES ulong 32
+const SM_MAX_FNS ulong 16
+const SM_MAX_INPUTS ulong 4
+const SM_MAX_BRANCHES ulong 8
+const SM_VAL_WORDS ulong 4
+const SM_CACHE_SLOTS ulong 128
+const SM_CACHE_MASK ulong 127
+const SM_MAX_EVENTS ulong 256
+const SM_NONE ulong 4294967295
+const SM_CONF_ONE ulong 1000000
+
+const SM_KIND_SOURCE ulong 1
+const SM_KIND_DERIVED ulong 2
+
+const SM_ABSENT ulong 0
+const SM_CLEAN ulong 1
+const SM_DIRTY ulong 2
+
+const SM_SERVED_MEMO ulong 1
+const SM_SERVED_CUTOFF ulong 2
+const SM_SERVED_CACHE ulong 3
+const SM_SERVED_COMPUTED ulong 4
+
+const SM_GRAIN_FIELD ulong 0
+const SM_GRAIN_OBJECT ulong 1
+
+const SM_EV_PRODUCE ulong 1
+const SM_EV_REUSE ulong 2
+
+note Built-in pure derivation opcodes for OM-2 dispatch:
+const SM_OP_SUM ulong 1
+const SM_OP_PROD ulong 2
+const SM_OP_CONST_MOD ulong 3
+const SM_OP_DOUBLE ulong 4
+
+note Engine meta:
+note [0]=grain, [1]=cache_enabled, [2]=audit, [3]=n_fns, [4]=n_sources, [5]=n_nodes,
+note [6]=cache_seq, [7]=cache_used, [8]=n_events, [9]=event_overflow
+global sm_eng ulong 16
+
+note Stats:
+note [0]=gets, [1]=memo_hits, [2]=cutoffs, [3]=cache_hits,
+note [4]=cross_branch, [5]=cross_agent, [6]=cross_task, [7]=cross_cand,
+note [8]=computes, [9]=invalidations, [10]=source_writes, [11]=source_writes_unchanged,
+note [12]=audits, [13]=false_hits, [14]=cache_full
+global sm_stats ulong 16
+
+note Registered fns: 4 ulongs each ([0]=op_code, [1]=out_type, [2]=gen, [3]=param) -> 64
+global sm_fns ulong 64
+note Fn derivation digests: 16 * 32 = 512
+global sm_fn_dig uchar 512
+
+note Sources: 6 ulongs each ([0]=used, [1]=sid, [2]=type, [3]=obj_id, [4]=field, [5]=n_readers) -> 192
+global sm_src ulong 192
+note Source readers: 32 * 32 = 1024
+global sm_src_rdr ulong 1024
+
+note Nodes: 5 ulongs each ([0]=used, [1]=sid, [2]=fn_id, [3]=n_inputs, [4]=n_readers) -> 160
+global sm_nod ulong 160
+note Node inputs: 32 * 4 = 128
+global sm_nod_in ulong 128
+note Node readers: 32 * 32 = 1024
+global sm_nod_rdr ulong 1024
+
+note Branches: 8 branches
+note meta: 8 * 8 ([0]=live, [1]=parent, [2]=agent, [3]=task, [4]=cand, [5]=ver_clock, [6]=inval, [7]=0) = 64
+global sm_br ulong 64
+note Per-branch source flags: 8 * 32 * 4 ([0]=have, [1]=stale, [2]=gen, [3]=ver) = 1024
+global sm_br_sf ulong 1024
+note Per-branch source values: 8 * 32 * 4 = 1024 ulongs
+global sm_br_sv ulong 1024
+note Per-branch source n_words & conf: 8 * 32 * 2 = 512
+global sm_br_sm ulong 512
+note Per-branch source digests: 8 * 32 * 32 = 8192
+global sm_br_sd uchar 8192
+
+note Per-branch node memo state: 8 * 32 * 4 ([0]=state, [1]=entry, [2]=ver, [3]=conf) = 1024
+global sm_br_nm ulong 1024
+note Per-branch node memo values: 8 * 32 * 4 = 1024
+global sm_br_nv ulong 1024
+note Per-branch node memo n_words & gen & type: 8 * 32 * 3 = 768
+global sm_br_nt ulong 768
+note Per-branch node memo value digest: 8 * 32 * 32 = 8192
+global sm_br_nd uchar 8192
+note Per-branch node memo key: 8 * 32 * 32 = 8192
+global sm_br_nk uchar 8192
+
+note Shared content-addressed cache: 128 slots
+note meta: 128 * 12 ([0]=used, [1]=fn_id, [2]=n_in, [3]=prod_br, [4]=prod_ag, [5]=prod_task,
+note [6]=prod_cand, [7]=seq, [8]=reuses, [9]=res_type, [10]=res_nwords, [11]=res_conf) = 1536
+global sm_ca ulong 1536
+note Cache input sids & gens: 128 * 4 * 2 = 1024
+global sm_ca_in ulong 1024
+note Cache input digests: 128 * 4 * 32 = 16384
+global sm_ca_id uchar 16384
+note Cache result values: 128 * 4 = 512
+global sm_ca_rv ulong 512
+note Cache digests (4 per slot: 0=deriv, 1=key, 2=res_vdig, 3=entry_dig): 128 * 128 = 16384
+global sm_ca_dg uchar 16384
+
+note Provenance events: 256 events
+note meta: 256 * 7 ([0]=id, [1]=kind, [2]=entry, [3]=branch, [4]=agent, [5]=task, [6]=cand) = 1792
+global sm_ev ulong 1792
+note Event digests (3 per event: 0=entry_dig, 1=prev, 2=digest): 256 * 96 = 24576
+global sm_ev_dg uchar 24576
+
+note Scratch buffers
+global sm_seen uchar 32
+global sm_tmp_dig uchar 32
+global sm_tmp_dig2 uchar 32
+global sm_key_tmp uchar 32
+global sm_in_sid ulong 4
+global sm_in_gen ulong 4
+global sm_in_dig uchar 128
+global sm_in_val ulong 16
+global sm_in_nw ulong 4
+global sm_in_conf ulong 4
+global sm_out_val ulong 4
+global sm_out_meta ulong 4
+global sm_last_served ulong 1
+
+text sm_tag_val "omega.sem.value.v1"
+text sm_tag_drv "omega.sem.derivation.v1"
+text sm_tag_nod "omega.sem.node.v1"
+text sm_tag_key "omega.sem.key.v1"
+text sm_tag_ent "omega.sem.entry.v1"
+text sm_tag_evt "omega.sem.event.v1"
+
+fn sm_sh_u32 p ulong v ulong to ulong
+  put sh_dat p uchar and v 255
+  put sh_dat add p 1 uchar and shr v 8 255
+  put sh_dat add p 2 uchar and shr v 16 255
+  put sh_dat add p 3 uchar and shr v 24 255
+  ret add p 4
+end
+
+fn sm_sh_u64 p ulong v ulong to ulong
+  q = sm_sh_u32 p and v 4294967295
+  ret sm_sh_u32 q shr v 32
+end
+
+fn sm_sh_tag p ulong t view uchar * to ulong
+  n = len t
+  for i ulong n bound 64
+    put sh_dat add p i get t i
+  end
+  put sh_dat add p n 0
+  ret add add p n 1
+end
+
+fn rx_sem_digest_eq a view uchar 32 b view uchar 32 to ulong
+  diff = ulong 0
+  for i ulong 32
+    diff = or diff xor ulong get a i ulong get b i
+  end
+  if eq diff 0
+    ret 1
+  end
+  ret 0
+end
+
+fn rx_sem_digest_value typ ulong words view ulong 4 nw ulong dst edit uchar 32 to void
+  p = sm_sh_tag 0 sm_tag_val
+  p = sm_sh_u32 p typ
+  p = sm_sh_u32 p nw
+  for i ulong nw bound 4
+    p = sm_sh_u64 p get words i
+  end
+  sh_all p
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn rx_sem_digest_impl txt view uchar * n ulong dst edit uchar 32 to void
+  for i ulong n bound 256
+    put sh_dat i get txt i
+  end
+  sh_all n
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn rx_sem_init to long
+  for i ulong 16
+    put sm_eng i 0
+    put sm_stats i 0
+  end
+  for i ulong 192
+    put sm_src i 0
+  end
+  for i ulong 160
+    put sm_nod i 0
+  end
+  for i ulong 64
+    put sm_br i 0
+  end
+  for i ulong 1536
+    put sm_ca i 0
+  end
+  put sm_eng 0 SM_GRAIN_FIELD
+  put sm_eng 1 1
+  ret SM_OK
+end
+
+fn rx_sem_set_mode grain ulong cache_en ulong audit ulong to void
+  put sm_eng 0 grain
+  put sm_eng 1 cache_en
+  put sm_eng 2 audit
+end
+
+fn sm_source_idx sid ulong to ulong
+  n = get sm_eng 4
+  for i ulong n bound 32
+    sb = mul i 6
+    if ne get sm_src sb 0
+      if eq get sm_src add sb 1 sid
+        ret i
+      end
+    end
+  end
+  ret SM_NONE
+end
+
+fn sm_node_idx sid ulong to ulong
+  n = get sm_eng 5
+  for i ulong n bound 32
+    nb = mul i 5
+    if ne get sm_nod nb 0
+      if eq get sm_nod add nb 1 sid
+        ret i
+      end
+    end
+  end
+  ret SM_NONE
+end
+
+fn rx_sem_add_fn op_code ulong out_type ulong gen ulong param ulong impl_dig view uchar 32 to long
+  n = get sm_eng 3
+  if ge n SM_MAX_FNS
+    ret SM_ERR_FULL
+  end
+  fb = mul n 4
+  put sm_fns fb op_code
+  put sm_fns add fb 1 out_type
+  put sm_fns add fb 2 gen
+  put sm_fns add fb 3 param
+  p = sm_sh_tag 0 sm_tag_drv
+  p = sm_sh_u32 p op_code
+  p = sm_sh_u32 p out_type
+  p = sm_sh_u32 p gen
+  p = sm_sh_u32 p param
+  for i ulong 32
+    put sh_dat add p i get impl_dig i
+  end
+  sh_all add p 32
+  db = mul n 32
+  for i ulong 32
+    put sm_fn_dig add db i get sh_dig i
+  end
+  put sm_eng 3 add n 1
+  ret long n
+end
+
+fn rx_sem_source_id obj_id ulong fld ulong to ulong
+  ret or shl SM_KIND_SOURCE 56 or shl obj_id 8 fld
+end
+
+fn rx_sem_add_source obj_id ulong fld ulong typ ulong to ulong
+  sid = rx_sem_source_id obj_id fld
+  if ne sm_source_idx sid SM_NONE
+    ret 0
+  end
+  n = get sm_eng 4
+  if ge n SM_MAX_SOURCES
+    ret 0
+  end
+  sb = mul n 6
+  put sm_src sb 1
+  put sm_src add sb 1 sid
+  put sm_src add sb 2 typ
+  put sm_src add sb 3 obj_id
+  put sm_src add sb 4 fld
+  put sm_src add sb 5 0
+  put sm_eng 4 add n 1
+  ret sid
+end
+
+fn sm_node_id fn_id ulong inputs view ulong 4 n ulong to ulong
+  p = sm_sh_tag 0 sm_tag_nod
+  db = mul fn_id 32
+  for i ulong 32
+    put sh_dat add p i get sm_fn_dig add db i
+  end
+  p = add p 32
+  p = sm_sh_u32 p n
+  for i ulong n bound 4
+    p = sm_sh_u64 p get inputs i
+  end
+  sh_all p
+  v = ulong 0
+  for i ulong 7
+    b = ulong get sh_dig i
+    v = or v shl b mul i 8
+  end
+  ret or shl SM_KIND_DERIVED 56 v
+end
+
+fn sm_attach_reader sid ulong idx ulong to void
+  if eq shr sid 56 SM_KIND_SOURCE
+    si = sm_source_idx sid
+    nr = get sm_src add mul si 6 5
+    put sm_src_rdr add mul si SM_MAX_NODES nr idx
+    put sm_src add mul si 6 5 add nr 1
+    ret
+  end
+  pi = sm_node_idx sid
+  nr = get sm_nod add mul pi 5 4
+  put sm_nod_rdr add mul pi SM_MAX_NODES nr idx
+  put sm_nod add mul pi 5 4 add nr 1
+end
+
+fn rx_sem_add_node fn_id ulong inputs view ulong 4 n ulong to ulong
+  if or eq n 0 gt n SM_MAX_INPUTS
+    ret 0
+  end
+  if ge fn_id get sm_eng 3
+    ret 0
+  end
+  for i ulong n bound 4
+    sid = get inputs i
+    k = shr sid 56
+    if eq k SM_KIND_SOURCE
+      if eq sm_source_idx sid SM_NONE
+        ret 0
+      end
+    else
+      if eq k SM_KIND_DERIVED
+        if eq sm_node_idx sid SM_NONE
+          ret 0
+        end
+      else
+        ret 0
+      end
+    end
+    for j ulong i bound 4
+      if eq get inputs j sid
+        ret 0
+      end
+    end
+  end
+  nsid = sm_node_id fn_id inputs n
+  have = sm_node_idx nsid
+  if ne have SM_NONE
+    ret nsid
+  end
+  idx = get sm_eng 5
+  if ge idx SM_MAX_NODES
+    ret 0
+  end
+  nb = mul idx 5
+  put sm_nod nb 1
+  put sm_nod add nb 1 nsid
+  put sm_nod add nb 2 fn_id
+  put sm_nod add nb 3 n
+  put sm_nod add nb 4 0
+  ib = mul idx 4
+  for i ulong n bound 4
+    sid = get inputs i
+    put sm_nod_in add ib i sid
+    sm_attach_reader sid idx
+  end
+  put sm_eng 5 add idx 1
+  ret nsid
+end
+
+fn sm_branch_alloc to long
+  for i ulong SM_MAX_BRANCHES
+    if eq get sm_br mul i 8 0
+      ret long i
+    end
+  end
+  ret SM_ERR_FULL
+end
+
+fn rx_sem_branch_root agent ulong task ulong to long
+  id = sm_branch_alloc
+  if lt id 0
+    ret id
+  end
+  u = ulong id
+  bb = mul u 8
+  put sm_br bb 1
+  put sm_br add bb 1 SM_NONE
+  put sm_br add bb 2 agent
+  put sm_br add bb 3 task
+  put sm_br add bb 4 0
+  put sm_br add bb 5 0
+  put sm_br add bb 6 0
+  for i ulong SM_MAX_SOURCES
+    sf = mul add mul u SM_MAX_SOURCES i 4
+    put sm_br_sf sf 0
+    put sm_br_sf add sf 1 0
+  end
+  for i ulong SM_MAX_NODES
+    nm = mul add mul u SM_MAX_NODES i 4
+    put sm_br_nm nm SM_ABSENT
+    put sm_br_nm add nm 1 SM_NONE
+  end
+  ret id
+end
+
+fn sm_fork_sources u ulong parent ulong to void
+  for i ulong SM_MAX_SOURCES
+    dsf = mul add mul u SM_MAX_SOURCES i 4
+    ssf = mul add mul parent SM_MAX_SOURCES i 4
+    for k ulong 4
+      put sm_br_sf add dsf k get sm_br_sf add ssf k
+      put sm_br_sv add dsf k get sm_br_sv add ssf k
+    end
+  end
+  for i ulong SM_MAX_SOURCES
+    dsm = mul add mul u SM_MAX_SOURCES i 2
+    ssm = mul add mul parent SM_MAX_SOURCES i 2
+    put sm_br_sm dsm get sm_br_sm ssm
+    put sm_br_sm add dsm 1 get sm_br_sm add ssm 1
+  end
+  for i ulong SM_MAX_SOURCES
+    dsd = mul add mul u SM_MAX_SOURCES i 32
+    ssd = mul add mul parent SM_MAX_SOURCES i 32
+    for k ulong 32
+      put sm_br_sd add dsd k get sm_br_sd add ssd k
+    end
+  end
+end
+
+fn sm_fork_nodes u ulong parent ulong to void
+  for i ulong SM_MAX_NODES
+    dnm = mul add mul u SM_MAX_NODES i 4
+    snm = mul add mul parent SM_MAX_NODES i 4
+    for k ulong 4
+      put sm_br_nm add dnm k get sm_br_nm add snm k
+      put sm_br_nv add dnm k get sm_br_nv add snm k
+    end
+  end
+  for i ulong SM_MAX_NODES
+    dnt = mul add mul u SM_MAX_NODES i 3
+    snt = mul add mul parent SM_MAX_NODES i 3
+    for k ulong 3
+      put sm_br_nt add dnt k get sm_br_nt add snt k
+    end
+  end
+  for i ulong SM_MAX_NODES
+    dnd = mul add mul u SM_MAX_NODES i 32
+    snd = mul add mul parent SM_MAX_NODES i 32
+    for k ulong 32
+      put sm_br_nd add dnd k get sm_br_nd add snd k
+      put sm_br_nk add dnd k get sm_br_nk add snd k
+    end
+  end
+end
+
+fn rx_sem_branch_fork parent ulong agent ulong task ulong cand ulong to long
+  if ge parent SM_MAX_BRANCHES
+    ret SM_ERR_NOT_FOUND
+  end
+  if eq get sm_br mul parent 8 0
+    ret SM_ERR_NOT_FOUND
+  end
+  id = sm_branch_alloc
+  if lt id 0
+    ret id
+  end
+  u = ulong id
+  bb = mul u 8
+  put sm_br bb 1
+  put sm_br add bb 1 parent
+  put sm_br add bb 2 agent
+  put sm_br add bb 3 task
+  put sm_br add bb 4 cand
+  put sm_br add bb 5 get sm_br add mul parent 8 5
+  put sm_br add bb 6 0
+  sm_fork_sources u parent
+  sm_fork_nodes u parent
+  ret id
+end
+
+fn rx_sem_branch_drop br ulong to long
+  if ge br SM_MAX_BRANCHES
+    ret SM_ERR_NOT_FOUND
+  end
+  if eq get sm_br mul br 8 0
+    ret SM_ERR_NOT_FOUND
+  end
+  put sm_br mul br 8 0
+  ret SM_OK
+end
+
+fn rx_sem_branch_context br ulong agent ulong task ulong cand ulong to long
+  if ge br SM_MAX_BRANCHES
+    ret SM_ERR_NOT_FOUND
+  end
+  bb = mul br 8
+  if eq get sm_br bb 0
+    ret SM_ERR_NOT_FOUND
+  end
+  put sm_br add bb 2 agent
+  put sm_br add bb 3 task
+  put sm_br add bb 4 cand
+  ret SM_OK
+end
+
+note Iterative transitive dirty propagation (no recursion needed).
+fn sm_dirty_propagate br ulong to void
+  changed = ulong 1
+  while ne changed 0 bound 32
+    changed = 0
+    nn = get sm_eng 5
+    for idx ulong nn bound 32
+      if eq get sm_seen idx 1
+        put sm_seen idx 2
+        nm = mul add mul br SM_MAX_NODES idx 4
+        if eq get sm_br_nm nm SM_CLEAN
+          put sm_br_nm nm SM_DIRTY
+          bb = mul br 8
+          put sm_br add bb 6 add get sm_br add bb 6 1
+          put sm_stats 9 add get sm_stats 9 1
+        end
+        nr = get sm_nod add mul idx 5 4
+        rb = mul idx SM_MAX_NODES
+        for r ulong nr bound 32
+          rd = get sm_nod_rdr add rb r
+          if eq get sm_seen rd 0
+            put sm_seen rd 1
+            changed = 1
+          end
+        end
+      end
+    end
+  end
+end
+
+fn sm_dirty_source br ulong si ulong to void
+  for i ulong SM_MAX_NODES
+    put sm_seen i 0
+  end
+  if eq get sm_eng 0 SM_GRAIN_OBJECT
+    obj = get sm_src add mul si 6 3
+    ns = get sm_eng 4
+    for j ulong ns bound 32
+      sb = mul j 6
+      if ne get sm_src sb 0
+        if eq get sm_src add sb 3 obj
+          nr = get sm_src add sb 5
+          rb = mul j SM_MAX_NODES
+          for r ulong nr bound 32
+            put sm_seen get sm_src_rdr add rb r 1
+          end
+        end
+      end
+    end
+  else
+    nr = get sm_src add mul si 6 5
+    rb = mul si SM_MAX_NODES
+    for r ulong nr bound 32
+      put sm_seen get sm_src_rdr add rb r 1
+    end
+  end
+  sm_dirty_propagate br
+end
+
+fn sm_src_dig_matches sd ulong dig view uchar 32 to ulong
+  diff = ulong 0
+  for i ulong 32
+    diff = or diff xor ulong get sm_br_sd add sd i ulong get dig i
+  end
+  if eq diff 0
+    ret 1
+  end
+  ret 0
+end
+
+fn sm_set_src_commit br ulong si ulong gen ulong words view ulong 4 nw ulong to void
+  sf = mul add mul br SM_MAX_SOURCES si 4
+  bb = mul br 8
+  vc = add get sm_br add bb 5 1
+  put sm_br add bb 5 vc
+  put sm_br_sf sf 1
+  put sm_br_sf add sf 2 gen
+  put sm_br_sf add sf 3 vc
+  for i ulong nw bound 4
+    put sm_br_sv add sf i get words i
+  end
+  sm = mul add mul br SM_MAX_SOURCES si 2
+  put sm_br_sm sm nw
+  put sm_br_sm add sm 1 SM_CONF_ONE
+  sd = mul add mul br SM_MAX_SOURCES si 32
+  for i ulong 32
+    put sm_br_sd add sd i get sm_tmp_dig i
+  end
+  sm_dirty_source br si
+end
+
+fn rx_sem_set_source br ulong sid ulong gen ulong words view ulong 4 nw ulong to long
+  if or ge br SM_MAX_BRANCHES gt nw SM_VAL_WORDS
+    ret SM_ERR_ARG
+  end
+  if eq get sm_br mul br 8 0
+    ret SM_ERR_NOT_FOUND
+  end
+  si = sm_source_idx sid
+  if eq si SM_NONE
+    ret SM_ERR_NOT_FOUND
+  end
+  typ = get sm_src add mul si 6 2
+  dig = new uchar 32 0
+  rx_sem_digest_value typ words nw dig
+  for i ulong 32
+    put sm_tmp_dig i get dig i
+  end
+  put sm_stats 10 add get sm_stats 10 1
+  sf = mul add mul br SM_MAX_SOURCES si 4
+  had = get sm_br_sf sf
+  was_stale = get sm_br_sf add sf 1
+  put sm_br_sf add sf 1 0
+  sd = mul add mul br SM_MAX_SOURCES si 32
+  if ne had 0
+    if eq was_stale 0
+      if eq get sm_br_sf add sf 2 gen
+        if ne sm_src_dig_matches sd dig 0
+          put sm_stats 11 add get sm_stats 11 1
+          ret SM_OK
+        end
+      end
+    end
+  end
+  sm_set_src_commit br si gen words nw
+  ret SM_OK
+end
+
+fn rx_sem_mark_stale br ulong sid ulong to long
+  if ge br SM_MAX_BRANCHES
+    ret SM_ERR_NOT_FOUND
+  end
+  si = sm_source_idx sid
+  if eq si SM_NONE
+    ret SM_ERR_NOT_FOUND
+  end
+  sf = mul add mul br SM_MAX_SOURCES si 4
+  if eq get sm_br_sf add sf 1 0
+    put sm_br_sf add sf 1 1
+    sm_dirty_source br si
+  end
+  ret SM_OK
+end
+
+fn sm_compute_key fn_id ulong n_in ulong to void
+  p = sm_sh_tag 0 sm_tag_key
+  db = mul fn_id 32
+  for i ulong 32
+    put sh_dat add p i get sm_fn_dig add db i
+  end
+  p = add p 32
+  p = sm_sh_u32 p n_in
+  for i ulong n_in bound 4
+    p = sm_sh_u64 p get sm_in_sid i
+    p = sm_sh_u32 p get sm_in_gen i
+    ib = mul i 32
+    for j ulong 32
+      put sh_dat add p j get sm_in_dig add ib j
+    end
+    p = add p 32
+  end
+  sh_all p
+  for i ulong 32
+    put sm_key_tmp i get sh_dig i
+  end
+end
+
+fn sm_sh_copy_ca_dg p ulong off ulong to ulong
+  for i ulong 32
+    put sh_dat add p i get sm_ca_dg add off i
+  end
+  ret add p 32
+end
+
+fn sm_sh_copy_ca_id p ulong off ulong to ulong
+  for j ulong 32
+    put sh_dat add p j get sm_ca_id add off j
+  end
+  ret add p 32
+end
+
+fn sm_cache_entry_digest slot ulong to void
+  cb = mul slot 12
+  dg = mul slot 128
+  p = sm_sh_tag 0 sm_tag_ent
+  p = sm_sh_u32 p get sm_ca add cb 1
+  p = sm_sh_copy_ca_dg p dg
+  p = sm_sh_copy_ca_dg p add dg 32
+  ni = get sm_ca add cb 2
+  p = sm_sh_u32 p ni
+  inb = mul slot 8
+  idb = mul slot 128
+  for i ulong ni bound 4
+    p = sm_sh_u64 p get sm_ca_in add inb mul i 2
+    p = sm_sh_u32 p get sm_ca_in add add inb mul i 2 1
+    p = sm_sh_copy_ca_id p add idb mul i 32
+  end
+  p = sm_sh_u32 p get sm_ca add cb 9
+  nw = get sm_ca add cb 10
+  p = sm_sh_u32 p nw
+  rvb = mul slot 4
+  for i ulong nw bound 4
+    p = sm_sh_u64 p get sm_ca_rv add rvb i
+  end
+  p = sm_sh_copy_ca_dg p add dg 64
+  p = sm_sh_u32 p get sm_ca add cb 3
+  p = sm_sh_u32 p get sm_ca add cb 4
+  p = sm_sh_u64 p get sm_ca add cb 5
+  p = sm_sh_u64 p get sm_ca add cb 6
+  p = sm_sh_u64 p get sm_ca add cb 7
+  sh_all p
+  for i ulong 32
+    put sm_tmp_dig i get sh_dig i
+  end
+end
+
+fn sm_ca_id_eq off1 ulong off2 ulong to ulong
+  for j ulong 32
+    if ne get sm_ca_id add off1 j get sm_in_dig add off2 j
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn sm_cache_same_inputs slot ulong fn_id ulong ni ulong to ulong
+  cb = mul slot 12
+  if ne get sm_ca add cb 1 fn_id
+    ret 0
+  end
+  if ne get sm_ca add cb 2 ni
+    ret 0
+  end
+  inb = mul slot 8
+  idb = mul slot 128
+  for i ulong ni bound 4
+    if ne get sm_ca_in add inb mul i 2 get sm_in_sid i
+      ret 0
+    end
+    if ne get sm_ca_in add add inb mul i 2 1 get sm_in_gen i
+      ret 0
+    end
+    if eq sm_ca_id_eq add idb mul i 32 mul i 32 0
+      ret 0
+    end
+  end
+  ret 1
+end
+
+global sm_cf_free ulong 1
+
+fn sm_key_eq_slot slot ulong to ulong
+  dg = add mul slot 128 32
+  for i ulong 32
+    if ne get sm_ca_dg add dg i get sm_key_tmp i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn sm_cache_find fn_id ulong ni ulong to ulong
+  b0 = ulong get sm_key_tmp 0
+  b1 = ulong get sm_key_tmp 1
+  start = and or b0 shl b1 8 SM_CACHE_MASK
+  put sm_cf_free 0 SM_NONE
+  for probe ulong SM_CACHE_SLOTS
+    slot = and add start probe SM_CACHE_MASK
+    cb = mul slot 12
+    if eq get sm_ca cb 0
+      put sm_cf_free 0 slot
+      ret SM_NONE
+    end
+    if ne sm_key_eq_slot slot 0
+      if ne sm_cache_same_inputs slot fn_id ni 0
+        ret slot
+      end
+    end
+  end
+  ret SM_NONE
+end
+
+fn sm_event_hash ev_idx ulong to void
+  eb = mul ev_idx 7
+  dg = mul ev_idx 96
+  p = sm_sh_tag 0 sm_tag_evt
+  for i ulong 32
+    put sh_dat add p i get sm_ev_dg add add dg 32 i
+  end
+  p = add p 32
+  p = sm_sh_u64 p get sm_ev eb
+  p = sm_sh_u32 p get sm_ev add eb 1
+  p = sm_sh_u32 p get sm_ev add eb 2
+  for i ulong 32
+    put sh_dat add p i get sm_ev_dg add dg i
+  end
+  p = add p 32
+  p = sm_sh_u32 p get sm_ev add eb 3
+  p = sm_sh_u32 p get sm_ev add eb 4
+  p = sm_sh_u64 p get sm_ev add eb 5
+  p = sm_sh_u64 p get sm_ev add eb 6
+  sh_all p
+  for i ulong 32
+    put sm_tmp_dig i get sh_dig i
+  end
+end
+
+fn sm_ev_copy_digs nev ulong slot ulong to void
+  dg = mul nev 96
+  cdg = add mul slot 128 96
+  for i ulong 32
+    put sm_ev_dg add dg i get sm_ca_dg add cdg i
+  end
+  d1 = add dg 32
+  if gt nev 0
+    pdg = add mul sub nev 1 96 64
+    for i ulong 32
+      put sm_ev_dg add d1 i get sm_ev_dg add pdg i
+    end
+  else
+    for i ulong 32
+      put sm_ev_dg add d1 i 0
+    end
+  end
+  sm_event_hash nev
+  d2 = add dg 64
+  for i ulong 32
+    put sm_ev_dg add d2 i get sm_tmp_dig i
+  end
+end
+
+fn sm_event_append kind ulong slot ulong br ulong to void
+  nev = get sm_eng 8
+  if ge nev SM_MAX_EVENTS
+    put sm_eng 9 add get sm_eng 9 1
+    ret
+  end
+  eb = mul nev 7
+  bb = mul br 8
+  put sm_ev eb add nev 1
+  put sm_ev add eb 1 kind
+  put sm_ev add eb 2 slot
+  put sm_ev add eb 3 br
+  put sm_ev add eb 4 get sm_br add bb 2
+  put sm_ev add eb 5 get sm_br add bb 3
+  put sm_ev add eb 6 get sm_br add bb 4
+  sm_ev_copy_digs nev slot
+  put sm_eng 8 add nev 1
+end
+
+fn sm_run_fn fn_id ulong ni ulong to long
+  fb = mul fn_id 4
+  op = get sm_fns fb
+  otype = get sm_fns add fb 1
+  fgen = get sm_fns add fb 2
+  param = get sm_fns add fb 3
+  conf = SM_CONF_ONE
+  for i ulong ni bound 4
+    c = get sm_in_conf i
+    if lt c conf
+      conf = c
+    end
+  end
+  for i ulong 4
+    put sm_out_val i 0
+  end
+  if eq op SM_OP_SUM
+    s = ulong 0
+    for i ulong ni bound 4
+      s = add s get sm_in_val mul i 4
+    end
+    put sm_out_val 0 s
+  else
+    if eq op SM_OP_PROD
+      pr = ulong 1
+      for i ulong ni bound 4
+        pr = mul pr get sm_in_val mul i 4
+      end
+      put sm_out_val 0 pr
+    else
+      if eq op SM_OP_CONST_MOD
+        v = get sm_in_val 0
+        if ne param 0
+          put sm_out_val 0 rem v param
+        else
+          put sm_out_val 0 0
+        end
+      else
+        if eq op SM_OP_DOUBLE
+          put sm_out_val 0 mul get sm_in_val 0 2
+        else
+          ret SM_ERR_FN
+        end
+      end
+    end
+  end
+  put sm_out_meta 0 otype
+  put sm_out_meta 1 1
+  put sm_out_meta 2 fgen
+  put sm_out_meta 3 conf
+  w = new ulong 4 0
+  put w 0 get sm_out_val 0
+  d = new uchar 32 0
+  rx_sem_digest_value otype w 1 d
+  for i ulong 32
+    put sm_tmp_dig2 i get d i
+  end
+  ret SM_OK
+end
+
+fn sm_install_memo br ulong idx ulong slot ulong to void
+  nm = mul add mul br SM_MAX_NODES idx 4
+  nt = mul add mul br SM_MAX_NODES idx 3
+  nd = mul add mul br SM_MAX_NODES idx 32
+  bb = mul br 8
+  vc = add get sm_br add bb 5 1
+  put sm_br add bb 5 vc
+  put sm_br_nm nm SM_CLEAN
+  put sm_br_nm add nm 1 slot
+  put sm_br_nm add nm 2 vc
+  put sm_br_nm add nm 3 get sm_out_meta 3
+  put sm_br_nt nt get sm_out_meta 1
+  put sm_br_nt add nt 1 get sm_out_meta 2
+  put sm_br_nt add nt 2 get sm_out_meta 0
+  for i ulong 4
+    put sm_br_nv add nm i get sm_out_val i
+  end
+  for i ulong 32
+    put sm_br_nd add nd i get sm_tmp_dig2 i
+    put sm_br_nk add nd i get sm_key_tmp i
+  end
+end
+
+fn sm_gather_src br ulong si ulong i ulong to long
+  sf = mul add mul br SM_MAX_SOURCES si 4
+  if eq get sm_br_sf sf 0
+    ret SM_ERR_NOT_FOUND
+  end
+  if ne get sm_br_sf add sf 1 0
+    ret SM_ERR_STALE
+  end
+  put sm_in_gen i get sm_br_sf add sf 2
+  sm = mul add mul br SM_MAX_SOURCES si 2
+  put sm_in_nw i get sm_br_sm sm
+  put sm_in_conf i get sm_br_sm add sm 1
+  vb = mul i 4
+  for k ulong 4
+    put sm_in_val add vb k get sm_br_sv add sf k
+  end
+  sd = mul add mul br SM_MAX_SOURCES si 32
+  db = mul i 32
+  for k ulong 32
+    put sm_in_dig add db k get sm_br_sd add sd k
+  end
+  ret SM_OK
+end
+
+fn sm_gather_node br ulong ci ulong i ulong to long
+  cnm = mul add mul br SM_MAX_NODES ci 4
+  if ne get sm_br_nm cnm SM_CLEAN
+    ret SM_ERR_NOT_FOUND
+  end
+  cnt = mul add mul br SM_MAX_NODES ci 3
+  put sm_in_nw i get sm_br_nt cnt
+  put sm_in_gen i get sm_br_nt add cnt 1
+  put sm_in_conf i get sm_br_nm add cnm 3
+  vb = mul i 4
+  for k ulong 4
+    put sm_in_val add vb k get sm_br_nv add cnm k
+  end
+  cnd = mul add mul br SM_MAX_NODES ci 32
+  db = mul i 32
+  for k ulong 32
+    put sm_in_dig add db k get sm_br_nd add cnd k
+  end
+  ret SM_OK
+end
+
+fn sm_gather_inputs br ulong idx ulong to long
+  nb = mul idx 5
+  ni = get sm_nod add nb 3
+  ib = mul idx 4
+  for i ulong ni bound 4
+    sid = get sm_nod_in add ib i
+    put sm_in_sid i sid
+    if eq shr sid 56 SM_KIND_SOURCE
+      rc = sm_gather_src br sm_source_idx sid i
+      if ne rc SM_OK
+        ret rc
+      end
+    else
+      rc = sm_gather_node br sm_node_idx sid i
+      if ne rc SM_OK
+        ret rc
+      end
+    end
+  end
+  ret SM_OK
+end
+
+note Evaluate a single node (assuming its upstream derived nodes are already CLEAN,
+note which rx_sem_get ensures in topological order since node indices are acyclic).
+fn sm_eval_cache_hit br ulong idx ulong slot ulong fn_id ulong to void
+  cb = mul slot 12
+  put sm_ca add cb 8 add get sm_ca add cb 8 1
+  put sm_stats 3 add get sm_stats 3 1
+  bb = mul br 8
+  if ne get sm_ca add cb 3 br
+    put sm_stats 4 add get sm_stats 4 1
+  end
+  if ne get sm_ca add cb 4 get sm_br add bb 2
+    put sm_stats 5 add get sm_stats 5 1
+  end
+  if ne get sm_ca add cb 5 get sm_br add bb 3
+    put sm_stats 6 add get sm_stats 6 1
+  end
+  if ne get sm_ca add cb 6 get sm_br add bb 4
+    put sm_stats 7 add get sm_stats 7 1
+  end
+  put sm_out_meta 0 get sm_ca add cb 9
+  put sm_out_meta 1 get sm_ca add cb 10
+  put sm_out_meta 2 get sm_fns add mul fn_id 4 2
+  put sm_out_meta 3 get sm_ca add cb 11
+  rvb = mul slot 4
+  for i ulong 4
+    put sm_out_val i get sm_ca_rv add rvb i
+  end
+  vdg = add mul slot 128 64
+  for i ulong 32
+    put sm_tmp_dig2 i get sm_ca_dg add vdg i
+  end
+  sm_install_memo br idx slot
+  sm_event_append SM_EV_REUSE slot br
+  put sm_last_served 0 SM_SERVED_CACHE
+end
+
+fn sm_store_ca_inputs fslot ulong ni ulong to void
+  inb = mul fslot 8
+  idb = mul fslot 128
+  for i ulong ni bound 4
+    p2 = add inb mul i 2
+    put sm_ca_in p2 get sm_in_sid i
+    put sm_ca_in add p2 1 get sm_in_gen i
+    d1 = add idb mul i 32
+    d2 = mul i 32
+    for j ulong 32
+      put sm_ca_id add d1 j get sm_in_dig add d2 j
+    end
+  end
+  rvb = mul fslot 4
+  for i ulong 4
+    put sm_ca_rv add rvb i get sm_out_val i
+  end
+end
+
+fn sm_store_ca_digs fslot ulong fn_id ulong to void
+  dg = mul fslot 128
+  fdb = mul fn_id 32
+  for i ulong 32
+    put sm_ca_dg add dg i get sm_fn_dig add fdb i
+    put sm_ca_dg add add dg 32 i get sm_key_tmp i
+    put sm_ca_dg add add dg 64 i get sm_tmp_dig2 i
+  end
+  sm_cache_entry_digest fslot
+  d3 = add dg 96
+  for i ulong 32
+    put sm_ca_dg add d3 i get sm_tmp_dig i
+  end
+end
+
+fn sm_eval_cache_store br ulong idx ulong fslot ulong fn_id ulong ni ulong to void
+  cb = mul fslot 12
+  bb = mul br 8
+  put sm_ca cb 1
+  put sm_ca add cb 1 fn_id
+  put sm_ca add cb 2 ni
+  put sm_ca add cb 3 br
+  put sm_ca add cb 4 get sm_br add bb 2
+  put sm_ca add cb 5 get sm_br add bb 3
+  put sm_ca add cb 6 get sm_br add bb 4
+  seq = add get sm_eng 6 1
+  put sm_eng 6 seq
+  put sm_ca add cb 7 seq
+  put sm_ca add cb 8 0
+  put sm_ca add cb 9 get sm_out_meta 0
+  put sm_ca add cb 10 get sm_out_meta 1
+  put sm_ca add cb 11 get sm_out_meta 3
+  sm_store_ca_inputs fslot ni
+  sm_store_ca_digs fslot fn_id
+  put sm_eng 7 add get sm_eng 7 1
+  sm_install_memo br idx fslot
+  sm_event_append SM_EV_PRODUCE fslot br
+end
+
+fn sm_memo_key_eq br ulong idx ulong to ulong
+  nd = mul add mul br SM_MAX_NODES idx 32
+  for i ulong 32
+    if ne get sm_br_nk add nd i get sm_key_tmp i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn sm_eval_node br ulong idx ulong to long
+  put sm_stats 0 add get sm_stats 0 1
+  nm = mul add mul br SM_MAX_NODES idx 4
+  st = get sm_br_nm nm
+  if eq st SM_CLEAN
+    put sm_stats 1 add get sm_stats 1 1
+    put sm_last_served 0 SM_SERVED_MEMO
+    ret SM_OK
+  end
+  rc = sm_gather_inputs br idx
+  if ne rc SM_OK
+    ret rc
+  end
+  nb = mul idx 5
+  fn_id = get sm_nod add nb 2
+  ni = get sm_nod add nb 3
+  sm_compute_key fn_id ni
+  if eq st SM_DIRTY
+    if ne sm_memo_key_eq br idx 0
+      put sm_br_nm nm SM_CLEAN
+      put sm_stats 2 add get sm_stats 2 1
+      put sm_last_served 0 SM_SERVED_CUTOFF
+      ret SM_OK
+    end
+  end
+  slot = sm_cache_find fn_id ni
+  if ne slot SM_NONE
+    if ne get sm_eng 1 0
+      sm_eval_cache_hit br idx slot fn_id
+      ret SM_OK
+    end
+  end
+  rrc = sm_run_fn fn_id ni
+  if ne rrc SM_OK
+    ret rrc
+  end
+  put sm_stats 8 add get sm_stats 8 1
+  put sm_last_served 0 SM_SERVED_COMPUTED
+  fslot = get sm_cf_free 0
+  if eq slot SM_NONE
+    if ne fslot SM_NONE
+      if lt get sm_eng 7 112
+        sm_eval_cache_store br idx fslot fn_id ni
+        ret SM_OK
+      end
+    end
+  end
+  sm_install_memo br idx slot
+  ret SM_OK
+end
+
+fn sm_mark_inputs cur ulong to void
+  ni = get sm_nod add mul cur 5 3
+  ib = mul cur 4
+  for j ulong ni bound 4
+    in_sid = get sm_nod_in add ib j
+    if eq shr in_sid 56 SM_KIND_DERIVED
+      ci = sm_node_idx in_sid
+      put sm_seen ci 1
+    end
+  end
+end
+
+fn sm_mark_needed br ulong idx ulong to void
+  for i ulong SM_MAX_NODES
+    put sm_seen i 0
+  end
+  put sm_seen idx 1
+  for step ulong add idx 1 bound 32
+    cur = sub idx step
+    if ne get sm_seen cur 0
+      nm = mul add mul br SM_MAX_NODES cur 4
+      if ne get sm_br_nm nm SM_CLEAN
+        sm_mark_inputs cur
+      end
+    end
+  end
+end
+
+note Demand derived node sid in branch br. Brings upstream derived dependencies
+note up to date in topological order (since node indices are acyclic).
+fn rx_sem_get br ulong sid ulong out_val edit ulong 4 to long
+  if ge br SM_MAX_BRANCHES
+    ret SM_ERR_NOT_FOUND
+  end
+  if eq get sm_br mul br 8 0
+    ret SM_ERR_NOT_FOUND
+  end
+  idx = sm_node_idx sid
+  if eq idx SM_NONE
+    ret SM_ERR_NOT_FOUND
+  end
+  sm_mark_needed br idx
+  for cur ulong add idx 1 bound 32
+    if ne get sm_seen cur 0
+      rc = sm_eval_node br cur
+      if ne rc SM_OK
+        ret rc
+      end
+    end
+  end
+  nm = mul add mul br SM_MAX_NODES idx 4
+  for i ulong 4
+    put out_val i get sm_br_nv add nm i
+  end
+  ret SM_OK
+end
+
+fn rx_sem_state br ulong sid ulong to long
+  if ge br SM_MAX_BRANCHES
+    ret SM_ERR_NOT_FOUND
+  end
+  if eq get sm_br mul br 8 0
+    ret SM_ERR_NOT_FOUND
+  end
+  idx = sm_node_idx sid
+  if eq idx SM_NONE
+    ret SM_ERR_NOT_FOUND
+  end
+  ret long get sm_br_nm mul add mul br SM_MAX_NODES idx 4
+end
+
+note Recompute every cache entry digest and every event chain link.
+fn rx_sem_verify to long
+  for s ulong SM_CACHE_SLOTS
+    cb = mul s 12
+    if ne get sm_ca cb 0
+      sm_cache_entry_digest s
+      dg = add mul s 128 96
+      for i ulong 32
+        if ne get sm_ca_dg add dg i get sm_tmp_dig i
+          ret SM_ERR_VERIFY
+        end
+      end
+    end
+  end
+  nev = get sm_eng 8
+  for i ulong nev bound 256
+    eb = mul i 7
+    if ne get sm_ev eb add i 1
+      ret SM_ERR_VERIFY
+    end
+    dg = mul i 96
+    if gt i 0
+      pdg = add mul sub i 1 96 64
+      for k ulong 32
+        if ne get sm_ev_dg add add dg 32 k get sm_ev_dg add pdg k
+          ret SM_ERR_VERIFY
+        end
+      end
+    end
+    sm_event_hash i
+    for k ulong 32
+      if ne get sm_ev_dg add add dg 64 k get sm_tmp_dig k
+        ret SM_ERR_VERIFY
+      end
+    end
+  end
+  ret SM_OK
+end
