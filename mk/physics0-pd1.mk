@@ -11,9 +11,9 @@ include mk/physics0-learner.mk
 PD1_DIR = $(OUT_DIR)/physics0-pd1
 PD1_SEED ?= 1
 PD1_RECORDS ?= $(RECORDS)
-$(PD1_DIR)/pd1-run: tests/physics0/pd1/pd1_run.c $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c $(P0L_HDRS)
+$(PD1_DIR)/pd1-run: $(P0L_OM_VERIFY) src/physics0/learner/pd0_learner.om tests/physics0/pd1/pd1_run.om $(P0L_OMC)
 	@mkdir -p $(PD1_DIR)
-	$(CC) $(P0L_CFLAGS) -o $@ tests/physics0/pd1/pd1_run.c $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c -lm
+	{ echo "om2"; $(P0L_OM_COMMIT); cat $(P0L_OM_VERIFY) src/physics0/learner/pd0_learner.om tests/physics0/pd1/pd1_run.om; } | $(P0L_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 physics0-pd1-run: $(PD1_DIR)/pd1-run
 	@test -n "$(PD1_RECORDS)" || { echo "set RECORDS=<pd1-records.bin> (tools/physics0/pd1-convert: make run OUT=...)"; exit 2; }
 	@mkdir -p $(PD1_DIR)/out
@@ -23,6 +23,6 @@ physics0-pd1-receipt: $(PD1_DIR)/pd1-run
 	@test -z "$$(git status --porcelain)" || { echo "refusing: working tree dirty"; exit 2; }
 	@mkdir -p $(PD1_DIR)/out evidence/physics0/pd1
 	@c=$$(git rev-parse --short=12 HEAD); f=evidence/physics0/pd1/PD1_RESULT-dev-$$c.txt; test ! -e $$f || { echo "refusing: $$f exists"; exit 2; }; \
-	{ echo "receipt_kind: PD1_RESULT development run (spec section 8 recommendation; not the blind run)"; echo "commit: $$c"; test -z "$(NOTE)" || echo "note: $(NOTE)"; echo "records_sha256: $$(sha256sum "$(PD1_RECORDS)" | cut -c1-64)"; echo "cc: $$($(CC) --version | head -1)"; echo "date_utc: $$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	{ echo "receipt_kind: PD1_RESULT development run (spec section 8 recommendation; not the blind run)"; echo "commit: $$c"; test -z "$(NOTE)" || echo "note: $(NOTE)"; echo "records_sha256: $$(sha256sum "$(PD1_RECORDS)" | cut -c1-64)"; echo "omc: $(P0L_OMC)"; echo "date_utc: $$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 	  $(PD1_DIR)/pd1-run "$(PD1_RECORDS)" $(PD1_DIR)/out $(PD1_SEED); echo "exit: $$?"; } > $$f; tail -1 $$f; echo "wrote $$f"
 endif

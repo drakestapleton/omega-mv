@@ -16,13 +16,6 @@ P0L_OMC ?= seed/out/omc
 P0L_COMMIT := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 P0L_OM_COMMIT = echo 'text PD0_VERIFIER_COMMIT "$(P0L_COMMIT)"'
 
-# Kept for mk/physics0-pd1.mk (live C planner still links the C learner and verifier)
-P0L_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -Wno-misleading-indentation -O2 -D_POSIX_C_SOURCE=200809L -ffp-contract=off -fno-fast-math \
-  -Isrc -Isrc/physics0/ladder -Isrc/physics0/score -Isrc/physics0/controls -Isrc/physics0/learner -Wno-pedantic
-P0L_LEARNER_SRCS = src/physics0/learner/pd0_learner.c src/physics0/ladder/pd0_fmt.c
-P0L_VERIFIER_SRCS = src/physics0/ladder/pd0_codes.c src/physics0/ladder/pd0_ladder.c src/physics0/score/pd0_score.c src/physics0/controls/pd0_controls.c
-P0L_HDRS = src/physics0/learner/pd0_learner.h src/physics0/ladder/pd0_fmt.h src/physics0/ladder/pd0_rng.h src/physics0/ladder/pd0_ladder.h src/physics0/ladder/pd0_codes.h src/physics0/score/pd0_score.h src/physics0/controls/pd0_controls.h
-
 # Pure seeded OM-2 module lists
 P0L_OM_BASE = src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_wire.om src/physics0/ladder/pd0_codes.om src/physics0/ladder/pd0_fmt.om src/physics0/controls/pd0_receipt.om
 P0L_OM_LEARNER = $(P0L_OM_BASE) src/physics0/learner/pd0_learner.om
