@@ -1,0 +1,1462 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/omega_accelerator_world.om -- Pure seeded OM-2 port of src/omega_accelerator_world.c.
+note Composes with seed/ng/sha256.om. CPU-only host substrate (zero /dev/nvidia* access).
+note Preserves exact handle capability model, 2-level epoch/generation ABA checks,
+note retiring-slot deferral, 2-pass batched drain, wrap-safe 32-bit sequence arithmetic,
+note scratch arena alignment, channel fault recovery, and byte-exact rolling SHA-256 digest.
+
+const OW_MAX_BUFFERS ulong 128
+const OW_MAX_CODE ulong 64
+const OW_SCRATCH_SIZE ulong 2097152
+const OW_MAX_IN_FLIGHT ulong 256
+const OW_BUF_STRIDE ulong 4096
+const OW_CODE_STRIDE ulong 1024
+
+const OMEGA_OBJ_NONE ulong 0
+const OMEGA_OBJ_BUFFER ulong 1
+const OMEGA_OBJ_CODE ulong 2
+
+const OMEGA_PERM_READ ulong 1
+const OMEGA_PERM_WRITE ulong 2
+const OMEGA_PERM_EXECUTE ulong 4
+
+const OMEGA_MATMUL_PREC_INT32 ulong 0
+const OMEGA_MATMUL_PREC_FP16 ulong 1
+const OMEGA_MATMUL_PREC_BF16 ulong 2
+
+const OMEGA_WORLD_OK long 0
+const OMEGA_WORLD_ERR_INVALID_ARG long -1
+const OMEGA_WORLD_ERR_NO_MEM long -2
+const OMEGA_WORLD_ERR_STALE_EPOCH long -3
+const OMEGA_WORLD_ERR_STALE_GEN long -4
+const OMEGA_WORLD_ERR_PERM_DENIED long -5
+const OMEGA_WORLD_ERR_BOUNDS long -6
+const OMEGA_WORLD_ERR_NOT_FOUND long -7
+const OMEGA_WORLD_ERR_HARDWARE long -8
+const OMEGA_WORLD_ERR_FAULT long -9
+const OMEGA_WORLD_ERR_FAULTED long -10
+
+const OW_U32_MAX ulong 4294967295
+const OW_U64_MAX ulong 18446744073709551615
+
+text ow_domain_rolling "OMEGA_WORLD_ROLLING_STATE_V1"
+text ow_domain_realize "OMEGA_CODE_REALIZATION_V1"
+
+note Process-unique handle epoch counter (starts at 1 on first init)
+global g_ow_next_handle_epoch ulong 1
+
+note World scalar state
+global g_ow_cur_epoch ulong 1
+global g_ow_handle_epoch ulong 1
+global g_ow_chan_gen ulong 1
+global g_ow_initialized ulong 1
+global g_ow_faulted ulong 1
+global g_ow_chan_active ulong 1
+global g_ow_ring_cap ulong 1
+global g_ow_rm_put ulong 1
+global g_ow_rm_retired ulong 1
+global g_ow_rm_alloc_cnt ulong 1
+global g_ow_rm_free_cnt ulong 1
+global g_ow_rm_live_cnt ulong 1
+global g_ow_rm_va_next ulong 1
+global g_ow_buf_cnt ulong 1
+global g_ow_code_cnt ulong 1
+global g_ow_scratch_cap ulong 1
+global g_ow_scratch_alloc ulong 1
+global g_ow_scratch_va ulong 1
+global g_ow_comp_marker ulong 1
+global g_ow_comp_marker2 ulong 1
+global g_ow_comp_last_payload ulong 1
+global g_ow_seq_num ulong 1
+global g_ow_rolling_digest uchar 32
+global g_ow_total_dispatches ulong 1
+global g_ow_chan_reconstructions ulong 1
+global g_ow_abandoned_dispatches ulong 1
+
+note Buffer registry (128 slots)
+global g_ow_buf_gen ulong 128
+global g_ow_buf_perms ulong 128
+global g_ow_buf_active ulong 128
+global g_ow_buf_retiring ulong 128
+global g_ow_buf_size ulong 128
+global g_ow_buf_alloc_sz ulong 128
+global g_ow_buf_va ulong 128
+global g_ow_buf_mem uchar 524288
+
+note Code registry (64 slots)
+global g_ow_code_gen ulong 64
+global g_ow_code_active ulong 64
+global g_ow_code_retiring ulong 64
+global g_ow_code_size ulong 64
+global g_ow_code_alloc_sz ulong 64
+global g_ow_code_va ulong 64
+global g_ow_code_digest uchar 2048
+global g_ow_code_realid uchar 2048
+global g_ow_code_mem uchar 65536
+
+note In-flight submissions (256 slots)
+global g_ow_if_cnt ulong 1
+global g_ow_if_sem_words ulong 1280
+global g_ow_if_code_id ulong 256
+global g_ow_if_code_gen ulong 256
+global g_ow_if_code_perm ulong 256
+global g_ow_if_a_id ulong 256
+global g_ow_if_a_gen ulong 256
+global g_ow_if_a_perm ulong 256
+global g_ow_if_b_id ulong 256
+global g_ow_if_b_gen ulong 256
+global g_ow_if_b_perm ulong 256
+global g_ow_if_c_id ulong 256
+global g_ow_if_c_gen ulong 256
+global g_ow_if_c_perm ulong 256
+global g_ow_if_a_bytes ulong 256
+global g_ow_if_b_bytes ulong 256
+global g_ow_if_c_bytes ulong 256
+global g_ow_if_comp_val ulong 256
+global g_ow_if_gp_seq ulong 256
+global g_ow_if_chan_gen ulong 256
+global g_ow_if_prot ulong 256
+global g_ow_if_committed ulong 256
+global g_ow_if_sem_id uchar 8192
+global g_ow_if_in_dig uchar 8192
+
+note Scratch for digest updates and submission staging
+global g_ow_stage_sem ulong 5
+global g_ow_stage_u ulong 16
+global g_ow_tmp_sem uchar 32
+global g_ow_tmp_real uchar 32
+global g_ow_tmp_code uchar 32
+global g_ow_tmp_bind uchar 32
+global g_ow_tmp_res uchar 32
+global g_ow_tmp_pairs ulong 16
+global g_ow_rec_u ulong 12
+global g_ow_mm_spec ulong 4
+global g_ow_mm_req ulong 3
+
+fn ow_put_u32le_sh off ulong v ulong to void
+  put sh_dat off uchar and v 255
+  put sh_dat add off 1 uchar and shr v 8 255
+  put sh_dat add off 2 uchar and shr v 16 255
+  put sh_dat add off 3 uchar and shr v 24 255
+end
+
+fn ow_put_u64le_sh off ulong v ulong to void
+  ow_put_u32le_sh off and v OW_U32_MAX
+  ow_put_u32le_sh add off 4 shr v 32
+end
+
+fn ow_buf_get_u32 slot ulong idx ulong to ulong
+  base = add mul slot OW_BUF_STRIDE mul idx 4
+  b0 = ulong get g_ow_buf_mem base
+  b1 = ulong get g_ow_buf_mem add base 1
+  b2 = ulong get g_ow_buf_mem add base 2
+  b3 = ulong get g_ow_buf_mem add base 3
+  r = or b0 shl b1 8
+  r = or r shl b2 16
+  ret or r shl b3 24
+end
+
+fn ow_buf_put_u32 slot ulong idx ulong v ulong to void
+  base = add mul slot OW_BUF_STRIDE mul idx 4
+  put g_ow_buf_mem base uchar and v 255
+  put g_ow_buf_mem add base 1 uchar and shr v 8 255
+  put g_ow_buf_mem add base 2 uchar and shr v 16 255
+  put g_ow_buf_mem add base 3 uchar and shr v 24 255
+end
+
+note Wrap-safe 32-bit serial comparison: (int32_t)(payload - upto) <= 0
+fn ow_payload_reached payload ulong upto ulong to bool
+  diff = and sub payload upto OW_U32_MAX
+  if eq diff 0
+    ret true
+  end
+  if ge diff 2147483648
+    ret true
+  end
+  ret false
+end
+
+fn ow_alloc_handle_epoch to ulong
+  cur = get g_ow_next_handle_epoch 0
+  if eq cur 0
+    cur = 1
+  end
+  if eq cur OW_U32_MAX
+    ret 0
+  end
+  put g_ow_next_handle_epoch 0 add cur 1
+  ret cur
+end
+
+fn ow_buf_in_flight id ulong to bool
+  cnt = get g_ow_if_cnt 0
+  for i ulong cnt bound 256
+    if eq get g_ow_if_a_id i id
+      ret true
+    end
+    if eq get g_ow_if_b_id i id
+      ret true
+    end
+    if eq get g_ow_if_c_id i id
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ow_code_in_flight id ulong to bool
+  cnt = get g_ow_if_cnt 0
+  for i ulong cnt bound 256
+    if eq get g_ow_if_code_id i id
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ow_release_buf_mem slot ulong to long
+  put g_ow_buf_retiring slot 0
+  put g_ow_buf_va slot 0
+  put g_ow_buf_size slot 0
+  put g_ow_buf_alloc_sz slot 0
+  put g_ow_rm_free_cnt 0 add get g_ow_rm_free_cnt 0 1
+  live = get g_ow_rm_live_cnt 0
+  if gt live 0
+    put g_ow_rm_live_cnt 0 sub live 1
+  end
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_release_code_mem slot ulong to long
+  put g_ow_code_retiring slot 0
+  put g_ow_code_va slot 0
+  put g_ow_code_size slot 0
+  put g_ow_code_alloc_sz slot 0
+  put g_ow_rm_free_cnt 0 add get g_ow_rm_free_cnt 0 1
+  live = get g_ow_rm_live_cnt 0
+  if gt live 0
+    put g_ow_rm_live_cnt 0 sub live 1
+  end
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_release_unreferenced_retiring to void
+  for i ulong OW_MAX_BUFFERS
+    if ne get g_ow_buf_retiring i 0
+      if not ow_buf_in_flight i
+        ign = ow_release_buf_mem i
+      end
+    end
+  end
+  for i ulong OW_MAX_CODE
+    if ne get g_ow_code_retiring i 0
+      if not ow_code_in_flight i
+        ign = ow_release_code_mem i
+      end
+    end
+  end
+end
+
+fn omega_world_init to long
+  ep = ow_alloc_handle_epoch
+  if eq ep 0
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  put g_ow_cur_epoch 0 1
+  put g_ow_handle_epoch 0 ep
+  put g_ow_chan_gen 0 1
+  put g_ow_faulted 0 0
+  put g_ow_chan_active 0 1
+  put g_ow_ring_cap 0 1024
+  put g_ow_rm_put 0 0
+  put g_ow_rm_retired 0 0
+  put g_ow_rm_alloc_cnt 0 3
+  put g_ow_rm_free_cnt 0 0
+  put g_ow_rm_live_cnt 0 3
+  put g_ow_rm_va_next 0 4294967296
+  put g_ow_buf_cnt 0 0
+  put g_ow_code_cnt 0 0
+  put g_ow_if_cnt 0 0
+  put g_ow_scratch_cap 0 OW_SCRATCH_SIZE
+  put g_ow_scratch_alloc 0 0
+  put g_ow_scratch_va 0 268435456
+  put g_ow_comp_marker 0 0
+  put g_ow_comp_marker2 0 0
+  put g_ow_comp_last_payload 0 0
+  put g_ow_seq_num 0 0
+  put g_ow_total_dispatches 0 0
+  put g_ow_chan_reconstructions 0 0
+  put g_ow_abandoned_dispatches 0 0
+  for i ulong 32
+    put g_ow_rolling_digest i 0
+  end
+  for i ulong OW_MAX_BUFFERS
+    put g_ow_buf_gen i 0
+    put g_ow_buf_perms i 0
+    put g_ow_buf_active i 0
+    put g_ow_buf_retiring i 0
+    put g_ow_buf_size i 0
+    put g_ow_buf_alloc_sz i 0
+    put g_ow_buf_va i 0
+  end
+  for i ulong OW_MAX_CODE
+    put g_ow_code_gen i 0
+    put g_ow_code_active i 0
+    put g_ow_code_retiring i 0
+    put g_ow_code_size i 0
+    put g_ow_code_alloc_sz i 0
+    put g_ow_code_va i 0
+  end
+  put g_ow_initialized 0 1
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_destroy to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  for i ulong OW_MAX_BUFFERS
+    put g_ow_buf_active i 0
+    put g_ow_buf_retiring i 0
+  end
+  for i ulong OW_MAX_CODE
+    put g_ow_code_active i 0
+    put g_ow_code_retiring i 0
+  end
+  put g_ow_buf_cnt 0 0
+  put g_ow_code_cnt 0 0
+  put g_ow_if_cnt 0 0
+  put g_ow_scratch_alloc 0 0
+  put g_ow_rm_live_cnt 0 0
+  put g_ow_rm_free_cnt 0 get g_ow_rm_alloc_cnt 0
+  put g_ow_chan_active 0 0
+  put g_ow_initialized 0 0
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_rebuild to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  cur = get g_ow_cur_epoch 0
+  if eq cur OW_U32_MAX
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  next_ep = add cur 1
+  drc = omega_world_destroy
+  if ne drc OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_HARDWARE
+  end
+  irc = omega_world_init
+  if eq irc OMEGA_WORLD_OK
+    put g_ow_cur_epoch 0 next_ep
+  end
+  ret irc
+end
+
+note Handle layout: 5 ulongs [0:world_epoch, 1:object_id, 2:object_generation, 3:object_type, 4:permissions]
+fn omega_world_register_buffer size_bytes ulong perms ulong out_h edit ulong 5 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq size_bytes 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_faulted 0 0
+    ret OMEGA_WORLD_ERR_FAULTED
+  end
+  if gt size_bytes sub OW_U64_MAX 4095
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  slot = long -1
+  for i ulong OW_MAX_BUFFERS
+    if eq slot -1
+      if and eq get g_ow_buf_active i 0 eq get g_ow_buf_retiring i 0
+        if ne get g_ow_buf_gen i OW_U32_MAX
+          slot = long i
+        end
+      end
+    end
+  end
+  if lt slot 0
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  s = ulong slot
+  alloc_sz = and add size_bytes 4095 not ulong 4095
+  if lt alloc_sz 4096
+    alloc_sz = 4096
+  end
+  if eq get g_ow_buf_gen s 0
+    put g_ow_buf_gen s 1
+  end
+  va = add 4294967296 mul add s 1 1048576
+  if gt add va alloc_sz get g_ow_rm_va_next 0
+    put g_ow_rm_va_next 0 add va alloc_sz
+  end
+  put g_ow_buf_perms s perms
+  put g_ow_buf_size s size_bytes
+  put g_ow_buf_alloc_sz s alloc_sz
+  put g_ow_buf_va s va
+  put g_ow_buf_active s 1
+  put g_ow_rm_alloc_cnt 0 add get g_ow_rm_alloc_cnt 0 1
+  put g_ow_rm_live_cnt 0 add get g_ow_rm_live_cnt 0 1
+  put out_h 0 get g_ow_handle_epoch 0
+  put out_h 1 s
+  put out_h 2 get g_ow_buf_gen s
+  put out_h 3 OMEGA_OBJ_BUFFER
+  put out_h 4 perms
+  put g_ow_buf_cnt 0 add get g_ow_buf_cnt 0 1
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_revoke_buffer h view ulong 5 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get h 0 get g_ow_handle_epoch 0
+    ret OMEGA_WORLD_ERR_STALE_EPOCH
+  end
+  oid = get h 1
+  if ge oid OW_MAX_BUFFERS
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_buf_active oid 0
+    ret OMEGA_WORLD_ERR_NOT_FOUND
+  end
+  if ne get h 2 get g_ow_buf_gen oid
+    ret OMEGA_WORLD_ERR_STALE_GEN
+  end
+  if ne get h 3 OMEGA_OBJ_BUFFER
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  put g_ow_buf_active oid 0
+  gen = get g_ow_buf_gen oid
+  if ne gen OW_U32_MAX
+    put g_ow_buf_gen oid add gen 1
+  end
+  bc = get g_ow_buf_cnt 0
+  if gt bc 0
+    put g_ow_buf_cnt 0 sub bc 1
+  end
+  if ow_buf_in_flight oid
+    put g_ow_buf_retiring oid 1
+    ret OMEGA_WORLD_OK
+  end
+  ret ow_release_buf_mem oid
+end
+
+fn omega_world_resolve_buffer h view ulong 5 req_perms ulong req_off ulong req_sz ulong out_va edit ulong 1 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get h 0 get g_ow_handle_epoch 0
+    ret OMEGA_WORLD_ERR_STALE_EPOCH
+  end
+  oid = get h 1
+  if ge oid OW_MAX_BUFFERS
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_buf_active oid 0
+    ret OMEGA_WORLD_ERR_NOT_FOUND
+  end
+  if ne get h 2 get g_ow_buf_gen oid
+    ret OMEGA_WORLD_ERR_STALE_GEN
+  end
+  if ne get h 3 OMEGA_OBJ_BUFFER
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne and get g_ow_buf_perms oid req_perms req_perms
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne and get h 4 req_perms req_perms
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne and req_perms OMEGA_PERM_WRITE 0
+    if ow_buf_in_flight oid
+      ret OMEGA_WORLD_ERR_FAULT
+    end
+  end
+  sz = get g_ow_buf_size oid
+  if gt req_off sz
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  if gt req_sz sub sz req_off
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  va = get g_ow_buf_va oid
+  if gt va sub OW_U64_MAX req_off
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  put out_va 0 add va req_off
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_code_finish_realize s ulong has_real ulong real_in view uchar 32 to void
+  dbase = mul s 32
+  if ne has_real 0
+    for i ulong 32
+      put g_ow_code_realid add dbase i get real_in i
+    end
+  else
+    for i ulong 32
+      put sh_dat i 0
+    end
+    for i ulong len ow_domain_realize bound 32
+      put sh_dat i get ow_domain_realize i
+    end
+    for i ulong 32
+      put sh_dat add 32 i get g_ow_code_digest add dbase i
+    end
+    sh_all 64
+    for i ulong 32
+      put g_ow_code_realid add dbase i get sh_dig i
+    end
+  end
+end
+
+fn ow_code_copy_hash s ulong code view uchar * code_sz ulong to void
+  cbase = mul s OW_CODE_STRIDE
+  copy_n = code_sz
+  if gt copy_n OW_CODE_STRIDE
+    copy_n = OW_CODE_STRIDE
+  end
+  for i ulong copy_n bound 1024
+    put g_ow_code_mem add cbase i get code i
+  end
+  for i ulong code_sz bound 65536
+    put sh_dat i get code i
+  end
+  sh_all code_sz
+  dbase = mul s 32
+  for i ulong 32
+    put g_ow_code_digest add dbase i get sh_dig i
+  end
+end
+
+fn omega_world_register_code code view uchar * code_sz ulong has_real ulong real_in view uchar 32 out_h edit ulong 5 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if or eq code_sz 0 gt code_sz len code
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_faulted 0 0
+    ret OMEGA_WORLD_ERR_FAULTED
+  end
+  if gt code_sz sub OW_U64_MAX 6144
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  slot = long -1
+  for i ulong OW_MAX_CODE
+    if eq slot -1
+      if and eq get g_ow_code_active i 0 eq get g_ow_code_retiring i 0
+        if ne get g_ow_code_gen i OW_U32_MAX
+          slot = long i
+        end
+      end
+    end
+  end
+  if lt slot 0
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  s = ulong slot
+  alloc_sz = and add add code_sz 2048 4095 not ulong 4095
+  if eq get g_ow_code_gen s 0
+    put g_ow_code_gen s 1
+  end
+  ow_code_copy_hash s code code_sz
+  ow_code_finish_realize s has_real real_in
+  va = add 8589934592 mul add s 1 65536
+  put g_ow_code_size s code_sz
+  put g_ow_code_alloc_sz s alloc_sz
+  put g_ow_code_va s va
+  put g_ow_code_active s 1
+  put g_ow_rm_alloc_cnt 0 add get g_ow_rm_alloc_cnt 0 1
+  put g_ow_rm_live_cnt 0 add get g_ow_rm_live_cnt 0 1
+  put out_h 0 get g_ow_handle_epoch 0
+  put out_h 1 s
+  put out_h 2 get g_ow_code_gen s
+  put out_h 3 OMEGA_OBJ_CODE
+  put out_h 4 OMEGA_PERM_EXECUTE
+  put g_ow_code_cnt 0 add get g_ow_code_cnt 0 1
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_revoke_code h view ulong 5 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get h 0 get g_ow_handle_epoch 0
+    ret OMEGA_WORLD_ERR_STALE_EPOCH
+  end
+  oid = get h 1
+  if ge oid OW_MAX_CODE
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_code_active oid 0
+    ret OMEGA_WORLD_ERR_NOT_FOUND
+  end
+  if ne get h 2 get g_ow_code_gen oid
+    ret OMEGA_WORLD_ERR_STALE_GEN
+  end
+  if ne get h 3 OMEGA_OBJ_CODE
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  put g_ow_code_active oid 0
+  gen = get g_ow_code_gen oid
+  if ne gen OW_U32_MAX
+    put g_ow_code_gen oid add gen 1
+  end
+  cc = get g_ow_code_cnt 0
+  if gt cc 0
+    put g_ow_code_cnt 0 sub cc 1
+  end
+  if ow_code_in_flight oid
+    put g_ow_code_retiring oid 1
+    ret OMEGA_WORLD_OK
+  end
+  ret ow_release_code_mem oid
+end
+
+fn omega_world_resolve_code h view ulong 5 out_va edit ulong 1 out_sz edit ulong 1 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get h 0 get g_ow_handle_epoch 0
+    ret OMEGA_WORLD_ERR_STALE_EPOCH
+  end
+  oid = get h 1
+  if ge oid OW_MAX_CODE
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_code_active oid 0
+    ret OMEGA_WORLD_ERR_NOT_FOUND
+  end
+  if ne get h 2 get g_ow_code_gen oid
+    ret OMEGA_WORLD_ERR_STALE_GEN
+  end
+  if ne get h 3 OMEGA_OBJ_CODE
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq and get h 4 OMEGA_PERM_EXECUTE 0
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  put out_va 0 get g_ow_code_va oid
+  put out_sz 0 get g_ow_code_size oid
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_validate_handle h view ulong 5 exp_type ulong req_perms ulong to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get h 0 get g_ow_handle_epoch 0
+    ret OMEGA_WORLD_ERR_STALE_EPOCH
+  end
+  if ne get h 3 exp_type
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  oid = get h 1
+  if eq exp_type OMEGA_OBJ_BUFFER
+    if ge oid OW_MAX_BUFFERS
+      ret OMEGA_WORLD_ERR_INVALID_ARG
+    end
+    if eq get g_ow_buf_active oid 0
+      ret OMEGA_WORLD_ERR_NOT_FOUND
+    end
+    if ne get h 2 get g_ow_buf_gen oid
+      ret OMEGA_WORLD_ERR_STALE_GEN
+    end
+    if ne and get g_ow_buf_perms oid req_perms req_perms
+      ret OMEGA_WORLD_ERR_PERM_DENIED
+    end
+  else
+    if eq exp_type OMEGA_OBJ_CODE
+      if ge oid OW_MAX_CODE
+        ret OMEGA_WORLD_ERR_INVALID_ARG
+      end
+      if eq get g_ow_code_active oid 0
+        ret OMEGA_WORLD_ERR_NOT_FOUND
+      end
+      if ne get h 2 get g_ow_code_gen oid
+        ret OMEGA_WORLD_ERR_STALE_GEN
+      end
+    else
+      ret OMEGA_WORLD_ERR_INVALID_ARG
+    end
+  end
+  if ne and get h 4 req_perms req_perms
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_scratch_acquire size_bytes ulong out_va edit ulong 1 out_off edit ulong 1 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq size_bytes 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if gt size_bytes sub OW_U64_MAX 255
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  aligned = and add size_bytes 255 not ulong 255
+  alloc = get g_ow_scratch_alloc 0
+  cap = get g_ow_scratch_cap 0
+  if gt alloc cap
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  if gt aligned sub cap alloc
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  put out_va 0 add get g_ow_scratch_va 0 alloc
+  put out_off 0 alloc
+  put g_ow_scratch_alloc 0 add alloc aligned
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_scratch_reset to void
+  put g_ow_scratch_alloc 0 0
+end
+
+fn omega_world_discover_ring_capacity out_cap edit ulong 1 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  put out_cap 0 get g_ow_ring_cap 0
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_recover_channel_fault to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  cg = get g_ow_chan_gen 0
+  cr = get g_ow_chan_reconstructions 0
+  if or eq cg OW_U32_MAX eq cr OW_U64_MAX
+    put g_ow_faulted 0 1
+    put g_ow_chan_active 0 0
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  put g_ow_chan_gen 0 add cg 1
+  put g_ow_chan_reconstructions 0 add cr 1
+  put g_ow_chan_active 0 1
+  cnt = get g_ow_if_cnt 0
+  for i ulong cnt bound 256
+    if eq get g_ow_if_committed i 0
+      ab = get g_ow_abandoned_dispatches 0
+      if eq ab OW_U64_MAX
+        put g_ow_faulted 0 1
+        ret OMEGA_WORLD_ERR_FAULT
+      end
+      put g_ow_abandoned_dispatches 0 add ab 1
+    end
+  end
+  put g_ow_if_cnt 0 0
+  ow_release_unreferenced_retiring
+  put g_ow_faulted 0 0
+  ret OMEGA_WORLD_OK
+end
+
+note Canonical rolling SHA-256 digest update matching src/omega_accelerator_world.c:607-642.
+note Inputs staged in g_ow_tmp_sem, g_ow_tmp_real, g_ow_tmp_code, g_ow_tmp_bind, g_ow_tmp_res, g_ow_tmp_pairs.
+fn omega_world_update_digest obj_count ulong cap_scope ulong comp_val ulong outcome_code ulong to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_seq_num 0 OW_U64_MAX
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  seq = add get g_ow_seq_num 0 1
+  for i ulong 32
+    put sh_dat i 0
+  end
+  for i ulong len ow_domain_rolling bound 32
+    put sh_dat i get ow_domain_rolling i
+  end
+  for i ulong 32
+    put sh_dat add 32 i get g_ow_rolling_digest i
+  end
+  ow_put_u32le_sh 64 get g_ow_cur_epoch 0
+  ow_put_u64le_sh 68 seq
+  for i ulong 32
+    put sh_dat add 76 i get g_ow_tmp_sem i
+    put sh_dat add 108 i get g_ow_tmp_real i
+    put sh_dat add 140 i get g_ow_tmp_code i
+    put sh_dat add 172 i get g_ow_tmp_bind i
+  end
+  ow_put_u32le_sh 204 obj_count
+  off = ulong 208
+  npairs = obj_count
+  if gt npairs 8
+    npairs = 8
+  end
+  for i ulong npairs bound 8
+    ow_put_u32le_sh off get g_ow_tmp_pairs mul i 2
+    ow_put_u32le_sh add off 4 get g_ow_tmp_pairs add mul i 2 1
+    off = add off 8
+  end
+  ow_put_u32le_sh off cap_scope
+  ow_put_u32le_sh add off 4 comp_val
+  for i ulong 32
+    put sh_dat add add off 8 i get g_ow_tmp_res i
+  end
+  ow_put_u32le_sh add off 40 outcome_code
+  total = add off 44
+  sh_all total
+  for i ulong 32
+    put g_ow_rolling_digest i get sh_dig i
+  end
+  put g_ow_seq_num 0 seq
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_hash_buf_bytes slot ulong nbytes ulong dst_kind ulong to void
+  n = nbytes
+  if gt n OW_BUF_STRIDE
+    n = OW_BUF_STRIDE
+  end
+  base = mul slot OW_BUF_STRIDE
+  for i ulong n bound 4096
+    put sh_dat i get g_ow_buf_mem add base i
+  end
+  sh_all n
+  for i ulong 32
+    if eq dst_kind 0
+      put g_ow_tmp_res i get sh_dig i
+    end
+  end
+end
+
+fn ow_compute_bindings_digest a_id ulong a_bytes ulong b_id ulong b_bytes ulong to void
+  ad = new uchar 32 0
+  bd = new uchar 32 0
+  na = a_bytes
+  if gt na OW_BUF_STRIDE
+    na = OW_BUF_STRIDE
+  end
+  ba = mul a_id OW_BUF_STRIDE
+  for i ulong na bound 4096
+    put sh_dat i get g_ow_buf_mem add ba i
+  end
+  sh_all na
+  for i ulong 32
+    put ad i get sh_dig i
+  end
+  nb = b_bytes
+  if gt nb OW_BUF_STRIDE
+    nb = OW_BUF_STRIDE
+  end
+  bb = mul b_id OW_BUF_STRIDE
+  for i ulong nb bound 4096
+    put sh_dat i get g_ow_buf_mem add bb i
+  end
+  sh_all nb
+  for i ulong 32
+    put bd i get sh_dig i
+  end
+  for i ulong 32
+    put sh_dat i get ad i
+    put sh_dat add 32 i get bd i
+  end
+  sh_all 64
+  for i ulong 32
+    put g_ow_tmp_bind i get sh_dig i
+  end
+end
+
+fn ow_compute_sem_id_from_stage to void
+  for i ulong 5
+    ow_put_u32le_sh mul i 4 get g_ow_stage_sem i
+  end
+  sh_all 20
+  for i ulong 32
+    put g_ow_tmp_sem i get sh_dig i
+  end
+end
+
+fn ow_record_completed c_bytes ulong comp_val ulong to long
+  if eq get g_ow_total_dispatches 0 OW_U64_MAX
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  cbase = mul get g_ow_rec_u 0 32
+  for i ulong 32
+    put g_ow_tmp_real i get g_ow_code_realid add cbase i
+    put g_ow_tmp_code i get g_ow_code_digest add cbase i
+  end
+  ow_hash_buf_bytes get g_ow_rec_u 9 c_bytes 0
+  put g_ow_tmp_pairs 0 get g_ow_rec_u 0
+  put g_ow_tmp_pairs 1 get g_ow_rec_u 1
+  put g_ow_tmp_pairs 2 get g_ow_rec_u 3
+  put g_ow_tmp_pairs 3 get g_ow_rec_u 4
+  put g_ow_tmp_pairs 4 get g_ow_rec_u 6
+  put g_ow_tmp_pairs 5 get g_ow_rec_u 7
+  put g_ow_tmp_pairs 6 get g_ow_rec_u 9
+  put g_ow_tmp_pairs 7 get g_ow_rec_u 10
+  scope = or get g_ow_rec_u 2 get g_ow_rec_u 5
+  scope = or scope get g_ow_rec_u 8
+  scope = or scope get g_ow_rec_u 11
+  ret omega_world_update_digest 4 scope comp_val 0
+end
+
+fn ow_submit_validate_objs to long
+  cid = get g_ow_stage_u 0
+  aid = get g_ow_stage_u 3
+  bid = get g_ow_stage_u 6
+  oid = get g_ow_stage_u 9
+  if ge cid OW_MAX_CODE
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ge aid OW_MAX_BUFFERS
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ge bid OW_MAX_BUFFERS
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ge oid OW_MAX_BUFFERS
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_buf_active aid 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_buf_active bid 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_buf_active oid 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq get g_ow_code_active cid 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_buf_gen aid get g_ow_stage_u 4
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_buf_gen bid get g_ow_stage_u 7
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_buf_gen oid get g_ow_stage_u 10
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_code_gen cid get g_ow_stage_u 1
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if gt get g_ow_stage_u 12 get g_ow_buf_size aid
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if gt get g_ow_stage_u 13 get g_ow_buf_size bid
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if gt get g_ow_stage_u 14 get g_ow_buf_size oid
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if eq and get g_ow_buf_perms oid OMEGA_PERM_WRITE 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_submit_check_alias to long
+  cnt = get g_ow_if_cnt 0
+  aid = get g_ow_stage_u 3
+  bid = get g_ow_stage_u 6
+  oid = get g_ow_stage_u 9
+  for i ulong cnt bound 256
+    if ne get g_ow_if_c_bytes i 0
+      pc = get g_ow_if_c_id i
+      if and ne get g_ow_stage_u 14 0 eq pc oid
+        ret OMEGA_WORLD_ERR_FAULT
+      end
+      if and ne get g_ow_stage_u 12 0 eq pc aid
+        ret OMEGA_WORLD_ERR_FAULT
+      end
+      if and ne get g_ow_stage_u 13 0 eq pc bid
+        ret OMEGA_WORLD_ERR_FAULT
+      end
+    end
+  end
+  ret OMEGA_WORLD_OK
+end
+
+note Staged submission fields in g_ow_stage_sem[0..4] and g_ow_stage_u[0..15]:
+note   0:code_id 1:code_gen 2:code_perm 3:a_id 4:a_gen 5:a_perm
+note   6:b_id 7:b_gen 8:b_perm 9:c_id 10:c_gen 11:c_perm
+note   12:a_bytes 13:b_bytes 14:c_bytes 15:completion_val
+fn omega_world_submit to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_faulted 0 0
+    ret OMEGA_WORLD_ERR_FAULTED
+  end
+  if eq get g_ow_chan_active 0 0
+    ret OMEGA_WORLD_ERR_HARDWARE
+  end
+  cnt = get g_ow_if_cnt 0
+  if ge cnt OW_MAX_IN_FLIGHT
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  vrc = ow_submit_validate_objs
+  if ne vrc OMEGA_WORLD_OK
+    ret vrc
+  end
+  arc = ow_submit_check_alias
+  if ne arc OMEGA_WORLD_OK
+    ret arc
+  end
+  cval = get g_ow_stage_u 15
+  last = get g_ow_comp_last_payload 0
+  if eq cval last
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ow_payload_reached cval last
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  put g_ow_rm_put 0 and add get g_ow_rm_put 0 1 OW_U32_MAX
+  put g_ow_comp_last_payload 0 cval
+  for j ulong 5
+    put g_ow_if_sem_words add mul cnt 5 j get g_ow_stage_sem j
+  end
+  put g_ow_if_code_id cnt get g_ow_stage_u 0
+  put g_ow_if_code_gen cnt get g_ow_stage_u 1
+  put g_ow_if_code_perm cnt get g_ow_stage_u 2
+  put g_ow_if_a_id cnt get g_ow_stage_u 3
+  put g_ow_if_a_gen cnt get g_ow_stage_u 4
+  put g_ow_if_a_perm cnt get g_ow_stage_u 5
+  put g_ow_if_b_id cnt get g_ow_stage_u 6
+  put g_ow_if_b_gen cnt get g_ow_stage_u 7
+  put g_ow_if_b_perm cnt get g_ow_stage_u 8
+  put g_ow_if_c_id cnt get g_ow_stage_u 9
+  put g_ow_if_c_gen cnt get g_ow_stage_u 10
+  put g_ow_if_c_perm cnt get g_ow_stage_u 11
+  put g_ow_if_a_bytes cnt get g_ow_stage_u 12
+  put g_ow_if_b_bytes cnt get g_ow_stage_u 13
+  put g_ow_if_c_bytes cnt get g_ow_stage_u 14
+  put g_ow_if_comp_val cnt cval
+  put g_ow_if_gp_seq cnt get g_ow_rm_put 0
+  put g_ow_if_chan_gen cnt get g_ow_chan_gen 0
+  if ne get g_ow_stage_u 14 0
+    put g_ow_if_prot cnt 1
+  else
+    put g_ow_if_prot cnt 0
+  end
+  put g_ow_if_committed cnt 0
+  ow_compute_sem_id_from_stage
+  ow_compute_bindings_digest get g_ow_stage_u 3 get g_ow_stage_u 12 get g_ow_stage_u 6 get g_ow_stage_u 13
+  db = mul cnt 32
+  for i ulong 32
+    put g_ow_if_sem_id add db i get g_ow_tmp_sem i
+    put g_ow_if_in_dig add db i get g_ow_tmp_bind i
+  end
+  put g_ow_if_cnt 0 add cnt 1
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_ring to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_faulted 0 0
+    ret OMEGA_WORLD_ERR_FAULTED
+  end
+  if eq get g_ow_chan_active 0 0
+    ret OMEGA_WORLD_ERR_HARDWARE
+  end
+  put g_ow_comp_marker 0 get g_ow_comp_last_payload 0
+  put g_ow_comp_marker2 0 get g_ow_comp_last_payload 0
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_copy_if_slot dst ulong src ulong to void
+  if eq dst src
+    ret
+  end
+  for j ulong 5
+    put g_ow_if_sem_words add mul dst 5 j get g_ow_if_sem_words add mul src 5 j
+  end
+  put g_ow_if_code_id dst get g_ow_if_code_id src
+  put g_ow_if_code_gen dst get g_ow_if_code_gen src
+  put g_ow_if_code_perm dst get g_ow_if_code_perm src
+  put g_ow_if_a_id dst get g_ow_if_a_id src
+  put g_ow_if_a_gen dst get g_ow_if_a_gen src
+  put g_ow_if_a_perm dst get g_ow_if_a_perm src
+  put g_ow_if_b_id dst get g_ow_if_b_id src
+  put g_ow_if_b_gen dst get g_ow_if_b_gen src
+  put g_ow_if_b_perm dst get g_ow_if_b_perm src
+  put g_ow_if_c_id dst get g_ow_if_c_id src
+  put g_ow_if_c_gen dst get g_ow_if_c_gen src
+  put g_ow_if_c_perm dst get g_ow_if_c_perm src
+  put g_ow_if_a_bytes dst get g_ow_if_a_bytes src
+  put g_ow_if_b_bytes dst get g_ow_if_b_bytes src
+  put g_ow_if_c_bytes dst get g_ow_if_c_bytes src
+  put g_ow_if_comp_val dst get g_ow_if_comp_val src
+  put g_ow_if_gp_seq dst get g_ow_if_gp_seq src
+  put g_ow_if_chan_gen dst get g_ow_if_chan_gen src
+  put g_ow_if_prot dst get g_ow_if_prot src
+  put g_ow_if_committed dst get g_ow_if_committed src
+  dd = mul dst 32
+  sd = mul src 32
+  for k ulong 32
+    put g_ow_if_sem_id add dd k get g_ow_if_sem_id add sd k
+    put g_ow_if_in_dig add dd k get g_ow_if_in_dig add sd k
+  end
+end
+
+fn ow_drain_validate upto ulong to long
+  cnt = get g_ow_if_cnt 0
+  cg = get g_ow_chan_gen 0
+  for i ulong cnt bound 256
+    if ow_payload_reached get g_ow_if_comp_val i upto
+      if ne get g_ow_if_chan_gen i cg
+        put g_ow_faulted 0 1
+        ret OMEGA_WORLD_ERR_FAULT
+      end
+      if or ge get g_ow_if_code_id i OW_MAX_CODE ge get g_ow_if_a_id i OW_MAX_BUFFERS
+        put g_ow_faulted 0 1
+        ret OMEGA_WORLD_ERR_INVALID_ARG
+      end
+      if or ge get g_ow_if_b_id i OW_MAX_BUFFERS ge get g_ow_if_c_id i OW_MAX_BUFFERS
+        put g_ow_faulted 0 1
+        ret OMEGA_WORLD_ERR_INVALID_ARG
+      end
+    end
+  end
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_if_objs_live i ulong to bool
+  aid = get g_ow_if_a_id i
+  bid = get g_ow_if_b_id i
+  cid = get g_ow_if_c_id i
+  kid = get g_ow_if_code_id i
+  if or eq get g_ow_buf_active aid 0 ne get g_ow_buf_gen aid get g_ow_if_a_gen i
+    ret false
+  end
+  if or eq get g_ow_buf_active bid 0 ne get g_ow_buf_gen bid get g_ow_if_b_gen i
+    ret false
+  end
+  if or eq get g_ow_buf_active cid 0 ne get g_ow_buf_gen cid get g_ow_if_c_gen i
+    ret false
+  end
+  if or eq get g_ow_code_active kid 0 ne get g_ow_code_gen kid get g_ow_if_code_gen i
+    ret false
+  end
+  ret true
+end
+
+fn ow_drain_commit_one i ulong cval ulong to long
+  db = mul i 32
+  for k ulong 32
+    put g_ow_tmp_sem k get g_ow_if_sem_id add db k
+    put g_ow_tmp_bind k get g_ow_if_in_dig add db k
+  end
+  put g_ow_rec_u 0 get g_ow_if_code_id i
+  put g_ow_rec_u 1 get g_ow_if_code_gen i
+  put g_ow_rec_u 2 and get g_ow_if_code_perm i OMEGA_PERM_EXECUTE
+  put g_ow_rec_u 3 get g_ow_if_a_id i
+  put g_ow_rec_u 4 get g_ow_if_a_gen i
+  put g_ow_rec_u 5 get g_ow_if_a_perm i
+  put g_ow_rec_u 6 get g_ow_if_b_id i
+  put g_ow_rec_u 7 get g_ow_if_b_gen i
+  put g_ow_rec_u 8 get g_ow_if_b_perm i
+  put g_ow_rec_u 9 get g_ow_if_c_id i
+  put g_ow_rec_u 10 get g_ow_if_c_gen i
+  put g_ow_rec_u 11 get g_ow_if_c_perm i
+  ret ow_record_completed get g_ow_if_c_bytes i cval
+end
+
+fn omega_world_drain upto_payload ulong timeout_ms long to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_faulted 0 0
+    ret OMEGA_WORLD_ERR_FAULTED
+  end
+  if eq get g_ow_chan_active 0 0
+    ret OMEGA_WORLD_ERR_HARDWARE
+  end
+  if lt timeout_ms 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if not ow_payload_reached upto_payload get g_ow_comp_marker 0
+    put g_ow_faulted 0 1
+    ret OMEGA_WORLD_ERR_HARDWARE
+  end
+  vrc = ow_drain_validate upto_payload
+  if ne vrc OMEGA_WORLD_OK
+    ret vrc
+  end
+  committed = long 0
+  keep = ulong 0
+  retire_to = get g_ow_rm_retired 0
+  cnt = get g_ow_if_cnt 0
+  for i ulong cnt bound 256
+    cval = get g_ow_if_comp_val i
+    if not ow_payload_reached cval upto_payload
+      ow_copy_if_slot keep i
+      keep = add keep 1
+    else
+      gps = get g_ow_if_gp_seq i
+      if not ow_payload_reached gps retire_to
+        retire_to = gps
+      end
+      if not ow_if_objs_live i
+        put g_ow_abandoned_dispatches 0 add get g_ow_abandoned_dispatches 0 1
+      else
+        rrc = ow_drain_commit_one i cval
+        if ne rrc OMEGA_WORLD_OK
+          put g_ow_faulted 0 1
+          ret OMEGA_WORLD_ERR_FAULT
+        end
+        put g_ow_if_committed i 1
+        put g_ow_total_dispatches 0 add get g_ow_total_dispatches 0 1
+        committed = add committed 1
+      end
+    end
+  end
+  put g_ow_rm_retired 0 retire_to
+  put g_ow_if_cnt 0 keep
+  ow_release_unreferenced_retiring
+  ret committed
+end
+
+fn ow_vec_exec_and_commit n ulong req_bytes ulong out_comp edit ulong 1 to long
+  aid = get g_ow_rec_u 3
+  bid = get g_ow_rec_u 6
+  cid = get g_ow_rec_u 9
+  nexec = n
+  if gt nexec 1024
+    nexec = 1024
+  end
+  for i ulong nexec bound 1024
+    sum = and add ow_buf_get_u32 aid i ow_buf_get_u32 bid i OW_U32_MAX
+    ow_buf_put_u32 cid i sum
+  end
+  payload = and add get g_ow_comp_last_payload 0 1 OW_U32_MAX
+  put g_ow_comp_last_payload 0 payload
+  put g_ow_comp_marker 0 payload
+  put g_ow_comp_marker2 0 payload
+  put g_ow_rm_put 0 and add get g_ow_rm_put 0 1 OW_U32_MAX
+  put g_ow_rm_retired 0 get g_ow_rm_put 0
+  put g_ow_stage_sem 0 1
+  put g_ow_stage_sem 1 n
+  put g_ow_stage_sem 2 0
+  put g_ow_stage_sem 3 0
+  put g_ow_stage_sem 4 0
+  ow_compute_sem_id_from_stage
+  ow_compute_bindings_digest aid req_bytes bid req_bytes
+  rrc = ow_record_completed req_bytes payload
+  omega_world_scratch_reset
+  if ne rrc OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  put out_comp 0 payload
+  put g_ow_total_dispatches 0 add get g_ow_total_dispatches 0 1
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_resolve_code_ok h_code view ulong 5 to long
+  t1 = new ulong 1 0
+  t2 = new ulong 1 0
+  ret omega_world_resolve_code h_code t1 t2
+end
+
+fn ow_resolve_buf_ok h view ulong 5 perms ulong sz ulong to long
+  t1 = new ulong 1 0
+  ret omega_world_resolve_buffer h perms 0 sz t1
+end
+
+fn ow_vec_acquire_scratch to long
+  t1 = new ulong 1 0
+  t2 = new ulong 1 0
+  for s ulong 4
+    if ne omega_world_scratch_acquire 4096 t1 t2 OMEGA_WORLD_OK
+      omega_world_scratch_reset
+      ret OMEGA_WORLD_ERR_NO_MEM
+    end
+  end
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_dispatch_vector h_code view ulong 5 h_a view ulong 5 h_b view ulong 5 h_c view ulong 5 n ulong out_comp edit ulong 1 to long
+  if or eq get g_ow_initialized 0 0 eq n 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_faulted 0 0
+    ret OMEGA_WORLD_ERR_FAULTED
+  end
+  if eq get g_ow_chan_active 0 0
+    ret OMEGA_WORLD_ERR_HARDWARE
+  end
+  if ne ow_resolve_code_ok h_code OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  if gt n sub OW_U32_MAX 63
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  req_bytes = mul n 4
+  if ne ow_resolve_buf_ok h_a OMEGA_PERM_READ req_bytes OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne ow_resolve_buf_ok h_b OMEGA_PERM_READ req_bytes OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne ow_resolve_buf_ok h_c OMEGA_PERM_WRITE req_bytes OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne ow_vec_acquire_scratch OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  put g_ow_rec_u 0 get h_code 1
+  put g_ow_rec_u 1 get h_code 2
+  put g_ow_rec_u 2 get h_code 4
+  put g_ow_rec_u 3 get h_a 1
+  put g_ow_rec_u 4 get h_a 2
+  put g_ow_rec_u 5 get h_a 4
+  put g_ow_rec_u 6 get h_b 1
+  put g_ow_rec_u 7 get h_b 2
+  put g_ow_rec_u 8 get h_b 4
+  put g_ow_rec_u 9 get h_c 1
+  put g_ow_rec_u 10 get h_c 2
+  put g_ow_rec_u 11 get h_c 4
+  ret ow_vec_exec_and_commit n req_bytes out_comp
+end
+
+fn ow_matmul_dot_i32 r ulong c ulong to ulong
+  aid = get g_ow_rec_u 3
+  bid = get g_ow_rec_u 6
+  k = get g_ow_mm_spec 1
+  n = get g_ow_mm_spec 2
+  acc = ulong 0
+  for p ulong k bound 32
+    av = ow_buf_get_u32 aid add mul r k p
+    bv = ow_buf_get_u32 bid add mul p n c
+    acc = and add acc mul av bv OW_U32_MAX
+  end
+  ret acc
+end
+
+fn ow_matmul_exec_i32 to void
+  cid = get g_ow_rec_u 9
+  m = get g_ow_mm_spec 0
+  n = get g_ow_mm_spec 2
+  for r ulong m bound 32
+    for c ulong n bound 32
+      ow_buf_put_u32 cid add mul r n c ow_matmul_dot_i32 r c
+    end
+  end
+end
+
+fn ow_matmul_exec_and_commit req_a ulong req_b ulong req_c ulong out_comp edit ulong 1 to long
+  if eq get g_ow_mm_spec 3 OMEGA_MATMUL_PREC_INT32
+    ow_matmul_exec_i32
+  end
+  payload = and add get g_ow_comp_last_payload 0 1 OW_U32_MAX
+  put g_ow_comp_last_payload 0 payload
+  put g_ow_comp_marker 0 payload
+  put g_ow_comp_marker2 0 payload
+  put g_ow_rm_put 0 and add get g_ow_rm_put 0 1 OW_U32_MAX
+  put g_ow_rm_retired 0 get g_ow_rm_put 0
+  put g_ow_stage_sem 0 2
+  put g_ow_stage_sem 1 get g_ow_mm_spec 0
+  put g_ow_stage_sem 2 get g_ow_mm_spec 1
+  put g_ow_stage_sem 3 get g_ow_mm_spec 2
+  put g_ow_stage_sem 4 get g_ow_mm_spec 3
+  ow_compute_sem_id_from_stage
+  ow_compute_bindings_digest get g_ow_rec_u 3 req_a get g_ow_rec_u 6 req_b
+  rrc = ow_record_completed req_c payload
+  omega_world_scratch_reset
+  if ne rrc OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  put out_comp 0 payload
+  put g_ow_total_dispatches 0 add get g_ow_total_dispatches 0 1
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_set_matmul_spec m ulong k ulong n ulong prec ulong to void
+  put g_ow_mm_spec 0 m
+  put g_ow_mm_spec 1 k
+  put g_ow_mm_spec 2 n
+  put g_ow_mm_spec 3 prec
+end
+
+fn ow_matmul_calc_reqs to long
+  m = get g_ow_mm_spec 0
+  k = get g_ow_mm_spec 1
+  n = get g_ow_mm_spec 2
+  prec = get g_ow_mm_spec 3
+  elem_sz = ulong 2
+  if eq prec OMEGA_MATMUL_PREC_INT32
+    elem_sz = 4
+    if or gt n sub OW_U32_MAX 15 gt m sub OW_U32_MAX 15
+      ret OMEGA_WORLD_ERR_BOUNDS
+    end
+  end
+  put g_ow_mm_req 0 mul mul m k elem_sz
+  put g_ow_mm_req 1 mul mul k n elem_sz
+  put g_ow_mm_req 2 mul mul m n 4
+  ret OMEGA_WORLD_OK
+end
+
+fn ow_matmul_acquire_scratch to long
+  t1 = new ulong 1 0
+  t2 = new ulong 1 0
+  for s ulong 4
+    if ne omega_world_scratch_acquire 4096 t1 t2 OMEGA_WORLD_OK
+      omega_world_scratch_reset
+      ret OMEGA_WORLD_ERR_NO_MEM
+    end
+  end
+  if ne omega_world_scratch_acquire 16384 t1 t2 OMEGA_WORLD_OK
+    omega_world_scratch_reset
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  ret OMEGA_WORLD_OK
+end
+
+fn omega_world_dispatch_matmul h_code view ulong 5 h_a view ulong 5 h_b view ulong 5 h_c view ulong 5 out_comp edit ulong 1 to long
+  if eq get g_ow_initialized 0 0
+    ret OMEGA_WORLD_ERR_INVALID_ARG
+  end
+  if ne get g_ow_faulted 0 0
+    ret OMEGA_WORLD_ERR_FAULTED
+  end
+  if eq get g_ow_chan_active 0 0
+    ret OMEGA_WORLD_ERR_HARDWARE
+  end
+  if ne ow_resolve_code_ok h_code OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_FAULT
+  end
+  if ne ow_matmul_calc_reqs OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_BOUNDS
+  end
+  if ne ow_resolve_buf_ok h_a OMEGA_PERM_READ get g_ow_mm_req 0 OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne ow_resolve_buf_ok h_b OMEGA_PERM_READ get g_ow_mm_req 1 OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne ow_resolve_buf_ok h_c OMEGA_PERM_WRITE get g_ow_mm_req 2 OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_PERM_DENIED
+  end
+  if ne ow_matmul_acquire_scratch OMEGA_WORLD_OK
+    ret OMEGA_WORLD_ERR_NO_MEM
+  end
+  put g_ow_rec_u 0 get h_code 1
+  put g_ow_rec_u 1 get h_code 2
+  put g_ow_rec_u 2 get h_code 4
+  put g_ow_rec_u 3 get h_a 1
+  put g_ow_rec_u 4 get h_a 2
+  put g_ow_rec_u 5 get h_a 4
+  put g_ow_rec_u 6 get h_b 1
+  put g_ow_rec_u 7 get h_b 2
+  put g_ow_rec_u 8 get h_b 4
+  put g_ow_rec_u 9 get h_c 1
+  put g_ow_rec_u 10 get h_c 2
+  put g_ow_rec_u 11 get h_c 4
+  ret ow_matmul_exec_and_commit get g_ow_mm_req 0 get g_ow_mm_req 1 get g_ow_mm_req 2 out_comp
+end

@@ -1,0 +1,180 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note src/visor/rx/visor_world_rx.om -- Pure seeded OM-2 port of src/visor/rx/visor_world_rx.c.
+note Composes with src/visor/visor.om and src/visor/visor_world.om.
+note Read-only snapshot of an RxWorld into VisorWorldView (vwld_* globals).
+
+const VWRX_MAX_WORLD_OBJS ulong 128
+const VWRX_PERSIST_EPHEMERAL ulong 0
+const VWRX_PERSIST_RESIDENT ulong 1
+const VWRX_PERSIST_DURABLE ulong 2
+
+text vwrx_t_resident "resident"
+text vwrx_t_ephemeral "EPHEMERAL"
+text vwrx_t_res_kind "RESIDENT"
+text vwrx_t_durable "DURABLE"
+text vwrx_t_qmark "?"
+text vwrx_t_live "live"
+text vwrx_t_live_placed "live,placed"
+text vwrx_t_rx_pfx "rx:"
+text vwrx_t_sha_pfx "sha256:"
+
+text vwrx_g_noworld "no World given: snapshot refused (fail closed)"
+text vwrx_g_trunc "object list truncated at 32"
+text vwrx_g_gen "generation: RxWorld holds no RxGenStore"
+text vwrx_g_pub "published results: kept per RcGate, not on RxWorld"
+text vwrx_g_staged "staged effects: RxGenStore only, not visible"
+text vwrx_g_quiesc "digest/tail read apart from objects, coherent only when quiescent"
+
+note Read-only RxWorld source table (populated by runtime/fixture; never mutated by snapshot)
+global g_vwrx_obj_live ulong 128
+global g_vwrx_obj_id ulong 128
+global g_vwrx_obj_gen ulong 128
+global g_vwrx_obj_persist ulong 128
+global g_vwrx_obj_placed ulong 128
+global g_vwrx_n_reactions ulong 1
+global g_vwrx_in_flight ulong 1
+global g_vwrx_pub_tail ulong 1
+global g_vwrx_digest uchar 32
+
+fn vwrx_put_u64_into_oid slot ulong start ulong v ulong to ulong
+  db = new uchar 24 0
+  base = mul slot 72
+  pos = start
+  if eq v 0
+    if lt pos 71
+      put vwld_oid add base pos 48
+      pos = add pos 1
+    end
+    ret pos
+  end
+  cur = v
+  n = ulong 0
+  while gt cur 0 bound 24
+    put db n uchar add 48 rem cur 10
+    cur = div cur 10
+    n = add n 1
+  end
+  for i ulong n bound 24
+    if lt pos 71
+      put vwld_oid add base pos get db sub sub n 1 i
+      pos = add pos 1
+    end
+  end
+  ret pos
+end
+
+fn vwrx_set_obj_id slot ulong id ulong gen ulong to void
+  base = mul slot 72
+  pos = ulong 0
+  for i ulong len vwrx_t_rx_pfx bound 8
+    put vwld_oid add base pos get vwrx_t_rx_pfx i
+    pos = add pos 1
+  end
+  pos = vwrx_put_u64_into_oid slot pos id
+  if lt pos 71
+    put vwld_oid add base pos 64
+    pos = add pos 1
+  end
+  pos = vwrx_put_u64_into_oid slot pos gen
+  put vwld_oidl slot pos
+end
+
+fn vwrx_copy_kind slot ulong s view uchar * to void
+  base = mul slot 32
+  sl = len s
+  for i ulong sl bound 32
+    put vwld_okind add base i get s i
+  end
+  put vwld_okl slot sl
+end
+
+fn vwrx_copy_state slot ulong s view uchar * to void
+  base = mul slot 32
+  sl = len s
+  for i ulong sl bound 32
+    put vwld_ostate add base i get s i
+  end
+  put vwld_osl slot sl
+end
+
+fn vwrx_set_obj_meta slot ulong persist ulong placed ulong to void
+  if eq persist VWRX_PERSIST_EPHEMERAL
+    vwrx_copy_kind slot vwrx_t_ephemeral
+  else
+    if eq persist VWRX_PERSIST_RESIDENT
+      vwrx_copy_kind slot vwrx_t_res_kind
+    else
+      if eq persist VWRX_PERSIST_DURABLE
+        vwrx_copy_kind slot vwrx_t_durable
+      else
+        vwrx_copy_kind slot vwrx_t_qmark
+      end
+    end
+  end
+  if ne placed 0
+    vwrx_copy_state slot vwrx_t_live_placed
+  else
+    vwrx_copy_state slot vwrx_t_live
+  end
+end
+
+fn visor_world_snapshot has_world ulong to long
+  if eq has_world 0
+    vwld_reset
+    sl = len vwld_t_unattached
+    for i ulong sl bound 64
+      put vwld_state i get vwld_t_unattached i
+    end
+    put vwld_slen 0 sl
+    vwld_append_gap vwrx_g_noworld
+    ret -1
+  end
+  vwld_reset
+  put vwld_attached 0 1
+  sl = len vwrx_t_resident
+  for i ulong sl bound 64
+    put vwld_state i get vwrx_t_resident i
+  end
+  put vwld_slen 0 sl
+  n_live = ulong 0
+  n_copied = ulong 0
+  for i ulong VWRX_MAX_WORLD_OBJS
+    if ne get g_vwrx_obj_live i 0
+      if lt n_copied VWLD_MAX_OBJECTS
+        vwrx_set_obj_id n_copied get g_vwrx_obj_id i get g_vwrx_obj_gen i
+        vwrx_set_obj_meta n_copied get g_vwrx_obj_persist i get g_vwrx_obj_placed i
+        n_copied = add n_copied 1
+      end
+      n_live = add n_live 1
+    end
+  end
+  put vwld_res_cnt 0 n_live
+  put vwld_obj_cnt 0 n_copied
+  put vwld_rxn_cnt 0 get g_vwrx_n_reactions 0
+  put vwld_act_cnt 0 get g_vwrx_in_flight 0
+  for i ulong 7
+    put vwld_digest i get vwrx_t_sha_pfx i
+  end
+  for i ulong 32
+    b = ulong get g_vwrx_digest i
+    put vwld_digest add 7 mul i 2 get vwld_hx shr b 4
+    put vwld_digest add 8 mul i 2 get vwld_hx and b 15
+  end
+  put vwld_dlen 0 71
+  put vwld_pub_tail 0 get g_vwrx_pub_tail 0
+  put vwld_generation 0 0
+  put vwld_pub_cnt 0 0
+  put vwld_staged 0 0
+  put vwld_staged_vis 0 0
+  if gt n_live n_copied
+    vwld_append_gap vwrx_g_trunc
+  end
+  vwld_append_gap vwrx_g_gen
+  vwld_append_gap vwrx_g_pub
+  vwld_append_gap vwrx_g_staged
+  vwld_append_gap vwrx_g_quiesc
+  ret 0
+end
