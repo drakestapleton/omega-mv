@@ -3,6 +3,9 @@ note Native DeepSeek-V4.1-Flash single-stream decoder CLI.
 note Modes:
 note   layer0 <tensors> <engram_map> <sidecar_dir> <ckpt_dir> <token_id> <out_bin>
 note   gen    <tensors> <engram_map> <sidecar_dir> <ckpt_dir> <trace_out> <num_gen> <tok0> [tok1...]
+note   pfcheck <tensors> <engram_map> <sidecar_dir> <ckpt_dir>
+note          Host preflight, no GPU: loads the inputs, starts the payload workers exactly as gen and
+note          chat do, prints "ARBORIS pf_enabled=0|1" on stderr, stops the workers and exits 0.
 
 text dcModelPre "/model-"
 text dcModelSuf "-of-00048.safetensors"
@@ -12,6 +15,9 @@ text dcLayerSuf ".bin"
 text dcModeL0 "layer0"
 text dcModeGen "gen"
 text dcModeChat "chat"
+text dcModePf "pfcheck"
+text dcPfLine "ARBORIS pf_enabled="
+text dcStNl "\n"
 text dcEngW1 "layers.1.engram.embed.weight"
 text dcEngS1 "layers.1.engram.embed.scale"
 text dcEngW14 "layers.14.engram.embed.weight"
@@ -24,6 +30,15 @@ text dcStEng " engram_ns="
 text dcStSha " trace_sha256="
 text dcStArbPre "ARBORIS pf_dispatched="
 text dcStArbHits " pf_hits="
+text dcStArbOn " pf_enabled="
+text dcStPfWaited "ARBORIS-PF waited="
+text dcStPfWaitNs " wait_ns="
+text dcStPfDropped " dropped_unused="
+text dcStPfFailed " failed="
+text dcStPfBusy " no_idle_worker="
+text dcStLaPre "ARBORIS-LOOKAHEAD depth="
+text dcStLaRight " right="
+text dcStLaOf " of="
 
 fn dcStrEq a view uchar * n ulong b view uchar * to bool
   if ne n len b
@@ -274,6 +289,11 @@ fn dcStartup h edit zonehdr ctx edit shactx nSlots ulong to bool
   if not dcPopulate z1
     ret false
   end
+  if eq get dfArbPfMeta 4 1
+    if not dfSpecInit
+      ret false
+    end
+  end
   if not dkTouch kv
     ret false
   end
@@ -421,6 +441,32 @@ fn dcPrintErrText s view uchar * to void
   r = write 2 s 0 len s
 end
 
+note Second Arboris line: how the non-blocking prefetch pipeline behaved (all zero with prefetch off).
+fn dcPrintPfStats to void
+  dcPrintErrText dcStPfWaited
+  dcPrintErrU64 get dfArbPfMeta 1
+  dcPrintErrText dcStPfWaitNs
+  dcPrintErrU64 get dfPfStat 2
+  dcPrintErrText dcStPfDropped
+  dcPrintErrU64 get dfPfStat 0
+  dcPrintErrText dcStPfFailed
+  dcPrintErrU64 get dfPfStat 1
+  dcPrintErrText dcStPfBusy
+  dcPrintErrU64 get dfPfStat 3
+  dcPrintErrText dcStNl
+  if eq get dfArbPfMeta 4 1
+    for i ulong dfSpecN
+      dcPrintErrText dcStLaPre
+      dcPrintErrU64 dfSpecDepthAt i
+      dcPrintErrText dcStLaRight
+      dcPrintErrU64 get dfSpecStat add mul i 2 1
+      dcPrintErrText dcStLaOf
+      dcPrintErrU64 get dfSpecStat mul i 2
+      dcPrintErrText dcStNl
+    end
+  end
+end
+
 fn dcPrintStats digest view uchar 32 to void
   hex = new uchar 65 0
   for i ulong 32
@@ -445,8 +491,11 @@ fn dcPrintStats digest view uchar 32 to void
   dcPrintErrU64 get dfArbPfMeta 3
   dcPrintErrText dcStArbHits
   dcPrintErrU64 get dfArbPfMeta 2
+  dcPrintErrText dcStArbOn
+  dcPrintErrU64 get dfArbPfMeta 4
   put hex 0 10
   r2 = write 2 hex 0 1
+  dcPrintPfStats
 end
 
 fn dcReadU32 fd int outVal edit uint 1 to bool
@@ -765,7 +814,11 @@ fn main to int
   slabHdr = new uchar 128 0
   traceCtx = new uchar 104 0
   modeBuf = new uchar 16 0
-  if lt argcnt 8
+  if lt argcnt 6
+    ret 64
+  end
+  pfSetting = dpsSetting
+  if lt pfSetting 0
     ret 64
   end
   mn = argread 1 modeBuf 0 16
@@ -775,18 +828,38 @@ fn main to int
   isL0 = dcStrEq modeBuf ulong mn dcModeL0
   isGen = dcStrEq modeBuf ulong mn dcModeGen
   isChat = dcStrEq modeBuf ulong mn dcModeChat
-  if and not isL0 and not isGen not isChat
+  isPf = dcStrEq modeBuf ulong mn dcModePf
+  if and not isL0 and not isGen and not isChat not isPf
     ret 64
+  end
+  if isPf
+    if ne argcnt 6
+      ret 64
+    end
+  else
+    if lt argcnt 8
+      ret 64
+    end
   end
   rc = dcLoadInputs slabHdr
   if ne rc 0
     ret rc
   end
-  if not dfStartWorkers
+  pfOn = ulong pfSetting
+  if isL0
+    pfOn = 0
+  end
+  if not dfStartWorkers pfOn
     ret 70
   end
+  if isPf
+    dcPrintErrText dcPfLine
+    dcPrintErrU64 get dfArbPfMeta 4
+    dcPrintErrText dcStNl
+    dfStopWorkers
+    ret 0
+  end
   if isL0
-    put dfArbPfMeta 4 0
     tv = dcReadTokArg 6
     if lt tv 0
       ret 64
