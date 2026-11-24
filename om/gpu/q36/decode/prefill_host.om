@@ -60,6 +60,14 @@ text qpMsgP2FwNeg " negctrl_alarm_tripped="
 text qpMsgP2FwBad "FASTW_1000_SOAK: FAIL\n"
 text qpMsgP2KvOk "KV_INT8_128K: PASS (1.30 GB slabs, pos=131071 tok="
 text qpMsgP2KvBad "KV_INT8_128K: FAIL\n"
+text qpMsgMtpHdr "\n=== NATIVE QWEN 3.6 MTP SPECULATIVE DECODE BENCH (M="
+text qpMsgMtpOk "MTP_SPEC (M="
+text qpMsgMtpLoad "Loaded & quantized native mtp.safetensors (Slot 40 W4 + 16 MB FC) in ms="
+text qpMsgBatHdr "\n=== CONTINUOUS MULTI-USER BATCHED DECODE BENCH (N="
+text qpMsgBatRes "BATCH_DECODE: streams="
+text qpMsgBatTot " total_toks="
+text qpMsgBatStep " step_us="
+text qpMsgBatAgg " agg_tok_s_x100="
 
 fn qdPreEmitKernels to void
 for ki ulong 17
@@ -1088,6 +1096,403 @@ end
 qdPrint qpMsgP2KvOk
 qdPrintU edgeTok
 qdPrint qdMsgRp
+ret 0
+end
+
+note =========================================================================
+note Native Qwen 3.6 MTP (mtp.safetensors -> Slot 40 W4) + Batched N=4..8 Decode
+note =========================================================================
+fn qdLoadMtpW4 to bool
+t0 = monons
+n = qdBuildPath qdSufMtp neg 1
+fd = int fopen qdPathBuf 0 n 0 0
+if lt fd 0
+ret false
+end
+if ne pread fd qdIoBuf 0 8 0 8
+c = fclose fd
+ret false
+end
+hdrLen = ulong 0
+for i ulong 8
+hdrLen = or hdrLen shl ulong get qdIoBuf i mul i 8
+end
+dataOff = add 8 hdrLen
+note 1. Stream mtp.fc.weight [2048, 4096] BF16 (16 MiB) -> qdMtpFcMap
+if not qdStreamToMap fd dataOff get qdMtpFcMap 0 0 16777216
+c = fclose fd
+ret false
+end
+baseOff = add dataOff 16777216
+note 2. Widen all scales + norms (including mtp.norm, pre_fc_norm_emb, pre_fc_norm_hid) -> Slot 40
+if not qdWidenLayerScales fd baseOff 40 1176192
+c = fclose fd
+ret false
+end
+note 3. Stream FP8 weights shifted by -12288 so every FA_* offset matches verbatim!
+if not qdStreamToMap fd add baseOff 1176192 get qdSlabMap 0 FA_EXP_W0 835715072
+c = fclose fd
+ret false
+end
+note Copy router GATE [256,2048] + SH_GATE [1,2048] to FA_GATE / FA_SH_GATE in staging slab
+if not qdStreamToMap fd add baseOff FA_GATE get qdSlabMap 0 FA_GATE 1048576
+c = fclose fd
+ret false
+end
+if not qdStreamToMap fd add baseOff FA_SH_GATE get qdSlabMap 0 FA_SH_GATE 4096
+c = fclose fd
+ret false
+end
+c = fclose fd
+note 4. Quantize all 256 experts + shared + FA Q/K/V/O on GPU into Slot 40
+if not qdQuantLayerExpW4 40 true
+ret false
+end
+if not qdQuantLayerDenseW4 40 true
+ret false
+end
+put qdMtpReady 0 1
+qdPrint qpMsgMtpLoad
+qdPrintU div ulong sub monons t0 1000000
+qdPrint qdMsgNl
+ret true
+end
+
+fn qdEmitMtpLayerW4 to bool
+w4 = qdLayerW4Va 40
+d4 = add w4 W4_DENSE
+sbase = qdLayerSVa 40
+note 1. pre_fc_norm_embedding(QDI_AOUT) -> QDI_Y[0..2047], pre_fc_norm_hidden(QDI_X) -> QDI_Y[2048..4095]
+qdPtr qdW QDI_AOUT
+qdPtr qdW QDI_AOUT
+qdPtr add sbase 2336000
+qdPtr qdW QDI_Y
+qdArg 0
+if not qdPktEmitBx 10 1 256
+ret false
+end
+qdPtr qdW QDI_X
+qdPtr qdW QDI_X
+qdPtr add sbase 2344192
+qdPtr add qdW QDI_Y 8192
+qdArg 0
+if not qdPktEmitBx 10 1 256
+ret false
+end
+note 2. QDI_X = mtp.fc @ QDI_Y[0..4095] ([2048, 4096] BF16) + input_layernorm -> QDI_XN
+if not qdEmitBf16 qdW QDI_Y get qdMtpFcVa 0 qdW QDI_X 4096 2048
+ret false
+end
+if not qdEmitRmsNormAdd sbase 0
+ret false
+end
+note 3. Full-Attention Q|K|V + KV append + Split-K GQA + O_proj
+if not qdEmitW4Gemv4R qdW QDI_XN d4 add d4 9437184 qdW QDI_QKV 2048 9216
+ret false
+end
+kBase = get qdMtpKvVa 0
+vBase = add kBase 268435456
+if eq get qdUseKvInt8 0 1
+qdPtr add qdW QDI_QKV 32768
+qdPtr add qdW QDI_QKV 34816
+qdPtr add sbase mul FA_KNORM 2
+qdPtr get qdRopeVa 0
+qdPtr kBase
+qdPtr qdW QDI_POS
+if not qdPktEmitGy 53 2 1 256
+ret false
+end
+else
+qdPtr add qdW QDI_QKV 32768
+qdPtr add qdW QDI_QKV 34816
+qdPtr add sbase mul FA_KNORM 2
+qdPtr get qdRopeVa 0
+qdPtr kBase
+qdPtr vBase
+qdPtr qdW QDI_POS
+if not qdPktEmitGy 14 2 1 256
+ret false
+end
+end
+if not qdEmitFaAttnSplit sbase kBase vBase
+ret false
+end
+if not qdEmitW4Gemv4R qdW QDI_Y add d4 10616832 add d4 14811136 qdW QDI_AOUT 4096 2048
+ret false
+end
+if not qdEmitRmsNormAdd add sbase mul FA_POST_NORM 2 1
+ret false
+end
+note 4. Router + 256E top-8 + shared W4 MoE + combine + mtp.norm -> QDI_X (h_mtp) & QDI_XN
+if not qdEmitBf161R qdW QDI_XN add d4 15335424 qdW QDI_ROUT 257
+ret false
+end
+idsVa = qdW QDI_IDS
+qdPtr qdW QDI_ROUT
+qdPtr idsVa
+qdPtr qdW QDI_WTS
+qdPtr add qdW QDI_ROUT 1024
+qdPtr qdW QDI_LEXMAP
+qdPtr qdW QDI_ARB_TAB
+qdPtr 0
+if not qdPktEmitGy 13 1 1 256
+ret false
+end
+qdPtr qdW QDI_XN
+qdPtr add w4 W4_GU_W
+qdPtr add w4 W4_GU_S
+qdPtr idsVa
+qdPtr qdW QDI_EMID
+qdArg 2048
+qdArg 1024
+qdArg 0
+if not qdPktEmitGy 20 32 9 256
+ret false
+end
+qdPtr qdW QDI_EMID
+qdPtr add w4 W4_DN_W
+qdPtr add w4 W4_DN_S
+qdPtr idsVa
+qdPtr qdW QDI_EOUT
+if not qdPktEmitGy 22 32 9 256
+ret false
+end
+qdPtr qdW QDI_X
+qdPtr qdW QDI_EOUT
+qdPtr qdW QDI_WTS
+qdPtr add sbase 2327808
+qdPtr qdW QDI_XN
+qdArg 1
+ret qdPktEmitGy 23 1 1 256
+end
+
+fn qdMtpRecordPackets to bool
+qdPktStartAt add qdO QDI_PKT 18874368
+if not qdEmitMtpLayerW4
+ret false
+end
+if not qdEmitFinalHead
+ret false
+end
+if not qdPktFinish 7
+ret false
+end
+qdPktStartAt add qdO QDI_PKT 20971520
+if not qdEmitMtpLayerW4
+ret false
+end
+ret qdPktFinish 8
+end
+
+fn qdLoadEmbedToAout tid ulong to bool
+off = add QD_EMB_OFF mul tid 4096
+if ne pread get qdOutFd 0 qdIoBuf 0 4096 long off 4096
+ret false
+end
+for i ulong QD_H
+p = mul i 2
+bits = or shl uint get qdIoBuf add p 1 24 shl uint get qdIoBuf p 16
+put qdX i bitcast f32 bits
+end
+ret qdWriteF32 get qdWork 0 qdO QDI_AOUT 6 QD_H
+end
+
+fn qdMtpWritePos pos ulong to bool
+w = uint pos
+put qdIoBuf 0 uchar and w 255
+put qdIoBuf 1 uchar and shr w 8 255
+put qdIoBuf 2 uchar and shr w 16 255
+put qdIoBuf 3 uchar and shr w 24 255
+ret eq mapwrite get qdWork 0 qdO QDI_POS qdIoBuf 0 4 4
+end
+
+fn qdMtpReadTopTok to ulong
+if not qdReadCandIds
+ret 999999
+end
+if not qdReadF32 get qdWork 0 qdO QDI_CLOG 12 128
+ret 999999
+end
+bestId = ulong get qdCandIds 0
+bestLog = get qdCandLog 0
+for j ulong 128
+if gt get qdCandLog j bestLog
+bestLog = get qdCandLog j
+bestId = ulong get qdCandIds j
+end
+end
+ret bestId
+end
+
+fn qdMtpDraftChain curTok ulong pos0 ulong M ulong to bool
+put qdSpecDraft 0 curTok
+for s ulong sub M 1 bound 16
+if not qdLoadEmbedToAout get qdSpecDraft s
+ret false
+end
+if not qdMtpWritePos add pos0 s
+ret false
+end
+if not qdReplayPre 7
+ret false
+end
+d = qdMtpReadTopTok
+if eq d 999999
+ret false
+end
+put qdSpecDraft add s 1 d
+end
+ret true
+end
+
+fn qdMtpCopyMainHid acc ulong to bool
+off = add QP_X mul sub acc 1 8192
+if ne mapread get qdPreMap 0 off qdIoBuf 0 8192 8192
+ret false
+end
+ret eq mapwrite get qdWork 0 qdO QDI_X qdIoBuf 0 8192 8192
+end
+
+fn qdMtpPrefillWarm to ulong
+prompt = new ulong 19 0
+qdSpecFillPrompt prompt
+qdResetState
+nextTok = ulong 0
+for p ulong 19
+isLast = eq p 18
+nextTok = qdForwardToken get prompt p p isLast false
+if eq nextTok 999999
+ret 999999
+end
+if lt p 18
+if not qdLoadEmbedToAout get prompt add p 1
+ret 999999
+end
+if not qdMtpWritePos p
+ret 999999
+end
+if not qdReplayPre 8
+ret 999999
+end
+end
+end
+ret nextTok
+end
+
+fn qdRunMtpBench genN ulong M ulong to int
+if not qdLoadMtpW4
+ret 41
+end
+if not qdMtpRecordPackets
+ret 42
+end
+if not qdSpecEmitVerifyPkt M
+ret 43
+end
+qdPrint qpMsgMtpHdr
+qdPrintU M
+qdPrint qdMsgRp
+n1Avg = qdSpecBenchN1 genN
+if eq n1Avg 0
+ret 44
+end
+nextTok = qdMtpPrefillWarm
+if eq nextTok 999999
+ret 45
+end
+put qdSpecSt 0 1
+put qdSpecSt 1 1
+if ne nextTok get qdRefOut 0
+put qdSpecSt 1 0
+end
+steps = ulong 0
+pos = ulong 19
+t0 = monons
+while lt get qdSpecSt 0 genN bound 64
+if not qdMtpDraftChain nextTok sub pos 1 M
+ret 46
+end
+acc = qdSpecVerifyStep M pos
+if eq acc 0
+ret 47
+end
+steps = add steps 1
+qdSpecCommitAcc acc genN false
+if not qdMtpCopyMainHid acc
+ret 48
+end
+nextTok = get qdSpecPred sub acc 1
+pos = add pos acc
+end
+mUs = div ulong sub monons t0 1000
+mAvg = div mUs sub get qdSpecSt 0 1
+qdPrint qpMsgMtpOk
+qdPrintU M
+if eq get qdSpecSt 1 1
+qdPrint qpMsgSpecParOk
+else
+qdPrint qpMsgSpecParBad
+end
+qdPrintU steps
+qdPrint qpMsgSpecAcc
+qdPrintU div mul sub get qdSpecSt 0 1 100 steps
+qdPrint qdMsgAvgMs
+qdPrintU mAvg
+qdPrint qdMsgTps
+qdPrintU div 100000000 mAvg
+qdPrint qpMsgSpecSpd
+qdPrintU div mul n1Avg 100 mAvg
+qdPrint qdMsgNl
+if ne get qdSpecSt 1 1
+ret 49
+end
+ret 0
+end
+
+fn qdRunBatchDecodeBench genN ulong B ulong to int
+qdPrint qpMsgBatHdr
+qdPrintU B
+qdPrint qdMsgRp
+if not qdSpecEmitVerifyPkt B
+ret 51
+end
+qdResetState
+for s ulong B bound 16
+put qdPreTokIds s uint add 271 s
+end
+t0 = monons
+pos = ulong 0
+for st ulong genN bound 64
+if not qdPreUploadToks B pos
+ret 52
+end
+if not qdKickPre 6
+ret 53
+end
+if not qdWaitPre
+ret 54
+end
+if not qdSpecReadPreds B
+ret 55
+end
+for s ulong B bound 16
+put qdPreTokIds s uint get qdSpecPred s
+end
+pos = add pos B
+end
+bUs = div ulong sub monons t0 1000
+totTok = mul genN B
+stepUs = div bUs genN
+aggTps = div mul totTok 100000000 bUs
+qdPrint qpMsgBatRes
+qdPrintU B
+qdPrint qpMsgBatTot
+qdPrintU totTok
+qdPrint qpMsgBatStep
+qdPrintU stepUs
+qdPrint qpMsgBatAgg
+qdPrintU aggTps
+qdPrint qdMsgNl
 ret 0
 end
 
