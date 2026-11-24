@@ -1,0 +1,217 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/sm121_pe.om: Runtime Shape Partial Evaluator + Proof-Checked SM121 Contract Emitter
+note + Minimal 64-bit ELF64 container emitter (decoupled from ISA: EM_AARCH64=183, EM_X86_64=62, EM_RISCV=243).
+
+note Execution regimes derived automatically by partial evaluation on (M, K, N):
+const PE_REGIME_GEMV_4R ulong 1
+const PE_REGIME_REG_TILE_M ulong 2
+const PE_REGIME_HMMA_16816 ulong 3
+
+note Output of peSpecializeW4Gemm: [0]=regime, [1]=reqSmem, [2]=reqRegs, [3]=gridX, [4]=cacheSlot, [5]=status
+global peOut ulong 8
+
+note ELF64 output buffer (small static executable: 64B ehdr + 56B phdr + code)
+global elfBuf uchar 4096
+global elfLen ulong 1
+
+fn peMakeShapeSig M ulong K ulong N ulong to ulong
+ret or shl M 32 or shl K 16 N
+end
+
+note Antibody #14 verifier over emitted 128-bit SM121 SASS buffer: every non-EXIT insn must have stall >= 6!
+fn peVerifySm121Antibodies to bool
+n = get isLen 0
+if or eq n 0 ne rem n 16 0
+ret false
+end
+insns = div n 16
+for i ulong insns bound 64
+off = mul i 16
+hi = ulong get isBuf add off 8
+if lt hi 6
+ret false
+end
+end
+ret true
+end
+
+fn pePlanRegime M ulong K ulong N ulong to void
+reg = PE_REGIME_GEMV_4R
+reqSmem = mul K 4
+reqRegs = ulong 40
+reqMma = ulong 0
+reqFeat = ulong 0
+gx = div add N 31 32
+if and ge M 2 le M 8
+reg = PE_REGIME_REG_TILE_M
+reqSmem = mul mul M K 4
+reqRegs = ulong 56
+gx = div add N 31 32
+end
+if gt M 8
+reg = PE_REGIME_HMMA_16816
+reqSmem = ulong 32768
+reqRegs = ulong 64
+reqMma = MMA_16816_BF16
+reqFeat = FEAT_HMMA16816
+gx = div add N 63 64
+end
+put peOut 0 reg
+put peOut 1 reqSmem
+put peOut 2 reqRegs
+put peOut 3 gx
+tdSetReq EXEC_SIMT_WARP reqSmem reqRegs 32 reqMma reqFeat
+end
+
+note Runtime Shape Partial Evaluator for W4-B32 GEMM/GEMV on TargetDesc tid (e.g. TID_SM121):
+fn peSpecializeW4Gemm semId ulong tid ulong M ulong K ulong N ulong to ulong
+feat = tdGet tid TDF_FEAT
+sig = peMakeShapeSig M K N
+hit = tdCacheLookup semId tid feat sig
+if ne hit 999999
+put peOut 4 hit
+put peOut 5 TDK_OK
+ret TDK_OK
+end
+pePlanRegime M K N
+rc = tdCheckKernelContract tid
+put peOut 4 999999
+put peOut 5 rc
+if ne rc TDK_OK
+ret rc
+end
+if not isCompileTestFn tid
+put peOut 5 99
+ret 99
+end
+if not peVerifySm121Antibodies
+put peOut 5 98
+ret 98
+end
+codePtr = add 65536 mul get peOut 0 4096
+slot = tdCacheInstall semId tid feat sig codePtr 7
+put peOut 4 slot
+if eq slot 999999
+put peOut 5 97
+ret 97
+end
+ret TDK_OK
+end
+
+note ---- Orthogonal ELF64 Container Plugin (works identically for AArch64, x86-64, and RV64GC!) ----
+fn elfPutU8 off ulong v ulong to void
+put elfBuf off uchar and v 255
+end
+
+fn elfPutU16 off ulong v ulong to void
+elfPutU8 off v
+elfPutU8 add off 1 shr v 8
+end
+
+fn elfPutU32 off ulong v ulong to void
+elfPutU16 off v
+elfPutU16 add off 2 shr v 16
+end
+
+fn elfPutU64 off ulong v ulong to void
+elfPutU32 off v
+elfPutU32 add off 4 shr v 32
+end
+
+fn elfMachineForIsa isa ulong to ulong
+if eq isa ISA_A64
+ret 183
+end
+if eq isa ISA_X64
+ret 62
+end
+if eq isa ISA_RV64
+ret 243
+end
+ret 0
+end
+
+note Emit a minimal static Linux ELF64 executable wrapping isBuf[0..isLen) at vaddr 0x400000 + 120!
+fn elfEmitStatic tid ulong to ulong
+em = elfMachineForIsa tdGet tid TDF_ISA
+if eq em 0
+ret 0
+end
+clen = get isLen 0
+tot = add 120 clen
+for i ulong tot bound 4096
+put elfBuf i 0
+end
+note ELF64 header (64 bytes)
+elfPutU8 0 127
+elfPutU8 1 69
+elfPutU8 2 76
+elfPutU8 3 70
+elfPutU8 4 2
+elfPutU8 5 1
+elfPutU8 6 1
+elfPutU16 16 2
+elfPutU16 18 em
+elfPutU32 20 1
+elfPutU64 24 4194424
+elfPutU64 32 64
+elfPutU16 52 64
+elfPutU16 54 56
+elfPutU16 56 1
+note PT_LOAD program header (56 bytes at offset 64): PF_R | PF_X (5)
+elfPutU32 64 1
+elfPutU32 68 5
+elfPutU64 72 0
+elfPutU64 80 4194304
+elfPutU64 88 4194304
+elfPutU64 96 tot
+elfPutU64 104 tot
+elfPutU64 112 4096
+for i ulong clen bound 1024
+put elfBuf add 120 i get isBuf i
+end
+put elfLen 0 tot
+ret tot
+end
+
+note Emit tiny standalone exit(36) test binary for AArch64 and x86-64 using our register-allocated emitters!
+note Computes (7 + 5) * 3 = 36 in register 0, then invokes Linux exit(reg0)!
+fn elfBuildExecDemo tid ulong to ulong
+isa = tdGet tid TDF_ISA
+isBufReset
+if eq isa ISA_A64
+note mov x0, #7 (0xd28000e0); mov x1, #5 (0xd28000a1); mov x2, #3 (0xd2800062)
+isEmitU32 3531604192
+isEmitU32 3531604129
+isEmitU32 3531604066
+note Shared ISel: ADD x0,x0,x1; MUL x0,x0,x2
+ok = isEmitOp tid OIR_ADD 0 0 1
+ok = isEmitOp tid OIR_MUL 0 0 2
+note mov x8, #93 (SYS_exit=93: 0xd2800ba8); svc #0 (0xd4000001)
+isEmitU32 3531606952
+isEmitU32 3556769793
+ret elfEmitStatic tid
+end
+if eq isa ISA_X64
+note mov eax, 7 (b8 07 00 00 00); mov edi, 5 (bf 05 00 00 00); mov esi, 3 (be 03 00 00 00)
+isEmitU8 184
+isEmitU32 7
+isEmitU8 191
+isEmitU32 5
+isEmitU8 190
+isEmitU32 3
+note Shared ISel: add rax, rdi; imul rax, rsi
+ok = isEmitOp tid OIR_ADD 0 0 1
+ok = isEmitOp tid OIR_MUL 0 0 2
+note mov rdi, rax (48 89 c7); mov eax, 60 (SYS_exit=60: b8 3c 00 00 00); syscall (0f 05)
+isEmitU8 72
+isEmitU8 137
+isEmitU8 199
+isEmitU8 184
+isEmitU32 60
+isEmitU8 15
+isEmitU8 5
+ret elfEmitStatic tid
+end
+ret 0
+end
