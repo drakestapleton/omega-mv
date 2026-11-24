@@ -1,0 +1,168 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_engine.c.
+note Host-only state-machine, fault-injection, timeout, uncertain-completion,
+note poison-detection, and name-table tests of src/omega_gpu_engine.om
+note against OGE_BACKEND_NONE and OGE_BACKEND_MOCK. Zero /dev/nvidia* access.
+om2
+
+text toge_pass "test_omega_gpu_engine: PASS\n"
+text toge_fail "test_omega_gpu_engine: FAIL\n"
+
+global g_oge_chk ulong 1
+global g_oge_fail ulong 1
+
+fn oge_chk cond bool to void
+  put g_oge_chk 0 add get g_oge_chk 0 1
+  if not cond
+    put g_oge_fail 0 add get g_oge_fail 0 1
+  end
+end
+
+fn setup_valid_job job edit ulong 12 to void
+  put job 0 512
+  put job 1 OGE_LAYOUT_VECTOR_1D
+  put job 2 16
+  put job 3 64
+  put job 4 64
+  put job 5 64
+  put job 6 16
+  put job 7 0
+  put job 8 111
+  put job 9 333
+  put job 10 222
+  put job 11 444
+  prog = new uchar 512 0
+  clen = bw_encode_vecadd prog
+  oge_chk eq clen 512
+  for i ulong clen
+    put oge_job_prog i get prog i
+  end
+  for i ulong 16
+    a = uint add mul i 17 3
+    b = uint add mul i 29 7
+    put oge_job_a i a
+    put oge_job_b i b
+    put oge_job_poison i xor add a b uint 0xffffffff
+    put oge_job_out i 0
+  end
+end
+
+fn test_names_and_validation to void
+  nbuf = new uchar 48 0
+  oge_chk eq oge_failure_name OGE_OK nbuf 2
+  oge_chk gt oge_failure_name OGE_SUBMIT nbuf 0
+  oge_chk gt oge_failure_name OGE_OUTPUT_UNCHANGED nbuf 0
+  oge_chk gt oge_failure_name OGE_UNCERTAIN_COMPLETION_BLOCKED nbuf 0
+  oge_chk eq oge_state_name OGE_STATE_SUCCESS nbuf 7
+  oge_chk eq oge_wait_name OGE_WAIT_MARKER2 nbuf 7
+  oge_chk eq oge_step_name OGE_STEP_SCAN nbuf 4
+
+  job = new ulong 12 0
+  setup_valid_job job
+  oge_chk oge_job_valid job
+
+  note Invalid n == 0 refused
+  put job 2 0
+  oge_chk not oge_job_valid job
+  put job 2 16
+
+  note Invalid layout refused
+  put job 1 99
+  oge_chk not oge_job_valid job
+  put job 1 OGE_LAYOUT_VECTOR_1D
+
+  note No backend returns INTERNAL_INVARIANT
+  res = new ulong 16 0
+  oge_test_reset_block
+  oge_set_backend OGE_BACKEND_NONE
+  oge_chk eq oge_execute job res OGE_INTERNAL_INVARIANT
+  oge_chk eq get res 2 OGE_STEP_NOT_IMPLEMENTED
+end
+
+fn test_happy_and_no_c3 to void
+  job = new ulong 12 0
+  res = new ulong 16 0
+  setup_valid_job job
+  oge_test_reset_block
+  oge_test_set_clock 1 100 10
+  oge_mock_reset
+  oge_set_backend OGE_BACKEND_MOCK
+
+  oge_chk eq oge_execute job res OGE_OK
+  oge_chk eq get res 1 OGE_STATE_SUCCESS
+  oge_chk eq get oge_mock_marker2_called 0 1
+  oge_chk eq get oge_mock_free_mask 0 31
+  for i ulong 16
+    a = uint add mul i 17 3
+    b = uint add mul i 29 7
+    oge_chk eq get oge_job_out i add a b
+  end
+
+  note NO_C3 skips marker2
+  oge_mock_reset
+  put job 7 OGE_FLAG_NO_C3
+  put job 10 0
+  oge_chk eq oge_execute job res OGE_OK
+  oge_chk eq get oge_mock_marker2_called 0 0
+end
+
+fn test_fault_injection_and_uncertain to void
+  job = new ulong 12 0
+  res = new ulong 16 0
+  setup_valid_job job
+  oge_set_backend OGE_BACKEND_MOCK
+
+  note Poison untouched -> OGE_OUTPUT_UNCHANGED
+  oge_test_reset_block
+  oge_mock_reset
+  put oge_mock_leave_poison 0 1
+  oge_chk eq oge_execute job res OGE_OUTPUT_UNCHANGED
+  oge_chk eq get res 14 16
+  oge_chk eq get res 1 OGE_STATE_OUTPUT_VISIBLE
+
+  note Submit failure + close failure preserves first failure
+  oge_mock_reset
+  put oge_mock_fail_step 0 OGE_STEP_SUBMIT
+  put oge_mock_fail_close 0 1
+  oge_chk eq oge_execute job res OGE_SUBMIT
+  oge_chk eq get res 12 1
+
+  note Open failure
+  oge_mock_reset
+  put oge_mock_fail_step 0 OGE_STEP_OPEN_DEVICE
+  oge_chk eq oge_execute job res OGE_DEVICE_OPEN
+
+  note Alloc failure
+  oge_mock_reset
+  put oge_mock_fail_step 0 OGE_STEP_ALLOC
+  oge_chk eq oge_execute job res OGE_ALLOC
+
+  note Uncertain completion on WAIT_MARKER retains allocs and blocks process
+  oge_mock_reset
+  oge_test_set_clock 1 1000 37
+  put oge_mock_fail_step 0 OGE_STEP_WAIT_MARKER
+  oge_chk eq oge_execute job res OGE_COMPLETION_WAIT
+  oge_chk eq get res 11 1
+  oge_chk eq get res 5 37
+  oge_chk eq get oge_mock_free_mask 0 0
+  oge_chk eq get oge_mock_close_calls 0 0
+  oge_chk eq oge_is_blocked 1
+
+  note Subsequent execution blocked
+  oge_chk eq oge_execute job res OGE_UNCERTAIN_COMPLETION_BLOCKED
+  oge_chk eq get res 2 OGE_STEP_BLOCKED
+  oge_test_reset_block
+  oge_test_set_clock 0 0 0
+end
+
+fn main to int
+  test_names_and_validation
+  test_happy_and_no_c3
+  test_fault_injection_and_uncertain
+  if eq get g_oge_fail 0 0
+    ign = write 1 toge_pass 0 len toge_pass
+    ret 0
+  end
+  ign = write 1 toge_fail 0 len toge_fail
+  ret 1
+end

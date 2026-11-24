@@ -1,0 +1,161 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_reduce.c (CPU host tiers).
+note Tests E1 WP-D frozen-order FP32 reductions (src/omega_numeric_reduce.om):
+note   - metadata (op_name, identity, levels)
+note   - empty, singleton, tile-boundary (32, 33, 64, 100, 1025) lengths
+note   - seeded distributions (mixed, subnormal, special, cancel) bit-exact CPU == reference
+note   - batched rows with stride & bad-arg refusals
+note   - negative controls: sequential sum and reverse-delta mutant differ from frozen tree.
+om2
+
+text red_pass "test_omega_reduce: PASS\n"
+text red_fail "test_omega_reduce: FAIL\n"
+
+global g_red_chk ulong 1
+global g_red_fail ulong 1
+global g_red_rng ulong 1
+
+fn red_chk cond bool to void
+  put g_red_chk 0 add get g_red_chk 0 1
+  if not cond
+    put g_red_fail 0 add get g_red_fail 0 1
+  end
+end
+
+fn red_rng to ulong
+  x = get g_red_rng 0
+  x = xor x shl x 13
+  x = xor x shr x 7
+  x = xor x shl x 17
+  put g_red_rng 0 x
+  ret x
+end
+
+fn gen_val dist ulong to uint
+  r = red_rng
+  lo = uint and r 0xffffffff
+  s = shl uint and shr r 63 1 31
+  if eq dist 0
+    note mixed finite
+    e = add 107 uint rem shr r 32 41
+    m = and lo uint 0x7fffff
+    ret or or s shl e 23 m
+  end
+  if eq dist 1
+    note subnormal & tiny normal
+    mask = uint 0x7fffff
+    if eq and shr r 40 1 0
+      mask = uint 0xffffff
+    end
+    ret or s and lo mask
+  end
+  note cancel: large +/- values mixed with small values
+  e = add 127 uint rem shr r 24 3
+  if eq rem shr r 40 3 0
+    e = add 151 uint rem shr r 20 4
+  end
+  ret or or s shl e 23 and lo uint 0x7fffff
+end
+
+fn test_meta_and_empty to void
+  nbuf = new uchar 8 0
+  red_chk eq omega_reduce_op_name OMEGA_RED_SUM nbuf 3
+  red_chk eq omega_reduce_op_name OMEGA_RED_MAX nbuf 3
+  red_chk eq omega_reduce_op_name OMEGA_RED_MIN nbuf 3
+  red_chk eq omega_reduce_op_name OMEGA_RED_MEAN nbuf 4
+  red_chk eq omega_reduce_op_name 99 nbuf -1
+
+  red_chk eq omega_reduce_identity OMEGA_RED_SUM OMEGA_REDUCE_SUM_PAD_BITS
+  red_chk eq omega_reduce_identity OMEGA_RED_MEAN OMEGA_REDUCE_SUM_PAD_BITS
+  red_chk eq omega_reduce_identity OMEGA_RED_MAX OMEGA_REDUCE_MINMAX_PAD_BITS
+  red_chk eq omega_reduce_identity OMEGA_RED_MIN OMEGA_REDUCE_MINMAX_PAD_BITS
+
+  red_chk eq omega_reduce_levels 0 0
+  red_chk eq omega_reduce_levels 1 1
+  red_chk eq omega_reduce_levels 32 1
+  red_chk eq omega_reduce_levels 33 2
+  red_chk eq omega_reduce_levels 1024 2
+  red_chk eq omega_reduce_levels 1025 3
+
+  x = new uint 4 0
+  red_chk eq omega_reduce_cpu OMEGA_RED_SUM x 0 0 0
+  red_chk eq get g_red_out 0 uint 0x00000000
+  red_chk eq omega_reduce_cpu OMEGA_RED_MAX x 0 0 0
+  red_chk eq get g_red_out 0 uint 0x7fc00000
+  red_chk eq omega_reduce_cpu OMEGA_RED_MIN x 0 0 0
+  red_chk eq get g_red_out 0 uint 0x7fc00000
+  red_chk eq omega_reduce_cpu OMEGA_RED_MEAN x 0 0 0
+  red_chk eq get g_red_out 0 uint 0x7fc00000
+end
+
+fn check_dist_len dist ulong n ulong to void
+  x = new uint 1025 0
+  for i ulong n bound 1025
+    put x i gen_val dist
+  end
+  for op ulong 4
+    red_chk eq omega_reduce_reference op x 0 n 0
+    vref = get g_red_out 0
+    red_chk eq omega_reduce_cpu op x 0 n 0
+    vcpu = get g_red_out 0
+    red_chk eq vref vcpu
+  end
+end
+
+fn test_distributions_and_lengths to void
+  put g_red_rng 0 ulong 0x9e3779b97f4a7c15
+  for d ulong 3
+    check_dist_len d 1
+    check_dist_len d 32
+    check_dist_len d 33
+    check_dist_len d 64
+    check_dist_len d 100
+  end
+  check_dist_len 0 1025
+end
+
+fn test_rows_and_negative_controls to void
+  x = new uint 64 0
+  for i ulong 64
+    put x i bitcast uint f32 uint add i 1
+  end
+  rref = new uint 3 0
+  red_chk eq omega_reduce_rows_reference OMEGA_RED_SUM x 3 10 20 0
+  for r ulong 3
+    put rref r get g_red_rows_out r
+  end
+  red_chk eq omega_reduce_rows_cpu OMEGA_RED_SUM x 3 10 20 0
+  for r ulong 3
+    red_chk eq get rref r get g_red_rows_out r
+  end
+  red_chk eq omega_reduce_rows_cpu OMEGA_RED_SUM x 3 10 5 OMEGA_NUMERIC_ERR_OPERANDS
+
+  note Negative control: cancellation vector where sequential sum != frozen tree sum
+  cvec = new uint 32 0
+  put cvec 0 uint 0x4b800000
+  for i ulong 15
+    put cvec add i 1 uint 0x3f800000
+  end
+  put cvec 16 uint 0xcb800000
+  for i ulong 15
+    put cvec add i 17 uint 0x3f800000
+  end
+  red_chk eq omega_reduce_cpu OMEGA_RED_SUM cvec 0 32 0
+  tree_sum = get g_red_out 0
+  seq_sum = omega_reduce_sequential_sum_not_contract cvec 32
+  red_chk eq tree_sum uint 0x41f00000
+  red_chk eq seq_sum uint 0x41700000
+  red_chk ne tree_sum seq_sum
+end
+
+fn main to int
+  test_meta_and_empty
+  test_distributions_and_lengths
+  test_rows_and_negative_controls
+  if eq get g_red_fail 0 0
+    ign = write 1 red_pass 0 len red_pass
+    ret 0
+  end
+  ign = write 1 red_fail 0 len red_fail
+  ret 1
+end

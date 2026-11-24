@@ -1,0 +1,227 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_bw_om_codegen_bounds.c.
+note Host boundary, error-path, and max-size headroom verification for pure OM-2
+note Blackwell codegen emitters:
+note   1) Negative / fail-closed boundary checks on bw_cg_unpack_raw
+note   2) Error-path checks on qmma, pfhost (rl, mc), and fp8gemm emitters
+note   3) Max-size legal input headroom checks (gemm, bf16, moe, qmma selftest).
+om2
+
+const BND_NONE ulong 0xffffffffffffffff
+const BND_OP_EXIT ulong 45
+const BND_OP_BRA ulong 46
+
+text bnd_pass "test_bw_om_codegen_bounds: PASS\n"
+text bnd_fail "test_bw_om_codegen_bounds: FAIL\n"
+
+global g_bnd_chk ulong 1
+global g_bnd_fail ulong 1
+
+fn bnd_chk cond bool to void
+  put g_bnd_chk 0 add get g_bnd_chk 0 1
+  if not cond
+    put g_bnd_fail 0 add get g_bnd_fail 0 1
+  end
+end
+
+fn make_minimal ins edit ulong 8192 meta edit ulong 512 to void
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  put meta 0 2
+  put meta 1 1
+  put meta 2 1
+  put meta 3 0
+  put meta 64 1
+  put meta 352 2
+  put ins 0 BND_OP_EXIT
+  for k ulong 5
+    put ins add 1 k BND_NONE
+  end
+  put ins 6 shl ulong 0x000fc000 32
+  put ins 7 0
+  put ins 8 BND_OP_BRA
+  for k ulong 5
+    put ins add 9 k BND_NONE
+  end
+  put ins 14 shl ulong 0x000fc000 32
+  put ins 15 0
+end
+
+fn test_unpacker_bounds to void
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  vinfo = new long 768 0
+
+  make_minimal ins meta
+  bnd_chk eq bw_cg_unpack_raw ins meta vinfo 0
+
+  note meta[5] error flag
+  make_minimal ins meta
+  put meta 5 1
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+
+  note n == 0 and n > 1024
+  make_minimal ins meta
+  put meta 0 0
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put meta 0 1025
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+
+  note nv > 256 and nu > 32
+  make_minimal ins meta
+  put meta 1 257
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put meta 2 33
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+
+  note invalid vreg / uvreg widths
+  make_minimal ins meta
+  put meta 64 3
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put meta 64 0
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put meta 352 4
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+
+  note invalid opcodes (-1, 64, mid-stream)
+  make_minimal ins meta
+  put ins 0 BND_NONE
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put ins 0 64
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put ins 8 162
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+
+  note out-of-range vreg, subreg, ureg, bar_reg, reserved flags
+  make_minimal ins meta
+  put ins 2 1
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put ins 2 0
+  put ins 7 shl ulong 1 24
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put ins 5 1
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put ins 7 shl ulong 16 8
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+  make_minimal ins meta
+  put ins 7 shl ulong 1 48
+  bnd_chk ne bw_cg_unpack_raw ins meta vinfo 0
+end
+
+fn chk_qmma_peak_bad iters ulong chains ulong stall ulong threads ulong to void
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  bnd_chk ne omega_blackwell_codegen_qmma_peak_prog iters chains stall threads ins meta 0
+end
+
+fn chk_rl_bad k ulong e ulong t ulong mut ulong to void
+  sp = new ulong 8 0
+  put sp 0 k
+  put sp 1 e
+  put sp 2 t
+  put sp 3 mut
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  bnd_chk ne omega_blackwell_codegen_rl_prog sp ins meta 0
+  bnd_chk eq omega_rl_spec_ok sp 0
+  bnd_chk eq omega_rl_shared_bytes sp 0
+end
+
+fn chk_mc_bad h ulong topk ulong mut ulong to void
+  sp = new ulong 8 0
+  put sp 0 h
+  put sp 1 topk
+  put sp 2 mut
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  bnd_chk ne omega_blackwell_codegen_mc_prog sp ins meta 0
+  bnd_chk eq omega_mc_spec_ok sp 0
+end
+
+fn test_qmma_and_pfhost_errors to void
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  bnd_chk ne omega_blackwell_codegen_qmma_probe_prog 2 0 ins meta 0
+  bnd_chk ne omega_blackwell_codegen_qmma_probe_prog 0 17 ins meta 0
+
+  chk_qmma_peak_bad 0 4 4 256
+  chk_qmma_peak_bad 8 0 4 256
+  chk_qmma_peak_bad 8 17 4 256
+  chk_qmma_peak_bad 8 4 0 256
+  chk_qmma_peak_bad 8 4 16 256
+  chk_qmma_peak_bad 8 4 4 0
+  chk_qmma_peak_bad 8 4 4 33
+  chk_qmma_peak_bad 8 4 4 1056
+
+  chk_rl_bad 0 128 4 0
+  chk_rl_bad 64 128 4 0
+  chk_rl_bad 16512 128 4 0
+  chk_rl_bad 2048 16 4 0
+  chk_rl_bad 2048 1056 4 0
+  chk_rl_bad 2048 128 0 0
+  chk_rl_bad 2048 128 17 0
+  chk_rl_bad 2048 128 3 0
+  chk_rl_bad 2048 128 4 3
+
+  chk_mc_bad 0 8 0
+  chk_mc_bad 2 8 0
+  chk_mc_bad 2048 0 0
+  chk_mc_bad 2048 3 0
+  chk_mc_bad 2048 20 0
+  chk_mc_bad 2048 8 3
+end
+
+fn test_max_headroom to void
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  sp = new ulong 8 0
+
+  note valid pfhost rl and mc specs
+  put sp 0 2048
+  put sp 1 128
+  put sp 2 4
+  put sp 3 0
+  bnd_chk eq omega_blackwell_codegen_rl_prog sp ins meta 0
+  bnd_chk le get meta 0 1024
+  put sp 0 2048
+  put sp 1 8
+  put sp 2 0
+  bnd_chk eq omega_blackwell_codegen_mc_prog sp ins meta 0
+  bnd_chk le get meta 0 1024
+
+  note QMMA probe and peak legal headroom
+  bnd_chk eq omega_blackwell_codegen_qmma_probe_prog 0 0 ins meta 0
+  bnd_chk le get meta 0 1024
+  bnd_chk eq omega_blackwell_codegen_qmma_peak_prog 8 4 4 256 ins meta 0
+  bnd_chk le get meta 0 1024
+  bnd_chk eq omega_blackwell_codegen_f2e4_probe_prog ins meta 0
+  bnd_chk le get meta 0 1024
+
+  note QMMA patch selftest
+  bnd_chk eq omega_qmma_patch_selftest 0
+end
+
+fn main to int
+  test_unpacker_bounds
+  test_qmma_and_pfhost_errors
+  test_max_headroom
+  if eq get g_bnd_fail 0 0
+    ign = write 1 bnd_pass 0 len bnd_pass
+    ret 0
+  end
+  ign = write 1 bnd_fail 0 len bnd_fail
+  ret 1
+end

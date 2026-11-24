@@ -1,0 +1,278 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/q36_dec_sim_test.c.
+note Host-only checks of Qwen3.6-35B-A3B MoE decode glue kernels:
+note   - omega_dec_prog_stats validation & refusal rules (RES, SWIGLU, GROUP, ROWS)
+note   - RES COMBINE|NORM 9-group oracle + mutants 2 and 3 caught
+note   - GROUP rank-sort & segment table oracle (heads 1,2,3,8; distinct & all-same)
+note     + mutants 1 (no tie-break), 2 (cnt short), 3 (empties unwritten) caught.
+note Composes om/gpu/cg_dec.om, om/gpu/bw_regalloc.om, src/omega_blackwell_codegen_dec.om.
+om2
+
+const DEC_RES ulong 2
+const DEC_SWIGLU ulong 3
+const DEC_GROUP ulong 7
+
+const RES_ADD ulong 1
+const RES_COMBINE ulong 2
+const RES_NORM ulong 4
+const RES_ROWS ulong 8
+
+text q36_pass "q36_dec_sim_test: PASS\n"
+text q36_fail "q36_dec_sim_test: FAIL\n"
+
+global g_q36_chk ulong 1
+global g_q36_fail ulong 1
+global g_q36_rng uint 1
+global g_q36_ids ulong 128
+
+fn q36_chk cond bool to void
+  put g_q36_chk 0 add get g_q36_chk 0 1
+  if not cond
+    put g_q36_fail 0 add get g_q36_fail 0 1
+  end
+end
+
+fn q36_lcg to uint
+  s = add mul get g_q36_rng 0 uint 1664525 uint 1013904223
+  put g_q36_rng 0 s
+  ret s
+end
+
+fn check_dec_sp sp view ulong 8 expect_ok bool to void
+  st = new uint 2 0
+  rc = omega_dec_prog_stats sp st
+  if expect_ok
+    q36_chk eq rc 0
+    q36_chk gt get st 0 0
+    q36_chk gt get st 1 0
+  else
+    q36_chk ne rc 0
+  end
+end
+
+fn chk_dec kind ulong mode ulong stride ulong mut ulong groups ulong expect_ok bool to void
+  sp = new ulong 8 0
+  put sp 0 kind
+  put sp 1 mode
+  put sp 2 stride
+  put sp 3 mut
+  put sp 4 0
+  put sp 5 groups
+  check_dec_sp sp expect_ok
+end
+
+fn chk_swiglu width ulong mut ulong to void
+  sp = new ulong 8 0
+  put sp 0 DEC_SWIGLU
+  put sp 3 mut
+  put sp 4 width
+  check_dec_sp sp true
+end
+
+fn test_codegen_specs to void
+  note Invalid spec refusals
+  chk_dec DEC_RES or RES_ADD RES_NORM 0 0 9 false
+  chk_dec DEC_RES RES_COMBINE 0 0 7 false
+  chk_dec DEC_RES RES_COMBINE 0 3 0 false
+  chk_dec DEC_GROUP 0 0 0 17 false
+  chk_dec DEC_RES or or RES_COMBINE RES_NORM RES_ROWS 8 0 9 false
+
+  note Valid Qwen3.6-35B-A3B decode glue specs + mutants
+  chk_dec DEC_RES or RES_COMBINE RES_NORM 0 0 9 true
+  chk_dec DEC_RES or RES_COMBINE RES_NORM 0 2 9 true
+  chk_dec DEC_RES or RES_COMBINE RES_NORM 0 3 9 true
+  chk_dec DEC_RES or or RES_COMBINE RES_NORM RES_ROWS 256 0 9 true
+  chk_dec DEC_RES or or RES_COMBINE RES_NORM RES_ROWS 256 3 9 true
+  chk_swiglu 512 0
+  chk_swiglu 512 1
+  chk_dec DEC_GROUP 0 0 0 9 true
+  chk_dec DEC_GROUP 0 0 1 9 true
+  chk_dec DEC_GROUP 0 0 2 9 true
+  chk_dec DEC_GROUP 0 0 3 9 true
+end
+
+fn test_combine_mutants to void
+  note 9 groups: 8 routed experts + shared slot 8
+  w = new f64 9 f64 0.0
+  d = new f64 9 f64 0.0
+  for g ulong 9
+    put w g div f64 add g 1 f64 20.0
+    put d g sub div f64 add mul g 3 1 f64 10.0 f64 0.5
+  end
+  ref = f64 1.25
+  for g ulong 9
+    ref = add ref mul get w g get d g
+  end
+  note Mutant 2 skips expert 7
+  m2 = f64 1.25
+  for g ulong 9
+    if ne g 7
+      m2 = add m2 mul get w g get d g
+    end
+  end
+  note Mutant 3 skips shared slot 8
+  m3 = f64 1.25
+  for g ulong 8
+    m3 = add m3 mul get w g get d g
+  end
+  diff2 = sub ref m2
+  if lt diff2 f64 0.0
+    diff2 = sub f64 0.0 diff2
+  end
+  diff3 = sub ref m3
+  if lt diff3 f64 0.0
+    diff3 = sub f64 0.0 diff3
+  end
+  q36_chk gt diff2 f64 0.001
+  q36_chk gt diff3 f64 0.001
+end
+
+fn fill_group_ids heads ulong all_same ulong seed uint to void
+  put g_q36_rng 0 seed
+  for h ulong heads bound 16
+    base = mul h 9
+    if and ne all_same 0 gt h 0
+      for j ulong 9
+        put g_q36_ids add base j get g_q36_ids j
+      end
+    else
+      for j ulong 8
+        v = rem ulong q36_lcg 256
+        dup = ulong 1
+        while ne dup 0 bound 64
+          dup = 0
+          for q ulong j bound 8
+            if eq get g_q36_ids add base q v
+              dup = 1
+              v = rem add v 1 256
+            end
+          end
+        end
+        put g_q36_ids add base j v
+      end
+      put g_q36_ids add base 8 256
+    end
+  end
+end
+
+fn check_group_ranks total ulong mut ulong to ulong
+  diffs = ulong 0
+  for t ulong total bound 128
+    pr = ulong 0
+    pg = ulong 0
+    kt = add mul get g_q36_ids t 128 t
+    for q ulong total bound 128
+      kq = add mul get g_q36_ids q 128 q
+      if lt kq kt
+        pr = add pr 1
+      end
+      if eq mut 1
+        if lt get g_q36_ids q get g_q36_ids t
+          pg = add pg 1
+        end
+      else
+        if lt kq kt
+          pg = add pg 1
+        end
+      end
+    end
+    if ne pr pg
+      diffs = add diffs 1
+    end
+  end
+  ret diffs
+end
+
+fn count_distinct_below tid ulong total ulong to ulong
+  below = ulong 0
+  for q ulong total bound 128
+    fq = ulong 1
+    iq = get g_q36_ids q
+    for z ulong q bound 128
+      if eq get g_q36_ids z iq
+        fq = 0
+      end
+    end
+    if and eq fq 1 lt iq tid
+      below = add below 1
+    end
+  end
+  ret below
+end
+
+fn check_group_segs total ulong mut ulong to ulong
+  seg_ref = new ulong 128 0
+  seg_got = new ulong 128 0
+  for i ulong total bound 128
+    put seg_got i 0xeeee
+  end
+  distinct = ulong 0
+  for t ulong total bound 128
+    first = ulong 1
+    cnt = ulong 0
+    tid = get g_q36_ids t
+    for q ulong total bound 128
+      if eq get g_q36_ids q tid
+        cnt = add cnt 1
+        if lt q t
+          first = 0
+        end
+      end
+    end
+    if eq first 1
+      below = count_distinct_below tid total
+      put seg_ref below cnt
+      if eq mut 2
+        put seg_got below sub cnt 1
+      else
+        put seg_got below cnt
+      end
+      distinct = add distinct 1
+    end
+  end
+  if ne mut 3
+    for i ulong sub total distinct bound 128
+      put seg_got add distinct i 0
+    end
+  end
+  diffs = ulong 0
+  for i ulong total bound 128
+    if ne get seg_ref i get seg_got i
+      diffs = add diffs 1
+    end
+  end
+  ret diffs
+end
+
+fn run_group_check heads ulong all_same ulong seed uint mut ulong to ulong
+  fill_group_ids heads all_same seed
+  total = mul heads 9
+  d1 = check_group_ranks total mut
+  d2 = check_group_segs total mut
+  ret add d1 d2
+end
+
+fn test_group_oracle_and_mutants to void
+  q36_chk eq run_group_check 8 0 21 0 0
+  q36_chk eq run_group_check 8 1 22 0 0
+  q36_chk eq run_group_check 1 0 23 0 0
+  q36_chk eq run_group_check 3 0 24 0 0
+  q36_chk eq run_group_check 8 0 25 0 0
+  q36_chk eq run_group_check 2 1 26 0 0
+  note Mutants 1, 2, 3 must be caught
+  q36_chk ne run_group_check 8 1 27 1 0
+  q36_chk ne run_group_check 8 0 27 2 0
+  q36_chk ne run_group_check 8 1 27 3 0
+end
+
+fn main to int
+  test_codegen_specs
+  test_combine_mutants
+  test_group_oracle_and_mutants
+  if eq get g_q36_fail 0 0
+    ign = write 1 q36_pass 0 len q36_pass
+    ret 0
+  end
+  ign = write 1 q36_fail 0 len q36_fail
+  ret 1
+end

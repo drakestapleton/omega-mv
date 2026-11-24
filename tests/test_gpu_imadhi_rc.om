@@ -1,0 +1,121 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/gpu_imadhi_rc_test.c.
+note Verifies IMAD.HI.U32 64-bit register-pair Rc model, SM121 encoder word
+note (opcode 0x7227, Rc byte 0x06), odd-Rc refusal, PR #487 replay, and
+note SHF.R + IADD3 control fix (commit 5b10b824). Host-only, zero GPU access.
+om2
+
+const OP_IMAD_HI_U32 ulong 53
+const IMAD_NONE ulong 0xffffffffffffffff
+const WS_E_IMADHI_RC long 17
+
+text imad_pass "gpu_imadhi_rc_test: PASS\n"
+text imad_fail "gpu_imadhi_rc_test: FAIL\n"
+
+global g_imad_chk ulong 1
+global g_imad_fail ulong 1
+
+fn imad_chk cond bool to void
+  put g_imad_chk 0 add get g_imad_chk 0 1
+  if not cond
+    put g_imad_fail 0 add get g_imad_fail 0 1
+  end
+end
+
+fn hi32_pair a uint b uint clo uint chi uint to uint
+  prod = mul ulong a ulong b
+  c64 = or shl ulong chi 32 ulong clo
+  ret uint shr add prod c64 32
+end
+
+fn sim_imad_hi a uint b uint clo uint chi uint rc_phys ulong res edit uint 1 to long
+  if eq rc_phys IMAD_NONE
+    put res 0 uint shr mul ulong a ulong b 32
+    ret 0
+  end
+  if ne and rc_phys 1 0
+    put res 0 uint 0xffbadbad
+    ret WS_E_IMADHI_RC
+  end
+  put res 0 hi32_pair a b clo chi
+  ret 0
+end
+
+fn test_encode_one to void
+  note 2a. Rc = R6 (even): encoder emits opcode 0x7227 and Rc byte 0x06
+  row = new ulong 8 0
+  put row 0 OP_IMAD_HI_U32
+  put row 1 8
+  put row 2 4
+  put row 3 5
+  put row 4 6
+  put row 5 IMAD_NONE
+  put row 6 0
+  put row 7 0
+  w = new uint 4 0
+  erc = omega_blackwell_encode_one row w
+  imad_chk eq erc 0
+  w0 = and get w 0 uint 0xffff
+  w2 = and get w 2 uint 0xff
+  imad_chk eq w0 uint 0x7227
+  imad_chk eq w2 uint 6
+end
+
+fn test_encode_and_rc_modes to void
+  a = uint 0xdeadbeef
+  b = uint 0x00010000
+  clo = uint 0x00001234
+  chi = uint 0x00005678
+  hi_ab = uint shr mul ulong a ulong b 32
+  pair_model = hi32_pair a b clo chi
+  old_32 = add hi_ab clo
+  imad_chk ne pair_model old_32
+
+  note 1. Rc = RZ: Rd = hi32(a * b)
+  out1 = new uint 1 0
+  rc1 = sim_imad_hi a b clo chi IMAD_NONE out1
+  imad_chk eq rc1 0
+  imad_chk eq get out1 0 hi_ab
+
+  test_encode_one
+
+  note 2b. Rc = R6 (even): Rd = hi32(a * b + R7:R6)
+  rc2 = sim_imad_hi a b clo chi 6 out1
+  imad_chk eq rc2 0
+  imad_chk eq get out1 0 pair_model
+
+  note 3. Rc = R7 (odd): refused with WS_E_IMADHI_RC
+  rc3 = sim_imad_hi a b clo chi 7 out1
+  imad_chk eq rc3 WS_E_IMADHI_RC
+end
+
+fn check_pack_case w0 uint w1 uint stale uint to void
+  tw = and w1 uint 0xffff0000
+  emul = add shr w0 16 tw
+  chip = hi32_pair w0 uint 0x00010000 tw stale
+
+  note 4. PR #487 replay: IMAD.HI.U32 odd-column pack differs from emulation
+  outp = new uint 1 0
+  rc = sim_imad_hi w0 uint 0x00010000 tw stale 6 outp
+  imad_chk eq rc 0
+  imad_chk eq get outp 0 chip
+  imad_chk ne get outp 0 emul
+
+  note 5. Control: SHF.R + IADD3 pack matches emulation
+  shf_val = shr w0 16
+  fixed = add shf_val tw
+  imad_chk eq fixed emul
+end
+
+fn main to int
+  test_encode_and_rc_modes
+  check_pack_case uint 0x3f80bf80 uint 0x40004040 uint 0x3f803f80
+  check_pack_case uint 0xdeadbeef uint 0x5678cafe uint 0x00000000
+  check_pack_case uint 0x12340001 uint 0xabcd0000 uint 0x00000000
+  if eq get g_imad_fail 0 0
+    ign = write 1 imad_pass 0 len imad_pass
+    ret 0
+  end
+  ign = write 1 imad_fail 0 len imad_fail
+  ret 1
+end
