@@ -1,0 +1,137 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_fp8_pack.c.
+note Composes on src/omega_gpu_hostmath.om.
+om2
+
+const OMEGA_FP8_X_EXP long 64
+const OMEGA_FP8_SCALE_EXP long 56
+const OMEGA_FP8_BLOCK ulong 128
+const FP8_MAX_SCALE_F32_BITS uint 0x7f61b1e6
+
+fn fp8_bf16_to_f32 b ushort to f32
+  u = shl uint b 16
+  ret bitcast f32 u
+end
+
+fn omega_fp8_e4m3_ref b uchar to f32
+  bu = uint b
+  exponent = long and shr bu 3 0x0f
+  mbits = and bu 0x07
+  if and eq exponent 15 eq mbits 7
+    ret bitcast f32 uint 0x7fc00000
+  end
+  sign = bitcast f32 uint 0x3f800000
+  if ne and bu 0x80 0
+    sign = bitcast f32 uint 0xbf800000
+  end
+  mantissa = f32 mbits
+  if eq exponent 0
+    ret mul mul sign mantissa omega_hostmath_pow2f -9
+  end
+  one = bitcast f32 uint 0x3f800000
+  eight = bitcast f32 uint 0x41000000
+  ret mul mul sign add one div mantissa eight omega_hostmath_pow2f sub exponent 7
+end
+
+fn omega_fp8_e4m3_kernel_bits b uchar to uint
+  bu = uint b
+  lo = shl and bu 0x7f 20
+  hi = shl and bu 0x80 24
+  ret or lo hi
+end
+
+fn omega_fp8_e4m3_is_nan b uchar to long
+  if eq and uint b 0x7f 0x7f
+    ret 1
+  end
+  ret 0
+end
+
+fn omega_fp8_pack_scan_nan w view uchar * count ulong first edit ulong 1 to ulong
+  n = ulong 0
+  for i ulong count bound 16777216
+    if ne omega_fp8_e4m3_is_nan get w i 0
+      if eq n 0
+        put first 0 i
+      end
+      n = add n 1
+    end
+  end
+  ret n
+end
+
+fn omega_fp8_pack_scales bf16 view ushort * count ulong dst edit f32 * mutant_no_fold long to long
+  fold = omega_hostmath_pow2f OMEGA_FP8_SCALE_EXP
+  if ne mutant_no_fold 0
+    fold = bitcast f32 uint 0x3f800000
+  end
+  lim = bitcast f32 FP8_MAX_SCALE_F32_BITS
+  for i ulong count bound 1048576
+    s = fp8_bf16_to_f32 get bf16 i
+    if not le fabs s lim
+      ret -1
+    end
+    f = mul s fold
+    if not le fabs f lim
+      ret -1
+    end
+    put dst i f
+  end
+  ret 0
+end
+
+fn omega_fp8_pack_x_f32 x view f32 * k ulong dst edit f32 * to void
+  fold = omega_hostmath_pow2f OMEGA_FP8_X_EXP
+  for i ulong k bound 1048576
+    put dst i mul get x i fold
+  end
+end
+
+fn omega_fp8_pack_x_bf16 x view ushort * k ulong dst edit f32 * to void
+  fold = omega_hostmath_pow2f OMEGA_FP8_X_EXP
+  for i ulong k bound 1048576
+    put dst i mul fp8_bf16_to_f32 get x i fold
+  end
+end
+
+global g_fp8_oracle_w uchar 65536
+global g_fp8_oracle_scale ushort 4096
+global g_fp8_oracle_x f32 4096
+global g_fp8_oracle_y f64 4096
+global g_fp8_oracle_yscale f64 4096
+
+fn fp8_gemv_blk row_off ulong cbase ulong s f64 acc_pair edit f64 2 to void
+  acc = get acc_pair 0
+  mag = get acc_pair 1
+  for j ulong OMEGA_FP8_BLOCK
+    c = add cbase j
+    wv = f64 omega_fp8_e4m3_ref get g_fp8_oracle_w add row_off c
+    xv = f64 get g_fp8_oracle_x c
+    p = mul mul wv xv s
+    acc = add acc p
+    mag = add mag fabs p
+  end
+  put acc_pair 0 acc
+  put acc_pair 1 mag
+end
+
+fn fp8_gemv_row r ulong k ulong kb ulong want_yscale long to void
+  acc_pair = new f64 2 0.0
+  row_off = mul r k
+  srow_off = mul div r OMEGA_FP8_BLOCK kb
+  for b ulong kb bound 4096
+    s = f64 fp8_bf16_to_f32 get g_fp8_oracle_scale add srow_off b
+    fp8_gemv_blk row_off mul b OMEGA_FP8_BLOCK s acc_pair
+  end
+  put g_fp8_oracle_y r get acc_pair 0
+  if ne want_yscale 0
+    put g_fp8_oracle_yscale r get acc_pair 1
+  end
+end
+
+fn omega_fp8_gemv_oracle n ulong k ulong want_yscale long to void
+  kb = div k OMEGA_FP8_BLOCK
+  for r ulong n bound 4096
+    fp8_gemv_row r k kb want_yscale
+  end
+end

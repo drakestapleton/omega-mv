@@ -1,0 +1,327 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_scan_ref.c.
+note Frozen-order FP32 warp-tree reductions (SUM/MAX/MIN) and hierarchical prefix sum.
+om2
+
+const OMEGA_GPU_RED_SUM ulong 0
+const OMEGA_GPU_RED_MAX ulong 1
+const OMEGA_GPU_RED_MIN ulong 2
+
+const SCAN_PAD_SUM uint 0x80000000
+const SCAN_PAD_MINMAX uint 0x7fc00000
+const SCAN_MAX_N ulong 65536
+
+global g_scan_buf0 uint 65568
+global g_scan_buf1 uint 65568
+global g_scan_tile uint 32
+global g_scan_lv1 uint 2048
+global g_scan_lv2 uint 64
+global g_scan_lv3 uint 2
+global g_scan_lv4 uint 1
+
+fn scan_is_nan u uint to bool
+  exp = and u uint 0x7f800000
+  frac = and u uint 0x007fffff
+  ret and eq exp uint 0x7f800000 ne frac uint 0
+end
+
+fn scan_fmaxnm a uint b uint to uint
+  na = scan_is_nan a
+  nb = scan_is_nan b
+  if and na nb
+    ret uint 0x7fc00000
+  end
+  if na
+    ret b
+  end
+  if nb
+    ret a
+  end
+  za = eq and a uint 0x7fffffff uint 0
+  zb = eq and b uint 0x7fffffff uint 0
+  if and za zb
+    ret and a b
+  end
+  fa = bitcast f32 a
+  fb = bitcast f32 b
+  if gt fa fb
+    ret a
+  end
+  ret b
+end
+
+fn scan_fminnm a uint b uint to uint
+  na = scan_is_nan a
+  nb = scan_is_nan b
+  if and na nb
+    ret uint 0x7fc00000
+  end
+  if na
+    ret b
+  end
+  if nb
+    ret a
+  end
+  za = eq and a uint 0x7fffffff uint 0
+  zb = eq and b uint 0x7fffffff uint 0
+  if and za zb
+    ret or a b
+  end
+  fa = bitcast f32 a
+  fb = bitcast f32 b
+  if lt fa fb
+    ret a
+  end
+  ret b
+end
+
+fn scan_combine op ulong a uint b uint to uint
+  if eq op OMEGA_GPU_RED_SUM
+    ret bitcast uint add bitcast f32 a bitcast f32 b
+  end
+  if eq op OMEGA_GPU_RED_MAX
+    ret scan_fmaxnm a b
+  end
+  ret scan_fminnm a b
+end
+
+fn scan_red_tile op ulong to uint
+  d = ulong 16
+  for s ulong 5
+    lim = sub 32 d
+    for i ulong lim bound 32
+      va = get g_scan_tile i
+      vb = get g_scan_tile add i d
+      put g_scan_tile i scan_combine op va vb
+    end
+    d = shr d 1
+  end
+  ret get g_scan_tile 0
+end
+
+fn scan_red_load_tile base ulong cur_len ulong src_is_0 ulong pad uint to void
+  for k ulong 32
+    idx = add base k
+    if lt idx cur_len
+      if eq src_is_0 1
+        put g_scan_tile k get g_scan_buf0 idx
+      else
+        put g_scan_tile k get g_scan_buf1 idx
+      end
+    else
+      put g_scan_tile k pad
+    end
+  end
+end
+
+fn omega_gpu_reduce_reference op ulong x view uint * n ulong dst edit uint 1 to long
+  if gt op OMEGA_GPU_RED_MIN
+    ret -1
+  end
+  if eq n 0
+    ret -1
+  end
+  if gt n SCAN_MAX_N
+    ret -1
+  end
+  if gt n len x
+    ret -1
+  end
+  for i ulong n bound 65536
+    put g_scan_buf0 i get x i
+  end
+  pad = SCAN_PAD_MINMAX
+  if eq op OMEGA_GPU_RED_SUM
+    pad = SCAN_PAD_SUM
+  end
+  cur_len = n
+  src_is_0 = ulong 1
+  done = ulong 0
+  while eq done 0 bound 8
+    nt = div add cur_len 31 32
+    for j ulong nt bound 2048
+      scan_red_load_tile mul j 32 cur_len src_is_0 pad
+      res = scan_red_tile op
+      if eq src_is_0 1
+        put g_scan_buf1 j res
+      else
+        put g_scan_buf0 j res
+      end
+    end
+    cur_len = nt
+    src_is_0 = xor src_is_0 1
+    if le cur_len 1
+      done = 1
+    end
+  end
+  if eq src_is_0 1
+    put dst 0 get g_scan_buf0 0
+  else
+    put dst 0 get g_scan_buf1 0
+  end
+  ret 0
+end
+
+fn scan_tile_hillis_steele to void
+  d = ulong 1
+  for s ulong 5
+    i = ulong 31
+    cnt = sub 32 d
+    for step ulong cnt bound 32
+      va = get g_scan_tile sub i d
+      vb = get g_scan_tile i
+      put g_scan_tile i bitcast uint add bitcast f32 va bitcast f32 vb
+      i = sub i 1
+    end
+    d = shl d 1
+  end
+end
+
+fn scan_level_buf0_to_lv1 n ulong to ulong
+  nt = div add n 31 32
+  for j ulong nt bound 2048
+    base = mul j 32
+    for k ulong 32
+      idx = add base k
+      if lt idx n
+        put g_scan_tile k get g_scan_buf0 idx
+      else
+        put g_scan_tile k SCAN_PAD_SUM
+      end
+    end
+    scan_tile_hillis_steele
+    for k ulong 32
+      idx = add base k
+      if lt idx n
+        put g_scan_buf1 idx get g_scan_tile k
+      end
+    end
+    put g_scan_lv1 j get g_scan_tile 31
+  end
+  ret nt
+end
+
+fn scan_level_lv1_to_lv2 n1 ulong to ulong
+  n2 = div add n1 31 32
+  for j ulong n2 bound 64
+    base = mul j 32
+    for k ulong 32
+      idx = add base k
+      if lt idx n1
+        put g_scan_tile k get g_scan_lv1 idx
+      else
+        put g_scan_tile k SCAN_PAD_SUM
+      end
+    end
+    scan_tile_hillis_steele
+    for k ulong 32
+      idx = add base k
+      if lt idx n1
+        put g_scan_lv1 idx get g_scan_tile k
+      end
+    end
+    put g_scan_lv2 j get g_scan_tile 31
+  end
+  ret n2
+end
+
+fn scan_level_lv2_to_lv3 n2 ulong to ulong
+  n3 = div add n2 31 32
+  for j ulong n3 bound 2
+    base = mul j 32
+    for k ulong 32
+      idx = add base k
+      if lt idx n2
+        put g_scan_tile k get g_scan_lv2 idx
+      else
+        put g_scan_tile k SCAN_PAD_SUM
+      end
+    end
+    scan_tile_hillis_steele
+    for k ulong 32
+      idx = add base k
+      if lt idx n2
+        put g_scan_lv2 idx get g_scan_tile k
+      end
+    end
+    put g_scan_lv3 j get g_scan_tile 31
+  end
+  ret n3
+end
+
+fn scan_level_lv3 n3 ulong to void
+  for k ulong 32
+    if lt k n3
+      put g_scan_tile k get g_scan_lv3 k
+    else
+      put g_scan_tile k SCAN_PAD_SUM
+    end
+  end
+  scan_tile_hillis_steele
+  for k ulong n3 bound 2
+    put g_scan_lv3 k get g_scan_tile k
+  end
+  put g_scan_lv4 0 get g_scan_tile 31
+end
+
+fn scan_carry_lv2 n2 ulong to void
+  for e ulong sub n2 32 bound 64
+    idx = add e 32
+    carry = get g_scan_lv3 sub div idx 32 1
+    cur = get g_scan_lv2 idx
+    put g_scan_lv2 idx bitcast uint add bitcast f32 carry bitcast f32 cur
+  end
+end
+
+fn scan_carry_lv1 n1 ulong to void
+  for e ulong sub n1 32 bound 2048
+    idx = add e 32
+    carry = get g_scan_lv2 sub div idx 32 1
+    cur = get g_scan_lv1 idx
+    put g_scan_lv1 idx bitcast uint add bitcast f32 carry bitcast f32 cur
+  end
+end
+
+fn scan_carry_buf1 n ulong to void
+  for e ulong sub n 32 bound 65536
+    idx = add e 32
+    carry = get g_scan_lv1 sub div idx 32 1
+    cur = get g_scan_buf1 idx
+    put g_scan_buf1 idx bitcast uint add bitcast f32 carry bitcast f32 cur
+  end
+end
+
+fn omega_gpu_prefix_sum_reference x view uint * n ulong y edit uint * to long
+  if eq n 0
+    ret -1
+  end
+  if gt n SCAN_MAX_N
+    ret -1
+  end
+  if gt n len x
+    ret -1
+  end
+  if gt n len y
+    ret -1
+  end
+  for i ulong n bound 65536
+    put g_scan_buf0 i get x i
+  end
+  n1 = scan_level_buf0_to_lv1 n
+  if gt n1 1
+    n2 = scan_level_lv1_to_lv2 n1
+    if gt n2 1
+      n3 = scan_level_lv2_to_lv3 n2
+      if gt n3 1
+        scan_level_lv3 n3
+        scan_carry_lv2 n2
+      end
+      scan_carry_lv1 n1
+    end
+    scan_carry_buf1 n
+  end
+  for i ulong n bound 65536
+    put y i get g_scan_buf1 i
+  end
+  ret 0
+end
