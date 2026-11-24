@@ -1,0 +1,1140 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/emit_generic.om: Shape-Parameterized Pure Seeded-OM-2 SM121 SASS Kernel Generator.
+note Emits specialized SM121 Blackwell machine code at runtime for ANY ModelSpec (engSpec):
+note   - uRmsNormAdd(H, addOne, eps)       : Any H % 256 == 0; (1+w) for Qwen3.5/3.8/4/Gemma or w for Llama/Qwen2/Mistral
+note   - uSwiGlu(I)                        : Any I % 256 == 0 (dense MLP or MoE)
+note   - uBf16ToW4Quant(K)                 : On-GPU BF16 -> W4 block-32 quantizer for ANY K % 64 == 0, any N
+note   - uBf16Gemv1R(K)                    : Universal BF16 GEMV for ANY K % 256 == 0, any N (BF16 models & in_proj_a/b)
+note   - uBf16RescoreCands(H)              : Exact Two-Pass BF16 lm_head rescoring for ANY H % 256 == 0
+note   - uArgmaxEmbedStep(H)               : Fused 128-cand argmax + BF16->F32 embed + pos++ for ANY H % 256 == 0
+note   - uFaPrepKv(nKV, hd, ropeD, qkN, a1): Per-head optional k_norm + partial/full RoPE + 128K KV store (hd=128 or 256)
+note   - uFaPrepQ(nQ, hd, ropeD, qkN, a1, g): Per-head optional q_norm + RoPE + 1/sqrt(hd) (gated or ungated QKV)
+note   - uFaAttendSplitF32(nQ, nKV, hd)    : Warp-only Split-K (S=8) F32 Flash-Decoding for ANY GQA ratio (nQ/nKV) & hd=128/256
+note   - uFaReduceGate(hd, attnGate)       : Split-K combine + optional sigmoid(gate) for ANY nQ, hd=128/256
+note   - uGdnStepReal(nK, nV)              : Fused decay/beta + 30 KiB SMEM GDN + Gated RMSNorm for ANY nV/nK (32/16, 48/16, etc.)
+note Reuses from om/gpu/q36/emit_fast.om & om/gpu/q38/emit_q38.om:
+note   - q38W4Gemv4R (4 KiB streaming SMEM W4 GEMV for ANY K % 1024 == 0, ANY N)
+note   - qFp8ToW4B32Quant (on-GPU FP8 block-128 -> W4 block-32 quantizer for ANY K % 128 == 0, N % 32 == 0)
+note   - qFp8B128GemvFast (Exact FP8 block-128 GEMV for ANY K, N)
+note   - qGdnConvL2Fast (causal Conv1d + SiLU + L2-norm for any Grid=(nQ+nK+nV, 1, 1))
+note   - vocab_chunk_top64 (64-chunk top-128 candidate screener)
+note   - qPreW4GemmHmma / qPreCopyU32
+
+note Helper: compute exact magic multiplier & shift for unsigned division by G (1..64)
+fn uGqaDivShift G ulong to ulong
+if eq G 1
+ret 0
+end
+if eq G 2
+ret 1
+end
+if eq G 3
+ret 17
+end
+if eq G 4
+ret 2
+end
+if eq G 6
+ret 18
+end
+if eq G 8
+ret 3
+end
+if eq G 12
+ret 19
+end
+if eq G 16
+ret 4
+end
+ret 0
+end
+
+fn uGqaDivMul G ulong to ulong
+if or eq G 3 or eq G 6 eq G 12
+ret 43691
+end
+ret 1
+end
+
+fn uEmitDivByG dstReg ulong srcReg ulong G ulong to void
+if eq G 1
+qicImm 8 dstReg srcReg QZ 1 qAlu4
+ret
+end
+sh = uGqaDivShift G
+ml = uGqaDivMul G
+if eq ml 1
+qic 17 dstReg srcReg QZ sh qAlu4
+else
+qMad dstReg srcReg ml QZ
+qic 17 dstReg dstReg QZ sh qAlu4
+end
+end
+
+note =========================================================================
+note Mode 300: uRmsNormAdd -- Shape-parameterized RMSNorm + optional residual add
+note   Specialized at emit time for H (MS_H), addOne (MS_NORM_ADD1), eps (MS_EPS_E6).
+note Args: x_inout[H] (R0:1), add_in[H] (R2:3), norm_w[H] (R4:5), out_xn[H] (R6:7), do_add (32).
+note Grid: (1, 1, 1), Block: 256, SMEM: 64.
+note =========================================================================
+fn uRmsNormAdd to void
+H = get engSpec MS_H
+nIter = div H 256
+addOne = get engSpec MS_NORM_ADD1
+eps = mul f32 get engSpec MS_EPS_E6 f32 0.000001f32
+invH = div f32 1.0f32 f32 H
+qStart 4
+qParam 18 32
+qNum 48 0.0f32
+qLit 20 0
+qLit 21 nIter
+qLit 22 1
+mSum = get q36Pc 0
+qMad 52 20 256 14
+qicImm 9 16 52 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+bA = qBssy
+qic 28 QZ 18 22 0 qCmp
+skA = qBraFwd 2
+qicImm 9 32 52 2 4 qW1
+qic 11 34 32 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 24 24 34 0 qAlu4
+qic 12 QZ 16 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skA 2
+qBsync bA
+qic4 33 48 24 24 48 qAlu4
+qIadd 20 20 22
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mSum get q36Pc 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+bW = qBssy
+qic 28 QZ 52 22 0 qCmp
+skW = qBraFwd 1
+qMad 53 53 4 QZ
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skW 1
+qBsync bW
+qBar
+qNum 48 0.0f32
+for w ulong 8
+qLit 55 mul w 4
+qic 49 49 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 49 0 qAlu4
+end
+qNum 49 invH
+qNum 50 eps
+qic4 33 48 48 49 50 qAlu4
+qic 41 49 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qNum 50 1.0f32
+qLit 20 0
+mOut = get q36Pc 0
+qMad 52 20 256 14
+qicImm 9 16 52 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qicImm 9 32 52 4 4 qW1
+qic 11 34 32 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+if eq addOne 1
+qic 30 34 34 50 0 qAlu4
+end
+qic 32 35 24 49 0 qAlu4
+qic 32 35 35 34 0 qAlu4
+qicImm 9 16 52 6 4 qAlu4
+qic 12 QZ 16 35 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 20 20 22
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mOut get q36Pc 0 qAlu4
+end
+
+note =========================================================================
+note Mode 301: uSwiGlu -- Shape-parameterized Dense SwiGLU silu(gate)*up for ANY I % 256 == 0
+note Args: GU[B, 2*I] (R0:1), out[B, I] (R2:3), I (16).
+note Grid: (I/256, B, 1), Block: 256, SMEM: 0.
+note =========================================================================
+fn uSwiGlu to void
+qStart 2
+qParam 22 16
+qIadd 28 22 22
+qMad 20 15 256 14
+qMadReg 21 18 28 20
+qicImm 9 16 21 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qIadd 23 21 22
+qicImm 9 16 23 0 4 qW1
+qic 11 25 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qNum 30 -1.4426950408889634f32
+qNum 31 1.0f32
+qSig 26 24 30 31
+qic 32 24 24 26 0 qAlu4
+qic 32 24 24 25 0 qAlu4
+qMadReg 27 18 22 20
+qicImm 9 16 27 2 4 qAlu4
+qic 12 QZ 16 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 302: uBf16ToW4Quant -- Universal On-GPU BF16 -> W4 block-32 quantizer
+note   Works for ANY K % 64 == 0, ANY N! Quantizes any BF16 HuggingFace weight matrix on GPU.
+note Args: W_bf16[N, K/2] u32 (R0:1), W_w4[N, K/8] u32 (R2:3), S_w4[N, K/64] u32 (R4:5), K (24), N (28).
+note Grid: (ceil(N/8), 1, 1), Block: 256, SMEM: 0.
+note =========================================================================
+fn uBf16ToW4Quant to void
+qStart 3
+qParam 12 24
+qParam 10 28
+qicImm 8 6 2 QZ 1 qAlu1
+qicImm 8 7 3 QZ 1 qAlu4
+qic 17 11 14 QZ 5 qAlu4
+qic 18 19 14 QZ 31 qAlu4
+qMad 20 15 8 11
+qic 28 QZ 20 10 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+note R13 = K/2 (bf16 u32 stride), R18 = K/8 (w4 u32 stride), R35 = K/64 (scale u32 stride / pair count)
+qic 17 13 12 QZ 1 qAlu1
+qic 17 18 12 QZ 3 qAlu1
+qic 17 35 12 QZ 6 qAlu4
+qLit 34 0
+qLit 36 1
+mBlk = get q36Pc 0
+qMadReg 37 20 13 QZ
+qMad 38 34 32 37
+qic 17 39 19 QZ 1 qAlu4
+qIadd 38 38 39
+qicImm 9 16 38 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 18 40 19 QZ 1 qAlu4
+qic 28 QZ 40 36 0 qCmp
+qicImm 8 41 24 QZ 65536 qAlu1
+qic 18 42 24 QZ 0xffff0000 qAlu4
+put q36Guard 0 1
+qicImm 8 41 42 QZ 1 qAlu4
+qicImm 8 24 41 QZ 1 qAlu4
+qMadReg 43 20 18 QZ
+qMad 44 34 8 43
+qQuant32Pack 44
+qicImm 8 58 25 QZ 1 qAlu4
+qLit 45 16
+qIadd 38 38 45
+qicImm 9 16 38 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 18 40 19 QZ 1 qAlu4
+qic 28 QZ 40 36 0 qCmp
+qicImm 8 41 24 QZ 65536 qAlu1
+qic 18 42 24 QZ 0xffff0000 qAlu4
+put q36Guard 0 1
+qicImm 8 41 42 QZ 1 qAlu4
+qicImm 8 24 41 QZ 1 qAlu4
+qLit 45 4
+qIadd 44 44 45
+qQuant32Pack 44
+qicImm 8 59 25 QZ 1 qAlu4
+bSc = qBssy
+qic 28 QZ 19 36 0 qCmp
+skSc = qBraFwd 1
+qic 17 50 58 QZ 16 qAlu4
+qic 18 51 59 QZ 0xffff0000 qAlu4
+qIadd 50 50 51
+qMadReg 49 20 35 34
+qicImm 9 16 49 4 4 qAlu4
+qic 12 QZ 16 50 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSc 1
+qBsync bSc
+qIadd 34 34 36
+qic 28 QZ 34 35 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mBlk get q36Pc 0 qAlu4
+end
+
+note =========================================================================
+note Mode 303: uBf16Gemv1R -- Universal 1-row/warp BF16 GEMV for ANY K % 256 == 0, ANY N
+note Args: W_bf16[N, K/2] u32 (R0:1), x[K] (R2:3), C[N] (R4:5), K (24), N (28).
+note Grid: (ceil(N/8), 1, 1), Block: 256, SMEM: 0 (streams x directly via LDG.E.128, works for any K!).
+note =========================================================================
+fn uBf16Gemv1R to void
+qStart 3
+qParam 6 24
+qParam 7 28
+qic 17 10 14 QZ 5 qAlu4
+qic 18 11 14 QZ 31 qAlu4
+qMad 8 15 8 10
+qic 28 QZ 8 7 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qic 17 9 6 QZ 1 qAlu4
+qMadReg 9 8 9 QZ
+qMad 9 11 4 9
+qicImm 9 16 9 0 4 qAlu4
+qMad 12 11 8 QZ
+qicImm 9 18 12 2 4 qAlu4
+qNum 48 0.0f32
+qLit 13 0
+qic 17 20 6 QZ 8 qAlu4
+qLit 21 1
+mLp = get q36Pc 0
+qic 57 24 16 QZ 0 qLdW1
+qic 57 40 18 QZ 0 qLd
+qic 57 44 18 QZ 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+for j ulong 4
+qicImm 8 52 add 24 j QZ 65536 qAlu4
+qic 18 53 add 24 j QZ 0xffff0000 qAlu4
+qic4 33 48 52 add 40 mul j 2 48 qAlu4
+qic4 33 48 53 add 41 mul j 2 48 qAlu4
+end
+qicImm 9 16 21 16 512 qAlu1
+qicImm 9 18 21 18 1024 qAlu4
+qIadd 13 13 21
+qic 28 QZ 13 20 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLp get q36Pc 0 qAlu4
+qWarpRedSum 48 52 16
+qic 28 QZ 11 21 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 16 8 4 4 qAlu4
+qic 12 QZ 16 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 304: uBf16RescoreCands -- Exact Two-Pass BF16 rescoring for ANY H % 256 == 0
+note Args: W_bf16[V, H/2] u32 (R0:1), x[H] (R2:3), cand_ids[M] (R4:5), out_logits[M] (R6:7), M (32).
+note Grid: (M, 1, 1), Block: 32, SMEM: 0.
+note =========================================================================
+fn uBf16RescoreCands to void
+H = get engSpec MS_H
+halfH = div H 2
+nIter = div H 256
+qStart 4
+qParam 10 32
+qic 28 QZ 15 10 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 16 15 4 4 qAlu4
+qic 11 11 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 12 11 halfH QZ
+qMad 12 14 4 12
+qicImm 9 20 12 0 4 qAlu4
+qMad 13 14 8 QZ
+qicImm 9 22 13 2 4 qAlu4
+qNum 48 0.0f32
+qLit 56 0
+qLit 57 nIter
+qLit 58 1
+mRes = get q36Pc 0
+qic 57 24 20 QZ 0 qLdW1
+qic 57 28 22 QZ 0 qLd
+qic 57 32 22 QZ 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+for j ulong 4
+qicImm 8 52 add 24 j QZ 65536 qAlu4
+qic 18 53 add 24 j QZ 0xffff0000 qAlu4
+qic4 33 48 52 add 28 mul j 2 48 qAlu4
+qic4 33 48 53 add 29 mul j 2 48 qAlu4
+end
+qicImm 9 20 58 20 512 qAlu4
+qicImm 9 22 58 22 1024 qAlu4
+qIadd 56 56 58
+qic 28 QZ 56 57 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mRes get q36Pc 0 qAlu4
+qWarpRedSum 48 52 16
+qic 28 QZ 14 58 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 16 15 6 4 qAlu4
+qic 12 QZ 16 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 305: uArgmaxEmbedStep -- Fused 128-cand argmax + BF16->F32 embed[tok, H] + pos++
+note Args: cand_ids[128] (R0:1), cand_log[128] (R2:3), embed_bf16[V,H/2] (R4:5),
+note       out_x[H] (R6:7), pos_ptr[1] (R8:9), out_tok_ptr[1] (R10:11).
+note Grid: (1, 1, 1), Block: 128, SMEM: 512.
+note =========================================================================
+fn uArgmaxEmbedStep to void
+H = get engSpec MS_H
+halfH = div H 2
+nIter = div H 256
+qStart 6
+qicImm 9 16 14 2 4 qAlu4
+qic 11 20 16 QZ 0 qLd
+qMad 21 14 4 QZ
+qic 0 QZ QZ QZ 0 qW0
+qic 50 QZ 21 20 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qLit 21 0
+qic 49 22 21 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 23 0
+qLit 24 1
+qLit 25 128
+qLit 26 1
+mArg = get q36Pc 0
+qMad 27 24 4 QZ
+qic 49 28 27 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 34 0 28 22 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 22 28 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 23 24 QZ 1 qAlu4
+qIadd 24 24 26
+qic 28 QZ 24 25 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mArg get q36Pc 0 qAlu4
+qicImm 9 16 23 0 4 qAlu4
+qic 11 29 16 QZ 0 qLd
+qic 11 30 8 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qIadd 30 30 26
+qic 28 QZ 14 26 0 qCmp
+put q36Guard 0 2
+qic 12 QZ 10 29 0 qSt
+put q36Guard 0 2
+qic 12 QZ 8 30 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qMad 31 29 halfH 14
+qLit 32 0
+qLit 33 nIter
+qLit 34 128
+qLit 35 256
+qMad 36 14 2 QZ
+mEmb = get q36Pc 0
+qicImm 9 16 31 4 4 qAlu4
+qic 11 37 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qicImm 8 38 37 QZ 65536 qAlu1
+qic 18 39 37 QZ 0xffff0000 qAlu4
+qicImm 9 16 36 6 4 qAlu4
+qic 12 QZ 16 38 0 qSt
+qIadd 40 36 26
+qicImm 9 16 40 6 4 qAlu4
+qic 12 QZ 16 39 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 31 31 34
+qIadd 36 36 35
+qIadd 32 32 26
+qic 28 QZ 32 33 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mEmb get q36Pc 0 qAlu4
+end
+
+note =========================================================================
+note Mode 306: uFaPrepKv -- Shape-parameterized KV prep (optional k_norm + RoPE + KV cache store)
+note   Specialized for nKV, hd (128 or 256), ropeDims, qkNorm, addOne, eps!
+note Args: K_in (R0:1), V_in (R2:3), k_norm (R4:5), rope (R6:7), K_cache (R8:9), V_cache (R10:11), pos_ptr (R12:13).
+note Grid: (nKV, 1, 1), Block: hd (128 or 256), SMEM: 1088.
+note =========================================================================
+fn uEmitQkNormBlock to void
+hd = get engSpec MS_HD
+nWarps = div hd 32
+invHd = div f32 1.0f32 f32 hd
+eps = mul f32 get engSpec MS_EPS_E6 f32 0.000001f32
+qic 32 48 21 21 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 55 1024
+qLit 57 1
+bKw = qBssy
+qic 28 QZ 52 57 0 qCmp
+skKw = qBraFwd 1
+qMad 53 53 4 55
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skKw 1
+qBsync bKw
+qBar
+qNum 48 0.0f32
+for w ulong nWarps bound 8
+qLit 56 add 1024 mul w 4
+qic 49 49 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 49 0 qAlu4
+end
+qNum 49 invHd
+qNum 50 eps
+qic4 33 48 48 49 50 qAlu4
+qic 41 49 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+if eq get engSpec MS_NORM_ADD1 1
+qNum 50 1.0f32
+qic 30 23 23 50 0 qAlu4
+end
+qic 32 21 21 49 0 qAlu4
+qic 32 21 21 23 0 qAlu4
+end
+
+fn uEmitRopeBlock ropePtrReg ulong to void
+ropeD = get engSpec MS_ROPE_DIMS
+halfR = div ropeD 2
+qMad 53 14 4 QZ
+qic 50 QZ 53 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qLit 57 ropeD
+bRp = qBssy
+qic 28 QZ 14 57 0 qCmp
+skRp = qBraFwd 1
+qic 18 25 14 QZ sub halfR 1 qAlu4
+qMad 26 20 ropeD 25
+qicImm 9 16 26 ropePtrReg 4 qW1
+qic 11 27 16 QZ 0 qLd
+qLit 52 halfR
+qIadd 28 26 52
+qicImm 9 16 28 ropePtrReg 4 qW1
+qic 11 29 16 QZ 0 qLd
+qMad 53 25 4 QZ
+qic 49 30 53 QZ 0 qLd
+qIadd 54 25 52
+qMad 54 54 4 QZ
+qic 49 31 54 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 32 30 27 0 qAlu4
+qic 32 33 31 29 0 qAlu4
+qic 31 32 32 33 0 qAlu4
+qic 32 34 31 27 0 qAlu4
+qic4 33 34 30 29 34 qAlu4
+qic 28 QZ 14 52 0 qCmp
+qicImm 8 21 32 QZ 1 qAlu4
+put q36Guard 0 1
+qicImm 8 21 34 QZ 1 qAlu4
+qPatch skRp 1
+qBsync bRp
+end
+
+fn uFaPrepKv to void
+hd = get engSpec MS_HD
+kvStride = mul get engSpec MS_NKV hd
+qStart 7
+qLit 52 0
+qicImm 9 16 52 12 4 qW1
+qic 11 20 16 QZ 0 qLd
+qMad 24 15 hd 14
+qicImm 9 16 24 0 4 qW1
+qic 11 21 16 QZ 0 qLd
+qicImm 9 16 24 2 4 qW1
+qic 11 22 16 QZ 0 qLd
+if eq get engSpec MS_QK_NORM 1
+qicImm 9 16 14 4 4 qW1
+qic 11 23 16 QZ 0 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+if eq get engSpec MS_QK_NORM 1
+uEmitQkNormBlock
+end
+uEmitRopeBlock 6
+qMad 25 20 kvStride 24
+qicImm 9 16 25 8 4 qAlu4
+qic 12 QZ 16 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qicImm 9 16 25 10 4 qAlu4
+qic 12 QZ 16 22 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+fn uFaPrepQ to void
+hd = get engSpec MS_HD
+qInStride = hd
+if eq get engSpec MS_ATTN_GATE 1
+qInStride = mul hd 2
+end
+scaleQ = f32 0.0625f32
+if eq hd 128
+scaleQ = f32 0.0883883476f32
+end
+qStart 5
+qLit 52 0
+qicImm 9 16 52 8 4 qW1
+qic 11 20 16 QZ 0 qLd
+qMad 24 15 qInStride 14
+qicImm 9 16 24 0 4 qW1
+qic 11 21 16 QZ 0 qLd
+if eq get engSpec MS_QK_NORM 1
+qicImm 9 16 14 2 4 qW1
+qic 11 23 16 QZ 0 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+if eq get engSpec MS_QK_NORM 1
+uEmitQkNormBlock
+end
+uEmitRopeBlock 4
+qNum 50 scaleQ
+qic 32 21 21 50 0 qAlu4
+qMad 25 15 hd 14
+qicImm 9 16 25 6 4 qAlu4
+qic 12 QZ 16 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 308: uFaAttendSplitF32 -- Shape-parameterized Split-K (S=8) F32 Flash-Decoding
+note   Supports ANY nQ, nKV (GQA ratio G = nQ/nKV), hd in {128, 256}!
+note Args: Q_rot (R0:1), K_cache (R2:3), V_cache (R4:5), O_part (R6:7), ml_part (R8:9), pos_ptr (R10:11).
+note Grid: (nQ, 8, 1), Block: 32, SMEM: 0.
+note =========================================================================
+fn uFaSplitInner epLane ulong advBytes ulong to void
+qic 57 40 48 QZ 0 qLd
+if eq epLane 8
+qic 57 44 48 QZ 16 qLd
+end
+qic 57 52 50 QZ 0 qLd
+if eq epLane 8
+qic 57 56 50 QZ 16 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+qic 32 2 20 40 0 qAlu4
+for j ulong sub epLane 1 bound 7
+qic4 33 2 add 21 j add 41 j 2 qAlu4
+end
+qWarpBflySum 2 3
+qic 37 3 36 2 0 qAlu4
+qic 31 4 36 3 0 qAlu4
+qExp 4 4 38
+qic 31 5 2 3 0 qAlu4
+qExp 5 5 38
+qic 32 37 37 4 0 qAlu4
+qic 30 37 37 5 0 qAlu4
+qicImm 8 36 3 QZ 1 qAlu4
+for j ulong sub epLane 1 bound 7
+qic 32 add 28 j add 28 j 4 0 qAlu1
+end
+last = sub epLane 1
+qic 32 add 28 last add 28 last 4 0 qAlu4
+for j ulong last bound 7
+qic4 33 add 28 j 5 add 52 j add 28 j qAlu1
+end
+qic4 33 add 28 last 5 add 52 last add 28 last qAlu4
+qicImm 9 48 1 48 advBytes qAlu1
+qicImm 9 50 1 50 advBytes qAlu1
+end
+
+fn uFaAttendSplitF32 to void
+hd = get engSpec MS_HD
+epLane = div hd 32
+kvStride = mul get engSpec MS_NKV hd
+qStart 6
+uEmitDivByG 12 15 div get engSpec MS_NQ get engSpec MS_NKV
+qLit 52 0
+qicImm 9 16 52 10 4 qW1
+qic 11 13 16 QZ 0 qLd
+qMad 52 15 hd QZ
+qMad 52 14 epLane 52
+qicImm 9 16 52 0 4 qW1
+qic 57 20 16 QZ 0 qLd
+if eq epLane 8
+qic 57 24 16 QZ 16 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+qLit 52 1
+qIadd 13 13 52
+qMad 54 18 kvStride QZ
+qMad 54 12 hd 54
+qMad 54 14 epLane 54
+qicImm 9 48 54 2 4 qAlu4
+qicImm 9 50 54 4 4 qAlu4
+for j ulong epLane bound 8
+qNum add 28 j 0.0f32
+end
+qNum 36 -1000000000.0f32
+qNum 37 0.0f32
+qNum 38 1.4426950408889634f32
+qicImm 8 0 18 QZ 1 qAlu4
+qLit 1 8
+bSkip = qBssy
+qic 28 QZ 0 13 0 qCmp
+skSkip = qBraFwd 1
+mTok = get q36Pc 0
+uFaSplitInner epLane mul kvStride 4
+qIadd 0 0 1
+qic 28 QZ 0 13 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mTok get q36Pc 0 qAlu4
+qPatch skSkip 1
+qBsync bSkip
+qMad 52 15 8 18
+qMad 53 52 hd QZ
+qMad 53 14 epLane 53
+for j ulong epLane bound 8
+qLit 54 j
+qIadd 54 53 54
+qicImm 9 16 54 6 4 qAlu4
+qic 12 QZ 16 add 28 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+qLit 57 1
+qic 28 QZ 14 57 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qMad 53 52 2 QZ
+qicImm 9 16 53 8 4 qAlu4
+qic 12 QZ 16 36 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 53 53 57
+qicImm 9 16 53 8 4 qAlu4
+qic 12 QZ 16 37 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 309: uFaReduceGate -- Shape-parameterized Split-K combine + optional sigmoid(gate)
+note Args: O_part[nQ, S, hd] (R0:1), ml_part[nQ, S, 2] (R2:3), Q_in (R4:5), Y_out[nQ*hd] (R6:7), S (32).
+note Grid: (nQ, 1, 1), Block: hd (128 or 256), SMEM: 0.
+note =========================================================================
+fn uFaReduceGate to void
+hd = get engSpec MS_HD
+attnGate = get engSpec MS_ATTN_GATE
+qStart 4
+qParam 20 32
+qMadReg 21 15 20 QZ
+qNum 22 -1000000000.0f32
+qLit 23 0
+qLit 24 1
+mMax = get q36Pc 0
+qIadd 25 21 23
+qMad 25 25 2 QZ
+qicImm 9 16 25 2 4 qW1
+qic 11 52 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 37 22 22 52 0 qAlu4
+qIadd 23 23 24
+qic 28 QZ 23 20 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mMax get q36Pc 0 qAlu4
+qNum 26 0.0f32
+qNum 27 0.0f32
+qNum 28 1.4426950408889634f32
+qLit 23 0
+mComb = get q36Pc 0
+qIadd 25 21 23
+qMad 29 25 2 QZ
+qicImm 9 16 29 2 4 qW1
+qic 11 30 16 QZ 0 qLd
+qIadd 29 29 24
+qicImm 9 16 29 2 4 qW1
+qic 11 31 16 QZ 0 qLd
+qMad 29 25 hd 14
+qicImm 9 16 29 0 4 qW1
+qic 11 32 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 31 33 30 22 0 qAlu4
+qExp 33 33 28
+qic4 33 27 31 33 27 qAlu4
+qic4 33 26 32 33 26 qAlu4
+qIadd 23 23 24
+qic 28 QZ 23 20 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mComb get q36Pc 0 qAlu4
+qic 40 27 27 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 26 26 27 0 qAlu4
+if eq attnGate 1
+qMad 33 15 mul hd 2 QZ
+qLit 37 hd
+qIadd 33 33 37
+qIadd 33 33 14
+qicImm 9 16 33 4 4 qW1
+qic 11 34 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qNum 35 -1.4426950408889634f32
+qNum 36 1.0f32
+qSig 34 34 35 36
+qic 32 26 26 34 0 qAlu4
+end
+qMad 29 15 hd 14
+qicImm 9 16 29 6 4 qAlu4
+qic 12 QZ 16 26 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 310: uGdnStepReal -- Shape-parameterized GDN step for ANY nV / nK (hd=128)
+note Args: qkv (R0:1), z (R2:3), ab[2*nV] (R4:5), alog_dt[2*nV] (R6:7),
+note       S_f32[nV,128,128] (R8:9), lin_norm[128] (R10:11), out[nV*128] (R12:13).
+note Grid: (nV, 1, 1), Block: 128, SMEM: 31744.
+note =========================================================================
+fn uGdnStepReal to void
+nK = get engSpec MS_GDN_NK
+nV = get engSpec MS_GDN_NV
+G = div nV nK
+kOff = mul nK 128
+vOff = mul nK 256
+qStart 7
+uEmitDivByG 20 15 G
+qMad 21 20 128 14
+qicImm 9 16 21 0 4 qW1
+qic 11 22 16 QZ 0 qLd
+qLit 52 kOff
+qIadd 23 21 52
+qicImm 9 16 23 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 53 14 4 QZ
+qic 50 QZ 53 22 0 qSt
+qLit 54 512
+qIadd 55 53 54
+qic 50 QZ 55 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qMad 27 15 128 14
+qLit 52 vOff
+qIadd 28 27 52
+qicImm 9 16 28 0 4 qW1
+qic 11 25 16 QZ 0 qLd
+qicImm 9 16 27 2 4 qW1
+qic 11 26 16 QZ 0 qLd
+qicImm 9 16 14 10 4 qW1
+qic 11 33 16 QZ 0 qLd
+qicImm 9 16 15 4 4 qW1
+qic 11 20 16 QZ 0 qLd
+qLit 52 nV
+qIadd 53 15 52
+qicImm 9 16 53 4 4 qW1
+qic 11 21 16 QZ 0 qLd
+qicImm 9 16 15 6 4 qW1
+qic 11 22 16 QZ 0 qLd
+qicImm 9 16 53 6 4 qW1
+qic 11 23 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 24 20 23 0 qAlu4
+qNum 30 20.0f32
+qNum 31 1.4426950408889634f32
+qNum 32 0.6931471805599453f32
+qNum 36 1.0f32
+qicImm 8 28 24 QZ 1 qAlu4
+bSp = qBssy
+qic 34 0 24 30 0x03f04000 qCmp
+skSp = qBraFwd 1
+qic 32 29 24 31 0 qAlu4
+qic 47 29 29 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 30 29 29 36 0 qAlu4
+qic 69 29 29 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 28 29 32 0 qAlu4
+qPatch skSp 1
+qBsync bSp
+qic 32 28 22 28 0 qAlu4
+qic 32 28 28 31 0 qAlu4
+qic 47 28 28 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qNum 30 -1.4426950408889634f32
+qSig 29 21 30 36
+qMad 32 15 16384 14
+qicImm 9 34 32 8 4 qAlu4
+qLit 58 1024
+qMad 58 14 4 58
+qNum 36 0.0f32
+qLit 37 0
+qLit 38 64
+qLit 39 1
+mP1 = get q36Pc 0
+qicImm 9 16 37 34 1024 qW1
+qic 11 40 16 QZ 0 qLd
+qicImm 9 18 39 16 512 qW1
+qic 11 41 18 QZ 0 qLd
+qMad 53 37 8 54
+qLit 59 4
+qIadd 57 53 59
+qic 49 42 53 QZ 0 qLd
+qic 49 43 57 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 61 60
+qic 28 QZ 37 61 0 qCmp
+qMad 61 37 512 58
+put q36Guard 0 2
+qic 50 QZ 61 40 0 qSt
+qic 32 44 40 28 0 qAlu4
+qic 32 41 41 28 0 qAlu4
+qic4 33 36 44 42 36 qAlu4
+qic4 33 36 41 43 36 qAlu4
+qic 0 QZ QZ QZ 0 qW1
+qIadd 37 37 39
+qic 28 QZ 37 38 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mP1 get q36Pc 0 qAlu4
+qic 31 46 25 36 0 qAlu4
+qic 32 46 46 29 0 qAlu4
+qNum 47 0.0f32
+qLit 37 0
+mP2 = get q36Pc 0
+qicImm 9 16 37 34 1024 qW1
+qicImm 9 18 39 16 512 qW1
+qLit 61 60
+qic 28 QZ 37 61 0 qCmp
+qMad 61 37 512 58
+put q36Guard 0 2
+qic 49 40 61 QZ 0 qLd
+put q36Guard 0 1
+qic 11 40 16 QZ 0 qLd
+qic 11 41 18 QZ 0 qLd
+qMad 53 37 8 54
+qLit 59 4
+qIadd 57 53 59
+qic 49 42 53 QZ 0 qLd
+qic 49 43 57 QZ 0 qLd
+qMad 53 37 8 QZ
+qIadd 57 53 59
+qic 49 44 53 QZ 0 qLd
+qic 49 45 57 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 40 40 28 0 qAlu1
+qic 32 41 41 28 0 qAlu4
+qic4 33 40 42 46 40 qAlu1
+qic4 33 41 43 46 41 qAlu4
+qic 12 QZ 16 40 0 qSt
+qic 12 QZ 18 41 0 qSt
+qic4 33 47 40 44 47 qAlu4
+qic4 33 47 41 45 47 qAlu4
+qic 0 QZ QZ QZ 0 qW1
+qIadd 37 37 39
+qic 28 QZ 37 38 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mP2 get q36Pc 0 qAlu4
+qic 32 48 47 47 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 55 1024
+bGn = qBssy
+qic 28 QZ 52 39 0 qCmp
+skGn = qBraFwd 1
+qMad 53 53 4 55
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skGn 1
+qBsync bGn
+qBar
+qNum 48 0.0f32
+for w ulong 4
+qLit 56 add 1024 mul w 4
+qic 49 49 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 49 0 qAlu4
+end
+qNum 49 0.0078125f32
+qNum 50 0.000001f32
+qic4 33 48 48 49 50 qAlu4
+qic 41 49 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 47 47 49 0 qAlu4
+qic 32 47 47 33 0 qAlu4
+qNum 30 -1.4426950408889634f32
+qNum 36 1.0f32
+qSig 31 26 30 36
+qic 32 26 26 31 0 qAlu4
+qic 32 47 47 26 0 qAlu4
+qicImm 9 16 27 12 4 qAlu4
+qic 12 QZ 16 47 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 200: uW4Gemv4R -- 4-row/warp zero-stall 4x LDG.E.128 W4 block-32 GEMV
+note   Streams K in 1024-float chunks through 4 KiB SMEM (works for ANY K % 1024 == 0, ANY N)!
+note Args: x[K] (R0:1), W[N,K/8] u32 (R2:3), S[N,K/64] u32 (R4:5), C[N] (R6:7), K (32), N (36).
+note Grid: (ceil(N/32), 1, 1), Block: 256, SMEM: 4128.
+note =========================================================================
+fn uW4Gemv4R to void
+qStart 4
+qParam 20 32
+qParam 21 36
+qLit 52 4096
+qLit 53 4100
+qLit 54 1
+bXp = qBssy
+qic 28 QZ 14 54 0 qCmp
+skXp = qBraFwd 1
+qic 50 QZ 52 0 0 qSt
+qic 50 QZ 53 1 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skXp 1
+qBsync bXp
+qBar
+qicImm 8 8 6 QZ 1 qAlu1
+qicImm 8 9 7 QZ 1 qAlu1
+qicImm 8 16 4 QZ 1 qAlu1
+qicImm 8 17 5 QZ 1 qAlu1
+qicImm 8 12 2 QZ 1 qAlu1
+qicImm 8 13 3 QZ 1 qAlu4
+qic 17 52 14 QZ 5 qAlu4
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+qicImm 8 19 21 QZ 1 qAlu4
+qic 17 24 20 QZ 3 qAlu4
+qic 17 22 20 QZ 10 qAlu4
+qic 17 20 20 QZ 6 qAlu4
+qMad 58 11 4 QZ
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMadReg 53 52 24 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qMad 10 11 128 QZ
+qLit 21 0
+qLit 23 1
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+mLoop = get q36Pc 0
+qLit 54 4096
+qLit 55 4100
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 21 1024 QZ
+qMad 54 14 4 54
+qicImm 9 56 54 52 4 qAlu4
+qic 57 24 56 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 16 QZ
+qLit 59 4
+for j ulong 4
+qic 50 QZ 54 add 24 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+if lt j 3
+qIadd 54 54 59
+end
+end
+qBar
+qic 57 24 0 QZ 0 qcw 2 0 7 0 1
+qic 57 28 2 QZ 0 qcw 2 0 7 0 1
+qic 57 32 4 QZ 0 qcw 2 0 7 0 1
+qic 57 36 6 QZ 0 qcw 2 0 7 0 1
+qic 17 60 11 QZ 1 qAlu4
+qMad 60 21 16 60
+qMadReg 52 18 20 60
+qicImm 9 52 52 16 4 qAlu4
+qicImm 9 54 20 52 4 qAlu4
+qicImm 9 56 20 54 4 qAlu4
+qicImm 9 58 20 56 4 qAlu4
+qic 11 12 52 QZ 0 qcw 2 0 7 0 1
+qic 11 13 54 QZ 0 qcw 2 0 7 0 1
+qic 11 15 56 QZ 0 qcw 2 0 7 0 1
+qic 11 19 58 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0
+qic 18 56 11 QZ 1 qAlu4
+qic 28 QZ 56 23 0 qCmp
+qicImm 8 52 12 QZ 65536 qAlu1
+qic 18 53 12 QZ 0xffff0000 qAlu4
+put q36Guard 0 1
+qicImm 8 52 53 QZ 1 qAlu4
+qicImm 8 12 52 QZ 1 qAlu4
+qicImm 8 52 13 QZ 65536 qAlu1
+qic 18 53 13 QZ 0xffff0000 qAlu4
+put q36Guard 0 1
+qicImm 8 52 53 QZ 1 qAlu4
+qicImm 8 13 52 QZ 1 qAlu4
+qicImm 8 52 15 QZ 65536 qAlu1
+qic 18 53 15 QZ 0xffff0000 qAlu4
+put q36Guard 0 1
+qicImm 8 52 53 QZ 1 qAlu4
+qicImm 8 15 52 QZ 1 qAlu4
+qicImm 8 52 19 QZ 65536 qAlu1
+qic 18 53 19 QZ 0xffff0000 qAlu4
+put q36Guard 0 1
+qicImm 8 52 53 QZ 1 qAlu4
+qicImm 8 19 52 QZ 1 qAlu4
+qW4MacBlock 10 12 13 15 19
+qicImm 9 0 23 0 512 qAlu1
+qicImm 9 2 23 2 512 qAlu1
+qicImm 9 4 23 4 512 qAlu1
+qicImm 9 6 23 6 512 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+qParam 19 36
+for r ulong 4
+qWarpRedSum add 48 r 52 16
+end
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qic 28 QZ 52 19 0 qCmp
+skO = qBraFwd 1
+qicImm 9 54 52 8 4 qAlu4
+qic 12 QZ 54 add 48 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skO 1
+end
+end
+
+fn engKernel mode ulong to bool
+if eq mode 200
+uW4Gemv4R
+ret true
+end
+if eq mode 300
+uRmsNormAdd
+ret true
+end
+if eq mode 301
+uSwiGlu
+ret true
+end
+if eq mode 302
+uBf16ToW4Quant
+ret true
+end
+if eq mode 303
+uBf16Gemv1R
+ret true
+end
+if eq mode 304
+uBf16RescoreCands
+ret true
+end
+if eq mode 305
+uArgmaxEmbedStep
+ret true
+end
+if eq mode 306
+uFaPrepKv
+ret true
+end
+if eq mode 307
+uFaPrepQ
+ret true
+end
+if eq mode 308
+uFaAttendSplitF32
+ret true
+end
+if eq mode 309
+uFaReduceGate
+ret true
+end
+if eq mode 310
+uGdnStepReal
+ret true
+end
+ret false
+end

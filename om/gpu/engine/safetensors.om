@@ -1,0 +1,575 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/safetensors.om: Universal Pure Seeded-OM-2 Safetensors Tensor Registry.
+note Dynamically discovers and indexes tensors across ALL 3 checkpoint layouts with ZERO hardcoded offsets:
+note   1) Standard single-file HuggingFace:   model.safetensors
+note   2) Standard sharded HuggingFace:       model.safetensors.index.json -> model-00001-of-*.safetensors
+note   3) Omega per-layer packed safetensors: outside.safetensors + layers-0..L-1.safetensors
+note Stores every tensor's (file_id, byte_offset_from_file_start, byte_len, dtype, dim0, dim1)
+note and resolves any tensor by canonical name (auto-handling model.* vs model.language_model.*).
+
+const ST_MAX_FILES ulong 256
+const ST_MAX_TENSORS ulong 8192
+
+const DT_BF16 ulong 0
+const DT_F16 ulong 1
+const DT_F32 ulong 2
+const DT_F8_E4M3 ulong 3
+const DT_OTHER ulong 4
+
+global stFileNamePool uchar 16384
+global stFileNameOff ulong 256
+global stFileNameLen ulong 256
+global stFileDataOff ulong 256
+global stFileCount ulong 1
+global stLayoutMode ulong 1
+
+global stNamePool uchar 655360
+global stNamePoolUsed ulong 1
+global stNameOff ulong 8192
+global stNameLen ulong 8192
+global stFileId ulong 8192
+global stByteOff ulong 8192
+global stByteLen ulong 8192
+global stDtype ulong 8192
+global stDim0 ulong 8192
+global stDim1 ulong 8192
+global stTensorCount ulong 1
+
+global stHdrBuf uchar 262144
+global stIdxBuf uchar 2097152
+global stIdxLen ulong 1
+global stPathBuf uchar 1024
+global stOpenFd int 1
+global stOpenFid ulong 1
+
+text stSufSingle "/model.safetensors"
+text stSufIndex "/model.safetensors.index.json"
+text stSufOutside "/outside.safetensors"
+text stSufLayerPre "layers-"
+text stSufSt ".safetensors"
+text stKeyDtype "\"dtype\""
+text stKeyShape "\"shape\""
+text stKeyOffs "\"data_offsets\""
+text stKeyMeta "__metadata__"
+text stKeyWMap "\"weight_map\""
+text stPrefLang "model.language_model."
+text stPrefPlain "model."
+text stLayPre "layers."
+
+fn stAddFile name view uchar * nlen ulong to ulong
+cnt = get stFileCount 0
+for i ulong cnt bound 256
+if eq get stFileNameLen i nlen
+off = get stFileNameOff i
+same = true
+for j ulong nlen bound 128
+if ne get stFileNamePool add off j get name j
+same = false
+break
+end
+end
+if same
+ret i
+end
+end
+end
+if ge cnt ST_MAX_FILES
+ret ST_MAX_FILES
+end
+off = ulong 0
+if gt cnt 0
+off = add get stFileNameOff sub cnt 1 get stFileNameLen sub cnt 1
+end
+if gt add off nlen 16300
+ret ST_MAX_FILES
+end
+for j ulong nlen bound 128
+put stFileNamePool add off j get name j
+end
+put stFileNameOff cnt off
+put stFileNameLen cnt nlen
+put stFileCount 0 add cnt 1
+ret cnt
+end
+
+fn stBuildFilePath fid ulong to ulong
+dlen = get engModelDirLen 0
+for i ulong dlen bound 512
+put stPathBuf i get engModelDir i
+end
+p = dlen
+put stPathBuf p 47
+p = add p 1
+off = get stFileNameOff fid
+nlen = get stFileNameLen fid
+for i ulong nlen bound 128
+put stPathBuf p get stFileNamePool add off i
+p = add p 1
+end
+put stPathBuf p 0
+ret p
+end
+
+fn stOpenFile fid ulong to int
+ofd = get stOpenFd 0
+if and ge ofd int 0 eq get stOpenFid 0 fid
+ret ofd
+end
+if ge ofd int 0
+c0 = fclose ofd
+put stOpenFd 0 neg 1
+end
+plen = stBuildFilePath fid
+fd = int fopen stPathBuf 0 plen 0 0
+if ge fd int 0
+put stOpenFd 0 fd
+put stOpenFid 0 fid
+end
+ret fd
+end
+
+fn stCloseCached to void
+ofd = get stOpenFd 0
+if ge ofd int 0
+c0 = fclose ofd
+put stOpenFd 0 neg 1
+end
+end
+
+fn stParseU64Hdr pos ulong lim ulong to ulong
+v = ulong 0
+p = pos
+while lt p lim bound 32
+c = get stHdrBuf p
+if and ge c 48 le c 57
+v = add mul v 10 ulong sub c 48
+p = add p 1
+else
+break
+end
+end
+ret v
+end
+
+fn stSkipWsHdr pos ulong lim ulong to ulong
+p = pos
+while lt p lim bound 128
+c = get stHdrBuf p
+if or eq c 32 or eq c 9 or eq c 10 eq c 13
+p = add p 1
+else
+break
+end
+end
+ret p
+end
+
+fn stSkipDigitsHdr pos ulong lim ulong to ulong
+p = pos
+while lt p lim bound 32
+c = get stHdrBuf p
+if and ge c 48 le c 57
+p = add p 1
+else
+break
+end
+end
+ret p
+end
+
+fn stSkipSepHdr pos ulong lim ulong to ulong
+p = pos
+while lt p lim bound 16
+c = get stHdrBuf p
+if or eq c 44 eq c 32
+p = add p 1
+else
+break
+end
+end
+ret p
+end
+
+fn stParseTensorMeta tid ulong oStart ulong oEnd ulong dataOff ulong to void
+put stDtype tid DT_OTHER
+put stDim0 tid 0
+put stDim1 tid 0
+put stByteOff tid dataOff
+put stByteLen tid 0
+q = oStart
+while lt add q 14 oEnd bound 2048
+if eq get stHdrBuf q 34
+c1 = get stHdrBuf add q 1
+c2 = get stHdrBuf add q 2
+if and eq c1 100 eq c2 116
+k = add q 7
+while and lt k oEnd ne get stHdrBuf k 34 bound 16
+k = add k 1
+end
+k = add k 1
+if lt add k 2 oEnd
+x0 = get stHdrBuf k
+x1 = get stHdrBuf add k 1
+if and eq x0 66 eq x1 70
+put stDtype tid DT_BF16
+else
+if and eq x0 70 eq x1 56
+put stDtype tid DT_F8_E4M3
+else
+if and eq x0 70 eq x1 49
+put stDtype tid DT_F16
+else
+if and eq x0 70 eq x1 51
+put stDtype tid DT_F32
+end
+end
+end
+end
+end
+end
+if and eq c1 115 eq c2 104
+k = add q 7
+while and lt k oEnd ne get stHdrBuf k 91 bound 16
+k = add k 1
+end
+k = stSkipWsHdr add k 1 oEnd
+put stDim0 tid stParseU64Hdr k oEnd
+k = stSkipSepHdr stSkipDigitsHdr k oEnd oEnd
+if lt k oEnd
+put stDim1 tid stParseU64Hdr k oEnd
+end
+end
+if and eq c1 100 eq c2 97
+k = add q 14
+while and lt k oEnd ne get stHdrBuf k 91 bound 16
+k = add k 1
+end
+k = stSkipWsHdr add k 1 oEnd
+b0 = stParseU64Hdr k oEnd
+k = stSkipSepHdr stSkipDigitsHdr k oEnd oEnd
+b1 = stParseU64Hdr k oEnd
+put stByteOff tid add dataOff b0
+put stByteLen tid sub b1 b0
+end
+end
+q = add q 1
+end
+end
+
+fn stCopyName used ulong nStart ulong nLen ulong to void
+for k ulong nLen bound 256
+put stNamePool add used k get stHdrBuf add nStart k
+end
+end
+
+fn stRecordTensor fid ulong dataOff ulong nStart ulong nLen ulong oStart ulong oEnd ulong to void
+if and eq nLen 12 eq get stHdrBuf nStart 95
+ret
+end
+if ge nLen 13
+if eq get stHdrBuf add nStart 6 118
+if eq get stHdrBuf add nStart 7 105
+ret
+end
+end
+end
+tid = get stTensorCount 0
+used = get stNamePoolUsed 0
+if or ge tid ST_MAX_TENSORS ge add used nLen 655000
+ret
+end
+stCopyName used nStart nLen
+put stNameOff tid used
+put stNameLen tid nLen
+put stNamePoolUsed 0 add used nLen
+put stFileId tid fid
+stParseTensorMeta tid oStart oEnd dataOff
+put stTensorCount 0 add tid 1
+end
+
+fn stSkipObj oStart ulong hlen ulong to ulong
+depth = ulong 1
+p = add oStart 1
+while and lt p hlen gt depth 0 bound 4096
+ch = get stHdrBuf p
+if eq ch 123
+depth = add depth 1
+else
+if eq ch 125
+depth = sub depth 1
+end
+end
+p = add p 1
+end
+ret p
+end
+
+fn stIndexOneFile fid ulong to bool
+fd = stOpenFile fid
+if lt fd int 0
+ret false
+end
+hdr8 = new uchar 8 0
+if ne pread fd hdr8 0 8 0 8
+ret false
+end
+hlen = ulong 0
+for i ulong 8
+hlen = or hlen shl ulong get hdr8 i mul i 8
+end
+if or eq hlen 0 gt hlen 262000
+ret false
+end
+dataOff = add hlen 8
+put stFileDataOff fid dataOff
+tot = ulong 0
+while lt tot hlen bound 64
+got = pread fd stHdrBuf tot sub hlen tot long add 8 tot
+if le got 0
+ret false
+end
+tot = add tot ulong got
+end
+p = ulong 0
+while lt p hlen bound 262144
+if eq get stHdrBuf p 34
+nStart = add p 1
+p = add p 1
+while and lt p hlen ne get stHdrBuf p 34 bound 256
+p = add p 1
+end
+nLen = sub p nStart
+p = stSkipWsHdr add p 1 hlen
+if and lt p hlen eq get stHdrBuf p 58
+p = stSkipWsHdr add p 1 hlen
+if and lt p hlen eq get stHdrBuf p 123
+oStart = p
+p = stSkipObj oStart hlen
+stRecordTensor fid dataOff nStart nLen oStart p
+end
+end
+else
+p = add p 1
+end
+end
+ret true
+end
+
+fn stAddFromIdx s ulong ln ulong to void
+fnBuf = new uchar 128 0
+for k ulong ln bound 128
+put fnBuf k get stIdxBuf add s k
+end
+fid = stAddFile fnBuf ln
+end
+
+fn stIsStSuf p ulong to bool
+for k ulong 12
+if ne get stIdxBuf add sub p 12 k get stSufSt k
+ret false
+end
+end
+ret true
+end
+
+fn stDiscoverFromIndex to bool
+plen = engJoinPath stSufIndex
+fd = int fopen engPathTmp 0 plen 0 0
+if lt fd int 0
+ret false
+end
+tot = ulong 0
+while lt tot 2097000 bound 256
+got = pread fd stIdxBuf tot sub 2097000 tot long tot
+if le got 0
+break
+end
+tot = add tot ulong got
+end
+c0 = fclose fd
+if eq tot 0
+ret false
+end
+put stIdxLen 0 tot
+p = ulong 0
+while lt p tot bound 2097152
+if eq get stIdxBuf p 34
+s = add p 1
+p = add p 1
+while and lt p tot ne get stIdxBuf p 34 bound 256
+p = add p 1
+end
+ln = sub p s
+if and gt ln 12 lt ln 120
+if stIsStSuf p
+stAddFromIdx s ln
+end
+end
+end
+p = add p 1
+end
+ret gt get stFileCount 0 0
+end
+
+fn stBuildLayerFilename L ulong dst edit uchar 64 to ulong
+p = ulong 0
+for i ulong len stSufLayerPre bound 16
+put dst p get stSufLayerPre i
+p = add p 1
+end
+if ge L 100
+put dst p uchar add 48 div L 100
+p = add p 1
+end
+if ge L 10
+put dst p uchar add 48 rem div L 10 10
+p = add p 1
+end
+put dst p uchar add 48 rem L 10
+p = add p 1
+for i ulong len stSufSt bound 16
+put dst p get stSufSt i
+p = add p 1
+end
+ret p
+end
+
+text stNmOutside "outside.safetensors"
+text stNmSingle "model.safetensors"
+
+fn stAddOmegaLayers to void
+lnBuf = new uchar 64 0
+f0 = stAddFile stNmOutside len stNmOutside
+nL = get engSpec MS_LAYERS
+for L ulong nL bound 256
+lnLen = stBuildLayerFilename L lnBuf
+fl = stAddFile lnBuf lnLen
+end
+end
+
+fn stDiscoverLayout to bool
+plen = engJoinPath stSufOutside
+fd = int fopen engPathTmp 0 plen 0 0
+if ge fd int 0
+c0 = fclose fd
+put stLayoutMode 0 2
+stAddOmegaLayers
+ret true
+end
+if stDiscoverFromIndex
+put stLayoutMode 0 1
+ret true
+end
+plen2 = engJoinPath stSufSingle
+fd2 = int fopen engPathTmp 0 plen2 0 0
+if lt fd2 int 0
+ret false
+end
+c1 = fclose fd2
+put stLayoutMode 0 0
+f1 = stAddFile stNmSingle len stNmSingle
+ret true
+end
+
+fn stIndexModel to bool
+put stFileCount 0 0
+put stTensorCount 0 0
+put stNamePoolUsed 0 0
+put stOpenFd 0 neg 1
+put stOpenFid 0 0
+if not stDiscoverLayout
+ret false
+end
+fc = get stFileCount 0
+for fid ulong fc bound 256
+if not stIndexOneFile fid
+stCloseCached
+ret false
+end
+end
+stCloseCached
+ret gt get stTensorCount 0 0
+end
+
+fn stFindExact name view uchar * nlen ulong to long
+tc = get stTensorCount 0
+for i ulong tc bound 8192
+if eq get stNameLen i nlen
+off = get stNameOff i
+same = true
+for j ulong nlen bound 256
+if ne get stNamePool add off j get name j
+same = false
+break
+end
+end
+if same
+ret long i
+end
+end
+end
+ret neg 1
+end
+
+fn stFindCanon suffix view uchar * slen ulong to long
+note Tries exact suffix, then "model.language_model." + suffix, then "model." + suffix
+r = stFindExact suffix slen
+if ge r 0
+ret r
+end
+tmp = new uchar 256 0
+p = ulong 0
+for i ulong len stPrefLang bound 32
+put tmp p get stPrefLang i
+p = add p 1
+end
+for i ulong slen bound 200
+put tmp p get suffix i
+p = add p 1
+end
+r2 = stFindExact tmp p
+if ge r2 0
+ret r2
+end
+p = ulong 0
+for i ulong len stPrefPlain bound 16
+put tmp p get stPrefPlain i
+p = add p 1
+end
+for i ulong slen bound 200
+put tmp p get suffix i
+p = add p 1
+end
+ret stFindExact tmp p
+end
+
+fn stBuildLayerKey L ulong suf view uchar * dst edit uchar 256 to ulong
+p = ulong 0
+for i ulong len stLayPre bound 16
+put dst p get stLayPre i
+p = add p 1
+end
+if ge L 100
+put dst p uchar add 48 div L 100
+p = add p 1
+end
+if ge L 10
+put dst p uchar add 48 rem div L 10 10
+p = add p 1
+end
+put dst p uchar add 48 rem L 10
+p = add p 1
+put dst p 46
+p = add p 1
+for i ulong len suf bound 128
+put dst p get suf i
+p = add p 1
+end
+ret p
+end
+
+fn stFindLayer L ulong suf view uchar * to long
+tmp = new uchar 256 0
+n = stBuildLayerKey L suf tmp
+ret stFindCanon tmp n
+end

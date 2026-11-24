@@ -1,0 +1,1467 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/runtime.om: Universal Pure Seeded-OM-2 Zero-CUDA GPU Runtime for ANY Dense/Hybrid Model.
+note Dynamically sizes UVM workspaces, loads tensors by canonical name from any safetensors layout,
+note quantizes BF16 or FP8 weights to W4 block-32 on GPU, specializes SM121 SASS kernels via emit_generic.om,
+note and records GPFIFO packets for 128K-context decode & OpenAI HTTP serving.
+
+const ENG_MAX_LAYERS ulong 128
+const ENG_WORK_BYTES ulong 33554432
+const ENG_SCRATCH_BYTES ulong 268435456
+
+note Per-layer device pointers (VA in UVM) for up to 128 layers
+global engLInNormVa ulong 128
+global engLPostNormVa ulong 128
+global engLA1WVa ulong 128
+global engLA1SVa ulong 128
+global engLA2WVa ulong 128
+global engLA2SVa ulong 128
+global engLA3WVa ulong 128
+global engLA3SVa ulong 128
+global engLA4WVa ulong 128
+global engLA4SVa ulong 128
+global engLQNormVa ulong 128
+global engLKNormVa ulong 128
+global engLGateWVa ulong 128
+global engLGateSVa ulong 128
+global engLUpWVa ulong 128
+global engLUpSVa ulong 128
+global engLDnWVa ulong 128
+global engLDnSVa ulong 128
+
+note Dynamic UVM slab allocator (up to 16 slabs of 2 GiB each = 32 GiB W4 capacity!)
+const ENG_SLAB_SZ ulong 2147483648
+global engSlabMap long 16
+global engSlabVa ulong 16
+global engSlabUsed ulong 16
+global engSlabCnt ulong 1
+
+note Decode workspace slot offsets inside engWork (32 MB)
+const EW_X ulong 0
+const EW_XN ulong 65536
+const EW_QKV ulong 131072
+const EW_K ulong 393216
+const EW_V ulong 524288
+const EW_Z ulong 655360
+const EW_Y ulong 917504
+const EW_AOUT ulong 1048576
+const EW_AB ulong 1114112
+const EW_GU ulong 1179648
+const EW_SW ulong 1703936
+const EW_FNORM ulong 1966080
+const EW_POS ulong 2031616
+const EW_OUT_TOK ulong 2035712
+const EW_LOGW4 ulong 2039808
+const EW_CIDS ulong 3145728
+const EW_CLOG ulong 3162112
+const EW_QROT ulong 3178496
+const EW_OPART ulong 3309568
+const EW_MLPART ulong 3833856
+const EW_PKT ulong 4194304
+
+global engCodePos ulong 1
+global engCodeMap long 1
+global engCodeFail uint 1
+global engEntry ulong 32
+global engSmem ulong 32
+global engBind uint 32
+global engBindN ulong 1
+global engPktOff ulong 1
+global engPktPos ulong 1
+global engSlotOff ulong 4
+global engSlotLen ulong 4
+
+global engWork long 1
+global engWorkVa ulong 1
+global engScratch long 1
+global engScratchVa ulong 1
+global engLut long 1
+global engLmBf16 long 1
+global engEmbBf16 long 1
+global engLmW4 long 1
+global engLmW4Va ulong 1
+global engLmW4SOff ulong 1
+global engRopeMap long 1
+global engRopeVa ulong 1
+global engGdnStateMap long 1
+global engGdnStateVa ulong 1
+global engGdnTailMap long 1
+global engGdnTailVa ulong 1
+global engKvMap long 64
+global engKvVa ulong 64
+global engKvSlabBytes ulong 1
+
+global engIoBuf uchar 1048576
+global engWideBuf uchar 524288
+global engRopeFreq f64 128
+global engCandIds uint 128
+global engDig uchar 32
+global engTokSeq uint 131072
+global engCurPos ulong 1
+
+fn engPrint s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn engPrintU x ulong to void
+if eq x 0
+put engDig 0 48
+r = write 1 engDig 0 1
+ret
+end
+v = x
+p = ulong 32
+while gt v 0 bound 24
+p = sub p 1
+put engDig p uchar add 48 rem v 10
+v = div v 10
+end
+r = write 1 engDig p sub 32 p
+end
+
+fn q36Write w view ulong 4 to void
+p = get engCodePos 0
+b = new uchar 16 0
+if gt get engCodeMap 0 0
+for i ulong 16
+ww = get w div i 4
+sh = mul rem i 4 8
+put b i uchar and shr ww sh 255
+end
+if ne mapwrite get engCodeMap 0 p b 0 16 16
+put engCodeFail 0 1
+end
+end
+put engCodePos 0 add p 16
+end
+
+fn engRegKernel kid ulong src ulong mode ulong smem ulong to void
+p = mul div add get engCodePos 0 255 256 256
+put engEntry kid p
+put engSmem kid smem
+put engCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+if eq src 0
+if not q36Kernel uchar mode
+exit 4
+end
+else
+if not engKernel mode
+exit 4
+end
+end
+q36Done
+end
+
+fn engEmitAll to void
+put engCodePos 0 0
+note 0: q38W4Gemv4R (4 KiB streaming SMEM W4 GEMV for ANY K % 1024 == 0, ANY N)
+engRegKernel 0 1 200 4128
+note 1: uRmsNormAdd (specialized for H, addOne, eps)
+engRegKernel 1 1 300 64
+note 2: uSwiGlu (any I % 256 == 0)
+engRegKernel 2 1 301 0
+note 3: uBf16ToW4Quant (on-GPU BF16->W4 quant for ANY K % 64 == 0, ANY N)
+engRegKernel 3 1 302 0
+note 4: uBf16Gemv1R (universal BF16 GEMV for ANY K % 256 == 0, ANY N)
+engRegKernel 4 1 303 0
+note 5: uBf16RescoreCands (specialized for H)
+engRegKernel 5 1 304 0
+note 6: uArgmaxEmbedStep (specialized for H)
+engRegKernel 6 1 305 512
+note 7: uFaPrepKv (specialized for nKV, hd, ropeDims, qkNorm, addOne)
+engRegKernel 7 1 306 1088
+note 8: uFaPrepQ (specialized for nQ, hd, ropeDims, qkNorm, addOne, attnGate)
+engRegKernel 8 1 307 1088
+note 9: uFaAttendSplitF32 (specialized for nQ, nKV, hd)
+engRegKernel 9 1 308 0
+note 10: uFaReduceGate (specialized for hd, attnGate)
+engRegKernel 10 1 309 0
+note 11: qFp8ToW4B32Quant (on-GPU FP8->W4 quant, SMEM=1024)
+engRegKernel 11 0 121 1024
+note 12: vocab_chunk_top64 (64 chunks -> 128 cands)
+engRegKernel 12 0 112 2048
+note 13: qGdnConvL2Fast (causal conv1d + SiLU + L2-norm)
+engRegKernel 13 0 114 64
+if gt get engSpec MS_N_GDN 0
+note 14: uGdnStepReal (specialized for nK, nV)
+engRegKernel 14 1 310 31744
+end
+end
+
+fn engW off ulong to ulong
+ret add get engWorkVa 0 off
+end
+
+fn engArg u uint to void
+n = get engBindN 0
+put engBind n u
+put engBindN 0 add n 1
+end
+
+fn engPtr va ulong to void
+engArg gblo va
+engArg gbhi va
+end
+
+fn engPktStartAt off ulong to void
+put engPktOff 0 off
+put engPktPos 0 0
+put engBindN 0 0
+put gbused 0 0
+gbsetup
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
+cb = mapaddr get gbmem 1
+gbdriver cb
+gbdma cb 224
+for j ulong 224
+gbemit get gbcb j
+end
+n = get gbused 0
+r = mapwrite get engWork 0 off gbcmd 0 n
+put engPktPos 0 n
+end
+
+fn engPktStart to void
+engPktStartAt add EW_PKT 16777216
+end
+
+fn engPrepQmdGy kid ulong gx uint gy uint bx uint to void
+gbqmd 1
+a = add mapaddr get engCodeMap 0 get engEntry kid
+put gbq1 32 gblo shr a 4
+put gbq1 33 or uint and shr a 36 2097151 20971520
+put gbq1 59 gblo shr a 8
+put gbq1 34 or uint 65536 bx
+put gbq1 35 or uint 131073 shl uint 64 8
+sm = get engSmem kid
+s7 = ulong 8
+if ne sm 0
+s7 = div add sm 127 128
+end
+sc = ulong 9
+if gt sm 32768
+sc = ulong 17
+end
+if gt sm 65536
+sc = ulong 26
+end
+w36 = or or or shl sc 23 shl ulong 26 17 shl sc 11 s7
+put gbq1 36 uint w36
+put gbq1 37 0
+put gbq1 39 gx
+put gbq1 40 gy
+put gbq1 41 1
+put gbcb 216 bx
+put gbcb 220 gx
+put gbcb 221 gy
+put gbcb 222 1
+end
+
+fn engPktEmitGy kid ulong gx uint gy uint bx uint to bool
+engPrepQmdGy kid gx gy bx
+cb = mapaddr get gbmem 1
+words = get engBindN 0
+endva = add cb add 896 mul words 4
+put gbcb 212 gbhi endva
+put gbcb 213 gblo endva
+put gbused 0 0
+gbdma add cb 896 uint words
+for j ulong words
+gbemit get engBind j
+end
+q = mapaddr get gbmem 2
+gbinline q false
+gbdma add q 8192 1
+gbemit 1
+gbinline add q 4096 true
+gbrel add mapaddr get gbmem 3 32 6
+put engBindN 0 0
+n = get gbused 0
+pos = get engPktPos 0
+if gt add pos n 4000000
+ret false
+end
+dstOff = add get engPktOff 0 pos
+if ne mapwrite get engWork 0 dstOff gbcmd 0 n long n
+ret false
+end
+put engPktPos 0 add pos n
+ret true
+end
+
+fn engPktFinish slot ulong to bool
+put gbused 0 0
+gbtail
+n = get gbused 0
+pos = get engPktPos 0
+dstOff = add get engPktOff 0 pos
+if ne mapwrite get engWork 0 dstOff gbcmd 0 n long n
+ret false
+end
+put engSlotOff slot get engPktOff 0
+put engSlotLen slot add pos n
+ret true
+end
+
+fn engWaitFast timeout ulong to bool
+for sp ulong 50000
+if eq mapget get gbmem 3 16 4 1179010630
+put nvret 0 get nvput 0
+ret true
+end
+end
+t0 = monons
+while lt ulong sub monons t0 timeout bound 5000000
+if eq mapget get gbmem 3 16 4 1179010630
+put nvret 0 get nvput 0
+ret true
+end
+r = sleepns long 5000
+end
+ret false
+end
+
+fn engReplayPre slot ulong to bool
+r0 = mapset get gbmem 2 8192 4 0
+r1 = mapset get gbmem 3 0 4 0
+r2 = mapset get gbmem 3 16 4 0
+off = get engSlotOff slot
+ln = get engSlotLen slot
+if not nvsend get engWork 0 off uint div ln 4
+ret false
+end
+if not engWaitFast 30000000000
+ret false
+end
+ret eq mapget get gbmem 3 0 4 1145324612
+end
+
+fn engPktRun to bool
+put gbused 0 0
+gbtail
+n = get gbused 0
+pos = get engPktPos 0
+dstOff = add get engPktOff 0 pos
+if ne mapwrite get engWork 0 dstOff gbcmd 0 n long n
+ret false
+end
+tot = add pos n
+r0 = mapset get gbmem 2 8192 4 0
+r1 = mapset get gbmem 3 0 4 0
+r2 = mapset get gbmem 3 16 4 0
+if not nvsend get engWork 0 get engPktOff 0 uint div tot 4
+ret false
+end
+if not engWaitFast 30000000000
+ret false
+end
+ret eq mapget get gbmem 3 0 4 1145324612
+end
+
+note Dynamic UVM slab bump allocator (returns 256-byte aligned VA, writes outMap/outOff)
+global engAllocMap long 1
+global engAllocOff ulong 1
+
+fn engSlabAlloc bytes ulong to ulong
+al = mul div add bytes 255 256 256
+sc = get engSlabCnt 0
+if gt sc 0
+last = sub sc 1
+used = get engSlabUsed last
+if le add used al ENG_SLAB_SZ
+put engSlabUsed last add used al
+put engAllocMap 0 get engSlabMap last
+put engAllocOff 0 used
+ret add get engSlabVa last used
+end
+end
+if ge sc 16
+ret 0
+end
+m = nvalloc ENG_SLAB_SZ true
+if le m 0
+ret 0
+end
+va = mapaddr m
+put engSlabMap sc m
+put engSlabVa sc va
+put engSlabUsed sc al
+put engSlabCnt 0 add sc 1
+put engAllocMap 0 m
+put engAllocOff 0 0
+ret va
+end
+
+fn engMathExp64 x f64 to f64
+k = long mul x f64 1.4426950408889634f64
+r = sub x mul f64 k f64 0.6931471805599453f64
+p = f64 1.0f64
+term = f64 1.0f64
+for i ulong 14
+term = div mul term r f64 add i 1
+p = add p term
+end
+if ge k 0
+for i ulong ulong k bound 1024
+p = mul p f64 2.0f64
+end
+else
+for i ulong ulong neg k bound 1024
+p = mul p f64 0.5f64
+end
+end
+ret p
+end
+
+fn engMathLn64 x f64 to f64
+note Natural log via range reduction x = m * 2^e, m in [0.75, 1.5], series for ln((1+u)/(1-u))
+m = x
+e = long 0
+while gt m f64 1.5f64 bound 64
+m = mul m f64 0.5f64
+e = add e 1
+end
+while lt m f64 0.75f64 bound 64
+m = mul m f64 2.0f64
+e = sub e 1
+end
+u = div sub m f64 1.0f64 add m f64 1.0f64
+u2 = mul u u
+s = u
+t = u
+for k ulong 12
+t = mul t u2
+s = add s div t f64 add mul add k 1 2 1
+end
+ret add mul f64 2.0f64 s mul f64 e f64 0.6931471805599453f64
+end
+
+fn engSinCore x f64 to f64
+x2 = mul x x
+s = x
+t = x
+for i ulong 7
+k0 = add mul i 2 2
+t = div mul neg t x2 mul f64 k0 f64 add k0 1
+s = add s t
+end
+ret s
+end
+
+fn engMathSinCos64 theta f64 isCos bool to f64
+tp = f64 6.283185307179586f64
+pi = f64 3.141592653589793f64
+hp = f64 1.570796326794896f64
+x = sub theta mul f64 long div theta tp tp
+if gt x pi
+x = sub x tp
+end
+if lt x neg pi
+x = add x tp
+end
+if isCos
+x = add x hp
+if gt x pi
+x = sub x tp
+end
+end
+sgn = f64 1.0f64
+if gt x hp
+x = sub pi x
+end
+if lt x neg hp
+x = sub neg pi x
+end
+if lt x f64 0.0f64
+x = neg x
+sgn = f64 -1.0f64
+end
+ret mul sgn engSinCore x
+end
+
+fn engPutU32Io off ulong w uint to void
+put engIoBuf off uchar and w 255
+put engIoBuf add off 1 uchar and shr w 8 255
+put engIoBuf add off 2 uchar and shr w 16 255
+put engIoBuf add off 3 uchar and shr w 24 255
+end
+
+fn engGetU32Io p ulong to uint
+b0 = uint get engIoBuf p
+b1 = shl uint get engIoBuf add p 1 8
+b2 = shl uint get engIoBuf add p 2 16
+b3 = shl uint get engIoBuf add p 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn engFillRopeRow base ulong p ulong halfR ulong to void
+for d ulong halfR bound 128
+th = mul f64 p get engRopeFreq d
+cw = bitcast uint f32 engMathSinCos64 th true
+sw = bitcast uint f32 engMathSinCos64 th false
+engPutU32Io add base mul d 4 cw
+engPutU32Io add base add mul halfR 4 mul d 4 sw
+end
+end
+
+fn engUploadRope to bool
+ropeD = get engSpec MS_ROPE_DIMS
+halfR = div ropeD 2
+maxT = get engSpec MS_MAX_CTX
+lnTh = engMathLn64 f64 get engSpec MS_ROPE_THETA
+for i ulong halfR bound 128
+e = div mul neg f64 mul i 2 lnTh f64 ropeD
+put engRopeFreq i engMathExp64 e
+end
+rowBytes = mul ropeD 4
+chunkT = div 262144 rowBytes
+pos = ulong 0
+while lt pos maxT bound 1024
+cnt = sub maxT pos
+if gt cnt chunkT
+cnt = chunkT
+end
+for t ulong cnt bound 1024
+engFillRopeRow mul t rowBytes add pos t halfR
+end
+wbytes = mul cnt rowBytes
+if ne mapwrite get engRopeMap 0 mul pos rowBytes engIoBuf 0 wbytes long wbytes
+ret false
+end
+pos = add pos cnt
+end
+ret true
+end
+
+fn engBuildFp8Lut to bool
+m = nvalloc 4096 true
+if le m 0
+ret false
+end
+put engLut 0 m
+for i ulong 256
+s = and shr i 7 1
+e = and shr i 3 15
+mn = and i 7
+v = f32 0.0f32
+if eq e 15
+if eq mn 7
+v = f32 0.0f32
+else
+v = mul f32 256.0f32 add f32 1.0f32 div f32 mn f32 8.0f32
+end
+else
+if eq e 0
+v = mul f32 0.015625f32 div f32 mn f32 8.0f32
+else
+pw = f32 1.0f32
+if ge e 7
+for k ulong sub e 7 bound 16
+pw = mul pw f32 2.0f32
+end
+else
+for k ulong sub 7 e bound 16
+pw = mul pw f32 0.5f32
+end
+end
+v = mul pw add f32 1.0f32 div f32 mn f32 8.0f32
+end
+end
+if eq s 1
+v = neg v
+end
+engPutU32Io mul i 4 bitcast uint v
+end
+ret eq mapwrite m 0 engIoBuf 0 1024 1024
+end
+
+fn engWidenBuf cnt ulong to void
+for i ulong cnt bound 131072
+p = mul i 2
+q = mul i 4
+put engWideBuf q 0
+put engWideBuf add q 1 0
+put engWideBuf add q 2 get engIoBuf p
+put engWideBuf add q 3 get engIoBuf add p 1
+end
+end
+
+fn engStreamTensorRaw tid ulong dstMap long dstOff ulong to bool
+fid = get stFileId tid
+foff = get stByteOff tid
+bytes = get stByteLen tid
+fd = stOpenFile fid
+if lt fd 0
+ret false
+end
+pos = ulong 0
+while lt pos bytes bound 4000
+want = sub bytes pos
+if gt want 1048576
+want = ulong 1048576
+end
+got = pread fd engIoBuf 0 want long add foff pos
+if le got 0
+ret false
+end
+if ne mapwrite dstMap add dstOff pos engIoBuf 0 ulong got got
+ret false
+end
+pos = add pos ulong got
+end
+ret true
+end
+
+fn engStreamWidenToMap fd int foff ulong bytes ulong dm long doff ulong to bool
+pos = ulong 0
+while lt pos bytes bound 64
+want = sub bytes pos
+if gt want 262144
+want = ulong 262144
+end
+got = pread fd engIoBuf 0 want long add foff pos
+if ne got long want
+ret false
+end
+engWidenBuf div want 2
+ob = mul want 2
+if ne mapwrite dm add doff mul pos 2 engWideBuf 0 ob long ob
+ret false
+end
+pos = add pos want
+end
+ret true
+end
+
+fn engLoadTensorF32 tid ulong to ulong
+dt = get stDtype tid
+bytes = get stByteLen tid
+outBytes = bytes
+if eq dt DT_BF16
+outBytes = mul bytes 2
+end
+va = engSlabAlloc outBytes
+if eq va 0
+ret 0
+end
+dm = get engAllocMap 0
+doff = get engAllocOff 0
+if eq dt DT_F32
+if not engStreamTensorRaw tid dm doff
+ret 0
+end
+ret va
+end
+fd = stOpenFile get stFileId tid
+if lt fd int 0
+ret 0
+end
+if not engStreamWidenToMap fd get stByteOff tid bytes dm doff
+ret 0
+end
+ret va
+end
+
+global engMatWVa ulong 1
+global engMatSVa ulong 1
+
+fn engLoadMatW4 tidW ulong tidS long K ulong N ulong to bool
+wBytes = div mul N K 2
+sBytes = mul N div K 16
+wVa = engSlabAlloc wBytes
+if eq wVa 0
+ret false
+end
+sVa = engSlabAlloc sBytes
+if eq sVa 0
+ret false
+end
+put engMatWVa 0 wVa
+put engMatSVa 0 sVa
+dt = get stDtype tidW
+if not engStreamTensorRaw tidW get engScratch 0 0
+ret false
+end
+if eq dt DT_F8_E4M3
+if lt tidS 0
+ret false
+end
+sSrcVa = engLoadTensorF32 ulong tidS
+if eq sSrcVa 0
+ret false
+end
+engPktStart
+engPtr get engScratchVa 0
+engPtr sSrcVa
+engPtr mapaddr get engLut 0
+engPtr wVa
+engPtr sVa
+engArg uint K
+engArg uint N
+if not engPktEmitGy 11 uint div add N 3 4 1 128
+ret false
+end
+ret engPktRun
+end
+engPktStart
+engPtr get engScratchVa 0
+engPtr wVa
+engPtr sVa
+engArg uint K
+engArg uint N
+if not engPktEmitGy 3 uint div add N 7 8 1 256
+ret false
+end
+ret engPktRun
+end
+
+text tNmEmb "embed_tokens.weight"
+text tNmLm "lm_head.weight"
+text tNmFNorm "norm.weight"
+text tNmInNorm "input_layernorm.weight"
+text tNmPostNorm "post_attention_layernorm.weight"
+text tNmQW "self_attn.q_proj.weight"
+text tNmQS "self_attn.q_proj.weight_scale_inv"
+text tNmKW "self_attn.k_proj.weight"
+text tNmKS "self_attn.k_proj.weight_scale_inv"
+text tNmVW "self_attn.v_proj.weight"
+text tNmVS "self_attn.v_proj.weight_scale_inv"
+text tNmOW "self_attn.o_proj.weight"
+text tNmOS "self_attn.o_proj.weight_scale_inv"
+text tNmQNorm "self_attn.q_norm.weight"
+text tNmKNorm "self_attn.k_norm.weight"
+text tNmGdnQkvW "linear_attn.in_proj_qkv.weight"
+text tNmGdnQkvS "linear_attn.in_proj_qkv.weight_scale_inv"
+text tNmGdnZW "linear_attn.in_proj_z.weight"
+text tNmGdnZS "linear_attn.in_proj_z.weight_scale_inv"
+text tNmGdnOutW "linear_attn.out_proj.weight"
+text tNmGdnOutS "linear_attn.out_proj.weight_scale_inv"
+text tNmGdnInA "linear_attn.in_proj_a.weight"
+text tNmGdnInB "linear_attn.in_proj_b.weight"
+text tNmGdnConv "linear_attn.conv1d.weight"
+text tNmGdnAlog "linear_attn.A_log"
+text tNmGdnDt "linear_attn.dt_bias"
+text tNmGdnNorm "linear_attn.norm.weight"
+text tNmGateW "mlp.gate_proj.weight"
+text tNmGateS "mlp.gate_proj.weight_scale_inv"
+text tNmUpW "mlp.up_proj.weight"
+text tNmUpS "mlp.up_proj.weight_scale_inv"
+text tNmDnW "mlp.down_proj.weight"
+text tNmDnS "mlp.down_proj.weight_scale_inv"
+
+fn engGetU32Wide p ulong to uint
+b0 = uint get engWideBuf p
+b1 = shl uint get engWideBuf add p 1 8
+b2 = shl uint get engWideBuf add p 2 16
+b3 = shl uint get engWideBuf add p 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn engNegExpAlog nV ulong isBf16 bool to void
+if isBf16
+engWidenBuf nV
+for h ulong nV bound 64
+p = mul h 4
+f = f32 engMathExp64 f64 bitcast f32 engGetU32Wide p
+engPutU32Io p bitcast uint neg f
+end
+else
+for h ulong nV bound 64
+p = mul h 4
+f = f32 engMathExp64 f64 bitcast f32 engGetU32Io p
+engPutU32Io p bitcast uint neg f
+end
+end
+end
+
+fn engLoadDtPart tid ulong dm long off ulong nV ulong to bool
+fdD = stOpenFile get stFileId tid
+if lt fdD int 0
+ret false
+end
+bD = get stByteLen tid
+if ne pread fdD engIoBuf 0 bD long get stByteOff tid long bD
+ret false
+end
+if eq get stDtype tid DT_BF16
+engWidenBuf nV
+ret eq mapwrite dm off engWideBuf 0 mul nV 4 long mul nV 4
+end
+ret eq mapwrite dm off engIoBuf 0 mul nV 4 long mul nV 4
+end
+
+fn engLoadGdnAlogDt L ulong to ulong
+nV = get engSpec MS_GDN_NV
+tA = stFindLayer L tNmGdnAlog
+tD = stFindLayer L tNmGdnDt
+if or lt tA 0 lt tD 0
+ret 0
+end
+va = engSlabAlloc mul nV 8
+if eq va 0
+ret 0
+end
+dm = get engAllocMap 0
+doff = get engAllocOff 0
+fdA = stOpenFile get stFileId ulong tA
+if lt fdA int 0
+ret 0
+end
+bA = get stByteLen ulong tA
+if ne pread fdA engIoBuf 0 bA long get stByteOff ulong tA long bA
+ret 0
+end
+engNegExpAlog nV eq get stDtype ulong tA DT_BF16
+if ne mapwrite dm doff engIoBuf 0 mul nV 4 long mul nV 4
+ret 0
+end
+if not engLoadDtPart ulong tD dm add doff mul nV 4 nV
+ret 0
+end
+ret va
+end
+
+fn engLoadGdnInAb L ulong to ulong
+H = get engSpec MS_H
+nV = get engSpec MS_GDN_NV
+tA = stFindLayer L tNmGdnInA
+tB = stFindLayer L tNmGdnInB
+if or lt tA 0 lt tB 0
+ret 0
+end
+oneBytes = mul nV mul H 2
+va = engSlabAlloc mul oneBytes 2
+if eq va 0
+ret 0
+end
+dm = get engAllocMap 0
+doff = get engAllocOff 0
+if not engStreamTensorRaw ulong tA dm doff
+ret 0
+end
+if not engStreamTensorRaw ulong tB dm add doff oneBytes
+ret 0
+end
+ret va
+end
+
+fn engLoadLayerMat tW long tS long K ulong N ulong to bool
+if lt tW 0
+ret false
+end
+ret engLoadMatW4 ulong tW tS K N
+end
+
+fn engLoadFaLayer L ulong to bool
+H = get engSpec MS_H
+qN = mul get engSpec MS_NQ get engSpec MS_HD
+if eq get engSpec MS_ATTN_GATE 1
+qN = mul qN 2
+end
+kvN = mul get engSpec MS_NKV get engSpec MS_HD
+if not engLoadLayerMat stFindLayer L tNmQW stFindLayer L tNmQS H qN
+ret false
+end
+put engLA1WVa L get engMatWVa 0
+put engLA1SVa L get engMatSVa 0
+if not engLoadLayerMat stFindLayer L tNmKW stFindLayer L tNmKS H kvN
+ret false
+end
+put engLA2WVa L get engMatWVa 0
+put engLA2SVa L get engMatSVa 0
+if not engLoadLayerMat stFindLayer L tNmVW stFindLayer L tNmVS H kvN
+ret false
+end
+put engLA3WVa L get engMatWVa 0
+put engLA3SVa L get engMatSVa 0
+if not engLoadLayerMat stFindLayer L tNmOW stFindLayer L tNmOS mul get engSpec MS_NQ get engSpec MS_HD H
+ret false
+end
+put engLA4WVa L get engMatWVa 0
+put engLA4SVa L get engMatSVa 0
+if eq get engSpec MS_QK_NORM 1
+tQN = stFindLayer L tNmQNorm
+tKN = stFindLayer L tNmKNorm
+if or lt tQN 0 lt tKN 0
+ret false
+end
+put engLQNormVa L engLoadTensorF32 ulong tQN
+put engLKNormVa L engLoadTensorF32 ulong tKN
+end
+ret true
+end
+
+fn engLoadGdnLayer L ulong to bool
+H = get engSpec MS_H
+qkvN = add mul get engSpec MS_GDN_NK 256 mul get engSpec MS_GDN_NV 128
+zN = mul get engSpec MS_GDN_NV 128
+if not engLoadLayerMat stFindLayer L tNmGdnQkvW stFindLayer L tNmGdnQkvS H qkvN
+ret false
+end
+put engLA1WVa L get engMatWVa 0
+put engLA1SVa L get engMatSVa 0
+if not engLoadLayerMat stFindLayer L tNmGdnZW stFindLayer L tNmGdnZS H zN
+ret false
+end
+put engLA2WVa L get engMatWVa 0
+put engLA2SVa L get engMatSVa 0
+if not engLoadLayerMat stFindLayer L tNmGdnOutW stFindLayer L tNmGdnOutS zN H
+ret false
+end
+put engLA3WVa L get engMatWVa 0
+put engLA3SVa L get engMatSVa 0
+tConv = stFindLayer L tNmGdnConv
+tNorm = stFindLayer L tNmGdnNorm
+if or lt tConv 0 lt tNorm 0
+ret false
+end
+put engLA4WVa L engLoadGdnInAb L
+put engLA4SVa L engLoadTensorF32 ulong tConv
+put engLQNormVa L engLoadTensorF32 ulong tNorm
+put engLKNormVa L engLoadGdnAlogDt L
+if or eq get engLA4WVa L 0 eq get engLA4SVa L 0
+ret false
+end
+ret and ne get engLQNormVa L 0 ne get engLKNormVa L 0
+end
+
+fn engLoadMlpLayer L ulong to bool
+H = get engSpec MS_H
+I = get engSpec MS_I
+if not engLoadLayerMat stFindLayer L tNmGateW stFindLayer L tNmGateS H I
+ret false
+end
+put engLGateWVa L get engMatWVa 0
+put engLGateSVa L get engMatSVa 0
+if not engLoadLayerMat stFindLayer L tNmUpW stFindLayer L tNmUpS H I
+ret false
+end
+put engLUpWVa L get engMatWVa 0
+put engLUpSVa L get engMatSVa 0
+if not engLoadLayerMat stFindLayer L tNmDnW stFindLayer L tNmDnS I H
+ret false
+end
+put engLDnWVa L get engMatWVa 0
+put engLDnSVa L get engMatSVa 0
+ret true
+end
+
+fn engLoadLayer L ulong to bool
+tIn = stFindLayer L tNmInNorm
+tPost = stFindLayer L tNmPostNorm
+if or lt tIn 0 lt tPost 0
+ret false
+end
+vaIn = engLoadTensorF32 ulong tIn
+vaPost = engLoadTensorF32 ulong tPost
+if or eq vaIn 0 eq vaPost 0
+ret false
+end
+put engLInNormVa L vaIn
+put engLPostNormVa L vaPost
+if eq get engLayerKind L 0
+if not engLoadFaLayer L
+ret false
+end
+else
+if not engLoadGdnLayer L
+ret false
+end
+end
+ret engLoadMlpLayer L
+end
+
+fn engEmitW4Gemv xVa ulong wVa ulong sVa ulong outVa ulong K ulong N ulong to bool
+engPtr xVa
+engPtr wVa
+engPtr sVa
+engPtr outVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 0 uint div add N 31 32 1 256
+end
+
+fn engEmitRmsNormAdd normVa ulong doAdd uint to bool
+engPtr engW EW_X
+engPtr engW EW_AOUT
+engPtr normVa
+engPtr engW EW_XN
+engArg doAdd
+ret engPktEmitGy 1 1 1 256
+end
+
+fn engEmitFaAttn L ulong faIdx ulong to bool
+nQ = get engSpec MS_NQ
+nKV = get engSpec MS_NKV
+hd = get engSpec MS_HD
+kBase = get engKvVa faIdx
+vBase = add kBase div get engKvSlabBytes 0 2
+engPtr engW EW_K
+engPtr engW EW_V
+engPtr get engLKNormVa L
+engPtr get engRopeVa 0
+engPtr kBase
+engPtr vBase
+engPtr engW EW_POS
+if not engPktEmitGy 7 uint nKV 1 uint hd
+ret false
+end
+engPtr engW EW_QKV
+engPtr get engLQNormVa L
+engPtr get engRopeVa 0
+engPtr engW EW_QROT
+engPtr engW EW_POS
+if not engPktEmitGy 8 uint nQ 1 uint hd
+ret false
+end
+engPtr engW EW_QROT
+engPtr kBase
+engPtr vBase
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr engW EW_POS
+if not engPktEmitGy 9 uint nQ 8 32
+ret false
+end
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr engW EW_QKV
+engPtr engW EW_Y
+engArg 8
+ret engPktEmitGy 10 uint nQ 1 uint hd
+end
+
+fn engEmitFaLayer L ulong faIdx ulong to bool
+H = get engSpec MS_H
+qN = mul get engSpec MS_NQ get engSpec MS_HD
+if eq get engSpec MS_ATTN_GATE 1
+qN = mul qN 2
+end
+kvN = mul get engSpec MS_NKV get engSpec MS_HD
+if not engEmitW4Gemv engW EW_XN get engLA1WVa L get engLA1SVa L engW EW_QKV H qN
+ret false
+end
+if not engEmitW4Gemv engW EW_XN get engLA2WVa L get engLA2SVa L engW EW_K H kvN
+ret false
+end
+if not engEmitW4Gemv engW EW_XN get engLA3WVa L get engLA3SVa L engW EW_V H kvN
+ret false
+end
+if not engEmitFaAttn L faIdx
+ret false
+end
+oK = mul get engSpec MS_NQ get engSpec MS_HD
+ret engEmitW4Gemv engW EW_Y get engLA4WVa L get engLA4SVa L engW EW_AOUT oK H
+end
+
+fn engEmitGdnLayer L ulong gdnIdx ulong to bool
+H = get engSpec MS_H
+nK = get engSpec MS_GDN_NK
+nV = get engSpec MS_GDN_NV
+qkvN = add mul nK 256 mul nV 128
+zN = mul nV 128
+if not engEmitW4Gemv engW EW_XN get engLA1WVa L get engLA1SVa L engW EW_QKV H qkvN
+ret false
+end
+if not engEmitW4Gemv engW EW_XN get engLA2WVa L get engLA2SVa L engW EW_Z H zN
+ret false
+end
+engPtr get engLA4WVa L
+engPtr engW EW_XN
+engPtr engW EW_AB
+engArg uint H
+engArg uint mul nV 2
+if not engPktEmitGy 4 uint div add mul nV 2 7 8 1 256
+ret false
+end
+engPtr engW EW_QKV
+engPtr get engLA4SVa L
+engPtr add get engGdnTailVa 0 mul gdnIdx mul qkvN 12
+if not engPktEmitGy 13 uint div qkvN 128 1 128
+ret false
+end
+engPtr engW EW_QKV
+engPtr engW EW_Z
+engPtr engW EW_AB
+engPtr get engLKNormVa L
+engPtr add get engGdnStateVa 0 mul gdnIdx mul nV 65536
+engPtr get engLQNormVa L
+engPtr engW EW_Y
+if not engPktEmitGy 14 uint nV 1 128
+ret false
+end
+ret engEmitW4Gemv engW EW_Y get engLA3WVa L get engLA3SVa L engW EW_AOUT zN H
+end
+
+fn engEmitMlpLayer L ulong to bool
+H = get engSpec MS_H
+I = get engSpec MS_I
+if not engEmitRmsNormAdd get engLPostNormVa L 1
+ret false
+end
+if not engEmitW4Gemv engW EW_XN get engLGateWVa L get engLGateSVa L engW EW_GU H I
+ret false
+end
+if not engEmitW4Gemv engW EW_XN get engLUpWVa L get engLUpSVa L add engW EW_GU mul I 4 H I
+ret false
+end
+engPtr engW EW_GU
+engPtr engW EW_SW
+engArg uint I
+if not engPktEmitGy 2 uint div I 256 1 256
+ret false
+end
+ret engEmitW4Gemv engW EW_SW get engLDnWVa L get engLDnSVa L engW EW_AOUT I H
+end
+
+fn engEmitAllLayers to bool
+nL = get engSpec MS_LAYERS
+gdnIdx = ulong 0
+faIdx = ulong 0
+for L ulong nL bound 128
+doAdd = uint 1
+if eq L 0
+doAdd = uint 0
+end
+if not engEmitRmsNormAdd get engLInNormVa L doAdd
+ret false
+end
+if eq get engLayerKind L 0
+if not engEmitFaLayer L faIdx
+ret false
+end
+faIdx = add faIdx 1
+else
+if not engEmitGdnLayer L gdnIdx
+ret false
+end
+gdnIdx = add gdnIdx 1
+end
+if not engEmitMlpLayer L
+ret false
+end
+end
+ret true
+end
+
+fn engEmitFinalHead to bool
+H = get engSpec MS_H
+V = get engSpec MS_VOCAB
+if not engEmitRmsNormAdd engW EW_FNORM 1
+ret false
+end
+if not engEmitW4Gemv engW EW_XN get engLmW4Va 0 add get engLmW4Va 0 get engLmW4SOff 0 engW EW_LOGW4 H V
+ret false
+end
+engPtr engW EW_LOGW4
+engPtr engW EW_CIDS
+if not engPktEmitGy 12 64 1 256
+ret false
+end
+engPtr mapaddr get engLmBf16 0
+engPtr engW EW_XN
+engPtr engW EW_CIDS
+engPtr engW EW_CLOG
+engArg 128
+ret engPktEmitGy 5 128 1 32
+end
+
+fn engEmitArgmaxEmbed to bool
+engPtr engW EW_CIDS
+engPtr engW EW_CLOG
+engPtr mapaddr get engEmbBf16 0
+engPtr engW EW_X
+engPtr engW EW_POS
+engPtr engW EW_OUT_TOK
+ret engPktEmitGy 6 1 1 128
+end
+
+fn engRecordPackets to bool
+engPktStartAt EW_PKT
+if not engEmitAllLayers
+ret false
+end
+if not engEmitFinalHead
+ret false
+end
+if not engPktFinish 0
+ret false
+end
+engPktStartAt add EW_PKT 4194304
+if not engEmitAllLayers
+ret false
+end
+if not engPktFinish 1
+ret false
+end
+engPktStartAt add EW_PKT 8388608
+if not engEmitAllLayers
+ret false
+end
+if not engEmitFinalHead
+ret false
+end
+if not engEmitArgmaxEmbed
+ret false
+end
+ret engPktFinish 2
+end
+
+fn engSetPos pos ulong to bool
+engPutU32Io 0 uint pos
+ret eq mapwrite get engWork 0 EW_POS engIoBuf 0 4 4
+end
+
+fn engLoadEmbed tid ulong to bool
+H = get engSpec MS_H
+b = mul H 2
+if ne mapread get engEmbBf16 0 mul tid b engIoBuf 0 b long b
+ret false
+end
+engWidenBuf H
+ret eq mapwrite get engWork 0 EW_X engWideBuf 0 mul H 4 long mul H 4
+end
+
+fn engReadOutTok to ulong
+if ne mapread get engWork 0 EW_OUT_TOK engIoBuf 0 4 4
+ret 999999
+end
+ret ulong engGetU32Io 0
+end
+
+fn engReadBestFromCands to ulong
+if ne mapread get engWork 0 EW_CIDS engIoBuf 0 512 512
+ret 999999
+end
+for i ulong 128
+put engCandIds i engGetU32Io mul i 4
+end
+if ne mapread get engWork 0 EW_CLOG engIoBuf 0 512 512
+ret 999999
+end
+bestIdx = ulong 0
+bestVal = f32 -1000000000.0f32
+for i ulong 128
+v = bitcast f32 engGetU32Io mul i 4
+if gt v bestVal
+bestVal = v
+bestIdx = i
+end
+end
+ret ulong get engCandIds bestIdx
+end
+
+fn engZeroMap m long blks ulong to void
+for z ulong blks bound 8192
+r = mapwrite m mul z 65536 engIoBuf 0 65536
+end
+end
+
+fn engResetState to void
+nGdn = get engSpec MS_N_GDN
+if gt nGdn 0
+for i ulong 65536
+put engIoBuf i 0
+end
+sTot = mul nGdn mul get engSpec MS_GDN_NV 65536
+engZeroMap get engGdnStateMap 0 div add sTot 65535 65536
+qkvN = add mul get engSpec MS_GDN_NK 256 mul get engSpec MS_GDN_NV 128
+tTot = mul nGdn mul qkvN 12
+engZeroMap get engGdnTailMap 0 div add tTot 65535 65536
+end
+put engCurPos 0 0
+end
+
+fn engGpuInitKvAndGdn to int
+ropeBytes = mul get engSpec MS_MAX_CTX mul get engSpec MS_ROPE_DIMS 4
+put engRopeMap 0 nvalloc ropeBytes true
+if le get engRopeMap 0 0
+ret 10
+end
+put engRopeVa 0 mapaddr get engRopeMap 0
+nGdn = get engSpec MS_N_GDN
+if gt nGdn 0
+nK = get engSpec MS_GDN_NK
+nV = get engSpec MS_GDN_NV
+qkvN = add mul nK 256 mul nV 128
+put engGdnStateMap 0 nvalloc mul nGdn mul nV 65536 true
+if le get engGdnStateMap 0 0
+ret 10
+end
+put engGdnStateVa 0 mapaddr get engGdnStateMap 0
+put engGdnTailMap 0 nvalloc mul div add mul nGdn mul qkvN 12 65535 65536 65536 true
+if le get engGdnTailMap 0 0
+ret 10
+end
+put engGdnTailVa 0 mapaddr get engGdnTailMap 0
+end
+kvBytes = mul get engSpec MS_MAX_CTX mul get engSpec MS_NKV mul get engSpec MS_HD 8
+put engKvSlabBytes 0 kvBytes
+nFa = get engSpec MS_N_FA
+for fi ulong nFa bound 64
+km = nvalloc kvBytes true
+if le km 0
+ret 11
+end
+put engKvMap fi km
+put engKvVa fi mapaddr km
+end
+put engSlabCnt 0 0
+ret 0
+end
+
+fn engGpuInit to int
+if not gbopen 1
+ret 2
+end
+if not gbbopen
+ret 3
+end
+put engCodeMap 0 0
+engEmitAll
+csize = mul div add get engCodePos 0 4095 4096 4096
+cm = nvalloc csize false
+if le cm 0
+ret 4
+end
+put engCodeMap 0 cm
+put engCodeFail 0 0
+engEmitAll
+if ne get engCodeFail 0 0
+ret 5
+end
+if not engBuildFp8Lut
+ret 6
+end
+put engWork 0 nvalloc ENG_WORK_BYTES true
+if le get engWork 0 0
+ret 7
+end
+put engWorkVa 0 mapaddr get engWork 0
+put engScratch 0 nvalloc ENG_SCRATCH_BYTES true
+if le get engScratch 0 0
+ret 7
+end
+put engScratchVa 0 mapaddr get engScratch 0
+H = get engSpec MS_H
+V = get engSpec MS_VOCAB
+lmBytes = mul V mul H 2
+put engEmbBf16 0 nvalloc lmBytes true
+if le get engEmbBf16 0 0
+ret 8
+end
+if eq get engSpec MS_TIE_EMB 1
+put engLmBf16 0 get engEmbBf16 0
+else
+put engLmBf16 0 nvalloc lmBytes true
+if le get engLmBf16 0 0
+ret 8
+end
+end
+w4LmW = div mul V H 2
+w4LmS = mul V div H 16
+put engLmW4SOff 0 w4LmW
+put engLmW4 0 nvalloc mul div add add w4LmW w4LmS 4095 4096 4096 true
+if le get engLmW4 0 0
+ret 9
+end
+put engLmW4Va 0 mapaddr get engLmW4 0
+ret engGpuInitKvAndGdn
+end
+
+fn engLoadAll to int
+H = get engSpec MS_H
+V = get engSpec MS_VOCAB
+if not engUploadRope
+ret 13
+end
+tEmb = stFindCanon tNmEmb len tNmEmb
+tFNorm = stFindCanon tNmFNorm len tNmFNorm
+if or lt tEmb 0 lt tFNorm 0
+ret 14
+end
+if not engStreamTensorRaw ulong tEmb get engEmbBf16 0 0
+ret 14
+end
+if eq get engSpec MS_TIE_EMB 0
+tLm = stFindCanon tNmLm len tNmLm
+if lt tLm 0
+ret 14
+end
+if not engStreamTensorRaw ulong tLm get engLmBf16 0 0
+ret 14
+end
+end
+note Load final norm into EW_FNORM
+fdFn = stOpenFile get stFileId ulong tFNorm
+if lt fdFn 0
+ret 14
+end
+fnBytes = get stByteLen ulong tFNorm
+if ne pread fdFn engIoBuf 0 fnBytes long get stByteOff ulong tFNorm long fnBytes
+ret 14
+end
+if eq get stDtype ulong tFNorm DT_BF16
+engWidenBuf H
+if ne mapwrite get engWork 0 EW_FNORM engWideBuf 0 mul H 4 long mul H 4
+ret 14
+end
+else
+if ne mapwrite get engWork 0 EW_FNORM engIoBuf 0 mul H 4 long mul H 4
+ret 14
+end
+end
+note Quantize lm_head BF16 -> W4 on GPU
+engPktStart
+engPtr mapaddr get engLmBf16 0
+engPtr get engLmW4Va 0
+engPtr add get engLmW4Va 0 get engLmW4SOff 0
+engArg uint H
+engArg uint V
+if not engPktEmitGy 3 uint div add V 7 8 1 256
+ret 14
+end
+if not engPktRun
+ret 14
+end
+nL = get engSpec MS_LAYERS
+for L ulong nL bound 128
+if not engLoadLayer L
+stCloseCached
+ret 15
+end
+end
+stCloseCached
+if not engRecordPackets
+ret 16
+end
+ret 0
+end
+
+fn engPrefillSeq ntok ulong to ulong
+engResetState
+for i ulong ntok bound 2048
+if not engLoadEmbed ulong get engTokSeq i
+ret 999999
+end
+if not engSetPos i
+ret 999999
+end
+if eq add i 1 ntok
+if not engReplayPre 0
+ret 999999
+end
+else
+if not engReplayPre 1
+ret 999999
+end
+end
+end
+put engCurPos 0 ntok
+ret engReadBestFromCands
+end

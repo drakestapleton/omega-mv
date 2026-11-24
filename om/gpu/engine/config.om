@@ -1,0 +1,421 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/config.om: Universal Pure Seeded-OM-2 HuggingFace config.json Parser & ModelSpec.
+note Automatically detects architecture, dimensions, layer types (Full-Attention vs Gated DeltaNet),
+note MoE vs Dense, RoPE parameters, RMSNorm convention ((1+w) vs w), QK-Norm, and quantization
+note from any standard HuggingFace config.json (Llama 3, Qwen 2.5/3/3.5/3.6/3.8/4, Gemma 2/3,
+note Mistral, DeepSeek, Phi, or custom checkpoints).
+
+note ModelSpec field indices (global engSpec ulong 64)
+const MS_ARCH ulong 0
+const MS_H ulong 1
+const MS_I ulong 2
+const MS_MOE_I ulong 3
+const MS_LAYERS ulong 4
+const MS_NQ ulong 5
+const MS_NKV ulong 6
+const MS_HD ulong 7
+const MS_VOCAB ulong 8
+const MS_NEXP ulong 9
+const MS_TOPK ulong 10
+const MS_FA_INT ulong 11
+const MS_GDN_NK ulong 12
+const MS_GDN_NV ulong 13
+const MS_GDN_HD ulong 14
+const MS_ROPE_DIMS ulong 15
+const MS_ROPE_THETA ulong 16
+const MS_NORM_ADD1 ulong 17
+const MS_QK_NORM ulong 18
+const MS_ATTN_GATE ulong 19
+const MS_TIE_EMB ulong 20
+const MS_QUANT ulong 21
+const MS_MAX_CTX ulong 22
+const MS_N_FA ulong 23
+const MS_N_GDN ulong 24
+const MS_SH_EXP ulong 25
+const MS_SH_I ulong 26
+const MS_HAS_TEXT_PREFIX ulong 27
+const MS_CONV_K ulong 28
+const MS_EPS_E6 ulong 29
+
+global engSpec ulong 64
+global engLayerKind uchar 256
+global engCfgBuf uchar 262144
+global engCfgLen ulong 1
+global engModelType uchar 64
+global engModelTypeLen ulong 1
+global engModelDir uchar 512
+global engModelDirLen ulong 1
+global engPathTmp uchar 1024
+
+text engCfgSuf "/config.json"
+text engKTextCfg "\"text_config\""
+text engKModelType "\"model_type\""
+text engKHid "\"hidden_size\""
+text engKInter "\"intermediate_size\""
+text engKMoeInter "\"moe_intermediate_size\""
+text engKShInter "\"shared_expert_intermediate_size\""
+text engKLayers "\"num_hidden_layers\""
+text engKNq "\"num_attention_heads\""
+text engKNkv "\"num_key_value_heads\""
+text engKHd "\"head_dim\""
+text engKVocab "\"vocab_size\""
+text engKNexp "\"num_experts\""
+text engKNRouted "\"n_routed_experts\""
+text engKTopk "\"num_experts_per_tok\""
+text engKFaInt "\"full_attention_interval\""
+text engKGdnNk "\"linear_num_key_heads\""
+text engKGdnNv "\"linear_num_value_heads\""
+text engKGdnHd "\"linear_key_head_dim\""
+text engKConvK "\"linear_conv_kernel_dim\""
+text engKPartRot "\"partial_rotary_factor\""
+text engKRopeTheta "\"rope_theta\""
+text engKTieEmb "\"tie_word_embeddings\""
+text engKAttnGate "\"attn_output_gate\""
+text engKQuantMeth "\"quant_method\""
+text engKEps "\"rms_norm_eps\""
+
+fn engJoinPath suf view uchar * to ulong
+dlen = get engModelDirLen 0
+for i ulong dlen bound 512
+put engPathTmp i get engModelDir i
+end
+p = dlen
+for i ulong len suf bound 256
+put engPathTmp p get suf i
+p = add p 1
+end
+put engPathTmp p 0
+ret p
+end
+
+fn engMatchCfg pos ulong pat view uchar * to bool
+clen = get engCfgLen 0
+plen = len pat
+if gt add pos plen clen
+ret false
+end
+for i ulong plen bound 64
+if ne get engCfgBuf add pos i get pat i
+ret false
+end
+end
+ret true
+end
+
+fn engFindKey start ulong endPos ulong key view uchar * to ulong
+p = start
+klen = len key
+while lt add p klen endPos bound 262144
+if engMatchCfg p key
+j = add p klen
+while and lt j endPos ne get engCfgBuf j 58 bound 64
+j = add j 1
+end
+if lt add j 1 endPos
+j = add j 1
+while lt j endPos bound 64
+c = get engCfgBuf j
+if eq c 32
+j = add j 1
+else
+if eq c 9
+j = add j 1
+else
+if eq c 10
+j = add j 1
+else
+if eq c 13
+j = add j 1
+else
+break
+end
+end
+end
+end
+end
+ret j
+end
+end
+p = add p 1
+end
+ret 0
+end
+
+fn engParseU64At pos ulong to ulong
+clen = get engCfgLen 0
+v = ulong 0
+p = pos
+while lt p clen bound 32
+c = get engCfgBuf p
+if and ge c 48 le c 57
+v = add mul v 10 ulong sub c 48
+p = add p 1
+else
+break
+end
+end
+ret v
+end
+
+fn engParseBoolAt pos ulong to ulong
+clen = get engCfgLen 0
+if lt pos clen
+if eq get engCfgBuf pos 116
+ret 1
+end
+end
+ret 0
+end
+
+fn engParseFrac100At pos ulong to ulong
+note Parses a decimal like 0.25 -> 25, 1.0 -> 100, 0.5 -> 50
+clen = get engCfgLen 0
+if ge pos clen
+ret 100
+end
+whole = engParseU64At pos
+p = pos
+while and lt p clen and ge get engCfgBuf p 48 le get engCfgBuf p 57 bound 16
+p = add p 1
+end
+frac = ulong 0
+if and lt p clen eq get engCfgBuf p 46
+p = add p 1
+if and lt p clen and ge get engCfgBuf p 48 le get engCfgBuf p 57
+frac = mul ulong sub get engCfgBuf p 48 10
+p = add p 1
+if and lt p clen and ge get engCfgBuf p 48 le get engCfgBuf p 57
+frac = add frac ulong sub get engCfgBuf p 48
+end
+end
+end
+ret add mul whole 100 frac
+end
+
+fn engReadStrAt pos ulong dst edit uchar 64 to ulong
+clen = get engCfgLen 0
+if or ge pos clen ne get engCfgBuf pos 34
+ret 0
+end
+p = add pos 1
+n = ulong 0
+while and lt p clen lt n 62 bound 64
+c = get engCfgBuf p
+if eq c 34
+break
+end
+put dst n c
+n = add n 1
+p = add p 1
+end
+put dst n 0
+ret n
+end
+
+fn engStrHas buf view uchar 64 blen ulong pat view uchar * to bool
+slen = len pat
+if gt slen blen
+ret false
+end
+for i ulong add sub blen slen 1 bound 64
+ok = true
+for j ulong slen bound 32
+if ne get buf add i j get pat j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+text engSubQwen35 "qwen3_5"
+text engSubQwen4 "qwen4"
+text engSubMoe "moe"
+text engSubDeepseek "deepseek"
+text engSubGemma "gemma"
+text engSubQwen3 "qwen3"
+text engSubFp8 "fp8"
+text engSubModelopt "modelopt"
+
+fn engSetIfKey start ulong tot ulong key view uchar * slot ulong to void
+p = engFindKey start tot key
+if gt p 0
+put engSpec slot engParseU64At p
+end
+end
+
+fn engDetectArch tot ulong tStart ulong to void
+mtPos = engFindKey tStart tot engKModelType
+if eq mtPos 0
+mtPos = engFindKey 0 tot engKModelType
+end
+mtLocal = new uchar 64 0
+mtLen = ulong 0
+if gt mtPos 0
+mtLen = engReadStrAt mtPos mtLocal
+for i ulong mtLen bound 64
+put engModelType i get mtLocal i
+end
+end
+put engModelTypeLen 0 mtLen
+if engStrHas mtLocal mtLen engSubQwen35
+put engSpec MS_NORM_ADD1 1
+put engSpec MS_QK_NORM 1
+put engSpec MS_ATTN_GATE 1
+if or gt get engSpec MS_NEXP 0 engStrHas mtLocal mtLen engSubMoe
+put engSpec MS_ARCH 2
+put engSpec MS_SH_EXP 1
+if eq get engSpec MS_SH_I 0
+put engSpec MS_SH_I get engSpec MS_MOE_I
+end
+else
+put engSpec MS_ARCH 1
+end
+else
+if engStrHas mtLocal mtLen engSubQwen4
+put engSpec MS_ARCH 3
+put engSpec MS_NORM_ADD1 1
+put engSpec MS_QK_NORM 1
+put engSpec MS_ATTN_GATE 1
+put engSpec MS_SH_EXP 1
+else
+if engStrHas mtLocal mtLen engSubDeepseek
+put engSpec MS_ARCH 4
+else
+if engStrHas mtLocal mtLen engSubGemma
+put engSpec MS_ARCH 5
+put engSpec MS_NORM_ADD1 1
+put engSpec MS_QK_NORM 1
+else
+put engSpec MS_ARCH 0
+if engStrHas mtLocal mtLen engSubQwen3
+put engSpec MS_QK_NORM 1
+end
+end
+end
+end
+end
+qTmp = new uchar 64 0
+qp = engFindKey 0 tot engKQuantMeth
+if gt qp 0
+ql = engReadStrAt qp qTmp
+if engStrHas qTmp ql engSubFp8
+put engSpec MS_QUANT 1
+else
+if engStrHas qTmp ql engSubModelopt
+put engSpec MS_QUANT 2
+end
+end
+end
+end
+
+fn engComputeLayerKinds to void
+nL = get engSpec MS_LAYERS
+faInt = get engSpec MS_FA_INT
+nFa = ulong 0
+nGdn = ulong 0
+for L ulong nL bound 256
+if eq faInt 1
+put engLayerKind L 0
+nFa = add nFa 1
+else
+if eq rem add L 1 faInt 0
+put engLayerKind L 0
+nFa = add nFa 1
+else
+put engLayerKind L 1
+nGdn = add nGdn 1
+end
+end
+end
+put engSpec MS_N_FA nFa
+put engSpec MS_N_GDN nGdn
+end
+
+fn engLoadConfig to bool
+plen = engJoinPath engCfgSuf
+fd = int fopen engPathTmp 0 plen 0 0
+if lt fd 0
+ret false
+end
+tot = ulong 0
+while lt tot 262100 bound 64
+got = pread fd engCfgBuf tot sub 262100 tot long tot
+if le got 0
+break
+end
+tot = add tot ulong got
+end
+c0 = fclose fd
+if eq tot 0
+ret false
+end
+put engCfgLen 0 tot
+for i ulong 64
+put engSpec i 0
+end
+put engSpec MS_FA_INT 1
+put engSpec MS_ROPE_THETA 1000000
+put engSpec MS_CONV_K 4
+put engSpec MS_EPS_E6 1
+put engSpec MS_MAX_CTX 131072
+tStart = ulong 0
+tcPos = engFindKey 0 tot engKTextCfg
+if gt tcPos 0
+tStart = tcPos
+put engSpec MS_HAS_TEXT_PREFIX 1
+end
+engSetIfKey tStart tot engKHid MS_H
+engSetIfKey tStart tot engKInter MS_I
+engSetIfKey tStart tot engKMoeInter MS_MOE_I
+engSetIfKey tStart tot engKShInter MS_SH_I
+if gt get engSpec MS_SH_I 0
+put engSpec MS_SH_EXP 1
+end
+engSetIfKey tStart tot engKLayers MS_LAYERS
+engSetIfKey tStart tot engKNq MS_NQ
+engSetIfKey tStart tot engKNkv MS_NKV
+engSetIfKey tStart tot engKHd MS_HD
+if and eq get engSpec MS_HD 0 gt get engSpec MS_NQ 0
+put engSpec MS_HD div get engSpec MS_H get engSpec MS_NQ
+end
+if eq get engSpec MS_NKV 0
+put engSpec MS_NKV get engSpec MS_NQ
+end
+engSetIfKey tStart tot engKVocab MS_VOCAB
+engSetIfKey tStart tot engKNexp MS_NEXP
+if eq get engSpec MS_NEXP 0
+engSetIfKey tStart tot engKNRouted MS_NEXP
+end
+engSetIfKey tStart tot engKTopk MS_TOPK
+engSetIfKey tStart tot engKFaInt MS_FA_INT
+if eq get engSpec MS_FA_INT 0
+put engSpec MS_FA_INT 1
+end
+engSetIfKey tStart tot engKGdnNk MS_GDN_NK
+engSetIfKey tStart tot engKGdnNv MS_GDN_NV
+engSetIfKey tStart tot engKGdnHd MS_GDN_HD
+engSetIfKey tStart tot engKConvK MS_CONV_K
+engSetIfKey tStart tot engKRopeTheta MS_ROPE_THETA
+p = engFindKey tStart tot engKTieEmb
+if gt p 0
+put engSpec MS_TIE_EMB engParseBoolAt p
+end
+p = engFindKey tStart tot engKAttnGate
+if gt p 0
+put engSpec MS_ATTN_GATE engParseBoolAt p
+end
+rotPct = ulong 100
+p = engFindKey tStart tot engKPartRot
+if gt p 0
+rotPct = engParseFrac100At p
+end
+put engSpec MS_ROPE_DIMS div mul get engSpec MS_HD rotPct 100
+engDetectArch tot tStart
+engComputeLayerKinds
+ret gt get engSpec MS_H 0
+end
