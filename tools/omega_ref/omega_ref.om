@@ -1,0 +1,4107 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note tools/omega_ref/omega_ref.om -- Pure seeded OM-2 reference interpreter for the om4 language.
+note Replaces tools/omega_ref/omega_ref.c with byte-exact parity across check, run, and call modes.
+
+const T_NONE ulong 0
+const T_BOOL ulong 1
+const T_U8 ulong 2
+const T_U16 ulong 3
+const T_U32 ulong 4
+const T_U64 ulong 5
+const T_I8 ulong 6
+const T_I16 ulong 7
+const T_I32 ulong 8
+const T_I64 ulong 9
+const T_VOID ulong 10
+
+const AK_GLOBAL ulong 0
+const AK_LOCAL ulong 1
+
+const N_NUM ulong 0
+const N_VAR ulong 1
+const N_BIN ulong 2
+const N_CMP ulong 3
+const N_NEG ulong 4
+const N_NOT ulong 5
+const N_CONV ulong 6
+const N_GET ulong 7
+const N_LEN ulong 8
+const N_READ ulong 9
+const N_WRITE ulong 10
+const N_CALL ulong 11
+const N_BARE ulong 12
+const N_ENLARGE ulong 13
+const N_ENVCNT ulong 14
+const N_ENVREAD ulong 15
+
+const OP_ADD ulong 0
+const OP_SUB ulong 1
+const OP_MUL ulong 2
+const OP_DIV ulong 3
+const OP_REM ulong 4
+const OP_AND ulong 5
+const OP_OR ulong 6
+const OP_XOR ulong 7
+const OP_SHL ulong 8
+const OP_SHR ulong 9
+const OP_EQ ulong 10
+const OP_NE ulong 11
+const OP_LT ulong 12
+const OP_LE ulong 13
+const OP_GT ulong 14
+const OP_GE ulong 15
+
+const S_ASSIGN ulong 0
+const S_NEW ulong 1
+const S_IF ulong 2
+const S_WHILE ulong 3
+const S_FOR ulong 4
+const S_BREAK ulong 5
+const S_RET ulong 6
+const S_PUT ulong 7
+const S_FREE ulong 8
+const S_TRAP ulong 9
+const S_EXIT ulong 10
+const S_CALL ulong 11
+
+const PK_SCALAR ulong 0
+const PK_VIEW ulong 1
+const PK_EDIT ulong 2
+
+const K_SCALAR ulong 0
+const K_OWN ulong 1
+const K_VIEW ulong 2
+const K_EDIT ulong 3
+
+const C_NORMAL ulong 0
+const C_BREAK ulong 1
+const C_RET ulong 2
+
+const MAX_POOL_ELEMS ulong 16777216
+const MAX_POOL_BYTES ulong 1073741824
+const MAX_LOCAL_ARR_BYTES ulong 4194304
+const STACK_BYTES ulong 8388608
+const LOOP_MAX ulong 1000000
+const U64_MAX ulong 18446744073709551615
+const I64_MAX_U ulong 9223372036854775807
+const I64_MIN_MAG ulong 9223372036854775808
+const INF_BOUND ulong 9223372036854775807
+
+text kw_list "bool\nuchar\nushort\nuint\nulong\nbyte\nshort\nint\nlong\nu8\nu16\nu32\nu64\ni8\ni16\ni32\ni64\nadd\nsub\nmul\ndiv\nrem\nand\nor\nxor\nshl\nshr\neq\nne\nlt\nle\ngt\nge\nfn\nto\nvoid\nend\nif\nelse\nwhile\nbound\nfor\nbreak\nret\nput\nfree\ntrap\nglobal\ntext\nnew\nview\nedit\nown\nget\nlen\nread\nwrite\nexit\nnote\ntrue\nfalse\nneg\nnot\nenlarge\nenvcnt\nenvread\n=\n(\n)\n*\nmain\ncheck\nrun\ncall\n"
+
+text msg_err_pre "omega_ref: line "
+text msg_err_mid ": error "
+text msg_err_end "\n"
+text msg_usage "usage: omega_ref check|run <prog> | omega_ref call <prog> <entry> <inputs>\n"
+text msg_run_main "omega_ref: run needs fn main\n"
+text msg_no_fn "omega_ref: no function\n"
+text msg_call_arr "omega_ref: call with an array parameter\n"
+text msg_in_range "omega_ref: input out of range\n"
+text msg_unk_cmd "omega_ref: unknown command\n"
+text msg_io_err "omega_ref: io error\n"
+text msg_oom "omega_ref: allocation failed\n"
+text msg_trap_pre "TRAP "
+text msg_trap_suf "\t-\n"
+text msg_hex_pre "\t0x"
+text hex_digits "0123456789abcdef"
+
+note Scalar global state packed in gs[0..31]:
+note 0:src_len 1:cur_line 2:refuse_exit 3:nw 4:wi 5:nfuncs 6:nglobals 7:pool_bytes
+note 8:program_mode 9:first_global_line 10:nnames 11:depth 12:curf 13:nslots
+note 14:nest 15:enlarge_assign 16:npend 17:nblocks 18:local_arr_bytes 19:fn_seen
+note 20:nnodes 21:nstmts 22:ncargs 23:nedges 24:narrs 25:mem_used 26:loc_used
+note 27:stack_used 28:trapped 29:trap_code 30:fr_sp 31:arg_sp
+global gs ulong 32
+
+note Pending line-end checks (up to 4 per line)
+global pend_node ulong 4
+global pend_want ulong 4
+
+note Scratch buffers for CLI args, I/O, formatting, envread
+global arg_buf uchar 4096
+global io_buf uchar 65536
+global fmt_buf uchar 128
+global env_tmp uchar 65536
+
+note Parse helper return registers:
+note 0:neg 1:mag 2:akind 3:aidx 4:ety 5:alen 6:ro 7:kindout
+global pr ulong 8
+global exec_ret ulong 1
+
+note Source and line tokens
+global src uchar *
+global tok_off ulong *
+global tok_len ulong *
+
+note Functions (0..nfuncs-1)
+global fn_noff ulong *
+global fn_nlen ulong *
+global fn_np ulong *
+global fn_pkind ulong *
+global fn_pty ulong *
+global fn_plen ulong *
+global fn_ret ulong *
+global fn_body ulong *
+global fn_nslots ulong *
+global fn_hascall ulong *
+global fn_done ulong *
+global fn_sigline ulong *
+global fn_ehead ulong *
+global fn_onpath ulong *
+global fn_visited ulong *
+
+note Call edges (1-indexed)
+global edge_to ulong *
+global edge_next ulong *
+
+note Globals (0..nglobals-1)
+global gl_noff ulong *
+global gl_nlen ulong *
+global gl_ety ulong *
+global gl_len ulong *
+global gl_istext ulong *
+global gl_aid ulong *
+
+note Runtime array descriptors (1-indexed)
+global arr_ety ulong *
+global arr_len ulong *
+global arr_ro ulong *
+global arr_off ulong *
+global arr_cap ulong *
+global arr_space ulong *
+
+note Backing memory pools: space 0 = mem_pool (globals/texts/pools), space 1 = loc_pool (local new)
+global mem_pool uchar *
+global loc_pool uchar *
+
+note AST Nodes (1-indexed)
+global nd_kind ulong *
+global nd_op ulong *
+global nd_ty ulong *
+global nd_bare ulong *
+global nd_num ulong *
+global nd_neg ulong *
+global nd_slot ulong *
+global nd_akind ulong *
+global nd_aidx ulong *
+global nd_fn ulong *
+global nd_a ulong *
+global nd_b ulong *
+global nd_c ulong *
+global nd_abase ulong *
+global nd_line ulong *
+
+note Call arguments (0-indexed)
+global ca_node ulong *
+global ca_akind ulong *
+global ca_aidx ulong *
+
+note Statements (1-indexed)
+global st_kind ulong *
+global st_line ulong *
+global st_slot ulong *
+global st_v ulong *
+global st_v2 ulong *
+global st_akind ulong *
+global st_aidx ulong *
+global st_ety ulong *
+global st_n ulong *
+global st_ckind ulong *
+global st_ty ulong *
+global st_body ulong *
+global st_els ulong *
+global st_next ulong *
+
+note Scope names (0..nnames-1)
+global nm_noff ulong *
+global nm_nlen ulong *
+global nm_kind ulong *
+global nm_ty ulong *
+global nm_slot ulong *
+global nm_depth ulong *
+global nm_isloop ulong *
+global nm_len ulong *
+
+note Open blocks (0..nblocks-1)
+global blk_kind ulong *
+global blk_owner ulong *
+global blk_tail ulong *
+global blk_ended ulong *
+global blk_then_ended ulong *
+
+note Runtime call frame stacks and argument stack
+global fr_vals ulong *
+global fr_arrs ulong *
+global arg_s ulong *
+global arg_a ulong *
+
+note Input file buffer for call mode
+global inp_buf uchar *
+
+note ---- I/O and error helpers ----
+
+fn write_all fd int n ulong to void
+off = ulong 0
+while lt off n bound INF_BOUND
+r = write fd fmt_buf off sub n off
+if le r 0
+ret
+end
+off = add off ulong r
+end
+end
+
+fn fmt_u64 v ulong to ulong
+if eq v 0
+put fmt_buf 0 48
+ret 1
+end
+x = v
+k = ulong 0
+while gt x 0 bound 32
+put fmt_buf add 64 k uchar add 48 rem x 10
+x = div x 10
+k = add k 1
+end
+i = ulong 0
+while lt i k bound 32
+put fmt_buf i get fmt_buf sub sub add 64 k i 1
+i = add i 1
+end
+ret k
+end
+
+fn fmt_i64 v ulong to ulong
+if ge v I64_MIN_MAG
+put fmt_buf 0 45
+mag = sub ulong 0 v
+n = fmt_u64 mag
+i = n
+while gt i 0 bound 32
+put fmt_buf i get fmt_buf sub i 1
+i = sub i 1
+end
+put fmt_buf 0 45
+ret add n 1
+end
+ret fmt_u64 v
+end
+
+fn err_u64 v ulong to void
+n = fmt_u64 v
+write_all 2 n
+end
+
+fn out_u64 v ulong to void
+n = fmt_u64 v
+write_all 1 n
+end
+
+fn out_i64 v ulong to void
+n = fmt_i64 v
+write_all 1 n
+end
+
+fn out_hex64 v ulong to void
+i = ulong 0
+while lt i 16 bound 16
+sh = mul sub 15 i 4
+nib = and shr v sh 15
+put fmt_buf i get hex_digits nib
+i = add i 1
+end
+write_all 1 16
+end
+
+fn die_oom to void
+r = write 2 msg_oom 0 len msg_oom
+exit 2
+end
+
+fn die_io to void
+r = write 2 msg_io_err 0 len msg_io_err
+exit 2
+end
+
+fn refuse code ulong to void
+r = write 2 msg_err_pre 0 len msg_err_pre
+err_u64 get gs 1
+r = write 2 msg_err_mid 0 len msg_err_mid
+err_u64 code
+r = write 2 msg_err_end 0 len msg_err_end
+re = get gs 2
+if ne re 0
+exit int re
+end
+exit int code
+end
+
+fn do_trap code ulong to void
+put gs 28 1
+put gs 29 code
+end
+
+note ---- Type helpers ----
+
+fn twidth t ulong to ulong
+if eq t T_BOOL
+ret 1
+end
+if or eq t T_U8 eq t T_I8
+ret 8
+end
+if or eq t T_U16 eq t T_I16
+ret 16
+end
+if or eq t T_U32 eq t T_I32
+ret 32
+end
+if or eq t T_U64 eq t T_I64
+ret 64
+end
+ret 0
+end
+
+fn tsigned t ulong to bool
+if ge t T_I8
+if le t T_I64
+ret true
+end
+end
+ret false
+end
+
+fn tnum t ulong to bool
+if ge t T_U8
+if le t T_I64
+ret true
+end
+end
+ret false
+end
+
+fn tbytes t ulong to ulong
+if eq t T_BOOL
+ret 1
+end
+ret div twidth t 8
+end
+
+fn canon t ulong x ulong to ulong
+if eq t T_BOOL
+ret and x 1
+end
+w = twidth t
+if ge w 64
+ret x
+end
+mask = sub shl ulong 1 w 1
+v = and x mask
+if tsigned t
+m = shl ulong 1 sub w 1
+ret sub xor v m m
+end
+ret v
+end
+
+fn smin_u t ulong to ulong
+w = twidth t
+if eq w 64
+ret I64_MIN_MAG
+end
+ret sub ulong 0 shl ulong 1 sub w 1
+end
+
+fn smax_u t ulong to ulong
+w = twidth t
+if eq w 64
+ret I64_MAX_U
+end
+ret sub shl ulong 1 sub w 1 1
+end
+
+fn umax_u t ulong to ulong
+if eq t T_BOOL
+ret 1
+end
+w = twidth t
+if eq w 64
+ret U64_MAX
+end
+ret sub shl ulong 1 w 1
+end
+
+fn smin_l t ulong to long
+if eq t T_I8
+ret long -128
+end
+if eq t T_I16
+ret long -32768
+end
+if eq t T_I32
+ret long -2147483648
+end
+ret long -9223372036854775808
+end
+
+fn smax_l t ulong to long
+if eq t T_I8
+ret long 127
+end
+if eq t T_I16
+ret long 32767
+end
+if eq t T_I32
+ret long 2147483647
+end
+ret long 9223372036854775807
+end
+
+fn u2l x ulong to long
+if ge x I64_MIN_MAG
+d = sub x I64_MIN_MAG
+ret add long -9223372036854775808 long d
+end
+ret long x
+end
+
+fn l2u x long to ulong
+if lt x 0
+d = sub x long -9223372036854775808
+ret add I64_MIN_MAG ulong d
+end
+ret ulong x
+end
+
+note ---- Pool growth helpers ----
+
+fn grow_cap cur ulong need ulong to ulong
+c = cur
+if eq c 0
+c = 64
+end
+while lt c need bound 64
+c = mul c 2
+end
+ret c
+end
+
+fn ensure_tok need ulong to void
+if le need len tok_off
+ret
+end
+nc = grow_cap len tok_off need
+r = enlarge tok_off nc
+if lt r 0
+die_oom
+end
+r = enlarge tok_len nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_fn need ulong to void
+if le need len fn_noff
+ret
+end
+nc = grow_cap len fn_noff need
+r = enlarge fn_noff nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_nlen nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_np nc
+if lt r 0
+die_oom
+end
+nc6 = mul nc 6
+r = enlarge fn_pkind nc6
+if lt r 0
+die_oom
+end
+r = enlarge fn_pty nc6
+if lt r 0
+die_oom
+end
+r = enlarge fn_plen nc6
+if lt r 0
+die_oom
+end
+r = enlarge fn_ret nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_body nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_nslots nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_hascall nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_done nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_sigline nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_ehead nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_onpath nc
+if lt r 0
+die_oom
+end
+r = enlarge fn_visited nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_edge need ulong to void
+if le need len edge_to
+ret
+end
+nc = grow_cap len edge_to need
+r = enlarge edge_to nc
+if lt r 0
+die_oom
+end
+r = enlarge edge_next nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_gl need ulong to void
+if le need len gl_noff
+ret
+end
+nc = grow_cap len gl_noff need
+r = enlarge gl_noff nc
+if lt r 0
+die_oom
+end
+r = enlarge gl_nlen nc
+if lt r 0
+die_oom
+end
+r = enlarge gl_ety nc
+if lt r 0
+die_oom
+end
+r = enlarge gl_len nc
+if lt r 0
+die_oom
+end
+r = enlarge gl_istext nc
+if lt r 0
+die_oom
+end
+r = enlarge gl_aid nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_arr need ulong to void
+if le need len arr_ety
+ret
+end
+nc = grow_cap len arr_ety need
+r = enlarge arr_ety nc
+if lt r 0
+die_oom
+end
+r = enlarge arr_len nc
+if lt r 0
+die_oom
+end
+r = enlarge arr_ro nc
+if lt r 0
+die_oom
+end
+r = enlarge arr_off nc
+if lt r 0
+die_oom
+end
+r = enlarge arr_cap nc
+if lt r 0
+die_oom
+end
+r = enlarge arr_space nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_nd need ulong to void
+if le need len nd_kind
+ret
+end
+nc = grow_cap len nd_kind need
+r = enlarge nd_kind nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_op nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_ty nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_bare nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_num nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_neg nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_slot nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_akind nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_aidx nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_fn nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_a nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_b nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_c nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_abase nc
+if lt r 0
+die_oom
+end
+r = enlarge nd_line nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_ca need ulong to void
+if le need len ca_node
+ret
+end
+nc = grow_cap len ca_node need
+r = enlarge ca_node nc
+if lt r 0
+die_oom
+end
+r = enlarge ca_akind nc
+if lt r 0
+die_oom
+end
+r = enlarge ca_aidx nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_st need ulong to void
+if le need len st_kind
+ret
+end
+nc = grow_cap len st_kind need
+r = enlarge st_kind nc
+if lt r 0
+die_oom
+end
+r = enlarge st_line nc
+if lt r 0
+die_oom
+end
+r = enlarge st_slot nc
+if lt r 0
+die_oom
+end
+r = enlarge st_v nc
+if lt r 0
+die_oom
+end
+r = enlarge st_v2 nc
+if lt r 0
+die_oom
+end
+r = enlarge st_akind nc
+if lt r 0
+die_oom
+end
+r = enlarge st_aidx nc
+if lt r 0
+die_oom
+end
+r = enlarge st_ety nc
+if lt r 0
+die_oom
+end
+r = enlarge st_n nc
+if lt r 0
+die_oom
+end
+r = enlarge st_ckind nc
+if lt r 0
+die_oom
+end
+r = enlarge st_ty nc
+if lt r 0
+die_oom
+end
+r = enlarge st_body nc
+if lt r 0
+die_oom
+end
+r = enlarge st_els nc
+if lt r 0
+die_oom
+end
+r = enlarge st_next nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_nm need ulong to void
+if le need len nm_noff
+ret
+end
+nc = grow_cap len nm_noff need
+r = enlarge nm_noff nc
+if lt r 0
+die_oom
+end
+r = enlarge nm_nlen nc
+if lt r 0
+die_oom
+end
+r = enlarge nm_kind nc
+if lt r 0
+die_oom
+end
+r = enlarge nm_ty nc
+if lt r 0
+die_oom
+end
+r = enlarge nm_slot nc
+if lt r 0
+die_oom
+end
+r = enlarge nm_depth nc
+if lt r 0
+die_oom
+end
+r = enlarge nm_isloop nc
+if lt r 0
+die_oom
+end
+r = enlarge nm_len nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_blk need ulong to void
+if le need len blk_kind
+ret
+end
+nc = grow_cap len blk_kind need
+r = enlarge blk_kind nc
+if lt r 0
+die_oom
+end
+r = enlarge blk_owner nc
+if lt r 0
+die_oom
+end
+r = enlarge blk_tail nc
+if lt r 0
+die_oom
+end
+r = enlarge blk_ended nc
+if lt r 0
+die_oom
+end
+r = enlarge blk_then_ended nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_fr need ulong to void
+if le need len fr_vals
+ret
+end
+nc = grow_cap len fr_vals need
+r = enlarge fr_vals nc
+if lt r 0
+die_oom
+end
+r = enlarge fr_arrs nc
+if lt r 0
+die_oom
+end
+end
+
+fn ensure_argst need ulong to void
+if le need len arg_s
+ret
+end
+nc = grow_cap len arg_s need
+r = enlarge arg_s nc
+if lt r 0
+die_oom
+end
+r = enlarge arg_a nc
+if lt r 0
+die_oom
+end
+end
+
+fn alloc_arr ety ulong alen ulong ro ulong space ulong to ulong
+id = add get gs 24 1
+put gs 24 id
+ensure_arr add id 1
+put arr_ety id ety
+put arr_len id alen
+put arr_ro id ro
+put arr_off id 0
+put arr_cap id 0
+put arr_space id space
+ret id
+end
+
+fn alloc_mem_bytes nb ulong to ulong
+if eq nb 0
+ret get gs 25
+end
+used = get gs 25
+need = add used nb
+if gt need len mem_pool
+r = enlarge mem_pool need
+if lt r 0
+die_oom
+end
+end
+put gs 25 need
+ret used
+end
+
+fn alloc_loc_bytes nb ulong to ulong
+if eq nb 0
+ret get gs 26
+end
+used = get gs 26
+need = add used nb
+if gt need len loc_pool
+nc = grow_cap len loc_pool need
+r = enlarge loc_pool nc
+if lt r 0
+die_oom
+end
+end
+put gs 26 need
+ret used
+end
+
+note ---- Token and keyword matching ----
+
+fn src_eq o1 ulong n1 ulong o2 ulong n2 ulong to bool
+if ne n1 n2
+ret false
+end
+i = ulong 0
+while lt i n1 bound INF_BOUND
+if ne get src add o1 i get src add o2 i
+ret false
+end
+i = add i 1
+end
+ret true
+end
+
+note Match src[off..off+n) against kw_list[s..s+n)
+fn kw_match_src off ulong s ulong n ulong to bool
+j = ulong 0
+while lt j n bound 64
+if ne get src add off j get kw_list add s j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+note Match src[off..off+n) against line id (0-based) of kw_list
+fn kw_id_of off ulong n ulong to ulong
+id = ulong 0
+s = ulong 0
+i = ulong 0
+kl = len kw_list
+while lt i kl bound 1024
+if eq get kw_list i 10
+if eq sub i s n
+if kw_match_src off s n
+ret id
+end
+end
+id = add id 1
+s = add i 1
+end
+i = add i 1
+end
+ret 999
+end
+
+fn kw_match_arg s ulong alen ulong to bool
+j = ulong 0
+while lt j alen bound 64
+if ne get arg_buf j get kw_list add s j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+fn arg_eq_kw alen ulong target_id ulong to bool
+id = ulong 0
+s = ulong 0
+i = ulong 0
+kl = len kw_list
+while lt i kl bound 1024
+if eq get kw_list i 10
+if eq id target_id
+if ne sub i s alen
+ret false
+end
+ret kw_match_arg s alen
+end
+id = add id 1
+s = add i 1
+end
+i = add i 1
+end
+ret false
+end
+
+note kw_list indices:
+note 0:bool 1:uchar 2:ushort 3:uint 4:ulong 5:byte 6:short 7:int 8:long
+note 9:u8 10:u16 11:u32 12:u64 13:i8 14:i16 15:i32 16:i64
+note 17:add 18:sub 19:mul 20:div 21:rem 22:and 23:or 24:xor 25:shl 26:shr
+note 27:eq 28:ne 29:lt 30:le 31:gt 32:ge
+note 33:fn 34:to 35:void 36:end 37:if 38:else 39:while 40:bound 41:for 42:break
+note 43:ret 44:put 45:free 46:trap 47:global 48:text 49:new 50:view 51:edit 52:own
+note 53:get 54:len 55:read 56:write 57:exit 58:note 59:true 60:false 61:neg 62:not
+note 63:enlarge 64:envcnt 65:envread 66:= 67:( 68:) 69:* 70:main 71:check 72:run 73:call
+
+fn type_word_kw k ulong to ulong
+if le k 8
+ret add k 1
+end
+if ge k 9
+if le k 16
+ret sub k 7
+end
+end
+ret T_NONE
+end
+
+fn type_word off ulong n ulong to ulong
+ret type_word_kw kw_id_of off n
+end
+
+fn op_word_kw k ulong to ulong
+if ge k 17
+if le k 32
+ret sub k 17
+end
+end
+ret 999
+end
+
+fn is_reserved off ulong n ulong to bool
+k = kw_id_of off n
+ret le k 68
+end
+
+fn is_alpha c uchar to bool
+if ge c 97
+if le c 122
+ret true
+end
+end
+if ge c 65
+if le c 90
+ret true
+end
+end
+ret eq c 95
+end
+
+fn is_digit c uchar to bool
+if ge c 48
+if le c 57
+ret true
+end
+end
+ret false
+end
+
+fn is_name off ulong n ulong to bool
+if eq n 0
+ret false
+end
+if not is_alpha get src off
+ret false
+end
+i = ulong 1
+while lt i n bound INF_BOUND
+c = get src add off i
+if not is_alpha c
+if not is_digit c
+ret false
+end
+end
+i = add i 1
+end
+ret true
+end
+
+fn looks_number off ulong n ulong to bool
+if eq n 0
+ret false
+end
+c = get src off
+if is_digit c
+ret true
+end
+ret eq c 45
+end
+
+note Parse decimal number into pr[0]=neg, pr[1]=mag
+fn parse_number off ulong n ulong to void
+p = ulong 0
+negv = ulong 0
+if eq get src off 45
+negv = 1
+p = 1
+end
+if ge p n
+refuse 6
+end
+if eq get src add off p 48
+if lt add p 1 n
+refuse 6
+end
+end
+if gt sub n p 20
+refuse 6
+end
+v = ulong 0
+while lt p n bound 24
+c = get src add off p
+if not is_digit c
+refuse 6
+end
+d = ulong sub c 48
+if gt v div sub U64_MAX d 10
+refuse 8
+end
+v = add mul v 10 d
+p = add p 1
+end
+if eq negv 1
+if eq v 0
+refuse 6
+end
+if gt v I64_MIN_MAG
+refuse 8
+end
+end
+put pr 0 negv
+put pr 1 v
+end
+
+fn fits t ulong negv ulong mag ulong to bool
+if eq t T_BOOL
+if ne negv 0
+ret false
+end
+ret le mag 1
+end
+if tsigned t
+if ne negv 0
+ret le mag add smax_u t 1
+end
+ret le mag smax_u t
+end
+if ne negv 0
+ret false
+end
+ret le mag umax_u t
+end
+
+fn num_value negv ulong mag ulong to ulong
+if ne negv 0
+ret sub ulong 0 mag
+end
+ret mag
+end
+
+note ---- Line splitting ----
+
+fn is_ws c uchar to bool
+if eq c 32
+ret true
+end
+if eq c 9
+ret true
+end
+ret eq c 13
+end
+
+fn is_sep c uchar to bool
+if is_ws c
+ret true
+end
+if eq c 40
+ret true
+end
+ret eq c 41
+end
+
+fn split_words loff ulong llen ulong to ulong
+nw = ulong 0
+i = ulong 0
+while lt i llen bound INF_BOUND
+c = get src add loff i
+if is_ws c
+i = add i 1
+continue
+end
+ensure_tok add nw 1
+if or eq c 40 eq c 41
+put tok_off nw add loff i
+put tok_len nw 1
+nw = add nw 1
+i = add i 1
+continue
+end
+s = i
+while lt i llen bound INF_BOUND
+if is_sep get src add loff i
+break
+end
+i = add i 1
+end
+put tok_off nw add loff s
+put tok_len nw sub i s
+nw = add nw 1
+end
+put gs 3 nw
+put gs 4 0
+ret nw
+end
+
+fn has_tok to bool
+ret lt get gs 4 get gs 3
+end
+
+fn cur_toff to ulong
+ret get tok_off get gs 4
+end
+
+fn cur_tlen to ulong
+ret get tok_len get gs 4
+end
+
+fn adv_tok to void
+put gs 4 add get gs 4 1
+end
+
+note ---- Symbol lookup & scopes ----
+
+fn find_func off ulong n ulong to ulong
+nf = get gs 5
+i = ulong 0
+while lt i nf bound INF_BOUND
+if src_eq get fn_noff i get fn_nlen i off n
+ret i
+end
+i = add i 1
+end
+ret U64_MAX
+end
+
+fn find_global off ulong n ulong to ulong
+ng = get gs 6
+i = ulong 0
+while lt i ng bound INF_BOUND
+if src_eq get gl_noff i get gl_nlen i off n
+ret i
+end
+i = add i 1
+end
+ret U64_MAX
+end
+
+fn find_name off ulong n ulong to ulong
+nn = get gs 10
+if eq nn 0
+ret U64_MAX
+end
+i = nn
+while gt i 0 bound INF_BOUND
+i = sub i 1
+if src_eq get nm_noff i get nm_nlen i off n
+ret i
+end
+end
+ret U64_MAX
+end
+
+fn check_new_name off ulong n ulong to void
+if not is_name off n
+refuse 16
+end
+if is_reserved off n
+refuse 16
+end
+if gt n 63
+refuse 13
+end
+if ne find_func off n U64_MAX
+refuse 10
+end
+if ne find_global off n U64_MAX
+refuse 10
+end
+if ne find_name off n U64_MAX
+refuse 10
+end
+end
+
+fn add_name off ulong n ulong kind ulong ty ulong alen ulong isloop ulong to ulong
+check_new_name off n
+idx = get gs 10
+ensure_nm add idx 1
+put nm_noff idx off
+put nm_nlen idx n
+put nm_kind idx kind
+put nm_ty idx ty
+put nm_len idx alen
+put nm_depth idx get gs 11
+put nm_isloop idx isloop
+sl = get gs 13
+put nm_slot idx sl
+put gs 13 add sl 1
+put gs 10 add idx 1
+ret idx
+end
+
+fn close_scope d ulong to void
+nn = get gs 10
+while gt nn 0 bound INF_BOUND
+if lt get nm_depth sub nn 1 d
+break
+end
+nn = sub nn 1
+end
+put gs 10 nn
+end
+
+note ---- AST node & statement constructors ----
+
+fn new_node kind ulong to ulong
+id = add get gs 20 1
+put gs 20 id
+ensure_nd add id 1
+put nd_kind id kind
+put nd_op id 0
+put nd_ty id T_NONE
+put nd_bare id 0
+put nd_num id 0
+put nd_neg id 0
+put nd_slot id 0
+put nd_akind id 0
+put nd_aidx id 0
+put nd_fn id 0
+put nd_a id 0
+put nd_b id 0
+put nd_c id 0
+put nd_abase id 0
+put nd_line id get gs 1
+ret id
+end
+
+fn new_stmt kind ulong to ulong
+id = add get gs 21 1
+put gs 21 id
+ensure_st add id 1
+put st_kind id kind
+put st_line id get gs 1
+put st_slot id 0
+put st_v id 0
+put st_v2 id 0
+put st_akind id 0
+put st_aidx id 0
+put st_ety id 0
+put st_n id 0
+put st_ckind id 0
+put st_ty id 0
+put st_body id 0
+put st_els id 0
+put st_next id 0
+ret id
+end
+
+note ---- Bare number fixing & unification ----
+
+fn fix_bare nid ulong t ulong to void
+if eq get nd_bare nid 0
+ret
+end
+put nd_bare nid 0
+put nd_ty nid t
+k = get nd_kind nid
+if eq k N_BARE
+negv = get nd_neg nid
+mag = get nd_num nid
+if eq t T_BOOL
+if or ne negv 0 gt mag 1
+refuse 8
+end
+else
+if not tnum t
+refuse 7
+end
+if not fits t negv mag
+refuse 8
+end
+end
+put nd_num nid canon t num_value negv mag
+put nd_kind nid N_NUM
+ret
+end
+if or eq k N_NEG eq k N_NOT
+fix_bare get nd_a nid t
+end
+end
+
+fn unify a ulong b ulong to ulong
+ab = get nd_bare a
+bb = get nd_bare b
+if and ne ab 0 ne bb 0
+refuse 11
+end
+if ne ab 0
+fix_bare a get nd_ty b
+else
+if ne bb 0
+fix_bare b get nd_ty a
+end
+end
+if ne get nd_ty a get nd_ty b
+refuse 7
+end
+ret get nd_ty a
+end
+
+note Parse array ref into pr[2]=akind, pr[3]=aidx, pr[4]=ety, pr[5]=alen, pr[6]=ro, pr[7]=kindout
+fn parse_array_ref to void
+if not has_tok
+refuse 4
+end
+off = cur_toff
+n = cur_tlen
+adv_tok
+if not is_name off n
+refuse 16
+end
+if is_reserved off n
+refuse 3
+end
+ni = find_name off n
+if ne ni U64_MAX
+nk = get nm_kind ni
+if ne nk K_SCALAR
+put pr 2 AK_LOCAL
+put pr 3 get nm_slot ni
+put pr 4 get nm_ty ni
+put pr 5 get nm_len ni
+if eq nk K_VIEW
+put pr 6 1
+else
+put pr 6 0
+end
+put pr 7 nk
+ret
+end
+end
+gi = find_global off n
+if ne gi U64_MAX
+put pr 2 AK_GLOBAL
+put pr 3 gi
+put pr 4 get gl_ety gi
+put pr 5 get gl_len gi
+put pr 6 get gl_istext gi
+put pr 7 99
+ret
+end
+if ne ni U64_MAX
+refuse 7
+end
+if ne find_func off n U64_MAX
+refuse 7
+end
+refuse 3
+end
+
+note ---- Value parsing ----
+
+fn parse_call_args fi ulong abase ulong to void
+np = get fn_np fi
+i = ulong 0
+while lt i np bound 8
+pk = get fn_pkind add mul fi 6 i
+pty = get fn_pty add mul fi 6 i
+if eq pk PK_SCALAR
+if not has_tok
+refuse 4
+end
+an = parse_value pty
+fix_bare an pty
+if ne get nd_ty an pty
+refuse 7
+end
+put ca_node add abase i an
+put ca_akind add abase i 0
+put ca_aidx add abase i 0
+else
+parse_call_arr_arg fi i abase pk pty
+end
+i = add i 1
+end
+end
+
+fn parse_call fi ulong want_void ulong to ulong
+fret = get fn_ret fi
+if eq want_void 0
+if eq fret T_VOID
+refuse 7
+end
+else
+if ne fret T_VOID
+refuse 7
+end
+end
+cf = get gs 12
+put fn_hascall cf 1
+if eq get gs 8 0
+if eq cf fi
+refuse 9
+end
+end
+eid = add get gs 23 1
+put gs 23 eid
+ensure_edge add eid 1
+put edge_to eid fi
+put edge_next eid get fn_ehead cf
+put fn_ehead cf eid
+nid = new_node N_CALL
+put nd_fn nid fi
+put nd_ty nid fret
+np = get fn_np fi
+abase = get gs 22
+put nd_abase nid abase
+put gs 22 add abase np
+ensure_ca add abase np
+parse_call_args fi abase
+ret nid
+end
+
+fn check_dup_arr_arg fi ulong i ulong abase ulong rk ulong ri ulong to void
+j = ulong 0
+while lt j i bound 8
+if ne get fn_pkind add mul fi 6 j PK_SCALAR
+if eq get ca_akind add abase j rk
+if eq get ca_aidx add abase j ri
+refuse 19
+end
+end
+end
+j = add j 1
+end
+end
+
+fn parse_call_arr_arg fi ulong i ulong abase ulong pk ulong pty ulong to void
+if not has_tok
+refuse 4
+end
+as_m = ulong 99
+if eq kw_id_of cur_toff cur_tlen 50
+as_m = PK_VIEW
+adv_tok
+else
+if eq kw_id_of cur_toff cur_tlen 51
+as_m = PK_EDIT
+adv_tok
+else
+if eq kw_id_of cur_toff cur_tlen 52
+refuse 9
+end
+end
+end
+if not has_tok
+refuse 4
+end
+if ne find_global cur_toff cur_tlen U64_MAX
+if eq get gl_istext find_global cur_toff cur_tlen 0
+refuse 19
+end
+end
+parse_array_ref
+if ne get pr 4 pty
+refuse 7
+end
+if ne get pr 5 get fn_plen add mul fi 6 i
+refuse 7
+end
+if eq as_m PK_EDIT
+if ne get pr 6 0
+refuse 20
+end
+end
+if eq pk PK_EDIT
+if or ne get pr 6 0 eq as_m PK_VIEW
+refuse 20
+end
+end
+check_dup_arr_arg fi i abase get pr 2 get pr 3
+put ca_node add abase i 0
+put ca_akind add abase i get pr 2
+put ca_aidx add abase i get pr 3
+end
+
+fn parse_val_op op ulong to ulong
+a = parse_value T_NONE
+b = parse_value T_NONE
+if or eq op OP_SHL eq op OP_SHR
+if and ne get nd_bare a 0 ne get nd_bare b 0
+refuse 11
+end
+if ne get nd_bare a 0
+fix_bare a get nd_ty b
+end
+if ne get nd_bare b 0
+fix_bare b get nd_ty a
+end
+if or not tnum get nd_ty a not tnum get nd_ty b
+refuse 7
+end
+nid = new_node N_BIN
+put nd_ty nid get nd_ty a
+put nd_op nid op
+put nd_a nid a
+put nd_b nid b
+ret nid
+end
+t = unify a b
+nid = ulong 0
+if ge op OP_EQ
+nid = new_node N_CMP
+put nd_ty nid T_BOOL
+if eq t T_BOOL
+if and ne op OP_EQ ne op OP_NE
+refuse 7
+end
+end
+else
+nid = new_node N_BIN
+put nd_ty nid t
+if eq t T_BOOL
+if and ne op OP_AND and ne op OP_OR ne op OP_XOR
+refuse 7
+end
+end
+end
+put nd_op nid op
+put nd_a nid a
+put nd_b nid b
+ret nid
+end
+
+fn parse_val_get to ulong
+nid = new_node N_GET
+parse_array_ref
+put nd_akind nid get pr 2
+put nd_aidx nid get pr 3
+put nd_ty nid get pr 4
+alen = get pr 5
+idx = parse_value T_NONE
+put nd_a nid idx
+if ne get nd_bare idx 0
+if ne get nd_neg idx 0
+refuse 8
+end
+if ne alen U64_MAX
+if ge get nd_num idx alen
+refuse 21
+end
+end
+fix_bare idx T_U64
+end
+if not tnum get nd_ty idx
+refuse 7
+end
+ret nid
+end
+
+fn parse_val_rw is_read ulong to ulong
+nid = ulong 0
+if ne is_read 0
+nid = new_node N_READ
+else
+nid = new_node N_WRITE
+end
+fdn = parse_value T_I32
+fix_bare fdn T_I32
+if ne get nd_ty fdn T_I32
+refuse 7
+end
+put nd_a nid fdn
+parse_array_ref
+if ne is_read 0
+if ne get pr 6 0
+refuse 20
+end
+end
+if ne get pr 4 T_U8
+refuse 7
+end
+put nd_akind nid get pr 2
+put nd_aidx nid get pr 3
+bn = parse_value T_U64
+fix_bare bn T_U64
+cn = parse_value T_U64
+fix_bare cn T_U64
+if or ne get nd_ty bn T_U64 ne get nd_ty cn T_U64
+refuse 7
+end
+put nd_b nid bn
+put nd_c nid cn
+put nd_ty nid T_I64
+ret nid
+end
+
+fn parse_val_enlarge to ulong
+if or eq get gs 15 0 ne get gs 14 1
+refuse 9
+end
+nid = new_node N_ENLARGE
+put nd_ty nid T_I64
+if not has_tok
+refuse 7
+end
+gi = find_global cur_toff cur_tlen
+adv_tok
+if or eq gi U64_MAX ne get gl_len gi U64_MAX
+refuse 7
+end
+put nd_akind nid AK_GLOBAL
+put nd_aidx nid gi
+an = parse_value T_U64
+fix_bare an T_U64
+if ne get nd_ty an T_U64
+refuse 7
+end
+put nd_a nid an
+ret nid
+end
+
+fn parse_val_envread to ulong
+nid = new_node N_ENVREAD
+put nd_ty nid T_I64
+an = parse_value T_U64
+fix_bare an T_U64
+parse_array_ref
+if ne get pr 6 0
+refuse 20
+end
+if or ne get pr 4 T_U8 eq get pr 5 U64_MAX
+refuse 7
+end
+put nd_akind nid get pr 2
+put nd_aidx nid get pr 3
+bn = parse_value T_U64
+fix_bare bn T_U64
+cn = parse_value T_U64
+fix_bare cn T_U64
+if ne get nd_ty an T_U64
+refuse 7
+end
+if ne get nd_ty bn T_U64
+refuse 7
+end
+if ne get nd_ty cn T_U64
+refuse 7
+end
+put nd_a nid an
+put nd_b nid bn
+put nd_c nid cn
+ret nid
+end
+
+fn parse_val_ident off ulong n ulong to ulong
+fi = find_func off n
+ni = find_name off n
+if ne ni U64_MAX
+if ne get nm_kind ni K_SCALAR
+refuse 7
+end
+nid = new_node N_VAR
+put nd_slot nid get nm_slot ni
+put nd_ty nid get nm_ty ni
+ret nid
+end
+if ne fi U64_MAX
+ret parse_call fi 0
+end
+if ne find_global off n U64_MAX
+refuse 7
+end
+if and is_name off n not is_reserved off n
+refuse 3
+end
+if looks_number off n
+refuse 6
+end
+refuse 16
+ret 0
+end
+
+fn parse_value want ulong to ulong
+if not has_tok
+refuse 4
+end
+off = cur_toff
+n = cur_tlen
+adv_tok
+put gs 14 add get gs 14 1
+k = kw_id_of off n
+nid = ulong 0
+if eq k 67
+nid = parse_value want
+if not has_tok
+refuse 4
+end
+if ne kw_id_of cur_toff cur_tlen 68
+refuse 5
+end
+adv_tok
+else
+if eq k 68
+refuse 5
+else
+if looks_number off n
+nid = new_node N_BARE
+parse_number off n
+put nd_neg nid get pr 0
+put nd_num nid get pr 1
+put nd_bare nid 1
+put nd_ty nid T_NONE
+else
+if or eq k 59 eq k 60
+nid = new_node N_NUM
+put nd_ty nid T_BOOL
+if eq k 59
+put nd_num nid 1
+else
+put nd_num nid 0
+end
+else
+op = op_word_kw k
+if ne op 999
+nid = parse_val_op op
+else
+nid = parse_value_ext off n k want
+end
+end
+end
+end
+end
+put gs 14 sub get gs 14 1
+ret nid
+end
+
+fn parse_value_ext off ulong n ulong k ulong want ulong to ulong
+if or eq k 61 eq k 62
+a = parse_value want
+nid = ulong 0
+if eq k 61
+nid = new_node N_NEG
+else
+nid = new_node N_NOT
+end
+put nd_a nid a
+put nd_ty nid get nd_ty a
+put nd_bare nid get nd_bare a
+if eq get nd_bare a 0
+aty = get nd_ty a
+if eq k 61
+if not tnum aty
+refuse 7
+end
+else
+if and not tnum aty ne aty T_BOOL
+refuse 7
+end
+end
+end
+ret nid
+end
+t = type_word_kw k
+if ne t T_NONE
+a = parse_value t
+if ne get nd_bare a 0
+fix_bare a t
+ret a
+end
+aty = get nd_ty a
+if or eq t T_BOOL eq aty T_BOOL
+refuse 9
+end
+if not tnum aty
+refuse 7
+end
+nid = new_node N_CONV
+put nd_a nid a
+put nd_ty nid t
+ret nid
+end
+if eq k 53
+ret parse_val_get
+end
+if eq k 54
+nid = new_node N_LEN
+parse_array_ref
+put nd_akind nid get pr 2
+put nd_aidx nid get pr 3
+put nd_ty nid T_U64
+put nd_num nid get pr 5
+ret nid
+end
+if eq k 55
+ret parse_val_rw 1
+end
+if eq k 56
+ret parse_val_rw 0
+end
+if eq k 63
+ret parse_val_enlarge
+end
+if eq k 64
+nid = new_node N_ENVCNT
+put nd_ty nid T_I64
+ret nid
+end
+if eq k 65
+ret parse_val_envread
+end
+if or eq k 49 eq k 52
+refuse 9
+end
+if or eq k 50 eq k 51
+refuse 16
+end
+ret parse_val_ident off n
+end
+
+fn place_check nid ulong want ulong to void
+if ne get nd_bare nid 0
+if eq want T_NONE
+refuse 11
+end
+fix_bare nid want
+end
+if ne want T_NONE
+if ne get nd_ty nid want
+refuse 7
+end
+end
+end
+
+fn value_for want ulong to ulong
+put gs 14 0
+nid = parse_value want
+if ne get nd_bare nid 0
+if eq want T_NONE
+refuse 11
+end
+end
+np = get gs 16
+put pend_node np nid
+put pend_want np want
+put gs 16 add np 1
+ret nid
+end
+
+fn line_end to void
+if has_tok
+refuse 5
+end
+np = get gs 16
+i = ulong 0
+while lt i np bound 8
+place_check get pend_node i get pend_want i
+i = add i 1
+end
+put gs 16 0
+end
+
+note ---- Blocks & Statements ----
+
+fn push_stmt sid ulong to void
+bi = sub get gs 17 1
+if ne get blk_ended bi 0
+refuse 17
+end
+tl = get blk_tail bi
+if eq tl 0
+bk = get blk_kind bi
+ow = get blk_owner bi
+if eq bk 0
+put fn_body get gs 12 sid
+else
+if eq bk 2
+put st_els ow sid
+else
+put st_body ow sid
+end
+end
+else
+put st_next tl sid
+end
+put blk_tail bi sid
+end
+
+fn open_block bk ulong owner ulong to void
+nb = get gs 17
+ensure_blk add nb 1
+put blk_kind nb bk
+put blk_owner nb owner
+put blk_tail nb 0
+put blk_ended nb 0
+put blk_then_ended nb 0
+put gs 17 add nb 1
+put gs 11 add get gs 11 1
+end
+
+fn local_arr_ok add_b ulong to bool
+nb = add get gs 18 add_b
+put gs 18 nb
+ret le nb MAX_LOCAL_ARR_BYTES
+end
+
+fn parse_stmt_if_while is_if ulong to void
+sid = ulong 0
+if ne is_if 0
+sid = new_stmt S_IF
+else
+sid = new_stmt S_WHILE
+end
+vn = value_for T_BOOL
+put st_v sid vn
+put gs 16 sub get gs 16 1
+place_check vn T_BOOL
+if eq is_if 0
+put st_n sid LOOP_MAX
+if has_tok
+if eq kw_id_of cur_toff cur_tlen 40
+adv_tok
+if not has_tok
+refuse 4
+end
+boff = cur_toff
+blen = cur_tlen
+adv_tok
+if is_reserved boff blen
+refuse 16
+end
+if and not is_name boff blen not looks_number boff blen
+refuse 16
+end
+if not looks_number boff blen
+refuse 6
+end
+parse_number boff blen
+if ne get pr 0 0
+refuse 8
+end
+if lt get pr 1 1
+refuse 8
+end
+if gt get pr 1 I64_MAX_U
+refuse 8
+end
+put st_n sid get pr 1
+end
+end
+end
+line_end
+push_stmt sid
+if ne is_if 0
+open_block 1 sid
+else
+open_block 3 sid
+end
+end
+
+fn parse_stmt_for to void
+sid = new_stmt S_FOR
+if not has_tok
+refuse 4
+end
+noff = cur_toff
+nlen = cur_tlen
+adv_tok
+if not has_tok
+refuse 4
+end
+toff = cur_toff
+tlen = cur_tlen
+adv_tok
+t = type_word toff tlen
+if eq t T_NONE
+refuse 16
+end
+if not tnum t
+refuse 7
+end
+put st_ty sid t
+if not has_tok
+refuse 4
+end
+coff = cur_toff
+clen = cur_tlen
+is_last = eq add get gs 4 1 get gs 3
+if and looks_number coff clen is_last
+adv_tok
+parse_number coff clen
+if not fits t get pr 0 get pr 1
+refuse 8
+end
+put st_ckind sid 0
+put st_n sid get pr 1
+else
+ni = find_name coff clen
+ck = ulong 2
+if and ne ni U64_MAX is_last
+if eq get nm_kind ni K_SCALAR
+ck = 1
+end
+end
+put st_ckind sid ck
+put st_v sid value_for t
+end
+line_end
+push_stmt sid
+open_block 4 sid
+lvi = add_name noff nlen K_SCALAR t 0 1
+put st_slot sid get nm_slot lvi
+end
+
+fn parse_stmt_put to void
+sid = new_stmt S_PUT
+parse_array_ref
+if ne get pr 6 0
+refuse 20
+end
+put st_akind sid get pr 2
+put st_aidx sid get pr 3
+ety = get pr 4
+alen = get pr 5
+put gs 14 0
+idx = parse_value T_NONE
+put st_v sid idx
+if ne get nd_bare idx 0
+if ne get nd_neg idx 0
+refuse 8
+end
+if ne alen U64_MAX
+if ge get nd_num idx alen
+refuse 21
+end
+end
+fix_bare idx T_U64
+end
+if not tnum get nd_ty idx
+refuse 7
+end
+put st_v2 sid value_for ety
+line_end
+push_stmt sid
+end
+
+fn parse_stmt_new off ulong n ulong ni ulong to void
+adv_tok
+if ne ni U64_MAX
+refuse 10
+end
+if ne get gs 11 1
+refuse 9
+end
+if not has_tok
+refuse 4
+end
+t = type_word cur_toff cur_tlen
+adv_tok
+if not has_tok
+refuse 4
+end
+if eq t T_NONE
+refuse 16
+end
+if not tnum t
+refuse 7
+end
+if not looks_number cur_toff cur_tlen
+refuse 16
+end
+parse_number cur_toff cur_tlen
+adv_tok
+mag = get pr 1
+if or ne get pr 0 0 lt mag 1
+refuse 8
+end
+if gt mag div MAX_LOCAL_ARR_BYTES tbytes t
+refuse 23
+end
+if not local_arr_ok mul mag tbytes t
+refuse 23
+end
+sid = new_stmt S_NEW
+put st_ety sid t
+put st_n sid mag
+put st_v sid value_for t
+line_end
+push_stmt sid
+put st_slot sid get nm_slot add_name off n K_OWN t mag 0
+end
+
+fn parse_stmt_assign off ulong n ulong to void
+if ne find_global off n U64_MAX
+refuse 7
+end
+if or not is_name off n is_reserved off n
+if looks_number off n
+parse_number off n
+end
+refuse 16
+end
+if has_tok
+if eq kw_id_of cur_toff cur_tlen 66
+adv_tok
+end
+end
+if not has_tok
+refuse 4
+end
+ni = find_name off n
+pk = kw_id_of cur_toff cur_tlen
+if eq pk 49
+parse_stmt_new off n ni
+ret
+end
+sid = new_stmt S_ASSIGN
+if eq pk 63
+put gs 15 1
+else
+put gs 15 0
+end
+if ne ni U64_MAX
+if ne get nm_kind ni K_SCALAR
+refuse 7
+end
+put st_v sid value_for get nm_ty ni
+put st_slot sid get nm_slot ni
+line_end
+push_stmt sid
+else
+check_new_name off n
+vn = value_for T_NONE
+put st_v sid vn
+line_end
+if eq get nd_ty vn T_VOID
+refuse 7
+end
+push_stmt sid
+ai = add_name off n K_SCALAR get nd_ty vn 0 0
+put st_slot sid get nm_slot ai
+end
+end
+
+fn parse_statement to void
+put gs 15 0
+off = cur_toff
+n = cur_tlen
+adv_tok
+bi = sub get gs 17 1
+if looks_number off n
+refuse 16
+end
+k = kw_id_of off n
+if ne get blk_ended bi 0
+if and ne k 36 ne k 38
+refuse 17
+end
+end
+if eq k 36
+line_end
+ended = get blk_ended bi
+close_scope get gs 11
+put gs 11 sub get gs 11 1
+bk = get blk_kind bi
+if eq bk 0
+cf = get gs 12
+if and eq ended 0 ne get fn_ret cf T_VOID
+refuse 18
+end
+put fn_done cf 1
+put fn_nslots cf get gs 13
+put gs 17 sub get gs 17 1
+ret
+end
+put gs 17 sub get gs 17 1
+if eq bk 2
+if ne ended 0
+if ne get blk_then_ended bi 0
+put blk_ended sub get gs 17 1 1
+end
+end
+end
+ret
+end
+if eq k 38
+if ne get blk_kind bi 1
+refuse 15
+end
+line_end
+ended = get blk_ended bi
+close_scope get gs 11
+put blk_kind bi 2
+put blk_ended bi 0
+put blk_then_ended bi ended
+put blk_tail bi 0
+ret
+end
+if eq k 58
+ret
+end
+if eq k 37
+parse_stmt_if_while 1
+ret
+end
+if eq k 39
+parse_stmt_if_while 0
+ret
+end
+if eq k 41
+parse_stmt_for
+ret
+end
+if or eq k 42 eq k 46
+refuse 9
+end
+if or eq k 45 eq k 52
+refuse 9
+end
+if eq k 43
+sid = new_stmt S_RET
+fret = get fn_ret get gs 12
+if eq fret T_VOID
+if has_tok
+refuse 7
+end
+else
+if not has_tok
+refuse 4
+end
+put st_v sid value_for fret
+end
+line_end
+push_stmt sid
+put blk_ended bi 1
+ret
+end
+if eq k 57
+sid = new_stmt S_EXIT
+put st_v sid value_for T_I32
+line_end
+push_stmt sid
+put blk_ended bi 1
+ret
+end
+if eq k 44
+parse_stmt_put
+ret
+end
+fi = find_func off n
+if ne fi U64_MAX
+sid = new_stmt S_CALL
+put gs 14 0
+put st_v sid parse_call fi 1
+line_end
+push_stmt sid
+ret
+end
+parse_stmt_assign off n
+end
+
+note ---- Function signatures, globals, and program parser ----
+
+fn parse_fn_arr_param pidx ulong tk ulong poff ulong plen ulong to void
+if eq tk 50
+put fn_pkind pidx PK_VIEW
+else
+put fn_pkind pidx PK_EDIT
+end
+if not has_tok
+refuse 16
+end
+et = type_word cur_toff cur_tlen
+adv_tok
+if eq et T_NONE
+refuse 16
+end
+if not tnum et
+refuse 7
+end
+if not has_tok
+refuse 16
+end
+if not looks_number cur_toff cur_tlen
+refuse 16
+end
+parse_number cur_toff cur_tlen
+adv_tok
+if ne get pr 0 0
+refuse 8
+end
+if lt get pr 1 1
+refuse 8
+end
+if gt get pr 1 MAX_POOL_ELEMS
+refuse 8
+end
+put fn_pty pidx et
+put fn_plen pidx get pr 1
+if eq tk 50
+ig = add_name poff plen K_VIEW et get pr 1 0
+else
+ig = add_name poff plen K_EDIT et get pr 1 0
+end
+end
+
+fn parse_fn_one_param fi ulong is_main bool noff ulong nlen ulong to bool
+if not has_tok
+refuse 4
+end
+poff = cur_toff
+plen = cur_tlen
+adv_tok
+if eq kw_id_of poff plen 34
+ret false
+end
+np = get fn_np fi
+if ge np 6
+refuse 9
+end
+if src_eq poff plen noff nlen
+refuse 10
+end
+check_new_name poff plen
+if is_main
+refuse 9
+end
+if not has_tok
+refuse 4
+end
+toff = cur_toff
+tlen = cur_tlen
+adv_tok
+put fn_np fi add np 1
+tk = kw_id_of toff tlen
+pidx = add mul fi 6 np
+if or eq tk 50 eq tk 51
+parse_fn_arr_param pidx tk poff plen
+ret true
+end
+if eq tk 52
+refuse 9
+end
+t = type_word_kw tk
+if eq t T_NONE
+refuse 16
+end
+put fn_pkind pidx PK_SCALAR
+put fn_pty pidx t
+put fn_plen pidx 0
+ig = add_name poff plen K_SCALAR t 0 0
+ret true
+end
+
+fn parse_fn_sig fi ulong prepass ulong to void
+if not has_tok
+refuse 4
+end
+noff = cur_toff
+nlen = cur_tlen
+adv_tok
+if ne prepass 0
+if or not is_name noff nlen is_reserved noff nlen
+refuse 16
+end
+if gt nlen 63
+refuse 13
+end
+if ne find_func noff nlen U64_MAX
+refuse 10
+end
+put fn_noff fi noff
+put fn_nlen fi nlen
+put fn_np fi 0
+put fn_ret fi T_NONE
+put fn_body fi 0
+put fn_nslots fi 0
+put fn_hascall fi 0
+put fn_done fi 0
+put fn_sigline fi get gs 1
+put fn_ehead fi 0
+else
+if ne find_global noff nlen U64_MAX
+refuse 10
+end
+put fn_np fi 0
+end
+put gs 12 fi
+put gs 10 0
+put gs 13 0
+put gs 11 0
+put gs 18 0
+is_main = eq kw_id_of noff nlen 70
+while parse_fn_one_param fi is_main noff nlen bound 32
+end
+if not has_tok
+refuse 4
+end
+rk = kw_id_of cur_toff cur_tlen
+adv_tok
+if eq rk 35
+put fn_ret fi T_VOID
+else
+rt = type_word_kw rk
+if eq rt T_NONE
+refuse 16
+end
+put fn_ret fi rt
+end
+line_end
+if ne prepass 0
+ret
+end
+put gs 17 0
+open_block 0 0
+end
+
+fn parse_global_pool gi ulong to void
+if not has_tok
+refuse 4
+end
+t = type_word cur_toff cur_tlen
+adv_tok
+if eq t T_NONE
+refuse 16
+end
+if not tnum t
+refuse 7
+end
+if not has_tok
+refuse 16
+end
+if eq kw_id_of cur_toff cur_tlen 69
+adv_tok
+line_end
+put gl_ety gi t
+put gl_len gi U64_MAX
+put gl_istext gi 0
+aid = alloc_arr t 0 0 0
+put gl_aid gi aid
+ret
+end
+if not looks_number cur_toff cur_tlen
+refuse 16
+end
+parse_number cur_toff cur_tlen
+adv_tok
+negv = get pr 0
+mag = get pr 1
+if or ne negv 0 lt mag 1
+refuse 8
+end
+if gt mag MAX_POOL_ELEMS
+refuse 23
+end
+line_end
+nb = mul mag tbytes t
+pb = add get gs 7 nb
+if gt pb MAX_POOL_BYTES
+refuse 23
+end
+put gs 7 pb
+put gl_ety gi t
+put gl_len gi mag
+put gl_istext gi 0
+aid = alloc_arr t mag 0 0
+off = alloc_mem_bytes nb
+put arr_off aid off
+put arr_cap aid nb
+put gl_aid gi aid
+end
+
+fn parse_global_text gi ulong loff ulong llen ulong to void
+q = ulong 0
+found = false
+while lt q llen bound INF_BOUND
+if eq get src add loff q 34
+found = true
+break
+end
+q = add q 1
+end
+if not found
+refuse 22
+end
+p = add q 1
+start_off = get gs 25
+tlen = ulong 0
+closed = false
+while lt p llen bound INF_BOUND
+c = get src add loff p
+p = add p 1
+if eq c 34
+closed = true
+break
+end
+if eq c 92
+if ge p llen
+break
+end
+x = get src add loff p
+p = add p 1
+if eq x 110
+c = 10
+else
+if eq x 116
+c = 9
+else
+if eq x 92
+c = 92
+else
+if eq x 34
+c = 34
+else
+refuse 22
+end
+end
+end
+end
+end
+bo = alloc_mem_bytes 1
+put mem_pool bo c
+tlen = add tlen 1
+end
+if not closed
+refuse 22
+end
+while lt p llen bound INF_BOUND
+rc = get src add loff p
+if and ne rc 32 and ne rc 9 ne rc 13
+refuse 5
+end
+p = add p 1
+end
+put gl_ety gi T_U8
+put gl_len gi tlen
+put gl_istext gi 1
+aid = alloc_arr T_U8 tlen 1 0
+put arr_off aid start_off
+put arr_cap aid tlen
+put gl_aid gi aid
+end
+
+fn parse_global is_text ulong loff ulong llen ulong to void
+ng = get gs 6
+if eq ng 0
+put gs 9 get gs 1
+end
+if not has_tok
+refuse 4
+end
+noff = cur_toff
+nlen = cur_tlen
+adv_tok
+check_new_name noff nlen
+ensure_gl add ng 1
+put gl_noff ng noff
+put gl_nlen ng nlen
+if eq is_text 0
+parse_global_pool ng
+else
+parse_global_text ng loff llen
+end
+put gs 6 add ng 1
+end
+
+fn find_cycle f ulong to ulong
+if ne get fn_onpath f 0
+ret f
+end
+if ne get fn_visited f 0
+ret U64_MAX
+end
+put fn_visited f 1
+put fn_onpath f 1
+e = get fn_ehead f
+while ne e 0 bound INF_BOUND
+c = find_cycle get edge_to e
+if ne c U64_MAX
+ret c
+end
+e = get edge_next e
+end
+put fn_onpath f 0
+ret U64_MAX
+end
+
+fn find_nl pos ulong slen ulong to ulong
+i = pos
+while lt i slen bound INF_BOUND
+if eq get src i 10
+ret i
+end
+i = add i 1
+end
+ret slen
+end
+
+fn parse_prog_pass1 to void
+slen = get gs 0
+pos = ulong 0
+put gs 1 0
+while lt pos slen bound INF_BOUND
+nl = find_nl pos slen
+llen = sub nl pos
+loff = pos
+if lt nl slen
+pos = add nl 1
+else
+pos = slen
+end
+put gs 1 add get gs 1 1
+nw = split_words loff llen
+if eq nw 0
+continue
+end
+if ne kw_id_of get tok_off 0 get tok_len 0 33
+continue
+end
+if ge nw 2
+if eq kw_id_of get tok_off 1 get tok_len 1 70
+put gs 8 1
+end
+end
+nf = get gs 5
+ensure_fn add nf 1
+put gs 4 1
+parse_fn_sig nf 1
+put gs 5 add nf 1
+end
+end
+
+fn parse_prog_pass2 to void
+slen = get gs 0
+pos = ulong 0
+put gs 1 0
+infn = ulong 0
+while lt pos slen bound INF_BOUND
+nl = find_nl pos slen
+llen = sub nl pos
+loff = pos
+if lt nl slen
+pos = add nl 1
+else
+pos = slen
+end
+put gs 1 add get gs 1 1
+nw = split_words loff llen
+if eq nw 0
+continue
+end
+w0_off = get tok_off 0
+w0_len = get tok_len 0
+k0 = kw_id_of w0_off w0_len
+if eq infn 0
+put gs 4 1
+if eq k0 33
+fs = get gs 19
+put gs 19 add fs 1
+parse_fn_sig fs 0
+infn = 1
+else
+if eq k0 47
+parse_global 0 loff llen
+else
+if eq k0 48
+parse_global 1 loff llen
+else
+if eq k0 58
+continue
+else
+if looks_number w0_off w0_len
+parse_number w0_off w0_len
+refuse 16
+else
+if is_name w0_off w0_len
+if not is_reserved w0_off w0_len
+if gt w0_len 8
+refuse 13
+end
+end
+end
+refuse 16
+end
+end
+end
+end
+end
+continue
+end
+if or eq k0 33 eq k0 47
+refuse 15
+end
+if eq k0 48
+refuse 15
+end
+parse_statement
+if ne get fn_done get gs 12 0
+infn = 0
+end
+end
+if ne infn 0
+refuse 15
+end
+end
+
+fn parse_program to void
+parse_prog_pass1
+put gs 10 0
+put gs 13 0
+put gs 11 0
+put gs 12 0
+put gs 19 0
+parse_prog_pass2
+if and eq get gs 8 0 gt get gs 6 0
+put gs 1 get gs 9
+refuse 9
+end
+if eq get gs 8 0
+slen = get gs 0
+f = ulong 0
+nf = get gs 5
+while lt f nf bound INF_BOUND
+c = find_cycle f
+if ne c U64_MAX
+ln = ulong 1
+j = ulong 0
+while lt j slen bound INF_BOUND
+if eq get src j 10
+ln = add ln 1
+end
+j = add j 1
+end
+put gs 1 ln
+refuse 9
+end
+f = add f 1
+end
+end
+if eq get gs 5 0
+refuse 16
+end
+end
+
+note ---- Runtime array access ----
+
+fn aref akind ulong aidx ulong fp ulong to ulong
+if eq akind AK_GLOBAL
+ret get gl_aid aidx
+end
+ret get fr_arrs add fp aidx
+end
+
+fn check_index ity ulong idx ulong alen ulong to ulong
+if tsigned ity
+if ge idx I64_MIN_MAG
+do_trap 3
+ret 0
+end
+end
+if ge idx alen
+do_trap 3
+ret 0
+end
+ret idx
+end
+
+fn pool_ld_u8 sp ulong off ulong to ulong
+if eq sp 0
+ret ulong get mem_pool off
+end
+ret ulong get loc_pool off
+end
+
+fn pool_st_u8 sp ulong off ulong v uchar to void
+if eq sp 0
+put mem_pool off v
+else
+put loc_pool off v
+end
+end
+
+fn pool_ld_u32 sp ulong base ulong to ulong
+v = pool_ld_u8 sp base
+v = or v shl pool_ld_u8 sp add base 1 8
+v = or v shl pool_ld_u8 sp add base 2 16
+v = or v shl pool_ld_u8 sp add base 3 24
+ret v
+end
+
+fn arr_get aid ulong idx ulong to ulong
+ety = get arr_ety aid
+tb = tbytes ety
+base = add get arr_off aid mul idx tb
+sp = get arr_space aid
+v = ulong 0
+if eq tb 1
+v = pool_ld_u8 sp base
+else
+if eq tb 2
+v = or pool_ld_u8 sp base shl pool_ld_u8 sp add base 1 8
+else
+if eq tb 4
+v = pool_ld_u32 sp base
+else
+lo = pool_ld_u32 sp base
+hi = pool_ld_u32 sp add base 4
+v = or lo shl hi 32
+end
+end
+end
+ret canon ety v
+end
+
+fn arr_put aid ulong idx ulong v ulong to void
+ety = get arr_ety aid
+tb = tbytes ety
+base = add get arr_off aid mul idx tb
+sp = get arr_space aid
+pool_st_u8 sp base uchar and v 255
+if ge tb 2
+pool_st_u8 sp add base 1 uchar and shr v 8 255
+end
+if ge tb 4
+pool_st_u8 sp add base 2 uchar and shr v 16 255
+pool_st_u8 sp add base 3 uchar and shr v 24 255
+end
+if eq tb 8
+pool_st_u8 sp add base 4 uchar and shr v 32 255
+pool_st_u8 sp add base 5 uchar and shr v 40 255
+pool_st_u8 sp add base 6 uchar and shr v 48 255
+pool_st_u8 sp add base 7 uchar and shr v 56 255
+end
+end
+
+note ---- Runtime arithmetic, shifts, comparisons, conversions ----
+
+fn check_srange t ulong r long to ulong
+if or lt r smin_l t gt r smax_l t
+do_trap 1
+ret 0
+end
+ret canon t l2u r
+end
+
+fn smul_ovf a long b long to bool
+if or eq a 0 eq b 0
+ret false
+end
+if and eq a long -9223372036854775808 eq b long -1
+ret true
+end
+if and eq b long -9223372036854775808 eq a long -1
+ret true
+end
+au = l2u a
+bu = l2u b
+if lt a 0
+au = sub ulong 0 au
+end
+if lt b 0
+bu = sub ulong 0 bu
+end
+if gt au div I64_MIN_MAG bu
+ret true
+end
+prod = mul au bu
+neg_res = ne lt a 0 lt b 0
+if neg_res
+ret gt prod I64_MIN_MAG
+end
+ret gt prod I64_MAX_U
+end
+
+fn arith_s op ulong t ulong x ulong y ulong to ulong
+a = u2l x
+b = u2l y
+if eq op OP_ADD
+if gt b 0
+if gt a sub long 9223372036854775807 b
+do_trap 1
+ret 0
+end
+end
+if lt b 0
+if lt a sub long -9223372036854775808 b
+do_trap 1
+ret 0
+end
+end
+ret check_srange t add a b
+end
+if eq op OP_SUB
+if lt b 0
+if gt a add long 9223372036854775807 b
+do_trap 1
+ret 0
+end
+end
+if gt b 0
+if lt a add long -9223372036854775808 b
+do_trap 1
+ret 0
+end
+end
+ret check_srange t sub a b
+end
+if eq op OP_MUL
+if smul_ovf a b
+do_trap 1
+ret 0
+end
+ret check_srange t mul a b
+end
+if eq op OP_DIV
+if eq b 0
+do_trap 2
+ret 0
+end
+if and eq a smin_l t eq b long -1
+do_trap 1
+ret 0
+end
+ret canon t l2u div a b
+end
+if eq op OP_REM
+if eq b 0
+do_trap 2
+ret 0
+end
+if eq b long -1
+ret 0
+end
+ret canon t l2u rem a b
+end
+if eq op OP_AND
+ret and x y
+end
+if eq op OP_OR
+ret or x y
+end
+ret xor x y
+end
+
+fn arith op ulong t ulong x ulong y ulong to ulong
+if eq t T_BOOL
+if eq op OP_AND
+ret and x y
+end
+if eq op OP_OR
+ret or x y
+end
+ret xor x y
+end
+if tsigned t
+ret arith_s op t x y
+end
+if eq op OP_ADD
+ret canon t add x y
+end
+if eq op OP_SUB
+ret canon t sub x y
+end
+if eq op OP_MUL
+ret canon t mul x y
+end
+if eq op OP_DIV
+if eq y 0
+do_trap 2
+ret 0
+end
+ret div x y
+end
+if eq op OP_REM
+if eq y 0
+do_trap 2
+ret 0
+end
+ret rem x y
+end
+if eq op OP_AND
+ret and x y
+end
+if eq op OP_OR
+ret or x y
+end
+ret xor x y
+end
+
+fn shift_op op ulong t ulong x ulong st ulong s ulong to ulong
+w = twidth t
+if tsigned st
+if ge s I64_MIN_MAG
+do_trap 7
+ret 0
+end
+end
+if ge s w
+do_trap 7
+ret 0
+end
+if eq op OP_SHR
+if tsigned t
+ret canon t l2u shr u2l x s
+end
+ret shr x s
+end
+if not tsigned t
+ret canon t shl x s
+end
+a = u2l x
+if eq s 0
+ret canon t x
+end
+sh_u = shl x s
+sh_l = u2l sh_u
+if ne shr sh_l s a
+do_trap 1
+ret 0
+end
+ret check_srange t sh_l
+end
+
+fn compare_op op ulong t ulong x ulong y ulong to ulong
+eqv = eq x y
+ltv = false
+if tsigned t
+ltv = lt u2l x u2l y
+else
+ltv = lt x y
+end
+if eq op OP_EQ
+if eqv
+ret 1
+end
+ret 0
+end
+if eq op OP_NE
+if eqv
+ret 0
+end
+ret 1
+end
+if eq op OP_LT
+if ltv
+ret 1
+end
+ret 0
+end
+if eq op OP_LE
+if or ltv eqv
+ret 1
+end
+ret 0
+end
+if eq op OP_GT
+if and not ltv not eqv
+ret 1
+end
+ret 0
+end
+if ltv
+ret 0
+end
+ret 1
+end
+
+fn convert_op to_t ulong from_t ulong x ulong to ulong
+if tsigned from_t
+if ge x I64_MIN_MAG
+if not tsigned to_t
+do_trap 5
+ret 0
+end
+if lt u2l x smin_l to_t
+do_trap 5
+ret 0
+end
+ret x
+end
+end
+lim = umax_u to_t
+if tsigned to_t
+lim = smax_u to_t
+end
+if gt x lim
+do_trap 5
+ret 0
+end
+ret x
+end
+
+note ---- Runtime enlarge / envread / read / write ----
+
+fn mem_zero off ulong n ulong to void
+i = ulong 0
+while lt i n bound INF_BOUND
+put mem_pool add off i 0
+i = add i 1
+end
+end
+
+fn mem_copy dst ulong src_o ulong n ulong to void
+i = ulong 0
+while lt i n bound INF_BOUND
+put mem_pool add dst i get mem_pool add src_o i
+i = add i 1
+end
+end
+
+fn eval_enlarge aid ulong new_elems ulong to ulong
+cur_len = get arr_len aid
+if le new_elems cur_len
+ret 0
+end
+tb = tbytes get arr_ety aid
+if gt new_elems div I64_MAX_U tb
+ret l2u long -22
+end
+new_bytes = mul new_elems tb
+old_b = mul cur_len tb
+cur_cap = get arr_cap aid
+cur_off = get arr_off aid
+if le new_bytes cur_cap
+mem_zero add cur_off old_b sub new_bytes old_b
+put arr_len aid new_elems
+ret 0
+end
+used = get gs 25
+if and gt cur_cap 0 eq add cur_off cur_cap used
+need = add cur_off new_bytes
+if gt need len mem_pool
+r = enlarge mem_pool need
+if lt r 0
+ret l2u r
+end
+end
+mem_zero add cur_off old_b sub new_bytes old_b
+put arr_cap aid new_bytes
+put arr_len aid new_elems
+put gs 25 need
+ret 0
+end
+if gt used sub U64_MAX new_bytes
+ret l2u long -12
+end
+need = add used new_bytes
+if gt need len mem_pool
+r = enlarge mem_pool need
+if lt r 0
+ret l2u r
+end
+end
+mem_copy used cur_off old_b
+mem_zero add used old_b sub new_bytes old_b
+put arr_off aid used
+put arr_cap aid new_bytes
+put arr_len aid new_elems
+put gs 25 need
+ret 0
+end
+
+fn eval_envread aid ulong x ulong y ulong z ulong to ulong
+alen = get arr_len aid
+if or gt z alen gt y sub alen z
+do_trap 3
+ret 0
+end
+ec = ulong envcnt
+if ge x ec
+do_trap 3
+ret 0
+end
+cap = z
+if gt cap len env_tmp
+cap = len env_tmp
+end
+r = envread x env_tmp 0 cap
+if lt r 0
+ret l2u r
+end
+n = ulong r
+sp = get arr_space aid
+base = add get arr_off aid y
+i = ulong 0
+while lt i n bound INF_BOUND
+pool_st_u8 sp add base i get env_tmp i
+i = add i 1
+end
+ret n
+end
+
+fn eval_rw is_read ulong aid ulong x ulong y ulong z ulong to ulong
+alen = get arr_len aid
+if or gt z alen gt y sub alen z
+do_trap 3
+ret 0
+end
+sp = get arr_space aid
+base = add get arr_off aid y
+fd = int u2l canon T_I32 x
+r = long 0
+if ne is_read 0
+if eq sp 0
+r = read fd mem_pool base z
+else
+r = read fd loc_pool base z
+end
+else
+if eq sp 0
+r = write fd mem_pool base z
+else
+r = write fd loc_pool base z
+end
+end
+ret l2u r
+end
+
+note ---- Runtime evaluator and executor ----
+
+fn eval nid ulong fp ulong to ulong
+k = get nd_kind nid
+if eq k N_NUM
+ret get nd_num nid
+end
+if eq k N_VAR
+ret get fr_vals add fp get nd_slot nid
+end
+if eq k N_BIN
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+y = eval get nd_b nid fp
+if ne get gs 28 0
+ret 0
+end
+op = get nd_op nid
+if or eq op OP_SHL eq op OP_SHR
+ret shift_op op get nd_ty nid x get nd_ty get nd_b nid y
+end
+ret arith op get nd_ty nid x y
+end
+if eq k N_CMP
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+y = eval get nd_b nid fp
+if ne get gs 28 0
+ret 0
+end
+ret compare_op get nd_op nid get nd_ty get nd_a nid x y
+end
+if eq k N_NEG
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+t = get nd_ty nid
+if tsigned t
+if eq u2l x smin_l t
+do_trap 1
+ret 0
+end
+ret canon t sub ulong 0 x
+end
+ret canon t sub ulong 0 x
+end
+if eq k N_NOT
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+t = get nd_ty nid
+if eq t T_BOOL
+if eq x 0
+ret 1
+end
+ret 0
+end
+ret canon t not x
+end
+if eq k N_CONV
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+ret convert_op get nd_ty nid get nd_ty get nd_a nid x
+end
+ret eval_ext nid fp k
+end
+
+fn eval_ext nid ulong fp ulong k ulong to ulong
+if eq k N_GET
+aid = aref get nd_akind nid get nd_aidx nid fp
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+idx = check_index get nd_ty get nd_a nid x get arr_len aid
+if ne get gs 28 0
+ret 0
+end
+ret arr_get aid idx
+end
+if eq k N_LEN
+aid = aref get nd_akind nid get nd_aidx nid fp
+ret get arr_len aid
+end
+if eq k N_ENLARGE
+aid = aref get nd_akind nid get nd_aidx nid fp
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+ret eval_enlarge aid x
+end
+if eq k N_ENVCNT
+ret ulong envcnt
+end
+if eq k N_ENVREAD
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+y = eval get nd_b nid fp
+if ne get gs 28 0
+ret 0
+end
+z = eval get nd_c nid fp
+if ne get gs 28 0
+ret 0
+end
+aid = aref get nd_akind nid get nd_aidx nid fp
+ret eval_envread aid x y z
+end
+if or eq k N_READ eq k N_WRITE
+aid = aref get nd_akind nid get nd_aidx nid fp
+x = eval get nd_a nid fp
+if ne get gs 28 0
+ret 0
+end
+y = eval get nd_b nid fp
+if ne get gs 28 0
+ret 0
+end
+z = eval get nd_c nid fp
+if ne get gs 28 0
+ret 0
+end
+if eq k N_READ
+ret eval_rw 1 aid x y z
+end
+ret eval_rw 0 aid x y z
+end
+if eq k N_CALL
+ret eval_call nid fp
+end
+exit 2
+end
+
+fn eval_call_one fi ulong fp ulong asp ulong abase ulong i ulong to void
+pk = get fn_pkind add mul fi 6 i
+ci = add abase i
+if eq pk PK_SCALAR
+v = eval get ca_node ci fp
+if ne get gs 28 0
+ret
+end
+put arg_s add asp i v
+put arg_a add asp i 0
+else
+put arg_s add asp i 0
+aid = aref get ca_akind ci get ca_aidx ci fp
+put arg_a add asp i aid
+end
+end
+
+fn eval_call nid ulong fp ulong to ulong
+fi = get nd_fn nid
+np = get fn_np fi
+abase = get nd_abase nid
+asp = get gs 31
+ensure_argst add asp np
+put gs 31 add asp np
+i = ulong 0
+while lt i np bound 8
+eval_call_one fi fp asp abase i
+if ne get gs 28 0
+put gs 31 asp
+ret 0
+end
+i = add i 1
+end
+res = call_fn fi asp
+put gs 31 asp
+ret res
+end
+
+note exec_ret declared at top of file
+
+fn exec_new sid ulong fp ulong to void
+nb = mul get st_n sid tbytes get st_ety sid
+ch = and add nb 15 not ulong 15
+su = get gs 27
+if gt add su ch STACK_BYTES
+do_trap 6
+ret
+end
+iv = eval get st_v sid fp
+if ne get gs 28 0
+ret
+end
+put gs 27 add su ch
+aid = alloc_arr get st_ety sid get st_n sid 0 1
+off = alloc_loc_bytes nb
+put arr_off aid off
+put arr_cap aid nb
+n = get st_n sid
+i = ulong 0
+while lt i n bound INF_BOUND
+arr_put aid i iv
+i = add i 1
+end
+put fr_arrs add fp get st_slot sid aid
+end
+
+fn exec_while sid ulong fp ulong to ulong
+passes = ulong 0
+lim = get st_n sid
+while true bound INF_BOUND
+cond = eval get st_v sid fp
+if ne get gs 28 0
+ret C_RET
+end
+if eq cond 0
+break
+end
+if ge passes lim
+do_trap 4
+ret C_RET
+end
+passes = add passes 1
+c = exec_list get st_body sid fp
+if ne get gs 28 0
+ret C_RET
+end
+if eq c C_BREAK
+break
+end
+if eq c C_RET
+ret C_RET
+end
+end
+ret C_NORMAL
+end
+
+fn exec_for sid ulong fp ulong to ulong
+ck = get st_ckind sid
+cnt = ulong 0
+passes = ulong 0
+if eq ck 0
+cnt = get st_n sid
+else
+if eq ck 2
+cnt = eval get st_v sid fp
+if ne get gs 28 0
+ret C_RET
+end
+end
+end
+sl = add fp get st_slot sid
+put fr_vals sl 0
+fty = get st_ty sid
+while true bound INF_BOUND
+if eq ck 1
+cnt = eval get st_v sid fp
+if ne get gs 28 0
+ret C_RET
+end
+end
+if eq compare_op OP_LT fty get fr_vals sl cnt 0
+break
+end
+if ne ck 0
+if ge passes LOOP_MAX
+do_trap 4
+ret C_RET
+end
+passes = add passes 1
+end
+c = exec_list get st_body sid fp
+if ne get gs 28 0
+ret C_RET
+end
+if eq c C_BREAK
+break
+end
+if eq c C_RET
+ret C_RET
+end
+nv = arith OP_ADD fty get fr_vals sl 1
+if ne get gs 28 0
+ret C_RET
+end
+put fr_vals sl nv
+end
+ret C_NORMAL
+end
+
+fn exec_list sid ulong fp ulong to ulong
+s = sid
+while ne s 0 bound INF_BOUND
+k = get st_kind s
+if eq k S_ASSIGN
+v = eval get st_v s fp
+if ne get gs 28 0
+ret C_RET
+end
+put fr_vals add fp get st_slot s v
+else
+if eq k S_NEW
+exec_new s fp
+if ne get gs 28 0
+ret C_RET
+end
+else
+if eq k S_IF
+cond = eval get st_v s fp
+if ne get gs 28 0
+ret C_RET
+end
+c = C_NORMAL
+if ne cond 0
+c = exec_list get st_body s fp
+else
+c = exec_list get st_els s fp
+end
+if ne get gs 28 0
+ret C_RET
+end
+if ne c C_NORMAL
+ret c
+end
+else
+if eq k S_WHILE
+c = exec_while s fp
+if or ne get gs 28 0 ne c C_NORMAL
+ret c
+end
+else
+if eq k S_FOR
+c = exec_for s fp
+if or ne get gs 28 0 ne c C_NORMAL
+ret c
+end
+else
+c = exec_stmt_tail s fp k
+if or ne get gs 28 0 ne c C_NORMAL
+ret c
+end
+end
+end
+end
+end
+end
+s = get st_next s
+end
+ret C_NORMAL
+end
+
+fn exec_stmt_tail s ulong fp ulong k ulong to ulong
+if eq k S_BREAK
+ret C_BREAK
+end
+if eq k S_RET
+vn = get st_v s
+if ne vn 0
+v = eval vn fp
+if ne get gs 28 0
+ret C_RET
+end
+put exec_ret 0 v
+end
+ret C_RET
+end
+if eq k S_PUT
+aid = aref get st_akind s get st_aidx s fp
+idx = eval get st_v s fp
+if ne get gs 28 0
+ret C_RET
+end
+val = eval get st_v2 s fp
+if ne get gs 28 0
+ret C_RET
+end
+ci = check_index get nd_ty get st_v s idx get arr_len aid
+if ne get gs 28 0
+ret C_RET
+end
+arr_put aid ci val
+ret C_NORMAL
+end
+if eq k S_TRAP
+do_trap get st_n s
+ret C_RET
+end
+if eq k S_EXIT
+v = eval get st_v s fp
+if ne get gs 28 0
+ret C_RET
+end
+exit int and v 255
+end
+if eq k S_CALL
+ig = eval get st_v s fp
+if ne get gs 28 0
+ret C_RET
+end
+end
+ret C_NORMAL
+end
+
+fn clone_arr_view src_aid ulong pk ulong to ulong
+ro = get arr_ro src_aid
+if eq pk PK_VIEW
+ro = 1
+end
+vaid = alloc_arr get arr_ety src_aid get arr_len src_aid ro get arr_space src_aid
+put arr_off vaid get arr_off src_aid
+put arr_cap vaid get arr_cap src_aid
+ret vaid
+end
+
+fn bind_fn_params fi ulong fp ulong asp ulong to void
+np = get fn_np fi
+i = ulong 0
+while lt i np bound 8
+pk = get fn_pkind add mul fi 6 i
+if eq pk PK_SCALAR
+put fr_vals add fp i get arg_s add asp i
+else
+put fr_arrs add fp i clone_arr_view get arg_a add asp i pk
+end
+i = add i 1
+end
+end
+
+fn call_fn fi ulong asp ulong to ulong
+ch = ulong 0
+if ne get fn_hascall fi 0
+ch = 16
+end
+saved_su = get gs 27
+if ne get gs 8 0
+if gt add saved_su ch STACK_BYTES
+do_trap 6
+ret 0
+end
+end
+put gs 27 add saved_su ch
+saved_loc = get gs 26
+saved_narrs = get gs 24
+fp = get gs 30
+ns = get fn_nslots fi
+ensure_fr add fp add ns 1
+put gs 30 add fp add ns 1
+i = ulong 0
+while lt i ns bound INF_BOUND
+put fr_vals add fp i 0
+put fr_arrs add fp i 0
+i = add i 1
+end
+bind_fn_params fi fp asp
+put exec_ret 0 0
+ig = exec_list get fn_body fi fp
+res = get exec_ret 0
+put gs 30 fp
+put gs 26 saved_loc
+put gs 24 saved_narrs
+put gs 27 saved_su
+ret res
+end
+
+note ---- Driver: load file, check, run, call ----
+
+fn load_prog arg_idx ulong to void
+n = argread arg_idx arg_buf 0 4095
+if lt n 1
+die_io
+end
+fd = fopen arg_buf 0 ulong n 524288 0
+if lt fd 0
+die_io
+end
+slen = ulong 0
+while true bound INF_BOUND
+r = read int fd io_buf 0 len io_buf
+if lt r 0
+ig = fclose int fd
+die_io
+end
+if eq r 0
+break
+end
+got = ulong r
+need = add slen got
+if gt need len src
+nc = grow_cap len src need
+er = enlarge src nc
+if lt er 0
+die_oom
+end
+end
+i = ulong 0
+while lt i got bound 65536
+put src add slen i get io_buf i
+i = add i 1
+end
+slen = need
+end
+ig = fclose int fd
+put gs 0 slen
+end
+
+fn load_inp arg_idx ulong to ulong
+n = argread arg_idx arg_buf 0 4095
+if lt n 1
+die_io
+end
+fd = fopen arg_buf 0 ulong n 524288 0
+if lt fd 0
+die_io
+end
+ilen = ulong 0
+while true bound INF_BOUND
+r = read int fd io_buf 0 len io_buf
+if lt r 0
+ig = fclose int fd
+die_io
+end
+if eq r 0
+break
+end
+got = ulong r
+need = add ilen got
+if gt need len inp_buf
+nc = grow_cap len inp_buf need
+er = enlarge inp_buf nc
+if lt er 0
+die_oom
+end
+end
+i = ulong 0
+while lt i got bound 65536
+put inp_buf add ilen i get io_buf i
+i = add i 1
+end
+ilen = need
+end
+ig = fclose int fd
+ret ilen
+end
+
+fn src_eq_arg off ulong un ulong to bool
+j = ulong 0
+while lt j un bound 64
+if ne get src add off j get arg_buf j
+ret false
+end
+j = add j 1
+end
+ret true
+end
+
+fn find_func_arg arg_idx ulong to ulong
+n = argread arg_idx arg_buf 0 4095
+if lt n 1
+ret U64_MAX
+end
+un = ulong n
+nf = get gs 5
+i = ulong 0
+while lt i nf bound INF_BOUND
+if eq get fn_nlen i un
+if src_eq_arg get fn_noff i un
+ret i
+end
+end
+i = add i 1
+end
+ret U64_MAX
+end
+
+note Parse signed/unsigned decimal from inp_buf[pos..end), advances pr[0]=new_pos, pr[1]=val
+fn parse_inp_int pos ulong lim ulong is_sig ulong to void
+p = pos
+while lt p lim bound 1024
+c = get inp_buf p
+if and ne c 32 and ne c 9 ne c 13
+break
+end
+p = add p 1
+end
+negv = ulong 0
+if lt p lim
+if eq get inp_buf p 45
+negv = 1
+p = add p 1
+else
+if eq get inp_buf p 43
+p = add p 1
+end
+end
+end
+v = ulong 0
+while lt p lim bound 64
+c = get inp_buf p
+if not is_digit c
+break
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+end
+if ne negv 0
+v = sub ulong 0 v
+end
+put pr 0 p
+put pr 1 v
+end
+
+fn run_call_line fi ulong np ulong p0 ulong eol ulong to int
+p = p0
+ensure_argst np
+put gs 31 np
+j = ulong 0
+while lt j np bound 8
+pty = get fn_pty add mul fi 6 j
+is_s = ulong 0
+if tsigned pty
+is_s = 1
+end
+parse_inp_int p eol is_s
+p = get pr 0
+val = get pr 1
+if ne val canon pty val
+r = write 2 msg_in_range 0 len msg_in_range
+ret 2
+end
+put arg_s j val
+put arg_a j 0
+j = add j 1
+end
+put gs 27 0
+put gs 28 0
+put gs 29 0
+res = call_fn fi 0
+put gs 31 0
+if ne get gs 28 0
+r = write 1 msg_trap_pre 0 len msg_trap_pre
+out_u64 get gs 29
+r = write 1 msg_trap_suf 0 len msg_trap_suf
+else
+if tsigned get fn_ret fi
+out_i64 res
+else
+out_u64 res
+end
+r = write 1 msg_hex_pre 0 len msg_hex_pre
+out_hex64 res
+r = write 1 msg_err_end 0 len msg_err_end
+end
+ret 0
+end
+
+fn do_call_mode to int
+load_prog 2
+parse_program
+fi = find_func_arg 3
+if eq fi U64_MAX
+r = write 2 msg_no_fn 0 len msg_no_fn
+ret 2
+end
+np = get fn_np fi
+i = ulong 0
+while lt i np bound 8
+if ne get fn_pkind add mul fi 6 i PK_SCALAR
+r = write 2 msg_call_arr 0 len msg_call_arr
+ret 2
+end
+i = add i 1
+end
+ilen = load_inp 4
+pos = ulong 0
+while lt pos ilen bound INF_BOUND
+eol = pos
+while lt eol ilen bound INF_BOUND
+if eq get inp_buf eol 10
+break
+end
+eol = add eol 1
+end
+p0 = pos
+if lt eol ilen
+pos = add eol 1
+else
+pos = ilen
+end
+rc = run_call_line fi np p0 eol
+if ne rc 0
+ret rc
+end
+end
+ret 0
+end
+
+fn main to int
+ac = argcnt
+if lt ac 3
+r = write 2 msg_usage 0 len msg_usage
+ret 2
+end
+n = argread 1 arg_buf 0 4095
+if lt n 1
+r = write 2 msg_usage 0 len msg_usage
+ret 2
+end
+un = ulong n
+if arg_eq_kw un 71
+load_prog 2
+parse_program
+ret 0
+end
+if arg_eq_kw un 72
+load_prog 2
+put gs 2 125
+parse_program
+nf = get gs 5
+mi = U64_MAX
+i = ulong 0
+while lt i nf bound INF_BOUND
+if eq kw_id_of get fn_noff i get fn_nlen i 70
+mi = i
+break
+end
+i = add i 1
+end
+if or eq get gs 8 0 eq mi U64_MAX
+r = write 2 msg_run_main 0 len msg_run_main
+ret 125
+end
+put gs 28 0
+put gs 29 0
+v = call_fn mi 0
+if ne get gs 28 0
+ret int add 100 get gs 29
+end
+if eq get fn_ret mi T_VOID
+ret 0
+end
+ret int and v 255
+end
+if arg_eq_kw un 73
+if ne ac 5
+r = write 2 msg_usage 0 len msg_usage
+ret 2
+end
+ret do_call_mode
+end
+r = write 2 msg_unk_cmd 0 len msg_unk_cmd
+ret 2
+end

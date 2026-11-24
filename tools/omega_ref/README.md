@@ -33,8 +33,15 @@ not semantic completeness of the oracle or correctness of the compiler.
 Run from the repository root on Linux AArch64, on an assigned CPU if shared:
 
 ```sh
+make omega-ref
+make test-omega-ref
+```
+
+Or directly with `seed/out/omc`:
+
+```sh
 T=$(mktemp -d)
-gcc -O2 -std=gnu11 -Wall -Wextra -Werror tools/omega_ref/omega_ref.c -o "$T/ref" -lpthread
+seed/out/omc < tools/omega_ref/omega_ref.om > "$T/ref" && chmod +x "$T/ref"
 "$T/ref" run seed/omc/omc.om < seed/omc/omc.om > "$T/ref-result"
 cmp "$T/ref-result" seed/out/omc
 ```
