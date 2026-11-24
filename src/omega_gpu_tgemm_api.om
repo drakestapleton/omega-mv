@@ -1,0 +1,243 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_tgemm_api.om: Pure seeded OM-2 port of src/omega_gpu_tgemm_api.c.
+note Composes src/omega_blackwell_codegen_tgemm.om and src/omega_blackwell_qmd.om.
+om2
+
+const TG_PF_OK long 0
+const TG_PF_BAD_ARGS long -1
+const TG_PF_TOO_LARGE long -2
+const TG_PF_CODEGEN_FAIL long -3
+const TG_PF_CHIP_FAIL long -4
+
+const TG_TIMEOUT_MS ulong 20000
+const TG_SPIN_US ulong 200000
+const TG_ARGS_WORDS ulong 6
+const TG_TILE_BYTES ulong 32
+
+note Global config: [0]=rt, [1]=warps, [2]=aqn, [3]=mutant, [4]=next_va
+global tg_g_cfg ulong 8
+
+fn tg_gpr_declared peak ulong to ulong
+  ret mul div add peak 9 8 8
+end
+
+fn tg_gpr_declared_ok decl ulong peak ulong to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn tg_alloc_va sz ulong to ulong
+  cur = get tg_g_cfg 4
+  if eq cur 0
+    cur = ulong 0x40000000
+  end
+  aligned = and add cur 255 ulong 0xffffffffffffff00
+  nxt = add aligned and add sz 4095 ulong 0xfffffffffffff000
+  put tg_g_cfg 4 nxt
+  ret aligned
+end
+
+fn omega_gpu_tgemm_set_shape rt ulong warps ulong aqn ulong to void
+  put tg_g_cfg 0 rt
+  put tg_g_cfg 1 warps
+  put tg_g_cfg 2 aqn
+end
+
+fn omega_gpu_tgemm_test_set_mutant m ulong to void
+  put tg_g_cfg 3 m
+end
+
+fn omega_gpu_tgemm_bm n ulong to ulong
+  grt = get tg_g_cfg 0
+  if ne grt 0
+    ret mul 16 grt
+  end
+  w = get tg_g_cfg 1
+  if eq w 0
+    if ne rem n 256 0
+      w = 8
+    else
+      w = 16
+    end
+  end
+  if eq w 16
+    ret 128
+  end
+  ret 64
+end
+
+note call[8]: [0]=layout, [1]=epi, [2]=m, [3]=n, [4]=k, [5]=a_va, [6]=b_va, [7]=c_va
+fn omega_gpu_tgemm_spec call view ulong 8 sp edit ulong 10 to long
+  for i ulong 10
+    put sp i 0
+  end
+  m = get call 2
+  n = get call 3
+  k = get call 4
+  w = get tg_g_cfg 1
+  if eq w 0
+    if ne rem n 256 0
+      w = 8
+    else
+      w = 16
+    end
+  end
+  rt = get tg_g_cfg 0
+  if eq rt 0
+    if eq w 16
+      rt = 8
+    else
+      rt = 4
+    end
+  end
+  aqn = get tg_g_cfg 2
+  if eq aqn 0
+    aqn = 1
+  end
+  put sp 0 k
+  put sp 1 n
+  put sp 2 rt
+  put sp 3 2
+  put sp 4 w
+  put sp 5 32
+  put sp 6 aqn
+  put sp 7 get call 0
+  put sp 8 get call 1
+  put sp 9 get tg_g_cfg 3
+  if eq omega_tgemm_spec_ok sp 0
+    ret TG_PF_BAD_ARGS
+  end
+  bm = ulong omega_tgemm_bm sp
+  if eq bm 0
+    ret TG_PF_BAD_ARGS
+  end
+  if eq m 0
+    ret TG_PF_BAD_ARGS
+  end
+  if ne rem m bm 0
+    ret TG_PF_BAD_ARGS
+  end
+  if eq get call 5 0
+    ret TG_PF_BAD_ARGS
+  end
+  if eq get call 6 0
+    ret TG_PF_BAD_ARGS
+  end
+  if eq get call 7 0
+    ret TG_PF_BAD_ARGS
+  end
+  if gt div m bm 65535
+    ret TG_PF_TOO_LARGE
+  end
+  if ge mul m n 0x100000000
+    ret TG_PF_TOO_LARGE
+  end
+  ret TG_PF_OK
+end
+
+note tab holds 4 ulongs per tile: [0]=c_va, [1]=row0, [2]=kb0, [3]=nkb
+fn omega_gpu_tgemm_tiles call view ulong 8 tab edit ulong * max_tiles ulong to ulong
+  sp = new ulong 10 0
+  if ne omega_gpu_tgemm_spec call sp TG_PF_OK
+    ret 0
+  end
+  bm = ulong omega_tgemm_bm sp
+  nt = div get call 2 bm
+  if gt nt max_tiles
+    ret 0
+  end
+  if lt len tab mul nt 4
+    ret 0
+  end
+  c_va = get call 7
+  nkb = div get call 4 128
+  for t ulong nt
+    off = mul t 4
+    put tab off c_va
+    put tab add off 1 mul t bm
+    put tab add off 2 0
+    put tab add off 3 nkb
+  end
+  ret nt
+end
+
+fn tg_put64 args edit uint 6 idx ulong v ulong to void
+  put args idx uint and v 0xffffffff
+  put args add idx 1 uint shr v 32
+end
+
+fn tg_compile_stats sp view ulong 10 stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  if ne omega_blackwell_codegen_tgemm_prog sp ins meta 0
+    ret -1
+  end
+  ret tgemm_om_solve ins meta stats
+end
+
+fn omega_gpu_tgemm_fill_launch_locked call view ulong 8 tiles_va ulong ntiles ulong launch edit ulong 12 args edit uint 6 to long
+  sp = new ulong 10 0
+  stats = new uint 2 0
+  if or eq tiles_va 0 eq ntiles 0
+    ret TG_PF_BAD_ARGS
+  end
+  rc = omega_gpu_tgemm_spec call sp
+  if ne rc TG_PF_OK
+    ret rc
+  end
+  if ne tg_compile_stats sp stats 0
+    ret TG_PF_CODEGEN_FAIL
+  end
+  insns = ulong get stats 0
+  peak = ulong get stats 1
+  if eq insns 0
+    ret TG_PF_CODEGEN_FAIL
+  end
+  decl = tg_gpr_declared peak
+  threads = mul 32 get sp 4
+  if gt mul threads decl 65536
+    ret TG_PF_TOO_LARGE
+  end
+  if eq tg_gpr_declared_ok decl peak 0
+    ret TG_PF_CHIP_FAIL
+  end
+  span = ulong omega_tgemm_span sp
+  if eq span 0
+    ret TG_PF_BAD_ARGS
+  end
+  tg_put64 args 0 tiles_va
+  tg_put64 args 2 get call 5
+  tg_put64 args 4 get call 6
+  gx = div get call 3 span
+  put launch 0 tg_alloc_va mul insns 16
+  put launch 1 decl
+  put launch 2 threads
+  put launch 3 1
+  put launch 4 gx
+  put launch 5 ntiles
+  put launch 6 mul mul threads gx ntiles
+  put launch 7 TG_ARGS_WORDS
+  put launch 8 TG_TIMEOUT_MS
+  put launch 9 ulong omega_tgemm_shared_bytes sp
+  put launch 10 TG_SPIN_US
+  put launch 11 peak
+  ret TG_PF_OK
+end
+
+fn omega_gpu_tgemm call view ulong 8 launch edit ulong 12 args edit uint 6 to long
+  sp = new ulong 10 0
+  rc = omega_gpu_tgemm_spec call sp
+  if ne rc TG_PF_OK
+    ret rc
+  end
+  bm = ulong omega_tgemm_bm sp
+  nt = div get call 2 bm
+  need = and add mul nt TG_TILE_BYTES 4095 ulong 0xfffffffffffff000
+  tab_va = tg_alloc_va need
+  ret omega_gpu_tgemm_fill_launch_locked call tab_va nt launch args
+end

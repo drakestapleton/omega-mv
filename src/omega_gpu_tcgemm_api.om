@@ -1,0 +1,383 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_tcgemm_api.om: Pure seeded OM-2 port of src/omega_gpu_tcgemm_api.c.
+note Composes src/omega_blackwell_codegen_tc.om and src/omega_blackwell_qmd.om.
+om2
+
+const OMEGA_GPU_TCGEMM_OK long 0
+const OMEGA_GPU_TCGEMM_BAD_ARGS long -1
+const OMEGA_GPU_TCGEMM_TOO_LARGE long -2
+const OMEGA_GPU_TCGEMM_CODEGEN_FAIL long -3
+const OMEGA_GPU_TCGEMM_CHIP_FAIL long -4
+
+const TCG_CACHE_SLOTS ulong 8
+const TCG_ARGS_WORDS ulong 9
+const TCG_TILE_BYTES ulong 32
+const TCG_MARKER_TIMEOUT_MS ulong 20000
+
+note Global config: [0]=rt, [1]=ct, [2]=warps, [3]=mutant, [4]=next_slot, [5]=next_va, [6]=last_err
+global tcg_g_cfg ulong 8
+note 8 cache slots x 16 ulongs:
+note   0:valid 1:pinned 2:code_va 3:peak 4:decl 5:insns 6..13:spec[0..7]
+global tcg_cache ulong 128
+
+text tcg_rc_ok "OK"
+text tcg_rc_bad "BAD_ARGS"
+text tcg_rc_big "TOO_LARGE"
+text tcg_rc_cg "CODEGEN_FAIL"
+text tcg_rc_chip "CHIP_FAIL"
+text tcg_rc_unk "UNKNOWN"
+
+text tcg_err_none ""
+text tcg_err_full "tc gemm kernel cache: every slot holds a prepared kernel"
+text tcg_err_cg "tc gemm codegen refused the shape"
+text tcg_err_reg "tc gemm kernel: declared registers do not fit"
+text tcg_err_gpr "declared registers below peak + 2: refusing to launch"
+
+fn tcg_gpr_declared peak ulong to ulong
+  ret mul div add peak 9 8 8
+end
+
+fn tcg_gpr_declared_ok decl ulong peak ulong to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn tcg_copy_txt src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get src i
+  end
+  ret n
+end
+
+fn tcg_alloc_va sz ulong to ulong
+  cur = get tcg_g_cfg 5
+  if eq cur 0
+    cur = ulong 0x20000000
+  end
+  aligned = and add cur 255 ulong 0xffffffffffffff00
+  nxt = add aligned and add sz 4095 ulong 0xfffffffffffff000
+  put tcg_g_cfg 5 nxt
+  ret aligned
+end
+
+fn omega_gpu_tcgemm_last_error dst edit uchar * to ulong
+  e = get tcg_g_cfg 6
+  if eq e 1
+    ret tcg_copy_txt tcg_err_full dst
+  end
+  if eq e 2
+    ret tcg_copy_txt tcg_err_cg dst
+  end
+  if eq e 3
+    ret tcg_copy_txt tcg_err_reg dst
+  end
+  if eq e 4
+    ret tcg_copy_txt tcg_err_gpr dst
+  end
+  ret tcg_copy_txt tcg_err_none dst
+end
+
+fn omega_gpu_tcgemm_rc_name rc long dst edit uchar * to ulong
+  if eq rc OMEGA_GPU_TCGEMM_OK
+    ret tcg_copy_txt tcg_rc_ok dst
+  end
+  if eq rc OMEGA_GPU_TCGEMM_BAD_ARGS
+    ret tcg_copy_txt tcg_rc_bad dst
+  end
+  if eq rc OMEGA_GPU_TCGEMM_TOO_LARGE
+    ret tcg_copy_txt tcg_rc_big dst
+  end
+  if eq rc OMEGA_GPU_TCGEMM_CODEGEN_FAIL
+    ret tcg_copy_txt tcg_rc_cg dst
+  end
+  if eq rc OMEGA_GPU_TCGEMM_CHIP_FAIL
+    ret tcg_copy_txt tcg_rc_chip dst
+  end
+  ret tcg_copy_txt tcg_rc_unk dst
+end
+
+fn omega_gpu_tcgemm_cache_clear to void
+  for i ulong 128
+    put tcg_cache i 0
+  end
+  put tcg_g_cfg 4 0
+end
+
+fn omega_gpu_tcgemm_set_shape rt ulong ct ulong w ulong to void
+  put tcg_g_cfg 0 rt
+  put tcg_g_cfg 1 ct
+  put tcg_g_cfg 2 w
+  omega_gpu_tcgemm_cache_clear
+end
+
+fn omega_gpu_tcgemm_test_set_mutant m ulong to void
+  put tcg_g_cfg 3 m
+  omega_gpu_tcgemm_cache_clear
+end
+
+fn omega_gpu_tcgemm_spec_for k ulong n ulong sp edit ulong 8 to void
+  for i ulong 8
+    put sp i 0
+  end
+  rt = get tcg_g_cfg 0
+  if eq rt 0
+    rt = 4
+  end
+  ct = get tcg_g_cfg 1
+  if eq ct 0
+    if eq rem n 128 0
+      ct = 2
+    else
+      ct = 1
+    end
+  end
+  w = get tcg_g_cfg 2
+  if eq w 0
+    w = 8
+  end
+  put sp 0 k
+  put sp 1 rt
+  put sp 2 ct
+  put sp 3 w
+  put sp 4 get tcg_g_cfg 3
+end
+
+fn tcg_slot_matches idx ulong sp view ulong 8 to long
+  base = mul idx 16
+  if eq get tcg_cache base 0
+    ret 0
+  end
+  for i ulong 8
+    if ne get tcg_cache add base add 6 i get sp i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn tcg_compile_stats sp view ulong 8 stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  if ne omega_blackwell_codegen_tcgemm_prog sp ins meta 0
+    ret -1
+  end
+  ret tc_om_solve ins meta stats
+end
+
+fn tcg_kernel_for sp view ulong 8 kout edit ulong 5 to long
+  stats = new uint 2 0
+  for i ulong TCG_CACHE_SLOTS
+    if ne tcg_slot_matches i sp 0
+      base = mul i 16
+      put kout 0 get tcg_cache add base 2
+      put kout 1 get tcg_cache add base 3
+      put kout 2 get tcg_cache add base 4
+      put kout 3 1
+      put kout 4 i
+      ret OMEGA_GPU_TCGEMM_OK
+    end
+  end
+  pick = TCG_CACHE_SLOTS
+  nxt = get tcg_g_cfg 4
+  for i ulong TCG_CACHE_SLOTS
+    idx = rem add nxt i TCG_CACHE_SLOTS
+    base = mul idx 16
+    if eq pick TCG_CACHE_SLOTS
+      if or eq get tcg_cache base 0 eq get tcg_cache add base 1 0
+        pick = idx
+        put tcg_g_cfg 4 rem add idx 1 TCG_CACHE_SLOTS
+      end
+    end
+  end
+  if eq pick TCG_CACHE_SLOTS
+    put tcg_g_cfg 6 1
+    ret OMEGA_GPU_TCGEMM_TOO_LARGE
+  end
+  if ne tcg_compile_stats sp stats 0
+    put tcg_g_cfg 6 2
+    ret OMEGA_GPU_TCGEMM_CODEGEN_FAIL
+  end
+  insns = ulong get stats 0
+  peak = ulong get stats 1
+  if eq insns 0
+    put tcg_g_cfg 6 2
+    ret OMEGA_GPU_TCGEMM_CODEGEN_FAIL
+  end
+  decl = tcg_gpr_declared peak
+  if gt decl 128
+    put tcg_g_cfg 6 3
+    ret OMEGA_GPU_TCGEMM_TOO_LARGE
+  end
+  if gt mul mul 32 get sp 3 decl 65536
+    put tcg_g_cfg 6 3
+    ret OMEGA_GPU_TCGEMM_TOO_LARGE
+  end
+  code_va = tcg_alloc_va mul insns 16
+  base = mul pick 16
+  put tcg_cache base 1
+  put tcg_cache add base 1 0
+  put tcg_cache add base 2 code_va
+  put tcg_cache add base 3 peak
+  put tcg_cache add base 4 decl
+  put tcg_cache add base 5 insns
+  for i ulong 8
+    put tcg_cache add base add 6 i get sp i
+  end
+  put kout 0 code_va
+  put kout 1 peak
+  put kout 2 decl
+  put kout 3 0
+  put kout 4 pick
+  ret OMEGA_GPU_TCGEMM_OK
+end
+
+fn omega_gpu_tcgemm_prepare k ulong to long
+  sp = new ulong 8 0
+  omega_gpu_tcgemm_spec_for k 128 sp
+  kout = new ulong 5 0
+  rc = tcg_kernel_for sp kout
+  if eq rc OMEGA_GPU_TCGEMM_OK
+    slot = get kout 4
+    put tcg_cache add mul slot 16 1 1
+  end
+  ret rc
+end
+
+fn tcg_put64 args edit uint 9 idx ulong v ulong to void
+  put args idx uint and v 0xffffffff
+  put args add idx 1 uint shr v 32
+end
+
+note rcfg[4] = {experts, m, x_rows, bm}
+fn tcg_validate_rows rcfg view ulong 4 ids view uint 64 trow view uint 64 seg_tiles edit ulong 2 to long
+  segs = ulong 0
+  ntiles = ulong 0
+  i = ulong 0
+  while lt i get rcfg 1 bound 65536
+    cur_id = ulong get ids i
+    if ge cur_id get rcfg 0
+      ret OMEGA_GPU_TCGEMM_BAD_ARGS
+    end
+    j = i
+    while lt j get rcfg 1 bound 65536
+      if ne ulong get ids j cur_id
+        break
+      end
+      if ge ulong get trow j get rcfg 2
+        ret OMEGA_GPU_TCGEMM_BAD_ARGS
+      end
+      j = add j 1
+    end
+    if lt j get rcfg 1
+      if lt ulong get ids j cur_id
+        ret OMEGA_GPU_TCGEMM_BAD_ARGS
+      end
+    end
+    segs = add segs 1
+    ntiles = add ntiles div sub add sub j i get rcfg 3 1 get rcfg 3
+    i = j
+  end
+  if gt ntiles 65535
+    ret OMEGA_GPU_TCGEMM_TOO_LARGE
+  end
+  put seg_tiles 0 segs
+  put seg_tiles 1 ntiles
+  ret OMEGA_GPU_TCGEMM_OK
+end
+
+fn tcg_fill_outputs dims view ulong 5 sp view ulong 8 kout view ulong 5 st view ulong 2 out_meta edit ulong 24 to void
+  span = ulong omega_tcgemm_span sp
+  put out_meta 0 get dims 3
+  put out_meta 1 get st 0
+  put out_meta 2 get st 1
+  put out_meta 3 get dims 1
+  put out_meta 4 get dims 2
+  put out_meta 5 get sp 1
+  put out_meta 6 get sp 2
+  put out_meta 7 get sp 3
+  put out_meta 8 div get dims 1 span
+  put out_meta 9 get st 1
+  put out_meta 10 get kout 2
+  put out_meta 11 get kout 3
+  put out_meta 12 get kout 0
+  put out_meta 13 get kout 2
+  put out_meta 14 mul 32 get sp 3
+  put out_meta 15 1
+  put out_meta 16 div get dims 1 span
+  put out_meta 17 get st 1
+  put out_meta 18 mul get dims 3 get dims 1
+  put out_meta 19 TCG_ARGS_WORDS
+  put out_meta 20 TCG_MARKER_TIMEOUT_MS
+  put out_meta 21 ulong omega_tcgemm_shared_bytes sp
+  put out_meta 22 0
+  put out_meta 23 get kout 1
+end
+
+fn tcg_check_and_rows dims view ulong 5 sp view ulong 8 ids view uint 64 trow view uint 64 st edit ulong 2 to long
+  rcfg = new ulong 4 0
+  if eq get dims 0 0
+    ret OMEGA_GPU_TCGEMM_BAD_ARGS
+  end
+  if eq get dims 3 0
+    ret OMEGA_GPU_TCGEMM_BAD_ARGS
+  end
+  if eq get dims 4 0
+    ret OMEGA_GPU_TCGEMM_BAD_ARGS
+  end
+  if eq omega_tcgemm_spec_ok sp 0
+    ret OMEGA_GPU_TCGEMM_BAD_ARGS
+  end
+  span = ulong omega_tcgemm_span sp
+  if eq span 0
+    ret OMEGA_GPU_TCGEMM_BAD_ARGS
+  end
+  if ne rem get dims 1 span 0
+    ret OMEGA_GPU_TCGEMM_BAD_ARGS
+  end
+  if ne rem get dims 1 128 0
+    ret OMEGA_GPU_TCGEMM_BAD_ARGS
+  end
+  put rcfg 0 get dims 0
+  put rcfg 1 get dims 3
+  put rcfg 2 get dims 4
+  put rcfg 3 mul 16 get sp 1
+  ret tcg_validate_rows rcfg ids trow st
+end
+
+note Host-mode grouped FP8 TC-GEMM contract:
+note dims[5] = {experts, n, k, M, x_rows}, out_meta[24] = {info[0..11], launch[12..23]}, args[9].
+fn omega_gpu_tcgemm_f32 dims view ulong 5 ids view uint 64 trow view uint 64 out_meta edit ulong 24 args edit uint 9 to long
+  sp = new ulong 8 0
+  st = new ulong 2 0
+  kout = new ulong 5 0
+  omega_gpu_tcgemm_spec_for get dims 2 get dims 1 sp
+  rc = tcg_check_and_rows dims sp ids trow st
+  if ne rc OMEGA_GPU_TCGEMM_OK
+    ret rc
+  end
+  rc = tcg_kernel_for sp kout
+  if ne rc OMEGA_GPU_TCGEMM_OK
+    ret rc
+  end
+  if eq tcg_gpr_declared_ok get kout 2 get kout 1 0
+    put tcg_g_cfg 6 4
+    ret OMEGA_GPU_TCGEMM_CHIP_FAIL
+  end
+  tcg_put64 args 0 tcg_alloc_va mul get st 1 TCG_TILE_BYTES
+  tcg_put64 args 2 tcg_alloc_va mul add get dims 3 mul 16 get sp 1 4
+  tcg_put64 args 4 tcg_alloc_va mul mul get dims 4 get dims 2 2
+  tcg_put64 args 6 tcg_alloc_va mul mul get dims 3 get dims 1 4
+  put args 8 uint get dims 1
+  tcg_fill_outputs dims sp kout st out_meta
+  ret OMEGA_GPU_TCGEMM_OK
+end

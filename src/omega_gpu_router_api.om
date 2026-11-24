@@ -1,0 +1,668 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_router_api.om: Pure seeded OM-2 port of src/omega_gpu_router_api.c.
+note Composes src/omega_blackwell_codegen_router.om and src/omega_blackwell_qmd.om.
+note Host-side contract, allocation, directory, kernel caching, arg packing, and QMD1 validation.
+om2
+
+const OMEGA_GPU_ROUTER_OK long 0
+const OMEGA_GPU_ROUTER_BAD_ARGS long -1
+const OMEGA_GPU_ROUTER_TOO_LARGE long -2
+const OMEGA_GPU_ROUTER_CODEGEN_FAIL long -3
+const OMEGA_GPU_ROUTER_CHIP_FAIL long -4
+
+const OMEGA_GPU_ROUTER_MAX_LAYERS ulong 64
+const OMEGA_GPU_ROUTER_WARPS ulong 32
+const OMEGA_GPU_ROUTER_DEPTH ulong 4
+const OMEGA_GPU_ROUTER_MAX_ROWS ulong 64
+const OMEGA_ROUTER_EXPERTS ulong 128
+const OMEGA_ROUTER_HIDDEN ulong 2048
+const OMEGA_ROUTER_TOPK ulong 8
+const OMEGA_ROUTER_ROW_BYTES ulong 4096
+const OMEGA_ROUTER_ARGS_WORDS ulong 23
+const RT_MARKER_TIMEOUT_MS ulong 20000
+
+const RT_LB_X ulong 0
+const RT_LB_XOUT ulong 8192
+const RT_LB_IDS ulong 16384
+const RT_LB_WTS ulong 16448
+const RT_LB_TAB_GU ulong 16512
+const RT_LB_TAB_DN ulong 16640
+const RT_LB_BYTES ulong 16768
+const RT_LB_TAB_DN9 ulong 16656
+const RT_LB_BYTES9 ulong 16800
+
+note Global router config: [0]=warps, [1]=depth, [2]=mutant, [3]=g_rec, [4]=next_va, [5]=last_err
+global rt_g_cfg ulong 8
+note Plain and ROWS kernel cache slots: valid(0), code_va(1), peak(2), decl(3), insns(4), spec[0..7](5..12)
+global rt_slot_plain ulong 16
+global rt_slot_rows ulong 16
+note Router instance pool (4 handles, 16 ulongs each):
+note   0:used 1:layers 2:experts 3:shared 4:rows 5:slots 6:lb_tab_dn 7:lb_bytes
+note   8:gate_va 9:norm_va 10:dir_va 11:lb_va 12:layer_set_cnt 13:dir_set_cnt
+global rt_inst ulong 64
+
+text rt_rc_ok "OK"
+text rt_rc_bad "BAD_ARGS"
+text rt_rc_big "TOO_LARGE"
+text rt_rc_cg "CODEGEN_FAIL"
+text rt_rc_chip "CHIP_FAIL"
+text rt_rc_unk "?"
+
+text rt_err_none ""
+text rt_err_evict "router record: kernel cache miss would evict the resident kernel"
+text rt_err_cg "router codegen refused the spec"
+text rt_err_reg "router: register file"
+text rt_err_gpr "declared registers below peak + 2: refusing to launch"
+
+fn rt_gpr_declared peak ulong to ulong
+  ret mul div add peak 9 8 8
+end
+
+fn rt_gpr_declared_ok decl ulong peak ulong to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn rt_copy_txt src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get src i
+  end
+  ret n
+end
+
+fn rt_slot_clear to void
+  for i ulong 16
+    put rt_slot_plain i 0
+    put rt_slot_rows i 0
+  end
+end
+
+fn rt_alloc_va sz ulong to ulong
+  cur = get rt_g_cfg 4
+  if eq cur 0
+    cur = ulong 0x10000000
+  end
+  aligned = and add cur 255 ulong 0xffffffffffffff00
+  nxt = add aligned and add sz 4095 ulong 0xfffffffffffff000
+  put rt_g_cfg 4 nxt
+  ret aligned
+end
+
+fn omega_gpu_router_set_shape warps ulong depth ulong to void
+  put rt_g_cfg 0 warps
+  put rt_g_cfg 1 depth
+  rt_slot_clear
+end
+
+fn omega_gpu_router_test_set_mutant mut ulong to void
+  put rt_g_cfg 2 mut
+  rt_slot_clear
+end
+
+fn omega_gpu_router_last_error dst edit uchar * to ulong
+  e = get rt_g_cfg 5
+  if eq e 1
+    ret rt_copy_txt rt_err_evict dst
+  end
+  if eq e 2
+    ret rt_copy_txt rt_err_cg dst
+  end
+  if eq e 3
+    ret rt_copy_txt rt_err_reg dst
+  end
+  if eq e 4
+    ret rt_copy_txt rt_err_gpr dst
+  end
+  ret rt_copy_txt rt_err_none dst
+end
+
+fn omega_gpu_router_rc_name rc long dst edit uchar * to ulong
+  if eq rc OMEGA_GPU_ROUTER_OK
+    ret rt_copy_txt rt_rc_ok dst
+  end
+  if eq rc OMEGA_GPU_ROUTER_BAD_ARGS
+    ret rt_copy_txt rt_rc_bad dst
+  end
+  if eq rc OMEGA_GPU_ROUTER_TOO_LARGE
+    ret rt_copy_txt rt_rc_big dst
+  end
+  if eq rc OMEGA_GPU_ROUTER_CODEGEN_FAIL
+    ret rt_copy_txt rt_rc_cg dst
+  end
+  if eq rc OMEGA_GPU_ROUTER_CHIP_FAIL
+    ret rt_copy_txt rt_rc_chip dst
+  end
+  ret rt_copy_txt rt_rc_unk dst
+end
+
+fn rt_handle_ok h ulong to long
+  if ge h 4
+    ret 0
+  end
+  base = mul h 16
+  if eq get rt_inst base 0
+    ret 0
+  end
+  ret 1
+end
+
+fn omega_gpu_router_alloc_shape layers ulong experts ulong shared ulong out_h edit ulong 1 to long
+  put out_h 0 4
+  if eq layers 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if gt layers OMEGA_GPU_ROUTER_MAX_LAYERS
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  ex = experts
+  if eq ex 0
+    ex = OMEGA_ROUTER_EXPERTS
+  end
+  if and ne ex 128 ne ex 256
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if gt shared 1
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  slot = ulong 4
+  for i ulong 4
+    if eq get rt_inst mul i 16 0
+      if eq slot 4
+        slot = i
+      end
+    end
+  end
+  if eq slot 4
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  base = mul slot 16
+  rows = add ex shared
+  put rt_inst base 1
+  put rt_inst add base 1 layers
+  put rt_inst add base 2 ex
+  put rt_inst add base 3 shared
+  put rt_inst add base 4 rows
+  put rt_inst add base 5 add OMEGA_ROUTER_TOPK shared
+  if ne shared 0
+    put rt_inst add base 6 RT_LB_TAB_DN9
+    put rt_inst add base 7 RT_LB_BYTES9
+  else
+    put rt_inst add base 6 RT_LB_TAB_DN
+    put rt_inst add base 7 RT_LB_BYTES
+  end
+  put rt_inst add base 8 rt_alloc_va mul layers mul rows OMEGA_ROUTER_ROW_BYTES
+  put rt_inst add base 9 rt_alloc_va mul layers mul OMEGA_ROUTER_HIDDEN 4
+  put rt_inst add base 10 rt_alloc_va mul layers mul 2 mul rows 16
+  put rt_inst add base 11 rt_alloc_va get rt_inst add base 7
+  put rt_inst add base 12 0
+  put rt_inst add base 13 0
+  put out_h 0 slot
+  ret OMEGA_GPU_ROUTER_OK
+end
+
+fn omega_gpu_router_alloc layers ulong out_h edit ulong 1 to long
+  ret omega_gpu_router_alloc_shape layers 0 0 out_h
+end
+
+fn omega_gpu_router_free h ulong to void
+  if ge h 4
+    ret
+  end
+  base = mul h 16
+  for i ulong 16
+    put rt_inst add base i 0
+  end
+end
+
+fn omega_gpu_router_set_layer h ulong layer ulong gate_len ulong norm_len ulong to long
+  if eq rt_handle_ok h 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  base = mul h 16
+  if ge layer get rt_inst add base 1
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  need_gate = mul get rt_inst add base 4 OMEGA_ROUTER_HIDDEN
+  if lt gate_len need_gate
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if lt norm_len OMEGA_ROUTER_HIDDEN
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  put rt_inst add base 12 add get rt_inst add base 12 1
+  ret OMEGA_GPU_ROUTER_OK
+end
+
+fn omega_gpu_router_set_directory h ulong layer ulong gu_len ulong dn_len ulong to long
+  if eq rt_handle_ok h 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  base = mul h 16
+  if ge layer get rt_inst add base 1
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  need = mul get rt_inst add base 4 2
+  if lt gu_len need
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if lt dn_len need
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  put rt_inst add base 13 add get rt_inst add base 13 1
+  ret OMEGA_GPU_ROUTER_OK
+end
+
+fn omega_gpu_router_set_directory_fp8 h ulong layer ulong gu_experts ulong dn_experts ulong to long
+  if eq rt_handle_ok h 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  base = mul h 16
+  rows = get rt_inst add base 4
+  if lt gu_experts rows
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if lt dn_experts rows
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  ret omega_gpu_router_set_directory h layer mul rows 2 mul rows 2
+end
+
+fn omega_gpu_router_device_outputs h ulong dst edit ulong 3 to void
+  if eq rt_handle_ok h 0
+    put dst 0 0
+    put dst 1 0
+    put dst 2 0
+    ret
+  end
+  base = mul h 16
+  lb = get rt_inst add base 11
+  tab_dn = get rt_inst add base 6
+  put dst 0 add lb RT_LB_XOUT
+  put dst 1 add lb RT_LB_TAB_GU
+  put dst 2 add lb tab_dn
+end
+
+fn omega_gpu_router_read_back h ulong dst edit ulong 3 to long
+  if eq rt_handle_ok h 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  omega_gpu_router_device_outputs h dst
+  ret OMEGA_GPU_ROUTER_OK
+end
+
+fn omega_gpu_router_layout_bytes h ulong to ulong
+  if eq rt_handle_ok h 0
+    ret 0
+  end
+  base = mul h 16
+  ret get rt_inst add base 7
+end
+
+fn rt_spec_for h ulong xstride ulong lbstride ulong sp edit ulong 8 to void
+  for i ulong 8
+    put sp i 0
+  end
+  w = get rt_g_cfg 0
+  if eq w 0
+    w = OMEGA_GPU_ROUTER_WARPS
+  end
+  d = get rt_g_cfg 1
+  if eq d 0
+    d = OMEGA_GPU_ROUTER_DEPTH
+  end
+  base = mul h 16
+  ex = get rt_inst add base 2
+  sh = get rt_inst add base 3
+  put sp 0 w
+  put sp 1 d
+  put sp 2 get rt_g_cfg 2
+  if eq ex OMEGA_ROUTER_EXPERTS
+    put sp 3 0
+  else
+    put sp 3 ex
+  end
+  put sp 4 sh
+  put sp 5 xstride
+  put sp 6 lbstride
+end
+
+fn rt_slot_match is_rows ulong sp view ulong 8 to long
+  if eq is_rows 0
+    if eq get rt_slot_plain 0 0
+      ret 0
+    end
+    for i ulong 8
+      if ne get rt_slot_plain add 5 i get sp i
+        ret 0
+      end
+    end
+    ret 1
+  end
+  if eq get rt_slot_rows 0 0
+    ret 0
+  end
+  for i ulong 8
+    if ne get rt_slot_rows add 5 i get sp i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn rt_slot_store is_rows ulong code_va ulong peak ulong decl ulong insns ulong sp view ulong 8 to void
+  if eq is_rows 0
+    put rt_slot_plain 0 1
+    put rt_slot_plain 1 code_va
+    put rt_slot_plain 2 peak
+    put rt_slot_plain 3 decl
+    put rt_slot_plain 4 insns
+    for i ulong 8
+      put rt_slot_plain add 5 i get sp i
+    end
+    ret
+  end
+  put rt_slot_rows 0 1
+  put rt_slot_rows 1 code_va
+  put rt_slot_rows 2 peak
+  put rt_slot_rows 3 decl
+  put rt_slot_rows 4 insns
+  for i ulong 8
+    put rt_slot_rows add 5 i get sp i
+  end
+end
+
+fn rt_kernel_for sp view ulong 8 kout edit ulong 4 to long
+  is_rows = ulong 0
+  if ne get sp 5 0
+    is_rows = 1
+  end
+  if ne rt_slot_match is_rows sp 0
+    if eq is_rows 0
+      put kout 0 get rt_slot_plain 1
+      put kout 1 get rt_slot_plain 2
+      put kout 2 get rt_slot_plain 3
+      put kout 3 1
+    else
+      put kout 0 get rt_slot_rows 1
+      put kout 1 get rt_slot_rows 2
+      put kout 2 get rt_slot_rows 3
+      put kout 3 1
+    end
+    ret OMEGA_GPU_ROUTER_OK
+  end
+  has_valid = ulong 0
+  if eq is_rows 0
+    has_valid = get rt_slot_plain 0
+  else
+    has_valid = get rt_slot_rows 0
+  end
+  if and ne get rt_g_cfg 3 0 ne has_valid 0
+    put rt_g_cfg 5 1
+    ret OMEGA_GPU_ROUTER_TOO_LARGE
+  end
+  stats = new uint 2 0
+  if ne omega_router_prog_stats sp stats 0
+    put rt_g_cfg 5 2
+    ret OMEGA_GPU_ROUTER_CODEGEN_FAIL
+  end
+  insns = ulong get stats 0
+  peak = ulong get stats 1
+  if eq insns 0
+    put rt_g_cfg 5 2
+    ret OMEGA_GPU_ROUTER_CODEGEN_FAIL
+  end
+  decl = rt_gpr_declared peak
+  if gt mul mul 32 get sp 0 decl 65536
+    put rt_g_cfg 5 3
+    ret OMEGA_GPU_ROUTER_TOO_LARGE
+  end
+  code_va = rt_alloc_va mul insns 16
+  rt_slot_store is_rows code_va peak decl insns sp
+  put kout 0 code_va
+  put kout 1 peak
+  put kout 2 decl
+  put kout 3 0
+  ret OMEGA_GPU_ROUTER_OK
+end
+
+fn rt_put64 args edit uint 23 idx ulong v ulong to void
+  put args idx uint and v 0xffffffff
+  put args add idx 1 uint shr v 32
+end
+
+fn rt_pack_args h ulong layer ulong x_va ulong lb ulong sc_bits view uint 3 args edit uint 23 to void
+  base = mul h 16
+  rows = get rt_inst add base 4
+  rt_put64 args 0 x_va
+  v = mul rows OMEGA_ROUTER_ROW_BYTES
+  v = add get rt_inst add base 8 mul layer v
+  rt_put64 args 2 v
+  v = mul layer 8192
+  v = add get rt_inst add base 9 v
+  rt_put64 args 4 v
+  rt_put64 args 6 add lb RT_LB_XOUT
+  rt_put64 args 8 add lb RT_LB_IDS
+  rt_put64 args 10 add lb RT_LB_WTS
+  v = mul rows 32
+  v = add get rt_inst add base 10 mul layer v
+  rt_put64 args 12 v
+  v = add v mul rows 16
+  rt_put64 args 14 v
+  rt_put64 args 16 add lb RT_LB_TAB_GU
+  rt_put64 args 18 add lb get rt_inst add base 6
+  put args 20 get sc_bits 0
+  put args 21 get sc_bits 1
+  put args 22 get sc_bits 2
+end
+
+note req[8]: [0]=h, [1]=layer, [2]=rec, [3]=dev_x, [4]=rec_lb, [5]=xstride, [6]=lbstride, [7]=rows
+fn rt_core req view ulong 8 sc_bits view uint 3 launch edit ulong 12 args edit uint 23 to long
+  sp = new ulong 8 0
+  sm = new uint 6 0
+  kout = new ulong 4 0
+  h = get req 0
+  if eq rt_handle_ok h 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if ge get req 1 get rt_inst add mul h 16 1
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if and ne get req 2 0 eq get req 3 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if gt get req 7 1
+    if or eq get req 2 0 eq get req 4 0
+      ret OMEGA_GPU_ROUTER_BAD_ARGS
+    end
+    rt_spec_for h get req 5 get req 6 sp
+  else
+    rt_spec_for h 0 0 sp
+  end
+  if ne omega_router_smem sp sm 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  put rt_g_cfg 3 get req 2
+  rc = rt_kernel_for sp kout
+  put rt_g_cfg 3 0
+  if ne rc OMEGA_GPU_ROUTER_OK
+    ret rc
+  end
+  if eq rt_gpr_declared_ok get kout 2 get kout 1 0
+    put rt_g_cfg 5 4
+    ret OMEGA_GPU_ROUTER_CHIP_FAIL
+  end
+  lb = get req 4
+  if eq lb 0
+    lb = get rt_inst add mul h 16 11
+  end
+  xva = get req 3
+  if eq get req 2 0
+    xva = add get rt_inst add mul h 16 11 RT_LB_X
+  end
+  rt_pack_args h get req 1 xva lb sc_bits args
+  gy = ulong 1
+  if gt get req 7 1
+    gy = get req 7
+  end
+  put launch 0 get kout 0
+  put launch 1 get kout 2
+  put launch 2 mul 32 get sp 0
+  put launch 3 1
+  put launch 4 1
+  put launch 5 gy
+  put launch 6 mul OMEGA_ROUTER_HIDDEN gy
+  put launch 7 OMEGA_ROUTER_ARGS_WORDS
+  put launch 8 RT_MARKER_TIMEOUT_MS
+  put launch 9 ulong get sm 5
+  put launch 10 0
+  put launch 11 get kout 1
+  ret OMEGA_GPU_ROUTER_OK
+end
+
+fn omega_gpu_router h ulong layer ulong sc_bits view uint 3 launch edit ulong 12 args edit uint 23 to long
+  req = new ulong 8 0
+  put req 0 h
+  put req 1 layer
+  ret rt_core req sc_bits launch args
+end
+
+note hdr[4]: [0]=cl_ok, [1]=h, [2]=layer, [3]=x_va
+fn omega_gpu_router_record hdr view ulong 4 sc_bits view uint 3 dev_out edit ulong 5 launch edit ulong 12 args edit uint 23 to long
+  if eq get hdr 0 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  h = get hdr 1
+  req = new ulong 8 0
+  put req 0 h
+  put req 1 get hdr 2
+  put req 2 1
+  put req 3 get hdr 3
+  rc = rt_core req sc_bits launch args
+  if eq rc OMEGA_GPU_ROUTER_OK
+    base = mul h 16
+    lb = get rt_inst add base 11
+    put dev_out 0 add lb RT_LB_XOUT
+    put dev_out 1 add lb RT_LB_IDS
+    put dev_out 2 add lb RT_LB_WTS
+    put dev_out 3 add lb RT_LB_TAB_GU
+    put dev_out 4 add lb get rt_inst add base 6
+  end
+  ret rc
+end
+
+note hdr[5]: [0]=cl_ok, [1]=h, [2]=layer, [3]=x_va, [4]=lb_va
+fn omega_gpu_router_record_to hdr view ulong 5 sc_bits view uint 3 dev_out edit ulong 5 launch edit ulong 12 args edit uint 23 to long
+  h = get hdr 1
+  lb_va = get hdr 4
+  if or eq get hdr 0 0 eq rt_handle_ok h 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if or eq lb_va 0 ne and lb_va 255 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  req = new ulong 8 0
+  put req 0 h
+  put req 1 get hdr 2
+  put req 2 1
+  put req 3 get hdr 3
+  put req 4 lb_va
+  rc = rt_core req sc_bits launch args
+  if eq rc OMEGA_GPU_ROUTER_OK
+    base = mul h 16
+    put dev_out 0 add lb_va RT_LB_XOUT
+    put dev_out 1 add lb_va RT_LB_IDS
+    put dev_out 2 add lb_va RT_LB_WTS
+    put dev_out 3 add lb_va RT_LB_TAB_GU
+    put dev_out 4 add lb_va get rt_inst add base 6
+  end
+  ret rc
+end
+
+fn omega_gpu_router_prepare_rows h ulong xstride ulong lbstride ulong to long
+  if eq rt_handle_ok h 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  base = mul h 16
+  lb_b = get rt_inst add base 7
+  if lt xstride mul OMEGA_ROUTER_HIDDEN 4
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if ne and xstride 15 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if lt lbstride lb_b
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if ne and lbstride 255 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  sp = new ulong 8 0
+  rt_spec_for h xstride lbstride sp
+  kout = new ulong 4 0
+  put rt_g_cfg 3 0
+  ret rt_kernel_for sp kout
+end
+
+fn rt_fill_dev_out h ulong lb_va ulong dev_out edit ulong 5 to void
+  put dev_out 0 add lb_va RT_LB_XOUT
+  put dev_out 1 add lb_va RT_LB_IDS
+  put dev_out 2 add lb_va RT_LB_WTS
+  put dev_out 3 add lb_va RT_LB_TAB_GU
+  put dev_out 4 add lb_va get rt_inst add mul h 16 6
+end
+
+note hdr[8]: [0]=cl_ok, [1]=h, [2]=layer, [3]=x_va, [4]=lb_va, [5]=xstride, [6]=lbstride, [7]=rows
+fn omega_gpu_router_record_rows hdr view ulong 8 sc_bits view uint 3 dev_out edit ulong 5 launch edit ulong 12 args edit uint 23 to long
+  h5 = new ulong 5 0
+  req = new ulong 8 0
+  if or eq get hdr 0 0 eq rt_handle_ok get hdr 1 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if or eq get hdr 4 0 ne and get hdr 4 255 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if or eq get hdr 7 0 gt get hdr 7 OMEGA_GPU_ROUTER_MAX_ROWS
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if eq get hdr 7 1
+    for i ulong 5
+      put h5 i get hdr i
+    end
+    ret omega_gpu_router_record_to h5 sc_bits dev_out launch args
+  end
+  if lt get hdr 5 mul OMEGA_ROUTER_HIDDEN 4
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if ne and get hdr 5 15 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if lt get hdr 6 get rt_inst add mul get hdr 1 16 7
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  if ne and get hdr 6 255 0
+    ret OMEGA_GPU_ROUTER_BAD_ARGS
+  end
+  put req 0 get hdr 1
+  put req 1 get hdr 2
+  put req 2 1
+  put req 3 get hdr 3
+  put req 4 get hdr 4
+  put req 5 get hdr 5
+  put req 6 get hdr 6
+  put req 7 get hdr 7
+  rc = rt_core req sc_bits launch args
+  if eq rc OMEGA_GPU_ROUTER_OK
+    rt_fill_dev_out get hdr 1 get hdr 4 dev_out
+  end
+  ret rc
+end

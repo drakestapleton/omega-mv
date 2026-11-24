@@ -1,0 +1,349 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_gemm.om: Pure seeded OM-2 port of src/omega_gpu_gemm.c.
+note Composes om/gpu/cg_gpu_gemm.om and src/omega_blackwell_qmd.om.
+om2
+
+const OMEGA_GPU_GEMM_OK long 0
+const OMEGA_GPU_GEMM_BAD_ARGS long -1
+const OMEGA_GPU_GEMM_TOO_LARGE long -2
+const OMEGA_GPU_GEMM_CODEGEN_FAIL long -3
+const OMEGA_GPU_GEMM_CHIP_FAIL long -4
+
+const OMEGA_GPU_GEMM_BF16 ulong 0
+const OMEGA_GPU_GEMM_E4M3 ulong 1
+const OMEGA_GPU_GEMM_A_COL ulong 1
+const OMEGA_GPU_GEMM_B_COL ulong 2
+
+const OMEGA_GEMM_K_PACK_A ulong 0
+const OMEGA_GEMM_K_PACK_B ulong 1
+const OMEGA_GEMM_K_MAIN ulong 2
+const OMEGA_GEMM_K_COUNT ulong 3
+const OMEGA_GPU_GEMM_ARGS_WORDS ulong 9
+const GM_TIMEOUT_MS ulong 60000
+
+note Per-type cfg state: set[2], cfg[2 x 7], gpr[2 x 3], next_va
+global gm_g_set ulong 2
+global gm_g_cfg ulong 14
+global gm_g_gpr ulong 6
+global gm_g_va ulong 1
+
+text gm_rc_ok "OK"
+text gm_rc_bad "BAD_ARGS"
+text gm_rc_big "TOO_LARGE"
+text gm_rc_cg "CODEGEN_FAIL"
+text gm_rc_chip "CHIP_FAIL"
+text gm_rc_unk "?"
+
+fn gm_copy_txt src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get src i
+  end
+  ret n
+end
+
+fn gm_pow124 v ulong to long
+  if or eq v 1 or eq v 2 eq v 4
+    ret 1
+  end
+  ret 0
+end
+
+fn gm_up256 v ulong to ulong
+  ret and add v 255 ulong 0xffffffffffffff00
+end
+
+fn gm_alloc_va sz ulong to ulong
+  cur = get gm_g_va 0
+  if eq cur 0
+    cur = ulong 0x50000000
+  end
+  aligned = gm_up256 cur
+  nxt = add aligned and add sz 4095 ulong 0xfffffffffffff000
+  put gm_g_va 0 nxt
+  ret aligned
+end
+
+note cfg[7]: [0]=type, [1]=rt, [2]=ct, [3]=wm, [4]=wn, [5]=stall, [6]=mutant
+fn omega_gpu_gemm_default_cfg gtype ulong cfg edit ulong 7 to void
+  put cfg 0 gtype
+  put cfg 1 2
+  put cfg 2 4
+  put cfg 3 2
+  put cfg 4 2
+  if eq gtype OMEGA_GPU_GEMM_BF16
+    put cfg 5 4
+  else
+    put cfg 5 2
+  end
+  put cfg 6 0
+end
+
+fn omega_gpu_gemm_cfg_ok c view ulong 7 to long
+  gt_v = get c 0
+  if and ne gt_v OMEGA_GPU_GEMM_BF16 ne gt_v OMEGA_GPU_GEMM_E4M3
+    ret 0
+  end
+  if eq gm_pow124 get c 1 0
+    ret 0
+  end
+  if eq gm_pow124 get c 2 0
+    ret 0
+  end
+  if eq gm_pow124 get c 3 0
+    ret 0
+  end
+  if eq gm_pow124 get c 4 0
+    ret 0
+  end
+  st = get c 5
+  if or lt st 1 gt st 15
+    ret 0
+  end
+  if gt get c 6 3
+    ret 0
+  end
+  rt = get c 1
+  ct = get c 2
+  regs = mul 4 add add mul 4 rt mul 2 ct mul rt ct
+  if gt regs 100
+    ret 0
+  end
+  ret 1
+end
+
+fn omega_gpu_gemm_codegen cfg view ulong 7 kind ulong ins edit ulong 8192 meta edit ulong 512 to long
+  if ge kind OMEGA_GEMM_K_COUNT
+    ret -1
+  end
+  sp = new ulong 8 0
+  for i ulong 7
+    put sp i get cfg i
+  end
+  put sp 7 kind
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  if ne cg_gpu_gemm_emit sp ins meta 0
+    ret -1
+  end
+  if or ne get meta 5 0 eq get meta 0 0
+    ret -1
+  end
+  ret 0
+end
+
+note plan[18] matches cg_gpu_gemm_plan res[18]:
+note   0:Mp 1:Np 2:Kp 3:KS2 4:a_bytes 5:b_bytes 6:ap_bytes 7:bp_bytes
+note   8..9:grid[PACK_A] 10..11:grid[PACK_B] 12..13:grid[MAIN]
+note   14:threads[PACK_A] 15:threads[PACK_B] 16:threads[MAIN]
+fn omega_gpu_gemm_plan cfg view ulong 7 m ulong n ulong k ulong plan edit ulong 18 to long
+  sp = new ulong 10 0
+  for i ulong 7
+    put sp i get cfg i
+  end
+  put sp 7 m
+  put sp 8 n
+  put sp 9 k
+  for i ulong 18
+    put plan i 0
+  end
+  rc = cg_gpu_gemm_plan sp plan
+  if eq rc 2
+    ret OMEGA_GPU_GEMM_TOO_LARGE
+  end
+  if ne rc 0
+    ret OMEGA_GPU_GEMM_BAD_ARGS
+  end
+  ret OMEGA_GPU_GEMM_OK
+end
+
+fn gm_put64 dst edit uint 27 off ulong v ulong to void
+  put dst off uint and v 0xffffffff
+  put dst add off 1 uint shr v 32
+end
+
+fn gm_fill_launches plan view ulong 18 launches edit ulong 36 to void
+  for kd ulong 3
+    lo = mul kd 12
+    gx = get plan add 8 mul kd 2
+    gy = get plan add 9 mul kd 2
+    th = get plan add 14 kd
+    put launches lo gm_alloc_va 4096
+    put launches add lo 1 128
+    put launches add lo 2 th
+    put launches add lo 3 1
+    put launches add lo 4 gx
+    put launches add lo 5 gy
+    put launches add lo 6 mul mul gx gy th
+    put launches add lo 7 OMEGA_GPU_GEMM_ARGS_WORDS
+    put launches add lo 8 GM_TIMEOUT_MS
+    put launches add lo 9 0
+    put launches add lo 10 0
+    put launches add lo 11 96
+  end
+end
+
+note Host-mode 3-kernel driver: fills launches[36] (3 x 12 ulongs) and all_args[27] (3 x 9 uints).
+note vas[5] = {a_va, b_va, ap_va, bp_va, c_va}, dims[3] = {M, N, K}.
+fn omega_gpu_gemm_drive cfg view ulong 7 lay ulong dims view ulong 3 vas view ulong 5 launches edit ulong 36 all_args edit uint 27 to long
+  plan = new ulong 18 0
+  if ne and lay ulong 0xfffffffffffffffc 0
+    ret OMEGA_GPU_GEMM_BAD_ARGS
+  end
+  rc = omega_gpu_gemm_plan cfg get dims 0 get dims 1 get dims 2 plan
+  if ne rc OMEGA_GPU_GEMM_OK
+    ret rc
+  end
+  for i ulong 27
+    put all_args i 0
+  end
+  ks2 = uint get plan 3
+  note Kernel 0: PACK_A
+  gm_put64 all_args 0 get vas 0
+  gm_put64 all_args 2 get vas 2
+  put all_args 4 uint get dims 0
+  put all_args 5 uint get dims 2
+  if ne and lay OMEGA_GPU_GEMM_A_COL 0
+    put all_args 6 1
+    put all_args 7 uint get dims 0
+  else
+    put all_args 6 uint get dims 2
+    put all_args 7 1
+  end
+  put all_args 8 ks2
+  note Kernel 1: PACK_B (offset 9)
+  gm_put64 all_args 9 get vas 1
+  gm_put64 all_args 11 get vas 3
+  put all_args 13 uint get dims 1
+  put all_args 14 uint get dims 2
+  if ne and lay OMEGA_GPU_GEMM_B_COL 0
+    put all_args 15 uint get dims 2
+    put all_args 16 1
+  else
+    put all_args 15 1
+    put all_args 16 uint get dims 1
+  end
+  put all_args 17 ks2
+  note Kernel 2: MAIN (offset 18)
+  gm_put64 all_args 18 get vas 2
+  gm_put64 all_args 20 get vas 3
+  gm_put64 all_args 22 get vas 4
+  put all_args 24 uint get dims 0
+  put all_args 25 uint get dims 1
+  put all_args 26 ks2
+  gm_fill_launches plan launches
+  ret OMEGA_GPU_GEMM_OK
+end
+
+fn gm_get_cfg gtype ulong cfg edit ulong 7 to void
+  if eq get gm_g_set gtype 0
+    omega_gpu_gemm_default_cfg gtype cfg
+    base = mul gtype 7
+    for i ulong 7
+      put gm_g_cfg add base i get cfg i
+    end
+    put gm_g_set gtype 1
+    ret
+  end
+  base = mul gtype 7
+  for i ulong 7
+    put cfg i get gm_g_cfg add base i
+  end
+end
+
+fn omega_gpu_gemm_test_set_cfg gtype ulong use_cfg ulong cfg view ulong 7 to long
+  if gt gtype OMEGA_GPU_GEMM_E4M3
+    ret OMEGA_GPU_GEMM_BAD_ARGS
+  end
+  if ne use_cfg 0
+    if or eq omega_gpu_gemm_cfg_ok cfg 0 ne get cfg 0 gtype
+      ret OMEGA_GPU_GEMM_BAD_ARGS
+    end
+    base = mul gtype 7
+    for i ulong 7
+      put gm_g_cfg add base i get cfg i
+    end
+    put gm_g_set gtype 1
+    ret OMEGA_GPU_GEMM_OK
+  end
+  defc = new ulong 7 0
+  omega_gpu_gemm_default_cfg gtype defc
+  base = mul gtype 7
+  for i ulong 7
+    put gm_g_cfg add base i get defc i
+  end
+  put gm_g_set gtype 1
+  ret OMEGA_GPU_GEMM_OK
+end
+
+fn omega_gpu_gemm_rc_name rc long dst edit uchar * to ulong
+  if eq rc OMEGA_GPU_GEMM_OK
+    ret gm_copy_txt gm_rc_ok dst
+  end
+  if eq rc OMEGA_GPU_GEMM_BAD_ARGS
+    ret gm_copy_txt gm_rc_bad dst
+  end
+  if eq rc OMEGA_GPU_GEMM_TOO_LARGE
+    ret gm_copy_txt gm_rc_big dst
+  end
+  if eq rc OMEGA_GPU_GEMM_CODEGEN_FAIL
+    ret gm_copy_txt gm_rc_cg dst
+  end
+  if eq rc OMEGA_GPU_GEMM_CHIP_FAIL
+    ret gm_copy_txt gm_rc_chip dst
+  end
+  ret gm_copy_txt gm_rc_unk dst
+end
+
+fn gm_emit_all cfg view ulong 7 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  for kd ulong 3
+    if ne omega_gpu_gemm_codegen cfg kd ins meta 0
+      ret OMEGA_GPU_GEMM_CODEGEN_FAIL
+    end
+  end
+  ret OMEGA_GPU_GEMM_OK
+end
+
+fn gm_layout_vas plan view ulong 18 dims view ulong 3 vas edit ulong 5 to void
+  ob = gm_up256 add get plan 4 16
+  oap = add ob gm_up256 add get plan 5 16
+  obp = add oap gm_up256 get plan 6
+  oc = add obp gm_up256 get plan 7
+  base_va = gm_alloc_va add oc mul mul get dims 0 get dims 1 4
+  put vas 0 base_va
+  put vas 1 add base_va ob
+  put vas 2 add base_va oap
+  put vas 3 add base_va obp
+  put vas 4 add base_va oc
+end
+
+note Host-mode full GEMM orchestration: validates, plans, emits all 3 kernels, computes
+note single-buffer layout (A | B | packed A | packed B | C), and drives 3 launches.
+fn omega_gpu_gemm gtype ulong lay ulong dims view ulong 3 launches edit ulong 36 all_args edit uint 27 to long
+  cfg = new ulong 7 0
+  plan = new ulong 18 0
+  vas = new ulong 5 0
+  if or gt gtype OMEGA_GPU_GEMM_E4M3 ne and lay ulong 0xfffffffffffffffc 0
+    ret OMEGA_GPU_GEMM_BAD_ARGS
+  end
+  gm_get_cfg gtype cfg
+  rc = omega_gpu_gemm_plan cfg get dims 0 get dims 1 get dims 2 plan
+  if ne rc OMEGA_GPU_GEMM_OK
+    ret rc
+  end
+  if ne gm_emit_all cfg OMEGA_GPU_GEMM_OK
+    ret OMEGA_GPU_GEMM_CODEGEN_FAIL
+  end
+  gm_layout_vas plan dims vas
+  ret omega_gpu_gemm_drive cfg lay dims vas launches all_args
+end

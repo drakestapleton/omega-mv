@@ -1,0 +1,711 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_pfgemm.om: Pure seeded OM-2 port of src/omega_gpu_pfgemm.c.
+note Composes src/omega_blackwell_codegen_tc2.om, src/omega_blackwell_codegen_qg.om,
+note src/omega_gpu_fp8_pack.om, and src/omega_blackwell_qmd.om.
+om2
+
+const PF_OK long 0
+const PF_BAD_ARGS long -1
+const PF_TOO_LARGE long -2
+const PF_CODEGEN_FAIL long -3
+const PF_CHIP_FAIL long -4
+
+const OMEGA_GPU_PF_PLAIN ulong 0
+const OMEGA_GPU_PF_SWIGLU ulong 1
+const OMEGA_GPU_PF_SWIGLU_NAT ulong 2
+
+const PF_TC2_EPI_F32 ulong 0
+const PF_TC2_EPI_SWIGLU ulong 1
+const PF_QG_EPI_F32 ulong 0
+const PF_QG_EPI_SWIGLU ulong 1
+
+const PF_TC2_ARGS_WORDS ulong 9
+const PF_PQ_ARGS_WORDS ulong 6
+const PF_QG_ARGS_WORDS ulong 11
+const PF_TIMEOUT_MS ulong 20000
+
+note TC2 global knobs: [0]=rt, [1]=warps, [2]=aqn, [3]=mutant
+global pf_g_tc2 ulong 4
+note PQ global knobs: [0]=mutant
+global pf_g_pq ulong 2
+note QG global knobs: [0]=rt, [1]=warps, [2]=wait, [3]=set, [4]=mutant
+global pf_g_qg ulong 6
+note VA allocator cursor
+global pf_g_va ulong 1
+note Weight handle pool (4 handles x 8 ulongs):
+note   0:used 1:experts 2:n 3:k 4:layout 5:w_va 6:r_va 7:pad
+global pf_weights ulong 32
+
+fn pf_gpr_declared peak ulong to ulong
+  ret mul div add peak 9 8 8
+end
+
+fn pf_alloc_va sz ulong to ulong
+  cur = get pf_g_va 0
+  if eq cur 0
+    cur = ulong 0x60000000
+  end
+  aligned = and add cur 255 ulong 0xffffffffffffff00
+  nxt = add aligned and add sz 4095 ulong 0xfffffffffffff000
+  put pf_g_va 0 nxt
+  ret aligned
+end
+
+fn pf_put64_9 args edit uint 9 idx ulong v ulong to void
+  put args idx uint and v 0xffffffff
+  put args add idx 1 uint shr v 32
+end
+
+fn pf_put64_6 args edit uint 6 idx ulong v ulong to void
+  put args idx uint and v 0xffffffff
+  put args add idx 1 uint shr v 32
+end
+
+fn pf_put64_11 args edit uint 11 idx ulong v ulong to void
+  put args idx uint and v 0xffffffff
+  put args add idx 1 uint shr v 32
+end
+
+fn omega_gpu_pf_gemm_set_shape rt ulong warps ulong aqn ulong to void
+  put pf_g_tc2 0 rt
+  put pf_g_tc2 1 warps
+  put pf_g_tc2 2 aqn
+end
+
+fn omega_gpu_pf_gemm_test_set_mutant m ulong to void
+  put pf_g_tc2 3 m
+end
+
+fn pf_rt to ulong
+  v = get pf_g_tc2 0
+  if ne v 0
+    ret v
+  end
+  ret 8
+end
+
+fn omega_gpu_pf_gemm_bm to ulong
+  ret mul 16 pf_rt
+end
+
+fn pf_perm4 q ulong to ulong
+  lo = and q 3
+  hi = and q ulong 0xfffffffffffffffc
+  if eq lo 1
+    ret or hi 2
+  end
+  if eq lo 2
+    ret or hi 1
+  end
+  ret q
+end
+
+fn pf_w_handle_ok h ulong to long
+  if ge h 4
+    ret 0
+  end
+  if eq get pf_weights mul h 8 0
+    ret 0
+  end
+  ret 1
+end
+
+fn pf_copy_row w view uchar 32768 pw edit uchar 32768 src_off ulong dst_off ulong k ulong to void
+  for c ulong k
+    put pw add dst_off c get w add src_off c
+  end
+end
+
+fn pf_fill_ratio sf view f32 4096 ratio edit f32 4096 rbase ulong srow ulong kb ulong to void
+  put ratio rbase f32 1.0
+  for b ulong kb
+    if gt b 0
+      a = get sf add srow sub b 1
+      c = get sf add srow b
+      put ratio add rbase mul 2 b div a c
+    end
+  end
+  put ratio add rbase mul 2 kb get sf add srow sub kb 1
+end
+
+fn pf_src_row p ulong n ulong lay ulong to ulong
+  if ne lay OMEGA_GPU_PF_SWIGLU
+    ret p
+  end
+  grp = div p 16
+  h = rem p 16
+  idx = pf_perm4 add mul 8 grp rem h 8
+  if lt h 8
+    ret idx
+  end
+  ret add div n 2 idx
+end
+
+fn pf_host_form_w e ulong dims view ulong 4 w view uchar 32768 pw edit uchar 32768 to void
+  n = get dims 1
+  k = get dims 2
+  for p ulong n
+    src = pf_src_row p n get dims 3
+    so = mul add mul e n src k
+    doff = mul add mul e n p k
+    pf_copy_row w pw so doff k
+  end
+end
+
+fn pf_rbase e ulong p ulong n ulong kb ulong to ulong
+  gidx = add mul e div n 16 div p 16
+  st = mul add kb 1 2
+  ret add mul gidx st rem div p 8 2
+end
+
+fn pf_host_form_r e ulong dims view ulong 4 sf view f32 4096 ratio edit f32 4096 to void
+  for p ulong get dims 1
+    if eq rem p 8 0
+      kb = div get dims 2 128
+      rb = pf_rbase e p get dims 1 kb
+      src = pf_src_row p get dims 1 get dims 3
+      pf_fill_ratio sf ratio rb mul div src 128 kb kb
+    end
+  end
+end
+
+fn pf_pack_expert_scales sinv view ushort 4096 sbase ulong nblk ulong sf edit f32 4096 to long
+  sinv_e = new ushort 4096 0
+  for b ulong nblk
+    put sinv_e b get sinv add sbase b
+  end
+  if ne omega_fp8_pack_scales sinv_e nblk sf 0 0
+    ret PF_BAD_ARGS
+  end
+  ret PF_OK
+end
+
+note dims[4]: [0]=e_cnt, [1]=n, [2]=k, [3]=lay
+fn omega_gpu_pf_weights_host_form dims view ulong 4 w view uchar 32768 sinv view ushort 4096 pw edit uchar 32768 ratio edit f32 4096 to long
+  sf = new f32 4096 0.0
+  if eq get dims 0 0
+    ret PF_BAD_ARGS
+  end
+  if eq get dims 1 0
+    ret PF_BAD_ARGS
+  end
+  if eq get dims 2 0
+    ret PF_BAD_ARGS
+  end
+  if ne rem get dims 1 128 0
+    ret PF_BAD_ARGS
+  end
+  if ne rem get dims 2 128 0
+    ret PF_BAD_ARGS
+  end
+  if gt get dims 3 OMEGA_GPU_PF_SWIGLU
+    ret PF_BAD_ARGS
+  end
+  if eq get dims 3 OMEGA_GPU_PF_SWIGLU
+    if ne rem get dims 1 256 0
+      ret PF_BAD_ARGS
+    end
+  end
+  nblk = mul div get dims 1 128 div get dims 2 128
+  if gt nblk 4096
+    ret PF_TOO_LARGE
+  end
+  for e ulong get dims 0
+    if ne pf_pack_expert_scales sinv mul e nblk nblk sf PF_OK
+      ret PF_BAD_ARGS
+    end
+    pf_host_form_w e dims w pw
+    pf_host_form_r e dims sf ratio
+  end
+  ret PF_OK
+end
+
+fn omega_gpu_pf_weights_upload e_cnt ulong n ulong k ulong lay ulong out_h edit ulong 1 to long
+  put out_h 0 4
+  if eq e_cnt 0
+    ret PF_BAD_ARGS
+  end
+  if eq n 0
+    ret PF_BAD_ARGS
+  end
+  if eq k 0
+    ret PF_BAD_ARGS
+  end
+  if ne rem n 128 0
+    ret PF_BAD_ARGS
+  end
+  if ne rem k 128 0
+    ret PF_BAD_ARGS
+  end
+  if gt lay OMEGA_GPU_PF_SWIGLU
+    ret PF_BAD_ARGS
+  end
+  if eq lay OMEGA_GPU_PF_SWIGLU
+    if ne rem n 256 0
+      ret PF_BAD_ARGS
+    end
+  end
+  slot = ulong 4
+  for i ulong 4
+    if eq get pf_weights mul i 8 0
+      if eq slot 4
+        slot = i
+      end
+    end
+  end
+  if eq slot 4
+    ret PF_TOO_LARGE
+  end
+  wb = mul mul e_cnt n k
+  rb = mul mul mul e_cnt div n 8 add div k 128 1 4
+  rb16 = and add rb 15 ulong 0xfffffffffffffff0
+  w_va = pf_alloc_va wb
+  r_va = pf_alloc_va rb16
+  base = mul slot 8
+  put pf_weights base 1
+  put pf_weights add base 1 e_cnt
+  put pf_weights add base 2 n
+  put pf_weights add base 3 k
+  put pf_weights add base 4 lay
+  put pf_weights add base 5 w_va
+  put pf_weights add base 6 r_va
+  put pf_weights add base 7 0
+  put out_h 0 slot
+  ret PF_OK
+end
+
+fn omega_gpu_pf_weights_free h ulong to void
+  if ge h 4
+    ret
+  end
+  base = mul h 8
+  for i ulong 8
+    put pf_weights add base i 0
+  end
+end
+
+fn pf_emit_tile tinfo view ulong 4 tab edit ulong 256 nt ulong to void
+  off = mul nt 4
+  base = get tinfo 0
+  e = get tinfo 1
+  n = get pf_weights add base 2
+  k = get pf_weights add base 3
+  put tab off add get pf_weights add base 5 mul mul e n k
+  rb = mul div n 8 4
+  rb = mul rb add div k 128 1
+  put tab add off 1 add get pf_weights add base 6 mul e rb
+  put tab add off 2 get tinfo 2
+  put tab add off 3 get tinfo 3
+end
+
+fn pf_tiles_for_expert st edit ulong 6 tab edit ulong 256 max_tiles ulong to long
+  note st: [0]=base, [1]=e, [2]=ce, [3]=row, [4]=nt, [5]=bm
+  tinfo = new ulong 4 0
+  r = ulong 0
+  while lt r get st 2 bound 65536
+    if ge get st 4 max_tiles
+      ret -1
+    end
+    cnt = sub get st 2 r
+    if gt cnt get st 5
+      cnt = get st 5
+    end
+    put tinfo 0 get st 0
+    put tinfo 1 get st 1
+    put tinfo 2 add get st 3 r
+    put tinfo 3 cnt
+    pf_emit_tile tinfo tab get st 4
+    put st 4 add get st 4 1
+    r = add r get st 5
+  end
+  put st 3 add get st 3 get st 2
+  ret 0
+end
+
+note tab holds 4 ulongs per tile: [0]=w_va, [1]=r_va, [2]=row0, [3]=cnt
+fn omega_gpu_pf_gemm_tiles wh ulong counts view uint 256 tab edit ulong 256 max_tiles ulong to ulong
+  st = new ulong 6 0
+  if eq pf_w_handle_ok wh 0
+    ret 0
+  end
+  put st 0 mul wh 8
+  put st 5 omega_gpu_pf_gemm_bm
+  for e ulong get pf_weights add mul wh 8 1
+    put st 1 e
+    put st 2 ulong get counts e
+    if ne pf_tiles_for_expert st tab max_tiles 0
+      ret 0
+    end
+  end
+  ret get st 4
+end
+
+fn pf_tc2_stats sp view ulong 10 stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  if ne omega_blackwell_codegen_tc2_prog sp ins meta 0
+    ret -1
+  end
+  ret tc2_om_solve ins meta stats
+end
+
+fn pf_tc2_build_spec wh ulong direct ulong sp edit ulong 10 to long
+  base = mul wh 8
+  put sp 0 get pf_weights add base 3
+  put sp 1 pf_rt
+  put sp 2 2
+  w = get pf_g_tc2 1
+  if eq w 0
+    w = 16
+  end
+  put sp 3 w
+  aqn = get pf_g_tc2 2
+  if eq aqn 0
+    aqn = 1
+  end
+  put sp 4 aqn
+  if eq get pf_weights add base 4 OMEGA_GPU_PF_SWIGLU
+    put sp 5 PF_TC2_EPI_SWIGLU
+  else
+    put sp 5 PF_TC2_EPI_F32
+  end
+  put sp 6 direct
+  put sp 7 get pf_weights add base 2
+  put sp 8 get pf_g_tc2 3
+  if eq omega_tc2_spec_ok sp 0
+    ret PF_BAD_ARGS
+  end
+  ret PF_OK
+end
+
+note vas[4] = {tiles_va, rowidx_va, x_va, y_va}
+fn omega_gpu_pf_gemm wh ulong ntiles ulong vas view ulong 4 launch edit ulong 12 args edit uint 9 to long
+  sp = new ulong 10 0
+  stats = new uint 2 0
+  if eq pf_w_handle_ok wh 0
+    ret PF_BAD_ARGS
+  end
+  if eq get pf_weights add mul wh 8 5 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 0 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 2 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 3 0
+    ret PF_BAD_ARGS
+  end
+  if eq ntiles 0
+    ret PF_OK
+  end
+  if gt ntiles 65535
+    ret PF_TOO_LARGE
+  end
+  dir_v = ulong 0
+  if eq get vas 1 0
+    dir_v = 1
+  end
+  if ne pf_tc2_build_spec wh dir_v sp PF_OK
+    ret PF_BAD_ARGS
+  end
+  span = ulong omega_tc2_span sp
+  if eq span 0
+    ret PF_BAD_ARGS
+  end
+  if ne rem get sp 7 span 0
+    ret PF_BAD_ARGS
+  end
+  if ne pf_tc2_stats sp stats 0
+    ret PF_CODEGEN_FAIL
+  end
+  pf_put64_9 args 0 get vas 0
+  pf_put64_9 args 2 get vas 1
+  pf_put64_9 args 4 get vas 2
+  pf_put64_9 args 6 get vas 3
+  put args 8 uint get sp 7
+  put launch 0 pf_alloc_va mul ulong get stats 0 16
+  put launch 1 pf_gpr_declared ulong get stats 1
+  put launch 2 mul 32 get sp 3
+  put launch 3 1
+  put launch 4 div get sp 7 span
+  put launch 5 ntiles
+  put launch 6 mul mul mul 32 get sp 3 div get sp 7 span ntiles
+  put launch 7 PF_TC2_ARGS_WORDS
+  put launch 8 PF_TIMEOUT_MS
+  put launch 9 ulong omega_tc2_shared_bytes sp
+  put launch 10 0
+  put launch 11 ulong get stats 1
+  ret PF_OK
+end
+
+note ---- PQ activation quantiser ----
+fn omega_gpu_pf_quant_test_set_mutant m ulong to void
+  put pf_g_pq 0 m
+end
+
+fn pf_pq_stats sp view ulong 8 stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  if ne omega_blackwell_codegen_pq_prog sp ins meta 0
+    ret -1
+  end
+  ret qg_om_solve ins meta stats
+end
+
+fn pf_pq_core k ulong in_type ulong rows ulong vas view ulong 3 launch edit ulong 12 args edit uint 6 to long
+  sp = new ulong 8 0
+  stats = new uint 2 0
+  put sp 0 k
+  put sp 1 in_type
+  put sp 2 get pf_g_pq 0
+  kb = div k 128
+  grp = ulong 0
+  if and eq rem k 128 0 gt kb 32
+    g = ulong 32
+    while gt g 1 bound 32
+      if eq rem kb g 0
+        break
+      end
+      g = sub g 1
+    end
+    grp = g
+  end
+  put sp 3 grp
+  g_eff = kb
+  gy = ulong 1
+  if ne grp 0
+    g_eff = grp
+    gy = div kb grp
+  end
+  if eq omega_pq_spec_ok sp 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 0 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 1 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 2 0
+    ret PF_BAD_ARGS
+  end
+  if eq rows 0
+    ret PF_OK
+  end
+  if ne pf_pq_stats sp stats 0
+    ret PF_CODEGEN_FAIL
+  end
+  pf_put64_6 args 0 get vas 0
+  pf_put64_6 args 2 get vas 1
+  pf_put64_6 args 4 get vas 2
+  put launch 0 pf_alloc_va mul ulong get stats 0 16
+  put launch 1 pf_gpr_declared ulong get stats 1
+  put launch 2 mul 32 g_eff
+  put launch 3 1
+  put launch 4 rows
+  put launch 5 gy
+  put launch 6 mul mul mul 32 g_eff rows gy
+  put launch 7 PF_PQ_ARGS_WORDS
+  put launch 8 PF_TIMEOUT_MS
+  put launch 9 0
+  put launch 10 0
+  put launch 11 ulong get stats 1
+  ret PF_OK
+end
+
+fn omega_gpu_pf_quant k ulong in_type ulong rows ulong vas view ulong 3 launch edit ulong 12 args edit uint 6 to long
+  ret pf_pq_core k in_type rows vas launch args
+end
+
+fn omega_gpu_pf_quant_record cl_ok ulong pcfg view ulong 3 vas view ulong 3 launch edit ulong 12 args edit uint 6 to long
+  if eq cl_ok 0
+    ret PF_BAD_ARGS
+  end
+  ret pf_pq_core get pcfg 0 get pcfg 1 get pcfg 2 vas launch args
+end
+
+note ---- Native FP8 QMMA grouped GEMM ----
+fn omega_gpu_pf_qgemm_set_shape rt ulong warps ulong wait_c ulong to void
+  put pf_g_qg 0 rt
+  put pf_g_qg 1 warps
+  put pf_g_qg 2 wait_c
+  if or ne rt 0 or ne warps 0 ne wait_c 0
+    put pf_g_qg 3 1
+  else
+    put pf_g_qg 3 0
+  end
+end
+
+fn omega_gpu_pf_qgemm_test_set_mutant m ulong to void
+  put pf_g_qg 4 m
+end
+
+fn pf_qrt to ulong
+  v = get pf_g_qg 0
+  if ne v 0
+    ret v
+  end
+  ret 4
+end
+
+fn pf_qwarps to ulong
+  v = get pf_g_qg 1
+  if ne v 0
+    ret v
+  end
+  ret 8
+end
+
+fn pf_qwait to ulong
+  if ne get pf_g_qg 3 0
+    ret get pf_g_qg 2
+  end
+  ret 45
+end
+
+fn omega_gpu_pf_qgemm_bm to ulong
+  ret mul 16 pf_qrt
+end
+
+fn pf_qtiles_for_expert st edit ulong 6 tab edit ulong 256 max_tiles ulong to long
+  note st: [0]=w_va, [1]=s_va, [2]=ce, [3]=row, [4]=nt, [5]=bm
+  r = ulong 0
+  while lt r get st 2 bound 65536
+    if ge get st 4 max_tiles
+      ret -1
+    end
+    off = mul get st 4 4
+    put tab off get st 0
+    put tab add off 1 get st 1
+    put tab add off 2 add get st 3 r
+    cnt = sub get st 2 r
+    if gt cnt get st 5
+      cnt = get st 5
+    end
+    put tab add off 3 cnt
+    put st 4 add get st 4 1
+    r = add r get st 5
+  end
+  put st 3 add get st 3 get st 2
+  ret 0
+end
+
+fn omega_gpu_pf_qgemm_tiles_va e_cnt ulong w_vas view ulong 256 s_vas view ulong 256 counts view uint 256 tab edit ulong 256 max_tiles ulong to ulong
+  st = new ulong 6 0
+  if eq e_cnt 0
+    ret 0
+  end
+  put st 5 omega_gpu_pf_qgemm_bm
+  for e ulong e_cnt
+    put st 0 get w_vas e
+    put st 1 get s_vas e
+    put st 2 ulong get counts e
+    if ne pf_qtiles_for_expert st tab max_tiles 0
+      ret 0
+    end
+  end
+  ret get st 4
+end
+
+fn omega_gpu_pf_qgemm_tiles e_cnt ulong w_vas view ulong 256 s_vas view ulong 256 counts view uint 256 tab edit ulong 256 max_tiles ulong to ulong
+  ret omega_gpu_pf_qgemm_tiles_va e_cnt w_vas s_vas counts tab max_tiles
+end
+
+fn pf_qg_stats sp view ulong 10 stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  if ne omega_blackwell_codegen_qgemm_prog sp ins meta 0
+    ret -1
+  end
+  ret qg_om_solve ins meta stats
+end
+
+note qcfg[4] = {n, k, lay, ntiles}, vas[5] = {tiles_va, rowidx_va, xq_va, xs_va, y_va}
+fn pf_qg_core qcfg view ulong 4 vas view ulong 5 launch edit ulong 12 args edit uint 11 to long
+  sp = new ulong 10 0
+  stats = new uint 2 0
+  n = get qcfg 0
+  k = get qcfg 1
+  lay = get qcfg 2
+  ntiles = get qcfg 3
+  if eq get vas 0 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 2 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 3 0
+    ret PF_BAD_ARGS
+  end
+  if eq get vas 4 0
+    ret PF_BAD_ARGS
+  end
+  if and ne lay OMEGA_GPU_PF_PLAIN ne lay OMEGA_GPU_PF_SWIGLU_NAT
+    ret PF_BAD_ARGS
+  end
+  if eq ntiles 0
+    ret PF_OK
+  end
+  if gt ntiles 65535
+    ret PF_TOO_LARGE
+  end
+  put sp 0 k
+  put sp 1 pf_qrt
+  put sp 2 pf_qwarps
+  if eq lay OMEGA_GPU_PF_SWIGLU_NAT
+    put sp 3 PF_QG_EPI_SWIGLU
+  else
+    put sp 3 PF_QG_EPI_F32
+  end
+  if eq get vas 1 0
+    put sp 4 1
+  else
+    put sp 4 0
+  end
+  put sp 5 n
+  put sp 6 pf_qwait
+  put sp 7 get pf_g_qg 4
+  if eq omega_qg_spec_ok sp 0
+    ret PF_BAD_ARGS
+  end
+  span = ulong omega_qg_span sp
+  if eq span 0
+    ret PF_BAD_ARGS
+  end
+  if ne pf_qg_stats sp stats 0
+    ret PF_CODEGEN_FAIL
+  end
+  pf_put64_11 args 0 get vas 0
+  pf_put64_11 args 2 get vas 1
+  pf_put64_11 args 4 get vas 2
+  pf_put64_11 args 6 get vas 4
+  pf_put64_11 args 8 get vas 3
+  put args 10 uint n
+  w = get sp 2
+  put launch 0 pf_alloc_va mul ulong get stats 0 16
+  put launch 1 pf_gpr_declared ulong get stats 1
+  put launch 2 mul 32 w
+  put launch 3 1
+  put launch 4 div n span
+  put launch 5 ntiles
+  put launch 6 mul mul get launch 2 get launch 4 ntiles
+  put launch 7 PF_QG_ARGS_WORDS
+  put launch 8 PF_TIMEOUT_MS
+  put launch 9 ulong omega_qg_shared_bytes sp
+  put launch 10 0
+  put launch 11 ulong get stats 1
+  ret PF_OK
+end
+
+fn omega_gpu_pf_qgemm qcfg view ulong 4 vas view ulong 5 launch edit ulong 12 args edit uint 11 to long
+  ret pf_qg_core qcfg vas launch args
+end
+
+fn omega_gpu_pf_qgemm_record cl_ok ulong qcfg view ulong 4 vas view ulong 5 launch edit ulong 12 args edit uint 11 to long
+  if eq cl_ok 0
+    ret PF_BAD_ARGS
+  end
+  ret pf_qg_core qcfg vas launch args
+end

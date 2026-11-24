@@ -1,0 +1,746 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_tern_api.om: Pure seeded OM-2 port of src/omega_gpu_tern_api.c.
+note Composes src/omega_blackwell_codegen_tern.om and src/omega_blackwell_qmd.om.
+om2
+
+const OMEGA_GPU_TERN_OK long 0
+const OMEGA_GPU_TERN_BAD_ARGS long -1
+const OMEGA_GPU_TERN_TOO_LARGE long -2
+const OMEGA_GPU_TERN_CODEGEN_FAIL long -3
+const OMEGA_GPU_TERN_CHIP_FAIL long -4
+const OMEGA_GPU_TERN_BAD_TRIT long -5
+
+const OMEGA_TERN_LAYOUT_ROWMAJOR ulong 0
+const OMEGA_TERN_LAYOUT_BLOCK ulong 1
+const OMEGA_TERN_EPI_I32 ulong 0
+const OMEGA_TERN_EPI_F32 ulong 1
+const OMEGA_TERN_ROW_PAD ulong 8
+const OMEGA_TERN_MAX_K_API ulong 16384
+const OMEGA_TERN_ARGS_WORDS ulong 16
+const TN_CACHE_SLOTS ulong 8
+const TN_DEFAULT_CTAS ulong 160
+const TN_DEFAULT_WARPS ulong 8
+const TN_MARKER_TIMEOUT_MS ulong 20000
+
+note Global config:
+note   0:rows 1:warps 2:depth 3:ctas 4:layout 5:block_rows 6:uncached 7:mutant 8:next_slot 9:g_rec 10:next_va 11:last_err
+global tn_g_cfg ulong 16
+note 8 cache slots x 16 ulongs:
+note   0:valid 1:code_va 2:peak 3:decl 4:insns 5..12:spec[0..7]
+global tn_cache ulong 128
+note 4 tensor handles x 20 ulongs:
+note   0:used 1:n 2:k 3:n_padded 4:layout 5:R 6:cached 7:w_va 8:ws_va
+note   9:seg_count 10..13:seg_end[0..3] 14..17:seg_scale_bits[0..3]
+global tn_tensors ulong 80
+
+text tn_rc_ok "OK"
+text tn_rc_bad "BAD_ARGS"
+text tn_rc_big "TOO_LARGE"
+text tn_rc_cg "CODEGEN_FAIL"
+text tn_rc_chip "CHIP_FAIL"
+text tn_rc_trit "BAD_TRIT"
+text tn_rc_unk "UNKNOWN"
+
+text tn_err_none ""
+text tn_err_evict "tern record: kernel cache miss would evict a resident kernel"
+text tn_err_cg "tern codegen refused the shape"
+text tn_err_reg "tern kernel: declared registers exceed 65536-register file"
+text tn_err_trit "tern upload: value is not a trit"
+text tn_err_gpr "declared registers below peak + 2: refusing to launch"
+
+fn tn_gpr_declared peak ulong to ulong
+  ret mul div add peak 9 8 8
+end
+
+fn tn_gpr_declared_ok decl ulong peak ulong to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn tn_copy_txt src view uchar * dst edit uchar * to ulong
+  n = len src
+  cap = len dst
+  if gt n cap
+    n = cap
+  end
+  for i ulong n
+    put dst i get src i
+  end
+  ret n
+end
+
+fn tn_alloc_va sz ulong to ulong
+  cur = get tn_g_cfg 10
+  if eq cur 0
+    cur = ulong 0x30000000
+  end
+  aligned = and add cur 255 ulong 0xffffffffffffff00
+  nxt = add aligned and add sz 4095 ulong 0xfffffffffffff000
+  put tn_g_cfg 10 nxt
+  ret aligned
+end
+
+fn tn_f32_finite bits uint to long
+  exp_b = and shr bits 23 0xff
+  if eq exp_b 0xff
+    ret 0
+  end
+  ret 1
+end
+
+fn omega_gpu_tern_last_error dst edit uchar * to ulong
+  e = get tn_g_cfg 11
+  if eq e 1
+    ret tn_copy_txt tn_err_evict dst
+  end
+  if eq e 2
+    ret tn_copy_txt tn_err_cg dst
+  end
+  if eq e 3
+    ret tn_copy_txt tn_err_reg dst
+  end
+  if eq e 4
+    ret tn_copy_txt tn_err_trit dst
+  end
+  if eq e 5
+    ret tn_copy_txt tn_err_gpr dst
+  end
+  ret tn_copy_txt tn_err_none dst
+end
+
+fn omega_gpu_tern_rc_name rc long dst edit uchar * to ulong
+  if eq rc OMEGA_GPU_TERN_OK
+    ret tn_copy_txt tn_rc_ok dst
+  end
+  if eq rc OMEGA_GPU_TERN_BAD_ARGS
+    ret tn_copy_txt tn_rc_bad dst
+  end
+  if eq rc OMEGA_GPU_TERN_TOO_LARGE
+    ret tn_copy_txt tn_rc_big dst
+  end
+  if eq rc OMEGA_GPU_TERN_CODEGEN_FAIL
+    ret tn_copy_txt tn_rc_cg dst
+  end
+  if eq rc OMEGA_GPU_TERN_CHIP_FAIL
+    ret tn_copy_txt tn_rc_chip dst
+  end
+  if eq rc OMEGA_GPU_TERN_BAD_TRIT
+    ret tn_copy_txt tn_rc_trit dst
+  end
+  ret tn_copy_txt tn_rc_unk dst
+end
+
+fn omega_gpu_tern_cache_clear to void
+  for i ulong 128
+    put tn_cache i 0
+  end
+  put tn_g_cfg 8 0
+end
+
+fn omega_gpu_tern_set_layout lay ulong block_rows ulong to void
+  put tn_g_cfg 4 lay
+  put tn_g_cfg 5 block_rows
+end
+
+fn omega_gpu_tern_set_shape rows ulong warps ulong depth ulong to void
+  put tn_g_cfg 0 rows
+  put tn_g_cfg 1 warps
+  put tn_g_cfg 2 depth
+  omega_gpu_tern_cache_clear
+end
+
+fn omega_gpu_tern_set_cta_budget ctas ulong to void
+  put tn_g_cfg 3 ctas
+end
+
+fn omega_gpu_tern_set_weight_cache cached ulong to void
+  if eq cached 0
+    put tn_g_cfg 6 1
+  else
+    put tn_g_cfg 6 0
+  end
+end
+
+fn omega_gpu_tern_test_set_mutant m ulong to void
+  put tn_g_cfg 7 m
+  omega_gpu_tern_cache_clear
+end
+
+fn omega_gpu_tern_kernel_fits sp view ulong 8 decl_out edit ulong 1 to long
+  stats = new uint 2 0
+  if ne omega_tern_gemv_prog_stats sp stats 0
+    put tn_g_cfg 11 2
+    ret OMEGA_GPU_TERN_CODEGEN_FAIL
+  end
+  peak = ulong get stats 1
+  decl = tn_gpr_declared peak
+  put decl_out 0 decl
+  if gt mul mul 32 get sp 3 decl 65536
+    put tn_g_cfg 11 3
+    ret OMEGA_GPU_TERN_TOO_LARGE
+  end
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn omega_gpu_tern_shape_for k ulong lay ulong r_blk ulong dst edit ulong 4 to void
+  nch = div sub add k OMEGA_TERN_CHUNK_MAX 1 OMEGA_TERN_CHUNK_MAX
+  ksc = ulong 0
+  if ne nch 0
+    ksc = div div k nch 256
+  end
+  r = ulong 1
+  if eq lay OMEGA_TERN_LAYOUT_BLOCK
+    r = r_blk
+  else
+    gr = get tn_g_cfg 0
+    if ne gr 0
+      r = gr
+    end
+  end
+  d = get tn_g_cfg 2
+  if eq d 0
+    d = div 16 r
+  end
+  while gt d 1 bound 32
+    if and eq rem ksc d 0 le mul r d 16
+      break
+    end
+    d = sub d 1
+  end
+  w = get tn_g_cfg 1
+  if eq w 0
+    w = TN_DEFAULT_WARPS
+  end
+  c = get tn_g_cfg 3
+  if eq c 0
+    c = TN_DEFAULT_CTAS
+  end
+  put dst 0 r
+  put dst 1 w
+  put dst 2 d
+  put dst 3 c
+end
+
+fn omega_gpu_tern_padded_rows n ulong to ulong
+  ret mul div sub add n OMEGA_TERN_ROW_PAD 1 OMEGA_TERN_ROW_PAD OMEGA_TERN_ROW_PAD
+end
+
+fn tn_pack_word w view byte * base ulong out_w edit uint 1 to long
+  word = uint 0
+  for i ulong 16
+    v = long get w add base i
+    code = uint 3
+    if eq v 1
+      code = 1
+    end
+    if eq v -1
+      code = 2
+    end
+    if eq v 0
+      code = 0
+    end
+    if eq code 3
+      ret OMEGA_GPU_TERN_BAD_TRIT
+    end
+    word = or word shl code uint mul 2 i
+  end
+  put out_w 0 word
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn tn_pack_row pcfg view ulong 5 w view byte * dst edit uint * r ulong to long
+  ow = new uint 1 0
+  kw = div get pcfg 1 16
+  for c ulong kw
+    rc = tn_pack_word w add mul r get pcfg 1 mul 16 c ow
+    if ne rc OMEGA_GPU_TERN_OK
+      ret rc
+    end
+    off = div omega_tern_word_offset get pcfg 2 get pcfg 3 get pcfg 1 r c 4
+    put dst off get ow 0
+  end
+  ret OMEGA_GPU_TERN_OK
+end
+
+note pcfg[5] = {n, k, lay, r_blk, n_padded}
+fn omega_gpu_tern_pack pcfg view ulong 5 w view byte * dst edit uint * to long
+  if or eq get pcfg 0 0 ne rem get pcfg 1 16 0
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  if lt get pcfg 4 get pcfg 0
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  unit = ulong 2
+  if eq get pcfg 2 OMEGA_TERN_LAYOUT_BLOCK
+    unit = mul 2 get pcfg 3
+  end
+  if or eq unit 0 ne rem get pcfg 4 unit 0
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  tot = mul get pcfg 4 div get pcfg 1 16
+  if lt len dst tot
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  for z ulong tot
+    put dst z 0
+  end
+  for r ulong get pcfg 0
+    rc = tn_pack_row pcfg w dst r
+    if ne rc OMEGA_GPU_TERN_OK
+      ret rc
+    end
+  end
+  ret OMEGA_GPU_TERN_OK
+end
+
+note seg[9]: [0]=count (0 means NULL/default 1), [1..4]=end[0..3], [5..8]=scale_bits[0..3]
+fn omega_gpu_tern_segment_bounds n ulong seg view ulong 9 mut ulong b edit uint 3 to long
+  cnt = get seg 0
+  if eq cnt 0
+    cnt = 1
+  end
+  if or lt cnt 1 gt cnt 4
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  for i ulong 3
+    if ge add i 1 cnt
+      put b i uint n
+    else
+      if eq mut 2
+        put b i uint mul add i 1 div n cnt
+      else
+        put b i uint get seg add 1 i
+      end
+    end
+  end
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn tn_seg_ok n ulong seg view ulong 9 to long
+  cnt = get seg 0
+  if eq cnt 0
+    ret 1
+  end
+  if or lt cnt 1 gt cnt 4
+    ret 0
+  end
+  if ne get seg cnt n
+    ret 0
+  end
+  for i ulong cnt
+    sb = uint get seg add 5 i
+    if eq tn_f32_finite sb 0
+      ret 0
+    end
+    ei = get seg add 1 i
+    if eq ei 0
+      ret 0
+    end
+    if gt i 0
+      if le ei get seg i
+        ret 0
+      end
+    end
+  end
+  ret 1
+end
+
+fn tn_handle_ok h ulong to long
+  if ge h 4
+    ret 0
+  end
+  if eq get tn_tensors mul h 20 0
+    ret 0
+  end
+  ret 1
+end
+
+fn omega_gpu_tern_tensor_shape h ulong dst edit ulong 2 to void
+  if eq tn_handle_ok h 0
+    put dst 0 0
+    put dst 1 0
+    ret
+  end
+  base = mul h 20
+  put dst 0 get tn_tensors add base 1
+  put dst 1 get tn_tensors add base 2
+end
+
+fn omega_gpu_tern_tensor_bytes h ulong to ulong
+  if eq tn_handle_ok h 0
+    ret 0
+  end
+  base = mul h 20
+  ret div mul get tn_tensors add base 3 get tn_tensors add base 2 4
+end
+
+fn tn_init_tensor_slot slot ulong n ulong k ulong seg view ulong 9 to void
+  npad = omega_gpu_tern_padded_rows n
+  base = mul slot 20
+  r_blk = get tn_g_cfg 5
+  if eq r_blk 0
+    r_blk = 4
+  end
+  put tn_tensors base 1
+  put tn_tensors add base 1 n
+  put tn_tensors add base 2 k
+  put tn_tensors add base 3 npad
+  put tn_tensors add base 4 get tn_g_cfg 4
+  put tn_tensors add base 5 r_blk
+  if eq get tn_g_cfg 6 0
+    put tn_tensors add base 6 1
+  else
+    put tn_tensors add base 6 0
+  end
+  put tn_tensors add base 7 tn_alloc_va div mul npad k 4
+  put tn_tensors add base 8 tn_alloc_va 16
+  if eq get seg 0 0
+    put tn_tensors add base 9 1
+    put tn_tensors add base 10 n
+    put tn_tensors add base 14 0x3f800000
+    ret
+  end
+  put tn_tensors add base 9 get seg 0
+  for i ulong 4
+    put tn_tensors add base add 10 i get seg add 1 i
+    put tn_tensors add base add 14 i get seg add 5 i
+  end
+end
+
+fn omega_gpu_tern_tensor_upload n ulong k ulong w view byte * seg view ulong 9 out_h edit ulong 1 to long
+  put out_h 0 4
+  if or eq n 0 gt n 0x40000000
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  if or eq k 0 ne rem k 256 0
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  if eq tn_seg_ok n seg 0
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  if gt k OMEGA_TERN_MAX_K_API
+    ret OMEGA_GPU_TERN_TOO_LARGE
+  end
+  if and gt k OMEGA_TERN_CHUNK_MAX ne rem k 512 0
+    ret OMEGA_GPU_TERN_TOO_LARGE
+  end
+  lay = get tn_g_cfg 4
+  r_blk = get tn_g_cfg 5
+  if eq r_blk 0
+    r_blk = 4
+  end
+  if gt lay OMEGA_TERN_LAYOUT_BLOCK
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  if eq lay OMEGA_TERN_LAYOUT_BLOCK
+    if and ne r_blk 2 ne r_blk 4
+      ret OMEGA_GPU_TERN_BAD_ARGS
+    end
+  end
+  cnt_el = mul n k
+  if lt len w cnt_el
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  for i ulong cnt_el
+    v = long get w i
+    if or lt v -1 gt v 1
+      put tn_g_cfg 11 4
+      ret OMEGA_GPU_TERN_BAD_TRIT
+    end
+  end
+  slot = ulong 4
+  for i ulong 4
+    if eq get tn_tensors mul i 20 0
+      if eq slot 4
+        slot = i
+      end
+    end
+  end
+  if eq slot 4
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  tn_init_tensor_slot slot n k seg
+  put out_h 0 slot
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn omega_gpu_tern_tensor_free h ulong to void
+  if ge h 4
+    ret
+  end
+  base = mul h 20
+  for i ulong 20
+    put tn_tensors add base i 0
+  end
+end
+
+fn tn_slot_matches idx ulong sp view ulong 8 to long
+  base = mul idx 16
+  if eq get tn_cache base 0
+    ret 0
+  end
+  for i ulong 8
+    if ne get tn_cache add base add 5 i get sp i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn tn_kernel_for sp view ulong 8 kout edit ulong 4 to long
+  for i ulong TN_CACHE_SLOTS
+    if ne tn_slot_matches i sp 0
+      base = mul i 16
+      put kout 0 get tn_cache add base 1
+      put kout 1 get tn_cache add base 2
+      put kout 2 get tn_cache add base 3
+      put kout 3 1
+      ret OMEGA_GPU_TERN_OK
+    end
+  end
+  nxt = get tn_g_cfg 8
+  base = mul nxt 16
+  if and ne get tn_g_cfg 9 0 ne get tn_cache base 0
+    put tn_g_cfg 11 1
+    ret OMEGA_GPU_TERN_TOO_LARGE
+  end
+  stats = new uint 2 0
+  if ne omega_tern_gemv_prog_stats sp stats 0
+    put tn_g_cfg 11 2
+    ret OMEGA_GPU_TERN_CODEGEN_FAIL
+  end
+  insns = ulong get stats 0
+  peak = ulong get stats 1
+  if eq insns 0
+    put tn_g_cfg 11 2
+    ret OMEGA_GPU_TERN_CODEGEN_FAIL
+  end
+  decl = tn_gpr_declared peak
+  if gt mul mul 32 get sp 3 decl 65536
+    put tn_g_cfg 11 3
+    ret OMEGA_GPU_TERN_TOO_LARGE
+  end
+  code_va = tn_alloc_va mul insns 16
+  put tn_cache base 1
+  put tn_cache add base 1 code_va
+  put tn_cache add base 2 peak
+  put tn_cache add base 3 decl
+  put tn_cache add base 4 insns
+  for i ulong 8
+    put tn_cache add base add 5 i get sp i
+  end
+  put tn_g_cfg 8 rem add nxt 1 TN_CACHE_SLOTS
+  put kout 0 code_va
+  put kout 1 peak
+  put kout 2 decl
+  put kout 3 0
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn tn_put64 args edit uint 16 idx ulong v ulong to void
+  put args idx uint and v 0xffffffff
+  put args add idx 1 uint shr v 32
+end
+
+fn tn_build_spec base ulong f32_mode ulong sp edit ulong 8 sh edit ulong 4 bounds edit uint 3 to long
+  seg = new ulong 9 0
+  omega_gpu_tern_shape_for get tn_tensors add base 2 get tn_tensors add base 4 get tn_tensors add base 5 sh
+  put sp 0 get tn_tensors add base 2
+  put sp 1 get tn_tensors add base 4
+  put sp 2 get sh 0
+  put sp 3 get sh 1
+  put sp 4 get sh 2
+  if ne f32_mode 0
+    put sp 5 OMEGA_TERN_EPI_F32
+  else
+    put sp 5 OMEGA_TERN_EPI_I32
+  end
+  if eq get tn_g_cfg 7 2
+    put sp 6 0
+  else
+    put sp 6 get tn_g_cfg 7
+  end
+  put seg 0 get tn_tensors add base 9
+  for i ulong 4
+    put seg add 1 i get tn_tensors add base add 10 i
+    put seg add 5 i get tn_tensors add base add 14 i
+  end
+  if eq omega_tern_gemv_spec_ok sp 0
+    put tn_g_cfg 11 2
+    ret OMEGA_GPU_TERN_CODEGEN_FAIL
+  end
+  if ne omega_gpu_tern_segment_bounds get tn_tensors add base 1 seg get tn_g_cfg 7 bounds OMEGA_GPU_TERN_OK
+    put tn_g_cfg 11 2
+    ret OMEGA_GPU_TERN_CODEGEN_FAIL
+  end
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn tn_validate_req req view ulong 7 to long
+  if ne get req 3 0
+    if eq get req 4 0
+      ret OMEGA_GPU_TERN_BAD_ARGS
+    end
+    if eq get req 5 0
+      ret OMEGA_GPU_TERN_BAD_ARGS
+    end
+    if ne and get req 4 15 0
+      ret OMEGA_GPU_TERN_BAD_ARGS
+    end
+  end
+  if eq tn_handle_ok get req 0 0
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  if ne get req 1 0
+    if eq get req 3 0
+      if eq tn_f32_finite uint get req 2 0
+        ret OMEGA_GPU_TERN_BAD_ARGS
+      end
+    end
+  end
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn tn_pack_gemv_out req view ulong 7 sp view ulong 8 mb view ulong 16 info edit ulong 12 launch edit ulong 12 args edit uint 16 to void
+  base = get mb 14
+  tn_put64 args 0 get tn_tensors add base 7
+  if eq get req 3 0
+    tn_put64 args 2 tn_alloc_va get tn_tensors add base 2
+    tn_put64 args 4 tn_alloc_va mul get tn_tensors add base 1 4
+    tn_put64 args 8 tn_alloc_va 16
+  else
+    tn_put64 args 2 get req 4
+    tn_put64 args 4 get req 5
+    tn_put64 args 8 get req 6
+  end
+  tn_put64 args 6 get tn_tensors add base 8
+  put args 10 uint get mb 12
+  put args 11 uint mul get mb 13 get sp 3
+  put args 12 sub uint 0 uint get tn_tensors add base 1
+  put args 13 sub uint 0 uint get mb 4
+  put args 14 sub uint 0 uint get mb 5
+  put args 15 sub uint 0 uint get mb 6
+  put info 0 get tn_tensors add base 1
+  put info 1 get tn_tensors add base 2
+  put info 2 get tn_tensors add base 3
+  put info 3 get tn_tensors add base 4
+  put info 4 get sp 2
+  put info 5 get sp 3
+  put info 6 get sp 4
+  put info 7 get mb 13
+  put info 8 ulong omega_tern_gemv_chunks sp
+  put info 9 get sp 5
+  put info 10 get mb 11
+  put info 11 get tn_tensors add base 6
+  put launch 0 get mb 8
+  put launch 1 get mb 10
+  put launch 2 mul 32 get sp 3
+  put launch 3 1
+  put launch 4 get mb 13
+  put launch 5 1
+  put launch 6 get tn_tensors add base 1
+  put launch 7 OMEGA_TERN_ARGS_WORDS
+  put launch 8 TN_MARKER_TIMEOUT_MS
+  put launch 9 ulong omega_tern_gemv_shared_bytes sp
+  put launch 10 0
+  put launch 11 get mb 9
+end
+
+fn tn_prep_gemv req view ulong 7 sp edit ulong 8 mb edit ulong 16 to long
+  sh = new ulong 4 0
+  bounds = new uint 3 0
+  kout = new ulong 4 0
+  rc = tn_validate_req req
+  if ne rc OMEGA_GPU_TERN_OK
+    ret rc
+  end
+  base = mul get req 0 20
+  rc = tn_build_spec base get req 1 sp sh bounds
+  if ne rc OMEGA_GPU_TERN_OK
+    ret rc
+  end
+  npad = get tn_tensors add base 3
+  unit = mul 2 get sp 2
+  if ne rem npad unit 0
+    ret OMEGA_GPU_TERN_CODEGEN_FAIL
+  end
+  u_cnt = div npad unit
+  gx = div sub add u_cnt get sp 3 1 get sp 3
+  if gt gx get sh 3
+    gx = get sh 3
+  end
+  if eq gx 0
+    gx = 1
+  end
+  put tn_g_cfg 9 get req 3
+  rc = tn_kernel_for sp kout
+  put tn_g_cfg 9 0
+  if ne rc OMEGA_GPU_TERN_OK
+    ret rc
+  end
+  if eq tn_gpr_declared_ok get kout 2 get kout 1 0
+    put tn_g_cfg 11 5
+    ret OMEGA_GPU_TERN_CHIP_FAIL
+  end
+  put mb 4 ulong get bounds 0
+  put mb 5 ulong get bounds 1
+  put mb 6 ulong get bounds 2
+  put mb 8 get kout 0
+  put mb 9 get kout 1
+  put mb 10 get kout 2
+  put mb 11 get kout 3
+  put mb 12 u_cnt
+  put mb 13 gx
+  put mb 14 base
+  ret OMEGA_GPU_TERN_OK
+end
+
+note req[7]: [0]=h, [1]=f32_mode, [2]=as_bits, [3]=rec, [4]=dev_x, [5]=dev_y, [6]=dev_as
+fn tn_gemv_core req view ulong 7 info edit ulong 12 launch edit ulong 12 args edit uint 16 to long
+  sp = new ulong 8 0
+  mb = new ulong 16 0
+  rc = tn_prep_gemv req sp mb
+  if ne rc OMEGA_GPU_TERN_OK
+    ret rc
+  end
+  tn_pack_gemv_out req sp mb info launch args
+  ret OMEGA_GPU_TERN_OK
+end
+
+fn omega_gpu_tern_gemv_i32 h ulong info edit ulong 12 launch edit ulong 12 args edit uint 16 to long
+  req = new ulong 7 0
+  put req 0 h
+  put req 2 0x3f800000
+  ret tn_gemv_core req info launch args
+end
+
+fn omega_gpu_tern_gemv_f32 h ulong as_bits uint info edit ulong 12 launch edit ulong 12 args edit uint 16 to long
+  req = new ulong 7 0
+  put req 0 h
+  put req 1 1
+  put req 2 ulong as_bits
+  ret tn_gemv_core req info launch args
+end
+
+fn omega_gpu_tern_gemv_record cl_ok ulong h ulong vas view ulong 3 launch edit ulong 12 args edit uint 16 to long
+  if eq cl_ok 0
+    ret OMEGA_GPU_TERN_BAD_ARGS
+  end
+  req = new ulong 7 0
+  put req 0 h
+  if ne get vas 2 0
+    put req 1 1
+  end
+  put req 2 0x3f800000
+  put req 3 1
+  put req 4 get vas 0
+  put req 5 get vas 1
+  put req 6 get vas 2
+  info = new ulong 12 0
+  ret tn_gemv_core req info launch args
+end
