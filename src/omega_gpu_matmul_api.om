@@ -1,0 +1,724 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_matmul_api.c.
+note Composes on src/omega_blackwell_matmul.om, src/omega_blackwell_codegen.om,
+note and src/omega_blackwell_qmd.om. CPU-only host contract + QMD validation (no /dev/nvidia*).
+om2
+
+const MM_API_OK long 0
+const MM_API_BAD_ARGS long -1
+const MM_API_TOO_LARGE long -2
+const MM_API_CODEGEN_FAIL long -3
+const MM_API_CHIP_FAIL long -4
+const MM_API_PARITY_FAIL long -5
+
+const MM_API_TILE_M uint 16
+const MM_API_TILE_N uint 8
+const MM_API_TILE_K uint 16
+const MM_API_MAX_CTAS uint 1024
+const MM_API_CACHE_SLOTS_DEF ulong 8
+const MM_API_CACHE_SLOTS_MAX ulong 128
+
+note Global state
+global mm_api_g_cta_budget uint 1
+global mm_api_oracle ulong 1
+global mm_api_mutant long 1
+global mm_api_unroll uint 1
+global mm_api_slots ulong 1
+global mm_api_cache_next ulong 1
+global mm_api_sealed ulong 1
+global mm_api_blocked ulong 1
+global mm_api_a_res ulong 1
+global mm_api_c_res ulong 1
+global mm_api_a_cap ulong 1
+global mm_api_c_cap ulong 1
+global mm_api_a_row0_ready ulong 1
+global mm_api_a_row0_kp uint 1
+global mm_api_a_row0_hits ulong 1
+global mm_api_stages ulong 8
+global mm_api_last_err uchar 160
+global mm_api_last_err_len ulong 1
+
+note 128-slot kernel cache (10 ulongs per slot):
+note 0=valid 1=pinned 2=kp 3=np 4=grid_x 5=rt 6=ct 7=mutant 8=gpr_count 9=code_va
+global mm_api_cache ulong 1280
+
+note 8 resident tensors (6 ulongs per slot):
+note 0=valid 1=k 2=n 3=kp 4=np 5=va
+global mm_api_tensors ulong 48
+global mm_api_tmp ulong 16
+
+text mm_rc_ok "OK"
+text mm_rc_bad "BAD_ARGS"
+text mm_rc_large "TOO_LARGE"
+text mm_rc_cg "CODEGEN_FAIL"
+text mm_rc_chip "CHIP_FAIL"
+text mm_rc_par "PARITY_FAIL"
+text mm_rc_unk "UNKNOWN"
+text mm_err_zero "matmul: zero dimension"
+text mm_err_env "matmul: shape past the matmul envelope"
+text mm_err_sealed_k "serving reservation exceeded: matmul kernel was not prepared"
+text mm_err_sealed_s "serving reservation exceeded: matmul sealed without a scratch reservation"
+text mm_err_full "matmul kernel cache: every slot holds a prepared kernel"
+text mm_err_upd_sh "tensor update refused: shape differs from the tensor's"
+text mm_err_upd_blk "tensor update refused: the session is latched"
+
+fn mm_api_set_err msg view uchar * to void
+  n = len msg
+  if gt n 159
+    n = 159
+  end
+  for i ulong n bound 160
+    put mm_api_last_err i get msg i
+  end
+  put mm_api_last_err n 0
+  put mm_api_last_err_len 0 n
+end
+
+fn mm_api_last_error dst edit uchar 160 to ulong
+  n = get mm_api_last_err_len 0
+  if gt n 159
+    n = 159
+  end
+  for i ulong n bound 160
+    put dst i get mm_api_last_err i
+  end
+  put dst n 0
+  ret n
+end
+
+fn mm_api_copy_text src view uchar * dst edit uchar 32 to ulong
+  n = len src
+  if gt n 31
+    n = 31
+  end
+  for i ulong n bound 32
+    put dst i get src i
+  end
+  put dst n 0
+  ret n
+end
+
+fn mm_api_rc_name rc long dst edit uchar 32 to ulong
+  if eq rc MM_API_OK
+    ret mm_api_copy_text mm_rc_ok dst
+  end
+  if eq rc MM_API_BAD_ARGS
+    ret mm_api_copy_text mm_rc_bad dst
+  end
+  if eq rc MM_API_TOO_LARGE
+    ret mm_api_copy_text mm_rc_large dst
+  end
+  if eq rc MM_API_CODEGEN_FAIL
+    ret mm_api_copy_text mm_rc_cg dst
+  end
+  if eq rc MM_API_CHIP_FAIL
+    ret mm_api_copy_text mm_rc_chip dst
+  end
+  if eq rc MM_API_PARITY_FAIL
+    ret mm_api_copy_text mm_rc_par dst
+  end
+  ret mm_api_copy_text mm_rc_unk dst
+end
+
+fn mm_api_round_up v uint q uint to uint
+  ret mul div sub add v q 1 q q
+end
+
+fn mm_api_cache_clear to void
+  for i ulong 1280
+    put mm_api_cache i 0
+  end
+  put mm_api_cache_next 0 0
+end
+
+fn mm_api_init to void
+  put mm_api_g_cta_budget 0 MM_API_MAX_CTAS
+  put mm_api_oracle 0 1
+  put mm_api_mutant 0 0
+  put mm_api_unroll 0 0
+  put mm_api_slots 0 MM_API_CACHE_SLOTS_DEF
+  put mm_api_sealed 0 0
+  put mm_api_blocked 0 0
+  put mm_api_a_res 0 0
+  put mm_api_c_res 0 0
+  put mm_api_a_cap 0 0
+  put mm_api_c_cap 0 0
+  put mm_api_a_row0_ready 0 0
+  put mm_api_a_row0_kp 0 0
+  put mm_api_a_row0_hits 0 0
+  put mm_api_last_err_len 0 0
+  for i ulong 8
+    put mm_api_stages i 0
+  end
+  for i ulong 48
+    put mm_api_tensors i 0
+  end
+  mm_api_cache_clear
+end
+
+fn mm_api_device_close to void
+  if ne get mm_api_blocked 0 0
+    ret
+  end
+  mm_api_cache_clear
+  put mm_api_a_row0_ready 0 0
+  put mm_api_a_res 0 0
+  put mm_api_c_res 0 0
+  put mm_api_a_cap 0 0
+  put mm_api_c_cap 0 0
+  put mm_api_slots 0 MM_API_CACHE_SLOTS_DEF
+  put mm_api_sealed 0 0
+end
+
+fn mm_api_is_blocked to ulong
+  ret get mm_api_blocked 0
+end
+
+fn mm_api_test_set_blocked on ulong to void
+  put mm_api_blocked 0 on
+end
+
+fn mm_api_last_stages dst edit ulong 8 to void
+  for i ulong 8
+    put dst i get mm_api_stages i
+  end
+end
+
+fn mm_api_set_cta_budget ctas uint to void
+  if eq ctas 0
+    put mm_api_g_cta_budget 0 MM_API_MAX_CTAS
+  else
+    put mm_api_g_cta_budget 0 ctas
+  end
+  mm_api_cache_clear
+end
+
+fn mm_api_cta_budget to uint
+  ret get mm_api_g_cta_budget 0
+end
+
+fn mm_api_seal on ulong to void
+  if ne on 0
+    put mm_api_sealed 0 1
+  else
+    put mm_api_sealed 0 0
+  end
+end
+
+fn mm_api_set_oracle on ulong to void
+  if ne on 0
+    put mm_api_oracle 0 1
+  else
+    put mm_api_oracle 0 0
+  end
+end
+
+fn mm_api_test_set_mutant on long to void
+  if ne on 0
+    put mm_api_mutant 0 1
+  else
+    put mm_api_mutant 0 0
+  end
+  mm_api_cache_clear
+end
+
+fn mm_api_test_set_unroll u uint to void
+  put mm_api_unroll 0 u
+  mm_api_cache_clear
+end
+
+fn mm_api_test_a_row0_hits to ulong
+  ret get mm_api_a_row0_hits 0
+end
+
+note out_sh: [rows_per_launch, grid_x, rt, ct]
+fn mm_api_launch_shape mp uint np uint out_sh edit uint 4 to void
+  bud = get mm_api_g_cta_budget 0
+  if eq bud 0
+    bud = MM_API_MAX_CTAS
+  end
+  mt = div mp 16
+  nt = div np 8
+  rc = new uint 2 0
+  omega_matmul_frag_block_shape mt nt rc
+  rt = get rc 0
+  ct = get rc 1
+  row_blks = div mt rt
+  nb = div nt ct
+  rpl = mul mul bud 16 rt
+  if le row_blks bud
+    rpl = mp
+  end
+  gx = div bud div div rpl 16 rt
+  if eq gx 0
+    gx = 1
+  end
+  if gt gx nb
+    gx = nb
+  end
+  put out_sh 0 rpl
+  put out_sh 1 gx
+  put out_sh 2 rt
+  put out_sh 3 ct
+end
+
+fn mm_api_slot_match idx ulong key view ulong 6 to bool
+  base = mul idx 10
+  if eq get mm_api_cache base 0
+    ret false
+  end
+  for j ulong 6
+    if ne get mm_api_cache add base add j 2 get key j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn mm_api_find_free_slot to ulong
+  slots = get mm_api_slots 0
+  nxt = get mm_api_cache_next 0
+  for i ulong slots bound 128
+    ci = rem add nxt i slots
+    base = mul ci 10
+    if or eq get mm_api_cache base 0 eq get mm_api_cache add base 1 0
+      put mm_api_cache_next 0 rem add ci 1 slots
+      ret ci
+    end
+  end
+  ret 999
+end
+
+fn mm_api_run_cg sp view ulong 12 blocked ulong out_gpr edit ulong 1 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  vinfo = new long 768 0
+  phys = new ulong 288 0
+  ra_out = new ulong 4 0
+  cg = long -1
+  if ne blocked 0
+    cg = omega_blackwell_codegen_matmul_frag_block_prog sp ins meta vinfo phys ra_out
+  else
+    cg = omega_blackwell_codegen_matmul_frag_prog sp ins meta vinfo phys ra_out
+  end
+  if or ne cg 0 eq omega_bw_program_code_bytes get meta 0 0
+    ret MM_API_CODEGEN_FAIL
+  end
+  put out_gpr 0 get ra_out 1
+  ret MM_API_OK
+end
+
+fn mm_api_pick_unroll key view ulong 6 to long
+  sid = new uchar 32 0
+  if ne omega_matmul_spec_init 16 uint get key 0 uint get key 1 OMEGA_MATMUL_PREC_BF16 sid 0
+    ret -1
+  end
+  kp = uint get key 0
+  blk = ulong 0
+  unr = omega_matmul_frag_unroll kp
+  if or gt get key 3 1 gt get key 4 1
+    blk = 1
+    unr = omega_matmul_frag_block_unroll kp uint get key 3 uint get key 4
+  else
+    if ne get mm_api_unroll 0 0
+      unr = get mm_api_unroll 0
+    end
+  end
+  if ne get key 5 0
+    if or ne blk 0 eq get mm_api_unroll 0 0
+      while and gt unr 1 lt div div kp 16 unr 2 bound 16
+        unr = div unr 2
+      end
+    end
+  end
+  put mm_api_tmp 10 blk
+  ret long unr
+end
+
+fn mm_api_compile_slot found ulong key view ulong 6 to long
+  unr = mm_api_pick_unroll key
+  if lt unr 0
+    ret MM_API_TOO_LARGE
+  end
+  blk = get mm_api_tmp 10
+  sp = new ulong 12 0
+  put sp 0 16
+  put sp 1 get key 0
+  put sp 2 get key 1
+  put sp 3 ulong OMEGA_MATMUL_PREC_BF16
+  put sp 4 get key 2
+  put sp 5 ulong unr
+  if ne blk 0
+    put sp 6 get key 3
+    put sp 7 get key 4
+    put sp 8 get key 5
+  else
+    put sp 6 get key 5
+  end
+  gpr = new ulong 1 0
+  rc = mm_api_run_cg sp blk gpr
+  if ne rc MM_API_OK
+    ret rc
+  end
+  base = mul found 10
+  put mm_api_cache base 1
+  put mm_api_cache add base 1 0
+  for j ulong 6
+    put mm_api_cache add base add j 2 get key j
+  end
+  put mm_api_cache add base 8 get gpr 0
+  put mm_api_cache add base 9 add 0x312000000 mul found 0x10000
+  ret MM_API_OK
+end
+
+fn mm_api_kernel_for kp uint np uint gx uint rt uint ct uint out_slot edit ulong 2 to long
+  key = new ulong 6 0
+  put key 0 ulong kp
+  put key 1 ulong np
+  put key 2 ulong gx
+  put key 3 ulong rt
+  put key 4 ulong ct
+  put key 5 ulong get mm_api_mutant 0
+  for i ulong get mm_api_slots 0 bound 128
+    if mm_api_slot_match i key
+      put out_slot 0 i
+      put out_slot 1 1
+      ret MM_API_OK
+    end
+  end
+  if ne get mm_api_sealed 0 0
+    mm_api_set_err mm_err_sealed_k
+    ret MM_API_TOO_LARGE
+  end
+  found = mm_api_find_free_slot
+  if eq found 999
+    mm_api_set_err mm_err_full
+    ret MM_API_TOO_LARGE
+  end
+  rc = mm_api_compile_slot found key
+  if ne rc MM_API_OK
+    ret rc
+  end
+  put out_slot 0 found
+  put out_slot 1 0
+  ret MM_API_OK
+end
+
+fn mm_api_reserve max_rows uint max_k uint max_n uint max_n_one uint kslots uint to long
+  if or eq max_rows 0 or eq max_k 0 eq max_n 0
+    mm_api_set_err mm_err_zero
+    ret MM_API_BAD_ARGS
+  end
+  if or gt max_rows OMEGA_BW_MATMUL_MAX_M gt max_k OMEGA_BW_MATMUL_MAX_K
+    mm_api_set_err mm_err_env
+    ret MM_API_TOO_LARGE
+  end
+  if or gt max_n OMEGA_BW_MATMUL_MAX_N gt max_n_one OMEGA_BW_MATMUL_MAX_N
+    mm_api_set_err mm_err_env
+    ret MM_API_TOO_LARGE
+  end
+  if gt ulong kslots MM_API_CACHE_SLOTS_MAX
+    mm_api_set_err mm_err_env
+    ret MM_API_TOO_LARGE
+  end
+  mp = ulong mm_api_round_up max_rows MM_API_TILE_M
+  kp = ulong mm_api_round_up max_k MM_API_TILE_K
+  c_bytes = mul mul mp ulong mm_api_round_up max_n MM_API_TILE_N 4
+  if ne max_n_one 0
+    one = mul mul ulong MM_API_TILE_M ulong mm_api_round_up max_n_one MM_API_TILE_N 4
+    if gt one c_bytes
+      c_bytes = one
+    end
+  end
+  put mm_api_a_res 0 1
+  put mm_api_c_res 0 1
+  put mm_api_a_cap 0 mul mul mp kp 2
+  put mm_api_c_cap 0 c_bytes
+  if gt ulong kslots get mm_api_slots 0
+    mm_api_cache_clear
+    put mm_api_slots 0 ulong kslots
+  end
+  ret MM_API_OK
+end
+
+fn mm_api_unreserve to void
+  put mm_api_a_res 0 0
+  put mm_api_c_res 0 0
+end
+
+fn mm_api_prepare m uint k uint n uint to long
+  if or eq m 0 or eq k 0 eq n 0
+    mm_api_set_err mm_err_zero
+    ret MM_API_BAD_ARGS
+  end
+  if or gt m OMEGA_BW_MATMUL_MAX_M or gt k OMEGA_BW_MATMUL_MAX_K gt n OMEGA_BW_MATMUL_MAX_N
+    mm_api_set_err mm_err_env
+    ret MM_API_TOO_LARGE
+  end
+  mp = mm_api_round_up m MM_API_TILE_M
+  kp = mm_api_round_up k MM_API_TILE_K
+  np = mm_api_round_up n MM_API_TILE_N
+  sh = new uint 4 0
+  mm_api_launch_shape mp np sh
+  sl = new ulong 2 0
+  rc = mm_api_kernel_for kp np get sh 1 get sh 2 get sh 3 sl
+  if ne rc MM_API_OK
+    ret rc
+  end
+  put mm_api_cache add mul get sl 0 10 1 1
+  ret MM_API_OK
+end
+
+fn mm_api_tensor_upload_bf16 k uint n uint out_tid edit ulong 1 to long
+  if or eq k 0 eq n 0
+    ret MM_API_BAD_ARGS
+  end
+  if or gt k OMEGA_BW_MATMUL_MAX_K gt n OMEGA_BW_MATMUL_MAX_N
+    ret MM_API_TOO_LARGE
+  end
+  tid = ulong 99
+  for i ulong 8
+    if and eq tid 99 eq get mm_api_tensors mul i 6 0
+      tid = i
+    end
+  end
+  if eq tid 99
+    ret MM_API_TOO_LARGE
+  end
+  b = mul tid 6
+  put mm_api_tensors b 1
+  put mm_api_tensors add b 1 ulong k
+  put mm_api_tensors add b 2 ulong n
+  put mm_api_tensors add b 3 ulong mm_api_round_up k MM_API_TILE_K
+  put mm_api_tensors add b 4 ulong mm_api_round_up n MM_API_TILE_N
+  put mm_api_tensors add b 5 add 0x360000000 mul tid 0x10000000
+  put out_tid 0 tid
+  ret MM_API_OK
+end
+
+fn mm_api_tensor_upload_f32 k uint n uint out_tid edit ulong 1 to long
+  ret mm_api_tensor_upload_bf16 k n out_tid
+end
+
+fn mm_api_tensor_free tid ulong to void
+  if ge tid 8
+    ret
+  end
+  b = mul tid 6
+  for i ulong 6
+    put mm_api_tensors add b i 0
+  end
+end
+
+fn mm_api_tensor_shape tid ulong out_kn edit uint 2 to void
+  if ge tid 8
+    put out_kn 0 0
+    put out_kn 1 0
+    ret
+  end
+  b = mul tid 6
+  if eq get mm_api_tensors b 0
+    put out_kn 0 0
+    put out_kn 1 0
+    ret
+  end
+  put out_kn 0 uint get mm_api_tensors add b 1
+  put out_kn 1 uint get mm_api_tensors add b 2
+end
+
+fn mm_api_tensor_update_core tid ulong k uint n uint to long
+  if ge tid 8
+    ret MM_API_BAD_ARGS
+  end
+  b = mul tid 6
+  if eq get mm_api_tensors b 0
+    ret MM_API_BAD_ARGS
+  end
+  if or ne ulong k get mm_api_tensors add b 1 ne ulong n get mm_api_tensors add b 2
+    mm_api_set_err mm_err_upd_sh
+    ret MM_API_BAD_ARGS
+  end
+  if ne get mm_api_blocked 0 0
+    mm_api_set_err mm_err_upd_blk
+    ret MM_API_CHIP_FAIL
+  end
+  ret MM_API_OK
+end
+
+fn mm_api_tensor_update_bf16 tid ulong k uint n uint to long
+  ret mm_api_tensor_update_core tid k n
+end
+
+fn mm_api_tensor_update_f32 tid ulong k uint n uint to long
+  ret mm_api_tensor_update_core tid k n
+end
+
+fn mm_api_check_scratch mp ulong b ulong to long
+  if ne get mm_api_sealed 0 0
+    if or eq get mm_api_a_res 0 0 eq get mm_api_c_res 0 0
+      mm_api_set_err mm_err_sealed_s
+      ret MM_API_TOO_LARGE
+    end
+  end
+  if ne get mm_api_a_res 0 0
+    if gt mul mul mp get mm_api_tensors add b 3 2 get mm_api_a_cap 0
+      ret MM_API_TOO_LARGE
+    end
+  end
+  if ne get mm_api_c_res 0 0
+    if gt mul mul mp get mm_api_tensors add b 4 4 get mm_api_c_cap 0
+      ret MM_API_TOO_LARGE
+    end
+  end
+  ret MM_API_OK
+end
+
+fn mm_api_track_row0 m uint mp uint kp uint to void
+  if and eq m 1 eq mp 16
+    if and ne get mm_api_a_row0_ready 0 0 eq get mm_api_a_row0_kp 0 kp
+      put mm_api_a_row0_hits 0 add get mm_api_a_row0_hits 0 1
+      ret
+    end
+    put mm_api_a_row0_ready 0 1
+    put mm_api_a_row0_kp 0 kp
+    ret
+  end
+  put mm_api_a_row0_ready 0 0
+  put mm_api_a_row0_kp 0 kp
+end
+
+fn mm_api_core_stage1 m uint tid ulong to long
+  if ge tid 8
+    ret MM_API_BAD_ARGS
+  end
+  b = mul tid 6
+  if or eq m 0 eq get mm_api_tensors b 0
+    ret MM_API_BAD_ARGS
+  end
+  if gt m OMEGA_BW_MATMUL_MAX_M
+    ret MM_API_TOO_LARGE
+  end
+  if ne get mm_api_blocked 0 0
+    ret MM_API_CHIP_FAIL
+  end
+  mp = mm_api_round_up m MM_API_TILE_M
+  sh = new uint 4 0
+  mm_api_launch_shape mp uint get mm_api_tensors add b 4 sh
+  rc = mm_api_check_scratch ulong mp b
+  if ne rc MM_API_OK
+    ret rc
+  end
+  kp = uint get mm_api_tensors add b 3
+  mm_api_track_row0 m mp kp
+  sl = new ulong 2 0
+  rc = mm_api_kernel_for kp uint get mm_api_tensors add b 4 get sh 1 get sh 2 get sh 3 sl
+  if ne rc MM_API_OK
+    ret rc
+  end
+  put mm_api_tmp 0 ulong mp
+  put mm_api_tmp 1 ulong get sh 0
+  put mm_api_tmp 2 ulong get sh 1
+  put mm_api_tmp 3 ulong get sh 2
+  put mm_api_tmp 4 get sl 0
+  put mm_api_tmp 5 get sl 1
+  ret MM_API_OK
+end
+
+fn mm_api_core_qmd b ulong kbase ulong gy uint out_cbank edit uint 10 out_qmd edit uint 96 to long
+  vas = new ulong 3 0
+  put vas 0 0x370000000
+  put vas 1 get mm_api_tensors add b 5
+  put vas 2 0x371000000
+  dims = new uint 3 0
+  put dims 0 mul mul gy 16 uint get mm_api_tmp 3
+  put dims 1 uint get mm_api_tensors add b 3
+  put dims 2 uint get mm_api_tensors add b 4
+  if ne omega_blackwell_build_cbank_args_matmul out_cbank vas dims 0
+    ret MM_API_CHIP_FAIL
+  end
+  cfg = new ulong 16 0
+  put cfg 0 0x320000000
+  put cfg 1 0x324280000
+  put cfg 2 0x322000000
+  put cfg 3 0x324010000
+  put cfg 4 get mm_api_cache add kbase 9
+  put cfg 5 mul mul get mm_api_tmp 2 ulong gy 128
+  put cfg 6 32
+  put cfg 7 get mm_api_tmp 2
+  put cfg 8 32
+  put cfg 9 1
+  put cfg 10 get mm_api_tmp 2
+  put cfg 11 ulong gy
+  put cfg 12 get mm_api_cache add kbase 8
+  put cfg 13 0
+  if ne omega_blackwell_build_qmd1 out_qmd cfg 0
+    ret MM_API_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants out_qmd 0
+    ret MM_API_CHIP_FAIL
+  end
+  ret MM_API_OK
+end
+
+fn mm_api_core m uint tid ulong out_info edit ulong 12 out_cbank edit uint 10 out_qmd edit uint 96 to long
+  rc = mm_api_core_stage1 m tid
+  if ne rc MM_API_OK
+    ret rc
+  end
+  b = mul tid 6
+  gy = div div uint get mm_api_tmp 1 16 uint get mm_api_tmp 3
+  rc = mm_api_core_qmd b mul get mm_api_tmp 4 10 gy out_cbank out_qmd
+  if ne rc MM_API_OK
+    ret rc
+  end
+  put out_info 0 ulong m
+  put out_info 1 get mm_api_tensors add b 1
+  put out_info 2 get mm_api_tensors add b 2
+  put out_info 3 get mm_api_tmp 0
+  put out_info 4 get mm_api_tensors add b 3
+  put out_info 5 get mm_api_tensors add b 4
+  put out_info 6 get mm_api_tmp 2
+  put out_info 7 ulong gy
+  put out_info 8 get mm_api_tmp 1
+  mp0 = get mm_api_tmp 0
+  rpl0 = get mm_api_tmp 1
+  calls = div sub add mp0 rpl0 1 rpl0
+  put out_info 9 calls
+  put out_info 10 get mm_api_tmp 5
+  put out_info 11 121
+  put mm_api_stages 7 1
+  ret MM_API_OK
+end
+
+fn mm_api_resident_bf16 m uint tid ulong out_info edit ulong 12 out_cbank edit uint 10 out_qmd edit uint 96 to long
+  ret mm_api_core m tid out_info out_cbank out_qmd
+end
+
+fn mm_api_resident_f32 m uint tid ulong out_info edit ulong 12 out_cbank edit uint 10 out_qmd edit uint 96 to long
+  ret mm_api_core m tid out_info out_cbank out_qmd
+end
+
+note dims=[m, k, n]
+fn mm_api_matmul_bf16 dims view uint 3 out_info edit ulong 12 out_cbank edit uint 10 out_qmd edit uint 96 to long
+  m = get dims 0
+  k = get dims 1
+  n = get dims 2
+  if or eq m 0 or eq k 0 eq n 0
+    ret MM_API_BAD_ARGS
+  end
+  if or gt m OMEGA_BW_MATMUL_MAX_M or gt k OMEGA_BW_MATMUL_MAX_K gt n OMEGA_BW_MATMUL_MAX_N
+    ret MM_API_TOO_LARGE
+  end
+  tid = new ulong 1 0
+  rc = mm_api_tensor_upload_bf16 k n tid
+  if ne rc MM_API_OK
+    ret rc
+  end
+  rc = mm_api_core m get tid 0 out_info out_cbank out_qmd
+  mm_api_tensor_free get tid 0
+  ret rc
+end
+
+fn mm_api_matmul_f32 dims view uint 3 out_info edit ulong 12 out_cbank edit uint 10 out_qmd edit uint 96 to long
+  ret mm_api_matmul_bf16 dims out_info out_cbank out_qmd
+end

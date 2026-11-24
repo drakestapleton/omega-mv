@@ -1,0 +1,700 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_fp8gemm_api.c.
+note Composes on src/omega_blackwell_codegen_gemm.om, src/omega_blackwell_codegen.om,
+note and src/omega_blackwell_qmd.om. CPU-only host contract + QMD validation (no /dev/nvidia*).
+om2
+
+const FGEM_OK long 0
+const FGEM_BAD_ARGS long -1
+const FGEM_TOO_LARGE long -2
+const FGEM_CODEGEN_FAIL long -3
+const FGEM_CHIP_FAIL long -4
+
+const FGEM_MAX_ROWS uint 1024
+const FGEM_MAX_SEGMENTS uint 256
+const FGEM_CACHE_SLOTS ulong 8
+const FGEM_ARGS_WORDS ulong 8
+const FGEM_ARGS_WORDS_MAP ulong 12
+const FGEM_SEG_BYTES ulong 32
+const FGEM_TIMEOUT_MS ulong 20000
+
+note Global state for FP8 grouped GEMM API
+global fgem_mt uint 1
+global fgem_warps uint 16
+global fgem_warps_ov uint 1
+global fgem_ctas uint 1
+global fgem_mutant long 1
+global fgem_rec ulong 1
+global fgem_next ulong 1
+global fgem_last_err uchar 160
+global fgem_last_err_len ulong 1
+
+note 8-slot kernel cache: per slot 12 ulongs:
+note 0=valid 1=pinned 2=k 3=lane_bytes 4=mt 5=warps 6=mutant 7=rowmap 8=insns 9=peak_gpr 10=code_bytes 11=code_va
+global fgem_cache ulong 96
+global fgem_tmp ulong 16
+
+text fgem_rc_ok "OK"
+text fgem_rc_bad "BAD_ARGS"
+text fgem_rc_large "TOO_LARGE"
+text fgem_rc_cg "CODEGEN_FAIL"
+text fgem_rc_chip "CHIP_FAIL"
+text fgem_rc_unk "UNKNOWN"
+text fgem_err_cg "fp8 gemm codegen refused the shape"
+text fgem_err_rf "fp8 gemm kernel: warps x declared registers exceed 65536"
+text fgem_err_full "fp8 gemm kernel cache: every slot holds a prepared kernel"
+text fgem_err_evict "fp8 gemm record: kernel cache miss would evict a resident kernel"
+text fgem_err_rm "fp8 gemm: shape refused (rowmap needs mt <= 4)"
+text fgem_err_decl "declared registers below peak + 2: refusing to launch"
+
+fn fgem_set_err msg view uchar * to void
+  n = len msg
+  if gt n 159
+    n = 159
+  end
+  for i ulong n bound 160
+    put fgem_last_err i get msg i
+  end
+  put fgem_last_err n 0
+  put fgem_last_err_len 0 n
+end
+
+fn fgem_last_error dst edit uchar 160 to ulong
+  n = get fgem_last_err_len 0
+  if gt n 159
+    n = 159
+  end
+  for i ulong n bound 160
+    put dst i get fgem_last_err i
+  end
+  put dst n 0
+  ret n
+end
+
+fn fgem_copy_text src view uchar * dst edit uchar 32 to ulong
+  n = len src
+  if gt n 31
+    n = 31
+  end
+  for i ulong n bound 32
+    put dst i get src i
+  end
+  put dst n 0
+  ret n
+end
+
+fn fgem_rc_name rc long dst edit uchar 32 to ulong
+  if eq rc FGEM_OK
+    ret fgem_copy_text fgem_rc_ok dst
+  end
+  if eq rc FGEM_BAD_ARGS
+    ret fgem_copy_text fgem_rc_bad dst
+  end
+  if eq rc FGEM_TOO_LARGE
+    ret fgem_copy_text fgem_rc_large dst
+  end
+  if eq rc FGEM_CODEGEN_FAIL
+    ret fgem_copy_text fgem_rc_cg dst
+  end
+  if eq rc FGEM_CHIP_FAIL
+    ret fgem_copy_text fgem_rc_chip dst
+  end
+  ret fgem_copy_text fgem_rc_unk dst
+end
+
+fn fgem_cache_clear to void
+  for i ulong 96
+    put fgem_cache i 0
+  end
+  put fgem_next 0 0
+end
+
+fn fgem_reset_all to void
+  put fgem_mt 0 0
+  put fgem_warps_ov 0 0
+  put fgem_ctas 0 0
+  put fgem_mutant 0 0
+  put fgem_rec 0 0
+  put fgem_last_err_len 0 0
+  fgem_cache_clear
+end
+
+fn fgem_set_shape mt uint warps uint to void
+  put fgem_mt 0 mt
+  put fgem_warps_ov 0 warps
+  fgem_cache_clear
+end
+
+fn fgem_set_cta_budget c uint to void
+  put fgem_ctas 0 c
+end
+
+fn fgem_test_set_mutant m long to void
+  put fgem_mutant 0 m
+  fgem_cache_clear
+end
+
+fn fgem_gpr_declared peak uint to uint
+  ret mul div add add peak 2 7 8 8
+end
+
+fn fgem_gpr_declared_ok decl uint peak uint to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn fgem_code_bytes cnt ulong to ulong
+  padded = mul div add cnt 7 8 8
+  if lt padded 32
+    padded = 32
+  end
+  ret mul padded 16
+end
+
+fn fgem_reg_fits warps uint peak uint to bool
+  decl = fgem_gpr_declared peak
+  total = mul mul ulong 32 ulong warps ulong decl
+  if le total 65536
+    ret true
+  end
+  fgem_set_err fgem_err_rf
+  ret false
+end
+
+fn fgem_kernel_fits sp view ulong 8 out_decl edit uint 1 to long
+  stats = new uint 2 0
+  if ne omega_fp8gemm_prog_stats sp stats 0
+    fgem_set_err fgem_err_cg
+    ret FGEM_CODEGEN_FAIL
+  end
+  peak = get stats 1
+  decl = fgem_gpr_declared peak
+  put out_decl 0 decl
+  if fgem_reg_fits uint get sp 3 peak
+    ret FGEM_OK
+  end
+  ret FGEM_TOO_LARGE
+end
+
+fn fgem_shape_for k uint out_sh edit uint 3 to void
+  lb = uint 8
+  if eq rem k 512 0
+    lb = 16
+  end
+  mt = get fgem_mt 0
+  if eq mt 0
+    mt = 4
+  end
+  w = get fgem_warps_ov 0
+  if eq w 0
+    w = 16
+  end
+  put out_sh 0 mt
+  put out_sh 1 w
+  put out_sh 2 lb
+end
+
+fn fgem_cta_budget_for segs uint to uint
+  c = get fgem_ctas 0
+  if ne c 0
+    ret c
+  end
+  if ge segs 64
+    ret 2
+  end
+  if ge segs 8
+    ret 12
+  end
+  ret 96
+end
+
+fn fgem_spec_for k uint segs uint sp edit ulong 8 to void
+  for i ulong 8
+    put sp i 0
+  end
+  sh = new uint 3 0
+  fgem_shape_for k sh
+  mt = get sh 0
+  if and eq get fgem_mt 0 0 lt segs 8
+    mt = 8
+  end
+  put sp 0 ulong k
+  put sp 1 ulong get sh 2
+  put sp 2 ulong mt
+  put sp 3 ulong get sh 1
+  put sp 4 ulong get fgem_mutant 0
+  put sp 5 0
+end
+
+fn fgem_spec_for_stroke k uint segs uint mt uint rowmap uint sp edit ulong 8 to void
+  fgem_spec_for k segs sp
+  if ne mt 0
+    put sp 2 ulong mt
+  end
+  if ne rowmap 0
+    put sp 5 1
+  else
+    put sp 5 0
+  end
+end
+
+fn fgem_slot_match idx ulong sp view ulong 8 to bool
+  base = mul idx 12
+  if eq get fgem_cache base 0
+    ret false
+  end
+  if ne get fgem_cache add base 2 get sp 0
+    ret false
+  end
+  if ne get fgem_cache add base 3 get sp 1
+    ret false
+  end
+  if ne get fgem_cache add base 4 get sp 2
+    ret false
+  end
+  if ne get fgem_cache add base 5 get sp 3
+    ret false
+  end
+  if ne get fgem_cache add base 6 get sp 4
+    ret false
+  end
+  if ne get fgem_cache add base 7 get sp 5
+    ret false
+  end
+  ret true
+end
+
+fn fgem_kernel_for sp view ulong 8 out_slot edit ulong 2 to long
+  for i ulong FGEM_CACHE_SLOTS
+    if fgem_slot_match i sp
+      put out_slot 0 i
+      put out_slot 1 1
+      ret FGEM_OK
+    end
+  end
+  found = ulong 99
+  nxt = get fgem_next 0
+  for i ulong FGEM_CACHE_SLOTS
+    if eq found 99
+      ci = rem add nxt i FGEM_CACHE_SLOTS
+      base = mul ci 12
+      if or eq get fgem_cache base 0 eq get fgem_cache add base 1 0
+        found = ci
+        put fgem_next 0 rem add ci 1 FGEM_CACHE_SLOTS
+      end
+    end
+  end
+  if eq found 99
+    fgem_set_err fgem_err_full
+    ret FGEM_TOO_LARGE
+  end
+  base = mul found 12
+  if and ne get fgem_rec 0 0 ne get fgem_cache base 0
+    fgem_set_err fgem_err_evict
+    ret FGEM_TOO_LARGE
+  end
+  stats = new uint 2 0
+  if ne omega_fp8gemm_prog_stats sp stats 0
+    fgem_set_err fgem_err_cg
+    ret FGEM_CODEGEN_FAIL
+  end
+  insns = ulong get stats 0
+  peak = get stats 1
+  need = fgem_code_bytes insns
+  if eq need 0
+    fgem_set_err fgem_err_cg
+    ret FGEM_CODEGEN_FAIL
+  end
+  if not fgem_reg_fits uint get sp 3 peak
+    ret FGEM_TOO_LARGE
+  end
+  put fgem_cache base 1
+  put fgem_cache add base 1 0
+  put fgem_cache add base 2 get sp 0
+  put fgem_cache add base 3 get sp 1
+  put fgem_cache add base 4 get sp 2
+  put fgem_cache add base 5 get sp 3
+  put fgem_cache add base 6 get sp 4
+  put fgem_cache add base 7 get sp 5
+  put fgem_cache add base 8 insns
+  put fgem_cache add base 9 ulong peak
+  put fgem_cache add base 10 need
+  put fgem_cache add base 11 add 0x310000000 mul found 0x10000
+  put out_slot 0 found
+  put out_slot 1 0
+  ret FGEM_OK
+end
+
+fn fgem_prepare k uint to long
+  sp0 = new ulong 8 0
+  sp1 = new ulong 8 0
+  fgem_spec_for k 64 sp0
+  fgem_spec_for k 1 sp1
+  sl = new ulong 2 0
+  rc = fgem_kernel_for sp0 sl
+  if ne rc FGEM_OK
+    ret rc
+  end
+  put fgem_cache add mul get sl 0 12 1 1
+  rc = fgem_kernel_for sp1 sl
+  if ne rc FGEM_OK
+    ret rc
+  end
+  put fgem_cache add mul get sl 0 12 1 1
+  ret FGEM_OK
+end
+
+fn fgem_prepare_shape k uint segs uint mt uint rowmap uint to long
+  sp = new ulong 8 0
+  fgem_spec_for_stroke k segs mt rowmap sp
+  if eq omega_fp8gemm_shared_bytes sp 0
+    fgem_set_err fgem_err_rm
+    ret FGEM_BAD_ARGS
+  end
+  sl = new ulong 2 0
+  rc = fgem_kernel_for sp sl
+  if ne rc FGEM_OK
+    ret rc
+  end
+  put fgem_cache add mul get sl 0 12 1 1
+  ret FGEM_OK
+end
+
+fn fgem_build_launch_qmd qin view ulong 6 out_qmd edit uint 96 to long
+  cfg = new ulong 16 0
+  put cfg 0 0x320000000
+  put cfg 1 0x324280000
+  put cfg 2 0x322000000
+  put cfg 3 0x324010000
+  put cfg 4 get qin 0
+  put cfg 5 mul get qin 3 get qin 4
+  put cfg 6 get qin 2
+  put cfg 7 get qin 3
+  put cfg 8 get qin 2
+  put cfg 9 1
+  put cfg 10 get qin 3
+  put cfg 11 get qin 4
+  put cfg 12 get qin 1
+  put cfg 13 get qin 5
+  if ne omega_blackwell_build_qmd1 out_qmd cfg 0
+    ret FGEM_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants out_qmd 0
+    ret FGEM_CHIP_FAIL
+  end
+  ret FGEM_OK
+end
+
+fn fgem_record_pack_args req view ulong 12 gx uint w uint out_args edit uint 12 to void
+  for i ulong 12
+    put out_args i 0
+  end
+  put out_args 0 bw_qmd_u32lo get req 5
+  put out_args 1 bw_qmd_u32hi get req 5
+  put out_args 2 bw_qmd_u32lo get req 6
+  put out_args 3 bw_qmd_u32hi get req 6
+  put out_args 4 bw_qmd_u32lo get req 7
+  put out_args 5 bw_qmd_u32hi get req 7
+  put out_args 6 uint get req 1
+  put out_args 7 mul gx w
+  put out_args 8 bw_qmd_u32lo get req 8
+  put out_args 9 bw_qmd_u32hi get req 8
+  put out_args 10 bw_qmd_u32lo get req 9
+  put out_args 11 bw_qmd_u32hi get req 9
+end
+
+fn fgem_record_check_req req view ulong 12 to long
+  if eq get req 0 0
+    ret FGEM_BAD_ARGS
+  end
+  if eq get req 5 0
+    ret FGEM_BAD_ARGS
+  end
+  if eq get req 6 0
+    ret FGEM_BAD_ARGS
+  end
+  if eq get req 7 0
+    ret FGEM_BAD_ARGS
+  end
+  if eq get req 3 0
+    ret FGEM_BAD_ARGS
+  end
+  if eq get req 4 0
+    ret FGEM_BAD_ARGS
+  end
+  if ne eq get req 8 0 eq get req 9 0
+    ret FGEM_BAD_ARGS
+  end
+  if gt get req 3 ulong FGEM_MAX_ROWS
+    ret FGEM_TOO_LARGE
+  end
+  if gt get req 4 ulong FGEM_MAX_SEGMENTS
+    ret FGEM_TOO_LARGE
+  end
+  ret FGEM_OK
+end
+
+fn fgem_record_stage1 req view ulong 12 to long
+  rc = fgem_record_check_req req
+  if ne rc FGEM_OK
+    ret rc
+  end
+  rm = uint 0
+  if ne get req 8 0
+    rm = 1
+  end
+  sp = new ulong 8 0
+  fgem_spec_for_stroke uint get req 2 uint get req 4 uint get req 10 rm sp
+  smem = omega_fp8gemm_shared_bytes sp
+  if eq smem 0
+    fgem_set_err fgem_err_rm
+    ret FGEM_BAD_ARGS
+  end
+  put fgem_tmp 0 get sp 3
+  put fgem_tmp 1 ulong smem
+  put fgem_tmp 2 ulong rm
+  sl = new ulong 2 0
+  put fgem_rec 0 1
+  rc = fgem_kernel_for sp sl
+  put fgem_rec 0 0
+  if ne rc FGEM_OK
+    ret rc
+  end
+  put fgem_tmp 3 get sl 0
+  put fgem_tmp 4 get sl 1
+  ret FGEM_OK
+end
+
+note fgem_record: req=[experts, n, k, rows, segs, seg_va, xp_va, y_va, xmap_va, ymap_va, mt, cta_budget]
+note out_launch=[code_va, decl_gpr, threads_x, grid_x, grid_y, smem, n_args, hit]
+fn fgem_record req view ulong 12 out_args edit uint 12 out_launch edit ulong 8 out_qmd edit uint 96 to long
+  rc = fgem_record_stage1 req
+  if ne rc FGEM_OK
+    ret rc
+  end
+  w = uint get fgem_tmp 0
+  gx = div sub add uint get req 1 w 1 w
+  bud = uint get req 11
+  if eq bud 0
+    bud = fgem_cta_budget_for uint get req 4
+  end
+  if gt gx bud
+    gx = bud
+  end
+  if eq gx 0
+    gx = 1
+  end
+  base = mul get fgem_tmp 3 12
+  peak = uint get fgem_cache add base 9
+  decl = fgem_gpr_declared peak
+  if eq fgem_gpr_declared_ok decl peak 0
+    fgem_set_err fgem_err_decl
+    ret FGEM_CHIP_FAIL
+  end
+  fgem_record_pack_args req gx w out_args
+  put out_launch 0 get fgem_cache add base 11
+  put out_launch 1 ulong decl
+  put out_launch 2 ulong mul 32 w
+  put out_launch 3 ulong gx
+  put out_launch 4 get req 4
+  put out_launch 5 get fgem_tmp 1
+  if ne get fgem_tmp 2 0
+    put out_launch 6 FGEM_ARGS_WORDS_MAP
+  else
+    put out_launch 6 FGEM_ARGS_WORDS
+  end
+  put out_launch 7 get fgem_tmp 4
+  qin = new ulong 6 0
+  put qin 0 get fgem_cache add base 11
+  put qin 1 ulong decl
+  put qin 2 ulong mul 32 w
+  put qin 3 ulong gx
+  put qin 4 get req 4
+  put qin 5 get fgem_tmp 1
+  ret fgem_build_launch_qmd qin out_qmd
+end
+
+fn fgem_perm_word4 x view f32 * soff ulong dst edit f32 * doff ulong to void
+  sc = bitcast f32 uint 0x5f800000
+  put dst doff mul get x soff sc
+  put dst add doff 1 mul get x add soff 1 sc
+  put dst add doff 2 mul get x add soff 2 sc
+  put dst add doff 3 mul get x add soff 3 sc
+end
+
+fn fgem_perm_lane x view f32 * dst edit f32 * to void
+  nw = div get fgem_tmp 13 4
+  for w ulong nw bound 8
+    s1 = mul get fgem_tmp 14 get fgem_tmp 13
+    soff = add add get fgem_tmp 12 s1 mul w 4
+    d1 = add mul w 32 get fgem_tmp 14
+    doff = add get fgem_tmp 12 mul d1 4
+    fgem_perm_word4 x soff dst doff
+  end
+end
+
+fn fgem_perm_row x view f32 * s0 ulong lb ulong dst edit f32 * to void
+  put fgem_tmp 12 s0
+  put fgem_tmp 13 lb
+  for lane ulong 32 bound 32
+    put fgem_tmp 14 lane
+    fgem_perm_lane x dst
+  end
+end
+
+note x' = x * 2^64 in kernel lane layout
+fn fgem_permute_x x view f32 * k ulong lb ulong dst edit f32 * to void
+  row = mul 32 lb
+  s0 = ulong 0
+  while le add s0 row k bound 256
+    fgem_perm_row x s0 lb dst
+    s0 = add s0 row
+  end
+end
+
+fn fgem_plan_validate req view uint 5 pairs view uint * to long
+  if or eq get req 0 0 or eq get req 3 0 eq get req 4 0
+    ret FGEM_BAD_ARGS
+  end
+  if gt get req 3 FGEM_MAX_ROWS
+    ret FGEM_TOO_LARGE
+  end
+  segs = uint 0
+  for i ulong ulong get req 3 bound 1024
+    eid = get pairs mul i 2
+    if ge eid get req 0
+      ret FGEM_BAD_ARGS
+    end
+    if ge get pairs add mul i 2 1 get req 4
+      ret FGEM_BAD_ARGS
+    end
+    if gt i 0
+      if lt eid get pairs mul sub i 1 2
+        ret FGEM_BAD_ARGS
+      end
+      if ne eid get pairs mul sub i 1 2
+        segs = add segs 1
+      end
+    else
+      segs = 1
+    end
+  end
+  if gt segs FGEM_MAX_SEGMENTS
+    ret FGEM_TOO_LARGE
+  end
+  put fgem_tmp 0 ulong segs
+  ret FGEM_OK
+end
+
+fn fgem_seg_end pairs view uint * m ulong i ulong to ulong
+  eid0 = get pairs mul i 2
+  j = i
+  while lt j m bound 1024
+    if ne get pairs mul j 2 eid0
+      ret j
+    end
+    j = add j 1
+  end
+  ret j
+end
+
+fn fgem_plan_stream req view uint 5 pairs view uint * mt uint to void
+  put fgem_tmp 7 0
+  put fgem_tmp 8 0
+  put fgem_tmp 9 0
+  nk = mul ulong get req 1 ulong get req 2
+  m = ulong get req 3
+  i = ulong 0
+  while lt i m bound 1024
+    j = fgem_seg_end pairs m i
+    cnt = uint sub j i
+    p = ulong div sub add cnt mt 1 mt
+    if gt p get fgem_tmp 7
+      put fgem_tmp 7 p
+    end
+    put fgem_tmp 8 add get fgem_tmp 8 nk
+    put fgem_tmp 9 add get fgem_tmp 9 mul p nk
+    i = j
+  end
+end
+
+fn fgem_plan_compile k uint n uint segs uint to long
+  sp = new ulong 8 0
+  fgem_spec_for k segs sp
+  sl = new ulong 2 0
+  rc = fgem_kernel_for sp sl
+  if ne rc FGEM_OK
+    ret rc
+  end
+  put fgem_tmp 1 get sp 1
+  put fgem_tmp 2 get sp 2
+  put fgem_tmp 3 get sp 3
+  put fgem_tmp 4 get sl 0
+  put fgem_tmp 5 get sl 1
+  put fgem_tmp 6 ulong omega_fp8gemm_shared_bytes sp
+  w = uint get sp 3
+  gx = div sub add n w 1 w
+  bud = fgem_cta_budget_for segs
+  if gt gx bud
+    gx = bud
+  end
+  if eq gx 0
+    gx = 1
+  end
+  put fgem_tmp 10 ulong gx
+  ret FGEM_OK
+end
+
+note CPU-only host contract + launch/QMD planner for omega_gpu_fp8gemm_{f32,bf16}
+fn fgem_plan_core req view uint 5 pairs view uint * out_info edit ulong 13 out_qmd edit uint 96 to long
+  rc = fgem_plan_validate req pairs
+  if ne rc FGEM_OK
+    ret rc
+  end
+  rc = fgem_plan_compile get req 2 get req 1 uint get fgem_tmp 0
+  if ne rc FGEM_OK
+    ret rc
+  end
+  fgem_plan_stream req pairs uint get fgem_tmp 2
+  base = mul get fgem_tmp 4 12
+  peak = uint get fgem_cache add base 9
+  decl = fgem_gpr_declared peak
+  if eq fgem_gpr_declared_ok decl peak 0
+    fgem_set_err fgem_err_decl
+    ret FGEM_CHIP_FAIL
+  end
+  put out_info 0 ulong get req 3
+  put out_info 1 get fgem_tmp 0
+  put out_info 2 ulong get req 1
+  put out_info 3 ulong get req 2
+  put out_info 4 get fgem_tmp 2
+  put out_info 5 get fgem_tmp 3
+  put out_info 6 get fgem_tmp 1
+  put out_info 7 get fgem_tmp 10
+  put out_info 8 get fgem_tmp 0
+  put out_info 9 get fgem_tmp 7
+  put out_info 10 get fgem_tmp 8
+  put out_info 11 get fgem_tmp 9
+  put out_info 12 get fgem_tmp 5
+  qin = new ulong 6 0
+  put qin 0 get fgem_cache add base 11
+  put qin 1 ulong decl
+  put qin 2 mul 32 get fgem_tmp 3
+  put qin 3 get fgem_tmp 10
+  put qin 4 get fgem_tmp 0
+  put qin 5 get fgem_tmp 6
+  ret fgem_build_launch_qmd qin out_qmd
+end
+
+fn fgem_gemm_f32 req view uint 5 pairs view uint * out_info edit ulong 13 out_qmd edit uint 96 to long
+  ret fgem_plan_core req pairs out_info out_qmd
+end
+
+fn fgem_gemm_bf16 req view uint 5 pairs view uint * out_info edit ulong 13 out_qmd edit uint 96 to long
+  ret fgem_plan_core req pairs out_info out_qmd
+end

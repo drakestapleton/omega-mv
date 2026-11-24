@@ -1,0 +1,433 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_prefill_attn256_api.c.
+note Composes on src/omega_blackwell_codegen_attn256.om, src/omega_blackwell_codegen_pattn256.om,
+note src/omega_blackwell_codegen.om, and src/omega_blackwell_qmd.om.
+note CPU-only host contract + QMD validation (no /dev/nvidia*).
+om2
+
+const PA256_API_OK long 0
+const PA256_API_BAD_ARGS long -1
+const PA256_API_TOO_LARGE long -2
+const PA256_API_CODEGEN_FAIL long -3
+const PA256_API_CHIP_FAIL long -4
+
+const PA256_API_MAX_M uint 32768
+const PA256_API_THREADS uint 256
+const PA256_API_TOKENS uint 8
+const PA256_API_ROW_BYTES uint 512
+const PA256_API_CHUNK uint 256
+const PA256_API_DEPTH uint 2
+const PA256_API_PREP_SHARED uint 14896
+const PA256_API_ATT_SHARED uint 16384
+const PA256_API_KK_PREP ulong 0
+const PA256_API_KK_ATTEND ulong 1
+
+note 2-slot kernel cache (9 ulongs per slot):
+note 0=valid 1=mut 2=qh 3=kvh 4=qpc 5=insns 6=peak_gpr 7=code_bytes 8=code_va
+global pa256_slots ulong 18
+global pa256_prep_mut long 1
+global pa256_att_mut long 1
+global pa256_have_qf ulong 1
+global pa256_qf_size ulong 1
+global pa256_qf_va ulong 1
+global pa256_last_args uint 37
+global pa256_tmp ulong 8
+
+fn pa256_slots_clear to void
+  for i ulong 18
+    put pa256_slots i 0
+  end
+end
+
+fn pa256_api_release to void
+  put pa256_have_qf 0 0
+  put pa256_qf_size 0 0
+  put pa256_qf_va 0 0
+end
+
+fn pa256_api_init to void
+  put pa256_prep_mut 0 0
+  put pa256_att_mut 0 0
+  pa256_slots_clear
+  pa256_api_release
+end
+
+fn pa256_api_test_set_mutant pmut long amut long to void
+  put pa256_prep_mut 0 pmut
+  put pa256_att_mut 0 amut
+  pa256_slots_clear
+end
+
+fn pa256_api_qf_bytes rows uint q_heads uint to ulong
+  ret mul mul ulong div add rows 1 2 ulong q_heads 1024
+end
+
+fn pa256_gpr_declared peak uint to uint
+  ret mul div add add peak 2 7 8 8
+end
+
+fn pa256_gpr_declared_ok decl uint peak uint to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn pa256_code_bytes cnt ulong to ulong
+  padded = mul div add cnt 7 8 8
+  if lt padded 32
+    padded = 32
+  end
+  ret mul padded 16
+end
+
+fn pa256_api_encode kind ulong out_gprs edit uint 1 to ulong
+  if ge kind 2
+    ret 0
+  end
+  stats = new uint 2 0
+  sp = new ulong 8 0
+  sp2 = new ulong 4 0
+  cg = long -1
+  if eq kind PA256_API_KK_PREP
+    put sp 0 ulong PA256_API_DEPTH
+    put sp 1 ulong get pa256_prep_mut 0
+    put sp 2 1
+    cg = omega_decode_attn256_prog_stats sp stats
+  else
+    put sp2 0 ulong get pa256_att_mut 0
+    cg = omega_prefill_attn256_prog_stats sp2 stats
+  end
+  if ne cg 0
+    ret 0
+  end
+  need = pa256_code_bytes ulong get stats 0
+  if eq need 0
+    ret 0
+  end
+  put out_gprs 0 get stats 1
+  ret need
+end
+
+fn pa256_api_slot_match b ulong key view ulong 4 to bool
+  for j ulong 4
+    if ne get pa256_slots add b add j 1 get key j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pa256_api_run_cg kind ulong key view ulong 4 stats edit uint 2 to long
+  sp = new ulong 8 0
+  sp2 = new ulong 4 0
+  if eq kind PA256_API_KK_PREP
+    put sp 0 ulong PA256_API_DEPTH
+    put sp 1 get key 0
+    put sp 2 1
+    put sp 3 get key 1
+    put sp 4 get key 2
+    put sp 5 get key 3
+    ret omega_decode_attn256_prog_stats sp stats
+  end
+  put sp2 0 get key 0
+  put sp2 1 get key 1
+  put sp2 2 get key 2
+  ret omega_prefill_attn256_prog_stats sp2 stats
+end
+
+note sh: [q_heads, kv_heads, q_per_cta]
+fn pa256_api_kernel_for kind ulong sh view uint 3 rec ulong out_slot edit ulong 2 to long
+  if ge kind 2
+    ret PA256_API_BAD_ARGS
+  end
+  key = new ulong 4 0
+  if eq kind PA256_API_KK_PREP
+    put key 0 ulong get pa256_prep_mut 0
+  else
+    put key 0 ulong get pa256_att_mut 0
+  end
+  put key 1 ulong get sh 0
+  put key 2 ulong get sh 1
+  put key 3 ulong get sh 2
+  b = mul kind 9
+  if ne get pa256_slots b 0
+    if pa256_api_slot_match b key
+      put out_slot 0 kind
+      put out_slot 1 1
+      ret PA256_API_OK
+    end
+  end
+  if ne rec 0
+    ret PA256_API_TOO_LARGE
+  end
+  stats = new uint 2 0
+  if ne pa256_api_run_cg kind key stats 0
+    ret PA256_API_CODEGEN_FAIL
+  end
+  need = pa256_code_bytes ulong get stats 0
+  if eq need 0
+    ret PA256_API_CODEGEN_FAIL
+  end
+  if gt mul ulong PA256_API_THREADS ulong pa256_gpr_declared get stats 1 65536
+    ret PA256_API_TOO_LARGE
+  end
+  put pa256_slots b 1
+  for j ulong 4
+    put pa256_slots add b add j 1 get key j
+  end
+  put pa256_slots add b 5 ulong get stats 0
+  put pa256_slots add b 6 ulong get stats 1
+  put pa256_slots add b 7 need
+  put pa256_slots add b 8 add 0x315000000 mul kind 0x10000
+  put out_slot 0 kind
+  put out_slot 1 0
+  ret PA256_API_OK
+end
+
+fn pa256_api_reserve_for sh view uint 3 max_m uint to long
+  if or eq max_m 0 gt max_m PA256_API_MAX_M
+    ret PA256_API_BAD_ARGS
+  end
+  qh = get sh 0
+  if eq qh 0
+    qh = 24
+  end
+  need = pa256_api_qf_bytes max_m qh
+  put pa256_have_qf 0 1
+  put pa256_qf_size 0 need
+  put pa256_qf_va 0 0x3c0000000
+  sl = new ulong 2 0
+  for k ulong 2
+    rc = pa256_api_kernel_for k sh 0 sl
+    if ne rc PA256_API_OK
+      ret rc
+    end
+  end
+  ret PA256_API_OK
+end
+
+fn pa256_api_reserve max_m uint to long
+  sh = new uint 3 0
+  put sh 0 24
+  put sh 1 4
+  put sh 2 6
+  ret pa256_api_reserve_for sh max_m
+end
+
+fn pa256_api_build_qmd qin view ulong 6 out_qmd edit uint 96 to long
+  cfg = new ulong 16 0
+  put cfg 0 0x320000000
+  put cfg 1 0x324280000
+  put cfg 2 0x322000000
+  put cfg 3 0x324010000
+  put cfg 4 get qin 0
+  put cfg 5 get qin 5
+  put cfg 6 ulong PA256_API_THREADS
+  put cfg 7 get qin 2
+  put cfg 8 ulong PA256_API_THREADS
+  put cfg 9 1
+  put cfg 10 get qin 2
+  put cfg 11 get qin 3
+  put cfg 12 get qin 1
+  put cfg 13 get qin 4
+  if ne omega_blackwell_build_qmd1 out_qmd cfg 0
+    ret PA256_API_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants out_qmd 0
+    ret PA256_API_CHIP_FAIL
+  end
+  ret PA256_API_OK
+end
+
+fn pa256_api_check_qf rec ulong m uint qh uint to long
+  qfn = pa256_api_qf_bytes m qh
+  if ne rec 0
+    if eq get pa256_have_qf 0 0
+      ret PA256_API_TOO_LARGE
+    end
+    if lt get pa256_qf_size 0 qfn
+      ret PA256_API_TOO_LARGE
+    end
+    ret PA256_API_OK
+  end
+  if or eq get pa256_have_qf 0 0 lt get pa256_qf_size 0 qfn
+    put pa256_have_qf 0 1
+    put pa256_qf_size 0 qfn
+    put pa256_qf_va 0 0x3c0000000
+  end
+  ret PA256_API_OK
+end
+
+fn pa256_api_stage1 req view ulong 9 cview view ulong 11 to long
+  m = uint get req 2
+  pos0 = uint get req 1
+  max_pos = uint get cview 7
+  if or eq m 0 gt m PA256_API_MAX_M
+    ret PA256_API_BAD_ARGS
+  end
+  if or gt pos0 max_pos gt m sub max_pos pos0
+    ret PA256_API_BAD_ARGS
+  end
+  if eq get req 3 0
+    if or eq get req 5 0 eq get req 6 0
+      ret PA256_API_BAD_ARGS
+    end
+    if or ne and get req 5 15 0 ne and get req 6 15 0
+      ret PA256_API_BAD_ARGS
+    end
+  end
+  qh = uint get cview 8
+  kvh = uint get cview 9
+  qpc = uint get cview 10
+  if or eq qh 0 eq kvh 0
+    ret PA256_API_BAD_ARGS
+  end
+  if or eq qpc 0 ne rem qh qpc 0
+    ret PA256_API_BAD_ARGS
+  end
+  sh = new uint 3 0
+  put sh 0 qh
+  put sh 1 kvh
+  put sh 2 qpc
+  sl = new ulong 2 0
+  hits = ulong 0
+  for k ulong 2
+    rc = pa256_api_kernel_for k sh get req 4 sl
+    if ne rc PA256_API_OK
+      ret rc
+    end
+    hits = add hits get sl 1
+  end
+  rc = pa256_api_check_qf get req 4 m qh
+  if ne rc PA256_API_OK
+    ret rc
+  end
+  put pa256_tmp 0 hits
+  ret PA256_API_OK
+end
+
+fn pa256_api_pack_args req view ulong 9 cview view ulong 11 to void
+  qva = get req 5
+  ova = get req 6
+  if ne get req 3 0
+    qva = 0x3c1000000
+    ova = 0x3c2000000
+  end
+  qf_va = get pa256_qf_va 0
+  kvs = uint mul get cview 7 ulong PA256_API_ROW_BYTES
+  fq = f32 mul f64 0.0625 f64 1.4426950408889634
+  put pa256_last_args 0 bw_qmd_u32lo qva
+  put pa256_last_args 1 bw_qmd_u32hi qva
+  put pa256_last_args 2 bw_qmd_u32lo get cview 0
+  put pa256_last_args 3 bw_qmd_u32hi get cview 0
+  put pa256_last_args 4 bw_qmd_u32lo get cview 1
+  put pa256_last_args 5 bw_qmd_u32hi get cview 1
+  put pa256_last_args 6 bw_qmd_u32lo get cview 2
+  put pa256_last_args 7 bw_qmd_u32hi get cview 2
+  put pa256_last_args 8 bw_qmd_u32lo get cview 3
+  put pa256_last_args 9 bw_qmd_u32hi get cview 3
+  put pa256_last_args 10 bw_qmd_u32lo get cview 4
+  put pa256_last_args 11 bw_qmd_u32hi get cview 4
+  put pa256_last_args 12 bw_qmd_u32lo qf_va
+  put pa256_last_args 13 bw_qmd_u32hi qf_va
+  put pa256_last_args 14 bw_qmd_u32lo get cview 5
+  put pa256_last_args 15 bw_qmd_u32hi get cview 5
+  put pa256_last_args 16 bw_qmd_u32lo get cview 6
+  put pa256_last_args 17 bw_qmd_u32hi get cview 6
+  put pa256_last_args 18 uint get req 1
+  put pa256_last_args 19 PA256_API_CHUNK
+  put pa256_last_args 20 1
+  put pa256_last_args 21 kvs
+  put pa256_last_args 22 uint get req 7
+  put pa256_last_args 23 bitcast uint f32 1.0
+  put pa256_last_args 24 bitcast uint fq
+  put pa256_last_args 25 bw_qmd_u32lo qf_va
+  put pa256_last_args 26 bw_qmd_u32hi qf_va
+  put pa256_last_args 27 bw_qmd_u32lo get cview 0
+  put pa256_last_args 28 bw_qmd_u32hi get cview 0
+  put pa256_last_args 29 bw_qmd_u32lo get cview 1
+  put pa256_last_args 30 bw_qmd_u32hi get cview 1
+  put pa256_last_args 31 bw_qmd_u32lo ova
+  put pa256_last_args 32 bw_qmd_u32hi ova
+  put pa256_last_args 33 uint get req 1
+  put pa256_last_args 34 uint get req 2
+  put pa256_last_args 35 kvs
+  put pa256_last_args 36 uint get req 8
+end
+
+fn pa256_api_emit_qmds m ulong cview view ulong 11 out_qmd edit uint 96 to long
+  qin = new ulong 6 0
+  p0 = uint get pa256_slots 6
+  d0 = pa256_gpr_declared p0
+  if eq pa256_gpr_declared_ok d0 p0 0
+    ret PA256_API_CHIP_FAIL
+  end
+  put qin 0 get pa256_slots 8
+  put qin 1 ulong d0
+  put qin 2 m
+  put qin 3 div get cview 8 get cview 10
+  put qin 4 ulong PA256_API_PREP_SHARED
+  put qin 5 mul m 8192
+  rc = pa256_api_build_qmd qin out_qmd
+  if ne rc PA256_API_OK
+    ret rc
+  end
+  p1 = uint get pa256_slots 15
+  d1 = pa256_gpr_declared p1
+  if eq pa256_gpr_declared_ok d1 p1 0
+    ret PA256_API_CHIP_FAIL
+  end
+  gx_att = div sub add m ulong PA256_API_TOKENS 1 ulong PA256_API_TOKENS
+  put qin 0 get pa256_slots 17
+  put qin 1 ulong d1
+  put qin 2 gx_att
+  put qin 3 get cview 9
+  put qin 4 ulong PA256_API_ATT_SHARED
+  put qin 5 mul m 6144
+  put pa256_tmp 1 gx_att
+  ret pa256_api_build_qmd qin out_qmd
+end
+
+note req: [layer, pos0, m, host, rec, qkv_va, out_va, eps_bits, out_scale_bits]
+note cview: [k_va, v_va, rope_va, q_norm_va, k_norm_va, part_va, cnt_va, max_pos, q_heads, kv_heads, q_per_cta]
+note out_info: [layer, pos0, m, gx_prep, gx_att, hits]
+fn pa256_api_core req view ulong 9 cview view ulong 11 out_info edit ulong 6 out_qmd edit uint 96 to long
+  rc = pa256_api_stage1 req cview
+  if ne rc PA256_API_OK
+    ret rc
+  end
+  pa256_api_pack_args req cview
+  rc = pa256_api_emit_qmds get req 2 cview out_qmd
+  if ne rc PA256_API_OK
+    ret rc
+  end
+  put out_info 0 get req 0
+  put out_info 1 get req 1
+  put out_info 2 get req 2
+  put out_info 3 get req 2
+  put out_info 4 get pa256_tmp 1
+  put out_info 5 get pa256_tmp 0
+  ret PA256_API_OK
+end
+
+fn pa256_api_prefill req view ulong 9 cview view ulong 11 out_info edit ulong 6 out_qmd edit uint 96 to long
+  if eq get req 3 0
+    ret PA256_API_BAD_ARGS
+  end
+  ret pa256_api_core req cview out_info out_qmd
+end
+
+fn pa256_api_prefill_dev req view ulong 9 cview view ulong 11 out_info edit ulong 6 out_qmd edit uint 96 to long
+  ret pa256_api_core req cview out_info out_qmd
+end
+
+fn pa256_api_prefill_record req view ulong 9 cview view ulong 11 out_info edit ulong 6 out_qmd edit uint 96 to long
+  if eq get req 4 0
+    ret PA256_API_BAD_ARGS
+  end
+  ret pa256_api_core req cview out_info out_qmd
+end

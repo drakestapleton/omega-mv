@@ -1,0 +1,536 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_prefill_attn_api.c.
+note Composes on src/omega_blackwell_codegen_pattn.om, src/omega_blackwell_codegen.om,
+note and src/omega_blackwell_qmd.om. CPU-only host contract + QMD validation (no /dev/nvidia*).
+om2
+
+const PATTN_API_OK long 0
+const PATTN_API_BAD_ARGS long -1
+const PATTN_API_TOO_LARGE long -2
+const PATTN_API_CODEGEN_FAIL long -3
+const PATTN_API_CHIP_FAIL long -4
+
+const PATTN_API_WARPS_DEF uint 8
+const PATTN_API_KV_HEADS uint 4
+const PATTN_API_ROW_BYTES uint 256
+const PATTN_API_CHUNK uint 64
+const PATTN_API_HOST_PASS uint 1024
+const PATTN_API_QKV_WORDS uint 5120
+const PATTN_API_OUT_WORDS uint 4096
+const PATTN_API_SHARED_BYTES uint 16384
+const PATTN_API_ARGS_WORDS ulong 25
+const PATTN_API_MODE_FUSED uint 0
+const PATTN_API_MODE_APPEND uint 1
+const PATTN_API_MODE_ATTEND uint 2
+const PATTN_API_MAX_MIRRORS ulong 128
+const PATTN_API_MAX_LOG ulong 256
+
+note 3-slot kernel cache (one per mode: 0=fused, 1=append, 2=attend), 9 ulongs per slot:
+note 0=valid 1=warps 2=mutant 3=mode 4=mirror 5=insns 6=peak_gpr 7=code_bytes 8=code_va
+global pattn_api_slots ulong 27
+global pattn_api_warps uint 1
+global pattn_api_mutant long 1
+global pattn_api_fused ulong 1
+global pattn_api_mirror_off ulong 1
+global pattn_api_mirror_per_call ulong 1
+global pattn_api_n_launch ulong 1
+global pattn_api_launch_ns ulong 256
+
+note Persistent KV mirrors (128 x 5 ulongs: 0=key_k_va 1=max_pos 2=valid 3=plane 4=mem_va)
+global pattn_api_mir ulong 640
+global pattn_api_n_mir ulong 1
+global pattn_api_last_args uint 25
+global pattn_api_tmp ulong 16
+
+fn pattn_api_slots_clear to void
+  for i ulong 27
+    put pattn_api_slots i 0
+  end
+end
+
+fn pattn_api_release to void
+  pattn_api_slots_clear
+  for i ulong 640
+    put pattn_api_mir i 0
+  end
+  put pattn_api_n_mir 0 0
+  put pattn_api_n_launch 0 0
+end
+
+fn pattn_api_init to void
+  put pattn_api_warps 0 0
+  put pattn_api_mutant 0 0
+  put pattn_api_fused 0 0
+  put pattn_api_mirror_off 0 0
+  put pattn_api_mirror_per_call 0 0
+  pattn_api_release
+end
+
+fn pattn_api_set_warps warps uint to void
+  put pattn_api_warps 0 warps
+  pattn_api_slots_clear
+end
+
+fn pattn_api_test_set_mutant mut long to void
+  put pattn_api_mutant 0 mut
+  pattn_api_slots_clear
+end
+
+fn pattn_api_set_fused on ulong to void
+  if ne on 0
+    put pattn_api_fused 0 1
+  else
+    put pattn_api_fused 0 0
+  end
+end
+
+fn pattn_api_set_kv_mirror on ulong to void
+  if ne on 0
+    put pattn_api_mirror_off 0 0
+  else
+    put pattn_api_mirror_off 0 1
+  end
+end
+
+fn pattn_api_kv_mirror_available to ulong
+  ret 1
+end
+
+fn pattn_api_test_set_mirror_per_call on ulong to void
+  if ne on 0
+    put pattn_api_mirror_per_call 0 1
+  else
+    put pattn_api_mirror_per_call 0 0
+  end
+end
+
+fn pattn_api_test_launch_ns dst edit ulong * cap ulong to ulong
+  total = get pattn_api_n_launch 0
+  n = total
+  if gt n PATTN_API_MAX_LOG
+    n = PATTN_API_MAX_LOG
+  end
+  if gt n cap
+    n = cap
+  end
+  for i ulong n bound 256
+    put dst i get pattn_api_launch_ns i
+  end
+  ret total
+end
+
+fn pattn_api_mirror_find k_va ulong max_pos uint to long
+  nm = get pattn_api_n_mir 0
+  for i ulong nm bound 128
+    b = mul i 5
+    if and eq get pattn_api_mir b k_va eq get pattn_api_mir add b 1 ulong max_pos
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn pattn_api_mirror_get k_va ulong v_va ulong max_pos uint to long
+  idx = pattn_api_mirror_find k_va max_pos
+  if ge idx 0
+    ret idx
+  end
+  nm = get pattn_api_n_mir 0
+  if ge nm PATTN_API_MAX_MIRRORS
+    ret -1
+  end
+  if le v_va k_va
+    ret -1
+  end
+  plane = sub v_va k_va
+  if ne and plane 15 0
+    ret -1
+  end
+  b = mul nm 5
+  put pattn_api_mir b k_va
+  put pattn_api_mir add b 1 ulong max_pos
+  put pattn_api_mir add b 2 0
+  put pattn_api_mir add b 3 plane
+  put pattn_api_mir add b 4 add 0x3a0000000 mul nm 0x1000000
+  put pattn_api_n_mir 0 add nm 1
+  ret long nm
+end
+
+note out_view: [k_va, v_va, kv_stride, max_pos, valid]
+fn pattn_api_kv_mirror_view k_va ulong max_pos uint out_view edit ulong 5 to long
+  for i ulong 5
+    put out_view i 0
+  end
+  idx = pattn_api_mirror_find k_va max_pos
+  if lt idx 0
+    ret PATTN_API_BAD_ARGS
+  end
+  b = mul ulong idx 5
+  mva = get pattn_api_mir add b 4
+  plane = get pattn_api_mir add b 3
+  put out_view 0 mva
+  put out_view 1 add mva plane
+  put out_view 2 mul ulong max_pos ulong PATTN_API_ROW_BYTES
+  put out_view 3 ulong max_pos
+  put out_view 4 get pattn_api_mir add b 2
+  ret PATTN_API_OK
+end
+
+fn pattn_api_kv_mirror_invalidate k_va ulong max_pos uint from_pos uint to void
+  idx = pattn_api_mirror_find k_va max_pos
+  if lt idx 0
+    ret
+  end
+  b = mul ulong idx 5
+  if gt get pattn_api_mir add b 2 ulong from_pos
+    put pattn_api_mir add b 2 ulong from_pos
+  end
+end
+
+fn pattn_api_kv_mirror_forget k_va ulong max_pos uint to void
+  idx = pattn_api_mirror_find k_va max_pos
+  if lt idx 0
+    ret
+  end
+  nm = get pattn_api_n_mir 0
+  last = sub nm 1
+  b = mul ulong idx 5
+  lb = mul last 5
+  for j ulong 5
+    put pattn_api_mir add b j get pattn_api_mir add lb j
+    put pattn_api_mir add lb j 0
+  end
+  put pattn_api_n_mir 0 last
+end
+
+fn pattn_gpr_declared peak uint to uint
+  ret mul div add add peak 2 7 8 8
+end
+
+fn pattn_gpr_declared_ok decl uint peak uint to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn pattn_code_bytes cnt ulong to ulong
+  padded = mul div add cnt 7 8 8
+  if lt padded 32
+    padded = 32
+  end
+  ret mul padded 16
+end
+
+fn pattn_api_encode sp view ulong 4 out_gprs edit uint 1 to ulong
+  stats = new uint 2 0
+  if ne omega_prefill_attn_prog_stats sp stats 0
+    ret 0
+  end
+  need = pattn_code_bytes ulong get stats 0
+  if eq need 0
+    ret 0
+  end
+  put out_gprs 0 get stats 1
+  ret need
+end
+
+fn pattn_api_slot_match b ulong sp view ulong 4 to bool
+  for j ulong 4
+    if ne get pattn_api_slots add b add j 1 get sp j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn pattn_api_kernel_for sp view ulong 4 out_slot edit ulong 2 to long
+  mode = get sp 2
+  if ge mode 3
+    ret PATTN_API_CODEGEN_FAIL
+  end
+  b = mul mode 9
+  if ne get pattn_api_slots b 0
+    if pattn_api_slot_match b sp
+      put out_slot 0 mode
+      put out_slot 1 1
+      ret PATTN_API_OK
+    end
+  end
+  stats = new uint 2 0
+  if ne omega_prefill_attn_prog_stats sp stats 0
+    ret PATTN_API_CODEGEN_FAIL
+  end
+  insns = ulong get stats 0
+  peak = get stats 1
+  need = pattn_code_bytes insns
+  if eq need 0
+    ret PATTN_API_CODEGEN_FAIL
+  end
+  decl = pattn_gpr_declared peak
+  if gt mul mul ulong 32 get sp 0 ulong decl 65536
+    ret PATTN_API_TOO_LARGE
+  end
+  put pattn_api_slots b 1
+  put pattn_api_slots add b 1 get sp 0
+  put pattn_api_slots add b 2 get sp 1
+  put pattn_api_slots add b 3 get sp 2
+  put pattn_api_slots add b 4 get sp 3
+  put pattn_api_slots add b 5 insns
+  put pattn_api_slots add b 6 ulong peak
+  put pattn_api_slots add b 7 need
+  put pattn_api_slots add b 8 add 0x314000000 mul mode 0x10000
+  put out_slot 0 mode
+  put out_slot 1 0
+  ret PATTN_API_OK
+end
+
+fn pattn_api_launch_prep lreq view ulong 10 to long
+  w = get pattn_api_warps 0
+  if eq w 0
+    w = PATTN_API_WARPS_DEF
+  end
+  sp = new ulong 4 0
+  put sp 0 ulong w
+  put sp 1 ulong get pattn_api_mutant 0
+  put sp 2 get lreq 0
+  if and eq uint get lreq 0 PATTN_API_MODE_APPEND ne get lreq 7 0
+    put sp 3 1
+  else
+    put sp 3 0
+  end
+  if eq omega_pattn_spec_ok sp 0
+    ret PATTN_API_BAD_ARGS
+  end
+  sl = new ulong 2 0
+  rc = pattn_api_kernel_for sp sl
+  if ne rc PATTN_API_OK
+    ret rc
+  end
+  put pattn_api_tmp 0 ulong w
+  put pattn_api_tmp 1 get sl 1
+  ret PATTN_API_OK
+end
+
+fn pattn_api_launch_pack lreq view ulong 10 cview view ulong 6 to void
+  for i ulong 25
+    put pattn_api_last_args i 0
+  end
+  kc = get cview 0
+  vc = get cview 1
+  kvs = uint mul get cview 5 ulong PATTN_API_ROW_BYTES
+  if and eq uint get lreq 0 PATTN_API_MODE_ATTEND ne get lreq 7 0
+    kc = get lreq 7
+    vc = get lreq 8
+    kvs = uint get lreq 9
+  end
+  qk_f = f32 mul f64 0.08838834764831845 f64 1.4426950408889634
+  put pattn_api_last_args 0 bw_qmd_u32lo get lreq 1
+  put pattn_api_last_args 1 bw_qmd_u32hi get lreq 1
+  put pattn_api_last_args 2 bw_qmd_u32lo kc
+  put pattn_api_last_args 3 bw_qmd_u32hi kc
+  put pattn_api_last_args 4 bw_qmd_u32lo vc
+  put pattn_api_last_args 5 bw_qmd_u32hi vc
+  put pattn_api_last_args 6 bw_qmd_u32lo get cview 2
+  put pattn_api_last_args 7 bw_qmd_u32hi get cview 2
+  put pattn_api_last_args 8 bw_qmd_u32lo get cview 3
+  put pattn_api_last_args 9 bw_qmd_u32hi get cview 3
+  put pattn_api_last_args 10 bw_qmd_u32lo get cview 4
+  put pattn_api_last_args 11 bw_qmd_u32hi get cview 4
+  put pattn_api_last_args 12 bw_qmd_u32lo get lreq 2
+  put pattn_api_last_args 13 bw_qmd_u32hi get lreq 2
+  put pattn_api_last_args 14 uint get lreq 3
+  put pattn_api_last_args 15 uint get lreq 4
+  put pattn_api_last_args 16 kvs
+  put pattn_api_last_args 17 uint get lreq 5
+  put pattn_api_last_args 18 uint get lreq 6
+  put pattn_api_last_args 19 bitcast uint qk_f
+  if eq uint get lreq 0 PATTN_API_MODE_APPEND
+    put pattn_api_last_args 20 bw_qmd_u32lo get lreq 7
+    put pattn_api_last_args 21 bw_qmd_u32hi get lreq 7
+    put pattn_api_last_args 22 bw_qmd_u32lo get lreq 8
+    put pattn_api_last_args 23 bw_qmd_u32hi get lreq 8
+    put pattn_api_last_args 24 uint get lreq 9
+  end
+end
+
+fn pattn_api_launch_qmd mode ulong mc ulong out_qmd edit uint 96 to long
+  b = mul mode 9
+  peak = uint get pattn_api_slots add b 6
+  decl = pattn_gpr_declared peak
+  if eq pattn_gpr_declared_ok decl peak 0
+    ret PATTN_API_CHIP_FAIL
+  end
+  w = get pattn_api_tmp 0
+  tx = mul 32 w
+  gx = div sub add mc w 1 w
+  put pattn_api_tmp 2 tx
+  put pattn_api_tmp 3 gx
+  cfg = new ulong 16 0
+  put cfg 0 0x320000000
+  put cfg 1 0x324280000
+  put cfg 2 0x322000000
+  put cfg 3 0x324010000
+  put cfg 4 get pattn_api_slots add b 8
+  put cfg 5 mul mc ulong PATTN_API_OUT_WORDS
+  put cfg 6 tx
+  put cfg 7 gx
+  put cfg 8 tx
+  put cfg 9 1
+  put cfg 10 gx
+  put cfg 11 ulong PATTN_API_KV_HEADS
+  put cfg 12 ulong decl
+  put cfg 13 ulong PATTN_API_SHARED_BYTES
+  if ne omega_blackwell_build_qmd1 out_qmd cfg 0
+    ret PATTN_API_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants out_qmd 0
+    ret PATTN_API_CHIP_FAIL
+  end
+  ret PATTN_API_OK
+end
+
+fn pattn_api_launch_one lreq view ulong 10 cview view ulong 6 out_info edit ulong 8 out_qmd edit uint 96 to long
+  rc = pattn_api_launch_prep lreq
+  if ne rc PATTN_API_OK
+    ret rc
+  end
+  pattn_api_launch_pack lreq cview
+  rc = pattn_api_launch_qmd get lreq 0 get lreq 4 out_qmd
+  if ne rc PATTN_API_OK
+    ret rc
+  end
+  nl = get pattn_api_n_launch 0
+  if lt nl PATTN_API_MAX_LOG
+    put pattn_api_launch_ns nl 1000
+  end
+  put pattn_api_n_launch 0 add nl 1
+  if eq get out_info 3 0
+    put out_info 4 get pattn_api_tmp 3
+    put out_info 5 ulong PATTN_API_KV_HEADS
+    put out_info 6 get pattn_api_tmp 2
+    put out_info 7 get pattn_api_tmp 1
+  else
+    if eq get pattn_api_tmp 1 0
+      put out_info 7 0
+    end
+  end
+  put out_info 3 add get out_info 3 1
+  ret PATTN_API_OK
+end
+
+fn pattn_api_check_run req view ulong 8 cview view ulong 6 to long
+  m = uint get req 2
+  pos0 = uint get req 1
+  max_pos = uint get cview 5
+  if or eq m 0 or gt pos0 max_pos gt m sub max_pos pos0
+    ret PATTN_API_BAD_ARGS
+  end
+  w = get pattn_api_warps 0
+  if eq w 0
+    w = PATTN_API_WARPS_DEF
+  end
+  sp = new ulong 4 0
+  put sp 0 ulong w
+  put sp 1 ulong get pattn_api_mutant 0
+  if eq omega_pattn_spec_ok sp 0
+    ret PATTN_API_BAD_ARGS
+  end
+  ret PATTN_API_OK
+end
+
+note req: [layer, pos0, m, qkv_va, out_va, eps_bits, out_scale_bits, has_io]
+fn pattn_api_run_core req view ulong 8 cview view ulong 6 out_info edit ulong 8 out_qmd edit uint 96 to long
+  rc = pattn_api_check_run req cview
+  if ne rc PATTN_API_OK
+    ret rc
+  end
+  for i ulong 8
+    put out_info i 0
+  end
+  put out_info 0 get req 0
+  put out_info 1 get req 1
+  put out_info 2 get req 2
+  put pattn_api_n_launch 0 0
+  lreq = new ulong 10 0
+  put lreq 1 get req 3
+  put lreq 2 get req 4
+  put lreq 3 get req 1
+  put lreq 4 get req 2
+  put lreq 5 get req 5
+  put lreq 6 get req 6
+  if eq get pattn_api_fused 0 0
+    midx = long -1
+    if eq get pattn_api_mirror_off 0 0
+      midx = pattn_api_mirror_get get cview 0 get cview 1 uint get cview 5
+      if lt midx 0
+        ret PATTN_API_CHIP_FAIL
+      end
+      mb = mul ulong midx 5
+      if ne get pattn_api_mirror_per_call 0 0
+        put pattn_api_mir add mb 2 0
+      end
+      put lreq 7 get pattn_api_mir add mb 4
+      put lreq 8 add get pattn_api_mir add mb 4 get pattn_api_mir add mb 3
+      put lreq 9 mul get cview 5 ulong PATTN_API_ROW_BYTES
+    end
+    put lreq 0 ulong PATTN_API_MODE_APPEND
+    rc = pattn_api_launch_one lreq cview out_info out_qmd
+    if ne rc PATTN_API_OK
+      ret rc
+    end
+    put lreq 0 ulong PATTN_API_MODE_ATTEND
+    rc = pattn_api_launch_one lreq cview out_info out_qmd
+    if ne rc PATTN_API_OK
+      ret rc
+    end
+    if ge midx 0
+      put pattn_api_mir add mul ulong midx 5 2 add get req 1 get req 2
+    end
+    ret PATTN_API_OK
+  end
+  done = ulong 0
+  while lt done get req 2 bound 512
+    mc = sub get req 2 done
+    if gt mc ulong PATTN_API_CHUNK
+      mc = ulong PATTN_API_CHUNK
+    end
+    put lreq 0 ulong PATTN_API_MODE_FUSED
+    put lreq 1 add get req 3 mul done mul ulong PATTN_API_QKV_WORDS 4
+    put lreq 2 add get req 4 mul done mul ulong PATTN_API_OUT_WORDS 4
+    put lreq 3 add get req 1 done
+    put lreq 4 mc
+    rc = pattn_api_launch_one lreq cview out_info out_qmd
+    if ne rc PATTN_API_OK
+      ret rc
+    end
+    done = add done ulong PATTN_API_CHUNK
+  end
+  ret PATTN_API_OK
+end
+
+fn pattn_api_prefill req view ulong 8 cview view ulong 6 out_info edit ulong 8 out_qmd edit uint 96 to long
+  if eq get req 7 0
+    ret PATTN_API_BAD_ARGS
+  end
+  hreq = new ulong 8 0
+  for i ulong 8
+    put hreq i get req i
+  end
+  put hreq 3 0x3b0000000
+  put hreq 4 0x3b1000000
+  ret pattn_api_run_core hreq cview out_info out_qmd
+end
+
+fn pattn_api_prefill_dev req view ulong 8 cview view ulong 6 out_info edit ulong 8 out_qmd edit uint 96 to long
+  if or eq get req 3 0 eq get req 4 0
+    ret PATTN_API_BAD_ARGS
+  end
+  if or ne and get req 3 15 0 ne and get req 4 15 0
+    ret PATTN_API_BAD_ARGS
+  end
+  ret pattn_api_run_core req cview out_info out_qmd
+end

@@ -1,0 +1,1015 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_gpu_gdn_api.c.
+note Composes on src/omega_blackwell_codegen_gdn.om, src/omega_blackwell_codegen.om,
+note src/omega_blackwell_qmd.om, and src/omega_gpu_hostmath.om.
+note CPU-only host contract, layout packing, and QMD validation (no /dev/nvidia*).
+om2
+
+const GDN_API_OK long 0
+const GDN_API_BAD_ARGS long -1
+const GDN_API_TOO_LARGE long -2
+const GDN_API_CODEGEN_FAIL long -3
+const GDN_API_CHIP_FAIL long -4
+
+const GDN_API_MAX_LAYERS uint 64
+const GDN_API_PF_MIN_T uint 3
+const GDN_API_PF_MAX_T uint 65536
+const GDN_API_SLOTS uint 384
+const GDN_API_THREADS uint 256
+const GDN_API_PREP_THREADS uint 128
+const GDN_API_COPY_THREADS uint 256
+const GDN_API_COPY_WORDS_PER_CTA ulong 1024
+const GDN_API_GRID_Y uint 16
+const GDN_API_SHARED_BYTES uint 5728
+const GDN_API_PREP_SHARED_BYTES uint 32
+const GDN_API_SCAN_SHARED_BYTES uint 12416
+const GDN_API_PREP_TOKENS uint 16
+const GDN_API_SCAN_CHUNK ulong 8
+const GDN_API_REC_BYTES ulong 1552
+
+const GDN_KK_DECODE ulong 0
+const GDN_KK_PREP ulong 1
+const GDN_KK_SCAN ulong 2
+const GDN_KK_POST ulong 3
+const GDN_KK_COPY ulong 4
+const GDN_KK_ZERO ulong 5
+const GDN_KK_MULTI ulong 6
+const GDN_KK_N ulong 7
+
+const GDN_LB_QKV ulong 0
+const GDN_LB_Z ulong 40960
+const GDN_LB_AB ulong 65536
+const GDN_LB_OUT ulong 65920
+const GDN_LB_BYTES ulong 90496
+
+note Global kernel cache (7 slots x 9 ulongs):
+note 0=valid 1=mutant 2=copy 3=ratio 4=state_bf16 5=insns 6=peak_gpr 7=code_bytes 8=code_va
+global gdn_kcache ulong 63
+global gdn_mutant long 1
+global gdn_rec ulong 1
+global gdn_last_err uchar 160
+global gdn_last_err_len ulong 1
+
+note Active GDN handle table (4 handles x 16 ulongs):
+note 0=valid 1=layers 2=ratio 3=cached 4=bf16 5=par_va 6=tail_va 7=state_va 8=lb_va 9=pf_va 10=pf_cap
+note 11=par_bytes 12=tail_bytes 13=state_bytes 14=vdim 15=conv
+global gdn_handles ulong 64
+global gdn_tmp ulong 16
+
+text gdn_rc_ok "OK"
+text gdn_rc_bad "BAD_ARGS"
+text gdn_rc_large "TOO_LARGE"
+text gdn_rc_cg "CODEGEN_FAIL"
+text gdn_rc_chip "CHIP_FAIL"
+text gdn_rc_unk "?"
+text gdn_err_evict "gdn record: kernel cache miss would evict resident kernel"
+text gdn_err_cg "gdn codegen refused the spec"
+text gdn_err_rf "gdn: register file"
+text gdn_err_decl "declared registers below peak + 2: refusing to launch"
+text gdn_err_pf_res "gdn prefill record: scratch below T tokens"
+
+fn gdn_api_set_err msg view uchar * to void
+  n = len msg
+  if gt n 159
+    n = 159
+  end
+  for i ulong n bound 160
+    put gdn_last_err i get msg i
+  end
+  put gdn_last_err n 0
+  put gdn_last_err_len 0 n
+end
+
+fn gdn_api_last_error dst edit uchar 160 to ulong
+  n = get gdn_last_err_len 0
+  if gt n 159
+    n = 159
+  end
+  for i ulong n bound 160
+    put dst i get gdn_last_err i
+  end
+  put dst n 0
+  ret n
+end
+
+fn gdn_api_copy_text src view uchar * dst edit uchar 32 to ulong
+  n = len src
+  if gt n 31
+    n = 31
+  end
+  for i ulong n bound 32
+    put dst i get src i
+  end
+  put dst n 0
+  ret n
+end
+
+fn gdn_api_rc_name rc long dst edit uchar 32 to ulong
+  if eq rc GDN_API_OK
+    ret gdn_api_copy_text gdn_rc_ok dst
+  end
+  if eq rc GDN_API_BAD_ARGS
+    ret gdn_api_copy_text gdn_rc_bad dst
+  end
+  if eq rc GDN_API_TOO_LARGE
+    ret gdn_api_copy_text gdn_rc_large dst
+  end
+  if eq rc GDN_API_CODEGEN_FAIL
+    ret gdn_api_copy_text gdn_rc_cg dst
+  end
+  if eq rc GDN_API_CHIP_FAIL
+    ret gdn_api_copy_text gdn_rc_chip dst
+  end
+  ret gdn_api_copy_text gdn_rc_unk dst
+end
+
+fn gdn_api_slots_clear to void
+  for i ulong 63
+    put gdn_kcache i 0
+  end
+end
+
+fn gdn_api_reset_globals to void
+  put gdn_mutant 0 0
+  put gdn_rec 0 0
+  put gdn_last_err_len 0 0
+  gdn_api_slots_clear
+  for i ulong 64
+    put gdn_handles i 0
+  end
+end
+
+fn gdn_api_test_set_mutant m long to void
+  put gdn_mutant 0 m
+  gdn_api_slots_clear
+end
+
+fn gdn_api_is_finite x f32 to bool
+  u = bitcast uint x
+  ret ne and u 0x7f800000 0x7f800000
+end
+
+fn gdn_api_slot_channel vh uint h uint s uint to uint
+  hk = div h div vh GDN_OM_KEY_HEADS
+  d = GDN_OM_HEAD_DIM
+  if lt s d
+    ret add mul hk d s
+  end
+  if lt s mul 2 d
+    ret add add mul GDN_OM_KEY_HEADS d mul hk d sub s d
+  end
+  ret add add mul mul 2 GDN_OM_KEY_HEADS d mul h d sub s mul 2 d
+end
+
+fn gdn_api_put_f32_le dst edit uchar * off ulong v f32 to void
+  u = bitcast uint v
+  put dst off uchar and u 0xff
+  put dst add off 1 uchar and shr u 8 0xff
+  put dst add off 2 uchar and shr u 16 0xff
+  put dst add off 3 uchar and shr u 24 0xff
+end
+
+fn gdn_api_pack_params_rest src view f32 * block edit uchar * to void
+  vh = get gdn_tmp 0
+  nconv = get gdn_tmp 1
+  for h ulong vh bound 64
+    ev = omega_hostmath_exp f64 get src add nconv h
+    bo = add get gdn_tmp 2 mul h 8
+    gdn_api_put_f32_le block bo sub f32 0.0 f32 ev
+    si = add add nconv vh h
+    gdn_api_put_f32_le block add bo 4 get src si
+  end
+  nbase = add nconv mul vh 2
+  for d ulong 128 bound 128
+    gdn_api_put_f32_le block add get gdn_tmp 3 mul d 4 get src add nbase d
+  end
+end
+
+note src=[conv_w[conv*4], a_log[vh], dt_bias[vh], norm_w[128]]
+fn gdn_api_pack_params_r ratio uint src view f32 * block edit uchar * to long
+  sh = new uint 10 0
+  if ne omega_gdn_shape ratio 0 sh 0
+    ret -1
+  end
+  nconv = mul ulong get sh 2 4
+  put gdn_tmp 0 ulong get sh 1
+  put gdn_tmp 1 nconv
+  put gdn_tmp 2 ulong get sh 4
+  put gdn_tmp 3 ulong get sh 5
+  for i ulong nconv bound 65536
+    gdn_api_put_f32_le block mul i 4 get src i
+  end
+  gdn_api_pack_params_rest src block
+  ret 0
+end
+
+fn gdn_api_pack_params src view f32 * block edit uchar * to long
+  ret gdn_api_pack_params_r 0 src block
+end
+
+fn gdn_api_pack_tail_one h ulong tail view f32 * dev edit f32 * to void
+  for s ulong ulong GDN_API_SLOTS bound 384
+    ch = ulong gdn_api_slot_channel uint get gdn_tmp 0 uint h uint s
+    doff = mul add mul h ulong GDN_API_SLOTS s 4
+    c1 = get gdn_tmp 1
+    put dev doff get tail ch
+    put dev add doff 1 get tail add c1 ch
+    t2 = add mul 2 c1 ch
+    put dev add doff 2 get tail t2
+    put dev add doff 3 f32 0.0
+  end
+end
+
+fn gdn_api_pack_tail_r ratio uint tail view f32 * dev edit f32 * to long
+  sh = new uint 10 0
+  if ne omega_gdn_shape ratio 0 sh 0
+    ret -1
+  end
+  put gdn_tmp 0 ulong get sh 1
+  put gdn_tmp 1 ulong get sh 2
+  for h ulong ulong get sh 1 bound 64
+    gdn_api_pack_tail_one h tail dev
+  end
+  ret 0
+end
+
+fn gdn_api_pack_tail tail view f32 * dev edit f32 * to void
+  ign = gdn_api_pack_tail_r 0 tail dev
+end
+
+fn gdn_api_unpack_slot doff ulong toff ulong dev view f32 * tail edit f32 * to long
+  if ne get gdn_tmp 2 0
+    put tail toff get dev doff
+    ret 0
+  end
+  if ne bitcast uint get tail toff bitcast uint get dev doff
+    ret -1
+  end
+  ret 0
+end
+
+fn gdn_api_unpack_one h ulong dev view f32 * tail edit f32 * to long
+  rc = long 0
+  for s ulong ulong GDN_API_SLOTS bound 384
+    ch = ulong gdn_api_slot_channel uint get gdn_tmp 0 uint h uint s
+    doff = mul add mul h ulong GDN_API_SLOTS s 4
+    r = div uint get gdn_tmp 0 GDN_OM_KEY_HEADS
+    put gdn_tmp 2 0
+    if ge s mul 2 ulong GDN_OM_HEAD_DIM
+      put gdn_tmp 2 1
+    end
+    if eq rem uint h r 0
+      put gdn_tmp 2 1
+    end
+    if ne gdn_api_unpack_slot doff ch dev tail 0
+      rc = -1
+    end
+    c1 = get gdn_tmp 1
+    if ne gdn_api_unpack_slot add doff 1 add c1 ch dev tail 0
+      rc = -1
+    end
+    t2 = add mul 2 c1 ch
+    if ne gdn_api_unpack_slot add doff 2 t2 dev tail 0
+      rc = -1
+    end
+  end
+  ret rc
+end
+
+fn gdn_api_unpack_tail_r ratio uint dev view f32 * tail edit f32 * to long
+  sh = new uint 10 0
+  if ne omega_gdn_shape ratio 0 sh 0
+    ret -1
+  end
+  put gdn_tmp 0 ulong get sh 1
+  put gdn_tmp 1 ulong get sh 2
+  rc = long 0
+  for h ulong ulong get sh 1 bound 64
+    if ne gdn_api_unpack_one h dev tail 0
+      rc = -1
+    end
+  end
+  ret rc
+end
+
+fn gdn_api_unpack_tail dev view f32 * tail edit f32 * to long
+  ret gdn_api_unpack_tail_r 0 dev tail
+end
+
+fn gdn_api_f32_to_bf16_rne f f32 to ushort
+  b = bitcast uint f
+  if gt and b 0x7fffffff 0x7f800000
+    ret 0x7fc0
+  end
+  rb = add add b 0x7fff and shr b 16 1
+  ret ushort shr rb 16
+end
+
+fn gdn_gpr_declared peak uint to uint
+  ret mul div add add peak 2 7 8 8
+end
+
+fn gdn_gpr_declared_ok decl uint peak uint to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn gdn_code_bytes cnt ulong to ulong
+  padded = mul div add cnt 7 8 8
+  if lt padded 32
+    padded = 32
+  end
+  ret mul padded 16
+end
+
+fn gdn_api_kk_threads kind ulong to uint
+  if eq kind GDN_KK_PREP
+    ret GDN_API_PREP_THREADS
+  end
+  ret GDN_API_THREADS
+end
+
+fn gdn_api_slot_match base ulong spec view ulong 4 to bool
+  if ne get gdn_kcache add base 1 get spec 0
+    ret false
+  end
+  if ne get gdn_kcache add base 2 get spec 1
+    ret false
+  end
+  if ne get gdn_kcache add base 3 get spec 2
+    ret false
+  end
+  if ne get gdn_kcache add base 4 get spec 3
+    ret false
+  end
+  ret true
+end
+
+fn gdn_api_copy_stats spec view ulong 4 stats edit uint 2 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  cg = omega_blackwell_codegen_gdn_copy_prog spec ins meta
+  if eq cg 0
+    put stats 0 uint get meta 0
+    put stats 1 24
+  end
+  ret cg
+end
+
+fn gdn_api_run_cg kind ulong spec view ulong 4 stats edit uint 2 to long
+  if eq kind GDN_KK_DECODE
+    ret omega_gdn_prog_stats spec stats
+  end
+  if eq kind GDN_KK_PREP
+    ret omega_gdn_pf_prog_stats 0 spec stats
+  end
+  if eq kind GDN_KK_SCAN
+    ret omega_gdn_pf_prog_stats 1 spec stats
+  end
+  if eq kind GDN_KK_POST
+    ret omega_gdn_pf_prog_stats 2 spec stats
+  end
+  if eq kind GDN_KK_MULTI
+    ret omega_gdn_multi_prog_stats spec stats
+  end
+  if or eq kind GDN_KK_COPY eq kind GDN_KK_ZERO
+    ret gdn_api_copy_stats spec stats
+  end
+  ret -1
+end
+
+fn gdn_api_kernel_for kind ulong spec view ulong 4 out_slot edit ulong 2 to long
+  if ge kind GDN_KK_N
+    ret GDN_API_BAD_ARGS
+  end
+  base = mul kind 9
+  if ne get gdn_kcache base 0
+    if gdn_api_slot_match base spec
+      put out_slot 0 kind
+      put out_slot 1 1
+      ret GDN_API_OK
+    end
+    if ne get gdn_rec 0 0
+      gdn_api_set_err gdn_err_evict
+      ret GDN_API_TOO_LARGE
+    end
+  end
+  stats = new uint 2 0
+  if ne gdn_api_run_cg kind spec stats 0
+    gdn_api_set_err gdn_err_cg
+    ret GDN_API_CODEGEN_FAIL
+  end
+  need = gdn_code_bytes ulong get stats 0
+  if eq need 0
+    gdn_api_set_err gdn_err_cg
+    ret GDN_API_CODEGEN_FAIL
+  end
+  decl = gdn_gpr_declared get stats 1
+  if gt mul ulong gdn_api_kk_threads kind ulong decl 65536
+    gdn_api_set_err gdn_err_rf
+    ret GDN_API_TOO_LARGE
+  end
+  put gdn_kcache base 1
+  put gdn_kcache add base 1 get spec 0
+  put gdn_kcache add base 2 get spec 1
+  put gdn_kcache add base 3 get spec 2
+  put gdn_kcache add base 4 get spec 3
+  put gdn_kcache add base 5 ulong get stats 0
+  put gdn_kcache add base 6 ulong get stats 1
+  put gdn_kcache add base 7 need
+  put gdn_kcache add base 8 add 0x311000000 mul kind 0x10000
+  put out_slot 0 kind
+  put out_slot 1 0
+  ret GDN_API_OK
+end
+
+fn gdn_api_build_qmd qin view ulong 6 out_qmd edit uint 96 to long
+  cfg = new ulong 16 0
+  put cfg 0 0x320000000
+  put cfg 1 0x324280000
+  put cfg 2 0x322000000
+  put cfg 3 0x324010000
+  put cfg 4 get qin 0
+  put cfg 5 mul get qin 3 get qin 4
+  put cfg 6 get qin 2
+  put cfg 7 get qin 3
+  put cfg 8 get qin 2
+  put cfg 9 1
+  put cfg 10 get qin 3
+  put cfg 11 get qin 4
+  put cfg 12 get qin 1
+  put cfg 13 get qin 5
+  if ne omega_blackwell_build_qmd1 out_qmd cfg 0
+    ret GDN_API_CHIP_FAIL
+  end
+  if ne omega_blackwell_verify_qmd_invariants out_qmd 0
+    ret GDN_API_CHIP_FAIL
+  end
+  ret GDN_API_OK
+end
+
+fn gdn_api_alloc_ratio layers uint ratio uint bf16 uint cached uint out_hid edit ulong 1 to long
+  if or eq layers 0 gt layers GDN_API_MAX_LAYERS
+    ret GDN_API_BAD_ARGS
+  end
+  sh = new uint 10 0
+  if ne omega_gdn_shape ratio bf16 sh 0
+    ret GDN_API_BAD_ARGS
+  end
+  hid = ulong 99
+  for i ulong 4
+    if and eq hid 99 eq get gdn_handles mul i 16 0
+      hid = i
+    end
+  end
+  if eq hid 99
+    ret GDN_API_TOO_LARGE
+  end
+  b = mul hid 16
+  put gdn_handles b 1
+  put gdn_handles add b 1 ulong layers
+  put gdn_handles add b 2 ulong ratio
+  put gdn_handles add b 3 ulong cached
+  put gdn_handles add b 4 ulong bf16
+  put gdn_handles add b 5 add 0x340000000 mul hid 0x10000000
+  put gdn_handles add b 6 add 0x341000000 mul hid 0x10000000
+  put gdn_handles add b 7 add 0x342000000 mul hid 0x10000000
+  put gdn_handles add b 8 add 0x348000000 mul hid 0x10000000
+  put gdn_handles add b 9 0
+  put gdn_handles add b 10 0
+  put gdn_handles add b 11 ulong get sh 6
+  put gdn_handles add b 12 ulong get sh 7
+  put gdn_handles add b 13 ulong get sh 8
+  put gdn_handles add b 14 ulong get sh 3
+  put gdn_handles add b 15 ulong get sh 2
+  put out_hid 0 hid
+  ret GDN_API_OK
+end
+
+fn gdn_api_alloc layers uint out_hid edit ulong 1 to long
+  ret gdn_api_alloc_ratio layers 0 0 1 out_hid
+end
+
+fn gdn_api_free hid ulong to void
+  if ge hid 4
+    ret
+  end
+  b = mul hid 16
+  for i ulong 16
+    put gdn_handles add b i 0
+  end
+end
+
+fn gdn_api_valid_layer hid ulong layer uint to bool
+  if ge hid 4
+    ret false
+  end
+  b = mul hid 16
+  if eq get gdn_handles b 0
+    ret false
+  end
+  ret lt ulong layer get gdn_handles add b 1
+end
+
+fn gdn_api_set_layer hid ulong layer uint to long
+  if not gdn_api_valid_layer hid layer
+    ret GDN_API_BAD_ARGS
+  end
+  ret GDN_API_OK
+end
+
+fn gdn_api_move_ensure kind ulong to long
+  spec = new ulong 4 0
+  if eq kind GDN_KK_COPY
+    put spec 1 1
+  else
+    put spec 1 2
+  end
+  sl = new ulong 2 0
+  ret gdn_api_kernel_for kind spec sl
+end
+
+fn gdn_api_move_validate kind ulong src ulong dst ulong bytes ulong out_args edit uint 4 out_qmd edit uint 96 to long
+  per = mul GDN_API_COPY_WORDS_PER_CTA 4
+  if and ne kind GDN_KK_COPY ne kind GDN_KK_ZERO
+    ret GDN_API_BAD_ARGS
+  end
+  if or eq dst 0 eq bytes 0
+    ret GDN_API_BAD_ARGS
+  end
+  if or ne rem bytes per 0 gt div bytes per 0x7fffffff
+    ret GDN_API_BAD_ARGS
+  end
+  rc = gdn_api_move_ensure kind
+  if ne rc GDN_API_OK
+    ret rc
+  end
+  base = mul kind 9
+  peak = uint get gdn_kcache add base 6
+  decl = gdn_gpr_declared peak
+  if eq gdn_gpr_declared_ok decl peak 0
+    gdn_api_set_err gdn_err_decl
+    ret GDN_API_CHIP_FAIL
+  end
+  put out_args 0 bw_qmd_u32lo src
+  put out_args 1 bw_qmd_u32hi src
+  put out_args 2 bw_qmd_u32lo dst
+  put out_args 3 bw_qmd_u32hi dst
+  qin = new ulong 6 0
+  put qin 0 get gdn_kcache add base 8
+  put qin 1 ulong decl
+  put qin 2 ulong GDN_API_COPY_THREADS
+  put qin 3 div bytes per
+  put qin 4 1
+  put qin 5 0
+  ret gdn_api_build_qmd qin out_qmd
+end
+
+fn gdn_api_reset hid ulong out_qmd edit uint 96 to long
+  if ge hid 4
+    ret GDN_API_BAD_ARGS
+  end
+  b = mul hid 16
+  if eq get gdn_handles b 0
+    ret GDN_API_BAD_ARGS
+  end
+  args = new uint 4 0
+  tb = mul get gdn_handles add b 1 get gdn_handles add b 12
+  rc = gdn_api_move_validate GDN_KK_ZERO 0 get gdn_handles add b 6 tb args out_qmd
+  if ne rc GDN_API_OK
+    ret rc
+  end
+  sb = mul get gdn_handles add b 1 get gdn_handles add b 13
+  ret gdn_api_move_validate GDN_KK_ZERO 0 get gdn_handles add b 7 sb args out_qmd
+end
+
+fn gdn_api_set_state hid ulong layer uint has_tail ulong has_state ulong out_qmd edit uint 96 to long
+  if or not gdn_api_valid_layer hid layer or eq has_tail 0 eq has_state 0
+    ret GDN_API_BAD_ARGS
+  end
+  b = mul hid 16
+  args = new uint 4 0
+  sb = get gdn_handles add b 13
+  so = mul ulong layer sb
+  ret gdn_api_move_validate GDN_KK_COPY 0x34f000000 add get gdn_handles add b 7 so sb args out_qmd
+end
+
+fn gdn_api_get_state hid ulong layer uint has_tail ulong has_state ulong out_qmd edit uint 96 to long
+  if or not gdn_api_valid_layer hid layer and eq has_tail 0 eq has_state 0
+    ret GDN_API_BAD_ARGS
+  end
+  b = mul hid 16
+  args = new uint 4 0
+  sb = get gdn_handles add b 13
+  so = mul ulong layer sb
+  ret gdn_api_move_validate GDN_KK_COPY add get gdn_handles add b 7 so 0x34f000000 sb args out_qmd
+end
+
+fn gdn_api_read_out hid ulong has_out ulong to long
+  if or ge hid 4 eq has_out 0
+    ret GDN_API_BAD_ARGS
+  end
+  if eq get gdn_handles mul hid 16 0
+    ret GDN_API_BAD_ARGS
+  end
+  ret GDN_API_OK
+end
+
+fn gdn_api_scales_ok scales view f32 4 to bool
+  for i ulong 4
+    if not gdn_api_is_finite get scales i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn gdn_api_ensure_kind kind ulong hid ulong rec ulong to long
+  b = mul hid 16
+  spec = new ulong 4 0
+  put spec 0 ulong get gdn_mutant 0
+  put spec 2 get gdn_handles add b 2
+  if ne kind GDN_KK_MULTI
+    put spec 3 get gdn_handles add b 4
+  end
+  sl = new ulong 2 0
+  put gdn_rec 0 rec
+  rc = gdn_api_kernel_for kind spec sl
+  put gdn_rec 0 0
+  ret rc
+end
+
+fn gdn_api_layer_va hid ulong layer ulong vi ulong si ulong to ulong
+  b = mul hid 16
+  ret add get gdn_handles add b vi mul layer get gdn_handles add b si
+end
+
+fn gdn_api_step_pack req view ulong 6 scales view f32 4 out_args edit uint 18 to void
+  h = get req 0
+  l = get req 1
+  lb_va = get gdn_handles add mul h 16 8
+  v = add lb_va GDN_LB_QKV
+  if ne get req 2 0
+    v = get req 3
+  end
+  put out_args 0 bw_qmd_u32lo v
+  put out_args 1 bw_qmd_u32hi v
+  v = add lb_va GDN_LB_Z
+  if ne get req 2 0
+    v = get req 4
+  end
+  put out_args 2 bw_qmd_u32lo v
+  put out_args 3 bw_qmd_u32hi v
+  v = add lb_va GDN_LB_AB
+  if ne get req 2 0
+    v = get req 5
+  end
+  put out_args 4 bw_qmd_u32lo v
+  put out_args 5 bw_qmd_u32hi v
+  v = gdn_api_layer_va h l 5 11
+  put out_args 6 bw_qmd_u32lo v
+  put out_args 7 bw_qmd_u32hi v
+  v = gdn_api_layer_va h l 6 12
+  put out_args 8 bw_qmd_u32lo v
+  put out_args 9 bw_qmd_u32hi v
+  v = gdn_api_layer_va h l 7 13
+  put out_args 10 bw_qmd_u32lo v
+  put out_args 11 bw_qmd_u32hi v
+  v = add lb_va GDN_LB_OUT
+  put out_args 12 bw_qmd_u32lo v
+  put out_args 13 bw_qmd_u32hi v
+  put out_args 14 bitcast uint get scales 0
+  put out_args 15 bitcast uint get scales 1
+  put out_args 16 bitcast uint get scales 2
+  put out_args 17 bitcast uint get scales 3
+end
+
+fn gdn_api_handle_r hid ulong to ulong
+  b = mul hid 16
+  r = get gdn_handles add b 2
+  if eq r 0
+    ret 3
+  end
+  ret r
+end
+
+fn gdn_api_emit_step_qmd kind ulong hid ulong out_qmd edit uint 96 to long
+  kb = mul kind 9
+  peak = uint get gdn_kcache add kb 6
+  decl = gdn_gpr_declared peak
+  if eq gdn_gpr_declared_ok decl peak 0
+    gdn_api_set_err gdn_err_decl
+    ret GDN_API_CHIP_FAIL
+  end
+  qin = new ulong 6 0
+  put qin 0 get gdn_kcache add kb 8
+  put qin 1 ulong decl
+  put qin 2 ulong GDN_API_THREADS
+  put qin 3 gdn_api_handle_r hid
+  put qin 4 ulong GDN_API_GRID_Y
+  put qin 5 ulong GDN_API_SHARED_BYTES
+  ret gdn_api_build_qmd qin out_qmd
+end
+
+note req=[hid, layer, rec, dev_qkv, dev_z, dev_ab], scales=[eps_l2, eps_norm, in_scale, out_scale]
+fn gdn_api_step_or_record req view ulong 6 scales view f32 4 out_args edit uint 18 out_qmd edit uint 96 to long
+  if not gdn_api_valid_layer get req 0 uint get req 1
+    ret GDN_API_BAD_ARGS
+  end
+  if ne get req 2 0
+    if or eq get req 3 0 or eq get req 4 0 eq get req 5 0
+      ret GDN_API_BAD_ARGS
+    end
+  end
+  if not gdn_api_scales_ok scales
+    ret GDN_API_BAD_ARGS
+  end
+  rc = gdn_api_ensure_kind GDN_KK_DECODE get req 0 get req 2
+  if ne rc GDN_API_OK
+    ret rc
+  end
+  gdn_api_step_pack req scales out_args
+  ret gdn_api_emit_step_qmd GDN_KK_DECODE get req 0 out_qmd
+end
+
+fn gdn_api_multi_prepare hid ulong to long
+  if ge hid 4
+    ret GDN_API_BAD_ARGS
+  end
+  if eq get gdn_handles mul hid 16 0
+    ret GDN_API_BAD_ARGS
+  end
+  ret gdn_api_ensure_kind GDN_KK_MULTI hid 0
+end
+
+fn gdn_api_multi_pack req view ulong 10 scales view f32 4 out_args edit uint 22 to void
+  h = get req 0
+  l = get req 1
+  put out_args 0 bw_qmd_u32lo get req 2
+  put out_args 1 bw_qmd_u32hi get req 2
+  put out_args 2 bw_qmd_u32lo get req 3
+  put out_args 3 bw_qmd_u32hi get req 3
+  put out_args 4 bw_qmd_u32lo get req 4
+  put out_args 5 bw_qmd_u32hi get req 4
+  v = gdn_api_layer_va h l 5 11
+  put out_args 6 bw_qmd_u32lo v
+  put out_args 7 bw_qmd_u32hi v
+  v = gdn_api_layer_va h l 6 12
+  put out_args 8 bw_qmd_u32lo v
+  put out_args 9 bw_qmd_u32hi v
+  v = gdn_api_layer_va h l 7 13
+  put out_args 10 bw_qmd_u32lo v
+  put out_args 11 bw_qmd_u32hi v
+  put out_args 12 bw_qmd_u32lo get req 5
+  put out_args 13 bw_qmd_u32hi get req 5
+  put out_args 14 bitcast uint get scales 0
+  put out_args 15 bitcast uint get scales 1
+  put out_args 16 bitcast uint get scales 2
+  put out_args 17 bitcast uint get scales 3
+  put out_args 18 uint get req 6
+  put out_args 19 uint get req 7
+  put out_args 20 uint get req 8
+  put out_args 21 uint get req 9
+end
+
+note req=[hid, layer, qkv_va, z_va, ab_va, out_va, tokens, xstride, abstride, ostride]
+fn gdn_api_multi_record req view ulong 10 scales view f32 4 out_args edit uint 22 out_qmd edit uint 96 to long
+  if or not gdn_api_valid_layer get req 0 uint get req 1 eq get req 6 0
+    ret GDN_API_BAD_ARGS
+  end
+  if or eq get req 2 0 eq get req 3 0
+    ret GDN_API_BAD_ARGS
+  end
+  if or eq get req 4 0 eq get req 5 0
+    ret GDN_API_BAD_ARGS
+  end
+  if not gdn_api_scales_ok scales
+    ret GDN_API_BAD_ARGS
+  end
+  m16 = or or get req 2 get req 3 or get req 5 or get req 7 get req 9
+  if ne and m16 15 0
+    ret GDN_API_BAD_ARGS
+  end
+  if ne and or get req 4 get req 8 7 0
+    ret GDN_API_BAD_ARGS
+  end
+  rc = gdn_api_ensure_kind GDN_KK_MULTI get req 0 1
+  if ne rc GDN_API_OK
+    ret rc
+  end
+  gdn_api_multi_pack req scales out_args
+  ret gdn_api_emit_step_qmd GDN_KK_MULTI get req 0 out_qmd
+end
+
+fn gdn_api_pf_layout sh view uint 10 t uint off edit ulong 6 to ulong
+  tu = ulong t
+  t8 = mul div sub add tu GDN_API_SCAN_CHUNK 1 GDN_API_SCAN_CHUNK GDN_API_SCAN_CHUNK
+  vh = ulong get sh 1
+  conv = ulong get sh 2
+  vdim = ulong get sh 3
+  sz = new ulong 6 0
+  put sz 0 mul mul tu conv 4
+  put sz 1 mul mul tu vdim 4
+  put sz 2 mul mul tu vh 8
+  put sz 3 mul mul tu vdim 4
+  put sz 4 mul mul tu vdim 4
+  put sz 5 mul mul t8 vh GDN_API_REC_BYTES
+  cur = ulong 0
+  for i ulong 6
+    put off i cur
+    s = get sz i
+    cur = add cur and add s 255 not ulong 255
+  end
+  ret cur
+end
+
+fn gdn_api_pf_bytes hid ulong tokens uint to ulong
+  b = mul hid 16
+  sh = new uint 10 0
+  ign = omega_gdn_shape uint get gdn_handles add b 2 uint get gdn_handles add b 4 sh
+  off = new ulong 6 0
+  bytes = gdn_api_pf_layout sh tokens off
+  for i ulong 6
+    put gdn_tmp i get off i
+  end
+  put gdn_tmp 6 ulong get sh 0
+  put gdn_tmp 7 ulong get sh 9
+  ret bytes
+end
+
+fn gdn_api_prefill_reserve hid ulong max_t uint to long
+  if or ge hid 4 or lt max_t GDN_API_PF_MIN_T gt max_t GDN_API_PF_MAX_T
+    ret GDN_API_BAD_ARGS
+  end
+  b = mul hid 16
+  if eq get gdn_handles b 0
+    ret GDN_API_BAD_ARGS
+  end
+  bytes = gdn_api_pf_bytes hid max_t
+  put gdn_handles add b 9 add 0x350000000 mul hid 0x10000000
+  put gdn_handles add b 10 bytes
+  ret GDN_API_OK
+end
+
+fn gdn_api_prefill_read_out hid ulong tokens uint has_out ulong to long
+  if or ge hid 4 eq has_out 0
+    ret GDN_API_BAD_ARGS
+  end
+  if or lt tokens GDN_API_PF_MIN_T gt tokens GDN_API_PF_MAX_T
+    ret GDN_API_BAD_ARGS
+  end
+  b = mul hid 16
+  if eq get gdn_handles b 0
+    ret GDN_API_BAD_ARGS
+  end
+  bytes = gdn_api_pf_bytes hid tokens
+  if eq get gdn_handles add b 9 0
+    ret GDN_API_BAD_ARGS
+  end
+  if lt get gdn_handles add b 10 bytes
+    ret GDN_API_BAD_ARGS
+  end
+  ret GDN_API_OK
+end
+
+fn gdn_api_pf_prep_scratch req view ulong 7 to long
+  b = mul get req 0 16
+  bytes = gdn_api_pf_bytes get req 0 uint get req 2
+  if ne get req 3 0
+    if eq get gdn_handles add b 9 0
+      gdn_api_set_err gdn_err_pf_res
+      ret GDN_API_TOO_LARGE
+    end
+    if lt get gdn_handles add b 10 bytes
+      gdn_api_set_err gdn_err_pf_res
+      ret GDN_API_TOO_LARGE
+    end
+  else
+    if lt get gdn_handles add b 10 bytes
+      put gdn_handles add b 9 add 0x350000000 mul get req 0 0x10000000
+      put gdn_handles add b 10 bytes
+    end
+  end
+  ret GDN_API_OK
+end
+
+fn gdn_api_pf_pack req view ulong 7 scales view f32 4 out_args edit uint 36 to void
+  h = get req 0
+  l = get req 1
+  va = get gdn_handles add mul h 16 9
+  v = add va get gdn_tmp 0
+  if ne get req 3 0
+    v = get req 4
+  end
+  put out_args 0 bw_qmd_u32lo v
+  put out_args 1 bw_qmd_u32hi v
+  put out_args 15 bw_qmd_u32lo v
+  put out_args 16 bw_qmd_u32hi v
+  v = add va get gdn_tmp 2
+  if ne get req 3 0
+    v = get req 6
+  end
+  put out_args 2 bw_qmd_u32lo v
+  put out_args 3 bw_qmd_u32hi v
+  v = gdn_api_layer_va h l 5 11
+  put out_args 4 bw_qmd_u32lo v
+  put out_args 5 bw_qmd_u32hi v
+  put out_args 29 bw_qmd_u32lo v
+  put out_args 30 bw_qmd_u32hi v
+  v = gdn_api_layer_va h l 6 12
+  put out_args 6 bw_qmd_u32lo v
+  put out_args 7 bw_qmd_u32hi v
+  put out_args 17 bw_qmd_u32lo v
+  put out_args 18 bw_qmd_u32hi v
+  v = add va get gdn_tmp 5
+  put out_args 8 bw_qmd_u32lo v
+  put out_args 9 bw_qmd_u32hi v
+  put out_args 13 bw_qmd_u32lo v
+  put out_args 14 bw_qmd_u32hi v
+  put out_args 10 uint get req 2
+  put out_args 11 bitcast uint get scales 0
+  put out_args 12 bitcast uint get scales 2
+  v = gdn_api_layer_va h l 7 13
+  put out_args 19 bw_qmd_u32lo v
+  put out_args 20 bw_qmd_u32hi v
+  v = add va get gdn_tmp 4
+  put out_args 21 bw_qmd_u32lo v
+  put out_args 22 bw_qmd_u32hi v
+  put out_args 25 bw_qmd_u32lo v
+  put out_args 26 bw_qmd_u32hi v
+  put out_args 23 uint get req 2
+  put out_args 24 bitcast uint get scales 2
+  v = add va get gdn_tmp 1
+  if ne get req 3 0
+    v = get req 5
+  end
+  put out_args 27 bw_qmd_u32lo v
+  put out_args 28 bw_qmd_u32hi v
+  v = add va get gdn_tmp 3
+  put out_args 31 bw_qmd_u32lo v
+  put out_args 32 bw_qmd_u32hi v
+  put out_args 33 bitcast uint get scales 1
+  put out_args 34 bitcast uint get scales 2
+  put out_args 35 bitcast uint get scales 3
+end
+
+fn gdn_api_pf_qmd_one kind ulong tx ulong gx ulong gy ulong smem ulong out_qmd edit uint 96 to long
+  kb = mul kind 9
+  peak = uint get gdn_kcache add kb 6
+  decl = gdn_gpr_declared peak
+  if eq gdn_gpr_declared_ok decl peak 0
+    ret GDN_API_CHIP_FAIL
+  end
+  qin = new ulong 6 0
+  put qin 0 get gdn_kcache add kb 8
+  put qin 1 ulong decl
+  put qin 2 tx
+  put qin 3 gx
+  put qin 4 gy
+  put qin 5 smem
+  ret gdn_api_build_qmd qin out_qmd
+end
+
+note Prefill (or record): req=[hid, layer, tokens, rec, dev_qkv, dev_z, dev_ab]
+fn gdn_api_prefill_core req view ulong 7 scales view f32 4 out_args edit uint 36 out_qmd edit uint 96 to long
+  if not gdn_api_valid_layer get req 0 uint get req 1
+    ret GDN_API_BAD_ARGS
+  end
+  if or lt uint get req 2 GDN_API_PF_MIN_T gt uint get req 2 GDN_API_PF_MAX_T
+    ret GDN_API_BAD_ARGS
+  end
+  if ne get req 3 0
+    if or eq get req 4 0 or eq get req 5 0 eq get req 6 0
+      ret GDN_API_BAD_ARGS
+    end
+  end
+  if not gdn_api_scales_ok scales
+    ret GDN_API_BAD_ARGS
+  end
+  rc = gdn_api_pf_prep_scratch req
+  if ne rc GDN_API_OK
+    ret rc
+  end
+  for k ulong 3
+    rc = gdn_api_ensure_kind add GDN_KK_PREP k get req 0 get req 3
+    if ne rc GDN_API_OK
+      ret rc
+    end
+  end
+  gdn_api_pf_pack req scales out_args
+  gx0 = div sub add get req 2 ulong GDN_API_PREP_TOKENS 1 ulong GDN_API_PREP_TOKENS
+  rc = gdn_api_pf_qmd_one GDN_KK_PREP ulong GDN_API_PREP_THREADS gx0 ulong GDN_OM_KEY_HEADS ulong GDN_API_PREP_SHARED_BYTES out_qmd
+  if ne rc GDN_API_OK
+    ret rc
+  end
+  rc = gdn_api_pf_qmd_one GDN_KK_SCAN ulong GDN_API_THREADS get gdn_tmp 6 ulong GDN_API_GRID_Y ulong GDN_API_SCAN_SHARED_BYTES out_qmd
+  if ne rc GDN_API_OK
+    ret rc
+  end
+  ret gdn_api_pf_qmd_one GDN_KK_POST ulong GDN_API_THREADS get req 2 get gdn_tmp 7 0 out_qmd
+end
