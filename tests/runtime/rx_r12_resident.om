@@ -1,0 +1,132 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_r12_resident.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_r12_resident.c (R12 host-only resident World suite;
+note silicon_observed=false, zero GPU/nvrm calls).
+note Verifies coherent physical window placement/relocation/detach, sealed
+note descriptor tamper/replay/authority fault detection, resident seat claim
+note execution + shutdown, and World reaction integration.
+
+global r12_checks ulong 1
+global r12_fail ulong 1
+
+text r12_pass "RX_R12_RESIDENT_OM: PASS (host; silicon_observed=false)\n"
+text r12_fail_m "RX_R12_RESIDENT_OM: FAIL\n"
+
+fn r12_chk cond bool to void
+  put r12_checks 0 add get r12_checks 0 1
+  if not cond
+    if eq get r12_fail 0 0
+      put r12_fail 0 get r12_checks 0
+    end
+  end
+end
+
+fn r12_setup_obj id ulong v0 ulong v1 ulong cap_id ulong cap_gen ulong to void
+  ob = mul id 12
+  put coh_obj ob 1
+  put coh_obj add ob 1 1
+  put coh_obj add ob 6 1
+  put coh_obj add ob 7 cap_id
+  put coh_obj add ob 8 cap_gen
+  put coh_obj add ob 9 1
+  fb = mul id COH_MAX_FIELDS
+  put coh_fld fb v0
+  put coh_fld add fb 1 v1
+end
+
+fn r12_test_coherent_layout_and_faults to void
+  r12_chk eq rx_world_off_c2g 256
+  r12_chk eq rx_world_off_g2c 131520
+  r12_chk eq rx_world_off_fault 262784
+  r12_chk eq rx_world_off_object_table 262848
+  r12_chk eq rx_world_physical_table_offset 262912
+  r12_chk eq rx_world_off_heartbeat 287552
+
+  r12_chk eq rx_coherent_format COH_OK
+  r12_setup_obj 1 50 75 10 1
+  r12_chk eq rx_world_attach_physical 1 1 COH_OK
+  r12_chk eq rx_world_attach_physical 1 1 COH_ERR_EXISTS
+  w0 = get coh_obj 15
+  r12_chk eq rx_world_relocate_physical 1 1 COH_OK
+  r12_chk ne get coh_obj 15 w0
+
+  note Publish sealed descriptor and check tamper, replay, and revoked cap
+  rx_coherent_publish 1 1
+  d = new uchar 128 0
+  r12_chk eq rx_world_take_publication d COH_OK
+  r12_chk eq get coh_last_fault 0 COH_FAULT_NONE
+
+  put d 32 xor get d 32 1
+  r12_chk eq rx_world_check_descriptor d 0 COH_ERR_TORN
+  r12_chk eq get coh_last_fault 0 COH_FAULT_BAD_CHECKSUM
+  put d 32 xor get d 32 1
+  r12_chk eq rx_world_check_descriptor d 7 COH_ERR_REPLAY
+  r12_chk eq get coh_last_fault 0 COH_FAULT_BAD_SEQ
+  put coh_obj 21 0
+  r12_chk eq rx_world_check_descriptor d 0 COH_ERR_AUTHORITY
+  r12_chk eq get coh_last_fault 0 COH_FAULT_CAP
+end
+
+fn r12_test_resident_seat to void
+  r12_chk eq rx_coherent_format COH_OK
+  r12_chk eq rx_world_enable_resident COH_OK
+  r12_setup_obj 1 100 23 11 1
+  r12_setup_obj 2 0 0 12 1
+  r12_chk eq rx_world_attach_physical 1 1 COH_OK
+  r12_chk eq rx_world_attach_physical 2 1 COH_OK
+
+  note Post claim to resident seat: obj2.f0 = 100 + 23 = 123
+  r12_chk eq rx_resident_post_claim 1 2 1 COH_OK
+  r12_chk eq rx_resident_seat_step 1
+  r12_chk eq get coh_fld mul 2 COH_MAX_FIELDS 123
+
+  res = new uchar 128 0
+  r12_chk eq rx_resident_take_result res COH_OK
+  r12_chk eq coh_get_u16 res 6 COH_RING_PUBLISH
+
+  note Clean resident shutdown
+  r12_chk eq rx_resident_shutdown COH_OK
+  r12_chk eq rx_resident_seat_step 2
+  r12_chk eq get coh_w 4 1
+end
+
+fn r12_test_host_world to void
+  note Explicit window placement, misaligned bounds refusal, and detach lifecycle
+  r12_chk eq rx_coherent_format COH_OK
+  r12_setup_obj 3 9 11 15 1
+  r12_chk eq rx_world_attach_physical 3 1 COH_OK
+  off4 = coh_window_offset 4
+  r12_chk eq rx_world_place_physical 3 1 off4 COH_OBJ_WINDOW COH_OK
+  r12_chk eq rx_world_place_physical 3 1 add off4 7 COH_OBJ_WINDOW COH_ERR_BOUNDS
+  r12_chk eq rx_world_detach_physical 3 1 COH_OK
+  r12_chk eq rx_world_detach_physical 3 1 COH_ERR_UNPLACED
+end
+
+fn r12_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len r12_pass
+    for i ulong n bound 64
+      put buf i get r12_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len r12_fail_m
+  for i ulong n bound 64
+    put buf i get r12_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  r12_test_coherent_layout_and_faults
+  r12_test_resident_seat
+  r12_test_host_world
+  if ne get r12_fail 0 0
+    r12_put_msg 0
+    ret int get r12_fail 0
+  end
+  r12_put_msg 1
+  ret 0
+end

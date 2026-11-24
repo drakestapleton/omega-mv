@@ -1,0 +1,173 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_heartbeat_test.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_heartbeat_test.c (R1..R6 host CPU heartbeat suite).
+note Verifies canonical World creation/retirement, reaction causality chain,
+note deterministic world digest across independent runs, crumb chain integrity,
+note capability authority checks, stability/resource bounds, and emergency halt.
+
+global hb_checks ulong 1
+global hb_fail ulong 1
+
+text hb_pass "RX_HEARTBEAT_TEST_OM: PASS (host CPU)\n"
+text hb_fail_m "RX_HEARTBEAT_TEST_OM: FAIL\n"
+
+fn hb_chk cond bool to void
+  put hb_checks 0 add get hb_checks 0 1
+  if not cond
+    if eq get hb_fail 0 0
+      put hb_fail 0 get hb_checks 0
+    end
+  end
+end
+
+fn hb_run_chain dst_dig edit uchar 32 dst_val edit ulong 1 to void
+  hb_chk eq rx_world_init 64 0
+  rx_world_set_resources 8 4 64 4
+  rx_world_set_stability 32 8 4 4 4
+
+  meta = new ulong 3 0
+  init_f = new ulong 8 0
+  ref_o = new ulong 2 0
+  note Create 3 objects: obj0 (input), obj1 (mid), obj2 (output)
+  put meta 0 100
+  put meta 1 1
+  put meta 2 600
+  hb_chk eq rx_world_create meta init_f ref_o 0
+  put meta 0 101
+  put meta 2 601
+  hb_chk eq rx_world_create meta init_f ref_o 0
+  put meta 0 102
+  put meta 2 602
+  hb_chk eq rx_world_create meta init_f ref_o 0
+
+  note Install capabilities for external writer and two chained reactions
+  rw_cap_install 0 1 1 0 600 3
+  rw_cap_install 1 2 1 10 600 1
+  rw_cap_install 2 3 1 11 601 1
+
+  spec = new ulong 16 0
+  rid = new ulong 1 0
+  note Reaction 0: reads obj0 -> writes obj1 (val + 1)
+  put spec 0 1
+  put spec 1 10
+  put spec 2 2
+  put spec 4 1
+  put spec 8 1
+  put spec 9 1
+  put spec 11 1
+  put spec 12 2
+  put spec 13 1
+  put spec 14 600
+  put spec 15 1
+  hb_chk eq rx_world_add_reaction spec rid 0
+
+  note Reaction 1: reads obj1 -> writes obj2 (val + 1)
+  put spec 0 2
+  put spec 1 11
+  put spec 6 1
+  put spec 9 2
+  put spec 12 3
+  put spec 14 601
+  hb_chk eq rx_world_add_reaction spec rid 0
+
+  note External publish obj0.f0 = 40 -> obj1.f0 = 41 -> obj2.f0 = 42
+  cid = rx_world_publish_external 1 1 0 0 0 40
+  hb_chk gt cid 0
+  hb_chk eq rx_world_step_one 1
+  hb_chk eq rx_world_step_one 1
+  hb_chk eq rx_world_step_one 0
+
+  hb_chk eq rx_world_read 2 0 init_f 0
+  put dst_val 0 get init_f 0
+  hb_chk eq get init_f 0 42
+  hb_chk gt rx_world_explain 2 0 0 0
+
+  chk = new ulong 1 0
+  hb_chk eq rx_world_verify_crumbs chk 0
+  hb_chk eq get chk 0 6
+  rx_world_digest dst_dig
+  rx_world_destroy
+end
+
+fn hb_test_determinism_and_fsm to void
+  note Legal vs illegal reaction state transitions
+  hb_chk eq rx_state_transition_legal RW_ST_DORMANT RW_ST_READY 1
+  hb_chk eq rx_state_transition_legal RW_ST_READY RW_ST_RUNNING 1
+  hb_chk eq rx_state_transition_legal RW_ST_RUNNING RW_ST_PUBLISHING 1
+  hb_chk eq rx_state_transition_legal RW_ST_PUBLISHING RW_ST_COMMITTED 1
+  hb_chk eq rx_state_transition_legal RW_ST_DORMANT RW_ST_COMMITTED 0
+
+  d1 = new uchar 32 0
+  d2 = new uchar 32 0
+  v1 = new ulong 1 0
+  v2 = new ulong 1 0
+  hb_run_chain d1 v1
+  hb_run_chain d2 v2
+  hb_chk eq get v1 0 42
+  hb_chk eq get v2 0 42
+  for i ulong 32
+    hb_chk eq get d1 i get d2 i
+  end
+end
+
+fn hb_test_authority_and_halt to void
+  hb_chk eq rx_world_init_with_auth 64 0
+  meta = new ulong 3 0
+  put meta 0 100
+  put meta 1 1
+  put meta 2 700
+  init_f = new ulong 8 0
+  ref_o = new ulong 2 0
+  hb_chk eq rx_world_create meta init_f ref_o 0
+
+  note Uncertified external publish refused
+  hb_chk eq rx_world_publish_external 99 1 0 0 0 10 RW_ERR_AUTHORITY
+
+  note Enroll operator caller and test emergency stop + resume
+  sec = new uchar 32 0
+  put sec 0 77
+  gen_o = new ulong 1 0
+  hb_chk eq rx_world_enroll_caller 50 sec gen_o 0
+  rw_cap_install 0 7 1 50 RW_WORLD_RES_CONTROL RW_WORLD_RIGHT_HALT
+  auth = new ulong 4 0
+  put auth 0 50
+  put auth 1 get gen_o 0
+  put auth 2 7
+  put auth 3 1
+  hb_chk eq rx_world_emergency_stop auth sec 9 0
+  hst = new ulong 7 0
+  rx_world_halt_status hst
+  hb_chk eq get hst 0 1
+  hb_chk eq rx_world_emergency_resume 50 get gen_o 0 sec 7 1 0
+  rx_world_halt_status hst
+  hb_chk eq get hst 0 0
+  rx_world_destroy
+end
+
+fn hb_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len hb_pass
+    for i ulong n bound 64
+      put buf i get hb_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len hb_fail_m
+  for i ulong n bound 64
+    put buf i get hb_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  hb_test_determinism_and_fsm
+  hb_test_authority_and_halt
+  if ne get hb_fail 0 0
+    hb_put_msg 0
+    ret int get hb_fail 0
+  end
+  hb_put_msg 1
+  ret 0
+end

@@ -1,0 +1,140 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_r14_recovery.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_r14_recovery.c (R14 recovery HOST mode;
+note HOST_PASS_NON_SILICON, zero GPU/nvrm calls).
+note Verifies generation crash injection across promotion phases, coherent
+note recovery and idempotency, external-effect replay refusal, promotion
+note barrier hold/release, and clean post-recovery promotion.
+
+const R14_SUBJ_PROP ulong 8
+const R14_SUBJ_AUTH ulong 4
+
+global r14_checks ulong 1
+global r14_fail ulong 1
+
+text r14_dir "/tmp/rx_r14_recovery_om"
+text r14_ev1 "R14_EVIDENCE_GEN2"
+text r14_ev2 "R14_EVIDENCE_GEN3"
+text r14_pass "RX_R14_RECOVERY_OM: PASS (HOST_PASS_NON_SILICON)\n"
+text r14_fail_m "RX_R14_RECOVERY_OM: FAIL\n"
+
+fn r14_chk cond bool to void
+  put r14_checks 0 add get r14_checks 0 1
+  if not cond
+    if eq get r14_fail 0 0
+      put r14_fail 0 get r14_checks 0
+    end
+  end
+end
+
+fn r14_open to long
+  dbuf = new uchar 128 0
+  dl = len r14_dir
+  for i ulong dl bound 128
+    put dbuf i get r14_dir i
+  end
+  ret rx_gen_open dbuf dl
+end
+
+fn r14_propose_ev ev_t view uchar * lin ulong cid_dst edit ulong 1 to long
+  ev = new uchar 256 0
+  el = len ev_t
+  for i ulong el bound 256
+    put ev i get ev_t i
+  end
+  pm = new ulong 6 0
+  put pm 0 R14_SUBJ_PROP
+  put pm 2 1
+  put pm 3 1
+  put pm 4 1
+  put pm 5 lin
+  ret rx_gen_propose pm ev el cid_dst
+end
+
+fn r14_make_promo_req cid ulong req edit ulong 7 to void
+  put req 0 cid
+  put req 1 R14_SUBJ_AUTH
+  put req 2 0
+  put req 3 1
+  put req 4 1
+  put req 5 RX_GEN_RES_PROMOTION
+  put req 6 RX_GEN_RIGHT_PROMOTE
+end
+
+fn r14_test_crash_and_recover to void
+  r14_chk eq r14_open RX_GEN_OK
+  act = new ulong 2 0
+  r14_chk eq rx_gen_active act RX_GEN_OK
+  r14_chk eq get act 0 1
+
+  cid = new ulong 1 0
+  r14_chk eq r14_propose_ev r14_ev1 2 cid RX_GEN_OK
+  c2 = get cid 0
+  r14_chk eq rx_gen_add_work c2 101 RX_WORK_EVIDENCE RX_WORK_PENDING 1 RX_GEN_OK
+  r14_chk eq rx_gen_add_work c2 202 RX_WORK_EXTERNAL RX_WORK_ISSUED 0 RX_GEN_OK
+  r14_chk eq rx_gen_finish_work c2 101 RX_GEN_OK
+
+  note Inject crash before pointer flip -> promote returns error, active stays gen 1
+  rx_gen_set_crash 1
+  req = new ulong 7 0
+  r14_make_promo_req c2 req
+  r14_chk ne rx_gen_promote req RX_GEN_OK
+  rx_gen_set_crash 0
+  r14_chk eq rx_gen_recover RX_GEN_OK
+  r14_chk eq rx_gen_active act RX_GEN_OK
+  r14_chk eq get act 0 1
+
+  note Recovery is idempotent
+  r14_chk eq rx_gen_recover RX_GEN_OK
+  r14_chk eq rx_gen_active act RX_GEN_OK
+  r14_chk eq get act 0 1
+
+  note Barrier hold blocks promotion until released
+  r14_chk eq rx_gen_hold_barrier RX_GEN_OK
+  r14_chk ne rx_gen_promote req RX_GEN_OK
+  r14_chk eq rx_gen_release_barrier RX_GEN_OK
+
+  note Clean promotion succeeds to gen 2; replay of issued external effect 202 refused
+  r14_chk eq rx_gen_promote req RX_GEN_OK
+  r14_chk eq rx_gen_active act RX_GEN_OK
+  r14_chk eq get act 0 c2
+  r14_chk ne rx_gen_reject_replay 202 RX_GEN_OK
+
+  note Second generation promotion after recovery (gen 2 -> gen 3)
+  r14_chk eq r14_propose_ev r14_ev2 3 cid RX_GEN_OK
+  c3 = get cid 0
+  r14_chk eq rx_gen_add_work c3 301 RX_WORK_EVIDENCE RX_WORK_PENDING 1 RX_GEN_OK
+  r14_chk eq rx_gen_finish_work c3 301 RX_GEN_OK
+  r14_make_promo_req c3 req
+  r14_chk eq rx_gen_promote req RX_GEN_OK
+  r14_chk eq rx_gen_active act RX_GEN_OK
+  r14_chk eq get act 0 c3
+  rx_gen_close
+end
+
+fn r14_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len r14_pass
+    for i ulong n bound 64
+      put buf i get r14_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len r14_fail_m
+  for i ulong n bound 64
+    put buf i get r14_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  r14_test_crash_and_recover
+  if ne get r14_fail 0 0
+    r14_put_msg 0
+    ret int get r14_fail 0
+  end
+  r14_put_msg 1
+  ret 0
+end

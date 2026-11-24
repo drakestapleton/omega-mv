@@ -1,0 +1,186 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_r16_negative.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_r16_negative.c (R16-G4 negative security suite).
+note Verifies legacy/unprivileged paths cannot bypass authority: forged admin
+note token refusal, operator control cap refusal on authority entry points,
+note revoked/wrong-subject cap refusal, AEGIS no-rule/privileged-right/human
+note rejection denials, and forged decision-origin install refusal.
+
+const R16_RES_CONTROL ulong 2305
+const R16_RIGHT_HALT ulong 0x80
+const R16_SUBJ_WORKER ulong 51
+const R16_RES_WORK ulong 150994945
+const R16_RES_EFFECT ulong 150994961
+const R16_RES_NORULE ulong 150995008
+
+global r16_checks ulong 1
+global r16_fail ulong 1
+
+text r16_pass "RX_R16_NEGATIVE_OM: PASS\n"
+text r16_fail_m "RX_R16_NEGATIVE_OM: FAIL\n"
+
+fn r16_chk cond bool to void
+  put r16_checks 0 add get r16_checks 0 1
+  if not cond
+    if eq get r16_fail 0 0
+      put r16_fail 0 get r16_checks 0
+    end
+  end
+end
+
+fn r16_test_caproot_negative to void
+  hdr = new ulong 4 0
+  slots = new ulong 3328 0
+  deliv = new uchar 256 0
+  tok = new uchar 32 0
+  r16_chk eq rx_caproot_start hdr slots deliv tok ERR_OK
+
+  note Forged admin token refused
+  bad_tok = new uchar 32 0
+  put bad_tok 0 xor get tok 0 1
+  r16_chk ne rx_cap_check_token bad_tok ERR_OK
+
+  note Mint operator halt cap on control resource
+  req = new ulong 9 0
+  put req 0 3
+  put req 1 RX_OP_SUBJ
+  put req 2 R16_RES_CONTROL
+  put req 3 R16_RIGHT_HALT
+  put req 5 CAP_NONE
+  put req 7 get rx_cap_office 0
+  put req 8 get rx_cap_office 1
+  halt_ref = new ulong 2 0
+  r16_chk eq rx_capadmin_mint hdr slots deliv tok req halt_ref ERR_OK
+
+  note Forged token cannot mint even with office ref
+  minted = new ulong 2 0
+  r16_chk ne rx_capadmin_mint hdr slots deliv bad_tok req minted ERR_OK
+
+  note Operator halt cap refused on authority ops (mint, bump_epoch, advance_clock)
+  put req 7 get halt_ref 0
+  put req 8 get halt_ref 1
+  r16_chk eq rx_capadmin_mint hdr slots deliv tok req minted ERR_UNAUTHORIZED
+  r16_chk ne rx_capadmin_bump_epoch hdr slots deliv tok get halt_ref 0 get halt_ref 1 ERR_OK
+  ca = new ulong 3 0
+  put ca 0 get halt_ref 0
+  put ca 1 get halt_ref 1
+  put ca 2 1
+  r16_chk eq rx_capadmin_advance_clock hdr slots deliv tok ca ERR_UNAUTHORIZED
+
+  note Wrong subject refused on validate; revoked cap refused on validate
+  va = new ulong 5 0
+  put va 0 get halt_ref 0
+  put va 1 get halt_ref 1
+  put va 2 999
+  put va 3 R16_RES_CONTROL
+  put va 4 R16_RIGHT_HALT
+  ent = new ulong 13 0
+  r16_chk eq rx_caproot_validate hdr slots va ent ERR_SUBJECT
+
+  rargs = new ulong 4 0
+  put rargs 0 get rx_cap_office 0
+  put rargs 1 get rx_cap_office 1
+  put rargs 2 get halt_ref 0
+  put rargs 3 get halt_ref 1
+  rlist = new ulong 257 0
+  r16_chk eq rx_capadmin_revoke hdr slots deliv tok rargs rlist ERR_OK
+  put va 2 RX_OP_SUBJ
+  r16_chk eq rx_caproot_validate hdr slots va ent ERR_REVOKED
+
+  r16_chk eq rx_caproot_stop hdr slots deliv tok ERR_OK
+end
+
+fn r16_test_aegis_negative to void
+  rules = new ulong 112 0
+  note Rule 0: worker, RES_WORK, R|W (3)
+  put rules 0 1
+  put rules 1 R16_SUBJ_WORKER
+  put rules 2 150994944
+  put rules 3 150994959
+  put rules 4 3
+  note Rule 1: worker, RES_EFFECT, R|W|E (7), requires human approval
+  put rules 7 2
+  put rules 8 R16_SUBJ_WORKER
+  put rules 9 150994960
+  put rules 10 150994975
+  put rules 11 7
+  put rules 13 1
+
+  in_f = new ulong 10 0
+  dec = new ulong 8 0
+
+  note No matching rule -> DENY + WHY_NO_RULE
+  put in_f 0 1
+  put in_f 1 R16_RES_NORULE
+  put in_f 2 1
+  put in_f 5 RX_AEGIS_OP_ACQUIRE
+  r16_chk eq rx_aegis_decide rules 2 R16_SUBJ_WORKER in_f dec 1
+  r16_chk eq get dec 1 RX_AEGIS_DENY
+  r16_chk eq get dec 6 RX_AEGIS_WHY_NO_RULE
+
+  note Privileged right requested -> DENY + WHY_PRIVILEGED
+  put in_f 0 2
+  put in_f 1 R16_RES_WORK
+  put in_f 2 RX_AEGIS_RIGHT_PRIVILEGED
+  r16_chk eq rx_aegis_decide rules 2 R16_SUBJ_WORKER in_f dec 1
+  r16_chk eq get dec 1 RX_AEGIS_DENY
+  r16_chk eq get dec 6 RX_AEGIS_WHY_PRIVILEGED
+
+  note Effect resource without approval -> ESCALATE, human reject -> DENY + WHY_HUMAN
+  put in_f 0 3
+  put in_f 1 R16_RES_EFFECT
+  put in_f 2 7
+  put in_f 6 3
+  put in_f 7 RX_AEGIS_REJECT
+  put in_f 8 3
+  put in_f 9 RX_AEGIS_ESCALATE
+  r16_chk eq rx_aegis_decide rules 2 R16_SUBJ_WORKER in_f dec 1
+  r16_chk eq get dec 1 RX_AEGIS_DENY
+  r16_chk eq get dec 6 RX_AEGIS_WHY_HUMAN
+
+  note Forged decision origin refused by rx_aegis_install_check
+  creq = new ulong 6 0
+  put creq 0 3
+  put creq 1 R16_RES_WORK
+  put creq 2 3
+  put creq 5 RX_AEGIS_OP_ACQUIRE
+  cl = new ulong 3 0
+  put cl 0 R16_SUBJ_WORKER
+  put cl 1 150994944
+  put cl 2 150995000
+  put dec 0 3
+  put dec 1 RX_AEGIS_GRANT
+  put dec 2 R16_RES_WORK
+  put dec 3 3
+  note Mismatched seq in creq -> WHY_MISMATCH
+  put creq 0 99
+  r16_chk eq rx_aegis_install_check dec creq cl RX_AEGIS_WHY_MISMATCH
+end
+
+fn r16_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len r16_pass
+    for i ulong n bound 64
+      put buf i get r16_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len r16_fail_m
+  for i ulong n bound 64
+    put buf i get r16_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  r16_test_caproot_negative
+  r16_test_aegis_negative
+  if ne get r16_fail 0 0
+    r16_put_msg 0
+    ret int get r16_fail 0
+  end
+  r16_put_msg 1
+  ret 0
+end

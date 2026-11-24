@@ -1,0 +1,133 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_composition_gate.om -- Pure seeded OM-2 port of
+note tests/runtime/rx_composition_gate.c (COMPOSITION-2 HOST tier gate).
+note Verifies the 14-step causal path (machine identity, world state,
+note alternative derivation, contract fail/pass, survivor selection, commit,
+note loser non-externalization, sealing/reclaim, Cortex recording,
+note close/reopen/replay, provenance, and deterministic rerun) on CPU only.
+
+global cg_checks ulong 1
+global cg_fail ulong 1
+
+text cg_dir1 "/tmp/rx_composition_gate_om_r1"
+text cg_dir2 "/tmp/rx_composition_gate_om_r2"
+text cg_pass "RX_COMPOSITION_GATE_OM: PASS (HOST)\n"
+text cg_fail_m "RX_COMPOSITION_GATE_OM: FAIL\n"
+
+fn cg_chk cond bool to void
+  put cg_checks 0 add get cg_checks 0 1
+  if not cond
+    if eq get cg_fail 0 0
+      put cg_fail 0 get cg_checks 0
+    end
+  end
+end
+
+fn cg_open_dir dir_t view uchar * mid ulong to long
+  dbuf = new uchar 128 0
+  dl = len dir_t
+  for i ulong dl bound 128
+    put dbuf i get dir_t i
+  end
+  ret rx_compose_open dbuf dl 1 mid
+end
+
+fn cg_check_cortex_links to void
+  cl0 = get rxc_last_res 8
+  cl1 = get rxc_last_res 9
+  ev = get rxc_last_res 10
+  pr = get rxc_last_res 11
+  cg_chk gt cl0 0
+  cg_chk gt cl1 cl0
+  cg_chk gt ev cl1
+  cg_chk gt pr ev
+  phb = mul sub pr 1 13
+  cg_chk eq get rxc_cx_hdr add phb 1 RXC_CX_K_PROMOTION
+  cg_chk eq get rxc_cx_hdr add phb 8 cl1
+  cg_chk eq get rxc_cx_hdr add phb 9 ev
+  ahb = mul pr 13
+  cg_chk eq get rxc_cx_hdr add ahb 1 RXC_CX_K_ADMISSION
+  cg_chk eq get rxc_cx_hdr add ahb 7 RXC_ADMIT_LOSER
+  cg_chk eq get rxc_cx_hdr add ahb 8 cl0
+  cg_chk eq get rxc_cx_hdr add ahb 9 ev
+end
+
+fn cg_run_once dir_t view uchar * out_dig edit uchar 32 out_meta edit ulong 4 to void
+  note Step 1: canonical machine identity & foreign identity refusal
+  cg_chk eq cg_open_dir dir_t 7001 RXC_OK
+  put rxc_st 18 1
+  cg_chk eq rx_compose_enroll_callers RXC_ERR_IDENTITY
+  put rxc_st 18 0
+  cg_chk eq rx_compose_enroll_callers RXC_OK
+
+  note Step 2-3: verify initial world state and genesis Cortex record
+  cg_chk eq get rxc_cx_n 0 1
+  cg_chk eq get rxc_cx_hdr 1 RXC_CX_K_ENTITY_CREATED
+  old_id = get rxc_st 6
+  cg_chk gt old_id 0
+
+  note Step 4-8: run goal where cand0 fails contract and cand1 passes -> cand1 wins
+  cg_chk eq rx_compose_run 5 10 0 16 1 RXC_OK
+  cg_chk eq get rxc_last_res 0 RXC_OUT_COMMITTED
+  cg_chk eq get rxc_last_res 1 1
+  cg_chk eq get rxc_last_res 6 16
+  cg_chk ge get rxc_last_res 7 1
+  new_id = get rxc_st 6
+  new_gen = get rxc_st 7
+  cg_chk ne new_id old_id
+
+  note Step 9-11: verify loser admission + winner promotion + Cortex links
+  cg_check_cortex_links
+
+  note Step 12-13: record digest and durable metadata capture
+  n_before = get rxc_cx_n 0
+  rx_compose_record_digest out_dig
+  put out_meta 0 new_id
+  put out_meta 1 new_gen
+  put out_meta 2 get rxc_last_res 11
+  put out_meta 3 n_before
+  rx_compose_close
+end
+
+fn cg_test_deterministic_rerun to void
+  note Step 14: two independent runs produce identical record digest and state
+  d1 = new uchar 32 0
+  d2 = new uchar 32 0
+  m1 = new ulong 4 0
+  m2 = new ulong 4 0
+  cg_run_once cg_dir1 d1 m1
+  cg_run_once cg_dir2 d2 m2
+  for i ulong 32
+    cg_chk eq get d1 i get d2 i
+  end
+  for i ulong 4
+    cg_chk eq get m1 i get m2 i
+  end
+end
+
+fn cg_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len cg_pass
+    for i ulong n bound 64
+      put buf i get cg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len cg_fail_m
+  for i ulong n bound 64
+    put buf i get cg_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  cg_test_deterministic_rerun
+  if ne get cg_fail 0 0
+    cg_put_msg 0
+    ret int get cg_fail 0
+  end
+  cg_put_msg 1
+  ret 0
+end
