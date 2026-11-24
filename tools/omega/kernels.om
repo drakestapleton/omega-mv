@@ -1,0 +1,1216 @@
+note SPDX-License-Identifier: Apache-2.0
+note tools/omega/kernels.om: `omega kernels`, composed after tools/omega/driver.om (docs/OMEGA-PACKAGE.md).
+note   omega kernels list                 every registry row and whether this device's order reaches it
+note   omega kernels select OP [SHAPE]    the kernel this device gets for OP (SHAPE defaults to any)
+note   omega kernels get OP [SHAPE]       select, then the cached kernel, or build, check and cache it
+note   omega kernels model FILE           get every `OP<TAB>SHAPE` line of FILE; exit 1 when one fails
+note Registry: OMEGA_SHARE/gpu/kernels/registry.tsv (format in its header). Device order (dr_n 4): nvidia
+note nvidia-sm121 then cpu; amd amd-gfx942 (only when a gfx942 KFD agent is present, dr_n 14) then cpu;
+note intel spirv-cl then cpu; cpu cpu. A row matches OP and SHAPE exactly (a request for SHAPE any takes
+note only rows of shape any).
+note Cache: OMEGA_CACHE, else XDG_CACHE_HOME/omega, else HOME/.cache/omega; a kernel lives in
+note kernels/KEY/kernel with kernels/KEY/receipt.tsv. KEY is the SHA-256 of the row's bytes, this CPU, the
+note SHA-256 of every lib/CPU program the build and its check run (omc always), and every file the build
+note reads, each framed as path, NUL, bytes, NUL, length; so a change to any of them is a new key, never a
+note stale hit. A build happens in kernels/KEY.tmp-PID, which is removed when it fails, and is renamed into
+note place only after its CHECK passed. A hit is served only when the kernel's SHA-256 equals its receipt's.
+
+text kn_use "usage: omega kernels list | select OP [SHAPE] | get OP [SHAPE] | model FILE\n"
+text kn_c_list "list"
+text kn_c_sel "select"
+text kn_c_get "get"
+text kn_c_model "model"
+text kn_any "any"
+text kn_t_cpu "cpu"
+text kn_t_nv "nvidia-sm121"
+text kn_t_amd "amd-gfx942"
+text kn_t_spv "spirv-cl"
+text kn_b_omc "omc"
+text kn_b_spv "spirv-emit"
+text kn_b_hsa "amd-hsaco"
+text kn_k_elf "elf"
+text kn_k_spv "spirv"
+text kn_k_tgt "targets"
+text kn_e_share "OMEGA_SHARE"
+text kn_e_cache "OMEGA_CACHE"
+text kn_e_xdg "XDG_CACHE_HOME"
+text kn_e_home "HOME"
+text kn_s_xdg "/omega"
+text kn_s_home "/.cache/omega"
+text kn_s_kern "/kernels/"
+text kn_s_tmp ".tmp-"
+text kn_s_art "/kernel"
+text kn_s_rec "/receipt.tsv"
+text kn_s_src "/src.om"
+text kn_s_in0 "/in0.bin"
+text kn_s_in1 "/in1.bin"
+text kn_s_out "/out.bin"
+text kn_s_reg "/gpu/kernels/registry.tsv"
+text kn_s_emit "/gpu/spirv/emit.om"
+text kn_s_hsa "/gpu/amd/gfx942/hsaco.om"
+text kn_p_emit "/spirv-emit"
+text kn_p_val "/spirv-val"
+text kn_p_run "/spirv-run"
+text kn_p_conf "/spirv-conform"
+text kn_p_chk "/kernel-check"
+text kn_p_hsa "/amd-hsaco"
+text kn_a_tenv "--target-env"
+text kn_a_load "load"
+text kn_a_spvcl "SPIRV_CL"
+text kn_a_in "in"
+text kn_a_chk "check"
+text kn_h "omega-kernel op="
+text kn_h_shape " shape="
+text kn_h_be " backend="
+text kn_h_cpu " cpu="
+text kn_skip "skip target="
+text kn_skip_r " reason=no registry row for this op and shape (MISSING_IMPLEMENTATION)\n"
+text kn_skip_isa " reason=no gfx942 agent in /sys/class/kfd/kfd/topology (gfx_target_version 90402); set OMEGA_GPU=amd-gfx942 to assert one\n"
+text kn_r_sha "kernel_sha256\t"
+text kn_sel "select target="
+text kn_fmt " format="
+text kn_bld " build="
+text kn_none "none: no target in this device's order has the op (MISSING_IMPLEMENTATION)\n"
+text kn_key "key="
+text kn_hit "cache=hit path="
+text kn_built "cache=built path="
+text kn_fail "FAIL kernel build or check; nothing was cached\n"
+text kn_stale "cache=stale (the kernel's SHA-256 differs from its receipt): rebuilt\n"
+text kn_ok "PASS "
+text kn_row "row\t"
+text kn_r_cpu "cpu\t"
+text kn_r_omc "omc_sha256\t"
+text kn_r_key "key\t"
+text kn_r_art "kernel_sha256\t"
+text kn_r_chk "check\tPASS\t"
+text kn_r_dev "device_execution\tNOT_RUN\n"
+text kn_r_host "device_execution\tHOST (cpu target: the kernel is a program for this CPU)\n"
+text kn_m_noshare "omega: OMEGA_SHARE is not set; run omega through bin/omega\n"
+text kn_m_nocache "omega: no cache directory: set OMEGA_CACHE, XDG_CACHE_HOME or HOME\n"
+text kn_m_model "omega-kernels-model ops="
+text kn_m_failed " failed="
+text kn_l_reach "\treachable\n"
+text kn_l_not "\tnot in this device's order\n"
+text kn_tab "\t"
+
+global kn_reg uchar *
+global kn_share uchar 4096
+global kn_cache uchar 4096
+global kn_dir uchar 4096
+global kn_op uchar 256
+global kn_shape uchar 256
+global kn_osha uchar 64
+global kn_kh uchar 64
+global kn_f ulong 16
+global kn_n ulong 16
+note kn_n: 0 registry len, 1 share len, 2 cache len, 3 dir len (cache/kernels/KEY), 4 op len, 5 shape len,
+note 6 selected row start, 7 selected row end, 8 field count of the parsed row
+note kn_f: field i is registry bytes [kn_f 2i, kn_f 2i+1)
+
+note cb_pa = OMEGA_SHARE, the kernel's cache directory or the cache root (globals are never arguments)
+fn kn_pa_sh0 to void
+cb_pa_clr
+for i ulong get kn_n 1 bound 4096
+cb_pa_ch get kn_share i
+end
+end
+
+fn kn_pa_dir0 to void
+cb_pa_clr
+for i ulong get kn_n 3 bound 4096
+cb_pa_ch get kn_dir i
+end
+end
+
+fn kn_pa_cache0 to void
+cb_pa_clr
+for i ulong get kn_n 2 bound 4096
+cb_pa_ch get kn_cache i
+end
+end
+
+fn kn_pa_share t view uchar * to void
+kn_pa_sh0
+cb_pa_tx t
+end
+
+fn kn_pa_dir t view uchar * to void
+kn_pa_dir0
+cb_pa_tx t
+end
+
+fn kn_out_f i ulong to void
+a = get kn_f mul i 2
+b = get kn_f add mul i 2 1
+if gt b a
+r = write 1 kn_reg a sub b a
+end
+end
+
+note kn_fields a b: split registry line [a, b) at tabs into kn_f; returns the field count
+fn kn_fields a ulong b ulong to ulong
+n = ulong 0
+s = a
+p = a
+while le p b bound 9223372036854775807
+if or eq p b eq get kn_reg p 9
+if lt n 8
+put kn_f mul n 2 s
+put kn_f add mul n 2 1 p
+n = add n 1
+end
+s = add p 1
+end
+p = add p 1
+end
+put kn_n 8 n
+ret n
+end
+
+fn kn_feq i ulong t view uchar * to bool
+a = get kn_f mul i 2
+b = get kn_f add mul i 2 1
+if ne sub b a len t
+ret false
+end
+for j ulong len t bound 256
+if ne get kn_reg add a j get t j
+ret false
+end
+end
+ret true
+end
+
+note kn_fop / kn_fshape: field 0 equals the requested op, field 1 the requested shape
+fn kn_fop to bool
+a = get kn_f 0
+n = get kn_n 4
+if ne sub get kn_f 1 a n
+ret false
+end
+for j ulong n bound 256
+if ne get kn_reg add a j get kn_op j
+ret false
+end
+end
+ret true
+end
+
+fn kn_fshape to bool
+a = get kn_f 2
+n = get kn_n 5
+if ne sub get kn_f 3 a n
+ret false
+end
+for j ulong n bound 256
+if ne get kn_reg add a j get kn_shape j
+ret false
+end
+end
+ret true
+end
+
+note kn_word i k: [start, end) of the k-th space-separated word of field i, as kn_f 14, 15; false past the end
+fn kn_word i ulong k ulong to bool
+a = get kn_f mul i 2
+b = get kn_f add mul i 2 1
+w = ulong 0
+p = a
+while lt p b bound 9223372036854775807
+q = p
+while and lt q b ne get kn_reg q 32 bound 9223372036854775807
+q = add q 1
+end
+if eq w k
+put kn_f 14 p
+put kn_f 15 q
+ret true
+end
+w = add w 1
+p = add q 1
+end
+ret false
+end
+
+fn kn_pa_word_share to void
+kn_pa_sh0
+cb_pa_ch 47
+for j ulong sub get kn_f 15 get kn_f 14 bound 4096
+cb_pa_ch get kn_reg add get kn_f 14 j
+end
+end
+
+fn kn_av_word to void
+cb_pa_clr
+for j ulong sub get kn_f 15 get kn_f 14 bound 4096
+cb_pa_ch get kn_reg add get kn_f 14 j
+end
+cb_av_push_pa
+end
+
+note kn_load: OMEGA_SHARE, the registry, the cache root; false with a message
+fn kn_load to bool
+if not cb_getenv kn_e_share
+cb_err kn_m_noshare
+ret false
+end
+n = get cb_n 4
+for i ulong n bound 4096
+put kn_share i get cb_pb i
+end
+put kn_n 1 n
+kn_pa_share kn_s_reg
+if not cb_read_pa
+dr_err dr_m_read
+cb_wbuf_pa 2
+dr_err cb_nl
+ret false
+end
+rn = get cb_n 0
+r = enlarge kn_reg add rn 1
+if ne r 0
+ret false
+end
+for i ulong rn bound 9223372036854775807
+put kn_reg i get cb_rb i
+end
+put kn_n 0 rn
+note cache root
+ok = cb_getenv kn_e_cache
+if not ok
+if cb_getenv kn_e_xdg
+cb_pb_tx kn_s_xdg
+ok = true
+else
+if cb_getenv kn_e_home
+cb_pb_tx kn_s_home
+ok = true
+end
+end
+end
+if not ok
+cb_err kn_m_nocache
+ret false
+end
+n2 = get cb_n 4
+for i ulong n2 bound 4096
+put kn_cache i get cb_pb i
+end
+put kn_n 2 n2
+ret true
+end
+
+note kn_find t: the registry row for kn_op / kn_shape on target t; true with kn_n 6, 7 and kn_f set
+fn kn_find t view uchar * to bool
+a = ulong 0
+rn = get kn_n 0
+while lt a rn bound 9223372036854775807
+b = a
+while and lt b rn ne get kn_reg b 10 bound 9223372036854775807
+b = add b 1
+end
+if and gt b a ne get kn_reg a 35
+if ge kn_fields a b 7
+if and kn_fop kn_fshape
+if kn_feq 2 t
+put kn_n 6 a
+put kn_n 7 b
+ret true
+end
+end
+end
+end
+a = add b 1
+end
+ret false
+end
+
+fn kn_skip_tx t view uchar * to void
+cb_out kn_skip
+cb_out t
+cb_out kn_skip_r
+end
+
+note kn_select: walk this device's target order; true with the chosen row parsed
+fn kn_select to bool
+g = get dr_n 4
+if eq g 1
+if kn_find kn_t_nv
+ret true
+end
+kn_skip_tx kn_t_nv
+end
+if eq g 2
+if ne get dr_n 14 0
+if kn_find kn_t_amd
+ret true
+end
+kn_skip_tx kn_t_amd
+else
+cb_out kn_skip
+cb_out kn_t_amd
+cb_out kn_skip_isa
+end
+end
+if eq g 3
+if kn_find kn_t_spv
+ret true
+end
+kn_skip_tx kn_t_spv
+end
+if kn_find kn_t_cpu
+ret true
+end
+kn_skip_tx kn_t_cpu
+ret false
+end
+
+fn kn_head to void
+cb_out kn_h
+r = write 1 kn_op 0 get kn_n 4
+cb_out kn_h_shape
+r2 = write 1 kn_shape 0 get kn_n 5
+cb_out kn_h_be
+dr_gpu_tx get dr_n 4
+cb_wbuf_pb 1
+cb_out kn_h_cpu
+cb_out dr_arch
+cb_out cb_nl
+end
+
+fn kn_sel_line to void
+cb_out kn_sel
+kn_out_f 2
+cb_out kn_fmt
+kn_out_f 3
+cb_out kn_bld
+kn_out_f 4
+cb_out cb_nl
+end
+
+note kn_args i ac: kn_op = argument i, kn_shape = argument i+1 or any
+fn kn_args i ulong ac ulong to bool
+if ge i ac
+ret false
+end
+if not cb_pa_arg i
+ret false
+end
+n = get cb_n 3
+if gt n 255
+ret false
+end
+for j ulong n bound 256
+put kn_op j get cb_pa j
+end
+put kn_n 4 n
+cb_pa_set kn_any
+if lt add i 1 ac
+if not cb_pa_arg add i 1
+ret false
+end
+end
+m = get cb_n 3
+if gt m 255
+ret false
+end
+for j ulong m bound 256
+put kn_shape j get cb_pa j
+end
+put kn_n 5 m
+ret true
+end
+
+note ---- the key ----
+fn kn_sha_wb to void
+cb_sha_reset
+n = get cb_n 1
+o = ulong 0
+while lt o n bound 9223372036854775807
+k = sub n o
+if gt k 65536
+k = 65536
+end
+for i ulong k bound 65536
+put cb_chunk1 i get cb_wb add o i
+end
+cb_sha_push_chunk 0 k
+o = add o k
+end
+cb_sha_finish
+end
+
+note kn_key_prog name: append `name SHA-256` of lib/CPU/name to cb_wb
+fn kn_key_prog name view uchar * to bool
+dr_pa_lib name
+if not cb_sha_file_pa
+ret false
+end
+cb_wb_tx name
+cb_wb_ch 32
+for i ulong 64
+cb_wb_ch get cb_shex i
+end
+cb_wb_ch 10
+ret true
+end
+
+note kn_key_file: append the file at cb_pa as path, NUL, bytes, NUL, decimal length, newline
+fn kn_key_file to bool
+for i ulong get cb_n 3 bound 4096
+cb_wb_ch get cb_pa i
+end
+cb_wb_ch 0
+n0 = get cb_n 1
+if not cb_append_pa_to_wb
+ret false
+end
+n1 = get cb_n 1
+cb_wb_ch 0
+cb_wb_num sub n1 n0
+cb_wb_ch 10
+ret true
+end
+
+note kn_key_wb: cb_wb = row, CPU, then every program the build and check run, then every file the build reads
+fn kn_key_wb to bool
+dr_pa_lib dr_n_omc
+if not cb_sha_file_pa
+ret false
+end
+for i ulong 64
+put kn_osha i get cb_shex i
+end
+cb_wb_clr
+a = get kn_n 6
+for i ulong sub get kn_n 7 a bound 9223372036854775807
+cb_wb_ch get kn_reg add a i
+end
+cb_wb_ch 10
+cb_wb_tx dr_arch
+cb_wb_ch 10
+if not kn_key_prog dr_n_omc
+ret false
+end
+if kn_feq 4 kn_b_spv
+if not kn_key_spv_progs
+ret false
+end
+kn_pa_share kn_s_emit
+ret kn_key_file
+end
+if kn_feq 4 kn_b_hsa
+if not kn_key_prog kn_p_hsa
+ret false
+end
+if not kn_key_prog kn_p_chk
+ret false
+end
+kn_pa_share kn_s_hsa
+if not kn_key_file
+ret false
+end
+end
+k = ulong 0
+while kn_word 5 k bound 9223372036854775807
+kn_pa_word_share
+if not kn_key_file
+ret false
+end
+k = add k 1
+end
+ret true
+end
+
+fn kn_key_spv_progs to bool
+if not kn_key_prog kn_p_emit
+ret false
+end
+if not kn_key_prog kn_p_val
+ret false
+end
+if not kn_key_prog kn_p_chk
+ret false
+end
+if not kn_key_prog kn_p_run
+ret false
+end
+ret kn_key_prog kn_p_conf
+end
+
+note kn_set_dir: kn_dir = cache/kernels/KEY (cb_shex), and the directory cache/kernels exists
+fn kn_set_dir to bool
+kn_pa_cache0
+cb_pa_tx kn_s_kern
+n0 = get cb_n 3
+put cb_n 3 sub n0 1
+if not cb_mkdir_p_pa
+ret false
+end
+put cb_n 3 n0
+for i ulong 64
+cb_pa_ch get cb_shex i
+end
+n = get cb_n 3
+for i ulong n bound 4096
+put kn_dir i get cb_pa i
+end
+put kn_n 3 n
+for i ulong 64
+put kn_kh i get cb_shex i
+end
+ret true
+end
+
+note ---- building into DIR (cb_pa holds DIR when these start; kn_dir is the final place) ----
+global kn_tdir uchar 4096
+global kn_tn ulong 1
+
+fn kn_pa_tdir0 to void
+cb_pa_clr
+for i ulong get kn_tn 0 bound 4096
+cb_pa_ch get kn_tdir i
+end
+end
+
+fn kn_pa_t t view uchar * to void
+kn_pa_tdir0
+cb_pa_tx t
+end
+
+note kn_spawn_to t: run cb_av with stdout to DIR + t (or inherited when t is empty); its status
+fn kn_spawn_to t view uchar * to ulong
+fo = long -1
+if gt len t 0
+kn_pa_t t
+z = unlink cb_pa 0 get cb_n 3
+fo = fopen cb_pa 0 get cb_n 3 524865 420
+if lt fo 0
+ret 512
+end
+end
+ret cb_spawn_fds -1 int fo -1 false
+end
+
+fn kn_av_lib name view uchar * to bool
+dr_pa_lib name
+if not dr_have_pa
+ret false
+end
+cb_av_clr
+cb_av_push_pa
+ret true
+end
+
+fn kn_build_omc to ulong
+cb_wb_clr
+if eq dr_is_x86 1
+cb_wb_tx dr_tgt_x86
+end
+k = ulong 0
+while kn_word 5 k bound 9223372036854775807
+kn_pa_word_share
+if not cb_append_pa_to_wb
+ret 4
+end
+k = add k 1
+end
+kn_pa_t kn_s_src
+if not cb_write_wb_pa 384
+ret 70
+end
+if not dr_omc
+ret 69
+end
+omcl = get cb_n 3
+kn_pa_t kn_s_art
+cb_pb_from_pa
+kn_pa_t kn_s_src
+ret cb_run_omc omcl 493 -1
+end
+
+fn kn_build_spv to ulong
+if not kn_av_lib kn_p_emit
+ret 69
+end
+k = ulong 0
+while kn_word 5 k bound 9223372036854775807
+kn_av_word
+k = add k 1
+end
+ret kn_spawn_to kn_s_art
+end
+
+fn kn_build_hsa to ulong
+if not kn_av_lib kn_p_hsa
+ret 69
+end
+if not kn_word 5 0
+ret 4
+end
+kn_pa_word_share
+cb_av_push_pa
+ret kn_spawn_to kn_s_art
+end
+fn kn_rb_is i ulong v ulong to bool
+ret eq ulong get cb_rb i v
+end
+
+note kn_check_elf: ELF64 little-endian, ET_EXEC, e_machine 62 (x86-64) or 183 (AArch64) for this CPU
+fn kn_check_elf to ulong
+kn_pa_t kn_s_art
+if not cb_read_pa
+ret 4
+end
+if lt get cb_n 0 20
+ret 1
+end
+if not and kn_rb_is 0 127 kn_rb_is 1 69
+ret 1
+end
+if not and kn_rb_is 2 76 kn_rb_is 3 70
+ret 1
+end
+if not and kn_rb_is 4 2 kn_rb_is 5 1
+ret 1
+end
+m = ulong 183
+if eq dr_is_x86 1
+m = 62
+end
+if not and kn_rb_is 16 2 kn_rb_is 18 m
+ret 1
+end
+ret 0
+end
+note kn_spawn: run cb_av with the inherited stdin, stdout and stderr; its status
+fn kn_spawn to ulong
+ret cb_spawn_fds -1 -1 -1 false
+end
+
+fn kn_check_tgt to ulong
+if not kn_av_lib kn_p_chk
+ret 69
+end
+cb_av_push_tx kn_a_load
+if not kn_word 6 1
+ret 2
+end
+kn_av_word
+kn_pa_t kn_s_art
+cb_av_push_pa
+if kn_word 6 2
+kn_av_word
+end
+ret kn_spawn
+end
+
+fn kn_two to bool
+if not kn_word 6 3
+ret false
+end
+ret eq get kn_reg get kn_f 14 50
+end
+
+fn kn_conform_in to ulong
+if not kn_av_lib kn_p_conf
+ret 69
+end
+cb_av_push_tx kn_a_in
+if not kn_word 6 2
+ret 2
+end
+kn_av_word
+kn_pa_t kn_s_in0
+cb_av_push_pa
+if kn_two
+kn_pa_t kn_s_in1
+cb_av_push_pa
+end
+ret kn_spawn
+end
+
+fn kn_spv_run to ulong
+if not kn_av_lib kn_p_run
+ret 69
+end
+kn_pa_t kn_s_art
+cb_av_push_pa
+if not kn_word 6 4
+ret 2
+end
+kn_av_word
+if not kn_word 6 5
+ret 2
+end
+kn_av_word
+kn_pa_t kn_s_out
+cb_av_push_pa
+kn_pa_t kn_s_in0
+cb_av_push_pa
+if kn_two
+kn_pa_t kn_s_in1
+cb_av_push_pa
+end
+ret kn_spawn
+end
+
+fn kn_check_spv to ulong
+note spirv ENV K NIN NWORK NOUT: val, load, conform in, run, conform check
+if not kn_av_lib kn_p_val
+ret 69
+end
+cb_av_push_tx kn_a_tenv
+if not kn_word 6 1
+ret 2
+end
+kn_av_word
+kn_pa_t kn_s_art
+cb_av_push_pa
+r = kn_spawn
+if ne r 0
+ret r
+end
+if not kn_av_lib kn_p_chk
+ret 69
+end
+cb_av_push_tx kn_a_load
+cb_av_push_tx kn_a_spvcl
+kn_pa_t kn_s_art
+cb_av_push_pa
+r = kn_spawn
+if ne r 0
+ret r
+end
+r = kn_conform_in
+if ne r 0
+ret r
+end
+r = kn_spv_run
+if ne r 0
+ret r
+end
+if not kn_av_lib kn_p_conf
+ret 69
+end
+cb_av_push_tx kn_a_chk
+if not kn_word 6 2
+ret 2
+end
+kn_av_word
+kn_pa_t kn_s_out
+cb_av_push_pa
+ret kn_spawn
+end
+
+fn kn_rm_t t view uchar * to void
+kn_pa_t t
+z = unlink cb_pa 0 get cb_n 3
+end
+
+note kn_receipt: DIR/receipt.tsv (row, cpu, omc, key, kernel sha256, the check, device execution)
+fn kn_receipt to bool
+kn_pa_t kn_s_art
+if not cb_sha_file_pa
+ret false
+end
+cb_wb_clr
+cb_wb_tx kn_row
+a = get kn_n 6
+for i ulong sub get kn_n 7 a bound 9223372036854775807
+cb_wb_ch get kn_reg add a i
+end
+cb_wb_ch 10
+cb_wb_tx kn_r_cpu
+cb_wb_tx dr_arch
+cb_wb_ch 10
+cb_wb_tx kn_r_omc
+for i ulong 64
+cb_wb_ch get kn_osha i
+end
+cb_wb_ch 10
+cb_wb_tx kn_r_key
+for i ulong 64
+cb_wb_ch get kn_kh i
+end
+cb_wb_ch 10
+cb_wb_tx kn_r_art
+for i ulong 64
+cb_wb_ch get cb_shex i
+end
+cb_wb_ch 10
+cb_wb_tx kn_r_chk
+a6 = get kn_f 12
+for i ulong sub get kn_f 13 a6 bound 9223372036854775807
+cb_wb_ch get kn_reg add a6 i
+end
+cb_wb_ch 10
+if kn_feq 2 kn_t_cpu
+cb_wb_tx kn_r_host
+else
+cb_wb_tx kn_r_dev
+end
+kn_pa_t kn_s_rec
+ret cb_write_wb_pa 420
+end
+
+fn kn_pb_dir to void
+cb_pb_clr
+for i ulong get kn_n 3 bound 4096
+cb_pb_ch get kn_dir i
+end
+end
+
+note kn_fword_is t: the word at kn_f 14, 15 equals t
+fn kn_fword_is t view uchar * to bool
+a = get kn_f 14
+if ne sub get kn_f 15 a len t
+ret false
+end
+for j ulong len t bound 64
+if ne get kn_reg add a j get t j
+ret false
+end
+end
+ret true
+end
+
+note kn_build: DIR = kn_dir.tmp-PID; build, check, receipt, rename to kn_dir; 0 or the failing status
+fn kn_build to ulong
+kn_pa_dir0
+cb_pa_tx kn_s_tmp
+dr_pa_num ulong getpid
+n = get cb_n 3
+for i ulong n bound 4096
+put kn_tdir i get cb_pa i
+end
+put kn_tn 0 n
+if not cb_mkdir_p_pa
+ret 74
+end
+r = ulong 4
+if kn_feq 4 kn_b_omc
+r = kn_build_omc
+end
+if kn_feq 4 kn_b_spv
+r = kn_build_spv
+end
+if kn_feq 4 kn_b_hsa
+r = kn_build_hsa
+end
+if ne r 0
+kn_rm_tdir
+ret r
+end
+c = ulong 4
+if kn_feq 6 kn_k_elf
+c = kn_check_elf
+else
+if not kn_word 6 0
+kn_rm_tdir
+ret 4
+end
+if kn_fword_is kn_k_spv
+c = kn_check_spv
+end
+if kn_fword_is kn_k_tgt
+c = kn_check_tgt
+end
+end
+kn_rm_t kn_s_in0
+kn_rm_t kn_s_in1
+kn_rm_t kn_s_out
+kn_rm_t kn_s_src
+if ne c 0
+kn_rm_tdir
+ret c
+end
+if not kn_receipt
+kn_rm_tdir
+ret 74
+end
+kn_pa_tdir0
+kn_pb_dir
+if not cb_rename_pa_pb
+note another omega installed KEY first: its checked kernel is the result, this copy is dropped
+kn_rm_tdir
+kn_pa_dir kn_s_rec
+if eq faccess cb_pa 0 get cb_n 3 4 0
+ret 0
+end
+ret 74
+end
+ret 0
+end
+
+fn kn_rm_tdir to void
+kn_pa_tdir0
+cb_rm_flat_pa
+end
+
+global kn_rsha uchar 64
+
+note kn_hit_ok: KEY/receipt.tsv is readable and its kernel_sha256 equals the SHA-256 of KEY/kernel
+fn kn_hit_ok to bool
+kn_pa_dir kn_s_rec
+if not cb_read_pa
+ret false
+end
+n = get cb_n 0
+m = len kn_r_sha
+p = ulong 0
+found = false
+while le add add p m 64 n bound 9223372036854775807
+if cb_rb_match_at p kn_r_sha
+found = true
+break
+end
+p = add p 1
+end
+if not found
+ret false
+end
+for i ulong 64
+put kn_rsha i get cb_rb add add p m i
+end
+kn_pa_dir kn_s_art
+if not cb_sha_file_pa
+ret false
+end
+for i ulong 64
+if ne get kn_rsha i get cb_shex i
+ret false
+end
+end
+ret true
+end
+
+note kn_get: select, key, hit or build; prints the head, the selection, key and path; 0 or failure status
+fn kn_get to ulong
+kn_head
+if not kn_select
+cb_out kn_none
+ret 1
+end
+kn_sel_line
+if not kn_key_wb
+ret 4
+end
+kn_sha_wb
+if not kn_set_dir
+ret 74
+end
+cb_out kn_key
+r = write 1 kn_kh 0 64
+cb_out cb_nl
+kn_pa_dir kn_s_rec
+hit = false
+if eq faccess cb_pa 0 get cb_n 3 4 0
+if kn_hit_ok
+hit = true
+else
+cb_out kn_stale
+kn_pa_dir0
+cb_rm_flat_pa
+end
+end
+if hit
+cb_out kn_hit
+else
+b = kn_build
+if ne b 0
+cb_err kn_fail
+ret b
+end
+cb_out kn_built
+end
+kn_pa_dir kn_s_art
+cb_wbuf_pa 1
+cb_out cb_nl
+ret 0
+end
+
+fn kn_list to int
+a = ulong 0
+rn = get kn_n 0
+g = get dr_n 4
+while lt a rn bound 9223372036854775807
+b = a
+while and lt b rn ne get kn_reg b 10 bound 9223372036854775807
+b = add b 1
+end
+if and gt b a ne get kn_reg a 35
+if ge kn_fields a b 7
+kn_out_f 0
+cb_out kn_tab
+kn_out_f 1
+cb_out kn_tab
+kn_out_f 2
+cb_out kn_tab
+kn_out_f 3
+reach = kn_feq 2 kn_t_cpu
+if and eq g 1 kn_feq 2 kn_t_nv
+reach = true
+end
+if and and eq g 2 ne get dr_n 14 0 kn_feq 2 kn_t_amd
+reach = true
+end
+if and eq g 3 kn_feq 2 kn_t_spv
+reach = true
+end
+if reach
+cb_out kn_l_reach
+else
+cb_out kn_l_not
+end
+end
+end
+a = add b 1
+end
+ret 0
+end
+
+global kn_mf uchar *
+note kn_set_opshape a t b: kn_op = model bytes [a, t), kn_shape = (t, b) or any
+fn kn_set_opshape a ulong t ulong b ulong to void
+n = sub t a
+if gt n 255
+n = 255
+end
+for j ulong n bound 256
+put kn_op j get kn_mf add a j
+end
+put kn_n 4 n
+if lt add t 1 b
+m = sub b add t 1
+if gt m 255
+m = 255
+end
+for j ulong m bound 256
+put kn_shape j get kn_mf add add t 1 j
+end
+put kn_n 5 m
+else
+for j ulong len kn_any
+put kn_shape j get kn_any j
+end
+put kn_n 5 len kn_any
+end
+end
+
+
+fn kn_model ac ulong to int
+if ne ac 4
+cb_err kn_use
+ret 2
+end
+if not cb_pa_arg 3
+cb_err kn_use
+ret 2
+end
+if not cb_read_pa
+dr_err dr_m_read
+cb_wbuf_pa 2
+dr_err cb_nl
+ret 66
+end
+mn = get cb_n 0
+r = enlarge kn_mf add mn 1
+if ne r 0
+ret 70
+end
+for i ulong mn bound 9223372036854775807
+put kn_mf i get cb_rb i
+end
+nop = ulong 0
+nbad = ulong 0
+a = ulong 0
+while lt a mn bound 9223372036854775807
+b = a
+while and lt b mn ne get kn_mf b 10 bound 9223372036854775807
+b = add b 1
+end
+if and gt b a ne get kn_mf a 35
+nop = add nop 1
+nbad = add nbad kn_mline a b
+end
+a = add b 1
+end
+cb_out kn_m_model
+cb_wnum 1 nop
+cb_out kn_m_failed
+cb_wnum 1 nbad
+cb_out cb_nl
+if ne nbad 0
+ret 1
+end
+ret 0
+end
+
+note kn_mline a b: one model line [a, b): get its kernel; 1 when that failed, else 0
+fn kn_mline a ulong b ulong to ulong
+t = a
+while and lt t b ne get kn_mf t 9 bound 9223372036854775807
+t = add t 1
+end
+kn_set_opshape a t b
+if ne kn_get 0
+ret 1
+end
+ret 0
+end
+
+fn dr_kernels ac ulong to int
+if lt ac 3
+cb_err kn_use
+ret 2
+end
+note dr_detect walks /sys and /dev through cb_pa, so the subcommand is read after it
+if not dr_detect
+ret 2
+end
+if not cb_pa_arg 2
+cb_err kn_use
+ret 2
+end
+if cb_pa_eq kn_c_list
+if not kn_load
+ret 69
+end
+ret kn_list
+end
+if cb_pa_eq kn_c_sel
+if not kn_args 3 ac
+cb_err kn_use
+ret 2
+end
+if not kn_load
+ret 69
+end
+kn_head
+if not kn_select
+cb_out kn_none
+ret 1
+end
+kn_sel_line
+ret 0
+end
+if cb_pa_eq kn_c_get
+if not kn_args 3 ac
+cb_err kn_use
+ret 2
+end
+if not kn_load
+ret 69
+end
+ret dr_status kn_get
+end
+if cb_pa_eq kn_c_model
+if not kn_load
+ret 69
+end
+ret kn_model ac
+end
+cb_err kn_use
+ret 2
+end

@@ -1,0 +1,912 @@
+note SPDX-License-Identifier: Apache-2.0
+note tools/omega/driver.om: the `omega` command, one native binary per CPU (docs/OMEGA-PACKAGE.md).
+note Compose (tools/omega/build.om does this for both CPUs):
+note   [target x86linux] seed/build/common.om tools/omega/arch-<cpu>.om tools/omega/driver.om
+note   tools/omega/kernels.om tools/omega/main.om
+note bin/omega (POSIX sh) reads `uname -m`, sets OMEGA_LIB to lib/<cpu> and runs lib/<cpu>/omega, so this
+note program always runs on the CPU it was compiled for (dr_arch, from arch-<cpu>.om). It finds its sibling
+note programs (omc, omega-console) in OMEGA_LIB.
+note
+note   omega hw                              the CPU and the GPU backend this machine gets
+note   omega compile SRC [-o OUT] [--cpu C]  compile SRC for this CPU (or C: x86_64, aarch64)
+note   omega run SRC [ARG]...                compile SRC for this CPU, run it with ARGs, exit with its status
+note   omega check SRC                       the compiler's `check` mode on SRC (no artifact)
+note   omega console [ARG]...                the Visor console (tools/omega.om)
+note   omega omc                             the compiler itself: stdin to stdout
+note   omega version                         the CPU and the sha256 of every program in OMEGA_LIB
+note   omega kernels list|select|get|model   model kernels for this device (tools/omega/kernels.om)
+note
+note GPU backend (hw, and OMEGA_GPU for `run`): OMEGA_GPU when set (cpu, nvidia, amd or intel), else the
+note first of nvidia, amd, intel with a GPU PCI function (/sys/bus/pci/devices/*/class base class 0x03 display,
+note or 0x12 processing accelerator as AMD Instinct reports,
+note vendor 0x10de, 0x1002, 0x8086) is present together with its device node (/dev/nvidiactl, /dev/kfd,
+note /dev/dri/renderD128), else cpu. The selection names a backend; it does not qualify that GPU.
+note `run` passes the program PATH, HOME, USER, LOGNAME, LANG, LC_ALL, TERM, TMPDIR, PWD, TZ and every
+note OMEGA_* and OMC_* entry, then OMEGA_CPU and OMEGA_GPU (execenv allows 64 entries and 4096 bytes;
+note an entry that does not fit is named on stderr and not passed).
+note Exit: the compiler's or program's status; 2 usage; 69 OMEGA_LIB unset or a program missing;
+note 70 a temporary file could not be written; 128 + N when the program died of signal N.
+
+text dr_use "usage: omega hw | compile SRC [-o OUT] [--cpu x86_64|aarch64] | run SRC [ARG]... | check SRC | console [ARG]... | omc | version | kernels list|select OP [SHAPE]|get OP [SHAPE]|model FILE\n"
+text dr_c_kernels "kernels"
+text dr_c_hw "hw"
+text dr_c_compile "compile"
+text dr_c_run "run"
+text dr_c_check "check"
+text dr_c_console "console"
+text dr_c_omc "omc"
+text dr_c_version "version"
+text dr_f_o "-o"
+text dr_f_cpu "--cpu"
+text dr_cpu_x86 "x86_64"
+text dr_cpu_a64 "aarch64"
+text dr_e_lib "OMEGA_LIB"
+text dr_e_gpu "OMEGA_GPU"
+text dr_e_tmp "TMPDIR"
+text dr_tmp_def "/tmp"
+text dr_n_omc "/omc"
+text dr_n_con "/omega-console"
+text dr_n_drv "/omega"
+text dr_tmp_pre "/omega-"
+text dr_tmp_om ".om"
+text dr_tmp_exe ".exe"
+text dr_tgt_x86 "target x86linux\n"
+text dr_tgt "target "
+text dr_lead_chk "check\n"
+text dr_out_def "a.out"
+text dr_m_nolib "omega: OMEGA_LIB is not set; run omega through bin/omega\n"
+text dr_m_noprog "omega: missing program "
+text dr_m_tmp "omega: cannot write a temporary file under "
+text dr_m_read "omega: cannot read "
+text dr_m_arg "omega: an argument is longer than 4095 bytes\n"
+text dr_p_kfdn "/sys/class/kfd/kfd/topology/nodes/"
+text dr_p_props "/properties"
+text dr_k_gfx942 "gfx_target_version 90402\n"
+text dr_g_amd942 "amd-gfx942"
+text dr_h_isa " amd_gfx942_agent="
+text dr_m_gpu "omega: OMEGA_GPU must be cpu, nvidia, amd, amd-gfx942 or intel\n"
+text dr_m_envfull "omega: environment entry not passed (execenv packet full): "
+text dr_g_cpu "cpu"
+text dr_g_nv "nvidia"
+text dr_g_amd "amd"
+text dr_g_int "intel"
+text dr_h_head "omega-hw 1\ncpu="
+text dr_h_pci "\ngpu_pci nvidia="
+text dr_h_amd " amd="
+text dr_h_int " intel="
+text dr_h_dev "\ndev nvidiactl="
+text dr_h_kfd " kfd="
+text dr_h_dri " renderD128="
+text dr_h_be "\nbackend="
+text dr_h_src_env " source=OMEGA_GPU\n"
+text dr_h_src_det " source=detected\n"
+text dr_yes "present"
+text dr_no "absent"
+text dr_p_pci "/sys/bus/pci/devices"
+text dr_p_cls "/class"
+text dr_p_ven "/vendor"
+text dr_p_nv "/dev/nvidiactl"
+text dr_p_kfd "/dev/kfd"
+text dr_p_dri "/dev/dri/renderD128"
+text dr_v_head "omega-version 1 cpu="
+text dr_v_lib " lib="
+text dr_v_sha "sha256 "
+text dr_v_miss "missing "
+text dr_k_cpu "OMEGA_CPU="
+text dr_k_gpu "OMEGA_GPU="
+text dr_k_om "OMEGA_"
+text dr_k_omc "OMC_"
+text dr_k_list "PATH HOME USER LOGNAME LANG LC_ALL TERM TMPDIR PWD TZ "
+
+global dr_lib uchar 4096
+global dr_src uchar 4096
+global dr_out uchar 4096
+global dr_tmp uchar 4096
+global dr_dents uchar 16384
+global dr_hex uchar 64
+global dr_n ulong 16
+note dr_n: 0 lib len, 1 src len, 2 out len, 3 tmp len, 4 gpu (0 cpu, 1 nvidia, 2 amd, 3 intel),
+note 5 gpu from OMEGA_GPU, 6..8 PCI display functions nvidia/amd/intel, 9..11 nodes nvidiactl/kfd/renderD128,
+note 12 compile for x86_64 (1) or aarch64 (0), 13 temporary file sequence
+
+fn dr_err t view uchar * to void
+cb_err t
+end
+
+note dr_pa_lib: cb_pa = OMEGA_LIB + name
+fn dr_pa_lib name view uchar * to void
+cb_pa_clr
+for i ulong get dr_n 0 bound 4096
+cb_pa_ch get dr_lib i
+end
+cb_pa_tx name
+end
+
+fn dr_need_lib to bool
+if not cb_getenv dr_e_lib
+dr_err dr_m_nolib
+ret false
+end
+n = get cb_n 4
+for i ulong n bound 4096
+put dr_lib i get cb_pb i
+end
+put dr_n 0 n
+ret true
+end
+
+fn dr_have_pa to bool
+r = faccess cb_pa 0 get cb_n 3 1
+if ne r 0
+dr_err dr_m_noprog
+cb_wbuf_pa 2
+dr_err cb_nl
+ret false
+end
+ret true
+end
+
+note ---- GPU detection (the PCI scan of gpu/qual/non_nvidia_qual.om, plus the NVIDIA node) ----
+fn dr_readhex to ulong
+fd = fopen cb_pa 0 get cb_n 3 0 0
+if lt fd 0
+ret 0
+end
+got = read int fd dr_hex 0 64
+r = fclose int fd
+if le got 0
+ret 0
+end
+p = ulong 0
+if ge got 2
+if and eq get dr_hex 0 48 or eq get dr_hex 1 120 eq get dr_hex 1 88
+p = ulong 2
+end
+end
+v = ulong 0
+while lt p ulong got bound 32
+c = ulong get dr_hex p
+d = ulong 16
+if and ge c 48 le c 57
+d = sub c 48
+end
+if and ge c 97 le c 102
+d = add 10 sub c 97
+end
+if and ge c 65 le c 70
+d = add 10 sub c 65
+end
+if eq d 16
+break
+end
+v = add mul v 16 d
+p = add p 1
+end
+ret v
+end
+
+note dr_fn: cb_pa = /sys/bus/pci/devices/<entry ns..ns+nl of dr_dents> + suffix
+fn dr_fn ns ulong nl ulong suffix view uchar * to void
+cb_pa_set dr_p_pci
+cb_pa_ch 47
+for k ulong nl bound 256
+cb_pa_ch get dr_dents add ns k
+end
+cb_pa_tx suffix
+end
+
+fn dr_pci_one ns ulong nl ulong to void
+if eq get dr_dents ns 46
+ret
+end
+dr_fn ns nl dr_p_cls
+bc = shr dr_readhex 16
+if and ne bc 3 ne bc 18
+ret
+end
+dr_fn ns nl dr_p_ven
+ven = dr_readhex
+if eq ven 4318
+put dr_n 6 add get dr_n 6 1
+end
+if eq ven 4098
+put dr_n 7 add get dr_n 7 1
+end
+if eq ven 32902
+put dr_n 8 add get dr_n 8 1
+end
+end
+
+fn dr_scan_pci to void
+cb_pa_set dr_p_pci
+fd = fopen cb_pa 0 get cb_n 3 0 0
+if lt fd 0
+ret
+end
+while true bound 4096
+got = getdnts int fd dr_dents 0 16384
+if le got 0
+break
+end
+pos = ulong 0
+while lt pos ulong got bound 16384
+reclen = or ulong get dr_dents add pos 16 shl ulong get dr_dents add pos 17 8
+if eq reclen 0
+break
+end
+ns = add pos 19
+nl = ulong 0
+while lt add ns nl add pos reclen bound 256
+if eq get dr_dents add ns nl 0
+break
+end
+nl = add nl 1
+end
+if gt nl 0
+dr_pci_one ns nl
+end
+pos = add pos reclen
+end
+end
+r = fclose int fd
+end
+
+fn dr_node t view uchar * to ulong
+cb_pa_set t
+if eq faccess cb_pa 0 get cb_n 3 0 0
+ret 1
+end
+ret 0
+end
+
+note dr_gpu_name g: the backend name as cb_pb
+fn dr_gpu_tx g ulong to void
+if eq g 1
+cb_pb_set dr_g_nv
+ret
+end
+if eq g 2
+cb_pb_set dr_g_amd
+ret
+end
+if eq g 3
+cb_pb_set dr_g_int
+ret
+end
+cb_pb_set dr_g_cpu
+end
+
+fn dr_pb_is t view uchar * to bool
+n = get cb_n 4
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get cb_pb i get t i
+ret false
+end
+end
+ret true
+end
+
+note dr_kfd_gfx942: 1 when a KFD topology node reports gfx_target_version 90402 (gfx942: MI300X, MI300A,
+note MI325X), the only AMD ISA the registry has kernels for; nodes are read in order until one is missing
+fn dr_kfd_gfx942 to ulong
+i = ulong 0
+while true bound 9223372036854775807
+cb_pa_set dr_p_kfdn
+dr_pa_num i
+cb_pa_tx dr_p_props
+if ne faccess cb_pa 0 get cb_n 3 4 0
+ret 0
+end
+if cb_file_contains_pa dr_k_gfx942
+ret 1
+end
+i = add i 1
+end
+ret 0
+end
+
+note dr_detect: fill dr_n 4..11 and 14 (a gfx942 KFD agent); false when OMEGA_GPU is an unknown name.
+note OMEGA_GPU=amd-gfx942 selects amd and asserts the gfx942 agent (for a host without the card).
+fn dr_detect to bool
+dr_scan_pci
+put dr_n 9 dr_node dr_p_nv
+put dr_n 10 dr_node dr_p_kfd
+put dr_n 11 dr_node dr_p_dri
+put dr_n 14 dr_kfd_gfx942
+put dr_n 4 0
+put dr_n 5 0
+if cb_getenv dr_e_gpu
+put dr_n 5 1
+if dr_pb_is dr_g_cpu
+ret true
+end
+if dr_pb_is dr_g_nv
+put dr_n 4 1
+ret true
+end
+if dr_pb_is dr_g_amd
+put dr_n 4 2
+ret true
+end
+if dr_pb_is dr_g_amd942
+put dr_n 4 2
+put dr_n 14 1
+ret true
+end
+if dr_pb_is dr_g_int
+put dr_n 4 3
+ret true
+end
+dr_err dr_m_gpu
+ret false
+end
+if and gt get dr_n 6 0 ne get dr_n 9 0
+put dr_n 4 1
+ret true
+end
+if and gt get dr_n 7 0 ne get dr_n 10 0
+put dr_n 4 2
+ret true
+end
+if and gt get dr_n 8 0 ne get dr_n 11 0
+put dr_n 4 3
+end
+ret true
+end
+
+fn dr_yn v ulong to void
+if ne v 0
+cb_out dr_yes
+else
+cb_out dr_no
+end
+end
+
+fn dr_hw to int
+if not dr_detect
+ret 2
+end
+cb_out dr_h_head
+cb_out dr_arch
+cb_out dr_h_pci
+cb_wnum 1 get dr_n 6
+cb_out dr_h_amd
+cb_wnum 1 get dr_n 7
+cb_out dr_h_int
+cb_wnum 1 get dr_n 8
+cb_out dr_h_dev
+dr_yn get dr_n 9
+cb_out dr_h_kfd
+dr_yn get dr_n 10
+cb_out dr_h_dri
+dr_yn get dr_n 11
+cb_out dr_h_isa
+dr_yn get dr_n 14
+cb_out dr_h_be
+dr_gpu_tx get dr_n 4
+cb_wbuf_pb 1
+if ne get dr_n 5 0
+cb_out dr_h_src_env
+else
+cb_out dr_h_src_det
+end
+ret 0
+end
+
+note ---- temporary files: a private directory TMPDIR (or /tmp) + /omega-<pid>-<seq>, made with mode 0700 by
+note mkdir, which fails when the name exists (then the next seq), so no other user can own or redirect a
+note file the compiler writes or the program that `run` executes; removed with its files when done ----
+note dr_pa_num: append decimal v to cb_pa (cb_wb is not touched: it may hold a composed source)
+fn dr_pa_num v ulong to void
+d = new uchar 20 0
+n = ulong 0
+x = v
+while true bound 20
+put d n uchar add 48 rem x 10
+n = add n 1
+x = div x 10
+if eq x 0
+break
+end
+end
+while gt n 0 bound 20
+n = sub n 1
+cb_pa_ch get d n
+end
+end
+
+global dr_tdir uchar 4096
+
+fn dr_tmpdir to bool
+if gt get dr_n 15 0
+ret true
+end
+if not cb_getenv dr_e_tmp
+cb_pb_set dr_tmp_def
+end
+s = ulong 0
+while true bound 9223372036854775807
+cb_pa_clr
+for i ulong get cb_n 4 bound 4096
+cb_pa_ch get cb_pb i
+end
+cb_pa_tx dr_tmp_pre
+dr_pa_num ulong getpid
+cb_pa_ch 45
+dr_pa_num s
+r = makedir cb_pa 0 get cb_n 3 448
+if eq r 0
+n = get cb_n 3
+for i ulong n bound 4096
+put dr_tdir i get cb_pa i
+end
+put dr_n 15 n
+ret true
+end
+if ne r -17
+ret false
+end
+s = add s 1
+end
+ret false
+end
+
+note dr_tmp_path suffix: dr_tmp = the private directory + /f<seq><suffix>; false when it cannot be made
+fn dr_tmp_path suffix view uchar * to bool
+if not dr_tmpdir
+dr_err dr_m_tmp
+cb_wbuf_pa 2
+dr_err cb_nl
+ret false
+end
+cb_pa_clr
+for i ulong get dr_n 15 bound 4096
+cb_pa_ch get dr_tdir i
+end
+cb_pa_ch 47
+cb_pa_ch 102
+s = add get dr_n 13 1
+put dr_n 13 s
+dr_pa_num s
+cb_pa_tx suffix
+n = get cb_n 3
+for i ulong n bound 4096
+put dr_tmp i get cb_pa i
+end
+put dr_n 3 n
+ret true
+end
+
+fn dr_tmp_clean to void
+if eq get dr_n 15 0
+ret
+end
+cb_pa_clr
+for i ulong get dr_n 15 bound 4096
+cb_pa_ch get dr_tdir i
+end
+cb_rm_flat_pa
+put dr_n 15 0
+end
+
+fn dr_pa_tmp to void
+cb_pa_clr
+for i ulong get dr_n 3 bound 4096
+cb_pa_ch get dr_tmp i
+end
+end
+
+fn dr_pa_src to void
+cb_pa_clr
+for i ulong get dr_n 1 bound 4096
+cb_pa_ch get dr_src i
+end
+end
+
+fn dr_pb_out to void
+cb_pb_clr
+for i ulong get dr_n 2 bound 4096
+cb_pb_ch get dr_out i
+end
+end
+
+fn dr_set_src idx ulong to bool
+if not cb_pa_arg idx
+ret false
+end
+n = get cb_n 3
+for i ulong n bound 4096
+put dr_src i get cb_pa i
+end
+put dr_n 1 n
+ret true
+end
+
+fn dr_set_out_pa to void
+n = get cb_n 3
+for i ulong n bound 4096
+put dr_out i get cb_pa i
+end
+put dr_n 2 n
+end
+
+note dr_compose lead x86: the compiler input in a private temporary .om file (dr_tmp). The target line must
+note be the source's first line: `target x86linux` when x86 and SRC names no target, else SRC's own first
+note line when it is a target line; then `check` when lead; then the rest of SRC. 66: SRC unreadable; 70: the
+note temporary file not written.
+fn dr_compose lead bool x86 bool to ulong
+dr_pa_src
+if not cb_read_pa
+dr_err dr_m_read
+cb_wbuf_pa 2
+dr_err cb_nl
+ret 66
+end
+n = get cb_n 0
+named = ge n len dr_tgt
+if named
+for i ulong len dr_tgt
+if ne get cb_rb i get dr_tgt i
+named = false
+end
+end
+end
+cb_wb_clr
+body = ulong 0
+if named
+while lt body n bound 9223372036854775807
+body = add body 1
+if eq get cb_rb sub body 1 10
+break
+end
+end
+cb_wb_rb 0 body
+else
+if x86
+cb_wb_tx dr_tgt_x86
+end
+end
+if lead
+cb_wb_tx dr_lead_chk
+end
+cb_wb_rb body sub n body
+if not dr_tmp_path dr_tmp_om
+ret 70
+end
+if not cb_write_wb_pa 384
+dr_err dr_m_tmp
+cb_wbuf_pa 2
+dr_err cb_nl
+ret 70
+end
+ret 0
+end
+
+note dr_omc: cb_pc = OMEGA_LIB/omc; false (message) when it is not executable
+fn dr_omc to bool
+dr_pa_lib dr_n_omc
+if not dr_have_pa
+ret false
+end
+n = get cb_n 3
+for i ulong n bound 4096
+put cb_pc i get cb_pa i
+end
+ret true
+end
+
+note dr_build lead x86 mode: compile dr_src to dr_out; returns the compiler's status (or 66, 69, 70)
+fn dr_build lead bool x86 bool mode int to ulong
+if not dr_omc
+ret 69
+end
+omcl = get cb_n 3
+c = dr_compose lead x86
+if ne c 0
+ret c
+end
+dr_pa_tmp
+dr_pb_out
+r = cb_run_omc omcl mode -1
+dr_pa_tmp
+z = unlink cb_pa 0 get cb_n 3
+ret r
+end
+
+fn dr_status r ulong to int
+if ge r 512
+ret 70
+end
+if ge r 256
+ret int add 128 and sub r 256 127
+end
+ret int r
+end
+
+fn dr_compile ac ulong to int
+if lt ac 3
+cb_err dr_use
+ret 2
+end
+if not dr_set_src 2
+cb_err dr_use
+ret 2
+end
+cb_pa_set dr_out_def
+dr_set_out_pa
+x86 = eq get dr_n 12 1
+i = ulong 3
+while lt i ac bound 9223372036854775807
+if not cb_pa_arg i
+cb_err dr_use
+ret 2
+end
+if cb_pa_eq dr_f_o
+if ge add i 1 ac
+cb_err dr_use
+ret 2
+end
+if not cb_pa_arg add i 1
+cb_err dr_use
+ret 2
+end
+dr_set_out_pa
+i = add i 2
+continue
+end
+if cb_pa_eq dr_f_cpu
+if ge add i 1 ac
+cb_err dr_use
+ret 2
+end
+if not cb_pa_arg add i 1
+cb_err dr_use
+ret 2
+end
+if cb_pa_eq dr_cpu_x86
+x86 = true
+else
+if cb_pa_eq dr_cpu_a64
+x86 = false
+else
+cb_err dr_use
+ret 2
+end
+end
+i = add i 2
+continue
+end
+cb_err dr_use
+ret 2
+end
+r = dr_build false x86 493
+dr_tmp_clean
+ret dr_status r
+end
+
+note dr_check: the compiler's `check` mode for this CPU (x86-64: `target x86linux` first, then `check`)
+fn dr_check ac ulong to int
+if ne ac 3
+cb_err dr_use
+ret 2
+end
+if not dr_set_src 2
+cb_err dr_use
+ret 2
+end
+if not dr_tmp_path dr_tmp_exe
+ret 70
+end
+dr_pa_tmp
+dr_set_out_pa
+r = dr_build true eq get dr_n 12 1 384
+dr_tmp_clean
+ret dr_status r
+end
+
+note ---- run: the environment packet ----
+fn dr_listed kl ulong to bool
+note an entry NAME=VALUE in cb_pa is passed when NAME is in dr_k_list or starts OMEGA_ or OMC_
+if ge kl len dr_k_om
+p = true
+for j ulong len dr_k_om
+if ne get cb_pa j get dr_k_om j
+p = false
+end
+end
+if p
+ret true
+end
+end
+if ge kl len dr_k_omc
+p = true
+for j ulong len dr_k_omc
+if ne get cb_pa j get dr_k_omc j
+p = false
+end
+end
+if p
+ret true
+end
+end
+s = ulong 0
+for j ulong len dr_k_list bound 4096
+if eq get dr_k_list j 32
+if eq sub j s kl
+same = true
+for t ulong kl bound 4096
+if ne get cb_pa t get dr_k_list add s t
+same = false
+end
+end
+if same
+ret true
+end
+end
+s = add j 1
+end
+end
+ret false
+end
+
+fn dr_pa_starts t view uchar * to bool
+if lt get cb_n 3 len t
+ret false
+end
+for j ulong len t bound 4096
+if ne get cb_pa j get t j
+ret false
+end
+end
+ret true
+end
+
+fn dr_ev_push to void
+c = get cb_n 8
+cb_ev_push_env_pa
+if eq get cb_n 8 c
+dr_err dr_m_envfull
+cb_wbuf_pa 2
+dr_err cb_nl
+end
+end
+
+fn dr_env to void
+cb_ev_clr
+ec = envcnt
+for idx ulong ulong ec bound 65536
+k = envread idx cb_pa 0 4095
+if lt k 0
+continue
+end
+put cb_n 3 ulong k
+kl = ulong 0
+while lt kl ulong k bound 4096
+if eq get cb_pa kl 61
+break
+end
+kl = add kl 1
+end
+if ge kl ulong k
+continue
+end
+note OMEGA_CPU and OMEGA_GPU are set below, never passed through
+if dr_pa_starts dr_k_cpu
+continue
+end
+if dr_pa_starts dr_k_gpu
+continue
+end
+if dr_listed kl
+dr_ev_push
+end
+end
+cb_pa_set dr_k_cpu
+cb_pa_tx dr_arch
+dr_ev_push
+cb_pa_set dr_k_gpu
+dr_gpu_tx get dr_n 4
+cb_pa_add_pb
+dr_ev_push
+end
+
+fn dr_pa_out to void
+cb_pa_clr
+for i ulong get dr_n 2 bound 4096
+cb_pa_ch get dr_out i
+end
+end
+
+fn dr_run ac ulong to int
+if lt ac 3
+cb_err dr_use
+ret 2
+end
+if not dr_set_src 2
+cb_err dr_use
+ret 2
+end
+if not dr_detect
+ret 2
+end
+if not dr_tmp_path dr_tmp_exe
+ret 70
+end
+dr_pa_tmp
+dr_set_out_pa
+r = dr_build false eq get dr_n 12 1 448
+if ne r 0
+dr_tmp_clean
+ret dr_status r
+end
+cb_av_clr
+dr_pa_out
+cb_av_push_pa
+k = ulong 3
+while lt k ac bound 9223372036854775807
+if not cb_pa_arg k
+dr_err dr_m_arg
+dr_tmp_clean
+ret 2
+end
+cb_av_push_pa
+k = add k 1
+end
+dr_env
+x = cb_spawn_fds -1 -1 -1 true
+dr_tmp_clean
+ret dr_status x
+end
+
+note console and omc: replace this process (execprog: an empty environment, as every omc build runs)
+fn dr_exec name view uchar * fi ulong ac ulong to int
+dr_pa_lib name
+if not dr_have_pa
+ret 69
+end
+cb_av_clr
+cb_av_push_pa
+i = fi
+while lt i ac bound 9223372036854775807
+if not cb_pa_arg i
+dr_err dr_m_arg
+ret 2
+end
+cb_av_push_pa
+i = add i 1
+end
+r = execprog cb_av 0 get cb_n 5
+ret 69
+end
+
+note dr_vline: `sha256 HEX PATH` for the program at cb_pa, or `missing PATH`
+fn dr_vline to void
+if cb_sha_file_pa
+cb_out dr_v_sha
+cb_wbuf_hex 1
+cb_out cb_sp
+else
+cb_out dr_v_miss
+end
+cb_wbuf_pa 1
+cb_out cb_nl
+end
+
+fn dr_version to int
+cb_out dr_v_head
+cb_out dr_arch
+cb_out dr_v_lib
+r = write 1 dr_lib 0 get dr_n 0
+cb_out cb_nl
+dr_pa_lib dr_n_drv
+dr_vline
+dr_pa_lib dr_n_omc
+dr_vline
+dr_pa_lib dr_n_con
+dr_vline
+ret 0
+end
+

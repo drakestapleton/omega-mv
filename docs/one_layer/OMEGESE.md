@@ -1009,11 +1009,11 @@ after the global, restored the pin.
 
 Decision 3 of 2026-11-11 (omega-mv #793 RM4, #795 RM6): a region whose length is known at run time,
 obtained from the host as zero pages, bounds-checked like every array, with no `free` and no general
-allocator. Program mode on AArch64 Linux only.
+allocator. Program mode on AArch64 Linux and, since 2026-11-23, `target x86linux`.
 
 - `global NAME T *`: a run-time pool of element type T (as for `global`; `bool` is error 9). Its length
-  is 0 when the program starts. Function mode and IR mode refuse it (error 9), any `target` other than
-  the default refuses it (error 25). Like every global it is never passed as an argument and never
+  is 0 when the program starts. Function mode and IR mode refuse it (error 9), `target x86efi` and
+  `target a64efi` refuse it (error 25). Like every global it is never passed as an argument and never
   sliced with `part` (error 19), and a struct argument is never a pool (error 7).
 - `r = enlarge NAME n`: n a ulong and r a long (error 7 otherwise; r is an existing long local or a new
   one), allowed only as the whole of an assignment (error 9 inside a value, a `put` or a condition; a bare
@@ -1043,7 +1043,10 @@ allocator. Program mode on AArch64 Linux only.
   growth inside the pages already mapped only stores the length, the first growth is mmap (syscall 222,
   MAP_PRIVATE|MAP_ANONYMOUS) and a later one mremap (216, MREMAP_MAYMOVE), which moves page tables and
   never copies the data or touches the untouched pages. A unit that uses no pool compiles to the same
-  bytes as before (gate-pools.sh compares every tracked unit).
+  bytes as before (gate-pools.sh compares every tracked unit). Under `target x86linux` the same rules
+  hold: the slot is read after the operands (LEA, MOV, CMP, JAE trap 3), and `enlarge` is emitted inline
+  at each site with the x86-64 Linux syscalls mmap (9) and mremap (25); gate-pools.sh section X runs every
+  pool case on x86-64 (EMULATED under qemu-x86_64) with two x86 mutants.
 - What verification keeps and loses: every access stays bounds-checked (trap 3 exactly as for a sized
   array) and `enlarge` cannot overrun or shrink; what is lost is the compile-time knowledge of the
   length, so a number index into a pool is no longer error 21 at compile time, no pool check is
@@ -1145,7 +1148,7 @@ Non-byte arrays and mismatched scalar types are error 7.
 
 | Expression | Meaning |
 | --- | --- |
-| `fopen A off n flags mode` | Open a length-delimited path relative to the current directory. Return descriptor. |
+| `fopen A off n flags mode` | Open a length-delimited path relative to the current directory. Return descriptor. `flags` are Linux asm-generic `O_` values on every target; under `target x86linux` the compiler renumbers O_DIRECTORY, O_NOFOLLOW, O_DIRECT and O_LARGEFILE to x86-64's values. |
 | `fclose fd` | Close descriptor. |
 | `fsync fd` | Sync file data and metadata. |
 | `fdsync fd` | Sync file data only (`fdatasync`). |

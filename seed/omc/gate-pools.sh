@@ -41,6 +41,13 @@
 #  M. Mutants (mutants.tsv: NAME, CASE, MARKERS): omc.om with, for each marker m, the line after
 #     `note POOLMUT m` replaced by the text after `note POOLMUT-ALT m ` (`note removed` deletes it),
 #     compiled by OMC; it must compile g4base right and FAIL its CASE.
+#  X. x86linux (docs/X86-LINUX.md): OMC builds the x86-64 compiler from `target x86linux` + omc.om; under
+#     qemu-x86_64 (EMULATED, not native x86) it rebuilds itself byte for byte and builds OMC's AArch64
+#     compiler byte for byte from omc.om; every g* case and gr, prefixed `target x86linux`, gives
+#     NAME.want. Mutants must FAIL their case: x86cmp (no bounds check, g2a), x86base (base not stored
+#     after mremap, g1), x86belowlen (n below the length shrinks, g1), x86ovf (no 2^63 overflow test, g8b),
+#     x86slotfail (a refused mmap/mremap stored as the base, g8a). Without qemu-x86_64 the section is
+#     NOT_RUN and the gate's last line says so.
 # POOLS_ONLY="1 3 M" runs only the named sections (0 always runs).
 set -eu
 O0=$(pwd)
@@ -568,11 +575,11 @@ if on 10; then
     n=$((n + 1))
   done
   say "PASS 10 refusals: $n units refused with their exact code and line"
-  for c in err-x86 err-devctl err-mapwrite; do
+  for c in err-x86efi err-devctl err-mapwrite; do
     sed 's/^global P \([a-z0-9]*\) \*$/global P \1 64/; s/^r = enlarge P .*/r = long 0/' $T/$c.om > $B/tw.om
     "$S" < $B/tw.om > /dev/null 2> $B/w.err || bad "10 control: $c with a sized global: $(head -1 $B/w.err)"
   done
-  say "PASS 10 control: err-x86, err-devctl, err-mapwrite compile with a sized global in place of the pool"
+  say "PASS 10 control: err-x86efi, err-devctl, err-mapwrite compile with a sized global in place of the pool"
 fi
 
 # 11. byte identity
@@ -671,5 +678,58 @@ if on M; then
   [ $fails = 0 ] || bad "$fails mutants not built or not caught"
 fi
 
-say "PASS gate-pools${POOLS_ONLY:+ (sections 0 $POOLS_ONLY only)}"
+# X. x86linux under qemu-x86_64 (EMULATED)
+xnr=
+if on X; then
+  if command -v qemu-x86_64 > /dev/null; then
+    X=$B/x86
+    mkdir -p $X
+    cat si/directives/target-x86linux.om seed/omc/omc.om > $X/c.om
+    "$S" < $X/c.om > $X/omc 2> $X/w.err || bad "X: OMC refuses target x86linux + omc.om ($(head -1 $X/w.err))"
+    chmod +x $X/omc
+    qemu-x86_64 $X/omc < $X/c.om > $X/omc2 2> $X/w.err || bad "X: the x86 compiler refuses its own source ($(head -1 $X/w.err))"
+    cmp -s $X/omc $X/omc2 || bad "X: the x86 compiler does not rebuild itself byte for byte"
+    "$S" < seed/omc/omc.om > $X/a64 2> /dev/null || bad "X: OMC refuses omc.om"
+    qemu-x86_64 $X/omc < seed/omc/omc.om > $X/a64x 2> $X/w.err || bad "X: the x86 compiler refuses omc.om ($(head -1 $X/w.err))"
+    cmp -s $X/a64 $X/a64x || bad "X: the x86 compiler's AArch64 compiler differs from OMC's"
+    say "PASS X fixpoint: x86 omc $(sha256sum $X/omc | cut -c1-16) rebuilds itself and OMC's AArch64 compiler byte for byte (qemu-x86_64, EMULATED)"
+    ckx() { # ckx COMPILER NAME: $T/NAME.om after `target x86linux`, compiled and run under qemu-x86_64
+      inp=/dev/null; want=$T/$2.want; pre=
+      case $2 in g3|g3i) inp=$B/letters ;; gr) inp=$B/seqin; want=$B/gr.want ;; g8a) pre="prlimit --as=1073741824" ;; esac
+      { echo 'target x86linux'; cat $T/$2.om; } > $X/p.om
+      qemu-x86_64 "$1" < $X/p.om > $X/p.bin 2> $X/p.err || { echo "$2: compile failed ($(head -1 $X/p.err))" > $B/why; return 1; }
+      chmod +x $X/p.bin
+      set +e; $pre timeout ${TO:-300} qemu-x86_64 $X/p.bin < $inp > $X/p.out 2> /dev/null; x=$?; set -e
+      echo "status $x" >> $X/p.out
+      cmp -s $X/p.out $want || { echo "$2: $(firstdiff $X/p.out $want)" > $B/why; return 1; }
+    }
+    n=0
+    for f in $T/g*.om; do
+      c=$(basename $f .om)
+      [ -f $T/$c.want ] || [ "$c" = gr ] || continue
+      [ "$c" = g9 ] && continue
+      ckx $X/omc $c || bad "X $(cat $B/why)"
+      n=$((n + 1))
+    done
+    say "PASS X cases: $n pool cases give their .want on x86linux (g8a under prlimit --as=1073741824: qemu needs room for its own guest map)"
+    for mut in x86cmp:g2a x86base:g1 x86belowlen:g1 x86ovf:g8b x86slotfail:g8a; do
+      m=${mut%%:*}; c=${mut#*:}
+      awk -v t="note POOLMUT $m" -v p="note POOLMUT-ALT $m " '
+        NR == FNR { if (index($0, p) == 1) alt = substr($0, length(p) + 1); next }
+        skip { skip = 0; if (alt != "note removed") print alt; next }
+        { print } $0 == t { skip = 1 }' seed/omc/omc.om seed/omc/omc.om > $X/m.om
+      ! cmp -s seed/omc/omc.om $X/m.om || bad "X mutant $m: marker changes nothing"
+      cat si/directives/target-x86linux.om $X/m.om | "$S" > $X/momc 2> $X/w.err || bad "X mutant $m: not built ($(head -1 $X/w.err))"
+      chmod +x $X/momc
+      TO=120 ckx $X/momc g4base || bad "X mutant $m: compiles g4base wrong ($(cat $B/why))"
+      if TO=120 ckx $X/momc $c; then bad "X mutant $m: $c passed"; fi
+      say "PASS X mutant $m: caught by $c: $(cut -c1-160 $B/why)"
+    done
+  else
+    xnr=" (X NOT_RUN: no qemu-x86_64)"
+    say "NOT_RUN X: no qemu-x86_64"
+  fi
+fi
+
+say "PASS gate-pools${POOLS_ONLY:+ (sections 0 $POOLS_ONLY only)}$xnr"
 say "RC=0"

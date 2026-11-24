@@ -728,7 +728,7 @@ errs = {
     # name: (source, line or '*', code)
     "err-fnmode": (PM + "fn f to long\nr = enlarge P ulong 4\nret r\nend\n", "*", 9),
     "err-ir": ("ir\n" + PM + "fn main to int\nret 0\nend\n", 2, 9),
-    "err-x86": ("target x86linux\n" + PM + "fn main to int\nr = enlarge P ulong 4\nput P 0 1\nret int get P 0\nend\n", "*", 25),
+    "err-x86efi": ("target x86efi\n" + PM + "fn main to int\nr = enlarge P ulong 4\nput P 0 1\nret int get P 0\nend\n", "*", 25),
     "err-arg": ("om2\n" + PM + "fn f a view ulong * to ulong\nret len a\nend\nfn main to int\nr = enlarge P ulong 4\nx = f P\nret 0\nend\n", 8, 19),
     "err-part": ("om2\n" + PM + "fn f a view ulong * to ulong\nret len a\nend\nfn main to int\nr = enlarge P ulong 4\nx = f part P 0 2\nret 0\nend\n", 8, 19),
     "err-expr": (PM + "fn main to int\nif eq enlarge P ulong 4 0\nret 1\nend\nret 0\nend\n", 3, 9),

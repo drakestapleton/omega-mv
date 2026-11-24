@@ -3,44 +3,21 @@
 # Keeps OMC_PIN and NATIVE_PIN at top level for legacy pin-reading scripts (seed/effects/check.sh, om/tls/test/*).
 # Regenerates or checks (--check) src/{omega_om_units.c,omega_native.h,omega_api_decl.h,omega_om_units.ident,omega_om_units_fs.c}.
 set -eu
-OMC_PIN=21a8f628f25465a10bd38473fabf95b5c8f5067c7e04127c339f3c776566abb9
+OMC_PIN=28fca13d44054e26f78c33d1753fd5c005d08e9144d95985c90bd75b60885072
 NATIVE_PIN=9788b27a92c8dd365de7052439653de62f89634189a34cb6b3f582cae65dda83
-
-# Check required env vars and host architecture BEFORE invoking any AArch64 binary.
-[ -n "${OMEGA_OMC:-}" ] && [ -n "${OMEGA_BRIDGE:-}" ] || { echo "NOT_RUN: set OMEGA_OMC and OMEGA_BRIDGE"; exit 3; }
-[ "$(uname -s)-$(uname -m)" = "Linux-aarch64" ] || { echo "NOT_RUN: om/units.sh requires Linux aarch64"; exit 3; }
-
-CALLER_PWD="$PWD"
-abs_path() {
-  case "$1" in
-    /*) printf '%s\n' "$1" ;;
-    *)  printf '%s/%s\n' "$CALLER_PWD" "$1" ;;
-  esac
-}
-
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-OMEGA_OMC=$(abs_path "$OMEGA_OMC")
-OMEGA_BRIDGE=$(abs_path "$OMEGA_BRIDGE")
-if [ -n "${OMEGA_UNITS_DEST:-}" ]; then
-  OMEGA_UNITS_DEST=$(abs_path "$OMEGA_UNITS_DEST")
-else
-  OMEGA_UNITS_DEST="$ROOT/src"
-fi
-export OMEGA_OMC OMEGA_BRIDGE OMEGA_UNITS_DEST
-
-[ -x "$OMEGA_OMC" ] || { echo "NOT_RUN: omc is not executable ($OMEGA_OMC)"; exit 3; }
-[ -f "$OMEGA_BRIDGE/src/native.om" ] || { echo "NOT_RUN: native.om not found under $OMEGA_BRIDGE"; exit 3; }
-
 SB="$ROOT/seed/build"
-[ -f "$SB/units.om" ] || SB="$CALLER_PWD/seed/build"
-[ -f "$SB/units.om" ] || { echo "FAIL: seed/build/units.om not found"; exit 1; }
-
+[ -f "$SB/units.om" ] || SB="$(pwd)/seed/build"
+OMC_BOOT="$ROOT/seed/out/omc"
+[ -x "$OMC_BOOT" ] || OMC_BOOT="${OMEGA_OMC:-$(pwd)/seed/out/omc}"
+[ -x "$OMC_BOOT" ] || { echo "NOT_RUN: set OMEGA_OMC and OMEGA_BRIDGE"; exit 3; }
 cd "$ROOT"
 mkdir -p build
 BIN="$ROOT/build/om-units.$$"
-trap 'rm -f "$BIN"' EXIT INT TERM
-cat "$SB/common.om" "$SB/units.om" | "$OMEGA_OMC" > "$BIN"
+trap 'rm -f "$BIN"' EXIT
+cat "$SB/common.om" "$SB/units.om" | "$OMC_BOOT" > "$BIN"
 chmod 755 "$BIN"
 rc=0
-OMEGA_OMC_PIN="$OMC_PIN" OMEGA_NATIVE_PIN="$NATIVE_PIN" "$BIN" "$@" || rc=$?
+OMEGA_OMC_PIN="$OMC_PIN" OMEGA_NATIVE_PIN="$NATIVE_PIN" OMEGA_UNITS_DEST="${OMEGA_UNITS_DEST:-$ROOT/src}" \
+  "$BIN" "$@" || rc=$?
 exit "$rc"
