@@ -1,0 +1,305 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/r15_seat_diag_test.om -- Pure seeded OM-2 port of tests/runtime/r15_seat_diag_test.c.
+note Host-only test of G15 sampler diagnostics (SeatDiag) and teardown stage clock JSON (R15StageClock).
+
+const SD_STAGE_MAX ulong 12
+
+note SeatDiag layout (13 ulongs):
+note  0:last_t 1:last_change_t 2:late_2ms 3:late_10ms 4:max_gap_ns
+note  5:dead_runs 6:dead_longest 7:dead_cur 8:first_dead_t 9:last_live_t
+note  10:stale_max_ns 11:t_first 12:have
+
+global sd_checks ulong 1
+global sd_fail ulong 1
+
+text sd_st_p1 "producers"
+text sd_st_p2 "seat_finish"
+text sd_st_x  "x"
+text sd_json_hdr ",\"teardown\":{\"total_ns\":"
+text sd_json_mid ",\"stages\":["
+text sd_json_end "]}"
+text sd_expect ",\"teardown\":{\"total_ns\":102000000500,\"stages\":[[\"producers\",500],[\"seat_finish\",102000000000]]}"
+text sd_msg_pass "R15_SEAT_DIAG_OM: PASS\n"
+text sd_msg_fail "R15_SEAT_DIAG_OM: FAIL\n"
+
+fn sd_chk cond bool to void
+  put sd_checks 0 add get sd_checks 0 1
+  if not cond
+    if eq get sd_fail 0 0
+      put sd_fail 0 get sd_checks 0
+    end
+  end
+end
+
+fn sd_reset d edit ulong 13 to void
+  for i ulong 13
+    put d i 0
+  end
+end
+
+fn sd_sample d edit ulong 13 t_ns ulong live ulong to void
+  if eq get d 12 0
+    put d 12 1
+    put d 11 t_ns
+    put d 1 t_ns
+  else
+    gap = sub t_ns get d 0
+    if gt gap get d 4
+      put d 4 gap
+    end
+    if gt gap 2000000
+      put d 2 add get d 2 1
+    end
+    if gt gap 10000000
+      put d 3 add get d 3 1
+    end
+  end
+  put d 0 t_ns
+  if ne live 0
+    put d 1 t_ns
+    put d 9 t_ns
+    put d 7 0
+  else
+    if eq get d 7 0
+      put d 5 add get d 5 1
+      if eq get d 8 0
+        put d 8 t_ns
+      end
+    end
+    dc = add get d 7 1
+    put d 7 dc
+    if gt dc get d 6
+      put d 6 dc
+    end
+    age = sub t_ns get d 1
+    if gt age get d 10
+      put d 10 age
+    end
+  end
+end
+
+fn sd_put_text dst edit uchar 512 pos ulong cap ulong t view uchar * to ulong
+  n = len t
+  if gt add pos n cap
+    ret cap
+  end
+  for i ulong n bound 128
+    put dst add pos i get t i
+  end
+  ret add pos n
+end
+
+fn sd_put_u64 dst edit uchar 512 pos ulong cap ulong v ulong to ulong
+  tmp = new uchar 24 0
+  k = ulong 0
+  cur = v
+  if eq cur 0
+    put tmp 0 uchar 48
+    k = 1
+  else
+    while gt cur 0 bound 24
+      d = rem cur 10
+      put tmp k uchar add 48 d
+      k = add k 1
+      cur = div cur 10
+    end
+  end
+  if gt add pos k cap
+    ret cap
+  end
+  for i ulong k bound 24
+    put dst add pos i get tmp sub sub k 1 i
+  end
+  ret add pos k
+end
+
+fn sd_stage_json st_t view ulong 12 st_id view ulong 12 n ulong dst edit uchar 512 cap ulong to ulong
+  if lt n 2
+    ret 0
+  end
+  if lt cap 64
+    ret 0
+  end
+  pos = sd_put_text dst 0 cap sd_json_hdr
+  tot = sub get st_t sub n 1 get st_t 0
+  pos = sd_put_u64 dst pos cap tot
+  pos = sd_put_text dst pos cap sd_json_mid
+  i = ulong 1
+  while lt i n bound 12
+    if gt i 1
+      if ge pos cap
+        ret 0
+      end
+      put dst pos uchar 44
+      pos = add pos 1
+    end
+    if gt add pos 2 cap
+      ret 0
+    end
+    put dst pos uchar 91
+    put dst add pos 1 uchar 34
+    pos = add pos 2
+    nid = get st_id i
+    if eq nid 1
+      pos = sd_put_text dst pos cap sd_st_p1
+    else
+      if eq nid 2
+        pos = sd_put_text dst pos cap sd_st_p2
+      else
+        pos = sd_put_text dst pos cap sd_st_x
+      end
+    end
+    if gt add pos 2 cap
+      ret 0
+    end
+    put dst pos uchar 34
+    put dst add pos 1 uchar 44
+    pos = add pos 2
+    dt = sub get st_t i get st_t sub i 1
+    pos = sd_put_u64 dst pos cap dt
+    if ge pos cap
+      ret 0
+    end
+    put dst pos uchar 93
+    pos = add pos 1
+    i = add i 1
+  end
+  pos = sd_put_text dst pos cap sd_json_end
+  if ge pos cap
+    ret 0
+  end
+  ret pos
+end
+
+fn sd_test_streams to void
+  d = new ulong 13 0
+  note Healthy: 1000 samples 1.05ms apart, heartbeat moves every time
+  sd_reset d
+  t = ulong 1000000000
+  for i ulong 1000
+    lv = ulong 0
+    if gt i 0
+      lv = 1
+    end
+    sd_sample d t lv
+    t = add t 1050000
+  end
+  sd_chk eq get d 5 1
+  sd_chk eq get d 6 1
+  sd_chk eq get d 2 0
+  sd_chk eq get d 3 0
+  sd_chk eq get d 4 1050000
+
+  note Seat stops (SEQ-06 shape): 600 live then 400 not live
+  sd_reset d
+  t = ulong 1000000000
+  for i ulong 1000
+    lv = ulong 0
+    if ge i 1
+      if lt i 600
+        lv = 1
+      end
+    end
+    sd_sample d t lv
+    t = add t 1050000
+  end
+  sd_chk eq get d 5 2
+  sd_chk eq get d 6 400
+  sd_chk eq get d 7 400
+  sd_chk eq get d 3 0
+  sd_chk eq get d 4 1050000
+  sd_chk eq get d 8 1000000000
+  sd_chk eq get d 9 add ulong 1000000000 mul ulong 599 1050000
+  sd_chk eq get d 10 mul ulong 400 1050000
+
+  note Starved sampler, seat fine: 100 samples 50ms apart
+  sd_reset d
+  t = ulong 1000000000
+  for i ulong 100
+    lv = ulong 0
+    if gt i 0
+      lv = 1
+    end
+    sd_sample d t lv
+    t = add t 50000000
+  end
+  sd_chk eq get d 3 99
+  sd_chk eq get d 2 99
+  sd_chk eq get d 4 50000000
+  sd_chk eq get d 6 1
+
+  note Scattered: not-live every 10th sample
+  sd_reset d
+  t = ulong 1000000000
+  for i ulong 1000
+    lv = ulong 0
+    if gt i 0
+      if ne rem i 10 0
+        lv = 1
+      end
+    end
+    sd_sample d t lv
+    t = add t 1050000
+  end
+  sd_chk eq get d 5 100
+  sd_chk eq get d 6 1
+  sd_chk eq get d 3 0
+end
+
+fn sd_test_stage_clock to void
+  st_t = new ulong 12 0
+  st_id = new ulong 12 0
+  buf = new uchar 512 0
+  sd_chk eq sd_stage_json st_t st_id 0 buf 512 0
+  put st_t 0 1000
+  sd_chk eq sd_stage_json st_t st_id 1 buf 512 0
+  put st_t 1 1500
+  put st_id 1 1
+  put st_t 2 ulong 102000001500
+  put st_id 2 2
+  w = sd_stage_json st_t st_id 3 buf 512
+  elen = len sd_expect
+  sd_chk eq w elen
+  for i ulong elen bound 256
+    sd_chk eq get buf i get sd_expect i
+  end
+  note Saturation cap at SD_STAGE_MAX and small buffer refusal
+  fn_n = ulong 0
+  for i ulong 17
+    if lt fn_n SD_STAGE_MAX
+      put st_t fn_n mul i 100
+      put st_id fn_n 3
+      fn_n = add fn_n 1
+    end
+  end
+  sd_chk eq fn_n SD_STAGE_MAX
+  sd_chk eq sd_stage_json st_t st_id fn_n buf 40 0
+end
+
+fn sd_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len sd_msg_pass
+    for i ulong n bound 64
+      put buf i get sd_msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len sd_msg_fail
+  for i ulong n bound 64
+    put buf i get sd_msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  sd_test_streams
+  sd_test_stage_clock
+  if eq get sd_fail 0 0
+    sd_put_msg 1
+    ret 0
+  end
+  sd_put_msg 0
+  ret 1
+end

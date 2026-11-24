@@ -1,0 +1,290 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_cortex_canon.om -- Pure seeded OM-2 port of tests/runtime/rx_cortex_canon.c.
+note M20 Cortex canonicalization tests:
+note  1. canonical append & tamper detection
+note  2. provenance relation & promotion
+note  3. typed recall & time range & max bound
+note  4. restart persistence, torn tail & derived chain
+note  5. execution -> Cortex recording & provenance
+note  6. duplicate-writer prevention & attach/detach
+
+global cxc_checks ulong 1
+global cxc_fail ulong 1
+
+text cxc_pass "M20 CORTEX TESTS: PASS\n"
+text cxc_fail_m "M20 CORTEX TESTS: FAIL\n"
+
+fn cxc_chk cond bool to void
+  put cxc_checks 0 add get cxc_checks 0 1
+  if not cond
+    if eq get cxc_fail 0 0
+      put cxc_fail 0 get cxc_checks 0
+    end
+  end
+end
+
+fn cxc_hdr hdr edit ulong 12 cls ulong kind ulong subj ulong t ulong to void
+  for i ulong 12
+    put hdr i 0
+  end
+  put hdr 0 cls
+  put hdr 1 kind
+  put hdr 2 subj
+  put hdr 3 t
+end
+
+fn cxc_save_chain st ulong dst edit uchar 32 to void
+  cb = mul st 32
+  for i ulong 32
+    put dst i get cx_chain add cb i
+  end
+end
+
+fn cxc_chain_eq st ulong ref view uchar 32 to bool
+  cb = mul st 32
+  for i ulong 32
+    if ne get cx_chain add cb i get ref i
+      ret eq ulong 1 0
+    end
+  end
+  ret eq ulong 1 1
+end
+
+fn cxc_test_append to void
+  cxc_chk eq cx_init 0 8 CX_OK
+  hdr = new ulong 12 0
+  pay = new ulong 3 0
+  put pay 0 7
+  put pay 1 8
+  put pay 2 9
+  cxc_hdr hdr CX_CLAIM CX_K_CLAIM 2 10
+  cxc_chk eq cx_append 0 hdr pay 3 CX_OK
+  cxc_hdr hdr CX_OBSERVATION CX_K_EVIDENCE_REF 2 11
+  cxc_chk eq cx_append 0 hdr pay 1 CX_OK
+  note Backwards time refused
+  cxc_hdr hdr CX_CLAIM CX_K_CLAIM 2 5
+  cxc_chk eq cx_append 0 hdr pay 1 CX_ERR_ORDER
+  note Invalid class and subject out of range refused
+  cxc_hdr hdr 0 0 2 20
+  cxc_chk eq cx_append 0 hdr pay 0 CX_ERR_ARG
+  cxc_hdr hdr CX_CLAIM 0 8 20
+  cxc_chk eq cx_append 0 hdr pay 0 CX_ERR_ARG
+  cxc_chk eq get cx_meta 0 2
+  cxc_chk eq cx_verify 0 1 CX_OK
+  cxc_chk eq cx_verify_chain 0 CX_OK
+  cx_tamper 0 1 0 99
+  cxc_chk eq cx_verify 0 1 CX_ERR_DIGEST
+  cxc_chk eq cx_verify_chain 0 CX_ERR_DIGEST
+  cx_free 0
+end
+
+fn cxc_test_provenance to void
+  cxc_chk eq cx_init 0 4 CX_OK
+  hdr = new ulong 12 0
+  pay = new ulong 1 1
+  cxc_hdr hdr CX_OBSERVATION CX_K_EVIDENCE_REF 1 1
+  cxc_chk eq cx_append 0 hdr pay 1 CX_OK
+  cxc_hdr hdr CX_EVIDENCE CX_K_EVIDENCE_REF 1 2
+  put hdr 8 1
+  cxc_chk eq cx_append 0 hdr pay 1 CX_OK
+  cxc_hdr hdr CX_CLAIM CX_K_CANDIDATE 1 3
+  cxc_chk eq cx_append 0 hdr pay 1 CX_OK
+  note Wrong promotion arguments refused
+  cxc_chk eq cx_promote 0 0 2 3 4 CX_ERR_ARG
+  cxc_chk eq cx_promote 0 0 3 1 4 CX_ERR_ARG
+  cxc_chk eq cx_promote 0 0 3 2 4 CX_OK
+  anc = new ulong 8 0
+  n = cx_provenance 0 4 anc
+  cxc_chk eq n 3
+  cxc_chk eq get anc 0 3
+  cxc_chk eq get anc 1 2
+  cxc_chk eq get anc 2 1
+  cx_free 0
+end
+
+fn cxc_test_recall to void
+  cxc_chk eq cx_init 0 4 CX_OK
+  hdr = new ulong 12 0
+  pay = new ulong 2 0
+  for k ulong 6
+    t = add k 1
+    cls = CX_OBSERVATION
+    knd = CX_K_EVIDENCE_REF
+    if ne rem t 2 0
+      cls = CX_CLAIM
+      knd = CX_K_CLAIM
+    end
+    subj = ulong 2
+    if le t 4
+      subj = 1
+    end
+    cxc_hdr hdr cls knd subj t
+    put pay 0 t
+    put pay 1 mul t 10
+    cxc_chk eq cx_append 0 hdr pay 2 CX_OK
+  end
+  note Typed filter query for subject 1, CX_CLAIM / CX_K_CLAIM
+  q = new ulong 8 0
+  put q 0 1
+  put q 1 0
+  put q 2 1000
+  put q 3 CX_CLAIM
+  put q 4 CX_K_CLAIM
+  put q 6 1
+  put q 7 8
+  ids = new ulong 8 0
+  n = cx_range_ids 0 q ids
+  cxc_chk eq n 2
+  cxc_chk eq get ids 0 1
+  cxc_chk eq get ids 1 3
+  cxc_chk eq cx_payload_word 0 1 1 10
+  cxc_chk eq cx_payload_word 0 3 1 30
+  note Time range [2, 3]
+  put q 1 2
+  put q 2 3
+  put q 3 0
+  put q 4 0
+  n = cx_range_ids 0 q ids
+  cxc_chk eq n 2
+  cxc_chk eq get ids 0 2
+  cxc_chk eq get ids 1 3
+  note Max bound = 1 (bounded by dst length)
+  put q 1 0
+  put q 2 1000
+  ids1 = new ulong 1 0
+  n = cx_range_ids 0 q ids1
+  cxc_chk eq n 1
+  cx_free 0
+end
+
+fn cxc_test_persist_and_chain to void
+  cx_mj_reset 0
+  cxc_chk eq cx_open_with 0 0 16 CX_OPEN_SYNC CX_OK
+  hdr = new ulong 12 0
+  pay = new ulong 3 0
+  for k ulong 5
+    t = add k 1
+    cxc_hdr hdr CX_CLAIM CX_K_CLAIM rem t 3 t
+    if gt t 1
+      put hdr 8 sub t 1
+    end
+    put pay 0 t
+    put pay 1 add t 100
+    put pay 2 add t 200
+    cxc_chk eq cx_append 0 hdr pay 3 CX_OK
+  end
+  chain5 = new uchar 32 0
+  cxc_save_chain 0 chain5
+  cx_close 0
+
+  cxc_chk eq cx_open_with 0 0 16 0 CX_OK
+  cxc_chk eq get cx_meta 0 5
+  cxc_chk cxc_chain_eq 0 chain5
+  cxc_chk eq cx_verify_chain 0 CX_OK
+  cxc_chk eq cx_payload_word 0 4 2 204
+  cx_close 0
+
+  note Subject count mismatch refused
+  cxc_chk eq cx_open_with 0 0 17 0 CX_ERR_FORMAT
+
+  note Torn trailing record refused, repaired on request
+  full = get cx_mj_meta 0
+  put cx_mj_meta 0 sub full 5
+  cxc_chk eq cx_open_with 0 0 16 0 CX_ERR_TORN
+  cxc_chk eq cx_open_with 0 0 16 CX_OPEN_REPAIR_TAIL CX_OK
+  cxc_chk eq get cx_meta 0 4
+  cx_close 0
+end
+
+fn cxc_test_exec_and_writer to void
+  cxc_chk eq cx_init 0 80 CX_OK
+  rx_cx_hub_init
+  cxc_chk eq rx_cx_attach 0 1 RXCX_OK
+  note Bypass write while attached is refused; duplicate attach refused
+  hdr = new ulong 12 0
+  pay = new ulong 1 0
+  cxc_hdr hdr CX_CLAIM CX_K_CLAIM 1 1
+  cxc_chk eq cx_append 0 hdr pay 0 CX_ERR_WRITER
+  cxc_chk eq cx_claim_writer 0 12345 CX_ERR_WRITER
+  cxc_chk eq rx_cx_attach 0 3 RXCX_ERR_EXISTS
+
+  note Record accepted work (crumb 1) and commit result (crumb 2)
+  for i ulong 16
+    put rxcx_cm i 0
+  end
+  for i ulong 4
+    put rxcx_par i 0
+  end
+  for i ulong 8
+    put rxcx_fld i 0
+  end
+  for i ulong 32
+    put rxcx_dig i 0
+  end
+  put rxcx_cm 0 1
+  put rxcx_cm 1 RX_CRUMB_EXTERNAL
+  put rxcx_cm 6 1
+  put rxcx_cm 7 10
+  put rxcx_cm 8 1
+  put rxcx_fld 0 21
+  rx_cx_record_crumb
+  acc_id = rx_cx_record_in 1 0 1
+  cxc_chk eq acc_id 1
+
+  put rxcx_cm 0 2
+  put rxcx_cm 1 RX_CRUMB_COMMIT
+  put rxcx_cm 7 11
+  put rxcx_cm 10 1
+  put rxcx_fld 0 42
+  rx_cx_record_crumb
+  res_id = rx_cx_recall_result 0 11
+  cxc_chk eq res_id 2
+  cxc_chk eq cx_payload_word 0 2 10 42
+  anc = new ulong 8 0
+  n = cx_provenance 0 res_id anc
+  cxc_chk ge n 1
+  cxc_chk eq get anc 0 acc_id
+
+  st_out = new ulong 2 0
+  cxc_chk eq rx_cx_status st_out RXCX_OK
+  cxc_chk eq get st_out 0 2
+  cxc_chk eq get st_out 1 0
+
+  note Detach releases writer claim so direct append succeeds
+  cxc_chk eq rx_cx_detach RXCX_OK
+  cxc_hdr hdr CX_CLAIM CX_K_CLAIM 1 10
+  cxc_chk eq cx_append 0 hdr pay 0 CX_OK
+  cxc_chk eq cx_verify_chain 0 CX_OK
+  cx_free 0
+end
+
+fn cxc_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len cxc_pass
+    for i ulong n bound 64
+      put buf i get cxc_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len cxc_fail_m
+  for i ulong n bound 64
+    put buf i get cxc_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  cxc_test_append
+  cxc_test_provenance
+  cxc_test_recall
+  cxc_test_persist_and_chain
+  cxc_test_exec_and_writer
+  if eq get cxc_fail 0 0
+    cxc_put_msg 1
+    ret 0
+  end
+  cxc_put_msg 0
+  ret 1
+end

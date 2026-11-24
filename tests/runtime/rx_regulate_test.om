@@ -1,0 +1,194 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_regulate_test.om -- Pure seeded OM-2 port of tests/runtime/rx_regulate_test.c.
+note ADAPTIVE-M4 host gate: bounded resource regulation phases A-G (nominal, pressure -> EXPAND,
+note calm -> NOMINAL, hysteresis chatter/dead-band, envelope bounds + forged refusal + PROTECT,
+note operator stop/resume, fairness bound invariant).
+
+global rgt_checks ulong 1
+global rgt_fail ulong 1
+
+text rgt_msg_pass "ADAPTIVE-M4 REGULATE_OM: PASS\n"
+text rgt_msg_fail "ADAPTIVE-M4 REGULATE_OM: FAIL\n"
+
+fn rgt_chk cond bool to void
+  put rgt_checks 0 add get rgt_checks 0 1
+  if not cond
+    if eq get rgt_fail 0 0
+      put rgt_fail 0 get rgt_checks 0
+    end
+  end
+end
+
+fn rgt_make_env env edit ulong 16 to void
+  note min_slots=2, max_slots=12, min_mem=2MiB, max_mem=16MiB, min_eng=100, max_eng=1000
+  note nom_slots=4, nom_mem=4MiB, nom_eng=400, cont_hi=4, cont_lo=1, press_hi=80, press_lo=40, dwell=3
+  put env 0 2
+  put env 1 12
+  put env 2 2097152
+  put env 3 16777216
+  put env 4 100
+  put env 5 1000
+  put env 6 4
+  put env 7 4194304
+  put env 8 400
+  put env 9 4
+  put env 10 1
+  put env 11 80
+  put env 12 40
+  put env 13 3
+end
+
+fn rgt_copy8 src view ulong 8 dst edit ulong 8 to void
+  for i ulong 8
+    put dst i get src i
+  end
+end
+
+fn rgt_test_phases_abc env view ulong 16 pol edit ulong 8 state edit ulong 8 to void
+  cond = new ulong 8 0
+  nxt = new ulong 8 0
+  note Phase A: nominal startup
+  put pol 0 1
+  put pol 1 4
+  put pol 2 4194304
+  put pol 3 400
+  put pol 4 RX_REG_NOMINAL
+  put pol 5 0
+  put pol 6 0
+  put pol 7 0
+  rgt_chk eq rx_regulate_apply env pol 0 state RX_REG_OK
+  rgt_chk eq get state 1 4
+  rgt_chk eq get state 2 4194304
+
+  note Phase B: burst pressure (contention=10 >= 4) -> EXPAND
+  put cond 0 1
+  put cond 1 10
+  put cond 3 20
+  rgt_chk eq rx_regulate_step env cond pol nxt 2
+  rgt_chk eq get nxt 4 RX_REG_EXPAND
+  rgt_chk eq get nxt 1 12
+  rgt_chk eq get nxt 2 16777216
+  rgt_copy8 nxt pol
+  rgt_chk eq rx_regulate_apply env pol 0 state RX_REG_OK
+  rgt_chk eq get state 1 12
+
+  note Phase C: calm requires dwell=3 steps before returning to NOMINAL
+  put cond 0 2
+  put cond 1 0
+  put cond 3 0
+  rgt_chk eq rx_regulate_step env cond pol nxt 1
+  rgt_chk eq get nxt 4 RX_REG_EXPAND
+  rgt_copy8 nxt pol
+  put cond 0 3
+  rgt_chk eq rx_regulate_step env cond pol nxt 1
+  rgt_chk eq get nxt 4 RX_REG_EXPAND
+  rgt_copy8 nxt pol
+  put cond 0 4
+  rgt_chk eq rx_regulate_step env cond pol nxt 2
+  rgt_chk eq get nxt 4 RX_REG_NOMINAL
+  rgt_chk eq get nxt 1 4
+  rgt_copy8 nxt pol
+  rgt_chk eq rx_regulate_apply env pol 0 state RX_REG_OK
+  rgt_chk eq get state 1 4
+end
+
+fn rgt_test_phases_defg env view ulong 16 pol edit ulong 8 state edit ulong 8 to void
+  cond = new ulong 8 0
+  nxt = new ulong 8 0
+  note Phase D: hysteresis chatter in dead band (contention=2, between cont_lo=1 and cont_hi=4)
+  flips0 = get pol 7
+  put cond 0 5
+  put cond 1 5
+  put cond 3 0
+  rgt_chk eq rx_regulate_step env cond pol nxt 2
+  rgt_chk eq get nxt 4 RX_REG_EXPAND
+  rgt_copy8 nxt pol
+  for k ulong 6
+    put cond 0 add 6 k
+    put cond 1 2
+    rgt_chk eq rx_regulate_step env cond pol nxt 1
+    rgt_chk eq get nxt 4 RX_REG_EXPAND
+    rgt_copy8 nxt pol
+  end
+  rgt_chk eq sub get pol 7 flips0 1
+
+  note Phase E: huge signal cannot exceed max; forged policy refused; PROTECT applies minimum
+  put cond 0 20
+  put cond 1 999999
+  put cond 3 95
+  rgt_chk eq rx_regulate_step env cond pol nxt 2
+  rgt_chk eq get nxt 4 RX_REG_PROTECT
+  rgt_chk eq get nxt 1 2
+  rgt_chk eq get nxt 2 2097152
+  rgt_copy8 nxt pol
+  rgt_chk eq rx_regulate_apply env pol 0 state RX_REG_OK
+  rgt_chk eq get state 1 2
+  forged = new ulong 8 0
+  put forged 0 99
+  put forged 1 999
+  put forged 2 16777216
+  put forged 3 1000
+  put forged 4 RX_REG_EXPAND
+  rgt_chk eq rx_regulate_apply env forged 0 state RX_REG_ERR_BOUNDS
+  rgt_chk eq get state 1 2
+
+  note Phase F: operator emergency stop halts apply, resume restores it
+  rgt_chk eq rx_world_init 32 0
+  sec = new uchar 32 5
+  gen = new ulong 1 0
+  rgt_chk eq rx_world_enroll_caller 70 sec gen 0
+  rgt_chk eq rx_world_bind_callers 0
+  rw_cap_install 0 10 1 70 RW_WORLD_RES_CONTROL RW_WORLD_RIGHT_HALT
+  auth = new ulong 4 0
+  put auth 0 70
+  put auth 1 1
+  put auth 2 10
+  put auth 3 1
+  rgt_chk eq rx_world_emergency_stop auth sec 1 0
+  put forged 0 100
+  put forged 1 4
+  put forged 2 4194304
+  put forged 3 400
+  put forged 4 RX_REG_NOMINAL
+  rgt_chk eq rx_regulate_apply env forged 1 state RX_REG_ERR_HALTED
+  rgt_chk eq rx_world_emergency_resume 70 1 sec 10 1 0
+  rgt_chk eq rx_regulate_apply env forged 0 state RX_REG_OK
+  rgt_chk eq get state 1 4
+
+  note Phase G: fairness bound invariant (slots always within [min_slots, max_slots])
+  rgt_chk ge get state 1 get env 0
+  rgt_chk le get state 1 get env 1
+end
+
+fn rgt_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len rgt_msg_pass
+    for i ulong n bound 64
+      put buf i get rgt_msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len rgt_msg_fail
+  for i ulong n bound 64
+    put buf i get rgt_msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  env = new ulong 16 0
+  pol = new ulong 8 0
+  state = new ulong 8 0
+  rgt_make_env env
+  rgt_chk eq rx_regulate_envelope_ok env RX_REG_OK
+  rgt_test_phases_abc env pol state
+  rgt_test_phases_defg env pol state
+  if eq get rgt_fail 0 0
+    rgt_put_msg 1
+    ret 0
+  end
+  rgt_put_msg 0
+  ret 1
+end

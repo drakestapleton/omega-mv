@@ -1,0 +1,153 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_deadline_cancel.om -- Pure seeded OM-2 port of tests/runtime/rx_deadline_cancel.c.
+note HD-09 resource contract v0: a reaction with deadline=5 whose execution finishes when
+note logical_tick > 5 is cancelled before publishing, leaves output unchanged, refunds its
+note footprint, increments deadline_cancelled, and keeps the crumb chain verifiable.
+note Control case: logical_tick == 5 (strictly greater) commits once.
+
+global dlc_checks ulong 1
+global dlc_fail ulong 1
+
+text dlc_pass "RX_DEADLINE_CANCEL: PASS\n"
+text dlc_fail_m "RX_DEADLINE_CANCEL: FAIL\n"
+
+fn dlc_chk cond bool to void
+  put dlc_checks 0 add get dlc_checks 0 1
+  if not cond
+    if eq get dlc_fail 0 0
+      put dlc_fail 0 get dlc_checks 0
+    end
+  end
+end
+
+fn dlc_setup_world to void
+  dlc_chk eq rx_world_init 64 0
+  rx_world_set_resources 4 2 1024 1024
+  put rw_budget 7 0
+  meta = new ulong 3 0
+  put meta 0 1
+  put meta 1 1
+  put meta 2 1
+  init_f = new ulong 8 0
+  ref = new ulong 2 0
+  note Objects: 0=E (trigger), 1=OD (deadline output), 2=OH (holder output)
+  dlc_chk eq rx_world_create meta init_f ref 0
+  dlc_chk eq rx_world_create meta init_f ref 0
+  dlc_chk eq rx_world_create meta init_f ref 0
+  note Caps: slot 0 ext WRITE on res 1, slot 1 rx READ|WRITE on res 1
+  rw_cap_install 0 1 1 0 1 3
+  rw_cap_install 1 2 1 1 1 3
+
+  note Reaction 0 (D): deadline=5, mem=64, energy=3, triggers E.f0, writes OD.f0
+  spec = new ulong 16 0
+  put spec 0 1
+  put spec 1 1
+  put spec 2 1
+  put spec 3 0
+  put spec 4 1
+  put spec 5 0
+  put spec 6 0
+  put spec 7 0
+  put spec 8 1
+  put spec 9 1
+  put spec 10 0
+  put spec 11 1
+  put spec 12 2
+  put spec 13 1
+  put spec 14 1
+  put spec 15 3
+  rid = new ulong 1 0
+  dlc_chk eq rx_world_add_reaction spec rid 0
+  dlc_chk eq get rid 0 0
+  put rw_rx_desc 10 64
+  put rw_rx_desc 11 3
+  put rw_rx_desc 14 5
+
+  note Reaction 1 (H): no deadline, mem=32, energy=5, triggers E.f0, writes OH.f0
+  put spec 0 2
+  put spec 9 2
+  dlc_chk eq rx_world_add_reaction spec rid 0
+  dlc_chk eq get rid 0 1
+  put rw_rx_desc 26 32
+  put rw_rx_desc 27 5
+  put rw_rx_desc 30 0
+end
+
+fn dlc_run_case final_tick ulong is_late ulong to void
+  dlc_setup_world
+  fp = new ulong 11 0
+  rx_world_footprint fp
+  dlc_chk eq get fp 7 0
+  dlc_chk eq get fp 9 0
+  dlc_chk eq get fp 10 0
+
+  note Outside publication at tick 0 wakes both D and H into ready queue
+  cid = rx_world_publish_external 1 1 0 0 0 100
+  dlc_chk gt cid 0
+
+  note Advance logical_tick to final_tick before stepping D
+  put rw_budget 7 final_tick
+  dlc_chk eq rx_world_step_one 1
+  note Step H (no deadline)
+  dlc_chk eq rx_world_step_one 1
+  note No more ready reactions
+  dlc_chk eq rx_world_step_one 0
+
+  note Footprint returned to 0/0/0 after both finish
+  rx_world_footprint fp
+  dlc_chk eq get fp 7 0
+  dlc_chk eq get fp 9 0
+  dlc_chk eq get fp 10 0
+
+  od = new ulong 8 0
+  oh = new ulong 8 0
+  dlc_chk eq rx_world_read 1 0 od 0
+  dlc_chk eq rx_world_read 2 0 oh 0
+  note H always commits once (E.f0 + 1 = 101)
+  dlc_chk eq get rw_rx_st 36 1
+  dlc_chk eq get oh 0 101
+
+  if ne is_late 0
+    note Late case: D cancelled (0 commits, OD unchanged, deadline_cancelled == 1)
+    dlc_chk eq get rw_rx_st 12 0
+    dlc_chk eq get od 0 0
+    dlc_chk eq get rw_stats 21 1
+  else
+    note Control case: tick == 5 is NOT strictly greater -> D commits once
+    dlc_chk eq get rw_rx_st 12 1
+    dlc_chk eq get od 0 101
+    dlc_chk eq get rw_stats 21 0
+  end
+
+  chk = new ulong 1 0
+  dlc_chk eq rx_world_verify_crumbs chk 0
+  dlc_chk gt get chk 0 0
+end
+
+fn dlc_put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len dlc_pass
+    for i ulong n bound 64
+      put buf i get dlc_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len dlc_fail_m
+  for i ulong n bound 64
+    put buf i get dlc_fail_m i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  dlc_run_case 6 1
+  dlc_run_case 5 0
+  if eq get dlc_fail 0 0
+    dlc_put_msg 1
+    ret 0
+  end
+  dlc_put_msg 0
+  ret 1
+end
