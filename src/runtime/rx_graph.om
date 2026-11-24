@@ -1,0 +1,2158 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_graph.om -- Pure seeded OM-2 port of src/runtime/rx_graph.c.
+note Requires seed/ng/sha256.om concatenated before this file.
+note
+note Supports 2 graph slots (g = 0 or 1) so rx_graph_check_preserved(before, after)
+note compares two live graphs directly. All tables live in static BSS.
+
+const AG_MAX_NODES ulong 64
+const AG_MAX_IN ulong 4
+const AG_MAX_EDGES ulong 256
+const AG_MAX_DEPS ulong 128
+const AG_MAX_FUSED ulong 8
+const AG_MAX_REQS ulong 64
+const AG_MAX_CONDS ulong 8
+const AG_META_MAX_STEPS ulong 8
+const AG_META_MAX_OBJ ulong 2
+const AG_RX_MAX_DEPS ulong 16
+const AG_RX_MAX_FIELDS ulong 8
+
+const AG_T_NONE ulong 0
+const AG_T_U64 ulong 1
+const AG_T_BOOL ulong 2
+const AG_T_PROPOSAL ulong 3
+const AG_T_VERDICT ulong 4
+const AG_T_RECEIPT ulong 5
+
+const AG_CONST ulong 1
+const AG_PURE ulong 2
+const AG_WORLD_READ ulong 3
+const AG_WORLD_PUBLISH ulong 4
+const AG_RECALL ulong 5
+const AG_CAP_RESOLVE ulong 6
+const AG_PHYSICAL ulong 7
+const AG_SKILL ulong 8
+const AG_EFFECT_PROPOSE ulong 9
+const AG_EFFECT_PERFORM ulong 10
+const AG_VERIFY ulong 11
+const AG_BRANCH ulong 12
+const AG_JOIN ulong 13
+const AG_RETRY ulong 14
+const AG_META ulong 15
+
+const AG_EDGE_DATA ulong 0
+const AG_EDGE_ON_FAIL ulong 1
+
+const AG_DEP_GUARD ulong 1
+const AG_DEP_ORDER ulong 2
+
+const AG_PENDING ulong 0
+const AG_OK ulong 1
+const AG_FAILED ulong 2
+const AG_SKIPPED ulong 3
+
+const AG_RUN_SUCCESS long 1
+const AG_RUN_FAILURE long 2
+const AG_RUN_INCOMPLETE long 3
+
+const AG_OK_READY long 0
+const AG_E_ARG long -1
+const AG_E_FULL long -2
+const AG_E_TYPE long -3
+const AG_E_CYCLE long -4
+const AG_E_STALE long -5
+const AG_E_CONSTRAINT long -6
+const AG_E_NO_PROCEDURE long -7
+const AG_E_EFFECT_ORDER long -8
+const AG_E_DEP_BUDGET long -9
+const AG_E_JOIN long -10
+const AG_E_LOWER long -11
+
+note Pure binary OpCodes (matching src/omega_core.h)
+const AG_OP_IDENTITY ulong 0
+const AG_OP_CONSTANT ulong 1
+const AG_OP_ADD ulong 2
+const AG_OP_SUB ulong 3
+const AG_OP_MUL ulong 4
+const AG_OP_DIV ulong 5
+const AG_OP_MOD ulong 6
+const AG_OP_AND ulong 7
+const AG_OP_OR ulong 8
+const AG_OP_XOR ulong 9
+const AG_OP_SHL ulong 10
+const AG_OP_SHR ulong 11
+const AG_OP_EQ ulong 12
+const AG_OP_NE ulong 13
+const AG_OP_LT ulong 14
+const AG_OP_LE ulong 15
+const AG_OP_GT ulong 16
+const AG_OP_GE ulong 17
+
+const AG_NSTRIDE ulong 16
+
+global ag_n_nodes ulong 2
+global ag_subject ulong 2
+global ag_digest uchar 64
+global ag_nodes ulong 2048
+global ag_node_id uchar 4096
+global ag_fused_op ulong 1024
+global ag_fused_imm ulong 1024
+global ag_in_type ulong 512
+
+global ag_n_data ulong 2
+global ag_data ulong 2560
+global ag_n_deps ulong 2
+global ag_deps ulong 1024
+global ag_n_auth ulong 2
+global ag_auth ulong 384
+global ag_n_res ulong 2
+global ag_res ulong 1024
+global ag_n_succ ulong 2
+global ag_succ ulong 32
+global ag_n_fail ulong 2
+global ag_fail ulong 32
+global ag_n_ev ulong 2
+global ag_ev ulong 128
+global ag_n_eff ulong 2
+global ag_eff ulong 128
+
+note Scratch buffers for topo, requirements, hashing, reference execution
+global ag_sh_len ulong 1
+global ag_ord ulong 64
+global ag_req_ok ulong 64
+global ag_req_fail ulong 64
+global ag_req_gt ulong 64
+global ag_req_gf ulong 64
+global ag_may_skip ulong 64
+global ag_may_fail ulong 64
+global ag_rep_passes ulong 6
+global ag_ref_status ulong 64
+global ag_ref_value ulong 64
+global ag_ref_ev ulong 64
+global ag_ref_eff_cnt ulong 1
+global ag_ref_eff_chain ulong 64
+global ag_ref_pub ulong 64
+global ag_ref_outcome long 1
+global ag_obj_id ulong 16
+global ag_obj_gen ulong 16
+global ag_obj_fields ulong 128
+global ag_n_objs ulong 1
+
+text ag_tag_node "OMEGA_ACTION_NODE_V1"
+text ag_tag_graph "OMEGA_ACTION_GRAPH_V1"
+text ag_tag_mstep "OMEGA_META_STEP_RECORD_V1"
+
+fn ag_noff g ulong n ulong to ulong
+  ret mul add mul g AG_MAX_NODES n AG_NSTRIDE
+end
+
+fn ag_idoff g ulong n ulong to ulong
+  ret mul add mul g AG_MAX_NODES n 32
+end
+
+fn ag_doff g ulong e ulong to ulong
+  ret mul add mul g AG_MAX_EDGES e 5
+end
+
+fn ag_peoff g ulong e ulong to ulong
+  ret mul add mul g AG_MAX_DEPS e 4
+end
+
+fn ag_aoff g ulong i ulong to ulong
+  ret mul add mul g AG_MAX_REQS i 3
+end
+
+fn ag_roff g ulong i ulong to ulong
+  ret mul add mul g AG_MAX_REQS i 8
+end
+
+fn ag_is_boundary k ulong to ulong
+  if or eq k AG_WORLD_PUBLISH eq k AG_EFFECT_PERFORM
+    ret 1
+  end
+  ret 0
+end
+
+fn ag_reads_world k ulong to ulong
+  if or eq k AG_WORLD_READ or eq k AG_RECALL eq k AG_EFFECT_PERFORM
+    ret 1
+  end
+  ret 0
+end
+
+fn ag_has_target k ulong to ulong
+  if or ne ag_reads_world k 0 eq k AG_WORLD_PUBLISH
+    ret 1
+  end
+  ret 0
+end
+
+fn ag_sh_reset to void
+  put ag_sh_len 0 0
+end
+
+fn ag_sh_put8 v ulong to void
+  p = get ag_sh_len 0
+  put sh_dat p uchar and v 255
+  put ag_sh_len 0 add p 1
+end
+
+fn ag_sh_put32 v ulong to void
+  ag_sh_put8 shr v 24
+  ag_sh_put8 shr v 16
+  ag_sh_put8 shr v 8
+  ag_sh_put8 v
+end
+
+fn ag_sh_put64 v ulong to void
+  ag_sh_put32 shr v 32
+  ag_sh_put32 v
+end
+
+fn ag_sh_put_id g ulong n ulong to void
+  base = ag_idoff g n
+  p = get ag_sh_len 0
+  for i ulong 32
+    put sh_dat add p i get ag_node_id add base i
+  end
+  put ag_sh_len 0 add p 32
+end
+
+fn ag_sh_low64 to ulong
+  v = ulong 0
+  for i ulong 8
+    v = or shl v 8 ulong get sh_dig i
+  end
+  ret v
+end
+
+fn rx_graph_chain chain ulong run ulong val ulong to ulong
+  ag_sh_reset
+  ag_sh_put64 chain
+  ag_sh_put64 run
+  ag_sh_put64 val
+  sh_all get ag_sh_len 0
+  ret ag_sh_low64
+end
+
+fn rx_graph_evidence_word g ulong n ulong meta view ulong 4 in_v view ulong 4 to ulong
+  ag_sh_reset
+  ag_sh_put_id g n
+  ag_sh_put64 get meta 0
+  ag_sh_put32 get meta 1
+  ag_sh_put64 get meta 2
+  n_in = get meta 3
+  ag_sh_put32 n_in
+  for i ulong n_in bound 4
+    ag_sh_put64 get in_v i
+  end
+  sh_all get ag_sh_len 0
+  ret or ag_sh_low64 1
+end
+
+fn rx_graph_step_record acc ulong local_id view uchar 32 meta view ulong 3 in_v view ulong 4 to ulong
+  ag_sh_reset
+  tl = len ag_tag_mstep
+  for i ulong tl bound 32
+    ag_sh_put8 ulong get ag_tag_mstep i
+  end
+  ag_sh_put64 acc
+  for i ulong 32
+    ag_sh_put8 ulong get local_id i
+  end
+  ag_sh_put32 get meta 0
+  ag_sh_put64 get meta 1
+  n_in = get meta 2
+  ag_sh_put32 n_in
+  for i ulong n_in bound 4
+    ag_sh_put64 get in_v i
+  end
+  sh_all get ag_sh_len 0
+  ret or ag_sh_low64 1
+end
+
+note ---- building ----
+
+fn rx_graph_init g ulong subject ulong to void
+  put ag_n_nodes g 0
+  put ag_subject g subject
+  put ag_n_data g 0
+  put ag_n_deps g 0
+  put ag_n_auth g 0
+  put ag_n_res g 0
+  put ag_n_succ g 0
+  put ag_n_fail g 0
+  put ag_n_ev g 0
+  put ag_n_eff g 0
+  db = mul g 32
+  for i ulong 32
+    put ag_digest add db i uchar 0
+  end
+end
+
+fn ag_copy_nodes dst ulong src ulong to void
+  nn = get ag_n_nodes src
+  for n ulong nn bound 64
+    bo = ag_noff dst n
+    so = ag_noff src n
+    for k ulong AG_NSTRIDE
+      put ag_nodes add bo k get ag_nodes add so k
+    end
+    bo = ag_idoff dst n
+    so = ag_idoff src n
+    for k ulong 32
+      put ag_node_id add bo k get ag_node_id add so k
+    end
+  end
+  for n ulong nn bound 64
+    bo = mul add mul dst 64 n 8
+    so = mul add mul src 64 n 8
+    for k ulong 8
+      put ag_fused_op add bo k get ag_fused_op add so k
+      put ag_fused_imm add bo k get ag_fused_imm add so k
+    end
+    bo = mul add mul dst 64 n 4
+    so = mul add mul src 64 n 4
+    for k ulong 4
+      put ag_in_type add bo k get ag_in_type add so k
+    end
+  end
+end
+
+fn ag_copy_data_deps dst ulong src ulong to void
+  cnt = get ag_n_data src
+  for e ulong cnt bound 256
+    bo = ag_doff dst e
+    so = ag_doff src e
+    for k ulong 5
+      put ag_data add bo k get ag_data add so k
+    end
+  end
+  cnt = get ag_n_deps src
+  for e ulong cnt bound 128
+    bo = ag_peoff dst e
+    so = ag_peoff src e
+    for k ulong 4
+      put ag_deps add bo k get ag_deps add so k
+    end
+  end
+end
+
+fn ag_copy_auth_res dst ulong src ulong to void
+  cnt = get ag_n_auth src
+  for i ulong cnt bound 64
+    bo = ag_aoff dst i
+    so = ag_aoff src i
+    for k ulong 3
+      put ag_auth add bo k get ag_auth add so k
+    end
+  end
+  cnt = get ag_n_res src
+  for i ulong cnt bound 64
+    bo = ag_roff dst i
+    so = ag_roff src i
+    for k ulong 8
+      put ag_res add bo k get ag_res add so k
+    end
+  end
+end
+
+fn ag_copy_succ_fail dst ulong src ulong to void
+  cnt = get ag_n_succ src
+  for i ulong cnt bound 8
+    bo = add mul dst 16 mul i 2
+    so = add mul src 16 mul i 2
+    put ag_succ bo get ag_succ so
+    put ag_succ add bo 1 get ag_succ add so 1
+  end
+  cnt = get ag_n_fail src
+  for i ulong cnt bound 8
+    bo = add mul dst 16 mul i 2
+    so = add mul src 16 mul i 2
+    put ag_fail bo get ag_fail so
+    put ag_fail add bo 1 get ag_fail add so 1
+  end
+end
+
+fn ag_copy_ev_eff dst ulong src ulong to void
+  cnt = get ag_n_ev src
+  for i ulong cnt bound 64
+    put ag_ev add mul dst 64 i get ag_ev add mul src 64 i
+  end
+  cnt = get ag_n_eff src
+  for i ulong cnt bound 64
+    put ag_eff add mul dst 64 i get ag_eff add mul src 64 i
+  end
+end
+
+fn rx_graph_copy dst ulong src ulong to void
+  put ag_n_nodes dst get ag_n_nodes src
+  put ag_subject dst get ag_subject src
+  put ag_n_data dst get ag_n_data src
+  put ag_n_deps dst get ag_n_deps src
+  put ag_n_auth dst get ag_n_auth src
+  put ag_n_res dst get ag_n_res src
+  put ag_n_succ dst get ag_n_succ src
+  put ag_n_fail dst get ag_n_fail src
+  put ag_n_ev dst get ag_n_ev src
+  put ag_n_eff dst get ag_n_eff src
+  for i ulong 32
+    put ag_digest add mul dst 32 i get ag_digest add mul src 32 i
+  end
+  ag_copy_nodes dst src
+  ag_copy_data_deps dst src
+  ag_copy_auth_res dst src
+  ag_copy_succ_fail dst src
+  ag_copy_ev_eff dst src
+end
+
+fn rx_graph_node g ulong kind ulong out_t ulong to long
+  n = get ag_n_nodes g
+  if ge n AG_MAX_NODES
+    ret AG_E_FULL
+  end
+  put ag_n_nodes g add n 1
+  base = ag_noff g n
+  for k ulong AG_NSTRIDE
+    put ag_nodes add base k 0
+  end
+  put ag_nodes base kind
+  put ag_nodes add base 1 out_t
+  put ag_nodes add base 11 n
+  put ag_nodes add base 12 1
+  ret long n
+end
+
+fn rx_graph_set_node g ulong n ulong fld ulong val ulong to void
+  base = ag_noff g n
+  put ag_nodes add base fld val
+end
+
+fn rx_graph_get_node g ulong n ulong fld ulong to ulong
+  base = ag_noff g n
+  ret get ag_nodes add base fld
+end
+
+fn rx_graph_data g ulong frm ulong to_n ulong port ulong mode ulong to long
+  nn = get ag_n_nodes g
+  nd = get ag_n_data g
+  if or ge frm nn or ge to_n nn or ge port AG_MAX_IN ge nd AG_MAX_EDGES
+    ret AG_E_ARG
+  end
+  base = ag_doff g nd
+  put ag_data base frm
+  put ag_data add base 1 to_n
+  put ag_data add base 2 port
+  put ag_data add base 3 mode
+  put ag_data add base 4 rx_graph_get_node g frm 1
+  put ag_n_data g add nd 1
+  ret 0
+end
+
+fn ag_add_dep g ulong frm ulong to_n ulong kind ulong pol ulong to long
+  nn = get ag_n_nodes g
+  np = get ag_n_deps g
+  if or ge frm nn or ge to_n nn ge np AG_MAX_DEPS
+    ret AG_E_ARG
+  end
+  base = ag_peoff g np
+  put ag_deps base frm
+  put ag_deps add base 1 to_n
+  put ag_deps add base 2 kind
+  put ag_deps add base 3 pol
+  put ag_n_deps g add np 1
+  ret 0
+end
+
+fn rx_graph_guard g ulong branch ulong node ulong pol ulong to long
+  p = ulong 0
+  if ne pol 0
+    p = ulong 1
+  end
+  ret ag_add_dep g branch node AG_DEP_GUARD p
+end
+
+fn rx_graph_order g ulong before ulong after ulong to long
+  ret ag_add_dep g before after AG_DEP_ORDER 0
+end
+
+fn rx_graph_need_authority g ulong node ulong resource ulong rights ulong to long
+  if ge node get ag_n_nodes g
+    ret AG_E_ARG
+  end
+  na = get ag_n_auth g
+  for i ulong na bound 64
+    base = ag_aoff g i
+    if and eq get ag_auth base node eq get ag_auth add base 1 resource
+      put ag_auth add base 2 or get ag_auth add base 2 rights
+      ret 0
+    end
+  end
+  if ge na AG_MAX_REQS
+    ret AG_E_FULL
+  end
+  base = ag_aoff g na
+  put ag_auth base node
+  put ag_auth add base 1 resource
+  put ag_auth add base 2 rights
+  put ag_n_auth g add na 1
+  ret 0
+end
+
+fn rx_graph_need_resource g ulong node ulong need view ulong 7 to long
+  nr = get ag_n_res g
+  if or ge node get ag_n_nodes g ge nr AG_MAX_REQS
+    ret AG_E_ARG
+  end
+  base = ag_roff g nr
+  put ag_res base node
+  for k ulong 7
+    put ag_res add base add k 1 get need k
+  end
+  put ag_n_res g add nr 1
+  ret 0
+end
+
+fn rx_graph_success g ulong node ulong status ulong to long
+  ns = get ag_n_succ g
+  if ge node get ag_n_nodes g
+    ret AG_E_ARG
+  end
+  if ge ns AG_MAX_CONDS
+    ret AG_E_FULL
+  end
+  base = add mul g 16 mul ns 2
+  put ag_succ base node
+  put ag_succ add base 1 status
+  put ag_n_succ g add ns 1
+  ret 0
+end
+
+fn rx_graph_failure g ulong node ulong status ulong to long
+  nf = get ag_n_fail g
+  if ge node get ag_n_nodes g
+    ret AG_E_ARG
+  end
+  if ge nf AG_MAX_CONDS
+    ret AG_E_FULL
+  end
+  base = add mul g 16 mul nf 2
+  put ag_fail base node
+  put ag_fail add base 1 status
+  put ag_n_fail g add nf 1
+  ret 0
+end
+
+fn rx_graph_evidence g ulong node ulong to long
+  if ge node get ag_n_nodes g
+    ret AG_E_ARG
+  end
+  nev = get ag_n_ev g
+  for i ulong nev bound 64
+    if eq get ag_ev add mul g 64 i node
+      ret 0
+    end
+  end
+  if ge nev AG_MAX_NODES
+    ret AG_E_FULL
+  end
+  put ag_ev add mul g 64 nev node
+  put ag_n_ev g add nev 1
+  ret 0
+end
+
+fn ag_is_evidence g ulong n ulong to ulong
+  nev = get ag_n_ev g
+  for i ulong nev bound 64
+    if eq get ag_ev add mul g 64 i n
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ag_in_conds g ulong n ulong to ulong
+  ns = get ag_n_succ g
+  for i ulong ns bound 8
+    if eq get ag_succ add mul g 16 mul i 2 n
+      ret 1
+    end
+  end
+  nf = get ag_n_fail g
+  for i ulong nf bound 8
+    if eq get ag_fail add mul g 16 mul i 2 n
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ag_pinned g ulong n ulong to ulong
+  if ne ag_is_boundary rx_graph_get_node g n 0 0
+    ret 1
+  end
+  if ne ag_is_evidence g n 0
+    ret 1
+  end
+  if ne ag_in_conds g n 0
+    ret 1
+  end
+  ret 0
+end
+
+note ---- structure ----
+
+global ag_topo_indeg ulong 64
+global ag_topo_done ulong 64
+
+fn ag_topo_init g ulong to ulong
+  for i ulong AG_MAX_NODES
+    put ag_topo_indeg i 0
+    put ag_topo_done i 0
+  end
+  live = ulong 0
+  for i ulong get ag_n_nodes g bound 64
+    if ne rx_graph_get_node g i 12 0
+      live = add live 1
+    end
+  end
+  for e ulong get ag_n_data g bound 256
+    t = get ag_data add ag_doff g e 1
+    put ag_topo_indeg t add get ag_topo_indeg t 1
+  end
+  for e ulong get ag_n_deps g bound 128
+    t = get ag_deps add ag_peoff g e 1
+    put ag_topo_indeg t add get ag_topo_indeg t 1
+  end
+  ret live
+end
+
+fn ag_topo_relax g ulong pu ulong to void
+  for e ulong get ag_n_data g bound 256
+    base = ag_doff g e
+    if eq get ag_data base pu
+      t = get ag_data add base 1
+      put ag_topo_indeg t sub get ag_topo_indeg t 1
+    end
+  end
+  for e ulong get ag_n_deps g bound 128
+    base = ag_peoff g e
+    if eq get ag_deps base pu
+      t = get ag_deps add base 1
+      put ag_topo_indeg t sub get ag_topo_indeg t 1
+    end
+  end
+end
+
+fn rx_graph_topo g ulong to long
+  live = ag_topo_init g
+  nn = get ag_n_nodes g
+  k = ulong 0
+  while lt k live bound 64
+    pick = long -1
+    for i ulong nn bound 64
+      if eq pick -1
+        if ne rx_graph_get_node g i 12 0
+          if eq get ag_topo_done i 0
+            if eq get ag_topo_indeg i 0
+              pick = long i
+            end
+          end
+        end
+      end
+    end
+    if lt pick 0
+      ret AG_E_CYCLE
+    end
+    pu = ulong pick
+    put ag_topo_done pu 1
+    put ag_ord k pu
+    k = add k 1
+    ag_topo_relax g pu
+  end
+  ret long k
+end
+
+fn rx_graph_ancestors g ulong node ulong to ulong
+  anc = ulong 0
+  front = shl ulong 1 node
+  nd = get ag_n_data g
+  np = get ag_n_deps g
+  while ne front 0 bound 64
+    nxt = ulong 0
+    for e ulong nd bound 256
+      base = ag_doff g e
+      t = get ag_data add base 1
+      if ne and front shl ulong 1 t 0
+        nxt = or nxt shl ulong 1 get ag_data base
+      end
+    end
+    for e ulong np bound 128
+      base = ag_peoff g e
+      t = get ag_deps add base 1
+      if ne and front shl ulong 1 t 0
+        nxt = or nxt shl ulong 1 get ag_deps base
+      end
+    end
+    nxt = and nxt xor anc ulong 0xffffffffffffffff
+    anc = or anc nxt
+    front = nxt
+  end
+  ret anc
+end
+
+fn ag_n_inputs g ulong n ulong to ulong
+  nd = get ag_n_data g
+  k = ulong 0
+  for e ulong nd bound 256
+    if eq get ag_data add ag_doff g e 1 n
+      k = add k 1
+    end
+  end
+  ret k
+end
+
+fn ag_inputs_by_port g ulong n ulong dst edit ulong 4 to ulong
+  nd = get ag_n_data g
+  k = ulong 0
+  for p ulong AG_MAX_IN
+    for e ulong nd bound 256
+      base = ag_doff g e
+      if eq get ag_data add base 1 n
+        if eq get ag_data add base 2 p
+          if lt k AG_MAX_IN
+            put dst k e
+            k = add k 1
+          end
+        end
+      end
+    end
+  end
+  ret k
+end
+
+fn ag_dep_of g ulong n ulong kind ulong to long
+  np = get ag_n_deps g
+  for e ulong np bound 128
+    base = ag_peoff g e
+    if and eq get ag_deps add base 1 n eq get ag_deps add base 2 kind
+      ret long e
+    end
+  end
+  ret -1
+end
+
+fn ag_type_ok_special g ulong n ulong k ulong el view ulong 4 to ulong
+  kind = rx_graph_get_node g n 0
+  ot = rx_graph_get_node g n 1
+  if eq kind AG_EFFECT_PERFORM
+    if ne k 2
+      ret 0
+    end
+    b0 = ag_doff g get el 0
+    if ne get ag_data add b0 4 AG_T_PROPOSAL
+      ret 0
+    end
+    if ne get ag_data add b0 3 AG_EDGE_DATA
+      ret 0
+    end
+    b0 = ag_doff g get el 1
+    if ne get ag_data add b0 4 AG_T_VERDICT
+      ret 0
+    end
+    if ne get ag_data add b0 3 AG_EDGE_DATA
+      ret 0
+    end
+    if ne ot AG_T_RECEIPT
+      ret 0
+    end
+    ret 1
+  end
+  if eq kind AG_JOIN
+    if lt k 2
+      ret 0
+    end
+    for i ulong k bound 4
+      b0 = ag_doff g get el i
+      if ne get ag_data add b0 4 ot
+        ret 0
+      end
+      if ne get ag_data add b0 3 AG_EDGE_DATA
+        ret 0
+      end
+    end
+    ret 1
+  end
+  if eq kind AG_META
+    if gt rx_graph_get_node g n 13 AG_META_MAX_OBJ
+      ret 0
+    end
+    b0 = mul add mul g 64 n 4
+    for i ulong k bound 4
+      it = get ag_in_type add b0 i
+      if eq it AG_T_NONE
+        ret 0
+      end
+      if ne get ag_data add ag_doff g get el i 4 it
+        ret 0
+      end
+    end
+    if ne ot AG_T_NONE
+      ret 1
+    end
+    ret 0
+  end
+  ret 0
+end
+
+fn ag_type_ok g ulong n ulong to ulong
+  el = new ulong 4 0
+  k = ag_inputs_by_port g n el
+  if ne k ag_n_inputs g n
+    ret 0
+  end
+  for i ulong k bound 4
+    if ne get ag_data add ag_doff g get el i 2 i
+      ret 0
+    end
+  end
+  kind = rx_graph_get_node g n 0
+  if or eq kind AG_EFFECT_PERFORM or eq kind AG_JOIN eq kind AG_META
+    ret ag_type_ok_special g n k el
+  end
+  num_in = ulong 1
+  for i ulong k bound 4
+    base = ag_doff g get el i
+    if ne get ag_data add base 3 AG_EDGE_ON_FAIL
+      tp = get ag_data add base 4
+      if and ne tp AG_T_U64 ne tp AG_T_BOOL
+        num_in = ulong 0
+      end
+    end
+  end
+  ot = rx_graph_get_node g n 1
+  num_out = ulong 0
+  if or eq ot AG_T_U64 eq ot AG_T_BOOL
+    num_out = ulong 1
+  end
+  if or eq kind AG_CONST or eq kind AG_CAP_RESOLVE eq kind AG_WORLD_READ
+    if and eq k 0 ne num_out 0
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind AG_RECALL
+    if and le k 1 and ne num_in 0 eq ot AG_T_U64
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind AG_PURE
+    if and ge k 1 and le k 2 and ne num_in 0 ne num_out 0
+      ret 1
+    end
+    ret 0
+  end
+  if or eq kind AG_PHYSICAL or eq kind AG_SKILL eq kind AG_RETRY
+    if and ge k 1 and ne num_in 0 eq ot AG_T_U64
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind AG_WORLD_PUBLISH
+    if and eq k 1 and ne num_in 0 eq ot AG_T_RECEIPT
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind AG_EFFECT_PROPOSE
+    if and eq k 1 and ne num_in 0 eq ot AG_T_PROPOSAL
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind AG_VERIFY
+    if and eq k 1 and ne num_in 0 eq ot AG_T_VERDICT
+      ret 1
+    end
+    ret 0
+  end
+  if eq kind AG_BRANCH
+    if and eq k 1 and ne num_in 0 eq ot AG_T_BOOL
+      ret 1
+    end
+    ret 0
+  end
+  ret 0
+end
+
+fn ag_popcount64 x ulong to ulong
+  v = x
+  c = ulong 0
+  for i ulong 64
+    c = add c and v 1
+    v = shr v 1
+  end
+  ret c
+end
+
+fn ag_dep_budget g ulong n ulong to ulong
+  srcs = ulong 0
+  nd = get ag_n_data g
+  for e ulong nd bound 256
+    base = ag_doff g e
+    if eq get ag_data add base 1 n
+      srcs = or srcs shl ulong 1 get ag_data base
+    end
+  end
+  np = get ag_n_deps g
+  for e ulong np bound 128
+    base = ag_peoff g e
+    if eq get ag_deps add base 1 n
+      srcs = or srcs shl ulong 1 get ag_deps base
+    end
+  end
+  k = add ag_popcount64 srcs 2
+  kind = rx_graph_get_node g n 0
+  if eq kind AG_META
+    nm = rx_graph_get_node g n 13
+    k = add k nm
+    if ne nm 0
+      k = add k 1
+    end
+    ret k
+  end
+  if ne ag_reads_world kind 0
+    k = add k 1
+  end
+  if ne ag_has_target kind 0
+    k = add k 1
+  end
+  ret k
+end
+
+fn ag_req_one_join g ulong n ulong to void
+  first = ulong 1
+  nd = get ag_n_data g
+  for e ulong nd bound 256
+    base = ag_doff g e
+    if eq get ag_data add base 1 n
+      s = get ag_data base
+      if ne first 0
+        v = or get ag_req_ok s shl ulong 1 s
+        put ag_req_ok n v
+        put ag_req_fail n get ag_req_fail s
+        put ag_req_gt n get ag_req_gt s
+        put ag_req_gf n get ag_req_gf s
+        first = ulong 0
+      else
+        v = or get ag_req_ok s shl ulong 1 s
+        put ag_req_ok n and get ag_req_ok n v
+        put ag_req_fail n and get ag_req_fail n get ag_req_fail s
+        put ag_req_gt n and get ag_req_gt n get ag_req_gt s
+        put ag_req_gf n and get ag_req_gf n get ag_req_gf s
+      end
+    end
+  end
+end
+
+fn ag_req_one_data g ulong n ulong to void
+  nd = get ag_n_data g
+  for e ulong nd bound 256
+    base = ag_doff g e
+    if eq get ag_data add base 1 n
+      s = get ag_data base
+      if eq get ag_data add base 3 AG_EDGE_ON_FAIL
+        put ag_req_fail n or get ag_req_fail n shl ulong 1 s
+      else
+        v = or get ag_req_ok s shl ulong 1 s
+        put ag_req_ok n or get ag_req_ok n v
+        put ag_req_fail n or get ag_req_fail n get ag_req_fail s
+        put ag_req_gt n or get ag_req_gt n get ag_req_gt s
+        put ag_req_gf n or get ag_req_gf n get ag_req_gf s
+      end
+    end
+  end
+end
+
+fn ag_req_one_guard g ulong n ulong to void
+  np = get ag_n_deps g
+  for e ulong np bound 128
+    base = ag_peoff g e
+    if eq get ag_deps add base 1 n
+      if eq get ag_deps add base 2 AG_DEP_GUARD
+        b = get ag_deps base
+        v = or get ag_req_ok b shl ulong 1 b
+        put ag_req_ok n or get ag_req_ok n v
+        put ag_req_fail n or get ag_req_fail n get ag_req_fail b
+        put ag_req_gt n or get ag_req_gt n get ag_req_gt b
+        put ag_req_gf n or get ag_req_gf n get ag_req_gf b
+        if ne get ag_deps add base 3 0
+          put ag_req_gt n or get ag_req_gt n shl ulong 1 b
+        else
+          put ag_req_gf n or get ag_req_gf n shl ulong 1 b
+        end
+      end
+    end
+  end
+end
+
+fn ag_requirements g ulong cnt ulong to void
+  for i ulong AG_MAX_NODES
+    put ag_req_ok i 0
+    put ag_req_fail i 0
+    put ag_req_gt i 0
+    put ag_req_gf i 0
+  end
+  for t ulong cnt bound 64
+    n = get ag_ord t
+    if eq rx_graph_get_node g n 0 AG_JOIN
+      ag_req_one_join g n
+    else
+      ag_req_one_data g n
+    end
+    ag_req_one_guard g n
+  end
+end
+
+fn ag_id_cmp g ulong a ulong b ulong to long
+  oa = ag_idoff g a
+  ob = ag_idoff g b
+  for i ulong 32
+    va = get ag_node_id add oa i
+    vb = get ag_node_id add ob i
+    if lt va vb
+      ret -1
+    end
+    if gt va vb
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ag_ident_node_edges g ulong n ulong to void
+  el = new ulong 4 0
+  k = ag_inputs_by_port g n el
+  ag_sh_put32 k
+  for i ulong k bound 4
+    base = ag_doff g get el i
+    ag_sh_put8 get ag_data add base 3
+    ag_sh_put_id g get ag_data base
+  end
+  dl = new ulong 16 0
+  ndl = ulong 0
+  np = get ag_n_deps g
+  for j ulong np bound 128
+    if eq get ag_deps add ag_peoff g j 1 n
+      if lt ndl 16
+        put dl ndl j
+        ndl = add ndl 1
+      end
+    end
+  end
+  ag_sh_put32 ndl
+  for j ulong ndl bound 16
+    base = ag_peoff g get dl j
+    ag_sh_put8 get ag_deps add base 2
+    ag_sh_put8 get ag_deps add base 3
+    ag_sh_put_id g get ag_deps base
+  end
+end
+
+fn ag_ident_one_node g ulong n ulong to void
+  ag_sh_reset
+  for i ulong len ag_tag_node bound 32
+    ag_sh_put8 ulong get ag_tag_node i
+  end
+  kind = rx_graph_get_node g n 0
+  ag_sh_put32 kind
+  ag_sh_put32 rx_graph_get_node g n 1
+  ag_sh_put32 rx_graph_get_node g n 2
+  ag_sh_put64 rx_graph_get_node g n 3
+  ag_sh_put64 rx_graph_get_node g n 4
+  ag_sh_put32 rx_graph_get_node g n 5
+  if ne ag_has_target kind 0
+    ag_sh_put32 rx_graph_get_node g n 6
+    ag_sh_put32 rx_graph_get_node g n 7
+  else
+    ag_sh_put32 0
+    ag_sh_put32 0
+  end
+  ag_sh_put32 rx_graph_get_node g n 8
+  ag_sh_put32 rx_graph_get_node g n 9
+  nf = rx_graph_get_node g n 10
+  ag_sh_put32 nf
+  fb = mul add mul g 64 n 8
+  for i ulong nf bound 8
+    ag_sh_put32 get ag_fused_op add fb i
+    ag_sh_put64 get ag_fused_imm add fb i
+  end
+  ag_ident_node_edges g n
+  if ne ag_is_boundary kind 0
+    pos = ulong 0
+    anc = rx_graph_ancestors g n
+    for p ulong get ag_n_nodes g bound 64
+      if ne and anc shl ulong 1 p 0
+        if ne rx_graph_get_node g p 12 0
+          if ne ag_is_boundary rx_graph_get_node g p 0 0
+            pos = add pos 1
+          end
+        end
+      end
+    end
+    ag_sh_put32 pos
+  end
+  sh_all get ag_sh_len 0
+  io = ag_idoff g n
+  for i ulong 32
+    put ag_node_id add io i get sh_dig i
+  end
+end
+
+fn rx_graph_identify g ulong to void
+  cnt_l = rx_graph_topo g
+  if lt cnt_l 0
+    ret
+  end
+  cnt = ulong cnt_l
+  for t ulong cnt bound 64
+    ag_ident_one_node g get ag_ord t
+  end
+  ag_sh_reset
+  for i ulong len ag_tag_graph bound 32
+    ag_sh_put8 ulong get ag_tag_graph i
+  end
+  ag_sh_put32 get ag_subject g
+  ag_sh_put32 cnt
+  for t ulong cnt bound 64
+    ag_sh_put_id g get ag_ord t
+  end
+  sh_all get ag_sh_len 0
+  db = mul g 32
+  for i ulong 32
+    put ag_digest add db i get sh_dig i
+  end
+end
+
+fn ag_val_nodes g ulong to long
+  nn = get ag_n_nodes g
+  np = get ag_n_deps g
+  for n ulong nn bound 64
+    if ne rx_graph_get_node g n 12 0
+      if eq ag_type_ok g n 0
+        ret AG_E_TYPE
+      end
+      guards = ulong 0
+      for e ulong np bound 128
+        base = ag_peoff g e
+        if eq get ag_deps add base 1 n
+          if eq get ag_deps add base 2 AG_DEP_GUARD
+            guards = add guards 1
+            if ne rx_graph_get_node g get ag_deps base 1 AG_T_BOOL
+              ret AG_E_TYPE
+            end
+          end
+        end
+      end
+      if gt guards 1
+        ret AG_E_DEP_BUDGET
+      end
+      if gt ag_dep_budget g n AG_RX_MAX_DEPS
+        ret AG_E_DEP_BUDGET
+      end
+    end
+  end
+  ret 0
+end
+
+fn ag_arms_exclusive si ulong sj ulong to ulong
+  if ne and get ag_req_gt si get ag_req_gf sj 0
+    ret 1
+  end
+  if ne and get ag_req_gf si get ag_req_gt sj 0
+    ret 1
+  end
+  aok = or get ag_req_ok si shl ulong 1 si
+  if ne and aok get ag_req_fail sj 0
+    ret 1
+  end
+  bok = or get ag_req_ok sj shl ulong 1 sj
+  if ne and get ag_req_fail si bok 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ag_val_joins g ulong to long
+  el = new ulong 4 0
+  for n ulong get ag_n_nodes g bound 64
+    if ne rx_graph_get_node g n 12 0
+      if eq rx_graph_get_node g n 0 AG_JOIN
+        k = ag_inputs_by_port g n el
+        for i ulong k bound 4
+          for j ulong k bound 4
+            if gt j i
+              si = get ag_data ag_doff g get el i
+              sj = get ag_data ag_doff g get el j
+              if eq ag_arms_exclusive si sj 0
+                ret AG_E_JOIN
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn rx_graph_validate g ulong to long
+  cnt_l = rx_graph_topo g
+  if lt cnt_l 0
+    ret cnt_l
+  end
+  cnt = ulong cnt_l
+  for e ulong get ag_n_data g bound 256
+    base = ag_doff g e
+    f = get ag_data base
+    t = get ag_data add base 1
+    if or eq rx_graph_get_node g f 12 0 eq rx_graph_get_node g t 12 0
+      ret AG_E_ARG
+    end
+    put ag_data add base 4 rx_graph_get_node g f 1
+  end
+  rc = ag_val_nodes g
+  if ne rc 0
+    ret rc
+  end
+  for n ulong get ag_n_nodes g bound 64
+    if ne rx_graph_get_node g n 12 0
+      k = rx_graph_get_node g n 0
+      if or eq k AG_VERIFY or ne ag_is_boundary k 0 eq k AG_META
+        ign = rx_graph_evidence g n
+      end
+    end
+  end
+  put ag_n_eff g 0
+  for t ulong cnt bound 64
+    n = get ag_ord t
+    if ne ag_is_boundary rx_graph_get_node g n 0 0
+      neff = get ag_n_eff g
+      put ag_eff add mul g 64 neff n
+      put ag_n_eff g add neff 1
+    end
+  end
+  neff = get ag_n_eff g
+  if gt neff 1
+    for i ulong sub neff 1 bound 64
+      cur = get ag_eff add mul g 64 add i 1
+      prv = get ag_eff add mul g 64 i
+      if eq and rx_graph_ancestors g cur shl ulong 1 prv 0
+        ret AG_E_EFFECT_ORDER
+      end
+    end
+  end
+  ag_requirements g cnt
+  rc = ag_val_joins g
+  if ne rc 0
+    ret rc
+  end
+  rx_graph_identify g
+  ret 0
+end
+
+note ---- pure op evaluation ----
+
+fn ag_pure_op op ulong a ulong b ulong dst edit ulong 1 to long
+  if eq op AG_OP_IDENTITY
+    put dst 0 a
+    ret 0
+  end
+  if eq op AG_OP_CONSTANT
+    put dst 0 b
+    ret 0
+  end
+  if eq op AG_OP_ADD
+    put dst 0 add a b
+    ret 0
+  end
+  if eq op AG_OP_SUB
+    put dst 0 sub a b
+    ret 0
+  end
+  if eq op AG_OP_MUL
+    put dst 0 mul a b
+    ret 0
+  end
+  if eq op AG_OP_DIV
+    if eq b 0
+      ret -1
+    end
+    put dst 0 div a b
+    ret 0
+  end
+  if eq op AG_OP_MOD
+    if eq b 0
+      ret -1
+    end
+    put dst 0 rem a b
+    ret 0
+  end
+  if eq op AG_OP_AND
+    put dst 0 and a b
+    ret 0
+  end
+  if eq op AG_OP_OR
+    put dst 0 or a b
+    ret 0
+  end
+  if eq op AG_OP_XOR
+    put dst 0 xor a b
+    ret 0
+  end
+  if eq op AG_OP_SHL
+    put dst 0 shl a and b 63
+    ret 0
+  end
+  if eq op AG_OP_SHR
+    put dst 0 shr a and b 63
+    ret 0
+  end
+  if eq op AG_OP_EQ
+    if eq a b
+      put dst 0 1
+    else
+      put dst 0 0
+    end
+    ret 0
+  end
+  if eq op AG_OP_NE
+    if ne a b
+      put dst 0 1
+    else
+      put dst 0 0
+    end
+    ret 0
+  end
+  if eq op AG_OP_LT
+    if lt a b
+      put dst 0 1
+    else
+      put dst 0 0
+    end
+    ret 0
+  end
+  if eq op AG_OP_LE
+    if le a b
+      put dst 0 1
+    else
+      put dst 0 0
+    end
+    ret 0
+  end
+  if eq op AG_OP_GT
+    if gt a b
+      put dst 0 1
+    else
+      put dst 0 0
+    end
+    ret 0
+  end
+  if eq op AG_OP_GE
+    if ge a b
+      put dst 0 1
+    else
+      put dst 0 0
+    end
+    ret 0
+  end
+  ret -1
+end
+
+note ---- costs, optimization, preservation ----
+
+global ag_cost_fin ulong 64
+
+fn ag_node_start g ulong n ulong to ulong
+  st = ulong 0
+  for e ulong get ag_n_data g bound 256
+    base = ag_doff g e
+    if eq get ag_data add base 1 n
+      fv = get ag_cost_fin get ag_data base
+      if gt fv st
+        st = fv
+      end
+    end
+  end
+  for e ulong get ag_n_deps g bound 128
+    base = ag_peoff g e
+    if eq get ag_deps add base 1 n
+      fv = get ag_cost_fin get ag_deps base
+      if gt fv st
+        st = fv
+      end
+    end
+  end
+  ret st
+end
+
+fn rx_graph_costs g ulong dst edit ulong 2 to void
+  cnt_l = rx_graph_topo g
+  if lt cnt_l 0
+    put dst 0 0
+    put dst 1 0
+    ret
+  end
+  for i ulong AG_MAX_NODES
+    put ag_cost_fin i 0
+  end
+  best = ulong 0
+  total = ulong 0
+  for t ulong ulong cnt_l bound 64
+    n = get ag_ord t
+    c = rx_graph_get_node g n 9
+    fnv = add ag_node_start g n c
+    put ag_cost_fin n fnv
+    total = add total c
+    if gt fnv best
+      best = fnv
+    end
+  end
+  put dst 0 best
+  put dst 1 total
+end
+
+fn ag_redirect g ulong frm ulong to_n ulong to void
+  nd = get ag_n_data g
+  for e ulong nd bound 256
+    base = ag_doff g e
+    if eq get ag_data base frm
+      put ag_data base to_n
+    end
+  end
+  np = get ag_n_deps g
+  for e ulong np bound 128
+    base = ag_peoff g e
+    if eq get ag_deps base frm
+      put ag_deps base to_n
+    end
+  end
+end
+
+fn ag_drop_edges_to g ulong n ulong to void
+  nd = get ag_n_data g
+  k = ulong 0
+  for e ulong nd bound 256
+    so = ag_doff g e
+    if ne get ag_data add so 1 n
+      bo = ag_doff g k
+      for j ulong 5
+        put ag_data add bo j get ag_data add so j
+      end
+      k = add k 1
+    end
+  end
+  put ag_n_data g k
+end
+
+fn ag_drop_edges_of g ulong n ulong to void
+  nd = get ag_n_data g
+  k = ulong 0
+  for e ulong nd bound 256
+    so = ag_doff g e
+    if and ne get ag_data so n ne get ag_data add so 1 n
+      bo = ag_doff g k
+      for j ulong 5
+        put ag_data add bo j get ag_data add so j
+      end
+      k = add k 1
+    end
+  end
+  put ag_n_data g k
+  np = get ag_n_deps g
+  k = ulong 0
+  for e ulong np bound 128
+    so = ag_peoff g e
+    if and ne get ag_deps so n ne get ag_deps add so 1 n
+      bo = ag_peoff g k
+      for j ulong 4
+        put ag_deps add bo j get ag_deps add so j
+      end
+      k = add k 1
+    end
+  end
+  put ag_n_deps g k
+end
+
+fn ag_consumers g ulong n ulong to ulong
+  k = ulong 0
+  nd = get ag_n_data g
+  for e ulong nd bound 256
+    if eq get ag_data ag_doff g e n
+      k = add k 1
+    end
+  end
+  np = get ag_n_deps g
+  for e ulong np bound 128
+    if eq get ag_deps ag_peoff g e n
+      k = add k 1
+    end
+  end
+  ret k
+end
+
+fn ag_compact_remap_edges g ulong mp view long 64 to void
+  j = ulong 0
+  for e ulong get ag_n_data g bound 256
+    so = ag_doff g e
+    mf = get mp get ag_data so
+    mt = get mp get ag_data add so 1
+    if and ge mf 0 ge mt 0
+      bo = ag_doff g j
+      put ag_data bo ulong mf
+      put ag_data add bo 1 ulong mt
+      put ag_data add bo 2 get ag_data add so 2
+      put ag_data add bo 3 get ag_data add so 3
+      put ag_data add bo 4 get ag_data add so 4
+      j = add j 1
+    end
+  end
+  put ag_n_data g j
+  j = ulong 0
+  for e ulong get ag_n_deps g bound 128
+    so = ag_peoff g e
+    mf = get mp get ag_deps so
+    mt = get mp get ag_deps add so 1
+    if and ge mf 0 ge mt 0
+      bo = ag_peoff g j
+      put ag_deps bo ulong mf
+      put ag_deps add bo 1 ulong mt
+      put ag_deps add bo 2 get ag_deps add so 2
+      put ag_deps add bo 3 get ag_deps add so 3
+      j = add j 1
+    end
+  end
+  put ag_n_deps g j
+end
+
+fn ag_compact_remap_conds g ulong mp view long 64 to void
+  j = ulong 0
+  for i ulong get ag_n_succ g bound 8
+    so = add mul g 16 mul i 2
+    mn = get mp get ag_succ so
+    if ge mn 0
+      bo = add mul g 16 mul j 2
+      put ag_succ bo ulong mn
+      put ag_succ add bo 1 get ag_succ add so 1
+      j = add j 1
+    end
+  end
+  put ag_n_succ g j
+  j = ulong 0
+  for i ulong get ag_n_fail g bound 8
+    so = add mul g 16 mul i 2
+    mn = get mp get ag_fail so
+    if ge mn 0
+      bo = add mul g 16 mul j 2
+      put ag_fail bo ulong mn
+      put ag_fail add bo 1 get ag_fail add so 1
+      j = add j 1
+    end
+  end
+  put ag_n_fail g j
+  j = ulong 0
+  for i ulong get ag_n_ev g bound 64
+    mn = get mp get ag_ev add mul g 64 i
+    if ge mn 0
+      put ag_ev add mul g 64 j ulong mn
+      j = add j 1
+    end
+  end
+  put ag_n_ev g j
+  j = ulong 0
+  for i ulong get ag_n_eff g bound 64
+    mn = get mp get ag_eff add mul g 64 i
+    if ge mn 0
+      put ag_eff add mul g 64 j ulong mn
+      j = add j 1
+    end
+  end
+  put ag_n_eff g j
+end
+
+fn ag_move_node g ulong dst_n ulong src_n ulong to void
+  bo = ag_noff g dst_n
+  so = ag_noff g src_n
+  for j ulong AG_NSTRIDE
+    put ag_nodes add bo j get ag_nodes add so j
+  end
+  bo = ag_idoff g dst_n
+  so = ag_idoff g src_n
+  for j ulong 32
+    put ag_node_id add bo j get ag_node_id add so j
+  end
+  bo = mul add mul g 64 dst_n 8
+  so = mul add mul g 64 src_n 8
+  for j ulong 8
+    put ag_fused_op add bo j get ag_fused_op add so j
+    put ag_fused_imm add bo j get ag_fused_imm add so j
+  end
+end
+
+fn ag_compact g ulong to void
+  mp = new long 64 -1
+  k = ulong 0
+  for n ulong get ag_n_nodes g bound 64
+    if ne rx_graph_get_node g n 12 0
+      put mp n long k
+      if ne k n
+        ag_move_node g k n
+      end
+      k = add k 1
+    end
+  end
+  put ag_n_nodes g k
+  ag_compact_remap_edges g mp
+  ag_compact_remap_conds g mp
+end
+
+fn ag_eval_pure_chain g ulong n ulong a ulong b ulong dst edit ulong 1 to long
+  rc = ag_pure_op rx_graph_get_node g n 2 a b dst
+  if ne rc 0
+    ret -1
+  end
+  nf = rx_graph_get_node g n 10
+  fb = mul add mul g 64 n 8
+  for i ulong nf bound 8
+    fop = get ag_fused_op add fb i
+    fimm = get ag_fused_imm add fb i
+    rc = ag_pure_op fop get dst 0 fimm dst
+    if ne rc 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn ag_opt_const_fold_one g ulong n ulong to ulong
+  if or ne rx_graph_get_node g n 0 AG_PURE ne ag_pinned g n 0
+    ret 0
+  end
+  el = new ulong 4 0
+  k = ag_inputs_by_port g n el
+  if eq k 0
+    ret 0
+  end
+  v0 = ulong 0
+  v1 = rx_graph_get_node g n 3
+  for i ulong k bound 4
+    base = ag_doff g get el i
+    s = get ag_data base
+    if ne rx_graph_get_node g s 0 AG_CONST
+      ret 0
+    end
+    if ne get ag_data add base 3 AG_EDGE_DATA
+      ret 0
+    end
+    if ge ag_dep_of g s AG_DEP_GUARD 0
+      ret 0
+    end
+    if eq i 0
+      v0 = rx_graph_get_node g s 3
+    end
+    if eq i 1
+      v1 = rx_graph_get_node g s 3
+    end
+  end
+  out_v = new ulong 1 0
+  if ne ag_eval_pure_chain g n v0 v1 out_v 0
+    ret 0
+  end
+  rx_graph_set_node g n 0 AG_CONST
+  rx_graph_set_node g n 3 get out_v 0
+  rx_graph_set_node g n 2 0
+  rx_graph_set_node g n 10 0
+  ag_drop_edges_to g n
+  put ag_rep_passes 0 add get ag_rep_passes 0 1
+  ret 1
+end
+
+fn ag_opt_const_fold g ulong to ulong
+  cnt_l = rx_graph_topo g
+  if lt cnt_l 0
+    ret 0
+  end
+  folded = ulong 0
+  for t ulong ulong cnt_l bound 64
+    folded = add folded ag_opt_const_fold_one g get ag_ord t
+  end
+  ret folded
+end
+
+fn ag_opt_cse_one g ulong t ulong to ulong
+  n = get ag_ord t
+  if eq rx_graph_get_node g n 12 0
+    ret 0
+  end
+  if ne ag_pinned g n 0
+    ret 0
+  end
+  k = rx_graph_get_node g n 0
+  if or eq k AG_BRANCH eq k AG_JOIN
+    ret 0
+  end
+  for u ulong t bound 64
+    m = get ag_ord u
+    if ne rx_graph_get_node g m 12 0
+      if eq ag_pinned g m 0
+        if eq ag_id_cmp g m n 0
+          ag_redirect g n m
+          ag_drop_edges_of g n
+          rx_graph_set_node g n 12 0
+          if or eq k AG_WORLD_READ eq k AG_RECALL
+            put ag_rep_passes 2 add get ag_rep_passes 2 1
+          else
+            put ag_rep_passes 1 add get ag_rep_passes 1 1
+          end
+          rx_graph_identify g
+          ret 1
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn ag_opt_cse g ulong to ulong
+  rx_graph_identify g
+  cnt_l = rx_graph_topo g
+  if lt cnt_l 0
+    ret 0
+  end
+  done_c = ulong 0
+  for t ulong ulong cnt_l bound 64
+    done_c = add done_c ag_opt_cse_one g t
+  end
+  ret done_c
+end
+
+fn ag_has_ctl_dep g ulong c ulong to ulong
+  for d ulong get ag_n_deps g bound 128
+    if eq get ag_deps add ag_peoff g d 1 c
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn ag_do_fuse g ulong p ulong c ulong op ulong to ulong
+  nfp = rx_graph_get_node g p 10
+  nfc = rx_graph_get_node g c 10
+  if gt add add nfp 1 nfc AG_MAX_FUSED
+    ret 0
+  end
+  fbp = mul add mul g 64 p 8
+  fbc = mul add mul g 64 c 8
+  put ag_fused_op add fbp nfp op
+  put ag_fused_imm add fbp nfp rx_graph_get_node g c 3
+  nfp = add nfp 1
+  for i ulong nfc bound 8
+    put ag_fused_op add fbp nfp get ag_fused_op add fbc i
+    put ag_fused_imm add fbp nfp get ag_fused_imm add fbc i
+    nfp = add nfp 1
+  end
+  rx_graph_set_node g p 10 nfp
+  rx_graph_set_node g p 1 rx_graph_get_node g c 1
+  rx_graph_set_node g p 9 add rx_graph_get_node g p 9 rx_graph_get_node g c 9
+  ag_drop_edges_to g c
+  ag_redirect g c p
+  rx_graph_set_node g c 12 0
+  put ag_rep_passes 3 add get ag_rep_passes 3 1
+  ret 1
+end
+
+fn ag_opt_fuse_one g ulong c ulong to ulong
+  if ne rx_graph_get_node g c 0 AG_PURE
+    ret 0
+  end
+  if ne ag_pinned g c 0
+    ret 0
+  end
+  op = rx_graph_get_node g c 2
+  if or eq op AG_OP_IDENTITY eq op AG_OP_CONSTANT
+    ret 0
+  end
+  el = new ulong 4 0
+  if ne ag_inputs_by_port g c el 1
+    ret 0
+  end
+  base = ag_doff g get el 0
+  if ne get ag_data add base 3 AG_EDGE_DATA
+    ret 0
+  end
+  if ne ag_has_ctl_dep g c 0
+    ret 0
+  end
+  p = get ag_data base
+  if ne rx_graph_get_node g p 0 AG_PURE
+    ret 0
+  end
+  if ne ag_pinned g p 0
+    ret 0
+  end
+  if ne ag_consumers g p 1
+    ret 0
+  end
+  ret ag_do_fuse g p c op
+end
+
+fn ag_opt_fuse_pure g ulong to ulong
+  cnt_l = rx_graph_topo g
+  if lt cnt_l 0
+    ret 0
+  end
+  for t ulong ulong cnt_l bound 64
+    if ne ag_opt_fuse_one g get ag_ord t 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn rx_graph_optimize g ulong to long
+  for i ulong 6
+    put ag_rep_passes i 0
+  end
+  for round ulong 16
+    ch = ulong 0
+    ch = add ch ag_opt_const_fold g
+    ch = add ch ag_opt_cse g
+    ch = add ch ag_opt_fuse_pure g
+    if eq ch 0
+      break
+    end
+  end
+  keep = ulong 0
+  nn = get ag_n_nodes g
+  for n ulong nn bound 64
+    if and ne rx_graph_get_node g n 12 0 ne ag_pinned g n 0
+      keep = or keep or shl ulong 1 n rx_graph_ancestors g n
+    end
+  end
+  for n ulong nn bound 64
+    if and ne rx_graph_get_node g n 12 0 eq and keep shl ulong 1 n 0
+      ag_drop_edges_of g n
+      rx_graph_set_node g n 12 0
+      put ag_rep_passes 4 add get ag_rep_passes 4 1
+    end
+  end
+  ag_compact g
+  ret 0
+end
+
+fn rx_graph_check_preserved b_g ulong a_g ulong to long
+  wh = new long 64 -1
+  na = get ag_n_nodes a_g
+  for n ulong na bound 64
+    put wh rx_graph_get_node a_g n 11 long n
+  end
+  if ne get ag_n_eff b_g get ag_n_eff a_g
+    ret -1
+  end
+  neff = get ag_n_eff b_g
+  for i ulong neff bound 64
+    bn = get ag_eff add mul b_g 64 i
+    an = get ag_eff add mul a_g 64 i
+    if ne rx_graph_get_node a_g an 11 rx_graph_get_node b_g bn 11
+      ret -2
+    end
+    if ne rx_graph_get_node a_g an 0 rx_graph_get_node b_g bn 0
+      ret -2
+    end
+  end
+  nev = get ag_n_ev b_g
+  for i ulong nev bound 64
+    bn = get ag_ev add mul b_g 64 i
+    mn = get wh rx_graph_get_node b_g bn 11
+    if lt mn 0
+      ret -3
+    end
+  end
+  if ne get ag_n_succ b_g get ag_n_succ a_g
+    ret -4
+  end
+  if ne get ag_n_fail b_g get ag_n_fail a_g
+    ret -4
+  end
+  ret 0
+end
+
+note ---- standalone reference execution (against object contents) ----
+
+fn ag_obj_reset to void
+  put ag_n_objs 0 0
+end
+
+fn ag_obj_set id ulong gen ulong fields view ulong 8 to void
+  idx = get ag_n_objs 0
+  if ge idx 16
+    ret
+  end
+  put ag_obj_id idx id
+  put ag_obj_gen idx gen
+  fb = mul idx 8
+  for k ulong 8
+    put ag_obj_fields add fb k get fields k
+  end
+  put ag_n_objs 0 add idx 1
+end
+
+fn ag_obj_find id ulong gen ulong to long
+  no = get ag_n_objs 0
+  for i ulong no bound 16
+    if and eq get ag_obj_id i id eq get ag_obj_gen i gen
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn ag_ref_eval_guard g ulong n ulong to ulong
+  gd = ag_dep_of g n AG_DEP_GUARD
+  if lt gd 0
+    ret AG_OK
+  end
+  gb = ag_peoff g ulong gd
+  gs = get ag_deps gb
+  gstat = get ag_ref_status gs
+  if eq gstat AG_FAILED
+    ret AG_FAILED
+  end
+  gv_b = ulong 0
+  if ne get ag_ref_value gs 0
+    gv_b = ulong 1
+  end
+  if or eq gstat AG_SKIPPED ne gv_b get ag_deps add gb 3
+    ret AG_SKIPPED
+  end
+  ret AG_OK
+end
+
+fn ag_ref_eval_perform g ulong n ulong run ulong in_v view ulong 4 res edit ulong 2 to void
+  oi = ag_obj_find rx_graph_get_node g n 6 rx_graph_get_node g n 7
+  if lt oi 0
+    put res 0 AG_PENDING
+    ret
+  end
+  if ne get in_v 1 1
+    put res 0 AG_FAILED
+    ret
+  end
+  ob = mul ulong oi 8
+  seq = add get ag_obj_fields ob 1
+  ch = rx_graph_chain get ag_obj_fields add ob 2 run get in_v 0
+  put ag_obj_fields ob seq
+  put ag_obj_fields add ob 1 get in_v 0
+  put ag_obj_fields add ob 2 ch
+  put ag_obj_fields add ob 3 run
+  put res 1 seq
+  ec = get ag_ref_eff_cnt 0
+  put ag_ref_eff_chain ec ch
+  put ag_ref_eff_cnt 0 add ec 1
+end
+
+global ag_ref_k ulong 1
+
+fn ag_ref_eval_pure g ulong n ulong in_v view ulong 4 res edit ulong 2 to void
+  ov = new ulong 1 0
+  b = rx_graph_get_node g n 3
+  if gt get ag_ref_k 0 1
+    b = get in_v 1
+  end
+  if ne ag_eval_pure_chain g n get in_v 0 b ov 0
+    put res 0 AG_FAILED
+  else
+    put res 1 get ov 0
+  end
+end
+
+fn ag_ref_eval_world g ulong n ulong is_pub ulong in_v view ulong 4 res edit ulong 2 to void
+  oi = ag_obj_find rx_graph_get_node g n 6 rx_graph_get_node g n 7
+  if lt oi 0
+    put res 0 AG_PENDING
+    ret
+  end
+  idx = add mul ulong oi 8 and rx_graph_get_node g n 8 7
+  if ne is_pub 0
+    v = get in_v 0
+    put ag_obj_fields idx v
+    put res 1 v
+  else
+    put res 1 get ag_obj_fields idx
+  end
+end
+
+fn ag_ref_eval_body g ulong n ulong run ulong in_v view ulong 4 res edit ulong 2 to void
+  kind = rx_graph_get_node g n 0
+  if or eq kind AG_CONST eq kind AG_CAP_RESOLVE
+    put res 1 rx_graph_get_node g n 3
+    ret
+  end
+  if eq kind AG_PURE
+    ag_ref_eval_pure g n in_v res
+    ret
+  end
+  if eq kind AG_WORLD_READ
+    ag_ref_eval_world g n 0 in_v res
+    ret
+  end
+  if eq kind AG_WORLD_PUBLISH
+    ag_ref_eval_world g n 1 in_v res
+    ret
+  end
+  if eq kind AG_EFFECT_PROPOSE
+    put res 1 get in_v 0
+    ret
+  end
+  if eq kind AG_VERIFY
+    a = get in_v 0
+    if lt a rx_graph_get_node g n 3
+      put res 0 AG_FAILED
+      ret
+    end
+    if gt a rx_graph_get_node g n 4
+      put res 0 AG_FAILED
+      ret
+    end
+    put res 1 1
+    ret
+  end
+  if eq kind AG_BRANCH
+    if ne get in_v 0 0
+      put res 1 1
+    else
+      put res 1 0
+    end
+    ret
+  end
+  if eq kind AG_EFFECT_PERFORM
+    ag_ref_eval_perform g n run in_v res
+  end
+end
+
+fn ag_ref_join_in g ulong k ulong el view ulong 4 res edit ulong 2 to void
+  oks = ulong 0
+  fnd = ulong 0
+  for i ulong k bound 4
+    s = get ag_data ag_doff g get el i
+    ss = get ag_ref_status s
+    if eq ss AG_OK
+      oks = add oks 1
+      put res 1 get ag_ref_value s
+    end
+    if eq ss AG_FAILED
+      fnd = ulong 1
+    end
+  end
+  if ne oks 1
+    if or gt oks 1 ne fnd 0
+      put res 0 AG_FAILED
+    else
+      put res 0 AG_SKIPPED
+    end
+  end
+end
+
+fn ag_ref_data_in g ulong k ulong el view ulong 4 in_v edit ulong 4 res edit ulong 2 to void
+  for i ulong k bound 4
+    base = ag_doff g get el i
+    s = get ag_data base
+    ss = get ag_ref_status s
+    put in_v i get ag_ref_value s
+    if eq get ag_data add base 3 AG_EDGE_ON_FAIL
+      if ne ss AG_FAILED
+        put res 0 AG_SKIPPED
+      end
+    else
+      if eq ss AG_SKIPPED
+        put res 0 AG_SKIPPED
+      end
+      if eq ss AG_FAILED
+        if eq get res 0 AG_OK
+          put res 0 AG_FAILED
+        end
+      end
+    end
+  end
+end
+
+fn ag_ref_step_node g ulong n ulong run ulong to void
+  el = new ulong 4 0
+  in_v = new ulong 4 0
+  res = new ulong 2 0
+  k = ag_inputs_by_port g n el
+  st = ag_ref_eval_guard g n
+  put res 0 st
+  put res 1 0
+  if eq st AG_OK
+    if eq rx_graph_get_node g n 0 AG_JOIN
+      ag_ref_join_in g k el res
+    else
+      ag_ref_data_in g k el in_v res
+      if eq get res 0 AG_OK
+        put ag_ref_k 0 k
+        ag_ref_eval_body g n run in_v res
+      end
+    end
+  end
+  put ag_ref_status n get res 0
+  put ag_ref_value n get res 1
+  put el 0 run
+  put el 1 get res 0
+  put el 2 get res 1
+  put el 3 k
+  put ag_ref_ev n rx_graph_evidence_word g n el in_v
+end
+
+fn rx_graph_reference_on g ulong run ulong to long
+  cnt_l = rx_graph_topo g
+  if lt cnt_l 0
+    ret cnt_l
+  end
+  for i ulong AG_MAX_NODES
+    put ag_ref_status i AG_PENDING
+    put ag_ref_value i 0
+    put ag_ref_ev i 0
+    put ag_ref_eff_chain i 0
+    put ag_ref_pub i 0
+  end
+  put ag_ref_eff_cnt 0 0
+  for t ulong ulong cnt_l bound 64
+    ag_ref_step_node g get ag_ord t run
+  end
+  outc = AG_RUN_INCOMPLETE
+  for i ulong get ag_n_fail g bound 8
+    base = add mul g 16 mul i 2
+    if eq get ag_ref_status get ag_fail base get ag_fail add base 1
+      outc = AG_RUN_FAILURE
+    end
+  end
+  if ne outc AG_RUN_FAILURE
+    nsucc = get ag_n_succ g
+    if gt nsucc 0
+      all_ok = ulong 1
+      for i ulong nsucc bound 8
+        base = add mul g 16 mul i 2
+        if ne get ag_ref_status get ag_succ base get ag_succ add base 1
+          all_ok = ulong 0
+        end
+      end
+      if ne all_ok 0
+        outc = AG_RUN_SUCCESS
+      end
+    end
+  end
+  put ag_ref_outcome 0 outc
+  ret 0
+end

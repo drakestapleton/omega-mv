@@ -1,0 +1,1324 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_jspace.om -- Pure seeded OM-2 port of src/runtime/rx_jspace.c.
+note Requires seed/ng/sha256.om concatenated before this file.
+
+const JS_OK long 0
+const JS_ERR_ARG long -1
+const JS_ERR_FULL long -2
+const JS_ERR_FROZEN long -3
+const JS_ERR_IO long -4
+const JS_ERR_CORRUPT long -5
+const JS_ERR_NOMEM long -6
+const JS_ERR_STALE long -7
+const JS_ERR_REMOTE long -8
+const JS_ERR_OWNER long -9
+const JS_ERR_VERSION long -10
+
+const JS_HOME_LOCAL ulong 0
+const JS_HOME_REMOTE_OWNED ulong 1
+const JS_HOME_REPLICA ulong 2
+
+const JS_PLACE_HOT ulong 1
+const JS_PLACE_COLD ulong 2
+const JS_PLACE_COMPRESSED ulong 3
+const JS_PLACE_SPILLED ulong 4
+const JS_PLACE_EVICTED ulong 5
+
+const JS_ACT_REUSE ulong 0
+const JS_ACT_COPY ulong 1
+const JS_ACT_REFERENCE ulong 2
+const JS_ACT_RECOMPUTE ulong 3
+const JS_ACT_MOVE ulong 4
+const JS_ACT_COMPRESS ulong 5
+const JS_ACT_SPILL ulong 6
+const JS_ACT_EVICT ulong 7
+const JS_ACT_COUNT ulong 8
+
+const JS_RECIPE_ROOT ulong 1
+const JS_RECIPE_DERIVE ulong 2
+const JS_RECIPE_EDIT ulong 3
+
+const JS_DUAL_OBS_KIND ulong 211
+const JS_DUAL_OBS_VERSION ulong 1
+const JS_DUAL_OBS_BYTES ulong 302
+const JS_DUAL_PRESSURE_CAPACITY ulong 1
+const JS_DUAL_PRESSURE_SOFT ulong 2
+const JS_DUAL_ALT_INADMISSIBLE ulong 0
+const JS_DUAL_ALT_UNPRICED ulong 1
+const JS_DUAL_ALT_PRICED ulong 2
+
+const JS_NONE ulong 0xffffffff
+const JS_REAL_GEN_RETIRED ulong 0xffffffffffffffff
+const JS_BRANCH_GEN_RETIRED ulong 0xffffffff
+
+note Static capacities (unit_bytes = 64 bytes per unit for pure-state runtime)
+const JS_MAX_BR ulong 64
+const JS_MAX_UNITS ulong 32
+const JS_MAX_REALS ulong 256
+const JS_UNIT_BYTES ulong 64
+const JS_RSTRIDE ulong 16
+const JS_BSTRIDE ulong 12
+
+note Realization table (256 * 16 ulongs):
+note  0:live, 1:gen, 2:real_type, 3:parent_slot(JS_NONE=none), 4:recipe,
+note  5:token, 6:edit_off, 7:edit_len, 8:refs, 9:holders, 10:placement,
+note  11:packed_len, 12:spill_off, 13:last_use, 14:reads, 15:unit_bytes
+global js_reals ulong 4096
+global js_real_sem uchar 8192
+global js_real_content uchar 8192
+global js_real_data uchar 16384
+global js_real_patch uchar 16384
+global js_spill_buf uchar 16384
+global js_spill_end ulong 1
+
+note Branch table (64 * 12 ulongs):
+note  0:live, 1:gen, 2:parent_br, 3:common_anc, 4:div_pt, 5:frozen,
+note  6:n_units, 7:owner, 8:staged, 9:locality, 10:real_type, 11:unit_bytes
+global js_br ulong 768
+global js_br_units ulong 2048
+global js_br_home uchar 2048
+global js_br_gen ulong 64
+
+note Space state, limits, stats, costs (f64 bitcast as ulong), anchor
+global js_limits ulong 4
+global js_stats ulong 16
+global js_clock ulong 1
+global js_reuse_en ulong 1
+global js_anchor uchar 48
+global js_anchor_set ulong 1
+global js_costs f64 9
+global js_sh_len ulong 1
+global js_dual_seq ulong 1
+global js_rep_cons ulong 1
+global js_rep_kept ulong 1
+global js_rep_chosen ulong 8
+
+text js_tag_root "js.root"
+text js_tag_derive "js.derive"
+text js_tag_edit "js.edit"
+text js_tag_branch "js.branch"
+text js_dual_site "jspace.residency"
+
+fn js_sh_reset to void
+  put js_sh_len 0 0
+end
+
+fn js_sh_put8 v ulong to void
+  p = get js_sh_len 0
+  put sh_dat p uchar and v 255
+  put js_sh_len 0 add p 1
+end
+
+fn js_sh_put32_le v ulong to void
+  js_sh_put8 v
+  js_sh_put8 shr v 8
+  js_sh_put8 shr v 16
+  js_sh_put8 shr v 24
+end
+
+fn js_sh_put64_le v ulong to void
+  js_sh_put32_le v
+  js_sh_put32_le shr v 32
+end
+
+note ---- content check & default realizer ----
+
+fn js_mix64 x ulong to ulong
+  v = mul xor x shr x 30 ulong 0xbf58476d1ce4e5b9
+  v = mul xor v shr v 27 ulong 0x94d049bb133111eb
+  ret xor v shr v 31
+end
+
+fn js_content_check_out h view ulong 4 n ulong dst edit uchar 32 to void
+  for i ulong 4
+    v = js_mix64 xor xor get h i get h and add i 1 3 n
+    for k ulong 8
+      put dst add mul i 8 k uchar and shr v mul k 8 255
+    end
+  end
+end
+
+fn js_content_check src view uchar 64 n ulong dst edit uchar 32 to void
+  h = new ulong 4 0
+  put h 0 ulong 0x243f6a8885a308d3
+  put h 1 ulong 0x13198a2e03707344
+  put h 2 ulong 0xa4093822299f31d0
+  put h 3 ulong 0x082efa98ec4e6c89
+  words = div n 8
+  for i ulong words bound 8
+    v = ulong 0
+    base = mul i 8
+    for k ulong 8
+      b = ulong get src add base k
+      v = or v shl b mul k 8
+    end
+    lane = and i 3
+    put h lane add js_mix64 xor get h lane v i
+  end
+  js_content_check_out h n dst
+end
+
+note Pure deterministic derive(prev, has_prev, token) -> dst[64]
+fn js_default_derive prev view uchar 64 has_prev ulong token ulong dst edit uchar 64 to void
+  st = js_mix64 xor token ulong 0x9e3779b97f4a7c15
+  for i ulong JS_UNIT_BYTES
+    pv = ulong 0
+    if ne has_prev 0
+      pv = ulong get prev i
+    end
+    st = js_mix64 xor st add pv i
+    put dst i uchar and st 255
+  end
+end
+
+note ---- semantic identity ----
+
+fn js_sem_root seed ulong dst edit uchar 32 to void
+  js_sh_reset
+  for i ulong len js_tag_root bound 16
+    js_sh_put8 ulong get js_tag_root i
+  end
+  js_sh_put64_le seed
+  sh_all get js_sh_len 0
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn js_sem_derive prev view uchar 32 token ulong dst edit uchar 32 to void
+  js_sh_reset
+  for i ulong len js_tag_derive bound 16
+    js_sh_put8 ulong get js_tag_derive i
+  end
+  for i ulong 32
+    js_sh_put8 ulong get prev i
+  end
+  js_sh_put64_le token
+  sh_all get js_sh_len 0
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn js_sem_edit prev view uchar 32 off ulong patch view uchar 64 plen ulong dst edit uchar 32 to void
+  for i ulong plen bound 64
+    put sh_dat i get patch i
+  end
+  sh_all plen
+  ph = new uchar 32 0
+  for i ulong 32
+    put ph i get sh_dig i
+  end
+  js_sh_reset
+  for i ulong len js_tag_edit bound 16
+    js_sh_put8 ulong get js_tag_edit i
+  end
+  for i ulong 32
+    js_sh_put8 ulong get prev i
+  end
+  js_sh_put32_le off
+  js_sh_put32_le plen
+  for i ulong 32
+    js_sh_put8 ulong get ph i
+  end
+  sh_all get js_sh_len 0
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn js_branch_semantic_id bid ulong dst edit uchar 32 to long
+  if ge bid JS_MAX_BR
+    ret JS_ERR_ARG
+  end
+  bb = mul bid JS_BSTRIDE
+  if eq get js_br bb 0
+    ret JS_ERR_ARG
+  end
+  js_sh_reset
+  for i ulong len js_tag_branch bound 16
+    js_sh_put8 ulong get js_tag_branch i
+  end
+  nu = get js_br add bb 6
+  js_sh_put32_le nu
+  ub = mul bid JS_MAX_UNITS
+  for i ulong nu bound 32
+    rslot = get js_br_units add ub i
+    sb = mul rslot 32
+    for j ulong 32
+      js_sh_put8 ulong get js_real_sem add sb j
+    end
+  end
+  sh_all get js_sh_len 0
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+  ret JS_OK
+end
+
+note ---- space init / limits / anchor ----
+
+fn js_limits_default dst edit ulong 4 to void
+  put dst 0 JS_MAX_REALS
+  put dst 1 JS_MAX_BR
+  put dst 2 16384
+  put dst 3 0
+end
+
+fn js_space_init_limits lim view ulong 4 to long
+  put js_limits 0 get lim 0
+  put js_limits 1 get lim 1
+  put js_limits 2 get lim 2
+  put js_limits 3 get lim 3
+  if gt get js_limits 0 JS_MAX_REALS
+    put js_limits 0 JS_MAX_REALS
+  end
+  if gt get js_limits 1 JS_MAX_BR
+    put js_limits 1 JS_MAX_BR
+  end
+  for i ulong 16
+    put js_stats i 0
+  end
+  put js_clock 0 0
+  put js_reuse_en 0 1
+  put js_spill_end 0 0
+  put js_anchor_set 0 0
+  put js_dual_seq 0 0
+  for i ulong 48
+    put js_anchor i uchar 0
+  end
+  for i ulong JS_MAX_REALS
+    rb = mul i JS_RSTRIDE
+    put js_reals rb 0
+    put js_reals add rb 1 1
+  end
+  for i ulong JS_MAX_BR
+    bb = mul i JS_BSTRIDE
+    put js_br bb 0
+    put js_br_gen i 1
+  end
+  put js_costs 0 500.0f64
+  put js_costs 1 0.5f64
+  put js_costs 2 2.0f64
+  put js_costs 3 1.5f64
+  put js_costs 4 10.0f64
+  put js_costs 5 8.0f64
+  put js_costs 6 0.5f64
+  put js_costs 7 0.01f64
+  put js_costs 8 0.25f64
+  ret JS_OK
+end
+
+fn js_space_init to long
+  lim = new ulong 4 0
+  js_limits_default lim
+  ret js_space_init_limits lim
+end
+
+fn js_space_destroy to void
+  for i ulong JS_MAX_BR
+    put js_br mul i JS_BSTRIDE 0
+  end
+  for i ulong JS_MAX_REALS
+    put js_reals mul i JS_RSTRIDE 0
+  end
+end
+
+fn js_space_set_anchor anc view uchar 48 to void
+  nz = ulong 0
+  for i ulong 48
+    b = get anc i
+    put js_anchor i b
+    if ne b uchar 0
+      nz = ulong 1
+    end
+  end
+  put js_anchor_set 0 nz
+end
+
+fn js_space_anchor dst edit uchar 48 to ulong
+  if eq get js_anchor_set 0 0
+    for i ulong 48
+      put dst i uchar 0
+    end
+    ret 0
+  end
+  for i ulong 48
+    put dst i get js_anchor i
+  end
+  ret 1
+end
+
+note ---- realization management & physical transitions ----
+
+fn js_real_res_bytes rslot ulong to ulong
+  rb = mul rslot JS_RSTRIDE
+  pl = get js_reals add rb 10
+  if or eq pl JS_PLACE_HOT eq pl JS_PLACE_COLD
+    ret get js_reals add rb 15
+  end
+  if eq pl JS_PLACE_COMPRESSED
+    ret get js_reals add rb 11
+  end
+  ret 0
+end
+
+fn js_update_peak to void
+  cur = get js_stats 12
+  if gt cur get js_stats 13
+    put js_stats 13 cur
+  end
+end
+
+fn js_real_find_sem sem view uchar 32 rtype ulong to long
+  if eq get js_reuse_en 0 0
+    ret -1
+  end
+  for i ulong get js_limits 0 bound 256
+    rb = mul i JS_RSTRIDE
+    if ne get js_reals rb 0
+      if eq get js_reals add rb 2 rtype
+        sb = mul i 32
+        ok = ulong 1
+        for k ulong 32
+          if ne get js_real_sem add sb k get sem k
+            ok = ulong 0
+          end
+        end
+        if ne ok 0
+          ret long i
+        end
+      end
+    end
+  end
+  ret -1
+end
+
+fn js_real_init_slot i ulong rtype ulong sem view uchar 32 bytes view uchar 64 to void
+  chk = new uchar 32 0
+  rb = mul i JS_RSTRIDE
+  put js_reals rb 1
+  put js_reals add rb 2 rtype
+  put js_reals add rb 3 JS_NONE
+  put js_reals add rb 4 JS_RECIPE_ROOT
+  put js_reals add rb 5 0
+  put js_reals add rb 6 0
+  put js_reals add rb 7 0
+  put js_reals add rb 8 1
+  put js_reals add rb 9 0
+  put js_reals add rb 10 JS_PLACE_HOT
+  put js_reals add rb 11 0
+  put js_reals add rb 12 0
+  put js_clock 0 add get js_clock 0 1
+  put js_reals add rb 13 get js_clock 0
+  put js_reals add rb 14 0
+  put js_reals add rb 15 JS_UNIT_BYTES
+  sb = mul i 32
+  for k ulong 32
+    put js_real_sem add sb k get sem k
+  end
+  db = mul i JS_UNIT_BYTES
+  for k ulong JS_UNIT_BYTES
+    put js_real_data add db k get bytes k
+  end
+  js_content_check bytes JS_UNIT_BYTES chk
+  for k ulong 32
+    put js_real_content add sb k get chk k
+  end
+  put js_stats 11 add get js_stats 11 1
+  put js_stats 12 add get js_stats 12 JS_UNIT_BYTES
+  js_update_peak
+end
+
+fn js_real_alloc rtype ulong sem view uchar 32 bytes view uchar 64 to long
+  for i ulong get js_limits 0 bound 256
+    rb = mul i JS_RSTRIDE
+    if eq get js_reals rb 0
+      if ne get js_reals add rb 1 JS_REAL_GEN_RETIRED
+        js_real_init_slot i rtype sem bytes
+        ret long i
+      end
+    end
+  end
+  ret JS_ERR_FULL
+end
+
+fn js_real_unref rslot ulong to void
+  cur = rslot
+  for step ulong 64
+    if ge cur JS_MAX_REALS
+      ret
+    end
+    rb = mul cur JS_RSTRIDE
+    if eq get js_reals rb 0
+      ret
+    end
+    refs = get js_reals add rb 8
+    if gt refs 1
+      put js_reals add rb 8 sub refs 1
+      ret
+    end
+    put js_reals add rb 8 0
+    resb = js_real_res_bytes cur
+    if ge get js_stats 12 resb
+      put js_stats 12 sub get js_stats 12 resb
+    end
+    if gt get js_stats 11 0
+      put js_stats 11 sub get js_stats 11 1
+    end
+    par = get js_reals add rb 3
+    put js_reals rb 0
+    gen = get js_reals add rb 1
+    if lt gen JS_REAL_GEN_RETIRED
+      put js_reals add rb 1 add gen 1
+    end
+    if eq par JS_NONE
+      ret
+    end
+    cur = par
+  end
+end
+
+fn js_real_move rslot ulong to long
+  if ge rslot JS_MAX_REALS
+    ret JS_ERR_ARG
+  end
+  rb = mul rslot JS_RSTRIDE
+  if eq get js_reals rb 0
+    ret JS_ERR_ARG
+  end
+  if ne get js_reals add rb 10 JS_PLACE_HOT
+    ret JS_OK
+  end
+  put js_reals add rb 10 JS_PLACE_COLD
+  put js_stats JS_ACT_MOVE add get js_stats JS_ACT_MOVE 1
+  ret JS_OK
+end
+
+fn js_real_compress rslot ulong to long
+  if ge rslot JS_MAX_REALS
+    ret JS_ERR_ARG
+  end
+  rb = mul rslot JS_RSTRIDE
+  if eq get js_reals rb 0
+    ret JS_ERR_ARG
+  end
+  pl = get js_reals add rb 10
+  if eq pl JS_PLACE_COMPRESSED
+    ret JS_OK
+  end
+  if and ne pl JS_PLACE_HOT ne pl JS_PLACE_COLD
+    ret JS_ERR_ARG
+  end
+  old_b = js_real_res_bytes rslot
+  new_b = div JS_UNIT_BYTES 4
+  put js_reals add rb 10 JS_PLACE_COMPRESSED
+  put js_reals add rb 11 new_b
+  put js_stats 12 add sub get js_stats 12 old_b new_b
+  put js_stats JS_ACT_COMPRESS add get js_stats JS_ACT_COMPRESS 1
+  ret JS_OK
+end
+
+fn js_real_spill rslot ulong to long
+  if ge rslot JS_MAX_REALS
+    ret JS_ERR_ARG
+  end
+  rb = mul rslot JS_RSTRIDE
+  if eq get js_reals rb 0
+    ret JS_ERR_ARG
+  end
+  pl = get js_reals add rb 10
+  if eq pl JS_PLACE_SPILLED
+    ret JS_OK
+  end
+  if eq pl JS_PLACE_EVICTED
+    ret JS_ERR_ARG
+  end
+  off = get js_spill_end 0
+  if gt add off JS_UNIT_BYTES 16384
+    ret JS_ERR_FULL
+  end
+  db = mul rslot JS_UNIT_BYTES
+  for k ulong JS_UNIT_BYTES
+    put js_spill_buf add off k get js_real_data add db k
+  end
+  put js_spill_end 0 add off JS_UNIT_BYTES
+  old_b = js_real_res_bytes rslot
+  put js_reals add rb 10 JS_PLACE_SPILLED
+  put js_reals add rb 12 off
+  if ge get js_stats 12 old_b
+    put js_stats 12 sub get js_stats 12 old_b
+  end
+  put js_stats 14 add get js_stats 14 JS_UNIT_BYTES
+  put js_stats JS_ACT_SPILL add get js_stats JS_ACT_SPILL 1
+  ret JS_OK
+end
+
+fn js_real_evict rslot ulong to long
+  if ge rslot JS_MAX_REALS
+    ret JS_ERR_ARG
+  end
+  rb = mul rslot JS_RSTRIDE
+  if eq get js_reals rb 0
+    ret JS_ERR_ARG
+  end
+  if eq get js_reals add rb 10 JS_PLACE_EVICTED
+    ret JS_OK
+  end
+  old_b = js_real_res_bytes rslot
+  put js_reals add rb 10 JS_PLACE_EVICTED
+  if ge get js_stats 12 old_b
+    put js_stats 12 sub get js_stats 12 old_b
+  end
+  put js_stats JS_ACT_EVICT add get js_stats JS_ACT_EVICT 1
+  ret JS_OK
+end
+
+fn js_real_verify_content rslot ulong buf view uchar 64 to long
+  chk = new uchar 32 0
+  js_content_check buf JS_UNIT_BYTES chk
+  sb = mul rslot 32
+  for k ulong 32
+    if ne get chk k get js_real_content add sb k
+      put js_stats 15 add get js_stats 15 1
+      ret JS_ERR_CORRUPT
+    end
+  end
+  ret JS_OK
+end
+
+fn js_recompute_one sl ulong prev view uchar 64 dst edit uchar 64 to void
+  rb = mul sl JS_RSTRIDE
+  pl = get js_reals add rb 10
+  if or eq pl JS_PLACE_HOT eq pl JS_PLACE_COLD
+    db = mul sl JS_UNIT_BYTES
+    for k ulong JS_UNIT_BYTES
+      put dst k get js_real_data add db k
+    end
+    ret
+  end
+  rec = get js_reals add rb 4
+  if eq rec JS_RECIPE_ROOT
+    js_default_derive prev 0 get js_reals add rb 5 dst
+    ret
+  end
+  if eq rec JS_RECIPE_DERIVE
+    js_default_derive prev 1 get js_reals add rb 5 dst
+    ret
+  end
+  if eq rec JS_RECIPE_EDIT
+    for k ulong JS_UNIT_BYTES
+      put dst k get prev k
+    end
+    eo = get js_reals add rb 6
+    el = get js_reals add rb 7
+    pb = mul sl JS_UNIT_BYTES
+    for k ulong el bound 64
+      put dst add eo k get js_real_patch add pb k
+    end
+  end
+end
+
+fn js_real_recompute_chain rslot ulong dst edit uchar 64 to long
+  chain = new ulong 32 0
+  prev = new uchar 64 0
+  depth = ulong 0
+  cur = rslot
+  while ne cur JS_NONE bound 32
+    put chain depth cur
+    depth = add depth 1
+    rb = mul cur JS_RSTRIDE
+    pl = get js_reals add rb 10
+    if or eq pl JS_PLACE_HOT eq pl JS_PLACE_COLD
+      break
+    end
+    cur = get js_reals add rb 3
+  end
+  for step ulong depth bound 32
+    sl = get chain sub sub depth 1 step
+    js_recompute_one sl prev dst
+    for k ulong JS_UNIT_BYTES
+      put prev k get dst k
+    end
+  end
+  ret JS_OK
+end
+
+fn js_real_restore rslot ulong to long
+  if ge rslot JS_MAX_REALS
+    ret JS_ERR_ARG
+  end
+  rb = mul rslot JS_RSTRIDE
+  if eq get js_reals rb 0
+    ret JS_ERR_ARG
+  end
+  pl = get js_reals add rb 10
+  if eq pl JS_PLACE_HOT
+    ret JS_OK
+  end
+  buf = new uchar 64 0
+  old_b = js_real_res_bytes rslot
+  if eq pl JS_PLACE_COLD
+    db = mul rslot JS_UNIT_BYTES
+    for k ulong JS_UNIT_BYTES
+      put buf k get js_real_data add db k
+    end
+  end
+  if eq pl JS_PLACE_COMPRESSED
+    db = mul rslot JS_UNIT_BYTES
+    for k ulong JS_UNIT_BYTES
+      put buf k get js_real_data add db k
+    end
+  end
+  if eq pl JS_PLACE_SPILLED
+    off = get js_reals add rb 12
+    for k ulong JS_UNIT_BYTES
+      put buf k get js_spill_buf add off k
+    end
+  end
+  if eq pl JS_PLACE_EVICTED
+    rc = js_real_recompute_chain rslot buf
+    if ne rc JS_OK
+      ret rc
+    end
+    put js_stats JS_ACT_RECOMPUTE add get js_stats JS_ACT_RECOMPUTE 1
+  end
+  vrc = js_real_verify_content rslot buf
+  if ne vrc JS_OK
+    ret vrc
+  end
+  db = mul rslot JS_UNIT_BYTES
+  for k ulong JS_UNIT_BYTES
+    put js_real_data add db k get buf k
+  end
+  put js_reals add rb 10 JS_PLACE_HOT
+  put js_stats 12 add sub get js_stats 12 old_b JS_UNIT_BYTES
+  js_update_peak
+  ret JS_OK
+end
+
+note ---- branch operations & stable references ----
+
+fn js_br_alloc to long
+  for i ulong get js_limits 1 bound 64
+    bb = mul i JS_BSTRIDE
+    if eq get js_br bb 0
+      if ne get js_br_gen i JS_BRANCH_GEN_RETIRED
+        ret long i
+      end
+    end
+  end
+  ret JS_ERR_FULL
+end
+
+fn js_root_new_real rtype ulong seed ulong sem view uchar 32 to long
+  prev = new uchar 64 0
+  buf = new uchar 64 0
+  js_default_derive prev 0 seed buf
+  put js_stats 8 add get js_stats 8 1
+  rslot = js_real_alloc rtype sem buf
+  if lt rslot 0
+    ret rslot
+  end
+  rb = mul ulong rslot JS_RSTRIDE
+  put js_reals add rb 4 JS_RECIPE_ROOT
+  put js_reals add rb 5 seed
+  ret rslot
+end
+
+fn js_branch_root rtype ulong seed ulong dst_bid edit ulong 1 to long
+  sem = new uchar 32 0
+  bid_l = js_br_alloc
+  if lt bid_l 0
+    ret bid_l
+  end
+  bid = ulong bid_l
+  js_sem_root seed sem
+  rslot = js_real_find_sem sem rtype
+  if ge rslot 0
+    rb = mul ulong rslot JS_RSTRIDE
+    put js_reals add rb 8 add get js_reals add rb 8 1
+    put js_stats JS_ACT_REUSE add get js_stats JS_ACT_REUSE 1
+  else
+    rslot = js_root_new_real rtype seed sem
+    if lt rslot 0
+      ret rslot
+    end
+  end
+  rb = mul ulong rslot JS_RSTRIDE
+  put js_reals add rb 9 add get js_reals add rb 9 1
+  bb = mul bid JS_BSTRIDE
+  put js_br bb 1
+  put js_br add bb 1 get js_br_gen bid
+  put js_br add bb 2 JS_NONE
+  put js_br add bb 3 bid
+  put js_br add bb 4 0
+  put js_br add bb 5 0
+  put js_br add bb 6 1
+  put js_br add bb 7 0
+  put js_br add bb 8 0
+  put js_br add bb 9 JS_HOME_LOCAL
+  put js_br add bb 10 rtype
+  put js_br add bb 11 JS_UNIT_BYTES
+  put js_br_units mul bid JS_MAX_UNITS ulong rslot
+  put dst_bid 0 bid
+  ret JS_OK
+end
+
+fn js_fork_copy_units parent ulong bid ulong nu ulong to void
+  pub = mul parent JS_MAX_UNITS
+  bub = mul bid JS_MAX_UNITS
+  for i ulong nu bound 32
+    rs = get js_br_units add pub i
+    put js_br_units add bub i rs
+    rb = mul rs JS_RSTRIDE
+    v = add get js_reals add rb 8 1
+    put js_reals add rb 8 v
+    v = add get js_reals add rb 9 1
+    put js_reals add rb 9 v
+    put js_stats JS_ACT_REFERENCE add get js_stats JS_ACT_REFERENCE 1
+  end
+end
+
+fn js_branch_fork parent ulong dst_bid edit ulong 1 to long
+  if ge parent JS_MAX_BR
+    ret JS_ERR_ARG
+  end
+  pb = mul parent JS_BSTRIDE
+  if eq get js_br pb 0
+    ret JS_ERR_ARG
+  end
+  bid_l = js_br_alloc
+  if lt bid_l 0
+    ret bid_l
+  end
+  bid = ulong bid_l
+  put js_br add pb 5 1
+  bb = mul bid JS_BSTRIDE
+  nu = get js_br add pb 6
+  put js_br bb 1
+  put js_br add bb 1 get js_br_gen bid
+  put js_br add bb 2 parent
+  put js_br add bb 3 get js_br add pb 3
+  put js_br add bb 4 nu
+  put js_br add bb 5 0
+  put js_br add bb 6 nu
+  put js_br add bb 7 get js_br add pb 7
+  put js_br add bb 8 0
+  put js_br add bb 9 JS_HOME_LOCAL
+  put js_br add bb 10 get js_br add pb 10
+  put js_br add bb 11 get js_br add pb 11
+  js_fork_copy_units parent bid nu
+  put dst_bid 0 bid
+  ret JS_OK
+end
+
+fn js_branch_ref bid ulong dst edit ulong 2 to long
+  if ge bid JS_MAX_BR
+    ret JS_ERR_ARG
+  end
+  bb = mul bid JS_BSTRIDE
+  if eq get js_br bb 0
+    ret JS_ERR_STALE
+  end
+  put dst 0 bid
+  put dst 1 get js_br add bb 1
+  ret JS_OK
+end
+
+fn js_branch_check bid ulong gen ulong to long
+  if ge bid JS_MAX_BR
+    ret JS_ERR_STALE
+  end
+  bb = mul bid JS_BSTRIDE
+  if eq get js_br bb 0
+    ret JS_ERR_STALE
+  end
+  if ne get js_br add bb 1 gen
+    ret JS_ERR_STALE
+  end
+  ret JS_OK
+end
+
+fn js_branch_fork_staged pid ulong pgen ulong owner ulong dst_ref edit ulong 2 to long
+  if ne js_branch_check pid pgen JS_OK
+    ret JS_ERR_STALE
+  end
+  nb = new ulong 1 0
+  rc = js_branch_fork pid nb
+  if ne rc JS_OK
+    ret rc
+  end
+  bid = get nb 0
+  bb = mul bid JS_BSTRIDE
+  put js_br add bb 7 owner
+  put js_br add bb 8 1
+  put dst_ref 0 bid
+  put dst_ref 1 get js_br add bb 1
+  ret JS_OK
+end
+
+fn js_branch_seal bid ulong gen ulong to long
+  if ne js_branch_check bid gen JS_OK
+    ret JS_ERR_STALE
+  end
+  put js_br add mul bid JS_BSTRIDE 8 0
+  ret JS_OK
+end
+
+fn js_branch_set_owner bid ulong gen ulong owner ulong to long
+  if ne js_branch_check bid gen JS_OK
+    ret JS_ERR_STALE
+  end
+  put js_br add mul bid JS_BSTRIDE 7 owner
+  ret JS_OK
+end
+
+fn js_branch_set_home bid ulong gen ulong loc ulong mach view uchar 32 to long
+  if ne js_branch_check bid gen JS_OK
+    ret JS_ERR_STALE
+  end
+  put js_br add mul bid JS_BSTRIDE 9 loc
+  hb = mul bid 32
+  for i ulong 32
+    put js_br_home add hb i get mach i
+  end
+  ret JS_OK
+end
+
+fn js_branch_info bid ulong gen ulong dst edit ulong 5 to long
+  if ne js_branch_check bid gen JS_OK
+    ret JS_ERR_STALE
+  end
+  bb = mul bid JS_BSTRIDE
+  put dst 0 get js_br add bb 7
+  par = get js_br add bb 2
+  put dst 1 par
+  pgen = ulong 0
+  if lt par JS_MAX_BR
+    pbb = mul par JS_BSTRIDE
+    if ne get js_br pbb 0
+      pgen = get js_br add pbb 1
+    end
+  end
+  put dst 2 pgen
+  put dst 3 get js_br add bb 8
+  put dst 4 get js_br add bb 9
+  ret JS_OK
+end
+
+fn js_derive_new_real rtype ulong last_r ulong token ulong sem view uchar 32 to long
+  rc = js_real_restore last_r
+  if ne rc JS_OK
+    ret rc
+  end
+  prev = new uchar 64 0
+  buf = new uchar 64 0
+  db = mul last_r JS_UNIT_BYTES
+  for k ulong JS_UNIT_BYTES
+    put prev k get js_real_data add db k
+  end
+  js_default_derive prev 1 token buf
+  put js_stats 8 add get js_stats 8 1
+  rslot = js_real_alloc rtype sem buf
+  if lt rslot 0
+    ret rslot
+  end
+  rb = mul ulong rslot JS_RSTRIDE
+  put js_reals add rb 3 last_r
+  put js_reals add rb 4 JS_RECIPE_DERIVE
+  put js_reals add rb 5 token
+  prb = mul last_r JS_RSTRIDE
+  v = add get js_reals add prb 8 1
+  put js_reals add prb 8 v
+  ret rslot
+end
+
+fn js_derive_make_sem last_r ulong token ulong sem edit uchar 32 to void
+  psem = new uchar 32 0
+  sb = mul last_r 32
+  for i ulong 32
+    put psem i get js_real_sem add sb i
+  end
+  js_sem_derive psem token sem
+end
+
+fn js_branch_derive bid ulong token ulong to long
+  sem = new uchar 32 0
+  if ge bid JS_MAX_BR
+    ret JS_ERR_ARG
+  end
+  bb = mul bid JS_BSTRIDE
+  if eq get js_br bb 0
+    ret JS_ERR_ARG
+  end
+  if ne get js_br add bb 5 0
+    ret JS_ERR_FROZEN
+  end
+  if ne get js_br add bb 9 JS_HOME_LOCAL
+    ret JS_ERR_REMOTE
+  end
+  nu = get js_br add bb 6
+  if ge nu JS_MAX_UNITS
+    ret JS_ERR_FULL
+  end
+  last_r = get js_br_units add mul bid JS_MAX_UNITS sub nu 1
+  js_derive_make_sem last_r token sem
+  rtype = get js_br add bb 10
+  rslot = js_real_find_sem sem rtype
+  if ge rslot 0
+    rb = mul ulong rslot JS_RSTRIDE
+    v = add get js_reals add rb 8 1
+    put js_reals add rb 8 v
+    put js_stats JS_ACT_REUSE add get js_stats JS_ACT_REUSE 1
+  else
+    rslot = js_derive_new_real rtype last_r token sem
+    if lt rslot 0
+      ret rslot
+    end
+  end
+  rb = mul ulong rslot JS_RSTRIDE
+  v2 = add get js_reals add rb 9 1
+  put js_reals add rb 9 v2
+  put js_br_units add mul bid JS_MAX_UNITS nu ulong rslot
+  put js_br add bb 6 add nu 1
+  ret JS_OK
+end
+
+fn js_edit_make_sem old_r ulong off ulong patch view uchar 64 plen ulong sem edit uchar 32 to void
+  psem = new uchar 32 0
+  sb = mul old_r 32
+  for i ulong 32
+    put psem i get js_real_sem add sb i
+  end
+  js_sem_edit psem off patch plen sem
+end
+
+fn js_store_patch rslot ulong patch view uchar 64 plen ulong to void
+  pb = mul rslot JS_UNIT_BYTES
+  for k ulong plen bound 64
+    put js_real_patch add pb k get patch k
+  end
+end
+
+fn js_edit_apply_real rtype ulong old_r ulong off ulong patch view uchar 64 plen ulong sem view uchar 32 to long
+  buf = new uchar 64 0
+  db = mul old_r JS_UNIT_BYTES
+  for k ulong JS_UNIT_BYTES
+    put buf k get js_real_data add db k
+  end
+  for k ulong plen bound 64
+    put buf add off k get patch k
+  end
+  put js_stats JS_ACT_COPY add get js_stats JS_ACT_COPY 1
+  put js_stats 9 add get js_stats 9 JS_UNIT_BYTES
+  rslot = js_real_alloc rtype sem buf
+  if lt rslot 0
+    ret rslot
+  end
+  rb = mul ulong rslot JS_RSTRIDE
+  put js_reals add rb 3 old_r
+  put js_reals add rb 4 JS_RECIPE_EDIT
+  put js_reals add rb 6 off
+  put js_reals add rb 7 plen
+  put js_reals add rb 9 1
+  js_store_patch ulong rslot patch plen
+  ret rslot
+end
+
+fn js_edit_finish bid ulong idx ulong old_r ulong rslot ulong to void
+  orb = mul old_r JS_RSTRIDE
+  v = add get js_reals add orb 8 1
+  put js_reals add orb 8 v
+  v = sub get js_reals add orb 9 1
+  put js_reals add orb 9 v
+  js_real_unref old_r
+  put js_br_units add mul bid JS_MAX_UNITS idx rslot
+end
+
+fn js_branch_edit bid ulong idx ulong off ulong patch view uchar 64 plen ulong to long
+  sem = new uchar 32 0
+  if ge bid JS_MAX_BR
+    ret JS_ERR_ARG
+  end
+  bb = mul bid JS_BSTRIDE
+  if eq get js_br bb 0
+    ret JS_ERR_ARG
+  end
+  if ne get js_br add bb 5 0
+    ret JS_ERR_FROZEN
+  end
+  if ne get js_br add bb 9 JS_HOME_LOCAL
+    ret JS_ERR_REMOTE
+  end
+  if ge idx get js_br add bb 6
+    ret JS_ERR_ARG
+  end
+  if gt add off plen JS_UNIT_BYTES
+    ret JS_ERR_ARG
+  end
+  old_r = get js_br_units add mul bid JS_MAX_UNITS idx
+  if ne js_real_restore old_r JS_OK
+    ret JS_ERR_CORRUPT
+  end
+  js_edit_make_sem old_r off patch plen sem
+  rslot = js_edit_apply_real get js_br add bb 10 old_r off patch plen sem
+  if lt rslot 0
+    ret rslot
+  end
+  js_edit_finish bid idx old_r ulong rslot
+  ret JS_OK
+end
+
+fn js_branch_read bid ulong idx ulong dst edit uchar 64 to long
+  if ge bid JS_MAX_BR
+    ret JS_ERR_ARG
+  end
+  bb = mul bid JS_BSTRIDE
+  if eq get js_br bb 0
+    ret JS_ERR_ARG
+  end
+  if ge idx get js_br add bb 6
+    ret JS_ERR_ARG
+  end
+  rs = get js_br_units add mul bid JS_MAX_UNITS idx
+  rb = mul rs JS_RSTRIDE
+  if eq get js_br add bb 9 JS_HOME_REMOTE_OWNED
+    pl = get js_reals add rb 10
+    if and ne pl JS_PLACE_HOT ne pl JS_PLACE_COLD
+      ret JS_ERR_REMOTE
+    end
+  end
+  rc = js_real_restore rs
+  if ne rc JS_OK
+    ret rc
+  end
+  put js_clock 0 add get js_clock 0 1
+  put js_reals add rb 13 get js_clock 0
+  put js_reals add rb 14 add get js_reals add rb 14 1
+  db = mul rs JS_UNIT_BYTES
+  for k ulong JS_UNIT_BYTES
+    put dst k get js_real_data add db k
+  end
+  ret JS_OK
+end
+
+fn js_branch_release bid ulong to long
+  if ge bid JS_MAX_BR
+    ret JS_ERR_ARG
+  end
+  bb = mul bid JS_BSTRIDE
+  if eq get js_br bb 0
+    ret JS_ERR_ARG
+  end
+  nu = get js_br add bb 6
+  ub = mul bid JS_MAX_UNITS
+  for i ulong nu bound 32
+    rs = get js_br_units add ub i
+    rb = mul rs JS_RSTRIDE
+    if gt get js_reals add rb 9 0
+      put js_reals add rb 9 sub get js_reals add rb 9 1
+    end
+    js_real_unref rs
+  end
+  put js_br bb 0
+  g = get js_br_gen bid
+  if lt g JS_BRANCH_GEN_RETIRED
+    put js_br_gen bid add g 1
+  end
+  ret JS_OK
+end
+
+fn js_branch_release_ref bid ulong gen ulong subject ulong to long
+  if ne js_branch_check bid gen JS_OK
+    ret JS_ERR_STALE
+  end
+  owner_id = get js_br add mul bid JS_BSTRIDE 7
+  if ne owner_id 0
+    if ne owner_id subject
+      ret JS_ERR_OWNER
+    end
+  end
+  ret js_branch_release bid
+end
+
+fn js_space_reclaim_staged to ulong
+  cnt = ulong 0
+  for i ulong get js_limits 1 bound 64
+    bb = mul i JS_BSTRIDE
+    if ne get js_br bb 0
+      if ne get js_br add bb 8 0
+        ign = js_branch_release i
+        cnt = add cnt 1
+      end
+    end
+  end
+  ret cnt
+end
+
+note ---- FORGE branch policy (f64 cost chooser) & DUAL-3a observation ----
+
+fn js_recompute_cost rslot ulong to f64
+  rb = mul rslot JS_RSTRIDE
+  n = f64 get js_reals add rb 15
+  if eq get js_reals add rb 4 JS_RECIPE_EDIT
+    ret mul n get js_costs 1
+  end
+  ret get js_costs 0
+end
+
+fn js_score_compress n f64 e f64 to f64
+  p = mul n get js_costs 8
+  num = add mul n get js_costs 2 mul e mul n get js_costs 3
+  ret div num sub n p
+end
+
+fn js_score_spill n f64 e f64 held f64 to f64
+  num = add mul n get js_costs 4 mul e mul n get js_costs 5
+  ret div num held
+end
+
+fn js_forge_choose rslot ulong pressure f64 allow_move ulong to ulong
+  rb = mul rslot JS_RSTRIDE
+  pl = get js_reals add rb 10
+  if ne pl JS_PLACE_HOT
+    if ne pl JS_PLACE_COLD
+      if ne pl JS_PLACE_COMPRESSED
+        ret JS_ACT_COUNT
+      end
+    end
+  end
+  n = f64 get js_reals add rb 15
+  held = n
+  if eq pl JS_PLACE_COMPRESSED
+    held = f64 get js_reals add rb 11
+  end
+  e = f64 1.0f64
+  if gt get js_reals add rb 9 1
+    e = f64 get js_reals add rb 9
+  end
+  best = f64 0.0f64
+  act = JS_ACT_COUNT
+  if eq pl JS_PLACE_HOT
+    if ne allow_move 0
+      best = div mul n get js_costs 6 mul n 0.5f64
+      act = JS_ACT_MOVE
+    end
+  end
+  if ne pl JS_PLACE_COMPRESSED
+    if lt mul n get js_costs 8 n
+      sc = js_score_compress n e
+      if or eq act JS_ACT_COUNT lt sc best
+        best = sc
+        act = JS_ACT_COMPRESS
+      end
+    end
+  end
+  sc = js_score_spill n e held
+  if or eq act JS_ACT_COUNT lt sc best
+    best = sc
+    act = JS_ACT_SPILL
+  end
+  sc = div mul e js_recompute_cost rslot held
+  if or eq act JS_ACT_COUNT lt sc best
+    best = sc
+    act = JS_ACT_EVICT
+  end
+  if ne act JS_ACT_COUNT
+    if ge best mul pressure get js_costs 7
+      ret JS_ACT_COUNT
+    end
+  end
+  ret act
+end
+
+fn js_forge_enforce budget_bytes ulong to long
+  put js_rep_cons 0 0
+  put js_rep_kept 0 0
+  for i ulong JS_ACT_COUNT
+    put js_rep_chosen i 0
+  end
+  for i ulong get js_limits 0 bound 256
+    if le get js_stats 12 budget_bytes
+      ret JS_OK
+    end
+    rb = mul i JS_RSTRIDE
+    if ne get js_reals rb 0
+      pl = get js_reals add rb 10
+      if or eq pl JS_PLACE_HOT or eq pl JS_PLACE_COLD eq pl JS_PLACE_COMPRESSED
+        a = js_forge_choose i 1000000000.0f64 0
+        put js_rep_cons 0 add get js_rep_cons 0 1
+        if eq a JS_ACT_COUNT
+          put js_rep_kept 0 add get js_rep_kept 0 1
+        else
+          rc = JS_OK
+          if eq a JS_ACT_COMPRESS
+            rc = js_real_compress i
+          end
+          if eq a JS_ACT_SPILL
+            rc = js_real_spill i
+          end
+          if eq a JS_ACT_EVICT
+            rc = js_real_evict i
+          end
+          if eq rc JS_OK
+            put js_rep_chosen a add get js_rep_chosen a 1
+          end
+        end
+      end
+    end
+  end
+  ret JS_OK
+end
+
+fn js_put_u32_buf dst edit uchar 302 off ulong v ulong to void
+  for k ulong 4
+    put dst add off k uchar and shr v mul k 8 255
+  end
+end
+
+fn js_put_u64_buf dst edit uchar 302 off ulong v ulong to void
+  for k ulong 8
+    put dst add off k uchar and shr v mul k 8 255
+  end
+end
+
+note Encode 302-byte canonical DUAL-3a observation record header + instant fields
+note meta[5]: 0=seq, 1=pressure_bits(f64 bitcast), 2=chosen, 3=rslot, 4=budget
+fn js_dual_observation_encode meta view ulong 5 dst edit uchar 302 to ulong
+  for i ulong JS_DUAL_OBS_BYTES
+    put dst i uchar 0
+  end
+  put dst 0 uchar JS_DUAL_OBS_KIND
+  put dst 1 uchar JS_DUAL_OBS_VERSION
+  put dst 2 uchar 16
+  for i ulong 16
+    put dst add 3 i get js_dual_site i
+  end
+  js_put_u64_buf dst 19 get meta 0
+  js_put_u64_buf dst 27 get meta 1
+  put dst 35 uchar JS_DUAL_PRESSURE_CAPACITY
+  put dst 36 uchar 0
+  put dst 37 uchar and get meta 2 255
+  put dst 38 uchar 3
+  rslot = get meta 3
+  rb = mul rslot JS_RSTRIDE
+  js_put_u32_buf dst 199 rslot
+  js_put_u64_buf dst 203 get js_reals add rb 1
+  put dst 211 uchar and get js_reals add rb 2 255
+  put dst 212 uchar and get js_reals add rb 10 255
+  put dst 213 uchar and get js_reals add rb 4 255
+  js_put_u64_buf dst 214 get js_reals add rb 15
+  js_put_u64_buf dst 222 js_real_res_bytes rslot
+  js_put_u32_buf dst 230 get js_reals add rb 9
+  js_put_u32_buf dst 234 get js_reals add rb 8
+  js_put_u64_buf dst 238 get js_reals add rb 13
+  sb = mul rslot 32
+  for i ulong 32
+    put dst add 246 i get js_real_sem add sb i
+  end
+  js_put_u64_buf dst 278 get meta 4
+  js_put_u64_buf dst 286 get js_stats 12
+  js_put_u64_buf dst 294 get js_stats 12
+  ret JS_DUAL_OBS_BYTES
+end

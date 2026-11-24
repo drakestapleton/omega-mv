@@ -1,0 +1,171 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/runtime/rx_skillroute_unit.om -- Pure seeded OM-2 unit test for rx_skillroute.om.
+
+global sr_checks ulong 1
+global sr_fail ulong 1
+
+text msg_pass "RX_SKILLROUTE_OM: PASS\n"
+text msg_fail "RX_SKILLROUTE_OM: FAIL\n"
+
+fn sr_chk cond bool to void
+  put sr_checks 0 add get sr_checks 0 1
+  if not cond
+    if eq get sr_fail 0 0
+      put sr_fail 0 get sr_checks 0
+    end
+  end
+end
+
+fn make_prov ent edit ulong 21 cap ulong real ulong cost ulong to void
+  for i ulong 21
+    put ent i 0
+  end
+  put ent 0 cap
+  put ent 1 real
+  put ent 4 1
+  put ent 6 2
+  put ent 7 1
+  put ent 8 1
+  put ent 9 1
+  put ent 12 950000
+  put ent 13 950000
+  put ent 14 cost
+  put ent 15 10
+  put ent 16 10
+  put ent 18 CQ_LIVE_AVAILABLE
+  put ent 20 1
+end
+
+fn test_route_check_bind to void
+  mid_self = new uchar 32 0
+  put mid_self 0 uchar 1
+  sr_chk eq cq_catalog_init_canonical 1 mid_self CQ_OK
+  sr_chk eq cq_op_define 1 0 CQ_SRC_ALL CQ_OK
+  sr_skills_reset
+
+  d_sk1 = new uchar 32 0
+  put d_sk1 0 uchar 0x11
+  d_sk2 = new uchar 32 0
+  put d_sk2 0 uchar 0x22
+  sr_chk eq sr_skills_add 10 d_sk1 SR_OK
+  sr_chk eq sr_skills_add 20 d_sk2 SR_OK
+
+  note Register local skill 10 (cost=50) and local skill 20 (cost=100)
+  ent = new ulong 21 0
+  make_prov ent 1 1 50
+  sr_chk eq sr_register_skill 10 1 1 d_sk1 ent SR_OK
+  make_prov ent 2 2 100
+  sr_chk eq sr_register_skill 20 1 1 d_sk2 ent SR_OK
+  sr_chk eq cq_catalog_build CQ_OK
+
+  caps = new ulong 16 0
+  sr_chk eq sr_skill_capabilities 10 1 caps 16 1
+  sr_chk eq get caps 0 1
+
+  need = new ulong 15 0
+  put need 0 1
+  put need 1 1
+  put need 2 1
+  put need 3 1
+  tr = new ulong 19 0
+  put tr 0 1
+  put tr 1 0
+  rpin = new ulong 5 0
+  pdig = new uchar 32 0
+
+  note Route picks cheapest admissible local skill 10
+  sr_chk eq sr_route need tr rpin pdig 100 SR_OK
+  sr_chk eq get sr_out_meta 8 10
+  sr_chk eq sr_route_check 0 100 SR_OK
+
+  note Alternatives returns both skill 10 and skill 20
+  sr_chk eq sr_route_alternatives need tr rpin pdig 100 4 2
+  sr_chk eq get sr_out_meta 8 10
+  sr_chk eq get sr_out_meta 18 20
+
+  note Bind held route to AG_SKILL node in graph 0
+  rx_graph_init 0 1
+  sn = rx_graph_node 0 AG_SKILL AG_T_U64
+  sr_chk eq sr_bind_route 0 ulong sn 0 100 SR_OK
+  sr_chk eq rx_graph_get_node 0 ulong sn 2 10
+
+  note Unavailable fails closed with SR_E_UNAVAILABLE
+  sr_chk eq cq_set_availability 1 1 1 10 CQ_LIVE_UNAVAILABLE CQ_OK
+  sr_chk eq sr_route_check 0 100 SR_E_UNAVAILABLE
+  note Withdrawn fails closed with SR_E_WITHDRAWN
+  sr_chk eq cq_withdraw 1 1 1 10 CQ_OK
+  sr_chk eq sr_route_check 0 100 SR_E_WITHDRAWN
+
+  note Pin version mismatch -> SR_E_NO_CANDIDATE with SR_WHY_PIN
+  put rpin 1 99
+  sr_chk eq sr_route need tr rpin pdig 100 SR_E_NO_CANDIDATE
+  sr_chk ne and get sr_out_why 0 SR_WHY_PIN 0
+end
+
+fn test_remote_route to void
+  mid_self = new uchar 32 0
+  put mid_self 0 uchar 1
+  sr_chk eq cq_catalog_init_canonical 1 mid_self CQ_OK
+  sr_chk eq cq_op_define 1 0 CQ_SRC_ALL CQ_OK
+  sr_skills_reset
+
+  mid_rem = new uchar 32 0
+  put mid_rem 0 uchar 2
+  ridx = new ulong 1 0
+  sr_chk eq cq_machine_advertise_id 1 mid_rem 500 ridx CQ_OK
+
+  d_rem = new uchar 32 0
+  put d_rem 0 uchar 0x33
+  ent = new ulong 21 0
+  make_prov ent 5 5 10
+  sr_chk eq sr_register_skill 30 1 get ridx 0 d_rem ent SR_OK
+  sr_chk eq cq_catalog_build CQ_OK
+
+  need = new ulong 15 0
+  put need 0 1
+  put need 1 1
+  put need 2 1
+  put need 3 1
+  tr = new ulong 19 0
+  rpin = new ulong 5 0
+  pdig = new uchar 32 0
+
+  note Remote winner returns SR_E_REMOTE while lease is live
+  sr_chk eq sr_route need tr rpin pdig 100 SR_E_REMOTE
+  sr_chk eq sr_route_check 0 100 SR_E_REMOTE
+  note Expired lease fails closed with SR_E_MACHINE
+  sr_chk eq sr_route_check 0 600 SR_E_MACHINE
+
+  note local_only refuses remote target with SR_WHY_REMOTE_REFUSED
+  put rpin 0 1
+  sr_chk eq sr_route need tr rpin pdig 100 SR_E_NO_CANDIDATE
+  sr_chk ne and get sr_out_why 0 SR_WHY_REMOTE_REFUSED 0
+end
+
+fn put_msg ok ulong to void
+  buf = new uchar 64 0
+  if ne ok 0
+    n = len msg_pass
+    for i ulong n bound 64
+      put buf i get msg_pass i
+    end
+    ign_p = write 1 buf 0 n
+    ret
+  end
+  n = len msg_fail
+  for i ulong n bound 64
+    put buf i get msg_fail i
+  end
+  ign_f = write 1 buf 0 n
+end
+
+fn main to int
+  test_route_check_bind
+  test_remote_route
+  if ne get sr_fail 0 0
+    put_msg 0
+    ret int get sr_fail 0
+  end
+  put_msg 1
+  ret 0
+end

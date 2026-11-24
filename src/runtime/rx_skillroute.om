@@ -1,0 +1,496 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_skillroute.om -- Pure seeded OM-2 port of src/runtime/rx_skillroute.c.
+note Requires seed/ng/sha256.om, om/runtime/rx_mid.om, om/runtime/rx_capq_core.om,
+note om/runtime/rx_skillroute_core.om, src/runtime/rx_graph.om, and src/runtime/rx_capq.om
+note concatenated before this file (with om2/export stripped).
+
+const SR_OK long 0
+const SR_E_ARG long -40
+const SR_E_NO_CANDIDATE long -41
+const SR_E_REMOTE long -42
+const SR_E_QUERY long -43
+const SR_E_BIND long -44
+const SR_E_STALE long -45
+const SR_E_WITHDRAWN long -46
+const SR_E_UNAVAILABLE long -47
+const SR_E_MACHINE long -48
+
+const SR_WHY_GONE ulong 1
+const SR_WHY_UNAVAILABLE ulong 2
+const SR_WHY_AUTHORITY ulong 4
+const SR_WHY_NOT_SKILL ulong 8
+const SR_WHY_NOT_EXECUTABLE ulong 16
+const SR_WHY_DIGEST ulong 32
+const SR_WHY_REMOTE_REFUSED ulong 64
+const SR_WHY_PIN ulong 128
+const SR_WHY_MACHINE ulong 256
+const SR_WHY_MACHINE_UNKNOWN ulong 512
+
+note Local executable skill table (up to 16 skills)
+global sr_n_skills ulong 1
+global sr_skill_id ulong 16
+global sr_skill_dig uchar 512
+
+note Route output state (up to 16 alternatives, index 0 = winner)
+note sr_out_meta[16*10]:
+note  0:verdict(as ulong), 1:remote, 2:target_known, 3:skill_ver, 4:generation,
+note  5:key_cap, 6:key_real, 7:key_mach, 8:key_skill, 9:cand_idx
+global sr_out_verdict long 16
+global sr_out_meta ulong 160
+global sr_out_sdig uchar 512
+global sr_out_troot ulong 16
+global sr_out_tid uchar 512
+global sr_out_why ulong 1
+global sr_out_nadm ulong 1
+global sr_rej ulong 7
+
+fn sr_skills_reset to void
+  put sr_n_skills 0 0
+end
+
+fn sr_skills_add id ulong dig view uchar 32 to long
+  n = get sr_n_skills 0
+  if or eq id 0 ge n 16
+    ret SR_E_ARG
+  end
+  put sr_skill_id n id
+  sb = mul n 32
+  for i ulong 32
+    put sr_skill_dig add sb i get dig i
+  end
+  put sr_n_skills 0 add n 1
+  ret SR_OK
+end
+
+fn sr_exec_find id ulong to long
+  n = get sr_n_skills 0
+  for i ulong n bound 16
+    if eq get sr_skill_id i id
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn sr_dig_eq_global idx ulong dig view uchar 32 to ulong
+  sb = mul idx 32
+  for i ulong 32
+    if ne get sr_skill_dig add sb i get dig i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn sr_ent_dig_eq eidx ulong dig view uchar 32 to ulong
+  sb = mul eidx 32
+  for i ulong 32
+    if ne get cq_ent_sdig add sb i get dig i
+      ret 0
+    end
+  end
+  ret 1
+end
+
+fn sr_register_skill skill_id ulong ver ulong mach ulong sdig view uchar 32 ent_in view ulong 21 to long
+  if or eq skill_id 0 eq mach 0
+    ret SR_E_ARG
+  end
+  ent = new ulong 21 0
+  for i ulong 21
+    put ent i get ent_in i
+  end
+  put ent 3 skill_id
+  put ent 19 ver
+  put ent 2 mach
+  if eq mach get cq_self_mach 0
+    put ent 5 CQ_SRC_SKILL
+  else
+    put ent 5 CQ_SRC_FABRIC
+  end
+  ret cq_register ent sdig
+end
+
+fn sr_skill_capabilities skill_id ulong ver ulong dst_caps edit ulong 16 max_n ulong to ulong
+  if eq skill_id 0
+    ret 0
+  end
+  n = ulong 0
+  ne_ = get cq_n_ent 0
+  for i ulong ne_ bound 256
+    eb = mul i CQ_ESTRIDE
+    if eq get cq_ent add eb 3 skill_id
+      if eq get cq_ent add eb 19 ver
+        if ne get cq_ent add eb 18 CQ_LIVE_WITHDRAWN
+          if lt n max_n
+            if lt n 16
+              put dst_caps n get cq_ent eb
+            end
+          end
+          n = add n 1
+        end
+      end
+    end
+  end
+  ret n
+end
+
+fn sr_check_mach_id mach ulong to ulong
+  if eq get cq_canonical 0 0
+    ret 1
+  end
+  mr = new ulong 1 0
+  mid = new uchar 32 0
+  if ne cq_machine_identity mach mr mid CQ_OK
+    ret 0
+  end
+  ret 1
+end
+
+fn sr_check_local_exec eidx ulong sk ulong to ulong
+  sidx = sr_exec_find sk
+  if lt sidx 0
+    put sr_rej 1 add get sr_rej 1 1
+    ret 0
+  end
+  edig = new uchar 32 0
+  sb = mul eidx 32
+  for i ulong 32
+    put edig i get cq_ent_sdig add sb i
+  end
+  if eq rx_sr_digest_zero edig 0
+    if eq sr_dig_eq_global ulong sidx edig 0
+      put sr_rej 2 add get sr_rej 2 1
+      ret 0
+    end
+  end
+  ret 1
+end
+
+note req_pin[5]: 0:local_only, 1:pin_ver, 2:pin_mach_set, 3:pin_mach_root, 4:resolved_pin_idx
+fn sr_admit_one eidx ulong is_loc ulong req_pin view ulong 5 pin_dig view uchar 32 to ulong
+  eb = mul eidx CQ_ESTRIDE
+  sk = get cq_ent add eb 3
+  if eq sk 0
+    put sr_rej 0 add get sr_rej 0 1
+    ret 0
+  end
+  pv = get req_pin 1
+  if ne pv 0
+    if ne get cq_ent add eb 19 pv
+      put sr_rej 4 add get sr_rej 4 1
+      ret 0
+    end
+  end
+  if eq rx_sr_digest_zero pin_dig 0
+    if eq sr_ent_dig_eq eidx pin_dig 0
+      put sr_rej 4 add get sr_rej 4 1
+      ret 0
+    end
+  end
+  pidx = get req_pin 4
+  mach = get cq_ent add eb 2
+  if ne pidx 0
+    if ne mach pidx
+      put sr_rej 5 add get sr_rej 5 1
+      ret 0
+    end
+  end
+  if eq sr_check_mach_id mach 0
+    put sr_rej 6 add get sr_rej 6 1
+    ret 0
+  end
+  if eq is_loc 0
+    if ne get req_pin 0 0
+      put sr_rej 3 add get sr_rej 3 1
+      ret 0
+    end
+    ret 1
+  end
+  ret sr_check_local_exec eidx sk
+end
+
+fn sr_compute_why to ulong
+  cnts = new ulong 10 0
+  put cnts 0 get cq_stats 2
+  put cnts 1 get cq_stats 4
+  put cnts 2 get cq_stats 5
+  for i ulong 7
+    put cnts add i 3 get sr_rej i
+  end
+  ret rx_sr_why_of cnts
+end
+
+fn sr_fill_target_mid slot ulong mach ulong to void
+  mr = new ulong 1 0
+  mid = new uchar 32 0
+  mb = mul slot 10
+  if eq cq_machine_identity mach mr mid CQ_OK
+    put sr_out_meta add mb 2 1
+    put sr_out_troot slot get mr 0
+    tb = mul slot 32
+    for i ulong 32
+      put sr_out_tid add tb i get mid i
+    end
+  else
+    put sr_out_meta add mb 2 0
+  end
+end
+
+fn sr_lookup_slot mb ulong to long
+  cap = get sr_out_meta add mb 5
+  real = get sr_out_meta add mb 6
+  mach = get sr_out_meta add mb 7
+  sk = get sr_out_meta add mb 8
+  ret cq_lookup cap real mach sk
+end
+
+fn sr_fill_target slot ulong cidx ulong to void
+  cb = mul cidx CQ_CSTRIDE
+  mb = mul slot 10
+  rem_f = ulong 1
+  if ne get cq_res_cand add cb 15 0
+    rem_f = ulong 0
+  end
+  put sr_out_meta add mb 1 rem_f
+  put sr_out_meta add mb 5 get cq_res_cand cb
+  put sr_out_meta add mb 6 get cq_res_cand add cb 3
+  put sr_out_meta add mb 7 get cq_res_cand add cb 2
+  put sr_out_meta add mb 8 get cq_res_cand add cb 1
+  put sr_out_meta add mb 9 cidx
+  eidx = sr_lookup_slot mb
+  if ge eidx 0
+    eb = mul ulong eidx CQ_ESTRIDE
+    put sr_out_meta add mb 3 get cq_ent add eb 19
+    put sr_out_meta add mb 4 get cq_ent add eb 20
+    sb = mul ulong eidx 32
+    db = mul slot 32
+    for i ulong 32
+      put sr_out_sdig add db i get cq_ent_sdig add sb i
+    end
+  end
+  sr_fill_target_mid slot get cq_res_cand add cb 2
+  if ne rem_f 0
+    put sr_out_verdict slot SR_E_REMOTE
+  else
+    put sr_out_verdict slot SR_OK
+  end
+end
+
+global sr_tmp_nf ulong 1
+
+fn sr_probe_entry eidx ulong req_pin view ulong 5 pin_dig view uchar 32 now_us ulong req_held ulong to void
+  eb = mul eidx CQ_ESTRIDE
+  put cq_stats 0 add get cq_stats 0 1
+  lv = get cq_ent add eb 18
+  mach = get cq_ent add eb 2
+  if eq lv CQ_LIVE_WITHDRAWN
+    put cq_stats 2 add get cq_stats 2 1
+    ret
+  end
+  if eq cq_machine_live mach now_us 0
+    put cq_stats 2 add get cq_stats 2 1
+    ret
+  end
+  if ne lv CQ_LIVE_AVAILABLE
+    put cq_stats 4 add get cq_stats 4 1
+    ret
+  end
+  is_loc = ulong 0
+  if eq mach get cq_self_mach 0
+    is_loc = ulong 1
+  end
+  if eq cq_filter_one eidx is_loc 0
+    ret
+  end
+  hf = cq_held_now_ent eb
+  if ne req_held 0
+    if eq hf 0
+      put cq_stats 5 add get cq_stats 5 1
+      ret
+    end
+  end
+  if eq sr_admit_one eidx is_loc req_pin pin_dig 0
+    put cq_stats 6 add get cq_stats 6 1
+    ret
+  end
+  nf = get sr_tmp_nf 0
+  if lt nf 64
+    cq_copy_ent_to_feas eidx nf is_loc hf
+    put sr_tmp_nf 0 add nf 1
+  end
+end
+
+fn sr_probe_bucket bk ulong req_pin view ulong 5 pin_dig view uchar 32 now_us ulong req_held ulong to void
+  j0 = get cq_bstart bk
+  cnt = sub get cq_bstart add bk 1 j0
+  for jj ulong cnt bound 256
+    sr_probe_entry get cq_bucket add j0 jj req_pin pin_dig now_us req_held
+  end
+end
+
+fn sr_probe_all req_pin view ulong 5 pin_dig view uchar 32 now_us ulong req_held ulong to void
+  put sr_tmp_nf 0 0
+  for oi ulong get cq_plan_n_ops 0 bound 32
+    op = get cq_plan_ops oi
+    for s ulong CQ_SOURCES
+      if ne and get cq_plan_sources 0 shl ulong 1 s 0
+        sr_probe_bucket add mul op CQ_SOURCES s req_pin pin_dig now_us req_held
+      end
+    end
+  end
+end
+
+fn sr_route_k need view ulong 15 tr view ulong 19 req_pin view ulong 5 pin_dig view uchar 32 now_us ulong alts ulong to long
+  for i ulong 7
+    put sr_rej i 0
+    put cq_stats i 0
+  end
+  put sr_out_why 0 0
+  put sr_out_nadm 0 0
+  put sr_out_verdict 0 SR_E_ARG
+  if eq get cq_built 0 0
+    put sr_out_verdict 0 SR_E_QUERY
+    ret SR_E_QUERY
+  end
+  cv = cq_compile need
+  if eq cv CQ_E_NO_SOURCE
+    put sr_out_verdict 0 SR_E_NO_CANDIDATE
+    ret SR_E_NO_CANDIDATE
+  end
+  if ne cv CQ_OK
+    put sr_out_verdict 0 SR_E_QUERY
+    ret SR_E_QUERY
+  end
+  cq_pack_need_vec need tr
+  sr_probe_all req_pin pin_dig now_us and get tr 18 2
+  nf = get sr_tmp_nf 0
+  put sr_out_nadm 0 nf
+  if eq nf 0
+    put sr_out_why 0 sr_compute_why
+    put sr_out_verdict 0 SR_E_NO_CANDIDATE
+    ret SR_E_NO_CANDIDATE
+  end
+  tr2 = new ulong 19 0
+  for i ulong 19
+    put tr2 i get tr i
+  end
+  kk = ulong 1
+  if ne alts 0
+    kk = alts
+    if gt kk CQ_MAX_K
+      kk = CQ_MAX_K
+    end
+    put tr2 18 or get tr2 18 1
+  end
+  n_out = cq_rank_feas nf tr2 kk
+  if le n_out 0
+    put sr_out_why 0 sr_compute_why
+    put sr_out_verdict 0 SR_E_NO_CANDIDATE
+    ret SR_E_NO_CANDIDATE
+  end
+  for i ulong ulong n_out bound 16
+    sr_fill_target i i
+  end
+  ret n_out
+end
+
+fn sr_route need view ulong 15 tr view ulong 19 req_pin view ulong 5 pin_dig view uchar 32 now_us ulong to long
+  n = sr_route_k need tr req_pin pin_dig now_us 0
+  if lt n 0
+    ret n
+  end
+  ret get sr_out_verdict 0
+end
+
+fn sr_route_alternatives need view ulong 15 tr view ulong 19 req_pin view ulong 5 pin_dig view uchar 32 now_us ulong max_n ulong to long
+  if eq max_n 0
+    ret SR_E_ARG
+  end
+  ret sr_route_k need tr req_pin pin_dig now_us max_n
+end
+
+fn sr_check_slot_dig slot ulong eu ulong sk ulong is_rem ulong to long
+  sdig = new uchar 32 0
+  db = mul slot 32
+  for i ulong 32
+    put sdig i get sr_out_sdig add db i
+  end
+  if eq sr_ent_dig_eq eu sdig 0
+    ret SR_E_STALE
+  end
+  if ne is_rem 0
+    ret SR_E_REMOTE
+  end
+  sidx = sr_exec_find sk
+  if lt sidx 0
+    ret SR_E_STALE
+  end
+  if eq rx_sr_digest_zero sdig 0
+    if eq sr_dig_eq_global ulong sidx sdig 0
+      ret SR_E_STALE
+    end
+  end
+  ret SR_OK
+end
+
+fn sr_route_check slot ulong now_us ulong to long
+  v = get sr_out_verdict slot
+  if and ne v SR_OK ne v SR_E_REMOTE
+    ret SR_E_ARG
+  end
+  mb = mul slot 10
+  eidx = sr_lookup_slot mb
+  if lt eidx 0
+    ret SR_E_WITHDRAWN
+  end
+  eu = ulong eidx
+  eb = mul eu CQ_ESTRIDE
+  lv = get cq_ent add eb 18
+  if eq lv CQ_LIVE_WITHDRAWN
+    ret SR_E_WITHDRAWN
+  end
+  if ne lv CQ_LIVE_AVAILABLE
+    ret SR_E_UNAVAILABLE
+  end
+  if ne get cq_ent add eb 20 get sr_out_meta add mb 4
+    ret SR_E_STALE
+  end
+  if ne get cq_ent add eb 19 get sr_out_meta add mb 3
+    ret SR_E_STALE
+  end
+  mach = get sr_out_meta add mb 7
+  if eq cq_machine_live mach now_us 0
+    ret SR_E_MACHINE
+  end
+  is_rem = get sr_out_meta add mb 1
+  if eq is_rem 0
+    if ne mach get cq_self_mach 0
+      ret SR_E_MACHINE
+    end
+  end
+  ret sr_check_slot_dig slot eu get sr_out_meta add mb 8 is_rem
+end
+
+fn sr_bind_closed g ulong node ulong cidx ulong to long
+  if ge node get ag_n_nodes g
+    ret SR_E_BIND
+  end
+  old_op = rx_graph_get_node g node 2
+  old_na = get ag_n_auth g
+  if ne cq_bind_skill_node g node cidx CQ_OK
+    rx_graph_set_node g node 2 old_op
+    put ag_n_auth g old_na
+    ret SR_E_BIND
+  end
+  ret SR_OK
+end
+
+fn sr_bind_route g ulong node ulong slot ulong now_us ulong to long
+  rc = sr_route_check slot now_us
+  if ne rc SR_OK
+    ret rc
+  end
+  cidx = get sr_out_meta add mul slot 10 9
+  ret sr_bind_closed g node cidx
+end

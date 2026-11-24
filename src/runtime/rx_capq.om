@@ -1,0 +1,1298 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_capq.om -- Pure seeded OM-2 port of src/runtime/rx_capq.c.
+note Requires seed/ng/sha256.om, om/runtime/rx_mid.om, om/runtime/rx_capq_core.om,
+note and src/runtime/rx_graph.om concatenated before this file (with om2/export stripped).
+
+const CQ_MAX_K ulong 16
+const CQ_MAX_PLAN_OPS ulong 32
+const CQ_SOURCES ulong 5
+const CQ_SRC_GRAPH ulong 0
+const CQ_SRC_SKILL ulong 1
+const CQ_SRC_MCP ulong 2
+const CQ_SRC_PHYSICAL ulong 3
+const CQ_SRC_FABRIC ulong 4
+const CQ_SRC_ALL ulong 31
+
+const CQ_LOC_LOCAL ulong 1
+const CQ_LOC_FABRIC ulong 2
+
+const CQ_LIVE_WITHDRAWN ulong 0
+const CQ_LIVE_AVAILABLE ulong 1
+const CQ_LIVE_UNAVAILABLE ulong 2
+
+const CQ_DIMS ulong 7
+const CQ_WIRE_BYTES ulong 188
+const CQ_WIRE_ADVERTISE ulong 1
+const CQ_WIRE_AVAILABILITY ulong 2
+const CQ_WIRE_WITHDRAW ulong 3
+
+const CQ_OK long 0
+const CQ_E_ARG long -1
+const CQ_E_NOMEM long -2
+const CQ_E_NO_OP long -3
+const CQ_E_NO_SOURCE long -4
+const CQ_E_UNBUILT long -5
+const CQ_E_PLAN_FULL long -6
+const CQ_E_NOT_FOUND long -7
+const CQ_E_WITHDRAWN long -8
+const CQ_E_NO_IDENTITY long -9
+const CQ_E_WIRE long -10
+const CQ_E_STALE long -11
+
+const CQ_MAX_OPS ulong 64
+const CQ_MAX_ALIASES ulong 64
+const CQ_MAX_MACHS ulong 32
+const CQ_MAX_ENTRIES ulong 256
+const CQ_ESTRIDE ulong 24
+const CQ_CSTRIDE ulong 16
+
+note Catalog state in static BSS
+global cq_self_mach ulong 1
+global cq_canonical ulong 1
+global cq_built ulong 1
+global cq_n_ops ulong 1
+global cq_op_parent ulong 65
+global cq_op_domains ulong 65
+global cq_op_first_ch ulong 65
+global cq_op_next_sib ulong 65
+
+global cq_n_alias ulong 1
+global cq_alias_key ulong 64
+global cq_alias_op ulong 64
+
+global cq_n_mach ulong 1
+global cq_mach_key ulong 32
+global cq_mach_lease ulong 32
+
+note Canonical machine index (1-based: slot 1..31)
+global cq_mid_n ulong 1
+global cq_mid_root ulong 32
+global cq_mid_bytes uchar 1024
+
+note Entry table (256 entries * 24 ulongs):
+note  0:cap_id, 1:real_id, 2:mach_id, 3:skill_id, 4:op, 5:source, 6:ev_level,
+note  7:effects, 8:in_types, 9:out_types, 10:auth_res, 11:auth_rights,
+note  12:conf_ppm, 13:rel_ppm, 14:cost, 15:lat_us, 16:eng_uj, 17:ev_ref,
+note  18:live, 19:skill_ver, 20:generation
+global cq_n_ent ulong 1
+global cq_ent ulong 6144
+global cq_ent_sdig uchar 8192
+
+note Bucket index: (op * 5 + src) -> start/count in cq_bucket[256]
+global cq_bstart ulong 330
+global cq_bucket ulong 256
+
+note Compiled plan state
+global cq_plan_verdict long 1
+global cq_plan_op ulong 1
+global cq_plan_n_ops ulong 1
+global cq_plan_ops ulong 32
+global cq_plan_sources ulong 1
+global cq_plan_n_probes ulong 1
+global cq_plan_digest uchar 32
+
+note Query result & stats & scratch candidates (max 64 feasible)
+note Candidate layout (stride 16):
+note  0:cap_id, 1:skill_id, 2:mach_id, 3:real_id, 4:auth_res, 5:auth_rights,
+note  6:auth_held, 7:cost, 8:lat, 9:eng, 10:conf, 11:rel, 12:ev_ref,
+note  13:ev_level, 14:source, 15:local (effects in separate array)
+global cq_feas ulong 1024
+global cq_feas_fx ulong 64
+global cq_res_verdict long 1
+global cq_res_n ulong 1
+global cq_res_n_feas ulong 1
+global cq_res_n_front ulong 1
+global cq_res_cand ulong 256
+global cq_res_fx ulong 16
+global cq_stats ulong 7
+
+note Held authority table (optional, up to 16 entries * 2: 0=res, 1=rights)
+global cq_held_n ulong 1
+global cq_held_tbl ulong 32
+
+global cq_sh_len ulong 1
+
+text cq_tag_ont "OMEGA-CAPQ-ONTOLOGY-1"
+text cq_tag_plan "OMEGA-CAPQ-PLAN-1"
+
+fn cq_sh_reset to void
+  put cq_sh_len 0 0
+end
+
+fn cq_sh_put8 v ulong to void
+  p = get cq_sh_len 0
+  put sh_dat p uchar and v 255
+  put cq_sh_len 0 add p 1
+end
+
+fn cq_sh_put32_le v ulong to void
+  cq_sh_put8 v
+  cq_sh_put8 shr v 8
+  cq_sh_put8 shr v 16
+  cq_sh_put8 shr v 24
+end
+
+fn cq_sh_put64_le v ulong to void
+  cq_sh_put32_le v
+  cq_sh_put32_le shr v 32
+end
+
+note ---- canonical machine index ----
+
+fn cq_mid_find root ulong id view uchar 32 to ulong
+  n = get cq_mid_n 0
+  for i ulong n bound 32
+    idx = add i 1
+    if eq get cq_mid_root idx root
+      mb = mul idx 32
+      eqm = ulong 1
+      for j ulong 32
+        if ne get cq_mid_bytes add mb j get id j
+          eqm = ulong 0
+        end
+      end
+      if ne eqm 0
+        ret idx
+      end
+    end
+  end
+  ret 0
+end
+
+fn cq_mid_bind root ulong id view uchar 32 to ulong
+  if or lt root 1 gt root 3
+    ret 0
+  end
+  if eq rx_mid_is_zero id 1
+    ret 0
+  end
+  ex = cq_mid_find root id
+  if ne ex 0
+    ret ex
+  end
+  n = get cq_mid_n 0
+  if ge n 31
+    ret 0
+  end
+  idx = add n 1
+  put cq_mid_n 0 idx
+  put cq_mid_root idx root
+  mb = mul idx 32
+  for j ulong 32
+    put cq_mid_bytes add mb j get id j
+  end
+  ret idx
+end
+
+fn cq_machine_identity mach ulong dst_root edit ulong 1 dst_id edit uchar 32 to long
+  if eq get cq_canonical 0 0
+    ret CQ_E_NO_IDENTITY
+  end
+  if or eq mach 0 gt mach get cq_mid_n 0
+    ret CQ_E_NO_IDENTITY
+  end
+  put dst_root 0 get cq_mid_root mach
+  mb = mul mach 32
+  for j ulong 32
+    put dst_id j get cq_mid_bytes add mb j
+  end
+  ret CQ_OK
+end
+
+fn cq_machine_index root ulong id view uchar 32 to ulong
+  if eq get cq_canonical 0 0
+    ret 0
+  end
+  ret cq_mid_find root id
+end
+
+note ---- catalog init / ops / aliases / leases ----
+
+fn cq_catalog_init self_m ulong to long
+  if eq self_m 0
+    ret CQ_E_ARG
+  end
+  put cq_self_mach 0 self_m
+  put cq_canonical 0 0
+  put cq_built 0 0
+  put cq_n_ops 0 0
+  put cq_n_alias 0 0
+  put cq_n_mach 0 0
+  put cq_n_ent 0 0
+  put cq_mid_n 0 0
+  put cq_held_n 0 0
+  for i ulong 65
+    put cq_op_parent i 0
+    put cq_op_domains i 0
+    put cq_op_first_ch i 0
+    put cq_op_next_sib i 0
+  end
+  ret CQ_OK
+end
+
+fn cq_catalog_init_canonical root ulong self_id view uchar 32 to long
+  ign = cq_catalog_init 1
+  idx = cq_mid_bind root self_id
+  if eq idx 0
+    ret CQ_E_NO_IDENTITY
+  end
+  put cq_self_mach 0 idx
+  put cq_canonical 0 1
+  ret CQ_OK
+end
+
+fn cq_catalog_free to void
+  put cq_n_ops 0 0
+  put cq_n_alias 0 0
+  put cq_n_mach 0 0
+  put cq_n_ent 0 0
+  put cq_built 0 0
+  put cq_canonical 0 0
+end
+
+fn cq_op_define op ulong parent ulong domains ulong to long
+  no = get cq_n_ops 0
+  if ne op add no 1
+    ret CQ_E_ARG
+  end
+  if or ge parent op ge op CQ_MAX_OPS
+    ret CQ_E_ARG
+  end
+  if ne and domains xor CQ_SRC_ALL ulong 0xffffffffffffffff 0
+    ret CQ_E_ARG
+  end
+  put cq_op_parent op parent
+  put cq_op_domains op domains
+  put cq_op_first_ch op 0
+  put cq_op_next_sib op 0
+  if ne parent 0
+    put cq_op_next_sib op get cq_op_first_ch parent
+    put cq_op_first_ch parent op
+  end
+  put cq_n_ops 0 op
+  put cq_built 0 0
+  ret CQ_OK
+end
+
+fn cq_alias al ulong op ulong to long
+  no = get cq_n_ops 0
+  if or eq al 0 eq op 0
+    ret CQ_E_ARG
+  end
+  if or gt op no eq al op
+    ret CQ_E_ARG
+  end
+  na = get cq_n_alias 0
+  for i ulong na bound 64
+    if eq get cq_alias_key i al
+      put cq_alias_op i op
+      ret CQ_OK
+    end
+  end
+  if ge na CQ_MAX_ALIASES
+    ret CQ_E_NOMEM
+  end
+  put cq_alias_key na al
+  put cq_alias_op na op
+  put cq_n_alias 0 add na 1
+  ret CQ_OK
+end
+
+fn cq_resolve name ulong to ulong
+  if eq name 0
+    ret 0
+  end
+  na = get cq_n_alias 0
+  for i ulong na bound 64
+    if eq get cq_alias_key i name
+      ret get cq_alias_op i
+    end
+  end
+  if le name get cq_n_ops 0
+    ret name
+  end
+  ret 0
+end
+
+fn cq_machine_advertise mach ulong lease_us ulong to long
+  if or eq mach 0 eq mach get cq_self_mach 0
+    ret CQ_E_ARG
+  end
+  nm = get cq_n_mach 0
+  for i ulong nm bound 32
+    if eq get cq_mach_key i mach
+      put cq_mach_lease i lease_us
+      ret CQ_OK
+    end
+  end
+  if ge nm CQ_MAX_MACHS
+    ret CQ_E_NOMEM
+  end
+  put cq_mach_key nm mach
+  put cq_mach_lease nm lease_us
+  put cq_n_mach 0 add nm 1
+  ret CQ_OK
+end
+
+fn cq_machine_advertise_id root ulong id view uchar 32 lease_us ulong dst_idx edit ulong 1 to long
+  if eq get cq_canonical 0 0
+    ret CQ_E_NO_IDENTITY
+  end
+  idx = cq_mid_bind root id
+  if eq idx 0
+    ret CQ_E_NO_IDENTITY
+  end
+  rc = cq_machine_advertise idx lease_us
+  if eq rc CQ_OK
+    put dst_idx 0 idx
+  end
+  ret rc
+end
+
+fn cq_machine_live mach ulong now_us ulong to ulong
+  if eq mach get cq_self_mach 0
+    ret 1
+  end
+  nm = get cq_n_mach 0
+  for i ulong nm bound 32
+    if eq get cq_mach_key i mach
+      if gt get cq_mach_lease i now_us
+        ret 1
+      end
+      ret 0
+    end
+  end
+  ret 0
+end
+
+note ---- entries: lookup / register / availability / withdraw / build ----
+
+fn cq_lookup cap_id ulong real_id ulong mach_id ulong skill_id ulong to long
+  ne_ = get cq_n_ent 0
+  for i ulong ne_ bound 256
+    b = mul i CQ_ESTRIDE
+    if eq get cq_ent b cap_id
+      if eq get cq_ent add b 1 real_id
+        if eq get cq_ent add b 2 mach_id
+          if eq get cq_ent add b 3 skill_id
+            ret long i
+          end
+        end
+      end
+    end
+  end
+  ret -1
+end
+
+fn cq_store_entry idx ulong ent view ulong 21 sdig view uchar 32 to void
+  b = mul idx CQ_ESTRIDE
+  for k ulong 21
+    put cq_ent add b k get ent k
+  end
+  b = mul idx 32
+  for k ulong 32
+    put cq_ent_sdig add b k get sdig k
+  end
+end
+
+fn cq_register ent view ulong 21 sdig view uchar 32 to long
+  op = get ent 4
+  src = get ent 5
+  mach = get ent 2
+  if or eq op 0 gt op get cq_n_ops 0
+    ret CQ_E_ARG
+  end
+  if or ge src CQ_SOURCES eq mach 0
+    ret CQ_E_ARG
+  end
+  if gt get ent 18 CQ_LIVE_UNAVAILABLE
+    ret CQ_E_ARG
+  end
+  if eq and get cq_op_domains op shl ulong 1 src 0
+    ret CQ_E_ARG
+  end
+  if ne eq src CQ_SRC_FABRIC ne mach get cq_self_mach 0
+    ret CQ_E_ARG
+  end
+  ex = cq_lookup get ent 0 get ent 1 mach get ent 3
+  if ge ex 0
+    b = mul ulong ex CQ_ESTRIDE
+    if ne get cq_ent add b 4 op
+      put cq_built 0 0
+    end
+    if ne get cq_ent add b 5 src
+      put cq_built 0 0
+    end
+    cq_store_entry ulong ex ent sdig
+    ret CQ_OK
+  end
+  ne_ = get cq_n_ent 0
+  if ge ne_ CQ_MAX_ENTRIES
+    ret CQ_E_NOMEM
+  end
+  cq_store_entry ne_ ent sdig
+  put cq_n_ent 0 add ne_ 1
+  put cq_built 0 0
+  ret CQ_OK
+end
+
+fn cq_set_availability cap_id ulong real_id ulong mach_id ulong skill_id ulong live ulong to long
+  if and ne live CQ_LIVE_AVAILABLE ne live CQ_LIVE_UNAVAILABLE
+    ret CQ_E_ARG
+  end
+  ex = cq_lookup cap_id real_id mach_id skill_id
+  if lt ex 0
+    ret CQ_E_NOT_FOUND
+  end
+  b = mul ulong ex CQ_ESTRIDE
+  if eq get cq_ent add b 18 CQ_LIVE_WITHDRAWN
+    ret CQ_E_WITHDRAWN
+  end
+  put cq_ent add b 18 live
+  ret CQ_OK
+end
+
+fn cq_withdraw cap_id ulong real_id ulong mach_id ulong skill_id ulong to long
+  ex = cq_lookup cap_id real_id mach_id skill_id
+  if lt ex 0
+    ret CQ_E_NOT_FOUND
+  end
+  b = mul ulong ex CQ_ESTRIDE
+  put cq_ent add b 18 CQ_LIVE_WITHDRAWN
+  ret CQ_OK
+end
+
+global cq_bfill ulong 330
+global cq_ont_pairs ulong 64
+
+fn cq_build_prefix nb ulong to void
+  for i ulong add nb 1 bound 330
+    put cq_bstart i 0
+  end
+  for i ulong get cq_n_ent 0 bound 256
+    b = mul i CQ_ESTRIDE
+    opv = get cq_ent add b 4
+    sv = get cq_ent add b 5
+    bk = add add mul opv CQ_SOURCES sv 1
+    put cq_bstart bk add get cq_bstart bk 1
+  end
+  for b ulong nb bound 329
+    nxt = add b 1
+    put cq_bstart nxt add get cq_bstart nxt get cq_bstart b
+  end
+end
+
+fn cq_catalog_build to long
+  nb = mul add get cq_n_ops 0 1 CQ_SOURCES
+  cq_build_prefix nb
+  for b ulong nb bound 330
+    put cq_bfill b get cq_bstart b
+  end
+  for i ulong get cq_n_ent 0 bound 256
+    eb = mul i CQ_ESTRIDE
+    opv = get cq_ent add eb 4
+    sv = get cq_ent add eb 5
+    bk = add mul opv CQ_SOURCES sv
+    pos = get cq_bfill bk
+    put cq_bucket pos i
+    put cq_bfill bk add pos 1
+  end
+  put cq_built 0 1
+  ret CQ_OK
+end
+
+note ---- ontology digest & compile ----
+
+fn cq_sort_ont_pairs na ulong to void
+  for a ulong na bound 64
+    for b ulong sub na a bound 64
+      if gt b 0
+        j = add a b
+        if gt get cq_ont_pairs a get cq_ont_pairs j
+          tmp = get cq_ont_pairs a
+          put cq_ont_pairs a get cq_ont_pairs j
+          put cq_ont_pairs j tmp
+        end
+      end
+    end
+  end
+end
+
+fn cq_ontology_digest dst edit uchar 32 to void
+  cq_sh_reset
+  for i ulong len cq_tag_ont bound 32
+    cq_sh_put8 ulong get cq_tag_ont i
+  end
+  no = get cq_n_ops 0
+  cq_sh_put32_le no
+  for i ulong no bound 64
+    op = add i 1
+    cq_sh_put32_le get cq_op_parent op
+    cq_sh_put32_le get cq_op_domains op
+  end
+  na = get cq_n_alias 0
+  for i ulong na bound 64
+    put cq_ont_pairs i or shl get cq_alias_key i 32 get cq_alias_op i
+  end
+  cq_sort_ont_pairs na
+  cq_sh_put32_le na
+  for i ulong na bound 64
+    cq_sh_put64_le get cq_ont_pairs i
+  end
+  sh_all get cq_sh_len 0
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn cq_compile_hash need view ulong 15 loc ulong to void
+  cq_sh_reset
+  for j ulong len cq_tag_plan bound 32
+    cq_sh_put8 ulong get cq_tag_plan j
+  end
+  cq_sh_put32_le get cq_plan_op 0
+  n_ops = get cq_plan_n_ops 0
+  cq_sh_put32_le n_ops
+  for j ulong n_ops bound 32
+    cq_sh_put32_le get cq_plan_ops j
+  end
+  cq_sh_put32_le get cq_plan_sources 0
+  cq_sh_put64_le get need 1
+  cq_sh_put64_le get need 2
+  cq_sh_put32_le get need 3
+  cq_sh_put64_le get need 4
+  cq_sh_put64_le get need 5
+  cq_sh_put32_le get need 6
+  cq_sh_put32_le loc
+  cq_sh_put32_le get need 8
+  cq_sh_put64_le get need 9
+  cq_sh_put64_le get need 10
+  cq_sh_put32_le get need 11
+  cq_sh_put32_le get need 12
+  sh_all get cq_sh_len 0
+  for j ulong 32
+    put cq_plan_digest j get sh_dig j
+  end
+end
+
+fn cq_sort_plan_ops n_ops ulong to void
+  for a ulong n_ops bound 32
+    for b ulong sub n_ops a bound 32
+      if gt b 0
+        j = add a b
+        if gt get cq_plan_ops a get cq_plan_ops j
+          tmp = get cq_plan_ops a
+          put cq_plan_ops a get cq_plan_ops j
+          put cq_plan_ops j tmp
+        end
+      end
+    end
+  end
+end
+
+note need[15]: 0:sem_op, 1:acc_in, 2:req_out, 3:fx_cls, 4:res_lo, 5:res_hi,
+note           6:max_r, 7:loc, 8:pin, 9:lat_b, 10:eng_b, 11:rel_req,
+note           12:ev_req, 13:sources
+fn cq_compile need view ulong 15 to long
+  put cq_plan_verdict 0 CQ_E_ARG
+  put cq_plan_op 0 0
+  put cq_plan_n_ops 0 0
+  put cq_plan_sources 0 0
+  put cq_plan_n_probes 0 0
+  op = cq_resolve get need 0
+  if eq op 0
+    put cq_plan_verdict 0 CQ_E_NO_OP
+    ret CQ_E_NO_OP
+  end
+  put cq_plan_op 0 op
+  put cq_plan_ops 0 op
+  n_ops = ulong 1
+  domains = ulong 0
+  i = ulong 0
+  while lt i n_ops bound 32
+    cur = get cq_plan_ops i
+    domains = or domains get cq_op_domains cur
+    ch = get cq_op_first_ch cur
+    while ne ch 0 bound 64
+      if ge n_ops CQ_MAX_PLAN_OPS
+        put cq_plan_verdict 0 CQ_E_PLAN_FULL
+        ret CQ_E_PLAN_FULL
+      end
+      put cq_plan_ops n_ops ch
+      n_ops = add n_ops 1
+      ch = get cq_op_next_sib ch
+    end
+    i = add i 1
+  end
+  cq_sort_plan_ops n_ops
+  put cq_plan_n_ops 0 n_ops
+  loc = get need 7
+  if eq loc 0
+    loc = or CQ_LOC_LOCAL CQ_LOC_FABRIC
+  end
+  s = rx_cq_plan_sources domains get need 13 loc get need 8 get cq_self_mach 0
+  put cq_plan_sources 0 s
+  pc = ulong 0
+  for b ulong 5
+    if ne and s shl ulong 1 b 0
+      pc = add pc 1
+    end
+  end
+  put cq_plan_n_probes 0 mul n_ops pc
+  cq_compile_hash need loc
+  if eq s 0
+    put cq_plan_verdict 0 CQ_E_NO_SOURCE
+    ret CQ_E_NO_SOURCE
+  end
+  put cq_plan_verdict 0 CQ_OK
+  ret CQ_OK
+end
+
+note ---- ranking ----
+
+fn cq_pack_feas_7 idx ulong dst edit ulong 7 to void
+  b = mul idx CQ_CSTRIDE
+  put dst 0 get cq_feas add b 7
+  put dst 1 get cq_feas add b 8
+  put dst 2 get cq_feas add b 9
+  put dst 3 get cq_feas add b 10
+  put dst 4 get cq_feas add b 11
+  put dst 5 get cq_feas add b 6
+  put dst 6 get cq_feas add b 15
+end
+
+fn cq_pack_feas_11 idx ulong dst edit ulong 11 to void
+  b = mul idx CQ_CSTRIDE
+  put dst 0 get cq_feas add b 7
+  put dst 1 get cq_feas add b 8
+  put dst 2 get cq_feas add b 9
+  put dst 3 get cq_feas add b 10
+  put dst 4 get cq_feas add b 11
+  put dst 5 get cq_feas add b 6
+  put dst 6 get cq_feas add b 15
+  put dst 7 get cq_feas b
+  put dst 8 get cq_feas add b 3
+  put dst 9 get cq_feas add b 2
+  put dst 10 get cq_feas add b 1
+end
+
+fn cq_feas_dim_val idx ulong dim ulong to ulong
+  v7 = new ulong 7 0
+  cq_pack_feas_7 idx v7
+  ret rx_cq_dim_value v7 dim
+end
+
+fn cq_feas_cmp a ulong b ulong dims view uchar 7 nd ulong to long
+  pa = new ulong 11 0
+  pb = new ulong 11 0
+  cq_pack_feas_11 a pa
+  cq_pack_feas_11 b pb
+  ret rx_cq_cmp_full pa pb dims nd
+end
+
+fn cq_feas_dom a ulong b ulong dims view uchar 7 nd ulong to ulong
+  pa = new ulong 7 0
+  pb = new ulong 7 0
+  cq_pack_feas_7 a pa
+  cq_pack_feas_7 b pb
+  ret rx_cq_dominates pa pb dims nd
+end
+
+global cq_rank_idx ulong 64
+global cq_rank_fr ulong 64
+global cq_rank_mark uchar 64
+global cq_rank_live uchar 64
+
+fn cq_rank_sort_and_front nf ulong dims view uchar 7 nd ulong to ulong
+  for i ulong nf bound 64
+    put cq_rank_idx i i
+  end
+  for a ulong nf bound 64
+    for b ulong sub nf a bound 64
+      if gt b 0
+        j = add a b
+        if gt cq_feas_cmp get cq_rank_idx a get cq_rank_idx j dims nd 0
+          tmp = get cq_rank_idx a
+          put cq_rank_idx a get cq_rank_idx j
+          put cq_rank_idx j tmp
+        end
+      end
+    end
+  end
+  nfr = ulong 0
+  for i ulong nf bound 64
+    ci = get cq_rank_idx i
+    dom = ulong 0
+    for j ulong nfr bound 64
+      if eq dom 0
+        if ne cq_feas_dom get cq_rank_fr j ci dims nd 0
+          dom = ulong 1
+        end
+      end
+    end
+    if eq dom 0
+      put cq_rank_fr nfr ci
+      nfr = add nfr 1
+    end
+  end
+  ret nfr
+end
+
+fn cq_rank_pick_one nf ulong dims view uchar 7 nd ulong tr view ulong 19 to long
+  for i ulong nf bound 64
+    if eq get cq_rank_mark i uchar 1
+      put cq_rank_live i uchar 1
+    else
+      put cq_rank_live i uchar 0
+    end
+  end
+  for d ulong nd bound 7
+    dim = ulong get dims d
+    best = ulong 0xffffffffffffffff
+    for i ulong nf bound 64
+      if ne get cq_rank_live i uchar 0
+        v = cq_feas_dim_val i dim
+        if lt v best
+          best = v
+        end
+      end
+    end
+    tol = get tr add 8 dim
+    for i ulong nf bound 64
+      if ne get cq_rank_live i uchar 0
+        if eq rx_cq_within cq_feas_dim_val i dim best tol 0
+          put cq_rank_live i uchar 0
+        end
+      end
+    end
+  end
+  for i ulong nf bound 64
+    ci = get cq_rank_idx i
+    if ne get cq_rank_live ci uchar 0
+      ret long ci
+    end
+  end
+  ret -1
+end
+
+fn cq_rank_init_mark nf ulong nfr ulong inc_dom ulong to ulong
+  for i ulong nf bound 64
+    put cq_rank_mark i uchar 0
+  end
+  if ne inc_dom 0
+    for i ulong nf bound 64
+      put cq_rank_mark i uchar 1
+    end
+    ret nf
+  end
+  for j ulong nfr bound 64
+    put cq_rank_mark get cq_rank_fr j uchar 1
+  end
+  ret nfr
+end
+
+fn cq_copy_cand_to_res pu ulong got ulong to void
+  sb = mul pu CQ_CSTRIDE
+  db = mul got CQ_CSTRIDE
+  for f ulong CQ_CSTRIDE
+    put cq_res_cand add db f get cq_feas add sb f
+  end
+  put cq_res_fx got get cq_feas_fx pu
+  put cq_rank_mark pu uchar 2
+end
+
+note tradeoffs[19]:
+note  0:n_order, 1..7:order[0..6], 8..14:tol_ppm[0..6],
+note  15:max_cost, 16:min_conf, 17:k, 18:include_dom_and_req_held (bit0=inc_dom, bit1=req_held)
+fn cq_rank_feas nf ulong tr view ulong 19 k_max ulong to long
+  nd = get tr 0
+  dims = new uchar 7 0
+  if eq nd 0
+    nd = CQ_DIMS
+    for i ulong 7
+      put dims i uchar i
+    end
+  else
+    if gt nd CQ_DIMS
+      ret CQ_E_ARG
+    end
+    for i ulong nd bound 7
+      d = get tr add 1 i
+      if ge d CQ_DIMS
+        ret CQ_E_ARG
+      end
+      put dims i uchar d
+    end
+  end
+  put cq_res_n_front 0 0
+  if or eq nf 0 eq k_max 0
+    put cq_res_n 0 0
+    ret 0
+  end
+  nfr = cq_rank_sort_and_front nf dims nd
+  put cq_res_n_front 0 nfr
+  pool = cq_rank_init_mark nf nfr and get tr 18 1
+  kk = k_max
+  if gt kk pool
+    kk = pool
+  end
+  if gt kk CQ_MAX_K
+    kk = CQ_MAX_K
+  end
+  got = ulong 0
+  while lt got kk bound 16
+    pick = cq_rank_pick_one nf dims nd tr
+    if lt pick 0
+      break
+    end
+    cq_copy_cand_to_res ulong pick got
+    got = add got 1
+  end
+  put cq_res_n 0 got
+  ret long got
+end
+
+note ---- query & bind ----
+
+fn cq_held_reset to void
+  put cq_held_n 0 0
+end
+
+fn cq_held_add res ulong rights ulong to void
+  n = get cq_held_n 0
+  if ge n 16
+    ret
+  end
+  put cq_held_tbl mul n 2 res
+  put cq_held_tbl add mul n 2 1 rights
+  put cq_held_n 0 add n 1
+end
+
+fn cq_held_now res ulong rights ulong to ulong
+  if eq rights 0
+    ret 1
+  end
+  n = get cq_held_n 0
+  for i ulong n bound 16
+    if eq get cq_held_tbl mul i 2 res
+      if eq and get cq_held_tbl add mul i 2 1 rights rights
+        ret 1
+      end
+    end
+  end
+  ret 0
+end
+
+fn cq_copy_ent_to_feas eidx ulong fidx ulong is_loc ulong held_f ulong to void
+  eb = mul eidx CQ_ESTRIDE
+  fb = mul fidx CQ_CSTRIDE
+  put cq_feas fb get cq_ent eb
+  put cq_feas add fb 1 get cq_ent add eb 3
+  put cq_feas add fb 2 get cq_ent add eb 2
+  put cq_feas add fb 3 get cq_ent add eb 1
+  put cq_feas add fb 4 get cq_ent add eb 10
+  put cq_feas add fb 5 get cq_ent add eb 11
+  put cq_feas add fb 6 held_f
+  put cq_feas add fb 7 get cq_ent add eb 14
+  put cq_feas add fb 8 get cq_ent add eb 15
+  put cq_feas add fb 9 get cq_ent add eb 16
+  put cq_feas add fb 10 get cq_ent add eb 12
+  put cq_feas add fb 11 get cq_ent add eb 13
+  put cq_feas add fb 12 get cq_ent add eb 17
+  put cq_feas add fb 13 get cq_ent add eb 6
+  put cq_feas add fb 14 get cq_ent add eb 5
+  put cq_feas add fb 15 is_loc
+  put cq_feas_fx fidx get cq_ent add eb 7
+end
+
+global cq_cur_nv ulong 14
+
+fn cq_filter_one eidx ulong is_loc ulong to ulong
+  eb = mul eidx CQ_ESTRIDE
+  ev = new ulong 14 0
+  nv = new ulong 14 0
+  for i ulong 14
+    put nv i get cq_cur_nv i
+  end
+  put ev 0 get cq_ent add eb 2
+  put ev 1 get cq_ent add eb 8
+  put ev 2 get cq_ent add eb 9
+  put ev 3 get cq_ent add eb 7
+  put ev 4 get cq_ent add eb 10
+  put ev 5 get cq_ent add eb 11
+  put ev 6 get cq_ent add eb 15
+  put ev 7 get cq_ent add eb 16
+  put ev 8 get cq_ent add eb 13
+  put ev 9 get cq_ent add eb 6
+  put ev 10 get cq_ent add eb 14
+  put ev 11 get cq_ent add eb 12
+  put ev 12 is_loc
+  put ev 13 get cq_ent add eb 18
+  ret rx_cq_filter_entry ev nv
+end
+
+fn cq_pack_need_vec need view ulong 15 tr view ulong 19 to void
+  loc = get need 7
+  if eq loc 0
+    loc = or CQ_LOC_LOCAL CQ_LOC_FABRIC
+  end
+  put cq_cur_nv 0 loc
+  put cq_cur_nv 1 get need 8
+  put cq_cur_nv 2 get need 1
+  put cq_cur_nv 3 get need 2
+  put cq_cur_nv 4 get need 3
+  put cq_cur_nv 5 get need 4
+  put cq_cur_nv 6 get need 5
+  put cq_cur_nv 7 get need 6
+  put cq_cur_nv 8 get need 9
+  put cq_cur_nv 9 get need 10
+  put cq_cur_nv 10 get need 11
+  put cq_cur_nv 11 get need 12
+  put cq_cur_nv 12 get tr 15
+  put cq_cur_nv 13 get tr 16
+end
+
+fn cq_held_now_ent eb ulong to ulong
+  res = get cq_ent add eb 10
+  rights = get cq_ent add eb 11
+  ret cq_held_now res rights
+end
+
+fn cq_probe_entry eidx ulong now_us ulong req_held ulong nf ulong to ulong
+  eb = mul eidx CQ_ESTRIDE
+  put cq_stats 0 add get cq_stats 0 1
+  lv = get cq_ent add eb 18
+  mach = get cq_ent add eb 2
+  if eq lv CQ_LIVE_WITHDRAWN
+    put cq_stats 2 add get cq_stats 2 1
+    ret nf
+  end
+  if eq cq_machine_live mach now_us 0
+    put cq_stats 2 add get cq_stats 2 1
+    ret nf
+  end
+  if ne lv CQ_LIVE_AVAILABLE
+    put cq_stats 4 add get cq_stats 4 1
+    ret nf
+  end
+  is_loc = ulong 0
+  if eq mach get cq_self_mach 0
+    is_loc = ulong 1
+  end
+  if eq cq_filter_one eidx is_loc 0
+    ret nf
+  end
+  hf = cq_held_now_ent eb
+  if ne req_held 0
+    if eq hf 0
+      put cq_stats 5 add get cq_stats 5 1
+      ret nf
+    end
+  end
+  if lt nf 64
+    cq_copy_ent_to_feas eidx nf is_loc hf
+    ret add nf 1
+  end
+  ret nf
+end
+
+fn cq_probe_bucket bk ulong now_us ulong req_held ulong nf ulong to ulong
+  j0 = get cq_bstart bk
+  cnt = sub get cq_bstart add bk 1 j0
+  cur = nf
+  for jj ulong cnt bound 256
+    cur = cq_probe_entry get cq_bucket add j0 jj now_us req_held cur
+  end
+  ret cur
+end
+
+fn cq_probe_all now_us ulong req_held ulong to ulong
+  nf = ulong 0
+  for oi ulong get cq_plan_n_ops 0 bound 32
+    op = get cq_plan_ops oi
+    for s ulong CQ_SOURCES
+      if ne and get cq_plan_sources 0 shl ulong 1 s 0
+        nf = cq_probe_bucket add mul op CQ_SOURCES s now_us req_held nf
+      end
+    end
+  end
+  ret nf
+end
+
+fn cq_query need view ulong 15 tr view ulong 19 now_us ulong to long
+  put cq_res_n 0 0
+  put cq_res_n_feas 0 0
+  put cq_res_n_front 0 0
+  for i ulong 7
+    put cq_stats i 0
+  end
+  if eq get cq_built 0 0
+    put cq_res_verdict 0 CQ_E_UNBUILT
+    ret CQ_E_UNBUILT
+  end
+  pv = get cq_plan_verdict 0
+  if ne pv CQ_OK
+    put cq_res_verdict 0 pv
+    ret pv
+  end
+  cq_pack_need_vec need tr
+  nf = cq_probe_all now_us and get tr 18 2
+  put cq_stats 1 nf
+  put cq_res_n_feas 0 nf
+  kk = get tr 17
+  if eq kk 0
+    kk = CQ_MAX_K
+  end
+  n_out = cq_rank_feas nf tr kk
+  if lt n_out 0
+    put cq_res_verdict 0 n_out
+    ret n_out
+  end
+  put cq_res_verdict 0 CQ_OK
+  ret CQ_OK
+end
+
+fn cq_bind_skill_node g ulong node ulong cand_idx ulong to long
+  if ge node get ag_n_nodes g
+    ret CQ_E_ARG
+  end
+  cb = mul cand_idx CQ_CSTRIDE
+  sk = get cq_res_cand add cb 1
+  if eq sk 0
+    ret CQ_E_ARG
+  end
+  k = rx_graph_get_node g node 0
+  if and ne k AG_SKILL ne k AG_RETRY
+    ret CQ_E_ARG
+  end
+  rx_graph_set_node g node 2 sk
+  ar = get cq_res_cand add cb 5
+  if ne ar 0
+    if lt rx_graph_need_authority g node get cq_res_cand add cb 4 ar 0
+      ret CQ_E_ARG
+    end
+  end
+  ret CQ_OK
+end
+
+note ---- wire encode / decode / apply ----
+
+fn cq_wire_check_fill rec edit uchar 188 to void
+  for i ulong 184
+    put sh_dat i get rec i
+  end
+  sh_all 184
+  for i ulong 4
+    put rec add 184 i get sh_dig i
+  end
+end
+
+fn cq_wire_pack_ent eidx ulong kind ulong hdr edit ulong 4 flds edit ulong 17 sdig edit uchar 32 to void
+  eb = mul eidx CQ_ESTRIDE
+  put hdr 0 kind
+  put hdr 1 get cq_ent add eb 5
+  put hdr 2 get cq_ent add eb 6
+  put hdr 3 get cq_ent add eb 18
+  put flds 0 get cq_ent eb
+  put flds 1 get cq_ent add eb 1
+  put flds 2 get cq_ent add eb 3
+  put flds 3 get cq_ent add eb 19
+  put flds 4 get cq_ent add eb 4
+  put flds 5 get cq_ent add eb 7
+  put flds 6 get cq_ent add eb 8
+  put flds 7 get cq_ent add eb 9
+  put flds 8 get cq_ent add eb 10
+  put flds 9 get cq_ent add eb 11
+  put flds 10 get cq_ent add eb 12
+  put flds 11 get cq_ent add eb 13
+  put flds 12 get cq_ent add eb 14
+  put flds 13 get cq_ent add eb 15
+  put flds 14 get cq_ent add eb 16
+  put flds 15 get cq_ent add eb 17
+  put flds 16 get cq_ent add eb 20
+  sb = mul eidx 32
+  for i ulong 32
+    put sdig i get cq_ent_sdig add sb i
+  end
+end
+
+fn cq_wire_encode_mid mach ulong mid_rec edit uchar 44 to long
+  mr = new ulong 1 0
+  mid_id = new uchar 32 0
+  if ne cq_machine_identity mach mr mid_id CQ_OK
+    ret CQ_E_NO_IDENTITY
+  end
+  if ne rx_mid_pack_hdr get mr 0 mid_id mid_rec MID_OK
+    ret CQ_E_NO_IDENTITY
+  end
+  for i ulong 40
+    put sh_dat i get mid_rec i
+  end
+  sh_all 40
+  for i ulong 4
+    put mid_rec add 40 i get sh_dig i
+  end
+  ret CQ_OK
+end
+
+fn cq_wire_encode eidx ulong kind ulong dst edit uchar 188 to long
+  if or lt kind CQ_WIRE_ADVERTISE gt kind CQ_WIRE_WITHDRAW
+    ret CQ_E_ARG
+  end
+  if ge eidx get cq_n_ent 0
+    ret CQ_E_ARG
+  end
+  eb = mul eidx CQ_ESTRIDE
+  mach = get cq_ent add eb 2
+  src = get cq_ent add eb 5
+  lv = get cq_ent add eb 18
+  if ne mach get cq_self_mach 0
+    ret CQ_E_WIRE
+  end
+  if or eq src CQ_SRC_FABRIC ge src CQ_SOURCES
+    ret CQ_E_WIRE
+  end
+  if gt lv CQ_LIVE_UNAVAILABLE
+    ret CQ_E_WIRE
+  end
+  mid_rec = new uchar 44 0
+  if ne cq_wire_encode_mid mach mid_rec CQ_OK
+    ret CQ_E_NO_IDENTITY
+  end
+  hdr = new ulong 4 0
+  flds = new ulong 17 0
+  sdig = new uchar 32 0
+  cq_wire_pack_ent eidx kind hdr flds sdig
+  if eq rx_cq_wire_encode_body hdr flds mid_rec sdig dst 0
+    ret CQ_E_WIRE
+  end
+  cq_wire_check_fill dst
+  ret CQ_OK
+end
+
+fn cq_wire_decode rec view uchar 188 dst_kind edit ulong 1 dst_mid edit uchar 33 dst_ent edit ulong 21 dst_sdig edit uchar 32 to long
+  for i ulong 184
+    put sh_dat i get rec i
+  end
+  sh_all 184
+  for i ulong 4
+    if ne get sh_dig i get rec add 184 i
+      ret CQ_E_WIRE
+    end
+  end
+  hdr = new ulong 4 0
+  flds = new ulong 17 0
+  if eq rx_cq_wire_decode_body rec hdr flds dst_sdig 0
+    ret CQ_E_WIRE
+  end
+  mrec = new uchar 44 0
+  for i ulong 44
+    put mrec i get rec add 8 i
+  end
+  for i ulong 40
+    put sh_dat i get mrec i
+  end
+  sh_all 40
+  chk = new uchar 4 0
+  for i ulong 4
+    put chk i get sh_dig i
+  end
+  if ne rx_mid_val_rec mrec chk dst_mid MID_OK
+    ret CQ_E_WIRE
+  end
+  put dst_kind 0 get hdr 0
+  put dst_ent 0 get flds 0
+  put dst_ent 1 get flds 1
+  put dst_ent 2 0
+  put dst_ent 3 get flds 2
+  put dst_ent 4 get flds 4
+  put dst_ent 5 get hdr 1
+  put dst_ent 6 get hdr 2
+  put dst_ent 7 get flds 5
+  put dst_ent 8 get flds 6
+  put dst_ent 9 get flds 7
+  put dst_ent 10 get flds 8
+  put dst_ent 11 get flds 9
+  put dst_ent 12 get flds 10
+  put dst_ent 13 get flds 11
+  put dst_ent 14 get flds 12
+  put dst_ent 15 get flds 13
+  put dst_ent 16 get flds 14
+  put dst_ent 17 get flds 15
+  put dst_ent 18 get hdr 3
+  put dst_ent 19 get flds 3
+  put dst_ent 20 get flds 16
+  ret CQ_OK
+end
+
+fn cq_wire_resolve_mid dmid view uchar 33 to long
+  mid_id = new uchar 32 0
+  for i ulong 32
+    put mid_id i get dmid add i 1
+  end
+  root = ulong get dmid 0
+  idx = cq_mid_find root mid_id
+  if eq idx get cq_self_mach 0
+    ret CQ_E_WIRE
+  end
+  if eq idx 0
+    idx = cq_mid_bind root mid_id
+    if eq idx 0
+      ret CQ_E_NO_IDENTITY
+    end
+  end
+  ret long idx
+end
+
+fn cq_wire_apply_commit kind ulong dent view ulong 21 dsdig view uchar 32 to long
+  old = cq_lookup get dent 0 get dent 1 get dent 2 get dent 3
+  has_old = ulong 0
+  old_gen = ulong 0
+  old_live = ulong 0
+  if ge old 0
+    has_old = ulong 1
+    ob = mul ulong old CQ_ESTRIDE
+    old_gen = get cq_ent add ob 20
+    old_live = get cq_ent add ob 18
+  end
+  chk = rx_cq_wire_apply_check has_old old_gen old_live get dent 20 kind
+  if ne chk 0
+    ret chk
+  end
+  if eq kind CQ_WIRE_ADVERTISE
+    ret cq_register dent dsdig
+  end
+  if lt old 0
+    ret CQ_E_WIRE
+  end
+  ob = mul ulong old CQ_ESTRIDE
+  put cq_ent add ob 18 get dent 18
+  put cq_ent add ob 20 get dent 20
+  ret CQ_OK
+end
+
+fn cq_wire_apply rec view uchar 188 to long
+  if eq get cq_canonical 0 0
+    ret CQ_E_NO_IDENTITY
+  end
+  dk = new ulong 1 0
+  dmid = new uchar 33 0
+  dent = new ulong 21 0
+  dsdig = new uchar 32 0
+  rc = cq_wire_decode rec dk dmid dent dsdig
+  if ne rc CQ_OK
+    ret rc
+  end
+  idx_l = cq_wire_resolve_mid dmid
+  if lt idx_l 0
+    ret idx_l
+  end
+  op = cq_resolve get dent 4
+  if eq op 0
+    ret CQ_E_NO_OP
+  end
+  put dent 4 op
+  put dent 2 ulong idx_l
+  put dent 5 CQ_SRC_FABRIC
+  ret cq_wire_apply_commit get dk 0 dent dsdig
+end

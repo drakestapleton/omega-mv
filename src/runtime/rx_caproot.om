@@ -1,0 +1,154 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/runtime/rx_caproot.om -- Pure seeded OM-2 port of src/runtime/rx_caproot.c.
+note Requires seed/authority/cap_table_om2.om concatenated before this file
+note (with its leading om2 line and export keywords stripped).
+note
+note Wraps the 256-slot capability authority table with the RxCapRoot / RxCapAdmin
+note lifecycle, office-token gate, monotonic boot generation, and clean shutdown.
+
+global rx_cap_last_boot ulong 1
+global rx_cap_admin_tok uchar 32
+global rx_cap_office ulong 2
+
+fn rx_cap_take_boot_gen dst edit ulong 1 to long
+  cur = get rx_cap_last_boot 0
+  if eq cur CAP_U64_MAX
+    ret ERR_EXHAUSTED
+  end
+  nxt = add cur 1
+  if eq nxt CAP_U64_MAX
+    ret ERR_EXHAUSTED
+  end
+  put rx_cap_last_boot 0 nxt
+  put dst 0 nxt
+  ret ERR_OK
+end
+
+note Start a new capability root: allocates a monotonic boot_gen, initializes
+note the 256-slot table with bootstrap office at slot 0, and derives the 32-byte
+note office secret token from boot_gen (copied to out_tok).
+fn rx_caproot_start hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 out_tok edit uchar 32 to long
+  bg = new ulong 1 0
+  brc = rx_cap_take_boot_gen bg
+  if ne brc ERR_OK
+    ret brc
+  end
+  boot_gen = get bg 0
+  rc = cap_table_init hdr slots delivered boot_gen
+  if ne rc ERR_OK
+    ret rc
+  end
+  put rx_cap_office 0 0
+  put rx_cap_office 1 boot_gen
+  st = xor boot_gen ulong 0x9e3779b97f4a7c15
+  for i ulong 32
+    st = mul xor st shr st 30 ulong 0xbf58476d1ce4e5b9
+    st = xor st shr st 27
+    b = uchar and st 255
+    put rx_cap_admin_tok i b
+    put out_tok i b
+  end
+  ret ERR_OK
+end
+
+note Copy the bootstrap office reference {id, generation} into dst[2].
+fn rx_capadmin_office dst edit ulong 2 to void
+  put dst 0 get rx_cap_office 0
+  put dst 1 get rx_cap_office 1
+end
+
+note Verify presented token matches rx_cap_admin_tok in constant time.
+fn rx_cap_check_token presented view uchar 32 to long
+  diff = ulong 0
+  for i ulong 32
+    x = ulong get presented i
+    y = ulong get rx_cap_admin_tok i
+    diff = or diff xor x y
+  end
+  if ne diff 0
+    ret ERR_UNAUTHORIZED
+  end
+  ret ERR_OK
+end
+
+note Mint a root-issued or delegated capability.
+note req[9]: 0=issuer, 1=subject, 2=resource, 3=rights, 4=lease_ticks,
+note         5=parent_id, 6=parent_gen, 7=auth_id, 8=auth_gen.
+fn rx_capadmin_mint hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 presented view uchar 32 req view ulong 9 dst_ref edit ulong 2 to long
+  trc = rx_cap_check_token presented
+  if ne trc ERR_OK
+    ret trc
+  end
+  ret cap_table_mint hdr slots delivered req dst_ref
+end
+
+note Revoke target capability and cascade to all live descendants.
+note args[4]: 0=auth_id, 1=auth_gen, 2=target_id, 3=target_gen.
+fn rx_capadmin_revoke hdr edit ulong 4 slots edit ulong 3328 delivered view uchar 256 presented view uchar 32 args view ulong 4 rev_list edit ulong 257 to long
+  trc = rx_cap_check_token presented
+  if ne trc ERR_OK
+    ret trc
+  end
+  ret cap_table_revoke hdr slots delivered args rev_list
+end
+
+note Reclaim a revoked slot back to FREE, advancing its generation.
+note args[3]: 0=auth_id, 1=auth_gen, 2=cap_id.
+fn rx_capadmin_reclaim hdr edit ulong 4 slots edit ulong 3328 delivered edit uchar 256 presented view uchar 32 args view ulong 3 to long
+  trc = rx_cap_check_token presented
+  if ne trc ERR_OK
+    ret trc
+  end
+  ret cap_table_reclaim hdr slots delivered args
+end
+
+note Advance logical lease clock. args[3]: 0=auth_id, 1=auth_gen, 2=ticks.
+fn rx_capadmin_advance_clock hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 presented view uchar 32 args view ulong 3 to long
+  trc = rx_cap_check_token presented
+  if ne trc ERR_OK
+    ret trc
+  end
+  ret cap_table_clock hdr slots delivered args
+end
+
+note Bump capability epoch.
+fn rx_capadmin_bump_epoch hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 presented view uchar 32 aid ulong agen ulong to long
+  trc = rx_cap_check_token presented
+  if ne trc ERR_OK
+    ret trc
+  end
+  ret cap_table_epoch hdr slots delivered aid agen
+end
+
+note Shut down the capability root: requires office token and MINT right.
+note Marks hdr[3]=1 (stopped) and wipes rx_cap_admin_tok.
+fn rx_caproot_stop hdr edit ulong 4 slots view ulong 3328 delivered view uchar 256 presented view uchar 32 to long
+  trc = rx_cap_check_token presented
+  if ne trc ERR_OK
+    ret trc
+  end
+  args = new ulong 3 0
+  put args 0 get rx_cap_office 0
+  put args 1 get rx_cap_office 1
+  put args 2 RIGHT_MINT
+  arc = cap_table_auth_use hdr slots delivered args
+  if ne arc ERR_OK
+    ret arc
+  end
+  put hdr 3 1
+  for i ulong 32
+    put rx_cap_admin_tok i uchar 0
+  end
+  ret ERR_OK
+end
+
+note Inspect a table entry if generation matches and slot is not FREE.
+fn rx_caproot_inspect hdr view ulong 4 slots view ulong 3328 cap_id ulong gen ulong dst_slot edit ulong 13 to long
+  ret cap_table_inspect hdr slots cap_id gen dst_slot
+end
+
+note Validate cap reference against (subject, resource, rights).
+note args[5]: 0=cap_id, 1=gen, 2=subject, 3=resource, 4=rights.
+fn rx_caproot_validate hdr view ulong 4 slots view ulong 3328 args view ulong 5 dst_slot edit ulong 13 to long
+  ret cap_table_validate hdr slots args dst_slot
+end
