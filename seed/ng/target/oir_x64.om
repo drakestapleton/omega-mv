@@ -1,12 +1,19 @@
 note SPDX-License-Identifier: Apache-2.0
-note seed/ng/target/oir_x64.om: Real ΩIR binary (seed/ng/src/ir.om + opt.om) -> Register-Allocated x86-64 ELF64 compiler!
-note Composes directly with seed/ng/src/ir.om, seed/ng/src/opt.om, and seed/ng/target/{target_desc,regalloc,isel,sm121_pe}.om.
-note Reads canonical OSC1IR v9 ΩIR bytes on stdin, runs op_run (seed/ng/src/opt.om), allocates physical x86-64 registers
-note via our shared target-parameterized regalloc.om (TID_X64_AVX2), and writes a standalone static x86-64 ELF64 to stdout.
+note seed/ng/target/oir_x64.om: Turing-Complete ΩIR binary (seed/ng/src/ir.om + opt.om) -> Register-Allocated x86-64 ELF64 compiler!
+note Supports straight-line ALU/bitwise/conv + full CFG blocks, parallel-copy block-param phi moves (br),
+note conditional branches (cbr), signed/unsigned comparisons (eq..ge), loops with back-edge live-range extension, and 2-pass rel32 patching.
 
 global oxValIdx ulong 256
 global oxValCnt ulong 1
-global oxOpPos ulong 256
+
+note Block offset table (indexed by block handle mod 256) + jump fixup list
+global oxBlkId ulong 128
+global oxBlkOff ulong 128
+global oxBlkStartPos ulong 128
+global oxBlkCnt ulong 1
+global oxFixPos ulong 256
+global oxFixBlk ulong 256
+global oxFixCnt ulong 1
 
 fn oxFindOrAddVal vid ulong to ulong
 n = get oxValCnt 0
@@ -18,6 +25,16 @@ end
 put oxValIdx n vid
 put oxValCnt 0 add n 1
 ret n
+end
+
+fn oxFindBlkIdx bid ulong to ulong
+n = get oxBlkCnt 0
+for i ulong n bound 128
+if eq get oxBlkId i bid
+ret i
+end
+end
+ret 999999
 end
 
 note Physical x86-64 register map for allocator slots 0..14 (avoids RSP=4):
@@ -47,7 +64,17 @@ end
 ret add slot 1
 end
 
-note Emit x86-64 movabs r64, imm64 (REX.W + (0xB8 + (r&7)) + imm64)
+fn oxPhysOfVal vid ulong to ulong
+n = get oxValCnt 0
+for i ulong n bound 256
+if eq get oxValIdx i vid
+ret oxX64Reg get raPhys i
+end
+end
+ret 0
+end
+
+note Emit x86-64 movabs r64, imm64
 fn oxEmitImm64 pr ulong imm ulong to void
 rex = ulong 72
 if ge pr 8
@@ -58,7 +85,6 @@ isEmitU8 add 184 and pr 7
 isEmitU64 imm
 end
 
-note Emit x86-64 mov dst, src (if dst != src)
 fn oxEmitMov prDst ulong prSrc ulong to void
 if eq prDst prSrc
 ret
@@ -68,16 +94,51 @@ isEmitU8 137
 isEmitU8 isX64ModRm prSrc prDst
 end
 
-note Emit x86-64 ALU reg-reg: op = 1(add), 41(sub), 33(and), 9(or), 49(xor)
+fn oxEmitPush pr ulong to void
+if ge pr 8
+isEmitU8 65
+end
+isEmitU8 add 80 and pr 7
+end
+
+fn oxEmitPop pr ulong to void
+if ge pr 8
+isEmitU8 65
+end
+isEmitU8 add 88 and pr 7
+end
+
 fn oxEmitAlu opc ulong pd ulong pn ulong pm ulong to void
+if eq pd pm
+if ne pd pn
+oxEmitPush pm
+oxEmitMov pd pn
+oxEmitPop 15
+isEmitU8 isX64Rex 15 pd
+isEmitU8 opc
+isEmitU8 isX64ModRm 15 pd
+ret
+end
+end
 oxEmitMov pd pn
 isEmitU8 isX64Rex pm pd
 isEmitU8 opc
 isEmitU8 isX64ModRm pm pd
 end
 
-note Emit x86-64 imul pd, pm (with 2-addr mov if pd != pn)
 fn oxEmitMul pd ulong pn ulong pm ulong to void
+if eq pd pm
+if ne pd pn
+oxEmitPush pm
+oxEmitMov pd pn
+oxEmitPop 15
+isEmitU8 isX64Rex pd 15
+isEmitU8 15
+isEmitU8 175
+isEmitU8 isX64ModRm pd 15
+ret
+end
+end
 oxEmitMov pd pn
 isEmitU8 isX64Rex pd pm
 isEmitU8 15
@@ -85,7 +146,6 @@ isEmitU8 175
 isEmitU8 isX64ModRm pd pm
 end
 
-note Emit x86-64 neg pd (REX.W 0xF7 /3)
 fn oxEmitNeg pd ulong pn ulong to void
 oxEmitMov pd pn
 rex = ulong 72
@@ -97,7 +157,83 @@ isEmitU8 247
 isEmitU8 or 216 and pd 7
 end
 
-note Emit Linux x86-64 SYS_exit(prVal): mov rdi, prVal; mov eax, 60; syscall
+note Emit signed/unsigned comparison: cmp pn, pm; setcc pd_b; movzx pd, pd_b
+fn oxCmpCc op ulong isSigned bool to ulong
+if eq op 30
+ret 148
+end
+if eq op 31
+ret 149
+end
+if isSigned
+if eq op 32
+ret 156
+end
+if eq op 33
+ret 158
+end
+if eq op 34
+ret 159
+end
+ret 157
+end
+if eq op 32
+ret 146
+end
+if eq op 33
+ret 150
+end
+if eq op 34
+ret 151
+end
+ret 147
+end
+
+fn oxEmitCmp op ulong pd ulong pn ulong pm ulong isSigned bool to void
+note cmp pn, pm (REX.W 0x39 /r: reg=pm, r/m=pn)
+isEmitU8 isX64Rex pm pn
+isEmitU8 57
+isEmitU8 isX64ModRm pm pn
+note setcc pd_low8 (REX 0x40|B 0x0F cc 0xC0|(pd&7))
+rexB = ulong 64
+if ge pd 8
+rexB = ulong 65
+end
+isEmitU8 rexB
+isEmitU8 15
+isEmitU8 oxCmpCc op isSigned
+isEmitU8 or 192 and pd 7
+note movzx pd, pd_low8 (REX.W 0x0F 0xB6 /r: reg=pd, r/m=pd)
+isEmitU8 isX64Rex pd pd
+isEmitU8 15
+isEmitU8 182
+isEmitU8 isX64ModRm pd pd
+end
+
+fn oxEmitJmpRel32 targetBid ulong to void
+isEmitU8 233
+f = get oxFixCnt 0
+put oxFixPos f get isLen 0
+put oxFixBlk f targetBid
+put oxFixCnt 0 add f 1
+isEmitU32 0
+end
+
+fn oxEmitJnzRel32 condPr ulong targetBid ulong to void
+note test condPr, condPr (REX.W 0x85 /r)
+isEmitU8 isX64Rex condPr condPr
+isEmitU8 133
+isEmitU8 isX64ModRm condPr condPr
+note jnz rel32 (0x0F 0x85 rel32)
+isEmitU8 15
+isEmitU8 133
+f = get oxFixCnt 0
+put oxFixPos f get isLen 0
+put oxFixBlk f targetBid
+put oxFixCnt 0 add f 1
+isEmitU32 0
+end
+
 fn oxEmitExit prVal ulong to void
 oxEmitMov 7 prVal
 isEmitU8 184
@@ -106,42 +242,71 @@ isEmitU8 15
 isEmitU8 5
 end
 
-fn oxPhysOfVal vid ulong to ulong
-n = get oxValCnt 0
-for i ulong n bound 256
-if eq get oxValIdx i vid
-ret oxX64Reg get raPhys i
+fn oxTouchUse av ulong pos ulong to void
+if eq av 0
+ret
+end
+vi = oxFindOrAddVal av
+if lt vi get raNVal 0
+if lt pos get raStart vi
+put raStart vi pos
+end
+if gt pos get raEnd vi
+put raEnd vi pos
 end
 end
-ret 0
 end
 
-note Build live intervals for all SSA values in export function f, then run shared regalloc.om (TID_X64_AVX2)!
-fn oxAllocFunc f uint to bool
-put oxValCnt 0 0
-raReset
+fn oxExtendBackEdge targetBid ulong backPos ulong to void
+bi = oxFindBlkIdx targetBid
+if eq bi 999999
+ret
+end
+hdrPos = get oxBlkStartPos bi
+if ge hdrPos backPos
+ret
+end
+nv = get raNVal 0
+for i ulong nv bound 256
+s = get raStart i
+e = get raEnd i
+if and le s backPos ge e hdrPos
+if lt hdrPos s
+put raStart i hdrPos
+end
+if gt backPos e
+put raEnd i backPos
+end
+end
+end
+end
+
+fn oxScanDefs f uint to void
 b = get i_fb1 f
 pos = ulong 0
-while ne b 0 bound 64
-o = get i_bo1 b
-while ne o 0 bound 256
-res = ulong get i_ors o
-if ne res 0
-idx = oxFindOrAddVal res
+while ne b 0 bound 128
+bc = get oxBlkCnt 0
+put oxBlkId bc ulong b
+put oxBlkStartPos bc pos
+put oxBlkCnt 0 add bc 1
+p = get i_bp1 b
+while ne p 0 bound 32
+if ne get i_vty p 20
+idx = oxFindOrAddVal ulong p
 if ge idx get raNVal 0
 id = raAddInterval pos pos RA_SPILL
 end
 end
-na = ulong get i_ona o
-a0 = ulong get i_oa0 o
-for k ulong na bound 16
-av = ulong get i_arg add a0 k
-if ne av 0
-vi = oxFindOrAddVal av
-if lt vi get raNVal 0
-if gt pos get raEnd vi
-put raEnd vi pos
+p = get i_vnx p
 end
+o = get i_bo1 b
+while ne o 0 bound 256
+res = ulong get i_ors o
+if ne res 0
+if ne get i_vty res 20
+idx = oxFindOrAddVal res
+if ge idx get raNVal 0
+id = raAddInterval pos pos RA_SPILL
 end
 end
 end
@@ -150,11 +315,112 @@ o = get i_onx o
 end
 b = get i_bnx b
 end
+end
+
+fn oxScanOpUses o uint pos ulong to void
+op = ulong get i_oop o
+na = ulong get i_ona o
+a0 = ulong get i_oa0 o
+if eq op 60
+if gt na 2
+for k ulong sub na 2 bound 16
+oxTouchUse ulong get i_arg add a0 add k 2 pos
+end
+end
+oxExtendBackEdge ulong get i_arg a0 pos
+ret
+end
+if eq op 61
+oxTouchUse ulong get i_arg add a0 1 pos
+oxExtendBackEdge ulong get i_arg add a0 2 pos
+oxExtendBackEdge ulong get i_arg add a0 3 pos
+ret
+end
+for k ulong na bound 16
+oxTouchUse ulong get i_arg add a0 k pos
+end
+end
+
+fn oxSortIntervals to void
+n = get raNVal 0
+for i ulong n bound 256
+if gt i 0
+j = i
+while gt j 0 bound 256
+jm = sub j 1
+if le get raStart jm get raStart j
+break
+end
+ts = get raStart jm
+te = get raEnd jm
+tv = get oxValIdx jm
+put raStart jm get raStart j
+put raEnd jm get raEnd j
+put oxValIdx jm get oxValIdx j
+put raStart j ts
+put raEnd j te
+put oxValIdx j tv
+j = jm
+end
+end
+end
+end
+
+note 2-pass live-interval builder (handles rotated loops) + sort by start + shared regalloc.om (14 GPRs)!
+fn oxAllocFunc f uint to bool
+put oxValCnt 0 0
+put oxBlkCnt 0 0
+raReset
+oxScanDefs f
+b = get i_fb1 f
+pos = ulong 0
+while ne b 0 bound 128
+o = get i_bo1 b
+while ne o 0 bound 256
+oxScanOpUses o pos
+pos = add pos 1
+o = get i_onx o
+end
+b = get i_bnx b
+end
+oxSortIntervals
+tdSet TID_X64_AVX2 TDF_NGPR 14
 sp = raRunForTarget TID_X64_AVX2
+tdSet TID_X64_AVX2 TDF_NGPR 15
 if ne raVerifyColoring 0
 ret false
 end
 ret eq sp 0
+end
+
+note Emit parallel-copy block-param moves for `br target(tok, v1, v2, ...)` via push/pop (cycle-safe!)
+fn oxEmitBrPhi o uint to void
+dstP = new ulong 16 0
+a0 = ulong get i_oa0 o
+na = ulong get i_ona o
+tb = get i_arg a0
+nArg = ulong 0
+if gt na 2
+nArg = sub na 2
+end
+for k ulong nArg bound 16
+srcV = ulong get i_arg add a0 add k 2
+oxEmitPush oxPhysOfVal srcV
+end
+p = get i_bp1 tb
+di = ulong 0
+while ne p 0 bound 32
+if ne get i_vty p 20
+put dstP di ulong p
+di = add di 1
+end
+p = get i_vnx p
+end
+for k ulong di bound 16
+ri = sub sub di 1 k
+oxEmitPop oxPhysOfVal get dstP ri
+end
+oxEmitJmpRel32 ulong tb
 end
 
 fn oxLowerOneOp o uint to bool
@@ -162,8 +428,7 @@ op = ulong get i_oop o
 res = ulong get i_ors o
 a0 = ulong get i_oa0 o
 if eq op 1
-pd = oxPhysOfVal res
-oxEmitImm64 pd get i_oim o
+oxEmitImm64 oxPhysOfVal res get i_oim o
 ret true
 end
 if eq op 10
@@ -194,23 +459,57 @@ if eq op 18
 oxEmitAlu 49 oxPhysOfVal res oxPhysOfVal ulong get i_arg a0 oxPhysOfVal ulong get i_arg add a0 1
 ret true
 end
+if and ge op 30 le op 35
+av0 = ulong get i_arg a0
+vt = ulong get i_vty av0
+isS = and ge vt 6 le vt 9
+oxEmitCmp op oxPhysOfVal res oxPhysOfVal av0 oxPhysOfVal ulong get i_arg add a0 1 isS
+ret true
+end
 if eq op 36
 oxEmitMov oxPhysOfVal res oxPhysOfVal ulong get i_arg a0
 ret true
 end
+if eq op 60
+oxEmitBrPhi o
+ret true
+end
+if eq op 61
+oxEmitJnzRel32 oxPhysOfVal ulong get i_arg add a0 1 ulong get i_arg add a0 2
+oxEmitJmpRel32 ulong get i_arg add a0 3
+ret true
+end
 if or eq op 63 eq op 66
-oxEmitExit oxPhysOfVal ulong get i_arg a0
+oxEmitExit oxPhysOfVal ulong get i_arg add a0 1
 ret true
 end
 if eq op 62
 oxEmitExit 0
 ret true
 end
-note Ignore pure facts (90..93) and checks (70..82) that op_run left on token chain
 if and ge op 70 le op 93
 ret true
 end
 ret false
+end
+
+fn oxPatchFixups to bool
+fc = get oxFixCnt 0
+for i ulong fc bound 256
+fp = get oxFixPos i
+tb = get oxFixBlk i
+bi = oxFindBlkIdx tb
+if eq bi 999999
+ret false
+end
+tgt = get oxBlkOff bi
+rel = sub tgt add fp 4
+put isBuf fp uchar and rel 255
+put isBuf add fp 1 uchar and shr rel 8 255
+put isBuf add fp 2 uchar and shr rel 16 255
+put isBuf add fp 3 uchar and shr rel 24 255
+end
+ret true
 end
 
 fn oxCompileExport to ulong
@@ -229,8 +528,13 @@ if not oxAllocFunc expF
 ret 0
 end
 isBufReset
+put oxFixCnt 0 0
 b = get i_fb1 expF
-while ne b 0 bound 64
+while ne b 0 bound 128
+bi = oxFindBlkIdx ulong b
+if ne bi 999999
+put oxBlkOff bi get isLen 0
+end
 o = get i_bo1 b
 while ne o 0 bound 256
 if not oxLowerOneOp o
@@ -239,6 +543,9 @@ end
 o = get i_onx o
 end
 b = get i_bnx b
+end
+if not oxPatchFixups
+ret 0
 end
 ret elfEmitStatic TID_X64_AVX2
 end
