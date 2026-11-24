@@ -1,0 +1,2135 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note tests/checker2/test_c2_ir.om: decoder and acceptance rules unit tests (pure OM-2).
+note Compose after: c2_om2_hdr.om, c2_ir.om, c2_check.om
+note Usage: test_c2_ir <corpus-ir-list>
+
+const TI_MAX_CORP ulong 512
+const TI_CORP_CAP ulong 16777216
+
+global ti_corp_buf uchar 16777216
+global ti_corp_off ulong 512
+global ti_corp_len ulong 512
+global ti_ncorp ulong 1
+global ti_corp_used ulong 1
+
+global ti_list uchar 262144
+global ti_path uchar 4096
+global ti_fbuf uchar 1048576
+global ti_checks ulong 1
+global ti_fails ulong 1
+global ti_out uchar 512
+global ti_outlen ulong 1
+
+note Temp instruction fields for ti_ins / ti_mk
+global ti_mk_op uchar 1
+global ti_mk_sub uchar 1
+global ti_mk_dst short 1
+global ti_mk_a short 1
+global ti_mk_b short 1
+global ti_mk_c short 1
+global ti_mk_t ushort 1
+global ti_mk_f ushort 1
+global ti_mk_imm ulong 1
+global ti_mk_cal ushort 1
+global ti_mk_na uchar 1
+global ti_mk_args short 6
+
+text ti_s_hdr "test_c2_ir: units="
+text ti_s_tr " truncs="
+text ti_s_fl " flips="
+text ti_s_pl " planted="
+text ti_s_ch " checks="
+text ti_s_fa " failed="
+
+fn ti_out_reset to void
+  put ti_outlen 0 0
+end
+
+fn ti_out_ch c uchar to void
+  p = get ti_outlen 0
+  if lt p 512
+    put ti_out p c
+    put ti_outlen 0 add p 1
+  end
+end
+
+fn ti_out_txt s view uchar * to void
+  n = len s
+  for i ulong n bound 128
+    ti_out_ch get s i
+  end
+end
+
+fn ti_out_u64 v ulong to void
+  if eq v 0
+    ti_out_ch 48
+    ret
+  end
+  tmp = new uchar 24 0
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  for i ulong n bound 24
+    ti_out_ch get tmp sub sub n 1 i
+  end
+end
+
+fn ti_flush to void
+  tmp = new uchar 512 0
+  n = get ti_outlen 0
+  if gt n 0
+    for i ulong n bound 512
+      put tmp i get ti_out i
+    end
+    ign = write 1 tmp 0 n
+  end
+  put ti_outlen 0 0
+end
+
+fn ti_chk cond bool to void
+  put ti_checks 0 add get ti_checks 0 1
+  if not cond
+    put ti_fails 0 add get ti_fails 0 1
+  end
+end
+
+fn ti_rule_eq want view uchar * to bool
+  rl = get c2_v_rulelen 0
+  if ne rl len want
+    ret false
+  end
+  for i ulong rl bound 64
+    if ne get c2_v_rule i get want i
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- Corpus loading ----
+
+fn ti_slurp_fd fd int to_list ulong to long
+  tot = ulong 0
+  cap = ulong 1048576
+  if ne to_list 0
+    cap = 262144
+  end
+  chunk = new uchar 65536 0
+  while true bound 64
+    r = read fd chunk 0 65536
+    if lt r 0
+      ign = fclose fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    ur = ulong r
+    if gt add tot ur cap
+      ign = fclose fd
+      ret -1
+    end
+    for i ulong ur bound 65536
+      if ne to_list 0
+        put ti_list add tot i get chunk i
+      else
+        put ti_fbuf add tot i get chunk i
+      end
+    end
+    tot = add tot ur
+  end
+  ign = fclose fd
+  ret long tot
+end
+
+fn ti_load_one pl ulong to void
+  nc = get ti_ncorp 0
+  if ge nc TI_MAX_CORP
+    ret
+  end
+  p = new uchar 4096 0
+  for i ulong pl bound 4096
+    put p i get ti_path i
+  end
+  fd = fopen p 0 pl 0 0
+  if lt fd 0
+    ret
+  end
+  sz = ti_slurp_fd int fd 0
+  if lt sz 0
+    ret
+  end
+  usz = ulong sz
+  u = get ti_corp_used 0
+  if gt add u usz TI_CORP_CAP
+    ret
+  end
+  put ti_corp_off nc u
+  put ti_corp_len nc usz
+  for i ulong usz bound 1048576
+    put ti_corp_buf add u i get ti_fbuf i
+  end
+  put ti_corp_used 0 add u usz
+  put ti_ncorp 0 add nc 1
+end
+
+fn ti_load_list idx ulong to long
+  p = new uchar 512 0
+  pl = argread idx p 0 510
+  if lt pl 1
+    ret -1
+  end
+  fd = fopen p 0 ulong pl 0 0
+  if lt fd 0
+    ret -1
+  end
+  lsz = ti_slurp_fd int fd 1
+  if le lsz 0
+    ret -1
+  end
+  ulsz = ulong lsz
+  pos = ulong 0
+  while lt pos ulsz bound 4096
+    n = ulong 0
+    while lt pos ulsz bound 4096
+      c = get ti_list pos
+      pos = add pos 1
+      if eq c 10
+        break
+      end
+      if eq c 13
+        continue
+      end
+      if lt n 4095
+        put ti_path n c
+        n = add n 1
+      end
+    end
+    if gt n 0
+      ti_load_one n
+    end
+  end
+  ret long get ti_ncorp 0
+end
+
+fn ti_load_corp_ir ci ulong to ulong
+  off = get ti_corp_off ci
+  ln = get ti_corp_len ci
+  for i ulong ln bound 1048576
+    put c2_ir_buf i get ti_corp_buf add off i
+  end
+  ret ln
+end
+
+note ---- Mutation helpers ----
+
+fn ti_is_slice_len_p fi ulong r ulong to bool
+  if eq r 0
+    ret false
+  end
+  if ge sub r 1 ulong get c2_fn_nparams fi
+    ret false
+  end
+  ps = get c2_vt_s add mul fi C2_MAX_VREGS sub r 1
+  ret or eq ps S_BYTES eq ps S_CELLS
+end
+
+fn ti_reg_val fi ulong from ulong want uchar nots uchar int_only bool to long
+  nv = ulong get c2_fn_nvregs fi
+  vbase = mul fi C2_MAX_VREGS
+  r = from
+  while lt r nv bound 480
+    s = get c2_vt_s add vbase r
+    ok = c2c_is_value s
+    if and ne want 0 ne s want
+      ok = false
+    end
+    if and ne nots 0 eq s nots
+      ok = false
+    end
+    if and int_only not c2c_is_int s
+      ok = false
+    end
+    if ok
+      if not ti_is_slice_len_p fi r
+        ret long r
+      end
+    end
+    r = add r 1
+  end
+  ret -1
+end
+
+fn ti_reg_ref fi ulong from ulong to long
+  nv = ulong get c2_fn_nvregs fi
+  vbase = mul fi C2_MAX_VREGS
+  r = from
+  while lt r nv bound 480
+    if eq get c2_vt_s add vbase r S_REF
+      ret long r
+    end
+    r = add r 1
+  end
+  ret -1
+end
+
+fn ti_newreg fi ulong s uchar kd uchar el uchar sd uchar ln ushort to short
+  nv = ulong get c2_fn_nvregs fi
+  vidx = add mul fi C2_MAX_VREGS nv
+  put c2_vt_s vidx s
+  put c2_vt_kind vidx kd
+  put c2_vt_elem vidx el
+  put c2_vt_sid vidx sd
+  put c2_vt_len vidx ln
+  put c2_fn_nvregs fi ushort add nv 1
+  ret short nv
+end
+
+fn ti_mk_reset op uchar a short to void
+  put ti_mk_op 0 op
+  put ti_mk_sub 0 0
+  put ti_mk_dst 0 -1
+  put ti_mk_a 0 a
+  put ti_mk_b 0 -1
+  put ti_mk_c 0 -1
+  put ti_mk_t 0 0
+  put ti_mk_f 0 0
+  put ti_mk_imm 0 0
+  put ti_mk_cal 0 0
+  put ti_mk_na 0 0
+  for k ulong 6
+    put ti_mk_args k -1
+  end
+end
+
+fn ti_copy_in dst_idx ulong src_idx ulong to void
+  put c2_in_op dst_idx get c2_in_op src_idx
+  put c2_in_sub dst_idx get c2_in_sub src_idx
+  put c2_in_dst dst_idx get c2_in_dst src_idx
+  put c2_in_a dst_idx get c2_in_a src_idx
+  put c2_in_b dst_idx get c2_in_b src_idx
+  put c2_in_c dst_idx get c2_in_c src_idx
+  put c2_in_t dst_idx get c2_in_t src_idx
+  put c2_in_f dst_idx get c2_in_f src_idx
+  put c2_in_imm dst_idx get c2_in_imm src_idx
+  put c2_in_callee dst_idx get c2_in_callee src_idx
+  put c2_in_nargs dst_idx get c2_in_nargs src_idx
+  db = mul dst_idx 6
+  sb = mul src_idx 6
+  for k ulong 6
+    put c2_in_args add db k get c2_in_args add sb k
+  end
+end
+
+fn ti_store_mk dst_idx ulong to void
+  put c2_in_op dst_idx get ti_mk_op 0
+  put c2_in_sub dst_idx get ti_mk_sub 0
+  put c2_in_dst dst_idx get ti_mk_dst 0
+  put c2_in_a dst_idx get ti_mk_a 0
+  put c2_in_b dst_idx get ti_mk_b 0
+  put c2_in_c dst_idx get ti_mk_c 0
+  put c2_in_t dst_idx get ti_mk_t 0
+  put c2_in_f dst_idx get ti_mk_f 0
+  put c2_in_imm dst_idx get ti_mk_imm 0
+  put c2_in_callee dst_idx get ti_mk_cal 0
+  put c2_in_nargs dst_idx get ti_mk_na 0
+  db = mul dst_idx 6
+  for k ulong 6
+    put c2_in_args add db k get ti_mk_args k
+  end
+end
+
+fn ti_load_mk src_idx ulong to void
+  put ti_mk_op 0 get c2_in_op src_idx
+  put ti_mk_sub 0 get c2_in_sub src_idx
+  put ti_mk_dst 0 get c2_in_dst src_idx
+  put ti_mk_a 0 get c2_in_a src_idx
+  put ti_mk_b 0 get c2_in_b src_idx
+  put ti_mk_c 0 get c2_in_c src_idx
+  put ti_mk_t 0 get c2_in_t src_idx
+  put ti_mk_f 0 get c2_in_f src_idx
+  put ti_mk_imm 0 get c2_in_imm src_idx
+  put ti_mk_cal 0 get c2_in_callee src_idx
+  put ti_mk_na 0 get c2_in_nargs src_idx
+  sb = mul src_idx 6
+  for k ulong 6
+    put ti_mk_args k get c2_in_args add sb k
+  end
+end
+
+fn ti_ins fi ulong pos ulong to void
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  k = ni
+  while gt k pos bound 4096
+    ti_copy_in add ibase k add ibase sub k 1
+    k = sub k 1
+  end
+  ti_store_mk add ibase pos
+  put c2_fn_ninsns fi uint add ni 1
+  nb = ulong get c2_fn_nblocks fi
+  bbase = mul fi C2_MAX_BLOCKS
+  for b ulong nb bound 512
+    bi = add bbase b
+    fst = ulong get c2_blk_first bi
+    cnt = ulong get c2_blk_count bi
+    if and ge pos fst lt pos add fst cnt
+      put c2_blk_count bi uint add cnt 1
+    else
+      if gt fst pos
+        put c2_blk_first bi uint add fst 1
+      end
+    end
+  end
+end
+
+fn ti_del fi ulong pos ulong to void
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  k = pos
+  while lt add k 1 ni bound 4096
+    ti_copy_in add ibase k add ibase add k 1
+    k = add k 1
+  end
+  put c2_fn_ninsns fi uint sub ni 1
+  nb = ulong get c2_fn_nblocks fi
+  bbase = mul fi C2_MAX_BLOCKS
+  for b ulong nb bound 512
+    bi = add bbase b
+    fst = ulong get c2_blk_first bi
+    cnt = ulong get c2_blk_count bi
+    if and ge pos fst lt pos add fst cnt
+      put c2_blk_count bi uint sub cnt 1
+    else
+      if gt fst pos
+        put c2_blk_first bi uint sub fst 1
+      end
+    end
+  end
+end
+
+fn ti_block_of fi ulong ii ulong to long
+  nb = ulong get c2_fn_nblocks fi
+  bbase = mul fi C2_MAX_BLOCKS
+  for b ulong nb bound 512
+    fst = ulong get c2_blk_first add bbase b
+    cnt = ulong get c2_blk_count add bbase b
+    if and ge ii fst lt ii add fst cnt
+      ret long b
+    end
+  end
+  ret -1
+end
+
+fn ti_blk_ends_ret fi ulong b ulong to bool
+  bidx = add mul fi C2_MAX_BLOCKS b
+  last = sub add ulong get c2_blk_first bidx ulong get c2_blk_count bidx 1
+  ret eq get c2_in_op add mul fi C2_MAX_INSNS last C2_RET
+end
+
+fn ti_slice_param fi ulong to long
+  np = ulong get c2_fn_nparams fi
+  vbase = mul fi C2_MAX_VREGS
+  r = ulong 0
+  while lt add r 1 np bound 6
+    s = get c2_vt_s add vbase r
+    if or eq s S_BYTES eq s S_CELLS
+      ret long r
+    end
+    r = add r 1
+  end
+  ret -1
+end
+
+fn ti_blk_branches_to fi ulong b ulong h ulong to bool
+  bi = add mul fi C2_MAX_BLOCKS b
+  last = sub add ulong get c2_blk_first bi ulong get c2_blk_count bi 1
+  tidx = add mul fi C2_MAX_INSNS last
+  op = get c2_in_op tidx
+  if eq op C2_BR
+    ret eq ulong get c2_in_t tidx h
+  end
+  if eq op C2_CBR
+    if eq ulong get c2_in_t tidx h
+      ret true
+    end
+    ret eq ulong get c2_in_f tidx h
+  end
+  ret false
+end
+
+fn ti_is_loop_hdr fi ulong h ulong to bool
+  nb = ulong get c2_fn_nblocks fi
+  b = h
+  while lt b nb bound 512
+    if ti_blk_branches_to fi b h
+      ret true
+    end
+    b = add b 1
+  end
+  ret false
+end
+
+fn ti_single_def_const fi ulong r short out_at edit ulong 1 to bool
+  np = ulong get c2_fn_nparams fi
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  n = ulong 0
+  if lt long r long np
+    n = 1
+  end
+  last = ulong 0
+  for i ulong ni bound 4096
+    d = c2c_defines add ibase i
+    if eq d long r
+      n = add n 1
+      last = i
+    end
+  end
+  if ne n 1
+    ret false
+  end
+  put out_at 0 last
+  ret eq get c2_in_op add ibase last C2_CONST
+end
+
+fn ti_loop_guard_cmp fi ulong ci ulong ta short ka edit ulong 1 to bool
+  if ne get c2_in_op ci C2_CMP
+    ret false
+  end
+  if ne get c2_in_dst ci ta
+    ret false
+  end
+  sb = get c2_in_sub ci
+  if and ne sb CC_GE ne sb CC_LT
+    ret false
+  end
+  ret ti_single_def_const fi get c2_in_b ci ka
+end
+
+fn ti_loop_guard_blk fi ulong g ulong out_ckg edit ulong 3 to bool
+  bi = add mul fi C2_MAX_BLOCKS g
+  fst = ulong get c2_blk_first bi
+  cnt = ulong get c2_blk_count bi
+  ibase = mul fi C2_MAX_INSNS
+  tidx = add ibase sub add fst cnt 1
+  if ne get c2_in_op tidx C2_CBR
+    ret false
+  end
+  ta = get c2_in_a tidx
+  ka = new ulong 1 0
+  for k ulong cnt bound 4096
+    i = add fst k
+    if ti_loop_guard_cmp fi add ibase i ta ka
+      put out_ckg 0 i
+      put out_ckg 1 get ka 0
+      put out_ckg 2 g
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_loop_guard fi ulong out_ckg edit ulong 3 to bool
+  nb = ulong get c2_fn_nblocks fi
+  for h ulong nb bound 512
+    if not ti_is_loop_hdr fi h
+      continue
+    end
+    g = h
+    while lt g nb bound 512
+      if ti_loop_guard_blk fi g out_ckg
+        ret true
+      end
+      g = add g 1
+    end
+  end
+  ret false
+end
+
+note ---- Hand-built fn0 defects ----
+
+fn ti_fn0_owns_param to bool
+  np = ulong get c2_fn_nparams 0
+  for r ulong np bound 6
+    if and eq get c2_vt_s r S_REF eq get c2_vt_kind r K_OWN
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_d_irreducible to bool
+  c = ti_reg_val 0 0 S_BOOL 0 false
+  if or lt c 0 ge c long get c2_fn_nparams 0
+    ret false
+  end
+  ti_mk_reset C2_CBR short c
+  put ti_mk_t 0 1
+  put ti_mk_f 0 2
+  ti_store_mk 0
+  ti_mk_reset C2_BR -1
+  put ti_mk_t 0 2
+  ti_store_mk 1
+  ti_mk_reset C2_BR -1
+  put ti_mk_t 0 1
+  ti_store_mk 2
+  put c2_fn_ninsns 0 3
+  put c2_fn_nblocks 0 3
+  put c2_blk_first 0 0
+  put c2_blk_count 0 1
+  put c2_blk_first 1 1
+  put c2_blk_count 1 1
+  put c2_blk_first 2 2
+  put c2_blk_count 2 1
+  put c2_fn_ret_s 0 S_VOID
+  ret true
+end
+
+fn ti_d_endless to bool
+  if ne get c2_fn_ret_s 0 S_VOID
+    ret false
+  end
+  ti_mk_reset C2_BR -1
+  put ti_mk_t 0 1
+  ti_store_mk 0
+  ti_store_mk 1
+  put c2_fn_ninsns 0 2
+  put c2_fn_nblocks 0 2
+  put c2_blk_first 0 0
+  put c2_blk_count 0 1
+  put c2_blk_first 1 1
+  put c2_blk_count 1 1
+  put c2_fn_ret_s 0 S_VOID
+  ret true
+end
+
+fn ti_d_leak_one_path to bool
+  if ti_fn0_owns_param
+    ret false
+  end
+  x = ti_newreg 0 S_U32 0 0 0 0
+  y = ti_newreg 0 S_U32 0 0 0 0
+  c = ti_newreg 0 S_BOOL 0 0 0 0
+  a = ti_newreg 0 S_REF K_OWN S_U32 0 4
+  ti_mk_reset C2_CONST -1
+  put ti_mk_dst 0 x
+  ti_store_mk 0
+  ti_mk_reset C2_CONST -1
+  put ti_mk_dst 0 y
+  put ti_mk_imm 0 1
+  ti_store_mk 1
+  ti_mk_reset C2_CMP x
+  put ti_mk_dst 0 c
+  put ti_mk_b 0 y
+  put ti_mk_sub 0 CC_EQ
+  ti_store_mk 2
+  ti_mk_reset C2_ALLOC x
+  put ti_mk_dst 0 a
+  ti_store_mk 3
+  ti_mk_reset C2_CBR c
+  put ti_mk_t 0 1
+  put ti_mk_f 0 2
+  ti_store_mk 4
+  ti_mk_reset C2_RELEASE a
+  ti_store_mk 5
+  ti_mk_reset C2_BR -1
+  put ti_mk_t 0 2
+  ti_store_mk 6
+  ti_mk_reset C2_RET -1
+  ti_store_mk 7
+  put c2_fn_ninsns 0 8
+  put c2_fn_nblocks 0 3
+  put c2_blk_first 0 0
+  put c2_blk_count 0 5
+  put c2_blk_first 1 5
+  put c2_blk_count 1 2
+  put c2_blk_first 2 7
+  put c2_blk_count 2 1
+  put c2_fn_ret_s 0 S_VOID
+  ret true
+end
+
+fn ti_d_mut_copied to bool
+  if ti_fn0_owns_param
+    ret false
+  end
+  x = ti_newreg 0 S_U32 0 0 0 0
+  a = ti_newreg 0 S_REF K_OWN S_U32 0 4
+  d = ti_newreg 0 S_REF K_MUT S_U32 0 4
+  e = ti_newreg 0 S_REF K_MUT S_U32 0 4
+  ti_mk_reset C2_CONST -1
+  put ti_mk_dst 0 x
+  ti_store_mk 0
+  ti_mk_reset C2_ALLOC x
+  put ti_mk_dst 0 a
+  ti_store_mk 1
+  ti_mk_reset C2_MOV a
+  put ti_mk_dst 0 d
+  ti_store_mk 2
+  ti_mk_reset C2_MOV d
+  put ti_mk_dst 0 e
+  ti_store_mk 3
+  ti_mk_reset C2_STORE d
+  put ti_mk_b 0 x
+  put ti_mk_c 0 x
+  ti_store_mk 4
+  ti_mk_reset C2_STORE e
+  put ti_mk_b 0 x
+  put ti_mk_c 0 x
+  ti_store_mk 5
+  ti_mk_reset C2_RELEASE a
+  ti_store_mk 6
+  ti_mk_reset C2_RET -1
+  ti_store_mk 7
+  put c2_fn_ninsns 0 8
+  put c2_fn_nblocks 0 1
+  put c2_blk_first 0 0
+  put c2_blk_count 0 8
+  put c2_fn_ret_s 0 S_VOID
+  ret true
+end
+
+fn ti_d_overwrite_one_path to bool
+  if not ti_d_leak_one_path
+    ret false
+  end
+  a = get c2_in_dst 3
+  ti_mk_reset C2_RELEASE a
+  ti_ins 0 7
+  ti_load_mk 3
+  ti_ins 0 7
+  ret true
+end
+
+note ---- Planted defects group A (IDs 0..24: const, mov, bin, un, cmp, cast, alloc, release) ----
+
+fn ti_is_shared_ref tr ulong to bool
+  if ne get c2_vt_s tr S_REF
+    ret false
+  end
+  ret eq get c2_vt_kind tr K_SHARED
+end
+
+fn ti_is_mut_ref tr ulong to bool
+  if ne get c2_vt_s tr S_REF
+    ret false
+  end
+  ret eq get c2_vt_kind tr K_MUT
+end
+
+fn ti_is_own_ref tr ulong to bool
+  if ne get c2_vt_s tr S_REF
+    ret false
+  end
+  ret eq get c2_vt_kind tr K_OWN
+end
+
+fn ti_def_mov_widen fi ulong idx ulong to bool
+  vbase = mul fi C2_MAX_VREGS
+  td = add vbase ulong get c2_in_dst idx
+  if ne get c2_vt_s td S_REF
+    ret false
+  end
+  if eq get c2_vt_kind td K_SHARED
+    ret false
+  end
+  nv = ulong get c2_fn_nvregs fi
+  for r ulong nv bound 480
+    tr = add vbase r
+    if ti_is_shared_ref tr
+      if c2c_same_shape tr td
+        put c2_in_a idx short r
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn ti_bool_arith_scan ibase ulong vbase ulong from ulong ni ulong d short to bool
+  j = from
+  while lt j ni bound 4096
+    jdx = add ibase j
+    if eq get c2_in_op jdx C2_BIN
+      if eq get c2_in_sub jdx B_ADD
+        if c2c_is_int get c2_vt_s add vbase ulong get c2_in_dst jdx
+          put c2_in_dst jdx d
+          put c2_in_a jdx d
+          put c2_in_b jdx d
+          ret true
+        end
+      end
+    end
+    j = add j 1
+  end
+  ret false
+end
+
+fn ti_def_bool_arith_fn fi ulong to bool
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  vbase = mul fi C2_MAX_VREGS
+  for i ulong ni bound 4096
+    idx = add ibase i
+    if eq get c2_in_op idx C2_BIN
+      if eq get c2_vt_s add vbase ulong get c2_in_dst idx S_BOOL
+        put c2_in_sub idx B_ADD
+        ret true
+      end
+    end
+    if eq get c2_in_op idx C2_CMP
+      if ti_bool_arith_scan ibase vbase add i 1 ni get c2_in_dst idx
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn ti_def_bool_arith to bool
+  nf = get c2_nfuncs 0
+  for fi ulong nf bound 32
+    if ti_def_bool_arith_fn fi
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_apply_a id ulong fi ulong i ulong idx ulong to bool
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  np = ulong get c2_fn_nparams fi
+  if and eq id 3 eq op C2_CONST
+    s = get c2_vt_s add vbase ulong get c2_in_dst idx
+    if eq s S_BOOL
+      put c2_in_imm idx 2
+      ret true
+    end
+    w = c2c_width s
+    if and gt w 0 lt w 64
+      put c2_in_imm idx shl ulong 1 w
+      ret true
+    end
+  end
+  if and eq id 4 eq op C2_CONST
+    r = ti_reg_ref fi np
+    if ge r 0
+      put c2_in_dst idx short r
+      ret true
+    end
+  end
+  if and eq id 5 eq op C2_MOV
+    s = get c2_vt_s add vbase ulong get c2_in_dst idx
+    if c2c_is_value s
+      r = ti_reg_val fi 0 0 s false
+      if ge r 0
+        put c2_in_a idx short r
+        ret true
+      end
+    end
+  end
+  if and eq id 6 eq op C2_MOV
+    if eq get c2_vt_s add vbase ulong get c2_in_dst idx S_REF
+      r = ti_reg_val fi 0 0 0 false
+      if ge r 0
+        put c2_in_a idx short r
+        ret true
+      end
+    end
+  end
+  if and eq id 7 eq op C2_MOV
+    ret ti_def_mov_widen fi idx
+  end
+  if and eq id 8 eq op C2_BIN
+    put c2_in_sub idx B_LIMIT
+    ret true
+  end
+  if and eq id 9 eq op C2_BIN
+    sb = get c2_in_sub idx
+    if and ne sb B_SHL ne sb B_SHR
+      s = get c2_vt_s add vbase ulong get c2_in_dst idx
+      if c2c_is_int s
+        r = ti_reg_val fi 0 0 s true
+        if ge r 0
+          put c2_in_b idx short r
+          ret true
+        end
+      end
+    end
+  end
+  if and eq id 10 eq op C2_BIN
+    sb = get c2_in_sub idx
+    if or eq sb B_SHL eq sb B_SHR
+      r = ti_reg_val fi 0 S_BOOL 0 false
+      if ge r 0
+        put c2_in_b idx short r
+        ret true
+      end
+    end
+  end
+  if and eq id 12 eq op C2_UN
+    put c2_in_sub idx U_LIMIT
+    ret true
+  end
+  if and eq id 13 eq op C2_UN
+    if ne get c2_in_sub idx U_LNOT
+      put c2_in_sub idx U_LNOT
+      ret true
+    end
+  end
+  if and eq id 14 eq op C2_UN
+    if eq get c2_in_sub idx U_LNOT
+      put c2_in_sub idx U_NEG
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_apply_b id ulong fi ulong idx ulong to bool
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  np = ulong get c2_fn_nparams fi
+  if and eq id 15 eq op C2_CMP
+    r = ti_reg_val fi np 0 S_BOOL true
+    if ge r 0
+      put c2_in_dst idx short r
+      ret true
+    end
+  end
+  if and eq id 16 eq op C2_CMP
+    put c2_in_sub idx CC_LIMIT
+    ret true
+  end
+  if and eq id 17 eq op C2_CMP
+    r = ti_reg_val fi 0 0 get c2_vt_s add vbase ulong get c2_in_a idx false
+    if ge r 0
+      put c2_in_b idx short r
+      ret true
+    end
+  end
+  if and eq id 18 eq op C2_CAST
+    r = ti_reg_val fi 0 S_BOOL 0 false
+    if ge r 0
+      put c2_in_a idx short r
+      ret true
+    end
+  end
+  if and eq id 19 eq op C2_ALLOC
+    r = ti_reg_val fi np 0 0 false
+    if ge r 0
+      put c2_in_dst idx short r
+      ret true
+    end
+  end
+  if and eq id 20 eq op C2_ALLOC
+    td = add vbase ulong get c2_in_dst idx
+    want = get c2_vt_elem td
+    if ne get c2_vt_sid td 0
+      want = S_U64
+    end
+    r = ti_reg_val fi 0 0 want false
+    if ge r 0
+      put c2_in_a idx short r
+      ret true
+    end
+  end
+  if and eq id 21 eq op C2_RELEASE
+    r = ti_reg_val fi 0 0 0 false
+    if ge r 0
+      put c2_in_a idx short r
+      ret true
+    end
+  end
+  if and eq id 22 eq op C2_LOAD
+    r = ti_reg_val fi 0 S_BOOL 0 false
+    if ge r 0
+      put c2_in_b idx short r
+      ret true
+    end
+  end
+  if and eq id 23 eq op C2_LOAD
+    r = ti_reg_val fi 0 0 0 false
+    if ge r 0
+      put c2_in_a idx short r
+      ret true
+    end
+  end
+  if and eq id 24 eq op C2_LOAD
+    r = ti_reg_val fi np 0 get c2_vt_elem add vbase ulong get c2_in_a idx false
+    if ge r 0
+      put c2_in_dst idx short r
+      ret true
+    end
+  end
+  if and eq id 25 eq op C2_STORE
+    ta = add vbase ulong get c2_in_a idx
+    if eq get c2_vt_kind ta K_MUT
+      put c2_vt_kind ta K_SHARED
+      ret true
+    end
+  end
+  if and eq id 26 eq op C2_FLOAD
+    sid = ulong get c2_vt_sid add vbase ulong get c2_in_a idx
+    put c2_in_imm idx ulong get c2_st_nfields sub sid 1
+    ret true
+  end
+  if and eq id 27 eq op C2_FLOAD
+    sid = ulong get c2_vt_sid add vbase ulong get c2_in_a idx
+    fs = get c2_fld_s add mul sub sid 1 16 get c2_in_imm idx
+    r = ti_reg_val fi np 0 fs false
+    if ge r 0
+      put c2_in_dst idx short r
+      ret true
+    end
+  end
+  if and eq id 28 eq op C2_FSTORE
+    if eq get c2_in_b idx -1
+      r = ti_reg_val fi 0 0 0 true
+      if ge r 0
+        put c2_in_b idx short r
+        ret true
+      end
+    end
+  end
+  if and eq id 29 eq op C2_FSTORE
+    ta = add vbase ulong get c2_in_a idx
+    if eq get c2_vt_kind ta K_MUT
+      put c2_vt_kind ta K_SHARED
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_apply_c id ulong fi ulong idx ulong to bool
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  if and eq id 30 eq op C2_AOPEN
+    put c2_in_imm idx 0
+    ret true
+  end
+  if and eq id 31 eq op C2_AOPEN
+    put c2_in_imm idx add C2_MAX_ARRAY 1
+    ret true
+  end
+  if and eq id 32 eq op C2_POPEN
+    put c2_in_nargs idx uchar add C2_POOL_SLOTS 1
+    ret true
+  end
+  if and eq id 33 eq op C2_POPEN
+    put c2_in_nargs idx 0
+    ret true
+  end
+  if and eq id 34 eq op C2_POPEN
+    put c2_in_sub idx S_REF
+    ret true
+  end
+  if and eq id 35 eq op C2_TRAP
+    put c2_in_imm idx 0
+    ret true
+  end
+  if and eq id 36 eq op C2_TRAP
+    put c2_in_imm idx add C2_TRAP_MAX 1
+    ret true
+  end
+  if and eq id 37 eq op C2_BR
+    put c2_in_t idx get c2_fn_nblocks fi
+    ret true
+  end
+  if and eq id 38 eq op C2_CBR
+    put c2_in_f idx get c2_fn_nblocks fi
+    ret true
+  end
+  if and eq id 39 eq op C2_CBR
+    r = ti_reg_val fi 0 0 0 true
+    if ge r 0
+      put c2_in_a idx short r
+      ret true
+    end
+  end
+  if and eq id 40 eq op C2_RET
+    if ge get c2_in_a idx 0
+      r = ti_reg_val fi 0 0 get c2_fn_ret_s fi false
+      if ge r 0
+        put c2_in_a idx short r
+        ret true
+      end
+    end
+  end
+  if and eq id 41 eq op C2_RET
+    if and lt get c2_in_a idx 0 gt get c2_fn_nvregs fi 0
+      put c2_in_a idx 0
+      ret true
+    end
+  end
+  if and eq id 42 eq op C2_CALL
+    put c2_in_callee idx ushort fi
+    ret true
+  end
+  if and eq id 43 eq op C2_CALL
+    if gt get c2_in_nargs idx 0
+      put c2_in_nargs idx sub get c2_in_nargs idx 1
+      ret true
+    end
+  end
+  if and eq id 46 eq op C2_CALL
+    d = get c2_in_dst idx
+    if ge d 0
+      r = ti_reg_val fi ulong get c2_fn_nparams fi 0 get c2_vt_s add vbase ulong d false
+      if ge r 0
+        put c2_in_dst idx short r
+        ret true
+      end
+    end
+  end
+  if and eq id 48 eq op C2_BR
+    put c2_in_op idx C2_TRAP
+    put c2_in_imm idx 1
+    ret true
+  end
+  ret false
+end
+
+fn ti_def_call_44 fi ulong idx ulong to bool
+  cal = ulong get c2_in_callee idx
+  na = ulong get c2_in_nargs idx
+  gbase = mul cal C2_MAX_VREGS
+  abase = mul idx 6
+  for k ulong na bound 6
+    s = get c2_vt_s add gbase k
+    if not c2c_is_value s
+      continue
+    end
+    if gt k 0
+      ps = get c2_vt_s add gbase sub k 1
+      if or eq ps S_BYTES eq ps S_CELLS
+        continue
+      end
+    end
+    r = ti_reg_val fi 0 0 s false
+    if ge r 0
+      put c2_in_args add abase k short r
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_find_shared_match fi ulong pk ulong to long
+  vbase = mul fi C2_MAX_VREGS
+  nv = ulong get c2_fn_nvregs fi
+  for r ulong nv bound 480
+    tr = add vbase r
+    if ti_is_shared_ref tr
+      if c2c_same_shape tr pk
+        ret long r
+      end
+    end
+  end
+  ret -1
+end
+
+fn ti_def_call_45 fi ulong idx ulong to bool
+  cal = ulong get c2_in_callee idx
+  na = ulong get c2_in_nargs idx
+  gbase = mul cal C2_MAX_VREGS
+  abase = mul idx 6
+  for k ulong na bound 6
+    pk = add gbase k
+    if not ti_is_mut_ref pk
+      continue
+    end
+    r = ti_find_shared_match fi pk
+    if ge r 0
+      put c2_in_args add abase k short r
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_find_alias_j gbase ulong na ulong k ulong pk ulong to long
+  for j ulong na bound 6
+    if eq j k
+      continue
+    end
+    pj = add gbase j
+    if eq get c2_vt_s pj S_REF
+      if c2c_same_shape pk pj
+        ret long j
+      end
+    end
+  end
+  ret -1
+end
+
+fn ti_def_call_47 idx ulong to bool
+  cal = ulong get c2_in_callee idx
+  na = ulong get c2_in_nargs idx
+  gbase = mul cal C2_MAX_VREGS
+  abase = mul idx 6
+  for k ulong na bound 6
+    pk = add gbase k
+    if not ti_is_mut_ref pk
+      continue
+    end
+    j = ti_find_alias_j gbase na k pk
+    if ge j 0
+      ak = get c2_in_args add abase k
+      put c2_in_args add abase ulong j ak
+      ret true
+    end
+  end
+  ret false
+end
+
+fn ti_clone_reg fi ulong src_v ulong kd_override uchar to short
+  kd = get c2_vt_kind src_v
+  if ne kd_override 255
+    kd = kd_override
+  end
+  ret ti_newreg fi get c2_vt_s src_v kd get c2_vt_elem src_v get c2_vt_sid src_v get c2_vt_len src_v
+end
+
+fn ti_apply_d id ulong fi ulong i ulong idx ulong to bool
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  if and eq id 44 eq op C2_CALL
+    ret ti_def_call_44 fi idx
+  end
+  if and eq id 45 eq op C2_CALL
+    ret ti_def_call_45 fi idx
+  end
+  if and eq id 47 eq op C2_CALL
+    ret ti_def_call_47 idx
+  end
+  if and eq id 51 eq op C2_BIN
+    ta = add vbase ulong get c2_in_a idx
+    put c2_in_a idx ti_clone_reg fi ta 255
+    ret true
+  end
+  if and eq id 52 eq op C2_BIN
+    put c2_in_a idx short get c2_fn_nvregs fi
+    ret true
+  end
+  if and eq id 53 eq op C2_CONST
+    p = ti_slice_param fi
+    if ge p 0
+      td = add vbase ulong get c2_in_dst idx
+      if eq get c2_vt_s td S_U64
+        put c2_in_dst idx short add p 1
+        ret true
+      end
+    end
+  end
+  if and eq id 54 eq op C2_CONST
+    p = ti_slice_param fi
+    if ge p 0
+      put c2_in_dst idx short p
+      ret true
+    end
+  end
+  if and eq id 55 eq op C2_SSTORE
+    put c2_vt_s add vbase ulong get c2_in_a idx S_BYTES
+    ret true
+  end
+  if and eq id 58 eq op C2_RELEASE
+    ti_load_mk idx
+    ti_ins fi add i 1
+    ret true
+  end
+  if and eq id 59 eq op C2_LOAD
+    a = get c2_in_a idx
+    if ge a short get c2_fn_nparams fi
+      if eq get c2_vt_kind add vbase ulong a K_OWN
+        is_ar = false
+        ni = ulong get c2_fn_ninsns fi
+        ib = mul fi C2_MAX_INSNS
+        for j ulong ni bound 4096
+          jdx = add ib j
+          if eq get c2_in_op jdx C2_AALLOC
+            if eq get c2_in_dst jdx a
+              is_ar = true
+            end
+          end
+        end
+        if not is_ar
+          ti_mk_reset C2_RELEASE a
+          ti_ins fi i
+          ret true
+        end
+      end
+    end
+  end
+  if and eq id 60 eq op C2_RELEASE
+    b = ti_block_of fi i
+    if ge b 0
+      if ti_blk_ends_ret fi ulong b
+        ti_del fi i
+        ret true
+      end
+    end
+  end
+  if and eq id 61 eq op C2_ALLOC
+    ti_load_mk idx
+    ti_ins fi add i 1
+    ret true
+  end
+  if and eq id 62 eq op C2_AALLOC
+    ti_mk_reset C2_RELEASE get c2_in_dst idx
+    ti_ins fi add i 1
+    ret true
+  end
+  if and eq id 63 eq op C2_AALLOC
+    ti_mk_reset C2_ADESTROY get c2_in_b idx
+    ti_ins fi i
+    ret true
+  end
+  if and eq id 64 eq op C2_ADESTROY
+    ti_load_mk idx
+    ti_ins fi add i 1
+    ret true
+  end
+  if and eq id 65 eq op C2_PCLOSE
+    ti_load_mk idx
+    ti_ins fi add i 1
+    ret true
+  end
+  if and eq id 66 eq op C2_HALLOC
+    ti_mk_reset C2_PCLOSE get c2_in_b idx
+    ti_ins fi i
+    ret true
+  end
+  if and eq id 67 eq op C2_ADESTROY
+    b = ti_block_of fi i
+    if ge b 0
+      if ti_blk_ends_ret fi ulong b
+        ti_del fi i
+        ret true
+      end
+    end
+  end
+  if and eq id 68 eq op C2_PCLOSE
+    b = ti_block_of fi i
+    if ge b 0
+      if ti_blk_ends_ret fi ulong b
+        ti_del fi i
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn ti_def_hdl_data fi ulong i ulong idx ulong to bool
+  h = get c2_in_dst idx
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  vbase = mul fi C2_MAX_VREGS
+  for j ulong ni bound 4096
+    jdx = add ibase j
+    op = get c2_in_op jdx
+    if or eq op C2_BIN eq op C2_CMP
+      ja = ulong get c2_in_a jdx
+      if eq get c2_vt_s add vbase ja S_U64
+        put c2_in_a jdx h
+        ret true
+      end
+    end
+  end
+  nr = ti_newreg fi S_BOOL 0 0 0 0
+  ti_mk_reset C2_CMP h
+  put ti_mk_sub 0 CC_EQ
+  put ti_mk_b 0 h
+  put ti_mk_dst 0 nr
+  ti_ins fi add i 1
+  ret true
+end
+
+fn ti_is_mem_op op uchar to bool
+  if eq op C2_LOAD
+    ret true
+  end
+  if eq op C2_STORE
+    ret true
+  end
+  if eq op C2_FLOAD
+    ret true
+  end
+  ret eq op C2_FSTORE
+end
+
+fn ti_bor_out_scan fi ulong i ulong b short o short to bool
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  bi = ti_block_of fi i
+  j = add i 1
+  while lt j ni bound 4096
+    if ne ti_block_of fi j bi
+      break
+    end
+    jdx = add ibase j
+    if ti_is_mem_op get c2_in_op jdx
+      if eq get c2_in_a jdx b
+        ti_mk_reset C2_RELEASE o
+        ti_ins fi j
+        ret true
+      end
+    end
+    j = add j 1
+  end
+  ret false
+end
+
+fn ti_def_borrow_outlives fi ulong i ulong idx ulong to bool
+  vbase = mul fi C2_MAX_VREGS
+  b = get c2_in_dst idx
+  o = get c2_in_a idx
+  tb = add vbase ulong b
+  if ne get c2_vt_s tb S_REF
+    ret false
+  end
+  if eq get c2_vt_kind tb K_OWN
+    ret false
+  end
+  if ne get c2_vt_kind add vbase ulong o K_OWN
+    ret false
+  end
+  if lt long o long get c2_fn_nparams fi
+    ret false
+  end
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  for j ulong ni bound 4096
+    jdx = add ibase j
+    if eq get c2_in_op jdx C2_AALLOC
+      if eq get c2_in_dst jdx o
+        ret false
+      end
+    end
+  end
+  ret ti_bor_out_scan fi i b o
+end
+
+fn ti_apply_e id ulong fi ulong i ulong idx ulong to bool
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  if and eq id 69 eq op C2_AOPEN
+    ret ti_def_hdl_data fi i idx
+  end
+  if and eq id 70 eq op C2_AALLOC
+    put c2_in_b idx ti_newreg fi S_U64 0 0 0 0
+    ret true
+  end
+  if and eq id 71 eq op C2_HLOAD
+    ns = S_U8
+    if eq get c2_vt_s add vbase ulong get c2_in_dst idx S_U8
+      ns = S_U16
+    end
+    put c2_in_dst idx ti_newreg fi ns 0 0 0 0
+    ret true
+  end
+  if and eq id 85 eq op C2_MOV
+    ret ti_def_borrow_outlives fi i idx
+  end
+  if and eq id 86 eq op C2_CALL
+    cal = ulong get c2_in_callee idx
+    na = ulong get c2_in_nargs idx
+    gbase = mul cal C2_MAX_VREGS
+    for k ulong na bound 6
+      if ti_is_own_ref add gbase k
+        ti_load_mk idx
+        ti_ins fi add i 1
+        ret true
+      end
+    end
+  end
+  if and eq id 87 eq op C2_MOV
+    td = add vbase ulong get c2_in_dst idx
+    ta = add vbase ulong get c2_in_a idx
+    if and eq get c2_vt_kind td K_OWN ti_is_own_ref ta
+      nr = ti_clone_reg fi td 255
+      ti_load_mk idx
+      put ti_mk_dst 0 nr
+      ti_ins fi add i 1
+      ret true
+    end
+  end
+  if and eq id 90 eq op C2_ALLOC
+    td = add vbase ulong get c2_in_dst idx
+    put c2_in_dst idx ti_clone_reg fi td K_MUT
+    ret true
+  end
+  if and eq id 91 eq op C2_FLOAD
+    sid = sub ulong get c2_vt_sid add vbase ulong get c2_in_a idx 1
+    nf = ulong get c2_st_nfields sid
+    if lt nf C2_MAX_FIELDS
+      dst_f = add mul sid 16 nf
+      src_f = add mul sid 16 get c2_in_imm idx
+      put c2_fld_s dst_f get c2_fld_s src_f
+      put c2_fld_alen dst_f get c2_fld_alen src_f
+      put c2_fld_off dst_f get c2_fld_off src_f
+      put c2_in_imm idx nf
+      ret true
+    end
+  end
+  if and eq id 92 eq op C2_LOAD
+    ta = add vbase ulong get c2_in_a idx
+    if eq get c2_vt_sid ta 0
+      r = ti_reg_val fi 0 S_U64 0 false
+      if ge r 0
+        put c2_vt_elem add vbase ulong r get c2_vt_elem ta
+        put c2_in_a idx short r
+        ret true
+      end
+    end
+  end
+  if and eq id 93 eq op C2_SLOAD
+    r = ti_reg_val fi 0 S_U64 0 false
+    if ge r 0
+      put c2_in_a idx short r
+    else
+      put c2_in_a idx ti_newreg fi S_U64 0 0 0 0
+    end
+    ret true
+  end
+  if and eq id 94 eq op C2_AALLOC
+    td = add vbase ulong get c2_in_dst idx
+    nr = ti_clone_reg fi td 255
+    ti_mk_reset C2_MOV get c2_in_dst idx
+    put ti_mk_dst 0 nr
+    ti_ins fi add i 1
+    ret true
+  end
+  ret false
+end
+
+fn ti_apply_unit_a id ulong to bool
+  ckg = new ulong 3 0
+  nf = get c2_nfuncs 0
+  if eq id 49
+    for fi ulong nf bound 32
+      nb = ulong get c2_fn_nblocks fi
+      bbase = mul fi C2_MAX_BLOCKS
+      ibase = mul fi C2_MAX_INSNS
+      for b ulong nb bound 512
+        if ge get c2_blk_count add bbase b 2
+          fst = ulong get c2_blk_first add bbase b
+          ti_mk_reset C2_BR -1
+          put ti_mk_t 0 0
+          ti_store_mk add ibase fst
+          ret true
+        end
+      end
+    end
+    ret false
+  end
+  if eq id 50
+    for fi ulong nf bound 32
+      if ge get c2_fn_nblocks fi 2
+        b1 = add mul fi C2_MAX_BLOCKS 1
+        if ge get c2_blk_count b1 2
+          put c2_blk_first b1 add get c2_blk_first b1 1
+          put c2_blk_count b1 sub get c2_blk_count b1 1
+          ret true
+        end
+      end
+    end
+    ret false
+  end
+  if eq id 56
+    for fi ulong nf bound 32
+      p = ti_slice_param fi
+      if ge p 0
+        put c2_vt_s add mul fi C2_MAX_VREGS ulong add p 1 S_U32
+        ret true
+      end
+    end
+    ret false
+  end
+  if eq id 57
+    for fi ulong nf bound 32
+      p = ti_slice_param fi
+      if ge p 0
+        put c2_fn_nparams fi uchar p
+        ret true
+      end
+    end
+    ret false
+  end
+  if eq id 72
+    for fi ulong nf bound 32
+      if ti_loop_guard fi ckg
+        ibase = mul fi C2_MAX_INSNS
+        breg = ulong get c2_in_b add ibase get ckg 0
+        s = get c2_vt_s add mul fi C2_MAX_VREGS breg
+        if ge c2c_width s 32
+          put c2_in_imm add ibase get ckg 1 2000000
+          ret true
+        end
+      end
+    end
+    ret false
+  end
+  if eq id 73
+    for fi ulong nf bound 32
+      if ti_loop_guard fi ckg
+        ibase = mul fi C2_MAX_INSNS
+        ctr = get c2_in_a add ibase get ckg 0
+        ni = ulong get c2_fn_ninsns fi
+        for i ulong ni bound 4096
+          idx = add ibase i
+          if eq get c2_in_op idx C2_BIN
+            if eq get c2_in_dst idx ctr
+              if eq get c2_in_a idx ctr
+                if eq get c2_in_sub idx B_ADD
+                  put c2_in_sub idx B_SUB
+                  ret true
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    ret false
+  end
+  if eq id 74
+    for fi ulong nf bound 32
+      if ti_loop_guard fi ckg
+        g = get ckg 2
+        bi = add mul fi C2_MAX_BLOCKS g
+        last = sub add ulong get c2_blk_first bi ulong get c2_blk_count bi 1
+        tidx = add mul fi C2_MAX_INSNS last
+        xt = get c2_in_t tidx
+        put c2_in_t tidx get c2_in_f tidx
+        put c2_in_f tidx xt
+        ret true
+      end
+    end
+    ret false
+  end
+  ret false
+end
+
+fn ti_apply_unit_b id ulong to bool
+  ns = get c2_nstructs 0
+  nf = get c2_nfuncs 0
+  if eq id 75
+    for s ulong ns bound 16
+      if ge get c2_st_nfields s 2
+        f1 = add mul s 16 1
+        put c2_fld_off f1 add get c2_fld_off f1 1
+        ret true
+      end
+    end
+    ret false
+  end
+  if eq id 76
+    if gt ns 0
+      put c2_st_ncells 0 add get c2_st_ncells 0 1
+      ret true
+    end
+    ret false
+  end
+  if eq id 77
+    for s ulong ns bound 16
+      if ge get c2_st_nfields s 2
+        f0 = mul s 16
+        f1 = add f0 1
+        nl = ulong get c2_fld_namelen f0
+        put c2_fld_namelen f1 uchar nl
+        for k ulong nl bound 64
+          ch = get c2_fld_name add mul f0 64 k
+          put c2_fld_name add mul f1 64 k ch
+        end
+        ret true
+      end
+    end
+    ret false
+  end
+  if eq id 78
+    if gt ns 0
+      put c2_fld_s 0 S_REF
+      ret true
+    end
+    ret false
+  end
+  if eq id 79
+    if ge nf 2
+      nl = ulong get c2_fn_namelen 0
+      put c2_fn_namelen 1 uchar nl
+      for k ulong nl bound 64
+        put c2_fn_name add 64 k get c2_fn_name k
+      end
+      ret true
+    end
+    ret false
+  end
+  if eq id 80
+    for fi ulong nf bound 32
+      r = ti_reg_ref fi 0
+      if ge r 0
+        vr = add mul fi C2_MAX_VREGS ulong r
+        put c2_fn_ret_s fi get c2_vt_s vr
+        put c2_fn_ret_kind fi get c2_vt_kind vr
+        put c2_fn_ret_elem fi get c2_vt_elem vr
+        put c2_fn_ret_sid fi get c2_vt_sid vr
+        put c2_fn_ret_len fi get c2_vt_len vr
+        ret true
+      end
+    end
+    ret false
+  end
+  if eq id 81
+    for fi ulong nf bound 32
+      r = ti_reg_ref fi 0
+      if ge r 0
+        put c2_vt_kind add mul fi C2_MAX_VREGS ulong r 4
+        ret true
+      end
+    end
+    ret false
+  end
+  if eq id 82
+    for fi ulong nf bound 32
+      nv = ulong get c2_fn_nvregs fi
+      vbase = mul fi C2_MAX_VREGS
+      for r ulong nv bound 480
+        vr = add vbase r
+        if eq get c2_vt_s vr S_REF
+          if eq get c2_vt_sid vr 0
+            put c2_vt_len vr 0
+            ret true
+          end
+        end
+      end
+    end
+    ret false
+  end
+  if eq id 83
+    for fi ulong nf bound 32
+      nv = ulong get c2_fn_nvregs fi
+      vbase = mul fi C2_MAX_VREGS
+      for r ulong nv bound 480
+        vr = add vbase r
+        if eq get c2_vt_s vr S_REF
+          if ne get c2_vt_sid vr 0
+            put c2_vt_sid vr uchar add ns 1
+            ret true
+          end
+        end
+      end
+    end
+    ret false
+  end
+  if eq id 84
+    put c2_fn_nparams 0 uchar add C2_MAX_PARAMS 1
+    ret gt ulong get c2_fn_nvregs 0 C2_MAX_PARAMS
+  end
+  ret false
+end
+
+fn ti_apply_defect id ulong to bool
+  if eq id 0
+    ret ti_d_leak_one_path
+  end
+  if eq id 1
+    ret ti_d_mut_copied
+  end
+  if eq id 2
+    ret ti_d_overwrite_one_path
+  end
+  if eq id 11
+    ret ti_def_bool_arith
+  end
+  if eq id 88
+    ret ti_d_irreducible
+  end
+  if eq id 89
+    ret ti_d_endless
+  end
+  if or eq id 49 eq id 50
+    ret ti_apply_unit_a id
+  end
+  if or eq id 56 eq id 57
+    ret ti_apply_unit_a id
+  end
+  if and ge id 72 le id 74
+    ret ti_apply_unit_a id
+  end
+  if and ge id 75 le id 84
+    ret ti_apply_unit_b id
+  end
+  nf = get c2_nfuncs 0
+  for fi ulong nf bound 32
+    ni = ulong get c2_fn_ninsns fi
+    ibase = mul fi C2_MAX_INSNS
+    for i ulong ni bound 4096
+      idx = add ibase i
+      if le id 14
+        if ti_apply_a id fi i idx
+          ret true
+        end
+      else
+        if le id 29
+          if ti_apply_b id fi idx
+            ret true
+          end
+        else
+          if le id 48
+            if or eq id 44 or eq id 45 eq id 47
+              if ti_apply_d id fi i idx
+                ret true
+              end
+            else
+              if ti_apply_c id fi idx
+                ret true
+              end
+            end
+          else
+            if le id 68
+              if ti_apply_d id fi i idx
+                ret true
+              end
+            else
+              if ti_apply_e id fi i idx
+                ret true
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  ret false
+end
+
+fn ti_run_one_defect id ulong want view uchar * to ulong
+  nc = get ti_ncorp 0
+  applied = false
+  ok = false
+  for ci ulong nc bound 512
+    ln = ti_load_corp_ir ci
+    if ne c2_decode ln 0
+      continue
+    end
+    if ti_apply_defect id
+      applied = true
+      c = c2_check_unit
+      ti_chk ne c 0
+      if ne c 0
+        eq_r = ti_rule_eq want
+        ti_chk eq_r
+        ok = eq_r
+      end
+      en = c2_encode
+      if gt en 0
+        for k ulong en bound 1048576
+          put c2_ir_buf k get c2_ir_enc k
+        end
+        ti_chk ne c2_check_bytes en 0
+      end
+      break
+    end
+  end
+  ti_chk applied
+  if ok
+    ret 1
+  end
+  ret 0
+end
+
+fn ti_run_defects_a to ulong
+  pl = ulong 0
+  pl = add pl ti_run_one_defect 0 c2c_r_own_lk
+  pl = add pl ti_run_one_defect 1 c2c_r_m_ali
+  pl = add pl ti_run_one_defect 2 c2c_r_own_lk
+  pl = add pl ti_run_one_defect 3 c2c_r_c_can
+  pl = add pl ti_run_one_defect 4 c2c_r_t_con
+  pl = add pl ti_run_one_defect 5 c2c_r_t_mov
+  pl = add pl ti_run_one_defect 6 c2c_r_t_mov
+  pl = add pl ti_run_one_defect 7 c2c_r_t_mov
+  pl = add pl ti_run_one_defect 8 c2c_r_d_sub
+  pl = add pl ti_run_one_defect 9 c2c_r_t_bin
+  pl = add pl ti_run_one_defect 10 c2c_r_t_bin
+  pl = add pl ti_run_one_defect 11 c2c_r_t_bin
+  pl = add pl ti_run_one_defect 12 c2c_r_d_sub
+  pl = add pl ti_run_one_defect 13 c2c_r_t_un
+  pl = add pl ti_run_one_defect 14 c2c_r_t_un
+  pl = add pl ti_run_one_defect 15 c2c_r_t_cmp
+  pl = add pl ti_run_one_defect 16 c2c_r_d_sub
+  pl = add pl ti_run_one_defect 17 c2c_r_t_cmp
+  pl = add pl ti_run_one_defect 18 c2c_r_t_cast
+  pl = add pl ti_run_one_defect 19 c2c_r_t_alloc
+  pl = add pl ti_run_one_defect 20 c2c_r_t_alloc
+  pl = add pl ti_run_one_defect 21 c2c_r_t_rel
+  pl = add pl ti_run_one_defect 22 c2c_r_t_idx
+  pl = add pl ti_run_one_defect 23 c2c_r_t_idx
+  pl = add pl ti_run_one_defect 24 c2c_r_t_idx
+  pl = add pl ti_run_one_defect 25 c2c_r_ro
+  pl = add pl ti_run_one_defect 26 c2c_r_t_fld
+  pl = add pl ti_run_one_defect 27 c2c_r_t_fld
+  pl = add pl ti_run_one_defect 28 c2c_r_t_fld
+  pl = add pl ti_run_one_defect 29 c2c_r_ro
+  pl = add pl ti_run_one_defect 30 c2c_r_a_cap
+  pl = add pl ti_run_one_defect 31 c2c_r_a_cap
+  ret pl
+end
+
+fn ti_run_defects_b to ulong
+  pl = ulong 0
+  pl = add pl ti_run_one_defect 32 c2c_r_p_cap
+  pl = add pl ti_run_one_defect 33 c2c_r_p_cap
+  pl = add pl ti_run_one_defect 34 c2c_r_t_pool
+  pl = add pl ti_run_one_defect 35 c2c_r_trap
+  pl = add pl ti_run_one_defect 36 c2c_r_trap
+  pl = add pl ti_run_one_defect 37 c2c_r_cfg_t
+  pl = add pl ti_run_one_defect 38 c2c_r_cfg_t
+  pl = add pl ti_run_one_defect 39 c2c_r_t_cond
+  pl = add pl ti_run_one_defect 40 c2c_r_t_ret
+  pl = add pl ti_run_one_defect 41 c2c_r_t_ret
+  pl = add pl ti_run_one_defect 42 c2c_r_c_ord
+  pl = add pl ti_run_one_defect 43 c2c_r_c_ari
+  pl = add pl ti_run_one_defect 44 c2c_r_t_call
+  pl = add pl ti_run_one_defect 45 c2c_r_t_call
+  pl = add pl ti_run_one_defect 46 c2c_r_t_call
+  pl = add pl ti_run_one_defect 47 c2c_r_c_ali
+  pl = add pl ti_run_one_defect 48 c2c_r_cfg_tm
+  pl = add pl ti_run_one_defect 49 c2c_r_cfg_tm
+  pl = add pl ti_run_one_defect 50 c2c_r_cfg_l
+  pl = add pl ti_run_one_defect 51 c2c_r_undef
+  pl = add pl ti_run_one_defect 52 c2c_r_op_rng
+  pl = add pl ti_run_one_defect 53 c2c_r_sl_wr
+  pl = add pl ti_run_one_defect 54 c2c_r_sl_wr
+  pl = add pl ti_run_one_defect 55 c2c_r_sl_wr
+  pl = add pl ti_run_one_defect 56 c2c_r_sl_par
+  pl = add pl ti_run_one_defect 57 c2c_r_sl_par
+  pl = add pl ti_run_one_defect 58 c2c_r_dbl_r
+  pl = add pl ti_run_one_defect 59 c2c_r_own_ud
+  pl = add pl ti_run_one_defect 60 c2c_r_own_lk
+  pl = add pl ti_run_one_defect 61 c2c_r_own_lk
+  pl = add pl ti_run_one_defect 62 c2c_r_rel_a
+  ret pl
+end
+
+fn ti_run_defects_c to ulong
+  pl = ulong 0
+  pl = add pl ti_run_one_defect 63 c2c_r_a_dead
+  pl = add pl ti_run_one_defect 64 c2c_r_h_dbl
+  pl = add pl ti_run_one_defect 65 c2c_r_h_dbl
+  pl = add pl ti_run_one_defect 66 c2c_r_h_dead
+  pl = add pl ti_run_one_defect 67 c2c_r_h_lk
+  pl = add pl ti_run_one_defect 68 c2c_r_h_lk
+  pl = add pl ti_run_one_defect 69 c2c_r_hdl_d
+  pl = add pl ti_run_one_defect 70 c2c_r_hdl_d
+  pl = add pl ti_run_one_defect 71 c2c_r_t_pool
+  pl = add pl ti_run_one_defect 72 c2c_r_loop
+  pl = add pl ti_run_one_defect 73 c2c_r_loop
+  pl = add pl ti_run_one_defect 74 c2c_r_loop
+  pl = add pl ti_run_one_defect 75 c2c_r_st_lay
+  pl = add pl ti_run_one_defect 76 c2c_r_st_lay
+  pl = add pl ti_run_one_defect 77 c2c_r_st_name
+  pl = add pl ti_run_one_defect 78 c2c_r_st_ft
+  pl = add pl ti_run_one_defect 79 c2c_r_fn_nm
+  pl = add pl ti_run_one_defect 80 c2c_r_fn_ret
+  pl = add pl ti_run_one_defect 81 c2c_r_t_inv
+  pl = add pl ti_run_one_defect 82 c2c_r_t_inv
+  pl = add pl ti_run_one_defect 83 c2c_r_t_inv
+  pl = add pl ti_run_one_defect 84 c2c_r_fn_par
+  pl = add pl ti_run_one_defect 85 c2c_r_bor_ol
+  pl = add pl ti_run_one_defect 86 c2c_r_own_ud
+  pl = add pl ti_run_one_defect 87 c2c_r_own_ud
+  pl = add pl ti_run_one_defect 88 c2c_r_irred
+  pl = add pl ti_run_one_defect 89 c2c_r_loop
+  pl = add pl ti_run_one_defect 90 c2c_r_t_alloc
+  pl = add pl ti_run_one_defect 91 c2c_r_t_fld
+  pl = add pl ti_run_one_defect 92 c2c_r_t_idx
+  pl = add pl ti_run_one_defect 93 c2c_r_t_sl
+  pl = add pl ti_run_one_defect 94 c2c_r_a_mov
+  ret pl
+end
+
+note ---- Byte-level defects ----
+
+fn ti_bytes_reject ln ulong want view uchar * check_rule bool to ulong
+  rc = c2_check_bytes ln
+  ti_chk ne rc 0
+  if and ne rc 0 check_rule
+    ti_chk ti_rule_eq want
+  end
+  if ne rc 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ti_byte_defects to ulong
+  nc = get ti_ncorp 0
+  si = long -1
+  pi = long -1
+  for i ulong nc bound 512
+    off = get ti_corp_off i
+    v = get ti_corp_buf add off 7
+    if and lt si 0 ge v 2
+      si = long i
+    end
+    if and lt pi 0 eq v 1
+      pi = long i
+    end
+  end
+  ti_chk and ge si 0 ge pi 0
+  if or lt si 0 lt pi 0
+    ret 0
+  end
+  pl = ulong 0
+  sln = ti_load_corp_ir ulong si
+  put c2_ir_buf 0 xor get c2_ir_buf 0 1
+  pl = add pl ti_bytes_reject sln c2i_r_magic true
+  sln = ti_load_corp_ir ulong si
+  put c2_ir_buf 7 6
+  pl = add pl ti_bytes_reject sln c2i_r_ver true
+  sln = ti_load_corp_ir ulong si
+  put c2_ir_buf sln 0
+  pl = add pl ti_bytes_reject add sln 1 c2i_r_trail true
+  sln = ti_load_corp_ir ulong si
+  pl = add pl ti_bytes_reject sub sln 1 c2i_r_trunc false
+  poff = get ti_corp_off ulong pi
+  pln = get ti_corp_len ulong pi
+  for k ulong 7
+    put c2_ir_buf k get ti_corp_buf add poff k
+  end
+  put c2_ir_buf 7 2
+  put c2_ir_buf 8 0
+  k = ulong 8
+  while lt k pln bound 1048576
+    put c2_ir_buf add k 1 get ti_corp_buf add poff k
+    k = add k 1
+  end
+  pl = add pl ti_bytes_reject add pln 1 c2i_r_noncan true
+  ret pl
+end
+
+note ---- Phases 1 & 2 ----
+
+fn ti_enc_matches_corp i ulong ln ulong to bool
+  off = get ti_corp_off i
+  for k ulong ln bound 1048576
+    a = get c2_ir_enc k
+    b = get ti_corp_buf add off k
+    if ne a b
+      ret false
+    end
+  end
+  ret true
+end
+
+fn ti_phase1 to ulong
+  nc = get ti_ncorp 0
+  acc = ulong 0
+  for i ulong nc bound 512
+    ln = ti_load_corp_ir i
+    d = c2_decode ln
+    ti_chk eq d 0
+    if eq d 0
+      c = c2_check_unit
+      ti_chk eq c 0
+      en = c2_encode
+      same = false
+      if eq en ln
+        same = ti_enc_matches_corp i ln
+      end
+      ti_chk same
+      if eq c 0
+        acc = add acc 1
+      end
+    end
+  end
+  ti_chk eq acc nc
+  ret acc
+end
+
+fn ti_phase2_unit i ulong out_tf edit ulong 2 to void
+  n = get ti_corp_len i
+  off = get ti_corp_off i
+  for k ulong 72
+    cut = div mul n k 64
+    if ge k 64
+      cut = sub n sub 72 k
+    end
+    if ge cut n
+      continue
+    end
+    for j ulong cut bound 1048576
+      put c2_ir_buf j get ti_corp_buf add off j
+    end
+    put out_tf 0 add get out_tf 0 1
+    ti_chk ne c2_check_bytes cut 0
+  end
+  for k ulong 96
+    for j ulong n bound 1048576
+      put c2_ir_buf j get ti_corp_buf add off j
+    end
+    pos = rem add mul k 2654435761 mul i 40503 n
+    put c2_ir_buf pos xor get c2_ir_buf pos uchar shl ulong 1 and k 7
+    put out_tf 1 add get out_tf 1 1
+    ign = c2_check_bytes n
+  end
+end
+
+fn ti_phase2 out_tf edit ulong 2 to void
+  nc = get ti_ncorp 0
+  put out_tf 0 0
+  put out_tf 1 0
+  for i ulong nc bound 512
+    ti_phase2_unit i out_tf
+  end
+end
+
+fn main to int
+  if ne ulong argcnt 2
+    ret 2
+  end
+  put ti_checks 0 0
+  put ti_fails 0 0
+  put ti_ncorp 0 0
+  put ti_corp_used 0 0
+  if le ti_load_list 1 0
+    ret 2
+  end
+  acc = ti_phase1
+  tf = new ulong 2 0
+  ti_phase2 tf
+  pl = ti_run_defects_a
+  pl = add pl ti_run_defects_b
+  pl = add pl ti_run_defects_c
+  pl = add pl ti_byte_defects
+  ti_chk ge pl 50
+  ti_out_reset
+  ti_out_txt ti_s_hdr
+  ti_out_u64 acc
+  ti_out_txt ti_s_tr
+  ti_out_u64 get tf 0
+  ti_out_txt ti_s_fl
+  ti_out_u64 get tf 1
+  ti_out_txt ti_s_pl
+  ti_out_u64 pl
+  ti_out_txt ti_s_ch
+  ti_out_u64 get ti_checks 0
+  ti_out_txt ti_s_fa
+  ti_out_u64 get ti_fails 0
+  ti_out_ch 10
+  ti_flush
+  if ne get ti_fails 0 0
+    ret 1
+  end
+  ret 0
+end

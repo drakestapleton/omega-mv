@@ -1,0 +1,764 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note src/checker2/c2_lrat.om: DIMACS CNF reader/printer and RUP-only LRAT checker (pure seeded OM-2).
+
+const C2_LRAT_MAX_VARS long 4000000
+const C2_LRAT_MAX_ID long 100000000
+const C2_CNF_MAX_LITS ulong 4194304
+const C2_CNF_MAX_CLAUSES ulong 1048576
+const C2_LRAT_MAX_POOL ulong 16777216
+const C2_LRAT_MAX_DB ulong 2097152
+const C2_LRAT_TXT_CAP ulong 16777216
+
+note CNF storage (active formula)
+global c2_cnf_nvars ulong 1
+global c2_cnf_nclauses ulong 1
+global c2_cnf_nlits ulong 1
+global c2_cnf_lits int 4194304
+global c2_cnf_start ulong 1048576
+
+note Shared text buffer for DIMACS CNF / LRAT proof input/output
+global c2_lr_txt uchar 16777216
+global c2_lr_txtlen ulong 1
+
+note Lexer state: 0=pos, 1=len, 2=line
+global c2_lx ulong 3
+
+note LRAT checker state
+global c2_lr_pool int 16777216
+global c2_lr_pool_n ulong 1
+global c2_lr_off long 2097152
+global c2_lr_cap ulong 1
+global c2_lr_val uchar 4000001
+global c2_lr_asgn int 4000001
+global c2_lr_lits int 4000002
+
+note Result globals
+global c2_lr_ok ulong 1
+global c2_lr_line long 1
+global c2_lr_steps long 1
+global c2_lr_del long 1
+global c2_lr_rule uchar 64
+global c2_lr_rulelen ulong 1
+global c2_cnf_why uchar 64
+global c2_cnf_whylen ulong 1
+
+text c2l_r_ok "LRAT-OK"
+text c2l_r_res "LRAT-RESOURCE"
+text c2l_r_syn "LRAT-SYNTAX"
+text c2l_r_delu "LRAT-DELETE-UNKNOWN"
+text c2l_r_ido "LRAT-ID-ORDER"
+text c2l_r_idr "LRAT-ID-RANGE"
+text c2l_r_lit "LRAT-LITERAL"
+text c2l_r_rat "LRAT-RAT-UNSUPPORTED"
+text c2l_r_hunk "LRAT-HINT-UNKNOWN"
+text c2l_r_hnu "LRAT-HINT-NOT-UNIT"
+text c2l_r_noc "LRAT-NO-CONFLICT"
+text c2l_r_noe "LRAT-NO-EMPTY-CLAUSE"
+
+text c2l_c_ok "CNF-OK"
+text c2l_c_hdr "CNF-HEADER"
+text c2l_c_lit "CNF-LITERAL"
+text c2l_c_res "CNF-RESOURCE"
+text c2l_c_long "CNF-CLAUSE-TOO-LONG"
+text c2l_c_cnt "CNF-COUNT"
+text c2l_pcnf "p cnf "
+
+fn c2_lr_set_why s view uchar * to void
+  n = len s
+  for i ulong n bound 64
+    put c2_cnf_why i get s i
+  end
+  put c2_cnf_whylen 0 n
+end
+
+fn c2_lr_fail s view uchar * ln long to long
+  put c2_lr_ok 0 0
+  n = len s
+  for i ulong n bound 64
+    put c2_lr_rule i get s i
+  end
+  put c2_lr_rulelen 0 n
+  put c2_lr_line 0 ln
+  ret -1
+end
+
+fn c2_lx_is_ws c uchar to bool
+  if eq c 32
+    ret true
+  end
+  if eq c 9
+    ret true
+  end
+  if eq c 13
+    ret true
+  end
+  if eq c 10
+    ret true
+  end
+  ret false
+end
+
+fn c2_lx_skip_ws to void
+  pos = get c2_lx 0
+  n = get c2_lx 1
+  ln = get c2_lx 2
+  while lt pos n bound 20000000
+    c = get c2_lr_txt pos
+    if c2_lx_is_ws c
+      if eq c 10
+        ln = add ln 1
+      end
+      pos = add pos 1
+    else
+      if eq c 99
+        while lt pos n bound 20000000
+          if eq get c2_lr_txt pos 10
+            break
+          end
+          pos = add pos 1
+        end
+      else
+        break
+      end
+    end
+  end
+  put c2_lx 0 pos
+  put c2_lx 2 ln
+end
+
+note Returns 0 ok (value in dst[0]), 1 EOF, -1 malformed/overflow
+fn c2_lx_rd_int dst edit long 1 to long
+  c2_lx_skip_ws
+  pos = get c2_lx 0
+  n = get c2_lx 1
+  if ge pos n
+    ret 1
+  end
+  neg_s = false
+  if eq get c2_lr_txt pos 45
+    neg_s = true
+    pos = add pos 1
+  end
+  if ge pos n
+    put c2_lx 0 pos
+    ret -1
+  end
+  c0 = get c2_lr_txt pos
+  if lt c0 48
+    put c2_lx 0 pos
+    ret -1
+  end
+  if gt c0 57
+    put c2_lx 0 pos
+    ret -1
+  end
+  v = long 0
+  while lt pos n bound 32
+    c = get c2_lr_txt pos
+    if lt c 48
+      break
+    end
+    if gt c 57
+      break
+    end
+    v = add mul v 10 long sub c 48
+    if gt v C2_LRAT_MAX_ID
+      put c2_lx 0 pos
+      ret -1
+    end
+    pos = add pos 1
+  end
+  if lt pos n
+    if not c2_lx_is_ws get c2_lr_txt pos
+      put c2_lx 0 pos
+      ret -1
+    end
+  end
+  put c2_lx 0 pos
+  if neg_s
+    put dst 0 sub 0 v
+  else
+    put dst 0 v
+  end
+  ret 0
+end
+
+fn c2_cnf_reset to void
+  put c2_cnf_nvars 0 0
+  put c2_cnf_nclauses 0 0
+  put c2_cnf_nlits 0 0
+end
+
+fn c2_cnf_add lits view int * n ulong to long
+  nl = get c2_cnf_nlits 0
+  nc = get c2_cnf_nclauses 0
+  if gt add nl add n 1 C2_CNF_MAX_LITS
+    ret -1
+  end
+  if ge nc C2_CNF_MAX_CLAUSES
+    ret -1
+  end
+  put c2_cnf_start nc nl
+  put c2_cnf_nclauses 0 add nc 1
+  nv = get c2_cnf_nvars 0
+  for k ulong n bound 4096
+    l = get lits k
+    if eq l 0
+      ret -1
+    end
+    v = long l
+    if lt v 0
+      v = sub 0 v
+    end
+    if gt v C2_LRAT_MAX_VARS
+      ret -1
+    end
+    uv = ulong v
+    if gt uv nv
+      nv = uv
+    end
+    put c2_cnf_lits nl l
+    nl = add nl 1
+  end
+  put c2_cnf_lits nl 0
+  put c2_cnf_nlits 0 add nl 1
+  put c2_cnf_nvars 0 nv
+  ret 0
+end
+
+note Parse DIMACS CNF from c2_lr_txt[0..tlen) into c2_cnf_*
+fn c2_cnf_parse tlen ulong to long
+  c2_cnf_reset
+  c2_lr_set_why c2l_c_ok
+  put c2_lx 0 0
+  put c2_lx 1 tlen
+  put c2_lx 2 1
+  c2_lx_skip_ws
+  pos = get c2_lx 0
+  if lt sub tlen pos 6
+    c2_lr_set_why c2l_c_hdr
+    ret -1
+  end
+  for i ulong 6
+    if ne get c2_lr_txt add pos i get c2l_pcnf i
+      c2_lr_set_why c2l_c_hdr
+      ret -1
+    end
+  end
+  put c2_lx 0 add pos 6
+  la = new long 1 0
+  r = c2_lx_rd_int la
+  nv = get la 0
+  if or ne r 0 or lt nv 0 gt nv C2_LRAT_MAX_VARS
+    c2_lr_set_why c2l_c_hdr
+    ret -1
+  end
+  r = c2_lx_rd_int la
+  nc = get la 0
+  if or ne r 0 lt nc 0
+    c2_lr_set_why c2l_c_hdr
+    ret -1
+  end
+  buf = new int 4096 0
+  nb = ulong 0
+  while true bound 20000000
+    r = c2_lx_rd_int la
+    if eq r 1
+      break
+    end
+    l = get la 0
+    if lt r 0
+      c2_lr_set_why c2l_c_lit
+      c2_cnf_reset
+      ret -1
+    end
+    if gt l nv
+      c2_lr_set_why c2l_c_lit
+      c2_cnf_reset
+      ret -1
+    end
+    if lt l sub 0 nv
+      c2_lr_set_why c2l_c_lit
+      c2_cnf_reset
+      ret -1
+    end
+    if eq l 0
+      if ne c2_cnf_add buf nb 0
+        c2_lr_set_why c2l_c_res
+        c2_cnf_reset
+        ret -1
+      end
+      nb = 0
+    else
+      if eq nb 4096
+        c2_lr_set_why c2l_c_long
+        c2_cnf_reset
+        ret -1
+      end
+      put buf nb int l
+      nb = add nb 1
+    end
+  end
+  bad_cnt = false
+  note GUARD:cnf-count
+  bad_cnt = or ne nb 0 ne get c2_cnf_nclauses 0 ulong nc
+  if bad_cnt
+    c2_lr_set_why c2l_c_cnt
+    c2_cnf_reset
+    ret -1
+  end
+  put c2_cnf_nvars 0 ulong nv
+  ret 0
+end
+
+fn c2_txt_put_u64 pos ulong v ulong to ulong
+  if eq v 0
+    if lt pos C2_LRAT_TXT_CAP
+      put c2_lr_txt pos 48
+    end
+    ret add pos 1
+  end
+  tmp = new uchar 24 0
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  for i ulong n bound 24
+    if lt pos C2_LRAT_TXT_CAP
+      put c2_lr_txt pos get tmp sub sub n 1 i
+    end
+    pos = add pos 1
+  end
+  ret pos
+end
+
+fn c2_txt_put_i32 pos ulong v long to ulong
+  if lt v 0
+    if lt pos C2_LRAT_TXT_CAP
+      put c2_lr_txt pos 45
+    end
+    pos = add pos 1
+    ret c2_txt_put_u64 pos ulong sub 0 v
+  end
+  ret c2_txt_put_u64 pos ulong v
+end
+
+note Print c2_cnf_* into c2_lr_txt; returns byte length (0 on overflow)
+fn c2_cnf_print to ulong
+  pos = ulong 0
+  for i ulong 6
+    put c2_lr_txt pos get c2l_pcnf i
+    pos = add pos 1
+  end
+  pos = c2_txt_put_u64 pos get c2_cnf_nvars 0
+  put c2_lr_txt pos 32
+  pos = add pos 1
+  pos = c2_txt_put_u64 pos get c2_cnf_nclauses 0
+  put c2_lr_txt pos 10
+  pos = add pos 1
+  nl = get c2_cnf_nlits 0
+  for i ulong nl bound 4194304
+    l = long get c2_cnf_lits i
+    pos = c2_txt_put_i32 pos l
+    if ge pos C2_LRAT_TXT_CAP
+      put c2_lr_txtlen 0 0
+      ret 0
+    end
+    if ne l 0
+      put c2_lr_txt pos 32
+    else
+      put c2_lr_txt pos 10
+    end
+    pos = add pos 1
+  end
+  put c2_lr_txtlen 0 pos
+  ret pos
+end
+
+note ---- LRAT checker ----
+
+fn c2_lr_db_add_from_cnf idx ulong to long
+  st = get c2_cnf_start idx
+  pn = get c2_lr_pool_n 0
+  off = long pn
+  k = ulong 0
+  while true bound 4194304
+    l = get c2_cnf_lits add st k
+    if ge pn C2_LRAT_MAX_POOL
+      ret -1
+    end
+    put c2_lr_pool pn l
+    pn = add pn 1
+    if eq l 0
+      break
+    end
+    k = add k 1
+  end
+  put c2_lr_pool_n 0 pn
+  id = add idx 1
+  if ge id C2_LRAT_MAX_DB
+    ret -1
+  end
+  put c2_lr_off id off
+  ret 0
+end
+
+fn c2_lr_db_add_lits id ulong n ulong to long
+  if ge id C2_LRAT_MAX_DB
+    ret -1
+  end
+  pn = get c2_lr_pool_n 0
+  if gt add pn add n 1 C2_LRAT_MAX_POOL
+    ret -1
+  end
+  off = long pn
+  for k ulong n bound 4000001
+    put c2_lr_pool pn get c2_lr_lits k
+    pn = add pn 1
+  end
+  put c2_lr_pool pn 0
+  put c2_lr_pool_n 0 add pn 1
+  put c2_lr_off id off
+  ret 0
+end
+
+fn c2_lr_undo na ulong to void
+  for k ulong na bound 4000001
+    v = ulong get c2_lr_asgn k
+    put c2_lr_val v 0
+  end
+end
+
+fn c2_lr_lit_state l long to long
+  v = l
+  if lt v 0
+    v = sub 0 v
+  end
+  sv = get c2_lr_val ulong v
+  if eq sv 0
+    ret 0
+  end
+  if gt l 0
+    if eq sv 1
+      ret 1
+    end
+    ret -1
+  end
+  if eq sv 2
+    ret 1
+  end
+  ret -1
+end
+
+fn c2_lr_check_hint h ulong na_in ulong to long
+  off = get c2_lr_off h
+  p = ulong off
+  unit = long 0
+  nfree = ulong 0
+  sat = false
+  while true bound 4000001
+    l = long get c2_lr_pool p
+    if eq l 0
+      break
+    end
+    s = c2_lr_lit_state l
+    if eq s 1
+      sat = true
+      break
+    end
+    if eq s 0
+      nfree = add nfree 1
+      unit = l
+    end
+    p = add p 1
+  end
+  bad_nu = false
+  note GUARD:hint-not-unit
+  bad_nu = or sat gt nfree 1
+  if bad_nu
+    ret -2
+  end
+  if eq nfree 0
+    ret -1
+  end
+  v = unit
+  if lt v 0
+    v = sub 0 v
+  end
+  if gt unit 0
+    put c2_lr_val ulong v 1
+  else
+    put c2_lr_val ulong v 2
+  end
+  put c2_lr_asgn na_in int v
+  ret long add na_in 1
+end
+
+fn c2_lr_id_missing id long cap ulong to bool
+  if lt id 0
+    ret true
+  end
+  if ge ulong id cap
+    ret true
+  end
+  ret lt get c2_lr_off ulong id 0
+end
+
+fn c2_lr_do_del ln long cap ulong to long
+  ida = new long 1 0
+  while true bound 20000000
+    if ne c2_lx_rd_int ida 0
+      ret c2_lr_fail c2l_r_syn ln
+    end
+    del = get ida 0
+    if eq del 0
+      ret 0
+    end
+    bad_del = false
+    note GUARD:delete-unknown
+    bad_del = c2_lr_id_missing del cap
+    if bad_del
+      ret c2_lr_fail c2l_r_delu ln
+    end
+    put c2_lr_off ulong del -1
+    put c2_lr_del 0 add get c2_lr_del 0 1
+  end
+  ret 0
+end
+
+fn c2_lr_read_clause ln long nv long to long
+  ida = new long 1 0
+  n = ulong 0
+  while true bound 4000002
+    if ne c2_lx_rd_int ida 0
+      ret c2_lr_fail c2l_r_syn ln
+    end
+    l = get ida 0
+    if eq l 0
+      ret long n
+    end
+    bad_lit = false
+    note GUARD:lrat-literal
+    bad_lit = or gt l nv lt l sub 0 nv
+    if bad_lit
+      ret c2_lr_fail c2l_r_lit ln
+    end
+    if gt long n nv
+      ret c2_lr_fail c2l_r_syn ln
+    end
+    put c2_lr_lits n int l
+    n = add n 1
+  end
+  ret long n
+end
+
+fn c2_lr_do_hints ln long cap ulong na_init ulong taut bool to long
+  ida = new long 1 0
+  na = na_init
+  ok = taut
+  while true bound 20000000
+    if ne c2_lx_rd_int ida 0
+      c2_lr_undo na
+      ret c2_lr_fail c2l_r_syn ln
+    end
+    h = get ida 0
+    if eq h 0
+      break
+    end
+    if ok
+      continue
+    end
+    bad = false
+    note GUARD:rat-refused
+    bad = lt h 0
+    if bad
+      c2_lr_undo na
+      ret c2_lr_fail c2l_r_rat ln
+    end
+    bad = false
+    note GUARD:hint-unknown
+    bad = c2_lr_id_missing h cap
+    if bad
+      c2_lr_undo na
+      ret c2_lr_fail c2l_r_hunk ln
+    end
+    hr = c2_lr_check_hint ulong h na
+    if eq hr -2
+      c2_lr_undo na
+      ret c2_lr_fail c2l_r_hnu ln
+    end
+    if eq hr -1
+      ok = true
+    else
+      na = ulong hr
+    end
+  end
+  c2_lr_undo na
+  no_conf = false
+  note GUARD:no-conflict
+  no_conf = not ok
+  if no_conf
+    ret c2_lr_fail c2l_r_noc ln
+  end
+  ret 0
+end
+
+fn c2_lr_assign_false n ulong taut_out edit ulong 1 to ulong
+  na = ulong 0
+  put taut_out 0 0
+  for k ulong n bound 4000001
+    l = long get c2_lr_lits k
+    v = l
+    if lt v 0
+      v = sub 0 v
+    end
+    want = uchar 2
+    opp = uchar 1
+    if lt l 0
+      want = 1
+      opp = 2
+    end
+    cur = get c2_lr_val ulong v
+    if eq cur opp
+      put taut_out 0 1
+    end
+    if eq cur 0
+      put c2_lr_val ulong v want
+      put c2_lr_asgn na int v
+      na = add na 1
+    end
+  end
+  ret na
+end
+
+fn c2_lr_init_db plen ulong to long
+  put c2_lr_ok 0 0
+  put c2_lr_line 0 0
+  put c2_lr_steps 0 0
+  put c2_lr_del 0 0
+  nr = len c2l_r_ok
+  for i ulong nr bound 64
+    put c2_lr_rule i get c2l_r_ok i
+  end
+  put c2_lr_rulelen 0 nr
+  nv = get c2_cnf_nvars 0
+  nc = get c2_cnf_nclauses 0
+  max_id = add long nc 1
+  for i ulong plen bound 16777216
+    if eq get c2_lr_txt i 10
+      max_id = add max_id 1
+    end
+  end
+  cap = ulong add max_id 1
+  if gt cap C2_LRAT_MAX_DB
+    cap = C2_LRAT_MAX_DB
+  end
+  for i ulong cap bound 2097152
+    put c2_lr_off i -1
+  end
+  put c2_lr_cap 0 cap
+  put c2_lr_pool_n 0 0
+  for i ulong add nv 1 bound 4000001
+    put c2_lr_val i 0
+  end
+  for i ulong nc bound 1048576
+    if ne c2_lr_db_add_from_cnf i 0
+      ret c2_lr_fail c2l_r_res 0
+    end
+  end
+  ret max_id
+end
+
+fn c2_lr_add_step id ulong ln long nv long cap ulong to long
+  nr = c2_lr_read_clause ln nv
+  if lt nr 0
+    ret -1
+  end
+  n = ulong nr
+  taut_a = new ulong 1 0
+  na = c2_lr_assign_false n taut_a
+  if ne c2_lr_do_hints ln cap na ne get taut_a 0 0 0
+    ret -1
+  end
+  if ne c2_lr_db_add_lits id n 0
+    ret c2_lr_fail c2l_r_res ln
+  end
+  put c2_lr_steps 0 add get c2_lr_steps 0 1
+  if eq n 0
+    put c2_lr_ok 0 1
+    ret 1
+  end
+  ret 0
+end
+
+note Check LRAT proof in c2_lr_txt[0..plen) against c2_cnf_*
+fn c2_lrat_check plen ulong to long
+  max_id = c2_lr_init_db plen
+  if lt max_id 0
+    ret -1
+  end
+  cap = get c2_lr_cap 0
+  nv = long get c2_cnf_nvars 0
+  put c2_lx 0 0
+  put c2_lx 1 plen
+  put c2_lx 2 1
+  last_id = long get c2_cnf_nclauses 0
+  ida = new long 1 0
+  while true bound 20000000
+    t = c2_lx_rd_int ida
+    if eq t 1
+      break
+    end
+    id = get ida 0
+    ln = long get c2_lx 2
+    if lt t 0
+      ret c2_lr_fail c2l_r_syn ln
+    end
+    if lt id 1
+      ret c2_lr_fail c2l_r_syn ln
+    end
+    c2_lx_skip_ws
+    pos = get c2_lx 0
+    if lt pos plen
+      if eq get c2_lr_txt pos 100
+        put c2_lx 0 add pos 1
+        if ne c2_lr_do_del ln cap 0
+          ret -1
+        end
+        continue
+      end
+    end
+    bad = false
+    note GUARD:id-order
+    bad = le id last_id
+    if bad
+      ret c2_lr_fail c2l_r_ido ln
+    end
+    bad = false
+    note GUARD:id-range
+    bad = gt id max_id
+    if bad
+      ret c2_lr_fail c2l_r_idr ln
+    end
+    last_id = id
+    sr = c2_lr_add_step ulong id ln nv cap
+    if lt sr 0
+      ret -1
+    end
+    if eq sr 1
+      ret 0
+    end
+  end
+  no_emp = false
+  note GUARD:no-empty-clause
+  no_emp = true
+  if no_emp
+    ret c2_lr_fail c2l_r_noe long get c2_lx 2
+  end
+  put c2_lr_ok 0 1
+  ret 0
+end

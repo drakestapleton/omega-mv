@@ -1,0 +1,3094 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note src/checker2/c2_check.om: acceptance rules over a decoded C2Unit (pure seeded OM-2).
+note Compose after: c2_om2_hdr.om, src/checker2/c2_ir.om
+
+note Bitset width: 8 ulongs = 512 bits (covers C2_MAX_VREGS=480 and C2_MAX_BLOCKS=512)
+const C2_BSW ulong 8
+
+note Per-function analysis globals
+global c2_fx_fi ulong 1
+global c2_fx_quiet ulong 1
+global c2_fx_blk_of int 4096
+global c2_fx_succ int 1024
+global c2_fx_nsucc int 512
+global c2_fx_reach uchar 512
+global c2_fx_dom ulong 4096
+global c2_fx_ndefs int 480
+global c2_fx_def_in int 480
+
+note Definite assignment globals
+global c2_da_in ulong 4096
+global c2_da_out ulong 4096
+
+note Loop check globals
+global c2_lp_color uchar 512
+global c2_lp_stk int 512
+global c2_lp_idx int 512
+global c2_lp_latch int 512
+global c2_lp_inloop uchar 512
+global c2_lp_wlst int 512
+
+note Ownership flow globals
+const ST_U uchar 1
+const ST_L uchar 2
+const ST_D uchar 4
+global c2_own_arena int 480
+global c2_own_orig int 480
+global c2_own_flag int 480
+global c2_own_isflg uchar 480
+global c2_own_in uchar 245760
+global c2_own_live uchar 512
+global c2_own_st uchar 480
+
+note Mutable-borrow exclusivity globals
+global c2_ma_mi int 480
+global c2_ma_mreg int 480
+global c2_ma_lin ulong 4096
+global c2_ma_pin ulong 2097152
+global c2_ma_p ulong 3840
+global c2_ma_after ulong 32768
+global c2_ma_seen uchar 512
+global c2_ma_cur ulong 8
+
+note Rule name texts
+text c2c_r_st_name "C2-STRUCT-NAME"
+text c2c_r_st_ft "C2-STRUCT-FIELD-TYPE"
+text c2c_r_st_fl "C2-STRUCT-FIELD-LEN"
+text c2c_r_st_lay "C2-STRUCT-LAYOUT"
+text c2c_r_op_rng "C2-OPERAND-RANGE"
+text c2c_r_sl_wr "C2-SLICE-WRITE"
+text c2c_r_sl_esc "C2-SLICE-ESCAPE"
+text c2c_r_sl_par "C2-SLICE-PARAM"
+text c2c_r_t_con "C2-TYPE-CONST"
+text c2c_r_c_can "C2-CONST-CANONICAL"
+text c2c_r_t_mov "C2-TYPE-MOV"
+text c2c_r_d_sub "C2-DECODE-SUBOP"
+text c2c_r_t_bin "C2-TYPE-BIN"
+text c2c_r_t_un "C2-TYPE-UN"
+text c2c_r_t_cmp "C2-TYPE-CMP"
+text c2c_r_t_cast "C2-TYPE-CAST"
+text c2c_r_t_alloc "C2-TYPE-ALLOC"
+text c2c_r_t_rel "C2-TYPE-RELEASE"
+text c2c_r_t_idx "C2-TYPE-INDEX"
+text c2c_r_ro "C2-READ-ONLY"
+text c2c_r_t_fld "C2-TYPE-FIELD"
+text c2c_r_t_hdl "C2-TYPE-HANDLE"
+text c2c_r_a_cap "C2-ARENA-CAPACITY"
+text c2c_r_t_pool "C2-TYPE-POOL"
+text c2c_r_p_cap "C2-POOL-CAPACITY"
+text c2c_r_t_sl "C2-TYPE-SLICE"
+text c2c_r_trap "C2-TRAP-CODE"
+text c2c_r_cfg_t "C2-CFG-TARGET"
+text c2c_r_t_cond "C2-TYPE-COND"
+text c2c_r_t_ret "C2-TYPE-RET"
+text c2c_r_c_ord "C2-CALL-ORDER"
+text c2c_r_c_ari "C2-CALL-ARITY"
+text c2c_r_t_call "C2-TYPE-CALL"
+text c2c_r_c_ali "C2-CALL-ALIAS"
+text c2c_r_cfg_l "C2-CFG-LAYOUT"
+text c2c_r_cfg_tm "C2-CFG-TERMINATOR"
+text c2c_r_hdl_d "C2-HANDLE-DISCIPLINE"
+text c2c_r_undef "C2-UNDEFINED-USE"
+text c2c_r_irred "C2-CFG-IRREDUCIBLE"
+text c2c_r_loop "C2-LOOP-UNBOUNDED"
+text c2c_r_own_ud "C2-OWN-USE-DEAD"
+text c2c_r_bor_ol "C2-BORROW-OUTLIVES-OWNER"
+text c2c_r_own_lk "C2-OWN-LEAK"
+text c2c_r_a_dead "C2-ARENA-DEAD"
+text c2c_r_rel_a "C2-OWN-RELEASE-ARENA"
+text c2c_r_dbl_r "C2-OWN-DOUBLE-RELEASE"
+text c2c_r_a_mov "C2-OWN-ARENA-MOVE"
+text c2c_r_h_reop "C2-HANDLE-REOPEN"
+text c2c_r_h_dbl "C2-HANDLE-DOUBLE-CLOSE"
+text c2c_r_h_dead "C2-HANDLE-DEAD"
+text c2c_r_h_lk "C2-HANDLE-LEAK"
+text c2c_r_m_ali "C2-BORROW-MUT-ALIAS"
+text c2c_r_fn_nm "C2-FUNC-NAME"
+text c2c_r_fn_par "C2-FUNC-PARAMS"
+text c2c_r_fn_ret "C2-FUNC-RETURN"
+text c2c_r_t_inv "C2-TYPE-INVALID"
+text c2c_det "check failed"
+
+note ---- Type helpers ----
+
+fn c2c_is_value s uchar to bool
+  if ge s S_BOOL
+    if le s S_I64
+      ret true
+    end
+  end
+  ret false
+end
+
+fn c2c_is_int s uchar to bool
+  if ge s S_U8
+    if le s S_I64
+      ret true
+    end
+  end
+  ret false
+end
+
+fn c2c_is_signed s uchar to bool
+  if ge s S_I8
+    if le s S_I64
+      ret true
+    end
+  end
+  ret false
+end
+
+fn c2c_width s uchar to ulong
+  if eq s S_BOOL
+    ret 1
+  end
+  if or eq s S_U8 eq s S_I8
+    ret 8
+  end
+  if or eq s S_U16 eq s S_I16
+    ret 16
+  end
+  if or eq s S_U32 eq s S_I32
+    ret 32
+  end
+  if or eq s S_U64 eq s S_I64
+    ret 64
+  end
+  ret 0
+end
+
+fn c2c_is_slice s uchar to bool
+  ret or eq s S_BYTES eq s S_CELLS
+end
+
+fn c2c_is_arr_ref idx ulong to bool
+  if ne get c2_vt_s idx S_REF
+    ret false
+  end
+  ret eq get c2_vt_sid idx 0
+end
+
+fn c2c_is_st_ref idx ulong to bool
+  if ne get c2_vt_s idx S_REF
+    ret false
+  end
+  ret ne get c2_vt_sid idx 0
+end
+
+fn c2c_same_vt a ulong b ulong to bool
+  sa = get c2_vt_s a
+  if ne sa get c2_vt_s b
+    ret false
+  end
+  if ne sa S_REF
+    ret true
+  end
+  if ne get c2_vt_kind a get c2_vt_kind b
+    ret false
+  end
+  if ne get c2_vt_elem a get c2_vt_elem b
+    ret false
+  end
+  if ne get c2_vt_len a get c2_vt_len b
+    ret false
+  end
+  ret eq get c2_vt_sid a get c2_vt_sid b
+end
+
+fn c2c_same_vt_ret vidx ulong fi ulong to bool
+  sa = get c2_vt_s vidx
+  if ne sa get c2_fn_ret_s fi
+    ret false
+  end
+  if ne sa S_REF
+    ret true
+  end
+  if ne get c2_vt_kind vidx get c2_fn_ret_kind fi
+    ret false
+  end
+  if ne get c2_vt_elem vidx get c2_fn_ret_elem fi
+    ret false
+  end
+  if ne get c2_vt_len vidx get c2_fn_ret_len fi
+    ret false
+  end
+  ret eq get c2_vt_sid vidx get c2_fn_ret_sid fi
+end
+
+fn c2c_same_shape a ulong b ulong to bool
+  if ne get c2_vt_s a S_REF
+    ret false
+  end
+  if ne get c2_vt_s b S_REF
+    ret false
+  end
+  if ne get c2_vt_elem a get c2_vt_elem b
+    ret false
+  end
+  if ne get c2_vt_len a get c2_vt_len b
+    ret false
+  end
+  ret eq get c2_vt_sid a get c2_vt_sid b
+end
+
+fn c2c_bindable dst_k uchar src_k uchar to bool
+  if eq src_k K_OWN
+    ret true
+  end
+  if eq src_k K_MUT
+    ret or eq dst_k K_MUT eq dst_k K_SHARED
+  end
+  if eq src_k K_SHARED
+    ret eq dst_k K_SHARED
+  end
+  ret false
+end
+
+fn c2c_canonical s uchar imm ulong to bool
+  w = c2c_width s
+  if eq s S_BOOL
+    ret le imm 1
+  end
+  if eq w 64
+    ret true
+  end
+  if not c2c_is_signed s
+    ret lt imm shl ulong 1 w
+  end
+  half = shl ulong 1 sub w 1
+  if lt imm half
+    ret true
+  end
+  lo = not sub half 1
+  ret ge imm lo
+end
+
+fn c2c_name_eq kind ulong a ulong b ulong to bool
+  la = ulong 0
+  lb = ulong 0
+  if eq kind 0
+    la = ulong get c2_st_namelen a
+    lb = ulong get c2_st_namelen b
+  end
+  if eq kind 1
+    la = ulong get c2_fld_namelen a
+    lb = ulong get c2_fld_namelen b
+  end
+  if eq kind 2
+    la = ulong get c2_fn_namelen a
+    lb = ulong get c2_fn_namelen b
+  end
+  if ne la lb
+    ret false
+  end
+  ba = mul a 64
+  bb = mul b 64
+  for i ulong la bound 64
+    ca = uchar 0
+    cb = uchar 0
+    if eq kind 0
+      ca = get c2_st_name add ba i
+      cb = get c2_st_name add bb i
+    end
+    if eq kind 1
+      ca = get c2_fld_name add ba i
+      cb = get c2_fld_name add bb i
+    end
+    if eq kind 2
+      ca = get c2_fn_name add ba i
+      cb = get c2_fn_name add bb i
+    end
+    if ne ca cb
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- Unit tables ----
+
+fn c2c_check_structs to long
+  ns = get c2_nstructs 0
+  for k ulong ns bound 16
+    for j ulong k bound 16
+      if c2c_name_eq 0 j k
+        ret c2_fail c2c_r_st_name -1 -1 c2c_det
+      end
+    end
+    off = ulong 0
+    nf = ulong get c2_st_nfields k
+    for f ulong nf bound 16
+      fidx = add mul k 16 f
+      for g ulong f bound 16
+        if c2c_name_eq 1 add mul k 16 g fidx
+          ret c2_fail c2c_r_st_name -1 -1 c2c_det
+        end
+      end
+      if not c2c_is_value get c2_fld_s fidx
+        ret c2_fail c2c_r_st_ft -1 -1 c2c_det
+      end
+      alen = ulong get c2_fld_alen fidx
+      if gt alen C2_MAX_ARRAY
+        ret c2_fail c2c_r_st_fl -1 -1 c2c_det
+      end
+      bad_off = false
+      note GUARD:struct-offset
+      bad_off = ne ulong get c2_fld_off fidx off
+      if bad_off
+        ret c2_fail c2c_r_st_lay -1 -1 c2c_det
+      end
+      if ne alen 0
+        off = add off alen
+      else
+        off = add off 1
+      end
+    end
+    nc = ulong get c2_st_ncells k
+    bad_nc = false
+    note GUARD:struct-cells
+    bad_nc = or ne nc off or lt off 1 gt off C2_MAX_ARRAY
+    if bad_nc
+      ret c2_fail c2c_r_st_lay -1 -1 c2c_det
+    end
+  end
+  ret 0
+end
+
+fn c2c_check_vt vidx ulong to bool
+  s = get c2_vt_s vidx
+  if ge s S_LIMIT
+    ret false
+  end
+  if eq s S_VOID
+    ret false
+  end
+  if ne s S_REF
+    ret true
+  end
+  kd = get c2_vt_kind vidx
+  if lt kd K_OWN
+    ret false
+  end
+  if gt kd K_MUT
+    ret false
+  end
+  el = get c2_vt_elem vidx
+  sd = ulong get c2_vt_sid vidx
+  ln = ulong get c2_vt_len vidx
+  if eq el S_VOID
+    if lt sd 1
+      ret false
+    end
+    if gt sd get c2_nstructs 0
+      ret false
+    end
+    ret eq ln ulong get c2_st_ncells sub sd 1
+  end
+  if not c2c_is_value el
+    ret false
+  end
+  if ne sd 0
+    ret false
+  end
+  if lt ln 1
+    ret false
+  end
+  ret le ln C2_MAX_ARRAY
+end
+
+note ---- Instruction uses / defines ----
+
+fn c2c_term op uchar to bool
+  if eq op C2_BR
+    ret true
+  end
+  if eq op C2_CBR
+    ret true
+  end
+  ret eq op C2_RET
+end
+
+fn c2c_uses idx ulong dst edit short 8 to ulong
+  op = get c2_in_op idx
+  n = ulong 0
+  if eq op C2_CONST
+    ret 0
+  end
+  if eq op C2_TRAP
+    ret 0
+  end
+  if eq op C2_BR
+    ret 0
+  end
+  if eq op C2_AOPEN
+    ret 0
+  end
+  if eq op C2_POPEN
+    ret 0
+  end
+  u1 = false
+  if eq op C2_MOV
+    u1 = true
+  end
+  if eq op C2_CAST
+    u1 = true
+  end
+  if eq op C2_UN
+    u1 = true
+  end
+  if eq op C2_ALLOC
+    u1 = true
+  end
+  if eq op C2_RELEASE
+    u1 = true
+  end
+  if eq op C2_ADESTROY
+    u1 = true
+  end
+  if eq op C2_PCLOSE
+    u1 = true
+  end
+  if eq op C2_CBR
+    u1 = true
+  end
+  if u1
+    put dst 0 get c2_in_a idx
+    ret 1
+  end
+  if eq op C2_RET
+    a = get c2_in_a idx
+    if ge a 0
+      put dst 0 a
+      ret 1
+    end
+    ret 0
+  end
+  u2 = false
+  if eq op C2_BIN
+    u2 = true
+  end
+  if eq op C2_CMP
+    u2 = true
+  end
+  if eq op C2_LOAD
+    u2 = true
+  end
+  if eq op C2_AALLOC
+    u2 = true
+  end
+  if eq op C2_HALLOC
+    u2 = true
+  end
+  if eq op C2_HGEN
+    u2 = true
+  end
+  if eq op C2_SLOAD
+    u2 = true
+  end
+  if u2
+    put dst 0 get c2_in_a idx
+    put dst 1 get c2_in_b idx
+    ret 2
+  end
+  u3 = false
+  if eq op C2_STORE
+    u3 = true
+  end
+  if eq op C2_HFREE
+    u3 = true
+  end
+  if eq op C2_HLOAD
+    u3 = true
+  end
+  if eq op C2_SSTORE
+    u3 = true
+  end
+  if u3
+    put dst 0 get c2_in_a idx
+    put dst 1 get c2_in_b idx
+    put dst 2 get c2_in_c idx
+    ret 3
+  end
+  if eq op C2_HSTORE
+    put dst 0 get c2_in_a idx
+    put dst 1 get c2_in_b idx
+    put dst 2 get c2_in_c idx
+    put dst 3 get c2_in_args mul idx 6
+    ret 4
+  end
+  if eq op C2_FLOAD
+    put dst 0 get c2_in_a idx
+    n = 1
+    b = get c2_in_b idx
+    if ge b 0
+      put dst 1 b
+      n = 2
+    end
+    ret n
+  end
+  if eq op C2_FSTORE
+    put dst 0 get c2_in_a idx
+    n = 1
+    b = get c2_in_b idx
+    if ge b 0
+      put dst 1 b
+      n = 2
+    end
+    put dst n get c2_in_c idx
+    ret add n 1
+  end
+  if eq op C2_CALL
+    na = ulong get c2_in_nargs idx
+    abase = mul idx 6
+    for k ulong na bound 6
+      put dst k get c2_in_args add abase k
+    end
+    ret na
+  end
+  ret 0
+end
+
+fn c2c_has_dst_op op uchar to bool
+  if eq op C2_CONST
+    ret true
+  end
+  if eq op C2_MOV
+    ret true
+  end
+  if eq op C2_BIN
+    ret true
+  end
+  if eq op C2_UN
+    ret true
+  end
+  if eq op C2_CMP
+    ret true
+  end
+  if eq op C2_CAST
+    ret true
+  end
+  if eq op C2_ALLOC
+    ret true
+  end
+  if eq op C2_LOAD
+    ret true
+  end
+  if eq op C2_FLOAD
+    ret true
+  end
+  if eq op C2_AOPEN
+    ret true
+  end
+  if eq op C2_AALLOC
+    ret true
+  end
+  if eq op C2_POPEN
+    ret true
+  end
+  if eq op C2_HALLOC
+    ret true
+  end
+  if eq op C2_HGEN
+    ret true
+  end
+  if eq op C2_HLOAD
+    ret true
+  end
+  ret eq op C2_SLOAD
+end
+
+fn c2c_defines idx ulong to long
+  op = get c2_in_op idx
+  if c2c_has_dst_op op
+    ret long get c2_in_dst idx
+  end
+  if eq op C2_CALL
+    ret long get c2_in_dst idx
+  end
+  ret -1
+end
+
+note ---- Per-instruction typing ----
+
+fn c2c_f rule view uchar * ii long to long
+  ret c2_fail rule long get c2_fx_fi 0 ii c2c_det
+end
+
+fn c2c_ref_bind_bad dst_v ulong src_v ulong to bool
+  if not c2c_same_shape dst_v src_v
+    ret true
+  end
+  ret not c2c_bindable get c2_vt_kind dst_v get c2_vt_kind src_v
+end
+
+fn c2c_chk_call_alias idx ulong cal ulong k ulong ak ulong to long
+  gvbase = mul cal C2_MAX_VREGS
+  abase = mul idx 6
+  pp = add gvbase k
+  pps = get c2_vt_s pp
+  is_wr = or eq pps S_REF eq pps S_CELLS
+  if not is_wr
+    ret 0
+  end
+  for j ulong k bound 6
+    if eq ulong get c2_in_args add abase j ak
+      kp = get c2_vt_kind pp
+      kj = get c2_vt_kind add gvbase j
+      both_sh = false
+      if eq kp K_SHARED
+        if eq kj K_SHARED
+          both_sh = true
+        end
+      end
+      bad = false
+      note GUARD:call-alias
+      bad = not both_sh
+      if bad
+        ret -1
+      end
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_call_arg1 idx ulong cal ulong k ulong na ulong to long
+  fi = get c2_fx_fi 0
+  abase = mul idx 6
+  ak = ulong get c2_in_args add abase k
+  pa = add mul fi C2_MAX_VREGS ak
+  pp = add mul cal C2_MAX_VREGS k
+  pps = get c2_vt_s pp
+  if eq pps S_REF
+    bad = false
+    note GUARD:call-ref
+    bad = c2c_ref_bind_bad pp pa
+    if bad
+      ret -1
+    end
+  else
+    if c2c_is_slice pps
+      if ne get c2_vt_s pa pps
+        ret -1
+      end
+      if ge add k 1 na
+        ret -1
+      end
+      nxt = long get c2_in_args add abase add k 1
+      if ne nxt add long ak 1
+        ret -1
+      end
+    else
+      bad = false
+      note GUARD:call-scalar
+      bad = not c2c_same_vt pa pp
+      if bad
+        ret -1
+      end
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_call_args fi ulong ii ulong idx ulong cal ulong to long
+  na = ulong get c2_in_nargs idx
+  abase = mul idx 6
+  for k ulong na bound 6
+    if ne c2c_chk_call_arg1 idx cal k na 0
+      ret c2c_f c2c_r_t_call long ii
+    end
+    ak = ulong get c2_in_args add abase k
+    if ne c2c_chk_call_alias idx cal k ak 0
+      ret c2c_f c2c_r_c_ali long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_call_ret_bad vbase ulong cal ulong nv long d long to bool
+  gret = get c2_fn_ret_s cal
+  if eq gret S_VOID
+    ret ne d -1
+  end
+  if lt d 0
+    ret true
+  end
+  if ge d nv
+    ret true
+  end
+  ret not c2c_same_vt_ret add vbase ulong d cal
+end
+
+fn c2c_chk_call fi ulong ii ulong idx ulong to long
+  nv = long get c2_fn_nvregs fi
+  vbase = mul fi C2_MAX_VREGS
+  cal = ulong get c2_in_callee idx
+  bad = false
+  note GUARD:call-order
+  bad = ge cal fi
+  if bad
+    ret c2c_f c2c_r_c_ord long ii
+  end
+  gnp = ulong get c2_fn_nparams cal
+  na = ulong get c2_in_nargs idx
+  bad = false
+  note GUARD:call-arity
+  bad = ne na gnp
+  if bad
+    ret c2c_f c2c_r_c_ari long ii
+  end
+  d = long get c2_in_dst idx
+  bad = false
+  note GUARD:call-ret
+  bad = c2c_call_ret_bad vbase cal nv d
+  if bad
+    ret c2c_f c2c_r_t_call long ii
+  end
+  ret c2c_chk_call_args fi ii idx cal
+end
+
+fn c2c_bin_shift_bad td ulong ta ulong tb ulong to bool
+  if not c2c_is_int get c2_vt_s td
+    ret true
+  end
+  if not c2c_same_vt td ta
+    ret true
+  end
+  ret not c2c_is_int get c2_vt_s tb
+end
+
+fn c2c_bin_val_bad td ulong ta ulong tb ulong to bool
+  if not c2c_is_value get c2_vt_s td
+    ret true
+  end
+  if not c2c_same_vt td ta
+    ret true
+  end
+  ret not c2c_same_vt td tb
+end
+
+fn c2c_bin_int_bad td ulong ta ulong tb ulong to bool
+  if not c2c_is_int get c2_vt_s td
+    ret true
+  end
+  if not c2c_same_vt td ta
+    ret true
+  end
+  ret not c2c_same_vt td tb
+end
+
+fn c2c_cmp_bad td ulong ta ulong tb ulong to bool
+  if ne get c2_vt_s td S_BOOL
+    ret true
+  end
+  if not c2c_is_value get c2_vt_s ta
+    ret true
+  end
+  ret not c2c_same_vt ta tb
+end
+
+fn c2c_chk_mov ii ulong idx ulong vbase ulong to long
+  td = add vbase ulong get c2_in_dst idx
+  ta = add vbase ulong get c2_in_a idx
+  sd = get c2_vt_s td
+  sa = get c2_vt_s ta
+  if or c2c_is_slice sa c2c_is_slice sd
+    ret c2c_f c2c_r_sl_esc long ii
+  end
+  if or eq sd S_REF eq sa S_REF
+    bad = false
+    note GUARD:mov-ref
+    bad = c2c_ref_bind_bad td ta
+    if bad
+      ret c2c_f c2c_r_t_mov long ii
+    end
+  else
+    bad = false
+    note GUARD:mov-type
+    bad = or not c2c_same_vt td ta not c2c_is_value sd
+    if bad
+      ret c2c_f c2c_r_t_mov long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_bin ii ulong idx ulong vbase ulong to long
+  sb = get c2_in_sub idx
+  if or lt sb B_ADD ge sb B_LIMIT
+    ret c2c_f c2c_r_d_sub long ii
+  end
+  td = add vbase ulong get c2_in_dst idx
+  ta = add vbase ulong get c2_in_a idx
+  tb = add vbase ulong get c2_in_b idx
+  if or eq sb B_SHL eq sb B_SHR
+    bad = false
+    note GUARD:bin-shift
+    bad = c2c_bin_shift_bad td ta tb
+    if bad
+      ret c2c_f c2c_r_t_bin long ii
+    end
+    ret 0
+  end
+  if or eq sb B_AND or eq sb B_OR eq sb B_XOR
+    if c2c_bin_val_bad td ta tb
+      ret c2c_f c2c_r_t_bin long ii
+    end
+    ret 0
+  end
+  bad = false
+  note GUARD:bin-type
+  bad = c2c_bin_int_bad td ta tb
+  if bad
+    ret c2c_f c2c_r_t_bin long ii
+  end
+  ret 0
+end
+
+fn c2c_chk_in_a fi ulong ii ulong idx ulong to long
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  if eq op C2_CONST
+    td = add vbase ulong get c2_in_dst idx
+    if not c2c_is_value get c2_vt_s td
+      ret c2c_f c2c_r_t_con long ii
+    end
+    bad = false
+    note GUARD:const-canonical
+    bad = not c2c_canonical get c2_vt_s td get c2_in_imm idx
+    if bad
+      ret c2c_f c2c_r_c_can long ii
+    end
+    ret 0
+  end
+  if eq op C2_MOV
+    ret c2c_chk_mov ii idx vbase
+  end
+  if eq op C2_BIN
+    ret c2c_chk_bin ii idx vbase
+  end
+  if eq op C2_UN
+    sb = get c2_in_sub idx
+    if or lt sb U_NEG ge sb U_LIMIT
+      ret c2c_f c2c_r_d_sub long ii
+    end
+    td = add vbase ulong get c2_in_dst idx
+    ta = add vbase ulong get c2_in_a idx
+    if not c2c_same_vt td ta
+      ret c2c_f c2c_r_t_un long ii
+    end
+    bad = false
+    if eq sb U_LNOT
+      note GUARD:un-type
+      bad = ne get c2_vt_s td S_BOOL
+    else
+      bad = not c2c_is_int get c2_vt_s td
+    end
+    if bad
+      ret c2c_f c2c_r_t_un long ii
+    end
+    ret 0
+  end
+  if eq op C2_CMP
+    sb = get c2_in_sub idx
+    if or lt sb CC_EQ ge sb CC_LIMIT
+      ret c2c_f c2c_r_d_sub long ii
+    end
+    td = add vbase ulong get c2_in_dst idx
+    ta = add vbase ulong get c2_in_a idx
+    tb = add vbase ulong get c2_in_b idx
+    bad = false
+    note GUARD:cmp-type
+    bad = c2c_cmp_bad td ta tb
+    if bad
+      ret c2c_f c2c_r_t_cmp long ii
+    end
+    ret 0
+  end
+  if eq op C2_CAST
+    td = add vbase ulong get c2_in_dst idx
+    ta = add vbase ulong get c2_in_a idx
+    bad = false
+    note GUARD:cast-type
+    bad = or not c2c_is_int get c2_vt_s td not c2c_is_int get c2_vt_s ta
+    if bad
+      ret c2c_f c2c_r_t_cast long ii
+    end
+    ret 0
+  end
+  ret 1
+end
+
+fn c2c_chk_field_val ii ulong idx ulong vbase ulong fidx ulong to long
+  op = get c2_in_op idx
+  vr = ulong 0
+  if eq op C2_FLOAD
+    vr = ulong get c2_in_dst idx
+  else
+    vr = ulong get c2_in_c idx
+  end
+  val_s = get c2_vt_s add vbase vr
+  bad = false
+  note GUARD:field-type
+  bad = ne val_s get c2_fld_s fidx
+  if bad
+    ret c2c_f c2c_r_t_fld long ii
+  end
+  if eq op C2_FSTORE
+    ta = add vbase ulong get c2_in_a idx
+    bad = false
+    note GUARD:fstore-shared
+    bad = eq get c2_vt_kind ta K_SHARED
+    if bad
+      ret c2c_f c2c_r_ro long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_field ii ulong idx ulong vbase ulong to long
+  ta = add vbase ulong get c2_in_a idx
+  if not c2c_is_st_ref ta
+    ret c2c_f c2c_r_t_fld long ii
+  end
+  si = sub ulong get c2_vt_sid ta 1
+  imm = get c2_in_imm idx
+  bad = false
+  note GUARD:field-index
+  bad = ge imm ulong get c2_st_nfields si
+  if bad
+    ret c2c_f c2c_r_t_fld long ii
+  end
+  fidx = add mul si 16 imm
+  b = long get c2_in_b idx
+  bad = false
+  if ne get c2_fld_alen fidx 0
+    if lt b 0
+      bad = true
+    else
+      if not c2c_is_int get c2_vt_s add vbase ulong b
+        bad = true
+      end
+    end
+  else
+    note GUARD:field-elem-index
+    bad = ne b -1
+  end
+  if bad
+    ret c2c_f c2c_r_t_fld long ii
+  end
+  ret c2c_chk_field_val ii idx vbase fidx
+end
+
+fn c2c_chk_alloc ii ulong idx ulong vbase ulong to long
+  op = get c2_in_op idx
+  td = add vbase ulong get c2_in_dst idx
+  ta = add vbase ulong get c2_in_a idx
+  bad = false
+  note GUARD:alloc-own
+  bad = or ne get c2_vt_s td S_REF ne get c2_vt_kind td K_OWN
+  if bad
+    ret c2c_f c2c_r_t_alloc long ii
+  end
+  want_s = S_U64
+  if c2c_is_arr_ref td
+    want_s = get c2_vt_elem td
+  end
+  bad = false
+  note GUARD:alloc-init
+  bad = ne get c2_vt_s ta want_s
+  if bad
+    ret c2c_f c2c_r_t_alloc long ii
+  end
+  if eq op C2_AALLOC
+    tb = add vbase ulong get c2_in_b idx
+    if ne get c2_vt_s tb S_U64
+      ret c2c_f c2c_r_t_alloc long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_idx ii ulong idx ulong vbase ulong to long
+  op = get c2_in_op idx
+  ta = add vbase ulong get c2_in_a idx
+  tb = add vbase ulong get c2_in_b idx
+  bad = false
+  note GUARD:index-array
+  bad = not c2c_is_arr_ref ta
+  if bad
+    ret c2c_f c2c_r_t_idx long ii
+  end
+  if not c2c_is_int get c2_vt_s tb
+    ret c2c_f c2c_r_t_idx long ii
+  end
+  vr = ulong 0
+  if eq op C2_LOAD
+    vr = ulong get c2_in_dst idx
+  else
+    vr = ulong get c2_in_c idx
+  end
+  val_s = get c2_vt_s add vbase vr
+  bad = false
+  note GUARD:index-elem
+  bad = ne val_s get c2_vt_elem ta
+  if bad
+    ret c2c_f c2c_r_t_idx long ii
+  end
+  if eq op C2_STORE
+    bad = false
+    note GUARD:store-shared
+    bad = eq get c2_vt_kind ta K_SHARED
+    if bad
+      ret c2c_f c2c_r_ro long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_in_b fi ulong ii ulong idx ulong to long
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  if or eq op C2_ALLOC eq op C2_AALLOC
+    ret c2c_chk_alloc ii idx vbase
+  end
+  if eq op C2_RELEASE
+    ta = add vbase ulong get c2_in_a idx
+    bad = false
+    note GUARD:release-own
+    bad = or ne get c2_vt_s ta S_REF ne get c2_vt_kind ta K_OWN
+    if bad
+      ret c2c_f c2c_r_t_rel long ii
+    end
+    ret 0
+  end
+  if or eq op C2_LOAD eq op C2_STORE
+    ret c2c_chk_idx ii idx vbase
+  end
+  if or eq op C2_FLOAD eq op C2_FSTORE
+    ret c2c_chk_field ii idx vbase
+  end
+  ret 1
+end
+
+fn c2c_chk_slice_ctl fi ulong ii ulong idx ulong vbase ulong to long
+  op = get c2_in_op idx
+  if or eq op C2_SLOAD eq op C2_SSTORE
+    sa = get c2_vt_s add vbase ulong get c2_in_a idx
+    bad = false
+    note GUARD:slice-ptr
+    bad = not c2c_is_slice sa
+    if bad
+      ret c2c_f c2c_r_t_sl long ii
+    end
+    if eq op C2_SSTORE
+      bad = false
+      note GUARD:slice-bytes-ro
+      bad = ne sa S_CELLS
+      if bad
+        ret c2c_f c2c_r_sl_wr long ii
+      end
+    end
+    if not c2c_is_int get c2_vt_s add vbase ulong get c2_in_b idx
+      ret c2c_f c2c_r_t_sl long ii
+    end
+    vr = ulong 0
+    if eq op C2_SLOAD
+      vr = ulong get c2_in_dst idx
+    else
+      vr = ulong get c2_in_c idx
+    end
+    vs = get c2_vt_s add vbase vr
+    if ne vs S_U64
+      ret c2c_f c2c_r_t_sl long ii
+    end
+    ret 0
+  end
+  if eq op C2_TRAP
+    imm = get c2_in_imm idx
+    bad = false
+    note GUARD:trap-code
+    bad = or lt imm 1 gt imm C2_TRAP_MAX
+    if bad
+      ret c2c_f c2c_r_trap long ii
+    end
+    ret 0
+  end
+  nb = ulong get c2_fn_nblocks fi
+  if eq op C2_BR
+    bad = false
+    note GUARD:br-target
+    bad = ge ulong get c2_in_t idx nb
+    if bad
+      ret c2c_f c2c_r_cfg_t long ii
+    end
+    ret 0
+  end
+  if eq op C2_CBR
+    bad = false
+    note GUARD:cbr-target
+    bad = or ge ulong get c2_in_t idx nb ge ulong get c2_in_f idx nb
+    if bad
+      ret c2c_f c2c_r_cfg_t long ii
+    end
+    bad = false
+    note GUARD:cbr-bool
+    bad = ne get c2_vt_s add vbase ulong get c2_in_a idx S_BOOL
+    if bad
+      ret c2c_f c2c_r_t_cond long ii
+    end
+    ret 0
+  end
+  if eq op C2_RET
+    rs = get c2_fn_ret_s fi
+    a = long get c2_in_a idx
+    bad = false
+    if eq rs S_VOID
+      bad = ne a -1
+    else
+      if lt a 0
+        bad = true
+      else
+        note GUARD:ret-type
+        bad = not c2c_same_vt_ret add vbase ulong a fi
+      end
+    end
+    if bad
+      ret c2c_f c2c_r_t_ret long ii
+    end
+    ret 0
+  end
+  if eq op C2_CALL
+    ret c2c_chk_call fi ii idx
+  end
+  ret c2c_f c2i_r_op long ii
+end
+
+fn c2c_u64_3 vbase ulong r1 short r2 short r3 short to bool
+  if ne get c2_vt_s add vbase ulong r1 S_U64
+    ret false
+  end
+  if ne get c2_vt_s add vbase ulong r2 S_U64
+    ret false
+  end
+  ret eq get c2_vt_s add vbase ulong r3 S_U64
+end
+
+fn c2c_chk_in_c fi ulong ii ulong idx ulong to long
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  if eq op C2_AOPEN
+    if ne get c2_vt_s add vbase ulong get c2_in_dst idx S_U64
+      ret c2c_f c2c_r_t_hdl long ii
+    end
+    imm = get c2_in_imm idx
+    bad = false
+    note GUARD:arena-cap
+    bad = or lt imm 1 gt imm C2_MAX_ARRAY
+    if bad
+      ret c2c_f c2c_r_a_cap long ii
+    end
+    ret 0
+  end
+  if or eq op C2_ADESTROY eq op C2_PCLOSE
+    if ne get c2_vt_s add vbase ulong get c2_in_a idx S_U64
+      ret c2c_f c2c_r_t_hdl long ii
+    end
+    ret 0
+  end
+  if eq op C2_POPEN
+    if ne get c2_vt_s add vbase ulong get c2_in_dst idx S_U64
+      ret c2c_f c2c_r_t_hdl long ii
+    end
+    if not c2c_is_value get c2_in_sub idx
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    na = ulong get c2_in_nargs idx
+    bad = false
+    note GUARD:pool-cap
+    bad = or lt na 1 gt na C2_POOL_SLOTS
+    if bad
+      ret c2c_f c2c_r_p_cap long ii
+    end
+    ret 0
+  end
+  if eq op C2_HALLOC
+    if ne get c2_vt_s add vbase ulong get c2_in_dst idx S_U64
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    if ne get c2_vt_s add vbase ulong get c2_in_b idx S_U64
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    if not c2c_is_value get c2_vt_s add vbase ulong get c2_in_a idx
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    ret 0
+  end
+  if eq op C2_HGEN
+    if not c2c_u64_3 vbase get c2_in_dst idx get c2_in_a idx get c2_in_b idx
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    ret 0
+  end
+  if eq op C2_HFREE
+    if not c2c_u64_3 vbase get c2_in_a idx get c2_in_b idx get c2_in_c idx
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    ret 0
+  end
+  if eq op C2_HLOAD
+    if not c2c_is_value get c2_vt_s add vbase ulong get c2_in_dst idx
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    if not c2c_u64_3 vbase get c2_in_a idx get c2_in_b idx get c2_in_c idx
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    ret 0
+  end
+  if eq op C2_HSTORE
+    a0 = long get c2_in_args mul idx 6
+    if or lt a0 0 ge a0 long get c2_fn_nvregs fi
+      ret c2c_f c2c_r_op_rng long ii
+    end
+    if not c2c_u64_3 vbase get c2_in_a idx get c2_in_b idx get c2_in_c idx
+      ret c2c_f c2c_r_t_pool long ii
+    end
+    ret 0
+  end
+  ret c2c_chk_slice_ctl fi ii idx vbase
+end
+
+fn c2c_chk_uses_rng idx ulong nv long ii ulong to long
+  us = new short 8 0
+  nu = c2c_uses idx us
+  for k ulong nu bound 8
+    u = long get us k
+    bad = false
+    note GUARD:operand-range
+    bad = or lt u 0 ge u nv
+    if bad
+      ret c2c_f c2c_r_op_rng long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_check_insn fi ulong ii ulong to long
+  idx = add mul fi C2_MAX_INSNS ii
+  nv = long get c2_fn_nvregs fi
+  if ne c2c_chk_uses_rng idx nv ii 0
+    ret -1
+  end
+  op = get c2_in_op idx
+  d = c2c_defines idx
+  if c2c_has_dst_op op
+    if lt d 0
+      ret c2c_f c2c_r_op_rng long ii
+    end
+  end
+  if ne d -1
+    bad = false
+    note GUARD:dst-range
+    bad = or lt d 0 ge d nv
+    if bad
+      ret c2c_f c2c_r_op_rng long ii
+    end
+  end
+  vbase = mul fi C2_MAX_VREGS
+  np = long get c2_fn_nparams fi
+  if ge d 0
+    if c2c_is_slice get c2_vt_s add vbase ulong d
+      ret c2c_f c2c_r_sl_wr long ii
+    end
+    if gt d 0
+      if lt d np
+        if c2c_is_slice get c2_vt_s add vbase ulong sub d 1
+          ret c2c_f c2c_r_sl_wr long ii
+        end
+      end
+    end
+  end
+  r = c2c_chk_in_a fi ii idx
+  if le r 0
+    ret r
+  end
+  r = c2c_chk_in_b fi ii idx
+  if le r 0
+    ret r
+  end
+  ret c2c_chk_in_c fi ii idx
+end
+
+note ---- Bitset helpers over global arrays ----
+
+fn c2c_bset_dom b ulong bit ulong to void
+  o = add mul b C2_BSW shr bit 6
+  put c2_fx_dom o or get c2_fx_dom o shl ulong 1 and bit 63
+end
+
+fn c2c_btest_dom b ulong bit ulong to bool
+  o = add mul b C2_BSW shr bit 6
+  ret ne and shr get c2_fx_dom o and bit 63 1 0
+end
+
+note ---- CFG layout, reachability, dominators ----
+
+fn c2c_build_cfg_blk ibase ulong b ulong fst ulong cnt ulong to long
+  for k ulong cnt bound 4096
+    ii = add fst k
+    put c2_fx_blk_of ii int b
+    is_last = eq add k 1 cnt
+    is_t = c2c_term get c2_in_op add ibase ii
+    bad_t = false
+    note GUARD:cfg-terminator
+    bad_t = ne is_t is_last
+    if bad_t
+      ret c2c_f c2c_r_cfg_tm long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_build_cfg fi ulong to long
+  nb = ulong get c2_fn_nblocks fi
+  ni = ulong get c2_fn_ninsns fi
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  pos = ulong 0
+  for b ulong nb bound 512
+    fst = ulong get c2_blk_first add bbase b
+    cnt = ulong get c2_blk_count add bbase b
+    bad = false
+    note GUARD:cfg-layout
+    bad = or lt cnt 1 or ne fst pos gt add fst cnt ni
+    if bad
+      ret c2c_f c2c_r_cfg_l -1
+    end
+    if ne c2c_build_cfg_blk ibase b fst cnt 0
+      ret -1
+    end
+    pos = add pos cnt
+  end
+  if ne pos ni
+    ret c2c_f c2c_r_cfg_l -1
+  end
+  ret 0
+end
+
+fn c2c_is_edge p ulong b ulong to bool
+  ns = ulong get c2_fx_nsucc p
+  for k ulong ns bound 2
+    if eq ulong get c2_fx_succ add mul p 2 k b
+      ret true
+    end
+  end
+  ret false
+end
+
+fn c2c_dom_step nb ulong b ulong to bool
+  for w ulong C2_BSW
+    put c2_ma_cur w ulong 0xffffffffffffffff
+  end
+  for p ulong nb bound 512
+    if eq get c2_fx_reach p 0
+      continue
+    end
+    if c2c_is_edge p b
+      for w ulong C2_BSW
+        put c2_ma_cur w and get c2_ma_cur w get c2_fx_dom add mul p C2_BSW w
+      end
+    end
+  end
+  ow = shr b 6
+  put c2_ma_cur ow or get c2_ma_cur ow shl ulong 1 and b 63
+  ch = false
+  for w ulong C2_BSW
+    if ne get c2_ma_cur w get c2_fx_dom add mul b C2_BSW w
+      put c2_fx_dom add mul b C2_BSW w get c2_ma_cur w
+      ch = true
+    end
+  end
+  ret ch
+end
+
+fn c2c_link_doms nb ulong to void
+  for b ulong nb bound 512
+    for w ulong C2_BSW
+      put c2_fx_dom add mul b C2_BSW w ulong 0xffffffffffffffff
+    end
+  end
+  for w ulong C2_BSW
+    put c2_fx_dom w 0
+  end
+  c2c_bset_dom 0 0
+  changed = true
+  while changed bound 512
+    changed = false
+    for b ulong nb bound 512
+      if or eq b 0 eq get c2_fx_reach b 0
+        continue
+      end
+      if c2c_dom_step nb b
+        changed = true
+      end
+    end
+  end
+end
+
+fn c2c_link_reach to void
+  put c2_fx_reach 0 1
+  put c2_lp_stk 0 0
+  sp = ulong 1
+  while gt sp 0 bound 2048
+    sp = sub sp 1
+    b = ulong get c2_lp_stk sp
+    ns = ulong get c2_fx_nsucc b
+    for k ulong ns bound 2
+      s = ulong get c2_fx_succ add mul b 2 k
+      if eq get c2_fx_reach s 0
+        put c2_fx_reach s 1
+        put c2_lp_stk sp int s
+        sp = add sp 1
+      end
+    end
+  end
+end
+
+fn c2c_link_cfg fi ulong to void
+  nb = ulong get c2_fn_nblocks fi
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  for b ulong nb bound 512
+    last = sub add ulong get c2_blk_first add bbase b ulong get c2_blk_count add bbase b 1
+    idx = add ibase last
+    op = get c2_in_op idx
+    ns = int 0
+    if eq op C2_BR
+      put c2_fx_succ mul b 2 int get c2_in_t idx
+      ns = 1
+    end
+    if eq op C2_CBR
+      tt = int get c2_in_t idx
+      ff = int get c2_in_f idx
+      put c2_fx_succ mul b 2 tt
+      ns = 1
+      if ne ff tt
+        put c2_fx_succ add mul b 2 1 ff
+        ns = 2
+      end
+    end
+    put c2_fx_nsucc b ns
+    put c2_fx_reach b 0
+  end
+  c2c_link_reach
+  c2c_link_doms nb
+end
+
+note ---- Handle disciplines ----
+
+fn c2c_count_defs fi ulong to void
+  nv = ulong get c2_fn_nvregs fi
+  np = ulong get c2_fn_nparams fi
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  for r ulong nv bound 480
+    if lt r np
+      put c2_fx_ndefs r 1
+    else
+      put c2_fx_ndefs r 0
+    end
+    put c2_fx_def_in r -1
+  end
+  for i ulong ni bound 4096
+    d = c2c_defines add ibase i
+    if ge d 0
+      ud = ulong d
+      nd = add get c2_fx_ndefs ud 1
+      put c2_fx_ndefs ud nd
+      if eq nd 1
+        put c2_fx_def_in ud int i
+      else
+        put c2_fx_def_in ud -1
+      end
+    end
+  end
+end
+
+fn c2c_hdl_use_ok def_op uchar oidx ulong h long to bool
+  op = get c2_in_op oidx
+  a = long get c2_in_a oidx
+  b = long get c2_in_b oidx
+  c = long get c2_in_c oidx
+  if eq def_op C2_AOPEN
+    if and eq op C2_AALLOC and eq b h ne a h
+      ret true
+    end
+    ret and eq op C2_ADESTROY eq a h
+  end
+  if and eq op C2_PCLOSE eq a h
+    ret true
+  end
+  if and eq op C2_HALLOC and eq b h ne a h
+    ret true
+  end
+  is_h = false
+  if eq op C2_HGEN
+    is_h = true
+  end
+  if eq op C2_HFREE
+    is_h = true
+  end
+  if eq op C2_HLOAD
+    is_h = true
+  end
+  if eq op C2_HSTORE
+    is_h = true
+  end
+  if is_h
+    if ne a h
+      ret false
+    end
+    if eq b h
+      ret false
+    end
+    if eq c h
+      ret false
+    end
+    ret ne long get c2_in_args mul oidx 6 h
+  end
+  ret false
+end
+
+fn c2c_hdl_op_h oidx ulong to long
+  op = get c2_in_op oidx
+  if or eq op C2_AALLOC eq op C2_HALLOC
+    ret long get c2_in_b oidx
+  end
+  if eq op C2_ADESTROY
+    ret long get c2_in_a oidx
+  end
+  if eq op C2_PCLOSE
+    ret long get c2_in_a oidx
+  end
+  if eq op C2_HGEN
+    ret long get c2_in_a oidx
+  end
+  if eq op C2_HFREE
+    ret long get c2_in_a oidx
+  end
+  if eq op C2_HLOAD
+    ret long get c2_in_a oidx
+  end
+  if eq op C2_HSTORE
+    ret long get c2_in_a oidx
+  end
+  ret -1
+end
+
+fn c2c_chk_pool_elem fi ulong j ulong oidx ulong es uchar to long
+  op = get c2_in_op oidx
+  vbase = mul fi C2_MAX_VREGS
+  if eq op C2_HALLOC
+    if ne get c2_vt_s add vbase ulong get c2_in_a oidx es
+      ret c2c_f c2c_r_t_pool long j
+    end
+  end
+  if eq op C2_HLOAD
+    bad = false
+    note GUARD:pool-elem
+    bad = ne get c2_vt_s add vbase ulong get c2_in_dst oidx es
+    if bad
+      ret c2c_f c2c_r_t_pool long j
+    end
+  end
+  if eq op C2_HSTORE
+    if ne get c2_vt_s add vbase ulong get c2_in_args mul oidx 6 es
+      ret c2c_f c2c_r_t_pool long j
+    end
+  end
+  ret 0
+end
+
+fn c2c_hdl_origin_bad ibase ulong di long want uchar to bool
+  if lt di 0
+    ret true
+  end
+  ret ne get c2_in_op add ibase ulong di want
+end
+
+fn c2c_chk_hdl_op1 fi ulong j ulong to long
+  ibase = mul fi C2_MAX_INSNS
+  oidx = add ibase j
+  h = c2c_hdl_op_h oidx
+  if lt h 0
+    ret 0
+  end
+  op = get c2_in_op oidx
+  di = long get c2_fx_def_in ulong h
+  want = C2_POPEN
+  if or eq op C2_AALLOC eq op C2_ADESTROY
+    want = C2_AOPEN
+  end
+  bad = false
+  note GUARD:handle-origin
+  bad = c2c_hdl_origin_bad ibase di want
+  if bad
+    ret c2c_f c2c_r_hdl_d long j
+  end
+  es = get c2_in_sub add ibase ulong di
+  ret c2c_chk_pool_elem fi j oidx es
+end
+
+fn c2c_chk_hdl_ops fi ulong to long
+  ni = ulong get c2_fn_ninsns fi
+  for j ulong ni bound 4096
+    if ne c2c_chk_hdl_op1 fi j 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_hdl_uses fi ulong op uchar h long to long
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  us = new short 8 0
+  for j ulong ni bound 4096
+    oidx = add ibase j
+    nu = c2c_uses oidx us
+    for k ulong nu bound 8
+      if eq long get us k h
+        bad = false
+        note GUARD:handle-use
+        bad = not c2c_hdl_use_ok op oidx h
+        if bad
+          ret c2c_f c2c_r_hdl_d long j
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn c2c_check_handles fi ulong to long
+  ni = ulong get c2_fn_ninsns fi
+  np = long get c2_fn_nparams fi
+  ibase = mul fi C2_MAX_INSNS
+  for i ulong ni bound 4096
+    op = get c2_in_op add ibase i
+    if and ne op C2_AOPEN ne op C2_POPEN
+      continue
+    end
+    h = long get c2_in_dst add ibase i
+    if or lt h np ne get c2_fx_ndefs ulong h 1
+      ret c2c_f c2c_r_hdl_d long i
+    end
+    if ne c2c_chk_hdl_uses fi op h 0
+      ret -1
+    end
+  end
+  ret c2c_chk_hdl_ops fi
+end
+
+note ---- Definite assignment ----
+
+fn c2c_da_meet nb ulong b ulong pmask ulong to void
+  for w ulong C2_BSW
+    put c2_ma_cur w 0
+  end
+  if eq b 0
+    put c2_ma_cur 0 pmask
+  else
+    for w ulong C2_BSW
+      put c2_ma_cur w ulong 0xffffffffffffffff
+    end
+  end
+  for p ulong nb bound 512
+    if eq get c2_fx_reach p 0
+      continue
+    end
+    if c2c_is_edge p b
+      for w ulong C2_BSW
+        put c2_ma_cur w and get c2_ma_cur w get c2_da_out add mul p C2_BSW w
+      end
+    end
+  end
+  for w ulong C2_BSW
+    put c2_da_in add mul b C2_BSW w get c2_ma_cur w
+  end
+end
+
+fn c2c_cur_set bit ulong to void
+  ow = shr bit 6
+  put c2_ma_cur ow or get c2_ma_cur ow shl ulong 1 and bit 63
+end
+
+fn c2c_cur_test bit ulong to bool
+  ow = shr bit 6
+  ret ne and shr get c2_ma_cur ow and bit 63 1 0
+end
+
+fn c2c_da_commit b ulong to bool
+  ch = false
+  bo = mul b C2_BSW
+  for w ulong C2_BSW
+    if ne get c2_ma_cur w get c2_da_out add bo w
+      put c2_da_out add bo w get c2_ma_cur w
+      ch = true
+    end
+  end
+  ret ch
+end
+
+fn c2c_da_blk fi ulong nb ulong b ulong pmask ulong to bool
+  c2c_da_meet nb b pmask
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  fst = ulong get c2_blk_first add bbase b
+  cnt = ulong get c2_blk_count add bbase b
+  for k ulong cnt bound 4096
+    idx = add ibase add fst k
+    if eq get c2_in_op idx C2_TRAP
+      for w ulong C2_BSW
+        put c2_ma_cur w ulong 0xffffffffffffffff
+      end
+      break
+    end
+    d = c2c_defines idx
+    if ge d 0
+      c2c_cur_set ulong d
+    end
+  end
+  ret c2c_da_commit b
+end
+
+fn c2c_da_verify_in idx ulong ii ulong to long
+  us = new short 8 0
+  nu = c2c_uses idx us
+  for j ulong nu bound 8
+    u = ulong get us j
+    bad = false
+    note GUARD:definite-assignment
+    bad = not c2c_cur_test u
+    if bad
+      ret c2c_f c2c_r_undef long ii
+    end
+  end
+  d = c2c_defines idx
+  if ge d 0
+    c2c_cur_set ulong d
+  end
+  ret 0
+end
+
+fn c2c_da_verify_blk fi ulong b ulong to long
+  for w ulong C2_BSW
+    put c2_ma_cur w get c2_da_in add mul b C2_BSW w
+  end
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  fst = ulong get c2_blk_first add bbase b
+  cnt = ulong get c2_blk_count add bbase b
+  for k ulong cnt bound 4096
+    ii = add fst k
+    idx = add ibase ii
+    if eq get c2_in_op idx C2_TRAP
+      break
+    end
+    if ne c2c_da_verify_in idx ii 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn c2c_check_defined fi ulong to long
+  nb = ulong get c2_fn_nblocks fi
+  np = ulong get c2_fn_nparams fi
+  pmask = ulong 0
+  for r ulong np bound 6
+    pmask = or pmask shl ulong 1 r
+  end
+  for b ulong nb bound 512
+    for w ulong C2_BSW
+      put c2_da_out add mul b C2_BSW w ulong 0xffffffffffffffff
+    end
+  end
+  changed = true
+  while changed bound 512
+    changed = false
+    for b ulong nb bound 512
+      if eq get c2_fx_reach b 0
+        continue
+      end
+      if c2c_da_blk fi nb b pmask
+        changed = true
+      end
+    end
+  end
+  for b ulong nb bound 512
+    if eq get c2_fx_reach b 0
+      continue
+    end
+    if ne c2c_da_verify_blk fi b 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+note ---- Loop bounds ----
+
+fn c2c_single_const fi ulong r long dst edit ulong 1 to bool
+  if lt r 0
+    ret false
+  end
+  ur = ulong r
+  if ne get c2_fx_ndefs ur 1
+    ret false
+  end
+  di = long get c2_fx_def_in ur
+  if lt di 0
+    ret false
+  end
+  idx = add mul fi C2_MAX_INSNS ulong di
+  if ne get c2_in_op idx C2_CONST
+    ret false
+  end
+  put dst 0 get c2_in_imm idx
+  ret true
+end
+
+fn c2c_dom_all_latches blk ulong nlatch ulong to bool
+  for k ulong nlatch bound 512
+    if not c2c_btest_dom ulong get c2_lp_latch k blk
+      ret false
+    end
+  end
+  ret true
+end
+
+fn c2c_loop_chk_ctr fi ulong ctr long nlatch ulong to bool
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  one = new ulong 1 0
+  incs = ulong 0
+  for i ulong ni bound 4096
+    bi = ulong get c2_fx_blk_of i
+    if eq get c2_lp_inloop bi 0
+      continue
+    end
+    didx = add ibase i
+    if ne c2c_defines didx ctr
+      continue
+    end
+    if ne get c2_in_op didx C2_BIN
+      ret false
+    end
+    if ne get c2_in_sub didx B_ADD
+      ret false
+    end
+    if ne long get c2_in_a didx ctr
+      ret false
+    end
+    if not c2c_single_const fi long get c2_in_b didx one
+      ret false
+    end
+    if ne get one 0 1
+      ret false
+    end
+    if not c2c_dom_all_latches bi nlatch
+      ret false
+    end
+    incs = add incs 1
+  end
+  ret ge incs 1
+end
+
+fn c2c_loop_guard_cmp fi ulong cidx ulong nlatch ulong to bool
+  vbase = mul fi C2_MAX_VREGS
+  kv = new ulong 1 0
+  cb = long get c2_in_b cidx
+  if not c2c_single_const fi cb kv
+    ret false
+  end
+  ks = get c2_vt_s add vbase ulong cb
+  kval = get kv 0
+  k_ok = le kval 1000000
+  if c2c_is_signed ks
+    if ge kval not ulong 999999
+      k_ok = true
+    end
+  end
+  if not k_ok
+    ret false
+  end
+  ctr = long get c2_in_a cidx
+  if not c2c_is_int get c2_vt_s add vbase ulong ctr
+    ret false
+  end
+  ret c2c_loop_chk_ctr fi ctr nlatch
+end
+
+fn c2c_loop_guard_blk fi ulong g ulong nlatch ulong to bool
+  if not c2c_dom_all_latches g nlatch
+    ret false
+  end
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  last = sub add ulong get c2_blk_first add bbase g ulong get c2_blk_count add bbase g 1
+  tidx = add ibase last
+  if ne get c2_in_op tidx C2_CBR
+    ret false
+  end
+  ci = long get c2_fx_def_in ulong get c2_in_a tidx
+  if lt ci 0
+    ret false
+  end
+  if ne ulong get c2_fx_blk_of ulong ci g
+    ret false
+  end
+  cidx = add ibase ulong ci
+  if ne get c2_in_op cidx C2_CMP
+    ret false
+  end
+  csb = get c2_in_sub cidx
+  if eq csb CC_GE
+    if ne get c2_lp_inloop ulong get c2_in_t tidx 0
+      ret false
+    end
+  else
+    if eq csb CC_LT
+      if ne get c2_lp_inloop ulong get c2_in_f tidx 0
+        ret false
+      end
+    else
+      ret false
+    end
+  end
+  ret c2c_loop_guard_cmp fi cidx nlatch
+end
+
+fn c2c_loop_guarded fi ulong nlatch ulong to bool
+  nb = ulong get c2_fn_nblocks fi
+  for g ulong nb bound 512
+    if eq get c2_lp_inloop g 0
+      continue
+    end
+    if c2c_loop_guard_blk fi g nlatch
+      ret true
+    end
+  end
+  ret false
+end
+
+fn c2c_chk_reducible fi ulong nb ulong to long
+  for b ulong nb bound 512
+    put c2_lp_color b 0
+  end
+  put c2_lp_stk 0 0
+  put c2_lp_idx 0 0
+  put c2_lp_color 0 1
+  sp = ulong 1
+  while gt sp 0 bound 4096
+    top = sub sp 1
+    b = ulong get c2_lp_stk top
+    ix = get c2_lp_idx top
+    if lt ix get c2_fx_nsucc b
+      put c2_lp_idx top add ix 1
+      s = ulong get c2_fx_succ add mul b 2 ulong ix
+      if eq get c2_lp_color s 1
+        bad_r = false
+        note GUARD:reducible
+        bad_r = not c2c_btest_dom b s
+        if bad_r
+          ret c2c_f c2c_r_irred -1
+        end
+      end
+      if eq get c2_lp_color s 0
+        put c2_lp_color s 1
+        put c2_lp_stk sp int s
+        put c2_lp_idx sp 0
+        sp = add sp 1
+      end
+    else
+      put c2_lp_color b 2
+      sp = top
+    end
+  end
+  ret 0
+end
+
+fn c2c_chk_nat_loop fi ulong nb ulong h ulong to long
+  nlatch = ulong 0
+  for p ulong nb bound 512
+    if eq get c2_fx_reach p 0
+      continue
+    end
+    if c2c_is_edge p h
+      if c2c_btest_dom p h
+        put c2_lp_latch nlatch int p
+        nlatch = add nlatch 1
+      end
+    end
+  end
+  if eq nlatch 0
+    ret 0
+  end
+  for b ulong nb bound 512
+    put c2_lp_inloop b 0
+  end
+  put c2_lp_inloop h 1
+  nw = ulong 0
+  for k ulong nlatch bound 512
+    lb = ulong get c2_lp_latch k
+    if eq get c2_lp_inloop lb 0
+      put c2_lp_inloop lb 1
+      put c2_lp_wlst nw int lb
+      nw = add nw 1
+    end
+  end
+  while gt nw 0 bound 2048
+    nw = sub nw 1
+    b = ulong get c2_lp_wlst nw
+    for p ulong nb bound 512
+      if or eq get c2_fx_reach p 0 ne get c2_lp_inloop p 0
+        continue
+      end
+      if c2c_is_edge p b
+        put c2_lp_inloop p 1
+        put c2_lp_wlst nw int p
+        nw = add nw 1
+      end
+    end
+  end
+  bad_l = false
+  note GUARD:loop-bound
+  bad_l = not c2c_loop_guarded fi nlatch
+  if bad_l
+    bbase = mul fi C2_MAX_BLOCKS
+    ret c2c_f c2c_r_loop long get c2_blk_first add bbase h
+  end
+  ret 0
+end
+
+fn c2c_check_loops fi ulong to long
+  nb = ulong get c2_fn_nblocks fi
+  if ne c2c_chk_reducible fi nb 0
+    ret -1
+  end
+  for h ulong nb bound 512
+    if eq get c2_fx_reach h 0
+      continue
+    end
+    if ne c2c_chk_nat_loop fi nb h 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+note ---- Ownership flow ----
+
+fn c2c_tracked fi ulong r ulong to bool
+  vidx = add mul fi C2_MAX_VREGS r
+  ret and eq get c2_vt_s vidx S_REF eq get c2_vt_kind vidx K_OWN
+end
+
+fn c2c_st_any s uchar to uchar
+  ret and or s shr s 3 7
+end
+
+fn c2c_st_set s uchar v uchar to uchar
+  lo = uchar 0
+  hi = uchar 0
+  if ne and s 7 0
+    lo = v
+  end
+  if ne and s 56 0
+    hi = shl v 3
+  end
+  ret or lo hi
+end
+
+fn c2c_own_fail rule view uchar * fi ulong ii ulong to long
+  if ne get c2_fx_quiet 0 0
+    ret 0
+  end
+  ret c2c_f rule long ii
+end
+
+fn c2c_own_use fi ulong ii ulong r ulong to long
+  if c2c_tracked fi r
+    bad = false
+    note GUARD:own-use-dead
+    bad = eq and c2c_st_any get c2_own_st r ST_L 0
+    if bad
+      ret c2c_own_fail c2c_r_own_ud fi ii
+    end
+  end
+  g = long get c2_own_orig r
+  if ge g 0
+    bad = false
+    note GUARD:borrow-outlives
+    bad = eq and c2c_st_any get c2_own_st ulong g ST_L 0
+    if bad
+      ret c2c_own_fail c2c_r_bor_ol fi ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_own_kill fi ulong ii ulong r ulong to long
+  bad = false
+  note GUARD:own-move-dead
+  bad = eq and c2c_st_any get c2_own_st r ST_L 0
+  if bad
+    if ne c2c_own_fail c2c_r_own_ud fi ii 0
+      ret -1
+    end
+  end
+  put c2_own_st r c2c_st_set get c2_own_st r ST_D
+  ret 0
+end
+
+fn c2c_own_birth fi ulong ii ulong r ulong to long
+  s = c2c_st_any get c2_own_st r
+  heap = lt get c2_own_arena r 0
+  if and ne and s ST_L 0 heap
+    note GUARD:overwrite-some-path
+    s = ST_L
+  end
+  bad = false
+  note GUARD:own-overwrite
+  bad = eq s ST_L
+  if bad
+    if ne c2c_own_fail c2c_r_own_lk fi ii 0
+      ret -1
+    end
+  end
+  put c2_own_st r c2c_st_set get c2_own_st r ST_L
+  ret 0
+end
+
+fn c2c_own_ret fi ulong ii ulong to long
+  ibase = mul fi C2_MAX_INSNS
+  nv = ulong get c2_fn_nvregs fi
+  for r ulong nv bound 480
+    di = long get c2_fx_def_in r
+    hdl = false
+    if ge di 0
+      dop = get c2_in_op add ibase ulong di
+      hdl = or eq dop C2_AOPEN eq dop C2_POPEN
+    end
+    s = c2c_st_any get c2_own_st r
+    if ne and s ST_L 0
+      note GUARD:leak-some-path
+      s = ST_L
+    end
+    need_chk = hdl
+    if not need_chk
+      if c2c_tracked fi r
+        if lt get c2_own_arena r 0
+          need_chk = true
+        end
+      end
+    end
+    bad = false
+    note GUARD:leak
+    bad = and eq s ST_L need_chk
+    if bad
+      if hdl
+        if ne c2c_own_fail c2c_r_h_lk fi ii 0
+          ret -1
+        end
+      else
+        if ne c2c_own_fail c2c_r_own_lk fi ii 0
+          ret -1
+        end
+      end
+    end
+  end
+  ret 0
+end
+
+fn c2c_own_step_b fi ulong ii ulong idx ulong to long
+  op = get c2_in_op idx
+  nv = ulong get c2_fn_nvregs fi
+  if or eq op C2_AOPEN eq op C2_POPEN
+    d = ulong get c2_in_dst idx
+    if ne and c2c_st_any get c2_own_st d ST_L 0
+      if ne c2c_own_fail c2c_r_h_reop fi ii 0
+        ret -1
+      end
+    end
+    put c2_own_st d c2c_st_set get c2_own_st d ST_L
+    ret 0
+  end
+  if or eq op C2_ADESTROY eq op C2_PCLOSE
+    a = ulong get c2_in_a idx
+    bad = false
+    note GUARD:double-close
+    bad = eq and c2c_st_any get c2_own_st a ST_L 0
+    if bad
+      if ne c2c_own_fail c2c_r_h_dbl fi ii 0
+        ret -1
+      end
+    end
+    put c2_own_st a c2c_st_set get c2_own_st a ST_D
+    if eq op C2_ADESTROY
+      for r ulong nv bound 480
+        if eq long get c2_own_arena r long a
+          cur = get c2_own_st r
+          lo = and cur 7
+          hi = and shr cur 3 7
+          if and ne lo 0 ne lo ST_U
+            lo = ST_D
+          end
+          if and ne hi 0 ne hi ST_U
+            hi = ST_D
+          end
+          put c2_own_st r or lo shl hi 3
+        end
+      end
+    end
+    ret 0
+  end
+  if or eq op C2_HALLOC or eq op C2_HGEN or eq op C2_HFREE or eq op C2_HLOAD eq op C2_HSTORE
+    h = ulong get c2_in_a idx
+    if eq op C2_HALLOC
+      h = ulong get c2_in_b idx
+    end
+    bad = false
+    note GUARD:pool-dead
+    bad = eq and c2c_st_any get c2_own_st h ST_L 0
+    if bad
+      ret c2c_own_fail c2c_r_h_dead fi ii
+    end
+    ret 0
+  end
+  if eq op C2_RET
+    ret c2c_own_ret fi ii
+  end
+  ret 0
+end
+
+fn c2c_own_call fi ulong ii ulong idx ulong to long
+  vbase = mul fi C2_MAX_VREGS
+  cal = ulong get c2_in_callee idx
+  gvbase = mul cal C2_MAX_VREGS
+  na = ulong get c2_in_nargs idx
+  abase = mul idx 6
+  for k ulong na bound 6
+    r = ulong get c2_in_args add abase k
+    if ne get c2_vt_s add vbase r S_REF
+      continue
+    end
+    if ne c2c_own_use fi ii r 0
+      ret -1
+    end
+    if eq get c2_vt_kind add gvbase k K_OWN
+      if ge get c2_own_arena r 0
+        if ne c2c_own_fail c2c_r_a_mov fi ii 0
+          ret -1
+        end
+      end
+      if ne c2c_own_kill fi ii r 0
+        ret -1
+      end
+    end
+  end
+  ret 0
+end
+
+fn c2c_own_step fi ulong ii ulong to long
+  idx = add mul fi C2_MAX_INSNS ii
+  op = get c2_in_op idx
+  vbase = mul fi C2_MAX_VREGS
+  if eq op C2_ALLOC
+    ret c2c_own_birth fi ii ulong get c2_in_dst idx
+  end
+  if eq op C2_AALLOC
+    b = ulong get c2_in_b idx
+    bad = false
+    note GUARD:arena-alloc-dead
+    bad = eq and c2c_st_any get c2_own_st b ST_L 0
+    if bad
+      if ne c2c_own_fail c2c_r_a_dead fi ii 0
+        ret -1
+      end
+    end
+    ret c2c_own_birth fi ii ulong get c2_in_dst idx
+  end
+  if eq op C2_RELEASE
+    a = ulong get c2_in_a idx
+    bad = false
+    note GUARD:release-arena
+    bad = ge get c2_own_arena a 0
+    if bad
+      if ne c2c_own_fail c2c_r_rel_a fi ii 0
+        ret -1
+      end
+    end
+    bad = false
+    note GUARD:double-release
+    bad = eq and c2c_st_any get c2_own_st a ST_L 0
+    if bad
+      if ne c2c_own_fail c2c_r_dbl_r fi ii 0
+        ret -1
+      end
+    end
+    put c2_own_st a c2c_st_set get c2_own_st a ST_D
+    ret 0
+  end
+  if eq op C2_MOV
+    a = ulong get c2_in_a idx
+    d = ulong get c2_in_dst idx
+    if c2c_tracked fi a
+      if eq get c2_vt_kind add vbase d K_OWN
+        bad = false
+        note GUARD:arena-move
+        bad = or ge get c2_own_arena a 0 ge get c2_own_arena d 0
+        if bad
+          if ne c2c_own_fail c2c_r_a_mov fi ii 0
+            ret -1
+          end
+        end
+        if ne c2c_own_kill fi ii a 0
+          ret -1
+        end
+        ret c2c_own_birth fi ii d
+      end
+      ret c2c_own_use fi ii a
+    end
+    if eq get c2_vt_s add vbase a S_REF
+      ret c2c_own_use fi ii a
+    end
+    ret 0
+  end
+  if or eq op C2_LOAD or eq op C2_STORE or eq op C2_FLOAD eq op C2_FSTORE
+    ret c2c_own_use fi ii ulong get c2_in_a idx
+  end
+  if eq op C2_CALL
+    ret c2c_own_call fi ii idx
+  end
+  ret c2c_own_step_b fi ii idx
+end
+
+fn c2c_own_flag_def fi ulong ii ulong to void
+  idx = add mul fi C2_MAX_INSNS ii
+  c = c2c_defines idx
+  if lt c 0
+    ret
+  end
+  if eq get c2_own_isflg ulong c 0
+    ret
+  end
+  nv = ulong get c2_fn_nvregs fi
+  op = get c2_in_op idx
+  imm = get c2_in_imm idx
+  for r ulong nv bound 480
+    if eq long get c2_own_flag r c
+      s = c2c_st_any get c2_own_st r
+      if eq op C2_CONST
+        if ne imm 0
+          put c2_own_st r shl s 3
+        else
+          put c2_own_st r s
+        end
+      else
+        put c2_own_st r or s shl s 3
+      end
+    end
+  end
+end
+
+fn c2c_own_try_flag fi ulong tb ulong ca int to void
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  hidx = add ibase ulong get c2_blk_first add bbase tb
+  if eq get c2_in_op hidx C2_RELEASE
+    ha = ulong get c2_in_a hidx
+    if and c2c_tracked fi ha lt get c2_own_flag ha 0
+      put c2_own_flag ha ca
+      put c2_own_isflg ulong ca 1
+    end
+  end
+end
+
+fn c2c_own_prep_flags fi ulong to void
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  for i ulong ni bound 4096
+    idx = add ibase i
+    if ne get c2_in_op idx C2_CBR
+      continue
+    end
+    tt = ulong get c2_in_t idx
+    ff = ulong get c2_in_f idx
+    if eq tt ff
+      continue
+    end
+    ca = int get c2_in_a idx
+    c2c_own_try_flag fi tt ca
+    c2c_own_try_flag fi ff ca
+  end
+end
+
+fn c2c_own_orig_step fi ulong idx ulong np ulong to bool
+  if ne get c2_in_op idx C2_MOV
+    ret false
+  end
+  vbase = mul fi C2_MAX_VREGS
+  d = ulong get c2_in_dst idx
+  if ne get c2_vt_s add vbase d S_REF
+    ret false
+  end
+  if eq get c2_vt_kind add vbase d K_OWN
+    ret false
+  end
+  a = ulong get c2_in_a idx
+  root = long get c2_own_orig a
+  if eq get c2_vt_kind add vbase a K_OWN
+    root = long a
+  end
+  cur = long get c2_own_orig d
+  nw = long -2
+  if and eq cur -1 ge root 0
+    nw = root
+  else
+    if eq cur root
+      nw = cur
+    end
+  end
+  if lt d np
+    nw = -2
+  end
+  if and ne nw cur ne cur -2
+    put c2_own_orig d int nw
+    ret true
+  end
+  ret false
+end
+
+fn c2c_own_prep_orig fi ulong to void
+  nv = ulong get c2_fn_nvregs fi
+  np = ulong get c2_fn_nparams fi
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  changed = true
+  while changed bound 480
+    changed = false
+    for i ulong ni bound 4096
+      if c2c_own_orig_step fi add ibase i np
+        changed = true
+      end
+    end
+  end
+  for r ulong nv bound 480
+    if eq get c2_own_orig r -2
+      put c2_own_orig r -1
+    end
+  end
+end
+
+fn c2c_own_prep fi ulong to long
+  nv = ulong get c2_fn_nvregs fi
+  ni = ulong get c2_fn_ninsns fi
+  ibase = mul fi C2_MAX_INSNS
+  for r ulong nv bound 480
+    put c2_own_arena r -1
+    put c2_own_orig r -1
+    put c2_own_flag r -1
+    put c2_own_isflg r 0
+  end
+  for i ulong ni bound 4096
+    idx = add ibase i
+    if eq get c2_in_op idx C2_AALLOC
+      put c2_own_arena ulong get c2_in_dst idx int get c2_in_b idx
+    end
+  end
+  for i ulong ni bound 4096
+    idx = add ibase i
+    op = get c2_in_op idx
+    if eq op C2_ALLOC
+      if ge get c2_own_arena ulong get c2_in_dst idx 0
+        ret c2c_f c2c_r_a_mov long i
+      end
+    end
+    if eq op C2_AALLOC
+      da = get c2_own_arena ulong get c2_in_dst idx
+      if ne da int get c2_in_b idx
+        ret c2c_f c2c_r_a_mov long i
+      end
+    end
+  end
+  c2c_own_prep_flags fi
+  c2c_own_prep_orig fi
+  ret 0
+end
+
+fn c2c_own_prop_edge nv ulong s ulong c long keep uchar to bool
+  if ge c 0
+    for r ulong nv bound 480
+      if eq long get c2_own_flag r c
+        if eq and get c2_own_st r keep 0
+          ret false
+        end
+      end
+    end
+  end
+  ch = false
+  if eq get c2_own_live s 0
+    put c2_own_live s 1
+    ch = true
+  end
+  os = mul s C2_MAX_VREGS
+  for r ulong nv bound 480
+    v = get c2_own_st r
+    if ge c 0
+      if eq long get c2_own_flag r c
+        v = and v keep
+      end
+    end
+    m = or get c2_own_in add os r v
+    if ne m get c2_own_in add os r
+      put c2_own_in add os r m
+      ch = true
+    end
+  end
+  ret ch
+end
+
+fn c2c_own_prop_succs nv ulong b ulong tidx ulong to bool
+  c = long -1
+  if eq get c2_in_op tidx C2_CBR
+    if ne get c2_in_t tidx get c2_in_f tidx
+      ta = ulong get c2_in_a tidx
+      if ne get c2_own_isflg ta 0
+        c = long ta
+      end
+    end
+  end
+  ch = false
+  ns = ulong get c2_fx_nsucc b
+  for k ulong ns bound 2
+    s = ulong get c2_fx_succ add mul b 2 k
+    keep = uchar 63
+    if ge c 0
+      want_k = uchar 7
+      if eq s ulong get c2_in_t tidx
+        want_k = 56
+      end
+      note GUARD:drop-flag-edge
+      keep = want_k
+    end
+    if c2c_own_prop_edge nv s c keep
+      ch = true
+    end
+  end
+  ret ch
+end
+
+fn c2c_own_fix_blk fi ulong nv ulong b ulong to bool
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  ob = mul b C2_MAX_VREGS
+  for r ulong nv bound 480
+    put c2_own_st r get c2_own_in add ob r
+  end
+  fst = ulong get c2_blk_first add bbase b
+  cnt = ulong get c2_blk_count add bbase b
+  for k ulong cnt bound 4096
+    ii = add fst k
+    if eq get c2_in_op add ibase ii C2_TRAP
+      ret false
+    end
+    ign = c2c_own_step fi ii
+    c2c_own_flag_def fi ii
+  end
+  ret c2c_own_prop_succs nv b add ibase sub add fst cnt 1
+end
+
+fn c2c_own_verify_blk fi ulong nv ulong b ulong to long
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  ob = mul b C2_MAX_VREGS
+  for r ulong nv bound 480
+    put c2_own_st r get c2_own_in add ob r
+  end
+  fst = ulong get c2_blk_first add bbase b
+  cnt = ulong get c2_blk_count add bbase b
+  for k ulong cnt bound 4096
+    ii = add fst k
+    if eq get c2_in_op add ibase ii C2_TRAP
+      break
+    end
+    if ne c2c_own_step fi ii 0
+      ret -1
+    end
+    c2c_own_flag_def fi ii
+  end
+  ret 0
+end
+
+fn c2c_check_ownership fi ulong to long
+  if ne c2c_own_prep fi 0
+    ret -1
+  end
+  nb = ulong get c2_fn_nblocks fi
+  nv = ulong get c2_fn_nvregs fi
+  np = ulong get c2_fn_nparams fi
+  for b ulong nb bound 512
+    put c2_own_live b 0
+    ob = mul b C2_MAX_VREGS
+    for r ulong nv bound 480
+      put c2_own_in add ob r 0
+    end
+  end
+  for r ulong nv bound 480
+    if and lt r np c2c_tracked fi r
+      put c2_own_in r or ST_L shl ST_L 3
+    else
+      put c2_own_in r or ST_U shl ST_U 3
+    end
+  end
+  put c2_own_live 0 1
+  put c2_fx_quiet 0 1
+  changed = true
+  while changed bound 4096
+    changed = false
+    for b ulong nb bound 512
+      if eq get c2_own_live b 0
+        continue
+      end
+      if c2c_own_fix_blk fi nv b
+        changed = true
+      end
+    end
+  end
+  put c2_fx_quiet 0 0
+  for b ulong nb bound 512
+    if eq get c2_own_live b 0
+      continue
+    end
+    if ne c2c_own_verify_blk fi nv b 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+note ---- Mutable borrow exclusivity ----
+
+fn c2c_cur_clr bit ulong to void
+  ow = shr bit 6
+  put c2_ma_cur ow and get c2_ma_cur ow not shl ulong 1 and bit 63
+end
+
+fn c2c_live_in_step idx ulong off ulong save_after bool to void
+  if save_after
+    ao = mul off C2_BSW
+    for w ulong C2_BSW
+      put c2_ma_after add ao w get c2_ma_cur w
+    end
+  end
+  d = c2c_defines idx
+  if ge d 0
+    c2c_cur_clr ulong d
+  end
+  us = new short 8 0
+  nu = c2c_uses idx us
+  for j ulong nu bound 8
+    c2c_cur_set ulong get us j
+  end
+end
+
+fn c2c_live_union_succs b ulong to void
+  ns = ulong get c2_fx_nsucc b
+  for k ulong ns bound 2
+    so = mul ulong get c2_fx_succ add mul b 2 k C2_BSW
+    for w ulong C2_BSW
+      put c2_ma_cur w or get c2_ma_cur w get c2_ma_lin add so w
+    end
+  end
+end
+
+fn c2c_live_block fi ulong b ulong save_after bool to void
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  fst = ulong get c2_blk_first add bbase b
+  cnt = ulong get c2_blk_count add bbase b
+  end_i = add fst cnt
+  for w ulong C2_BSW
+    put c2_ma_cur w 0
+  end
+  for k ulong cnt bound 4096
+    if eq get c2_in_op add ibase add fst k C2_TRAP
+      end_i = add fst k
+      break
+    end
+  end
+  if eq end_i add fst cnt
+    c2c_live_union_succs b
+  end
+  nlen = sub end_i fst
+  for k ulong nlen bound 4096
+    off = sub sub nlen 1 k
+    c2c_live_in_step add ibase add fst off off save_after
+  end
+end
+
+fn c2c_alias_seed fi ulong idx ulong to void
+  for w ulong C2_BSW
+    put c2_ma_cur w 0
+  end
+  if ne get c2_in_op idx C2_MOV
+    ret
+  end
+  a = ulong get c2_in_a idx
+  if ne get c2_vt_s add mul fi C2_MAX_VREGS a S_REF
+    ret
+  end
+  c2c_cur_set a
+  ma = long get c2_ma_mi a
+  if ge ma 0
+    mo = mul ulong ma C2_BSW
+    for w ulong C2_BSW
+      put c2_ma_cur w or get c2_ma_cur w get c2_ma_p add mo w
+    end
+  end
+end
+
+fn c2c_alias_def fi ulong nm ulong ii ulong to void
+  idx = add mul fi C2_MAX_INSNS ii
+  d = c2c_defines idx
+  if lt d 0
+    ret
+  end
+  ud = ulong d
+  md = long get c2_ma_mi ud
+  if ge md 0
+    c2c_alias_seed fi idx
+  end
+  dw = shr ud 6
+  dmask = not shl ulong 1 and ud 63
+  for j ulong nm bound 480
+    o = add mul j C2_BSW dw
+    put c2_ma_p o and get c2_ma_p o dmask
+  end
+  if ge md 0
+    c2c_cur_clr ud
+    do = mul ulong md C2_BSW
+    for w ulong C2_BSW
+      put c2_ma_p add do w get c2_ma_cur w
+    end
+  end
+end
+
+fn c2c_ma_run_liveness fi ulong to void
+  nb = ulong get c2_fn_nblocks fi
+  for b ulong nb bound 512
+    for w ulong C2_BSW
+      put c2_ma_lin add mul b C2_BSW w 0
+    end
+  end
+  changed = true
+  while changed bound 512
+    changed = false
+    for bi ulong nb bound 512
+      b = sub sub nb 1 bi
+      if eq get c2_fx_reach b 0
+        continue
+      end
+      c2c_live_block fi b false
+      for w ulong C2_BSW
+        if ne get c2_ma_cur w get c2_ma_lin add mul b C2_BSW w
+          put c2_ma_lin add mul b C2_BSW w get c2_ma_cur w
+          changed = true
+        end
+      end
+    end
+  end
+end
+
+fn c2c_ma_merge_succ s ulong nw ulong to bool
+  ch = false
+  if eq get c2_ma_seen s 0
+    put c2_ma_seen s 1
+    ch = true
+  end
+  so = mul s nw
+  for j ulong nw bound 3840
+    cur = get c2_ma_pin add so j
+    m = or cur get c2_ma_p j
+    if ne m cur
+      put c2_ma_pin add so j m
+      ch = true
+    end
+  end
+  ret ch
+end
+
+fn c2c_ma_prop_succs b ulong nw ulong to bool
+  ch = false
+  ns = ulong get c2_fx_nsucc b
+  for k ulong ns bound 2
+    s = ulong get c2_fx_succ add mul b 2 k
+    if c2c_ma_merge_succ s nw
+      ch = true
+    end
+  end
+  ret ch
+end
+
+fn c2c_ma_desc_blk fi ulong nm ulong b ulong to bool
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  nw = mul nm C2_BSW
+  bo = mul b nw
+  for j ulong nw bound 3840
+    put c2_ma_p j get c2_ma_pin add bo j
+  end
+  fst = ulong get c2_blk_first add bbase b
+  cnt = ulong get c2_blk_count add bbase b
+  for k ulong cnt bound 4096
+    ii = add fst k
+    if eq get c2_in_op add ibase ii C2_TRAP
+      ret false
+    end
+    c2c_alias_def fi nm ii
+  end
+  ret c2c_ma_prop_succs b nw
+end
+
+fn c2c_ma_run_descent fi ulong nm ulong to void
+  nb = ulong get c2_fn_nblocks fi
+  nw = mul nm C2_BSW
+  for b ulong nb bound 512
+    put c2_ma_seen b 0
+    bo = mul b nw
+    for j ulong nw bound 3840
+      put c2_ma_pin add bo j 0
+    end
+  end
+  put c2_ma_seen 0 1
+  changed = true
+  while changed bound 4096
+    changed = false
+    for b ulong nb bound 512
+      if eq get c2_ma_seen b 0
+        continue
+      end
+      if c2c_ma_desc_blk fi nm b
+        changed = true
+      end
+    end
+  end
+end
+
+fn c2c_ma_chk_use nm ulong k ulong r ulong d long to bool
+  for j ulong nm bound 480
+    m = ulong get c2_ma_mreg j
+    if or eq m r eq long m d
+      continue
+    end
+    la = get c2_ma_after add mul k C2_BSW shr m 6
+    if eq and shr la and m 63 1 0
+      continue
+    end
+    pw = get c2_ma_p add mul j C2_BSW shr r 6
+    hit = false
+    note GUARD:mut-alias
+    hit = ne and shr pw and r 63 1 0
+    if hit
+      ret true
+    end
+  end
+  ret false
+end
+
+fn c2c_ma_chk_in fi ulong nm ulong k ulong ii ulong to long
+  idx = add mul fi C2_MAX_INSNS ii
+  vbase = mul fi C2_MAX_VREGS
+  us = new short 8 0
+  nu = c2c_uses idx us
+  d = c2c_defines idx
+  for u_i ulong nu bound 8
+    r = ulong get us u_i
+    if ne get c2_vt_s add vbase r S_REF
+      continue
+    end
+    if c2c_ma_chk_use nm k r d
+      ret c2c_f c2c_r_m_ali long ii
+    end
+  end
+  ret 0
+end
+
+fn c2c_ma_verify_blk fi ulong nm ulong b ulong to long
+  bbase = mul fi C2_MAX_BLOCKS
+  ibase = mul fi C2_MAX_INSNS
+  c2c_live_block fi b true
+  nw = mul nm C2_BSW
+  bo = mul b nw
+  for j ulong nw bound 3840
+    put c2_ma_p j get c2_ma_pin add bo j
+  end
+  fst = ulong get c2_blk_first add bbase b
+  cnt = ulong get c2_blk_count add bbase b
+  for k ulong cnt bound 4096
+    ii = add fst k
+    if eq get c2_in_op add ibase ii C2_TRAP
+      break
+    end
+    if ne c2c_ma_chk_in fi nm k ii 0
+      ret -1
+    end
+    c2c_alias_def fi nm ii
+  end
+  ret 0
+end
+
+fn c2c_check_mut_alias fi ulong to long
+  nv = ulong get c2_fn_nvregs fi
+  nb = ulong get c2_fn_nblocks fi
+  vbase = mul fi C2_MAX_VREGS
+  nm = ulong 0
+  for r ulong nv bound 480
+    put c2_ma_mi r -1
+    if eq get c2_vt_s add vbase r S_REF
+      if eq get c2_vt_kind add vbase r K_MUT
+        put c2_ma_mi r int nm
+        put c2_ma_mreg nm int r
+        nm = add nm 1
+      end
+    end
+  end
+  if eq nm 0
+    ret 0
+  end
+  c2c_ma_run_liveness fi
+  c2c_ma_run_descent fi nm
+  for b ulong nb bound 512
+    if eq get c2_ma_seen b 0
+      continue
+    end
+    if ne c2c_ma_verify_blk fi nm b 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+note ---- Driver ----
+
+fn c2c_check_func fi ulong to long
+  for g ulong fi bound 32
+    bad_nm = false
+    note GUARD:func-name
+    bad_nm = c2c_name_eq 2 g fi
+    if bad_nm
+      ret c2_fail c2c_r_fn_nm long fi -1 c2c_det
+    end
+  end
+  np = ulong get c2_fn_nparams fi
+  nv = ulong get c2_fn_nvregs fi
+  bad_par = false
+  note GUARD:params
+  bad_par = or gt np C2_MAX_PARAMS gt np nv
+  if bad_par
+    ret c2_fail c2c_r_fn_par long fi -1 c2c_det
+  end
+  rs = get c2_fn_ret_s fi
+  bad_rs = false
+  note GUARD:ret-scalar
+  bad_rs = not or eq rs S_VOID c2c_is_value rs
+  if bad_rs
+    ret c2_fail c2c_r_fn_ret long fi -1 c2c_det
+  end
+  vbase = mul fi C2_MAX_VREGS
+  for r ulong nv bound 480
+    vidx = add vbase r
+    bad_vt = false
+    note GUARD:vreg-type
+    bad_vt = not c2c_check_vt vidx
+    if bad_vt
+      ret c2_fail c2c_r_t_inv long fi -1 c2c_det
+    end
+    if c2c_is_slice get c2_vt_s vidx
+      bad_sp = false
+      if ge add r 1 np
+        bad_sp = true
+      else
+        note GUARD:slice-param
+        bad_sp = ne get c2_vt_s add vidx 1 S_U64
+      end
+      if bad_sp
+        ret c2_fail c2c_r_sl_par long fi -1 c2c_det
+      end
+      if gt r 0
+        if c2c_is_slice get c2_vt_s sub vidx 1
+          ret c2_fail c2c_r_sl_par long fi -1 c2c_det
+        end
+      end
+    end
+  end
+  put c2_fx_fi 0 fi
+  if ne c2c_build_cfg fi 0
+    ret -1
+  end
+  ni = ulong get c2_fn_ninsns fi
+  for ii ulong ni bound 4096
+    if ne c2c_check_insn fi ii 0
+      ret -1
+    end
+  end
+  c2c_link_cfg fi
+  c2c_count_defs fi
+  if ne c2c_check_handles fi 0
+    ret -1
+  end
+  if ne c2c_check_defined fi 0
+    ret -1
+  end
+  if ne c2c_check_loops fi 0
+    ret -1
+  end
+  if ne c2c_check_ownership fi 0
+    ret -1
+  end
+  if ne c2c_check_mut_alias fi 0
+    ret -1
+  end
+  ret 0
+end
+
+fn c2_check_unit to long
+  put c2_v_ok 0 1
+  put c2_v_func 0 -1
+  put c2_v_insn 0 -1
+  rn = len c2i_accept
+  for i ulong rn bound 16
+    put c2_v_rule i get c2i_accept i
+  end
+  put c2_v_rulelen 0 rn
+  put c2_v_detaillen 0 0
+  if ne c2c_check_structs 0
+    ret -1
+  end
+  nf = get c2_nfuncs 0
+  for fi ulong nf bound 32
+    if ne c2c_check_func fi 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn c2_check_bytes blen ulong to long
+  if ne c2_decode blen 0
+    ret -1
+  end
+  ret c2_check_unit
+end

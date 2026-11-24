@@ -1,0 +1,1460 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note src/checker2/checker2_main.om: independent checker2 CLI (pure seeded OM-2).
+note Compose after: c2_om2_hdr.om, sha256.om, sha512.om, ed25519.om, ed_sign.om,
+note                c2_receipt.om, c2_ir.om, c2_check.om, c2_lrat.om, c2_blast.om,
+note                <generated c2_sources_id.om defining text c2_sources_sha256>
+
+const C2M_MAX_ARGS ulong 128
+const C2M_ARG_STRIDE ulong 512
+
+note CLI argv cache (loaded once in main)
+global c2m_argc ulong 1
+global c2m_args uchar 65536
+global c2m_arglen ulong 128
+
+note Scratch I/O & formatting buffers
+global c2m_fbuf uchar 16777216
+global c2m_out uchar 16384
+global c2m_outlen ulong 1
+global c2m_path uchar 4096
+global c2m_req_obj uchar 8192
+global c2m_req_len ulong 1
+global c2m_prev_fn uchar 256
+global c2m_prev_len ulong 1
+global c2m_deps uchar 2048
+global c2m_hex_tmp uchar 64
+global c2m_ir_sha uchar 32
+global c2m_exe_sha uchar 32
+global c2m_fw_sha uchar 32
+global c2m_prod_sha uchar 32
+global c2m_tgt_sha uchar 32
+global c2m_dep_sha uchar 32
+global c2m_req_sha uchar 32
+global c2m_prf_sha uchar 32
+
+text c2m_ver_str "checker2 1 (omega#446)"
+text c2m_t_ver "version"
+text c2m_t_check "check"
+text c2m_t_pcnf "prove-cnf"
+text c2m_t_pchk "prove-check"
+text c2m_t_rcpt "receipt"
+text c2m_t_issue "issue"
+text c2m_t_tbs "tbs"
+text c2m_t_attach "attach"
+text c2m_t_verify "verify"
+
+text c2m_o_target "--target"
+text c2m_o_epoch "--epoch"
+text c2m_o_expiry "--expiry"
+text c2m_o_outdir "--out-dir"
+text c2m_o_draft "--owner-draft"
+text c2m_o_fw "--firmware"
+text c2m_o_req "--requirements"
+text c2m_o_inp "--input"
+text c2m_o_prod "--producer"
+text c2m_o_dep "--dep"
+text c2m_o_lrat "--lrat"
+text c2m_o_allow_t "--allow-test-key"
+text c2m_o_production "--production"
+text c2m_o_floor "--floor"
+text c2m_o_rev_id "--revoked-id"
+text c2m_o_rev_k "--revoked-key"
+text c2m_o_acc_c "--accept-checker"
+
+text c2m_s_srcsha "\nsources_sha256="
+text c2m_s_chkid "\nchecker_id="
+text c2m_s_accept "checker2=ACCEPT ir_sha256="
+text c2m_s_reject "checker2=REJECT rule="
+text c2m_s_func " func="
+text c2m_s_insn " insn="
+text c2m_s_irsha " ir_sha256="
+text c2m_s_det " detail="
+text c2m_s_rcpt_eq "receipt="
+text c2m_s_rcpt_ext ".rcpt"
+text c2m_s_unch " unchanged\n"
+text c2m_s_valid "receipt=VALID\n"
+text c2m_s_req_hdr "OMEGA-REQUIREMENTS-V1\n"
+text c2m_s_prf_sha " proof_sha256="
+text c2m_s_req_out "requirements_sha256="
+text c2m_s_proofs " proofs="
+text c2m_s_prop "property="
+text c2m_s_inps " inputs="
+text c2m_s_paths " paths="
+text c2m_s_traps " trap_sites="
+text c2m_s_vars " vars="
+text c2m_s_cl " clauses="
+text c2m_s_pref "prove=REFUSED rule="
+text c2m_s_lref "lrat=REFUSED "
+text c2m_s_lref_f "func="
+text c2m_s_lref_r "rule="
+text c2m_s_lref_l " line="
+text c2m_s_lver "lrat=VERIFIED property="
+text c2m_s_steps " steps="
+text c2m_s_lr_fail "receipt=LRAT-REPLAY-FAILED\n"
+text c2m_s_lr_nc "receipt=LRAT-NOT-CLAIMED\n"
+text c2m_s_lr_req "receipt=LRAT-PROOFS-REQUIRED\n"
+text c2m_s_lr_mis "receipt=LRAT-REQUIREMENTS-MISMATCH\n"
+text c2m_s_usage "usage: checker2 check <unit.ir> | version | prove-cnf | prove-check | receipt issue|tbs|attach|verify ...\n"
+text c2m_s_err "checker2: error\n"
+
+note ---- Output builder helpers ----
+
+fn c2m_out_reset to void
+  put c2m_outlen 0 0
+end
+
+fn c2m_out_ch c uchar to void
+  p = get c2m_outlen 0
+  if lt p 16384
+    put c2m_out p c
+    put c2m_outlen 0 add p 1
+  end
+end
+
+fn c2m_out_txt s view uchar * to void
+  n = len s
+  for i ulong n bound 256
+    c2m_out_ch get s i
+  end
+end
+
+fn c2m_out_arg idx ulong to void
+  n = get c2m_arglen idx
+  base = mul idx C2M_ARG_STRIDE
+  for i ulong n bound 512
+    c2m_out_ch get c2m_args add base i
+  end
+end
+
+fn c2m_out_hex b view uchar * n ulong to void
+  for i ulong n bound 64
+    v = uint get b i
+    c2m_out_ch sh_hexd shr v 4
+    c2m_out_ch sh_hexd and v 15
+  end
+end
+
+fn c2m_out_u64 v ulong to void
+  if eq v 0
+    c2m_out_ch 48
+    ret
+  end
+  tmp = new uchar 24 0
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  for i ulong n bound 24
+    c2m_out_ch get tmp sub sub n 1 i
+  end
+end
+
+fn c2m_out_i64 v long to void
+  if lt v 0
+    c2m_out_ch 45
+    c2m_out_u64 ulong sub 0 v
+    ret
+  end
+  c2m_out_u64 ulong v
+end
+
+fn c2m_flush fd int to void
+  tmp = new uchar 16384 0
+  n = get c2m_outlen 0
+  if gt n 0
+    for i ulong n bound 16384
+      put tmp i get c2m_out i
+    end
+    ign = write fd tmp 0 n
+  end
+  put c2m_outlen 0 0
+end
+
+note ---- Argv helpers ----
+
+fn c2m_load_args to void
+  ac = ulong argcnt
+  if gt ac C2M_MAX_ARGS
+    ac = C2M_MAX_ARGS
+  end
+  b = new uchar 512 0
+  for n ulong ac bound 128
+    r = argread n b 0 510
+    if lt r 0
+      put c2m_arglen n 0
+      continue
+    end
+    ur = ulong r
+    base = mul n C2M_ARG_STRIDE
+    for i ulong ur bound 512
+      put c2m_args add base i get b i
+    end
+    put c2m_arglen n ur
+  end
+  put c2m_argc 0 ac
+end
+
+fn c2m_arg_eq idx ulong s view uchar * to bool
+  if ge idx get c2m_argc 0
+    ret false
+  end
+  al = get c2m_arglen idx
+  if ne al len s
+    ret false
+  end
+  base = mul idx C2M_ARG_STRIDE
+  for i ulong al bound 512
+    if ne get c2m_args add base i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+note Find option value index starting from arg `from`, or -1 if absent
+fn c2m_opt from ulong name view uchar * to long
+  ac = get c2m_argc 0
+  i = from
+  while lt add i 1 ac bound 128
+    if c2m_arg_eq i name
+      ret long add i 1
+    end
+    i = add i 1
+  end
+  ret -1
+end
+
+fn c2m_flag from ulong name view uchar * to bool
+  ac = get c2m_argc 0
+  i = from
+  while lt i ac bound 128
+    if c2m_arg_eq i name
+      ret true
+    end
+    i = add i 1
+  end
+  ret false
+end
+
+fn c2m_parse_u64 idx ulong dst edit ulong 1 to bool
+  n = get c2m_arglen idx
+  if eq n 0
+    ret false
+  end
+  base = mul idx C2M_ARG_STRIDE
+  v = ulong 0
+  for i ulong n bound 32
+    c = get c2m_args add base i
+    if lt c 48
+      ret false
+    end
+    if gt c 57
+      ret false
+    end
+    d = ulong sub c 48
+    if gt v ulong 1844674407370955161
+      ret false
+    end
+    if eq v ulong 1844674407370955161
+      if gt d 5
+        ret false
+      end
+    end
+    v = add mul v 10 d
+  end
+  put dst 0 v
+  ret true
+end
+
+fn c2m_unhex32_arg idx ulong dst edit uchar 32 to bool
+  if ne get c2m_arglen idx 64
+    ret false
+  end
+  base = mul idx C2M_ARG_STRIDE
+  for i ulong 32
+    hi = c2r_hex_nib get c2m_args add base mul i 2
+    lo = c2r_hex_nib get c2m_args add base add mul i 2 1
+    if or lt hi 0 lt lo 0
+      ret false
+    end
+    put dst i uchar or shl ulong hi 4 ulong lo
+  end
+  ret true
+end
+
+note ---- File I/O helpers ----
+
+fn c2m_slurp_fd fd int to long
+  tot = ulong 0
+  chunk = new uchar 65536 0
+  while true bound 512
+    r = read fd chunk 0 65536
+    if lt r 0
+      ign = fclose fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    ur = ulong r
+    if gt add tot ur 16777216
+      ign = fclose fd
+      ret -1
+    end
+    for i ulong ur bound 65536
+      put c2m_fbuf add tot i get chunk i
+    end
+    tot = add tot ur
+  end
+  ign = fclose fd
+  ret long tot
+end
+
+note Slurp file at argv[idx] into c2m_fbuf; returns length or -1 on error
+fn c2m_slurp_arg idx ulong to long
+  pl = get c2m_arglen idx
+  if eq pl 0
+    ret -1
+  end
+  p = new uchar 512 0
+  base = mul idx C2M_ARG_STRIDE
+  for i ulong pl bound 512
+    put p i get c2m_args add base i
+  end
+  fd = fopen p 0 pl 0 0
+  if lt fd 0
+    ret -1
+  end
+  ret c2m_slurp_fd int fd
+end
+
+note Slurp file at c2m_path[0..pl) into c2m_fbuf; returns length or -1
+fn c2m_slurp_path pl ulong to long
+  p = new uchar 4096 0
+  for i ulong pl bound 4096
+    put p i get c2m_path i
+  end
+  fd = fopen p 0 pl 0 0
+  if lt fd 0
+    ret -1
+  end
+  ret c2m_slurp_fd int fd
+end
+
+fn c2m_write_fd fd int n ulong to long
+  off = ulong 0
+  chunk = new uchar 65536 0
+  while lt off n bound 512
+    rem_n = sub n off
+    if gt rem_n 65536
+      rem_n = 65536
+    end
+    for i ulong rem_n bound 65536
+      put chunk i get c2m_fbuf add off i
+    end
+    w = write fd chunk 0 rem_n
+    if ne w long rem_n
+      ign = fclose fd
+      ret -2
+    end
+    off = add off rem_n
+  end
+  ign_c = fclose fd
+  if ne ign_c 0
+    ret -2
+  end
+  ret 0
+end
+
+note Write c2m_fbuf[0..n) to new file at c2m_path[0..pl) (O_WRONLY|O_CREAT|O_EXCL = 193, mode 0444 = 292)
+note Returns 0 ok, -1 EEXIST/open error, -2 write error
+fn c2m_write_new_path pl ulong n ulong to long
+  p = new uchar 4096 0
+  for i ulong pl bound 4096
+    put p i get c2m_path i
+  end
+  fd = fopen p 0 pl 193 292
+  if lt fd 0
+    ret -1
+  end
+  ret c2m_write_fd int fd n
+end
+
+fn c2m_file_sha_arg idx ulong dst edit uchar 32 to long
+  n = c2m_slurp_arg idx
+  if lt n 0
+    ret -1
+  end
+  un = ulong n
+  for i ulong un bound 16777216
+    put sh_dat i get c2m_fbuf i
+  end
+  sh_all un
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+  ret 0
+end
+
+fn c2m_opt_sha from ulong name view uchar * dst edit uchar 32 to long
+  for i ulong 32
+    put dst i 0
+  end
+  ix = c2m_opt from name
+  if lt ix 0
+    ret 0
+  end
+  ret c2m_file_sha_arg ulong ix dst
+end
+
+note Compute checker_id = SHA-256(c2m_ver_str || 0 || c2_sources_sha256)
+fn c2m_checker_id dst edit uchar 32 to void
+  vl = len c2m_ver_str
+  for i ulong vl bound 64
+    put sh_dat i get c2m_ver_str i
+  end
+  put sh_dat vl 0
+  p = add vl 1
+  sl = len c2_sources_sha256
+  for i ulong sl bound 128
+    put sh_dat add p i get c2_sources_sha256 i
+  end
+  sh_all add p sl
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+note ---- Subcommands ----
+
+fn c2m_judge idx ulong quiet bool to int
+  n = c2m_slurp_arg idx
+  if lt n 0
+    ret 2
+  end
+  un = ulong n
+  for i ulong un bound 16777216
+    put sh_dat i get c2m_fbuf i
+  end
+  sh_all un
+  h = new uchar 32 0
+  for i ulong 32
+    put h i get sh_dig i
+    put c2m_ir_sha i get sh_dig i
+  end
+  if gt un C2_IR_CAP
+    c2m_out_reset
+    c2m_out_txt c2m_s_reject
+    c2m_out_txt c2i_r_trunc
+    c2m_out_txt c2m_s_func
+    c2m_out_i64 -1
+    c2m_out_txt c2m_s_insn
+    c2m_out_i64 -1
+    c2m_out_txt c2m_s_irsha
+    c2m_out_hex h 32
+    c2m_out_txt c2m_s_det
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 1
+  end
+  for i ulong un bound 1048576
+    put c2_ir_buf i get c2m_fbuf i
+  end
+  rc = c2_check_bytes un
+  if eq rc 0
+    if not quiet
+      c2m_out_reset
+      c2m_out_txt c2m_s_accept
+      c2m_out_hex h 32
+      c2m_out_ch 10
+      c2m_flush 1
+    end
+    ret 0
+  end
+  c2m_out_reset
+  c2m_out_txt c2m_s_reject
+  rl = get c2_v_rulelen 0
+  for i ulong rl bound 64
+    c2m_out_ch get c2_v_rule i
+  end
+  c2m_out_txt c2m_s_func
+  c2m_out_i64 get c2_v_func 0
+  c2m_out_txt c2m_s_insn
+  c2m_out_i64 get c2_v_insn 0
+  c2m_out_txt c2m_s_irsha
+  c2m_out_hex h 32
+  c2m_out_txt c2m_s_det
+  dl = get c2_v_detaillen 0
+  for i ulong dl bound 160
+    c2m_out_ch get c2_v_detail i
+  end
+  c2m_out_ch 10
+  c2m_flush 1
+  ret 1
+end
+
+fn c2m_property_cnf ir_idx ulong fn_buf view uchar * fn_len ulong to int
+  n = c2m_slurp_arg ir_idx
+  if lt n 0
+    ret 2
+  end
+  un = ulong n
+  for i ulong un bound 16777216
+    put sh_dat i get c2m_fbuf i
+  end
+  sh_all un
+  for i ulong 32
+    put c2m_ir_sha i get sh_dig i
+  end
+  if gt un C2_IR_CAP
+    ret 1
+  end
+  for i ulong un bound 1048576
+    put c2_ir_buf i get c2m_fbuf i
+  end
+  if ne c2_decode un 0
+    c2m_out_reset
+    c2m_out_txt c2m_s_reject
+    rl = get c2_v_rulelen 0
+    for i ulong rl bound 64
+      c2m_out_ch get c2_v_rule i
+    end
+    c2m_out_txt c2m_s_det
+    dl = get c2_v_detaillen 0
+    for i ulong dl bound 160
+      c2m_out_ch get c2_v_detail i
+    end
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 1
+  end
+  fi = c2_func_index fn_buf fn_len
+  if ne c2_blast_notrap fi 0
+    c2m_out_reset
+    c2m_out_txt c2m_s_pref
+    rl = get c2_bi_rulelen 0
+    for i ulong rl bound 64
+      c2m_out_ch get c2_bi_rule i
+    end
+    c2m_out_txt c2m_s_det
+    dl = get c2_bi_detaillen 0
+    for i ulong dl bound 160
+      c2m_out_ch get c2_bi_detail i
+    end
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 1
+  end
+  ret 0
+end
+
+fn c2m_cmd_prove_cnf to int
+  fb = new uchar 512 0
+  fl = get c2m_arglen 3
+  base = mul 3 C2M_ARG_STRIDE
+  for i ulong fl bound 512
+    put fb i get c2m_args add base i
+  end
+  rc = c2m_property_cnf 2 fb fl
+  if ne rc 0
+    ret rc
+  end
+  cn = c2_cnf_print
+  if eq cn 0
+    ret 2
+  end
+  for i ulong cn bound 16777216
+    put c2m_fbuf i get c2_lr_txt i
+  end
+  ol = get c2m_arglen 4
+  obase = mul 4 C2M_ARG_STRIDE
+  for i ulong ol bound 512
+    put c2m_path i get c2m_args add obase i
+  end
+  if ne c2m_write_new_path ol cn 0
+    ret 2
+  end
+  c2m_out_reset
+  c2m_out_txt c2m_s_prop
+  c2m_out_txt c2b_prop
+  c2m_out_txt c2m_s_func
+  c2m_out_arg 3
+  c2m_out_txt c2m_s_inps
+  c2m_out_u64 get c2_bi_inputs 0
+  c2m_out_txt c2m_s_paths
+  c2m_out_u64 get c2_bi_paths 0
+  c2m_out_txt c2m_s_traps
+  c2m_out_u64 get c2_bi_traps 0
+  c2m_out_txt c2m_s_vars
+  c2m_out_u64 get c2_cnf_nvars 0
+  c2m_out_txt c2m_s_cl
+  c2m_out_u64 get c2_cnf_nclauses 0
+  c2m_out_ch 10
+  c2m_flush 1
+  ret 0
+end
+
+fn c2m_cmd_prove_check to int
+  fb = new uchar 512 0
+  fl = get c2m_arglen 3
+  base = mul 3 C2M_ARG_STRIDE
+  for i ulong fl bound 512
+    put fb i get c2m_args add base i
+  end
+  rc = c2m_property_cnf 2 fb fl
+  if ne rc 0
+    ret rc
+  end
+  pn = c2m_slurp_arg 4
+  if lt pn 0
+    ret 2
+  end
+  upn = ulong pn
+  for i ulong upn bound 16777216
+    b = get c2m_fbuf i
+    put sh_dat i b
+    put c2_lr_txt i b
+  end
+  sh_all upn
+  ps = new uchar 32 0
+  for i ulong 32
+    put ps i get sh_dig i
+  end
+  e = c2_lrat_check upn
+  if ne e 0
+    c2m_out_reset
+    c2m_out_txt c2m_s_lref
+    c2m_out_txt c2m_s_lref_r
+    rl = get c2_lr_rulelen 0
+    for i ulong rl bound 64
+      c2m_out_ch get c2_lr_rule i
+    end
+    c2m_out_txt c2m_s_lref_l
+    c2m_out_i64 get c2_lr_line 0
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 1
+  end
+  is = new uchar 32 0
+  for i ulong 32
+    put is i get c2m_ir_sha i
+  end
+  c2m_out_reset
+  c2m_out_txt c2m_s_lver
+  c2m_out_txt c2b_prop
+  c2m_out_txt c2m_s_func
+  c2m_out_arg 3
+  c2m_out_txt c2m_s_irsha
+  c2m_out_hex is 32
+  c2m_out_txt c2m_s_prf_sha
+  c2m_out_hex ps 32
+  c2m_out_txt c2m_s_steps
+  c2m_out_i64 get c2_lr_steps 0
+  c2m_out_ch 10
+  c2m_flush 1
+  ret 0
+end
+
+note Store c2r_buf[0..416) at <dir>/<id>.rcpt
+fn c2m_store dir_idx ulong to int
+  rid = new uchar 32 0
+  c2r_id rid
+  dl = get c2m_arglen dir_idx
+  dbase = mul dir_idx C2M_ARG_STRIDE
+  p = ulong 0
+  for i ulong dl bound 512
+    put c2m_path p get c2m_args add dbase i
+    p = add p 1
+  end
+  put c2m_path p 47
+  p = add p 1
+  for i ulong 32
+    v = uint get rid i
+    put c2m_path p sh_hexd shr v 4
+    p = add p 1
+    put c2m_path p sh_hexd and v 15
+    p = add p 1
+  end
+  el = len c2m_s_rcpt_ext
+  for i ulong el bound 8
+    put c2m_path p get c2m_s_rcpt_ext i
+    p = add p 1
+  end
+  for i ulong C2R_SIZE
+    put c2m_fbuf i get c2r_buf i
+  end
+  wrc = c2m_write_new_path p C2R_SIZE
+  if eq wrc 0
+    c2m_out_reset
+    c2m_out_txt c2m_s_rcpt_eq
+    for i ulong p bound 1024
+      c2m_out_ch get c2m_path i
+    end
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 0
+  end
+  if eq wrc -1
+    on = c2m_slurp_path p
+    if eq on long C2R_SIZE
+      same = true
+      for i ulong C2R_SIZE
+        if ne get c2m_fbuf i get c2r_buf i
+          same = false
+        end
+      end
+      if same
+        c2m_out_reset
+        c2m_out_txt c2m_s_rcpt_eq
+        for i ulong p bound 1024
+          c2m_out_ch get c2m_path i
+        end
+        c2m_out_txt c2m_s_unch
+        c2m_flush 1
+        ret 0
+      end
+      ret 1
+    end
+  end
+  ret 2
+end
+
+fn c2m_cmp_prev fn_b view uchar * fl ulong to long
+  pl = get c2m_prev_len 0
+  ml = pl
+  if lt fl ml
+    ml = fl
+  end
+  for i ulong ml bound 256
+    a = ulong get c2m_prev_fn i
+    b = ulong get fn_b i
+    if lt a b
+      ret -1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  if lt pl fl
+    ret -1
+  end
+  if gt pl fl
+    ret 1
+  end
+  ret 0
+end
+
+fn c2m_req_ch c uchar to void
+  p = get c2m_req_len 0
+  if lt p 8192
+    put c2m_req_obj p c
+    put c2m_req_len 0 add p 1
+  end
+end
+
+fn c2m_req_txt s view uchar * to void
+  n = len s
+  for i ulong n bound 64
+    c2m_req_ch get s i
+  end
+end
+
+fn c2m_lrat_run_proof pl ulong fl ulong to int
+  pn = c2m_slurp_path pl
+  if lt pn 0
+    ret 2
+  end
+  upn = ulong pn
+  for j ulong upn bound 16777216
+    b = get c2m_fbuf j
+    put sh_dat j b
+    put c2_lr_txt j b
+  end
+  sh_all upn
+  ps = new uchar 32 0
+  for j ulong 32
+    put ps j get sh_dig j
+  end
+  e = c2_lrat_check upn
+  if ne e 0
+    c2m_out_reset
+    c2m_out_txt c2m_s_lref
+    c2m_out_txt c2m_s_lref_f
+    for j ulong fl bound 256
+      c2m_out_ch get c2m_prev_fn j
+    end
+    c2m_out_ch 32
+    c2m_out_txt c2m_s_lref_r
+    rl = get c2_lr_rulelen 0
+    for j ulong rl bound 64
+      c2m_out_ch get c2_lr_rule j
+    end
+    c2m_out_txt c2m_s_lref_l
+    c2m_out_i64 get c2_lr_line 0
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 1
+  end
+  c2m_req_txt c2b_prop
+  c2m_req_ch 32
+  for j ulong fl bound 256
+    c2m_req_ch get c2m_prev_fn j
+  end
+  c2m_req_txt c2m_s_prf_sha
+  for j ulong 32
+    v = uint get ps j
+    c2m_req_ch sh_hexd shr v 4
+    c2m_req_ch sh_hexd and v 15
+  end
+  c2m_req_ch 10
+  ret 0
+end
+
+fn c2m_copy_arg_path arg_idx ulong off ulong n ulong to void
+  pstart = add mul arg_idx C2M_ARG_STRIDE off
+  for j ulong n bound 512
+    put c2m_path j get c2m_args add pstart j
+  end
+end
+
+fn c2m_lrat_one ir_idx ulong arg_idx ulong cnt ulong to int
+  al = get c2m_arglen arg_idx
+  abase = mul arg_idx C2M_ARG_STRIDE
+  eqp = long -1
+  for j ulong al bound 512
+    if eq get c2m_args add abase j 61
+      eqp = long j
+      break
+    end
+  end
+  if or le eqp 0 ge ulong eqp 255
+    ret 2
+  end
+  fl = ulong eqp
+  fb = new uchar 256 0
+  for j ulong fl bound 256
+    put fb j get c2m_args add abase j
+  end
+  if gt cnt 0
+    if ge c2m_cmp_prev fb fl 0
+      ret 1
+    end
+  end
+  for j ulong fl bound 256
+    put c2m_prev_fn j get fb j
+  end
+  put c2m_prev_len 0 fl
+  rc = c2m_property_cnf ir_idx fb fl
+  if ne rc 0
+    ret rc
+  end
+  pl = sub sub al fl 1
+  c2m_copy_arg_path arg_idx add fl 1 pl
+  ret c2m_lrat_run_proof pl fl
+end
+
+fn c2m_lrat_requirements from ulong ir_idx ulong cnt_out edit ulong 1 to int
+  put c2m_req_len 0 0
+  c2m_req_txt c2m_s_req_hdr
+  put c2m_prev_len 0 0
+  cnt = ulong 0
+  ac = get c2m_argc 0
+  i = from
+  while lt add i 1 ac bound 128
+    if c2m_arg_eq i c2m_o_lrat
+      rc = c2m_lrat_one ir_idx add i 1 cnt
+      if ne rc 0
+        ret rc
+      end
+      cnt = add cnt 1
+    end
+    i = add i 1
+  end
+  rl = get c2m_req_len 0
+  for j ulong rl bound 8192
+    put sh_dat j get c2m_req_obj j
+  end
+  sh_all rl
+  for j ulong 32
+    put c2m_req_sha j get sh_dig j
+  end
+  put cnt_out 0 cnt
+  ret 0
+end
+
+fn c2m_collect_deps from ulong dst edit uchar 32 to long
+  ac = get c2m_argc 0
+  nd = ulong 0
+  tmp = new uchar 32 0
+  i = from
+  while lt add i 1 ac bound 128
+    if c2m_arg_eq i c2m_o_dep
+      if ge nd 64
+        ret -1
+      end
+      if not c2m_unhex32_arg add i 1 tmp
+        ret -1
+      end
+      base = mul nd 32
+      for k ulong 32
+        put c2m_deps add base k get tmp k
+      end
+      nd = add nd 1
+    end
+    i = add i 1
+  end
+  db = new uchar 2048 0
+  for k ulong mul nd 32 bound 2048
+    put db k get c2m_deps k
+  end
+  ret c2r_deps_digest db nd dst
+end
+
+fn c2m_rcpt_issue_opts to int
+  ep = new ulong 1 0
+  ex = new ulong 1 0
+  ep_i = c2m_opt 3 c2m_o_epoch
+  ex_i = c2m_opt 3 c2m_o_expiry
+  if or lt ep_i 0 lt ex_i 0
+    ret 2
+  end
+  if not c2m_parse_u64 ulong ep_i ep
+    ret 2
+  end
+  if not c2m_parse_u64 ulong ex_i ex
+    ret 2
+  end
+  put c2r_r_ep 0 get ep 0
+  put c2r_r_ep 1 get ex 0
+  tmp = new uchar 32 0
+  if ne c2m_opt_sha 3 c2m_o_fw tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_r_h add C2RH_FW i get tmp i
+  end
+  if ne c2m_opt_sha 3 c2m_o_req tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_r_h add C2RH_REQ i get tmp i
+  end
+  if ne c2m_opt_sha 3 c2m_o_inp tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_r_h add C2RH_INP i get tmp i
+  end
+  if ne c2m_opt_sha 3 c2m_o_prod tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_r_h add C2RH_PCHK i get tmp i
+  end
+  if ne c2m_collect_deps 3 tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_r_h add C2RH_DEPS i get tmp i
+  end
+  ret 0
+end
+
+fn c2m_rcpt_issue_lrat to int
+  if ge c2m_opt 3 c2m_o_req 0
+    ret 2
+  end
+  cnt_a = new ulong 1 0
+  lrc = c2m_lrat_requirements 3 3 cnt_a
+  if ne lrc 0
+    ret lrc
+  end
+  put c2r_r_u16 3 C2R_EV_IR_CHECKED_LRAT
+  tmp = new uchar 32 0
+  for i ulong 32
+    put tmp i get c2m_req_sha i
+    put c2r_r_h add C2RH_REQ i get c2m_req_sha i
+  end
+  c2m_out_reset
+  c2m_out_txt c2m_s_req_out
+  c2m_out_hex tmp 32
+  c2m_out_txt c2m_s_proofs
+  c2m_out_u64 get cnt_a 0
+  c2m_out_ch 10
+  rl = get c2m_req_len 0
+  for i ulong rl bound 8192
+    c2m_out_ch get c2m_req_obj i
+  end
+  c2m_flush 1
+  ret 0
+end
+
+fn c2m_rcpt_issue_finish tgt_i ulong dir_i long drf_i long to int
+  tl = get c2m_arglen tgt_i
+  tb = new uchar 512 0
+  tbase = mul tgt_i C2M_ARG_STRIDE
+  for i ulong tl bound 512
+    put tb i get c2m_args add tbase i
+  end
+  tmp = new uchar 32 0
+  c2r_target_id tb tl tmp
+  for i ulong 32
+    put c2r_r_h add C2RH_TGT i get tmp i
+  end
+  c2m_checker_id tmp
+  for i ulong 32
+    put c2r_r_h add C2RH_CHK i get tmp i
+  end
+  c2r_init_keys
+  if ge drf_i 0
+    put c2r_r_u16 1 C2R_CLASS_OWNER
+    for i ulong 32
+      put sh_dat i get c2r_owner_root_pk i
+    end
+    sh_all 32
+    for i ulong 32
+      put c2r_r_h add C2RH_KFP i get sh_dig i
+    end
+    c2r_encode
+    for i ulong C2R_SIZE
+      put c2m_fbuf i get c2r_buf i
+    end
+    dl = get c2m_arglen ulong drf_i
+    c2m_copy_arg_path ulong drf_i 0 dl
+    if ne c2m_write_new_path dl C2R_SIZE 0
+      ret 2
+    end
+    ret 0
+  end
+  c2r_test_seed tmp
+  e = c2r_sign_test tmp
+  if ne e C2R_OK
+    ret 1
+  end
+  ret c2m_store ulong dir_i
+end
+
+fn c2m_rcpt_issue to int
+  if lt get c2m_argc 0 5
+    ret 2
+  end
+  tgt_i = c2m_opt 3 c2m_o_target
+  dir_i = c2m_opt 3 c2m_o_outdir
+  drf_i = c2m_opt 3 c2m_o_draft
+  if lt tgt_i 0
+    ret 2
+  end
+  if eq ge dir_i 0 ge drf_i 0
+    ret 2
+  end
+  put c2r_r_u16 0 C2R_FORMAT_VERSION
+  put c2r_r_u16 1 C2R_CLASS_TEST
+  put c2r_r_u16 2 C2R_ALG_ED25519
+  put c2r_r_u16 3 C2R_EV_IR_CHECKED
+  for i ulong 320
+    put c2r_r_h i 0
+  end
+  for i ulong 64
+    put c2r_r_sig i 0
+  end
+  rc = c2m_judge 3 true
+  if ne rc 0
+    ret rc
+  end
+  for i ulong 32
+    put c2r_r_h add C2RH_PROG i get c2m_ir_sha i
+  end
+  tmp = new uchar 32 0
+  if ne c2m_file_sha_arg 4 tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_r_h add C2RH_EXE i get tmp i
+  end
+  orc = c2m_rcpt_issue_opts
+  if ne orc 0
+    ret orc
+  end
+  if ge c2m_opt 3 c2m_o_lrat 0
+    lrc = c2m_rcpt_issue_lrat
+    if ne lrc 0
+      ret lrc
+    end
+  end
+  ret c2m_rcpt_issue_finish ulong tgt_i dir_i drf_i
+end
+
+fn c2m_read_rcpt idx ulong to int
+  n = c2m_slurp_arg idx
+  if lt n 0
+    ret 2
+  end
+  un = ulong n
+  if ne un C2R_SIZE
+    ret 1
+  end
+  for i ulong C2R_SIZE
+    put c2r_buf i get c2m_fbuf i
+  end
+  if ne c2r_decode C2R_SIZE C2R_OK
+    ret 1
+  end
+  ret 0
+end
+
+fn c2m_rcpt_tbs to int
+  if lt get c2m_argc 0 5
+    ret 2
+  end
+  rc = c2m_read_rcpt 3
+  if ne rc 0
+    ret rc
+  end
+  c2r_signed_message
+  for i ulong C2R_SIGNED_MSG_LEN
+    put c2m_fbuf i get c2r_msg i
+  end
+  ol = get c2m_arglen 4
+  obase = mul 4 C2M_ARG_STRIDE
+  for i ulong ol bound 512
+    put c2m_path i get c2m_args add obase i
+  end
+  if ne c2m_write_new_path ol C2R_SIGNED_MSG_LEN 0
+    ret 2
+  end
+  ret 0
+end
+
+fn c2m_rcpt_attach to int
+  if lt get c2m_argc 0 5
+    ret 2
+  end
+  dir_i = c2m_opt 3 c2m_o_outdir
+  if lt dir_i 0
+    ret 2
+  end
+  rc = c2m_read_rcpt 3
+  if ne rc 0
+    ret rc
+  end
+  if ne get c2r_r_u16 1 C2R_CLASS_OWNER
+    ret 1
+  end
+  ns = c2m_slurp_arg 4
+  if lt ns 0
+    ret 2
+  end
+  if ne ns 64
+    ret 2
+  end
+  c2r_init_keys
+  opk = new uchar 32 0
+  sg = new uchar 64 0
+  for i ulong 32
+    put opk i get c2r_owner_root_pk i
+  end
+  for i ulong 64
+    put sg i get c2m_fbuf i
+  end
+  e = c2r_attach opk sg
+  if ne e C2R_OK
+    ret 1
+  end
+  ret c2m_store ulong dir_i
+end
+
+fn c2m_rcpt_verify_pol_lists to int
+  tmp = new uchar 32 0
+  nchk = ulong 1
+  nid = ulong 0
+  nkey = ulong 0
+  ac = get c2m_argc 0
+  i = ulong 3
+  while lt add i 1 ac bound 128
+    if c2m_arg_eq i c2m_o_acc_c
+      if ge nchk 16
+        ret 2
+      end
+      if not c2m_unhex32_arg add i 1 tmp
+        ret 2
+      end
+      base = mul nchk 32
+      for k ulong 32
+        put c2r_pol_chk add base k get tmp k
+      end
+      nchk = add nchk 1
+    end
+    if c2m_arg_eq i c2m_o_rev_id
+      if ge nid 16
+        ret 2
+      end
+      if not c2m_unhex32_arg add i 1 tmp
+        ret 2
+      end
+      base = mul nid 32
+      for k ulong 32
+        put c2r_pol_rev_id add base k get tmp k
+      end
+      nid = add nid 1
+    end
+    if c2m_arg_eq i c2m_o_rev_k
+      if ge nkey 16
+        ret 2
+      end
+      if not c2m_unhex32_arg add i 1 tmp
+        ret 2
+      end
+      base = mul nkey 32
+      for k ulong 32
+        put c2r_pol_rev_key add base k get tmp k
+      end
+      nkey = add nkey 1
+    end
+    i = add i 1
+  end
+  put c2r_pol_nchk 0 nchk
+  put c2r_pol_nrev_id 0 nid
+  put c2r_pol_nrev_key 0 nkey
+  ret 0
+end
+
+fn c2m_rcpt_verify_pol to int
+  allow_t = c2m_flag 3 c2m_o_allow_t
+  if and allow_t c2m_flag 3 c2m_o_production
+    ret 2
+  end
+  c2r_init_keys
+  if allow_t
+    put c2r_pol_prod 0 0
+    put c2r_pol_ntest 0 1
+    for i ulong 32
+      put c2r_pol_test i get c2r_test_pk i
+    end
+  else
+    put c2r_pol_prod 0 1
+    put c2r_pol_ntest 0 0
+  end
+  put c2r_pol_nowner 0 1
+  for i ulong 32
+    put c2r_pol_owner i get c2r_owner_root_pk i
+  end
+  tmp = new uchar 32 0
+  c2m_checker_id tmp
+  for i ulong 32
+    put c2r_pol_chk i get tmp i
+  end
+  if ne c2m_rcpt_verify_pol_lists 0
+    ret 2
+  end
+  ep_i = c2m_opt 3 c2m_o_epoch
+  if lt ep_i 0
+    ret 2
+  end
+  uv = new ulong 1 0
+  if not c2m_parse_u64 ulong ep_i uv
+    ret 2
+  end
+  put c2r_pol_cur 0 get uv 0
+  put c2r_pol_floor 0 0
+  fl_i = c2m_opt 3 c2m_o_floor
+  if ge fl_i 0
+    if not c2m_parse_u64 ulong fl_i uv
+      ret 2
+    end
+    put c2r_pol_floor 0 get uv 0
+  end
+  ret 0
+end
+
+fn c2m_rcpt_verify_ex to int
+  tgt_i = c2m_opt 3 c2m_o_target
+  if lt tgt_i 0
+    ret 2
+  end
+  for i ulong 7
+    put c2r_ex_has i 1
+  end
+  tl = get c2m_arglen ulong tgt_i
+  tb = new uchar 512 0
+  tbase = mul ulong tgt_i C2M_ARG_STRIDE
+  for i ulong tl bound 512
+    put tb i get c2m_args add tbase i
+  end
+  tmp = new uchar 32 0
+  c2r_target_id tb tl tmp
+  for i ulong 32
+    put c2r_ex_h i get tmp i
+  end
+  rc = c2m_judge 4 true
+  if ne rc 0
+    ret rc
+  end
+  for i ulong 32
+    put c2r_ex_h add 64 i get c2m_ir_sha i
+  end
+  if ne c2m_file_sha_arg 5 tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_ex_h add 96 i get tmp i
+  end
+  if ne c2m_opt_sha 3 c2m_o_fw tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_ex_h add 32 i get tmp i
+  end
+  if ne c2m_opt_sha 3 c2m_o_prod tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_ex_h add 128 i get tmp i
+  end
+  if ne c2m_collect_deps 3 tmp 0
+    ret 2
+  end
+  for i ulong 32
+    put c2r_ex_h add 160 i get tmp i
+  end
+  ret 0
+end
+
+fn c2m_rcpt_verify_lrat ev ulong to int
+  cnt_a = new ulong 1 0
+  lrc = c2m_lrat_requirements 3 4 cnt_a
+  if ne lrc 0
+    c2m_out_reset
+    c2m_out_txt c2m_s_lr_fail
+    c2m_flush 1
+    ret lrc
+  end
+  if ne ev C2R_EV_IR_CHECKED_LRAT
+    c2m_out_reset
+    c2m_out_txt c2m_s_lr_nc
+    c2m_flush 1
+    ret 1
+  end
+  if eq get cnt_a 0 0
+    c2m_out_reset
+    c2m_out_txt c2m_s_lr_req
+    c2m_flush 1
+    ret 1
+  end
+  same = true
+  for i ulong 32
+    if ne get c2m_req_sha i get c2r_r_h add C2RH_REQ i
+      same = false
+    end
+  end
+  if not same
+    c2m_out_reset
+    c2m_out_txt c2m_s_lr_mis
+    c2m_flush 1
+    ret 1
+  end
+  ret 0
+end
+
+fn c2m_rcpt_verify to int
+  if lt get c2m_argc 0 6
+    ret 2
+  end
+  prc = c2m_rcpt_verify_pol
+  if ne prc 0
+    ret prc
+  end
+  erc = c2m_rcpt_verify_ex
+  if ne erc 0
+    ret erc
+  end
+  n = c2m_slurp_arg 3
+  if lt n 0
+    ret 2
+  end
+  un = ulong n
+  if eq un C2R_SIZE
+    for i ulong C2R_SIZE
+      put c2r_buf i get c2m_fbuf i
+    end
+  end
+  e = c2r_verify un
+  if ne e C2R_OK
+    c2r_reason e
+    c2m_out_reset
+    c2m_out_txt c2m_s_rcpt_eq
+    rl = get c2r_rsn_len 0
+    for i ulong rl bound 64
+      c2m_out_ch get c2r_rsn_buf i
+    end
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 1
+  end
+  ev = get c2r_r_u16 3
+  if or eq ev C2R_EV_IR_CHECKED_LRAT ge c2m_opt 3 c2m_o_lrat 0
+    lrc = c2m_rcpt_verify_lrat ev
+    if ne lrc 0
+      ret lrc
+    end
+  end
+  c2m_out_reset
+  c2m_out_txt c2m_s_valid
+  c2m_flush 1
+  ret 0
+end
+
+fn c2m_usage to int
+  c2m_out_reset
+  c2m_out_txt c2m_s_usage
+  c2m_flush 2
+  ret 2
+end
+
+fn main to int
+  cid = new uchar 32 0
+  c2m_load_args
+  ac = get c2m_argc 0
+  if lt ac 2
+    ret c2m_usage
+  end
+  if c2m_arg_eq 1 c2m_t_ver
+    c2m_checker_id cid
+    c2m_out_reset
+    c2m_out_txt c2m_ver_str
+    c2m_out_txt c2m_s_srcsha
+    c2m_out_txt c2_sources_sha256
+    c2m_out_txt c2m_s_chkid
+    c2m_out_hex cid 32
+    c2m_out_ch 10
+    c2m_flush 1
+    ret 0
+  end
+  if and c2m_arg_eq 1 c2m_t_pcnf eq ac 5
+    ret c2m_cmd_prove_cnf
+  end
+  if and c2m_arg_eq 1 c2m_t_pchk eq ac 5
+    ret c2m_cmd_prove_check
+  end
+  if and c2m_arg_eq 1 c2m_t_check eq ac 3
+    ret c2m_judge 2 false
+  end
+  if and c2m_arg_eq 1 c2m_t_rcpt ge ac 3
+    if c2m_arg_eq 2 c2m_t_issue
+      ret c2m_rcpt_issue
+    end
+    if c2m_arg_eq 2 c2m_t_tbs
+      ret c2m_rcpt_tbs
+    end
+    if c2m_arg_eq 2 c2m_t_attach
+      ret c2m_rcpt_attach
+    end
+    if c2m_arg_eq 2 c2m_t_verify
+      ret c2m_rcpt_verify
+    end
+  end
+  ret c2m_usage
+end

@@ -46,15 +46,19 @@
  * disagree on at least one input, so the comparison can tell the operations apart.
  *
  * AArch64 Linux only (the documented native ABI); the harness refuses to run elsewhere.
- * Usage: test_c2_blast_native <work-dir>   (written by tests/checker2/blast_native.sh) */
+ * Kept in minimal C solely because it maps oscc's AArch64 code executable (mmap/mprotect
+ * PROT_READ|PROT_EXEC) and catches runtime traps via sigsetjmp/siglongjmp, which OM-2 does not
+ * expose. Links zero checker2 C sources: invokes the pure OM-2 `checker2 prove-cnf` binary.
+ * Usage: test_c2_blast_native <checker2-bin> <work-dir>   (written by tests/checker2/blast_native.sh) */
 #include <dirent.h>
 #include <setjmp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-
-#include "c2_blast.h"
+#include <sys/wait.h>
+#include <unistd.h>
 
 #if !defined(__aarch64__) || !defined(__linux__)
 int main(void)
@@ -66,8 +70,144 @@ int main(void)
 
 #define TRAP_REQUIRES 9
 #define TRAP_ENSURES 10
+enum { S_VOID = 0, S_BOOL = 1, S_U8 = 2, S_U16 = 3, S_U32 = 4, S_U64 = 5, S_I8 = 6, S_I16 = 7, S_I32 = 8, S_I64 = 9 };
 
+typedef struct {
+    int nvars, nclauses;
+    int *start;
+    int32_t *lits;
+} C2Cnf;
+
+typedef struct {
+    char name[64];
+    int nparams;
+    uint8_t param_s[6];
+} MiniFunc;
+
+static const char *g_checker2;
 static int fails;
+
+static void c2_cnf_free(C2Cnf *c)
+{
+    free(c->start);
+    free(c->lits);
+    memset(c, 0, sizeof *c);
+}
+
+static uint16_t rd16(const uint8_t *b, size_t *p) { uint16_t v = (uint16_t)(b[*p] | ((uint16_t)b[*p + 1] << 8)); *p += 2; return v; }
+
+static int skip_type(const uint8_t *b, size_t n, size_t *p, uint8_t *out_s)
+{
+    if (*p >= n) return -1;
+    uint8_t s = b[(*p)++];
+    if (out_s) *out_s = s;
+    if (s == 10) { /* S_REF */
+        if (*p + 4 > n) return -1;
+        uint8_t el = b[*p + 1];
+        *p += 4;
+        if (el == 0) {
+            if (*p >= n) return -1;
+            (*p)++;
+        }
+    }
+    return 0;
+}
+
+/* Read minimal signature of function 0 from canonical OSC IR (nfuncs == 1). */
+static int ir_read_fn0(const uint8_t *b, size_t n, MiniFunc *f)
+{
+    memset(f, 0, sizeof *f);
+    if (n < 10 || memcmp(b, "OSC1IR", 6) != 0 || b[6] != 0) return -1;
+    uint8_t ver = b[7];
+    if (ver < 1 || ver > 5) return -1;
+    size_t p = 8;
+    if (ver >= 2) {
+        if (p >= n) return -1;
+        uint8_t ns = b[p++];
+        for (uint8_t s = 0; s < ns; s++) {
+            if (p >= n) return -1;
+            uint8_t nl = b[p++];
+            if (p + nl + 3 > n) return -1;
+            p += nl;
+            uint8_t nfl = b[p++];
+            p += 2; /* ncells u16 */
+            for (uint8_t k = 0; k < nfl; k++) {
+                if (p >= n) return -1;
+                uint8_t fl = b[p++];
+                if (p + fl + 5 > n) return -1;
+                p += fl + 5;
+            }
+        }
+    }
+    if (p + 2 > n) return -1;
+    uint16_t nf = rd16(b, &p);
+    if (nf != 1) return -1;
+    if (p >= n) return -1;
+    uint8_t nl = b[p++];
+    if (nl >= sizeof f->name || p + nl + 1 > n) return -1;
+    memcpy(f->name, b + p, nl);
+    f->name[nl] = 0;
+    p += nl;
+    uint8_t np = b[p++];
+    if (skip_type(b, n, &p, NULL)) return -1;
+    if (p + 2 > n) return -1;
+    uint16_t nv = rd16(b, &p);
+    if (np > 6 || np > nv) return -1;
+    f->nparams = np;
+    for (int i = 0; i < np; i++)
+        if (skip_type(b, n, &p, &f->param_s[i])) return -1;
+    return 0;
+}
+
+static int parse_dimacs(const char *path, C2Cnf *c)
+{
+    memset(c, 0, sizeof *c);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int nv = 0, nc = 0;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        if (line[0] == 'c' || line[0] == '\n') continue;
+        if (sscanf(line, "p cnf %d %d", &nv, &nc) == 2) break;
+        fclose(f);
+        return -1;
+    }
+    if (nv < 0 || nc < 0) { fclose(f); return -1; }
+    c->nvars = nv;
+    c->nclauses = nc;
+    c->start = malloc((size_t)(nc + 1) * sizeof *c->start);
+    size_t lcap = (size_t)nc * 4 + 16, nl = 0;
+    c->lits = malloc(lcap * sizeof *c->lits);
+    if (!c->start || !c->lits) { fclose(f); c2_cnf_free(c); return -1; }
+    for (int i = 0; i < nc; i++) {
+        c->start[i] = (int)nl;
+        for (;;) {
+            int lit = 0;
+            if (fscanf(f, "%d", &lit) != 1) { fclose(f); c2_cnf_free(c); return -1; }
+            if (nl == lcap) { lcap *= 2; c->lits = realloc(c->lits, lcap * sizeof *c->lits); }
+            c->lits[nl++] = lit;
+            if (lit == 0) break;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+static int run_prove_cnf(const char *ir_path, const char *fname, const char *cnf_path)
+{
+    unlink(cnf_path);
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        FILE *dn = fopen("/dev/null", "w");
+        if (dn) { dup2(fileno(dn), 1); dup2(fileno(dn), 2); fclose(dn); }
+        execl(g_checker2, g_checker2, "prove-cnf", ir_path, fname, cnf_path, (char *)NULL);
+        _exit(127);
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) < 0) return -1;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
 
 static uint8_t *slurp(const char *path, size_t *n)
 {
@@ -274,15 +414,15 @@ static void push(Vecs *vs, const uint64_t *x, int np)
     vs->n++;
 }
 
-static void vectors(const C2Func *f, int np, Vecs *vs)
+static void vectors(const MiniFunc *f, int np, Vecs *vs)
 {
     int bits = 0;
-    for (int i = 0; i < np; i++) bits += width(f->vt[i].s);
+    for (int i = 0; i < np; i++) bits += width(f->param_s[i]);
     uint64_t x[6] = {0};
     if (bits <= 16) {
         for (uint64_t a = 0; a < (1ULL << bits); a++) {
             int sh = 0;
-            for (int i = 0; i < np; i++) { int w = width(f->vt[i].s); x[i] = (a >> sh) & mask(w); sh += w; }
+            for (int i = 0; i < np; i++) { int w = width(f->param_s[i]); x[i] = (a >> sh) & mask(w); sh += w; }
             push(vs, x, np);
         }
         return;
@@ -290,7 +430,7 @@ static void vectors(const C2Func *f, int np, Vecs *vs)
     uint64_t e[6][80];
     int ne[6], idx[6] = {0};
     long combos = 1;
-    for (int i = 0; i < np; i++) { ne[i] = edges(f->vt[i].s, e[i]); combos *= ne[i]; }
+    for (int i = 0; i < np; i++) { ne[i] = edges(f->param_s[i], e[i]); combos *= ne[i]; }
     if (combos <= 20000)
         for (long c = 0; c < combos; c++) {
             long r = c;
@@ -301,7 +441,7 @@ static void vectors(const C2Func *f, int np, Vecs *vs)
         for (int i = 0; i < np; i++) {
             /* mix: sometimes an edge value, sometimes a uniform pattern */
             uint64_t r = rnd();
-            x[i] = (r & 3) == 0 ? e[i][(r >> 8) % (uint64_t)ne[i]] : rnd() & mask(width(f->vt[i].s));
+            x[i] = (r & 3) == 0 ? e[i][(r >> 8) % (uint64_t)ne[i]] : rnd() & mask(width(f->param_s[i]));
         }
         push(vs, x, np);
     }
@@ -332,33 +472,32 @@ static void note(Stat *st, const char *what, const uint64_t *x, int np, uint64_t
 /* compare the CNF of irfile with the code of codebase; value mode for op_* programs */
 static int compare(const char *dir, const char *irname, const char *codename, Stat *st)
 {
-    char p[1024], q[1024];
+    char p[1024], q[1024], cnfp[1024];
     memset(st, 0, sizeof *st);
     snprintf(p, sizeof p, "%s/%s.ir", dir, irname);
     size_t n;
     uint8_t *b = slurp(p, &n);
-    C2Unit *u = calloc(1, sizeof *u);
-    C2Verdict v;
-    if (!b || !u || c2_decode(b, n, u, &v) || c2_check_unit(u, &v) || u->nfuncs != 1) {
-        printf("FAIL %s: IR not accepted by checker2\n", irname);
+    MiniFunc mf;
+    if (!b || ir_read_fn0(b, n, &mf)) {
+        printf("FAIL %s: IR signature unreadable\n", irname);
         free(b);
-        free(u);
         return -1;
     }
     free(b);
+    snprintf(cnfp, sizeof cnfp, "%s/%s.cnf", dir, irname);
+    if (access(cnfp, R_OK) != 0 && run_prove_cnf(p, mf.name, cnfp)) {
+        printf("FAIL %s: not blasted by checker2 prove-cnf\n", irname);
+        return -1;
+    }
     C2Cnf cnf;
-    C2BlastInfo bi;
-    memset(&cnf, 0, sizeof cnf);
-    if (c2_blast_notrap(u, 0, &cnf, &bi)) {
-        printf("FAIL %s: not blasted (%s %s)\n", irname, bi.rule, bi.detail);
-        c2_unit_free(u);
-        free(u);
+    if (parse_dimacs(cnfp, &cnf)) {
+        printf("FAIL %s: cannot parse CNF %s\n", irname, cnfp);
         return -1;
     }
     Native nt;
     snprintf(p, sizeof p, "%s/%s.code", dir, codename);
     snprintf(q, sizeof q, "%s/%s.entries", dir, codename);
-    const C2Func *f = &u->fn[0];
+    const MiniFunc *f = &mf;
     int rc = -1;
     if (native_load(p, q, f->name, &nt)) {
         printf("FAIL %s: cannot load native code %s\n", irname, codename);
@@ -368,21 +507,23 @@ static int compare(const char *dir, const char *irname, const char *codename, St
     ev_init(&e, &cnf);
     int value_mode = strncmp(irname, "op_", 3) == 0;
     int np = f->nparams, nops = value_mode ? np - 1 : np;
-    uint8_t cs = f->vt[np - 1].s;
+    int inputs = 0;
+    for (int i = 0; i < np; i++) inputs += width(f->param_s[i]);
+    uint8_t cs = f->param_s[np - 1];
     int cw = width(cs);
     Vecs vs = {0};
     vectors(f, nops, &vs);
-    uint8_t *bits = malloc((size_t)bi.inputs + 1);
+    uint8_t *bits = malloc((size_t)inputs + 1);
     for (long i = 0; i < vs.n; i++) {
         uint64_t a[6], ret = 0, code = 0;
         int at = 0;
-        for (int k = 0; k < nops; k++) { a[k] = canon(vs.v[i][k], f->vt[k].s); put_bits(bits, &at, vs.v[i][k], width(f->vt[k].s)); }
+        for (int k = 0; k < nops; k++) { a[k] = canon(vs.v[i][k], f->param_s[k]); put_bits(bits, &at, vs.v[i][k], width(f->param_s[k])); }
         st->vectors++;
         if (!value_mode) {
             int t = native_run(&nt, a, np, &ret, &code);
             int native_trap = t && code != TRAP_REQUIRES;
             st->native_traps += native_trap;
-            int s = ev_sat(&e, bits, bi.inputs);
+            int s = ev_sat(&e, bits, inputs);
             if (s < 0) { st->undetermined++; continue; }
             if (s != native_trap) note(st, native_trap ? "code traps, CNF holds" : "CNF traps, code holds", vs.v[i], nops, code);
             continue;
@@ -404,7 +545,7 @@ static int compare(const char *dir, const char *irname, const char *codename, St
         for (int j = 0; j < 2; j++) {
             int at2 = at;
             put_bits(bits, &at2, cvals[j], cw);
-            int s = ev_sat(&e, bits, bi.inputs);
+            int s = ev_sat(&e, bits, inputs);
             if (s < 0) { st->undetermined++; continue; }
             if (s != want[j])
                 note(st, optrap ? "code traps, CNF does not" : (j ? "CNF disagrees: traps at c = r^1" : "CNF disagrees: no trap at c = r"),
@@ -418,8 +559,6 @@ static int compare(const char *dir, const char *irname, const char *codename, St
     rc = 0;
 out:
     c2_cnf_free(&cnf);
-    c2_unit_free(u);
-    free(u);
     return rc;
 }
 
@@ -427,8 +566,9 @@ static int by_name(const void *a, const void *b) { return strcmp(*(char *const *
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) { fprintf(stderr, "usage: test_c2_blast_native <work-dir>\n"); return 2; }
-    const char *dir = argv[1];
+    if (argc != 3) { fprintf(stderr, "usage: test_c2_blast_native <checker2-bin> <work-dir>\n"); return 2; }
+    g_checker2 = argv[1];
+    const char *dir = argv[2];
     for (unsigned i = 0; i < sizeof rt_table / sizeof *rt_table; i++) rt_table[i] = (void *)rt_entry;
     DIR *d = opendir(dir);
     if (!d) { printf("FAIL cannot open %s\n", dir); return 1; }

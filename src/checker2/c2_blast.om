@@ -1,0 +1,939 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note src/checker2/c2_blast.om: symbolic bit-blaster for bounded integer OSC IR (pure seeded OM-2).
+note Compose after: c2_om2_hdr.om, src/checker2/c2_ir.om, src/checker2/c2_check.om, src/checker2/c2_lrat.om
+
+const C2_BLAST_MAX_PATHS ulong 4096
+const C2_BLAST_MAX_STEPS ulong 4000000
+const C2_BL_T int 1
+const C2_BL_F int -1
+const C2_BL_MAXW ulong 128
+const C2_BL_POOL_CAP ulong 16777216
+const C2_BL_BAD_CAP ulong 65536
+
+note Blaster state globals
+global c2_bl_nvars ulong 1
+global c2_bl_oom ulong 1
+global c2_bl_fi ulong 1
+global c2_bl_steps ulong 1
+global c2_bl_pool int 16777216
+global c2_bl_npool ulong 1
+global c2_bl_bad int 65536
+global c2_bl_nbad ulong 1
+
+note Path stack (up to 4097 states * 480 vregs)
+global c2_bl_stk_blk ulong 4097
+global c2_bl_stk_grd int 4097
+global c2_bl_stk_reg ulong 1966560
+global c2_bl_sp ulong 1
+
+note Current active path state
+global c2_bl_cur_blk ulong 1
+global c2_bl_cur_grd int 1
+global c2_bl_cur_reg ulong 480
+
+note Scratch bit-vector arrays (128+1 ints)
+global c2_bl_tmp0 int 129
+global c2_bl_tmp1 int 129
+global c2_bl_tmp2 int 129
+global c2_bl_tmp3 int 129
+
+note BlastInfo output globals
+global c2_bi_inputs ulong 1
+global c2_bi_paths ulong 1
+global c2_bi_traps ulong 1
+global c2_bi_rule uchar 64
+global c2_bi_rulelen ulong 1
+global c2_bi_detail uchar 160
+global c2_bi_detaillen ulong 1
+
+text c2b_prop "no-trap-except-requires"
+text c2b_ok "BLAST-OK"
+text c2b_rej "BLAST-UNIT-REJECTED"
+text c2b_nofn "BLAST-NO-FUNCTION"
+text c2b_res "BLAST-RESOURCE"
+text c2b_big "BLAST-TOO-LARGE"
+text c2b_unsup "BLAST-UNSUPPORTED"
+text c2b_d_nonsc "register is not a scalar"
+text c2b_d_oom "out of memory"
+text c2b_d_steps "too many steps"
+text c2b_d_paths "too many paths"
+text c2b_d_shr "SHR on a signed operand"
+text c2b_d_bin "unsupported binary op"
+text c2b_d_op "unsupported opcode"
+text c2b_d_fall "block falls through"
+
+fn c2b_refuse rule view uchar * det view uchar * to long
+  rn = len rule
+  for i ulong rn bound 64
+    put c2_bi_rule i get rule i
+  end
+  put c2_bi_rulelen 0 rn
+  dn = len det
+  if gt dn 159
+    dn = 159
+  end
+  for i ulong dn bound 160
+    put c2_bi_detail i get det i
+  end
+  put c2_bi_detaillen 0 dn
+  ret -1
+end
+
+fn c2b_newvar to int
+  v = add get c2_bl_nvars 0 1
+  put c2_bl_nvars 0 v
+  ret int v
+end
+
+fn c2b_cl1 a int to void
+  l = new int 4 0
+  put l 0 a
+  if ne c2_cnf_add l 1 0
+    put c2_bl_oom 0 1
+  end
+end
+
+fn c2b_cl2 a int b int to void
+  l = new int 4 0
+  put l 0 a
+  put l 1 b
+  if ne c2_cnf_add l 2 0
+    put c2_bl_oom 0 1
+  end
+end
+
+fn c2b_cl3 a int b int c int to void
+  l = new int 4 0
+  put l 0 a
+  put l 1 b
+  put l 2 c
+  if ne c2_cnf_add l 3 0
+    put c2_bl_oom 0 1
+  end
+end
+
+fn c2b_neg x int to int
+  ret sub 0 x
+end
+
+fn c2b_and x int y int to int
+  if eq x C2_BL_F
+    ret C2_BL_F
+  end
+  if eq y C2_BL_F
+    ret C2_BL_F
+  end
+  if eq x c2b_neg y
+    ret C2_BL_F
+  end
+  if eq x C2_BL_T
+    ret y
+  end
+  if eq y C2_BL_T
+    ret x
+  end
+  if eq x y
+    ret x
+  end
+  v = c2b_newvar
+  c2b_cl2 c2b_neg v x
+  c2b_cl2 c2b_neg v y
+  c2b_cl3 v c2b_neg x c2b_neg y
+  ret v
+end
+
+fn c2b_or x int y int to int
+  ret c2b_neg c2b_and c2b_neg x c2b_neg y
+end
+
+fn c2b_xor x int y int to int
+  if eq x C2_BL_F
+    ret y
+  end
+  if eq y C2_BL_F
+    ret x
+  end
+  if eq x C2_BL_T
+    ret c2b_neg y
+  end
+  if eq y C2_BL_T
+    ret c2b_neg x
+  end
+  if eq x y
+    ret C2_BL_F
+  end
+  if eq x c2b_neg y
+    ret C2_BL_T
+  end
+  v = c2b_newvar
+  c2b_cl3 c2b_neg v x y
+  c2b_cl3 c2b_neg v c2b_neg x c2b_neg y
+  c2b_cl3 v c2b_neg x y
+  c2b_cl3 v x c2b_neg y
+  ret v
+end
+
+fn c2b_mux s int x int y int to int
+  if eq s C2_BL_T
+    ret x
+  end
+  if eq x y
+    ret x
+  end
+  if eq s C2_BL_F
+    ret y
+  end
+  ret c2b_or c2b_and s x c2b_and c2b_neg s y
+end
+
+fn c2b_alloc_val w ulong to ulong
+  sz = w
+  if eq sz 0
+    sz = 1
+  end
+  p = get c2_bl_npool 0
+  if gt add p sz C2_BL_POOL_CAP
+    put c2_bl_oom 0 1
+    ret 0
+  end
+  for i ulong sz bound 129
+    put c2_bl_pool add p i 0
+  end
+  put c2_bl_npool 0 add p sz
+  ret p
+end
+
+fn c2b_log2w w ulong to ulong
+  k = ulong 0
+  while lt shl ulong 1 k w bound 8
+    k = add k 1
+  end
+  ret k
+end
+
+note ---- Bit-vector operations (on pool offsets or tmp arrays) ----
+
+note Add pool[xo..xo+w) + tmp0[0..w) + cin -> pool[oo..oo+w), returns cout
+fn c2b_add_pt xo ulong cin int w ulong oo ulong to int
+  c = cin
+  for i ulong w bound 128
+    xi = get c2_bl_pool add xo i
+    yi = get c2_bl_tmp0 i
+    p = c2b_xor xi yi
+    g = c2b_and xi yi
+    put c2_bl_pool add oo i c2b_xor p c
+    c = c2b_or g c2b_and c p
+  end
+  ret c
+end
+
+note Add tmp0[0..w) + tmp1[0..w) + cin -> tmp0[0..w), returns cout
+fn c2b_add_tt cin int w ulong to int
+  c = cin
+  for i ulong w bound 128
+    xi = get c2_bl_tmp0 i
+    yi = get c2_bl_tmp1 i
+    p = c2b_xor xi yi
+    g = c2b_and xi yi
+    put c2_bl_tmp0 i c2b_xor p c
+    c = c2b_or g c2b_and c p
+  end
+  ret c
+end
+
+fn c2b_eq xo ulong yo ulong w ulong to int
+  r = C2_BL_T
+  for i ulong w bound 128
+    r = c2b_and r c2b_neg c2b_xor get c2_bl_pool add xo i get c2_bl_pool add yo i
+  end
+  ret r
+end
+
+note Unsigned x < y from tmp2[0..w) and tmp3[0..w)
+fn c2b_ult_t23 w ulong to int
+  c = C2_BL_T
+  for i ulong w bound 128
+    xi = get c2_bl_tmp2 i
+    yi = c2b_neg get c2_bl_tmp3 i
+    p = c2b_xor xi yi
+    g = c2b_and xi yi
+    c = c2b_or g c2b_and c p
+  end
+  ret c2b_neg c
+end
+
+fn c2b_ult xo ulong yo ulong w ulong to int
+  for i ulong w bound 128
+    put c2_bl_tmp2 i get c2_bl_pool add xo i
+    put c2_bl_tmp3 i get c2_bl_pool add yo i
+  end
+  ret c2b_ult_t23 w
+end
+
+fn c2b_slt xo ulong yo ulong w ulong to int
+  for i ulong w bound 128
+    put c2_bl_tmp2 i get c2_bl_pool add xo i
+    put c2_bl_tmp3 i get c2_bl_pool add yo i
+  end
+  top = sub w 1
+  put c2_bl_tmp2 top c2b_neg get c2_bl_tmp2 top
+  put c2_bl_tmp3 top c2b_neg get c2_bl_tmp3 top
+  ret c2b_ult_t23 w
+end
+
+note Multiply tmp2[0..w) * tmp3[0..w) -> tmp0[0..w)
+fn c2b_mul_t23 w ulong to void
+  for i ulong w bound 128
+    put c2_bl_tmp0 i C2_BL_F
+  end
+  for i ulong w bound 128
+    yi = get c2_bl_tmp3 i
+    for k ulong w bound 128
+      if lt k i
+        put c2_bl_tmp1 k C2_BL_F
+      else
+        put c2_bl_tmp1 k c2b_and yi get c2_bl_tmp2 sub k i
+      end
+    end
+    ign = c2b_add_tt C2_BL_F w
+  end
+end
+
+fn c2b_all_eq_t0 lo ulong hi ulong to int
+  r = C2_BL_T
+  ref = get c2_bl_tmp0 lo
+  i = add lo 1
+  while le i hi bound 128
+    r = c2b_and r c2b_neg c2b_xor get c2_bl_tmp0 i ref
+    i = add i 1
+  end
+  ret r
+end
+
+fn c2b_all_eq_pool xo ulong lo ulong hi ulong to int
+  r = C2_BL_T
+  ref = get c2_bl_pool add xo lo
+  i = add lo 1
+  while le i hi bound 128
+    r = c2b_and r c2b_neg c2b_xor get c2_bl_pool add xo i ref
+    i = add i 1
+  end
+  ret r
+end
+
+fn c2b_trap_if g int cond int to int
+  t = c2b_and g cond
+  if ne t C2_BL_F
+    nb = get c2_bl_nbad 0
+    if ge nb C2_BL_BAD_CAP
+      put c2_bl_oom 0 1
+      ret C2_BL_F
+    end
+    put c2_bl_bad nb t
+    put c2_bl_nbad 0 add nb 1
+  end
+  ret c2b_and g c2b_neg cond
+end
+
+note ---- Instruction blasting helpers ----
+
+fn c2b_shift_barrel sb uchar w ulong lg ulong wb ulong bo ulong to void
+  for j ulong lg bound 8
+    if ge j wb
+      break
+    end
+    sh = shl ulong 1 j
+    bj = get c2_bl_pool add bo j
+    for i ulong w bound 64
+      moved = C2_BL_F
+      if eq sb B_SHL
+        if ge i sh
+          moved = get c2_bl_tmp0 sub i sh
+        end
+      else
+        if lt add i sh w
+          moved = get c2_bl_tmp0 add i sh
+        end
+      end
+      put c2_bl_tmp1 i c2b_mux bj moved get c2_bl_tmp0 i
+    end
+    for i ulong w bound 64
+      put c2_bl_tmp0 i get c2_bl_tmp1 i
+    end
+  end
+end
+
+fn c2b_shl_ovf ao ulong bo ulong w ulong lg ulong to void
+  ovf = C2_BL_F
+  for i ulong sub w 1 bound 64
+    kk = add i 1
+    amt = C2_BL_T
+    for j ulong lg bound 8
+      bj = get c2_bl_pool add bo j
+      if ne and shr kk j 1 0
+        amt = c2b_and amt bj
+      else
+        amt = c2b_and amt c2b_neg bj
+      end
+    end
+    ae = c2b_all_eq_pool ao sub sub w 1 kk sub w 1
+    ovf = c2b_or ovf c2b_and amt c2b_neg ae
+  end
+  note GUARD:shl-overflow
+  put c2_bl_cur_grd 0 c2b_trap_if get c2_bl_cur_grd 0 ovf
+end
+
+fn c2b_shift_hi_bit bo ulong lg ulong wb ulong to int
+  hi_bit = C2_BL_F
+  k = lg
+  while lt k wb bound 64
+    hi_bit = c2b_or hi_bit get c2_bl_pool add bo k
+    k = add k 1
+  end
+  ret hi_bit
+end
+
+fn c2b_in_b_width idx ulong to ulong
+  bi = ulong get c2_in_b idx
+  vidx = add mul get c2_bl_fi 0 C2_MAX_VREGS bi
+  ret c2c_width get c2_vt_s vidx
+end
+
+fn c2b_do_shift idx ulong sg bool w ulong ro ulong to long
+  sb = get c2_in_sub idx
+  if and eq sb B_SHR sg
+    ret c2b_refuse c2b_unsup c2b_d_shr
+  end
+  wb = c2b_in_b_width idx
+  bo = get c2_bl_cur_reg ulong get c2_in_b idx
+  lg = c2b_log2w w
+  if true
+    hi_bit = c2b_shift_hi_bit bo lg wb
+    note GUARD:shift-range
+    put c2_bl_cur_grd 0 c2b_trap_if get c2_bl_cur_grd 0 hi_bit
+  end
+  ao = get c2_bl_cur_reg ulong get c2_in_a idx
+  for i ulong w bound 64
+    put c2_bl_tmp0 i get c2_bl_pool add ao i
+  end
+  c2b_shift_barrel sb w lg wb bo
+  for i ulong w bound 64
+    put c2_bl_pool add ro i get c2_bl_tmp0 i
+  end
+  if and eq sb B_SHL sg
+    c2b_shl_ovf ao bo w lg
+  end
+  ret 0
+end
+
+fn c2b_addsub_ovf ao ulong bo ulong sb uchar w ulong ro ulong to void
+  top = sub w 1
+  at_lit = get c2_bl_pool add ao top
+  bt_lit = get c2_bl_pool add bo top
+  xab = c2b_xor at_lit bt_lit
+  same = xab
+  if eq sb B_ADD
+    same = c2b_neg xab
+  end
+  ovf = c2b_and same c2b_xor get c2_bl_pool add ro top at_lit
+  note GUARD:add-sub-overflow
+  put c2_bl_cur_grd 0 c2b_trap_if get c2_bl_cur_grd 0 ovf
+end
+
+fn c2b_do_addsub ao ulong bo ulong sb uchar sg bool w ulong ro ulong to void
+  for k ulong w bound 64
+    bk = get c2_bl_pool add bo k
+    if eq sb B_SUB
+      put c2_bl_tmp0 k c2b_neg bk
+    else
+      put c2_bl_tmp0 k bk
+    end
+  end
+  cin = C2_BL_F
+  if eq sb B_SUB
+    cin = C2_BL_T
+  end
+  ign = c2b_add_pt ao cin w ro
+  if sg
+    c2b_addsub_ovf ao bo sb w ro
+  end
+end
+
+fn c2b_do_mul ao ulong bo ulong sg bool w ulong ro ulong to void
+  if not sg
+    for k ulong w bound 64
+      put c2_bl_tmp2 k get c2_bl_pool add ao k
+      put c2_bl_tmp3 k get c2_bl_pool add bo k
+    end
+    c2b_mul_t23 w
+    for k ulong w bound 64
+      put c2_bl_pool add ro k get c2_bl_tmp0 k
+    end
+    ret
+  end
+  w2 = mul w 2
+  for k ulong w2 bound 128
+    src = k
+    if ge src w
+      src = sub w 1
+    end
+    put c2_bl_tmp2 k get c2_bl_pool add ao src
+    put c2_bl_tmp3 k get c2_bl_pool add bo src
+  end
+  c2b_mul_t23 w2
+  for k ulong w bound 64
+    put c2_bl_pool add ro k get c2_bl_tmp0 k
+  end
+  ovf = c2b_neg c2b_all_eq_t0 sub w 1 sub w2 1
+  note GUARD:mul-overflow
+  put c2_bl_cur_grd 0 c2b_trap_if get c2_bl_cur_grd 0 ovf
+end
+
+fn c2b_do_bitwise ao ulong bo ulong sb uchar w ulong ro ulong to void
+  for k ulong w bound 64
+    av = get c2_bl_pool add ao k
+    bv = get c2_bl_pool add bo k
+    rv = C2_BL_F
+    if eq sb B_AND
+      rv = c2b_and av bv
+    else
+      if eq sb B_OR
+        rv = c2b_or av bv
+      else
+        rv = c2b_xor av bv
+      end
+    end
+    put c2_bl_pool add ro k rv
+  end
+end
+
+fn c2b_do_bin idx ulong tds uchar w ulong ro ulong to long
+  ao = get c2_bl_cur_reg ulong get c2_in_a idx
+  bo = get c2_bl_cur_reg ulong get c2_in_b idx
+  sg = c2c_is_signed tds
+  sb = get c2_in_sub idx
+  if or eq sb B_ADD eq sb B_SUB
+    c2b_do_addsub ao bo sb sg w ro
+    ret 0
+  end
+  if eq sb B_MUL
+    c2b_do_mul ao bo sg w ro
+    ret 0
+  end
+  if or eq sb B_AND or eq sb B_OR eq sb B_XOR
+    c2b_do_bitwise ao bo sb w ro
+    ret 0
+  end
+  if or eq sb B_SHL eq sb B_SHR
+    ret c2b_do_shift idx sg w ro
+  end
+  ret c2b_refuse c2b_unsup c2b_d_bin
+end
+
+fn c2b_do_un idx ulong tds uchar w ulong ro ulong to void
+  ao = get c2_bl_cur_reg ulong get c2_in_a idx
+  sb = get c2_in_sub idx
+  if eq sb U_NEG
+    for k ulong w bound 64
+      put c2_bl_tmp0 k C2_BL_F
+      put c2_bl_tmp1 k c2b_neg get c2_bl_pool add ao k
+    end
+    ign = c2b_add_tt C2_BL_T w
+    for k ulong w bound 64
+      put c2_bl_pool add ro k get c2_bl_tmp0 k
+    end
+    if c2c_is_signed tds
+      mn = get c2_bl_pool add ao sub w 1
+      for k ulong sub w 1 bound 64
+        mn = c2b_and mn c2b_neg get c2_bl_pool add ao k
+      end
+      note GUARD:neg-overflow
+      put c2_bl_cur_grd 0 c2b_trap_if get c2_bl_cur_grd 0 mn
+    end
+    ret
+  end
+  if eq sb U_BNOT
+    for k ulong w bound 64
+      put c2_bl_pool add ro k c2b_neg get c2_bl_pool add ao k
+    end
+    ret
+  end
+  put c2_bl_pool ro c2b_neg get c2_bl_pool ao
+end
+
+fn c2b_do_cmp idx ulong tas uchar ro ulong to void
+  ao = get c2_bl_cur_reg ulong get c2_in_a idx
+  bo = get c2_bl_cur_reg ulong get c2_in_b idx
+  wa = c2c_width tas
+  sg = c2c_is_signed tas
+  clt = C2_BL_F
+  cgt = C2_BL_F
+  if sg
+    clt = c2b_slt ao bo wa
+    cgt = c2b_slt bo ao wa
+  else
+    clt = c2b_ult ao bo wa
+    cgt = c2b_ult bo ao wa
+  end
+  ceq = c2b_eq ao bo wa
+  sb = get c2_in_sub idx
+  c = c2b_neg clt
+  if eq sb CC_EQ
+    c = ceq
+  end
+  if eq sb CC_NE
+    c = c2b_neg ceq
+  end
+  if eq sb CC_LT
+    c = clt
+  end
+  if eq sb CC_LE
+    c = c2b_neg cgt
+  end
+  if eq sb CC_GT
+    c = cgt
+  end
+  put c2_bl_pool ro c
+end
+
+fn c2b_cast_ext ao ulong ws ulong ww ulong sga bool to void
+  sign_bit = get c2_bl_pool add ao sub ws 1
+  for k ulong ww bound 129
+    if lt k ws
+      put c2_bl_tmp0 k get c2_bl_pool add ao k
+    else
+      if sga
+        put c2_bl_tmp0 k sign_bit
+      else
+        put c2_bl_tmp0 k C2_BL_F
+      end
+    end
+  end
+end
+
+fn c2b_do_cast idx ulong tas uchar tds uchar wt ulong ro ulong to void
+  ao = get c2_bl_cur_reg ulong get c2_in_a idx
+  ws = c2c_width tas
+  ww = ws
+  if gt wt ww
+    ww = wt
+  end
+  ww = add ww 1
+  c2b_cast_ext ao ws ww c2c_is_signed tas
+  if true
+    fill = C2_BL_F
+    if c2c_is_signed tds
+      fill = get c2_bl_tmp0 sub wt 1
+    end
+    fits = C2_BL_T
+    k = wt
+    while lt k ww bound 129
+      fits = c2b_and fits c2b_neg c2b_xor get c2_bl_tmp0 k fill
+      k = add k 1
+    end
+    note GUARD:cast-range
+    put c2_bl_cur_grd 0 c2b_trap_if get c2_bl_cur_grd 0 c2b_neg fits
+  end
+  for i ulong wt bound 64
+    put c2_bl_pool add ro i get c2_bl_tmp0 i
+  end
+end
+
+fn c2b_do_cbr idx ulong nv ulong to long
+  c = get c2_bl_pool get c2_bl_cur_reg ulong get c2_in_a idx
+  grd = get c2_bl_cur_grd 0
+  gt_g = c2b_and grd c
+  gf_g = c2b_and grd c2b_neg c
+  if and ne gt_g C2_BL_F ne gf_g C2_BL_F
+    if ge get c2_bi_paths 0 C2_BLAST_MAX_PATHS
+      ret c2b_refuse c2b_big c2b_d_paths
+    end
+    sp = get c2_bl_sp 0
+    put c2_bl_stk_blk sp ulong get c2_in_f idx
+    put c2_bl_stk_grd sp gf_g
+    rbase = mul sp C2_MAX_VREGS
+    for r ulong nv bound 480
+      put c2_bl_stk_reg add rbase r get c2_bl_cur_reg r
+    end
+    put c2_bl_sp 0 add sp 1
+    put c2_bi_paths 0 add get c2_bi_paths 0 1
+  end
+  if and eq gt_g C2_BL_F eq gf_g C2_BL_F
+    ret 1
+  end
+  if ne gt_g C2_BL_F
+    put c2_bl_cur_blk 0 ulong get c2_in_t idx
+    put c2_bl_cur_grd 0 gt_g
+  else
+    put c2_bl_cur_blk 0 ulong get c2_in_f idx
+    put c2_bl_cur_grd 0 gf_g
+  end
+  ret 0
+end
+
+fn c2b_do_val_op idx ulong op uchar vbase ulong to long
+  is_val = eq op C2_CONST
+  if eq op C2_BIN
+    is_val = true
+  end
+  if eq op C2_UN
+    is_val = true
+  end
+  if eq op C2_CMP
+    is_val = true
+  end
+  if eq op C2_CAST
+    is_val = true
+  end
+  if not is_val
+    ret c2b_refuse c2b_unsup c2b_d_op
+  end
+  d = ulong get c2_in_dst idx
+  tds = get c2_vt_s add vbase d
+  w = c2c_width tds
+  ro = c2b_alloc_val w
+  if ne get c2_bl_oom 0 0
+    ret c2b_refuse c2b_res c2b_d_oom
+  end
+  if eq op C2_CONST
+    imm = get c2_in_imm idx
+    for j ulong w bound 64
+      if ne and shr imm j 1 0
+        put c2_bl_pool add ro j C2_BL_T
+      else
+        put c2_bl_pool add ro j C2_BL_F
+      end
+    end
+  else
+    if eq op C2_BIN
+      if ne c2b_do_bin idx tds w ro 0
+        ret -1
+      end
+    else
+      if eq op C2_UN
+        c2b_do_un idx tds w ro
+      else
+        if eq op C2_CMP
+          tas = get c2_vt_s add vbase ulong get c2_in_a idx
+          c2b_do_cmp idx tas ro
+        else
+          if eq op C2_CAST
+            tas = get c2_vt_s add vbase ulong get c2_in_a idx
+            c2b_do_cast idx tas tds w ro
+          else
+            ret c2b_refuse c2b_unsup c2b_d_op
+          end
+        end
+      end
+    end
+  end
+  put c2_bl_cur_reg d ro
+  ret 0
+end
+
+note Step one instruction: 2 = continue block, 1 = jumped to next block, 0 = path ended, -1 = error
+fn c2b_step_insn fi ulong nv ulong idx ulong to long
+  st = add get c2_bl_steps 0 1
+  put c2_bl_steps 0 st
+  if gt st C2_BLAST_MAX_STEPS
+    ret c2b_refuse c2b_big c2b_d_steps
+  end
+  if ne get c2_bl_oom 0 0
+    ret c2b_refuse c2b_res c2b_d_oom
+  end
+  op = get c2_in_op idx
+  if eq op C2_MOV
+    mv_v = get c2_bl_cur_reg ulong get c2_in_a idx
+    put c2_bl_cur_reg ulong get c2_in_dst idx mv_v
+    ret 2
+  end
+  if eq op C2_TRAP
+    if ne get c2_in_imm idx 9
+      note GUARD:trap-insn
+      ign = c2b_trap_if get c2_bl_cur_grd 0 C2_BL_T
+    end
+    ret 0
+  end
+  if eq op C2_RET
+    ret 0
+  end
+  if eq op C2_BR
+    put c2_bl_cur_blk 0 ulong get c2_in_t idx
+    ret 1
+  end
+  if eq op C2_CBR
+    cr = c2b_do_cbr idx nv
+    if lt cr 0
+      ret -1
+    end
+    if gt cr 0
+      ret 0
+    end
+    ret 1
+  end
+  if ne c2b_do_val_op idx op mul fi C2_MAX_VREGS 0
+    ret -1
+  end
+  if eq get c2_bl_cur_grd 0 C2_BL_F
+    ret 0
+  end
+  ret 2
+end
+
+note Run one basic block: returns 0 = path ended, 1 = jumped to next block, -1 = error
+fn c2b_run_block fi ulong nv ulong to long
+  bidx = add mul fi C2_MAX_BLOCKS get c2_bl_cur_blk 0
+  fst = ulong get c2_blk_first bidx
+  cnt = ulong get c2_blk_count bidx
+  ibase = mul fi C2_MAX_INSNS
+  for k ulong cnt bound 4096
+    rc = c2b_step_insn fi nv add ibase add fst k
+    if ne rc 2
+      ret rc
+    end
+  end
+  ret c2b_refuse c2b_unsup c2b_d_fall
+end
+
+fn c2b_run_path to long
+  fi = get c2_bl_fi 0
+  nv = ulong get c2_fn_nvregs fi
+  while true bound 4000001
+    rc = c2b_run_block fi nv
+    if le rc 0
+      ret rc
+    end
+  end
+  ret 0
+end
+
+fn c2_func_index name view uchar * nlen ulong to long
+  nf = get c2_nfuncs 0
+  for i ulong nf bound 32
+    fl = ulong get c2_fn_namelen i
+    if eq fl nlen
+      base = mul i 64
+      eq_s = true
+      for k ulong fl bound 64
+        if ne get c2_fn_name add base k get name k
+          eq_s = false
+        end
+      end
+      if eq_s
+        ret long i
+      end
+    end
+  end
+  ret -1
+end
+
+fn c2_blast_notrap fi long to long
+  c2_cnf_reset
+  put c2_bi_inputs 0 0
+  put c2_bi_paths 0 0
+  put c2_bi_traps 0 0
+  rn = len c2b_ok
+  for i ulong rn bound 64
+    put c2_bi_rule i get c2b_ok i
+  end
+  put c2_bi_rulelen 0 rn
+  put c2_bi_detaillen 0 0
+  if ne c2_check_unit 0
+    ign = c2b_refuse c2b_rej c2b_d_op
+    vl = get c2_v_rulelen 0
+    for i ulong vl bound 64
+      put c2_bi_detail i get c2_v_rule i
+    end
+    put c2_bi_detaillen 0 vl
+    ret -1
+  end
+  if lt fi 0
+    ign = c2b_refuse c2b_nofn c2b_d_op
+    put c2_bi_detaillen 0 0
+    ret -1
+  end
+  if ge ulong fi get c2_nfuncs 0
+    ign = c2b_refuse c2b_nofn c2b_d_op
+    put c2_bi_detaillen 0 0
+    ret -1
+  end
+  ufi = ulong fi
+  put c2_bl_fi 0 ufi
+  put c2_bl_nvars 0 1
+  put c2_bl_oom 0 0
+  put c2_bl_steps 0 0
+  put c2_bl_npool 0 0
+  put c2_bl_nbad 0 0
+  put c2_bl_sp 0 0
+  nv = ulong get c2_fn_nvregs ufi
+  np = ulong get c2_fn_nparams ufi
+  vbase = mul ufi C2_MAX_VREGS
+  for r ulong nv bound 480
+    s = get c2_vt_s add vbase r
+    bad_sc = false
+    note GUARD:blast-scalar-only
+    bad_sc = not c2c_is_value s
+    if bad_sc
+      ret c2b_refuse c2b_unsup c2b_d_nonsc
+    end
+    put c2_bl_cur_reg r 0
+  end
+  c2b_cl1 C2_BL_T
+  for r ulong np bound 6
+    w = c2c_width get c2_vt_s add vbase r
+    po = c2b_alloc_val w
+    if ne get c2_bl_oom 0 0
+      c2_cnf_reset
+      ret c2b_refuse c2b_res c2b_d_oom
+    end
+    for k ulong w bound 64
+      put c2_bl_pool add po k c2b_newvar
+    end
+    put c2_bl_cur_reg r po
+    put c2_bi_inputs 0 add get c2_bi_inputs 0 w
+  end
+  put c2_bi_paths 0 1
+  put c2_bl_cur_blk 0 0
+  put c2_bl_cur_grd 0 C2_BL_T
+  if ne c2b_run_path 0
+    c2_cnf_reset
+    ret -1
+  end
+  while gt get c2_bl_sp 0 0 bound 4097
+    sp = sub get c2_bl_sp 0 1
+    put c2_bl_sp 0 sp
+    put c2_bl_cur_blk 0 get c2_bl_stk_blk sp
+    put c2_bl_cur_grd 0 get c2_bl_stk_grd sp
+    rbase = mul sp C2_MAX_VREGS
+    for r ulong nv bound 480
+      put c2_bl_cur_reg r get c2_bl_stk_reg add rbase r
+    end
+    if ne c2b_run_path 0
+      c2_cnf_reset
+      ret -1
+    end
+  end
+  nb = get c2_bl_nbad 0
+  put c2_bi_traps 0 nb
+  nc = get c2_cnf_nclauses 0
+  nl = get c2_cnf_nlits 0
+  if or ge nc C2_CNF_MAX_CLAUSES gt add nl add nb 1 C2_CNF_MAX_LITS
+    c2_cnf_reset
+    ret c2b_refuse c2b_res c2b_d_oom
+  end
+  put c2_cnf_start nc nl
+  put c2_cnf_nclauses 0 add nc 1
+  for k ulong nb bound 65536
+    put c2_cnf_lits nl get c2_bl_bad k
+    nl = add nl 1
+  end
+  put c2_cnf_lits nl 0
+  put c2_cnf_nlits 0 add nl 1
+  if ne get c2_bl_oom 0 0
+    c2_cnf_reset
+    ret c2b_refuse c2b_res c2b_d_oom
+  end
+  put c2_cnf_nvars 0 get c2_bl_nvars 0
+  ret 0
+end

@@ -1,0 +1,547 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note tests/checker2/test_c2_blast.om: bit-blaster unit tests without any SAT solver (pure OM-2).
+note Compose after: c2_om2_hdr.om, c2_ir.om, c2_check.om, c2_lrat.om, c2_blast.om
+note Usage: test_c2_blast <corpus-ir-list> <lrat-ir-list>
+
+global tb_fails ulong 1
+global tb_fbuf uchar 1048576
+global tb_list uchar 262144
+global tb_path uchar 4096
+global tb_out uchar 512
+global tb_outlen ulong 1
+
+note Static linked-list occurrence table for Tseitin unit propagation
+const TB_OCC_HEADS ulong 131073
+const TB_OCC_NODES ulong 1048576
+global tb_occ_head int 131073
+global tb_occ_cl int 1048576
+global tb_occ_next int 1048576
+global tb_occ_used ulong 1
+global tb_val int 65537
+global tb_trail int 65537
+global tb_ntrail ulong 1
+global tb_rng ulong 1
+
+text tb_s_unsup "BLAST-UNSUPPORTED"
+text tb_s_nonsc "not a scalar"
+text tb_s_fail "FAIL test_c2_blast\n"
+text tb_s_hdr "test_c2_blast: corpus="
+text tb_s_ok " scalar_ok="
+text tb_s_sref " scalar_refused="
+text tb_s_nref " nonscalar_refused="
+text tb_s_h " holds="
+text tb_s_t " traps="
+text tb_s_f " failures="
+
+fn tb_out_reset to void
+  put tb_outlen 0 0
+end
+
+fn tb_out_ch c uchar to void
+  p = get tb_outlen 0
+  if lt p 512
+    put tb_out p c
+    put tb_outlen 0 add p 1
+  end
+end
+
+fn tb_out_txt s view uchar * to void
+  n = len s
+  for i ulong n bound 128
+    tb_out_ch get s i
+  end
+end
+
+fn tb_out_u64 v ulong to void
+  if eq v 0
+    tb_out_ch 48
+    ret
+  end
+  tmp = new uchar 24 0
+  n = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put tmp n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  for i ulong n bound 24
+    tb_out_ch get tmp sub sub n 1 i
+  end
+end
+
+fn tb_flush to void
+  tmp = new uchar 512 0
+  n = get tb_outlen 0
+  if gt n 0
+    for i ulong n bound 512
+      put tmp i get tb_out i
+    end
+    ign = write 1 tmp 0 n
+  end
+  put tb_outlen 0 0
+end
+
+fn tb_slurp_fd fd int to_list ulong to long
+  tot = ulong 0
+  cap = ulong 1048576
+  if ne to_list 0
+    cap = 262144
+  end
+  chunk = new uchar 65536 0
+  while true bound 64
+    r = read fd chunk 0 65536
+    if lt r 0
+      ign = fclose fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    ur = ulong r
+    if gt add tot ur cap
+      ign = fclose fd
+      ret -1
+    end
+    for i ulong ur bound 65536
+      if ne to_list 0
+        put tb_list add tot i get chunk i
+      else
+        put tb_fbuf add tot i get chunk i
+      end
+    end
+    tot = add tot ur
+  end
+  ign = fclose fd
+  ret long tot
+end
+
+fn tb_slurp_arg idx ulong to_list ulong to long
+  p = new uchar 512 0
+  pl = argread idx p 0 510
+  if lt pl 1
+    ret -1
+  end
+  fd = fopen p 0 ulong pl 0 0
+  if lt fd 0
+    ret -1
+  end
+  ret tb_slurp_fd int fd to_list
+end
+
+fn tb_slurp_path pl ulong to long
+  p = new uchar 4096 0
+  for i ulong pl bound 4096
+    put p i get tb_path i
+  end
+  fd = fopen p 0 pl 0 0
+  if lt fd 0
+    ret -1
+  end
+  ret tb_slurp_fd int fd 0
+end
+
+fn tb_load_ir pl ulong to long
+  n = tb_slurp_path pl
+  if lt n 0
+    ret -1
+  end
+  un = ulong n
+  for i ulong un bound 1048576
+    put c2_ir_buf i get tb_fbuf i
+  end
+  if ne c2_decode un 0
+    ret -1
+  end
+  if ne c2_check_unit 0
+    ret -1
+  end
+  ret 0
+end
+
+fn tb_has_nonscalar fi ulong to bool
+  nv = ulong get c2_fn_nvregs fi
+  vbase = mul fi C2_MAX_VREGS
+  for r ulong nv bound 480
+    if not c2c_is_value get c2_vt_s add vbase r
+      ret true
+    end
+  end
+  ret false
+end
+
+fn tb_rule_is_unsup to bool
+  rl = get c2_bi_rulelen 0
+  if ne rl len tb_s_unsup
+    ret false
+  end
+  for i ulong rl bound 64
+    if ne get c2_bi_rule i get tb_s_unsup i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tb_detail_has_nonsc to bool
+  dl = get c2_bi_detaillen 0
+  nl = len tb_s_nonsc
+  if lt dl nl
+    ret false
+  end
+  lim = add sub dl nl 1
+  for i ulong lim bound 160
+    ok = true
+    for j ulong nl bound 32
+      if ne get c2_bi_detail add i j get tb_s_nonsc j
+        ok = false
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+note ---- Propagation evaluator ----
+
+fn tb_abs l int to ulong
+  if lt l 0
+    ret ulong sub 0 l
+  end
+  ret ulong l
+end
+
+fn tb_lval l int to int
+  v = get tb_val tb_abs l
+  if gt l 0
+    ret v
+  end
+  ret sub 0 v
+end
+
+fn tb_set l int to void
+  v = int -1
+  if gt l 0
+    v = 1
+  end
+  put tb_val tb_abs l v
+  nt = get tb_ntrail 0
+  put tb_trail nt l
+  put tb_ntrail 0 add nt 1
+end
+
+fn tb_ev_init to void
+  nv = get c2_cnf_nvars 0
+  nc = get c2_cnf_nclauses 0
+  nh = add mul nv 2 1
+  for i ulong nh bound 131073
+    put tb_occ_head i -1
+  end
+  for i ulong add nv 1 bound 65537
+    put tb_val i 0
+  end
+  put tb_ntrail 0 0
+  put tb_occ_used 0 0
+  for ci ulong nc bound 262144
+    p = get c2_cnf_start ci
+    while true bound 4096
+      lit = get c2_cnf_lits p
+      if eq lit 0
+        break
+      end
+      s = ulong add long lit long nv
+      u = get tb_occ_used 0
+      if lt u TB_OCC_NODES
+        put tb_occ_cl u int ci
+        put tb_occ_next u get tb_occ_head s
+        put tb_occ_head s int u
+        put tb_occ_used 0 add u 1
+      end
+      p = add p 1
+    end
+  end
+end
+
+fn tb_ev_prop_one ci ulong to long
+  p = get c2_cnf_start ci
+  nopen = ulong 0
+  last = int 0
+  while true bound 4096
+    lit = get c2_cnf_lits p
+    if eq lit 0
+      break
+    end
+    sv = tb_lval lit
+    if gt sv 0
+      ret 0
+    end
+    if eq sv 0
+      nopen = add nopen 1
+      last = lit
+    end
+    p = add p 1
+  end
+  if eq nopen 0
+    ret 1
+  end
+  if eq nopen 1
+    tb_set last
+  end
+  ret 0
+end
+
+fn tb_ev_prop_loop nv ulong to long
+  q = ulong 0
+  while lt q get tb_ntrail 0 bound 65537
+    f = sub 0 get tb_trail q
+    s = ulong add long f long nv
+    nd = get tb_occ_head s
+    while ge nd 0 bound 262144
+      ci = ulong get tb_occ_cl ulong nd
+      if ne tb_ev_prop_one ci 0
+        ret 1
+      end
+      nd = get tb_occ_next ulong nd
+    end
+    q = add q 1
+  end
+  if eq get tb_ntrail 0 nv
+    ret 0
+  end
+  ret -1
+end
+
+note Returns 1 = conflict, 0 = all assigned no conflict, -1 = undetermined
+fn tb_ev_run inputs ulong a ulong to long
+  nv = get c2_cnf_nvars 0
+  nc = get c2_cnf_nclauses 0
+  nt = get tb_ntrail 0
+  while gt nt 0 bound 65537
+    nt = sub nt 1
+    put tb_val tb_abs get tb_trail nt 0
+  end
+  put tb_ntrail 0 0
+  for i ulong nc bound 262144
+    p = get c2_cnf_start i
+    l0 = get c2_cnf_lits p
+    if eq l0 0
+      ret 1
+    end
+    if eq get c2_cnf_lits add p 1 0
+      sv = tb_lval l0
+      if lt sv 0
+        ret 1
+      end
+      if eq sv 0
+        tb_set l0
+      end
+    end
+  end
+  for k ulong inputs bound 64
+    v = int add 2 k
+    lit = sub 0 v
+    if ne and shr a k 1 0
+      lit = v
+    end
+    sv = tb_lval lit
+    if lt sv 0
+      ret 1
+    end
+    if eq sv 0
+      tb_set lit
+    end
+  end
+  ret tb_ev_prop_loop nv
+end
+
+fn tb_next_rand to ulong
+  x = get tb_rng 0
+  x = xor x shl x 13
+  x = xor x shr x 7
+  x = xor x shl x 17
+  put tb_rng 0 x
+  ret x
+end
+
+fn tb_run_corpus lsz ulong out_stats edit ulong 4 to void
+  pos = ulong 0
+  while lt pos lsz bound 4096
+    pl = ulong 0
+    while lt pos lsz bound 4096
+      c = get tb_list pos
+      pos = add pos 1
+      if eq c 10
+        break
+      end
+      if eq c 13
+        continue
+      end
+      if lt pl 4095
+        put tb_path pl c
+        pl = add pl 1
+      end
+    end
+    if eq pl 0
+      continue
+    end
+    put out_stats 0 add get out_stats 0 1
+    if ne tb_load_ir pl 0
+      put tb_fails 0 add get tb_fails 0 1
+      continue
+    end
+    nf = get c2_nfuncs 0
+    for fi ulong nf bound 32
+      rc = c2_blast_notrap long fi
+      if tb_has_nonscalar fi
+        if or eq rc 0 or not tb_rule_is_unsup not tb_detail_has_nonsc
+          put tb_fails 0 add get tb_fails 0 1
+        else
+          put out_stats 3 add get out_stats 3 1
+        end
+      else
+        if eq rc 0
+          put out_stats 1 add get out_stats 1 1
+        else
+          put out_stats 2 add get out_stats 2 1
+        end
+      end
+    end
+  end
+end
+
+fn tb_eval_one_gate want_trap bool to bool
+  tb_ev_init
+  inps = get c2_bi_inputs 0
+  total = ulong 65536
+  if le inps 16
+    total = shl ulong 1 inps
+  end
+  sat = ulong 0
+  nopen = ulong 0
+  put tb_rng 0 88172645463325252
+  for a ulong total bound 65536
+    inp = a
+    if gt inps 16
+      inp = tb_next_rand
+    end
+    r = tb_ev_run inps inp
+    if eq r 0
+      sat = add sat 1
+    end
+    if lt r 0
+      nopen = add nopen 1
+    end
+  end
+  if ne nopen 0
+    ret false
+  end
+  if and want_trap eq sat 0
+    ret false
+  end
+  if and not want_trap ne sat 0
+    ret false
+  end
+  ret true
+end
+
+fn tb_run_lrat lsz ulong out_ht edit ulong 2 to void
+  pos = ulong 0
+  while lt pos lsz bound 4096
+    pl = ulong 0
+    bstart = ulong 0
+    while lt pos lsz bound 4096
+      c = get tb_list pos
+      pos = add pos 1
+      if eq c 10
+        break
+      end
+      if eq c 13
+        continue
+      end
+      if lt pl 4095
+        put tb_path pl c
+        if eq c 47
+          bstart = add pl 1
+        end
+        pl = add pl 1
+      end
+    end
+    if eq pl 0
+      continue
+    end
+    if ge bstart pl
+      continue
+    end
+    c0 = get tb_path bstart
+    if and ne c0 110 ne c0 112
+      continue
+    end
+    want_trap = eq c0 110
+    if ne tb_load_ir pl 0
+      put tb_fails 0 add get tb_fails 0 1
+      continue
+    end
+    if or ne get c2_nfuncs 0 1 ne c2_blast_notrap 0 0
+      put tb_fails 0 add get tb_fails 0 1
+      continue
+    end
+    if tb_eval_one_gate want_trap
+      if want_trap
+        put out_ht 1 add get out_ht 1 1
+      else
+        put out_ht 0 add get out_ht 0 1
+      end
+    else
+      put tb_fails 0 add get tb_fails 0 1
+    end
+  end
+end
+
+fn main to int
+  if ne ulong argcnt 3
+    ret 2
+  end
+  put tb_fails 0 0
+  lsz1 = tb_slurp_arg 1 1
+  if le lsz1 0
+    ret 1
+  end
+  stats = new ulong 4 0
+  tb_run_corpus ulong lsz1 stats
+  if eq get stats 3 0
+    put tb_fails 0 add get tb_fails 0 1
+  end
+  lsz2 = tb_slurp_arg 2 1
+  if le lsz2 0
+    ret 1
+  end
+  ht = new ulong 2 0
+  tb_run_lrat ulong lsz2 ht
+  if lt get ht 0 20
+    put tb_fails 0 add get tb_fails 0 1
+  end
+  tb_out_reset
+  tb_out_txt tb_s_hdr
+  tb_out_u64 get stats 0
+  tb_out_txt tb_s_ok
+  tb_out_u64 get stats 1
+  tb_out_txt tb_s_sref
+  tb_out_u64 get stats 2
+  tb_out_txt tb_s_nref
+  tb_out_u64 get stats 3
+  tb_out_txt tb_s_h
+  tb_out_u64 get ht 0
+  tb_out_txt tb_s_t
+  tb_out_u64 get ht 1
+  tb_out_txt tb_s_f
+  tb_out_u64 get tb_fails 0
+  tb_out_ch 10
+  tb_flush
+  if ne get tb_fails 0 0
+    ret 1
+  end
+  ret 0
+end

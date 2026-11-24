@@ -25,9 +25,9 @@
 #   op_neg_<T> (signed), op_bnot_<T>, op_lnot_bool, op_land_bool, op_lor_bool, op_beq_bool
 #   op_cast_<S>_<T>      every ordered pair of distinct integer types
 # Any program oscc refuses, or that checker2 does not blast, fails the run.
-# Usage: blast_native.sh <oscc> <test_c2_blast_native> <work-dir>
+# Usage: blast_native.sh <oscc> <test_c2_blast_native> <checker2> <work-dir>
 set -u
-OSCC=$1 H=$2 W=$3
+OSCC=$1 H=$2 C2=$3 W=$4
 D=$(dirname "$0")/lrat
 rm -rf "$W" && mkdir -p "$W/src" || exit 2
 types="u8 u16 u32 u64 i8 i16 i32 i64"
@@ -71,6 +71,6 @@ op_eq_u64 op_ne_u64
 op_cast_i8_u16 op_cast_i8_i16
 CTL
 echo "blast_native: $(ls "$W"/src/*.osc | wc -l) programs written, $fail refused by oscc"
-"$H" "$W" || fail=$((fail + 1))
+"$H" "$C2" "$W" || fail=$((fail + 1))
 [ "$fail" -eq 0 ] || { echo "blast_native: FAIL"; exit 1; }
 echo "blast_native: PASS"
