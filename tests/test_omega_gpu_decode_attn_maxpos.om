@@ -1,0 +1,294 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_decode_attn_maxpos.c.
+note Verifies the 128K decode attention position bound contract (omega #535, MAX_POS=131072)
+note on a pure OM-2 fake platform (zero GPU), linking src/omega_gpu_hostmath.om:
+note   1. c_alloc_cap: 131072 allocates exact page-rounded K|V planes, RoPE table, and 512-split
+note      partials; 131072+256 refused before any allocation.
+note   2. c_kv_rows: KV row addressing (kv_head * max_pos + pos) * 256 at 0, 65535, 65536, 131071
+note      round-trips; 131072, 131073, and crossing-cap count refused.
+note   3. c_rope_rows: RoPE cos/sin table at rows 0, 65535, 65536, 99999, 131071 verified via
+note      omega_hostmath_pow + omega_hostmath_sincos (unit circle cos^2+sin^2 == 1 within 1e-6).
+note   4. c_decode_at_cap: pos 131071 launches 512 splits (grid 512x4), kv_bytes = 2*4*131072*256;
+note      pos 131072/131073 refused before any submission.
+note   5. c_old_cap_cache: 65536-position cache accepts 65535 (256 splits) and refuses 65536.
+note Host-only, CPU-only, zero GPU access.
+om2
+
+const DA_OK ulong 0
+const DA_BAD_ARGS ulong 1
+
+const DA_CAP ulong 131072
+const DA_CHUNK ulong 256
+const DA_KV_HEADS ulong 4
+const DA_ROW_BYTES ulong 256
+const DA_PLANE_SLACK ulong 4096
+const DA_ROPE_ROW_BYTES ulong 512
+const DA_PARTIAL_WORDS ulong 1040
+
+text t_da_pass "PASS test_omega_gpu_decode_attn_maxpos\n"
+text t_da_fail "FAIL test_omega_gpu_decode_attn_maxpos\n"
+
+note Fake cache state: [0]=max_pos, [1]=k_va, [2]=v_va, [3]=rope_va, [4]=allocs, [5]=submits,
+note [6]=kv_buf_bytes, [7]=rope_buf_bytes, [8]=part_buf_bytes
+global g_da_st ulong 12
+
+note Sparse KV store for test positions (up to 16 rows x 128 u16 K + 128 u16 V)
+global g_da_kv_k ushort 2048
+global g_da_kv_v ushort 2048
+
+fn da_page_round b ulong to ulong
+  ret and add b 4095 xor ulong 4095 ulong 0xffffffffffffffff
+end
+
+fn da_cache_alloc max_pos ulong to ulong
+  if or eq max_pos 0 or gt max_pos DA_CAP ne rem max_pos DA_CHUNK 0
+    ret DA_BAD_ARGS
+  end
+  plane = add mul mul 4 max_pos DA_ROW_BYTES DA_PLANE_SLACK
+  kv_b = da_page_round mul 2 plane
+  rope_b = da_page_round mul max_pos DA_ROPE_ROW_BYTES
+  splits = div max_pos DA_CHUNK
+  part_b = da_page_round mul mul mul 4 splits DA_PARTIAL_WORDS 4
+  put g_da_st 0 max_pos
+  put g_da_st 1 0x100000000
+  put g_da_st 2 add 0x100000000 plane
+  put g_da_st 3 0x180000000
+  put g_da_st 4 add get g_da_st 4 3
+  put g_da_st 6 kv_b
+  put g_da_st 7 rope_b
+  put g_da_st 8 part_b
+  ret DA_OK
+end
+
+fn da_kv_bounds pos ulong cnt ulong head ulong to ulong
+  mp = get g_da_st 0
+  if or ge head DA_KV_HEADS eq cnt 0
+    ret DA_BAD_ARGS
+  end
+  if or ge pos mp gt add pos cnt mp
+    ret DA_BAD_ARGS
+  end
+  ret DA_OK
+end
+
+fn da_decode_step pos ulong info edit ulong 4 to ulong
+  mp = get g_da_st 0
+  if ge pos mp
+    ret DA_BAD_ARGS
+  end
+  splits = div add pos DA_CHUNK DA_CHUNK
+  put g_da_st 5 add get g_da_st 5 1
+  put info 0 splits
+  put info 1 splits
+  put info 2 DA_KV_HEADS
+  put info 3 mul mul mul 2 DA_KV_HEADS add pos 1 DA_ROW_BYTES
+  ret DA_OK
+end
+
+fn da_case_alloc_cap to long
+  put g_da_st 4 0
+  if ne da_cache_alloc DA_CAP DA_OK
+    ret 10
+  end
+  plane = add mul mul 4 DA_CAP DA_ROW_BYTES DA_PLANE_SLACK
+  if ne get g_da_st 6 da_page_round mul 2 plane
+    ret 11
+  end
+  if ne get g_da_st 7 da_page_round mul DA_CAP DA_ROPE_ROW_BYTES
+    ret 12
+  end
+  part_want = mul mul mul ulong 4 512 DA_PARTIAL_WORDS 4
+  if ne get g_da_st 8 da_page_round part_want
+    ret 13
+  end
+  if ne sub get g_da_st 2 get g_da_st 1 plane
+    ret 14
+  end
+  allocs0 = get g_da_st 4
+  if ne da_cache_alloc add DA_CAP DA_CHUNK DA_BAD_ARGS
+    ret 15
+  end
+  if ne get g_da_st 4 allocs0
+    ret 16
+  end
+  ret 0
+end
+
+fn da_case_kv_rows to long
+  if ne da_cache_alloc DA_CAP DA_OK
+    ret 20
+  end
+  ok_pos = new ulong 4 0
+  put ok_pos 0 0
+  put ok_pos 1 65535
+  put ok_pos 2 65536
+  put ok_pos 3 131071
+  for n ulong 4
+    pos = get ok_pos n
+    for h ulong DA_KV_HEADS
+      if ne da_kv_bounds pos 1 h DA_OK
+        ret 21
+      end
+      slot = mul add mul n 4 h 128
+      for i ulong 128
+        kv = ushort and add add mul pos 7 mul h 131 i 65535
+        put g_da_kv_k add slot i kv
+        put g_da_kv_v add slot i xor kv ushort 65535
+      end
+      for i ulong 128
+        kv = ushort and add add mul pos 7 mul h 131 i 65535
+        if ne get g_da_kv_k add slot i kv
+          ret 22
+        end
+        if ne get g_da_kv_v add slot i xor kv ushort 65535
+          ret 23
+        end
+      end
+    end
+  end
+  note Verify plane offset formula for head 3, pos 131071 fits inside plane
+  off = mul add mul 3 DA_CAP 131071 DA_ROW_BYTES
+  plane = sub get g_da_st 2 get g_da_st 1
+  if gt add off DA_ROW_BYTES plane
+    ret 24
+  end
+  if ne da_kv_bounds 131072 1 0 DA_BAD_ARGS
+    ret 25
+  end
+  if ne da_kv_bounds 131073 1 0 DA_BAD_ARGS
+    ret 26
+  end
+  if ne da_kv_bounds 131071 2 3 DA_BAD_ARGS
+    ret 27
+  end
+  ret 0
+end
+
+fn da_check_rope_row row ulong to long
+  sc = new ulong 2 0
+  r_f = f64 row
+  theta = f64 1000000.0
+  one = f64 1.0
+  tol = div one theta
+  for i ulong 64
+    exp_v = div neg f64 mul 2 i f64 128.0
+    freq = omega_hostmath_pow theta exp_v
+    omega_hostmath_sincos mul r_f freq sc
+    sv = bitcast f64 get sc 0
+    cv = bitcast f64 get sc 1
+    diff = sub add mul cv cv mul sv sv one
+    if lt diff f64 0.0
+      diff = neg diff
+    end
+    if gt diff tol
+      ret 32
+    end
+  end
+  ret 0
+end
+
+fn da_case_rope_rows to long
+  if ne da_cache_alloc DA_CAP DA_OK
+    ret 30
+  end
+  if ne get g_da_st 7 da_page_round mul DA_CAP DA_ROPE_ROW_BYTES
+    ret 31
+  end
+  if ne da_check_rope_row 0 0
+    ret 32
+  end
+  if ne da_check_rope_row 65535 0
+    ret 33
+  end
+  if ne da_check_rope_row 65536 0
+    ret 34
+  end
+  if ne da_check_rope_row 99999 0
+    ret 35
+  end
+  if ne da_check_rope_row 131071 0
+    ret 36
+  end
+  ret 0
+end
+
+fn da_case_decode_at_cap to long
+  if ne da_cache_alloc DA_CAP DA_OK
+    ret 40
+  end
+  info = new ulong 4 0
+  if ne da_decode_step 131071 info DA_OK
+    ret 41
+  end
+  if or ne get info 0 512 or ne get info 1 512 ne get info 2 4
+    ret 42
+  end
+  kv_want = mul mul mul ulong 2 4 DA_CAP 256
+  if ne get info 3 kv_want
+    ret 43
+  end
+  sub0 = get g_da_st 5
+  if ne da_decode_step 131072 info DA_BAD_ARGS
+    ret 44
+  end
+  if ne da_decode_step 131073 info DA_BAD_ARGS
+    ret 45
+  end
+  if ne get g_da_st 5 sub0
+    ret 46
+  end
+  ret 0
+end
+
+fn da_case_old_cap to long
+  if ne da_cache_alloc 65536 DA_OK
+    ret 50
+  end
+  if ne da_kv_bounds 65535 1 3 DA_OK
+    ret 51
+  end
+  if ne da_kv_bounds 65536 1 3 DA_BAD_ARGS
+    ret 52
+  end
+  info = new ulong 4 0
+  if ne da_decode_step 65535 info DA_OK
+    ret 53
+  end
+  if ne get info 0 256
+    ret 54
+  end
+  if ne da_decode_step 65536 info DA_BAD_ARGS
+    ret 55
+  end
+  ret 0
+end
+
+fn main to int
+  rc = da_case_alloc_cap
+  if ne rc 0
+    ign = write 1 t_da_fail 0 len t_da_fail
+    ret int rc
+  end
+  rc = da_case_kv_rows
+  if ne rc 0
+    ign = write 1 t_da_fail 0 len t_da_fail
+    ret int rc
+  end
+  rc = da_case_rope_rows
+  if ne rc 0
+    ign = write 1 t_da_fail 0 len t_da_fail
+    ret int rc
+  end
+  rc = da_case_decode_at_cap
+  if ne rc 0
+    ign = write 1 t_da_fail 0 len t_da_fail
+    ret int rc
+  end
+  rc = da_case_old_cap
+  if ne rc 0
+    ign = write 1 t_da_fail 0 len t_da_fail
+    ret int rc
+  end
+  ign = write 1 t_da_pass 0 len t_da_pass
+  ret 0
+end

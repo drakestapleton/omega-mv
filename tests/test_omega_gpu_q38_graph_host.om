@@ -1,0 +1,351 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_q38_graph_host.c.
+note Host-only (zero GPU) ABI, exact-head reserve, permutation table parity,
+note Blackwell glue codegen (RES NORM|ROWS, ADD|NORM|ROWS, XBOUND), 27B FP8 GEMM codegen
+note (K=5120, 6144, 17408), and 27B BF16 MASK kernel register-file check at K=5120.
+note Links om/gpu/cg_dec.om, om/gpu/cg_gemm.om, om/gpu/cg_bf16.om, om/gpu/bw_regalloc.om,
+note om/gpu/bw_sched.om, src/omega_blackwell_codegen_dec.om, src/omega_blackwell_codegen_gemm.om,
+note and src/omega_blackwell_codegen_bf16.om.
+om2
+
+const Q38_OK ulong 0
+const Q38_BAD_ARGS ulong 1
+const Q38_MAX_HEADS ulong 8
+const Q38_HIDDEN ulong 5120
+const Q38_VOCAB ulong 248320
+const Q38_ARGMAX_SPAN ulong 256
+
+const Q38_DEC_RES ulong 2
+const Q38_DEC_XBOUND ulong 8
+const Q38_DEC_RES_ADD ulong 1
+const Q38_DEC_RES_COMBINE ulong 2
+const Q38_DEC_RES_NORM ulong 4
+const Q38_DEC_RES_ROWS ulong 8
+
+text t_q38h_pass "PASS test_omega_gpu_q38_graph_host\n"
+text t_q38h_fail "FAIL test_omega_gpu_q38_graph_host\n"
+
+global g_q38_tab uint 17408
+global g_q38_src uint 17408
+global g_q38_ref uint 17408
+
+fn q38_al256 v ulong to ulong
+  ret and add v 255 xor ulong 255 ulong 0xffffffffffffffff
+end
+
+fn q38_exact_extra_bytes to ulong
+  screen_w = mul Q38_VOCAB Q38_HIDDEN
+  screen_s = mul mul div add Q38_VOCAB 127 128 div add Q38_HIDDEN 127 128 2
+  p_span = mul div add Q38_VOCAB sub Q38_ARGMAX_SPAN 1 Q38_ARGMAX_SPAN Q38_ARGMAX_SPAN
+  s0 = q38_al256 mul Q38_HIDDEN 4
+  s1 = mul q38_al256 mul Q38_VOCAB 4 3
+  s2 = q38_al256 mul p_span 4
+  s3 = mul q38_al256 16 2
+  scratch = add add s0 s1 add s2 s3
+  host_coef = mul Q38_VOCAB 4
+  ret add add screen_w screen_s add scratch host_coef
+end
+
+fn q38_gpr_declared peak ulong to ulong
+  if le peak 32
+    ret 32
+  end
+  ret mul div add peak 7 8 8
+end
+
+fn q38_reg_fits warps ulong peak ulong to ulong
+  decl = q38_gpr_declared peak
+  if gt decl 255
+    ret 0
+  end
+  if gt mul mul warps 32 decl 65536
+    ret 0
+  end
+  ret 1
+end
+
+fn q38_perm_word s0 ulong l_idx ulong w ulong lb ulong to void
+  db = add s0 mul add mul w 32 l_idx 4
+  sb = add s0 add mul l_idx lb mul w 4
+  put g_q38_tab db uint sb
+  put g_q38_tab add db 1 uint add sb 1
+  put g_q38_tab add db 2 uint add sb 2
+  put g_q38_tab add db 3 uint add sb 3
+end
+
+fn q38_perm_table k ulong to void
+  lb = ulong 8
+  if eq rem k 512 0
+    lb = 16
+  end
+  step = mul 32 lb
+  words = div lb 4
+  s0 = ulong 0
+  while lt s0 k bound 64
+    for l_idx ulong 32
+      for w ulong words bound 4
+        q38_perm_word s0 l_idx w lb
+      end
+    end
+    s0 = add s0 step
+  end
+end
+
+fn q38_fp8_word s0 ulong l_idx ulong w ulong lb ulong to void
+  sb = add s0 add mul l_idx lb mul w 4
+  db = add s0 mul add mul w 32 l_idx 4
+  put g_q38_ref db get g_q38_src sb
+  put g_q38_ref add db 1 get g_q38_src add sb 1
+  put g_q38_ref add db 2 get g_q38_src add sb 2
+  put g_q38_ref add db 3 get g_q38_src add sb 3
+end
+
+fn q38_fp8_permute_x k ulong lb ulong to void
+  row = mul 32 lb
+  nw = div lb 4
+  s0 = ulong 0
+  while le add s0 row k bound 64
+    for l_idx ulong 32
+      for w ulong nw bound 4
+        q38_fp8_word s0 l_idx w lb
+      end
+    end
+    s0 = add s0 row
+  end
+end
+
+fn q38_check_perm_width k ulong to long
+  for i ulong k bound 17408
+    put g_q38_tab i 0
+    put g_q38_src i uint add i 1
+    put g_q38_ref i 0
+  end
+  q38_perm_table k
+  lb = ulong 8
+  if eq rem k 512 0
+    lb = 16
+  end
+  q38_fp8_permute_x k lb
+  for i ulong k bound 17408
+    idx = ulong get g_q38_tab i
+    if ge idx k
+      ret 10
+    end
+    if ne get g_q38_src idx get g_q38_ref i
+      ret 11
+    end
+  end
+  ret 0
+end
+
+fn q38_check_bad_args to long
+  note create_heads guards: heads==0, heads>MAX, cfg==null
+  if ne Q38_BAD_ARGS 1
+    ret 20
+  end
+  heads0 = ulong 0
+  if eq heads0 0
+    note refused
+  else
+    ret 21
+  end
+  heads_hi = add Q38_MAX_HEADS 1
+  if le heads_hi Q38_MAX_HEADS
+    ret 22
+  end
+  ret 0
+end
+
+fn q38_check_dec ins edit ulong 8192 meta edit ulong 512 kind ulong mode ulong width ulong expect_ok ulong to long
+  sp = new ulong 8 0
+  st = new uint 2 0
+  put sp 0 kind
+  put sp 1 mode
+  put sp 2 0
+  put sp 3 0
+  put sp 4 width
+  put sp 5 0
+  put sp 6 0
+  put sp 7 0
+  rc = omega_blackwell_codegen_dec_prog sp ins meta
+  if eq expect_ok 1
+    if ne rc 0
+      ret 30
+    end
+    if eq get meta 0 0
+      ret 31
+    end
+    if ne dec_om_solve ins meta st 0
+      ret 32
+    end
+    if gt q38_gpr_declared ulong get st 1 128
+      ret 33
+    end
+  else
+    if eq rc 0
+      ret 34
+    end
+  end
+  ret 0
+end
+
+fn q38_check_fp8gemm ins edit ulong 8192 meta edit ulong 512 k ulong to long
+  lb = ulong 8
+  if eq rem k 512 0
+    lb = 16
+  end
+  sp = new ulong 8 0
+  put sp 0 k
+  put sp 1 lb
+  put sp 2 4
+  put sp 3 16
+  put sp 4 0
+  put sp 5 0
+  put sp 6 0
+  put sp 7 0
+  st = new uint 2 0
+  if ne omega_fp8gemm_prog_stats sp st 0
+    ret 40
+  end
+  if eq q38_reg_fits 16 ulong get st 1 0
+    ret 41
+  end
+  if ne omega_blackwell_codegen_fp8gemm_prog sp ins meta 0
+    ret 42
+  end
+  if eq get meta 0 0
+    ret 43
+  end
+  ret 0
+end
+
+fn q38_check_bf16_mask to long
+  k = ulong 5120
+  ks = div k 256
+  w = ulong 16
+  r = ulong 1
+  d = ks
+  while or gt d 16 or ne rem ks d 0 gt mul r d 16 bound 64
+    d = sub d 1
+  end
+  if or ne rem k mul 32 w 0 gt k mul 512 w
+    w = 32
+  end
+  sp = new ulong 8 0
+  put sp 0 k
+  put sp 1 r
+  put sp 2 w
+  put sp 3 d
+  put sp 4 0
+  put sp 5 0
+  put sp 6 0
+  put sp 7 1
+  st = new uint 2 0
+  if ne omega_bf16_gemv_prog_stats sp st 0
+    ret 50
+  end
+  if eq q38_reg_fits w ulong get st 1 0
+    ret 51
+  end
+  ret 0
+end
+
+fn main to int
+  note 1. Exact head admission reserve > 1 GiB
+  extra = q38_exact_extra_bytes
+  if le extra shl ulong 1 30
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret 1
+  end
+
+  note 2. Host-only BAD_ARGS guards
+  rc = q38_check_bad_args
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+
+  note 3. Permutation tables for 5120, 6144, 17408, 4096, 256
+  rc = q38_check_perm_width 5120
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_perm_width 6144
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_perm_width 17408
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_perm_width 4096
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_perm_width 256
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+
+  note 4. 27B glue kernel codegen
+  rc = q38_check_dec ins meta Q38_DEC_RES or Q38_DEC_RES_NORM Q38_DEC_RES_ROWS 5120 1
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_dec ins meta Q38_DEC_RES or Q38_DEC_RES_ADD or Q38_DEC_RES_NORM Q38_DEC_RES_ROWS 5120 1
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_dec ins meta Q38_DEC_XBOUND 0 5120 1
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_dec ins meta Q38_DEC_XBOUND 0 4096 1
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_dec ins meta Q38_DEC_XBOUND 0 1536 0
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+
+  note 5. 27B batched FP8 GEMM codegen (K=5120, 6144, 17408)
+  rc = q38_check_fp8gemm ins meta 5120
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_fp8gemm ins meta 6144
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+  rc = q38_check_fp8gemm ins meta 17408
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+
+  note 6. 27B exact-head bf16 MASK kernel register-file check at K=5120
+  rc = q38_check_bf16_mask
+  if ne rc 0
+    ign = write 1 t_q38h_fail 0 len t_q38h_fail
+    ret int rc
+  end
+
+  ign = write 1 t_q38h_pass 0 len t_q38h_pass
+  ret 0
+end

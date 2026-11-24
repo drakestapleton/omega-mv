@@ -1,0 +1,531 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_decode_graph_abort.c.
+note Verifies lock and token-state recovery of the decode graph split API (omega #518)
+note on a pure OM-2 fake platform (zero GPU):
+note   1. c_sync_fails: visibility sync refused at begin -> split & one-shot recover, lock free
+note   2. c_open_fails: device open refused at begin -> lock free, stale graph refused, reopen recovers
+note   3. c_abort: abort_token cancels begun token without submitting, lock free, next token runs
+note   4. c_end_after_record_fail: failed record sticks, end_token submits nothing, lock free
+note   5. c_latched: uncertain completion latches session, later begins fail without retry/reopen.
+note Host-only, CPU-only, zero GPU access.
+om2
+
+const AB_OK ulong 0
+const AB_BAD_ARGS ulong 1
+const AB_CHIP_FAIL ulong 2
+
+text t_ab_pass "PASS test_omega_gpu_decode_graph_abort\n"
+text t_ab_fail "FAIL test_omega_gpu_decode_graph_abort\n"
+
+note Fake platform + session state (16 ulongs):
+note [0]=locks_held [1]=double_locks [2]=bad_unlocks [3]=submits [4]=dev_opens
+note [5]=fail_open [6]=fail_c2g [7]=dev_open [8]=dev_gen [9]=blocked
+note [10]=dev_token_armed [11]=dev_token
+global g_ab_fk ulong 16
+
+note Graph state (8 ulongs):
+note [0]=valid [1]=buf_gen [2]=in_token [3]=failed [4]=n_launches [5]=layer0_set
+global g_ab_g ulong 8
+
+fn ab_reset to void
+  for i ulong 16
+    put g_ab_fk i 0
+  end
+  for i ulong 8
+    put g_ab_g i 0
+  end
+end
+
+fn ab_lock to ulong
+  if ne get g_ab_fk 0 0
+    put g_ab_fk 1 add get g_ab_fk 1 1
+    ret 1
+  end
+  put g_ab_fk 0 1
+  ret 0
+end
+
+fn ab_unlock to ulong
+  if eq get g_ab_fk 0 0
+    put g_ab_fk 2 add get g_ab_fk 2 1
+    ret 1
+  end
+  put g_ab_fk 0 0
+  ret 0
+end
+
+fn ab_lock_free to long
+  if or ne get g_ab_fk 0 0 or ne get g_ab_fk 1 0 ne get g_ab_fk 2 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ab_session_ensure_open to ulong
+  if ne get g_ab_fk 9 0
+    ret AB_CHIP_FAIL
+  end
+  if ne get g_ab_fk 7 0
+    ret AB_OK
+  end
+  if ne get g_ab_fk 5 0
+    ret AB_CHIP_FAIL
+  end
+  put g_ab_fk 7 1
+  put g_ab_fk 8 add get g_ab_fk 8 1
+  put g_ab_fk 4 add get g_ab_fk 4 1
+  ret AB_OK
+end
+
+fn ab_session_close to void
+  put g_ab_fk 7 0
+end
+
+fn ab_world_build to ulong
+  if ne ab_session_ensure_open AB_OK
+    ret AB_CHIP_FAIL
+  end
+  put g_ab_g 0 1
+  put g_ab_g 1 get g_ab_fk 8
+  put g_ab_g 2 0
+  put g_ab_g 3 0
+  put g_ab_g 4 0
+  put g_ab_g 5 0
+  ret AB_OK
+end
+
+fn ab_world_free to void
+  put g_ab_g 0 0
+  put g_ab_g 2 0
+end
+
+fn ab_c2g to ulong
+  if ne get g_ab_fk 6 0
+    ret AB_CHIP_FAIL
+  end
+  if or eq get g_ab_fk 7 0 ne get g_ab_g 1 get g_ab_fk 8
+    ret AB_CHIP_FAIL
+  end
+  ret AB_OK
+end
+
+fn ab_set_final_norm to ulong
+  if or eq get g_ab_g 0 0 ne get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  if ne ab_lock 0
+    ret AB_CHIP_FAIL
+  end
+  rc = ab_c2g
+  ign = ab_unlock
+  if ne get g_ab_fk 9 0
+    ret AB_OK
+  end
+  ret rc
+end
+
+fn ab_read to ulong
+  if or eq get g_ab_g 0 0 ne get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  if ne ab_lock 0
+    ret AB_CHIP_FAIL
+  end
+  rc = ab_c2g
+  ign = ab_unlock
+  ret rc
+end
+
+fn ab_begin_token to ulong
+  if or eq get g_ab_g 0 0 ne get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  if ne ab_lock 0
+    ret AB_CHIP_FAIL
+  end
+  if ne ab_session_ensure_open AB_OK
+    ign = ab_unlock
+    ret AB_CHIP_FAIL
+  end
+  if ne ab_c2g AB_OK
+    ign = ab_unlock
+    ret AB_CHIP_FAIL
+  end
+  put g_ab_g 2 1
+  put g_ab_g 3 0
+  put g_ab_g 4 0
+  ret AB_OK
+end
+
+fn ab_record_res mode ulong to ulong
+  if or eq get g_ab_g 0 0 eq get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  if ne get g_ab_g 3 0
+    ret AB_CHIP_FAIL
+  end
+  if eq mode 0xff
+    put g_ab_g 3 1
+    ret AB_BAD_ARGS
+  end
+  put g_ab_g 4 add get g_ab_g 4 1
+  ret AB_OK
+end
+
+fn ab_record_layer to ulong
+  if or eq get g_ab_g 0 0 eq get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  if ne get g_ab_g 3 0
+    ret AB_CHIP_FAIL
+  end
+  if eq get g_ab_g 5 0
+    put g_ab_g 3 1
+    ret AB_BAD_ARGS
+  end
+  put g_ab_g 4 add get g_ab_g 4 1
+  ret AB_OK
+end
+
+fn ab_record_final to ulong
+  if or eq get g_ab_g 0 0 eq get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  if ne get g_ab_g 3 0
+    ret AB_CHIP_FAIL
+  end
+  put g_ab_g 4 add get g_ab_g 4 1
+  ret AB_OK
+end
+
+fn ab_abort_token has_g ulong to ulong
+  if or eq has_g 0 or eq get g_ab_g 0 0 eq get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  put g_ab_g 2 0
+  put g_ab_g 3 0
+  put g_ab_g 4 0
+  ign = ab_unlock
+  ret AB_OK
+end
+
+fn ab_end_token out_tok edit ulong 1 to ulong
+  if or eq get g_ab_g 0 0 eq get g_ab_g 2 0
+    ret AB_BAD_ARGS
+  end
+  failed = get g_ab_g 3
+  n = get g_ab_g 4
+  put g_ab_g 2 0
+  if ne failed 0
+    ign = ab_unlock
+    ret AB_CHIP_FAIL
+  end
+  if gt n 0
+    note Fake device never completes markers -> timeout -> latch session
+    put g_ab_fk 3 add get g_ab_fk 3 1
+    put g_ab_fk 9 1
+    ign = ab_unlock
+    ret AB_CHIP_FAIL
+  end
+  note Empty list submits nothing; read dev_token
+  if ne get g_ab_fk 10 0
+    put out_tok 0 get g_ab_fk 11
+  end
+  ign = ab_unlock
+  ret AB_OK
+end
+
+fn ab_oneshot_token out_tok edit ulong 1 to ulong
+  rc = ab_begin_token
+  if ne rc AB_OK
+    ret rc
+  end
+  ign = ab_record_layer
+  ret ab_end_token out_tok
+end
+
+fn ab_expect_between to long
+  if ne ab_set_final_norm AB_OK
+    ret 1
+  end
+  if ne ab_lock_free 0
+    ret 2
+  end
+  if ne ab_read AB_OK
+    ret 3
+  end
+  ret ab_lock_free
+end
+
+fn ab_expect_valid want ulong to long
+  put g_ab_fk 10 1
+  put g_ab_fk 11 want
+  sub0 = get g_ab_fk 3
+  if ne ab_begin_token AB_OK
+    ret 1
+  end
+  if ne get g_ab_fk 0 1
+    ret 2
+  end
+  tok = new ulong 1 0
+  put tok 0 0xdead
+  if ne ab_end_token tok AB_OK
+    ret 3
+  end
+  if or ne get tok 0 want ne get g_ab_fk 3 sub0
+    ret 4
+  end
+  put g_ab_fk 10 0
+  ret ab_lock_free
+end
+
+fn ab_case_sync_fails to long
+  ab_reset
+  if ne ab_world_build AB_OK
+    ret 10
+  end
+  sub0 = get g_ab_fk 3
+  put g_ab_fk 6 1
+  for rep ulong 3
+    if ne ab_begin_token AB_CHIP_FAIL
+      ret 11
+    end
+    if ne ab_lock_free 0
+      ret 12
+    end
+  end
+  tok = new ulong 1 0
+  put tok 0 7
+  if or ne ab_end_token tok AB_BAD_ARGS ne get tok 0 7
+    ret 13
+  end
+  if ne ab_abort_token 1 AB_BAD_ARGS
+    ret 14
+  end
+  if ne ab_record_final AB_BAD_ARGS
+    ret 15
+  end
+  if or ne ab_oneshot_token tok AB_CHIP_FAIL ne get tok 0 7
+    ret 16
+  end
+  if or ne get g_ab_fk 3 sub0 ne get g_ab_fk 9 0
+    ret 17
+  end
+  put g_ab_fk 6 0
+  if ne ab_expect_between 0
+    ret 18
+  end
+  if ne ab_expect_valid 42 0
+    ret 19
+  end
+  if ne ab_expect_valid 43 0
+    ret 20
+  end
+  ab_world_free
+  ret ab_lock_free
+end
+
+fn ab_case_open_fails to long
+  ab_reset
+  if ne ab_world_build AB_OK
+    ret 30
+  end
+  ab_session_close
+  put g_ab_fk 5 1
+  tok = new ulong 1 0
+  for rep ulong 3
+    if ne ab_begin_token AB_CHIP_FAIL
+      ret 31
+    end
+    if ne ab_lock_free 0
+      ret 32
+    end
+  end
+  if ne ab_oneshot_token tok AB_CHIP_FAIL
+    ret 33
+  end
+  if ne ab_end_token tok AB_BAD_ARGS
+    ret 34
+  end
+  if or ne ab_set_final_norm AB_CHIP_FAIL ne ab_read AB_CHIP_FAIL
+    ret 35
+  end
+  put g_ab_fk 5 0
+  if ne ab_begin_token AB_CHIP_FAIL
+    ret 36
+  end
+  ab_world_free
+  if ne ab_world_build AB_OK
+    ret 37
+  end
+  if ne ab_expect_valid 5 0
+    ret 38
+  end
+  ab_world_free
+  ret ab_lock_free
+end
+
+fn ab_case_abort to long
+  ab_reset
+  if ne ab_world_build AB_OK
+    ret 40
+  end
+  sub0 = get g_ab_fk 3
+  if ne ab_begin_token AB_OK
+    ret 41
+  end
+  if ne ab_record_res 2 AB_OK
+    ret 42
+  end
+  if ne ab_abort_token 1 AB_OK
+    ret 43
+  end
+  if or ne ab_lock_free 0 ne get g_ab_fk 3 sub0
+    ret 44
+  end
+  tok = new ulong 1 0
+  if or ne ab_abort_token 1 AB_BAD_ARGS ne ab_end_token tok AB_BAD_ARGS
+    ret 45
+  end
+  if ne ab_begin_token AB_OK
+    ret 46
+  end
+  if ne ab_record_res 0xff AB_BAD_ARGS
+    ret 47
+  end
+  if ne ab_abort_token 1 AB_OK
+    ret 48
+  end
+  if ne ab_abort_token 0 AB_BAD_ARGS
+    ret 49
+  end
+  if ne ab_expect_between 0
+    ret 50
+  end
+  if ne ab_expect_valid 9 0
+    ret 51
+  end
+  ab_world_free
+  ret ab_lock_free
+end
+
+fn ab_case_end_after_fail to long
+  ab_reset
+  if ne ab_world_build AB_OK
+    ret 60
+  end
+  sub0 = get g_ab_fk 3
+  if ne ab_begin_token AB_OK
+    ret 61
+  end
+  if ne ab_record_res 2 AB_OK
+    ret 62
+  end
+  if ne ab_record_layer AB_BAD_ARGS
+    ret 63
+  end
+  if ne ab_record_final AB_CHIP_FAIL
+    ret 64
+  end
+  tok = new ulong 1 0
+  put tok 0 7
+  if or ne ab_end_token tok AB_CHIP_FAIL ne get tok 0 7
+    ret 65
+  end
+  if or ne get g_ab_fk 3 sub0 ne ab_lock_free 0
+    ret 66
+  end
+  for rep ulong 2
+    if or ne ab_oneshot_token tok AB_CHIP_FAIL ne get tok 0 7
+      ret 67
+    end
+  end
+  if ne ab_expect_between 0
+    ret 68
+  end
+  if ne ab_expect_valid 11 0
+    ret 69
+  end
+  ab_world_free
+  ret ab_lock_free
+end
+
+fn ab_case_latched to long
+  ab_reset
+  if ne ab_world_build AB_OK
+    ret 70
+  end
+  put g_ab_fk 10 1
+  put g_ab_fk 11 3
+  if ne ab_begin_token AB_OK
+    ret 71
+  end
+  if ne ab_record_res 2 AB_OK
+    ret 72
+  end
+  tok = new ulong 1 0
+  put tok 0 7
+  if or ne ab_end_token tok AB_CHIP_FAIL ne get tok 0 7
+    ret 73
+  end
+  if or eq get g_ab_fk 3 0 eq get g_ab_fk 9 0
+    ret 74
+  end
+  if ne ab_lock_free 0
+    ret 75
+  end
+  sub0 = get g_ab_fk 3
+  op0 = get g_ab_fk 4
+  for rep ulong 3
+    if ne ab_begin_token AB_CHIP_FAIL
+      ret 76
+    end
+    if or ne ab_oneshot_token tok AB_CHIP_FAIL ne get tok 0 7
+      ret 77
+    end
+  end
+  if or ne get g_ab_fk 3 sub0 ne get g_ab_fk 4 op0
+    ret 78
+  end
+  if or ne ab_end_token tok AB_BAD_ARGS ne ab_abort_token 1 AB_BAD_ARGS
+    ret 79
+  end
+  if ne ab_set_final_norm AB_OK
+    ret 80
+  end
+  ab_world_free
+  if eq get g_ab_fk 9 0
+    ret 81
+  end
+  ret ab_lock_free
+end
+
+fn main to int
+  rc = ab_case_sync_fails
+  if ne rc 0
+    ign = write 1 t_ab_fail 0 len t_ab_fail
+    ret int rc
+  end
+  rc = ab_case_open_fails
+  if ne rc 0
+    ign = write 1 t_ab_fail 0 len t_ab_fail
+    ret int rc
+  end
+  rc = ab_case_abort
+  if ne rc 0
+    ign = write 1 t_ab_fail 0 len t_ab_fail
+    ret int rc
+  end
+  rc = ab_case_end_after_fail
+  if ne rc 0
+    ign = write 1 t_ab_fail 0 len t_ab_fail
+    ret int rc
+  end
+  rc = ab_case_latched
+  if ne rc 0
+    ign = write 1 t_ab_fail 0 len t_ab_fail
+    ret int rc
+  end
+  ign = write 1 t_ab_pass 0 len t_ab_pass
+  ret 0
+end

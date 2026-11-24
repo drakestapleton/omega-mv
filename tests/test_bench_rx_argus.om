@@ -1,0 +1,107 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/bench_rx_argus.c.
+note Exercises the ARGUS_PERFORMANCE_GATE CPU-only hot path using pure OM-2
+note src/runtime/rx_aegis.om + src/runtime/rx_argus.om + seed/ng/sha256.om:
+note   - Starts ARGUS in mode 2 (ingest)
+note   - Emits CAP_GRANTED for SUBJ=7, RES=0x5810100, RIGHTS=1
+note   - Evaluates AEGIS policy + ARGUS use_begin/use_end across warmup + benchmark loops
+note   - Verifies monotonic clock readings, zero refused/malformed events, nonzero uses_counted,
+note     and clean rx_argus_shutdown.
+note Host-only, CPU-only, zero GPU access.
+om2
+
+const BA_SUBJ ulong 7
+const BA_RES ulong 0x5810100
+const BA_RIGHTS ulong 1
+const BA_CAP_ID ulong 1
+const BA_CAP_GEN ulong 1
+
+text t_ba_run "bench_rx_argus_om"
+text t_ba_pass "PASS test_bench_rx_argus\n"
+text t_ba_fail "FAIL test_bench_rx_argus\n"
+
+fn main to int
+  if ne rx_argus_start 2 t_ba_run len t_ba_run 0
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 1
+  end
+  rx_argus_emit_cap_granted BA_SUBJ BA_CAP_ID BA_CAP_GEN BA_RES BA_RIGHTS 0
+
+  rules = new ulong 112 0
+  note Rule 0: allow=1, subj=7, res_lo=0x5810100, res_hi=0x58101ff, rights=1, expiry=0, flags=0
+  put rules 0 1
+  put rules 1 BA_SUBJ
+  put rules 2 BA_RES
+  put rules 3 add BA_RES 0xff
+  put rules 4 BA_RIGHTS
+  put rules 5 0
+  put rules 6 0
+
+  req = new ulong 4 0
+  res = new ulong 3 0
+  put req 0 BA_SUBJ
+  put req 2 BA_RIGHTS
+  put req 3 0
+
+  sink = ulong 0
+  note Warmup + throughput phase (1024 ops)
+  t0 = monons
+  for i ulong 1024
+    put req 1 add BA_RES and i 7
+    dec = rx_aegis_evaluate rules 1 req res
+    if ne dec 1
+      ign = write 1 t_ba_fail 0 len t_ba_fail
+      ret 2
+    end
+    k = rx_argus_use_begin
+    rx_argus_use_end k BA_SUBJ BA_CAP_ID BA_CAP_GEN BA_RES 0
+    sink = add sink dec
+  end
+  t1 = monons
+  if lt t1 t0
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 3
+  end
+  if ne sink 1024
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 4
+  end
+
+  note Use-update batch phase (4 batches of 256)
+  for b ulong 4
+    for j ulong 256
+      k = rx_argus_use_begin
+      rx_argus_use_end k BA_SUBJ BA_CAP_ID BA_CAP_GEN BA_RES 0
+    end
+  end
+
+  rx_argus_stats
+  note ar_stats_buf[2] = ring_refused (must be 0), ar_stats_buf[0] = emitted (> 0)
+  if or ne get ar_stats_buf 2 0 eq get ar_stats_buf 0 0
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 5
+  end
+
+  rx_argus_shutdown
+  rx_argus_stats
+  note ar_stats_buf[3]=uses_flushed (2048), [7]=claimed (1), [10]=findings_total (0), [11]=late_events (0)
+  if ne get ar_stats_buf 3 2048
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 6
+  end
+  if ne get ar_stats_buf 7 1
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 7
+  end
+  if ne get ar_stats_buf 10 0
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 8
+  end
+  if ne get ar_stats_buf 11 0
+    ign = write 1 t_ba_fail 0 len t_ba_fail
+    ret 9
+  end
+
+  ign = write 1 t_ba_pass 0 len t_ba_pass
+  ret 0
+end

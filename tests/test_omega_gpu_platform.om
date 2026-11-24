@@ -1,0 +1,641 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_platform.c.
+note Contract tests for src/omega_gpu_platform.h / src/omega_gpu_platform.c:
+note   1. Refusal codes and counts
+note   2. ABI negotiation (major/minor, required services, unknown bits, all 6 limits)
+note   3. Service table checks (v1 required set, missing fns, hidden fallback refusal)
+note   4. Session services ABI 1.1/1.2 (polling-not-IRQ, no MMIO required)
+note   5. Buffer descriptor validation (kind, length, align, cache, rights, exec, queue, host-polled)
+note   6. Typed generationed handle table (open, check, close, stale, reuse, per-kind limit,
+note      4096-slot capacity, and generation 0xFFFFFFFF wrap retirement).
+note Host-only, CPU-only, zero GPU access.
+om2
+
+const GP_ABI_MAJOR ulong 1
+const GP_ABI_MINOR ulong 2
+
+const GP_OK ulong 0
+const GP_REF_ARGS ulong 1
+const GP_REF_ABI ulong 2
+const GP_REF_MISSING_SVC ulong 3
+const GP_REF_NULL_SVC ulong 4
+const GP_REF_BAD_HANDLE ulong 5
+const GP_REF_STALE_HANDLE ulong 6
+const GP_REF_BAD_LENGTH ulong 7
+const GP_REF_BAD_RIGHTS ulong 8
+const GP_REF_BAD_KIND ulong 9
+const GP_REF_CACHE_POLICY ulong 10
+const GP_REF_LIMIT ulong 11
+const GP_REF_BUSY ulong 12
+const GP_REF_DEVICE ulong 13
+const GP_REF_COUNT ulong 14
+const GP_POLL_TIMED_OUT ulong 100
+
+const GP_H_DEV ulong 1
+const GP_H_BUF_DATA ulong 2
+const GP_H_BUF_CODE ulong 3
+const GP_H_BUF_QUEUE ulong 4
+const GP_H_QUEUE ulong 5
+const GP_H_KIND_COUNT ulong 6
+
+const GP_R_CPU_RD ulong 1
+const GP_R_CPU_WR ulong 2
+const GP_R_GPU_RD ulong 4
+const GP_R_GPU_WR ulong 8
+const GP_R_GPU_EX ulong 16
+const GP_R_HOST_POLLED ulong 32
+const GP_R_ALL ulong 63
+
+const GP_CACHE_UNCACHED ulong 0
+const GP_CACHE_CACHED ulong 1
+
+const GP_SVC_TIME ulong 1
+const GP_SVC_WAIT ulong 2
+const GP_SVC_LOCK ulong 4
+const GP_SVC_MMIO ulong 8
+const GP_SVC_DMA ulong 16
+const GP_SVC_SYNC ulong 32
+const GP_SVC_COMPLETION ulong 64
+const GP_SVC_IRQ ulong 128
+const GP_SVC_REQ_V1 ulong 127
+const GP_SVC_DEVICE ulong 256
+const GP_SVC_QUEUE ulong 512
+const GP_SVC_CLOCK_NS ulong 1024
+const GP_SVC_HOST_MEM ulong 2048
+const GP_SVC_REQ_SESSION ulong 3959
+const GP_SVC_ALL ulong 4095
+
+const GP_SLOTS ulong 4096
+
+text t_gp_pass "PASS test_omega_gpu_platform\n"
+text t_gp_fail "FAIL test_omega_gpu_platform\n"
+
+note Handle table globals (4096 slots)
+global g_ht_gen uint 4096
+global g_ht_kind uint 4096
+global g_ht_bytes ulong 4096
+global g_ht_live uchar 4096
+global g_ht_nlive ulong 1
+global g_ht_tot ulong 1
+
+note Caps layout (9 ulongs):
+note [0]=major [1]=minor [2]=services [3]=max_dev [4]=max_buf [5]=max_q [6]=max_inf [7]=max_buf_b [8]=max_tot_b
+
+fn gp_caps_v1 c edit ulong 9 to void
+  put c 0 GP_ABI_MAJOR
+  put c 1 GP_ABI_MINOR
+  put c 2 GP_SVC_REQ_V1
+  put c 3 1
+  put c 4 8
+  put c 5 2
+  put c 6 1
+  put c 7 1048576
+  put c 8 4194304
+end
+
+fn gp_negotiate p view ulong 9 r view ulong 9 to ulong
+  if ne get p 0 get r 0
+    ret GP_REF_ABI
+  end
+  if lt get p 1 get r 1
+    ret GP_REF_ABI
+  end
+  comb = or get p 2 get r 2
+  if ne and comb xor GP_SVC_ALL ulong 0xffffffffffffffff 0
+    ret GP_REF_ARGS
+  end
+  miss = and get r 2 xor get p 2 ulong 0xffffffffffffffff
+  if ne miss 0
+    ret GP_REF_MISSING_SVC
+  end
+  if gt get r 3 get p 3
+    ret GP_REF_LIMIT
+  end
+  if gt get r 4 get p 4
+    ret GP_REF_LIMIT
+  end
+  if gt get r 5 get p 5
+    ret GP_REF_LIMIT
+  end
+  if gt get r 6 get p 6
+    ret GP_REF_LIMIT
+  end
+  if gt get r 7 get p 7
+    ret GP_REF_LIMIT
+  end
+  if gt get r 8 get p 8
+    ret GP_REF_LIMIT
+  end
+  ret GP_OK
+end
+
+note Platform table: bitmask of 21 function pointers in a ulong:
+note 0:time_now_ms 1:wait_ms 2:lock 3:unlock 4:mmio_rd 5:mmio_wr 6:dma_alloc 7:dma_free
+note 8:sync_c2g 9:sync_g2c 10:poll_word 11:irq_wait
+note 12:dev_open 13:dev_close 14:diag_text 15:q_open 16:q_close 17:q_sub 18:q_ret
+note 19:time_now_ns 20:host_alloc 21:host_free
+
+fn gp_svc_check svcs ulong sbit ulong fmask ulong want ulong to ulong
+  has_all = eq and fmask want want
+  has_any = ne and fmask want 0
+  if ne and svcs sbit 0
+    if has_all
+      ret GP_OK
+    end
+    ret GP_REF_NULL_SVC
+  end
+  if has_any
+    ret GP_REF_ARGS
+  end
+  ret GP_OK
+end
+
+fn gp_check_for fmask ulong svcs ulong req ulong to ulong
+  if ne and svcs xor GP_SVC_ALL ulong 0xffffffffffffffff 0
+    ret GP_REF_ARGS
+  end
+  if ne and req xor GP_SVC_ALL ulong 0xffffffffffffffff 0
+    ret GP_REF_ARGS
+  end
+  if ne and svcs req req
+    ret GP_REF_MISSING_SVC
+  end
+  rc = gp_svc_check svcs GP_SVC_TIME fmask 1
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_WAIT fmask 2
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_LOCK fmask 12
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_MMIO fmask 48
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_DMA fmask 192
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_SYNC fmask 768
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_COMPLETION fmask 1024
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_IRQ fmask 2048
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_DEVICE fmask 28672
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_QUEUE fmask 491520
+  if ne rc 0
+    ret rc
+  end
+  rc = gp_svc_check svcs GP_SVC_CLOCK_NS fmask 524288
+  if ne rc 0
+    ret rc
+  end
+  ret gp_svc_check svcs GP_SVC_HOST_MEM fmask 3145728
+end
+
+note Buffer desc layout (5 ulongs): [0]=kind [1]=rights [2]=gpu_cache [3]=align [4]=bytes
+fn gp_check_buf d view ulong 5 max_buf_b ulong to ulong
+  k = get d 0
+  if and ne k GP_H_BUF_DATA and ne k GP_H_BUF_CODE ne k GP_H_BUF_QUEUE
+    ret GP_REF_BAD_KIND
+  end
+  if eq get d 4 0
+    ret GP_REF_BAD_LENGTH
+  end
+  if gt get d 4 max_buf_b
+    ret GP_REF_LIMIT
+  end
+  al = get d 3
+  if ne al 0
+    if ne and al sub al 1 0
+      ret GP_REF_ARGS
+    end
+  end
+  gc = get d 2
+  if and ne gc GP_CACHE_UNCACHED ne gc GP_CACHE_CACHED
+    ret GP_REF_ARGS
+  end
+  r = get d 1
+  if or eq r 0 ne and r xor GP_R_ALL ulong 0xffffffffffffffff 0
+    ret GP_REF_BAD_RIGHTS
+  end
+  if and ne and r GP_R_GPU_EX 0 ne k GP_H_BUF_CODE
+    ret GP_REF_BAD_RIGHTS
+  end
+  if eq k GP_H_BUF_CODE
+    if ne and r or GP_R_GPU_WR GP_R_HOST_POLLED 0
+      ret GP_REF_BAD_RIGHTS
+    end
+    if or eq and r GP_R_GPU_EX 0 eq and r GP_R_CPU_WR 0
+      ret GP_REF_BAD_RIGHTS
+    end
+  end
+  if eq k GP_H_BUF_QUEUE
+    if or eq and r GP_R_CPU_WR 0 eq and r GP_R_GPU_RD 0
+      ret GP_REF_BAD_RIGHTS
+    end
+  end
+  if ne and r GP_R_HOST_POLLED 0
+    if or eq and r GP_R_CPU_RD 0 eq and r GP_R_GPU_WR 0
+      ret GP_REF_BAD_RIGHTS
+    end
+    if ne gc GP_CACHE_UNCACHED
+      ret GP_REF_CACHE_POLICY
+    end
+  end
+  ret GP_OK
+end
+
+fn gp_ht_init to void
+  for i ulong GP_SLOTS
+    put g_ht_gen i 1
+    put g_ht_kind i 0
+    put g_ht_bytes i 0
+    put g_ht_live i 0
+  end
+  put g_ht_nlive 0 0
+  put g_ht_tot 0 0
+end
+
+fn gp_ht_open kind ulong nbytes ulong lim_slots ulong lim_bytes ulong dst edit ulong 2 to ulong
+  if or lt kind GP_H_DEV ge kind GP_H_KIND_COUNT
+    ret GP_REF_BAD_KIND
+  end
+  same = ulong 0
+  for i ulong GP_SLOTS
+    if and ne get g_ht_live i 0 eq ulong get g_ht_kind i kind
+      same = add same 1
+    end
+  end
+  if ge same lim_slots
+    ret GP_REF_LIMIT
+  end
+  tot = get g_ht_tot 0
+  if ne nbytes 0
+    if or gt nbytes lim_bytes gt tot sub lim_bytes nbytes
+      ret GP_REF_LIMIT
+    end
+  end
+  for i ulong GP_SLOTS
+    if and eq get g_ht_live i 0 ne get g_ht_gen i 0
+      put g_ht_live i 1
+      put g_ht_kind i uint kind
+      put g_ht_bytes i nbytes
+      put g_ht_nlive 0 add get g_ht_nlive 0 1
+      put g_ht_tot 0 add tot nbytes
+      put dst 0 i
+      put dst 1 ulong get g_ht_gen i
+      ret GP_OK
+    end
+  end
+  ret GP_REF_LIMIT
+end
+
+fn gp_ht_check idx ulong gen ulong kind ulong to ulong
+  if or ge idx GP_SLOTS eq gen 0
+    ret GP_REF_BAD_HANDLE
+  end
+  if or eq get g_ht_live idx 0 ne ulong get g_ht_gen idx gen
+    ret GP_REF_STALE_HANDLE
+  end
+  if ne ulong get g_ht_kind idx kind
+    ret GP_REF_BAD_HANDLE
+  end
+  ret GP_OK
+end
+
+fn gp_ht_close idx ulong gen ulong kind ulong to ulong
+  rc = gp_ht_check idx gen kind
+  if ne rc GP_OK
+    ret rc
+  end
+  put g_ht_live idx 0
+  put g_ht_tot 0 sub get g_ht_tot 0 get g_ht_bytes idx
+  put g_ht_bytes idx 0
+  put g_ht_nlive 0 sub get g_ht_nlive 0 1
+  ng = uint and add ulong get g_ht_gen idx 1 0xffffffff
+  put g_ht_gen idx ng
+  ret GP_OK
+end
+
+fn gp_test_negotiate to long
+  p = new ulong 9 0
+  r = new ulong 9 0
+  gp_caps_v1 p
+  gp_caps_v1 r
+  if ne gp_negotiate p r GP_OK
+    ret 10
+  end
+  put p 1 add get r 1 1
+  if ne gp_negotiate p r GP_OK
+    ret 11
+  end
+  gp_caps_v1 p
+  put r 1 add get p 1 1
+  if ne gp_negotiate p r GP_REF_ABI
+    ret 12
+  end
+  gp_caps_v1 r
+  put p 0 add get r 0 1
+  if ne gp_negotiate p r GP_REF_ABI
+    ret 13
+  end
+  gp_caps_v1 p
+  put r 2 or get r 2 GP_SVC_IRQ
+  if ne gp_negotiate p r GP_REF_MISSING_SVC
+    ret 14
+  end
+  put p 2 or get p 2 GP_SVC_IRQ
+  if ne gp_negotiate p r GP_OK
+    ret 15
+  end
+  put p 2 or get p 2 4096
+  if ne gp_negotiate p r GP_REF_ARGS
+    ret 16
+  end
+  gp_caps_v1 p
+  gp_caps_v1 r
+  put r 3 2
+  if ne gp_negotiate p r GP_REF_LIMIT
+    ret 17
+  end
+  gp_caps_v1 r
+  put r 4 9
+  if ne gp_negotiate p r GP_REF_LIMIT
+    ret 18
+  end
+  gp_caps_v1 r
+  put r 5 3
+  if ne gp_negotiate p r GP_REF_LIMIT
+    ret 19
+  end
+  gp_caps_v1 r
+  put r 6 2
+  if ne gp_negotiate p r GP_REF_LIMIT
+    ret 20
+  end
+  gp_caps_v1 r
+  put r 7 1048577
+  if ne gp_negotiate p r GP_REF_LIMIT
+    ret 21
+  end
+  gp_caps_v1 r
+  put r 8 4194305
+  if ne gp_negotiate p r GP_REF_LIMIT
+    ret 22
+  end
+  gp_caps_v1 r
+  put r 4 1
+  put r 8 1
+  if ne gp_negotiate p r GP_OK
+    ret 23
+  end
+  ret 0
+end
+
+fn gp_test_tables to long
+  full_v1 = ulong 2047
+  if ne gp_check_for full_v1 GP_SVC_REQ_V1 GP_SVC_REQ_V1 GP_OK
+    ret 30
+  end
+  if ne gp_check_for full_v1 and GP_SVC_REQ_V1 xor GP_SVC_SYNC ulong 0xffffffffffffffff GP_SVC_REQ_V1 GP_REF_MISSING_SVC
+    ret 31
+  end
+  if ne gp_check_for and full_v1 xor 1 ulong 0xffffffffffffffff GP_SVC_REQ_V1 GP_SVC_REQ_V1 GP_REF_NULL_SVC
+    ret 32
+  end
+  if ne gp_check_for and full_v1 xor 8 ulong 0xffffffffffffffff GP_SVC_REQ_V1 GP_SVC_REQ_V1 GP_REF_NULL_SVC
+    ret 33
+  end
+  if ne gp_check_for and full_v1 xor 1024 ulong 0xffffffffffffffff GP_SVC_REQ_V1 GP_SVC_REQ_V1 GP_REF_NULL_SVC
+    ret 34
+  end
+  if ne gp_check_for full_v1 or GP_SVC_REQ_V1 GP_SVC_IRQ GP_SVC_REQ_V1 GP_REF_NULL_SVC
+    ret 35
+  end
+  if ne gp_check_for or full_v1 2048 or GP_SVC_REQ_V1 GP_SVC_IRQ GP_SVC_REQ_V1 GP_OK
+    ret 36
+  end
+  if ne gp_check_for or full_v1 2048 GP_SVC_REQ_V1 GP_SVC_REQ_V1 GP_REF_ARGS
+    ret 37
+  end
+
+  note Session services ABI 1.1/1.2 (polling, no MMIO, no IRQ)
+  sess_f = ulong 4192207
+  if ne gp_check_for sess_f GP_SVC_REQ_SESSION GP_SVC_REQ_SESSION GP_OK
+    ret 38
+  end
+  if ne gp_check_for sess_f GP_SVC_REQ_SESSION GP_SVC_REQ_V1 GP_REF_MISSING_SVC
+    ret 39
+  end
+  if ne gp_check_for sess_f GP_SVC_REQ_SESSION add GP_SVC_ALL 1 GP_REF_ARGS
+    ret 40
+  end
+  if ne gp_check_for or sess_f 2048 GP_SVC_REQ_SESSION GP_SVC_REQ_SESSION GP_REF_ARGS
+    ret 41
+  end
+  if lt GP_POLL_TIMED_OUT GP_REF_COUNT
+    ret 42
+  end
+  ret 0
+end
+
+fn gp_test_buffers to long
+  d = new ulong 5 0
+  mb = ulong 1048576
+  put d 0 GP_H_BUF_DATA
+  put d 1 or GP_R_CPU_WR GP_R_GPU_RD
+  put d 2 GP_CACHE_UNCACHED
+  put d 3 0
+  put d 4 4096
+  if ne gp_check_buf d mb GP_OK
+    ret 50
+  end
+  put d 0 GP_H_QUEUE
+  if ne gp_check_buf d mb GP_REF_BAD_KIND
+    ret 51
+  end
+  put d 0 GP_H_BUF_DATA
+  put d 4 0
+  if ne gp_check_buf d mb GP_REF_BAD_LENGTH
+    ret 52
+  end
+  put d 4 1048577
+  if ne gp_check_buf d mb GP_REF_LIMIT
+    ret 53
+  end
+  put d 4 4096
+  put d 3 48
+  if ne gp_check_buf d mb GP_REF_ARGS
+    ret 54
+  end
+  put d 3 64
+  if ne gp_check_buf d mb GP_OK
+    ret 55
+  end
+  put d 2 7
+  if ne gp_check_buf d mb GP_REF_ARGS
+    ret 56
+  end
+  put d 2 GP_CACHE_CACHED
+  put d 1 0
+  if ne gp_check_buf d mb GP_REF_BAD_RIGHTS
+    ret 57
+  end
+  put d 1 128
+  if ne gp_check_buf d mb GP_REF_BAD_RIGHTS
+    ret 58
+  end
+  put d 1 or GP_R_GPU_EX GP_R_CPU_WR
+  if ne gp_check_buf d mb GP_REF_BAD_RIGHTS
+    ret 59
+  end
+  put d 0 GP_H_BUF_CODE
+  if ne gp_check_buf d mb GP_OK
+    ret 60
+  end
+  put d 1 or get d 1 GP_R_GPU_WR
+  if ne gp_check_buf d mb GP_REF_BAD_RIGHTS
+    ret 61
+  end
+  put d 0 GP_H_BUF_QUEUE
+  put d 1 GP_R_CPU_WR
+  if ne gp_check_buf d mb GP_REF_BAD_RIGHTS
+    ret 62
+  end
+  put d 1 or GP_R_CPU_WR GP_R_GPU_RD
+  if ne gp_check_buf d mb GP_OK
+    ret 63
+  end
+  put d 0 GP_H_BUF_DATA
+  put d 1 or GP_R_HOST_POLLED or GP_R_CPU_RD GP_R_GPU_WR
+  put d 2 GP_CACHE_CACHED
+  if ne gp_check_buf d mb GP_REF_CACHE_POLICY
+    ret 64
+  end
+  put d 2 GP_CACHE_UNCACHED
+  if ne gp_check_buf d mb GP_OK
+    ret 65
+  end
+  put d 1 or GP_R_HOST_POLLED GP_R_CPU_RD
+  if ne gp_check_buf d mb GP_REF_BAD_RIGHTS
+    ret 66
+  end
+  ret 0
+end
+
+fn gp_test_handles to long
+  h0 = new ulong 2 0
+  h1 = new ulong 2 0
+  h2 = new ulong 2 0
+  gp_ht_init
+  if ne gp_ht_open 0 0 1 0 h0 GP_REF_BAD_KIND
+    ret 70
+  end
+  if ne gp_ht_open GP_H_KIND_COUNT 0 1 0 h0 GP_REF_BAD_KIND
+    ret 71
+  end
+  if ne gp_ht_open GP_H_DEV 0 1 0 h0 GP_OK
+    ret 72
+  end
+  if eq get h0 1 0
+    ret 73
+  end
+  if ne gp_ht_open GP_H_DEV 0 1 0 h1 GP_REF_LIMIT
+    ret 74
+  end
+  if ne gp_ht_open GP_H_BUF_DATA 3000 8 4096 h1 GP_OK
+    ret 75
+  end
+  if ne gp_ht_open GP_H_BUF_DATA 2000 8 4096 h2 GP_REF_LIMIT
+    ret 76
+  end
+  if ne gp_ht_open GP_H_BUF_CODE 1096 8 4096 h2 GP_OK
+    ret 77
+  end
+  if or ne get g_ht_nlive 0 3 ne get g_ht_tot 0 4096
+    ret 78
+  end
+  if ne gp_ht_check get h1 0 get h1 1 GP_H_BUF_DATA GP_OK
+    ret 79
+  end
+  if ne gp_ht_check get h1 0 get h1 1 GP_H_BUF_CODE GP_REF_BAD_HANDLE
+    ret 80
+  end
+  if ne gp_ht_check GP_SLOTS 1 GP_H_BUF_DATA GP_REF_BAD_HANDLE
+    ret 81
+  end
+  if ne gp_ht_check get h1 0 add get h1 1 1 GP_H_BUF_DATA GP_REF_STALE_HANDLE
+    ret 82
+  end
+  if ne gp_ht_close get h1 0 get h1 1 GP_H_BUF_DATA GP_OK
+    ret 83
+  end
+  if ne gp_ht_close get h1 0 get h1 1 GP_H_BUF_DATA GP_REF_STALE_HANDLE
+    ret 84
+  end
+  if ne gp_ht_open GP_H_BUF_DATA 3000 8 4096 h2 GP_OK
+    ret 85
+  end
+  if or ne get h2 0 get h1 0 ne get h2 1 add get h1 1 1
+    ret 86
+  end
+  note Wrap generation 0xFFFFFFFF retires slot 0
+  gp_ht_init
+  put g_ht_gen 0 0xffffffff
+  if ne gp_ht_open GP_H_BUF_DATA 1 8 8 h0 GP_OK
+    ret 87
+  end
+  if or ne get h0 0 0 ne get h0 1 0xffffffff
+    ret 88
+  end
+  if ne gp_ht_close 0 get h0 1 GP_H_BUF_DATA GP_OK
+    ret 89
+  end
+  if ne gp_ht_open GP_H_BUF_DATA 1 8 8 h1 GP_OK
+    ret 90
+  end
+  if or ne get h1 0 1 ne get h1 1 1
+    ret 91
+  end
+  ret 0
+end
+
+fn main to int
+  rc = gp_test_negotiate
+  if ne rc 0
+    ign = write 1 t_gp_fail 0 len t_gp_fail
+    ret int rc
+  end
+  rc = gp_test_tables
+  if ne rc 0
+    ign = write 1 t_gp_fail 0 len t_gp_fail
+    ret int rc
+  end
+  rc = gp_test_buffers
+  if ne rc 0
+    ign = write 1 t_gp_fail 0 len t_gp_fail
+    ret int rc
+  end
+  rc = gp_test_handles
+  if ne rc 0
+    ign = write 1 t_gp_fail 0 len t_gp_fail
+    ret int rc
+  end
+  ign = write 1 t_gp_pass 0 len t_gp_pass
+  ret 0
+end

@@ -1,0 +1,235 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/test_omega_gpu_decode_graph_timeline.c.
+note Verifies the decode graph per-token timeline contract (omega #456) on a pure OM-2
+note fake platform (zero GPU):
+note   - Timeline holds MAX_LAUNCHES + 1 = 4097 stamps (for MAX_LAUNCHES = 4096 launches).
+note   - With flush_each=1 (one submission per launch), 4096 stamped launches fill the
+note     timeline exactly, read back 4096 strictly increasing stamps, and release the lock.
+note   - 4097th launch (index 4096) fails the token (CHIP_FAIL, timeline full), never writes
+note     past stamp[4096], releases the lock at end_token, refuses stamps() readback, and
+note     allows the next token (3 launches) to succeed and read back 3 stamps cleanly.
+note Host-only, CPU-only, zero GPU access.
+om2
+
+const TL_OK ulong 0
+const TL_BAD_ARGS ulong 1
+const TL_CHIP_FAIL ulong 2
+const TL_MAX_LAUNCHES ulong 4096
+const TL_KIND_SWIGLU ulong 3
+
+text t_tl_pass "PASS test_omega_gpu_decode_graph_timeline\n"
+text t_tl_fail "FAIL test_omega_gpu_decode_graph_timeline\n"
+
+note Fake platform state: [0]=ns, [1]=locks_held, [2]=double_locks, [3]=bad_unlocks, [4]=submits
+global g_tl_fk ulong 8
+
+note Decode graph state:
+note [0]=in_token, [1]=failed, [2]=stamps_on, [3]=flush_each, [4]=n_stamps, [5]=last_ok_stamps, [6]=dev_token
+global g_tl_g ulong 8
+note Timeline buffers: 4097 stamps + 1 sentinel at index 4097 (must stay 0xdeadbeef)
+global g_tl_stamps ulong 4098
+global g_tl_kinds uchar 4098
+
+fn tl_reset to void
+  for i ulong 8
+    put g_tl_fk i 0
+    put g_tl_g i 0
+  end
+  put g_tl_g 2 1
+  put g_tl_g 3 1
+  for i ulong 4097
+    put g_tl_stamps i 0
+    put g_tl_kinds i 0
+  end
+  put g_tl_stamps 4097 0xdeadbeef
+  put g_tl_kinds 4097 0xaa
+end
+
+fn tl_lock to ulong
+  if ne get g_tl_fk 1 0
+    put g_tl_fk 2 add get g_tl_fk 2 1
+    ret 1
+  end
+  put g_tl_fk 1 1
+  ret 0
+end
+
+fn tl_unlock to ulong
+  if eq get g_tl_fk 1 0
+    put g_tl_fk 3 add get g_tl_fk 3 1
+    ret 1
+  end
+  put g_tl_fk 1 0
+  ret 0
+end
+
+fn tl_lock_free to long
+  if or ne get g_tl_fk 1 0 or ne get g_tl_fk 2 0 ne get g_tl_fk 3 0
+    ret 1
+  end
+  ret 0
+end
+
+fn tl_begin_token dev_tok ulong to ulong
+  if ne get g_tl_g 0 0
+    ret TL_BAD_ARGS
+  end
+  if ne tl_lock 0
+    ret TL_CHIP_FAIL
+  end
+  put g_tl_g 0 1
+  put g_tl_g 1 0
+  put g_tl_g 4 0
+  put g_tl_g 5 0
+  put g_tl_g 6 dev_tok
+  note Initial t0 stamp at index 0
+  ns = add get g_tl_fk 0 1000
+  put g_tl_fk 0 ns
+  put g_tl_stamps 0 ns
+  ret TL_OK
+end
+
+fn tl_record_swiglu to ulong
+  if eq get g_tl_g 0 0
+    ret TL_BAD_ARGS
+  end
+  if ne get g_tl_g 1 0
+    ret TL_CHIP_FAIL
+  end
+  n = get g_tl_g 4
+  if ge n TL_MAX_LAUNCHES
+    put g_tl_g 1 1
+    ret TL_CHIP_FAIL
+  end
+  note flush_each submits immediately and writes stamp[n+1]
+  put g_tl_fk 4 add get g_tl_fk 4 1
+  ns = add get g_tl_fk 0 1000
+  put g_tl_fk 0 ns
+  put g_tl_stamps add n 1 ns
+  put g_tl_kinds n uchar TL_KIND_SWIGLU
+  put g_tl_g 4 add n 1
+  ret TL_OK
+end
+
+fn tl_end_token out_tok edit ulong 1 to ulong
+  if eq get g_tl_g 0 0
+    ret TL_BAD_ARGS
+  end
+  failed = get g_tl_g 1
+  n = get g_tl_g 4
+  put g_tl_g 0 0
+  ign = tl_unlock
+  if ne failed 0
+    put g_tl_g 5 0
+    ret TL_CHIP_FAIL
+  end
+  put g_tl_g 5 n
+  put out_tok 0 get g_tl_g 6
+  ret TL_OK
+end
+
+fn tl_read_stamps to long
+  if ne get g_tl_g 1 0
+    ret -1
+  end
+  ret long get g_tl_g 5
+end
+
+fn tl_run_token launches ulong want_tok ulong res edit ulong 2 to ulong
+  if ne tl_begin_token want_tok TL_OK
+    ret 99
+  end
+  refused = launches
+  for i ulong launches bound 4100
+    rc = tl_record_swiglu
+    if and ne rc TL_OK eq refused launches
+      refused = i
+    end
+  end
+  tok = new ulong 1 0
+  put tok 0 get res 1
+  erc = tl_end_token tok
+  put res 0 refused
+  put res 1 get tok 0
+  ret erc
+end
+
+fn tl_case_full to long
+  tl_reset
+  res = new ulong 2 0
+  put res 1 0
+  if ne tl_run_token TL_MAX_LAUNCHES 7 res TL_OK
+    ret 10
+  end
+  if or ne get res 0 TL_MAX_LAUNCHES ne get res 1 7
+    ret 11
+  end
+  if ne get g_tl_fk 4 TL_MAX_LAUNCHES
+    ret 12
+  end
+  if ne tl_lock_free 0
+    ret 13
+  end
+  if ne tl_read_stamps long TL_MAX_LAUNCHES
+    ret 14
+  end
+  for i ulong TL_MAX_LAUNCHES
+    if le get g_tl_stamps add i 1 get g_tl_stamps i
+      ret 15
+    end
+  end
+  if ne get g_tl_stamps 4097 0xdeadbeef
+    ret 16
+  end
+  ret 0
+end
+
+fn tl_case_overflow to long
+  tl_reset
+  res = new ulong 2 0
+  put res 1 0xdead
+  if ne tl_run_token add TL_MAX_LAUNCHES 1 7 res TL_CHIP_FAIL
+    ret 20
+  end
+  if or ne get res 0 TL_MAX_LAUNCHES ne get res 1 0xdead
+    ret 21
+  end
+  if ne tl_lock_free 0
+    ret 22
+  end
+  if ne get g_tl_stamps 4097 0xdeadbeef
+    ret 23
+  end
+  if ne tl_read_stamps -1
+    ret 24
+  end
+  note Next small token (3 launches) succeeds cleanly
+  if ne tl_run_token 3 9 res TL_OK
+    ret 25
+  end
+  if or ne get res 0 3 ne get res 1 9
+    ret 26
+  end
+  if ne tl_lock_free 0
+    ret 27
+  end
+  if ne tl_read_stamps 3
+    ret 28
+  end
+  ret 0
+end
+
+fn main to int
+  rc = tl_case_full
+  if ne rc 0
+    ign = write 1 t_tl_fail 0 len t_tl_fail
+    ret int rc
+  end
+  rc = tl_case_overflow
+  if ne rc 0
+    ign = write 1 t_tl_fail 0 len t_tl_fail
+    ret int rc
+  end
+  ign = write 1 t_tl_pass 0 len t_tl_pass
+  ret 0
+end
