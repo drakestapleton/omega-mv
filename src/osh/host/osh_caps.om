@@ -1,0 +1,606 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_caps.c (capability policy & effect gate).
+note Reuses osh_om_op_right, osh_om_map_cap_rc, osh_om_path_under, osh_om_check_binding from osh_core.om.
+om2
+
+const OSH_CAPS_MAX_GRANTS ulong 200
+const OSH_CAPS_POOL ulong 65536
+
+global cap_started ulong 1
+global cap_sealed ulong 1
+global cap_principal ulong 1
+global cap_prin_gen ulong 1
+global cap_prin_revoked ulong 1
+global cap_ngrants ulong 1
+global cap_g_op ulong 200
+global cap_g_poff ulong 200
+global cap_g_plen ulong 200
+global cap_g_gen ulong 200
+global cap_g_revoked ulong 200
+global cap_pool uchar 65536
+global cap_pool_used ulong 1
+global cap_enabled ulong 1
+
+text cap_s_prin "principal"
+text cap_s_allow "allow"
+text cap_s_spawn "spawn"
+text cap_s_read "read"
+text cap_s_write "write"
+text cap_s_chdir "chdir"
+
+fn cap_eq_txt s view uchar * off ulong ln ulong t view uchar * to ulong
+  if ne ln len t
+    ret 0
+  end
+  i = ulong 0
+  while lt i ln bound 32
+    if ne get s add off i get t i
+      ret 0
+    end
+    i = add i 1
+  end
+  ret 1
+end
+
+note Lexical canonicalization of an absolute path into dst[0..4096), returns len or -1.
+fn osh_path_lex_canon src view uchar * sl ulong dst edit uchar * to long
+  if or eq sl 0 ne get src 0 47
+    ret -1
+  end
+  put dst 0 47
+  n = ulong 1
+  i = ulong 0
+  while lt i sl bound 4096
+    while lt i sl bound 4096
+      if ne get src i 47
+        break
+      end
+      i = add i 1
+    end
+    st = i
+    while lt i sl bound 4096
+      if eq get src i 47
+        break
+      end
+      i = add i 1
+    end
+    cl = sub i st
+    if eq cl 0
+      break
+    end
+    if eq cl 1
+      if eq get src st 46
+        continue
+      end
+    end
+    if eq cl 2
+      if eq get src st 46
+        if eq get src add st 1 46
+          while gt n 1 bound 4096
+            if eq get dst sub n 1 47
+              break
+            end
+            n = sub n 1
+          end
+          if gt n 1
+            n = sub n 1
+          end
+          continue
+        end
+      end
+    end
+    if gt add add n cl 2 4096
+      ret -1
+    end
+    if gt n 1
+      put dst n 47
+      n = add n 1
+    end
+    k = ulong 0
+    while lt k cl bound 4096
+      put dst add n k get src add st k
+      k = add k 1
+    end
+    n = add n cl
+  end
+  ret long n
+end
+
+fn cap_init_abs src view uchar * sl ulong cur edit uchar 4096 to long
+  if eq get src 0 47
+    i = ulong 0
+    while lt i sl bound 4096
+      put cur i get src i
+      i = add i 1
+    end
+    ret long sl
+  end
+  cr = cwd cur 0 4096
+  if le cr 1
+    ret -1
+  end
+  cl = sub ulong cr 1
+  if gt add add cl 1 sl 4095
+    ret -1
+  end
+  put cur cl 47
+  cl = add cl 1
+  i = ulong 0
+  while lt i sl bound 4096
+    put cur add cl i get src i
+    i = add i 1
+  end
+  ret long add cl sl
+end
+
+fn cap_apply_link cur edit uchar 4096 cl ulong lbuf view uchar 4096 ull ulong to long
+  if and gt ull 0 eq get lbuf 0 47
+    i = ulong 0
+    while lt i ull bound 4096
+      put cur i get lbuf i
+      i = add i 1
+    end
+    ret long ull
+  end
+  n = cl
+  while and gt n 1 ne get cur sub n 1 47 bound 4096
+    n = sub n 1
+  end
+  if gt add n ull 4095
+    ret -1
+  end
+  i = ulong 0
+  while lt i ull bound 4096
+    put cur add n i get lbuf i
+    i = add i 1
+  end
+  ret long add n ull
+end
+
+fn cap_realpath_step cur edit uchar 4096 cl ulong to long
+  note returns >=0 new cl (still symlink), -2 if done (not symlink, cur holds canon), -1 on error
+  st = new uchar 128 0
+  lbuf = new uchar 4096 0
+  tmp = new uchar 4096 0
+  nl = osh_path_lex_canon cur cl tmp
+  if lt nl 0
+    ret -1
+  end
+  ucl = ulong nl
+  i = ulong 0
+  while lt i ucl bound 4096
+    put cur i get tmp i
+    i = add i 1
+  end
+  if ne stat cur 0 ucl st 0 128 0
+    ret -1
+  end
+  lr = readlnk cur 0 ucl lbuf 0 4095
+  if lt lr 0
+    ret sub 0 add long ucl 10
+  end
+  ret cap_apply_link cur ucl lbuf ulong lr
+end
+
+note Resolve symlinks (realpath-equivalent) for an existing path; returns len or -1.
+fn osh_realpath src view uchar * sl ulong dst edit uchar * to long
+  if eq sl 0
+    ret -1
+  end
+  cur = new uchar 4096 0
+  ic = cap_init_abs src sl cur
+  if lt ic 0
+    ret -1
+  end
+  cl = ulong ic
+  steps = ulong 0
+  while lt steps 40 bound 40
+    sr = cap_realpath_step cur cl
+    if eq sr -1
+      ret -1
+    end
+    if lt sr -1
+      ucl = ulong sub neg sr 10
+      i = ulong 0
+      while lt i ucl bound 4096
+        put dst i get cur i
+        i = add i 1
+      end
+      ret long ucl
+    end
+    cl = ulong sr
+    steps = add steps 1
+  end
+  ret -1
+end
+
+fn cap_split_dir path view uchar * pl ulong dir edit uchar 4096 boff_box edit ulong 1 to ulong
+  sl = ulong 0
+  has_sl = ulong 0
+  i = ulong 0
+  while lt i pl bound 4096
+    if eq get path i 47
+      sl = i
+      has_sl = 1
+    end
+    i = add i 1
+  end
+  if eq has_sl 0
+    put dir 0 46
+    put boff_box 0 0
+    ret 1
+  end
+  if eq sl 0
+    put dir 0 47
+    put boff_box 0 1
+    ret 1
+  end
+  i = ulong 0
+  while lt i sl bound 4096
+    put dir i get path i
+    i = add i 1
+  end
+  put boff_box 0 add sl 1
+  ret sl
+end
+
+fn cap_lstat_exists path view uchar * pl ulong to ulong
+  st = new uchar 128 0
+  if eq lstat path 0 pl st 0 128 0
+    ret 1
+  end
+  ret 0
+end
+
+fn cap_join_dir_base rd view uchar 4096 n0 ulong base view uchar * dst edit uchar * to long
+  n = n0
+  bl = len base
+  if eq bl 0
+    ret -1
+  end
+  if eq bl 1
+    if eq get base 0 46
+      ret -1
+    end
+  end
+  if eq bl 2
+    if eq get base 0 46
+      if eq get base 1 46
+        ret -1
+      end
+    end
+  end
+  if gt add add n 1 bl 4095
+    ret -1
+  end
+  i = ulong 0
+  while lt i n bound 4096
+    put dst i get rd i
+    i = add i 1
+  end
+  if and eq n 1 eq get rd 0 47
+    n = 0
+  end
+  put dst n 47
+  i = ulong 0
+  while lt i bl bound 4096
+    put dst add add n 1 i get base i
+    i = add i 1
+  end
+  ret long add add n 1 bl
+end
+
+note Canonicalize target (existing or parent + "/" + base; refuse dangling symlink).
+fn cap_canon_target path view uchar * pl ulong dst edit uchar * to long
+  dir = new uchar 4096 0
+  rd = new uchar 4096 0
+  boff_box = new ulong 1 0
+  if eq pl 0
+    ret -1
+  end
+  rp = osh_realpath path pl dst
+  if ge rp 0
+    ret rp
+  end
+  if ne cap_lstat_exists path pl 0
+    ret -1
+  end
+  dl = cap_split_dir path pl dir boff_box
+  rdl = osh_realpath dir dl rd
+  if lt rdl 0
+    ret -1
+  end
+  boff = get boff_box 0
+  ret cap_join_dir_base rd ulong rdl part path boff sub pl boff dst
+end
+
+fn osh_caps_start to void
+  put cap_started 0 1
+  put cap_sealed 0 0
+  put cap_principal 0 0
+  put cap_prin_gen 0 1
+  put cap_prin_revoked 0 0
+  put cap_ngrants 0 0
+  put cap_pool_used 0 0
+  put cap_enabled 0 0
+end
+
+fn cap_skip_ws s view uchar * i ulong e ulong to ulong
+  p = i
+  while lt p e bound 4096
+    c = ulong get s p
+    if and ne c 32 and ne c 9 ne c 13
+      break
+    end
+    p = add p 1
+  end
+  ret p
+end
+
+fn cap_scan_tok s view uchar * i ulong e ulong to ulong
+  p = i
+  while lt p e bound 4096
+    c = ulong get s p
+    if or eq c 32 eq c 9
+      break
+    end
+    if or eq c 13 eq c 35
+      break
+    end
+    p = add p 1
+  end
+  ret p
+end
+
+fn cap_parse_prin txt view uchar * pe ulong lend ulong to long
+  p2 = cap_skip_ws txt pe lend
+  p2e = cap_scan_tok txt p2 lend
+  if eq p2 p2e
+    ret -1
+  end
+  pr = ulong 0
+  k = p2
+  while lt k p2e bound 32
+    c = ulong get txt k
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    pr = add mul pr 10 sub c 48
+    k = add k 1
+  end
+  if gt pr 0xffffffff
+    ret -1
+  end
+  if lt cap_skip_ws txt p2e lend lend
+    ret -1
+  end
+  put cap_principal 0 pr
+  put cap_prin_gen 0 1
+  put cap_prin_revoked 0 0
+  ret 0
+end
+
+fn cap_parse_op txt view uchar * k1 ulong kl ulong to ulong
+  if eq cap_eq_txt txt k1 kl cap_s_spawn 1
+    ret OSH_OP_SPAWN
+  end
+  if eq cap_eq_txt txt k1 kl cap_s_read 1
+    ret OSH_OP_OPEN_READ
+  end
+  if eq cap_eq_txt txt k1 kl cap_s_write 1
+    ret OSH_OP_OPEN_WRITE
+  end
+  if eq cap_eq_txt txt k1 kl cap_s_chdir 1
+    ret OSH_OP_CHDIR
+  end
+  ret 0
+end
+
+fn cap_add_grant op ulong canon view uchar 4096 cl ulong to long
+  ng = get cap_ngrants 0
+  pu = get cap_pool_used 0
+  if or ge ng OSH_CAPS_MAX_GRANTS gt add pu cl OSH_CAPS_POOL
+    ret -1
+  end
+  k = ulong 0
+  while lt k cl bound 4096
+    put cap_pool add pu k get canon k
+    k = add k 1
+  end
+  put cap_g_op ng op
+  put cap_g_poff ng pu
+  put cap_g_plen ng cl
+  put cap_g_gen ng 1
+  put cap_g_revoked ng 0
+  put cap_pool_used 0 add pu cl
+  put cap_ngrants 0 add ng 1
+  ret 0
+end
+
+fn cap_parse_allow txt view uchar * pe ulong lend ulong to long
+  canon = new uchar 4096 0
+  k1 = cap_skip_ws txt pe lend
+  k1e = cap_scan_tok txt k1 lend
+  op = cap_parse_op txt k1 sub k1e k1
+  if eq op 0
+    ret -1
+  end
+  p1 = cap_skip_ws txt k1e lend
+  p1e = cap_scan_tok txt p1 lend
+  pl = sub p1e p1
+  if or eq pl 0 ne get txt p1 47
+    ret -1
+  end
+  if lt cap_skip_ws txt p1e lend lend
+    ret -1
+  end
+  cl = osh_realpath part txt p1 pl pl canon
+  if lt cl 0
+    ret -1
+  end
+  ret cap_add_grant op canon ulong cl
+end
+
+fn osh_caps_load txt view uchar * tlen ulong to long
+  if or eq get cap_started 0 0 ne get cap_sealed 0 0
+    ret -1
+  end
+  have_prin = ulong 0
+  i = ulong 0
+  while lt i tlen bound 4096
+    lst = i
+    while lt i tlen bound 4096
+      if eq get txt i 10
+        break
+      end
+      i = add i 1
+    end
+    lend = i
+    if lt i tlen
+      i = add i 1
+    end
+    j = lst
+    while lt j lend bound 4096
+      if eq get txt j 35
+        lend = j
+        break
+      end
+      j = add j 1
+    end
+    p = cap_skip_ws txt lst lend
+    if ge p lend
+      continue
+    end
+    pe = cap_scan_tok txt p lend
+    if eq cap_eq_txt txt p sub pe p cap_s_prin 1
+      if ne have_prin 0
+        ret -1
+      end
+      if ne cap_parse_prin txt pe lend 0
+        ret -1
+      end
+      have_prin = 1
+      continue
+    end
+    if eq cap_eq_txt txt p sub pe p cap_s_allow 1
+      if eq have_prin 0
+        ret -1
+      end
+      if ne cap_parse_allow txt pe lend 0
+        ret -1
+      end
+      continue
+    end
+    ret -1
+  end
+  if eq have_prin 0
+    ret -1
+  end
+  ret 0
+end
+
+fn osh_caps_attach to void
+  pr = get cap_principal 0
+  i = ulong 0
+  while lt i 32 bound 32
+    put sess_bind_pid i 0
+    i = add i 1
+  end
+  put sess_bind_pid 0 uchar and pr 255
+  put sess_bind_pid 1 uchar and shr pr 8 255
+  put sess_bind_pid 2 uchar and shr pr 16 255
+  put sess_bind_pid 3 uchar and shr pr 24 255
+  put sess_bind_domain 0 2
+  put sess_bind_cap_idx 0 0
+  put sess_bind_cap_gen 0 get cap_prin_gen 0
+  put sess_bind_valid 0 1
+  put cap_enabled 0 1
+end
+
+fn osh_caps_seal to void
+  put cap_sealed 0 1
+end
+
+fn osh_caps_stop to void
+  put cap_started 0 0
+  put cap_sealed 0 0
+  put cap_ngrants 0 0
+  put cap_pool_used 0 0
+  put cap_enabled 0 0
+end
+
+fn cap_check_binding to ulong
+  pid = new uchar 32 0
+  i = ulong 0
+  while lt i 32 bound 32
+    put pid i get sess_bind_pid i
+    i = add i 1
+  end
+  chk = osh_om_check_binding get sess_bind_domain 0 pid
+  if lt chk 0
+    ret ulong neg chk
+  end
+  if ne ulong chk get cap_principal 0
+    ret OSH_E_DENIED
+  end
+  if ne get cap_prin_revoked 0 0
+    ret OSH_E_REVOKED
+  end
+  if ne get sess_bind_cap_gen 0 get cap_prin_gen 0
+    ret OSH_E_STALE
+  end
+  ret OSH_E_OK
+end
+
+fn cap_check_one i ulong canon view uchar 4096 cl ulong to ulong
+  pref = new uchar 4096 0
+  po = get cap_g_poff i
+  gl = get cap_g_plen i
+  k = ulong 0
+  while lt k gl bound 4096
+    put pref k get cap_pool add po k
+    k = add k 1
+  end
+  ret osh_om_path_under part pref 0 gl gl part canon 0 cl cl
+end
+
+fn cap_match_grant op ulong canon view uchar 4096 cl ulong to ulong
+  ng = get cap_ngrants 0
+  res = OSH_E_DENIED
+  i = ulong 0
+  while lt i ng bound 200
+    if eq get cap_g_op i op
+      if ne cap_check_one i canon cl 0
+        if ne get cap_g_revoked i 0
+          res = OSH_E_REVOKED
+        else
+          ret OSH_E_OK
+        end
+      end
+    end
+    i = add i 1
+  end
+  ret res
+end
+
+fn osh_caps_effect op ulong path view uchar * pl ulong to ulong
+  canon = new uchar 4096 0
+  if eq get cap_enabled 0 0
+    ret OSH_E_OK
+  end
+  if or eq get cap_started 0 0 eq get sess_bind_valid 0 0
+    ret OSH_E_DENIED
+  end
+  br = cap_check_binding
+  if ne br OSH_E_OK
+    ret br
+  end
+  if eq osh_om_op_right op 0
+    ret OSH_E_DENIED
+  end
+  cl = cap_canon_target path pl canon
+  if lt cl 0
+    ret OSH_E_DENIED
+  end
+  ret cap_match_grant op canon ulong cl
+end

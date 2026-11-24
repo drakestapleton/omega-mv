@@ -1,0 +1,617 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_req.c + shared host constants and I/O helpers.
+note Requires src/osh/osh_core.om and src/osh/osh_layout.om before this file.
+om2
+
+const OSH_REQ_MAGIC ulong 0x4f524551
+const OSH_REQ_VERSION ulong 1
+const OSH_REQ_HDR_CELLS ulong 8
+const OSH_CMD_CELLS ulong 164
+const OSH_MAX_CMDS ulong 8
+const OSH_MAX_ARGV ulong 32
+const OSH_MAX_ASSIGN ulong 16
+const OSH_MAX_REDIR ulong 8
+const OSH_OUT_CAP ulong 8192
+const OSH_REQ_FLAG_DIRECT ulong 1
+
+const OSH_E_OK ulong 0
+const OSH_E_DENIED ulong 1
+const OSH_E_REVOKED ulong 2
+const OSH_E_STALE ulong 3
+const OSH_E_NOT_FOUND ulong 4
+const OSH_E_UNAVAILABLE ulong 5
+const OSH_E_INVALID_ARG ulong 6
+const OSH_E_LIMIT ulong 7
+const OSH_E_INTERRUPTED ulong 8
+const OSH_E_BROKEN_PIPE ulong 9
+const OSH_E_IO ulong 10
+const OSH_E_OUTCOME_UNKNOWN ulong 11
+const OSH_E_CAP_DOMAIN_MISMATCH ulong 12
+const OSH_E_CAP_GEN_NARROW ulong 13
+const OSH_E_NOT_SUPPORTED ulong 14
+const OSH_E_WOULD_BLOCK ulong 15
+const OSH_E_PARTIAL_LAUNCH ulong 16
+
+const OSH_OUT_NOT_STARTED ulong 0
+const OSH_OUT_COMPLETED ulong 1
+const OSH_OUT_FAILED_NO_EFFECT ulong 2
+const OSH_OUT_CANCELLED ulong 3
+const OSH_OUT_UNKNOWN ulong 4
+
+const OSH_B_NONE ulong 0
+const OSH_B_CD ulong 1
+const OSH_B_PWD ulong 2
+const OSH_B_PRINTF ulong 3
+const OSH_B_EXPORT ulong 4
+const OSH_B_UNSET ulong 5
+const OSH_B_EXIT ulong 6
+
+const OSH_R_IN ulong 1
+const OSH_R_OUT ulong 2
+const OSH_R_APPEND ulong 3
+const OSH_R_DUP ulong 4
+
+const OSH_CONN_NONE ulong 0
+const OSH_CONN_SEMI ulong 1
+const OSH_CONN_AND ulong 2
+const OSH_CONN_OR ulong 3
+
+const OSH_OP_SPAWN ulong 1
+const OSH_OP_CHDIR ulong 2
+const OSH_OP_OPEN_WRITE ulong 3
+const OSH_OP_OPEN_READ ulong 4
+
+const OSH_O_RDONLY int 0
+const OSH_O_WRONLY int 1
+const OSH_O_CREAT int 64
+const OSH_O_EXCL int 128
+const OSH_O_TRUNC int 512
+const OSH_O_APPEND int 1024
+const OSH_O_DIRECTORY int 16384
+const OSH_O_NOFOLLOW int 32768
+const OSH_O_CLOEXEC int 524288
+
+note Decoded OshRequest global storage
+global rq_ncmds ulong 1
+global rq_conn ulong 1
+global rq_flags ulong 1
+global rq_arena uchar 16384
+global rq_arena_used ulong 1
+global rq_tmp_off ulong 1
+global rq_cmd_bi ulong 8
+global rq_cmd_na ulong 8
+global rq_cmd_ns ulong 8
+global rq_cmd_nr ulong 8
+note argv[cmd*32 + i]: off and len in rq_arena
+global rq_argv_off ulong 256
+global rq_argv_len ulong 256
+note assign[cmd*16 + i]: name off/len, val off/len in rq_arena
+global rq_as_noff ulong 128
+global rq_as_nlen ulong 128
+global rq_as_voff ulong 128
+global rq_as_vlen ulong 128
+note redir[cmd*8 + i]: kind, fd, src_fd, path off/len in rq_arena
+global rq_rd_kind ulong 64
+global rq_rd_fd ulong 64
+global rq_rd_src ulong 64
+global rq_rd_poff ulong 64
+global rq_rd_plen ulong 64
+
+note OshBuilder global storage (for direct-argv and tests)
+global rb_rec ulong 1320
+global rb_out ulong 8192
+global rb_out_used ulong 1
+global rb_ncmds ulong 1
+global rb_err ulong 1
+
+note Shared diagnostic buffer
+global osh_dbuf uchar 2048
+global osh_dlen ulong 1
+
+text osh_s_prefix "osh: "
+text osh_s_enoent "No such file or directory"
+text osh_s_eacces "Permission denied"
+text osh_s_enotdir "Not a directory"
+text osh_s_eisdir "Is a directory"
+text osh_s_eexist "File exists"
+text osh_s_einval "Invalid argument"
+text osh_s_ebadf "Bad file descriptor"
+text osh_s_enoexec "Exec format error"
+text osh_s_enametoolong "File name too long"
+text osh_s_enospc "No space left on device"
+text osh_s_eio "Input/output error"
+text osh_s_ebusy "Device or resource busy"
+text osh_s_eagain "Resource temporarily unavailable"
+text osh_s_epipe "Broken pipe"
+text osh_s_eloop "Too many levels of symbolic links"
+text osh_s_err_unk "Error"
+
+fn osh_write_all fd int buf view uchar * n ulong to long
+  o = ulong 0
+  while lt o n bound 100000
+    w = write fd buf o sub n o
+    if lt w 0
+      if eq w -4
+        continue
+      end
+      ret w
+    end
+    o = add o ulong w
+  end
+  ret 0
+end
+
+fn osh_write_g_dbuf fd int to void
+  n = get osh_dlen 0
+  o = ulong 0
+  while lt o n bound 4096
+    w = write fd osh_dbuf o sub n o
+    if lt w 0
+      if eq w -4
+        continue
+      end
+      break
+    end
+    o = add o ulong w
+  end
+  put osh_dlen 0 0
+end
+
+fn osh_d_reset to void
+  put osh_dlen 0 0
+end
+
+fn osh_d_ch c uchar to void
+  n = get osh_dlen 0
+  if lt n 2040
+    put osh_dbuf n c
+    put osh_dlen 0 add n 1
+  end
+end
+
+fn osh_d_str s view uchar * ln ulong to void
+  i = ulong 0
+  while lt i ln bound 2048
+    osh_d_ch get s i
+    i = add i 1
+  end
+end
+
+fn osh_d_txt s view uchar * to void
+  osh_d_str s len s
+end
+
+fn osh_d_u64 v ulong to void
+  dig = new uchar 24 0
+  x = v
+  n = ulong 0
+  while ge x 10 bound 24
+    put dig n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  put dig n uchar add 48 x
+  n = add n 1
+  i = ulong 0
+  while lt i n bound 24
+    osh_d_ch get dig sub sub n i 1
+    i = add i 1
+  end
+end
+
+fn osh_d_i64 v long to void
+  if lt v 0
+    osh_d_ch 45
+    if eq v -9223372036854775808
+      osh_d_u64 ulong 9223372036854775808
+      ret
+    end
+    osh_d_u64 ulong neg v
+    ret
+  end
+  osh_d_u64 ulong v
+end
+
+fn osh_d_errno e long to void
+  ae = e
+  if lt ae 0
+    ae = neg ae
+  end
+  if eq ae 2
+    osh_d_txt osh_s_enoent
+    ret
+  end
+  if eq ae 13
+    osh_d_txt osh_s_eacces
+    ret
+  end
+  if eq ae 20
+    osh_d_txt osh_s_enotdir
+    ret
+  end
+  if eq ae 21
+    osh_d_txt osh_s_eisdir
+    ret
+  end
+  if eq ae 17
+    osh_d_txt osh_s_eexist
+    ret
+  end
+  if eq ae 22
+    osh_d_txt osh_s_einval
+    ret
+  end
+  if eq ae 9
+    osh_d_txt osh_s_ebadf
+    ret
+  end
+  if eq ae 8
+    osh_d_txt osh_s_enoexec
+    ret
+  end
+  if eq ae 36
+    osh_d_txt osh_s_enametoolong
+    ret
+  end
+  if eq ae 28
+    osh_d_txt osh_s_enospc
+    ret
+  end
+  if eq ae 5
+    osh_d_txt osh_s_eio
+    ret
+  end
+  if eq ae 16
+    osh_d_txt osh_s_ebusy
+    ret
+  end
+  if eq ae 11
+    osh_d_txt osh_s_eagain
+    ret
+  end
+  if eq ae 32
+    osh_d_txt osh_s_epipe
+    ret
+  end
+  if eq ae 40
+    osh_d_txt osh_s_eloop
+    ret
+  end
+  osh_d_txt osh_s_err_unk
+end
+
+fn osh_d_arena off ulong ln ulong to void
+  i = ulong 0
+  while lt i ln bound 2048
+    osh_d_ch get rq_arena add off i
+    i = add i 1
+  end
+end
+
+fn osh_rq_take out_cells view ulong * used ulong off ulong ln ulong to ulong
+  if or gt off used gt ln sub used off
+    ret 0
+  end
+  au = get rq_arena_used 0
+  if gt add add au ln 1 16384
+    ret 0
+  end
+  i = ulong 0
+  while lt i ln bound 8192
+    v = get out_cells add off i
+    if or eq v 0 gt v 255
+      ret 0
+    end
+    put rq_arena add au i uchar v
+    i = add i 1
+  end
+  put rq_arena add au ln 0
+  put rq_tmp_off 0 au
+  put rq_arena_used 0 add add au ln 1
+  ret 1
+end
+
+fn osh_rq_name_valid_arena off ulong ln ulong to ulong
+  if or eq ln 0 gt ln 256
+    ret 0
+  end
+  tmp = new uchar 256 0
+  i = ulong 0
+  while lt i ln bound 256
+    put tmp i get rq_arena add off i
+    i = add i 1
+  end
+  ret osh_om_name_valid part tmp 0 ln ln
+end
+
+fn osh_rq_dec_argv c ulong b view ulong * out_cells view ulong * used ulong to ulong
+  na = get b 0
+  i = ulong 0
+  while lt i na bound 32
+    ao = get b add 4 mul i 2
+    al = get b add 5 mul i 2
+    if eq osh_rq_take out_cells used ao al 0
+      ret 218
+    end
+    idx = add mul c 32 i
+    put rq_argv_off idx get rq_tmp_off 0
+    put rq_argv_len idx al
+    i = add i 1
+  end
+  ret 0
+end
+
+fn osh_rq_dec_assign c ulong b view ulong * out_cells view ulong * used ulong to ulong
+  ns = get b 1
+  i = ulong 0
+  while lt i ns bound 16
+    e = add 68 mul i 4
+    idx = add mul c 16 i
+    if true
+      nl = get b add e 1
+      if eq nl 0
+        ret 218
+      end
+      if eq osh_rq_take out_cells used get b e nl 0
+        ret 218
+      end
+      if eq osh_rq_name_valid_arena get rq_tmp_off 0 nl 0
+        ret 218
+      end
+      put rq_as_noff idx get rq_tmp_off 0
+      put rq_as_nlen idx nl
+    end
+    if true
+      vl = get b add e 3
+      if eq osh_rq_take out_cells used get b add e 2 vl 0
+        ret 218
+      end
+      put rq_as_voff idx get rq_tmp_off 0
+      put rq_as_vlen idx vl
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn osh_rq_dec_redir c ulong b view ulong * out_cells view ulong * used ulong to ulong
+  nr = get b 2
+  i = ulong 0
+  while lt i nr bound 8
+    e = add 132 mul i 4
+    rk = get b e
+    if lt rk OSH_R_IN
+      ret 218
+    end
+    if gt rk OSH_R_DUP
+      ret 218
+    end
+    if gt get b add e 1 2
+      ret 218
+    end
+    idx = add mul c 8 i
+    put rq_rd_kind idx rk
+    put rq_rd_fd idx get b add e 1
+    if eq rk OSH_R_DUP
+      if gt get b add e 2 2
+        ret 218
+      end
+      if ne get b add e 3 0
+        ret 218
+      end
+      put rq_rd_src idx get b add e 2
+      put rq_rd_poff idx 0
+      put rq_rd_plen idx 0
+    else
+      if true
+        pl = get b add e 3
+        if eq osh_rq_take out_cells used get b add e 2 pl 0
+          ret 218
+        end
+        put rq_rd_src idx 0
+        put rq_rd_poff idx get rq_tmp_off 0
+        put rq_rd_plen idx pl
+      end
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn osh_rq_decode_cmd c ulong b view ulong * out_cells view ulong * used ulong to ulong
+  na = get b 0
+  ns = get b 1
+  nr = get b 2
+  bi = get b 3
+  if gt na OSH_MAX_ARGV
+    ret 218
+  end
+  if gt ns OSH_MAX_ASSIGN
+    ret 218
+  end
+  if gt nr OSH_MAX_REDIR
+    ret 218
+  end
+  if gt bi OSH_B_EXIT
+    ret 218
+  end
+  if ne bi 0
+    if eq na 0
+      ret 218
+    end
+    if ne and get rq_flags 0 OSH_REQ_FLAG_DIRECT 0
+      ret 218
+    end
+  end
+  cer = osh_om_check_cmd_reserved b na ns nr
+  if ne cer 0
+    ret cer
+  end
+  put rq_cmd_bi c bi
+  put rq_cmd_na c na
+  put rq_cmd_ns c ns
+  put rq_cmd_nr c nr
+  rc = osh_rq_dec_argv c b out_cells used
+  if ne rc 0
+    ret rc
+  end
+  rc = osh_rq_dec_assign c b out_cells used
+  if ne rc 0
+    ret rc
+  end
+  ret osh_rq_dec_redir c b out_cells used
+end
+
+fn osh_req_decode rec view ulong * nrec ulong out_cells view ulong * nout ulong to ulong
+  if lt nrec OSH_REQ_HDR_CELLS
+    ret 216
+  end
+  herr = osh_om_check_req_hdr part rec 0 OSH_REQ_HDR_CELLS nrec nout 1
+  if ne herr 0
+    ret herr
+  end
+  ncmds = get rec 1
+  conn = get rec 2
+  used = get rec 4
+  put rq_ncmds 0 ncmds
+  put rq_conn 0 conn
+  put rq_flags 0 get rec 3
+  put rq_arena_used 0 0
+  c = ulong 0
+  while lt c ncmds bound 8
+    base = add OSH_REQ_HDR_CELLS mul c OSH_CMD_CELLS
+    rc = osh_rq_decode_cmd c part rec base OSH_CMD_CELLS out_cells used
+    if ne rc 0
+      ret rc
+    end
+    c = add c 1
+  end
+  ret 0
+end
+
+note ---- OshBuilder ----
+
+fn osh_rb_init flags ulong conn ulong to void
+  i = ulong 0
+  while lt i 1320 bound 1320
+    put rb_rec i 0
+    i = add i 1
+  end
+  put rb_out_used 0 0
+  put rb_ncmds 0 0
+  put rb_err 0 0
+  put rb_rec 2 conn
+  put rb_rec 3 flags
+end
+
+fn osh_rb_cmd bi ulong to void
+  nc = get rb_ncmds 0
+  if ge nc OSH_MAX_CMDS
+    put rb_err 0 218
+    ret
+  end
+  base = add OSH_REQ_HDR_CELLS mul nc OSH_CMD_CELLS
+  put rb_rec add base 3 bi
+  put rb_ncmds 0 add nc 1
+end
+
+fn osh_rb_put_str s view uchar * n ulong out_off edit ulong 1 to ulong
+  ou = get rb_out_used 0
+  if gt add ou n OSH_OUT_CAP
+    put rb_err 0 218
+    ret 0
+  end
+  put out_off 0 ou
+  i = ulong 0
+  while lt i n bound 8192
+    put rb_out add ou i ulong get s i
+    i = add i 1
+  end
+  put rb_out_used 0 add ou n
+  ret 1
+end
+
+fn osh_rb_arg s view uchar * n ulong to void
+  nc = get rb_ncmds 0
+  if eq nc 0
+    put rb_err 0 218
+    ret
+  end
+  base = add OSH_REQ_HDR_CELLS mul sub nc 1 OSH_CMD_CELLS
+  na = get rb_rec base
+  if ge na OSH_MAX_ARGV
+    put rb_err 0 218
+    ret
+  end
+  off_box = new ulong 1 0
+  if eq osh_rb_put_str s n off_box 0
+    ret
+  end
+  put rb_rec add base add 4 mul na 2 get off_box 0
+  put rb_rec add base add 5 mul na 2 n
+  put rb_rec base add na 1
+end
+
+fn osh_rb_assign nm view uchar * nl ulong vl view uchar * vlen ulong to void
+  nc = get rb_ncmds 0
+  if eq nc 0
+    put rb_err 0 218
+    ret
+  end
+  base = add OSH_REQ_HDR_CELLS mul sub nc 1 OSH_CMD_CELLS
+  ns = get rb_rec add base 1
+  if ge ns OSH_MAX_ASSIGN
+    put rb_err 0 218
+    ret
+  end
+  no_box = new ulong 1 0
+  vo_box = new ulong 1 0
+  if eq osh_rb_put_str nm nl no_box 0
+    ret
+  end
+  if eq osh_rb_put_str vl vlen vo_box 0
+    ret
+  end
+  e = add base add 68 mul ns 4
+  put rb_rec e get no_box 0
+  put rb_rec add e 1 nl
+  put rb_rec add e 2 get vo_box 0
+  put rb_rec add e 3 vlen
+  put rb_rec add base 1 add ns 1
+end
+
+fn osh_rb_redir kind ulong rfd ulong path view uchar * plen ulong to void
+  off_box = new ulong 1 0
+  nc = get rb_ncmds 0
+  if eq nc 0
+    put rb_err 0 218
+    ret
+  end
+  base = add OSH_REQ_HDR_CELLS mul sub nc 1 OSH_CMD_CELLS
+  nr = get rb_rec add base 2
+  if ge nr OSH_MAX_REDIR
+    put rb_err 0 218
+    ret
+  end
+  e = add base add 132 mul nr 4
+  put rb_rec e kind
+  put rb_rec add e 1 rfd
+  if eq kind OSH_R_DUP
+    put rb_rec add e 2 plen
+    put rb_rec add e 3 0
+  else
+    if eq osh_rb_put_str path plen off_box 0
+      ret
+    end
+    put rb_rec add e 2 get off_box 0
+    put rb_rec add e 3 plen
+  end
+  put rb_rec add base 2 add nr 1
+end
+
+fn osh_rb_seal to void
+  put rb_rec 0 OSH_REQ_MAGIC
+  put rb_rec 1 get rb_ncmds 0
+  put rb_rec 4 get rb_out_used 0
+  put rb_rec 5 OSH_REQ_VERSION
+end

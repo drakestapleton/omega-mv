@@ -1,0 +1,1314 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_journal.c (durable intent/outcome journal).
+note Requires om/sha256/sha256-om2.om, src/osh/host/osh_req.om, and src/osh/host/osh_vars.om before this file.
+om2
+
+global j_fd int 1
+global j_next_rec ulong 1
+global j_key uchar 32
+global j_why uchar 512
+global j_why_len ulong 1
+global j_poisoned ulong 1
+global j_tail_clean ulong 1
+global j_path uchar 4096
+global j_path_len ulong 1
+
+note Scratch buffers for canonical request hashing and journal formatting
+global j_canon uchar 32768
+global j_canon_len ulong 1
+global j_line uchar 2048
+global j_line_len ulong 1
+global j_scan_buf uchar 65536
+global j_open_rec ulong 256
+global j_open_idx ulong 256
+global j_open_nc ulong 256
+global j_open_dig uchar 16384
+global j_open_a0 uchar 16384
+global j_open_a0l ulong 256
+global j_nopen ulong 1
+global j_closed_ref ulong 256
+global j_nclosed ulong 1
+
+text j_hex "0123456789abcdef"
+text j_hex_up "0123456789ABCDEF"
+text j_sec_frags "PASSWORD\nPASSWD\nPASSPHRASE\nSECRET\nTOKEN\nCREDENTIAL\nAPIKEY\nAPI_KEY\nPRIVATE\nAUTH\nCOOKIE\nKEY\nSESSION\nSIGNATURE\n"
+text j_s_oshreq1 "OSHREQ1"
+text j_s_redacted "REDACTED"
+text j_s_oshj1 "OSHJ1 "
+text j_s_out0 "NOT_STARTED"
+text j_s_out1 "COMPLETED"
+text j_s_out2 "FAILED_NO_EFFECT"
+text j_s_out3 "CANCELLED"
+text j_s_out4 "OUTCOME_UNKNOWN"
+text j_s_key_ext ".key"
+text j_s_tmp_ext ".tmp."
+text j_s_def1 "/osh/effects.journal"
+text j_s_def2 "/.local/state/osh/effects.journal"
+text j_s_dot "."
+text j_s_sl "/"
+text j_s_inuse "journal is in use by another osh session (one session per journal); start this one with --journal FILE"
+text j_s_badmode "journal must be a regular file owned by you with mode 0600"
+text j_s_baddir "state directory must be owned by you with mode 0700"
+text j_s_badkey "key file must be a regular file of 32 bytes, owned by you, mode 0600"
+text j_s_misskey "key file is missing but the journal already has records; refusing to start a new key"
+text j_s_openfail "cannot open journal"
+
+fn j_set_why s view uchar * to void
+  n = len s
+  if gt n 500
+    n = 500
+  end
+  i = ulong 0
+  while lt i n bound 512
+    put j_why i get s i
+    i = add i 1
+  end
+  put j_why_len 0 n
+end
+
+fn j_upper c uchar to uchar
+  if and ge c 97 le c 122
+    ret uchar sub ulong c 32
+  end
+  ret c
+end
+
+fn j_secret_match nm view uchar * nl ulong st ulong fl ulong to ulong
+  lim = add sub nl fl 1
+  i = ulong 0
+  while lt i lim bound 256
+    k = ulong 0
+    while lt k fl bound 32
+      if ne j_upper get nm add i k get j_sec_frags add st k
+        break
+      end
+      k = add k 1
+    end
+    if eq k fl
+      ret 1
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn osh_secret_name nm view uchar * nl ulong to ulong
+  fi = ulong 0
+  fn_len = len j_sec_frags
+  while lt fi fn_len bound 256
+    st = fi
+    while lt fi fn_len bound 32
+      if eq get j_sec_frags fi 10
+        break
+      end
+      fi = add fi 1
+    end
+    fl = sub fi st
+    if and gt fl 0 le fl nl
+      if ne j_secret_match nm nl st fl 0
+        ret 1
+      end
+    end
+    if lt fi fn_len
+      fi = add fi 1
+    end
+  end
+  ret 0
+end
+
+fn j_c_put b uchar to void
+  n = get j_canon_len 0
+  if lt n 32768
+    put j_canon n b
+    put j_canon_len 0 add n 1
+  end
+end
+
+fn j_c_u64 v ulong to void
+  j_c_put uchar and v 255
+  j_c_put uchar and shr v 8 255
+  j_c_put uchar and shr v 16 255
+  j_c_put uchar and shr v 24 255
+  j_c_put uchar and shr v 32 255
+  j_c_put uchar and shr v 40 255
+  j_c_put uchar and shr v 48 255
+  j_c_put uchar and shr v 56 255
+end
+
+fn j_c_str s view uchar * ln ulong to void
+  j_c_u64 ln
+  i = ulong 0
+  while lt i ln bound 8192
+    j_c_put get s i
+    i = add i 1
+  end
+end
+
+fn j_c_arena off ulong ln ulong to void
+  j_c_u64 ln
+  i = ulong 0
+  while lt i ln bound 8192
+    j_c_put get rq_arena add off i
+    i = add i 1
+  end
+end
+
+fn j_c_redacted to void
+  j_c_u64 9
+  j_c_put 1
+  i = ulong 0
+  while lt i 8 bound 8
+    j_c_put get j_s_redacted i
+    i = add i 1
+  end
+end
+
+fn j_build_canon_as idx ulong to void
+  nbuf = new uchar 256 0
+  no = get rq_as_noff idx
+  nl = get rq_as_nlen idx
+  j_c_arena no nl
+  is_sec = ulong 0
+  if le nl 256
+    m = ulong 0
+    while lt m nl bound 256
+      put nbuf m get rq_arena add no m
+      m = add m 1
+    end
+    is_sec = osh_secret_name part nbuf 0 nl nl
+  end
+  if eq is_sec 1
+    j_c_redacted
+  else
+    j_c_arena get rq_as_voff idx get rq_as_vlen idx
+  end
+end
+
+fn j_build_canon_cmd c ulong to void
+  j_c_u64 get rq_cmd_bi c
+  n = get rq_cmd_na c
+  j_c_u64 n
+  k = ulong 0
+  while lt k n bound 32
+    idx = add mul c 32 k
+    j_c_arena get rq_argv_off idx get rq_argv_len idx
+    k = add k 1
+  end
+  n = get rq_cmd_ns c
+  j_c_u64 n
+  k = ulong 0
+  while lt k n bound 16
+    j_build_canon_as add mul c 16 k
+    k = add k 1
+  end
+  n = get rq_cmd_nr c
+  j_c_u64 n
+  k = ulong 0
+  while lt k n bound 8
+    idx = add mul c 8 k
+    j_c_u64 get rq_rd_kind idx
+    j_c_u64 get rq_rd_fd idx
+    j_c_u64 get rq_rd_src idx
+    j_c_arena get rq_rd_poff idx get rq_rd_plen idx
+    k = add k 1
+  end
+end
+
+fn j_build_canon to void
+  put j_canon_len 0 0
+  j_c_str j_s_oshreq1 7
+  nc = get rq_ncmds 0
+  j_c_u64 nc
+  j_c_u64 get rq_conn 0
+  j_c_u64 get rq_flags 0
+  c = ulong 0
+  while lt c nc bound 8
+    j_build_canon_cmd c
+    c = add c 1
+  end
+end
+
+fn osh_hmac_sha256 key view uchar 32 msg view uchar * mlen ulong dst edit uchar 32 to void
+  buf = new uchar 32832 0
+  inner = new uchar 32 0
+  obuf = new uchar 96 0
+  out_d = new uchar 32 0
+  i = ulong 0
+  while lt i 64 bound 64
+    b = uchar 0x36
+    if lt i 32
+      b = uchar xor ulong b ulong get key i
+    end
+    put buf i b
+    i = add i 1
+  end
+  ml = mlen
+  if gt ml 32768
+    ml = 32768
+  end
+  i = ulong 0
+  while lt i ml bound 32768
+    put buf add 64 i get msg i
+    i = add i 1
+  end
+  sha256_hash part buf 0 add 64 ml inner
+  i = ulong 0
+  while lt i 64 bound 64
+    b = uchar 0x5c
+    if lt i 32
+      b = uchar xor ulong b ulong get key i
+    end
+    put obuf i b
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 32 bound 32
+    put obuf add 64 i get inner i
+    i = add i 1
+  end
+  sha256_hash part obuf 0 96 out_d
+  i = ulong 0
+  while lt i 32 bound 32
+    put dst i get out_d i
+    i = add i 1
+  end
+end
+
+fn osh_req_digest_unkeyed dst edit uchar 32 to void
+  j_build_canon
+  raw = new uchar 32768 0
+  out_d = new uchar 32 0
+  cl = get j_canon_len 0
+  i = ulong 0
+  while lt i cl bound 32768
+    put raw i get j_canon i
+    i = add i 1
+  end
+  sha256_hash part raw 0 cl out_d
+  i = ulong 0
+  while lt i 32 bound 32
+    put dst i get out_d i
+    i = add i 1
+  end
+end
+
+fn osh_req_digest dst edit uchar 32 to void
+  j_build_canon
+  key = new uchar 32 0
+  raw = new uchar 32768 0
+  cl = get j_canon_len 0
+  i = ulong 0
+  while lt i 32 bound 32
+    put key i get j_key i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i cl bound 32768
+    put raw i get j_canon i
+    i = add i 1
+  end
+  osh_hmac_sha256 key part raw 0 cl cl dst
+end
+
+fn j_sync_fd fd int to long
+  k = ulong 0
+  while lt k 100 bound 100
+    r = fsync fd
+    if eq r 0
+      ret 0
+    end
+    if ne r -4
+      ret r
+    end
+    k = add k 1
+  end
+  ret -5
+end
+
+fn j_fsync_parent path view uchar * pl ulong to long
+  d = new uchar 4096 0
+  if ge pl 4096
+    ret -36
+  end
+  sl = ulong 0
+  has_sl = ulong 0
+  i = ulong 0
+  while lt i pl bound 4096
+    put d i get path i
+    if eq get path i 47
+      sl = i
+      has_sl = 1
+    end
+    i = add i 1
+  end
+  dl = ulong 1
+  if eq has_sl 0
+    put d 0 46
+    dl = 1
+  else
+    if eq sl 0
+      dl = 1
+    else
+      dl = sl
+    end
+  end
+  fd = fopen d 0 dl or OSH_O_RDONLY or OSH_O_DIRECTORY OSH_O_CLOEXEC 0
+  if lt fd 0
+    ret fd
+  end
+  rc = j_sync_fd int fd
+  ign = fclose int fd
+  ret rc
+end
+
+fn j_commit_line is_outcome ulong to long
+  fd = get j_fd 0
+  if lt fd 0
+    ret -1
+  end
+  if ne get j_poisoned 0 0
+    if not and ne is_outcome 0 ne get j_tail_clean 0 0
+      ret -5
+    end
+  end
+  pre = fseek fd 0 2
+  n = get j_line_len 0
+  o = ulong 0
+  wfail = ulong 0
+  while lt o n bound 4096
+    w = write fd j_line o sub n o
+    if lt w 0
+      if eq w -4
+        continue
+      end
+      wfail = 1
+      break
+    end
+    o = add o ulong w
+  end
+  if eq wfail 1
+    tc = ulong 0
+    if ge pre 0
+      if eq ftrunc fd pre 0
+        tc = 1
+      end
+    end
+    put j_tail_clean 0 tc
+    put j_poisoned 0 1
+    ret -1
+  end
+  if ne j_sync_fd fd 0
+    put j_tail_clean 0 0
+    put j_poisoned 0 1
+    ret -1
+  end
+  ret 0
+end
+
+fn j_build_tmp_name kp view uchar * kpl ulong tmp edit uchar 4096 to ulong
+  dig = new uchar 24 0
+  i = ulong 0
+  while lt i kpl bound 4096
+    put tmp i get kp i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 5 bound 5
+    put tmp add kpl i get j_s_tmp_ext i
+    i = add i 1
+  end
+  tl = add kpl 5
+  pid = ulong getpid
+  nd = ulong 0
+  while ge pid 10 bound 24
+    put dig nd uchar add 48 rem pid 10
+    pid = div pid 10
+    nd = add nd 1
+  end
+  put dig nd uchar add 48 pid
+  nd = add nd 1
+  i = ulong 0
+  while lt i nd bound 24
+    put tmp add tl i get dig sub sub nd i 1
+    i = add i 1
+  end
+  ret add tl nd
+end
+
+fn j_link_pair src view uchar * sl ulong dst view uchar * dl ulong to long
+  lp = new uchar 4096 0
+  if gt add add 6 sl dl 4096
+    ret -36
+  end
+  put lp 0 2
+  put lp 1 0
+  put lp 2 uchar and sl 255
+  put lp 3 uchar and shr sl 8 255
+  i = ulong 0
+  while lt i sl bound 2048
+    put lp add 4 i get src i
+    i = add i 1
+  end
+  off2 = add 4 sl
+  put lp off2 uchar and dl 255
+  put lp add off2 1 uchar and shr dl 8 255
+  i = ulong 0
+  while lt i dl bound 2048
+    put lp add add off2 2 i get dst i
+    i = add i 1
+  end
+  ret link lp 0 add add off2 2 dl
+end
+
+fn j_create_key kp view uchar * kpl ulong to long
+  tmp = new uchar 4096 0
+  kb = new uchar 32 0
+  tl = j_build_tmp_name kp kpl tmp
+  fl = or or OSH_O_WRONLY OSH_O_CREAT or OSH_O_EXCL OSH_O_NOFOLLOW
+  tfd = fopen tmp 0 tl or fl OSH_O_CLOEXEC 384
+  if lt tfd 0
+    j_set_why j_s_badkey
+    ret tfd
+  end
+  ok = ulong 0
+  if eq random kb 0 32 0 32
+    if eq osh_write_all int tfd kb 32 0
+      if eq j_sync_fd int tfd 0
+        ok = 1
+      end
+    end
+  end
+  ign = fclose int tfd
+  if eq ok 1
+    lr = j_link_pair part tmp 0 tl tl kp kpl
+    if and ne lr 0 ne lr -17
+      ok = 0
+    end
+  end
+  ign = unlink tmp 0 tl
+  if eq ok 0
+    j_set_why j_s_badkey
+    ret -5
+  end
+  dr = j_fsync_parent kp kpl
+  if ne dr 0
+    j_set_why j_s_badkey
+    ret dr
+  end
+  ret 0
+end
+
+fn j_check_key_fd fd int to long
+  st = new uchar 128 0
+  if ne fstat fd st 0 128 0
+    ret -13
+  end
+  mode = vs_u32_le st 16
+  if ne and mode 0xf000 0x8000
+    ret -13
+  end
+  if ne and mode 0x1ff 0x180
+    ret -13
+  end
+  if ne vs_u32_le st 24 ulong geteuid
+    ret -13
+  end
+  if ne vs_u64_le st 48 32
+    ret -13
+  end
+  ret 0
+end
+
+fn j_read_key_bytes fd int to long
+  kb2 = new uchar 32 0
+  got = ulong 0
+  while lt got 32 bound 64
+    r = read fd kb2 got sub 32 got
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      ret -5
+    end
+    if eq r 0
+      ret -5
+    end
+    got = add got ulong r
+  end
+  i = ulong 0
+  while lt i 32 bound 32
+    put j_key i get kb2 i
+    i = add i 1
+  end
+  ret 0
+end
+
+fn j_load_key path view uchar * pl ulong have_rec ulong to long
+  kp = new uchar 4096 0
+  if gt add pl 4 4090
+    j_set_why j_s_openfail
+    ret -36
+  end
+  i = ulong 0
+  while lt i pl bound 4096
+    put kp i get path i
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 4 bound 4
+    put kp add pl i get j_s_key_ext i
+    i = add i 1
+  end
+  kpl = add pl 4
+  fd = fopen kp 0 kpl or OSH_O_RDONLY or OSH_O_NOFOLLOW OSH_O_CLOEXEC 0
+  if eq fd -2
+    if ne have_rec 0
+      j_set_why j_s_misskey
+      ret -2
+    end
+    cr = j_create_key kp kpl
+    if ne cr 0
+      ret cr
+    end
+    fd = fopen kp 0 kpl or OSH_O_RDONLY or OSH_O_NOFOLLOW OSH_O_CLOEXEC 0
+  end
+  if lt fd 0
+    j_set_why j_s_badkey
+    ret fd
+  end
+  rc = j_check_key_fd int fd
+  if eq rc 0
+    rc = j_read_key_bytes int fd
+  end
+  ign = fclose int fd
+  if ne rc 0
+    j_set_why j_s_badkey
+    ret rc
+  end
+  ret 0
+end
+
+fn osh_journal_check_dir dir view uchar * dl ulong to long
+  st = new uchar 128 0
+  r = stat dir 0 dl st 0 128
+  if ne r 0
+    j_set_why j_s_baddir
+    ret r
+  end
+  mode = vs_u32_le st 16
+  uid = vs_u32_le st 24
+  if ne and mode 0xf000 0x4000
+    j_set_why j_s_baddir
+    ret -13
+  end
+  if ne uid ulong geteuid
+    j_set_why j_s_baddir
+    ret -13
+  end
+  if ne and mode 0x3f 0
+    j_set_why j_s_baddir
+    ret -13
+  end
+  ret 0
+end
+
+fn osh_journal_close to void
+  fd = get j_fd 0
+  if ge fd 0
+    ign = fclose fd
+  end
+  put j_fd 0 -1
+  i = ulong 0
+  while lt i 32 bound 32
+    put j_key i 0
+    i = add i 1
+  end
+end
+
+fn j_scan_read path view uchar * pl ulong to long
+  fd = fopen path 0 pl or OSH_O_RDONLY OSH_O_CLOEXEC 0
+  if lt fd 0
+    ret fd
+  end
+  total = ulong 0
+  while lt total 65536 bound 65536
+    r = read int fd j_scan_buf total sub 65536 total
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      ign = fclose int fd
+      ret r
+    end
+    if eq r 0
+      break
+    end
+    total = add total ulong r
+  end
+  ign = fclose int fd
+  ret long total
+end
+
+fn j_parse_u64_at pos ulong end_p ulong out_v edit ulong 1 to ulong
+  i = pos
+  v = ulong 0
+  if ge i end_p
+    ret pos
+  end
+  while lt i end_p bound 32
+    c = ulong get j_scan_buf i
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 sub c 48
+    i = add i 1
+  end
+  put out_v 0 v
+  ret i
+end
+
+fn j_scan_copy_dig no ulong dig_p ulong to void
+  base = mul no 64
+  k = ulong 0
+  while lt k 64 bound 64
+    put j_open_dig add base k get j_scan_buf add dig_p k
+    k = add k 1
+  end
+end
+
+fn j_scan_copy_a0 no ulong p ulong le_p ulong to void
+  put j_open_a0l no 0
+  base = mul no 64
+  q = p
+  while lt add q 3 le_p bound 1024
+    if eq get j_scan_buf q 97
+      if eq get j_scan_buf add q 1 48
+        if eq get j_scan_buf add q 2 61
+          q = add q 3
+          al = ulong 0
+          while and lt add q al le_p lt al 64 bound 64
+            if eq get j_scan_buf add q al 32
+              break
+            end
+            put j_open_a0 add base al get j_scan_buf add q al
+            al = add al 1
+          end
+          put j_open_a0l no al
+          ret
+        end
+      end
+    end
+    q = add q 1
+  end
+end
+
+fn j_scan_rec_open rec ulong cidx ulong cnc ulong dig_p ulong p ulong le_p ulong to void
+  no = get j_nopen 0
+  if ge no 256
+    ret
+  end
+  put j_open_rec no rec
+  put j_open_idx no cidx
+  put j_open_nc no cnc
+  j_scan_copy_dig no dig_p
+  j_scan_copy_a0 no p le_p
+  put j_nopen 0 add no 1
+end
+
+fn j_scan_check_hdr st ulong le_p ulong to ulong
+  if lt sub le_p st 10
+    ret 0
+  end
+  if ne get j_scan_buf st 79
+    ret 0
+  end
+  if ne get j_scan_buf add st 1 83
+    ret 0
+  end
+  if ne get j_scan_buf add st 2 72
+    ret 0
+  end
+  if ne get j_scan_buf add st 3 74
+    ret 0
+  end
+  if ne get j_scan_buf add st 4 49
+    ret 0
+  end
+  if ne get j_scan_buf add st 5 32
+    ret 0
+  end
+  ret 1
+end
+
+fn j_scan_one_line st ulong le_p ulong max_rec edit ulong 1 to ulong
+  v_box = new ulong 1 0
+  if eq j_scan_check_hdr st le_p 0
+    ret 0
+  end
+  p = j_parse_u64_at add st 6 le_p v_box
+  rec = get v_box 0
+  if or eq rec 0 ge add p 2 le_p
+    ret 0
+  end
+  if ne get j_scan_buf p 32
+    ret 0
+  end
+  kind = ulong get j_scan_buf add p 1
+  p = add p 2
+  if and ne kind 73 ne kind 79
+    ret 0
+  end
+  if or ge p le_p ne get j_scan_buf p 32
+    ret 0
+  end
+  p = add p 1
+  ref_v = ulong 0
+  if eq kind 79
+    p = j_parse_u64_at p le_p v_box
+    ref_v = get v_box 0
+    if or ge p le_p ne get j_scan_buf p 32
+      ret 0
+    end
+    p = add p 1
+  end
+  if lt sub le_p p 65
+    ret 0
+  end
+  dig_p = p
+  p = add p 64
+  if ne get j_scan_buf p 32
+    ret 0
+  end
+  p = j_parse_u64_at add p 1 le_p v_box
+  cidx = get v_box 0
+  if or ge p le_p ne get j_scan_buf p 47
+    ret 0
+  end
+  p = j_parse_u64_at add p 1 le_p v_box
+  if gt rec get max_rec 0
+    put max_rec 0 rec
+  end
+  if eq kind 73
+    j_scan_rec_open rec cidx get v_box 0 dig_p p le_p
+  else
+    if ne ref_v 0
+      ncl = get j_nclosed 0
+      if lt ncl 256
+        put j_closed_ref ncl ref_v
+        put j_nclosed 0 add ncl 1
+      end
+    end
+  end
+  ret 1
+end
+
+fn j_scan_parse_lines total ulong max_rec edit ulong 1 bad_out edit ulong 1 to void
+  put j_nopen 0 0
+  put j_nclosed 0 0
+  put max_rec 0 0
+  put bad_out 0 0
+  i = ulong 0
+  while lt i total bound 4096
+    st = i
+    while lt i total bound 4096
+      if eq get j_scan_buf i 10
+        break
+      end
+      i = add i 1
+    end
+    term = ulong 0
+    if lt i total
+      term = 1
+    end
+    le_p = i
+    if lt i total
+      i = add i 1
+    end
+    if eq le_p st
+      continue
+    end
+    if eq term 0
+      put bad_out 0 add get bad_out 0 1
+      continue
+    end
+    if eq j_scan_one_line st le_p max_rec 0
+      put bad_out 0 add get bad_out 0 1
+    end
+  end
+end
+
+fn j_stat_is_reg_0600 st view uchar 128 to ulong
+  mode = vs_u32_le st 16
+  if ne and mode 0xf000 0x8000
+    ret 0
+  end
+  if ne and mode 0xfff 0x180
+    ret 0
+  end
+  if ne vs_u32_le st 24 ulong geteuid
+    ret 0
+  end
+  ret 1
+end
+
+fn j_open_scan_tail path view uchar * pl ulong sz ulong to ulong
+  mx = new ulong 1 0
+  bad = new ulong 1 0
+  ends_nl = ulong 1
+  if gt sz 0
+    sr = j_scan_read path pl
+    if gt sr 0
+      if ne get j_scan_buf sub ulong sr 1 10
+        ends_nl = 0
+      end
+      j_scan_parse_lines ulong sr mx bad
+    end
+  end
+  put j_next_rec 0 add get mx 0 1
+  ret ends_nl
+end
+
+fn j_open_finish path view uchar * pl ulong fd int sz ulong to long
+  ends_nl = j_open_scan_tail path pl sz
+  put j_fd 0 fd
+  i = ulong 0
+  while and lt i pl lt i 4096 bound 4096
+    put j_path i get path i
+    i = add i 1
+  end
+  put j_path_len 0 pl
+  if eq ends_nl 0
+    put j_line 0 10
+    put j_line_len 0 1
+    if ne j_commit_line 0 0
+      osh_journal_close
+      j_set_why j_s_openfail
+      ret -5
+    end
+  end
+  ret 0
+end
+
+fn osh_journal_open path view uchar * pl ulong to long
+  put j_fd 0 -1
+  put j_next_rec 0 1
+  put j_poisoned 0 0
+  put j_tail_clean 0 0
+  put j_why_len 0 0
+  st = new uchar 128 0
+  if eq lstat path 0 pl st 0 128 0
+    if eq j_stat_is_reg_0600 st 0
+      j_set_why j_s_badmode
+      ret -13
+    end
+  end
+  fl = or or OSH_O_WRONLY OSH_O_APPEND or OSH_O_CREAT OSH_O_NOFOLLOW
+  fd = fopen path 0 pl or fl OSH_O_CLOEXEC 384
+  if lt fd 0
+    j_set_why j_s_openfail
+    ret fd
+  end
+  fr = flock int fd 6
+  if ne fr 0
+    ign = fclose int fd
+    if eq fr -11
+      j_set_why j_s_inuse
+      ret -16
+    end
+    j_set_why j_s_openfail
+    ret fr
+  end
+  if ne fstat int fd st 0 128 0
+    ign = fclose int fd
+    j_set_why j_s_openfail
+    ret -13
+  end
+  if eq j_stat_is_reg_0600 st 0
+    ign = fclose int fd
+    j_set_why j_s_badmode
+    ret -13
+  end
+  sz = vs_u64_le st 48
+  hr = ulong 0
+  if gt sz 0
+    hr = 1
+  end
+  krc = j_load_key path pl hr
+  if ne krc 0
+    ign = fclose int fd
+    ret krc
+  end
+  if eq sz 0
+    if ne j_sync_fd int fd 0
+      ign = fclose int fd
+      j_set_why j_s_openfail
+      ret -5
+    end
+    if ne j_fsync_parent path pl 0
+      ign = fclose int fd
+      j_set_why j_s_openfail
+      ret -5
+    end
+  end
+  ret j_open_finish path pl int fd sz
+end
+
+fn j_l_ch c uchar to void
+  n = get j_line_len 0
+  if lt n 2040
+    put j_line n c
+    put j_line_len 0 add n 1
+  end
+end
+
+fn j_l_txt s view uchar * to void
+  n = len s
+  i = ulong 0
+  while lt i n bound 256
+    j_l_ch get s i
+    i = add i 1
+  end
+end
+
+fn j_l_u64 v ulong to void
+  dig = new uchar 24 0
+  x = v
+  n = ulong 0
+  while ge x 10 bound 24
+    put dig n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  put dig n uchar add 48 x
+  n = add n 1
+  i = ulong 0
+  while lt i n bound 24
+    j_l_ch get dig sub sub n i 1
+    i = add i 1
+  end
+end
+
+fn j_l_hex dig view uchar 32 to void
+  i = ulong 0
+  while lt i 32 bound 32
+    b = ulong get dig i
+    j_l_ch get j_hex shr b 4
+    j_l_ch get j_hex and b 15
+    i = add i 1
+  end
+end
+
+fn j_l_esc_arena off ulong ln ulong to void
+  if eq ln 0
+    j_l_ch 37
+    ret
+  end
+  fr = ulong 0
+  if gt ln 64
+    fr = sub ln 64
+    j_l_ch 126
+  end
+  i = fr
+  while lt i ln bound 128
+    c = ulong get rq_arena add off i
+    ok = ulong 0
+    if and ge c 48 le c 57
+      ok = 1
+    end
+    if and ge c 65 le c 90
+      ok = 1
+    end
+    if and ge c 97 le c 122
+      ok = 1
+    end
+    if or eq c 46 or eq c 95 eq c 47
+      ok = 1
+    end
+    if or eq c 45 eq c 43
+      ok = 1
+    end
+    if eq ok 1
+      j_l_ch uchar c
+    else
+      j_l_ch 37
+      j_l_ch get j_hex_up shr c 4
+      j_l_ch get j_hex_up and c 15
+    end
+    i = add i 1
+  end
+end
+
+text j_t_b " b="
+text j_t_argc " argc="
+text j_t_wr " wr="
+text j_t_a0 " a0="
+text j_t_lens " lens="
+text j_t_st " st="
+text j_t_err " err="
+text j_t_rec1 " st=-1 err=11 recovered=1\n"
+
+fn osh_journal_intent dig view uchar 32 c ulong to ulong
+  put j_line_len 0 0
+  rec = get j_next_rec 0
+  j_l_txt j_s_oshj1
+  j_l_u64 rec
+  j_l_ch 32
+  j_l_ch 73
+  j_l_ch 32
+  j_l_hex dig
+  j_l_ch 32
+  j_l_u64 c
+  j_l_ch 47
+  j_l_u64 get rq_ncmds 0
+  j_l_txt j_t_b
+  j_l_u64 get rq_cmd_bi c
+  na = get rq_cmd_na c
+  j_l_txt j_t_argc
+  j_l_u64 na
+  nr = get rq_cmd_nr c
+  wr = ulong 0
+  k = ulong 0
+  while lt k nr bound 8
+    rk = get rq_rd_kind add mul c 8 k
+    if or eq rk OSH_R_OUT eq rk OSH_R_APPEND
+      wr = add wr 1
+    end
+    k = add k 1
+  end
+  j_l_txt j_t_wr
+  j_l_u64 wr
+  j_l_txt j_t_a0
+  if gt na 0
+    j_l_esc_arena get rq_argv_off mul c 32 get rq_argv_len mul c 32
+  else
+    j_l_ch 37
+  end
+  j_l_txt j_t_lens
+  if eq na 0
+    j_l_ch 45
+  else
+    k = ulong 0
+    while lt k na bound 32
+      if gt k 0
+        j_l_ch 44
+      end
+      j_l_u64 get rq_argv_len add mul c 32 k
+      k = add k 1
+    end
+  end
+  j_l_ch 10
+  if ne j_commit_line 0 0
+    ret 0
+  end
+  put j_next_rec 0 add rec 1
+  ret rec
+end
+
+fn j_l_outcome oc ulong to void
+  if eq oc 0
+    j_l_txt j_s_out0
+    ret
+  end
+  if eq oc 1
+    j_l_txt j_s_out1
+    ret
+  end
+  if eq oc 2
+    j_l_txt j_s_out2
+    ret
+  end
+  if eq oc 3
+    j_l_txt j_s_out3
+    ret
+  end
+  j_l_txt j_s_out4
+end
+
+fn osh_journal_write_one_outcome dig view uchar 32 idx ulong ref_r ulong oc ulong st_err ulong to long
+  put j_line_len 0 0
+  rec = get j_next_rec 0
+  j_l_txt j_s_oshj1
+  j_l_u64 rec
+  j_l_ch 32
+  j_l_ch 79
+  j_l_ch 32
+  j_l_u64 ref_r
+  j_l_ch 32
+  j_l_hex dig
+  j_l_ch 32
+  j_l_u64 idx
+  j_l_ch 47
+  j_l_u64 get rq_ncmds 0
+  j_l_ch 32
+  j_l_outcome oc
+  j_l_txt j_t_st
+  j_l_u64 and st_err 0xffff
+  j_l_txt j_t_err
+  j_l_u64 shr st_err 16
+  j_l_ch 10
+  if ne j_commit_line 1 0
+    ret -1
+  end
+  put j_next_rec 0 add rec 1
+  ret 0
+end
+
+fn j_recover_emit i ulong orec ulong to long
+  put j_line_len 0 0
+  rec = get j_next_rec 0
+  j_l_txt j_s_oshj1
+  j_l_u64 rec
+  j_l_ch 32
+  j_l_ch 79
+  j_l_ch 32
+  j_l_u64 orec
+  j_l_ch 32
+  m = ulong 0
+  while lt m 64 bound 64
+    j_l_ch get j_open_dig add mul i 64 m
+    m = add m 1
+  end
+  j_l_ch 32
+  j_l_u64 get j_open_idx i
+  j_l_ch 47
+  j_l_u64 get j_open_nc i
+  j_l_ch 32
+  j_l_txt j_s_out4
+  j_l_txt j_t_rec1
+  if ne j_commit_line 1 0
+    ret -5
+  end
+  put j_next_rec 0 add rec 1
+  ret 0
+end
+
+fn j_is_closed orec ulong to ulong
+  ncl = get j_nclosed 0
+  k = ulong 0
+  while lt k ncl bound 256
+    if eq get j_closed_ref k orec
+      ret 1
+    end
+    k = add k 1
+  end
+  ret 0
+end
+
+fn osh_journal_recover path view uchar * pl ulong bad_out edit ulong 1 to long
+  mx = new ulong 1 0
+  sr = j_scan_read path pl
+  if lt sr 0
+    ret sr
+  end
+  j_scan_parse_lines ulong sr mx bad_out
+  no = get j_nopen 0
+  found = ulong 0
+  i = ulong 0
+  while lt i no bound 256
+    orec = get j_open_rec i
+    if eq j_is_closed orec 0
+      found = add found 1
+      if ne j_recover_emit i orec 0
+        ret -5
+      end
+    end
+    i = add i 1
+  end
+  ret long found
+end
+
+fn osh_journal_default_path xdg view uchar * home view uchar * dst edit uchar * to long
+  xl = len xdg
+  hl = len home
+  if gt xl 0
+    if eq get xdg 0 47
+      el = len j_s_def1
+      if ge add xl el 4096
+        ret -1
+      end
+      i = ulong 0
+      while lt i xl bound 4096
+        put dst i get xdg i
+        i = add i 1
+      end
+      i = ulong 0
+      while lt i el bound 64
+        put dst add xl i get j_s_def1 i
+        i = add i 1
+      end
+      ret long add xl el
+    end
+  end
+  if gt hl 0
+    if eq get home 0 47
+      el = len j_s_def2
+      if ge add hl el 4096
+        ret -1
+      end
+      i = ulong 0
+      while lt i hl bound 4096
+        put dst i get home i
+        i = add i 1
+      end
+      i = ulong 0
+      while lt i el bound 64
+        put dst add hl i get j_s_def2 i
+        i = add i 1
+      end
+      ret long add hl el
+    end
+  end
+  ret -1
+end
+
+fn j_mkdir_one d view uchar * n ulong to long
+  mr = makedir d 0 n 448
+  if eq mr 0
+    dfd = fopen d 0 n or OSH_O_RDONLY or OSH_O_DIRECTORY OSH_O_CLOEXEC 0
+    if lt dfd 0
+      ret dfd
+    end
+    sr = j_sync_fd int dfd
+    ign = fclose int dfd
+    if ne sr 0
+      ret sr
+    end
+    ret j_fsync_parent d n
+  end
+  if eq mr -17
+    ret 0
+  end
+  ret mr
+end
+
+fn osh_journal_mkparents path view uchar * pl ulong to long
+  d = new uchar 4096 0
+  if ge pl 4096
+    ret -36
+  end
+  last = ulong 0
+  has_sl = ulong 0
+  i = ulong 0
+  while lt i pl bound 4096
+    put d i get path i
+    if eq get path i 47
+      last = i
+      has_sl = 1
+    end
+    i = add i 1
+  end
+  if or eq has_sl 0 eq last 0
+    ret 0
+  end
+  i = ulong 1
+  while le i last bound 4096
+    if or eq i last eq get d i 47
+      rc = j_mkdir_one d i
+      if ne rc 0
+        ret rc
+      end
+    end
+    i = add i 1
+  end
+  ret 0
+end

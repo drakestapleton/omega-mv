@@ -1,0 +1,1475 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_builtin.c (cd, pwd, printf, export, unset, exit).
+note Requires osh_req.om, osh_vars.om, osh_caps.om before this file.
+om2
+
+global bi_out uchar 8192
+global bi_out_n ulong 1
+global bi_out_fd int 1
+global bi_out_err long 1
+global bi_sort_idx ulong 256
+
+text bi_s_home "HOME"
+text bi_s_oldpwd "OLDPWD"
+text bi_s_pwd "PWD"
+text bi_s_cdpath "CDPATH"
+text bi_s_dot "."
+text bi_s_cd_inv1 "cd: -"
+text bi_s_cd_inv2 ": invalid option\ncd: usage: cd [-L|[-P [-e]] [-@]] [dir]\n"
+text bi_s_cd_many "cd: too many arguments\n"
+text bi_s_cd_nohome "cd: HOME not set\n"
+text bi_s_cd_noold "cd: OLDPWD not set\n"
+text bi_s_cd_cdpath1 "cd: "
+text bi_s_cd_cdpath2 ": CDPATH is set and osh does not search it; use ./"
+text bi_s_cd_cdpath3 " or an absolute path\n"
+text bi_s_cd_nocwd "cd: cannot determine current directory\n"
+text bi_s_cd_long ": File name too long\n"
+text bi_s_pwd_inv1 "pwd: -"
+text bi_s_pwd_inv2 ": invalid option\npwd: usage: pwd [-LP]\n"
+text bi_s_getcwd_err "pwd: error retrieving current directory: getcwd: cannot access parent directories: No such file or directory\n"
+text bi_s_pf_usage "printf: usage: printf [-v var] format [arguments]\n"
+text bi_s_pf_v1 "printf: "
+text bi_s_pf_v2 ": option not supported\n"
+text bi_s_pf_inv1 "printf: -"
+text bi_s_pf_inv2 ": invalid option\nprintf: usage: printf [-v var] format [arguments]\n"
+text bi_s_pf_badnum1 "printf: '"
+text bi_s_pf_badnum2 "': invalid number\n"
+text bi_s_pf_miss1 "printf: `%"
+text bi_s_pf_miss2 "': missing format character\n"
+text bi_s_pf_invf1 "printf: `"
+text bi_s_pf_invf2 "': invalid format character\n"
+text bi_s_exp_inv1 "export: -"
+text bi_s_exp_inv2 ": invalid option\nexport: usage: export [-fn] [name[=value] ...] or export -p\n"
+text bi_s_exp_notfn1 "export: "
+text bi_s_exp_notfn2 ": not a function\n"
+text bi_s_exp_bad1 "export: `"
+text bi_s_exp_bad2 "': not a valid identifier\n"
+text bi_s_declx "declare -x "
+text bi_s_uns_inv1 "unset: -"
+text bi_s_uns_inv2 ": invalid option\nunset: usage: unset [-f] [-v] [-n] [name ...]\n"
+text bi_s_exit_many "exit: too many arguments\n"
+text bi_s_exit_num1 "exit: "
+text bi_s_exit_num2 ": numeric argument required\n"
+text bi_s_eff_spawn "spawn"
+text bi_s_eff_cd "cd"
+text bi_s_eff_write "write"
+text bi_s_eff_read "read"
+text bi_s_eff_den1 ": denied ("
+text bi_s_eff_den2 "); nothing was done\n"
+text bi_s_en_denied "DENIED"
+text bi_s_en_revoked "REVOKED"
+text bi_s_en_stale "STALE"
+text bi_s_en_dom "CAP_DOMAIN_MISMATCH"
+text bi_s_en_gen "CAP_GEN_NARROW"
+text bi_s_en_ref "REFUSED"
+text bi_hex_lo "0123456789abcdef"
+text bi_hex_hi "0123456789ABCDEF"
+
+fn osh_effect_check op ulong path view uchar * pl ulong diagfd int to ulong
+  rc = osh_caps_effect op path pl
+  if eq rc OSH_E_OK
+    ret OSH_E_OK
+  end
+  osh_d_reset
+  osh_d_txt osh_s_prefix
+  if eq op OSH_OP_SPAWN
+    osh_d_txt bi_s_eff_spawn
+  else
+    if eq op OSH_OP_CHDIR
+      osh_d_txt bi_s_eff_cd
+    else
+      if eq op OSH_OP_OPEN_WRITE
+        osh_d_txt bi_s_eff_write
+      else
+        osh_d_txt bi_s_eff_read
+      end
+    end
+  end
+  osh_d_ch 32
+  osh_d_str path pl
+  osh_d_txt bi_s_eff_den1
+  if eq rc OSH_E_DENIED
+    osh_d_txt bi_s_en_denied
+  else
+    if eq rc OSH_E_REVOKED
+      osh_d_txt bi_s_en_revoked
+    else
+      if eq rc OSH_E_STALE
+        osh_d_txt bi_s_en_stale
+      else
+        if eq rc OSH_E_CAP_DOMAIN_MISMATCH
+          osh_d_txt bi_s_en_dom
+        else
+          if eq rc OSH_E_CAP_GEN_NARROW
+            osh_d_txt bi_s_en_gen
+          else
+            osh_d_txt bi_s_en_ref
+          end
+        end
+      end
+    end
+  end
+  osh_d_txt bi_s_eff_den2
+  osh_write_g_dbuf diagfd
+  ret rc
+end
+
+fn bi_out_init fd int to void
+  put bi_out_fd 0 fd
+  put bi_out_n 0 0
+  put bi_out_err 0 0
+end
+
+fn bi_out_flush to void
+  n = get bi_out_n 0
+  if and gt n 0 eq get bi_out_err 0 0
+    fd = get bi_out_fd 0
+    o = ulong 0
+    while lt o n bound 8192
+      w = write fd bi_out o sub n o
+      if lt w 0
+        if eq w -4
+          continue
+        end
+        put bi_out_err 0 w
+        break
+      end
+      o = add o ulong w
+    end
+  end
+  put bi_out_n 0 0
+end
+
+fn bi_out_ch c uchar to void
+  n = get bi_out_n 0
+  if ge n 8100
+    bi_out_flush
+    n = ulong 0
+  end
+  put bi_out n c
+  put bi_out_n 0 add n 1
+end
+
+fn bi_out_bytes s view uchar * ln ulong to void
+  i = ulong 0
+  while lt i ln bound 8192
+    bi_out_ch get s i
+    i = add i 1
+  end
+end
+
+fn bi_out_txt s view uchar * to void
+  bi_out_bytes s len s
+end
+
+fn bi_copy_arg c ulong ai ulong dst edit uchar * cap ulong to ulong
+  idx = add mul c 32 ai
+  off = get rq_argv_off idx
+  ln = get rq_argv_len idx
+  i = ulong 0
+  while and lt i ln lt i cap bound 4096
+    put dst i get rq_arena add off i
+    i = add i 1
+  end
+  ret i
+end
+
+fn bi_logical_pwd dst edit uchar * to long
+  pbuf = new uchar 4096 0
+  pl = osh_var_get bi_s_pwd 3 pbuf 4096
+  if gt pl 0
+    if eq vs_pwd_names_cwd pbuf ulong pl 1
+      i = ulong 0
+      while lt i ulong pl bound 4096
+        put dst i get pbuf i
+        i = add i 1
+      end
+      ret pl
+    end
+  end
+  cr = cwd dst 0 4096
+  if gt cr 1
+    ret sub cr 1
+  end
+  if and eq cr -2 gt pl 0
+    if eq get pbuf 0 47
+      i = ulong 0
+      while lt i ulong pl bound 4096
+        put dst i get pbuf i
+        i = add i 1
+      end
+      ret pl
+    end
+  end
+  ret cr
+end
+
+note ---- cd ----
+
+fn bi_cd_join old view uchar 4096 uoldl ulong dir view uchar * dl ulong joined edit uchar 8192 to long
+  if eq get dir 0 47
+    k = ulong 0
+    while lt k dl bound 4096
+      put joined k get dir k
+      k = add k 1
+    end
+    ret long dl
+  end
+  if gt add add uoldl 1 dl 8190
+    ret -1
+  end
+  k = ulong 0
+  while lt k uoldl bound 4096
+    put joined k get old k
+    k = add k 1
+  end
+  put joined uoldl 47
+  k = ulong 0
+  while lt k dl bound 4096
+    put joined add add uoldl 1 k get dir k
+    k = add k 1
+  end
+  ret long add add uoldl 1 dl
+end
+
+fn bi_cd_finish old view uchar 4096 oldl ulong cur edit uchar 4096 ucl0 ulong phys ulong to ulong
+  p2 = new uchar 4096 0
+  ucl = ucl0
+  if eq phys 1
+    pr = cwd p2 0 4096
+    if gt pr 1
+      ucl = sub ulong pr 1
+      k = ulong 0
+      while lt k ucl bound 4096
+        put cur k get p2 k
+        k = add k 1
+      end
+    end
+  end
+  ign = osh_var_export bi_s_oldpwd 6 old oldl
+  ign = osh_var_set bi_s_pwd 3 cur ucl
+  ret ucl
+end
+
+fn bi_cd_exec dir view uchar * dl ulong phys ulong show ulong io view int 3 to ulong
+  old = new uchar 4096 0
+  joined = new uchar 8192 0
+  cur = new uchar 4096 0
+  oldl = bi_logical_pwd old
+  if lt oldl 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_cd_nocwd
+    osh_write_g_dbuf get io 2
+    ret 1
+  end
+  jl = bi_cd_join old ulong oldl dir dl joined
+  if lt jl 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_cd_cdpath1
+    osh_d_str dir dl
+    osh_d_txt bi_s_cd_long
+    osh_write_g_dbuf get io 2
+    ret 1
+  end
+  cl = osh_path_lex_canon joined ulong jl cur
+  if lt cl 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_cd_cdpath1
+    osh_d_str dir dl
+    osh_d_txt bi_s_cd_long
+    osh_write_g_dbuf get io 2
+    ret 1
+  end
+  ucl = ulong cl
+  if ne osh_effect_check OSH_OP_CHDIR cur ucl get io 2 OSH_E_OK
+    ret 1
+  end
+  cr = chdir cur 0 ucl
+  if ne cr 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_cd_cdpath1
+    osh_d_str dir dl
+    osh_d_ch 58
+    osh_d_ch 32
+    osh_d_errno cr
+    osh_d_ch 10
+    osh_write_g_dbuf get io 2
+    ret 1
+  end
+  ucl = bi_cd_finish old ulong oldl cur ucl phys
+  if eq show 1
+    bi_out_init get io 1
+    bi_out_bytes cur ucl
+    bi_out_ch 10
+    bi_out_flush
+    if ne get bi_out_err 0 0
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn bi_cd_check_cdpath dir view uchar * dl ulong fd2 int to ulong
+  cdp = new uchar 64 0
+  if le osh_var_get bi_s_cdpath 6 cdp 64 0
+    ret 0
+  end
+  anch = ulong 0
+  if eq get dir 0 47
+    anch = 1
+  end
+  if eq get dir 0 46
+    if or eq dl 1 eq get dir 1 47
+      anch = 1
+    end
+    if and ge dl 2 eq get dir 1 46
+      if or eq dl 2 eq get dir 2 47
+        anch = 1
+      end
+    end
+  end
+  if eq anch 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_cd_cdpath1
+    osh_d_str dir dl
+    osh_d_txt bi_s_cd_cdpath2
+    osh_d_str dir dl
+    osh_d_txt bi_s_cd_cdpath3
+    osh_write_g_dbuf fd2
+    ret 1
+  end
+  ret 0
+end
+
+fn bi_cd c ulong io view int 3 to ulong
+  arg = new uchar 4096 0
+  dir = new uchar 4096 0
+  na = get rq_cmd_na c
+  show = ulong 0
+  phys = ulong 0
+  i = ulong 1
+  while lt i na bound 32
+    al = bi_copy_arg c i arg 4096
+    if or lt al 2 ne get arg 0 45
+      break
+    end
+    if and eq al 2 eq get arg 1 45
+      i = add i 1
+      break
+    end
+    j = ulong 1
+    while lt j al bound 64
+      ch = get arg j
+      if eq ch 76
+        phys = 0
+      else
+        if eq ch 80
+          phys = 1
+        else
+          osh_d_reset
+          osh_d_txt osh_s_prefix
+          osh_d_txt bi_s_cd_inv1
+          osh_d_ch ch
+          osh_d_txt bi_s_cd_inv2
+          osh_write_g_dbuf get io 2
+          ret 2
+        end
+      end
+      j = add j 1
+    end
+    i = add i 1
+  end
+  if gt sub na i 1
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_cd_many
+    osh_write_g_dbuf get io 2
+    ret 1
+  end
+  dl = ulong 0
+  if eq na i
+    hl = osh_var_get bi_s_home 4 dir 4096
+    if le hl 0
+      osh_d_reset
+      osh_d_txt osh_s_prefix
+      osh_d_txt bi_s_cd_nohome
+      osh_write_g_dbuf get io 2
+      ret 1
+    end
+    dl = ulong hl
+  else
+    al = bi_copy_arg c i arg 4096
+    if and eq al 1 eq get arg 0 45
+      ol = osh_var_get bi_s_oldpwd 6 dir 4096
+      if le ol 0
+        osh_d_reset
+        osh_d_txt osh_s_prefix
+        osh_d_txt bi_s_cd_noold
+        osh_write_g_dbuf get io 2
+        ret 1
+      end
+      dl = ulong ol
+      show = 1
+    else
+      if eq al 0
+        ret 0
+      end
+      k = ulong 0
+      while lt k al bound 4096
+        put dir k get arg k
+        k = add k 1
+      end
+      dl = al
+      if ne bi_cd_check_cdpath dir dl get io 2 0
+        ret 1
+      end
+    end
+  end
+  ret bi_cd_exec dir dl phys show io
+end
+
+note ---- pwd ----
+
+fn bi_pwd c ulong io view int 3 to ulong
+  na = get rq_cmd_na c
+  phys = ulong 0
+  i = ulong 1
+  arg = new uchar 256 0
+  while lt i na bound 32
+    al = bi_copy_arg c i arg 256
+    if or lt al 2 ne get arg 0 45
+      break
+    end
+    if and eq al 2 eq get arg 1 45
+      break
+    end
+    j = ulong 1
+    while lt j al bound 64
+      ch = get arg j
+      if eq ch 80
+        phys = 1
+      else
+        if eq ch 76
+          phys = 0
+        else
+          osh_d_reset
+          osh_d_txt osh_s_prefix
+          osh_d_txt bi_s_pwd_inv1
+          osh_d_ch ch
+          osh_d_txt bi_s_pwd_inv2
+          osh_write_g_dbuf get io 2
+          ret 2
+        end
+      end
+      j = add j 1
+    end
+    i = add i 1
+  end
+  p = new uchar 4096 0
+  pl = long 0
+  if eq phys 1
+    cr = cwd p 0 4096
+    if gt cr 1
+      pl = sub cr 1
+    else
+      pl = cr
+    end
+  else
+    pl = bi_logical_pwd p
+  end
+  if lt pl 0
+    if eq pl -2
+      ign = osh_write_all get io 2 bi_s_getcwd_err len bi_s_getcwd_err
+    else
+      osh_d_reset
+      osh_d_txt osh_s_prefix
+      osh_d_txt bi_s_pwd
+      osh_d_ch 58
+      osh_d_ch 32
+      osh_d_errno pl
+      osh_d_ch 10
+      osh_write_g_dbuf get io 2
+    end
+    ret 1
+  end
+  bi_out_init get io 1
+  bi_out_bytes p ulong pl
+  bi_out_ch 10
+  bi_out_flush
+  if ne get bi_out_err 0 0
+    ret 1
+  end
+  ret 0
+end
+
+note ---- printf ----
+
+fn pf_is_conv ch uchar to ulong
+  c = ulong ch
+  if or eq c 100 eq c 105
+    ret 1
+  end
+  if or eq c 111 eq c 117
+    ret 1
+  end
+  if or eq c 120 eq c 88
+    ret 1
+  end
+  if or eq c 99 eq c 115
+    ret 1
+  end
+  if or eq c 98 eq c 113
+    ret 1
+  end
+  ret 0
+end
+
+fn pf_parse_digits s view uchar * st ulong base ulong out_u edit ulong 1 to ulong
+  ln = len s
+  i = st
+  v = ulong 0
+  bad = ulong 0
+  while lt i ln bound 64
+    c = ulong get s i
+    d = ulong 99
+    if and ge c 48 le c 57
+      d = sub c 48
+    end
+    if and ge c 97 le c 102
+      d = add sub c 97 10
+    end
+    if and ge c 65 le c 70
+      d = add sub c 65 10
+    end
+    if ge d base
+      bad = 1
+      break
+    end
+    v = add mul v base d
+    i = add i 1
+  end
+  if eq i st
+    bad = 1
+    v = 0
+  end
+  put out_u 0 v
+  ret bad
+end
+
+note Parse int argument for printf (base 0 or 'x/"x); returns 0 ok, 1 bad number.
+fn pf_parse_int s view uchar * ln ulong is_signed ulong out_u edit ulong 1 fd_err int to ulong
+  put out_u 0 0
+  if eq ln 0
+    ret 0
+  end
+  c0 = ulong get s 0
+  if or eq c0 39 eq c0 34
+    if gt ln 1
+      put out_u 0 ulong get s 1
+    end
+    ret 0
+  end
+  i = ulong 0
+  while and lt i ln or eq get s i 32 eq get s i 9 bound 64
+    i = add i 1
+  end
+  neg_f = ulong 0
+  if lt i ln
+    if eq get s i 45
+      neg_f = 1
+      i = add i 1
+    else
+      if eq get s i 43
+        i = add i 1
+      end
+    end
+  end
+  base = ulong 10
+  if lt i ln
+    if eq get s i 48
+      base = 8
+      if lt add i 1 ln
+        c1 = ulong get s add i 1
+        if or eq c1 120 eq c1 88
+          base = 16
+          i = add i 2
+        end
+      end
+    end
+  end
+  bad = pf_parse_digits part s 0 ln i base out_u
+  if eq neg_f 1
+    put out_u 0 sub ulong 0 get out_u 0
+  end
+  if ne bad 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_pf_badnum1
+    osh_d_str s ln
+    osh_d_txt bi_s_pf_badnum2
+    osh_write_g_dbuf fd_err
+    ret 1
+  end
+  ret 0
+end
+
+fn pf_out_pad s view uchar * ln ulong width ulong left ulong zero_p ulong to void
+  if eq left 0
+    k = ln
+    while lt k width bound 4096
+      if ne zero_p 0
+        bi_out_ch 48
+      else
+        bi_out_ch 32
+      end
+      k = add k 1
+    end
+  end
+  bi_out_bytes s ln
+  if ne left 0
+    k = ln
+    while lt k width bound 4096
+      bi_out_ch 32
+      k = add k 1
+    end
+  end
+end
+
+fn pf_fmt_uint v ulong base ulong upper ulong dst edit uchar 64 to ulong
+  tmp = new uchar 64 0
+  x = v
+  n = ulong 0
+  while ge x base bound 64
+    d = rem x base
+    if ne upper 0
+      put tmp n get bi_hex_hi d
+    else
+      put tmp n get bi_hex_lo d
+    end
+    x = div x base
+    n = add n 1
+  end
+  if ne upper 0
+    put tmp n get bi_hex_hi x
+  else
+    put tmp n get bi_hex_lo x
+  end
+  n = add n 1
+  i = ulong 0
+  while lt i n bound 64
+    put dst i get tmp sub sub n i 1
+    i = add i 1
+  end
+  ret n
+end
+
+fn pf_fmt_sint sv long dst edit uchar 64 to ulong
+  sub_b = new uchar 64 0
+  if lt sv 0
+    put dst 0 45
+    u = ulong 0
+    if eq sv -9223372036854775808
+      u = ulong 9223372036854775808
+    else
+      u = ulong neg sv
+    end
+    n = pf_fmt_uint u 10 0 sub_b
+    i = ulong 0
+    while lt i n bound 63
+      put dst add i 1 get sub_b i
+      i = add i 1
+    end
+    ret add n 1
+  end
+  ret pf_fmt_uint ulong sv 10 0 dst
+end
+
+fn pf_expand_b s view uchar * ln ulong to ulong
+  i = ulong 0
+  while lt i ln bound 4096
+    c = get s i
+    if ne c 92
+      bi_out_ch c
+      i = add i 1
+      continue
+    end
+    if ge add i 1 ln
+      bi_out_ch 92
+      ret 0
+    end
+    e = ulong get s add i 1
+    if eq e 99
+      ret 1
+    end
+    if eq e 110
+      bi_out_ch 10
+      i = add i 2
+      continue
+    end
+    if eq e 116
+      bi_out_ch 9
+      i = add i 2
+      continue
+    end
+    if eq e 114
+      bi_out_ch 13
+      i = add i 2
+      continue
+    end
+    if eq e 92
+      bi_out_ch 92
+      i = add i 2
+      continue
+    end
+    if eq e 97
+      bi_out_ch 7
+      i = add i 2
+      continue
+    end
+    if eq e 98
+      bi_out_ch 8
+      i = add i 2
+      continue
+    end
+    if eq e 102
+      bi_out_ch 12
+      i = add i 2
+      continue
+    end
+    if eq e 118
+      bi_out_ch 11
+      i = add i 2
+      continue
+    end
+    if or eq e 101 eq e 69
+      bi_out_ch 27
+      i = add i 2
+      continue
+    end
+    if or eq e 39 eq e 34
+      bi_out_ch uchar e
+      i = add i 2
+      continue
+    end
+    if and ge e 48 le e 55
+      lim = ulong 3
+      if eq e 48
+        lim = 4
+      end
+      v8 = ulong 0
+      k = ulong 0
+      p = add i 1
+      while and lt k lim lt p ln bound 4
+        d = ulong get s p
+        if or lt d 48 gt d 55
+          break
+        end
+        v8 = add mul v8 8 sub d 48
+        p = add p 1
+        k = add k 1
+      end
+      bi_out_ch uchar and v8 255
+      i = p
+      continue
+    end
+    bi_out_ch 92
+    i = add i 1
+  end
+  ret 0
+end
+
+fn pf_validate_fmt fmt view uchar 4096 fl ulong fd2 int to long
+  nargs = ulong 0
+  p = ulong 0
+  while lt p fl bound 4096
+    ch = get fmt p
+    if eq ch 92
+      p = add p 1
+      if lt p fl
+        p = add p 1
+      end
+      continue
+    end
+    if ne ch 37
+      p = add p 1
+      continue
+    end
+    p = add p 1
+    if ge p fl
+      osh_d_reset
+      osh_d_txt osh_s_prefix
+      osh_d_txt bi_s_pf_miss1
+      osh_d_txt bi_s_pf_miss2
+      osh_write_g_dbuf fd2
+      ret -1
+    end
+    if eq get fmt p 37
+      p = add p 1
+      continue
+    end
+    while lt p fl bound 16
+      fc = ulong get fmt p
+      if or eq fc 45 eq fc 43
+        p = add p 1
+      else
+        if or eq fc 32 eq fc 35
+          p = add p 1
+        else
+          if eq fc 48
+            p = add p 1
+          else
+            break
+          end
+        end
+      end
+    end
+    while lt p fl bound 16
+      if or lt get fmt p 48 gt get fmt p 57
+        break
+      end
+      p = add p 1
+    end
+    if and lt p fl eq get fmt p 46
+      p = add p 1
+      while lt p fl bound 16
+        if or lt get fmt p 48 gt get fmt p 57
+          break
+        end
+        p = add p 1
+      end
+    end
+    if ge p fl
+      osh_d_reset
+      osh_d_txt osh_s_prefix
+      osh_d_txt bi_s_pf_miss1
+      osh_d_txt bi_s_pf_miss2
+      osh_write_g_dbuf fd2
+      ret -1
+    end
+    if eq pf_is_conv get fmt p 0
+      osh_d_reset
+      osh_d_txt osh_s_prefix
+      osh_d_txt bi_s_pf_invf1
+      osh_d_ch get fmt p
+      osh_d_txt bi_s_pf_invf2
+      osh_write_g_dbuf fd2
+      ret -1
+    end
+    nargs = add nargs 1
+    p = add p 1
+  end
+  ret long nargs
+end
+
+fn pf_emit_esc fmt view uchar 4096 fl ulong p ulong to ulong
+  if ge add p 1 fl
+    bi_out_ch 92
+    ret add p 1
+  end
+  e = ulong get fmt add p 1
+  if eq e 110
+    bi_out_ch 10
+    ret add p 2
+  end
+  if eq e 116
+    bi_out_ch 9
+    ret add p 2
+  end
+  if eq e 114
+    bi_out_ch 13
+    ret add p 2
+  end
+  if eq e 92
+    bi_out_ch 92
+    ret add p 2
+  end
+  if eq e 34
+    bi_out_ch 34
+    ret add p 2
+  end
+  if and ge e 48 le e 55
+    v8 = ulong 0
+    k = ulong 0
+    q = add p 1
+    while and lt k 3 lt q fl bound 3
+      d = ulong get fmt q
+      if or lt d 48 gt d 55
+        break
+      end
+      v8 = add mul v8 8 sub d 48
+      q = add q 1
+      k = add k 1
+    end
+    bi_out_ch uchar and v8 255
+    ret q
+  end
+  bi_out_ch 92
+  bi_out_ch uchar e
+  ret add p 2
+end
+
+global pf_st ulong 6
+note pf_st[0]=left, [1]=zpad, [2]=width, [3]=has_pr, [4]=prec, [5]=conv
+
+fn pf_parse_spec fmt view uchar 4096 fl ulong p0 ulong to ulong
+  p = p0
+  put pf_st 0 0
+  put pf_st 1 0
+  while lt p fl bound 16
+    fc = ulong get fmt p
+    if eq fc 45
+      put pf_st 0 1
+      p = add p 1
+    else
+      if eq fc 48
+        put pf_st 1 1
+        p = add p 1
+      else
+        if or eq fc 43 or eq fc 32 eq fc 35
+          p = add p 1
+        else
+          break
+        end
+      end
+    end
+  end
+  w = ulong 0
+  while lt p fl bound 16
+    if or lt get fmt p 48 gt get fmt p 57
+      break
+    end
+    w = add mul w 10 sub ulong get fmt p 48
+    p = add p 1
+  end
+  put pf_st 2 w
+  put pf_st 3 0
+  put pf_st 4 0
+  if and lt p fl eq get fmt p 46
+    put pf_st 3 1
+    p = add p 1
+    pr = ulong 0
+    while lt p fl bound 16
+      if or lt get fmt p 48 gt get fmt p 57
+        break
+      end
+      pr = add mul pr 10 sub ulong get fmt p 48
+      p = add p 1
+    end
+    put pf_st 4 pr
+  end
+  put pf_st 5 ulong get fmt p
+  ret add p 1
+end
+
+fn pf_out_pad_st s view uchar * n ulong use_zp ulong to void
+  zp = ulong 0
+  if ne use_zp 0
+    zp = get pf_st 1
+  end
+  pf_out_pad s n get pf_st 2 get pf_st 0 zp
+end
+
+fn pf_emit_conv arg view uchar 4096 al ulong fd2 int st_box edit ulong 1 to ulong
+  ubox = new ulong 1 0
+  nbuf = new uchar 64 0
+  c1 = new uchar 1 0
+  conv = get pf_st 5
+  if eq conv 115
+    sl = al
+    if and ne get pf_st 3 0 lt get pf_st 4 sl
+      sl = get pf_st 4
+    end
+    pf_out_pad_st arg sl 0
+    ret 0
+  end
+  if eq conv 99
+    put c1 0 0
+    if gt al 0
+      put c1 0 get arg 0
+    end
+    pf_out_pad_st c1 1 0
+    ret 0
+  end
+  if eq conv 98
+    ret pf_expand_b arg al
+  end
+  if or eq conv 100 eq conv 105
+    if ne pf_parse_int arg al 1 ubox fd2 0
+      put st_box 0 1
+    end
+    nl = pf_fmt_sint long get ubox 0 nbuf
+    pf_out_pad_st nbuf nl 1
+    ret 0
+  end
+  if ne pf_parse_int arg al 0 ubox fd2 0
+    put st_box 0 1
+  end
+  base = ulong 10
+  up = ulong 0
+  if eq conv 111
+    base = 8
+  end
+  if eq conv 120
+    base = 16
+  end
+  if eq conv 88
+    base = 16
+    up = 1
+  end
+  nl = pf_fmt_uint get ubox 0 base up nbuf
+  pf_out_pad_st nbuf nl 1
+  ret 0
+end
+
+fn pf_run_pass c ulong fmt view uchar 4096 fl ulong ci_box edit ulong 2 fd2 int to ulong
+  note ci_box[0]=ci, ci_box[1]=status; returns stop flag
+  arg = new uchar 4096 0
+  st_box = new ulong 1 0
+  put st_box 0 get ci_box 1
+  na = get rq_cmd_na c
+  p = ulong 0
+  stop = ulong 0
+  while and lt p fl eq stop 0 bound 4096
+    ch = get fmt p
+    if eq ch 92
+      p = pf_emit_esc fmt fl p
+      continue
+    end
+    if ne ch 37
+      bi_out_ch ch
+      p = add p 1
+      continue
+    end
+    p = add p 1
+    if eq get fmt p 37
+      bi_out_ch 37
+      p = add p 1
+      continue
+    end
+    p = pf_parse_spec fmt fl p
+    al = ulong 0
+    if lt get ci_box 0 na
+      al = bi_copy_arg c get ci_box 0 arg 4096
+      put ci_box 0 add get ci_box 0 1
+    end
+    stop = pf_emit_conv arg al fd2 st_box
+  end
+  put ci_box 1 get st_box 0
+  ret stop
+end
+
+fn bi_printf c ulong io view int 3 to ulong
+  arg = new uchar 4096 0
+  fmt = new uchar 4096 0
+  ci_box = new ulong 2 0
+  na = get rq_cmd_na c
+  ai = ulong 1
+  if lt ai na
+    al = bi_copy_arg c ai arg 4096
+    if and eq al 2 and eq get arg 0 45 eq get arg 1 45
+      ai = add ai 1
+    else
+      if and ge al 2 eq get arg 0 45
+        osh_d_reset
+        osh_d_txt osh_s_prefix
+        if eq get arg 1 118
+          osh_d_txt bi_s_pf_v1
+          osh_d_str arg al
+          osh_d_txt bi_s_pf_v2
+        else
+          osh_d_txt bi_s_pf_inv1
+          osh_d_ch get arg 1
+          osh_d_txt bi_s_pf_inv2
+        end
+        osh_write_g_dbuf get io 2
+        ret 2
+      end
+    end
+  end
+  if ge ai na
+    ign = osh_write_all get io 2 bi_s_pf_usage len bi_s_pf_usage
+    ret 2
+  end
+  fl = bi_copy_arg c ai fmt 4096
+  ai = add ai 1
+  nargs = pf_validate_fmt fmt fl get io 2
+  if lt nargs 0
+    ret 1
+  end
+  bi_out_init get io 1
+  put ci_box 0 ai
+  put ci_box 1 0
+  passes = ulong 0
+  while lt passes 64 bound 64
+    stop = pf_run_pass c fmt fl ci_box get io 2
+    if ne stop 0
+      break
+    end
+    if eq nargs 0
+      break
+    end
+    if ge get ci_box 0 na
+      break
+    end
+    passes = add passes 1
+  end
+  bi_out_flush
+  if ne get bi_out_err 0 0
+    ret 1
+  end
+  ret get ci_box 1
+end
+
+note ---- export / unset / exit ----
+
+fn bi_var_cmp a ulong b ulong to long
+  oa = get vs_noff a
+  la = get vs_nlen a
+  ob = get vs_noff b
+  lb = get vs_nlen b
+  ml = la
+  if lt lb ml
+    ml = lb
+  end
+  i = ulong 0
+  while lt i ml bound 256
+    ca = ulong get vs_pool add oa i
+    cb = ulong get vs_pool add ob i
+    if lt ca cb
+      ret -1
+    end
+    if gt ca cb
+      ret 1
+    end
+    i = add i 1
+  end
+  if lt la lb
+    ret -1
+  end
+  if gt la lb
+    ret 1
+  end
+  ret 0
+end
+
+fn bi_out_declare_val vo ulong vl ulong to void
+  bi_out_ch 34
+  i = ulong 0
+  while lt i vl bound 4096
+    c = get vs_pool add vo i
+    if or eq c 34 eq c 92
+      bi_out_ch 92
+    else
+      if or eq c 36 eq c 96
+        bi_out_ch 92
+      end
+    end
+    bi_out_ch c
+    i = add i 1
+  end
+  bi_out_ch 34
+end
+
+fn bi_export_list fd int to ulong
+  nv = get vs_nvars 0
+  n = ulong 0
+  k = ulong 0
+  while lt k nv bound 256
+    if ne get vs_exp k 0
+      put bi_sort_idx n k
+      n = add n 1
+    end
+    k = add k 1
+  end
+  note Insertion sort by name
+  i = ulong 1
+  while lt i n bound 256
+    key = get bi_sort_idx i
+    j = i
+    while gt j 0 bound 256
+      prev = get bi_sort_idx sub j 1
+      if le bi_var_cmp prev key 0
+        break
+      end
+      put bi_sort_idx j prev
+      j = sub j 1
+    end
+    put bi_sort_idx j key
+    i = add i 1
+  end
+  bi_out_init fd
+  i = ulong 0
+  while lt i n bound 256
+    idx = get bi_sort_idx i
+    bi_out_txt bi_s_declx
+    no = get vs_noff idx
+    nl = get vs_nlen idx
+    j = ulong 0
+    while lt j nl bound 256
+      bi_out_ch get vs_pool add no j
+      j = add j 1
+    end
+    if ne get vs_hasv idx 0
+      bi_out_ch 61
+      bi_out_declare_val get vs_voff idx get vs_vlen idx
+    end
+    bi_out_ch 10
+    i = add i 1
+  end
+  bi_out_flush
+  if ne get bi_out_err 0 0
+    ret 1
+  end
+  ret 0
+end
+
+fn bi_export_one arg view uchar 4096 al ulong unexp ulong fn_flag ulong fd2 int to ulong
+  nm = new uchar 256 0
+  if ne fn_flag 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_exp_notfn1
+    osh_d_str arg al
+    osh_d_txt bi_s_exp_notfn2
+    osh_write_g_dbuf fd2
+    ret 1
+  end
+  eqp = ulong 0
+  has_eq = ulong 0
+  while lt eqp al bound 4096
+    if eq get arg eqp 61
+      has_eq = 1
+      break
+    end
+    eqp = add eqp 1
+  end
+  nl = al
+  if eq has_eq 1
+    nl = eqp
+  end
+  ok = ulong 0
+  if and gt nl 0 lt nl 256
+    ni = ulong 0
+    while lt ni nl bound 256
+      put nm ni get arg ni
+      ni = add ni 1
+    end
+    ok = osh_om_name_valid nm nl
+  end
+  if eq ok 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_exp_bad1
+    osh_d_str arg al
+    osh_d_txt bi_s_exp_bad2
+    osh_write_g_dbuf fd2
+    ret 1
+  end
+  if ne unexp 0
+    if eq has_eq 1
+      vl = sub sub al eqp 1
+      ign = osh_var_set nm nl part arg add eqp 1 vl vl
+    end
+    osh_var_unexport nm nl
+  else
+    if eq has_eq 1
+      vl = sub sub al eqp 1
+      ign = osh_var_export nm nl part arg add eqp 1 vl vl
+    else
+      ign = osh_var_export_mark nm nl
+    end
+  end
+  ret 0
+end
+
+fn bi_export c ulong io view int 3 to ulong
+  arg = new uchar 4096 0
+  na = get rq_cmd_na c
+  i = ulong 1
+  status = ulong 0
+  unexp = ulong 0
+  fn_flag = ulong 0
+  while lt i na bound 32
+    al = bi_copy_arg c i arg 4096
+    if or lt al 2 ne get arg 0 45
+      break
+    end
+    if and eq al 2 eq get arg 1 45
+      i = add i 1
+      break
+    end
+    j = ulong 1
+    while lt j al bound 64
+      ch = get arg j
+      if eq ch 110
+        unexp = 1
+      else
+        if eq ch 102
+          fn_flag = 1
+        else
+          if ne ch 112
+            osh_d_reset
+            osh_d_txt osh_s_prefix
+            osh_d_txt bi_s_exp_inv1
+            osh_d_ch ch
+            osh_d_txt bi_s_exp_inv2
+            osh_write_g_dbuf get io 2
+            ret 2
+          end
+        end
+      end
+      j = add j 1
+    end
+    i = add i 1
+  end
+  if ge i na
+    ret bi_export_list get io 1
+  end
+  while lt i na bound 32
+    al = bi_copy_arg c i arg 4096
+    if ne bi_export_one arg al unexp fn_flag get io 2 0
+      status = 1
+    end
+    i = add i 1
+  end
+  ret status
+end
+
+fn bi_unset c ulong io view int 3 to ulong
+  na = get rq_cmd_na c
+  i = ulong 1
+  arg = new uchar 256 0
+  while lt i na bound 32
+    al = bi_copy_arg c i arg 256
+    if or lt al 2 ne get arg 0 45
+      break
+    end
+    if and eq al 2 eq get arg 1 118
+      i = add i 1
+      continue
+    end
+    if and eq al 2 eq get arg 1 45
+      i = add i 1
+      break
+    end
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_uns_inv1
+    osh_d_ch get arg 1
+    osh_d_txt bi_s_uns_inv2
+    osh_write_g_dbuf get io 2
+    ret 2
+  end
+  while lt i na bound 32
+    al = bi_copy_arg c i arg 256
+    if and gt al 0 lt al 256
+      if ne osh_om_name_valid part arg 0 al al 0
+        osh_var_unset part arg 0 al al
+      end
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn bi_parse_exit_arg arg view uchar 256 al ulong out_st edit ulong 1 to ulong
+  p = ulong 0
+  while and lt p al or eq get arg p 32 eq get arg p 9 bound 64
+    p = add p 1
+  end
+  neg_f = ulong 0
+  if lt p al
+    if eq get arg p 45
+      neg_f = 1
+      p = add p 1
+    else
+      if eq get arg p 43
+        p = add p 1
+      end
+    end
+  end
+  st_d = p
+  v = ulong 0
+  bad = ulong 0
+  while lt p al bound 64
+    ch = ulong get arg p
+    if or lt ch 48 gt ch 57
+      bad = 1
+      break
+    end
+    v = add mul v 10 sub ch 48
+    p = add p 1
+  end
+  if or ne bad 0 eq p st_d
+    ret 1
+  end
+  if eq neg_f 1
+    v = sub ulong 0 v
+  end
+  put out_st 0 and v 255
+  ret 0
+end
+
+fn bi_exit c ulong io view int 3 in_parent ulong to ulong
+  arg = new uchar 256 0
+  out_st = new ulong 1 0
+  na = get rq_cmd_na c
+  st = and get sess_last_status 0 255
+  if gt na 2
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt bi_s_exit_many
+    osh_write_g_dbuf get io 2
+    if ne in_parent 0
+      put sess_abort_list 0 1
+    end
+    ret 1
+  end
+  if eq na 2
+    al = bi_copy_arg c 1 arg 256
+    if ne bi_parse_exit_arg arg al out_st 0
+      osh_d_reset
+      osh_d_txt osh_s_prefix
+      osh_d_txt bi_s_exit_num1
+      osh_d_str arg al
+      osh_d_txt bi_s_exit_num2
+      osh_write_g_dbuf get io 2
+      st = 2
+    else
+      st = get out_st 0
+    end
+  end
+  if ne in_parent 0
+    put sess_exit_req 0 1
+    put sess_exit_st 0 st
+  end
+  ret st
+end
+
+fn osh_builtin_run c ulong io view int 3 in_parent ulong to ulong
+  bi = get rq_cmd_bi c
+  if eq bi OSH_B_CD
+    ret bi_cd c io
+  end
+  if eq bi OSH_B_PWD
+    ret bi_pwd c io
+  end
+  if eq bi OSH_B_PRINTF
+    ret bi_printf c io
+  end
+  if eq bi OSH_B_EXPORT
+    ret bi_export c io
+  end
+  if eq bi OSH_B_UNSET
+    ret bi_unset c io
+  end
+  if eq bi OSH_B_EXIT
+    ret bi_exit c io in_parent
+  end
+  ret 1
+end

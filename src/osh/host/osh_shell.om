@@ -1,0 +1,428 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_shell.c (shell driver loop).
+note Requires osh_layout.om, osh_lex.om, osh_parse.om, osh_expand.om, osh_codes.om, osh_exec.om before this file.
+om2
+
+global sh_src uchar 65536
+global sh_src_len ulong 1
+global sh_src_pos ulong 1
+global sh_src_fd int 1
+global sh_exact_end ulong 1
+
+global sh_arg0 uchar 1024
+global sh_arg0_len ulong 1
+global sh_pos_buf uchar 16384
+global sh_pos_off ulong 32
+global sh_pos_len ulong 32
+global sh_npos ulong 1
+
+global sh_lists ulong 1
+global sh_refused ulong 1
+
+text sh_s_syn "syntax error: "
+text sh_s_ref "refused: "
+text sh_s_atb " at byte "
+text sh_s_eof "syntax error: unexpected end of input\n"
+text sh_s_inerr "input too long or unreadable\n"
+text sh_s_interr "internal error (unit status "
+
+fn sh_reset_list w edit ulong * to void
+  i = ulong 0
+  while lt i OSH_WS_CELLS bound 12000
+    put w i 0
+    i = add i 1
+  end
+  put w OSH_S_MAGIC OSH_ABI_MAGIC
+  put w OSH_S_VERSION OSH_ABI_VERSION
+  put w OSH_S_WS_CELLS OSH_WS_CELLS
+end
+
+fn sh_run_entry unit ulong buf view uchar * blen ulong w edit ulong * to ulong
+  i = ulong 0
+  while lt i 100000 bound 100000
+    st = ulong 0
+    if eq unit 0
+      st = osh_lex_run buf blen w OSH_WS_CELLS
+    else
+      st = osh_parse_run buf blen w OSH_WS_CELLS
+    end
+    if ne st 101
+      ret st
+    end
+    i = add i 1
+  end
+  ret ulong 0xffffffffffffffff
+end
+
+fn sh_lex_parse buf view uchar * blen ulong w edit ulong * to ulong
+  st = sh_run_entry 0 buf blen w
+  if ne st 0
+    ret st
+  end
+  ret sh_run_entry 1 buf blen w
+end
+
+fn sh_dec v ulong dst edit uchar 24 to ulong
+  t = new uchar 24 0
+  x = v
+  n = ulong 0
+  while ge x 10 bound 24
+    put t n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  put t n uchar add 48 x
+  n = add n 1
+  i = ulong 0
+  while lt i n bound 24
+    put dst i get t sub sub n i 1
+    i = add i 1
+  end
+  ret n
+end
+
+fn sh_answer_stage w edit ulong * found ulong vl ulong val view uchar 1024 to void
+  put w OSH_STAGING found
+  put w add OSH_STAGING 1 vl
+  put w add OSH_STAGING 2 get sh_npos 0
+  put w add OSH_STAGING 3 0
+  i = ulong 0
+  while and lt i vl lt i 1024 bound 1024
+    put w add add OSH_STAGING 4 i ulong get val i
+    i = add i 1
+  end
+end
+
+fn sh_ans_var buf view uchar * blen ulong a ulong ln ulong val edit uchar 1024 to long
+  nm = new uchar 256 0
+  if or gt a blen or ge ln 256 gt ln sub blen a
+    ret -1
+  end
+  i = ulong 0
+  while lt i ln bound 256
+    put nm i get buf add a i
+    i = add i 1
+  end
+  ret osh_var_get nm ln val 1024
+end
+
+fn sh_ans_pos a ulong val edit uchar 1024 to long
+  if eq a 0
+    vl = get sh_arg0_len 0
+    i = ulong 0
+    while and lt i vl lt i 1024 bound 1024
+      put val i get sh_arg0 i
+      i = add i 1
+    end
+    ret long vl
+  end
+  if and ge a 1 le a get sh_npos 0
+    idx = sub a 1
+    poff = get sh_pos_off idx
+    vl = get sh_pos_len idx
+    i = ulong 0
+    while and lt i vl lt i 1024 bound 1024
+      put val i get sh_pos_buf add poff i
+      i = add i 1
+    end
+    ret long vl
+  end
+  ret -1
+end
+
+fn sh_answer buf view uchar * blen ulong w edit ulong * to void
+  val = new uchar 1024 0
+  num = new uchar 24 0
+  kind = get w OSH_S_VR_KIND
+  found = ulong 0
+  vl = ulong 0
+  if eq kind 1
+    gl = sh_ans_var buf blen get w OSH_S_VR_A get w OSH_S_VR_LEN val
+    if ge gl 0
+      found = 1
+      vl = ulong gl
+    end
+  end
+  if eq kind 2
+    found = 1
+    vl = sh_dec get sess_last_status 0 num
+    i = ulong 0
+    while lt i vl bound 24
+      put val i get num i
+      i = add i 1
+    end
+  end
+  if eq kind 3
+    gl = sh_ans_pos get w OSH_S_VR_A val
+    if ge gl 0
+      found = 1
+      vl = ulong gl
+    end
+  end
+  if eq kind 4
+    found = 1
+    vl = sh_dec get sh_npos 0 num
+    i = ulong 0
+    while lt i vl bound 24
+      put val i get num i
+      i = add i 1
+    end
+  end
+  sh_answer_stage w found vl val
+end
+
+fn sh_refusal w view ulong * code ulong is_syn ulong to void
+  nm = new uchar 64 0
+  nl = osh_code_name code nm 64
+  osh_d_reset
+  osh_d_txt osh_s_prefix
+  if ne is_syn 0
+    osh_d_txt sh_s_syn
+  else
+    osh_d_txt sh_s_ref
+  end
+  if gt nl 0
+    osh_d_str nm nl
+  else
+    osh_d_ch 69
+    osh_d_u64 code
+  end
+  osh_d_txt sh_s_atb
+  osh_d_u64 get w OSH_S_ERR_OFF
+  osh_d_ch 10
+  osh_write_g_dbuf get sess_fd 2
+  put sess_last_status 0 2
+  put sh_refused 0 add get sh_refused 0 1
+end
+
+fn sh_exec_from_ws w edit ulong * to void
+  rec_copy = new ulong 1400 0
+  nc = get w add OSH_REQUEST 1
+  nrec = add OSH_REQ_HDR_CELLS mul nc OSH_CMD_CELLS
+  used = get w add OSH_REQUEST 4
+  if le nrec 1400
+    ci = ulong 0
+    while lt ci nrec bound 1400
+      put rec_copy ci get w add OSH_REQUEST ci
+      ci = add ci 1
+    end
+    ign = osh_exec_record part rec_copy 0 nrec nrec part w OSH_OUT used used
+  else
+    ign = osh_exec_record part rec_copy 0 1 1 part w OSH_OUT used used
+  end
+  put w OSH_S_LAST_STATUS get sess_last_status 0
+end
+
+fn sh_run_list buf view uchar * blen ulong w edit ulong * to ulong
+  put w OSH_S_LAST_STATUS get sess_last_status 0
+  g = ulong 0
+  while lt g 1000000 bound 1000000
+    st = osh_expand_run buf blen w OSH_WS_CELLS
+    if eq st 101
+      g = add g 1
+      continue
+    end
+    if eq st 102
+      sh_answer buf blen w
+      g = add g 1
+      continue
+    end
+    if eq st 103
+      sh_exec_from_ws w
+      if ne get sess_exit_req 0 0
+        ret 1
+      end
+      if ne get res_killed_int 0 0
+        ret 0
+      end
+      if ne get sess_abort_list 0 0
+        put sess_abort_list 0 0
+        ret 2
+      end
+      g = add g 1
+      continue
+    end
+    if eq st 104
+      ret 0
+    end
+    if and ge st 200 ne st ulong 0xffffffffffffffff
+      sh_refusal w st 0
+      if eq get sess_interactive 0 0
+        ret 1
+      end
+      ret 0
+    end
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt sh_s_interr
+    osh_d_u64 st
+    osh_d_ch 41
+    osh_d_ch 10
+    osh_write_g_dbuf get sess_fd 2
+    put sess_last_status 0 70
+    ret 1
+  end
+  ret 1
+end
+
+fn sh_read_line buf edit uchar * blen_box edit ulong 1 to long
+  fd = get sh_src_fd 0
+  bl = get blen_box 0
+  if lt fd 0
+    sp = get sh_src_pos 0
+    sl = get sh_src_len 0
+    if ge sp sl
+      ret 0
+    end
+    n = ulong 0
+    while lt add sp n sl bound 65536
+      if eq get sh_src add sp n 10
+        break
+      end
+      n = add n 1
+    end
+    nl = ulong 0
+    if lt add sp n sl
+      nl = 1
+    end
+    if gt add bl n 4096
+      ret -1
+    end
+    i = ulong 0
+    while lt i n bound 4096
+      put buf add bl i get sh_src add sp i
+      i = add i 1
+    end
+    bl = add bl n
+    add_nl = ulong 1
+    if and eq nl 0 ne get sh_exact_end 0 0
+      add_nl = 0
+    end
+    if eq add_nl 1
+      if ge bl 4096
+        ret -1
+      end
+      put buf bl 10
+      bl = add bl 1
+    end
+    put blen_box 0 bl
+    put sh_src_pos 0 add add sp n nl
+    if eq add_nl 1
+      ret 1
+    end
+    ret 2
+  end
+  got = ulong 0
+  ch = new uchar 1 0
+  while lt got 4096 bound 4096
+    r = read fd ch 0 1
+    if lt r 0
+      if eq r -4
+        continue
+      end
+      ret -1
+    end
+    if eq r 0
+      if eq got 0
+        ret 0
+      end
+      if ge bl 4096
+        ret -1
+      end
+      put buf bl 10
+      put blen_box 0 add bl 1
+      ret 1
+    end
+    if ge bl 4096
+      ret -1
+    end
+    put buf bl get ch 0
+    bl = add bl 1
+    got = add got 1
+    put blen_box 0 bl
+    if eq get ch 0 10
+      ret 1
+    end
+  end
+  ret -1
+end
+
+fn sh_run_loop to ulong
+  w = new ulong 11456 0
+  buf = new uchar 4096 0
+  blen_box = new ulong 1 0
+  outer = ulong 0
+  while lt outer 10000 bound 10000
+    sh_reset_list w
+    put blen_box 0 0
+    st = ulong 0
+    eof = ulong 0
+    inner = ulong 0
+    while lt inner 10000 bound 10000
+      r = sh_read_line buf blen_box
+      if lt r 0
+        osh_d_reset
+        osh_d_txt osh_s_prefix
+        osh_d_txt sh_s_inerr
+        osh_write_g_dbuf get sess_fd 2
+        put sess_last_status 0 2
+        ret 2
+      end
+      if and eq r 0 eq get blen_box 0 0
+        ret get sess_last_status 0
+      end
+      if or eq r 0 eq r 2
+        eof = 1
+        put w OSH_S_EOI 1
+      end
+      st = sh_lex_parse buf get blen_box 0 w
+      if and eq st 0 ne get w OSH_PX_STATE 4
+        if eq eof 1
+          st = 104
+        else
+          st = 100
+        end
+      end
+      if and eq st 100 eq eof 0
+        inner = add inner 1
+        continue
+      end
+      break
+    end
+    if eq st 104
+      note empty list at eof
+    else
+      if eq st 0
+        put sh_lists 0 add get sh_lists 0 1
+        rl = sh_run_list buf get blen_box 0 w
+        if eq rl 1
+          if ne get sess_exit_req 0 0
+            ret get sess_exit_st 0
+          end
+          ret get sess_last_status 0
+        end
+        if and eq rl 2 ne get sh_exact_end 0 0
+          ret get sess_last_status 0
+        end
+      else
+        if and ge st 200 ne st ulong 0xffffffffffffffff
+          sh_refusal w st 1
+        else
+          osh_d_reset
+          osh_d_txt osh_s_prefix
+          osh_d_txt sh_s_eof
+          osh_write_g_dbuf get sess_fd 2
+          put sess_last_status 0 2
+        end
+        if eq get sess_interactive 0 0
+          ret 2
+        end
+      end
+    end
+    if eq eof 1
+      ret get sess_last_status 0
+    end
+    outer = add outer 1
+  end
+  ret get sess_last_status 0
+end

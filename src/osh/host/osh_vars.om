@@ -1,0 +1,636 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_vars.c (shell variable table + envp builder).
+note Requires src/osh/host/osh_req.om before this file.
+om2
+
+const OSH_MAX_VARS ulong 256
+const OSH_VAR_POOL ulong 131072
+const OSH_MAX_RAW ulong 64
+const OSH_RAW_POOL ulong 32768
+
+global vs_nvars ulong 1
+global vs_noff ulong 256
+global vs_nlen ulong 256
+global vs_voff ulong 256
+global vs_vlen ulong 256
+global vs_hasv ulong 256
+global vs_exp ulong 256
+global vs_pool uchar 131072
+global vs_pool_used ulong 1
+
+global vs_nraw ulong 1
+global vs_roff ulong 64
+global vs_rlen ulong 64
+global vs_rpool uchar 32768
+global vs_rpool_used ulong 1
+
+note Session state scalars
+global sess_last_status ulong 1
+global sess_fd int 3
+global sess_interactive ulong 1
+global sess_exit_req ulong 1
+global sess_exit_st ulong 1
+global sess_abort_list ulong 1
+global sess_j_req ulong 1
+global sess_j_open ulong 1
+global sess_j_err uchar 512
+global sess_j_err_len ulong 1
+
+note Binding state
+global sess_bind_valid ulong 1
+global sess_bind_domain ulong 1
+global sess_bind_cap_idx ulong 1
+global sess_bind_cap_gen ulong 1
+global sess_bind_pid uchar 32
+
+note Packed envp buffer for execenv (u16 count + records, max 4096 bytes, max 64 entries)
+global env_pkt uchar 4096
+global env_pkt_len ulong 1
+global env_pkt_cnt ulong 1
+global env_entry_buf uchar 4096
+
+text vs_t_pwd "PWD"
+text vs_t_oldpwd "OLDPWD"
+text vs_t_shlvl "SHLVL"
+text vs_t_dot "."
+text vs_t_shlvl_w1 "osh: warning: shell level ("
+text vs_t_shlvl_w2 ") too high, resetting to 1\n"
+
+fn vs_pool_alloc s view uchar * ln ulong to long
+  pu = get vs_pool_used 0
+  if gt add add pu ln 1 OSH_VAR_POOL
+    ret -1
+  end
+  i = ulong 0
+  while lt i ln bound 8192
+    put vs_pool add pu i get s i
+    i = add i 1
+  end
+  put vs_pool add pu ln 0
+  put vs_pool_used 0 add add pu ln 1
+  ret long pu
+end
+
+fn vs_find nm view uchar * nl ulong to long
+  nv = get vs_nvars 0
+  i = ulong 0
+  while lt i nv bound 256
+    if eq get vs_nlen i nl
+      off = get vs_noff i
+      same = ulong 1
+      j = ulong 0
+      while and lt j nl eq same 1 bound 256
+        if ne get vs_pool add off j get nm j
+          same = 0
+        end
+        j = add j 1
+      end
+      if eq same 1
+        ret long i
+      end
+    end
+    i = add i 1
+  end
+  ret -1
+end
+
+fn vs_add nm view uchar * nl ulong to long
+  nv = get vs_nvars 0
+  if ge nv OSH_MAX_VARS
+    ret -1
+  end
+  no = vs_pool_alloc nm nl
+  if lt no 0
+    ret -1
+  end
+  put vs_noff nv ulong no
+  put vs_nlen nv nl
+  put vs_voff nv 0
+  put vs_vlen nv 0
+  put vs_hasv nv 0
+  put vs_exp nv 0
+  put vs_nvars 0 add nv 1
+  ret long nv
+end
+
+note Copy variable value into dst[0..cap), return length or -1 if unset.
+fn osh_var_get nm view uchar * nl ulong dst edit uchar * cap ulong to long
+  idx = vs_find nm nl
+  if lt idx 0
+    ret -1
+  end
+  u = ulong idx
+  if eq get vs_hasv u 0
+    ret -1
+  end
+  vl = get vs_vlen u
+  vo = get vs_voff u
+  i = ulong 0
+  while and lt i vl lt i cap bound 8192
+    put dst i get vs_pool add vo i
+    i = add i 1
+  end
+  ret long vl
+end
+
+fn osh_var_set nm view uchar * nl ulong val view uchar * vl ulong to long
+  if eq osh_om_name_valid nm nl 0
+    ret -1
+  end
+  idx = vs_find nm nl
+  if lt idx 0
+    idx = vs_add nm nl
+    if lt idx 0
+      ret -1
+    end
+  end
+  vo = vs_pool_alloc val vl
+  if lt vo 0
+    ret -1
+  end
+  u = ulong idx
+  put vs_voff u ulong vo
+  put vs_vlen u vl
+  put vs_hasv u 1
+  ret 0
+end
+
+fn osh_var_export_mark nm view uchar * nl ulong to long
+  if eq osh_om_name_valid nm nl 0
+    ret -1
+  end
+  idx = vs_find nm nl
+  if lt idx 0
+    idx = vs_add nm nl
+    if lt idx 0
+      ret -1
+    end
+  end
+  put vs_exp ulong idx 1
+  ret 0
+end
+
+fn osh_var_export nm view uchar * nl ulong val view uchar * vl ulong to long
+  if eq osh_om_name_valid nm nl 0
+    ret -1
+  end
+  idx = vs_find nm nl
+  if lt idx 0
+    idx = vs_add nm nl
+    if lt idx 0
+      ret -1
+    end
+  end
+  vo = vs_pool_alloc val vl
+  if lt vo 0
+    ret -1
+  end
+  u = ulong idx
+  put vs_voff u ulong vo
+  put vs_vlen u vl
+  put vs_hasv u 1
+  put vs_exp u 1
+  ret 0
+end
+
+fn osh_var_unexport nm view uchar * nl ulong to void
+  idx = vs_find nm nl
+  if ge idx 0
+    put vs_exp ulong idx 0
+  end
+end
+
+fn osh_var_unset nm view uchar * nl ulong to void
+  idx = vs_find nm nl
+  if lt idx 0
+    ret
+  end
+  u = ulong idx
+  last = sub get vs_nvars 0 1
+  if ne u last
+    put vs_noff u get vs_noff last
+    put vs_nlen u get vs_nlen last
+    put vs_voff u get vs_voff last
+    put vs_vlen u get vs_vlen last
+    put vs_hasv u get vs_hasv last
+    put vs_exp u get vs_exp last
+  end
+  put vs_nvars 0 last
+end
+
+fn vs_raw_keep s view uchar * ln ulong to void
+  nr = get vs_nraw 0
+  if ge nr OSH_MAX_RAW
+    ret
+  end
+  ru = get vs_rpool_used 0
+  if gt add ru ln OSH_RAW_POOL
+    ret
+  end
+  i = ulong 0
+  while lt i ln bound 4096
+    put vs_rpool add ru i get s i
+    i = add i 1
+  end
+  put vs_roff nr ru
+  put vs_rlen nr ln
+  put vs_rpool_used 0 add ru ln
+  put vs_nraw 0 add nr 1
+end
+
+fn vs_u64_le buf view uchar * off ulong to ulong
+  v = ulong get buf off
+  v = or v shl ulong get buf add off 1 8
+  v = or v shl ulong get buf add off 2 16
+  v = or v shl ulong get buf add off 3 24
+  v = or v shl ulong get buf add off 4 32
+  v = or v shl ulong get buf add off 5 40
+  v = or v shl ulong get buf add off 6 48
+  v = or v shl ulong get buf add off 7 56
+  ret v
+end
+
+fn vs_u32_le buf view uchar * off ulong to ulong
+  v = ulong get buf off
+  v = or v shl ulong get buf add off 1 8
+  v = or v shl ulong get buf add off 2 16
+  v = or v shl ulong get buf add off 3 24
+  ret v
+end
+
+fn vs_pwd_names_cwd p view uchar * pl ulong to ulong
+  if eq pl 0
+    ret 0
+  end
+  if ne get p 0 47
+    ret 0
+  end
+  sa = new uchar 128 0
+  sb = new uchar 128 0
+  if ne stat p 0 pl sa 0 128 0
+    ret 0
+  end
+  if ne stat vs_t_dot 0 1 sb 0 128 0
+    ret 0
+  end
+  if ne vs_u64_le sa 0 vs_u64_le sb 0
+    ret 0
+  end
+  if ne vs_u64_le sa 8 vs_u64_le sb 8
+    ret 0
+  end
+  ret 1
+end
+
+fn vs_parse_shlvl s view uchar * ln ulong to long
+  i = ulong 0
+  while and lt i ln or eq get s i 32 eq get s i 9 bound 64
+    i = add i 1
+  end
+  neg_f = ulong 0
+  if lt i ln
+    if eq get s i 45
+      neg_f = 1
+      i = add i 1
+    else
+      if eq get s i 43
+        i = add i 1
+      end
+    end
+  end
+  v = long 0
+  while lt i ln bound 32
+    c = ulong get s i
+    if or lt c 48 gt c 57
+      break
+    end
+    if lt v 1000000
+      v = add mul v 10 long sub c 48
+    end
+    i = add i 1
+  end
+  if eq neg_f 1
+    ret neg v
+  end
+  ret v
+end
+
+fn vs_import_one s view uchar * ln ulong to void
+  nm = new uchar 256 0
+  eqp = ulong 0
+  found = ulong 0
+  while lt eqp ln bound 4096
+    if eq get s eqp 61
+      found = 1
+      break
+    end
+    eqp = add eqp 1
+  end
+  if or eq found 0 eq eqp 0
+    ret
+  end
+  ident = ulong 0
+  if lt eqp 256
+    i = ulong 0
+    while lt i eqp bound 256
+      put nm i get s i
+      i = add i 1
+    end
+    ident = osh_om_name_valid nm eqp
+  end
+  if eq ident 0
+    vs_raw_keep s ln
+    ret
+  end
+  vlen = sub sub ln eqp 1
+  ign = osh_var_export nm eqp part s add eqp 1 vlen vlen
+end
+
+fn vs_init_shlvl to void
+  buf = new uchar 64 0
+  gl = osh_var_get vs_t_shlvl 5 buf 64
+  lvl = long 1
+  if ge gl 0
+    lvl = add vs_parse_shlvl buf ulong gl 1
+  end
+  if lt lvl 0
+    lvl = 0
+  end
+  if ge lvl 1000
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_txt vs_t_shlvl_w1
+    osh_d_i64 lvl
+    osh_d_txt vs_t_shlvl_w2
+    osh_write_g_dbuf get sess_fd 2
+    lvl = 1
+  end
+  dig = new uchar 24 0
+  x = ulong lvl
+  n = ulong 0
+  while ge x 10 bound 24
+    put dig n uchar add 48 rem x 10
+    x = div x 10
+    n = add n 1
+  end
+  put dig n uchar add 48 x
+  n = add n 1
+  out_s = new uchar 24 0
+  i = ulong 0
+  while lt i n bound 24
+    put out_s i get dig sub sub n i 1
+    i = add i 1
+  end
+  ign = osh_var_export vs_t_shlvl 5 out_s n
+end
+
+fn vs_init_pwd_oldpwd to void
+  pbuf = new uchar 4096 0
+  st = new uchar 128 0
+  pl = osh_var_get vs_t_pwd 3 pbuf 4096
+  ok = ulong 0
+  if ge pl 0
+    ok = vs_pwd_names_cwd pbuf ulong pl
+  end
+  if eq ok 0
+    cr = cwd pbuf 0 4096
+    if gt cr 1
+      ign = osh_var_export vs_t_pwd 3 pbuf sub ulong cr 1
+    end
+  end
+  ol = osh_var_get vs_t_oldpwd 6 pbuf 4096
+  is_dir = ulong 0
+  if gt ol 0
+    if eq stat pbuf 0 ulong ol st 0 128 0
+      mode = vs_u32_le st 16
+      if eq and mode 0xf000 0x4000
+        is_dir = 1
+      end
+    end
+  end
+  if eq is_dir 0
+    osh_var_unset vs_t_oldpwd 6
+    ign = osh_var_export_mark vs_t_oldpwd 6
+  end
+end
+
+fn osh_session_init_from_env to void
+  put vs_nvars 0 0
+  put vs_pool_used 0 0
+  put vs_nraw 0 0
+  put vs_rpool_used 0 0
+  put sess_last_status 0 0
+  put sess_fd 0 0
+  put sess_fd 1 1
+  put sess_fd 2 2
+  put sess_interactive 0 0
+  put sess_exit_req 0 0
+  put sess_exit_st 0 0
+  put sess_abort_list 0 0
+  put sess_bind_valid 0 1
+  put sess_bind_domain 0 2
+  put sess_bind_cap_idx 0 0
+  put sess_bind_cap_gen 0 1
+  ec = envcnt
+  buf = new uchar 4096 0
+  i = ulong 0
+  if gt ec 0
+    uec = ulong ec
+    while lt i uec bound 1024
+      r = envread i buf 0 4096
+      if gt r 0
+        vs_import_one buf ulong r
+      end
+      i = add i 1
+    end
+  end
+  vs_init_pwd_oldpwd
+  vs_init_shlvl
+end
+
+note ---- Packed envp builder for execenv (max 64 entries, 4096 bytes) ----
+
+fn env_pkt_reset to void
+  put env_pkt 0 0
+  put env_pkt 1 0
+  put env_pkt_len 0 2
+  put env_pkt_cnt 0 0
+end
+
+fn env_pkt_has_name nm view uchar * nl ulong to ulong
+  cnt = get env_pkt_cnt 0
+  pos = ulong 2
+  k = ulong 0
+  while lt k cnt bound 64
+    rlen = or ulong get env_pkt pos shl ulong get env_pkt add pos 1 8
+    pos = add pos 2
+    if gt rlen nl
+      if eq get env_pkt add pos nl 61
+        same = ulong 1
+        j = ulong 0
+        while and lt j nl eq same 1 bound 256
+          if ne get env_pkt add pos j get nm j
+            same = 0
+          end
+          j = add j 1
+        end
+        if eq same 1
+          ret 1
+        end
+      end
+    end
+    pos = add pos rlen
+    k = add k 1
+  end
+  ret 0
+end
+
+fn env_pkt_append_kv nm view uchar * nl ulong vl view uchar * vlen ulong to void
+  cnt = get env_pkt_cnt 0
+  if ge cnt 64
+    ret
+  end
+  if eq env_pkt_has_name nm nl 1
+    ret
+  end
+  rec_len = add add nl 1 vlen
+  cur = get env_pkt_len 0
+  if gt add add cur 2 rec_len 4096
+    ret
+  end
+  put env_pkt cur uchar and rec_len 255
+  put env_pkt add cur 1 uchar and shr rec_len 8 255
+  cur = add cur 2
+  i = ulong 0
+  while lt i nl bound 256
+    put env_pkt add cur i get nm i
+    i = add i 1
+  end
+  put env_pkt add cur nl 61
+  cur = add add cur nl 1
+  i = ulong 0
+  while lt i vlen bound 4096
+    put env_pkt add cur i get vl i
+    i = add i 1
+  end
+  put env_pkt_len 0 add cur vlen
+  cnt = add cnt 1
+  put env_pkt_cnt 0 cnt
+  put env_pkt 0 uchar and cnt 255
+  put env_pkt 1 uchar and shr cnt 8 255
+end
+
+fn env_pkt_append_raw roff ulong rlen ulong to void
+  cnt = get env_pkt_cnt 0
+  if ge cnt 64
+    ret
+  end
+  cur = get env_pkt_len 0
+  if gt add add cur 2 rlen 4096
+    ret
+  end
+  put env_pkt cur uchar and rlen 255
+  put env_pkt add cur 1 uchar and shr rlen 8 255
+  cur = add cur 2
+  i = ulong 0
+  while lt i rlen bound 4096
+    put env_pkt add cur i get vs_rpool add roff i
+    i = add i 1
+  end
+  put env_pkt_len 0 add cur rlen
+  cnt = add cnt 1
+  put env_pkt_cnt 0 cnt
+  put env_pkt 0 uchar and cnt 255
+  put env_pkt 1 uchar and shr cnt 8 255
+end
+
+fn env_pkt_push_assign idx ulong to void
+  nbuf = new uchar 256 0
+  vbuf = new uchar 4096 0
+  nl = get rq_as_nlen idx
+  vl = get rq_as_vlen idx
+  if gt nl 256
+    ret
+  end
+  if gt vl 4096
+    ret
+  end
+  off = get rq_as_noff idx
+  j = ulong 0
+  while lt j nl bound 256
+    put nbuf j get rq_arena add off j
+    j = add j 1
+  end
+  off = get rq_as_voff idx
+  j = ulong 0
+  while lt j vl bound 4096
+    put vbuf j get rq_arena add off j
+    j = add j 1
+  end
+  env_pkt_append_kv nbuf nl vbuf vl
+end
+
+fn env_pkt_add_assigns c ulong to void
+  k = get rq_cmd_ns c
+  while gt k 0 bound 16
+    k = sub k 1
+    env_pkt_push_assign add mul c 16 k
+  end
+end
+
+fn env_pkt_push_var i ulong to void
+  nbuf = new uchar 256 0
+  vbuf = new uchar 4096 0
+  nl = get vs_nlen i
+  vl = get vs_vlen i
+  if gt nl 256
+    ret
+  end
+  if gt vl 4096
+    ret
+  end
+  off = get vs_noff i
+  j = ulong 0
+  while lt j nl bound 256
+    put nbuf j get vs_pool add off j
+    j = add j 1
+  end
+  off = get vs_voff i
+  j = ulong 0
+  while lt j vl bound 4096
+    put vbuf j get vs_pool add off j
+    j = add j 1
+  end
+  env_pkt_append_kv nbuf nl vbuf vl
+end
+
+fn env_pkt_add_exported to void
+  nv = get vs_nvars 0
+  i = ulong 0
+  while lt i nv bound 256
+    if and ne get vs_exp i 0 ne get vs_hasv i 0
+      env_pkt_push_var i
+    end
+    i = add i 1
+  end
+end
+
+fn osh_build_envp_for_cmd c ulong prog view uchar * plen ulong to void
+  us = new uchar 1 95
+  env_pkt_reset
+  note 1. _=<prog> has highest precedence (bash rule)
+  if gt plen 0
+    env_pkt_append_kv us 1 prog plen
+  end
+  note 2. Command prefix assignments (last assignment to same name wins, so scan backwards)
+  env_pkt_add_assigns c
+  note 3. Exported shell variables
+  env_pkt_add_exported
+  note 4. Raw non-identifier environment entries
+  nr = get vs_nraw 0
+  i = ulong 0
+  while lt i nr bound 64
+    env_pkt_append_raw get vs_roff i get vs_rlen i
+    i = add i 1
+  end
+end

@@ -1,0 +1,501 @@
+om2
+note test_osh_e2e.om -- pure OM-2 end-to-end tests for osh + argprint.
+note Usage: test_osh_e2e OSH ARGPRINT
+
+const E2E_O_RDONLY int 0
+const E2E_O_WRONLY int 1
+const E2E_O_CREAT int 64
+const E2E_O_TRUNC int 512
+
+global e2e_osh uchar 512
+global e2e_osh_len ulong 1
+global e2e_arg uchar 512
+global e2e_arg_len ulong 1
+global e2e_tmp uchar 512
+global e2e_tmp_len ulong 1
+global e2e_pol uchar 512
+global e2e_pol_len ulong 1
+global e2e_jnl uchar 512
+global e2e_jnl_len ulong 1
+global e2e_out uchar 16384
+global e2e_out_len ulong 1
+global e2e_err uchar 16384
+global e2e_err_len ulong 1
+global e2e_st ulong 1
+global e2e_pkt uchar 16384
+global e2e_pkt_len ulong 1
+global e2e_checks ulong 1
+global e2e_fails ulong 1
+global e2e_dbuf uchar 512
+global e2e_dlen ulong 1
+
+text e2e_s_pass "OSH_E2E_PASS\n"
+text e2e_s_fail "OSH_E2E_FAIL\n"
+text e2e_s_bad "FAIL: case="
+text e2e_s_chk "checks="
+text e2e_s_fl " fails="
+text e2e_s_tmp "/tmp/osh_e2e_"
+text e2e_s_pol_f "/pol"
+text e2e_s_jnl_f "/jnl"
+text e2e_s_out_f "/.out"
+text e2e_s_err_f "/.err"
+text e2e_s_in_f "/.in"
+text e2e_s_scr_f "/script.osh"
+text e2e_s_pol_txt "principal 1\nallow spawn /\nallow read /\nallow write /\nallow chdir /\n"
+text e2e_s_caps "--caps"
+text e2e_s_journal "--journal"
+text e2e_s_dashc "-c"
+text e2e_s_devnull "/dev/null"
+text e2e_s_a0 "mysh"
+text e2e_s_a1 "one"
+text e2e_s_a2 "two"
+
+text e2e_c1 "printf '%s\\n' hello"
+text e2e_e1 "hello\n"
+text e2e_c2 "X=42; printf '%s\\n' \"$X\""
+text e2e_e2 "42\n"
+text e2e_c3 "printf 'a\\nb\\n' | @A -cat"
+text e2e_e3 "a\nb\n"
+text e2e_c4 "@A -x 7; printf '%s\\n' $?"
+text e2e_e4 "7\n"
+text e2e_c5 "@A -x 0 && printf 'ok\\n' || printf 'no\\n'"
+text e2e_e5 "ok\n"
+text e2e_c6 "@A -x 1 && printf 'ok\\n' || printf 'no\\n'"
+text e2e_e6 "no\n"
+text e2e_c7 "@A -io > @T/f1 2> @T/f2; @A -cat < @T/f1; @A -cat < @T/f2"
+text e2e_e7 "OE"
+text e2e_c8 "@A -io 2>&1"
+text e2e_e8 "OE"
+text e2e_c9 "FOO=bar @A -e FOO; @A -e FOO"
+text e2e_e9 "[bar]\n[(unset)]\n"
+text e2e_c10 "export Z=hi; @A -e Z; unset Z; @A -e Z"
+text e2e_e10 "[hi]\n[(unset)]\n"
+text e2e_c11 "printf '%s|%s|%s|%s\\n' \"$0\" \"$1\" \"$2\" \"$#\""
+text e2e_e11 "mysh|one|two|2\n"
+text e2e_c12 "exit 17"
+text e2e_c13 "echo $(hi)"
+text e2e_c14 "printf 'from_script\\n'\n"
+text e2e_e14 "from_script\n"
+text e2e_c15 "printf 'from_stdin\\n'\n"
+text e2e_e15 "from_stdin\n"
+text e2e_s_skip "!"
+text e2e_c16 "cd /tmp && pwd -P"
+text e2e_e16 "/tmp\n"
+
+fn e2e_d_ch c uchar to void
+  n = get e2e_dlen 0
+  if lt n 510
+    put e2e_dbuf n c
+    put e2e_dlen 0 add n 1
+  end
+end
+
+fn e2e_d_txt s view uchar * to void
+  i = ulong 0
+  n = len s
+  while lt i n bound 256
+    e2e_d_ch get s i
+    i = add i 1
+  end
+end
+
+fn e2e_d_u64 v0 ulong to void
+  dig = new uchar 24 0
+  v = v0
+  n = ulong 0
+  while ge v 10 bound 24
+    put dig n uchar add 48 rem v 10
+    v = div v 10
+    n = add n 1
+  end
+  put dig n uchar add 48 v
+  n = add n 1
+  i = ulong 0
+  while lt i n bound 24
+    e2e_d_ch get dig sub sub n i 1
+    i = add i 1
+  end
+end
+
+fn e2e_d_flush fd int to void
+  n = get e2e_dlen 0
+  if gt n 0
+    ign = write fd e2e_dbuf 0 n
+  end
+  put e2e_dlen 0 0
+end
+
+fn e2e_check ok ulong id ulong to void
+  put e2e_checks 0 add get e2e_checks 0 1
+  if eq ok 0
+    put e2e_fails 0 add get e2e_fails 0 1
+    put e2e_dlen 0 0
+    e2e_d_txt e2e_s_bad
+    e2e_d_u64 id
+    e2e_d_ch 10
+    e2e_d_flush 2
+  end
+end
+
+fn e2e_join_tmp suf view uchar * dst edit uchar 512 to ulong
+  tl = get e2e_tmp_len 0
+  i = ulong 0
+  while lt i tl bound 512
+    put dst i get e2e_tmp i
+    i = add i 1
+  end
+  sl = len suf
+  i = ulong 0
+  while lt i sl bound 128
+    put dst add tl i get suf i
+    i = add i 1
+  end
+  ret add tl sl
+end
+
+fn e2e_write_file path view uchar * pl ulong data view uchar * dl ulong to void
+  fl = or E2E_O_WRONLY or E2E_O_CREAT E2E_O_TRUNC
+  fd = fopen path 0 pl fl 384
+  if ge fd 0
+    o = ulong 0
+    while lt o dl bound 16384
+      w = write int fd data o sub dl o
+      if le w 0
+        break
+      end
+      o = add o ulong w
+    end
+    ign = fclose int fd
+  end
+end
+
+fn e2e_append_buf buf view uchar 4096 ur ulong tot ulong is_err ulong to ulong
+  k = ulong 0
+  while lt k ur bound 4096
+    if ge add tot k 16384
+      break
+    end
+    if eq is_err 0
+      put e2e_out add tot k get buf k
+    else
+      put e2e_err add tot k get buf k
+    end
+    k = add k 1
+  end
+  ret add tot k
+end
+
+fn e2e_slurp_out path view uchar * pl ulong is_err ulong to void
+  buf = new uchar 4096 0
+  fd = fopen path 0 pl E2E_O_RDONLY 0
+  tot = ulong 0
+  if ge fd 0
+    while lt tot 16384 bound 16384
+      r = read int fd buf 0 4096
+      if le r 0
+        break
+      end
+      tot = e2e_append_buf buf ulong r tot is_err
+    end
+    ign = fclose int fd
+  end
+  if eq is_err 0
+    put e2e_out_len 0 tot
+  else
+    put e2e_err_len 0 tot
+  end
+end
+
+fn e2e_subst src view uchar * dst edit uchar 4096 to ulong
+  sl = len src
+  o = ulong 0
+  i = ulong 0
+  while lt i sl bound 4096
+    if and eq get src i 64 lt add i 1 sl
+      nx = get src add i 1
+      if eq nx 65
+        al = get e2e_arg_len 0
+        k = ulong 0
+        while and lt k al lt o 4095 bound 512
+          put dst o get e2e_arg k
+          o = add o 1
+          k = add k 1
+        end
+        i = add i 2
+        continue
+      end
+      if eq nx 84
+        tl = get e2e_tmp_len 0
+        k = ulong 0
+        while and lt k tl lt o 4095 bound 512
+          put dst o get e2e_tmp k
+          o = add o 1
+          k = add k 1
+        end
+        i = add i 2
+        continue
+      end
+    end
+    if lt o 4095
+      put dst o get src i
+      o = add o 1
+    end
+    i = add i 1
+  end
+  ret o
+end
+
+fn e2e_pkt_add s view uchar * n ulong to void
+  pos = get e2e_pkt_len 0
+  put e2e_pkt pos uchar and n 255
+  put e2e_pkt add pos 1 uchar and shr n 8 255
+  pos = add pos 2
+  i = ulong 0
+  while lt i n bound 4096
+    put e2e_pkt add pos i get s i
+    i = add i 1
+  end
+  put e2e_pkt_len 0 add pos n
+end
+
+fn e2e_pkt_add_g which ulong to void
+  tmp = new uchar 512 0
+  n = ulong 0
+  if eq which 0
+    n = get e2e_osh_len 0
+    i = ulong 0
+    while lt i n bound 512
+      put tmp i get e2e_osh i
+      i = add i 1
+    end
+  else
+    if eq which 1
+      n = get e2e_pol_len 0
+      i = ulong 0
+      while lt i n bound 512
+        put tmp i get e2e_pol i
+        i = add i 1
+      end
+    else
+      n = get e2e_jnl_len 0
+      i = ulong 0
+      while lt i n bound 512
+        put tmp i get e2e_jnl i
+        i = add i 1
+      end
+    end
+  end
+  e2e_pkt_add tmp n
+end
+
+fn e2e_child_run mode ulong to void
+  p = new uchar 512 0
+  fl = or E2E_O_WRONLY or E2E_O_CREAT E2E_O_TRUNC
+  pl = e2e_join_tmp e2e_s_out_f p
+  fo = fopen p 0 pl fl 420
+  pl = e2e_join_tmp e2e_s_err_f p
+  fe = fopen p 0 pl fl 420
+  fi = long 0
+  if eq mode 2
+    pl = e2e_join_tmp e2e_s_in_f p
+    fi = fopen p 0 pl E2E_O_RDONLY 0
+  else
+    fi = fopen e2e_s_devnull 0 len e2e_s_devnull E2E_O_RDONLY 0
+  end
+  ign = dupfd int fi 0 0
+  ign = dupfd int fo 1 0
+  ign = dupfd int fe 2 0
+  ign = fclose int fi
+  ign = fclose int fo
+  ign = fclose int fe
+  er = execprog e2e_pkt 0 get e2e_pkt_len 0
+  exit 127
+end
+
+fn e2e_build_pkt mode ulong sub_b view uchar 4096 sl ulong extra ulong to void
+  scr = new uchar 512 0
+  inp = new uchar 512 0
+  scl = e2e_join_tmp e2e_s_scr_f scr
+  if eq mode 1
+    e2e_write_file scr scl sub_b sl
+  end
+  if eq mode 2
+    il = e2e_join_tmp e2e_s_in_f inp
+    e2e_write_file inp il sub_b sl
+  end
+  cnt = ulong 5
+  if eq mode 0
+    cnt = add 7 extra
+  end
+  if eq mode 1
+    cnt = add 6 extra
+  end
+  put e2e_pkt 0 uchar and cnt 255
+  put e2e_pkt 1 uchar and shr cnt 8 255
+  put e2e_pkt_len 0 2
+  e2e_pkt_add_g 0
+  e2e_pkt_add e2e_s_caps len e2e_s_caps
+  e2e_pkt_add_g 1
+  e2e_pkt_add e2e_s_journal len e2e_s_journal
+  e2e_pkt_add_g 2
+  if eq mode 0
+    e2e_pkt_add e2e_s_dashc len e2e_s_dashc
+    e2e_pkt_add sub_b sl
+  end
+  if eq mode 1
+    e2e_pkt_add scr scl
+  end
+  if eq extra 3
+    e2e_pkt_add e2e_s_a0 len e2e_s_a0
+    e2e_pkt_add e2e_s_a1 len e2e_s_a1
+    e2e_pkt_add e2e_s_a2 len e2e_s_a2
+  end
+end
+
+fn e2e_slurp_both to void
+  p = new uchar 512 0
+  pl = e2e_join_tmp e2e_s_out_f p
+  e2e_slurp_out p pl 0
+  pl = e2e_join_tmp e2e_s_err_f p
+  e2e_slurp_out p pl 1
+end
+
+fn e2e_spawn_osh mode ulong text_s view uchar * extra ulong to void
+  sub_b = new uchar 4096 0
+  wst = new uchar 4 0
+  sl = e2e_subst text_s sub_b
+  e2e_build_pkt mode sub_b sl extra
+  pid = fork
+  if eq pid 0
+    e2e_child_run mode
+  end
+  wr = waitpid int pid wst 0 4 0
+  put e2e_st 0 ulong get wst 1
+  e2e_slurp_both
+end
+
+fn e2e_out_eq exp view uchar * to ulong
+  el = len exp
+  if ne get e2e_out_len 0 el
+    ret 0
+  end
+  i = ulong 0
+  while lt i el bound 16384
+    if ne get e2e_out i get exp i
+      ret 0
+    end
+    i = add i 1
+  end
+  ret 1
+end
+
+fn e2e_case txt view uchar * exp view uchar * mode ulong exp_st ulong to void
+  extra = ulong 0
+  if ge mode 10
+    extra = 3
+    mode = sub mode 10
+  end
+  e2e_spawn_osh mode txt extra
+  id = add get e2e_checks 0 1
+  ok = ulong 0
+  if eq get e2e_st 0 exp_st
+    ok = 1
+  end
+  e2e_check ok id
+  if ne get exp 0 33
+    e2e_check e2e_out_eq exp add id 100
+  end
+end
+
+fn e2e_setup_tmp to void
+  dig = new uchar 24 0
+  sl = len e2e_s_tmp
+  i = ulong 0
+  while lt i sl bound 64
+    put e2e_tmp i get e2e_s_tmp i
+    i = add i 1
+  end
+  pid = ulong getpid
+  nd = ulong 0
+  while ge pid 10 bound 24
+    put dig nd uchar add 48 rem pid 10
+    pid = div pid 10
+    nd = add nd 1
+  end
+  put dig nd uchar add 48 pid
+  nd = add nd 1
+  i = ulong 0
+  while lt i nd bound 24
+    put e2e_tmp add sl i get dig sub sub nd i 1
+    i = add i 1
+  end
+  tl = add sl nd
+  put e2e_tmp_len 0 tl
+  ign = makedir e2e_tmp 0 tl 448
+  pol = new uchar 512 0
+  pl = e2e_join_tmp e2e_s_pol_f pol
+  i = ulong 0
+  while lt i pl bound 512
+    put e2e_pol i get pol i
+    i = add i 1
+  end
+  put e2e_pol_len 0 pl
+  e2e_write_file pol pl e2e_s_pol_txt len e2e_s_pol_txt
+  jnl = new uchar 512 0
+  jl = e2e_join_tmp e2e_s_jnl_f jnl
+  i = ulong 0
+  while lt i jl bound 512
+    put e2e_jnl i get jnl i
+    i = add i 1
+  end
+  put e2e_jnl_len 0 jl
+end
+
+fn main to int
+  put e2e_checks 0 0
+  put e2e_fails 0 0
+  if lt argcnt 3
+    ret 2
+  end
+  r1 = argread 1 e2e_osh 0 512
+  r2 = argread 2 e2e_arg 0 512
+  if or le r1 0 le r2 0
+    ret 2
+  end
+  put e2e_osh_len 0 ulong r1
+  put e2e_arg_len 0 ulong r2
+  e2e_setup_tmp
+  e2e_case e2e_c1 e2e_e1 0 0
+  e2e_case e2e_c2 e2e_e2 0 0
+  e2e_case e2e_c3 e2e_e3 0 0
+  e2e_case e2e_c4 e2e_e4 0 0
+  e2e_case e2e_c5 e2e_e5 0 0
+  e2e_case e2e_c6 e2e_e6 0 0
+  e2e_case e2e_c7 e2e_e7 0 0
+  e2e_case e2e_c8 e2e_e8 0 0
+  e2e_case e2e_c9 e2e_e9 0 0
+  e2e_case e2e_c10 e2e_e10 0 0
+  e2e_case e2e_c11 e2e_e11 10 0
+  e2e_case e2e_c12 e2e_s_skip 0 17
+  e2e_case e2e_c13 e2e_s_skip 0 2
+  e2e_case e2e_c14 e2e_e14 1 0
+  e2e_case e2e_c15 e2e_e15 2 0
+  e2e_case e2e_c16 e2e_e16 0 0
+  put e2e_dlen 0 0
+  e2e_d_txt e2e_s_chk
+  e2e_d_u64 get e2e_checks 0
+  e2e_d_txt e2e_s_fl
+  e2e_d_u64 get e2e_fails 0
+  e2e_d_ch 10
+  e2e_d_flush 1
+  if eq get e2e_fails 0 0
+    put e2e_dlen 0 0
+    e2e_d_txt e2e_s_pass
+    e2e_d_flush 1
+    ret 0
+  end
+  put e2e_dlen 0 0
+  e2e_d_txt e2e_s_fail
+  e2e_d_flush 1
+  ret 1
+end

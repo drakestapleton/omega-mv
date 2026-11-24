@@ -1,0 +1,876 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_exec.c (execution service, pipelines, redirections).
+note Requires osh_req.om, osh_vars.om, osh_journal.om, osh_caps.om, osh_builtin.om before this file.
+om2
+
+note Execution result globals (mirrors OshResult)
+global res_status ulong 1
+global res_err ulong 1
+global res_ncmds ulong 1
+global res_refusal ulong 1
+global res_killed_int ulong 1
+global res_j_failed ulong 1
+global res_cmd_pid long 8
+global res_cmd_status ulong 8
+global res_cmd_outcome ulong 8
+global res_cmd_termsig ulong 8
+global res_cmd_err ulong 8
+
+note Pipeline scratch globals
+global ex_j_dig uchar 32
+global ex_j_ref ulong 8
+global ex_argv_pkt uchar 65536
+global ex_argv_len ulong 1
+
+text ex_s_path "PATH"
+text ex_s_notfound ": command not found\n"
+text ex_s_j_unavail "effect journal unavailable; effect refused, nothing was run\n"
+text ex_s_j_fail "effect journal: intent could not be made durable; effect refused, nothing was run\n"
+text ex_s_j_ofail "journal: an outcome could not be made durable; recovery will report it UNKNOWN\n"
+text ex_s_sig_kill "Killed"
+text ex_s_sig_term "Terminated"
+text ex_s_sig_segv "Segmentation fault"
+text ex_s_sig_abrt "Aborted"
+text ex_s_sig_quit "Quit"
+text ex_s_sig_hup "Hangup"
+text ex_s_sig_oth "Signal"
+text ex_s_sig_mid " (signal "
+
+fn ex_check_exec path view uchar * pl ulong why_out edit long 1 to ulong
+  st = new uchar 128 0
+  r = stat path 0 pl st 0 128
+  if ne r 0
+    if or eq r -2 eq r -20
+      put why_out 0 2
+      ret 127
+    end
+    put why_out 0 neg r
+    ret 126
+  end
+  mode = vs_u32_le st 16
+  if eq and mode 0xf000 0x4000
+    put why_out 0 21
+    ret 126
+  end
+  if ne and mode 0xf000 0x8000
+    put why_out 0 13
+    ret 126
+  end
+  if ne faccess path 0 pl 1 0
+    put why_out 0 13
+    ret 126
+  end
+  ret 0
+end
+
+fn ex_try_dir dir view uchar * nm view uchar * dst edit uchar * to ulong
+  note returns 0=found, 1=denied(EACCES), 2=not found
+  why = new long 1 2
+  dl = len dir
+  nl = len nm
+  cl = ulong 0
+  if eq dl 0
+    put dst 0 46
+    cl = 1
+  else
+    if lt dl 4000
+      k = ulong 0
+      while lt k dl bound 4096
+        put dst k get dir k
+        k = add k 1
+      end
+      cl = dl
+    end
+  end
+  if or eq cl 0 ge add add cl 1 nl 4095
+    ret 2
+  end
+  put dst cl 47
+  cl = add cl 1
+  k = ulong 0
+  while lt k nl bound 4096
+    put dst add cl k get nm k
+    k = add k 1
+  end
+  cl = add cl nl
+  put dst cl 0
+  rc = ex_check_exec dst cl why
+  if eq rc 0
+    ret 0
+  end
+  if and eq rc 126 eq get why 0 13
+    ret 1
+  end
+  ret 2
+end
+
+fn ex_resolve_direct nm view uchar * dst edit uchar * to ulong
+  why = new long 1 2
+  nl = len nm
+  if ge nl 4095
+    ret 126
+  end
+  i = ulong 0
+  while lt i nl bound 4096
+    put dst i get nm i
+    i = add i 1
+  end
+  put dst nl 0
+  ret ex_check_exec dst nl why
+end
+
+fn ex_resolve_in pv view uchar * nm view uchar * dst edit uchar * to ulong
+  pvl = len pv
+  nl = len nm
+  if eq nl 0
+    ret 127
+  end
+  i = ulong 0
+  while lt i nl bound 4096
+    if eq get nm i 47
+      ret ex_resolve_direct nm dst
+    end
+    i = add i 1
+  end
+  if eq pvl 0
+    ret 127
+  end
+  denied = ulong 0
+  p = ulong 0
+  while le p pvl bound 256
+    e = p
+    while lt e pvl bound 4096
+      if eq get pv e 58
+        break
+      end
+      e = add e 1
+    end
+    tr = ex_try_dir part pv p sub e p nm dst
+    if eq tr 0
+      ret 0
+    end
+    if eq tr 1
+      denied = 1
+    end
+    if ge e pvl
+      break
+    end
+    p = add e 1
+  end
+  if eq denied 1
+    ret 126
+  end
+  ret 127
+end
+
+fn ex_is_path_assign idx ulong to ulong
+  if ne get rq_as_nlen idx 4
+    ret 0
+  end
+  no = get rq_as_noff idx
+  if ne get rq_arena no 80
+    ret 0
+  end
+  if ne get rq_arena add no 1 65
+    ret 0
+  end
+  if ne get rq_arena add no 2 84
+    ret 0
+  end
+  if ne get rq_arena add no 3 72
+    ret 0
+  end
+  ret 1
+end
+
+fn ex_copy_as_val idx ulong pv edit uchar 4096 to ulong
+  vo = get rq_as_voff idx
+  vl = get rq_as_vlen idx
+  if gt vl 4096
+    ret 0
+  end
+  j = ulong 0
+  while lt j vl bound 4096
+    put pv j get rq_arena add vo j
+    j = add j 1
+  end
+  ret vl
+end
+
+fn ex_cmd_path_override c ulong pv edit uchar 4096 cur_len ulong to ulong
+  upvl = cur_len
+  ns = get rq_cmd_ns c
+  k = ulong 0
+  while lt k ns bound 16
+    idx = add mul c 16 k
+    if eq ex_is_path_assign idx 1
+      if le get rq_as_vlen idx 4096
+        upvl = ex_copy_as_val idx pv
+      end
+    end
+    k = add k 1
+  end
+  ret upvl
+end
+
+fn osh_resolve_for_cmd c ulong dst edit uchar * dst_len edit ulong 1 to ulong
+  nm = new uchar 4096 0
+  pv = new uchar 4096 0
+  nl = bi_copy_arg c 0 nm 4096
+  pvl = osh_var_get ex_s_path 4 pv 4096
+  upvl = ulong 0
+  if ge pvl 0
+    upvl = ulong pvl
+  end
+  upvl = ex_cmd_path_override c pv upvl
+  rc = ex_resolve_in part pv 0 upvl part nm 0 nl dst
+  if eq rc 0
+    ln = ulong 0
+    while lt ln 4096 bound 4096
+      if eq get dst ln 0
+        break
+      end
+      ln = add ln 1
+    end
+    put dst_len 0 ln
+  end
+  ret rc
+end
+
+fn ex_cmd_is_effect c ulong to ulong
+  if and gt get rq_cmd_na c 0 eq get rq_cmd_bi c OSH_B_NONE
+    ret 1
+  end
+  nr = get rq_cmd_nr c
+  k = ulong 0
+  while lt k nr bound 8
+    rk = get rq_rd_kind add mul c 8 k
+    if or eq rk OSH_R_OUT eq rk OSH_R_APPEND
+      ret 1
+    end
+    k = add k 1
+  end
+  ret 0
+end
+
+fn ex_open_one_redir idx ulong diagfd int rerr edit ulong 1 to long
+  pbuf = new uchar 4096 0
+  rk = get rq_rd_kind idx
+  po = get rq_rd_poff idx
+  pl = get rq_rd_plen idx
+  j = ulong 0
+  while and lt j pl lt j 4096 bound 4096
+    put pbuf j get rq_arena add po j
+    j = add j 1
+  end
+  op = OSH_OP_OPEN_WRITE
+  if eq rk OSH_R_IN
+    op = OSH_OP_OPEN_READ
+  end
+  ge_r = osh_effect_check op pbuf pl diagfd
+  if ne ge_r OSH_E_OK
+    put rerr 0 ge_r
+    ret -1
+  end
+  fl = or OSH_O_WRONLY or OSH_O_CREAT OSH_O_CLOEXEC
+  if eq rk OSH_R_IN
+    fl = or OSH_O_RDONLY OSH_O_CLOEXEC
+  else
+    if eq rk OSH_R_APPEND
+      fl = or fl OSH_O_APPEND
+    else
+      fl = or fl OSH_O_TRUNC
+    end
+  end
+  nfd = fopen pbuf 0 pl fl 438
+  if lt nfd 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_str pbuf pl
+    osh_d_ch 58
+    osh_d_ch 32
+    osh_d_errno nfd
+    osh_d_ch 10
+    osh_write_g_dbuf diagfd
+    ret -1
+  end
+  ret nfd
+end
+
+fn ex_dup_one idx ulong io view int 3 tgt int diagfd int to long
+  src_idx = get rq_rd_src idx
+  dr = dupfd get io src_idx tgt OSH_O_CLOEXEC
+  if lt dr 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_u64 get rq_rd_fd idx
+    osh_d_ch 62
+    osh_d_ch 38
+    osh_d_u64 src_idx
+    osh_d_ch 58
+    osh_d_ch 32
+    osh_d_errno dr
+    osh_d_ch 10
+    osh_write_g_dbuf diagfd
+    ret -1
+  end
+  ret dr
+end
+
+fn ex_apply_redirs c ulong io edit int 3 owned edit int 8 nown edit ulong 1 diagfd int rerr edit ulong 1 to long
+  nr = get rq_cmd_nr c
+  k = ulong 0
+  while lt k nr bound 8
+    idx = add mul c 8 k
+    nfd = long -1
+    if eq get rq_rd_kind idx OSH_R_DUP
+      nfd = ex_dup_one idx io int add 20 add get nown 0 k diagfd
+      if lt nfd 0
+        ret -1
+      end
+    else
+      nfd = ex_open_one_redir idx diagfd rerr
+      if lt nfd 0
+        ret -1
+      end
+    end
+    no = get nown 0
+    put owned no int nfd
+    put nown 0 add no 1
+    put io get rq_rd_fd idx int nfd
+    k = add k 1
+  end
+  ret 0
+end
+
+fn ex_argv_append_arena idx ulong pos0 ulong to long
+  ao = get rq_argv_off idx
+  al = get rq_argv_len idx
+  if gt add add pos0 2 al 65536
+    ret -1
+  end
+  put ex_argv_pkt pos0 uchar and al 255
+  put ex_argv_pkt add pos0 1 uchar and shr al 8 255
+  pos = add pos0 2
+  j = ulong 0
+  while lt j al bound 8192
+    put ex_argv_pkt add pos j get rq_arena add ao j
+    j = add j 1
+  end
+  ret long add pos al
+end
+
+fn ex_build_argv_pkt c ulong path view uchar * plen ulong to ulong
+  na = get rq_cmd_na c
+  if eq na 0
+    ret 0
+  end
+  put ex_argv_pkt 0 uchar and na 255
+  put ex_argv_pkt 1 uchar and shr na 8 255
+  pos = ulong 2
+  if gt add add pos 2 plen 65536
+    ret 0
+  end
+  put ex_argv_pkt pos uchar and plen 255
+  put ex_argv_pkt add pos 1 uchar and shr plen 8 255
+  pos = add pos 2
+  i = ulong 0
+  while lt i plen bound 4096
+    put ex_argv_pkt add pos i get path i
+    i = add i 1
+  end
+  pos = add pos plen
+  k = ulong 1
+  while lt k na bound 32
+    np = ex_argv_append_arena add mul c 32 k pos
+    if lt np 0
+      ret 0
+    end
+    pos = ulong np
+    k = add k 1
+  end
+  put ex_argv_len 0 pos
+  ret 1
+end
+
+fn ex_jc_intent c ulong to long
+  if eq ex_cmd_is_effect c 0
+    ret 0
+  end
+  if and ne get sess_j_req 0 0 eq get sess_j_open 0 0
+    ret -2
+  end
+  if eq get sess_j_open 0 0
+    ret 0
+  end
+  dig = new uchar 32 0
+  i = ulong 0
+  while lt i 32 bound 32
+    put dig i get ex_j_dig i
+    i = add i 1
+  end
+  ref = osh_journal_intent dig c
+  put ex_j_ref c ref
+  if eq ref 0
+    ret -1
+  end
+  ret 0
+end
+
+fn ex_jc_finish to void
+  if eq get sess_j_open 0 0
+    ret
+  end
+  dig = new uchar 32 0
+  i = ulong 0
+  while lt i 32 bound 32
+    put dig i get ex_j_dig i
+    i = add i 1
+  end
+  nc = get rq_ncmds 0
+  i = ulong 0
+  while lt i nc bound 8
+    if ne ex_cmd_is_effect i 0
+      st_err = or and get res_cmd_status i 0xffff shl get res_cmd_err i 16
+      if ne osh_journal_write_one_outcome dig i get ex_j_ref i get res_cmd_outcome i st_err 0
+        put res_j_failed 0 1
+        osh_d_reset
+        osh_d_txt osh_s_prefix
+        osh_d_txt ex_s_j_ofail
+        osh_write_g_dbuf 2
+      end
+    end
+    i = add i 1
+  end
+end
+
+fn ex_apply_parent_assign k ulong to ulong
+  nbuf = new uchar 256 0
+  vbuf = new uchar 4096 0
+  nl = get rq_as_nlen k
+  vl = get rq_as_vlen k
+  if or gt nl 256 gt vl 4096
+    ret 0
+  end
+  off = get rq_as_noff k
+  j = ulong 0
+  while lt j nl bound 256
+    put nbuf j get rq_arena add off j
+    j = add j 1
+  end
+  off = get rq_as_voff k
+  j = ulong 0
+  while lt j vl bound 4096
+    put vbuf j get rq_arena add off j
+    j = add j 1
+  end
+  if ne osh_var_set nbuf nl vbuf vl 0
+    ret 1
+  end
+  ret 0
+end
+
+fn ex_run_in_parent to void
+  io = new int 3 0
+  owned = new int 8 0
+  nown = new ulong 1 0
+  rerr = new ulong 1 10
+  put io 0 get sess_fd 0
+  put io 1 get sess_fd 1
+  put io 2 get sess_fd 2
+  jrc = ex_jc_intent 0
+  if ne jrc 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    if eq jrc -2
+      osh_d_txt ex_s_j_unavail
+    else
+      osh_d_txt ex_s_j_fail
+    end
+    osh_write_g_dbuf get sess_fd 2
+    put res_cmd_status 0 1
+    put res_cmd_outcome 0 OSH_OUT_FAILED_NO_EFFECT
+    put res_cmd_err 0 OSH_E_IO
+    put res_status 0 1
+    ret
+  end
+  st = ulong 0
+  if ne ex_apply_redirs 0 io owned nown get sess_fd 2 rerr 0
+    st = 1
+    put res_cmd_status 0 1
+    put res_cmd_outcome 0 OSH_OUT_FAILED_NO_EFFECT
+    put res_cmd_err 0 get rerr 0
+  else
+    if ne get rq_cmd_bi 0 OSH_B_NONE
+      st = osh_builtin_run 0 io 1
+    else
+      ns = get rq_cmd_ns 0
+      k = ulong 0
+      while lt k ns bound 16
+        if ne ex_apply_parent_assign k 0
+          st = 1
+        end
+        k = add k 1
+      end
+    end
+    put res_cmd_status 0 st
+    put res_cmd_outcome 0 OSH_OUT_COMPLETED
+    put res_cmd_err 0 OSH_E_OK
+  end
+  k = get nown 0
+  while gt k 0 bound 8
+    k = sub k 1
+    ign = fclose get owned k
+  end
+  put res_status 0 st
+end
+
+fn ex_child_install io edit int 3 to long
+  i = ulong 0
+  while lt i 3 bound 3
+    f = get io i
+    if and lt f 3 ne f int i
+      h = dupfd f int add 30 i OSH_O_CLOEXEC
+      if lt h 0
+        ret -1
+      end
+      put io i int h
+    end
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i 3 bound 3
+    f = get io i
+    if ne f int i
+      if lt dupfd f int i 0 0
+        ret -1
+      end
+    end
+    i = add i 1
+  end
+  ret 0
+end
+
+fn ex_precheck_redirs i ulong to ulong
+  path = new uchar 4096 0
+  nr = get rq_cmd_nr i
+  k = ulong 0
+  while lt k nr bound 8
+    idx = add mul i 8 k
+    rk = get rq_rd_kind idx
+    if ne rk OSH_R_DUP
+      po = get rq_rd_poff idx
+      pl = get rq_rd_plen idx
+      j = ulong 0
+      while and lt j pl lt j 4096 bound 4096
+        put path j get rq_arena add po j
+        j = add j 1
+      end
+      op = OSH_OP_OPEN_WRITE
+      if eq rk OSH_R_IN
+        op = OSH_OP_OPEN_READ
+      end
+      rc = osh_effect_check op path pl get sess_fd 2
+      if ne rc OSH_E_OK
+        ret rc
+      end
+    end
+    k = add k 1
+  end
+  ret OSH_E_OK
+end
+
+fn ex_prepare_ext i ulong to ulong
+  path = new uchar 4096 0
+  plen_box = new ulong 1 0
+  rc = osh_resolve_for_cmd i path plen_box
+  if ne rc 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_arena get rq_argv_off mul i 32 get rq_argv_len mul i 32
+    if eq rc 127
+      osh_d_txt ex_s_notfound
+    else
+      osh_d_ch 58
+      osh_d_ch 32
+      osh_d_errno 13
+      osh_d_ch 10
+    end
+    osh_write_g_dbuf get sess_fd 2
+    put res_cmd_status i rc
+    put res_cmd_outcome i OSH_OUT_FAILED_NO_EFFECT
+    put res_cmd_err i OSH_E_NOT_FOUND
+    ret 1
+  end
+  ge_s = osh_effect_check OSH_OP_SPAWN path get plen_box 0 get sess_fd 2
+  if ne ge_s OSH_E_OK
+    put res_cmd_status i 126
+    put res_cmd_outcome i OSH_OUT_FAILED_NO_EFFECT
+    put res_cmd_err i ge_s
+    ret 1
+  end
+  osh_build_envp_for_cmd i path get plen_box 0
+  ign = ex_build_argv_pkt i path get plen_box 0
+  ret 0
+end
+
+fn ex_child_exec i ulong ext ulong io edit int 3 to void
+  owned = new int 8 0
+  nown = new ulong 1 0
+  rerr = new ulong 1 0
+  cio = new int 3 0
+  put cio 0 0
+  put cio 1 1
+  put cio 2 2
+  if ge get j_fd 0 0
+    ign = fclose get j_fd 0
+  end
+  if ne ex_apply_redirs i io owned nown get sess_fd 2 rerr 0
+    exit 1
+  end
+  if ne ex_child_install io 0
+    exit 1
+  end
+  if eq ext 1
+    if gt get env_pkt_cnt 0 0
+      er = execenv ex_argv_pkt 0 get ex_argv_len 0 env_pkt 0 get env_pkt_len 0
+      if eq er -2
+        exit 127
+      end
+      exit 126
+    else
+      er2 = execprog ex_argv_pkt 0 get ex_argv_len 0
+      if eq er2 -2
+        exit 127
+      end
+      exit 126
+    end
+  else
+    if ne get rq_cmd_bi i OSH_B_NONE
+      bst = osh_builtin_run i cio 0
+      exit int bst
+    else
+      exit 0
+    end
+  end
+end
+
+fn ex_spawn_stage i ulong rd int wr int to long
+  io = new int 3 0
+  put io 0 get sess_fd 0
+  put io 1 get sess_fd 1
+  put io 2 get sess_fd 2
+  if ge rd 0
+    put io 0 rd
+  end
+  if ge wr 0
+    put io 1 wr
+  end
+  pre_err = ex_precheck_redirs i
+  if ne pre_err OSH_E_OK
+    put res_cmd_status i 1
+    put res_cmd_outcome i OSH_OUT_FAILED_NO_EFFECT
+    put res_cmd_err i pre_err
+    ret 0
+  end
+  ext = ulong 0
+  if and gt get rq_cmd_na i 0 eq get rq_cmd_bi i OSH_B_NONE
+    ext = 1
+  end
+  if eq ext 1
+    if ne ex_prepare_ext i 0
+      ret 0
+    end
+  end
+  jrc = ex_jc_intent i
+  if ne jrc 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    if eq jrc -2
+      osh_d_txt ex_s_j_unavail
+    else
+      osh_d_txt ex_s_j_fail
+    end
+    osh_write_g_dbuf get sess_fd 2
+    put res_cmd_status i 1
+    put res_cmd_outcome i OSH_OUT_FAILED_NO_EFFECT
+    put res_cmd_err i OSH_E_IO
+    ret 0
+  end
+  pid = fork
+  if lt pid 0
+    put res_cmd_status i 1
+    put res_cmd_outcome i OSH_OUT_NOT_STARTED
+    put res_cmd_err i OSH_E_LIMIT
+    ret -1
+  end
+  if eq pid 0
+    ex_child_exec i ext io
+  end
+  put res_cmd_pid i pid
+  ret 0
+end
+
+fn ex_reap_all nc ulong to void
+  wst = new uchar 4 0
+  i = ulong 0
+  while lt i nc bound 8
+    cpid = get res_cmd_pid i
+    if gt cpid 0
+      wr_r = waitpid int cpid wst 0 4 0
+      if lt wr_r 0
+        put res_cmd_status i 1
+        put res_cmd_outcome i OSH_OUT_UNKNOWN
+        put res_cmd_err i OSH_E_OUTCOME_UNKNOWN
+      else
+        wval = vs_u32_le wst 0
+        sig = and wval 127
+        if ne sig 0
+          put res_cmd_termsig i sig
+          put res_cmd_status i add 128 sig
+          if eq sig 2
+            put res_killed_int 0 1
+          end
+        else
+          put res_cmd_status i and shr wval 8 255
+        end
+        put res_cmd_outcome i OSH_OUT_COMPLETED
+        put res_cmd_err i OSH_E_OK
+      end
+    end
+    i = add i 1
+  end
+end
+
+fn ex_run_pipeline to void
+  nc = get rq_ncmds 0
+  ppr = new int 8 -1
+  ppw = new int 8 -1
+  pbuf = new uchar 8 0
+  i = ulong 0
+  while lt add i 1 nc bound 8
+    if ne pipefds pbuf 0 8 OSH_O_CLOEXEC 0
+      k = ulong 0
+      while lt k i bound 8
+        ign = fclose get ppr k
+        ign = fclose get ppw k
+        k = add k 1
+      end
+      put res_status 0 1
+      put res_err 0 OSH_E_LIMIT
+      ret
+    end
+    put ppr i int vs_u32_le pbuf 0
+    put ppw i int vs_u32_le pbuf 4
+    i = add i 1
+  end
+  i = ulong 0
+  while lt i nc bound 8
+    rd = int -1
+    wr = int -1
+    if gt i 0
+      rd = get ppr sub i 1
+    end
+    if lt add i 1 nc
+      wr = get ppw i
+    end
+    sr = ex_spawn_stage i rd wr
+    if ge rd 0
+      ign = fclose rd
+      put ppr sub i 1 -1
+    end
+    if ge wr 0
+      ign = fclose wr
+      put ppw i -1
+    end
+    if lt sr 0
+      break
+    end
+    i = add i 1
+  end
+  i = ulong 0
+  while lt add i 1 nc bound 8
+    if ge get ppr i 0
+      ign = fclose get ppr i
+    end
+    if ge get ppw i 0
+      ign = fclose get ppw i
+    end
+    i = add i 1
+  end
+  ex_reap_all nc
+  put res_status 0 get res_cmd_status sub nc 1
+end
+
+fn osh_exec to ulong
+  dig = new uchar 32 0
+  nc = get rq_ncmds 0
+  put res_ncmds 0 nc
+  put res_status 0 0
+  put res_err 0 OSH_E_OK
+  put res_refusal 0 0
+  put res_killed_int 0 0
+  put res_j_failed 0 0
+  i = ulong 0
+  while lt i 8 bound 8
+    put res_cmd_pid i 0
+    put res_cmd_status i 0
+    put res_cmd_outcome i OSH_OUT_NOT_STARTED
+    put res_cmd_termsig i 0
+    put res_cmd_err i OSH_E_OK
+    put ex_j_ref i 0
+    i = add i 1
+  end
+  if ne get sess_j_open 0 0
+    osh_req_digest dig
+    i = ulong 0
+    while lt i 32 bound 32
+      put ex_j_dig i get dig i
+      i = add i 1
+    end
+  end
+  if and eq nc 1 or ne get rq_cmd_bi 0 OSH_B_NONE eq get rq_cmd_na 0 0
+    ex_run_in_parent
+  else
+    ex_run_pipeline
+  end
+  ex_jc_finish
+  st = get res_status 0
+  put sess_last_status 0 st
+  last_ts = get res_cmd_termsig sub nc 1
+  if or eq last_ts 2 eq last_ts 3
+    put res_killed_int 0 1
+    if eq get sess_interactive 0 0
+      put sess_exit_req 0 1
+      put sess_exit_st 0 add 128 last_ts
+    end
+  end
+  ret st
+end
+
+fn osh_exec_record rec view ulong * nrec ulong out_cells view ulong * nout ulong to ulong
+  ref = osh_req_decode rec nrec out_cells nout
+  if ne ref 0
+    put res_status 0 2
+    put res_refusal 0 ref
+    put sess_last_status 0 2
+    ret 2
+  end
+  ret osh_exec
+end
+
+fn osh_conn_should_run conn ulong last_st ulong to ulong
+  if eq conn OSH_CONN_AND
+    if eq last_st 0
+      ret 1
+    end
+    ret 0
+  end
+  if eq conn OSH_CONN_OR
+    if ne last_st 0
+      ret 1
+    end
+    ret 0
+  end
+  ret 1
+end

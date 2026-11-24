@@ -1,0 +1,403 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/osh/host/osh_main.c (the osh shell executable).
+note Build order:
+note   om/sha256/sha256-om2.om src/osh/osh_core.om src/osh/osh_layout.om
+note   src/osh/osh_lex.om src/osh/osh_parse.om src/osh/osh_expand.om
+note   src/osh/host/osh_codes.om src/osh/host/osh_req.om src/osh/host/osh_vars.om
+note   src/osh/host/osh_journal.om src/osh/host/osh_caps.om src/osh/host/osh_builtin.om
+note   src/osh/host/osh_exec.om src/osh/host/osh_shell.om src/osh/host/osh_main.om
+om2
+
+global main_caps_path uchar 4096
+global main_caps_len ulong 1
+global main_j_path uchar 4096
+global main_j_len ulong 1
+global main_tmp uchar 65536
+
+text main_s_caps "--caps"
+text main_s_journal "--journal"
+text main_s_dashc "-c"
+text main_s_osh "osh"
+text main_s_defpol "principal 1\n"
+text main_s_xdg "XDG_STATE_HOME"
+text main_s_home "HOME"
+text main_s_needc "osh: -c needs a command string\n"
+text main_s_caps_err "osh: --caps: cannot load policy\n"
+text main_s_isdir ": Is a directory\n"
+text main_s_jun1 "osh: effect journal unavailable ("
+text main_s_jun2 "): every command that starts a program or writes a file will be refused\n"
+text main_s_jrec1 "osh: journal: effect "
+text main_s_jrec2 " has outcome UNKNOWN; it is not re-run\n"
+
+fn main_eq_txt buf view uchar * ln ulong t view uchar * to ulong
+  if ne ln len t
+    ret 0
+  end
+  i = ulong 0
+  while lt i ln bound 64
+    if ne get buf i get t i
+      ret 0
+    end
+    i = add i 1
+  end
+  ret 1
+end
+
+fn main_journal_unavailable msg view uchar * ml ulong to void
+  osh_journal_close
+  put sess_j_open 0 0
+  osh_d_reset
+  osh_d_txt main_s_jun1
+  osh_d_str msg ml
+  osh_d_txt main_s_jun2
+  osh_write_g_dbuf 2
+end
+
+fn main_resolve_jpath path edit uchar 4096 to long
+  xdg = new uchar 4096 0
+  home = new uchar 4096 0
+  if gt get main_j_len 0 0
+    pl = get main_j_len 0
+    i = ulong 0
+    while lt i pl bound 4096
+      put path i get main_j_path i
+      i = add i 1
+    end
+    ret long pl
+  end
+  xl = osh_var_get main_s_xdg 14 xdg 4096
+  hl = osh_var_get main_s_home 4 home 4096
+  uxl = ulong 0
+  uhl = ulong 0
+  if gt xl 0
+    uxl = ulong xl
+  end
+  if gt hl 0
+    uhl = ulong hl
+  end
+  dp = osh_journal_default_path part xdg 0 uxl part home 0 uhl path
+  if lt dp 0
+    main_journal_unavailable j_s_openfail len j_s_openfail
+    ret -1
+  end
+  if ne osh_journal_mkparents path ulong dp 0
+    main_journal_unavailable j_s_baddir len j_s_baddir
+    ret -1
+  end
+  ret dp
+end
+
+fn main_check_jdir path view uchar 4096 pl ulong to long
+  dir = new uchar 4096 0
+  sl = ulong 0
+  has_sl = ulong 0
+  i = ulong 0
+  while lt i pl bound 4096
+    put dir i get path i
+    if eq get path i 47
+      sl = i
+      has_sl = 1
+    end
+    i = add i 1
+  end
+  dl = ulong 1
+  if eq has_sl 0
+    put dir 0 46
+  else
+    if ne sl 0
+      dl = sl
+    end
+  end
+  ret osh_journal_check_dir dir dl
+end
+
+fn main_attach_journal to void
+  path = new uchar 4096 0
+  wbuf = new uchar 512 0
+  bad = new ulong 1 0
+  put sess_j_req 0 1
+  put sess_j_open 0 0
+  rpl = main_resolve_jpath path
+  if lt rpl 0
+    ret
+  end
+  pl = ulong rpl
+  if ne main_check_jdir path pl 0
+    main_journal_unavailable j_s_baddir len j_s_baddir
+    ret
+  end
+  if ne osh_journal_open path pl 0
+    wl = get j_why_len 0
+    i = ulong 0
+    while and lt i wl lt i 512 bound 512
+      put wbuf i get j_why i
+      i = add i 1
+    end
+    main_journal_unavailable wbuf wl
+    ret
+  end
+  nrec = osh_journal_recover path pl bad
+  if lt nrec 0
+    main_journal_unavailable j_s_openfail len j_s_openfail
+    ret
+  end
+  if gt nrec 0
+    osh_d_reset
+    osh_d_txt main_s_jrec1
+    osh_d_u64 ulong nrec
+    osh_d_txt main_s_jrec2
+    osh_write_g_dbuf 2
+  end
+  put sess_j_open 0 1
+end
+
+fn main_arm to long
+  pol = new uchar 65536 0
+  cp = new uchar 4096 0
+  main_attach_journal
+  osh_caps_start
+  plen = ulong 0
+  if gt get main_caps_len 0 0
+    cl = get main_caps_len 0
+    i = ulong 0
+    while lt i cl bound 4096
+      put cp i get main_caps_path i
+      i = add i 1
+    end
+    fd = fopen cp 0 cl or OSH_O_RDONLY OSH_O_CLOEXEC 0
+    if lt fd 0
+      ign = osh_write_all 2 main_s_caps_err len main_s_caps_err
+      ret -1
+    end
+    while lt plen 65536 bound 65536
+      r = read int fd pol plen sub 65536 plen
+      if lt r 0
+        ign = fclose int fd
+        ign2 = osh_write_all 2 main_s_caps_err len main_s_caps_err
+        ret -1
+      end
+      if eq r 0
+        break
+      end
+      plen = add plen ulong r
+    end
+    ign = fclose int fd
+    note Reject embedded NUL bytes in policy file
+    i = ulong 0
+    while lt i plen bound 65536
+      if eq get pol i 0
+        ign2 = osh_write_all 2 main_s_caps_err len main_s_caps_err
+        ret -1
+      end
+      i = add i 1
+    end
+  else
+    plen = len main_s_defpol
+    i = ulong 0
+    while lt i plen bound 32
+      put pol i get main_s_defpol i
+      i = add i 1
+    end
+  end
+  if ne osh_caps_load part pol 0 plen plen 0
+    ign = osh_write_all 2 main_s_caps_err len main_s_caps_err
+    ret -1
+  end
+  osh_caps_attach
+  osh_caps_seal
+  ret 0
+end
+
+fn main_set_arg0 s view uchar * ln ulong to void
+  ml = ln
+  if gt ml 1024
+    ml = 1024
+  end
+  i = ulong 0
+  while lt i ml bound 1024
+    put sh_arg0 i get s i
+    i = add i 1
+  end
+  put sh_arg0_len 0 ml
+end
+
+fn main_load_pos first_idx ulong argc ulong to void
+  put sh_npos 0 0
+  po = ulong 0
+  abuf = new uchar 4096 0
+  i = first_idx
+  while lt i argc bound 32
+    al = argread i abuf 0 4096
+    if lt al 0
+      break
+    end
+    ual = ulong al
+    np = get sh_npos 0
+    if or ge np 32 gt add po ual 16384
+      break
+    end
+    put sh_pos_off np po
+    put sh_pos_len np ual
+    k = ulong 0
+    while lt k ual bound 4096
+      put sh_pos_buf add po k get abuf k
+      k = add k 1
+    end
+    po = add po ual
+    put sh_npos 0 add np 1
+    i = add i 1
+  end
+end
+
+fn main_run_dashc ai ulong ac ulong to int
+  abuf = new uchar 4096 0
+  if ge add ai 1 ac
+    ign = osh_write_all 2 main_s_needc len main_s_needc
+    ret 2
+  end
+  cl = argread add ai 1 sh_src 0 65536
+  if lt cl 0
+    ret 70
+  end
+  put sh_src_len 0 ulong cl
+  put sh_src_pos 0 0
+  put sh_src_fd 0 -1
+  put sh_exact_end 0 1
+  osh_session_init_from_env
+  if lt add ai 2 ac
+    a0l = argread add ai 2 abuf 0 4096
+    if ge a0l 0
+      main_set_arg0 abuf ulong a0l
+    end
+    main_load_pos add ai 3 ac
+  else
+    main_set_arg0 main_s_osh 3
+    put sh_npos 0 0
+  end
+  if ne main_arm 0
+    osh_caps_stop
+    osh_journal_close
+    ret 70
+  end
+  rc = sh_run_loop
+  osh_caps_stop
+  osh_journal_close
+  ret int and rc 255
+end
+
+fn main_run_script abuf view uchar 4096 fl ulong ai ulong ac ulong to int
+  st = new uchar 128 0
+  fd = fopen abuf 0 fl or OSH_O_RDONLY OSH_O_CLOEXEC 0
+  if lt fd 0
+    osh_d_reset
+    osh_d_txt osh_s_prefix
+    osh_d_str abuf fl
+    osh_d_ch 58
+    osh_d_ch 32
+    osh_d_errno fd
+    osh_d_ch 10
+    osh_write_g_dbuf 2
+    if or eq fd -2 eq fd -20
+      ret 127
+    end
+    ret 126
+  end
+  if eq fstat int fd st 0 128 0
+    if eq and vs_u32_le st 16 0xf000 0x4000
+      ign = fclose int fd
+      osh_d_reset
+      osh_d_txt osh_s_prefix
+      osh_d_str abuf fl
+      osh_d_txt main_s_isdir
+      osh_write_g_dbuf 2
+      ret 126
+    end
+  end
+  total = ulong 0
+  while lt total 65536 bound 65536
+    r = read int fd sh_src total sub 65536 total
+    if lt r 0
+      ign = fclose int fd
+      ret 126
+    end
+    if eq r 0
+      break
+    end
+    total = add total ulong r
+  end
+  ign = fclose int fd
+  put sh_src_len 0 total
+  put sh_src_pos 0 0
+  put sh_src_fd 0 -1
+  put sh_exact_end 0 0
+  osh_session_init_from_env
+  main_set_arg0 abuf fl
+  main_load_pos add ai 1 ac
+  if ne main_arm 0
+    osh_caps_stop
+    osh_journal_close
+    ret 70
+  end
+  rc = sh_run_loop
+  osh_caps_stop
+  osh_journal_close
+  ret int and rc 255
+end
+
+fn main to int
+  ac_l = argcnt
+  if le ac_l 0
+    ret 70
+  end
+  ac = ulong ac_l
+  put main_caps_len 0 0
+  put main_j_len 0 0
+  ai = ulong 1
+  abuf = new uchar 4096 0
+  while lt add ai 1 ac bound 16
+    al = argread ai abuf 0 4096
+    if le al 0
+      break
+    end
+    if eq main_eq_txt abuf ulong al main_s_caps 1
+      vl = argread add ai 1 main_caps_path 0 4096
+      if lt vl 0
+        ret 70
+      end
+      put main_caps_len 0 ulong vl
+      ai = add ai 2
+      continue
+    end
+    if eq main_eq_txt abuf ulong al main_s_journal 1
+      vl = argread add ai 1 main_j_path 0 4096
+      if lt vl 0
+        ret 70
+      end
+      put main_j_len 0 ulong vl
+      ai = add ai 2
+      continue
+    end
+    break
+  end
+  if lt ai ac
+    al = argread ai abuf 0 4096
+    if and gt al 0 eq main_eq_txt abuf ulong al main_s_dashc 1
+      ret main_run_dashc ai ac
+    end
+    ret main_run_script abuf ulong al ai ac
+  end
+  put sh_src_fd 0 0
+  put sh_exact_end 0 0
+  osh_session_init_from_env
+  main_set_arg0 main_s_osh 3
+  put sh_npos 0 0
+  if ne main_arm 0
+    osh_caps_stop
+    osh_journal_close
+    ret 70
+  end
+  rc = sh_run_loop
+  osh_caps_stop
+  osh_journal_close
+  ret int and rc 255
+end
