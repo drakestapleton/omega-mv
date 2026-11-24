@@ -1,0 +1,145 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 unit test for src/omega_numeric_reduce.om.
+om2
+
+text msg_pass "OMEGA_NUMERIC_REDUCE_OM_PASS\n"
+text msg_fail "OMEGA_NUMERIC_REDUCE_OM_FAIL\n"
+
+global g_fail ulong 1
+global g_chk ulong 1
+
+fn chk cond bool to void
+  put g_chk 0 add get g_chk 0 1
+  if not cond
+    put g_fail 0 add get g_fail 0 1
+  end
+end
+
+fn test_meta to void
+  nbuf = new uchar 8 0
+  chk eq omega_reduce_op_name OMEGA_RED_SUM nbuf 3
+  chk eq get nbuf 0 uchar 83
+  chk eq omega_reduce_op_name OMEGA_RED_MAX nbuf 3
+  chk eq omega_reduce_op_name OMEGA_RED_MIN nbuf 3
+  chk eq omega_reduce_op_name OMEGA_RED_MEAN nbuf 4
+  chk eq omega_reduce_op_name 99 nbuf -1
+
+  chk eq omega_reduce_identity OMEGA_RED_SUM OMEGA_REDUCE_SUM_PAD_BITS
+  chk eq omega_reduce_identity OMEGA_RED_MEAN OMEGA_REDUCE_SUM_PAD_BITS
+  chk eq omega_reduce_identity OMEGA_RED_MAX OMEGA_REDUCE_MINMAX_PAD_BITS
+  chk eq omega_reduce_identity OMEGA_RED_MIN OMEGA_REDUCE_MINMAX_PAD_BITS
+
+  chk eq omega_reduce_levels 0 0
+  chk eq omega_reduce_levels 1 1
+  chk eq omega_reduce_levels 32 1
+  chk eq omega_reduce_levels 33 2
+  chk eq omega_reduce_levels 1024 2
+  chk eq omega_reduce_levels 1025 3
+end
+
+fn test_empty_and_special to void
+  x = new uint 8 0
+
+  note Empty inputs
+  chk eq omega_reduce_reference OMEGA_RED_SUM x 0 0 0
+  chk eq get g_red_out 0 uint 0x00000000
+  chk eq omega_reduce_cpu OMEGA_RED_SUM x 0 0 0
+  chk eq get g_red_out 0 uint 0x00000000
+
+  chk eq omega_reduce_reference OMEGA_RED_MAX x 0 0 0
+  chk eq get g_red_out 0 uint 0x7fc00000
+  chk eq omega_reduce_cpu OMEGA_RED_MIN x 0 0 0
+  chk eq get g_red_out 0 uint 0x7fc00000
+  chk eq omega_reduce_cpu OMEGA_RED_MEAN x 0 0 0
+  chk eq get g_red_out 0 uint 0x7fc00000
+
+  note Signed zeros and NaN missing-data semantics for MAX and MIN
+  put x 0 uint 0x80000000
+  put x 1 uint 0x7fc00001
+  put x 2 uint 0x00000000
+  put x 3 uint 0x7fa00001
+  chk eq omega_reduce_reference OMEGA_RED_MAX x 0 4 0
+  rmax_ref = get g_red_out 0
+  chk eq omega_reduce_cpu OMEGA_RED_MAX x 0 4 0
+  rmax_cpu = get g_red_out 0
+  chk eq rmax_ref uint 0x00000000
+  chk eq rmax_cpu uint 0x00000000
+
+  chk eq omega_reduce_reference OMEGA_RED_MIN x 0 4 0
+  rmin_ref = get g_red_out 0
+  chk eq omega_reduce_cpu OMEGA_RED_MIN x 0 4 0
+  rmin_cpu = get g_red_out 0
+  chk eq rmin_ref uint 0x80000000
+  chk eq rmin_cpu uint 0x80000000
+end
+
+fn test_multilevel_and_rows to void
+  x = new uint 100 0
+
+  for i ulong 100
+    put x i bitcast uint f32 uint add i 1
+  end
+
+  note 1+2+...+100 = 5050.0 (0x459dd000), max = 100.0 (0x42c80000), min = 1.0 (0x3f800000), mean = 50.5 (0x424a0000)
+  for op ulong 4
+    chk eq omega_reduce_reference op x 0 100 0
+    vref = get g_red_out 0
+    chk eq omega_reduce_cpu op x 0 100 0
+    vcpu = get g_red_out 0
+    chk eq vref vcpu
+  end
+  chk eq omega_reduce_cpu OMEGA_RED_SUM x 0 100 0
+  chk eq get g_red_out 0 uint 0x459dd000
+  chk eq omega_reduce_cpu OMEGA_RED_MAX x 0 100 0
+  chk eq get g_red_out 0 uint 0x42c80000
+  chk eq omega_reduce_cpu OMEGA_RED_MIN x 0 100 0
+  chk eq get g_red_out 0 uint 0x3f800000
+  chk eq omega_reduce_cpu OMEGA_RED_MEAN x 0 100 0
+  chk eq get g_red_out 0 uint 0x424a0000
+
+  note Batched rows with stride > n
+  rows_ref = new uint 3 0
+  chk eq omega_reduce_rows_reference OMEGA_RED_SUM x 3 10 20 0
+  for r ulong 3
+    put rows_ref r get g_red_rows_out r
+  end
+  chk eq omega_reduce_rows_cpu OMEGA_RED_SUM x 3 10 20 0
+  for r ulong 3
+    chk eq get rows_ref r get g_red_rows_out r
+  end
+  note Row 0: 1..10 = 55.0 (0x425c0000), Row 1: 21..30 = 255.0 (0x437f0000), Row 2: 41..50 = 455.0 (0x43e38000)
+  chk eq get g_red_rows_out 0 uint 0x425c0000
+  chk eq get g_red_rows_out 1 uint 0x437f0000
+  chk eq get g_red_rows_out 2 uint 0x43e38000
+
+  note Bad stride refused
+  chk eq omega_reduce_rows_cpu OMEGA_RED_SUM x 3 10 5 OMEGA_NUMERIC_ERR_OPERANDS
+
+  note Negative control: sequential sum differs from tree sum on cancellation vector
+  cvec = new uint 32 0
+  put cvec 0 uint 0x4b800000
+  for i ulong 15
+    put cvec add i 1 uint 0x3f800000
+  end
+  put cvec 16 uint 0xcb800000
+  for i ulong 15
+    put cvec add i 17 uint 0x3f800000
+  end
+  chk eq omega_reduce_cpu OMEGA_RED_SUM cvec 0 32 0
+  chk eq get g_red_out 0 uint 0x41f00000
+  seq_sum = omega_reduce_sequential_sum_not_contract cvec 32
+  chk eq seq_sum uint 0x41700000
+  chk ne get g_red_out 0 seq_sum
+end
+
+fn main to int
+  test_meta
+  test_empty_and_special
+  test_multilevel_and_rows
+  if eq get g_fail 0 0
+    ign = write 1 msg_pass 0 len msg_pass
+    ret 0
+  end
+  ign = write 1 msg_fail 0 len msg_fail
+  ret 1
+end

@@ -1,0 +1,126 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 unit test for src/omega_bw_hazard.om.
+om2
+
+text msg_pass "OMEGA_BW_HAZARD_OM_PASS\n"
+text msg_fail "OMEGA_BW_HAZARD_OM_FAIL\n"
+
+global g_fail ulong 1
+global g_chk ulong 1
+
+fn chk cond bool to void
+  put g_chk 0 add get g_chk 0 1
+  if not cond
+    put g_fail 0 add get g_fail 0 1
+  end
+end
+
+fn put_u32_le buf edit uchar * off ulong v ulong to void
+  put buf off uchar and v 255
+  put buf add off 1 uchar and shr v 8 255
+  put buf add off 2 uchar and shr v 16 255
+  put buf add off 3 uchar and shr v 24 255
+end
+
+fn put_insn_lo buf edit uchar * pc ulong w0 ulong w1 ulong to void
+  off = mul pc 16
+  put_u32_le buf off w0
+  put_u32_le buf add off 4 w1
+end
+
+fn put_insn_hi buf edit uchar * pc ulong w2 ulong w3 ulong to void
+  off = mul pc 16
+  put_u32_le buf add off 8 w2
+  put_u32_le buf add off 12 w3
+end
+
+fn mk_cw stall ulong wbar ulong rbar ulong wait ulong to ulong
+  ret or or shl stall 9 shl wbar 14 or shl rbar 17 shl wait 20
+end
+
+fn test_hazards to void
+  buf = new uchar 128 0
+  ktxt = new uchar 8 0
+
+  note Kind string checks
+  chk eq omega_bw_hazard_kind OMEGA_BW_HZ_RAW ktxt 3
+  chk eq get ktxt 0 uchar 82
+  chk eq omega_bw_hazard_kind OMEGA_BW_HZ_WAR ktxt 3
+  chk eq get ktxt 2 uchar 82
+  chk eq omega_bw_hazard_kind OMEGA_BW_HZ_WAW ktxt 3
+  chk eq get ktxt 2 uchar 87
+  chk eq omega_bw_hazard_kind 99 ktxt 1
+  chk eq get ktxt 0 uchar 63
+
+  note Bad length refused
+  chk eq omega_bw_hazard_check buf 0 -1
+  chk eq omega_bw_hazard_check buf 12 -1
+
+  note 1. Clean kernel: LDG R2, [R4.64] (wbar=0, rbar=1) -> FADD R3, R2, R5 (wait=SB0) -> EXIT
+  cw_ldg = mk_cw 1 0 1 0
+  cw_wait0 = mk_cw 1 7 7 1
+  cw_exit = mk_cw 5 7 7 0
+  note LDG.E R2, [R4.64]: op=0x981, guard=7, D=2, A=4, w2=0x100 (64-bit addr, size=0 -> 1 reg)
+  put_insn_lo buf 0 0x04027981 0
+  put_insn_hi buf 0 0x100 cw_ldg
+  note FADD R3, R2, R5: op=0x221, guard=7, D=3, A=2, B=5
+  put_insn_lo buf 1 0x02037221 5
+  put_insn_hi buf 1 0 cw_wait0
+  note EXIT: op=0x94d, guard=7
+  put_insn_lo buf 2 0x0000794d 0
+  put_insn_hi buf 2 0 cw_exit
+  chk eq omega_bw_hazard_check buf 48 0
+  chk eq get g_bwr_insns 0 3
+  chk eq get g_bwr_reachable 0 3
+  chk eq get g_bwr_count 0 0
+
+  note 2. RAW hazard: drop wait mask on FADD -> detects RAW on R2 at pc=1 from src=0, release=1 (SB0)
+  put_insn_lo buf 1 0x02037221 5
+  put_insn_hi buf 1 0 cw_exit
+  chk eq omega_bw_hazard_check buf 48 0
+  chk eq get g_bwr_count 0 1
+  chk eq get g_bwr_f_pc 0 1
+  chk eq get g_bwr_f_src 0 0
+  chk eq get g_bwr_f_kind 0 OMEGA_BW_HZ_RAW
+  chk eq get g_bwr_f_reg 0 2
+  chk eq get g_bwr_f_uni 0 0
+  chk eq get g_bwr_f_rel 0 1
+
+  note 3. WAR hazard: MOV R4, 0 after LDG without waiting on rbar=1 or wbar=0 (release=3)
+  put_insn_lo buf 1 0x00047802 0
+  put_insn_hi buf 1 0 cw_exit
+  chk eq omega_bw_hazard_check buf 48 0
+  chk eq get g_bwr_count 0 1
+  chk eq get g_bwr_f_pc 0 1
+  chk eq get g_bwr_f_src 0 0
+  chk eq get g_bwr_f_kind 0 OMEGA_BW_HZ_WAR
+  chk eq get g_bwr_f_reg 0 4
+  chk eq get g_bwr_f_rel 0 3
+
+  note 4. WAW hazard: MOV R2, 0 after LDG without waiting on wbar=0 (release=1)
+  put_insn_lo buf 1 0x00027802 0
+  put_insn_hi buf 1 0 cw_exit
+  chk eq omega_bw_hazard_check buf 48 0
+  chk eq get g_bwr_count 0 1
+  chk eq get g_bwr_f_pc 0 1
+  chk eq get g_bwr_f_src 0 0
+  chk eq get g_bwr_f_kind 0 OMEGA_BW_HZ_WAW
+  chk eq get g_bwr_f_reg 0 2
+  chk eq get g_bwr_f_rel 0 1
+
+  note 5. Unknown opcode rejected with bad_pc=1
+  put_insn_lo buf 1 0x00007fff 0
+  put_insn_hi buf 1 0 cw_exit
+  chk eq omega_bw_hazard_check buf 48 -1
+  chk eq get g_bwr_bad_pc 0 1
+end
+
+fn main to int
+  test_hazards
+  if eq get g_fail 0 0
+    ign = write 1 msg_pass 0 len msg_pass
+    ret 0
+  end
+  ign = write 1 msg_fail 0 len msg_fail
+  ret 1
+end

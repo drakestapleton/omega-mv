@@ -1,0 +1,858 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_bw_hazard.c (static scoreboard hazard checker
+note over encoded sm_121 16-byte kernel instructions). Host-only, zero GPU dependencies.
+om2
+
+const OMEGA_BW_RZ ulong 255
+const OMEGA_BW_NOBAR ulong 7
+
+const OMEGA_BW_FLOW_NEXT ulong 0
+const OMEGA_BW_FLOW_EXIT ulong 1
+const OMEGA_BW_FLOW_BRA ulong 2
+
+const OMEGA_BW_HZ_RAW ulong 1
+const OMEGA_BW_HZ_WAR ulong 2
+const OMEGA_BW_HZ_WAW ulong 3
+
+const OMEGA_BW_HAZARD_MAX ulong 256
+const BW_MAX_INSNS ulong 1024
+const BW_NREG ulong 512
+
+note Decoded instruction table (indexed by pc 0..BW_MAX_INSNS-1)
+global g_bwd_op ulong 1024
+global g_bwd_guard ulong 1024
+global g_bwd_stall ulong 1024
+global g_bwd_yield ulong 1024
+global g_bwd_wbar ulong 1024
+global g_bwd_rbar ulong 1024
+global g_bwd_wait ulong 1024
+global g_bwd_var ulong 1024
+global g_bwd_late ulong 1024
+global g_bwd_nr ulong 1024
+global g_bwd_nw ulong 1024
+global g_bwd_flow ulong 1024
+global g_bwd_target long 1024
+note Up to 5 read operands per insn: stride 5
+global g_bwd_rd_reg ulong 5120
+global g_bwd_rd_n ulong 5120
+global g_bwd_rd_u ulong 5120
+note Up to 1 write operand per insn
+global g_bwd_wr_reg ulong 1024
+global g_bwd_wr_n ulong 1024
+global g_bwd_wr_u ulong 1024
+
+note Dataflow fixed-point state: 1024 insns * 512 regs = 524288
+global g_bw_in_w ulong 524288
+global g_bw_in_r ulong 524288
+global g_bw_in_wpc ulong 524288
+global g_bw_in_rpc ulong 524288
+
+global g_bw_cur_w ulong 512
+global g_bw_cur_r ulong 512
+global g_bw_cur_wpc ulong 512
+global g_bw_cur_rpc ulong 512
+
+global g_bw_seen ulong 1024
+global g_bw_queued ulong 1024
+global g_bw_work ulong 1024
+
+note Report state
+global g_bwr_insns ulong 1
+global g_bwr_reachable ulong 1
+global g_bwr_count ulong 1
+global g_bwr_bad_pc long 1
+global g_bwr_f_pc ulong 256
+global g_bwr_f_src ulong 256
+global g_bwr_f_kind ulong 256
+global g_bwr_f_reg ulong 256
+global g_bwr_f_uni ulong 256
+global g_bwr_f_rel ulong 256
+global g_bwd_regs ulong 4
+
+text bw_hz_raw_txt "RAW"
+text bw_hz_war_txt "WAR"
+text bw_hz_waw_txt "WAW"
+text bw_hz_unk_txt "?"
+
+fn omega_bw_hazard_kind kind ulong dst edit uchar * to ulong
+  if eq kind OMEGA_BW_HZ_RAW
+    for i ulong 3
+      put dst i get bw_hz_raw_txt i
+    end
+    ret 3
+  end
+  if eq kind OMEGA_BW_HZ_WAR
+    for i ulong 3
+      put dst i get bw_hz_war_txt i
+    end
+    ret 3
+  end
+  if eq kind OMEGA_BW_HZ_WAW
+    for i ulong 3
+      put dst i get bw_hz_waw_txt i
+    end
+    ret 3
+  end
+  put dst 0 get bw_hz_unk_txt 0
+  ret 1
+end
+
+fn bw_rd32 code view uchar * off ulong to ulong
+  b0 = ulong get code off
+  b1 = ulong get code add off 1
+  b2 = ulong get code add off 2
+  b3 = ulong get code add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn bw_size_regs w2 ulong to long
+  s = and shr w2 9 7
+  if le s 4
+    ret 1
+  end
+  if eq s 5
+    ret 2
+  end
+  if eq s 6
+    ret 4
+  end
+  ret -1
+end
+
+fn bw_add_r pc ulong reg ulong n ulong uni ulong to void
+  if or eq reg OMEGA_BW_RZ eq n 0
+    ret
+  end
+  nr = get g_bwd_nr pc
+  if ge nr 5
+    ret
+  end
+  idx = add mul pc 5 nr
+  put g_bwd_rd_reg idx reg
+  put g_bwd_rd_n idx n
+  put g_bwd_rd_u idx uni
+  put g_bwd_nr pc add nr 1
+end
+
+fn bw_add_w pc ulong reg ulong n ulong uni ulong to void
+  if or eq reg OMEGA_BW_RZ eq n 0
+    ret
+  end
+  if ge get g_bwd_nw pc 1
+    ret
+  end
+  put g_bwd_wr_reg pc reg
+  put g_bwd_wr_n pc n
+  put g_bwd_wr_u pc uni
+  put g_bwd_nw pc 1
+end
+
+fn bw_decode_ctrl_flow pc ulong op ulong w0 ulong w1 ulong a ulong to long
+  if or eq op 0x918 or eq op 0xb1d eq op 0x992
+    ret 1
+  end
+  if or eq op 0x945 eq op 0x941
+    ret 1
+  end
+  if eq op 0x98f
+    bw_add_r pc a 1 0
+    put g_bwd_late pc 1
+    ret 1
+  end
+  if eq op 0x94d
+    put g_bwd_flow pc OMEGA_BW_FLOW_EXIT
+    ret 1
+  end
+  if eq op 0x947
+    put g_bwd_flow pc OMEGA_BW_FLOW_BRA
+    s32 = long w1
+    if ge s32 2147483648
+      s32 = sub s32 4294967296
+    end
+    rem2 = long and w1 3
+    hi = div sub s32 rem2 4
+    lo = long and shr w0 18 63
+    put g_bwd_target pc add add mul hi 64 lo 1
+    ret 1
+  end
+  ret 0
+end
+
+fn bw_decode_int_ops pc ulong op ulong d ulong a ulong b ulong c ulong to long
+  if eq op 0x202
+    bw_add_w pc d 1 0
+    bw_add_r pc b 1 0
+    ret 1
+  end
+  if eq op 0x802
+    bw_add_w pc d 1 0
+    ret 1
+  end
+  if eq op 0x919
+    bw_add_w pc d 1 0
+    put g_bwd_var pc 1
+    ret 1
+  end
+  if or eq op 0x224 or eq op 0x227 eq op 0x210
+    bw_add_w pc d 1 0
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 0
+    bw_add_r pc c 1 0
+    ret 1
+  end
+  if or eq op 0x824 or eq op 0x819 eq op 0x812
+    bw_add_w pc d 1 0
+    bw_add_r pc a 1 0
+    bw_add_r pc c 1 0
+    ret 1
+  end
+  if eq op 0xc24
+    bw_add_w pc d 1 0
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 1
+    bw_add_r pc c 1 0
+    ret 1
+  end
+  if eq op 0x825
+    bw_add_w pc d 2 0
+    bw_add_r pc a 1 0
+    bw_add_r pc c 2 0
+    ret 1
+  end
+  if eq op 0x20c
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 0
+    ret 1
+  end
+  if eq op 0x80c
+    bw_add_r pc a 1 0
+    ret 1
+  end
+  if eq op 0xc0c
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 1
+    ret 1
+  end
+  if or eq op 0x219 eq op 0x212
+    bw_add_w pc d 1 0
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 0
+    bw_add_r pc c 1 0
+    ret 1
+  end
+  if or eq op 0x23c eq op 0x27a
+    bw_add_w pc d 4 0
+    bw_add_r pc a 4 0
+    bw_add_r pc b 2 0
+    bw_add_r pc c 4 0
+    ret 1
+  end
+  ret 0
+end
+
+fn bw_decode_fp_ops pc ulong op ulong d ulong a ulong b ulong c ulong to long
+  if or eq op 0x221 or eq op 0x220 or eq op 0x208 or eq op 0x209 eq op 0x23e
+    bw_add_w pc d 1 0
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 0
+    ret 1
+  end
+  if eq op 0x223
+    bw_add_w pc d 1 0
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 0
+    bw_add_r pc c 1 0
+    ret 1
+  end
+  if eq op 0x20b
+    bw_add_r pc a 1 0
+    bw_add_r pc b 1 0
+    ret 1
+  end
+  if eq op 0x245
+    bw_add_w pc d 1 0
+    bw_add_r pc b 1 0
+    ret 1
+  end
+  if or eq op 0x305 eq op 0x308
+    bw_add_w pc d 1 0
+    bw_add_r pc b 1 0
+    put g_bwd_var pc 1
+    ret 1
+  end
+  if eq op 0xf89
+    bw_add_w pc d 1 0
+    bw_add_r pc a 1 0
+    put g_bwd_var pc 1
+    ret 1
+  end
+  ret 0
+end
+
+fn bw_decode_mem_ops pc ulong op ulong w2 ulong to long
+  d = get g_bwd_regs 0
+  a = get g_bwd_regs 1
+  b = get g_bwd_regs 2
+  c = get g_bwd_regs 3
+  addr_n = ulong 1
+  if ne and w2 0x100 0
+    addr_n = 2
+  end
+  has_desc = ne and w2 0x08000000 0
+  if eq op 0xb82
+    n = bw_size_regs w2
+    if lt n 0
+      ret -1
+    end
+    bw_add_w pc d ulong n 0
+    bw_add_r pc a 1 0
+    put g_bwd_var pc 1
+    put g_bwd_late pc 1
+    ret 1
+  end
+  if eq op 0x7ac
+    n = bw_size_regs w2
+    if lt n 0
+      ret -1
+    end
+    bw_add_w pc d ulong n 1
+    bw_add_r pc a 1 1
+    put g_bwd_var pc 1
+    put g_bwd_late pc 1
+    ret 1
+  end
+  if eq op 0x981
+    n = bw_size_regs w2
+    if lt n 0
+      ret -1
+    end
+    bw_add_w pc d ulong n 0
+    bw_add_r pc a addr_n 0
+    if has_desc
+      bw_add_r pc b 1 1
+    end
+    put g_bwd_var pc 1
+    put g_bwd_late pc 1
+    ret 1
+  end
+  if eq op 0x986
+    n = bw_size_regs w2
+    if lt n 0
+      ret -1
+    end
+    bw_add_r pc a addr_n 0
+    bw_add_r pc b ulong n 0
+    if has_desc
+      bw_add_r pc c 1 1
+    end
+    put g_bwd_late pc 1
+    ret 1
+  end
+  if eq op 0x9a8
+    bw_add_w pc d 1 0
+    bw_add_r pc a addr_n 0
+    bw_add_r pc b 1 0
+    if has_desc
+      bw_add_r pc c 1 1
+    end
+    put g_bwd_var pc 1
+    put g_bwd_late pc 1
+    ret 1
+  end
+  if eq op 0x984
+    n = bw_size_regs w2
+    if lt n 0
+      ret -1
+    end
+    bw_add_w pc d ulong n 0
+    bw_add_r pc a 1 0
+    if has_desc
+      bw_add_r pc b 1 1
+    end
+    put g_bwd_var pc 1
+    put g_bwd_late pc 1
+    ret 1
+  end
+  if or eq op 0x388 eq op 0x988
+    n = bw_size_regs w2
+    if lt n 0
+      ret -1
+    end
+    bw_add_r pc a 1 0
+    bw_add_r pc b ulong n 0
+    if has_desc
+      bw_add_r pc c 1 1
+    end
+    put g_bwd_late pc 1
+    ret 1
+  end
+  ret 0
+end
+
+fn bw_decode_dispatch pc ulong op ulong w0 ulong w1 ulong w2 ulong to long
+  d = and shr w0 16 255
+  a = and shr w0 24 255
+  b = and w1 255
+  c = and w2 255
+  put g_bwd_regs 0 d
+  put g_bwd_regs 1 a
+  put g_bwd_regs 2 b
+  put g_bwd_regs 3 c
+
+  r = bw_decode_ctrl_flow pc op w0 w1 a
+  if gt r 0
+    ret 0
+  end
+  r = bw_decode_int_ops pc op d a b c
+  if gt r 0
+    ret 0
+  end
+  r = bw_decode_fp_ops pc op d a b c
+  if gt r 0
+    ret 0
+  end
+  r = bw_decode_mem_ops pc op w2
+  if gt r 0
+    ret 0
+  end
+  ret -1
+end
+
+fn omega_bw_decode code view uchar * off ulong pc ulong to long
+  if or ge pc BW_MAX_INSNS gt add off 16 len code
+    ret -1
+  end
+  w0 = bw_rd32 code off
+  w1 = bw_rd32 code add off 4
+  w2 = bw_rd32 code add off 8
+  w3 = bw_rd32 code add off 12
+
+  op = and w0 0xfff
+  wbar = and shr w3 14 7
+  rbar = and shr w3 17 7
+  if or eq wbar 6 eq rbar 6
+    ret -1
+  end
+  put g_bwd_op pc op
+  put g_bwd_guard pc and shr w0 12 15
+  put g_bwd_stall pc and shr w3 9 15
+  put g_bwd_yield pc and shr w3 13 1
+  put g_bwd_wbar pc wbar
+  put g_bwd_rbar pc rbar
+  put g_bwd_wait pc and shr w3 20 63
+  put g_bwd_var pc 0
+  put g_bwd_late pc 0
+  put g_bwd_nr pc 0
+  put g_bwd_nw pc 0
+  put g_bwd_flow pc OMEGA_BW_FLOW_NEXT
+  put g_bwd_target pc 0
+
+  ret bw_decode_dispatch pc op w0 w1 w2
+end
+
+fn bw_pmin a ulong b ulong to ulong
+  if eq a 0
+    ret b
+  end
+  if eq b 0
+    ret a
+  end
+  if lt a b
+    ret a
+  end
+  ret b
+end
+
+fn bw_kill_mask wmask ulong to ulong
+  k = ulong 0
+  for m ulong 64
+    if ne and m wmask 0
+      k = or k shl ulong 1 m
+    end
+  end
+  ret k
+end
+
+fn bw_note pc ulong src ulong kind ulong idx ulong pending ulong to void
+  rel = ulong 0
+  found = ulong 0
+  for m ulong 64
+    if and eq found 0 ne and shr pending m 1 0
+      rel = m
+      found = 1
+    end
+  end
+  reg = and idx 255
+  uni = ulong 0
+  if ge idx 256
+    uni = 1
+  end
+  cnt = get g_bwr_count 0
+  lim = cnt
+  if gt lim OMEGA_BW_HAZARD_MAX
+    lim = OMEGA_BW_HAZARD_MAX
+  end
+  for i ulong lim bound 256
+    if eq get g_bwr_f_pc i pc
+      if eq get g_bwr_f_kind i kind
+        if eq get g_bwr_f_reg i reg
+          if eq get g_bwr_f_uni i uni
+            ret
+          end
+        end
+      end
+    end
+  end
+  if lt cnt OMEGA_BW_HAZARD_MAX
+    put g_bwr_f_pc cnt pc
+    put g_bwr_f_src cnt src
+    put g_bwr_f_kind cnt kind
+    put g_bwr_f_reg cnt reg
+    put g_bwr_f_uni cnt uni
+    put g_bwr_f_rel cnt rel
+  end
+  put g_bwr_count 0 add cnt 1
+end
+
+fn bw_step_wait wmask ulong to void
+  if eq wmask 0
+    ret
+  end
+  k = xor bw_kill_mask wmask ulong 0xffffffffffffffff
+  for i ulong 512
+    nw = and get g_bw_cur_w i k
+    nr = and get g_bw_cur_r i k
+    put g_bw_cur_w i nw
+    put g_bw_cur_r i nr
+    if eq nw 0
+      put g_bw_cur_wpc i 0
+    end
+    if eq nr 0
+      put g_bw_cur_rpc i 0
+    end
+  end
+end
+
+fn bw_step_one_read pc ulong rec ulong o ulong to void
+  reg = get g_bwd_rd_reg o
+  cnt = get g_bwd_rd_n o
+  base = ulong 0
+  if ne get g_bwd_rd_u o 0
+    base = 256
+  end
+  for q ulong cnt bound 4
+    r8 = and add reg q 255
+    if ne r8 OMEGA_BW_RZ
+      i = add base r8
+      w = get g_bw_cur_w i
+      if ne w 0
+        if ne rec 0
+          bw_note pc sub get g_bw_cur_wpc i 1 OMEGA_BW_HZ_RAW i w
+        end
+        put g_bw_cur_w i 0
+        put g_bw_cur_wpc i 0
+      end
+    end
+  end
+end
+
+fn bw_step_reads pc ulong rec ulong to void
+  nr = get g_bwd_nr pc
+  for j ulong nr bound 5
+    bw_step_one_read pc rec add mul pc 5 j
+  end
+end
+
+fn bw_step_one_write pc ulong rec ulong i ulong to void
+  rv = get g_bw_cur_r i
+  if ne rv 0
+    if ne rec 0
+      bw_note pc sub get g_bw_cur_rpc i 1 OMEGA_BW_HZ_WAR i rv
+    end
+    put g_bw_cur_r i 0
+    put g_bw_cur_rpc i 0
+  end
+  wv = get g_bw_cur_w i
+  if ne wv 0
+    if ne rec 0
+      bw_note pc sub get g_bw_cur_wpc i 1 OMEGA_BW_HZ_WAW i wv
+    end
+    put g_bw_cur_w i 0
+    put g_bw_cur_wpc i 0
+  end
+  wbar = get g_bwd_wbar pc
+  is_var = get g_bwd_var pc
+  has_w = ne wbar OMEGA_BW_NOBAR
+  if or has_w ne is_var 0
+    sh = ulong 0
+    if has_w
+      sh = shl ulong 1 wbar
+    end
+    put g_bw_cur_w i or get g_bw_cur_w i shl ulong 1 sh
+    put g_bw_cur_wpc i add pc 1
+  end
+end
+
+fn bw_step_writes pc ulong rec ulong to void
+  if eq get g_bwd_nw pc 0
+    ret
+  end
+  reg = get g_bwd_wr_reg pc
+  cnt = get g_bwd_wr_n pc
+  base = ulong 0
+  if ne get g_bwd_wr_u pc 0
+    base = 256
+  end
+  for q ulong cnt bound 4
+    r8 = and add reg q 255
+    if ne r8 OMEGA_BW_RZ
+      bw_step_one_write pc rec add base r8
+    end
+  end
+end
+
+fn bw_step_one_late pc ulong bit ulong o ulong to void
+  reg = get g_bwd_rd_reg o
+  cnt = get g_bwd_rd_n o
+  base = ulong 0
+  if ne get g_bwd_rd_u o 0
+    base = 256
+  end
+  for q ulong cnt bound 4
+    r8 = and add reg q 255
+    if ne r8 OMEGA_BW_RZ
+      i = add base r8
+      if ne get g_bw_cur_r i 0
+        put g_bw_cur_rpc i bw_pmin get g_bw_cur_rpc i add pc 1
+      else
+        put g_bw_cur_rpc i add pc 1
+      end
+      put g_bw_cur_r i or get g_bw_cur_r i bit
+    end
+  end
+end
+
+fn bw_step_late pc ulong to void
+  late = get g_bwd_late pc
+  rbar = get g_bwd_rbar pc
+  if and eq late 0 eq rbar OMEGA_BW_NOBAR
+    ret
+  end
+  wbar = get g_bwd_wbar pc
+  m = ulong 0
+  if ne rbar OMEGA_BW_NOBAR
+    m = or m shl ulong 1 rbar
+  end
+  if ne wbar OMEGA_BW_NOBAR
+    m = or m shl ulong 1 wbar
+  end
+  bit = shl ulong 1 m
+  nr = get g_bwd_nr pc
+  for j ulong nr bound 5
+    bw_step_one_late pc bit add mul pc 5 j
+  end
+end
+
+fn bw_step pc ulong rec ulong to void
+  bw_step_wait get g_bwd_wait pc
+  bw_step_reads pc rec
+  bw_step_writes pc rec
+  bw_step_late pc
+end
+
+fn bw_load_cur pc ulong to void
+  base = mul pc BW_NREG
+  for i ulong 512
+    idx = add base i
+    put g_bw_cur_w i get g_bw_in_w idx
+    put g_bw_cur_r i get g_bw_in_r idx
+    put g_bw_cur_wpc i get g_bw_in_wpc idx
+    put g_bw_cur_rpc i get g_bw_in_rpc idx
+  end
+end
+
+fn bw_join_w base ulong to ulong
+  ch = ulong 0
+  for i ulong 512
+    idx = add base i
+    dw = get g_bw_in_w idx
+    sw = get g_bw_cur_w i
+    nw = or dw sw
+    dwp = get g_bw_in_wpc idx
+    nwp = dwp
+    if ne sw 0
+      nwp = bw_pmin dwp get g_bw_cur_wpc i
+    end
+    if or ne nw dw ne nwp dwp
+      put g_bw_in_w idx nw
+      put g_bw_in_wpc idx nwp
+      ch = 1
+    end
+  end
+  ret ch
+end
+
+fn bw_join_r base ulong to ulong
+  ch = ulong 0
+  for i ulong 512
+    idx = add base i
+    dr = get g_bw_in_r idx
+    sr = get g_bw_cur_r i
+    nr = or dr sr
+    drp = get g_bw_in_rpc idx
+    nrp = drp
+    if ne sr 0
+      nrp = bw_pmin drp get g_bw_cur_rpc i
+    end
+    if or ne nr dr ne nrp drp
+      put g_bw_in_r idx nr
+      put g_bw_in_rpc idx nrp
+      ch = 1
+    end
+  end
+  ret ch
+end
+
+fn bw_join_into dst_pc ulong to ulong
+  base = mul dst_pc BW_NREG
+  c1 = bw_join_w base
+  c2 = bw_join_r base
+  ret or c1 c2
+end
+
+fn bw_clear_state n ulong to void
+  put g_bwr_insns 0 n
+  put g_bwr_reachable 0 0
+  put g_bwr_count 0 0
+  put g_bwr_bad_pc 0 -1
+  for pc ulong n bound 1024
+    put g_bw_seen pc 0
+    put g_bw_queued pc 0
+    base = mul pc BW_NREG
+    for i ulong 512
+      idx = add base i
+      put g_bw_in_w idx 0
+      put g_bw_in_r idx 0
+      put g_bw_in_wpc idx 0
+      put g_bw_in_rpc idx 0
+    end
+  end
+end
+
+fn bw_reach_pass code view uchar * n ulong to long
+  top = ulong 1
+  put g_bw_work 0 0
+  put g_bw_queued 0 1
+  while gt top 0 bound 4096
+    top = sub top 1
+    pc = get g_bw_work top
+    if ne omega_bw_decode code mul pc 16 pc 0
+      put g_bwr_bad_pc 0 long pc
+      ret -1
+    end
+    put g_bw_seen pc 1
+    fl = get g_bwd_flow pc
+    gd = get g_bwd_guard pc
+    if or eq fl OMEGA_BW_FLOW_NEXT ne gd 7
+      s0 = add long pc 1
+      if or lt s0 0 ge s0 long n
+        put g_bwr_bad_pc 0 long pc
+        ret -1
+      end
+      u0 = ulong s0
+      if eq get g_bw_queued u0 0
+        put g_bw_queued u0 1
+        put g_bw_work top u0
+        top = add top 1
+      end
+    end
+    if eq fl OMEGA_BW_FLOW_BRA
+      s1 = add long pc get g_bwd_target pc
+      if or lt s1 0 ge s1 long n
+        put g_bwr_bad_pc 0 long pc
+        ret -1
+      end
+      u1 = ulong s1
+      if eq get g_bw_queued u1 0
+        put g_bw_queued u1 1
+        put g_bw_work top u1
+        top = add top 1
+      end
+    end
+  end
+  reach = ulong 0
+  for i ulong n bound 1024
+    reach = add reach get g_bw_seen i
+  end
+  put g_bwr_reachable 0 reach
+  ret 0
+end
+
+fn bw_fp_push top ulong t ulong to ulong
+  ch = bw_join_into t
+  need = ulong 0
+  if ne ch 0
+    need = 1
+  end
+  if eq get g_bw_seen t 1
+    need = 1
+  end
+  if eq need 0
+    ret top
+  end
+  if ne get g_bw_queued t 0
+    ret top
+  end
+  put g_bw_queued t 1
+  put g_bw_work top t
+  ret add top 1
+end
+
+fn bw_fixpoint_pass n ulong to void
+  for i ulong n bound 1024
+    put g_bw_queued i 0
+  end
+  top = ulong 1
+  put g_bw_work 0 0
+  put g_bw_queued 0 1
+  while gt top 0 bound 65536
+    top = sub top 1
+    pc = get g_bw_work top
+    put g_bw_queued pc 0
+    put g_bw_seen pc 2
+    bw_load_cur pc
+    bw_step pc 0
+    fl = get g_bwd_flow pc
+    gd = get g_bwd_guard pc
+    if or eq fl OMEGA_BW_FLOW_NEXT ne gd 7
+      top = bw_fp_push top add pc 1
+    end
+    if eq fl OMEGA_BW_FLOW_BRA
+      top = bw_fp_push top ulong add long pc get g_bwd_target pc
+    end
+  end
+end
+
+fn omega_bw_hazard_check code view uchar * blen ulong to long
+  if or eq blen 0 or ne rem blen 16 0 gt blen len code
+    put g_bwr_bad_pc 0 -1
+    ret -1
+  end
+  n = div blen 16
+  if gt n BW_MAX_INSNS
+    put g_bwr_bad_pc 0 -1
+    ret -1
+  end
+  bw_clear_state n
+  if ne bw_reach_pass code n 0
+    ret -1
+  end
+  bw_fixpoint_pass n
+  for pc ulong n bound 1024
+    if ne get g_bw_seen pc 0
+      bw_load_cur pc
+      bw_step pc 1
+    end
+  end
+  ret 0
+end

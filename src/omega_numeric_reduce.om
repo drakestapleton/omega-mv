@@ -1,0 +1,410 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_numeric_reduce.c (E1 WP-D frozen-order FP32
+note reductions: SUM, MAX, MIN, MEAN; reference, CPU, batched rows, and sequential control).
+om2
+
+const OMEGA_RED_SUM ulong 0
+const OMEGA_RED_MAX ulong 1
+const OMEGA_RED_MIN ulong 2
+const OMEGA_RED_MEAN ulong 3
+const OMEGA_RED_COUNT ulong 4
+
+const OMEGA_NUMERIC_OK long 0
+const OMEGA_NUMERIC_ERR_BAD_ARGS long -1
+const OMEGA_NUMERIC_ERR_OPERANDS long -3
+
+const OMEGA_REDUCE_EMPTY_SUM_BITS uint 0x00000000
+const OMEGA_REDUCE_EMPTY_OTHER_BITS uint 0x7fc00000
+const OMEGA_REDUCE_SUM_PAD_BITS uint 0x80000000
+const OMEGA_REDUCE_MINMAX_PAD_BITS uint 0x7fc00000
+const OMEGA_REDUCE_MEAN_MAX_N ulong 16777216
+const RED_MAX_N ulong 65536
+
+text red_name_sum "SUM"
+text red_name_max "MAX"
+text red_name_min "MIN"
+text red_name_mean "MEAN"
+
+global g_red_buf0 uint 65568
+global g_red_buf1 uint 65568
+global g_red_tile uint 32
+global g_red_out uint 1
+global g_red_rows_out uint 4096
+
+fn omega_reduce_op_name op ulong dst edit uchar * to long
+  if eq op OMEGA_RED_SUM
+    if lt len dst 3
+      ret -1
+    end
+    for i ulong 3
+      put dst i get red_name_sum i
+    end
+    ret 3
+  end
+  if eq op OMEGA_RED_MAX
+    if lt len dst 3
+      ret -1
+    end
+    for i ulong 3
+      put dst i get red_name_max i
+    end
+    ret 3
+  end
+  if eq op OMEGA_RED_MIN
+    if lt len dst 3
+      ret -1
+    end
+    for i ulong 3
+      put dst i get red_name_min i
+    end
+    ret 3
+  end
+  if eq op OMEGA_RED_MEAN
+    if lt len dst 4
+      ret -1
+    end
+    for i ulong 4
+      put dst i get red_name_mean i
+    end
+    ret 4
+  end
+  ret -1
+end
+
+fn omega_reduce_identity op ulong to uint
+  if or eq op OMEGA_RED_MAX eq op OMEGA_RED_MIN
+    ret OMEGA_REDUCE_MINMAX_PAD_BITS
+  end
+  ret OMEGA_REDUCE_SUM_PAD_BITS
+end
+
+fn omega_reduce_levels n ulong to ulong
+  if eq n 0
+    ret 0
+  end
+  lv = ulong 1
+  cap = ulong 32
+  while lt cap n bound 16
+    cap = mul cap 32
+    lv = add lv 1
+  end
+  ret lv
+end
+
+fn red_empty_result op ulong to uint
+  if eq op OMEGA_RED_SUM
+    ret OMEGA_REDUCE_EMPTY_SUM_BITS
+  end
+  ret OMEGA_REDUCE_EMPTY_OTHER_BITS
+end
+
+fn red_is_nan u uint to bool
+  exp = and u uint 0x7f800000
+  frac = and u uint 0x007fffff
+  ret and eq exp uint 0x7f800000 ne frac uint 0
+end
+
+fn red_fmax a uint b uint to uint
+  na = red_is_nan a
+  nb = red_is_nan b
+  if and na nb
+    ret uint 0x7fc00000
+  end
+  if na
+    ret b
+  end
+  if nb
+    ret a
+  end
+  za = eq and a uint 0x7fffffff uint 0
+  zb = eq and b uint 0x7fffffff uint 0
+  if and za zb
+    ret and a b
+  end
+  fa = bitcast f32 a
+  fb = bitcast f32 b
+  if gt fa fb
+    ret a
+  end
+  ret b
+end
+
+fn red_fmin a uint b uint to uint
+  na = red_is_nan a
+  nb = red_is_nan b
+  if and na nb
+    ret uint 0x7fc00000
+  end
+  if na
+    ret b
+  end
+  if nb
+    ret a
+  end
+  za = eq and a uint 0x7fffffff uint 0
+  zb = eq and b uint 0x7fffffff uint 0
+  if and za zb
+    ret or a b
+  end
+  fa = bitcast f32 a
+  fb = bitcast f32 b
+  if lt fa fb
+    ret a
+  end
+  ret b
+end
+
+fn red_combine op ulong a uint b uint to uint
+  if eq op OMEGA_RED_SUM
+    ret bitcast uint add bitcast f32 a bitcast f32 b
+  end
+  if eq op OMEGA_RED_MAX
+    ret red_fmax a b
+  end
+  ret red_fmin a b
+end
+
+fn red_common_checks op ulong n ulong to long
+  if ge op OMEGA_RED_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if and eq op OMEGA_RED_MEAN gt n OMEGA_REDUCE_MEAN_MAX_N
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if gt n RED_MAX_N
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn red_ref_tile op ulong to uint
+  d = ulong 16
+  for s ulong 5
+    lim = sub 32 d
+    for i ulong lim bound 32
+      va = get g_red_tile i
+      vb = get g_red_tile add i d
+      put g_red_tile i red_combine op va vb
+    end
+    d = shr d 1
+  end
+  ret get g_red_tile 0
+end
+
+fn red_ref_load_tile base ulong cur_len ulong src_is_0 ulong pad uint to void
+  for k ulong 32
+    idx = add base k
+    if lt idx cur_len
+      if eq src_is_0 1
+        put g_red_tile k get g_red_buf0 idx
+      else
+        put g_red_tile k get g_red_buf1 idx
+      end
+    else
+      put g_red_tile k pad
+    end
+  end
+end
+
+fn red_ref_sum_like op ulong x view uint * xoff ulong n ulong to long
+  eff_op = op
+  if eq eff_op OMEGA_RED_MEAN
+    eff_op = OMEGA_RED_SUM
+  end
+  if eq n 0
+    put g_red_out 0 red_empty_result eff_op
+    ret OMEGA_NUMERIC_OK
+  end
+  pad = omega_reduce_identity eff_op
+  for i ulong n bound 65536
+    put g_red_buf0 i get x add xoff i
+  end
+  cur_len = n
+  src_is_0 = ulong 1
+  while gt cur_len 0 bound 8
+    next_len = div add cur_len 31 32
+    for j ulong next_len bound 2048
+      red_ref_load_tile mul j 32 cur_len src_is_0 pad
+      tv = red_ref_tile eff_op
+      if eq src_is_0 1
+        put g_red_buf1 j tv
+      else
+        put g_red_buf0 j tv
+      end
+    end
+    if eq src_is_0 1
+      src_is_0 = 0
+    else
+      src_is_0 = 1
+    end
+    cur_len = next_len
+    if eq cur_len 1
+      if eq src_is_0 1
+        put g_red_out 0 get g_red_buf0 0
+      else
+        put g_red_out 0 get g_red_buf1 0
+      end
+      ret OMEGA_NUMERIC_OK
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_reduce_reference op ulong x view uint * xoff ulong n ulong to long
+  rc = red_common_checks op n
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  if gt add xoff n len x
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if ne op OMEGA_RED_MEAN
+    ret red_ref_sum_like op x xoff n
+  end
+  if eq n 0
+    put g_red_out 0 red_empty_result op
+    ret OMEGA_NUMERIC_OK
+  end
+  rc = red_ref_sum_like OMEGA_RED_SUM x xoff n
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  sf = bitcast f32 get g_red_out 0
+  nf = f32 uint n
+  put g_red_out 0 bitcast uint div sf nf
+  ret OMEGA_NUMERIC_OK
+end
+
+fn red_cpu_tile eff_op ulong j ulong to void
+  base = mul j 32
+  d = ulong 16
+  for s ulong 5
+    for i ulong d bound 16
+      va = get g_red_buf0 add base i
+      vb = get g_red_buf0 add add base i d
+      put g_red_buf0 add base i red_combine eff_op va vb
+    end
+    d = shr d 1
+  end
+  put g_red_buf0 j get g_red_buf0 base
+end
+
+fn red_cpu_sum_like op ulong x view uint * xoff ulong n ulong to long
+  eff_op = op
+  if eq eff_op OMEGA_RED_MEAN
+    eff_op = OMEGA_RED_SUM
+  end
+  if eq n 0
+    put g_red_out 0 red_empty_result eff_op
+    ret OMEGA_NUMERIC_OK
+  end
+  pad = omega_reduce_identity eff_op
+  for i ulong n bound 65536
+    put g_red_buf0 i get x add xoff i
+  end
+  cur_len = n
+  while gt cur_len 0 bound 8
+    padded = mul div add cur_len 31 32 32
+    pad_n = sub padded cur_len
+    for p ulong pad_n bound 32
+      put g_red_buf0 add cur_len p pad
+    end
+    tiles = div padded 32
+    for j ulong tiles bound 2048
+      red_cpu_tile eff_op j
+    end
+    cur_len = tiles
+    if eq cur_len 1
+      put g_red_out 0 get g_red_buf0 0
+      ret OMEGA_NUMERIC_OK
+    end
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_reduce_cpu op ulong x view uint * xoff ulong n ulong to long
+  rc = red_common_checks op n
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  if gt add xoff n len x
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if ne op OMEGA_RED_MEAN
+    ret red_cpu_sum_like op x xoff n
+  end
+  if eq n 0
+    put g_red_out 0 red_empty_result op
+    ret OMEGA_NUMERIC_OK
+  end
+  rc = red_cpu_sum_like OMEGA_RED_SUM x xoff n
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  sf = bitcast f32 get g_red_out 0
+  nf = f32 uint n
+  put g_red_out 0 bitcast uint div sf nf
+  ret OMEGA_NUMERIC_OK
+end
+
+fn red_rows_common op ulong rows ulong n ulong row_stride ulong to long
+  if ge op OMEGA_RED_COUNT
+    ret OMEGA_NUMERIC_ERR_BAD_ARGS
+  end
+  if gt rows 4096
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  if and gt rows 1 lt row_stride n
+    ret OMEGA_NUMERIC_ERR_OPERANDS
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_reduce_rows_reference op ulong x view uint * rows ulong n ulong row_stride ulong to long
+  rc = red_rows_common op rows n row_stride
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  for r ulong rows bound 4096
+    off = ulong 0
+    if gt n 0
+      off = mul r row_stride
+    end
+    rc = omega_reduce_reference op x off n
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+    put g_red_rows_out r get g_red_out 0
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_reduce_rows_cpu op ulong x view uint * rows ulong n ulong row_stride ulong to long
+  rc = red_rows_common op rows n row_stride
+  if ne rc OMEGA_NUMERIC_OK
+    ret rc
+  end
+  for r ulong rows bound 4096
+    off = ulong 0
+    if gt n 0
+      off = mul r row_stride
+    end
+    rc = omega_reduce_cpu op x off n
+    if ne rc OMEGA_NUMERIC_OK
+      ret rc
+    end
+    put g_red_rows_out r get g_red_out 0
+  end
+  ret OMEGA_NUMERIC_OK
+end
+
+fn omega_reduce_sequential_sum_not_contract x view uint * n ulong to uint
+  if eq n 0
+    ret uint 0
+  end
+  s = OMEGA_REDUCE_SUM_PAD_BITS
+  for i ulong n bound 65536
+    s = bitcast uint add bitcast f32 s bitcast f32 get x i
+  end
+  ret s
+end
