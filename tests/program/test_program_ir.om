@@ -1,0 +1,190 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 unit + C-parity test for src/omega_program_ir.om
+note Covers omega_program_ir_encode, omega_program_ir_decode, omega_program_ir_recompute_id.
+om2
+
+text t_ir_pass "GATE OMEGA_PROGRAM_IR_OM PASS "
+text t_ir_fail "GATE OMEGA_PROGRAM_IR_OM FAIL "
+text t_ir_sl "/"
+text t_ir_nl "\n"
+text t_ir_fail_id "FAIL pir check "
+text t_pre_true "true"
+text t_post_rge1 "result >= 1"
+
+global g_ir_fails ulong 1
+global g_ir_total ulong 1
+global g_ir_nbuf uchar 32
+global g_ir_hex uchar 65
+global g_ir_saved uchar 768
+
+fn ir_ws s view uchar * n ulong to void
+  if eq n 0
+    ret
+  end
+  ign = write 1 s 0 n
+end
+
+fn ir_pu64 v ulong to void
+  if eq v 0
+    put g_ir_nbuf 0 uchar 48
+    ign = write 1 g_ir_nbuf 0 1
+    ret
+  end
+  x = v
+  cnt = ulong 0
+  while gt x 0 bound 24
+    put g_ir_nbuf cnt uchar add rem x 10 48
+    cnt = add cnt 1
+    x = div x 10
+  end
+  i = ulong 0
+  j = sub cnt 1
+  while lt i j bound 24
+    a = get g_ir_nbuf i
+    b = get g_ir_nbuf j
+    put g_ir_nbuf i b
+    put g_ir_nbuf j a
+    i = add i 1
+    j = sub j 1
+  end
+  ign = write 1 g_ir_nbuf 0 cnt
+end
+
+fn ir_chk ok bool cid ulong to void
+  put g_ir_total 0 add get g_ir_total 0 1
+  if not ok
+    put g_ir_fails 0 add get g_ir_fails 0 1
+    ir_ws t_ir_fail_id len t_ir_fail_id
+    ir_pu64 cid
+    ir_ws t_ir_nl len t_ir_nl
+  end
+end
+
+fn ir_hex_nib v ulong to uchar
+  if lt v 10
+    ret uchar add v 48
+  end
+  ret uchar add v 87
+end
+
+fn ir_print_id slot ulong to void
+  ib = mul slot 32
+  for i ulong 32
+    b = ulong get gp_id add ib i
+    put g_ir_hex mul i 2 ir_hex_nib shr b 4
+    put g_ir_hex add mul i 2 1 ir_hex_nib and b 15
+  end
+  put g_ir_hex 64 uchar 10
+  ign = write 1 g_ir_hex 0 65
+end
+
+fn build_sample_u64 slot ulong to void
+  pir_slot_init slot
+  put gp_intype slot OMEGA_TYPE_UINT
+  put gp_inw slot 64
+  put gp_outtype slot OMEGA_TYPE_UINT
+  put gp_outw slot 64
+  pir_build_constraint_id OMEGA_CONST_PRE t_pre_true len t_pre_true
+  ib = mul slot 32
+  for i ulong 32
+    put gp_preid add ib i get sh_dig i
+  end
+  pir_build_constraint_id OMEGA_CONST_POST t_post_rge1 len t_post_rge1
+  for i ulong 32
+    put gp_postid add ib i get sh_dig i
+  end
+  put gp_has slot 1
+  put gp_scnt slot 2
+  sb = mul slot PIR_MAX_STEPS
+  put gp_sop sb OMEGA_OP_MUL
+  put gp_simm sb 3
+  put gp_sop add sb 1 OMEGA_OP_ADD
+  put gp_simm add sb 1 1
+  ign = pir_compute_id slot
+end
+
+fn main to int
+  put g_ir_fails 0 0
+  put g_ir_total 0 0
+
+  note 1. Encode u64 2-step program, decode, recompute_id
+  build_sample_u64 0
+  ir_chk eq omega_program_ir_encode 0 0 1
+  n0 = get gp_ir_len 0
+  ir_chk eq n0 114 2
+  for i ulong n0 bound 768
+    put g_ir_saved i get gp_ir_buf i
+  end
+  ir_chk eq omega_program_ir_decode n0 1 0 3
+  ir_chk pir_ids_eq 0 1 4
+  ir_chk eq get gp_scnt 1 2 5
+  ir_chk and eq get gp_sop mul 1 PIR_MAX_STEPS OMEGA_OP_MUL eq get gp_simm mul 1 PIR_MAX_STEPS 3 6
+
+  reid = new uchar 32 0
+  ir_chk eq omega_program_ir_recompute_id n0 2 reid 0 7
+  same = ulong 1
+  for i ulong 32
+    if ne get reid i get gp_id i
+      same = 0
+    end
+  end
+  ir_chk eq same 1 8
+
+  note 2. Refusal cases: no body, bad tag, truncated, trailing byte, >64 steps, bad op
+  pir_slot_init 3
+  ir_chk ne omega_program_ir_encode 3 0 9
+
+  put gp_ir_buf 0 uchar 88
+  ir_chk ne omega_program_ir_decode n0 3 0 10
+  put gp_ir_buf 0 get g_ir_saved 0
+
+  ir_chk ne omega_program_ir_decode sub n0 1 3 0 11
+  ir_chk ne omega_program_ir_decode add n0 1 3 0 12
+
+  note steps = 65 refused
+  put gp_ir_buf 94 uchar 0
+  put gp_ir_buf 95 uchar 65
+  ir_chk ne omega_program_ir_decode ulong 681 3 0 13
+  put gp_ir_buf 94 get g_ir_saved 94
+  put gp_ir_buf 95 get g_ir_saved 95
+
+  note invalid opcode 0xff refused by pir_compute_id
+  put gp_ir_buf 96 uchar 255
+  ir_chk ne omega_program_ir_decode n0 3 0 14
+  put gp_ir_buf 96 get g_ir_saved 96
+
+  note 3. FP32 program round-trip through IR codec
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x3f800000
+  put g_fp32_ops 1 OMEGA_OP_CONVERT
+  put g_fp32_imms 1 OMEGA_TYPE_UINT
+  ir_chk eq omega_program_build_fp32 4 OMEGA_TYPE_FP32 OMEGA_TYPE_UINT 2 0 15
+  ir_chk eq omega_program_ir_encode 4 0 16
+  n4 = get gp_ir_len 0
+  ir_chk eq n4 114 17
+  ir_chk eq omega_program_ir_decode n4 5 0 18
+  ir_chk pir_ids_eq 4 5 19
+
+  note Print golden IDs when --dump is passed
+  if ge argcnt 2
+    ir_print_id 0
+    ir_print_id 4
+    ret 0
+  end
+
+  fails = get g_ir_fails 0
+  total = get g_ir_total 0
+  if ne fails 0
+    ir_ws t_ir_fail len t_ir_fail
+  else
+    ir_ws t_ir_pass len t_ir_pass
+  end
+  ir_pu64 sub total fails
+  ir_ws t_ir_sl len t_ir_sl
+  ir_pu64 total
+  ir_ws t_ir_nl len t_ir_nl
+  if ne fails 0
+    ret 1
+  end
+  ret 0
+end

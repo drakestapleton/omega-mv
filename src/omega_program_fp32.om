@@ -1,0 +1,219 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 implementation of FP32 in the program IR (spec/program-fp32.md),
+note replacing src/omega_program_fp32.c and src/omega_program_fp32.h.
+note Composes on seed/ng/sha256.om and src/omega_program_ir.om.
+om2
+
+text fp32_pre_txt "x is a binary32 or u32 value"
+text fp32_post_pfx "fp32 program of "
+text fp32_post_sfx " steps"
+
+global g_fp32_post uchar 64
+global g_fp32_saved_id uchar 32
+global g_fp32_ops ulong 64
+global g_fp32_imms ulong 64
+
+fn fp32_walk slot ulong to long
+  if eq get gp_has slot 0
+    ret -1
+  end
+  sc = get gp_scnt slot
+  if gt sc PIR_MAX_STEPS
+    ret -1
+  end
+  if or ne get gp_inw slot 32 ne get gp_outw slot 32
+    ret -1
+  end
+  it = get gp_intype slot
+  ot = get gp_outtype slot
+  if and ne it OMEGA_TYPE_FP32 ne it OMEGA_TYPE_UINT
+    ret -1
+  end
+  if and ne ot OMEGA_TYPE_FP32 ne ot OMEGA_TYPE_UINT
+    ret -1
+  end
+  cur = it
+  sb = mul slot PIR_MAX_STEPS
+  for i ulong sc bound 64
+    op = get gp_sop add sb i
+    imm = get gp_simm add sb i
+    if eq op OMEGA_OP_CONVERT
+      if and ne imm OMEGA_TYPE_FP32 ne imm OMEGA_TYPE_UINT
+        ret -1
+      end
+      if eq imm cur
+        ret -1
+      end
+      cur = imm
+    else
+      if ne cur OMEGA_TYPE_FP32
+        ret -1
+      end
+      ok = ulong 0
+      if eq op OMEGA_OP_ADD
+        ok = 1
+      end
+      if eq op OMEGA_OP_SUB
+        ok = 1
+      end
+      if eq op OMEGA_OP_MUL
+        ok = 1
+      end
+      if eq op OMEGA_OP_DIV
+        ok = 1
+      end
+      if eq ok 0
+        ret -1
+      end
+      if gt imm 0xffffffff
+        ret -1
+      end
+    end
+  end
+  if ne cur ot
+    ret -1
+  end
+  ret 0
+end
+
+fn omega_program_fp32_check slot ulong to long
+  rc = fp32_walk slot
+  if ne rc 0
+    ret -1
+  end
+  ib = mul slot 32
+  for i ulong 32
+    put g_fp32_saved_id i get gp_id add ib i
+  end
+  rc = pir_compute_id slot
+  same = ulong 1
+  for i ulong 32
+    if ne get gp_id add ib i get g_fp32_saved_id i
+      same = 0
+    end
+    put gp_id add ib i get g_fp32_saved_id i
+  end
+  if or ne rc 0 eq same 0
+    ret -1
+  end
+  ret 0
+end
+
+fn fp32_format_post cnt ulong to ulong
+  p = ulong 0
+  for i ulong 16
+    put g_fp32_post i get fp32_post_pfx i
+  end
+  p = 16
+  if ge cnt 10
+    put g_fp32_post p uchar add div cnt 10 48
+    p = add p 1
+  end
+  put g_fp32_post p uchar add rem cnt 10 48
+  p = add p 1
+  for i ulong 6
+    put g_fp32_post add p i get fp32_post_sfx i
+  end
+  ret add p 6
+end
+
+fn omega_program_build_fp32 slot ulong in_type ulong out_type ulong cnt ulong to long
+  if gt cnt PIR_MAX_STEPS
+    ret -1
+  end
+  pir_slot_init slot
+  put gp_intype slot in_type
+  put gp_inw slot 32
+  put gp_outtype slot out_type
+  put gp_outw slot 32
+  put gp_has slot 1
+  put gp_scnt slot cnt
+  sb = mul slot PIR_MAX_STEPS
+  for i ulong cnt bound 64
+    put gp_sop add sb i get g_fp32_ops i
+    put gp_simm add sb i get g_fp32_imms i
+  end
+  rc = fp32_walk slot
+  if ne rc 0
+    ret -1
+  end
+  pir_build_constraint_id OMEGA_CONST_PRE fp32_pre_txt len fp32_pre_txt
+  ib = mul slot 32
+  for i ulong 32
+    put gp_preid add ib i get sh_dig i
+  end
+  plen = fp32_format_post cnt
+  pbuf = new uchar 64 0
+  for i ulong plen bound 64
+    put pbuf i get g_fp32_post i
+  end
+  pir_build_constraint_id OMEGA_CONST_POST pbuf plen
+  for i ulong 32
+    put gp_postid add ib i get sh_dig i
+  end
+  ret pir_compute_id slot
+end
+
+fn omega_program_build_convert slot ulong from_t ulong to_t ulong to long
+  put g_fp32_ops 0 OMEGA_OP_CONVERT
+  put g_fp32_imms 0 to_t
+  ret omega_program_build_fp32 slot from_t to_t 1
+end
+
+note IEEE-754 binary32 -> u32 (truncate toward zero, saturating, NaN and negatives -> 0).
+fn fp32_ref_f2u bits uint to uint
+  v = bitcast f32 bits
+  ret uint v
+end
+
+note u32 -> IEEE-754 binary32 (round to nearest even).
+fn fp32_ref_u2f u uint to uint
+  v = f32 u
+  ret bitcast uint v
+end
+
+fn fp32_eval_one slot ulong x uint to uint
+  cur = x
+  sc = get gp_scnt slot
+  sb = mul slot PIR_MAX_STEPS
+  for i ulong sc bound 64
+    op = get gp_sop add sb i
+    imm = get gp_simm add sb i
+    if eq op OMEGA_OP_CONVERT
+      if eq imm OMEGA_TYPE_FP32
+        cur = fp32_ref_u2f cur
+      else
+        cur = fp32_ref_f2u cur
+      end
+    else
+      vf = bitcast f32 cur
+      kf = bitcast f32 uint imm
+      rf = f32 0.0
+      if eq op OMEGA_OP_ADD
+        rf = add vf kf
+      end
+      if eq op OMEGA_OP_SUB
+        rf = sub vf kf
+      end
+      if eq op OMEGA_OP_MUL
+        rf = mul vf kf
+      end
+      if eq op OMEGA_OP_DIV
+        rf = div vf kf
+      end
+      cur = bitcast uint rf
+    end
+  end
+  ret cur
+end
+
+fn omega_program_fp32_eval slot ulong xs view uint * n ulong ys edit uint * to long
+  rc = omega_program_fp32_check slot
+  if ne rc 0
+    ret -1
+  end
+  for k ulong n bound 8192
+    put ys k fp32_eval_one slot get xs k
+  end
+  ret 0
+end

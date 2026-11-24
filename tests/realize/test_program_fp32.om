@@ -1,0 +1,348 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tests/realize/test_program_fp32.c
+note Gate OMEGA_PROGRAM_FP32_PASS: type check refuses mixed types, conversions are explicit,
+note ids bind the types, evaluation equals an independent evaluator, and the AArch64
+note realizer refuses FP32 programs. Physics-free; opens no device.
+om2
+
+text t_fail_pfx "FAIL: check "
+text t_gate_pfx "GATE OMEGA_PROGRAM_FP32_PASS "
+text t_pass "PASS "
+text t_fail "FAIL "
+text t_slash "/"
+text t_nl "\n"
+
+global g_fails ulong 1
+global g_total ulong 1
+global g_numbuf uchar 32
+global g_xs uint 4096
+global g_ys uint 4096
+
+fn fp32_write_s s view uchar * n ulong to void
+  if eq n 0
+    ret
+  end
+  ign = write 1 s 0 n
+end
+
+fn fp32_print_u64 v ulong to void
+  if eq v 0
+    put g_numbuf 0 uchar 48
+    ign = write 1 g_numbuf 0 1
+    ret
+  end
+  x = v
+  cnt = ulong 0
+  while gt x 0 bound 24
+    put g_numbuf cnt uchar add rem x 10 48
+    cnt = add cnt 1
+    x = div x 10
+  end
+  i = ulong 0
+  j = sub cnt 1
+  while lt i j bound 24
+    a = get g_numbuf i
+    b = get g_numbuf j
+    put g_numbuf i b
+    put g_numbuf j a
+    i = add i 1
+    j = sub j 1
+  end
+  ign = write 1 g_numbuf 0 cnt
+end
+
+fn fp32_chk ok bool cid ulong to void
+  put g_total 0 add get g_total 0 1
+  if not ok
+    put g_fails 0 add get g_fails 0 1
+    fp32_write_s t_fail_pfx len t_fail_pfx
+    fp32_print_u64 cid
+    fp32_write_s t_nl len t_nl
+  end
+end
+
+fn fp32_is_nan u uint to bool
+  e = and shr u 23 255
+  m = and u 0x7fffff
+  ret and eq e 255 ne m 0
+end
+
+note Independent host-float reference evaluator for FP32 programs (ADD/SUB/MUL/DIV).
+fn fp32_host_ref slot ulong x uint to uint
+  v = bitcast f32 x
+  sc = get gp_scnt slot
+  sb = mul slot PIR_MAX_STEPS
+  for i ulong sc bound 64
+    op = get gp_sop add sb i
+    k = bitcast f32 uint get gp_simm add sb i
+    if eq op OMEGA_OP_ADD
+      v = add v k
+    end
+    if eq op OMEGA_OP_SUB
+      v = sub v k
+    end
+    if eq op OMEGA_OP_MUL
+      v = mul v k
+    end
+    if eq op OMEGA_OP_DIV
+      v = div v k
+    end
+  end
+  ret bitcast uint v
+end
+
+note Independent bit-level reference for u32 -> binary32 (RNE).
+fn fp32_indep_u2f a uint to uint
+  if eq a 0
+    ret 0
+  end
+  v = ulong a
+  p = ulong 31
+  while eq and shr v p 1 0 bound 32
+    p = sub p 1
+  end
+  if le p 23
+    sh = sub 23 p
+    mant = and shl v sh 0x7fffff
+    be = add p 127
+    ret uint or shl be 23 mant
+  end
+  sh = sub p 23
+  q = shr v sh
+  half = shl ulong 1 sub sh 1
+  mask = sub shl ulong 1 sh 1
+  r = and v mask
+  if or gt r half and eq r half eq and q 1 1
+    q = add q 1
+  end
+  be = add p 127
+  if ge q 0x1000000
+    q = shr q 1
+    be = add be 1
+  end
+  ret uint or shl be 23 and q 0x7fffff
+end
+
+note Independent bit-level reference for binary32 -> u32 (RTZ, saturating, NaN/neg -> 0).
+fn fp32_indep_f2u u uint to uint
+  sign = shr u 31
+  be = and shr u 23 255
+  frac = and u 0x7fffff
+  if eq be 255
+    if ne frac 0
+      ret 0
+    end
+    if ne sign 0
+      ret 0
+    end
+    ret 0xffffffff
+  end
+  if ne sign 0
+    ret 0
+  end
+  if lt be 127
+    ret 0
+  end
+  exp = sub be 127
+  if ge exp 32
+    ret 0xffffffff
+  end
+  sig = ulong or frac 0x800000
+  if ge exp 23
+    ret uint shl sig ulong sub exp 23
+  end
+  ret uint shr sig ulong sub 23 exp
+end
+
+fn init_xs to void
+  put g_xs 0 0
+  put g_xs 1 0x80000000
+  put g_xs 2 0x3f800000
+  put g_xs 3 0xbf800000
+  put g_xs 4 0x7f800000
+  put g_xs 5 0xff800000
+  put g_xs 6 0x7fc00000
+  put g_xs 7 0x00000001
+  put g_xs 8 0x007fffff
+  put g_xs 9 0x00800000
+  put g_xs 10 0x7f7fffff
+  put g_xs 11 0x4b800000
+  put g_xs 12 0x33800000
+  put g_xs 13 0x3effffff
+  s = ulong 0x9e3779b97f4a7c15
+  for i ulong 4082
+    s = xor s shl s 13
+    s = xor s shr s 7
+    s = xor s shl s 17
+    put g_xs add 14 i uint and shr s 16 0xffffffff
+  end
+end
+
+fn run_eval_checks to void
+  init_xs
+  xs = new uint 4096 0
+  ys = new uint 4096 0
+  for i ulong 4096
+    put xs i get g_xs i
+  end
+  progs = new ulong 3 0
+  put progs 0 0
+  put progs 1 1
+  put progs 2 6
+  eq_all = ulong 1
+  for pi ulong 3
+    pslot = get progs pi
+    rc = omega_program_fp32_eval pslot xs 4096 ys
+    fp32_chk eq rc 0 add 22 pi
+    for i ulong 4096
+      r = fp32_host_ref pslot get xs i
+      got = get ys i
+      if ne r got
+        if not and fp32_is_nan r fp32_is_nan got
+          eq_all = 0
+        end
+      end
+    end
+  end
+  fp32_chk eq eq_all 1 25
+  rc = omega_program_fp32_eval 3 xs 4096 ys
+  fp32_chk eq rc 0 26
+  eq_u2f = ulong 1
+  for i ulong 4096
+    if ne get ys i fp32_indep_u2f get xs i
+      eq_u2f = 0
+    end
+  end
+  fp32_chk eq eq_u2f 1 27
+  rc = omega_program_fp32_eval 4 xs 4096 ys
+  fp32_chk eq rc 0 28
+  eq_f2u = ulong 1
+  for i ulong 4096
+    if ne get ys i fp32_indep_f2u get xs i
+      eq_f2u = 0
+    end
+  end
+  fp32_chk eq eq_f2u 1 29
+end
+
+fn run_build_and_compose_checks to void
+  note slots: 0=a, 1=b, 2=c, 3=u2f, 4=f2u, 5=a2, 6=a3, 7=t, 8=ch
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x3f800000
+  fp32_chk eq omega_program_build_fp32 0 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1 0 1
+  fp32_chk eq omega_program_fp32_check 0 0 2
+
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x3f800000
+  put g_fp32_ops 1 OMEGA_OP_MUL
+  put g_fp32_imms 1 0x40200000
+  put g_fp32_ops 2 OMEGA_OP_DIV
+  put g_fp32_imms 2 0x40400000
+  put g_fp32_ops 3 OMEGA_OP_SUB
+  put g_fp32_imms 3 0x3f000000
+  fp32_chk eq omega_program_build_fp32 1 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 4 0 3
+
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x3f800000
+  fp32_chk ne omega_program_build_fp32 2 OMEGA_TYPE_UINT OMEGA_TYPE_UINT 1 0 4
+  fp32_chk eq omega_program_build_convert 3 OMEGA_TYPE_UINT OMEGA_TYPE_FP32 0 5
+  fp32_chk eq omega_program_build_convert 4 OMEGA_TYPE_FP32 OMEGA_TYPE_UINT 0 6
+  fp32_chk not pir_ids_eq 3 4 7
+  fp32_chk not pir_ids_eq 0 1 8
+
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x3f800000
+  rc_a2 = omega_program_build_fp32 5 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1
+  fp32_chk and eq rc_a2 0 pir_ids_eq 0 5 9
+
+  put g_fp32_imms 0 0x40000000
+  rc_a3 = omega_program_build_fp32 6 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1
+  fp32_chk and eq rc_a3 0 not pir_ids_eq 0 6 10
+
+  put g_fp32_ops 0 OMEGA_OP_AND
+  put g_fp32_imms 0 0xff
+  fp32_chk ne omega_program_build_fp32 2 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1 0 11
+
+  put g_fp32_ops 0 OMEGA_OP_CONVERT
+  put g_fp32_imms 0 OMEGA_TYPE_UINT
+  put g_fp32_ops 1 OMEGA_OP_ADD
+  put g_fp32_imms 1 1
+  fp32_chk ne omega_program_build_fp32 2 OMEGA_TYPE_FP32 OMEGA_TYPE_UINT 2 0 12
+
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x3f800000
+  fp32_chk ne omega_program_build_fp32 2 OMEGA_TYPE_FP32 OMEGA_TYPE_UINT 1 0 13
+
+  put g_fp32_ops 0 OMEGA_OP_CONVERT
+  put g_fp32_imms 0 OMEGA_TYPE_FP32
+  fp32_chk ne omega_program_build_fp32 2 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1 0 14
+
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x100000000
+  fp32_chk ne omega_program_build_fp32 2 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1 0 15
+
+  note Tampered body: stale id refused
+  put g_fp32_ops 0 OMEGA_OP_ADD
+  put g_fp32_imms 0 0x3f800000
+  ign = omega_program_build_fp32 7 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1
+  put gp_simm mul 7 PIR_MAX_STEPS 0x41100000
+  fp32_chk ne omega_program_fp32_check 7 0 16
+
+  note Width 64 refused
+  ign = omega_program_build_fp32 7 OMEGA_TYPE_FP32 OMEGA_TYPE_FP32 1
+  put gp_inw 7 64
+  fp32_chk ne omega_program_fp32_check 7 0 17
+
+  note Composition checks
+  fp32_chk eq pir_compose 0 1 2 0 18
+  fp32_chk and eq get gp_scnt 2 5 eq omega_program_fp32_check 2 0 19
+  fp32_chk and eq pir_compose 0 4 2 0 eq omega_program_fp32_check 2 0 20
+  fp32_chk ne pir_compose 4 0 2 0 21
+  fp32_chk and eq pir_compose 3 0 2 0 eq omega_program_fp32_check 2 0 22
+end
+
+fn run_chain_and_realize_checks to void
+  put g_fp32_ops 0 OMEGA_OP_CONVERT
+  put g_fp32_imms 0 OMEGA_TYPE_FP32
+  put g_fp32_ops 1 OMEGA_OP_ADD
+  put g_fp32_imms 1 0x3fc00000
+  put g_fp32_ops 2 OMEGA_OP_CONVERT
+  put g_fp32_imms 2 OMEGA_TYPE_UINT
+  fp32_chk eq omega_program_build_fp32 8 OMEGA_TYPE_UINT OMEGA_TYPE_UINT 3 0 30
+  in3 = new uint 4 0
+  out3 = new uint 4 0
+  put in3 0 0
+  put in3 1 1
+  put in3 2 41
+  put in3 3 0xfffffff0
+  rc = omega_program_fp32_eval 8 in3 4 out3
+  ok = and eq rc 0 and eq get out3 0 1 and eq get out3 1 2 eq get out3 2 42
+  fp32_chk ok 31
+
+  note AArch64 realizer refuses FP32 program
+  fp32_chk ne pir_realize_check 0 0 32
+end
+
+fn main to int
+  put g_fails 0 0
+  put g_total 0 0
+  run_build_and_compose_checks
+  run_eval_checks
+  run_chain_and_realize_checks
+  fails = get g_fails 0
+  total = get g_total 0
+  fp32_write_s t_gate_pfx len t_gate_pfx
+  if ne fails 0
+    fp32_write_s t_fail len t_fail
+  else
+    fp32_write_s t_pass len t_pass
+  end
+  fp32_print_u64 sub total fails
+  fp32_write_s t_slash len t_slash
+  fp32_print_u64 total
+  fp32_write_s t_nl len t_nl
+  if ne fails 0
+    ret 1
+  end
+  ret 0
+end
