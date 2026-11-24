@@ -1,0 +1,814 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_engine.om: Pure seeded OM-2 twin of src/omega_gpu_engine.c.
+note 7-state GPU execution engine (INITIAL -> PREPARED -> SUBMITTED -> GPU_COMPLETE ->
+note OUTPUT_VISIBLE -> OUTPUT_PRODUCED -> SUCCESS), uncertain-completion latch &
+note retention, reverse-order cleanup, poison verification, pluggable backend dispatch.
+om2
+
+const OGE_OK ulong 0
+const OGE_DEVICE_OPEN ulong 1
+const OGE_CHANNEL_CREATE ulong 2
+const OGE_ALLOC ulong 3
+const OGE_PREPARE ulong 4
+const OGE_SUBMIT ulong 5
+const OGE_COMPLETION_WAIT ulong 6
+const OGE_RELEASE_WAIT ulong 7
+const OGE_VISIBILITY_WAIT ulong 8
+const OGE_OUTPUT_UNCHANGED ulong 9
+const OGE_INVALID_ARGS ulong 10
+const OGE_INTERNAL_INVARIANT ulong 11
+const OGE_CLEANUP ulong 12
+const OGE_UNCERTAIN_COMPLETION_BLOCKED ulong 13
+const OGE_FAILURE_COUNT ulong 14
+
+const OGE_STATE_INITIAL ulong 0
+const OGE_STATE_PREPARED ulong 1
+const OGE_STATE_SUBMITTED ulong 2
+const OGE_STATE_GPU_COMPLETE ulong 3
+const OGE_STATE_OUTPUT_VISIBLE ulong 4
+const OGE_STATE_OUTPUT_PRODUCED ulong 5
+const OGE_STATE_SUCCESS ulong 6
+const OGE_STATE_COUNT ulong 7
+
+const OGE_WAIT_NONE ulong 0
+const OGE_WAIT_MARKER ulong 1
+const OGE_WAIT_RELEASE_SEMAPHORE ulong 2
+const OGE_WAIT_MARKER2 ulong 3
+const OGE_WAIT_COUNT ulong 4
+
+const OGE_STEP_NONE ulong 0
+const OGE_STEP_VALIDATE ulong 1
+const OGE_STEP_BACKEND_CHECK ulong 2
+const OGE_STEP_BLOCKED ulong 3
+const OGE_STEP_NOT_IMPLEMENTED ulong 4
+const OGE_STEP_OPEN_DEVICE ulong 5
+const OGE_STEP_CREATE_CHANNEL ulong 6
+const OGE_STEP_ALLOC ulong 7
+const OGE_STEP_COPY_IN ulong 8
+const OGE_STEP_FILL_POISON ulong 9
+const OGE_STEP_BUILD ulong 10
+const OGE_STEP_SUBMIT ulong 11
+const OGE_STEP_WAIT_MARKER ulong 12
+const OGE_STEP_WAIT_MARKER2 ulong 13
+const OGE_STEP_WAIT_RELEASE_SEMAPHORE ulong 14
+const OGE_STEP_BARRIER ulong 15
+const OGE_STEP_COPY_OUT ulong 16
+const OGE_STEP_SCAN ulong 17
+const OGE_STEP_FREE ulong 18
+const OGE_STEP_CLOSE ulong 19
+const OGE_STEP_CLOCK_CHECK ulong 20
+const OGE_STEP_COUNT ulong 21
+
+const OGE_LAYOUT_VECTOR_1D ulong 0
+const OGE_FLAG_NO_C3 ulong 1
+
+const OGE_BUF_SCRATCH ulong 0
+const OGE_BUF_PROGRAM ulong 1
+const OGE_BUF_INPUT_A ulong 2
+const OGE_BUF_INPUT_B ulong 3
+const OGE_BUF_OUTPUT ulong 4
+const OGE_BUF_ROLE_COUNT ulong 5
+
+const OGE_BACKEND_NONE ulong 0
+const OGE_BACKEND_MOCK ulong 1
+const OGE_BACKEND_BLACKWELL ulong 2
+const OGE_BACKEND_INCOMPLETE ulong 3
+
+const OGE_SYNC_MARKER ulong 1
+const OGE_SYNC_MARKER2 ulong 2
+const OGE_SYNC_SEMAPHORE ulong 4
+
+note Job descriptor (ulong[12]):
+note   0: program_len, 1: layout, 2: element_count, 3: input_a_len, 4: input_b_len,
+note   5: output_len, 6: poison_count, 7: flags, 8: marker_ms, 9: release_ms,
+note   10: marker2_ms, 11: visibility_ms
+note Result record (ulong[16]):
+note   0: failure, 1: last_state, 2: failed_step, 3: wait, 4: wait_timeout_ms,
+note   5: waited_ms, 6: drv_rc, 7: sync_valid, 8: marker, 9: marker2,
+note   10: semaphore, 11: retained, 12: cleanup_failed, 13: n_outputs,
+note   14: output_unchanged_words, 15: err_no
+
+global oge_backend ulong 1
+global oge_blocked ulong 1
+global oge_clock_mode ulong 1
+global oge_clock_val ulong 1
+global oge_clock_step ulong 1
+global oge_last_res ulong 16
+
+note Mock backend controls for CPU-only host tests & fault injection
+global oge_mock_fail_step ulong 1
+global oge_mock_fail_rc ulong 1
+global oge_mock_fail_free_role ulong 1
+global oge_mock_fail_close ulong 1
+global oge_mock_leave_poison ulong 1
+global oge_mock_open_calls ulong 1
+global oge_mock_close_calls ulong 1
+global oge_mock_free_mask ulong 1
+global oge_mock_alloc_mask ulong 1
+global oge_mock_marker2_called ulong 1
+global oge_mock_poison_buf uint 4096
+global oge_mock_out_buf uint 4096
+global oge_mock_a_buf uint 4096
+global oge_mock_b_buf uint 4096
+
+note Engine job staging buffers (avoids >8 ABI regs on oge_execute)
+global oge_job_prog uchar 4096
+global oge_job_a uint 4096
+global oge_job_b uint 4096
+global oge_job_poison uint 4096
+global oge_job_out uint 4096
+
+text oge_fn_0 "OK"
+text oge_fn_1 "DEVICE_OPEN"
+text oge_fn_2 "CHANNEL_CREATE"
+text oge_fn_3 "ALLOC"
+text oge_fn_4 "PREPARE"
+text oge_fn_5 "SUBMIT"
+text oge_fn_6 "COMPLETION_WAIT"
+text oge_fn_7 "RELEASE_WAIT"
+text oge_fn_8 "VISIBILITY_WAIT"
+text oge_fn_9 "OUTPUT_UNCHANGED"
+text oge_fn_10 "INVALID_ARGS"
+text oge_fn_11 "INTERNAL_INVARIANT"
+text oge_fn_12 "CLEANUP"
+text oge_fn_13 "UNCERTAIN_COMPLETION_BLOCKED"
+text oge_fn_unk "UNKNOWN"
+
+text oge_sn_0 "INITIAL"
+text oge_sn_1 "PREPARED"
+text oge_sn_2 "SUBMITTED"
+text oge_sn_3 "GPU_COMPLETE"
+text oge_sn_4 "OUTPUT_VISIBLE"
+text oge_sn_5 "OUTPUT_PRODUCED"
+text oge_sn_6 "SUCCESS"
+
+text oge_wn_0 "NONE"
+text oge_wn_1 "MARKER"
+text oge_wn_2 "RELEASE_SEMAPHORE"
+text oge_wn_3 "MARKER2"
+
+text oge_stn_0 "NONE"
+text oge_stn_1 "VALIDATE"
+text oge_stn_2 "BACKEND_CHECK"
+text oge_stn_3 "BLOCKED"
+text oge_stn_4 "NOT_IMPLEMENTED"
+text oge_stn_5 "OPEN_DEVICE"
+text oge_stn_6 "CREATE_CHANNEL"
+text oge_stn_7 "ALLOC"
+text oge_stn_8 "COPY_IN"
+text oge_stn_9 "FILL_POISON"
+text oge_stn_10 "BUILD"
+text oge_stn_11 "SUBMIT"
+text oge_stn_12 "WAIT_MARKER"
+text oge_stn_13 "WAIT_MARKER2"
+text oge_stn_14 "WAIT_RELEASE_SEMAPHORE"
+text oge_stn_15 "BARRIER"
+text oge_stn_16 "COPY_OUT"
+text oge_stn_17 "SCAN"
+text oge_stn_18 "FREE"
+text oge_stn_19 "CLOSE"
+text oge_stn_20 "CLOCK_CHECK"
+
+fn oge_copy_str src view uchar * dst edit uchar * to ulong
+n = len src
+cap = len dst
+if gt n cap
+n = cap
+end
+for i ulong n
+put dst i get src i
+end
+ret n
+end
+
+fn oge_failure_name code ulong dst edit uchar * to ulong
+if eq code 0
+ret oge_copy_str oge_fn_0 dst
+end
+if eq code 1
+ret oge_copy_str oge_fn_1 dst
+end
+if eq code 2
+ret oge_copy_str oge_fn_2 dst
+end
+if eq code 3
+ret oge_copy_str oge_fn_3 dst
+end
+if eq code 4
+ret oge_copy_str oge_fn_4 dst
+end
+if eq code 5
+ret oge_copy_str oge_fn_5 dst
+end
+if eq code 6
+ret oge_copy_str oge_fn_6 dst
+end
+if eq code 7
+ret oge_copy_str oge_fn_7 dst
+end
+if eq code 8
+ret oge_copy_str oge_fn_8 dst
+end
+if eq code 9
+ret oge_copy_str oge_fn_9 dst
+end
+if eq code 10
+ret oge_copy_str oge_fn_10 dst
+end
+if eq code 11
+ret oge_copy_str oge_fn_11 dst
+end
+if eq code 12
+ret oge_copy_str oge_fn_12 dst
+end
+if eq code 13
+ret oge_copy_str oge_fn_13 dst
+end
+ret oge_copy_str oge_fn_unk dst
+end
+
+fn oge_state_name code ulong dst edit uchar * to ulong
+if eq code 0
+ret oge_copy_str oge_sn_0 dst
+end
+if eq code 1
+ret oge_copy_str oge_sn_1 dst
+end
+if eq code 2
+ret oge_copy_str oge_sn_2 dst
+end
+if eq code 3
+ret oge_copy_str oge_sn_3 dst
+end
+if eq code 4
+ret oge_copy_str oge_sn_4 dst
+end
+if eq code 5
+ret oge_copy_str oge_sn_5 dst
+end
+if eq code 6
+ret oge_copy_str oge_sn_6 dst
+end
+ret oge_copy_str oge_fn_unk dst
+end
+
+fn oge_wait_name code ulong dst edit uchar * to ulong
+if eq code 0
+ret oge_copy_str oge_wn_0 dst
+end
+if eq code 1
+ret oge_copy_str oge_wn_1 dst
+end
+if eq code 2
+ret oge_copy_str oge_wn_2 dst
+end
+if eq code 3
+ret oge_copy_str oge_wn_3 dst
+end
+ret oge_copy_str oge_fn_unk dst
+end
+
+fn oge_step_name code ulong dst edit uchar * to ulong
+if eq code 0
+ret oge_copy_str oge_stn_0 dst
+end
+if eq code 1
+ret oge_copy_str oge_stn_1 dst
+end
+if eq code 2
+ret oge_copy_str oge_stn_2 dst
+end
+if eq code 3
+ret oge_copy_str oge_stn_3 dst
+end
+if eq code 4
+ret oge_copy_str oge_stn_4 dst
+end
+if eq code 5
+ret oge_copy_str oge_stn_5 dst
+end
+if eq code 6
+ret oge_copy_str oge_stn_6 dst
+end
+if eq code 7
+ret oge_copy_str oge_stn_7 dst
+end
+if eq code 8
+ret oge_copy_str oge_stn_8 dst
+end
+if eq code 9
+ret oge_copy_str oge_stn_9 dst
+end
+if eq code 10
+ret oge_copy_str oge_stn_10 dst
+end
+if eq code 11
+ret oge_copy_str oge_stn_11 dst
+end
+if eq code 12
+ret oge_copy_str oge_stn_12 dst
+end
+if eq code 13
+ret oge_copy_str oge_stn_13 dst
+end
+if eq code 14
+ret oge_copy_str oge_stn_14 dst
+end
+if eq code 15
+ret oge_copy_str oge_stn_15 dst
+end
+if eq code 16
+ret oge_copy_str oge_stn_16 dst
+end
+if eq code 17
+ret oge_copy_str oge_stn_17 dst
+end
+if eq code 18
+ret oge_copy_str oge_stn_18 dst
+end
+if eq code 19
+ret oge_copy_str oge_stn_19 dst
+end
+if eq code 20
+ret oge_copy_str oge_stn_20 dst
+end
+ret oge_copy_str oge_fn_unk dst
+end
+
+fn oge_set_backend id ulong to void
+put oge_backend 0 id
+end
+
+fn oge_is_blocked to ulong
+if ne get oge_blocked 0 0
+ret 1
+end
+ret 0
+end
+
+fn oge_test_reset_block to void
+put oge_blocked 0 0
+end
+
+fn oge_test_force_block to void
+put oge_blocked 0 1
+end
+
+fn oge_set_clock mode ulong start_ms ulong step_ms ulong to void
+put oge_clock_mode 0 mode
+put oge_clock_val 0 start_ms
+put oge_clock_step 0 step_ms
+end
+
+fn oge_test_set_clock mode ulong start_ms ulong step_ms ulong to void
+oge_set_clock mode start_ms step_ms
+end
+
+fn oge_now_ms to ulong
+if ne get oge_clock_mode 0 0
+v = get oge_clock_val 0
+put oge_clock_val 0 add v get oge_clock_step 0
+ret v
+end
+ret div ulong monons 1000000
+end
+
+fn oge_mock_reset to void
+put oge_mock_fail_step 0 0
+put oge_mock_fail_rc 0 1
+put oge_mock_fail_free_role 0 99
+put oge_mock_fail_close 0 0
+put oge_mock_leave_poison 0 0
+put oge_mock_open_calls 0 0
+put oge_mock_close_calls 0 0
+put oge_mock_free_mask 0 0
+put oge_mock_alloc_mask 0 0
+put oge_mock_marker2_called 0 0
+end
+
+fn oge_job_valid job view ulong 12 to bool
+if eq get job 0 0
+ret false
+end
+if ne get job 1 OGE_LAYOUT_VECTOR_1D
+ret false
+end
+n = get job 2
+if eq n 0
+ret false
+end
+nbytes = mul n 4
+if ne get job 3 nbytes
+ret false
+end
+if ne get job 4 nbytes
+ret false
+end
+if ne get job 5 nbytes
+ret false
+end
+if ne get job 6 n
+ret false
+end
+if ne and get job 7 not OGE_FLAG_NO_C3 0
+ret false
+end
+if eq get job 8 0
+ret false
+end
+if eq get job 9 0
+ret false
+end
+if eq get job 11 0
+ret false
+end
+if eq and get job 7 OGE_FLAG_NO_C3 0
+if eq get job 10 0
+ret false
+end
+end
+ret true
+end
+
+fn oge_buf_bytes job view ulong 12 role ulong to ulong
+if eq role OGE_BUF_PROGRAM
+ret get job 0
+end
+if eq role OGE_BUF_INPUT_A
+ret get job 3
+end
+if eq role OGE_BUF_INPUT_B
+ret get job 4
+end
+if eq role OGE_BUF_OUTPUT
+ret get job 5
+end
+ret 0
+end
+
+fn oge_be_open to ulong
+b = get oge_backend 0
+if eq b OGE_BACKEND_MOCK
+put oge_mock_open_calls 0 add get oge_mock_open_calls 0 1
+if eq get oge_mock_fail_step 0 OGE_STEP_OPEN_DEVICE
+ret get oge_mock_fail_rc 0
+end
+ret 0
+end
+ret obwe_be_open
+end
+
+fn oge_be_channel to ulong
+b = get oge_backend 0
+if eq b OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_CREATE_CHANNEL
+ret get oge_mock_fail_rc 0
+end
+ret 0
+end
+ret obwe_be_channel
+end
+
+fn oge_be_alloc role ulong nbytes ulong to ulong
+b = get oge_backend 0
+if eq b OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_ALLOC
+ret get oge_mock_fail_rc 0
+end
+put oge_mock_alloc_mask 0 or get oge_mock_alloc_mask 0 shl ulong 1 role
+ret 0
+end
+ret obwe_be_alloc role nbytes
+end
+
+fn oge_be_copy_in plen ulong n ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_COPY_IN
+ret get oge_mock_fail_rc 0
+end
+for i ulong n
+put oge_mock_a_buf i get oge_job_a i
+put oge_mock_b_buf i get oge_job_b i
+end
+ret 0
+end
+ret obwe_be_copy_in plen n
+end
+
+fn oge_be_fill_poison n ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_FILL_POISON
+ret get oge_mock_fail_rc 0
+end
+for i ulong n
+put oge_mock_poison_buf i get oge_job_poison i
+put oge_mock_out_buf i get oge_job_poison i
+end
+ret 0
+end
+ret obwe_be_fill_poison n
+end
+
+fn oge_be_build n ulong flags ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_BUILD
+ret get oge_mock_fail_rc 0
+end
+ret 0
+end
+ret obwe_be_build n flags
+end
+
+fn oge_be_submit n ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_SUBMIT
+ret get oge_mock_fail_rc 0
+end
+if eq get oge_mock_leave_poison 0 0
+for i ulong n
+put oge_mock_out_buf i uint and add ulong get oge_mock_a_buf i ulong get oge_mock_b_buf i 0xffffffff
+end
+end
+ret 0
+end
+ret obwe_be_submit
+end
+
+fn oge_be_wait_marker ms ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_WAIT_MARKER
+ret get oge_mock_fail_rc 0
+end
+ret 0
+end
+ret obwe_be_wait_marker ms
+end
+
+fn oge_be_wait_marker2 ms ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+put oge_mock_marker2_called 0 1
+if eq get oge_mock_fail_step 0 OGE_STEP_WAIT_MARKER2
+ret get oge_mock_fail_rc 0
+end
+ret 0
+end
+ret obwe_be_wait_marker2 ms
+end
+
+fn oge_be_wait_sem ms ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_WAIT_RELEASE_SEMAPHORE
+ret get oge_mock_fail_rc 0
+end
+ret 0
+end
+ret obwe_be_wait_sem ms
+end
+
+fn oge_be_barrier ms ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_BARRIER
+ret get oge_mock_fail_rc 0
+end
+ret 0
+end
+ret obwe_be_barrier ms
+end
+
+fn oge_be_copy_out n ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+if eq get oge_mock_fail_step 0 OGE_STEP_COPY_OUT
+ret get oge_mock_fail_rc 0
+end
+for i ulong n
+put oge_job_out i get oge_mock_out_buf i
+end
+ret 0
+end
+ret obwe_be_copy_out n
+end
+
+fn oge_be_diag res edit ulong 16 to void
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+put res 6 get oge_mock_fail_rc 0
+ret
+end
+obwe_be_diag res
+end
+
+fn oge_be_free role ulong to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+put oge_mock_free_mask 0 or get oge_mock_free_mask 0 shl ulong 1 role
+if eq get oge_mock_fail_free_role 0 role
+ret 1
+end
+ret 0
+end
+ret obwe_be_free role
+end
+
+fn oge_be_close to ulong
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_MOCK
+put oge_mock_close_calls 0 add get oge_mock_close_calls 0 1
+if ne get oge_mock_fail_close 0 0
+ret 1
+end
+ret 0
+end
+ret obwe_be_close
+end
+
+fn oge_fail res edit ulong 16 failure ulong step ulong to ulong
+oge_be_diag res
+put res 0 failure
+put res 2 step
+ret failure
+end
+
+fn oge_cleanup_fault res edit ulong 16 step ulong to void
+if eq get res 0 OGE_OK
+ign = oge_fail res OGE_CLEANUP step
+end
+put res 12 1
+end
+
+fn oge_leave opened ulong alloc_mask ulong res edit ulong 16 to ulong
+i = ulong OGE_BUF_ROLE_COUNT
+while gt i 0 bound 8
+i = sub i 1
+if ne and alloc_mask shl ulong 1 i 0
+rc = oge_be_free i
+if ne rc 0
+oge_cleanup_fault res OGE_STEP_FREE
+end
+end
+end
+if ne opened 0
+rc = oge_be_close
+if ne rc 0
+oge_cleanup_fault res OGE_STEP_CLOSE
+end
+end
+for k ulong 16
+put oge_last_res k get res k
+end
+ret get res 0
+end
+
+fn oge_uncertain res edit ulong 16 failure ulong step ulong wait_k ulong limit_ms ulong waited_ms ulong to ulong
+ign = oge_fail res failure step
+put res 3 wait_k
+put res 4 limit_ms
+put res 5 waited_ms
+put res 11 1
+put oge_blocked 0 1
+ret failure
+end
+
+fn oge_wait_phase job view ulong 12 res edit ulong 16 to ulong
+t0 = oge_now_ms
+rc = oge_be_wait_marker get job 8
+t1 = oge_now_ms
+w = ulong 0
+if ge t1 t0
+w = sub t1 t0
+end
+if ne rc 0
+ret oge_uncertain res OGE_COMPLETION_WAIT OGE_STEP_WAIT_MARKER OGE_WAIT_MARKER get job 8 w
+end
+if eq and get job 7 OGE_FLAG_NO_C3 0
+t0 = oge_now_ms
+rc = oge_be_wait_marker2 get job 10
+t1 = oge_now_ms
+w = ulong 0
+if ge t1 t0
+w = sub t1 t0
+end
+if ne rc 0
+ret oge_uncertain res OGE_COMPLETION_WAIT OGE_STEP_WAIT_MARKER2 OGE_WAIT_MARKER2 get job 10 w
+end
+end
+t0 = oge_now_ms
+rc = oge_be_wait_sem get job 9
+t1 = oge_now_ms
+w = ulong 0
+if ge t1 t0
+w = sub t1 t0
+end
+if ne rc 0
+ret oge_uncertain res OGE_RELEASE_WAIT OGE_STEP_WAIT_RELEASE_SEMAPHORE OGE_WAIT_RELEASE_SEMAPHORE get job 9 w
+end
+ret OGE_OK
+end
+
+fn oge_scan_poison n ulong to ulong
+unchanged = ulong 0
+for i ulong n
+if eq get oge_job_out i get oge_job_poison i
+unchanged = add unchanged 1
+end
+end
+ret unchanged
+end
+
+fn oge_execute job view ulong 12 res edit ulong 16 to ulong
+for i ulong 16
+put res i 0
+end
+if ne oge_is_blocked 0
+put res 0 OGE_UNCERTAIN_COMPLETION_BLOCKED
+put res 2 OGE_STEP_BLOCKED
+ret OGE_UNCERTAIN_COMPLETION_BLOCKED
+end
+if not oge_job_valid job
+put res 0 OGE_INVALID_ARGS
+put res 2 OGE_STEP_VALIDATE
+ret OGE_INVALID_ARGS
+end
+bk = get oge_backend 0
+if eq bk OGE_BACKEND_NONE
+put res 0 OGE_INTERNAL_INVARIANT
+put res 2 OGE_STEP_NOT_IMPLEMENTED
+ret OGE_INTERNAL_INVARIANT
+end
+if eq bk OGE_BACKEND_INCOMPLETE
+put res 0 OGE_INTERNAL_INVARIANT
+put res 2 OGE_STEP_BACKEND_CHECK
+ret OGE_INTERNAL_INVARIANT
+end
+opened = ulong 0
+alloc_mask = ulong 0
+if ne oge_be_open 0
+ign = oge_fail res OGE_DEVICE_OPEN OGE_STEP_OPEN_DEVICE
+ret oge_leave opened alloc_mask res
+end
+opened = ulong 1
+if ne oge_be_channel 0
+ign = oge_fail res OGE_CHANNEL_CREATE OGE_STEP_CREATE_CHANNEL
+ret oge_leave opened alloc_mask res
+end
+for role ulong OGE_BUF_ROLE_COUNT
+if ne oge_be_alloc role oge_buf_bytes job role 0
+ign = oge_fail res OGE_ALLOC OGE_STEP_ALLOC
+ret oge_leave opened alloc_mask res
+end
+alloc_mask = or alloc_mask shl ulong 1 role
+end
+if ne oge_be_copy_in get job 0 get job 2 0
+ign = oge_fail res OGE_PREPARE OGE_STEP_COPY_IN
+ret oge_leave opened alloc_mask res
+end
+if ne oge_be_fill_poison get job 2 0
+ign = oge_fail res OGE_PREPARE OGE_STEP_FILL_POISON
+ret oge_leave opened alloc_mask res
+end
+if ne oge_be_build get job 2 get job 7 0
+ign = oge_fail res OGE_PREPARE OGE_STEP_BUILD
+ret oge_leave opened alloc_mask res
+end
+put res 1 OGE_STATE_PREPARED
+if ne oge_be_submit get job 2 0
+ign = oge_fail res OGE_SUBMIT OGE_STEP_SUBMIT
+ret oge_leave opened alloc_mask res
+end
+put res 1 OGE_STATE_SUBMITTED
+rc = oge_wait_phase job res
+if ne rc OGE_OK
+ret rc
+end
+put res 1 OGE_STATE_GPU_COMPLETE
+if ne oge_be_barrier get job 11 0
+ign = oge_fail res OGE_VISIBILITY_WAIT OGE_STEP_BARRIER
+ret oge_leave opened alloc_mask res
+end
+if ne oge_be_copy_out get job 2 0
+ign = oge_fail res OGE_VISIBILITY_WAIT OGE_STEP_COPY_OUT
+ret oge_leave opened alloc_mask res
+end
+put res 1 OGE_STATE_OUTPUT_VISIBLE
+unchanged = oge_scan_poison get job 2
+put res 13 1
+put res 14 unchanged
+if ne unchanged 0
+ign = oge_fail res OGE_OUTPUT_UNCHANGED OGE_STEP_SCAN
+ret oge_leave opened alloc_mask res
+end
+put res 1 OGE_STATE_OUTPUT_PRODUCED
+rc = oge_leave opened alloc_mask res
+if eq rc OGE_OK
+put res 1 OGE_STATE_SUCCESS
+end
+ret rc
+end

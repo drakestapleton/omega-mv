@@ -1,0 +1,513 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_gpu_platform_linux.om: Pure seeded OM-2 twin of src/omega_gpu_platform_linux.c.
+note Linux NVRM reference implementation of OmegaGpuPlatform 1.2 backed directly by
+note gpu/nvidia/native/nvrm/context.om (zero CUDA, zero libc) with a mock mode for CPU-only host tests.
+om2
+
+const OGPL_MAX_EXTRA_CHANNELS ulong 3
+const OGPL_REF_BUFFERS ulong 4094
+const OGPL_L2_INVAL_WORDS ulong 5
+const OGPL_MAX_BYTES ulong 137438953472
+
+text ogpl_env_channels "AIEN_OMEGA_GPU_CHANNELS="
+
+note Platform state
+global ogpl_mock ulong 1
+global ogpl_ready ulong 1
+global ogpl_dev_idx ulong 1
+global ogpl_dev_gen ulong 1
+global ogpl_q_idx ulong 1
+global ogpl_q_gen ulong 1
+global ogpl_q_ring_idx ulong 1
+global ogpl_l2_pending ulong 1
+global ogpl_nchan ulong 1
+global ogpl_mock_va ulong 1
+global ogpl_submit_count ulong 1
+global ogpl_last_submit_words ulong 1
+global ogpl_last_had_l2_prefix ulong 1
+
+note Per-slot buffer metadata (mirrors LinuxRef.mem/rights/gpu_cached)
+global ogpl_map long 4096
+global ogpl_va ulong 4096
+global ogpl_size ulong 4096
+global ogpl_rights uint 4096
+global ogpl_cached uchar 4096
+
+fn ogpl_set_mock enable ulong to void
+put ogpl_mock 0 enable
+end
+
+fn ogpl_reset_state to void
+ogp_handles_init
+put ogpl_ready 0 1
+put ogpl_dev_idx 0 0
+put ogpl_dev_gen 0 0
+put ogpl_q_idx 0 0
+put ogpl_q_gen 0 0
+put ogpl_q_ring_idx 0 0
+put ogpl_l2_pending 0 0
+put ogpl_nchan 0 0
+put ogpl_mock_va 0 0x10000000
+put ogpl_submit_count 0 0
+put ogpl_last_submit_words 0 0
+put ogpl_last_had_l2_prefix 0 0
+for i ulong 4096
+put ogpl_map i 0
+put ogpl_va i 0
+put ogpl_size i 0
+put ogpl_rights i 0
+put ogpl_cached i 0
+end
+end
+
+fn ogpl_ensure_ready to void
+if eq get ogpl_ready 0 0
+ogpl_reset_state
+end
+end
+
+fn ogpl_channels_env to ulong
+cntl = envcnt
+cnt = ulong cntl
+buf = new uchar 256 0
+plen = len ogpl_env_channels
+for i ulong cnt
+nl = envread i buf 0 256
+if gt nl long plen
+n = ulong nl
+match = true
+for j ulong plen
+if ne get buf j get ogpl_env_channels j
+match = false
+end
+end
+if match
+if eq n add plen 1
+ch = ulong get buf plen
+if and ge ch 50 le ch add 49 OGPL_MAX_EXTRA_CHANNELS
+ret sub ch 48
+end
+end
+ret 1
+end
+end
+end
+ret 1
+end
+
+fn ogpl_caps caps edit ulong 10 to void
+put caps 0 OGP_ABI_MAJOR
+put caps 1 OGP_ABI_MINOR
+put caps 2 OGP_SVC_REQUIRED_SESSION
+put caps 3 1
+put caps 4 OGPL_REF_BUFFERS
+put caps 5 add 1 OGPL_MAX_EXTRA_CHANNELS
+put caps 6 1
+put caps 7 OGPL_MAX_BYTES
+put caps 8 OGPL_MAX_BYTES
+put caps 9 OGPL_L2_INVAL_WORDS
+end
+
+fn ogpl_fnmask mask edit ulong 12 to void
+put mask 0 3
+put mask 1 3
+put mask 2 3
+put mask 3 0
+put mask 4 3
+put mask 5 3
+put mask 6 3
+put mask 7 0
+put mask 8 3
+put mask 9 3
+put mask 10 3
+put mask 11 3
+end
+
+fn ogpl_buf_ok idx ulong gen ulong kind_out edit ulong 1 to ulong
+if or ge idx OGP_HANDLE_SLOTS eq gen 0
+ret OGP_REFUSED_BAD_HANDLE
+end
+if or eq get ogp_ht_live idx 0 ne ulong get ogp_ht_gen idx gen
+ret OGP_REFUSED_STALE_HANDLE
+end
+k = ulong get ogp_ht_kind idx
+ok = false
+if eq k OGP_HANDLE_BUF_DATA
+ok = true
+end
+if eq k OGP_HANDLE_BUF_CODE
+ok = true
+end
+if eq k OGP_HANDLE_BUF_QUEUE
+ok = true
+end
+if not ok
+ret OGP_REFUSED_BAD_HANDLE
+end
+put kind_out 0 k
+ret OGP_OK
+end
+
+fn ogpl_range_ok idx ulong off ulong nlen ulong to ulong
+sz = get ogpl_size idx
+if eq nlen 0
+ret OGP_REFUSED_BAD_LENGTH
+end
+if gt off sz
+ret OGP_REFUSED_BAD_LENGTH
+end
+if gt nlen sub sz off
+ret OGP_REFUSED_BAD_LENGTH
+end
+ret OGP_OK
+end
+
+fn ogpl_device_open ordinal ulong dev_out edit ulong 2 to ulong
+ogpl_ensure_ready
+put dev_out 0 0
+put dev_out 1 0
+if ne ordinal 0
+ret OGP_REFUSED_ARGS
+end
+if ne get ogpl_dev_gen 0 0
+ret OGP_REFUSED_LIMIT
+end
+if eq get ogpl_mock 0 0
+if not nvfull
+ign = nvstop
+ret OGP_REFUSED_DEVICE
+end
+if not nvchan
+ign = nvstop
+ret OGP_REFUSED_DEVICE
+end
+end
+put ogpl_nchan 0 ogpl_channels_env
+rc = ogp_handles_open OGP_HANDLE_DEVICE 0 1 0 dev_out
+if ne rc OGP_OK
+if eq get ogpl_mock 0 0
+ign = nvstop
+end
+ret rc
+end
+put ogpl_dev_idx 0 get dev_out 0
+put ogpl_dev_gen 0 get dev_out 1
+ret OGP_OK
+end
+
+fn ogpl_device_close dev_idx ulong dev_gen ulong to ulong
+ogpl_ensure_ready
+rc = ogp_handles_check dev_idx dev_gen OGP_HANDLE_DEVICE
+if ne rc OGP_OK
+ret rc
+end
+for i ulong OGP_HANDLE_SLOTS
+if and ne get ogp_ht_live i 0 ne i dev_idx
+ign = ogp_handles_close i ulong get ogp_ht_gen i ulong get ogp_ht_kind i
+put ogpl_map i 0
+put ogpl_va i 0
+put ogpl_size i 0
+put ogpl_rights i 0
+put ogpl_cached i 0
+end
+end
+ign2 = ogp_handles_close dev_idx dev_gen OGP_HANDLE_DEVICE
+put ogpl_dev_idx 0 0
+put ogpl_dev_gen 0 0
+put ogpl_q_idx 0 0
+put ogpl_q_gen 0 0
+put ogpl_q_ring_idx 0 0
+put ogpl_l2_pending 0 0
+put ogpl_nchan 0 0
+if eq get ogpl_mock 0 0
+if not nvstop
+ret OGP_REFUSED_DEVICE
+end
+end
+ret OGP_OK
+end
+
+fn ogpl_dma_check dev_idx ulong dev_gen ulong desc view ulong 5 to ulong
+rc = ogp_handles_check dev_idx dev_gen OGP_HANDLE_DEVICE
+if ne rc OGP_OK
+ret rc
+end
+caps = new ulong 10 0
+ogpl_caps caps
+rc = ogp_check_buffer desc caps
+if ne rc OGP_OK
+ret rc
+end
+if eq get desc 2 OGP_CACHE_GPU_CACHED
+if ne get desc 0 OGP_HANDLE_BUF_DATA
+ret OGP_REFUSED_CACHE_POLICY
+end
+if ne and get desc 1 or OGP_RIGHT_CPU_READ OGP_RIGHT_HOST_POLLED 0
+ret OGP_REFUSED_CACHE_POLICY
+end
+end
+ret OGP_OK
+end
+
+fn ogpl_mock_bump sz ulong to ulong
+va = get ogpl_mock_va 0
+step = and add sz 4095 not ulong 4095
+if lt step 4096
+step = ulong 4096
+end
+put ogpl_mock_va 0 add va step
+ret va
+end
+
+fn ogpl_dma_alloc dev_idx ulong dev_gen ulong desc view ulong 5 h_out edit ulong 2 info_out edit ulong 3 to ulong
+ogpl_ensure_ready
+put h_out 0 0
+put h_out 1 0
+put info_out 0 0
+put info_out 1 0
+put info_out 2 0
+rc = ogpl_dma_check dev_idx dev_gen desc
+if ne rc OGP_OK
+ret rc
+end
+rc = ogp_handles_open get desc 0 get desc 4 OGPL_REF_BUFFERS OGPL_MAX_BYTES h_out
+if ne rc OGP_OK
+ret rc
+end
+idx = get h_out 0
+sz = get desc 4
+cached = eq get desc 2 OGP_CACHE_GPU_CACHED
+m = long 0
+va = ulong 0
+if eq get ogpl_mock 0 0
+m = nvalloc sz cached
+if le m 0
+ign = ogp_handles_close idx get h_out 1 get desc 0
+put h_out 0 0
+put h_out 1 0
+ret OGP_REFUSED_DEVICE
+end
+va = mapaddr m
+else
+m = long add idx 1
+va = ogpl_mock_bump sz
+end
+put ogpl_map idx m
+put ogpl_va idx va
+put ogpl_size idx sz
+put ogpl_rights idx uint get desc 1
+if cached
+put ogpl_cached idx 1
+else
+put ogpl_cached idx 0
+end
+put info_out 0 ulong m
+put info_out 1 va
+put info_out 2 sz
+ret OGP_OK
+end
+
+fn ogpl_dma_free b_idx ulong b_gen ulong to ulong
+ogpl_ensure_ready
+kout = new ulong 1 0
+rc = ogpl_buf_ok b_idx b_gen kout
+if ne rc OGP_OK
+ret rc
+end
+if ne get ogpl_q_gen 0 0
+if eq get ogpl_q_ring_idx 0 b_idx
+ret OGP_REFUSED_BUSY
+end
+end
+if eq get ogpl_mock 0 0
+ign = nvdrop get ogpl_map b_idx
+end
+ign2 = ogp_handles_close b_idx b_gen get kout 0
+put ogpl_map b_idx 0
+put ogpl_va b_idx 0
+put ogpl_size b_idx 0
+put ogpl_rights b_idx 0
+put ogpl_cached b_idx 0
+ret OGP_OK
+end
+
+fn ogpl_sync_to_gpu b_idx ulong b_gen ulong off ulong nlen ulong to ulong
+ogpl_ensure_ready
+kout = new ulong 1 0
+rc = ogpl_buf_ok b_idx b_gen kout
+if ne rc OGP_OK
+ret rc
+end
+rc = ogpl_range_ok b_idx off nlen
+if ne rc OGP_OK
+ret rc
+end
+if ne get ogpl_cached b_idx 0
+put ogpl_l2_pending 0 1
+end
+cpufence
+ret OGP_OK
+end
+
+fn ogpl_sync_to_cpu b_idx ulong b_gen ulong off ulong nlen ulong to ulong
+ogpl_ensure_ready
+kout = new ulong 1 0
+rc = ogpl_buf_ok b_idx b_gen kout
+if ne rc OGP_OK
+ret rc
+end
+rc = ogpl_range_ok b_idx off nlen
+if ne rc OGP_OK
+ret rc
+end
+cpufence
+ret OGP_OK
+end
+
+fn ogpl_queue_open dev_idx ulong dev_gen ulong ring_idx ulong ring_gen ulong q_out edit ulong 2 to ulong
+ogpl_ensure_ready
+put q_out 0 0
+put q_out 1 0
+rc = ogp_handles_check dev_idx dev_gen OGP_HANDLE_DEVICE
+if ne rc OGP_OK
+ret rc
+end
+kout = new ulong 1 0
+rc = ogpl_buf_ok ring_idx ring_gen kout
+if ne rc OGP_OK
+ret rc
+end
+if ne get kout 0 OGP_HANDLE_BUF_QUEUE
+ret OGP_REFUSED_BAD_KIND
+end
+if ne get ogpl_q_gen 0 0
+ret OGP_REFUSED_LIMIT
+end
+rc = ogp_handles_open OGP_HANDLE_QUEUE 0 1 0 q_out
+if ne rc OGP_OK
+ret rc
+end
+put ogpl_q_idx 0 get q_out 0
+put ogpl_q_gen 0 get q_out 1
+put ogpl_q_ring_idx 0 ring_idx
+ret OGP_OK
+end
+
+fn ogpl_queue_close q_idx ulong q_gen ulong to ulong
+ogpl_ensure_ready
+rc = ogp_handles_check q_idx q_gen OGP_HANDLE_QUEUE
+if ne rc OGP_OK
+ret rc
+end
+rc = ogp_handles_close q_idx q_gen OGP_HANDLE_QUEUE
+if ne rc OGP_OK
+ret rc
+end
+put ogpl_q_idx 0 0
+put ogpl_q_gen 0 0
+put ogpl_q_ring_idx 0 0
+ret OGP_OK
+end
+
+fn ogpl_put_u32 dst edit uchar * off ulong v uint to void
+put dst off uchar and v 255
+put dst add off 1 uchar and shr v 8 255
+put dst add off 2 uchar and shr v 16 255
+put dst add off 3 uchar and shr v 24 255
+end
+
+fn ogpl_submit_live ridx ulong pre ulong words view uint * nwords ulong to ulong
+pb = new uchar 65536 0
+total_words = add nwords pre
+if gt mul total_words 4 65536
+ret OGP_REFUSED_BAD_LENGTH
+end
+pos = ulong 0
+if ne pre 0
+note omega #457: MEM_OP_A..D = 0,0,0, L2_SYSMEM_NCOH_INVALIDATE (0x11 << 27)
+ogpl_put_u32 pb 0 0x2004000a
+ogpl_put_u32 pb 4 0
+ogpl_put_u32 pb 8 0
+ogpl_put_u32 pb 12 0
+ogpl_put_u32 pb 16 0x88000000
+pos = ulong 20
+end
+for i ulong nwords
+ogpl_put_u32 pb pos get words i
+pos = add pos 4
+end
+rm = get ogpl_map ridx
+wr = mapwrite rm 0 pb 0 pos
+if ne wr long pos
+ret OGP_REFUSED_DEVICE
+end
+cpufence
+if not nvsend rm 0 uint total_words
+ret OGP_REFUSED_DEVICE
+end
+ret OGP_OK
+end
+
+fn ogpl_queue_submit q_idx ulong q_gen ulong words view uint * nwords ulong to ulong
+ogpl_ensure_ready
+rc = ogp_handles_check q_idx q_gen OGP_HANDLE_QUEUE
+if ne rc OGP_OK
+ret rc
+end
+if eq nwords 0
+ret OGP_REFUSED_ARGS
+end
+pre = ulong 0
+if ne get ogpl_l2_pending 0 0
+pre = OGPL_L2_INVAL_WORDS
+end
+ridx = get ogpl_q_ring_idx 0
+total_words = add nwords pre
+if gt mul total_words 4 get ogpl_size ridx
+ret OGP_REFUSED_BAD_LENGTH
+end
+if eq get ogpl_mock 0 0
+rc = ogpl_submit_live ridx pre words nwords
+if ne rc OGP_OK
+ret rc
+end
+end
+put ogpl_last_had_l2_prefix 0 pre
+put ogpl_last_submit_words 0 total_words
+put ogpl_submit_count 0 add get ogpl_submit_count 0 1
+if ne pre 0
+put ogpl_l2_pending 0 0
+end
+ret OGP_OK
+end
+
+fn ogpl_poll_word b_idx ulong b_gen ulong off ulong expected uint timeout_ms ulong obs edit uint 1 to ulong
+ogpl_ensure_ready
+kout = new ulong 1 0
+rc = ogpl_buf_ok b_idx b_gen kout
+if ne rc OGP_OK
+ret rc
+end
+if eq and ulong get ogpl_rights b_idx OGP_RIGHT_HOST_POLLED 0
+ret OGP_REFUSED_BAD_RIGHTS
+end
+if ne and off 3 0
+ret OGP_REFUSED_ARGS
+end
+rc = ogpl_range_ok b_idx off 4
+if ne rc OGP_OK
+ret rc
+end
+if eq get ogpl_mock 0 0
+rm = get ogpl_map b_idx
+ok = nvwait rm off expected mul timeout_ms 1000000
+v = uint mapget rm off 4
+put obs 0 v
+if ok
+ret OGP_OK
+end
+ret OGP_POLL_TIMED_OUT
+end
+put obs 0 expected
+ret OGP_OK
+end

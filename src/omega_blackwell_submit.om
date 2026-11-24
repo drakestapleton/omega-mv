@@ -1,0 +1,239 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_blackwell_submit.om: Pure seeded OM-2 twin of src/omega_blackwell_submit.c.
+note Routes vector execution through omega_gpu_engine.om + omega_blackwell_engine.om
+note with SM121 vecadd machine code (om/gpu/bw_vecadd.om), bit-complement poison,
+note modular 32-bit semantic oracle, and pure OM-2 zero-CUDA /proc/self verification.
+om2
+
+text obws_proc_maps "/proc/self/maps"
+text obws_proc_exe "/proc/self/exe"
+text obws_needle_cuda "libcuda"
+
+fn obws_contains_needle buf view uchar * n ulong needle view uchar * to bool
+nl = len needle
+if or eq nl 0 lt n nl
+ret false
+end
+lim = add sub n nl 1
+for i ulong lim
+ok = true
+for j ulong nl
+if ne get buf add i j get needle j
+ok = false
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+note Verify /proc/self/maps has zero libcuda / libcudart regions (returns 0 on clean, 1 on found/error).
+fn obws_verify_zero_libcuda_runtime to ulong
+fdl = fopen obws_proc_maps 0 len obws_proc_maps 0 0
+if lt fdl 0
+ret 1
+end
+fd = int fdl
+buf = new uchar 4096 0
+found = false
+iters = ulong 0
+while lt iters 256 bound 256
+r = read fd buf 0 4096
+if le r 0
+iters = ulong 256
+else
+if obws_contains_needle buf ulong r obws_needle_cuda
+found = true
+iters = ulong 256
+end
+iters = add iters 1
+end
+end
+ign = fclose fd
+if found
+ret 1
+end
+ret 0
+end
+
+fn obws_scan_phdrs pbuf view uchar 1792 phnum ulong to ulong
+for i ulong phnum
+off = mul i 56
+b0 = ulong get pbuf off
+b1 = shl ulong get pbuf add off 1 8
+b2 = shl ulong get pbuf add off 2 16
+b3 = shl ulong get pbuf add off 3 24
+ptype = or or b0 b1 or b2 b3
+if or eq ptype 2 eq ptype 3
+ret 1
+end
+end
+ret 0
+end
+
+note Verify /proc/self/exe is a static ELF with zero PT_INTERP / PT_DYNAMIC (zero libcuda linkage).
+fn obws_verify_zero_libcuda_linkage to ulong
+fdl = fopen obws_proc_exe 0 len obws_proc_exe 0 0
+if lt fdl 0
+ret 1
+end
+fd = int fdl
+hdr = new uchar 64 0
+r = read fd hdr 0 64
+if lt r 64
+ign = fclose fd
+ret 1
+end
+if ne get hdr 0 127
+ign = fclose fd
+ret 1
+end
+if ne get hdr 1 69
+ign = fclose fd
+ret 1
+end
+if ne get hdr 2 76
+ign = fclose fd
+ret 1
+end
+if ne get hdr 3 70
+ign = fclose fd
+ret 1
+end
+phnum = add ulong get hdr 56 shl ulong get hdr 57 8
+phent = add ulong get hdr 54 shl ulong get hdr 55 8
+if or ne phent 56 gt phnum 32
+ign = fclose fd
+ret 1
+end
+pbuf = new uchar 1792 0
+need = mul phnum 56
+r2 = read fd pbuf 0 need
+ign = fclose fd
+if lt r2 long need
+ret 1
+end
+ret obws_scan_phdrs pbuf phnum
+end
+
+note Static pure OM-2 ELF has zero undefined external symbols (no cu* / cuda*).
+fn obws_verify_zero_cuda_symbols to ulong
+ret obws_verify_zero_libcuda_linkage
+end
+
+fn obws_run_vec_job clen ulong n ulong to ulong
+job = new ulong 12 0
+put job 0 clen
+put job 1 OGE_LAYOUT_VECTOR_1D
+put job 2 n
+put job 3 mul n 4
+put job 4 mul n 4
+put job 5 mul n 4
+put job 6 n
+put job 7 0
+put job 8 5000
+put job 9 5000
+put job 10 5000
+put job 11 5000
+res = new ulong 16 0
+oge_set_backend obwe_backend
+ret oge_execute job res
+end
+
+fn obws_stage_vecadd to ulong
+code = new uchar 512 0
+clen = bw_encode_vecadd code
+for i ulong clen
+put oge_job_prog i get code i
+end
+ret clen
+end
+
+fn obws_verify_vec n ulong dst edit uint 1024 to ulong
+mismatches = ulong 0
+for i ulong n
+v = get oge_job_out i
+put dst i v
+va = ulong get oge_job_a i
+vb = ulong get oge_job_b i
+s = and add va vb 0xffffffff
+if ne v uint s
+mismatches = add mismatches 1
+end
+end
+ret mismatches
+end
+
+fn obws_stage_ab n ulong a view uint 1024 b view uint 1024 to void
+for i ulong n
+va = get a i
+vb = get b i
+put oge_job_a i va
+put oge_job_b i vb
+s = and add ulong va ulong vb 0xffffffff
+put oge_job_poison i xor uint s 0xffffffff
+put oge_job_out i 0
+end
+end
+
+fn obws_check_and_fill exec_info edit ulong 10 to ulong
+info = new ulong 5 0
+obwe_run_info info
+if ne get info 2 ulong OBWE_MARKER1_PAYLOAD
+ret 3
+end
+if ne get info 3 ulong OBWE_MARKER2_PAYLOAD
+ret 4
+end
+if ne get info 4 ulong OBWE_SEM_DONE
+ret 5
+end
+put exec_info 1 get info 0
+put exec_info 2 get info 1
+if gt get info 1 get info 0
+put exec_info 3 sub get info 1 get info 0
+end
+put exec_info 4 get info 2
+put exec_info 5 get info 3
+put exec_info 6 get info 4
+ret 0
+end
+
+note ExecInfo layout (ulong[10]):
+note   0: element_count, 1: launch_ns, 2: completion_ns, 3: elapsed_ns,
+note   4: marker, 5: marker2, 6: semaphore, 7: parity_verified,
+note   8: zero_libcuda_linkage, 9: zero_libcuda_runtime
+fn obws_execute_vector n ulong a view uint 1024 b view uint 1024 dst edit uint 1024 exec_info edit ulong 10 to ulong
+for i ulong 10
+put exec_info i 0
+end
+if or eq n 0 gt n 1024
+ret 1
+end
+put exec_info 0 n
+if eq obws_verify_zero_libcuda_linkage 0
+put exec_info 8 1
+end
+if eq obws_verify_zero_libcuda_runtime 0
+put exec_info 9 1
+end
+clen = obws_stage_vecadd
+if eq clen 0
+ret 1
+end
+obws_stage_ab n a b
+if ne obws_run_vec_job clen n OGE_OK
+ret 2
+end
+rc = obws_check_and_fill exec_info
+if ne rc 0
+ret rc
+end
+if eq obws_verify_vec n dst 0
+put exec_info 7 1
+ret 0
+end
+ret 6
+end

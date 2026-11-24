@@ -1,0 +1,458 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/test_gb10_gpu_1_host.om: CPU-only structural, API, state-machine, and
+note negative-control verification for wave gb10-gpu-1 (zero /dev/nvidia* access).
+om2
+
+text h_pass "PASS test-gb10-gpu-1-host (platform + platform_linux + mem_cached + gpu_engine + blackwell_engine + blackwell_submit zero-CUDA)\n"
+text h_fail "FAIL test-gb10-gpu-1-host code="
+text h_nl "\n"
+
+fn h_print s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn h_print_u x ulong to void
+b = new uchar 24 0
+pos = ulong 24
+v = x
+while true
+pos = sub pos 1
+put b pos uchar add 48 rem v 10
+v = div v 10
+if eq v 0
+r = write 1 b pos sub 24 pos
+ret
+end
+end
+end
+
+fn test_platform_contract to ulong
+prov = new ulong 10 0
+req = new ulong 10 0
+ogpl_caps prov
+ogpl_caps req
+if ne ogp_negotiate prov req OGP_OK
+ret 1
+end
+note Negative control: ABI major mismatch
+put req 0 2
+if ne ogp_negotiate prov req OGP_REFUSED_ABI
+ret 2
+end
+put req 0 1
+note Negative control: required minor newer than provided
+put req 1 3
+if ne ogp_negotiate prov req OGP_REFUSED_ABI
+ret 3
+end
+put req 1 2
+note Negative control: missing service (IRQ not provided by Linux ref)
+put req 2 or get req 2 OGP_SVC_IRQ
+if ne ogp_negotiate prov req OGP_REFUSED_MISSING_SERVICE
+ret 4
+end
+put req 2 get prov 2
+note Negative control: limit exceeded
+put req 3 2
+if ne ogp_negotiate prov req OGP_REFUSED_LIMIT
+ret 5
+end
+put req 3 1
+
+note Platform fnmask check for session services
+fmask = new ulong 12 0
+ogpl_fnmask fmask
+if ne ogp_check_for fmask prov OGP_SVC_REQUIRED_SESSION OGP_OK
+ret 6
+end
+note Missing V1 MMIO must fail ogp_check (V1 requires MMIO)
+if ne ogp_check fmask prov OGP_REFUSED_MISSING_SERVICE
+ret 7
+end
+note Undeclared function pointer in unclaimed service must fail ARGS
+put fmask 3 2
+if ne ogp_check_for fmask prov OGP_SVC_REQUIRED_SESSION OGP_REFUSED_ARGS
+ret 8
+end
+put fmask 3 0
+note Claimed service with NULL function must fail NULL_SERVICE
+put fmask 4 0
+if ne ogp_check_for fmask prov OGP_SVC_REQUIRED_SESSION OGP_REFUSED_NULL_SERVICE
+ret 9
+end
+put fmask 4 3
+
+note Buffer descriptor checks
+d = new ulong 5 0
+put d 0 OGP_HANDLE_BUF_DATA
+put d 1 or OGP_RIGHT_CPU_READ or OGP_RIGHT_GPU_WRITE OGP_RIGHT_HOST_POLLED
+put d 2 OGP_CACHE_GPU_UNCACHED
+put d 3 4096
+put d 4 4096
+if ne ogp_check_buffer d prov OGP_OK
+ret 10
+end
+note Negative control: HOST_POLLED + GPU_CACHED must be refused
+put d 2 OGP_CACHE_GPU_CACHED
+if ne ogp_check_buffer d prov OGP_REFUSED_CACHE_POLICY
+ret 11
+end
+note Negative control: non-power-of-two align
+put d 2 OGP_CACHE_GPU_UNCACHED
+put d 3 3000
+if ne ogp_check_buffer d prov OGP_REFUSED_ARGS
+ret 12
+end
+note Negative control: zero length
+put d 3 4096
+put d 4 0
+if ne ogp_check_buffer d prov OGP_REFUSED_BAD_LENGTH
+ret 13
+end
+note Negative control: GPU_EXEC on DATA buffer
+put d 4 4096
+put d 1 OGP_RIGHT_GPU_EXEC
+if ne ogp_check_buffer d prov OGP_REFUSED_BAD_RIGHTS
+ret 14
+end
+note CODE buffer valid
+put d 0 OGP_HANDLE_BUF_CODE
+put d 1 or OGP_RIGHT_CPU_WRITE OGP_RIGHT_GPU_EXEC
+if ne ogp_check_buffer d prov OGP_OK
+ret 15
+end
+note Refusal name check
+nbuf = new uchar 32 0
+if ne ogp_refusal_name OGP_OK nbuf 2
+ret 16
+end
+if ne ogp_refusal_name 99 nbuf 7
+ret 17
+end
+ret 0
+end
+
+fn test_handle_table to ulong
+ogp_handles_init
+h1 = new ulong 2 0
+if ne ogp_handles_open OGP_HANDLE_BUF_DATA 4096 2 8192 h1 OGP_OK
+ret 20
+end
+if ne ogp_handles_check get h1 0 get h1 1 OGP_HANDLE_BUF_DATA OGP_OK
+ret 21
+end
+note Wrong kind must fail BAD_HANDLE
+if ne ogp_handles_check get h1 0 get h1 1 OGP_HANDLE_BUF_CODE OGP_REFUSED_BAD_HANDLE
+ret 22
+end
+note Byte limit exceeded
+h2 = new ulong 2 0
+if ne ogp_handles_open OGP_HANDLE_BUF_DATA 8192 2 8192 h2 OGP_REFUSED_LIMIT
+ret 23
+end
+if ne ogp_handles_close get h1 0 get h1 1 OGP_HANDLE_BUF_DATA OGP_OK
+ret 24
+end
+note Stale handle after close must fail STALE_HANDLE
+if ne ogp_handles_check get h1 0 get h1 1 OGP_HANDLE_BUF_DATA OGP_REFUSED_STALE_HANDLE
+ret 25
+end
+if ne get ogp_ht_total_bytes 0 0
+ret 26
+end
+ret 0
+end
+
+fn test_platform_linux_and_cached to ulong
+ogpl_set_mock 1
+ogpl_reset_state
+ch = ogpl_channels_env
+if or lt ch 1 gt ch 4
+ret 30
+end
+dev = new ulong 2 0
+if ne ogpl_device_open 1 dev OGP_REFUSED_ARGS
+ret 31
+end
+if ne ogpl_device_open 0 dev OGP_OK
+ret 32
+end
+note Second open refused
+dev2 = new ulong 2 0
+if ne ogpl_device_open 0 dev2 OGP_REFUSED_LIMIT
+ret 33
+end
+note Cached alloc via omega_gpu_mem_cached.om
+hc = new ulong 2 0
+inf = new ulong 3 0
+if ne ogmc_alloc_cached get dev 0 get dev 1 0 hc inf OGP_REFUSED_BAD_LENGTH
+ret 34
+end
+if ne ogmc_alloc_cached get dev 0 get dev 1 100 hc inf OGP_OK
+ret 35
+end
+if ne get inf 2 4096
+ret 36
+end
+note Sync to GPU on cached buffer sets L2_INVAL_PREFIX pending
+if ne ogpl_sync_to_gpu get hc 0 get hc 1 0 4096 OGP_OK
+ret 37
+end
+if ne get ogpl_l2_pending 0 1
+ret 38
+end
+note Allocate queue ring buffer and open queue
+qdesc = new ulong 5 0
+put qdesc 0 OGP_HANDLE_BUF_QUEUE
+put qdesc 1 or OGP_RIGHT_CPU_WRITE OGP_RIGHT_GPU_READ
+put qdesc 2 OGP_CACHE_GPU_UNCACHED
+put qdesc 3 4096
+put qdesc 4 4096
+hring = new ulong 2 0
+if ne ogpl_dma_alloc get dev 0 get dev 1 qdesc hring inf OGP_OK
+ret 39
+end
+hq = new ulong 2 0
+if ne ogpl_queue_open get dev 0 get dev 1 get hring 0 get hring 1 hq OGP_OK
+ret 40
+end
+note Freeing busy ring must be refused BUSY
+if ne ogpl_dma_free get hring 0 get hring 1 OGP_REFUSED_BUSY
+ret 41
+end
+note Submit 3 words: L2_INVAL_PREFIX (5 words) must be prepended -> 8 words total
+w = new uint 4 0
+put w 0 1
+put w 1 2
+put w 2 3
+if ne ogpl_queue_submit get hq 0 get hq 1 w 3 OGP_OK
+ret 42
+end
+if ne get ogpl_last_had_l2_prefix 0 5
+ret 43
+end
+if ne get ogpl_last_submit_words 0 8
+ret 44
+end
+if ne get ogpl_l2_pending 0 0
+ret 45
+end
+note Second submit has 0 prefix words
+if ne ogpl_queue_submit get hq 0 get hq 1 w 3 OGP_OK
+ret 46
+end
+if ne get ogpl_last_had_l2_prefix 0 0
+ret 47
+end
+if ne ogpl_queue_close get hq 0 get hq 1 OGP_OK
+ret 48
+end
+if ne ogpl_dma_free get hring 0 get hring 1 OGP_OK
+ret 49
+end
+if ne ogpl_device_close get dev 0 get dev 1 OGP_OK
+ret 50
+end
+note Child handle hc must now be stale
+if ne ogpl_dma_free get hc 0 get hc 1 OGP_REFUSED_STALE_HANDLE
+ret 51
+end
+ret 0
+end
+
+fn test_engine_state_machine to ulong
+oge_test_reset_block
+oge_test_set_clock 1 100 25
+oge_mock_reset
+job = new ulong 12 0
+put job 0 512
+put job 1 OGE_LAYOUT_VECTOR_1D
+put job 2 8
+put job 3 32
+put job 4 32
+put job 5 32
+put job 6 8
+put job 7 0
+put job 8 5000
+put job 9 5000
+put job 10 5000
+put job 11 5000
+
+prog = new uchar 512 0
+clen = bw_encode_vecadd prog
+if ne clen 512
+ret 60
+end
+for i ulong clen
+put oge_job_prog i get prog i
+end
+for i ulong 8
+put oge_job_a i uint mul i 10
+put oge_job_b i uint add i 3
+put oge_job_poison i xor uint add mul i 10 add i 3 0xffffffff
+put oge_job_out i 0
+end
+res = new ulong 16 0
+
+note No backend -> INTERNAL_INVARIANT at NOT_IMPLEMENTED
+oge_set_backend OGE_BACKEND_NONE
+if ne oge_execute job res OGE_INTERNAL_INVARIANT
+ret 61
+end
+if ne get res 2 OGE_STEP_NOT_IMPLEMENTED
+ret 62
+end
+
+note Happy path on mock backend
+oge_set_backend OGE_BACKEND_MOCK
+if ne oge_execute job res OGE_OK
+ret 63
+end
+if ne get res 1 OGE_STATE_SUCCESS
+ret 64
+end
+if ne get oge_mock_marker2_called 0 1
+ret 65
+end
+if ne get oge_mock_free_mask 0 31
+ret 66
+end
+for i ulong 8
+if ne get oge_job_out i uint add mul i 10 add i 3
+ret 67
+end
+end
+
+note Negative control: NO_C3 skips marker2
+oge_mock_reset
+put job 7 OGE_FLAG_NO_C3
+put job 10 0
+if ne oge_execute job res OGE_OK
+ret 68
+end
+if ne get oge_mock_marker2_called 0 0
+ret 69
+end
+put job 7 0
+put job 10 5000
+
+note Negative control: output unchanged (poison left untouched)
+oge_mock_reset
+put oge_mock_leave_poison 0 1
+if ne oge_execute job res OGE_OUTPUT_UNCHANGED
+ret 70
+end
+if ne get res 14 8
+ret 71
+end
+if ne get res 1 OGE_STATE_OUTPUT_VISIBLE
+ret 72
+end
+
+note Negative control: cleanup fault does not overwrite first failure
+oge_mock_reset
+put oge_mock_fail_step 0 OGE_STEP_SUBMIT
+put oge_mock_fail_close 0 1
+if ne oge_execute job res OGE_SUBMIT
+ret 73
+end
+if ne get res 12 1
+ret 74
+end
+
+note Negative control: uncertain completion retains allocations and blocks process
+oge_mock_reset
+oge_test_set_clock 1 1000 37
+put oge_mock_fail_step 0 OGE_STEP_WAIT_MARKER
+if ne oge_execute job res OGE_COMPLETION_WAIT
+ret 75
+end
+if ne get res 11 1
+ret 76
+end
+if ne get res 5 37
+ret 77
+end
+if ne get oge_mock_free_mask 0 0
+ret 78
+end
+if ne get oge_mock_close_calls 0 0
+ret 79
+end
+if ne oge_is_blocked 1
+ret 80
+end
+note Subsequent call while blocked must return UNCERTAIN_COMPLETION_BLOCKED
+if ne oge_execute job res OGE_UNCERTAIN_COMPLETION_BLOCKED
+ret 81
+end
+if ne get res 2 OGE_STEP_BLOCKED
+ret 82
+end
+oge_test_reset_block
+oge_test_set_clock 0 0 0
+
+note Name table checks + zero-CUDA static ELF & runtime checks
+nbuf = new uchar 32 0
+if ne oge_failure_name OGE_OK nbuf 2
+ret 83
+end
+if ne oge_state_name OGE_STATE_SUCCESS nbuf 7
+ret 84
+end
+if ne oge_wait_name OGE_WAIT_MARKER2 nbuf 7
+ret 85
+end
+if ne oge_step_name OGE_STEP_SCAN nbuf 4
+ret 86
+end
+if ne obws_verify_zero_libcuda_linkage 0
+ret 87
+end
+if ne obws_verify_zero_cuda_symbols 0
+ret 88
+end
+if ne obws_verify_zero_libcuda_runtime 0
+ret 89
+end
+if ne obwe_device_is_open 0
+ret 90
+end
+if ne obwe_shutdown 0
+ret 91
+end
+ret 0
+end
+
+fn main to int
+rc = test_platform_contract
+if ne rc 0
+h_print h_fail
+h_print_u rc
+h_print h_nl
+ret int rc
+end
+rc = test_handle_table
+if ne rc 0
+h_print h_fail
+h_print_u rc
+h_print h_nl
+ret int rc
+end
+rc = test_platform_linux_and_cached
+if ne rc 0
+h_print h_fail
+h_print_u rc
+h_print h_nl
+ret int rc
+end
+rc = test_engine_state_machine
+if ne rc 0
+h_print h_fail
+h_print_u rc
+h_print h_nl
+ret int rc
+end
+h_print h_pass
+ret 0
+end

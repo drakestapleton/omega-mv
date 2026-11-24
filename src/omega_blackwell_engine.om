@@ -1,0 +1,688 @@
+note SPDX-License-Identifier: Apache-2.0
+note src/omega_blackwell_engine.om: Pure seeded OM-2 twin of src/omega_blackwell_engine.c.
+note Blackwell GB10 backend for omega_gpu_engine.om, backed directly by
+note gpu/nvidia/native/nvrm/context.om (zero CUDA, zero libc) and om/gpu/bw_qmd.om.
+om2
+
+const OBWE_PAGE ulong 4096
+const OBWE_PB_BYTES ulong 65536
+const OBWE_QMD_BYTES ulong 65536
+const OBWE_SEM_OFFSET ulong 8192
+const OBWE_MARKER1_PAYLOAD uint 0x44444444
+const OBWE_MARKER2_OFFSET ulong 16
+const OBWE_MARKER2_PAYLOAD uint 0x46464646
+const OBWE_SEM_DONE uint 6
+
+text obwe_env_nopersist "OMEGA_GPU_ENGINE_NO_PERSIST=1"
+
+global obwe_busy ulong 1
+global obwe_dev_open ulong 1
+global obwe_chan_open ulong 1
+global obwe_c3 ulong 1
+global obwe_last_rc ulong 1
+global obwe_has_scratch ulong 1
+
+note Device buffer map handles (SCRATCH parts + 4 job buffers)
+global obwe_pb long 1
+global obwe_cbank long 1
+global obwe_marker long 1
+global obwe_qmd long 1
+global obwe_buf long 5
+
+note Pushbuffer assembly buffer (4096 bytes = 1024 uint32 words)
+global obwe_pb_bytes uchar 4096
+global obwe_pb_len ulong 1
+global obwe_pb_overflow ulong 1
+
+note RunInfo snapshot (ulong[5]):
+note   0: launch_ns, 1: marker_done_ns, 2: marker, 3: marker2, 4: semaphore
+global obwe_info ulong 5
+
+fn obwe_persist_enabled to bool
+cntl = envcnt
+cnt = ulong cntl
+buf = new uchar 64 0
+plen = len obwe_env_nopersist
+for i ulong cnt
+nl = envread i buf 0 64
+if ge nl long plen
+ok = true
+for j ulong plen
+if ne get buf j get obwe_env_nopersist j
+ok = false
+end
+end
+if ok
+ret false
+end
+end
+end
+ret true
+end
+
+fn obwe_backend to ulong
+ret OGE_BACKEND_BLACKWELL
+end
+
+fn obwe_device_is_open to ulong
+ret get obwe_dev_open 0
+end
+
+fn obwe_run_info dst edit ulong 5 to void
+for i ulong 5
+put dst i get obwe_info i
+end
+end
+
+fn obwe_shutdown to ulong
+if ne get obwe_busy 0 0
+ret 1
+end
+if eq get obwe_dev_open 0 0
+ret 0
+end
+ok = nvstop
+put obwe_dev_open 0 0
+put obwe_chan_open 0 0
+put obwe_has_scratch 0 0
+if ok
+ret 0
+end
+ret 1
+end
+
+fn obwe_round_pages nbytes ulong to ulong
+if eq nbytes 0
+ret 0
+end
+v = and add nbytes 4095 not ulong 4095
+if lt v OBWE_PAGE
+v = OBWE_PAGE
+end
+ret v
+end
+
+fn obwe_pb_put w uint to void
+pos = get obwe_pb_len 0
+if ge pos 1024
+put obwe_pb_overflow 0 1
+ret
+end
+off = mul pos 4
+put obwe_pb_bytes off uchar and w 255
+put obwe_pb_bytes add off 1 uchar and shr w 8 255
+put obwe_pb_bytes add off 2 uchar and shr w 16 255
+put obwe_pb_bytes add off 3 uchar and shr w 24 255
+put obwe_pb_len 0 add pos 1
+end
+
+fn obwe_mth subc uint method uint count uint to void
+obwe_pb_put or or or uint 0x20000000 shl count 16 shl subc 13 shr method 2
+end
+
+fn obwe_ptr va ulong to void
+obwe_pb_put uint shr va 32
+obwe_pb_put uint and va 0xffffffff
+end
+
+fn obwe_emit_setup to void
+obwe_pb_put 0x20012061
+obwe_pb_put 0x0000cec0
+obwe_pb_put 0x20012092
+obwe_pb_put 0x00000001
+obwe_pb_put 0x200120a8
+obwe_pb_put 0x0000000f
+obwe_pb_put 0x2001255d
+obwe_pb_put 0x00000003
+obwe_pb_put 0x2001255e
+obwe_pb_put 0x20000000
+obwe_pb_put 0x2001255f
+obwe_pb_put 0x000fffff
+obwe_pb_put 0x20012557
+obwe_pb_put 0x00000003
+obwe_pb_put 0x20012558
+obwe_pb_put 0x22000000
+obwe_pb_put 0x20012559
+obwe_pb_put 0x00000000
+end
+
+fn obwe_emit_dma va ulong count uint to void
+obwe_mth 1 392 2
+obwe_ptr va
+obwe_mth 1 384 2
+obwe_pb_put mul count 4
+obwe_pb_put 1
+obwe_mth 1 432 1
+obwe_pb_put 65
+obwe_pb_put or uint 0x6000206d shl count 16
+end
+
+fn obwe_emit_inline va ulong q view uint 96 to void
+obwe_mth 1 792 98
+obwe_pb_put or uint 0x40000000 uint and shr va 40 511
+obwe_pb_put uint and shr va 8 0xffffffff
+for i ulong 96
+obwe_pb_put get q i
+end
+end
+
+fn obwe_emit_rel va ulong val uint to void
+obwe_mth 0 92 5
+obwe_pb_put uint and va 0xffffffff
+obwe_pb_put uint shr va 32
+obwe_pb_put val
+obwe_pb_put 0
+obwe_pb_put 0x00100001
+end
+
+fn obwe_emit_l2_flush to void
+obwe_mth 0 40 4
+obwe_pb_put 0
+obwe_pb_put 0
+obwe_pb_put 0
+obwe_pb_put 0x80000000
+end
+
+fn obwe_fill_cbank cb edit uint 224 va ulong to void
+for i ulong 224
+put cb i 0
+end
+put cb 0 641859584
+put cb 1 3
+put cb 48 2499697920
+put cb 49 3893478299
+put cb 62 1048575
+put cb 64 536870912
+put cb 65 3
+put cb 66 570425344
+put cb 67 3
+put cb 68 uint shr va 32
+put cb 69 uint and va 0xffffffff
+put cb 70 604045312
+put cb 71 3
+put cb 80 1
+put cb 82 67158016
+put cb 83 2
+put cb 91 1024
+put cb 108 79311560
+put cb 114 1
+put cb 118 288
+put cb 126 632711424
+put cb 127 3
+for i ulong 3
+put cb add 128 i 1
+put cb add 132 i 1065353216
+end
+put cb 135 1024
+for i ulong 4
+put cb add 136 i 1
+end
+put cb 148 79311560
+put cb 154 1
+put cb 158 288
+put cb 166 632711424
+put cb 167 3
+for i ulong 3
+put cb add 168 i 1
+put cb add 172 i 1065353216
+end
+put cb 175 1024
+for i ulong 4
+put cb add 176 i 1
+end
+put cb 180 48
+put cb 183 16777216
+put cb 185 59840
+put cb 189 59840
+put cb 190 16777216
+put cb 191 59839
+put cb 210 uint shr add va 896 32
+put cb 211 uint and add va 896 0xffffffff
+put cb 212 uint shr add va 924 32
+put cb 213 uint and add va 924 0xffffffff
+put cb 216 64
+put cb 217 1
+put cb 218 1
+put cb 220 1
+put cb 221 1
+put cb 222 1
+put cb 223 16776640
+end
+
+fn obwe_be_open to ulong
+if ne get obwe_busy 0 0
+ret 1
+end
+put obwe_busy 0 1
+put obwe_last_rc 0 0
+for i ulong 5
+put obwe_info i 0
+end
+reuse = false
+if ne get obwe_dev_open 0 0
+if obwe_persist_enabled
+if eq get nvfault 0 0
+reuse = true
+end
+end
+end
+if and ne get obwe_dev_open 0 0 not reuse
+ign = nvstop
+put obwe_dev_open 0 0
+put obwe_chan_open 0 0
+end
+if reuse
+ret 0
+end
+if not nvfull
+put obwe_last_rc 0 1
+put obwe_busy 0 0
+ret 1
+end
+put obwe_dev_open 0 1
+ret 0
+end
+
+fn obwe_be_channel to ulong
+if ne get obwe_chan_open 0 0
+ret 0
+end
+if not nvchan
+put obwe_last_rc 0 2
+ret 2
+end
+put obwe_chan_open 0 1
+ret 0
+end
+
+fn obwe_release_scratch to ulong
+put obwe_has_scratch 0 0
+rc = ulong 0
+if gt get obwe_qmd 0 0
+if not nvdrop get obwe_qmd 0
+rc = ulong 1
+end
+put obwe_qmd 0 0
+end
+if gt get obwe_marker 0 0
+if not nvdrop get obwe_marker 0
+rc = ulong 1
+end
+put obwe_marker 0 0
+end
+if gt get obwe_cbank 0 0
+if not nvdrop get obwe_cbank 0
+rc = ulong 1
+end
+put obwe_cbank 0 0
+end
+if gt get obwe_pb 0 0
+if not nvdrop get obwe_pb 0
+rc = ulong 1
+end
+put obwe_pb 0 0
+end
+ret rc
+end
+
+fn obwe_be_alloc role ulong nbytes ulong to ulong
+if eq role OGE_BUF_SCRATCH
+m0 = nvalloc OBWE_PB_BYTES false
+if le m0 0
+ret 1
+end
+put obwe_pb 0 m0
+m1 = nvalloc OBWE_PAGE false
+if le m1 0
+ign = obwe_release_scratch
+ret 1
+end
+put obwe_cbank 0 m1
+m2 = nvalloc OBWE_PAGE false
+if le m2 0
+ign = obwe_release_scratch
+ret 1
+end
+put obwe_marker 0 m2
+m3 = nvalloc OBWE_QMD_BYTES false
+if le m3 0
+ign = obwe_release_scratch
+ret 1
+end
+put obwe_qmd 0 m3
+put obwe_has_scratch 0 1
+ret 0
+end
+sz = obwe_round_pages nbytes
+if eq sz 0
+ret 1
+end
+m = nvalloc sz false
+if le m 0
+ret 1
+end
+if ne and mapaddr m 255 0
+ign = nvdrop m
+ret 1
+end
+put obwe_buf role m
+ret 0
+end
+
+fn obwe_write_from_a n ulong to ulong
+m = get obwe_buf OGE_BUF_INPUT_A
+tmp = new uchar 4096 0
+pos = ulong 0
+while lt pos n bound 1024
+chunk = sub n pos
+if gt chunk 1024
+chunk = ulong 1024
+end
+for i ulong chunk
+v = get oge_job_a add pos i
+off = mul i 4
+put tmp off uchar and v 255
+put tmp add off 1 uchar and shr v 8 255
+put tmp add off 2 uchar and shr v 16 255
+put tmp add off 3 uchar and shr v 24 255
+end
+wr = mapwrite m mul pos 4 tmp 0 mul chunk 4
+if ne wr long mul chunk 4
+ret 1
+end
+pos = add pos chunk
+end
+ret 0
+end
+
+fn obwe_write_from_b n ulong to ulong
+m = get obwe_buf OGE_BUF_INPUT_B
+tmp = new uchar 4096 0
+pos = ulong 0
+while lt pos n bound 1024
+chunk = sub n pos
+if gt chunk 1024
+chunk = ulong 1024
+end
+for i ulong chunk
+v = get oge_job_b add pos i
+off = mul i 4
+put tmp off uchar and v 255
+put tmp add off 1 uchar and shr v 8 255
+put tmp add off 2 uchar and shr v 16 255
+put tmp add off 3 uchar and shr v 24 255
+end
+wr = mapwrite m mul pos 4 tmp 0 mul chunk 4
+if ne wr long mul chunk 4
+ret 1
+end
+pos = add pos chunk
+end
+ret 0
+end
+
+fn obwe_be_copy_in plen ulong n ulong to ulong
+wr = mapwrite get obwe_buf OGE_BUF_PROGRAM 0 oge_job_prog 0 plen
+if ne wr long plen
+ret 1
+end
+if ne obwe_write_from_a n 0
+ret 1
+end
+if ne obwe_write_from_b n 0
+ret 1
+end
+ret 0
+end
+
+fn obwe_be_fill_poison n ulong to ulong
+m = get obwe_buf OGE_BUF_OUTPUT
+tmp = new uchar 4096 0
+pos = ulong 0
+while lt pos n bound 1024
+chunk = sub n pos
+if gt chunk 1024
+chunk = ulong 1024
+end
+for i ulong chunk
+v = get oge_job_poison add pos i
+off = mul i 4
+put tmp off uchar and v 255
+put tmp add off 1 uchar and shr v 8 255
+put tmp add off 2 uchar and shr v 16 255
+put tmp add off 3 uchar and shr v 24 255
+end
+wr = mapwrite m mul pos 4 tmp 0 mul chunk 4
+if ne wr long mul chunk 4
+ret 1
+end
+pos = add pos chunk
+end
+ret 0
+end
+
+fn obwe_build_cbank_and_args n ulong to void
+cb_va = mapaddr get obwe_cbank 0
+cb = new uint 224 0
+obwe_fill_cbank cb cb_va
+obwe_emit_setup
+obwe_emit_dma cb_va 224
+for i ulong 224
+obwe_pb_put get cb i
+end
+a_va = mapaddr get obwe_buf OGE_BUF_INPUT_A
+b_va = mapaddr get obwe_buf OGE_BUF_INPUT_B
+c_va = mapaddr get obwe_buf OGE_BUF_OUTPUT
+obwe_emit_dma add cb_va 896 7
+obwe_pb_put uint and a_va 0xffffffff
+obwe_pb_put uint shr a_va 32
+obwe_pb_put uint and b_va 0xffffffff
+obwe_pb_put uint shr b_va 32
+obwe_pb_put uint and c_va 0xffffffff
+obwe_pb_put uint shr c_va 32
+obwe_pb_put uint n
+end
+
+fn obwe_build_qmds n ulong to ulong
+q_va = mapaddr get obwe_qmd 0
+q0 = new uint 96 0
+q1 = new uint 96 0
+cfg = new ulong 16 0
+put cfg 0 mapaddr get obwe_buf OGE_BUF_PROGRAM
+put cfg 1 mapaddr get obwe_cbank 0
+put cfg 2 add q_va 16384
+put cfg 3 add q_va OBWE_SEM_OFFSET
+put cfg 4 q_va
+put cfg 5 n
+put cfg 6 64
+put cfg 7 div add n 63 64
+put cfg 8 64
+put cfg 9 1
+put cfg 10 div add n 63 64
+put cfg 11 1
+put cfg 12 16
+put cfg 13 0
+ign0 = bw_qmd0 q0 add q_va 4096
+if ne bw_qmd1 cfg q1 0
+ret 1
+end
+if ne bw_qmd_verify q1 0
+ret 1
+end
+obwe_emit_inline q_va q0
+obwe_emit_dma add q_va OBWE_SEM_OFFSET 1
+obwe_pb_put 1
+obwe_emit_inline add q_va 4096 q1
+ret 0
+end
+
+fn obwe_be_build n ulong flags ulong to ulong
+put obwe_pb_len 0 0
+put obwe_pb_overflow 0 0
+if eq and flags OGE_FLAG_NO_C3 0
+put obwe_c3 0 1
+else
+put obwe_c3 0 0
+end
+obwe_build_cbank_and_args n
+if ne obwe_build_qmds n 0
+ret 1
+end
+mark_va = mapaddr get obwe_marker 0
+obwe_emit_rel mark_va OBWE_MARKER1_PAYLOAD
+if ne get obwe_c3 0 0
+obwe_emit_l2_flush
+obwe_emit_rel add mark_va OBWE_MARKER2_OFFSET OBWE_MARKER2_PAYLOAD
+end
+if ne get obwe_pb_overflow 0 0
+ret 1
+end
+r0 = mapset get obwe_qmd 0 OBWE_SEM_OFFSET 4 0
+r1 = mapset get obwe_marker 0 0 4 0
+r2 = mapset get obwe_marker 0 OBWE_MARKER2_OFFSET 4 0
+cpufence
+ret 0
+end
+
+fn obwe_be_submit to ulong
+nwords = get obwe_pb_len 0
+nbytes = mul nwords 4
+wr = mapwrite get obwe_pb 0 0 obwe_pb_bytes 0 nbytes
+if ne wr long nbytes
+ret 1
+end
+cpufence
+put obwe_info 0 ulong monons
+if not nvsend get obwe_pb 0 0 uint nwords
+ret 1
+end
+ret 0
+end
+
+fn obwe_be_wait_marker ms ulong to ulong
+ok = nvwait get obwe_marker 0 0 OBWE_MARKER1_PAYLOAD mul ms 1000000
+v = uint mapget get obwe_marker 0 0 4
+put obwe_info 2 ulong v
+if not ok
+ret 1
+end
+put obwe_info 1 ulong monons
+ret 0
+end
+
+fn obwe_poll_word m long off ulong want uint ms ulong to bool
+start = monons
+if lt start 0
+ret false
+end
+budget = long mul ms 1000000
+while true
+if eq mapget m off 4 ulong want
+ret true
+end
+now = monons
+if or lt now start ge sub now start budget
+ret false
+end
+r = sleepns long 100000
+if ne r 0
+ret false
+end
+end
+ret false
+end
+
+fn obwe_be_wait_marker2 ms ulong to ulong
+ok = obwe_poll_word get obwe_marker 0 OBWE_MARKER2_OFFSET OBWE_MARKER2_PAYLOAD ms
+v = uint mapget get obwe_marker 0 OBWE_MARKER2_OFFSET 4
+put obwe_info 3 ulong v
+if not ok
+ret 1
+end
+ret 0
+end
+
+fn obwe_be_wait_sem ms ulong to ulong
+ok = obwe_poll_word get obwe_qmd 0 OBWE_SEM_OFFSET OBWE_SEM_DONE ms
+v = uint mapget get obwe_qmd 0 OBWE_SEM_OFFSET 4
+put obwe_info 4 ulong v
+if not ok
+ret 1
+end
+ret 0
+end
+
+fn obwe_be_barrier ms ulong to ulong
+cpufence
+ret 0
+end
+
+fn obwe_be_copy_out n ulong to ulong
+m = get obwe_buf OGE_BUF_OUTPUT
+tmp = new uchar 4096 0
+pos = ulong 0
+while lt pos n bound 1024
+chunk = sub n pos
+if gt chunk 1024
+chunk = ulong 1024
+end
+rd = mapread m mul pos 4 tmp 0 mul chunk 4
+if ne rd long mul chunk 4
+ret 1
+end
+for i ulong chunk
+off = mul i 4
+v = uint get tmp off
+v = or v shl uint get tmp add off 1 8
+v = or v shl uint get tmp add off 2 16
+v = or v shl uint get tmp add off 3 24
+put oge_job_out add pos i v
+end
+pos = add pos chunk
+end
+ret 0
+end
+
+fn obwe_be_diag res edit ulong 16 to void
+put res 6 get obwe_last_rc 0
+if ne get obwe_has_scratch 0 0
+sv = ulong 0
+put res 8 mapget get obwe_marker 0 0 4
+sv = or sv OGE_SYNC_MARKER
+put res 9 mapget get obwe_marker 0 OBWE_MARKER2_OFFSET 4
+sv = or sv OGE_SYNC_MARKER2
+put res 10 mapget get obwe_qmd 0 OBWE_SEM_OFFSET 4
+sv = or sv OGE_SYNC_SEMAPHORE
+put res 7 sv
+end
+end
+
+fn obwe_be_free role ulong to ulong
+if eq role OGE_BUF_SCRATCH
+ret obwe_release_scratch
+end
+m = get obwe_buf role
+if gt m 0
+ok = nvdrop m
+put obwe_buf role 0
+if not ok
+ret 1
+end
+end
+ret 0
+end
+
+fn obwe_be_close to ulong
+if and ne get obwe_dev_open 0 0 and obwe_persist_enabled eq get nvfault 0 0
+put obwe_busy 0 0
+ret 0
+end
+ok = nvstop
+put obwe_dev_open 0 0
+put obwe_chan_open 0 0
+put obwe_busy 0 0
+if ok
+ret 0
+end
+ret 1
+end
