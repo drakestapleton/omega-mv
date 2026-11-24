@@ -1,0 +1,2228 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/physics0/learner/pd0_harness.om: Pure seeded OM-2 PD-0 development harness for the learner.
+note Verifier-side build: links pd0_fmt/pd0_ladder/pd0_score/pd0_controls and pd0_learner, never generators.
+note Usage: pd0-harness <world-bin> <truth-bin|-> <level|null> <seed> <out-dir>
+
+const PH_EP_LEN ulong 20
+const PH_MAX_EP ulong 1024
+const PH_HYP_BASE ulong 100
+const PH_NULL_SLOT ulong 108
+const PH_TRUTH_SLOT ulong 109
+
+text PH_USAGE "usage: pd0-harness <world> <truth> <level|null> <seed> <out-dir>\n"
+text PH_DESC2 "PD0DESC2"
+text PH_SHAP1 "PD0SHAP1"
+text PH_AUDT1 "PD0AUDT1"
+text PH_NULL "null"
+text PH_DASH "-"
+text PH_PD0B "PD0B=1"
+text PH_WORLD_NAME "pd0-world"
+text PH_TRIAL_TAG "trial"
+text PH_REP_TAG "rep"
+text PH_SCORE_TAG "score"
+text PH_SCORE_IN "score-in"
+text PH_SCORE_EX "score-ex"
+text PH_REL_CMD "rel\n"
+text PH_QUIT_CMD "quit\n"
+text PH_EP_CMD "ep "
+text PH_END_CMD "end"
+text PH_OOB_CMD "oob"
+text PH_HEX "0123456789abcdef"
+
+text PH_S_NOCAND "NO_CANDIDATE"
+text PH_S_PASS "PASS"
+text PH_S_NOTSC "NOT_SCORED"
+text PH_S_FAIL "FAIL"
+text PH_M_SEALED "SEALED"
+text PH_M_PD0 "PD0"
+text PH_V_VALID "VALID"
+text PH_V_INVALID "INVALID"
+
+note ---- CLI args ----
+global ph_arg_w uchar 512
+global ph_arg_wn ulong 1
+global ph_arg_t uchar 512
+global ph_arg_tn ulong 1
+global ph_arg_l uchar 32
+global ph_arg_ln ulong 1
+global ph_arg_s uchar 32
+global ph_arg_sn ulong 1
+global ph_arg_o uchar 512
+global ph_arg_on ulong 1
+
+note ---- Process handles ----
+global ph_w_pid int 1
+global ph_w_in int 1
+global ph_w_out int 1
+global ph_t_pid int 1
+global ph_t_in int 1
+global ph_t_out int 1
+global ph_pkt uchar 2048
+
+note ---- Run state ----
+global ph_level int 1
+global ph_seed ulong 1
+global ph_ext int 1
+global ph_sealed int 1
+global ph_dims_ok int 1
+global ph_dims int 4
+global ph_have_truth int 1
+global ph_truth_size int 1
+global ph_truth_nlat int 1
+global ph_next_ep uint 1
+global ph_n_ep ulong 1
+global ph_steps_used uint 1
+global ph_eps_used uint 1
+global ph_ep_tag uchar 1024
+global ph_ep_hash uchar 32768
+global ph_ep_first ulong 1024
+global ph_ep_n ulong 1024
+global ph_ep_ok uchar 1024
+global ph_ep_void uchar 1024
+
+note ---- Stored observation records for TRIAL->FIT promotion ----
+global ph_nrec ulong 1
+global ph_rec_nobs uchar 65536
+global ph_rec_st uchar 65536
+global ph_rec_kind uchar 65536
+global ph_rec_ch uchar 65536
+global ph_rec_ep uint 65536
+global ph_rec_step uint 65536
+global ph_rec_app long 65536
+global ph_rec_bef long 262144
+global ph_rec_aft long 262144
+
+note ---- Counters & scratch ----
+global ph_n_oob uint 1
+global ph_n_ref uint 1
+global ph_n_pfail uint 1
+global ph_n_trnd uint 1
+global ph_n_att uint 1
+global ph_n_bud uint 1
+global ph_n_vep uint 1
+global ph_n_vbat uint 1
+global ph_have_best int 1
+global ph_best_ci ulong 1
+global ph_n_hyp ulong 1
+global ph_n_forb ulong 1
+global ph_ch_rc int 1
+global ph_law_len ulong 1
+global ph_law_rc int 1
+global ph_law uchar 65536
+global ph_pl uchar 16384
+global ph_tline uchar 4096
+global ph_fhash uchar 32
+global ph_fin_st int 1
+global ph_fin_ok int 1
+global ph_aud_ok int 1
+global ph_aud_cnt uint 4
+global ph_n_sc_eps int 1
+global ph_rmin_orig long 8
+global ph_rmax_orig long 8
+global ph_out_line uchar 2048
+global ph_app_ch uchar 20
+global ph_app_val long 20
+global ph_n_ok ulong 1
+
+fn ph_parse_u64 buf view uchar * n ulong to ulong
+v = ulong 0
+for i ulong n bound 32
+c = get buf i
+if and ge c uchar 48 le c uchar 57
+v = add mul v ulong 10 ulong sub c uchar 48
+end
+end
+ret v
+end
+
+fn ph_streq a view uchar * na ulong b view uchar * to int
+nb = len b
+if ne na nb
+ret 0
+end
+for i ulong na bound 256
+if ne get a i get b i
+ret 0
+end
+end
+ret 1
+end
+
+fn ph_le32 buf view uchar 8 off ulong to int
+b0 = uint get buf off
+b1 = shl uint get buf add off 1 8
+b2 = shl uint get buf add off 2 16
+b3 = shl uint get buf add off 3 24
+ret int or or b0 b1 or b2 b3
+end
+
+fn ph_pkt_push pos ulong src view uchar * n ulong to ulong
+put ph_pkt pos uchar and n ulong 255
+put ph_pkt add pos ulong 1 uchar and shr n 8 ulong 255
+p = add pos ulong 2
+for i ulong n bound 512
+put ph_pkt add p i get src i
+end
+ret add p n
+end
+
+fn ph_pkt_push_g pos ulong which int to ulong
+if eq which 0
+n = get ph_arg_wn 0
+put ph_pkt pos uchar and n ulong 255
+put ph_pkt add pos ulong 1 uchar and shr n 8 ulong 255
+p = add pos ulong 2
+for i ulong n bound 512
+put ph_pkt add p i get ph_arg_w i
+end
+ret add p n
+end
+if eq which 1
+n = get ph_arg_tn 0
+put ph_pkt pos uchar and n ulong 255
+put ph_pkt add pos ulong 1 uchar and shr n 8 ulong 255
+p = add pos ulong 2
+for i ulong n bound 512
+put ph_pkt add p i get ph_arg_t i
+end
+ret add p n
+end
+if eq which 2
+n = get ph_arg_ln 0
+put ph_pkt pos uchar and n ulong 255
+put ph_pkt add pos ulong 1 uchar and shr n 8 ulong 255
+p = add pos ulong 2
+for i ulong n bound 32
+put ph_pkt add p i get ph_arg_l i
+end
+ret add p n
+end
+n = get ph_arg_sn 0
+put ph_pkt pos uchar and n ulong 255
+put ph_pkt add pos ulong 1 uchar and shr n 8 ulong 255
+p = add pos ulong 2
+for i ulong n bound 32
+put ph_pkt add p i get ph_arg_s i
+end
+ret add p n
+end
+
+fn ph_exec_child p ulong to void
+pkt = new uchar 2048 0
+for i ulong p bound 2048
+put pkt i get ph_pkt i
+end
+r = execprog pkt 0 p
+exit 127
+end
+
+fn ph_spawn is_truth int to int
+pa = new uchar 8 0
+pb = new uchar 8 0
+if ne pipefds pa 0 ulong 8 0 long 0
+ret -1
+end
+if ne pipefds pb 0 ulong 8 0 long 0
+ret -1
+end
+a_rd = ph_le32 view pa ulong 0
+a_wr = ph_le32 view pa ulong 4
+b_rd = ph_le32 view pb ulong 0
+b_wr = ph_le32 view pb ulong 4
+put ph_pkt 0 uchar 3
+put ph_pkt 1 uchar 0
+p = ph_pkt_push_g ulong 2 is_truth
+p = ph_pkt_push_g p 2
+p = ph_pkt_push_g p 3
+pid = fork
+if lt pid long 0
+ret -1
+end
+if eq pid long 0
+ign0 = dupfd a_rd 0 0
+ign1 = dupfd b_wr 1 0
+ign2 = fclose a_rd
+ign3 = fclose a_wr
+ign4 = fclose b_rd
+ign5 = fclose b_wr
+ph_exec_child p
+end
+ign6 = fclose a_rd
+ign7 = fclose b_wr
+if eq is_truth 0
+put ph_w_pid 0 int pid
+put ph_w_out 0 a_wr
+put ph_w_in 0 b_rd
+else
+put ph_t_pid 0 int pid
+put ph_t_out 0 a_wr
+put ph_t_in 0 b_rd
+end
+ret 0
+end
+
+fn ph_rd_full fd int dst edit uchar * n ulong to int
+got = ulong 0
+while lt got n bound 65536
+k = read fd dst got sub n got
+if le k long 0
+ret -1
+end
+got = add got ulong k
+end
+ret 0
+end
+
+fn ph_wr_full fd int src view uchar * n ulong to int
+sent = ulong 0
+while lt sent n bound 65536
+k = write fd src sent sub n sent
+if le k long 0
+ret -1
+end
+sent = add sent ulong k
+end
+ret 0
+end
+
+fn ph_world_call req view uchar * n ulong resp edit uchar * cap ulong to ulong
+l4 = new uchar 4 0
+pd0_put_u32 edit l4 ulong 0 uint n
+if ne ph_wr_full get ph_w_out 0 view l4 ulong 4 0
+ret ulong 0
+end
+if ne ph_wr_full get ph_w_out 0 req n 0
+ret ulong 0
+end
+if ne ph_rd_full get ph_w_in 0 edit l4 ulong 4 0
+ret ulong 0
+end
+rn = ulong pd0_get_u32 view l4 ulong 0
+if or eq rn ulong 0 gt rn cap
+ret ulong 0
+end
+if ne ph_rd_full get ph_w_in 0 resp rn 0
+ret ulong 0
+end
+ret rn
+end
+
+fn ph_parse_desc b view uchar * n ulong to int
+if lt n ulong 10
+ret -1
+end
+for i ulong 8
+if ne get b i get PH_DESC2 i
+ret -1
+end
+end
+nobs = get b 8
+nch = get b 9
+if or eq nobs uchar 0 or gt ulong nobs V_MAX_OBS gt ulong nch V_MAX_CHAN
+ret -1
+end
+need = add ulong 10 add ulong 8 add mul ulong 16 ulong nch add mul ulong 16 ulong nobs ulong 12
+if lt n need
+ret -1
+end
+o = ulong 10
+dt = bitcast long pd0_get_u64 b o
+o = add o ulong 8
+for c ulong 4
+put p0l_cmin c long 0
+put p0l_cmax c long 0
+end
+for c ulong ulong nch bound 4
+put p0l_cmin c bitcast long pd0_get_u64 b o
+o = add o ulong 8
+end
+for c ulong ulong nch bound 4
+put p0l_cmax c bitcast long pd0_get_u64 b o
+o = add o ulong 8
+end
+for j ulong 8
+put p0l_rmin j long 0
+put p0l_rmax j long 0
+end
+for j ulong ulong nobs bound 8
+v = bitcast long pd0_get_u64 b o
+put p0l_rmin j v
+put ph_rmin_orig j v
+o = add o ulong 8
+end
+for j ulong ulong nobs bound 8
+v = bitcast long pd0_get_u64 b o
+put p0l_rmax j v
+put ph_rmax_orig j v
+o = add o ulong 8
+end
+p0l_set_budget pd0_get_u32 b o pd0_get_u32 b add o ulong 4 pd0_get_u32 b add o ulong 8
+ret p0l_init nobs nch dt get ph_seed 0
+end
+
+fn ph_check_sealed to int
+nc = envcnt
+eb = new uchar 64 0
+for i ulong ulong nc bound 1024
+k = envread i eb 0 ulong 64
+if eq k long 6
+if ne ph_streq view eb ulong 6 PH_PD0B 0
+ret 1
+end
+end
+end
+wn = get ph_arg_wn 0
+st = ulong 0
+for i ulong wn bound 512
+if eq get ph_arg_w i uchar 47
+st = add i ulong 1
+end
+end
+blen = sub wn st
+if ne blen ulong 9
+ret 1
+end
+for i ulong 9
+if ne get ph_arg_w add st i get PH_WORLD_NAME i
+ret 1
+end
+end
+ret 0
+end
+
+note ---- Ledger append directly into vledg_buf ----
+fn ph_ledg_append kind uchar plen ulong to void
+o = get vledg_len 0
+if gt add add o PD0_LEDG_HDR add plen PD0_LEDG_TRAILER VLEDG_CAP
+ret
+end
+hdr = new uchar 16 0
+for i ulong 8
+put hdr i get V_MAGIC_LEDG1 i
+end
+pd0_put_u16 edit hdr ulong 8 ushort 1
+put hdr 10 kind
+put hdr 11 uchar 0
+pd0_put_u32 edit hdr ulong 12 uint plen
+for i ulong 16
+put vledg_buf add o i get hdr i
+end
+for i ulong plen bound 16384
+put vledg_buf add add o PD0_LEDG_HDR i get ph_pl i
+end
+poff = add add o PD0_LEDG_HDR plen
+for k ulong 32
+put vledg_buf add poff k get vledg_last k
+end
+hlen = add add PD0_LEDG_HDR plen PD0_HASH
+hb = new uchar 16448 0
+for i ulong hlen bound 16448
+put hb i get vledg_buf add o i
+end
+h = new uchar 32 0
+pd0_sha256_hash view hb hlen edit h
+for k ulong 32
+put vledg_buf add add poff PD0_HASH k get h k
+put vledg_last k get h k
+end
+put vledg_len 0 add poff PD0_LEDG_TRAILER
+ret
+end
+
+fn ph_tag ep uint tag uchar batch uint orig uchar to void
+p = new uchar 32 0
+n = vr_tag_write ep tag batch orig edit p
+for i ulong n bound 32
+put ph_pl i get p i
+end
+ph_ledg_append LEDG_TAG n
+ret
+end
+
+fn ph_store_rec r view Pd0Rec to void
+nr = get ph_nrec 0
+if ge nr ulong 65536
+ret
+end
+put ph_rec_nobs nr get r n_obs
+put ph_rec_st nr get r status
+put ph_rec_kind nr get r kind
+put ph_rec_ch nr get r channel
+put ph_rec_ep nr get r episode
+put ph_rec_step nr get r step_in_episode
+put ph_rec_app nr get r applied
+rb = mul nr ulong 4
+for j ulong 4
+put ph_rec_bef add rb j get r before j
+put ph_rec_aft add rb j get r after j
+end
+put ph_nrec 0 add nr ulong 1
+ret
+end
+
+fn ph_load_rec idx ulong r edit Pd0Rec to void
+put r n_obs get ph_rec_nobs idx
+put r status get ph_rec_st idx
+put r kind get ph_rec_kind idx
+put r channel get ph_rec_ch idx
+put r episode get ph_rec_ep idx
+put r step_in_episode get ph_rec_step idx
+put r applied get ph_rec_app idx
+rb = mul idx ulong 4
+for j ulong 4
+put r before j get ph_rec_bef add rb j
+put r after j get ph_rec_aft add rb j
+end
+ret
+end
+
+fn ph_push_fit r view Pd0Rec to void
+nf = ulong get sf_n_fit 0
+if ge nf SC_MAX_FIT
+ret
+end
+fb = mul nf V_MAX_OBS
+for j ulong 4
+put sf_bef add fb j get r before j
+put sf_aft add fb j get r after j
+end
+put sf_ch nf get r channel
+put sf_val nf get r applied
+put sf_n_fit 0 uint add nf ulong 1
+ret
+end
+
+fn ph_ep_step_one slot ulong tag uchar ch uchar val long to int
+req = new uchar 16 0
+resp = new uchar 1024 0
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+used = new ulong 1 0
+put req 0 uchar 2
+put req 1 ch
+pd0_put_u64 edit req ulong 2 bitcast ulong val
+rn = ph_world_call view req ulong 10 edit resp ulong 1024
+if eq rn ulong 0
+exit 3
+end
+if ne vr_rec_parse view part resp ulong 0 rn edit r edit used PD0V_OK
+exit 3
+end
+for i ulong rn bound 1024
+put ph_pl i get resp i
+end
+ph_ledg_append LEDG_OBS rn
+ph_store_rec view r
+put ph_ep_n slot add get ph_ep_n slot ulong 1
+if or eq tag TAG_FIT eq tag TAG_SELECT
+ign = p0l_observe view r tag
+end
+st = get r status
+if eq st PD0_BUDGET_EXHAUSTED
+put ph_n_bud 0 add get ph_n_bud 0 uint 1
+ret 1
+end
+put ph_steps_used 0 add get ph_steps_used 0 uint 1
+if or eq st PD0_OK eq st PD0_EPISODE_END
+ok = get ph_n_ok 0
+if lt ok V_MAX_STEPS
+put ph_app_ch ok get r channel
+put ph_app_val ok get r applied
+end
+put ph_n_ok 0 add ok ulong 1
+if eq tag TAG_FIT
+ph_push_fit view r
+end
+end
+if eq st PD0_OUT_OF_BOUNDS
+put ph_n_oob 0 add get ph_n_oob 0 uint 1
+if or eq tag TAG_TRIAL eq tag TAG_REP
+put ph_ep_void slot uchar 1
+put ph_n_vep 0 add get ph_n_vep 0 uint 1
+end
+ret 1
+end
+if eq st PD0_REFUSED_RANGE
+put ph_n_ref 0 add get ph_n_ref 0 uint 1
+ret 0
+end
+if eq st PD0_EPISODE_END
+ret 1
+end
+ret 0
+end
+
+fn ph_ep_reset_call rst view long 8 r edit Pd0Rec to ulong
+req = new uchar 128 0
+resp = new uchar 1024 0
+used = new ulong 1 0
+no = ulong get p0l_nobs 0
+put req 0 uchar 1
+put req 1 uchar no
+for j ulong no bound 8
+pd0_put_u64 edit req add ulong 2 mul j ulong 8 bitcast ulong get rst j
+end
+rn = ph_world_call view req add ulong 2 mul no ulong 8 edit resp ulong 1024
+if eq rn ulong 0
+exit 3
+end
+if ne vr_rec_parse view part resp ulong 0 rn r edit used PD0V_OK
+exit 3
+end
+for i ulong rn bound 1024
+put ph_pl i get resp i
+end
+ret rn
+end
+
+fn ph_ep_reset tag uchar batch uint orig uchar rst view long 8 to int
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+if ge get ph_n_ep 0 PH_MAX_EP
+ret -1
+end
+ep = get ph_next_ep 0
+slot = get ph_n_ep 0
+ph_tag ep tag batch orig
+rn = ph_ep_reset_call rst edit r
+if eq get r status PD0_BUDGET_EXHAUSTED
+put ph_n_bud 0 add get ph_n_bud 0 uint 1
+ret -1
+end
+if ne get r episode ep
+exit 3
+end
+put ph_next_ep 0 add ep uint 1
+put ph_eps_used 0 add get ph_eps_used 0 uint 1
+put ph_ep_tag slot tag
+put ph_ep_first slot get ph_nrec 0
+put ph_ep_n slot ulong 0
+put ph_ep_ok slot uchar 0
+put ph_ep_void slot uchar 0
+put ph_n_ep 0 add slot ulong 1
+ph_ledg_append LEDG_OBS rn
+ph_store_rec view r
+put ph_ep_n slot ulong 1
+if or eq tag TAG_FIT eq tag TAG_SELECT
+ign = p0l_observe view r tag
+end
+if ne get r status PD0_OK
+put ph_n_ref 0 add get ph_n_ref 0 uint 1
+hb = mul slot PD0_HASH
+for k ulong 32
+put ph_ep_hash add hb k uchar 0
+end
+ret -2
+end
+ret int slot
+end
+
+fn ph_ep_hash_finish slot ulong rst view long 8 nst ulong to void
+app_ch = new uchar 20 0
+app_val = new long 20 0
+h = new uchar 32 0
+for s ulong nst bound 20
+put app_ch s get ph_app_ch s
+put app_val s get ph_app_val s
+end
+vr_schedule_hash_raw ulong get p0l_nobs 0 rst nst view app_ch view app_val edit h
+hb = mul slot PD0_HASH
+for k ulong 32
+put ph_ep_hash add hb k get h k
+end
+ret
+end
+
+fn ph_episode tag uchar batch uint orig uchar rst view long 8 chs view uchar 20 vals view long 20 to int
+sret = ph_ep_reset tag batch orig rst
+if eq sret -1
+ret -1
+end
+if eq sret -2
+ret int sub get ph_n_ep 0 ulong 1
+end
+slot = ulong sret
+put ph_n_ok 0 ulong 0
+for s ulong PH_EP_LEN
+if ne ph_ep_step_one slot tag get chs s get vals s 0
+break
+end
+end
+ok = get ph_n_ok 0
+if ge ok PH_EP_LEN
+put ph_ep_ok slot uchar 1
+end
+nst = ok
+if gt nst V_MAX_STEPS
+nst = V_MAX_STEPS
+end
+ph_ep_hash_finish slot rst nst
+ret sret
+end
+
+note ---- Truth / External-world protocol v2 ----
+fn ph_t_readline to long
+pos = ulong 0
+ch = new uchar 1 0
+fd = get ph_t_in 0
+while lt pos ulong 4095 bound 4096
+k = read fd ch 0 ulong 1
+if le k long 0
+if eq pos ulong 0
+ret long -1
+end
+put ph_tline pos uchar 0
+ret long pos
+end
+b = get ch 0
+put ph_tline pos b
+pos = add pos ulong 1
+if eq b uchar 10
+put ph_tline pos uchar 0
+ret long pos
+end
+end
+put ph_tline pos uchar 0
+ret long pos
+end
+
+fn ph_tl_next_i64 pos_io edit ulong 1 n ulong to long
+p = get pos_io 0
+while lt p n bound 4096
+b = get ph_tline p
+if or eq b uchar 32 or eq b uchar 9 or eq b uchar 10 eq b uchar 13
+p = add p ulong 1
+else
+break
+end
+end
+negv = int 0
+if lt p n
+b = get ph_tline p
+if eq b uchar 45
+negv = 1
+p = add p ulong 1
+end
+end
+v = ulong 0
+while lt p n bound 64
+b = get ph_tline p
+if and ge b uchar 48 le b uchar 57
+v = add mul v ulong 10 ulong sub b uchar 48
+p = add p ulong 1
+else
+break
+end
+end
+put pos_io 0 p
+if ne negv 0
+ret neg long v
+end
+ret long v
+end
+
+fn ph_truth_alloc_term tg uchar coef long to ulong
+neq = ulong get vr_neq PH_TRUTH_SLOT
+e = neq
+for i ulong neq bound 12
+if eq get vr_eq_tgt vr_eq_idx PH_TRUTH_SLOT i tg
+e = i
+break
+end
+end
+if eq e neq
+put vr_eq_tgt vr_eq_idx PH_TRUTH_SLOT e tg
+put vr_eq_nt vr_eq_idx PH_TRUTH_SLOT e ushort 0
+put vr_neq PH_TRUTH_SLOT uchar add neq ulong 1
+end
+ei = vr_eq_idx PH_TRUTH_SLOT e
+k = ulong get vr_eq_nt ei
+put vr_eq_nt ei ushort add k ulong 1
+ti = vr_term_idx PH_TRUTH_SLOT e k
+put vr_coef ti coef
+xb = mul ti V_MAX_EX
+for i ulong V_MAX_EX
+put vr_ex add xb i uchar 0
+end
+ret xb
+end
+
+fn ph_truth_add_term tg uchar coef long pos edit ulong 1 nlen ulong ne_ex ulong to void
+xb = ph_truth_alloc_term tg coef
+for i ulong ne_ex bound 16
+put vr_ex add xb i uchar ph_tl_next_i64 pos nlen
+end
+ret
+end
+
+fn ph_ext_add_term b view uchar 2048 o ulong ne_ex ulong to ulong
+tg = get b o
+coef = bitcast long pd0_get_u64 b add o ulong 1
+o = add o ulong 9
+xb = ph_truth_alloc_term tg coef
+for i ulong ne_ex bound 16
+put vr_ex add xb i get b o
+o = add o ulong 1
+end
+ret o
+end
+
+fn ph_ext_rel to int
+req = new uchar 1 4
+b = new uchar 2048 0
+n = ph_world_call view req ulong 1 edit b ulong 2048
+if lt n ulong 22
+ret -1
+end
+for i ulong 8
+if ne get b i get PH_SHAP1 i
+ret -1
+end
+end
+nv = ulong get b 8
+nl = ulong get b 9
+nc = ulong get b 10
+tsz = pd0_get_u32 view b ulong 12
+nt = ulong pd0_get_u16 view b ulong 20
+o = ulong 22
+if gt nv V_MAX_VARS
+ret -1
+end
+if gt nc V_MAX_CHAN
+ret -1
+end
+exp_n = add o mul nt add ulong 9 add nv nc
+if ne n exp_n
+ret -1
+end
+vr_clear PH_TRUTH_SLOT
+put vr_nvars PH_TRUTH_SLOT uchar nv
+put vr_nlat PH_TRUTH_SLOT uchar nl
+put vr_nch PH_TRUTH_SLOT uchar nc
+put ph_truth_size 0 int tsz
+put ph_truth_nlat 0 int nl
+ne_ex = add nv nc
+for k ulong nt bound 64
+o = ph_ext_add_term view b o ne_ex
+end
+put vr_dbits PH_TRUTH_SLOT vr_rel_bits PH_TRUTH_SLOT
+put ph_have_truth 0 1
+ret 0
+end
+
+fn ph_tline_is s view uchar * to int
+n = len s
+for i ulong n bound 8
+if ne get ph_tline i get s i
+ret 0
+end
+end
+ret 1
+end
+
+fn ph_truth_rel to int
+pos = new ulong 1 4
+if ne get ph_ext 0 0
+ret ph_ext_rel
+end
+if ne ph_wr_full get ph_t_out 0 PH_REL_CMD ulong 4 0
+ret -1
+end
+rl = ph_t_readline
+if lt rl long 4
+ret -1
+end
+nlen = ulong rl
+nv = ulong ph_tl_next_i64 edit pos nlen
+nl = ulong ph_tl_next_i64 edit pos nlen
+nc = ulong ph_tl_next_i64 edit pos nlen
+ign_ne = ph_tl_next_i64 edit pos nlen
+ign_sz = ph_tl_next_i64 edit pos nlen
+tsz = int ph_tl_next_i64 edit pos nlen
+vr_clear PH_TRUTH_SLOT
+put vr_nvars PH_TRUTH_SLOT uchar nv
+put vr_nlat PH_TRUTH_SLOT uchar nl
+put vr_nch PH_TRUTH_SLOT uchar nc
+put ph_truth_size 0 tsz
+put ph_truth_nlat 0 int nl
+ne_ex = add nv nc
+while true bound 256
+rl = ph_t_readline
+if lt rl long 3
+break
+end
+if ne ph_tline_is PH_END_CMD 0
+break
+end
+put pos 0 ulong 5
+tg = uchar ph_tl_next_i64 edit pos ulong rl
+coef = ph_tl_next_i64 edit pos ulong rl
+ph_truth_add_term tg coef edit pos ulong rl ne_ex
+end
+put vr_dbits PH_TRUTH_SLOT vr_rel_bits PH_TRUTH_SLOT
+put ph_have_truth 0 1
+ret 0
+end
+
+fn ph_ext_ep_unpack epi ulong no ulong got ulong resp view uchar 1400 to void
+gb = mul epi ulong 160
+for s ulong got bound 20
+sb = add gb mul s V_MAX_OBS
+sno = mul s no
+for j ulong no bound 8
+off = add ulong 2 mul ulong 8 add sno j
+v = bitcast long pd0_get_u64 resp off
+put se_gold add sb j v
+end
+end
+ret
+end
+
+fn ph_ext_episode epi ulong rst view long 8 chs view uchar 20 vals view long 20 to int
+no = ulong get p0l_nobs 0
+req = new uchar 256 0
+resp = new uchar 1400 0
+put req 0 uchar 3
+put req 1 uchar no
+o = ulong 2
+for j ulong no bound 8
+pd0_put_u64 edit req o bitcast ulong get rst j
+o = add o ulong 8
+end
+put req o uchar V_MAX_STEPS
+o = add o ulong 1
+for s ulong V_MAX_STEPS
+put req o get chs s
+o = add o ulong 1
+pd0_put_u64 edit req o bitcast ulong get vals s
+o = add o ulong 8
+end
+rn = ph_world_call view req o edit resp ulong 1400
+if lt rn ulong 2
+ret 0
+end
+got = ulong get resp 1
+if gt got V_MAX_STEPS
+ret 0
+end
+exp_rn = add ulong 2 mul ulong 8 mul no got
+if ne rn exp_rn
+ret 0
+end
+ph_ext_ep_unpack epi no got view resp
+if and eq get resp 0 uchar 0 eq got V_MAX_STEPS
+ret 1
+end
+ret 0
+end
+
+fn ph_truth_ep_send rst view long 8 chs view uchar 20 vals view long 20 to int
+no = ulong get p0l_nobs 0
+ob = new uchar 1024 0
+p = pd0_buf_str edit ob ulong 0 ulong 1024 PH_EP_CMD
+p = pd0_buf_u64 edit ob p ulong 1024 no
+for j ulong no bound 8
+p = pd0_buf_ch edit ob p ulong 1024 uchar 32
+p = pd0_buf_i64 edit ob p ulong 1024 get rst j
+end
+p = pd0_buf_ch edit ob p ulong 1024 uchar 32
+p = pd0_buf_u64 edit ob p ulong 1024 V_MAX_STEPS
+for s ulong V_MAX_STEPS
+p = pd0_buf_ch edit ob p ulong 1024 uchar 32
+ch = get chs s
+if eq ch PD0_CH_NONE
+p = pd0_buf_i64 edit ob p ulong 1024 long -1
+else
+p = pd0_buf_u64 edit ob p ulong 1024 ulong ch
+end
+p = pd0_buf_ch edit ob p ulong 1024 uchar 32
+p = pd0_buf_i64 edit ob p ulong 1024 get vals s
+end
+p = pd0_buf_ch edit ob p ulong 1024 uchar 10
+ret ph_wr_full get ph_t_out 0 view ob p
+end
+
+fn ph_truth_ep_row gb ulong got ulong no ulong nlen ulong to void
+pos = new ulong 1 0
+sb = add gb mul got V_MAX_OBS
+for j ulong no bound 8
+v = ph_tl_next_i64 edit pos nlen
+put se_gold add sb j v
+end
+ret
+end
+
+fn ph_truth_episode epi ulong rst view long 8 chs view uchar 20 vals view long 20 to int
+if ne get ph_ext 0 0
+ret ph_ext_episode epi rst chs vals
+end
+if ne ph_truth_ep_send rst chs vals 0
+ret 0
+end
+rl = ph_t_readline
+if lt rl long 0
+ret 0
+end
+no = ulong get p0l_nobs 0
+gb = mul epi ulong 160
+got = ulong 0
+ok = int 1
+while true bound 64
+rl = ph_t_readline
+if lt rl long 3
+break
+end
+if ne ph_tline_is PH_END_CMD 0
+break
+end
+if ne ph_tline_is PH_OOB_CMD 0
+ok = 0
+continue
+end
+if lt got V_MAX_STEPS
+ph_truth_ep_row gb got no ulong rl
+end
+got = add got ulong 1
+end
+if and ne ok 0 eq got V_MAX_STEPS
+ret 1
+end
+ret 0
+end
+
+note ---- Ladder params & stages ----
+fn ph_setup_ladder_params to void
+no = get p0l_nobs 0
+nch = get p0l_nch 0
+lad_params_default no nch
+for c ulong ulong nch bound 4
+put lp_cmin c get p0l_cmin c
+put lp_cmax c get p0l_cmax c
+end
+rlo = get p0l_rmin 0
+rhi = get p0l_rmax 0
+for j ulong ulong no bound 8
+if lt get p0l_rmin j rlo
+rlo = get p0l_rmin j
+end
+if gt get p0l_rmax j rhi
+rhi = get p0l_rmax j
+end
+end
+put lp_rmin 0 rlo
+put lp_rmax 0 rhi
+put lp_eplen 0 uint PH_EP_LEN
+put lp_dt 0 get p0l_dt 0
+tsz = get ph_truth_size 0
+sb = uint 6
+if gt tsz 0
+sb = add uint tsz uint 2
+end
+put lp_size_bound 0 sb
+lvl = get ph_level 0
+eps = long 20000
+if eq lvl 5
+eps = long 50000
+else
+if eq lvl 6
+eps = long 30000
+end
+end
+put lp_eps_bound 0 eps
+if eq lvl 5
+put lp_noisy 0 uchar 1
+else
+put lp_noisy 0 uchar 0
+end
+ret
+end
+
+fn ph_explore_stage to void
+bst = ulong get p0l_bsteps 0
+bep = ulong get p0l_beps 0
+res = ulong 800
+n_exp = ulong 0
+if gt bst res
+n_exp = div sub bst res PH_EP_LEN
+end
+if gt add n_exp ulong 40 bep
+if gt bep ulong 40
+n_exp = sub bep ulong 40
+else
+n_exp = ulong 0
+end
+end
+rst = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+for e ulong n_exp bound 512
+m = rem e ulong 5
+tag = TAG_HOLDOUT
+if lt m ulong 3
+tag = TAG_FIT
+else
+if eq m ulong 3
+tag = TAG_SELECT
+end
+end
+p0l_explore uint e edit rst edit chs edit vals
+if lt ph_episode tag uint 0 uchar 0 view rst view chs view vals 0
+break
+end
+end
+ret
+end
+
+fn ph_push_forb slot ulong to void
+nf = get ph_n_forb 0
+if ge nf P0L_MAX_FORBID
+ret
+end
+db = mul nf PD0_HASH
+sb = mul slot PD0_HASH
+for k ulong 32
+put p0l_forb add db k get ph_ep_hash add sb k
+end
+put ph_n_forb 0 add nf ulong 1
+ret
+end
+
+fn ph_ledg_write_rel kind uchar rslot ulong out_h edit uchar 32 to void
+buf = new uchar 8192 0
+n = vr_rel_write rslot edit buf
+put ph_pl 0 kind
+for i ulong n bound 8192
+put ph_pl add i ulong 1 get buf i
+end
+ph_ledg_append LEDG_RELATION add n ulong 1
+for k ulong 32
+put out_h k get vledg_last k
+end
+ret
+end
+
+fn ph_submit_fals cand_h view uchar 32 nriv ulong rivs view uchar 256 to void
+fm = new long 2 0
+put fm 0 get lp_eps_bound 0
+put fm 1 long 5
+fb = new uchar 512 0
+fn_len = vr_fals_write cand_h uchar nriv rivs view fm edit fb
+for i ulong fn_len bound 512
+put ph_pl i get fb i
+end
+ph_ledg_append LEDG_FALSIFIER fn_len
+ret
+end
+
+fn ph_submit_hyps nc ulong best_ci ulong to void
+cand_h = new uchar 32 0
+rivs = new uchar 256 0
+rh = new uchar 32 0
+nriv = ulong 0
+nh = ulong 0
+vr_copy PH_HYP_BASE add P0L_CAND_BASE best_ci
+ph_ledg_write_rel REL_CANDIDATE PH_HYP_BASE edit cand_h
+nh = ulong 1
+for i ulong nc bound 8
+if ge nh ulong 4
+break
+end
+if or eq i best_ci ne get p0l_c_null i 0
+continue
+end
+vr_copy add PH_HYP_BASE nh add P0L_CAND_BASE i
+ph_ledg_write_rel REL_RIVAL add PH_HYP_BASE nh edit rh
+rb = mul nriv PD0_HASH
+for k ulong 32
+put rivs add rb k get rh k
+end
+nriv = add nriv ulong 1
+nh = add nh ulong 1
+end
+vr_clear PH_NULL_SLOT
+put vr_nvars PH_NULL_SLOT get p0l_nobs 0
+put vr_nch PH_NULL_SLOT get p0l_nch 0
+vr_copy add PH_HYP_BASE nh PH_NULL_SLOT
+ph_ledg_write_rel REL_NULL PH_NULL_SLOT edit rh
+rb = mul nriv PD0_HASH
+for k ulong 32
+put rivs add rb k get rh k
+end
+nriv = add nriv ulong 1
+nh = add nh ulong 1
+put ph_n_hyp 0 nh
+ph_submit_fals view cand_h nriv view rivs
+ret
+end
+
+fn ph_trial_fb_roll h ulong no ulong rst view long 8 chs view uchar 20 vals view long 20 to void
+pr = new long 160 0
+p0l_rollout add PH_HYP_BASE h rst chs vals V_MAX_STEPS edit pr
+for s ulong V_MAX_STEPS
+sno = mul s no
+for j ulong no bound 8
+val = get pr add sno j
+put ve_expected vr_exp_idx P0L_EXP_BEST h s j val
+end
+end
+ret
+end
+
+fn ph_trial_fallback a ulong t ulong nh ulong to void
+put ve_nobs P0L_EXP_BEST get p0l_nobs 0
+put ve_nhyp P0L_EXP_BEST uchar nh
+put ve_nsteps P0L_EXP_BEST uchar V_MAX_STEPS
+rst = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+sd = add mul get ph_seed 0 ulong 7919 a
+p0l_random_schedule p0l_mix sd uint t PH_TRIAL_TAG edit rst edit chs edit vals
+no = ulong get p0l_nobs 0
+rb = mul P0L_EXP_BEST V_MAX_OBS
+for j ulong no bound 8
+put ve_reset add rb j get rst j
+end
+sb = mul P0L_EXP_BEST V_MAX_STEPS
+for s ulong V_MAX_STEPS
+put ve_step_ch add sb s get chs s
+put ve_step_val add sb s get vals s
+end
+for h ulong nh bound 8
+ph_trial_fb_roll h no view rst view chs view vals
+end
+put ve_div P0L_EXP_BEST long 0
+ret
+end
+
+fn ph_run_trial_prereg to void
+eb = new uchar 16384 0
+xn = vr_exp_write P0L_EXP_BEST edit eb
+for i ulong xn bound 16384
+put ph_pl i get eb i
+end
+ph_ledg_append LEDG_PREREG xn
+ret
+end
+
+fn ph_run_trial_write_and_ep to int
+ph_run_trial_prereg
+rst = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+rb = mul P0L_EXP_BEST V_MAX_OBS
+for j ulong 8
+put rst j get ve_reset add rb j
+end
+sb = mul P0L_EXP_BEST V_MAX_STEPS
+for s ulong 20
+put chs s get ve_step_ch add sb s
+put vals s get ve_step_val add sb s
+end
+slot = ph_episode TAG_TRIAL uint 0 uchar 0 view rst view chs view vals
+if ge slot 0
+ph_push_forb ulong slot
+if ne get ph_ep_void ulong slot uchar 0
+ret 1
+end
+end
+ret 0
+end
+
+fn ph_run_trial a ulong t ulong nh ulong to int
+hyps = new ulong 8 0
+for h ulong nh bound 8
+put hyps h add PH_HYP_BASE h
+end
+pseed = add add mul get ph_seed 0 ulong 1000 mul a ulong 10 t
+dv = p0l_propose view hyps nh pseed ulong 256 get ph_n_forb 0 P0L_EXP_BEST
+if lt dv long 0
+put ph_n_pfail 0 add get ph_n_pfail 0 uint 1
+put ph_n_trnd 0 add get ph_n_trnd 0 uint 1
+ph_trial_fallback a t nh
+end
+ret ph_run_trial_write_and_ep
+end
+
+fn ph_promote_trials to void
+nep = get ph_n_ep 0
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+for s ulong nep bound 1024
+if eq get ph_ep_tag s TAG_TRIAL
+f = get ph_ep_first s
+en = get ph_ep_n s
+for i ulong en bound 64
+ph_load_rec add f i edit r
+ign = p0l_observe view r TAG_FIT
+end
+put ph_ep_tag s TAG_FIT
+end
+end
+ret
+end
+
+fn ph_try_corr to int
+cm = new long 8 0
+if ne p0l_correlation xor get ph_seed 0 ulong 0xc0de uint 2000 edit cm 0
+ret 0
+end
+cb = new uchar 128 0
+cn = vr_corr_write view cm edit cb
+for i ulong cn bound 128
+put ph_pl i get cb i
+end
+ph_ledg_append LEDG_CORR cn
+ret 1
+end
+
+fn ph_trials_stage to void
+put ph_ch_rc 0 lad_check
+have_corr = int 0
+for a ulong 3
+put ph_n_att 0 add get ph_n_att 0 uint 1
+nc = ulong p0l_fit
+if eq have_corr 0
+have_corr = ph_try_corr
+end
+put ph_have_best 0 0
+for i ulong nc bound 8
+if eq get p0l_c_null i 0
+put ph_have_best 0 1
+put ph_best_ci 0 i
+break
+end
+end
+if or eq get ph_have_best 0 0 ne get p0l_c_null 0 0
+put ph_have_best 0 0
+break
+end
+ph_submit_hyps nc get ph_best_ci 0
+put ph_ch_rc 0 lad_check
+if lt get lr_state 0 LS_HYPOTHESIS
+break
+end
+put ph_n_forb 0 ulong 0
+nep = get ph_n_ep 0
+for s ulong nep bound 1024
+ph_push_forb s
+end
+nh = get ph_n_hyp 0
+voids = ulong 0
+t = ulong 0
+while lt t add ulong 5 voids bound 12
+if ne ph_run_trial a t nh 0
+if lt voids ulong 3
+voids = add voids ulong 1
+end
+end
+t = add t ulong 1
+end
+put ph_ch_rc 0 lad_check
+if ge get lr_state 0 LS_INTERVENED
+break
+end
+if eq get lr_code 0 PD0V_T6_TRIAL_FAILED
+ph_promote_trials
+continue
+end
+break
+end
+ret
+end
+
+fn ph_rep_one bid uint sseed ulong e ulong orig uchar nh ulong to int
+rst = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+hyps = new ulong 8 0
+got_p = int 0
+if eq orig ORIGIN_PLANNER
+for h ulong nh bound 8
+put hyps h add PH_HYP_BASE h
+end
+if ge p0l_propose view hyps nh add mul sseed ulong 31 e ulong 128 get ph_n_forb 0 P0L_EXP_BEST long 0
+rb = mul P0L_EXP_BEST V_MAX_OBS
+for j ulong 8
+put rst j get ve_reset add rb j
+end
+sb = mul P0L_EXP_BEST V_MAX_STEPS
+for s ulong 20
+put chs s get ve_step_ch add sb s
+put vals s get ve_step_val add sb s
+end
+got_p = 1
+else
+put ph_n_pfail 0 add get ph_n_pfail 0 uint 1
+end
+end
+if eq got_p 0
+p0l_random_schedule p0l_mix sseed uint e PH_REP_TAG edit rst edit chs edit vals
+end
+slot = ph_episode TAG_REP bid orig view rst view chs view vals
+if ge slot 0
+ph_push_forb ulong slot
+if ne get ph_ep_void ulong slot uchar 0
+ret 1
+end
+end
+ret 0
+end
+
+fn ph_rep_stage to void
+if lt get lr_state 0 LS_INTERVENED
+ret
+end
+nh = get ph_n_hyp 0
+bb = new uchar 32 0
+for bt ulong 3
+for redraw ulong 4
+bid = uint add add bt ulong 1 mul ulong 10 redraw
+sseed = add add mul get ph_seed 0 ulong 100 add bt ulong 1 mul ulong 50 redraw
+bn = vr_batch_write bid sseed uint 10 edit bb
+for i ulong bn bound 32
+put ph_pl i get bb i
+end
+ph_ledg_append LEDG_BATCH bn
+good = ulong 0
+voids = ulong 0
+e = ulong 0
+while and lt good ulong 10 le voids ulong 3 bound 24
+orig = ORIGIN_PLANNER
+if ne and good ulong 1 ulong 0
+orig = ORIGIN_RANDOM
+end
+if ne ph_rep_one bid sseed e orig nh 0
+voids = add voids ulong 1
+else
+good = add good ulong 1
+end
+e = add e ulong 1
+end
+if le voids ulong 3
+break
+end
+put ph_n_vbat 0 add get ph_n_vbat 0 uint 1
+end
+end
+put ph_ch_rc 0 lad_check
+ret
+end
+
+fn ph_emit_law_stage to void
+law = new uchar 65536 0
+ln = lad_emit_law edit law
+put ph_law_len 0 ln
+for i ulong ln bound 65536
+put ph_law i get law i
+end
+if gt ln ulong 0
+put ph_law_rc 0 lad_verify_law view part law ulong 0 ln
+else
+put ph_law_rc 0 -1
+end
+ret
+end
+
+fn ph_ext_final_stage scored_slot ulong has_scored int to void
+fb = new uchar 65536 0
+fh = new uchar 32 0
+fq = new uchar 33 0
+fr = new uchar 16 0
+put ph_fin_st 0 -1
+put ph_fin_ok 0 1
+if eq get ph_ext 0 0
+ret
+end
+fn_len = get ph_law_len 0
+if gt fn_len ulong 0
+for i ulong fn_len bound 65536
+put fb i get ph_law i
+end
+else
+if ne has_scored 0
+fn_len = vr_rel_write scored_slot edit fb
+end
+end
+pd0_sha256_hash view fb fn_len edit fh
+for k ulong 32
+put ph_fhash k get fh k
+end
+put fq 0 uchar 5
+for k ulong 32
+put fq add k ulong 1 get fh k
+end
+frn = ph_world_call view fq ulong 33 edit fr ulong 16
+if eq frn ulong 1
+put ph_fin_st 0 int get fr 0
+end
+if ne get ph_fin_st 0 0
+put ph_fin_ok 0 0
+end
+if ne get ph_fin_ok 0 0
+if ne ph_ext_rel 0
+put ph_fin_ok 0 0
+end
+end
+if ne get ph_fin_ok 0 0
+if ne get ph_dims 0 int get vr_nvars PH_TRUTH_SLOT
+put ph_fin_ok 0 0
+end
+if ne get ph_dims 1 int get vr_nlat PH_TRUTH_SLOT
+put ph_fin_ok 0 0
+end
+if ne get ph_dims 2 int get vr_nch PH_TRUTH_SLOT
+put ph_fin_ok 0 0
+end
+if ne get ph_dims 3 get ph_truth_size 0
+put ph_fin_ok 0 0
+end
+end
+if eq get ph_fin_ok 0 0
+put ph_have_truth 0 0
+end
+ret
+end
+
+fn ph_score_set_box in_box int to void
+no = ulong get p0l_nobs 0
+for j ulong no bound 8
+lo = get ph_rmin_orig j
+hi = get ph_rmax_orig j
+if eq in_box 0
+lo = div mul lo long 3 long 2
+hi = div mul hi long 3 long 2
+end
+put p0l_rmin j lo
+put p0l_rmax j hi
+end
+ret
+end
+
+fn ph_score_copy_term st ulong tgt uchar ti ulong to void
+put sp_t_tgt st tgt
+put sp_t_coef st get vr_coef ti
+db = mul st V_MAX_EX
+sb = mul ti V_MAX_EX
+for k ulong V_MAX_EX
+put sp_t_ex add db k get vr_ex add sb k
+end
+ret
+end
+
+fn ph_score_fill_true to void
+ne_cnt = ulong get vr_neq PH_TRUTH_SLOT
+for e ulong ne_cnt bound 12
+ei = vr_eq_idx PH_TRUTH_SLOT e
+tgt = get vr_eq_tgt ei
+nt = ulong get vr_eq_nt ei
+for t ulong nt bound 32
+st = ulong get sp_n_terms 0
+if ge st SC_MAX_TRUE
+break
+end
+ph_score_copy_term st tgt vr_term_idx PH_TRUTH_SLOT e t
+put sp_n_terms 0 uint add st ulong 1
+end
+end
+ret
+end
+
+fn ph_score_collect to ulong
+g = new ulong 1 0
+rst = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+pd0_stream edit g add get ph_seed 0 ulong 500 PH_SCORE_TAG
+i = ulong 0
+neps = ulong 0
+while and lt i ulong 20 lt neps ulong 20 bound 4096
+ib = int 0
+if lt i ulong 10
+ib = 1
+end
+ph_score_set_box ib
+idx = uint and pd0_splitmix64 edit g ulong 0xffffffff
+if ne ib 0
+p0l_random_schedule p0l_mix add get ph_seed 0 ulong 500 idx PH_SCORE_IN edit rst edit chs edit vals
+else
+p0l_random_schedule p0l_mix add get ph_seed 0 ulong 500 idx PH_SCORE_EX edit rst edit chs edit vals
+end
+if ne ph_truth_episode neps view rst view chs view vals 0
+put se_in_box neps uchar ib
+ib_off = mul neps V_MAX_OBS
+for j ulong 8
+put se_init add ib_off j get rst j
+end
+sb = mul neps V_MAX_STEPS
+for s ulong 20
+put se_ch add sb s get chs s
+put se_val add sb s get vals s
+end
+neps = add neps ulong 1
+i = add i ulong 1
+else
+if eq rem pd0_splitmix64 edit g ulong 64 ulong 0
+i = add i ulong 1
+end
+end
+end
+ph_score_set_box 1
+ret neps
+end
+
+fn ph_score_stage scored_slot ulong has_scored int to void
+put sr_code 0 -1
+put sr_fail_mask 0 uint 0
+put sr_inbox 0 long 0
+put sr_extrap 0 long 0
+put sr_onestep 0 long 0
+put sr_ref 0 long 0
+put ph_n_sc_eps 0 0
+if or eq has_scored 0 or eq get ph_have_truth 0 0 lt get ph_level 0 0
+ret
+end
+neps = ph_score_collect
+put se_n_eps 0 uint neps
+put ph_n_sc_eps 0 int neps
+sc_sp_clear
+put sp_n_obs 0 get p0l_nobs 0
+put sp_n_ch 0 get p0l_nch 0
+put sp_size_bound 0 get lp_size_bound 0
+lvl = get ph_level 0
+if eq lvl 6
+put sp_inbox_bound 0 long 30000
+put sp_extrap_bound 0 long 80000
+put sp_onestep_bound 0 long 0
+put sp_score_const 0 0
+put sp_req_lat 0 1
+else
+put sp_inbox_bound 0 long 20000
+put sp_extrap_bound 0 long 60000
+put sp_onestep_bound 0 long 10000
+put sp_score_const 0 1
+put sp_req_lat 0 0
+end
+if eq lvl 5
+put sp_const_tol 0 long 100000
+else
+put sp_const_tol 0 long 50000
+end
+put sp_lat_ref_fac 0 long 3
+if ne lvl 6
+ph_score_fill_true
+end
+ign = pd0_score scored_slot uint 0 0
+ret
+end
+
+note ---- File outputs & PD0L / PD0F summary lines ----
+fn ph_buf_lvl dst edit uchar * pos ulong cap ulong to ulong
+lvl = get ph_level 0
+if lt lvl 0
+ret pd0_buf_str dst pos cap PH_NULL
+end
+pos = pd0_buf_ch dst pos cap uchar 76
+ret pd0_buf_u64 dst pos cap ulong lvl
+end
+
+fn ph_build_path ext view uchar * dst edit uchar 1024 to ulong
+p = ulong 0
+on = get ph_arg_on 0
+for i ulong on bound 512
+put dst p get ph_arg_o i
+p = add p ulong 1
+end
+p = pd0_buf_ch dst p ulong 1024 uchar 47
+p = pd0_buf_ch dst p ulong 1024 uchar 112
+p = pd0_buf_ch dst p ulong 1024 uchar 100
+p = pd0_buf_ch dst p ulong 1024 uchar 48
+p = pd0_buf_ch dst p ulong 1024 uchar 108
+p = pd0_buf_ch dst p ulong 1024 uchar 45
+p = ph_buf_lvl dst p ulong 1024
+p = pd0_buf_ch dst p ulong 1024 uchar 45
+p = pd0_buf_ch dst p ulong 1024 uchar 115
+p = pd0_buf_u64 dst p ulong 1024 get ph_seed 0
+ret pd0_buf_str dst p ulong 1024 ext
+end
+
+text PH_EXT_LEDG ".ledger"
+text PH_EXT_LAW ".law"
+text PH_EXT_JSON ".json"
+
+fn ph_write_vledg path view uchar 1024 plen ulong to void
+chk = new uchar 4096 0
+fd = fopen path 0 plen int 577 int 420
+if lt fd long 0
+ret
+end
+tot = get vledg_len 0
+pos = ulong 0
+while lt pos tot bound 2048
+want = sub tot pos
+if gt want ulong 4096
+want = ulong 4096
+end
+for i ulong want bound 4096
+put chk i get vledg_buf add pos i
+end
+ign = write int fd chk 0 want
+pos = add pos want
+end
+ign2 = fclose int fd
+ret
+end
+
+fn ph_write_law path view uchar 1024 plen ulong to void
+chk = new uchar 4096 0
+tot = get ph_law_len 0
+if eq tot ulong 0
+ret
+end
+fd = fopen path 0 plen int 577 int 420
+if lt fd long 0
+ret
+end
+pos = ulong 0
+while lt pos tot bound 32
+want = sub tot pos
+if gt want ulong 4096
+want = ulong 4096
+end
+for i ulong want bound 4096
+put chk i get ph_law add pos i
+end
+ign = write int fd chk 0 want
+pos = add pos want
+end
+ign2 = fclose int fd
+ret
+end
+
+text PH_J1 "{\"level\":\""
+text PH_J2 "\",\"seed\":"
+text PH_J3 ",\"describe_version\":2,\"state\":\""
+text PH_J4 "\",\"code\":"
+text PH_J5 ",\"refutations\":"
+text PH_J6 ",\"score_code\":"
+text PH_J7 ",\"score_mask\":"
+text PH_J8 ",\"learner\":"
+text PH_J9 "}\n"
+
+fn ph_write_json_body fd int to void
+rlen = p0l_report
+chk = new uchar 4096 0
+pos = ulong 0
+while lt pos rlen bound 512
+want = sub rlen pos
+if gt want ulong 4096
+want = ulong 4096
+end
+for i ulong want bound 4096
+put chk i get p0l_rep_buf add pos i
+end
+ign = write fd chk 0 want
+pos = add pos want
+end
+ign = write fd PH_J9 0 ulong 2
+ret
+end
+
+fn ph_write_json path view uchar 1024 plen ulong to void
+hdr = new uchar 512 0
+fd = fopen path 0 plen int 577 int 420
+if lt fd long 0
+ret
+end
+p = pd0_buf_str edit hdr ulong 0 ulong 512 PH_J1
+p = ph_buf_lvl edit hdr p ulong 512
+p = pd0_buf_str edit hdr p ulong 512 PH_J2
+p = pd0_buf_u64 edit hdr p ulong 512 get ph_seed 0
+p = pd0_buf_str edit hdr p ulong 512 PH_J3
+p = lad_buf_state_name edit hdr p ulong 512 get lr_state 0
+p = pd0_buf_str edit hdr p ulong 512 PH_J4
+p = pd0_buf_i64 edit hdr p ulong 512 long get lr_code 0
+p = pd0_buf_str edit hdr p ulong 512 PH_J5
+p = pd0_buf_u64 edit hdr p ulong 512 ulong get lr_n_refut 0
+p = pd0_buf_str edit hdr p ulong 512 PH_J6
+p = pd0_buf_i64 edit hdr p ulong 512 long get sr_code 0
+p = pd0_buf_str edit hdr p ulong 512 PH_J7
+p = pd0_buf_u64 edit hdr p ulong 512 ulong get sr_fail_mask 0
+p = pd0_buf_str edit hdr p ulong 512 PH_J8
+ign = write int fd hdr 0 p
+ph_write_json_body int fd
+ign2 = fclose int fd
+ret
+end
+
+fn ph_write_files to void
+path = new uchar 1024 0
+pl = ph_build_path PH_EXT_LEDG edit path
+ph_write_vledg view path pl
+pl = ph_build_path PH_EXT_LAW edit path
+ph_write_law view path pl
+pl = ph_build_path PH_EXT_JSON edit path
+ph_write_json view path pl
+ret
+end
+
+fn ph_buf_hex32 dst edit uchar * pos ulong cap ulong v uint to ulong
+if eq v uint 0
+ret pd0_buf_ch dst pos cap uchar 48
+end
+tmp = new uchar 8 0
+k = ulong 0
+cur = v
+while gt cur uint 0 bound 8
+put tmp k get PH_HEX ulong and cur uint 15
+k = add k ulong 1
+cur = shr cur 4
+end
+for i ulong k bound 8
+pos = pd0_buf_ch dst pos cap get tmp sub sub k ulong 1 i
+end
+ret pos
+end
+
+text PH_L1 "PD0L level="
+text PH_L2 " seed="
+text PH_L3 " desc=v2 episodes="
+text PH_L4 " steps="
+text PH_L5 " fit="
+text PH_L6 " select="
+text PH_L7 " state="
+text PH_L8 " code="
+text PH_L9 " stall="
+text PH_L10 " refutations="
+text PH_L11 " attempts="
+text PH_L12 " cand_size="
+text PH_L13 " cand_bits="
+text PH_L14 " size_bound="
+text PH_L15 " fit_nrmse="
+text PH_L16 " select_nrmse="
+text PH_L17 " hidden_state="
+text PH_L18 " score="
+text PH_L19 " score_code="
+text PH_L20 " mask=0x"
+text PH_L21 " inbox="
+text PH_L22 " extrap="
+text PH_L23 " onestep="
+text PH_L24 " ref="
+text PH_L25 " score_eps="
+text PH_L26 " law="
+text PH_L27 " checker_rc="
+text PH_L28 " oob="
+text PH_L29 " refused="
+text PH_L30 " budget_hits="
+text PH_L31 " propose_fail="
+text PH_L32 " trial_random="
+text PH_L33 " void_ep="
+text PH_L34 " void_batch="
+
+fn ph_print_pd0l_part1 to void
+ob = new uchar 512 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 PH_L1
+p = ph_buf_lvl edit ob p ulong 512
+p = pd0_buf_str edit ob p ulong 512 PH_L2
+p = pd0_buf_u64 edit ob p ulong 512 get ph_seed 0
+p = pd0_buf_str edit ob p ulong 512 PH_L3
+p = pd0_buf_u64 edit ob p ulong 512 get ph_n_ep 0
+p = pd0_buf_str edit ob p ulong 512 PH_L4
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_steps_used 0
+p = pd0_buf_str edit ob p ulong 512 PH_L5
+p = pd0_buf_u64 edit ob p ulong 512 ulong p0l_n_transitions TAG_FIT
+p = pd0_buf_str edit ob p ulong 512 PH_L6
+p = pd0_buf_u64 edit ob p ulong 512 ulong p0l_n_transitions TAG_SELECT
+p = pd0_buf_str edit ob p ulong 512 PH_L7
+p = lad_buf_state_name edit ob p ulong 512 get lr_state 0
+p = pd0_buf_str edit ob p ulong 512 PH_L8
+p = pd0_buf_i64 edit ob p ulong 512 long get lr_code 0
+p = pd0_buf_str edit ob p ulong 512 PH_L9
+p = pd0_buf_i64 edit ob p ulong 512 long get lr_stall_code 0
+p = pd0_buf_str edit ob p ulong 512 PH_L10
+p = pd0_buf_u64 edit ob p ulong 512 ulong get lr_n_refut 0
+p = pd0_buf_str edit ob p ulong 512 PH_L11
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_att 0
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn ph_print_pd0l_part2 scored_slot ulong has_scored int to void
+ob = new uchar 512 0
+cbits = uint 0
+csize = uint 0
+if ne has_scored 0
+cbits = vr_rel_bits scored_slot
+csize = vr_rel_size scored_slot
+end
+fnr = long -1
+snr = long -1
+hid = int 0
+if ne get ph_have_best 0 0
+ci = get ph_best_ci 0
+fnr = get p0l_c_fnrmse ci
+snr = get p0l_c_snrmse ci
+hid = get p0l_c_hid ci
+end
+p = pd0_buf_str edit ob ulong 0 ulong 512 PH_L12
+p = pd0_buf_u64 edit ob p ulong 512 ulong csize
+p = pd0_buf_str edit ob p ulong 512 PH_L13
+p = pd0_buf_u64 edit ob p ulong 512 ulong cbits
+p = pd0_buf_str edit ob p ulong 512 PH_L14
+p = pd0_buf_u64 edit ob p ulong 512 ulong get lp_size_bound 0
+p = pd0_buf_str edit ob p ulong 512 PH_L15
+p = pd0_buf_i64 edit ob p ulong 512 fnr
+p = pd0_buf_str edit ob p ulong 512 PH_L16
+p = pd0_buf_i64 edit ob p ulong 512 snr
+p = pd0_buf_str edit ob p ulong 512 PH_L17
+p = pd0_buf_i64 edit ob p ulong 512 long hid
+p = pd0_buf_str edit ob p ulong 512 PH_L18
+sc = get sr_code 0
+if eq has_scored 0
+p = pd0_buf_str edit ob p ulong 512 PH_S_NOCAND
+else
+if eq sc 0
+p = pd0_buf_str edit ob p ulong 512 PH_S_PASS
+else
+if lt sc 0
+p = pd0_buf_str edit ob p ulong 512 PH_S_NOTSC
+else
+p = pd0_buf_str edit ob p ulong 512 PH_S_FAIL
+end
+end
+end
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn ph_print_pd0l_part3 to void
+ob = new uchar 512 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 PH_L19
+p = pd0_buf_i64 edit ob p ulong 512 long get sr_code 0
+p = pd0_buf_str edit ob p ulong 512 PH_L20
+p = ph_buf_hex32 edit ob p ulong 512 get sr_fail_mask 0
+p = pd0_buf_str edit ob p ulong 512 PH_L21
+p = pd0_buf_i64 edit ob p ulong 512 get sr_inbox 0
+p = pd0_buf_str edit ob p ulong 512 PH_L22
+p = pd0_buf_i64 edit ob p ulong 512 get sr_extrap 0
+p = pd0_buf_str edit ob p ulong 512 PH_L23
+p = pd0_buf_i64 edit ob p ulong 512 get sr_onestep 0
+p = pd0_buf_str edit ob p ulong 512 PH_L24
+p = pd0_buf_i64 edit ob p ulong 512 get sr_ref 0
+p = pd0_buf_str edit ob p ulong 512 PH_L25
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_n_sc_eps 0
+p = pd0_buf_str edit ob p ulong 512 PH_L26
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_law_rc 0
+p = pd0_buf_str edit ob p ulong 512 PH_L27
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_ch_rc 0
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn ph_print_pd0l_part4 to void
+ob = new uchar 512 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 PH_L28
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_oob 0
+p = pd0_buf_str edit ob p ulong 512 PH_L29
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_ref 0
+p = pd0_buf_str edit ob p ulong 512 PH_L30
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_bud 0
+p = pd0_buf_str edit ob p ulong 512 PH_L31
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_pfail 0
+p = pd0_buf_str edit ob p ulong 512 PH_L32
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_trnd 0
+p = pd0_buf_str edit ob p ulong 512 PH_L33
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_vep 0
+p = pd0_buf_str edit ob p ulong 512 PH_L34
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_n_vbat 0
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ret
+end
+
+text PH_F1 "PD0F level="
+text PH_F2 " seed="
+text PH_F3 " final="
+text PH_F4 " final_status="
+text PH_F5 " score_before_final="
+text PH_F6 " shape_before_final="
+text PH_F7 " play_after_final="
+text PH_F8 " dup_final="
+text PH_F9 " audit_ok="
+text PH_F10 " mode="
+text PH_F11 " s_star="
+text PH_F12 " n_vars="
+text PH_F13 " n_latent="
+text PH_F14 " n_channels="
+text PH_F15 " valid="
+
+fn ph_audit_print aok int valid int to void
+ob = new uchar 512 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 PH_F1
+p = ph_buf_lvl edit ob p ulong 512
+p = pd0_buf_str edit ob p ulong 512 PH_F2
+p = pd0_buf_u64 edit ob p ulong 512 get ph_seed 0
+p = pd0_buf_str edit ob p ulong 512 PH_F3
+for k ulong 32
+b = get ph_fhash k
+p = pd0_buf_ch edit ob p ulong 512 get PH_HEX ulong shr b 4
+p = pd0_buf_ch edit ob p ulong 512 get PH_HEX ulong and b uchar 15
+end
+p = pd0_buf_str edit ob p ulong 512 PH_F4
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_fin_st 0
+p = pd0_buf_str edit ob p ulong 512 PH_F5
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_aud_cnt 0
+p = pd0_buf_str edit ob p ulong 512 PH_F6
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_aud_cnt 1
+p = pd0_buf_str edit ob p ulong 512 PH_F7
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_aud_cnt 2
+p = pd0_buf_str edit ob p ulong 512 PH_F8
+p = pd0_buf_u64 edit ob p ulong 512 ulong get ph_aud_cnt 3
+p = pd0_buf_str edit ob p ulong 512 PH_F9
+p = pd0_buf_i64 edit ob p ulong 512 long aok
+p = pd0_buf_str edit ob p ulong 512 PH_F10
+if ne get ph_sealed 0 0
+p = pd0_buf_str edit ob p ulong 512 PH_M_SEALED
+else
+p = pd0_buf_str edit ob p ulong 512 PH_M_PD0
+end
+p = pd0_buf_str edit ob p ulong 512 PH_F11
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_dims 3
+p = pd0_buf_str edit ob p ulong 512 PH_F12
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_dims 0
+p = pd0_buf_str edit ob p ulong 512 PH_F13
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_dims 1
+p = pd0_buf_str edit ob p ulong 512 PH_F14
+p = pd0_buf_i64 edit ob p ulong 512 long get ph_dims 2
+p = pd0_buf_str edit ob p ulong 512 PH_F15
+if ne valid 0
+p = pd0_buf_str edit ob p ulong 512 PH_V_VALID
+else
+p = pd0_buf_str edit ob p ulong 512 PH_V_INVALID
+end
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn ph_audit_stage to void
+aq = new uchar 1 6
+ar = new uchar 128 0
+if eq get ph_ext 0 0
+ret
+end
+arn = ph_world_call view aq ulong 1 edit ar ulong 128
+aok = int 0
+if eq arn ulong 57
+m = int 1
+for i ulong 8
+if ne get ar i get PH_AUDT1 i
+m = 0
+end
+end
+if ne m 0
+for i ulong 4
+put ph_aud_cnt i pd0_get_u32 view ar add ulong 9 mul i ulong 4
+end
+if eq get ar 8 uchar 1
+aok = 1
+for k ulong 32
+if ne get ar add ulong 25 k get ph_fhash k
+aok = 0
+end
+end
+end
+end
+end
+put ph_aud_ok 0 aok
+valid = int 1
+if eq get ph_fin_ok 0 0
+valid = 0
+end
+if eq aok 0
+valid = 0
+end
+for i ulong 4
+if ne get ph_aud_cnt i uint 0
+valid = 0
+end
+end
+ph_audit_print aok valid
+ret
+end
+
+fn ph_read_args to int
+if lt argcnt long 6
+pd0_puts 2 PH_USAGE
+ret 2
+end
+b = new uchar 512 0
+n1 = argread 1 b 0 512
+if le n1 long 0
+ret 2
+end
+put ph_arg_wn 0 ulong n1
+for i ulong ulong n1 bound 512
+put ph_arg_w i get b i
+end
+n2 = argread 2 b 0 512
+if le n2 long 0
+ret 2
+end
+put ph_arg_tn 0 ulong n2
+for i ulong ulong n2 bound 512
+put ph_arg_t i get b i
+end
+n3 = argread 3 b 0 32
+if le n3 long 0
+ret 2
+end
+put ph_arg_ln 0 ulong n3
+for i ulong ulong n3 bound 32
+put ph_arg_l i get b i
+end
+if ne ph_streq view b ulong n3 PH_NULL 0
+put ph_level 0 -1
+else
+put ph_level 0 int ph_parse_u64 view b ulong n3
+end
+n4 = argread 4 b 0 32
+if le n4 long 0
+ret 2
+end
+put ph_arg_sn 0 ulong n4
+for i ulong ulong n4 bound 32
+put ph_arg_s i get b i
+end
+put ph_seed 0 ph_parse_u64 view b ulong n4
+n5 = argread 5 b 0 512
+if le n5 long 0
+ret 2
+end
+put ph_arg_on 0 ulong n5
+for i ulong ulong n5 bound 512
+put ph_arg_o i get b i
+end
+if and eq ulong n2 ulong 1 eq get ph_arg_t 0 uchar 45
+put ph_ext 0 1
+else
+put ph_ext 0 0
+end
+ret 0
+end
+
+fn ph_pub_sstar lvl int to int
+if eq lvl 0
+ret 2
+end
+if eq lvl 1
+ret 3
+end
+if eq lvl 2
+ret 4
+end
+if eq lvl 3
+ret 8
+end
+if eq lvl 4
+ret 4
+end
+if eq lvl 5
+ret 4
+end
+if eq lvl 6
+ret 7
+end
+ret 0
+end
+
+fn ph_init_world to int
+if ne ph_spawn 0 0
+ret 3
+end
+if eq get ph_ext 0 0
+if ne ph_spawn 1 0
+ret 3
+end
+end
+req = new uchar 1 0
+resp = new uchar 1024 0
+rn = ph_world_call view req ulong 1 edit resp ulong 1024
+if or eq rn ulong 0 ne ph_parse_desc view resp rn 0
+ret 3
+end
+put ph_sealed 0 ph_check_sealed
+if ne get ph_ext 0 0
+if ne ph_ext_rel 0
+ret 3
+end
+put ph_dims 0 int get vr_nvars PH_TRUTH_SLOT
+put ph_dims 1 int get vr_nlat PH_TRUTH_SLOT
+put ph_dims 2 int get vr_nch PH_TRUTH_SLOT
+put ph_dims 3 get ph_truth_size 0
+put ph_have_truth 0 0
+put ph_dims_ok 0 1
+if eq get ph_sealed 0 0
+lvl = get ph_level 0
+if and ge lvl 0 lt lvl 8
+if ne get ph_truth_size 0 ph_pub_sstar lvl
+put ph_dims_ok 0 0
+end
+end
+end
+else
+if ne ph_truth_rel 0
+ret 3
+end
+end
+ret 0
+end
+
+fn ph_cleanup to void
+if eq get ph_ext 0 0
+ign = ph_wr_full get ph_t_out 0 PH_QUIT_CMD ulong 5
+ign2 = fclose get ph_t_out 0
+ign3 = fclose get ph_t_in 0
+end
+ign4 = fclose get ph_w_out 0
+ign5 = fclose get ph_w_in 0
+st = new uchar 4 0
+ign6 = waitpid get ph_w_pid 0 st 0 ulong 4 0
+if eq get ph_ext 0 0
+ign7 = waitpid get ph_t_pid 0 st 0 ulong 4 0
+end
+ret
+end
+
+fn main to int
+rc = ph_read_args
+if ne rc 0
+ret rc
+end
+rc = ph_init_world
+if ne rc 0
+ret rc
+end
+ph_setup_ladder_params
+ph_explore_stage
+ph_trials_stage
+ph_rep_stage
+ph_emit_law_stage
+scored_slot = ulong 0
+has_scored = int 0
+if ne get lr_have_cand 0 0
+scored_slot = LR_CAND_SLOT
+has_scored = 1
+else
+if ne get ph_have_best 0 0
+scored_slot = add P0L_CAND_BASE get ph_best_ci 0
+has_scored = 1
+end
+end
+ph_ext_final_stage scored_slot has_scored
+ph_score_stage scored_slot has_scored
+ph_write_files
+ph_print_pd0l_part1
+ph_print_pd0l_part2 scored_slot has_scored
+ph_print_pd0l_part3
+ph_print_pd0l_part4
+ph_audit_stage
+ph_cleanup
+ret 0
+end

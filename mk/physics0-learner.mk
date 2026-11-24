@@ -1,10 +1,10 @@
 # PD-0 learner (Physics-0 Discovery Engine, Direction 4): src/physics0/learner,
-# tests/physics0/learner. The learner links only the verifier's byte formats
-# (ladder/pd0_fmt.c, header-only pd0_rng.h) and sha256; never the generators,
-# the world, or any file I/O (isolation check below). The harness drives the
-# world process and a test-only truth process (links the generators) over pipes.
+# tests/physics0/learner. Pure seeded OM-2: the learner links only the verifier's
+# byte formats (ladder/pd0_fmt.om, pd0_rng.om, pd0_wire.om) and never the
+# generators, the world, or any file I/O (isolation check below). The harness
+# drives the world process and a test-only truth process over pipes.
 #
-# test-physics0-learner     isolation + unit tests (plain + ASan/UBSan)
+# test-physics0-learner     isolation + pure OM-2 unit tests + protocol v2 + pd0b run smoke
 # physics0-learner-dev      development run: levels L0..L6 + null, seeds 1..5
 # physics0-learner-evidence copy new receipts into evidence/physics0/learner/ (cp -n)
 # physics0-pd0b-run / physics0-pd0b-freeze  PD-0b harness against an external world (see the end of this file)
@@ -12,62 +12,56 @@ ifndef PHYSICS0_LEARNER_MK
 PHYSICS0_LEARNER_MK := 1
 .PHONY: test-physics0-learner physics0-learner-dev physics0-learner-evidence p0l-isolation
 P0L_DIR = $(OUT_DIR)/physics0-learner
-# -Wno-pedantic: generated binding src/omega_om_units.c uses GNU range designators; see mk/estimation.mk.
+P0L_OMC ?= seed/out/omc
+P0L_COMMIT := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+P0L_OM_COMMIT = echo 'text PD0_VERIFIER_COMMIT "$(P0L_COMMIT)"'
+
+# Kept for mk/physics0-pd1.mk (live C planner still links the C learner and verifier)
 P0L_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -Wno-misleading-indentation -O2 -D_POSIX_C_SOURCE=200809L -ffp-contract=off -fno-fast-math \
   -Isrc -Isrc/physics0/ladder -Isrc/physics0/score -Isrc/physics0/controls -Isrc/physics0/learner -Wno-pedantic
-P0L_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
 P0L_LEARNER_SRCS = src/physics0/learner/pd0_learner.c src/physics0/ladder/pd0_fmt.c
 P0L_VERIFIER_SRCS = src/physics0/ladder/pd0_codes.c src/physics0/ladder/pd0_ladder.c src/physics0/score/pd0_score.c src/physics0/controls/pd0_controls.c
 P0L_HDRS = src/physics0/learner/pd0_learner.h src/physics0/ladder/pd0_fmt.h src/physics0/ladder/pd0_rng.h src/physics0/ladder/pd0_ladder.h src/physics0/ladder/pd0_codes.h src/physics0/score/pd0_score.h src/physics0/controls/pd0_controls.h
-# substrate side (generators): the truth process only
-P0L_TRUTH_SRCS = src/physics0/pd0_chan.c src/physics0/pd0_wire.c src/physics0/pd0_rng.c src/physics0/pd0_relation.c src/physics0/pd0_gen.c src/physics0/pd0_world.c src/physics0/pd0_guard.c src/omega_om_units.c
+
+# Pure seeded OM-2 module lists
+P0L_OM_BASE = src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_wire.om src/physics0/ladder/pd0_codes.om src/physics0/ladder/pd0_fmt.om src/physics0/controls/pd0_receipt.om
+P0L_OM_LEARNER = $(P0L_OM_BASE) src/physics0/learner/pd0_learner.om
+P0L_OM_VERIFY = $(P0L_OM_BASE) src/physics0/ladder/pd0_ladder.om src/physics0/score/pd0_score.om src/physics0/controls/pd0_controls.om
+P0L_OM_WORLD = src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_chan.om src/physics0/pd0_wire.om src/physics0/pd0_relation.om src/physics0/pd0_world.om
+P0L_OM_ISOL_UNITS = src/physics0/learner/pd0_learner.om src/physics0/learner/pd0_learner_main.om src/physics0/ladder/pd0_fmt.om
+P0L_FORBIDDEN = 'truth_|oracle|rx_|aienos_|argus_|forge_|mmap|fork|exec|socket|getenv|system'
+
 P0L_LEVELS ?= 0 1 2 3 4 5 6 null
 P0L_SEEDS ?= 1 2 3 4 5
 
-$(P0L_DIR)/obj/%.o: src/physics0/learner/%.c $(P0L_HDRS)
-	@mkdir -p $(P0L_DIR)/obj
-	$(CC) $(P0L_CFLAGS) -c -o $@ $<
-$(P0L_DIR)/obj/pd0_fmt.o: src/physics0/ladder/pd0_fmt.c $(P0L_HDRS)
-	@mkdir -p $(P0L_DIR)/obj
-	$(CC) $(P0L_CFLAGS) -c -o $@ $<
-$(P0L_DIR)/obj/pd0_gen.o: src/physics0/pd0_gen.c
-	@mkdir -p $(P0L_DIR)/obj
-	$(CC) -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -c -o $@ $<
-P0L_OBJS = $(P0L_DIR)/obj/pd0_learner.o $(P0L_DIR)/obj/pd0_learner_main.o $(P0L_DIR)/obj/pd0_fmt.o
-# G5 isolation (spec I10) on the learner objects, plus: no truth/oracle symbol, no process or socket call
-p0l-isolation: $(P0L_OBJS) $(P0L_DIR)/obj/pd0_gen.o
-	PD0_GEN_OBJ=$(P0L_DIR)/obj/pd0_gen.o sh tests/physics0/isolation.sh $(P0L_OBJS) | tee $(P0L_DIR)/isolation.out | tail -1; grep -q '^PHYSICS0_ISOLATION: PASS' $(P0L_DIR)/isolation.out
-	@if nm $(P0L_OBJS) | grep -E 'truth_|oracle|rx_|aienos_|argus_|forge_|mmap|fork|exec|socket|getenv|system'; then echo "learner object references forbidden symbol"; exit 1; fi
-	@echo "p0l-isolation: learner objects carry no generator, world, file, process or authority symbol"
+# G5 isolation (spec I10) on the learner OM units, plus: no truth/oracle/process/socket/authority symbol
+p0l-isolation: $(P0L_OM_ISOL_UNITS) src/physics0/pd0_world.om
+	@mkdir -p $(P0L_DIR)
+	PD0_GEN_OM=src/physics0/pd0_world.om sh tests/physics0/isolation.sh $(P0L_OM_ISOL_UNITS) | tee $(P0L_DIR)/isolation.out | tail -1; grep -q '^PHYSICS0_ISOLATION: PASS' $(P0L_DIR)/isolation.out
+	@if grep -hv '^[[:space:]]*note' $(P0L_OM_ISOL_UNITS) | grep -E $(P0L_FORBIDDEN); then echo "learner OM source references forbidden symbol"; exit 1; fi
+	@echo "p0l-isolation: learner OM sources carry no generator, world, file, process or authority symbol"
 
-$(P0L_DIR)/pd0-learner: src/physics0/learner/pd0_learner_main.c $(P0L_LEARNER_SRCS) src/omega_om_units.c $(P0L_HDRS)
+$(P0L_DIR)/pd0-learner: $(P0L_OM_LEARNER) src/physics0/learner/pd0_learner_main.om $(P0L_OMC)
 	@mkdir -p $(P0L_DIR)
-	$(CC) $(P0L_CFLAGS) -o $@ src/physics0/learner/pd0_learner_main.c $(P0L_LEARNER_SRCS) src/omega_om_units.c -lm
-$(P0L_DIR)/test_pd0_learner: tests/physics0/learner/test_pd0_learner.c $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c $(P0L_HDRS)
+	{ echo "om2"; $(P0L_OM_COMMIT); cat $(P0L_OM_LEARNER) src/physics0/learner/pd0_learner_main.om; } | $(P0L_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+$(P0L_DIR)/test_pd0_learner: $(P0L_OM_VERIFY) src/physics0/learner/pd0_learner.om tests/physics0/learner/test_pd0_learner.om $(P0L_OMC)
 	@mkdir -p $(P0L_DIR)
-	$(CC) $(P0L_CFLAGS) -o $@ $< $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c -lm
-$(P0L_DIR)/test_pd0_learner_asan: tests/physics0/learner/test_pd0_learner.c $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c $(P0L_HDRS)
+	{ echo "om2"; $(P0L_OM_COMMIT); cat $(P0L_OM_VERIFY) src/physics0/learner/pd0_learner.om tests/physics0/learner/test_pd0_learner.om; } | $(P0L_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+$(P0L_DIR)/pd0-harness: $(P0L_OM_VERIFY) src/physics0/learner/pd0_learner.om tests/physics0/learner/pd0_harness.om $(P0L_OMC)
 	@mkdir -p $(P0L_DIR)
-	$(CC) $(P0L_CFLAGS) $(P0L_ASAN) -o $@ $< $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c -lm
-$(P0L_DIR)/pd0-harness: tests/physics0/learner/pd0_harness.c $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c $(P0L_HDRS)
+	{ echo "om2"; $(P0L_OM_COMMIT); cat $(P0L_OM_VERIFY) src/physics0/learner/pd0_learner.om tests/physics0/learner/pd0_harness.om; } | $(P0L_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+$(P0L_DIR)/pd0-truth: $(P0L_OM_WORLD) tests/physics0/learner/pd0_truth_main.om $(P0L_OMC)
 	@mkdir -p $(P0L_DIR)
-	$(CC) $(P0L_CFLAGS) -o $@ $< $(P0L_LEARNER_SRCS) $(P0L_VERIFIER_SRCS) src/omega_om_units.c -lm
-$(P0L_DIR)/pd0-truth: tests/physics0/learner/pd0_truth_main.c $(P0L_TRUTH_SRCS) $(wildcard src/physics0/*.h)
-	@mkdir -p $(P0L_DIR)
-	$(CC) -std=c11 -Wall -Wextra -Werror -pedantic -O2 -D_POSIX_C_SOURCE=200809L -Isrc -o $@ $< $(P0L_TRUTH_SRCS) -lm -Wno-pedantic
-
-P0L_OMC ?= seed/out/omc
-P0L_OM_WORLD = src/physics0/pd0_types.om src/physics0/pd0_rng.om src/physics0/pd0_chan.om src/physics0/pd0_wire.om src/physics0/pd0_relation.om src/physics0/pd0_world.om
+	{ echo "om2"; cat $(P0L_OM_WORLD) tests/physics0/learner/pd0_truth_main.om; } | $(P0L_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(P0L_DIR)/test_pd0_protocol_v2: $(P0L_OM_WORLD) tests/physics0/learner/test_pd0_protocol_v2.om $(P0L_OMC)
 	@mkdir -p $(P0L_DIR)
-	{ echo "om2"; cat $(P0L_OM_WORLD) tests/physics0/learner/test_pd0_protocol_v2.om; } | $(P0L_OMC) > $@ && chmod +x $@
+	{ echo "om2"; cat $(P0L_OM_WORLD) tests/physics0/learner/test_pd0_protocol_v2.om; } | $(P0L_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-test-physics0-learner: p0l-isolation $(P0L_DIR)/test_pd0_learner $(P0L_DIR)/test_pd0_learner_asan $(P0L_DIR)/pd0-learner $(P0L_DIR)/test_pd0_protocol_v2
+test-physics0-learner: p0l-isolation $(P0L_DIR)/test_pd0_learner $(P0L_DIR)/pd0-learner $(P0L_DIR)/test_pd0_protocol_v2
 	./$(P0L_DIR)/test_pd0_learner
-	./$(P0L_DIR)/test_pd0_learner_asan
 	./$(P0L_DIR)/test_pd0_protocol_v2
 	sh tests/physics0/learner/test_pd0b_run.sh
-	@echo "test-physics0-learner: PASS (isolation, unit tests plain + ASan/UBSan, protocol v2 world ops)"
+	@echo "test-physics0-learner: PASS (isolation, pure OM-2 unit tests, protocol v2 world ops)"
 
 # development run on the world process; results in $(P0L_DIR)/dev/ (one line per instance + ledger/law/json per instance)
 physics0-learner-dev: $(P0L_DIR)/pd0-harness $(P0L_DIR)/pd0-truth $(OUT_DIR)/physics0/pd0-world

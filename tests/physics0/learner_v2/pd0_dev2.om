@@ -1,0 +1,1563 @@
+note SPDX-License-Identifier: Apache-2.0
+note tests/physics0/learner_v2/pd0_dev2.om: Pure seeded OM-2 PD-0 learner v2/v2.1 development driver.
+note Modes: flag, regime, prior, detect, shift, prior21.
+note Usage: pd0-dev2 <mode> <seed_lo> <seed_hi>
+
+const D2_EP_LEN ulong 20
+const D2_MAXEP ulong 64
+const D2_NLEV ulong 8
+const D2_NK ulong 4
+const D2_REL_F ulong 114
+const D2_REL_P0 ulong 115
+const D2_REL_P1 ulong 116
+const D2_REL_B ulong 117
+
+text D2_USAGE "usage: pd0-dev2 flag|regime|prior|detect|shift|prior21 <seed_lo> <seed_hi>\n"
+text D2_M_FLAG "flag"
+text D2_M_REGIME "regime"
+text D2_M_PRIOR "prior"
+text D2_M_DETECT "detect"
+text D2_M_SHIFT "shift"
+text D2_M_PRIOR21 "prior21"
+text D2_NULL "null"
+text D2_FIT "fit"
+text D2_T_TEST1 "test1"
+text D2_T_TEST2 "test2"
+text D2_T_EXP "explore"
+text D2_T_R2 "r2"
+text D2_DESC2 "PD0DESC2"
+text D2_V_TIE "TIE"
+text D2_V_HELPS "HELPS"
+text D2_V_HARMS "HARMS"
+text D2_O_KEPT "KEPT"
+text D2_O_CORR "CORRECTED"
+text D2_O_OTH "REJECTED_OTHER_TERMS"
+text D2_O_NULL "REJECTED_TO_NULL"
+text D2_PN_WRONG "wrong"
+text D2_PN_STALE "stale"
+text D2_R_SW "switch"
+text D2_R_NOSW "noswitch"
+text D2_ARM_V2 "v2"
+text D2_ARM_V21 "v21"
+
+note ---- Active world session ----
+global d2_lvl int 1
+global d2_seed ulong 1
+global d2_nobs uchar 1
+global d2_nch uchar 1
+global d2_dt long 1
+global d2_cmin long 4
+global d2_cmax long 4
+global d2_rmin long 8
+global d2_rmax long 8
+global d2_epmax uint 1
+global d2_bsteps uint 1
+global d2_beps uint 1
+global d2_forget int 1
+
+note ---- Episode store (0..255 = r1 train, 256..319 = r1 test, 320..339 = r2 test, 340..371 = r2 train) ----
+const D2_EP_SLOTS ulong 384
+const D2_REC_PER_EP ulong 21
+global d2_ep_n uint 384
+global d2_r1_tag uchar 256
+global d2_r1_ntrain ulong 1
+global d2_r1_ntest ulong 1
+global d2_er_nobs uchar 8064
+global d2_er_st uchar 8064
+global d2_er_kind uchar 8064
+global d2_er_ch uchar 8064
+global d2_er_ep uint 8064
+global d2_er_step uint 8064
+global d2_er_app long 8064
+global d2_er_bef long 32256
+global d2_er_aft long 32256
+
+note ---- Eval accumulators & summary arrays ----
+global d2_ar_se f64 8
+global d2_ar_s f64 8
+global d2_ar_ss f64 8
+global d2_ao_se f64 8
+global d2_ao_s f64 8
+global d2_ao_ss f64 8
+global d2_ev_roll long 1
+global d2_ev_one long 1
+global d2_ks ulong 4
+global d2_rolls long 64
+global d2_ones long 64
+global d2_fx long 256
+global d2_rt long 256
+global d2_fr long 256
+global d2_v21 long 256
+global d2_delays long 64
+global d2_pcnt int 40
+global d2_pvb long 640
+global d2_pvp long 640
+global d2_pvn long 640
+global d2_pnv ulong 10
+global d2_f_null int 1
+global d2_prank int 1
+
+fn d2_parse_u64 buf view uchar * n ulong to ulong
+v = ulong 0
+for i ulong n bound 32
+c = get buf i
+if and ge c uchar 48 le c uchar 57
+v = add mul v ulong 10 ulong sub c uchar 48
+end
+end
+ret v
+end
+
+fn d2_streq a view uchar * na ulong b view uchar * to int
+nb = len b
+if ne na nb
+ret 0
+end
+for i ulong na bound 32
+if ne get a i get b i
+ret 0
+end
+end
+ret 1
+end
+
+fn d2_buf_lvl dst edit uchar * pos ulong cap ulong lvl int to ulong
+if eq lvl 7
+ret pd0_buf_str dst pos cap D2_NULL
+end
+pos = pd0_buf_ch dst pos cap uchar 76
+ret pd0_buf_u64 dst pos cap ulong lvl
+end
+
+fn d2_buf_f64_2 dst edit uchar * pos ulong cap ulong x f64 to ulong
+if lt x 0.0f64
+pos = pd0_buf_ch dst pos cap uchar 45
+x = neg x
+end
+sc = ulong pd0_llround mul x 100.0f64
+ip = div sc ulong 100
+fp = rem sc ulong 100
+pos = pd0_buf_u64 dst pos cap ip
+pos = pd0_buf_ch dst pos cap uchar 46
+pos = pd0_buf_ch dst pos cap uchar add ulong 48 div fp ulong 10
+ret pd0_buf_ch dst pos cap uchar add ulong 48 rem fp ulong 10
+end
+
+fn d2_world_open w edit Pd0World d edit Pd0Desc g edit Pd0Gen lvl int seed ulong to int
+put d2_lvl 0 lvl
+put d2_seed 0 seed
+if ne pd0_world_init w d g lvl seed 0
+ret -1
+end
+put p0w_req 0 PD0_OP_DESCRIBE
+rn = pd0_world_handle w view d view g ulong 1
+if lt rn ulong 10
+ret -1
+end
+for i ulong 8
+if ne get p0w_resp i get D2_DESC2 i
+ret -1
+end
+end
+nobs = get p0w_resp 8
+nch = get p0w_resp 9
+put d2_nobs 0 nobs
+put d2_nch 0 nch
+b = new uchar 256 0
+for i ulong rn bound 256
+put b i get p0w_resp i
+end
+o = ulong 10
+put d2_dt 0 bitcast long pd0_get_u64 view b o
+o = add o ulong 8
+for c ulong 4
+put d2_cmin c long 0
+put d2_cmax c long 0
+end
+for c ulong ulong nch bound 4
+put d2_cmin c bitcast long pd0_get_u64 view b o
+o = add o ulong 8
+end
+for c ulong ulong nch bound 4
+put d2_cmax c bitcast long pd0_get_u64 view b o
+o = add o ulong 8
+end
+for j ulong 8
+put d2_rmin j long 0
+put d2_rmax j long 0
+end
+for j ulong ulong nobs bound 8
+put d2_rmin j bitcast long pd0_get_u64 view b o
+o = add o ulong 8
+end
+for j ulong ulong nobs bound 8
+put d2_rmax j bitcast long pd0_get_u64 view b o
+o = add o ulong 8
+end
+put d2_epmax 0 pd0_get_u32 view b o
+put d2_bsteps 0 pd0_get_u32 view b add o ulong 4
+put d2_beps 0 pd0_get_u32 view b add o ulong 8
+ret 0
+end
+
+fn d2_sync_learner_desc seed ulong to void
+cmin = new long 4 0
+cmax = new long 4 0
+rmin = new long 8 0
+rmax = new long 8 0
+for c ulong 4
+put cmin c get d2_cmin c
+put cmax c get d2_cmax c
+end
+for j ulong 8
+put rmin j get d2_rmin j
+put rmax j get d2_rmax j
+end
+p0l_set_bounds view cmin view cmax view rmin view rmax
+p0l_set_budget get d2_epmax 0 get d2_bsteps 0 get d2_beps 0
+ign = p0l_init get d2_nobs 0 get d2_nch 0 get d2_dt 0 seed
+ret
+end
+
+fn d2_store_ep_rec eslot ulong ri ulong r view Pd0Rec to void
+idx = add mul eslot D2_REC_PER_EP ri
+put d2_er_nobs idx get r n_obs
+put d2_er_st idx get r status
+put d2_er_kind idx get r kind
+put d2_er_ch idx get r channel
+put d2_er_ep idx get r episode
+put d2_er_step idx get r step_in_episode
+put d2_er_app idx get r applied
+rb = mul idx ulong 4
+for j ulong 4
+put d2_er_bef add rb j get r before j
+put d2_er_aft add rb j get r after j
+end
+ret
+end
+
+fn d2_load_ep_rec eslot ulong ri ulong r edit Pd0Rec to void
+idx = add mul eslot D2_REC_PER_EP ri
+put r n_obs get d2_er_nobs idx
+put r status get d2_er_st idx
+put r kind get d2_er_kind idx
+put r channel get d2_er_ch idx
+put r episode get d2_er_ep idx
+put r step_in_episode get d2_er_step idx
+put r applied get d2_er_app idx
+rb = mul idx ulong 4
+for j ulong 4
+put r before j get d2_er_bef add rb j
+put r after j get d2_er_aft add rb j
+end
+ret
+end
+
+fn d2_parse_world_resp rn ulong r edit Pd0Rec to void
+b = new uchar 256 0
+used = new ulong 1 0
+for i ulong rn bound 256
+put b i get p0w_resp i
+end
+if ne vr_rec_parse view part b ulong 0 rn r edit used PD0V_OK
+exit 3
+end
+ret
+end
+
+fn d2_put_req_u64 off ulong v ulong to void
+b = new uchar 8 0
+pd0_put_u64 edit b ulong 0 v
+for i ulong 8
+put p0w_req add off i get b i
+end
+ret
+end
+
+fn d2_run_ep_rst w edit Pd0World d view Pd0Desc g view Pd0Gen eslot ulong rst view long 8 to uchar
+no = ulong get d2_nobs 0
+put p0w_req 0 PD0_OP_RESET
+put p0w_req 1 uchar no
+for j ulong no bound 8
+d2_put_req_u64 add ulong 2 mul j ulong 8 bitcast ulong get rst j
+end
+rn = pd0_world_handle w d g add ulong 2 mul no ulong 8
+if eq rn ulong 0
+exit 3
+end
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+d2_parse_world_resp rn edit r
+d2_store_ep_rec eslot ulong 0 view r
+put d2_ep_n eslot uint 1
+ret get r status
+end
+
+fn d2_run_ep_step w edit Pd0World d view Pd0Desc g view Pd0Gen eslot ulong ch uchar val long to uchar
+put p0w_req 0 PD0_OP_STEP
+put p0w_req 1 ch
+d2_put_req_u64 ulong 2 bitcast ulong val
+rn = pd0_world_handle w d g ulong 10
+if eq rn ulong 0
+exit 3
+end
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+d2_parse_world_resp rn edit r
+en = ulong get d2_ep_n eslot
+d2_store_ep_rec eslot en view r
+put d2_ep_n eslot uint add en ulong 1
+ret get r status
+end
+
+fn d2_run_ep w edit Pd0World d view Pd0Desc g view Pd0Gen eslot ulong tid int idx uint to void
+rst = new long 8 0
+chs = new uchar 20 0
+vals = new long 20 0
+d2_sync_learner_desc get d2_seed 0
+sd = p0l_mix get d2_seed 0 idx
+if eq tid 0
+p0l_random_schedule sd D2_T_TEST1 edit rst edit chs edit vals
+else
+if eq tid 1
+p0l_random_schedule sd D2_T_TEST2 edit rst edit chs edit vals
+else
+if eq tid 3
+p0l_random_schedule sd D2_T_R2 edit rst edit chs edit vals
+else
+p0l_random_schedule sd D2_T_EXP edit rst edit chs edit vals
+end
+end
+end
+st0 = d2_run_ep_rst w d g eslot view rst
+if ne st0 PD0_OK
+ret
+end
+for s ulong D2_EP_LEN
+stt = d2_run_ep_step w d g eslot get chs s get vals s
+if eq stt PD0_EPISODE_END
+break
+end
+if eq stt PD0_OUT_OF_BOUNDS
+break
+end
+if eq stt PD0_BUDGET_EXHAUSTED
+break
+end
+end
+ret
+end
+
+fn d2_feed_ep eslot ulong tag uchar to void
+en = ulong get d2_ep_n eslot
+r = new Pd0Rec 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+for i ulong en bound 21
+d2_load_ep_rec eslot i edit r
+ign = p0l_observe view r tag
+end
+ret
+end
+
+fn d2_collect_r1 w edit Pd0World d view Pd0Desc g view Pd0Gen to void
+put d2_r1_ntrain 0 ulong 0
+put d2_r1_ntest 0 ulong 0
+bst = ulong get d2_bsteps 0
+bep = ulong get d2_beps 0
+res = ulong 800
+n_exp = ulong 0
+if gt bst res
+n_exp = div sub bst res D2_EP_LEN
+end
+if gt add n_exp ulong 40 bep
+if gt bep ulong 40
+n_exp = sub bep ulong 40
+else
+n_exp = ulong 0
+end
+end
+for e ulong n_exp bound 300
+m = rem e ulong 5
+if eq m ulong 4
+nt = get d2_r1_ntest 0
+if lt nt D2_MAXEP
+d2_run_ep w d g add ulong 256 nt 0 uint nt
+put d2_r1_ntest 0 add nt ulong 1
+end
+continue
+end
+ntr = get d2_r1_ntrain 0
+if ge ntr ulong 256
+break
+end
+d2_run_ep w d g ntr 2 uint e
+if eq m ulong 3
+put d2_r1_tag ntr TAG_SELECT
+else
+put d2_r1_tag ntr TAG_FIT
+end
+put d2_r1_ntrain 0 add ntr ulong 1
+end
+ret
+end
+
+fn d2_build with_r1 int k2 ulong has_prior int pslot ulong to void
+d2_sync_learner_desc get d2_seed 0
+p0l_set_forgetting get d2_forget 0
+if ne with_r1 0
+ntr = get d2_r1_ntrain 0
+for i ulong ntr bound 256
+d2_feed_ep i get d2_r1_tag i
+end
+end
+for i ulong k2 bound 32
+tag = TAG_FIT
+if eq rem i ulong 4 ulong 3
+tag = TAG_SELECT
+end
+d2_feed_ep add ulong 340 i tag
+end
+if ne has_prior 0
+p0l_set_prior 1 pslot
+end
+ign = p0l_fit
+ret
+end
+
+note ---- Evaluation on TEST episodes ----
+fn d2_mclear to void
+for j ulong 8
+put d2_ar_se j 0.0f64
+put d2_ar_s j 0.0f64
+put d2_ar_ss j 0.0f64
+put d2_ao_se j 0.0f64
+put d2_ao_s j 0.0f64
+put d2_ao_ss j 0.0f64
+end
+ret
+end
+
+fn d2_madd_ar j ulong pj long tv long to void
+e = div f64 sub pj tv 1000000.0f64
+v = div f64 tv 1000000.0f64
+put d2_ar_se j add get d2_ar_se j mul e e
+put d2_ar_s j add get d2_ar_s j v
+put d2_ar_ss j add get d2_ar_ss j mul v v
+ret
+end
+
+fn d2_madd_ao j ulong pj long tv long to void
+e = div f64 sub pj tv 1000000.0f64
+v = div f64 tv 1000000.0f64
+put d2_ao_se j add get d2_ao_se j mul e e
+put d2_ao_s j add get d2_ao_s j v
+put d2_ao_ss j add get d2_ao_ss j mul v v
+ret
+end
+
+fn d2_mnrmse_ar n ulong no ulong to long
+if eq n ulong 0
+ret long 0
+end
+fn_d = f64 n
+w = 0.0f64
+for j ulong no bound 8
+rmse = fsqrt div get d2_ar_se j fn_d
+m = div get d2_ar_s j fn_d
+var = sub div get d2_ar_ss j fn_d mul m m
+sd = 0.0f64
+if gt var 0.0f64
+sd = fsqrt var
+end
+v = rmse
+if gt sd 1.0e-9f64
+v = div rmse sd
+end
+if gt v w
+w = v
+end
+end
+if gt w 9.0e12f64
+ret P0L_I64_MAX
+end
+ret long mul w 1000000.0f64
+end
+
+fn d2_mnrmse_ao n ulong no ulong to long
+if eq n ulong 0
+ret long 0
+end
+fn_d = f64 n
+w = 0.0f64
+for j ulong no bound 8
+rmse = fsqrt div get d2_ao_se j fn_d
+m = div get d2_ao_s j fn_d
+var = sub div get d2_ao_ss j fn_d mul m m
+sd = 0.0f64
+if gt var 0.0f64
+sd = fsqrt var
+end
+v = rmse
+if gt sd 1.0e-9f64
+v = div rmse sd
+end
+if gt v w
+w = v
+end
+end
+if gt w 9.0e12f64
+ret P0L_I64_MAX
+end
+ret long mul w 1000000.0f64
+end
+
+fn d2_eval_one_step rslot ulong eslot ulong ri ulong no ulong to void
+idx = add mul eslot D2_REC_PER_EP ri
+rb = mul idx ulong 4
+s0 = new long 12 0
+nx = new long 12 0
+for j ulong no bound 4
+put s0 j get d2_er_bef add rb j
+end
+vr_rel_step rslot view s0 get d2_er_ch idx get d2_er_app idx edit nx
+for j ulong no bound 4
+d2_madd_ao j get nx j get d2_er_aft add rb j
+end
+ret
+end
+
+fn d2_eval_ep_collect eslot ulong en ulong chs edit uchar 20 vals edit long 20 ris edit ulong 20 to ulong
+ns = ulong 0
+for k ulong sub en ulong 1 bound 20
+ri = add k ulong 1
+idx = add mul eslot D2_REC_PER_EP ri
+st = get d2_er_st idx
+ok = int 0
+if eq st PD0_OK
+ok = 1
+end
+if eq st PD0_EPISODE_END
+ok = 1
+end
+if ne ok 0
+put chs ns get d2_er_ch idx
+put vals ns get d2_er_app idx
+put ris ns ri
+ns = add ns ulong 1
+end
+end
+ret ns
+end
+
+fn d2_eval_ep_ar dst view long 160 sb ulong rb ulong no ulong to void
+for j ulong no bound 4
+pj = get dst add sb j
+tv = get d2_er_aft add rb j
+d2_madd_ar j pj tv
+end
+ret
+end
+
+fn d2_eval_ep_score rslot ulong eslot ulong no ulong ns ulong ris view ulong 20 dst view long 160 to void
+for s ulong ns bound 20
+ri = get ris s
+rb = mul add mul eslot D2_REC_PER_EP ri ulong 4
+sb = mul s no
+d2_eval_ep_ar dst sb rb no
+d2_eval_one_step rslot eslot ri no
+end
+ret
+end
+
+fn d2_eval_ep rslot ulong eslot ulong no ulong to ulong
+en = ulong get d2_ep_n eslot
+if le en ulong 1
+ret ulong 0
+end
+chs = new uchar 20 0
+vals = new long 20 0
+ris = new ulong 20 0
+ns = d2_eval_ep_collect eslot en edit chs edit vals edit ris
+if eq ns ulong 0
+ret ulong 0
+end
+init = new long 8 0
+rb0 = mul mul eslot D2_REC_PER_EP ulong 4
+for j ulong no bound 4
+put init j get d2_er_aft add rb0 j
+end
+dst = new long 160 0
+p0l_rollout rslot view init view chs view vals ns edit dst
+d2_eval_ep_score rslot eslot no ns view ris view dst
+ret ns
+end
+
+fn d2_eval_rel rslot ulong base_ep ulong nte ulong no ulong to void
+d2_mclear
+tot = ulong 0
+for i ulong nte bound 64
+tot = add tot d2_eval_ep rslot add base_ep i no
+end
+put d2_ev_roll 0 d2_mnrmse_ar tot no
+put d2_ev_one 0 d2_mnrmse_ao tot no
+ret
+end
+
+note ---- Median & verdict helpers ----
+fn d2_median v edit long 64 n ulong to long
+if eq n ulong 0
+ret long 0
+end
+for i ulong n bound 64
+if eq i ulong 0
+continue
+end
+key = get v i
+j = i
+while gt j ulong 0 bound 64
+jm = sub j ulong 1
+if gt get v jm key
+put v j get v jm
+j = jm
+else
+break
+end
+end
+put v j key
+end
+ret get v div n ulong 2
+end
+
+fn d2_verdict_code a long b long to int
+m = a
+if lt b m
+m = b
+end
+d = sub a b
+if lt d long 0
+d = neg d
+end
+tol = div m long 5
+if lt tol long 200
+tol = long 200
+end
+if le d tol
+ret 1
+end
+if lt a b
+ret 0
+end
+ret 2
+end
+
+fn d2_buf_verdict dst edit uchar * pos ulong cap ulong vc int to ulong
+if eq vc 0
+ret pd0_buf_str dst pos cap D2_V_HELPS
+end
+if eq vc 1
+ret pd0_buf_str dst pos cap D2_V_TIE
+end
+ret pd0_buf_str dst pos cap D2_V_HARMS
+end
+
+note ---- C1: flag mode ----
+text D2_F1 "P0V2F learner=v2 level="
+text D2_F2 " seed="
+text D2_F3 " cand0="
+text D2_F4 " size="
+text D2_F5 " sel1="
+text D2_F6 " selroll="
+text D2_F7 " by_roll="
+text D2_F8 " test_roll20="
+text D2_F9 " test_one="
+text D2_F10 " hidden="
+text D2_FS1 "P0V2F-SUM learner=v2 level="
+text D2_FS2 " seeds="
+text D2_FS3 " hidden_fired="
+text D2_FS4 " median_test_roll20="
+text D2_FS5 " median_test_one="
+
+fn d2_flag_print lvl int seed ulong has_best int best_ci ulong to void
+ob = new uchar 512 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_F1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_F2
+p = pd0_buf_u64 edit ob p ulong 512 seed
+p = pd0_buf_str edit ob p ulong 512 D2_F3
+if ne get p0l_c_null 0 0
+p = pd0_buf_str edit ob p ulong 512 D2_NULL
+else
+p = pd0_buf_str edit ob p ulong 512 D2_FIT
+end
+p = pd0_buf_str edit ob p ulong 512 D2_F4
+p = pd0_buf_u64 edit ob p ulong 512 ulong get p0l_c_size 0
+p = pd0_buf_str edit ob p ulong 512 D2_F5
+p = pd0_buf_i64 edit ob p ulong 512 get p0l_c_snrmse 0
+p = pd0_buf_str edit ob p ulong 512 D2_F6
+sr = long 0
+byr = int 0
+hid = int 0
+if ne has_best 0
+sr = get p0l_c_roll_nrmse best_ci
+byr = get p0l_c_hid_roll best_ci
+hid = get p0l_c_hid best_ci
+end
+p = pd0_buf_i64 edit ob p ulong 512 sr
+p = pd0_buf_str edit ob p ulong 512 D2_F7
+p = pd0_buf_i64 edit ob p ulong 512 long byr
+p = pd0_buf_str edit ob p ulong 512 D2_F8
+p = pd0_buf_i64 edit ob p ulong 512 get d2_ev_roll 0
+p = pd0_buf_str edit ob p ulong 512 D2_F9
+p = pd0_buf_i64 edit ob p ulong 512 get d2_ev_one 0
+p = pd0_buf_str edit ob p ulong 512 D2_F10
+p = pd0_buf_i64 edit ob p ulong 512 long hid
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn d2_flag_seed lvl int seed ulong to int
+w = new Pd0World 0 0 0 0 0 0 0 0 0 0 0 0 0
+d = new Pd0Desc 0 0 0 0 0 0 0 0 0 0
+g = new Pd0Gen 0 0 0 0 0 0 0
+if ne d2_world_open edit w edit d edit g lvl seed 0
+ret -1
+end
+d2_collect_r1 edit w view d view g
+put d2_forget 0 0
+d2_build 1 ulong 0 0 ulong 0
+nc = get p0l_ncand 0
+has_best = int 0
+best_ci = ulong 0
+for i ulong nc bound 8
+if eq get p0l_c_null i 0
+has_best = 1
+best_ci = i
+break
+end
+end
+if ne get p0l_c_null 0 0
+has_best = 0
+end
+d2_eval_rel P0L_CAND_BASE ulong 256 get d2_r1_ntest 0 ulong get d2_nobs 0
+d2_flag_print lvl seed has_best best_ci
+if ne has_best 0
+ret get p0l_c_hid best_ci
+end
+ret 0
+end
+
+fn d2_flag_level lvl int lo ulong hi ulong to int
+r_arr = new long 64 0
+o_arr = new long 64 0
+ob = new uchar 256 0
+fired = ulong 0
+nseed = ulong 0
+nr = ulong 0
+for sd_i ulong add sub hi lo ulong 1 bound 64
+h = d2_flag_seed lvl add lo sd_i
+if lt h 0
+ret 3
+end
+fired = add fired ulong h
+nseed = add nseed ulong 1
+if lt nr ulong 64
+put r_arr nr get d2_ev_roll 0
+put o_arr nr get d2_ev_one 0
+nr = add nr ulong 1
+end
+end
+p = pd0_buf_str edit ob ulong 0 ulong 256 D2_FS1
+p = d2_buf_lvl edit ob p ulong 256 lvl
+p = pd0_buf_str edit ob p ulong 256 D2_FS2
+p = pd0_buf_u64 edit ob p ulong 256 nseed
+p = pd0_buf_str edit ob p ulong 256 D2_FS3
+p = pd0_buf_u64 edit ob p ulong 256 fired
+p = pd0_buf_str edit ob p ulong 256 D2_FS4
+p = pd0_buf_i64 edit ob p ulong 256 d2_median edit r_arr nr
+p = pd0_buf_str edit ob p ulong 256 D2_FS5
+p = pd0_buf_i64 edit ob p ulong 256 d2_median edit o_arr nr
+p = pd0_buf_ch edit ob p ulong 256 uchar 10
+pd0_put_bytes 1 view ob p
+ret 0
+end
+
+fn d2_mode_flag lo ulong hi ulong to int
+for lvl_u ulong D2_NLEV
+rc = d2_flag_level int lvl_u lo hi
+if ne rc 0
+ret rc
+end
+end
+ret 0
+end
+
+note ---- v2.1 C1: detect mode ----
+text D2_D1 "P0V21D level="
+text D2_D2 " seed="
+text D2_D3 " run="
+text D2_D4 " const_change_ppm="
+text D2_D5 " episodes="
+text D2_D6 " base_ep="
+text D2_D7 " alarm="
+text D2_D8 " alarm_ep="
+text D2_D9 " change_ep="
+text D2_D10 " switch_ep="
+text D2_D11 " delay="
+text D2_D12 " cusum_max="
+text D2_D13 " old_kept="
+text D2_DS1 "P0V21D-SUM level="
+text D2_DS2 " false_alarms="
+text D2_DS3 " switch_detected="
+text D2_DS4 " median_delay_episodes="
+
+fn d2_detect_print lvl int seed ulong sw int ppm long to void
+ob = new uchar 512 0
+ntrain = long get d2_r1_ntrain 0
+al = get p0l_det_alarm 0
+delay = long 0
+if ne al 0
+delay = add sub long get p0l_det_aep 0 ntrain long 1
+end
+swep = long -1
+if ne sw 0
+swep = ntrain
+end
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_D1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_D2
+p = pd0_buf_u64 edit ob p ulong 512 seed
+p = pd0_buf_str edit ob p ulong 512 D2_D3
+if ne sw 0
+p = pd0_buf_str edit ob p ulong 512 D2_R_SW
+else
+p = pd0_buf_str edit ob p ulong 512 D2_R_NOSW
+end
+p = pd0_buf_str edit ob p ulong 512 D2_D4
+p = pd0_buf_i64 edit ob p ulong 512 ppm
+p = pd0_buf_str edit ob p ulong 512 D2_D5
+p = pd0_buf_u64 edit ob p ulong 512 ulong get p0l_det_nep 0
+p = pd0_buf_str edit ob p ulong 512 D2_D6
+p = pd0_buf_u64 edit ob p ulong 512 ulong get p0l_det_bep 0
+p = pd0_buf_str edit ob p ulong 512 D2_D7
+p = pd0_buf_i64 edit ob p ulong 512 long al
+p = pd0_buf_str edit ob p ulong 512 D2_D8
+p = pd0_buf_u64 edit ob p ulong 512 ulong get p0l_det_aep 0
+p = pd0_buf_str edit ob p ulong 512 D2_D9
+p = pd0_buf_u64 edit ob p ulong 512 ulong get p0l_det_cep 0
+p = pd0_buf_str edit ob p ulong 512 D2_D10
+p = pd0_buf_i64 edit ob p ulong 512 swep
+p = pd0_buf_str edit ob p ulong 512 D2_D11
+p = pd0_buf_i64 edit ob p ulong 512 delay
+p = pd0_buf_str edit ob p ulong 512 D2_D12
+p = d2_buf_f64_2 edit ob p ulong 512 get p0l_det_cmax 0
+p = pd0_buf_str edit ob p ulong 512 D2_D13
+p = pd0_buf_i64 edit ob p ulong 512 long get p0l_det_oldk 0
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn d2_detect_one lvl int seed ulong sw int out_ppm edit long 1 to int
+w = new Pd0World 0 0 0 0 0 0 0 0 0 0 0 0 0
+d = new Pd0Desc 0 0 0 0 0 0 0 0 0 0
+g = new Pd0Gen 0 0 0 0 0 0 0
+if ne d2_world_open edit w edit d edit g lvl seed 0
+ret -1
+end
+d2_collect_r1 edit w view d view g
+put out_ppm 0 long 0
+if ne sw 0
+if ne pd0_world_switch_regime edit w edit g lvl uint 1 out_ppm 0
+ret -1
+end
+end
+for i ulong 32
+d2_run_ep edit w view d view g add ulong 340 i 3 uint i
+end
+put d2_forget 0 1
+d2_build 1 ulong 32 0 ulong 0
+put d2_forget 0 0
+d2_detect_print lvl seed sw get out_ppm 0
+ret 0
+end
+
+fn d2_detect_step lvl int seed ulong sw int st edit ulong 4 d_arr edit long 64 to int
+ppm = new long 1 0
+if ne d2_detect_one lvl seed sw edit ppm 0
+ret 3
+end
+al = get p0l_det_alarm 0
+if eq sw 0
+put st 0 add get st 0 ulong al
+put st 1 add get st 1 ulong 1
+ret 0
+end
+if gt get ppm 0 long 0
+put st 3 add get st 3 ulong 1
+if ne al 0
+delay = add sub long get p0l_det_aep 0 long get d2_r1_ntrain 0 long 1
+det = get st 2
+if lt det ulong 64
+put d_arr det delay
+end
+put st 2 add det ulong 1
+end
+end
+ret 0
+end
+
+fn d2_detect_level lvl int lo ulong hi ulong to int
+d_arr = new long 64 0
+st = new ulong 4 0
+for sd_i ulong add sub hi lo ulong 1 bound 64
+seed = add lo sd_i
+if ne d2_detect_step lvl seed 0 edit st edit d_arr 0
+ret 3
+end
+if ne d2_detect_step lvl seed 1 edit st edit d_arr 0
+ret 3
+end
+end
+md_n = get st 2
+if gt md_n ulong 64
+md_n = ulong 64
+end
+ob = new uchar 256 0
+p = pd0_buf_str edit ob ulong 0 ulong 256 D2_DS1
+p = d2_buf_lvl edit ob p ulong 256 lvl
+p = pd0_buf_str edit ob p ulong 256 D2_DS2
+p = pd0_buf_u64 edit ob p ulong 256 get st 0
+p = pd0_buf_ch edit ob p ulong 256 uchar 47
+p = pd0_buf_u64 edit ob p ulong 256 get st 1
+p = pd0_buf_str edit ob p ulong 256 D2_DS3
+p = pd0_buf_u64 edit ob p ulong 256 get st 2
+p = pd0_buf_ch edit ob p ulong 256 uchar 47
+p = pd0_buf_u64 edit ob p ulong 256 get st 3
+p = pd0_buf_str edit ob p ulong 256 D2_DS4
+p = pd0_buf_i64 edit ob p ulong 256 d2_median edit d_arr md_n
+p = pd0_buf_ch edit ob p ulong 256 uchar 10
+pd0_put_bytes 1 view ob p
+ret 0
+end
+
+fn d2_mode_detect lo ulong hi ulong to int
+for lvl_u ulong D2_NLEV
+rc = d2_detect_level int lvl_u lo hi
+if ne rc 0
+ret rc
+end
+end
+ret 0
+end
+
+note ---- C2: regime mode & v2.1 shift mode ----
+text D2_R1 "P0V2R level="
+text D2_R2 " k="
+text D2_R3 " pre_switch_roll20="
+text D2_R4 " fixed_roll20="
+text D2_R5 " retain_roll20="
+text D2_R6 " fresh_roll20="
+text D2_R7 " retain_vs_fresh="
+text D2_R8 " retain_vs_fixed="
+text D2_R9 " fixed_one="
+text D2_R10 " retain_one="
+text D2_R11 " fresh_one="
+text D2_R12 " fixed_null="
+text D2_R13 " retain_null="
+text D2_R14 " fresh_null="
+text D2_RS1 "P0V2R-SUM level="
+text D2_RS2 " applicable="
+text D2_RS3 " median_fixed="
+text D2_RS4 " median_retain="
+text D2_RS5 " median_fresh="
+text D2_RS6 " retain_vs_fresh(helps/tie/harms)="
+text D2_RS7 " retain_vs_fixed(helps/tie/harms)="
+
+fn d2_collect_r2 w edit Pd0World d view Pd0Desc g view Pd0Gen to void
+for i ulong 20
+d2_run_ep w d g add ulong 320 i 1 uint i
+end
+for i ulong 32
+d2_run_ep w d g add ulong 340 i 3 uint i
+end
+ret
+end
+
+fn d2_reg_print_row lvl int seed ulong ppm long k ulong meta view long 9 to void
+ob = new uchar 512 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_R1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_D2
+p = pd0_buf_u64 edit ob p ulong 512 seed
+p = pd0_buf_str edit ob p ulong 512 D2_D4
+p = pd0_buf_i64 edit ob p ulong 512 ppm
+p = pd0_buf_str edit ob p ulong 512 D2_R2
+p = pd0_buf_u64 edit ob p ulong 512 k
+p = pd0_buf_str edit ob p ulong 512 D2_R3
+p = pd0_buf_i64 edit ob p ulong 512 get meta 0
+p = pd0_buf_str edit ob p ulong 512 D2_R4
+p = pd0_buf_i64 edit ob p ulong 512 get meta 1
+p = pd0_buf_str edit ob p ulong 512 D2_R5
+p = pd0_buf_i64 edit ob p ulong 512 get meta 2
+p = pd0_buf_str edit ob p ulong 512 D2_R6
+p = pd0_buf_i64 edit ob p ulong 512 get meta 3
+p = pd0_buf_str edit ob p ulong 512 D2_R7
+p = d2_buf_verdict edit ob p ulong 512 d2_verdict_code get meta 2 get meta 3
+p = pd0_buf_str edit ob p ulong 512 D2_R8
+p = d2_buf_verdict edit ob p ulong 512 d2_verdict_code get meta 2 get meta 1
+p = pd0_buf_str edit ob p ulong 512 D2_R9
+p = pd0_buf_i64 edit ob p ulong 512 get meta 4
+p = pd0_buf_str edit ob p ulong 512 D2_R10
+p = pd0_buf_i64 edit ob p ulong 512 get meta 5
+p = pd0_buf_str edit ob p ulong 512 D2_R11
+p = pd0_buf_i64 edit ob p ulong 512 get meta 6
+p = pd0_buf_str edit ob p ulong 512 D2_R12
+p = pd0_buf_i64 edit ob p ulong 512 long get d2_f_null 0
+p = pd0_buf_str edit ob p ulong 512 D2_R13
+p = pd0_buf_i64 edit ob p ulong 512 get meta 7
+p = pd0_buf_str edit ob p ulong 512 D2_R14
+p = pd0_buf_i64 edit ob p ulong 512 get meta 8
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn d2_reg_seed lvl int seed ulong zn ulong out_app edit int 1 to int
+w = new Pd0World 0 0 0 0 0 0 0 0 0 0 0 0 0
+d = new Pd0Desc 0 0 0 0 0 0 0 0 0 0
+g = new Pd0Gen 0 0 0 0 0 0 0
+ppm = new long 1 0
+meta = new long 9 0
+if ne d2_world_open edit w edit d edit g lvl seed 0
+ret -1
+end
+d2_collect_r1 edit w view d view g
+no = ulong get d2_nobs 0
+put d2_forget 0 0
+d2_build 1 ulong 0 0 ulong 0
+vr_copy D2_REL_F P0L_CAND_BASE
+put d2_f_null 0 get p0l_c_null 0
+d2_eval_rel D2_REL_F ulong 256 get d2_r1_ntest 0 no
+put meta 0 get d2_ev_roll 0
+if ne pd0_world_switch_regime edit w edit g lvl uint 1 edit ppm 0
+ret -1
+end
+if gt get ppm 0 long 0
+put out_app 0 1
+end
+d2_collect_r2 edit w view d view g
+d2_eval_rel D2_REL_F ulong 320 ulong 20 no
+put meta 1 get d2_ev_roll 0
+put meta 4 get d2_ev_one 0
+for ki ulong D2_NK
+kv = get d2_ks ki
+d2_build 1 kv 0 ulong 0
+d2_eval_rel P0L_CAND_BASE ulong 320 ulong 20 no
+put meta 2 get d2_ev_roll 0
+put meta 5 get d2_ev_one 0
+put meta 7 long get p0l_c_null 0
+d2_build 0 kv 0 ulong 0
+d2_eval_rel P0L_CAND_BASE ulong 320 ulong 20 no
+put meta 3 get d2_ev_roll 0
+put meta 6 get d2_ev_one 0
+put meta 8 long get p0l_c_null 0
+d2_reg_print_row lvl seed get ppm 0 kv view meta
+idx = add mul ki ulong 64 zn
+put d2_fx idx get meta 1
+put d2_rt idx get meta 2
+put d2_fr idx get meta 3
+end
+ret 0
+end
+
+fn d2_reg_fill_sum ki ulong zn ulong a edit long 64 b edit long 64 c edit long 64 cnt edit ulong 6 to void
+for i ulong zn bound 64
+idx = add mul ki ulong 64 i
+put a i get d2_fx idx
+put b i get d2_rt idx
+put c i get d2_fr idx
+vc = ulong d2_verdict_code get d2_rt idx get d2_fr idx
+put cnt vc add get cnt vc ulong 1
+vc = add ulong 3 ulong d2_verdict_code get d2_rt idx get d2_fx idx
+put cnt vc add get cnt vc ulong 1
+end
+ret
+end
+
+fn d2_reg_print_sum lvl int app int ki ulong zn ulong to void
+a = new long 64 0
+b = new long 64 0
+c = new long 64 0
+cnt = new ulong 6 0
+d2_reg_fill_sum ki zn edit a edit b edit c edit cnt
+ob = new uchar 512 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_RS1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_RS2
+p = pd0_buf_i64 edit ob p ulong 512 long app
+p = pd0_buf_str edit ob p ulong 512 D2_R2
+p = pd0_buf_u64 edit ob p ulong 512 get d2_ks ki
+p = pd0_buf_str edit ob p ulong 512 D2_FS2
+p = pd0_buf_u64 edit ob p ulong 512 zn
+p = pd0_buf_str edit ob p ulong 512 D2_RS3
+p = pd0_buf_i64 edit ob p ulong 512 d2_median edit a zn
+p = pd0_buf_str edit ob p ulong 512 D2_RS4
+p = pd0_buf_i64 edit ob p ulong 512 d2_median edit b zn
+p = pd0_buf_str edit ob p ulong 512 D2_RS5
+p = pd0_buf_i64 edit ob p ulong 512 d2_median edit c zn
+p = pd0_buf_str edit ob p ulong 512 D2_RS6
+p = pd0_buf_u64 edit ob p ulong 512 get cnt 0
+p = pd0_buf_ch edit ob p ulong 512 uchar 47
+p = pd0_buf_u64 edit ob p ulong 512 get cnt 1
+p = pd0_buf_ch edit ob p ulong 512 uchar 47
+p = pd0_buf_u64 edit ob p ulong 512 get cnt 2
+p = pd0_buf_str edit ob p ulong 512 D2_RS7
+p = pd0_buf_u64 edit ob p ulong 512 get cnt 3
+p = pd0_buf_ch edit ob p ulong 512 uchar 47
+p = pd0_buf_u64 edit ob p ulong 512 get cnt 4
+p = pd0_buf_ch edit ob p ulong 512 uchar 47
+p = pd0_buf_u64 edit ob p ulong 512 get cnt 5
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn d2_mode_regime lo ulong hi ulong to int
+app = new int 1 0
+for lvl_u ulong D2_NLEV
+lvl = int lvl_u
+put app 0 0
+zn = ulong 0
+for sd_i ulong add sub hi lo ulong 1 bound 64
+if ge zn ulong 64
+break
+end
+if ne d2_reg_seed lvl add lo sd_i zn edit app 0
+ret 3
+end
+zn = add zn ulong 1
+end
+for ki ulong D2_NK
+d2_reg_print_sum lvl get app 0 ki zn
+end
+end
+ret 0
+end
+
+note ---- C3: prior & prior21 modes ----
+fn d2_eq_expo xa ulong xb ulong to int
+for k ulong V_MAX_EX
+if ne get vr_ex add xa k get vr_ex add xb k
+ret 0
+end
+end
+ret 1
+end
+
+fn d2_find_term tgt uchar xa ulong sb ulong neb ulong to int
+for f ulong neb bound 12
+ef = vr_eq_idx sb f
+if eq get vr_eq_tgt ef tgt
+nf = ulong get vr_eq_nt ef
+for u ulong nf bound 32
+xb = mul vr_term_idx sb f u V_MAX_EX
+if ne d2_eq_expo xa xb 0
+ret 1
+end
+end
+end
+end
+ret 0
+end
+
+fn d2_same_support sa ulong sb ulong to int
+na = ulong 0
+nb = ulong 0
+nea = ulong get vr_neq sa
+neb = ulong get vr_neq sb
+for e ulong nea bound 12
+na = add na ulong get vr_eq_nt vr_eq_idx sa e
+end
+for e ulong neb bound 12
+nb = add nb ulong get vr_eq_nt vr_eq_idx sb e
+end
+if ne na nb
+ret 0
+end
+for e ulong nea bound 12
+ea = vr_eq_idx sa e
+tgt = get vr_eq_tgt ea
+nt = ulong get vr_eq_nt ea
+for t ulong nt bound 32
+xa = mul vr_term_idx sa e t V_MAX_EX
+if eq d2_find_term tgt xa sb neb 0
+ret 0
+end
+end
+end
+ret 1
+end
+
+fn d2_make_wrong dst ulong src ulong to void
+vr_copy dst src
+bm = long -1
+bti = ulong 0
+ne_cnt = ulong get vr_neq dst
+for e ulong ne_cnt bound 12
+nt = ulong get vr_eq_nt vr_eq_idx dst e
+for t ulong nt bound 32
+ti = vr_term_idx dst e t
+m = p0l_iabs get vr_coef ti
+if gt m bm
+bm = m
+bti = ti
+end
+end
+end
+if gt bm long -1
+put vr_coef bti neg get vr_coef bti
+end
+ret
+end
+
+fn d2_outcome pslot ulong to int
+put d2_prank 0 -1
+nc = get p0l_ncand 0
+for i ulong nc bound 8
+if ne get p0l_c_is_prior i 0
+put d2_prank 0 int i
+break
+end
+end
+if ne get p0l_c_is_prior 0 0
+ret 0
+end
+if ne get p0l_c_null 0 0
+ret 3
+end
+if ne d2_same_support P0L_CAND_BASE pslot 0
+ret 1
+end
+ret 2
+end
+
+fn d2_buf_outcome dst edit uchar * pos ulong cap ulong oc int to ulong
+if eq oc 0
+ret pd0_buf_str dst pos cap D2_O_KEPT
+end
+if eq oc 1
+ret pd0_buf_str dst pos cap D2_O_CORR
+end
+if eq oc 2
+ret pd0_buf_str dst pos cap D2_O_OTH
+end
+ret pd0_buf_str dst pos cap D2_O_NULL
+end
+
+text D2_P_SKIP " SKIP regime-1 learner found nothing better than the null, no lesson to corrupt\n"
+text D2_P1 "P0V2P level="
+text D2_P2 " prior="
+text D2_P3 " k=pre outcome="
+text D2_P4 " outcome="
+text D2_P5 " prior_rank="
+text D2_P6 " best_roll20="
+text D2_P7 " prior_roll20="
+text D2_P8 " noprior_best_roll20="
+text D2_PA1 "P0V21P-ARM arm="
+text D2_PA2 " (the lines below are in the C3 format of #397)\n"
+
+fn d2_prior_r2 lvl int seed ulong ppm long no ulong to void
+ob = new uchar 512 0
+for ki ulong D2_NK
+kv = get d2_ks ki
+d2_build 1 kv 0 ulong 0
+d2_eval_rel P0L_CAND_BASE ulong 320 ulong 20 no
+nr = get d2_ev_roll 0
+for pi ulong 2
+ps = D2_REL_P0
+if eq pi ulong 1
+ps = D2_REL_P1
+end
+d2_build 1 kv 1 ps
+oc = d2_outcome ps
+d2_eval_rel P0L_CAND_BASE ulong 320 ulong 20 no
+br = get d2_ev_roll 0
+d2_eval_rel ps ulong 320 ulong 20 no
+wr = get d2_ev_roll 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_P1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_D2
+p = pd0_buf_u64 edit ob p ulong 512 seed
+p = pd0_buf_str edit ob p ulong 512 D2_D4
+p = pd0_buf_i64 edit ob p ulong 512 ppm
+p = pd0_buf_str edit ob p ulong 512 D2_P2
+if eq pi ulong 0
+p = pd0_buf_str edit ob p ulong 512 D2_PN_WRONG
+else
+p = pd0_buf_str edit ob p ulong 512 D2_PN_STALE
+end
+p = pd0_buf_str edit ob p ulong 512 D2_R2
+p = pd0_buf_u64 edit ob p ulong 512 kv
+p = pd0_buf_str edit ob p ulong 512 D2_P4
+p = d2_buf_outcome edit ob p ulong 512 oc
+p = pd0_buf_str edit ob p ulong 512 D2_P5
+p = pd0_buf_i64 edit ob p ulong 512 long get d2_prank 0
+p = pd0_buf_str edit ob p ulong 512 D2_P6
+p = pd0_buf_i64 edit ob p ulong 512 br
+p = pd0_buf_str edit ob p ulong 512 D2_P7
+p = pd0_buf_i64 edit ob p ulong 512 wr
+p = pd0_buf_str edit ob p ulong 512 D2_P8
+p = pd0_buf_i64 edit ob p ulong 512 nr
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+end
+end
+ret
+end
+
+fn d2_prior_seed lvl int seed ulong to int
+w = new Pd0World 0 0 0 0 0 0 0 0 0 0 0 0 0
+d = new Pd0Desc 0 0 0 0 0 0 0 0 0 0
+g = new Pd0Gen 0 0 0 0 0 0 0
+ppm = new long 1 0
+ob = new uchar 512 0
+if ne d2_world_open edit w edit d edit g lvl seed 0
+ret -1
+end
+d2_collect_r1 edit w view d view g
+no = ulong get d2_nobs 0
+d2_build 1 ulong 0 0 ulong 0
+if ne get p0l_c_null 0 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_P1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_D2
+p = pd0_buf_u64 edit ob p ulong 512 seed
+p = pd0_buf_str edit ob p ulong 512 D2_P_SKIP
+pd0_put_bytes 1 view ob p
+ret 0
+end
+vr_copy D2_REL_P1 P0L_CAND_BASE
+d2_make_wrong D2_REL_P0 D2_REL_P1
+d2_build 1 ulong 0 1 D2_REL_P0
+oc = d2_outcome D2_REL_P0
+d2_eval_rel P0L_CAND_BASE ulong 256 get d2_r1_ntest 0 no
+br = get d2_ev_roll 0
+d2_eval_rel D2_REL_P0 ulong 256 get d2_r1_ntest 0 no
+wr = get d2_ev_roll 0
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_P1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_D2
+p = pd0_buf_u64 edit ob p ulong 512 seed
+p = pd0_buf_str edit ob p ulong 512 D2_P2
+p = pd0_buf_str edit ob p ulong 512 D2_PN_WRONG
+p = pd0_buf_str edit ob p ulong 512 D2_P3
+p = d2_buf_outcome edit ob p ulong 512 oc
+p = pd0_buf_str edit ob p ulong 512 D2_P5
+p = pd0_buf_i64 edit ob p ulong 512 long get d2_prank 0
+p = pd0_buf_str edit ob p ulong 512 D2_P6
+p = pd0_buf_i64 edit ob p ulong 512 br
+p = pd0_buf_str edit ob p ulong 512 D2_P7
+p = pd0_buf_i64 edit ob p ulong 512 wr
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ign = pd0_world_switch_regime edit w edit g lvl uint 1 edit ppm
+d2_collect_r2 edit w view d view g
+d2_prior_r2 lvl seed get ppm 0 no
+ret 1
+end
+
+fn d2_mode_prior lo ulong hi ulong to int
+for lvl_u ulong D2_NLEV
+lvl = int lvl_u
+for sd_i ulong add sub hi lo ulong 1 bound 64
+if lt d2_prior_seed lvl add lo sd_i 0
+ret 3
+end
+end
+end
+ret 0
+end
+
+fn d2_mode_prior21 lo ulong hi ulong to int
+ob = new uchar 256 0
+for arm ulong 2
+put d2_forget 0 int arm
+p = pd0_buf_str edit ob ulong 0 ulong 256 D2_PA1
+if ne arm ulong 0
+p = pd0_buf_str edit ob p ulong 256 D2_ARM_V21
+else
+p = pd0_buf_str edit ob p ulong 256 D2_ARM_V2
+end
+p = pd0_buf_str edit ob p ulong 256 D2_PA2
+pd0_put_bytes 1 view ob p
+rc = d2_mode_prior lo hi
+if ne rc 0
+ret rc
+end
+end
+put d2_forget 0 0
+ret 0
+end
+
+note ---- v2.1 C2: shift mode ----
+text D2_SH1 "P0V21R level="
+text D2_SH2 " v21_roll20="
+text D2_SH3 " v21_vs_fresh="
+text D2_SH4 " v21_vs_retain="
+text D2_SH5 " v21_top_is_old="
+text D2_SN1 "P0V21N level="
+text D2_SN2 " run=noswitch alarm="
+
+fn d2_shift_print_row lvl int seed ulong ppm long k ulong meta view long 6 to void
+ob = new uchar 512 0
+ntrain = long get d2_r1_ntrain 0
+al = get p0l_det_alarm 0
+delay = long 0
+if ne al 0
+delay = add sub long get p0l_det_aep 0 ntrain long 1
+end
+p = pd0_buf_str edit ob ulong 0 ulong 512 D2_SH1
+p = d2_buf_lvl edit ob p ulong 512 lvl
+p = pd0_buf_str edit ob p ulong 512 D2_D2
+p = pd0_buf_u64 edit ob p ulong 512 seed
+p = pd0_buf_str edit ob p ulong 512 D2_D4
+p = pd0_buf_i64 edit ob p ulong 512 ppm
+p = pd0_buf_str edit ob p ulong 512 D2_R2
+p = pd0_buf_u64 edit ob p ulong 512 k
+p = pd0_buf_str edit ob p ulong 512 D2_R4
+p = pd0_buf_i64 edit ob p ulong 512 get meta 0
+p = pd0_buf_str edit ob p ulong 512 D2_R5
+p = pd0_buf_i64 edit ob p ulong 512 get meta 1
+p = pd0_buf_str edit ob p ulong 512 D2_SH2
+p = pd0_buf_i64 edit ob p ulong 512 get meta 2
+p = pd0_buf_str edit ob p ulong 512 D2_R6
+p = pd0_buf_i64 edit ob p ulong 512 get meta 3
+p = pd0_buf_str edit ob p ulong 512 D2_SH3
+p = d2_buf_verdict edit ob p ulong 512 d2_verdict_code get meta 2 get meta 3
+p = pd0_buf_str edit ob p ulong 512 D2_SH4
+p = d2_buf_verdict edit ob p ulong 512 d2_verdict_code get meta 2 get meta 1
+p = pd0_buf_str edit ob p ulong 512 D2_D7
+p = pd0_buf_i64 edit ob p ulong 512 long al
+p = pd0_buf_str edit ob p ulong 512 D2_D8
+p = pd0_buf_u64 edit ob p ulong 512 ulong get p0l_det_aep 0
+p = pd0_buf_str edit ob p ulong 512 D2_D9
+p = pd0_buf_u64 edit ob p ulong 512 ulong get p0l_det_cep 0
+p = pd0_buf_str edit ob p ulong 512 D2_D10
+p = pd0_buf_i64 edit ob p ulong 512 ntrain
+p = pd0_buf_str edit ob p ulong 512 D2_D11
+p = pd0_buf_i64 edit ob p ulong 512 delay
+p = pd0_buf_str edit ob p ulong 512 D2_SH5
+p = pd0_buf_i64 edit ob p ulong 512 get meta 4
+p = pd0_buf_ch edit ob p ulong 512 uchar 10
+pd0_put_bytes 1 view ob p
+ret
+end
+
+fn d2_shift_seed lvl int seed ulong to int
+w = new Pd0World 0 0 0 0 0 0 0 0 0 0 0 0 0
+d = new Pd0Desc 0 0 0 0 0 0 0 0 0 0
+g = new Pd0Gen 0 0 0 0 0 0 0
+ppm = new long 1 0
+meta = new long 6 0
+if ne d2_world_open edit w edit d edit g lvl seed 0
+ret -1
+end
+d2_collect_r1 edit w view d view g
+no = ulong get d2_nobs 0
+put d2_forget 0 0
+d2_build 1 ulong 0 0 ulong 0
+vr_copy D2_REL_F P0L_CAND_BASE
+if ne pd0_world_switch_regime edit w edit g lvl uint 1 edit ppm 0
+ret -1
+end
+d2_collect_r2 edit w view d view g
+d2_eval_rel D2_REL_F ulong 320 ulong 20 no
+put meta 0 get d2_ev_roll 0
+for ki ulong D2_NK
+kv = get d2_ks ki
+put d2_forget 0 0
+d2_build 1 kv 0 ulong 0
+d2_eval_rel P0L_CAND_BASE ulong 320 ulong 20 no
+put meta 1 get d2_ev_roll 0
+d2_build 0 kv 0 ulong 0
+d2_eval_rel P0L_CAND_BASE ulong 320 ulong 20 no
+put meta 3 get d2_ev_roll 0
+put d2_forget 0 1
+d2_build 1 kv 0 ulong 0
+put d2_forget 0 0
+d2_eval_rel P0L_CAND_BASE ulong 320 ulong 20 no
+put meta 2 get d2_ev_roll 0
+put meta 4 long get p0l_c_is_old 0
+d2_shift_print_row lvl seed get ppm 0 kv view meta
+end
+ret 0
+end
+
+fn d2_mode_shift lo ulong hi ulong to int
+for lvl_u ulong D2_NLEV
+lvl = int lvl_u
+for sd_i ulong add sub hi lo ulong 1 bound 64
+if ne d2_shift_seed lvl add lo sd_i 0
+ret 3
+end
+end
+end
+ret 0
+end
+
+text D2_HDR1 "PD0_DEV2 mode="
+text D2_HDR2 " learner=v2 seeds="
+text D2_HDR3 ".."
+text D2_HDR4 " (public dev seeds; development evidence only)\n"
+
+fn main to int
+if lt argcnt long 4
+pd0_puts 2 D2_USAGE
+ret 2
+end
+put d2_ks 0 ulong 4
+put d2_ks 1 ulong 8
+put d2_ks 2 ulong 16
+put d2_ks 3 ulong 32
+a1 = new uchar 32 0
+a2 = new uchar 32 0
+a3 = new uchar 32 0
+n1 = argread 1 a1 0 32
+n2 = argread 2 a2 0 32
+n3 = argread 3 a3 0 32
+if or le n1 long 0 or le n2 long 0 le n3 long 0
+pd0_puts 2 D2_USAGE
+ret 2
+end
+lo = d2_parse_u64 view a2 ulong n2
+hi = d2_parse_u64 view a3 ulong n3
+ob = new uchar 256 0
+p = pd0_buf_str edit ob ulong 0 ulong 256 D2_HDR1
+for i ulong ulong n1 bound 32
+p = pd0_buf_ch edit ob p ulong 256 get a1 i
+end
+p = pd0_buf_str edit ob p ulong 256 D2_HDR2
+p = pd0_buf_u64 edit ob p ulong 256 lo
+p = pd0_buf_str edit ob p ulong 256 D2_HDR3
+p = pd0_buf_u64 edit ob p ulong 256 hi
+p = pd0_buf_str edit ob p ulong 256 D2_HDR4
+pd0_put_bytes 1 view ob p
+if ne d2_streq view a1 ulong n1 D2_M_FLAG 0
+ret d2_mode_flag lo hi
+end
+if ne d2_streq view a1 ulong n1 D2_M_REGIME 0
+ret d2_mode_regime lo hi
+end
+if ne d2_streq view a1 ulong n1 D2_M_PRIOR 0
+ret d2_mode_prior lo hi
+end
+if ne d2_streq view a1 ulong n1 D2_M_DETECT 0
+ret d2_mode_detect lo hi
+end
+if ne d2_streq view a1 ulong n1 D2_M_SHIFT 0
+ret d2_mode_shift lo hi
+end
+if ne d2_streq view a1 ulong n1 D2_M_PRIOR21 0
+ret d2_mode_prior21 lo hi
+end
+pd0_puts 2 D2_USAGE
+ret 2
+end
