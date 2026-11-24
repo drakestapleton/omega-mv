@@ -528,6 +528,9 @@ Session (`src/omega_gpu_session.h`):
 - `omega_gpu_session_on_close` (lets a library drop its resident kernels before the session closes; up to 8 hooks).
 - `omega_gpu_session_latch_uncertain`, `omega_gpu_session_note_module_latch` (a module such as the command lists tells the session it latched).
 
+Command list (`src/omega_gpu_cmdlist.h`):
+- `omega_gpu_cmdlist_record_attn256` (internal OM-2 head_dim 256 attention QMD recorder).
+
 Job engine (`src/omega_gpu_engine.h`):
 - `omega_gpu_engine_test_reset_block`, `omega_gpu_engine_test_force_block`, `omega_gpu_engine_test_set_clock`: TEST ONLY. A blocked process must stay blocked because the GPU may still be running.
 
@@ -540,7 +543,7 @@ Matmul (`src/omega_gpu_matmul_api.h`):
 Elementwise (`src/omega_gpu_elementwise_api.h`):
 - `omega_gpu_elementwise_cache_clear`, `omega_gpu_elementwise_last_error`.
 - `omega_gpu_elementwise_codegen`, `omega_gpu_elementwise_codegen_ir` (build a kernel without launching it, for offline disassembly and the host IR simulator).
-- `omega_gpu_ex2_f32`, `omega_gpu_shared_xchg_u32`, `omega_gpu_reconv_probe_u32` (chip probes).
+- `omega_gpu_ex2_f32`, `omega_gpu_rsq_f32`, `omega_gpu_shared_xchg_u32`, `omega_gpu_reconv_probe_u32` (chip probes).
 - `omega_gpu_elementwise_test_set_mutant`, `omega_gpu_elementwise_test_set_mutant_level`: TEST ONLY.
 
 Attention (`src/omega_gpu_attention_api.h`):
