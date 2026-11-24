@@ -1,0 +1,329 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_realize_synth.c (machine-aware realization
+note synthesis G_S x G_M -> G_R, triple identity, deterministic xorshift64*
+note differential inputs, program-vs-machine verification, DGX Spark / QEMU virt).
+note Composes on seed/ng/sha256.om, om/visor/canonical_om2.om, om/aarch64/aarch64_om2.om,
+note src/omega_canonical.om, src/omega_core.om, src/aarch64_encoder.om,
+note src/aarch64_decoder.om, src/omega_realize.om, src/omega_machine.om, src/omega_program.om.
+om2
+
+const RS_DIFF_INPUTS ulong 84
+
+note Active RealizationSynthesisTask
+global g_rs_task_prog ulong 1
+global g_rs_task_opt_lat ulong 1
+global g_rs_task_unroll ulong 1
+
+note Active RealizationSynthesisResult
+global g_rs_solved ulong 1
+global g_rs_sched ulong 1
+global g_rs_code_len ulong 1
+global g_rs_code uchar 1536
+global g_rs_real_id uchar 32
+global g_rs_sem_id uchar 32
+global g_rs_mach_id uchar 32
+global g_rs_profile ulong 1
+global g_rs_entry ulong 1
+global g_rs_est_cycles ulong 1
+global g_rs_inputs_chk ulong 1
+global g_rs_ver_passed ulong 1
+
+note Search-trace hook state (off by default)
+global g_rs_hook_id ulong 1
+global g_rs_hook_ctx ulong 1
+global g_rs_hook_events ulong 1
+global g_rs_hook_last_rc long 1
+
+fn omega_realize_task_init prog_slot ulong to void
+  put g_rs_task_prog 0 prog_slot
+  put g_rs_task_opt_lat 0 1
+  put g_rs_task_unroll 0 1
+end
+
+fn omega_realize_compute_triple_id code view uchar * clen ulong dst edit uchar 32 to long
+  if gt clen PROG_MAX_CODE
+    ret -1
+  end
+  prof = get g_rs_profile 0
+  entry = get g_rs_entry 0
+  put sh_dat 0 uchar 0x4f
+  put sh_dat 1 uchar 0x4d
+  put sh_dat 2 uchar 0x47
+  put sh_dat 3 uchar 0x30
+  put sh_dat 4 uchar PROG_KIND_REALIZATION
+  put sh_dat 5 uchar and prof 255
+  put sh_dat 6 uchar and shr entry 24 255
+  put sh_dat 7 uchar and shr entry 16 255
+  put sh_dat 8 uchar and shr entry 8 255
+  put sh_dat 9 uchar and entry 255
+  put sh_dat 10 uchar and shr clen 24 255
+  put sh_dat 11 uchar and shr clen 16 255
+  put sh_dat 12 uchar and shr clen 8 255
+  put sh_dat 13 uchar and clen 255
+  for i ulong 32
+    put sh_dat add 14 i get g_rs_sem_id i
+    put sh_dat add 46 i get g_rs_mach_id i
+  end
+  for i ulong clen bound 1536
+    put sh_dat add 78 i get code i
+  end
+  sh_all add 78 clen
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+  ret 0
+end
+
+fn rs_rng_step st edit ulong 1 to ulong
+  x = get st 0
+  x = xor x shr x 12
+  x = xor x shl x 25
+  x = xor x shr x 27
+  put st 0 x
+  ret mul x ulong 0x2545f4914f6cdd1d
+end
+
+fn rs_fill_rand_inputs prog_slot ulong mask ulong xs edit ulong * to ulong
+  s = ulong 0x9e3779b97f4a7c15
+  idb = mul prog_slot 32
+  for i ulong 8
+    s = xor s shl ulong get g_prog_id add idb i mul i 8
+  end
+  if eq s 0
+    s = 1
+  end
+  st = new ulong 1 0
+  put st 0 s
+  n = ulong 20
+  while lt n RS_DIFF_INPUTS bound 64
+    put xs n and rs_rng_step st mask
+    n = add n 1
+  end
+  ret n
+end
+
+fn omega_realize_differential_inputs prog_slot ulong xs edit ulong * max_n ulong to ulong
+  if or ge prog_slot PROG_MAX_SLOTS lt max_n RS_DIFF_INPUTS
+    ret 0
+  end
+  w = get g_prog_in_w prog_slot
+  mask = ulong 0xffffffffffffffff
+  top = shl ulong 1 63
+  if and gt w 0 lt w 64
+    mask = sub shl ulong 1 w 1
+    top = shl ulong 1 sub w 1
+  end
+  put xs 0 0
+  put xs 1 and 1 mask
+  put xs 2 and 2 mask
+  put xs 3 and 3 mask
+  put xs 4 and 5 mask
+  put xs 5 and 7 mask
+  put xs 6 and 10 mask
+  put xs 7 and 100 mask
+  put xs 8 mask
+  put xs 9 and sub mask 1 mask
+  put xs 10 and sub mask 2 mask
+  put xs 11 and top mask
+  put xs 12 and sub top 1 mask
+  put xs 13 and add top 1 mask
+  put xs 14 and ulong 0x5555555555555555 mask
+  put xs 15 and ulong 0xaaaaaaaaaaaaaaaa mask
+  put xs 16 and ulong 0xffff mask
+  put xs 17 and ulong 0x10000 mask
+  put xs 18 and ulong 0xffffffff mask
+  put xs 19 and ulong 0x100000000 mask
+  ret rs_fill_rand_inputs prog_slot mask xs
+end
+
+fn omega_realize_choose_schedule to ulong
+  if and ge get g_mg_issue_w 0 4 ge get g_mg_gpr_cnt 0 16
+    ret PROG_SCHED_PRELOAD
+  end
+  ret PROG_SCHED_SEQUENTIAL
+end
+
+fn rs_verify_diff prog_slot ulong code view uchar * clen ulong out_chk edit ulong 1 to long
+  xs = new ulong 84 0
+  ys = new ulong 84 0
+  n = omega_realize_differential_inputs prog_slot xs 84
+  if eq n 0
+    ret -1
+  end
+  if ne omega_program_eval prog_slot xs n ys 0
+    ret -1
+  end
+  got = new ulong 1 0
+  for i ulong n bound 84
+    if ne prog_exec_code code clen get xs i got 0
+      ret -1
+    end
+    if ne get got 0 get ys i
+      ret -1
+    end
+    put out_chk 0 add get out_chk 0 1
+  end
+  ret 0
+end
+
+fn omega_realization_verify_program prog_slot ulong code view uchar * clen ulong out_chk edit ulong 1 to long
+  put out_chk 0 0
+  if ge prog_slot PROG_MAX_SLOTS
+    ret -1
+  end
+  ow = new ulong 1 0
+  if ne omega_program_realize_check prog_slot ow 0
+    ret -1
+  end
+  idb = mul prog_slot 32
+  for i ulong 32
+    if ne get g_rs_sem_id i get g_prog_id add idb i
+      ret -1
+    end
+  end
+  saved_mid = new uchar 32 0
+  for i ulong 32
+    put saved_mid i get g_mg_id i
+  end
+  if ne omega_machine_compute_id 0
+    ret -1
+  end
+  for i ulong 32
+    if ne get g_mg_id i get saved_mid i
+      ret -1
+    end
+    if ne get g_rs_mach_id i get saved_mid i
+      ret -1
+    end
+  end
+  if ne get g_rs_profile 0 get g_mg_profile 0
+    ret -1
+  end
+  for i ulong 32
+    put g_v0_sem i get g_rs_sem_id i
+    put g_v0_mid i get g_rs_mach_id i
+    put g_v0_rid i get g_rs_real_id i
+  end
+  put g_v0_has_mid 0 1
+  put g_v0_prof 0 get g_rs_profile 0
+  put g_v0_entry 0 get g_rs_entry 0
+  if ne prog_verify_v0_code code clen 0
+    ret -1
+  end
+  ret rs_verify_diff prog_slot code clen out_chk
+end
+
+fn omega_realize_set_trace_hook hook_id ulong ctx ulong to long
+  if or eq hook_id 0 ne get g_rs_hook_id 0 0
+    ret -1
+  end
+  put g_rs_hook_id 0 hook_id
+  put g_rs_hook_ctx 0 ctx
+  ret 0
+end
+
+fn omega_realize_clear_trace_hook ctx ulong to long
+  if or eq get g_rs_hook_id 0 0 ne get g_rs_hook_ctx 0 ctx
+    ret -1
+  end
+  put g_rs_hook_id 0 0
+  put g_rs_hook_ctx 0 0
+  ret 0
+end
+
+fn rs_synth_impl to long
+  put g_rs_solved 0 0
+  put g_rs_sched 0 0
+  put g_rs_code_len 0 0
+  put g_rs_est_cycles 0 0
+  put g_rs_inputs_chk 0 0
+  put g_rs_ver_passed 0 0
+  for i ulong 32
+    put g_rs_real_id i 0
+    put g_rs_sem_id i 0
+    put g_rs_mach_id i 0
+  end
+  ps = get g_rs_task_prog 0
+  if ge ps PROG_MAX_SLOTS
+    ret -1
+  end
+  ow = new ulong 1 0
+  if ne omega_program_realize_check ps ow 0
+    ret -2
+  end
+  if ne get g_mg_profile 0 MG_PROFILE_V8A
+    ret -2
+  end
+  sched = omega_realize_choose_schedule
+  put g_rs_sched 0 sched
+  code = new uchar 1536 0
+  cl_l = omega_program_emit_schedule ps get ow 0 sched code
+  if lt cl_l 0
+    ret -2
+  end
+  cl = ulong cl_l
+  put g_rs_code_len 0 cl
+  for i ulong cl bound 1536
+    put g_rs_code i get code i
+  end
+  idb = mul ps 32
+  for i ulong 32
+    put g_rs_sem_id i get g_prog_id add idb i
+    put g_rs_mach_id i get g_mg_id i
+  end
+  put g_rs_profile 0 get g_mg_profile 0
+  put g_rs_entry 0 0
+  rid = new uchar 32 0
+  if ne omega_realize_compute_triple_id code cl rid 0
+    ret -1
+  end
+  for i ulong 32
+    put g_rs_real_id i get rid i
+  end
+  put g_rs_est_cycles 0 omega_machine_estimate_latency code cl
+  nchk = new ulong 1 0
+  vrc = omega_realization_verify_program ps code cl nchk
+  put g_rs_inputs_chk 0 get nchk 0
+  if ne vrc 0
+    put g_rs_ver_passed 0 0
+    ret -1
+  end
+  if ne prog_verify_v2_code code cl 0
+    put g_rs_ver_passed 0 0
+    ret -1
+  end
+  put g_rs_ver_passed 0 1
+  put g_rs_solved 0 1
+  ret 0
+end
+
+fn omega_synthesize_realization to long
+  rc = rs_synth_impl
+  if ne get g_rs_hook_id 0 0
+    put g_rs_hook_events 0 add get g_rs_hook_events 0 1
+    put g_rs_hook_last_rc 0 rc
+  end
+  ret rc
+end
+
+fn omega_synthesize_for_dgx_spark prog_slot ulong to long
+  if ge prog_slot PROG_MAX_SLOTS
+    ret -1
+  end
+  if ne omega_machine_build_dgx_spark 0
+    ret -1
+  end
+  omega_realize_task_init prog_slot
+  ret omega_synthesize_realization
+end
+
+fn omega_synthesize_for_qemu_virt prog_slot ulong to long
+  if ge prog_slot PROG_MAX_SLOTS
+    ret -1
+  end
+  if ne omega_machine_build_qemu_virt 0
+    ret -1
+  end
+  omega_realize_task_init prog_slot
+  ret omega_synthesize_realization
+end

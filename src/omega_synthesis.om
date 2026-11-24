@@ -1,0 +1,471 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_synthesis.c (primitive bank, observational
+note equivalence table, 6-probe signature hashing, deterministic depth 1..3
+note synthesis search, affine 2x+1 and composed 3x-2 synthesis targets).
+note Composes on seed/ng/sha256.om, om/visor/canonical_om2.om, om/aarch64/aarch64_om2.om,
+note src/omega_canonical.om, src/omega_core.om, src/aarch64_encoder.om,
+note src/aarch64_decoder.om, src/omega_realize.om, src/omega_program.om.
+om2
+
+const SYNTH_MAX_PRIMS ulong 32
+const SYNTH_MAX_CANDS ulong 256
+const SYNTH_MAX_SIGS ulong 1024
+const SYNTH_PROBE_COUNT ulong 6
+const SYNTH_BASE_DEF_COUNT ulong 15
+
+note Slot allocation inside g_prog_* pool (PROG_MAX_SLOTS = 320):
+note   0..14   : primitive bank (15 entries)
+note   16..30  : depth1 kept candidates (up to 15)
+note   32..287 : depth2 kept candidates (up to 256)
+note   300     : scratch candidate slot
+note   301     : winning solution slot
+const SYNTH_SLOT_BANK ulong 0
+const SYNTH_SLOT_D1 ulong 16
+const SYNTH_SLOT_D2 ulong 32
+const SYNTH_SLOT_CAND ulong 300
+const SYNTH_SLOT_SOL ulong 301
+
+text syn_n0 "add_1"
+text syn_n1 "add_2"
+text syn_n2 "add_3"
+text syn_n3 "add_5"
+text syn_n4 "sub_1"
+text syn_n5 "sub_2"
+text syn_n6 "sub_3"
+text syn_n7 "sub_5"
+text syn_n8 "mul_2"
+text syn_n9 "mul_3"
+text syn_n10 "mul_4"
+text syn_n11 "and_ff"
+text syn_n12 "and_0f"
+text syn_n13 "or_1"
+text syn_n14 "or_2"
+
+text syn_desc_affine "task_affine_2x_plus_1"
+text syn_desc_composed "task_composed_3x_minus_2"
+
+note Bank & EquivTable globals
+global g_syn_bank_cnt ulong 1
+global g_syn_eq_cnt ulong 1
+global g_syn_eq_hashes uchar 32768
+global g_syn_eq_costs ulong 1024
+
+note SynthesisResult globals
+global g_syn_solved ulong 1
+global g_syn_gen ulong 1
+global g_syn_pruned_type ulong 1
+global g_syn_pruned_equiv ulong 1
+global g_syn_failed_v1 ulong 1
+global g_syn_sol_found ulong 1
+
+note Search-trace hook state (off by default)
+global g_syn_hook_id ulong 1
+global g_syn_hook_ctx ulong 1
+global g_syn_hook_events ulong 1
+
+fn omega_synth_base_prim_defs dops edit ulong 15 dimms edit ulong 15 to ulong
+  put dops 0 PROG_OP_ADD
+  put dimms 0 1
+  put dops 1 PROG_OP_ADD
+  put dimms 1 2
+  put dops 2 PROG_OP_ADD
+  put dimms 2 3
+  put dops 3 PROG_OP_ADD
+  put dimms 3 5
+  put dops 4 PROG_OP_SUB
+  put dimms 4 1
+  put dops 5 PROG_OP_SUB
+  put dimms 5 2
+  put dops 6 PROG_OP_SUB
+  put dimms 6 3
+  put dops 7 PROG_OP_SUB
+  put dimms 7 5
+  put dops 8 PROG_OP_MUL
+  put dimms 8 2
+  put dops 9 PROG_OP_MUL
+  put dimms 9 3
+  put dops 10 PROG_OP_MUL
+  put dimms 10 4
+  put dops 11 PROG_OP_AND
+  put dimms 11 0xff
+  put dops 12 PROG_OP_AND
+  put dimms 12 0x0f
+  put dops 13 PROG_OP_OR
+  put dimms 13 1
+  put dops 14 PROG_OP_OR
+  put dimms 14 2
+  ret SYNTH_BASE_DEF_COUNT
+end
+
+fn syn_build_prim slot ulong idx ulong op ulong imm ulong to long
+  if eq idx 0
+    ret omega_program_build_unary_op slot syn_n0 len syn_n0 op imm
+  end
+  if eq idx 1
+    ret omega_program_build_unary_op slot syn_n1 len syn_n1 op imm
+  end
+  if eq idx 2
+    ret omega_program_build_unary_op slot syn_n2 len syn_n2 op imm
+  end
+  if eq idx 3
+    ret omega_program_build_unary_op slot syn_n3 len syn_n3 op imm
+  end
+  if eq idx 4
+    ret omega_program_build_unary_op slot syn_n4 len syn_n4 op imm
+  end
+  if eq idx 5
+    ret omega_program_build_unary_op slot syn_n5 len syn_n5 op imm
+  end
+  if eq idx 6
+    ret omega_program_build_unary_op slot syn_n6 len syn_n6 op imm
+  end
+  if eq idx 7
+    ret omega_program_build_unary_op slot syn_n7 len syn_n7 op imm
+  end
+  if eq idx 8
+    ret omega_program_build_unary_op slot syn_n8 len syn_n8 op imm
+  end
+  if eq idx 9
+    ret omega_program_build_unary_op slot syn_n9 len syn_n9 op imm
+  end
+  if eq idx 10
+    ret omega_program_build_unary_op slot syn_n10 len syn_n10 op imm
+  end
+  if eq idx 11
+    ret omega_program_build_unary_op slot syn_n11 len syn_n11 op imm
+  end
+  if eq idx 12
+    ret omega_program_build_unary_op slot syn_n12 len syn_n12 op imm
+  end
+  if eq idx 13
+    ret omega_program_build_unary_op slot syn_n13 len syn_n13 op imm
+  end
+  ret omega_program_build_unary_op slot syn_n14 len syn_n14 op imm
+end
+
+fn omega_synth_bank_init to long
+  put g_syn_bank_cnt 0 0
+  p_ops = new ulong 15 0
+  p_imms = new ulong 15 0
+  nd = omega_synth_base_prim_defs p_ops p_imms
+  cnt = ulong 0
+  for i ulong nd bound 15
+    if eq syn_build_prim add SYNTH_SLOT_BANK cnt i get p_ops i get p_imms i 0
+      cnt = add cnt 1
+    end
+  end
+  put g_syn_bank_cnt 0 cnt
+  ret 0
+end
+
+fn omega_synth_bank_destroy to void
+  cnt = get g_syn_bank_cnt 0
+  for i ulong cnt bound 32
+    omega_program_destroy add SYNTH_SLOT_BANK i
+  end
+  put g_syn_bank_cnt 0 0
+end
+
+fn omega_synth_equiv_init to void
+  put g_syn_eq_cnt 0 0
+end
+
+fn omega_synth_equiv_contains_or_add h view uchar 32 cost ulong to bool
+  cnt = get g_syn_eq_cnt 0
+  for i ulong cnt bound 1024
+    hb = mul i 32
+    same = true
+    for k ulong 32
+      if ne get g_syn_eq_hashes add hb k get h k
+        same = false
+        break
+      end
+    end
+    if same
+      if le get g_syn_eq_costs i cost
+        ret true
+      end
+      put g_syn_eq_costs i cost
+      ret false
+    end
+  end
+  if lt cnt SYNTH_MAX_SIGS
+    hb = mul cnt 32
+    for k ulong 32
+      put g_syn_eq_hashes add hb k get h k
+    end
+    put g_syn_eq_costs cnt cost
+    put g_syn_eq_cnt 0 add cnt 1
+  end
+  ret false
+end
+
+fn syn_probe_val idx ulong to ulong
+  if eq idx 0
+    ret 0
+  end
+  if eq idx 1
+    ret 1
+  end
+  if eq idx 2
+    ret 3
+  end
+  if eq idx 3
+    ret 7
+  end
+  if eq idx 4
+    ret 13
+  end
+  ret 42
+end
+
+fn omega_synth_compute_signature s ulong dst edit uchar 32 to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  if eq get g_prog_is_real s 0
+    ret -1
+  end
+  ov = new ulong 1 0
+  for i ulong SYNTH_PROBE_COUNT
+    if ne omega_program_exec s syn_probe_val i ov 0
+      ret -1
+    end
+    v = get ov 0
+    off = mul i 8
+    for b ulong 8
+      put sh_dat add off b uchar and shr v mul b 8 255
+    end
+  end
+  sh_all 48
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+  ret 0
+end
+
+fn omega_synth_set_trace_hook hook_id ulong ctx ulong to long
+  if or eq hook_id 0 ne get g_syn_hook_id 0 0
+    ret -1
+  end
+  put g_syn_hook_id 0 hook_id
+  put g_syn_hook_ctx 0 ctx
+  ret 0
+end
+
+fn omega_synth_clear_trace_hook ctx ulong to long
+  if or eq get g_syn_hook_id 0 0 ne get g_syn_hook_ctx 0 ctx
+    ret -1
+  end
+  put g_syn_hook_id 0 0
+  put g_syn_hook_ctx 0 0
+  ret 0
+end
+
+fn syn_hook_tick to void
+  if ne get g_syn_hook_id 0 0
+    put g_syn_hook_events 0 add get g_syn_hook_events 0 1
+  end
+end
+
+fn syn_try_candidate s ulong dedup ulong to long
+  note returns: 1 = solved, 2 = pruned_equiv, 0 = rejected
+  sig = new uchar 32 0
+  if ne dedup 0
+    if eq omega_synth_compute_signature s sig 0
+      if omega_synth_equiv_contains_or_add sig get g_prog_insn_cnt s
+        put g_syn_pruned_equiv 0 add get g_syn_pruned_equiv 0 1
+        syn_hook_tick
+        ret 2
+      end
+    end
+  end
+  sol = new ulong 1 0
+  erc = omega_task_evaluate_candidate s sol
+  if and eq erc 0 ne get sol 0 0
+    vrc = omega_program_verify s
+    syn_hook_tick
+    if eq vrc 0
+      put g_syn_solved 0 1
+      prog_copy_slot SYNTH_SLOT_SOL s
+      put g_syn_sol_found 0 add get g_syn_sol_found 0 1
+      ret 1
+    end
+    ret 0
+  end
+  put g_syn_failed_v1 0 add get g_syn_failed_v1 0 1
+  syn_hook_tick
+  ret 0
+end
+
+fn syn_cost_too_high max_cost ulong to bool
+  ic = get g_prog_insn_cnt SYNTH_SLOT_CAND
+  if gt ic get g_task_budget_insn 0
+    ret true
+  end
+  if gt ic max_cost
+    ret true
+  end
+  ret false
+end
+
+fn syn_run_depth2 d1_cnt ulong max_cost ulong max_cands ulong dedup ulong to ulong
+  bcnt = get g_syn_bank_cnt 0
+  d2_cnt = ulong 0
+  for i ulong d1_cnt bound 32
+    for j ulong bcnt bound 32
+      if ge get g_syn_gen 0 max_cands
+        syn_hook_tick
+        ret d2_cnt
+      end
+      put g_syn_gen 0 add get g_syn_gen 0 1
+      if ne omega_program_compose add SYNTH_SLOT_D1 i add SYNTH_SLOT_BANK j SYNTH_SLOT_CAND 0
+        put g_syn_pruned_type 0 add get g_syn_pruned_type 0 1
+        syn_hook_tick
+        continue
+      end
+      if syn_cost_too_high max_cost
+        syn_hook_tick
+        omega_program_destroy SYNTH_SLOT_CAND
+        continue
+      end
+      r = syn_try_candidate SYNTH_SLOT_CAND dedup
+      if eq r 1
+        ret d2_cnt
+      end
+      if eq r 2
+        omega_program_destroy SYNTH_SLOT_CAND
+        continue
+      end
+      if lt d2_cnt SYNTH_MAX_CANDS
+        prog_copy_slot add SYNTH_SLOT_D2 d2_cnt SYNTH_SLOT_CAND
+        d2_cnt = add d2_cnt 1
+      else
+        omega_program_destroy SYNTH_SLOT_CAND
+      end
+    end
+  end
+  ret d2_cnt
+end
+
+fn syn_run_depth3 d2_cnt ulong max_cost ulong max_cands ulong dedup ulong to void
+  bcnt = get g_syn_bank_cnt 0
+  for i ulong d2_cnt bound 256
+    for j ulong bcnt bound 32
+      if ge get g_syn_gen 0 max_cands
+        syn_hook_tick
+        ret
+      end
+      put g_syn_gen 0 add get g_syn_gen 0 1
+      if ne omega_program_compose add SYNTH_SLOT_D2 i add SYNTH_SLOT_BANK j SYNTH_SLOT_CAND 0
+        put g_syn_pruned_type 0 add get g_syn_pruned_type 0 1
+        syn_hook_tick
+        continue
+      end
+      if syn_cost_too_high max_cost
+        syn_hook_tick
+        omega_program_destroy SYNTH_SLOT_CAND
+        continue
+      end
+      r = syn_try_candidate SYNTH_SLOT_CAND dedup
+      if eq r 1
+        ret
+      end
+      omega_program_destroy SYNTH_SLOT_CAND
+    end
+  end
+end
+
+fn omega_synthesize max_depth ulong max_cost ulong max_cands ulong dedup ulong to long
+  put g_syn_solved 0 0
+  put g_syn_gen 0 0
+  put g_syn_pruned_type 0 0
+  put g_syn_pruned_equiv 0 0
+  put g_syn_failed_v1 0 0
+  put g_syn_sol_found 0 0
+  omega_synth_equiv_init
+  bcnt = get g_syn_bank_cnt 0
+  d1_cnt = ulong 0
+
+  note DEPTH 1
+  for i ulong bcnt bound 32
+    ps = add SYNTH_SLOT_BANK i
+    put g_syn_gen 0 add get g_syn_gen 0 1
+    r = syn_try_candidate ps dedup
+    if eq r 1
+      ret 0
+    end
+    if eq r 2
+      continue
+    end
+    if lt d1_cnt SYNTH_MAX_PRIMS
+      prog_copy_slot add SYNTH_SLOT_D1 d1_cnt ps
+      d1_cnt = add d1_cnt 1
+    end
+  end
+  if lt max_depth 2
+    ret 0
+  end
+
+  note DEPTH 2
+  d2_cnt = syn_run_depth2 d1_cnt max_cost max_cands dedup
+  if or lt max_depth 3 ne get g_syn_solved 0 0
+    ret 0
+  end
+
+  note DEPTH 3
+  syn_run_depth3 d2_cnt max_cost max_cands dedup
+  ret 0
+end
+
+fn omega_synthesize_target_affine to long
+  ins = new ulong 16 0
+  outs = new ulong 16 0
+  put ins 0 0
+  put ins 1 1
+  put ins 2 2
+  put ins 3 3
+  put ins 4 5
+  put ins 5 10
+  put outs 0 1
+  put outs 1 3
+  put outs 2 5
+  put outs 3 7
+  put outs 4 11
+  put outs 5 21
+  omega_task_set_contract CORE_TYPE_UINT 64 CORE_TYPE_UINT 64
+  if ne omega_task_init syn_desc_affine ins outs 6 0
+    ret -1
+  end
+  if ne omega_synth_bank_init 0
+    ret -1
+  end
+  rc = omega_synthesize 2 10 500 1
+  omega_synth_bank_destroy
+  ret rc
+end
+
+fn omega_synthesize_target_composed to long
+  ins = new ulong 16 0
+  outs = new ulong 16 0
+  put ins 0 1
+  put ins 1 2
+  put ins 2 3
+  put ins 3 4
+  put ins 4 10
+  put outs 0 1
+  put outs 1 4
+  put outs 2 7
+  put outs 3 10
+  put outs 4 28
+  omega_task_set_contract CORE_TYPE_UINT 64 CORE_TYPE_UINT 64
+  if ne omega_task_init syn_desc_composed ins outs 5 0
+    ret -1
+  end
+  if ne omega_synth_bank_init 0
+    ret -1
+  end
+  rc = omega_synthesize 2 10 500 1
+  omega_synth_bank_destroy
+  ret rc
+end

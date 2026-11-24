@@ -1,0 +1,2013 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_program.c (program identity v2, contract id,
+note canonical body lowering, V0 realization check, sequential/preload AArch64 emission,
+note lifting, semantic evaluator, composition, native-instruction interpreter, verification,
+note and synthesis task init/evaluation).
+note Composes on seed/ng/sha256.om, om/visor/canonical_om2.om, om/aarch64/aarch64_om2.om,
+note src/omega_canonical.om, src/omega_core.om, src/aarch64_encoder.om,
+note src/aarch64_decoder.om, src/omega_realize.om.
+om2
+
+const PROG_MAX_SLOTS ulong 320
+const PROG_MAX_STEPS ulong 64
+const PROG_MAX_CODE ulong 1536
+const PROG_PRELOAD_REGS ulong 15
+const PROG_SCHED_SEQUENTIAL ulong 0
+const PROG_SCHED_PRELOAD ulong 1
+
+const PROG_KIND_CONSTRAINT ulong 5
+const PROG_KIND_REALIZATION ulong 9
+const PROG_CONST_PRE ulong 7
+const PROG_CONST_POST ulong 8
+const PROG_OV_WRAP ulong 1
+const PROG_OV_SATURATE ulong 2
+
+const PROG_OP_ADD ulong 3
+const PROG_OP_SUB ulong 4
+const PROG_OP_MUL ulong 5
+const PROG_OP_DIV ulong 6
+const PROG_OP_AND ulong 9
+const PROG_OP_OR ulong 10
+const PROG_OP_CONVERT ulong 16
+
+const PROG_DEC_ADD ulong 1
+const PROG_DEC_SUB ulong 2
+const PROG_DEC_MUL ulong 3
+const PROG_DEC_AND ulong 4
+const PROG_DEC_ORR ulong 5
+const PROG_DEC_MOVZ ulong 7
+const PROG_DEC_RET ulong 8
+const PROG_DEC_MOVK ulong 13
+
+text prog_dom_v2 "omega.program.v2"
+text prog_dom_contract "aien.vc1.contract.v1"
+text prog_attr_compose "omega.compose"
+text prog_val_seq "seq"
+text prog_attr_param "omega.param"
+text prog_pre_default "x >= 0"
+text prog_task_default "task_target"
+
+note Program pool (PROG_MAX_SLOTS = 320)
+global g_prog_id uchar 10240
+global g_prog_name uchar 20480
+global g_prog_name_len ulong 320
+global g_prog_has_body ulong 320
+global g_prog_scnt ulong 320
+global g_prog_sop uchar 20480
+global g_prog_simm ulong 20480
+
+global g_prog_in_type ulong 320
+global g_prog_in_w ulong 320
+global g_prog_out_type ulong 320
+global g_prog_out_w ulong 320
+global g_prog_pre_id uchar 10240
+global g_prog_post_id uchar 10240
+global g_prog_pre_txt uchar 20480
+global g_prog_pre_len ulong 320
+global g_prog_post_txt uchar 20480
+global g_prog_post_len ulong 320
+global g_prog_lcnt ulong 320
+global g_prog_leaves uchar 655360
+
+global g_prog_insn_cnt ulong 320
+global g_prog_reg_p ulong 320
+global g_prog_mem_b ulong 320
+global g_prog_lat_c ulong 320
+
+global g_prog_is_real ulong 320
+global g_prog_is_ver ulong 320
+global g_prog_r_len ulong 320
+global g_prog_r_prof ulong 320
+global g_prog_r_entry ulong 320
+global g_prog_r_has_mid ulong 320
+global g_prog_r_sem uchar 10240
+global g_prog_r_mid uchar 10240
+global g_prog_r_id uchar 10240
+global g_prog_r_code uchar 491520
+
+note Scratch buffers for lowering/lifting/composition/verify
+global g_prog_plan_op uchar 65
+global g_prog_plan_imm ulong 65
+global g_prog_re_code uchar 1536
+global g_prog_la uchar 2048
+global g_prog_lb uchar 2048
+global g_v0_sem uchar 32
+global g_v0_mid uchar 32
+global g_v0_rid uchar 32
+global g_v0_has_mid ulong 1
+global g_v0_prof ulong 1
+global g_v0_entry ulong 1
+global g_eval_ops ulong 64
+global g_eval_tws ulong 64
+global g_eval_consts ulong 64
+global g_fp_tfid uchar 32
+global g_fp_tuid uchar 32
+global g_fp_cur uchar 32
+
+note SynthesisTask state (single active task)
+global g_task_id uchar 32
+global g_task_desc uchar 128
+global g_task_desc_len ulong 1
+global g_task_in_type ulong 1
+global g_task_in_w ulong 1
+global g_task_out_type ulong 1
+global g_task_out_w ulong 1
+global g_task_pre_id uchar 32
+global g_task_post_id uchar 32
+global g_task_budget_insn ulong 1
+global g_task_budget_reg ulong 1
+global g_task_budget_lat ulong 1
+global g_task_ex_cnt ulong 1
+global g_task_inputs ulong 16
+global g_task_outputs ulong 16
+
+fn prog_step_op_valid op ulong to bool
+  if eq op PROG_OP_ADD
+    ret true
+  end
+  if eq op PROG_OP_SUB
+    ret true
+  end
+  if eq op PROG_OP_MUL
+    ret true
+  end
+  if eq op PROG_OP_AND
+    ret true
+  end
+  if eq op PROG_OP_OR
+    ret true
+  end
+  ret false
+end
+
+fn prog_width_mask w ulong to ulong
+  if ge w 64
+    ret ulong 0xffffffffffffffff
+  end
+  ret sub shl ulong 1 w 1
+end
+
+fn prog_clear_slot s ulong to void
+  if ge s PROG_MAX_SLOTS
+    ret
+  end
+  idb = mul s 32
+  for i ulong 32
+    put g_prog_id add idb i 0
+    put g_prog_pre_id add idb i 0
+    put g_prog_post_id add idb i 0
+    put g_prog_r_sem add idb i 0
+    put g_prog_r_mid add idb i 0
+    put g_prog_r_id add idb i 0
+  end
+  nb = mul s 64
+  for i ulong 64
+    put g_prog_name add nb i 0
+    put g_prog_pre_txt add nb i 0
+    put g_prog_post_txt add nb i 0
+    put g_prog_sop add nb i 0
+    put g_prog_simm add nb i 0
+  end
+  put g_prog_name_len s 0
+  put g_prog_has_body s 0
+  put g_prog_scnt s 0
+  put g_prog_in_type s 0
+  put g_prog_in_w s 0
+  put g_prog_out_type s 0
+  put g_prog_out_w s 0
+  put g_prog_pre_len s 0
+  put g_prog_post_len s 0
+  put g_prog_lcnt s 0
+  put g_prog_insn_cnt s 0
+  put g_prog_reg_p s 0
+  put g_prog_mem_b s 0
+  put g_prog_lat_c s 0
+  put g_prog_is_real s 0
+  put g_prog_is_ver s 0
+  put g_prog_r_len s 0
+  put g_prog_r_prof s 0
+  put g_prog_r_entry s 0
+  put g_prog_r_has_mid s 0
+end
+
+fn prog_copy_slot_a dst ulong src ulong to void
+  db = mul dst 32
+  sb = mul src 32
+  for i ulong 32
+    put g_prog_id add db i get g_prog_id add sb i
+    put g_prog_pre_id add db i get g_prog_pre_id add sb i
+    put g_prog_post_id add db i get g_prog_post_id add sb i
+    put g_prog_r_sem add db i get g_prog_r_sem add sb i
+    put g_prog_r_mid add db i get g_prog_r_mid add sb i
+    put g_prog_r_id add db i get g_prog_r_id add sb i
+  end
+  dnb = mul dst 64
+  snb = mul src 64
+  for i ulong 64
+    put g_prog_name add dnb i get g_prog_name add snb i
+    put g_prog_pre_txt add dnb i get g_prog_pre_txt add snb i
+    put g_prog_post_txt add dnb i get g_prog_post_txt add snb i
+    put g_prog_sop add dnb i get g_prog_sop add snb i
+    put g_prog_simm add dnb i get g_prog_simm add snb i
+  end
+end
+
+fn prog_copy_slot_b dst ulong src ulong to void
+  put g_prog_name_len dst get g_prog_name_len src
+  put g_prog_has_body dst get g_prog_has_body src
+  put g_prog_scnt dst get g_prog_scnt src
+  put g_prog_in_type dst get g_prog_in_type src
+  put g_prog_in_w dst get g_prog_in_w src
+  put g_prog_out_type dst get g_prog_out_type src
+  put g_prog_out_w dst get g_prog_out_w src
+  put g_prog_pre_len dst get g_prog_pre_len src
+  put g_prog_post_len dst get g_prog_post_len src
+  lc = get g_prog_lcnt src
+  put g_prog_lcnt dst lc
+  dlb = mul dst 2048
+  slb = mul src 2048
+  for i ulong mul lc 32 bound 2048
+    put g_prog_leaves add dlb i get g_prog_leaves add slb i
+  end
+end
+
+fn prog_copy_slot_c dst ulong src ulong to void
+  put g_prog_insn_cnt dst get g_prog_insn_cnt src
+  put g_prog_reg_p dst get g_prog_reg_p src
+  put g_prog_mem_b dst get g_prog_mem_b src
+  put g_prog_lat_c dst get g_prog_lat_c src
+  put g_prog_is_real dst get g_prog_is_real src
+  put g_prog_is_ver dst get g_prog_is_ver src
+  rlen = get g_prog_r_len src
+  put g_prog_r_len dst rlen
+  put g_prog_r_prof dst get g_prog_r_prof src
+  put g_prog_r_entry dst get g_prog_r_entry src
+  put g_prog_r_has_mid dst get g_prog_r_has_mid src
+  dcb = mul dst PROG_MAX_CODE
+  scb = mul src PROG_MAX_CODE
+  for i ulong rlen bound 1536
+    put g_prog_r_code add dcb i get g_prog_r_code add scb i
+  end
+end
+
+fn prog_copy_slot dst ulong src ulong to void
+  if ge dst PROG_MAX_SLOTS
+    ret
+  end
+  if ge src PROG_MAX_SLOTS
+    ret
+  end
+  prog_copy_slot_a dst src
+  prog_copy_slot_b dst src
+  prog_copy_slot_c dst src
+end
+
+fn omega_program_init s ulong name view uchar * nlen ulong to void
+  if ge s PROG_MAX_SLOTS
+    ret
+  end
+  prog_clear_slot s
+  c = nlen
+  if gt c 60
+    c = 60
+  end
+  nb = mul s 64
+  for i ulong c bound 60
+    put g_prog_name add nb i get name i
+  end
+  put g_prog_name_len s c
+end
+
+fn omega_program_destroy s ulong to void
+  prog_clear_slot s
+end
+
+fn omega_build_constraint_id ckind ulong ann view uchar * alen ulong dst edit uchar 32 to long
+  if gt alen 128
+    ret -1
+  end
+  if ne omega_graph_create 0
+    ret -1
+  end
+  idx = omega_graph_add_object PROG_KIND_CONSTRAINT
+  if lt idx 0
+    omega_graph_destroy
+    ret -1
+  end
+  if ne omega_object_add_constraint ulong idx ckind ann alen 0
+    omega_graph_destroy
+    ret -1
+  end
+  if ne core_compute_id ulong idx 0
+    omega_graph_destroy
+    ret -1
+  end
+  core_get_id ulong idx dst
+  omega_graph_destroy
+  ret 0
+end
+
+fn prog_build_type_for tag ulong width ulong to long
+  if eq tag CORE_TYPE_UINT
+    ret omega_build_type_uint width
+  end
+  if eq tag CORE_TYPE_SINT
+    ret omega_build_type_signed_int width
+  end
+  if eq tag CORE_TYPE_BV
+    ret omega_build_type_bitvector width
+  end
+  if eq tag CORE_TYPE_FP32
+    if eq width 32
+      ret omega_build_type_fp32
+    end
+    ret -1
+  end
+  ret -1
+end
+
+fn prog_type_id_for tag ulong width ulong dst edit uchar 32 to long
+  if ne omega_graph_create 0
+    ret -1
+  end
+  idx = prog_build_type_for tag width
+  if lt idx 0
+    omega_graph_destroy
+    ret -1
+  end
+  core_get_id ulong idx dst
+  omega_graph_destroy
+  ret 0
+end
+
+fn prog_body_is_fp32 s ulong to bool
+  if eq get g_prog_in_type s CORE_TYPE_FP32
+    ret true
+  end
+  if eq get g_prog_out_type s CORE_TYPE_FP32
+    ret true
+  end
+  sc = get g_prog_scnt s
+  if gt sc PROG_MAX_STEPS
+    sc = PROG_MAX_STEPS
+  end
+  sb = mul s 64
+  for i ulong sc bound 64
+    if eq ulong get g_prog_sop add sb i PROG_OP_CONVERT
+      ret true
+    end
+  end
+  ret false
+end
+
+fn prog_add_convert_step cur_id view uchar 32 from_id view uchar 32 to_id view uchar 32 dst_id edit uchar 32 to long
+  oi = omega_graph_add_object CORE_KIND_OP
+  if lt oi 0
+    ret -1
+  end
+  pb = mul ulong oi 1024
+  for j ulong CORE_OP_SIZE bound 256
+    put g_core_pays add pb j 0
+  end
+  core_pay_put_u32le pb 0 PROG_OP_CONVERT
+  core_pay_put_u32le pb 4 PROG_OV_SATURATE
+  core_pay_put_id pb 8 to_id
+  put g_core_pays add pb 40 uchar 1
+  core_pay_put_id pb 41 from_id
+  core_pay_put_id pb 169 to_id
+  put g_core_pay_len ulong oi CORE_OP_SIZE
+  if ne core_compute_id ulong oi 0
+    ret -1
+  end
+  opid = new uchar 32 0
+  core_get_id ulong oi opid
+  ai = omega_graph_add_object CORE_KIND_OP
+  if lt ai 0
+    ret -1
+  end
+  apb = mul ulong ai 1024
+  for j ulong CORE_APP_SIZE bound 256
+    put g_core_pays add apb j 0
+  end
+  core_pay_put_id apb 0 opid
+  put g_core_pays add apb 32 uchar 1
+  core_pay_put_id apb 33 cur_id
+  put g_core_pay_len ulong ai CORE_APP_SIZE
+  if ne core_compute_id ulong ai 0
+    ret -1
+  end
+  core_get_id ulong ai dst_id
+  ret ai
+end
+
+fn prog_fp32_conv cur_tag ulong imm ulong to long
+  if and ne imm CORE_TYPE_FP32 ne imm CORE_TYPE_UINT
+    ret -1
+  end
+  if eq imm cur_tag
+    ret -1
+  end
+  cur = new uchar 32 0
+  tf = new uchar 32 0
+  tu = new uchar 32 0
+  nid = new uchar 32 0
+  for k ulong 32
+    put cur k get g_fp_cur k
+    put tf k get g_fp_tfid k
+    put tu k get g_fp_tuid k
+  end
+  rc = long -1
+  if eq cur_tag CORE_TYPE_FP32
+    rc = prog_add_convert_step cur tf tu nid
+  else
+    rc = prog_add_convert_step cur tu tf nid
+  end
+  if lt rc 0
+    ret -1
+  end
+  for k ulong 32
+    put g_fp_cur k get nid k
+  end
+  ret long imm
+end
+
+fn prog_fp32_op_ok op ulong to bool
+  if or eq op PROG_OP_ADD eq op PROG_OP_SUB
+    ret true
+  end
+  if or eq op PROG_OP_MUL eq op PROG_OP_DIV
+    ret true
+  end
+  ret false
+end
+
+fn prog_fp32_step op ulong imm ulong cur_tag ulong to long
+  if eq op PROG_OP_CONVERT
+    ret prog_fp32_conv cur_tag imm
+  end
+  if or ne cur_tag CORE_TYPE_FP32 not prog_fp32_op_ok op
+    ret -1
+  end
+  if gt imm ulong 0xffffffff
+    ret -1
+  end
+  tf = new uchar 32 0
+  cur = new uchar 32 0
+  for k ulong 32
+    put tf k get g_fp_tfid k
+    put cur k get g_fp_cur k
+  end
+  ki = omega_build_val_uint tf 32 imm
+  if lt ki 0
+    ret -1
+  end
+  kid = new uchar 32 0
+  core_get_id ulong ki kid
+  oi = omega_build_op_binary op PROG_OV_SATURATE tf
+  if lt oi 0
+    ret -1
+  end
+  core_get_id ulong oi tf
+  ai = omega_build_apply tf cur kid
+  if lt ai 0
+    ret -1
+  end
+  core_get_id ulong ai cur
+  for k ulong 32
+    put g_fp_cur k get cur k
+  end
+  ret long cur_tag
+end
+
+fn prog_fp32_init_types it ulong to long
+  tfi = omega_build_type_fp32
+  tui = omega_build_type_uint 32
+  if or lt tfi 0 lt tui 0
+    ret -1
+  end
+  tmp = new uchar 32 0
+  core_get_id ulong tfi tmp
+  for k ulong 32
+    put g_fp_tfid k get tmp k
+  end
+  core_get_id ulong tui tmp
+  for k ulong 32
+    put g_fp_tuid k get tmp k
+  end
+  if eq it CORE_TYPE_FP32
+    for k ulong 32
+      put tmp k get g_fp_tfid k
+    end
+  end
+  ci = omega_build_param tmp 0
+  if lt ci 0
+    ret -1
+  end
+  core_get_id ulong ci tmp
+  for k ulong 32
+    put g_fp_cur k get tmp k
+  end
+  ret 0
+end
+
+fn prog_fp32_loop s ulong cur_tag ulong to long
+  sb = mul s 64
+  sc = get g_prog_scnt s
+  ct = cur_tag
+  for i ulong sc bound 64
+    idx = add sb i
+    op = ulong get g_prog_sop idx
+    imm = get g_prog_simm idx
+    nt = prog_fp32_step op imm ct
+    if lt nt 0
+      ret -1
+    end
+    ct = ulong nt
+  end
+  ret long ct
+end
+
+fn prog_lower_body_fp32 s ulong dst_root edit uchar 32 to long
+  if or ne get g_prog_in_w s 32 ne get g_prog_out_w s 32
+    ret -1
+  end
+  it = get g_prog_in_type s
+  ot = get g_prog_out_type s
+  if and ne it CORE_TYPE_FP32 ne it CORE_TYPE_UINT
+    ret -1
+  end
+  if and ne ot CORE_TYPE_FP32 ne ot CORE_TYPE_UINT
+    ret -1
+  end
+  if ne prog_fp32_init_types it 0
+    ret -1
+  end
+  ft = prog_fp32_loop s it
+  if or lt ft 0 ne ulong ft ot
+    ret -1
+  end
+  for k ulong 32
+    put dst_root k get g_fp_cur k
+  end
+  ret 0
+end
+
+fn prog_lower_int_step w ulong op ulong imm ulong to long
+  if not prog_step_op_valid op
+    ret -1
+  end
+  tid = new uchar 32 0
+  cur = new uchar 32 0
+  kid = new uchar 32 0
+  for k ulong 32
+    put tid k get g_fp_tuid k
+    put cur k get g_fp_cur k
+  end
+  ki = omega_build_val_uint tid w imm
+  if lt ki 0
+    ret -1
+  end
+  core_get_id ulong ki kid
+  oi = omega_build_op_binary op PROG_OV_WRAP tid
+  if lt oi 0
+    ret -1
+  end
+  core_get_id ulong oi tid
+  ai = omega_build_apply tid cur kid
+  if lt ai 0
+    ret -1
+  end
+  core_get_id ulong ai cur
+  for k ulong 32
+    put g_fp_cur k get cur k
+  end
+  ret 0
+end
+
+fn prog_lower_int_loop s ulong w ulong sc ulong to long
+  sb = mul s 64
+  for i ulong sc bound 64
+    idx = add sb i
+    op = ulong get g_prog_sop idx
+    imm = get g_prog_simm idx
+    if ne prog_lower_int_step w op imm 0
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn prog_lower_body s ulong dst_root edit uchar 32 to long
+  if eq get g_prog_has_body s 0
+    ret -1
+  end
+  sc = get g_prog_scnt s
+  if gt sc PROG_MAX_STEPS
+    ret -1
+  end
+  if prog_body_is_fp32 s
+    ret prog_lower_body_fp32 s dst_root
+  end
+  w = get g_prog_in_w s
+  ti = prog_build_type_for get g_prog_in_type s w
+  if lt ti 0
+    ret -1
+  end
+  tmp = new uchar 32 0
+  core_get_id ulong ti tmp
+  for k ulong 32
+    put g_fp_tuid k get tmp k
+  end
+  ci = omega_build_param tmp 0
+  if lt ci 0
+    ret -1
+  end
+  core_get_id ulong ci tmp
+  for k ulong 32
+    put g_fp_cur k get tmp k
+  end
+  if ne prog_lower_int_loop s w sc 0
+    ret -1
+  end
+  for k ulong 32
+    put dst_root k get g_fp_cur k
+  end
+  ret 0
+end
+
+fn omega_program_body_root_id s ulong dst edit uchar 32 to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  if ne omega_graph_create 0
+    ret -1
+  end
+  rc = prog_lower_body s dst
+  omega_graph_destroy
+  ret rc
+end
+
+fn omega_program_contract_id s ulong dst edit uchar 32 to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  tin = new uchar 32 0
+  tout = new uchar 32 0
+  if ne prog_type_id_for get g_prog_in_type s get g_prog_in_w s tin 0
+    ret -1
+  end
+  if ne prog_type_id_for get g_prog_out_type s get g_prog_out_w s tout 0
+    ret -1
+  end
+  pos = ulong 0
+  dlen = len prog_dom_contract
+  for i ulong dlen bound 64
+    put sh_dat pos get prog_dom_contract i
+    pos = add pos 1
+  end
+  put sh_dat pos 0
+  pos = add pos 1
+  for i ulong 32
+    put sh_dat add pos i get tin i
+  end
+  pos = add pos 32
+  for i ulong 32
+    put sh_dat add pos i get tout i
+  end
+  pos = add pos 32
+  idb = mul s 32
+  for i ulong 32
+    put sh_dat add pos i get g_prog_pre_id add idb i
+  end
+  pos = add pos 32
+  for i ulong 32
+    put sh_dat add pos i get g_prog_post_id add idb i
+  end
+  pos = add pos 32
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+  ret 0
+end
+
+fn prog_compute_id_into s ulong dst edit uchar 32 to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  root = new uchar 32 0
+  tin = new uchar 32 0
+  tout = new uchar 32 0
+  if ne omega_program_body_root_id s root 0
+    ret -1
+  end
+  if ne prog_type_id_for get g_prog_in_type s get g_prog_in_w s tin 0
+    ret -1
+  end
+  if ne prog_type_id_for get g_prog_out_type s get g_prog_out_w s tout 0
+    ret -1
+  end
+  pos = ulong 0
+  dlen = len prog_dom_v2
+  for i ulong dlen bound 64
+    put sh_dat pos get prog_dom_v2 i
+    pos = add pos 1
+  end
+  put sh_dat pos 0
+  pos = add pos 1
+  for i ulong 32
+    put sh_dat add pos i get root i
+  end
+  pos = add pos 32
+  for i ulong 32
+    put sh_dat add pos i get tin i
+  end
+  pos = add pos 32
+  for i ulong 32
+    put sh_dat add pos i get tout i
+  end
+  pos = add pos 32
+  idb = mul s 32
+  for i ulong 32
+    put sh_dat add pos i get g_prog_pre_id add idb i
+  end
+  pos = add pos 32
+  for i ulong 32
+    put sh_dat add pos i get g_prog_post_id add idb i
+  end
+  pos = add pos 32
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+  ret 0
+end
+
+fn omega_program_compute_id s ulong to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  idb = mul s 32
+  for i ulong 32
+    put g_prog_id add idb i 0
+  end
+  tmp = new uchar 32 0
+  if ne prog_compute_id_into s tmp 0
+    ret -1
+  end
+  for i ulong 32
+    put g_prog_id add idb i get tmp i
+  end
+  ret 0
+end
+
+fn omega_program_realize_check s ulong out_w edit ulong 1 to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  if eq get g_prog_has_body s 0
+    ret -1
+  end
+  sc = get g_prog_scnt s
+  if gt sc PROG_MAX_STEPS
+    ret -1
+  end
+  if ne get g_prog_in_type s CORE_TYPE_UINT
+    ret -1
+  end
+  if ne get g_prog_out_type s CORE_TYPE_UINT
+    ret -1
+  end
+  w = get g_prog_in_w s
+  if ne w get g_prog_out_w s
+    ret -1
+  end
+  ok_w = false
+  if or eq w 8 eq w 16
+    ok_w = true
+  end
+  if or eq w 32 eq w 64
+    ok_w = true
+  end
+  if not ok_w
+    ret -1
+  end
+  mask = prog_width_mask w
+  nmask = xor mask ulong 0xffffffffffffffff
+  sb = mul s 64
+  for i ulong sc bound 64
+    op = ulong get g_prog_sop add sb i
+    if not prog_step_op_valid op
+      ret -1
+    end
+    if ne and get g_prog_simm add sb i nmask 0
+      ret -1
+    end
+  end
+  cid_chk = new uchar 32 0
+  if ne prog_compute_id_into s cid_chk 0
+    ret -1
+  end
+  idb = mul s 32
+  for i ulong 32
+    if ne get cid_chk i get g_prog_id add idb i
+      ret -1
+    end
+  end
+  put out_w 0 w
+  ret 0
+end
+
+fn prog_put_u32le buf edit uchar * pos ulong w long to long
+  if lt w 0
+    ret -1
+  end
+  if gt add pos 4 len buf
+    ret -1
+  end
+  wu = ulong w
+  put buf pos uchar and wu 255
+  put buf add pos 1 uchar and shr wu 8 255
+  put buf add pos 2 uchar and shr wu 16 255
+  put buf add pos 3 uchar and shr wu 24 255
+  ret long add pos 4
+end
+
+fn prog_emit_const buf edit uchar * pos ulong reg ulong imm ulong to long
+  p = prog_put_u32le buf pos a64movz 1 reg and imm 0xffff 0
+  if lt p 0
+    ret -1
+  end
+  up = ulong p
+  for k ulong 3
+    sh = mul add k 1 16
+    chunk = and shr imm sh 0xffff
+    if ne chunk 0
+      p2 = prog_put_u32le buf up a64movk 1 reg chunk sh
+      if lt p2 0
+        ret -1
+      end
+      up = ulong p2
+    end
+  end
+  ret long up
+end
+
+fn prog_emit_op buf edit uchar * pos ulong op ulong rm ulong to long
+  w = long -1
+  if eq op PROG_OP_ADD
+    w = a64addreg 1 0 0 rm
+  end
+  if eq op PROG_OP_SUB
+    w = a64subreg 1 0 0 rm
+  end
+  if eq op PROG_OP_MUL
+    w = a64mulreg 1 0 0 rm
+  end
+  if eq op PROG_OP_AND
+    w = a64andreg 1 0 0 rm
+  end
+  if eq op PROG_OP_OR
+    w = a64orrreg 1 0 0 rm
+  end
+  if lt w 0
+    ret -1
+  end
+  ret prog_put_u32le buf pos w
+end
+
+fn prog_emit_plan_seq n ulong dst edit uchar * to long
+  pos = ulong 0
+  for i ulong n bound 65
+    p1 = prog_emit_const dst pos 1 get g_prog_plan_imm i
+    if lt p1 0
+      ret -1
+    end
+    p2 = prog_emit_op dst ulong p1 ulong get g_prog_plan_op i 1
+    if lt p2 0
+      ret -1
+    end
+    pos = ulong p2
+  end
+  ret prog_put_u32le dst pos a64ret
+end
+
+fn prog_emit_plan_preload n ulong dst edit uchar * to long
+  pos = ulong 0
+  base = ulong 0
+  while lt base n bound 8
+    k = sub n base
+    if gt k PROG_PRELOAD_REGS
+      k = PROG_PRELOAD_REGS
+    end
+    for j ulong k bound 15
+      p1 = prog_emit_const dst pos add 1 j get g_prog_plan_imm add base j
+      if lt p1 0
+        ret -1
+      end
+      pos = ulong p1
+    end
+    for j ulong k bound 15
+      p2 = prog_emit_op dst pos ulong get g_prog_plan_op add base j add 1 j
+      if lt p2 0
+        ret -1
+      end
+      pos = ulong p2
+    end
+    base = add base PROG_PRELOAD_REGS
+  end
+  ret prog_put_u32le dst pos a64ret
+end
+
+fn prog_build_plan s ulong width ulong to long
+  sc = get g_prog_scnt s
+  if gt sc PROG_MAX_STEPS
+    ret -1
+  end
+  mask = prog_width_mask width
+  nmask = xor mask ulong 0xffffffffffffffff
+  sb = mul s 64
+  for i ulong sc bound 64
+    op = ulong get g_prog_sop add sb i
+    imm = get g_prog_simm add sb i
+    if not prog_step_op_valid op
+      ret -1
+    end
+    if ne and imm nmask 0
+      ret -1
+    end
+    put g_prog_plan_op i uchar op
+    put g_prog_plan_imm i imm
+  end
+  n = sc
+  if lt width 64
+    put g_prog_plan_op n uchar PROG_OP_AND
+    put g_prog_plan_imm n mask
+    n = add n 1
+  end
+  ret long n
+end
+
+fn omega_program_emit_schedule s ulong width ulong sched ulong dst edit uchar * to long
+  if or ge s PROG_MAX_SLOTS eq get g_prog_has_body s 0
+    ret -1
+  end
+  if and ne width 8 and ne width 16 and ne width 32 ne width 64
+    ret -1
+  end
+  if and ne sched PROG_SCHED_SEQUENTIAL ne sched PROG_SCHED_PRELOAD
+    ret -1
+  end
+  nl = prog_build_plan s width
+  if lt nl 0
+    ret -1
+  end
+  if eq sched PROG_SCHED_SEQUENTIAL
+    ret prog_emit_plan_seq ulong nl dst
+  end
+  ret prog_emit_plan_preload ulong nl dst
+end
+
+fn omega_program_emit_body s ulong dst edit uchar * to long
+  ret omega_program_emit_schedule s 64 PROG_SCHED_SEQUENTIAL dst
+end
+
+fn prog_rd_u32le code view uchar * off ulong to ulong
+  b0 = ulong get code off
+  b1 = ulong get code add off 1
+  b2 = ulong get code add off 2
+  b3 = ulong get code add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn prog_dec_op_to_ir dop ulong to ulong
+  if eq dop PROG_DEC_ADD
+    ret PROG_OP_ADD
+  end
+  if eq dop PROG_DEC_SUB
+    ret PROG_OP_SUB
+  end
+  if eq dop PROG_DEC_MUL
+    ret PROG_OP_MUL
+  end
+  if eq dop PROG_DEC_AND
+    ret PROG_OP_AND
+  end
+  if eq dop PROG_DEC_ORR
+    ret PROG_OP_OR
+  end
+  ret 0
+end
+
+fn prog_lift_put_step dst_slot ulong sc ulong ir_op ulong imm ulong to void
+  idx = add mul dst_slot 64 sc
+  put g_prog_sop idx uchar ir_op
+  put g_prog_simm idx imm
+end
+
+fn prog_lift_confirm dst_slot ulong code view uchar * clen ulong to long
+  re = new uchar 1536 0
+  rlen = omega_program_emit_body dst_slot re
+  if or lt rlen 0 ne ulong rlen clen
+    ret -1
+  end
+  for j ulong clen bound 1536
+    if ne get re j get code j
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn omega_program_lift_body code view uchar * clen ulong dst_slot ulong to long
+  if or ge dst_slot PROG_MAX_SLOTS or lt clen 4 ne rem clen 4 0
+    ret -1
+  end
+  if gt clen PROG_MAX_CODE
+    ret -1
+  end
+  prog_clear_slot dst_slot
+  put g_prog_has_body dst_slot 1
+  n = div clen 4
+  i = ulong 0
+  sc = ulong 0
+  dec = new ulong 9 0
+  while lt add i 1 n bound 512
+    if ne aarch64_decode_instruction prog_rd_u32le code mul i 4 dec 0
+      ret -1
+    end
+    if ne get dec 0 PROG_DEC_MOVZ
+      ret -1
+    end
+    if ne get dec 2 1
+      ret -1
+    end
+    if ne get dec 6 0
+      ret -1
+    end
+    imm = get dec 5
+    i = add i 1
+    while lt i n bound 4
+      if ne aarch64_decode_instruction prog_rd_u32le code mul i 4 dec 0
+        break
+      end
+      if ne get dec 0 PROG_DEC_MOVK
+        break
+      end
+      if ne get dec 2 1
+        ret -1
+      end
+      if eq get dec 6 0
+        ret -1
+      end
+      imm = or imm shl get dec 5 mul get dec 6 16
+      i = add i 1
+    end
+    if ge i n
+      ret -1
+    end
+    if ne aarch64_decode_instruction prog_rd_u32le code mul i 4 dec 0
+      ret -1
+    end
+    ir_op = prog_dec_op_to_ir get dec 0
+    if or eq ir_op 0 ge sc PROG_MAX_STEPS
+      ret -1
+    end
+    i = add i 1
+    prog_lift_put_step dst_slot sc ir_op imm
+    sc = add sc 1
+  end
+  put g_prog_scnt dst_slot sc
+  ret prog_lift_confirm dst_slot code clen
+end
+
+fn prog_attr_is_param oidx ulong aidx ulong to bool
+  kb = add mul oidx 2048 mul aidx 64
+  plen = len prog_attr_param
+  for i ulong plen bound 16
+    if ne get g_core_attr_keys add kb i get prog_attr_param i
+      ret false
+    end
+  end
+  if ne get g_core_attr_keys add kb plen 0
+    ret false
+  end
+  ret true
+end
+
+fn prog_read_const_val id view uchar 32 dst edit ulong 1 to long
+  oi = omega_graph_find_object_const id
+  if lt oi 0
+    ret -1
+  end
+  uo = ulong oi
+  if or ne get g_core_kind uo CORE_KIND_VALUE ne get g_core_pay_len uo CORE_VP_SIZE
+    ret -1
+  end
+  pb = mul uo 1024
+  blen = core_pay_get_u16le pb 32
+  if or eq blen 0 gt blen 8
+    ret -1
+  end
+  v = ulong 0
+  for i ulong blen bound 8
+    v = or shl v 8 ulong get g_core_pays add add pb 34 i
+  end
+  put dst 0 v
+  ret 0
+end
+
+fn prog_eval_check_param uo ulong to long
+  if ne get g_core_pay_len uo CORE_VP_SIZE
+    ret -1
+  end
+  if ne core_pay_get_u16le mul uo 1024 32 0
+    ret -1
+  end
+  for i ulong get g_core_attr_n uo bound 32
+    if prog_attr_is_param uo i
+      ret 0
+    end
+  end
+  ret -1
+end
+
+fn prog_eval_read_op op_id view uchar 32 depth ulong to long
+  opi = omega_graph_find_object_const op_id
+  if lt opi 0
+    ret -1
+  end
+  uop = ulong opi
+  if or ne get g_core_kind uop CORE_KIND_OP ne get g_core_pay_len uop CORE_OP_SIZE
+    ret -1
+  end
+  opb = mul uop 1024
+  if ne core_pay_get_u32le opb 4 PROG_OV_WRAP
+    ret -1
+  end
+  put g_eval_ops depth core_pay_get_u32le opb 0
+  ty_id = new uchar 32 0
+  for i ulong 32
+    put ty_id i get g_core_pays add add opb 8 i
+  end
+  tyi = omega_graph_find_object_const ty_id
+  if lt tyi 0
+    ret -1
+  end
+  uty = ulong tyi
+  if or ne get g_core_kind uty CORE_KIND_TYPE ne get g_core_pay_len uty CORE_TP_SIZE
+    ret -1
+  end
+  tpb = mul uty 1024
+  if ne core_pay_get_u32le tpb 0 CORE_TYPE_UINT
+    ret -1
+  end
+  tw = core_pay_get_u16le tpb 4
+  if or eq tw 0 gt tw 64
+    ret -1
+  end
+  put g_eval_tws depth tw
+  ret 0
+end
+
+fn prog_eval_step_app uo ulong depth ulong cur edit uchar 32 to long
+  if or ne get g_core_kind uo CORE_KIND_OP ne get g_core_pay_len uo CORE_APP_SIZE
+    ret -1
+  end
+  pb = mul uo 1024
+  if ne ulong get g_core_pays add pb 32 2
+    ret -1
+  end
+  tmp = new uchar 32 0
+  for i ulong 32
+    put tmp i get g_core_pays add pb i
+  end
+  if ne prog_eval_read_op tmp depth 0
+    ret -1
+  end
+  for i ulong 32
+    put tmp i get g_core_pays add add pb 65 i
+    put cur i get g_core_pays add add pb 33 i
+  end
+  cv = new ulong 1 0
+  if ne prog_read_const_val tmp cv 0
+    ret -1
+  end
+  put g_eval_consts depth get cv 0
+  ret 0
+end
+
+fn prog_eval_fold depth ulong x ulong dst edit ulong 1 to long
+  acc = x
+  out_tmp = new ulong 1 0
+  idx = depth
+  while gt idx 0 bound 64
+    idx = sub idx 1
+    if ne omega_eval_pure_binary_uint get g_eval_ops idx PROG_OV_WRAP get g_eval_tws idx acc get g_eval_consts idx out_tmp 0
+      ret -1
+    end
+    acc = get out_tmp 0
+  end
+  put dst 0 acc
+  ret 0
+end
+
+fn prog_eval_graph root view uchar 32 x ulong dst edit ulong 1 to long
+  cur = new uchar 32 0
+  for i ulong 32
+    put cur i get root i
+  end
+  depth = ulong 0
+  while le depth PROG_MAX_STEPS bound 66
+    oi = omega_graph_find_object_const cur
+    if lt oi 0
+      ret -1
+    end
+    uo = ulong oi
+    if eq get g_core_kind uo CORE_KIND_VALUE
+      if ne prog_eval_check_param uo 0
+        ret -1
+      end
+      break
+    end
+    if ge depth PROG_MAX_STEPS
+      ret -1
+    end
+    if ne prog_eval_step_app uo depth cur 0
+      ret -1
+    end
+    depth = add depth 1
+  end
+  ret prog_eval_fold depth x dst
+end
+
+fn prog_eval_loop mask ulong xs view ulong * n ulong ys edit ulong * to long
+  rid = new uchar 32 0
+  for k ulong 32
+    put rid k get g_fp_cur k
+  end
+  nmask = xor mask ulong 0xffffffffffffffff
+  outv = new ulong 1 0
+  for i ulong n bound 256
+    xv = get xs i
+    if ne and xv nmask 0
+      ret -1
+    end
+    if ne prog_eval_graph rid xv outv 0
+      ret -1
+    end
+    put ys i get outv 0
+  end
+  ret 0
+end
+
+fn omega_program_eval s ulong xs view ulong * n ulong ys edit ulong * to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  ow = new ulong 1 0
+  if ne omega_program_realize_check s ow 0
+    ret -1
+  end
+  if ne omega_graph_create 0
+    ret -1
+  end
+  rid = new uchar 32 0
+  if ne prog_lower_body s rid 0
+    omega_graph_destroy
+    ret -1
+  end
+  for k ulong 32
+    put g_fp_cur k get rid k
+  end
+  rc = prog_eval_loop prog_width_mask get ow 0 xs n ys
+  omega_graph_destroy
+  ret rc
+end
+
+fn prog_verify_v0_code code view uchar * clen ulong to long
+  if or eq clen 0 gt clen PROG_MAX_CODE
+    ret -1
+  end
+  if ne rem clen 4 0
+    ret -1
+  end
+  msg = new uchar 128 0
+  if ne aarch64_validate_code_buffer code clen msg 128 0
+    ret -1
+  end
+  last_w = prog_rd_u32le code sub clen 4
+  dec = new ulong 9 0
+  if ne aarch64_decode_instruction last_w dec 0
+    ret -1
+  end
+  if ne get dec 0 PROG_DEC_RET
+    ret -1
+  end
+  prof = get g_v0_prof 0
+  entry = get g_v0_entry 0
+  if ne get g_v0_has_mid 0 0
+    put sh_dat 0 uchar 0x4f
+    put sh_dat 1 uchar 0x4d
+    put sh_dat 2 uchar 0x47
+    put sh_dat 3 uchar 0x30
+    put sh_dat 4 uchar PROG_KIND_REALIZATION
+    put sh_dat 5 uchar and prof 255
+    put sh_dat 6 uchar and shr entry 24 255
+    put sh_dat 7 uchar and shr entry 16 255
+    put sh_dat 8 uchar and shr entry 8 255
+    put sh_dat 9 uchar and entry 255
+    put sh_dat 10 uchar and shr clen 24 255
+    put sh_dat 11 uchar and shr clen 16 255
+    put sh_dat 12 uchar and shr clen 8 255
+    put sh_dat 13 uchar and clen 255
+    for i ulong 32
+      put sh_dat add 14 i get g_v0_sem i
+      put sh_dat add 46 i get g_v0_mid i
+    end
+    for i ulong clen bound 1536
+      put sh_dat add 78 i get code i
+    end
+    sh_all add 78 clen
+  else
+    put sh_dat 0 uchar 0x4f
+    put sh_dat 1 uchar 0x4d
+    put sh_dat 2 uchar 0x47
+    put sh_dat 3 uchar 0x5f
+    put sh_dat 4 uchar 0x52
+    put sh_dat 5 uchar 0x30
+    put sh_dat 6 uchar and prof 255
+    for i ulong 32
+      put sh_dat add 7 i get g_v0_sem i
+    end
+    put sh_dat 39 uchar and shr clen 24 255
+    put sh_dat 40 uchar and shr clen 16 255
+    put sh_dat 41 uchar and shr clen 8 255
+    put sh_dat 42 uchar and clen 255
+    for i ulong clen bound 1536
+      put sh_dat add 43 i get code i
+    end
+    sh_all add 43 clen
+  end
+  for i ulong 32
+    if ne get sh_dig i get g_v0_rid i
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn prog_verify_v2_code code view uchar * clen ulong to long
+  if or eq clen 0 ne rem clen 4 0
+    ret -1
+  end
+  n = div clen 4
+  dec = new ulong 9 0
+  for i ulong n bound 512
+    if ne aarch64_decode_instruction prog_rd_u32le code mul i 4 dec 0
+      ret -1
+    end
+    dop = get dec 0
+    ok = false
+    if or eq dop PROG_DEC_ADD eq dop PROG_DEC_SUB
+      ok = true
+    end
+    if or eq dop PROG_DEC_MUL eq dop PROG_DEC_AND
+      ok = true
+    end
+    if or eq dop PROG_DEC_ORR eq dop PROG_DEC_MOVZ
+      ok = true
+    end
+    if or eq dop PROG_DEC_MOVK eq dop PROG_DEC_RET
+      ok = true
+    end
+    if not ok
+      ret -1
+    end
+  end
+  ret 0
+end
+
+fn omega_program_realize_ex s ulong to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  ow = new ulong 1 0
+  if ne omega_program_realize_check s ow 0
+    ret -2
+  end
+  code = new uchar 1536 0
+  cl_l = omega_program_emit_schedule s get ow 0 PROG_SCHED_SEQUENTIAL code
+  if lt cl_l 0
+    ret -2
+  end
+  cl = ulong cl_l
+  put g_real_profile 0 REAL_PROFILE_V8A_BAREMETAL
+  put g_real_entry_off 0 0
+  put g_real_code_len 0 cl
+  idb = mul s 32
+  for i ulong 32
+    put g_real_sem_id i get g_prog_id add idb i
+  end
+  for i ulong cl bound 1536
+    put g_real_code i get code i
+  end
+  if ne omega_compute_realization_id 0
+    ret -1
+  end
+  for i ulong 32
+    put g_v0_sem i get g_real_sem_id i
+    put g_v0_mid i 0
+    put g_v0_rid i get g_real_id i
+  end
+  put g_v0_has_mid 0 0
+  put g_v0_prof 0 REAL_PROFILE_V8A_BAREMETAL
+  put g_v0_entry 0 0
+  if ne prog_verify_v0_code code cl 0
+    ret -1
+  end
+  put g_prog_r_len s cl
+  put g_prog_r_prof s REAL_PROFILE_V8A_BAREMETAL
+  put g_prog_r_entry s 0
+  put g_prog_r_has_mid s 0
+  cb = mul s PROG_MAX_CODE
+  for i ulong cl bound 1536
+    put g_prog_r_code add cb i get code i
+  end
+  for i ulong 32
+    put g_prog_r_sem add idb i get g_real_sem_id i
+    put g_prog_r_mid add idb i 0
+    put g_prog_r_id add idb i get g_real_id i
+  end
+  put g_prog_is_real s 1
+  put g_prog_is_ver s 0
+  ret 0
+end
+
+fn omega_program_realize s ulong to long
+  ret omega_program_realize_ex s
+end
+
+fn omega_program_validate_contract s ulong to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  if or eq get g_prog_in_type s 0 eq get g_prog_out_type s 0
+    ret -1
+  end
+  if or eq get g_prog_in_w s 0 eq get g_prog_out_w s 0
+    ret -1
+  end
+  nz_pre = false
+  nz_post = false
+  idb = mul s 32
+  for i ulong 32
+    if ne get g_prog_pre_id add idb i 0
+      nz_pre = true
+    end
+    if ne get g_prog_post_id add idb i 0
+      nz_post = true
+    end
+  end
+  if or not nz_pre not nz_post
+    ret -1
+  end
+  ret 0
+end
+
+fn prog_fmt_post op ulong imm ulong dst edit uchar 64 to ulong
+  put dst 0 120
+  put dst 1 32
+  sym = uchar 63
+  if eq op PROG_OP_ADD
+    sym = uchar 43
+  end
+  if eq op PROG_OP_SUB
+    sym = uchar 45
+  end
+  if eq op PROG_OP_MUL
+    sym = uchar 42
+  end
+  if eq op PROG_OP_AND
+    sym = uchar 38
+  end
+  if eq op PROG_OP_OR
+    sym = uchar 124
+  end
+  put dst 2 sym
+  put dst 3 32
+  pos = ulong 4
+  if eq imm 0
+    put dst pos 48
+    ret add pos 1
+  end
+  digs = new uchar 24 0
+  nd = ulong 0
+  v = imm
+  while gt v 0 bound 24
+    put digs nd uchar add 48 rem v 10
+    v = div v 10
+    nd = add nd 1
+  end
+  for i ulong nd bound 24
+    put dst pos get digs sub sub nd 1 i
+    pos = add pos 1
+  end
+  ret pos
+end
+
+fn prog_build_unary_constraints s ulong op ulong imm ulong to long
+  nb = mul s 64
+  plen = len prog_pre_default
+  for i ulong plen bound 60
+    put g_prog_pre_txt add nb i get prog_pre_default i
+  end
+  put g_prog_pre_len s plen
+  cid = new uchar 32 0
+  if ne omega_build_constraint_id PROG_CONST_PRE prog_pre_default plen cid 0
+    ret -1
+  end
+  idb = mul s 32
+  for i ulong 32
+    put g_prog_pre_id add idb i get cid i
+  end
+  post_buf = new uchar 64 0
+  post_len = prog_fmt_post op imm post_buf
+  for i ulong post_len bound 64
+    put g_prog_post_txt add nb i get post_buf i
+  end
+  put g_prog_post_len s post_len
+  if ne omega_build_constraint_id PROG_CONST_POST post_buf post_len cid 0
+    ret -1
+  end
+  for i ulong 32
+    put g_prog_post_id add idb i get cid i
+  end
+  ret 0
+end
+
+fn omega_program_build_unary_op s ulong name view uchar * nlen ulong op ulong imm ulong to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  omega_program_init s name nlen
+  if or not prog_step_op_valid op gt imm ulong 0xffffffff
+    ret -1
+  end
+  put g_prog_in_type s CORE_TYPE_UINT
+  put g_prog_in_w s 64
+  put g_prog_out_type s CORE_TYPE_UINT
+  put g_prog_out_w s 64
+  if ne prog_build_unary_constraints s op imm 0
+    ret -1
+  end
+  put g_prog_has_body s 1
+  put g_prog_scnt s 1
+  put g_prog_sop mul s 64 uchar op
+  put g_prog_simm mul s 64 imm
+  if ne omega_program_compute_id s 0
+    ret -1
+  end
+  if ne omega_program_realize s 0
+    ret -1
+  end
+  put g_prog_insn_cnt s div get g_prog_r_len s 4
+  put g_prog_reg_p s 2
+  put g_prog_mem_b s 0
+  if eq op PROG_OP_MUL
+    put g_prog_lat_c s 3
+  else
+    put g_prog_lat_c s 2
+  end
+  ret 0
+end
+
+fn omega_contract_post_seq_id leaves view uchar * n ulong dst edit uchar 32 to long
+  if or eq n 0 gt n PROG_MAX_STEPS
+    ret -1
+  end
+  acc = new uchar 32 0
+  lb = mul sub n 1 32
+  for k ulong 32
+    put acc k get leaves add lb k
+  end
+  if eq n 1
+    for k ulong 32
+      put dst k get acc k
+    end
+    ret 0
+  end
+  pl = new uchar 64 0
+  idx = sub n 1
+  while gt idx 0 bound 64
+    idx = sub idx 1
+    ib = mul idx 32
+    for k ulong 32
+      put pl k get leaves add ib k
+      put pl add 32 k get acc k
+    end
+    if ne omega_graph_create 0
+      ret -1
+    end
+    oi = omega_graph_add_object PROG_KIND_CONSTRAINT
+    if lt oi 0
+      omega_graph_destroy
+      ret -1
+    end
+    if ne omega_object_add_attribute ulong oi prog_attr_compose prog_val_seq len prog_val_seq 0
+      omega_graph_destroy
+      ret -1
+    end
+    if ne omega_object_add_constraint ulong oi PROG_CONST_POST pl 64 0
+      omega_graph_destroy
+      ret -1
+    end
+    if ne core_compute_id ulong oi 0
+      omega_graph_destroy
+      ret -1
+    end
+    core_get_id ulong oi acc
+    omega_graph_destroy
+  end
+  for k ulong 32
+    put dst k get acc k
+  end
+  ret 0
+end
+
+fn prog_post_leaves_of s ulong dst edit uchar 2048 to ulong
+  lc = get g_prog_lcnt s
+  f = new uchar 32 0
+  if and ge lc 2 le lc PROG_MAX_STEPS
+    slb = mul s 2048
+    for i ulong mul lc 32 bound 2048
+      put dst i get g_prog_leaves add slb i
+    end
+    if eq omega_contract_post_seq_id dst lc f 0
+      same = true
+      idb = mul s 32
+      for k ulong 32
+        if ne get f k get g_prog_post_id add idb k
+          same = false
+        end
+      end
+      if same
+        ret lc
+      end
+    end
+  end
+  idb = mul s 32
+  for k ulong 32
+    put dst k get g_prog_post_id add idb k
+  end
+  ret 1
+end
+
+fn prog_compose_post_store sc ulong na ulong nb ulong to long
+  ntot = add na nb
+  put g_prog_lcnt sc ntot
+  clb = mul sc 2048
+  for i ulong mul na 32 bound 2048
+    put g_prog_leaves add clb i get g_prog_la i
+  end
+  off = mul na 32
+  for i ulong mul nb 32 bound 2048
+    put g_prog_leaves add add clb off i get g_prog_lb i
+    put g_prog_la add off i get g_prog_lb i
+  end
+  comb = new uchar 2048 0
+  for i ulong mul ntot 32 bound 2048
+    put comb i get g_prog_la i
+  end
+  pid = new uchar 32 0
+  if ne omega_contract_post_seq_id comb ntot pid 0
+    ret -1
+  end
+  id_c = mul sc 32
+  for k ulong 32
+    put g_prog_post_id add id_c k get pid k
+  end
+  ret 0
+end
+
+fn prog_compose_post sa ulong sb ulong sc ulong to long
+  la = new uchar 2048 0
+  na = prog_post_leaves_of sa la
+  for i ulong mul na 32 bound 2048
+    put g_prog_la i get la i
+  end
+  nb = prog_post_leaves_of sb la
+  if gt add na nb PROG_MAX_STEPS
+    ret -1
+  end
+  for i ulong mul nb 32 bound 2048
+    put g_prog_lb i get la i
+  end
+  ret prog_compose_post_store sc na nb
+end
+
+fn prog_copy_steps dst_base ulong src_base ulong cnt ulong to void
+  for i ulong cnt bound 64
+    put g_prog_sop add dst_base i get g_prog_sop add src_base i
+    put g_prog_simm add dst_base i get g_prog_simm add src_base i
+  end
+end
+
+fn prog_compose_body_cost sa ulong sb ulong sc ulong to long
+  if and ne get g_prog_has_body sa 0 ne get g_prog_has_body sb 0
+    sca = get g_prog_scnt sa
+    scb = get g_prog_scnt sb
+    if gt add sca scb PROG_MAX_STEPS
+      ret -1
+    end
+    put g_prog_has_body sc 1
+    put g_prog_scnt sc add sca scb
+    prog_copy_steps mul sc 64 mul sa 64 sca
+    prog_copy_steps add mul sc 64 sca mul sb 64 scb
+  end
+  ic = add get g_prog_insn_cnt sa get g_prog_insn_cnt sb
+  if gt ic 0
+    ic = sub ic 1
+  end
+  put g_prog_insn_cnt sc ic
+  rp = get g_prog_reg_p sa
+  if gt get g_prog_reg_p sb rp
+    rp = get g_prog_reg_p sb
+  end
+  put g_prog_reg_p sc rp
+  put g_prog_mem_b sc add get g_prog_mem_b sa get g_prog_mem_b sb
+  put g_prog_lat_c sc add get g_prog_lat_c sa get g_prog_lat_c sb
+  ret 0
+end
+
+fn omega_program_compose sa ulong sb ulong sc ulong to long
+  if or ge sa PROG_MAX_SLOTS or ge sb PROG_MAX_SLOTS ge sc PROG_MAX_SLOTS
+    ret -1
+  end
+  if or ne get g_prog_out_type sa get g_prog_in_type sb ne get g_prog_out_w sa get g_prog_in_w sb
+    ret -1
+  end
+  prog_clear_slot sc
+  put g_prog_in_type sc get g_prog_in_type sa
+  put g_prog_in_w sc get g_prog_in_w sa
+  put g_prog_out_type sc get g_prog_out_type sb
+  put g_prog_out_w sc get g_prog_out_w sb
+  for k ulong 32
+    put g_prog_pre_id add mul sc 32 k get g_prog_pre_id add mul sa 32 k
+  end
+  if ne prog_compose_post sa sb sc 0
+    ret -1
+  end
+  if ne prog_compose_body_cost sa sb sc 0
+    ret -1
+  end
+  ign = omega_program_compute_id sc
+  if ne get g_prog_has_body sc 0
+    ign2 = omega_program_realize sc
+  end
+  ret 0
+end
+
+fn prog_exec_step dec view ulong 9 regs edit ulong 16 to long
+  dop = get dec 0
+  if eq dop PROG_DEC_RET
+    ret 1
+  end
+  rd = get dec 2
+  if ge rd 16
+    ret -1
+  end
+  if eq dop PROG_DEC_MOVZ
+    put regs rd shl get dec 5 mul get dec 6 16
+    ret 0
+  end
+  if eq dop PROG_DEC_MOVK
+    sh = mul get dec 6 16
+    clr = xor shl ulong 0xffff sh ulong 0xffffffffffffffff
+    put regs rd or and get regs rd clr shl get dec 5 sh
+    ret 0
+  end
+  rn = get dec 3
+  rm = get dec 4
+  if or ge rn 16 ge rm 16
+    ret -1
+  end
+  a = get regs rn
+  b = get regs rm
+  if eq dop PROG_DEC_ADD
+    put regs rd add a b
+    ret 0
+  end
+  if eq dop PROG_DEC_SUB
+    put regs rd sub a b
+    ret 0
+  end
+  if eq dop PROG_DEC_MUL
+    put regs rd mul a b
+    ret 0
+  end
+  if eq dop PROG_DEC_AND
+    put regs rd and a b
+    ret 0
+  end
+  if eq dop PROG_DEC_ORR
+    put regs rd or a b
+    ret 0
+  end
+  ret -1
+end
+
+fn prog_exec_code code view uchar * clen ulong in_val ulong dst edit ulong 1 to long
+  if or eq clen 0 ne rem clen 4 0
+    ret -1
+  end
+  regs = new ulong 16 0
+  put regs 0 in_val
+  dec = new ulong 9 0
+  for i ulong div clen 4 bound 512
+    if ne aarch64_decode_instruction prog_rd_u32le code mul i 4 dec 0
+      ret -1
+    end
+    st = prog_exec_step dec regs
+    if eq st 1
+      put dst 0 get regs 0
+      ret 0
+    end
+    if lt st 0
+      ret -1
+    end
+  end
+  ret -1
+end
+
+fn omega_program_exec s ulong in_val ulong dst edit ulong 1 to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  if eq get g_prog_is_real s 0
+    ret -1
+  end
+  cl = get g_prog_r_len s
+  if eq cl 0
+    ret -1
+  end
+  code = new uchar 1536 0
+  cb = mul s PROG_MAX_CODE
+  for i ulong cl bound 1536
+    put code i get g_prog_r_code add cb i
+  end
+  ret prog_exec_code code cl in_val dst
+end
+
+fn omega_program_verify s ulong to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  if eq get g_prog_is_real s 0
+    ret -1
+  end
+  cl = get g_prog_r_len s
+  code = new uchar 1536 0
+  cb = mul s PROG_MAX_CODE
+  for i ulong cl bound 1536
+    put code i get g_prog_r_code add cb i
+  end
+  idb = mul s 32
+  for i ulong 32
+    put g_v0_sem i get g_prog_r_sem add idb i
+    put g_v0_mid i get g_prog_r_mid add idb i
+    put g_v0_rid i get g_prog_r_id add idb i
+  end
+  put g_v0_has_mid 0 get g_prog_r_has_mid s
+  put g_v0_prof 0 get g_prog_r_prof s
+  put g_v0_entry 0 get g_prog_r_entry s
+  if ne prog_verify_v0_code code cl 0
+    ret -1
+  end
+  if ne prog_verify_v2_code code cl 0
+    ret -1
+  end
+  put g_prog_is_ver s 1
+  ret 0
+end
+
+fn omega_task_set_contract it ulong iw ulong ot ulong ow ulong to void
+  put g_task_in_type 0 it
+  put g_task_in_w 0 iw
+  put g_task_out_type 0 ot
+  put g_task_out_w 0 ow
+end
+
+fn prog_task_hash c ulong cnt ulong to void
+  pos = ulong 0
+  for i ulong c bound 120
+    put sh_dat pos get g_task_desc i
+    pos = add pos 1
+  end
+  for i ulong 32
+    put sh_dat pos get g_task_pre_id i
+    pos = add pos 1
+  end
+  for i ulong 32
+    put sh_dat pos get g_task_post_id i
+    pos = add pos 1
+  end
+  for i ulong cnt bound 16
+    iv = get g_task_inputs i
+    ov = get g_task_outputs i
+    for b ulong 8
+      put sh_dat pos uchar and shr iv mul b 8 255
+      pos = add pos 1
+    end
+    for b ulong 8
+      put sh_dat pos uchar and shr ov mul b 8 255
+      pos = add pos 1
+    end
+  end
+  sh_all pos
+  for i ulong 32
+    put g_task_id i get sh_dig i
+  end
+end
+
+fn omega_task_init desc view uchar * ins view ulong 16 outs view ulong 16 cnt ulong to long
+  if gt cnt 16
+    ret -1
+  end
+  c = len desc
+  if gt c 120
+    c = 120
+  end
+  for i ulong 128
+    put g_task_desc i 0
+  end
+  for i ulong c bound 120
+    put g_task_desc i get desc i
+  end
+  put g_task_desc_len 0 c
+  cid = new uchar 32 0
+  if ne omega_build_constraint_id PROG_CONST_PRE prog_pre_default len prog_pre_default cid 0
+    ret -1
+  end
+  for i ulong 32
+    put g_task_pre_id i get cid i
+  end
+  if gt c 0
+    pc = c
+    if gt pc 60
+      pc = 60
+    end
+    if ne omega_build_constraint_id PROG_CONST_POST desc pc cid 0
+      ret -1
+    end
+  else
+    if ne omega_build_constraint_id PROG_CONST_POST prog_task_default len prog_task_default cid 0
+      ret -1
+    end
+  end
+  for i ulong 32
+    put g_task_post_id i get cid i
+  end
+  put g_task_budget_insn 0 10
+  put g_task_budget_reg 0 4
+  put g_task_budget_lat 0 10
+  put g_task_ex_cnt 0 cnt
+  for i ulong 16
+    put g_task_inputs i 0
+    put g_task_outputs i 0
+  end
+  for i ulong cnt bound 16
+    put g_task_inputs i get ins i
+    put g_task_outputs i get outs i
+  end
+  prog_task_hash c cnt
+  ret 0
+end
+
+fn omega_task_evaluate_candidate s ulong solved edit ulong 1 to long
+  if ge s PROG_MAX_SLOTS
+    ret -1
+  end
+  put solved 0 0
+  if eq get g_prog_is_real s 0
+    ret 0
+  end
+  if or ne get g_prog_in_type s get g_task_in_type 0 ne get g_prog_out_type s get g_task_out_type 0
+    ret 0
+  end
+  if gt get g_prog_insn_cnt s get g_task_budget_insn 0
+    ret 0
+  end
+  cnt = get g_task_ex_cnt 0
+  obs = new ulong 1 0
+  for i ulong cnt bound 16
+    if ne omega_program_exec s get g_task_inputs i obs 0
+      ret 0
+    end
+    if ne get obs 0 get g_task_outputs i
+      ret 0
+    end
+  end
+  put solved 0 1
+  ret 0
+end

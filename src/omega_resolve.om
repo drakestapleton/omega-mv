@@ -1,0 +1,2107 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_resolve.c (Verified Crumb resolver:
+note profiles, omega.lock v1 parser, receipt & blob dir fetchers, SPEC 5.1
+note receipt checker, transitive closure walk & digest, build_id, artifact
+note metadata text/parse, admit and admit_genesis).
+note Composes on seed/ng/sha256.om, om/blake3/b3unit.om, src/omega_blake3.om,
+note src/omega_receipt.om.
+om2
+
+const RES_OK long 0
+const RES_UNVERIFIED_DEP long 1
+const RES_MISSING_RECEIPT long 2
+const RES_RECEIPT_HASH_MISMATCH long 3
+const RES_DEP_NOT_PINNED long 4
+const RES_DEP_CYCLE long 5
+const RES_STALE_RECEIPT long 6
+const RES_UNDECLARED_IMPORT long 7
+const RES_TAINTED_ARTIFACT long 8
+const RES_UNKNOWN_PROFILE long 9
+const RES_VERIFIER_TOO_OLD long 10
+const RES_BAD_ARGUMENT long 20
+const RES_NOMEM long 21
+
+const RES_DOMAIN_BUILD ulong 1
+const RES_DOMAIN_DEV ulong 2
+
+const RES_DIGEST_SOURCE ulong 1
+const RES_DIGEST_IR ulong 2
+const RES_ADM_VERIFIED ulong 1
+const RES_ADM_BOOTSTRAP ulong 2
+
+const RES_VCS_GENESIS_NOT_LISTED long 40
+const RES_MAX_DEPTH ulong 128
+const RES_MAX_LOCK ulong 256
+const RES_MAX_STORE ulong 64
+const RES_MAX_VC_BYTES ulong 4096
+const RES_MAX_DEPS ulong 32
+const RES_MAX_CAPS ulong 16
+const RES_MAX_NODES ulong 128
+
+text res_cn_ok "OK"
+text res_cn_unv "UNVERIFIED_DEPENDENCY"
+text res_cn_mis "MISSING_RECEIPT"
+text res_cn_rhm "RECEIPT_HASH_MISMATCH"
+text res_cn_dnp "DEPENDENCY_NOT_PINNED"
+text res_cn_cyc "DEPENDENCY_CYCLE"
+text res_cn_stl "STALE_RECEIPT"
+text res_cn_und "UNDECLARED_IMPORT"
+text res_cn_tnt "TAINTED_ARTIFACT"
+text res_cn_unkp "UNKNOWN_VERIFIER_PROFILE"
+text res_cn_old "VERIFIER_TOO_OLD"
+text res_cn_arg "BAD_ARGUMENT"
+text res_cn_nom "NOMEM"
+text res_cn_q "?"
+
+text res_dom_dev "dev"
+text res_dom_build "build"
+
+text res_prof_0 "host-v1"
+text res_prof_1 "qemu-v1"
+text res_prof_2 "production-v1"
+text res_pver_def "1.0.0"
+text res_ptier_0 "HOST_TEST"
+text res_ptier_1 "QEMU"
+text res_ptier_2 "PRODUCTION"
+
+text res_lock_hdr "omega.lock v1"
+text res_lock_mid1 " = semantic "
+text res_lock_mid2 " receipt "
+text res_tag_vc "AIEN_VERIFIED_CRUMB_V1"
+text res_dom_closure "OMEGA.CLOSURE.V1"
+text res_dom_build_id "OSC1.BUILD.V1"
+text res_cap_taint "omega-dev.taint"
+text res_cap_selfmint "omega-bridge.selfminted"
+text res_sha256_pfx "sha256:"
+text res_ext_json ".json"
+text res_ext_blob ".blob"
+
+text res_am_k0 "OMEGA-ARTIFACT v1"
+text res_am_k1 "domain "
+text res_am_k2 "tainted "
+text res_am_k3 "ir_sha256 "
+text res_am_k4 "closure_sha256 "
+text res_am_k5 "build_id "
+text res_lit_1 "1"
+text res_lit_0 "0"
+
+note Error state
+global g_res_err_code long 1
+global g_res_err_store long 1
+global g_res_err_subj uchar 140
+global g_res_err_subj_len ulong 1
+global g_res_err_msg uchar 240
+global g_res_err_msg_len ulong 1
+
+note Resolver configuration
+global g_res_domain ulong 1
+global g_res_rcpt_dir uchar 512
+global g_res_rcpt_dir_len ulong 1
+global g_res_blob_dir uchar 512
+global g_res_blob_dir_len ulong 1
+global g_res_has_rcpt_dir ulong 1
+global g_res_has_blob_dir ulong 1
+
+note Lock state (up to RES_MAX_LOCK = 256 entries)
+global g_lock_n ulong 1
+global g_lock_names uchar 33024
+global g_lock_nlens ulong 256
+global g_lock_sem uchar 8192
+global g_lock_rcpt uchar 8192
+
+note In-memory Verified Crumb Store (up to RES_MAX_STORE = 64 records)
+global g_vcs_n ulong 1
+global g_vcs_sem uchar 2048
+global g_vcs_vcid uchar 2048
+global g_vcs_adm ulong 64
+global g_vcs_blen ulong 64
+global g_vcs_bytes uchar 262144
+
+note Decoded VC view scratch
+global g_vcv_sem uchar 32
+global g_vcv_con uchar 32
+global g_vcv_dkind ulong 1
+global g_vcv_srcdig uchar 32
+global g_vcv_rcpt uchar 32
+global g_vcv_evroot uchar 32
+global g_vcv_prof uchar 256
+global g_vcv_prof_len ulong 1
+global g_vcv_ver uchar 256
+global g_vcv_ver_len ulong 1
+global g_vcv_ndep ulong 1
+global g_vcv_deps uchar 2048
+global g_vcv_ncap ulong 1
+global g_vcv_caps uchar 4096
+global g_vcv_cap_len ulong 16
+
+note Walk & closure globals
+global g_walk_n ulong 1
+global g_walk_id uchar 4096
+global g_walk_rcpt uchar 4096
+global g_walk_con uchar 4096
+global g_walk_kind ulong 128
+global g_walk_state ulong 128
+
+global g_clos_n ulong 1
+global g_clos_sem uchar 4096
+global g_clos_rcpt uchar 4096
+global g_clos_kind uchar 128
+global g_clos_digest uchar 32
+
+note ArtifactMeta globals
+global g_am_domain ulong 1
+global g_am_tainted ulong 1
+global g_am_ir uchar 32
+global g_am_clos uchar 32
+global g_am_build uchar 32
+
+note Scratch I/O buffer for receipt/blob file fetch & DFS stack
+global g_res_io_buf uchar 65536
+global g_res_io_len ulong 1
+global g_res_orig_has ulong 1
+global g_res_orig_dom ulong 1
+global g_res_orig_taint ulong 1
+global g_st_me ulong 128
+global g_st_adm ulong 128
+global g_st_ndep ulong 128
+global g_st_di ulong 128
+global g_st_deps uchar 65536
+global g_st_req uchar 4096
+
+fn res_copy_txt src view uchar * dst edit uchar * cap ulong to ulong
+  n = len src
+  if gt n cap
+    n = cap
+  end
+  for i ulong n bound 256
+    put dst i get src i
+  end
+  ret n
+end
+
+fn res_set_err code long scode long subj view uchar * slen ulong to long
+  put g_res_err_code 0 code
+  put g_res_err_store 0 scode
+  sc = slen
+  if gt sc 139
+    sc = 139
+  end
+  for i ulong sc bound 140
+    put g_res_err_subj i get subj i
+  end
+  put g_res_err_subj sc 0
+  put g_res_err_subj_len 0 sc
+  m = new uchar 64 0
+  ml = omega_resolve_code_name code m 64
+  for i ulong ml bound 64
+    put g_res_err_msg i get m i
+  end
+  put g_res_err_msg ml 0
+  put g_res_err_msg_len 0 ml
+  ret code
+end
+
+fn omega_resolve_code_name code long dst edit uchar * cap ulong to ulong
+  if eq code RES_OK
+    ret res_copy_txt res_cn_ok dst cap
+  end
+  if eq code RES_UNVERIFIED_DEP
+    ret res_copy_txt res_cn_unv dst cap
+  end
+  if eq code RES_MISSING_RECEIPT
+    ret res_copy_txt res_cn_mis dst cap
+  end
+  if eq code RES_RECEIPT_HASH_MISMATCH
+    ret res_copy_txt res_cn_rhm dst cap
+  end
+  if eq code RES_DEP_NOT_PINNED
+    ret res_copy_txt res_cn_dnp dst cap
+  end
+  if eq code RES_DEP_CYCLE
+    ret res_copy_txt res_cn_cyc dst cap
+  end
+  if eq code RES_STALE_RECEIPT
+    ret res_copy_txt res_cn_stl dst cap
+  end
+  if eq code RES_UNDECLARED_IMPORT
+    ret res_copy_txt res_cn_und dst cap
+  end
+  if eq code RES_TAINTED_ARTIFACT
+    ret res_copy_txt res_cn_tnt dst cap
+  end
+  if eq code RES_UNKNOWN_PROFILE
+    ret res_copy_txt res_cn_unkp dst cap
+  end
+  if eq code RES_VERIFIER_TOO_OLD
+    ret res_copy_txt res_cn_old dst cap
+  end
+  if eq code RES_BAD_ARGUMENT
+    ret res_copy_txt res_cn_arg dst cap
+  end
+  if eq code RES_NOMEM
+    ret res_copy_txt res_cn_nom dst cap
+  end
+  ret res_copy_txt res_cn_q dst cap
+end
+
+fn omega_domain_name d ulong dst edit uchar * cap ulong to ulong
+  if eq d RES_DOMAIN_DEV
+    ret res_copy_txt res_dom_dev dst cap
+  end
+  if eq d RES_DOMAIN_BUILD
+    ret res_copy_txt res_dom_build dst cap
+  end
+  ret res_copy_txt res_cn_q dst cap
+end
+
+fn res_hex_nib v ulong to uchar
+  if lt v 10
+    ret uchar add 48 v
+  end
+  ret uchar add 87 v
+end
+
+fn res_hex32 src view uchar 32 dst edit uchar 64 to void
+  for i ulong 32
+    b = ulong get src i
+    put dst mul i 2 res_hex_nib shr b 4
+    put dst add mul i 2 1 res_hex_nib and b 15
+  end
+end
+
+fn res_unhex32 s view uchar * off ulong dst edit uchar 32 to long
+  for i ulong 64
+    c = ulong get s add off i
+    ok = false
+    if and ge c 48 le c 57
+      ok = true
+    end
+    if and ge c 97 le c 102
+      ok = true
+    end
+    if not ok
+      ret -1
+    end
+  end
+  for i ulong 32
+    c0 = ulong get s add off mul i 2
+    c1 = ulong get s add off add mul i 2 1
+    hi = ulong 0
+    if le c0 57
+      hi = sub c0 48
+    else
+      hi = add sub c0 97 10
+    end
+    lo = ulong 0
+    if le c1 57
+      lo = sub c1 48
+    else
+      lo = add sub c1 97 10
+    end
+    put dst i uchar or shl hi 4 lo
+  end
+  ret 0
+end
+
+fn res_is_zero32 p view uchar 32 to bool
+  for i ulong 32
+    if ne get p i 0
+      ret false
+    end
+  end
+  ret true
+end
+
+fn res_cmp32 a view uchar 32 b view uchar 32 to long
+  for i ulong 32
+    va = ulong get a i
+    vb = ulong get b i
+    if lt va vb
+      ret -1
+    end
+    if gt va vb
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn res_buf_eq a view uchar * alen ulong b view uchar * blen ulong to bool
+  if ne alen blen
+    ret false
+  end
+  for i ulong alen bound 256
+    if ne get a i get b i
+      ret false
+    end
+  end
+  ret true
+end
+
+note ---- profiles ----
+
+fn omega_resolve_default_profiles to ulong
+  ret 3
+end
+
+fn res_profile_idx name view uchar * nlen ulong to long
+  if res_buf_eq name nlen res_prof_0 len res_prof_0
+    ret 0
+  end
+  if res_buf_eq name nlen res_prof_1 len res_prof_1
+    ret 1
+  end
+  if res_buf_eq name nlen res_prof_2 len res_prof_2
+    ret 2
+  end
+  ret -1
+end
+
+fn res_profile_min_tier_rank idx ulong to long
+  if eq idx 0
+    ret omega_tier_rank res_ptier_0 len res_ptier_0
+  end
+  if eq idx 1
+    ret omega_tier_rank res_ptier_1 len res_ptier_1
+  end
+  if eq idx 2
+    ret omega_tier_rank res_ptier_2 len res_ptier_2
+  end
+  ret -1
+end
+
+fn res_parse_ver s view uchar * slen ulong parts edit ulong 8 cnt edit ulong 1 to long
+  put cnt 0 0
+  if eq slen 0
+    ret -1
+  end
+  pos = ulong 0
+  while lt pos slen bound 64
+    nc = get cnt 0
+    if ge nc 8
+      ret -1
+    end
+    v = ulong 0
+    digs = ulong 0
+    while lt pos slen bound 16
+      c = ulong get s pos
+      if or lt c 48 gt c 57
+        break
+      end
+      digs = add digs 1
+      if gt digs 9
+        ret -1
+      end
+      v = add mul v 10 sub c 48
+      pos = add pos 1
+    end
+    if eq digs 0
+      ret -1
+    end
+    put parts nc v
+    put cnt 0 add nc 1
+    if eq pos slen
+      ret 0
+    end
+    if ne get s pos 46
+      ret -1
+    end
+    pos = add pos 1
+    if eq pos slen
+      ret -1
+    end
+  end
+  ret -1
+end
+
+fn res_cmp_ver_parts have view ulong 8 nh ulong need view ulong 8 nn ulong to long
+  for i ulong 8
+    a = ulong 0
+    b = ulong 0
+    if lt i nh
+      a = get have i
+    end
+    if lt i nn
+      b = get need i
+    end
+    if lt a b
+      ret -1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  ret 0
+end
+
+fn omega_resolve_check_profile prof view uchar * plen ulong ver view uchar * vlen ulong to long
+  if lt res_profile_idx prof plen 0
+    ret res_set_err RES_UNKNOWN_PROFILE 0 prof plen
+  end
+  have = new ulong 8 0
+  need = new ulong 8 0
+  cnt = new ulong 1 0
+  if ne res_parse_ver ver vlen have cnt 0
+    ret res_set_err RES_VERIFIER_TOO_OLD 0 prof plen
+  end
+  nh = get cnt 0
+  if ne res_parse_ver res_pver_def len res_pver_def need cnt 0
+    ret res_set_err RES_VERIFIER_TOO_OLD 0 prof plen
+  end
+  if lt res_cmp_ver_parts have nh need get cnt 0 0
+    ret res_set_err RES_VERIFIER_TOO_OLD 0 prof plen
+  end
+  ret RES_OK
+end
+
+note ---- omega.lock v1 ----
+
+fn omega_lock_free to void
+  put g_lock_n 0 0
+end
+
+fn omega_lock_find name view uchar * nlen ulong to long
+  ln = get g_lock_n 0
+  for i ulong ln bound 256
+    el = get g_lock_nlens i
+    if eq el nlen
+      nb = mul i 129
+      same = true
+      for k ulong nlen bound 129
+        if ne get g_lock_names add nb k get name k
+          same = false
+          break
+        end
+      end
+      if same
+        ret long i
+      end
+    end
+  end
+  ret -1
+end
+
+fn res_lock_name_cmp idx ulong txt view uchar * off ulong nlen ulong to long
+  el = get g_lock_nlens idx
+  nb = mul idx 129
+  m = el
+  if lt nlen m
+    m = nlen
+  end
+  for i ulong m bound 129
+    a = ulong get g_lock_names add nb i
+    b = ulong get txt add off i
+    if lt a b
+      ret -1
+    end
+    if gt a b
+      ret 1
+    end
+  end
+  if lt el nlen
+    ret -1
+  end
+  if gt el nlen
+    ret 1
+  end
+  ret 0
+end
+
+fn res_is_ident_start c ulong to bool
+  if and ge c 65 le c 90
+    ret true
+  end
+  if and ge c 97 le c 122
+    ret true
+  end
+  if eq c 95
+    ret true
+  end
+  ret false
+end
+
+fn res_is_ident_cont c ulong to bool
+  if res_is_ident_start c
+    ret true
+  end
+  if and ge c 48 le c 57
+    ret true
+  end
+  if or eq c 46 eq c 45
+    ret true
+  end
+  ret false
+end
+
+fn res_match_at txt view uchar * off ulong pat view uchar * to bool
+  pl = len pat
+  for i ulong pl bound 32
+    if ne get txt add off i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn res_lock_parse_line txt view uchar * lstart ulong ll ulong n ulong to long
+  if not res_is_ident_start ulong get txt lstart
+    ret -1
+  end
+  k = ulong 0
+  while lt k ll bound 130
+    if not res_is_ident_cont ulong get txt add lstart k
+      break
+    end
+    k = add k 1
+  end
+  if gt k 128
+    ret -1
+  end
+  if ne ll add k 149
+    ret -1
+  end
+  if not res_match_at txt add lstart k res_lock_mid1
+    ret -1
+  end
+  if not res_match_at txt add add lstart k 76 res_lock_mid2
+    ret -1
+  end
+  sbuf = new uchar 32 0
+  rbuf = new uchar 32 0
+  if ne res_unhex32 txt add add lstart k 12 sbuf 0
+    ret -1
+  end
+  if ne res_unhex32 txt add add lstart k 85 rbuf 0
+    ret -1
+  end
+  if res_is_zero32 sbuf
+    ret -1
+  end
+  if res_is_zero32 rbuf
+    ret -1
+  end
+  if gt n 0
+    if ge res_lock_name_cmp sub n 1 txt lstart k 0
+      ret -1
+    end
+  end
+  if ge n RES_MAX_LOCK
+    ret -1
+  end
+  nb = mul n 129
+  for j ulong k bound 128
+    put g_lock_names add nb j get txt add lstart j
+  end
+  put g_lock_names add nb k 0
+  put g_lock_nlens n k
+  ib = mul n 32
+  for j ulong 32
+    put g_lock_sem add ib j get sbuf j
+    put g_lock_rcpt add ib j get rbuf j
+  end
+  ret 0
+end
+
+fn omega_lock_parse txt view uchar * tlen ulong to long
+  put g_lock_n 0 0
+  if or eq tlen 0 gt tlen 1048576
+    ret res_set_err RES_DEP_NOT_PINNED 0 res_lock_hdr len res_lock_hdr
+  end
+  for i ulong tlen bound 65536
+    c = ulong get txt i
+    if or eq c 9 or eq c 13 eq c 0
+      ret res_set_err RES_DEP_NOT_PINNED 0 res_lock_hdr len res_lock_hdr
+    end
+  end
+  if ne get txt sub tlen 1 10
+    ret res_set_err RES_DEP_NOT_PINNED 0 res_lock_hdr len res_lock_hdr
+  end
+  pos = ulong 0
+  hdr = ulong 0
+  n = ulong 0
+  while lt pos tlen bound 1024
+    ep = pos
+    while lt ep tlen bound 512
+      if eq get txt ep 10
+        break
+      end
+      ep = add ep 1
+    end
+    ll = sub ep pos
+    lstart = pos
+    pos = add ep 1
+    if eq hdr 0
+      if or ne ll 13 not res_match_at txt lstart res_lock_hdr
+        put g_lock_n 0 0
+        ret res_set_err RES_DEP_NOT_PINNED 0 res_lock_hdr len res_lock_hdr
+      end
+      hdr = 1
+      continue
+    end
+    if or eq ll 0 eq get txt lstart 35
+      continue
+    end
+    if ne res_lock_parse_line txt lstart ll n 0
+      put g_lock_n 0 0
+      ret res_set_err RES_DEP_NOT_PINNED 0 res_lock_hdr len res_lock_hdr
+    end
+    n = add n 1
+  end
+  if eq hdr 0
+    ret res_set_err RES_DEP_NOT_PINNED 0 res_lock_hdr len res_lock_hdr
+  end
+  put g_lock_n 0 n
+  ret RES_OK
+end
+
+note ---- directory file fetchers ----
+
+fn res_read_all fd long to long
+  tot = ulong 0
+  rb = new uchar 4096 0
+  while lt tot 65536 bound 64
+    left = sub 65536 tot
+    want = left
+    if gt want 4096
+      want = 4096
+    end
+    r = read int fd rb 0 want
+    if lt r 0
+      ign = fclose int fd
+      ret -1
+    end
+    if eq r 0
+      break
+    end
+    ur = ulong r
+    for i ulong ur bound 4096
+      put g_res_io_buf add tot i get rb i
+    end
+    tot = add tot ur
+  end
+  ign = fclose int fd
+  put g_res_io_len 0 tot
+  ret 0
+end
+
+fn res_dir_fetch dir view uchar * dlen ulong id view uchar 32 ext view uchar * to long
+  if or eq dlen 0 gt dlen 400
+    ret -1
+  end
+  path = new uchar 512 0
+  pos = ulong 0
+  for i ulong dlen bound 400
+    put path pos get dir i
+    pos = add pos 1
+  end
+  put path pos 47
+  pos = add pos 1
+  hx = new uchar 64 0
+  res_hex32 id hx
+  for i ulong 64
+    put path pos get hx i
+    pos = add pos 1
+  end
+  el = len ext
+  for i ulong el bound 16
+    put path pos get ext i
+    pos = add pos 1
+  end
+  fd = fopen path 0 pos 0 0
+  if lt fd 0
+    ret 1
+  end
+  ret res_read_all fd
+end
+
+fn omega_receipt_dir_fetch dir view uchar * dlen ulong id view uchar 32 to long
+  ret res_dir_fetch dir dlen id res_ext_json
+end
+
+fn omega_blob_dir_fetch dir view uchar * dlen ulong dig view uchar 32 to long
+  ret res_dir_fetch dir dlen dig res_ext_blob
+end
+
+note ---- VC1 binary decoder & in-memory store ----
+
+fn res_rd_u32be b view uchar * pos ulong to ulong
+  b0 = ulong get b pos
+  b1 = ulong get b add pos 1
+  b2 = ulong get b add pos 2
+  b3 = ulong get b add pos 3
+  ret or or shl b0 24 shl b1 16 or shl b2 8 b3
+end
+
+fn res_rd_u64be b view uchar * pos ulong to ulong
+  hi = res_rd_u32be b pos
+  lo = res_rd_u32be b add pos 4
+  ret or shl hi 32 lo
+end
+
+fn res_vc_decode_caps b view uchar * pos ulong n ulong to long
+  if gt add pos 4 n
+    ret 22
+  end
+  nc = res_rd_u32be b pos
+  pos = add pos 4
+  if gt nc RES_MAX_CAPS
+    ret 29
+  end
+  put g_vcv_ncap 0 nc
+  for i ulong nc bound 16
+    if gt add pos 8 n
+      ret 22
+    end
+    cl = res_rd_u64be b pos
+    pos = add pos 8
+    if or eq cl 0 or gt cl 256 gt add pos cl n
+      ret 27
+    end
+    put g_vcv_cap_len i cl
+    cb = mul i 256
+    for j ulong cl bound 256
+      put g_vcv_caps add cb j get b add pos j
+    end
+    pos = add pos cl
+  end
+  if ne pos n
+    ret 23
+  end
+  ret 0
+end
+
+fn res_vc_decode_tail b view uchar * pos ulong n ulong to long
+  note evidence_root
+  if gt add pos 32 n
+    ret 22
+  end
+  for i ulong 32
+    put g_vcv_evroot i get b add pos i
+  end
+  pos = add pos 32
+  note exports
+  if gt add pos 4 n
+    ret 22
+  end
+  nex = res_rd_u32be b pos
+  pos = add pos 4
+  for i ulong nex bound 256
+    if gt add pos 8 n
+      ret 22
+    end
+    el = res_rd_u64be b pos
+    pos = add pos 8
+    if or eq el 0 gt add pos el n
+      ret 27
+    end
+    pos = add pos el
+  end
+  ret res_vc_decode_caps b pos n
+end
+
+fn res_vc_decode b view uchar * n ulong to long
+  if lt n 22
+    ret 22
+  end
+  for i ulong 22
+    if ne get b i get res_tag_vc i
+      ret 20
+    end
+  end
+  pos = ulong 22
+  if gt add pos 101 n
+    ret 22
+  end
+  if ne res_rd_u32be b pos 1
+    ret 21
+  end
+  pos = add pos 4
+  for i ulong 32
+    put g_vcv_sem i get b add pos i
+    put g_vcv_con i get b add add pos 32 i
+  end
+  pos = add pos 64
+  dk = ulong get b pos
+  pos = add pos 1
+  if and ne dk RES_DIGEST_SOURCE ne dk RES_DIGEST_IR
+    ret 30
+  end
+  put g_vcv_dkind 0 dk
+  for i ulong 32
+    put g_vcv_srcdig i get b add pos i
+  end
+  pos = add pos 32
+  if gt add pos 4 n
+    ret 22
+  end
+  nr = res_rd_u32be b pos
+  pos = add pos 4
+  if gt add pos mul nr 32 n
+    ret 22
+  end
+  pos = add pos mul nr 32
+  if gt add pos 4 n
+    ret 22
+  end
+  nd = res_rd_u32be b pos
+  pos = add pos 4
+  if gt nd RES_MAX_DEPS
+    ret 29
+  end
+  if gt add pos add mul nd 64 32 n
+    ret 22
+  end
+  put g_vcv_ndep 0 nd
+  for i ulong mul nd 64 bound 2048
+    put g_vcv_deps i get b add pos i
+  end
+  pos = add pos mul nd 64
+  for i ulong 32
+    put g_vcv_rcpt i get b add pos i
+  end
+  pos = add pos 32
+  if gt add pos 8 n
+    ret 22
+  end
+  pl = res_rd_u64be b pos
+  pos = add pos 8
+  if or eq pl 0 or gt pl 256 gt add pos pl n
+    ret 27
+  end
+  put g_vcv_prof_len 0 pl
+  for i ulong pl bound 256
+    put g_vcv_prof i get b add pos i
+  end
+  pos = add pos pl
+  if gt add pos 8 n
+    ret 22
+  end
+  vl = res_rd_u64be b pos
+  pos = add pos 8
+  if or eq vl 0 or gt vl 256 gt add pos vl n
+    ret 27
+  end
+  put g_vcv_ver_len 0 vl
+  for i ulong vl bound 256
+    put g_vcv_ver i get b add pos i
+  end
+  ret res_vc_decode_tail b add pos vl n
+end
+
+fn res_vcs_clear to void
+  put g_vcs_n 0 0
+end
+
+fn res_vcs_find sem view uchar 32 to long
+  n = get g_vcs_n 0
+  for i ulong n bound 64
+    sb = mul i 32
+    same = true
+    for k ulong 32
+      if ne get g_vcs_sem add sb k get sem k
+        same = false
+        break
+      end
+    end
+    if same
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn res_vcs_receipt_of sem view uchar 32 dst edit uchar 32 to long
+  idx = res_vcs_find sem
+  if lt idx 0
+    ret -1
+  end
+  u = ulong idx
+  blen = get g_vcs_blen u
+  buf = new uchar 4096 0
+  bb = mul u RES_MAX_VC_BYTES
+  for i ulong blen bound 4096
+    put buf i get g_vcs_bytes add bb i
+  end
+  if ne res_vc_decode buf blen 0
+    ret -1
+  end
+  for i ulong 32
+    put dst i get g_vcv_rcpt i
+  end
+  ret 0
+end
+
+fn res_vcs_cmp_slot u ulong canon view uchar * clen ulong to long
+  if ne get g_vcs_blen u clen
+    ret 32
+  end
+  bb = mul u RES_MAX_VC_BYTES
+  for i ulong clen bound 4096
+    if ne get g_vcs_bytes add bb i get canon i
+      ret 32
+    end
+  end
+  ret 0
+end
+
+fn res_vcs_store_slot n ulong canon view uchar * clen ulong claimed view uchar 32 to void
+  sb = mul n 32
+  for i ulong 32
+    put g_vcs_sem add sb i get g_vcv_sem i
+    put g_vcs_vcid add sb i get claimed i
+  end
+  put g_vcs_blen n clen
+  bb = mul n RES_MAX_VC_BYTES
+  for i ulong clen bound 4096
+    put g_vcs_bytes add bb i get canon i
+  end
+end
+
+fn res_vcs_insert_raw canon view uchar * clen ulong claimed view uchar 32 adm ulong to long
+  if gt clen RES_MAX_VC_BYTES
+    ret 36
+  end
+  for i ulong clen bound 4096
+    put sh_dat i get canon i
+  end
+  sh_all clen
+  for i ulong 32
+    if ne get sh_dig i get claimed i
+      ret 31
+    end
+  end
+  rc = res_vc_decode canon clen
+  if ne rc 0
+    ret rc
+  end
+  sem = new uchar 32 0
+  for i ulong 32
+    put sem i get g_vcv_sem i
+  end
+  ex = res_vcs_find sem
+  if ge ex 0
+    ret res_vcs_cmp_slot ulong ex canon clen
+  end
+  n = get g_vcs_n 0
+  if ge n RES_MAX_STORE
+    ret 36
+  end
+  put g_vcs_adm n adm
+  res_vcs_store_slot n canon clen claimed
+  put g_vcs_n 0 add n 1
+  ret 0
+end
+
+fn res_vcv_has_cap pat view uchar * to bool
+  nc = get g_vcv_ncap 0
+  pl = len pat
+  for i ulong nc bound 16
+    if eq get g_vcv_cap_len i pl
+      cb = mul i 256
+      same = true
+      for j ulong pl bound 64
+        if ne get g_vcv_caps add cb j get pat j
+          same = false
+          break
+        end
+      end
+      if same
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn res_rcpt_has_artifact want view uchar * wlen ulong to bool
+  cnt = get g_rc_l_cnt 0
+  for i ulong cnt bound 256
+    off = get g_rc_l_off i
+    al = get g_rc_l_len i
+    if eq al wlen
+      same = true
+      for j ulong wlen bound 80
+        ca = ulong get g_rc_str add off j
+        cb = ulong get want j
+        if and ge ca 65 le ca 90
+          ca = add ca 32
+        end
+        if and ge cb 65 le cb 90
+          cb = add cb 32
+        end
+        if ne ca cb
+          same = false
+          break
+        end
+      end
+      if same
+        ret true
+      end
+    end
+  end
+  ret false
+end
+
+fn res_sort_ids arr edit uchar 1024 cnt ulong to void
+  if le cnt 1
+    ret
+  end
+  for i ulong cnt bound 32
+    for j ulong sub cnt 1 bound 32
+      a = mul j 32
+      b = mul add j 1 32
+      gt_ab = false
+      for k ulong 32
+        va = ulong get arr add a k
+        vb = ulong get arr add b k
+        if lt va vb
+          break
+        end
+        if gt va vb
+          gt_ab = true
+          break
+        end
+      end
+      if gt_ab
+        for k ulong 32
+          t = get arr add a k
+          put arr add a k get arr add b k
+          put arr add b k t
+        end
+      end
+    end
+  end
+end
+
+fn res_sort_dedup_ids arr edit uchar 1024 cnt ulong to ulong
+  res_sort_ids arr cnt
+  u = ulong 0
+  for i ulong cnt bound 32
+    ib = mul i 32
+    dup = false
+    if gt u 0
+      pb = mul sub u 1 32
+      dup = true
+      for k ulong 32
+        if ne get arr add pb k get arr add ib k
+          dup = false
+          break
+        end
+      end
+    end
+    if not dup
+      for k ulong 32
+        put arr add mul u 32 k get arr add ib k
+      end
+      u = add u 1
+    end
+  end
+  ret u
+end
+
+fn res_load_vc_deps da edit uchar 1024 nd ulong to long
+  dsem = new uchar 32 0
+  drcp = new uchar 32 0
+  for i ulong nd bound 32
+    for k ulong 32
+      put dsem k get g_vcv_deps add mul i 64 k
+    end
+    if ne res_vcs_receipt_of dsem drcp 0
+      ret RES_UNVERIFIED_DEP
+    end
+    for k ulong 32
+      put da add mul i 32 k get drcp k
+    end
+  end
+  ret RES_OK
+end
+
+fn res_load_rcpt_deps db edit uchar 1024 nrd ulong to long
+  drcp = new uchar 32 0
+  low = new uchar 64 0
+  for i ulong nrd bound 32
+    doff = get g_rc_l_off add 512 i
+    if ne get g_rc_l_len add 512 i 64
+      ret RES_RECEIPT_HASH_MISMATCH
+    end
+    for k ulong 64
+      ch = ulong get g_rc_str add doff k
+      if and ge ch 65 le ch 70
+        ch = add ch 32
+      end
+      put low k uchar ch
+    end
+    if ne res_unhex32 low 0 drcp 0
+      ret RES_RECEIPT_HASH_MISMATCH
+    end
+    for k ulong 32
+      put db add mul i 32 k get drcp k
+    end
+  end
+  ret RES_OK
+end
+
+fn res_check_rcpt_deps to long
+  nd = get g_vcv_ndep 0
+  nrd = get g_rc_l_cnt 2
+  if or gt nd 32 gt nrd 32
+    ret RES_RECEIPT_HASH_MISMATCH
+  end
+  da = new uchar 1024 0
+  db = new uchar 1024 0
+  rc = res_load_vc_deps da nd
+  if ne rc RES_OK
+    ret rc
+  end
+  rc = res_load_rcpt_deps db nrd
+  if ne rc RES_OK
+    ret rc
+  end
+  ua = res_sort_dedup_ids da nd
+  ub = res_sort_dedup_ids db nrd
+  if ne ua ub
+    ret RES_RECEIPT_HASH_MISMATCH
+  end
+  for i ulong mul ua 32 bound 1024
+    if ne get da i get db i
+      ret RES_RECEIPT_HASH_MISMATCH
+    end
+  end
+  ret RES_OK
+end
+
+fn res_check_blob_store to long
+  if eq get g_res_has_blob_dir 0 0
+    if eq get g_res_domain 0 RES_DOMAIN_BUILD
+      ret -1
+    end
+    ret 0
+  end
+  bdir = new uchar 512 0
+  bdl = get g_res_blob_dir_len 0
+  for i ulong bdl bound 512
+    put bdir i get g_res_blob_dir i
+  end
+  sdig = new uchar 32 0
+  for i ulong 32
+    put sdig i get g_vcv_srcdig i
+  end
+  if ne omega_blob_dir_fetch bdir bdl sdig 0
+    ret -1
+  end
+  iol = get g_res_io_len 0
+  for i ulong iol bound 65536
+    put sh_dat i get g_res_io_buf i
+  end
+  sh_all iol
+  for i ulong 32
+    if ne get sh_dig i get sdig i
+      ret -1
+    end
+  end
+  if and ne get g_vcv_dkind 0 RES_DIGEST_IR eq get g_res_domain 0 RES_DOMAIN_BUILD
+    ret -1
+  end
+  ret 0
+end
+
+fn res_rcpt_fetch_and_verify to long
+  if eq get g_res_has_rcpt_dir 0 0
+    ret RES_MISSING_RECEIPT
+  end
+  dir = new uchar 512 0
+  dl = get g_res_rcpt_dir_len 0
+  for i ulong dl bound 512
+    put dir i get g_res_rcpt_dir i
+  end
+  rid = new uchar 32 0
+  for i ulong 32
+    put rid i get g_vcv_rcpt i
+  end
+  if ne omega_receipt_dir_fetch dir dl rid 0
+    ret RES_MISSING_RECEIPT
+  end
+  blen = get g_res_io_len 0
+  if gt blen 8192
+    ret RES_RECEIPT_HASH_MISMATCH
+  end
+  rbuf = new uchar 8192 0
+  for i ulong blen bound 8192
+    put rbuf i get g_res_io_buf i
+  end
+  got_id = new uchar 32 0
+  if ne omega_receipt_verify_bytes rbuf blen got_id 0
+    ret RES_RECEIPT_HASH_MISMATCH
+  end
+  if ne res_cmp32 got_id rid 0
+    omega_receipt_free
+    ret RES_RECEIPT_HASH_MISMATCH
+  end
+  ret RES_OK
+end
+
+fn res_rcpt_check_bindings prof view uchar * pl ulong to long
+  if and eq get g_res_domain 0 RES_DOMAIN_BUILD ne get g_rc_dirty 0 0
+    ret RES_UNVERIFIED_DEP
+  end
+  want = new uchar 71 0
+  for i ulong 7
+    put want i get res_sha256_pfx i
+  end
+  sid_b = new uchar 32 0
+  hx = new uchar 64 0
+  for i ulong 32
+    put sid_b i get g_vcv_sem i
+  end
+  res_hex32 sid_b hx
+  for i ulong 64
+    put want add 7 i get hx i
+  end
+  if not res_rcpt_has_artifact want 71
+    ret RES_RECEIPT_HASH_MISMATCH
+  end
+  for i ulong 32
+    put sid_b i get g_vcv_srcdig i
+  end
+  res_hex32 sid_b hx
+  for i ulong 64
+    put want add 7 i get hx i
+  end
+  if not res_rcpt_has_artifact want 71
+    ret RES_STALE_RECEIPT
+  end
+  for i ulong 32
+    if ne get g_rc_out_digest i get g_vcv_evroot i
+      ret RES_RECEIPT_HASH_MISMATCH
+    end
+  end
+  koff = get g_rc_s_off 0
+  if ne get g_rc_s_len 0 pl
+    ret RES_RECEIPT_HASH_MISMATCH
+  end
+  for i ulong pl bound 256
+    if ne get g_rc_str add koff i get prof i
+      ret RES_RECEIPT_HASH_MISMATCH
+    end
+  end
+  ret RES_OK
+end
+
+fn res_rcpt_check_tier need_rank long to long
+  if ne get g_rc_result 0 0
+    ret RES_UNVERIFIED_DEP
+  end
+  for i ulong get g_rc_as_cnt 0 bound 128
+    if eq get g_rc_as_pass i 0
+      ret RES_UNVERIFIED_DEP
+    end
+  end
+  tr = get g_rc_tier_rank 0
+  if and ge tr 4 and le tr 6 eq get g_rc_has_lease 0 0
+    ret RES_UNVERIFIED_DEP
+  end
+  if or eq tr 0 eq omega_tier_satisfies need_rank tr 0
+    ret RES_UNVERIFIED_DEP
+  end
+  ret RES_OK
+end
+
+fn omega_resolve_check_record_receipt to long
+  prof = new uchar 256 0
+  ver = new uchar 256 0
+  pl = get g_vcv_prof_len 0
+  vl = get g_vcv_ver_len 0
+  for i ulong pl bound 256
+    put prof i get g_vcv_prof i
+  end
+  for i ulong vl bound 256
+    put ver i get g_vcv_ver i
+  end
+  rc = omega_resolve_check_profile prof pl ver vl
+  if ne rc 0
+    ret rc
+  end
+  pidx = res_profile_idx prof pl
+  if lt pidx 0
+    ret res_set_err RES_UNKNOWN_PROFILE 0 prof pl
+  end
+  rc = res_rcpt_fetch_and_verify
+  if ne rc RES_OK
+    ret res_set_err rc 0 prof pl
+  end
+  rc = res_rcpt_check_bindings prof pl
+  if ne rc RES_OK
+    omega_receipt_free
+    ret res_set_err rc 0 prof pl
+  end
+  rc = res_check_rcpt_deps
+  if ne rc RES_OK
+    omega_receipt_free
+    ret res_set_err rc 0 prof pl
+  end
+  rc = res_rcpt_check_tier res_profile_min_tier_rank ulong pidx
+  omega_receipt_free
+  if ne rc RES_OK
+    ret res_set_err rc 0 prof pl
+  end
+  ret RES_OK
+end
+
+note ---- closure & walk ----
+
+fn omega_closure_free to void
+  put g_clos_n 0 0
+  for i ulong 32
+    put g_clos_digest i 0
+  end
+end
+
+fn omega_closure_digest n ulong dst edit uchar 32 to void
+  pos = ulong 0
+  dl = len res_dom_closure
+  for i ulong dl bound 32
+    put sh_dat pos get res_dom_closure i
+    pos = add pos 1
+  end
+  put sh_dat pos 0
+  pos = add pos 1
+  put sh_dat pos uchar and shr n 24 255
+  put sh_dat add pos 1 uchar and shr n 16 255
+  put sh_dat add pos 2 uchar and shr n 8 255
+  put sh_dat add pos 3 uchar and n 255
+  pos = add pos 4
+  for i ulong n bound 128
+    ib = mul i 32
+    for k ulong 32
+      put sh_dat add pos k get g_clos_sem add ib k
+    end
+    pos = add pos 32
+    for k ulong 32
+      put sh_dat add pos k get g_clos_rcpt add ib k
+    end
+    pos = add pos 32
+    put sh_dat pos get g_clos_kind i
+    pos = add pos 1
+  end
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn res_walk_find id view uchar 32 to long
+  n = get g_walk_n 0
+  for i ulong n bound 128
+    ib = mul i 32
+    same = true
+    for k ulong 32
+      if ne get g_walk_id add ib k get id k
+        same = false
+        break
+      end
+    end
+    if same
+      ret long i
+    end
+  end
+  ret -1
+end
+
+fn res_enter_load_vc id view uchar 32 to long
+  sidx = res_vcs_find id
+  if lt sidx 0
+    ret -1
+  end
+  su = ulong sidx
+  blen = get g_vcs_blen su
+  vbuf = new uchar 4096 0
+  for i ulong blen bound 4096
+    put vbuf i get g_vcs_bytes add mul su RES_MAX_VC_BYTES i
+  end
+  if ne res_vc_decode vbuf blen 0
+    ret -1
+  end
+  ret long get g_vcs_adm su
+end
+
+fn res_walk_add id view uchar 32 adm ulong to long
+  me = get g_walk_n 0
+  if ge me RES_MAX_NODES
+    ret -1
+  end
+  put g_walk_n 0 add me 1
+  mb = mul me 32
+  for k ulong 32
+    put g_walk_id add mb k get id k
+    put g_walk_rcpt add mb k get g_vcv_rcpt k
+    put g_walk_con add mb k get g_vcv_con k
+  end
+  put g_walk_kind me adm
+  put g_walk_state me 1
+  ret 0
+end
+
+fn res_enter_node id view uchar 32 has_lr ulong lr view uchar 32 subj view uchar * slen ulong to long
+  at_idx = res_walk_find id
+  if ge at_idx 0
+    u = ulong at_idx
+    if eq get g_walk_state u 1
+      ign = res_set_err RES_DEP_CYCLE 0 subj slen
+      ret -1
+    end
+    if ne has_lr 0
+      for k ulong 32
+        if ne get lr k get g_walk_rcpt add mul u 32 k
+          ign = res_set_err RES_RECEIPT_HASH_MISMATCH 0 subj slen
+          ret -1
+        end
+      end
+    end
+    ret 1
+  end
+  adm_l = res_enter_load_vc id
+  if lt adm_l 0
+    ign = res_set_err RES_UNVERIFIED_DEP 0 subj slen
+    ret -1
+  end
+  adm = ulong adm_l
+  if ne res_check_blob_store 0
+    ign = res_set_err RES_UNVERIFIED_DEP 0 subj slen
+    ret -1
+  end
+  if ne has_lr 0
+    for k ulong 32
+      if ne get lr k get g_vcv_rcpt k
+        ign = res_set_err RES_RECEIPT_HASH_MISMATCH 0 subj slen
+        ret -1
+      end
+    end
+  end
+  if and ne adm RES_ADM_VERIFIED ne adm RES_ADM_BOOTSTRAP
+    ign = res_set_err RES_UNVERIFIED_DEP 0 subj slen
+    ret -1
+  end
+  if res_vcv_has_cap res_cap_taint
+    ign = res_set_err RES_TAINTED_ARTIFACT 0 subj slen
+    ret -1
+  end
+  if and eq get g_res_domain 0 RES_DOMAIN_BUILD res_vcv_has_cap res_cap_selfmint
+    ign = res_set_err RES_UNVERIFIED_DEP 0 subj slen
+    ret -1
+  end
+  if eq adm RES_ADM_VERIFIED
+    rrc = omega_resolve_check_record_receipt
+    if ne rrc 0
+      ign = res_set_err rrc 0 subj slen
+      ret -1
+    end
+  end
+  if ne res_walk_add id adm 0
+    ign = res_set_err RES_NOMEM 0 subj slen
+    ret -1
+  end
+  ret 0
+end
+
+fn res_st_push sp ulong me ulong to void
+  put g_st_me sp me
+  put g_st_adm sp get g_walk_kind me
+  cnd = get g_vcv_ndep 0
+  put g_st_ndep sp cnd
+  put g_st_di sp 0
+  sb_base = mul sp 2048
+  for i ulong mul cnd 64 bound 2048
+    put g_st_deps add sb_base i get g_vcv_deps i
+  end
+end
+
+fn res_walk_con_eq cu ulong req_off ulong to bool
+  cb = mul cu 32
+  for k ulong 32
+    if ne get g_walk_con add cb k get g_st_deps add req_off k
+      ret false
+    end
+  end
+  ret true
+end
+
+fn res_iter_step_dep sp ulong di ulong subj view uchar * slen ulong to long
+  d_id = new uchar 32 0
+  z_lr = new uchar 32 0
+  db = add mul sp 2048 mul di 64
+  for k ulong 32
+    put d_id k get g_st_deps add db k
+  end
+  cer = res_enter_node d_id 0 z_lr subj slen
+  if lt cer 0
+    ret -1
+  end
+  cidx = res_walk_find d_id
+  if lt cidx 0
+    ign = res_set_err RES_UNVERIFIED_DEP 0 subj slen
+    ret -1
+  end
+  cu = ulong cidx
+  if not res_walk_con_eq cu add db 32
+    ign = res_set_err RES_UNVERIFIED_DEP 0 subj slen
+    ret -1
+  end
+  if eq get g_st_adm sp RES_ADM_BOOTSTRAP
+    if ne get g_walk_kind cu RES_ADM_BOOTSTRAP
+      ign = res_set_err RES_UNVERIFIED_DEP 0 subj slen
+      ret -1
+    end
+  end
+  if eq cer 0
+    res_st_push add sp 1 cu
+    ret 1
+  end
+  ret 0
+end
+
+fn res_resolve_iter id view uchar 32 lr view uchar 32 subj view uchar * slen ulong to long
+  er = res_enter_node id 1 lr subj slen
+  if lt er 0
+    ret get g_res_err_code 0
+  end
+  if eq er 1
+    ret RES_OK
+  end
+  sp = ulong 0
+  res_st_push 0 sub get g_walk_n 0 1
+  while true bound 2048
+    di = get g_st_di sp
+    if ge di get g_st_ndep sp
+      if eq get g_st_adm sp RES_ADM_BOOTSTRAP
+        ret res_set_err RES_UNVERIFIED_DEP RES_VCS_GENESIS_NOT_LISTED subj slen
+      end
+      put g_walk_state get g_st_me sp 2
+      if eq sp 0
+        ret RES_OK
+      end
+      sp = sub sp 1
+      continue
+    end
+    put g_st_di sp add di 1
+    if ge add sp 1 RES_MAX_DEPTH
+      ret res_set_err RES_UNVERIFIED_DEP 0 subj slen
+    end
+    sr = res_iter_step_dep sp di subj slen
+    if lt sr 0
+      ret get g_res_err_code 0
+    end
+    if eq sr 1
+      sp = add sp 1
+    end
+  end
+  ret RES_OK
+end
+
+fn res_swap_clos j ulong to void
+  a = mul j 32
+  b = mul add j 1 32
+  for k ulong 32
+    t = get g_clos_sem add a k
+    put g_clos_sem add a k get g_clos_sem add b k
+    put g_clos_sem add b k t
+    t2 = get g_clos_rcpt add a k
+    put g_clos_rcpt add a k get g_clos_rcpt add b k
+    put g_clos_rcpt add b k t2
+  end
+  tk = get g_clos_kind j
+  put g_clos_kind j get g_clos_kind add j 1
+  put g_clos_kind add j 1 tk
+end
+
+fn res_clos_gt j ulong to bool
+  a = mul j 32
+  b = mul add j 1 32
+  for k ulong 32
+    va = ulong get g_clos_sem add a k
+    vb = ulong get g_clos_sem add b k
+    if lt va vb
+      ret false
+    end
+    if gt va vb
+      ret true
+    end
+  end
+  ret false
+end
+
+fn res_sort_closure to void
+  n = get g_clos_n 0
+  if le n 1
+    ret
+  end
+  for i ulong n bound 128
+    for j ulong sub n 1 bound 128
+      if res_clos_gt j
+        res_swap_clos j
+      end
+    end
+  end
+end
+
+fn res_names_row_eq names view uchar * i ulong k ulong slen ulong to bool
+  bi = mul i 129
+  bk = mul k 129
+  for b ulong slen bound 129
+    if ne get names add bi b get names add bk b
+      ret false
+    end
+  end
+  ret true
+end
+
+fn res_check_dup_and_pinned names view uchar * nlens view ulong * n_names ulong to long
+  ni = new uchar 129 0
+  for i ulong n_names bound 64
+    li = get nlens i
+    for b ulong li bound 129
+      put ni b get names add mul i 129 b
+    end
+    for k ulong i bound 64
+      if eq get nlens k li
+        if res_names_row_eq names i k li
+          ret res_set_err RES_BAD_ARGUMENT 0 ni li
+        end
+      end
+    end
+    if lt omega_lock_find ni li 0
+      ret res_set_err RES_DEP_NOT_PINNED 0 ni li
+    end
+  end
+  ret RES_OK
+end
+
+fn res_lock_matches_name lidx ulong names view uchar * k ulong slen ulong to bool
+  bl = mul lidx 129
+  bk = mul k 129
+  for b ulong slen bound 129
+    if ne get g_lock_names add bl b get names add bk b
+      ret false
+    end
+  end
+  ret true
+end
+
+fn res_err_undeclared i ulong el ulong to long
+  nk = new uchar 129 0
+  for b ulong el bound 129
+    put nk b get g_lock_names add mul i 129 b
+  end
+  ret res_set_err RES_UNDECLARED_IMPORT 0 nk el
+end
+
+fn res_check_undeclared names view uchar * nlens view ulong * n_names ulong to long
+  for i ulong get g_lock_n 0 bound 256
+    el = get g_lock_nlens i
+    used = false
+    for k ulong n_names bound 64
+      if eq get nlens k el
+        if res_lock_matches_name i names k el
+          used = true
+          break
+        end
+      end
+    end
+    if not used
+      ret res_err_undeclared i el
+    end
+  end
+  ret RES_OK
+end
+
+fn res_finalize_closure to void
+  wn = get g_walk_n 0
+  put g_clos_n 0 wn
+  for i ulong wn bound 128
+    ib = mul i 32
+    for k ulong 32
+      put g_clos_sem add ib k get g_walk_id add ib k
+      put g_clos_rcpt add ib k get g_walk_rcpt add ib k
+    end
+    put g_clos_kind i uchar and get g_walk_kind i 255
+  end
+  res_sort_closure
+  dig = new uchar 32 0
+  omega_closure_digest wn dig
+  for k ulong 32
+    put g_clos_digest k get dig k
+  end
+end
+
+fn res_resolve_one_import names view uchar * idx ulong li ulong to long
+  ni = new uchar 129 0
+  bi = mul idx 129
+  for b ulong li bound 129
+    put ni b get names add bi b
+  end
+  lidx = omega_lock_find ni li
+  if lt lidx 0
+    ret res_set_err RES_BAD_ARGUMENT 0 ni li
+  end
+  lsem = new uchar 32 0
+  lrcp = new uchar 32 0
+  lb = mul ulong lidx 32
+  for k ulong 32
+    put lsem k get g_lock_sem add lb k
+    put lrcp k get g_lock_rcpt add lb k
+  end
+  ret res_resolve_iter lsem lrcp ni li
+end
+
+fn omega_resolve_imports names view uchar * nlens view ulong * n_names ulong to long
+  omega_closure_free
+  put g_walk_n 0 0
+  rc = res_check_dup_and_pinned names nlens n_names
+  if ne rc RES_OK
+    ret rc
+  end
+  rc = res_check_undeclared names nlens n_names
+  if ne rc RES_OK
+    ret rc
+  end
+  for i ulong n_names bound 64
+    rc = res_resolve_one_import names i get nlens i
+    if ne rc 0
+      ret rc
+    end
+  end
+  res_finalize_closure
+  ret RES_OK
+end
+
+note ---- build identity & artifact metadata ----
+
+fn omega_build_id ir_dig view uchar 32 dom ulong clos_dig view uchar 32 dst edit uchar 32 to void
+  pos = ulong 0
+  dl = len res_dom_build_id
+  for i ulong dl bound 32
+    put sh_dat pos get res_dom_build_id i
+    pos = add pos 1
+  end
+  put sh_dat pos 0
+  pos = add pos 1
+  for i ulong 32
+    put sh_dat add pos i get ir_dig i
+  end
+  pos = add pos 32
+  put sh_dat pos uchar and dom 255
+  pos = add pos 1
+  for i ulong 32
+    put sh_dat add pos i get clos_dig i
+  end
+  pos = add pos 32
+  sh_all pos
+  for i ulong 32
+    put dst i get sh_dig i
+  end
+end
+
+fn omega_artifact_meta_make dom ulong ir_dig view uchar 32 clos_dig view uchar 32 to void
+  put g_am_domain 0 dom
+  if eq dom RES_DOMAIN_DEV
+    put g_am_tainted 0 1
+  else
+    put g_am_tainted 0 0
+  end
+  for i ulong 32
+    put g_am_ir i get ir_dig i
+    put g_am_clos i get clos_dig i
+  end
+  bid = new uchar 32 0
+  omega_build_id ir_dig dom clos_dig bid
+  for i ulong 32
+    put g_am_build i get bid i
+  end
+end
+
+fn res_append_txt dst edit uchar * pos ulong cap ulong s view uchar * to long
+  sl = len s
+  if gt add pos sl cap
+    ret -1
+  end
+  for i ulong sl bound 64
+    put dst add pos i get s i
+  end
+  ret long add pos sl
+end
+
+fn res_append_hex dst edit uchar * pos ulong cap ulong id view uchar 32 to long
+  if gt add pos 64 cap
+    ret -1
+  end
+  hx = new uchar 64 0
+  res_hex32 id hx
+  for i ulong 64
+    put dst add pos i get hx i
+  end
+  ret long add pos 64
+end
+
+fn res_append_nl dst edit uchar * pos ulong cap ulong to long
+  if ge pos cap
+    ret -1
+  end
+  put dst pos 10
+  ret long add pos 1
+end
+
+fn omega_artifact_meta_text dst edit uchar * cap ulong to long
+  p = res_append_txt dst 0 cap res_am_k0
+  if lt p 0
+    ret -1
+  end
+  p = res_append_nl dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  p = res_append_txt dst ulong p cap res_am_k1
+  if lt p 0
+    ret -1
+  end
+  if eq get g_am_domain 0 RES_DOMAIN_DEV
+    p = res_append_txt dst ulong p cap res_dom_dev
+  else
+    p = res_append_txt dst ulong p cap res_dom_build
+  end
+  if lt p 0
+    ret -1
+  end
+  p = res_append_nl dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  p = res_append_txt dst ulong p cap res_am_k2
+  if lt p 0
+    ret -1
+  end
+  if ne get g_am_tainted 0 0
+    p = res_append_txt dst ulong p cap res_lit_1
+  else
+    p = res_append_txt dst ulong p cap res_lit_0
+  end
+  if lt p 0
+    ret -1
+  end
+  p = res_append_nl dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  p = res_append_txt dst ulong p cap res_am_k3
+  if lt p 0
+    ret -1
+  end
+  tmp = new uchar 32 0
+  for i ulong 32
+    put tmp i get g_am_ir i
+  end
+  p = res_append_hex dst ulong p cap tmp
+  if lt p 0
+    ret -1
+  end
+  p = res_append_nl dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  p = res_append_txt dst ulong p cap res_am_k4
+  if lt p 0
+    ret -1
+  end
+  for i ulong 32
+    put tmp i get g_am_clos i
+  end
+  p = res_append_hex dst ulong p cap tmp
+  if lt p 0
+    ret -1
+  end
+  p = res_append_nl dst ulong p cap
+  if lt p 0
+    ret -1
+  end
+  p = res_append_txt dst ulong p cap res_am_k5
+  if lt p 0
+    ret -1
+  end
+  for i ulong 32
+    put tmp i get g_am_build i
+  end
+  p = res_append_hex dst ulong p cap tmp
+  if lt p 0
+    ret -1
+  end
+  p = res_append_nl dst ulong p cap
+  ret p
+end
+
+fn res_line_end txt view uchar * pos ulong tlen ulong to long
+  p = pos
+  while lt p tlen bound 512
+    if eq get txt p 10
+      ret long p
+    end
+    p = add p 1
+  end
+  ret -1
+end
+
+fn res_am_read_hex_line txt view uchar * pos ulong which ulong dst edit uchar 32 to long
+  tlen = len txt
+  nl = res_line_end txt pos tlen
+  if lt nl 0
+    ret -1
+  end
+  pl = ulong 0
+  ok = false
+  if eq which 0
+    pl = len res_am_k3
+    ok = res_match_at txt pos res_am_k3
+  end
+  if eq which 1
+    pl = len res_am_k4
+    ok = res_match_at txt pos res_am_k4
+  end
+  if eq which 2
+    pl = len res_am_k5
+    ok = res_match_at txt pos res_am_k5
+  end
+  if not ok
+    ret -1
+  end
+  if ne sub ulong nl pos add pl 64
+    ret -1
+  end
+  if ne res_unhex32 txt add pos pl dst 0
+    ret -1
+  end
+  ret add nl 1
+end
+
+fn res_am_parse_digests txt view uchar * pos ulong tlen ulong dom ulong tnt ulong to long
+  ir = new uchar 32 0
+  cl = new uchar 32 0
+  bid = new uchar 32 0
+  p = res_am_read_hex_line txt pos 0 ir
+  if lt p 0
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  p = res_am_read_hex_line txt ulong p 1 cl
+  if lt p 0
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  p = res_am_read_hex_line txt ulong p 2 bid
+  if or lt p 0 ne ulong p tlen
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  exp_tnt = ulong 0
+  if eq dom RES_DOMAIN_DEV
+    exp_tnt = 1
+  end
+  if ne tnt exp_tnt
+    ret res_set_err RES_TAINTED_ARTIFACT 0 res_am_k0 len res_am_k0
+  end
+  comp = new uchar 32 0
+  omega_build_id ir dom cl comp
+  if ne res_cmp32 comp bid 0
+    ret res_set_err RES_TAINTED_ARTIFACT 0 res_am_k0 len res_am_k0
+  end
+  put g_am_domain 0 dom
+  put g_am_tainted 0 tnt
+  for i ulong 32
+    put g_am_ir i get ir i
+    put g_am_clos i get cl i
+    put g_am_build i get bid i
+  end
+  ret RES_OK
+end
+
+fn omega_artifact_meta_parse txt view uchar * tlen ulong to long
+  put g_am_domain 0 0
+  put g_am_tainted 0 0
+  if or eq tlen 0 or gt tlen 4096 ne get txt sub tlen 1 10
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  pos = ulong 0
+  nl = res_line_end txt pos tlen
+  if or lt nl 0 or ne sub ulong nl pos len res_am_k0 not res_match_at txt pos res_am_k0
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  pos = add ulong nl 1
+  nl = res_line_end txt pos tlen
+  if or lt nl 0 or lt sub ulong nl pos 7 not res_match_at txt pos res_am_k1
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  vlen = sub sub ulong nl pos 7
+  dom = ulong 0
+  if and eq vlen 3 res_match_at txt add pos 7 res_dom_dev
+    dom = RES_DOMAIN_DEV
+  end
+  if and eq vlen 5 res_match_at txt add pos 7 res_dom_build
+    dom = RES_DOMAIN_BUILD
+  end
+  if eq dom 0
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  pos = add ulong nl 1
+  nl = res_line_end txt pos tlen
+  if or lt nl 0 or ne sub ulong nl pos 9 not res_match_at txt pos res_am_k2
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  tc = ulong get txt add pos 8
+  tnt = ulong 2
+  if eq tc 48
+    tnt = 0
+  end
+  if eq tc 49
+    tnt = 1
+  end
+  if gt tnt 1
+    ret res_set_err RES_BAD_ARGUMENT 0 res_am_k0 len res_am_k0
+  end
+  ret res_am_parse_digests txt add ulong nl 1 tlen dom tnt
+end
+
+note ---- admit & admit_genesis ----
+
+fn omega_resolve_admit canon view uchar * clen ulong claimed view uchar 32 to long
+  if ne get g_res_orig_has 0 0
+    if or ne get g_res_orig_taint 0 0 eq get g_res_orig_dom 0 RES_DOMAIN_DEV
+      ret res_set_err RES_TAINTED_ARTIFACT 0 res_cn_tnt len res_cn_tnt
+    end
+  end
+  rc = res_vc_decode canon clen
+  if ne rc 0
+    ret res_set_err RES_UNVERIFIED_DEP rc res_cn_unv len res_cn_unv
+  end
+  if res_vcv_has_cap res_cap_taint
+    ret res_set_err RES_TAINTED_ARTIFACT 0 res_cn_tnt len res_cn_tnt
+  end
+  rrc = omega_resolve_check_record_receipt
+  if ne rrc 0
+    ret rrc
+  end
+  irc = res_vcs_insert_raw canon clen claimed RES_ADM_VERIFIED
+  if ne irc 0
+    ret res_set_err RES_UNVERIFIED_DEP irc res_cn_unv len res_cn_unv
+  end
+  ret RES_OK
+end
+
+fn omega_resolve_admit_genesis canon view uchar * clen ulong claimed view uchar 32 to long
+  if ne get g_res_orig_has 0 0
+    if or ne get g_res_orig_taint 0 0 eq get g_res_orig_dom 0 RES_DOMAIN_DEV
+      ret res_set_err RES_TAINTED_ARTIFACT 0 res_cn_tnt len res_cn_tnt
+    end
+  end
+  rc = res_vc_decode canon clen
+  if ne rc 0
+    ret res_set_err RES_UNVERIFIED_DEP rc res_cn_unv len res_cn_unv
+  end
+  if res_vcv_has_cap res_cap_taint
+    ret res_set_err RES_TAINTED_ARTIFACT 0 res_cn_tnt len res_cn_tnt
+  end
+  note VC-GENESIS-1 is empty (OMEGA_GENESIS_1_COUNT = 0): refuse unlisted genesis record
+  ret res_set_err RES_UNVERIFIED_DEP RES_VCS_GENESIS_NOT_LISTED res_cn_unv len res_cn_unv
+end
