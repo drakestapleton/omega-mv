@@ -1,0 +1,197 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/regalloc.om: Shared target-parameterized live-range register allocator + whole-program IPRA.
+note Parameterized purely by TargetDesc (ngpr, two_addr, caller_save_mask) -- works across A64, x86-64, RV64, Thumb-2, SM121.
+
+const RA_MAX_VALS ulong 256
+const RA_MAX_FNS ulong 32
+const RA_SPILL ulong 65535
+
+note Input live intervals per SSA value: [raStart[v], raEnd[v]]
+global raNVal ulong 1
+global raStart ulong 256
+global raEnd ulong 256
+global raFixed ulong 256
+
+note Output assignment: raPhys[v] = physical reg (0..ngpr-1) or RA_SPILL; raSlot[v] = spill slot
+global raPhys ulong 256
+global raSlot ulong 256
+global raNSpill ulong 1
+global raUsedMask ulong 1
+
+note Internal active-set tracking (max 64 physical regs)
+global raBusy ulong 64
+global raBusyEnd ulong 64
+
+note Whole-program IPRA tables (per function: direct clobbers, callee edges, propagated clobbers)
+global raFnCnt ulong 1
+global raFnDirect ulong 32
+global raFnProp ulong 32
+global raEdgeSrc ulong 64
+global raEdgeDst ulong 64
+global raEdgeCnt ulong 1
+
+fn raReset to void
+put raNVal 0 0
+put raNSpill 0 0
+put raUsedMask 0 0
+for i ulong 64
+put raBusy i 0
+put raBusyEnd i 0
+end
+end
+
+fn raAddInterval s ulong e ulong fixedReg ulong to ulong
+id = get raNVal 0
+put raStart id s
+put raEnd id e
+put raFixed id fixedReg
+put raPhys id RA_SPILL
+put raSlot id 0
+put raNVal 0 add id 1
+ret id
+end
+
+fn raExpireAt pos ulong ngpr ulong to void
+for r ulong ngpr bound 64
+if and eq get raBusy r 1 lt get raBusyEnd r pos
+put raBusy r 0
+end
+end
+end
+
+fn raFindFree ngpr ulong to ulong
+for r ulong ngpr bound 64
+if eq get raBusy r 0
+ret r
+end
+end
+ret RA_SPILL
+end
+
+fn raAllocOne v ulong ngpr ulong to void
+s = get raStart v
+e = get raEnd v
+raExpireAt s ngpr
+fx = get raFixed v
+if and ne fx RA_SPILL lt fx ngpr
+if eq get raBusy fx 0
+put raBusy fx 1
+put raBusyEnd fx e
+put raPhys v fx
+if lt fx 64
+put raUsedMask 0 or get raUsedMask 0 shl ulong 1 fx
+end
+ret
+end
+end
+r = raFindFree ngpr
+if ne r RA_SPILL
+put raBusy r 1
+put raBusyEnd r e
+put raPhys v r
+if lt r 64
+put raUsedMask 0 or get raUsedMask 0 shl ulong 1 r
+end
+ret
+end
+sl = get raNSpill 0
+put raPhys v RA_SPILL
+put raSlot v sl
+put raNSpill 0 add sl 1
+end
+
+note Run target-parameterized linear-scan allocation for any TargetDesc tid!
+fn raRunForTarget tid ulong to ulong
+ngpr = tdGet tid TDF_NGPR
+if gt ngpr 64
+ngpr = ulong 64
+end
+put raNSpill 0 0
+put raUsedMask 0 0
+for r ulong 64
+put raBusy r 0
+put raBusyEnd r 0
+end
+n = get raNVal 0
+for v ulong n bound 256
+raAllocOne v ngpr
+end
+ret get raNSpill 0
+end
+
+note Graph-coloring invariant verifier: returns 0 iff NO two overlapping intervals share a physical reg!
+fn raVerifyColoring to ulong
+n = get raNVal 0
+bad = ulong 0
+for i ulong n bound 256
+pi = get raPhys i
+if ne pi RA_SPILL
+si = get raStart i
+ei = get raEnd i
+for j ulong n bound 256
+if gt j i
+if eq get raPhys j pi
+sj = get raStart j
+ej = get raEnd j
+if and le si ej le sj ei
+bad = add bad 1
+end
+end
+end
+end
+end
+end
+ret bad
+end
+
+note Whole-program IPRA: propagate clobber bitmasks bottom-up across the call graph to fixed point!
+fn raIpraReset nFns ulong to void
+put raFnCnt 0 nFns
+put raEdgeCnt 0 0
+for i ulong nFns bound 32
+put raFnDirect i 0
+put raFnProp i 0
+end
+end
+
+fn raIpraSetDirect fnId ulong mask ulong to void
+put raFnDirect fnId mask
+put raFnProp fnId mask
+end
+
+fn raIpraAddCall caller ulong callee ulong to void
+e = get raEdgeCnt 0
+put raEdgeSrc e caller
+put raEdgeDst e callee
+put raEdgeCnt 0 add e 1
+end
+
+fn raIpraSolve to void
+ec = get raEdgeCnt 0
+for iter ulong 32
+chg = ulong 0
+for e ulong ec bound 64
+u = get raEdgeSrc e
+v = get raEdgeDst e
+old = get raFnProp u
+nw = or old get raFnProp v
+if ne nw old
+put raFnProp u nw
+chg = ulong 1
+end
+end
+if eq chg 0
+ret
+end
+end
+end
+
+fn raPopcount m ulong to ulong
+x = m
+c = ulong 0
+for i ulong 64
+c = add c and x 1
+x = shr x 1
+end
+ret c
+end

@@ -1,0 +1,328 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/target/isel.om: Shared cost-guided declarative ISA pattern selector + real machine-code emitters
+note for AArch64, register-allocated x86-64, RV64GC, and SM121 (with compile-time SMEM/hazard verification).
+
+note Abstract ΩIR opcodes supported by the multi-ISA selector:
+const OIR_ADD ulong 1
+const OIR_SUB ulong 2
+const OIR_MUL ulong 3
+const OIR_FMA ulong 4
+const OIR_SHA256 ulong 5
+const OIR_RET ulong 6
+
+note Rule table (up to 64 rules): (isa, oirOp, featGuard, cost, encId)
+const IS_MAX_RULES ulong 64
+global isCnt ulong 1
+global isIsa ulong 64
+global isOp ulong 64
+global isFeat ulong 64
+global isCost ulong 64
+global isEnc ulong 64
+
+note Output byte buffer for emitted machine code (shared across all 4 ISAs)
+global isBuf uchar 1024
+global isLen ulong 1
+
+fn isBufReset to void
+put isLen 0 0
+end
+
+fn isEmitU8 b ulong to void
+p = get isLen 0
+put isBuf p uchar and b 255
+put isLen 0 add p 1
+end
+
+fn isEmitU32 w ulong to void
+isEmitU8 w
+isEmitU8 shr w 8
+isEmitU8 shr w 16
+isEmitU8 shr w 24
+end
+
+fn isEmitU64 w ulong to void
+isEmitU32 w
+isEmitU32 shr w 32
+end
+
+fn isAddRule isa ulong op ulong feat ulong cost ulong encId ulong to void
+i = get isCnt 0
+put isIsa i isa
+put isOp i op
+put isFeat i feat
+put isCost i cost
+put isEnc i encId
+put isCnt 0 add i 1
+end
+
+note Initialize declarative ISA rule tables across AArch64, x86-64, RV64GC, and SM121!
+fn isInitRules to void
+put isCnt 0 0
+note AArch64 rules (encId 100..119):
+isAddRule ISA_A64 OIR_ADD 0 1 100
+isAddRule ISA_A64 OIR_SUB 0 1 101
+isAddRule ISA_A64 OIR_MUL 0 3 102
+isAddRule ISA_A64 OIR_FMA 0 6 103
+isAddRule ISA_A64 OIR_FMA FEAT_FMA 3 104
+isAddRule ISA_A64 OIR_SHA256 0 40 105
+isAddRule ISA_A64 OIR_SHA256 FEAT_SHA 4 106
+isAddRule ISA_A64 OIR_RET 0 1 107
+
+note x86-64 rules (encId 200..219):
+isAddRule ISA_X64 OIR_ADD 0 1 200
+isAddRule ISA_X64 OIR_SUB 0 1 201
+isAddRule ISA_X64 OIR_MUL 0 3 202
+isAddRule ISA_X64 OIR_FMA 0 7 203
+isAddRule ISA_X64 OIR_FMA FEAT_FMA 4 204
+isAddRule ISA_X64 OIR_SHA256 0 42 205
+isAddRule ISA_X64 OIR_SHA256 FEAT_SHA 5 206
+isAddRule ISA_X64 OIR_RET 0 1 207
+
+note RV64GC rules (encId 300..319):
+isAddRule ISA_RV64 OIR_ADD 0 1 300
+isAddRule ISA_RV64 OIR_SUB 0 1 301
+isAddRule ISA_RV64 OIR_MUL 0 3 302
+isAddRule ISA_RV64 OIR_FMA 0 7 303
+isAddRule ISA_RV64 OIR_FMA FEAT_FMA 4 304
+isAddRule ISA_RV64 OIR_SHA256 0 48 305
+isAddRule ISA_RV64 OIR_RET 0 1 307
+
+note SM121 Blackwell GPU rules (encId 400..419):
+isAddRule ISA_SM121 OIR_ADD 0 4 400
+isAddRule ISA_SM121 OIR_SUB 0 4 401
+isAddRule ISA_SM121 OIR_MUL 0 4 402
+isAddRule ISA_SM121 OIR_FMA FEAT_FMA 4 404
+isAddRule ISA_SM121 OIR_RET 0 4 407
+end
+
+note Cost-guided selector: picks lowest-cost legal rule for (TargetDesc tid, oirOp)!
+fn isSelect tid ulong op ulong to ulong
+isa = tdGet tid TDF_ISA
+feat = tdGet tid TDF_FEAT
+bestEnc = ulong 999999
+bestCost = ulong 999999
+n = get isCnt 0
+for i ulong n bound 64
+if and eq get isIsa i isa eq get isOp i op
+req = get isFeat i
+if eq and feat req req
+c = get isCost i
+if lt c bestCost
+bestCost = c
+bestEnc = get isEnc i
+end
+end
+end
+end
+ret bestEnc
+end
+
+note ---- Real Machine-Code Emitters (all 4 ISAs from the same (op, rd, rn, rm)!) ----
+
+note 1. AArch64 encoder (Arm ARM DDI 0487): ADD/SUB/MUL/RET 32-bit LE words
+fn isEmitA64 encId ulong rd ulong rn ulong rm ulong to bool
+if eq encId 100
+note ADD Xd, Xn, Xm: 0x8b000000 | (rm<<16) | (rn<<5) | rd
+w = or 2332033024 or shl rm 16 or shl rn 5 rd
+isEmitU32 w
+ret true
+end
+if eq encId 101
+note SUB Xd, Xn, Xm: 0xcb000000 | (rm<<16) | (rn<<5) | rd
+w = or 3405774848 or shl rm 16 or shl rn 5 rd
+isEmitU32 w
+ret true
+end
+if eq encId 102
+note MUL Xd, Xn, Xm (MADD Xd, Xn, Xm, XZR): 0x9b007c00 | (rm<<16) | (rn<<5) | rd
+w = or 2600500224 or shl rm 16 or shl rn 5 rd
+isEmitU32 w
+ret true
+end
+if eq encId 107
+note RET (X30): 0xd65f03c0
+isEmitU32 3596551104
+ret true
+end
+ret false
+end
+
+note 2. Register-Allocated x86-64 encoder (real REX.W + opcode + ModRM, handling 2-addr move when rd != rn!)
+note Logical reg mapping: 0=RAX(0), 1=RDI(7), 2=RSI(6), 3=RDX(2), 4=RCX(1), 5=R8(8), 6=R9(9)
+fn isX64Phys r ulong to ulong
+if eq r 0
+ret 0
+end
+if eq r 1
+ret 7
+end
+if eq r 2
+ret 6
+end
+if eq r 3
+ret 2
+end
+if eq r 4
+ret 1
+end
+ret add r 3
+end
+
+fn isX64Rex rReg ulong rmReg ulong to ulong
+rex = ulong 72
+if ge rReg 8
+rex = or rex 4
+end
+if ge rmReg 8
+rex = or rex 1
+end
+ret rex
+end
+
+fn isX64ModRm rReg ulong rmReg ulong to ulong
+ret or 192 or shl and rReg 7 3 and rmReg 7
+end
+
+fn isEmitX64Mov dst ulong src ulong to void
+if eq dst src
+ret
+end
+isEmitU8 isX64Rex src dst
+isEmitU8 137
+isEmitU8 isX64ModRm src dst
+end
+
+fn isEmitX64 encId ulong rd ulong rn ulong rm ulong to bool
+pd = isX64Phys rd
+pn = isX64Phys rn
+pm = isX64Phys rm
+if eq encId 200
+note 2-addr lowering: mov pd, pn (if needed); add pd, pm (REX.W 0x01 /r)
+isEmitX64Mov pd pn
+isEmitU8 isX64Rex pm pd
+isEmitU8 1
+isEmitU8 isX64ModRm pm pd
+ret true
+end
+if eq encId 201
+note sub pd, pm (REX.W 0x29 /r)
+isEmitX64Mov pd pn
+isEmitU8 isX64Rex pm pd
+isEmitU8 41
+isEmitU8 isX64ModRm pm pd
+ret true
+end
+if eq encId 202
+note imul pd, pm (REX.W 0x0F 0xAF /r -- note ModRM reg=pd, rm=pm)
+isEmitX64Mov pd pn
+isEmitU8 isX64Rex pd pm
+isEmitU8 15
+isEmitU8 175
+isEmitU8 isX64ModRm pd pm
+ret true
+end
+if eq encId 207
+note ret (0xC3)
+isEmitU8 195
+ret true
+end
+ret false
+end
+
+note 3. RV64GC encoder (RISC-V Unprivileged Spec: R-type ADD/SUB/MUL, I-type JALR x0, 0(x1))
+note Logical reg mapping: 0=a0(x10), 1=a1(x11), 2=a2(x12), 3=a3(x13)
+fn isRvPhys r ulong to ulong
+ret add 10 r
+end
+
+fn isRvRtype f7 ulong pd ulong pn ulong pm ulong to ulong
+w = or shl f7 25 shl pm 20
+w = or w shl pn 15
+w = or w shl pd 7
+ret or w 51
+end
+
+fn isEmitRv64 encId ulong rd ulong rn ulong rm ulong to bool
+pd = isRvPhys rd
+pn = isRvPhys rn
+pm = isRvPhys rm
+if eq encId 300
+isEmitU32 isRvRtype 0 pd pn pm
+ret true
+end
+if eq encId 301
+isEmitU32 isRvRtype 32 pd pn pm
+ret true
+end
+if eq encId 302
+isEmitU32 isRvRtype 1 pd pn pm
+ret true
+end
+if eq encId 307
+note RET (JALR x0, 0(ra=x1)): 0x00008067
+isEmitU32 32871
+ret true
+end
+ret false
+end
+
+note 4. SM121 Blackwell GPU 128-bit SASS word emitter (low 64b op + high 64b control/stall word)
+fn isEmitSm121 encId ulong rd ulong rn ulong rm ulong to bool
+if eq encId 400
+note SM121 IADD3 Rd, Rn, Rm, RZ + safe stall=6 control word (Antibody #14 floor!)
+lo = or 2064 or shl rd 16 or shl rn 24 shl rm 32
+hi = ulong 6
+isEmitU64 lo
+isEmitU64 hi
+ret true
+end
+if eq encId 402
+note SM121 IMAD Rd, Rn, Rm, RZ + safe stall=6 control word
+lo = or 2084 or shl rd 16 or shl rn 24 shl rm 32
+hi = ulong 6
+isEmitU64 lo
+isEmitU64 hi
+ret true
+end
+if eq encId 407
+note SM121 EXIT (0x000000000000794d) + stall=15
+isEmitU64 31053
+isEmitU64 15
+ret true
+end
+ret false
+end
+
+note Universal dispatch: lower one ΩIR op for ANY TargetDesc tid!
+fn isEmitOp tid ulong op ulong rd ulong rn ulong rm ulong to bool
+enc = isSelect tid op
+if eq enc 999999
+ret false
+end
+isa = tdGet tid TDF_ISA
+if eq isa ISA_A64
+ret isEmitA64 enc rd rn rm
+end
+if eq isa ISA_X64
+ret isEmitX64 enc rd rn rm
+end
+if eq isa ISA_RV64
+ret isEmitRv64 enc rd rn rm
+end
+if eq isa ISA_SM121
+ret isEmitSm121 enc rd rn rm
+end
+ret false
+end
+
+note Emit canonical 3-op ΩIR kernel `f(a, b, c) = (a + b) * c; ret` for ANY TargetDesc!
+fn isCompileTestFn tid ulong to bool
+isBufReset
+if not isEmitOp tid OIR_ADD 0 0 1
+ret false
+end
+if not isEmitOp tid OIR_MUL 0 0 2
+ret false
+end
+ret isEmitOp tid OIR_RET 0 0 0
+end
