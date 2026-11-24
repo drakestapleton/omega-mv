@@ -1,0 +1,411 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/algebra/realize_bitplane.c (MA-2 R2 family).
+note Implements R2_bitplane (2 b/w pos/neg planes), R2b_lut (4-act subset-sum LUT), R2c_crumb (2-bit crumbs).
+om2
+
+const BP_CHUNK ulong 128
+const LUT_ROWS ulong 16
+
+note ================= R2_bitplane =================
+
+fn rz_pack_bp_lane base_w ulong base_d ulong col0 ulong w view byte * to ulong
+  nnz = ulong 0
+  pb = ulong 0
+  nb = ulong 0
+  for k ulong 8
+    col = add col0 mul 16 k
+    if lt col get rz_plan 1
+      v = int get w add base_w col
+      if gt v 0
+        pb = or pb shl ulong 1 k
+        nnz = add nnz 1
+      else
+        if lt v 0
+          nb = or nb shl ulong 1 k
+          nnz = add nnz 1
+        end
+      end
+    end
+  end
+  put rz_mem base_d uchar pb
+  put rz_mem add base_d 16 uchar nb
+  ret nnz
+end
+
+fn rz_pack_bp_chunk i ulong c ulong w view byte * to ulong
+  n = get rz_plan 1
+  base_w = mul i n
+  base_d = add mul i mul div add n 127 BP_CHUNK 32 mul c 32
+  cbase = mul c BP_CHUNK
+  nnz = ulong 0
+  for j ulong 16
+    nnz = add nnz rz_pack_bp_lane base_w add base_d j add cbase j w
+  end
+  ret nnz
+end
+
+fn rz_pack_bp_all w view byte * m ulong chunks ulong to ulong
+  nnz = ulong 0
+  for i ulong m bound 1024
+    for c ulong chunks bound 2048
+      nnz = add nnz rz_pack_bp_chunk i c w
+    end
+  end
+  ret nnz
+end
+
+fn rz_pack_bitplane w view byte * m ulong n ulong to int
+  rc = oma_rz_check_shape m n OMA_RZ_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  rc = oma_rz_validate w m n
+  if ne rc 0
+    ret rc
+  end
+  chunks = div add n 127 BP_CHUNK
+  wb = mul m mul chunks 32
+  if or eq oma_rz_alloc wb 0 gt oma_rz_alloc wb RZ_MEM_CAP
+    ret OMA_RZ_E_NOMEM
+  end
+  put rz_plan 0 m
+  put rz_plan 1 n
+  nnz = rz_pack_bp_all w m chunks
+  put rz_plan 2 wb
+  put rz_plan 3 wb
+  put rz_plan 4 ulong 0
+  put rz_plan 5 nnz
+  put rz_plan 6 ulong 1
+  put rz_plan 7 RZ_R2_BITPLANE
+  ret OMA_RZ_OK
+end
+
+fn rz_run_bp_lane base_d ulong cbase ulong n ulong j ulong x view byte * to int
+  acc = int 0
+  pb = ulong get rz_mem add base_d j
+  nb = ulong get rz_mem add add base_d 16 j
+  for k ulong 8
+    col = add add cbase mul 16 k j
+    if lt col n
+      xv = int get x col
+      if ne and shr pb k 1 0
+        acc = add acc xv
+      else
+        if ne and shr nb k 1 0
+          acc = sub acc xv
+        end
+      end
+    end
+  end
+  ret acc
+end
+
+fn rz_run_bp_chunk base_d ulong cbase ulong n ulong x view byte * to int
+  acc = int 0
+  for j ulong 16
+    acc = add acc rz_run_bp_lane base_d cbase n j x
+  end
+  ret acc
+end
+
+fn rz_run_bp_row i ulong n ulong chunks ulong rb ulong x view byte * to int
+  acc = int 0
+  base_r = mul i rb
+  for c ulong chunks bound 2048
+    acc = add acc rz_run_bp_chunk add base_r mul c 32 mul c BP_CHUNK n x
+  end
+  ret acc
+end
+
+fn rz_run_bitplane x view byte * y edit int * to int
+  m = get rz_plan 0
+  n = get rz_plan 1
+  chunks = div add n 127 BP_CHUNK
+  rb = mul chunks 32
+  for i ulong m bound 1024
+    put y i rz_run_bp_row i n chunks rb x
+  end
+  ret OMA_RZ_OK
+end
+
+note ================= R2b_lut =================
+
+fn rz_pack_lut_byte row ulong col0 ulong dst_off ulong w view byte * to ulong
+  m = get rz_plan 0
+  n = get rz_plan 1
+  nnz = ulong 0
+  pos_n = ulong 0
+  neg_n = ulong 0
+  for q ulong 4
+    col = add col0 q
+    if and lt row m lt col n
+      v = int get w add mul row n col
+      if gt v 0
+        pos_n = or pos_n shl ulong 1 q
+        nnz = add nnz 1
+      else
+        if lt v 0
+          neg_n = or neg_n shl ulong 1 q
+          nnz = add nnz 1
+        end
+      end
+    end
+  end
+  put rz_mem dst_off uchar or pos_n shl neg_n 4
+  ret nnz
+end
+
+fn rz_lut_ro r ulong to ulong
+  ret add mul div r 4 16 mul rem r 4 4
+end
+
+fn rz_pack_lut_row row ulong g ulong ro ulong w view byte * to ulong
+  nnz = ulong 0
+  for j ulong 4
+    col0 = add mul g 16 mul 4 j
+    nnz = add nnz rz_pack_lut_byte row col0 add ro j w
+  end
+  ret nnz
+end
+
+fn rz_pack_lut_blk bl ulong g ulong w view byte * to ulong
+  sg = div add get rz_plan 1 15 16
+  nnz = ulong 0
+  blk_off = mul add mul bl sg g 64
+  for r ulong LUT_ROWS
+    row = add mul bl LUT_ROWS r
+    nnz = add nnz rz_pack_lut_row row g add blk_off rz_lut_ro r w
+  end
+  ret nnz
+end
+
+fn rz_pack_lut_all w view byte * mb ulong sg ulong to ulong
+  nnz = ulong 0
+  for bl ulong mb bound 128
+    for g ulong sg bound 8192
+      nnz = add nnz rz_pack_lut_blk bl g w
+    end
+  end
+  ret nnz
+end
+
+fn rz_pack_lut w view byte * m ulong n ulong to int
+  rc = oma_rz_check_shape m n OMA_RZ_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  rc = oma_rz_validate w m n
+  if ne rc 0
+    ret rc
+  end
+  sg = div add n 15 16
+  mb = div add m 15 LUT_ROWS
+  wb = mul mul mb sg 64
+  sb = mul sg 128
+  if or eq oma_rz_alloc wb 0 gt oma_rz_alloc wb RZ_MEM_CAP
+    ret OMA_RZ_E_NOMEM
+  end
+  if or eq oma_rz_alloc sb 0 gt oma_rz_alloc sb RZ_SCRATCH_CAP
+    ret OMA_RZ_E_NOMEM
+  end
+  put rz_plan 0 m
+  put rz_plan 1 n
+  nnz = rz_pack_lut_all w mb sg
+  put rz_plan 2 wb
+  put rz_plan 3 add wb sb
+  put rz_plan 4 sb
+  put rz_plan 5 nnz
+  put rz_plan 6 ulong 1
+  put rz_plan 7 RZ_R2B_LUT
+  ret OMA_RZ_OK
+end
+
+note Build 4-activation subset-sum LUTs: lo = T & 0xFF (uchar), hi = T >> 8 (signed byte in uchar)
+fn rz_lut_subset_sum col0 ulong n ulong s ulong x view byte * to int
+  tv = int 0
+  for q ulong 4
+    if ne and s shl ulong 1 q 0
+      if lt add col0 q n
+        tv = add tv int get x add col0 q
+      end
+    end
+  end
+  ret tv
+end
+
+fn rz_build_lut_group g ulong j ulong n ulong x view byte * to void
+  col0 = add mul g 16 mul 4 j
+  lo_base = add mul g 128 mul j 16
+  for s ulong 16
+    tv = rz_lut_subset_sum col0 n s x
+    put rz_scratch add lo_base s uchar and tv 255
+    tv = shr sub tv and tv 255 8
+    put rz_scratch add add lo_base 64 s uchar and tv 255
+  end
+end
+
+fn rz_lut_lookup g ulong j ulong idx ulong to int
+  lo_off = add add mul g 128 mul j 16 idx
+  lo_v = int get rz_scratch lo_off
+  hi_v = rz_u8_to_s8 get rz_scratch add lo_off 64
+  ret add mul hi_v 256 lo_v
+end
+
+fn rz_run_lut_row row ulong bl ulong g ulong sg ulong y edit int * to void
+  ro = add mul add mul bl sg g 64 rz_lut_ro sub row mul bl LUT_ROWS
+  acc = get y row
+  for j ulong 4
+    bv = ulong get rz_mem add ro j
+    acc = add acc rz_lut_lookup g j and bv 15
+    acc = sub acc rz_lut_lookup g j shr bv 4
+  end
+  put y row acc
+end
+
+fn rz_run_lut_blk bl ulong g ulong m ulong sg ulong y edit int * to void
+  for r ulong LUT_ROWS
+    row = add mul bl LUT_ROWS r
+    if lt row m
+      rz_run_lut_row row bl g sg y
+    end
+  end
+end
+
+fn rz_run_lut x view byte * y edit int * to int
+  m = get rz_plan 0
+  n = get rz_plan 1
+  sg = div add n 15 16
+  mb = div add m 15 LUT_ROWS
+  for g ulong sg bound 8192
+    for j ulong 4
+      rz_build_lut_group g j n x
+    end
+  end
+  for i ulong m bound 1024
+    put y i 0
+  end
+  for bl ulong mb bound 128
+    for g ulong sg bound 8192
+      rz_run_lut_blk bl g m sg y
+    end
+  end
+  ret OMA_RZ_OK
+end
+
+note ================= R2c_crumb =================
+
+fn rz_pack_crumb_lane base_w ulong base_d ulong col0 ulong w view byte * to ulong
+  nnz = ulong 0
+  bv = ulong 0
+  for k ulong 4
+    col = add col0 mul 16 k
+    if lt col get rz_plan 1
+      v = int get w add base_w col
+      if eq v 1
+        bv = or bv shl ulong 1 mul 2 k
+        nnz = add nnz 1
+      else
+        if eq v -1
+          bv = or bv shl ulong 3 mul 2 k
+          nnz = add nnz 1
+        end
+      end
+    end
+  end
+  put rz_mem base_d uchar bv
+  ret nnz
+end
+
+fn rz_pack_crumb_chunk i ulong c ulong w view byte * to ulong
+  n = get rz_plan 1
+  base_w = mul i n
+  base_d = add mul i mul div add n 63 64 16 mul c 16
+  cbase = mul c 64
+  nnz = ulong 0
+  for j ulong 16
+    nnz = add nnz rz_pack_crumb_lane base_w add base_d j add cbase j w
+  end
+  ret nnz
+end
+
+fn rz_pack_crumb_all w view byte * m ulong chunks ulong to ulong
+  nnz = ulong 0
+  for i ulong m bound 1024
+    for c ulong chunks bound 4096
+      nnz = add nnz rz_pack_crumb_chunk i c w
+    end
+  end
+  ret nnz
+end
+
+fn rz_pack_crumb w view byte * m ulong n ulong to int
+  rc = oma_rz_check_shape m n OMA_RZ_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  rc = oma_rz_validate w m n
+  if ne rc 0
+    ret rc
+  end
+  chunks = div add n 63 64
+  wb = mul m mul chunks 16
+  if or eq oma_rz_alloc wb 0 gt oma_rz_alloc wb RZ_MEM_CAP
+    ret OMA_RZ_E_NOMEM
+  end
+  put rz_plan 0 m
+  put rz_plan 1 n
+  nnz = rz_pack_crumb_all w m chunks
+  put rz_plan 2 wb
+  put rz_plan 3 wb
+  put rz_plan 4 ulong 0
+  put rz_plan 5 nnz
+  put rz_plan 6 ulong 1
+  put rz_plan 7 RZ_R2C_CRUMB
+  ret OMA_RZ_OK
+end
+
+fn rz_run_crumb_lane bv ulong cbase ulong n ulong j ulong x view byte * to int
+  acc = int 0
+  for k ulong 4
+    col = add add cbase mul 16 k j
+    if lt col n
+      cr = and shr bv mul 2 k 3
+      if eq cr 1
+        acc = add acc int get x col
+      else
+        if eq cr 3
+          acc = sub acc int get x col
+        end
+      end
+    end
+  end
+  ret acc
+end
+
+fn rz_run_crumb_chunk base_d ulong cbase ulong n ulong x view byte * to int
+  acc = int 0
+  for j ulong 16
+    acc = add acc rz_run_crumb_lane ulong get rz_mem add base_d j cbase n j x
+  end
+  ret acc
+end
+
+fn rz_run_crumb_row i ulong n ulong chunks ulong rb ulong x view byte * to int
+  acc = int 0
+  base_r = mul i rb
+  for c ulong chunks bound 4096
+    acc = add acc rz_run_crumb_chunk add base_r mul c 16 mul c 64 n x
+  end
+  ret acc
+end
+
+fn rz_run_crumb x view byte * y edit int * to int
+  m = get rz_plan 0
+  n = get rz_plan 1
+  chunks = div add n 63 64
+  rb = mul chunks 16
+  for i ulong m bound 1024
+    put y i rz_run_crumb_row i n chunks rb x
+  end
+  ret OMA_RZ_OK
+end

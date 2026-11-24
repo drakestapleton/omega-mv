@@ -1,0 +1,281 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/algebra/realize_binary.c (MA-2 R1 family).
+note Implements R1_plain, R1_sdot, R1_sdot_il (4-row interleaved tiles), R1_smmla (row-pair interleaved).
+om2
+
+fn rz_u8_to_s8 b uchar to int
+  v = int b
+  if ge v 128
+    ret sub v 256
+  end
+  ret v
+end
+
+note ---- R1_plain & R1_sdot: unpadded row-major int8 ----
+
+fn rz_copy_rowmajor w view byte * tot ulong to ulong
+  nnz = ulong 0
+  for i ulong tot bound 300000
+    v = int get w i
+    if ne v 0
+      nnz = add nnz 1
+    end
+    put rz_mem i uchar and v 255
+  end
+  ret nnz
+end
+
+fn rz_pack_rowmajor rid ulong w view byte * m ulong n ulong to int
+  rc = oma_rz_check_shape m n OMA_RZ_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  rc = oma_rz_validate w m n
+  if ne rc 0
+    ret rc
+  end
+  tot = mul m n
+  al = oma_rz_alloc tot
+  if or eq al 0 gt al RZ_MEM_CAP
+    ret OMA_RZ_E_NOMEM
+  end
+  nnz = rz_copy_rowmajor w tot
+  put rz_plan 0 m
+  put rz_plan 1 n
+  put rz_plan 2 tot
+  put rz_plan 3 tot
+  put rz_plan 4 ulong 0
+  put rz_plan 5 nnz
+  put rz_plan 6 ulong 1
+  put rz_plan 7 rid
+  ret OMA_RZ_OK
+end
+
+fn rz_run_plain_row row_off ulong n ulong x view byte * to int
+  acc = int 0
+  for j ulong n bound 200000
+    wv = rz_u8_to_s8 get rz_mem add row_off j
+    acc = add acc mul wv int get x j
+  end
+  ret acc
+end
+
+fn rz_run_plain x view byte * y edit int * to int
+  m = get rz_plan 0
+  n = get rz_plan 1
+  for i ulong m bound 1024
+    put y i rz_run_plain_row mul i n n x
+  end
+  ret OMA_RZ_OK
+end
+
+fn rz_run_sdot x view byte * y edit int * to int
+  m = get rz_plan 0
+  n = get rz_plan 1
+  i = ulong 0
+  while le add i 4 m bound 256
+    put y i rz_run_plain_row mul i n n x
+    put y add i 1 rz_run_plain_row mul add i 1 n n x
+    put y add i 2 rz_run_plain_row mul add i 2 n n x
+    put y add i 3 rz_run_plain_row mul add i 3 n n x
+    i = add i 4
+  end
+  while lt i m bound 4
+    put y i rz_run_plain_row mul i n n x
+    i = add i 1
+  end
+  ret OMA_RZ_OK
+end
+
+note ---- R1_sdot_il: 4-row interleaved 16-column tiles ----
+
+fn rz_pack_il_row row_off ulong tbase ulong n ulong w view byte * to ulong
+  nnz = ulong 0
+  for col ulong n bound 200000
+    v = int get w add row_off col
+    if ne v 0
+      nnz = add nnz 1
+    end
+    dst = add tbase mul div col 16 64
+    dst = add dst rem col 16
+    put rz_mem dst uchar and v 255
+  end
+  ret nnz
+end
+
+fn rz_pack_il_all w view byte * m ulong n ulong np ulong to ulong
+  nnz = ulong 0
+  for row ulong m bound 1024
+    tbase = mul div row 4 mul 4 np
+    tbase = add tbase mul rem row 4 16
+    nnz = add nnz rz_pack_il_row mul row n tbase n w
+  end
+  ret nnz
+end
+
+fn rz_pack_il w view byte * m ulong n ulong to int
+  rc = oma_rz_check_shape m n OMA_RZ_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  rc = oma_rz_validate w m n
+  if ne rc 0
+    ret rc
+  end
+  np = mul div add n 15 16 16
+  tot = mul mul div add m 3 4 4 np
+  if or eq oma_rz_alloc tot 0 gt oma_rz_alloc tot RZ_MEM_CAP
+    ret OMA_RZ_E_NOMEM
+  end
+  rz_zero_mem tot
+  nnz = rz_pack_il_all w m n np
+  put rz_plan 0 m
+  put rz_plan 1 n
+  put rz_plan 2 tot
+  put rz_plan 3 tot
+  put rz_plan 4 ulong 0
+  put rz_plan 5 nnz
+  put rz_plan 6 ulong 1
+  put rz_plan 7 RZ_R1_SDOT_IL
+  ret OMA_RZ_OK
+end
+
+fn rz_run_il_16 ubase ulong c ulong n ulong x view byte * to int
+  acc = int 0
+  for k ulong 16
+    col = add c k
+    if lt col n
+      wv = rz_u8_to_s8 get rz_mem add ubase k
+      acc = add acc mul wv int get x col
+    end
+  end
+  ret acc
+end
+
+fn rz_run_il_row q ulong r ulong x view byte * to int
+  n = get rz_plan 1
+  np = mul div add n 15 16 16
+  tbase = add mul mul q 4 np mul r 16
+  acc = int 0
+  c = ulong 0
+  while lt c np bound 16384
+    acc = add acc rz_run_il_16 add tbase mul c 4 c n x
+    c = add c 16
+  end
+  ret acc
+end
+
+fn rz_run_il x view byte * y edit int * to int
+  m = get rz_plan 0
+  for row ulong m bound 1024
+    put y row rz_run_il_row div row 4 rem row 4 x
+  end
+  ret OMA_RZ_OK
+end
+
+note ---- R1_smmla: row-pair interleaved 8-column halves ----
+
+fn rz_pack_smmla_8 dst0 ulong row ulong col0 ulong w view byte * to ulong
+  nnz = ulong 0
+  if ge row get rz_plan 0
+    ret ulong 0
+  end
+  for k ulong 8
+    col = add col0 k
+    v = int 0
+    if lt col get rz_plan 1
+      v = int get w add mul row get rz_plan 1 col
+    end
+    if ne v 0
+      nnz = add nnz 1
+    end
+    put rz_mem add dst0 k uchar and v 255
+  end
+  ret nnz
+end
+
+fn rz_pack_smmla_blk q ulong c ulong w view byte * to ulong
+  np = mul div add get rz_plan 1 15 16 16
+  blk = add mul mul q 2 np mul c 2
+  r0 = mul q 2
+  nnz = rz_pack_smmla_8 blk r0 c w
+  nnz = add nnz rz_pack_smmla_8 add blk 8 add r0 1 c w
+  nnz = add nnz rz_pack_smmla_8 add blk 16 r0 add c 8 w
+  nnz = add nnz rz_pack_smmla_8 add blk 24 add r0 1 add c 8 w
+  ret nnz
+end
+
+fn rz_pack_smmla_all w view byte * nq ulong np ulong to ulong
+  nnz = ulong 0
+  for q ulong nq bound 512
+    c = ulong 0
+    while lt c np bound 16384
+      nnz = add nnz rz_pack_smmla_blk q c w
+      c = add c 16
+    end
+  end
+  ret nnz
+end
+
+fn rz_pack_smmla w view byte * m ulong n ulong to int
+  rc = oma_rz_check_shape m n OMA_RZ_MAX_N
+  if ne rc 0
+    ret rc
+  end
+  rc = oma_rz_validate w m n
+  if ne rc 0
+    ret rc
+  end
+  np = mul div add n 15 16 16
+  nq = div add m 1 2
+  tot = mul mul nq 2 np
+  if or eq oma_rz_alloc tot 0 gt oma_rz_alloc tot RZ_MEM_CAP
+    ret OMA_RZ_E_NOMEM
+  end
+  rz_zero_mem tot
+  put rz_plan 0 m
+  put rz_plan 1 n
+  nnz = rz_pack_smmla_all w nq np
+  put rz_plan 2 tot
+  put rz_plan 3 tot
+  put rz_plan 4 ulong 0
+  put rz_plan 5 nnz
+  put rz_plan 6 ulong 1
+  put rz_plan 7 RZ_R1_SMMLA
+  ret OMA_RZ_OK
+end
+
+fn rz_run_smmla_8 src0 ulong col0 ulong n ulong x view byte * to int
+  acc = int 0
+  for k ulong 8
+    col = add col0 k
+    if lt col n
+      wv = rz_u8_to_s8 get rz_mem add src0 k
+      acc = add acc mul wv int get x col
+    end
+  end
+  ret acc
+end
+
+fn rz_run_smmla_row q ulong r ulong x view byte * to int
+  n = get rz_plan 1
+  np = mul div add n 15 16 16
+  pbase = add mul mul q 2 np mul r 8
+  acc = int 0
+  c = ulong 0
+  while lt c np bound 16384
+    blk = add pbase mul c 2
+    acc = add acc rz_run_smmla_8 blk c n x
+    acc = add acc rz_run_smmla_8 add blk 16 add c 8 n x
+    c = add c 16
+  end
+  ret acc
+end
+
+fn rz_run_smmla x view byte * y edit int * to int
+  m = get rz_plan 0
+  for row ulong m bound 1024
+    put y row rz_run_smmla_row div row 2 rem row 2 x
+  end
+  ret OMA_RZ_OK
+end
