@@ -1,3 +1,4 @@
-# NOT BUILT
-Nothing here has been compiled or run (status NOT_RUN). There is no Makefile hook and none may be added to Omega `src/`, `tests/` or `mk/`. To build later, by hand, in a quiet window:
-`cc -std=c11 -O0 -Wall -Wextra -o /tmp/oracle_clifford src/oracle_clifford.c` (no -lm, none needed).
+# NOT BUILT (no Makefile hook)
+There is no Makefile hook and none may be added to Omega `src/`, `tests/` or `mk/`.
+`src/oracle_clifford.om` (pure seeded OM-2, ported from the retired `src/oracle_clifford.c` with 23/23 byte-exact parity) builds directly with `seed/out/omc`:
+`seed/out/omc < src/oracle_clifford.om > /tmp/oracle_clifford && chmod +x /tmp/oracle_clifford`.
