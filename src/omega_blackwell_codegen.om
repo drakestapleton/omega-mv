@@ -1,0 +1,1414 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of src/omega_blackwell_codegen.c.
+note Composes on om/encoder/bw_enc_sm121.om, om/gpu/bw_regalloc.om,
+note om/gpu/cg_matmul.om, and seed/ng/sha256.om.
+om2
+
+const BW_CG_MAX_INSNS ulong 1024
+const BW_CG_MAX_VREGS ulong 256
+const BW_CG_MAX_UVREGS ulong 32
+const BW_CG_PHYS_GPR_MAX uint 128
+const BW_CG_PHYS_GPR_HW_LIMIT uint 246
+const BW_CG_RECONV_MAX_BAR ulong 16
+const BW_CG_CODE_TOO_SMALL long -2
+const BW_CG_NONE ulong 0xffffffffffffffff
+const BW_CG_SR_CTAID_X uint 0x25
+
+fn omega_bw_ir_init ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 to void
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+  for i ulong 768
+    put vinfo i 0
+  end
+  for i ulong 288
+    put phys i BW_CG_NONE
+  end
+end
+
+fn bw_cg_alloc_vreg_w meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 w ulong to long
+  nv = get meta 1
+  if ge nv BW_CG_MAX_VREGS
+    ret -1
+  end
+  put meta 1 add nv 1
+  put meta add 64 nv w
+  base = mul nv 3
+  put vinfo base -1
+  put vinfo add base 1 -1
+  put vinfo add base 2 long w
+  put phys nv BW_CG_NONE
+  ret long nv
+end
+
+fn omega_bw_ir_alloc_vreg meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 to long
+  ret bw_cg_alloc_vreg_w meta vinfo phys 1
+end
+
+fn omega_bw_ir_alloc_vreg64 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 to long
+  ret bw_cg_alloc_vreg_w meta vinfo phys 2
+end
+
+fn omega_bw_ir_alloc_vreg128 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 to long
+  ret bw_cg_alloc_vreg_w meta vinfo phys 4
+end
+
+fn bw_cg_alloc_uvreg_w meta edit ulong 512 phys edit ulong 288 w ulong to long
+  nu = get meta 2
+  if ge nu BW_CG_MAX_UVREGS
+    ret -1
+  end
+  put meta 2 add nu 1
+  put meta add 352 nu w
+  put phys add 256 nu BW_CG_NONE
+  ret long nu
+end
+
+fn omega_bw_ir_alloc_uvreg meta edit ulong 512 phys edit ulong 288 to long
+  ret bw_cg_alloc_uvreg_w meta phys 1
+end
+
+fn omega_bw_ir_alloc_uvreg64 meta edit ulong 512 phys edit ulong 288 to long
+  ret bw_cg_alloc_uvreg_w meta phys 2
+end
+
+fn bw_cg_touch_vreg vinfo edit long 768 r64 ulong pos long nv ulong to void
+  if ge r64 nv
+    ret
+  end
+  base = mul r64 3
+  fd = get vinfo base
+  lu = get vinfo add base 1
+  if lt fd 0
+    put vinfo base pos
+  end
+  if gt pos lu
+    put vinfo add base 1 pos
+  end
+end
+
+fn omega_bw_ir_append ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 row view ulong 8 to long
+  cnt = get meta 0
+  if ge cnt BW_CG_MAX_INSNS
+    ret -1
+  end
+  put meta 0 add cnt 1
+  off = mul cnt 8
+  for k ulong 8
+    put ins add off k get row k
+  end
+  nv = get meta 1
+  flags = get row 7
+  pos = long cnt
+  if eq and flags 1 0
+    bw_cg_touch_vreg vinfo get row 1 pos nv
+  end
+  bw_cg_touch_vreg vinfo get row 2 pos nv
+  bw_cg_touch_vreg vinfo get row 3 pos nv
+  bw_cg_touch_vreg vinfo get row 4 pos nv
+  ret pos
+end
+
+fn omega_bw_ir_set_gpr_limit meta edit ulong 512 lim uint to long
+  if or le lim BW_CG_PHYS_GPR_MAX gt lim BW_CG_PHYS_GPR_HW_LIMIT
+    ret -1
+  end
+  put meta 4 ulong lim
+  ret 0
+end
+
+fn bw_cg_copy_ra_res nv ulong nu ulong res view long 290 phys edit ulong 288 ra_out edit ulong 4 to void
+  for v ulong nv bound 256
+    put phys v ulong get res v
+  end
+  for u ulong nu bound 32
+    put phys add 256 u ulong get res add 256 u
+  end
+  put ra_out 0 ulong get res 288
+  put ra_out 1 ulong get res 289
+end
+
+fn omega_bw_regalloc_solve meta view ulong 512 vinfo view long 768 phys edit ulong 288 ra_out edit ulong 4 to long
+  nv = get meta 1
+  nu = get meta 2
+  if or gt nv BW_CG_MAX_VREGS gt nu BW_CG_MAX_UVREGS
+    ret -1
+  end
+  uinfo = new ulong 32 0
+  for u ulong nu bound 32
+    put uinfo u get meta add 352 u
+  end
+  cfg = new ulong 4 0
+  put cfg 0 nv
+  put cfg 1 nu
+  put cfg 2 get meta 4
+  res = new long 290 0
+  if ne bw_regalloc_solve cfg vinfo uinfo res 0
+    ret -1
+  end
+  bw_cg_copy_ra_res nv nu res phys ra_out
+  ret 0
+end
+
+fn omega_bw_gpr_declared peak uint to uint
+  ret mul div add add peak 2 7 8 8
+end
+
+fn omega_bw_gpr_declared_ok decl uint peak uint to long
+  if ne rem decl 8 0
+    ret 0
+  end
+  if lt decl add peak 2
+    ret 0
+  end
+  ret 1
+end
+
+fn omega_bw_program_code_bytes cnt ulong to ulong
+  padded = mul div add cnt 7 8 8
+  if lt padded 32
+    padded = 32
+  end
+  ret mul padded 16
+end
+
+fn bw_cg_rd_le32 buf view uchar 16384 off ulong to uint
+  b0 = uint get buf off
+  b1 = shl uint get buf add off 1 8
+  b2 = shl uint get buf add off 2 16
+  b3 = shl uint get buf add off 3 24
+  ret or or b0 b1 or b2 b3
+end
+
+fn bw_cg_encode_single row view ulong 8 phys view ulong 288 w edit uint 4 to long
+  ins = new ulong 8192 0
+  for k ulong 8
+    put ins k get row k
+  end
+  code = new uchar 16384 0
+  got = bw_enc_sm121 ins phys 1 0 code
+  if ne got 16
+    for k ulong 4
+      put w k 0
+    end
+    ret -1
+  end
+  for k ulong 4
+    put w k bw_cg_rd_le32 code mul k 4
+  end
+  ret 0
+end
+
+fn omega_blackwell_encode_one row view ulong 8 w edit uint 4 to long
+  phys = new ulong 288 0
+  for i ulong 256
+    put phys i i
+  end
+  for i ulong 32
+    put phys add 256 i i
+  end
+  ret bw_cg_encode_single row phys w
+end
+
+fn omega_bw_encode_program ins view ulong 8192 cnt ulong phys view ulong 288 code edit uchar 16384 max_len ulong out_len edit ulong 1 to long
+  req = omega_bw_program_code_bytes cnt
+  if lt max_len req
+    ret -1
+  end
+  got = bw_enc_sm121 ins phys cnt 1 code
+  if or eq got 0 ne got req
+    ret -1
+  end
+  put out_len 0 req
+  ret 0
+end
+
+fn bw_cg_hash_code code view uchar 16384 em ulong digest edit uchar 32 to void
+  for i ulong em bound 16384
+    put sh_dat i get code i
+  end
+  sh_all em
+  for i ulong 32
+    put digest i get sh_dig i
+  end
+end
+
+fn omega_blackwell_kernel_encode_into ins view ulong 8192 phys view ulong 288 ra_out view ulong 4 code edit uchar 16384 kmeta edit ulong 4 digest edit uchar 32 to long
+  cnt = get kmeta 0
+  code_cap = get kmeta 1
+  for i ulong 4
+    put kmeta i 0
+  end
+  for i ulong 32
+    put digest i 0
+  end
+  if lt code_cap omega_bw_program_code_bytes cnt
+    ret BW_CG_CODE_TOO_SMALL
+  end
+  olen = new ulong 1 0
+  if ne omega_bw_encode_program ins cnt phys code code_cap olen 0
+    ret -1
+  end
+  em = get olen 0
+  put kmeta 0 em
+  put kmeta 1 div em 16
+  put kmeta 2 get ra_out 0
+  put kmeta 3 get ra_out 1
+  bw_cg_hash_code code em digest
+  ret 0
+end
+
+fn bw_cg_check_reg r64 ulong subr ulong lim ulong meta view ulong 512 wbase ulong to long
+  if eq r64 BW_CG_NONE
+    if eq subr 0
+      ret 0
+    end
+    ret -1
+  end
+  if ge r64 lim
+    ret -1
+  end
+  w = get meta add wbase r64
+  if ge subr w
+    ret -1
+  end
+  ret 0
+end
+
+fn bw_cg_check_row ins view ulong 8192 off ulong meta view ulong 512 to long
+  op = get ins off
+  if gt op 63
+    ret -1
+  end
+  flags = get ins add off 7
+  if ne shr flags 48 0
+    ret -1
+  end
+  bar = and shr flags 8 255
+  if ge bar BW_CG_RECONV_MAX_BAR
+    ret -1
+  end
+  is_u = and flags 1
+  lim = get meta 1
+  wbase = ulong 64
+  if ne is_u 0
+    lim = get meta 2
+    wbase = ulong 352
+  end
+  if ne bw_cg_check_reg get ins add off 1 and shr flags 16 255 lim meta wbase 0
+    ret -1
+  end
+  if ne bw_cg_check_reg get ins add off 2 and shr flags 24 255 lim meta wbase 0
+    ret -1
+  end
+  if ne bw_cg_check_reg get ins add off 3 and shr flags 32 255 lim meta wbase 0
+    ret -1
+  end
+  if ne bw_cg_check_reg get ins add off 4 and shr flags 40 255 lim meta wbase 0
+    ret -1
+  end
+  if ne bw_cg_check_reg get ins add off 5 0 get meta 2 meta 352 0
+    ret -1
+  end
+  ret 0
+end
+
+fn bw_cg_unpack_raw ins view ulong 8192 meta view ulong 512 vinfo edit long 768 to long
+  if ne get meta 5 0
+    ret -1
+  end
+  n = get meta 0
+  nv = get meta 1
+  nu = get meta 2
+  if or eq n 0 gt n BW_CG_MAX_INSNS
+    ret -1
+  end
+  if or gt nv BW_CG_MAX_VREGS gt nu BW_CG_MAX_UVREGS
+    ret -1
+  end
+  for v ulong nv bound 256
+    w = get meta add 64 v
+    if and ne w 1 and ne w 2 ne w 4
+      ret -1
+    end
+    base = mul v 3
+    put vinfo base -1
+    put vinfo add base 1 -1
+    put vinfo add base 2 long w
+  end
+  for u ulong nu bound 32
+    w = get meta add 352 u
+    if and ne w 1 ne w 2
+      ret -1
+    end
+  end
+  for i ulong n bound 1024
+    off = mul i 8
+    if ne bw_cg_check_row ins off meta 0
+      ret -1
+    end
+    flags = get ins add off 7
+    pos = long i
+    if eq and flags 1 0
+      bw_cg_touch_vreg vinfo get ins add off 1 pos nv
+    end
+    bw_cg_touch_vreg vinfo get ins add off 2 pos nv
+    bw_cg_touch_vreg vinfo get ins add off 3 pos nv
+    bw_cg_touch_vreg vinfo get ins add off 4 pos nv
+  end
+  ret 0
+end
+
+fn bw_cg_keep_alive vinfo edit long 768 nv ulong from_i long to_i long last_i long to void
+  for v ulong nv bound 256
+    base = mul v 3
+    fd = get vinfo base
+    lu = get vinfo add base 1
+    if ge fd from_i
+      if lt fd to_i
+        if lt lu last_i
+          put vinfo add base 1 last_i
+        end
+      end
+    end
+  end
+end
+
+fn bw_cg_live_until vinfo edit long 768 nv ulong vr ulong last_i long to void
+  if ge vr nv
+    ret
+  end
+  base = mul vr 3
+  if lt get vinfo add base 1 last_i
+    put vinfo add base 1 last_i
+  end
+end
+
+fn bw_cg_clear_im ins edit ulong 8192 meta edit ulong 512 to void
+  for i ulong 8192
+    put ins i 0
+  end
+  for i ulong 512
+    put meta i 0
+  end
+end
+
+fn omega_blackwell_codegen_matmul_i32_prog sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 ra_out edit ulong 4 to long
+  bw_cg_clear_im ins meta
+  if ne cg_matmul_i32 sp ins meta 0
+    ret -1
+  end
+  if ne bw_cg_unpack_raw ins meta vinfo 0
+    ret -1
+  end
+  ret omega_bw_regalloc_solve meta vinfo phys ra_out
+end
+
+fn omega_blackwell_codegen_matmul_tensor_prog sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 ra_out edit ulong 4 to long
+  bw_cg_clear_im ins meta
+  if ne cg_matmul_tensor sp ins meta 0
+    ret -1
+  end
+  if ne bw_cg_unpack_raw ins meta vinfo 0
+    ret -1
+  end
+  ret omega_bw_regalloc_solve meta vinfo phys ra_out
+end
+
+fn omega_blackwell_codegen_matmul_tensor_loop_prog sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 ra_out edit ulong 4 to long
+  bw_cg_clear_im ins meta
+  if ne cg_matmul_tensor_loop sp ins meta 0
+    ret -1
+  end
+  if ne bw_cg_unpack_raw ins meta vinfo 0
+    ret -1
+  end
+  nv = get meta 1
+  l_col = long get meta 480
+  l_k = long get meta 481
+  l_ke = long get meta 482
+  l_ce = long get meta 483
+  bw_cg_keep_alive vinfo nv 0 l_col l_ce
+  bw_cg_keep_alive vinfo nv l_col l_k l_ke
+  bw_cg_keep_alive vinfo nv l_k l_ke l_ke
+  bw_cg_live_until vinfo nv get meta 484 l_ce
+  ret omega_bw_regalloc_solve meta vinfo phys ra_out
+end
+
+fn omega_blackwell_codegen_matmul_frag_prog sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 ra_out edit ulong 4 to long
+  bw_cg_clear_im ins meta
+  if ne cg_matmul_frag sp ins meta 0
+    ret -1
+  end
+  if ne bw_cg_unpack_raw ins meta vinfo 0
+    ret -1
+  end
+  nv = get meta 1
+  l_k = long get meta 481
+  l_ke = long get meta 482
+  l_ce = long get meta 483
+  for i ulong 7
+    bw_cg_live_until vinfo nv get meta add 484 i l_ce
+  end
+  for i ulong 3
+    bw_cg_live_until vinfo nv get meta add 491 i l_ke
+  end
+  bw_cg_keep_alive vinfo nv l_k l_ke l_ke
+  ret omega_bw_regalloc_solve meta vinfo phys ra_out
+end
+
+fn omega_blackwell_codegen_matmul_frag_block_prog sp view ulong 12 ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 ra_out edit ulong 4 to long
+  bw_cg_clear_im ins meta
+  if ne cg_matmul_frag_block sp ins meta 0
+    ret -1
+  end
+  if ne bw_cg_unpack_raw ins meta vinfo 0
+    ret -1
+  end
+  nv = get meta 1
+  l_k = long get meta 481
+  l_ke = long get meta 482
+  l_ce = long get meta 483
+  for i ulong 6
+    bw_cg_live_until vinfo nv get meta add 484 i l_ce
+  end
+  ntiles = mul get sp 6 get sp 7
+  for t ulong ntiles bound 64
+    bw_cg_live_until vinfo nv get meta add 408 t l_ce
+  end
+  for i ulong 3
+    bw_cg_live_until vinfo nv get meta add 490 i l_ke
+  end
+  bw_cg_keep_alive vinfo nv l_k l_ke l_ke
+  ret omega_bw_regalloc_solve meta vinfo phys ra_out
+end
+
+fn omega_matmul_frag_block_shape mt uint nt uint out_rc edit uint 2 to void
+  res = new ulong 4 1
+  if ne cg_matmul_frag_shape ulong mt ulong nt 16 res 0
+    put out_rc 0 1
+    put out_rc 1 1
+    ret
+  end
+  put out_rc 0 uint get res 0
+  put out_rc 1 uint get res 1
+end
+
+fn omega_matmul_frag_block_unroll kp uint rt uint ct uint to uint
+  ks = div kp 16
+  if eq rem ks 2 0
+    if le mul 2 add rt ct 8
+      ret 2
+    end
+  end
+  ret 1
+end
+
+fn omega_matmul_frag_unroll kp uint to uint
+  res = new ulong 4 1
+  if ne cg_matmul_frag_shape 1 1 ulong kp res 0
+    ret 1
+  end
+  ret uint get res 3
+end
+
+fn bw_cg_frag_a_idx rr ulong cc ulong to ulong
+  lane = add mul and rr 7 4 shr and cc 7 1
+  e = add add mul shr cc 3 4 mul shr rr 3 2 and cc 1
+  ret add mul lane 8 e
+end
+
+fn bw_cg_f32_to_bf16 u uint to ushort
+  if eq and u 0x7f800000 0x7f800000
+    q = uint 0
+    if ne and u 0x007fffff 0
+      q = uint 0x0040
+    end
+    ret ushort or shr u 16 q
+  end
+  ret ushort shr add add u 0x7fff and shr u 16 1 16
+end
+
+fn bw_cg_pack_a_row a view ushort * p view ulong 4 dst edit ushort * to void
+  blk = get p 0
+  src = get p 1
+  rr = get p 2
+  c1 = get p 3
+  for cc ulong c1 bound 16
+    put dst add blk bw_cg_frag_a_idx rr cc get a add src cc
+  end
+end
+
+fn bw_cg_pack_a_tile a view ushort * dims view uint 4 tk ulong dst edit ushort * to void
+  p = new ulong 4 0
+  r1 = sub ulong get dims 0 mul shr tk 32 16
+  if gt r1 16
+    r1 = 16
+  end
+  put p 3 sub ulong get dims 1 mul and tk 0xffffffff 16
+  if gt get p 3 16
+    put p 3 16
+  end
+  put p 0 mul shr tk 32 div ulong get dims 3 16
+  put p 0 mul add get p 0 and tk 0xffffffff 256
+  for rr ulong r1 bound 16
+    put p 1 add mul shr tk 32 16 rr
+    put p 1 mul get p 1 ulong get dims 1
+    put p 1 add get p 1 mul and tk 0xffffffff 16
+    put p 2 rr
+    bw_cg_pack_a_row a p dst
+  end
+end
+
+fn omega_matmul_frag_pack_a a view ushort * dims view uint 4 dst edit ushort * to void
+  m = ulong get dims 0
+  k = ulong get dims 1
+  tot = mul ulong get dims 2 ulong get dims 3
+  for i ulong tot bound 1048576
+    put dst i 0
+  end
+  mt_n = div add m 15 16
+  ks_m = div add k 15 16
+  for mt ulong mt_n bound 1024
+    for ks ulong ks_m bound 1024
+      bw_cg_pack_a_tile a dims or shl mt 32 ks dst
+    end
+  end
+end
+
+fn bw_cg_pack_af_row a view uint * p view ulong 4 dst edit ushort * to void
+  blk = get p 0
+  src = get p 1
+  rr = get p 2
+  c1 = get p 3
+  for cc ulong c1 bound 16
+    put dst add blk bw_cg_frag_a_idx rr cc bw_cg_f32_to_bf16 get a add src cc
+  end
+end
+
+fn bw_cg_pack_af_tile a view uint * dims view uint 4 tk ulong dst edit ushort * to void
+  p = new ulong 4 0
+  r1 = sub ulong get dims 0 mul shr tk 32 16
+  if gt r1 16
+    r1 = 16
+  end
+  put p 3 sub ulong get dims 1 mul and tk 0xffffffff 16
+  if gt get p 3 16
+    put p 3 16
+  end
+  put p 0 mul shr tk 32 div ulong get dims 3 16
+  put p 0 mul add get p 0 and tk 0xffffffff 256
+  for rr ulong r1 bound 16
+    put p 1 add mul shr tk 32 16 rr
+    put p 1 mul get p 1 ulong get dims 1
+    put p 1 add get p 1 mul and tk 0xffffffff 16
+    put p 2 rr
+    bw_cg_pack_af_row a p dst
+  end
+end
+
+fn omega_matmul_frag_pack_a_f32 a view uint * dims view uint 4 dst edit ushort * to void
+  m = ulong get dims 0
+  k = ulong get dims 1
+  tot = mul ulong get dims 2 ulong get dims 3
+  for i ulong tot bound 1048576
+    put dst i 0
+  end
+  mt_n = div add m 15 16
+  ks_m = div add k 15 16
+  for mt ulong mt_n bound 1024
+    for ks ulong ks_m bound 1024
+      bw_cg_pack_af_tile a dims or shl mt 32 ks dst
+    end
+  end
+end
+
+fn bw_cg_zero_row0 dst edit ushort * blk ulong c1 ulong to void
+  rem_z = sub 16 c1
+  for z ulong rem_z bound 16
+    put dst add blk bw_cg_frag_a_idx 0 add c1 z 0
+  end
+end
+
+fn omega_matmul_frag_pack_a_row0 a view ushort * k uint kp uint dst edit ushort * to void
+  p = new ulong 4 0
+  ks_n = div ulong kp 16
+  for ks ulong ks_n bound 1024
+    c0 = mul ks 16
+    c1 = ulong 0
+    if lt c0 ulong k
+      c1 = sub ulong k c0
+      if gt c1 16
+        c1 = 16
+      end
+    end
+    put p 0 mul ks 256
+    put p 1 c0
+    put p 2 0
+    put p 3 c1
+    bw_cg_pack_a_row a p dst
+    bw_cg_zero_row0 dst get p 0 c1
+  end
+end
+
+fn omega_matmul_frag_pack_a_row0_f32 a view uint * k uint kp uint dst edit ushort * to void
+  p = new ulong 4 0
+  ks_n = div ulong kp 16
+  for ks ulong ks_n bound 1024
+    c0 = mul ks 16
+    c1 = ulong 0
+    if lt c0 ulong k
+      c1 = sub ulong k c0
+      if gt c1 16
+        c1 = 16
+      end
+    end
+    put p 0 mul ks 256
+    put p 1 c0
+    put p 2 0
+    put p 3 c1
+    bw_cg_pack_af_row a p dst
+    bw_cg_zero_row0 dst get p 0 c1
+  end
+end
+
+fn bw_cg_sentinel_row cd edit uint * dims view uint 5 row_base ulong to ulong
+  n = ulong get dims 1
+  poison = get dims 3
+  set_flag = get dims 4
+  nt = div add n 7 8
+  cnt = ulong 0
+  for tj ulong nt bound 1024
+    c = add mul tj 8 7
+    if ge c n
+      c = sub n 1
+    end
+    idx = add row_base c
+    if ne set_flag 0
+      put cd idx poison
+      cnt = add cnt 1
+    else
+      if eq get cd idx poison
+        cnt = add cnt 1
+      end
+    end
+  end
+  ret cnt
+end
+
+fn omega_matmul_result_sentinels cd edit uint * dims view uint 5 to ulong
+  m = ulong get dims 0
+  n = ulong get dims 1
+  if or eq m 0 eq n 0
+    ret 0
+  end
+  cnt = ulong 0
+  mt = div add m 15 16
+  np = ulong get dims 2
+  for ti ulong mt bound 1024
+    r = add mul ti 16 15
+    if ge r m
+      r = sub m 1
+    end
+    cnt = add cnt bw_cg_sentinel_row cd dims mul r np
+  end
+  ret cnt
+end
+
+fn bw_cg_pack_b_di r ulong t ulong ks_n ulong grp ulong to ulong
+  rr = rem r 16
+  lane = add mul grp 4 div rem rr 8 2
+  di = mul add mul t ks_n div r 16 32
+  di = mul add di lane 4
+  ret add di add mul div rr 8 2 rem r 2
+end
+
+fn bw_cg_pack_b_cell b view ushort * dims view uint 5 rt ulong dst edit ushort * to void
+  r = shr rt 32
+  t = and rt 0xffffffff
+  n = ulong get dims 1
+  c0 = mul add ulong get dims 3 t 8
+  for grp ulong 8
+    col = add c0 grp
+    if lt col n
+      di = bw_cg_pack_b_di r t div ulong get dims 2 16 grp
+      put dst di get b add mul r n col
+    end
+  end
+end
+
+fn bw_cg_pack_b_row b view ushort * dims view uint 5 r ulong dst edit ushort * to void
+  nt_span = sub ulong get dims 4 ulong get dims 3
+  for t ulong nt_span bound 1024
+    bw_cg_pack_b_cell b dims or shl r 32 t dst
+  end
+end
+
+fn omega_matmul_frag_pack_b b view ushort * dims view uint 5 dst edit ushort * to void
+  k = ulong get dims 0
+  ks_n = div ulong get dims 2 16
+  nt_span = sub ulong get dims 4 ulong get dims 3
+  tot = mul mul nt_span ks_n 128
+  for i ulong tot bound 1048576
+    put dst i 0
+  end
+  for r ulong k bound 16384
+    bw_cg_pack_b_row b dims r dst
+  end
+end
+
+fn bw_cg_mk_row row edit ulong 8 op ulong d ulong a ulong b ulong imm uint to void
+  put row 0 op
+  put row 1 d
+  put row 2 a
+  put row 3 b
+  put row 4 0
+  put row 5 0
+  put row 6 ulong imm
+  put row 7 0
+end
+
+fn bw_cg_set_cu row edit ulong 8 c ulong u ulong to void
+  put row 4 c
+  put row 5 u
+end
+
+fn bw_cg_chk3 phys view ulong 288 row view ulong 8 e0 uint e1 uint e2 uint to long
+  w = new uint 4 0
+  if ne bw_cg_encode_single row phys w 0
+    ret -1
+  end
+  if or ne get w 0 e0 or ne get w 1 e1 ne get w 2 e2
+    ret -2
+  end
+  ret 0
+end
+
+fn bw_cg_chk4 phys view ulong 288 row view ulong 8 e0 uint e1 uint e2 uint e3 uint to long
+  w = new uint 4 0
+  if ne bw_cg_encode_single row phys w 0
+    ret -1
+  end
+  if or ne get w 0 e0 ne get w 1 e1
+    ret -2
+  end
+  if or ne get w 2 e2 ne get w 3 e3
+    ret -2
+  end
+  ret 0
+end
+
+fn bw_cg_id_chk3 row view ulong 8 e0 uint e1 uint e2 uint to long
+  w = new uint 4 0
+  if ne omega_blackwell_encode_one row w 0
+    ret -1
+  end
+  if or ne get w 0 e0 or ne get w 1 e1 ne get w 2 e2
+    ret -2
+  end
+  ret 0
+end
+
+fn bw_cg_id_chk4 row view ulong 8 e0 uint e1 uint e2 uint e3 uint to long
+  w = new uint 4 0
+  if ne omega_blackwell_encode_one row w 0
+    ret -1
+  end
+  if or ne get w 0 e0 ne get w 1 e1
+    ret -2
+  end
+  if or ne get w 2 e2 ne get w 3 e3
+    ret -2
+  end
+  ret 0
+end
+
+fn omega_blackwell_verify_codegen_fixtures_intops to long
+  phys = new ulong 288 0
+  put phys 0 0
+  put phys 1 2
+  put phys 2 6
+  put phys 3 7
+  put phys 4 9
+  put phys 5 11
+  put phys 6 13
+  row = new ulong 8 0
+  bw_cg_mk_row row 51 4 3 0 0xfc
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0x07097212 0x00000000 0x078efcff 0
+    ret -1
+  end
+  bw_cg_mk_row row 51 5 2 3 0x78
+  bw_cg_set_cu row 0 BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0x060b7212 0x00000007 0x078e7800 0
+    ret -2
+  end
+  bw_cg_mk_row row 51 6 2 3 0x10
+  bw_cg_set_cu row 0 BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0x060d7212 0x00000007 0x078e1000 0
+    ret -3
+  end
+  bw_cg_mk_row row 51 3 BW_CG_NONE 4 0x33
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0xff077212 0x00000009 0x078e33ff 0
+    ret -4
+  end
+  bw_cg_mk_row row 52 3 4 1 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0x09077219 0x00000002 0x000006ff 0
+    ret -5
+  end
+  bw_cg_mk_row row 52 3 0 3 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0x00077219 0x00000007 0x000006ff 0
+    ret -6
+  end
+  bw_cg_mk_row row 53 4 4 0 0
+  bw_cg_set_cu row 2 BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0x09097227 0x00000000 0x078e0006 0
+    ret -7
+  end
+  bw_cg_mk_row row 53 3 0 3 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_chk3 phys row 0x00077227 0x00000007 0x078e00ff 0
+    ret -8
+  end
+  ret 0
+end
+
+fn omega_blackwell_verify_codegen_fixtures_fragmm to long
+  row = new ulong 8 0
+  bw_cg_mk_row row 56 2 30 BW_CG_NONE 0
+  bw_cg_set_cu row BW_CG_NONE 8
+  if ne bw_cg_id_chk3 row 0x1e027981 0x00000008 0x0c1e1b00 0
+    ret -1
+  end
+  bw_cg_mk_row row 56 28 30 BW_CG_NONE 0x100
+  bw_cg_set_cu row BW_CG_NONE 8
+  if ne bw_cg_id_chk3 row 0x1e1c7981 0x00010008 0x0c1e1b00 0
+    ret -2
+  end
+  bw_cg_mk_row row 57 8 32 BW_CG_NONE 0
+  bw_cg_set_cu row BW_CG_NONE 8
+  if ne bw_cg_id_chk3 row 0x20087981 0x00000008 0x0c1e1d00 0
+    ret -3
+  end
+  bw_cg_mk_row row 57 20 32 BW_CG_NONE 0x1000
+  bw_cg_set_cu row BW_CG_NONE 8
+  if ne bw_cg_id_chk3 row 0x20147981 0x00100008 0x0c1e1d00 0
+    ret -4
+  end
+  bw_cg_mk_row row 16 8 12 6 0
+  bw_cg_set_cu row 8 BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x0c08723c 0x00000006 0x00041808 0
+    ret -5
+  end
+  bw_cg_mk_row row 0 BW_CG_NONE BW_CG_NONE BW_CG_NONE 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  put row 6 shl ulong 0x000fdc00 32
+  if ne bw_cg_id_chk4 row 0x00007918 0 0 0x000fdc00 0
+    ret -6
+  end
+  bw_cg_mk_row row 58 4 20 BW_CG_NONE 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x14047984 0x00000000 0x00000c00 0
+    ret -7
+  end
+  bw_cg_mk_row row 58 8 20 BW_CG_NONE 0x40
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x14087984 0x00004000 0x00000c00 0
+    ret -8
+  end
+  bw_cg_mk_row row 58 12 20 BW_CG_NONE 0x100
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x140c7984 0x00010000 0x00000c00 0
+    ret -9
+  end
+  bw_cg_mk_row row 12 BW_CG_NONE 4 8 0
+  bw_cg_set_cu row BW_CG_NONE 4
+  if ne bw_cg_id_chk3 row 0x04007986 0x00000008 0x0c101904 0
+    ret -10
+  end
+  bw_cg_mk_row row 12 BW_CG_NONE 4 9 0x4
+  bw_cg_set_cu row BW_CG_NONE 4
+  if ne bw_cg_id_chk3 row 0x04007986 0x00000409 0x0c101904 0
+    ret -11
+  end
+  bw_cg_mk_row row 12 BW_CG_NONE 4 10 0x4000
+  bw_cg_set_cu row BW_CG_NONE 4
+  if ne bw_cg_id_chk3 row 0x04007986 0x0040000a 0x0c101904 0
+    ret -12
+  end
+  bw_cg_mk_row row 12 BW_CG_NONE 6 11 0xfff00000
+  bw_cg_set_cu row BW_CG_NONE 4
+  if ne bw_cg_id_chk3 row 0x06007986 0xf000000b 0x0c101904 0
+    ret -13
+  end
+  w = new uint 4 0
+  bw_cg_mk_row row 56 2 30 BW_CG_NONE 0x00800000
+  bw_cg_set_cu row BW_CG_NONE 8
+  if eq omega_blackwell_encode_one row w 0
+    ret -100
+  end
+  bw_cg_mk_row row 56 2 30 BW_CG_NONE 0xff800000
+  bw_cg_set_cu row BW_CG_NONE 8
+  if ne omega_blackwell_encode_one row w 0
+    ret -101
+  end
+  ret 0
+end
+
+fn omega_blackwell_verify_codegen_fixtures_reconv to long
+  row = new ulong 8 0
+  bw_cg_mk_row row 54 BW_CG_NONE BW_CG_NONE BW_CG_NONE 13
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk4 row 0x00007945 0x000000c0 0x03800200 0x000fe200 0
+    ret -1
+  end
+  bw_cg_mk_row row 54 BW_CG_NONE BW_CG_NONE BW_CG_NONE 41
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk4 row 0x00007945 0x00000280 0x03800200 0x000fe200 0
+    ret -2
+  end
+  bw_cg_mk_row row 54 BW_CG_NONE BW_CG_NONE BW_CG_NONE 10
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk4 row 0x00007945 0x00000090 0x03800200 0x000fe200 0
+    ret -3
+  end
+  bw_cg_mk_row row 55 BW_CG_NONE BW_CG_NONE BW_CG_NONE 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk4 row 0x00007941 0x00000000 0x03800200 0x000fea00 0
+    ret -4
+  end
+  w = new uint 4 0
+  bw_cg_mk_row row 54 BW_CG_NONE BW_CG_NONE BW_CG_NONE 1
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if eq omega_blackwell_encode_one row w 0
+    ret -101
+  end
+  bw_cg_mk_row row 54 BW_CG_NONE BW_CG_NONE BW_CG_NONE 0xfffffffd
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if eq omega_blackwell_encode_one row w 0
+    ret -102
+  end
+  bw_cg_mk_row row 54 BW_CG_NONE BW_CG_NONE BW_CG_NONE 5
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  put row 7 shl ulong 16 8
+  if eq omega_blackwell_encode_one row w 0
+    ret -103
+  end
+  bw_cg_mk_row row 55 BW_CG_NONE BW_CG_NONE BW_CG_NONE 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  put row 7 shl ulong 16 8
+  if eq omega_blackwell_encode_one row w 0
+    ret -104
+  end
+  put row 7 shl ulong 15 8
+  if ne omega_blackwell_encode_one row w 0
+    ret -105
+  end
+  if ne get w 0 or 0x00007941 shl uint 15 16
+    ret -106
+  end
+  ret 0
+end
+
+fn omega_blackwell_verify_codegen_fixtures_bfly_f2fp to long
+  row = new ulong 8 0
+  bw_cg_mk_row row 60 5 0 BW_CG_NONE 1
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x00057f89 0x0c201f00 0x000e0000 0
+    ret -1
+  end
+  bw_cg_mk_row row 60 7 8 BW_CG_NONE 1
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x08077f89 0x0c201f00 0x000e0000 0
+    ret -2
+  end
+  bw_cg_mk_row row 60 4 9 BW_CG_NONE 2
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x09047f89 0x0c401f00 0x000e0000 0
+    ret -3
+  end
+  bw_cg_mk_row row 60 6 11 BW_CG_NONE 2
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x0b067f89 0x0c401f00 0x000e0000 0
+    ret -4
+  end
+  bw_cg_mk_row row 61 9 3 0 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x0309723e 0x00000000 0x000010ff 0
+    ret -5
+  end
+  bw_cg_mk_row row 61 13 13 10 0
+  bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+  if ne bw_cg_id_chk3 row 0x0d0d723e 0x0000000a 0x000010ff 0
+    ret -6
+  end
+  wdn = new uint 4 0
+  wbf = new uint 4 0
+  for lane ulong 32
+    bw_cg_mk_row row 42 9 2 BW_CG_NONE uint lane
+    bw_cg_set_cu row BW_CG_NONE BW_CG_NONE
+    if ne omega_blackwell_encode_one row wdn 0
+      ret -100
+    end
+    put row 0 60
+    if ne omega_blackwell_encode_one row wbf 0
+      ret -101
+    end
+    if or ne get wbf 0 get wdn 0 ne get wbf 1 or get wdn 1 0x04000000
+      ret -102
+    end
+    if or ne get wbf 2 get wdn 2 ne get wbf 3 get wdn 3
+      ret -103
+    end
+  end
+  ret 0
+end
+
+fn omega_blackwell_verify_codegen_fixtures_atomf32 to long
+  row = new ulong 8 0
+  bw_cg_mk_row row 62 4 2 5 0
+  bw_cg_set_cu row BW_CG_NONE 6
+  if ne bw_cg_id_chk4 row 0x020479a3 0x80000005 0x0c1f5306 0x00321e00 0
+    ret -1
+  end
+  bw_cg_mk_row row 62 9 10 7 0
+  bw_cg_set_cu row BW_CG_NONE 4
+  if ne bw_cg_id_chk4 row 0x0a0979a3 0x80000007 0x0c1f5304 0x00321e00 0
+    ret -2
+  end
+  bw_cg_mk_row row 62 255 2 5 0
+  bw_cg_set_cu row BW_CG_NONE 6
+  if ne bw_cg_id_chk4 row 0x02ff79a3 0x80000005 0x0c1f5306 0x00321e00 0
+    ret -3
+  end
+  bw_cg_mk_row row 62 BW_CG_NONE 2 5 0
+  bw_cg_set_cu row BW_CG_NONE 6
+  if ne bw_cg_id_chk4 row 0x02ff79a3 0x80000005 0x0c1f5306 0x00321e00 0
+    ret -4
+  end
+  bw_cg_mk_row row 63 4 2 5 0
+  bw_cg_set_cu row BW_CG_NONE 6
+  if ne bw_cg_id_chk4 row 0x020479a3 0x80000005 0x0c1ef306 0x00321e00 0
+    ret -5
+  end
+  bw_cg_mk_row row 63 9 10 7 0
+  bw_cg_set_cu row BW_CG_NONE 4
+  if ne bw_cg_id_chk4 row 0x0a0979a3 0x80000007 0x0c1ef304 0x00321e00 0
+    ret -6
+  end
+  bw_cg_mk_row row 63 BW_CG_NONE 2 5 0
+  bw_cg_set_cu row BW_CG_NONE 6
+  if ne bw_cg_id_chk4 row 0x02ff79a3 0x80000005 0x0c1ef306 0x00321e00 0
+    ret -7
+  end
+  ret 0
+end
+
+fn omega_blackwell_verify_codegen_fixtures_fb1cut4 to long
+  phys = new ulong 288 0
+  put phys 0 2
+  put phys 1 4
+  put phys 2 9
+  put phys 3 10
+  put phys 4 8
+  row = new ulong 8 0
+  bw_cg_mk_row row 47 0 1 0 0
+  if ne bw_cg_chk3 phys row 0x00027308 4 0x00000800 0
+    ret -1
+  end
+  bw_cg_mk_row row 48 0 0 0 0
+  if ne bw_cg_chk4 phys row 0x00007b1d 0 0x00010000 0x000fec00 0
+    ret -2
+  end
+  bw_cg_mk_row row 49 2 3 0 0
+  if ne bw_cg_chk3 phys row 0x0a097984 0xff 0x08000800 0
+    ret -3
+  end
+  bw_cg_mk_row row 50 0 4 0 0
+  if ne bw_cg_chk3 phys row 0x08007988 2 0x080008ff 0
+    ret -4
+  end
+  ret 0
+end
+
+fn bw_cg_fx_part1 phys view ulong 288 to long
+  row = new ulong 8 0
+  bw_cg_mk_row row 1 3 0 0 0
+  if ne bw_cg_chk3 phys row 0x00077202 0xff 0x00000f00 0
+    ret -2
+  end
+  bw_cg_mk_row row 2 0 0 0 1
+  if ne bw_cg_chk3 phys row 0x00027802 1 0x00000f00 0
+    ret -4
+  end
+  bw_cg_mk_row row 8 3 0 2 0
+  bw_cg_set_cu row 3 0
+  if ne bw_cg_chk3 phys row 0x02077224 6 0x078e0207 0
+    ret -6
+  end
+  bw_cg_mk_row row 8 2 0 BW_CG_NONE 16
+  bw_cg_set_cu row BW_CG_NONE 0
+  if ne bw_cg_chk3 phys row 0x02067824 16 0x078e02ff 0
+    ret -8
+  end
+  bw_cg_mk_row row 9 1 0 0 4
+  bw_cg_set_cu row 1 0
+  if ne bw_cg_chk3 phys row 0x02047825 4 0x078e0004 0
+    ret -10
+  end
+  bw_cg_mk_row row 5 1 0 0 0x380
+  if ne bw_cg_chk3 phys row 0xff047b82 0x0000e000 0x00000a00 0
+    ret -12
+  end
+  bw_cg_mk_row row 7 0 0 0 0x358
+  put row 7 1
+  if ne bw_cg_chk3 phys row 0xff0477ac 0x00006b00 0x08000a00 0
+    ret -14
+  end
+  bw_cg_mk_row row 11 0 1 0 0
+  if ne bw_cg_chk3 phys row 0x04027981 4 0x0c1e1900 0
+    ret -16
+  end
+  bw_cg_mk_row row 12 0 1 3 0
+  if ne bw_cg_chk3 phys row 0x04007986 7 0x0c101904 0
+    ret -18
+  end
+  bw_cg_mk_row row 3 0 0 0 BW_CG_SR_CTAID_X
+  if ne bw_cg_chk3 phys row 0x00027919 0 0x00002500 0
+    ret -20
+  end
+  ret 0
+end
+
+fn bw_cg_fx_part2 phys view ulong 288 to long
+  row = new ulong 8 0
+  bw_cg_mk_row row 15 1 1 0 0
+  bw_cg_set_cu row BW_CG_NONE 0
+  if ne bw_cg_chk4 phys row 0x0404723c 0x00000002 0x000018ff 0x000fe200 0
+    ret -22
+  end
+  bw_cg_mk_row row 16 1 1 0 0
+  bw_cg_set_cu row BW_CG_NONE 0
+  if ne bw_cg_chk4 phys row 0x0404723c 0x00000002 0x000418ff 0x000fe200 0
+    ret -24
+  end
+  bw_cg_mk_row row 17 1 0 0 2
+  if ne bw_cg_chk4 phys row 0xff047819 2 0x00011602 0x001fca00 0
+    ret -28
+  end
+  bw_cg_mk_row row 18 1 0 0 3
+  if ne bw_cg_chk4 phys row 0x02047812 3 0x078ec0ff 0x001fca00 0
+    ret -30
+  end
+  bw_cg_mk_row row 19 0 1 0 0
+  if ne bw_cg_chk4 phys row 0x04027981 4 0x0c1e1500 0x000f2200 0
+    ret -32
+  end
+  bw_cg_mk_row row 46 0 0 0 0
+  if ne bw_cg_chk4 phys row 0x00fc7947 0xfffffffc 0x0383ffff 0x000fc000 0
+    ret -34
+  end
+  bw_cg_mk_row row 28 0 1 2 0
+  if ne bw_cg_chk3 phys row 0x0400720c 6 0x03f06070 0
+    ret -36
+  end
+  bw_cg_mk_row row 29 1 0 2 0
+  if ne bw_cg_chk3 phys row 0x02047212 6 0x078e3cff 0
+    ret -38
+  end
+  bw_cg_mk_row row 20 0 1 0 0
+  if ne bw_cg_chk3 phys row 0x04027981 4 0x0c1f5900 0
+    ret -40
+  end
+  ret 0
+end
+
+fn bw_cg_fx_part3 phys view ulong 288 to long
+  row = new ulong 8 0
+  bw_cg_mk_row row 30 3 0 1 0
+  if ne bw_cg_chk4 phys row 0x02077221 4 0 0x004fc400 0
+    ret -134
+  end
+  bw_cg_mk_row row 31 3 0 1 0
+  if ne bw_cg_chk4 phys row 0x02077221 0x80000004 0 0x004fc400 0
+    ret -136
+  end
+  bw_cg_mk_row row 32 3 0 1 0
+  if ne bw_cg_chk4 phys row 0x02077220 4 0x00400000 0x004fc400 0
+    ret -138
+  end
+  bw_cg_mk_row row 33 3 0 1 0
+  bw_cg_set_cu row 2 0
+  if ne bw_cg_chk4 phys row 0x02077223 4 6 0x004fc400 0
+    ret -140
+  end
+  bw_cg_mk_row row 36 3 0 1 0
+  if ne bw_cg_chk4 phys row 0x02077209 4 0x03800000 0x004fc400 0
+    ret -142
+  end
+  bw_cg_mk_row row 37 3 0 1 0
+  if ne bw_cg_chk4 phys row 0x02077209 4 0x07800000 0x004fc400 0
+    ret -144
+  end
+  bw_cg_mk_row row 38 3 0 0 0
+  if ne bw_cg_chk4 phys row 0x00077245 2 0x00201400 0x004fe200 0
+    ret -146
+  end
+  bw_cg_mk_row row 39 3 0 0 0
+  if ne bw_cg_chk4 phys row 0x00077305 2 0x0020f100 0x004e2200 0
+    ret -148
+  end
+  bw_cg_mk_row row 40 3 0 0 0
+  if ne bw_cg_chk4 phys row 0x00077308 2 0x00001000 0x000e2400 0
+    ret -150
+  end
+  bw_cg_mk_row row 41 3 0 0 0
+  if ne bw_cg_chk4 phys row 0x00077308 2 0x00001400 0x000e2400 0
+    ret -152
+  end
+  bw_cg_mk_row row 42 3 0 0 16
+  if ne bw_cg_chk4 phys row 0x02077f89 0x0a001f00 0x000e0000 0x000e2400 0
+    ret -154
+  end
+  bw_cg_mk_row row 43 3 0 0 0
+  if ne bw_cg_chk4 phys row 0x02077984 0 0 0x000fe200 0
+    ret -156
+  end
+  bw_cg_mk_row row 44 0 0 1 0
+  if ne bw_cg_chk4 phys row 0x02007388 4 0 0x000fe200 0
+    ret -158
+  end
+  ret 0
+end
+
+fn omega_blackwell_verify_codegen_fixtures to long
+  phys = new ulong 288 0
+  put phys 0 2
+  put phys 1 4
+  put phys 2 6
+  put phys 3 7
+  put phys 256 4
+  rc = bw_cg_fx_part1 phys
+  if ne rc 0
+    ret rc
+  end
+  rc = bw_cg_fx_part2 phys
+  if ne rc 0
+    ret rc
+  end
+  ret bw_cg_fx_part3 phys
+end
+
+fn bw_cg_regalloc_bounds_check phys view ulong 288 to long
+  p0 = get phys 0
+  p1 = get phys 1
+  p2 = get phys 2
+  p3 = get phys 3
+  if ne rem p0 2 0
+    ret -2
+  end
+  if ne rem p2 2 0
+    ret -3
+  end
+  if ne rem p3 4 0
+    ret -4
+  end
+  if or eq p1 p0 eq p1 add p0 1
+    ret -5
+  end
+  if or eq p2 p0 eq p2 add p0 1
+    ret -6
+  end
+  for k ulong 4
+    pk = add p3 k
+    if or eq pk p0 eq pk add p0 1
+      ret -7
+    end
+    if or eq pk p2 eq pk add p2 1
+      ret -8
+    end
+    if eq pk p1
+      ret -9
+    end
+  end
+  ret 0
+end
+
+fn bw_cg_regalloc_bounds_run ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 to long
+  ra_out = new ulong 4 0
+  row = new ulong 8 0
+  omega_bw_ir_init ins meta vinfo phys
+  v0 = ulong omega_bw_ir_alloc_vreg64 meta vinfo phys
+  v1 = ulong omega_bw_ir_alloc_vreg meta vinfo phys
+  v2 = ulong omega_bw_ir_alloc_vreg64 meta vinfo phys
+  v3 = ulong omega_bw_ir_alloc_vreg128 meta vinfo phys
+  bw_cg_mk_row row 5 v0 0 0 0x380
+  ign = omega_bw_ir_append ins meta vinfo row
+  bw_cg_mk_row row 2 v1 0 0 10
+  ign = omega_bw_ir_append ins meta vinfo row
+  bw_cg_mk_row row 5 v2 0 0 0x388
+  ign = omega_bw_ir_append ins meta vinfo row
+  bw_cg_mk_row row 15 v3 v3 v0 0
+  bw_cg_set_cu row BW_CG_NONE 0
+  ign = omega_bw_ir_append ins meta vinfo row
+  vs = ulong omega_bw_ir_alloc_vreg meta vinfo phys
+  bw_cg_mk_row row 14 vs v1 v2 0
+  bw_cg_set_cu row v3 0
+  ign = omega_bw_ir_append ins meta vinfo row
+  if ne omega_bw_regalloc_solve meta vinfo phys ra_out 0
+    ret -1
+  end
+  ret bw_cg_regalloc_bounds_check phys
+end
+
+fn bw_cg_regalloc_bounds_ok to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  vinfo = new long 768 0
+  phys = new ulong 288 0
+  ret bw_cg_regalloc_bounds_run ins meta vinfo phys
+end
+
+fn bw_cg_regalloc_ovf_run ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 to long
+  ra_out = new ulong 4 0
+  row = new ulong 8 0
+  omega_bw_ir_init ins meta vinfo phys
+  for i ulong 133
+    v = omega_bw_ir_alloc_vreg meta vinfo phys
+    if ge v 0
+      bw_cg_mk_row row 2 ulong v 0 0 uint i
+      ign = omega_bw_ir_append ins meta vinfo row
+    end
+  end
+  last_i = sub long get meta 0 1
+  nv = get meta 1
+  for v ulong nv bound 256
+    put vinfo add mul v 3 1 last_i
+  end
+  if eq omega_bw_regalloc_solve meta vinfo phys ra_out 0
+    ret -6
+  end
+  ret 0
+end
+
+fn bw_cg_regalloc_bounds_overflow to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  vinfo = new long 768 0
+  phys = new ulong 288 0
+  ret bw_cg_regalloc_ovf_run ins meta vinfo phys
+end
+
+fn omega_blackwell_test_regalloc_bounds to long
+  rc = bw_cg_regalloc_bounds_ok
+  if ne rc 0
+    ret rc
+  end
+  ret bw_cg_regalloc_bounds_overflow
+end

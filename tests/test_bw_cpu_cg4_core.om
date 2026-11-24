@@ -1,0 +1,414 @@
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 unit and C-parity test for src/omega_blackwell_codegen.om.
+note Covers IR builder, regalloc, SM121 encoder + SHA-256 digests, matmul emitters,
+note fragment packing, sentinels, and all 7 SM121 golden fixture suites.
+om2
+
+global g_cg4c_out uchar 4096
+global g_cg4c_out_n ulong 1
+
+text t_cg4c_pass "PASS test-bw-cpu-cg4-core-om\n"
+
+fn cg4c_flush to void
+  n = get g_cg4c_out_n 0
+  if gt n 0
+    ign = write 1 g_cg4c_out 0 n
+    put g_cg4c_out_n 0 0
+  end
+end
+
+fn cg4c_ch c uchar to void
+  n = get g_cg4c_out_n 0
+  if ge n 4000
+    cg4c_flush
+    n = 0
+  end
+  put g_cg4c_out n c
+  put g_cg4c_out_n 0 add n 1
+end
+
+fn cg4c_hexd nib uint to uchar
+  if lt nib 10
+    ret uchar add 48 nib
+  end
+  ret uchar add 87 nib
+end
+
+fn cg4c_hex32 v uint to void
+  for i ulong 8
+    sh = uint mul sub 7 i 4
+    nib = and shr v sh 15
+    cg4c_ch cg4c_hexd nib
+  end
+end
+
+fn cg4c_hex64 v ulong to void
+  cg4c_hex32 uint shr v 32
+  cg4c_hex32 uint and v 0xffffffff
+end
+
+fn cg4c_hex_dig dig view uchar 32 to void
+  for i ulong 32
+    b = uint get dig i
+    cg4c_ch cg4c_hexd shr b 4
+    cg4c_ch cg4c_hexd and b 15
+  end
+end
+
+fn cg4c_nl to void
+  cg4c_ch 10
+  cg4c_flush
+end
+
+fn cg4c_emit_kern tag uint kmeta view ulong 4 dig view uchar 32 to void
+  cg4c_ch uchar shr tag 8
+  cg4c_ch uchar and tag 255
+  cg4c_ch 58
+  cg4c_hex32 uint get kmeta 0
+  cg4c_ch 58
+  cg4c_hex32 uint get kmeta 1
+  cg4c_ch 58
+  cg4c_hex32 uint get kmeta 2
+  cg4c_ch 58
+  cg4c_hex32 uint get kmeta 3
+  cg4c_ch 58
+  cg4c_hex_dig dig
+  cg4c_nl
+end
+
+fn cg4c_fnv64_u16s arr view ushort * n ulong to ulong
+  h = ulong 0xcbf29ce484222325
+  for i ulong n bound 65536
+    v = ulong get arr i
+    h = mul xor h and v 255 ulong 0x100000001b3
+    h = mul xor h and shr v 8 255 ulong 0x100000001b3
+  end
+  ret h
+end
+
+fn test_core_fixtures to long
+  if ne omega_blackwell_verify_codegen_fixtures 0
+    ret 10
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_fb1cut4 0
+    ret 11
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_intops 0
+    ret 12
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_fragmm 0
+    ret 13
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_reconv 0
+    ret 14
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_bfly_f2fp 0
+    ret 15
+  end
+  if ne omega_blackwell_verify_codegen_fixtures_atomf32 0
+    ret 16
+  end
+  if ne omega_blackwell_test_regalloc_bounds 0
+    ret 17
+  end
+  if ne omega_bw_gpr_declared 30 32
+    ret 18
+  end
+  if ne omega_bw_gpr_declared 31 40
+    ret 19
+  end
+  if ne omega_bw_gpr_declared_ok 32 30 1
+    ret 20
+  end
+  if ne omega_bw_gpr_declared_ok 32 31 0
+    ret 21
+  end
+  if ne omega_bw_gpr_declared_ok 34 30 0
+    ret 22
+  end
+  meta = new ulong 512 0
+  if ne omega_bw_ir_set_gpr_limit meta 128 -1
+    ret 23
+  end
+  if ne omega_bw_ir_set_gpr_limit meta 247 -1
+    ret 24
+  end
+  if ne omega_bw_ir_set_gpr_limit meta 246 0
+    ret 25
+  end
+  if ne get meta 4 246
+    ret 26
+  end
+  ret 0
+end
+
+fn cg4c_enc_and_emit tag uint ins view ulong 8192 cnt ulong phys view ulong 288 ra_out view ulong 4 dig edit uchar 32 to long
+  code = new uchar 16384 0
+  kmeta = new ulong 4 0
+  put kmeta 0 cnt
+  put kmeta 1 16384
+  if ne omega_blackwell_kernel_encode_into ins phys ra_out code kmeta dig 0
+    ret -1
+  end
+  cg4c_emit_kern tag kmeta dig
+  ret 0
+end
+
+fn cg4c_check_too_small ins view ulong 8192 cnt ulong phys view ulong 288 ra_out view ulong 4 to long
+  code = new uchar 16384 0
+  kmeta = new ulong 4 0
+  dig = new uchar 32 0
+  put code 0 0xaa
+  put kmeta 0 cnt
+  put kmeta 1 16
+  if ne omega_blackwell_kernel_encode_into ins phys ra_out code kmeta dig -2
+    ret -1
+  end
+  if ne get code 0 0xaa
+    ret -2
+  end
+  ret 0
+end
+
+fn cg4c_matmul_i32_run ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 dig1 edit uchar 32 dig2 edit uchar 32 to long
+  sp = new ulong 12 0
+  ra_out = new ulong 4 0
+  put sp 0 16
+  put sp 1 16
+  put sp 2 16
+  if ne omega_blackwell_codegen_matmul_i32_prog sp ins meta vinfo phys ra_out 0
+    ret 30
+  end
+  if ne cg4c_check_too_small ins get meta 0 phys ra_out 0
+    ret 31
+  end
+  if ne cg4c_enc_and_emit 0x4931 ins get meta 0 phys ra_out dig1 0
+    ret 33
+  end
+  put sp 0 32
+  put sp 1 16
+  put sp 2 64
+  if ne omega_blackwell_codegen_matmul_i32_prog sp ins meta vinfo phys ra_out 0
+    ret 34
+  end
+  if ne cg4c_enc_and_emit 0x4932 ins get meta 0 phys ra_out dig2 0
+    ret 35
+  end
+  diff = ulong 0
+  for i ulong 32
+    if ne get dig1 i get dig2 i
+      diff = 1
+    end
+  end
+  if eq diff 0
+    ret 36
+  end
+  ret 0
+end
+
+fn test_core_matmul_i32 to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  vinfo = new long 768 0
+  phys = new ulong 288 0
+  dig1 = new uchar 32 0
+  dig2 = new uchar 32 0
+  ret cg4c_matmul_i32_run ins meta vinfo phys dig1 dig2
+end
+
+fn cg4c_matmul_tensor_run ins edit ulong 8192 meta edit ulong 512 vinfo edit long 768 phys edit ulong 288 to long
+  sp = new ulong 12 0
+  ra_out = new ulong 4 0
+  dig = new uchar 32 0
+
+  put sp 0 16
+  put sp 1 16
+  put sp 2 16
+  put sp 3 2
+  if ne omega_blackwell_codegen_matmul_tensor_prog sp ins meta vinfo phys ra_out 0
+    ret 40
+  end
+  if ne cg4c_enc_and_emit 0x5431 ins get meta 0 phys ra_out dig 0
+    ret 41
+  end
+
+  put sp 0 64
+  put sp 1 64
+  put sp 2 64
+  put sp 3 2
+  put sp 4 2
+  put sp 5 0
+  if ne omega_blackwell_codegen_matmul_tensor_loop_prog sp ins meta vinfo phys ra_out 0
+    ret 42
+  end
+  if ne cg4c_enc_and_emit 0x5432 ins get meta 0 phys ra_out dig 0
+    ret 43
+  end
+
+  put sp 4 2
+  put sp 5 2
+  put sp 6 0
+  if ne omega_blackwell_codegen_matmul_frag_prog sp ins meta vinfo phys ra_out 0
+    ret 44
+  end
+  if ne cg4c_enc_and_emit 0x4631 ins get meta 0 phys ra_out dig 0
+    ret 45
+  end
+
+  put sp 4 2
+  put sp 5 2
+  put sp 6 2
+  put sp 7 2
+  put sp 8 0
+  if ne omega_blackwell_codegen_matmul_frag_block_prog sp ins meta vinfo phys ra_out 0
+    ret 46
+  end
+  if ne cg4c_enc_and_emit 0x4632 ins get meta 0 phys ra_out dig 0
+    ret 47
+  end
+  ret 0
+end
+
+fn test_core_matmul_tensor to long
+  ins = new ulong 8192 0
+  meta = new ulong 512 0
+  vinfo = new long 768 0
+  phys = new ulong 288 0
+  ret cg4c_matmul_tensor_run ins meta vinfo phys
+end
+
+fn test_core_pack_a_and_b to long
+  rc2 = new uint 2 0
+  omega_matmul_frag_block_shape 4 4 rc2
+  fu = omega_matmul_frag_unroll 64
+  fbu = omega_matmul_frag_block_unroll 64 get rc2 0 get rc2 1
+  if or eq get rc2 0 0 eq get rc2 1 0
+    ret 50
+  end
+  if or eq fu 0 eq fbu 0
+    ret 50
+  end
+  cg4c_ch 0x53
+  cg4c_ch 0x48
+  cg4c_ch 58
+  cg4c_hex32 get rc2 0
+  cg4c_ch 58
+  cg4c_hex32 get rc2 1
+  cg4c_ch 58
+  cg4c_hex32 fu
+  cg4c_ch 58
+  cg4c_hex32 fbu
+  cg4c_nl
+
+  dims4 = new uint 4 0
+  put dims4 0 16
+  put dims4 1 32
+  put dims4 2 16
+  put dims4 3 32
+  a16 = new ushort 512 0
+  for i ulong 512
+    put a16 i ushort add 0x3c00 and uint i 0xff
+  end
+  dst_a = new ushort 512 0
+  omega_matmul_frag_pack_a a16 dims4 dst_a
+  ha = cg4c_fnv64_u16s dst_a 512
+  for i ulong 512
+    put dst_a i 0
+  end
+  omega_matmul_frag_pack_a_row0 a16 32 32 dst_a
+  hr0 = cg4c_fnv64_u16s dst_a 512
+
+  dims5 = new uint 5 0
+  put dims5 0 32
+  put dims5 1 16
+  put dims5 2 32
+  put dims5 3 0
+  put dims5 4 2
+  for i ulong 512
+    put a16 i ushort add 0x4000 and uint i 0xff
+  end
+  omega_matmul_frag_pack_b a16 dims5 dst_a
+  hb = cg4c_fnv64_u16s dst_a 512
+
+  cg4c_ch 0x50
+  cg4c_ch 0x31
+  cg4c_ch 58
+  cg4c_hex64 ha
+  cg4c_ch 58
+  cg4c_hex64 hr0
+  cg4c_ch 58
+  cg4c_hex64 hb
+  cg4c_nl
+  ret 0
+end
+
+fn test_core_pack_f32_and_sent to long
+  dims4 = new uint 4 0
+  put dims4 0 16
+  put dims4 1 32
+  put dims4 2 16
+  put dims4 3 32
+  af32 = new uint 512 0
+  for i ulong 512
+    put af32 i or 0x3f800000 shl and uint i 0x7f 13
+  end
+  dst_af = new ushort 512 0
+  omega_matmul_frag_pack_a_f32 af32 dims4 dst_af
+  haf = cg4c_fnv64_u16s dst_af 512
+  for i ulong 512
+    put dst_af i 0
+  end
+  omega_matmul_frag_pack_a_row0_f32 af32 32 32 dst_af
+  hr0f = cg4c_fnv64_u16s dst_af 512
+
+  dims5 = new uint 5 0
+  put dims5 0 16
+  put dims5 1 16
+  put dims5 2 16
+  put dims5 3 0xdeadbeef
+  put dims5 4 1
+  s1 = omega_matmul_result_sentinels af32 dims5
+  put dims5 4 0
+  s2 = omega_matmul_result_sentinels af32 dims5
+  if or ne s1 2 ne s2 2
+    ret 51
+  end
+
+  cg4c_ch 0x50
+  cg4c_ch 0x32
+  cg4c_ch 58
+  cg4c_hex64 haf
+  cg4c_ch 58
+  cg4c_hex64 hr0f
+  cg4c_nl
+  ret 0
+end
+
+fn test_core_pack_and_shapes to long
+  rc = test_core_pack_a_and_b
+  if ne rc 0
+    ret rc
+  end
+  ret test_core_pack_f32_and_sent
+end
+
+fn main to int
+  rc = test_core_fixtures
+  if ne rc 0
+    ret int rc
+  end
+  rc = test_core_matmul_i32
+  if ne rc 0
+    ret int rc
+  end
+  rc = test_core_matmul_tensor
+  if ne rc 0
+    ret int rc
+  end
+  rc = test_core_pack_and_shapes
+  if ne rc 0
+    ret int rc
+  end
+  ign = write 1 t_cg4c_pass 0 len t_cg4c_pass
+  ret 0
+end
