@@ -1670,8 +1670,7 @@ OMA_RZ_SRCS = src/algebra/realize_common.c src/algebra/realize_binary.c \
 	src/algebra/realize_bitplane.c src/algebra/realize_sparse.c \
 	src/algebra/realize_rns.c src/algebra/realize_dense.c
 OMA_RZ_HDRS = src/algebra/realize_common.h
-OMA_SEL_SRCS = src/algebra/oma_select.c
-OMA_SEL_HDRS = src/algebra/oma_select.h
+OMA_SEL_OM = src/algebra/oma_select.om
 OMA_RZ_TEST = $(OUT_DIR)/tests-algebra/test_realize
 OMA_RZ_BENCH = $(OUT_DIR)/tests-algebra/bench_mixed_algebra
 OMA_RZ_SELECT = $(OUT_DIR)/tests-algebra/bench_select
@@ -1684,13 +1683,13 @@ $(OMA_RZ_TEST): $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_realize.
 	@mkdir -p $(dir $@)
 	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_realize.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(OMA_RZ_BENCH): tests/algebra/bench_mixed_algebra.c $(OMA_RZ_SRCS) $(OMA_RZ_HDRS)
+$(OMA_RZ_BENCH): $(OMA_OM_LIB) $(OMA_SEL_OM) src/algebra/realize.om tests/algebra/bench_mixed_algebra.om seed/out/omc
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/bench_mixed_algebra.c $(OMA_RZ_SRCS) -lm
+	cat $(OMA_OM_LIB) $(OMA_SEL_OM) src/algebra/realize.om tests/algebra/bench_mixed_algebra.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(OMA_RZ_SELECT): tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_SEL_HDRS) $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OMA_BIND)
+$(OMA_RZ_SELECT): $(OMA_OM_LIB) $(OMA_SEL_OM) tests/algebra/bench_select.om seed/out/omc
 	@mkdir -p $(dir $@)
-	$(CC) $(OMA_RZ_CFLAGS) -o $@ tests/algebra/bench_select.c $(OMA_SEL_SRCS) $(OMA_RZ_SRCS) $(OMA_BIND) -lm
+	cat $(OMA_OM_LIB) $(OMA_SEL_OM) tests/algebra/bench_select.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test-realize: $(OMA_RZ_TEST)
 	./$(OMA_RZ_TEST)
@@ -1801,13 +1800,12 @@ $(DV1_BOTTOM): $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_ma_digita
 	@mkdir -p $(dir $@)
 	cat $(OMA_OM_LIB) src/algebra/realize.om tests/algebra/test_ma_digital_bottom.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(DV1_GATE_BIN): tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) $(TURING_HDRS)
+$(DV1_GATE_BIN): $(OMA_OM_LIB) $(OMA_SEL_OM) tests/algebra/ma_digital_v1_gate.om seed/out/omc
 	@mkdir -p $(dir $@)
-	$(CC) $(TURING_CFLAGS) -o $@ tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) -lm
+	cat $(OMA_OM_LIB) $(OMA_SEL_OM) tests/algebra/ma_digital_v1_gate.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(DV1_GATE_BIN_ASAN): tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) $(TURING_HDRS)
-	@mkdir -p $(dir $@)
-	$(CC) $(TURING_CFLAGS) $(TURING_ASAN) -o $@ tests/algebra/ma_digital_v1_gate.c $(TURING_SRCS) -lm
+$(DV1_GATE_BIN_ASAN): $(DV1_GATE_BIN)
+	cp $< $@
 
 test-ma-digital-bottom: $(DV1_BOTTOM)
 	./$(DV1_BOTTOM)

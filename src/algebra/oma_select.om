@@ -1,0 +1,1649 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note Pure seeded OM-2 MA-2 selector (oma_select) + SHA-256 + buffered JSON/text writer.
+note Concatenated after src/algebra/oma_lib.om.
+
+const SEL_MAX_ROWS ulong 2048
+const SEL_MAX_RUNS ulong 4
+const SEL_MAX_CAND ulong 16
+const SEL_ID_LEN ulong 32
+const SEL_RZ_COUNT ulong 10
+
+const SEL_OK int 0
+const SEL_E_IO int -1
+const SEL_E_FORMAT int -2
+const SEL_E_FULL int -3
+const SEL_E_EMPTY int -4
+
+const SEL_O_RDONLY int 0
+const SEL_O_WRONLY_CREAT_TRUNC int 577
+const SEL_MODE_0644 int 420
+
+note ---- realization metadata ----
+text t_rz_0 "R1_plain"
+text t_rz_1 "R1_sdot"
+text t_rz_2 "R1_sdot_il"
+text t_rz_3 "R1_smmla"
+text t_rz_4 "R2_bitplane"
+text t_rz_5 "R2b_lut"
+text t_rz_6 "R2c_crumb"
+text t_rz_7 "R3_sparse"
+text t_rz_8 "R4_rns"
+text t_rz_9 "R5_dense5"
+
+text t_sel_ref "R1_plain"
+text t_sel_sch1 "\"schema\": \"OMEGA_MIXED_ALGEBRA_MA2_BENCH_V1\""
+text t_sel_sch2 "\"schema\": \"OMEGA_MIXED_ALGEBRA_MA3_BENCH_V1\""
+text t_sel_ct "\"cost_table\": ["
+text t_sel_row_pfx "{\"n\": "
+text t_sel_end_ct "  ]"
+text t_sel_true "true"
+text t_sel_false "false"
+text t_sel_k_runid "run_id"
+text t_sel_k_n "n"
+text t_sel_k_m "m"
+text t_sel_k_sp "sparsity"
+text t_sel_k_rz "rz"
+text t_sel_k_elig "eligible"
+text t_sel_k_ver "verified"
+text t_sel_k_med "median_ps"
+text t_sel_k_min "min_ps"
+text t_sel_k_nz "noise_rel"
+text t_sel_k_pk "pack_ps"
+text t_sel_k_pf "pct_floor_best"
+text t_sel_k_pnz "pack_noise_rel"
+
+text t_sel_ex_not_exact "not exact"
+text t_sel_ex_maxn "query n above max_n"
+text t_sel_ex_unver "not verified (or not measured) in every run"
+text t_sel_ex_nomeas "no measurement for this cell"
+text t_sel_tr_none "none"
+text t_sel_tr_inc "incumbent"
+text t_sel_tr_ref "reference"
+text t_sel_tr_chp "cheapest"
+text t_sel_tr_dref "digital reference"
+
+note ---- buffered output ----
+global sel_obuf uchar 16384
+global sel_olen ulong 1
+global sel_ofd int 1
+
+fn sel_o_init fd int to void
+  put sel_ofd 0 fd
+  put sel_olen 0 0
+end
+
+fn sel_o_flush to void
+  n = get sel_olen 0
+  if eq n 0
+    ret
+  end
+  fd = get sel_ofd 0
+  off = ulong 0
+  while lt off n bound 100000
+    k = write fd sel_obuf off sub n off
+    if le k 0
+      break
+    end
+    off = add off ulong k
+  end
+  put sel_olen 0 0
+end
+
+fn sel_o_b c uchar to void
+  n = get sel_olen 0
+  if ge n 16384
+    sel_o_flush
+    n = 0
+  end
+  put sel_obuf n c
+  put sel_olen 0 add n 1
+end
+
+fn sel_o_txt s view uchar * to void
+  m = len s
+  for i ulong m bound 16384
+    sel_o_b get s i
+  end
+end
+
+fn sel_o_u64 v ulong to void
+  if eq v 0
+    sel_o_b uchar 48
+    ret
+  end
+  tmp = new uchar 24 0
+  cnt = ulong 0
+  x = v
+  while gt x 0 bound 32
+    put tmp cnt uchar add 48 rem x 10
+    cnt = add cnt 1
+    x = div x 10
+  end
+  for i ulong cnt bound 32
+    sel_o_b get tmp sub sub cnt 1 i
+  end
+end
+
+fn sel_o_i64 v long to void
+  if lt v 0
+    sel_o_b uchar 45
+    sel_o_u64 sub ulong 0 bitcast ulong v
+  else
+    sel_o_u64 ulong v
+  end
+end
+
+fn sel_o_spaces n ulong to void
+  for i ulong n bound 256
+    sel_o_b uchar 32
+  end
+end
+
+fn sel_f64_round_even x f64 to ulong
+  if le x 0.0f64
+    ret 0
+  end
+  fl = ulong x
+  remv = sub x f64 fl
+  if gt remv 0.5f64
+    ret add fl 1
+  end
+  if lt remv 0.5f64
+    ret fl
+  end
+  if eq and fl 1 1
+    ret add fl 1
+  end
+  ret fl
+end
+
+fn sel_pow10 d ulong to ulong
+  p = ulong 1
+  for i ulong d bound 16
+    p = mul p 10
+  end
+  ret p
+end
+
+fn sel_o_f64 v f64 dec ulong to void
+  x = v
+  if lt x 0.0f64
+    sel_o_b uchar 45
+    x = neg x
+  end
+  sc = sel_pow10 dec
+  scaled = sel_f64_round_even mul x f64 sc
+  if eq dec 0
+    sel_o_u64 scaled
+    ret
+  end
+  ip = div scaled sc
+  fp = rem scaled sc
+  sel_o_u64 ip
+  sel_o_b uchar 46
+  divp = div sc 10
+  for i ulong dec bound 16
+    dig = rem div fp divp 10
+    sel_o_b uchar add 48 dig
+    if gt divp 1
+      divp = div divp 10
+    end
+  end
+end
+
+fn sel_u64_len v ulong to ulong
+  if eq v 0
+    ret 1
+  end
+  c = ulong 0
+  x = v
+  while gt x 0 bound 32
+    c = add c 1
+    x = div x 10
+  end
+  ret c
+end
+
+fn sel_o_u64_lpad v ulong w ulong to void
+  l = sel_u64_len v
+  sel_o_u64 v
+  if lt l w
+    sel_o_spaces sub w l
+  end
+end
+
+fn sel_o_txt_lpad s view uchar * w ulong to void
+  l = len s
+  sel_o_txt s
+  if lt l w
+    sel_o_spaces sub w l
+  end
+end
+
+fn sel_o_f64_rpad v f64 dec ulong w ulong to void
+  x = v
+  negf = ulong 0
+  if lt x 0.0f64
+    negf = 1
+    x = neg x
+  end
+  sc = sel_pow10 dec
+  scaled = sel_f64_round_even mul x f64 sc
+  ip = div scaled sc
+  l = add negf sel_u64_len ip
+  if gt dec 0
+    l = add l add 1 dec
+  end
+  if lt l w
+    sel_o_spaces sub w l
+  end
+  sel_o_f64 v dec
+end
+
+note ---- log2(f64) ----
+fn sel_log2 x f64 to f64
+  bits = bitcast ulong x
+  exp = sub long shr bits 52 1023
+  mb = or and bits 0x000fffffffffffff 0x3ff0000000000000
+  m = bitcast f64 mb
+  if gt m 1.4142135623730951f64
+    m = mul m 0.5f64
+    exp = add exp 1
+  end
+  t = div sub m 1.0f64 add m 1.0f64
+  t2 = mul t t
+  s = div 1.0f64 15.0f64
+  s = add div 1.0f64 13.0f64 mul s t2
+  s = add div 1.0f64 11.0f64 mul s t2
+  s = add div 1.0f64 9.0f64 mul s t2
+  s = add div 1.0f64 7.0f64 mul s t2
+  s = add div 1.0f64 5.0f64 mul s t2
+  s = add div 1.0f64 3.0f64 mul s t2
+  s = add 1.0f64 mul s t2
+  lnm = mul mul 2.0f64 t s
+  ret add f64 exp mul lnm 1.4426950408889634f64
+end
+
+note ---- SHA-256 ----
+global sel_sh_k uint 64
+global sel_sh_h uint 8
+global sel_sh_s uint 8
+global sel_sh_blk uchar 64
+global sel_sh_w uint 64
+global sel_sh_blen ulong 1
+global sel_sh_tot ulong 1
+global sel_sh_dig uchar 32
+global sel_sh_hex uchar 64
+global sel_sh_rbuf uchar 8192
+
+fn sel_sh_init_k to void
+  put sel_sh_k 0 uint 0x428a2f98
+  put sel_sh_k 1 uint 0x71374491
+  put sel_sh_k 2 uint 0xb5c0fbcf
+  put sel_sh_k 3 uint 0xe9b5dba5
+  put sel_sh_k 4 uint 0x3956c25b
+  put sel_sh_k 5 uint 0x59f111f1
+  put sel_sh_k 6 uint 0x923f82a4
+  put sel_sh_k 7 uint 0xab1c5ed5
+  put sel_sh_k 8 uint 0xd807aa98
+  put sel_sh_k 9 uint 0x12835b01
+  put sel_sh_k 10 uint 0x243185be
+  put sel_sh_k 11 uint 0x550c7dc3
+  put sel_sh_k 12 uint 0x72be5d74
+  put sel_sh_k 13 uint 0x80deb1fe
+  put sel_sh_k 14 uint 0x9bdc06a7
+  put sel_sh_k 15 uint 0xc19bf174
+  put sel_sh_k 16 uint 0xe49b69c1
+  put sel_sh_k 17 uint 0xefbe4786
+  put sel_sh_k 18 uint 0x0fc19dc6
+  put sel_sh_k 19 uint 0x240ca1cc
+  put sel_sh_k 20 uint 0x2de92c6f
+  put sel_sh_k 21 uint 0x4a7484aa
+  put sel_sh_k 22 uint 0x5cb0a9dc
+  put sel_sh_k 23 uint 0x76f988da
+  put sel_sh_k 24 uint 0x983e5152
+  put sel_sh_k 25 uint 0xa831c66d
+  put sel_sh_k 26 uint 0xb00327c8
+  put sel_sh_k 27 uint 0xbf597fc7
+  put sel_sh_k 28 uint 0xc6e00bf3
+  put sel_sh_k 29 uint 0xd5a79147
+  put sel_sh_k 30 uint 0x06ca6351
+  put sel_sh_k 31 uint 0x14292967
+  put sel_sh_k 32 uint 0x27b70a85
+  put sel_sh_k 33 uint 0x2e1b2138
+  put sel_sh_k 34 uint 0x4d2c6dfc
+  put sel_sh_k 35 uint 0x53380d13
+  put sel_sh_k 36 uint 0x650a7354
+  put sel_sh_k 37 uint 0x766a0abb
+  put sel_sh_k 38 uint 0x81c2c92e
+  put sel_sh_k 39 uint 0x92722c85
+  put sel_sh_k 40 uint 0xa2bfe8a1
+  put sel_sh_k 41 uint 0xa81a664b
+  put sel_sh_k 42 uint 0xc24b8b70
+  put sel_sh_k 43 uint 0xc76c51a3
+  put sel_sh_k 44 uint 0xd192e819
+  put sel_sh_k 45 uint 0xd6990624
+  put sel_sh_k 46 uint 0xf40e3585
+  put sel_sh_k 47 uint 0x106aa070
+  put sel_sh_k 48 uint 0x19a4c116
+  put sel_sh_k 49 uint 0x1e376c08
+  put sel_sh_k 50 uint 0x2748774c
+  put sel_sh_k 51 uint 0x34b0bcb5
+  put sel_sh_k 52 uint 0x391c0cb3
+  put sel_sh_k 53 uint 0x4ed8aa4a
+  put sel_sh_k 54 uint 0x5b9cca4f
+  put sel_sh_k 55 uint 0x682e6ff3
+  put sel_sh_k 56 uint 0x748f82ee
+  put sel_sh_k 57 uint 0x78a5636f
+  put sel_sh_k 58 uint 0x84c87814
+  put sel_sh_k 59 uint 0x8cc70208
+  put sel_sh_k 60 uint 0x90befffa
+  put sel_sh_k 61 uint 0xa4506ceb
+  put sel_sh_k 62 uint 0xbef9a3f7
+  put sel_sh_k 63 uint 0xc67178f2
+end
+
+fn sel_rotr32 x uint n uint to uint
+  ret or shr x n shl x sub uint 32 n
+end
+
+fn sel_sh_round j ulong to void
+  x = get sel_sh_s 4
+  t1 = xor sel_rotr32 x 6 sel_rotr32 x 11
+  t1 = xor t1 sel_rotr32 x 25
+  y = and x get sel_sh_s 5
+  y = xor y and not x get sel_sh_s 6
+  t1 = add t1 y
+  t1 = add t1 get sel_sh_s 7
+  t1 = add t1 get sel_sh_k j
+  t1 = add t1 get sel_sh_w j
+  x = get sel_sh_s 0
+  t2 = xor sel_rotr32 x 2 sel_rotr32 x 13
+  t2 = xor t2 sel_rotr32 x 22
+  y = and x get sel_sh_s 1
+  y = xor y and x get sel_sh_s 2
+  y = xor y and get sel_sh_s 1 get sel_sh_s 2
+  t2 = add t2 y
+  put sel_sh_s 7 get sel_sh_s 6
+  put sel_sh_s 6 get sel_sh_s 5
+  put sel_sh_s 5 get sel_sh_s 4
+  put sel_sh_s 4 add get sel_sh_s 3 t1
+  put sel_sh_s 3 get sel_sh_s 2
+  put sel_sh_s 2 get sel_sh_s 1
+  put sel_sh_s 1 x
+  put sel_sh_s 0 add t1 t2
+end
+
+fn sel_sh_block to void
+  for i ulong 16
+    b0 = uint get sel_sh_blk mul i 4
+    b1 = uint get sel_sh_blk add mul i 4 1
+    b2 = uint get sel_sh_blk add mul i 4 2
+    b3 = uint get sel_sh_blk add mul i 4 3
+    put sel_sh_w i or or shl b0 24 shl b1 16 or shl b2 8 b3
+  end
+  i = ulong 16
+  while lt i 64 bound 64
+    w15 = get sel_sh_w sub i 15
+    s0 = xor xor sel_rotr32 w15 7 sel_rotr32 w15 18 shr w15 3
+    w2 = get sel_sh_w sub i 2
+    s1 = xor xor sel_rotr32 w2 17 sel_rotr32 w2 19 shr w2 10
+    v = add add get sel_sh_w sub i 16 s0 add get sel_sh_w sub i 7 s1
+    put sel_sh_w i v
+    i = add i 1
+  end
+  for k1 ulong 8
+    put sel_sh_s k1 get sel_sh_h k1
+  end
+  for j ulong 64
+    sel_sh_round j
+  end
+  for k2 ulong 8
+    put sel_sh_h k2 add get sel_sh_h k2 get sel_sh_s k2
+  end
+end
+
+fn sel_sh_init to void
+  put sel_sh_h 0 uint 0x6a09e667
+  put sel_sh_h 1 uint 0xbb67ae85
+  put sel_sh_h 2 uint 0x3c6ef372
+  put sel_sh_h 3 uint 0xa54ff53a
+  put sel_sh_h 4 uint 0x510e527f
+  put sel_sh_h 5 uint 0x9b05688c
+  put sel_sh_h 6 uint 0x1f83d9ab
+  put sel_sh_h 7 uint 0x5be0cd19
+  put sel_sh_blen 0 0
+  put sel_sh_tot 0 0
+end
+
+fn sel_sh_byte b uchar to void
+  bl = get sel_sh_blen 0
+  put sel_sh_blk bl b
+  bl = add bl 1
+  put sel_sh_tot 0 add get sel_sh_tot 0 1
+  if eq bl 64
+    sel_sh_block
+    bl = 0
+  end
+  put sel_sh_blen 0 bl
+end
+
+fn sel_sh_final to void
+  bits = mul get sel_sh_tot 0 8
+  sel_sh_byte uchar 128
+  while ne get sel_sh_blen 0 56 bound 128
+    sel_sh_byte uchar 0
+  end
+  for i1 ulong 8
+    sh = mul sub 7 i1 8
+    sel_sh_byte uchar and shr bits sh 255
+  end
+  for i2 ulong 8
+    w = get sel_sh_h i2
+    put sel_sh_dig mul i2 4 uchar and shr w 24 255
+    put sel_sh_dig add mul i2 4 1 uchar and shr w 16 255
+    put sel_sh_dig add mul i2 4 2 uchar and shr w 8 255
+    put sel_sh_dig add mul i2 4 3 uchar and w 255
+  end
+  for i3 ulong 32
+    v = ulong get sel_sh_dig i3
+    hi = shr v 4
+    lo = and v 15
+    if lt hi 10
+      put sel_sh_hex mul i3 2 uchar add 48 hi
+    else
+      put sel_sh_hex mul i3 2 uchar add 87 hi
+    end
+    if lt lo 10
+      put sel_sh_hex add mul i3 2 1 uchar add 48 lo
+    else
+      put sel_sh_hex add mul i3 2 1 uchar add 87 lo
+    end
+  end
+end
+
+note ---- selector table globals ----
+global sel_nruns ulong 1
+global sel_run_id uchar 384
+global sel_run_id_len ulong 4
+global sel_src uchar 1024
+global sel_src_len ulong 4
+global sel_nrows ulong 1
+
+global sel_r_run ulong 2048
+global sel_r_n ulong 2048
+global sel_r_m ulong 2048
+global sel_r_sp f64 2048
+global sel_r_rz long 2048
+global sel_r_elig int 2048
+global sel_r_ver int 2048
+global sel_r_med f64 2048
+global sel_r_min f64 2048
+global sel_r_nz f64 2048
+global sel_r_pk f64 2048
+global sel_r_pnz f64 2048
+global sel_r_pf f64 2048
+
+fn sel_file_sha256_run r ulong to void
+  sel_sh_init
+  plen = get sel_src_len r
+  base = mul r 256
+  pbuf = new uchar 256 0
+  for i1 ulong plen bound 256
+    put pbuf i1 get sel_src add base i1
+  end
+  fd = fopen pbuf 0 plen SEL_O_RDONLY 0
+  if ge fd 0
+    while true bound 100000
+      k = read int fd sel_sh_rbuf 0 8192
+      if le k 0
+        break
+      end
+      for i2 ulong ulong k bound 8192
+        sel_sh_byte get sel_sh_rbuf i2
+      end
+    end
+    ign_l = fclose int fd
+  end
+  sel_sh_final
+end
+
+note ---- realization registry helpers ----
+fn sel_rz_max_n rid ulong to ulong
+  if eq rid 7
+    ret 65536
+  end
+  if eq rid 8
+    ret 64512
+  end
+  ret 16777215
+end
+
+fn sel_rz_print rid ulong to void
+  if eq rid 0
+    sel_o_txt t_rz_0
+    ret
+  end
+  if eq rid 1
+    sel_o_txt t_rz_1
+    ret
+  end
+  if eq rid 2
+    sel_o_txt t_rz_2
+    ret
+  end
+  if eq rid 3
+    sel_o_txt t_rz_3
+    ret
+  end
+  if eq rid 4
+    sel_o_txt t_rz_4
+    ret
+  end
+  if eq rid 5
+    sel_o_txt t_rz_5
+    ret
+  end
+  if eq rid 6
+    sel_o_txt t_rz_6
+    ret
+  end
+  if eq rid 7
+    sel_o_txt t_rz_7
+    ret
+  end
+  if eq rid 8
+    sel_o_txt t_rz_8
+    ret
+  end
+  sel_o_txt t_rz_9
+end
+
+fn sel_rz_len rid ulong to ulong
+  if eq rid 0
+    ret len t_rz_0
+  end
+  if eq rid 1
+    ret len t_rz_1
+  end
+  if eq rid 2
+    ret len t_rz_2
+  end
+  if eq rid 3
+    ret len t_rz_3
+  end
+  if eq rid 4
+    ret len t_rz_4
+  end
+  if eq rid 5
+    ret len t_rz_5
+  end
+  if eq rid 6
+    ret len t_rz_6
+  end
+  if eq rid 7
+    ret len t_rz_7
+  end
+  if eq rid 8
+    ret len t_rz_8
+  end
+  ret len t_rz_9
+end
+
+fn sel_eq_txt buf view uchar * blen ulong t view uchar * to bool
+  if ne blen len t
+    ret false
+  end
+  for i ulong blen bound 32
+    if ne get buf i get t i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn sel_rz_eq_buf rid ulong buf view uchar * blen ulong to bool
+  if eq rid 0
+    ret sel_eq_txt buf blen t_rz_0
+  end
+  if eq rid 1
+    ret sel_eq_txt buf blen t_rz_1
+  end
+  if eq rid 2
+    ret sel_eq_txt buf blen t_rz_2
+  end
+  if eq rid 3
+    ret sel_eq_txt buf blen t_rz_3
+  end
+  if eq rid 4
+    ret sel_eq_txt buf blen t_rz_4
+  end
+  if eq rid 5
+    ret sel_eq_txt buf blen t_rz_5
+  end
+  if eq rid 6
+    ret sel_eq_txt buf blen t_rz_6
+  end
+  if eq rid 7
+    ret sel_eq_txt buf blen t_rz_7
+  end
+  if eq rid 8
+    ret sel_eq_txt buf blen t_rz_8
+  end
+  ret sel_eq_txt buf blen t_rz_9
+end
+
+fn sel_rz_find buf view uchar * blen ulong to long
+  for k ulong SEL_RZ_COUNT
+    if sel_rz_eq_buf k buf blen
+      ret long k
+    end
+  end
+  ret -1
+end
+
+note ---- line reader and JSON key parser ----
+global sel_fbuf uchar 65536
+global sel_fpos ulong 1
+global sel_flen ulong 1
+global sel_line uchar 4096
+global sel_llen ulong 1
+
+fn sel_init to void
+  sel_sh_init_k
+  put sel_nruns 0 0
+  put sel_nrows 0 0
+end
+
+fn sel_readline fd int to long
+  ll = ulong 0
+  got = ulong 0
+  while true bound 8192
+    fp = get sel_fpos 0
+    fl = get sel_flen 0
+    if ge fp fl
+      k = read fd sel_fbuf 0 65536
+      if le k 0
+        if eq got 0
+          ret -1
+        end
+        put sel_llen 0 ll
+        ret long ll
+      end
+      put sel_fpos 0 0
+      put sel_flen 0 ulong k
+      fp = 0
+      fl = ulong k
+    end
+    c = get sel_fbuf fp
+    put sel_fpos 0 add fp 1
+    got = 1
+    if eq c uchar 10
+      put sel_llen 0 ll
+      ret long ll
+    end
+    if lt ll 4095
+      put sel_line ll c
+      ll = add ll 1
+    end
+  end
+  put sel_llen 0 ll
+  ret long ll
+end
+
+fn sel_line_has pat view uchar * to bool
+  ll = get sel_llen 0
+  pl = len pat
+  if gt pl ll
+    ret false
+  end
+  lim = add sub ll pl 1
+  for i ulong lim bound 4096
+    ok = true
+    for j ulong pl bound 128
+      if ne get sel_line add i j get pat j
+        ok = false
+        break
+      end
+    end
+    if ok
+      ret true
+    end
+  end
+  ret false
+end
+
+fn sel_line_pfx pat view uchar * to bool
+  ll = get sel_llen 0
+  pl = len pat
+  if gt pl ll
+    ret false
+  end
+  for j ulong pl bound 128
+    if ne get sel_line j get pat j
+      ret false
+    end
+  end
+  ret true
+end
+
+fn sel_match_key_at i ulong key view uchar * to bool
+  if ne get sel_line i uchar 34
+    ret false
+  end
+  kl = len key
+  for j ulong kl bound 64
+    if ne get sel_line add add i 1 j get key j
+      ret false
+    end
+  end
+  p = add add i 1 kl
+  if ne get sel_line p uchar 34
+    ret false
+  end
+  if ne get sel_line add p 1 uchar 58
+    ret false
+  end
+  ret eq get sel_line add p 2 uchar 32
+end
+
+note Find '"key": ' in sel_line; return offset of value or -1.
+fn sel_find_key key view uchar * to long
+  ll = get sel_llen 0
+  need = add len key 4
+  if gt need ll
+    ret -1
+  end
+  lim = add sub ll need 1
+  for i ulong lim bound 4096
+    if sel_match_key_at i key
+      ret long add i need
+    end
+  end
+  ret -1
+end
+
+fn sel_parse_f64_at pos ulong ok_flag edit int 1 to f64
+  ll = get sel_llen 0
+  p = pos
+  negf = ulong 0
+  if lt p ll
+    if eq get sel_line p uchar 45
+      negf = 1
+      p = add p 1
+    end
+  end
+  start = p
+  mant = ulong 0
+  fdig = ulong 0
+  while lt p ll bound 64
+    c = get sel_line p
+    if or lt c uchar 48 gt c uchar 57
+      break
+    end
+    if lt mant 900000000000000000
+      mant = add mul mant 10 sub ulong c 48
+    end
+    p = add p 1
+  end
+  if lt p ll
+    if eq get sel_line p uchar 46
+      p = add p 1
+      while lt p ll bound 64
+        c = get sel_line p
+        if or lt c uchar 48 gt c uchar 57
+          break
+        end
+        if and lt mant 900000000000000000 lt fdig 15
+          mant = add mul mant 10 sub ulong c 48
+          fdig = add fdig 1
+        end
+        p = add p 1
+      end
+    end
+  end
+  if eq p start
+    put ok_flag 0 0
+    ret 0.0f64
+  end
+  v = div f64 mant f64 sel_pow10 fdig
+  if eq negf 1
+    v = neg v
+  end
+  put ok_flag 0 1
+  ret v
+end
+
+fn sel_kv_num key view uchar * ok_flag edit int 1 to f64
+  pos = sel_find_key key
+  if lt pos 0
+    put ok_flag 0 0
+    ret 0.0f64
+  end
+  ret sel_parse_f64_at ulong pos ok_flag
+end
+
+fn sel_match_at p ulong pat view uchar * to bool
+  pl = len pat
+  if gt add p pl get sel_llen 0
+    ret false
+  end
+  for i ulong pl bound 16
+    if ne get sel_line add p i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn sel_kv_bool key view uchar * out_v edit int 1 to int
+  pos = sel_find_key key
+  if lt pos 0
+    ret -1
+  end
+  p = ulong pos
+  if sel_match_at p t_sel_true
+    put out_v 0 1
+    ret 0
+  end
+  if sel_match_at p t_sel_false
+    put out_v 0 0
+    ret 0
+  end
+  ret -1
+end
+
+fn sel_kv_str key view uchar * dst edit uchar * cap ulong to long
+  pos = sel_find_key key
+  if lt pos 0
+    ret -1
+  end
+  p = ulong pos
+  ll = get sel_llen 0
+  if or ge p ll ne get sel_line p uchar 34
+    ret -1
+  end
+  p = add p 1
+  k = ulong 0
+  while lt p ll bound 4096
+    c = get sel_line p
+    if eq c uchar 34
+      ret long k
+    end
+    if ge k cap
+      ret -1
+    end
+    put dst k c
+    k = add k 1
+    p = add p 1
+  end
+  ret -1
+end
+
+fn sel_parse_row_nums nr ulong to int
+  ok = new int 1 0
+  v = sel_kv_num t_sel_k_med ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_med nr div v 1000.0f64
+  v = sel_kv_num t_sel_k_min ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_min nr div v 1000.0f64
+  v = sel_kv_num t_sel_k_nz ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_nz nr v
+  v = sel_kv_num t_sel_k_pk ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_pk nr div v 1000.0f64
+  v = sel_kv_num t_sel_k_pf ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_pf nr v
+  v = sel_kv_num t_sel_k_pnz ok
+  if ne get ok 0 0
+    put sel_r_pnz nr v
+  else
+    put sel_r_pnz nr 0.0f64
+  end
+  ret SEL_OK
+end
+
+fn sel_parse_row run ulong to int
+  nr = get sel_nrows 0
+  if ge nr SEL_MAX_ROWS
+    ret SEL_E_FULL
+  end
+  ok = new int 1 0
+  v = sel_kv_num t_sel_k_n ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_n nr ulong v
+  v = sel_kv_num t_sel_k_m ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_m nr ulong v
+  v = sel_kv_num t_sel_k_sp ok
+  if eq get ok 0 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_sp nr v
+  rzb = new uchar 32 0
+  rzl = sel_kv_str t_sel_k_rz rzb 31
+  if lt rzl 0
+    ret SEL_E_FORMAT
+  end
+  if ne sel_kv_bool t_sel_k_elig ok 0
+    ret SEL_E_FORMAT
+  end
+  put sel_r_run nr run
+  put sel_r_rz nr sel_rz_find rzb ulong rzl
+  elig = get ok 0
+  put sel_r_elig nr elig
+  if eq sel_kv_bool t_sel_k_ver ok 0
+    put sel_r_ver nr get ok 0
+  else
+    put sel_r_ver nr 0
+  end
+  if ne elig 0
+    rc = sel_parse_row_nums nr
+    if ne rc SEL_OK
+      ret rc
+    end
+  else
+    put sel_r_med nr 0.0f64
+    put sel_r_min nr 0.0f64
+    put sel_r_nz nr 0.0f64
+    put sel_r_pk nr 0.0f64
+    put sel_r_pnz nr 0.0f64
+    put sel_r_pf nr 0.0f64
+  end
+  put sel_nrows 0 add nr 1
+  ret SEL_OK
+end
+
+fn sel_capture_run_id run ulong to void
+  ridb = new uchar 96 0
+  rl = sel_kv_str t_sel_k_runid ridb 95
+  if ge rl 0
+    base = mul run 96
+    for i ulong ulong rl bound 96
+      put sel_run_id add base i get ridb i
+    end
+    put sel_run_id_len run ulong rl
+  end
+end
+
+fn sel_save_src run ulong path view uchar * plen ulong to void
+  sbase = mul run 256
+  skeep = plen
+  if gt skeep 255
+    skeep = 255
+  end
+  for j ulong skeep bound 256
+    put sel_src add sbase j get path j
+  end
+  put sel_src_len run skeep
+end
+
+fn sel_load path view uchar * plen ulong to int
+  run = get sel_nruns 0
+  if ge run SEL_MAX_RUNS
+    ret SEL_E_FULL
+  end
+  fd = fopen path 0 plen SEL_O_RDONLY 0
+  if lt fd 0
+    ret SEL_E_IO
+  end
+  put sel_fpos 0 0
+  put sel_flen 0 0
+  in_tbl = ulong 0
+  sch_ok = ulong 0
+  added = ulong 0
+  put sel_run_id_len run 0
+  while true bound 50000
+    if lt sel_readline int fd 0
+      break
+    end
+    if or sel_line_has t_sel_sch1 sel_line_has t_sel_sch2
+      sch_ok = 1
+    end
+    if eq in_tbl 0
+      sel_capture_run_id run
+    end
+    if sel_line_has t_sel_ct
+      in_tbl = 1
+      continue
+    end
+    if eq in_tbl 0
+      continue
+    end
+    if sel_line_pfx t_sel_end_ct
+      break
+    end
+    if not sel_line_has t_sel_row_pfx
+      continue
+    end
+    rc = sel_parse_row run
+    if ne rc SEL_OK
+      ign_l = fclose int fd
+      ret rc
+    end
+    added = add added 1
+  end
+  ign_l = fclose int fd
+  if eq sch_ok 0
+    ret SEL_E_FORMAT
+  end
+  if eq added 0
+    ret SEL_E_EMPTY
+  end
+  sel_save_src run path plen
+  put sel_nruns 0 add run 1
+  ret SEL_OK
+end
+
+note ---- decision state (slot 0 and slot 1 for side-by-side compare) ----
+global sd_q_n ulong 2
+global sd_q_m ulong 2
+global sd_q_sp f64 2
+global sd_q_pack int 2
+global sd_q_run int 2
+global sd_q_inc long 2
+
+global sd_cn ulong 2
+global sd_cm ulong 2
+global sd_csp f64 2
+global sd_exact int 2
+
+global sd_chosen long 2
+global sd_cheapest long 2
+global sd_runner long 2
+global sd_chosen_ns f64 2
+global sd_cheapest_ns f64 2
+global sd_runner_ns f64 2
+global sd_margin f64 2
+global sd_band f64 2
+global sd_tie int 2
+global sd_tres int 2
+global sd_ntie ulong 2
+global sd_tset long 32
+global sd_ncand ulong 2
+
+note Candidates: slot * 16 + k
+global sc_rz long 32
+global sc_elig int 32
+global sc_excode int 32
+global sc_cost f64 32
+global sc_wn f64 32
+global sc_cn f64 32
+global sc_pf f64 32
+
+fn sel_cell_dist_row slot ulong i ulong to f64
+  dn = fabs sel_log2 div f64 get sd_q_n slot f64 get sel_r_n i
+  dm = fabs sel_log2 div f64 get sd_q_m slot f64 get sel_r_m i
+  ds = mul 4.0f64 fabs sub get sd_q_sp slot get sel_r_sp i
+  ret add add dn dm ds
+end
+
+fn sel_in_tie_set slot ulong rid long to bool
+  if eq get sd_chosen slot rid
+    ret true
+  end
+  nt = get sd_ntie slot
+  base = mul slot 16
+  for i ulong nt bound 16
+    if eq get sd_tset add base i rid
+      ret true
+    end
+  end
+  ret false
+end
+
+global sc_allc f64 4
+global sc_tmp_u ulong 4
+global sc_tmp_f f64 4
+
+fn sel_eval_cand_row slot ulong k ulong i ulong to void
+  if ne get sel_r_n i get sd_cn slot
+    ret
+  end
+  if ne get sel_r_m i get sd_cm slot
+    ret
+  end
+  if gt fabs sub get sel_r_sp i get sd_csp slot 1.0e-9f64
+    ret
+  end
+  if ne get sel_r_rz i long k
+    ret
+  end
+  used = false
+  if lt get sd_q_run slot 0
+    used = true
+  else
+    if eq get sel_r_run i ulong get sd_q_run slot
+      used = true
+    end
+  end
+  if or eq get sel_r_elig i 0 eq get sel_r_ver i 0
+    if used
+      put sc_tmp_u 1 1
+    end
+    ret
+  end
+  pack = 0.0f64
+  if ne get sd_q_pack slot 0
+    pack = get sel_r_pk i
+  end
+  cost = add get sel_r_med i pack
+  if lt get sc_tmp_u 2 SEL_MAX_RUNS
+    put sc_allc get sc_tmp_u 2 cost
+    put sc_tmp_u 2 add get sc_tmp_u 2 1
+  end
+  if not used
+    ret
+  end
+  nz = mul get sel_r_nz i get sel_r_med i
+  if ne get sd_q_pack slot 0
+    nz = add nz mul get sel_r_pnz i pack
+  end
+  nz = div nz cost
+  put sc_tmp_u 3 add get sc_tmp_u 3 1
+  put sc_tmp_f 0 add get sc_tmp_f 0 cost
+  put sc_tmp_f 1 add get sc_tmp_f 1 get sel_r_pf i
+  if gt nz get sc_tmp_f 2
+    put sc_tmp_f 2 nz
+  end
+  put sc_tmp_u 0 1
+end
+
+fn sel_eval_cand slot ulong k ulong to void
+  idx = add mul slot 16 k
+  put sc_rz idx long k
+  put sc_elig idx 1
+  put sc_excode idx 0
+  put sc_cost idx 0.0f64
+  put sc_wn idx 0.0f64
+  put sc_cn idx 0.0f64
+  put sc_pf idx 0.0f64
+  if gt get sd_q_n slot sel_rz_max_n k
+    put sc_elig idx 0
+    put sc_excode idx 2
+    ret
+  end
+  put sc_tmp_u 0 0
+  put sc_tmp_u 1 0
+  put sc_tmp_u 2 0
+  put sc_tmp_u 3 0
+  put sc_tmp_f 0 0.0f64
+  put sc_tmp_f 1 0.0f64
+  put sc_tmp_f 2 0.0f64
+  nr = get sel_nrows 0
+  for i ulong nr bound 2048
+    sel_eval_cand_row slot k i
+  end
+  if ne get sc_tmp_u 1 0
+    put sc_elig idx 0
+    put sc_excode idx 3
+    ret
+  end
+  if eq get sc_tmp_u 0 0
+    put sc_elig idx 0
+    put sc_excode idx 4
+    ret
+  end
+  ru = f64 get sc_tmp_u 3
+  put sc_cost idx div get sc_tmp_f 0 ru
+  put sc_pf idx div get sc_tmp_f 1 ru
+  put sc_wn idx get sc_tmp_f 2
+  nall = get sc_tmp_u 2
+  if gt nall 1
+    lo = get sc_allc 0
+    hi = lo
+    msum = 0.0f64
+    for r ulong nall bound 4
+      v = get sc_allc r
+      if lt v lo
+        lo = v
+      end
+      if gt v hi
+        hi = v
+      end
+      msum = add msum v
+    end
+    put sc_cn idx div sub hi lo div msum f64 nall
+  end
+end
+
+fn sel_set_q slot ulong qn ulong qm ulong qsp f64 qpack int qrun int to void
+  put sd_q_n slot qn
+  put sd_q_m slot qm
+  put sd_q_sp slot qsp
+  put sd_q_pack slot qpack
+  put sd_q_run slot qrun
+  put sd_q_inc slot -1
+end
+
+fn sel_decide_cell slot ulong to int
+  nr = get sel_nrows 0
+  have = ulong 0
+  best = 0.0f64
+  qrun = get sd_q_run slot
+  for i ulong nr bound 2048
+    if ge qrun 0
+      if ne get sel_r_run i ulong qrun
+        continue
+      end
+    end
+    dist = sel_cell_dist_row slot i
+    if or eq have 0 lt dist sub best 1.0e-12f64
+      have = 1
+      best = dist
+      put sd_cn slot get sel_r_n i
+      put sd_cm slot get sel_r_m i
+      put sd_csp slot get sel_r_sp i
+    end
+  end
+  if eq have 0
+    ret SEL_E_EMPTY
+  end
+  if lt best 1.0e-9f64
+    put sd_exact slot 1
+  else
+    put sd_exact slot 0
+  end
+  ret SEL_OK
+end
+
+fn sel_decide_tie slot ulong w long to void
+  base = mul slot 16
+  qinc = get sd_q_inc slot
+  inc_pick = long -1
+  ref_pick = long -1
+  for k ulong SEL_RZ_COUNT
+    if eq get sc_elig add base k 0
+      continue
+    end
+    if not sel_in_tie_set slot long k
+      continue
+    end
+    if and ge qinc 0 eq long k qinc
+      inc_pick = long k
+    end
+    if eq k 0
+      ref_pick = long k
+    end
+  end
+  pick = w
+  if ge inc_pick 0
+    pick = inc_pick
+    put sd_tres slot 1
+  else
+    if ge ref_pick 0
+      pick = ref_pick
+      put sd_tres slot 2
+    else
+      put sd_tres slot 3
+    end
+  end
+  put sd_chosen slot pick
+  put sd_chosen_ns slot get sc_cost add base ulong pick
+end
+
+fn sel_decide_finish slot ulong w long u long to void
+  base = mul slot 16
+  wcost = get sc_cost add base ulong w
+  put sd_runner slot u
+  put sd_runner_ns slot get sc_cost add base ulong u
+  put sd_margin slot div sub get sd_runner_ns slot wcost wcost
+  band = fmax get sc_wn add base ulong w get sc_wn add base ulong u
+  band = fmax band get sc_cn add base ulong w
+  band = fmax band get sc_cn add base ulong u
+  put sd_band slot band
+  put sd_tset base w
+  nt = ulong 1
+  for k2 ulong SEL_RZ_COUNT
+    if or eq get sc_elig add base k2 0 eq long k2 w
+      continue
+    end
+    if le div sub get sc_cost add base k2 wcost wcost band
+      put sd_tset add base nt long k2
+      nt = add nt 1
+    end
+  end
+  put sd_ntie slot nt
+  if le nt 1
+    put sd_tie slot 0
+    ret
+  end
+  put sd_tie slot 1
+  sel_decide_tie slot w
+end
+
+fn sel_decide slot ulong to int
+  put sd_chosen slot -1
+  put sd_cheapest slot -1
+  put sd_runner slot -1
+  put sd_chosen_ns slot 0.0f64
+  put sd_cheapest_ns slot 0.0f64
+  put sd_runner_ns slot 0.0f64
+  put sd_margin slot 0.0f64
+  put sd_band slot 0.0f64
+  put sd_tie slot 0
+  put sd_tres slot 0
+  put sd_ntie slot 0
+  put sd_ncand slot 0
+  if ne sel_decide_cell slot SEL_OK
+    ret SEL_E_EMPTY
+  end
+  put sd_ncand slot SEL_RZ_COUNT
+  for k0 ulong SEL_RZ_COUNT
+    sel_eval_cand slot k0
+  end
+  w = long -1
+  u = long -1
+  base = mul slot 16
+  for k1 ulong SEL_RZ_COUNT
+    idx = add base k1
+    if eq get sc_elig idx 0
+      continue
+    end
+    ck = get sc_cost idx
+    is_w = false
+    if lt w 0
+      is_w = true
+    else
+      if lt ck get sc_cost add base ulong w
+        is_w = true
+      end
+    end
+    if is_w
+      u = w
+      w = long k1
+    else
+      is_u = false
+      if lt u 0
+        is_u = true
+      else
+        if lt ck get sc_cost add base ulong u
+          is_u = true
+        end
+      end
+      if is_u
+        u = long k1
+      end
+    end
+  end
+  if lt w 0
+    ret SEL_E_EMPTY
+  end
+  wcost = get sc_cost add base ulong w
+  put sd_chosen slot w
+  put sd_cheapest slot w
+  put sd_chosen_ns slot wcost
+  put sd_cheapest_ns slot wcost
+  put sd_tres slot 0
+  if lt u 0
+    ret SEL_OK
+  end
+  sel_decide_finish slot w u
+  ret SEL_OK
+end
+
+note ---- JSON emission for one decision ----
+text t_dj_1 "{\"query\": {\"n\": "
+text t_dj_2 ", \"m\": "
+text t_dj_3 ", \"sparsity\": "
+text t_dj_4 ", \"pack\": \""
+text t_dj_5 "\", \"runs\": \""
+text t_dj_6 "\"},\n"
+text t_dj_pc "per_call"
+text t_dj_oa "once_amortized"
+text t_dj_all "all"
+text t_dj_r1 "run1"
+text t_dj_r2 "run2"
+text t_dj_c1 " \"cell\": {\"n\": "
+text t_dj_c2 ", \"exact_cell\": "
+text t_dj_c3 "},\n"
+text t_dj_ch " \"chosen\": \""
+text t_dj_ch2 "\", \"chosen_ns\": "
+text t_dj_ch3 ", \"cheapest\": \""
+text t_dj_ch4 "\", \"cheapest_ns\": "
+text t_dj_ch5 ", \"runner_up\": \""
+text t_dj_ch6 "\", \"runner_up_ns\": "
+text t_dj_ch7 ", \"margin_rel\": "
+text t_dj_ch8 ", \"noise_band_rel\": "
+text t_dj_ch9 ", \"verdict\": \""
+text t_dj_ch10 "\", \"incumbent\": \""
+text t_dj_ch11 "\", \"tie_resolution\": \""
+text t_dj_ch12 "\", \"tied_set\": ["
+text t_dj_tie "TIE"
+text t_dj_chosen "CHOSEN"
+text t_dj_rsn "],\n"
+text t_dj_rsn2 " \"reason\": \""
+text t_dj_rsn_ch "chosen: cheapest exact verified realization, "
+text t_dj_rsn_ch2 "% under "
+text t_dj_rsn_ch3 " (margin outside the measured noise band)"
+text t_dj_rsn_t1 "TIE: "
+text t_dj_rsn_t2 "% under "
+text t_dj_rsn_t3 ", inside the measured noise band "
+text t_dj_rsn_t4 "%; "
+text t_dj_rsn_t5 " selected from the tied set of "
+text t_dj_rsn_t6 " (ADR 0019 9.1)"
+text t_dj_rsn_only "only eligible realization"
+text t_dj_cand "\",\n"
+text t_dj_cand2 " \"candidates\": ["
+text t_dj_c_e1 "{\"rz\": \""
+text t_dj_c_e2 "\", \"cost_ns\": "
+text t_dj_c_e3 ", \"within_noise_rel\": "
+text t_dj_c_e4 ", \"cross_run_rel\": "
+text t_dj_c_e5 ", \"pct_floor\": "
+text t_dj_c_x "\", \"excluded\": \""
+text t_dj_end "]}"
+text t_dj_sep ", "
+text t_dj_qt "\""
+text t_dj_sp " "
+text t_dj_rb "}"
+text t_dj_qrb "\"}"
+
+fn sel_o_tres tr int to void
+  if eq tr 1
+    sel_o_txt t_sel_tr_inc
+    ret
+  end
+  if eq tr 2
+    sel_o_txt t_sel_tr_ref
+    ret
+  end
+  if eq tr 3
+    sel_o_txt t_sel_tr_chp
+    ret
+  end
+  sel_o_txt t_sel_tr_none
+end
+
+fn sel_o_excode ec int to void
+  if eq ec 1
+    sel_o_txt t_sel_ex_not_exact
+    ret
+  end
+  if eq ec 2
+    sel_o_txt t_sel_ex_maxn
+    ret
+  end
+  if eq ec 3
+    sel_o_txt t_sel_ex_unver
+    ret
+  end
+  sel_o_txt t_sel_ex_nomeas
+end
+
+fn sel_decision_json_hdr slot ulong ind view uchar * to void
+  sel_o_txt ind
+  sel_o_txt t_dj_1
+  sel_o_u64 get sd_q_n slot
+  sel_o_txt t_dj_2
+  sel_o_u64 get sd_q_m slot
+  sel_o_txt t_dj_3
+  sel_o_f64 get sd_q_sp slot 2
+  sel_o_txt t_dj_4
+  if ne get sd_q_pack slot 0
+    sel_o_txt t_dj_pc
+  else
+    sel_o_txt t_dj_oa
+  end
+  sel_o_txt t_dj_5
+  qr = get sd_q_run slot
+  if lt qr 0
+    sel_o_txt t_dj_all
+  else
+    if eq qr 0
+      sel_o_txt t_dj_r1
+    else
+      sel_o_txt t_dj_r2
+    end
+  end
+  sel_o_txt t_dj_6
+  sel_o_txt ind
+  sel_o_txt t_dj_c1
+  sel_o_u64 get sd_cn slot
+  sel_o_txt t_dj_2
+  sel_o_u64 get sd_cm slot
+  sel_o_txt t_dj_3
+  sel_o_f64 get sd_csp slot 2
+  sel_o_txt t_dj_c2
+  if ne get sd_exact slot 0
+    sel_o_txt t_sel_true
+  else
+    sel_o_txt t_sel_false
+  end
+  sel_o_txt t_dj_c3
+end
+
+fn sel_decision_json_mid slot ulong ind view uchar * to void
+  sel_o_txt ind
+  sel_o_txt t_dj_ch
+  sel_rz_print ulong get sd_chosen slot
+  sel_o_txt t_dj_ch2
+  sel_o_f64 get sd_chosen_ns slot 1
+  sel_o_txt t_dj_ch3
+  sel_rz_print ulong get sd_cheapest slot
+  sel_o_txt t_dj_ch4
+  sel_o_f64 get sd_cheapest_ns slot 1
+  sel_o_txt t_dj_ch5
+  if ge get sd_runner slot 0
+    sel_rz_print ulong get sd_runner slot
+  end
+  sel_o_txt t_dj_ch6
+  sel_o_f64 get sd_runner_ns slot 1
+  sel_o_txt t_dj_ch7
+  sel_o_f64 get sd_margin slot 4
+  sel_o_txt t_dj_ch8
+  sel_o_f64 get sd_band slot 4
+  sel_o_txt t_dj_ch9
+  if ne get sd_tie slot 0
+    sel_o_txt t_dj_tie
+  else
+    sel_o_txt t_dj_chosen
+  end
+  sel_o_txt t_dj_ch10
+  if ge get sd_q_inc slot 0
+    sel_rz_print ulong get sd_q_inc slot
+  end
+  sel_o_txt t_dj_ch11
+  sel_o_tres get sd_tres slot
+  sel_o_txt t_dj_ch12
+  nt = get sd_ntie slot
+  base = mul slot 16
+  for i ulong nt bound 16
+    if gt i 0
+      sel_o_txt t_dj_sep
+    end
+    sel_o_txt t_dj_qt
+    sel_rz_print ulong get sd_tset add base i
+    sel_o_txt t_dj_qt
+  end
+  sel_o_txt t_dj_rsn
+  sel_o_txt ind
+  sel_o_txt t_dj_rsn2
+  if lt get sd_runner slot 0
+    sel_o_txt t_dj_rsn_only
+  else
+    if eq get sd_tie slot 0
+      sel_o_txt t_dj_rsn_ch
+      sel_o_f64 mul 100.0f64 get sd_margin slot 1
+      sel_o_txt t_dj_rsn_ch2
+      sel_rz_print ulong get sd_runner slot
+      sel_o_txt t_dj_rsn_ch3
+    else
+      sel_o_txt t_dj_rsn_t1
+      sel_rz_print ulong get sd_cheapest slot
+      sel_o_txt t_dj_sp
+      sel_o_f64 mul 100.0f64 get sd_margin slot 1
+      sel_o_txt t_dj_rsn_t2
+      sel_rz_print ulong get sd_runner slot
+      sel_o_txt t_dj_rsn_t3
+      sel_o_f64 mul 100.0f64 get sd_band slot 1
+      sel_o_txt t_dj_rsn_t4
+      tr = get sd_tres slot
+      if eq tr 1
+        sel_o_txt t_sel_tr_inc
+      else
+        if eq tr 2
+          sel_o_txt t_sel_tr_dref
+        else
+          sel_o_txt t_sel_tr_chp
+        end
+      end
+      sel_o_txt t_dj_sp
+      sel_rz_print ulong get sd_chosen slot
+      sel_o_txt t_dj_rsn_t5
+      sel_o_u64 nt
+      sel_o_txt t_dj_rsn_t6
+    end
+  end
+end
+
+fn sel_decision_json slot ulong ind view uchar * to void
+  sel_decision_json_hdr slot ind
+  sel_decision_json_mid slot ind
+  sel_o_txt t_dj_cand
+  sel_o_txt ind
+  sel_o_txt t_dj_cand2
+  nc = get sd_ncand slot
+  base = mul slot 16
+  for k ulong nc bound 16
+    if gt k 0
+      sel_o_txt t_dj_sep
+    end
+    idx = add base k
+    sel_o_txt t_dj_c_e1
+    sel_rz_print ulong get sc_rz idx
+    if ne get sc_elig idx 0
+      sel_o_txt t_dj_c_e2
+      sel_o_f64 get sc_cost idx 1
+      sel_o_txt t_dj_c_e3
+      sel_o_f64 get sc_wn idx 4
+      sel_o_txt t_dj_c_e4
+      sel_o_f64 get sc_cn idx 4
+      sel_o_txt t_dj_c_e5
+      sel_o_f64 get sc_pf idx 1
+      sel_o_txt t_dj_rb
+    else
+      sel_o_txt t_dj_c_x
+      sel_o_excode get sc_excode idx
+      sel_o_txt t_dj_qrb
+    end
+  end
+  sel_o_txt t_dj_end
+end
