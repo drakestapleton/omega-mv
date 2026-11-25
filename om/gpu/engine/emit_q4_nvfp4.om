@@ -681,184 +681,555 @@ end
 end
 
 note =========================================================================
-note Mode 424: uMoeNvfp4Gu -- Fused Top-K MoE NVFP4 gate+up+SiLU*up in ONE launch
-note Args: x[H] (R0:1), W_gu (R2:3), S_gu (R4:5), topk_ids[K] (R6:7), out_mid[K,moeI] (R8:9).
-note Grid: (ceil(moeI/8), topK, 1), Block: 256 (8 warps), SMEM: 64 (E2M1 LUT).
+note Mode 424: uMoeNvfp4Gu4R -- 4-row/warp LDG.E.64 + 2 KiB SMEM Fused Top-K MoE NVFP4 gate+up+SiLU*up
+note   Supports BOTH B=1 (Grid.y = topK) AND B=8 batched (Grid.y = topK * 8) in ONE launch!
+note Args: x[B,H] (R0:1), W_gu (R2:3), S_gu (R4:5), idsBase (R6:7), out_mid[B,topK,moeI] (R8:9),
+note       topK (40), idsStride (44).
+note Grid: (ceil(moeI/32), topK * B, 1), Block: 256 (8 warps x 4 rows = 32 rows/CTA), SMEM: 2144.
+note   SMEM[0..2047] = x[512], SMEM[2048..2079] = saved args, SMEM[2080..2143] = E2M1 LUT[16].
 note =========================================================================
-fn uMoeNvfp4Gu to void
+fn uMoeNv4Emit4Rows acc0 ulong sStride ulong isUp bool to void
+qic 11 12 32 QZ 0 qLd
+qic 11 13 34 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 20 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickNvfp4Scale 12 12 11
+uPickNvfp4Scale 13 13 11
+uPickNvfp4Scale 15 15 11
+uPickNvfp4Scale 20 20 11
+for r ulong 4
+wA = add 24 mul r 2
+wB = add 25 mul r 2
+sR = ulong 12
+if eq r 1
+sR = ulong 13
+end
+if eq r 2
+sR = ulong 15
+end
+if eq r 3
+sR = ulong 20
+end
+accR = add acc0 r
+if and isUp gt r 1
+accR = add 17 mul sub r 2 2
+end
+qNum 36 0.0f32
+uNvfp4Mac8Smem wA 10 0 2080 36
+uNvfp4Mac8Smem wB 10 32 2080 36
+qic4 33 accR 36 sR accR qAlu4
+end
+end
+
+fn uMoeNvfp4Gu4R to void
 H = get engSpec MS_H
 moeI = get engSpec MS_MOE_I
 wStride = div H 8
 sStride = div H 64
-nIter = div H 128
-expWOff = mul mul 2 moeI wStride
-expSOff = mul mul 2 moeI sStride
-upWOff = mul moeI wStride
-upSOff = mul moeI sStride
 qStart 5
-uNvfp4InitLut 0
-qic 17 10 14 QZ 5 qAlu1
-qic 18 11 14 QZ 31 qAlu4
-qMad 12 15 8 10
-qLit 13 moeI
-qic 28 QZ 12 13 0 qCmp
+uNvfp4InitLut 2080
+qParam 54 40
+qParam 55 44
+qLit 52 0
+qLit 53 1
+qLit 57 0xffffffff
+for bStep ulong 7
+qic 28 QZ 18 54 0 qCmp
 put q36Guard 0 1
-qic 45 QZ QZ QZ 0 qSafe
+qIadd 52 52 53
+put q36Guard 0 1
+qMadReg 18 54 57 18
+end
+qMad 56 52 H QZ
+qicImm 9 0 56 0 4 qAlu1
+qMadReg 56 52 55 QZ
+qicImm 9 6 56 6 4 qAlu1
+qMadReg 56 52 54 QZ
+qMad 56 56 moeI QZ
+qicImm 9 8 56 8 4 qAlu4
+qLit 54 1
+bXp = qBssy
+qic 28 QZ 14 54 0 qCmp
+skXp = qBraFwd 1
+qLit 52 2048
+qic 50 QZ 52 0 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 2052
+qic 50 QZ 52 1 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 2056
+qic 50 QZ 52 4 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 2060
+qic 50 QZ 52 5 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 2064
+qic 50 QZ 52 8 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 2068
+qic 50 QZ 52 9 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 2072
+qic 50 QZ 52 18 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skXp 1
+qBsync bXp
+qBar
 qicImm 9 16 18 6 4 qW1
 qic 11 19 16 QZ 0 qLd
 qic 0 QZ QZ QZ 0 qW0
-qMad 26 19 expWOff QZ
-qMad 26 12 wStride 26
-qic 17 27 11 QZ 1 qAlu4
-qIadd 26 26 27
-qicImm 9 20 26 2 4 qAlu1
-qLit 27 upWOff
-qIadd 26 26 27
-qicImm 9 22 26 2 4 qAlu4
-qMad 26 19 expSOff QZ
-qMad 26 12 sStride 26
-qic 17 27 11 QZ 4 qAlu4
-qIadd 26 26 27
-qicImm 9 24 26 4 4 qAlu1
-qLit 27 upSOff
-qIadd 26 26 27
-qicImm 9 28 26 4 4 qAlu4
-qMad 26 11 4 QZ
-qicImm 9 30 26 0 4 qAlu4
-qNum 48 0.0f32
-qNum 49 0.0f32
-qLit 32 0
-qLit 33 nIter
-qLit 34 1
-mLp = get q36Pc 0
-qic 57 40 30 QZ 0 qLdW1
-qic 11 35 20 QZ 0 qLd
-qic 11 36 22 QZ 0 qLd
-qic 11 37 24 QZ 0 qLd
-qic 11 38 28 QZ 0 qLd
+qicImm 8 12 2 QZ 1 qAlu1
+qicImm 8 13 3 QZ 1 qAlu1
+qic 17 52 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+qMad 58 19 mul mul 2 moeI wStride QZ
+qMad 58 11 2 58
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMad 53 52 wStride 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qMad 16 19 mul mul 2 moeI sStride QZ
+qMad 16 18 sStride 16
+qic 17 52 11 QZ 2 qAlu4
+qIadd 16 16 52
+qMad 10 11 64 QZ
+qLit 21 0
+qLit 22 div H 512
+qLit 23 1
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+qNum 60 0.0f32
+qNum 61 0.0f32
+qNum 17 0.0f32
+qNum 19 0.0f32
+mLoop = get q36Pc 0
+qLit 54 2048
+qLit 55 2052
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
 qic 0 QZ QZ QZ 0 qW0
-uPickW4Half 35 11
-uPickW4Half 36 11
-qic 17 44 11 QZ 2 qAlu4
-uPickNvfp4Scale 37 37 44
-uPickNvfp4Scale 38 38 44
-uNvfp4Mac4Lane 35 37 0 48
-uNvfp4Mac4Lane 36 38 0 49
-qicImm 9 30 34 30 512 qAlu1
-qicImm 9 20 34 20 64 qAlu1
-qicImm 9 22 34 22 64 qAlu1
-qicImm 9 24 34 24 8 qAlu1
-qicImm 9 28 34 28 8 qAlu4
-qIadd 32 32 34
-qic 28 QZ 32 33 0 qCmp
+qMad 54 21 512 QZ
+qMad 54 14 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 8 QZ
+qic 50 QZ 54 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 25 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qLit 54 2056
+qLit 55 2060
+qic 49 8 54 QZ 0 qLd
+qic 49 9 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 56 24 0 QZ 0 qLd
+qic 56 26 2 QZ 0 qLd
+qic 56 28 4 QZ 0 qLd
+qic 56 30 6 QZ 0 qLd
+qMad 52 21 8 16
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+uMoeNv4Emit4Rows 48 sStride false
+qLit 52 mul moeI wStride
+qicImm 9 32 52 0 4 qAlu1
+qicImm 9 34 52 2 4 qAlu1
+qicImm 9 56 52 4 4 qAlu1
+qicImm 9 58 52 6 4 qAlu4
+qic 56 24 32 QZ 0 qLd
+qic 56 26 34 QZ 0 qLd
+qic 56 28 56 QZ 0 qLd
+qic 56 30 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW1
+qMad 52 21 8 16
+qLit 53 mul moeI sStride
+qIadd 52 52 53
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+uMoeNv4Emit4Rows 60 sStride true
+qicImm 9 0 23 0 256 qAlu1
+qicImm 9 2 23 2 256 qAlu1
+qicImm 9 4 23 4 256 qAlu1
+qicImm 9 6 23 6 256 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
 put q36Guard 0 2
-qic 46 QZ QZ QZ sub mLp get q36Pc 0 qAlu4
-qWarpRedSum 48 52 16
-qWarpRedSum 49 52 16
-qic 28 QZ 11 34 0 qCmp
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+for r ulong 4
+qWarpRedSum add 48 r 24 16
+end
+qWarpRedSum 60 24 16
+qWarpRedSum 61 24 16
+qWarpRedSum 17 24 16
+qWarpRedSum 19 24 16
+qic 28 QZ 11 23 0 qCmp
 put q36Guard 0 1
 qic 45 QZ QZ QZ 0 qSafe
+qLit 24 2064
+qLit 25 2068
+qLit 28 2072
+qic 49 8 24 QZ 0 qLd
+qic 49 9 25 QZ 0 qLd
+qic 49 20 28 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
 qNum 30 -1.4426950408889634f32
 qNum 31 1.0f32
-qSig 35 48 30 31
-qic 32 48 48 35 0 qAlu4
-qic 32 48 48 49 0 qAlu4
-qMad 26 18 moeI 12
-qicImm 9 16 26 8 4 qAlu4
-qic 12 QZ 16 48 0 qSt
+qLit 29 moeI
+for r ulong 4
+upR = ulong 60
+if eq r 1
+upR = ulong 61
+end
+if eq r 2
+upR = ulong 17
+end
+if eq r 3
+upR = ulong 19
+end
+qSig 35 add 48 r 30 31
+qic 32 add 48 r add 48 r 35 0 qAlu4
+qic 32 add 48 r add 48 r upR 0 qAlu4
+qLit 26 r
+qIadd 26 18 26
+qic 28 QZ 26 29 0 qCmp
+skO = qBraFwd 1
+qMad 27 20 moeI 26
+qicImm 9 24 27 8 4 qAlu4
+qic 12 QZ 24 add 48 r 0 qSt
 qic 0 QZ QZ QZ 0 qW1
+qPatch skO 1
+end
 end
 
 note =========================================================================
-note Mode 425: uMoeNvfp4DnAdd -- Fused Top-K MoE NVFP4 down_proj + weighted sum + shared expert
-note Args: moe_mid[K,moeI] (R0:1), W_dn (R2:3), S_dn (R4:5), topk_ids[K] (R6:7),
-note       topk_w[K] (R8:9), sh_out[H] (R10:11), sh_gate_s[1] (R12:13), out[H] (56,60).
-note Grid: (ceil(H/8), 1, 1), Block: 256 (8 warps), SMEM: 64 (E2M1 LUT).
+note Mode 425: uMoeNvfp4DnAdd4R -- 4-row/warp LDG.E.64 + SMEM Fused Top-K MoE NVFP4 down_proj
+note   Supports BOTH B=1 (Grid.y = 1) AND B=8 (Grid.y = 8) in ONE launch!
+note Args: moe_mid[B,K,640] (R0:1), W_dn (R2:3), S_dn (R4:5), idsBase (R6:7), wBase[B,K] (R8:9),
+note       sh_out[B,H] (R10:11), sh_gate_s[B,1] (R12:13), out[B,H] (56,60), idsStride (64).
+note Grid: (ceil(H/32), B, 1), Block: 256 (8 warps x 4 rows = 32 rows/CTA), SMEM: 2688.
 note =========================================================================
-fn uMoeNvfp4DnAdd to void
+fn uMoeNvDn4SaveArgs to void
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+topK = get engSpec MS_TOPK
+qParam 55 64
+qMad 52 18 mul topK moeI QZ
+qicImm 9 0 52 0 4 qAlu1
+qMadReg 52 18 55 QZ
+qicImm 9 6 52 6 4 qAlu1
+qMad 52 18 topK QZ
+qicImm 9 8 52 8 4 qAlu1
+qMad 52 18 H QZ
+qicImm 9 10 52 10 4 qAlu1
+qicImm 9 12 18 12 4 qAlu4
+qLit 54 1
+bSv = qBssy
+qic 28 QZ 14 54 0 qCmp
+skSv = qBraFwd 1
+for i ulong 7
+qLit 52 add 2624 mul i 8
+qLit 53 add 2628 mul i 8
+qic 50 QZ 52 mul i 2 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qic 50 QZ 53 add mul i 2 1 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+qParam 52 56
+qParam 53 60
+qMad 54 18 H QZ
+qicImm 9 52 54 52 4 qAlu4
+qLit 54 2680
+qic 50 QZ 54 52 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 54 2684
+qic 50 QZ 54 53 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSv 1
+qBsync bSv
+qBar
+end
+
+fn uMoeNvDn4StageMid to void
+qLit 54 2624
+qLit 55 2628
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 21 640 QZ
+qMad 54 14 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 8 QZ
+qic 50 QZ 54 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 25 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qic 18 59 14 QZ 63 qAlu4
+qMad 54 21 640 QZ
+qLit 58 512
+qIadd 54 54 58
+qMad 54 59 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 59 8 QZ
+qLit 58 2048
+qIadd 54 54 58
+qic 50 QZ 54 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 58 4
+qIadd 54 54 58
+qic 50 QZ 54 25 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+end
+
+fn uMoeNvDn4Chunk0 expWOff ulong wStride ulong expSOff ulong sStride ulong to void
+qLit 54 2632
+qLit 55 2636
+qic 49 12 54 QZ 0 qLd
+qic 49 13 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 54 2640
+qLit 55 2644
+qic 49 8 54 QZ 0 qLd
+qic 49 9 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 58 20 expWOff QZ
+qMad 58 11 2 58
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMad 53 52 wStride 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qic 56 24 0 QZ 0 qLd
+qic 56 26 2 QZ 0 qLd
+qic 56 28 4 QZ 0 qLd
+qic 56 30 6 QZ 0 qLd
+qMad 52 20 expSOff QZ
+qMad 52 18 sStride 52
+qic 17 53 11 QZ 2 qAlu4
+qIadd 52 52 53
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+qic 11 12 32 QZ 0 qLd
+qic 11 13 34 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 37 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickNvfp4Scale 12 12 11
+uPickNvfp4Scale 13 13 11
+uPickNvfp4Scale 15 15 11
+uPickNvfp4Scale 37 37 11
+for r ulong 4
+wA = add 24 mul r 2
+wB = add 25 mul r 2
+sR = ulong 12
+accR = ulong 60
+if eq r 1
+sR = ulong 13
+accR = ulong 61
+end
+if eq r 2
+sR = ulong 15
+accR = ulong 17
+end
+if eq r 3
+sR = ulong 37
+accR = ulong 19
+end
+qNum 36 0.0f32
+uNvfp4Mac8Smem wA 10 0 2560 36
+uNvfp4Mac8Smem wB 10 32 2560 36
+qic 32 accR 36 sR 0 qAlu4
+end
+end
+
+fn uMoeNvDn4Chunk1 expWOff ulong wStride ulong expSOff ulong sStride ulong to void
+qLit 54 2632
+qLit 55 2636
+qic 49 12 54 QZ 0 qLd
+qic 49 13 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 58 20 expWOff QZ
+qic 17 59 11 QZ 1 qAlu4
+qIadd 58 58 59
+qLit 59 64
+qIadd 58 58 59
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMad 53 52 wStride 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qic 11 24 0 QZ 0 qLd
+qic 11 25 2 QZ 0 qLd
+qic 11 26 4 QZ 0 qLd
+qic 11 27 6 QZ 0 qLd
+qMad 52 20 expSOff QZ
+qMad 52 18 sStride 52
+qic 17 53 11 QZ 4 qAlu4
+qIadd 52 52 53
+qLit 53 8
+qIadd 52 52 53
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+qic 11 12 32 QZ 0 qLd
+qic 11 13 34 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 37 58 QZ 0 qLd
+qMad 39 11 16 QZ
+qLit 54 2048
+qIadd 39 39 54
+qic 58 40 39 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickW4Half 24 11
+uPickW4Half 25 11
+uPickW4Half 26 11
+uPickW4Half 27 11
+qic 17 38 11 QZ 2 qAlu4
+uPickNvfp4Scale 12 12 38
+uPickNvfp4Scale 13 13 38
+uPickNvfp4Scale 15 15 38
+uPickNvfp4Scale 37 37 38
+for r ulong 4
+sR = ulong 12
+accR = ulong 60
+if eq r 1
+sR = ulong 13
+accR = ulong 61
+end
+if eq r 2
+sR = ulong 15
+accR = ulong 17
+end
+if eq r 3
+sR = ulong 37
+accR = ulong 19
+end
+qNum 36 0.0f32
+uNvfp4Unpack4 add 24 r 40 2560 36
+qic4 33 accR 36 sR accR qAlu4
+end
+end
+
+fn uMoeNvfp4DnAdd4R to void
 H = get engSpec MS_H
 moeI = get engSpec MS_MOE_I
 topK = get engSpec MS_TOPK
 wStride = div moeI 8
 sStride = div moeI 64
-nIter = div moeI 128
 expWOff = mul H wStride
 expSOff = mul H sStride
 qStart 7
-uNvfp4InitLut 0
-qic 17 16 14 QZ 5 qAlu1
-qic 18 17 14 QZ 31 qAlu4
-qMad 18 15 8 16
-qLit 19 H
-qic 28 QZ 18 19 0 qCmp
-put q36Guard 0 1
-qic 45 QZ QZ QZ 0 qSafe
-qNum 48 0.0f32
-qLit 20 0
-qLit 21 topK
-qLit 22 1
+uNvfp4InitLut 2560
+uMoeNvDn4SaveArgs
+qic 17 52 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+qMad 10 11 64 QZ
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+qLit 21 0
+qLit 22 topK
+qLit 23 1
 mExp = get q36Pc 0
-qicImm 9 26 20 6 4 qW1
-qic 11 23 26 QZ 0 qLd
-qicImm 9 26 20 8 4 qW1
-qic 11 24 26 QZ 0 qLd
+uMoeNvDn4StageMid
+qLit 54 2648
+qLit 55 2652
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
 qic 0 QZ QZ QZ 0 qW0
-qMad 28 23 expWOff QZ
-qMad 28 18 wStride 28
-qic 17 29 17 QZ 1 qAlu4
-qIadd 28 28 29
-qicImm 9 26 28 2 4 qAlu4
-qMad 30 23 expSOff QZ
-qMad 30 18 sStride 30
-qic 17 31 17 QZ 4 qAlu4
-qIadd 30 30 31
-qicImm 9 28 30 4 4 qAlu4
-qMad 32 20 moeI QZ
-qMad 32 17 4 32
-qicImm 9 30 32 0 4 qAlu4
-qNum 49 0.0f32
-qLit 33 0
-qLit 34 nIter
-mK = get q36Pc 0
-qic 57 40 30 QZ 0 qLdW1
-qic 11 35 26 QZ 0 qLd
-qic 11 36 28 QZ 0 qLd
+qLit 54 2656
+qLit 55 2660
+qic 49 32 54 QZ 0 qLd
+qic 49 33 55 QZ 0 qLd
 qic 0 QZ QZ QZ 0 qW0
-uPickW4Half 35 17
-qic 17 44 17 QZ 2 qAlu4
-uPickNvfp4Scale 36 36 44
-uNvfp4Mac4Lane 35 36 0 49
-qicImm 9 30 22 30 512 qAlu1
-qicImm 9 26 22 26 64 qAlu1
-qicImm 9 28 22 28 8 qAlu4
-qIadd 33 33 22
-qic 28 QZ 33 34 0 qCmp
-put q36Guard 0 2
-qic 46 QZ QZ QZ sub mK get q36Pc 0 qAlu4
-qic4 33 48 49 24 48 qAlu4
-qIadd 20 20 22
-qic 28 QZ 20 21 0 qCmp
+qicImm 9 56 21 52 4 qW1
+qic 11 20 56 QZ 0 qLd
+qicImm 9 58 21 32 4 qW1
+qic 11 16 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qWall
+uMoeNvDn4Chunk0 expWOff wStride expSOff sStride
+uMoeNvDn4Chunk1 expWOff wStride expSOff sStride
+qic4 33 48 60 16 48 qAlu1
+qic4 33 49 61 16 49 qAlu1
+qic4 33 50 17 16 50 qAlu1
+qic4 33 51 19 16 51 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
 put q36Guard 0 2
 qic 46 QZ QZ QZ sub mExp get q36Pc 0 qAlu4
-qWarpRedSum 48 52 16
-qic 28 QZ 17 22 0 qCmp
+for r ulong 4
+qWarpRedSum add 48 r 24 16
+end
+qic 28 QZ 11 23 0 qCmp
 put q36Guard 0 1
 qic 45 QZ QZ QZ 0 qSafe
-qLit 25 0
-qicImm 9 26 25 12 4 qW1
-qic 11 35 26 QZ 0 qLd
-qicImm 9 26 18 10 4 qW1
-qic 11 36 26 QZ 0 qLd
+qLit 54 2672
+qLit 55 2676
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 54 2664
+qLit 55 2668
+qic 49 8 54 QZ 0 qLd
+qic 49 9 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 54 2680
+qLit 55 2684
+qic 49 26 54 QZ 0 qLd
+qic 49 27 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 11 35 52 QZ 0 qLd
 qic 0 QZ QZ QZ 0 qW0
 qNum 30 -1.4426950408889634f32
 qNum 31 1.0f32
 qSig 35 35 30 31
-qic4 33 48 36 35 48 qAlu4
-qParam 26 56
-qParam 27 60
-qicImm 9 26 18 26 4 qAlu4
-qic 12 QZ 26 48 0 qSt
+qLit 29 H
+for r ulong 4
+qLit 24 r
+qIadd 24 18 24
+qic 28 QZ 24 29 0 qCmp
+skO = qBraFwd 1
+qicImm 9 52 24 8 4 qW1
+qic 11 36 52 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic4 33 add 48 r 36 35 add 48 r qAlu4
+qicImm 9 54 24 26 4 qAlu4
+qic 12 QZ 54 add 48 r 0 qSt
 qic 0 QZ QZ QZ 0 qW1
+qPatch skO 1
+end
 end
 
 note =========================================================================
@@ -918,6 +1289,329 @@ qic 12 QZ 16 48 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
 
+note =========================================================================
+note Blackwell SM121 Native Hardware NVFP4 Tensor Core (OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X)
+note   Uses hardware F2FP.E4M3 (op 65) + F2FP.E2M1 (op 66) for FP32->NVFP4 activation quant (ACT_SHIFT=16)
+note   and OMMA.SF.16864 Tensor Core with W_nv4 (W_SHIFT=256) + 2^-12 epilogue scale!
+note =========================================================================
+fn q4OmmaCtrl rD ulong rA ulong rB ulong rSa ulong rSb ulong isFast ulong to void
+w = new ulong 4 0
+put w 0 or or 29823 shl and rD 255 16 shl and rA 255 24
+v1 = or 1879048192 and rB 255
+v1 = or v1 shl and rSa 255 8
+v1 = or v1 shl and rSb 255 20
+put w 1 v1
+put w 2 or 278016 and rD 255
+if eq isFast 1
+put w 3 qcw 8 7 7 0 0
+else
+put w 3 qcw 15 7 7 0 0
+end
+pc = get q36Pc 0
+base = mul pc 4
+for i ulong 4
+put q36Buf add base i get w i
+end
+put q36Pc 0 add pc 1
+end
+
+fn q4Nvfp4ActQuantPass to void
+note Input: R24 = x_f32 (32 lanes = 2 blocks of 16), R19 = lane, SMEM[0..1023] = engLut!
+note Output: R29 = packed 8x E2M1 u32, R27 = packed 2x UE4M3 lo16 (shifted by 16.0).
+qic 18 25 24 QZ 0x7fffffff qAlu4
+qic 60 26 25 QZ 8 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qic 37 25 25 26 0 qAlu4
+qic 60 26 25 QZ 4 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qic 37 25 25 26 0 qAlu4
+qic 60 26 25 QZ 2 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qic 37 25 25 26 0 qAlu4
+qic 60 26 25 QZ 1 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qic 37 25 25 26 0 qAlu4
+qNum 28 0.16666667f32
+qic 32 26 25 28 0 qAlu4
+qNum 28 0.001953125f32
+qic 37 26 26 28 0 qAlu4
+qNum 28 448.0f32
+qic 36 26 26 28 0 qAlu4
+qic 65 27 26 26 0 qAlu4
+qic 18 27 27 QZ 127 qAlu4
+qMad 28 27 4 QZ
+qic 49 26 28 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 40 26 26 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 24 24 26 0 qAlu4
+qic 60 28 24 QZ 1 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qic 66 29 28 24 0 qAlu4
+qic 18 29 29 QZ 255 qAlu4
+qic 60 30 29 QZ 2 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qMad 30 30 256 29
+qicImm 8 29 30 QZ 1 qAlu4
+qic 60 30 29 QZ 4 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qMad 30 30 65536 29
+qicImm 8 29 30 QZ 1 qAlu4
+qic 60 30 27 QZ 16 qShfl
+qic 0 QZ QZ QZ 0 qW0
+qMad 27 30 256 27
+end
+
+note =========================================================================
+note Mode 440: uF32ToNvfp4ActQuant -- Dynamic FP32 X[B,K] -> X_nv4[B,K/8] + Sx_nv4[B,K/64]
+note Args: X_f32 (R0:1), Lut[256] (R2:3), X_nv4 (R4:5), Sx_nv4 (R6:7), K (32).
+note Grid: (B, 1, 1), Block: 256 (8 warps), SMEM: 1024.
+note =========================================================================
+fn uF32ToNvfp4ActQuant to void
+qStart 4
+qParam 12 32
+qicImm 9 16 14 2 4 qAlu4
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 17 14 4 QZ
+qic 50 QZ 17 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qic 17 11 14 QZ 5 qAlu1
+qic 18 19 14 QZ 31 qAlu4
+qic 17 21 12 QZ 6 qAlu1
+qic 17 23 12 QZ 3 qAlu4
+qicImm 8 32 11 QZ 1 qAlu4
+qLit 33 1
+qLit 34 8
+mAc = get q36Pc 0
+qic 28 QZ 32 21 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for ps ulong 2
+qMadReg 36 15 12 QZ
+qMad 36 32 64 36
+if eq ps 1
+qLit 37 32
+qIadd 36 36 37
+end
+qIadd 36 36 19
+qicImm 9 16 36 0 4 qAlu4
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+q4Nvfp4ActQuantPass
+if eq ps 0
+qicImm 8 39 27 QZ 1 qAlu4
+else
+qMad 39 27 65536 39
+end
+bAw = qBssy
+qic 18 36 19 QZ 7 qAlu4
+qic 28 QZ 36 33 0 qCmp
+skAw = qBraFwd 1
+qic 17 37 19 QZ 3 qAlu4
+qMadReg 36 15 23 QZ
+qMad 36 32 8 36
+if eq ps 1
+qLit 38 4
+qIadd 36 36 38
+end
+qIadd 36 36 37
+qicImm 9 16 36 4 4 qAlu4
+qic 12 QZ 16 29 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skAw 1
+qBsync bAw
+end
+bAs = qBssy
+qic 28 QZ 19 33 0 qCmp
+skAs = qBraFwd 1
+qMadReg 36 15 21 32
+qicImm 9 16 36 6 4 qAlu4
+qic 12 QZ 16 39 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skAs 1
+qBsync bAs
+qIadd 32 32 34
+qic 46 QZ QZ QZ sub mAc get q36Pc 0 qAlu4
+end
+
+note =========================================================================
+note Mode 441: uNvfp4GemmM8Omma -- Native Blackwell OMMA.SF.16864 Tensor Core GEMM for B <= 8!
+note Args: X_nv4 (R0:1), Sx_nv4 (R2:3), W_nv4 (R4:5), S_nv4 (R6:7), Y_f32 (R8:9), K (40), N (44), B (48).
+note Grid: (ceil(N/64), 1, 1), Block: 128, SMEM: 2688, Regs: 64.
+note =========================================================================
+fn uNvM8StorePair tReg ulong accA ulong accB ulong to void
+bEt = qBssy
+qic 28 QZ tReg 19 0 qCmp
+skEt = qBraFwd 1
+qMadReg 56 tReg 32 QZ
+qIadd 57 56 15
+qicImm 9 48 57 8 4 qAlu4
+qIadd 57 56 37
+qicImm 9 50 57 8 4 qAlu4
+qic 28 QZ 15 32 0 qCmp
+put q36Guard 0 2
+qic 12 QZ 48 accA 0 qSt
+qic 28 QZ 37 32 0 qCmp
+put q36Guard 0 2
+qic 12 QZ 50 accB 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skEt 1
+qBsync bEt
+end
+
+fn uNvfp4GemmM8Omma to void
+qStart 5
+qParam 32 40
+qParam 33 44
+qParam 19 48
+qic 17 20 14 QZ 3 qAlu1
+qic 18 36 14 QZ 7 qAlu1
+qic 18 21 14 QZ 1 qAlu1
+qic 17 37 14 QZ 1 qAlu4
+qic 17 34 32 QZ 3 qAlu1
+qic 17 18 32 QZ 6 qAlu4
+qLit 38 0xffffffff
+qIadd 38 19 38
+qicImm 8 39 20 QZ 1 qAlu4
+qic 28 QZ 39 19 0 qCmp
+put q36Guard 0 1
+qicImm 8 39 38 QZ 1 qAlu4
+qMadReg 39 39 34 36
+qicImm 9 0 39 0 4 qAlu1
+qicImm 8 39 14 QZ 1 qAlu4
+qic 28 QZ 39 19 0 qCmp
+put q36Guard 0 1
+qicImm 8 39 38 QZ 1 qAlu4
+qMadReg 39 39 18 QZ
+qicImm 9 2 39 2 4 qAlu4
+qMad 38 15 64 37
+qLit 39 0xffffffff
+qIadd 39 33 39
+qic 28 QZ 38 33 0 qCmp
+put q36Guard 0 1
+qicImm 8 38 39 QZ 1 qAlu4
+qMad 40 21 4 QZ
+qMadReg 40 38 34 40
+qicImm 9 4 40 4 4 qAlu1
+qMadReg 41 38 18 QZ
+qicImm 9 6 41 6 4 qAlu4
+qLit 40 384
+qMad 10 14 16 40
+qLit 40 2432
+qMad 11 37 4 40
+qic 17 36 14 QZ 5 qAlu1
+qic 18 37 14 QZ 31 qAlu4
+qic 17 38 37 QZ 2 qAlu1
+qic 18 39 37 QZ 3 qAlu4
+qMad 37 36 16 38
+qMad 15 15 64 37
+qLit 40 384
+qMad 13 37 32 40
+qMad 13 39 4 13
+qic 18 40 39 QZ 1 qAlu4
+qMad 40 40 8 37
+qLit 41 2432
+qMad 16 40 4 41
+qMad 12 38 32 QZ
+qMad 12 39 4 12
+qLit 40 256
+qMad 22 38 4 40
+qNum 24 0.0f32
+qNum 25 0.0f32
+qNum 26 0.0f32
+qNum 27 0.0f32
+qLit 17 0
+mNvM8 = get q36Pc 0
+qic 57 48 4 QZ 0 qLd
+qLit 60 1
+qic 28 QZ 21 60 0 qCmp
+put q36Guard 0 2
+qic 11 52 6 QZ 0 qLd
+qLit 53 0
+qic 28 QZ 20 19 0 qCmp
+put q36Guard 0 2
+qic 11 53 0 QZ 0 qLd
+qLit 54 0
+qic 28 QZ 14 19 0 qCmp
+put q36Guard 0 2
+qic 11 54 2 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 60 4
+qIadd 58 10 60
+qIadd 59 58 60
+qIadd 60 59 60
+qic 50 QZ 10 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qic 50 QZ 58 49 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qic 50 QZ 59 50 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qic 50 QZ 60 51 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 60 64
+qic 28 QZ 14 60 0 qCmp
+qMad 58 14 4 QZ
+put q36Guard 0 2
+qic 50 QZ 58 53 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 60 8
+qic 28 QZ 14 60 0 qCmp
+qLit 61 256
+qMad 59 14 4 61
+put q36Guard 0 2
+qic 50 QZ 59 54 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 60 1
+qic 28 QZ 21 60 0 qCmp
+put q36Guard 0 2
+qic 50 QZ 11 52 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qLit 60 256
+qIadd 56 13 60
+qLit 60 16
+qIadd 57 13 60
+qIadd 58 56 60
+qIadd 59 12 60
+qic 49 40 13 QZ 0 qLd
+qic 49 41 56 QZ 0 qLd
+qic 49 42 57 QZ 0 qLd
+qic 49 43 58 QZ 0 qLd
+qic 49 44 16 QZ 0 qLd
+qic 49 28 12 QZ 0 qLd
+qic 49 29 59 QZ 0 qLd
+qic 49 30 22 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+q4OmmaCtrl 24 40 28 44 30 0
+qBar
+qLit 60 1
+qicImm 9 0 60 0 32 qAlu1
+qicImm 9 2 60 2 4 qAlu1
+qicImm 9 4 60 4 32 qAlu1
+qicImm 9 6 60 6 4 qAlu1
+qIadd 17 17 60
+qic 28 QZ 17 18 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mNvM8 get q36Pc 0 qAlu4
+note Scale accumulators by 2^-8 (compensating ACT_SHIFT=1 * W_SHIFT=256) once in epilogue!
+qNum 60 0.00390625f32
+qic 32 24 24 60 0 qAlu1
+qic 32 25 25 60 0 qAlu1
+qic 32 26 26 60 0 qAlu1
+qic 32 27 27 60 0 qAlu4
+qParam 32 44
+qic 18 35 14 QZ 3 qAlu4
+qMad 35 35 2 QZ
+qLit 60 1
+qIadd 36 35 60
+qLit 60 8
+qIadd 37 15 60
+uNvM8StorePair 35 24 26
+uNvM8StorePair 36 25 27
+end
+
 fn engNvfp4Kernel mode ulong to bool
 if eq mode 420
 uFp8ToNvfp4Quant
@@ -936,15 +1630,23 @@ uNvfp4GemmB8
 ret true
 end
 if eq mode 424
-uMoeNvfp4Gu
+uMoeNvfp4Gu4R
 ret true
 end
 if eq mode 425
-uMoeNvfp4DnAdd
+uMoeNvfp4DnAdd4R
 ret true
 end
 if eq mode 426
 uNvfp4GemvAnyK
+ret true
+end
+if eq mode 440
+uF32ToNvfp4ActQuant
+ret true
+end
+if eq mode 441
+uNvfp4GemmM8Omma
 ret true
 end
 ret false
