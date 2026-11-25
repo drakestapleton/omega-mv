@@ -148,6 +148,8 @@ const QP_LOGW4 ulong 204472320
 const QP_CIDS ulong 213057536
 const QP_CLOG ulong 213319680
 const QP_GDN_SNAP ulong 218103808
+const QP_X_NV4 ulong 220000000
+const QP_SX_NV4 ulong 225000000
 
 note MTP W4 + Speculative Snapshot layout
 const Q38_MTP_W4_BYTES ulong 268435456
@@ -219,6 +221,7 @@ global q38IoBuf uchar 1048576
 global q38ScaleOut uchar 524288
 global q38OutFd int 1
 global q38UseW4 ulong 1
+global q38UseNv4 ulong 1
 global q38UseMtp ulong 1
 global q38MtpReady ulong 1
 global q38MtpM ulong 1
@@ -424,6 +427,15 @@ q38RegKernel 37 2 226 10496
 put q38Regs 37 128
 note 38: q38Bf16ToW4QuantAnyK (BF16->W4 quantizer for mtp.fc [5120, 10240])
 q38RegKernel 38 2 227 0
+note 39: q38Fp8ToNvfp4Quant (on-GPU FP8->NVFP4 E2M1 + UE4M3 block-16 quantizer)
+q38RegKernel 39 2 228 1024
+note 40: q38Bf16ToNvfp4ActQuant (dynamic BF16->NVFP4 activation quantizer)
+q38RegKernel 40 2 229 1024
+note 41: q38PreNvfp4GemmSuper (128-tok/CTA L2-swizzled native OMMA.SF.16864.E2M1 prefill!)
+q38RegKernel 41 2 230 6912
+put q38Regs 41 128
+note 42: q38Nvfp4GemmM8Omma (100% coalesced native OMMA.SF.16864.E2M1 for B<=8!)
+q38RegKernel 42 2 231 2688
 end
 
 fn q38O idx ulong to ulong
@@ -987,6 +999,10 @@ q38Ptr wW4Va
 q38Ptr sW4Va
 q38Arg K
 q38Arg N
+if eq get q38UseNv4 0 1
+gx = div add N 7 8
+ret q38PktEmitGy 39 gx 1 256
+end
 gx = div add N 3 4
 ret q38PktEmitGy 15 gx 1 128
 end
@@ -1398,6 +1414,31 @@ end
 
 fn q38PreEmitGemm xBfVa ulong wVa ulong sVa ulong yVa ulong K uint N uint to bool
 B = get q38CurB 0
+if eq get q38UseNv4 0 1
+q38Ptr xBfVa
+q38Ptr mapaddr get q38Lut 0
+q38Ptr q38P QP_X_NV4
+q38Ptr q38P QP_SX_NV4
+q38Arg K
+if not q38PktEmitGy 40 B 1 256
+ret false
+end
+q38Ptr q38P QP_X_NV4
+q38Ptr q38P QP_SX_NV4
+q38Ptr wVa
+q38Ptr sVa
+q38Ptr yVa
+q38Arg K
+q38Arg N
+q38Arg B
+if le B 8
+gx = div add N 63 64
+ret q38PktEmitGy 42 gx 1 128
+end
+gx = div add N 63 64
+gy = div add B 127 128
+ret q38PktEmitGy 41 gy gx 128
+end
 q38Ptr xBfVa
 q38Ptr wVa
 q38Ptr sVa
@@ -1712,26 +1753,35 @@ ret true
 end
 
 fn q38QuantMtpFa wVa ulong sVa ulong to bool
+savNv4 = get q38UseNv4 0
+put q38UseNv4 0 0
 tVa = get q38TmpSlabVa 0
 q38PktStart
 if not q38EmitQuantFp8Mat add tVa F38_Q_W add sVa mul F38_Q_S 2 add wVa W4F_QKV_W add wVa W4F_QKV_S 5120 12288
+put q38UseNv4 0 savNv4
 ret false
 end
 if not q38EmitQuantFp8Mat add tVa F38_K_W add sVa mul F38_K_S 2 add wVa W4F_K_W add wVa W4F_K_S 5120 1024
+put q38UseNv4 0 savNv4
 ret false
 end
 if not q38EmitQuantFp8Mat add tVa F38_V_W add sVa mul F38_V_S 2 add wVa W4F_V_W add wVa W4F_V_S 5120 1024
+put q38UseNv4 0 savNv4
 ret false
 end
 if not q38EmitQuantFp8Mat add tVa F38_O_W add sVa mul F38_O_S 2 add wVa W4F_O_W add wVa W4F_O_S 6144 5120
+put q38UseNv4 0 savNv4
 ret false
 end
 if not q38EmitQuantFp8Mat add tVa F38_GU_W add sVa mul F38_GU_S 2 add wVa W4F_GU_W add wVa W4F_GU_S 5120 34816
+put q38UseNv4 0 savNv4
 ret false
 end
 if not q38EmitQuantFp8Mat add tVa F38_DN_W add sVa mul F38_DN_S 2 add wVa W4F_DN_W add wVa W4F_DN_S 17408 5120
+put q38UseNv4 0 savNv4
 ret false
 end
+put q38UseNv4 0 savNv4
 ret q38PktRun
 end
 
@@ -2237,7 +2287,27 @@ end
 if not q38PreEmitFinalHead 8
 ret false
 end
-ret q38PktFinish 6
+if not q38PktFinish 6
+ret false
+end
+if eq get q38UseNv4 0 1
+note Slot 10: NVFP4 B=1 OMMA.SF.16864 decode step!
+q38PktStartAt add q38O QI_PKT 46137344
+q38Ptr q38P QP_TOKS
+q38Ptr mapaddr get q38EmbBf16 0
+q38Ptr q38P QP_X
+if not q38PktEmitGy 33 1 1 256
+ret false
+end
+if not q38PreEmitAll64W4 1 true true
+ret false
+end
+if not q38PreEmitFinalHead 1
+ret false
+end
+ret q38PktFinish 10
+end
+ret true
 end
 ret true
 end
