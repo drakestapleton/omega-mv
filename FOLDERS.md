@@ -446,7 +446,7 @@ DUAL applicability experiment library (ARCH-0031 offline evidence lane): determi
 
 ## `src/osh/`
 
-osh (Omega-native shell, arch#158) lexer unit: layout list, generator, osh_lex.osc, C reference tokenizer
+osh (Omega-native shell, arch#158) pure seeded OM-2 core units (`osh_core.om`, `osh_layout.om`, `osh_lex.om`, `osh_parse.om`, `osh_expand.om`).
 
 ## `src/osh/host/`
 
