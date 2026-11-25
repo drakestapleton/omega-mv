@@ -1,0 +1,1576 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/bonsai.om: Pure Seeded-OM-2 Zero-CUDA Full-APU Ternary Bonsai 2.5 27B Engine!
+note Native 1.750000 bpw 896-Byte 4-Row Tiled PTQ1_0 + 64-Row/CTA Overlapped Double-Stream GEMV
+note + 1024-Block Walsh-Hadamard + BF16-State Grouped GDN + Uncached Host-Coherent APU Shm
+note + Full GB10 APU (20 ARMv9 Cores + 48 Blackwell SMs = 6,164 Cores Simultaneously)!
+
+const BW_XN_ROT ulong 98304
+const BW_Y_ROT ulong 950272
+const BW_SW_ROT ulong 1785856
+const BW_PARTS ulong 2039808
+const BW_SIGN5120 ulong 2113536
+const BW_SIGN6144 ulong 2146304
+const BW_SIGN17408 ulong 2179072
+
+note Uncached host-coherent bonApuShm (64 KiB) layout:
+note   0..20479     : xn_rot[5120] F32 (GPU -> 20 CPU workers)
+note   32768..32775 : gpu_best (val f32, idx u32)
+note   32784..32787 : pos u32 (CPU -> GPU FA kernels, uncached coherent!)
+note   40960..61439 : x_init[5120] F32 (CPU embed -> GPU EW_X, uncached coherent!)
+const APU_SHM_XROT ulong 0
+const APU_SHM_BEST ulong 32768
+const APU_SHM_POS ulong 32800
+const APU_SHM_MTP_POS ulong 32832
+const APU_SHM_XROT_M4 ulong 131072
+const APU_SHM_XINIT ulong 40960
+
+note Per-layer single-VA 896-B tiled PTQ1_0 pointers (100% 1.750000 bpw!)
+global bonA1T ulong 128
+global bonOT ulong 128
+global bonGuT ulong 128
+global bonDnT ulong 128
+
+global bonLmT ulong 1
+global bonLmNAll ulong 1
+global bonLmNGpu ulong 1
+global bonLmNCpu ulong 1
+global bonUseApu ulong 1
+
+global bonApuShm long 1
+global bonApuShmVa ulong 1
+
+global bonEmbRawOff ulong 1
+global bonLmRawOff ulong 1
+global bonEmbRowBuf uchar 1280
+global bonEmbF32 f32 5120
+
+note 4-row-group tiled loader buffers (up to 64 row-groups = 256 rows per I/O batch -> ~1 MB!)
+global bonRaw4Buf uchar 1048576
+global bonTileOut uchar 1048576
+
+note 20-core persistent Full-APU CPU worker pool (10x X925 + 10x A725)
+global bonApuReady ulong 1
+global bonPids long 20
+global bonGoFds int 20
+global bonResFds int 20
+global bonPipeMsg uchar 32
+global bonCpuX f32 5120
+global bonCpuX4 f32 20480
+global bonCpuAcc4 f32 4
+global bonCpuRowAcc f32 4
+global bonCpuBestV f32 4
+global bonCpuBestI ulong 4
+global bonCpuLut uchar 1280
+global bonCpuLutF f32 1280
+global bonCpuRawBuf uchar 4194304
+global bonCpuRowStart ulong 1
+global bonCpuRowCnt ulong 1
+global bonCpuScaleBuf f32 262144
+
+text gNmEmb "token_embd.weight"
+text gNmOut "output.weight"
+text gNmFNorm "output_norm.weight"
+text gSufInNorm "attn_norm.weight"
+text gSufPostNorm "post_attention_norm.weight"
+text gSufQ "attn_q.weight"
+text gSufK "attn_k.weight"
+text gSufV "attn_v.weight"
+text gSufO "attn_output.weight"
+text gSufQNorm "attn_q_norm.weight"
+text gSufKNorm "attn_k_norm.weight"
+text gSufQkv "attn_qkv.weight"
+text gSufZ "attn_gate.weight"
+text gSufSsmOut "ssm_out.weight"
+text gSufConv "ssm_conv1d.weight"
+text gSufSsmA "ssm_a"
+text gSufSsmDt "ssm_dt.bias"
+text gSufSsmNorm "ssm_norm.weight"
+text gSufAlpha "ssm_alpha.weight"
+text gSufBeta "ssm_beta.weight"
+text gSufGate "ffn_gate.weight"
+text gSufUp "ffn_up.weight"
+text gSufDn "ffn_down.weight"
+
+text bonMsgMode "quant_format    : PTQ1_0 896B-Tiled (1.75 bpw) + Hadamard-1024 + BF16-GDN + Full-APU (20 CPU + 48 SM)\n"
+text bonMsgApu "Full-APU split  : GPU_48SM_rows="
+text bonMsgApuCpu " CPU_20CORE_rows="
+text bonMsgMtp "mtp_draft_layer : "
+text bonDbgS "DBG "
+text bonDbgEq "="
+text bonDbgSp " "
+text bonDbgNl "\n"
+
+global bonCurMap long 1
+global bonCurOff ulong 1
+global bonCurVa ulong 1
+
+fn bonSlabAllocMap bytes ulong to bool
+al = mul div add bytes 4095 4096 4096
+cnt = get engSlabCnt 0
+if gt cnt 0
+last = sub cnt 1
+used = get engSlabUsed last
+if le add used al ENG_SLAB_SZ
+put engSlabUsed last add used al
+put bonCurMap 0 get engSlabMap last
+put bonCurOff 0 used
+put bonCurVa 0 add get engSlabVa last used
+ret true
+end
+end
+if ge cnt 16
+ret false
+end
+sm = nvalloc ENG_SLAB_SZ true
+if le sm 0
+ret false
+end
+sva = mapaddr sm
+put engSlabMap cnt sm
+put engSlabVa cnt sva
+put engSlabUsed cnt al
+put engSlabCnt 0 add cnt 1
+put bonCurMap 0 sm
+put bonCurOff 0 0
+put bonCurVa 0 sva
+ret true
+end
+
+fn bonLoadF32 tid ulong to ulong
+n = mul get ggDim0 tid get ggDim1 tid
+nb = mul n 4
+if not bonSlabAllocMap nb
+ret 0
+end
+dm = get bonCurMap 0
+doff = get bonCurOff 0
+va = get bonCurVa 0
+foff = add get ggDataStart 0 get ggTOff tid
+fd = get ggFd 0
+done = ulong 0
+while lt done nb bound 4096
+ch = sub nb done
+if gt ch 1048576
+ch = ulong 1048576
+end
+if ne pread fd engIoBuf 0 ch long add foff done long ch
+ret 0
+end
+if ne mapwrite dm add doff done engIoBuf 0 ch long ch
+ret 0
+end
+done = add done ch
+end
+ret va
+end
+
+fn bonPackF32ToBf16 elems ulong to void
+for i ulong elems bound 524288
+u = engGetU32Io mul i 4
+r = add u add 32767 and shr u 16 1
+bf = shr r 16
+put engWideBuf mul i 2 uchar and bf 255
+put engWideBuf add mul i 2 1 uchar and shr bf 8 255
+end
+end
+
+fn bonLoadGdnAbPart tid ulong dm long dstOff ulong elems ulong to bool
+f32B = mul elems 4
+bfB = mul elems 2
+foff = add get ggDataStart 0 get ggTOff tid
+if ne pread get ggFd 0 engIoBuf 0 f32B long foff long f32B
+ret false
+end
+bonPackF32ToBf16 elems
+ret eq mapwrite dm dstOff engWideBuf 0 bfB long bfB
+end
+
+fn bonLoadGdnAbBf16 L ulong to ulong
+tA = ggFindLayer L gSufAlpha
+tB = ggFindLayer L gSufBeta
+if or lt tA 0 lt tB 0
+ret 0
+end
+elems = mul get engSpec MS_GDN_NV get engSpec MS_H
+bfB = mul elems 2
+if not bonSlabAllocMap mul bfB 2
+ret 0
+end
+dm = get bonCurMap 0
+doff = get bonCurOff 0
+va = get bonCurVa 0
+if not bonLoadGdnAbPart ulong tA dm doff elems
+ret 0
+end
+if not bonLoadGdnAbPart ulong tB dm add doff bfB elems
+ret 0
+end
+ret va
+end
+
+fn bonCopySmall tid ulong dm long dstOff ulong nb ulong to bool
+foff = add get ggDataStart 0 get ggTOff tid
+got = pread get ggFd 0 engIoBuf 0 nb long foff
+if ne got long nb
+ret false
+end
+ret eq mapwrite dm dstOff engIoBuf 0 nb long nb
+end
+
+fn bonLoadGdnAlogDt L ulong to ulong
+tA = ggFindLayer L gSufSsmA
+tD = ggFindLayer L gSufSsmDt
+if or lt tA 0 lt tD 0
+ret 0
+end
+nb = mul get engSpec MS_GDN_NV 4
+if not bonSlabAllocMap mul nb 2
+ret 0
+end
+dm = get bonCurMap 0
+doff = get bonCurOff 0
+va = get bonCurVa 0
+if not bonCopySmall ulong tA dm doff nb
+ret 0
+end
+if not bonCopySmall ulong tD dm add doff nb nb
+ret 0
+end
+ret va
+end
+
+note =========================================================================
+note 896-Byte 4-Row Contiguous Tile PTQ1_0 Loader!
+note Packs every 4 rows x 8 blocks (4 x 1024 w = 896 B) into:
+note   [0..511]   : 32 lanes x 16 B (W_a -> 512 B coalesced LDG.E.128!)
+note   [512..767] : 32 lanes x  8 B (W_b -> 256 B coalesced LDG.E.64!)
+note   [768..895] : 32 lanes x  4 B (W_c -> 128 B coalesced LDG.E.32!)
+note =========================================================================
+global bonTDstMap long 1
+global bonTDstOff ulong 1
+global bonTResVa ulong 1
+
+fn bonCopyBlk28 src ulong tBase ulong lane ulong to void
+da = add tBase mul lane 16
+db = add add tBase 512 mul lane 8
+dc = add add tBase 768 mul lane 4
+for j ulong 16
+put bonTileOut add da j get bonRaw4Buf add src j
+end
+for j ulong 8
+put bonTileOut add db j get bonRaw4Buf add add src 16 j
+end
+for j ulong 4
+put bonTileOut add dc j get bonRaw4Buf add add src 24 j
+end
+end
+
+fn bonPackChunk4 rgRawOff ulong tBase ulong cByte ulong rowBytes ulong to void
+for sr ulong 4
+rOff = add add rgRawOff mul sr rowBytes cByte
+for blk ulong 8
+bonCopyBlk28 add rOff mul blk 28 tBase add mul sr 8 blk
+end
+end
+end
+
+fn bonPackOneTile4 rgRawOff ulong rgTileOff ulong nChunks ulong to void
+rowBytes = mul nChunks 224
+for c ulong nChunks bound 64
+bonPackChunk4 rgRawOff add rgTileOff mul c 896 mul c 224 rowBytes
+end
+end
+
+fn bonTileBatch foff ulong dstOff ulong cnt ulong nChunks ulong to bool
+rgBytes = mul nChunks 896
+nb = mul cnt rgBytes
+if ne pread get ggFd 0 bonRaw4Buf 0 nb long foff long nb
+ret false
+end
+for g ulong cnt bound 256
+bonPackOneTile4 mul g rgBytes mul g rgBytes nChunks
+end
+ret eq mapwrite get bonTDstMap 0 dstOff bonTileOut 0 nb long nb
+end
+
+fn bonStreamTiledRange tid ulong nRows ulong byteOff ulong to bool
+nChunks = div get ggDim0 tid 1024
+rgBytes = mul nChunks 896
+nRg = div nRows 4
+batchRg = div 1048576 rgBytes
+if eq batchRg 0
+batchRg = ulong 1
+end
+foff = add get ggDataStart 0 get ggTOff tid
+dstBase = add get bonTDstOff 0 byteOff
+done = ulong 0
+while lt done nRg bound 100000
+cnt = sub nRg done
+if gt cnt batchRg
+cnt = batchRg
+end
+if not bonTileBatch add foff mul done rgBytes add dstBase mul done rgBytes cnt nChunks
+ret false
+end
+done = add done cnt
+end
+ret true
+end
+
+fn bonAllocTiled totBytes ulong to bool
+if not bonSlabAllocMap totBytes
+ret false
+end
+put bonTDstMap 0 get bonCurMap 0
+put bonTDstOff 0 get bonCurOff 0
+put bonTResVa 0 get bonCurVa 0
+ret true
+end
+
+fn bonLoadTiled1 tid ulong to bool
+nb = mul div mul get ggDim0 tid get ggDim1 tid 128 28
+if not bonAllocTiled nb
+ret false
+end
+ret bonStreamTiledRange tid get ggDim1 tid 0
+end
+
+fn bonLoadTiled2 t0 ulong t1 ulong to bool
+b0 = mul div mul get ggDim0 t0 get ggDim1 t0 128 28
+b1 = mul div mul get ggDim0 t1 get ggDim1 t1 128 28
+if not bonAllocTiled add b0 b1
+ret false
+end
+if not bonStreamTiledRange t0 get ggDim1 t0 0
+ret false
+end
+ret bonStreamTiledRange t1 get ggDim1 t1 b0
+end
+
+fn bonLoadTiled3 t0 ulong t1 ulong t2 ulong to bool
+b0 = mul div mul get ggDim0 t0 get ggDim1 t0 128 28
+b1 = mul div mul get ggDim0 t1 get ggDim1 t1 128 28
+b2 = mul div mul get ggDim0 t2 get ggDim1 t2 128 28
+if not bonAllocTiled add add b0 b1 b2
+ret false
+end
+if not bonStreamTiledRange t0 get ggDim1 t0 0
+ret false
+end
+if not bonStreamTiledRange t1 get ggDim1 t1 b0
+ret false
+end
+ret bonStreamTiledRange t2 get ggDim1 t2 add b0 b1
+end
+
+fn bonLoadTiledSlice tid ulong nRows ulong to bool
+nb = mul div mul get ggDim0 tid nRows 128 28
+if not bonAllocTiled nb
+ret false
+end
+ret bonStreamTiledRange tid nRows 0
+end
+
+note =========================================================================
+note CPU-side PTQ1_0 embed dequant + inverse 1024-block FWHT -> uncached bonApuShm!
+note =========================================================================
+fn bonBuildCpuLut to void
+for bv ulong 256
+v = bv
+for tr ulong 5
+t = mul v 3
+xi = shr t 8
+v = and t 255
+put bonCpuLut add mul bv 5 tr uchar xi
+put bonCpuLutF add mul bv 5 tr sub f32 xi f32 1.0f32
+end
+end
+end
+
+fn bonFwht1024Cpu base ulong to void
+h = ulong 1
+while lt h 1024 bound 12
+step = shl h 1
+i = ulong 0
+while lt i 1024 bound 1024
+for j ulong h bound 512
+p0 = add base add i j
+p1 = add p0 h
+a = get bonEmbF32 p0
+b = get bonEmbF32 p1
+put bonEmbF32 p0 add a b
+put bonEmbF32 p1 sub a b
+end
+i = add i step
+end
+h = step
+end
+for j ulong 1024
+put bonEmbF32 add base j mul get bonEmbF32 add base j f32 0.03125f32
+end
+end
+
+fn bonEmbByte bv ulong dstOff ulong stride ulong cnt ulong d f32 to void
+lb = mul bv 5
+for tr ulong cnt bound 5
+w = get bonCpuLutF add lb tr
+put bonEmbF32 add dstOff mul tr stride mul w d
+end
+end
+
+fn bonDequantEmbBlk b ulong to void
+src = mul b 28
+h = or ulong get bonEmbRowBuf add src 26 shl ulong get bonEmbRowBuf add src 27 8
+d = bitcast f32 ggFp16ToF32Bits h
+base = mul b 128
+for m ulong 16
+bonEmbByte ulong get bonEmbRowBuf add src m add base m 16 5 d
+end
+for m ulong 8
+bonEmbByte ulong get bonEmbRowBuf add add src 16 m add add base 80 m 8 5 d
+end
+for j ulong 2
+bonEmbByte ulong get bonEmbRowBuf add add src 24 j add add base 120 j 2 4 d
+end
+end
+
+fn bonLoadEmbedCpu tok ulong to bool
+H = get engSpec MS_H
+nb = div H 128
+rowBytes = mul nb 28
+foff = add get bonEmbRawOff 0 mul tok rowBytes
+if ne pread get ggFd 0 bonEmbRowBuf 0 rowBytes long foff long rowBytes
+ret false
+end
+for b ulong nb bound 64
+bonDequantEmbBlk b
+end
+nblks = div H 1024
+for kb ulong nblks bound 8
+bonFwht1024Cpu mul kb 1024
+end
+for i ulong H bound 8192
+v = mul get bonEmbF32 i get ggSign5120 i
+engPutU32Io mul i 4 bitcast uint v
+end
+note Write to UNCACHED host-coherent bonApuShm + APU_SHM_XINIT (zero stale GPU L2!)
+ret eq mapwrite get bonApuShm 0 APU_SHM_XINIT engIoBuf 0 mul H 4 long mul H 4
+end
+
+fn bonSetPos pos ulong to bool
+engPutU32Io 0 uint pos
+note Write to UNCACHED host-coherent bonApuShm + APU_SHM_POS (zero stale GPU L2!)
+ret eq mapwrite get bonApuShm 0 APU_SHM_POS engIoBuf 0 4 4
+end
+
+note =========================================================================
+note Full-APU 20-Core CPU Pool (10x X925 @ 3.9 GHz + 10x A725 @ 2.8 GHz)
+note =========================================================================
+fn bonPinCore cpu ulong to void
+m = new uchar 8 0
+put m div cpu 8 uchar shl ulong 1 rem cpu 8
+r = cpuset 0 m 0 8
+end
+
+fn bonPutU32Msg off ulong v uint to void
+for j ulong 4
+put bonPipeMsg add off j uchar and shr v mul j 8 255
+end
+end
+
+fn bonGetU32Msg off ulong to uint
+b0 = uint get bonPipeMsg off
+b1 = shl uint get bonPipeMsg add off 1 8
+b2 = shl uint get bonPipeMsg add off 2 16
+b3 = shl uint get bonPipeMsg add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn bonGetI32 b view uchar * off ulong to int
+b0 = uint get b off
+b1 = shl uint get b add off 1 8
+b2 = shl uint get b add off 2 16
+b3 = shl uint get b add off 3 24
+ret int or or b0 b1 or b2 b3
+end
+
+fn bonWorkerLoadSlice r0 ulong rCnt ulong to void
+rowBytes = ulong 1120
+totB = mul rCnt rowBytes
+foff = add get bonLmRawOff 0 mul r0 rowBytes
+done = ulong 0
+while lt done totB bound 256
+ch = sub totB done
+if gt ch 1048576
+ch = ulong 1048576
+end
+got = pread get ggFd 0 bonCpuRawBuf done ch long add foff done
+if le got 0
+break
+end
+done = add done ulong got
+end
+nBlks = mul rCnt 40
+for b ulong nBlks bound 262144
+src = mul b 28
+dlo = ulong get bonCpuRawBuf add src 26
+dhi = ulong get bonCpuRawBuf add src 27
+put bonCpuScaleBuf b bitcast f32 ggFp16ToF32Bits or dlo shl dhi 8
+end
+put bonCpuRowStart 0 r0
+put bonCpuRowCnt 0 rCnt
+end
+
+fn bonCpuDotBlk blkIdx ulong xb ulong to f32
+src = mul blkIdx 28
+bsum = f32 0.0f32
+for m ulong 16
+lb = mul ulong get bonCpuRawBuf add src m 5
+xm = add xb m
+bsum = add bsum mul get bonCpuLutF lb get bonCpuX xm
+bsum = add bsum mul get bonCpuLutF add lb 1 get bonCpuX add xm 16
+bsum = add bsum mul get bonCpuLutF add lb 2 get bonCpuX add xm 32
+bsum = add bsum mul get bonCpuLutF add lb 3 get bonCpuX add xm 48
+bsum = add bsum mul get bonCpuLutF add lb 4 get bonCpuX add xm 64
+end
+for m ulong 8
+lb = mul ulong get bonCpuRawBuf add add src 16 m 5
+xm = add add xb 80 m
+bsum = add bsum mul get bonCpuLutF lb get bonCpuX xm
+bsum = add bsum mul get bonCpuLutF add lb 1 get bonCpuX add xm 8
+bsum = add bsum mul get bonCpuLutF add lb 2 get bonCpuX add xm 16
+bsum = add bsum mul get bonCpuLutF add lb 3 get bonCpuX add xm 24
+bsum = add bsum mul get bonCpuLutF add lb 4 get bonCpuX add xm 32
+end
+for j ulong 2
+lb = mul ulong get bonCpuRawBuf add add src 24 j 5
+xm = add add xb 120 j
+bsum = add bsum mul get bonCpuLutF lb get bonCpuX xm
+bsum = add bsum mul get bonCpuLutF add lb 1 get bonCpuX add xm 2
+bsum = add bsum mul get bonCpuLutF add lb 2 get bonCpuX add xm 4
+bsum = add bsum mul get bonCpuLutF add lb 3 get bonCpuX add xm 6
+end
+ret mul bsum get bonCpuScaleBuf blkIdx
+end
+
+fn bonCpuDotRow rIdx ulong to f32
+acc = f32 0.0f32
+blkBase = mul rIdx 40
+for b ulong 40
+acc = add acc bonCpuDotBlk add blkBase b mul b 128
+end
+ret acc
+end
+
+fn bonWorkerExecAt shmOff ulong resFd int to void
+rr = mapread get bonApuShm 0 shmOff engIoBuf 0 20480
+for i ulong 5120
+put bonCpuX i bitcast f32 engGetU32Io mul i 4
+end
+bestVal = f32 -1000000000.0f32
+bestIdx = ulong 0
+rc = get bonCpuRowCnt 0
+rs = get bonCpuRowStart 0
+for ri ulong rc bound 32768
+v = bonCpuDotRow ri
+if gt v bestVal
+bestVal = v
+bestIdx = add rs ri
+end
+end
+bonPutU32Msg 0 bitcast uint bestVal
+bonPutU32Msg 4 uint bestIdx
+wr = write resFd bonPipeMsg 0 8
+end
+
+fn bonCpuDotBlkM4A src ulong xb ulong to void
+s0 = f32 0.0f32
+s1 = f32 0.0f32
+s2 = f32 0.0f32
+s3 = f32 0.0f32
+for m ulong 16
+lb = mul ulong get bonCpuRawBuf add src m 5
+xm = add xb m
+w = get bonCpuLutF lb
+s0 = add s0 mul w get bonCpuX4 xm
+s1 = add s1 mul w get bonCpuX4 add xm 5120
+s2 = add s2 mul w get bonCpuX4 add xm 10240
+s3 = add s3 mul w get bonCpuX4 add xm 15360
+w = get bonCpuLutF add lb 1
+s0 = add s0 mul w get bonCpuX4 add xm 16
+s1 = add s1 mul w get bonCpuX4 add xm 5136
+s2 = add s2 mul w get bonCpuX4 add xm 10256
+s3 = add s3 mul w get bonCpuX4 add xm 15376
+w = get bonCpuLutF add lb 2
+s0 = add s0 mul w get bonCpuX4 add xm 32
+s1 = add s1 mul w get bonCpuX4 add xm 5152
+s2 = add s2 mul w get bonCpuX4 add xm 10272
+s3 = add s3 mul w get bonCpuX4 add xm 15392
+w = get bonCpuLutF add lb 3
+s0 = add s0 mul w get bonCpuX4 add xm 48
+s1 = add s1 mul w get bonCpuX4 add xm 5168
+s2 = add s2 mul w get bonCpuX4 add xm 10288
+s3 = add s3 mul w get bonCpuX4 add xm 15408
+w = get bonCpuLutF add lb 4
+s0 = add s0 mul w get bonCpuX4 add xm 64
+s1 = add s1 mul w get bonCpuX4 add xm 5184
+s2 = add s2 mul w get bonCpuX4 add xm 10304
+s3 = add s3 mul w get bonCpuX4 add xm 15424
+end
+put bonCpuAcc4 0 s0
+put bonCpuAcc4 1 s1
+put bonCpuAcc4 2 s2
+put bonCpuAcc4 3 s3
+end
+
+fn bonCpuDotBlkM4B src ulong xb ulong to void
+s0 = get bonCpuAcc4 0
+s1 = get bonCpuAcc4 1
+s2 = get bonCpuAcc4 2
+s3 = get bonCpuAcc4 3
+for m ulong 8
+lb = mul ulong get bonCpuRawBuf add add src 16 m 5
+xm = add add xb 80 m
+w = get bonCpuLutF lb
+s0 = add s0 mul w get bonCpuX4 xm
+s1 = add s1 mul w get bonCpuX4 add xm 5120
+s2 = add s2 mul w get bonCpuX4 add xm 10240
+s3 = add s3 mul w get bonCpuX4 add xm 15360
+w = get bonCpuLutF add lb 1
+s0 = add s0 mul w get bonCpuX4 add xm 8
+s1 = add s1 mul w get bonCpuX4 add xm 5128
+s2 = add s2 mul w get bonCpuX4 add xm 10248
+s3 = add s3 mul w get bonCpuX4 add xm 15368
+w = get bonCpuLutF add lb 2
+s0 = add s0 mul w get bonCpuX4 add xm 16
+s1 = add s1 mul w get bonCpuX4 add xm 5136
+s2 = add s2 mul w get bonCpuX4 add xm 10256
+s3 = add s3 mul w get bonCpuX4 add xm 15376
+w = get bonCpuLutF add lb 3
+s0 = add s0 mul w get bonCpuX4 add xm 24
+s1 = add s1 mul w get bonCpuX4 add xm 5144
+s2 = add s2 mul w get bonCpuX4 add xm 10264
+s3 = add s3 mul w get bonCpuX4 add xm 15384
+w = get bonCpuLutF add lb 4
+s0 = add s0 mul w get bonCpuX4 add xm 32
+s1 = add s1 mul w get bonCpuX4 add xm 5152
+s2 = add s2 mul w get bonCpuX4 add xm 10272
+s3 = add s3 mul w get bonCpuX4 add xm 15392
+end
+put bonCpuAcc4 0 s0
+put bonCpuAcc4 1 s1
+put bonCpuAcc4 2 s2
+put bonCpuAcc4 3 s3
+end
+
+fn bonCpuDotBlkM4C src ulong xb ulong to void
+s0 = get bonCpuAcc4 0
+s1 = get bonCpuAcc4 1
+s2 = get bonCpuAcc4 2
+s3 = get bonCpuAcc4 3
+for j ulong 2
+lb = mul ulong get bonCpuRawBuf add add src 24 j 5
+xm = add add xb 120 j
+w = get bonCpuLutF lb
+s0 = add s0 mul w get bonCpuX4 xm
+s1 = add s1 mul w get bonCpuX4 add xm 5120
+s2 = add s2 mul w get bonCpuX4 add xm 10240
+s3 = add s3 mul w get bonCpuX4 add xm 15360
+w = get bonCpuLutF add lb 1
+s0 = add s0 mul w get bonCpuX4 add xm 2
+s1 = add s1 mul w get bonCpuX4 add xm 5122
+s2 = add s2 mul w get bonCpuX4 add xm 10242
+s3 = add s3 mul w get bonCpuX4 add xm 15362
+w = get bonCpuLutF add lb 2
+s0 = add s0 mul w get bonCpuX4 add xm 4
+s1 = add s1 mul w get bonCpuX4 add xm 5124
+s2 = add s2 mul w get bonCpuX4 add xm 10244
+s3 = add s3 mul w get bonCpuX4 add xm 15364
+w = get bonCpuLutF add lb 3
+s0 = add s0 mul w get bonCpuX4 add xm 6
+s1 = add s1 mul w get bonCpuX4 add xm 5126
+s2 = add s2 mul w get bonCpuX4 add xm 10246
+s3 = add s3 mul w get bonCpuX4 add xm 15366
+end
+put bonCpuAcc4 0 s0
+put bonCpuAcc4 1 s1
+put bonCpuAcc4 2 s2
+put bonCpuAcc4 3 s3
+end
+
+fn bonCpuDotBlkM4 blkIdx ulong xb ulong to void
+src = mul blkIdx 28
+bonCpuDotBlkM4A src xb
+bonCpuDotBlkM4B src xb
+bonCpuDotBlkM4C src xb
+sc = get bonCpuScaleBuf blkIdx
+put bonCpuRowAcc 0 add get bonCpuRowAcc 0 mul get bonCpuAcc4 0 sc
+put bonCpuRowAcc 1 add get bonCpuRowAcc 1 mul get bonCpuAcc4 1 sc
+put bonCpuRowAcc 2 add get bonCpuRowAcc 2 mul get bonCpuAcc4 2 sc
+put bonCpuRowAcc 3 add get bonCpuRowAcc 3 mul get bonCpuAcc4 3 sc
+end
+
+fn bonWorkerExecM4 resFd int to void
+rr = mapread get bonApuShm 0 APU_SHM_XROT_M4 engIoBuf 0 81920
+for i ulong 20480
+put bonCpuX4 i bitcast f32 engGetU32Io mul i 4
+end
+put bonCpuBestV 0 f32 -1000000000.0f32
+put bonCpuBestV 1 f32 -1000000000.0f32
+put bonCpuBestV 2 f32 -1000000000.0f32
+put bonCpuBestV 3 f32 -1000000000.0f32
+put bonCpuBestI 0 0
+put bonCpuBestI 1 0
+put bonCpuBestI 2 0
+put bonCpuBestI 3 0
+rc = get bonCpuRowCnt 0
+rs = get bonCpuRowStart 0
+for ri ulong rc bound 32768
+put bonCpuRowAcc 0 f32 0.0f32
+put bonCpuRowAcc 1 f32 0.0f32
+put bonCpuRowAcc 2 f32 0.0f32
+put bonCpuRowAcc 3 f32 0.0f32
+for b ulong 40
+bonCpuDotBlkM4 add mul ri 40 b mul b 128
+end
+for m ulong 4
+if gt get bonCpuRowAcc m get bonCpuBestV m
+put bonCpuBestV m get bonCpuRowAcc m
+put bonCpuBestI m add rs ri
+end
+end
+end
+for m2 ulong 4
+bonPutU32Msg mul m2 8 bitcast uint get bonCpuBestV m2
+bonPutU32Msg add mul m2 8 4 uint get bonCpuBestI m2
+end
+wr = write resFd bonPipeMsg 0 32
+end
+
+fn bonWorkerLoop w ulong goFd int resFd int r0 ulong rCnt ulong to void
+bonPinCore w
+bonBuildCpuLut
+bonWorkerLoadSlice r0 rCnt
+put bonPipeMsg 0 1
+wr0 = write resFd bonPipeMsg 0 1
+for iter ulong 2000000
+rd = read goFd bonPipeMsg 0 1
+if or le rd 0 eq get bonPipeMsg 0 0
+exit 0
+end
+tag = ulong get bonPipeMsg 0
+if eq tag 2
+bonWorkerExecM4 resFd
+else
+bonWorkerExecAt APU_SHM_XROT resFd
+end
+end
+exit 0
+end
+
+fn bonClosePrevPipes w ulong to void
+for pw ulong w bound 20
+cp1 = fclose get bonGoFds pw
+cp2 = fclose get bonResFds pw
+end
+end
+
+fn bonSpawnOne w ulong cur ulong cnt ulong to void
+pGo = new uchar 8 0
+pRes = new uchar 8 0
+r1 = pipefds pGo 0 8 0
+r2 = pipefds pRes 0 8 0
+goRd = bonGetI32 pGo 0
+goWr = bonGetI32 pGo 4
+resRd = bonGetI32 pRes 0
+resWr = bonGetI32 pRes 4
+pid = fork
+if eq pid 0
+c1 = fclose goWr
+c2 = fclose resRd
+bonClosePrevPipes w
+bonWorkerLoop w goRd resWr cur cnt
+end
+c3 = fclose goRd
+c4 = fclose resWr
+put bonPids w pid
+put bonGoFds w goWr
+put bonResFds w resRd
+end
+
+fn bonApuInit to void
+if or eq get bonUseApu 0 0 eq get bonLmNCpu 0 0
+put bonApuReady 0 0
+ret
+end
+cur = get bonLmNGpu 0
+remW = ulong 30
+remR = get bonLmNCpu 0
+for w ulong 20
+wt = ulong 2
+if lt rem w 10 5
+wt = ulong 1
+end
+cnt = div mul remR wt remW
+if eq w 19
+cnt = remR
+end
+remR = sub remR cnt
+remW = sub remW wt
+bonSpawnOne w cur cnt
+cur = add cur cnt
+end
+for w ulong 20
+ack = read get bonResFds w bonPipeMsg 0 1
+end
+put bonApuReady 0 1
+end
+
+fn bonApuStop to void
+if eq get bonApuReady 0 0
+ret
+end
+st = new uchar 4 0
+put bonPipeMsg 0 0
+for w ulong 20
+wr = write get bonGoFds w bonPipeMsg 0 1
+c1 = fclose get bonGoFds w
+c2 = fclose get bonResFds w
+wp = waitpid int get bonPids w st 0 4 0
+end
+put bonApuReady 0 0
+end
+
+note =========================================================================
+note Kernel registration & command buffer emission
+note =========================================================================
+fn bonRegTernary kid ulong mode ulong smem ulong to void
+p = mul div add get engCodePos 0 255 256 256
+put engEntry kid p
+put engSmem kid smem
+put engCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+if not tTernaryKernel mode
+exit 4
+end
+q36Done
+end
+
+fn bonEmitAllKernels to void
+put engCodePos 0 0
+engRegKernel 0 1 200 4128
+engRegKernel 1 1 300 64
+engRegKernel 2 1 301 0
+engRegKernel 4 1 303 0
+engRegKernel 7 1 306 1088
+engRegKernel 8 1 307 1088
+engRegKernel 9 1 308 0
+engRegKernel 10 1 309 0
+engRegKernel 13 0 114 64
+bonRegTernary 15 400 4352
+bonRegTernary 16 401 4096
+bonRegTernary 17 402 31744
+bonRegTernary 18 403 4352
+bonRegTernary 19 404 2048
+bonRegTernary 20 405 0
+bonRegTernary 21 406 16960
+bonRegTernary 22 407 16960
+bonRegTernary 23 408 64
+bonRegTernary 24 409 64
+bonRegTernary 25 410 0
+bonRegTernary 26 411 0
+end
+
+fn bonEmitPtq1 xVa ulong wVa ulong outVa ulong K ulong N ulong to bool
+engPtr xVa
+engPtr wVa
+engPtr outVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 15 uint div add N 127 128 1 256
+end
+
+fn bonEmitFwht inVa ulong signVa ulong outVa ulong K ulong to bool
+engPtr inVa
+engPtr signVa
+engPtr outVa
+engArg uint K
+engArg 0
+ret engPktEmitGy 16 uint div K 1024 1 256
+end
+
+fn bonEmitFaAttnSub L ulong faIdx ulong to bool
+nQ = get engSpec MS_NQ
+nKV = get engSpec MS_NKV
+hd = get engSpec MS_HD
+kBase = get engKvVa faIdx
+vBase = add kBase div get engKvSlabBytes 0 2
+kInVa = add engW EW_QKV mul mul nQ mul hd 2 4
+vInVa = add kInVa mul mul nKV hd 4
+posVa = engW EW_POS
+engPtr kInVa
+engPtr vInVa
+engPtr get engLKNormVa L
+engPtr get engRopeVa 0
+engPtr kBase
+engPtr vBase
+engPtr posVa
+if not engPktEmitGy 7 uint nKV 1 uint hd
+ret false
+end
+engPtr engW EW_QKV
+engPtr get engLQNormVa L
+engPtr get engRopeVa 0
+engPtr engW EW_QROT
+engPtr posVa
+if not engPktEmitGy 8 uint nQ 1 uint hd
+ret false
+end
+engPtr engW EW_QROT
+engPtr kBase
+engPtr vBase
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr posVa
+if not engPktEmitGy 9 uint nQ 8 32
+ret false
+end
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr engW EW_QKV
+engPtr engW EW_Y
+engArg 8
+ret engPktEmitGy 10 uint nQ 1 uint hd
+end
+
+fn bonEmitFaLayer L ulong faIdx ulong to bool
+H = get engSpec MS_H
+oK = mul get engSpec MS_NQ get engSpec MS_HD
+qkvN = add mul oK 2 mul mul get engSpec MS_NKV get engSpec MS_HD 2
+if not bonEmitFwht engW EW_XN engW BW_SIGN5120 engW BW_XN_ROT H
+ret false
+end
+if not bonEmitPtq1 engW BW_XN_ROT get bonA1T L engW EW_QKV H qkvN
+ret false
+end
+if not bonEmitFaAttnSub L faIdx
+ret false
+end
+if not bonEmitFwht engW EW_Y engW BW_SIGN6144 engW BW_Y_ROT oK
+ret false
+end
+ret bonEmitPtq1 engW BW_Y_ROT get bonOT L engW EW_AOUT oK H
+end
+
+fn bonEmitGdnCore L ulong gdnIdx ulong to bool
+H = get engSpec MS_H
+nV = get engSpec MS_GDN_NV
+qkvN = add mul get engSpec MS_GDN_NK 256 mul nV 128
+engPtr get engLA4WVa L
+engPtr engW EW_XN
+engPtr engW EW_AB
+engArg uint H
+engArg uint mul nV 2
+if not engPktEmitGy 4 uint div add mul nV 2 7 8 1 256
+ret false
+end
+engPtr engW EW_QKV
+engPtr get engLA4SVa L
+engPtr add get engGdnTailVa 0 mul gdnIdx mul qkvN 12
+if not engPktEmitGy 13 uint div qkvN 128 1 128
+ret false
+end
+engPtr engW EW_QKV
+engPtr add engW EW_QKV mul qkvN 4
+engPtr engW EW_AB
+engPtr get engLKNormVa L
+engPtr add get engGdnStateVa 0 mul gdnIdx mul nV 32768
+engPtr get engLQNormVa L
+engPtr engW EW_Y
+ret engPktEmitGy 17 uint nV 1 128
+end
+
+fn bonEmitGdnLayer L ulong gdnIdx ulong to bool
+H = get engSpec MS_H
+zN = mul get engSpec MS_GDN_NV 128
+qkvzN = add add mul get engSpec MS_GDN_NK 256 zN zN
+if not bonEmitFwht engW EW_XN engW BW_SIGN5120 engW BW_XN_ROT H
+ret false
+end
+if not bonEmitPtq1 engW BW_XN_ROT get bonA1T L engW EW_QKV H qkvzN
+ret false
+end
+if not bonEmitGdnCore L gdnIdx
+ret false
+end
+if not bonEmitFwht engW EW_Y engW BW_SIGN6144 engW BW_Y_ROT zN
+ret false
+end
+ret bonEmitPtq1 engW BW_Y_ROT get bonOT L engW EW_AOUT zN H
+end
+
+fn bonEmitMlpLayer L ulong to bool
+H = get engSpec MS_H
+I = get engSpec MS_I
+if not engEmitRmsNormAdd get engLPostNormVa L 1
+ret false
+end
+if not bonEmitFwht engW EW_XN engW BW_SIGN5120 engW BW_XN_ROT H
+ret false
+end
+if not bonEmitPtq1 engW BW_XN_ROT get bonGuT L engW EW_GU H mul I 2
+ret false
+end
+engPtr engW EW_GU
+engPtr engW EW_SW
+engArg uint I
+if not engPktEmitGy 2 uint div I 256 1 256
+ret false
+end
+if not bonEmitFwht engW EW_SW engW BW_SIGN17408 engW BW_SW_ROT I
+ret false
+end
+ret bonEmitPtq1 engW BW_SW_ROT get bonDnT L engW EW_AOUT I H
+end
+
+fn bonEmitTrunk to bool
+H = get engSpec MS_H
+note Copy uncached host-coherent bonApuShm -> GPU-cached EW_X & EW_POS (0.5 us, ZERO stale L2!)
+engPtr add get bonApuShmVa 0 APU_SHM_XINIT
+engPtr engW EW_X
+engArg uint H
+if not engPktEmitGy 20 uint div H 256 1 256
+ret false
+end
+engPtr add get bonApuShmVa 0 APU_SHM_POS
+engPtr engW EW_POS
+engArg 1
+if not engPktEmitGy 20 1 1 256
+ret false
+end
+nL = get engSpec MS_LAYERS
+faIdx = ulong 0
+gdnIdx = ulong 0
+for L ulong nL bound 128
+doAdd = uint 1
+if eq L 0
+doAdd = 0
+end
+if not engEmitRmsNormAdd get engLInNormVa L doAdd
+ret false
+end
+if eq get engLayerKind L 0
+if not bonEmitFaLayer L faIdx
+ret false
+end
+faIdx = add faIdx 1
+else
+if not bonEmitGdnLayer L gdnIdx
+ret false
+end
+gdnIdx = add gdnIdx 1
+end
+if not bonEmitMlpLayer L
+ret false
+end
+end
+ret true
+end
+
+fn bonEmitLmHead nRows ulong to bool
+H = get engSpec MS_H
+nParts = div add nRows 127 128
+engPtr engW BW_XN_ROT
+engPtr get bonLmT 0
+engPtr engW BW_PARTS
+engArg uint H
+engArg uint nRows
+if not engPktEmitGy 18 uint nParts 1 256
+ret false
+end
+engPtr engW BW_PARTS
+engPtr add get bonApuShmVa 0 APU_SHM_BEST
+engArg uint nParts
+ret engPktEmitGy 19 1 1 256
+end
+
+fn bonRecordPackets to bool
+H = get engSpec MS_H
+engPktStartAt EW_PKT
+if not bonEmitTrunk
+ret false
+end
+if not engEmitRmsNormAdd engW EW_FNORM 1
+ret false
+end
+if not bonEmitFwht engW EW_XN engW BW_SIGN5120 engW BW_XN_ROT H
+ret false
+end
+engPtr engW BW_XN_ROT
+engPtr add get bonApuShmVa 0 APU_SHM_XROT
+engArg uint H
+if not engPktEmitGy 20 uint div H 256 1 256
+ret false
+end
+if not engPktFinish 0
+ret false
+end
+engPktStartAt add EW_PKT 4194304
+if not bonEmitTrunk
+ret false
+end
+if not engEmitRmsNormAdd engW EW_FNORM 1
+ret false
+end
+if not engPktFinish 1
+ret false
+end
+engPktStartAt add EW_PKT 8388608
+if not bonEmitLmHead get bonLmNGpu 0
+ret false
+end
+if not engPktFinish 2
+ret false
+end
+engPktStartAt add EW_PKT 12582912
+if not bonEmitTrunk
+ret false
+end
+if not engEmitRmsNormAdd engW EW_FNORM 1
+ret false
+end
+if not bonEmitFwht engW EW_XN engW BW_SIGN5120 engW BW_XN_ROT H
+ret false
+end
+if not bonEmitLmHead get bonLmNGpu 0
+ret false
+end
+ret engPktFinish 3
+end
+
+fn bonGpuInitKvGdn to int
+ropeBytes = mul get engSpec MS_MAX_CTX mul get engSpec MS_ROPE_DIMS 4
+put engRopeMap 0 nvalloc ropeBytes true
+if le get engRopeMap 0 0
+ret 10
+end
+put engRopeVa 0 mapaddr get engRopeMap 0
+nGdn = get engSpec MS_N_GDN
+nK = get engSpec MS_GDN_NK
+nV = get engSpec MS_GDN_NV
+qkvN = add mul nK 256 mul nV 128
+put engGdnStateMap 0 nvalloc mul nGdn mul nV 32768 true
+if le get engGdnStateMap 0 0
+ret 10
+end
+put engGdnStateVa 0 mapaddr get engGdnStateMap 0
+put engGdnTailMap 0 nvalloc mul div add mul nGdn mul qkvN 12 65535 65536 65536 true
+if le get engGdnTailMap 0 0
+ret 10
+end
+put engGdnTailVa 0 mapaddr get engGdnTailMap 0
+kvBytes = mul get engSpec MS_MAX_CTX mul get engSpec MS_NKV mul get engSpec MS_HD 8
+put engKvSlabBytes 0 kvBytes
+nFa = add get engSpec MS_N_FA get ggHasMtp 0
+for fi ulong nFa bound 64
+km = nvalloc kvBytes true
+if le km 0
+ret 11
+end
+put engKvMap fi km
+put engKvVa fi mapaddr km
+end
+put engSlabCnt 0 0
+if not bmAllocGpu
+ret 12
+end
+ret 0
+end
+
+fn bonGpuInit to int
+put engUseStrictSync 0 1
+if not gbopen 1
+ret 2
+end
+if not gbbopen
+ret 3
+end
+put engCodeMap 0 0
+bonEmitAllKernels
+csize = mul div add get engCodePos 0 4095 4096 4096
+cm = nvalloc csize false
+if le cm 0
+ret 4
+end
+put engCodeMap 0 cm
+put engCodeFail 0 0
+bonEmitAllKernels
+if ne get engCodeFail 0 0
+ret 5
+end
+put engWork 0 nvalloc ENG_WORK_BYTES true
+if le get engWork 0 0
+ret 7
+end
+put engWorkVa 0 mapaddr get engWork 0
+put bonApuShm 0 nvalloc 262144 false
+if le get bonApuShm 0 0
+ret 7
+end
+put bonApuShmVa 0 mapaddr get bonApuShm 0
+ret bonGpuInitKvGdn
+end
+
+fn bonUploadSigns to bool
+for i ulong 5120
+engPutU32Io mul i 4 bitcast uint get ggSign5120 i
+end
+if ne mapwrite get engWork 0 BW_SIGN5120 engIoBuf 0 20480 20480
+ret false
+end
+for i ulong 6144
+engPutU32Io mul i 4 bitcast uint get ggSign6144 i
+end
+if ne mapwrite get engWork 0 BW_SIGN6144 engIoBuf 0 24576 24576
+ret false
+end
+for i ulong 17408
+engPutU32Io mul i 4 bitcast uint get ggSign17408 i
+end
+if ne mapwrite get engWork 0 BW_SIGN17408 engIoBuf 0 69632 69632
+ret false
+end
+ret true
+end
+
+fn bonLoadFaSub L ulong to bool
+tQ = ggFindLayer L gSufQ
+tK = ggFindLayer L gSufK
+tV = ggFindLayer L gSufV
+if or lt tQ 0 or lt tK 0 lt tV 0
+ret false
+end
+if not bonLoadTiled3 ulong tQ ulong tK ulong tV
+ret false
+end
+put bonA1T L get bonTResVa 0
+tO = ggFindLayer L gSufO
+if lt tO 0
+ret false
+end
+if not bonLoadTiled1 ulong tO
+ret false
+end
+put bonOT L get bonTResVa 0
+tQn = ggFindLayer L gSufQNorm
+tKn = ggFindLayer L gSufKNorm
+if or lt tQn 0 lt tKn 0
+ret false
+end
+vaQn = bonLoadF32 ulong tQn
+vaKn = bonLoadF32 ulong tKn
+if or eq vaQn 0 eq vaKn 0
+ret false
+end
+put engLQNormVa L vaQn
+put engLKNormVa L vaKn
+ret true
+end
+
+fn bonLoadGdnSub L ulong to bool
+tQkv = ggFindLayer L gSufQkv
+tZ = ggFindLayer L gSufZ
+if or lt tQkv 0 lt tZ 0
+ret false
+end
+if not bonLoadTiled2 ulong tQkv ulong tZ
+ret false
+end
+put bonA1T L get bonTResVa 0
+tO = ggFindLayer L gSufSsmOut
+if lt tO 0
+ret false
+end
+if not bonLoadTiled1 ulong tO
+ret false
+end
+put bonOT L get bonTResVa 0
+tConv = ggFindLayer L gSufConv
+tSn = ggFindLayer L gSufSsmNorm
+if or lt tConv 0 lt tSn 0
+ret false
+end
+va0 = bonLoadF32 ulong tConv
+if eq va0 0
+ret false
+end
+put engLA4SVa L va0
+va0 = bonLoadF32 ulong tSn
+if eq va0 0
+ret false
+end
+put engLQNormVa L va0
+va0 = bonLoadGdnAbBf16 L
+if eq va0 0
+ret false
+end
+put engLA4WVa L va0
+va0 = bonLoadGdnAlogDt L
+if eq va0 0
+ret false
+end
+put engLKNormVa L va0
+ret true
+end
+
+fn bonLoadMlpSub L ulong to bool
+tG = ggFindLayer L gSufGate
+tU = ggFindLayer L gSufUp
+if or lt tG 0 lt tU 0
+ret false
+end
+if not bonLoadTiled2 ulong tG ulong tU
+ret false
+end
+put bonGuT L get bonTResVa 0
+tD = ggFindLayer L gSufDn
+if lt tD 0
+ret false
+end
+if not bonLoadTiled1 ulong tD
+ret false
+end
+put bonDnT L get bonTResVa 0
+ret true
+end
+
+fn bonLoadLayer L ulong to bool
+tIn = ggFindLayer L gSufInNorm
+tPost = ggFindLayer L gSufPostNorm
+if or lt tIn 0 lt tPost 0
+ret false
+end
+vaIn = bonLoadF32 ulong tIn
+vaPost = bonLoadF32 ulong tPost
+if or eq vaIn 0 eq vaPost 0
+ret false
+end
+put engLInNormVa L vaIn
+put engLPostNormVa L vaPost
+if eq get engLayerKind L 0
+if not bonLoadFaSub L
+ret false
+end
+else
+if not bonLoadGdnSub L
+ret false
+end
+end
+ret bonLoadMlpSub L
+end
+
+fn bonLoadAll to int
+bonBuildCpuLut
+if not engUploadRope
+ret 13
+end
+if not bonUploadSigns
+ret 13
+end
+tEmb = ggFindExact gNmEmb len gNmEmb
+tOut = ggFindExact gNmOut len gNmOut
+tFn = ggFindExact gNmFNorm len gNmFNorm
+if or lt tEmb 0 or lt tOut 0 lt tFn 0
+ret 14
+end
+put bonEmbRawOff 0 add get ggDataStart 0 get ggTOff ulong tEmb
+put bonLmRawOff 0 add get ggDataStart 0 get ggTOff ulong tOut
+H = get engSpec MS_H
+V = get engSpec MS_VOCAB
+put bonLmNAll 0 V
+if eq get bonUseApu 0 1
+if eq get bonLmNCpu 0 0
+put bonLmNCpu 0 512
+end
+if ge get bonLmNCpu 0 V
+put bonLmNCpu 0 0
+end
+note Keep bonLmNGpu a multiple of 4 for 4-row tiled PTQ1_0!
+ng = mul div sub V get bonLmNCpu 0 4 4
+put bonLmNGpu 0 ng
+put bonLmNCpu 0 sub V ng
+else
+put bonLmNCpu 0 0
+put bonLmNGpu 0 V
+end
+if not bonCopySmall ulong tFn get engWork 0 EW_FNORM mul H 4
+ret 14
+end
+if not bonLoadTiledSlice ulong tOut get bonLmNAll 0
+ret 14
+end
+put bonLmT 0 get bonTResVa 0
+nL = get engSpec MS_LAYERS
+for L ulong nL bound 128
+if not bonLoadLayer L
+ret 15
+end
+end
+if not bonRecordPackets
+ret 16
+end
+if not bmLoadAndRecord
+ret 17
+end
+bonApuInit
+ret 0
+end
+
+fn bonResetState to void
+if gt get engSlotLen 16 0
+okZ = engReplayPre 16
+put engCurPos 0 0
+ret
+end
+for i ulong 65536
+put engIoBuf i 0
+end
+nGdn = get engSpec MS_N_GDN
+nV = get engSpec MS_GDN_NV
+nK = get engSpec MS_GDN_NK
+sTot = mul nGdn mul nV 32768
+engZeroMap get engGdnStateMap 0 div add sTot 65535 65536
+qkvN = add mul nK 256 mul nV 128
+tTot = mul nGdn mul qkvN 12
+engZeroMap get engGdnTailMap 0 div add tTot 65535 65536
+put engCurPos 0 0
+end
+
+fn bonStepDecode to ulong
+if eq get bonApuReady 0 0
+if not engReplayPre 3
+ret 999999
+end
+if ne mapread get bonApuShm 0 APU_SHM_BEST engIoBuf 0 8 8
+ret 999999
+end
+ret ulong engGetU32Io 4
+end
+if not engReplayPre 0
+ret 999999
+end
+r0 = mapset get gbmem 2 8192 4 0
+r1 = mapset get gbmem 3 0 4 0
+r2 = mapset get gbmem 3 16 4 0
+if not nvsend get engWork 0 get engSlotOff 2 uint div get engSlotLen 2 4
+ret 999999
+end
+put bonPipeMsg 0 1
+for w ulong 20
+wr = write get bonGoFds w bonPipeMsg 0 1
+end
+if not engWaitFast 10000000000
+ret 999999
+end
+if ne mapread get bonApuShm 0 APU_SHM_BEST engIoBuf 0 8 8
+ret 999999
+end
+bestVal = bitcast f32 engGetU32Io 0
+bestIdx = ulong engGetU32Io 4
+for w ulong 20
+rd = read get bonResFds w bonPipeMsg 0 8
+fv = bitcast f32 bonGetU32Msg 0
+idx = ulong bonGetU32Msg 4
+if gt fv bestVal
+bestVal = fv
+bestIdx = idx
+end
+end
+ret bestIdx
+end
+
+fn bonPrefillAndFirst ntok ulong to ulong
+bonResetState
+for i ulong ntok bound 4096
+if not bonLoadEmbedCpu ulong get engTokSeq i
+ret 999999
+end
+if not bonSetPos i
+ret 999999
+end
+if eq add i 1 ntok
+tok = bonStepDecode
+put engCurPos 0 ntok
+ret tok
+else
+if not engReplayPre 1
+ret 999999
+end
+end
+end
+ret 999999
+end
+
+global bonProfUs ulong 8
+text bonDbgM4 "M4_PROBE (copy rms fwht ptq1M4_ok ptq1M4_us gdnM4 faM4 mlpM4 s6_ok s6_us mtp4_ok mtp4_us): "
+text bonP1 "PROF_1TOK: trunk_us="
+text bonP2 " lm_gpu_us="
+text bonP3 " ptq1_34816x5120_us="
+text bonP4 " fwht5120_us="
+text bonP5 " gdn_layer_us="
+text bonP6 " fa_layer_us="
+text bonP7 " mlp_layer_us="
+
+fn bonBenchSlot slot ulong reps ulong idx ulong to void
+ok = engReplayPre slot
+t0 = ulong monons
+for r ulong reps bound 128
+ok = engReplayPre slot
+end
+t1 = ulong monons
+put bonProfUs idx div sub t1 t0 mul reps 1000
+end
+
+fn bonProfileSteps to void
+bonResetState
+ok = bonLoadEmbedCpu 760
+ok = bonSetPos 0
+bonBenchSlot 0 2 0
+bonBenchSlot 2 2 1
+engPktStartAt add EW_PKT 54525952
+ok = bonEmitPtq1 engW BW_XN_ROT get bonGuT 0 engW EW_GU 5120 34816
+ok = engPktFinish 0
+bonBenchSlot 0 10 2
+engPktStartAt add EW_PKT 54525952
+ok = bonEmitFwht engW EW_XN engW BW_SIGN5120 engW BW_XN_ROT 5120
+ok = engPktFinish 0
+bonBenchSlot 0 50 3
+engPktStartAt add EW_PKT 54525952
+ok = bonEmitGdnLayer 0 0
+ok = engPktFinish 0
+bonBenchSlot 0 10 4
+engPktStartAt add EW_PKT 54525952
+ok = bonEmitFaLayer 3 0
+ok = engPktFinish 0
+bonBenchSlot 0 10 5
+engPktStartAt add EW_PKT 54525952
+ok = bonEmitMlpLayer 0
+ok = engPktFinish 0
+bonBenchSlot 0 10 6
+engPrint bonP1
+engPrintU get bonProfUs 0
+engPrint bonP2
+engPrintU get bonProfUs 1
+engPrint bonP3
+engPrintU get bonProfUs 2
+engPrint bonP4
+engPrintU get bonProfUs 3
+engPrint bonP5
+engPrintU get bonProfUs 4
+engPrint bonP6
+engPrintU get bonProfUs 5
+engPrint bonP7
+engPrintU get bonProfUs 6
+engPrint bonDbgNl
+end

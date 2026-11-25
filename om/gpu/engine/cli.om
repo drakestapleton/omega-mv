@@ -7,6 +7,9 @@ note   omega-engine serve   <model-dir> [--port PORT] [--self-test]
 
 global ecPort ulong 1
 global ecSelfTest ulong 1
+global ecUseLong ulong 1
+global ecStreamFd int 1
+global ecMsgOutCnt ulong 1
 global ecMode ulong 1
 global ecGenN ulong 1
 global ecReqBuf uchar 262144
@@ -70,6 +73,7 @@ text ecKPlanQ4 "kernel_plan     : FULL-APU (20 ARMv9 CPU + 48 SM121 = 6,164 core
 text ecLay0 "single-file (model.safetensors)"
 text ecLay1 "sharded-hf (model.safetensors.index.json)"
 text ecLay2 "omega-per-layer (outside + layers-L.safetensors)"
+text ecLayGguf "gguf-v3 (PTQ1_0 1.75bpw + blk.64 Q4_0 MTP)"
 text ecLoading "Specializing SM121 SASS kernels & loading weights into GB10 UVM...\n"
 text ecLoaded "Engine ready in ms="
 text ecRunStat "OMEGA_ENGINE_RUN: gen_tokens="
@@ -83,6 +87,23 @@ text ecListenA "Listening on 0.0.0.0:"
 text ecListenB " (GET /health, GET /v1/models, POST /v1/chat/completions)\n"
 text ecHdrOk "HTTP/1.1 200 OK\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\nContent-Length: "
 text ecHdrEnd "\n\n"
+text ecMtpStat1 "MTP_SPEC_STATS: steps="
+text ecMtpStat2 " accepted_toks="
+text ecMtpStat3 " avg_acc_x100="
+text ecLongPrompt "Explain how GPU warp schedulers hide memory latency in Transformer inference, comparing occupancy, warp switching, and memory-level parallelism."
+text ecHdrOpt "HTTP/1.1 204 No Content\nAccess-Control-Allow-Origin: *\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\nAccess-Control-Allow-Headers: Content-Type, Authorization\nConnection: close\n\n"
+text ecHdrSse "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\nAccess-Control-Allow-Origin: *\nConnection: close\n\n"
+text ecSseA "data: {\"id\":\"cmpl-omega\",\"object\":\"chat.completion.chunk\",\"model\":\""
+text ecSseB "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+text ecSseC "\"},\"finish_reason\":null}]}\n\n"
+text ecSseEndA "data: {\"id\":\"cmpl-omega\",\"object\":\"chat.completion.chunk\",\"model\":\""
+text ecSseEndB "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+text ecPatRole "\"role\""
+text ecPatText "\"text\""
+text ecPatStream "\"stream\""
+text ecPatTrue "true"
+text ecRoleSys "system"
+text ecRoleAsst "assistant"
 text ecHdr404 "HTTP/1.1 404 Not Found\nContent-Length: 2\nConnection: close\n\n{}"
 text ecHealthA "{\"status\":\"ok\",\"engine\":\"omega-universal-zero-cuda\",\"model_type\":\""
 text ecHealthB "\",\"hidden_size\":"
@@ -183,6 +204,13 @@ engPrintU get engSpec MS_QUANT
 engPrint ecNl
 engPrint ecKLayout
 lm = get stLayoutMode 0
+if eq get ggIsGguf 0 1
+engPrint ecLayGguf
+engPrint ecKFiles
+engPrintU 1
+engPrint ecKTensors
+engPrintU get ggNTensors 0
+else
 if eq lm 0
 engPrint ecLay0
 else
@@ -196,6 +224,7 @@ engPrint ecKFiles
 engPrintU get stFileCount 0
 engPrint ecKTensors
 engPrintU get stTensorCount 0
+end
 engPrint ecNl
 if gt get engSpec MS_HC_COUNT 1
 engPrint ecKHc
@@ -222,10 +251,17 @@ engPrint ecKQsaC
 engPrintU get engSpec MS_IDX_COMP
 engPrint ecNl
 end
+if eq get ggIsGguf 0 1
+engPrint bonMsgMode
+engPrint bonMsgMtp
+engPrintU get ggHasMtp 0
+engPrint ecNl
+else
 if eq get engSpec MS_ARCH 3
 engPrint ecKPlanQ4
 else
 engPrint ecKPlan
+end
 end
 end
 
@@ -313,13 +349,72 @@ end
 put ecRespLen 0 p
 end
 
+fn ecSendSseSlice start ulong blen ulong to void
+sfd = get ecStreamFd 0
+if le sfd 0
+ret
+end
+if eq blen 0
+ret
+end
+put ecRespLen 0 0
+ecAppStr ecSseA
+ecAppModelType
+ecAppStr ecSseB
+p = get ecRespLen 0
+for i ulong blen bound 256
+if ge p 262000
+break
+end
+c = get ecGenText add start i
+if eq c 34
+put ecRespBuf p 92
+put ecRespBuf add p 1 34
+p = add p 2
+else
+if eq c 92
+put ecRespBuf p 92
+put ecRespBuf add p 1 92
+p = add p 2
+else
+if eq c 10
+put ecRespBuf p 92
+put ecRespBuf add p 1 110
+p = add p 2
+else
+if eq c 13
+put ecRespBuf p 92
+put ecRespBuf add p 1 114
+p = add p 2
+else
+if eq c 9
+put ecRespBuf p 92
+put ecRespBuf add p 1 116
+p = add p 2
+else
+if ge c 32
+put ecRespBuf p c
+p = add p 1
+end
+end
+end
+end
+end
+end
+end
+put ecRespLen 0 p
+ecAppStr ecSseC
+ws = write sfd ecRespBuf 0 get ecRespLen 0
+end
+
 fn ecAppendTokText tid ulong to void
 if ge tid 248044
 ret
 end
 off = ulong get q36TokOff tid
 tl = ulong get q36TokLen tid
-gp = get ecGenTextLen 0
+gp0 = get ecGenTextLen 0
+gp = gp0
 for i ulong tl bound 128
 if lt gp 131000
 put ecGenText gp get q36TokPool add off i
@@ -327,6 +422,9 @@ gp = add gp 1
 end
 end
 put ecGenTextLen 0 gp
+if gt get ecStreamFd 0 0
+ecSendSseSlice gp0 sub gp gp0
+end
 end
 
 fn ecIsStop tok ulong to bool
@@ -339,10 +437,149 @@ end
 ret ge tok get engSpec MS_VOCAB
 end
 
+fn ecMtpDraft3 tok ulong pos ulong to void
+put bmM4Toks 0 tok
+dtok = tok
+for d ulong 3
+dtok = bmStepMtpDraft dtok sub add pos d 1
+put bmDraftToks d dtok
+put bmM4Toks add d 1 dtok
+end
+end
+
+fn ecMtpCountAcc remToks ulong to ulong
+acc = ulong 1
+if and eq get bmVerToks 0 get bmDraftToks 0 gt remToks 1
+acc = ulong 2
+if and eq get bmVerToks 1 get bmDraftToks 1 gt remToks 2
+acc = ulong 3
+if and eq get bmVerToks 2 get bmDraftToks 2 gt remToks 3
+acc = ulong 4
+end
+end
+end
+ret acc
+end
+
+fn ecRunMtpLoop pos0 ulong tok0 ulong maxToks ulong to ulong
+genCnt = ulong 1
+pos = pos0
+tok = tok0
+put bmStatSteps 0 0
+put bmStatAcc 0 0
+while lt genCnt maxToks bound 4096
+ecMtpDraft3 tok pos
+if not bmStepVerifyM4 pos
+break
+end
+acc = ecMtpCountAcc sub maxToks genCnt
+stopped = false
+emitN = ulong 0
+for ai ulong acc bound 4
+vt = get bmVerToks ai
+if ecIsStop vt
+stopped = true
+break
+end
+ecAppendTokText vt
+genCnt = add genCnt 1
+emitN = add emitN 1
+tok = vt
+if ge genCnt maxToks
+stopped = true
+break
+end
+end
+put bmStatSteps 0 add get bmStatSteps 0 1
+put bmStatAcc 0 add get bmStatAcc 0 emitN
+if stopped
+break
+end
+if gt acc 1
+for kj ulong sub acc 1 bound 3
+if not bmStepMtpKvFromM4 kj get bmVerToks kj add pos kj
+break
+end
+end
+end
+if lt acc 4
+if not engReplayPre add 8 acc
+break
+end
+end
+pos = add pos acc
+end
+ret genCnt
+end
+
+fn ecPrintMtpStats to void
+st = get bmStatSteps 0
+if gt st 0
+engPrint ecMtpStat1
+engPrintU st
+engPrint ecMtpStat2
+engPrintU get bmStatAcc 0
+engPrint ecMtpStat3
+engPrintU div mul get bmStatAcc 0 100 st
+engPrint bonDbgNl
+end
+end
+
+fn ecRunChatBonsai ntok ulong maxToks ulong to ulong
+t0 = ulong monons
+firstTok = ulong 0
+if eq get bmMtpReady 0 1
+firstTok = bmPrefillAndFirst ntok
+else
+firstTok = bonPrefillAndFirst ntok
+end
+t1 = ulong monons
+put ecTimings 0 div sub t1 t0 1000000
+put ecTimings 1 0
+if ecIsStop firstTok
+ret 0
+end
+ecAppendTokText firstTok
+t0 = ulong monons
+genCnt = ulong 1
+if eq get bmMtpReady 0 1
+genCnt = ecRunMtpLoop ntok firstTok maxToks
+t1 = ulong monons
+put ecTimings 1 div sub t1 t0 1000000
+if eq get ecStreamFd 0 0
+ecPrintMtpStats
+end
+ret genCnt
+end
+pos = ntok
+tok = firstTok
+while lt genCnt maxToks bound 4096
+if not bonLoadEmbedCpu tok
+break
+end
+if not bonSetPos pos
+break
+end
+tok = bonStepDecode
+if ecIsStop tok
+break
+end
+ecAppendTokText tok
+genCnt = add genCnt 1
+pos = add pos 1
+end
+t1 = ulong monons
+put ecTimings 1 div sub t1 t0 1000000
+ret genCnt
+end
+
 fn ecRunChat ntok ulong maxToks ulong to ulong
 put ecGenTextLen 0 0
-for i ulong ntok bound 2048
+for i ulong ntok bound 131072
 put engTokSeq i get q36TokOutIds i
+end
+if eq get ggIsGguf 0 1
+ret ecRunChatBonsai ntok maxToks
 end
 isQ4 = eq get engSpec MS_ARCH 3
 t0 = ulong monons
@@ -404,6 +641,9 @@ ret genCnt
 end
 
 fn ecLoadTok to bool
+if eq get ggIsGguf 0 1
+ret true
+end
 tlen = engJoinPath ecSufTok
 pLocal = new uchar 512 0
 for i ulong tlen bound 512
@@ -545,7 +785,7 @@ end
 end
 pos = add pos 1
 end
-ret 512
+ret 4096
 end
 
 fn ecIsWs c uchar to bool
@@ -579,6 +819,214 @@ end
 ret false
 end
 
+fn ecSkipWsNl j0 ulong rlen ulong to ulong
+j = j0
+while lt j rlen bound 64
+c = get ecReqBuf j
+if or eq c 32 or eq c 9 or eq c 10 eq c 13
+j = add j 1
+else
+break
+end
+end
+ret j
+end
+
+fn ecReadJsonStrLen p0 ulong rlen ulong dstOff ulong to ulong
+p = p0
+olen = dstOff
+while and lt p rlen lt olen 262000 bound 262144
+c = get ecReqBuf p
+if eq c 34
+put ecMsgOutCnt 0 olen
+ret add p 1
+end
+if and eq c 92 lt add p 1 rlen
+nx = get ecReqBuf add p 1
+if eq nx 110
+put q36TokInBuf olen 10
+else
+if eq nx 114
+put q36TokInBuf olen 13
+else
+if eq nx 116
+put q36TokInBuf olen 9
+else
+put q36TokInBuf olen nx
+end
+end
+end
+olen = add olen 1
+p = add p 2
+else
+put q36TokInBuf olen c
+olen = add olen 1
+p = add p 1
+end
+end
+put ecMsgOutCnt 0 olen
+ret p
+end
+
+fn ecTokAppendBuf tlen ulong cnt0 ulong to ulong
+res = new ulong 2 0
+cnt = cnt0
+pos = ulong 0
+while and lt pos tlen lt cnt 131050 bound 524288
+maxTry = sub tlen pos
+if gt maxTry 24
+maxTry = ulong 24
+end
+q36TokBestGlobal pos maxTry res
+bestLen = get res 1
+if eq bestLen 0
+bestLen = ulong 1
+end
+put q36TokOutIds cnt uint get res 0
+cnt = add cnt 1
+pos = add pos bestLen
+end
+ret cnt
+end
+
+fn ecEmitTurn roleId ulong clen ulong cnt0 ulong to ulong
+cnt = cnt0
+put q36TokOutIds cnt 248045
+cnt = add cnt 1
+if eq roleId 0
+put q36TokOutIds cnt 8678
+else
+if eq roleId 2
+put q36TokOutIds cnt 74455
+else
+put q36TokOutIds cnt 846
+end
+end
+cnt = add cnt 1
+put q36TokOutIds cnt 198
+cnt = add cnt 1
+cnt = ecTokAppendBuf clen cnt
+put q36TokOutIds cnt 248046
+cnt = add cnt 1
+put q36TokOutIds cnt 198
+cnt = add cnt 1
+ret cnt
+end
+
+fn ecReadPartsArray p0 ulong rlen ulong to ulong
+clen = ulong 0
+p = p0
+while and lt p rlen ne get ecReqBuf p 93 bound 65536
+if ecMatchReq p rlen ecPatText
+k = add p 6
+while and lt k rlen ne get ecReqBuf k 58 bound 32
+k = add k 1
+end
+k = ecSkipWsNl add k 1 rlen
+if and lt k rlen eq get ecReqBuf k 34
+p = ecReadJsonStrLen add k 1 rlen clen
+clen = get ecMsgOutCnt 0
+else
+p = add p 6
+end
+else
+p = add p 1
+end
+end
+put ecMsgOutCnt 0 clen
+ret add p 1
+end
+
+fn ecReadRoleAt j0 ulong rlen ulong to ulong
+j = j0
+while and lt j rlen ne get ecReqBuf j 58 bound 32
+j = add j 1
+end
+j = ecSkipWsNl add j 1 rlen
+if and lt j rlen eq get ecReqBuf j 34
+j = add j 1
+if ecMatchReq j rlen ecRoleSys
+ret 0
+end
+if ecMatchReq j rlen ecRoleAsst
+ret 2
+end
+end
+ret 1
+end
+
+fn ecEncodeMessagesHttp rlen ulong to ulong
+cnt = ulong 0
+pos = ulong 0
+curRole = ulong 1
+turns = ulong 0
+while lt add pos 8 rlen bound 262144
+if ecMatchReq pos rlen ecPatRole
+curRole = ecReadRoleAt add pos 6 rlen
+pos = add pos 6
+else
+if ecMatchReq pos rlen ecPatContent
+j = add pos 9
+while and lt j rlen ne get ecReqBuf j 58 bound 32
+j = add j 1
+end
+j = ecSkipWsNl add j 1 rlen
+if and lt j rlen eq get ecReqBuf j 34
+pos = ecReadJsonStrLen add j 1 rlen 0
+cnt = ecEmitTurn curRole get ecMsgOutCnt 0 cnt
+turns = add turns 1
+else
+if and lt j rlen eq get ecReqBuf j 91
+pos = ecReadPartsArray add j 1 rlen
+cnt = ecEmitTurn curRole get ecMsgOutCnt 0 cnt
+turns = add turns 1
+else
+pos = add pos 9
+end
+end
+else
+pos = add pos 1
+end
+end
+end
+if eq turns 0
+ret 0
+end
+put q36TokOutIds cnt 248045
+cnt = add cnt 1
+put q36TokOutIds cnt 74455
+cnt = add cnt 1
+put q36TokOutIds cnt 198
+cnt = add cnt 1
+put q36TokOutIds cnt 248068
+cnt = add cnt 1
+put q36TokOutIds cnt 271
+cnt = add cnt 1
+put q36TokOutIds cnt 248069
+cnt = add cnt 1
+put q36TokOutIds cnt 271
+cnt = add cnt 1
+ret cnt
+end
+
+fn ecExtractStream rlen ulong to bool
+pos = ulong 0
+while lt add pos 12 rlen bound 262144
+if ecMatchReq pos rlen ecPatStream
+j = add pos 8
+while and lt j rlen ne get ecReqBuf j 58 bound 32
+j = add j 1
+end
+j = ecSkipWsNl add j 1 rlen
+if ecMatchReq j rlen ecPatTrue
+ret true
+end
+end
+pos = add pos 1
+end
+ret false
+end
+
 fn ecHandleHttp fd int to void
 tot = ulong 0
 for it ulong 16
@@ -588,7 +1036,7 @@ break
 end
 tot = add tot ulong got
 if ge tot 16
-if and eq get ecReqBuf 0 71 eq get ecReqBuf 1 69
+if or and eq get ecReqBuf 0 71 eq get ecReqBuf 1 69 eq get ecReqBuf 0 79
 break
 end
 if ecHasJsonEnd tot
@@ -597,6 +1045,10 @@ end
 end
 end
 if lt tot 12
+ret
+end
+if eq get ecReqBuf 0 79
+wo = write fd ecHdrOpt 0 len ecHdrOpt
 ret
 end
 if and eq get ecReqBuf 0 71 eq get ecReqBuf 5 104
@@ -622,9 +1074,25 @@ ecSendJson fd
 ret
 end
 if eq get ecReqBuf 0 80
+ntok = ecEncodeMessagesHttp tot
+if eq ntok 0
 clen = ecExtractContent tot
-maxToks = ecExtractMaxToks tot
 ntok = q36TokEncodeChatGlobal clen
+end
+maxToks = ecExtractMaxToks tot
+if ecExtractStream tot
+wh = write fd ecHdrSse 0 len ecHdrSse
+put ecStreamFd 0 fd
+genCnt = ecRunChat ntok maxToks
+put ecStreamFd 0 0
+put ecRespLen 0 0
+ecAppStr ecSseEndA
+ecAppModelType
+ecAppStr ecSseEndB
+we = write fd ecRespBuf 0 get ecRespLen 0
+ret
+end
+put ecStreamFd 0 0
 genCnt = ecRunChat ntok maxToks
 put ecRespLen 0 0
 ecAppStr ecChatA
@@ -692,10 +1160,18 @@ ret v
 end
 
 fn ecRunSelfOrCli to int
+pl = len ecSelfP0
+if eq get ecUseLong 0 1
+pl = len ecLongPrompt
+for i ulong len ecLongPrompt bound 512
+put q36TokInBuf i get ecLongPrompt i
+end
+else
 for i ulong len ecSelfP0 bound 64
 put q36TokInBuf i get ecSelfP0 i
 end
-ntok = q36TokEncodeChatGlobal len ecSelfP0
+end
+ntok = q36TokEncodeChatGlobal pl
 g = ecRunChat ntok get ecGenN 0
 engPrint ecRunTxt
 w = write 1 ecGenText 0 get ecGenTextLen 0
@@ -1376,6 +1852,55 @@ ecB8StepAll
 end
 end
 
+fn ecParseFlags to void
+put ecGenN 0 24
+put ecPort 0 18095
+put ecSelfTest 0 0
+put ecUseLong 0 0
+put bonUseApu 0 1
+put bonLmNCpu 0 0
+put bmUseMtp 0 1
+put bmMtpK 0 3
+a = new uchar 32 0
+ai = ulong 3
+while lt ai ulong argcnt bound 16
+al = argread ai a 0 30
+c0 = get a 0
+c2 = get a 2
+if and ge al 1 and ge c0 48 le c0 57
+put ecGenN 0 ecParseU ai
+end
+if eq c0 45
+if and ge al 6 eq c2 112
+if lt add ai 1 ulong argcnt
+ai = add ai 1
+put ecPort 0 ecParseU ai
+end
+end
+if and ge al 6 eq c2 115
+put ecSelfTest 0 1
+end
+if and ge al 6 eq c2 108
+put ecUseLong 0 1
+end
+if and ge al 8 eq c2 110
+if eq get a 5 109
+put bmUseMtp 0 0
+else
+put bonUseApu 0 0
+end
+end
+if and ge al 10 eq c2 97
+if lt add ai 1 ulong argcnt
+ai = add ai 1
+put bonLmNCpu 0 ecParseU ai
+end
+end
+end
+ai = add ai 1
+end
+end
+
 fn main to int
 engPrint ecBanner
 if lt argcnt 3
@@ -1402,28 +1927,14 @@ engPrint ecUsage
 ret 1
 end
 put engModelDirLen 0 ulong dl
-put ecGenN 0 24
-put ecPort 0 18095
-put ecSelfTest 0 0
-a = new uchar 32 0
-ai = ulong 3
-while lt ai ulong argcnt bound 16
-al = argread ai a 0 30
-if and ge al 1 and ge get a 0 48 le get a 0 57
-put ecGenN 0 ecParseU ai
-end
-if and ge al 6 and eq get a 0 45 eq get a 2 112
-if lt add ai 1 ulong argcnt
-ai = add ai 1
-put ecPort 0 ecParseU ai
-end
-end
-if and ge al 6 and eq get a 0 45 eq get a 2 115
-put ecSelfTest 0 1
-end
-ai = add ai 1
-end
+ecParseFlags
 
+if ggDetectAndOpen
+if not ggParseFile
+engPrint ecErrCfg
+ret 2
+end
+else
 if not engLoadConfig
 engPrint ecErrCfg
 ret 2
@@ -1431,6 +1942,7 @@ end
 if not stIndexModel
 engPrint ecErrSt
 ret 3
+end
 end
 ecPrintInspect
 if eq get ecMode 0 0
@@ -1447,7 +1959,12 @@ end
 engPrint ecTokOk
 engPrint ecLoading
 t0 = ulong monons
+irc = int 0
+if eq get ggIsGguf 0 1
+irc = bonGpuInit
+else
 irc = engGpuInit
+end
 if ne irc 0
 engPrint ecErrGpu
 engPrintU ulong irc
@@ -1460,6 +1977,9 @@ rc = nvstop
 ret krc
 end
 lrc = int 0
+if eq get ggIsGguf 0 1
+lrc = bonLoadAll
+else
 if eq get engSpec MS_ARCH 3
 lrc = q4LoadAll
 if eq lrc 0
@@ -1469,6 +1989,7 @@ end
 end
 else
 lrc = engLoadAll
+end
 end
 if ne lrc 0
 engPrint ecErrGpu
@@ -1484,6 +2005,7 @@ engPrint ecNl
 
 if or eq get ecMode 0 1 eq get ecSelfTest 0 1
 rrc = ecRunSelfOrCli
+bonApuStop
 q4ApuStop
 rc = nvstop
 ret rrc
@@ -1492,6 +2014,7 @@ end
 port = get ecPort 0
 lfd = ecListen port
 if lt lfd 0
+bonApuStop
 q4ApuStop
 rc = nvstop
 ret 40
@@ -1511,6 +2034,7 @@ end
 end
 end
 c1 = fclose int lfd
+bonApuStop
 q4ApuStop
 rc = nvstop
 ret 0

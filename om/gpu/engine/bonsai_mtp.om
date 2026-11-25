@@ -1,0 +1,1184 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/bonsai_mtp.om: Pure Seeded-OM-2 blk.64 MTP Speculative Decoder + M=4 Batched Verify + M=4 Chunked Prefill!
+note   - Converts blk.64 Q4_0 weights -> uW4Gemv4R (198+ GB/s, 1.14 ms/draft!) at load time
+note   - M=4 Batched PTQ1_0 Verify reads 5.322 GB trunk ONCE to verify 4 tokens simultaneously!
+note   - 3x GDN BF16 state + conv-tail snapshots with 0.35 ms exact rollback (0.00 ms when acc==4!)
+note   - Full-APU (20 CPU cores + 48 Blackwell SMs) works simultaneously on BOTH 1-tok AND M=4 verify!
+
+const BM_M4_BYTES ulong 67108864
+const M4_X ulong 0
+const M4_XN ulong 131072
+const M4_XN_ROT ulong 262144
+const M4_AOUT ulong 393216
+const M4_QKV ulong 524288
+const M4_Y ulong 1048576
+const M4_Y_ROT ulong 1179648
+const M4_AB ulong 1310720
+const M4_GU ulong 1572864
+const M4_SW ulong 2621440
+const M4_SW_ROT ulong 3145728
+const M4_PARTS ulong 3670016
+const M4_MTP_CAT ulong 4194304
+const M4_MTP_H ulong 4259840
+const M4_MTP_E ulong 4325376
+const M4_POS4 ulong 4390912
+const M4_MTP_POS ulong 4390976
+const M4_BEST ulong 4391040
+
+global bmUseMtp ulong 1
+global bmMtpK ulong 3
+global bmMtpReady ulong 1
+
+global bmM4Map long 1
+global bmM4Va ulong 1
+global bmGdnSnapMap long 3
+global bmGdnSnapVa ulong 3
+global bmTailSnapMap long 3
+global bmTailSnapVa ulong 3
+global bmGdnTotF32 ulong 1
+global bmTailTotF32 ulong 1
+
+note blk.64 MTP tensor GPU VAs
+global bmEnormVa ulong 1
+global bmHnormVa ulong 1
+global bmSharedNormVa ulong 1
+global bmAttnNormVa ulong 1
+global bmPostNormVa ulong 1
+global bmQNormVa ulong 1
+global bmKNormVa ulong 1
+global bmEhW ulong 1
+global bmEhS ulong 1
+global bmQkvW ulong 1
+global bmQkvS ulong 1
+global bmOW ulong 1
+global bmOS ulong 1
+global bmGuW ulong 1
+global bmGuS ulong 1
+global bmDnW ulong 1
+global bmDnS ulong 1
+
+note Q4_0 -> W4_b32 streaming conversion scratch buffers (up to 64 rows per batch)
+global bmQ4Raw uchar 700000
+global bmW4Out uchar 600000
+global bmS4Out uchar 80000
+global bmQ4WMap long 1
+global bmQ4WOff ulong 1
+global bmQ4WVa ulong 1
+global bmQ4SMap long 1
+global bmQ4SOff ulong 1
+global bmQ4SVa ulong 1
+global bmStmP ulong 4
+
+note MTP draft/verify runtime arrays & counters
+global bmDraftToks ulong 4
+global bmVerToks ulong 4
+global bmM4Toks ulong 4
+global bmStatSteps ulong 1
+global bmStatAcc ulong 1
+
+text bmNmEnorm "blk.64.nextn.enorm.weight"
+text bmNmHnorm "blk.64.nextn.hnorm.weight"
+text bmNmShNorm "blk.64.nextn.shared_head_norm.weight"
+text bmNmANorm "blk.64.attn_norm.weight"
+text bmNmPNorm "blk.64.post_attention_norm.weight"
+text bmNmQNorm "blk.64.attn_q_norm.weight"
+text bmNmKNorm "blk.64.attn_k_norm.weight"
+text bmNmEh "blk.64.nextn.eh_proj.weight"
+text bmNmQ "blk.64.attn_q.weight"
+text bmNmK "blk.64.attn_k.weight"
+text bmNmV "blk.64.attn_v.weight"
+text bmNmO "blk.64.attn_output.weight"
+text bmNmGate "blk.64.ffn_gate.weight"
+text bmNmUp "blk.64.ffn_up.weight"
+text bmNmDn "blk.64.ffn_down.weight"
+
+fn bmW off ulong to ulong
+ret add get bmM4Va 0 off
+end
+
+fn bmAllocGpu to bool
+put bmM4Map 0 nvalloc BM_M4_BYTES true
+if le get bmM4Map 0 0
+ret false
+end
+put bmM4Va 0 mapaddr get bmM4Map 0
+engZeroMap get bmM4Map 0 80
+nGdn = get engSpec MS_N_GDN
+nV = get engSpec MS_GDN_NV
+nK = get engSpec MS_GDN_NK
+sTot = mul nGdn mul nV 32768
+qkvN = add mul nK 256 mul nV 128
+tTot = mul div add mul nGdn mul qkvN 12 65535 65536 65536
+put bmGdnTotF32 0 div sTot 4
+put bmTailTotF32 0 div tTot 4
+if eq get ggHasMtp 0 1
+for si ulong 3
+sm = nvalloc sTot true
+if le sm 0
+ret false
+end
+put bmGdnSnapMap si sm
+put bmGdnSnapVa si mapaddr sm
+tm = nvalloc tTot true
+if le tm 0
+ret false
+end
+put bmTailSnapMap si tm
+put bmTailSnapVa si mapaddr tm
+end
+end
+ret true
+end
+
+note =========================================================================
+note GGML Q4_0 (18 B/32w) -> uW4Gemv4R (16 B consecutive nibbles + BF16 scale pairs)
+note =========================================================================
+fn bmFp16ToBf16 bits ulong to ulong
+f32b = ulong ggFp16ToF32Bits bits
+ret and shr add f32b 32768 16 65535
+end
+
+fn bmPutU32W4 off ulong v uint to void
+put bmW4Out off uchar and v 255
+put bmW4Out add off 1 uchar and shr v 8 255
+put bmW4Out add off 2 uchar and shr v 16 255
+put bmW4Out add off 3 uchar and shr v 24 255
+end
+
+fn bmPutU32S4 off ulong v uint to void
+put bmS4Out off uchar and v 255
+put bmS4Out add off 1 uchar and shr v 8 255
+put bmS4Out add off 2 uchar and shr v 16 255
+put bmS4Out add off 3 uchar and shr v 24 255
+end
+
+fn bmPackNib8Lo qs ulong dstOff ulong to void
+w = uint 0
+for j ulong 8
+b = uint and ulong get bmQ4Raw add qs j 15
+w = or w shl b uint mul j 4
+end
+bmPutU32W4 dstOff w
+end
+
+fn bmPackNib8Hi qs ulong dstOff ulong to void
+w = uint 0
+for j ulong 8
+b = uint and shr ulong get bmQ4Raw add qs j 4 15
+w = or w shl b uint mul j 4
+end
+bmPutU32W4 dstOff w
+end
+
+fn bmConvertQ40Blk srcOff ulong wDst ulong to ulong
+dlo = ulong get bmQ4Raw srcOff
+dhi = ulong get bmQ4Raw add srcOff 1
+bf = bmFp16ToBf16 or dlo shl dhi 8
+qs = add srcOff 2
+bmPackNib8Lo qs wDst
+bmPackNib8Lo add qs 8 add wDst 4
+bmPackNib8Hi qs add wDst 8
+bmPackNib8Hi add qs 8 add wDst 12
+ret bf
+end
+
+fn bmConvertQ40Pair rBase ulong wBase ulong sOff ulong to void
+bf0 = bmConvertQ40Blk rBase wBase
+bf1 = bmConvertQ40Blk add rBase 18 add wBase 16
+bmPutU32S4 sOff uint or bf0 shl bf1 16
+end
+
+fn bmConvertQ40Row rIdx ulong nBlks ulong to void
+rBase = mul rIdx mul nBlks 18
+wBase = mul rIdx mul nBlks 16
+sBase = mul rIdx mul nBlks 2
+nPairs = div nBlks 2
+for p ulong nPairs bound 512
+a0 = add rBase mul p 36
+a1 = add wBase mul p 32
+a2 = add sBase mul p 4
+bmConvertQ40Pair a0 a1 a2
+end
+end
+
+fn bmStreamQ40Batch foff ulong wDst ulong sDst ulong cnt ulong nBlks ulong to bool
+rBytes = mul cnt mul nBlks 18
+if ne pread get ggFd 0 bmQ4Raw 0 rBytes long foff long rBytes
+ret false
+end
+for ri ulong cnt bound 64
+bmConvertQ40Row ri nBlks
+end
+wBytes = mul cnt mul nBlks 16
+sBytes = mul cnt mul nBlks 2
+if ne mapwrite get bmQ4WMap 0 wDst bmW4Out 0 wBytes long wBytes
+ret false
+end
+ret eq mapwrite get bmQ4SMap 0 sDst bmS4Out 0 sBytes long sBytes
+end
+
+fn bmStreamQ40Step done ulong cnt ulong to bool
+nBlks = get bmStmP 3
+f0 = add get bmStmP 0 mul done mul nBlks 18
+w0 = add get bmStmP 1 mul done mul nBlks 16
+s0 = add get bmStmP 2 mul done mul nBlks 2
+ret bmStreamQ40Batch f0 w0 s0 cnt nBlks
+end
+
+fn bmStreamQ40Range tid ulong wByteOff ulong sByteOff ulong to bool
+nBlks = div get ggDim0 tid 32
+put bmStmP 0 add get ggDataStart 0 get ggTOff tid
+put bmStmP 1 add get bmQ4WOff 0 wByteOff
+put bmStmP 2 add get bmQ4SOff 0 sByteOff
+put bmStmP 3 nBlks
+N = get ggDim1 tid
+batchR = div 655360 mul nBlks 18
+if gt batchR 64
+batchR = ulong 64
+end
+if eq batchR 0
+batchR = ulong 1
+end
+done = ulong 0
+while lt done N bound 65536
+cnt = sub N done
+if gt cnt batchR
+cnt = batchR
+end
+if not bmStreamQ40Step done cnt
+ret false
+end
+done = add done cnt
+end
+ret true
+end
+
+fn bmAllocQ40 totW ulong totS ulong to bool
+if not bonSlabAllocMap totW
+ret false
+end
+put bmQ4WMap 0 get bonCurMap 0
+put bmQ4WOff 0 get bonCurOff 0
+put bmQ4WVa 0 get bonCurVa 0
+if not bonSlabAllocMap totS
+ret false
+end
+put bmQ4SMap 0 get bonCurMap 0
+put bmQ4SOff 0 get bonCurOff 0
+put bmQ4SVa 0 get bonCurVa 0
+ret true
+end
+
+fn bmLoadQ40_1 tid ulong to bool
+K = get ggDim0 tid
+N = get ggDim1 tid
+tw = mul N div K 2
+ts = mul N div K 16
+if not bmAllocQ40 tw ts
+ret false
+end
+ret bmStreamQ40Range tid 0 0
+end
+
+fn bmLoadQ40_2 t0 ulong t1 ulong to bool
+K = get ggDim0 t0
+n0 = get ggDim1 t0
+n1 = get ggDim1 t1
+w0 = mul n0 div K 2
+s0 = mul n0 div K 16
+w1 = mul n1 div K 2
+s1 = mul n1 div K 16
+if not bmAllocQ40 add w0 w1 add s0 s1
+ret false
+end
+if not bmStreamQ40Range t0 0 0
+ret false
+end
+ret bmStreamQ40Range t1 w0 s0
+end
+
+fn bmLoadQ40_3 t0 ulong t1 ulong t2 ulong to bool
+K = get ggDim0 t0
+totN = add add get ggDim1 t0 get ggDim1 t1 get ggDim1 t2
+if not bmAllocQ40 mul totN div K 2 mul totN div K 16
+ret false
+end
+if not bmStreamQ40Range t0 0 0
+ret false
+end
+n0 = get ggDim1 t0
+if not bmStreamQ40Range t1 mul n0 div K 2 mul n0 div K 16
+ret false
+end
+n01 = add n0 get ggDim1 t1
+ret bmStreamQ40Range t2 mul n01 div K 2 mul n01 div K 16
+end
+
+fn bmLoadOneF32 nm view uchar * ln ulong to ulong
+t = ggFindExact nm ln
+if lt t 0
+ret 0
+end
+ret bonLoadF32 ulong t
+end
+
+fn bmLoadMtpNorms to bool
+v = bmLoadOneF32 bmNmEnorm len bmNmEnorm
+if eq v 0
+ret false
+end
+put bmEnormVa 0 v
+v = bmLoadOneF32 bmNmHnorm len bmNmHnorm
+if eq v 0
+ret false
+end
+put bmHnormVa 0 v
+v = bmLoadOneF32 bmNmShNorm len bmNmShNorm
+if eq v 0
+ret false
+end
+put bmSharedNormVa 0 v
+v = bmLoadOneF32 bmNmANorm len bmNmANorm
+if eq v 0
+ret false
+end
+put bmAttnNormVa 0 v
+v = bmLoadOneF32 bmNmPNorm len bmNmPNorm
+if eq v 0
+ret false
+end
+put bmPostNormVa 0 v
+v = bmLoadOneF32 bmNmQNorm len bmNmQNorm
+if eq v 0
+ret false
+end
+put bmQNormVa 0 v
+v = bmLoadOneF32 bmNmKNorm len bmNmKNorm
+if eq v 0
+ret false
+end
+put bmKNormVa 0 v
+ret true
+end
+
+fn bmLoadMtpWeights to bool
+if not bmLoadMtpNorms
+ret false
+end
+t0 = ggFindExact bmNmEh len bmNmEh
+if or lt t0 0 not bmLoadQ40_1 ulong t0
+ret false
+end
+put bmEhW 0 get bmQ4WVa 0
+put bmEhS 0 get bmQ4SVa 0
+t0 = ggFindExact bmNmQ len bmNmQ
+t1 = ggFindExact bmNmK len bmNmK
+t2 = ggFindExact bmNmV len bmNmV
+if or lt t0 0 or lt t1 0 lt t2 0
+ret false
+end
+if not bmLoadQ40_3 ulong t0 ulong t1 ulong t2
+ret false
+end
+put bmQkvW 0 get bmQ4WVa 0
+put bmQkvS 0 get bmQ4SVa 0
+t0 = ggFindExact bmNmO len bmNmO
+if or lt t0 0 not bmLoadQ40_1 ulong t0
+ret false
+end
+put bmOW 0 get bmQ4WVa 0
+put bmOS 0 get bmQ4SVa 0
+t0 = ggFindExact bmNmGate len bmNmGate
+t1 = ggFindExact bmNmUp len bmNmUp
+if or lt t0 0 lt t1 0
+ret false
+end
+if not bmLoadQ40_2 ulong t0 ulong t1
+ret false
+end
+put bmGuW 0 get bmQ4WVa 0
+put bmGuS 0 get bmQ4SVa 0
+t0 = ggFindExact bmNmDn len bmNmDn
+if or lt t0 0 not bmLoadQ40_1 ulong t0
+ret false
+end
+put bmDnW 0 get bmQ4WVa 0
+put bmDnS 0 get bmQ4SVa 0
+ret true
+end
+
+note =========================================================================
+note GPU Packet Emitters for M=4 Batched Verify, M=4 Chunked Prefill & blk.64 MTP
+note =========================================================================
+fn bmEmitZeroFast dstVa ulong nF32 ulong to bool
+engPtr dstVa
+engArg uint nF32
+ret engPktEmitGy 26 uint div add nF32 1023 1024 1 256
+end
+
+fn bmEmitCopyFast srcVa ulong dstVa ulong nF32 ulong to bool
+engPtr srcVa
+engPtr dstVa
+engArg uint nF32
+ret engPktEmitGy 25 uint div add nF32 1023 1024 1 256
+end
+
+fn bmEmitCopySys srcVa ulong dstVa ulong nF32 ulong to bool
+engPtr srcVa
+engPtr dstVa
+engArg uint nF32
+gx = div add nF32 255 256
+if eq gx 0
+gx = ulong 1
+end
+ret engPktEmitGy 20 uint gx 1 256
+end
+
+fn bmEmitW4 xVa ulong wVa ulong sVa ulong outVa ulong K ulong N ulong to bool
+engPtr xVa
+engPtr wVa
+engPtr sVa
+engPtr outVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 0 uint div add N 31 32 1 256
+end
+
+fn bmEmitPtq1M4 xVa ulong wVa ulong outVa ulong K ulong N ulong to bool
+engPtr xVa
+engPtr wVa
+engPtr outVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 21 uint div add N 31 32 1 256
+end
+
+fn bmEmitRmsM4 wVa ulong doAdd uint to bool
+engPtr bmW M4_X
+engPtr bmW M4_AOUT
+engPtr wVa
+engPtr bmW M4_XN
+engArg doAdd
+ret engPktEmitGy 23 1 4 256
+end
+
+fn bmEmitFwhtM4 inVa ulong signVa ulong outVa ulong K ulong to bool
+engPtr inVa
+engPtr signVa
+engPtr outVa
+engArg uint K
+engArg 0
+ret engPktEmitGy 16 uint div K 1024 4 256
+end
+
+fn bmEmitM4GdnSnap gdnIdx ulong m ulong to bool
+sLayB = mul get engSpec MS_GDN_NV 32768
+sOff = mul gdnIdx sLayB
+if not bmEmitCopyFast add get engGdnStateVa 0 sOff add get bmGdnSnapVa m sOff div sLayB 4
+ret false
+end
+qkvN = add mul get engSpec MS_GDN_NK 256 mul get engSpec MS_GDN_NV 128
+tLayB = mul qkvN 12
+tOff = mul gdnIdx tLayB
+ret bmEmitCopyFast add get engGdnTailVa 0 tOff add get bmTailSnapVa m tOff div tLayB 4
+end
+
+fn bmEmitM4GdnStep1 L ulong gdnIdx ulong m ulong doSnap bool to bool
+nV = get engSpec MS_GDN_NV
+qkvN = add mul get engSpec MS_GDN_NK 256 mul nV 128
+zN = mul nV 128
+qkvVa = add bmW M4_QKV mul m mul add qkvN zN 4
+engPtr qkvVa
+engPtr get engLA4SVa L
+engPtr add get engGdnTailVa 0 mul gdnIdx mul qkvN 12
+if not engPktEmitGy 13 uint div qkvN 128 1 128
+ret false
+end
+engPtr qkvVa
+engPtr add qkvVa mul qkvN 4
+engPtr add bmW M4_AB mul m mul nV 8
+engPtr get engLKNormVa L
+engPtr add get engGdnStateVa 0 mul gdnIdx mul nV 32768
+engPtr get engLQNormVa L
+engPtr add bmW M4_Y mul m mul zN 4
+if not engPktEmitGy 17 uint nV 1 128
+ret false
+end
+if and doSnap lt m 3
+ret bmEmitM4GdnSnap gdnIdx m
+end
+ret true
+end
+
+fn bmEmitM4GdnLayer L ulong gdnIdx ulong doSnap bool to bool
+H = get engSpec MS_H
+nK = get engSpec MS_GDN_NK
+nV = get engSpec MS_GDN_NV
+qkvN = add mul nK 256 mul nV 128
+zN = mul nV 128
+if not bmEmitFwhtM4 bmW M4_XN engW BW_SIGN5120 bmW M4_XN_ROT H
+ret false
+end
+if not bmEmitPtq1M4 bmW M4_XN_ROT get bonA1T L bmW M4_QKV H add qkvN zN
+ret false
+end
+for m ulong 4
+engPtr get engLA4WVa L
+engPtr add bmW M4_XN mul m mul H 4
+engPtr add bmW M4_AB mul m mul mul nV 2 4
+engArg uint H
+engArg uint mul nV 2
+if not engPktEmitGy 4 uint div add mul nV 2 7 8 1 256
+ret false
+end
+end
+for m ulong 4
+if not bmEmitM4GdnStep1 L gdnIdx m doSnap
+ret false
+end
+end
+if not bmEmitFwhtM4 bmW M4_Y engW BW_SIGN6144 bmW M4_Y_ROT zN
+ret false
+end
+ret bmEmitPtq1M4 bmW M4_Y_ROT get bonOT L bmW M4_AOUT zN H
+end
+
+fn bmEmitM4FaPart1 L ulong faIdx ulong qBase ulong posVa ulong to bool
+nQ = get engSpec MS_NQ
+nKV = get engSpec MS_NKV
+hd = get engSpec MS_HD
+kInVa = add qBase mul mul nQ mul hd 2 4
+kBase = get engKvVa faIdx
+vBase = add kBase div get engKvSlabBytes 0 2
+engPtr kInVa
+engPtr add kInVa mul mul nKV hd 4
+engPtr get engLKNormVa L
+engPtr get engRopeVa 0
+engPtr kBase
+engPtr vBase
+engPtr posVa
+if not engPktEmitGy 7 uint nKV 1 uint hd
+ret false
+end
+engPtr qBase
+engPtr get engLQNormVa L
+engPtr get engRopeVa 0
+engPtr engW EW_QROT
+engPtr posVa
+ret engPktEmitGy 8 uint nQ 1 uint hd
+end
+
+fn bmEmitM4FaPart2 faIdx ulong qBase ulong yVa ulong posVa ulong to bool
+nQ = get engSpec MS_NQ
+hd = get engSpec MS_HD
+kBase = get engKvVa faIdx
+vBase = add kBase div get engKvSlabBytes 0 2
+engPtr engW EW_QROT
+engPtr kBase
+engPtr vBase
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr posVa
+if not engPktEmitGy 9 uint nQ 8 32
+ret false
+end
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr qBase
+engPtr yVa
+engArg 8
+ret engPktEmitGy 10 uint nQ 1 uint hd
+end
+
+fn bmEmitM4FaStep1 L ulong faIdx ulong m ulong to bool
+nQ = get engSpec MS_NQ
+hd = get engSpec MS_HD
+qStride = add mul nQ mul hd 2 mul get engSpec MS_NKV mul hd 2
+qBase = add bmW M4_QKV mul m mul qStride 4
+posVa = add bmW M4_POS4 mul m 4
+if not bmEmitM4FaPart1 L faIdx qBase posVa
+ret false
+end
+yVa = add bmW M4_Y mul m mul mul nQ hd 4
+ret bmEmitM4FaPart2 faIdx qBase yVa posVa
+end
+
+fn bmEmitM4FaLayer L ulong faIdx ulong to bool
+H = get engSpec MS_H
+nQ = get engSpec MS_NQ
+nKV = get engSpec MS_NKV
+hd = get engSpec MS_HD
+qkvTot = add mul nQ mul hd 2 mul nKV mul hd 2
+if not bmEmitFwhtM4 bmW M4_XN engW BW_SIGN5120 bmW M4_XN_ROT H
+ret false
+end
+if not bmEmitPtq1M4 bmW M4_XN_ROT get bonA1T L bmW M4_QKV H qkvTot
+ret false
+end
+for m ulong 4
+if not bmEmitM4FaStep1 L faIdx m
+ret false
+end
+end
+if not bmEmitFwhtM4 bmW M4_Y engW BW_SIGN6144 bmW M4_Y_ROT mul nQ hd
+ret false
+end
+ret bmEmitPtq1M4 bmW M4_Y_ROT get bonOT L bmW M4_AOUT mul nQ hd H
+end
+
+fn bmEmitM4MlpLayer L ulong to bool
+H = get engSpec MS_H
+I = get engSpec MS_I
+if not bmEmitRmsM4 get engLPostNormVa L 1
+ret false
+end
+if not bmEmitFwhtM4 bmW M4_XN engW BW_SIGN5120 bmW M4_XN_ROT H
+ret false
+end
+if not bmEmitPtq1M4 bmW M4_XN_ROT get bonGuT L bmW M4_GU H mul I 2
+ret false
+end
+engPtr bmW M4_GU
+engPtr bmW M4_SW
+engArg uint I
+if not engPktEmitGy 2 uint div add I 255 256 4 256
+ret false
+end
+if not bmEmitFwhtM4 bmW M4_SW engW BW_SIGN17408 bmW M4_SW_ROT I
+ret false
+end
+ret bmEmitPtq1M4 bmW M4_SW_ROT get bonDnT L bmW M4_AOUT I H
+end
+
+fn bmEmitM4Trunk doSnap bool to bool
+H = get engSpec MS_H
+if not bmEmitCopySys add get bonApuShmVa 0 APU_SHM_XINIT bmW M4_X mul H 4
+ret false
+end
+if not bmEmitCopySys add get bonApuShmVa 0 APU_SHM_POS bmW M4_POS4 4
+ret false
+end
+nL = get engSpec MS_LAYERS
+faIdx = ulong 0
+gdnIdx = ulong 0
+for L ulong nL bound 128
+doAdd = uint 1
+if eq L 0
+doAdd = 0
+end
+if not bmEmitRmsM4 get engLInNormVa L doAdd
+ret false
+end
+if eq get engLayerKind L 0
+if not bmEmitM4FaLayer L faIdx
+ret false
+end
+faIdx = add faIdx 1
+else
+if not bmEmitM4GdnLayer L gdnIdx doSnap
+ret false
+end
+gdnIdx = add gdnIdx 1
+end
+if not bmEmitM4MlpLayer L
+ret false
+end
+end
+ret bmEmitRmsM4 engW EW_FNORM 1
+end
+
+fn bmEmitM4LmHead nRows ulong to bool
+H = get engSpec MS_H
+nParts = div add nRows 63 64
+engPtr bmW M4_XN_ROT
+engPtr get bonLmT 0
+engPtr bmW M4_PARTS
+engArg uint H
+engArg uint nRows
+if not engPktEmitGy 22 uint nParts 1 256
+ret false
+end
+for m ulong 4
+engPtr add bmW M4_PARTS mul m mul nParts 8
+engPtr add get bonApuShmVa 0 add APU_SHM_BEST mul m 8
+engArg uint nParts
+if not engPktEmitGy 19 1 1 256
+ret false
+end
+end
+ret true
+end
+
+fn bmEmitMtpFaSub to bool
+nQ = get engSpec MS_NQ
+nKV = get engSpec MS_NKV
+hd = get engSpec MS_HD
+faIdx = get engSpec MS_N_FA
+kBase = get engKvVa faIdx
+vBase = add kBase div get engKvSlabBytes 0 2
+kInVa = add engW EW_QKV mul mul nQ mul hd 2 4
+vInVa = add kInVa mul mul nKV hd 4
+posVa = bmW M4_MTP_POS
+engPtr kInVa
+engPtr vInVa
+engPtr get bmKNormVa 0
+engPtr get engRopeVa 0
+engPtr kBase
+engPtr vBase
+engPtr posVa
+if not engPktEmitGy 7 uint nKV 1 uint hd
+ret false
+end
+engPtr engW EW_QKV
+engPtr get bmQNormVa 0
+engPtr get engRopeVa 0
+engPtr engW EW_QROT
+engPtr posVa
+if not engPktEmitGy 8 uint nQ 1 uint hd
+ret false
+end
+engPtr engW EW_QROT
+engPtr kBase
+engPtr vBase
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr posVa
+if not engPktEmitGy 9 uint nQ 8 32
+ret false
+end
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr engW EW_QKV
+engPtr engW EW_Y
+engArg 8
+ret engPktEmitGy 10 uint nQ 1 uint hd
+end
+
+fn bmEmitMtpKvOnlySub to bool
+H = get engSpec MS_H
+nQ = get engSpec MS_NQ
+nKV = get engSpec MS_NKV
+hd = get engSpec MS_HD
+qRows = mul nQ mul hd 2
+kvRows = mul nKV mul hd 2
+kInVa = add engW EW_QKV mul qRows 4
+wVa = add get bmQkvW 0 mul qRows div H 2
+sVa = add get bmQkvS 0 mul qRows div H 16
+if not bmEmitW4 engW EW_XN wVa sVa kInVa H kvRows
+ret false
+end
+kBase = get engKvVa get engSpec MS_N_FA
+vBase = add kBase div get engKvSlabBytes 0 2
+engPtr kInVa
+engPtr add kInVa mul mul nKV hd 4
+engPtr get bmKNormVa 0
+engPtr get engRopeVa 0
+engPtr kBase
+engPtr vBase
+engPtr bmW M4_MTP_POS
+ret engPktEmitGy 7 uint nKV 1 uint hd
+end
+
+fn bmEmitMtpFullTail to bool
+H = get engSpec MS_H
+I = get engSpec MS_I
+nQ = get engSpec MS_NQ
+hd = get engSpec MS_HD
+qkvTot = add mul nQ mul hd 2 mul get engSpec MS_NKV mul hd 2
+if not bmEmitW4 engW EW_XN get bmQkvW 0 get bmQkvS 0 engW EW_QKV H qkvTot
+ret false
+end
+if not bmEmitMtpFaSub
+ret false
+end
+if not bmEmitW4 engW EW_Y get bmOW 0 get bmOS 0 engW EW_AOUT mul nQ hd H
+ret false
+end
+if not engEmitRmsNormAdd get bmPostNormVa 0 1
+ret false
+end
+if not bmEmitW4 engW EW_XN get bmGuW 0 get bmGuS 0 engW EW_GU H mul I 2
+ret false
+end
+engPtr engW EW_GU
+engPtr engW EW_SW
+engArg uint I
+if not engPktEmitGy 2 uint div add I 255 256 1 256
+ret false
+end
+if not bmEmitW4 engW EW_SW get bmDnW 0 get bmDnS 0 engW EW_AOUT I H
+ret false
+end
+if not engEmitRmsNormAdd get bmSharedNormVa 0 1
+ret false
+end
+if not bmEmitCopyFast engW EW_X bmW M4_MTP_H H
+ret false
+end
+if not bonEmitFwht engW EW_XN engW BW_SIGN5120 engW BW_XN_ROT H
+ret false
+end
+ret bonEmitLmHead get bonLmNAll 0
+end
+
+fn bmEmitMtpDraft fullHead bool to bool
+H = get engSpec MS_H
+if not bmEmitCopySys add get bonApuShmVa 0 APU_SHM_XINIT bmW M4_MTP_E H
+ret false
+end
+if not bmEmitCopySys add get bonApuShmVa 0 APU_SHM_MTP_POS bmW M4_MTP_POS 1
+ret false
+end
+engPtr bmW M4_MTP_E
+engPtr get bmEnormVa 0
+engPtr bmW M4_MTP_H
+engPtr get bmHnormVa 0
+engPtr bmW M4_MTP_CAT
+if not engPktEmitGy 24 2 1 256
+ret false
+end
+if not bmEmitW4 bmW M4_MTP_CAT get bmEhW 0 get bmEhS 0 engW EW_X mul H 2 H
+ret false
+end
+if not engEmitRmsNormAdd get bmAttnNormVa 0 0
+ret false
+end
+if not fullHead
+ret bmEmitMtpKvOnlySub
+end
+ret bmEmitMtpFullTail
+end
+
+fn bmRecordPackets to bool
+H = get engSpec MS_H
+note Slot 6: M=4 Chunked Prefill Trunk (always available!)
+engPktStartAt add EW_PKT 25165824
+if not bmEmitM4Trunk false
+ret false
+end
+if not engPktFinish 6
+ret false
+end
+note Slot 16: GPU-coherent GDN state + conv tail reset (0.25 ms, safe across unlimited serve requests!)
+engPktStartAt add EW_PKT 67108864
+if not bmEmitZeroFast get engGdnStateVa 0 get bmGdnTotF32 0
+ret false
+end
+if not bmEmitZeroFast get engGdnTailVa 0 get bmTailTotF32 0
+ret false
+end
+if not engPktFinish 16
+ret false
+end
+if eq get bmMtpReady 0 0
+ret true
+end
+note Slot 4: blk.64 MTP Full Draft Step
+engPktStartAt add EW_PKT 16777216
+if not bmEmitMtpDraft true
+ret false
+end
+if not engPktFinish 4
+ret false
+end
+note Slot 5: blk.64 MTP KV-Populate Only (using current M4_MTP_H)
+engPktStartAt add EW_PKT 20971520
+if not bmEmitMtpDraft false
+ret false
+end
+if not engPktFinish 5
+ret false
+end
+note Slots 12, 13, 14: Pre-recorded GPU copy M4_X[kj]->M4_MTP_H + blk.64 KV-Only (kj=0,1,2, ZERO dynamic packets!)
+for kj ulong 3
+engPktStartAt add EW_PKT add 50331648 mul kj 4194304
+if not bmEmitCopyFast add bmW M4_X mul kj mul get engSpec MS_H 4 bmW M4_MTP_H get engSpec MS_H
+ret false
+end
+if not bmEmitMtpDraft false
+ret false
+end
+if eq kj 2
+if not bmEmitCopyFast add bmW M4_X mul 3 mul get engSpec MS_H 4 bmW M4_MTP_H get engSpec MS_H
+ret false
+end
+end
+if not engPktFinish add 12 kj
+ret false
+end
+end
+note Slot 15: Pre-recorded GPU copy EW_X -> M4_MTP_H (after prefill last 1-tok step!)
+engPktStartAt add EW_PKT 62914560
+if not bmEmitCopyFast engW EW_X bmW M4_MTP_H get engSpec MS_H
+ret false
+end
+if not engPktFinish 15
+ret false
+end
+note Slot 7: M=4 Verify Trunk (+3 GDN snapshots + final norm + FWHT + M4_X[3]->M4_MTP_H + APU copy or GPU lm_head!)
+engPktStartAt add EW_PKT 29360128
+if not bmEmitM4Trunk true
+ret false
+end
+if not bmEmitFwhtM4 bmW M4_XN engW BW_SIGN5120 bmW M4_XN_ROT H
+ret false
+end
+if not bmEmitCopyFast add bmW M4_X mul 3 mul H 4 bmW M4_MTP_H H
+ret false
+end
+if gt get bonLmNCpu 0 0
+if not bmEmitCopySys bmW M4_XN_ROT add get bonApuShmVa 0 APU_SHM_XROT_M4 mul H 4
+ret false
+end
+end
+if not engPktFinish 7
+ret false
+end
+note Slot 8: M=4 GPU lm_head slice (for Full-APU parallel M=4 verify!)
+engPktStartAt add EW_PKT 33554432
+if not bmEmitM4LmHead get bonLmNGpu 0
+ret false
+end
+if not engPktFinish 8
+ret false
+end
+note Slots 9, 10, 11: GDN Snapshot Restore + M4_X[acc-1]->M4_MTP_H for acc = 1, 2, 3!
+for si ulong 3
+engPktStartAt add EW_PKT add 37748736 mul si 4194304
+if not bmEmitCopyFast get bmGdnSnapVa si get engGdnStateVa 0 get bmGdnTotF32 0
+ret false
+end
+if not bmEmitCopyFast get bmTailSnapVa si get engGdnTailVa 0 get bmTailTotF32 0
+ret false
+end
+if not bmEmitCopyFast add bmW M4_X mul si mul H 4 bmW M4_MTP_H H
+ret false
+end
+if not engPktFinish add 9 si
+ret false
+end
+end
+ret true
+end
+
+fn bmLoadAndRecord to bool
+put bmMtpReady 0 0
+if and eq get ggHasMtp 0 1 eq get bmUseMtp 0 1
+if bmLoadMtpWeights
+put bmMtpReady 0 1
+end
+end
+ret bmRecordPackets
+end
+
+note =========================================================================
+note Runtime Helpers: M=4 Embeddings, MTP Draft, M=4 Verify, M=4 Chunked Prefill
+note =========================================================================
+fn bmLoadEmbedAt tok ulong shmOff ulong to bool
+H = get engSpec MS_H
+nb = div H 128
+rowBytes = mul nb 28
+foff = add get bonEmbRawOff 0 mul tok rowBytes
+if ne pread get ggFd 0 bonEmbRowBuf 0 rowBytes long foff long rowBytes
+ret false
+end
+for b ulong nb bound 64
+bonDequantEmbBlk b
+end
+nblks = div H 1024
+for kb ulong nblks bound 8
+bonFwht1024Cpu mul kb 1024
+end
+for i ulong H bound 8192
+v = mul get bonEmbF32 i get ggSign5120 i
+engPutU32Io mul i 4 bitcast uint v
+end
+ret eq mapwrite get bonApuShm 0 shmOff engIoBuf 0 mul H 4 long mul H 4
+end
+
+fn bmSetPos4 p0 ulong to bool
+for m ulong 4
+engPutU32Io mul m 4 uint add p0 m
+end
+ret eq mapwrite get bonApuShm 0 APU_SHM_POS engIoBuf 0 16 16
+end
+
+fn bmSetMtpPos p ulong to bool
+engPutU32Io 0 uint p
+ret eq mapwrite get bonApuShm 0 APU_SHM_MTP_POS engIoBuf 0 4 4
+end
+
+fn bmCopyH1ToMtp to bool
+ret engReplayPre 15
+end
+
+fn bmStepMtpKvFromM4 kj ulong tok ulong mtpPos ulong to bool
+if not bmLoadEmbedAt tok APU_SHM_XINIT
+ret false
+end
+if not bmSetMtpPos mtpPos
+ret false
+end
+ok5 = engReplayPre add 12 kj
+ret ok5
+end
+
+fn bmStepMtpDraft tok ulong mtpPos ulong to ulong
+if not bmLoadEmbedAt tok APU_SHM_XINIT
+ret 999999
+end
+if not bmSetMtpPos mtpPos
+ret 999999
+end
+if not engReplayPre 4
+ret 999999
+end
+if ne mapread get bonApuShm 0 APU_SHM_BEST engIoBuf 0 8 8
+ret 999999
+end
+ret ulong engGetU32Io 4
+end
+
+fn bmStepMtpKvOnly tok ulong mtpPos ulong to bool
+if not bmLoadEmbedAt tok APU_SHM_XINIT
+ret false
+end
+if not bmSetMtpPos mtpPos
+ret false
+end
+ok5 = engReplayPre 5
+ret ok5
+end
+
+fn bmStepVerifyM4Apu to bool
+if not engReplayPre 7
+ret false
+end
+r0 = mapset get gbmem 2 8192 4 0
+r1 = mapset get gbmem 3 0 4 0
+r2 = mapset get gbmem 3 16 4 0
+if not nvsend get engWork 0 get engSlotOff 8 uint div get engSlotLen 8 4
+ret false
+end
+put bonPipeMsg 0 2
+for w ulong 20
+wr = write get bonGoFds w bonPipeMsg 0 1
+end
+if not engWaitFast 10000000000
+ret false
+end
+if ne mapread get bonApuShm 0 APU_SHM_BEST engIoBuf 0 32 32
+ret false
+end
+bestV = new f32 4 0.0f32
+bestI = new ulong 4 0
+for m ulong 4
+put bestV m bitcast f32 engGetU32Io mul m 8
+put bestI m ulong engGetU32Io add mul m 8 4
+end
+for w2 ulong 20
+rd = read get bonResFds w2 bonPipeMsg 0 32
+for m2 ulong 4
+fv = bitcast f32 bonGetU32Msg mul m2 8
+idx = ulong bonGetU32Msg add mul m2 8 4
+if gt fv get bestV m2
+put bestV m2 fv
+put bestI m2 idx
+end
+end
+end
+for m3 ulong 4
+put bmVerToks m3 get bestI m3
+end
+ret true
+end
+
+fn bmStepVerifyM4 p0 ulong to bool
+H = get engSpec MS_H
+for m ulong 4
+if not bmLoadEmbedAt get bmM4Toks m add APU_SHM_XINIT mul m mul H 4
+ret false
+end
+end
+if not bmSetPos4 p0
+ret false
+end
+if ne get bonApuReady 0 0
+ret bmStepVerifyM4Apu
+end
+if not engReplayPre 7
+ret false
+end
+if not engReplayPre 8
+ret false
+end
+if ne mapread get bonApuShm 0 APU_SHM_BEST engIoBuf 0 32 32
+ret false
+end
+for m2 ulong 4
+put bmVerToks m2 ulong engGetU32Io add mul m2 8 4
+end
+ret true
+end
+
+fn bmPrefillAndFirst ntok ulong to ulong
+bonResetState
+H = get engSpec MS_H
+i = ulong 0
+note M=4 chunked prefill for all full 4-token blocks strictly before the final token!
+while le add i 4 sub ntok 1 bound 1024
+for m ulong 4
+if not bmLoadEmbedAt ulong get engTokSeq add i m add APU_SHM_XINIT mul m mul H 4
+ret 999999
+end
+end
+if not bmSetPos4 i
+ret 999999
+end
+if not engReplayPre 6
+ret 999999
+end
+if eq get bmMtpReady 0 1
+for m ulong 4
+if lt m 3
+if not bmStepMtpKvFromM4 m ulong get engTokSeq add add i m 1 add i m
+ret 999999
+end
+else
+if not bmStepMtpKvOnly ulong get engTokSeq add add i m 1 add i m
+ret 999999
+end
+end
+end
+end
+i = add i 4
+end
+note Tail single-token prefill + final token decode!
+while lt i ntok bound 16
+if not bonLoadEmbedCpu ulong get engTokSeq i
+ret 999999
+end
+if not bonSetPos i
+ret 999999
+end
+if eq add i 1 ntok
+tok = bonStepDecode
+if eq get bmMtpReady 0 1
+okH = bmCopyH1ToMtp
+end
+put engCurPos 0 ntok
+ret tok
+else
+if not engReplayPre 1
+ret 999999
+end
+if eq get bmMtpReady 0 1
+okH = bmCopyH1ToMtp
+okKv = bmStepMtpKvOnly ulong get engTokSeq add i 1 i
+end
+end
+i = add i 1
+end
+ret 999999
+end
+

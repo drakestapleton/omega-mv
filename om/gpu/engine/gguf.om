@@ -1,0 +1,695 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/gguf.om: Pure Seeded-OM-2 GGUF v3 Parser, Hadamard Sign Loader & Aligned SoA PTQ1_0/Q4_0 Weight Loader.
+note Zero C, zero Python, zero CUDA. Reads Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf directly into GB10 UVM!
+
+text ggDefName "ternary-bonsai-2.5-27b"
+const GG_MAX_TENSORS ulong 2048
+const GG_STR_POOL ulong 131072
+const GG_TYPE_F32 ulong 0
+const GG_TYPE_F16 ulong 1
+const GG_TYPE_Q4_0 ulong 2
+const GG_TYPE_PTQ1_0 ulong 143
+
+global ggIsGguf ulong 1
+global ggFd int 1
+global ggFilePath uchar 1024
+global ggFilePathLen ulong 1
+global ggNTensors ulong 1
+global ggNKv ulong 1
+global ggAlign ulong 1
+global ggDataStart ulong 1
+global ggCurOff ulong 1
+
+note Tensor table
+global ggNameOff uint 2048
+global ggNameLen uint 2048
+global ggDim0 ulong 2048
+global ggDim1 ulong 2048
+global ggTType uint 2048
+global ggTOff ulong 2048
+global ggNames uchar 131072
+global ggNamePos ulong 1
+
+note Streaming read buffer (64 KiB for header parsing)
+global ggHdrBuf uchar 65536
+global ggHdrPos ulong 1
+global ggHdrLen ulong 1
+global ggHdrFileOff ulong 1
+
+note Hadamard metadata & explicit sign vectors (widths 5120, 6144, 17408 -> 28672 floats)
+global ggHdmdBlock ulong 1
+global ggHdmdGdnGrp ulong 1
+global ggSignW ulong 8
+global ggSignWCnt ulong 1
+global ggSign5120 f32 5120
+global ggSign6144 f32 6144
+global ggSign17408 f32 17408
+global ggHasMtp ulong 1
+
+note Temporary key/string buffers
+global ggKeyBuf uchar 256
+global ggValBuf uchar 256
+global ggNameTmp uchar 128
+
+text ggSufMain "/Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf"
+text ggSufNoMtp "/Ternary-Bonsai-2.5-27B-PTQ1_0.gguf"
+text ggExtGguf ".gguf"
+text ggKAlign "general.alignment"
+text ggKBlocks "qwen35.block_count"
+text ggKNextn "qwen35.nextn_predict_layers"
+text ggKEmb "qwen35.embedding_length"
+text ggKFfn "qwen35.feed_forward_length"
+text ggKNq "qwen35.attention.head_count"
+text ggKNkv "qwen35.attention.head_count_kv"
+text ggKHd "qwen35.attention.key_length"
+text ggKFaInt "qwen35.full_attention_interval"
+text ggKRopeD "qwen35.rope.dimension_count"
+text ggKRopeTh "qwen35.rope.freq_base"
+text ggKConvK "qwen35.ssm.conv_kernel"
+text ggKGdnHd "qwen35.ssm.state_size"
+text ggKGdnNk "qwen35.ssm.group_count"
+text ggKGdnNv "qwen35.ssm.time_step_rank"
+text ggKHdBlk "prism.hadamard.block_size"
+text ggKHdSw "prism.hadamard.sign_widths"
+text ggKHdSv "prism.hadamard.sign_values"
+text ggKHdGrp "prism.hadamard.gdn_v_grouped"
+text ggKToks "tokenizer.ggml.tokens"
+
+fn ggKeyEq alen ulong b view uchar * to bool
+if ne alen len b
+ret false
+end
+for i ulong alen bound 256
+if ne get ggKeyBuf i get b i
+ret false
+end
+end
+ret true
+end
+
+fn ggDirEndsWith blen ulong suf view uchar * to bool
+sl = len suf
+if lt blen sl
+ret false
+end
+st = sub blen sl
+for i ulong sl bound 64
+if ne get engModelDir add st i get suf i
+ret false
+end
+end
+ret true
+end
+
+fn ggRefill to bool
+fd = get ggFd 0
+foff = get ggHdrFileOff 0
+got = pread fd ggHdrBuf 0 65536 long foff
+if le got 0
+ret false
+end
+put ggHdrFileOff 0 add foff ulong got
+put ggHdrPos 0 0
+put ggHdrLen 0 ulong got
+ret true
+end
+
+fn ggSkip n ulong to void
+remN = n
+while gt remN 0 bound 200000000
+avail = sub get ggHdrLen 0 get ggHdrPos 0
+if le remN avail
+put ggHdrPos 0 add get ggHdrPos 0 remN
+put ggCurOff 0 add get ggCurOff 0 remN
+ret
+end
+remN = sub remN avail
+put ggCurOff 0 add get ggCurOff 0 avail
+put ggHdrPos 0 get ggHdrLen 0
+if gt remN 65536
+put ggHdrFileOff 0 add get ggHdrFileOff 0 remN
+put ggCurOff 0 add get ggCurOff 0 remN
+put ggHdrPos 0 0
+put ggHdrLen 0 0
+ret
+end
+if not ggRefill
+ret
+end
+end
+end
+
+fn ggReadByte to uchar
+p = get ggHdrPos 0
+if ge p get ggHdrLen 0
+if not ggRefill
+ret 0
+end
+p = ulong 0
+end
+b = get ggHdrBuf p
+put ggHdrPos 0 add p 1
+put ggCurOff 0 add get ggCurOff 0 1
+ret b
+end
+
+fn ggReadU32 to uint
+b0 = uint ggReadByte
+b1 = uint ggReadByte
+b2 = uint ggReadByte
+b3 = uint ggReadByte
+ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn ggReadU64 to ulong
+lo = ulong ggReadU32
+hi = ulong ggReadU32
+ret or lo shl hi 32
+end
+
+fn ggReadKeyCap cap ulong to ulong
+slen = ggReadU64
+keep = slen
+if gt keep cap
+keep = cap
+end
+for i ulong keep bound 256
+put ggKeyBuf i ggReadByte
+end
+if gt slen keep
+ggSkip sub slen keep
+end
+ret slen
+end
+
+fn ggReadNameCap cap ulong to ulong
+slen = ggReadU64
+keep = slen
+if gt keep cap
+keep = cap
+end
+for i ulong keep bound 256
+put ggNameTmp i ggReadByte
+end
+if gt slen keep
+ggSkip sub slen keep
+end
+ret slen
+end
+
+fn ggScalarSize t uint to ulong
+if or eq t 0 or eq t 1 eq t 7
+ret 1
+end
+if or eq t 2 eq t 3
+ret 2
+end
+if or eq t 4 or eq t 5 eq t 6
+ret 4
+end
+if or eq t 10 or eq t 11 eq t 12
+ret 8
+end
+ret 0
+end
+
+fn ggSkipVal t uint to void
+if eq t 8
+slen = ggReadU64
+ggSkip slen
+ret
+end
+if eq t 9
+et = ggReadU32
+cnt = ggReadU64
+if eq et 8
+for i ulong cnt bound 1000000
+sl = ggReadU64
+ggSkip sl
+end
+ret
+end
+ss = ggScalarSize et
+if gt ss 0
+ggSkip mul cnt ss
+end
+ret
+end
+ss = ggScalarSize t
+if gt ss 0
+ggSkip ss
+end
+end
+
+fn ggReadScalarU64 t uint to ulong
+if eq t 0
+ret ulong ggReadByte
+end
+if eq t 1
+ret ulong ggReadByte
+end
+if eq t 2
+b0 = ulong ggReadByte
+b1 = ulong ggReadByte
+ret or b0 shl b1 8
+end
+if eq t 4
+ret ulong ggReadU32
+end
+if eq t 5
+ret ulong ggReadU32
+end
+if eq t 6
+f = bitcast f32 ggReadU32
+if lt f f32 0.0f32
+ret 0
+end
+ret ulong f
+end
+if eq t 7
+ret ulong ggReadByte
+end
+if eq t 10
+ret ggReadU64
+end
+if eq t 11
+ret ggReadU64
+end
+ggSkipVal t
+ret 0
+end
+
+fn ggStoreSignArr et uint cnt ulong to void
+if ne et 5
+ggSkip mul cnt ggScalarSize et
+ret
+end
+off = ulong 0
+wc = get ggSignWCnt 0
+for wi ulong wc bound 8
+w = get ggSignW wi
+for j ulong w bound 32768
+u = ggReadU32
+fv = f32 1.0f32
+if gt u 2147483647
+fv = f32 -1.0f32
+end
+if eq w 5120
+put ggSign5120 j fv
+else
+if eq w 6144
+put ggSign6144 j fv
+else
+if eq w 17408
+put ggSign17408 j fv
+end
+end
+end
+off = add off 1
+end
+end
+if gt cnt off
+ggSkip mul sub cnt off 4
+end
+end
+
+fn ggReadOneTok tid ulong to void
+sl = ggReadU64
+st = get q36TokPoolPos 0
+done = ulong 0
+while lt done sl bound 4096
+c = ggReadByte
+done = add done 1
+cp = ulong c
+if ge c 192
+if and lt c 224 lt done sl
+c2 = ggReadByte
+done = add done 1
+cp = or shl ulong and c 31 6 ulong and c2 63
+else
+if and lt c 240 le add done 2 sl
+c2 = ggReadByte
+c3 = ggReadByte
+done = add done 2
+cp = ulong 999
+else
+if le add done 3 sl
+c2 = ggReadByte
+c3 = ggReadByte
+c4 = ggReadByte
+done = add done 3
+cp = ulong 999
+end
+end
+end
+end
+if and lt cp 512 lt get q36TokPoolPos 0 Q36_STR_POOL
+put q36TokPool get q36TokPoolPos 0 get q36TokRev cp
+put q36TokPoolPos 0 add get q36TokPoolPos 0 1
+end
+end
+if lt tid Q36_VOCAB_MAX
+put q36TokOff tid uint st
+put q36TokLen tid ushort sub get q36TokPoolPos 0 st
+end
+end
+
+fn ggLoadTokArr cnt ulong to void
+q36TokInitRev
+for i ulong Q36_VOCAB_MAX
+put q36TokLen i 0
+put q36TokOff i 0
+end
+put q36TokPoolPos 0 0
+for tid ulong cnt bound 500000
+ggReadOneTok tid
+end
+q36TokBuildIndex
+end
+
+fn ggHandleKv klen ulong vt uint to void
+if ggKeyEq klen ggKAlign
+put ggAlign 0 ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKBlocks
+put engSpec MS_LAYERS ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKNextn
+put ggHasMtp 0 ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKEmb
+put engSpec MS_H ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKFfn
+put engSpec MS_I ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKNq
+put engSpec MS_NQ ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKNkv
+put engSpec MS_NKV ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKHd
+put engSpec MS_HD ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKFaInt
+put engSpec MS_FA_INT ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKRopeD
+put engSpec MS_ROPE_DIMS ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKRopeTh
+put engSpec MS_ROPE_THETA ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKConvK
+put engSpec MS_CONV_K ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKGdnHd
+put engSpec MS_GDN_HD ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKGdnNk
+put engSpec MS_GDN_NK ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKGdnNv
+put engSpec MS_GDN_NV ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKHdBlk
+put ggHdmdBlock 0 ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKHdGrp
+put ggHdmdGdnGrp 0 ggReadScalarU64 vt
+ret
+end
+if ggKeyEq klen ggKHdSw
+if eq vt 9
+et = ggReadU32
+cnt = ggReadU64
+put ggSignWCnt 0 cnt
+for i ulong cnt bound 8
+put ggSignW i ulong ggReadU32
+end
+ret
+end
+end
+if ggKeyEq klen ggKHdSv
+if eq vt 9
+et = ggReadU32
+cnt = ggReadU64
+ggStoreSignArr et cnt
+ret
+end
+end
+if ggKeyEq klen ggKToks
+if eq vt 9
+et = ggReadU32
+cnt = ggReadU64
+put engSpec MS_VOCAB cnt
+if eq et 8
+ggLoadTokArr cnt
+ret
+end
+ggSkip mul cnt ggScalarSize et
+ret
+end
+end
+ggSkipVal vt
+end
+
+fn ggTryOpenDir plen ulong to int
+fd = int fopen engModelDir 0 plen 0 0
+if lt fd 0
+ret -1
+end
+for i ulong plen bound 1024
+put ggFilePath i get engModelDir i
+end
+put ggFilePath plen 0
+put ggFilePathLen 0 plen
+ret fd
+end
+
+fn ggTryOpenTmp plen ulong to int
+fd = int fopen engPathTmp 0 plen 0 0
+if lt fd 0
+ret -1
+end
+for i ulong plen bound 1024
+put ggFilePath i get engPathTmp i
+end
+put ggFilePath plen 0
+put ggFilePathLen 0 plen
+ret fd
+end
+
+fn ggDetectAndOpen to bool
+put ggIsGguf 0 0
+dlen = get engModelDirLen 0
+if ggDirEndsWith dlen ggExtGguf
+fd = ggTryOpenDir dlen
+if ge fd 0
+put ggFd 0 fd
+put ggIsGguf 0 1
+ret true
+end
+ret false
+end
+p1 = engJoinPath ggSufMain
+fd1 = ggTryOpenTmp p1
+if ge fd1 0
+put ggFd 0 fd1
+put ggIsGguf 0 1
+ret true
+end
+p2 = engJoinPath ggSufNoMtp
+fd2 = ggTryOpenTmp p2
+if ge fd2 0
+put ggFd 0 fd2
+put ggIsGguf 0 1
+ret true
+end
+ret false
+end
+
+fn ggParseFile to bool
+put ggHdrFileOff 0 0
+put ggHdrPos 0 0
+put ggHdrLen 0 0
+put ggCurOff 0 0
+put ggAlign 0 32
+put ggNamePos 0 0
+put ggHdmdBlock 0 0
+put ggHdmdGdnGrp 0 0
+put ggSignWCnt 0 0
+put ggHasMtp 0 0
+for i ulong 64
+put engSpec i 0
+end
+put engSpec MS_ARCH 1
+put engSpec MS_FA_INT 4
+put engSpec MS_ROPE_THETA 10000000
+put engSpec MS_CONV_K 4
+put engSpec MS_EPS_E6 1
+put engSpec MS_MAX_CTX 131072
+put engSpec MS_NORM_ADD1 0
+put engSpec MS_QK_NORM 1
+put engSpec MS_ATTN_GATE 1
+put engSpec MS_TIE_EMB 0
+put engSpec MS_QUANT 3
+for ni ulong len ggDefName bound 64
+put engModelType ni get ggDefName ni
+end
+put engModelTypeLen 0 len ggDefName
+
+m = ggReadU32
+if ne m 1179993927
+ret false
+end
+ver = ggReadU32
+if lt ver 2
+ret false
+end
+nt = ggReadU64
+nkv = ggReadU64
+if gt nt GG_MAX_TENSORS
+ret false
+end
+put ggNTensors 0 nt
+put ggNKv 0 nkv
+for ki ulong nkv bound 4096
+kl = ggReadKeyCap 250
+vt = ggReadU32
+ggHandleKv kl vt
+end
+note Adjust trunk layer count (subtract nextn_predict_layers so MS_LAYERS = 64)
+nxt = get ggHasMtp 0
+if and gt nxt 0 gt get engSpec MS_LAYERS nxt
+put engSpec MS_LAYERS sub get engSpec MS_LAYERS nxt
+end
+engComputeLayerKinds
+for ti ulong nt bound 2048
+nl = ggReadNameCap 120
+np = get ggNamePos 0
+put ggNameOff ti uint np
+put ggNameLen ti uint nl
+for j ulong nl bound 128
+if lt np GG_STR_POOL
+put ggNames np get ggNameTmp j
+np = add np 1
+end
+end
+put ggNamePos 0 np
+nd = ggReadU32
+d0 = ulong 1
+d1 = ulong 1
+for di ulong ulong nd bound 8
+dv = ggReadU64
+if eq di 0
+d0 = dv
+else
+if eq di 1
+d1 = dv
+end
+end
+end
+put ggDim0 ti d0
+put ggDim1 ti d1
+put ggTType ti ggReadU32
+put ggTOff ti ggReadU64
+end
+al = get ggAlign 0
+if eq al 0
+al = ulong 32
+end
+pos = get ggCurOff 0
+ds = mul div add pos sub al 1 al al
+put ggDataStart 0 ds
+ret true
+end
+
+fn ggFindExact nm view uchar * nlen ulong to long
+nt = get ggNTensors 0
+for ti ulong nt bound 2048
+if eq ulong get ggNameLen ti nlen
+no = ulong get ggNameOff ti
+ok = true
+for j ulong nlen bound 128
+if ne get ggNames add no j get nm j
+ok = false
+break
+end
+end
+if ok
+ret long ti
+end
+end
+end
+ret -1
+end
+
+fn ggFmtLayerName L ulong suf view uchar * dst edit uchar 128 to ulong
+put dst 0 98
+put dst 1 108
+put dst 2 107
+put dst 3 46
+p = ulong 4
+if ge L 100
+put dst p uchar add 48 div L 100
+p = add p 1
+end
+if ge L 10
+put dst p uchar add 48 rem div L 10 10
+p = add p 1
+end
+put dst p uchar add 48 rem L 10
+p = add p 1
+put dst p 46
+p = add p 1
+for j ulong len suf bound 80
+put dst p get suf j
+p = add p 1
+end
+ret p
+end
+
+fn ggFindLayer L ulong suf view uchar * to long
+nm = new uchar 128 0
+nlen = ggFmtLayerName L suf nm
+ret ggFindExact nm nlen
+end
+
+fn ggFp16ToF32Bits h ulong to uint
+s = shl and h 32768 16
+e = and shr h 10 31
+m = and h 1023
+if eq e 0
+if eq m 0
+ret uint s
+end
+note Subnormal FP16: m * 2^-24
+f = mul f32 m f32 0.000000059604645f32
+if ne s 0
+f = sub f32 0.0f32 f
+end
+ret bitcast uint f
+end
+if eq e 31
+ret uint or or s 2139095040 shl m 13
+end
+ret uint or or s shl add e 112 23 shl m 13
+end

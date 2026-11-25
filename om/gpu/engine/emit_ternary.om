@@ -1,0 +1,1683 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/emit_ternary.om: High-Throughput Pure Seeded-OM-2 SM121 Blackwell SASS Kernels
+note for Ternary Bonsai 2.5 27B:
+note   - 128 Rows/CTA (4 rows/thread, 16 rows/warp) Exact 1.750000 bpw 896B-Tiled PTQ1_0!
+note   - 4x LDG.E.128 (2048 B/warp coalesced!) + 4x shared SMEM x + zero LUT bank conflicts!
+note   - 5-unrolled true Stall-1 4-way ILP across 4 independent row accumulators (R56..59)!
+note   - 1024-Block FWHT + BF16-State Grouped GDN!
+
+fn qSt1 to ulong
+ret qcw 1 7 7 0 0
+end
+
+fn qW0Fast to ulong
+ret qcw 1 7 7 1 0
+end
+
+note =========================================================================
+note Helper: Emit 1 ternary step across 4 rows (R44..47) x shared scalar xReg -> R56..59!
+note   True Stall-1 4-way ILP (24 insts in 30 cyc -> 0.80 IPC/warp, 1.00 IPC @ 8 warps/sched)!
+note   R16 = 0x4B000000, R17 = -8388609.0f. Uses R48..51, R53..55, R61 as temps.
+note =========================================================================
+fn tPtq1Step4R xReg ulong isLast bool to void
+qicImm 8 48 44 QZ 3 qSt1
+qicImm 8 49 45 QZ 3 qSt1
+qicImm 8 50 46 QZ 3 qSt1
+qicImm 8 51 47 QZ 3 qAlu3
+qic 17 53 48 QZ 8 qSt1
+qic 17 54 49 QZ 8 qSt1
+qic 17 55 50 QZ 8 qSt1
+qic 17 60 51 QZ 8 qSt1
+if not isLast
+qic 18 44 48 QZ 255 qSt1
+qic 18 45 49 QZ 255 qSt1
+qic 18 46 50 QZ 255 qSt1
+qic 18 47 51 QZ 255 qSt1
+else
+qic 0 QZ QZ QZ 0 qcw 4 7 7 0 0
+end
+qic 14 53 53 16 0 qSt1
+qic 14 54 54 16 0 qSt1
+qic 14 55 55 16 0 qSt1
+qic 14 60 60 16 0 qAlu3
+qic 30 53 53 17 0 qSt1
+qic 30 54 54 17 0 qSt1
+qic 30 55 55 17 0 qSt1
+qic 30 60 60 17 0 qAlu3
+qic4 33 56 53 xReg 56 qSt1
+qic4 33 57 54 xReg 57 qSt1
+qic4 33 58 55 xReg 58 qSt1
+qic4 33 59 60 xReg 59 qSt1
+end
+
+note =========================================================================
+note Helper: Process 1 u32 word (4 packed bytes -> 20 trits x 4 rows = 80 weights!)
+note   w0,w1,w2,w3 hold the u32 for rows 0..3 (shifted right by 8 in-place each iter j=0..3).
+note   Batch-loads all 5 x floats (R40..43, R52) in ONE SB0 wait while extracting bytes!
+note =========================================================================
+fn tPtq1EmitWord4R w0 ulong w1 ulong w2 ulong w3 ulong smBaseOff ulong tStride ulong to void
+qicImm 8 22 13 10 smBaseOff qAlu4
+qicImm 8 23 13 22 16 qAlu4
+mJ = get q36Pc 0
+note Compute 4 strided SMEM x addresses + issue 5x LDS.32 on SB0 in one burst!
+qicImm 8 48 13 22 tStride qSt1
+qicImm 8 49 13 22 mul tStride 2 qSt1
+qicImm 8 50 13 22 mul tStride 3 qSt1
+qicImm 8 51 13 22 mul tStride 4 qAlu4
+qic 49 40 22 QZ 0 qcw 2 0 7 0 1
+qic 49 41 48 QZ 0 qcw 2 0 7 0 1
+qic 49 42 49 QZ 0 qcw 2 0 7 0 1
+qic 49 43 50 QZ 0 qcw 2 0 7 0 1
+qic 49 52 51 QZ 0 qcw 2 0 7 0 1
+note Hide LDS latency behind byte extraction + shift!
+qic 18 44 w0 QZ 255 qSt1
+qic 18 45 w1 QZ 255 qSt1
+qic 18 46 w2 QZ 255 qSt1
+qic 18 47 w3 QZ 255 qSt1
+qic 17 w0 w0 QZ 8 qSt1
+qic 17 w1 w1 QZ 8 qSt1
+qic 17 w2 w2 QZ 8 qSt1
+qic 17 w3 w3 QZ 8 qAlu4
+qic 0 QZ QZ QZ 0 qW0Fast
+qicImm 8 22 13 22 4 qSt1
+tPtq1Step4R 40 false
+tPtq1Step4R 41 false
+tPtq1Step4R 42 false
+tPtq1Step4R 43 false
+note Hoist loop compare >=14 cyc before BRA while t=4 computes!
+qic 28 QZ 22 23 0 qSt1
+tPtq1Step4R 52 true
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mJ get q36Pc 0 qSt1
+end
+
+note =========================================================================
+note Helper: Decode 1 FP16 scale (hi16 of wcReg) into dstReg (exp<1 -> 0.0f)
+note =========================================================================
+fn tPtq1DecScale wcReg ulong dstReg ulong to void
+qic 17 dstReg wcReg QZ 16 qAlu4
+qic 17 48 dstReg QZ 10 qAlu4
+qLit 49 1
+qic 28 QZ 48 49 0 qCmp
+qicImm 8 dstReg dstReg QZ 8192 qAlu4
+qLit 49 939524096
+qIadd dstReg dstReg 49
+put q36Guard 0 2
+qLit dstReg 0
+end
+
+note =========================================================================
+note Helper: Tail qh[0..1] (8 weights x 4 rows) + 4x FP16 scales -> R18..21!
+note   wc0..3 are R26, R30, R34, R38 (qh[0] | qh[1]<<8 | d<<16).
+note =========================================================================
+fn tPtq1Tail4R to void
+for j ulong 2
+qicImm 8 22 13 10 add 480 mul j 4 qAlu4
+qicImm 8 48 13 22 8 qSt1
+qicImm 8 49 13 22 16 qSt1
+qicImm 8 50 13 22 24 qAlu4
+qic 49 40 22 QZ 0 qcw 2 0 7 0 1
+qic 49 41 48 QZ 0 qcw 2 0 7 0 1
+qic 49 42 49 QZ 0 qcw 2 0 7 0 1
+qic 49 43 50 QZ 0 qcw 2 0 7 0 1
+if eq j 0
+qic 18 44 26 QZ 255 qSt1
+qic 18 45 30 QZ 255 qSt1
+qic 18 46 34 QZ 255 qSt1
+qic 18 47 38 QZ 255 qAlu3
+else
+qic 17 44 26 QZ 8 qSt1
+qic 17 45 30 QZ 8 qSt1
+qic 17 46 34 QZ 8 qSt1
+qic 17 47 38 QZ 8 qAlu4
+qic 18 44 44 QZ 255 qSt1
+qic 18 45 45 QZ 255 qSt1
+qic 18 46 46 QZ 255 qSt1
+qic 18 47 47 QZ 255 qAlu3
+end
+qic 0 QZ QZ QZ 0 qW0Fast
+tPtq1Step4R 40 false
+tPtq1Step4R 41 false
+tPtq1Step4R 42 false
+tPtq1Step4R 43 true
+end
+tPtq1DecScale 26 40
+tPtq1DecScale 30 41
+tPtq1DecScale 34 42
+tPtq1DecScale 38 43
+qic4 33 18 56 40 18 qSt1
+qic4 33 19 57 41 19 qSt1
+qic4 33 20 58 42 20 qSt1
+qic4 33 21 59 43 21 qAlu4
+end
+
+note =========================================================================
+note Mode 400 / 403: tPtq1Gemv4R -- 128 Rows/CTA (4 rows/thread) 896-B Tiled PTQ1_0 GEMV!
+note   W_tile layout: [N/4, K/1024, 896 bytes] (EXACT 1.750000 bpw!)
+note   4x LDG.E.128 (2048 B/warp) -> 4x LDG.E.64 + 4x LDG.E.32 (1536 B/warp), zero LUT!
+note Args: x[K] (R0:1), W_tile (R2:3), C[N] (R4:5), K (24), N (28).
+note Grid: (ceil(N/128), 1, 1), Block: 256, SMEM: 4128.
+note =========================================================================
+fn tPtq1GemvBody isArgmax bool to void
+qStart 3
+note Save xPtr (R0:1) into SMEM[4096..4100]
+qLit 48 4224
+qLit 49 4228
+qLit 13 1
+bXp = qBssy
+qic 28 QZ 14 13 0 qCmp
+skXp = qBraFwd 1
+qic 50 QZ 48 0 0 qSt
+qic 50 QZ 49 1 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skXp 1
+qBsync bXp
+qBar
+note Shift pointers: W_tile->R0:1, C->R6:7
+qicImm 8 0 2 QZ 1 qAlu1
+qicImm 8 1 3 QZ 1 qAlu1
+qicImm 8 6 4 QZ 1 qAlu1
+qicImm 8 7 5 QZ 1 qAlu4
+qParam 12 24
+qParam 9 28
+note warp = tid >> 5 (R48), lane = tid & 31 (R49), sub = lane >> 3 (R50), blk = lane & 7 (R51)
+qic 17 48 14 QZ 5 qSt1
+qic 18 49 14 QZ 31 qAlu4
+qic 17 50 49 QZ 3 qSt1
+qic 18 51 49 QZ 7 qAlu4
+note rg0 = blockIdx.x * 32 + warp * 4 (R2), row0 = rg0 * 4 + sub (R8)
+qMad 2 15 32 QZ
+qMad 2 48 4 2
+qMad 8 2 4 50
+note nChunks = K >> 10 (R12), rgBytes = nChunks * 896 (R22)
+qic 17 12 12 QZ 10 qAlu4
+qMad 22 12 896 QZ
+qMad 23 22 2 QZ
+qMad 60 22 3 QZ
+note nRg = N >> 2 (R3); rg0_eff = min(rg0, nRg - 1) -> R4
+qic 17 3 9 QZ 2 qAlu4
+qLit 5 4294967295
+qIadd 5 3 5
+qicImm 8 4 2 QZ 1 qAlu4
+qic 28 QZ 2 3 0 qCmp
+put q36Guard 0 1
+qicImm 8 4 5 QZ 1 qAlu4
+note tileIdx0 = rg0_eff * nChunks -> R4, R0:1 += tileIdx0 * 896
+qMadReg 4 4 12 QZ
+qicImm 9 0 4 0 896 qAlu4
+note Clamp step1 (R22), step2 (R23), step3 (R60) to 0 if rg0 + k >= nRg
+qIadd 5 2 13
+qic 28 QZ 5 3 0 qCmp
+put q36Guard 0 1
+qLit 22 0
+qLit 48 2
+qIadd 5 2 48
+qic 28 QZ 5 3 0 qCmp
+put q36Guard 0 1
+qLit 23 0
+qLit 48 3
+qIadd 5 2 48
+qic 28 QZ 5 3 0 qCmp
+put q36Guard 0 1
+qLit 60 0
+note Store step1(R22), step2(R23), step3(R60) per warp into SMEM[4104 + warp*12] (lane 0 of each warp!)
+qic 17 48 14 QZ 5 qAlu4
+bStp = qBssy
+qic 28 QZ 49 13 0 qCmp
+skStp = qBraFwd 1
+qLit 52 4232
+qMad 52 48 12 52
+qLit 53 4
+qic 50 QZ 52 22 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 52 52 53
+qic 50 QZ 52 23 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 52 52 53
+qic 50 QZ 52 60 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skStp 1
+qBsync bStp
+qBar
+note Set pB0 = R0:1 + 512 + lane*8 (R2:3), pC0 = R0:1 + 768 + lane*4 (R4:5), pA0 = R0:1 + lane*16 (R0:1)
+qLit 5 512
+qMad 5 49 8 5
+qicImm 9 2 5 0 1 qAlu4
+qLit 5 768
+qMad 5 49 4 5
+qicImm 9 4 5 0 1 qAlu4
+qMad 48 49 16 QZ
+qicImm 9 0 48 0 1 qAlu4
+note smOff = blk * 512 (R10), constants R16/R17, 4 persistent accumulators R18..21
+qMad 10 51 528 QZ
+qLit 16 1258291200
+qNum 17 -8388609.0f32
+qNum 18 0.0f32
+qNum 19 0.0f32
+qNum 20 0.0f32
+qNum 21 0.0f32
+qLit 11 0
+mLoop = get q36Pc 0
+note 1. Load x[1024] + Half 1 (4x LDG.E.128 = 2048 B/warp for qs[0..15] of rows 0..3!) IN PARALLEL!
+qLit 48 4224
+qLit 49 4228
+qic 17 52 14 QZ 5 qAlu4
+qLit 53 4232
+qMad 52 52 12 53
+qicImm 8 53 13 52 4 qSt1
+qicImm 8 54 13 52 8 qAlu4
+qic 49 50 48 QZ 0 qcw 2 0 7 0 1
+qic 49 51 49 QZ 0 qcw 2 0 7 0 1
+qic 49 22 52 QZ 0 qcw 2 0 7 0 1
+qic 49 23 53 QZ 0 qcw 2 0 7 0 1
+qic 49 60 54 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qMad 48 11 1024 QZ
+qMad 48 14 4 48
+qicImm 9 44 48 50 4 qSt1
+qicImm 9 46 22 0 1 qSt1
+qicImm 9 48 23 0 1 qSt1
+qicImm 9 50 60 0 1 qAlu4
+qic 57 40 44 QZ 0 qcw 2 0 7 0 1
+qic 57 24 0 QZ 0 qcw 2 0 7 0 1
+qic 57 28 46 QZ 0 qcw 2 0 7 0 1
+qic 57 32 48 QZ 0 qcw 2 0 7 0 1
+qic 57 36 50 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+note Store x[1024] into bank-conflict-free SMEM[0..4223] (528B/block!) & sync CTA
+qic 17 49 14 QZ 5 qAlu4
+qMad 48 14 16 QZ
+qMad 48 49 16 48
+qLit 49 4
+for j ulong 4
+qic 50 QZ 48 add 40 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+if lt j 3
+qIadd 48 48 49
+end
+end
+qBar
+note 2. Compute Half 1 (qs[0..15] = 80 weights x 4 rows = 320 weights!)
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 58 0.0f32
+qNum 59 0.0f32
+tPtq1EmitWord4R 24 28 32 36 0 64
+tPtq1EmitWord4R 25 29 33 37 16 64
+tPtq1EmitWord4R 26 30 34 38 32 64
+tPtq1EmitWord4R 27 31 35 39 48 64
+note 3. Issue Half 2 (reload step1..3 + 4x LDG.E.64 qs[16..23] + 4x LDG.E.32 qh+d in ONE burst!)
+qic 17 52 14 QZ 5 qAlu4
+qLit 53 4232
+qMad 52 52 12 53
+qicImm 8 53 13 52 4 qSt1
+qicImm 8 54 13 52 8 qAlu4
+qic 49 22 52 QZ 0 qcw 2 0 7 0 1
+qic 49 23 53 QZ 0 qcw 2 0 7 0 1
+qic 49 60 54 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qicImm 9 40 22 2 1 qSt1
+qicImm 9 42 23 2 1 qSt1
+qicImm 9 44 60 2 1 qSt1
+qicImm 9 46 22 4 1 qSt1
+qicImm 9 48 23 4 1 qSt1
+qicImm 9 50 60 4 1 qAlu4
+qic 56 24 2 QZ 0 qcw 2 0 7 0 1
+qic 56 28 40 QZ 0 qcw 2 0 7 0 1
+qic 56 32 42 QZ 0 qcw 2 0 7 0 1
+qic 56 36 44 QZ 0 qcw 2 0 7 0 1
+qic 11 26 4 QZ 0 qcw 2 0 7 0 1
+qic 11 30 46 QZ 0 qcw 2 0 7 0 1
+qic 11 34 48 QZ 0 qcw 2 0 7 0 1
+qic 11 38 50 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+note 4. Compute Half 2 (qs[16..23] + qh[0..1] + 4x FP16 scales -> R18..21!)
+tPtq1EmitWord4R 24 28 32 36 320 32
+tPtq1EmitWord4R 25 29 33 37 336 32
+tPtq1Tail4R
+note 5. Advance tile pointers by 896 bytes & loop
+qicImm 9 0 13 0 896 qSt1
+qicImm 9 2 13 2 896 qSt1
+qicImm 9 4 13 4 896 qAlu4
+qIadd 11 11 13
+qBar
+qic 28 QZ 11 12 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+note 8-lane sub-warp reductions for ALL 4 rows (R18, R19, R20, R21)!
+qWarpRedSum 18 48 4
+qWarpRedSum 19 48 4
+qWarpRedSum 20 48 4
+qWarpRedSum 21 48 4
+if not isArgmax
+qic 18 48 14 QZ 7 qAlu4
+qic 28 QZ 48 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qLit 48 4
+for r ulong 4
+bSr = qBssy
+qic 28 QZ 8 9 0 qCmp
+skSr = qBraFwd 1
+qicImm 9 50 8 6 4 qAlu4
+qic 12 QZ 50 add 18 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSr 1
+qBsync bSr
+if lt r 3
+qIadd 8 8 48
+end
+end
+else
+note Fused CTA 128-row argmax! Reduce 4 rows per sub-warp (R18..21 at R8, +4, +8, +12) -> 32 finalists!
+qNum 49 -1000000000.0f32
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qicImm 8 18 49 QZ 1 qAlu4
+qLit 48 4
+qicImm 8 53 8 QZ 1 qAlu4
+for r ulong 3
+qIadd 53 53 48
+qic 28 QZ 53 9 0 qCmp
+put q36Guard 0 1
+qicImm 8 add 19 r 49 QZ 1 qAlu4
+qic 34 0 add 19 r 18 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 18 add 19 r QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 8 53 QZ 1 qAlu4
+end
+note Store 32 finalists to SMEM[subRow*4] & SMEM[128 + subRow*4]
+qic 18 48 14 QZ 7 qAlu1
+qic 17 49 14 QZ 3 qAlu4
+bAr = qBssy
+qic 28 QZ 48 13 0 qCmp
+skAr = qBraFwd 1
+qMad 50 49 4 QZ
+qLit 52 128
+qIadd 51 50 52
+qic 50 QZ 50 18 0 qSt
+qic 50 QZ 51 8 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skAr 1
+qBsync bAr
+qBar
+qic 28 QZ 14 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qNum 18 -1000000000.0f32
+qLit 19 0
+qLit 20 0
+qLit 21 32
+mR = get q36Pc 0
+qMad 48 20 4 QZ
+qLit 49 128
+qIadd 49 48 49
+qic 49 50 48 QZ 0 qLd
+qic 49 51 49 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 34 0 50 18 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 18 50 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 19 51 QZ 1 qAlu4
+qIadd 20 20 13
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mR get q36Pc 0 qAlu4
+qMad 48 15 2 QZ
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 18 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 48 48 13
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 19 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+fn tPtq1Gemv to void
+tPtq1GemvBody false
+end
+
+fn tPtq1ArgmaxPart to void
+tPtq1GemvBody true
+end
+
+note =========================================================================
+note Mode 401: tFwht1024 -- Normalized 1024-Block Sylvester Walsh-Hadamard Transform!
+note =========================================================================
+fn tFwht1024 to void
+qStart 3
+qParam 8 24
+qParam 9 28
+qMad 11 15 1024 QZ
+qMadReg 10 18 8 11
+for k ulong 4
+qLit 48 mul k 256
+qIadd 48 14 48
+qIadd 49 10 48
+qicImm 9 50 49 0 4 qW1
+qic 11 add 20 k 50 QZ 0 qLd
+end
+qLit 13 1
+bIn = qBssy
+qic 28 QZ 9 13 0 qCmp
+skIn = qBraFwd 1
+for k ulong 4
+qLit 48 mul k 256
+qIadd 48 14 48
+qIadd 49 11 48
+qicImm 9 50 49 2 4 qW1
+qic 11 add 24 k 50 QZ 0 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+for k ulong 4
+qic 32 add 20 k add 20 k add 24 k 0 qAlu1
+end
+qic 0 QZ QZ QZ 0 qAlu4
+qPatch skIn 1
+qBsync bIn
+qic 0 QZ QZ QZ 0 qW0
+qic 30 28 20 22 0 qAlu1
+qic 31 29 20 22 0 qAlu1
+qic 30 30 21 23 0 qAlu1
+qic 31 31 21 23 0 qAlu4
+qic 30 20 28 30 0 qAlu1
+qic 31 21 28 30 0 qAlu1
+qic 30 22 29 31 0 qAlu1
+qic 31 23 29 31 0 qAlu4
+for k ulong 4
+qLit 48 mul k 256
+qIadd 48 14 48
+qMad 48 48 4 QZ
+qic 50 QZ 48 add 20 k 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+qBar
+qic 17 48 14 QZ 6 qAlu1
+qic 18 49 14 QZ 63 qAlu4
+qMad 12 48 256 49
+for k ulong 4
+qLit 48 mul k 64
+qIadd 48 12 48
+qMad 48 48 4 QZ
+qic 49 add 20 k 48 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+end
+qic 30 28 20 22 0 qAlu1
+qic 31 29 20 22 0 qAlu1
+qic 30 30 21 23 0 qAlu1
+qic 31 31 21 23 0 qAlu4
+qic 30 20 28 30 0 qAlu1
+qic 31 21 28 30 0 qAlu1
+qic 30 22 29 31 0 qAlu1
+qic 31 23 29 31 0 qAlu4
+for k ulong 4
+qLit 48 mul k 64
+qIadd 48 12 48
+qMad 48 48 4 QZ
+qic 50 QZ 48 add 20 k 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+qBar
+qic 17 48 14 QZ 5 qAlu1
+qic 18 32 14 QZ 31 qAlu4
+qMad 12 48 128 32
+for k ulong 4
+qLit 48 mul k 32
+qIadd 48 12 48
+qMad 48 48 4 QZ
+qic 49 add 20 k 48 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+end
+qic 30 28 20 21 0 qAlu1
+qic 31 29 20 21 0 qAlu1
+qic 30 30 22 23 0 qAlu1
+qic 31 31 22 23 0 qAlu4
+qicImm 8 20 28 QZ 1 qAlu1
+qicImm 8 21 29 QZ 1 qAlu1
+qicImm 8 22 30 QZ 1 qAlu1
+qicImm 8 23 31 QZ 1 qAlu4
+qNum 34 1.0f32
+qNum 35 -1.0f32
+d = ulong 16
+while ge d 1 bound 5
+qic 18 48 32 QZ d qAlu4
+qic 28 QZ 48 13 0 qCmp
+qicImm 8 36 34 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 36 35 QZ 1 qAlu4
+for k ulong 4
+qic 60 add 28 k add 20 k QZ d qShfl
+end
+qic 0 QZ QZ QZ 0 qW0
+for k ulong 4
+qic4 33 add 20 k add 20 k 36 add 28 k qAlu1
+end
+qic 0 QZ QZ QZ 0 qAlu4
+d = shr d 1
+end
+qNum 34 0.03125f32
+for k ulong 4
+qic 32 add 20 k add 20 k 34 0 qAlu1
+end
+qic 0 QZ QZ QZ 0 qAlu4
+bOut = qBssy
+qic 28 QZ 9 13 0 qCmp
+skOut = qBraFwd 2
+for k ulong 4
+qLit 48 mul k 32
+qIadd 48 12 48
+qIadd 49 11 48
+qicImm 9 50 49 2 4 qW1
+qic 11 add 24 k 50 QZ 0 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+for k ulong 4
+qic 32 add 20 k add 20 k add 24 k 0 qAlu1
+end
+qic 0 QZ QZ QZ 0 qAlu4
+qPatch skOut 2
+qBsync bOut
+for k ulong 4
+qLit 48 mul k 32
+qIadd 48 12 48
+qIadd 49 10 48
+qicImm 9 50 49 4 4 qAlu4
+qic 12 QZ 50 add 20 k 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+note =========================================================================
+note Mode 402: tGdnStepBf16Grouped -- BF16-Packed-State GDN Step with GGUF Tiled->Grouped Map
+note =========================================================================
+fn tGdnStepBf16Grouped to void
+qStart 7
+qic 18 20 15 QZ 15 qAlu4
+qMad 21 20 128 14
+qicImm 9 16 21 0 4 qW1
+qic 11 22 16 QZ 0 qLd
+qLit 52 2048
+qIadd 23 21 52
+qicImm 9 16 23 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 53 14 4 QZ
+qic 50 QZ 53 22 0 qSt
+qLit 54 512
+qIadd 55 53 54
+qic 50 QZ 55 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qMad 27 15 128 14
+qLit 52 4096
+qIadd 28 27 52
+qicImm 9 16 28 0 4 qW1
+qic 11 25 16 QZ 0 qLd
+qicImm 9 16 27 2 4 qW1
+qic 11 26 16 QZ 0 qLd
+qicImm 9 16 14 10 4 qW1
+qic 11 33 16 QZ 0 qLd
+qicImm 9 16 15 4 4 qW1
+qic 11 20 16 QZ 0 qLd
+qLit 52 48
+qIadd 53 15 52
+qicImm 9 16 53 4 4 qW1
+qic 11 21 16 QZ 0 qLd
+qicImm 9 16 15 6 4 qW1
+qic 11 22 16 QZ 0 qLd
+qicImm 9 16 53 6 4 qW1
+qic 11 23 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 24 20 23 0 qAlu4
+qNum 30 20.0f32
+qNum 31 1.4426950408889634f32
+qNum 32 0.6931471805599453f32
+qNum 36 1.0f32
+qicImm 8 28 24 QZ 1 qAlu4
+bSp = qBssy
+qic 34 0 24 30 0x03f04000 qCmp
+skSp = qBraFwd 1
+qic 32 29 24 31 0 qAlu4
+qic 47 29 29 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 30 29 29 36 0 qAlu4
+qic 69 29 29 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 28 29 32 0 qAlu4
+qPatch skSp 1
+qBsync bSp
+qic 32 28 22 28 0 qAlu4
+qic 32 28 28 31 0 qAlu4
+qic 47 28 28 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qNum 30 -1.4426950408889634f32
+qSig 29 21 30 36
+qMad 32 15 8192 14
+qicImm 9 34 32 8 4 qAlu4
+qLit 58 1024
+qMad 58 14 4 58
+qNum 36 0.0f32
+qLit 37 0
+qLit 38 64
+qLit 39 1
+mP1 = get q36Pc 0
+qicImm 9 16 37 34 512 qW1
+qic 11 40 16 QZ 0 qLd
+qMad 53 37 8 54
+qLit 59 4
+qIadd 57 53 59
+qic 49 42 53 QZ 0 qLd
+qic 49 43 57 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qLit 61 60
+qic 28 QZ 37 61 0 qCmp
+qMad 61 37 512 58
+put q36Guard 0 2
+qic 50 QZ 61 40 0 qSt
+qicImm 8 44 40 QZ 65536 qAlu1
+qic 18 45 40 QZ 0xffff0000 qAlu4
+qic 32 44 44 28 0 qAlu1
+qic 32 45 45 28 0 qAlu4
+qic4 33 36 44 42 36 qAlu4
+qic4 33 36 45 43 36 qAlu4
+qic 0 QZ QZ QZ 0 qW1
+qIadd 37 37 39
+qic 28 QZ 37 38 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mP1 get q36Pc 0 qAlu4
+qic 31 46 25 36 0 qAlu4
+qic 32 46 46 29 0 qAlu4
+qNum 47 0.0f32
+qLit 37 0
+mP2 = get q36Pc 0
+qicImm 9 16 37 34 512 qW1
+qLit 61 60
+qic 28 QZ 37 61 0 qCmp
+qMad 61 37 512 58
+put q36Guard 0 2
+qic 49 40 61 QZ 0 qLd
+put q36Guard 0 1
+qic 11 40 16 QZ 0 qLd
+qMad 53 37 8 54
+qLit 59 4
+qIadd 57 53 59
+qic 49 42 53 QZ 0 qLd
+qic 49 43 57 QZ 0 qLd
+qMad 56 37 8 QZ
+qIadd 60 56 59
+qic 49 52 56 QZ 0 qLd
+qic 49 55 60 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qicImm 8 44 40 QZ 65536 qAlu1
+qic 18 45 40 QZ 0xffff0000 qAlu4
+qic 32 44 44 28 0 qAlu1
+qic 32 45 45 28 0 qAlu4
+qic4 33 44 42 46 44 qAlu1
+qic4 33 45 43 46 45 qAlu4
+qic4 33 47 44 52 47 qAlu4
+qic4 33 47 45 55 47 qAlu4
+qic 61 40 45 44 0 qAlu4
+qic 12 QZ 16 40 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 37 37 39
+qic 28 QZ 37 38 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mP2 get q36Pc 0 qAlu4
+qBar
+qic 32 48 47 47 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+qLit 55 1024
+bGn = qBssy
+qic 28 QZ 52 39 0 qCmp
+skGn = qBraFwd 1
+qMad 53 53 4 55
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skGn 1
+qBsync bGn
+qBar
+qNum 48 0.0f32
+for w ulong 4
+qLit 56 add 1024 mul w 4
+qic 49 49 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 49 0 qAlu4
+end
+qNum 49 0.0078125f32
+qNum 50 0.000001f32
+qic4 33 48 48 49 50 qAlu4
+qic 41 49 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qic 32 47 47 49 0 qAlu4
+qic 32 47 47 33 0 qAlu4
+qNum 30 -1.4426950408889634f32
+qNum 36 1.0f32
+qSig 31 26 30 36
+qic 32 26 26 31 0 qAlu4
+qic 32 47 47 26 0 qAlu4
+qic 18 52 15 QZ 15 qAlu1
+qic 17 53 15 QZ 4 qAlu4
+qMad 52 52 3 53
+qMad 52 52 128 14
+qicImm 9 16 52 12 4 qAlu4
+qic 12 QZ 16 47 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 404: tArgmaxReduce -- 1-CTA reduction of nParts (val, idx) pairs
+note =========================================================================
+fn tArgmaxReduce to void
+qStart 2
+qParam 8 16
+qNum 20 -1000000000.0f32
+qLit 21 0
+qicImm 8 22 14 QZ 1 qAlu4
+qLit 23 256
+qLit 13 1
+bAr = qBssy
+mAr = get q36Pc 0
+qic 28 QZ 22 8 0 qCmp
+skAr = qBraFwd 1
+qMad 48 22 2 QZ
+qicImm 9 50 48 0 4 qW1
+qic 11 24 50 QZ 0 qLd
+qIadd 48 48 13
+qicImm 9 50 48 0 4 qW1
+qic 11 25 50 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 34 0 24 20 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 20 24 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 21 25 QZ 1 qAlu4
+qIadd 22 22 23
+qic 46 QZ QZ QZ sub mAr get q36Pc 0 qAlu4
+qPatch skAr 1
+qBsync bAr
+qMad 48 14 4 QZ
+qLit 49 1024
+qIadd 50 48 49
+qic 50 QZ 48 20 0 qSt
+qic 50 QZ 50 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qic 28 QZ 14 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qNum 20 -1000000000.0f32
+qLit 21 0
+qLit 22 0
+mF = get q36Pc 0
+qMad 48 22 4 QZ
+qLit 49 1024
+qIadd 49 48 49
+qic 49 24 48 QZ 0 qLd
+qic 49 25 49 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 34 0 24 20 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 20 24 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 21 25 QZ 1 qAlu4
+qIadd 22 22 13
+qic 28 QZ 22 23 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mF get q36Pc 0 qAlu4
+qLit 48 0
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 20 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qicImm 9 50 13 2 4 qW1
+qic 12 QZ 50 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 405: tCopyF32 -- Fast coalesced copy of N floats (host-uncached <-> GPU-cached)
+note =========================================================================
+fn tCopyF32 to void
+qStart 2
+qParam 8 16
+qMad 20 15 256 14
+qic 28 QZ 20 8 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 48 20 0 4 qW1
+qic 11 21 48 QZ 0 qLd
+qicImm 9 50 20 2 4 qW1
+qic 0 QZ QZ QZ 0 qW0
+qic 12 QZ 50 21 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Mode 406 / 407: tPtq1GemmM4 / tPtq1ArgmaxM4 -- Batched M=4 PTQ1_0 GEMM!
+note   Reads EVERY 896-B weight tile ONCE for 4 tokens (4x less DRAM traffic/token)!
+note   SMEM: [0..16383] = X[4, 1024], [16384..16391] = xPtr, [16392] = K.
+note   Args: X[4,K] (R0:1), W_tile (R2:3), C (R4:5), K (24), N (28).
+note   Grid: (ceil(N/32), 1, 1), Block: 256, SMEM: 16416.
+note =========================================================================
+fn tPtq1M4Word5 wReg ulong smBaseOff ulong tStride ulong to void
+qic 18 32 wReg QZ 255 qSt1
+qic 17 33 wReg QZ 8 qSt1
+qic 17 34 wReg QZ 16 qSt1
+qic 17 35 wReg QZ 24 qcw 4 7 7 0 0
+qic 18 33 33 QZ 255 qSt1
+qic 18 34 34 QZ 255 qSt1
+qicImm 8 31 13 10 smBaseOff qAlu4
+qLit 22 0
+qLit 23 5
+mT = get q36Pc 0
+note Compact L1-ICache-resident loop (ZERO R60 usage -> R60..63 hold Row 1 accs!):
+qic 58 36 31 QZ 0 qcw 2 0 7 0 1
+qic 58 40 31 QZ 4224 qcw 2 0 7 0 1
+qicImm 8 48 32 QZ 3 qSt1
+qicImm 8 49 33 QZ 3 qSt1
+qicImm 8 50 34 QZ 3 qSt1
+qicImm 8 51 35 QZ 3 qAlu3
+qic 17 44 48 QZ 8 qSt1
+qic 17 45 49 QZ 8 qSt1
+qic 17 46 50 QZ 8 qSt1
+qic 17 47 51 QZ 8 qSt1
+qic 18 32 48 QZ 255 qSt1
+qic 18 33 49 QZ 255 qSt1
+qic 18 34 50 QZ 255 qSt1
+qic 18 35 51 QZ 255 qSt1
+qic 58 48 31 QZ 8448 qcw 2 2 7 0 1
+qic 58 52 31 QZ 12672 qcw 2 2 7 0 1
+qic 14 22 22 13 0 qSt1
+qic 14 44 44 16 0 qSt1
+qic 14 45 45 16 0 qSt1
+qic 14 46 46 16 0 qSt1
+qic 14 47 47 16 0 qAlu3
+qic 28 QZ 22 23 0 qSt1
+qic 30 44 44 17 0 qSt1
+qic 30 45 45 17 0 qSt1
+qic 30 46 46 17 0 qSt1
+qic 30 47 47 17 0 qAlu3
+qic 0 QZ QZ QZ 0 qcw 1 7 7 5 0
+qic4 33 56 44 36 56 qSt1
+qic4 33 57 44 40 57 qSt1
+qic4 33 58 44 48 58 qSt1
+qic4 33 59 44 52 59 qSt1
+qic4 33 56 45 37 56 qSt1
+qic4 33 57 45 41 57 qSt1
+qic4 33 58 45 49 58 qSt1
+qic4 33 59 45 53 59 qSt1
+qic4 33 56 46 38 56 qSt1
+qic4 33 57 46 42 57 qSt1
+qic4 33 58 46 50 58 qSt1
+qic4 33 59 46 54 59 qSt1
+qicImm 8 31 13 31 tStride qSt1
+qic4 33 56 47 39 56 qSt1
+qic4 33 57 47 43 57 qSt1
+qic4 33 58 47 51 58 qSt1
+qic4 33 59 47 55 59 qSt1
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mT get q36Pc 0 qSt1
+end
+
+fn tPtq1M4Tail a0 ulong a1 ulong a2 ulong a3 ulong to void
+qic 18 32 30 QZ 255 qSt1
+qic 17 33 30 QZ 8 qAlu4
+qic 18 33 33 QZ 255 qAlu4
+for half ulong 2
+smH = add 480 mul half 16
+qic 58 36 10 QZ smH qcw 2 0 7 0 1
+qic 58 40 10 QZ add smH 4224 qcw 2 0 7 0 1
+qic 58 48 10 QZ add smH 8448 qcw 2 0 7 0 1
+qic 58 52 10 QZ add smH 12672 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+for st ulong 2
+qicImm 8 44 32 QZ 3 qSt1
+qicImm 8 45 33 QZ 3 qAlu4
+qic 17 46 44 QZ 8 qSt1
+qic 17 47 45 QZ 8 qSt1
+qic 18 32 44 QZ 255 qSt1
+qic 18 33 45 QZ 255 qAlu3
+qic 14 46 46 16 0 qSt1
+qic 14 47 47 16 0 qAlu4
+qic 30 46 46 17 0 qSt1
+qic 30 47 47 17 0 qAlu4
+qic4 33 56 46 add 36 mul st 2 56 qSt1
+qic4 33 57 46 add 40 mul st 2 57 qSt1
+qic4 33 58 46 add 48 mul st 2 58 qSt1
+qic4 33 59 46 add 52 mul st 2 59 qSt1
+qic4 33 56 47 add 37 mul st 2 56 qSt1
+qic4 33 57 47 add 41 mul st 2 57 qSt1
+qic4 33 58 47 add 49 mul st 2 58 qSt1
+qic4 33 59 47 add 53 mul st 2 59 qSt1
+end
+end
+tPtq1DecScale 30 22
+qic4 33 a0 56 22 a0 qSt1
+qic4 33 a1 57 22 a1 qSt1
+qic4 33 a2 58 22 a2 qSt1
+qic4 33 a3 59 22 a3 qAlu4
+end
+
+fn tPtq1M4ComputeRow a0 ulong a1 ulong a2 ulong a3 ulong to void
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 58 0.0f32
+qNum 59 0.0f32
+tPtq1M4Word5 24 0 64
+tPtq1M4Word5 25 16 64
+tPtq1M4Word5 26 32 64
+tPtq1M4Word5 27 48 64
+tPtq1M4Word5 28 320 32
+tPtq1M4Word5 29 336 32
+tPtq1M4Tail a0 a1 a2 a3
+end
+
+fn tPtq1GemmM4Body isArgmax bool to void
+qStart 3
+qParam 12 24
+qParam 9 28
+qLit 48 16896
+qLit 49 16900
+qLit 50 16904
+qLit 51 16944
+qLit 52 16948
+qLit 13 1
+bXp = qBssy
+qic 28 QZ 14 13 0 qCmp
+skXp = qBraFwd 1
+qic 50 QZ 48 0 0 qSt
+qic 50 QZ 49 1 0 qSt
+qic 50 QZ 50 12 0 qSt
+qic 50 QZ 51 4 0 qSt
+qic 50 QZ 52 5 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skXp 1
+qBsync bXp
+qBar
+note Shift W_tile->R0:1 (C is safely stored in SMEM[16944..16948]!)
+qicImm 8 0 2 QZ 1 qAlu1
+qicImm 8 1 3 QZ 1 qAlu4
+note warp = tid >> 5 (R48), lane = tid & 31 (R49), sub = lane >> 3 (R50), blk = lane & 7 (R51)
+qic 17 48 14 QZ 5 qSt1
+qic 18 49 14 QZ 31 qAlu4
+qic 17 50 49 QZ 3 qSt1
+qic 18 51 49 QZ 7 qAlu4
+note 64 rows/CTA (2 row-groups/warp): rg0 = blockIdx.x*16 + warp*2 (R2), row0 = rg0*4 + sub (R8)
+qMad 2 15 16 QZ
+qMad 2 48 2 2
+qMad 8 2 4 50
+note nChunks = K >> 10 (R12), rgBytes = nChunks * 896 (R22), nRg = N >> 2 (R3)
+qic 17 12 12 QZ 10 qAlu4
+qMad 22 12 896 QZ
+qic 17 3 9 QZ 2 qAlu4
+qLit 5 4294967295
+qIadd 5 3 5
+qicImm 8 4 2 QZ 1 qAlu4
+qic 28 QZ 2 3 0 qCmp
+put q36Guard 0 1
+qicImm 8 4 5 QZ 1 qAlu4
+qMadReg 4 4 12 QZ
+qicImm 9 0 4 0 896 qAlu4
+note Clamp step1 (R22) = 0 if rg0 + 1 >= nRg, store per-warp into SMEM[16908 + warp*4]
+qIadd 5 2 13
+qic 28 QZ 5 3 0 qCmp
+put q36Guard 0 1
+qLit 22 0
+bStp = qBssy
+qic 28 QZ 49 13 0 qCmp
+skStp = qBraFwd 1
+qLit 52 16908
+qMad 52 48 4 52
+qic 50 QZ 52 22 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skStp 1
+qBsync bStp
+qBar
+note Set pB0 = R0:1 + 512 + lane*8 (R2:3), pC0 = R0:1 + 768 + lane*4 (R4:5), pA0 = R0:1 + lane*16 (R0:1)
+qLit 5 512
+qMad 5 49 8 5
+qicImm 9 2 5 0 1 qAlu4
+qLit 5 768
+qMad 5 49 4 5
+qicImm 9 4 5 0 1 qAlu4
+qMad 48 49 16 QZ
+qicImm 9 0 48 0 1 qAlu4
+qMad 10 51 528 QZ
+qLit 16 1258291200
+qNum 17 -8388609.0f32
+qNum 18 0.0f32
+qNum 19 0.0f32
+qNum 20 0.0f32
+qNum 21 0.0f32
+qNum 6 0.0f32
+qNum 7 0.0f32
+qNum 60 0.0f32
+qNum 61 0.0f32
+qLit 11 0
+mLoop = get q36Pc 0
+note 1. Issue Row 0 weight loads (SB2) in parallel with 4x LDG.E.128 X[4,1024] -> SMEM[0..16895]!
+qic 57 24 0 QZ 0 qcw 2 2 7 0 1
+qic 56 28 2 QZ 0 qcw 2 2 7 0 1
+qic 11 30 4 QZ 0 qcw 2 2 7 0 1
+qLit 48 16896
+qLit 49 16900
+qLit 52 16904
+qic 49 50 48 QZ 0 qcw 2 0 7 0 1
+qic 49 51 49 QZ 0 qcw 2 0 7 0 1
+qic 49 53 52 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qMad 54 11 1024 QZ
+qMad 54 14 4 54
+qIadd 31 54 53
+qIadd 49 31 53
+qIadd 52 49 53
+qicImm 9 44 54 50 4 qSt1
+qicImm 9 46 31 50 4 qSt1
+qicImm 9 22 52 50 4 qSt1
+qicImm 9 48 49 50 4 qAlu4
+qic 57 32 44 QZ 0 qcw 2 0 7 0 1
+qic 57 36 46 QZ 0 qcw 2 0 7 0 1
+qic 57 40 48 QZ 0 qcw 2 0 7 0 1
+qic 57 56 22 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qic 17 52 14 QZ 5 qAlu4
+qMad 48 14 16 QZ
+qMad 48 52 16 48
+qLit 52 4224
+qIadd 49 48 52
+qIadd 50 49 52
+qIadd 51 50 52
+qLit 53 4
+for j ulong 4
+qic 50 QZ 48 add 32 j 0 qSt
+qic 50 QZ 49 add 36 j 0 qSt
+qic 50 QZ 50 add 40 j 0 qSt
+qic 50 QZ 51 add 56 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+if lt j 3
+qIadd 48 48 53
+qIadd 49 49 53
+qIadd 50 50 53
+qIadd 51 51 53
+end
+end
+qic 0 QZ QZ QZ 0 qcw 1 7 7 4 0
+qBar
+note 2. Compute Row 0 (128 weights x 4 tokens -> R18..21)!
+tPtq1M4ComputeRow 18 19 20 21
+note 3. Load Row 1 weights (pA0+step1, pB0+step1, pC0+step1) & compute Row 1 from SAME SMEM X -> R6,R7,R60,R61!
+qic 17 52 14 QZ 5 qAlu4
+qLit 53 16908
+qMad 52 52 4 53
+qic 49 22 52 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qicImm 9 44 22 0 1 qSt1
+qicImm 9 46 22 2 1 qSt1
+qicImm 9 48 22 4 1 qAlu4
+qic 57 24 44 QZ 0 qcw 2 2 7 0 1
+qic 56 28 46 QZ 0 qcw 2 2 7 0 1
+qic 11 30 48 QZ 0 qcw 2 2 7 0 1
+qic 0 QZ QZ QZ 0 qcw 1 7 7 4 0
+tPtq1M4ComputeRow 6 7 60 61
+note 4. Advance Row 0 pointers by 896 & loop!
+qicImm 9 0 13 0 896 qSt1
+qicImm 9 2 13 2 896 qSt1
+qicImm 9 4 13 4 896 qAlu4
+qIadd 11 11 13
+qBar
+qic 28 QZ 11 12 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+note Reload C pointer from SMEM[16944..16948] into R2:3!
+qLit 48 16944
+qLit 49 16948
+qic 49 2 48 QZ 0 qcw 2 0 7 0 1
+qic 49 3 49 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+note 8-lane sub-warp reductions for BOTH rows (R18..21 and R6,R7,R60,R61)!
+qWarpRedSum 18 48 4
+qWarpRedSum 19 48 4
+qWarpRedSum 20 48 4
+qWarpRedSum 21 48 4
+qWarpRedSum 6 48 4
+qWarpRedSum 7 48 4
+qWarpRedSum 60 48 4
+qWarpRedSum 61 48 4
+if not isArgmax
+qic 18 48 14 QZ 7 qAlu4
+qic 28 QZ 48 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+bS0 = qBssy
+qic 28 QZ 8 9 0 qCmp
+skS0 = qBraFwd 1
+for m ulong 4
+qLit 48 m
+qMadReg 48 48 9 8
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 add 18 m 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+qPatch skS0 1
+qBsync bS0
+qLit 48 4
+qIadd 8 8 48
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+note Store Row 1 (R6, R7, R60, R61) for m=0..3!
+qLit 48 0
+qMadReg 48 48 9 8
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 6 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 48 1
+qMadReg 48 48 9 8
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 7 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 48 2
+qMadReg 48 48 9 8
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 60 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 48 3
+qMadReg 48 48 9 8
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 61 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+else
+note Fused CTA 64-row argmax for ALL 4 tokens -> Parts[m * nParts * 2 + blockIdx.x * 2 + {0,1}]!
+note Copy R6,R7,R60,R61 -> R32..35 so loop over m=0..3 is uniform!
+qicImm 8 32 6 QZ 1 qAlu1
+qicImm 8 33 7 QZ 1 qAlu1
+qicImm 8 34 60 QZ 1 qAlu1
+qicImm 8 35 61 QZ 1 qAlu4
+qNum 49 -1000000000.0f32
+qic 28 QZ 8 9 0 qCmp
+for m ulong 4
+put q36Guard 0 1
+qicImm 8 add 18 m 49 QZ 1 qAlu1
+end
+qLit 52 4
+qIadd 53 8 52
+qic 28 QZ 53 9 0 qCmp
+for m ulong 4
+put q36Guard 0 1
+qicImm 8 add 32 m 49 QZ 1 qAlu1
+end
+qic 0 QZ QZ QZ 0 qAlu4
+for m ulong 4
+qicImm 8 add 26 m 8 QZ 1 qAlu4
+qic 34 0 add 32 m add 18 m 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 add 18 m add 32 m QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 add 26 m 53 QZ 1 qAlu4
+end
+qLit 48 63
+qIadd 48 9 48
+qic 17 22 48 QZ 6 qAlu4
+qic 18 23 14 QZ 7 qAlu1
+qic 17 24 14 QZ 3 qAlu4
+bAm = qBssy
+qic 28 QZ 23 13 0 qCmp
+skAm = qBraFwd 1
+qMad 50 24 4 QZ
+qLit 52 128
+for m ulong 4
+qic 50 QZ 50 add 18 m 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 50 50 52
+end
+for m ulong 4
+qic 50 QZ 50 add 26 m 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 50 50 52
+end
+qPatch skAm 1
+qBsync bAm
+qBar
+qLit 48 4
+qic 28 QZ 14 48 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qMad 25 14 128 QZ
+qLit 48 512
+qIadd 26 25 48
+qNum 30 -1000000000.0f32
+qLit 31 0
+qLit 32 0
+qLit 33 32
+mRm = get q36Pc 0
+qMad 48 32 4 25
+qMad 49 32 4 26
+qic 49 50 48 QZ 0 qLd
+qic 49 51 49 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 34 0 50 30 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 30 50 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 31 51 QZ 1 qAlu4
+qIadd 32 32 13
+qic 28 QZ 32 33 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mRm get q36Pc 0 qAlu4
+qMadReg 48 14 22 15
+qMad 48 48 2 QZ
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 30 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 48 48 13
+qicImm 9 50 48 2 4 qW1
+qic 12 QZ 50 31 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+fn tPtq1GemmM4 to void
+qStart 3
+qParam 12 24
+qParam 9 28
+qLit 48 16896
+qLit 49 16900
+qLit 50 16904
+qLit 13 1
+bXp = qBssy
+qic 28 QZ 14 13 0 qCmp
+skXp = qBraFwd 1
+qic 50 QZ 48 0 0 qSt
+qic 50 QZ 49 1 0 qSt
+qic 50 QZ 50 12 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skXp 1
+qBsync bXp
+qBar
+qicImm 8 0 2 QZ 1 qAlu1
+qicImm 8 1 3 QZ 1 qAlu1
+qicImm 8 6 4 QZ 1 qAlu1
+qicImm 8 7 5 QZ 1 qAlu4
+qic 17 48 14 QZ 5 qSt1
+qic 18 49 14 QZ 31 qAlu4
+qic 17 50 49 QZ 3 qSt1
+qic 18 51 49 QZ 7 qAlu4
+qMad 2 15 8 QZ
+qIadd 2 2 48
+qMad 8 2 4 50
+qic 17 12 12 QZ 10 qAlu4
+qic 17 3 9 QZ 2 qAlu4
+qLit 5 4294967295
+qIadd 5 3 5
+qicImm 8 4 2 QZ 1 qAlu4
+qic 28 QZ 2 3 0 qCmp
+put q36Guard 0 1
+qicImm 8 4 5 QZ 1 qAlu4
+qMadReg 4 4 12 QZ
+qicImm 9 0 4 0 896 qAlu4
+qLit 5 512
+qMad 5 49 8 5
+qicImm 9 2 5 0 1 qAlu4
+qLit 5 768
+qMad 5 49 4 5
+qicImm 9 4 5 0 1 qAlu4
+qMad 48 49 16 QZ
+qicImm 9 0 48 0 1 qAlu4
+qMad 10 51 528 QZ
+qLit 16 1258291200
+qNum 17 -8388609.0f32
+qNum 18 0.0f32
+qNum 19 0.0f32
+qNum 20 0.0f32
+qNum 21 0.0f32
+qLit 11 0
+mLoop = get q36Pc 0
+qic 57 24 0 QZ 0 qcw 2 2 7 0 1
+qic 56 28 2 QZ 0 qcw 2 2 7 0 1
+qic 11 30 4 QZ 0 qcw 2 2 7 0 1
+qLit 48 16896
+qLit 49 16900
+qLit 52 16904
+qic 49 50 48 QZ 0 qcw 2 0 7 0 1
+qic 49 51 49 QZ 0 qcw 2 0 7 0 1
+qic 49 53 52 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qMad 54 11 1024 QZ
+qMad 54 14 4 54
+qIadd 31 54 53
+qIadd 49 31 53
+qIadd 52 49 53
+qicImm 9 44 54 50 4 qSt1
+qicImm 9 46 31 50 4 qSt1
+qicImm 9 22 52 50 4 qSt1
+qicImm 9 48 49 50 4 qAlu4
+qic 57 32 44 QZ 0 qcw 2 0 7 0 1
+qic 57 36 46 QZ 0 qcw 2 0 7 0 1
+qic 57 40 48 QZ 0 qcw 2 0 7 0 1
+qic 57 56 22 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qic 17 52 14 QZ 5 qAlu4
+qMad 48 14 16 QZ
+qMad 48 52 16 48
+qLit 52 4224
+qIadd 49 48 52
+qIadd 50 49 52
+qIadd 51 50 52
+qLit 53 4
+for j ulong 4
+qic 50 QZ 48 add 32 j 0 qSt
+qic 50 QZ 49 add 36 j 0 qSt
+qic 50 QZ 50 add 40 j 0 qSt
+qic 50 QZ 51 add 56 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+if lt j 3
+qIadd 48 48 53
+qIadd 49 49 53
+qIadd 50 50 53
+qIadd 51 51 53
+end
+end
+qic 0 QZ QZ QZ 0 qcw 1 7 7 4 0
+qBar
+tPtq1M4ComputeRow 18 19 20 21
+qicImm 9 0 13 0 896 qSt1
+qicImm 9 2 13 2 896 qSt1
+qicImm 9 4 13 4 896 qAlu4
+qIadd 11 11 13
+qBar
+qic 28 QZ 11 12 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+qWarpRedSum 18 48 4
+qWarpRedSum 19 48 4
+qWarpRedSum 20 48 4
+qWarpRedSum 21 48 4
+qic 18 48 14 QZ 7 qAlu4
+qic 28 QZ 48 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for m ulong 4
+qLit 48 m
+qMadReg 48 48 9 8
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 add 18 m 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+fn tPtq1ArgmaxM4 to void
+tPtq1GemmM4Body true
+end
+
+note =========================================================================
+note Mode 408: tRmsNormAddM4 -- Batched M-token RMSNorm + optional residual add (grid_y = M)
+note   Args: x[M,H] (R0:1), aout[M,H] (R2:3), w[H] (R4:5), xn[M,H] (R6:7), doAdd (32).
+note   Grid: (1, M, 1), Block: 256, SMEM: 64.
+note =========================================================================
+fn tRmsNormAddM4 to void
+H = get engSpec MS_H
+nIter = div H 256
+eps = mul f32 get engSpec MS_EPS_E6 f32 0.000001f32
+invH = div f32 1.0f32 f32 H
+qStart 4
+qParam 19 32
+qMad 23 18 H QZ
+qNum 48 0.0f32
+qLit 20 0
+qLit 21 nIter
+qLit 22 1
+mSum = get q36Pc 0
+qMad 52 20 256 14
+qIadd 53 52 23
+qicImm 9 16 53 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+bA = qBssy
+qic 28 QZ 19 22 0 qCmp
+skA = qBraFwd 2
+qicImm 9 32 53 2 4 qW1
+qic 11 34 32 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 24 24 34 0 qAlu4
+qic 12 QZ 16 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skA 2
+qBsync bA
+qic4 33 48 24 24 48 qAlu4
+qIadd 20 20 22
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mSum get q36Pc 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+bW = qBssy
+qic 28 QZ 52 22 0 qCmp
+skW = qBraFwd 1
+qMad 53 53 4 QZ
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skW 1
+qBsync bW
+qBar
+qNum 48 0.0f32
+for wi ulong 8
+qLit 52 mul wi 4
+qic 49 53 52 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 53 0 qAlu4
+end
+qNum 52 invH
+qNum 53 eps
+qic4 33 48 48 52 53 qAlu4
+qic 41 48 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qLit 20 0
+mOut = get q36Pc 0
+qMad 52 20 256 14
+qIadd 53 52 23
+qicImm 9 16 53 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qicImm 9 32 52 4 4 qW1
+qic 11 25 32 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 24 24 48 0 qAlu4
+qic 32 24 24 25 0 qAlu4
+qicImm 9 16 53 6 4 qW1
+qic 12 QZ 16 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 20 20 22
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mOut get q36Pc 0 qAlu4
+end
+
+note =========================================================================
+note Mode 409: tRmsNormCat2 -- MTP blk.64 [enorm(e) || hnorm(h)] -> out[2*H] in 1 launch!
+note   Args: e (R0:1), enorm (R2:3), h (R4:5), hnorm (R6:7), out (R8:9).
+note   Grid: (2, 1, 1), Block: 256, SMEM: 64.
+note =========================================================================
+fn tRmsNormCat2 to void
+H = get engSpec MS_H
+nIter = div H 256
+eps = mul f32 get engSpec MS_EPS_E6 f32 0.000001f32
+invH = div f32 1.0f32 f32 H
+qStart 5
+qLit 22 1
+bSel = qBssy
+qic 28 QZ 15 22 0 qCmp
+skSel = qBraFwd 2
+qicImm 8 0 4 QZ 1 qAlu1
+qicImm 8 1 5 QZ 1 qAlu1
+qicImm 8 2 6 QZ 1 qAlu1
+qicImm 8 3 7 QZ 1 qAlu1
+qLit 52 H
+qicImm 9 8 52 8 4 qAlu4
+qPatch skSel 2
+qBsync bSel
+qNum 48 0.0f32
+qLit 20 0
+qLit 21 nIter
+mSum = get q36Pc 0
+qMad 52 20 256 14
+qicImm 9 16 52 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic4 33 48 24 24 48 qAlu4
+qIadd 20 20 22
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mSum get q36Pc 0 qAlu4
+qWarpRedSum 48 52 16
+qic 18 52 14 QZ 31 qAlu4
+qic 17 53 14 QZ 5 qAlu4
+bW = qBssy
+qic 28 QZ 52 22 0 qCmp
+skW = qBraFwd 1
+qMad 53 53 4 QZ
+qic 50 QZ 53 48 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skW 1
+qBsync bW
+qBar
+qNum 48 0.0f32
+for wi ulong 8
+qLit 52 mul wi 4
+qic 49 53 52 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 48 48 53 0 qAlu4
+end
+qNum 52 invH
+qNum 53 eps
+qic4 33 48 48 52 53 qAlu4
+qic 41 48 48 QZ 0 qMufu
+qic 0 QZ QZ QZ 0 qW0
+qLit 20 0
+mOut = get q36Pc 0
+qMad 52 20 256 14
+qicImm 9 16 52 0 4 qW1
+qic 11 24 16 QZ 0 qLd
+qicImm 9 32 52 2 4 qW1
+qic 11 25 32 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 32 24 24 48 0 qAlu4
+qic 32 24 24 25 0 qAlu4
+qicImm 9 16 52 8 4 qW1
+qic 12 QZ 16 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 20 20 22
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mOut get q36Pc 0 qAlu4
+end
+
+note =========================================================================
+note Mode 410: tCopyF32Fast -- Fast GPU-L2 4-float/thread copy (for GDN state snapshots!)
+note   Args: src (R0:1), dst (R2:3), nF32 (16, multiple of 4).
+note   Grid: (ceil(nF32 / 1024), 1, 1), Block: 256, SMEM: 0.
+note =========================================================================
+fn tCopyF32Fast to void
+qStart 2
+qParam 8 16
+qMad 20 15 256 14
+qMad 20 20 4 QZ
+qic 28 QZ 20 8 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 48 20 0 4 qW1
+qic 57 24 48 QZ 0 qLd
+qicImm 9 50 20 2 4 qW1
+qLit 13 1
+qic 0 QZ QZ QZ 0 qW0
+for j ulong 4
+qic 12 QZ 50 add 24 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+if lt j 3
+qicImm 9 50 13 50 4 qAlu4
+end
+end
+end
+
+note =========================================================================
+note Mode 411: tZeroF32 -- Fast GPU-L2-coherent 4-float/thread zeroing (for multi-request serve!)
+note   Args: dst (R0:1), nF32 (8, multiple of 4).
+note   Grid: (ceil(nF32 / 1024), 1, 1), Block: 256, SMEM: 0.
+note =========================================================================
+fn tZeroF32 to void
+qStart 1
+qParam 8 8
+qMad 20 15 256 14
+qMad 20 20 4 QZ
+qic 28 QZ 20 8 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 50 20 0 4 qW1
+qLit 13 1
+qLit 24 0
+for j ulong 4
+qic 12 QZ 50 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+if lt j 3
+qicImm 9 50 13 50 4 qAlu4
+end
+end
+end
+
+fn tTernaryKernel mode ulong to bool
+if eq mode 400
+tPtq1Gemv
+ret true
+end
+if eq mode 401
+tFwht1024
+ret true
+end
+if eq mode 402
+tGdnStepBf16Grouped
+ret true
+end
+if eq mode 403
+tPtq1ArgmaxPart
+ret true
+end
+if eq mode 404
+tArgmaxReduce
+ret true
+end
+if eq mode 405
+tCopyF32
+ret true
+end
+if eq mode 406
+tPtq1GemmM4
+ret true
+end
+if eq mode 407
+tPtq1ArgmaxM4
+ret true
+end
+if eq mode 408
+tRmsNormAddM4
+ret true
+end
+if eq mode 409
+tRmsNormCat2
+ret true
+end
+if eq mode 410
+tCopyF32Fast
+ret true
+end
+if eq mode 411
+tZeroF32
+ret true
+end
+ret false
+end
