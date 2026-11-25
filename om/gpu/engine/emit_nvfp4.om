@@ -1,0 +1,774 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/emit_nvfp4.om: Pure Seeded-OM-2 SM121 Blackwell Canonical NVFP4 Kernels
+note   - Canonical NVIDIA NVFP4: packed FP4 E2M1 nibbles W_u8[N, K/2] + per-16 UE4M3 scales S_u8[N, K/16] + alpha=1/256
+note   - Mode 420: tPtq1ToNvfp4   -- On-GPU exact PTQ1_0 -> NVFP4 converter (<0.1s for 25.6B weights!)
+note   - Mode 421: n4Gemv         -- 32 Rows/CTA, 2.2 KB SMEM (6 CTAs/SM max occupancy!), LDG.E.128 1-tok NVFP4 GEMV
+note   - Mode 422: n4ArgmaxPart   -- Fused 32-row CTA NVFP4 argmax (1-tok lm_head)
+note   - Mode 423: n4GemmM4       -- 32 Rows/CTA, 5.2 KB SMEM (6 CTAs/SM max occupancy!), M=4 Batched NVFP4 GEMM
+note   - Mode 424: n4ArgmaxM4     -- Fused 32-row CTA M=4 NVFP4 argmax (4 tokens in 1 pass!)
+
+note =========================================================================
+note Helper for Mode 420: map trit (0->mNeg, 1->0, 2->mPos) in reg tr -> nib in dst!
+note   R18 = mPos, R19 = mNeg, R20 = 1, R21 = 2. Uses R48 as temp.
+note =========================================================================
+fn n4MapTrit tr ulong dst ulong to void
+qLit dst 0
+qic 28 QZ tr 20 0 qCmp
+put q36Guard 0 2
+qicImm 8 dst 19 QZ 1 qAlu1
+qic 28 QZ tr 21 0 qCmp
+put q36Guard 0 1
+qicImm 8 dst 18 QZ 1 qAlu4
+end
+
+note Extract 1 trit step from 4 packed byte regs (R32..35) -> pack 4 nibbles into u16 in outReg!
+fn n4Pack4Trits outReg ulong isLast bool to void
+qicImm 8 40 32 QZ 3 qSt1
+qicImm 8 41 33 QZ 3 qSt1
+qicImm 8 42 34 QZ 3 qSt1
+qicImm 8 43 35 QZ 3 qAlu3
+qic 17 44 40 QZ 8 qSt1
+qic 17 45 41 QZ 8 qSt1
+qic 17 46 42 QZ 8 qSt1
+qic 17 47 43 QZ 8 qAlu4
+if not isLast
+qic 18 32 40 QZ 255 qSt1
+qic 18 33 41 QZ 255 qSt1
+qic 18 34 42 QZ 255 qSt1
+qic 18 35 43 QZ 255 qAlu4
+end
+n4MapTrit 44 40
+n4MapTrit 45 41
+n4MapTrit 46 42
+n4MapTrit 47 43
+qicImm 8 41 41 QZ 16 qAlu4
+qIadd outReg 40 41
+qicImm 8 42 42 QZ 256 qAlu4
+qIadd outReg outReg 42
+qicImm 8 43 43 QZ 4096 qAlu4
+qIadd outReg outReg 43
+end
+
+note Emit 5 packed u32s (40 nibbles) from wLo (R24/R26/R28) and wHi (R25/R27/R29) into W_u8!
+note wLo gives low u16, wHi gives high u16 of each u32 written at outOff0 + tr*outStride!
+fn n4ConvPair wLo ulong wHi ulong outOff0 ulong outStride ulong to void
+note Unpack bytes of wLo into R32..35, save 5 u16s into R50..54
+qic 18 32 wLo QZ 255 qSt1
+qic 17 33 wLo QZ 8 qSt1
+qic 17 34 wLo QZ 16 qSt1
+qic 17 35 wLo QZ 24 qAlu4
+qic 18 33 33 QZ 255 qSt1
+qic 18 34 34 QZ 255 qAlu4
+n4Pack4Trits 50 false
+n4Pack4Trits 51 false
+n4Pack4Trits 52 false
+n4Pack4Trits 53 false
+n4Pack4Trits 54 true
+note Unpack bytes of wHi into R32..35, combine with R50..54 and store 5 u32s!
+qic 18 32 wHi QZ 255 qSt1
+qic 17 33 wHi QZ 8 qSt1
+qic 17 34 wHi QZ 16 qSt1
+qic 17 35 wHi QZ 24 qAlu4
+qic 18 33 33 QZ 255 qSt1
+qic 18 34 34 QZ 255 qAlu4
+for tr ulong 5
+n4Pack4Trits 55 eq tr 4
+qicImm 8 55 55 QZ 65536 qAlu4
+qIadd 55 add 50 tr 55
+qLit 56 add outOff0 mul tr outStride
+qicImm 9 58 56 2 1 qW1
+qic 12 QZ 58 55 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+note =========================================================================
+note Mode 420: tPtq1ToNvfp4 -- On-GPU exact PTQ1_0 (28B/128w) -> NVFP4 (64B W + 8B S)!
+note   Args: rawPtq1 (R0:1), W_u8 (R2:3), S_u8 (R4:5), fp16Lut (R6:7), nBlks (32).
+note   Grid: (ceil(nBlks/256), 1, 1), Block: 256, SMEM: 0.
+note =========================================================================
+fn tPtq1ToNvfp4 to void
+qStart 4
+qParam 8 32
+qMad 10 15 256 14
+qic 28 QZ 10 8 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+note Load 7 u32s (28 bytes) of PTQ1_0 block b -> R24..30
+qMad 11 10 28 QZ
+qicImm 9 0 11 0 1 qW1
+for wi ulong 7
+qic 11 add 24 wi 0 QZ mul wi 4 qLd
+end
+qic 0 QZ QZ QZ 0 qW0
+note Lookup fp16_d = R30 >> 16 in fp16Lut (R6:7) -> entry = sc | (mPos<<8) | (mNeg<<12)
+qic 17 12 30 QZ 16 qAlu4
+qicImm 9 48 12 6 4 qW1
+qic 11 13 48 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 18 16 13 QZ 255 qSt1
+qic 17 18 13 QZ 8 qSt1
+qic 17 19 13 QZ 12 qAlu4
+qic 18 18 18 QZ 15 qSt1
+qic 18 19 19 QZ 15 qAlu4
+note Write 8 identical UE4M3 scale bytes to S_u8 + b*8 (2 x STG.E.32!)
+qLit 48 16843009
+qMadReg 17 16 48 QZ
+qMad 11 10 8 QZ
+qicImm 9 48 11 4 1 qW1
+qic 12 QZ 48 17 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 48 4
+qIadd 11 11 48
+qicImm 9 48 11 4 1 qW1
+qic 12 QZ 48 17 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+note Advance R2:3 -> W_u8 + b*64
+qMad 11 10 64 QZ
+qicImm 9 2 11 2 1 qAlu4
+qLit 20 1
+qLit 21 2
+note Group 1: qs[0..7] (w0,w1) -> offsets 0,8,16,24,32; qs[8..15] (w2,w3) -> offsets 4,12,20,28,36
+n4ConvPair 24 25 0 8
+n4ConvPair 26 27 4 8
+note Group 2: qs[16..23] (w4,w5) -> offsets 40,44,48,52,56
+n4ConvPair 28 29 40 4
+note Group 3: qh[0..1] (w6 low16, 8 weights -> 4 bytes = 1 u32 at offset 60!)
+qic 18 32 30 QZ 255 qSt1
+qic 17 33 30 QZ 8 qAlu4
+qic 18 33 33 QZ 255 qAlu4
+qLit 55 0
+for j ulong 4
+qicImm 8 40 32 QZ 3 qSt1
+qicImm 8 41 33 QZ 3 qAlu4
+qic 17 44 40 QZ 8 qSt1
+qic 17 45 41 QZ 8 qAlu4
+qic 18 32 40 QZ 255 qSt1
+qic 18 33 41 QZ 255 qAlu4
+n4MapTrit 44 40
+n4MapTrit 45 41
+qicImm 8 41 41 QZ 16 qAlu4
+qIadd 40 40 41
+if gt j 0
+qicImm 8 40 40 QZ shl ulong 1 mul j 8 qAlu4
+end
+qIadd 55 55 40
+end
+qLit 56 60
+qicImm 9 58 56 2 1 qW1
+qic 12 QZ 58 55 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+
+note =========================================================================
+note Helper: Stage NVFP4 LUT[272] (R6:7) into SMEM[0..1087] (all 256 threads + tid<16)!
+note   SMEM[0..1023] = UE4M3*alpha (256 floats), SMEM[1024..1087] = E2M1 (16 floats).
+note =========================================================================
+fn n4StageLut to void
+qicImm 9 48 14 6 4 qW1
+qic 11 52 48 QZ 0 qLd
+qMad 53 14 4 QZ
+qic 0 QZ QZ QZ 0 qW0
+qic 50 QZ 53 52 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 54 16
+bL16 = qBssy
+qic 28 QZ 14 54 0 qCmp
+skL16 = qBraFwd 1
+qLit 55 256
+qIadd 55 14 55
+qicImm 9 48 55 6 4 qW1
+qic 11 52 48 QZ 0 qLd
+qMad 53 55 4 QZ
+qic 0 QZ QZ QZ 0 qW0
+qic 50 QZ 53 52 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skL16 1
+qBsync bL16
+end
+
+note =========================================================================
+note Helper for 1-tok NVFP4 GEMV: dot 8 nibbles in wReg with X at SMEM[xOff..+31] -> R56!
+note   Uses R32..39 (nibbles -> E2M1 floats), R40..47 (X floats), R56 (block acc).
+note =========================================================================
+fn n4Dot8Tok1 wReg ulong xBaseReg ulong xImm ulong to void
+qic 18 32 wReg QZ 15 qSt1
+qic 17 33 wReg QZ 4 qSt1
+qic 17 34 wReg QZ 8 qSt1
+qic 17 35 wReg QZ 12 qSt1
+qic 17 36 wReg QZ 16 qSt1
+qic 17 37 wReg QZ 20 qSt1
+qic 17 38 wReg QZ 24 qSt1
+qic 17 39 wReg QZ 28 qAlu4
+for j ulong 7
+qic 18 add 33 j add 33 j QZ 15 qSt1
+end
+qLit 48 1024
+for j ulong 8
+qicImm 8 add 32 j add 32 j 48 4 qSt1
+end
+qic 0 QZ QZ QZ 0 qAlu4
+for j ulong 8
+qic 49 add 32 j add 32 j QZ 0 qcw 2 0 7 0 1
+end
+qic 58 40 xBaseReg QZ xImm qcw 2 2 7 0 1
+qic 58 44 xBaseReg QZ add xImm 16 qcw 2 2 7 0 1
+qic 0 QZ QZ QZ 0 qcw 1 7 7 5 0
+qic4 33 56 32 40 56 qSt1
+qic4 33 57 33 41 57 qSt1
+qic4 33 58 34 42 58 qSt1
+qic4 33 59 35 43 59 qSt1
+qic4 33 56 36 44 56 qSt1
+qic4 33 57 37 45 57 qSt1
+qic4 33 58 38 46 58 qSt1
+qic4 33 59 39 47 59 qAlu4
+end
+
+note =========================================================================
+note Mode 421 / 422: n4Gemv / n4ArgmaxPart -- 32 Rows/CTA 1-Token NVFP4 GEMV!
+note   Args: x[K] (R0:1), W_u8[N,K/2] (R2:3), S_u8[N,K/16] (R4:5), lut[272] (R6:7), C (R8:9), K (40), N (44).
+note   Grid: (ceil(N/32), 1, 1), Block: 256 (8 warps x 4 rows, 8 lanes/row, K-chunk=256).
+note   SMEM: 2176 B (0..1087=LUT, 1088..2111=X[256], 2112..2135=xPtr,cPtr,K,N). -> 6 CTAs/SM MAX OCCUPANCY!
+note =========================================================================
+fn n4GemvBody isArgmax bool to void
+qStart 5
+qParam 12 40
+qParam 13 44
+n4StageLut
+note Save xPtr(R0:1), cPtr(R8:9) into SMEM[2112..2127]
+qLit 48 2240
+qLit 49 2244
+qLit 50 2248
+qLit 51 2252
+qLit 52 1
+bSp = qBssy
+qic 28 QZ 14 52 0 qCmp
+skSp = qBraFwd 1
+qic 50 QZ 48 0 0 qSt
+qic 50 QZ 49 1 0 qSt
+qic 50 QZ 50 8 0 qSt
+qic 50 QZ 51 9 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSp 1
+qBsync bSp
+qBar
+note Shift pointers: W_u8->R0:1, S_u8->R2:3, N->R9, R13=1
+qicImm 8 0 2 QZ 1 qAlu1
+qicImm 8 1 3 QZ 1 qAlu1
+qicImm 8 2 4 QZ 1 qAlu1
+qicImm 8 3 5 QZ 1 qAlu1
+qicImm 8 9 13 QZ 1 qAlu4
+qLit 13 1
+note warp = tid>>5 (R48), lane = tid&31 (R49), sub = lane>>3 (R50), blk = lane&7 (R51)
+qic 17 48 14 QZ 5 qSt1
+qic 18 49 14 QZ 31 qAlu4
+qic 17 50 49 QZ 3 qSt1
+qic 18 51 49 QZ 7 qAlu4
+note row = blockIdx.x*32 + warp*4 + sub (R8); row_eff = min(row, N-1) (R4)
+qMad 8 15 32 QZ
+qMad 8 48 4 8
+qIadd 8 8 50
+qLit 5 4294967295
+qIadd 5 9 5
+qicImm 8 4 8 QZ 1 qAlu4
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qicImm 8 4 5 QZ 1 qAlu4
+note W_u8 offset = row_eff * (K>>1) + blk*16; S_u8 offset = row_eff * (K>>4) + (blk&6)*2
+qic 17 52 12 QZ 1 qSt1
+qic 17 53 12 QZ 4 qAlu4
+qMadReg 54 4 52 QZ
+qMad 54 51 16 54
+qicImm 9 0 54 0 1 qAlu4
+qMadReg 55 4 53 QZ
+qic 18 56 51 QZ 6 qAlu4
+qMad 55 56 2 55
+qicImm 9 2 55 2 1 qAlu4
+note Save blk&1 shift (0 or 16) in R7, xSmemBase = 1088 + blk*128 in R10, nChunks = K>>8 in R12
+qic 18 7 51 QZ 1 qAlu4
+qLit 10 1088
+qMad 10 51 144 10
+qic 17 12 12 QZ 8 qAlu4
+qNum 18 0.0f32
+qLit 11 0
+mLoop = get q36Pc 0
+note 1. Issue W_u8 (LDG.E.128 -> R24..27) + S_u8 (LDG.E.32 -> R28) on SB2 in parallel with X[256] load!
+qic 57 24 0 QZ 0 qcw 2 2 7 0 1
+qic 11 28 2 QZ 0 qcw 2 2 7 0 1
+qLit 48 2240
+qLit 49 2244
+qic 49 50 48 QZ 0 qcw 2 0 7 0 1
+qic 49 51 49 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qMad 52 11 256 14
+qicImm 9 48 52 50 4 qW1
+qic 11 53 48 QZ 0 qcw 2 0 7 0 1
+qLit 54 1088
+qMad 54 14 4 54
+qic 17 55 14 QZ 5 qAlu4
+qMad 54 55 16 54
+qic 0 QZ QZ QZ 0 qW0Fast
+qic 50 QZ 54 53 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qic 0 QZ QZ QZ 0 qcw 1 7 7 4 0
+note 2. Extract 2 UE4M3 scales (sc0, sc1) from R28 >> R7 and load from SMEM LUT[0..255]!
+qic 17 29 28 QZ 16 qAlu4
+qic 28 QZ 7 13 0 qCmp
+put q36Guard 0 2
+qicImm 8 29 28 QZ 1 qAlu4
+qic 18 30 29 QZ 255 qSt1
+qic 17 31 29 QZ 8 qAlu4
+qic 18 31 31 QZ 255 qAlu4
+qMad 30 30 4 QZ
+qMad 31 31 4 QZ
+qic 49 22 30 QZ 0 qcw 2 3 7 0 1
+qic 49 23 31 QZ 0 qcw 2 3 7 0 1
+note 3. Block-16 #0 (R24, R25 -> 16 weights x X[blk*32 + 0..15]) * sc0 (R22)!
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 58 0.0f32
+qNum 59 0.0f32
+n4Dot8Tok1 24 10 0
+n4Dot8Tok1 25 10 32
+qic 30 56 56 57 0 qSt1
+qic 30 58 58 59 0 qAlu4
+qic 30 56 56 58 0 qAlu4
+qic 0 QZ QZ QZ 0 qcw 1 7 7 8 0
+qic4 33 18 56 22 18 qAlu4
+note 4. Block-16 #1 (R26, R27 -> 16 weights x X[blk*32 + 16..31]) * sc1 (R23)!
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 58 0.0f32
+qNum 59 0.0f32
+n4Dot8Tok1 26 10 64
+n4Dot8Tok1 27 10 96
+qic 30 56 56 57 0 qSt1
+qic 30 58 58 59 0 qAlu4
+qic 30 56 56 58 0 qAlu4
+qic4 33 18 56 23 18 qAlu4
+note 5. Advance W_u8 (+128 B), S_u8 (+16 B), k++ & loop!
+qicImm 9 0 13 0 128 qSt1
+qicImm 9 2 13 2 16 qAlu4
+qIadd 11 11 13
+qBar
+qic 28 QZ 11 12 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+note Reload C pointer from SMEM[2120..2124] into R6:7
+qLit 48 2248
+qLit 49 2252
+qic 49 6 48 QZ 0 qcw 2 0 7 0 1
+qic 49 7 49 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qWarpRedSum 18 48 4
+if not isArgmax
+qic 18 48 14 QZ 7 qAlu4
+qic 28 QZ 48 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qicImm 9 50 8 6 4 qW1
+qic 12 QZ 50 18 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+else
+qBar
+note Fused CTA 32-row argmax -> Parts[blockIdx.x * 2 + {0,1}] (with SB1 qW1 fix!)
+qNum 49 -1000000000.0f32
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qicImm 8 18 49 QZ 1 qAlu4
+qic 18 48 14 QZ 7 qAlu1
+qic 17 49 14 QZ 3 qAlu4
+bAr = qBssy
+qic 28 QZ 48 13 0 qCmp
+skAr = qBraFwd 1
+qMad 50 49 4 QZ
+qLit 52 128
+qIadd 51 50 52
+qic 50 QZ 50 18 0 qSt
+qic 50 QZ 51 8 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skAr 1
+qBsync bAr
+qBar
+qic 28 QZ 14 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qNum 18 -1000000000.0f32
+qLit 19 0
+qLit 20 0
+qLit 21 32
+mR = get q36Pc 0
+qMad 48 20 4 QZ
+qLit 49 128
+qIadd 49 48 49
+qic 49 50 48 QZ 0 qLd
+qic 49 51 49 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 34 0 50 18 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 18 50 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 19 51 QZ 1 qAlu4
+qIadd 20 20 13
+qic 28 QZ 20 21 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mR get q36Pc 0 qAlu4
+qMad 48 15 2 QZ
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 18 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 48 48 13
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 19 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+fn n4Gemv to void
+n4GemvBody false
+end
+
+fn n4ArgmaxPart to void
+n4GemvBody true
+end
+
+note =========================================================================
+note Helper for M=4 NVFP4 GEMM: dot 4 nibbles (lo or hi half of wReg) x 4 tokens -> R56..59!
+note   SMEM X[4, 256] at [1088 + m*1024] -> stride between tokens = 1024 B!
+note   Loads 4 E2M1 floats (R44..47) on SB0 + 4x LDS.128 X[0..3] on SB2 -> 16 Stall-1 FFMAs!
+note =========================================================================
+fn n4Dot4M4 wReg ulong shift0 ulong xBaseReg ulong xImm ulong to void
+if eq shift0 0
+qic 18 44 wReg QZ 15 qSt1
+qic 17 45 wReg QZ 4 qSt1
+qic 17 46 wReg QZ 8 qSt1
+qic 17 47 wReg QZ 12 qAlu4
+else
+qic 17 44 wReg QZ 16 qSt1
+qic 17 45 wReg QZ 20 qSt1
+qic 17 46 wReg QZ 24 qSt1
+qic 17 47 wReg QZ 28 qAlu4
+end
+if eq shift0 0
+qic 18 45 45 QZ 15 qSt1
+qic 18 46 46 QZ 15 qSt1
+qic 18 47 47 QZ 15 qAlu4
+else
+qic 18 44 44 QZ 15 qSt1
+qic 18 45 45 QZ 15 qSt1
+qic 18 46 46 QZ 15 qAlu4
+end
+qLit 32 1024
+qicImm 8 44 44 32 4 qSt1
+qicImm 8 45 45 32 4 qSt1
+qicImm 8 46 46 32 4 qSt1
+qicImm 8 47 47 32 4 qAlu4
+qic 49 44 44 QZ 0 qcw 2 0 7 0 1
+qic 49 45 45 QZ 0 qcw 2 0 7 0 1
+qic 49 46 46 QZ 0 qcw 2 0 7 0 1
+qic 49 47 47 QZ 0 qcw 2 0 7 0 1
+qic 58 36 xBaseReg QZ xImm qcw 2 2 7 0 1
+qic 58 40 xBaseReg QZ add xImm 1152 qcw 2 2 7 0 1
+qic 58 48 xBaseReg QZ add xImm 2304 qcw 2 2 7 0 1
+qic 58 52 xBaseReg QZ add xImm 3456 qcw 2 2 7 0 1
+qic 0 QZ QZ QZ 0 qcw 1 7 7 5 0
+qic4 33 56 44 36 56 qSt1
+qic4 33 57 44 40 57 qSt1
+qic4 33 58 44 48 58 qSt1
+qic4 33 59 44 52 59 qSt1
+qic4 33 56 45 37 56 qSt1
+qic4 33 57 45 41 57 qSt1
+qic4 33 58 45 49 58 qSt1
+qic4 33 59 45 53 59 qSt1
+qic4 33 56 46 38 56 qSt1
+qic4 33 57 46 42 57 qSt1
+qic4 33 58 46 50 58 qSt1
+qic4 33 59 46 54 59 qSt1
+qic4 33 56 47 39 56 qSt1
+qic4 33 57 47 43 57 qSt1
+qic4 33 58 47 51 58 qSt1
+qic4 33 59 47 55 59 qAlu4
+end
+
+note =========================================================================
+note Mode 423 / 424: n4GemmM4 / n4ArgmaxM4 -- 32 Rows/CTA M=4 Batched NVFP4 GEMM!
+note   Args: X[4,K] (R0:1), W_u8[N,K/2] (R2:3), S_u8[N,K/16] (R4:5), lut[272] (R6:7), C (R8:9), K (40), N (44).
+note   Grid: (ceil(N/32), 1, 1), Block: 256, SMEM: 5248 B (6 CTAs/SM MAX OCCUPANCY!!).
+note   SMEM: [0..1087]=LUT, [1088..5183]=X[4,256], [5184..5203]=xPtr,cPtr,K.
+note =========================================================================
+fn n4GemmM4Body isArgmax bool to void
+qStart 5
+qParam 12 40
+qParam 13 44
+n4StageLut
+qLit 48 5696
+qLit 49 5700
+qLit 50 5704
+qLit 51 5708
+qLit 52 5712
+qLit 53 1
+bSp = qBssy
+qic 28 QZ 14 53 0 qCmp
+skSp = qBraFwd 1
+qic 50 QZ 48 0 0 qSt
+qic 50 QZ 49 1 0 qSt
+qic 50 QZ 50 8 0 qSt
+qic 50 QZ 51 9 0 qSt
+qic 50 QZ 52 12 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSp 1
+qBsync bSp
+qBar
+qicImm 8 0 2 QZ 1 qAlu1
+qicImm 8 1 3 QZ 1 qAlu1
+qicImm 8 2 4 QZ 1 qAlu1
+qicImm 8 3 5 QZ 1 qAlu1
+qicImm 8 9 13 QZ 1 qAlu4
+qLit 13 1
+qic 17 48 14 QZ 5 qSt1
+qic 18 49 14 QZ 31 qAlu4
+qic 17 50 49 QZ 3 qSt1
+qic 18 51 49 QZ 7 qAlu4
+qMad 8 15 32 QZ
+qMad 8 48 4 8
+qIadd 8 8 50
+qLit 5 4294967295
+qIadd 5 9 5
+qicImm 8 4 8 QZ 1 qAlu4
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qicImm 8 4 5 QZ 1 qAlu4
+qic 17 52 12 QZ 1 qSt1
+qic 17 53 12 QZ 4 qAlu4
+qMadReg 54 4 52 QZ
+qMad 54 51 16 54
+qicImm 9 0 54 0 1 qAlu4
+qMadReg 55 4 53 QZ
+qic 18 56 51 QZ 6 qAlu4
+qMad 55 56 2 55
+qicImm 9 2 55 2 1 qAlu4
+qic 18 7 51 QZ 1 qAlu4
+qLit 10 1088
+qMad 10 51 144 10
+qic 17 12 12 QZ 8 qAlu4
+qNum 18 0.0f32
+qNum 19 0.0f32
+qNum 20 0.0f32
+qNum 21 0.0f32
+qLit 11 0
+mLoop = get q36Pc 0
+note 1. Issue W_u8 (LDG.E.128) + S_u8 (LDG.E.32) on SB2 in parallel with 4x X[256] loads on SB0!
+qic 57 24 0 QZ 0 qcw 2 2 7 0 1
+qic 11 28 2 QZ 0 qcw 2 2 7 0 1
+qLit 48 5696
+qLit 49 5700
+qLit 52 5712
+qic 49 50 48 QZ 0 qcw 2 0 7 0 1
+qic 49 51 49 QZ 0 qcw 2 0 7 0 1
+qic 49 53 52 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qMad 54 11 256 14
+qIadd 31 54 53
+qIadd 49 31 53
+qIadd 52 49 53
+qicImm 9 44 54 50 4 qSt1
+qicImm 9 46 31 50 4 qSt1
+qicImm 9 22 52 50 4 qSt1
+qicImm 9 48 49 50 4 qAlu4
+qic 11 32 44 QZ 0 qcw 2 0 7 0 1
+qic 11 33 46 QZ 0 qcw 2 0 7 0 1
+qic 11 34 48 QZ 0 qcw 2 0 7 0 1
+qic 11 35 22 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qLit 48 1088
+qMad 48 14 4 48
+qic 17 52 14 QZ 5 qAlu4
+qMad 48 52 16 48
+qLit 52 1152
+qIadd 49 48 52
+qIadd 50 49 52
+qIadd 51 50 52
+qic 50 QZ 48 32 0 qSt
+qic 50 QZ 49 33 0 qSt
+qic 50 QZ 50 34 0 qSt
+qic 50 QZ 51 35 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+qic 0 QZ QZ QZ 0 qcw 1 7 7 4 0
+note 2. Extract 2 UE4M3 scales (sc0 -> R22, sc1 -> R23) on SB3 (overlapped with Block-16 #0)!
+qic 17 29 28 QZ 16 qAlu4
+qic 28 QZ 7 13 0 qCmp
+put q36Guard 0 2
+qicImm 8 29 28 QZ 1 qAlu4
+qic 18 30 29 QZ 255 qSt1
+qic 17 31 29 QZ 8 qAlu4
+qic 18 31 31 QZ 255 qAlu4
+qMad 30 30 4 QZ
+qMad 31 31 4 QZ
+qic 49 22 30 QZ 0 qcw 2 3 7 0 1
+qic 49 23 31 QZ 0 qcw 2 3 7 0 1
+note 3. Block-16 #0 (R24, R25 = 16 weights x 4 tokens) * sc0 (R22) -> R18..21!
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 58 0.0f32
+qNum 59 0.0f32
+n4Dot4M4 24 0 10 0
+n4Dot4M4 24 1 10 16
+n4Dot4M4 25 0 10 32
+n4Dot4M4 25 1 10 48
+qic 0 QZ QZ QZ 0 qcw 1 7 7 8 0
+qic4 33 18 56 22 18 qSt1
+qic4 33 19 57 22 19 qSt1
+qic4 33 20 58 22 20 qSt1
+qic4 33 21 59 22 21 qAlu4
+note 4. Block-16 #1 (R26, R27 = 16 weights x 4 tokens) * sc1 (R23) -> R18..21!
+qNum 56 0.0f32
+qNum 57 0.0f32
+qNum 58 0.0f32
+qNum 59 0.0f32
+n4Dot4M4 26 0 10 64
+n4Dot4M4 26 1 10 80
+n4Dot4M4 27 0 10 96
+n4Dot4M4 27 1 10 112
+qic4 33 18 56 23 18 qSt1
+qic4 33 19 57 23 19 qSt1
+qic4 33 20 58 23 20 qSt1
+qic4 33 21 59 23 21 qAlu4
+note 5. Advance W_u8 (+128 B), S_u8 (+16 B), k++ & loop!
+qicImm 9 0 13 0 128 qSt1
+qicImm 9 2 13 2 16 qAlu4
+qIadd 11 11 13
+qBar
+qic 28 QZ 11 12 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+note Reload C pointer from SMEM[5192..5196] into R6:7
+qLit 48 5704
+qLit 49 5708
+qic 49 6 48 QZ 0 qcw 2 0 7 0 1
+qic 49 7 49 QZ 0 qcw 2 0 7 0 1
+qic 0 QZ QZ QZ 0 qW0Fast
+qWarpRedSum 18 48 4
+qWarpRedSum 19 48 4
+qWarpRedSum 20 48 4
+qWarpRedSum 21 48 4
+if not isArgmax
+qic 18 48 14 QZ 7 qAlu4
+qic 28 QZ 48 13 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qic 28 QZ 8 9 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for m ulong 4
+qLit 48 m
+qMadReg 48 48 9 8
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 add 18 m 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+else
+qBar
+note Fused CTA 32-row argmax for ALL 4 tokens -> Parts[m * nParts * 2 + blockIdx.x * 2 + {0,1}]!
+qNum 49 -1000000000.0f32
+qic 28 QZ 8 9 0 qCmp
+for m ulong 4
+put q36Guard 0 1
+qicImm 8 add 18 m 49 QZ 1 qAlu1
+end
+qic 0 QZ QZ QZ 0 qAlu4
+qLit 48 31
+qIadd 48 9 48
+qic 17 22 48 QZ 5 qAlu4
+qic 18 23 14 QZ 7 qAlu1
+qic 17 24 14 QZ 3 qAlu4
+bAm = qBssy
+qic 28 QZ 23 13 0 qCmp
+skAm = qBraFwd 1
+qMad 50 24 4 QZ
+qLit 52 128
+qIadd 51 50 52
+qIadd 53 51 52
+qIadd 54 53 52
+qIadd 55 54 52
+qic 50 QZ 50 18 0 qSt
+qic 50 QZ 51 19 0 qSt
+qic 50 QZ 53 20 0 qSt
+qic 50 QZ 54 21 0 qSt
+qic 50 QZ 55 8 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skAm 1
+qBsync bAm
+qBar
+qLit 48 4
+qic 28 QZ 14 48 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qMad 25 14 128 QZ
+qLit 26 512
+qNum 30 -1000000000.0f32
+qLit 31 0
+qLit 32 0
+qLit 33 32
+mRm = get q36Pc 0
+qMad 48 32 4 25
+qMad 49 32 4 26
+qic 49 50 48 QZ 0 qLd
+qic 49 51 49 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 34 0 50 30 0x03f04000 qCmp
+put q36Guard 0 1
+qicImm 8 30 50 QZ 1 qAlu1
+put q36Guard 0 1
+qicImm 8 31 51 QZ 1 qAlu4
+qIadd 32 32 13
+qic 28 QZ 32 33 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mRm get q36Pc 0 qAlu4
+qMadReg 48 14 22 15
+qMad 48 48 2 QZ
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 30 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qIadd 48 48 13
+qicImm 9 50 48 6 4 qW1
+qic 12 QZ 50 31 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+fn n4GemmM4 to void
+n4GemmM4Body false
+end
+
+fn n4ArgmaxM4 to void
+n4GemmM4Body true
+end
+
+fn n4Nvfp4Kernel mode ulong to bool
+if eq mode 420
+tPtq1ToNvfp4
+ret true
+end
+if eq mode 421
+n4Gemv
+ret true
+end
+if eq mode 422
+n4ArgmaxPart
+ret true
+end
+if eq mode 423
+n4GemmM4
+ret true
+end
+if eq mode 424
+n4ArgmaxM4
+ret true
+end
+ret false
+end

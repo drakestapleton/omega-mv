@@ -54,17 +54,9 @@ global bonPids long 20
 global bonGoFds int 20
 global bonResFds int 20
 global bonPipeMsg uchar 32
-global bonCpuX f32 5120
-global bonCpuX4 f32 20480
 global bonCpuAcc4 f32 4
-global bonCpuRowAcc f32 4
 global bonCpuBestV f32 4
 global bonCpuBestI ulong 4
-global bonCpuLut uchar 1280
-global bonCpuLutF f32 1280
-global bonCpuRawBuf uchar 4194304
-global bonCpuRowStart ulong 1
-global bonCpuRowCnt ulong 1
 global bonCpuScaleBuf f32 262144
 
 text gNmEmb "token_embd.weight"
@@ -100,41 +92,7 @@ text bonDbgEq "="
 text bonDbgSp " "
 text bonDbgNl "\n"
 
-global bonCurMap long 1
-global bonCurOff ulong 1
-global bonCurVa ulong 1
-
-fn bonSlabAllocMap bytes ulong to bool
-al = mul div add bytes 4095 4096 4096
-cnt = get engSlabCnt 0
-if gt cnt 0
-last = sub cnt 1
-used = get engSlabUsed last
-if le add used al ENG_SLAB_SZ
-put engSlabUsed last add used al
-put bonCurMap 0 get engSlabMap last
-put bonCurOff 0 used
-put bonCurVa 0 add get engSlabVa last used
-ret true
-end
-end
-if ge cnt 16
-ret false
-end
-sm = nvalloc ENG_SLAB_SZ true
-if le sm 0
-ret false
-end
-sva = mapaddr sm
-put engSlabMap cnt sm
-put engSlabVa cnt sva
-put engSlabUsed cnt al
-put engSlabCnt 0 add cnt 1
-put bonCurMap 0 sm
-put bonCurOff 0 0
-put bonCurVa 0 sva
-ret true
-end
+note bonCurMap/bonCurOff/bonCurVa/bonSlabAllocMap defined in bonsai_nvfp4.om
 
 fn bonLoadF32 tid ulong to ulong
 n = mul get ggDim0 tid get ggDim1 tid
@@ -248,7 +206,6 @@ note   [768..895] : 32 lanes x  4 B (W_c -> 128 B coalesced LDG.E.32!)
 note =========================================================================
 global bonTDstMap long 1
 global bonTDstOff ulong 1
-global bonTResVa ulong 1
 
 fn bonCopyBlk28 src ulong tBase ulong lane ulong to void
 da = add tBase mul lane 16
@@ -328,6 +285,9 @@ ret true
 end
 
 fn bonLoadTiled1 tid ulong to bool
+if eq get bonUseNvfp4 0 1
+ret bonLoadNvfp4_1 tid
+end
 nb = mul div mul get ggDim0 tid get ggDim1 tid 128 28
 if not bonAllocTiled nb
 ret false
@@ -336,6 +296,9 @@ ret bonStreamTiledRange tid get ggDim1 tid 0
 end
 
 fn bonLoadTiled2 t0 ulong t1 ulong to bool
+if eq get bonUseNvfp4 0 1
+ret bonLoadNvfp4_2 t0 t1
+end
 b0 = mul div mul get ggDim0 t0 get ggDim1 t0 128 28
 b1 = mul div mul get ggDim0 t1 get ggDim1 t1 128 28
 if not bonAllocTiled add b0 b1
@@ -348,6 +311,9 @@ ret bonStreamTiledRange t1 get ggDim1 t1 b0
 end
 
 fn bonLoadTiled3 t0 ulong t1 ulong t2 ulong to bool
+if eq get bonUseNvfp4 0 1
+ret bonLoadNvfp4_3 t0 t1 t2
+end
 b0 = mul div mul get ggDim0 t0 get ggDim1 t0 128 28
 b1 = mul div mul get ggDim0 t1 get ggDim1 t1 128 28
 b2 = mul div mul get ggDim0 t2 get ggDim1 t2 128 28
@@ -364,6 +330,9 @@ ret bonStreamTiledRange t2 get ggDim1 t2 add b0 b1
 end
 
 fn bonLoadTiledSlice tid ulong nRows ulong to bool
+if eq get bonUseNvfp4 0 1
+ret bonLoadNvfp4_Slice tid nRows
+end
 nb = mul div mul get ggDim0 tid nRows 128 28
 if not bonAllocTiled nb
 ret false
@@ -519,6 +488,9 @@ put bonCpuScaleBuf b bitcast f32 ggFp16ToF32Bits or dlo shl dhi 8
 end
 put bonCpuRowStart 0 r0
 put bonCpuRowCnt 0 rCnt
+if eq get bonUseNvfp4 0 1
+bonWorkerConvertNvfp4
+end
 end
 
 fn bonCpuDotBlk blkIdx ulong xb ulong to f32
@@ -572,7 +544,12 @@ bestIdx = ulong 0
 rc = get bonCpuRowCnt 0
 rs = get bonCpuRowStart 0
 for ri ulong rc bound 32768
+v = f32 0.0f32
+if eq get bonUseNvfp4 0 1
+v = bonCpuDotRowNvfp4 ri
+else
 v = bonCpuDotRow ri
+end
 if gt v bestVal
 bestVal = v
 bestIdx = add rs ri
@@ -726,12 +703,16 @@ put bonCpuBestI 3 0
 rc = get bonCpuRowCnt 0
 rs = get bonCpuRowStart 0
 for ri ulong rc bound 32768
+if eq get bonUseNvfp4 0 1
+bonCpuDotRowM4Nvfp4 ri
+else
 put bonCpuRowAcc 0 f32 0.0f32
 put bonCpuRowAcc 1 f32 0.0f32
 put bonCpuRowAcc 2 f32 0.0f32
 put bonCpuRowAcc 3 f32 0.0f32
 for b ulong 40
 bonCpuDotBlkM4 add mul ri 40 b mul b 128
+end
 end
 for m ulong 4
 if gt get bonCpuRowAcc m get bonCpuBestV m
@@ -857,6 +838,19 @@ end
 q36Done
 end
 
+fn bonRegNvfp4 kid ulong mode ulong smem ulong to void
+p = mul div add get engCodePos 0 255 256 256
+put engEntry kid p
+put engSmem kid smem
+put engCodePos 0 p
+put q36Pc 0 0
+put q36Guard 0 0
+if not n4Nvfp4Kernel mode
+exit 4
+end
+q36Done
+end
+
 fn bonEmitAllKernels to void
 put engCodePos 0 0
 engRegKernel 0 1 200 4128
@@ -880,9 +874,24 @@ bonRegTernary 23 408 64
 bonRegTernary 24 409 64
 bonRegTernary 25 410 0
 bonRegTernary 26 411 0
+bonRegNvfp4 27 420 0
+bonRegNvfp4 28 421 2304
+bonRegNvfp4 29 422 2304
+bonRegNvfp4 30 423 5760
+bonRegNvfp4 31 424 5760
 end
 
 fn bonEmitPtq1 xVa ulong wVa ulong outVa ulong K ulong N ulong to bool
+if eq get bonUseNvfp4 0 1
+engPtr xVa
+engPtr wVa
+engPtr add wVa div mul N K 2
+engPtr get bonNvLutVa 0
+engPtr outVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 28 uint div add N 31 32 1 256
+end
 engPtr xVa
 engPtr wVa
 engPtr outVa
@@ -1080,6 +1089,23 @@ end
 
 fn bonEmitLmHead nRows ulong to bool
 H = get engSpec MS_H
+if eq get bonUseNvfp4 0 1
+nParts = div add nRows 31 32
+engPtr engW BW_XN_ROT
+engPtr get bonLmT 0
+engPtr add get bonLmT 0 div mul get bonLmNAll 0 H 2
+engPtr get bonNvLutVa 0
+engPtr engW BW_PARTS
+engArg uint H
+engArg uint nRows
+if not engPktEmitGy 29 uint nParts 1 256
+ret false
+end
+engPtr engW BW_PARTS
+engPtr add get bonApuShmVa 0 APU_SHM_BEST
+engArg uint nParts
+ret engPktEmitGy 19 1 1 256
+end
 nParts = div add nRows 127 128
 engPtr engW BW_XN_ROT
 engPtr get bonLmT 0
@@ -1219,6 +1245,11 @@ if le get bonApuShm 0 0
 ret 7
 end
 put bonApuShmVa 0 mapaddr get bonApuShm 0
+if eq get bonUseNvfp4 0 1
+if not bonNvInitGpu
+ret 7
+end
+end
 ret bonGpuInitKvGdn
 end
 

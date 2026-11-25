@@ -26,6 +26,8 @@ SRC="$OUT_DIR/omega-engine.om"
     "$ROOT/om/gpu/engine/runtime_qwen4_b8.om" \
     "$ROOT/om/gpu/engine/gguf.om" \
     "$ROOT/om/gpu/engine/emit_ternary.om" \
+    "$ROOT/om/gpu/engine/emit_nvfp4.om" \
+    "$ROOT/om/gpu/engine/bonsai_nvfp4.om" \
     "$ROOT/om/gpu/engine/bonsai.om" \
     "$ROOT/om/gpu/engine/bonsai_mtp.om" \
     "$ROOT/om/gpu/engine/cli.om"

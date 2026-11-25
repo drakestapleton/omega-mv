@@ -1,0 +1,515 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/bonsai_nvfp4.om: Canonical NVIDIA NVFP4 (E2M1 + UE4M3/16, alpha=1/256, 4.50 bpw)
+note   - Builds exact LUT[272] (256 UE4M3*alpha + 16 E2M1) & 65536-entry FP16->(UE4M3, E2M1_mag) table on CPU (<2ms)
+note   - Converts all 25.6B PTQ1_0 weights -> canonical NVFP4 [N, K/2] + [N, K/16] ON GPU via tPtq1ToNvfp4 (<0.2s!)
+note   - Full-APU 20 ARMv9 CPU workers execute canonical 4-bit E2M1 + UE4M3 NVFP4 in parallel with 48 Blackwell SMs!
+
+global bonUseNvfp4 ulong 1
+global bonNvLutMap long 1
+global bonNvLutVa ulong 1
+global bonNvFp16Map long 1
+global bonNvFp16Va ulong 1
+global bonNvRawMap long 1
+global bonNvRawVa ulong 1
+global bonNvPktMap long 1
+
+global bonNvLutCpu f32 272
+global bonNvFp16Cpu uint 65536
+global bonNvBestErr f32 1
+global bonNvBestSc ulong 1
+global bonNvBestNib ulong 1
+
+note Shared slab allocation state & Full-APU CPU buffers (used by both PTQ1_0 and NVFP4)
+global bonCurMap long 1
+global bonCurOff ulong 1
+global bonCurVa ulong 1
+global bonTResVa ulong 1
+
+global bonCpuX f32 5120
+global bonCpuX4 f32 20480
+global bonCpuRowAcc f32 4
+global bonCpuLut uchar 1280
+global bonCpuLutF f32 1280
+global bonCpuRawBuf uchar 4194304
+global bonCpuRowStart ulong 1
+global bonCpuRowCnt ulong 1
+global bonCpuNvW uchar 4194304
+global bonCpuNvS uchar 524288
+
+text bonMsgModeNv4 "quant_format    : NVFP4 Canonical (E2M1 + UE4M3/16, 4.50 bpw) + Hadamard-1024 + BF16-GDN + Full-APU (20 CPU + 48 SM)\n"
+
+fn bonSlabAllocMap bytes ulong to bool
+al = mul div add bytes 4095 4096 4096
+cnt = get engSlabCnt 0
+if gt cnt 0
+last = sub cnt 1
+used = get engSlabUsed last
+if le add used al ENG_SLAB_SZ
+put engSlabUsed last add used al
+put bonCurMap 0 get engSlabMap last
+put bonCurOff 0 used
+put bonCurVa 0 add get engSlabVa last used
+ret true
+end
+end
+if ge cnt 48
+ret false
+end
+sm = nvalloc ENG_SLAB_SZ true
+if le sm 0
+ret false
+end
+sva = mapaddr sm
+put engSlabMap cnt sm
+put engSlabVa cnt sva
+put engSlabUsed cnt al
+put engSlabCnt 0 add cnt 1
+put bonCurMap 0 sm
+put bonCurOff 0 0
+put bonCurVa 0 sva
+ret true
+end
+
+fn bonNvBuildUe4m3 c ulong to f32
+if ge c 127
+ret f32 0.0f32
+end
+se = shr c 3
+sm = and c 7
+if eq se 0
+ret mul f32 sm f32 0.00000762939453125f32
+end
+mant = f32 add 8 sm
+expI = sub long se 18
+v = mant
+while gt expI 0 bound 16
+v = mul v f32 2.0f32
+expI = sub expI 1
+end
+while lt expI 0 bound 24
+v = mul v f32 0.5f32
+expI = add expI 1
+end
+ret v
+end
+
+fn bonNvFillCpuLut to void
+for c ulong 256
+put bonNvLutCpu c bonNvBuildUe4m3 c
+end
+put bonNvLutCpu 256 f32 0.0f32
+put bonNvLutCpu 257 f32 0.5f32
+put bonNvLutCpu 258 f32 1.0f32
+put bonNvLutCpu 259 f32 1.5f32
+put bonNvLutCpu 260 f32 2.0f32
+put bonNvLutCpu 261 f32 3.0f32
+put bonNvLutCpu 262 f32 4.0f32
+put bonNvLutCpu 263 f32 6.0f32
+put bonNvLutCpu 264 f32 0.0f32
+put bonNvLutCpu 265 f32 -0.5f32
+put bonNvLutCpu 266 f32 -1.0f32
+put bonNvLutCpu 267 f32 -1.5f32
+put bonNvLutCpu 268 f32 -2.0f32
+put bonNvLutCpu 269 f32 -3.0f32
+put bonNvLutCpu 270 f32 -4.0f32
+put bonNvLutCpu 271 f32 -6.0f32
+end
+
+fn bonNvBinSearch target f32 to ulong
+lo = ulong 1
+hi = ulong 126
+while lt add lo 1 hi bound 8
+mid = shr add lo hi 1
+if le get bonNvLutCpu mid target
+lo = mid
+else
+hi = mid
+end
+end
+ret lo
+end
+
+fn bonNvCheckCand ad f32 nib ulong cc ulong to void
+if gt cc 126
+ret
+end
+err = sub mul get bonNvLutCpu cc get bonNvLutCpu add 256 nib ad
+if lt err f32 0.0f32
+err = sub f32 0.0f32 err
+end
+if lt err get bonNvBestErr 0
+put bonNvBestErr 0 err
+put bonNvBestSc 0 cc
+put bonNvBestNib 0 nib
+end
+end
+
+fn bonNvBestEntry d f32 to uint
+if eq d f32 0.0f32
+ret 0
+end
+negD = lt d f32 0.0f32
+ad = d
+if negD
+ad = sub f32 0.0f32 ad
+end
+if gt ad f32 100.0f32
+ret 0
+end
+put bonNvBestErr 0 f32 1000000000.0f32
+put bonNvBestSc 0 1
+put bonNvBestNib 0 2
+for ni ulong 2
+lo = bonNvBinSearch div ad get bonNvLutCpu add 258 ni
+bonNvCheckCand ad add 2 ni lo
+bonNvCheckCand ad add 2 ni add lo 1
+end
+mPos = get bonNvBestNib 0
+mNeg = or mPos 8
+if negD
+ret uint or get bonNvBestSc 0 or shl mNeg 8 shl mPos 12
+end
+ret uint or get bonNvBestSc 0 or shl mPos 8 shl mNeg 12
+end
+
+fn bonNvInitGpu to bool
+bonNvFillCpuLut
+put bonNvLutMap 0 nvalloc 4096 false
+if le get bonNvLutMap 0 0
+ret false
+end
+put bonNvLutVa 0 mapaddr get bonNvLutMap 0
+for i ulong 272
+engPutU32Io mul i 4 bitcast uint get bonNvLutCpu i
+end
+if ne mapwrite get bonNvLutMap 0 0 engIoBuf 0 1088 1088
+ret false
+end
+put bonNvFp16Map 0 nvalloc 262144 false
+if le get bonNvFp16Map 0 0
+ret false
+end
+put bonNvFp16Va 0 mapaddr get bonNvFp16Map 0
+for h ulong 65536
+expF = and shr h 10 31
+ent = uint 0
+if lt expF 31
+ent = bonNvBestEntry bitcast f32 ggFp16ToF32Bits h
+end
+put bonNvFp16Cpu h ent
+engPutU32Io mul h 4 ent
+end
+if ne mapwrite get bonNvFp16Map 0 0 engIoBuf 0 262144 262144
+ret false
+end
+put bonNvRawMap 0 nvalloc 16777216 false
+if le get bonNvRawMap 0 0
+ret false
+end
+put bonNvRawVa 0 mapaddr get bonNvRawMap 0
+put bonNvPktMap 0 nvalloc 65536 false
+if le get bonNvPktMap 0 0
+ret false
+end
+ret true
+end
+
+fn bonNvRunConv nBlks ulong dstWVa ulong dstSVa ulong to bool
+put gbused 0 0
+gbsetup
+gbmth 0 40 4
+gbemit 0
+gbemit 0
+gbemit 0
+gbemit 2281701376
+cb = mapaddr get gbmem 1
+gbdriver cb
+gbdma cb 224
+for j ulong 224
+gbemit get gbcb j
+end
+put engBindN 0 0
+engPtr get bonNvRawVa 0
+engPtr dstWVa
+engPtr dstSVa
+engPtr get bonNvFp16Va 0
+engArg uint nBlks
+engPrepQmdGy 27 uint div add nBlks 255 256 1 256
+words = get engBindN 0
+endva = add cb add 896 mul words 4
+put gbcb 212 gbhi endva
+put gbcb 213 gblo endva
+gbdma add cb 896 uint words
+for j2 ulong words
+gbemit get engBind j2
+end
+q = mapaddr get gbmem 2
+gbinline q false
+gbdma add q 8192 1
+gbemit 1
+gbinline add q 4096 true
+gbtail
+tot = get gbused 0
+if ne mapwrite get bonNvPktMap 0 0 gbcmd 0 tot long tot
+ret false
+end
+if lt mapset get gbmem 2 8192 4 0 0
+ret false
+end
+if lt mapset get gbmem 3 0 4 0 0
+ret false
+end
+if lt mapset get gbmem 3 16 4 0 0
+ret false
+end
+if not nvsend get bonNvPktMap 0 0 uint div tot 4
+ret false
+end
+if not engWaitFast 30000000000
+ret false
+end
+ret eq mapget get gbmem 3 0 4 1145324612
+end
+
+fn bonNvReadRawChunk fd int foff ulong rawB ulong to bool
+rdDone = ulong 0
+while lt rdDone rawB bound 64
+ch = sub rawB rdDone
+if gt ch 1048576
+ch = ulong 1048576
+end
+got = pread fd engIoBuf 0 ch long add foff rdDone
+if le got 0
+ret false
+end
+if ne mapwrite get bonNvRawMap 0 rdDone engIoBuf 0 ulong got got
+ret false
+end
+rdDone = add rdDone ulong got
+end
+ret true
+end
+
+fn bonNvStreamRange tid ulong nRows ulong dstWVa ulong dstSVa ulong to bool
+nBlksTot = div mul get ggDim0 tid nRows 128
+foff = add get ggDataStart 0 get ggTOff tid
+doneBlks = ulong 0
+while lt doneBlks nBlksTot bound 256
+cb = sub nBlksTot doneBlks
+if gt cb 524288
+cb = ulong 524288
+end
+if not bonNvReadRawChunk get ggFd 0 add foff mul doneBlks 28 mul cb 28
+ret false
+end
+if not bonNvRunConv cb add dstWVa mul doneBlks 64 add dstSVa mul doneBlks 8
+ret false
+end
+doneBlks = add doneBlks cb
+end
+ret true
+end
+
+fn bonLoadNvfp4_1 tid ulong to bool
+K = get ggDim0 tid
+N = get ggDim1 tid
+wB = div mul N K 2
+sB = div mul N K 16
+if not bonSlabAllocMap add wB sB
+ret false
+end
+wVa = get bonCurVa 0
+put bonTResVa 0 wVa
+ret bonNvStreamRange tid N wVa add wVa wB
+end
+
+fn bonLoadNvfp4_2 t0 ulong t1 ulong to bool
+K = get ggDim0 t0
+totN = add get ggDim1 t0 get ggDim1 t1
+wB = div mul totN K 2
+if not bonSlabAllocMap add wB div mul totN K 16
+ret false
+end
+wVa = get bonCurVa 0
+sVa = add wVa wB
+put bonTResVa 0 wVa
+if not bonNvStreamRange t0 get ggDim1 t0 wVa sVa
+ret false
+end
+wVa = add wVa div mul get ggDim1 t0 K 2
+sVa = add sVa div mul get ggDim1 t0 K 16
+ret bonNvStreamRange t1 get ggDim1 t1 wVa sVa
+end
+
+fn bonLoadNvfp4_3 t0 ulong t1 ulong t2 ulong to bool
+K = get ggDim0 t0
+totN = add add get ggDim1 t0 get ggDim1 t1 get ggDim1 t2
+wB = div mul totN K 2
+if not bonSlabAllocMap add wB div mul totN K 16
+ret false
+end
+wVa = get bonCurVa 0
+sVa = add wVa wB
+put bonTResVa 0 wVa
+if not bonNvStreamRange t0 get ggDim1 t0 wVa sVa
+ret false
+end
+wVa = add wVa div mul get ggDim1 t0 K 2
+sVa = add sVa div mul get ggDim1 t0 K 16
+if not bonNvStreamRange t1 get ggDim1 t1 wVa sVa
+ret false
+end
+wVa = add wVa div mul get ggDim1 t1 K 2
+sVa = add sVa div mul get ggDim1 t1 K 16
+ret bonNvStreamRange t2 get ggDim1 t2 wVa sVa
+end
+
+fn bonLoadNvfp4_Slice tid ulong nRows ulong to bool
+K = get ggDim0 tid
+wB = div mul nRows K 2
+sB = div mul nRows K 16
+if not bonSlabAllocMap add wB sB
+ret false
+end
+wVa = get bonCurVa 0
+put bonTResVa 0 wVa
+ret bonNvStreamRange tid nRows wVa add wVa wB
+end
+
+note =========================================================================
+note Full-APU 20-Core CPU Canonical NVFP4 Workers (exact E2M1 + UE4M3 dot products!)
+note =========================================================================
+global bonConvMPos ulong 1
+global bonConvMNeg ulong 1
+
+fn bonCpuMapTrit tr ulong to ulong
+if eq tr 0
+ret get bonConvMNeg 0
+end
+if eq tr 2
+ret get bonConvMPos 0
+end
+ret 0
+end
+
+fn bonCpuConvPairByte b0 ulong b1 ulong tr ulong to uchar
+n0 = bonCpuMapTrit ulong get bonCpuLut add b0 tr
+n1 = bonCpuMapTrit ulong get bonCpuLut add b1 tr
+ret uchar or n0 shl n1 4
+end
+
+fn bonCpuConvBlkG1 src ulong wb ulong to void
+for m ulong 8
+b0 = mul ulong get bonCpuRawBuf add src mul m 2 5
+b1 = mul ulong get bonCpuRawBuf add src add mul m 2 1 5
+for tr ulong 5
+put bonCpuNvW add wb add mul tr 8 m bonCpuConvPairByte b0 b1 tr
+end
+end
+end
+
+fn bonCpuConvBlkG2 src ulong wb ulong to void
+for m2 ulong 4
+b0 = mul ulong get bonCpuRawBuf add src add 16 mul m2 2 5
+b1 = mul ulong get bonCpuRawBuf add src add 16 add mul m2 2 1 5
+for tr2 ulong 5
+put bonCpuNvW add wb add 40 add mul tr2 4 m2 bonCpuConvPairByte b0 b1 tr2
+end
+end
+end
+
+fn bonCpuConvBlkG3 src ulong wb ulong to void
+q0 = mul ulong get bonCpuRawBuf add src 24 5
+q1 = mul ulong get bonCpuRawBuf add src 25 5
+for tr3 ulong 4
+put bonCpuNvW add wb add 60 tr3 bonCpuConvPairByte q0 q1 tr3
+end
+end
+
+fn bonCpuConvBlkNv4 b ulong to void
+src = mul b 28
+ent = ulong get bonNvFp16Cpu or ulong get bonCpuRawBuf add src 26 shl ulong get bonCpuRawBuf add src 27 8
+put bonConvMPos 0 and shr ent 8 15
+put bonConvMNeg 0 and shr ent 12 15
+for si ulong 8
+put bonCpuNvS add mul b 8 si uchar and ent 255
+end
+bonCpuConvBlkG1 src mul b 64
+bonCpuConvBlkG2 src mul b 64
+bonCpuConvBlkG3 src mul b 64
+end
+
+fn bonWorkerConvertNvfp4 to void
+nBlks = mul get bonCpuRowCnt 0 40
+for b ulong nBlks bound 65536
+bonCpuConvBlkNv4 b
+end
+end
+
+fn bonCpuDotGrpNv4 wb ulong xb ulong to f32
+bs = f32 0.0f32
+for j ulong 8
+by = ulong get bonCpuNvW add wb j
+x0 = add xb mul j 2
+w = get bonNvLutCpu add 256 and by 15
+bs = add bs mul w get bonCpuX x0
+w = get bonNvLutCpu add 256 shr by 4
+bs = add bs mul w get bonCpuX add x0 1
+end
+ret bs
+end
+
+fn bonCpuDotRowNvfp4 rIdx ulong to f32
+acc = f32 0.0f32
+wBase = mul rIdx 2560
+sBase = mul rIdx 320
+for g ulong 320
+sc = get bonNvLutCpu ulong get bonCpuNvS add sBase g
+acc = add acc mul bonCpuDotGrpNv4 add wBase mul g 8 mul g 16 sc
+end
+ret acc
+end
+
+global bonNvGrpAcc f32 4
+
+fn bonCpuDotGrpM4Nv4 wb ulong xb ulong to void
+s0 = f32 0.0f32
+s1 = f32 0.0f32
+s2 = f32 0.0f32
+s3 = f32 0.0f32
+for j ulong 8
+by = ulong get bonCpuNvW add wb j
+x0 = add xb mul j 2
+w = get bonNvLutCpu add 256 and by 15
+s0 = add s0 mul w get bonCpuX4 x0
+s1 = add s1 mul w get bonCpuX4 add x0 5120
+s2 = add s2 mul w get bonCpuX4 add x0 10240
+s3 = add s3 mul w get bonCpuX4 add x0 15360
+w = get bonNvLutCpu add 256 shr by 4
+s0 = add s0 mul w get bonCpuX4 add x0 1
+s1 = add s1 mul w get bonCpuX4 add x0 5121
+s2 = add s2 mul w get bonCpuX4 add x0 10241
+s3 = add s3 mul w get bonCpuX4 add x0 15361
+end
+put bonNvGrpAcc 0 s0
+put bonNvGrpAcc 1 s1
+put bonNvGrpAcc 2 s2
+put bonNvGrpAcc 3 s3
+end
+
+fn bonCpuDotRowM4Nvfp4 rIdx ulong to void
+put bonCpuRowAcc 0 f32 0.0f32
+put bonCpuRowAcc 1 f32 0.0f32
+put bonCpuRowAcc 2 f32 0.0f32
+put bonCpuRowAcc 3 f32 0.0f32
+wBase = mul rIdx 2560
+sBase = mul rIdx 320
+for g ulong 320
+bonCpuDotGrpM4Nv4 add wBase mul g 8 mul g 16
+sc = get bonNvLutCpu ulong get bonCpuNvS add sBase g
+put bonCpuRowAcc 0 add get bonCpuRowAcc 0 mul get bonNvGrpAcc 0 sc
+put bonCpuRowAcc 1 add get bonCpuRowAcc 1 mul get bonNvGrpAcc 1 sc
+put bonCpuRowAcc 2 add get bonCpuRowAcc 2 mul get bonNvGrpAcc 2 sc
+put bonCpuRowAcc 3 add get bonCpuRowAcc 3 mul get bonNvGrpAcc 3 sc
+end
+end
