@@ -1611,9 +1611,7 @@ test-argus-runtime: $(ARGUS_R7) $(ARGUS_R8) $(ARGUS_R9)
 bench-rx-argus: $(ARGUS_BENCH)
 	./$(ARGUS_BENCH)
 
-ARGUS_REPLAY = $(OUT_DIR)/argus_replay-$(ARGUS_SHORT)
-$(ARGUS_REPLAY): tools/argus_replay.c src/omega_om_units.c $(ARGUS_STAMP) | $(OUT_DIR)
-	$(CC) $(CFLAGS) -I$(ARGUS_SRC) -o $@ tools/argus_replay.c src/omega_om_units.c $(ARGUS_LIB_SRCS)
+ARGUS_REPLAY = $(RTBR_ARGUS_REPLAY_BIN)
 .PHONY: argus-replay
 argus-replay: $(ARGUS_REPLAY)
 

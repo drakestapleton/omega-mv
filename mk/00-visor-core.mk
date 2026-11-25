@@ -1,14 +1,14 @@
 # Omega Visor V1 (lead-owned). The `omega` binary is pure seeded OM-2 and
 # PHYSICS-FREE: it is compiled directly from $(OMEGA_OM_SRCS) by seed/out/omc.
 # Every Visor lane and its test is pure OM-2. The only Visor C left is what the
-# runtime-linked, test-only binaries link: visor_world.c (mk/visor-world.mk) and
-# visor_effect_request.c (mk/visor-authority.mk, test-effect-cap64).
+# runtime-linked, test-only binary links: visor_effect_request.c (mk/visor-authority.mk,
+# test-effect-cap64).
 VISOR_CORE = omega_om_units omega_canonical omega_validate omega_core omega_codec aarch64_encoder aarch64_decoder \
 	omega_realize omega_realize_synth omega_machine omega_exec omega_verify omega_program omega_synthesis omega_library \
 	omega_vector omega_blackwell_qmd omega_blackwell_encoder omega_blackwell_realize
 VISOR_CORE_OBJS = $(addprefix $(OUT_DIR)/,$(addsuffix .o,$(VISOR_CORE)))
 VISOR_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -MMD -MP -D_GNU_SOURCE -O2 -Isrc -Isrc/visor
-VISOR_SRCS = src/visor/visor_world.c src/visor/visor_effect_request.c
+VISOR_SRCS = src/visor/visor_effect_request.c
 VISOR_OBJS = $(patsubst src/visor/%.c,$(OUT_DIR)/visor/%.o,$(VISOR_SRCS))
 VISOR_DEPS = $(VISOR_OBJS:.o=.d)
 -include $(VISOR_DEPS)
