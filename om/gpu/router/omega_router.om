@@ -1,0 +1,720 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note om/gpu/router/omega_router.om:
+note 100% Pure Seeded-Omega On-Demand Multi-Model OpenAI Router & SSE Proxy.
+note Zero Python, zero C, zero libc, zero CUDA. Static AArch64 ELF via seed/out/omc.
+note
+note Listens on 127.0.0.1:18090 (or argv[1]). Exposes all installed pure-Omega models
+note in GET /v1/models for Open WebUI & q36-chat, dynamically hot-swaps the active
+note GPU backend on 127.0.0.1:18091 when a different model is selected in the UI,
+note routes omega-llm-15.8m-om2 to a dedicated CPU backend on 127.0.0.1:18098 (zero
+note GPU eviction), streams raw SSE chunks byte-for-byte, and auto-unloads the GPU
+note after 20 minutes of inactivity (1,200 s) so GB10 never sits idle hogging VRAM.
+note
+note Model IDs:
+note   1 = qwen3.6-35b-a3b-w4-mtp  (q36-serve --mtp4, 62-100 tok/s, 128K ctx)
+note   2 = qwen3.6-35b-a3b-w4      (q36-serve, 68 tok/s steady, 128K ctx)
+note   3 = qwen3.6-35b-a3b-fp8     (q36-serve --fp8, 48 tok/s exact FP8, 128K ctx)
+note   4 = inkling-2-mini          (inkling2-serve, 19GB NVFP4+MXFP8 looped core, 32K ctx)
+note   5 = omega-llm-15.8m-om2     (ollm serve on CPU :18098, 21/159 OM-2 coder, 0ms switch)
+
+global rtReqBuf uchar 524288
+global rtRelayBuf uchar 65536
+global rtPkt uchar 4096
+global rtSt ulong 12
+note rtSt[0]=listenPort, [1]=activeGpuModel(0..4), [2]=gpuPid, [3]=lastGpuNs, [4]=cpuPid, [5]=reqLen
+
+text rtBanner "=== OMEGA PURE-OM-2 MODEL SWITCHER ROUTER (ZERO PYTHON, ZERO CUDA) ===\n"
+text rtListenMsg "Listening on 127.0.0.1:"
+text rtReadyMsg " -> GPU :18091 (20m idle auto-unload) + CPU :18098 (omega-llm-15.8m-om2)\n"
+text rtLogSwitch "[omega-router] Switching GPU backend -> model #"
+text rtLogReady "[omega-router] Backend ready on :18091\n"
+text rtLogUnload "[omega-router] Idle 20m -> cleanly unloaded GPU backend (GB10 free)\n"
+text rtNl "\n"
+
+text rtH200 "HTTP/1.1 200 OK\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n\n"
+text rtH200Html "HTTP/1.1 200 OK\nContent-Type: text/html; charset=utf-8\nCache-Control: no-cache\nConnection: close\n\n"
+text rtH204Cors "HTTP/1.1 204 No Content\nAccess-Control-Allow-Origin: *\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\nAccess-Control-Allow-Headers: Content-Type, Authorization\nConnection: close\n\n"
+text rtH503Hdr "HTTP/1.1 503 Service Unavailable\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n\n"
+text rtBody503 "{\"error\":{\"message\":\"backend startup failed or busy\",\"type\":\"server_error\"}}\n"
+text rtH404Hdr "HTTP/1.1 404 Not Found\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n\n"
+text rtBody404 "{\"error\":{\"type\":\"not_found\"}}\n"
+text rtHealthReq "GET /health HTTP/1.1\nHost: 127.0.0.1\nConnection: close\n\n"
+
+text rtModelsJson "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.6-35b-a3b-w4-mtp\",\"object\":\"model\",\"owned_by\":\"omega-zero-cuda\",\"context_window\":131072},{\"id\":\"qwen3.6-35b-a3b-w4\",\"object\":\"model\",\"owned_by\":\"omega-zero-cuda\",\"context_window\":131072},{\"id\":\"qwen3.6-35b-a3b-fp8\",\"object\":\"model\",\"owned_by\":\"omega-zero-cuda\",\"context_window\":131072},{\"id\":\"inkling-2-mini\",\"object\":\"model\",\"owned_by\":\"omega-zero-cuda\",\"context_window\":32768},{\"id\":\"omega-llm-15.8m-om2\",\"object\":\"model\",\"owned_by\":\"omega-cpu\",\"context_window\":512}]}\n"
+
+text rtHealthA "{\"status\":\"ok\",\"engine\":\"omega-router\",\"active_gpu_model\":\""
+text rtHealthB "\",\"gpu_pid\":"
+text rtHealthC ",\"cpu_pid\":"
+text rtHealthD "}\n"
+
+text mName0 "none"
+text mName1 "qwen3.6-35b-a3b-w4-mtp"
+text mName2 "qwen3.6-35b-a3b-w4"
+text mName3 "qwen3.6-35b-a3b-fp8"
+text mName4 "inkling-2-mini"
+text mName5 "omega-llm-15.8m-om2"
+
+text rtKeyModel "\"model\""
+text rtKeyClen "content-length:"
+
+note Executable paths & args on Spark
+text binQ36 "/home/drakestapleton/.local/opt/q36/q36-serve"
+text argMdir "--model-dir"
+text pathQ36 "/home/drakestapleton/models/qwen3.6-35b-a3b-fp8-95a723d0"
+text argPort "--port"
+text val18091 "18091"
+text argMtp4 "--mtp4"
+text argFp8 "--fp8"
+
+text binIk2 "/home/drakestapleton/.local/opt/inkling2/inkling2-serve"
+text pathIk2 "/home/drakestapleton/models/inkling-2-mini-ed40e7da"
+
+text binOllm "/home/drakestapleton/work/ollm-helix-rlvr-20261121/bin/ollm"
+text argServe "serve"
+text val18098 "18098"
+text pathOllmCk "/home/drakestapleton/.local/opt/ollm/omega-llm-15.8m-om2.ck"
+text pathOllmBpe "/home/drakestapleton/work/ollm-loop-20261121/data/omega4096.bin"
+text pathLogGpu "/tmp/omega_router_gpu.log"
+text pathLogCpu "/tmp/omega_router_cpu.log"
+text pathDevNull "/dev/null"
+text pathBotsHtml "/home/drakestapleton/.local/opt/omega-router/bots.html"
+
+fn rtPrint s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn rtPrintU fd int v ulong to void
+b = new uchar 24 0
+p = ulong 24
+x = v
+while true bound 24
+p = sub p 1
+put b p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+break
+end
+end
+r = write fd b p sub 24 p
+end
+
+fn rtPktU16 off ulong v ulong to void
+put rtPkt off uchar and v 255
+put rtPkt add off 1 uchar and shr v 8 255
+end
+
+fn rtPktAdd pos ulong s view uchar * to ulong
+n = len s
+rtPktU16 pos n
+pos = add pos 2
+for i ulong n bound 512
+put rtPkt add pos i get s i
+end
+ret add pos n
+end
+
+fn rtConnectLocal port ulong to long
+sa = new uchar 16 0
+fd = socknew 2 1 0
+if lt fd 0
+ret fd
+end
+put sa 0 2
+put sa 1 0
+put sa 2 uchar and shr port 8 255
+put sa 3 uchar and port 255
+put sa 4 127
+put sa 5 0
+put sa 6 0
+put sa 7 1
+cr = connect int fd sa 0 16
+if lt cr 0
+c = fclose int fd
+ret cr
+end
+ret fd
+end
+
+fn rtWriteHdr fd int s view uchar * to void
+b = new uchar 512 0
+p = ulong 0
+for i ulong len s bound 480
+c = get s i
+if eq c 10
+put b p 13
+p = add p 1
+end
+put b p c
+p = add p 1
+end
+w = write fd b 0 p
+end
+
+fn rtSend503 cfd int to void
+rtWriteHdr cfd rtH503Hdr
+w = write cfd rtBody503 0 len rtBody503
+end
+
+fn rtSend404 cfd int to void
+rtWriteHdr cfd rtH404Hdr
+w = write cfd rtBody404 0 len rtBody404
+end
+
+fn rtProbeHealth port ulong to bool
+fd = rtConnectLocal port
+if lt fd 0
+ret false
+end
+rtWriteHdr int fd rtHealthReq
+r = read int fd rtRelayBuf 0 512
+c = fclose int fd
+if lt r 12
+ret false
+end
+note Check HTTP/1.1 200
+ret and eq get rtRelayBuf 9 50 and eq get rtRelayBuf 10 48 eq get rtRelayBuf 11 48
+end
+
+fn rtStopGpu to void
+st = new uchar 4 0
+pid = get rtSt 2
+if gt pid 0
+k = killpid int pid 15
+note Wait up to 8s for clean GPU teardown
+for it ulong 40
+w = waitpid int pid st 0 4 1
+if gt w 0
+break
+end
+s = sleepns 200000000
+end
+if eq waitpid int pid st 0 4 1 0
+k2 = killpid int pid 9
+w2 = waitpid int pid st 0 4 0
+end
+put rtSt 2 0
+put rtSt 1 0
+note Let NVRM/UVM release VRAM cleanly
+s2 = sleepns 2000000000
+end
+end
+
+fn rtSpawnPkt plen ulong logPath view uchar * to long
+pid = fork
+if lt pid 0
+ret pid
+end
+if eq pid 0
+dn = fopen pathDevNull 0 len pathDevNull 0 0
+if ge dn 0
+d0 = dupfd int dn 0 0
+c0 = fclose int dn
+end
+lf = fopen logPath 0 len logPath 577 420
+if ge lf 0
+d1 = dupfd int lf 1 0
+d2 = dupfd int lf 2 0
+c1 = fclose int lf
+end
+ex = execprog rtPkt 0 plen
+exit 127
+end
+ret pid
+end
+
+fn rtStartGpuModel mid ulong to bool
+if eq get rtSt 1 mid
+if rtProbeHealth 18091
+ret true
+end
+end
+rtStopGpu
+rtPrint rtLogSwitch
+rtPrintU 1 mid
+rtPrint rtNl
+
+pos = ulong 2
+if eq mid 1
+rtPktU16 0 6
+pos = rtPktAdd pos binQ36
+pos = rtPktAdd pos argMdir
+pos = rtPktAdd pos pathQ36
+pos = rtPktAdd pos argPort
+pos = rtPktAdd pos val18091
+pos = rtPktAdd pos argMtp4
+else
+if eq mid 2
+rtPktU16 0 5
+pos = rtPktAdd pos binQ36
+pos = rtPktAdd pos argMdir
+pos = rtPktAdd pos pathQ36
+pos = rtPktAdd pos argPort
+pos = rtPktAdd pos val18091
+else
+if eq mid 3
+rtPktU16 0 6
+pos = rtPktAdd pos binQ36
+pos = rtPktAdd pos argMdir
+pos = rtPktAdd pos pathQ36
+pos = rtPktAdd pos argPort
+pos = rtPktAdd pos val18091
+pos = rtPktAdd pos argFp8
+else
+rtPktU16 0 3
+pos = rtPktAdd pos binIk2
+pos = rtPktAdd pos pathIk2
+pos = rtPktAdd pos val18091
+end
+end
+end
+
+pid = rtSpawnPkt pos pathLogGpu
+if le pid 0
+ret false
+end
+put rtSt 2 ulong pid
+put rtSt 1 mid
+put rtSt 3 ulong monons
+
+note Poll GET /health on :18091 up to 120s (240 x 500ms)
+st = new uchar 4 0
+for it ulong 240
+if rtProbeHealth 18091
+rtPrint rtLogReady
+ret true
+end
+if gt waitpid int pid st 0 4 1 0
+put rtSt 2 0
+put rtSt 1 0
+ret false
+end
+s = sleepns 500000000
+end
+ret false
+end
+
+fn rtEnsureCpuOllm to bool
+if rtProbeHealth 18098
+ret true
+end
+rtPktU16 0 5
+pos = ulong 2
+pos = rtPktAdd pos binOllm
+pos = rtPktAdd pos argServe
+pos = rtPktAdd pos val18098
+pos = rtPktAdd pos pathOllmCk
+pos = rtPktAdd pos pathOllmBpe
+pid = rtSpawnPkt pos pathLogCpu
+if le pid 0
+ret false
+end
+put rtSt 4 ulong pid
+for it ulong 40
+if rtProbeHealth 18098
+ret true
+end
+s = sleepns 250000000
+end
+ret false
+end
+
+fn rtFindHdrEnd n ulong to ulong
+if lt n 4
+ret 0
+end
+lim = sub n 3
+for i ulong lim bound 32768
+if and eq get rtReqBuf i 13 eq get rtReqBuf add i 1 10
+if and eq get rtReqBuf add i 2 13 eq get rtReqBuf add i 3 10
+ret add i 4
+end
+end
+if and eq get rtReqBuf i 10 eq get rtReqBuf add i 1 10
+ret add i 2
+end
+end
+ret 0
+end
+
+fn rtMatchCI pos ulong s view uchar * to bool
+for j ulong len s bound 32
+c = get rtReqBuf add pos j
+if and ge c 65 le c 90
+c = add c 32
+end
+if ne c get s j
+ret false
+end
+end
+ret true
+end
+
+fn rtFindClen hdrEnd ulong to ulong
+if lt hdrEnd 16
+ret 0
+end
+lim = sub hdrEnd 15
+for i ulong lim bound 32768
+if rtMatchCI i rtKeyClen
+p = add i 15
+while and lt p hdrEnd or eq get rtReqBuf p 32 eq get rtReqBuf p 9 bound 32
+p = add p 1
+end
+v = ulong 0
+while lt p hdrEnd bound 16
+c = get rtReqBuf p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+end
+ret v
+end
+end
+ret 0
+end
+
+fn rtReadReq fd int to ulong
+tot = ulong 0
+hdrEnd = ulong 0
+need = ulong 0
+for it ulong 1024
+if ge tot 524280
+break
+end
+r = read fd rtReqBuf tot sub 524280 tot
+if eq r -4
+continue
+end
+if le r 0
+break
+end
+tot = add tot ulong r
+if eq hdrEnd 0
+hdrEnd = rtFindHdrEnd tot
+if gt hdrEnd 0
+cl = rtFindClen hdrEnd
+need = add hdrEnd cl
+if gt need 524280
+need = ulong 524280
+end
+end
+end
+if and gt hdrEnd 0 ge tot need
+break
+end
+end
+ret tot
+end
+
+fn rtReqEq pos ulong slen ulong s view uchar * to bool
+if ne slen len s
+ret false
+end
+for i ulong slen bound 64
+if ne get rtReqBuf add pos i get s i
+ret false
+end
+end
+ret true
+end
+
+fn rtParseModelId n ulong to ulong
+if lt n 14
+ret 1
+end
+lim = sub n 8
+for i ulong lim bound 524288
+if rtMatchCI i rtKeyModel
+p = add i 7
+saw = false
+while lt p n bound 64
+c = get rtReqBuf p
+if or or eq c 32 eq c 9 or eq c 10 eq c 13
+p = add p 1
+else
+if and eq c 58 not saw
+saw = true
+p = add p 1
+else
+break
+end
+end
+end
+if and saw and lt p n eq get rtReqBuf p 34
+st = add p 1
+q = st
+while and lt q n ne get rtReqBuf q 34 bound 128
+q = add q 1
+end
+ml = sub q st
+if rtReqEq st ml mName1
+ret 1
+end
+if rtReqEq st ml mName2
+ret 2
+end
+if rtReqEq st ml mName3
+ret 3
+end
+if rtReqEq st ml mName4
+ret 4
+end
+if rtReqEq st ml mName5
+ret 5
+end
+end
+end
+end
+ret 1
+end
+
+fn rtWriteRelay fd int n ulong to bool
+off = ulong 0
+while lt off n bound 65536
+w = write fd rtRelayBuf off sub n off
+if eq w -4
+continue
+end
+if le w 0
+ret false
+end
+off = add off ulong w
+end
+ret true
+end
+
+fn rtProxyTo cfd int port ulong reqLen ulong to void
+bfd = rtConnectLocal port
+if lt bfd 0
+rtSend503 cfd
+ret
+end
+note Forward complete HTTP request to backend
+off = ulong 0
+while lt off reqLen bound 65536
+w = write int bfd rtReqBuf off sub reqLen off
+if eq w -4
+continue
+end
+if le w 0
+c0 = fclose int bfd
+rtSend503 cfd
+ret
+end
+off = add off ulong w
+end
+note Stream raw HTTP/SSE response bytes live back to client!
+while true bound 1048576
+r = read int bfd rtRelayBuf 0 65536
+if eq r -4
+continue
+end
+if le r 0
+break
+end
+if not rtWriteRelay cfd ulong r
+break
+end
+end
+c1 = fclose int bfd
+end
+
+fn rtSendHealth cfd int to void
+rtWriteHdr cfd rtH200
+w = write cfd rtHealthA 0 len rtHealthA
+m = get rtSt 1
+if eq m 1
+w = write cfd mName1 0 len mName1
+else
+if eq m 2
+w = write cfd mName2 0 len mName2
+else
+if eq m 3
+w = write cfd mName3 0 len mName3
+else
+if eq m 4
+w = write cfd mName4 0 len mName4
+else
+w = write cfd mName0 0 len mName0
+end
+end
+end
+end
+w = write cfd rtHealthB 0 len rtHealthB
+rtPrintU cfd get rtSt 2
+w = write cfd rtHealthC 0 len rtHealthC
+rtPrintU cfd get rtSt 4
+w = write cfd rtHealthD 0 len rtHealthD
+end
+
+fn rtServeBotsHtml cfd int to void
+fd = fopen pathBotsHtml 0 len pathBotsHtml 0 0
+if lt fd 0
+rtSend404 cfd
+ret
+end
+rtWriteHdr cfd rtH200Html
+for it ulong 64
+r = read int fd rtRelayBuf 0 65536
+if eq r -4
+continue
+end
+if le r 0
+break
+end
+if not rtWriteRelay cfd ulong r
+break
+end
+end
+c = fclose int fd
+end
+
+fn rtReapWorkers to void
+st = new uchar 4 0
+for it ulong 16
+w = waitpid -1 st 0 4 1
+if le w 0
+break
+end
+if eq ulong w get rtSt 2
+put rtSt 2 0
+put rtSt 1 0
+end
+if eq ulong w get rtSt 4
+put rtSt 4 0
+end
+end
+end
+
+fn rtHandleClient cfd int to void
+n = rtReadReq cfd
+if le n 4
+ret
+end
+note OPTIONS CORS preflight
+if eq get rtReqBuf 0 79
+rtWriteHdr cfd rtH204Cors
+ret
+end
+note GET /, GET /bots, GET /health, GET /v1/models, GET /models
+if and eq get rtReqBuf 0 71 eq get rtReqBuf 4 47
+if or eq get rtReqBuf 5 32 eq get rtReqBuf 5 98
+rtServeBotsHtml cfd
+ret
+end
+if eq get rtReqBuf 5 104
+rtSendHealth cfd
+ret
+end
+if or and eq get rtReqBuf 5 118 eq get rtReqBuf 8 109 eq get rtReqBuf 5 109
+rtWriteHdr cfd rtH200
+w = write cfd rtModelsJson 0 len rtModelsJson
+ret
+end
+end
+note POST /v1/chat/completions, POST /v1/completions, or POST /v1/batch-chat
+if and eq get rtReqBuf 0 80 eq get rtReqBuf 5 47
+mid = rtParseModelId n
+if eq mid 5
+if not rtEnsureCpuOllm
+rtSend503 cfd
+ret
+end
+note Fork CPU proxy worker so CPU bots run in TRUE hardware parallel with GPU bots!
+wpid = fork
+if eq wpid 0
+rtProxyTo cfd 18098 n
+c0 = fclose cfd
+exit 0
+end
+if lt wpid 0
+rtProxyTo cfd 18098 n
+end
+ret
+end
+put rtSt 3 ulong monons
+if not rtStartGpuModel mid
+rtSend503 cfd
+ret
+end
+put rtSt 3 ulong monons
+rtProxyTo cfd 18091 n
+put rtSt 3 ulong monons
+ret
+end
+rtSend404 cfd
+end
+
+fn rtListen port ulong to long
+addr = new uchar 16 0
+one = new uchar 4 0
+put addr 0 2
+put addr 2 uchar and shr port 8 255
+put addr 3 uchar and port 255
+put addr 4 127
+put addr 5 0
+put addr 6 0
+put addr 7 1
+put one 0 1
+fd = socknew 2 524289 0
+if lt fd 0
+ret fd
+end
+r = sockopt int fd 1 2 one 0 4
+if eq r 0
+r = bind int fd addr 0 16
+end
+if eq r 0
+r = listen int fd 32
+end
+if ne r 0
+c = fclose int fd
+ret r
+end
+ret fd
+end
+
+fn main to int
+port = ulong 18090
+put rtSt 0 port
+put rtSt 1 0
+put rtSt 2 0
+put rtSt 3 ulong monons
+put rtSt 4 0
+
+lfd = rtListen port
+if lt lfd 0
+ret 40
+end
+rtPrint rtBanner
+rtPrint rtListenMsg
+rtPrintU 1 port
+rtPrint rtReadyMsg
+
+note Main accept loop with 10s waitio wakeups for 20-minute (1200s) GPU idle auto-unload
+idleLim = ulong 1200000000000
+while true bound 10000000
+rtReapWorkers
+ev = waitio int lfd 1 10000000000
+if gt ev 0
+cfd = accept int lfd 524288
+if ge cfd 0
+rtHandleClient int cfd
+c = fclose int cfd
+end
+else
+if gt get rtSt 2 0
+now = ulong monons
+last = get rtSt 3
+if and gt now last ge sub now last idleLim
+rtStopGpu
+rtPrint rtLogUnload
+end
+end
+end
+end
+ret 0
+end

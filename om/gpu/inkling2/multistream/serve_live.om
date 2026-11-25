@@ -35,6 +35,22 @@ text slSelfOk "PASS: live real-weight N=8 multi-stream continuous batcher (2 int
 text slSelfBad "FAIL: live multi-stream self-test failed\n"
 
 text slH200 "HTTP/1.1 200 OK\nContent-Type: application/json\nConnection: close\n\n"
+text slH200Sse "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\nConnection: close\n\n"
+text slSseA "data: {\"id\":\"cmpl-ik2\",\"object\":\"chat.completion.chunk\",\"model\":\"inkling-2-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+text slSseB "\"},\"finish_reason\":null}]}\n\n"
+text slSseEnd "data: {\"id\":\"cmpl-ik2\",\"object\":\"chat.completion.chunk\",\"model\":\"inkling-2-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+text slKeyText "\"text\""
+text slKeyStream "\"stream\""
+text slKeyPrompts "\"prompts\""
+text slBatSseA "data: {\"slot\":"
+text slBatSseB ",\"delta\":\""
+text slBatSseC "\"}\n\n"
+text slBatDone ",\"done\":true}\n\n"
+text slBatEnd "data: [DONE]\n\n"
+global slStreamFd int 8
+global slBatSlot ulong 8
+global slBatPrev ulong 8
+global slBatFin ulong 8
 text slH503 "HTTP/1.1 503 Service Unavailable\nContent-Type: application/json\nRetry-After: 1\nConnection: close\n\n{\"error\":{\"type\":\"server_busy\",\"message\":\"all 8 static KV slots occupied\",\"slots_max\":8}}\n"
 text slH404 "HTTP/1.1 404 Not Found\nContent-Type: application/json\nConnection: close\n\n{\"error\":{\"type\":\"not_found\"}}\n"
 text slHealthPre "{\"status\":\"ok\",\"model\":\"inkling-2-mini\",\"context_window\":32768,\"slots_max\":8,\"slots_active\":"
@@ -482,53 +498,97 @@ end
 ret o
 end
 
+fn slMatchAt pos ulong s view uchar * to bool
+for j ulong len s bound 32
+if ne get slReqBuf add pos j get s j
+ret false
+end
+end
+ret true
+end
+
+fn slSkipWsColon p0 ulong n ulong to ulong
+p = p0
+saw = false
+while lt p n bound 64
+c = get slReqBuf p
+if or or eq c 32 eq c 9 or eq c 10 eq c 13
+p = add p 1
+else
+if and eq c 58 not saw
+saw = true
+p = add p 1
+else
+break
+end
+end
+end
+if not saw
+ret n
+end
+ret p
+end
+
+fn slFindStream n ulong to bool
+if lt n 14
+ret false
+end
+lim = sub n 9
+for i ulong lim bound 131072
+if slMatchAt i slKeyStream
+p = slSkipWsColon add i 8 n
+if le add p 4 n
+if and eq get slReqBuf p 116 eq get slReqBuf add p 1 114
+if and eq get slReqBuf add p 2 117 eq get slReqBuf add p 3 101
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
 fn slExtractContent n ulong to ulong
 if lt n 14
 ret 0
 end
+lastSt = ulong 0
+found = false
 lim = sub n 10
 for i ulong lim bound 131072
-ok = true
-for j ulong 9
-if ne get slReqBuf add i j get slKeyContent j
-ok = false
+if slMatchAt i slKeyContent
+p = slSkipWsColon add i 9 n
+if and lt p n eq get slReqBuf p 34
+lastSt = add p 1
+found = true
+end
+if and lt p n eq get slReqBuf p 91
+q = add p 1
+while lt add q 6 n bound 32768
+if eq get slReqBuf q 93
+break
+end
+if slMatchAt q slKeyText
+v = slSkipWsColon add q 6 n
+if and lt v n eq get slReqBuf v 34
+lastSt = add v 1
+found = true
 break
 end
 end
-if ok
-p = add i 9
-while and lt p n ne get slReqBuf p 34 bound 64
-p = add p 1
-end
-if lt p n
-ret slUnescapeToPrompt add p 1 n
+q = add q 1
 end
 end
 end
+end
+if not found
 ret 0
 end
+ret slUnescapeToPrompt lastSt n
+end
 
-fn slHandleChat fd int n ulong to void
-slot = msAdmit fd 1024 0
-if lt slot 0
-w = write fd slH503 0 len slH503
-ret
-end
-pLen = slExtractContent n
-if eq pLen 0
-pLen = len slS0Prompt
-for i ulong pLen bound 1024
-put ikTokInBuf i get slS0Prompt i
-end
-end
-s = ulong slot
-if slStartFromBuf s pLen 1024
-for step ulong 17408
-if slStepStream s
-break
-end
-end
-end
+fn slSendChatJson fd int s ulong to void
 pToks = get slPromptLen s
 cToks = get msGenCnt s
 slRespReset
@@ -543,7 +603,186 @@ slRespAppend slChatMid3 len slChatMid3
 slRespAppendU add pToks cToks
 slRespAppend slChatSuf len slChatSuf
 w = write fd slRespBuf 0 get slRespLen 0
+end
+
+fn slRunChatLoop fd int s ulong pLen ulong isStream bool to void
+prevLen = ulong 0
+if slStartFromBuf s pLen 4096
+for step ulong 17408
+done = slStepStream s
+curLen = get slOutLen s
+if and isStream gt curLen prevLen
+slRespReset
+slRespAppend slSseA len slSseA
+slRespAppendJsonEsc add mul s 8192 prevLen sub curLen prevLen
+slRespAppend slSseB len slSseB
+w = write fd slRespBuf 0 get slRespLen 0
+prevLen = curLen
+end
+if done
+break
+end
+end
+end
+end
+
+fn slHandleChat fd int n ulong to void
+slot = msAdmit fd 4096 0
+if lt slot 0
+w = write fd slH503 0 len slH503
+ret
+end
+pLen = slExtractContent n
+if eq pLen 0
+pLen = len slS0Prompt
+for i ulong pLen bound 1024
+put ikTokInBuf i get slS0Prompt i
+end
+end
+isStream = slFindStream n
+s = ulong slot
+if isStream
+put slStreamFd s fd
+slRespReset
+slRespAppendHdr slH200Sse len slH200Sse
+w = write fd slRespBuf 0 get slRespLen 0
+else
+put slStreamFd s -1
+end
+slRunChatLoop fd s pLen isStream
+put slStreamFd s -1
+if isStream
+w = write fd slSseEnd 0 len slSseEnd
+else
+slSendChatJson fd s
+end
 msRetire s
+end
+
+fn slFindPromptsArr n ulong to ulong
+if lt n 16
+ret n
+end
+lim = sub n 10
+for i ulong lim bound 131072
+if slMatchAt i slKeyPrompts
+p = slSkipWsColon add i 9 n
+if and lt p n eq get slReqBuf p 91
+ret add p 1
+end
+end
+end
+ret n
+end
+
+fn slSkipJsonStr p0 ulong n ulong to ulong
+p = add p0 1
+while lt p n bound 131072
+c = get slReqBuf p
+if eq c 92
+p = add p 2
+else
+if eq c 34
+ret add p 1
+end
+p = add p 1
+end
+end
+ret n
+end
+
+fn slAdmitBatchPrompts fd int n ulong to ulong
+p = slFindPromptsArr n
+if ge p n
+ret 0
+end
+cnt = ulong 0
+while and lt p n lt cnt 8 bound 131072
+c = get slReqBuf p
+if eq c 93
+break
+end
+if eq c 34
+pLen = slUnescapeToPrompt add p 1 n
+slot = msAdmit fd 2048 0
+if ge slot 0
+s = ulong slot
+if slStartFromBuf s pLen 2048
+put slBatSlot cnt s
+put slBatPrev cnt 0
+put slBatFin cnt 0
+cnt = add cnt 1
+else
+msRetire s
+end
+end
+p = slSkipJsonStr p n
+else
+p = add p 1
+end
+end
+ret cnt
+end
+
+fn slEmitBatchDelta fd int idx ulong s ulong prev ulong cur ulong to void
+slRespReset
+slRespAppend slBatSseA len slBatSseA
+slRespAppendU idx
+slRespAppend slBatSseB len slBatSseB
+slRespAppendJsonEsc add mul s 8192 prev sub cur prev
+slRespAppend slBatSseC len slBatSseC
+w = write fd slRespBuf 0 get slRespLen 0
+end
+
+fn slEmitBatchDone fd int idx ulong to void
+slRespReset
+slRespAppend slBatSseA len slBatSseA
+slRespAppendU idx
+slRespAppend slBatDone len slBatDone
+w = write fd slRespBuf 0 get slRespLen 0
+end
+
+fn slStepBatchOnce fd int cnt ulong to ulong
+active = ulong 0
+for i ulong cnt bound 8
+if eq get slBatFin i 0
+s = get slBatSlot i
+done = slStepStream s
+cur = get slOutLen s
+prev = get slBatPrev i
+if gt cur prev
+slEmitBatchDelta fd i s prev cur
+put slBatPrev i cur
+end
+if done
+put slBatFin i 1
+slEmitBatchDone fd i
+else
+active = add active 1
+end
+end
+end
+ret active
+end
+
+fn slHandleBatchChat fd int n ulong to void
+cnt = slAdmitBatchPrompts fd n
+if eq cnt 0
+w = write fd slH404 0 len slH404
+ret
+end
+slRespReset
+slRespAppendHdr slH200Sse len slH200Sse
+w = write fd slRespBuf 0 get slRespLen 0
+for step ulong 17408
+if eq slStepBatchOnce fd cnt 0
+break
+end
+end
+w = write fd slBatEnd 0 len slBatEnd
+for i ulong cnt bound 8
+msRetire get slBatSlot i
+end
 end
 
 fn slHandleHttp fd int to void
@@ -578,6 +817,10 @@ ret
 end
 end
 if and eq get slReqBuf 0 80 eq get slReqBuf 5 47
+if and ge n 14 eq get slReqBuf 9 98
+slHandleBatchChat fd n
+ret
+end
 slHandleChat fd n
 ret
 end
@@ -606,12 +849,39 @@ end
 ret false
 end
 
+fn slParsePortArg to ulong
+if lt argcnt 3
+ret 8080
+end
+a = new uchar 16 0
+n = argread 2 a 0 16
+if or le n 0 gt n 5
+ret 8080
+end
+v = ulong 0
+for i ulong ulong n bound 5
+c = get a i
+if or lt c 48 gt c 57
+ret 8080
+end
+v = add mul v 10 ulong sub c 48
+end
+if or eq v 0 gt v 65535
+ret 8080
+end
+ret v
+end
+
 fn slListen port ulong to long
 addr = new uchar 16 0
 one = new uchar 4 0
 put addr 0 2
 put addr 2 uchar shr port 8
 put addr 3 uchar and port 255
+put addr 4 127
+put addr 5 0
+put addr 6 0
+put addr 7 1
 put one 0 1
 fd = socknew 2 524289 0
 if lt fd 0
@@ -663,7 +933,7 @@ rc = nvstop
 ret rc1
 end
 msInit
-port = ulong 8080
+port = slParsePortArg
 lfd = slListen port
 if lt lfd 0
 rc = nvstop
