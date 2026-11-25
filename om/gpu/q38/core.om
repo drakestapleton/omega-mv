@@ -149,17 +149,36 @@ const QP_CIDS ulong 213057536
 const QP_CLOG ulong 213319680
 const QP_GDN_SNAP ulong 218103808
 
+note MTP W4 + Speculative Snapshot layout
+const Q38_MTP_W4_BYTES ulong 268435456
+const MTP_FC_BYTES ulong 104857600
+const MTP_BF16_BYTES ulong 97664
+const MTP_FP8_BYTES ulong 372244480
+const MTP_FC_W ulong 216006656
+const MTP_FC_S ulong 242221056
+const MTP_SCALE_OFF ulong 246000000
+const MTP_NORM_OFF ulong 133888
+const MTP_PRE_EMB_OFF ulong 154368
+const MTP_PRE_HID_OFF ulong 174848
+
+const Q38_SNAP_BYTES ulong 201326592
+const QSP_GDN_STATE ulong 0
+const QSP_GDN_TAIL ulong 150994944
+const QSP_QKV ulong 157286400
+const QSP_AB ulong 182452224
+
 global q38CodePos ulong 1
 global q38CodeMap long 1
 global q38CodeFail uint 1
-global q38Entry ulong 40
-global q38Smem ulong 40
+global q38Entry ulong 44
+global q38Smem ulong 44
+global q38Regs ulong 44
 global q38Bind uint 32
 global q38BindN ulong 1
 global q38PktOff ulong 1
 global q38PktPos ulong 1
-global q38SlotOff ulong 8
-global q38SlotLen ulong 8
+global q38SlotOff ulong 12
+global q38SlotLen ulong 12
 
 global q38Work long 1
 global q38WorkVa ulong 1
@@ -184,6 +203,12 @@ global q38SlabMap long 8
 global q38SlabVa ulong 8
 global q38TmpSlab long 1
 global q38TmpSlabVa ulong 1
+global q38MtpW4Map long 1
+global q38MtpW4Va ulong 1
+global q38MtpKvMap long 1
+global q38MtpKvVa ulong 1
+global q38SpecSnapMap long 1
+global q38SpecSnapVa ulong 1
 
 global q38SlotOffs ulong 24
 global q38SlotSzs ulong 24
@@ -194,6 +219,10 @@ global q38IoBuf uchar 1048576
 global q38ScaleOut uchar 524288
 global q38OutFd int 1
 global q38UseW4 ulong 1
+global q38UseMtp ulong 1
+global q38MtpReady ulong 1
+global q38MtpM ulong 1
+global q38SpecMode ulong 1
 global q38BatchN ulong 1
 global q38SpecM ulong 1
 global q38CurPos ulong 1
@@ -202,6 +231,10 @@ global q38CurM4 ulong 1
 global q38RopeFreq f64 32
 global q38CandIds uint 128
 global q38CandLog f32 128
+global q38SpecDraft ulong 16
+global q38SpecPred ulong 16
+global q38RefOut ulong 512
+global q38MtpSt ulong 4
 global q38Dig uchar 32
 global q38TokSeq uint 131072
 
@@ -209,7 +242,16 @@ text q38DefDir "/home/aienalpha/models/qwen3.8-27b-fp8-017b9c7a"
 text q38SufOut "/outside.safetensors"
 text q38SufLay "/layers-"
 text q38SufSt ".safetensors"
+text q38SufMtp "/mtp.safetensors"
 text q38SufTok "/tokenizer.json"
+text q38MsgMtpLoad "Loaded & quantized Qwen 3.8 27B native MTP drafter (mtp.safetensors -> W4) in ms="
+text q38MsgMtpStat "NATIVE_MTP_Q38_27B: M="
+text q38MsgMtpParOk " PARITY=EXACT steps="
+text q38MsgMtpParBad " PARITY=MISMATCH steps="
+text q38MsgMtpSpd " speedup_x100="
+text q38MsgMtpMis "  [MTP_MISMATCH] idx="
+text q38MsgMtpGot " got="
+text q38MsgMtpRef " ref="
 text q38MsgNl "\n"
 text q38MsgSp " "
 text q38MsgErr "Q38_ERR stage="
@@ -279,6 +321,7 @@ fn q38RegKernel kid ulong src ulong mode uchar smem ulong to void
 p = mul div add get q38CodePos 0 255 256 256
 put q38Entry kid p
 put q38Smem kid smem
+put q38Regs kid 64
 put q38CodePos 0 p
 put q36Pc 0 0
 put q36Guard 0 0
@@ -302,9 +345,9 @@ end
 
 fn q38EmitAll to void
 put q38CodePos 0 0
-note 0: q38W4Gemv4R (4 KiB streaming SMEM for K=5120/6144/17408 + lm_head!)
+note 0: q38W4Gemv4R (Zero-I2F overlapped 4 KiB streaming SMEM W4 GEMV)
 q38RegKernel 0 2 200 4128
-note 1: q38W4GemmM4 (8 KiB SMEM for B=4/8 across K=5120/6144/17408!)
+note 1: q38W4GemmM4 (legacy fallback)
 q38RegKernel 1 2 201 8192
 note 2: qFp8B128GemvFast (K=5120 -> 21568 B SMEM)
 q38RegKernel 2 0 98 21568
@@ -344,7 +387,7 @@ note 19: q38ArgmaxEmbedStep (H=5120)
 q38RegKernel 19 2 210 512
 note 20: q38PreRmsNormBf16 (H=5120 -> BF16)
 q38RegKernel 20 2 211 1088
-note 21: qPreW4GemmHmma (SM121 HMMA.16816 W4 GEMM)
+note 21: qPreW4GemmHmma (legacy 32-tok HMMA W4 GEMM)
 q38RegKernel 21 1 132 2048
 note 22: q38PreBf16GemmBatch (SM121 HMMA.16816 BF16 GEMM, K=5120)
 q38RegKernel 22 2 224 2048
@@ -370,10 +413,17 @@ note 32: q38F32ToBf16
 q38RegKernel 32 2 221 0
 note 33: q38PreGatherEmbeds (H=5120)
 q38RegKernel 33 2 223 0
-note 34: qPreLmHeadW4Hmma (batched W4 lm_head)
+note 34: qPreLmHeadW4Hmma (unused; replaced by kid 36)
 q38RegKernel 34 1 147 2048
 note 35: qPreCopyU32 (GPU u32 memcpy for GDN snapshot/rollback)
 q38RegKernel 35 1 148 0
+note 36: q38W4GemmM8Hmma (100% Coalesced SMEM-W4 Tensor Core HMMA.16816 for B<=8 + lm_head!)
+q38RegKernel 36 2 225 3328
+note 37: q38PreW4GemmSuper (128-tok/CTA 128-reg L2-Swizzled Overlapped Coalesced SMEM-W4 Super-HMMA!)
+q38RegKernel 37 2 226 10496
+put q38Regs 37 128
+note 38: q38Bf16ToW4QuantAnyK (BF16->W4 quantizer for mtp.fc [5120, 10240])
+q38RegKernel 38 2 227 0
 end
 
 fn q38O idx ulong to ulong
@@ -480,17 +530,21 @@ put gbq1 32 gblo shr a 4
 put gbq1 33 or uint and shr a 36 2097151 20971520
 put gbq1 59 gblo shr a 8
 put gbq1 34 or uint 65536 bx
-put gbq1 35 or uint 131073 shl uint 64 8
+rg = get q38Regs kid
+if eq rg 0
+rg = ulong 64
+end
+put gbq1 35 or uint 131073 shl uint rg 8
 sm = get q38Smem kid
 s7 = ulong 8
 if ne sm 0
 s7 = div add sm 127 128
 end
 sc = ulong 9
-if gt sm 32768
+if gt sm 8192
 sc = ulong 17
 end
-if gt sm 65536
+if gt sm 16000
 sc = ulong 26
 end
 w36 = or or or shl sc 23 shl ulong 26 17 shl sc 11 s7
@@ -893,22 +947,6 @@ fn q38LayerSVa L ulong to ulong
 ret add get q38ScaleVa 0 mul L Q38_SCALE_STRIDE
 end
 
-fn q38QuantFp8Mat wFp8Va ulong sFp8Va ulong wW4Va ulong sW4Va ulong K uint N uint to bool
-q38PktStart
-q38Ptr wFp8Va
-q38Ptr sFp8Va
-q38Ptr mapaddr get q38Lut 0
-q38Ptr wW4Va
-q38Ptr sW4Va
-q38Arg K
-q38Arg N
-gx = div add N 3 4
-if not q38PktEmitGy 15 gx 1 128
-ret false
-end
-ret q38PktRun
-end
-
 fn q38GetU32Io p ulong to uint
 b0 = uint get q38IoBuf p
 b1 = shl uint get q38IoBuf add p 1 8
@@ -941,38 +979,57 @@ end
 ret q38StreamToMap fd add dataOff G38_IN_AB sm add sOff 2300000 983040
 end
 
+fn q38EmitQuantFp8Mat wFp8Va ulong sFp8Va ulong wW4Va ulong sW4Va ulong K uint N uint to bool
+q38Ptr wFp8Va
+q38Ptr sFp8Va
+q38Ptr mapaddr get q38Lut 0
+q38Ptr wW4Va
+q38Ptr sW4Va
+q38Arg K
+q38Arg N
+gx = div add N 3 4
+ret q38PktEmitGy 15 gx 1 128
+end
+
 fn q38QuantLayerW4 L ulong isFa bool to bool
 tVa = get q38TmpSlabVa 0
 sVa = q38LayerSVa L
 wVa = q38LayerWVa L
+q38PktStart
 if not isFa
-if not q38QuantFp8Mat add tVa G38_QKVZ_W add sVa mul G38_QKVZ_S 2 add wVa W4G_QKVZ_W add wVa W4G_QKVZ_S 5120 16384
+if not q38EmitQuantFp8Mat add tVa G38_QKVZ_W add sVa mul G38_QKVZ_S 2 add wVa W4G_QKVZ_W add wVa W4G_QKVZ_S 5120 16384
 ret false
 end
-if not q38QuantFp8Mat add tVa G38_OUT_W add sVa mul G38_OUT_S 2 add wVa W4G_OUT_W add wVa W4G_OUT_S 6144 5120
+if not q38EmitQuantFp8Mat add tVa G38_OUT_W add sVa mul G38_OUT_S 2 add wVa W4G_OUT_W add wVa W4G_OUT_S 6144 5120
 ret false
 end
-if not q38QuantFp8Mat add tVa G38_GU_W add sVa mul G38_GU_S 2 add wVa W4G_GU_W add wVa W4G_GU_S 5120 34816
+if not q38EmitQuantFp8Mat add tVa G38_GU_W add sVa mul G38_GU_S 2 add wVa W4G_GU_W add wVa W4G_GU_S 5120 34816
 ret false
 end
-ret q38QuantFp8Mat add tVa G38_DN_W add sVa mul G38_DN_S 2 add wVa W4G_DN_W add wVa W4G_DN_S 17408 5120
-end
-if not q38QuantFp8Mat add tVa F38_Q_W add sVa mul F38_Q_S 2 add wVa W4F_QKV_W add wVa W4F_QKV_S 5120 12288
+if not q38EmitQuantFp8Mat add tVa G38_DN_W add sVa mul G38_DN_S 2 add wVa W4G_DN_W add wVa W4G_DN_S 17408 5120
 ret false
 end
-if not q38QuantFp8Mat add tVa F38_K_W add sVa mul F38_K_S 2 add wVa W4F_K_W add wVa W4F_K_S 5120 1024
+ret q38PktRun
+end
+if not q38EmitQuantFp8Mat add tVa F38_Q_W add sVa mul F38_Q_S 2 add wVa W4F_QKV_W add wVa W4F_QKV_S 5120 12288
 ret false
 end
-if not q38QuantFp8Mat add tVa F38_V_W add sVa mul F38_V_S 2 add wVa W4F_V_W add wVa W4F_V_S 5120 1024
+if not q38EmitQuantFp8Mat add tVa F38_K_W add sVa mul F38_K_S 2 add wVa W4F_K_W add wVa W4F_K_S 5120 1024
 ret false
 end
-if not q38QuantFp8Mat add tVa F38_O_W add sVa mul F38_O_S 2 add wVa W4F_O_W add wVa W4F_O_S 6144 5120
+if not q38EmitQuantFp8Mat add tVa F38_V_W add sVa mul F38_V_S 2 add wVa W4F_V_W add wVa W4F_V_S 5120 1024
 ret false
 end
-if not q38QuantFp8Mat add tVa F38_GU_W add sVa mul F38_GU_S 2 add wVa W4F_GU_W add wVa W4F_GU_S 5120 34816
+if not q38EmitQuantFp8Mat add tVa F38_O_W add sVa mul F38_O_S 2 add wVa W4F_O_W add wVa W4F_O_S 6144 5120
 ret false
 end
-ret q38QuantFp8Mat add tVa F38_DN_W add sVa mul F38_DN_S 2 add wVa W4F_DN_W add wVa W4F_DN_S 17408 5120
+if not q38EmitQuantFp8Mat add tVa F38_GU_W add sVa mul F38_GU_S 2 add wVa W4F_GU_W add wVa W4F_GU_S 5120 34816
+ret false
+end
+if not q38EmitQuantFp8Mat add tVa F38_DN_W add sVa mul F38_DN_S 2 add wVa W4F_DN_W add wVa W4F_DN_S 17408 5120
+ret false
+end
+ret q38PktRun
 end
 
 fn q38LoadLayer L ulong to bool
@@ -1325,8 +1382,20 @@ ret q38PktEmitGy 19 1 1 128
 end
 
 note =========================================================================
-note HMMA Tensor-Core Chunked Prefill & Continuous Batch-4/8 / Spec-4/8 Emitters!
+note Super-HMMA Tensor-Core Chunked Prefill & Single-Read M8 Batch/Spec Emitters!
 note =========================================================================
+fn q38EmitCopyU32 srcVa ulong dstVa ulong bytes ulong to bool
+nVec4 = div bytes 16
+q38Ptr srcVa
+q38Ptr dstVa
+q38Arg uint nVec4
+gx = div add nVec4 255 256
+if gt gx 256
+gx = ulong 256
+end
+ret q38PktEmitGy 35 uint gx 1 256
+end
+
 fn q38PreEmitGemm xBfVa ulong wVa ulong sVa ulong yVa ulong K uint N uint to bool
 B = get q38CurB 0
 q38Ptr xBfVa
@@ -1335,23 +1404,18 @@ q38Ptr sVa
 q38Ptr yVa
 q38Arg K
 q38Arg N
-if eq get q38CurM4 0 1
-q38Arg div K 2
-q38Arg 0
-q38Arg N
-q38Arg 0
-gx = div add N 7 8
-gy = div B 4
-ret q38PktEmitGy 1 gx gy 256
-end
 q38Arg B
 q38Arg div K 2
 q38Arg 0
 q38Arg N
 q38Arg 0
+if le B 8
 gx = div add N 63 64
-gy = div add B 31 32
-ret q38PktEmitGy 21 gx gy 128
+ret q38PktEmitGy 36 gx 1 128
+end
+gx = div add N 63 64
+gy = div add B 127 128
+ret q38PktEmitGy 37 gy gx 128
 end
 
 fn q38PreEmitGdn L ulong gdnIdx ulong B uint to bool
@@ -1380,6 +1444,15 @@ q38Arg B
 q38Arg 96
 if not q38PktEmitGy 22 2 div add B 31 32 128
 ret false
+end
+if eq get q38SpecMode 0 1
+sva = get q38SpecSnapVa 0
+if not q38EmitCopyU32 q38P QP_QKV add sva add QSP_QKV mul gdnIdx 524288 mul ulong B 65536
+ret false
+end
+if not q38EmitCopyU32 q38P QP_AB add sva add QSP_AB mul gdnIdx 3072 mul ulong B 384
+ret false
+end
 end
 q38Ptr q38P QP_QKV
 q38Ptr add sVa mul G38_CONV 2
@@ -1549,14 +1622,22 @@ ret true
 end
 
 fn q38PreEmitFinalHead B uint to bool
-note Run W4 lm_head for all B tokens when B<=8 via HMMA, or copy last token -> QI_X/QI_AOUT + exact head when B>8!
+note Exact F32 RMSNorm + Single-Read HMMA W4 lm_head + Exact BF16 top-128 rescore for B<=8!
 if le B 8
-q38Ptr q38P QP_X
-q38Ptr q38P QP_AOUT
+for t ulong ulong B bound 8
+q38Ptr add q38P QP_X mul t 20480
+q38Ptr add q38P QP_AOUT mul t 20480
 q38Ptr q38W QI_FNORM
-q38Ptr q38P QP_XN_BF16
+q38Ptr add q38P QP_YRAW mul t 20480
 q38Arg 1
-if not q38PktEmitGy 20 B 1 256
+if not q38PktEmitGy 5 1 1 256
+ret false
+end
+end
+q38Ptr q38P QP_YRAW
+q38Ptr q38P QP_XN_BF16
+q38Arg 5120
+if not q38PktEmitGy 32 10 B 256
 ret false
 end
 q38Ptr q38P QP_XN_BF16
@@ -1570,13 +1651,21 @@ q38Arg 2560
 q38Arg 0
 q38Arg uint Q38_VOCAB
 q38Arg 0
-if not q38PktEmitGy 34 3880 1 128
+if not q38PktEmitGy 36 3880 1 128
 ret false
 end
 for t ulong ulong B bound 8
 q38Ptr add q38P QP_LOGW4 mul t mul Q38_VOCAB 4
 q38Ptr add q38P QP_CIDS mul t 512
 if not q38PktEmitGy 17 64 1 256
+ret false
+end
+q38Ptr mapaddr get q38LmBf16 0
+q38Ptr add q38P QP_YRAW mul t 20480
+q38Ptr add q38P QP_CIDS mul t 512
+q38Ptr add q38P QP_CLOG mul t 512
+q38Arg 128
+if not q38PktEmitGy 18 128 1 32
 ret false
 end
 end
@@ -1596,6 +1685,483 @@ if not q38PktEmitGy 35 5 1 256
 ret false
 end
 ret q38EmitFinalHead
+end
+
+note =========================================================================
+note Native Qwen 3.8 27B MTP Speculative Drafter (mtp.safetensors -> W4) + GDN Rollback
+note =========================================================================
+fn q38WidenToMap fd int foff ulong dstMap long dstOff ulong bf16Bytes ulong to bool
+pos = ulong 0
+while lt pos bf16Bytes bound 32
+want = sub bf16Bytes pos
+if gt want 262144
+want = ulong 262144
+end
+got = pread fd q38IoBuf 0 want long add foff pos
+if ne got long want
+ret false
+end
+q38WidenBuf div want 2
+outBytes = mul want 2
+if ne mapwrite dstMap add dstOff mul pos 2 q38ScaleOut 0 outBytes long outBytes
+ret false
+end
+pos = add pos want
+end
+ret true
+end
+
+fn q38QuantMtpFa wVa ulong sVa ulong to bool
+tVa = get q38TmpSlabVa 0
+q38PktStart
+if not q38EmitQuantFp8Mat add tVa F38_Q_W add sVa mul F38_Q_S 2 add wVa W4F_QKV_W add wVa W4F_QKV_S 5120 12288
+ret false
+end
+if not q38EmitQuantFp8Mat add tVa F38_K_W add sVa mul F38_K_S 2 add wVa W4F_K_W add wVa W4F_K_S 5120 1024
+ret false
+end
+if not q38EmitQuantFp8Mat add tVa F38_V_W add sVa mul F38_V_S 2 add wVa W4F_V_W add wVa W4F_V_S 5120 1024
+ret false
+end
+if not q38EmitQuantFp8Mat add tVa F38_O_W add sVa mul F38_O_S 2 add wVa W4F_O_W add wVa W4F_O_S 6144 5120
+ret false
+end
+if not q38EmitQuantFp8Mat add tVa F38_GU_W add sVa mul F38_GU_S 2 add wVa W4F_GU_W add wVa W4F_GU_S 5120 34816
+ret false
+end
+if not q38EmitQuantFp8Mat add tVa F38_DN_W add sVa mul F38_DN_S 2 add wVa W4F_DN_W add wVa W4F_DN_S 17408 5120
+ret false
+end
+ret q38PktRun
+end
+
+fn q38LoadMtpW4 to bool
+t0 = ulong monons
+n = q38BuildPath q38SufMtp neg 1
+fd = int fopen q38PathBuf 0 n 0 0
+if lt fd 0
+ret false
+end
+rc = long 0
+dataOff = q38ReadHdrOff fd
+if eq dataOff 0
+rc = fclose fd
+ret false
+end
+if not q38StreamToMap fd dataOff get q38TmpSlab 0 0 MTP_FC_BYTES
+rc = fclose fd
+ret false
+end
+wVa = get q38MtpW4Va 0
+sVa = add wVa MTP_SCALE_OFF
+q38PktStart
+q38Ptr get q38TmpSlabVa 0
+q38Ptr add wVa MTP_FC_W
+q38Ptr add wVa MTP_FC_S
+q38Arg 10240
+q38Arg 5120
+if not q38PktEmitGy 38 640 1 256
+rc = fclose fd
+ret false
+end
+if not q38PktRun
+rc = fclose fd
+ret false
+end
+if not q38WidenToMap fd add dataOff MTP_FC_BYTES get q38MtpW4Map 0 MTP_SCALE_OFF MTP_BF16_BYTES
+rc = fclose fd
+ret false
+end
+if not q38StreamToMap fd add dataOff add MTP_FC_BYTES MTP_BF16_BYTES get q38TmpSlab 0 F38_DN_W MTP_FP8_BYTES
+rc = fclose fd
+ret false
+end
+rc = fclose fd
+if not q38QuantMtpFa wVa sVa
+ret false
+end
+put q38MtpReady 0 1
+q38Print q38MsgMtpLoad
+q38PrintU div sub ulong monons t0 1000000
+q38Print q38MsgNl
+ret true
+end
+
+fn q38EmitMtpLayerW4 to bool
+wVa = get q38MtpW4Va 0
+sVa = add wVa MTP_SCALE_OFF
+kBase = get q38MtpKvVa 0
+vBase = add kBase 536870912
+note 1. pre_fc_norm_embedding(QI_AOUT) -> QI_QKV[0..5119], pre_fc_norm_hidden(QI_X) -> QI_QKV[5120..10239]
+q38Ptr q38W QI_AOUT
+q38Ptr q38W QI_AOUT
+q38Ptr add sVa MTP_PRE_EMB_OFF
+q38Ptr q38W QI_QKV
+q38Arg 0
+if not q38PktEmitGy 5 1 1 256
+ret false
+end
+q38Ptr q38W QI_X
+q38Ptr q38W QI_X
+q38Ptr add sVa MTP_PRE_HID_OFF
+q38Ptr add q38W QI_QKV 20480
+q38Arg 0
+if not q38PktEmitGy 5 1 1 256
+ret false
+end
+note 2. QI_X = mtp.fc @ QI_QKV[0..10239] ([5120, 10240] W4) + input_layernorm -> QI_XN
+if not q38EmitW4Gemv q38W QI_QKV add wVa MTP_FC_W add wVa MTP_FC_S q38W QI_X 10240 5120
+ret false
+end
+if not q38EmitRmsNormAdd sVa 0
+ret false
+end
+note 3. Full-Attention layer mtp.layers.0 with dedicated 1 GiB KV slab
+if not q38EmitW4Gemv q38W QI_XN add wVa W4F_QKV_W add wVa W4F_QKV_S q38W QI_QKV 5120 14336
+ret false
+end
+q38Ptr q38W QI_K
+q38Ptr q38W QI_V
+q38Ptr add sVa mul F38_KNORM 2
+q38Ptr get q38RopeVa 0
+q38Ptr kBase
+q38Ptr vBase
+q38Ptr q38W QI_POS
+if not q38PktEmitGy 11 4 1 256
+ret false
+end
+q38Ptr q38W QI_QKV
+q38Ptr add sVa mul F38_QNORM 2
+q38Ptr get q38RopeVa 0
+q38Ptr q38W QI_QROT
+q38Ptr q38W QI_POS
+if not q38PktEmitGy 12 24 1 256
+ret false
+end
+q38Ptr q38W QI_QROT
+q38Ptr kBase
+q38Ptr vBase
+q38Ptr q38W QI_OPART
+q38Ptr q38W QI_MLPART
+q38Ptr q38W QI_POS
+if not q38PktEmitGy 13 24 8 32
+ret false
+end
+q38Ptr q38W QI_OPART
+q38Ptr q38W QI_MLPART
+q38Ptr q38W QI_QKV
+q38Ptr q38W QI_Y
+q38Arg 8
+if not q38PktEmitGy 14 24 1 256
+ret false
+end
+if not q38EmitW4Gemv q38W QI_Y add wVa W4F_O_W add wVa W4F_O_S q38W QI_AOUT 6144 5120
+ret false
+end
+if not q38EmitRmsNormAdd add sVa mul F38_POST_NORM 2 1
+ret false
+end
+if not q38EmitW4Gemv q38W QI_XN add wVa W4F_GU_W add wVa W4F_GU_S q38W QI_GU 5120 34816
+ret false
+end
+q38Ptr q38W QI_GU
+q38Ptr q38W QI_SW
+if not q38PktEmitGy 6 68 1 256
+ret false
+end
+if not q38EmitW4Gemv q38W QI_SW add wVa W4F_DN_W add wVa W4F_DN_S q38W QI_AOUT 17408 5120
+ret false
+end
+note 4. Add MLP residual into QI_X (for chained draft) + mtp.norm -> QI_XN!
+ret q38EmitRmsNormAdd add sVa MTP_NORM_OFF 1
+end
+
+fn q38EmitMtpShortHead to bool
+note Fast 100,880-row shortlist draft lm_head (290 MB vs 720 MB; main 64L verify scores full 248,320 -> PARITY=EXACT!)
+if not q38EmitW4Gemv q38W QI_XN add get q38LmW4Va 0 W4LM_W add get q38LmW4Va 0 W4LM_S q38W QI_LOGW4 5120 100880
+ret false
+end
+q38Ptr q38W QI_LOGW4
+q38Ptr q38W QI_CIDS
+if not q38PktEmitGy 17 26 1 256
+ret false
+end
+q38Ptr mapaddr get q38LmBf16 0
+q38Ptr q38W QI_XN
+q38Ptr q38W QI_CIDS
+q38Ptr q38W QI_CLOG
+q38Arg 52
+ret q38PktEmitGy 18 52 1 32
+end
+
+fn q38SpecEmitVerifyPkt M ulong to bool
+sva = get q38SpecSnapVa 0
+q38PktStartAt add q38O QI_PKT 41943040
+if not q38EmitCopyU32 get q38GdnStateVa 0 add sva QSP_GDN_STATE 150994944
+ret false
+end
+if not q38EmitCopyU32 get q38GdnTailVa 0 add sva QSP_GDN_TAIL 5898240
+ret false
+end
+q38Ptr q38P QP_TOKS
+q38Ptr mapaddr get q38EmbBf16 0
+q38Ptr q38P QP_X
+if not q38PktEmitGy 33 uint M 1 256
+ret false
+end
+put q38SpecMode 0 1
+ok = q38PreEmitAll64W4 uint M true true
+put q38SpecMode 0 0
+if not ok
+ret false
+end
+if not q38PreEmitFinalHead uint M
+ret false
+end
+ret q38PktFinish 9
+end
+
+fn q38MtpRecordPackets M ulong to bool
+q38PktStartAt add q38O QI_PKT 37748736
+if not q38EmitMtpLayerW4
+ret false
+end
+if not q38EmitMtpShortHead
+ret false
+end
+if not q38PktFinish 7
+ret false
+end
+q38PktStartAt add q38O QI_PKT 39845888
+if not q38EmitMtpLayerW4
+ret false
+end
+if not q38PktFinish 8
+ret false
+end
+ret q38SpecEmitVerifyPkt M
+end
+
+fn q38LoadEmbedToAout tid ulong to bool
+off = mul tid 10240
+if ne mapread get q38EmbBf16 0 off q38IoBuf 0 10240 10240
+ret false
+end
+q38WidenBuf Q38_H
+ret eq mapwrite get q38Work 0 q38O QI_AOUT q38ScaleOut 0 20480 20480
+end
+
+fn q38MtpReadTopTok to ulong
+if ne mapread get q38Work 0 q38O QI_CIDS q38IoBuf 0 208 208
+ret 999999
+end
+for i ulong 52
+put q38CandIds i q38GetU32Io mul i 4
+end
+if ne mapread get q38Work 0 q38O QI_CLOG q38IoBuf 0 208 208
+ret 999999
+end
+bestIdx = ulong 0
+bestVal = f32 -1000000000.0f32
+for i ulong 52
+v = bitcast f32 q38GetU32Io mul i 4
+if gt v bestVal
+bestVal = v
+bestIdx = i
+end
+end
+ret ulong get q38CandIds bestIdx
+end
+
+fn q38MtpDraftChain curTok ulong pos0 ulong M ulong to bool
+put q38SpecDraft 0 curTok
+for s ulong sub M 1 bound 16
+if not q38LoadEmbedToAout get q38SpecDraft s
+ret false
+end
+if not q38SetPos add pos0 s
+ret false
+end
+if not q38ReplayPre 7
+ret false
+end
+d = q38MtpReadTopTok
+if eq d 999999
+ret false
+end
+put q38SpecDraft add s 1 d
+end
+ret true
+end
+
+fn q38GetU32Scale p ulong to uint
+b0 = uint get q38ScaleOut p
+b1 = shl uint get q38ScaleOut add p 1 8
+b2 = shl uint get q38ScaleOut add p 2 16
+b3 = shl uint get q38ScaleOut add p 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn q38SpecReadPreds M ulong to bool
+nb = mul M 512
+if ne mapread get q38PreWork 0 QP_CIDS q38IoBuf 0 nb long nb
+ret false
+end
+for t ulong M bound 8
+base = mul t 512
+for j ulong 128
+put q38CandIds j q38GetU32Io add base mul j 4
+end
+if ne mapread get q38PreWork 0 add QP_CLOG base q38ScaleOut 0 512 512
+ret false
+end
+bestId = ulong get q38CandIds 0
+bestLog = f32 -1000000000.0f32
+for j ulong 128
+v = bitcast f32 q38GetU32Scale mul j 4
+if gt v bestLog
+bestLog = v
+bestId = ulong get q38CandIds j
+end
+end
+put q38SpecPred t bestId
+end
+ret true
+end
+
+fn q38SpecRollbackGdn acc ulong to bool
+sva = get q38SpecSnapVa 0
+q38PktStart
+if not q38EmitCopyU32 add sva QSP_GDN_STATE get q38GdnStateVa 0 150994944
+ret false
+end
+if not q38EmitCopyU32 add sva QSP_GDN_TAIL get q38GdnTailVa 0 5898240
+ret false
+end
+gdnIdx = ulong 0
+for L ulong Q38_LAYERS
+if ne rem L 4 3
+sVa = q38LayerSVa L
+if not q38EmitCopyU32 add sva add QSP_QKV mul gdnIdx 524288 q38P QP_QKV mul acc 65536
+ret false
+end
+if not q38EmitCopyU32 add sva add QSP_AB mul gdnIdx 3072 q38P QP_AB mul acc 384
+ret false
+end
+q38Ptr q38P QP_QKV
+q38Ptr add sVa mul G38_CONV 2
+q38Ptr add get q38GdnTailVa 0 mul gdnIdx 122880
+q38Arg uint acc
+if not q38PktEmitGy 23 80 1 128
+ret false
+end
+q38Ptr q38P QP_AB
+q38Ptr add q38W QI_ALOG mul gdnIdx 384
+q38Ptr q38P QP_DB
+if not q38PktEmitGy 24 uint acc 1 64
+ret false
+end
+q38Ptr q38P QP_QKV
+q38Ptr q38P QP_DB
+q38Ptr add get q38GdnStateVa 0 mul gdnIdx 3145728
+q38Ptr q38P QP_YRAW
+q38Arg uint acc
+if not q38PktEmitGy 25 48 4 256
+ret false
+end
+gdnIdx = add gdnIdx 1
+end
+end
+ret q38PktRun
+end
+
+fn q38SpecVerifyStep M ulong pos0 ulong to ulong
+for t ulong M bound 8
+q38PutU32Io mul t 4 uint get q38SpecDraft t
+end
+if ne mapwrite get q38PreWork 0 QP_TOKS q38IoBuf 0 mul M 4 long mul M 4
+ret 0
+end
+if not q38SetPos pos0
+ret 0
+end
+if not q38ReplayPre 9
+ret 0
+end
+if not q38SpecReadPreds M
+ret 0
+end
+acc = ulong 1
+for k ulong sub M 1 bound 8
+if eq get q38SpecPred k get q38SpecDraft add k 1
+acc = add k 2
+else
+break
+end
+end
+if lt acc M
+if not q38SpecRollbackGdn acc
+ret 0
+end
+end
+ret acc
+end
+
+fn q38MtpCopyMainHid acc ulong to bool
+off = add QP_X mul sub acc 1 20480
+if ne mapread get q38PreWork 0 off q38IoBuf 0 20480 20480
+ret false
+end
+ret eq mapwrite get q38Work 0 q38O QI_X q38IoBuf 0 20480 20480
+end
+
+fn q38MtpWarmFromPre ntok ulong to bool
+if or le ntok 1 gt ntok 128
+ret true
+end
+note Save h_main(ntok-1) currently in QI_X -> QP_YRAW, warm MTP KV for p=0..ntok-2, then restore QI_X!
+if ne mapread get q38Work 0 q38O QI_X q38IoBuf 0 20480 20480
+ret false
+end
+if ne mapwrite get q38PreWork 0 QP_YRAW q38IoBuf 0 20480 20480
+ret false
+end
+doAdd = uint 1
+if le ntok 8
+doAdd = uint 0
+end
+for p ulong sub ntok 1 bound 128
+if not q38LoadEmbedToAout ulong get q38TokSeq add p 1
+ret false
+end
+if not q38SetPos p
+ret false
+end
+q38PktStart
+if not q38EmitCopyU32 add q38P QP_X mul p 20480 q38W QI_X 20480
+ret false
+end
+if eq doAdd 1
+q38Ptr q38W QI_X
+q38Ptr add q38P QP_AOUT mul p 20480
+q38Ptr q38W QI_FNORM
+q38Ptr q38W QI_XN
+q38Arg 1
+if not q38PktEmitGy 5 1 1 256
+ret false
+end
+end
+if not q38PktRun
+ret false
+end
+if not q38ReplayPre 8
+ret false
+end
+end
+if ne mapread get q38PreWork 0 QP_YRAW q38IoBuf 0 20480 20480
+ret false
+end
+ret eq mapwrite get q38Work 0 q38O QI_X q38IoBuf 0 20480 20480
 end
 
 fn q38RecordAllPackets to bool
@@ -1893,6 +2459,23 @@ if le get q38TmpSlab 0 0
 ret 12
 end
 put q38TmpSlabVa 0 mapaddr get q38TmpSlab 0
+if eq get q38UseMtp 0 1
+put q38MtpW4Map 0 nvalloc Q38_MTP_W4_BYTES true
+if le get q38MtpW4Map 0 0
+ret 12
+end
+put q38MtpW4Va 0 mapaddr get q38MtpW4Map 0
+put q38MtpKvMap 0 nvalloc 1073741824 true
+if le get q38MtpKvMap 0 0
+ret 12
+end
+put q38MtpKvVa 0 mapaddr get q38MtpKvMap 0
+put q38SpecSnapMap 0 nvalloc Q38_SNAP_BYTES true
+if le get q38SpecSnapMap 0 0
+ret 12
+end
+put q38SpecSnapVa 0 mapaddr get q38SpecSnapMap 0
+end
 else
 for s ulong 8
 sm = nvalloc Q38_FP8_SLAB true
@@ -1922,6 +2505,18 @@ end
 end
 if not q38RecordAllPackets
 ret 16
+end
+if eq get q38UseMtp 0 1
+mVal = get q38MtpM 0
+if eq mVal 0
+mVal = ulong 5
+put q38MtpM 0 5
+end
+if q38LoadMtpW4
+if not q38MtpRecordPackets mVal
+ret 17
+end
+end
 end
 t1 = ulong monons
 q38Print q38MsgLoaded
