@@ -1,0 +1,506 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note Pure seeded OM-2 port of tools/own30b_decode_profile.c (OWN-30B decode stage profiler).
+note Implements the exact stage classifier, 48x6+head (289-launch) sequence state machine,
+note growable token pools (no 4096-token cap), stderr DECODE_* reporter, --stream binary
+note reader, and --test host verification battery.
+
+const OMEGA_FP8_ARGS_WORDS ulong 10
+const OMEGA_DATTN_ARGS_WORDS ulong 25
+const OMEGA_ROUTER_ARGS_WORDS ulong 23
+const OMEGA_BF16_ARGS_WORDS ulong 8
+
+const ST_QKV ulong 0
+const ST_ATTN ulong 1
+const ST_O ulong 2
+const ST_ROUTER ulong 3
+const ST_GU ulong 4
+const ST_DOWN ulong 5
+const ST_HEAD ulong 6
+const ST_OTHER ulong 7
+const ST_COUNT ulong 7
+
+const TOK_FIELDS ulong 37
+note Per token in g_toks (TOK_FIELDS = 37 ulongs):
+note 0..6: qkv..head calls; 7..13: bytes; 14..20: session_ns; 21..27: submit_wait_ns; 28..34: gap_before_ns
+note 35: wall_ns (end_ns - start_ns); 36: launches (pos)
+
+global g_toks ulong *
+global g_used ulong 1
+global g_dropped ulong 1
+
+global g_pend ulong 37
+global g_pend_start ulong 1
+global g_armed ulong 1
+global g_invalid ulong 1
+global g_last_end ulong 1
+
+global g_cls_res ulong 2
+global g_obuf uchar 16384
+global g_olen ulong 1
+global g_inbuf uchar 65536
+global g_argbuf uchar 256
+
+text t_sn0 "qkv"
+text t_sn1 "attention"
+text t_sn2 "o"
+text t_sn3 "router"
+text t_sn4 "gate_up"
+text t_sn5 "down"
+text t_sn6 "lm_head"
+
+text t_flag_test "--test"
+text t_flag_stream "--stream"
+text t_hdr_1 "DECODE_PROFILE semantics=host_session_and_submit_wait weight_bytes_exclude_scales pure_gpu_time=UNKNOWN tokens="
+text t_hdr_2 " dropped="
+text t_tok_1 "DECODE_TOKEN token="
+text t_tok_2 " wall_ns="
+text t_tok_3 " launches="
+text t_stg_1 "DECODE_STAGE token="
+text t_stg_2 " stage="
+text t_stg_3 " calls="
+text t_stg_4 " bytes="
+text t_stg_5 " session_ns="
+text t_stg_6 " submit_wait_ns="
+text t_stg_7 " gap_before_ns="
+text t_pass_1 "PROFILE_HOST_PASS sequence, accounting, malformed shape, missing stage, failed launch; "
+text t_fail_msg "PROFILE_HOST_FAIL\n"
+text t_bad_arg "usage: own30b_decode_profile [--test | --stream]\n"
+
+fn ob_flush fd int to void
+  n = get g_olen 0
+  if gt n 0
+    w = write fd g_obuf 0 n
+    ign_l = w
+    put g_olen 0 0
+  end
+end
+
+fn ob_b fd int c uchar to void
+  n = get g_olen 0
+  if ge n 16000
+    ob_flush fd
+    n = get g_olen 0
+  end
+  put g_obuf n c
+  put g_olen 0 add n 1
+end
+
+fn ob_txt fd int s view uchar * to void
+  n = len s
+  for i ulong n bound 1024
+    ob_b fd get s i
+  end
+end
+
+fn ob_u64 fd int v ulong to void
+  if eq v 0
+    ob_b fd uchar 48
+    ret
+  end
+  dig = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put dig nd uchar add 48 rem x 10
+    x = div x 10
+    nd = add nd 1
+  end
+  while gt nd 0 bound 24
+    nd = sub nd 1
+    ob_b fd get dig nd
+  end
+end
+
+fn ob_stage_name fd int s ulong to void
+  if eq s ST_QKV
+    ob_txt fd t_sn0
+    ret
+  end
+  if eq s ST_ATTN
+    ob_txt fd t_sn1
+    ret
+  end
+  if eq s ST_O
+    ob_txt fd t_sn2
+    ret
+  end
+  if eq s ST_ROUTER
+    ob_txt fd t_sn3
+    ret
+  end
+  if eq s ST_GU
+    ob_txt fd t_sn4
+    ret
+  end
+  if eq s ST_DOWN
+    ob_txt fd t_sn5
+    ret
+  end
+  ob_txt fd t_sn6
+end
+
+fn classify n_args ulong grid_y ulong num_elements ulong arg8 ulong arg18 ulong to void
+  put g_cls_res 0 ST_OTHER
+  put g_cls_res 1 0
+  if eq n_args OMEGA_FP8_ARGS_WORDS
+    n = div arg8 4
+    g = grid_y
+    s = ST_OTHER
+    k = ulong 0
+    if and eq g 1 eq n 5120
+      s = ST_QKV
+      k = ulong 2048
+    else
+      if and eq g 1 eq n 2048
+        s = ST_O
+        k = ulong 4096
+      else
+        if and eq g 8 eq n 1536
+          s = ST_GU
+          k = ulong 2048
+        else
+          if and eq g 8 eq n 2048
+            s = ST_DOWN
+            k = ulong 768
+          else
+            ret
+          end
+        end
+      end
+    end
+    put g_cls_res 0 s
+    put g_cls_res 1 mul mul g n k
+    ret
+  end
+  if and eq n_args OMEGA_DATTN_ARGS_WORDS eq num_elements 4096
+    put g_cls_res 0 ST_ATTN
+    put g_cls_res 1 mul ulong 2048 add arg18 1
+    ret
+  end
+  if and eq n_args OMEGA_ROUTER_ARGS_WORDS eq num_elements 2048
+    put g_cls_res 0 ST_ROUTER
+    put g_cls_res 1 mul ulong 128 mul ulong 2048 2
+    ret
+  end
+  if and eq n_args OMEGA_BF16_ARGS_WORDS eq num_elements 151936
+    put g_cls_res 0 ST_HEAD
+    put g_cls_res 1 mul ulong 151936 mul ulong 2048 2
+    ret
+  end
+end
+
+fn pend_clear to void
+  for i ulong TOK_FIELDS
+    put g_pend i 0
+  end
+end
+
+fn store_pending end_ns ulong to void
+  used = get g_used 0
+  need = mul add used 1 TOK_FIELDS
+  if gt need len g_toks
+    cap = len g_toks
+    if eq cap 0
+      cap = mul ulong 64 TOK_FIELDS
+    else
+      cap = mul cap 2
+    end
+    if lt cap need
+      cap = need
+    end
+    rc = enlarge g_toks cap
+    if lt rc 0
+      put g_dropped 0 add get g_dropped 0 1
+      ret
+    end
+  end
+  base = mul used TOK_FIELDS
+  for i ulong 35
+    put g_toks add base i get g_pend i
+  end
+  put g_toks add base 35 sub end_ns get g_pend_start 0
+  put g_toks add base 36 get g_pend 36
+  put g_used 0 add used 1
+end
+
+fn record s ulong bytes ulong begin_ns ulong end_ns ulong elapsed_ns ulong rc long to void
+  if ne get g_armed 0 0
+    pos = get g_pend 36
+    expected = ST_HEAD
+    if lt pos 288
+      expected = rem pos 6
+    end
+    if or ne rc 0 or ne s expected gt pos 288
+      put g_invalid 0 1
+    end
+    if eq get g_invalid 0 0
+      put g_pend s add get g_pend s 1
+      i1 = add 7 s
+      put g_pend i1 add get g_pend i1 bytes
+      i2 = add 14 s
+      put g_pend i2 add get g_pend i2 sub end_ns begin_ns
+      i3 = add 21 s
+      put g_pend i3 add get g_pend i3 elapsed_ns
+      i4 = add 28 s
+      put g_pend i4 add get g_pend i4 sub begin_ns get g_last_end 0
+      put g_pend 36 add pos 1
+    end
+  end
+  if eq s ST_HEAD
+    if and ne get g_armed 0 0 and eq get g_invalid 0 0 eq get g_pend 36 289
+      store_pending end_ns
+    end
+    pend_clear
+    put g_pend_start 0 end_ns
+    if eq rc 0
+      put g_armed 0 1
+    else
+      put g_armed 0 0
+    end
+    put g_invalid 0 0
+  end
+  put g_last_end 0 end_ns
+end
+
+fn dump_stage fd int t ulong s ulong to void
+  base = mul t TOK_FIELDS
+  ob_txt fd t_stg_1
+  ob_u64 fd t
+  ob_txt fd t_stg_2
+  ob_stage_name fd s
+  ob_txt fd t_stg_3
+  ob_u64 fd get g_toks add base s
+  ob_txt fd t_stg_4
+  ob_u64 fd get g_toks add base add 7 s
+  ob_txt fd t_stg_5
+  ob_u64 fd get g_toks add base add 14 s
+  ob_txt fd t_stg_6
+  ob_u64 fd get g_toks add base add 21 s
+  ob_txt fd t_stg_7
+  ob_u64 fd get g_toks add base add 28 s
+  ob_b fd uchar 10
+end
+
+fn dump fd int to void
+  used = get g_used 0
+  ob_txt fd t_hdr_1
+  ob_u64 fd used
+  ob_txt fd t_hdr_2
+  ob_u64 fd get g_dropped 0
+  ob_b fd uchar 10
+  for t ulong used bound 1000000
+    base = mul t TOK_FIELDS
+    ob_txt fd t_tok_1
+    ob_u64 fd t
+    ob_txt fd t_tok_2
+    ob_u64 fd get g_toks add base 35
+    ob_txt fd t_tok_3
+    ob_u64 fd get g_toks add base 36
+    ob_b fd uchar 10
+    for s ulong ST_COUNT
+      dump_stage fd t s
+    end
+  end
+  ob_flush fd
+end
+
+fn rd_u32 off ulong to ulong
+  b0 = ulong get g_inbuf off
+  b1 = ulong get g_inbuf add off 1
+  b2 = ulong get g_inbuf add off 2
+  b3 = ulong get g_inbuf add off 3
+  ret or or b0 shl b1 8 or shl b2 16 shl b3 24
+end
+
+fn rd_u64 off ulong to ulong
+  lo = rd_u32 off
+  hi = rd_u32 add off 4
+  ret or lo shl hi 32
+end
+
+fn rd_i32 off ulong to long
+  u = rd_u32 off
+  if ge u 2147483648
+    ret sub long u 4294967296
+  end
+  ret long u
+end
+
+fn process_rec pos ulong to void
+  n_args = rd_u32 pos
+  grid_y = rd_u32 add pos 4
+  num_el = rd_u32 add pos 8
+  arg8 = rd_u32 add pos 12
+  arg18 = rd_u32 add pos 16
+  classify n_args grid_y num_el arg8 arg18
+  rc = rd_i32 add pos 20
+  b_ns = rd_u64 add pos 24
+  e_ns = rd_u64 add pos 32
+  el_ns = rd_u64 add pos 40
+  record get g_cls_res 0 get g_cls_res 1 b_ns e_ns el_ns rc
+end
+
+fn run_stream to int
+  have = ulong 0
+  done = false
+  while not done bound 100000000
+    r = read 0 g_inbuf have sub 65536 have
+    if lt r 0
+      ret 2
+    end
+    if eq r 0
+      done = true
+    else
+      have = add have ulong r
+    end
+    pos = ulong 0
+    while le add pos 48 have bound 2000
+      process_rec pos
+      pos = add pos 48
+    end
+    rem_b = sub have pos
+    for i ulong rem_b bound 48
+      put g_inbuf i get g_inbuf add pos i
+    end
+    have = rem_b
+    if and done ne have 0
+      ret 2
+    end
+  end
+  dump int 2
+  ret 0
+end
+
+fn reset_state to void
+  put g_used 0 0
+  put g_dropped 0 0
+  pend_clear
+  put g_pend_start 0 0
+  put g_armed 0 0
+  put g_invalid 0 0
+  put g_last_end 0 0
+end
+
+fn run_self_test to int
+  reset_state
+  classify OMEGA_FP8_ARGS_WORDS 8 0 mul ulong 2048 4 0
+  if or ne get g_cls_res 0 ST_DOWN ne get g_cls_res 1 mul ulong 8 mul ulong 2048 768
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+  classify OMEGA_FP8_ARGS_WORDS 7 0 mul ulong 2048 4 0
+  if ne get g_cls_res 0 ST_OTHER
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+  classify OMEGA_DATTN_ARGS_WORDS 1 4096 0 15
+  if or ne get g_cls_res 0 ST_ATTN ne get g_cls_res 1 mul ulong 2048 16
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+  classify OMEGA_ROUTER_ARGS_WORDS 1 2048 0 0
+  if or ne get g_cls_res 0 ST_ROUTER ne get g_cls_res 1 mul ulong 128 4096
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+  classify OMEGA_BF16_ARGS_WORDS 1 151936 0 0
+  if or ne get g_cls_res 0 ST_HEAD ne get g_cls_res 1 mul ulong 151936 4096
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+
+  record ST_HEAD 0 0 1 1 0
+  for i ulong 289
+    st = ST_HEAD
+    if lt i 288
+      st = rem i 6
+    end
+    record st 10 add 2 mul i 3 add 4 mul i 3 1 0
+  end
+  if or ne get g_used 0 1 ne get g_toks 36 289
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+  sum = ulong 0
+  for s ulong ST_COUNT
+    sum = add sum add get g_toks add 14 s get g_toks add 28 s
+  end
+  if ne sum get g_toks 35
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+
+  note Swapped/missing/failed stages must never become a decode timing
+  record ST_O 0 1000 1001 1 0
+  record ST_HEAD 0 1002 1003 1 0
+  if ne get g_used 0 1
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+  record ST_QKV 0 1004 1005 1 -1
+  record ST_HEAD 0 1006 1007 1 0
+  if ne get g_used 0 1
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+
+  note Verify growable pool works well past the old 4096-token cap (4100 tokens)
+  reset_state
+  record ST_HEAD 0 0 1 1 0
+  tbase = ulong 10
+  for tok ulong 4100
+    for i ulong 289
+      st = ST_HEAD
+      if lt i 288
+        st = rem i 6
+      end
+      record st 10 tbase add tbase 2 1 0
+      tbase = add tbase 3
+    end
+  end
+  if or ne get g_used 0 4100 ne get g_dropped 0 0
+    ign_l = write 2 t_fail_msg 0 len t_fail_msg
+    ret 1
+  end
+
+  ob_txt int 1 t_pass_1
+  ob_stage_name int 1 ST_HEAD
+  ob_b int 1 uchar 10
+  ob_flush int 1
+  ret 0
+end
+
+fn eq_arg idx ulong target view uchar * to bool
+  k = argread idx g_argbuf 0 256
+  if lt k 0
+    ret false
+  end
+  if ne ulong k len target
+    ret false
+  end
+  for i ulong ulong k bound 256
+    if ne get g_argbuf i get target i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn main to int
+  ac = argcnt
+  if le ac 1
+    ret run_self_test
+  end
+  if eq ac 2
+    if eq_arg 1 t_flag_test
+      ret run_self_test
+    end
+    if eq_arg 1 t_flag_stream
+      ret run_stream
+    end
+  end
+  ign_l = write 2 t_bad_arg 0 len t_bad_arg
+  ret 2
+end

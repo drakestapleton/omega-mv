@@ -34,7 +34,6 @@
 #include "omega_gpu_tern_api.h"
 #include "omega_gpu_session.h"
 #include "omega_gpu_cmdlist.h"
-#include "algebra/realize_common.h"
 #include "bw_warp_sim_k.h"
 #include "omega_path_check.h"
 #include <fcntl.h>
@@ -77,8 +76,15 @@ static int8_t *make_x(uint32_t k, uint32_t seed) {
     return x;
 }
 static int32_t *oracle(const int8_t *w, uint32_t n, uint32_t k, const int8_t *x) {
+    if (!w || !x || n == 0 || k == 0 || k > 16777215u || (size_t)n > SIZE_MAX / k / 4u) return NULL;
     int32_t *y = malloc((size_t)n * 4);
-    if (oma_rz_oracle(w, n, k, x, y) != OMA_RZ_OK) { free(y); return NULL; }
+    if (!y) return NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        int64_t acc = 0;
+        const int8_t *row = w + (size_t)i * k;
+        for (uint32_t j = 0; j < k; j++) acc += (int64_t)row[j] * (int64_t)x[j];
+        y[i] = (int32_t)acc;
+    }
     return y;
 }
 /* f32 epilogue as the header specifies: ((float)y * a) * scale[seg], seg from explicit boundaries (this file is built with

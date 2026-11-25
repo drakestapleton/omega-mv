@@ -2715,8 +2715,8 @@ test-gpu-bf16-gemv: $(GPU_BF16_TEST)
 # epilogue, three warp orders, mutants 1 to 5 caught); the chip gate is tools/run_gpu_tern_chip.sh with the quiet flag held.
 .PHONY: test-gpu-tern
 GPU_TERN_TEST = $(OUT_DIR)/gpu_tern_test
-$(GPU_TERN_TEST): tests/gpu_tern_test.c tests/bw_warp_sim_k.h src/omega_gpu_tern_api.h src/omega_blackwell_codegen_tern.h $(OMA_RZ_SRCS) $(OMA_RZ_HDRS) $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -ffp-contract=off $(OMA_RZ_ARCH) -Itests -o $@ tests/gpu_tern_test.c $(OMA_RZ_SRCS) $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+$(GPU_TERN_TEST): tests/gpu_tern_test.c tests/bw_warp_sim_k.h src/omega_gpu_tern_api.h src/omega_blackwell_codegen_tern.h $(OUT_DIR)/libomega_gpu.a
+	$(CC) $(CFLAGS) -ffp-contract=off -Itests -o $@ tests/gpu_tern_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 test-gpu-tern: $(GPU_TERN_TEST)
 	$(GPU_TERN_TEST) --host-only
 	$(GPU_TERN_TEST) --sim
@@ -2874,10 +2874,12 @@ test-gpu-prefill-modelshapes: $(GPU_TCGEMM_TEST) $(GPU_QGEMM_TEST) $(GPU_PATTN_T
 	./$(GPU_PFHOST_TEST) --sim
 	@echo "test-gpu-prefill-modelshapes: PASS (5 model-shape prefill tests, host model + warp simulator, no device)"
 # omega#456: tools/own30b_decode_profile.c is a link-only recorder built by hand on the Spark; compile it with the
-# project's -Werror flags so a warning cannot land unseen.
+# project's -Werror flags so a warning cannot land unseen, and also build & run the pure OM-2 port.
 .PHONY: check-own30b-decode-profile
-check-own30b-decode-profile: tools/own30b_decode_profile.c
+check-own30b-decode-profile: tools/own30b_decode_profile.c tools/own30b_decode_profile.om seed/out/omc
 	@mkdir -p $(OUT_DIR)
+	seed/out/omc < tools/own30b_decode_profile.om > $(OUT_DIR)/own30b_decode_profile.tmp.$$$$ && chmod +x $(OUT_DIR)/own30b_decode_profile.tmp.$$$$ && mv -f $(OUT_DIR)/own30b_decode_profile.tmp.$$$$ $(OUT_DIR)/own30b_decode_profile
+	./$(OUT_DIR)/own30b_decode_profile --test
 	$(CC) $(CFLAGS) -c -o $(OUT_DIR)/own30b_decode_profile.o tools/own30b_decode_profile.c
 	@echo "check-own30b-decode-profile: PASS (compiles with -Werror)"
 # OWN-30B W-L2 (2026-10-13): command list (many launches, one submission) + decode glue kernels. test-gpu-cmdlist is

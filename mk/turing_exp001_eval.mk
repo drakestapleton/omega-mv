@@ -24,9 +24,12 @@ EXP_ID ?= EXP-001
 export EXP_ID
 TE_DRY = $(TE_DIR)/dry$(if $(filter EXP-001R,$(EXP_ID)),_EXP-001R,)
 
-$(TE_BIN): tools/turing_cal_eval.c $(TE_SRCS) $(TE_HDRS)
+TE_OMC ?= seed/out/omc
+
+$(TE_BIN): tools/turing_cal_eval.om
 	@mkdir -p $(TE_DIR)
-	$(CC) $(TE_CFLAGS) -o $@ tools/turing_cal_eval.c $(TE_SRCS) -lm
+	@test -x "$(TE_OMC)" || { echo "MISSING: $(TE_OMC) (build seed/out/omc via make omega-from-seed)"; exit 3; }
+	$(TE_OMC) < tools/turing_cal_eval.om > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 $(TE_BIN_ASAN): tools/turing_cal_eval.c $(TE_SRCS) $(TE_HDRS)
 	@mkdir -p $(TE_DIR)
 	$(CC) $(TE_CFLAGS) $(TE_ASAN) -o $@ tools/turing_cal_eval.c $(TE_SRCS) -lm

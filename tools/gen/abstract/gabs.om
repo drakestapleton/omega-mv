@@ -1,0 +1,1193 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note Pure seeded OM-2 port of tools/gen/abstract/gabs.c (split, canon, inputs).
+note Note: gabs run requires passing candidate IR on fd 3 to ola_runner, which omc
+note execprog/execenv closes via close_range(3, ~0u, CLOSE_RANGE_UNSHARE); run refuses cleanly.
+
+const K_BOOL ulong 0
+const K_U8 ulong 1
+const K_U16 ulong 2
+const K_U32 ulong 3
+const K_U64 ulong 4
+const K_I8 ulong 5
+const K_I16 ulong 6
+const K_I32 ulong 7
+const K_I64 ulong 8
+
+note Dynamic pools (no MAXF=32 or 4096-line hard caps)
+global g_src uchar *
+global g_srclen ulong 1
+global g_loff ulong *
+global g_llen ulong *
+global g_fn_start ulong *
+global g_fn_name uchar *
+global g_fn_nlen ulong *
+global g_fn_cnt ulong 1
+global g_calls uchar *
+global g_calls_len ulong 1
+
+global g_out uchar 65536
+global g_olen ulong 1
+
+global g_args uchar *
+global g_alen ulong 64
+global g_ks ulong 6
+global g_small long 14
+
+text t_pfx "gabs: "
+text t_nl "\n"
+text t_sp " "
+text t_cmd_split "split"
+text t_cmd_canon "canon"
+text t_cmd_inputs "inputs"
+text t_cmd_run "run"
+text t_flag_max "--max"
+text t_usage "usage: gabs split <prog> <prefix> | canon <in.json> <out.json> | inputs <count> [--max <arg>:<max>] <type>... | run ...\n"
+text t_err_read "cannot read"
+text t_err_write "cannot write"
+text t_err_nl "program does not end with a newline:"
+text t_err_ascii "byte outside 0x20..0x7E in"
+text t_err_blank "blank line in"
+text t_err_fn_in "fn inside a function in"
+text t_err_fn_nm "fn without a name in"
+text t_err_out_fn "text after end in"
+text t_err_outside "text outside a function in"
+text t_err_unclosed "unclosed function in"
+text t_err_unk_kw "unknown statement opener (not a split block word) in"
+text t_err_bad_fn "bad function name in"
+text t_err_no_fn "no function in"
+text t_err_unterm "unterminated name in"
+text t_err_unk_fn "call to an unknown function in"
+text t_err_run_fd3 "gabs: run subcommand requires fd 3 across execve (blocked: omc execprog/execenv close_range >= 3)\n"
+text t_err_max1 "--max wants <arg 0..5>:<max>"
+text t_err_max2 "--max wants <arg 0..5>:<max 1..1000000>"
+text t_err_max_past "--max names an argument past the last type"
+text t_err_max_uns "--max applies to an unsigned argument"
+text t_err_in_use "usage: gabs inputs <count> [--max <arg>:<max>] <type 1..6>...\n"
+text t_err_unk_t "unknown type"
+
+text t_fn_sp "fn "
+text t_w_if "if"
+text t_w_while "while"
+text t_w_for "for"
+text t_w_end "end"
+text t_w_else "else"
+text t_w_break "break"
+text t_w_ret "ret"
+text t_w_trap "trap"
+text t_w_put "put"
+text t_w_free "free"
+text t_okw0 "to"
+text t_okw1 "void"
+text t_okw2 "true"
+text t_okw3 "false"
+text t_okw4 "bound"
+text t_okw5 "="
+text t_ext ".omegese"
+text t_dash "-"
+text t_jname "\"name\": \""
+text t_jfunc "\"func\": \""
+text t_jfn_p "fn"
+text t_jfn_s "_\""
+
+text tk_0 "bool"
+text tk_1 "u8"
+text tk_2 "u16"
+text tk_3 "u32"
+text tk_4 "u64"
+text tk_5 "i8"
+text tk_6 "i16"
+text tk_7 "i32"
+text tk_8 "i64"
+
+fn ob_flush fd int to void
+  n = get g_olen 0
+  if gt n 0
+    w = write fd g_out 0 n
+    ign_l = w
+    put g_olen 0 0
+  end
+end
+
+fn ob_b fd int c uchar to void
+  n = get g_olen 0
+  if ge n 65000
+    ob_flush fd
+    n = get g_olen 0
+  end
+  put g_out n c
+  put g_olen 0 add n 1
+end
+
+fn ob_txt fd int s view uchar * to void
+  for i ulong len s bound 4096
+    ob_b fd get s i
+  end
+end
+
+fn ob_u64 fd int v ulong to void
+  if eq v 0
+    ob_b fd uchar 48
+    ret
+  end
+  dig = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put dig nd uchar add 48 rem x 10
+    x = div x 10
+    nd = add nd 1
+  end
+  while gt nd 0 bound 24
+    nd = sub nd 1
+    ob_b fd get dig nd
+  end
+end
+
+fn ob_i64 fd int v long to void
+  if lt v 0
+    ob_b fd uchar 45
+    uv = add ulong sub long 0 add v 1 1
+    ob_u64 fd uv
+    ret
+  end
+  ob_u64 fd ulong v
+end
+
+fn load_args to ulong
+  ac = argcnt
+  if lt ac 0
+    ret 0
+  end
+  n = ulong ac
+  if gt n 64
+    n = ulong 64
+  end
+  ign = enlarge g_args mul n 4096
+  tmp = new uchar 4096 0
+  for i ulong n bound 64
+    k = argread i tmp 0 4096
+    if lt k 0
+      put g_alen i 0
+    else
+      uk = ulong k
+      put g_alen i uk
+      off = mul i 4096
+      for j ulong uk bound 4096
+        put g_args add off j get tmp j
+      end
+    end
+  end
+  ret n
+end
+
+fn arg_eq idx ulong s view uchar * to bool
+  al = get g_alen idx
+  if ne al len s
+    ret false
+  end
+  off = mul idx 4096
+  for i ulong al bound 4096
+    if ne get g_args add off i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn die_msg m view uchar * aidx ulong has_a bool to int
+  ob_flush int 1
+  put g_olen 0 0
+  ob_txt int 2 t_pfx
+  ob_txt int 2 m
+  if has_a
+    ob_b int 2 uchar 32
+    off = mul aidx 4096
+    al = get g_alen aidx
+    for i ulong al bound 4096
+      ob_b int 2 get g_args add off i
+    end
+  end
+  ob_b int 2 uchar 10
+  ob_flush int 2
+  ret 2
+end
+
+fn slurp_arg aidx ulong to bool
+  off = mul aidx 4096
+  al = get g_alen aidx
+  p = new uchar 4096 0
+  for i ulong al bound 4096
+    put p i get g_args add off i
+  end
+  fd = fopen p 0 al 0 0
+  if lt fd 0
+    ret false
+  end
+  sz = ulong 0
+  cap = ulong 65536
+  rc = enlarge g_src cap
+  if lt rc 0
+    ign_l = fclose int fd
+    ret false
+  end
+  done = false
+  while not done bound 1000000
+    if eq sz cap
+      cap = mul cap 2
+      rc2 = enlarge g_src cap
+      if lt rc2 0
+        ign_l = fclose int fd
+        ret false
+      end
+    end
+    r = read int fd g_src sz sub cap sz
+    if lt r 0
+      ign_l = fclose int fd
+      ret false
+    end
+    if eq r 0
+      done = true
+    else
+      sz = add sz ulong r
+    end
+  end
+  ign_l = fclose int fd
+  put g_srclen 0 sz
+  ret true
+end
+
+fn src_slice_eq off ulong l ulong s view uchar * to bool
+  if ne l len s
+    ret false
+  end
+  for i ulong l bound 4096
+    if ne get g_src add off i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn src_slice_has_pfx off ulong l ulong s view uchar * to bool
+  sl = len s
+  if lt l sl
+    ret false
+  end
+  for i ulong sl bound 64
+    if ne get g_src add off i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn add_fn line ulong noff ulong nlen ulong to bool
+  nf = get g_fn_cnt 0
+  if gt add nf 1 len g_fn_start
+    cap = mul add nf 1 2
+    if lt cap 32
+      cap = ulong 32
+    end
+    r1 = enlarge g_fn_start cap
+    if lt r1 0
+      ret false
+    end
+    r2 = enlarge g_fn_nlen cap
+    if lt r2 0
+      ret false
+    end
+    r3 = enlarge g_fn_name mul cap 64
+    if lt r3 0
+      ret false
+    end
+  end
+  put g_fn_start nf line
+  put g_fn_nlen nf nlen
+  db = mul nf 64
+  for i ulong nlen bound 64
+    put g_fn_name add db i get g_src add noff i
+  end
+  put g_fn_cnt 0 add nf 1
+  ret true
+end
+
+fn fn_tok_eq k ulong off ulong l ulong to bool
+  nl = get g_fn_nlen k
+  if ne nl l
+    ret false
+  end
+  db = mul k 64
+  for i ulong nl bound 64
+    a = get g_fn_name add db i
+    b = get g_src add off i
+    if ne a b
+      ret false
+    end
+  end
+  ret true
+end
+
+fn calls_contains off ulong l ulong to bool
+  cl = get g_calls_len 0
+  p = ulong 0
+  while lt p cl bound 1000000
+    e = p
+    while lt e cl bound 1000000
+      if eq get g_calls e uchar 44
+        break
+      end
+      e = add e 1
+    end
+    if eq sub e p l
+      ok = true
+      for i ulong l bound 64
+        cb = get g_calls add p i
+        sb = get g_src add off i
+        if ne cb sb
+          ok = false
+          break
+        end
+      end
+      if ok
+        ret true
+      end
+    end
+    p = add e 1
+  end
+  ret false
+end
+
+fn calls_append off ulong l ulong to void
+  cl = get g_calls_len 0
+  extra = add l 1
+  if gt add cl extra len g_calls
+    cap = mul add cl extra 2
+    if lt cap 1024
+      cap = ulong 1024
+    end
+    ign_l = enlarge g_calls cap
+  end
+  if gt cl 0
+    put g_calls cl uchar 44
+    cl = add cl 1
+  end
+  for i ulong l bound 64
+    put g_calls add cl i get g_src add off i
+  end
+  put g_calls_len 0 add cl l
+end
+
+fn write_all fd int buf view uchar * off ulong n ulong to bool
+  p = off
+  rem_b = n
+  while gt rem_b 0 bound 1000000
+    w = write fd buf p rem_b
+    if le w 0
+      ret false
+    end
+    p = add p ulong w
+    rem_b = sub rem_b ulong w
+  end
+  ret true
+end
+
+fn write_pool_slice fd int off ulong n ulong to bool
+  buf = new uchar 4096 0
+  p = off
+  rem_b = n
+  while gt rem_b 0 bound 1000000
+    chunk = rem_b
+    if gt chunk 4096
+      chunk = ulong 4096
+    end
+    for i ulong chunk bound 4096
+      put buf i get g_src add p i
+    end
+    if not write_all fd buf 0 chunk
+      ret false
+    end
+    p = add p chunk
+    rem_b = sub rem_b chunk
+  end
+  ret true
+end
+
+fn check_other_kw off ulong l ulong to bool
+  if src_slice_eq off l t_okw0
+    ret true
+  end
+  if src_slice_eq off l t_okw1
+    ret true
+  end
+  if src_slice_eq off l t_okw2
+    ret true
+  end
+  if src_slice_eq off l t_okw3
+    ret true
+  end
+  if src_slice_eq off l t_okw4
+    ret true
+  end
+  if src_slice_eq off l t_okw5
+    ret true
+  end
+  ret false
+end
+
+fn split_collect_lines in_idx ulong to long
+  n = get g_srclen 0
+  if eq n 0
+    ign_i = die_msg t_err_nl in_idx true
+    ret -1
+  end
+  if ne get g_src sub n 1 uchar 10
+    ign_i = die_msg t_err_nl in_idx true
+    ret -1
+  end
+  nl = ulong 0
+  ign_l = enlarge g_loff 128
+  ign_l = enlarge g_llen 128
+  p = ulong 0
+  while lt p n bound 1000000
+    e = p
+    while lt e n bound 1000000
+      b = get g_src e
+      if eq b uchar 10
+        break
+      end
+      if or lt b uchar 32 gt b uchar 126
+        ign_i = die_msg t_err_ascii in_idx true
+        ret -1
+      end
+      e = add e 1
+    end
+    ll = sub e p
+    if eq ll 0
+      ign_i = die_msg t_err_blank in_idx true
+      ret -1
+    end
+    if ge nl len g_loff
+      cap = mul len g_loff 2
+      ign_l = enlarge g_loff cap
+      ign_l = enlarge g_llen cap
+    end
+    put g_loff nl p
+    put g_llen nl ll
+    nl = add nl 1
+    p = add e 1
+  end
+  ret long nl
+end
+
+fn split_skip_sp q_in ulong lim ulong to ulong
+  q = q_in
+  while lt q lim bound 4096
+    if ne get g_src q uchar 32
+      break
+    end
+    q = add q 1
+  end
+  ret q
+end
+
+fn split_scan_tok q_in ulong lim ulong to ulong
+  q = q_in
+  while lt q lim bound 4096
+    if eq get g_src q uchar 32
+      break
+    end
+    q = add q 1
+  end
+  ret q
+end
+
+fn split_is_stmt_kw qs ulong wl ulong to bool
+  if src_slice_eq qs wl t_w_else
+    ret true
+  end
+  if src_slice_eq qs wl t_w_break
+    ret true
+  end
+  if src_slice_eq qs wl t_w_ret
+    ret true
+  end
+  if src_slice_eq qs wl t_w_trap
+    ret true
+  end
+  if src_slice_eq qs wl t_w_put
+    ret true
+  end
+  if src_slice_eq qs wl t_w_free
+    ret true
+  end
+  ret false
+end
+
+fn split_is_blk_kw qs ulong wl ulong to bool
+  if src_slice_eq qs wl t_w_if
+    ret true
+  end
+  if src_slice_eq qs wl t_w_while
+    ret true
+  end
+  if src_slice_eq qs wl t_w_for
+    ret true
+  end
+  ret false
+end
+
+fn split_parse_fns in_idx ulong nl ulong to bool
+  put g_fn_cnt 0 0
+  open_d = ulong 0
+  for line ulong nl bound 1000000
+    lo = get g_loff line
+    ll = get g_llen line
+    if src_slice_has_pfx lo ll t_fn_sp
+      if ne open_d 0
+        ign_i = die_msg t_err_fn_in in_idx true
+        ret false
+      end
+      qs = split_skip_sp add lo 3 add lo ll
+      qe = split_scan_tok qs add lo ll
+      nm_l = sub qe qs
+      if eq nm_l 0
+        ign_i = die_msg t_err_fn_nm in_idx true
+        ret false
+      end
+      if gt nm_l 63
+        nm_l = ulong 63
+      end
+      if not add_fn line qs nm_l
+        ign_i = die_msg t_err_read in_idx true
+        ret false
+      end
+      open_d = ulong 1
+    else
+      if eq open_d 0
+        ign_i = die_msg t_err_outside in_idx true
+        ret false
+      end
+      qs = split_skip_sp lo add lo ll
+      qe = split_scan_tok qs add lo ll
+      wl = sub qe qs
+      if eq wl 0
+        ign_i = die_msg t_err_outside in_idx true
+        ret false
+      end
+      if split_is_blk_kw qs wl
+        open_d = add open_d 1
+      else
+        if src_slice_eq qs wl t_w_end
+          if not src_slice_eq lo ll t_w_end
+            ign_i = die_msg t_err_out_fn in_idx true
+            ret false
+          end
+          open_d = sub open_d 1
+        else
+          if not split_is_stmt_kw qs wl
+            if check_other_kw qs wl
+              ign_i = die_msg t_err_unk_kw in_idx true
+              ret false
+            end
+          end
+        end
+      end
+    end
+  end
+  if ne open_d 0
+    ign_i = die_msg t_err_unclosed in_idx true
+    ret false
+  end
+  ret true
+end
+
+fn split_scan_calls k ulong lo ulong ll ulong to void
+  q = lo
+  lim = add lo ll
+  while lt q lim bound 10000
+    c = get g_src q
+    if or eq c uchar 32 or eq c uchar 40 eq c uchar 41
+      q = add q 1
+    else
+      ws = q
+      while lt q lim bound 10000
+        c2 = get g_src q
+        if or eq c2 uchar 32 or eq c2 uchar 40 eq c2 uchar 41
+          break
+        end
+        q = add q 1
+      end
+      wl = sub q ws
+      for j ulong k bound 100000
+        if fn_tok_eq j ws wl
+          if not calls_contains ws wl
+            calls_append ws wl
+          end
+        end
+      end
+    end
+  end
+end
+
+fn fmt_u64_buf v ulong dst edit uchar * to ulong
+  if eq v 0
+    put dst 0 uchar 48
+    ret 1
+  end
+  dig = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while gt x 0 bound 24
+    r = rem x 10
+    put dig nd uchar add 48 r
+    x = div x 10
+    nd = add nd 1
+  end
+  o = ulong 0
+  while gt nd 0 bound 24
+    nd = sub nd 1
+    put dst o get dig nd
+    o = add o 1
+  end
+  ret o
+end
+
+fn split_build_path pfx_idx ulong k ulong path edit uchar * to ulong
+  pfx_off = mul pfx_idx 4096
+  pfx_len = get g_alen pfx_idx
+  po = ulong 0
+  for i ulong pfx_len bound 3900
+    put path po get g_args add pfx_off i
+    po = add po 1
+  end
+  put path po uchar 46
+  po = add po 1
+  nb = new uchar 24 0
+  nl = fmt_u64_buf k nb
+  for i ulong nl bound 24
+    put path po get nb i
+    po = add po 1
+  end
+  for i ulong len t_ext bound 16
+    put path po get t_ext i
+    po = add po 1
+  end
+  ret po
+end
+
+fn split_emit_fn_summary k ulong nlines ulong to void
+  ob_txt int 1 t_fn_sp
+  ob_u64 int 1 k
+  ob_b int 1 uchar 32
+  db = mul k 64
+  fnl = get g_fn_nlen k
+  for j ulong fnl bound 64
+    b = get g_fn_name add db j
+    ob_b int 1 b
+  end
+  ob_b int 1 uchar 32
+  cl = get g_calls_len 0
+  if eq cl 0
+    ob_txt int 1 t_dash
+  else
+    for j ulong cl bound 1000000
+      c = get g_calls j
+      ob_b int 1 c
+    end
+  end
+  ob_b int 1 uchar 32
+  ob_u64 int 1 nlines
+  ob_b int 1 uchar 10
+end
+
+fn split_emit_one k ulong nl ulong pfx_idx ulong to bool
+  path = new uchar 4096 0
+  nlb = new uchar 1 10
+  nf = get g_fn_cnt 0
+  a = get g_fn_start k
+  b = nl
+  if lt add k 1 nf
+    b = get g_fn_start add k 1
+  end
+  po = split_build_path pfx_idx k path
+  fd = fopen path 0 po 577 420
+  if lt fd 0
+    ign_i = die_msg t_err_write pfx_idx false
+    ret false
+  end
+  put g_calls_len 0 0
+  i = a
+  while lt i b bound 1000000
+    lo = get g_loff i
+    ll = get g_llen i
+    if not write_pool_slice int fd lo ll
+      ign_l = fclose int fd
+      ign_i = die_msg t_err_write pfx_idx false
+      ret false
+    end
+    if not write_all int fd nlb 0 1
+      ign_l = fclose int fd
+      ign_i = die_msg t_err_write pfx_idx false
+      ret false
+    end
+    if ne i a
+      split_scan_calls k lo ll
+    end
+    i = add i 1
+  end
+  if ne fclose int fd 0
+    ign_i = die_msg t_err_write pfx_idx false
+    ret false
+  end
+  split_emit_fn_summary k sub b a
+  ret true
+end
+
+fn do_split in_idx ulong pfx_idx ulong to int
+  if not slurp_arg in_idx
+    ret die_msg t_err_read in_idx true
+  end
+  nl_s = split_collect_lines in_idx
+  if lt nl_s 0
+    ret 2
+  end
+  nl = ulong nl_s
+  if not split_parse_fns in_idx nl
+    ret 2
+  end
+  nf = get g_fn_cnt 0
+  for k ulong nf bound 100000
+    if not split_emit_one k nl pfx_idx
+      ret 2
+    end
+  end
+  ob_flush int 1
+  ret 0
+end
+
+fn find_at pos ulong pat view uchar * n ulong to bool
+  pl = len pat
+  if gt add pos pl n
+    ret false
+  end
+  for i ulong pl bound 32
+    if ne get g_src add pos i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn canon_collect_fns in_idx ulong n ulong to bool
+  put g_fn_cnt 0 0
+  p = ulong 0
+  while lt p n bound 10000000
+    if find_at p t_jname n
+      a = add p len t_jname
+      e = a
+      while lt e n bound 100000
+        if eq get g_src e uchar 34
+          break
+        end
+        e = add e 1
+      end
+      if or ge e n gt sub e a 63
+        ign_i = die_msg t_err_bad_fn in_idx true
+        ret false
+      end
+      if not add_fn 0 a sub e a
+        ign_i = die_msg t_err_bad_fn in_idx true
+        ret false
+      end
+      p = add a 1
+    else
+      p = add p 1
+    end
+  end
+  if eq get g_fn_cnt 0 0
+    ign_i = die_msg t_err_no_fn in_idx true
+    ret false
+  end
+  ret true
+end
+
+fn canon_write in_idx ulong fd int n ulong nf ulong to bool
+  put g_olen 0 0
+  p = ulong 0
+  while lt p n bound 10000000
+    hit = ulong 0
+    if find_at p t_jname n
+      hit = ulong 1
+    else
+      if find_at p t_jfunc n
+        hit = ulong 2
+      end
+    end
+    if eq hit 0
+      ob_b fd get g_src p
+      p = add p 1
+    else
+      kl = len t_jname
+      if eq hit 2
+        kl = len t_jfunc
+      end
+      a = add p kl
+      e = a
+      while lt e n bound 100000
+        if eq get g_src e uchar 34
+          break
+        end
+        e = add e 1
+      end
+      if ge e n
+        ign_i = die_msg t_err_unterm in_idx true
+        ret false
+      end
+      idx = long -1
+      wl = sub e a
+      for k ulong nf bound 100000
+        if fn_tok_eq k a wl
+          idx = long k
+          break
+        end
+      end
+      if lt idx 0
+        ign_i = die_msg t_err_unk_fn in_idx true
+        ret false
+      end
+      if eq hit 1
+        ob_txt fd t_jname
+      else
+        ob_txt fd t_jfunc
+      end
+      ob_txt fd t_jfn_p
+      ob_u64 fd ulong idx
+      ob_txt fd t_jfn_s
+      p = add e 1
+    end
+  end
+  ob_flush fd
+  ret true
+end
+
+fn do_canon in_idx ulong out_idx ulong to int
+  if not slurp_arg in_idx
+    ret die_msg t_err_read in_idx true
+  end
+  n = get g_srclen 0
+  if not canon_collect_fns in_idx n
+    ret 2
+  end
+  nf = get g_fn_cnt 0
+  out_off = mul out_idx 4096
+  out_len = get g_alen out_idx
+  opath = new uchar 4096 0
+  for i ulong out_len bound 4096
+    put opath i get g_args add out_off i
+  end
+  fd = fopen opath 0 out_len 577 420
+  if lt fd 0
+    ret die_msg t_err_write out_idx true
+  end
+  ok = canon_write in_idx int fd n nf
+  if ne fclose int fd 0
+    if ok
+      ret die_msg t_err_write out_idx true
+    end
+    ret 2
+  end
+  if not ok
+    ret 2
+  end
+  ret 0
+end
+
+fn kind_of idx ulong to long
+  if arg_eq idx tk_0
+    ret long K_BOOL
+  end
+  if arg_eq idx tk_1
+    ret long K_U8
+  end
+  if arg_eq idx tk_2
+    ret long K_U16
+  end
+  if arg_eq idx tk_3
+    ret long K_U32
+  end
+  if arg_eq idx tk_4
+    ret long K_U64
+  end
+  if arg_eq idx tk_5
+    ret long K_I8
+  end
+  if arg_eq idx tk_6
+    ret long K_I16
+  end
+  if arg_eq idx tk_7
+    ret long K_I32
+  end
+  if arg_eq idx tk_8
+    ret long K_I64
+  end
+  ret -1
+end
+
+fn kwidth k ulong to ulong
+  if eq k K_BOOL
+    ret 8
+  end
+  if or eq k K_U8 eq k K_I8
+    ret 8
+  end
+  if or eq k K_U16 eq k K_I16
+    ret 16
+  end
+  if or eq k K_U32 eq k K_I32
+    ret 32
+  end
+  ret 64
+end
+
+fn ksigned k ulong to bool
+  ret and ge k K_I8 le k K_I64
+end
+
+fn at_width r ulong k ulong to ulong
+  w = kwidth k
+  if eq w 64
+    ret r
+  end
+  m = sub shl ulong 1 w 1
+  rv = and r m
+  if ksigned k
+    if ne shr rv sub w 1 0
+      rv = or rv xor m ulong 0xffffffffffffffff
+    end
+  end
+  ret rv
+end
+
+fn kmin k ulong to ulong
+  if ksigned k
+    w = kwidth k
+    ret shl ulong 0xffffffffffffffff sub w 1
+  end
+  ret 0
+end
+
+fn kmax k ulong to ulong
+  if eq k K_BOOL
+    ret 1
+  end
+  w = kwidth k
+  if ksigned k
+    w = sub w 1
+  end
+  if eq w 64
+    ret ulong 0xffffffffffffffff
+  end
+  ret sub shl ulong 1 w 1
+end
+
+fn init_small to void
+  put g_small 0 0
+  put g_small 1 1
+  put g_small 2 2
+  put g_small 3 3
+  put g_small 4 5
+  put g_small 5 7
+  put g_small 6 9
+  put g_small 7 10
+  put g_small 8 11
+  put g_small 9 99
+  put g_small 10 100
+  put g_small 11 255
+  put g_small 12 256
+  put g_small 13 1000
+end
+
+fn pick k ulong r ulong line ulong to ulong
+  lo = kmin k
+  hi = kmax k
+  if eq k K_BOOL
+    ret and r 1
+  end
+  if lt line 4
+    if eq line 0
+      ret lo
+    end
+    if eq line 1
+      ret hi
+    end
+    if eq line 2
+      ret 0
+    end
+    if ksigned k
+      ret ulong 0xffffffffffffffff
+    end
+    ret 1
+  end
+  mode = rem r 4
+  if eq mode 0
+    v = get g_small rem shr r 8 14
+    if and ksigned k ne and shr r 20 1 0
+      v = neg v
+    end
+    ret at_width bitcast ulong v k
+  end
+  if eq mode 1
+    v = long rem shr r 8 512
+    if and ksigned k ne and shr r 20 1 0
+      v = neg v
+    end
+    ret at_width bitcast ulong v k
+  end
+  if eq mode 2
+    ret at_width shr r 11 k
+  end
+  uv = rem shr r 13 100000
+  if and ksigned k ne and shr r 40 1 0
+    uv = sub ulong 0 uv
+  end
+  ret at_width uv k
+end
+
+fn parse_u64_slice aidx ulong off_in ulong end_in ulong to long
+  if ge off_in end_in
+    ret -1
+  end
+  base = mul aidx 4096
+  v = ulong 0
+  i = off_in
+  while lt i end_in bound 32
+    c = ulong get g_args add base i
+    if or lt c 48 gt c 57
+      ret -1
+    end
+    if gt v div sub ulong 9223372036854775807 sub c 48 10
+      ret -1
+    end
+    v = add mul v 10 sub c 48
+    i = add i 1
+  end
+  ret long v
+end
+
+fn inputs_emit cnt ulong np ulong marg long mmax ulong to void
+  x = ulong 0x9e3779b97f4a7c15
+  for l ulong cnt bound 1000000
+    for i ulong np bound 6
+      x = add mul x ulong 6364136223846793005 ulong 1442695040888963407
+      li = l
+      if lt l 4
+        li = rem add l i 4
+      end
+      k = get g_ks i
+      rx = xor x shr x 29
+      v = pick k rx li
+      if eq long i marg
+        v = rem v add mmax 1
+      end
+      if gt i 0
+        ob_b int 1 uchar 32
+      end
+      if ksigned k
+        ob_i64 int 1 bitcast long v
+      else
+        ob_u64 int 1 v
+      end
+    end
+    ob_b int 1 uchar 10
+  end
+  ob_flush int 1
+end
+
+fn do_inputs ac ulong to int
+  init_small
+  if lt ac 4
+    ign_l = write 2 t_err_in_use 0 len t_err_in_use
+    ret 2
+  end
+  cnt_l = parse_u64_slice 2 0 get g_alen 2
+  if lt cnt_l 1
+    ign_l = write 2 t_err_in_use 0 len t_err_in_use
+    ret 2
+  end
+  cur = ulong 3
+  marg = long -1
+  mmax = ulong 0
+  if ge sub ac cur 2
+    if arg_eq cur t_flag_max
+      aidx = add cur 1
+      aoff = mul aidx 4096
+      alen = get g_alen aidx
+      col = alen
+      for i ulong alen bound 4096
+        if eq get g_args add aoff i uchar 58
+          col = i
+          break
+        end
+      end
+      if ge col alen
+        ret die_msg t_err_max1 aidx true
+      end
+      av = parse_u64_slice aidx 0 col
+      if or lt av 0 gt av 5
+        ret die_msg t_err_max1 aidx true
+      end
+      mv = parse_u64_slice aidx add col 1 alen
+      if or lt mv 1 gt mv 1000000
+        ret die_msg t_err_max2 aidx true
+      end
+      marg = av
+      mmax = ulong mv
+      cur = add cur 2
+    end
+  end
+
+  np = sub ac cur
+  if or lt np 1 gt np 6
+    ign_l = write 2 t_err_in_use 0 len t_err_in_use
+    ret 2
+  end
+  if ge marg long np
+    ret die_msg t_err_max_past 0 false
+  end
+  for i ulong np bound 6
+    kv = kind_of add cur i
+    if lt kv 0
+      ret die_msg t_err_unk_t add cur i true
+    end
+    put g_ks i ulong kv
+  end
+  if ge marg 0
+    mk = get g_ks ulong marg
+    if or eq mk K_BOOL ksigned mk
+      ret die_msg t_err_max_uns 0 false
+    end
+  end
+
+  inputs_emit ulong cnt_l np marg mmax
+  ret 0
+end
+
+fn main to int
+  ac = load_args
+  if and ge ac 4 arg_eq 1 t_cmd_split
+    ret do_split 2 3
+  end
+  if and eq ac 4 arg_eq 1 t_cmd_canon
+    ret do_canon 2 3
+  end
+  if and ge ac 4 arg_eq 1 t_cmd_inputs
+    ret do_inputs ac
+  end
+  if and ge ac 2 arg_eq 1 t_cmd_run
+    ign_l = write 2 t_err_run_fd3 0 len t_err_run_fd3
+    ret 2
+  end
+  ign_l = write 2 t_usage 0 len t_usage
+  ret 2
+end
