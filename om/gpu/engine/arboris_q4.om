@@ -1,0 +1,239 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/arboris_q4.om: Live Arboris Online Adaptive Sum-Over-Paths Expert Prefetcher
+note for Qwen 3.8 Flash Next (48 layers, 512 experts/layer, top-10 routed experts per token).
+note 47 cross-layer transitions (L -> L+1) x 512 source experts x 16 Space-Saving slots
+note packed as (count << 16) | target_eid = 385,024 uints (~1.47 MiB static table).
+note Overlapped asynchronously with lm_head on the Full-APU path (zero critical-path latency).
+
+const Q4A_LAYERS ulong 48
+const Q4A_TRANS ulong 47
+const Q4A_NEXP ulong 512
+const Q4A_TOPK ulong 10
+const Q4A_EDGES ulong 385024
+const Q4A_TOP1 ulong 24064
+
+global q4ArbEdges uint 385024
+global q4ArbTop1 uint 24064
+global q4ArbScores ulong 512
+global q4ArbTouch ulong 256
+global q4ArbTrace uint 480
+global q4ArbTraceBytes uchar 2048
+global q4ArbPred uint 10
+global q4ArbHits ulong 1
+global q4ArbTotal ulong 1
+
+fn q4ArbResetAll to void
+for i ulong Q4A_EDGES
+put q4ArbEdges i 0
+end
+for i ulong Q4A_TOP1
+put q4ArbTop1 i 0xffffffff
+end
+put q4ArbHits 0 0
+put q4ArbTotal 0 0
+end
+
+fn q4ArbPack cnt ulong tgt ulong to uint
+ret or shl uint cnt 16 uint tgt
+end
+
+fn q4ArbHalve base ulong to void
+for h ulong 16
+hw = get q4ArbEdges add base h
+if ne hw 0
+hc = shr ulong shr hw 16 1
+if eq hc 0
+hc = ulong 1
+end
+put q4ArbEdges add base h q4ArbPack hc ulong and hw 65535
+end
+end
+end
+
+fn q4ArbUpdateEdge trans ulong src ulong tgt ulong to void
+base = mul add mul trans Q4A_NEXP src 16
+minIdx = ulong 0
+minCnt = ulong 65536
+for s ulong 16
+w = get q4ArbEdges add base s
+if eq w 0
+put q4ArbEdges add base s q4ArbPack 1 tgt
+ret
+end
+e = ulong and w 65535
+c = ulong shr w 16
+if eq e tgt
+c = add c 1
+if gt c 65000
+q4ArbHalve base
+c = shr c 1
+end
+put q4ArbEdges add base s q4ArbPack c tgt
+ret
+end
+if lt c minCnt
+minCnt = c
+minIdx = s
+end
+end
+if gt minCnt 1
+put q4ArbEdges add base minIdx q4ArbPack sub minCnt 1 ulong and get q4ArbEdges add base minIdx 65535
+else
+put q4ArbEdges add base minIdx q4ArbPack 1 tgt
+end
+end
+
+fn q4ArbRefreshTop1 trans ulong src ulong to void
+row = add mul trans Q4A_NEXP src
+base = mul row 16
+bestCnt = ulong 0
+bestTgt = uint 0xffffffff
+for s ulong 16
+w = get q4ArbEdges add base s
+if ne w 0
+c = ulong shr w 16
+if gt c bestCnt
+bestCnt = c
+bestTgt = and w 65535
+end
+end
+end
+put q4ArbTop1 row bestTgt
+end
+
+fn q4ArbAccumLayer trans ulong to ulong
+nTouch = ulong 0
+tBase = mul trans Q4A_TOPK
+for i ulong Q4A_TOPK
+src = ulong get q4ArbTrace add tBase i
+if lt src Q4A_NEXP
+base = mul add mul trans Q4A_NEXP src 16
+for s ulong 16
+w = get q4ArbEdges add base s
+if ne w 0
+tgt = ulong and w 65535
+cnt = ulong shr w 16
+if lt tgt Q4A_NEXP
+prev = get q4ArbScores tgt
+if and eq prev 0 lt nTouch 256
+put q4ArbTouch nTouch tgt
+nTouch = add nTouch 1
+end
+put q4ArbScores tgt add prev cnt
+end
+end
+end
+end
+end
+ret nTouch
+end
+
+fn q4ArbPickBest nTouch ulong to ulong
+best = ulong Q4A_NEXP
+bestSc = ulong 0
+for ti ulong nTouch bound 256
+e = get q4ArbTouch ti
+sc = get q4ArbScores e
+if gt sc bestSc
+bestSc = sc
+best = e
+end
+end
+ret best
+end
+
+fn q4ArbPredictLayer trans ulong to ulong
+nTouch = q4ArbAccumLayer trans
+if eq nTouch 0
+ret 0
+end
+picked = ulong 0
+for slot ulong Q4A_TOPK
+best = q4ArbPickBest nTouch
+if eq best Q4A_NEXP
+break
+end
+put q4ArbPred slot uint best
+put q4ArbScores best 0
+picked = add picked 1
+end
+for ti ulong nTouch bound 256
+put q4ArbScores get q4ArbTouch ti 0
+end
+ret picked
+end
+
+fn q4ArbScoreLayer nextL ulong np ulong to ulong
+hits = ulong 0
+nBase = mul nextL Q4A_TOPK
+for i ulong np bound 10
+p = get q4ArbPred i
+for j ulong Q4A_TOPK
+if eq p get q4ArbTrace add nBase j
+hits = add hits 1
+break
+end
+end
+end
+ret hits
+end
+
+fn q4ArbObservePair trans ulong to void
+sBase = mul trans Q4A_TOPK
+tBase = mul add trans 1 Q4A_TOPK
+for i ulong Q4A_TOPK
+src = ulong get q4ArbTrace add sBase i
+if lt src Q4A_NEXP
+for j ulong Q4A_TOPK
+tgt = ulong get q4ArbTrace add tBase j
+if lt tgt Q4A_NEXP
+q4ArbUpdateEdge trans src tgt
+end
+end
+q4ArbRefreshTop1 trans src
+end
+end
+end
+
+fn q4ArbUnpackTrace nL ulong to void
+nIds = mul nL Q4A_TOPK
+for i ulong nIds bound 480
+p = mul i 4
+b0 = uint get q4ArbTraceBytes p
+b1 = shl uint get q4ArbTraceBytes add p 1 8
+b2 = shl uint get q4ArbTraceBytes add p 2 16
+b3 = shl uint get q4ArbTraceBytes add p 3 24
+put q4ArbTrace i or or b0 b1 or b2 b3
+end
+end
+
+fn q4ArbProcessTrace shmMap long shmOff ulong to void
+nL = get engSpec MS_LAYERS
+if gt nL Q4A_LAYERS
+nL = ulong Q4A_LAYERS
+end
+nb = mul mul nL Q4A_TOPK 4
+r = mapread shmMap shmOff q4ArbTraceBytes 0 nb
+q4ArbUnpackTrace nL
+if le nL 1
+ret
+end
+nTr = sub nL 1
+for tr ulong nTr bound 47
+np = q4ArbPredictLayer tr
+if gt np 0
+h = q4ArbScoreLayer add tr 1 np
+put q4ArbHits 0 add get q4ArbHits 0 h
+put q4ArbTotal 0 add get q4ArbTotal 0 np
+end
+q4ArbObservePair tr
+end
+end
+
+fn q4ArbHitPctX10 to ulong
+tot = get q4ArbTotal 0
+if eq tot 0
+ret 0
+end
+ret div mul get q4ArbHits 0 1000 tot
+end

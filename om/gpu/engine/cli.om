@@ -55,9 +55,18 @@ text ecKPlan "kernel_plan     : uRmsNormAdd(H) + q38W4Gemv4R + uFaAttendSplitF32
 text ecArch0 "Standard Dense Transformer (Llama/Qwen2/Qwen3/Mistral)"
 text ecArch1 "Hybrid GDN+FA Dense Transformer (Qwen3.5/3.8 Dense)"
 text ecArch2 "Hybrid GDN+FA MoE Transformer (Qwen3.5/3.6 MoE)"
-text ecArch3 "Hybrid GDN+FA MoE Transformer (Qwen4 Exp)"
+text ecArch3 "Hybrid GDN+QSA MoE + Gated Residual + 51B PLE (Qwen 3.8 Flash Next / Qwen4 Exp)"
 text ecArch4 "DeepSeek MoE Transformer"
 text ecArch5 "Gemma Transformer"
+text ecKHc "hyper_conn      : hc_count="
+text ecKHcLr " hc_lowrank="
+text ecKGdnSig " gdn_sigmoid="
+text ecKPle "ple_ngram       : layer="
+text ecKPleDim " dim="
+text ecKPleSp " splits="
+text ecKQsa "qsa_indexer     : budget="
+text ecKQsaC " compress="
+text ecKPlanQ4 "kernel_plan     : FULL-APU (20 ARMv9 CPU + 48 SM121 = 6,164 cores) + Live Arboris (48L x 512E top-10) + uGroupedRmsNorm + uHcMixReduce/Inject + uPleGate/Conv + uGdnStepReal(sig) + uRouterTopK + uMoeW4Gu/DnAdd + uFaAttendSplitF32\n"
 text ecLay0 "single-file (model.safetensors)"
 text ecLay1 "sharded-hf (model.safetensors.index.json)"
 text ecLay2 "omega-per-layer (outside + layers-L.safetensors)"
@@ -66,6 +75,7 @@ text ecLoaded "Engine ready in ms="
 text ecRunStat "OMEGA_ENGINE_RUN: gen_tokens="
 text ecRunUs " avg_us_per_tok="
 text ecRunTps " tok_s_x100="
+text ecRunArb " arboris_hit_pct_x10="
 text ecRunTxt "Output: "
 text ecTokOk "Loaded tokenizer.json\n"
 text ecTokFail "ERROR: failed to load tokenizer.json\n"
@@ -186,7 +196,36 @@ engPrintU get stFileCount 0
 engPrint ecKTensors
 engPrintU get stTensorCount 0
 engPrint ecNl
+if gt get engSpec MS_HC_COUNT 1
+engPrint ecKHc
+engPrintU get engSpec MS_HC_COUNT
+engPrint ecKHcLr
+engPrintU get engSpec MS_HC_LOWRANK
+engPrint ecKGdnSig
+engPrintU get engSpec MS_GDN_SIGMOID
+engPrint ecNl
+end
+if gt get engSpec MS_PLE_LAYER 0
+engPrint ecKPle
+engPrintU get engSpec MS_PLE_LAYER
+engPrint ecKPleDim
+engPrintU get engSpec MS_PLE_DIM
+engPrint ecKPleSp
+engPrintU get engSpec MS_PLE_SPLITS
+engPrint ecNl
+end
+if gt get engSpec MS_IDX_BUDGET 0
+engPrint ecKQsa
+engPrintU get engSpec MS_IDX_BUDGET
+engPrint ecKQsaC
+engPrintU get engSpec MS_IDX_COMP
+engPrint ecNl
+end
+if eq get engSpec MS_ARCH 3
+engPrint ecKPlanQ4
+else
 engPrint ecKPlan
+end
 end
 
 fn ecAppStr s view uchar * to void
@@ -304,8 +343,14 @@ put ecGenTextLen 0 0
 for i ulong ntok bound 2048
 put engTokSeq i get q36TokOutIds i
 end
+isQ4 = eq get engSpec MS_ARCH 3
 t0 = ulong monons
+firstTok = ulong 999999
+if isQ4
+firstTok = q4PrefillSeq ntok
+else
 firstTok = engPrefillSeq ntok
+end
 t1 = ulong monons
 put ecTimings 0 div sub t1 t0 1000000
 put ecTimings 1 0
@@ -315,6 +360,23 @@ end
 ecAppendTokText firstTok
 genCnt = ulong 1
 if lt genCnt maxToks
+if isQ4
+curTok = firstTok
+curPos = ntok
+t0 = ulong monons
+while lt genCnt maxToks bound 4096
+tok = q4DecodeStep curTok curPos
+if ecIsStop tok
+break
+end
+ecAppendTokText tok
+curTok = tok
+curPos = add curPos 1
+genCnt = add genCnt 1
+end
+t1 = ulong monons
+put ecTimings 1 div sub t1 t0 1000000
+else
 if not engLoadEmbed firstTok
 ret genCnt
 end
@@ -335,6 +397,7 @@ genCnt = add genCnt 1
 end
 t1 = ulong monons
 put ecTimings 1 div sub t1 t0 1000000
+end
 end
 ret genCnt
 end
@@ -614,6 +677,10 @@ engPrint ecRunUs
 engPrintU div mul dms 1000 decN
 engPrint ecRunTps
 engPrintU div mul decN 100000 dms
+if eq get engSpec MS_ARCH 3
+engPrint ecRunArb
+engPrintU q4ArbHitPctX10
+end
 engPrint ecNl
 if eq g 0
 ret 25
@@ -680,7 +747,7 @@ ecPrintInspect
 if eq get ecMode 0 0
 ret 0
 end
-if gt get engSpec MS_NEXP 0
+if and gt get engSpec MS_NEXP 0 ne get engSpec MS_ARCH 3
 engPrint ecErrMoe
 ret 0
 end
@@ -698,7 +765,12 @@ engPrintU ulong irc
 engPrint ecNl
 ret irc
 end
+lrc = int 0
+if eq get engSpec MS_ARCH 3
+lrc = q4LoadAll
+else
 lrc = engLoadAll
+end
 if ne lrc 0
 engPrint ecErrGpu
 engPrintU ulong lrc
@@ -713,6 +785,7 @@ engPrint ecNl
 
 if or eq get ecMode 0 1 eq get ecSelfTest 0 1
 rrc = ecRunSelfOrCli
+q4ApuStop
 rc = nvstop
 ret rrc
 end
@@ -720,6 +793,7 @@ end
 port = get ecPort 0
 lfd = ecListen port
 if lt lfd 0
+q4ApuStop
 rc = nvstop
 ret 40
 end
@@ -734,6 +808,7 @@ c0 = fclose int cfd
 end
 end
 c1 = fclose int lfd
+q4ApuStop
 rc = nvstop
 ret 0
 end

@@ -19,7 +19,10 @@ SRC="$OUT_DIR/omega-engine.om"
     "$ROOT/om/gpu/engine/config.om" \
     "$ROOT/om/gpu/engine/safetensors.om" \
     "$ROOT/om/gpu/engine/emit_generic.om" \
+    "$ROOT/om/gpu/engine/emit_qwen4.om" \
     "$ROOT/om/gpu/engine/runtime.om" \
+    "$ROOT/om/gpu/engine/arboris_q4.om" \
+    "$ROOT/om/gpu/engine/runtime_qwen4.om" \
     "$ROOT/om/gpu/engine/cli.om"
 } > "$SRC"
 

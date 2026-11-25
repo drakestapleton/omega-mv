@@ -8,13 +8,16 @@ note Stores every tensor's (file_id, byte_offset_from_file_start, byte_len, dtyp
 note and resolves any tensor by canonical name (auto-handling model.* vs model.language_model.*).
 
 const ST_MAX_FILES ulong 256
-const ST_MAX_TENSORS ulong 8192
+const ST_MAX_TENSORS ulong 163840
+const ST_HASH_SZ ulong 524288
+const ST_HASH_MASK ulong 524287
 
 const DT_BF16 ulong 0
 const DT_F16 ulong 1
 const DT_F32 ulong 2
 const DT_F8_E4M3 ulong 3
 const DT_OTHER ulong 4
+const DT_I64 ulong 5
 
 global stFileNamePool uchar 16384
 global stFileNameOff ulong 256
@@ -23,20 +26,21 @@ global stFileDataOff ulong 256
 global stFileCount ulong 1
 global stLayoutMode ulong 1
 
-global stNamePool uchar 655360
+global stNamePool uchar 16777216
 global stNamePoolUsed ulong 1
-global stNameOff ulong 8192
-global stNameLen ulong 8192
-global stFileId ulong 8192
-global stByteOff ulong 8192
-global stByteLen ulong 8192
-global stDtype ulong 8192
-global stDim0 ulong 8192
-global stDim1 ulong 8192
+global stNameOff ulong 163840
+global stNameLen ulong 163840
+global stFileId ulong 163840
+global stByteOff ulong 163840
+global stByteLen ulong 163840
+global stDtype ulong 163840
+global stDim0 ulong 163840
+global stDim1 ulong 163840
 global stTensorCount ulong 1
+global stHashTab uint 524288
 
-global stHdrBuf uchar 262144
-global stIdxBuf uchar 2097152
+global stHdrBuf uchar 1048576
+global stIdxBuf uchar 262400
 global stIdxLen ulong 1
 global stPathBuf uchar 1024
 global stOpenFd int 1
@@ -221,6 +225,10 @@ put stDtype tid DT_F16
 else
 if and eq x0 70 eq x1 51
 put stDtype tid DT_F32
+else
+if and eq x0 73 eq x1 54
+put stDtype tid DT_I64
+end
 end
 end
 end
@@ -262,6 +270,33 @@ put stNamePool add used k get stHdrBuf add nStart k
 end
 end
 
+fn stHashHdr nStart ulong nLen ulong to ulong
+h = ulong 14695981039346656037
+for k ulong nLen bound 256
+h = mul xor h ulong get stHdrBuf add nStart k 1099511628211
+end
+ret and h ST_HASH_MASK
+end
+
+fn stHashView name view uchar * nlen ulong to ulong
+h = ulong 14695981039346656037
+for k ulong nlen bound 256
+h = mul xor h ulong get name k 1099511628211
+end
+ret and h ST_HASH_MASK
+end
+
+fn stHashInsert tid ulong slot0 ulong to void
+slot = slot0
+for probe ulong 1024
+if eq get stHashTab slot 0
+put stHashTab slot uint add tid 1
+ret
+end
+slot = and add slot 1 ST_HASH_MASK
+end
+end
+
 fn stRecordTensor fid ulong dataOff ulong nStart ulong nLen ulong oStart ulong oEnd ulong to void
 if and eq nLen 12 eq get stHdrBuf nStart 95
 ret
@@ -273,9 +308,20 @@ ret
 end
 end
 end
+if ge nLen 4
+if eq get stHdrBuf nStart 109
+if eq get stHdrBuf add nStart 1 116
+if eq get stHdrBuf add nStart 2 112
+if eq get stHdrBuf add nStart 3 46
+ret
+end
+end
+end
+end
+end
 tid = get stTensorCount 0
 used = get stNamePoolUsed 0
-if or ge tid ST_MAX_TENSORS ge add used nLen 655000
+if or ge tid ST_MAX_TENSORS ge add used nLen 16770000
 ret
 end
 stCopyName used nStart nLen
@@ -284,6 +330,7 @@ put stNameLen tid nLen
 put stNamePoolUsed 0 add used nLen
 put stFileId tid fid
 stParseTensorMeta tid oStart oEnd dataOff
+stHashInsert tid stHashHdr nStart nLen
 put stTensorCount 0 add tid 1
 end
 
@@ -317,13 +364,13 @@ hlen = ulong 0
 for i ulong 8
 hlen = or hlen shl ulong get hdr8 i mul i 8
 end
-if or eq hlen 0 gt hlen 262000
+if or eq hlen 0 gt hlen 1048000
 ret false
 end
 dataOff = add hlen 8
 put stFileDataOff fid dataOff
 tot = ulong 0
-while lt tot hlen bound 64
+while lt tot hlen bound 256
 got = pread fd stHdrBuf tot sub hlen tot long add 8 tot
 if le got 0
 ret false
@@ -331,7 +378,7 @@ end
 tot = add tot ulong got
 end
 p = ulong 0
-while lt p hlen bound 262144
+while lt p hlen bound 1048576
 if eq get stHdrBuf p 34
 nStart = add p 1
 p = add p 1
@@ -372,33 +419,19 @@ end
 ret true
 end
 
-fn stDiscoverFromIndex to bool
-plen = engJoinPath stSufIndex
-fd = int fopen engPathTmp 0 plen 0 0
-if lt fd int 0
-ret false
-end
-tot = ulong 0
-while lt tot 2097000 bound 256
-got = pread fd stIdxBuf tot sub 2097000 tot long tot
-if le got 0
-break
-end
-tot = add tot ulong got
-end
-c0 = fclose fd
-if eq tot 0
-ret false
-end
-put stIdxLen 0 tot
+fn stScanIdxChunk tot ulong to void
 p = ulong 0
-while lt p tot bound 2097152
+while lt p tot bound 262400
 if eq get stIdxBuf p 34
 s = add p 1
 p = add p 1
-while and lt p tot ne get stIdxBuf p 34 bound 256
+while lt p tot bound 256
+if eq get stIdxBuf p 34
+break
+end
 p = add p 1
 end
+if lt p tot
 ln = sub p s
 if and gt ln 12 lt ln 120
 if stIsStSuf p
@@ -406,8 +439,53 @@ stAddFromIdx s ln
 end
 end
 end
+end
 p = add p 1
 end
+end
+
+fn stFindLastNl tot ulong to ulong
+k = tot
+while gt k 0 bound 512
+k = sub k 1
+if eq get stIdxBuf k 10
+ret add k 1
+end
+end
+ret tot
+end
+
+fn stShiftCarry cut ulong tot ulong to ulong
+carry = sub tot cut
+for j ulong carry bound 512
+put stIdxBuf j get stIdxBuf add cut j
+end
+ret carry
+end
+
+fn stDiscoverFromIndex to bool
+plen = engJoinPath stSufIndex
+fd = int fopen engPathTmp 0 plen 0 0
+if lt fd int 0
+ret false
+end
+foff = ulong 0
+carry = ulong 0
+while true bound 512
+got = pread fd stIdxBuf carry sub 262144 carry long foff
+if le got 0
+break
+end
+tot = add carry ulong got
+cut = stFindLastNl tot
+stScanIdxChunk cut
+foff = add foff ulong got
+carry = stShiftCarry cut tot
+end
+if gt carry 0
+stScanIdxChunk carry
+end
+c0 = fclose fd
 ret gt get stFileCount 0 0
 end
 
@@ -477,6 +555,9 @@ put stTensorCount 0 0
 put stNamePoolUsed 0 0
 put stOpenFd 0 neg 1
 put stOpenFid 0 0
+for hi ulong ST_HASH_SZ
+put stHashTab hi 0
+end
 if not stDiscoverLayout
 ret false
 end
@@ -492,8 +573,13 @@ ret gt get stTensorCount 0 0
 end
 
 fn stFindExact name view uchar * nlen ulong to long
-tc = get stTensorCount 0
-for i ulong tc bound 8192
+slot = stHashView name nlen
+for probe ulong 1024
+ent = get stHashTab slot
+if eq ent 0
+ret neg 1
+end
+i = ulong sub ent 1
 if eq get stNameLen i nlen
 off = get stNameOff i
 same = true
@@ -507,6 +593,7 @@ if same
 ret long i
 end
 end
+slot = and add slot 1 ST_HASH_MASK
 end
 ret neg 1
 end
@@ -572,4 +659,46 @@ fn stFindLayer L ulong suf view uchar * to long
 tmp = new uchar 256 0
 n = stBuildLayerKey L suf tmp
 ret stFindCanon tmp n
+end
+
+text stExpMid "mlp.experts."
+text stPleMid "ple.ple_embedding.ngram_embedding.shard_"
+text stPleEnd ".weight"
+
+fn stAppU64 dst edit uchar 256 p0 ulong v ulong to ulong
+p = p0
+if ge v 100
+put dst p uchar add 48 div v 100
+p = add p 1
+end
+if ge v 10
+put dst p uchar add 48 rem div v 10 10
+p = add p 1
+end
+put dst p uchar add 48 rem v 10
+ret add p 1
+end
+
+fn stFindExpert L ulong E ulong suf view uchar * to long
+tmp = new uchar 256 0
+p = stBuildLayerKey L stExpMid tmp
+p = stAppU64 tmp p E
+put tmp p 46
+p = add p 1
+for i ulong len suf bound 64
+put tmp p get suf i
+p = add p 1
+end
+ret stFindCanon tmp p
+end
+
+fn stFindPleShard L ulong P ulong to long
+tmp = new uchar 256 0
+p = stBuildLayerKey L stPleMid tmp
+p = stAppU64 tmp p P
+for i ulong len stPleEnd bound 16
+put tmp p get stPleEnd i
+p = add p 1
+end
+ret stFindCanon tmp p
 end

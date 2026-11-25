@@ -1,0 +1,1320 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/runtime_qwen4.om: Pure Seeded-OM-2 Zero-CUDA Runtime for Qwen 3.8 Flash Next (qwen4_exp).
+note Implements:
+note   - 4-stream Gated Residual Hyper-Connections (attn_hyper_connection, mlp_hyper_connection, hyper_connection_mixer)
+note   - 51B N-gram Per-Layer Embedding (PLE) streamed sparsely from NVMe (16 rows x 160 B = 2.56 KB/tok, 0 GPU RAM)
+note   - 48-layer Hybrid GDN (sigmoid output gate) + Full Attention (24Q/2KV, hd=256, rope=64)
+note   - 512-expert Top-10 MoE (W4 block-32 quantized on GPU from FP8 block-128) + Gated Shared Expert
+note   - Single-submit pre-recorded GPFIFO execution of all 48 layers + hyper_connection_mixer + Two-Pass lm_head!
+
+note Qwen4Exp dedicated workspace slots inside engWork (28 MB .. 32 MB, disjoint from EW_PKT 4..24 MB)
+const EW_HC_X ulong 29360128
+const EW_HC_NORM ulong 29425664
+const EW_HC_DOWN ulong 29491200
+const EW_HC_UP ulong 29507584
+const EW_HC_INJ ulong 29573120
+const EW_MOE_LOG ulong 29577216
+const EW_MOE_IDS ulong 29593600
+const EW_MOE_W ulong 29597696
+const EW_MOE_MID ulong 29601792
+const EW_SH_OUT ulong 29667328
+const EW_SH_GATE ulong 29683712
+const EW_PLE_EMB ulong 29687808
+const EW_PLE_KEY ulong 29704192
+const EW_PLE_KN ulong 29769728
+const EW_PLE_QN ulong 29835264
+const EW_PLE_VAL ulong 29900800
+const EW_PLE_GV ulong 29917184
+const EW_PLE_GN ulong 29982720
+
+note Per-layer Hyper-Connection device pointers (48 layers, up to 128)
+global q4AHcNormVa ulong 128
+global q4AHcDnVa ulong 128
+global q4AHcUpVa ulong 128
+global q4AHcInjVa ulong 128
+global q4MHcNormVa ulong 128
+global q4MHcDnVa ulong 128
+global q4MHcUpVa ulong 128
+global q4MHcInjVa ulong 128
+
+note Final hyper_connection_mixer device pointers
+global q4FinHcNormVa ulong 1
+global q4FinHcDnVa ulong 1
+global q4FinHcUpVa ulong 1
+
+note Per-layer MoE device pointers (512 experts contiguous W4 + router + shared expert)
+global q4RouterWVa ulong 128
+global q4ShGateWVa ulong 128
+global q4ShUpWVa ulong 128
+global q4ShDnWVa ulong 128
+global q4ShGateSVa ulong 128
+global q4ExpGuWVa ulong 128
+global q4ExpGuSVa ulong 128
+global q4ExpDnWVa ulong 128
+global q4ExpDnSVa ulong 128
+
+note PLE layer state & NVMe shard table (0 GPU RAM for the 51B n-gram table!)
+global q4PleKeyProjVa ulong 1
+global q4PleValProjVa ulong 1
+global q4PleNormKeyVa ulong 1
+global q4PleNormQryVa ulong 1
+global q4PleNormConvVa ulong 1
+global q4PleConvWVa ulong 1
+global q4PleConvStateMap long 1
+global q4PleConvStateVa ulong 1
+global q4PleMult long 8
+global q4PleVsz long 32
+global q4PleOff long 32
+global q4PleWScale f32 1
+global q4PleShardFid ulong 256
+global q4PleShardOff ulong 256
+global q4PleShardStart ulong 257
+global q4PleHist long 2
+global q4PleSegPos ulong 1
+global q4Fp8CpuLut f32 256
+global q4PleRowBuf uchar 256
+global q4PleEmbBuf uchar 16384
+
+note Uncached host-coherent Full-APU Shm (128 KiB, GPU-uncached for NVLink-C2C coherency)
+const Q4_SHM_BYTES ulong 131072
+const Q4_SHM_XN ulong 0
+const Q4_SHM_PLE ulong 16384
+const Q4_SHM_TRACE ulong 32768
+global q4ApuShm long 1
+global q4ApuShmVa ulong 1
+global q4ApuReady ulong 1
+global q4LmVGpu ulong 1
+global q4ApuPids long 20
+global q4ApuGoFds int 20
+global q4ApuResFds int 20
+global q4ApuMsg uchar 32
+global q4ApuCpuX f32 4096
+global q4ApuCpuRow uchar 8192
+global q4ApuWStart ulong 20
+global q4ApuWCount ulong 20
+global q4ApuCpuBestVal f32 1
+global q4ApuCpuBestId ulong 1
+
+text q4NmAHcNorm "attn_hyper_connection.hc_norm.weight"
+text q4NmAHcDn "attn_hyper_connection.input_mix_weight_down.weight"
+text q4NmAHcUp "attn_hyper_connection.input_mix_weight_up.weight"
+text q4NmAHcInj "attn_hyper_connection.block_inject_weight.weight"
+text q4NmMHcNorm "mlp_hyper_connection.hc_norm.weight"
+text q4NmMHcDn "mlp_hyper_connection.input_mix_weight_down.weight"
+text q4NmMHcUp "mlp_hyper_connection.input_mix_weight_up.weight"
+text q4NmMHcInj "mlp_hyper_connection.block_inject_weight.weight"
+text q4NmFinHcNorm "hyper_connection_mixer.hc_norm.weight"
+text q4NmFinHcDn "hyper_connection_mixer.input_mix_weight_down.weight"
+text q4NmFinHcUp "hyper_connection_mixer.input_mix_weight_up.weight"
+text q4NmRouter "mlp.gate.weight"
+text q4NmShGate "mlp.shared_expert.gate_proj.weight"
+text q4NmShUp "mlp.shared_expert.up_proj.weight"
+text q4NmShDn "mlp.shared_expert.down_proj.weight"
+text q4NmShGateS "mlp.shared_expert_gate.weight"
+text q4NmExpGW "gate_proj.weight"
+text q4NmExpGS "gate_proj.weight_scale_inv"
+text q4NmExpUW "up_proj.weight"
+text q4NmExpUS "up_proj.weight_scale_inv"
+text q4NmExpDW "down_proj.weight"
+text q4NmExpDS "down_proj.weight_scale_inv"
+text q4NmPleKey "ple.key_proj.weight"
+text q4NmPleVal "ple.value_proj.weight"
+text q4NmPleNKey "ple.norm_key.weight"
+text q4NmPleNQry "ple.norm_query.weight"
+text q4NmPleNConv "ple.norm_conv.weight"
+text q4NmPleConv "ple.conv1d.weight"
+text q4NmPleMult "ple.ple_embedding.layer_multipliers"
+text q4NmPleVsz "ple.ple_embedding.ngram_heads_vocab_sizes"
+text q4NmPleOff "ple.ple_embedding.ngram_heads_offsets"
+text q4NmPleScale "ple.ple_embedding.ngram_embedding.weight_scale"
+text q4MsgProg "  [qwen4_exp] loaded layers="
+text q4MsgSlash "/"
+text q4MsgNl "\n"
+
+fn q4BuildCpuFp8Lut to void
+for i ulong 256
+s = and shr i 7 1
+e = and shr i 3 15
+mn = and i 7
+v = f32 0.0f32
+if eq e 15
+if eq mn 7
+v = f32 0.0f32
+else
+v = mul f32 256.0f32 add f32 1.0f32 div f32 mn f32 8.0f32
+end
+else
+if eq e 0
+v = mul f32 0.015625f32 div f32 mn f32 8.0f32
+else
+pw = f32 1.0f32
+if ge e 7
+for k ulong sub e 7 bound 16
+pw = mul pw f32 2.0f32
+end
+else
+for k ulong sub 7 e bound 16
+pw = mul pw f32 0.5f32
+end
+end
+v = mul pw add f32 1.0f32 div f32 mn f32 8.0f32
+end
+end
+if eq s 1
+v = neg v
+end
+put q4Fp8CpuLut i v
+end
+end
+
+fn q4LoadTensorBf16 tid long to ulong
+if lt tid 0
+ret 0
+end
+bytes = get stByteLen ulong tid
+va = engSlabAlloc bytes
+if eq va 0
+ret 0
+end
+if not engStreamTensorRaw ulong tid get engAllocMap 0 get engAllocOff 0
+ret 0
+end
+ret va
+end
+
+fn q4ReadU64Io base ulong to ulong
+v = ulong 0
+for b ulong 8
+v = or v shl ulong get engIoBuf add base b mul b 8
+end
+ret v
+end
+
+fn q4LoadI64Arr tid long which ulong cnt ulong to bool
+if lt tid 0
+ret false
+end
+fd = stOpenFile get stFileId ulong tid
+if lt fd int 0
+ret false
+end
+bytes = mul cnt 8
+if ne pread fd engIoBuf 0 bytes long get stByteOff ulong tid long bytes
+ret false
+end
+for i ulong cnt bound 32
+val = long q4ReadU64Io mul i 8
+if eq which 0
+put q4PleMult i val
+else
+if eq which 1
+put q4PleVsz i val
+else
+put q4PleOff i val
+end
+end
+end
+ret true
+end
+
+fn q4LoadPleScale tS long to bool
+fdS = stOpenFile get stFileId ulong tS
+if lt fdS int 0
+ret false
+end
+bS = get stByteLen ulong tS
+offS = long get stByteOff ulong tS
+if ne pread fdS engIoBuf 0 bS offS long bS
+ret false
+end
+if eq get stDtype ulong tS DT_BF16
+w = or shl uint get engIoBuf 1 24 shl uint get engIoBuf 0 16
+put q4PleWScale 0 bitcast f32 w
+else
+put q4PleWScale 0 bitcast f32 engGetU32Io 0
+end
+ret true
+end
+
+fn q4LoadPleShards L ulong to bool
+nSplits = get engSpec MS_PLE_SPLITS
+cum = ulong 0
+put q4PleShardStart 0 0
+for s ulong nSplits bound 256
+tSh = stFindPleShard L s
+if lt tSh 0
+ret false
+end
+put q4PleShardFid s get stFileId ulong tSh
+put q4PleShardOff s get stByteOff ulong tSh
+cum = add cum get stDim0 ulong tSh
+put q4PleShardStart add s 1 cum
+end
+ret true
+end
+
+fn q4LoadPleWeights L ulong to bool
+put q4PleKeyProjVa 0 q4LoadTensorBf16 stFindLayer L q4NmPleKey
+put q4PleValProjVa 0 q4LoadTensorBf16 stFindLayer L q4NmPleVal
+tNK = stFindLayer L q4NmPleNKey
+tNQ = stFindLayer L q4NmPleNQry
+tNC = stFindLayer L q4NmPleNConv
+tCv = stFindLayer L q4NmPleConv
+if or lt tNK 0 lt tNQ 0
+ret false
+end
+if or lt tNC 0 lt tCv 0
+ret false
+end
+put q4PleNormKeyVa 0 engLoadTensorF32 ulong tNK
+put q4PleNormQryVa 0 engLoadTensorF32 ulong tNQ
+put q4PleNormConvVa 0 engLoadTensorF32 ulong tNC
+put q4PleConvWVa 0 engLoadTensorF32 ulong tCv
+hcH = mul get engSpec MS_HC_COUNT get engSpec MS_H
+csBytes = mul div add mul hcH 36 65535 65536 65536
+csm = nvalloc csBytes true
+if le csm 0
+ret false
+end
+put q4PleConvStateMap 0 csm
+put q4PleConvStateVa 0 mapaddr csm
+if eq get q4PleKeyProjVa 0 0
+ret false
+end
+if eq get q4PleValProjVa 0 0
+ret false
+end
+ret ne get q4PleConvWVa 0 0
+end
+
+fn q4LoadPleMeta to bool
+pleL1 = get engSpec MS_PLE_LAYER
+if eq pleL1 0
+ret true
+end
+L = sub pleL1 1
+tM = stFindLayer L q4NmPleMult
+tV = stFindLayer L q4NmPleVsz
+tO = stFindLayer L q4NmPleOff
+tS = stFindLayer L q4NmPleScale
+if or lt tM 0 lt tV 0
+ret false
+end
+if or lt tO 0 lt tS 0
+ret false
+end
+nNgram = get engSpec MS_PLE_NGRAM
+nHeads = mul sub nNgram 1 get engSpec MS_PLE_HPN
+if not q4LoadI64Arr tM 0 nNgram
+ret false
+end
+if not q4LoadI64Arr tV 1 nHeads
+ret false
+end
+if not q4LoadI64Arr tO 2 nHeads
+ret false
+end
+if not q4LoadPleScale tS
+ret false
+end
+if not q4LoadPleShards L
+ret false
+end
+ret q4LoadPleWeights L
+end
+
+fn q4StreamScaleToScratch tidS long dstOff ulong to bool
+if lt tidS 0
+ret false
+end
+dt = get stDtype ulong tidS
+bytes = get stByteLen ulong tidS
+if eq dt DT_F32
+ret engStreamTensorRaw ulong tidS get engScratch 0 dstOff
+end
+fd = stOpenFile get stFileId ulong tidS
+if lt fd int 0
+ret false
+end
+ret engStreamWidenToMap fd get stByteOff ulong tidS bytes get engScratch 0 dstOff
+end
+
+fn q4StageExpMat L ulong E ulong which ulong wOff ulong sOff ulong to bool
+tW = neg long 1
+tS = neg long 1
+if eq which 0
+tW = stFindExpert L E q4NmExpGW
+tS = stFindExpert L E q4NmExpGS
+else
+if eq which 1
+tW = stFindExpert L E q4NmExpUW
+tS = stFindExpert L E q4NmExpUS
+else
+tW = stFindExpert L E q4NmExpDW
+tS = stFindExpert L E q4NmExpDS
+end
+end
+if or lt tW 0 lt tS 0
+ret false
+end
+if not engStreamTensorRaw ulong tW get engScratch 0 wOff
+ret false
+end
+ret q4StreamScaleToScratch tS sOff
+end
+
+fn q4EmitQuantOne wOff ulong sOff ulong dstW ulong dstS ulong K ulong N ulong to bool
+scVa = get engScratchVa 0
+engPtr add scVa wOff
+engPtr add scVa sOff
+engPtr mapaddr get engLut 0
+engPtr dstW
+engPtr dstS
+engArg uint K
+engArg uint N
+ret engPktEmitGy 11 uint div add N 3 4 1 128
+end
+
+fn q4LoadOneExpert L ulong E ulong to bool
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+if not q4StageExpMat L E 0 0 12582912
+ret false
+end
+if not q4StageExpMat L E 1 4194304 12648448
+ret false
+end
+if not q4StageExpMat L E 2 8388608 12713984
+ret false
+end
+gWVa = add get q4ExpGuWVa L mul E mul moeI H
+gSVa = add get q4ExpGuSVa L mul E mul mul 2 moeI div H 16
+dWVa = add get q4ExpDnWVa L mul E div mul H moeI 2
+dSVa = add get q4ExpDnSVa L mul E mul H div moeI 16
+engPktStart
+if not q4EmitQuantOne 0 12582912 gWVa gSVa H moeI
+ret false
+end
+if not q4EmitQuantOne 4194304 12648448 add gWVa div mul moeI H 2 add gSVa mul moeI div H 16 H moeI
+ret false
+end
+if not q4EmitQuantOne 8388608 12713984 dWVa dSVa moeI H
+ret false
+end
+ret engPktRun
+end
+
+fn q4LoadLayerHc L ulong to bool
+tAN = stFindLayer L q4NmAHcNorm
+tMN = stFindLayer L q4NmMHcNorm
+if or lt tAN 0 lt tMN 0
+ret false
+end
+put q4AHcNormVa L engLoadTensorF32 ulong tAN
+put q4AHcDnVa L q4LoadTensorBf16 stFindLayer L q4NmAHcDn
+put q4AHcUpVa L q4LoadTensorBf16 stFindLayer L q4NmAHcUp
+put q4AHcInjVa L q4LoadTensorBf16 stFindLayer L q4NmAHcInj
+put q4MHcNormVa L engLoadTensorF32 ulong tMN
+put q4MHcDnVa L q4LoadTensorBf16 stFindLayer L q4NmMHcDn
+put q4MHcUpVa L q4LoadTensorBf16 stFindLayer L q4NmMHcUp
+put q4MHcInjVa L q4LoadTensorBf16 stFindLayer L q4NmMHcInj
+ret and ne get q4AHcInjVa L 0 ne get q4MHcInjVa L 0
+end
+
+fn q4LoadLayerMoe L ulong to bool
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+nE = get engSpec MS_NEXP
+put q4RouterWVa L q4LoadTensorBf16 stFindLayer L q4NmRouter
+put q4ShGateWVa L q4LoadTensorBf16 stFindLayer L q4NmShGate
+put q4ShUpWVa L q4LoadTensorBf16 stFindLayer L q4NmShUp
+put q4ShDnWVa L q4LoadTensorBf16 stFindLayer L q4NmShDn
+put q4ShGateSVa L q4LoadTensorBf16 stFindLayer L q4NmShGateS
+if or eq get q4RouterWVa L 0 eq get q4ShGateSVa L 0
+ret false
+end
+guExpW = mul moeI H
+guExpS = mul mul 2 moeI div H 16
+dnExpW = div mul H moeI 2
+dnExpS = mul H div moeI 16
+guWBase = engSlabAlloc mul nE guExpW
+guSBase = engSlabAlloc mul nE guExpS
+dnWBase = engSlabAlloc mul nE dnExpW
+dnSBase = engSlabAlloc mul nE dnExpS
+if or eq guWBase 0 eq guSBase 0
+ret false
+end
+if or eq dnWBase 0 eq dnSBase 0
+ret false
+end
+put q4ExpGuWVa L guWBase
+put q4ExpGuSVa L guSBase
+put q4ExpDnWVa L dnWBase
+put q4ExpDnSVa L dnSBase
+for E ulong nE bound 1024
+if not q4LoadOneExpert L E
+ret false
+end
+end
+ret true
+end
+
+fn q4EmitBf16Gemv wVa ulong xVa ulong outVa ulong K ulong N ulong to bool
+engPtr wVa
+engPtr xVa
+engPtr outVa
+engArg uint K
+engArg uint N
+if eq rem K 256 0
+ret engPktEmitGy 4 uint div add N 7 8 1 256
+end
+ret engPktEmitGy 16 uint div add N 7 8 1 256
+end
+
+fn q4EmitHcPrep normVa ulong dnVa ulong upVa ulong injVa ulong doInj bool to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+lr = get engSpec MS_HC_LOWRANK
+engPtr engW EW_HC_X
+engPtr normVa
+engPtr engW EW_HC_NORM
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+if not q4EmitBf16Gemv dnVa engW EW_HC_NORM engW EW_HC_DOWN hcH lr
+ret false
+end
+engPtr engW EW_HC_DOWN
+engArg uint lr
+if not engPktEmitGy 18 uint div add lr 255 256 1 256
+ret false
+end
+if not q4EmitBf16Gemv upVa engW EW_HC_DOWN engW EW_HC_UP lr hcH
+ret false
+end
+engPtr engW EW_HC_UP
+engPtr engW EW_HC_NORM
+engPtr engW EW_XN
+if not engPktEmitGy 19 uint div H 256 1 256
+ret false
+end
+if doInj
+ret q4EmitBf16Gemv injVa engW EW_HC_NORM engW EW_HC_INJ hcH hc
+end
+ret true
+end
+
+fn q4EmitHcInject to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+engPtr engW EW_HC_X
+engPtr engW EW_AOUT
+engPtr engW EW_HC_INJ
+ret engPktEmitGy 20 uint div H 256 uint hc 256
+end
+
+fn q4EmitPleLayer to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+pleVa = add get q4ApuShmVa 0 Q4_SHM_PLE
+if not q4EmitBf16Gemv get q4PleKeyProjVa 0 pleVa engW EW_PLE_KEY H hcH
+ret false
+end
+if not q4EmitBf16Gemv get q4PleValProjVa 0 pleVa engW EW_PLE_VAL H H
+ret false
+end
+engPtr engW EW_PLE_KEY
+engPtr get q4PleNormKeyVa 0
+engPtr engW EW_PLE_KN
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+engPtr engW EW_HC_X
+engPtr get q4PleNormQryVa 0
+engPtr engW EW_PLE_QN
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+engPtr engW EW_PLE_KN
+engPtr engW EW_PLE_QN
+engPtr engW EW_PLE_VAL
+engPtr engW EW_PLE_GV
+if not engPktEmitGy 24 uint hc 1 256
+ret false
+end
+engPtr engW EW_PLE_GV
+engPtr get q4PleNormConvVa 0
+engPtr engW EW_PLE_GN
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+engPtr engW EW_PLE_GV
+engPtr engW EW_PLE_GN
+engPtr get q4PleConvWVa 0
+engPtr get q4PleConvStateVa 0
+engPtr engW EW_HC_X
+ret engPktEmitGy 25 uint div hcH 256 1 256
+end
+
+fn q4EmitMoeLayer L ulong to bool
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+shI = get engSpec MS_SH_I
+nE = get engSpec MS_NEXP
+topK = get engSpec MS_TOPK
+idsVa = add add get q4ApuShmVa 0 Q4_SHM_TRACE mul mul L topK 4
+if not q4EmitBf16Gemv get q4RouterWVa L engW EW_XN engW EW_MOE_LOG H nE
+ret false
+end
+engPtr engW EW_MOE_LOG
+engPtr idsVa
+engPtr engW EW_MOE_W
+if not engPktEmitGy 21 1 1 32
+ret false
+end
+if not q4EmitBf16Gemv get q4ShGateWVa L engW EW_XN engW EW_GU H shI
+ret false
+end
+if not q4EmitBf16Gemv get q4ShUpWVa L engW EW_XN add engW EW_GU mul shI 4 H shI
+ret false
+end
+engPtr engW EW_GU
+engPtr engW EW_SW
+engArg uint shI
+if not engPktEmitGy 2 uint div add shI 255 256 1 256
+ret false
+end
+if not q4EmitBf16Gemv get q4ShDnWVa L engW EW_SW engW EW_SH_OUT shI H
+ret false
+end
+if not q4EmitBf16Gemv get q4ShGateSVa L engW EW_XN engW EW_SH_GATE H 1
+ret false
+end
+engPtr engW EW_XN
+engPtr get q4ExpGuWVa L
+engPtr get q4ExpGuSVa L
+engPtr idsVa
+engPtr engW EW_MOE_MID
+if not engPktEmitGy 22 uint div add moeI 7 8 uint topK 256
+ret false
+end
+engPtr engW EW_MOE_MID
+engPtr get q4ExpDnWVa L
+engPtr get q4ExpDnSVa L
+engPtr idsVa
+engPtr engW EW_MOE_W
+engPtr engW EW_SH_OUT
+engPtr engW EW_SH_GATE
+engPtr engW EW_AOUT
+ret engPktEmitGy 23 uint div add H 7 8 1 256
+end
+
+text q4MsgApu "  [qwen4_exp] Full-APU online: 20 ARMv9 CPU cores (10x X925 + 10x A725) + 48 Blackwell SMs = 6,164 cores!\n"
+
+fn q4ApuPinCore cpu ulong to void
+m = new uchar 8 0
+put m div cpu 8 uchar shl ulong 1 rem cpu 8
+r = cpuset 0 m 0 8
+end
+
+fn q4ApuGetI32 b view uchar * off ulong to int
+b0 = uint get b off
+b1 = shl uint get b add off 1 8
+b2 = shl uint get b add off 2 16
+b3 = shl uint get b add off 3 24
+ret int or or b0 b1 or b2 b3
+end
+
+fn q4ApuPut64 off ulong v ulong to void
+for i ulong 8
+put q4ApuMsg add off i uchar and shr v mul i 8 255
+end
+end
+
+fn q4ApuGet64 off ulong to ulong
+v = ulong 0
+for i ulong 8
+v = or v shl ulong get q4ApuMsg add off i mul i 8
+end
+ret v
+end
+
+fn q4ApuSend fd int cmd ulong a ulong b ulong c ulong to void
+q4ApuPut64 0 cmd
+q4ApuPut64 8 a
+q4ApuPut64 16 b
+q4ApuPut64 24 c
+w = write fd q4ApuMsg 0 32
+end
+
+fn q4ApuWritePair fd int a ulong b ulong to void
+q4ApuPut64 0 a
+q4ApuPut64 8 b
+w = write fd q4ApuMsg 0 16
+end
+
+fn q4ApuReadPair fd int to void
+r = read fd q4ApuMsg 0 16
+end
+
+fn q4ApuDequantHead hDim ulong wsc f32 to void
+for d ulong hDim bound 256
+v = mul get q4Fp8CpuLut ulong get q4PleRowBuf d wsc
+w = bitcast uint v
+p = mul d 4
+put q4PleEmbBuf p uchar and w 255
+put q4PleEmbBuf add p 1 uchar and shr w 8 255
+put q4PleEmbBuf add p 2 uchar and shr w 16 255
+put q4PleEmbBuf add p 3 uchar and shr w 24 255
+end
+end
+
+fn q4ApuWorkerPle h ulong shIdx ulong locRow ulong to void
+hpn = get engSpec MS_PLE_HPN
+hDim = div get engSpec MS_PLE_DIM mul 2 hpn
+fd = stOpenFile get q4PleShardFid shIdx
+if lt fd int 0
+ret
+end
+off = add get q4PleShardOff shIdx mul locRow hDim
+if ne pread fd q4PleRowBuf 0 hDim long off long hDim
+ret
+end
+q4ApuDequantHead hDim get q4PleWScale 0
+hb = mul hDim 4
+r = mapwrite get q4ApuShm 0 add Q4_SHM_PLE mul h hb q4PleEmbBuf 0 hb
+end
+
+fn q4ApuDotRow H ulong to f32
+acc = f32 0.0f32
+for d ulong H bound 4096
+p = mul d 2
+w = or shl uint get q4ApuCpuRow add p 1 24 shl uint get q4ApuCpuRow p 16
+acc = add acc mul bitcast f32 w get q4ApuCpuX d
+end
+ret acc
+end
+
+fn q4ApuLoadX H ulong to void
+hBytes = mul H 4
+r0 = mapread get q4ApuShm 0 Q4_SHM_XN q4PleEmbBuf 0 hBytes
+for d ulong H bound 4096
+p = mul d 4
+b0 = uint get q4PleEmbBuf p
+b1 = shl uint get q4PleEmbBuf add p 1 8
+b2 = shl uint get q4PleEmbBuf add p 2 16
+b3 = shl uint get q4PleEmbBuf add p 3 24
+put q4ApuCpuX d bitcast f32 or or b0 b1 or b2 b3
+end
+end
+
+fn q4ApuWorkerLm rStart ulong rCnt ulong resFd int to void
+H = get engSpec MS_H
+q4ApuLoadX H
+bestV = f32 -1000000000.0f32
+bestId = rStart
+rowBytes = mul H 2
+for i ulong rCnt bound 8192
+rid = add rStart i
+r1 = mapread get engLmBf16 0 mul rid rowBytes q4ApuCpuRow 0 rowBytes
+v = q4ApuDotRow H
+if gt v bestV
+bestV = v
+bestId = rid
+end
+end
+q4ApuWritePair resFd ulong bitcast uint bestV bestId
+end
+
+fn q4ApuWorkerLoop w ulong goFd int resFd int to void
+q4ApuPinCore w
+q4ApuWritePair resFd add w 1 0
+for round ulong 1000000
+r = read goFd q4ApuMsg 0 32
+if le r 0
+exit 0
+end
+cmd = q4ApuGet64 0
+if eq cmd 0
+exit 0
+end
+a = q4ApuGet64 8
+b = q4ApuGet64 16
+c = q4ApuGet64 24
+if eq cmd 1
+q4ApuWorkerPle a b c
+q4ApuWritePair resFd 1 0
+else
+q4ApuWorkerLm a b resFd
+end
+end
+exit 0
+end
+
+fn q4ApuInitRanges to void
+V = get engSpec MS_VOCAB
+vGpu = ulong 221184
+if le V vGpu
+vGpu = V
+end
+put q4LmVGpu 0 vGpu
+vCpu = sub V vGpu
+unit = div vCpu 30
+cur = vGpu
+for w ulong 20
+wt = ulong 2
+if lt rem w 10 5
+wt = ulong 1
+end
+cnt = mul unit wt
+if eq w 19
+cnt = sub V cur
+end
+put q4ApuWStart w cur
+put q4ApuWCount w cnt
+cur = add cur cnt
+end
+end
+
+fn q4ApuSpawnOne w ulong to void
+pGo = new uchar 8 0
+pRes = new uchar 8 0
+r1 = pipefds pGo 0 8 0
+r2 = pipefds pRes 0 8 0
+goRd = q4ApuGetI32 pGo 0
+goWr = q4ApuGetI32 pGo 4
+resRd = q4ApuGetI32 pRes 0
+resWr = q4ApuGetI32 pRes 4
+pid = fork
+if eq pid 0
+c1 = fclose goWr
+c2 = fclose resRd
+q4ApuWorkerLoop w goRd resWr
+end
+c3 = fclose goRd
+c4 = fclose resWr
+put q4ApuPids w pid
+put q4ApuGoFds w goWr
+put q4ApuResFds w resRd
+end
+
+fn q4ApuInit to bool
+q4ApuInitRanges
+for w ulong 20
+q4ApuSpawnOne w
+end
+for w ulong 20
+q4ApuReadPair get q4ApuResFds w
+end
+put q4ApuReady 0 1
+engPrint q4MsgApu
+ret true
+end
+
+fn q4ApuStop to void
+if eq get q4ApuReady 0 0
+ret
+end
+st = new uchar 4 0
+for w ulong 20
+q4ApuSend get q4ApuGoFds w 0 0 0 0
+c1 = fclose get q4ApuGoFds w
+c2 = fclose get q4ApuResFds w
+wp = waitpid int get q4ApuPids w st 0 4 0
+end
+put q4ApuReady 0 0
+end
+
+fn q4KickPre slot ulong to bool
+r0 = mapset get gbmem 2 8192 4 0
+r1 = mapset get gbmem 3 0 4 0
+r2 = mapset get gbmem 3 16 4 0
+off = get engSlotOff slot
+ln = get engSlotLen slot
+ret nvsend get engWork 0 off uint div ln 4
+end
+
+fn q4WaitPre to bool
+if not engWaitFast 30000000000
+ret false
+end
+ret eq mapget get gbmem 3 0 4 1145324612
+end
+
+fn q4FillNegInfIo to void
+negInf = bitcast uint f32 -1000000000.0f32
+for i ulong 16384
+engPutU32Io mul i 4 negInf
+end
+end
+
+fn q4ZeroTailLogits to void
+pos = get q4LmVGpu 0
+V = get engSpec MS_VOCAB
+if ge pos V
+ret
+end
+q4FillNegInfIo
+while lt pos V bound 32
+cnt = sub V pos
+if gt cnt 16384
+cnt = ulong 16384
+end
+off = add EW_LOGW4 mul pos 4
+nb = mul cnt 4
+r = mapwrite get engWork 0 off engIoBuf 0 nb
+pos = add pos cnt
+end
+end
+
+fn q4EmitOneLayer L ulong faIdx ulong gdnIdx ulong to bool
+pleL1 = get engSpec MS_PLE_LAYER
+if and gt pleL1 0 eq add L 1 pleL1
+if not q4EmitPleLayer
+ret false
+end
+end
+if not q4EmitHcPrep get q4AHcNormVa L get q4AHcDnVa L get q4AHcUpVa L get q4AHcInjVa L true
+ret false
+end
+if eq get engLayerKind L 0
+if not engEmitFaLayer L faIdx
+ret false
+end
+else
+if not engEmitGdnLayer L gdnIdx
+ret false
+end
+end
+if not q4EmitHcInject
+ret false
+end
+if not q4EmitHcPrep get q4MHcNormVa L get q4MHcDnVa L get q4MHcUpVa L get q4MHcInjVa L true
+ret false
+end
+if not q4EmitMoeLayer L
+ret false
+end
+ret q4EmitHcInject
+end
+
+fn q4EmitLayersFrom startL ulong to bool
+nL = get engSpec MS_LAYERS
+gdnIdx = ulong 0
+faIdx = ulong 0
+for L ulong nL bound 128
+if ge L startL
+if not q4EmitOneLayer L faIdx gdnIdx
+ret false
+end
+end
+if eq get engLayerKind L 0
+faIdx = add faIdx 1
+else
+gdnIdx = add gdnIdx 1
+end
+end
+ret true
+end
+
+fn q4EmitFinalMixToShm to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+lr = get engSpec MS_HC_LOWRANK
+engPtr engW EW_HC_X
+engPtr get q4FinHcNormVa 0
+engPtr engW EW_HC_NORM
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+if not q4EmitBf16Gemv get q4FinHcDnVa 0 engW EW_HC_NORM engW EW_HC_DOWN hcH lr
+ret false
+end
+engPtr engW EW_HC_DOWN
+engArg uint lr
+if not engPktEmitGy 18 uint div add lr 255 256 1 256
+ret false
+end
+if not q4EmitBf16Gemv get q4FinHcUpVa 0 engW EW_HC_DOWN engW EW_HC_UP lr hcH
+ret false
+end
+engPtr engW EW_HC_UP
+engPtr engW EW_HC_NORM
+engPtr add get q4ApuShmVa 0 Q4_SHM_XN
+ret engPktEmitGy 19 uint div H 256 1 256
+end
+
+fn q4EmitLmHeadGpu to bool
+H = get engSpec MS_H
+vGpu = get q4LmVGpu 0
+xnVa = add get q4ApuShmVa 0 Q4_SHM_XN
+if not engEmitW4Gemv xnVa get engLmW4Va 0 add get engLmW4Va 0 get engLmW4SOff 0 engW EW_LOGW4 H vGpu
+ret false
+end
+engPtr engW EW_LOGW4
+engPtr engW EW_CIDS
+if not engPktEmitGy 12 64 1 256
+ret false
+end
+engPtr mapaddr get engLmBf16 0
+engPtr xnVa
+engPtr engW EW_CIDS
+engPtr engW EW_CLOG
+engArg 128
+ret engPktEmitGy 5 128 1 32
+end
+
+fn q4RecordPackets to bool
+note Slot 0: Layer 0 only (runs on 48 Blackwell SMs WHILE 16 CPU cores read 51B PLE in parallel!)
+engPktStartAt EW_PKT
+if not q4EmitOneLayer 0 0 0
+ret false
+end
+if not engPktFinish 0
+ret false
+end
+note Slot 1: Layers 1..47 + hyper_connection_mixer -> uncached q4ApuShm[Q4_SHM_XN]
+engPktStartAt add EW_PKT 4194304
+if not q4EmitLayersFrom 1
+ret false
+end
+if not q4EmitFinalMixToShm
+ret false
+end
+if not engPktFinish 1
+ret false
+end
+note Slot 2: GPU lm_head slice (0..vGpu-1) while 20 CPU cores run vGpu..V-1 in parallel!
+engPktStartAt add EW_PKT 8388608
+if not q4EmitLmHeadGpu
+ret false
+end
+if not engPktFinish 2
+ret false
+end
+note Slot 3: Layers 1..47 only (non-final prefill tokens, no lm_head)
+engPktStartAt add EW_PKT 12582912
+if not q4EmitLayersFrom 1
+ret false
+end
+ret engPktFinish 3
+end
+
+fn q4LoadTopTensors to bool
+tEmb = stFindCanon tNmEmb len tNmEmb
+tLm = stFindCanon tNmLm len tNmLm
+if or lt tEmb 0 lt tLm 0
+ret false
+end
+if not engStreamTensorRaw ulong tEmb get engEmbBf16 0 0
+ret false
+end
+if not engStreamTensorRaw ulong tLm get engLmBf16 0 0
+ret false
+end
+tFN = stFindCanon q4NmFinHcNorm len q4NmFinHcNorm
+tFD = stFindCanon q4NmFinHcDn len q4NmFinHcDn
+tFU = stFindCanon q4NmFinHcUp len q4NmFinHcUp
+if or lt tFN 0 lt tFD 0
+ret false
+end
+if lt tFU 0
+ret false
+end
+put q4FinHcNormVa 0 engLoadTensorF32 ulong tFN
+put q4FinHcDnVa 0 q4LoadTensorBf16 tFD
+put q4FinHcUpVa 0 q4LoadTensorBf16 tFU
+if eq get q4FinHcNormVa 0 0
+ret false
+end
+if eq get q4FinHcDnVa 0 0
+ret false
+end
+ret ne get q4FinHcUpVa 0 0
+end
+
+fn q4QuantLmHead to bool
+H = get engSpec MS_H
+V = get engSpec MS_VOCAB
+engPktStart
+engPtr mapaddr get engLmBf16 0
+engPtr get engLmW4Va 0
+engPtr add get engLmW4Va 0 get engLmW4SOff 0
+engArg uint H
+engArg uint V
+if not engPktEmitGy 3 uint div add V 7 8 1 256
+ret false
+end
+ret engPktRun
+end
+
+fn q4LoadAll to int
+q4BuildCpuFp8Lut
+q4ArbResetAll
+shm = nvalloc Q4_SHM_BYTES false
+if le shm 0
+ret 12
+end
+put q4ApuShm 0 shm
+put q4ApuShmVa 0 mapaddr shm
+if not engUploadRope
+ret 13
+end
+if not q4LoadTopTensors
+ret 14
+end
+if not q4QuantLmHead
+ret 14
+end
+if not q4LoadPleMeta
+ret 17
+end
+note Fork 20-core Full-APU pool BEFORE allocating 73 GiB of 48-layer UVM slabs (zero page-table bloat!)
+stCloseCached
+if not q4ApuInit
+ret 18
+end
+q4ZeroTailLogits
+nL = get engSpec MS_LAYERS
+for L ulong nL bound 128
+if not q4LoadLayerHc L
+stCloseCached
+ret 15
+end
+if eq get engLayerKind L 0
+if not engLoadFaLayer L
+stCloseCached
+ret 15
+end
+else
+if not engLoadGdnLayer L
+stCloseCached
+ret 15
+end
+end
+if not q4LoadLayerMoe L
+stCloseCached
+ret 15
+end
+if eq rem add L 1 8 0
+engPrint q4MsgProg
+engPrintU add L 1
+engPrint q4MsgSlash
+engPrintU nL
+engPrint q4MsgNl
+end
+end
+stCloseCached
+if not q4RecordPackets
+ret 16
+end
+ret 0
+end
+
+fn q4ResetState to void
+engResetState
+eos = long get engSpec MS_EOS_ID
+put q4PleHist 0 eos
+put q4PleHist 1 eos
+put q4PleSegPos 0 0
+if gt get engSpec MS_PLE_LAYER 0
+for i ulong 65536
+put engIoBuf i 0
+end
+hcH = mul get engSpec MS_HC_COUNT get engSpec MS_H
+engZeroMap get q4PleConvStateMap 0 div add mul hcH 36 65535 65536
+end
+end
+
+fn q4LoadEmbedHc tid ulong to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+b = mul H 2
+if ne mapread get engEmbBf16 0 mul tid b engIoBuf 0 b long b
+ret false
+end
+engWidenBuf H
+hBytes = mul H 4
+for c ulong hc bound 8
+if ne mapwrite get engWork 0 add EW_HC_X mul c hBytes engWideBuf 0 hBytes long hBytes
+ret false
+end
+end
+ret true
+end
+
+fn q4FindPleShardIdx row ulong to ulong
+lo = ulong 0
+hi = get engSpec MS_PLE_SPLITS
+while lt add lo 1 hi bound 16
+mid = div add lo hi 2
+if le get q4PleShardStart mid row
+lo = mid
+else
+hi = mid
+end
+end
+ret lo
+end
+
+fn q4DequantPleHead h ulong hDim ulong wsc f32 to void
+dstBase = mul mul h hDim 4
+for d ulong hDim bound 256
+v = mul get q4Fp8CpuLut ulong get q4PleRowBuf d wsc
+w = bitcast uint v
+p = add dstBase mul d 4
+put q4PleEmbBuf p uchar and w 255
+put q4PleEmbBuf add p 1 uchar and shr w 8 255
+put q4PleEmbBuf add p 2 uchar and shr w 16 255
+put q4PleEmbBuf add p 3 uchar and shr w 24 255
+end
+end
+
+fn q4SendOnePleHead h ulong mx long to void
+vsz = get q4PleVsz h
+r = rem mx vsz
+if lt r 0
+r = add r vsz
+end
+row = ulong add r get q4PleOff h
+shIdx = q4FindPleShardIdx row
+locRow = sub row get q4PleShardStart shIdx
+q4ApuSend get q4ApuGoFds h 1 h shIdx locRow
+end
+
+fn q4DispatchPleApu tok ulong to bool
+if eq get engSpec MS_PLE_LAYER 0
+ret true
+end
+eos = long get engSpec MS_EOS_ID
+s0 = long tok
+seg = get q4PleSegPos 0
+s1 = eos
+s2 = eos
+if ge seg 1
+s1 = get q4PleHist 1
+end
+if ge seg 2
+s2 = get q4PleHist 0
+end
+put q4PleHist 0 get q4PleHist 1
+put q4PleHist 1 s0
+if eq s0 eos
+put q4PleSegPos 0 0
+else
+put q4PleSegPos 0 add seg 1
+end
+mix2 = xor mul s0 get q4PleMult 0 mul s1 get q4PleMult 1
+mix3 = xor mix2 mul s2 get q4PleMult 2
+hpn = get engSpec MS_PLE_HPN
+nHeads = mul 2 hpn
+for h ulong nHeads bound 20
+if lt h hpn
+q4SendOnePleHead h mix2
+else
+q4SendOnePleHead h mix3
+end
+end
+for h ulong nHeads bound 20
+q4ApuReadPair get q4ApuResFds h
+end
+ret true
+end
+
+fn q4RunLmHeadApu to ulong
+note Kick GPU lm_head (0..vGpu-1) on 48 Blackwell SMs WHILE 20 ARMv9 CPU cores run vGpu..V-1
+note AND Live Arboris updates its 48L x 512E co-activation graph asynchronously (0 critical-path latency)!
+if not q4KickPre 2
+ret 999999
+end
+for w ulong 20
+q4ApuSend get q4ApuGoFds w 2 get q4ApuWStart w get q4ApuWCount w 0
+end
+q4ArbProcessTrace get q4ApuShm 0 Q4_SHM_TRACE
+bestCpuV = f32 -1000000000.0f32
+bestCpuId = ulong 0
+for w ulong 20
+q4ApuReadPair get q4ApuResFds w
+v = bitcast f32 uint q4ApuGet64 0
+id = q4ApuGet64 8
+if gt v bestCpuV
+bestCpuV = v
+bestCpuId = id
+end
+end
+if not q4WaitPre
+ret 999999
+end
+if ne mapread get engWork 0 EW_CIDS engIoBuf 0 512 512
+ret 999999
+end
+for i ulong 128
+put engCandIds i engGetU32Io mul i 4
+end
+if ne mapread get engWork 0 EW_CLOG engIoBuf 0 512 512
+ret 999999
+end
+bestV = bestCpuV
+bestTok = bestCpuId
+for i ulong 128
+v = bitcast f32 engGetU32Io mul i 4
+if gt v bestV
+bestV = v
+bestTok = ulong get engCandIds i
+end
+end
+ret bestTok
+end
+
+fn q4StepToken tok ulong pos ulong needLogits bool to ulong
+if not q4LoadEmbedHc tok
+ret 999999
+end
+if not engSetPos pos
+ret 999999
+end
+note Full-APU Stage 1: Kick Layer 0 on 48 SMs WHILE 16 CPU cores read & dequant 51B PLE in parallel!
+if not q4KickPre 0
+ret 999999
+end
+if not q4DispatchPleApu tok
+ret 999999
+end
+if not q4WaitPre
+ret 999999
+end
+if not needLogits
+if not engReplayPre 3
+ret 999999
+end
+q4ArbProcessTrace get q4ApuShm 0 Q4_SHM_TRACE
+ret 0
+end
+note Full-APU Stage 2: Layers 1..47 + hyper_connection_mixer -> uncached q4ApuShm
+if not engReplayPre 1
+ret 999999
+end
+note Full-APU Stage 3: 248,320-vocab lm_head split across 48 SMs + 20 CPU cores simultaneously!
+ret q4RunLmHeadApu
+end
+
+fn q4PrefillSeq ntok ulong to ulong
+q4ResetState
+tok = ulong 0
+for i ulong ntok bound 2048
+t = ulong get engTokSeq i
+tok = q4StepToken t i eq add i 1 ntok
+if eq tok 999999
+ret 999999
+end
+end
+put engCurPos 0 ntok
+ret tok
+end
+
+fn q4DecodeStep tok ulong pos ulong to ulong
+ret q4StepToken tok pos true
+end
