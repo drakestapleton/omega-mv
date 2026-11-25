@@ -1,0 +1,827 @@
+note SPDX-License-Identifier: AGPL-3.0-only
+note om/gpu/engine/runtime_qwen4_b8.om: Pure Seeded-OM-2 Zero-CUDA Batched B=8 Multi-Stream Runtime
+note for Qwen 3.8 Flash Next (qwen4_exp).
+note   - Partitions the existing 128K KV cache into 8 streams x 16,384 tokens (0 extra KV RAM)
+note   - Allocates 8 independent GDN states + PLE conv states + 32 MiB batched activation slab
+note   - Executes ALL dense W4 & BF16 projections + lm_head in 1 launch across all 8 streams
+note     (uW4GemmB8 kid 30 + uBf16GemmB8 kid 31 -> 8x weight reuse & 8x launch amortization!)
+note   - Keeps Full-APU (20 ARMv9 CPU cores + 48 Blackwell SMs) + Live Arboris ON by default!
+
+const Q4_B8 ulong 8
+const Q4_B8_WORK_BYTES ulong 33554432
+const Q4_B8_SHM_BYTES ulong 524288
+
+note Offsets inside q4B8Work (32 MiB)
+const B8_HC_X ulong 0
+const B8_HC_NORM ulong 524288
+const B8_HC_DOWN ulong 1048576
+const B8_HC_UP ulong 1114112
+const B8_HC_INJ ulong 1638400
+const B8_XN ulong 1703936
+const B8_QKV ulong 1835008
+const B8_K ulong 2359296
+const B8_V ulong 2424832
+const B8_Z ulong 2490368
+const B8_AB ulong 2752512
+const B8_Y ulong 2818048
+const B8_AOUT ulong 3145728
+const B8_MOE_LOG ulong 3276800
+const B8_MOE_W ulong 3342336
+const B8_MOE_MID ulong 3407872
+const B8_GU ulong 3670016
+const B8_SW ulong 3801088
+const B8_SH_OUT ulong 3866624
+const B8_SH_GATE ulong 3997696
+const B8_PLE_KEY ulong 4063232
+const B8_PLE_KN ulong 4587520
+const B8_PLE_QN ulong 5111808
+const B8_PLE_VAL ulong 5636096
+const B8_PLE_GV ulong 5767168
+const B8_PLE_GN ulong 6291456
+const B8_POS ulong 6815744
+const B8_LOGW4 ulong 7340032
+const B8_CIDS ulong 15728640
+const B8_CLOG ulong 15794176
+
+note Offsets inside q4B8Shm (512 KiB uncached NVLink-C2C shm)
+const B8_SHM_XN ulong 0
+const B8_SHM_PLE ulong 131072
+const B8_SHM_TRACE ulong 262144
+
+global q4B8Work long 1
+global q4B8WorkVa ulong 1
+global q4B8Shm long 1
+global q4B8ShmVa ulong 1
+global q4B8GdnStateMap long 1
+global q4B8GdnStateVa ulong 1
+global q4B8GdnStateStride ulong 1
+global q4B8GdnTailMap long 1
+global q4B8GdnTailVa ulong 1
+global q4B8GdnTailStride ulong 1
+global q4B8PleConvMap long 1
+global q4B8PleConvVa ulong 1
+global q4B8PleConvStride ulong 1
+global q4B8Ready ulong 1
+
+note Per-stream PLE n-gram history (8 streams)
+global q4B8PleHist long 16
+global q4B8PleSegPos ulong 8
+
+note Per-stream input tokens, positions, and output tokens for batched step
+global q4B8InTok ulong 8
+global q4B8InPos ulong 8
+global q4B8Active ulong 8
+global q4B8OutTok ulong 8
+
+fn b8W off ulong to ulong
+ret add get q4B8WorkVa 0 off
+end
+
+fn q4B8EmitW4Gemm xVa ulong wVa ulong sVa ulong cVa ulong K ulong N ulong to bool
+engPtr xVa
+engPtr wVa
+engPtr sVa
+engPtr cVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 30 uint div add N 7 8 1 256
+end
+
+fn q4B8EmitBf16Gemm wVa ulong xVa ulong cVa ulong K ulong N ulong to bool
+engPtr wVa
+engPtr xVa
+engPtr cVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 31 uint div add N 7 8 1 256
+end
+
+fn q4B8EmitHcPrep L ulong isMlp bool to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+lr = get engSpec MS_HC_LOWRANK
+normVa = get q4AHcNormVa L
+dnVa = get q4AHcDnVa L
+upVa = get q4AHcUpVa L
+injVa = get q4AHcInjVa L
+if isMlp
+normVa = get q4MHcNormVa L
+dnVa = get q4MHcDnVa L
+upVa = get q4MHcUpVa L
+injVa = get q4MHcInjVa L
+end
+for b ulong Q4_B8
+engPtr add b8W B8_HC_X mul b mul hcH 4
+engPtr normVa
+engPtr add b8W B8_HC_NORM mul b mul hcH 4
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+end
+if not q4B8EmitBf16Gemm dnVa b8W B8_HC_NORM b8W B8_HC_DOWN hcH lr
+ret false
+end
+for b ulong Q4_B8
+engPtr add b8W B8_HC_DOWN mul b mul lr 4
+engArg uint lr
+if not engPktEmitGy 18 uint div add lr 255 256 1 256
+ret false
+end
+end
+if not q4B8EmitBf16Gemm upVa b8W B8_HC_DOWN b8W B8_HC_UP lr hcH
+ret false
+end
+for b ulong Q4_B8
+engPtr add b8W B8_HC_UP mul b mul hcH 4
+engPtr add b8W B8_HC_NORM mul b mul hcH 4
+engPtr add b8W B8_XN mul b mul H 4
+if not engPktEmitGy 19 uint div H 256 1 256
+ret false
+end
+end
+ret q4B8EmitBf16Gemm injVa b8W B8_HC_NORM b8W B8_HC_INJ hcH hc
+end
+
+fn q4B8EmitHcInject to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+for b ulong Q4_B8
+engPtr add b8W B8_HC_X mul b mul hcH 4
+engPtr add b8W B8_AOUT mul b mul H 4
+engPtr add b8W B8_HC_INJ mul b mul hc 4
+if not engPktEmitGy 20 uint div H 256 uint hc 256
+ret false
+end
+end
+ret true
+end
+
+fn q4B8EmitPleLayer to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+pleVa = add get q4B8ShmVa 0 B8_SHM_PLE
+if not q4B8EmitBf16Gemm get q4PleKeyProjVa 0 pleVa b8W B8_PLE_KEY H hcH
+ret false
+end
+if not q4B8EmitBf16Gemm get q4PleValProjVa 0 pleVa b8W B8_PLE_VAL H H
+ret false
+end
+csStride = get q4B8PleConvStride 0
+for b ulong Q4_B8
+offHc = mul b mul hcH 4
+engPtr add b8W B8_PLE_KEY offHc
+engPtr get q4PleNormKeyVa 0
+engPtr add b8W B8_PLE_KN offHc
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+engPtr add b8W B8_HC_X offHc
+engPtr get q4PleNormQryVa 0
+engPtr add b8W B8_PLE_QN offHc
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+engPtr add b8W B8_PLE_KN offHc
+engPtr add b8W B8_PLE_QN offHc
+engPtr add b8W B8_PLE_VAL mul b mul H 4
+engPtr add b8W B8_PLE_GV offHc
+if not engPktEmitGy 24 uint hc 1 256
+ret false
+end
+engPtr add b8W B8_PLE_GV offHc
+engPtr get q4PleNormConvVa 0
+engPtr add b8W B8_PLE_GN offHc
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+engPtr add b8W B8_PLE_GV offHc
+engPtr add b8W B8_PLE_GN offHc
+engPtr get q4PleConvWVa 0
+engPtr add get q4B8PleConvVa 0 mul b csStride
+engPtr add b8W B8_HC_X offHc
+if not engPktEmitGy 25 uint div hcH 256 1 256
+ret false
+end
+end
+ret true
+end
+
+fn q4B8EmitFaAttnOne L ulong faIdx ulong b ulong qN ulong kvN ulong to bool
+nQ = get engSpec MS_NQ
+hd = get engSpec MS_HD
+kBase = add get engKvVa faIdx mul b div get engKvSlabBytes 0 16
+vBase = add kBase div get engKvSlabBytes 0 2
+posVa = add b8W B8_POS mul b 4096
+engPtr add b8W B8_K mul b mul kvN 4
+engPtr add b8W B8_V mul b mul kvN 4
+engPtr get engLKNormVa L
+engPtr get engRopeVa 0
+engPtr kBase
+engPtr vBase
+engPtr posVa
+if not engPktEmitGy 7 uint get engSpec MS_NKV 1 uint hd
+ret false
+end
+engPtr add b8W B8_QKV mul b mul qN 4
+engPtr get engLQNormVa L
+engPtr get engRopeVa 0
+engPtr engW EW_QROT
+engPtr posVa
+if not engPktEmitGy 8 uint nQ 1 uint hd
+ret false
+end
+engPtr engW EW_QROT
+engPtr kBase
+engPtr vBase
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr posVa
+if not engPktEmitGy 9 uint nQ 8 32
+ret false
+end
+yOff = mul mul b 4 mul nQ hd
+engPtr engW EW_OPART
+engPtr engW EW_MLPART
+engPtr add b8W B8_QKV mul b mul qN 4
+engPtr add b8W B8_Y yOff
+engArg 8
+ret engPktEmitGy 10 uint nQ 1 uint hd
+end
+
+fn q4B8EmitFaLayer L ulong faIdx ulong to bool
+H = get engSpec MS_H
+qN = mul get engSpec MS_NQ get engSpec MS_HD
+if eq get engSpec MS_ATTN_GATE 1
+qN = mul qN 2
+end
+kvN = mul get engSpec MS_NKV get engSpec MS_HD
+if not q4B8EmitW4Gemm b8W B8_XN get engLA1WVa L get engLA1SVa L b8W B8_QKV H qN
+ret false
+end
+if not q4B8EmitW4Gemm b8W B8_XN get engLA2WVa L get engLA2SVa L b8W B8_K H kvN
+ret false
+end
+if not q4B8EmitW4Gemm b8W B8_XN get engLA3WVa L get engLA3SVa L b8W B8_V H kvN
+ret false
+end
+for b ulong Q4_B8
+if not q4B8EmitFaAttnOne L faIdx b qN kvN
+ret false
+end
+end
+oK = mul get engSpec MS_NQ get engSpec MS_HD
+ret q4B8EmitW4Gemm b8W B8_Y get engLA4WVa L get engLA4SVa L b8W B8_AOUT oK H
+end
+
+fn q4B8EmitGdnOne L ulong gdnIdx ulong b ulong qkvN ulong zN ulong to bool
+nV = get engSpec MS_GDN_NV
+qkvVa = add b8W B8_QKV mul b mul qkvN 4
+tOff = add mul b get q4B8GdnTailStride 0 mul gdnIdx mul qkvN 12
+engPtr qkvVa
+engPtr get engLA4SVa L
+engPtr add get q4B8GdnTailVa 0 tOff
+if not engPktEmitGy 13 uint div qkvN 128 1 128
+ret false
+end
+sOff = add mul b get q4B8GdnStateStride 0 mul gdnIdx mul nV 65536
+engPtr qkvVa
+engPtr add b8W B8_Z mul b mul zN 4
+engPtr add b8W B8_AB mul b mul nV 8
+engPtr get engLKNormVa L
+engPtr add get q4B8GdnStateVa 0 sOff
+engPtr get engLQNormVa L
+engPtr add b8W B8_Y mul b mul zN 4
+ret engPktEmitGy 14 uint nV 1 128
+end
+
+fn q4B8EmitGdnLayer L ulong gdnIdx ulong to bool
+H = get engSpec MS_H
+nK = get engSpec MS_GDN_NK
+nV = get engSpec MS_GDN_NV
+qkvN = add mul nK 256 mul nV 128
+zN = mul nV 128
+if not q4B8EmitW4Gemm b8W B8_XN get engLA1WVa L get engLA1SVa L b8W B8_QKV H qkvN
+ret false
+end
+if not q4B8EmitW4Gemm b8W B8_XN get engLA2WVa L get engLA2SVa L b8W B8_Z H zN
+ret false
+end
+if not q4B8EmitBf16Gemm get engLA4WVa L b8W B8_XN b8W B8_AB H mul nV 2
+ret false
+end
+for b ulong Q4_B8
+if not q4B8EmitGdnOne L gdnIdx b qkvN zN
+ret false
+end
+end
+ret q4B8EmitW4Gemm b8W B8_Y get engLA3WVa L get engLA3SVa L b8W B8_AOUT zN H
+end
+
+fn q4B8EmitMoeShared L ulong to bool
+H = get engSpec MS_H
+shI = get engSpec MS_SH_I
+nE = get engSpec MS_NEXP
+if not q4B8EmitBf16Gemm get q4RouterWVa L b8W B8_XN b8W B8_MOE_LOG H nE
+ret false
+end
+if not q4B8EmitBf16Gemm get q4ShGateWVa L b8W B8_XN b8W B8_GU H shI
+ret false
+end
+if not q4B8EmitBf16Gemm get q4ShUpWVa L b8W B8_XN add b8W B8_GU mul mul Q4_B8 shI 4 H shI
+ret false
+end
+if not q4B8EmitBf16Gemm get q4ShGateSVa L b8W B8_XN b8W B8_SH_GATE H 1
+ret false
+end
+for b ulong Q4_B8
+note SwiGLU reads contiguous [gate, up]; emit per-stream gate+up copy? No: put up right after gate!
+end
+ret true
+end
+
+fn q4B8IdsVa L ulong b ulong to ulong
+nL = get engSpec MS_LAYERS
+topK = get engSpec MS_TOPK
+off = mul add mul b nL L mul topK 4
+ret add add get q4B8ShmVa 0 B8_SHM_TRACE off
+end
+
+fn q4B8EmitMoeOne L ulong b ulong to bool
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+shI = get engSpec MS_SH_I
+topK = get engSpec MS_TOPK
+idsVa = q4B8IdsVa L b
+engPtr add b8W B8_MOE_LOG mul b mul get engSpec MS_NEXP 4
+engPtr idsVa
+engPtr add b8W B8_MOE_W mul b mul topK 4
+if not engPktEmitGy 21 1 1 32
+ret false
+end
+xnVa = add b8W B8_XN mul b mul H 4
+if not q4EmitBf16Gemv get q4ShGateWVa L xnVa engW EW_GU H shI
+ret false
+end
+if not q4EmitBf16Gemv get q4ShUpWVa L xnVa add engW EW_GU mul shI 4 H shI
+ret false
+end
+engPtr engW EW_GU
+engPtr add b8W B8_SW mul b mul shI 4
+engArg uint shI
+if not engPktEmitGy 2 uint div add shI 255 256 1 256
+ret false
+end
+engPtr xnVa
+engPtr get q4ExpGuWVa L
+engPtr get q4ExpGuSVa L
+engPtr idsVa
+engPtr add b8W B8_MOE_MID mul b mul mul topK moeI 4
+ret engPktEmitGy 22 uint div add moeI 7 8 uint topK 256
+end
+
+fn q4B8EmitMoeLayer L ulong to bool
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+shI = get engSpec MS_SH_I
+topK = get engSpec MS_TOPK
+if not q4B8EmitBf16Gemm get q4RouterWVa L b8W B8_XN b8W B8_MOE_LOG H get engSpec MS_NEXP
+ret false
+end
+if not q4B8EmitBf16Gemm get q4ShGateSVa L b8W B8_XN b8W B8_SH_GATE H 1
+ret false
+end
+for b ulong Q4_B8
+if not q4B8EmitMoeOne L b
+ret false
+end
+end
+if not q4B8EmitBf16Gemm get q4ShDnWVa L b8W B8_SW b8W B8_SH_OUT shI H
+ret false
+end
+for b ulong Q4_B8
+idsVa = q4B8IdsVa L b
+engPtr add b8W B8_MOE_MID mul b mul mul topK moeI 4
+engPtr get q4ExpDnWVa L
+engPtr get q4ExpDnSVa L
+engPtr idsVa
+engPtr add b8W B8_MOE_W mul b mul topK 4
+engPtr add b8W B8_SH_OUT mul b mul H 4
+engPtr add b8W B8_SH_GATE mul b 4
+engPtr add b8W B8_AOUT mul b mul H 4
+if not engPktEmitGy 23 uint div add H 7 8 1 256
+ret false
+end
+end
+ret true
+end
+
+fn q4B8EmitOneLayer L ulong faIdx ulong gdnIdx ulong to bool
+pleL1 = get engSpec MS_PLE_LAYER
+if and gt pleL1 0 eq add L 1 pleL1
+if not q4B8EmitPleLayer
+ret false
+end
+end
+if not q4B8EmitHcPrep L false
+ret false
+end
+if eq get engLayerKind L 0
+if not q4B8EmitFaLayer L faIdx
+ret false
+end
+else
+if not q4B8EmitGdnLayer L gdnIdx
+ret false
+end
+end
+if not q4B8EmitHcInject
+ret false
+end
+if not q4B8EmitHcPrep L true
+ret false
+end
+if not q4B8EmitMoeLayer L
+ret false
+end
+ret q4B8EmitHcInject
+end
+
+fn q4B8EmitLayersRange startL ulong endL ulong to bool
+nL = get engSpec MS_LAYERS
+gdnIdx = ulong 0
+faIdx = ulong 0
+for L ulong nL bound 128
+if and ge L startL lt L endL
+if not q4B8EmitOneLayer L faIdx gdnIdx
+ret false
+end
+end
+if eq get engLayerKind L 0
+faIdx = add faIdx 1
+else
+gdnIdx = add gdnIdx 1
+end
+end
+ret true
+end
+
+fn q4B8EmitFinalMixToShm to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+lr = get engSpec MS_HC_LOWRANK
+for b ulong Q4_B8
+engPtr add b8W B8_HC_X mul b mul hcH 4
+engPtr get q4FinHcNormVa 0
+engPtr add b8W B8_HC_NORM mul b mul hcH 4
+if not engPktEmitGy 17 uint hc 1 256
+ret false
+end
+end
+if not q4B8EmitBf16Gemm get q4FinHcDnVa 0 b8W B8_HC_NORM b8W B8_HC_DOWN hcH lr
+ret false
+end
+for b ulong Q4_B8
+engPtr add b8W B8_HC_DOWN mul b mul lr 4
+engArg uint lr
+if not engPktEmitGy 18 uint div add lr 255 256 1 256
+ret false
+end
+end
+if not q4B8EmitBf16Gemm get q4FinHcUpVa 0 b8W B8_HC_DOWN b8W B8_HC_UP lr hcH
+ret false
+end
+for b ulong Q4_B8
+engPtr add b8W B8_HC_UP mul b mul hcH 4
+engPtr add b8W B8_HC_NORM mul b mul hcH 4
+engPtr add add get q4B8ShmVa 0 B8_SHM_XN mul b mul H 4
+if not engPktEmitGy 19 uint div H 256 1 256
+ret false
+end
+end
+ret true
+end
+
+fn q4B8EmitLmHeadGpu to bool
+H = get engSpec MS_H
+V = get engSpec MS_VOCAB
+xnVa = add get q4B8ShmVa 0 B8_SHM_XN
+note Compute ALL 8 streams' lm_head logits (8 x 248,320) in ONE pass over 318 MB W4 weights!
+if not q4B8EmitW4Gemm xnVa get engLmW4Va 0 add get engLmW4Va 0 get engLmW4SOff 0 b8W B8_LOGW4 H V
+ret false
+end
+for b ulong Q4_B8
+logVa = add b8W B8_LOGW4 mul b mul V 4
+cidVa = add b8W B8_CIDS mul b 512
+clogVa = add b8W B8_CLOG mul b 512
+engPtr logVa
+engPtr cidVa
+if not engPktEmitGy 12 64 1 256
+ret false
+end
+engPtr mapaddr get engLmBf16 0
+engPtr add xnVa mul b mul H 4
+engPtr cidVa
+engPtr clogVa
+engArg 128
+if not engPktEmitGy 5 128 1 32
+ret false
+end
+end
+ret true
+end
+
+fn q4B8RecordPackets to bool
+nL = get engSpec MS_LAYERS
+midL = div nL 2
+note Slot 4: B=8 Layer 0 at 32 MiB (completely disjoint from 0..32 MiB B=1 workspace!)
+engPktStartAt 33554432
+if not q4B8EmitOneLayer 0 0 0
+ret false
+end
+if not engPktFinish 4
+ret false
+end
+note Slot 5: B=8 Layers 1..midL-1 at 34 MiB (6 MiB headroom)
+engPktStartAt 35651584
+if not q4B8EmitLayersRange 1 midL
+ret false
+end
+if not engPktFinish 5
+ret false
+end
+note Slot 7: B=8 Layers midL..nL-1 + final mixer at 40 MiB (6 MiB headroom)
+engPktStartAt 41943040
+if not q4B8EmitLayersRange midL nL
+ret false
+end
+if not q4B8EmitFinalMixToShm
+ret false
+end
+if not engPktFinish 7
+ret false
+end
+note Slot 6: B=8 Batched lm_head at 46 MiB (2 MiB headroom)
+engPktStartAt 48234496
+if not q4B8EmitLmHeadGpu
+ret false
+end
+ret engPktFinish 6
+end
+
+fn q4B8AllocStates to bool
+nGdn = get engSpec MS_N_GDN
+nK = get engSpec MS_GDN_NK
+nV = get engSpec MS_GDN_NV
+qkvN = add mul nK 256 mul nV 128
+stStride = mul mul nGdn nV 65536
+tlStride = mul div add mul mul nGdn qkvN 12 4095 4096 4096
+put q4B8GdnStateStride 0 stStride
+put q4B8GdnTailStride 0 tlStride
+sm = nvalloc mul Q4_B8 stStride true
+tm = nvalloc mul Q4_B8 tlStride true
+if or le sm 0 le tm 0
+ret false
+end
+put q4B8GdnStateMap 0 sm
+put q4B8GdnStateVa 0 mapaddr sm
+put q4B8GdnTailMap 0 tm
+put q4B8GdnTailVa 0 mapaddr tm
+ret true
+end
+
+fn q4B8Init to bool
+w = nvalloc Q4_B8_WORK_BYTES true
+if le w 0
+ret false
+end
+put q4B8Work 0 w
+put q4B8WorkVa 0 mapaddr w
+s = nvalloc Q4_B8_SHM_BYTES false
+if le s 0
+ret false
+end
+put q4B8Shm 0 s
+put q4B8ShmVa 0 mapaddr s
+if not q4B8AllocStates
+ret false
+end
+hcH = mul get engSpec MS_HC_COUNT get engSpec MS_H
+csStride = mul div add mul hcH 36 65535 65536 65536
+put q4B8PleConvStride 0 csStride
+cm = nvalloc mul Q4_B8 csStride true
+if le cm 0
+ret false
+end
+put q4B8PleConvMap 0 cm
+put q4B8PleConvVa 0 mapaddr cm
+if not q4B8RecordPackets
+ret false
+end
+put q4B8Ready 0 1
+ret true
+end
+
+fn q4B8ResetStream b ulong to void
+eos = long get engSpec MS_EOS_ID
+put q4B8PleHist mul b 2 eos
+put q4B8PleHist add mul b 2 1 eos
+put q4B8PleSegPos b 0
+for i ulong 1048576
+put engIoBuf i 0
+end
+stStride = get q4B8GdnStateStride 0
+pos = ulong 0
+while lt pos stStride bound 1024
+cnt = sub stStride pos
+if gt cnt 1048576
+cnt = ulong 1048576
+end
+r = mapwrite get q4B8GdnStateMap 0 add mul b stStride pos engIoBuf 0 cnt
+pos = add pos cnt
+end
+tlStride = get q4B8GdnTailStride 0
+pos = ulong 0
+while lt pos tlStride bound 256
+cnt = sub tlStride pos
+if gt cnt 1048576
+cnt = ulong 1048576
+end
+r = mapwrite get q4B8GdnTailMap 0 add mul b tlStride pos engIoBuf 0 cnt
+pos = add pos cnt
+end
+csStride = get q4B8PleConvStride 0
+pos = ulong 0
+while lt pos csStride bound 64
+cnt = sub csStride pos
+if gt cnt 1048576
+cnt = ulong 1048576
+end
+r = mapwrite get q4B8PleConvMap 0 add mul b csStride pos engIoBuf 0 cnt
+pos = add pos cnt
+end
+end
+
+fn q4B8LoadEmbedOne b ulong tid ulong to bool
+H = get engSpec MS_H
+hc = get engSpec MS_HC_COUNT
+hcH = mul hc H
+b2 = mul H 2
+if ne mapread get engEmbBf16 0 mul tid b2 engIoBuf 0 b2 long b2
+ret false
+end
+engWidenBuf H
+hBytes = mul H 4
+base = add B8_HC_X mul b mul hcH 4
+for c ulong hc bound 8
+if ne mapwrite get q4B8Work 0 add base mul c hBytes engWideBuf 0 hBytes long hBytes
+ret false
+end
+end
+ret true
+end
+
+fn q4B8SetPosOne b ulong pos ulong to void
+engPutU32Io 0 uint pos
+r = mapwrite get q4B8Work 0 add B8_POS mul b 4096 engIoBuf 0 4
+end
+
+fn q4B8CopyPleToB8 b ulong to void
+hb = mul get engSpec MS_H 4
+r0 = mapread get q4ApuShm 0 Q4_SHM_PLE engIoBuf 0 hb
+r1 = mapwrite get q4B8Shm 0 add B8_SHM_PLE mul b hb engIoBuf 0 hb
+end
+
+fn q4B8DispatchPleOne b ulong tok ulong to void
+if eq get engSpec MS_PLE_LAYER 0
+ret
+end
+eos = long get engSpec MS_EOS_ID
+s0 = long tok
+seg = get q4B8PleSegPos b
+s1 = eos
+s2 = eos
+if ge seg 1
+s1 = get q4B8PleHist add mul b 2 1
+end
+if ge seg 2
+s2 = get q4B8PleHist mul b 2
+end
+put q4B8PleHist mul b 2 get q4B8PleHist add mul b 2 1
+put q4B8PleHist add mul b 2 1 s0
+if eq s0 eos
+put q4B8PleSegPos b 0
+else
+put q4B8PleSegPos b add seg 1
+end
+mix2 = xor mul s0 get q4PleMult 0 mul s1 get q4PleMult 1
+mix3 = xor mix2 mul s2 get q4PleMult 2
+hpn = get engSpec MS_PLE_HPN
+nHeads = mul 2 hpn
+for h ulong nHeads bound 20
+if lt h hpn
+q4SendOnePleHead h mix2
+else
+q4SendOnePleHead h mix3
+end
+end
+for h ulong nHeads bound 20
+q4ApuReadPair get q4ApuResFds h
+end
+q4B8CopyPleToB8 b
+end
+
+text b8Dbg4 " [B8] S4="
+text b8Dbg5 " S5="
+text b8Dbg7 " S7="
+text b8Dbg6 " S6="
+text b8DbgNl "\n"
+
+fn q4B8StepDecode needLogits bool to bool
+for b ulong Q4_B8
+tok = get q4B8InTok b
+pos = get q4B8InPos b
+if not q4B8LoadEmbedOne b tok
+ret false
+end
+q4B8SetPosOne b pos
+end
+note Stage 1: Kick B=8 Layer 0 on 48 SMs WHILE 16 ARMv9 CPU cores read 8x 51B PLE in parallel!
+if not q4KickPre 4
+ret false
+end
+for b ulong Q4_B8
+if ne get q4B8Active b 0
+q4B8DispatchPleOne b get q4B8InTok b
+end
+end
+if not q4WaitPre
+engPrint b8Dbg4
+engPrintU get engSlotLen 4
+engPrint b8DbgNl
+ret false
+end
+note Stage 2: Run B=8 Layers 1..midL-1 (Slot 5) + Layers midL..47 + final mixer (Slot 7) -> q4B8Shm[B8_SHM_XN]
+if not engReplayPre 5
+engPrint b8Dbg5
+engPrintU get engSlotLen 5
+engPrint b8DbgNl
+ret false
+end
+if not engReplayPre 7
+engPrint b8Dbg7
+engPrintU get engSlotLen 7
+engPrint b8DbgNl
+ret false
+end
+if not needLogits
+nL = get engSpec MS_LAYERS
+topK = get engSpec MS_TOPK
+for b ulong Q4_B8
+if ne get q4B8Active b 0
+q4ArbProcessTrace get q4B8Shm 0 add B8_SHM_TRACE mul b mul mul nL topK 4
+end
+end
+ret true
+end
+note Stage 3: Kick B=8 Batched lm_head (1 pass over 318 MB W4 for all 8 streams!) WHILE Live Arboris updates!
+if not q4KickPre 6
+ret false
+end
+nL = get engSpec MS_LAYERS
+topK = get engSpec MS_TOPK
+for b ulong Q4_B8
+if ne get q4B8Active b 0
+q4ArbProcessTrace get q4B8Shm 0 add B8_SHM_TRACE mul b mul mul nL topK 4
+end
+end
+if not q4WaitPre
+engPrint b8Dbg6
+engPrintU get engSlotLen 6
+engPrint b8DbgNl
+ret false
+end
+for b ulong Q4_B8
+if ne get q4B8Active b 0
+r0 = mapread get q4B8Work 0 add B8_CIDS mul b 512 engIoBuf 0 512
+for i ulong 128
+put engCandIds i engGetU32Io mul i 4
+end
+r1 = mapread get q4B8Work 0 add B8_CLOG mul b 512 engIoBuf 0 512
+bestV = f32 -1000000000.0f32
+bestTok = ulong 0
+for i ulong 128
+v = bitcast f32 engGetU32Io mul i 4
+if gt v bestV
+bestV = v
+bestTok = ulong get engCandIds i
+end
+end
+put q4B8OutTok b bestTok
+end
+end
+ret true
+end

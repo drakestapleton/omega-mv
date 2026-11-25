@@ -5,8 +5,8 @@ note quantizes BF16 or FP8 weights to W4 block-32 on GPU, specializes SM121 SASS
 note and records GPFIFO packets for 128K-context decode & OpenAI HTTP serving.
 
 const ENG_MAX_LAYERS ulong 128
-const ENG_WORK_BYTES ulong 33554432
-const ENG_SCRATCH_BYTES ulong 268435456
+const ENG_WORK_BYTES ulong 50331648
+const ENG_SCRATCH_BYTES ulong 402653184
 
 note Per-layer device pointers (VA in UVM) for up to 128 layers
 global engLInNormVa ulong 128
@@ -61,14 +61,14 @@ const EW_PKT ulong 4194304
 global engCodePos ulong 1
 global engCodeMap long 1
 global engCodeFail uint 1
-global engEntry ulong 32
-global engSmem ulong 32
+global engEntry ulong 64
+global engSmem ulong 64
 global engBind uint 32
 global engBindN ulong 1
 global engPktOff ulong 1
 global engPktPos ulong 1
-global engSlotOff ulong 4
-global engSlotLen ulong 4
+global engSlotOff ulong 8
+global engSlotLen ulong 8
 
 global engWork long 1
 global engWorkVa ulong 1
@@ -201,7 +201,17 @@ engRegKernel 22 1 407 0
 engRegKernel 23 1 408 0
 engRegKernel 24 1 409 64
 engRegKernel 25 1 410 0
+engRegKernel 27 1 412 2080
+engRegKernel 28 1 413 2624
 end
+note 26: uW4Gemv4R512 (4-row/warp LDG.E.64 + 2 KiB SMEM W4 GEMV for any K % 512 == 0)
+engRegKernel 26 1 411 2080
+note 29: uBf16Gemv4R (4-row/warp LDG.E.64 + 512 B SMEM BF16 GEMV for any K % 128 == 0)
+engRegKernel 29 1 414 528
+note 30: uW4GemmB8 (Batched B=8 W4 GEMM for any K % 128 == 0, any N)
+engRegKernel 30 1 415 4128
+note 31: uBf16GemmB8 (Batched B=8 BF16 GEMM for any K % 64 == 0, any N)
+engRegKernel 31 1 416 2080
 end
 
 fn engW off ulong to ulong
@@ -683,6 +693,125 @@ end
 
 global engMatWVa ulong 1
 global engMatSVa ulong 1
+global engFuseTidW long 4
+global engFuseTidS long 4
+global engFuseN ulong 4
+global engFuseOff ulong 4
+global engFuseSVa ulong 4
+
+fn engEmitQuantOne idx ulong wVa ulong sVa ulong K ulong to bool
+tidW = ulong get engFuseTidW idx
+dt = get stDtype tidW
+N = get engFuseN idx
+srcVa = add get engScratchVa 0 get engFuseOff idx
+if eq dt DT_F8_E4M3
+engPtr srcVa
+engPtr get engFuseSVa idx
+engPtr mapaddr get engLut 0
+engPtr wVa
+engPtr sVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 11 uint div add N 3 4 1 128
+end
+engPtr srcVa
+engPtr wVa
+engPtr sVa
+engArg uint K
+engArg uint N
+ret engPktEmitGy 3 uint div add N 7 8 1 256
+end
+
+fn engStageFusedOne i ulong sOff ulong to bool
+tidW = ulong get engFuseTidW i
+if not engStreamTensorRaw tidW get engScratch 0 sOff
+ret false
+end
+put engFuseOff i sOff
+if eq get stDtype tidW DT_F8_E4M3
+tidS = get engFuseTidS i
+if lt tidS 0
+ret false
+end
+sv = engLoadTensorF32 ulong tidS
+if eq sv 0
+ret false
+end
+put engFuseSVa i sv
+end
+ret true
+end
+
+fn engQuantFusedBatched cnt ulong K ulong wVa ulong sVa ulong to bool
+sOff = ulong 0
+for i ulong cnt bound 4
+if not engStageFusedOne i sOff
+ret false
+end
+bl = get stByteLen ulong get engFuseTidW i
+sOff = add sOff mul div add bl 255 256 256
+end
+engPktStart
+curW = wVa
+curS = sVa
+for i ulong cnt bound 4
+if not engEmitQuantOne i curW curS K
+ret false
+end
+Ni = get engFuseN i
+curW = add curW div mul Ni K 2
+curS = add curS mul Ni div K 16
+end
+ret engPktRun
+end
+
+fn engQuantFusedSerial cnt ulong K ulong wVa ulong sVa ulong to bool
+curW = wVa
+curS = sVa
+for i ulong cnt bound 4
+if not engStageFusedOne i 0
+ret false
+end
+engPktStart
+if not engEmitQuantOne i curW curS K
+ret false
+end
+if not engPktRun
+ret false
+end
+Ni = get engFuseN i
+curW = add curW div mul Ni K 2
+curS = add curS mul Ni div K 16
+end
+ret true
+end
+
+fn engLoadFusedMatsW4 cnt ulong K ulong to bool
+totN = ulong 0
+totBytes = ulong 0
+for i ulong cnt bound 4
+if lt get engFuseTidW i 0
+ret false
+end
+totN = add totN get engFuseN i
+bl0 = get stByteLen ulong get engFuseTidW i
+totBytes = add totBytes mul div add bl0 255 256 256
+end
+wVa = engSlabAlloc div mul totN K 2
+if eq wVa 0
+ret false
+end
+sVa = engSlabAlloc mul totN div K 16
+if eq sVa 0
+ret false
+end
+put engMatWVa 0 wVa
+put engMatSVa 0 sVa
+if le totBytes ENG_SCRATCH_BYTES
+ret engQuantFusedBatched cnt K wVa sVa
+end
+ret engQuantFusedSerial cnt K wVa sVa
+end
 
 fn engLoadMatW4 tidW ulong tidS long K ulong N ulong to bool
 wBytes = div mul N K 2
@@ -947,16 +1076,18 @@ end
 fn engLoadMlpLayer L ulong to bool
 H = get engSpec MS_H
 I = get engSpec MS_I
-if not engLoadLayerMat stFindLayer L tNmGateW stFindLayer L tNmGateS H I
+note Fuse gate_proj|up_proj into one contiguous [2*I, H] W4 slab (saves 64 WFI barriers/tok!)
+put engFuseTidW 0 stFindLayer L tNmGateW
+put engFuseTidS 0 stFindLayer L tNmGateS
+put engFuseN 0 I
+put engFuseTidW 1 stFindLayer L tNmUpW
+put engFuseTidS 1 stFindLayer L tNmUpS
+put engFuseN 1 I
+if not engLoadFusedMatsW4 2 H
 ret false
 end
 put engLGateWVa L get engMatWVa 0
 put engLGateSVa L get engMatSVa 0
-if not engLoadLayerMat stFindLayer L tNmUpW stFindLayer L tNmUpS H I
-ret false
-end
-put engLUpWVa L get engMatWVa 0
-put engLUpSVa L get engMatSVa 0
 if not engLoadLayerMat stFindLayer L tNmDnW stFindLayer L tNmDnS I H
 ret false
 end
@@ -999,6 +1130,9 @@ engArg uint K
 engArg uint N
 if eq rem K 1024 0
 ret engPktEmitGy 0 uint div add N 31 32 1 256
+end
+if eq rem K 512 0
+ret engPktEmitGy 26 uint div add N 31 32 1 256
 end
 ret engPktEmitGy 15 uint div add N 7 8 1 256
 end
@@ -1121,10 +1255,7 @@ I = get engSpec MS_I
 if not engEmitRmsNormAdd get engLPostNormVa L 1
 ret false
 end
-if not engEmitW4Gemv engW EW_XN get engLGateWVa L get engLGateSVa L engW EW_GU H I
-ret false
-end
-if not engEmitW4Gemv engW EW_XN get engLUpWVa L get engLUpSVa L add engW EW_GU mul I 4 H I
+if not engEmitW4Gemv engW EW_XN get engLGateWVa L get engLGateSVa L engW EW_GU H mul I 2
 ret false
 end
 engPtr engW EW_GU

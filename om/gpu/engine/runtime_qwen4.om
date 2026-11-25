@@ -27,26 +27,32 @@ const EW_PLE_VAL ulong 29900800
 const EW_PLE_GV ulong 29917184
 const EW_PLE_GN ulong 29982720
 
-note Per-layer Hyper-Connection device pointers (48 layers, up to 128)
+note Per-layer Hyper-Connection device pointers (48 layers, up to 128; hc_dn quantized to W4!)
 global q4AHcNormVa ulong 128
 global q4AHcDnVa ulong 128
+global q4AHcDnSVa ulong 128
 global q4AHcUpVa ulong 128
 global q4AHcInjVa ulong 128
 global q4MHcNormVa ulong 128
 global q4MHcDnVa ulong 128
+global q4MHcDnSVa ulong 128
 global q4MHcUpVa ulong 128
 global q4MHcInjVa ulong 128
 
 note Final hyper_connection_mixer device pointers
 global q4FinHcNormVa ulong 1
 global q4FinHcDnVa ulong 1
+global q4FinHcDnSVa ulong 1
 global q4FinHcUpVa ulong 1
 
-note Per-layer MoE device pointers (512 experts contiguous W4 + router + shared expert)
+note Per-layer MoE device pointers (512 experts + shared expert in W4 + router in BF16)
 global q4RouterWVa ulong 128
 global q4ShGateWVa ulong 128
+global q4ShGateSVa2 ulong 128
 global q4ShUpWVa ulong 128
+global q4ShUpSVa ulong 128
 global q4ShDnWVa ulong 128
+global q4ShDnSVa ulong 128
 global q4ShGateSVa ulong 128
 global q4ExpGuWVa ulong 128
 global q4ExpGuSVa ulong 128
@@ -421,18 +427,22 @@ put q4MHcInjVa L q4LoadTensorBf16 stFindLayer L q4NmMHcInj
 ret and ne get q4AHcInjVa L 0 ne get q4MHcInjVa L 0
 end
 
-fn q4LoadLayerMoe L ulong to bool
-H = get engSpec MS_H
-moeI = get engSpec MS_MOE_I
-nE = get engSpec MS_NEXP
+fn q4LoadLayerSharedExp L ulong to bool
 put q4RouterWVa L q4LoadTensorBf16 stFindLayer L q4NmRouter
 put q4ShGateWVa L q4LoadTensorBf16 stFindLayer L q4NmShGate
 put q4ShUpWVa L q4LoadTensorBf16 stFindLayer L q4NmShUp
 put q4ShDnWVa L q4LoadTensorBf16 stFindLayer L q4NmShDn
 put q4ShGateSVa L q4LoadTensorBf16 stFindLayer L q4NmShGateS
-if or eq get q4RouterWVa L 0 eq get q4ShGateSVa L 0
+ret and ne get q4RouterWVa L 0 ne get q4ShGateSVa L 0
+end
+
+fn q4LoadLayerMoe L ulong to bool
+if not q4LoadLayerSharedExp L
 ret false
 end
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+nE = get engSpec MS_NEXP
 guExpW = mul moeI H
 guExpS = mul mul 2 moeI div H 16
 dnExpW = div mul H moeI 2
@@ -465,17 +475,32 @@ engPtr xVa
 engPtr outVa
 engArg uint K
 engArg uint N
+if and eq rem K 128 0 ge N 16
+ret engPktEmitGy 29 uint div add N 31 32 1 256
+end
 if eq rem K 256 0
 ret engPktEmitGy 4 uint div add N 7 8 1 256
 end
 ret engPktEmitGy 16 uint div add N 7 8 1 256
 end
 
-fn q4EmitHcPrep normVa ulong dnVa ulong upVa ulong injVa ulong doInj bool to bool
+fn q4EmitHcPrep L ulong isMlp bool to bool
 H = get engSpec MS_H
 hc = get engSpec MS_HC_COUNT
 hcH = mul hc H
 lr = get engSpec MS_HC_LOWRANK
+normVa = get q4AHcNormVa L
+dnVa = get q4AHcDnVa L
+dnSVa = get q4AHcDnSVa L
+upVa = get q4AHcUpVa L
+injVa = get q4AHcInjVa L
+if isMlp
+normVa = get q4MHcNormVa L
+dnVa = get q4MHcDnVa L
+dnSVa = get q4MHcDnSVa L
+upVa = get q4MHcUpVa L
+injVa = get q4MHcInjVa L
+end
 engPtr engW EW_HC_X
 engPtr normVa
 engPtr engW EW_HC_NORM
@@ -499,10 +524,7 @@ engPtr engW EW_XN
 if not engPktEmitGy 19 uint div H 256 1 256
 ret false
 end
-if doInj
 ret q4EmitBf16Gemv injVa engW EW_HC_NORM engW EW_HC_INJ hcH hc
-end
-ret true
 end
 
 fn q4EmitHcInject to bool
@@ -755,7 +777,7 @@ end
 
 fn q4ApuInitRanges to void
 V = get engSpec MS_VOCAB
-vGpu = ulong 221184
+vGpu = ulong 240128
 if le V vGpu
 vGpu = V
 end
@@ -876,7 +898,7 @@ if not q4EmitPleLayer
 ret false
 end
 end
-if not q4EmitHcPrep get q4AHcNormVa L get q4AHcDnVa L get q4AHcUpVa L get q4AHcInjVa L true
+if not q4EmitHcPrep L false
 ret false
 end
 if eq get engLayerKind L 0
@@ -891,7 +913,7 @@ end
 if not q4EmitHcInject
 ret false
 end
-if not q4EmitHcPrep get q4MHcNormVa L get q4MHcDnVa L get q4MHcUpVa L get q4MHcInjVa L true
+if not q4EmitHcPrep L true
 ret false
 end
 if not q4EmitMoeLayer L

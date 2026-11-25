@@ -782,6 +782,1053 @@ qic 12 QZ 16 22 0 qSt
 qic 0 QZ QZ QZ 0 qW1
 end
 
+note Helper: unpack 8 nibbles from wReg (u32) against 8 SMEM floats at smOffReg + baseOff, accumulate into baccReg
+fn uW4Mac8Smem wReg ulong smOffReg ulong baseOff ulong baccReg ulong to void
+qic 58 40 smOffReg QZ baseOff qLd
+qic 58 44 smOffReg QZ add baseOff 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+qW4Unpack4 wReg 40 41 42 43 baccReg
+qic 17 59 wReg QZ 16 qAlu4
+qW4Unpack4 59 44 45 46 47 baccReg
+end
+
+note Helper: compute sum of 16 SMEM floats at smOffReg[0..63] -> sumReg
+fn uSum16Smem smOffReg ulong sumReg ulong to void
+qNum sumReg 0.0f32
+for g ulong 4
+qic 58 40 smOffReg QZ mul g 16 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 52 40 41 0 qAlu1
+qic 30 53 42 43 0 qAlu4
+qic 30 52 52 53 0 qAlu4
+qic 30 sumReg sumReg 52 0 qAlu4
+end
+end
+
+note Helper: select low or high 16-bit BF16 scale from sPackReg based on (lane & 2) != 0 -> dstReg
+fn uPickBf16Scale2 dstReg ulong sPackReg ulong laneReg ulong to void
+qic 18 52 laneReg QZ 2 qAlu4
+qLit 53 1
+qic 28 QZ 52 53 0 qCmp
+qic 18 54 sPackReg QZ 0xffff0000 qAlu1
+qicImm 8 dstReg sPackReg QZ 65536 qAlu4
+put q36Guard 0 1
+qicImm 8 dstReg 54 QZ 1 qAlu4
+end
+
+note =========================================================================
+note Mode 411: uW4Gemv4R512 -- 4-row/warp LDG.E.64 + 2 KiB streaming SMEM W4 GEMV
+note   Works for ANY K % 512 == 0 (2560, 6144, 10240, 5120, 17408, 2048), ANY N!
+note Args: x[K] (R0:1), W[N,K/8] u32 (R2:3), S[N,K/64] u32 (R4:5), C[N] (R6:7), K (32), N (36).
+note Grid: (ceil(N/32), 1, 1), Block: 256 (8 warps x 4 rows = 32 rows/CTA), SMEM: 2080.
+note =========================================================================
+fn uW4Gemv4R512 to void
+qStart 4
+qParam 20 32
+qParam 21 36
+note Save x_ptr (R0:1) to SMEM[2048..2052]
+qLit 52 2048
+qLit 53 2052
+qLit 54 1
+bXp = qBssy
+qic 28 QZ 14 54 0 qCmp
+skXp = qBraFwd 1
+qic 50 QZ 52 0 0 qSt
+qic 50 QZ 53 1 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skXp 1
+qBsync bXp
+qBar
+note R8:9 = C, R16:17 = S, R12:13 = W
+qicImm 8 8 6 QZ 1 qAlu1
+qicImm 8 9 7 QZ 1 qAlu1
+qicImm 8 16 4 QZ 1 qAlu1
+qicImm 8 17 5 QZ 1 qAlu1
+qicImm 8 12 2 QZ 1 qAlu1
+qicImm 8 13 3 QZ 1 qAlu4
+note warp = tid >> 5 (R52), lane = tid & 31 (R11), row0 = cta_x*32 + warp*4 (R18)
+qic 17 52 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+note R24 = K/8 (W u32 stride), R22 = K/512 (nChunks), R20 = K/64 (S u32 stride)
+qic 17 24 20 QZ 3 qAlu1
+qic 17 22 20 QZ 9 qAlu1
+qic 17 20 20 QZ 6 qAlu4
+note 4 row W pointers in R0:1, R2:3, R4:5, R6:7 at offset (row*wStride + lane*2)*4
+qMad 58 11 2 QZ
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMadReg 53 52 24 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+note R10 = lane * 64 (SMEM byte offset for lane's 16 floats)
+qMad 10 11 64 QZ
+qLit 21 0
+qLit 23 1
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+mLoop = get q36Pc 0
+note Stage 512 floats of x into SMEM[0..2047] (256 threads x 2 floats via LDG.E.64)
+qLit 54 2048
+qLit 55 2052
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 21 512 QZ
+qMad 54 14 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 8 QZ
+qic 50 QZ 54 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 25 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+note Compute xSum16 for this lane's 16 SMEM floats -> R38 (reused across all 4 rows!)
+uSum16Smem 10 38
+qNum 39 -8.0f32
+qic 32 38 38 39 0 qAlu4
+note Load 4 rows of W (4x LDG.E.64 -> R24:25, R26:27, R28:29, R30:31) and 4 scales (R12, R13, R15, R19)
+qic 56 24 0 QZ 0 qLd
+qic 56 26 2 QZ 0 qLd
+qic 56 28 4 QZ 0 qLd
+qic 56 30 6 QZ 0 qLd
+qic 17 60 11 QZ 2 qAlu4
+qMad 60 21 8 60
+qMadReg 60 18 20 60
+qicImm 9 52 60 16 4 qAlu4
+qicImm 9 54 20 52 4 qAlu4
+qicImm 9 56 20 54 4 qAlu4
+qicImm 9 58 20 56 4 qAlu4
+qic 11 12 52 QZ 0 qLd
+qic 11 13 54 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 19 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickBf16Scale2 12 12 11
+uPickBf16Scale2 13 13 11
+uPickBf16Scale2 15 15 11
+uPickBf16Scale2 19 19 11
+note Unpack & accumulate all 4 rows against SMEM x[lane*16..lane*16+15]!
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 24 10 0 36
+uW4Mac8Smem 25 10 32 36
+qic4 33 48 36 12 48 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 26 10 0 36
+uW4Mac8Smem 27 10 32 36
+qic4 33 49 36 13 49 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 28 10 0 36
+uW4Mac8Smem 29 10 32 36
+qic4 33 50 36 15 50 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 30 10 0 36
+uW4Mac8Smem 31 10 32 36
+qic4 33 51 36 19 51 qAlu4
+note Advance W pointers by 64 u32s = 256 bytes
+qicImm 9 0 23 0 256 qAlu1
+qicImm 9 2 23 2 256 qAlu1
+qicImm 9 4 23 4 256 qAlu1
+qicImm 9 6 23 6 256 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+qParam 19 36
+for r ulong 4
+qWarpRedSum add 48 r 52 16
+end
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qic 28 QZ 52 19 0 qCmp
+skO = qBraFwd 1
+qicImm 9 54 52 8 4 qAlu4
+qic 12 QZ 54 add 48 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skO 1
+end
+end
+
+note =========================================================================
+note Mode 412: uMoeW4Gu4R -- 4-row/warp LDG.E.64 + 2 KiB SMEM Fused Top-K MoE gate+up+SiLU*up
+note Args: x[H] (R0:1), W_gu (R2:3), S_gu (R4:5), topk_ids[K] (R6:7), out_mid[K,moeI] (R8:9).
+note Grid: (ceil(moeI/32), topK, 1), Block: 256 (8 warps x 4 rows = 32 rows/CTA), SMEM: 2080.
+note =========================================================================
+fn uMoeGu4Emit4Rows acc0 ulong sStride ulong to void
+qic 11 12 32 QZ 0 qLd
+qic 11 13 34 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 20 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickBf16Scale2 12 12 11
+uPickBf16Scale2 13 13 11
+uPickBf16Scale2 15 15 11
+uPickBf16Scale2 20 20 11
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 24 10 0 36
+uW4Mac8Smem 25 10 32 36
+qic4 33 acc0 36 12 acc0 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 26 10 0 36
+uW4Mac8Smem 27 10 32 36
+qic4 33 add acc0 1 36 13 add acc0 1 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 28 10 0 36
+uW4Mac8Smem 29 10 32 36
+qic4 33 add acc0 2 36 15 add acc0 2 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 30 10 0 36
+uW4Mac8Smem 31 10 32 36
+qic4 33 add acc0 3 36 20 add acc0 3 qAlu4
+end
+
+fn uMoeGu4Emit4Up to void
+qic 11 12 32 QZ 0 qLd
+qic 11 13 34 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 20 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickBf16Scale2 12 12 11
+uPickBf16Scale2 13 13 11
+uPickBf16Scale2 15 15 11
+uPickBf16Scale2 20 20 11
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 24 10 0 36
+uW4Mac8Smem 25 10 32 36
+qic4 33 60 36 12 60 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 26 10 0 36
+uW4Mac8Smem 27 10 32 36
+qic4 33 61 36 13 61 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 28 10 0 36
+uW4Mac8Smem 29 10 32 36
+qic4 33 17 36 15 17 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 30 10 0 36
+uW4Mac8Smem 31 10 32 36
+qic4 33 19 36 20 19 qAlu4
+end
+
+fn uMoeW4Gu4R to void
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+wStride = div H 8
+sStride = div H 64
+qStart 5
+qLit 52 2048
+qLit 53 2052
+qLit 54 1
+bXp = qBssy
+qic 28 QZ 14 54 0 qCmp
+skXp = qBraFwd 1
+qic 50 QZ 52 0 0 qSt
+qic 50 QZ 53 1 0 qSt
+qLit 52 2056
+qLit 53 2060
+qic 50 QZ 52 4 0 qSt
+qic 50 QZ 53 5 0 qSt
+qLit 52 2064
+qLit 53 2068
+qic 50 QZ 52 8 0 qSt
+qic 50 QZ 53 9 0 qSt
+qLit 52 2072
+qic 50 QZ 52 18 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skXp 1
+qBsync bXp
+qBar
+qicImm 9 16 18 6 4 qW1
+qic 11 19 16 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qicImm 8 12 2 QZ 1 qAlu1
+qicImm 8 13 3 QZ 1 qAlu1
+qic 17 52 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+qMad 58 19 mul mul 2 moeI wStride QZ
+qMad 58 11 2 58
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMad 53 52 wStride 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qMad 16 19 mul mul 2 moeI sStride QZ
+qMad 16 18 sStride 16
+qic 17 52 11 QZ 2 qAlu4
+qIadd 16 16 52
+qMad 10 11 64 QZ
+qLit 21 0
+qLit 22 div H 512
+qLit 23 1
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+qNum 60 0.0f32
+qNum 61 0.0f32
+qNum 17 0.0f32
+qNum 19 0.0f32
+mLoop = get q36Pc 0
+qLit 54 2048
+qLit 55 2052
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 21 512 QZ
+qMad 54 14 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 8 QZ
+qic 50 QZ 54 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 25 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+uSum16Smem 10 38
+qNum 39 -8.0f32
+qic 32 38 38 39 0 qAlu4
+qLit 54 2056
+qLit 55 2060
+qic 49 8 54 QZ 0 qLd
+qic 49 9 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 56 24 0 QZ 0 qLd
+qic 56 26 2 QZ 0 qLd
+qic 56 28 4 QZ 0 qLd
+qic 56 30 6 QZ 0 qLd
+qMad 52 21 8 16
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+uMoeGu4Emit4Rows 48 sStride
+qLit 52 mul moeI wStride
+qicImm 9 32 52 0 4 qAlu1
+qicImm 9 34 52 2 4 qAlu1
+qicImm 9 56 52 4 4 qAlu1
+qicImm 9 58 52 6 4 qAlu4
+qic 56 24 32 QZ 0 qLd
+qic 56 26 34 QZ 0 qLd
+qic 56 28 56 QZ 0 qLd
+qic 56 30 58 QZ 0 qLd
+qMad 52 21 8 16
+qLit 53 mul moeI sStride
+qIadd 52 52 53
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+uMoeGu4Emit4Up
+qicImm 9 0 23 0 256 qAlu1
+qicImm 9 2 23 2 256 qAlu1
+qicImm 9 4 23 4 256 qAlu1
+qicImm 9 6 23 6 256 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+for r ulong 4
+qWarpRedSum add 48 r 24 16
+end
+qWarpRedSum 60 24 16
+qWarpRedSum 61 24 16
+qWarpRedSum 17 24 16
+qWarpRedSum 19 24 16
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qLit 24 2064
+qLit 25 2068
+qLit 28 2072
+qic 49 8 24 QZ 0 qLd
+qic 49 9 25 QZ 0 qLd
+qic 49 20 28 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qNum 30 -1.4426950408889634f32
+qNum 31 1.0f32
+qLit 29 moeI
+for r ulong 4
+upR = ulong 60
+if eq r 1
+upR = ulong 61
+end
+if eq r 2
+upR = ulong 17
+end
+if eq r 3
+upR = ulong 19
+end
+qSig 35 add 48 r 30 31
+qic 32 add 48 r add 48 r 35 0 qAlu4
+qic 32 add 48 r add 48 r upR 0 qAlu4
+qLit 26 r
+qIadd 26 18 26
+qic 28 QZ 26 29 0 qCmp
+skO = qBraFwd 1
+qMad 27 20 moeI 26
+qicImm 9 24 27 8 4 qAlu4
+qic 12 QZ 24 add 48 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skO 1
+end
+end
+
+note =========================================================================
+note Mode 413: uMoeW4DnAdd4R -- 4-row/warp LDG.E.64 + 2.5 KiB SMEM Fused Top-K MoE W4 down_proj (moeI=640)
+note Args: moe_mid[K,640] (R0:1), W_dn (R2:3), S_dn (R4:5), topk_ids[K] (R6:7),
+note       topk_w[K] (R8:9), sh_out[H] (R10:11), sh_gate_s[1] (R12:13), out[H] (56,60).
+note Grid: (ceil(H/32), 1, 1), Block: 256 (8 warps x 4 rows = 32 rows/CTA), SMEM: 2624.
+note =========================================================================
+fn uMoeDn4SaveArgs to void
+qLit 54 1
+bSv = qBssy
+qic 28 QZ 14 54 0 qCmp
+skSv = qBraFwd 1
+for i ulong 7
+qLit 52 add 2560 mul i 8
+qLit 53 add 2564 mul i 8
+qic 50 QZ 52 mul i 2 0 qSt
+qic 50 QZ 53 add mul i 2 1 0 qSt
+end
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSv 1
+qBsync bSv
+qBar
+end
+
+fn uMoeDn4StageMid to void
+qLit 54 2560
+qLit 55 2564
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 21 640 QZ
+qMad 54 14 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 8 QZ
+qic 50 QZ 54 24 0 qSt
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 25 0 qSt
+qLit 59 64
+bTail = qBssy
+qic 28 QZ 14 59 0 qCmp
+skTail = qBraFwd 1
+qMad 54 21 640 QZ
+qLit 59 512
+qIadd 54 54 59
+qMad 54 14 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 8 QZ
+qLit 59 2048
+qIadd 54 54 59
+qic 50 QZ 54 24 0 qSt
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 25 0 qSt
+qPatch skTail 1
+qBsync bTail
+qic 0 QZ QZ QZ 0 qW1
+qBar
+end
+
+fn uMoeDn4Chunk0 expWOff ulong wStride ulong expSOff ulong sStride ulong to void
+qLit 54 2568
+qLit 55 2572
+qic 49 12 54 QZ 0 qLd
+qic 49 13 55 QZ 0 qLd
+qLit 54 2576
+qLit 55 2580
+qic 49 8 54 QZ 0 qLd
+qic 49 9 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 58 20 expWOff QZ
+qMad 58 11 2 58
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMad 53 52 wStride 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+uSum16Smem 10 38
+qNum 39 -8.0f32
+qic 32 38 38 39 0 qAlu4
+qic 56 24 0 QZ 0 qLd
+qic 56 26 2 QZ 0 qLd
+qic 56 28 4 QZ 0 qLd
+qic 56 30 6 QZ 0 qLd
+qMad 52 20 expSOff QZ
+qMad 52 18 sStride 52
+qic 17 53 11 QZ 2 qAlu4
+qIadd 52 52 53
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+qic 11 12 32 QZ 0 qLd
+qic 11 13 34 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 37 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickBf16Scale2 12 12 11
+uPickBf16Scale2 13 13 11
+uPickBf16Scale2 15 15 11
+uPickBf16Scale2 37 37 11
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 24 10 0 36
+uW4Mac8Smem 25 10 32 36
+qic 32 60 36 12 0 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 26 10 0 36
+uW4Mac8Smem 27 10 32 36
+qic 32 61 36 13 0 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 28 10 0 36
+uW4Mac8Smem 29 10 32 36
+qic 32 17 36 15 0 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+uW4Mac8Smem 30 10 0 36
+uW4Mac8Smem 31 10 32 36
+qic 32 19 36 37 0 qAlu4
+end
+
+fn uMoeDn4Chunk1 expWOff ulong wStride ulong expSOff ulong sStride ulong to void
+qLit 54 2568
+qLit 55 2572
+qic 49 12 54 QZ 0 qLd
+qic 49 13 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 58 20 expWOff QZ
+qic 17 59 11 QZ 1 qAlu4
+qIadd 58 58 59
+qLit 59 64
+qIadd 58 58 59
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qMad 53 52 wStride 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qic 11 24 0 QZ 0 qLd
+qic 11 25 2 QZ 0 qLd
+qic 11 26 4 QZ 0 qLd
+qic 11 27 6 QZ 0 qLd
+qMad 52 20 expSOff QZ
+qMad 52 18 sStride 52
+qic 17 53 11 QZ 4 qAlu4
+qIadd 52 52 53
+qLit 53 8
+qIadd 52 52 53
+qLit 53 sStride
+qicImm 9 32 52 8 4 qAlu4
+qicImm 9 34 53 32 4 qAlu4
+qicImm 9 56 53 34 4 qAlu4
+qicImm 9 58 53 56 4 qAlu4
+qic 11 12 32 QZ 0 qLd
+qic 11 13 34 QZ 0 qLd
+qic 11 15 56 QZ 0 qLd
+qic 11 37 58 QZ 0 qLd
+qMad 39 11 16 QZ
+qLit 59 2048
+qIadd 39 39 59
+qic 58 40 39 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 30 38 40 41 0 qAlu1
+qic 30 52 42 43 0 qAlu4
+qic 30 38 38 52 0 qAlu4
+qNum 39 -8.0f32
+qic 32 38 38 39 0 qAlu4
+uPickW4Half 24 11
+uPickW4Half 25 11
+uPickW4Half 26 11
+uPickW4Half 27 11
+uPickBf16Scale 12 12 11
+uPickBf16Scale 13 13 11
+uPickBf16Scale 15 15 11
+uPickBf16Scale 37 37 11
+qicImm 8 36 38 QZ 1 qAlu4
+qW4Unpack4 24 40 41 42 43 36
+qic4 33 60 36 12 60 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+qW4Unpack4 25 40 41 42 43 36
+qic4 33 61 36 13 61 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+qW4Unpack4 26 40 41 42 43 36
+qic4 33 17 36 15 17 qAlu4
+qicImm 8 36 38 QZ 1 qAlu4
+qW4Unpack4 27 40 41 42 43 36
+qic4 33 19 36 37 19 qAlu4
+end
+
+fn uMoeW4DnAdd4R to void
+H = get engSpec MS_H
+moeI = get engSpec MS_MOE_I
+topK = get engSpec MS_TOPK
+wStride = div moeI 8
+sStride = div moeI 64
+expWOff = mul H wStride
+expSOff = mul H sStride
+qStart 7
+uMoeDn4SaveArgs
+qic 17 52 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+qMad 10 11 64 QZ
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+qLit 21 0
+qLit 22 topK
+qLit 23 1
+mExp = get q36Pc 0
+uMoeDn4StageMid
+qLit 54 2584
+qLit 55 2588
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qLit 54 2592
+qLit 55 2596
+qic 49 32 54 QZ 0 qLd
+qic 49 33 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qicImm 9 56 21 52 4 qW1
+qic 11 20 56 QZ 0 qLd
+qicImm 9 58 21 32 4 qW1
+qic 11 16 58 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uMoeDn4Chunk0 expWOff wStride expSOff sStride
+uMoeDn4Chunk1 expWOff wStride expSOff sStride
+qic4 33 48 60 16 48 qAlu1
+qic4 33 49 61 16 49 qAlu1
+qic4 33 50 17 16 50 qAlu1
+qic4 33 51 19 16 51 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mExp get q36Pc 0 qAlu4
+for r ulong 4
+qWarpRedSum add 48 r 24 16
+end
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qLit 54 2608
+qLit 55 2612
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qLit 54 2600
+qLit 55 2604
+qic 49 8 54 QZ 0 qLd
+qic 49 9 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic 11 35 52 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qNum 30 -1.4426950408889634f32
+qNum 31 1.0f32
+qSig 35 35 30 31
+qParam 26 56
+qParam 27 60
+qLit 29 H
+for r ulong 4
+qLit 24 r
+qIadd 24 18 24
+qic 28 QZ 24 29 0 qCmp
+skO = qBraFwd 1
+qicImm 9 52 24 8 4 qW1
+qic 11 36 52 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic4 33 add 48 r 36 35 add 48 r qAlu4
+qicImm 9 54 24 26 4 qAlu4
+qic 12 QZ 54 add 48 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skO 1
+end
+end
+
+note =========================================================================
+note Mode 414: uBf16Gemv4R -- 4-row/warp LDG.E.64 + 512 B SMEM BF16 GEMV for ANY K % 128 == 0, ANY N
+note Args: W_bf16[N,K/2] u32 (R0:1), x[K] (R2:3), C[N] (R4:5), K (24), N (28).
+note Grid: (ceil(N/32), 1, 1), Block: 256 (8 warps x 4 rows = 32 rows/CTA), SMEM: 528.
+note =========================================================================
+fn uBf16Gemv4R to void
+qStart 3
+qParam 20 24
+qParam 19 28
+qLit 54 1
+bSv = qBssy
+qic 28 QZ 14 54 0 qCmp
+skSv = qBraFwd 1
+qLit 52 512
+qLit 53 516
+qic 50 QZ 52 2 0 qSt
+qic 50 QZ 53 3 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSv 1
+qBsync bSv
+qBar
+qicImm 8 8 4 QZ 1 qAlu1
+qicImm 8 9 5 QZ 1 qAlu1
+qicImm 8 12 0 QZ 1 qAlu1
+qicImm 8 13 1 QZ 1 qAlu4
+qic 17 52 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 32 QZ
+qMad 18 52 4 18
+note R24 = K/2 (W u32 stride), R22 = K/128 (nChunks), R59 = N - 1
+qic 17 24 20 QZ 1 qAlu1
+qic 17 22 20 QZ 7 qAlu4
+qLit 59 0xffffffff
+qIadd 59 19 59
+qMad 58 11 2 QZ
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qic 28 QZ 52 19 0 qCmp
+put q36Guard 0 1
+qicImm 8 52 59 QZ 1 qAlu4
+qMadReg 53 52 24 58
+qicImm 9 mul r 2 53 12 4 qAlu4
+end
+qMad 10 11 16 QZ
+qLit 21 0
+qLit 23 1
+for r ulong 4
+qNum add 48 r 0.0f32
+end
+mLoop = get q36Pc 0
+qLit 59 64
+bLd = qBssy
+qic 28 QZ 14 59 0 qCmp
+skLd = qBraFwd 1
+qLit 54 512
+qLit 55 516
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 21 128 QZ
+qMad 54 14 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 24 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 14 8 QZ
+qic 50 QZ 54 24 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 25 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skLd 1
+qBsync bLd
+qBar
+qic 56 24 0 QZ 0 qLd
+qic 56 26 2 QZ 0 qLd
+qic 56 28 4 QZ 0 qLd
+qic 56 30 6 QZ 0 qLd
+qic 58 40 10 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+for r ulong 4
+w0 = add 24 mul r 2
+w1 = add 25 mul r 2
+acc = add 48 r
+qicImm 8 52 w0 QZ 65536 qAlu1
+qic 18 53 w0 QZ 0xffff0000 qAlu1
+qicImm 8 54 w1 QZ 65536 qAlu1
+qic 18 55 w1 QZ 0xffff0000 qAlu4
+qic4 33 acc 52 40 acc qAlu4
+qic4 33 acc 53 41 acc qAlu4
+qic4 33 acc 54 42 acc qAlu4
+qic4 33 acc 55 43 acc qAlu4
+end
+qicImm 9 0 23 0 256 qAlu1
+qicImm 9 2 23 2 256 qAlu1
+qicImm 9 4 23 4 256 qAlu1
+qicImm 9 6 23 6 256 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLoop get q36Pc 0 qAlu4
+for r ulong 4
+qWarpRedSum add 48 r 52 16
+end
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+for r ulong 4
+qLit 52 r
+qIadd 52 18 52
+qic 28 QZ 52 19 0 qCmp
+skO = qBraFwd 1
+qicImm 9 54 52 8 4 qAlu4
+qic 12 QZ 54 add 48 r 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skO 1
+end
+end
+
+note =========================================================================
+note Mode 415: uW4GemmB8 -- Batched B=8 W4 block-32 GEMM (reads W & S ONCE for all 8 streams!)
+note   Works for ANY K % 128 == 0, ANY N. X[8,K], W[N,K/8], S[N,K/64], C[8,N].
+note Args: X[8,K] (R0:1), W (R2:3), S (R4:5), C[8,N] (R6:7), K (32), N (36).
+note Grid: (ceil(N/8), 1, 1), Block: 256 (8 warps = 8 rows), SMEM: 4128.
+note =========================================================================
+fn uW4GemmB8 to void
+qStart 4
+qParam 20 32
+qParam 19 36
+qLit 54 1
+bSv = qBssy
+qic 28 QZ 14 54 0 qCmp
+skSv = qBraFwd 1
+qLit 52 4096
+qLit 53 4100
+qic 50 QZ 52 0 0 qSt
+qic 50 QZ 53 1 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 4104
+qLit 53 4108
+qic 50 QZ 52 6 0 qSt
+qic 50 QZ 53 7 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSv 1
+qBsync bSv
+qBar
+note R16 = warp (0..7), R11 = lane (0..31), R18 = row = cta_x*8 + warp
+qic 17 16 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 8 16
+note Clamp row for W/S load (R59 = min(row, N-1)) so partial last CTA never faults
+qLit 59 0xffffffff
+qIadd 59 19 59
+qicImm 8 52 18 QZ 1 qAlu4
+qic 28 QZ 52 19 0 qCmp
+put q36Guard 0 1
+qicImm 8 52 59 QZ 1 qAlu4
+note R12 = K/8, R13 = K/64, R22 = K/128
+qic 17 12 20 QZ 3 qAlu1
+qic 17 13 20 QZ 6 qAlu1
+qic 17 22 20 QZ 7 qAlu4
+note W ptr -> R24:25, S ptr -> R28:29
+qMadReg 26 52 12 QZ
+qic 17 27 11 QZ 1 qAlu4
+qIadd 26 26 27
+qicImm 9 24 26 2 4 qAlu4
+qMadReg 26 52 13 QZ
+qic 17 27 11 QZ 4 qAlu4
+qIadd 26 26 27
+qicImm 9 28 26 4 4 qAlu4
+note R10 = lane * 16 (SMEM byte offset within each stream's 512 B slice)
+qMad 10 11 16 QZ
+note R0..R7 = 8 batch accumulators (zero conflicts with R40..R61!)
+for b ulong 8
+qNum b 0.0f32
+end
+qLit 21 0
+qLit 23 1
+mLp = get q36Pc 0
+note Warp b (R16) loads stream b's 128 floats via LDG.E.128 -> SMEM[b*512 + lane*16]
+qLit 54 4096
+qLit 55 4100
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMadReg 54 16 20 QZ
+qMad 54 21 128 54
+qMad 54 11 4 54
+qicImm 9 56 54 52 4 qAlu4
+qic 57 40 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 16 512 10
+qLit 59 4
+for j ulong 4
+qic 50 QZ 54 add 40 j 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+if lt j 3
+qIadd 54 54 59
+end
+end
+qBar
+note Load W and S ONCE for this row, reuse across all 8 streams!
+qic 11 34 24 QZ 0 qLd
+qic 11 35 28 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+uPickW4Half 34 11
+uPickBf16Scale 36 35 11
+for b ulong 8
+qic 58 40 10 QZ mul b 512 qLd
+qic 0 QZ QZ QZ 0 qW0
+uW4Mac4Lane 34 36 b
+end
+qicImm 9 24 23 24 64 qAlu1
+qicImm 9 28 23 28 8 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLp get q36Pc 0 qAlu4
+for b ulong 8
+qWarpRedSum b 52 16
+end
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qic 28 QZ 18 19 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qLit 54 4104
+qLit 55 4108
+qic 49 26 54 QZ 0 qLd
+qic 49 27 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+for b ulong 8
+qLit 52 b
+qMadReg 52 52 19 18
+qicImm 9 54 52 26 4 qAlu4
+qic 12 QZ 54 b 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
+note =========================================================================
+note Mode 416: uBf16GemmB8 -- Batched B=8 BF16 GEMM (reads W_bf16 ONCE for all 8 streams!)
+note   Works for ANY K % 64 == 0, ANY N. W[N,K/2] u32, X[8,K], C[8,N].
+note Args: W (R0:1), X[8,K] (R2:3), C[8,N] (R4:5), K (24), N (28).
+note Grid: (ceil(N/8), 1, 1), Block: 256 (8 warps = 8 rows), SMEM: 2080.
+note =========================================================================
+fn uBf16GemmB8 to void
+qStart 3
+qParam 20 24
+qParam 19 28
+qLit 54 1
+bSv = qBssy
+qic 28 QZ 14 54 0 qCmp
+skSv = qBraFwd 1
+qLit 52 2048
+qLit 53 2052
+qic 50 QZ 52 2 0 qSt
+qic 50 QZ 53 3 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 52 2056
+qLit 53 2060
+qic 50 QZ 52 4 0 qSt
+qic 50 QZ 53 5 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qPatch skSv 1
+qBsync bSv
+qBar
+qic 17 16 14 QZ 5 qAlu1
+qic 18 11 14 QZ 31 qAlu4
+qMad 18 15 8 16
+qLit 59 0xffffffff
+qIadd 59 19 59
+qicImm 8 52 18 QZ 1 qAlu4
+qic 28 QZ 52 19 0 qCmp
+put q36Guard 0 1
+qicImm 8 52 59 QZ 1 qAlu4
+note R12 = K/2, R22 = K/64
+qic 17 12 20 QZ 1 qAlu1
+qic 17 22 20 QZ 6 qAlu4
+qMadReg 26 52 12 11
+qicImm 9 24 26 0 4 qAlu4
+qMad 10 11 8 QZ
+for b ulong 8
+qNum b 0.0f32
+end
+qLit 21 0
+qLit 23 1
+mLp = get q36Pc 0
+note Warp b (R16) loads stream b's 64 floats via LDG.E.64 -> SMEM[b*256 + lane*8]
+qLit 54 2048
+qLit 55 2052
+qic 49 52 54 QZ 0 qLd
+qic 49 53 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMadReg 54 16 20 QZ
+qMad 54 21 64 54
+qMad 54 11 2 54
+qicImm 9 56 54 52 4 qAlu4
+qic 56 40 56 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qMad 54 16 256 10
+qic 50 QZ 54 40 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qLit 59 4
+qIadd 54 54 59
+qic 50 QZ 54 41 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+qBar
+note Load W_bf16 ONCE, unpack to R35/R36, reuse across all 8 streams!
+qic 11 34 24 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qicImm 8 35 34 QZ 65536 qAlu1
+qic 18 36 34 QZ 0xffff0000 qAlu4
+for b ulong 8
+qLit 54 mul b 256
+qIadd 54 54 10
+qic 49 40 54 QZ 0 qLd
+qLit 59 4
+qIadd 54 54 59
+qic 49 41 54 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+qic4 33 b 35 40 b qAlu4
+qic4 33 b 36 41 b qAlu4
+end
+qicImm 9 24 23 24 128 qAlu4
+qIadd 21 21 23
+qBar
+qic 28 QZ 21 22 0 qCmp
+put q36Guard 0 2
+qic 46 QZ QZ QZ sub mLp get q36Pc 0 qAlu4
+for b ulong 8
+qWarpRedSum b 52 16
+end
+qic 28 QZ 11 23 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qic 28 QZ 18 19 0 qCmp
+put q36Guard 0 1
+qic 45 QZ QZ QZ 0 qSafe
+qLit 54 2056
+qLit 55 2060
+qic 49 26 54 QZ 0 qLd
+qic 49 27 55 QZ 0 qLd
+qic 0 QZ QZ QZ 0 qW0
+for b ulong 8
+qLit 52 b
+qMadReg 52 52 19 18
+qicImm 9 54 52 26 4 qAlu4
+qic 12 QZ 54 b 0 qSt
+qic 0 QZ QZ QZ 0 qW1
+end
+end
+
 fn engQwen4Kernel mode ulong to bool
 if eq mode 400
 uW4GemvAnyK
@@ -825,6 +1872,30 @@ ret true
 end
 if eq mode 410
 uPleDilatedConvAdd
+ret true
+end
+if eq mode 411
+uW4Gemv4R512
+ret true
+end
+if eq mode 412
+uMoeW4Gu4R
+ret true
+end
+if eq mode 413
+uMoeW4DnAdd4R
+ret true
+end
+if eq mode 414
+uBf16Gemv4R
+ret true
+end
+if eq mode 415
+uW4GemmB8
+ret true
+end
+if eq mode 416
+uBf16GemmB8
 ret true
 end
 ret false
