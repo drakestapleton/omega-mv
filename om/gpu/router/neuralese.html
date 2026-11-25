@@ -258,7 +258,13 @@ canvas#ltpSpark {
 <main>
   <section class="stack">
     <div class="card">
-      <h2>Prompt &amp; Presets</h2>
+      <h2>Model &amp; Prompt</h2>
+      <label for="modelSel">Target Model</label>
+      <select id="modelSel">
+        <option value="omega-llm-15.8m-om2">omega-llm-15.8m-om2 (Grace CPU :18098 · Full Steering + LTP0)</option>
+        <option value="qwen3.6-35b-a3b-w4-mtp">qwen3.6-35b-a3b-w4-mtp (GB10 GPU :18091 · Live Arboris)</option>
+        <option value="inkling-2-mini">inkling-2-mini (GB10 GPU :18091 · 48L Looped + Arboris)</option>
+      </select>
       <label for="preset">OM-2 Coding Preset</label>
       <select id="preset">
         <option value="fn double x ulong to ulong&#10;">fn double x ulong to ulong</option>
@@ -323,13 +329,14 @@ canvas#ltpSpark {
       <div class="btn-row">
         <button id="runBtn" class="primary">Run Baseline vs Experimental</button>
         <button id="resetSteerBtn">Reset Steering</button>
+        <button id="exportPresetBtn">Copy Steering Preset</button>
       </div>
       <div id="statusMsg" class="status-msg muted"></div>
     </div>
 
     <div class="card">
       <h2>LTP0 Latent Handoff (Agent A &rarr; B) <span id="ltpStateBadge" class="pill">Empty</span></h2>
-      <div class="muted">Captures last-layer 384-D hidden state (HF) with immutable model_id + FNV-1a-64 checksum. Fail-closed on mismatch.</div>
+      <div class="muted">Captures last-layer 384-D hidden state (HF) with immutable model_id + FNV-1a-64 checksum. Unit-RMS normalized before alpha scaling; fail-closed on mismatch.</div>
       <canvas id="ltpSpark" width="320" height="68" style="margin-top:8px"></canvas>
       <div class="row" style="margin-top:8px">
         <div>
@@ -578,21 +585,43 @@ $('tamperBtn').onclick = async () => {
   }
 };
 
+$('exportPresetBtn').onclick = () => {
+  const preset = {
+    model: $('modelSel').value,
+    adapt_extra: Number($('adaptExtra').value) || 0,
+    adapt_thresh_milli: Number($('adaptThresh').value) || 0,
+    steer_kind: Number($('steerKind').value) || 0,
+    steer_layer: Number($('steerLayer').value) || 999,
+    steer_idx: Number($('steerIdx').value) || 0,
+    steer_val_milli: Number($('steerVal').value) || 0,
+    ltp_alpha_milli: Number($('ltpAlpha').value) || 150,
+    ltp_layer: Number($('ltpLayer').value) || 0
+  };
+  const txt = JSON.stringify(preset, null, 2);
+  if (navigator.clipboard) navigator.clipboard.writeText(txt).catch(() => {});
+  $('statusMsg').textContent = 'Steering preset JSON copied: ' + JSON.stringify(preset);
+};
+
 $('runBtn').onclick = async () => {
   $('runBtn').disabled = true;
-  $('statusMsg').textContent = 'Running baseline + experimental traces on Spark Grace CPU...';
+  const model = $('modelSel').value;
+  $('statusMsg').textContent = `Running baseline + experimental traces on ${model}...`;
   const prompt = $('prompt').value;
   const max_tokens = Number($('maxTok').value) || 32;
   const temperature_milli = Number($('tempMilli').value) || 0;
 
   try {
-    const base = await runTrace({ prompt, max_tokens, temperature_milli, seed: 42, adapt_extra: 0, steer_kind: 0 });
-    $('baseCode').textContent = prompt + base.text;
-    $('baseMeta').textContent = `${base.completion_tokens} tok in ${base.ms} ms · extra_loops=${base.total_extra_loops} · HF norm=${(base.ltp0_out.hf_norm_milli/1000).toFixed(2)}`;
-    renderTokens($('baseToks'), base.tokens);
-    verifyOm2(prompt + base.text, $('baseOmc'));
+    const base = await runTrace({ model, prompt, max_tokens, temperature_milli, seed: 42, adapt_extra: 0, steer_kind: 0 });
+    $('baseCode').textContent = (model === 'omega-llm-15.8m-om2' ? prompt : '') + base.text;
+    const baseArb = base.arboris ? ` · Arboris=${JSON.stringify(base.arboris)}` : '';
+    const baseHf = base.ltp0_out ? ` · HF norm=${(base.ltp0_out.hf_norm_milli/1000).toFixed(2)}` : '';
+    $('baseMeta').textContent = `${base.completion_tokens} tok in ${base.ms} ms · extra_loops=${base.total_extra_loops}${baseHf}${baseArb}`;
+    renderTokens($('baseToks'), base.tokens || []);
+    if (model === 'omega-llm-15.8m-om2') verifyOm2(prompt + base.text, $('baseOmc'));
+    else { $('baseOmc').className = 'pill accent'; $('baseOmc').textContent = base.model_id; }
 
     const expReq = {
+      model,
       prompt,
       max_tokens,
       temperature_milli,
@@ -604,7 +633,7 @@ $('runBtn').onclick = async () => {
       steer_idx: Number($('steerIdx').value) || 0,
       steer_val_milli: Number($('steerVal').value) || 0
     };
-    if (capturedLtp0) {
+    if (capturedLtp0 && model === 'omega-llm-15.8m-om2') {
       expReq.ltp_model_id = capturedLtp0.model_id;
       expReq.ltp_fnv64 = capturedLtp0.fnv64;
       expReq.ltp_alpha_milli = Number($('ltpAlpha').value) || 150;
@@ -613,16 +642,21 @@ $('runBtn').onclick = async () => {
     }
 
     const exp = await runTrace(expReq);
-    $('expCode').textContent = prompt + exp.text;
-    $('expMeta').textContent = `${exp.completion_tokens} tok in ${exp.ms} ms · extra_loops=${exp.total_extra_loops} · HF norm=${(exp.ltp0_out.hf_norm_milli/1000).toFixed(2)}`;
-    renderTokens($('expToks'), exp.tokens);
-    verifyOm2(prompt + exp.text, $('expOmc'));
-    renderDiag(exp);
+    $('expCode').textContent = (model === 'omega-llm-15.8m-om2' ? prompt : '') + exp.text;
+    const expArb = exp.arboris ? ` · Arboris=${JSON.stringify(exp.arboris)}` : '';
+    const expHf = exp.ltp0_out ? ` · HF norm=${(exp.ltp0_out.hf_norm_milli/1000).toFixed(2)}` : '';
+    $('expMeta').textContent = `${exp.completion_tokens} tok in ${exp.ms} ms · extra_loops=${exp.total_extra_loops}${expHf}${expArb}`;
+    renderTokens($('expToks'), exp.tokens || []);
+    if (model === 'omega-llm-15.8m-om2') verifyOm2(prompt + exp.text, $('expOmc'));
+    else { $('expOmc').className = 'pill accent'; $('expOmc').textContent = exp.model_id; }
+    if ((exp.layer_norms_milli || []).length) renderDiag(exp);
 
-    lastExpLtp0 = exp.ltp0_out;
-    drawSpark(lastExpLtp0.vec_1e4);
-    $('capLtpBtn').disabled = false;
-    $('statusMsg').textContent = `Done. Baseline ${base.ms} ms vs Experimental ${exp.ms} ms (extra_loops=${exp.total_extra_loops}).`;
+    if (exp.ltp0_out) {
+      lastExpLtp0 = exp.ltp0_out;
+      drawSpark(lastExpLtp0.vec_1e4);
+      $('capLtpBtn').disabled = false;
+    }
+    $('statusMsg').textContent = `Done (${model}). Baseline ${base.ms} ms vs Experimental ${exp.ms} ms (extra_loops=${exp.total_extra_loops}).`;
   } catch (e) {
     $('statusMsg').textContent = `Error: ${e.message}`;
   } finally {
