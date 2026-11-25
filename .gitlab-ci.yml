@@ -1,0 +1,113 @@
+variables:
+  GIT_DEPTH: "0"
+
+.phase1a_rules: &phase1a_rules
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^feat\//'
+
+linux-arm64-phase1a:
+  tags:
+    - saas-linux-medium-arm64
+  image: ubuntu:24.04
+  <<: *phase1a_rules
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libc6-dev make git ca-certificates file strace bubblewrap python3 gawk jq >/dev/null
+  script:
+    - sh seed/omega-from-seed.sh
+    - sh seed/effects/check.sh
+    - |
+      if grep -qw dit /proc/cpuinfo; then
+        sh seed/qualification/om2/every.sh
+      else
+        echo "NOTE: runner CPU lacks ARMv8.4 FEAT_DIT; running om2/every excluding s5-dit-ok/ctl-dit-ok/m-msr (verified on Spark Neoverse V2)"
+        set -eu
+        B=build/seed/om2every-nodit
+        rm -rf "$B" && mkdir -p "$B"
+        seed/out/omc < seed/qualification/om2/gate.om > "$B/gate" && chmod +x "$B/gate"
+        pin=$(sha256sum seed/out/omc | cut -d' ' -f1)
+        for c in seed/omc/om2/*/*.cases seed/omc/sites/*.cases \
+          seed/qualification/om2/baseline/guard.cases seed/qualification/om2/baseline/language.cases \
+          seed/qualification/om2/baseline/sha256.cases seed/qualification/om2/baseline/transform.cases \
+          seed/qualification/om2/sec/s4fuel/candidate.cases seed/qualification/om2/selftest/pass.cases \
+          seed/qualification/security673/relational/bindings.cases \
+          seed/qualification/security673/relational/consumer.cases \
+          seed/qualification/security673/relational/l4-tripwire.cases \
+          seed/qualification/security673/relational/qualification.cases \
+          seed/qualification/om2/sec/s0s2/candidate.cases seed/qualification/om2/sec/s3s4/candidate.cases \
+          seed/qualification/om2/sec/s5s7/candidate.cases seed/qualification/om2/leak/candidate.cases; do
+          case_file="$c"
+          tag=$(echo "$c" | tr / _)
+          case "$c" in
+            seed/omc/om2/s5/s5.cases)
+              grep -v '^s5-dit-ok ' "$c" > "$B/s5.cases"
+              case_file="$B/s5.cases"
+              ;;
+            seed/omc/om2/s5/s5-mutants.cases)
+              grep -v '^ctl-dit-ok ' "$c" | awk '/^subst seed\/omc\/om2\/s5\/mut\/msr\./{skip=2; next} skip>0{skip--; next} {print}' > "$B/s5-mutants.cases"
+              case_file="$B/s5-mutants.cases"
+              ;;
+          esac
+          st=0
+          "$B/gate" "$(pwd)/seed/out/omc" "$pin" "$case_file" "$B/s-$tag" > "$B/$tag.log" 2>&1 || st=$?
+          case "$c" in
+            *mutants.cases)
+              [ "$st" = 1 ] || { cat "$B/$tag.log"; exit 1; }
+              k=$(grep -c '^VERDICT ' "$B/$tag.log")
+              cp=$(grep -c '^VERDICT ctl-[^ ]* PASS' "$B/$tag.log")
+              mf=$(grep '^VERDICT ' "$B/$tag.log" | grep -v '^VERDICT ctl-' | grep -c '^VERDICT [^ ]* FAIL')
+              mt=$(grep '^VERDICT ' "$B/$tag.log" | grep -vc '^VERDICT ctl-')
+              [ "$mt" -gt 0 ] && [ "$mf" = "$mt" ] && [ "$cp" = $((k - mt)) ] || { cat "$B/$tag.log"; exit 1; }
+              ;;
+            *)
+              dn=$(grep -c '^[^ #]* notrun ' "$case_file" || true)
+              if [ "$dn" = 0 ]; then w=0; else w=2; fi
+              [ "$st" = "$w" ] || { cat "$B/$tag.log"; exit 1; }
+              ;;
+          esac
+          echo "PASS $c"
+        done
+      fi
+    - PARITY_BASE=c17de66b411a06eb5a1c5f462f932e0cad1e8dcb sh tools/migration/parity_check.sh
+    - bash tests/gates/run.sh zero-disk-secrets
+    - ASAN_OPTIONS=detect_leaks=0 make -j1 PHYSICS_DIR=/nonexistent PHYSICS_LOCK_CHECK=0 test-osh-lex test-osh-parse test-osh-expand test-osh-e2e osh-trace test-osh-host test-osh-caps test-osh-journal test-autodiff test-polyglot test-polyglot-asm test-polyglot-encoder test-tensor test-tensor-store test-m20-receipt test-turing-exp001-eval test-gen-abstract-parity check-own30b-decode-profile test-algebra-realize-om argus-replay test-rt-bridges-om test-visor-world-rx-om test-visor-world test-visor-effect-parity test-visor-authority visor-physics-free-check test-tests-rt-1-om test-tests-rt-2-om test-tests-rt-3-om test-tests-rt-4-om test-tests-rt-5-om
+    - mkdir -p build
+    - |
+      { printf 'om2\n'; cat seed/ng/sha256.om protocol/units-gate.om; } | seed/out/omc > build/protocol-units-gate
+      chmod +x build/protocol-units-gate
+      ./build/protocol-units-gate seed/out/omc build/protocol-units-gate-scratch
+    - |
+      cat si/directives/om2.om om/tls/sha2.om protocol/uor-gpu/b3_uor.om protocol/omnet/om/sha512/sha512.om protocol/omnet/om/ed25519/ed25519.om protocol/uor-gpu/canonical.om protocol/uor-gpu/payload_vm.om protocol/uor-gpu/verify.om protocol/uor-gpu/gate.om protocol/uor-gpu/emit_kernels.om protocol/uor-gpu/ed_sign.om protocol/uor-gpu/uor-gpu-gate.om | seed/out/omc > build/uor_gpu_gate
+      chmod +x build/uor_gpu_gate
+      ./build/uor_gpu_gate
+    - |
+      { printf 'target a64macos\n'; cat seed/omc/omc.om; } | seed/out/omc > omc-macos
+      chmod 755 omc-macos
+  artifacts:
+    paths:
+      - omc-macos
+    expire_in: 1 day
+
+# GitLab SaaS macOS runners (saas-macos-medium-m1) require Premium/Ultimate (no_matching_runner on Free tier);
+# keep manual + allow_failure so a self-hosted or paid macOS runner can still execute gate-macos on the artifact.
+macos-arm64-gate:
+  tags:
+    - saas-macos-medium-m1
+  image: macos-14-xcode-15
+  needs:
+    - linux-arm64-phase1a
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^feat\//'
+      when: manual
+      allow_failure: true
+  script:
+    - chmod +x omc-macos
+    - codesign -s - -f omc-macos
+    - sh seed/macos/gate-macos.sh ./omc-macos
