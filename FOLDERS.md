@@ -484,10 +484,6 @@ PD-0 score: see docs on physics main
 
 Ionic-droplet reservoir simulator (omega#440): binary32 fixed-step RK4 of the authors' droplet model, refusals instead of silent repair, run receipts, binary64 ridge readout. CPU only; the reference and contract are docs/reservoir/RESERVOIR_REFERENCE.md.
 
-## `src/synapse/`
-
-Synapse ADR 0003 J1 binary codec port: layout list, generator, syn_codec.osc (A1 WAL records + checkpoints, strict decode, typed refusals)
-
 ## `src/tensor/`
 
 M20 OMEGA_TENSOR: immutable tensor semantic layer, views, generation-checked storage, CPU realization over E1 (not qualified)
@@ -555,10 +551,6 @@ Reservoir tests (omega#440): Gate 1 simulator and readout checks against an inde
 ## `tests/reservoir/fixtures/`
 
 Two unmodified CC-BY-4.0 files from the authors' Zenodo archive 10.5281/zenodo.17296788 (Length5.mat, Length50.mat), sha256-pinned in RESERVOIR_REFERENCE.md section 11.6, so CI can test the .mat reader without the archive. Data, never code; do not edit.
-
-## `tests/synapse/`
-
-J1 parity driver for syn_codec.osc against the sealed Rust A1 corpus (aien-dev/synapse j1-codec-corpus), interp and native
 
 ## `tools/codebook/`
 
