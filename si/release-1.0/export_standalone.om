@@ -1,0 +1,1821 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note si/release-1.0/export_standalone.om: Pure seeded-OM-2 Standalone Community Repo Exporter & Verifier.
+note
+note Build:
+note   seed/out/omc < si/release-1.0/export_standalone.om > export_standalone && chmod +x export_standalone
+note
+note Modes:
+note   1. export_standalone export STANDALONE-REPOS.tsv SOURCE_ROOT OUT_DIR UPSTREAM_COMMIT_40HEX OMC_SHA256_FILE
+note      Reads the declarative sync table, deterministically walks and hashes every canonical source
+note      file (lexicographically sorted), writes per-repo:
+note        - OUT_DIR/<repo>/UPSTREAM_PIN.tsv   (deterministic SHA-256 provenance manifest + tree_sha256)
+note        - OUT_DIR/<repo>/README_ROSETTA.md  (60-Second Omega Rosetta Card README header)
+note        - OUT_DIR/<repo>/omega2_plugin.zig  (for zig-abi-v2 / zig-abi-v2-optional layout repos)
+note      Exits 0 on success (EXPORT_OK), 1 on fail-closed refusal, 2 on usage error.
+note
+note   2. export_standalone verify EXPORT_REPO_DIR SOURCE_ROOT
+note      Re-hashes every file in UPSTREAM_PIN.tsv against SOURCE_ROOT, verifies exact byte count,
+note      per-file SHA-256, row count, and header tree_sha256. Catches any single-byte tamper in either
+note      source files or UPSTREAM_PIN.tsv. Exits 0 (VERIFY_OK) or 1 (VERIFY_FAIL).
+
+note ---- Embedded FIPS 180-4 SHA-256 (pure OM-2, zero external deps)
+global s2_ok ulong 1
+global s2_k uint 64
+global s2_h uint 8
+global s2_w uint 64
+global s2_buf uchar 64
+global s2_n ulong 1
+global s2_tot ulong 1
+global s2_out uchar 32
+
+note ---- Main buffers
+global g_inp uchar 1048576
+global g_out uchar 1048576
+global g_tbuf uchar 1048576
+global g_bsum uchar 65536
+global g_fbuf uchar 65536
+global g_dent uchar 32768
+global g_pa uchar 4096
+global g_pa2 uchar 4096
+global g_src uchar 4096
+global g_dst uchar 4096
+global g_com uchar 64
+global g_pin uchar 64
+global g_pinf uchar 4096
+global g_std uchar 65536
+global g_tmp uchar 4096
+
+note ---- Per-repo file collection & sorting tables (up to 4096 files per repo)
+global g_fpool uchar 524288
+global g_foff ulong 4096
+global g_flen ulong 4096
+global g_ford ulong 4096
+global g_fbytes ulong 4096
+global g_fhex uchar 262144
+global g_treehex uchar 64
+
+note ---- Iterative directory walk queue (up to 2048 subdirs)
+global g_dqpool uchar 262144
+global g_dqoff ulong 2048
+global g_dqlen ulong 2048
+
+note ---- Row column offsets and seen-repo table
+global g_co ulong 16
+global g_cn ulong 16
+global g_seen_o ulong 128
+global g_seen_n ulong 128
+
+note ---- Verify metadata scratch
+global g_vrepo uchar 128
+global g_vtree uchar 64
+global g_vstat ulong 8
+note g_vstat: 0=repo_len, 1=has_fc, 2=hdr_fc, 3=has_tree, 4=pending_hdr, 5=rows_ok, 6=hdr_table, 7=fail_cnt
+
+note ---- Global scalar slots g_n[0..31]
+global g_n ulong 32
+note g_n:
+note   0=inp_len, 1=out_len, 2=tbuf_len, 3=bsum_len, 4=std_len,
+note   5=pa_len, 6=src_len, 7=dst_len, 8=fpool_len, 9=file_cnt,
+note   10=dqpool_len, 11=dq_head, 12=dq_tail, 13=seen_cnt, 14=repos_done,
+note   15=total_files, 16=hdr_seen, 17=cur_mode, 18=cur_pending, 19=pa2_len,
+note   20=tmp_len
+
+text t_usage "usage:\n  export_standalone export STANDALONE-REPOS.tsv SOURCE_ROOT OUT_DIR UPSTREAM_COMMIT_40HEX OMC_SHA256_FILE\n  export_standalone verify EXPORT_REPO_DIR SOURCE_ROOT\n"
+text t_mexp "export"
+text t_mver "verify"
+text t_hdr "repo\tsource_dirs\tlayout_mode\tom_entry\tupstream_url\tdescription"
+text t_pinhdr "relpath\tbytes\tsha256"
+text t_mpure "pure-om"
+text t_mpopt "pure-om-optional"
+text t_mzig "zig-abi-v2"
+text t_mzopt "zig-abi-v2-optional"
+
+text t_dot "."
+text t_dd ".."
+text t_dgit ".git"
+text t_dds ".DS_Store"
+text t_dbld "build"
+text t_dpy "__pycache__"
+
+text t_upin "/UPSTREAM_PIN.tsv"
+text t_rros "/README_ROSETTA.md"
+text t_zplg "/omega2_plugin.zig"
+text t_pend "PENDING_SOURCE\n"
+
+text t_fail "EXPORT_FAIL "
+text t_vfail "VERIFY_FAIL "
+text t_rea "reason="
+text t_rp "repo="
+text t_sp " "
+text t_exok "EXPORT_OK repos="
+text t_exed "EXPORTED repo="
+text t_modp " mode="
+text t_filp " files="
+text t_trp " tree_sha256="
+text t_bnp " bundle_sha256="
+text t_vok "VERIFY_OK repo="
+
+text r_arg "BAD_ARGUMENTS"
+text r_com "BAD_UPSTREAM_COMMIT_NOT_40HEX"
+text r_pin "BAD_OMC_SHA256_PIN"
+text r_tab "CANNOT_READ_TABLE"
+text r_hdr "MISSING_OR_BAD_HEADER"
+text r_mkd "CANNOT_CREATE_OUT_DIR"
+text r_col "MALFORMED_TABLE_ROW"
+text r_rep "INVALID_OR_DUPLICATE_REPO_NAME"
+text r_mod "UNKNOWN_LAYOUT_MODE"
+text r_pth "UNSAFE_SOURCE_PATH"
+text r_mis "MISSING_REQUIRED_SOURCE_DIR"
+text r_emp "EMPTY_REQUIRED_SOURCE_DIR"
+text r_cap "FILE_OR_BUFFER_CAPACITY_EXCEEDED"
+text r_rd "FILE_READ_FAILED"
+text r_wr "OUTPUT_WRITE_FAILED"
+text r_vpin "CANNOT_READ_UPSTREAM_PIN"
+text r_vhdr "MALFORMED_UPSTREAM_PIN_HEADER"
+text r_vrow "MALFORMED_UPSTREAM_PIN_ROW"
+text r_vfil "FILE_TAMPER_OR_MISSING"
+text r_vcnt "FILE_COUNT_MISMATCH"
+text r_vtr "TREE_SHA256_MISMATCH"
+
+note ---- UPSTREAM_PIN.tsv templates
+text p_h0 "# Deterministic Standalone Repo Provenance Manifest (generated by export_standalone.om)\n"
+text p_h1 "# upstream_repo\tomega-mv\n# standalone_repo\t"
+text p_h2 "\n# upstream_commit\t"
+text p_h3 "\n# omc_sha256\t"
+text p_h4 "\n# layout_mode\t"
+text p_h5 "\n# source_dirs\t"
+text p_h6 "\n# file_count\t"
+text p_h7 "\n# tree_sha256\t"
+text p_hp "\n# status\tPENDING_SOURCE"
+text p_h8 "\nrelpath\tbytes\tsha256\n"
+
+text v_krepo "# standalone_repo\t"
+text v_kfc "# file_count\t"
+text v_ktree "# tree_sha256\t"
+text v_kpend "# status\tPENDING_SOURCE"
+
+note ---- 60-Second Omega Rosetta Card README templates
+text rc_0 "# "
+text rc_1 "\n\n> "
+text rc_2 "\n>\n> Canonical upstream: `omega-mv` (`"
+text rc_3 "`) | Mirror: "
+text rc_4 "\n\n## 60-Second Omega Rosetta Card\n\nNew to Omega (`.om`)? Every program is plain ASCII, one statement per line, **prefix operators**, explicit bounded loops, zero hidden allocation, and zero C/Python/LLVM on the production path.\n\n| If you know C / Rust / Python | Pure Seeded Omega (`.om`) |\n|---|---|\n| `// comment` or `# comment` | `note comment` |\n| `uint64_t x = a + b;` | `x = add a b` |\n| `v = buf[i];` / `buf[i] = v;` | `v = get buf i` / `put buf i v` |\n| `fn f(a: u64, b: u64) -> u64 { return a * b; }` | `fn f a ulong b ulong to ulong` / `ret mul a b` / `end` |\n| `while (cond) { ... }` | `while cond bound N` ... `end` (trap 4 if exceeded) |\n| `if (x == 0) { ... } else { ... }` | `if eq x 0` ... `else` ... `end` |\n| `let s: &[u8] = &buf[off..off+n];` | `part buf off n` passed to `a view uchar *` (`om2`) |\n| `char msg[] = \"hi\\n\";` | `text msg \"hi\\n\"` |\n\n### Compile & Run in 2 Commands (408-Byte Seed Trust Chain)\n\nOmega compiles itself from a 408-byte hand-written loader (`seed0 -> hex1 -> asm2 -> om4 -> omc`) with zero C compiler on the bootstrap path:\n\n```sh\n# 1. Verify pinned seeded compiler digest (must match UPSTREAM_PIN.tsv)\nsha256sum seed/out/omc\n# expected: "
+text rc_5 "\n\n# 2. Compile primary entry unit and verify provenance manifest\nseed/out/omc < "
+text rc_6 " > build_bin && chmod +x build_bin\n```\n\n### Deterministic Upstream Provenance Pin\n\n| Field | Value |\n|---|---|\n| Standalone repo | `"
+text rc_7 "` |\n| Upstream `omega-mv` commit | `"
+text rc_8 "` |\n| Canonical source dir(s) | `"
+text rc_9 "` |\n| Layout mode | `"
+text rc_10 "` |\n| Pinned `seed/out/omc` SHA-256 | `"
+text rc_11 "` |\n| Deterministic `tree_sha256` | `"
+text rc_12 "` |\n| Exported files | `"
+text rc_13 "` |\n\nVerify every exported file against `UPSTREAM_PIN.tsv` fail-closed:\n\n```sh\nexport_standalone verify . /path/to/omega-mv\n```\n"
+
+note ---- Zig ABI v2 plugin layout template (for tensorfold-omega)
+text zg_0 "// Generated by pure seeded-OM-2 si/release-1.0/export_standalone.om\n// Standalone Zig ABI v2 (omega2_*) plugin layout for: "
+text zg_1 "\n// Upstream omega-mv commit: "
+text zg_2 "\n// Pinned seed/out/omc SHA-256: "
+text zg_3 "\n// Deterministic tree_sha256: "
+text zg_4 "\n//\n// Contract (docs/NATIVE-ABI.md, ABI v2):\n//   - Every OM-2 export fn binds as extern symbol `omega2_<name>`.\n//   - Unsized views pass `(ptr, count)` with alignment & overflow checks before Omega runs.\n//   - `out` buffers copy back to caller ONLY on status == OMEGA_OK (0).\n//   - Non-zero status never triggers UB: 32 = bad argument/overlap, 33 = reentry, 101..114 = trap.\n\npub const OMEGA_OK: u32 = 0;\npub const OMEGA_ERR_BAD_ARG: u32 = 32;\npub const OMEGA_ERR_REENTRY: u32 = 33;\n\npub const UPSTREAM_COMMIT = \""
+text zg_5 "\";\npub const OMC_SHA256 = \""
+text zg_6 "\";\npub const TREE_SHA256 = \""
+text zg_7 "\";\n\npub const PluginIdent = extern struct {\n    unit_sha256: [32]u8,\n    omc_sha256: [32]u8,\n    abi_version: u32,\n    flags: u32,\n};\n\npub extern \"c\" fn omega2_ident_plugin(out_ident: *PluginIdent) callconv(.c) u32;\npub extern \"c\" fn omega2_tensor_op(\n    in_ptr: [*]const u8,\n    in_len: u64,\n    out_ptr: [*]u8,\n    out_len: u64,\n) callconv(.c) u32;\n"
+
+note ---- SHA-256 (FIPS 180-4)
+fn s2_setup to void
+if eq get s2_ok 0 1
+ret
+end
+put s2_k 0 1116352408
+put s2_k 1 1899447441
+put s2_k 2 3049323471
+put s2_k 3 3921009573
+put s2_k 4 961987163
+put s2_k 5 1508970993
+put s2_k 6 2453635748
+put s2_k 7 2870763221
+put s2_k 8 3624381080
+put s2_k 9 310598401
+put s2_k 10 607225278
+put s2_k 11 1426881987
+put s2_k 12 1925078388
+put s2_k 13 2162078206
+put s2_k 14 2614888103
+put s2_k 15 3248222580
+put s2_k 16 3835390401
+put s2_k 17 4022224774
+put s2_k 18 264347078
+put s2_k 19 604807628
+put s2_k 20 770255983
+put s2_k 21 1249150122
+put s2_k 22 1555081692
+put s2_k 23 1996064986
+put s2_k 24 2554220882
+put s2_k 25 2821834349
+put s2_k 26 2952996808
+put s2_k 27 3210313671
+put s2_k 28 3336571891
+put s2_k 29 3584528711
+put s2_k 30 113926993
+put s2_k 31 338241895
+put s2_k 32 666307205
+put s2_k 33 773529912
+put s2_k 34 1294757372
+put s2_k 35 1396182291
+put s2_k 36 1695183700
+put s2_k 37 1986661051
+put s2_k 38 2177026350
+put s2_k 39 2456956037
+put s2_k 40 2730485921
+put s2_k 41 2820302411
+put s2_k 42 3259730800
+put s2_k 43 3345764771
+put s2_k 44 3516065817
+put s2_k 45 3600352804
+put s2_k 46 4094571909
+put s2_k 47 275423344
+put s2_k 48 430227734
+put s2_k 49 506948616
+put s2_k 50 659060556
+put s2_k 51 883997877
+put s2_k 52 958139571
+put s2_k 53 1322822218
+put s2_k 54 1537002063
+put s2_k 55 1747873779
+put s2_k 56 1955562222
+put s2_k 57 2024104815
+put s2_k 58 2227730452
+put s2_k 59 2361852424
+put s2_k 60 2428436474
+put s2_k 61 2756734187
+put s2_k 62 3204031479
+put s2_k 63 3329325298
+put s2_ok 0 1
+end
+
+fn s2_init to void
+s2_setup
+put s2_h 0 1779033703
+put s2_h 1 3144134277
+put s2_h 2 1013904242
+put s2_h 3 2773480762
+put s2_h 4 1359893119
+put s2_h 5 2600822924
+put s2_h 6 528734635
+put s2_h 7 1541459225
+put s2_n 0 0
+put s2_tot 0 0
+end
+
+fn s2_rounds to void
+a = get s2_h 0
+b = get s2_h 1
+c = get s2_h 2
+d = get s2_h 3
+e = get s2_h 4
+f = get s2_h 5
+g = get s2_h 6
+h = get s2_h 7
+for r2 ulong 64
+x2 = or shr e 6 shl e 26
+x2 = xor x2 or shr e 11 shl e 21
+x2 = xor x2 or shr e 25 shl e 7
+x2 = add x2 h
+x2 = add x2 xor and e f and not e g
+x2 = add x2 get s2_k r2
+x2 = add x2 get s2_w r2
+h = g
+g = f
+f = e
+e = add d x2
+d = c
+c = b
+b = a
+y2 = or shr b 2 shl b 30
+y2 = xor y2 or shr b 13 shl b 19
+y2 = xor y2 or shr b 22 shl b 10
+x2 = add x2 y2
+y2 = xor and b c and b d
+y2 = xor y2 and c d
+a = add x2 y2
+end
+put s2_h 0 add get s2_h 0 a
+put s2_h 1 add get s2_h 1 b
+put s2_h 2 add get s2_h 2 c
+put s2_h 3 add get s2_h 3 d
+put s2_h 4 add get s2_h 4 e
+put s2_h 5 add get s2_h 5 f
+put s2_h 6 add get s2_h 6 g
+put s2_h 7 add get s2_h 7 h
+end
+
+fn s2_compress to void
+for t ulong 16
+p = mul t 4
+v = or shl uint get s2_buf p 24 shl uint get s2_buf add p 1 16
+v = or v or shl uint get s2_buf add p 2 8 uint get s2_buf add p 3
+put s2_w t v
+end
+for u ulong 48
+i = add u 16
+x = get s2_w sub i 2
+s = or shr x 17 shl x 15
+s = xor s or shr x 19 shl x 13
+s = xor s shr x 10
+y = get s2_w sub i 15
+r = or shr y 7 shl y 25
+r = xor r or shr y 18 shl y 14
+r = xor r shr y 3
+s = add s get s2_w sub i 7
+r = add r get s2_w sub i 16
+put s2_w i add s r
+end
+s2_rounds
+end
+
+fn s2_byte b uchar to void
+n = get s2_n 0
+put s2_buf n b
+n = add n 1
+if eq n 64
+s2_compress
+n = ulong 0
+end
+put s2_n 0 n
+put s2_tot 0 add get s2_tot 0 1
+end
+
+fn s2_fin to void
+bits = mul get s2_tot 0 8
+n = get s2_n 0
+put s2_buf n 128
+n = add n 1
+if gt n 56
+while lt n 64 bound 64
+put s2_buf n 0
+n = add n 1
+end
+s2_compress
+n = ulong 0
+end
+while lt n 56 bound 64
+put s2_buf n 0
+n = add n 1
+end
+for k ulong 8
+put s2_buf add 56 k uchar and shr bits mul sub 7 k 8 255
+end
+s2_compress
+put s2_n 0 0
+for j ulong 8
+w = ulong get s2_h j
+o = mul j 4
+put s2_out o uchar and shr w 24 255
+put s2_out add o 1 uchar and shr w 16 255
+put s2_out add o 2 uchar and shr w 8 255
+put s2_out add o 3 uchar and w 255
+end
+end
+
+fn hexd v ulong to uchar
+if lt v 10
+ret uchar add v 48
+end
+ret uchar add v 87
+end
+
+fn is_lhex c uchar to bool
+d = and ge c 48 le c 57
+h = and ge c 97 le c 102
+ret or d h
+end
+
+note ---- Stdout buffer helpers (g_std)
+fn sflush to void
+n = get g_n 4
+p = ulong 0
+while lt p n bound 65537
+k = write 1 g_std p sub n p
+if le k 0
+break
+end
+p = add p ulong k
+end
+put g_n 4 0
+end
+
+fn sc c uchar to void
+n = get g_n 4
+if ge n 65400
+sflush
+n = get g_n 4
+end
+put g_std n c
+put g_n 4 add n 1
+end
+
+fn st t view uchar * to void
+for i ulong len t bound 4096
+sc get t i
+end
+end
+
+fn si_inp o ulong n ulong to void
+lim = n
+if gt lim 512
+lim = 512
+end
+for i ulong lim bound 512
+sc get g_inp add o i
+end
+end
+
+fn snum v ulong to void
+if ge v 10
+snum div v 10
+end
+sc uchar add 48 rem v 10
+end
+
+fn shex32 to void
+for j ulong 32
+b = ulong get s2_out j
+sc hexd shr b 4
+sc hexd and b 15
+end
+end
+
+fn die_exp rea view uchar * o ulong n ulong to void
+sflush
+w = write 1 t_fail 0 len t_fail
+w = write 1 t_rea 0 len t_rea
+w = write 1 rea 0 len rea
+if gt n 0
+w = write 1 t_sp 0 len t_sp
+lim = n
+if gt lim 512
+lim = 512
+end
+w = write 1 g_inp o lim
+end
+nl = new uchar 1 10
+w = write 1 nl 0 1
+exit 1
+end
+
+fn die_ver rea view uchar * o ulong n ulong to void
+sflush
+w = write 1 t_vfail 0 len t_vfail
+w = write 1 t_rea 0 len t_rea
+w = write 1 rea 0 len rea
+if gt n 0
+w = write 1 t_sp 0 len t_sp
+lim = n
+if gt lim 512
+lim = 512
+end
+w = write 1 g_inp o lim
+end
+nl = new uchar 1 10
+w = write 1 nl 0 1
+exit 1
+end
+
+note ---- File output buffer helpers (g_out)
+fn oclr to void
+put g_n 1 0
+end
+
+fn oc c uchar to void
+n = get g_n 1
+if ge n 1048575
+die_exp r_cap 0 0
+end
+put g_out n c
+put g_n 1 add n 1
+end
+
+fn ot t view uchar * to void
+for i ulong len t bound 8192
+oc get t i
+end
+end
+
+fn oi o ulong n ulong to void
+for i ulong n bound 65536
+oc get g_inp add o i
+end
+end
+
+fn ofp o ulong n ulong to void
+for i ulong n bound 4096
+oc get g_fpool add o i
+end
+end
+
+fn onum v ulong to void
+if ge v 10
+onum div v 10
+end
+oc uchar add 48 rem v 10
+end
+
+fn ocom to void
+for j ulong 40
+oc get g_com j
+end
+end
+
+fn opin to void
+for j ulong 64
+oc get g_pin j
+end
+end
+
+fn otree to void
+for j ulong 64
+oc get g_treehex j
+end
+end
+
+fn ofhex idx ulong to void
+base = mul idx 64
+for j ulong 64
+oc get g_fhex add base j
+end
+end
+
+note ---- Tree buffer helpers (g_tbuf)
+fn tclr to void
+put g_n 2 0
+end
+
+fn tc c uchar to void
+n = get g_n 2
+if ge n 1048575
+die_exp r_cap 0 0
+end
+put g_tbuf n c
+put g_n 2 add n 1
+end
+
+fn tnum v ulong to void
+if ge v 10
+tnum div v 10
+end
+tc uchar add 48 rem v 10
+end
+
+note ---- Bundle summary buffer helpers (g_bsum)
+fn bc c uchar to void
+n = get g_n 3
+if ge n 65535
+die_exp r_cap 0 0
+end
+put g_bsum n c
+put g_n 3 add n 1
+end
+
+fn bnum v ulong to void
+if ge v 10
+bnum div v 10
+end
+bc uchar add 48 rem v 10
+end
+
+note ---- Path builder g_pa[0..g_n 5)
+fn pclr to void
+put g_n 5 0
+end
+
+fn pc c uchar to void
+n = get g_n 5
+if ge n 4094
+die_exp r_cap 0 0
+end
+put g_pa n c
+put g_n 5 add n 1
+end
+
+fn pt t view uchar * to void
+for i ulong len t bound 4096
+pc get t i
+end
+end
+
+fn psrc to void
+for i ulong get g_n 6 bound 4096
+pc get g_src i
+end
+end
+
+fn pdst to void
+for i ulong get g_n 7 bound 4096
+pc get g_dst i
+end
+end
+
+fn pinp o ulong n ulong to void
+for i ulong n bound 4096
+pc get g_inp add o i
+end
+end
+
+fn pfpool o ulong n ulong to void
+for i ulong n bound 4096
+pc get g_fpool add o i
+end
+end
+
+fn pdq o ulong n ulong to void
+for i ulong n bound 4096
+pc get g_dqpool add o i
+end
+end
+
+note ---- Path builder g_pa2[0..g_n 19) for temp comparisons
+fn p2clr to void
+put g_n 19 0
+end
+
+fn p2c c uchar to void
+n = get g_n 19
+if ge n 4094
+die_exp r_cap 0 0
+end
+put g_pa2 n c
+put g_n 19 add n 1
+end
+
+note ---- Compare helpers on g_inp
+fn eq_it o ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get g_inp add o i get t i
+ret false
+end
+end
+ret true
+end
+
+fn eq_ii o1 ulong n1 ulong o2 ulong n2 ulong to bool
+if ne n1 n2
+ret false
+end
+for i ulong n1 bound 4096
+if ne get g_inp add o1 i get g_inp add o2 i
+ret false
+end
+end
+ret true
+end
+
+fn pref_it o ulong n ulong t view uchar * to bool
+if lt n len t
+ret false
+end
+for i ulong len t bound 64
+if ne get g_inp add o i get t i
+ret false
+end
+end
+ret true
+end
+
+fn eq_tmp t view uchar * to bool
+n = get g_n 20
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get g_tmp i get t i
+ret false
+end
+end
+ret true
+end
+
+note ---- File I/O helpers
+fn ensure_dir to bool
+r = makedir g_pa 0 get g_n 5 493
+if or eq r 0 eq r -17
+ret true
+end
+ret false
+end
+
+fn write_gout_to_pa to bool
+fd = fopen g_pa 0 get g_n 5 524865 420
+if lt fd 0
+ret false
+end
+n = get g_n 1
+p = ulong 0
+while lt p n bound 1048577
+k = write int fd g_out p sub n p
+if le k 0
+z = fclose int fd
+ret false
+end
+p = add p ulong k
+end
+z = fclose int fd
+ret true
+end
+
+fn read_pa_to_inp to bool
+fd = fopen g_pa 0 get g_n 5 524288 0
+if lt fd 0
+ret false
+end
+n = ulong 0
+while lt n 1048576 bound 1048577
+k = read int fd g_inp n sub 1048576 n
+if lt k 0
+z = fclose int fd
+ret false
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+z = fclose int fd
+if or eq n 0 ge n 1048576
+ret false
+end
+put g_n 0 n
+ret true
+end
+
+note Hash file at g_pa streaming in 64 KiB chunks; returns byte count, or 2^63 on failure
+fn hash_pa_file to ulong
+fd = fopen g_pa 0 get g_n 5 524288 0
+if lt fd 0
+ret shl ulong 1 63
+end
+s2_init
+tot = ulong 0
+while true bound 1048576
+k = read int fd g_fbuf 0 65536
+if lt k 0
+z = fclose int fd
+ret shl ulong 1 63
+end
+if eq k 0
+break
+end
+m = ulong k
+for i ulong m bound 65536
+s2_byte get g_fbuf i
+end
+tot = add tot m
+end
+z = fclose int fd
+s2_fin
+ret tot
+end
+
+note ---- Safety validation for relative paths in g_inp[o, o+n)
+fn seg_is_dotdot o ulong p ulong sl ulong to bool
+if ne sl 2
+ret false
+end
+if ne get g_inp add o p 46
+ret false
+end
+ret eq get g_inp add o add p 1 46
+end
+
+fn safe_relpath o ulong n ulong to bool
+if or eq n 0 gt n 512
+ret false
+end
+if eq get g_inp o 47
+ret false
+end
+if eq get g_inp add o sub n 1 47
+ret false
+end
+p = ulong 0
+while lt p n bound 513
+q = p
+while lt q n bound 512
+c = get g_inp add o q
+if eq c 47
+break
+end
+if or le c 32 eq c 127
+ret false
+end
+if eq c 92
+ret false
+end
+q = add q 1
+end
+sl = sub q p
+if eq sl 0
+ret false
+end
+if eq sl 1
+if eq get g_inp add o p 46
+ret false
+end
+end
+if seg_is_dotdot o p sl
+ret false
+end
+p = add q 1
+end
+ret true
+end
+
+fn valid_repo_name o ulong n ulong to bool
+if or eq n 0 gt n 64
+ret false
+end
+if or eq_it o n t_dot eq_it o n t_dd
+ret false
+end
+for i ulong n bound 64
+c = get g_inp add o i
+ok = or and ge c 48 le c 57 and ge c 65 le c 90
+ok = or ok or and ge c 97 le c 122 or eq c 45 or eq c 95 eq c 46
+if not ok
+ret false
+end
+end
+cnt = get g_n 13
+for i ulong cnt bound 128
+if eq_ii get g_seen_o i get g_seen_n i o n
+ret false
+end
+end
+if ge cnt 128
+ret false
+end
+put g_seen_o cnt o
+put g_seen_n cnt n
+put g_n 13 add cnt 1
+ret true
+end
+
+note ---- Directory walk helpers
+fn dq_push_pa2 to void
+tail = get g_n 12
+if ge tail 2048
+die_exp r_cap 0 0
+end
+po = get g_n 10
+n = get g_n 19
+if gt add po n 262144
+die_exp r_cap 0 0
+end
+for i ulong n bound 4096
+put g_dqpool add po i get g_pa2 i
+end
+put g_dqoff tail po
+put g_dqlen tail n
+put g_n 10 add po n
+put g_n 12 add tail 1
+end
+
+fn fpool_push_pa2 to void
+fc = get g_n 9
+if ge fc 4096
+die_exp r_cap 0 0
+end
+po = get g_n 8
+n = get g_n 19
+if gt add po n 524288
+die_exp r_cap 0 0
+end
+for i ulong n bound 4096
+put g_fpool add po i get g_pa2 i
+end
+put g_foff fc po
+put g_flen fc n
+put g_ford fc fc
+put g_n 8 add po n
+put g_n 9 add fc 1
+end
+
+fn dent_nlen ns ulong lim ulong to ulong
+k = ulong 0
+while lt add ns k lim bound 512
+if eq get g_dent add ns k 0
+break
+end
+k = add k 1
+end
+ret k
+end
+
+fn dent_eq ns ulong nl ulong t view uchar * to bool
+if ne nl len t
+ret false
+end
+for i ulong nl bound 256
+if ne get g_dent add ns i get t i
+ret false
+end
+end
+ret true
+end
+
+fn skip_entry ns ulong nl ulong to bool
+if eq nl 0
+ret true
+end
+if or dent_eq ns nl t_dot dent_eq ns nl t_dd
+ret true
+end
+if or dent_eq ns nl t_dgit dent_eq ns nl t_dds
+ret true
+end
+if or dent_eq ns nl t_dbld dent_eq ns nl t_dpy
+ret true
+end
+ret false
+end
+
+fn build_child_rel d_o ulong d_n ulong ns ulong nl ulong to void
+p2clr
+for i ulong d_n bound 4096
+p2c get g_dqpool add d_o i
+end
+p2c 47
+for i ulong nl bound 512
+p2c get g_dent add ns i
+end
+end
+
+fn probe_pa2_is_dir to bool
+pclr
+psrc
+pc 47
+for i ulong get g_n 19 bound 4096
+pc get g_pa2 i
+end
+fd = fopen g_pa 0 get g_n 5 540672 0
+if ge fd 0
+z = fclose int fd
+ret true
+end
+ret false
+end
+
+fn dent_rlen pos ulong to ulong
+b0 = ulong get g_dent add pos 16
+b1 = ulong get g_dent add pos 17
+ret or b0 shl b1 8
+end
+
+fn handle_dent_item d_o ulong d_n ulong dt uchar ns ulong nl ulong to void
+if skip_entry ns nl
+ret
+end
+build_child_rel d_o d_n ns nl
+if eq dt 4
+dq_push_pa2
+ret
+end
+if eq dt 8
+fpool_push_pa2
+ret
+end
+if eq dt 0
+if probe_pa2_is_dir
+dq_push_pa2
+else
+fpool_push_pa2
+end
+end
+end
+
+fn scan_dent_buf d_o ulong d_n ulong lim ulong to void
+pos = ulong 0
+while lt pos lim bound 32768
+rlen = dent_rlen pos
+if eq rlen 0
+break
+end
+dt = get g_dent add pos 18
+ns = add pos 19
+nl = dent_nlen ns add pos rlen
+handle_dent_item d_o d_n dt ns nl
+pos = add pos rlen
+end
+end
+
+fn walk_one_dir d_o ulong d_n ulong to bool
+pclr
+psrc
+pc 47
+pdq d_o d_n
+dfd = fopen g_pa 0 get g_n 5 540672 0
+if lt dfd 0
+ret false
+end
+while true bound 65536
+nr = getdnts int dfd g_dent 0 32768
+if le nr 0
+break
+end
+scan_dent_buf d_o d_n ulong nr
+end
+z = fclose int dfd
+ret true
+end
+
+fn walk_dir_tree o ulong n ulong to bool
+put g_n 10 0
+put g_n 11 0
+put g_n 12 0
+p2clr
+for i ulong n bound 512
+p2c get g_inp add o i
+end
+dq_push_pa2
+first_ok = true
+while lt get g_n 11 get g_n 12 bound 2048
+h = get g_n 11
+put g_n 11 add h 1
+ok = walk_one_dir get g_dqoff h get g_dqlen h
+if and eq h 0 not ok
+first_ok = false
+end
+end
+ret first_ok
+end
+
+note ---- Lexicographical sort of collected file indices g_ford[0..file_cnt)
+note returns true if file a > file b lexicographically
+fn fidx_gt a ulong b ulong to bool
+oa = get g_foff a
+na = get g_flen a
+ob = get g_foff b
+nb = get g_flen b
+m = na
+if lt nb m
+m = nb
+end
+for i ulong m bound 4096
+ca = get g_fpool add oa i
+cb = get g_fpool add ob i
+if ne ca cb
+ret gt ca cb
+end
+end
+ret gt na nb
+end
+
+fn sift_gap gap ulong i ulong to void
+tmp = get g_ford i
+j = i
+while ge j gap bound 4096
+prev = get g_ford sub j gap
+if fidx_gt prev tmp
+put g_ford j prev
+j = sub j gap
+else
+break
+end
+end
+put g_ford j tmp
+end
+
+fn sort_files to void
+fc = get g_n 9
+if le fc 1
+ret
+end
+gap = div fc 2
+while gt gap 0 bound 32
+i = gap
+while lt i fc bound 4096
+sift_gap gap i
+i = add i 1
+end
+gap = div gap 2
+end
+end
+
+note ---- Hash all sorted files & build deterministic tree_sha256
+fn store_s2_fhex base ulong to void
+for j ulong 32
+b = ulong get s2_out j
+o = add base mul j 2
+put g_fhex o hexd shr b 4
+put g_fhex add o 1 hexd and b 15
+end
+end
+
+fn hash_one_file k ulong to void
+idx = get g_ford k
+fo = get g_foff idx
+fnl = get g_flen idx
+pclr
+psrc
+pc 47
+pfpool fo fnl
+sz = hash_pa_file
+if eq sz shl ulong 1 63
+die_exp r_rd 0 0
+end
+put g_fbytes idx sz
+base = mul idx 64
+store_s2_fhex base
+for j ulong fnl bound 4096
+tc get g_fpool add fo j
+end
+tc 9
+tnum sz
+tc 9
+for j ulong 64
+tc get g_fhex add base j
+end
+tc 10
+end
+
+fn hash_all_files to void
+fc = get g_n 9
+tclr
+for k ulong fc bound 4096
+hash_one_file k
+end
+
+s2_init
+if eq fc 0
+for j ulong len t_pend bound 32
+s2_byte get t_pend j
+end
+else
+tn = get g_n 2
+for j ulong tn bound 1048576
+s2_byte get g_tbuf j
+end
+end
+s2_fin
+for j ulong 32
+b = ulong get s2_out j
+o = mul j 2
+put g_treehex o hexd shr b 4
+put g_treehex add o 1 hexd and b 15
+end
+end
+
+note ---- Write UPSTREAM_PIN.tsv for current repo
+fn emit_upstream_pin to void
+fc = get g_n 9
+oclr
+ot p_h0
+ot p_h1
+oi get g_co 0 get g_cn 0
+ot p_h2
+ocom
+ot p_h3
+opin
+ot p_h4
+oi get g_co 2 get g_cn 2
+ot p_h5
+oi get g_co 1 get g_cn 1
+ot p_h6
+onum fc
+ot p_h7
+otree
+if and eq fc 0 ne get g_n 18 0
+ot p_hp
+end
+ot p_h8
+for k ulong fc bound 4096
+idx = get g_ford k
+ofp get g_foff idx get g_flen idx
+oc 9
+onum get g_fbytes idx
+oc 9
+ofhex idx
+oc 10
+end
+
+pclr
+pdst
+pc 47
+pinp get g_co 0 get g_cn 0
+pt t_upin
+if not write_gout_to_pa
+die_exp r_wr get g_co 0 get g_cn 0
+end
+end
+
+note ---- Write 60-Second Omega Rosetta Card README_ROSETTA.md for current repo
+fn emit_rosetta_card to void
+oclr
+ot rc_0
+oi get g_co 0 get g_cn 0
+ot rc_1
+oi get g_co 5 get g_cn 5
+ot rc_2
+oi get g_co 1 get g_cn 1
+ot rc_3
+oi get g_co 4 get g_cn 4
+ot rc_4
+opin
+ot rc_5
+oi get g_co 3 get g_cn 3
+ot rc_6
+oi get g_co 0 get g_cn 0
+ot rc_7
+ocom
+ot rc_8
+oi get g_co 1 get g_cn 1
+ot rc_9
+oi get g_co 2 get g_cn 2
+ot rc_10
+opin
+ot rc_11
+otree
+ot rc_12
+onum get g_n 9
+ot rc_13
+
+pclr
+pdst
+pc 47
+pinp get g_co 0 get g_cn 0
+pt t_rros
+if not write_gout_to_pa
+die_exp r_wr get g_co 0 get g_cn 0
+end
+end
+
+note ---- Write optional Zig ABI v2 plugin layout (omega2_plugin.zig)
+fn emit_zig_plugin to void
+ro = get g_co 0
+rn = get g_cn 0
+oclr
+ot zg_0
+oi ro rn
+ot zg_1
+ocom
+ot zg_2
+opin
+ot zg_3
+otree
+ot zg_4
+ocom
+ot zg_5
+opin
+ot zg_6
+otree
+ot zg_7
+
+pclr
+pdst
+pc 47
+pinp ro rn
+pt t_zplg
+if not write_gout_to_pa
+die_exp r_wr ro rn
+end
+end
+
+note ---- Layout mode classifier: 1=pure-om, 2=pure-om-optional, 3=zig-abi-v2, 4=zig-abi-v2-optional, 0=invalid
+fn parse_mode o ulong n ulong to ulong
+if eq_it o n t_mpure
+ret 1
+end
+if eq_it o n t_mpopt
+ret 2
+end
+if eq_it o n t_mzig
+ret 3
+end
+if eq_it o n t_mzopt
+ret 4
+end
+ret 0
+end
+
+fn split_cols s ulong e ulong to ulong
+cnt = ulong 0
+p = s
+while le p e bound 1048577
+q = p
+while lt q e bound 1048576
+if eq get g_inp q 9
+break
+end
+q = add q 1
+end
+if lt cnt 16
+put g_co cnt p
+put g_cn cnt sub q p
+end
+cnt = add cnt 1
+if ge q e
+break
+end
+p = add q 1
+end
+ret cnt
+end
+
+note ---- Process one STANDALONE-REPOS.tsv row
+fn walk_src_list is_opt bool to void
+p = get g_co 1
+end_s = add p get g_cn 1
+while lt p end_s bound 1024
+q = p
+while lt q end_s bound 1024
+if eq get g_inp q 44
+break
+end
+q = add q 1
+end
+dl = sub q p
+if not safe_relpath p dl
+die_exp r_pth p dl
+end
+ok = walk_dir_tree p dl
+if not ok
+if is_opt
+put g_n 18 1
+else
+die_exp r_mis p dl
+end
+end
+p = add q 1
+end
+end
+
+fn record_exported to void
+ro = get g_co 0
+rn = get g_cn 0
+fc = get g_n 9
+for j ulong rn bound 64
+bc get g_inp add ro j
+end
+bc 9
+bnum fc
+bc 9
+for j ulong 64
+bc get g_treehex j
+end
+bc 10
+put g_n 14 add get g_n 14 1
+put g_n 15 add get g_n 15 fc
+st t_exed
+si_inp ro rn
+st t_modp
+si_inp get g_co 2 get g_cn 2
+st t_filp
+snum fc
+st t_trp
+for j ulong 64
+sc get g_treehex j
+end
+sc 10
+sflush
+end
+
+fn process_export_row s ulong e ulong to void
+if eq s e
+ret
+end
+if eq get g_inp s 35
+ret
+end
+if eq get g_n 16 0
+if eq_it s sub e s t_hdr
+put g_n 16 1
+ret
+end
+die_exp r_hdr s sub e s
+end
+
+nc = split_cols s e
+if ne nc 6
+die_exp r_col s sub e s
+end
+
+ro = get g_co 0
+rn = get g_cn 0
+if not valid_repo_name ro rn
+die_exp r_rep ro rn
+end
+
+lm = parse_mode get g_co 2 get g_cn 2
+if eq lm 0
+die_exp r_mod get g_co 2 get g_cn 2
+end
+put g_n 17 lm
+
+is_opt = or eq lm 2 eq lm 4
+put g_n 8 0
+put g_n 9 0
+put g_n 18 0
+
+walk_src_list is_opt
+
+if and eq get g_n 9 0 not is_opt
+die_exp r_emp ro rn
+end
+
+sort_files
+hash_all_files
+
+pclr
+pdst
+pc 47
+pinp ro rn
+if not ensure_dir
+die_exp r_mkd ro rn
+end
+
+emit_upstream_pin
+emit_rosetta_card
+if or eq lm 3 eq lm 4
+emit_zig_plugin
+end
+
+record_exported
+end
+
+note ---- Verify mode helpers
+fn parse_u64 o ulong n ulong to ulong
+if or eq n 0 gt n 20
+ret shl ulong 1 63
+end
+v = ulong 0
+for i ulong n bound 20
+c = get g_inp add o i
+if or lt c 48 gt c 57
+ret shl ulong 1 63
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn valid_hex_inp o ulong n ulong want ulong to bool
+if ne n want
+ret false
+end
+for i ulong n bound 128
+if not is_lhex get g_inp add o i
+ret false
+end
+end
+ret true
+end
+
+fn s2_matches_inp o ulong to bool
+for j ulong 32
+b = ulong get s2_out j
+if ne get g_inp add o mul j 2 hexd shr b 4
+ret false
+end
+if ne get g_inp add o add mul j 2 1 hexd and b 15
+ret false
+end
+end
+ret true
+end
+
+fn verify_hdr_line s ulong ln ulong to void
+if eq get g_inp s 35
+if pref_it s ln v_krepo
+vo = add s len v_krepo
+vn = sub ln len v_krepo
+if gt vn 128
+vn = 128
+end
+for j ulong vn bound 128
+put g_vrepo j get g_inp add vo j
+end
+put g_vstat 0 vn
+ret
+end
+if pref_it s ln v_kfc
+vo = add s len v_kfc
+vn = sub ln len v_kfc
+fc = parse_u64 vo vn
+if eq fc shl ulong 1 63
+die_ver r_vhdr s ln
+end
+put g_vstat 1 1
+put g_vstat 2 fc
+ret
+end
+if pref_it s ln v_ktree
+vo = add s len v_ktree
+vn = sub ln len v_ktree
+if not valid_hex_inp vo vn 64
+die_ver r_vhdr s ln
+end
+for j ulong 64
+put g_vtree j get g_inp add vo j
+end
+put g_vstat 3 1
+ret
+end
+if eq_it s ln v_kpend
+put g_vstat 4 1
+ret
+end
+ret
+end
+if eq_it s ln t_pinhdr
+put g_vstat 6 1
+ret
+end
+die_ver r_vhdr s ln
+end
+
+fn verify_data_line s ulong e ulong to void
+nc = split_cols s e
+if ne nc 3
+die_ver r_vrow s sub e s
+end
+po = get g_co 0
+pn = get g_cn 0
+if not safe_relpath po pn
+die_ver r_pth po pn
+end
+want_sz = parse_u64 get g_co 1 get g_cn 1
+if eq want_sz shl ulong 1 63
+die_ver r_vrow s sub e s
+end
+if not valid_hex_inp get g_co 2 get g_cn 2 64
+die_ver r_vrow s sub e s
+end
+
+pclr
+psrc
+pc 47
+pinp po pn
+got_sz = hash_pa_file
+if ne got_sz want_sz
+die_ver r_vfil po pn
+end
+if not s2_matches_inp get g_co 2
+die_ver r_vfil po pn
+end
+
+for j ulong pn bound 4096
+tc get g_inp add po j
+end
+tc 9
+bo = get g_co 1
+bn = get g_cn 1
+for j ulong bn bound 32
+tc get g_inp add bo j
+end
+tc 9
+ho = get g_co 2
+for j ulong 64
+tc get g_inp add ho j
+end
+tc 10
+put g_vstat 5 add get g_vstat 5 1
+end
+
+fn handle_verify_line s ulong e ulong to void
+if eq s e
+ret
+end
+if eq get g_vstat 6 0
+verify_hdr_line s sub e s
+ret
+end
+verify_data_line s e
+end
+
+fn run_verify to int
+if ne argcnt 4
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+r1 = argread 2 g_dst 0 4094
+r2 = argread 3 g_src 0 4094
+if or le r1 0 le r2 0
+die_ver r_arg 0 0
+end
+put g_n 7 ulong r1
+put g_n 6 ulong r2
+
+pclr
+pdst
+pt t_upin
+if not read_pa_to_inp
+die_ver r_vpin 0 0
+end
+
+tclr
+n = get g_n 0
+p = ulong 0
+while lt p n bound 1048577
+q = p
+while lt q n bound 1048576
+if eq get g_inp q 10
+break
+end
+q = add q 1
+end
+handle_verify_line p q
+p = add q 1
+end
+
+if or eq get g_vstat 6 0 or eq get g_vstat 1 0 eq get g_vstat 3 0
+die_ver r_vhdr 0 0
+end
+if ne get g_vstat 5 get g_vstat 2
+die_ver r_vcnt 0 0
+end
+
+s2_init
+if eq get g_vstat 5 0
+if eq get g_vstat 4 0
+die_ver r_vhdr 0 0
+end
+for j ulong len t_pend bound 32
+s2_byte get t_pend j
+end
+else
+tn = get g_n 2
+for j ulong tn bound 1048576
+s2_byte get g_tbuf j
+end
+end
+s2_fin
+
+for j ulong 32
+b = ulong get s2_out j
+if ne get g_vtree mul j 2 hexd shr b 4
+die_ver r_vtr 0 0
+end
+if ne get g_vtree add mul j 2 1 hexd and b 15
+die_ver r_vtr 0 0
+end
+end
+
+st t_vok
+for j ulong get g_vstat 0 bound 128
+sc get g_vrepo j
+end
+st t_filp
+snum get g_vstat 5
+st t_trp
+shex32
+sc 10
+sflush
+ret 0
+end
+
+note ---- Export mode entry
+fn load_commit_arg to bool
+r = argread 5 g_com 0 64
+if ne r 40
+ret false
+end
+allz = true
+for j ulong 40
+c = get g_com j
+if not is_lhex c
+ret false
+end
+if ne c 48
+allz = false
+end
+end
+if allz
+ret false
+end
+ret true
+end
+
+fn load_pin_arg to bool
+r = argread 6 g_pa 0 4094
+if le r 0
+ret false
+end
+put g_n 5 ulong r
+fd = fopen g_pa 0 get g_n 5 524288 0
+if lt fd 0
+ret false
+end
+n = ulong 0
+while lt n 4096 bound 4097
+k = read int fd g_pinf n sub 4096 n
+if lt k 0
+z = fclose int fd
+ret false
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+z = fclose int fd
+if lt n 64
+ret false
+end
+for j ulong 64
+c = get g_pinf j
+if not is_lhex c
+ret false
+end
+put g_pin j c
+end
+ret true
+end
+
+fn run_export to int
+if ne argcnt 7
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+if not load_commit_arg
+die_exp r_com 0 0
+end
+if not load_pin_arg
+die_exp r_pin 0 0
+end
+rs = argread 3 g_src 0 4094
+rd = argread 4 g_dst 0 4094
+rt = argread 2 g_pa 0 4094
+if or le rs 0 or le rd 0 le rt 0
+die_exp r_arg 0 0
+end
+put g_n 6 ulong rs
+put g_n 7 ulong rd
+put g_n 5 ulong rt
+if not read_pa_to_inp
+die_exp r_tab 0 0
+end
+
+pclr
+pdst
+if not ensure_dir
+die_exp r_mkd 0 0
+end
+
+n = get g_n 0
+p = ulong 0
+while lt p n bound 1048577
+q = p
+while lt q n bound 1048576
+if eq get g_inp q 10
+break
+end
+q = add q 1
+end
+process_export_row p q
+p = add q 1
+end
+
+if eq get g_n 16 0
+die_exp r_hdr 0 0
+end
+
+s2_init
+bn = get g_n 3
+for j ulong bn bound 65536
+s2_byte get g_bsum j
+end
+s2_fin
+
+st t_exok
+snum get g_n 14
+st t_filp
+snum get g_n 15
+st t_bnp
+shex32
+sc 10
+sflush
+ret 0
+end
+
+fn main to int
+if lt argcnt 2
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+r = argread 1 g_tmp 0 4094
+if le r 0
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+put g_n 20 ulong r
+if eq_tmp t_mexp
+ret run_export
+end
+if eq_tmp t_mver
+ret run_verify
+end
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
