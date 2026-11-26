@@ -1,0 +1,1487 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/modules/rm6/modlink.om:
+note Pure seeded OM-2 Digest-Addressed Module Compiler & Linker (RM6).
+note
+note Syntax supported inside `.om` module units:
+note   Line 1 (profile): `om2` | `om2 debug` | `om2 release` | `om1.0` | `om1.0 debug` | `om1.0 release`
+note   Imports:          `import <alias> sha256:<64-hex> pin:<64-hex>`
+note   Visibility:       `export fn <name> ...` (exported) vs `fn <name> ...` (module-private)
+note   Cross-module call: `<alias>.<exported_fn>` (verified against module's export table)
+note
+note CLI commands:
+note   modlink put <file.om> --omc <omc> --pin <hex64> [--store <dir>]
+note   modlink link <root.om> --omc <omc> --pin <hex64> --mode <program|function> --out <bin> [--store <dir>] [--emit-src <file>]
+note   Store dir falls back to environment variable `MOD_STORE_DIR` when `--store` is omitted.
+note
+note Fail-closed exit codes:
+note   0  OK
+note   2  CLI usage error
+note   1..30 Exact `omc` compiler refusal code
+note   40 ML_ERR_DIGEST     source SHA-256 mismatch (wrong/tampered digest)
+note   41 ML_ERR_PIN        compiler binary or import `pin:` SHA-256 mismatch
+note   42 ML_ERR_PROFILE    unsupported or mismatched module profile
+note   43 ML_ERR_DUP_EXPORT duplicate `export fn` across linked modules
+note   44 ML_ERR_CYCLE      cyclic module import (A -> B -> A or self-cycle)
+note   45 ML_ERR_MISSING    imported module digest missing from MOD_STORE_DIR
+note   46 ML_ERR_SYNTAX     malformed `import` directive or duplicate alias
+note   47 ML_ERR_VISIBILITY attempt to call non-exported private function via `alias.sym`
+note   48 ML_ERR_STORE      missing MOD_STORE_DIR or store/output I/O error
+om2
+
+const ML_MAX_MODS ulong 32
+const ML_MAX_IMPS ulong 64
+const ML_MAX_EXPS ulong 128
+const ML_MAX_POOL ulong 524288
+const ML_MAX_EMIT ulong 524288
+
+const ML_ERR_DIGEST int 40
+const ML_ERR_PIN int 41
+const ML_ERR_PROFILE int 42
+const ML_ERR_DUP_EXPORT int 43
+const ML_ERR_CYCLE int 44
+const ML_ERR_MISSING int 45
+const ML_ERR_SYNTAX int 46
+const ML_ERR_VISIBILITY int 47
+const ML_ERR_STORE int 48
+
+note Global state g_st[0..15]:
+note 0=cmd(1=put,2=link), 1=mode(0=program,1=function), 2=root_prof(0=debug,1=release),
+note 3=mod_cnt, 4=imp_cnt, 5=exp_cnt, 6=topo_cnt, 7=pool_len,
+note 8=emit_len, 9=has_omc, 10=has_pin, 11=has_in, 12=has_out, 13=has_store, 14=has_emitsrc, 15=pin_from_file
+global g_st ulong 16
+
+note CLI path & string buffers
+global g_arg uchar 512
+global g_omc uchar 512
+global g_omcl ulong 1
+global g_pin uchar 128
+global g_pinl ulong 1
+global g_in uchar 512
+global g_inl ulong 1
+global g_outf uchar 512
+global g_outfl ulong 1
+global g_store uchar 512
+global g_storel ulong 1
+global g_esrc uchar 512
+global g_esrcl ulong 1
+global g_path uchar 768
+global g_pathl ulong 1
+global g_env uchar 768
+
+note Byte pools: module sources + emitted linked source + scratch I/O
+global g_pool uchar 524288
+global g_emit uchar 524288
+global g_binbuf uchar 524288
+global g_binlen ulong 1
+global g_pk uchar 1024
+global g_pkl ulong 1
+global g_pkr ulong 1
+global g_dig uchar 24
+
+note Per-module tables (max 32 modules)
+global m_off ulong 32
+global m_len ulong 32
+global m_prof ulong 32
+global m_color ulong 32
+global m_imp0 ulong 32
+global m_impc ulong 32
+global m_hash uchar 2048
+global m_topo ulong 32
+
+note Per-import tables (max 64 imports across DAG)
+global im_mod ulong 64
+global im_tgt ulong 64
+global im_alen ulong 64
+global im_alias uchar 4096
+global im_hash uchar 4096
+global im_pin uchar 4096
+
+note Global export table (max 128 exported functions across DAG)
+global ex_mod ulong 128
+global ex_nlen ulong 128
+global ex_name uchar 8192
+
+note Streaming FIPS 180-4 SHA-256 state
+text t_sha_kiv "1116352408 1899447441 3049323471 3921009573 961987163 1508970993 2453635748 2870763221 3624381080 310598401 607225278 1426881987 1925078388 2162078206 2614888103 3248222580 3835390401 4022224774 264347078 604807628 770255983 1249150122 1555081692 1996064986 2554220882 2821834349 2952996808 3210313671 3336571891 3584528711 113926993 338241895 666307205 773529912 1294757372 1396182291 1695183700 1986661051 2177026350 2456956037 2730485921 2820302411 3259730800 3345764771 3516065817 3600352804 4094571909 275423344 430227734 506948616 659060556 883997877 958139571 1322822218 1537002063 1747873779 1955562222 2024104815 2227730452 2361852424 2428436474 2756734187 3204031479 3329325298 1779033703 3144134277 1013904242 2773480762 1359893119 2600822924 528734635 1541459225"
+global s_k uint 72
+global s_w uint 64
+global s_v uint 8
+global s_h uint 8
+global s_blk uchar 64
+global s_dig uchar 32
+global s_hex uchar 64
+global s_st ulong 4
+global s_chunk uchar 65536
+global g_omc_hex uchar 64
+global g_out_hex uchar 64
+
+note Line scratch buffer for line parsing & emission
+global g_line uchar 4096
+global g_tok uchar 128
+global g_tok2 uchar 128
+
+note Static texts
+text t_usage "usage: modlink put <file.om> --omc <omc> (--pin <hex64> | --pin-file <f>) [--store <dir>]\n       modlink link <root.om> --omc <omc> (--pin <hex64> | --pin-file <f>) --mode <program|function> --out <bin> [--store <dir>] [--emit-src <f>]\n"
+text t_cmd_put "put"
+text t_cmd_link "link"
+text t_flg_omc "--omc"
+text t_flg_pin "--pin"
+text t_flg_pinf "--pin-file"
+text t_flg_mode "--mode"
+text t_flg_out "--out"
+text t_flg_store "--store"
+text t_flg_esrc "--emit-src"
+text t_m_prog "program"
+text t_m_func "function"
+text t_env_store "MOD_STORE_DIR="
+text t_ext_om ".om"
+text t_p_om2 "om2"
+text t_p_om2d "om2 debug"
+text t_p_om2r "om2 release"
+text t_p_10 "om1.0"
+text t_p_10d "om1.0 debug"
+text t_p_10r "om1.0 release"
+text t_kw_imp "import "
+text t_kw_exp "export fn "
+text t_kw_fn "fn "
+text t_kw_note "note "
+text t_pfx_sha "sha256:"
+text t_pfx_pin "pin:"
+text t_hdr_om2 "om2\n"
+text t_hdr_om2r "om2 release\n"
+text t_err_pfx "MODLINK REFUSE code="
+text t_ok_pfx "MODLINK OK mode="
+text t_ok_mods " modules="
+text t_ok_exps " exports="
+text t_ok_bytes " bytes="
+text t_ok_sha " sha256="
+text t_tmp_mfd "modlink"
+text t_nl "\n"
+
+note ============================================================================
+note Helpers: stderr refusal & decimal printing
+note ============================================================================
+
+fn w_u64 fd int v ulong to void
+  x = v
+  p = ulong 24
+  for i ulong 21
+    p = sub p 1
+    put g_dig p uchar add 48 rem x 10
+    x = div x 10
+    if eq x 0
+      w = write fd g_dig p sub 24 p
+      ret
+    end
+  end
+end
+
+fn refuse code int to void
+  w = write 2 t_err_pfx 0 len t_err_pfx
+  w_u64 2 ulong code
+  w = write 2 t_nl 0 1
+  exit code
+end
+
+fn is_low_hex c uchar to bool
+  if and ge c 48 le c 57
+    ret true
+  end
+  if and ge c 97 le c 102
+    ret true
+  end
+  ret false
+end
+
+fn is_ident_c c uchar to bool
+  if and ge c 65 le c 90
+    ret true
+  end
+  if and ge c 97 le c 122
+    ret true
+  end
+  if and ge c 48 le c 57
+    ret true
+  end
+  if eq c 95
+    ret true
+  end
+  ret false
+end
+
+note ============================================================================
+note Streaming FIPS 180-4 SHA-256
+note ============================================================================
+
+fn sha_init_k to void
+  if ne get s_st 0 0
+    ret
+  end
+  put s_st 0 1
+  p = ulong 0
+  for i ulong 72
+    v = ulong 0
+    while lt get t_sha_kiv p 48 bound 4
+      p = add p 1
+    end
+    while ge get t_sha_kiv p 48 bound 11
+      v = add mul v 10 ulong sub get t_sha_kiv p 48
+      p = add p 1
+      if ge p len t_sha_kiv
+        put s_k i uint v
+        ret
+      end
+    end
+    put s_k i uint v
+  end
+end
+
+fn sha_s0 a uint to uint
+  ret xor xor rotr a 2 rotr a 13 rotr a 22
+end
+
+fn sha_s1 e uint to uint
+  ret xor xor rotr e 6 rotr e 11 rotr e 25
+end
+
+fn sha_g0 x uint to uint
+  ret xor xor rotr x 7 rotr x 18 shr x 3
+end
+
+fn sha_g1 x uint to uint
+  ret xor xor rotr x 17 rotr x 19 shr x 10
+end
+
+fn sha_maj a uint b uint c uint to uint
+  ret xor xor and a b and a c and b c
+end
+
+fn sha_be o ulong to uint
+  b0 = shl uint get s_blk o 24
+  b1 = shl uint get s_blk add o 1 16
+  b2 = shl uint get s_blk add o 2 8
+  b3 = uint get s_blk add o 3
+  ret or or b0 b1 or b2 b3
+end
+
+fn sha_rnd i ulong to void
+  e = get s_v 4
+  t1 = add get s_v 7 sha_s1 e
+  t1 = add t1 xor and e get s_v 5 and not e get s_v 6
+  t1 = add t1 add get s_k i get s_w i
+  a = get s_v 0
+  t2 = add sha_s0 a sha_maj a get s_v 1 get s_v 2
+  put s_v 7 get s_v 6
+  put s_v 6 get s_v 5
+  put s_v 5 e
+  put s_v 4 add get s_v 3 t1
+  put s_v 3 get s_v 2
+  put s_v 2 get s_v 1
+  put s_v 1 a
+  put s_v 0 add t1 t2
+end
+
+fn sha_compress to void
+  for t ulong 16
+    put s_w t sha_be mul t 4
+  end
+  for t ulong 48
+    u = add t 16
+    x = add sha_g1 get s_w sub u 2 get s_w sub u 7
+    put s_w u add x add sha_g0 get s_w sub u 15 get s_w sub u 16
+  end
+  for j ulong 8
+    put s_v j get s_h j
+  end
+  for i ulong 64
+    sha_rnd i
+  end
+  for j ulong 8
+    put s_h j add get s_h j get s_v j
+  end
+end
+
+fn sha_start to void
+  sha_init_k
+  for j ulong 8
+    put s_h j get s_k add j 64
+  end
+  put s_st 1 0
+  put s_st 2 0
+end
+
+fn sha_push b uchar to void
+  f = get s_st 1
+  put s_blk f b
+  f = add f 1
+  put s_st 2 add get s_st 2 1
+  if eq f 64
+    sha_compress
+    put s_st 1 0
+  else
+    put s_st 1 f
+  end
+end
+
+fn sha_nib d ulong to uchar
+  if lt d 10
+    ret uchar add 48 d
+  end
+  ret uchar add 87 d
+end
+
+fn sha_finish to void
+  tot = get s_st 2
+  bits = mul tot 8
+  sha_push 128
+  while ne get s_st 1 56 bound 65
+    sha_push 0
+  end
+  for j ulong 8
+    sh = mul sub 7 j 8
+    sha_push uchar and shr bits sh 255
+  end
+  for j ulong 8
+    v = get s_h j
+    o = mul j 4
+    put s_dig o uchar and shr v 24 255
+    put s_dig add o 1 uchar and shr v 16 255
+    put s_dig add o 2 uchar and shr v 8 255
+    put s_dig add o 3 uchar and v 255
+  end
+  for i ulong 32
+    b = ulong get s_dig i
+    put s_hex mul i 2 sha_nib shr b 4
+    put s_hex add mul i 2 1 sha_nib and b 15
+  end
+end
+
+fn sha_hash_omc to void
+  fd = fopen g_omc 0 get g_omcl 0 0 0
+  if lt fd 0
+    refuse ML_ERR_PIN
+  end
+  sha_start
+  while true bound 16384
+    k = read int fd s_chunk 0 65536
+    if lt k 0
+      x = fclose int fd
+      refuse ML_ERR_PIN
+    end
+    if eq k 0
+      break
+    end
+    n = ulong k
+    for i ulong n bound 65536
+      sha_push get s_chunk i
+    end
+  end
+  x = fclose int fd
+  sha_finish
+  for i ulong 64
+    put g_omc_hex i get s_hex i
+  end
+end
+
+fn verify_omc_pin to void
+  if eq get g_st 15 1
+    fd = fopen g_pin 0 get g_pinl 0 0 0
+    if lt fd 0
+      refuse ML_ERR_PIN
+    end
+    k = read int fd g_pin 0 127
+    x = fclose int fd
+    if lt k 64
+      refuse ML_ERR_PIN
+    end
+    put g_pinl 0 64
+  end
+  if ne get g_pinl 0 64
+    refuse ML_ERR_PIN
+  end
+  for i ulong 64
+    if not is_low_hex get g_pin i
+      refuse ML_ERR_PIN
+    end
+  end
+  sha_hash_omc
+  for i ulong 64
+    if ne get g_pin i get g_omc_hex i
+      refuse ML_ERR_PIN
+    end
+  end
+end
+
+note ============================================================================
+note Environment & store path helpers
+note ============================================================================
+
+fn load_env_store to void
+  if eq get g_st 13 1
+    ret
+  end
+  ec = envcnt
+  if le ec 0
+    refuse ML_ERR_STORE
+  end
+  pl = len t_env_store
+  for idx ulong ulong ec bound 512
+    n = envread idx g_env 0 767
+    if gt n long pl
+      ok = true
+      for j ulong pl bound 32
+        if ne get g_env j get t_env_store j
+          ok = false
+          break
+        end
+      end
+      if ok
+        vl = sub ulong n pl
+        if and gt vl 0 lt vl 511
+          for j ulong vl bound 512
+            put g_store j get g_env add pl j
+          end
+          put g_storel 0 vl
+          put g_st 13 1
+          ret
+        end
+      end
+    end
+  end
+  refuse ML_ERR_STORE
+end
+
+fn build_store_path hashOff ulong isImp bool to void
+  p = ulong 0
+  sl = get g_storel 0
+  for i ulong sl bound 512
+    put g_path p get g_store i
+    p = add p 1
+  end
+  if and gt p 0 ne get g_path sub p 1 47
+    put g_path p 47
+    p = add p 1
+  end
+  for i ulong 64
+    if isImp
+      put g_path p get im_hash add hashOff i
+    else
+      put g_path p get s_hex i
+    end
+    p = add p 1
+  end
+  for i ulong len t_ext_om bound 8
+    put g_path p get t_ext_om i
+    p = add p 1
+  end
+  put g_pathl 0 p
+end
+
+fn load_file_to_pool useIn bool to ulong
+  fd = long -1
+  if useIn
+    fd = fopen g_in 0 get g_inl 0 0 0
+  else
+    fd = fopen g_path 0 get g_pathl 0 0 0
+  end
+  if lt fd 0
+    if useIn
+      refuse ML_ERR_STORE
+    end
+    refuse ML_ERR_MISSING
+  end
+  base = get g_st 7
+  cur = base
+  while true bound 8192
+    if ge cur ML_MAX_POOL
+      x = fclose int fd
+      refuse ML_ERR_STORE
+    end
+    k = read int fd g_pool cur sub ML_MAX_POOL cur
+    if lt k 0
+      x = fclose int fd
+      refuse ML_ERR_STORE
+    end
+    if eq k 0
+      break
+    end
+    cur = add cur ulong k
+  end
+  x = fclose int fd
+  put g_st 7 cur
+  ret sub cur base
+end
+
+note ============================================================================
+note Module parser: profile, canonical body SHA-256, imports, exports
+note ============================================================================
+
+fn line_eq llen ulong pat view uchar * to bool
+  if ne llen len pat
+    ret false
+  end
+  for i ulong llen bound 64
+    if ne get g_line i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn line_starts llen ulong pat view uchar * to bool
+  if lt llen len pat
+    ret false
+  end
+  for i ulong len pat bound 32
+    if ne get g_line i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+note Copy line from g_pool[pos..endp) into g_line (without trailing \n or \r); returns length.
+fn read_line pos ulong endp ulong to ulong
+  n = ulong 0
+  p = pos
+  while lt p endp bound 4096
+    c = get g_pool p
+    if eq c 10
+      break
+    end
+    if lt n 4095
+      put g_line n c
+      n = add n 1
+    end
+    p = add p 1
+  end
+  if gt n 0
+    if eq get g_line sub n 1 13
+      n = sub n 1
+    end
+  end
+  ret n
+end
+
+fn next_line_pos pos ulong endp ulong to ulong
+  p = pos
+  while lt p endp bound 4096
+    if eq get g_pool p 10
+      ret add p 1
+    end
+    p = add p 1
+  end
+  ret endp
+end
+
+note Parse profile header line -> 0 (debug) or 1 (release); refuses anything else with ML_ERR_PROFILE!
+fn parse_profile llen ulong to ulong
+  if or line_eq llen t_p_om2 line_eq llen t_p_om2d
+    ret 0
+  end
+  if or line_eq llen t_p_10 line_eq llen t_p_10d
+    ret 0
+  end
+  if or line_eq llen t_p_om2r line_eq llen t_p_10r
+    ret 1
+  end
+  refuse ML_ERR_PROFILE
+  ret 0
+end
+
+note Compute canonical body SHA-256 of module in g_pool[off..off+mlen):
+note hashes every line EXCEPT `import ...` lines (identical to full-file SHA-256 for leaf modules,
+note enabling real cryptographic SHA-256 cycle detection A -> B -> A without backdoors!).
+fn hash_module_body off ulong mlen ulong to void
+  sha_start
+  endp = add off mlen
+  p = off
+  while lt p endp bound 65536
+    np = next_line_pos p endp
+    llen = read_line p endp
+    if not line_starts llen t_kw_imp
+      q = p
+      while lt q np bound 4096
+        sha_push get g_pool q
+        q = add q 1
+      end
+    end
+    p = np
+  end
+  sha_finish
+end
+
+fn parse_import_tail ic ulong p0 ulong to void
+  p = p0
+  if ne get g_line p 32
+    refuse ML_ERR_SYNTAX
+  end
+  p = add p 1
+  for i ulong 7
+    if ne get g_line add p i get t_pfx_sha i
+      refuse ML_ERR_SYNTAX
+    end
+  end
+  p = add p 7
+  ho = mul ic 64
+  for i ulong 64
+    c = get g_line add p i
+    if not is_low_hex c
+      refuse ML_ERR_SYNTAX
+    end
+    put im_hash add ho i c
+  end
+  p = add p 64
+  if ne get g_line p 32
+    refuse ML_ERR_SYNTAX
+  end
+  p = add p 1
+  for i ulong 4
+    if ne get g_line add p i get t_pfx_pin i
+      refuse ML_ERR_SYNTAX
+    end
+  end
+  p = add p 4
+  for i ulong 64
+    c = get g_line add p i
+    if not is_low_hex c
+      refuse ML_ERR_SYNTAX
+    end
+    put im_pin add ho i c
+  end
+  note Fail-closed compiler pin check per import!
+  for i ulong 64
+    if ne get im_pin add ho i get g_omc_hex i
+      refuse ML_ERR_PIN
+    end
+  end
+end
+
+fn alias_match prev ulong ao ulong al ulong to bool
+  if ne get im_alen prev al
+    ret false
+  end
+  po = mul prev 64
+  for k ulong al bound 64
+    if ne get im_alias add po k get im_alias add ao k
+      ret false
+    end
+  end
+  ret true
+end
+
+fn store_import_alias mid ulong ic ulong a0 ulong al ulong to void
+  ao = mul ic 64
+  for i ulong al bound 64
+    put im_alias add ao i get g_line add a0 i
+  end
+  put im_mod ic mid
+  put im_alen ic al
+  put im_tgt ic 999999
+  m0 = get m_imp0 mid
+  mc = get m_impc mid
+  for j ulong mc bound 64
+    if alias_match add m0 j ao al
+      refuse ML_ERR_SYNTAX
+    end
+  end
+  put m_impc mid add mc 1
+  put g_st 4 add ic 1
+end
+
+note Parse `import <alias> sha256:<64-hex> pin:<64-hex>` from g_line[0..llen)
+fn parse_import_line mid ulong llen ulong to void
+  ic = get g_st 4
+  if ge ic ML_MAX_IMPS
+    refuse ML_ERR_STORE
+  end
+  p = ulong 7
+  a0 = p
+  while lt p llen bound 128
+    if eq get g_line p 32
+      break
+    end
+    if not is_ident_c get g_line p
+      refuse ML_ERR_SYNTAX
+    end
+    p = add p 1
+  end
+  al = sub p a0
+  if or eq al 0 gt al 63
+    refuse ML_ERR_SYNTAX
+  end
+  note Expect ` sha256:<64-hex> pin:<64-hex>` (141 bytes)
+  if ne sub llen p 141
+    refuse ML_ERR_SYNTAX
+  end
+  parse_import_tail ic p
+  store_import_alias mid ic a0 al
+end
+
+fn export_match idx ulong n0 ulong nl ulong to bool
+  if ne get ex_nlen idx nl
+    ret false
+  end
+  jo = mul idx 64
+  for k ulong nl bound 64
+    if ne get ex_name add jo k get g_line add n0 k
+      ret false
+    end
+  end
+  ret true
+end
+
+fn register_export mid ulong llen ulong to void
+  ec = get g_st 5
+  if ge ec ML_MAX_EXPS
+    refuse ML_ERR_STORE
+  end
+  p = ulong 10
+  n0 = p
+  while lt p llen bound 128
+    if eq get g_line p 32
+      break
+    end
+    if not is_ident_c get g_line p
+      refuse ML_ERR_SYNTAX
+    end
+    p = add p 1
+  end
+  nl = sub p n0
+  if or eq nl 0 gt nl 63
+    refuse ML_ERR_SYNTAX
+  end
+  note Duplicate export check across ALL loaded modules!
+  for j ulong ec bound 128
+    if export_match j n0 nl
+      refuse ML_ERR_DUP_EXPORT
+    end
+  end
+  eo = mul ec 64
+  for k ulong nl bound 64
+    put ex_name add eo k get g_line add n0 k
+  end
+  put ex_mod ec mid
+  put ex_nlen ec nl
+  put g_st 5 add ec 1
+end
+
+fn scan_module_header mid ulong to void
+  off = get m_off mid
+  endp = add off get m_len mid
+  p = off
+  gotProf = false
+  put m_imp0 mid get g_st 4
+  put m_impc mid 0
+  while lt p endp bound 65536
+    np = next_line_pos p endp
+    llen = read_line p endp
+    if eq llen 0
+      p = np
+      continue
+    end
+    if line_starts llen t_kw_note
+      p = np
+      continue
+    end
+    if not gotProf
+      put m_prof mid parse_profile llen
+      gotProf = true
+      p = np
+      continue
+    end
+    if line_starts llen t_kw_imp
+      parse_import_line mid llen
+      p = np
+      continue
+    end
+    if line_starts llen t_kw_exp
+      register_export mid llen
+    end
+    p = np
+  end
+  if not gotProf
+    refuse ML_ERR_PROFILE
+  end
+end
+
+fn find_mod_by_imp impIdx ulong to ulong
+  ho = mul impIdx 64
+  mc = get g_st 3
+  for m ulong mc bound 32
+    mo = mul m 64
+    same = true
+    for i ulong 64
+      if ne get m_hash add mo i get im_hash add ho i
+        same = false
+        break
+      end
+    end
+    if same
+      ret m
+    end
+  end
+  ret 999999
+end
+
+fn load_store_module impIdx ulong to ulong
+  mid = get g_st 3
+  if ge mid ML_MAX_MODS
+    refuse ML_ERR_STORE
+  end
+  ho = mul impIdx 64
+  build_store_path ho true
+  base = get g_st 7
+  mlen = load_file_to_pool false
+  note Verify canonical body SHA-256 matches requested sha256:<64-hex> fail-closed!
+  hash_module_body base mlen
+  for i ulong 64
+    if ne get s_hex i get im_hash add ho i
+      refuse ML_ERR_DIGEST
+    end
+  end
+  put m_off mid base
+  put m_len mid mlen
+  put m_color mid 0
+  mo = mul mid 64
+  for i ulong 64
+    put m_hash add mo i get s_hex i
+  end
+  put g_st 3 add mid 1
+  scan_module_header mid
+  note Profile MUST match root module's profile across the DAG!
+  if ne get m_prof mid get g_st 2
+    refuse ML_ERR_PROFILE
+  end
+  ret mid
+end
+
+note 3-Color DFS resolver: detects cycles (ML_ERR_CYCLE = 44) and computes topological order!
+fn dfs_resolve mid ulong to void
+  put m_color mid 1
+  i0 = get m_imp0 mid
+  ic = get m_impc mid
+  for j ulong ic bound 64
+    ii = add i0 j
+    tgt = find_mod_by_imp ii
+    if eq tgt 999999
+      tgt = load_store_module ii
+    end
+    put im_tgt ii tgt
+    col = get m_color tgt
+    if eq col 1
+      refuse ML_ERR_CYCLE
+    end
+    if eq col 0
+      dfs_resolve tgt
+    end
+  end
+  put m_color mid 2
+  tc = get g_st 6
+  put m_topo tc mid
+  put g_st 6 add tc 1
+end
+
+note ============================================================================
+note Visibility check & alias.sym -> sym emitter
+note ============================================================================
+
+fn em_byte c uchar to void
+  n = get g_st 8
+  if ge n ML_MAX_EMIT
+    refuse ML_ERR_STORE
+  end
+  put g_emit n c
+  put g_st 8 add n 1
+end
+
+fn em_txt t view uchar * to void
+  for i ulong len t bound 64
+    em_byte get t i
+  end
+end
+
+fn imp_tok_match ii ulong alen ulong to bool
+  if ne get im_alen ii alen
+    ret false
+  end
+  ao = mul ii 64
+  for k ulong alen bound 64
+    if ne get im_alias add ao k get g_tok k
+      ret false
+    end
+  end
+  ret true
+end
+
+fn lookup_alias mid ulong alen ulong to ulong
+  i0 = get m_imp0 mid
+  ic = get m_impc mid
+  for j ulong ic bound 64
+    ii = add i0 j
+    if imp_tok_match ii alen
+      ret get im_tgt ii
+    end
+  end
+  ret 999999
+end
+
+fn exp_tok_match j ulong tgt ulong slen ulong to bool
+  if ne get ex_mod j tgt
+    ret false
+  end
+  if ne get ex_nlen j slen
+    ret false
+  end
+  eo = mul j 64
+  for k ulong slen bound 64
+    if ne get ex_name add eo k get g_tok2 k
+      ret false
+    end
+  end
+  ret true
+end
+
+fn is_exported_in tgt ulong slen ulong to bool
+  ec = get g_st 5
+  for j ulong ec bound 128
+    if exp_tok_match j tgt slen
+      ret true
+    end
+  end
+  ret false
+end
+
+fn emit_alias_sym tgt ulong dotPos ulong llen ulong to ulong
+  r = add dotPos 1
+  sl = ulong 0
+  while lt r llen bound 128
+    ch2 = get g_line r
+    if not is_ident_c ch2
+      break
+    end
+    if lt sl 64
+      put g_tok2 sl ch2
+    end
+    sl = add sl 1
+    r = add r 1
+  end
+  if or eq sl 0 gt sl 63
+    refuse ML_ERR_VISIBILITY
+  end
+  if not is_exported_in tgt sl
+    refuse ML_ERR_VISIBILITY
+  end
+  for k ulong sl bound 64
+    em_byte get g_tok2 k
+  end
+  ret r
+end
+
+note Emit one body line of module `mid`, rewriting `alias.sym` -> `sym` ONLY if `sym` is exported!
+fn emit_rewritten_line mid ulong start ulong llen ulong to void
+  p = start
+  inStr = false
+  while lt p llen bound 4096
+    c = get g_line p
+    if eq c 34
+      inStr = not inStr
+      em_byte c
+      p = add p 1
+      continue
+    end
+    if and not inStr is_ident_c c
+      q = p
+      tl = ulong 0
+      while lt q llen bound 128
+        ch = get g_line q
+        if not is_ident_c ch
+          break
+        end
+        if lt tl 64
+          put g_tok tl ch
+        end
+        tl = add tl 1
+        q = add q 1
+      end
+      if lt q llen
+        if eq get g_line q 46
+          if and gt tl 0 le tl 63
+            tgt = lookup_alias mid tl
+            if ne tgt 999999
+              p = emit_alias_sym tgt q llen
+              continue
+            end
+          end
+        end
+      end
+      for k ulong tl bound 128
+        em_byte get g_line add p k
+      end
+      p = q
+      continue
+    end
+    em_byte c
+    p = add p 1
+  end
+  em_byte 10
+end
+
+fn emit_module_body mid ulong to void
+  off = get m_off mid
+  endp = add off get m_len mid
+  p = off
+  skippedProf = false
+  while lt p endp bound 65536
+    np = next_line_pos p endp
+    llen = read_line p endp
+    if eq llen 0
+      p = np
+      continue
+    end
+    if line_starts llen t_kw_note
+      p = np
+      continue
+    end
+    if not skippedProf
+      skippedProf = true
+      p = np
+      continue
+    end
+    if line_starts llen t_kw_imp
+      p = np
+      continue
+    end
+    if line_starts llen t_kw_exp
+      if eq get g_st 1 0
+        note Program mode: strip `export ` visibility modifier -> `fn ...`
+        emit_rewritten_line mid 7 llen
+      else
+        note Function mode: keep `export fn ...`
+        emit_rewritten_line mid 0 llen
+      end
+      p = np
+      continue
+    end
+    emit_rewritten_line mid 0 llen
+    p = np
+  end
+end
+
+fn emit_linked_source to void
+  put g_st 8 0
+  if eq get g_st 2 0
+    em_txt t_hdr_om2
+  else
+    em_txt t_hdr_om2r
+  end
+  tc = get g_st 6
+  for i ulong tc bound 32
+    emit_module_body get m_topo i
+  end
+end
+
+note ============================================================================
+note Invoke pinned `omc` via memfd + fork + execprog
+note ============================================================================
+
+fn pk_omc to void
+  put g_pk 0 1
+  put g_pk 1 0
+  n = get g_omcl 0
+  put g_pk 2 uchar and n 255
+  put g_pk 3 uchar and shr n 8 255
+  for i ulong n bound 512
+    put g_pk add 4 i get g_omc i
+  end
+  put g_pkl 0 add 4 n
+end
+
+fn write_fd_emit fd int srcLen ulong to void
+  off = ulong 0
+  while lt off srcLen bound 65536
+    w = write fd g_emit off sub srcLen off
+    if le w 0
+      refuse ML_ERR_STORE
+    end
+    off = add off ulong w
+  end
+end
+
+fn run_omc_on_emit keepBin bool to int
+  fi = memfd t_tmp_mfd 0 len t_tmp_mfd 0
+  fo = memfd t_tmp_mfd 0 len t_tmp_mfd 0
+  if or lt fi 0 lt fo 0
+    refuse ML_ERR_STORE
+  end
+  write_fd_emit int fi get g_st 8
+  x = fseek int fi 0 0
+  pk_omc
+  pid = fork
+  if lt pid 0
+    x = fclose int fi
+    x = fclose int fo
+    refuse ML_ERR_STORE
+  end
+  if eq pid 0
+    x = dupfd int fi 0 0
+    x = dupfd int fo 1 0
+    x = execprog g_pk 0 get g_pkl 0
+    exit 127
+  end
+  st = new uchar 4 0
+  w = waitpid int pid st 0 4 0
+  x = fclose int fi
+  s = or ulong get st 0 shl ulong get st 1 8
+  rc = int 1
+  if eq and s 127 0
+    rc = int and shr s 8 255
+  end
+  if ne rc 0
+    x = fclose int fo
+    ret rc
+  end
+  if keepBin
+    x = fseek int fo 0 0
+    put g_binlen 0 0
+    while true bound 8192
+      n = get g_binlen 0
+      if ge n 524288
+        x = fclose int fo
+        refuse ML_ERR_STORE
+      end
+      k = read int fo g_binbuf n sub 524288 n
+      if lt k 0
+        x = fclose int fo
+        refuse ML_ERR_STORE
+      end
+      if eq k 0
+        break
+      end
+      put g_binlen 0 add n ulong k
+    end
+  end
+  x = fclose int fo
+  ret 0
+end
+
+note Separately validate every leaf module (0 imports) with pinned `omc` in function mode!
+fn precheck_leaf_modules to void
+  tc = get g_st 6
+  savedMode = get g_st 1
+  put g_st 1 1
+  for i ulong tc bound 32
+    mid = get m_topo i
+    if and ne mid 0 eq get m_impc mid 0
+      put g_st 8 0
+      if eq get g_st 2 0
+        em_txt t_hdr_om2
+      else
+        em_txt t_hdr_om2r
+      end
+      emit_module_body mid
+      rc = run_omc_on_emit false
+      if ne rc 0
+        exit rc
+      end
+    end
+  end
+  put g_st 1 savedMode
+end
+
+fn write_output_bin to void
+  perm = int 420
+  if eq get g_st 1 0
+    perm = int 493
+  end
+  fd = fopen g_outf 0 get g_outfl 0 577 perm
+  if lt fd 0
+    refuse ML_ERR_STORE
+  end
+  n = get g_binlen 0
+  off = ulong 0
+  while lt off n bound 65536
+    w = write int fd g_binbuf off sub n off
+    if le w 0
+      x = fclose int fd
+      refuse ML_ERR_STORE
+    end
+    off = add off ulong w
+  end
+  x = fclose int fd
+  sha_start
+  for i ulong n bound 524288
+    sha_push get g_binbuf i
+  end
+  sha_finish
+  for i ulong 64
+    put g_out_hex i get s_hex i
+  end
+end
+
+fn write_emitted_src to void
+  if eq get g_st 14 0
+    ret
+  end
+  fd = fopen g_esrc 0 get g_esrcl 0 577 420
+  if lt fd 0
+    refuse ML_ERR_STORE
+  end
+  write_fd_emit int fd get g_st 8
+  x = fclose int fd
+end
+
+note ============================================================================
+note CLI argument parsing & commands
+note ============================================================================
+
+fn arg_eq al ulong pat view uchar * to bool
+  if ne al len pat
+    ret false
+  end
+  for i ulong al bound 64
+    if ne get g_arg i get pat i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn parse_cli argc ulong to bool
+  i = ulong 2
+  while lt i argc bound 32
+    al = argread i g_arg 0 511
+    if le al 0
+      ret false
+    end
+    ul = ulong al
+    if arg_eq ul t_flg_omc
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_omc 0 511
+      if le vl 0
+        ret false
+      end
+      put g_omcl 0 ulong vl
+      put g_st 9 1
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_pin
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_pin 0 127
+      if le vl 0
+        ret false
+      end
+      put g_pinl 0 ulong vl
+      put g_st 10 1
+      put g_st 15 0
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_pinf
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_pin 0 127
+      if le vl 0
+        ret false
+      end
+      put g_pinl 0 ulong vl
+      put g_st 10 1
+      put g_st 15 1
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_mode
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_arg 0 511
+      if le vl 0
+        ret false
+      end
+      if arg_eq ulong vl t_m_prog
+        put g_st 1 0
+      else
+        if arg_eq ulong vl t_m_func
+          put g_st 1 1
+        else
+          ret false
+        end
+      end
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_out
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_outf 0 511
+      if le vl 0
+        ret false
+      end
+      put g_outfl 0 ulong vl
+      put g_st 12 1
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_store
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_store 0 511
+      if le vl 0
+        ret false
+      end
+      put g_storel 0 ulong vl
+      put g_st 13 1
+      i = add i 1
+      continue
+    end
+    if arg_eq ul t_flg_esrc
+      i = add i 1
+      if ge i argc
+        ret false
+      end
+      vl = argread i g_esrc 0 511
+      if le vl 0
+        ret false
+      end
+      put g_esrcl 0 ulong vl
+      put g_st 14 1
+      i = add i 1
+      continue
+    end
+    if eq get g_st 11 0
+      for k ulong ul bound 512
+        put g_in k get g_arg k
+      end
+      put g_inl 0 ul
+      put g_st 11 1
+      i = add i 1
+      continue
+    end
+    ret false
+  end
+  if or eq get g_st 9 0 or eq get g_st 10 0 eq get g_st 11 0
+    ret false
+  end
+  if and eq get g_st 0 2 eq get g_st 12 0
+    ret false
+  end
+  ret true
+end
+
+fn cmd_put to int
+  load_env_store
+  verify_omc_pin
+  base = get g_st 7
+  mlen = load_file_to_pool true
+  put m_off 0 base
+  put m_len 0 mlen
+  put m_color 0 0
+  put g_st 3 1
+  scan_module_header 0
+  hash_module_body base mlen
+  build_store_path 0 false
+  fd = fopen g_path 0 get g_pathl 0 577 420
+  if lt fd 0
+    refuse ML_ERR_STORE
+  end
+  off = ulong 0
+  while lt off mlen bound 65536
+    w = write int fd g_pool add base off sub mlen off
+    if le w 0
+      x = fclose int fd
+      refuse ML_ERR_STORE
+    end
+    off = add off ulong w
+  end
+  x = fclose int fd
+  w = write 1 s_hex 0 64
+  w = write 1 t_nl 0 1
+  ret 0
+end
+
+fn cmd_link to int
+  load_env_store
+  verify_omc_pin
+  base = get g_st 7
+  mlen = load_file_to_pool true
+  hash_module_body base mlen
+  put m_off 0 base
+  put m_len 0 mlen
+  put m_color 0 0
+  for i ulong 64
+    put m_hash i get s_hex i
+  end
+  put g_st 3 1
+  scan_module_header 0
+  put g_st 2 get m_prof 0
+  dfs_resolve 0
+  precheck_leaf_modules
+  emit_linked_source
+  write_emitted_src
+  rc = run_omc_on_emit true
+  if ne rc 0
+    exit rc
+  end
+  write_output_bin
+  w = write 1 t_ok_pfx 0 len t_ok_pfx
+  if eq get g_st 1 0
+    w = write 1 t_m_prog 0 len t_m_prog
+  else
+    w = write 1 t_m_func 0 len t_m_func
+  end
+  w = write 1 t_ok_mods 0 len t_ok_mods
+  w_u64 1 get g_st 3
+  w = write 1 t_ok_exps 0 len t_ok_exps
+  w_u64 1 get g_st 5
+  w = write 1 t_ok_bytes 0 len t_ok_bytes
+  w_u64 1 get g_binlen 0
+  w = write 1 t_ok_sha 0 len t_ok_sha
+  w = write 1 g_out_hex 0 64
+  w = write 1 t_nl 0 1
+  ret 0
+end
+
+fn main to int
+  ac = argcnt
+  if lt ac 3
+    w = write 2 t_usage 0 len t_usage
+    ret 2
+  end
+  al = argread 1 g_arg 0 511
+  if le al 0
+    w = write 2 t_usage 0 len t_usage
+    ret 2
+  end
+  if arg_eq ulong al t_cmd_put
+    put g_st 0 1
+  else
+    if arg_eq ulong al t_cmd_link
+      put g_st 0 2
+    else
+      w = write 2 t_usage 0 len t_usage
+      ret 2
+    end
+  end
+  if not parse_cli ulong ac
+    w = write 2 t_usage 0 len t_usage
+    ret 2
+  end
+  if eq get g_st 0 1
+    ret cmd_put
+  end
+  ret cmd_link
+end
