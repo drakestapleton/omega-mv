@@ -15,13 +15,7 @@ ifndef TURING_YIELD_ENERGY_MK
 TURING_YIELD_ENERGY_MK := 1
 
 TYE_DIR = $(OUT_DIR)/ty
-TYE_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc -Itests/runtime
-# -Wno-pedantic: generated binding src/omega_om_units.c uses GNU range designators; see mk/estimation.mk.
-TYE_LIB_CFLAGS = -std=c11 -Wall -Wextra -Werror -pedantic -O2 -Isrc -Wno-pedantic
-TYE_ARCH = -march=armv8.6-a+dotprod+i8mm+sve
-TYE_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-TYE_ALG_SRCS = src/algebra/realize_common.c src/algebra/realize_binary.c src/algebra/realize_bitplane.c \
-	src/algebra/realize_sparse.c src/algebra/realize_rns.c src/algebra/realize_dense.c
+TYE_OMC ?= seed/out/omc
 TYE_OM_LIB = src/turing/ty_energy.om
 TYE_WORKLOAD = $(TYE_DIR)/ty_workload
 TYE_WINDOW = $(TYE_DIR)/ty_energy_window
@@ -29,13 +23,13 @@ TYE_REDUCE = $(TYE_DIR)/ty_energy_reduce
 TYE_TEST = $(TYE_DIR)/test_ty_energy
 TYE_FIXTURE = $(TYE_DIR)/ty_energy_fixture
 
-$(TYE_WORKLOAD): tests/turing/ty_workload.c tests/runtime/r15_measure.c tests/runtime/r15_measure.h $(TYE_ALG_SRCS) src/algebra/realize_common.h
+$(TYE_WORKLOAD): src/algebra/oma_lib.om src/algebra/realize.om tests/turing/ty_workload.om $(TYE_OMC)
 	@mkdir -p $(dir $@)
-	$(CC) $(TYE_CFLAGS) $(TYE_ARCH) -o $@ tests/turing/ty_workload.c tests/runtime/r15_measure.c $(TYE_ALG_SRCS) -lpthread -ldl
+	(printf 'om2\n'; sed '/^om2$$/d' src/algebra/oma_lib.om src/algebra/realize.om tests/turing/ty_workload.om) | $(TYE_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(TYE_WINDOW): tests/turing/ty_energy_window.c tests/runtime/r15_measure.c tests/runtime/r15_measure.h
+$(TYE_WINDOW): src/runtime/r15_measure.om tests/turing/ty_energy_window.om $(TYE_OMC)
 	@mkdir -p $(dir $@)
-	$(CC) $(TYE_CFLAGS) -o $@ tests/turing/ty_energy_window.c tests/runtime/r15_measure.c -lpthread -ldl
+	(printf 'om2\n'; sed '/^om2$$/d' src/runtime/r15_measure.om tests/turing/ty_energy_window.om) | $(TYE_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 $(TYE_REDUCE): $(TYE_OM_LIB) tools/ty_energy_reduce.om seed/out/omc
 	@mkdir -p $(dir $@)

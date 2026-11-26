@@ -1,0 +1,642 @@
+note SPDX-License-Identifier: Apache-2.0
+note Copyright 2026 Drake Stapleton (AIEN / aien-dev)
+note
+note tests/turing/ty_workload.om -- Pure seeded OM-2 port of tests/turing/ty_workload.c.
+note Concatenated after src/algebra/oma_lib.om and src/algebra/realize.om.
+note Runs one MA-2 realization back-to-back on fixed shape, one pinned worker per CPU,
+note prints "READY <pid> <weight_bytes> <footprint_bytes>\n", blocks on 1 GO byte on stdin,
+note runs for --secs seconds using monons, and prints one JSON result line.
+
+const TYW_MAX_CPUS ulong 10
+const TYW_MAX_TILE_M ulong 256
+const TYW_MAX_TILE_N ulong 1024
+
+text tyw_f_tag "--tag"
+text tyw_f_rz "--rz"
+text tyw_f_m "--m"
+text tyw_f_n "--n"
+text tyw_f_cpus "--cpus"
+text tyw_f_secs "--secs"
+text tyw_f_seed "--seed"
+text tyw_f_sp "--sparsity-milli"
+
+text tyw_rz0 "R1_plain"
+text tyw_rz1 "R1_sdot"
+text tyw_rz2 "R1_sdot_il"
+text tyw_rz3 "R1_smmla"
+text tyw_rz4 "R2_bitplane"
+text tyw_rz5 "R2b_lut"
+text tyw_rz6 "R2c_crumb"
+text tyw_rz7 "R3_sparse"
+text tyw_rz8 "R4_rns"
+text tyw_rz9 "R5_dense5"
+
+text tyw_def_tag "A"
+text tyw_def_rz "R1_plain"
+text tyw_def_cpus "5"
+
+text tyw_err_pfx "ty_workload: "
+text tyw_err_arg "unknown argument\n"
+text tyw_err_rz "unknown realization id\n"
+text tyw_err_cpu "bad --cpus\n"
+text tyw_err_need "need cpus and secs\n"
+text tyw_err_orac "oracle failed\n"
+text tyw_err_pack "pack failed\n"
+text tyw_err_mis "realization disagrees with oracle\n"
+text tyw_err_go "no GO byte\n"
+text tyw_ready "READY "
+
+text tyw_j0 "{\"tag\":\""
+text tyw_j1 "\",\"rz\":\""
+text tyw_j2 "\",\"m\":"
+text tyw_j3 ",\"n\":"
+text tyw_j4 ",\"sparsity_milli\":"
+text tyw_j5 ",\"seed\":"
+text tyw_j6 ",\"cpus\":\""
+text tyw_j7 "\",\"threads\":"
+text tyw_j8 ",\"pinned\":"
+text tyw_j9 ",\"oracle_ok\":1,\"weight_bytes\":"
+text tyw_j10 ",\"planned_ns\":"
+text tyw_j11 ",\"go_ns\":"
+text tyw_j12 ",\"t0_ns\":"
+text tyw_j13 ",\"t1_ns\":"
+text tyw_j14 ",\"done_ns\":"
+text tyw_j15 ",\"calls\":"
+text tyw_j16 ",\"thread_calls\":["
+text tyw_j17 "],\"pmu_open\":0,\"pmu_why\":\"om2-no-perf-event-open\"}\n"
+
+global g_tyw_tag uchar 64
+global g_tyw_rz uchar 64
+global g_tyw_cpus_s uchar 64
+global g_tyw_tmp uchar 128
+global g_tyw_lens ulong 4
+note g_tyw_cfg: [0]=m, [1]=n, [2]=secs, [3]=sp_milli, [4]=seed, [5]=rid, [6]=ncpu, [7]=rng
+global g_tyw_cfg ulong 8
+global g_tyw_cpu ulong 10
+global g_tyw_wcalls ulong 10
+global g_tyw_wt0 ulong 10
+global g_tyw_wt1 ulong 10
+global g_tyw_wpin ulong 10
+global g_tyw_wpid int 10
+global g_tyw_wfd int 10
+global g_tyw_obuf uchar 4096
+global g_tyw_olen ulong 1
+
+fn tyw_wr fd int s view uchar * to void
+  n = len s
+  off = ulong 0
+  while lt off n bound 256
+    w = write fd s off sub n off
+    if eq w neg long 4
+      continue
+    end
+    if le w 0
+      ret
+    end
+    off = add off ulong w
+  end
+end
+
+fn tyw_die msg view uchar * to void
+  tyw_wr 2 tyw_err_pfx
+  tyw_wr 2 msg
+  exit 2
+end
+
+fn tyw_ob_ch c uchar to void
+  n = get g_tyw_olen 0
+  if lt n 4096
+    put g_tyw_obuf n c
+    put g_tyw_olen 0 add n 1
+  end
+end
+
+fn tyw_ob_txt s view uchar * to void
+  n = len s
+  for i ulong n bound 256
+    tyw_ob_ch get s i
+  end
+end
+
+fn tyw_ob_u64 v ulong to void
+  if eq v 0
+    tyw_ob_ch 48
+    ret
+  end
+  dig = new uchar 24 0
+  nd = ulong 0
+  x = v
+  while gt x 0 bound 24
+    put dig nd uchar add 48 rem x 10
+    x = div x 10
+    nd = add nd 1
+  end
+  k = nd
+  while gt k 0 bound 24
+    k = sub k 1
+    tyw_ob_ch get dig k
+  end
+end
+
+fn tyw_ob_flush fd int to void
+  n = get g_tyw_olen 0
+  off = ulong 0
+  while lt off n bound 256
+    w = write fd g_tyw_obuf off sub n off
+    if eq w neg long 4
+      continue
+    end
+    if le w 0
+      break
+    end
+    off = add off ulong w
+  end
+  put g_tyw_olen 0 0
+end
+
+fn tyw_tmp_eq n ulong s view uchar * to bool
+  if ne n len s
+    ret false
+  end
+  for i ulong n bound 128
+    if ne get g_tyw_tmp i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tyw_rz_eq n ulong s view uchar * to bool
+  if ne n len s
+    ret false
+  end
+  for i ulong n bound 64
+    if ne get g_tyw_rz i get s i
+      ret false
+    end
+  end
+  ret true
+end
+
+fn tyw_find_rz to long
+  n = get g_tyw_lens 1
+  if tyw_rz_eq n tyw_rz0
+    ret long RZ_R1_PLAIN
+  end
+  if tyw_rz_eq n tyw_rz1
+    ret long RZ_R1_SDOT
+  end
+  if tyw_rz_eq n tyw_rz2
+    ret long RZ_R1_SDOT_IL
+  end
+  if tyw_rz_eq n tyw_rz3
+    ret long RZ_R1_SMMLA
+  end
+  if tyw_rz_eq n tyw_rz4
+    ret long RZ_R2_BITPLANE
+  end
+  if tyw_rz_eq n tyw_rz5
+    ret long RZ_R2B_LUT
+  end
+  if tyw_rz_eq n tyw_rz6
+    ret long RZ_R2C_CRUMB
+  end
+  if tyw_rz_eq n tyw_rz7
+    ret long RZ_R3_SPARSE
+  end
+  if tyw_rz_eq n tyw_rz8
+    ret long RZ_R4_RNS
+  end
+  if tyw_rz_eq n tyw_rz9
+    ret long RZ_R5_DENSE5
+  end
+  ret -1
+end
+
+fn tyw_parse_u64 n ulong to ulong
+  v = ulong 0
+  for i ulong n bound 32
+    c = ulong get g_tyw_tmp i
+    if or lt c 48 gt c 57
+      break
+    end
+    v = add mul v 10 sub c 48
+  end
+  ret v
+end
+
+fn tyw_init_defaults to void
+  for i ulong len tyw_def_tag
+    put g_tyw_tag i get tyw_def_tag i
+  end
+  put g_tyw_lens 0 len tyw_def_tag
+  for i ulong len tyw_def_rz
+    put g_tyw_rz i get tyw_def_rz i
+  end
+  put g_tyw_lens 1 len tyw_def_rz
+  for i ulong len tyw_def_cpus
+    put g_tyw_cpus_s i get tyw_def_cpus i
+  end
+  put g_tyw_lens 2 len tyw_def_cpus
+  put g_tyw_cfg 0 16384
+  put g_tyw_cfg 1 16384
+  put g_tyw_cfg 2 30
+  put g_tyw_cfg 3 300
+  put g_tyw_cfg 4 1
+end
+
+fn tyw_parse_args to void
+  tyw_init_defaults
+  ac = ulong argcnt
+  i = ulong 1
+  while lt add i 1 ac bound 64
+    klen = argread i g_tyw_tmp 0 127
+    if le klen 0
+      tyw_die tyw_err_arg
+    end
+    uk = ulong klen
+    if tyw_tmp_eq uk tyw_f_tag
+      vlen = argread add i 1 g_tyw_tag 0 63
+      if le vlen 0
+        tyw_die tyw_err_arg
+      end
+      put g_tyw_lens 0 ulong vlen
+    else
+      if tyw_tmp_eq uk tyw_f_rz
+        vlen = argread add i 1 g_tyw_rz 0 63
+        if le vlen 0
+          tyw_die tyw_err_arg
+        end
+        put g_tyw_lens 1 ulong vlen
+      else
+        if tyw_tmp_eq uk tyw_f_cpus
+          vlen = argread add i 1 g_tyw_cpus_s 0 63
+          if le vlen 0
+            tyw_die tyw_err_arg
+          end
+          put g_tyw_lens 2 ulong vlen
+        else
+          vlen = argread add i 1 g_tyw_tmp 0 127
+          if le vlen 0
+            tyw_die tyw_err_arg
+          end
+          val = tyw_parse_u64 ulong vlen
+          klen2 = argread i g_tyw_tmp 0 127
+          uk2 = ulong klen2
+          if tyw_tmp_eq uk2 tyw_f_m
+            put g_tyw_cfg 0 val
+          else
+            if tyw_tmp_eq uk2 tyw_f_n
+              put g_tyw_cfg 1 val
+            else
+              if tyw_tmp_eq uk2 tyw_f_secs
+                put g_tyw_cfg 2 val
+              else
+                if tyw_tmp_eq uk2 tyw_f_seed
+                  put g_tyw_cfg 4 val
+                else
+                  if tyw_tmp_eq uk2 tyw_f_sp
+                    put g_tyw_cfg 3 val
+                  else
+                    tyw_die tyw_err_arg
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    i = add i 2
+  end
+end
+
+fn tyw_parse_cpus to void
+  n = get g_tyw_lens 2
+  ncpu = ulong 0
+  p = ulong 0
+  while and lt p n lt ncpu TYW_MAX_CPUS bound 32
+    c0 = ulong get g_tyw_cpus_s p
+    if or lt c0 48 gt c0 57
+      tyw_die tyw_err_cpu
+    end
+    v = ulong 0
+    while lt p n bound 16
+      ch = ulong get g_tyw_cpus_s p
+      if or lt ch 48 gt ch 57
+        break
+      end
+      v = add mul v 10 sub ch 48
+      p = add p 1
+    end
+    put g_tyw_cpu ncpu v
+    ncpu = add ncpu 1
+    if lt p n
+      if ne get g_tyw_cpus_s p 44
+        tyw_die tyw_err_cpu
+      end
+      p = add p 1
+    end
+  end
+  put g_tyw_cfg 6 ncpu
+end
+
+fn tyw_rng_next to ulong
+  z = add get g_tyw_cfg 7 ulong 0x9e3779b97f4a7c15
+  put g_tyw_cfg 7 z
+  z = mul xor z shr z 30 ulong 0xbf58476d1ce4e5b9
+  z = mul xor z shr z 27 ulong 0x94d049bb133111eb
+  ret xor z shr z 31
+end
+
+fn tyw_pin_cpu cpu ulong to ulong
+  mask = new uchar 16 0
+  if ge cpu 128
+    ret 0
+  end
+  bi = div cpu 8
+  sh = rem cpu 8
+  put mask bi uchar shl ulong 1 sh
+  rc = cpuset 0 mask 0 16
+  if eq rc 0
+    ret 1
+  end
+  ret 0
+end
+
+fn tyw_est_weight_bytes rid ulong m ulong n ulong sp ulong to ulong
+  if le rid RZ_R1_SMMLA
+    np = mul div add n 15 16 16
+    ret mul m np
+  end
+  if or eq rid RZ_R2_BITPLANE eq rid RZ_R2B_LUT
+    np = mul div add n 15 16 16
+    ret div mul m np 4
+  end
+  if eq rid RZ_R2C_CRUMB
+    np = mul div add n 15 16 16
+    ret div mul m np 4
+  end
+  if eq rid RZ_R3_SPARSE
+    nnz = div mul mul m n sub 1000 sp 1000
+    ret mul nnz 2
+  end
+  if eq rid RZ_R4_RNS
+    np = mul div add n 15 16 16
+    ret mul m np
+  end
+  chunks = div add n 79 80
+  ret mul mul m chunks 16
+end
+
+fn tyw_put_u64_le buf edit uchar 32 off ulong v ulong to void
+  for k ulong 8
+    put buf add off k uchar and shr v mul k 8 255
+  end
+end
+
+fn tyw_get_u64_le buf view uchar 32 off ulong to ulong
+  v = ulong 0
+  for k ulong 8
+    v = or v shl ulong get buf add off k mul k 8
+  end
+  ret v
+end
+
+fn tyw_worker_run cpu ulong deadline ulong res edit uchar 32 to void
+  pok = tyw_pin_cpu cpu
+  t0 = ulong monons
+  now = t0
+  calls = ulong 0
+  while lt now deadline bound 1000000000
+    ign = oma_rz_run_g
+    calls = add calls 1
+    now = ulong monons
+  end
+  tyw_put_u64_le res 0 calls
+  tyw_put_u64_le res 8 t0
+  tyw_put_u64_le res 16 now
+  tyw_put_u64_le res 24 pok
+end
+
+fn tyw_emit_json go_ns ulong done_ns ulong wb ulong to void
+  ncpu = get g_tyw_cfg 6
+  tot_calls = ulong 0
+  t0 = get g_tyw_wt0 0
+  t1 = get g_tyw_wt1 0
+  pins = ulong 1
+  for k ulong ncpu bound 10
+    tot_calls = add tot_calls get g_tyw_wcalls k
+    if lt get g_tyw_wt0 k t0
+      t0 = get g_tyw_wt0 k
+    end
+    if gt get g_tyw_wt1 k t1
+      t1 = get g_tyw_wt1 k
+    end
+    if eq get g_tyw_wpin k 0
+      pins = ulong 0
+    end
+  end
+  put g_tyw_olen 0 0
+  tyw_ob_txt tyw_j0
+  for i ulong get g_tyw_lens 0 bound 64
+    tyw_ob_ch get g_tyw_tag i
+  end
+  tyw_ob_txt tyw_j1
+  for i ulong get g_tyw_lens 1 bound 64
+    tyw_ob_ch get g_tyw_rz i
+  end
+  tyw_ob_txt tyw_j2
+  tyw_ob_u64 get g_tyw_cfg 0
+  tyw_ob_txt tyw_j3
+  tyw_ob_u64 get g_tyw_cfg 1
+  tyw_ob_txt tyw_j4
+  tyw_ob_u64 get g_tyw_cfg 3
+  tyw_ob_txt tyw_j5
+  tyw_ob_u64 get g_tyw_cfg 4
+  tyw_ob_txt tyw_j6
+  for i ulong get g_tyw_lens 2 bound 64
+    tyw_ob_ch get g_tyw_cpus_s i
+  end
+  tyw_ob_txt tyw_j7
+  tyw_ob_u64 ncpu
+  tyw_ob_txt tyw_j8
+  tyw_ob_u64 pins
+  tyw_ob_txt tyw_j9
+  tyw_ob_u64 wb
+  tyw_ob_txt tyw_j10
+  tyw_ob_u64 mul get g_tyw_cfg 2 1000000000
+  tyw_ob_txt tyw_j11
+  tyw_ob_u64 go_ns
+  tyw_ob_txt tyw_j12
+  tyw_ob_u64 t0
+  tyw_ob_txt tyw_j13
+  tyw_ob_u64 t1
+  tyw_ob_txt tyw_j14
+  tyw_ob_u64 done_ns
+  tyw_ob_txt tyw_j15
+  tyw_ob_u64 tot_calls
+  tyw_ob_txt tyw_j16
+  for k ulong ncpu bound 10
+    if gt k 0
+      tyw_ob_ch 44
+    end
+    tyw_ob_u64 get g_tyw_wcalls k
+  end
+  tyw_ob_txt tyw_j17
+  tyw_ob_flush 1
+end
+
+fn tyw_fd_u32 buf view uchar 8 off ulong to int
+  b0 = ulong get buf off
+  b1 = shl ulong get buf add off 1 8
+  b2 = shl ulong get buf add off 2 16
+  b3 = shl ulong get buf add off 3 24
+  ret int or or b0 b1 or b2 b3
+end
+
+fn tyw_spawn_one k ulong deadline ulong to void
+  pfd = new uchar 8 0
+  res = new uchar 32 0
+  if ne pipefds pfd 0 8 0 0
+    tyw_die tyw_err_go
+  end
+  rfd = tyw_fd_u32 pfd 0
+  wfd = tyw_fd_u32 pfd 4
+  pid = fork
+  if eq pid 0
+    cl0 = fclose rfd
+    tyw_worker_run get g_tyw_cpu k deadline res
+    wr = write wfd res 0 32
+    cl1 = fclose wfd
+    exit 0
+  end
+  cl2 = fclose wfd
+  put g_tyw_wpid k int pid
+  put g_tyw_wfd k rfd
+end
+
+fn tyw_spawn_workers deadline ulong to void
+  ncpu = get g_tyw_cfg 6
+  res = new uchar 32 0
+  wst = new uchar 4 0
+  for k ulong ncpu bound 10
+    tyw_spawn_one k deadline
+  end
+  for k ulong ncpu bound 10
+    rfd = get g_tyw_wfd k
+    got = ulong 0
+    while lt got 32 bound 64
+      r = read rfd res got sub 32 got
+      if eq r neg long 4
+        continue
+      end
+      if le r 0
+        break
+      end
+      got = add got ulong r
+    end
+    cl3 = fclose rfd
+    wp = waitpid get g_tyw_wpid k wst 0 4 0
+    put g_tyw_wcalls k tyw_get_u64_le res 0
+    put g_tyw_wt0 k tyw_get_u64_le res 8
+    put g_tyw_wt1 k tyw_get_u64_le res 16
+    put g_tyw_wpin k tyw_get_u64_le res 24
+  end
+end
+
+fn tyw_prepare rid ulong to void
+  mt = get g_tyw_cfg 0
+  if gt mt TYW_MAX_TILE_M
+    mt = TYW_MAX_TILE_M
+  end
+  nt = get g_tyw_cfg 1
+  if gt nt TYW_MAX_TILE_N
+    nt = TYW_MAX_TILE_N
+  end
+  sp = get g_tyw_cfg 3
+  put g_tyw_cfg 7 get g_tyw_cfg 4
+  tot = mul mt nt
+  for i ulong tot bound 262144
+    r = tyw_rng_next
+    v = byte 0
+    if ge rem r 1000 sp
+      if ne and shr r 32 1 0
+        v = byte 1
+      else
+        v = byte -1
+      end
+    end
+    put rz_w i v
+  end
+  for j ulong nt bound 1024
+    xr = and tyw_rng_next 255
+    xb = byte 0
+    if ge xr 128
+      xb = byte sub long xr 256
+    else
+      xb = byte xr
+    end
+    put rz_x j xb
+  end
+  if ne oma_rz_oracle_g mt nt 0
+    tyw_die tyw_err_orac
+  end
+  if ne oma_rz_pack_g rid mt nt 0
+    tyw_die tyw_err_pack
+  end
+  if ne oma_rz_run_g 0
+    tyw_die tyw_err_mis
+  end
+  for i ulong mt bound 256
+    if ne get rz_y i get rz_yref i
+      tyw_die tyw_err_mis
+    end
+  end
+end
+
+fn main to int
+  gobuf = new uchar 4 0
+  res = new uchar 32 0
+  tyw_parse_args
+  rid_l = tyw_find_rz
+  if lt rid_l 0
+    tyw_die tyw_err_rz
+  end
+  rid = ulong rid_l
+  put g_tyw_cfg 5 rid
+  tyw_parse_cpus
+  if or eq get g_tyw_cfg 6 0 eq get g_tyw_cfg 2 0
+    tyw_die tyw_err_need
+  end
+
+  tyw_prepare rid
+  wb = tyw_est_weight_bytes rid get g_tyw_cfg 0 get g_tyw_cfg 1 get g_tyw_cfg 3
+  fp = add wb mul get g_tyw_cfg 0 4
+  put g_tyw_olen 0 0
+  tyw_ob_txt tyw_ready
+  tyw_ob_u64 ulong getpid
+  tyw_ob_ch 32
+  tyw_ob_u64 wb
+  tyw_ob_ch 32
+  tyw_ob_u64 fp
+  tyw_ob_ch 10
+  tyw_ob_flush 1
+
+  if ne read 0 gobuf 0 1 1
+    tyw_die tyw_err_go
+  end
+  go_ns = ulong monons
+  deadline = add go_ns mul get g_tyw_cfg 2 1000000000
+  if eq get g_tyw_cfg 6 1
+    tyw_worker_run get g_tyw_cpu 0 deadline res
+    put g_tyw_wcalls 0 tyw_get_u64_le res 0
+    put g_tyw_wt0 0 tyw_get_u64_le res 8
+    put g_tyw_wt1 0 tyw_get_u64_le res 16
+    put g_tyw_wpin 0 tyw_get_u64_le res 24
+  else
+    tyw_spawn_workers deadline
+  end
+  tyw_emit_json go_ns ulong monons wb
+  ret 0
+end

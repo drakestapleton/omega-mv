@@ -76,7 +76,12 @@ while IFS="$(printf '\t')" read -r kind cpath ref target covered excluded; do
     git cat-file -e "$ref:$cpath" 2>/dev/null || { err "$cpath: not in ref commit $ref"; continue; }
     git show "$ref:$cpath" | awk -f "$AWKF" > "$W/funcs"
   fi
-  [ -s "$W/funcs" ] || err "$cpath: no function found (extractor failed?)"
+  if [ ! -s "$W/funcs" ]; then
+    case "$covered|$excluded" in
+      "-|0funcs="*[!-]*) continue ;;
+      *) err "$cpath: no function found (extractor failed?)" ;;
+    esac
+  fi
   : > "$W/listed"
   [ "$covered" = - ] || printf '%s\n' "$covered" | tr ',' '\n' | sed '/^$/d' >> "$W/listed"
   if [ "$excluded" != - ]; then
