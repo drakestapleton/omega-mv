@@ -1,0 +1,2476 @@
+om2
+note SPDX-License-Identifier: Apache-2.0
+note apps/om-route/om_route.om: Sovereign Intelligence 1.0 Universal Pure-Omega Local Model Router.
+note
+note Zero C, zero Python, zero libc, zero hardcoded user paths, zero external network telemetry.
+note
+note Build:
+note   seed/out/omc < apps/om-route/om_route.om > om_route && chmod +x om_route
+note Run:
+note   om_route MODELS.tsv [PORT] [--tz5 PATH] [--tz0 PATH] [--watts-override W]
+note
+note Features:
+note   - Declarative TSV config (models.tsv) with fail-closed validation (loopback-only URLs, no duplicates).
+note   - Dual API: OpenAI POST /v1/chat/completions (string & array-of-parts content, live SSE stream:true)
+note     AND Anthropic POST /v1/messages (request translation + Anthropic JSON/SSE response translation),
+note     plus GET /v1/models, GET /health, and OPTIONS CORS preflight.
+note   - Single-process non-blocking multi-client pollfds event loop (up to 8 concurrent connections).
+note   - Live fail-closed thermal & Watt admission reading Spark /sys/class/thermal/thermal_zone5/temp
+note     (TGPU) and thermal_zone0/temp (TSOC) -> HTTP 503 thermal_budget_exceeded if over ceiling.
+note   - Idle auto-unload timer for spawned GPU backends.
+note   - Structured local-only TY-4+ request/energy/latency telemetry lines on stdout.
+
+note ---- Constants
+const MAX_MOD ulong 32
+const MAX_SLOTS ulong 8
+const SLOT_SZ ulong 65536
+const LINE_SZ ulong 8192
+
+note ---- Config storage (up to 32 models)
+global g_cfg uchar 262144
+global g_m_id_o ulong 32
+global g_m_id_n ulong 32
+global g_m_port ulong 32
+global g_m_kind ulong 32
+global g_m_idle ulong 32
+global g_m_watt ulong 32
+global g_m_tgpu ulong 32
+global g_m_cmd_o ulong 32
+global g_m_cmd_n ulong 32
+global g_m_pid ulong 32
+global g_m_last ulong 32
+
+note ---- Per-slot non-blocking connection state (8 slots, 16 ulongs per slot)
+note slot fields (base = slot * 16):
+note   0=state(0=FREE,1=READ_REQ,2=SEND_BE,3=RELAY)  1=cfd  2=bfd  3=midx
+note   4=api(0=openai,1=anthropic)  5=is_stream  6=req_len  7=hdr_end
+note   8=need_len  9=bsend_off  10=bsend_len  11=brx_len
+note   12=resp_hdr_done  13=anth_started  14=out_chunks  15=start_ns
+global g_sl ulong 128
+global g_sreq uchar 524288
+global g_sbtx uchar 524288
+global g_sbrx uchar 524288
+global g_slin uchar 65536
+global g_slin_n ulong 8
+global g_srx_b ulong 8
+global g_stx_b ulong 8
+
+note ---- Scratch & I/O buffers
+global g_pfd uchar 256
+global g_pmap ulong 32
+global g_pknd ulong 32
+global g_tmp uchar 65536
+global g_out uchar 131072
+global g_log uchar 16384
+global g_tz5_p uchar 512
+global g_tz0_p uchar 512
+global g_tbuf uchar 128
+global g_pkt uchar 4096
+global g_co ulong 16
+global g_cn ulong 16
+global g_pa uchar 4096
+global g_ty ulong 4
+note g_ty: 0=dt_ns, 1=rx_b, 2=tx_b
+
+note ---- Global counters & state g_n[0..31]
+note   0=cfg_len  1=nmod  2=port  3=lfd  4=hdr_seen  5=tz5_len  6=tz0_len
+note   7=tgpu_mc  8=tsoc_mc  9=tgpu_ok  10=tsoc_ok  11=watts_ov  12=has_wov
+note   13=req_seq  14=thermal_rej  15=idle_unloads  16=out_len  17=log_len
+note   18=pa_len  19=est_mw  20=tmp_len
+global g_n ulong 32
+
+note ---- Strings & protocol templates
+text t_usage "usage: om_route MODELS.tsv [PORT] [--tz5 PATH] [--tz0 PATH] [--watts-override W]\n"
+text t_cfg_err "OM_ROUTE_CONFIG_ERROR "
+text t_hdr_cfg "model_id\tbackend_url\tkind\tidle_unload_s\tmax_watts\tmax_tgpu_mc\tlaunch_cmd"
+text t_http127 "http://127.0.0.1:"
+text t_httploc "http://localhost:"
+text t_gpu "gpu"
+text t_cpu "cpu"
+text t_dash "-"
+text t_def_tz5 "/sys/class/thermal/thermal_zone5/temp"
+text t_def_tz0 "/sys/class/thermal/thermal_zone0/temp"
+text t_flag_tz5 "--tz5"
+text t_flag_tz0 "--tz0"
+text t_flag_wov "--watts-override"
+text t_devnull "/dev/null"
+
+text c_open "cannot open config file"
+text c_hdr "missing or invalid header row"
+text c_cols "row must have exactly 7 tab-separated columns"
+text c_mid "invalid or duplicate model_id"
+text c_url "backend_url must be loopback http://127.0.0.1:<port> or http://localhost:<port>"
+text c_kind "kind must be gpu or cpu"
+text c_num "invalid numeric budget or idle_unload_s"
+text c_cmd "unsafe launch_cmd"
+text c_empty "config declares zero models"
+text c_bind "cannot listen on 127.0.0.1 port"
+
+text t_ready0 "OM_ROUTE_READY port="
+text t_ready1 " models="
+text t_ready2 " tgpu_mc="
+text t_ready3 " tsoc_mc="
+
+text m_GET "GET"
+text m_POST "POST"
+text m_OPTIONS "OPTIONS"
+text p_health "/health"
+text p_models "/v1/models"
+text p_chat "/v1/chat/completions"
+text p_anth "/v1/messages"
+
+text h_200_json "HTTP/1.1 200 OK\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n"
+text h_200_sse "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\nAccess-Control-Allow-Origin: *\nConnection: close\n\n"
+text h_204_cors "HTTP/1.1 204 No Content\nAccess-Control-Allow-Origin: *\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\nAccess-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\nConnection: close\n\n"
+text h_400 "HTTP/1.1 400 Bad Request\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n"
+text h_404 "HTTP/1.1 404 Not Found\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n"
+text h_405 "HTTP/1.1 405 Method Not Allowed\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n"
+text h_503 "HTTP/1.1 503 Service Unavailable\nContent-Type: application/json\nAccess-Control-Allow-Origin: *\nConnection: close\n"
+text h_clen "Content-Length: "
+text h_crlf2 "\n\n"
+
+text b_400 "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"malformed request or unsafe path\"}}\n"
+text b_404_path "{\"error\":{\"type\":\"not_found\",\"message\":\"unknown endpoint\"}}\n"
+text b_404_mod "{\"error\":{\"type\":\"model_not_found\",\"message\":\"unknown model\"}}\n"
+text b_405 "{\"error\":{\"type\":\"method_not_allowed\",\"message\":\"HTTP method not allowed on this endpoint\"}}\n"
+text b_503_be "{\"error\":{\"type\":\"backend_unavailable\",\"message\":\"backend unreachable or busy\"}}\n"
+text b_503_th0 "{\"error\":{\"type\":\"thermal_budget_exceeded\",\"message\":\"live thermal or watt ceiling exceeded\",\"tgpu_mc\":"
+text b_503_th1 ",\"tsoc_mc\":"
+text b_503_th2 ",\"max_tgpu_mc\":"
+text b_503_th3 ",\"est_mw\":"
+text b_503_th4 ",\"max_watts\":"
+text b_503_th5 "}}\n"
+text b_503_sn "{\"error\":{\"type\":\"thermal_sensor_unavailable\",\"message\":\"fail-closed: live TGPU sensor unreadable\"}}\n"
+
+text j_h0 "{\"status\":\"ok\",\"engine\":\"om-route\",\"models\":"
+text j_h1 ",\"active_slots\":"
+text j_h2 ",\"tgpu_mc\":"
+text j_h3 ",\"tsoc_mc\":"
+text j_h4 ",\"thermal_ok\":"
+text j_h5 ",\"requests_total\":"
+text j_h6 ",\"thermal_rejects\":"
+text j_h7 ",\"idle_unloads\":"
+text j_h8 "}\n"
+text j_true "true"
+text j_false "false"
+
+text j_m0 "{\"object\":\"list\",\"data\":["
+text j_m1 "{\"id\":\""
+text j_m2 "\",\"object\":\"model\",\"owned_by\":\"om-route\",\"kind\":\""
+text j_m3 "\",\"max_watts\":"
+text j_m4 ",\"max_tgpu_mc\":"
+text j_m5 ",\"idle_unload_s\":"
+text j_m6 "}"
+text j_m7 "]}\n"
+
+text k_clen "content-length:"
+text k_model "\"model\""
+text k_stream "\"stream\""
+text k_maxtok "\"max_tokens\""
+text k_system "\"system\""
+text k_msgs "\"messages\""
+text k_content "\"content\""
+text k_text "\"text\""
+text k_msg "\"message\""
+text k_delta "\"delta\""
+text k_ptok "\"prompt_tokens\""
+text k_ctok "\"completion_tokens\""
+text k_data "data: "
+text k_done "[DONE]"
+
+text be_req0 "POST /v1/chat/completions HTTP/1.1\nHost: 127.0.0.1\nContent-Type: application/json\nContent-Length: "
+text be_req1 "\nConnection: close\n\n"
+
+text an_o0 "{\"model\":\""
+text an_o1 "\",\"stream\":"
+text an_o2 ",\"max_tokens\":"
+text an_o3 ",\"messages\":["
+text an_sys0 "{\"role\":\"system\",\"content\":\""
+text an_sys1 "\"},"
+text an_o4 "]}"
+
+text an_r0 "{\"id\":\"msg_omroute_"
+text an_r1 "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\""
+text an_r2 "\",\"content\":[{\"type\":\"text\",\"text\":\""
+text an_r3 "\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":"
+text an_r4 ",\"output_tokens\":"
+text an_r5 "}}\n"
+
+text sse_s0 "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_omroute_"
+text sse_s1 "\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\""
+text sse_s2 "\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+text sse_d0 "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\""
+text sse_d1 "\"}}\n\n"
+text sse_e0 "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":"
+text sse_e1 "}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+text ty_0 "TY-4+ req_id="
+text ty_1 " api="
+text ty_2 " model="
+text ty_3 " status="
+text ty_4 " stream="
+text ty_5 " lat_us="
+text ty_6 " tgpu_mc="
+text ty_7 " tsoc_mc="
+text ty_8 " est_mw="
+text ty_9 " rx_b="
+text ty_10 " tx_b="
+text ty_unl "TY-4+ event=idle_unload model="
+text a_openai "openai"
+text a_anth "anthropic"
+text a_health "health"
+text a_models "models"
+text a_err "err"
+
+note ---- Buffered stdout telemetry log helpers (g_log)
+fn lflush to void
+n = get g_n 17
+p = ulong 0
+while lt p n bound 16385
+k = write 1 g_log p sub n p
+if le k 0
+break
+end
+p = add p ulong k
+end
+put g_n 17 0
+end
+
+fn lc c uchar to void
+n = get g_n 17
+if ge n 16300
+lflush
+n = get g_n 17
+end
+put g_log n c
+put g_n 17 add n 1
+end
+
+fn lt_s t view uchar * to void
+for i ulong len t bound 4096
+lc get t i
+end
+end
+
+fn lcfg o ulong n ulong to void
+lim = n
+if gt lim 128
+lim = 128
+end
+for i ulong lim bound 128
+lc get g_cfg add o i
+end
+end
+
+fn lnum v ulong to void
+if ge v 10
+lnum div v 10
+end
+lc uchar add 48 rem v 10
+end
+
+fn die_cfg msg view uchar * to void
+w = write 2 t_cfg_err 0 len t_cfg_err
+w = write 2 msg 0 len msg
+nl = new uchar 1 10
+w = write 2 nl 0 1
+exit 2
+end
+
+note ---- Output builder g_out[0..g_n 16)
+fn oclr to void
+put g_n 16 0
+end
+
+fn oc c uchar to void
+n = get g_n 16
+if lt n 131070
+put g_out n c
+put g_n 16 add n 1
+end
+end
+
+fn ot t view uchar * to void
+for i ulong len t bound 8192
+oc get t i
+end
+end
+
+fn ocfg o ulong n ulong to void
+for i ulong n bound 4096
+oc get g_cfg add o i
+end
+end
+
+fn onum v ulong to void
+if ge v 10
+onum div v 10
+end
+oc uchar add 48 rem v 10
+end
+
+fn ot_crlf t view uchar * to void
+for i ulong len t bound 8192
+c = get t i
+if eq c 10
+oc 13
+end
+oc c
+end
+end
+
+fn send_gtmp fd int n ulong to ulong
+off = ulong 0
+tries = ulong 0
+while lt off n bound 65536
+k = send fd g_tmp off sub n off 64
+if gt k 0
+off = add off ulong k
+tries = ulong 0
+else
+if or eq k -4 eq k -11
+tries = add tries 1
+if gt tries 200
+break
+end
+z = sleepns 1000000
+else
+break
+end
+end
+end
+ret off
+end
+
+fn send_gout fd int to ulong
+n = get g_n 16
+off = ulong 0
+tries = ulong 0
+while lt off n bound 65536
+k = send fd g_out off sub n off 64
+if gt k 0
+off = add off ulong k
+tries = ulong 0
+else
+if or eq k -4 eq k -11
+tries = add tries 1
+if gt tries 200
+break
+end
+z = sleepns 1000000
+else
+break
+end
+end
+end
+ret off
+end
+
+fn send_http_body fd int hdr view uchar * body view uchar * to ulong
+oclr
+ot_crlf hdr
+ot h_clen
+onum len body
+ot_crlf h_crlf2
+ot body
+ret send_gout fd
+end
+
+note ---- Live thermal & Watt admission reader (strictly read-only sysfs)
+fn read_sysfs_u64 is_tz5 bool to ulong
+plen = ulong 0
+fd = long -1
+if is_tz5
+plen = get g_n 5
+fd = fopen g_tz5_p 0 plen 524288 0
+else
+plen = get g_n 6
+fd = fopen g_tz0_p 0 plen 524288 0
+end
+if lt fd 0
+ret shl ulong 1 63
+end
+k = read int fd g_tbuf 0 120
+z = fclose int fd
+if le k 0
+ret shl ulong 1 63
+end
+n = ulong k
+i = ulong 0
+while lt i n bound 64
+c = get g_tbuf i
+if or eq c 32 eq c 9
+i = add i 1
+else
+break
+end
+end
+if ge i n
+ret shl ulong 1 63
+end
+if eq get g_tbuf i 45
+ret 0
+end
+v = ulong 0
+digs = ulong 0
+while lt i n bound 64
+c = get g_tbuf i
+if and ge c 48 le c 57
+v = add mul v 10 ulong sub c 48
+digs = add digs 1
+i = add i 1
+else
+break
+end
+end
+if eq digs 0
+ret shl ulong 1 63
+end
+ret v
+end
+
+fn refresh_thermal to void
+v5 = read_sysfs_u64 true
+if eq v5 shl ulong 1 63
+put g_n 9 0
+put g_n 7 0
+else
+put g_n 9 1
+put g_n 7 v5
+end
+v0 = read_sysfs_u64 false
+if eq v0 shl ulong 1 63
+put g_n 10 0
+put g_n 8 0
+else
+put g_n 10 1
+put g_n 8 v0
+end
+if ne get g_n 12 0
+put g_n 19 mul get g_n 11 1000
+else
+tg = get g_n 7
+if gt tg 25000
+put g_n 19 mul div sub tg 25000 1000 1000
+else
+put g_n 19 5000
+end
+end
+end
+
+note ---- Config parsing (models.tsv)
+fn cfg_eq_t o ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 4096
+if ne get g_cfg add o i get t i
+ret false
+end
+end
+ret true
+end
+
+fn cfg_pref_t o ulong n ulong t view uchar * to bool
+if lt n len t
+ret false
+end
+for i ulong len t bound 64
+if ne get g_cfg add o i get t i
+ret false
+end
+end
+ret true
+end
+
+fn cfg_eq_cfg o1 ulong n1 ulong o2 ulong n2 ulong to bool
+if ne n1 n2
+ret false
+end
+for i ulong n1 bound 256
+if ne get g_cfg add o1 i get g_cfg add o2 i
+ret false
+end
+end
+ret true
+end
+
+fn cfg_parse_u64 o ulong n ulong to ulong
+if or eq n 0 gt n 18
+ret shl ulong 1 63
+end
+v = ulong 0
+for i ulong n bound 18
+c = get g_cfg add o i
+if or lt c 48 gt c 57
+ret shl ulong 1 63
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn is_id_char c uchar to bool
+if and ge c 48 le c 57
+ret true
+end
+if and ge c 65 le c 90
+ret true
+end
+if and ge c 97 le c 122
+ret true
+end
+if or eq c 45 eq c 95
+ret true
+end
+ret or eq c 46 eq c 58
+end
+
+fn cfg_valid_id o ulong n ulong to bool
+if or eq n 0 gt n 96
+ret false
+end
+for i ulong n bound 96
+if not is_id_char get g_cfg add o i
+ret false
+end
+end
+cnt = get g_n 1
+for i ulong cnt bound 32
+if cfg_eq_cfg get g_m_id_o i get g_m_id_n i o n
+ret false
+end
+end
+ret true
+end
+
+fn cfg_parse_url o ulong n ulong to ulong
+po = ulong 0
+pn = ulong 0
+if cfg_pref_t o n t_http127
+po = add o len t_http127
+pn = sub n len t_http127
+else
+if cfg_pref_t o n t_httploc
+po = add o len t_httploc
+pn = sub n len t_httploc
+else
+ret 0
+end
+end
+port = cfg_parse_u64 po pn
+if or eq port 0 gt port 65535
+ret 0
+end
+ret port
+end
+
+fn cfg_valid_cmd o ulong n ulong to bool
+if or eq n 0 gt n 512
+ret false
+end
+for i ulong n bound 512
+c = get g_cfg add o i
+if or lt c 32 eq c 127
+ret false
+end
+if or eq c 59 or eq c 38 or eq c 124 eq c 36
+ret false
+end
+if and eq c 46 lt add i 1 n
+if eq get g_cfg add o add i 1 46
+ret false
+end
+end
+end
+ret true
+end
+
+fn cfg_split s ulong e ulong to ulong
+cnt = ulong 0
+p = s
+while le p e bound 262145
+q = p
+while lt q e bound 262144
+if eq get g_cfg q 9
+break
+end
+q = add q 1
+end
+if lt cnt 16
+put g_co cnt p
+put g_cn cnt sub q p
+end
+cnt = add cnt 1
+if ge q e
+break
+end
+p = add q 1
+end
+ret cnt
+end
+
+fn parse_cfg_line s ulong e ulong to void
+if eq s e
+ret
+end
+if eq get g_cfg s 35
+ret
+end
+if eq get g_n 4 0
+if cfg_eq_t s sub e s t_hdr_cfg
+put g_n 4 1
+ret
+end
+die_cfg c_hdr
+end
+nc = cfg_split s e
+if ne nc 7
+die_cfg c_cols
+end
+m = get g_n 1
+if ge m MAX_MOD
+die_cfg c_mid
+end
+if not cfg_valid_id get g_co 0 get g_cn 0
+die_cfg c_mid
+end
+port = cfg_parse_url get g_co 1 get g_cn 1
+if eq port 0
+die_cfg c_url
+end
+kd = ulong 9
+if cfg_eq_t get g_co 2 get g_cn 2 t_gpu
+kd = 1
+else
+if cfg_eq_t get g_co 2 get g_cn 2 t_cpu
+kd = 0
+end
+end
+if eq kd 9
+die_cfg c_kind
+end
+idl = cfg_parse_u64 get g_co 3 get g_cn 3
+if gt idl 86400
+die_cfg c_num
+end
+wat = cfg_parse_u64 get g_co 4 get g_cn 4
+if or eq wat 0 gt wat 1000
+die_cfg c_num
+end
+tgp = cfg_parse_u64 get g_co 5 get g_cn 5
+if or lt tgp 1000 gt tgp 120000
+die_cfg c_num
+end
+if not cfg_valid_cmd get g_co 6 get g_cn 6
+die_cfg c_cmd
+end
+put g_m_id_o m get g_co 0
+put g_m_id_n m get g_cn 0
+put g_m_port m port
+put g_m_kind m kd
+put g_m_idle m idl
+put g_m_watt m wat
+put g_m_tgpu m tgp
+put g_m_cmd_o m get g_co 6
+put g_m_cmd_n m get g_cn 6
+put g_m_pid m 0
+put g_m_last m ulong monons
+put g_n 1 add m 1
+end
+
+fn load_config to void
+fd = fopen g_pa 0 get g_n 18 524288 0
+if lt fd 0
+die_cfg c_open
+end
+n = ulong 0
+while lt n 262144 bound 262145
+k = read int fd g_cfg n sub 262144 n
+if lt k 0
+z = fclose int fd
+die_cfg c_open
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+z = fclose int fd
+if or eq n 0 ge n 262144
+die_cfg c_empty
+end
+put g_n 0 n
+p = ulong 0
+while lt p n bound 262145
+q = p
+while lt q n bound 262144
+if eq get g_cfg q 10
+break
+end
+q = add q 1
+end
+parse_cfg_line p q
+p = add q 1
+end
+if eq get g_n 4 0
+die_cfg c_hdr
+end
+if eq get g_n 1 0
+die_cfg c_empty
+end
+end
+
+note ---- Slot field accessors
+fn sl_get s ulong f ulong to ulong
+ret get g_sl add mul s 16 f
+end
+
+fn sl_set s ulong f ulong v ulong to void
+put g_sl add mul s 16 f v
+end
+
+fn active_slot_count to ulong
+c = ulong 0
+for s ulong MAX_SLOTS
+if ne sl_get s 0 0
+c = add c 1
+end
+end
+ret c
+end
+
+fn set_ty_stats dt_ns ulong rx ulong tx ulong to void
+put g_ty 0 dt_ns
+put g_ty 1 rx
+put g_ty 2 tx
+end
+
+fn emit_ty4 api view uchar * midx ulong status ulong strm ulong to void
+seq = add get g_n 13 1
+put g_n 13 seq
+lt_s ty_0
+lnum seq
+lt_s ty_1
+lt_s api
+lt_s ty_2
+if lt midx get g_n 1
+lcfg get g_m_id_o midx get g_m_id_n midx
+else
+lt_s t_dash
+end
+lt_s ty_3
+lnum status
+lt_s ty_4
+lnum strm
+lt_s ty_5
+lnum div get g_ty 0 1000
+lt_s ty_6
+lnum get g_n 7
+lt_s ty_7
+lnum get g_n 8
+lt_s ty_8
+lnum get g_n 19
+lt_s ty_9
+lnum get g_ty 1
+lt_s ty_10
+lnum get g_ty 2
+lc 10
+lflush
+end
+
+fn slot_close s ulong status ulong to void
+st = sl_get s 0
+if eq st 0
+ret
+end
+cfd = sl_get s 1
+bfd = sl_get s 2
+if gt cfd 0
+z1 = fclose int cfd
+end
+if gt bfd 0
+z2 = fclose int bfd
+end
+if gt status 0
+now = ulong monons
+t0 = sl_get s 15
+dt = ulong 0
+if gt now t0
+dt = sub now t0
+end
+set_ty_stats dt get g_srx_b s get g_stx_b s
+api_k = sl_get s 4
+if eq api_k 1
+emit_ty4 a_anth sl_get s 3 status sl_get s 5
+else
+emit_ty4 a_openai sl_get s 3 status sl_get s 5
+end
+end
+for f ulong 16
+sl_set s f 0
+end
+put g_slin_n s 0
+put g_srx_b s 0
+put g_stx_b s 0
+end
+
+note ---- HTTP request parsing helpers on g_sreq[base .. base + n)
+fn req_find_hdr_end base ulong n ulong to ulong
+if lt n 4
+ret 0
+end
+lim = sub n 3
+for i ulong lim bound 32768
+if eq get g_sreq add base i 13
+if eq get g_sreq add base add i 1 10
+if eq get g_sreq add base add i 2 13
+if eq get g_sreq add base add i 3 10
+ret add i 4
+end
+end
+end
+end
+if eq get g_sreq add base i 10
+if eq get g_sreq add base add i 1 10
+ret add i 2
+end
+end
+end
+ret 0
+end
+
+fn req_ci_match base ulong pos ulong lim ulong t view uchar * to bool
+tn = len t
+if gt add pos tn lim
+ret false
+end
+for j ulong tn bound 64
+c = get g_sreq add base add pos j
+if and ge c 65 le c 90
+c = add c 32
+end
+if ne c get t j
+ret false
+end
+end
+ret true
+end
+
+fn req_find_clen base ulong hdr_end ulong to ulong
+if lt hdr_end 16
+ret 0
+end
+for i ulong hdr_end bound 32768
+if req_ci_match base i hdr_end k_clen
+p = add i len k_clen
+while lt p hdr_end bound 64
+c = get g_sreq add base p
+if or eq c 32 eq c 9
+p = add p 1
+else
+break
+end
+end
+v = ulong 0
+while lt p hdr_end bound 16
+c = get g_sreq add base p
+if or lt c 48 gt c 57
+break
+end
+v = add mul v 10 ulong sub c 48
+p = add p 1
+end
+ret v
+end
+end
+ret 0
+end
+
+fn req_slice_eq base ulong off ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 256
+if ne get g_sreq add base add off i get t i
+ret false
+end
+end
+ret true
+end
+
+fn req_path_safe base ulong po ulong pn ulong to bool
+if or eq pn 0 gt pn 1024
+ret false
+end
+if ne get g_sreq add base po 47
+ret false
+end
+for i ulong pn bound 1024
+c = get g_sreq add base add po i
+if or le c 32 or eq c 127 eq c 92
+ret false
+end
+if and eq c 46 lt add i 1 pn
+if eq get g_sreq add base add po add i 1 46
+ret false
+end
+end
+if and eq c 37 lt add i 2 pn
+c1 = get g_sreq add base add po add i 1
+c2 = get g_sreq add base add po add i 2
+if eq c1 50
+if or eq c2 101 eq c2 69
+ret false
+end
+end
+end
+end
+ret true
+end
+
+note ---- JSON inspection helpers on g_sreq[bo .. bend)
+fn skip_jstr base ulong p ulong lim ulong to ulong
+note p points at opening '"'
+q = add p 1
+while lt q lim bound 65536
+c = get g_sreq add base q
+if eq c 92
+q = add q 2
+else
+if eq c 34
+ret add q 1
+end
+q = add q 1
+end
+end
+ret lim
+end
+
+fn skip_ws_req base ulong p ulong lim ulong to ulong
+q = p
+while lt q lim bound 65536
+c = get g_sreq add base q
+if or eq c 32 or eq c 9 or eq c 10 eq c 13
+q = add q 1
+else
+break
+end
+end
+ret q
+end
+
+note Find JSON key inside g_sreq[bo..bend); returns index right after ':', or bend if not found
+fn find_jkey_req base ulong bo ulong bend ulong key view uchar * to ulong
+p = bo
+kn = len key
+while lt p bend bound 65536
+c = get g_sreq add base p
+if eq c 34
+q = skip_jstr base p bend
+if eq sub q p kn
+if req_slice_eq base p kn key
+r = skip_ws_req base q bend
+if lt r bend
+if eq get g_sreq add base r 58
+ret skip_ws_req base add r 1 bend
+end
+end
+end
+end
+p = q
+else
+p = add p 1
+end
+end
+ret bend
+end
+
+fn req_eq_cfg base ulong mo ulong mn ulong m ulong to bool
+if ne mn get g_m_id_n m
+ret false
+end
+co = get g_m_id_o m
+for j ulong mn bound 128
+if ne get g_sreq add base add mo j get g_cfg add co j
+ret false
+end
+end
+ret true
+end
+
+fn lookup_model_req base ulong mo ulong mn ulong to ulong
+cnt = get g_n 1
+for m ulong cnt bound 32
+if req_eq_cfg base mo mn m
+ret m
+end
+end
+ret 999
+end
+
+fn parse_req_model base ulong bo ulong bend ulong to ulong
+v = find_jkey_req base bo bend k_model
+if ge v bend
+ret 999
+end
+if ne get g_sreq add base v 34
+ret 999
+end
+q = skip_jstr base v bend
+if le q add v 2
+ret 999
+end
+ret lookup_model_req base add v 1 sub sub q v 2
+end
+
+fn parse_req_stream base ulong bo ulong bend ulong to ulong
+v = find_jkey_req base bo bend k_stream
+if ge add v 4 bend
+ret 0
+end
+if req_slice_eq base v 4 j_true
+ret 1
+end
+ret 0
+end
+
+fn parse_req_maxtok base ulong bo ulong bend ulong to ulong
+v = find_jkey_req base bo bend k_maxtok
+if ge v bend
+ret 4096
+end
+acc = ulong 0
+digs = ulong 0
+p = v
+while lt p bend bound 16
+c = get g_sreq add base p
+if and ge c 48 le c 57
+acc = add mul acc 10 ulong sub c 48
+digs = add digs 1
+p = add p 1
+else
+break
+end
+end
+if eq digs 0
+ret 4096
+end
+ret acc
+end
+
+fn emit_req_slice base ulong o ulong n ulong to void
+for j ulong n bound 65536
+oc get g_sreq add base add o j
+end
+end
+
+note ---- Flatten array-of-parts [...] at g_sreq[arr_p..bend) into g_out
+fn flatten_parts_to_out base ulong arr_p ulong bend ulong to ulong
+p = add arr_p 1
+depth = ulong 1
+while and lt p bend gt depth 0 bound 65536
+c = get g_sreq add base p
+if eq c 34
+q = skip_jstr base p bend
+if eq sub q p len k_text
+if req_slice_eq base p len k_text k_text
+r = skip_ws_req base q bend
+if lt r bend
+if eq get g_sreq add base r 58
+v = skip_ws_req base add r 1 bend
+if lt v bend
+if eq get g_sreq add base v 34
+ve = skip_jstr base v bend
+if gt ve add v 2
+emit_req_slice base add v 1 sub sub ve v 2
+end
+p = ve
+continue
+end
+end
+end
+end
+end
+end
+p = q
+else
+if eq c 91
+depth = add depth 1
+else
+if eq c 93
+depth = sub depth 1
+end
+end
+p = add p 1
+end
+end
+ret p
+end
+
+note Copy JSON slice g_sreq[so..slim) to g_out, flattening any "content": [...] array-of-parts to "content": "..."
+fn copy_norm_json base ulong so ulong slim ulong to void
+p = so
+while lt p slim bound 65536
+c = get g_sreq add base p
+if eq c 34
+q = skip_jstr base p slim
+is_cnt = false
+if eq sub q p len k_content
+if req_slice_eq base p len k_content k_content
+is_cnt = true
+end
+end
+if is_cnt
+r = skip_ws_req base q slim
+if lt r slim
+if eq get g_sreq add base r 58
+v = skip_ws_req base add r 1 slim
+if lt v slim
+if eq get g_sreq add base v 91
+ot k_content
+oc 58
+oc 34
+p = flatten_parts_to_out base v slim
+oc 34
+continue
+end
+end
+end
+end
+end
+emit_req_slice base p sub q p
+p = q
+else
+oc c
+p = add p 1
+end
+end
+end
+
+note Find closing ']' of array starting at g_sreq[arr_p] == '['
+fn find_arr_end base ulong arr_p ulong bend ulong to ulong
+p = add arr_p 1
+depth = ulong 1
+while and lt p bend gt depth 0 bound 65536
+c = get g_sreq add base p
+if eq c 34
+p = skip_jstr base p bend
+else
+if eq c 91
+depth = add depth 1
+else
+if eq c 93
+depth = sub depth 1
+end
+end
+p = add p 1
+end
+end
+ret p
+end
+
+note ---- Build backend HTTP POST /v1/chat/completions into slot s g_sbtx buffer
+fn copy_gout_to_sbtx s ulong to void
+sb = mul s SLOT_SZ
+blen = get g_n 16
+note Save JSON body in g_tmp, then build HTTP headers + body into g_sbtx
+if gt blen 60000
+blen = 60000
+end
+for i ulong blen bound 65536
+put g_tmp i get g_out i
+end
+oclr
+ot_crlf be_req0
+onum blen
+ot_crlf be_req1
+hlen = get g_n 16
+for i ulong hlen bound 1024
+put g_sbtx add sb i get g_out i
+end
+for i ulong blen bound 65536
+put g_sbtx add sb add hlen i get g_tmp i
+end
+sl_set s 9 0
+sl_set s 10 add hlen blen
+end
+
+fn build_openai_be_req s ulong bo ulong bend ulong to void
+base = mul s SLOT_SZ
+oclr
+copy_norm_json base bo bend
+copy_gout_to_sbtx s
+end
+
+fn build_anth_be_req s ulong midx ulong bo ulong bend ulong strm ulong to void
+base = mul s SLOT_SZ
+mtok = parse_req_maxtok base bo bend
+oclr
+ot an_o0
+ocfg get g_m_id_o midx get g_m_id_n midx
+ot an_o1
+if ne strm 0
+ot j_true
+else
+ot j_false
+end
+ot an_o2
+onum mtok
+ot an_o3
+
+note Optional Anthropic top-level "system" field (string or content-block array)
+sv = find_jkey_req base bo bend k_system
+if lt sv bend
+sc = get g_sreq add base sv
+if eq sc 34
+se = skip_jstr base sv bend
+if gt se add sv 2
+ot an_sys0
+emit_req_slice base add sv 1 sub sub se sv 2
+ot an_sys1
+end
+else
+if eq sc 91
+ot an_sys0
+z = flatten_parts_to_out base sv bend
+ot an_sys1
+end
+end
+end
+
+note Messages array from Anthropic request (normalized for array-of-parts content blocks)
+mv = find_jkey_req base bo bend k_msgs
+if lt mv bend
+if eq get g_sreq add base mv 91
+me = find_arr_end base mv bend
+if gt me add mv 2
+copy_norm_json base add mv 1 sub me 1
+end
+end
+end
+
+ot an_o4
+copy_gout_to_sbtx s
+end
+
+note ---- Direct responses: GET /health and GET /v1/models
+fn serve_health cfd int t0 ulong to void
+refresh_thermal
+oclr
+ot j_h0
+onum get g_n 1
+ot j_h1
+onum active_slot_count
+ot j_h2
+onum get g_n 7
+ot j_h3
+onum get g_n 8
+ot j_h4
+if ne get g_n 9 0
+ot j_true
+else
+ot j_false
+end
+ot j_h5
+onum get g_n 13
+ot j_h6
+onum get g_n 14
+ot j_h7
+onum get g_n 15
+ot j_h8
+blen = get g_n 16
+for i ulong blen bound 4096
+put g_tmp i get g_out i
+end
+oclr
+ot_crlf h_200_json
+ot h_clen
+onum blen
+ot_crlf h_crlf2
+for i ulong blen bound 4096
+oc get g_tmp i
+end
+tx = send_gout cfd
+set_ty_stats sub ulong monons t0 0 tx
+emit_ty4 a_health 999 200 0
+end
+
+fn serve_models cfd int t0 ulong to void
+refresh_thermal
+oclr
+ot j_m0
+cnt = get g_n 1
+for m ulong cnt bound 32
+if gt m 0
+oc 44
+end
+ot j_m1
+ocfg get g_m_id_o m get g_m_id_n m
+ot j_m2
+if eq get g_m_kind m 1
+ot t_gpu
+else
+ot t_cpu
+end
+ot j_m3
+onum get g_m_watt m
+ot j_m4
+onum get g_m_tgpu m
+ot j_m5
+onum get g_m_idle m
+ot j_m6
+end
+ot j_m7
+blen = get g_n 16
+for i ulong blen bound 32768
+put g_tmp i get g_out i
+end
+oclr
+ot_crlf h_200_json
+ot h_clen
+onum blen
+ot_crlf h_crlf2
+for i ulong blen bound 32768
+oc get g_tmp i
+end
+tx = send_gout cfd
+set_ty_stats sub ulong monons t0 0 tx
+emit_ty4 a_models 999 200 0
+end
+
+fn send_thermal_503 cfd int midx ulong to ulong
+put g_n 14 add get g_n 14 1
+if eq get g_n 9 0
+ret send_http_body cfd h_503 b_503_sn
+end
+oclr
+ot b_503_th0
+onum get g_n 7
+ot b_503_th1
+onum get g_n 8
+ot b_503_th2
+onum get g_m_tgpu midx
+ot b_503_th3
+onum get g_n 19
+ot b_503_th4
+onum get g_m_watt midx
+ot b_503_th5
+blen = get g_n 16
+for i ulong blen bound 4096
+put g_tmp i get g_out i
+end
+oclr
+ot_crlf h_503
+ot h_clen
+onum blen
+ot_crlf h_crlf2
+for i ulong blen bound 4096
+oc get g_tmp i
+end
+ret send_gout cfd
+end
+
+note ---- Optional on-demand backend launcher (when launch_cmd != "-")
+fn pkt_u16 off ulong v ulong to void
+put g_pkt off uchar and v 255
+put g_pkt add off 1 uchar and shr v 8 255
+end
+
+fn pkt_copy_cfg pos ulong p ulong al ulong to ulong
+pkt_u16 pos al
+o = add pos 2
+for j ulong al bound 512
+put g_pkt add o j get g_cfg add p j
+end
+ret add o al
+end
+
+fn build_launch_pkt co ulong cn ulong to ulong
+pos = ulong 2
+ac = ulong 0
+p = co
+end_c = add co cn
+while lt p end_c bound 512
+while lt p end_c bound 512
+if ne get g_cfg p 32
+break
+end
+p = add p 1
+end
+if ge p end_c
+break
+end
+q = p
+while lt q end_c bound 512
+if eq get g_cfg q 32
+break
+end
+q = add q 1
+end
+al = sub q p
+if gt add add pos 2 al 4090
+ret 0
+end
+pos = pkt_copy_cfg pos p al
+ac = add ac 1
+p = q
+end
+if eq ac 0
+ret 0
+end
+pkt_u16 0 ac
+ret pos
+end
+
+fn try_launch_model midx ulong to void
+co = get g_m_cmd_o midx
+cn = get g_m_cmd_n midx
+if cfg_eq_t co cn t_dash
+ret
+end
+if gt get g_m_pid midx 0
+ret
+end
+pos = build_launch_pkt co cn
+if eq pos 0
+ret
+end
+pid = fork
+if eq pid 0
+dn = fopen t_devnull 0 len t_devnull 2 0
+if ge dn 0
+z0 = dupfd int dn 0 0
+z1 = dupfd int dn 1 0
+z2 = dupfd int dn 2 0
+zc = fclose int dn
+end
+zx = execprog g_pkt 0 pos
+exit 127
+end
+if gt pid 0
+put g_m_pid midx ulong pid
+z = sleepns 200000000
+end
+end
+
+fn connect_nonblock port ulong to long
+sa = new uchar 16 0
+fd = socknew 2 526337 0
+if lt fd 0
+ret fd
+end
+put sa 0 2
+put sa 1 0
+put sa 2 uchar and shr port 8 255
+put sa 3 uchar and port 255
+put sa 4 127
+put sa 5 0
+put sa 6 0
+put sa 7 1
+r = connect int fd sa 0 16
+if or eq r 0 eq r -115
+ret fd
+end
+z = fclose int fd
+ret r
+end
+
+note ---- Thermal admission check: returns true if admitted, false if rejected (fail-closed!)
+fn admit_thermal midx ulong to bool
+refresh_thermal
+kd = get g_m_kind midx
+if eq kd 1
+if eq get g_n 9 0
+ret false
+end
+end
+if ne get g_n 9 0
+if gt get g_n 7 get g_m_tgpu midx
+ret false
+end
+end
+if gt get g_n 19 mul get g_m_watt midx 1000
+ret false
+end
+ret true
+end
+
+note ---- Dispatch complete HTTP request on slot s
+fn dispatch_post_api s ulong api ulong hdr_end ulong req_len ulong to void
+base = mul s SLOT_SZ
+cfd = int sl_get s 1
+midx = parse_req_model base hdr_end req_len
+if ge midx get g_n 1
+tx = send_http_body cfd h_404 b_404_mod
+put g_stx_b s tx
+sl_set s 3 999
+sl_set s 4 api
+slot_close s 404
+ret
+end
+strm = parse_req_stream base hdr_end req_len
+sl_set s 3 midx
+sl_set s 4 api
+sl_set s 5 strm
+put g_m_last midx ulong monons
+
+if not admit_thermal midx
+tx = send_thermal_503 cfd midx
+put g_stx_b s tx
+slot_close s 503
+ret
+end
+
+if eq api 0
+build_openai_be_req s hdr_end req_len
+else
+build_anth_be_req s midx hdr_end req_len strm
+end
+
+port = get g_m_port midx
+bfd = connect_nonblock port
+if lt bfd 0
+try_launch_model midx
+bfd = connect_nonblock port
+end
+if lt bfd 0
+tx = send_http_body cfd h_503 b_503_be
+put g_stx_b s tx
+slot_close s 503
+ret
+end
+sl_set s 2 ulong bfd
+sl_set s 0 2
+end
+
+fn err_close s ulong hdr view uchar * body view uchar * code ulong to void
+cfd = int sl_get s 1
+tx = send_http_body cfd hdr body
+now = ulong monons
+t0 = sl_get s 15
+dt = ulong 0
+if gt now t0
+dt = sub now t0
+end
+set_ty_stats dt sl_get s 6 tx
+emit_ty4 a_err 999 code 0
+slot_close s 0
+end
+
+fn dispatch_slot s ulong to void
+base = mul s SLOT_SZ
+req_len = sl_get s 6
+hdr_end = sl_get s 7
+cfd = int sl_get s 1
+t0 = sl_get s 15
+
+note Parse method and path on line 1
+sp1 = ulong 0
+while lt sp1 hdr_end bound 32
+if eq get g_sreq add base sp1 32
+break
+end
+sp1 = add sp1 1
+end
+if or eq sp1 0 ge sp1 hdr_end
+err_close s h_400 b_400 400
+ret
+end
+po = add sp1 1
+sp2 = po
+while lt sp2 hdr_end bound 1080
+c = get g_sreq add base sp2
+if or eq c 32 or eq c 13 eq c 10
+break
+end
+sp2 = add sp2 1
+end
+pn = sub sp2 po
+if not req_path_safe base po pn
+err_close s h_400 b_400 400
+ret
+end
+
+if req_slice_eq base 0 sp1 m_OPTIONS
+oclr
+ot_crlf h_204_cors
+tx = send_gout cfd
+slot_close s 0
+ret
+end
+
+if req_slice_eq base 0 sp1 m_GET
+if req_slice_eq base po pn p_health
+serve_health cfd t0
+slot_close s 0
+ret
+end
+if req_slice_eq base po pn p_models
+serve_models cfd t0
+slot_close s 0
+ret
+end
+if or req_slice_eq base po pn p_chat req_slice_eq base po pn p_anth
+err_close s h_405 b_405 405
+ret
+end
+err_close s h_404 b_404_path 404
+ret
+end
+
+if req_slice_eq base 0 sp1 m_POST
+if req_slice_eq base po pn p_chat
+dispatch_post_api s 0 hdr_end req_len
+ret
+end
+if req_slice_eq base po pn p_anth
+dispatch_post_api s 1 hdr_end req_len
+ret
+end
+if or req_slice_eq base po pn p_health req_slice_eq base po pn p_models
+err_close s h_405 b_405 405
+ret
+end
+err_close s h_404 b_404_path 404
+ret
+end
+
+err_close s h_405 b_405 405
+end
+
+note ---- Anthropic JSON & SSE response translation helpers (on g_sbrx / g_slin)
+fn brx_find_hdr_end base ulong n ulong to ulong
+if lt n 4
+ret 0
+end
+lim = sub n 3
+for i ulong lim bound 16384
+if eq get g_sbrx add base i 13
+if eq get g_sbrx add base add i 1 10
+if eq get g_sbrx add base add i 2 13
+if eq get g_sbrx add base add i 3 10
+ret add i 4
+end
+end
+end
+end
+if eq get g_sbrx add base i 10
+if eq get g_sbrx add base add i 1 10
+ret add i 2
+end
+end
+end
+ret 0
+end
+
+fn skip_jstr_brx base ulong p ulong lim ulong to ulong
+q = add p 1
+while lt q lim bound 65536
+c = get g_sbrx add base q
+if eq c 92
+q = add q 2
+else
+if eq c 34
+ret add q 1
+end
+q = add q 1
+end
+end
+ret lim
+end
+
+fn brx_slice_eq base ulong off ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 64
+if ne get g_sbrx add base add off i get t i
+ret false
+end
+end
+ret true
+end
+
+fn skip_ws_brx base ulong p ulong lim ulong to ulong
+r = p
+while lt r lim bound 64
+rc = get g_sbrx add base r
+if or eq rc 32 or eq rc 9 or eq rc 10 eq rc 13
+r = add r 1
+else
+break
+end
+end
+ret r
+end
+
+fn find_jkey_brx base ulong bo ulong bend ulong key view uchar * to ulong
+p = bo
+kn = len key
+while lt p bend bound 65536
+c = get g_sbrx add base p
+if eq c 34
+q = skip_jstr_brx base p bend
+if eq sub q p kn
+if brx_slice_eq base p kn key
+r = skip_ws_brx base q bend
+if lt r bend
+if eq get g_sbrx add base r 58
+ret skip_ws_brx base add r 1 bend
+end
+end
+end
+end
+p = q
+else
+p = add p 1
+end
+end
+ret bend
+end
+
+fn parse_brx_u64 base ulong p ulong bend ulong to ulong
+acc = ulong 0
+q = p
+while lt q bend bound 16
+c = get g_sbrx add base q
+if and ge c 48 le c 57
+acc = add mul acc 10 ulong sub c 48
+q = add q 1
+else
+break
+end
+end
+ret acc
+end
+
+fn send_gout_json_200 cfd int to ulong
+blen = get g_n 16
+for i ulong blen bound 65536
+put g_tmp i get g_out i
+end
+oclr
+ot_crlf h_200_json
+ot h_clen
+onum blen
+ot_crlf h_crlf2
+for i ulong blen bound 65536
+oc get g_tmp i
+end
+ret send_gout cfd
+end
+
+fn emit_brx_slice base ulong co ulong cn ulong to void
+for j ulong cn bound 32768
+oc get g_sbrx add base add co j
+end
+end
+
+fn emit_anth_usage base ulong he ulong n ulong to void
+ot an_r3
+pp = find_jkey_brx base he n k_ptok
+if lt pp n
+onum parse_brx_u64 base pp n
+else
+onum 0
+end
+ot an_r4
+kp = find_jkey_brx base he n k_ctok
+if lt kp n
+onum parse_brx_u64 base kp n
+else
+onum 0
+end
+ot an_r5
+end
+
+fn emit_anth_content base ulong he ulong n ulong to void
+mp = find_jkey_brx base he n k_msg
+if ge mp n
+mp = he
+end
+cp = find_jkey_brx base mp n k_content
+if lt cp n
+if eq get g_sbrx add base cp 34
+ce = skip_jstr_brx base cp n
+if gt ce add cp 2
+emit_brx_slice base add cp 1 sub sub ce cp 2
+end
+end
+end
+end
+
+fn finish_anth_json s ulong to void
+base = mul s SLOT_SZ
+n = sl_get s 11
+cfd = int sl_get s 1
+he = brx_find_hdr_end base n
+if or eq he 0 gt he n
+tx = send_http_body cfd h_503 b_503_be
+put g_stx_b s tx
+slot_close s 503
+ret
+end
+oclr
+ot an_r0
+onum add get g_n 13 1
+ot an_r1
+midx = sl_get s 3
+ocfg get g_m_id_o midx get g_m_id_n midx
+ot an_r2
+emit_anth_content base he n
+emit_anth_usage base he n
+tx = send_gout_json_200 cfd
+put g_stx_b s tx
+slot_close s 200
+end
+
+note ---- Anthropic SSE translation line processor on g_slin[lbase..lbase+ln)
+fn lin_pref lbase ulong ln ulong t view uchar * to bool
+if lt ln len t
+ret false
+end
+for i ulong len t bound 32
+if ne get g_slin add lbase i get t i
+ret false
+end
+end
+ret true
+end
+
+fn skip_jstr_lin lbase ulong p ulong lim ulong to ulong
+q = add p 1
+while lt q lim bound 8192
+c = get g_slin add lbase q
+if eq c 92
+q = add q 2
+else
+if eq c 34
+ret add q 1
+end
+q = add q 1
+end
+end
+ret lim
+end
+
+fn lin_slice_eq lbase ulong off ulong n ulong t view uchar * to bool
+if ne n len t
+ret false
+end
+for i ulong n bound 64
+if ne get g_slin add lbase add off i get t i
+ret false
+end
+end
+ret true
+end
+
+fn skip_ws_lin lbase ulong p ulong lim ulong to ulong
+r = p
+while lt r lim bound 64
+rc = get g_slin add lbase r
+if or eq rc 32 eq rc 9
+r = add r 1
+else
+break
+end
+end
+ret r
+end
+
+fn find_jkey_lin lbase ulong bo ulong bend ulong key view uchar * to ulong
+p = bo
+kn = len key
+while lt p bend bound 8192
+c = get g_slin add lbase p
+if eq c 34
+q = skip_jstr_lin lbase p bend
+if eq sub q p kn
+if lin_slice_eq lbase p kn key
+r = skip_ws_lin lbase q bend
+if lt r bend
+if eq get g_slin add lbase r 58
+ret skip_ws_lin lbase add r 1 bend
+end
+end
+end
+end
+p = q
+else
+p = add p 1
+end
+end
+ret bend
+end
+
+fn anth_sse_start s ulong to void
+if ne sl_get s 13 0
+ret
+end
+sl_set s 13 1
+cfd = int sl_get s 1
+midx = sl_get s 3
+oclr
+ot_crlf h_200_sse
+ot sse_s0
+onum add get g_n 13 1
+ot sse_s1
+ocfg get g_m_id_o midx get g_m_id_n midx
+ot sse_s2
+tx = send_gout cfd
+put g_stx_b s add get g_stx_b s tx
+end
+
+fn emit_lin_slice lbase ulong o ulong n ulong to void
+for j ulong n bound 4096
+oc get g_slin add lbase add o j
+end
+end
+
+fn anth_sse_handle_line s ulong to void
+lbase = mul s LINE_SZ
+ln = get g_slin_n s
+if gt ln 0
+if eq get g_slin add lbase sub ln 1 13
+ln = sub ln 1
+end
+end
+if not lin_pref lbase ln k_data
+ret
+end
+do = len k_data
+if lin_pref add lbase do sub ln do k_done
+ret
+end
+dp = find_jkey_lin lbase do ln k_delta
+if ge dp ln
+dp = do
+end
+cp = find_jkey_lin lbase dp ln k_content
+if ge cp ln
+ret
+end
+if ne get g_slin add lbase cp 34
+ret
+end
+ce = skip_jstr_lin lbase cp ln
+if le ce add cp 2
+ret
+end
+anth_sse_start s
+oclr
+ot sse_d0
+emit_lin_slice lbase add cp 1 sub sub ce cp 2
+ot sse_d1
+tx = send_gout int sl_get s 1
+put g_stx_b s add get g_stx_b s tx
+sl_set s 14 add sl_get s 14 1
+end
+
+fn anth_sse_feed s ulong off ulong n ulong to void
+lbase = mul s LINE_SZ
+for i ulong n bound 65536
+c = get g_tmp add off i
+if eq c 10
+anth_sse_handle_line s
+put g_slin_n s 0
+else
+ln = get g_slin_n s
+if lt ln sub LINE_SZ 2
+put g_slin add lbase ln c
+put g_slin_n s add ln 1
+end
+end
+end
+end
+
+fn anth_sse_finish s ulong to void
+anth_sse_start s
+if gt get g_slin_n s 0
+anth_sse_handle_line s
+put g_slin_n s 0
+end
+oclr
+ot sse_e0
+onum sl_get s 14
+ot sse_e1
+tx = send_gout int sl_get s 1
+put g_stx_b s add get g_stx_b s tx
+slot_close s 200
+end
+
+note ---- Non-blocking slot step handlers
+fn step_read_req s ulong to void
+base = mul s SLOT_SZ
+cfd = int sl_get s 1
+rl = sl_get s 6
+if ge rl sub SLOT_SZ 8
+slot_close s 0
+ret
+end
+k = recv cfd g_sreq add base rl sub sub SLOT_SZ 8 rl 64
+if or eq k -11 eq k -4
+ret
+end
+if le k 0
+if gt rl 0
+he = req_find_hdr_end base rl
+if gt he 0
+sl_set s 7 he
+dispatch_slot s
+ret
+end
+end
+slot_close s 0
+ret
+end
+rl = add rl ulong k
+sl_set s 6 rl
+put g_srx_b s rl
+he = sl_get s 7
+if eq he 0
+he = req_find_hdr_end base rl
+if gt he 0
+sl_set s 7 he
+cl = req_find_clen base he
+need = add he cl
+if gt need sub SLOT_SZ 8
+need = sub SLOT_SZ 8
+end
+sl_set s 8 need
+end
+end
+he = sl_get s 7
+need = sl_get s 8
+if and gt he 0 ge rl need
+dispatch_slot s
+end
+end
+
+fn step_send_be s ulong to void
+sb = mul s SLOT_SZ
+bfd = int sl_get s 2
+off = sl_get s 9
+tot = sl_get s 10
+if ge off tot
+sl_set s 0 3
+ret
+end
+k = send bfd g_sbtx add sb off sub tot off 64
+if or eq k -11 eq k -4
+ret
+end
+if le k 0
+tx = send_http_body int sl_get s 1 h_503 b_503_be
+put g_stx_b s tx
+slot_close s 503
+ret
+end
+off = add off ulong k
+sl_set s 9 off
+if ge off tot
+sl_set s 0 3
+end
+end
+
+fn append_gtmp_to_brx s ulong got ulong to void
+base = mul s SLOT_SZ
+brx = sl_get s 11
+for i ulong got bound 65536
+if lt add brx i SLOT_SZ
+put g_sbrx add base add brx i get g_tmp i
+end
+end
+brx = add brx got
+if gt brx SLOT_SZ
+brx = SLOT_SZ
+end
+sl_set s 11 brx
+end
+
+fn step_relay_anth_sse s ulong got ulong to void
+base = mul s SLOT_SZ
+if eq sl_get s 12 0
+append_gtmp_to_brx s got
+brx = sl_get s 11
+he = brx_find_hdr_end base brx
+if gt he 0
+sl_set s 12 1
+anth_sse_start s
+rem_n = sub brx he
+if gt rem_n 0
+for j ulong rem_n bound 65536
+put g_tmp j get g_sbrx add base add he j
+end
+anth_sse_feed s 0 rem_n
+end
+end
+else
+anth_sse_feed s 0 got
+end
+end
+
+fn step_relay_be s ulong to void
+bfd = int sl_get s 2
+cfd = int sl_get s 1
+api = sl_get s 4
+strm = sl_get s 5
+k = recv bfd g_tmp 0 32768 64
+if or eq k -11 eq k -4
+ret
+end
+if le k 0
+if and eq api 1 eq strm 0
+finish_anth_json s
+ret
+end
+if and eq api 1 ne strm 0
+anth_sse_finish s
+ret
+end
+slot_close s 200
+ret
+end
+got = ulong k
+if eq api 0
+tx = send_gtmp cfd got
+put g_stx_b s add get g_stx_b s tx
+ret
+end
+if eq strm 0
+append_gtmp_to_brx s got
+else
+step_relay_anth_sse s got
+end
+end
+
+note ---- Accept new client into free slot
+fn accept_client to void
+lfd = int get g_n 3
+cfd = accept lfd 526336
+if lt cfd 0
+ret
+end
+free_s = ulong 99
+for s ulong MAX_SLOTS
+if eq sl_get s 0 0
+free_s = s
+break
+end
+end
+if ge free_s MAX_SLOTS
+tx = send_http_body int cfd h_503 b_503_be
+z = fclose int cfd
+ret
+end
+sl_set free_s 0 1
+sl_set free_s 1 ulong cfd
+sl_set free_s 2 0
+sl_set free_s 15 ulong monons
+put g_slin_n free_s 0
+put g_srx_b free_s 0
+put g_stx_b free_s 0
+end
+
+note ---- Idle auto-unload & child reaping
+fn model_busy midx ulong to bool
+for s ulong MAX_SLOTS
+if ne sl_get s 0 0
+if eq sl_get s 3 midx
+ret true
+end
+end
+end
+ret false
+end
+
+fn tick_maintenance to void
+st = new uchar 4 0
+for it ulong 16
+w = waitpid -1 st 0 4 1
+if le w 0
+break
+end
+cnt = get g_n 1
+for m ulong cnt bound 32
+if eq ulong w get g_m_pid m
+put g_m_pid m 0
+end
+end
+end
+now = ulong monons
+cnt = get g_n 1
+for m ulong cnt bound 32
+pid = get g_m_pid m
+idl = get g_m_idle m
+if and gt pid 0 gt idl 0
+if not model_busy m
+last = get g_m_last m
+lim = mul idl 1000000000
+if gt now last
+if ge sub now last lim
+zk = killpid int pid 15
+put g_m_pid m 0
+put g_n 15 add get g_n 15 1
+lt_s ty_unl
+lcfg get g_m_id_o m get g_m_id_n m
+lc 10
+lflush
+end
+end
+end
+end
+end
+end
+
+note ---- pollfds table builder & event loop
+fn pfd_put idx ulong fd ulong ev ulong to void
+o = mul idx 8
+put g_pfd o uchar and fd 255
+put g_pfd add o 1 uchar and shr fd 8 255
+put g_pfd add o 2 uchar and shr fd 16 255
+put g_pfd add o 3 uchar and shr fd 24 255
+put g_pfd add o 4 uchar and ev 255
+put g_pfd add o 5 uchar and shr ev 8 255
+put g_pfd add o 6 0
+put g_pfd add o 7 0
+end
+
+fn pfd_rev idx ulong to ulong
+o = mul idx 8
+b0 = ulong get g_pfd add o 6
+b1 = ulong get g_pfd add o 7
+ret or b0 shl b1 8
+end
+
+fn poll_once to void
+nfds = ulong 1
+pfd_put 0 get g_n 3 1
+for s ulong MAX_SLOTS
+st = sl_get s 0
+if eq st 1
+pfd_put nfds sl_get s 1 1
+put g_pmap nfds s
+put g_pknd nfds 1
+nfds = add nfds 1
+else
+if eq st 2
+pfd_put nfds sl_get s 2 4
+put g_pmap nfds s
+put g_pknd nfds 2
+nfds = add nfds 1
+else
+if eq st 3
+pfd_put nfds sl_get s 2 1
+put g_pmap nfds s
+put g_pknd nfds 3
+nfds = add nfds 1
+end
+end
+end
+end
+
+r = pollfds g_pfd 0 mul nfds 8 50000000
+if gt r 0
+if ne and pfd_rev 0 1 0
+accept_client
+end
+for k ulong sub nfds 1 bound 32
+idx = add k 1
+rev = pfd_rev idx
+if ne rev 0
+s = get g_pmap idx
+kd = get g_pknd idx
+if eq kd 1
+step_read_req s
+else
+if eq kd 2
+step_send_be s
+else
+if eq kd 3
+step_relay_be s
+end
+end
+end
+end
+end
+end
+end
+
+note ---- Listen socket on 127.0.0.1:PORT
+fn listen_local port ulong to long
+addr = new uchar 16 0
+one = new uchar 4 0
+put addr 0 2
+put addr 2 uchar and shr port 8 255
+put addr 3 uchar and port 255
+put addr 4 127
+put addr 5 0
+put addr 6 0
+put addr 7 1
+put one 0 1
+fd = socknew 2 526337 0
+if lt fd 0
+ret fd
+end
+r = sockopt int fd 1 2 one 0 4
+if eq r 0
+r = bind int fd addr 0 16
+end
+if eq r 0
+r = listen int fd 64
+end
+if ne r 0
+z = fclose int fd
+ret r
+end
+ret fd
+end
+
+note ---- CLI argument parsing
+fn pa_eq t view uchar * to bool
+n = get g_n 18
+if ne n len t
+ret false
+end
+for i ulong n bound 256
+if ne get g_pa i get t i
+ret false
+end
+end
+ret true
+end
+
+fn pa_parse_u64 to ulong
+n = get g_n 18
+if or eq n 0 gt n 18
+ret shl ulong 1 63
+end
+v = ulong 0
+for i ulong n bound 18
+c = get g_pa i
+if or lt c 48 gt c 57
+ret shl ulong 1 63
+end
+v = add mul v 10 ulong sub c 48
+end
+ret v
+end
+
+fn set_def_tz to void
+for i ulong len t_def_tz5 bound 512
+put g_tz5_p i get t_def_tz5 i
+end
+put g_n 5 len t_def_tz5
+for i ulong len t_def_tz0 bound 512
+put g_tz0_p i get t_def_tz0 i
+end
+put g_n 6 len t_def_tz0
+end
+
+fn parse_opt_args to bool
+ac = ulong argcnt
+i = ulong 2
+while lt i ac bound 32
+r = argread i g_pa 0 4094
+if le r 0
+ret false
+end
+put g_n 18 ulong r
+if pa_eq t_flag_tz5
+i = add i 1
+if ge i ac
+ret false
+end
+r2 = argread i g_tz5_p 0 510
+if le r2 0
+ret false
+end
+put g_n 5 ulong r2
+else
+if pa_eq t_flag_tz0
+i = add i 1
+if ge i ac
+ret false
+end
+r2 = argread i g_tz0_p 0 510
+if le r2 0
+ret false
+end
+put g_n 6 ulong r2
+else
+if pa_eq t_flag_wov
+i = add i 1
+if ge i ac
+ret false
+end
+r2 = argread i g_pa 0 4094
+if le r2 0
+ret false
+end
+put g_n 18 ulong r2
+wv = pa_parse_u64
+if eq wv shl ulong 1 63
+ret false
+end
+put g_n 11 wv
+put g_n 12 1
+else
+pv = pa_parse_u64
+if or eq pv 0 gt pv 65535
+ret false
+end
+put g_n 2 pv
+end
+end
+end
+i = add i 1
+end
+ret true
+end
+
+fn main to int
+if lt argcnt 2
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+put g_n 2 18090
+set_def_tz
+if not parse_opt_args
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+r = argread 1 g_pa 0 4094
+if le r 0
+w = write 2 t_usage 0 len t_usage
+ret 2
+end
+put g_n 18 ulong r
+load_config
+refresh_thermal
+
+lfd = listen_local get g_n 2
+if lt lfd 0
+die_cfg c_bind
+end
+put g_n 3 ulong lfd
+
+lt_s t_ready0
+lnum get g_n 2
+lt_s t_ready1
+lnum get g_n 1
+lt_s t_ready2
+lnum get g_n 7
+lt_s t_ready3
+lnum get g_n 8
+lc 10
+lflush
+
+while true bound 9223372036854775807
+poll_once
+tick_maintenance
+end
+ret 0
+end
