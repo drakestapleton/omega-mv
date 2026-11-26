@@ -26,6 +26,8 @@ Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-2): cut over `oscv`, `test-re
 
 Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-3): completed 100% pure seeded OM-2 retirement of `src/physics0/` + `tests/physics0/` (17 C/H files), `src/visor/` + `tests/effect/` (3 C/H files, cutting `test-effect-cap64` to `test-effect-cap64-om` and `visor-authority-check` to pure OM-2 + zero-C guard), `tools/own30b_decode_profile.c`, and `tests/universal/arithmetic.c` (22 C/H files retired; `PARITY.tsv` ref `868d02f92`).
 
+Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-4): cut over `tools/autodiff_mutations.sh` (12/12 pure OM-2 mutants), `tools/tensor_mutations.sh` CPU + store sweeps (33 pure OM-2 mutants), and `mk/tensor.mk` (`test-tensor-no-hooks`) to pure seeded OM-2; retired `tests/test_omega_autodiff.c`, `src/tensor/omega_tensor_store.{c,h}`, `tests/test_omega_tensor.c`, `tests/test_omega_tensor_store.c`, and `tests/tensor_reduce_multi_tests.inc` (`PARITY.tsv` ref `2ed9f8735`; Stage 2 GB10 C files `omega_autodiff.c`/`test_omega_ad_fixture.c`/`omega_tensor{,_cpu,_reduce_seam,_gb10}.c` remain until Stage 2 retires chip arms).
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage

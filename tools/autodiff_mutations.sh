@@ -24,57 +24,31 @@ set -u
 cd "$(dirname "$0")/.." || exit 2
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/autodiff-mut.XXXXXX") || exit 2
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM
-TENSOR="src/tensor/omega_tensor.c src/tensor/omega_tensor_cpu.c src/tensor/omega_tensor_reduce_seam.c \
-src/omega_numeric_reduce.c src/omega_numeric_transc.c"
-DEPS="src/omega_numeric.c src/omega_numeric_provenance.c src/omega_blackwell_encoder.c \
-src/omega_blackwell_codegen.c src/omega_blackwell_matmul.c src/omega_blackwell_qmd.c src/omega_om_units.c"
-FLAGS="-std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -ffp-contract=off -O2 -DOMEGA_NUMERIC_CPU_ONLY"
 
 # name|file|sed expression (applied only to the line carrying MUT:<name>)
 # DIV_FORMULA computes gb as -((g * y) / b) instead of -(g * (y / b)): the same
 # real number with the same rounding count, so it stays inside the per-op
 # contract and the 1e-3 FD bound; it is aimed at the bit-exact layer.
-MUTATIONS='TAPE_WALK|omega_autodiff.c|s/root + 1; i-- > 0/root; i-- > 0/
-ACCUMULATE|omega_autodiff.c|s/omega_tensor_binary(t->ctx, OMEGA_TB_ADD, n->grad, contrib, &sum)/omega_tensor_contiguous(t->ctx, contrib, \&sum)/
+MUTATIONS='TAPE_WALK|omega_autodiff.om|{n;s/ad_bwd_visit sub root k/ad_bwd_visit k/;}
+ACCUMULATE|omega_autodiff.om|{n;s/ot_binary OT_TB_ADD get ad_nodes add nb 10 get ad_nodes add nb 11 cs cg sum_h/ot_contiguous cs cg sum_h/;}
 UNBROADCAST|gradient_shape.om|{n;s/if and eq get target axis 1 ne get source add leading axis 1/if false/;}
-SUB_NEGATE|omega_autodiff.c|s/-1\.0f/1.0f/
-MUL_OPERAND|omega_autodiff.c|s/t->nodes\[n->in1\]\.value/t->nodes[n->in0].value/
-MATMUL_TRANSPOSE|omega_autodiff.c|s/matmul(t->ctx, g, tmp, &c)/matmul(t->ctx, g, nb->value, \&c)/
-SQRT_TWICE|omega_autodiff.c|s/omega_tensor_binary(t->ctx, OMEGA_TB_ADD, n->value, n->value, &tmp)/omega_tensor_contiguous(t->ctx, n->value, \&tmp)/
-MEAN_DIVISOR|omega_autodiff.c|s/(float)len/(float)(len + 1)/
-MAX_ROUTE|omega_autodiff.c|s/return a > b;/return a < b;/
-MAX_TIE|omega_autodiff.c|s/return a > b;/return a >= b;/
-DIV_B_SIGN|omega_autodiff.c|s/-1\.0f/1.0f/
-DIV_FORMULA|omega_autodiff.c|{s/OMEGA_TB_DIV, n->value, nb->value, &tmp)/OMEGA_TB_MUL, g, n->value, \&tmp)/;s/OMEGA_TB_MUL, g, tmp, &c2)/OMEGA_TB_DIV, tmp, nb->value, \&c2)/}'
+SUB_NEGATE|omega_autodiff.om|{n;s/-1\.0f32/1.0f32/;}
+MUL_OPERAND|omega_autodiff.om|{n;s/ad_bwd_mul_side in0 in1/ad_bwd_mul_side in0 in0/;}
+MATMUL_TRANSPOSE|omega_autodiff.om|{n;s/ot_matmul gs gg get tmp 0 get tmp 1 c/ot_matmul gs gg get ad_nodes add nbb 8 get ad_nodes add nbb 9 c/;}
+SQRT_TWICE|omega_autodiff.om|{n;s/ot_binary OT_TB_ADD vs vg vs vg tmp/ot_contiguous vs vg tmp/;}
+MEAN_DIVISOR|omega_autodiff.om|{n;s/f32 axlen/f32 add axlen 1/;}
+MAX_ROUTE|omega_autodiff.om|{n;s/ret gt a b/ret lt a b/;}
+MAX_TIE|omega_autodiff.om|{n;s/ret gt a b/ret ge a b/;}
+DIV_B_SIGN|omega_autodiff.om|{n;s/-1\.0f32/1.0f32/;}
+DIV_FORMULA|omega_autodiff.om|{n;s/ot_binary OT_TB_DIV ys yg bs bg tmp/ot_binary OT_TB_MUL gs gg ys yg tmp/;s/ot_binary OT_TB_MUL gs gg get tmp 0 get tmp 1 c2/ot_binary OT_TB_DIV get tmp 0 get tmp 1 bs bg c2/;}'
 
-# Runs on the shared runner tools/mutation_runner.sh (marker reader). This
-# script is a thin adapter: it feeds the rows above, then maps the runner's
-# per-mutant stderr lines back to the legacy stdout lines and exit codes.
-# Rows name src/autodiff/<file>, relative to the runner's scratch tree.
-# Rebuild the seeded binding only for a changed Omega source.
-AUTODIFF_ROOT=$(pwd)
-export AUTODIFF_ROOT
-case " ${ONLY:-UNBROADCAST} " in
-    *" UNBROADCAST "*)
-        compiler=${OMEGA_OMC:-$AUTODIFF_ROOT/seed/out/omc}
-        bridge=${OMEGA_BRIDGE:-$AUTODIFF_ROOT/../omega-bridge}
-        if [ ! -x "$compiler" ] || [ ! -r "$bridge/src/native.om" ]; then
-            echo "autodiff mutations: NOT_RUN (UNBROADCAST needs the pinned omc and omega-bridge)" >&2
-            exit 3
-        fi
-        OMEGA_OMC=$(realpath "$compiler") || exit 3
-        OMEGA_BRIDGE=$(realpath "$bridge") || exit 3
-        export OMEGA_OMC OMEGA_BRIDGE ;;
-esac
-REGEN='if ! cmp -s src/autodiff/gradient_shape.om "$AUTODIFF_ROOT/src/autodiff/gradient_shape.om"; then
-    unset OMEGA_UNITS
-    OMEGA_UNITS_DEST="$PWD/src" sh om/units.sh || exit 1
-fi'
-BUILD="$REGEN
-gcc $FLAGS -Isrc -Isrc/tensor -Isrc/autodiff -o t tests/test_omega_autodiff.c src/autodiff/omega_autodiff.c \
-$TENSOR $DEPS"
+# Runs on the shared runner tools/mutation_runner.sh (marker reader) using pure
+# seeded OM-2 (seed/out/omc), zero C compiler and zero external bridge checkout.
+OMC=${AUTODIFF_OMC:-seed/out/omc}
+OM_SRCS="src/tensor/tensor_shape.om src/tensor/tensor_ops.om src/train/tg_sha256.om src/tensor/omega_tensor_cpu.om src/tensor/omega_tensor.om src/autodiff/gradient_shape.om src/autodiff/omega_autodiff.om src/autodiff/test_autodiff.om"
+BUILD="(printf 'om2\n'; sed -e '/^om2$/d' -e 's/^export fn /fn /' $OM_SRCS) | $OMC > t && chmod +x t"
 printf '%s\n' "$MUTATIONS" | sed 's#^\([A-Z_]*\)|#\1|src/autodiff/#' > "$SCRATCH/rows"
-tools/mutation_runner.sh -k marker -m "$SCRATCH/rows" -d . -c "src om gpu seed/authority seed/build seed/out/omc.sha256 tests/test_omega_autodiff.c" \
+tools/mutation_runner.sh -k marker -m "$SCRATCH/rows" -d . -c "src/tensor src/train/tg_sha256.om src/autodiff $OMC" \
     -b "$BUILD" -t ./t -f FAIL -B > "$SCRATCH/runner.out" 2> "$SCRATCH/runner.err"
 if grep -q 'unmutated baseline' "$SCRATCH/runner.out"; then
     cat "$SCRATCH/runner.err"
