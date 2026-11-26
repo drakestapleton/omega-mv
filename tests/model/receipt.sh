@@ -25,7 +25,7 @@ rcpt=$out/LG-receipt.json
 
 commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then dirty=true; else dirty=false; fi
-cc_ver=$(${CC:-gcc} --version 2>/dev/null | head -n1)
+cc_ver="seed/out/omc $(sha256sum seed/out/omc 2>/dev/null | cut -c1-16 || echo unknown)"
 host=$(uname -srm)
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 

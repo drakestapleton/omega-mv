@@ -30,6 +30,8 @@ Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-4): cut over `tools/autodiff_
 
 Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-5): cut over `test-library`, `test-exec-native-cache`, `test-vcstore`, `test-vcstore-genesis`, `test-genesis`, `test-genesis-real`, `test-program-ir`, `test-vc-bridge`, `test-unwritten-trap-host`, and `mk/compiler.mk` (`test-compiler`, `test-compiler-quick`) to pure seeded OM-2; retired 38 C/H files (12 `src/` CPU modules + 16 headers + 9 CPU tests + `tests/vc_fixture.h`; `PARITY.tsv` ref `8726d4eff`). `src/omega_blake3.{c,h}` stay on disk as declared `om-units` C parity oracle (`om/blake3/parity/run.sh`).
 
+Updated 2026-11-26 (Stage 1 Zero-C Closure Wave S1-6a): completed 100% pure seeded OM-2 retirement of `tests/model/` (5 C/H files: `world_model.{c,h}`, `world_explore.{c,h}`, `world_diff.c`; `PARITY.tsv` ref `ffb96c32f`); cut over `mk/proof.mk` (`test-model`, `test-model-diff`, `test-model-tsan`, `test-proof`) and `tests/model/receipt.sh` to pure seeded OM-2, and added live `real.I1.{settled,quiescent}_leak_violations` + `real.I3.duplicate_commit_runs` receipt counters to `tests/model/world_diff.om`.
+
 This is an inventory and cutover backlog, **not a retirement or deployment claim**. The main tree contains **674 `.c` + 331 `.h` = 1,005 tracked paths**, and no tracked `.om`. Candidate branches already contain seeded Om; main alone does not describe the whole programme. Counts cover this repository, not external PHYSICS/NVIDIA dependencies, other extensions, assembly or shell/Python automation.
 
 ## Role triage
