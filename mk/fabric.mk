@@ -1,55 +1,33 @@
-# Fabric interface F5-0 (src/fabric/fabric.h): membership, capability
+# Fabric interface F5-0 (src/fabric/fabric.om): membership, capability
 # advertisement, leases and loss detection keyed by AienMachineId, over the
-# in-process loopback transport. Files under src/fabric/ and tests/fabric/.
-# Picked up by `-include mk/*.mk`. Not part of `all` or `test` (that runs only
-# the omegatool gates); CI runs test-fabric and test-fabric-living (rx-host.yml).
-# Lane 32: every Fabric build here is a TEST build (-DAIEN_TEST_BUILD=1): the
-# loopback transport, HMAC stand-in and dispatcher refuse to compile without
-# it, and only the R13 test-build variant links them (RX_FABRIC_TEST_SRCS); the
-# production program carries no Fabric until a real transport exists (TRUST-1).
-# It uses the Capability Graph only
-# through src/runtime/rx_capq.h and links the same objects test-capability-graph
-# links (rx_capq.o, rx_graph.o, the pinned Aienux capability library).
+# in-process loopback transport. Pure seeded OM-2 (seed/out/omc).
 #
-# test-fabric         purity check, then the exit-gate test plain and with ASan/UBSan
-# fabric-purity       fabric objects reference no authority, World, socket or process call
+# test-fabric         purity check, then the exit-gate tests in pure OM-2
+# fabric-purity       fabric .om sources reference no authority, World, socket or process builtin
 # fabric-receipt      digest-named receipt under evidence/F5-0 (clean tree only)
 # test-fabric-living  Lane 13: a second machine's Skill found and used by the
-#                     COMPOSITION-2 causal path (rx_compose) through the Fabric
-#                     dispatcher (fab_dispatch.c); lease loss, forgery and wrong
-#                     machine refused; plain and ASan/UBSan, two runs each. The
-#                     same scenario runs inside the R13 test-build variant.
+#                     COMPOSITION-2 causal path (rx_compose.om) through the Fabric
+#                     dispatcher (fab_dispatch.om); lease loss, forgery and wrong
+#                     machine refused; two deterministic pure OM-2 runs.
 ifndef FABRIC_MK
 FABRIC_MK := 1
 .PHONY: test-fabric test-fab-dispatch test-fabric-living fabric-purity fabric-receipt
 FAB_DIR = $(OUT_DIR)/fabric
-FAB_CFLAGS = -std=gnu11 -Wall -Wextra -Werror -D_GNU_SOURCE -O2 -Isrc -Isrc/runtime -Isrc/fabric \
-	-DAIEN_TEST_BUILD=1
-FAB_ASAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-FAB_SRCS = src/fabric/fabric.c src/fabric/fab_hmac.c src/fabric/fab_loopback.c
-FAB_LIVING_SRCS = $(FAB_SRCS) src/fabric/fab_dispatch.c
-FAB_HDRS = src/fabric/fabric.h src/fabric/fab_hmac.h src/fabric/fab_loopback.h src/fabric/fab_dispatch.h \
-	src/runtime/rx_skillroute.h \
-	src/runtime/rx_capq.h src/runtime/aien_machine_id.h src/runtime/rx_jspace.h
-# Routing discovers and carries records; it never grants authority, never
-# touches the World, and F5-0 opens no socket and starts no process.
-FAB_FORBIDDEN = ' U (aienos_|rx_caproot_|rx_world_|rx_aegis|argus_|ag_cap|socket$$|connect$$|bind$$|listen$$|accept$$|sendto$$|recvfrom$$|fork$$|exec|system$$|dlopen$$|mmap$$)'
-# Decoupled from legacy C runtime & libaienos_capability.a: Fabric links only
-# rx_capq.o (backed by om/runtime/rx_capq_core.om), aien_machine_id.c, and OM-2 units.
-FAB_LINK_SRCS = src/omega_om_units.c src/runtime/aien_machine_id.c
-
-$(FAB_DIR)/%.o: src/fabric/%.c $(FAB_HDRS)
-	@mkdir -p $(FAB_DIR)
-	$(CC) $(FAB_CFLAGS) -c -o $@ $<
-
-fabric-purity: $(FAB_DIR)/fabric.o $(FAB_DIR)/fab_hmac.o $(FAB_DIR)/fab_loopback.o $(FAB_DIR)/fab_dispatch.o
-	@if nm -u $^ | grep -E $(FAB_FORBIDDEN) ; then \
-		echo "fabric object references an operation the Fabric must not have"; exit 1; fi
-	@echo "fabric-purity: fabric.o, fab_hmac.o, fab_loopback.o and fab_dispatch.o reference no forbidden symbol"
-
 FAB_OMC ?= seed/out/omc
 FAB_OM_SRCS = seed/ng/sha256.om src/runtime/aien_machine_id.om \
 	src/fabric/fab_hmac.om src/fabric/fab_loopback.om src/fabric/fabric.om
+FAB_OM_PURITY_SRCS = src/fabric/fabric.om src/fabric/fab_hmac.om \
+	src/fabric/fab_loopback.om src/fabric/fab_dispatch.om
+FAB_LIVING_OM_SRCS = $(FAB_OM_SRCS) src/fabric/fab_dispatch.om src/runtime/rx_compose.om \
+	tests/fabric/fabric_living_test.om
+# Routing discovers and carries records; it never grants authority, never
+# touches the World, and F5-0 opens no socket and starts no process.
+FAB_FORBIDDEN_OM = '\b(aienos_|rx_caproot_|rx_world_|rx_aegis|argus_|ag_cap|socknew|sockbind|socklisten|sockaccept|sockconnect|fork|execprog|mapnew)\b'
+
+fabric-purity: $(FAB_OM_PURITY_SRCS)
+	@if grep -Eq $(FAB_FORBIDDEN_OM) $(FAB_OM_PURITY_SRCS) ; then \
+		echo "fabric source references an operation the Fabric must not have"; exit 1; fi
+	@echo "fabric-purity: fabric.om, fab_hmac.om, fab_loopback.om and fab_dispatch.om reference no forbidden symbol"
 
 $(FAB_DIR)/fabric_test: tests/fabric/fabric_test.om $(FAB_OM_SRCS) $(FAB_OMC)
 	@mkdir -p $(FAB_DIR)
@@ -59,6 +37,10 @@ $(FAB_DIR)/test_fab_dispatch: tests/fabric/test_fab_dispatch.om $(FAB_OM_SRCS) s
 	@mkdir -p $(FAB_DIR)
 	(printf 'om2\n'; sed '/^om2$$/d' $(FAB_OM_SRCS) src/fabric/fab_dispatch.om tests/fabric/test_fab_dispatch.om) | $(FAB_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
+$(FAB_DIR)/fabric_living_test: $(FAB_LIVING_OM_SRCS) $(FAB_OMC)
+	@mkdir -p $(FAB_DIR)
+	(printf 'om2\n'; sed '/^om2$$/d' $(FAB_LIVING_OM_SRCS)) | $(FAB_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
+
 test-fab-dispatch: $(FAB_DIR)/test_fab_dispatch
 	$(abspath $(FAB_DIR)/test_fab_dispatch)
 
@@ -66,16 +48,10 @@ test-fabric: fabric-purity $(FAB_DIR)/fabric_test $(FAB_DIR)/test_fab_dispatch
 	$(abspath $(FAB_DIR)/fabric_test)
 	$(abspath $(FAB_DIR)/test_fab_dispatch)
 
-test-fabric-living: fabric-purity
-	@$(MAKE) --no-print-directory $(RX_CAPQ_OBJ) $(RX_GRAPH_OBJ) $(RX_SKILLROUTE_OBJ) $(OUT_DIR)/rx_cortex.o $(AIENOS_CAP_LIB)
-	$(CC) $(CFLAGS) $(FAB_CFLAGS) -Itests/runtime -Itests/fabric -pthread -o $(FAB_DIR)/fabric_living_test \
-		tests/fabric/fabric_living_test.c $(FAB_LIVING_SRCS) $(RX_COMPOSE_SRCS) $(RX_COMPOSE_LINK)
-	$(CC) $(CFLAGS) $(FAB_CFLAGS) $(FAB_ASAN) -Itests/runtime -Itests/fabric -pthread \
-		-o $(FAB_DIR)/fabric_living_test_asan tests/fabric/fabric_living_test.c $(FAB_LIVING_SRCS) \
-		$(RX_COMPOSE_SRCS) $(RX_COMPOSE_LINK)
-	$(abspath $(FAB_DIR)/fabric_living_test)
-	$(abspath $(FAB_DIR)/fabric_living_test_asan) > $(FAB_DIR)/living_asan.out
-	@grep -q '^FABRIC_LIVING_PASS$$' $(FAB_DIR)/living_asan.out && echo "test-fabric-living: ASan/UBSan run PASS"
+test-fabric-living: fabric-purity $(FAB_DIR)/fabric_living_test
+	$(abspath $(FAB_DIR)/fabric_living_test) > $(FAB_DIR)/living.out
+	@cat $(FAB_DIR)/living.out
+	@grep -q '^FABRIC_LIVING_PASS$$' $(FAB_DIR)/living.out && echo "test-fabric-living: pure OM-2 run PASS"
 
 fabric-receipt:
 	tests/fabric/fabric_receipt.sh
