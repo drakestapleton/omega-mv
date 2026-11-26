@@ -1,0 +1,454 @@
+note SPDX-License-Identifier: Apache-2.0
+note bridge/tensorfold-omega/tf_omega_unit.om: Pure seeded OM-2 function-mode ABI v2 unit
+note for the optional zero-touch TensorFold Zig plugin (--backend omega).
+note
+note Exports (bound via bridge/omega-bridge/src/native.om as omega2_<name>):
+note   1. tf_arboris_observe  : Online Live Arboris Space-Saving MoE co-activation update
+note                            (zero-drift: only updates caller-owned prefetch table).
+note   2. tf_arboris_predict  : Pure read-only MoE next-layer expert prefetch predictor
+note                            (view-only table, writes top-K<=16 expert IDs to out buffer).
+note   3. tf_sm121_check_stall: SM121 Blackwell scoreboard RAW stall-floor & basic-block
+note                            pinning checker (requires raw_floor >= 6, Antibodies #14/#15/#16).
+note   4. tf_egp3_check_cert  : Standalone EGP3 single-cert structural rewrite verifier.
+note   5. tf_omega_ident      : Byte-traceable ABI v2 capability/floor metadata output.
+om2
+
+const TF_MAGIC ulong 0x4f4d544630303032
+const TF_ABI_VER ulong 2
+const TF_PROFILE ulong 2
+const TF_CAPS ulong 7
+const TF_MIN_RAW_FLOOR ulong 6
+const TF_EXPORT_COUNT ulong 5
+const TF_NONE uint 0xffffffff
+const TF_MAX_PRED ulong 16
+const TF_RZ ulong 255
+
+note ---- 1. Live Arboris Zero-Drift MoE Co-Activation Prefetcher ----
+note cfg[0]=n_exp (1..65535), cfg[1]=n_slots (1..64), cfg[2]=top_k_pred (1..16), cfg[3]=decay_at (>=2)
+note Table word packing: (count << 16) | target_eid in uint.
+
+fn tf_pack_edge cnt ulong tgt ulong to uint
+ret or shl uint cnt 16 uint tgt
+end
+
+fn tf_halve_row table edit uint * base ulong n_slots ulong to void
+for h ulong n_slots bound 65
+idx = add base h
+e = get table idx
+c = ulong shr e 16
+if gt c 1
+put table idx tf_pack_edge shr c 1 ulong and e 65535
+else
+put table idx 0
+end
+end
+end
+
+fn tf_insert_edge table edit uint * base ulong n_slots ulong tgt ulong decay_at ulong to void
+empty_i = n_slots
+min_i = ulong 0
+min_c = ulong 0xffffffff
+for h ulong n_slots bound 65
+e = get table add base h
+c = ulong shr e 16
+if eq c 0
+if eq empty_i n_slots
+empty_i = h
+end
+else
+if eq ulong and e 65535 tgt
+nc = add c 1
+put table add base h tf_pack_edge nc tgt
+if ge nc decay_at
+tf_halve_row table base n_slots
+end
+ret
+end
+if lt c min_c
+min_c = c
+min_i = h
+end
+end
+end
+if lt empty_i n_slots
+put table add base empty_i tf_pack_edge 1 tgt
+ret
+end
+nc = add min_c 1
+put table add base min_i tf_pack_edge nc tgt
+if ge nc decay_at
+tf_halve_row table base n_slots
+end
+end
+
+export fn tf_arboris_observe table edit uint * cfg view ulong 4 prev_eid ulong cur_ids view uint * to ulong
+requires gt get cfg 0 0
+requires le get cfg 0 65535
+requires gt get cfg 1 0
+requires le get cfg 1 64
+requires ge get cfg 3 2
+requires lt prev_eid get cfg 0
+requires ge len table mul get cfg 0 get cfg 1
+n_exp = get cfg 0
+n_slots = get cfg 1
+decay_at = get cfg 3
+base = mul prev_eid n_slots
+updated = ulong 0
+for j ulong len cur_ids bound 256
+tgt = ulong get cur_ids j
+if lt tgt n_exp
+tf_insert_edge table base n_slots tgt decay_at
+updated = add updated 1
+end
+end
+ret updated
+end
+
+fn tf_cand_add cand edit ulong 33 tgt ulong sc ulong to void
+n = get cand 32
+for k ulong n bound 17
+if eq get cand k tgt
+put cand add 16 k add get cand add 16 k sc
+ret
+end
+end
+if lt n 16
+put cand n tgt
+put cand add 16 n sc
+put cand 32 add n 1
+ret
+end
+min_k = ulong 0
+for k ulong 16
+if lt get cand add 16 k get cand add 16 min_k
+min_k = k
+end
+end
+if gt sc get cand add 16 min_k
+put cand min_k tgt
+put cand add 16 min_k sc
+end
+end
+
+fn tf_scan_row table view uint * cfg view ulong 4 src ulong cand edit ulong 33 to void
+if ge src get cfg 0
+ret
+end
+base = mul src get cfg 1
+for h ulong get cfg 1 bound 65
+e = get table add base h
+c = ulong shr e 16
+if gt c 0
+tgt = ulong and e 65535
+if lt tgt get cfg 0
+tf_cand_add cand tgt c
+end
+end
+end
+end
+
+fn tf_cand_select cand edit ulong 33 want ulong pred edit uint 16 to ulong
+n = get cand 32
+out_n = n
+if gt out_n want
+out_n = want
+end
+for p ulong out_n bound 17
+best = ulong 0
+best_sc = ulong 0
+for k ulong n bound 17
+sc = get cand add 16 k
+if gt sc best_sc
+best_sc = sc
+best = k
+end
+end
+if eq best_sc 0
+ret p
+end
+put pred p uint get cand best
+put cand add 16 best 0
+end
+ret out_n
+end
+
+export fn tf_arboris_predict table view uint * cfg view ulong 4 cur_ids view uint * pred out uint 16 to ulong
+requires gt get cfg 0 0
+requires le get cfg 0 65535
+requires gt get cfg 1 0
+requires le get cfg 1 64
+requires gt get cfg 2 0
+requires le get cfg 2 16
+requires ge len table mul get cfg 0 get cfg 1
+cand = new ulong 33 0
+for i ulong len cur_ids bound 256
+tf_scan_row table cfg ulong get cur_ids i cand
+end
+for p ulong 16
+put pred p TF_NONE
+end
+ret tf_cand_select cand get cfg 2 pred
+end
+
+note ---- 2. SM121 Blackwell Scoreboard Stall-Floor & Basic-Block Pinning Checker ----
+note Each instruction i occupies 4 ulong words in insns[4*i .. 4*i+4):
+note   +0: stall_cycles (0..15)
+note   +1: dst_reg (0..254 GPR, 255 = RZ / no write)
+note   +2: packed srcs: src0 | (src1 << 8) | (src2 << 16), 255 = unused
+note   +3: flags: bit0=IS_ANCHOR, bit1=IS_FIXED_ALU (IMAD.WIDE/I2FP),
+note              bits[8..23]=bb_id, bits[24..39]=orig_bb_id
+note Returns: 0=PASS, 1=RAW stall underflow, 2=BB pin escape, 3=BB non-monotonic, 4=fixed-ALU floor underflow.
+
+fn tf_reads_reg srcs ulong reg ulong to bool
+if eq reg TF_RZ
+ret false
+end
+if eq and srcs 255 reg
+ret true
+end
+if eq and shr srcs 8 255 reg
+ret true
+end
+ret eq and shr srcs 16 255 reg
+end
+
+fn tf_insn_bb insns view ulong * idx ulong to ulong
+f = get insns add mul idx 4 3
+ret and shr f 8 65535
+end
+
+fn tf_insn_fl insns view ulong * idx ulong to ulong
+ret get insns add mul idx 4 3
+end
+
+fn tf_check_raw_u insns view ulong * n_insns ulong u ulong raw_floor ulong to ulong
+dst = get insns add mul u 4 1
+if eq dst TF_RZ
+ret 0
+end
+sum = get insns mul u 4
+if ne and tf_insn_fl insns u 2 0
+if lt sum raw_floor
+ret 4
+end
+end
+lim = add u 16
+if gt lim n_insns
+lim = n_insns
+end
+v = add u 1
+while lt v lim bound 17
+if ne tf_insn_bb insns v tf_insn_bb insns u
+if ne and tf_insn_fl insns u 2 0
+if lt sum raw_floor
+ret 1
+end
+end
+ret 0
+end
+if tf_reads_reg get insns add mul v 4 2 dst
+if lt sum raw_floor
+ret 1
+end
+ret 0
+end
+if eq get insns add mul v 4 1 dst
+ret 0
+end
+sum = add sum get insns mul v 4
+if ne and tf_insn_fl insns v 1 0
+if lt sum raw_floor
+ret 1
+end
+ret 0
+end
+v = add v 1
+end
+ret 0
+end
+
+export fn tf_sm121_check_stall insns view ulong * n_insns ulong raw_floor ulong to ulong
+requires ge raw_floor 6
+requires gt n_insns 0
+requires le n_insns 2048
+requires ge len insns mul n_insns 4
+prev_bb = ulong 0
+for i ulong n_insns bound 2049
+di = mul i 4
+if gt get insns di 15
+ret 4
+end
+fl = get insns add di 3
+bb = and shr fl 8 65535
+orig_bb = and shr fl 24 65535
+if ne bb orig_bb
+ret 2
+end
+if gt i 0
+if lt bb prev_bb
+ret 3
+end
+end
+prev_bb = bb
+rc = tf_check_raw_u insns n_insns i raw_floor
+if ne rc 0
+ret rc
+end
+end
+ret 0
+end
+
+note ---- 3. Standalone EGP3 Single-Cert Structural Proof Checker ----
+note Mirrors seed/ng/verify/egp3_checker.om binary wire layout (magic "EGP3", opcodes 1..11, rules 1..18).
+note Returns 0 on PASS, nonzero refusal code 1..11 on invalid cert or rewrite step.
+
+fn tf_rdu32 cert view uchar * off ulong to ulong
+b0 = ulong get cert off
+b1 = shl ulong get cert add off 1 8
+b2 = shl ulong get cert add off 2 16
+b3 = shl ulong get cert add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn tf_node_field cert view uchar * idx ulong fld ulong to ulong
+ret tf_rdu32 cert add 36 add mul idx 32 mul fld 4
+end
+
+fn tf_check_egp3_rule cert view uchar * rule ulong lhs ulong rhs ulong nc ulong to ulong
+if or ge lhs nc ge rhs nc
+ret 6
+end
+if or eq rule 0 gt rule 18
+ret 7
+end
+if eq rule 1
+note Rule 1: add(mul(a,b), c) = fma(a,b,c)
+if ne tf_node_field cert lhs 0 3
+ret 8
+end
+if ne tf_node_field cert rhs 0 6
+ret 8
+end
+la = tf_node_field cert lhs 1
+if ne tf_node_field cert la 0 5
+ret 8
+end
+if ne tf_node_field cert la 1 tf_node_field cert rhs 1
+ret 8
+end
+if ne tf_node_field cert la 2 tf_node_field cert rhs 2
+ret 8
+end
+if ne tf_node_field cert lhs 2 tf_node_field cert rhs 3
+ret 8
+end
+ret 0
+end
+if eq rule 2
+note Rule 2: add(c, mul(a,b)) = fma(a,b,c)
+if ne tf_node_field cert lhs 0 3
+ret 8
+end
+if ne tf_node_field cert rhs 0 6
+ret 8
+end
+lm = tf_node_field cert lhs 2
+if ne tf_node_field cert lm 0 5
+ret 8
+end
+if ne tf_node_field cert lm 1 tf_node_field cert rhs 1
+ret 8
+end
+if ne tf_node_field cert lm 2 tf_node_field cert rhs 2
+ret 8
+end
+if ne tf_node_field cert lhs 1 tf_node_field cert rhs 3
+ret 8
+end
+ret 0
+end
+ret 0
+end
+
+fn tf_check_egp3_nodes cert view uchar * nc ulong to ulong
+for i ulong nc bound 4097
+op = tf_node_field cert i 0
+if or eq op 0 gt op 11
+ret 9
+end
+if gt op 2
+if ge tf_node_field cert i 1 i
+ret 10
+end
+if ge tf_node_field cert i 2 i
+ret 10
+end
+if eq op 6
+if ge tf_node_field cert i 3 i
+ret 10
+end
+end
+end
+end
+ret 0
+end
+
+export fn tf_egp3_check_cert cert view uchar * to ulong
+if lt len cert 36
+ret 1
+end
+if or ne get cert 0 69 ne get cert 1 71
+ret 2
+end
+if or ne get cert 2 80 ne get cert 3 51
+ret 2
+end
+if ne tf_rdu32 cert 4 1
+ret 3
+end
+if and ne tf_rdu32 cert 16 32 ne tf_rdu32 cert 16 64
+ret 4
+end
+nc = tf_rdu32 cert 20
+if or eq nc 0 gt nc 4096
+ret 4
+end
+if or ge tf_rdu32 cert 24 nc ge tf_rdu32 cert 28 nc
+ret 4
+end
+tc = tf_rdu32 cert 32
+if gt tc 8192
+ret 4
+end
+if ne len cert add 36 add mul nc 32 mul tc 12
+ret 5
+end
+rc = tf_check_egp3_nodes cert nc
+if ne rc 0
+ret rc
+end
+toff = add 36 mul nc 32
+for t ulong tc bound 8193
+so = add toff mul t 12
+rl = tf_rdu32 cert so
+lh = tf_rdu32 cert add so 4
+rh = tf_rdu32 cert add so 8
+rc2 = tf_check_egp3_rule cert rl lh rh nc
+if ne rc2 0
+ret rc2
+end
+end
+ret 0
+end
+
+note ---- 4. Byte-Traceable Plugin Capability & Floor Metadata ----
+
+export fn tf_omega_ident meta out ulong 6 to ulong
+put meta 0 TF_MAGIC
+put meta 1 TF_ABI_VER
+put meta 2 TF_PROFILE
+put meta 3 TF_CAPS
+put meta 4 TF_MIN_RAW_FLOOR
+put meta 5 TF_EXPORT_COUNT
+ret TF_MAGIC
+end
