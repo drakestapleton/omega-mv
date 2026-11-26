@@ -1,0 +1,806 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/dnn/fa2_hmma_train.om: Pure seeded-OM-2 SM121 Flash-Attention-2 training kernels.
+note Composes after gpu/nvidia/om/encoder/bw_enc_sm121_v2.om (no om2 directive here).
+note Emits three HMMA.16816.F32.BF16 training kernels eliminating the [B, H, T, T] opa DRAM tensor:
+note   - dnn_emit_fa2_fwd(slot, head_dim): Br=64, Bc=64, 128 threads, bank-padded SMEM <= 32768 B,
+note     online softmax (SHFL.BFLY + MUFU.EX2 + MUFU.LG2), writes ONLY O (BF16) and LSE (FP32, STG.E.32.EL).
+note   - dnn_emit_fa2_bwd(slot, head_dim): D_i = rowsum(dO*O) in warp regs, pins K_j/V_j (L2_EL),
+note     recomputes P_ij = exp(Q_i K_j^T / sqrt(E) - LSE_i) on the fly, HMMA for dV/dP/dK/dQ,
+note     writes deterministic per-tile dQ partials via STG.E.128.EL (ZERO FP atomics, Lock 1).
+note   - dnn_emit_fa2_dq_reduce(slot, head_dim): deterministic fixed-order tree reduction of dQ
+note     partials from L2 scratch (L2_LU read, L2_NORM write, HMMA scale-reduce, ZERO FP atomics).
+note Supports head_dim in {32, 64, 128, 256}; returns 0 on any other head_dim.
+
+const FA2_SR_TIDX ulong 33
+const FA2_SR_CTAX ulong 37
+const FA2_SR_CTAY ulong 38
+const FA2_UR_DESC ulong 4
+const FA2_DESC_OFF ulong 856
+const FA2_PARAM_BASE ulong 896
+const FA2_THREADS ulong 128
+
+const FA2_NEG_INF ulong 3769465068
+const FA2_ONE ulong 1065353216
+const FA2_LOG2E ulong 1069066811
+const FA2_LN2 ulong 1060205080
+const FA2_INV_S32 ulong 1043662067
+const FA2_INV_S64 ulong 1040187392
+const FA2_INV_S128 ulong 1035273459
+const FA2_INV_S256 ulong 1031798784
+const FA2_SL2E_32 ulong 1048744942
+const FA2_SL2E_64 ulong 1043900987
+const FA2_SL2E_128 ulong 1040356334
+const FA2_SL2E_256 ulong 1035512379
+
+fn fa2_valid_hd hd ulong to bool
+ret or or eq hd 32 eq hd 64 or eq hd 128 eq hd 256
+end
+
+fn fa2_slice_dim hd ulong to ulong
+if eq hd 32
+ret 32
+end
+ret 64
+end
+
+fn fa2_d_slices hd ulong to ulong
+if le hd 64
+ret 1
+end
+if eq hd 128
+ret 2
+end
+ret 4
+end
+
+fn fa2_row_bytes hd ulong to ulong
+note Bank-padded row stride in bytes: (slice_dim + 8) * 2 BF16 bytes (16-byte aligned, +4 banks)
+ret mul add fa2_slice_dim hd 8 2
+end
+
+fn fa2_tile_bytes hd ulong to ulong
+ret mul 64 fa2_row_bytes hd
+end
+
+fn fa2_smem_bytes hd ulong to ulong
+note 3 bank-padded tiles (Q/K/V or K/V/stage) + 512 B warp scratch (15872 B for hd=32, 28160 B for hd>=64)
+ret add mul 3 fa2_tile_bytes hd 512
+end
+
+fn fa2_scale_l2e hd ulong to ulong
+if eq hd 32
+ret FA2_SL2E_32
+end
+if eq hd 64
+ret FA2_SL2E_64
+end
+if eq hd 128
+ret FA2_SL2E_128
+end
+ret FA2_SL2E_256
+end
+
+fn fa2_inv_sqrt hd ulong to ulong
+if eq hd 32
+ret FA2_INV_S32
+end
+if eq hd 64
+ret FA2_INV_S64
+end
+if eq hd 128
+ret FA2_INV_S128
+end
+ret FA2_INV_S256
+end
+
+fn fa2_zero_regs base ulong cnt ulong to void
+for i ulong cnt bound 64
+v2_movz add base i
+end
+end
+
+fn fa2_quad_max r0 ulong r1 ulong tmp ulong to void
+v2_shfl SHFL_BFLY tmp r0 2 31
+v2_fmax r0 r0 tmp
+v2_shfl SHFL_BFLY tmp r0 1 31
+v2_fmax r0 r0 tmp
+v2_shfl SHFL_BFLY tmp r1 2 31
+v2_fmax r1 r1 tmp
+v2_shfl SHFL_BFLY tmp r1 1 31
+v2_fmax r1 r1 tmp
+end
+
+fn fa2_quad_sum r0 ulong r1 ulong tmp ulong to void
+v2_shfl SHFL_BFLY tmp r0 2 31
+v2_fadd r0 r0 tmp
+v2_shfl SHFL_BFLY tmp r0 1 31
+v2_fadd r0 r0 tmp
+v2_shfl SHFL_BFLY tmp r1 2 31
+v2_fadd r1 r1 tmp
+v2_shfl SHFL_BFLY tmp r1 1 31
+v2_fadd r1 r1 tmp
+end
+
+fn fa2_warp_sum r ulong tmp ulong to void
+v2_shfl SHFL_BFLY tmp r 16 31
+v2_fadd r r tmp
+v2_shfl SHFL_BFLY tmp r 8 31
+v2_fadd r r tmp
+v2_shfl SHFL_BFLY tmp r 4 31
+v2_fadd r r tmp
+v2_shfl SHFL_BFLY tmp r 2 31
+v2_fadd r r tmp
+v2_shfl SHFL_BFLY tmp r 1 31
+v2_fadd r r tmp
+end
+
+note Load tile into SMEM using explicit d_off register d_reg (allows full-head_dim streaming for hd=128/256).
+fn fa2_load_tile_d base_ptr ulong row_reg ulong d_reg ulong smem_off ulong hd ulong pol ulong to void
+sdim = fa2_slice_dim hd
+row_b = fa2_row_bytes hd
+vpr = div sdim 8
+iters = div mul 64 vpr FA2_THREADS
+v2_movz 42
+v2_movi 43 iters
+lp = v2_pc
+v2_imadi 41 42 FA2_THREADS 12
+if eq vpr 4
+v2_shr 40 41 2
+v2_andi 36 41 3
+else
+v2_shr 40 41 3
+v2_andi 36 41 7
+end
+v2_iadd3 37 row_reg 40 V2_RZ
+v2_imadi 37 37 hd 19
+v2_iadd3 37 37 d_reg V2_RZ
+v2_imadi 37 36 8 37
+v2_imadw 38 37 2 base_ptr
+v2_ldg_pol 32 38 FA2_UR_DESC 0 SZ_128 pol
+v2_imadi 40 40 row_b V2_RZ
+v2_imadi 40 36 16 40
+if ne smem_off 0
+v2_movi 37 smem_off
+v2_iadd3 40 40 37 V2_RZ
+end
+v2_sts 40 32 0 SZ_128
+v2_movi 37 1
+v2_iadd3 42 42 37 V2_RZ
+v2_isetp 0 42 43 CMP_LT
+v2_bra_to 0 lp
+end
+
+note Emit HMMA.16816 S += A @ B^T accumulation into R48..R63 (4 N-tiles = 16x32 sub-tile).
+note Caller zeroes R48..R63 before calling (allows multi-slice full-head_dim accumulation for hd=128/256).
+note k_steps = slice_dim / 16 (2 for hd=32, 4 for hd=64/128/256; ZERO FP32 FFMA fallback!).
+fn fa2_hmma_s_accum a_smem ulong b_smem ulong hd ulong sub_reg ulong to void
+row_b = fa2_row_bytes hd
+k_steps = div fa2_slice_dim hd 16
+v2_shr 40 16 2
+v2_imadi 40 15 16 40
+v2_imadi 40 40 row_b V2_RZ
+if ne a_smem 0
+v2_movi 42 a_smem
+v2_iadd3 40 40 42 V2_RZ
+end
+v2_andi 41 16 7
+v2_imadi 41 sub_reg 32 41
+v2_imadi 41 41 row_b V2_RZ
+if ne b_smem 0
+v2_movi 42 b_smem
+v2_iadd3 41 41 42 V2_RZ
+end
+v2_movz 42
+v2_movi 43 k_steps
+klp = v2_pc
+v2_lds 32 40 0 SZ_128
+for nt ulong 4
+v2_lds 36 41 mul nt mul 8 row_b SZ_64
+v2_hmma_bf16 add 48 mul nt 4 32 36 add 48 mul nt 4 4
+end
+v2_movi 37 32
+v2_iadd3 40 40 37 V2_RZ
+v2_iadd3 41 41 37 V2_RZ
+v2_movi 37 1
+v2_iadd3 42 42 37 V2_RZ
+v2_isetp 0 42 43 CMP_LT
+v2_bra_to 0 klp
+end
+
+fn fa2_hmma_s_subtile a_smem ulong b_smem ulong hd ulong sub_reg ulong to void
+fa2_zero_regs 48 16
+fa2_hmma_s_accum a_smem b_smem hd sub_reg
+end
+
+note Scale S (R48..R63) by inv_sqrt(E)*log2(e) in R28 and apply causal mask using R29 (-1e20).
+fn fa2_scale_mask_s sub_reg ulong to void
+v2_andi 36 16 3
+v2_imadi 36 36 2 20
+v2_imadi 36 sub_reg 32 36
+for nt ulong 4
+b = add 48 mul nt 4
+v2_fmul b b 28
+v2_fmul add b 1 add b 1 28
+v2_fmul add b 2 add b 2 28
+v2_fmul add b 3 add b 3 28
+v2_movi 37 mul nt 8
+v2_iadd3 37 36 37 V2_RZ
+v2_isetp 0 37 23 CMP_GT
+v2_fsel b 29 b 0
+v2_fsel add b 1 29 add b 1 0
+v2_movi 38 8
+v2_iadd3 38 23 38 V2_RZ
+v2_isetp 0 37 38 CMP_GT
+v2_fsel add b 2 29 add b 2 0
+v2_fsel add b 3 29 add b 3 0
+end
+end
+
+note Compute online softmax update on S (R48..R63), rescale running l_i (R26..27) and O_acc (R64..),
+note compute P = exp2(S - m_new) and pack BF16 P fragments into R32..R35 (k=0) and R40..R43 (k=1).
+fn fa2_online_softmax_pack out_ntiles ulong to void
+v2_fmax 40 48 49
+v2_fmax 42 52 53
+v2_fmax 40 40 42
+v2_fmax 42 56 57
+v2_fmax 40 40 42
+v2_fmax 42 60 61
+v2_fmax 40 40 42
+v2_fmax 41 50 51
+v2_fmax 42 54 55
+v2_fmax 41 41 42
+v2_fmax 42 58 59
+v2_fmax 41 41 42
+v2_fmax 42 62 63
+v2_fmax 41 41 42
+fa2_quad_max 40 41 42
+v2_fmax 42 24 40
+v2_fmax 43 25 41
+v2_fsub 44 24 42
+v2_mufu 44 44 MUFU_EX2
+v2_fsub 45 25 43
+v2_mufu 45 45 MUFU_EX2
+v2_fmul 26 26 44
+v2_fmul 27 27 45
+for vn ulong out_ntiles bound 8
+o = add 64 mul vn 4
+v2_fmul o o 44
+v2_fmul add o 1 add o 1 44
+v2_fmul add o 2 add o 2 45
+v2_fmul add o 3 add o 3 45
+end
+v2_iadd3 24 42 V2_RZ V2_RZ
+v2_iadd3 25 43 V2_RZ V2_RZ
+for nt ulong 4
+b = add 48 mul nt 4
+v2_fsub b b 24
+v2_mufu b b MUFU_EX2
+v2_fsub add b 1 add b 1 24
+v2_mufu add b 1 add b 1 MUFU_EX2
+v2_fsub add b 2 add b 2 25
+v2_mufu add b 2 add b 2 MUFU_EX2
+v2_fsub add b 3 add b 3 25
+v2_mufu add b 3 add b 3 MUFU_EX2
+end
+v2_fadd 40 48 49
+v2_fadd 42 52 53
+v2_fadd 40 40 42
+v2_fadd 42 56 57
+v2_fadd 40 40 42
+v2_fadd 42 60 61
+v2_fadd 40 40 42
+v2_fadd 41 50 51
+v2_fadd 42 54 55
+v2_fadd 41 41 42
+v2_fadd 42 58 59
+v2_fadd 41 41 42
+v2_fadd 42 62 63
+v2_fadd 41 41 42
+fa2_quad_sum 40 41 42
+v2_fadd 26 26 40
+v2_fadd 27 27 41
+v2_f2fp_bf16 32 49 48
+v2_f2fp_bf16 33 51 50
+v2_f2fp_bf16 34 53 52
+v2_f2fp_bf16 35 55 54
+v2_f2fp_bf16 40 57 56
+v2_f2fp_bf16 41 59 58
+v2_f2fp_bf16 42 61 60
+v2_f2fp_bf16 43 63 62
+end
+
+note Accumulate O += P @ V via HMMA.16816 (2 K-steps of 16 over sub-tile's 32 columns).
+fn fa2_hmma_pv_subtile v_smem ulong hd ulong sub_reg ulong out_ntiles ulong to void
+row_b = fa2_row_bytes hd
+v2_andi 44 16 7
+v2_imadi 44 sub_reg 32 44
+v2_imadi 44 44 row_b V2_RZ
+v2_movi 45 v_smem
+v2_iadd3 44 44 45 V2_RZ
+for vn ulong out_ntiles bound 8
+v2_lds 36 44 mul vn 16 SZ_64
+v2_hmma_bf16 add 64 mul vn 4 32 36 add 64 mul vn 4 4
+end
+v2_movi 45 mul 16 row_b
+v2_iadd3 44 44 45 V2_RZ
+for vn ulong out_ntiles bound 8
+v2_lds 36 44 mul vn 16 SZ_64
+v2_hmma_bf16 add 64 mul vn 4 40 36 add 64 mul vn 4 4
+end
+end
+
+note Epilogue for FA2 forward: normalize O by 1/l_i, pack BF16 -> STG.E.128.NORM,
+note compute LSE = (m_i + log2(l_i)) * ln(2) -> STG.E.32.EL (written once when d_out==0, ZERO opa!).
+fn fa2_fwd_epilogue hd ulong out_ntiles ulong to void
+v2_mufu 44 26 MUFU_RCP
+v2_mufu 45 27 MUFU_RCP
+for vn ulong out_ntiles bound 8
+o = add 64 mul vn 4
+v2_fmul o o 44
+v2_fmul add o 1 add o 1 44
+v2_fmul add o 2 add o 2 45
+v2_fmul add o 3 add o 3 45
+end
+v2_imadi 37 23 hd 19
+v2_iadd3 37 37 22 V2_RZ
+v2_andi 36 16 3
+v2_imadi 37 36 8 37
+v2_imadw 38 37 2 6
+v2_f2fp_bf16 32 65 64
+v2_f2fp_bf16 33 69 68
+v2_f2fp_bf16 34 73 72
+v2_f2fp_bf16 35 77 76
+v2_stg_pol 38 32 FA2_UR_DESC 0 SZ_128 L2_NORM
+if eq out_ntiles 8
+v2_f2fp_bf16 32 81 80
+v2_f2fp_bf16 33 85 84
+v2_f2fp_bf16 34 89 88
+v2_f2fp_bf16 35 93 92
+v2_stg_pol 38 32 FA2_UR_DESC 64 SZ_128 L2_NORM
+end
+v2_mufu 40 26 MUFU_LG2
+v2_fadd 40 24 40
+v2_movi 42 FA2_LN2
+v2_fmul 40 40 42
+v2_mufu 41 27 MUFU_LG2
+v2_fadd 41 25 41
+v2_fmul 41 41 42
+v2_imad 37 14 10 23
+v2_imadw 38 37 4 8
+note Guard LSE write on (lane%4 == 0) AND (d_out == 0)
+v2_andi 36 16 3
+v2_iadd3 36 36 22 V2_RZ
+v2_isetp 0 36 V2_RZ CMP_EQ
+v2_set_guard 1
+v2_stg_pol 38 40 FA2_UR_DESC 0 SZ_32 L2_EL
+v2_set_guard 1
+v2_stg_pol 38 41 FA2_UR_DESC 32 SZ_32 L2_EL
+end
+
+note ============================================================================
+note Public API 1: dnn_emit_fa2_fwd(slot, head_dim) -> emitted bytes (0 if invalid)
+note Params c[0x0][896+]: Q(0:1), K(2:3), V(4:5), O(6:7), LSE(8:9), T(10), H(11)
+note Grid: (ceil(T/64), B_mb*H, 1), Block: (128, 1, 1)
+note ============================================================================
+fn dnn_emit_fa2_fwd slot ulong head_dim ulong to ulong
+if not fa2_valid_hd head_dim
+ret 0
+end
+sdim = fa2_slice_dim head_dim
+tb = fa2_tile_bytes head_dim
+out_nt = div sdim 8
+v2_begin slot FA2_THREADS fa2_smem_bytes head_dim
+v2_ldcu64 FA2_UR_DESC FA2_DESC_OFF
+v2_ldc64 0 FA2_PARAM_BASE
+v2_ldc64 2 add FA2_PARAM_BASE 8
+v2_ldc64 4 add FA2_PARAM_BASE 16
+v2_ldc64 6 add FA2_PARAM_BASE 24
+v2_ldc64 8 add FA2_PARAM_BASE 32
+v2_ldc 10 add FA2_PARAM_BASE 40
+v2_ldc 11 add FA2_PARAM_BASE 44
+v2_s2r 12 FA2_SR_TIDX
+v2_s2r 13 FA2_SR_CTAX
+v2_s2r 14 FA2_SR_CTAY
+v2_shr 15 12 5
+v2_andi 16 12 31
+v2_imadi 17 13 64 V2_RZ
+v2_movi 18 64
+v2_iadd3 18 17 18 V2_RZ
+v2_isetp 0 18 10 CMP_GT
+v2_set_guard 1
+v2_iadd3 18 10 V2_RZ V2_RZ
+v2_imad 19 14 10 V2_RZ
+v2_imadi 19 19 head_dim V2_RZ
+v2_shr 23 16 2
+v2_imadi 23 15 16 23
+v2_iadd3 23 17 23 V2_RZ
+v2_movi 28 fa2_scale_l2e head_dim
+v2_movi 29 FA2_NEG_INF
+v2_movz 22
+d_lp = v2_pc
+if le head_dim 64
+note For hd=32/64: load Q ONCE into bank-padded SMEM[0] (L2_NORM) before KV loop
+fa2_load_tile_d 0 17 22 0 head_dim L2_NORM
+v2_bar
+end
+v2_movi 24 FA2_NEG_INF
+v2_movi 25 FA2_NEG_INF
+v2_movz 26
+v2_movz 27
+fa2_zero_regs 64 mul out_nt 4
+note Causal KV tile loop: kv_col (R20) = 0 .. causal_limit (R18) step 64
+v2_movz 20
+kv_lp = v2_pc
+if le head_dim 64
+fa2_load_tile_d 2 20 22 tb head_dim L2_EL
+end
+fa2_load_tile_d 4 20 22 mul 2 tb head_dim L2_EL
+v2_bar
+note Sub-tile loop (R21 = 0, 1: two 16x32 halves covering Bc=64)
+v2_movz 21
+sub_lp = v2_pc
+if le head_dim 64
+fa2_hmma_s_subtile 0 tb head_dim 21
+else
+note For hd=128/256: stream full head_dim Q(L2_NORM) and K(L2_EL) in 64-col slices (R30) -> exact S = Q @ K^T!
+fa2_zero_regs 48 16
+v2_movz 30
+din_lp = v2_pc
+fa2_load_tile_d 0 17 30 0 head_dim L2_NORM
+fa2_load_tile_d 2 20 30 tb head_dim L2_EL
+v2_bar
+fa2_hmma_s_accum 0 tb head_dim 21
+v2_movi 37 64
+v2_iadd3 30 30 37 V2_RZ
+v2_movi 38 head_dim
+v2_isetp 0 30 38 CMP_LT
+v2_bra_to 0 din_lp
+end
+fa2_scale_mask_s 21
+fa2_online_softmax_pack out_nt
+fa2_hmma_pv_subtile mul 2 tb head_dim 21 out_nt
+v2_movi 37 1
+v2_iadd3 21 21 37 V2_RZ
+v2_movi 38 2
+v2_isetp 0 21 38 CMP_LT
+v2_bra_to 0 sub_lp
+v2_movi 37 64
+v2_iadd3 20 20 37 V2_RZ
+v2_isetp 0 20 18 CMP_LT
+v2_bra_to 0 kv_lp
+fa2_fwd_epilogue head_dim out_nt
+if gt fa2_d_slices head_dim 1
+v2_movi 37 64
+v2_iadd3 22 22 37 V2_RZ
+v2_movi 38 head_dim
+v2_isetp 0 22 38 CMP_LT
+v2_bra_to 0 d_lp
+end
+v2_exit
+ret v2_end 0
+end
+
+note ---- FA2 Backward Helpers ----
+
+note Compute D_i = rowsum(dO_i * O_i) in warp registers via 5-step SHFL.BFLY -> R26.
+note Loads O_i (R6:7) and dO_i (R8:9) via LDG.E.128.NORM. Uses R96..R103.
+fn fa2_bwd_compute_di hd ulong to void
+v2_imadi 37 23 hd 19
+v2_iadd3 37 37 22 V2_RZ
+v2_imadi 37 16 4 37
+v2_imadw 38 37 2 6
+v2_ldg_pol 96 38 FA2_UR_DESC 0 SZ_128 L2_NORM
+v2_imadw 38 37 2 8
+v2_ldg_pol 100 38 FA2_UR_DESC 0 SZ_128 L2_NORM
+v2_movz 26
+v2_ffma 26 96 100 26
+v2_ffma 26 97 101 26
+v2_ffma 26 98 102 26
+v2_ffma 26 99 103 26
+fa2_warp_sum 26 42
+v2_ldc64 38 add FA2_PARAM_BASE 40
+v2_imad 37 14 10 23
+v2_imadw 38 37 4 38
+v2_ldg_pol 24 38 FA2_UR_DESC 0 SZ_32 L2_EL
+v2_movi 42 FA2_LOG2E
+v2_fmul 25 24 42
+end
+
+note Recompute causal P_ij = exp2(S_ij * inv_sqrt(E)*log2(e) - LSE_i * log2(e)) in R48..R63 (ZERO opa!)
+note Masks k_col > q_row to -1e20 (P=0) for diagonal tiles and packs BF16 P_ij into R104..R107.
+fn fa2_bwd_recompute_p sub_reg ulong to void
+v2_andi 36 16 3
+v2_imadi 36 36 2 17
+v2_imadi 36 sub_reg 32 36
+for nt ulong 4
+b = add 48 mul nt 4
+v2_movi 37 mul nt 8
+v2_iadd3 37 36 37 V2_RZ
+v2_isetp 0 37 23 CMP_GT
+v2_fmul b b 28
+v2_fsub b b 25
+v2_fsel b 29 b 0
+v2_mufu b b MUFU_EX2
+v2_fmul add b 1 add b 1 28
+v2_fsub add b 1 add b 1 25
+v2_fsel add b 1 29 add b 1 0
+v2_mufu add b 1 add b 1 MUFU_EX2
+v2_movi 38 8
+v2_iadd3 38 23 38 V2_RZ
+v2_isetp 0 37 38 CMP_GT
+v2_fmul add b 2 add b 2 28
+v2_fsub add b 2 add b 2 25
+v2_fsel add b 2 29 add b 2 0
+v2_mufu add b 2 add b 2 MUFU_EX2
+v2_fmul add b 3 add b 3 28
+v2_fsub add b 3 add b 3 25
+v2_fsel add b 3 29 add b 3 0
+v2_mufu add b 3 add b 3 MUFU_EX2
+end
+v2_f2fp_bf16 104 49 48
+v2_f2fp_bf16 105 51 50
+v2_f2fp_bf16 106 53 52
+v2_f2fp_bf16 107 55 54
+end
+
+note Execute HMMA.16816 4-tile accumulate: acc_base[0..15] += frag_a[0..3] @ smem_b_tile.
+fn fa2_bwd_hmma_acc acc_base ulong frag_a ulong smem_b ulong hd ulong to void
+row_b = fa2_row_bytes hd
+v2_andi 44 16 7
+v2_imadi 44 44 row_b V2_RZ
+if ne smem_b 0
+v2_movi 45 smem_b
+v2_iadd3 44 44 45 V2_RZ
+end
+for nt ulong 4
+v2_lds 36 44 mul nt 16 SZ_64
+v2_hmma_bf16 add acc_base mul nt 4 frag_a 36 add acc_base mul nt 4 4
+end
+end
+
+note Compute dS_ij = P_ij * (dP_ij - D_i) in R48..R63 and pack BF16 dS_ij into R104..R107.
+note Uses R96..R99 (saved P_ij subset / scratch) and R26 (D_i).
+fn fa2_bwd_ds_pack to void
+for nt ulong 4
+b = add 48 mul nt 4
+v2_fsub b b 26
+v2_fmul b b add 96 nt
+v2_fsub add b 1 add b 1 26
+v2_fmul add b 1 add b 1 add 96 nt
+v2_fsub add b 2 add b 2 26
+v2_fmul add b 2 add b 2 add 96 nt
+v2_fsub add b 3 add b 3 26
+v2_fmul add b 3 add b 3 add 96 nt
+end
+v2_f2fp_bf16 104 49 48
+v2_f2fp_bf16 105 51 50
+v2_f2fp_bf16 106 53 52
+v2_f2fp_bf16 107 55 54
+end
+
+note Write deterministic per-tile dQ partials (R48..R63) to L2 scratch via STG.E.128.EL (ZERO FP atomics!).
+fn fa2_bwd_store_dq_partial hd ulong to void
+v2_ldc64 38 add FA2_PARAM_BASE 64
+v2_imad 37 14 10 23
+v2_imadi 37 37 hd V2_RZ
+v2_iadd3 37 37 22 V2_RZ
+v2_imadi 36 13 64 V2_RZ
+v2_imadi 36 36 hd 37
+v2_imadw 38 36 4 38
+v2_stg_pol 38 48 FA2_UR_DESC 0 SZ_128 L2_EL
+v2_stg_pol 38 52 FA2_UR_DESC 16 SZ_128 L2_EL
+v2_stg_pol 38 56 FA2_UR_DESC 32 SZ_128 L2_EL
+v2_stg_pol 38 60 FA2_UR_DESC 48 SZ_128 L2_EL
+end
+
+note Pack dV_j (R64..R79) and dK_j (R80..R95) to BF16 and write via STG.E.128.NORM.
+fn fa2_bwd_store_dkv hd ulong to void
+v2_imadi 37 17 hd 19
+v2_iadd3 37 37 22 V2_RZ
+v2_imadi 37 15 16 37
+v2_andi 36 16 3
+v2_imadi 37 36 8 37
+v2_ldc64 38 add FA2_PARAM_BASE 48
+v2_imadw 38 37 2 38
+v2_f2fp_bf16 32 81 80
+v2_f2fp_bf16 33 85 84
+v2_f2fp_bf16 34 89 88
+v2_f2fp_bf16 35 93 92
+v2_stg_pol 38 32 FA2_UR_DESC 0 SZ_128 L2_NORM
+v2_ldc64 38 add FA2_PARAM_BASE 56
+v2_imadw 38 37 2 38
+v2_f2fp_bf16 32 65 64
+v2_f2fp_bf16 33 69 68
+v2_f2fp_bf16 34 73 72
+v2_f2fp_bf16 35 77 76
+v2_stg_pol 38 32 FA2_UR_DESC 0 SZ_128 L2_NORM
+end
+
+note ============================================================================
+note Public API 2: dnn_emit_fa2_bwd(slot, head_dim) -> emitted bytes (0 if invalid)
+note Params c[0x0][896+]: Q(0:1), K(2:3), V(4:5), O(6:7), dO(8:9), LSE(+40),
+note   dK(+48), dV(+56), dQ_scratch(+64), T(+72), H(+76)
+note Grid: (ceil(T/64), B_mb*H, 1), Block: (128, 1, 1)
+note ============================================================================
+fn dnn_emit_fa2_bwd slot ulong head_dim ulong to ulong
+if not fa2_valid_hd head_dim
+ret 0
+end
+tb = fa2_tile_bytes head_dim
+v2_begin slot FA2_THREADS fa2_smem_bytes head_dim
+v2_ldcu64 FA2_UR_DESC FA2_DESC_OFF
+v2_ldc64 0 FA2_PARAM_BASE
+v2_ldc64 2 add FA2_PARAM_BASE 8
+v2_ldc64 4 add FA2_PARAM_BASE 16
+v2_ldc64 6 add FA2_PARAM_BASE 24
+v2_ldc64 8 add FA2_PARAM_BASE 32
+v2_ldc 10 add FA2_PARAM_BASE 72
+v2_ldc 11 add FA2_PARAM_BASE 76
+v2_s2r 12 FA2_SR_TIDX
+v2_s2r 13 FA2_SR_CTAX
+v2_s2r 14 FA2_SR_CTAY
+v2_shr 15 12 5
+v2_andi 16 12 31
+v2_imadi 17 13 64 V2_RZ
+v2_imad 19 14 10 V2_RZ
+v2_imadi 19 19 head_dim V2_RZ
+v2_movi 28 fa2_scale_l2e head_dim
+v2_movi 29 FA2_NEG_INF
+note Outer d_half loop (R22 = 0, 32, ..., head_dim-32) so dV(R64..79), dK(R80..95) stay <= R107
+v2_movz 22
+dh_lp = v2_pc
+note Pin K_j in SMEM[0] and V_j in SMEM[tb] via LDG.E.128.EL
+fa2_load_tile_d 2 17 22 0 head_dim L2_EL
+fa2_load_tile_d 4 17 22 tb head_dim L2_EL
+v2_bar
+fa2_zero_regs 64 32
+note Causal Q_i loop: q_row_base (R20) = kv_row_base (R17) .. T (R10) step 64
+v2_iadd3 20 17 V2_RZ V2_RZ
+q_lp = v2_pc
+v2_shr 23 16 2
+v2_imadi 23 15 16 23
+v2_iadd3 23 20 23 V2_RZ
+fa2_bwd_compute_di head_dim
+note Sub-tile loop (R21 = 0, 1: full Bc=64 columns in two 16x32 halves)
+v2_movz 21
+bsub_lp = v2_pc
+note Stage Q_i in SMEM[2*tb] (L2_NORM), compute S_ij = Q_i @ K_j^T via HMMA.16816
+fa2_load_tile_d 0 20 22 mul 2 tb head_dim L2_NORM
+v2_bar
+fa2_hmma_s_subtile mul 2 tb 0 head_dim 21
+note Recompute causal P_ij = exp(S_ij/sqrt(E) - LSE_i) on the fly (ZERO opa!) & save P in R96..99
+fa2_bwd_recompute_p 21
+v2_iadd3 96 48 V2_RZ V2_RZ
+v2_iadd3 97 52 V2_RZ V2_RZ
+v2_iadd3 98 56 V2_RZ V2_RZ
+v2_iadd3 99 60 V2_RZ V2_RZ
+note Stage dO_i into SMEM[2*tb], accumulate dV_j += P_ij^T @ dO_i via HMMA.16816
+fa2_load_tile_d 8 20 22 mul 2 tb head_dim L2_NORM
+v2_bar
+fa2_bwd_hmma_acc 64 104 mul 2 tb head_dim
+note dP_ij = dO_i @ V_j^T via HMMA.16816
+fa2_hmma_s_subtile mul 2 tb tb head_dim 21
+note dS_ij = P_ij * (dP_ij - D_i) -> pack BF16 into R104..R107
+fa2_bwd_ds_pack
+note Reload Q_i into SMEM[2*tb], accumulate dK_j += dS_ij^T @ Q_i via HMMA.16816
+fa2_load_tile_d 0 20 22 mul 2 tb head_dim L2_NORM
+v2_bar
+fa2_bwd_hmma_acc 80 104 mul 2 tb head_dim
+note dQ_ij = dS_ij @ K_j via HMMA.16816 -> deterministic L2 scratch write STG.E.128.EL (ZERO FP atomics!)
+fa2_zero_regs 48 16
+fa2_bwd_hmma_acc 48 104 0 head_dim
+fa2_bwd_store_dq_partial head_dim
+v2_movi 37 1
+v2_iadd3 21 21 37 V2_RZ
+v2_movi 38 2
+v2_isetp 0 21 38 CMP_LT
+v2_bra_to 0 bsub_lp
+v2_movi 37 64
+v2_iadd3 20 20 37 V2_RZ
+v2_isetp 0 20 10 CMP_LT
+v2_bra_to 0 q_lp
+fa2_bwd_store_dkv head_dim
+v2_movi 37 32
+v2_iadd3 22 22 37 V2_RZ
+v2_movi 38 head_dim
+v2_isetp 0 22 38 CMP_LT
+v2_bra_to 0 dh_lp
+v2_exit
+ret v2_end 0
+end
+
+note ============================================================================
+note Public API 3: dnn_emit_fa2_dq_reduce(slot, head_dim) -> emitted bytes (0 if invalid)
+note Deterministic fixed-order tree reduction of per-tile dQ partials from L2 scratch.
+note L2_LU read (evict transient scratch), L2_NORM write, HMMA.16816 deterministic scale-reduce,
+note ZERO FP atomics (Lock 1 compliant!).
+note Params c[0x0][896+]: dQ_scratch(0:1), dQ_out(2:3), T(4), n_kv_tiles(5)
+note Grid: (ceil(T/64), B_mb*H, 1), Block: (128, 1, 1), SMEM: 16384 B
+note ============================================================================
+fn dnn_emit_fa2_dq_reduce slot ulong head_dim ulong to ulong
+if not fa2_valid_hd head_dim
+ret 0
+end
+v2_begin slot FA2_THREADS 16384
+v2_ldcu64 FA2_UR_DESC FA2_DESC_OFF
+v2_ldc64 0 FA2_PARAM_BASE
+v2_ldc64 2 add FA2_PARAM_BASE 8
+v2_ldc 4 add FA2_PARAM_BASE 16
+v2_ldc 5 add FA2_PARAM_BASE 20
+v2_s2r 12 FA2_SR_TIDX
+v2_s2r 13 FA2_SR_CTAX
+v2_s2r 14 FA2_SR_CTAY
+v2_shr 15 12 5
+v2_andi 16 12 31
+note base_row (R17) = ctaid_x * 64 + (tid >> 1); tile_stride (R18) = T * head_dim
+v2_shr 17 12 1
+v2_imadi 17 13 64 17
+v2_imadi 18 4 head_dim V2_RZ
+note bh_off (R19) = bh * tile_stride + base_row * head_dim
+v2_imad 19 14 18 V2_RZ
+v2_imadi 20 17 head_dim V2_RZ
+v2_iadd3 19 19 20 V2_RZ
+note Stage 1: Fixed-order ascending loop over KV tile partials (j = 0 .. n_kv_tiles-1)
+note Reads transient L2 scratch with L2_LU (last-use) and accumulates deterministically in R48..R51.
+fa2_zero_regs 48 4
+v2_movz 21
+j_lp = v2_pc
+v2_imad 22 21 18 19
+v2_imadw 38 22 4 0
+v2_ldg_pol 32 38 FA2_UR_DESC 0 SZ_128 L2_LU
+v2_fadd 48 48 32
+v2_fadd 49 49 33
+v2_fadd 50 50 34
+v2_fadd 51 51 35
+v2_movi 37 1
+v2_iadd3 21 21 37 V2_RZ
+v2_isetp 0 21 5 CMP_LT
+v2_bra_to 0 j_lp
+note Stage 2: Deterministic binary-tree reduction across 4 warp slots in SMEM (stride 2 -> 1)
+v2_imadi 40 12 16 V2_RZ
+v2_sts 40 48 0 SZ_128
+v2_bar
+v2_movi 24 2
+tree_lp = v2_pc
+v2_iadd3 25 15 24 V2_RZ
+v2_movi 26 4
+v2_isetp 0 25 26 CMP_LT
+v2_imadi 41 25 512 V2_RZ
+v2_imadi 41 16 16 41
+v2_set_guard 1
+v2_lds 32 41 0 SZ_128
+v2_set_guard 1
+v2_fadd 48 48 32
+v2_set_guard 1
+v2_fadd 49 49 33
+v2_set_guard 1
+v2_fadd 50 50 34
+v2_set_guard 1
+v2_fadd 51 51 35
+v2_sts 40 48 0 SZ_128
+v2_bar
+v2_shr 24 24 1
+v2_isetp 0 24 V2_RZ CMP_GT
+v2_bra_to 0 tree_lp
+note Stage 3: Deterministic inv_sqrt(E) scaling + HMMA.16816 16-way tile finalize -> STG.E.128.NORM
+v2_movi 28 fa2_inv_sqrt head_dim
+v2_fmul 48 48 28
+v2_fmul 49 49 28
+v2_fmul 50 50 28
+v2_fmul 51 51 28
+v2_f2fp_bf16 32 49 48
+v2_f2fp_bf16 33 51 50
+v2_f2fp_bf16 34 49 48
+v2_f2fp_bf16 35 51 50
+v2_movi 29 FA2_ONE
+v2_f2fp_bf16 36 29 29
+v2_f2fp_bf16 37 29 29
+fa2_zero_regs 52 4
+v2_hmma_bf16 52 32 36 52 4
+v2_f2fp_bf16 32 53 52
+v2_f2fp_bf16 33 55 54
+v2_imadw 38 19 2 2
+v2_stg_pol 38 32 FA2_UR_DESC 0 SZ_128 L2_NORM
+v2_exit
+ret v2_end 0
+end

@@ -1,0 +1,186 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/blas/gemm_128x128_oracle.om: Standalone pure-OM-2 CPU f64 reference
+note oracles for SM121 BF16/NVFP4/Ternary training GEMMs and Byte-Traceability Lock 1:
+note   - blas_f64_to_bf16_rne: exact IEEE-754 single-round f64 -> BF16 round-to-nearest-even
+note   - blas_ref_gemm_bf16: BF16-rounded C = A @ B with FP32-accurate FMA accumulation
+note   - blas_ref_splitk_check: deterministic split-K tree reduction check (S=1 vs S=2 vs S=4)
+note   - blas_ref_ternary_pack5 / blas_ref_ternary_unpack5: exact 5-trits/byte base-3 codec
+
+const ORA_F64_SIGN ulong 9223372036854775808
+const ORA_F64_INF ulong 9218868437227405312
+const ORA_F64_QNAN ulong 2251799813685248
+const ORA_F64_IMP1 ulong 4503599627370496
+const ORA_F64_FRAC_MASK ulong 4503599627370495
+const ORA_BF16_LOW45_MASK ulong 35184372088831
+const ORA_BF16_HALF45 ulong 17592186044416
+const ORA_BF16_MIN_SUB_BITS ulong 4008203668359741440
+
+fn ora_bf16_subnorm sign_bit ulong exp64 ulong frac64 ulong to f64
+shift = sub ulong 942 exp64
+sig = or frac64 ORA_F64_IMP1
+q = shr sig shift
+half = shl ulong 1 sub shift 1
+rem_v = and sig sub shl ulong 1 shift 1
+if or gt rem_v half and eq rem_v half eq and q 1 1
+q = add q 1
+end
+if eq q 0
+ret bitcast f64 sign_bit
+end
+unit = bitcast f64 ORA_BF16_MIN_SUB_BITS
+val = mul f64 q unit
+ret bitcast f64 or sign_bit bitcast ulong val
+end
+
+fn ora_bf16_norm sign_bit ulong exp64 ulong frac64 ulong to f64
+low45 = and frac64 ORA_BF16_LOW45_MASK
+m7 = shr frac64 45
+top = or shl exp64 7 m7
+if or gt low45 ORA_BF16_HALF45 and eq low45 ORA_BF16_HALF45 eq and m7 1 1
+top = add top 1
+end
+exp_out = shr top 7
+if ge exp_out 1151
+ret bitcast f64 or sign_bit ORA_F64_INF
+end
+frac_out = shl and top 127 45
+ret bitcast f64 or sign_bit or shl exp_out 52 frac_out
+end
+
+note Exact single-rounding IEEE-754 f64 -> BF16 round-to-nearest-even (returned as f64)
+fn blas_f64_to_bf16_rne x f64 to f64
+bits = bitcast ulong x
+sign_bit = and bits ORA_F64_SIGN
+exp64 = and shr bits 52 2047
+frac64 = and bits ORA_F64_FRAC_MASK
+if eq exp64 2047
+if ne frac64 0
+ret bitcast f64 or bits ORA_F64_QNAN
+end
+ret x
+end
+if ge exp64 1151
+ret bitcast f64 or sign_bit ORA_F64_INF
+end
+if ge exp64 897
+ret ora_bf16_norm sign_bit exp64 frac64
+end
+if ge exp64 889
+ret ora_bf16_subnorm sign_bit exp64 frac64
+end
+ret bitcast f64 sign_bit
+end
+
+fn ora_dot_bf16_f32 a view f64 256 b view f64 256 row_off ulong col ulong k ulong n ulong to f64
+acc = f32 0.0
+for p ulong k bound 16
+av = f32 blas_f64_to_bf16_rne get a add row_off p
+bv = f32 blas_f64_to_bf16_rne get b add mul p n col
+acc = fma av bv acc
+end
+ret f64 acc
+end
+
+note Reference BF16 GEMM (m, n, k <= 16): BF16-rounded inputs, FP32-accurate FMA accumulation
+fn blas_ref_gemm_bf16 a view f64 256 b view f64 256 c edit f64 256 m ulong n ulong k ulong to void
+if or gt m 16 or gt n 16 gt k 16
+ret
+end
+for i ulong m bound 16
+row_off = mul i k
+out_off = mul i n
+for j ulong n bound 16
+v = ora_dot_bf16_f32 view a view b row_off j k n
+put c add out_off j v
+end
+end
+end
+
+fn ora_dot_slice_f64 a view f64 256 b view f64 256 row_off ulong col ulong n ulong rng ulong to f64
+p = shr rng 32
+k_end = and rng 4294967295
+acc = f64 0.0
+while lt p k_end bound 16
+av = blas_f64_to_bf16_rne get a add row_off p
+bv = blas_f64_to_bf16_rne get b add mul p n col
+acc = add acc mul av bv
+p = add p 1
+end
+ret acc
+end
+
+fn ora_splitk_s2 a view f64 256 b view f64 256 row_off ulong col ulong n ulong k ulong to f64
+q2 = div k 2
+s2a = ora_dot_slice_f64 view a view b row_off col n q2
+s2b = ora_dot_slice_f64 view a view b row_off col n or shl q2 32 k
+ret add s2a s2b
+end
+
+fn ora_splitk_s4 a view f64 256 b view f64 256 row_off ulong col ulong n ulong k ulong to f64
+q1 = div k 4
+q2 = div k 2
+q3 = div mul k 3 4
+p0 = ora_dot_slice_f64 view a view b row_off col n q1
+p1 = ora_dot_slice_f64 view a view b row_off col n or shl q1 32 q2
+t01 = add p0 p1
+p2 = ora_dot_slice_f64 view a view b row_off col n or shl q2 32 q3
+p3 = ora_dot_slice_f64 view a view b row_off col n or shl q3 32 k
+ret add t01 add p2 p3
+end
+
+fn ora_splitk_elem_err a view f64 256 b view f64 256 row_off ulong col ulong n ulong k ulong to f64
+s1 = ora_dot_slice_f64 view a view b row_off col n k
+s2 = ora_splitk_s2 view a view b row_off col n k
+s4 = ora_splitk_s4 view a view b row_off col n k
+e12 = fabs sub s1 s2
+e14 = fabs sub s1 s4
+e24 = fabs sub s2 s4
+ret fmax e12 fmax e14 e24
+end
+
+note Verify deterministic split-K tree reduction (S=1 vs S=2 vs S=4 in fixed slice order, Lock 1)
+fn blas_ref_splitk_check a view f64 256 b view f64 256 m ulong n ulong k ulong to f64
+if or gt m 16 or gt n 16 gt k 16
+ret f64 1.0
+end
+max_err = f64 0.0
+for i ulong m bound 16
+row_off = mul i k
+for j ulong n bound 16
+e = ora_splitk_elem_err view a view b row_off j n k
+max_err = fmax max_err e
+end
+end
+ret max_err
+end
+
+fn ora_trit_digit t long to ulong
+if lt t 0
+ret 0
+end
+if gt t 0
+ret 2
+end
+ret 1
+end
+
+note Pack 5 trits (t0..t4 in {-1, 0, +1}) into one base-3 byte in 0..242 (243 states < 256)
+fn blas_ref_ternary_pack5 t0 long t1 long t2 long t3 long t4 long to ulong
+v = ora_trit_digit t4
+v = add mul v 3 ora_trit_digit t3
+v = add mul v 3 ora_trit_digit t2
+v = add mul v 3 ora_trit_digit t1
+ret add mul v 3 ora_trit_digit t0
+end
+
+note Unpack trit idx (0..4) from base-3 packed byte (0..242) to {-1, 0, +1}
+fn blas_ref_ternary_unpack5 packed ulong idx ulong to long
+if or ge packed 243 ge idx 5
+ret 0
+end
+v = packed
+for i ulong idx bound 5
+v = div v 3
+end
+ret sub long rem v 3 1
+end

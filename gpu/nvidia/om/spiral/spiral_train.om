@@ -1,0 +1,2626 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/spiral/spiral_train.om: L2-Pinned Reversible Looped Spiral Training
+note Reference Core & Verification Oracle in standalone pure seeded-Omega (OM-2).
+note Compose after si/directives/om2.om (no om2 directive here).
+note
+note Implements:
+note   1. Pure-Omega f64 sp_exp (Cody-Waite + deg-13 Taylor) and sp_log (range-reduced + Newton).
+note   2. Compact reversible looped spiral geometry (T<=16, D<=16, H<=4, F<=32, L<=8, NP<=4,
+note      LV<=16, G<=8, V<=32) with flat pools sp_w, sp_g, sp_m, sp_v, sp_g_ref and sp_olp.
+note   3. Zero-opa tiled online Flash-Attention-2 forward/backward (sp_fa2_fwd, sp_fa2_bwd)
+note      storing only O[T,D] + LSE[H,T], with Mutant M2 switch sp_mut[1] (sp_mut_fa2_sign).
+note   4. Reversible coupling Y1 = X1 + F(X2), Y2 = X2 + G(Y1):
+note      - Lock 4 bit-exact Q30/Q32 modular-integer invertibility test (sp_q32_inv_test == 0).
+note      - Zero-activation-spill reversible macrobatch grad (sp_rev_macro_grad) storing only
+note        final (Y1, Y2) + LSE per microbatch, with Mutant M1 switch sp_mut[0].
+note   5. Independent unrolled non-reversible f64 reference twin (sp_twin_macro_grad) storing
+note      all intermediate activations and full explicit P[H,T,T] into sp_g_ref, plus
+note      sp_grad_rel_err (< 1e-11 when mutants are off).
+note   6. Quantized gradient cosine check (sp_quant_grad_cos):
+note      - mode 0: BF16 RNE operand rounding (>= 0.999)
+note      - mode 1: Canonical NVFP4 (2D 16x16 UE4M3 weights + 1D block-16 UE4M3 activations/grads
+note                + orthogonal RHT16 + Philox4x32-10 stochastic rounding on backward, >= 0.98).
+
+const SP_MAX_V ulong 32
+const SP_MAX_T ulong 16
+const SP_MAX_D ulong 16
+const SP_MAX_H ulong 4
+const SP_MAX_F ulong 32
+const SP_MAX_L ulong 8
+const SP_MAX_NP ulong 4
+const SP_MAX_LV ulong 16
+const SP_MAX_G ulong 8
+const SP_POOL_P ulong 65536
+const SP_RMS_EPS f64 0.00001
+const SP_FA_TILE ulong 4
+const SP_LSE_SCRATCH ulong 8192
+
+note Shared single-layer scratch offsets inside sp_sc (reused across all LV layers; zero per-layer spill)
+const SC_X1 ulong 0
+const SC_X2 ulong 256
+const SC_DX1 ulong 512
+const SC_DX2 ulong 768
+const SC_A ulong 1024
+const SC_Q ulong 1280
+const SC_K ulong 1536
+const SC_V ulong 1792
+const SC_O ulong 2048
+const SC_DO ulong 2304
+const SC_DQ ulong 2560
+const SC_DK ulong 2816
+const SC_DV ulong 3072
+const SC_DA ulong 3328
+const SC_TMP ulong 3584
+const SC_B ulong 3840
+const SC_HP ulong 4096
+const SC_HA ulong 4608
+const SC_DH ulong 5120
+const SC_HM ulong 5632
+const SC_HN ulong 5888
+const SC_LG ulong 6144
+const SC_S1 ulong 6656
+const SC_S2 ulong 6672
+const SC_SF ulong 6688
+const SC_DHM ulong 6704
+const SC_DHN ulong 6960
+const SC_DLG ulong 7216
+const SC_DB ulong 7728
+
+note Independent unrolled reference twin activation pool offsets inside sp_tw
+const TW_X2 ulong 0
+const TW_S1 ulong 4096
+const TW_A ulong 4352
+const TW_Q ulong 8448
+const TW_K ulong 12544
+const TW_V ulong 16640
+const TW_P ulong 20736
+const TW_O ulong 37120
+const TW_Y1 ulong 41216
+const TW_S2 ulong 45312
+const TW_B ulong 45568
+const TW_HP ulong 49664
+const TW_HA ulong 57856
+const TW_CUR1 ulong 66048
+const TW_CUR2 ulong 66304
+const TW_DY1 ulong 66560
+const TW_DY2 ulong 66816
+const TW_HM ulong 67072
+const TW_HN ulong 67328
+const TW_SF ulong 67584
+const TW_LG ulong 67600
+const TW_DLG ulong 68112
+const TW_DHN ulong 68624
+const TW_DHM ulong 68880
+const TW_DO ulong 69136
+const TW_DQ ulong 69392
+const TW_DK ulong 69648
+const TW_DV ulong 69904
+const TW_DA ulong 70160
+const TW_DB ulong 70416
+const TW_DH ulong 70672
+const TW_TMP ulong 71184
+const TW_DP ulong 71440
+
+note Public parameter, gradient, Adam moment, twin gradient and mutant switch pools
+global sp_w f64 65536
+global sp_g f64 65536
+global sp_m f64 65536
+global sp_v f64 65536
+global sp_g_ref f64 65536
+global sp_g_q f64 65536
+global sp_mut ulong 4
+
+note Configuration slots sp_cfg[0..31]:
+note  0:V 1:T 2:D 3:H 4:F 5:L 6:LP 7:LC 8:NP 9:G 10:E 11:LV 12:LSTR 13:OFF_LAY 14:OFF_GF 15:P
+note  16:ADAM_STEP 17:SEED 18:QMODE(0=f64,1=bf16,2=nvfp4) 19:MB_CUR 20:APP_CUR 21:OP_TAG
+note  22:REF_VALID 23:G_TGT(0=sp_g,1=sp_g_q) 24:PHX_CTR 25:PHX_IDX
+global sp_cfg ulong 32
+global sp_stat ulong 8
+
+note Microbatch token pools [G * T]
+global sp_tok_x ulong 128
+global sp_tok_y ulong 128
+
+note Reversible forward state: ONLY final (Y1, Y2) [G*T*D] and LSE [G*LV*H*T] + 64 scratch
+global sp_rev_y1 f64 2048
+global sp_rev_y2 f64 2048
+global sp_lse f64 8256
+
+note Single shared scratch pool reused by every reversible layer
+global sp_sc f64 8192
+global sp_fa_d f64 16
+global sp_fa_s f64 4
+global sp_faux f64 8
+
+note Lock 4 Q30/Q32 modular-integer reversible streams
+global sp_q1 uint 256
+global sp_q2 uint 256
+global sp_q1_0 uint 256
+global sp_q2_0 uint 256
+
+note Quantization (Philox4x32-10, RHT16, NVFP4 2D/1D tile staging)
+global sp_phx uint 4
+global sp_rht_s f64 16
+global sp_blk f64 16
+global sp_qm_a f64 512
+global sp_qm_b f64 512
+
+note Independent unrolled reference twin activation pool (with explicit P[LV, H, T, T])
+global sp_tw f64 131072
+
+note ============================================================================
+note Section 1: Pure-Omega Math Helpers (sp_exp, sp_log) & Utility Primitives
+note ============================================================================
+
+fn sp_minu a ulong b ulong to ulong
+if lt a b
+ret a
+end
+ret b
+end
+
+fn sp_smx x ulong to ulong
+z = add x 11400714819323198485
+z = mul xor z shr z 30 13787848793156543929
+z = mul xor z shr z 27 10723151780598845931
+ret xor z shr z 31
+end
+
+fn sp_popcnt32 v uint to ulong
+c = ulong 0
+x = v
+for i ulong 32
+if ne and x 1 0
+c = add c 1
+end
+x = shr x 1
+end
+ret c
+end
+
+note sp_exp: Cody-Waite reduction by ln2 (hi + lo) + degree-13 Taylor Horner, exact to < 1e-15.
+fn sp_exp x f64 to f64
+if ne x x
+ret x
+end
+if lt x -708.0f64
+ret 0.0f64
+end
+y = fmin x 709.0f64
+t = mul y 1.4426950408889634f64
+n = long 0
+if ge t 0.0f64
+n = long add t 0.5f64
+else
+n = long sub t 0.5f64
+end
+t = f64 n
+y = sub sub y mul t 0.6931471803691238f64 mul t 1.9082149292705877e-10f64
+t = 1.0f64
+for j ulong 13
+t = add 1.0f64 div mul y t f64 sub 13 j
+end
+ret mul t bitcast f64 shl ulong add n 1023 52
+end
+
+note sp_log: range reduction to [sqrt(1/2), sqrt(2)] + Newton-Raphson refinement via sp_exp.
+fn sp_log x f64 to f64
+if ne x x
+ret x
+end
+if lt x 0.0f64
+ret bitcast f64 ulong 9221120237041090560
+end
+if eq x 0.0f64
+ret bitcast f64 ulong 18442240474082181120
+end
+b = bitcast ulong x
+if eq b 9218868437227405312
+ret x
+end
+e = long 0
+if lt b 4503599627370496
+b = bitcast ulong mul x 18014398509481984.0f64
+e = long -54
+end
+e = add e sub long shr b 52 1023
+m = bitcast f64 or and b 4503599627370495 4607182418800017408
+if gt m 1.4142135623730951f64
+m = mul m 0.5f64
+e = add e 1
+end
+s = div sub m 1.0f64 add m 1.0f64
+y = mul mul 2.0f64 s add 1.0f64 div mul s s 3.0f64
+for k ulong 3
+ey = sp_exp y
+y = add y div sub m ey ey
+end
+fe = f64 e
+ret add mul fe 0.6931471803691238f64 add y mul fe 1.9082149292705877e-10f64
+end
+
+note ============================================================================
+note Section 2: Model Configuration, Looped Core Map, Offsets & Initialization
+note ============================================================================
+
+fn sp_set_mut slot ulong val ulong to void
+if lt slot 4
+put sp_mut slot val
+end
+end
+
+fn sp_clear_mut to void
+for i ulong 4
+put sp_mut i 0
+end
+end
+
+fn sp_mut_fa2_sign to ulong
+ret get sp_mut 1
+end
+
+note sp_olp: maps virtual layer application app in 0..LV-1 to physical parameter layer 0..L-1.
+note prelude 0..LP-1, core LP + ((app - LP) % LC) repeated NP times, coda LP+LC..L-1.
+fn sp_olp app ulong to ulong
+np = get sp_cfg 8
+lc = get sp_cfg 7
+if or le np 1 eq lc 0
+ret app
+end
+lp = get sp_cfg 6
+if lt app lp
+ret app
+end
+j = sub app lp
+if lt j mul lc np
+ret add lp rem j lc
+end
+ret sub app mul lc sub np 1
+end
+
+fn sp_set_geom v ulong t ulong d ulong h ulong f ulong l ulong to void
+put sp_cfg 0 v
+put sp_cfg 1 t
+put sp_cfg 2 d
+put sp_cfg 3 h
+put sp_cfg 4 f
+put sp_cfg 5 l
+put sp_cfg 22 0
+end
+
+fn sp_geom_ok to ulong
+v = get sp_cfg 0
+if or eq v 0 gt v SP_MAX_V
+ret 0
+end
+t = get sp_cfg 1
+if or eq t 0 gt t SP_MAX_T
+ret 0
+end
+d = get sp_cfg 2
+h = get sp_cfg 3
+if or eq d 0 gt d SP_MAX_D
+ret 0
+end
+if or eq h 0 gt h SP_MAX_H
+ret 0
+end
+if ne rem d h 0
+ret 0
+end
+f = get sp_cfg 4
+if or eq f 0 gt f SP_MAX_F
+ret 0
+end
+l = get sp_cfg 5
+if or eq l 0 gt l SP_MAX_L
+ret 0
+end
+ret 1
+end
+
+fn sp_cfg_layout to ulong
+d = get sp_cfg 2
+f = get sp_cfg 4
+lstr = add add mul 2 d mul 4 mul d d mul 2 mul d f
+off_lay = mul get sp_cfg 0 d
+off_gf = add off_lay mul get sp_cfg 5 lstr
+p = add off_gf d
+if gt p SP_POOL_P
+ret 0
+end
+put sp_cfg 12 lstr
+put sp_cfg 13 off_lay
+put sp_cfg 14 off_gf
+put sp_cfg 15 p
+put sp_cfg 16 0
+put sp_cfg 18 0
+put sp_cfg 22 0
+put sp_cfg 23 0
+ret 1
+end
+
+note sp_set_spiral: configure LP, LC, NP, G and compute derived strides/offsets. Returns 1 if valid.
+fn sp_set_spiral lp ulong lc ulong np ulong g ulong to ulong
+if eq sp_geom_ok 0
+ret 0
+end
+if or eq np 0 gt np SP_MAX_NP
+ret 0
+end
+if or eq g 0 gt g SP_MAX_G
+ret 0
+end
+l = get sp_cfg 5
+if gt add lp lc l
+ret 0
+end
+lv = l
+if and gt np 1 gt lc 0
+lv = add l mul lc sub np 1
+end
+if gt lv SP_MAX_LV
+ret 0
+end
+put sp_cfg 6 lp
+put sp_cfg 7 lc
+put sp_cfg 8 np
+put sp_cfg 9 g
+put sp_cfg 10 div get sp_cfg 2 get sp_cfg 3
+put sp_cfg 11 lv
+ret sp_cfg_layout
+end
+
+fn sp_param_count to ulong
+ret get sp_cfg 15
+end
+
+fn sp_off_lay l ulong to ulong
+ret add get sp_cfg 13 mul l get sp_cfg 12
+end
+
+fn sp_off_g1 l ulong to ulong
+ret sp_off_lay l
+end
+
+fn sp_off_wq l ulong to ulong
+ret add sp_off_lay l get sp_cfg 2
+end
+
+fn sp_off_wk l ulong to ulong
+d = get sp_cfg 2
+ret add add sp_off_lay l d mul d d
+end
+
+fn sp_off_wv l ulong to ulong
+d = get sp_cfg 2
+ret add add sp_off_lay l d mul 2 mul d d
+end
+
+fn sp_off_wo l ulong to ulong
+d = get sp_cfg 2
+ret add add sp_off_lay l d mul 3 mul d d
+end
+
+fn sp_off_g2 l ulong to ulong
+d = get sp_cfg 2
+ret add add sp_off_lay l d mul 4 mul d d
+end
+
+fn sp_off_w1 l ulong to ulong
+d = get sp_cfg 2
+ret add add sp_off_lay l mul 2 d mul 4 mul d d
+end
+
+fn sp_off_w2 l ulong to ulong
+d = get sp_cfg 2
+f = get sp_cfg 4
+ret add add add sp_off_lay l mul 2 d mul 4 mul d d mul d f
+end
+
+fn sp_off_gf to ulong
+ret get sp_cfg 14
+end
+
+fn sp_init_rht16 seed ulong to void
+for i ulong 16
+h = sp_smx add seed add i 7777
+if eq and h 1 0
+put sp_rht_s i 1.0f64
+else
+put sp_rht_s i -1.0f64
+end
+end
+end
+
+fn sp_zero_g to void
+p = get sp_cfg 15
+for i ulong p
+put sp_g i 0.0f64
+end
+end
+
+fn sp_zero_g_ref to void
+p = get sp_cfg 15
+for i ulong p
+put sp_g_ref i 0.0f64
+end
+end
+
+fn sp_zero_g_q to void
+p = get sp_cfg 15
+for i ulong p
+put sp_g_q i 0.0f64
+end
+end
+
+fn sp_g_add idx ulong val f64 to void
+if eq get sp_cfg 23 0
+put sp_g idx add get sp_g idx val
+else
+put sp_g_q idx add get sp_g_q idx val
+end
+end
+
+fn sp_w_fill o ulong n ulong v f64 to void
+for i ulong n
+put sp_w add o i v
+end
+end
+
+fn sp_w_scale o ulong n ulong s f64 to void
+for i ulong n
+idx = add o i
+put sp_w idx mul get sp_w idx s
+end
+end
+
+note sp_init_weights: deterministic uniform weight init with residual output scaling 1/sqrt(2*LV).
+fn sp_init_weights seed ulong to void
+put sp_cfg 17 seed
+put sp_cfg 22 0
+put sp_cfg 16 0
+p = get sp_cfg 15
+for i ulong p
+r = mul f64 shr sp_smx add seed i 11 1.1102230246251565e-16f64
+put sp_w i mul sub add r r 1.0f64 0.034641016151377546f64
+put sp_g i 0.0f64
+put sp_g_ref i 0.0f64
+put sp_g_q i 0.0f64
+put sp_m i 0.0f64
+put sp_v i 0.0f64
+end
+d = get sp_cfg 2
+f = get sp_cfg 4
+ri = div 1.0f64 fsqrt f64 mul 2 get sp_cfg 11
+for l ulong get sp_cfg 5
+sp_w_fill sp_off_g1 l d 1.0f64
+sp_w_fill sp_off_g2 l d 1.0f64
+sp_w_scale sp_off_wo l mul d d ri
+sp_w_scale sp_off_w2 l mul d f ri
+end
+sp_w_fill sp_off_gf d 1.0f64
+sp_init_rht16 seed
+end
+
+fn sp_init_tokens seed ulong to void
+v = get sp_cfg 0
+n = mul get sp_cfg 9 get sp_cfg 1
+for i ulong n
+hx = sp_smx add seed add mul i 2 100003
+hy = sp_smx add seed add mul i 2 100004
+put sp_tok_x i rem hx v
+put sp_tok_y i rem hy v
+end
+put sp_cfg 22 0
+end
+
+note sp_init_default: canonical test-scale spiral config (V=16, T=8, D=16, H=4, F=32,
+note L=4, LP=1, LC=2, NP=4 -> LV=10, G=4). Returns total parameter count P.
+fn sp_init_default seed ulong to ulong
+sp_set_geom 16 8 16 4 32 4
+ok = sp_set_spiral 1 2 4 4
+if eq ok 0
+ret 0
+end
+sp_clear_mut
+sp_init_weights seed
+sp_init_tokens add seed 991
+ret get sp_cfg 15
+end
+
+fn sp_ensure_init to void
+if eq get sp_cfg 15 0
+put sp_stat 7 sp_init_default 42
+end
+end
+
+note ============================================================================
+note Section 3: BF16 RNE, Philox4x32-10, UE4M3, E2M1 RNE/SR, RHT16, NVFP4 Tiles
+note ============================================================================
+
+fn sp_bf16_rne x f64 to f64
+u = bitcast uint f32 x
+mag = and u 2147483647
+if ge mag 2139095040
+ret x
+end
+lsb = and shr u 16 1
+u2 = and add u add 32767 lsb 4294901760
+ret f64 bitcast f32 u2
+end
+
+note Philox4x32-10 (Salmon et al. 2011): fills sp_phx[0..3] with 4 independent 32-bit words.
+fn sp_philox4x32 c0 uint c1 uint k0 uint k1 uint to void
+a0 = c0
+a1 = c1
+a2 = uint 0
+a3 = uint 0
+kk0 = k0
+kk1 = k1
+for r ulong 10
+p0 = mul ulong a0 3528531795
+p1 = mul ulong a2 3449720151
+a0 = xor xor uint shr p1 32 a1 kk0
+a1 = uint and p1 4294967295
+a2 = xor xor uint shr p0 32 a3 kk1
+a3 = uint and p0 4294967295
+kk0 = add kk0 2654435769
+kk1 = add kk1 3144134277
+end
+put sp_phx 0 a0
+put sp_phx 1 a1
+put sp_phx 2 a2
+put sp_phx 3 a3
+end
+
+fn sp_phx_reset tag ulong to void
+put sp_cfg 21 tag
+put sp_cfg 24 0
+put sp_cfg 25 4
+end
+
+fn sp_phx_refill to void
+ctr = get sp_cfg 24
+c0 = uint and ctr 4294967295
+t1 = mul get sp_cfg 19 65536
+t2 = add t1 mul get sp_cfg 20 256
+c1 = uint and add t2 get sp_cfg 21 4294967295
+sd = get sp_cfg 17
+k0 = uint and sd 4294967295
+k1 = uint and shr sd 32 4294967295
+sp_philox4x32 c0 c1 k0 k1
+put sp_cfg 24 add ctr 1
+end
+
+note Draw next uniform f64 in [0, 1) from the Philox4x32-10 stream.
+fn sp_phx_next_u01 to f64
+idx = get sp_cfg 25
+if ge idx 4
+sp_phx_refill
+idx = ulong 0
+end
+w = get sp_phx idx
+put sp_cfg 25 add idx 1
+ret div f64 w 4294967296.0f64
+end
+
+fn sp_rne_int x f64 to long
+n = long x
+fr = sub x f64 n
+if gt fr 0.5f64
+ret add n 1
+end
+if eq fr 0.5f64
+if eq and ulong n 1 1
+ret add n 1
+end
+end
+ret n
+end
+
+note Exact UE4M3 scale quantization (bias 7, 3 mantissa bits, codes 0..126, max 448.0).
+fn sp_ue4m3_quant x f64 to f64
+if ne x x
+ret 0.0f64
+end
+if le x 0.0f64
+ret 0.0f64
+end
+if ge x 448.0f64
+ret 448.0f64
+end
+if lt x 0.015625f64
+r = sp_rne_int mul x 512.0f64
+ret div f64 r 512.0f64
+end
+b = bitcast ulong x
+e = sub long shr b 52 1023
+step = bitcast f64 shl ulong add sub e 3 1023 52
+r = sp_rne_int div x step
+ret fmin mul f64 r step 448.0f64
+end
+
+note Exact OCP MX E2M1 round-to-nearest-even: {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+fn sp_e2m1_rne x f64 to f64
+ax = fabs x
+q = 6.0f64
+if lt ax 0.25f64
+q = 0.0f64
+else
+if eq ax 0.25f64
+q = 0.0f64
+else
+if lt ax 0.75f64
+q = 0.5f64
+else
+if le ax 1.25f64
+q = 1.0f64
+else
+if lt ax 1.75f64
+q = 1.5f64
+else
+if le ax 2.5f64
+q = 2.0f64
+else
+if lt ax 3.5f64
+q = 3.0f64
+else
+if le ax 5.0f64
+q = 4.0f64
+end
+end
+end
+end
+end
+end
+end
+end
+if lt x 0.0f64
+ret neg q
+end
+ret q
+end
+
+note Unbiased E2M1 stochastic rounding using uniform u in [0, 1) from Philox4x32-10.
+fn sp_e2m1_sr x f64 u f64 to f64
+ax = fabs x
+q = 6.0f64
+if lt ax 6.0f64
+lo = 4.0f64
+hi = 6.0f64
+if lt ax 0.5f64
+lo = 0.0f64
+hi = 0.5f64
+else
+if lt ax 1.0f64
+lo = 0.5f64
+hi = 1.0f64
+else
+if lt ax 1.5f64
+lo = 1.0f64
+hi = 1.5f64
+else
+if lt ax 2.0f64
+lo = 1.5f64
+hi = 2.0f64
+else
+if lt ax 3.0f64
+lo = 2.0f64
+hi = 3.0f64
+else
+if lt ax 4.0f64
+lo = 3.0f64
+hi = 4.0f64
+end
+end
+end
+end
+end
+end
+p = div sub ax lo sub hi lo
+if lt u p
+q = hi
+else
+q = lo
+end
+end
+if lt x 0.0f64
+ret neg q
+end
+ret q
+end
+
+fn sp_rht_stage st ulong to void
+i = ulong 0
+while lt i 16 bound 16
+j = ulong 0
+while lt j st bound 16
+p = add i j
+q = add p st
+a = get sp_blk p
+b = get sp_blk q
+put sp_blk p add a b
+put sp_blk q sub a b
+j = add j 1
+end
+i = add i mul 2 st
+end
+end
+
+note Orthogonal RHT16 in-place on sp_blk[0..15]: diag(sp_rht_s) then normalized 16-pt FWHT.
+fn sp_rht16_vec to void
+if eq get sp_rht_s 0 0.0f64
+sp_init_rht16 42
+end
+for i ulong 16
+put sp_blk i mul get sp_blk i get sp_rht_s i
+end
+sp_rht_stage 1
+sp_rht_stage 2
+sp_rht_stage 4
+sp_rht_stage 8
+for i2 ulong 16
+put sp_blk i2 mul get sp_blk i2 0.25f64
+end
+end
+
+fn sp_qw2d_row_amax base ulong nb ulong nend ulong to f64
+am = 0.0f64
+c = nb
+while lt c nend bound 16
+am = fmax am fabs get sp_w add base c
+c = add c 1
+end
+ret am
+end
+
+fn sp_qw2d_amax w_off ulong n ulong kb ulong nb ulong kend ulong nend ulong to f64
+am = 0.0f64
+r = kb
+while lt r kend bound 16
+am = fmax am sp_qw2d_row_amax add w_off mul r n nb nend
+r = add r 1
+end
+ret am
+end
+
+fn sp_qw2d_row_apply w_off ulong row_idx ulong nb ulong nend ulong to void
+seff = get sp_faux 1
+c = nb
+while lt c nend bound 16
+idx = add row_idx c
+qv = 0.0f64
+if gt seff 0.0f64
+qv = mul sp_e2m1_rne div get sp_w add w_off idx seff seff
+end
+put sp_qm_b idx qv
+c = add c 1
+end
+end
+
+fn sp_qw2d_apply w_off ulong n ulong kb ulong nb ulong kend ulong nend ulong to void
+r = kb
+while lt r kend bound 16
+sp_qw2d_row_apply w_off mul r n nb nend
+r = add r 1
+end
+end
+
+note Quantize one 2D tile [kb..kend, nb..nend] of sp_w[w_off] into sp_qm_b with UE4M3 + E2M1 RNE.
+fn sp_qw2d_tile w_off ulong n ulong kb ulong nb ulong k ulong to void
+kend = sp_minu add kb 16 k
+nend = sp_minu add nb 16 n
+am = sp_qw2d_amax w_off n kb nb kend nend
+st = get sp_faux 0
+put sp_faux 1 mul st sp_ue4m3_quant div div am 6.0f64 st
+sp_qw2d_apply w_off n kb nb kend nend
+end
+
+note Quantize full weight matrix [k, n] at sp_w[w_off] into sp_qm_b with 2D 16x16 NVFP4 scales.
+fn sp_quant_w_2d w_off ulong k ulong n ulong to void
+tot = mul k n
+tam = 0.0f64
+for i ulong tot
+tam = fmax tam fabs get sp_w add w_off i
+end
+if eq tam 0.0f64
+for j ulong tot
+put sp_qm_b j 0.0f64
+end
+ret
+end
+put sp_faux 0 div tam 2688.0f64
+kb = ulong 0
+while lt kb k bound 4
+nb = ulong 0
+while lt nb n bound 4
+sp_qw2d_tile w_off n kb nb k
+nb = add nb 16
+end
+kb = add kb 16
+end
+end
+
+fn sp_qa1d_amax x_off ulong base ulong cb ulong ce ulong to f64
+am = 0.0f64
+c = cb
+while lt c ce bound 16
+am = fmax am fabs get sp_sc add x_off add base c
+c = add c 1
+end
+ret am
+end
+
+fn sp_qa1d_apply x_off ulong base ulong cb ulong ce ulong sr ulong to void
+seff = get sp_faux 1
+c = cb
+while lt c ce bound 16
+qv = 0.0f64
+if gt seff 0.0f64
+scv = div get sp_sc add x_off add base c seff
+if eq sr 0
+qv = mul sp_e2m1_rne scv seff
+else
+qv = mul sp_e2m1_sr scv sp_phx_next_u01 seff
+end
+end
+put sp_qm_a add base c qv
+c = add c 1
+end
+end
+
+note Quantize one 1D block-16 slice of sp_sc[x_off] row r at [cb..ce) into sp_qm_a. sr: 0=RNE, 1=Philox SR.
+fn sp_qa1d_blk x_off ulong cols ulong r ulong cb ulong sr ulong to void
+ce = sp_minu add cb 16 cols
+base = mul r cols
+am = sp_qa1d_amax x_off base cb ce
+st = get sp_faux 0
+put sp_faux 1 mul st sp_ue4m3_quant div div am 6.0f64 st
+sp_qa1d_apply x_off base cb ce sr
+end
+
+note Quantize [rows, cols] at sp_sc[x_off] into sp_qm_a with 1D block-16 NVFP4 (RNE or Philox SR).
+fn sp_quant_a_1d x_off ulong rows ulong cols ulong sr ulong to void
+tot = mul rows cols
+tam = 0.0f64
+for i ulong tot
+tam = fmax tam fabs get sp_sc add x_off i
+end
+if eq tam 0.0f64
+for j ulong tot
+put sp_qm_a j 0.0f64
+end
+ret
+end
+put sp_faux 0 div tam 2688.0f64
+for r ulong rows
+cb = ulong 0
+while lt cb cols bound 4
+sp_qa1d_blk x_off cols r cb sr
+cb = add cb 16
+end
+end
+end
+
+note Transform each column c of [m, ncols] at sp_sc[x_off] with RHT16 (zero-padded to 16)
+note into dst (0=sp_qm_a, 1=sp_qm_b), then apply 1D block-16 NVFP4 + Philox SR.
+fn sp_rht_pack x_off ulong m ulong ncols ulong dst ulong to void
+for c ulong ncols
+for i ulong 16
+if lt i m
+put sp_blk i get sp_sc add x_off add mul i ncols c
+else
+put sp_blk i 0.0f64
+end
+end
+sp_rht16_vec
+base = mul c 16
+for j ulong 16
+if eq dst 0
+put sp_qm_a add base j get sp_blk j
+else
+put sp_qm_b add base j get sp_blk j
+end
+end
+end
+end
+
+fn sp_rht_quant_row c ulong dst ulong to void
+base = mul c 16
+am = 0.0f64
+for j ulong 16
+v = 0.0f64
+if eq dst 0
+v = get sp_qm_a add base j
+else
+v = get sp_qm_b add base j
+end
+am = fmax am fabs v
+end
+st = get sp_faux 0
+seff = mul st sp_ue4m3_quant div div am 6.0f64 st
+for j2 ulong 16
+v2 = 0.0f64
+if eq dst 0
+v2 = get sp_qm_a add base j2
+else
+v2 = get sp_qm_b add base j2
+end
+qv = 0.0f64
+if gt seff 0.0f64
+if eq dst 0
+qv = mul sp_e2m1_rne div v2 seff seff
+else
+qv = mul sp_e2m1_sr div v2 seff sp_phx_next_u01 seff
+end
+end
+if eq dst 0
+put sp_qm_a add base j2 qv
+else
+put sp_qm_b add base j2 qv
+end
+end
+end
+
+fn sp_quant_rht_cols x_off ulong m ulong ncols ulong dst ulong to void
+sp_rht_pack x_off m ncols dst
+tot = mul ncols 16
+tam = 0.0f64
+for i ulong tot
+v = 0.0f64
+if eq dst 0
+v = get sp_qm_a i
+else
+v = get sp_qm_b i
+end
+tam = fmax tam fabs v
+end
+if eq tam 0.0f64
+ret
+end
+put sp_faux 0 div tam 2688.0f64
+for c ulong ncols
+sp_rht_quant_row c dst
+end
+end
+
+note ============================================================================
+note Section 4: Quant-Aware Linear GEMMs (Fwd / Dgrad / Wgrad) & RMSNorm
+note ============================================================================
+
+fn sp_sc_zero o ulong n ulong to void
+for i ulong n
+put sp_sc add o i 0.0f64
+end
+end
+
+fn sp_sc_copy dst ulong src ulong n ulong to void
+for i ulong n
+put sp_sc add dst i get sp_sc add src i
+end
+end
+
+fn sp_sc_addto dst ulong src ulong n ulong to void
+for i ulong n
+v = get sp_sc add dst i
+v = add v get sp_sc add src i
+put sp_sc add dst i v
+end
+end
+
+fn sp_sc_subto dst ulong src ulong n ulong to void
+for i ulong n
+v = get sp_sc add dst i
+v = sub v get sp_sc add src i
+put sp_sc add dst i v
+end
+end
+
+fn sp_lin_fwd_f64_row xb ulong w_off ulong yb ulong k ulong n ulong to void
+for c ulong n
+s = 0.0f64
+for p ulong k
+xv = get sp_sc add xb p
+wv = get sp_w add w_off add mul p n c
+s = add s mul xv wv
+end
+put sp_sc add yb c s
+end
+end
+
+fn sp_lin_fwd_f64 x_off ulong w_off ulong y_off ulong m ulong k ulong n ulong to void
+for r ulong m
+sp_lin_fwd_f64_row add x_off mul r k w_off add y_off mul r n k n
+end
+end
+
+fn sp_lin_fwd_bf16_row xb ulong w_off ulong yb ulong k ulong n ulong to void
+for c ulong n
+s = 0.0f64
+for p ulong k
+xv = sp_bf16_rne get sp_sc add xb p
+wv = sp_bf16_rne get sp_w add w_off add mul p n c
+s = add s mul xv wv
+end
+put sp_sc add yb c s
+end
+end
+
+fn sp_lin_fwd_bf16 x_off ulong w_off ulong y_off ulong m ulong k ulong n ulong to void
+for r ulong m
+sp_lin_fwd_bf16_row add x_off mul r k w_off add y_off mul r n k n
+end
+end
+
+fn sp_lin_fwd_nv_row xb ulong yb ulong k ulong n ulong to void
+for c ulong n
+s = 0.0f64
+for p ulong k
+xv = get sp_qm_a add xb p
+wv = get sp_qm_b add mul p n c
+s = add s mul xv wv
+end
+put sp_sc add yb c s
+end
+end
+
+fn sp_lin_fwd_nvfp4 x_off ulong w_off ulong y_off ulong m ulong k ulong n ulong to void
+sp_quant_a_1d x_off m k 0
+sp_quant_w_2d w_off k n
+for r ulong m
+sp_lin_fwd_nv_row mul r k add y_off mul r n k n
+end
+end
+
+fn sp_lin_fwd x_off ulong w_off ulong y_off ulong m ulong k ulong n ulong to void
+qm = get sp_cfg 18
+if eq qm 0
+sp_lin_fwd_f64 x_off w_off y_off m k n
+ret
+end
+if eq qm 1
+sp_lin_fwd_bf16 x_off w_off y_off m k n
+ret
+end
+sp_lin_fwd_nvfp4 x_off w_off y_off m k n
+end
+
+fn sp_lin_dg_f64_row w_off ulong dyb ulong dxb ulong k ulong n ulong to void
+for p ulong k
+wb = add w_off mul p n
+s = 0.0f64
+for c ulong n
+dv = get sp_sc add dyb c
+wv = get sp_w add wb c
+s = add s mul dv wv
+end
+v = add get sp_sc add dxb p s
+put sp_sc add dxb p v
+end
+end
+
+fn sp_lin_dg_f64 w_off ulong dy_off ulong dx_off ulong m ulong k ulong n ulong to void
+for r ulong m
+sp_lin_dg_f64_row w_off add dy_off mul r n add dx_off mul r k k n
+end
+end
+
+fn sp_lin_dg_bf16_row w_off ulong dyb ulong dxb ulong k ulong n ulong to void
+for p ulong k
+wb = add w_off mul p n
+s = 0.0f64
+for c ulong n
+dv = sp_bf16_rne get sp_sc add dyb c
+wv = sp_bf16_rne get sp_w add wb c
+s = add s mul dv wv
+end
+v = add get sp_sc add dxb p s
+put sp_sc add dxb p v
+end
+end
+
+fn sp_lin_dg_bf16 w_off ulong dy_off ulong dx_off ulong m ulong k ulong n ulong to void
+for r ulong m
+sp_lin_dg_bf16_row w_off add dy_off mul r n add dx_off mul r k k n
+end
+end
+
+fn sp_lin_dg_nv_row dyb ulong dxb ulong k ulong n ulong to void
+for p ulong k
+wb = mul p n
+s = 0.0f64
+for c ulong n
+dv = get sp_qm_a add dyb c
+wv = get sp_qm_b add wb c
+s = add s mul dv wv
+end
+v = add get sp_sc add dxb p s
+put sp_sc add dxb p v
+end
+end
+
+fn sp_lin_dg_nvfp4 w_off ulong dy_off ulong dx_off ulong m ulong k ulong n ulong to void
+sp_phx_reset add 10 rem w_off 97
+sp_quant_a_1d dy_off m n 1
+sp_quant_w_2d w_off k n
+for r ulong m
+sp_lin_dg_nv_row mul r n add dx_off mul r k k n
+end
+end
+
+note Dgrad: accumulates dX += dY @ W^T into sp_sc[dx_off].
+fn sp_lin_dgrad w_off ulong dy_off ulong dx_off ulong m ulong k ulong n ulong to void
+qm = get sp_cfg 18
+if eq qm 0
+sp_lin_dg_f64 w_off dy_off dx_off m k n
+ret
+end
+if eq qm 1
+sp_lin_dg_bf16 w_off dy_off dx_off m k n
+ret
+end
+sp_lin_dg_nvfp4 w_off dy_off dx_off m k n
+end
+
+fn sp_lin_wg_f64_dot xc ulong yc ulong m ulong k ulong n ulong to f64
+s = 0.0f64
+for r ulong m
+xv = get sp_sc add xc mul r k
+dv = get sp_sc add yc mul r n
+s = add s mul xv dv
+end
+ret s
+end
+
+fn sp_lin_wg_f64 x_off ulong dy_off ulong w_off ulong m ulong k ulong n ulong to void
+for p ulong k
+for c ulong n
+s = sp_lin_wg_f64_dot add x_off p add dy_off c m k n
+sp_g_add add w_off add mul p n c s
+end
+end
+end
+
+fn sp_lin_wg_bf16_dot xc ulong yc ulong m ulong k ulong n ulong to f64
+s = 0.0f64
+for r ulong m
+xv = sp_bf16_rne get sp_sc add xc mul r k
+dv = sp_bf16_rne get sp_sc add yc mul r n
+s = add s mul xv dv
+end
+ret s
+end
+
+fn sp_lin_wg_bf16 x_off ulong dy_off ulong w_off ulong m ulong k ulong n ulong to void
+for p ulong k
+for c ulong n
+s = sp_lin_wg_bf16_dot add x_off p add dy_off c m k n
+sp_g_add add w_off add mul p n c s
+end
+end
+end
+
+fn sp_lin_wg_nv_p w_off ulong p ulong n ulong to void
+ab = mul p 16
+for c ulong n
+bb = mul c 16
+s = 0.0f64
+for q ulong 16
+xv = get sp_qm_a add ab q
+dv = get sp_qm_b add bb q
+s = add s mul xv dv
+end
+sp_g_add add w_off add mul p n c s
+end
+end
+
+fn sp_lin_wg_nvfp4 x_off ulong dy_off ulong w_off ulong m ulong k ulong n ulong to void
+sp_phx_reset add 110 rem w_off 97
+sp_quant_rht_cols x_off m k 0
+sp_phx_reset add 210 rem w_off 97
+sp_quant_rht_cols dy_off m n 1
+for p ulong k
+sp_lin_wg_nv_p w_off p n
+end
+end
+
+note Wgrad: accumulates dW += X^T @ dY into sp_g (or sp_g_q) at w_off.
+fn sp_lin_wgrad x_off ulong dy_off ulong w_off ulong m ulong k ulong n ulong to void
+qm = get sp_cfg 18
+if eq qm 0
+sp_lin_wg_f64 x_off dy_off w_off m k n
+ret
+end
+if eq qm 1
+sp_lin_wg_bf16 x_off dy_off w_off m k n
+ret
+end
+sp_lin_wg_nvfp4 x_off dy_off w_off m k n
+end
+
+fn sp_rms_ss x_off ulong to f64
+d = get sp_cfg 2
+ss = 0.0f64
+for i ulong d
+v = get sp_sc add x_off i
+ss = add ss mul v v
+end
+ret fsqrt add div ss f64 d SP_RMS_EPS
+end
+
+note RMSNorm forward on [T, D]: y[t,d] = (x[t,d]/s[t]) * g[d], s[t] = sqrt(mean(x^2)+eps).
+fn sp_rms_row x_off ulong g_off ulong y_off ulong s_idx ulong to void
+d = get sp_cfg 2
+s = sp_rms_ss x_off
+put sp_sc s_idx s
+for j ulong d
+nv = div get sp_sc add x_off j s
+gv = get sp_w add g_off j
+put sp_sc add y_off j mul nv gv
+end
+end
+
+fn sp_rms_fwd x_off ulong g_off ulong y_off ulong s_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+for r ulong t
+ro = mul r d
+sp_rms_row add x_off ro g_off add y_off ro add s_off r
+end
+end
+
+fn sp_rms_bwd_c x_off ulong g_off ulong dy_off ulong s f64 to f64
+d = get sp_cfg 2
+cc = 0.0f64
+for i ulong d
+nv = div get sp_sc add x_off i s
+dy = get sp_sc add dy_off i
+dn = mul dy get sp_w add g_off i
+cc = add cc mul dn nv
+end
+ret div cc f64 d
+end
+
+fn sp_rms_bwd_el xp ulong gp ulong dyp ulong dxp ulong to void
+s = get sp_faux 2
+cc = get sp_faux 3
+nv = div get sp_sc xp s
+dy = get sp_sc dyp
+sp_g_add gp mul dy nv
+dn = mul dy get sp_w gp
+dx = div sub dn mul nv cc s
+old = get sp_sc dxp
+put sp_sc dxp add old dx
+end
+
+note RMSNorm backward for row r: accumulates dg into sp_g/sp_g_q and adds dx into sp_sc[dx_off].
+fn sp_rms_bwd_row x_off ulong g_off ulong s_idx ulong dy_off ulong dx_off ulong to void
+d = get sp_cfg 2
+s = get sp_sc s_idx
+put sp_faux 2 s
+put sp_faux 3 sp_rms_bwd_c x_off g_off dy_off s
+for j ulong d
+sp_rms_bwd_el add x_off j add g_off j add dy_off j add dx_off j
+end
+end
+
+fn sp_rms_bwd x_off ulong g_off ulong s_off ulong dy_off ulong dx_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+for r ulong t
+ro = mul r d
+sp_rms_bwd_row add x_off ro g_off add s_off r add dy_off ro add dx_off ro
+end
+end
+
+note ============================================================================
+note Section 5: Zero-opa Online Flash-Attention-2 Forward & Backward
+note ============================================================================
+
+fn sp_head_off base ulong row ulong h ulong to ulong
+d = get sp_cfg 2
+e = get sp_cfg 10
+ret add add base mul row d mul h e
+end
+
+fn sp_fa2_dot qo ulong ko ulong e ulong to f64
+s = 0.0f64
+for c ulong e
+qv = get sp_sc add qo c
+kv = get sp_sc add ko c
+s = add s mul qv kv
+end
+ret s
+end
+
+fn sp_fa2_tile_sc h ulong i ulong c0 ulong nk ulong to f64
+e = get sp_cfg 10
+isq = div 1.0f64 fsqrt f64 e
+qo = sp_head_off SC_Q i h
+mb = bitcast f64 ulong 18442240474082181120
+for k ulong nk
+ko = sp_head_off SC_K add c0 k h
+sv = mul sp_fa2_dot qo ko e isq
+put sp_fa_s k sv
+mb = fmax mb sv
+end
+ret mb
+end
+
+fn sp_fa2_axpy oo ulong vo ulong pk f64 e ulong to void
+for c ulong e
+ov = get sp_sc add oo c
+vv = get sp_sc add vo c
+put sp_sc add oo c add ov mul pk vv
+end
+end
+
+fn sp_fa2_tile_acc h ulong oo ulong c0 ulong nk ulong mn f64 to void
+e = get sp_cfg 10
+li = get sp_faux 1
+for k ulong nk
+pk = sp_exp sub get sp_fa_s k mn
+li = add li pk
+sp_fa2_axpy oo sp_head_off SC_V add c0 k h pk e
+end
+put sp_faux 1 li
+end
+
+fn sp_sc_scale o ulong n ulong s f64 to void
+for i ulong n
+v = mul get sp_sc add o i s
+put sp_sc add o i v
+end
+end
+
+note Process one causal KV tile [c0..ce) for query row i, head h; updates running m/l in sp_faux[0..1]
+note and unnormalized output accumulator in sp_sc[oo..oo+e-1].
+fn sp_fa2_tile h ulong i ulong c0 ulong ce ulong to void
+nk = sub ce c0
+mb = sp_fa2_tile_sc h i c0 nk
+mi = get sp_faux 0
+mn = fmax mi mb
+al = 0.0f64
+if gt c0 0
+al = sp_exp sub mi mn
+end
+put sp_faux 0 mn
+put sp_faux 1 mul get sp_faux 1 al
+oo = sp_head_off SC_O i h
+sp_sc_scale oo get sp_cfg 10 al
+sp_fa2_tile_acc h oo c0 nk mn
+put sp_stat 1 add get sp_stat 1 1
+end
+
+fn sp_fa2_row h ulong i ulong lse_off ulong to void
+e = get sp_cfg 10
+oo = sp_head_off SC_O i h
+sp_sc_zero oo e
+put sp_faux 0 bitcast f64 ulong 18442240474082181120
+put sp_faux 1 0.0f64
+c0 = ulong 0
+while le c0 i bound 16
+ce = sp_minu add c0 SP_FA_TILE add i 1
+sp_fa2_tile h i c0 ce
+c0 = add c0 SP_FA_TILE
+end
+li = get sp_faux 1
+sp_sc_scale oo e div 1.0f64 li
+t = get sp_cfg 1
+idx = add lse_off add mul h t i
+lv = add get sp_faux 0 sp_log li
+put sp_lse idx lv
+end
+
+note sp_fa2_fwd: Zero-opa tiled online Flash-Attention-2 forward.
+note Reads SC_Q, SC_K, SC_V; writes SC_O and sp_lse[lse_off .. lse_off + H*T - 1].
+fn sp_fa2_fwd lse_off ulong to void
+hcnt = get sp_cfg 3
+t = get sp_cfg 1
+for h ulong hcnt
+r0 = ulong 0
+while lt r0 t bound 16
+re = sp_minu add r0 SP_FA_TILE t
+i = r0
+while lt i re bound 16
+sp_fa2_row h i lse_off
+i = add i 1
+end
+r0 = add r0 SP_FA_TILE
+end
+end
+end
+
+note Compute D_i = sum_c dO[i, h, c] * O[i, h, c] for head h across all rows i in 0..T-1.
+fn sp_fa2_bwd_d h ulong to void
+t = get sp_cfg 1
+e = get sp_cfg 10
+for i ulong t
+oo = sp_head_off SC_O i h
+doo = sp_head_off SC_DO i h
+put sp_fa_d i sp_fa2_dot doo oo e
+end
+end
+
+fn sp_fa2_bwd_dv h ulong i ulong j ulong pij f64 to f64
+e = get sp_cfg 10
+vo = sp_head_off SC_V j h
+doo = sp_head_off SC_DO i h
+dvo = sp_head_off SC_DV j h
+sp_fa2_axpy dvo doo pij e
+ret sp_fa2_dot doo vo e
+end
+
+fn sp_fa2_bwd_dqk h ulong i ulong j ulong ds f64 to void
+e = get sp_cfg 10
+sp_fa2_axpy sp_head_off SC_DQ i h sp_head_off SC_K j h ds e
+sp_fa2_axpy sp_head_off SC_DK j h sp_head_off SC_Q i h ds e
+end
+
+note Recompute P_ij = exp(q_i . k_j / sqrt(E) - LSE_i) and accumulate dQ_i, dK_j, dV_j.
+note Honors Mutant M2 (sp_mut_fa2_sign != 0 flips dP - D_i to dP + D_i).
+fn sp_fa2_bwd_pair h ulong i ulong j ulong lse_val f64 to void
+e = get sp_cfg 10
+isq = div 1.0f64 fsqrt f64 e
+qo = sp_head_off SC_Q i h
+ko = sp_head_off SC_K j h
+pij = sp_exp sub mul sp_fa2_dot qo ko e isq lse_val
+dp = sp_fa2_bwd_dv h i j pij
+di = get sp_fa_d i
+diff = sub dp di
+if ne sp_mut_fa2_sign 0
+diff = add dp di
+end
+sp_fa2_bwd_dqk h i j mul mul pij diff isq
+end
+
+fn sp_fa2_bwd_row h ulong i ulong c0 ulong ce ulong lsev f64 to void
+je = sp_minu ce add i 1
+j = c0
+while lt j je bound 16
+sp_fa2_bwd_pair h i j lsev
+j = add j 1
+end
+end
+
+fn sp_fa2_bwd_blk h ulong lse_off ulong c0 ulong ce ulong r0 ulong re ulong to void
+t = get sp_cfg 1
+i = r0
+while lt i re bound 16
+lsev = get sp_lse add lse_off add mul h t i
+sp_fa2_bwd_row h i c0 ce lsev
+i = add i 1
+end
+end
+
+fn sp_fa2_bwd_head h ulong lse_off ulong to void
+t = get sp_cfg 1
+sp_fa2_bwd_d h
+c0 = ulong 0
+while lt c0 t bound 16
+ce = sp_minu add c0 SP_FA_TILE t
+r0 = c0
+while lt r0 t bound 16
+re = sp_minu add r0 SP_FA_TILE t
+sp_fa2_bwd_blk h lse_off c0 ce r0 re
+r0 = add r0 SP_FA_TILE
+end
+c0 = add c0 SP_FA_TILE
+end
+end
+
+note sp_fa2_bwd: Zero-opa tiled Flash-Attention-2 backward using stored LSE[lse_off..].
+note Reads SC_Q, SC_K, SC_V, SC_O, SC_DO, sp_lse[lse_off..]; writes SC_DQ, SC_DK, SC_DV.
+fn sp_fa2_bwd lse_off ulong to void
+td = mul get sp_cfg 1 get sp_cfg 2
+sp_sc_zero SC_DQ td
+sp_sc_zero SC_DK td
+sp_sc_zero SC_DV td
+for h ulong get sp_cfg 3
+sp_fa2_bwd_head h lse_off
+end
+end
+
+note ============================================================================
+note Section 6: Reversible Branches F(x), G(y), Lock 4 Q32 & Zero-Spill Training
+note ============================================================================
+
+note F_l(x): RMSNorm(x, g1) -> Q, K, V -> Causal FA2 -> Wo -> y_off.
+fn sp_layer_f_fwd l ulong lse_off ulong x_off ulong y_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+sp_rms_fwd x_off sp_off_g1 l SC_A SC_S1
+sp_lin_fwd SC_A sp_off_wq l SC_Q t d d
+sp_lin_fwd SC_A sp_off_wk l SC_K t d d
+sp_lin_fwd SC_A sp_off_wv l SC_V t d d
+sp_fa2_fwd lse_off
+sp_lin_fwd SC_O sp_off_wo l y_off t d d
+end
+
+note G_l(y): RMSNorm(y, g2) -> W1 -> ReLU -> W2 -> out_off.
+fn sp_layer_g_fwd l ulong x_off ulong y_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+f = get sp_cfg 4
+sp_rms_fwd x_off sp_off_g2 l SC_B SC_S2
+sp_lin_fwd SC_B sp_off_w1 l SC_HP t d f
+tf = mul t f
+for i ulong tf
+v = get sp_sc add SC_HP i
+if le v 0.0f64
+v = 0.0f64
+end
+put sp_sc add SC_HA i v
+end
+sp_lin_fwd SC_HA sp_off_w2 l y_off t f d
+end
+
+note F_l backward (uses SC_A, SC_S1, SC_Q, SC_K, SC_V, SC_O already populated by sp_layer_f_fwd).
+note Accumulates dW into sp_g/sp_g_q and adds dX into sp_sc[dx_off].
+fn sp_layer_f_bwd l ulong lse_off ulong x_off ulong dy_off ulong dx_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+td = mul t d
+sp_sc_zero SC_DO td
+sp_lin_dgrad sp_off_wo l dy_off SC_DO t d d
+sp_lin_wgrad SC_O dy_off sp_off_wo l t d d
+sp_fa2_bwd lse_off
+sp_sc_zero SC_DA td
+sp_lin_dgrad sp_off_wq l SC_DQ SC_DA t d d
+sp_lin_wgrad SC_A SC_DQ sp_off_wq l t d d
+sp_lin_dgrad sp_off_wk l SC_DK SC_DA t d d
+sp_lin_wgrad SC_A SC_DK sp_off_wk l t d d
+sp_lin_dgrad sp_off_wv l SC_DV SC_DA t d d
+sp_lin_wgrad SC_A SC_DV sp_off_wv l t d d
+sp_rms_bwd x_off sp_off_g1 l SC_S1 SC_DA dx_off
+end
+
+note G_l backward (uses SC_B, SC_S2, SC_HP, SC_HA already populated by sp_layer_g_fwd).
+note Accumulates dW into sp_g/sp_g_q and adds dX into sp_sc[dx_off].
+fn sp_layer_g_bwd l ulong x_off ulong dy_off ulong dx_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+f = get sp_cfg 4
+tf = mul t f
+sp_sc_zero SC_DH tf
+sp_lin_dgrad sp_off_w2 l dy_off SC_DH t f d
+sp_lin_wgrad SC_HA dy_off sp_off_w2 l t f d
+for i ulong tf
+if le get sp_sc add SC_HP i 0.0f64
+put sp_sc add SC_DH i 0.0f64
+end
+end
+sp_sc_zero SC_DB mul t d
+sp_lin_dgrad sp_off_w1 l SC_DH SC_DB t d f
+sp_lin_wgrad SC_B SC_DH sp_off_w1 l t d f
+sp_rms_bwd x_off sp_off_g2 l SC_S2 SC_DB dx_off
+end
+
+note ---- Lock 4 Exact Q30/Q32 Modular-Integer Invertibility Test ----
+
+fn sp_round_q30 v f64 to uint
+s = mul v 1073741824.0f64
+r = long 0
+if ge s 0.0f64
+r = long add s 0.5f64
+else
+r = long sub s 0.5f64
+end
+ret uint and bitcast ulong r 4294967295
+end
+
+fn sp_from_q30 u uint to f64
+ret div f64 bitcast int u 1073741824.0f64
+end
+
+fn sp_q32_to_sc qsel ulong dst ulong td ulong to void
+for i ulong td
+u = uint 0
+if eq qsel 1
+u = get sp_q1 i
+else
+u = get sp_q2 i
+end
+put sp_sc add dst i sp_from_q30 u
+end
+end
+
+fn sp_q32_couple qsel ulong src ulong td ulong sub_flag ulong to void
+for i ulong td
+dq = sp_round_q30 get sp_sc add src i
+if eq qsel 1
+v = get sp_q1 i
+if eq sub_flag 0
+put sp_q1 i add v dq
+else
+put sp_q1 i sub v dq
+end
+else
+v2 = get sp_q2 i
+if eq sub_flag 0
+put sp_q2 i add v2 dq
+else
+put sp_q2 i sub v2 dq
+end
+end
+end
+end
+
+fn sp_q32_init to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+for r ulong t
+tok = get sp_tok_x r
+for c ulong d
+q = sp_round_q30 get sp_w add mul tok d c
+idx = add mul r d c
+put sp_q1 idx q
+put sp_q2 idx q
+put sp_q1_0 idx q
+put sp_q2_0 idx q
+end
+end
+end
+
+fn sp_q32_diff td ulong to ulong
+diff = ulong 0
+for i ulong td
+diff = add diff sp_popcnt32 xor get sp_q1 i get sp_q1_0 i
+diff = add diff sp_popcnt32 xor get sp_q2 i get sp_q2_0 i
+end
+ret diff
+end
+
+fn sp_q32_fwd_pass lv ulong td ulong to void
+for app ulong lv
+l = sp_olp app
+sp_q32_to_sc 2 SC_X2 td
+sp_layer_f_fwd l SP_LSE_SCRATCH SC_X2 SC_TMP
+sp_q32_couple 1 SC_TMP td 0
+sp_q32_to_sc 1 SC_X1 td
+sp_layer_g_fwd l SC_X1 SC_TMP
+sp_q32_couple 2 SC_TMP td 0
+end
+end
+
+fn sp_q32_bwd_pass lv ulong td ulong to void
+for step ulong lv
+l = sp_olp sub sub lv 1 step
+sp_q32_to_sc 1 SC_X1 td
+sp_layer_g_fwd l SC_X1 SC_TMP
+sp_q32_couple 2 SC_TMP td 1
+sp_q32_to_sc 2 SC_X2 td
+sp_layer_f_fwd l SP_LSE_SCRATCH SC_X2 SC_TMP
+sp_q32_couple 1 SC_TMP td 1
+end
+end
+
+note sp_q32_inv_test: Lock 4 bit-exact Q30/Q32 invertibility over LV applications
+note (default LP=1, LC=2, NP=4 -> LV=10). Forward y1=x1+q30(F(x2)), y2=x2+q30(G(y1)),
+note then algebraic inverse x2=y2-q30(G(y1)), x1=y1-q30(F(x2)). Returns total differing bits (0).
+fn sp_q32_inv_test to ulong
+sp_ensure_init
+save_qm = get sp_cfg 18
+put sp_cfg 18 0
+td = mul get sp_cfg 1 get sp_cfg 2
+lv = get sp_cfg 11
+sp_q32_init
+sp_q32_fwd_pass lv td
+put sp_stat 0 sp_q32_diff td
+sp_q32_bwd_pass lv td
+diff = sp_q32_diff td
+put sp_cfg 18 save_qm
+ret diff
+end
+
+note ---- Reversible Spiral Forward, Output Head & Algebraic-Inversion Backward ----
+
+fn sp_rev_embed_row wb ulong ro ulong d ulong to void
+for c ulong d
+v = get sp_w add wb c
+put sp_sc add SC_X1 add ro c v
+put sp_sc add SC_X2 add ro c v
+end
+end
+
+fn sp_rev_embed mb ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+mb_base = mul mb t
+for r ulong t
+tok = get sp_tok_x add mb_base r
+sp_rev_embed_row mul tok d mul r d d
+end
+end
+
+fn sp_rev_embed_bwd_row wb ulong ro ulong d ulong to void
+for c ulong d
+g1 = get sp_sc add SC_DX1 add ro c
+g2 = get sp_sc add SC_DX2 add ro c
+sp_g_add add wb c add g1 g2
+end
+end
+
+fn sp_rev_embed_bwd mb ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+mb_base = mul mb t
+for r ulong t
+tok = get sp_tok_x add mb_base r
+sp_rev_embed_bwd_row mul tok d mul r d d
+end
+end
+
+fn sp_rev_lse_off mb ulong app ulong to ulong
+lv = get sp_cfg 11
+ht = mul get sp_cfg 3 get sp_cfg 1
+ret mul add mul mb lv app ht
+end
+
+note Forward for microbatch mb: stores ONLY final (Y1, Y2) into sp_rev_y1/y2 and LSE into sp_lse.
+fn sp_rev_mb_fwd mb ulong to void
+put sp_cfg 19 mb
+td = mul get sp_cfg 1 get sp_cfg 2
+lv = get sp_cfg 11
+sp_rev_embed mb
+for app ulong lv
+put sp_cfg 20 app
+l = sp_olp app
+sp_layer_f_fwd l sp_rev_lse_off mb app SC_X2 SC_TMP
+sp_sc_addto SC_X1 SC_TMP td
+sp_layer_g_fwd l SC_X1 SC_TMP
+sp_sc_addto SC_X2 SC_TMP td
+end
+yb = mul mb td
+for i ulong td
+put sp_rev_y1 add yb i get sp_sc add SC_X1 i
+put sp_rev_y2 add yb i get sp_sc add SC_X2 i
+end
+end
+
+fn sp_sc_wdot hnb ulong wb ulong d ulong to f64
+s = 0.0f64
+for c ulong d
+hv = get sp_sc add hnb c
+wv = get sp_w add wb c
+s = add s mul hv wv
+end
+ret s
+end
+
+fn sp_rev_logits_row r ulong to f64
+v = get sp_cfg 0
+d = get sp_cfg 2
+hn_b = add SC_HN mul r d
+lg_b = add SC_LG mul r v
+mx = bitcast f64 ulong 18442240474082181120
+for vv ulong v
+s = sp_sc_wdot hn_b mul vv d d
+put sp_sc add lg_b vv s
+mx = fmax mx s
+end
+ret mx
+end
+
+fn sp_rev_ce_bwd_row lg_b ulong dlg_b ulong tgt ulong sm f64 inv_gt f64 to void
+v = get sp_cfg 0
+for vv ulong v
+pv = div get sp_sc add lg_b vv sm
+if eq vv tgt
+pv = sub pv 1.0f64
+end
+put sp_sc add dlg_b vv mul pv inv_gt
+end
+end
+
+fn sp_rev_ce_row r ulong tgt ulong do_bwd ulong inv_gt f64 to f64
+v = get sp_cfg 0
+lg_b = add SC_LG mul r v
+mx = sp_rev_logits_row r
+sm = 0.0f64
+for vv ulong v
+ev = sp_exp sub get sp_sc add lg_b vv mx
+put sp_sc add lg_b vv ev
+sm = add sm ev
+end
+ls = neg sp_log div get sp_sc add lg_b tgt sm
+if ne do_bwd 0
+sp_rev_ce_bwd_row lg_b add SC_DLG mul r v tgt sm inv_gt
+end
+ret ls
+end
+
+fn sp_rev_head_bwd_v hnb ulong dhnb ulong wb ulong dlv f64 d ulong to void
+for c ulong d
+wv = get sp_w add wb c
+dv = add get sp_sc add dhnb c mul dlv wv
+put sp_sc add dhnb c dv
+sp_g_add add wb c mul dlv get sp_sc add hnb c
+end
+end
+
+fn sp_rev_head_bwd_row r ulong to void
+v = get sp_cfg 0
+d = get sp_cfg 2
+hn_b = add SC_HN mul r d
+dlg_b = add SC_DLG mul r v
+dhn_b = add SC_DHN mul r d
+for vv ulong v
+dlv = get sp_sc add dlg_b vv
+sp_rev_head_bwd_v hn_b dhn_b mul vv d dlv d
+end
+end
+
+fn sp_rev_head_bwd to void
+t = get sp_cfg 1
+td = mul t get sp_cfg 2
+sp_sc_zero SC_DHN td
+for r ulong t
+sp_rev_head_bwd_row r
+end
+sp_sc_zero SC_DHM td
+sp_rms_bwd SC_HM sp_off_gf SC_SF SC_DHN SC_DHM
+for i ulong td
+hv = mul 0.5f64 get sp_sc add SC_DHM i
+put sp_sc add SC_DX1 i hv
+put sp_sc add SC_DX2 i hv
+end
+end
+
+note Head forward + cross-entropy loss + head backward for microbatch mb.
+note Reads final (Y1, Y2) in SC_X1/SC_X2; writes dY1/dY2 into SC_DX1/SC_DX2; returns mean loss.
+fn sp_rev_head mb ulong do_bwd ulong to f64
+t = get sp_cfg 1
+td = mul t get sp_cfg 2
+for i ulong td
+x1v = get sp_sc add SC_X1 i
+x2v = get sp_sc add SC_X2 i
+put sp_sc add SC_HM i mul 0.5f64 add x1v x2v
+end
+sp_rms_fwd SC_HM sp_off_gf SC_HN SC_SF
+inv_gt = div 1.0f64 f64 mul get sp_cfg 9 t
+ls = 0.0f64
+mb_base = mul mb t
+for r ulong t
+ls = add ls sp_rev_ce_row r get sp_tok_y add mb_base r do_bwd inv_gt
+end
+if ne do_bwd 0
+sp_rev_head_bwd
+end
+ret div ls f64 t
+end
+
+note Backward for microbatch mb: reconstructs (X2, X1) layer-by-layer from LV-1 down to 0
+note using only the single shared scratch buffer sp_sc and stored LSE.
+fn sp_rev_mb_bwd mb ulong to f64
+put sp_cfg 19 mb
+t = get sp_cfg 1
+d = get sp_cfg 2
+td = mul t d
+lv = get sp_cfg 11
+yb = mul mb td
+for i ulong td
+put sp_sc add SC_X1 i get sp_rev_y1 add yb i
+put sp_sc add SC_X2 i get sp_rev_y2 add yb i
+end
+skip = ulong 0
+if and ne get sp_mut 0 0 eq mb sub get sp_cfg 9 1
+skip = ulong 1
+end
+loss = sp_rev_head mb sub 1 skip
+if ne skip 0
+ret loss
+end
+for step ulong lv
+app = sub sub lv 1 step
+put sp_cfg 20 app
+l = sp_olp app
+sp_layer_g_fwd l SC_X1 SC_TMP
+sp_sc_subto SC_X2 SC_TMP td
+sp_layer_g_bwd l SC_X1 SC_DX2 SC_DX1
+sp_layer_f_fwd l SP_LSE_SCRATCH SC_X2 SC_TMP
+sp_sc_subto SC_X1 SC_TMP td
+sp_layer_f_bwd l sp_rev_lse_off mb app SC_X2 SC_DX1 SC_DX2
+put sp_stat 2 add get sp_stat 2 1
+end
+sp_rev_embed_bwd mb
+ret loss
+end
+
+fn sp_rev_macro_core to f64
+g = get sp_cfg 9
+for mb ulong g
+sp_rev_mb_fwd mb
+end
+ls = 0.0f64
+for mb2 ulong g
+ls = add ls sp_rev_mb_bwd mb2
+end
+ret div ls f64 g
+end
+
+note sp_rev_macro_grad: zero-activation-spill reversible forward + algebraic-inversion backward
+note over LV spiral applications and G microbatches, accumulating into sp_g.
+note Honors Mutant M1 (sp_mut[0]) and Mutant M2 (sp_mut[1]). Returns macrobatch mean loss.
+fn sp_rev_macro_grad to f64
+sp_ensure_init
+put sp_cfg 18 0
+put sp_cfg 23 0
+put sp_stat 1 0
+put sp_stat 2 0
+sp_zero_g
+ret sp_rev_macro_core
+end
+
+note ============================================================================
+note Section 7: Independent Unrolled Non-Reversible f64 Reference Twin
+note ============================================================================
+
+fn sp_tw_zero o ulong n ulong to void
+for i ulong n
+put sp_tw add o i 0.0f64
+end
+end
+
+fn sp_tw_rms_ss xo ulong to f64
+d = get sp_cfg 2
+ss = 0.0f64
+for i ulong d
+v = get sp_tw add xo i
+ss = add ss mul v v
+end
+ret fsqrt add div ss f64 d SP_RMS_EPS
+end
+
+fn sp_tw_rms_row xo ulong g_off ulong yo ulong s_idx ulong to void
+d = get sp_cfg 2
+s = sp_tw_rms_ss xo
+put sp_tw s_idx s
+for j ulong d
+nv = div get sp_tw add xo j s
+gv = get sp_w add g_off j
+put sp_tw add yo j mul nv gv
+end
+end
+
+fn sp_tw_rms_fwd x_off ulong g_off ulong y_off ulong s_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+for r ulong t
+ro = mul r d
+sp_tw_rms_row add x_off ro g_off add y_off ro add s_off r
+end
+end
+
+fn sp_tw_rms_bwd_c xo ulong g_off ulong dyo ulong s f64 to f64
+d = get sp_cfg 2
+cc = 0.0f64
+for i ulong d
+nv = div get sp_tw add xo i s
+dy = get sp_tw add dyo i
+dn = mul dy get sp_w add g_off i
+cc = add cc mul dn nv
+end
+ret div cc f64 d
+end
+
+fn sp_tw_rms_bwd_el xp ulong gp ulong dyp ulong dxp ulong to void
+s = get sp_faux 2
+cc = get sp_faux 3
+nv = div get sp_tw xp s
+dy = get sp_tw dyp
+grv = add get sp_g_ref gp mul dy nv
+put sp_g_ref gp grv
+dn = mul dy get sp_w gp
+dx = div sub dn mul nv cc s
+old = get sp_tw dxp
+put sp_tw dxp add old dx
+end
+
+fn sp_tw_rms_bwd_row xo ulong g_off ulong s_idx ulong dyo ulong dxo ulong to void
+d = get sp_cfg 2
+s = get sp_tw s_idx
+put sp_faux 2 s
+put sp_faux 3 sp_tw_rms_bwd_c xo g_off dyo s
+for j ulong d
+sp_tw_rms_bwd_el add xo j add g_off j add dyo j add dxo j
+end
+end
+
+fn sp_tw_rms_bwd x_off ulong g_off ulong s_off ulong dy_off ulong dx_off ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+for r ulong t
+ro = mul r d
+sp_tw_rms_bwd_row add x_off ro g_off add s_off r add dy_off ro add dx_off ro
+end
+end
+
+fn sp_tw_lin_fwd_row xb ulong w_off ulong yb ulong k ulong n ulong to void
+for c ulong n
+s = 0.0f64
+for p ulong k
+xv = get sp_tw add xb p
+wv = get sp_w add w_off add mul p n c
+s = add s mul xv wv
+end
+put sp_tw add yb c s
+end
+end
+
+fn sp_tw_lin_fwd x_off ulong w_off ulong y_off ulong m ulong k ulong n ulong to void
+for r ulong m
+sp_tw_lin_fwd_row add x_off mul r k w_off add y_off mul r n k n
+end
+end
+
+fn sp_tw_lin_dg_row w_off ulong dyb ulong dxb ulong k ulong n ulong to void
+for p ulong k
+wb = add w_off mul p n
+s = 0.0f64
+for c ulong n
+dv = get sp_tw add dyb c
+wv = get sp_w add wb c
+s = add s mul dv wv
+end
+v = add get sp_tw add dxb p s
+put sp_tw add dxb p v
+end
+end
+
+fn sp_tw_lin_dg w_off ulong dy_off ulong dx_off ulong m ulong k ulong n ulong to void
+for r ulong m
+sp_tw_lin_dg_row w_off add dy_off mul r n add dx_off mul r k k n
+end
+end
+
+fn sp_tw_lin_wg_dot xc ulong yc ulong m ulong k ulong n ulong to f64
+s = 0.0f64
+for r ulong m
+xv = get sp_tw add xc mul r k
+dv = get sp_tw add yc mul r n
+s = add s mul xv dv
+end
+ret s
+end
+
+fn sp_tw_lin_wg x_off ulong dy_off ulong w_off ulong m ulong k ulong n ulong to void
+for p ulong k
+for c ulong n
+s = sp_tw_lin_wg_dot add x_off p add dy_off c m k n
+gi = add w_off add mul p n c
+gv = add get sp_g_ref gi s
+put sp_g_ref gi gv
+end
+end
+end
+
+fn sp_tw_poff app ulong h ulong i ulong to ulong
+t = get sp_cfg 1
+tt = mul t t
+a = mul app mul get sp_cfg 3 tt
+b = add mul h tt mul i t
+ret add TW_P add a b
+end
+
+fn sp_tw_hoff base ulong app ulong row ulong h ulong to ulong
+t = get sp_cfg 1
+d = get sp_cfg 2
+e = get sp_cfg 10
+a = add base mul app mul t d
+ret add a add mul row d mul h e
+end
+
+fn sp_tw_dot a ulong b ulong e ulong to f64
+s = 0.0f64
+for c ulong e
+av = get sp_tw add a c
+bv = get sp_tw add b c
+s = add s mul av bv
+end
+ret s
+end
+
+fn sp_tw_axpy dst ulong src ulong sc f64 e ulong to void
+for c ulong e
+ov = get sp_tw add dst c
+sv = get sp_tw add src c
+put sp_tw add dst c add ov mul sc sv
+end
+end
+
+fn sp_tw_attn_sc app ulong h ulong i ulong pb ulong to f64
+e = get sp_cfg 10
+isq = div 1.0f64 fsqrt f64 e
+qb = sp_tw_hoff TW_Q app i h
+mx = bitcast f64 ulong 18442240474082181120
+for j ulong add i 1
+kb = sp_tw_hoff TW_K app j h
+s = mul sp_tw_dot qb kb e isq
+put sp_tw add pb j s
+mx = fmax mx s
+end
+ret mx
+end
+
+fn sp_tw_attn_out app ulong h ulong i ulong pb ulong sm f64 to void
+e = get sp_cfg 10
+ob = sp_tw_hoff TW_O app i h
+sp_tw_zero ob e
+for j ulong add i 1
+pv = div get sp_tw add pb j sm
+put sp_tw add pb j pv
+sp_tw_axpy ob sp_tw_hoff TW_V app j h pv e
+end
+end
+
+note Textbook explicit-P[H,T,T] causal attention forward (independent of FA2).
+fn sp_tw_attn_row app ulong h ulong i ulong to void
+pb = sp_tw_poff app h i
+mx = sp_tw_attn_sc app h i pb
+sm = 0.0f64
+for j ulong add i 1
+ev = sp_exp sub get sp_tw add pb j mx
+put sp_tw add pb j ev
+sm = add sm ev
+end
+sp_tw_attn_out app h i pb sm
+end
+
+fn sp_tw_attnb_dv1 app ulong h ulong j ulong dob ulong pv f64 to f64
+e = get sp_cfg 10
+sp_tw_axpy sp_head_off TW_DV j h dob pv e
+ret sp_tw_dot dob sp_tw_hoff TW_V app j h e
+end
+
+fn sp_tw_attnb_dv app ulong h ulong i ulong pb ulong to f64
+dob = sp_head_off TW_DO i h
+sum_pdp = 0.0f64
+for j ulong add i 1
+pv = get sp_tw add pb j
+dpv = sp_tw_attnb_dv1 app h j dob pv
+put sp_tw add TW_DP j dpv
+sum_pdp = add sum_pdp mul pv dpv
+end
+ret sum_pdp
+end
+
+fn sp_tw_attnb_dqk1 app ulong h ulong i ulong j ulong ds f64 to void
+e = get sp_cfg 10
+qb = sp_tw_hoff TW_Q app i h
+dqb = sp_head_off TW_DQ i h
+sp_tw_axpy dqb sp_tw_hoff TW_K app j h ds e
+sp_tw_axpy sp_head_off TW_DK j h qb ds e
+end
+
+fn sp_tw_attnb_dqk app ulong h ulong i ulong pb ulong sum_pdp f64 to void
+isq = div 1.0f64 fsqrt f64 get sp_cfg 10
+for j ulong add i 1
+pv = get sp_tw add pb j
+dpv = get sp_tw add TW_DP j
+ds = mul mul pv sub dpv sum_pdp isq
+sp_tw_attnb_dqk1 app h i j ds
+end
+end
+
+note Textbook explicit-P[H,T,T] causal attention backward (direct softmax Jacobian, no LSE/D_i).
+fn sp_tw_attnb_row app ulong h ulong i ulong to void
+pb = sp_tw_poff app h i
+spdp = sp_tw_attnb_dv app h i pb
+sp_tw_attnb_dqk app h i pb spdp
+end
+
+fn sp_tw_copy dst ulong src ulong n ulong to void
+for i ulong n
+v = get sp_tw add src i
+put sp_tw add dst i v
+end
+end
+
+fn sp_tw_addto dst ulong src ulong n ulong to void
+for i ulong n
+v = add get sp_tw add dst i get sp_tw add src i
+put sp_tw add dst i v
+end
+end
+
+fn sp_tw_relu_fwd src ulong dst ulong n ulong to void
+for i ulong n
+v = get sp_tw add src i
+if le v 0.0f64
+v = 0.0f64
+end
+put sp_tw add dst i v
+end
+end
+
+fn sp_tw_relu_bwd hp ulong dh ulong n ulong to void
+for i ulong n
+if le get sp_tw add hp i 0.0f64
+put sp_tw add dh i 0.0f64
+end
+end
+end
+
+fn sp_tw_attn_all app ulong to void
+t = get sp_cfg 1
+for h ulong get sp_cfg 3
+for r ulong t
+sp_tw_attn_row app h r
+end
+end
+end
+
+fn sp_tw_attnb_all app ulong to void
+t = get sp_cfg 1
+for h ulong get sp_cfg 3
+for r ulong t
+sp_tw_attnb_row app h r
+end
+end
+end
+
+fn sp_tw_layer_f_fwd app ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+td = mul t d
+l = sp_olp app
+x2o = add TW_X2 mul app td
+ao = add TW_A mul app td
+sp_tw_copy x2o TW_CUR2 td
+sp_tw_rms_fwd x2o sp_off_g1 l ao add TW_S1 mul app t
+sp_tw_lin_fwd ao sp_off_wq l add TW_Q mul app td t d d
+sp_tw_lin_fwd ao sp_off_wk l add TW_K mul app td t d d
+sp_tw_lin_fwd ao sp_off_wv l add TW_V mul app td t d d
+sp_tw_attn_all app
+sp_tw_lin_fwd add TW_O mul app td sp_off_wo l TW_TMP t d d
+sp_tw_addto TW_CUR1 TW_TMP td
+sp_tw_copy add TW_Y1 mul app td TW_CUR1 td
+end
+
+fn sp_tw_layer_g_fwd app ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+f = get sp_cfg 4
+l = sp_olp app
+bo = add TW_B mul app mul t d
+sp_tw_rms_fwd add TW_Y1 mul app mul t d sp_off_g2 l bo add TW_S2 mul app t
+sp_tw_lin_fwd bo sp_off_w1 l add TW_HP mul app mul t f t d f
+sp_tw_relu_fwd add TW_HP mul app mul t f add TW_HA mul app mul t f mul t f
+sp_tw_lin_fwd add TW_HA mul app mul t f sp_off_w2 l TW_TMP t f d
+sp_tw_addto TW_CUR2 TW_TMP mul t d
+end
+
+fn sp_tw_layer_fwd app ulong to void
+sp_tw_layer_f_fwd app
+sp_tw_layer_g_fwd app
+end
+
+fn sp_tw_layer_g_bwd app ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+f = get sp_cfg 4
+l = sp_olp app
+sp_tw_zero TW_DH mul t f
+sp_tw_lin_dg sp_off_w2 l TW_DY2 TW_DH t f d
+sp_tw_lin_wg add TW_HA mul app mul t f TW_DY2 sp_off_w2 l t f d
+sp_tw_relu_bwd add TW_HP mul app mul t f TW_DH mul t f
+sp_tw_zero TW_DB mul t d
+sp_tw_lin_dg sp_off_w1 l TW_DH TW_DB t d f
+sp_tw_lin_wg add TW_B mul app mul t d TW_DH sp_off_w1 l t d f
+sp_tw_rms_bwd add TW_Y1 mul app mul t d sp_off_g2 l add TW_S2 mul app t TW_DB TW_DY1
+end
+
+fn sp_tw_layer_f_bwd app ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+td = mul t d
+l = sp_olp app
+ao = add TW_A mul app td
+sp_tw_zero TW_DO td
+sp_tw_lin_dg sp_off_wo l TW_DY1 TW_DO t d d
+sp_tw_lin_wg add TW_O mul app td TW_DY1 sp_off_wo l t d d
+sp_tw_zero TW_DQ td
+sp_tw_zero TW_DK td
+sp_tw_zero TW_DV td
+sp_tw_attnb_all app
+sp_tw_zero TW_DA td
+sp_tw_lin_dg sp_off_wq l TW_DQ TW_DA t d d
+sp_tw_lin_wg ao TW_DQ sp_off_wq l t d d
+sp_tw_lin_dg sp_off_wk l TW_DK TW_DA t d d
+sp_tw_lin_wg ao TW_DK sp_off_wk l t d d
+sp_tw_lin_dg sp_off_wv l TW_DV TW_DA t d d
+sp_tw_lin_wg ao TW_DV sp_off_wv l t d d
+sp_tw_rms_bwd add TW_X2 mul app td sp_off_g1 l add TW_S1 mul app t TW_DA TW_DY2
+end
+
+fn sp_tw_layer_bwd app ulong to void
+sp_tw_layer_g_bwd app
+sp_tw_layer_f_bwd app
+end
+
+fn sp_tw_wdot hnb ulong wb ulong d ulong to f64
+s = 0.0f64
+for c ulong d
+hv = get sp_tw add hnb c
+wv = get sp_w add wb c
+s = add s mul hv wv
+end
+ret s
+end
+
+fn sp_tw_logits_row r ulong to f64
+v = get sp_cfg 0
+d = get sp_cfg 2
+hnb = add TW_HN mul r d
+lgb = add TW_LG mul r v
+mx = bitcast f64 ulong 18442240474082181120
+for vv ulong v
+s = sp_tw_wdot hnb mul vv d d
+put sp_tw add lgb vv s
+mx = fmax mx s
+end
+ret mx
+end
+
+fn sp_tw_ce_bwd_row lgb ulong dlgb ulong tgt ulong sm f64 inv_gt f64 to void
+v = get sp_cfg 0
+for vv ulong v
+pv = div get sp_tw add lgb vv sm
+if eq vv tgt
+pv = sub pv 1.0f64
+end
+put sp_tw add dlgb vv mul pv inv_gt
+end
+end
+
+fn sp_tw_ce_row r ulong tgt ulong inv_gt f64 to f64
+v = get sp_cfg 0
+lgb = add TW_LG mul r v
+mx = sp_tw_logits_row r
+sm = 0.0f64
+for vv ulong v
+ev = sp_exp sub get sp_tw add lgb vv mx
+put sp_tw add lgb vv ev
+sm = add sm ev
+end
+ls = neg sp_log div get sp_tw add lgb tgt sm
+sp_tw_ce_bwd_row lgb add TW_DLG mul r v tgt sm inv_gt
+ret ls
+end
+
+fn sp_tw_head_bwd_v hnb ulong dhnb ulong wb ulong dlv f64 d ulong to void
+for c ulong d
+wv = get sp_w add wb c
+dv = add get sp_tw add dhnb c mul dlv wv
+put sp_tw add dhnb c dv
+gi = add wb c
+hv = get sp_tw add hnb c
+gv = add get sp_g_ref gi mul dlv hv
+put sp_g_ref gi gv
+end
+end
+
+fn sp_tw_head_bwd_row r ulong to void
+v = get sp_cfg 0
+d = get sp_cfg 2
+hnb = add TW_HN mul r d
+dlgb = add TW_DLG mul r v
+dhnb = add TW_DHN mul r d
+for vv ulong v
+dlv = get sp_tw add dlgb vv
+sp_tw_head_bwd_v hnb dhnb mul vv d dlv d
+end
+end
+
+fn sp_tw_head_bwd to void
+t = get sp_cfg 1
+td = mul t get sp_cfg 2
+sp_tw_zero TW_DHN td
+for r ulong t
+sp_tw_head_bwd_row r
+end
+sp_tw_zero TW_DHM td
+sp_tw_rms_bwd TW_HM sp_off_gf TW_SF TW_DHN TW_DHM
+for i ulong td
+hv = mul 0.5f64 get sp_tw add TW_DHM i
+put sp_tw add TW_DY1 i hv
+put sp_tw add TW_DY2 i hv
+end
+end
+
+fn sp_tw_head mb ulong to f64
+t = get sp_cfg 1
+td = mul t get sp_cfg 2
+for i ulong td
+x1v = get sp_tw add TW_CUR1 i
+x2v = get sp_tw add TW_CUR2 i
+put sp_tw add TW_HM i mul 0.5f64 add x1v x2v
+end
+sp_tw_rms_fwd TW_HM sp_off_gf TW_HN TW_SF
+inv_gt = div 1.0f64 f64 mul get sp_cfg 9 t
+ls = 0.0f64
+mb_base = mul mb t
+for r ulong t
+ls = add ls sp_tw_ce_row r get sp_tok_y add mb_base r inv_gt
+end
+sp_tw_head_bwd
+ret div ls f64 t
+end
+
+fn sp_tw_embed_row wb ulong ro ulong d ulong to void
+for c ulong d
+wv = get sp_w add wb c
+put sp_tw add TW_CUR1 add ro c wv
+put sp_tw add TW_CUR2 add ro c wv
+end
+end
+
+fn sp_tw_embed mb ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+mb_base = mul mb t
+for r ulong t
+tok = get sp_tok_x add mb_base r
+sp_tw_embed_row mul tok d mul r d d
+end
+end
+
+fn sp_tw_embed_bwd_row wb ulong ro ulong d ulong to void
+for c ulong d
+g1 = get sp_tw add TW_DY1 add ro c
+g2 = get sp_tw add TW_DY2 add ro c
+gi = add wb c
+gv = add get sp_g_ref gi add g1 g2
+put sp_g_ref gi gv
+end
+end
+
+fn sp_tw_embed_bwd mb ulong to void
+t = get sp_cfg 1
+d = get sp_cfg 2
+mb_base = mul mb t
+for r ulong t
+tok = get sp_tok_x add mb_base r
+sp_tw_embed_bwd_row mul tok d mul r d d
+end
+end
+
+fn sp_tw_mb mb ulong to f64
+lv = get sp_cfg 11
+sp_tw_embed mb
+for app ulong lv
+sp_tw_layer_fwd app
+end
+loss = sp_tw_head mb
+for step ulong lv
+sp_tw_layer_bwd sub sub lv 1 step
+end
+sp_tw_embed_bwd mb
+ret loss
+end
+
+note sp_twin_macro_grad: independent unrolled non-reversible f64 reference twin.
+note Stores every layer's activations and explicit P[H,T,T], accumulates textbook grads in sp_g_ref.
+fn sp_twin_macro_grad to f64
+sp_ensure_init
+sp_zero_g_ref
+g = get sp_cfg 9
+ls = 0.0f64
+for mb ulong g
+ls = add ls sp_tw_mb mb
+end
+put sp_cfg 22 1
+ret div ls f64 g
+end
+
+note ============================================================================
+note Section 8: Verification Metrics (sp_grad_rel_err, sp_quant_grad_cos) & Adam
+note ============================================================================
+
+note sp_grad_rel_err: max_i |sp_g[i] - sp_g_ref[i]| / max_i |sp_g_ref[i]|.
+fn sp_grad_rel_err to f64
+p = get sp_cfg 15
+md = 0.0f64
+mr = 0.0f64
+for i ulong p
+g = get sp_g i
+gr = get sp_g_ref i
+md = fmax md fabs sub g gr
+mr = fmax mr fabs gr
+end
+if eq mr 0.0f64
+if eq md 0.0f64
+ret 0.0f64
+end
+ret 1.0f64
+end
+ret div md mr
+end
+
+fn sp_cos_gq_gref to f64
+p = get sp_cfg 15
+dt = 0.0f64
+nq = 0.0f64
+nr = 0.0f64
+for i ulong p
+gq = get sp_g_q i
+gr = get sp_g_ref i
+dt = add dt mul gq gr
+nq = add nq mul gq gq
+nr = add nr mul gr gr
+end
+dn = mul fsqrt nq fsqrt nr
+if eq dn 0.0f64
+ret 0.0f64
+end
+ret div dt dn
+end
+
+note sp_quant_grad_cos: mode=0 BF16 RNE (>=0.999), mode=1 canonical NVFP4
+note (2D 16x16 UE4M3 weights + 1D block-16 activations/grads + RHT16 + Philox SR, >=0.98).
+note Returns cosine similarity dot(sp_g_q, sp_g_ref) / (||sp_g_q|| * ||sp_g_ref||).
+fn sp_quant_grad_cos mode ulong to f64
+sp_ensure_init
+if eq get sp_cfg 22 0
+put sp_faux 7 sp_twin_macro_grad
+end
+m0 = get sp_mut 0
+m1 = get sp_mut 1
+put sp_mut 0 0
+put sp_mut 1 0
+if eq mode 0
+put sp_cfg 18 1
+else
+put sp_cfg 18 2
+end
+put sp_cfg 23 1
+sp_zero_g_q
+put sp_faux 6 sp_rev_macro_core
+put sp_cfg 18 0
+put sp_cfg 23 0
+put sp_mut 0 m0
+put sp_mut 1 m1
+ret sp_cos_gq_gref
+end
+
+fn sp_pow_f64 b f64 n ulong to f64
+pw = 1.0f64
+for i ulong n
+pw = mul pw b
+end
+ret pw
+end
+
+fn sp_adam_1 i ulong to void
+b1 = get sp_faux 1
+b2 = get sp_faux 2
+gv = get sp_g i
+mv = add mul b1 get sp_m i mul sub 1.0f64 b1 gv
+vv = add mul b2 get sp_v i mul sub 1.0f64 b2 mul gv gv
+put sp_m i mv
+put sp_v i vv
+mh = div mv get sp_faux 4
+vh = div vv get sp_faux 5
+upd = div mul get sp_faux 0 mh add fsqrt vh get sp_faux 3
+wv = sub get sp_w i upd
+put sp_w i wv
+end
+
+note sp_adam_step: bias-corrected Adam update on sp_w using sp_g, sp_m, sp_v.
+fn sp_adam_step lr f64 b1 f64 b2 f64 eps f64 to void
+st = add get sp_cfg 16 1
+put sp_cfg 16 st
+put sp_faux 0 lr
+put sp_faux 1 b1
+put sp_faux 2 b2
+put sp_faux 3 eps
+put sp_faux 4 sub 1.0f64 sp_pow_f64 b1 st
+put sp_faux 5 sub 1.0f64 sp_pow_f64 b2 st
+p = get sp_cfg 15
+for i ulong p
+sp_adam_1 i
+end
+put sp_cfg 22 0
+end

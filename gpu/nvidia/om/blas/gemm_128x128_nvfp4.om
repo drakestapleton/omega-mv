@@ -1,0 +1,636 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/blas/gemm_128x128_nvfp4.om: Native SM121 (Blackwell GB10) NVFP4 Tensor Core
+note training GEMM (BM=128, BN=128, BK=64, 256 threads, 18432B double-buffered SMEM for 32 KiB
+note carveout -> 96 KiB L1, native OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X, 16x OMMA/K-block,
+note in-register 16x16 Random Hadamard SHFL.BFLY + Philox dithered F2FP.E4M3/E2M1 for DW,
+note fused online NVFP4 epilogue for FWD/DX, ZERO FP atomics) AND 1.58-bit Ternary (5 trits/byte
+note base-3 packed = 0.2 B/param) L2-pinned LUT-GEMM kernel.
+note Composes after gpu/nvidia/om/encoder/bw_enc_sm121_v2.om (zero collisions with gemm_128x128_bf16.om).
+note
+note NVFP4 Kernel ABI (cbank 0, c[0x0][0x358..0x3cf]):
+note   0x358 (856): UR4:UR5 global descriptor
+note   0x380 (896): ptr_A_nv4   u64 (packed E2M1 A matrix)
+note   0x388 (904): ptr_B_nv4   u64 (packed E2M1 B matrix, L2.EL pinned weights)
+note   0x390 (912): ptr_Sa      u64 (UE4M3 16x16 block scales for A)
+note   0x398 (920): ptr_Sb      u64 (UE4M3 16x16 block scales for B, L2.EL pinned)
+note   0x3a0 (928): ptr_C       u64 (output FP32/NVFP4 or DW split-K partials [L2.EL])
+note   0x3a8 (936): ptr_Sc_aux  u64 (output UE4M3 scales for epi==3, or residual/mask)
+note   0x3b0 (944): M u32
+note   0x3b4 (948): N u32
+note   0x3b8 (952): K u32 (per-split K_slice in DW mode; multiple of 64)
+note   0x3bc (956): lda_bytes u32 (K / 2)
+note   0x3c0 (960): ldb_bytes u32 (K / 2)
+note   0x3c4 (964): ldc_bytes u32
+note   0x3c8 (968): philox_seed u32 (deterministic per-step Philox key for DW dithering)
+note   0x3cc (972): splitk_stride_bytes u32 (per-slice C byte stride in DW mode)
+
+const BN4_SR_TID_X ulong 33
+const BN4_SR_CTAID_X ulong 37
+const BN4_SR_CTAID_Y ulong 38
+const BN4_SR_CTAID_Z ulong 39
+
+const BN4_UREG ulong 4
+const BN4_THREADS ulong 256
+const BN4_STAGE_BYTES ulong 9216
+const BN4_SMEM_BYTES ulong 18432
+
+const BN4_MODE_FWD ulong 0
+const BN4_MODE_DX ulong 1
+const BN4_MODE_DW ulong 2
+
+const BN4_EPI_NONE ulong 0
+const BN4_EPI_ADD_RES ulong 1
+const BN4_EPI_RELU_MASK ulong 2
+const BN4_EPI_NVFP4_OUT ulong 3
+
+note FP32 constants as IEEE-754 u32 bit patterns
+const BN4_F32_QUARTER ulong 1048576000
+const BN4_F32_INV6 ulong 1042983595
+const BN4_F32_ONE ulong 1065353216
+const BN4_F32_SIGN_MASK ulong 2147483648
+const BN4_F32_ABS_MASK ulong 2147483647
+const BN4_F32_DITHER_SCALE ulong 1031798784
+const BN4_PHILOX_MUL ulong 3528531795
+const BN4_PHILOX_WEYL ulong 2654435769
+
+fn bn4_pol_a mode ulong to ulong
+if eq mode BN4_MODE_DW
+ret L2_EL
+end
+if eq mode BN4_MODE_DX
+ret L2_LU
+end
+ret L2_NORM
+end
+
+fn bn4_pol_b mode ulong to ulong
+if eq mode BN4_MODE_DW
+ret L2_LU
+end
+ret L2_EL
+end
+
+note Prologue: load cbank params, 8-wide L2 CTA swizzle, bounds exit, SMEM/GMEM pointers
+fn bn4_emit_prologue mode ulong to void
+v2_ldcu64 BN4_UREG 856
+v2_ldc64 4 896
+v2_ldc64 6 904
+v2_ldc64 8 912
+v2_ldc64 10 920
+v2_ldc 16 944
+v2_ldc 17 948
+v2_ldc 18 952
+v2_ldc 31 968
+v2_s2r 0 BN4_SR_TID_X
+v2_s2r 1 BN4_SR_CTAID_X
+v2_s2r 2 BN4_SR_CTAID_Y
+v2_s2r 3 BN4_SR_CTAID_Z
+v2_wait 7
+note 8-wide L2-swizzled CTA coords: bid_m in R1, bid_n in R2
+v2_andi 46 1 7
+v2_shr 1 1 3
+v2_imadi 2 2 8 46
+note Early-out bounds check (bid_m * 128 >= M or bid_n * 128 >= N)
+v2_imadi 46 1 128 V2_RZ
+v2_isetp 0 46 16 CMP_GE
+v2_exit_p 0
+v2_imadi 47 2 128 V2_RZ
+v2_isetp 0 47 17 CMP_GE
+v2_exit_p 0
+note Load data strides lda (R16) and ldb (R17); M and N no longer needed in K-loop
+v2_ldc 16 956
+v2_ldc 17 960
+v2_wait 3
+note DW mode split-K K-slice offsets on A_nv4, B_nv4, Sa, Sb (K/2 data bytes, K/16 scale bytes)
+if eq mode BN4_MODE_DW
+v2_shr 46 18 1
+v2_imad 47 3 46 V2_RZ
+v2_imadw 4 47 1 4
+v2_imadw 6 47 1 6
+v2_shr 46 18 4
+v2_imad 47 3 46 V2_RZ
+v2_imadw 8 47 1 8
+v2_imadw 10 47 1 10
+end
+note SMEM stage layout (9216B/stage x 2 = 18432B):
+note   +0: A_nv4 (4096B = 128 rows x 32B), +4096: B_nv4 (4096B),
+note   +8192: Sa_ue4m3 (512B = 128 rows x 4B), +8704: Sb_ue4m3 (512B)
+note Thread loader: row = tid >> 1 (0..127), col_b = (tid & 1) * 16 (0 or 16)
+v2_shr 46 0 1
+v2_andi 47 0 1
+v2_imadi 47 47 16 V2_RZ
+v2_imadi 24 46 32 47
+v2_movi 42 4096
+v2_iadd3 25 24 42 V2_RZ
+note Scale write offset for tid < 128: 8192 + tid * 4 (Sb is at +512)
+v2_movi 42 8192
+v2_imadi 26 0 4 42
+note Initial global load pointers for A_nv4 (R4:R5), B_nv4 (R6:R7), Sa (R8:R9), Sb (R10:R11)
+v2_imadi 42 1 128 46
+v2_imadwr 4 42 16 4
+v2_movi 23 1
+v2_imadwr 4 23 47 4
+v2_imadi 43 2 128 46
+v2_imadwr 6 43 17 6
+v2_imadwr 6 23 47 6
+note Scale row stride = K >> 4 bytes (4 bytes per K=64 block)
+v2_shr 44 18 4
+v2_andi 45 0 127
+v2_imadi 42 1 128 45
+v2_imadwr 8 42 44 8
+v2_imadi 43 2 128 45
+v2_imadwr 10 43 44 10
+note Warp SMEM read offsets (2x4 warp grid, 64x32 warp tile): warp_id=tid>>5, lane=tid&31
+v2_shr 42 0 5
+v2_andi 43 0 31
+v2_shr 44 42 2
+v2_andi 45 42 3
+v2_imadi 46 44 2048 V2_RZ
+v2_imadi 27 43 32 46
+v2_imadi 46 45 1024 V2_RZ
+v2_movi 47 4096
+v2_iadd3 46 46 47 V2_RZ
+v2_imadi 28 43 32 46
+v2_imadi 46 44 256 V2_RZ
+v2_movi 47 8192
+v2_iadd3 46 46 47 V2_RZ
+v2_imadi 29 43 4 46
+v2_imadi 46 45 128 V2_RZ
+v2_movi 47 8704
+v2_iadd3 46 46 47 V2_RZ
+v2_imadi 30 43 4 46
+end
+
+note Zero 64 FP32 accumulators (R48..R111) and prime stage 0 with ZERO software unpack
+fn bn4_emit_prime pa ulong pb ulong to void
+for i ulong 64
+v2_movz add 48 i
+end
+v2_movi 19 64
+v2_movz 20
+v2_movi 22 BN4_STAGE_BYTES
+note Prime K=64 block 0: 128-bit NVFP4 data loads + predicated 32-bit UE4M3 scale loads (tid < 128)
+v2_ldg_pol 32 4 BN4_UREG 0 SZ_128 pa
+v2_ldg_pol 36 6 BN4_UREG 0 SZ_128 pb
+v2_movi 46 128
+v2_isetp 0 0 46 CMP_LT
+v2_set_guard 1
+v2_ldg_pol 40 8 BN4_UREG 0 SZ_32 pa
+v2_set_guard 1
+v2_ldg_pol 41 10 BN4_UREG 0 SZ_32 pb
+note Advance global pointers: data += 32B (64 FP4), scales += 4B (4 UE4M3)
+v2_imadw 4 23 32 4
+v2_imadw 6 23 32 6
+v2_imadw 8 23 4 8
+v2_imadw 10 23 4 10
+v2_wait 3
+note Stage primed data and scales into SMEM stage 0
+v2_sts 24 32 0 SZ_128
+v2_sts 25 36 0 SZ_128
+v2_set_guard 1
+v2_sts 26 40 0 SZ_32
+v2_set_guard 1
+v2_sts 26 41 512 SZ_32
+v2_bar
+end
+
+note Pipelined double-buffered K=64 loop executing 16x OMMA.SF.16864 (8-cycle independent-acc spacing)
+fn bn4_emit_kloop pa ulong pb ulong to void
+loop_pc = v2_pc
+note P0 = (k_iter < K); flip alternate stage offset in R21
+v2_isetp 0 19 18 CMP_LT
+v2_lop3 21 20 22 V2_RZ 60
+note Prefetch next K=64 block (predicated @P0) while OMMA executes current SMEM stage
+v2_set_guard 1
+v2_ldg_pol 32 4 BN4_UREG 0 SZ_128 pa
+v2_set_guard 1
+v2_ldg_pol 36 6 BN4_UREG 0 SZ_128 pb
+note Compute current-stage SMEM read pointers: A(R42), B(R43), Sa(R44), Sb(R45)
+v2_iadd3 42 27 20 V2_RZ
+v2_iadd3 43 28 20 V2_RZ
+v2_iadd3 44 29 20 V2_RZ
+v2_iadd3 45 30 20 V2_RZ
+note Load all 4 B NVFP4 fragment pairs (R116..R123) and all 4 Sb UE4M3 scale words (R12..R15) once
+v2_lds 116 43 0 SZ_128
+v2_lds 120 43 512 SZ_128
+v2_lds 12 45 0 SZ_128
+note Execute 4 M-rows x 4 N-cols = 16x OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X (stall=8)
+for m ulong 4
+v2_lds 112 42 mul m 512 SZ_128
+v2_lds 124 44 mul m 64 SZ_32
+v2_wait 3
+base = add 48 mul m 16
+v2_omma_nvfp4 base 112 116 124 12 8
+v2_omma_nvfp4 add base 4 112 118 124 13 8
+v2_omma_nvfp4 add base 8 112 120 124 14 8
+v2_omma_nvfp4 add base 12 112 122 124 15 8
+end
+note Prefetch next K=64 UE4M3 scales strictly when (tid < 128 && k_iter < K)
+v2_movz 46
+v2_set_guard 1
+v2_movi 46 128
+v2_isetp 0 0 46 CMP_LT
+v2_set_guard 1
+v2_ldg_pol 40 8 BN4_UREG 0 SZ_32 pa
+v2_set_guard 1
+v2_ldg_pol 41 10 BN4_UREG 0 SZ_32 pb
+v2_wait 3
+v2_iadd3 42 24 21 V2_RZ
+v2_iadd3 43 25 21 V2_RZ
+v2_iadd3 44 26 21 V2_RZ
+note Stage scale bytes into next SMEM stage strictly for (tid < 128 && k_iter < K)
+v2_set_guard 1
+v2_sts 44 40 0 SZ_32
+v2_set_guard 1
+v2_sts 44 41 512 SZ_32
+note Stage data tiles into next SMEM stage for all 256 threads when (k_iter < K)
+v2_isetp 0 19 18 CMP_LT
+v2_set_guard 1
+v2_sts 42 32 0 SZ_128
+v2_set_guard 1
+v2_sts 43 36 0 SZ_128
+note Advance global pointers (+32B data, +4B scale), k_iter += 64, flip stage, sync & branch
+v2_imadw 4 23 32 4
+v2_imadw 6 23 32 6
+v2_imadw 8 23 4 8
+v2_imadw 10 23 4 10
+v2_movi 46 64
+v2_iadd3 19 19 46 V2_RZ
+v2_iadd3 20 21 V2_RZ V2_RZ
+v2_bar
+v2_bra_to 0 loop_pc
+end
+
+note Compute output pointer R12:R13 (ptr_C) and auxiliary/scale pointer R14:R15 (ptr_Sc_aux)
+fn bn4_emit_epi_addr mode ulong epi ulong to void
+v2_ldc64 12 928
+v2_ldc64 14 936
+v2_ldc 16 964
+v2_ldc 17 972
+v2_wait 3
+if eq mode BN4_MODE_DW
+v2_imadwr 12 3 17 12
+end
+note Thread output coords: warp_m=(tid>>7), warp_n=((tid>>5)&3), lane=(tid&31)
+v2_shr 42 0 7
+v2_shr 43 0 5
+v2_andi 43 43 3
+v2_andi 44 0 31
+v2_shr 45 44 2
+v2_imadi 46 42 64 45
+v2_imadi 42 1 128 46
+v2_andi 45 44 3
+v2_imadi 46 43 32 V2_RZ
+v2_imadi 47 2 128 46
+v2_imadi 45 45 4 47
+v2_imadwr 12 42 16 12
+if and ne mode BN4_MODE_DW eq epi BN4_EPI_NVFP4_OUT
+v2_shr 46 45 1
+v2_imadw 12 46 1 12
+v2_shr 46 45 4
+v2_imadw 14 42 8 14
+v2_imadw 14 46 1 14
+else
+v2_imadw 12 45 4 12
+v2_imadwr 14 42 16 14
+v2_imadw 14 45 4 14
+end
+end
+
+note In-register 16x16 Random Hadamard Transform (SHFL.BFLY deltas 1, 2, 4, 8) on reg r
+fn bn4_emit_rht16 r ulong lane_r ulong to void
+note Random Rademacher sign flip from Philox key R31 ^ lane_r -> sign bit in R46
+v2_lop3 46 31 lane_r V2_RZ 60
+v2_movi 47 BN4_F32_SIGN_MASK
+v2_lop3 46 46 47 V2_RZ 192
+v2_lop3 r r 46 V2_RZ 60
+note 4 butterfly stages: deltas 1, 2, 4, 8 across 16-lane sub-warp
+for st ulong 4
+delta = shl ulong 1 st
+v2_shfl SHFL_BFLY 120 r delta 31
+v2_andi 46 lane_r delta
+v2_isetp 0 46 V2_RZ CMP_NE
+v2_fadd 121 r 120
+v2_fsub 122 120 r
+v2_fsel r 122 121 0
+end
+note Normalize by 1/sqrt(16) = 0.25
+v2_movi 47 BN4_F32_QUARTER
+v2_fmul r r 47
+end
+
+note Emit Philox-2x32 dither value into R123 (uniform in [-step/2, +step/2] for stochastic rounding)
+fn bn4_emit_philox_dither to void
+v2_imadi 46 0 257 3
+v2_lop3 46 46 31 V2_RZ 60
+v2_imadi 47 46 BN4_PHILOX_MUL BN4_PHILOX_WEYL
+v2_lop3 46 47 31 V2_RZ 60
+v2_imadi 47 46 BN4_PHILOX_MUL BN4_PHILOX_WEYL
+note Map random u32 -> IEEE-754 float in [1.0, 2.0), subtract 1.0, scale by dither step
+v2_shr 47 47 9
+v2_movi 46 BN4_F32_ONE
+v2_lop3 123 47 46 V2_RZ 252
+v2_fsub 123 123 46
+v2_movi 46 BN4_F32_DITHER_SCALE
+v2_fmul 123 123 46
+end
+
+note DW mode epilogue: 16x16 RHT + Philox dithered F2FP.E4M3/E2M1 + deterministic L2 split-K STG.E.128.EL
+fn bn4_emit_epi_dw to void
+v2_andi 44 0 31
+note Copy R48..R51 into R112..R115 so R48..R111 remain exact FP32 accumulators for split-K L2 reduction
+for c ulong 4
+v2_iadd3 add 112 c add 48 c V2_RZ V2_RZ
+end
+note Apply in-register 16x16 Random Hadamard Transform (SHFL.BFLY 1,2,4,8) on R112..R115
+bn4_emit_rht16 112 44
+bn4_emit_rht16 113 44
+bn4_emit_rht16 114 44
+bn4_emit_rht16 115 44
+note Deterministic Philox dither (R123) + UE4M3 block scale (F2FP.E4M3) + E2M1 pack (F2FP.E2M1)
+bn4_emit_philox_dither
+v2_movi 46 BN4_F32_ABS_MASK
+v2_lop3 116 112 46 V2_RZ 192
+v2_lop3 117 113 46 V2_RZ 192
+v2_fmax 116 116 117
+v2_lop3 118 114 46 V2_RZ 192
+v2_lop3 119 115 46 V2_RZ 192
+v2_fmax 118 118 119
+v2_fmax 116 116 118
+v2_movi 47 BN4_F32_INV6
+v2_fmul 117 116 47
+v2_f2fp_e4m3 124 117 117 V2_RZ
+v2_mufu 118 117 MUFU_RCP
+v2_wait 1
+v2_fmul 116 112 118
+v2_fmul 117 113 118
+v2_fmul 119 114 118
+v2_fmul 121 115 118
+v2_fadd 116 116 123
+v2_fadd 117 117 123
+v2_fadd 119 119 123
+v2_fadd 121 121 123
+v2_f2fp_e2m1 120 116 117 V2_RZ
+v2_f2fp_e2m1 120 119 121 120
+note Write quantized scale metadata to aux L2 buffer and ALL 16 FP32 accum quads to split-K L2 buffer
+v2_stg_pol 14 124 BN4_UREG 0 SZ_32 L2_EL
+v2_stg_pol 14 120 BN4_UREG 4 SZ_32 L2_EL
+for q ulong 16
+v2_stg_pol 12 add 48 mul q 4 BN4_UREG mul q 16 SZ_128 L2_EL
+end
+end
+
+note Quantize one 16-element block (4 FP32 quads starting at acc_base) into 2x E2M1 words + 1 UE4M3 scale
+fn bn4_emit_quant_blk16 acc_base ulong dst_word0 ulong sc_dst ulong to void
+note Compute block max-abs across 16 FP32 accumulators into R120
+v2_movi 46 BN4_F32_ABS_MASK
+v2_lop3 120 acc_base 46 V2_RZ 192
+for i ulong 15
+v2_lop3 121 add acc_base add i 1 46 V2_RZ 192
+v2_fmax 120 120 121
+end
+note Scale s = max_abs * (1/6), pack UE4M3 scale via F2FP.E4M3, inv_s = RCP(s)
+v2_movi 47 BN4_F32_INV6
+v2_fmul 121 120 47
+v2_f2fp_e4m3 sc_dst 121 121 sc_dst
+v2_mufu 122 121 MUFU_RCP
+v2_wait 1
+note Pack first 8 elems -> dst_word0, next 8 elems -> dst_word0 + 1 via F2FP.E2M1
+v2_movz dst_word0
+for p ulong 4
+r0 = add acc_base mul p 2
+r1 = add r0 1
+v2_fmul 120 r0 122
+v2_fmul 121 r1 122
+v2_f2fp_e2m1 dst_word0 120 121 dst_word0
+end
+w1 = add dst_word0 1
+v2_movz w1
+for p ulong 4
+r0 = add acc_base add 8 mul p 2
+r1 = add r0 1
+v2_fmul 120 r0 122
+v2_fmul 121 r1 122
+v2_f2fp_e2m1 w1 120 121 w1
+end
+end
+
+note Fused online epilogue NVFP4 quantization (epi == 3, FWD/DX) directly into L2
+fn bn4_emit_epi_nvfp4 to void
+v2_movz 124
+note Quantize 4 blocks of 16 FP32 accumulators (64 elems -> 8x u32 E2M1 words + 4 UE4M3 scales)
+bn4_emit_quant_blk16 48 112 124
+bn4_emit_quant_blk16 64 114 124
+v2_stg_pol 12 112 BN4_UREG 0 SZ_128 L2_EL
+bn4_emit_quant_blk16 80 116 124
+bn4_emit_quant_blk16 96 118 124
+v2_stg_pol 12 116 BN4_UREG 16 SZ_128 L2_EL
+v2_stg_pol 14 124 BN4_UREG 0 SZ_32 L2_EL
+end
+
+fn bn4_emit_epi_std epi ulong to void
+if eq epi BN4_EPI_ADD_RES
+for q ulong 16
+off = mul q 16
+base = add 48 mul q 4
+v2_ldg_pol 112 14 BN4_UREG off SZ_128 L2_NORM
+v2_wait 3
+v2_fadd base base 112
+v2_fadd add base 1 add base 1 113
+v2_fadd add base 2 add base 2 114
+v2_fadd add base 3 add base 3 115
+v2_stg_pol 12 base BN4_UREG off SZ_128 L2_NORM
+end
+else
+if eq epi BN4_EPI_RELU_MASK
+v2_andi 44 0 31
+for q ulong 16
+off = mul q 16
+base = add 48 mul q 4
+for c ulong 4
+r = add base c
+v2_fsetp 0 r V2_RZ CMP_GT
+v2_fsel r r V2_RZ 0
+v2_vote add 112 c V2_PT 0 0
+end
+v2_stg_pol 12 base BN4_UREG off SZ_128 L2_NORM
+v2_isetp 0 44 V2_RZ CMP_EQ
+v2_set_guard 1
+v2_stg_pol 14 112 BN4_UREG off SZ_128 L2_NORM
+end
+else
+for q ulong 16
+v2_stg_pol 12 add 48 mul q 4 BN4_UREG mul q 16 SZ_128 L2_NORM
+end
+end
+end
+end
+
+fn blas_emit_nvfp4_128x128 slot ulong mode ulong epi ulong to ulong
+v2_begin slot BN4_THREADS BN4_SMEM_BYTES
+pa = bn4_pol_a mode
+pb = bn4_pol_b mode
+bn4_emit_prologue mode
+bn4_emit_prime pa pb
+bn4_emit_kloop pa pb
+bn4_emit_epi_addr mode epi
+if eq mode BN4_MODE_DW
+bn4_emit_epi_dw
+else
+if eq epi BN4_EPI_NVFP4_OUT
+bn4_emit_epi_nvfp4
+else
+bn4_emit_epi_std epi
+end
+end
+v2_exit
+ret v2_end 124
+end
+
+note ========================================================================
+note 1.58-bit Ternary (5 trits/byte base-3 packed = 0.2 B/param) L2-pinned LUT-GEMM
+note Up to 503M effective ternary params resident in 24 MiB L2 (with L2.EL pinning).
+note Zero floating-point multiplies for weight products: PRMT byte extract + IMAD base-3
+note reciprocal-multiply decode (*171 >> 9, rem = b - 3*q) + LOP3.LUT (0x28 = (A^B)&C)
+note sign-select + FADD accumulation!
+note
+note Ternary Kernel ABI (cbank 0, c[0x0][0x358..0x3bf]):
+note   0x358 (856): UR4:UR5 global descriptor
+note   0x380 (896): ptr_X       u64 ([M, K] FP32 activations)
+note   0x388 (904): ptr_W_tern  u64 ([N, K/5] packed 5-trits/byte weights, L2.EL)
+note   0x390 (912): ptr_Scale   u64 ([N] FP32 per-row ternary weight scale, L2.EL)
+note   0x398 (920): ptr_Y       u64 ([M, N] FP32 output)
+note   0x3a0 (928): M u32
+note   0x3a4 (932): N u32
+note   0x3a8 (936): K_bytes u32 (K / 5, multiple of 16 bytes = 80 trits)
+note   0x3ac (940): ldx_bytes u32 (K * 4)
+note   0x3b0 (944): ldy_bytes u32 (N * 4)
+
+const TERN_SMEM_BYTES ulong 20480
+const TERN_PRMT_B0 ulong 17472
+const TERN_PRMT_B1 ulong 17473
+const TERN_PRMT_B2 ulong 17474
+const TERN_PRMT_B3 ulong 17475
+const TERN_NEG3 ulong 4294967293
+const TERN_NEG1 ulong 4294967295
+
+note Decode one packed base-3 byte (in R36) across 5 trits using IMAD + LOP3.LUT(40) zero-multiply FADD
+fn tern_emit_decode5 smem_x_reg ulong to void
+v2_movz 37
+v2_movi 38 5
+trit_pc = v2_pc
+note Exact base-3 division for b in 0..242: q = (b * 171) >> 9, digit = b - 3 * q in {0, 1, 2}
+v2_imadi 39 36 171 V2_RZ
+v2_shr 39 39 9
+v2_imadi 40 39 TERN_NEG3 36
+note sign_mask = ((digit - 1) & 0x80000000): 0x80000000 iff trit==-1, else 0
+v2_movi 41 TERN_NEG1
+v2_iadd3 42 40 41 V2_RZ
+v2_movi 43 BN4_F32_SIGN_MASK
+v2_lop3 42 42 43 V2_RZ 192
+note nz_mask = 0 - ((digit ^ 1) & 1): 0xFFFFFFFF iff trit in {-1,+1}, 0x00000000 iff trit==0
+v2_movi 43 1
+v2_lop3 44 40 43 V2_RZ 60
+v2_andi 44 44 1
+v2_imadi 44 44 TERN_NEG1 V2_RZ
+note Advance packed byte quotient b = q for next trit
+v2_iadd3 36 39 V2_RZ V2_RZ
+note Load 4 FP32 activations from SMEM and accumulate via LOP3.LUT (40 = (A^B)&C) + FADD (ZERO FMUL!)
+v2_lds 52 smem_x_reg 0 SZ_128
+v2_wait 3
+for r ulong 4
+v2_lop3 add 56 r add 52 r 42 44 40
+v2_fadd add 64 r add 64 r add 56 r
+end
+note Advance SMEM activation offset by 16B (4 rows x FP32), t += 1, loop 5 trits
+v2_movi 43 16
+v2_iadd3 smem_x_reg smem_x_reg 43 V2_RZ
+v2_movi 43 1
+v2_iadd3 37 37 43 V2_RZ
+v2_isetp 0 37 38 CMP_LT
+v2_bra_to 0 trit_pc
+end
+
+fn blas_emit_ternary_l2_128 slot ulong to ulong
+v2_begin slot BN4_THREADS TERN_SMEM_BYTES
+v2_ldcu64 BN4_UREG 856
+v2_ldc64 4 896
+v2_ldc64 6 904
+v2_ldc64 8 912
+v2_ldc64 10 920
+v2_ldc 12 928
+v2_ldc 13 932
+v2_ldc 14 936
+v2_ldc 15 940
+v2_ldc 16 944
+v2_s2r 0 BN4_SR_TID_X
+v2_s2r 1 BN4_SR_CTAID_X
+v2_s2r 2 BN4_SR_CTAID_Y
+v2_wait 7
+note 8-wide L2 CTA swizzle for 128-wide ternary output tiles
+v2_andi 20 1 7
+v2_shr 18 1 3
+v2_imadi 19 2 8 20
+note Output col = bid_n * 128 + (tid & 127), output row base = bid_m * 128 + (tid >> 7) * 64
+v2_andi 21 0 127
+v2_imadi 22 19 128 21
+v2_isetp 0 22 13 CMP_GE
+v2_exit_p 0
+v2_shr 23 0 7
+v2_imadi 24 23 64 V2_RZ
+v2_imadi 24 18 128 24
+v2_isetp 0 24 12 CMP_GE
+v2_exit_p 0
+note Compute initial global pointers: X (R26:R27), W_tern (R28:R29, L2.EL), Scale (R30:R31, L2.EL)
+v2_imadwr 26 24 15 4
+v2_imadwr 28 22 14 6
+v2_imadw 30 22 4 8
+note Zero 4 FP32 output accumulators (R64..R67) and load per-column ternary scale (R68) via L2.EL
+v2_movz 64
+v2_movz 65
+v2_movz 66
+v2_movz 67
+v2_ldg_pol 68 30 BN4_UREG 0 SZ_32 L2_EL
+note SMEM activation staging offset: tid * 16 (4096B per tile chunk), kb_iter in R32, const 1 in R33
+v2_imadi 34 0 16 V2_RZ
+v2_movz 32
+v2_movi 33 1
+note K-block loop: each pass loads 16 packed bytes = 80 ternary weights via LDG.E.128.EL!
+k_pc = v2_pc
+v2_ldg_pol 48 28 BN4_UREG 0 SZ_128 L2_EL
+v2_ldg_pol 52 26 BN4_UREG 0 SZ_128 L2_NORM
+v2_wait 3
+v2_sts 34 52 0 SZ_128
+v2_bar
+note Walk 4 packed words (R48..R51), extracting each byte via PRMT and decoding 5 trits/byte
+v2_movz 35
+for w ulong 4
+wreg = add 48 w
+v2_prmt 36 wreg TERN_PRMT_B0 V2_RZ
+tern_emit_decode5 35
+v2_prmt 36 wreg TERN_PRMT_B1 V2_RZ
+tern_emit_decode5 35
+v2_prmt 36 wreg TERN_PRMT_B2 V2_RZ
+tern_emit_decode5 35
+v2_prmt 36 wreg TERN_PRMT_B3 V2_RZ
+tern_emit_decode5 35
+end
+note Advance W_tern by 16B (80 trits), X by 320B (80 FP32), kb_iter += 16
+v2_imadw 28 33 16 28
+v2_imadw 26 33 320 26
+v2_movi 43 16
+v2_iadd3 32 32 43 V2_RZ
+v2_bar
+v2_isetp 0 32 14 CMP_LT
+v2_bra_to 0 k_pc
+note Apply per-column ternary scale (R68) once at epilogue and write 4 FP32 outputs
+v2_fmul 64 64 68
+v2_fmul 65 65 68
+v2_fmul 66 66 68
+v2_fmul 67 67 68
+v2_imadwr 70 24 16 10
+v2_imadw 70 22 4 70
+v2_stg_pol 70 64 BN4_UREG 0 SZ_128 L2_NORM
+v2_exit
+ret v2_end 75
+end

@@ -1,0 +1,422 @@
+note SPDX-License-Identifier: Apache-2.0
+note gpu/nvidia/om/blas/gemm_128x128_bf16.om: Native SM121 (Blackwell GB10) BF16 Tensor Core
+note training GEMM (BM=128, BN=128, BK=32, 256 threads, 2x4 warp grid, 64x32 warp tile,
+note 32 FP32 accumulators in R64..R95, 32768-byte double-buffered XOR-swizzled SMEM)
+note and deterministic split-K tree reducer (Byte-Traceability Lock 1: ZERO FP atomics).
+note Composes after gpu/nvidia/om/encoder/bw_enc_sm121_v2.om.
+note
+note Kernel ABI (cbank 0, c[0x0][0x358..0x3bf]):
+note   0x358 (856): u64 global memory descriptor (loaded into UR4:UR5)
+note   0x380 (896): ptr_A   u64 (FWD: X, DX: dY, DW: X^T)
+note   0x388 (904): ptr_B   u64 (FWD: W [L2.EL], DX: W^T [L2.EL], DW: dY^T)
+note   0x390 (912): ptr_C   u64 (FWD/DX: Y/dX, DW: split-K partial buffer [L2.EL])
+note   0x398 (920): ptr_AUX u64 (EPI_ADD_RES: residual R; EPI_RELU_MASK: 1-bit mask)
+note   0x3a0 (928): M u32
+note   0x3a4 (932): N u32
+note   0x3a8 (936): K u32 (per-split K_slice in DW mode)
+note   0x3ac (940): lda_bytes u32
+note   0x3b0 (944): ldb_bytes u32
+note   0x3b4 (948): ldc_bytes u32
+note   0x3b8 (952): grid_m_tiles u32
+note   0x3bc (956): splitk_stride_bytes u32 (per-slice C byte stride in DW mode)
+
+const BLAS_MODE_FWD ulong 0
+const BLAS_MODE_DX ulong 1
+const BLAS_MODE_DW ulong 2
+
+const BLAS_EPI_NONE ulong 0
+const BLAS_EPI_ADD_RES ulong 1
+const BLAS_EPI_RELU_MASK ulong 2
+const BLAS_EPI_BF16_OUT ulong 3
+
+const B16_SR_TID_X ulong 33
+const B16_SR_CTAID_X ulong 37
+const B16_SR_CTAID_Y ulong 38
+const B16_SR_CTAID_Z ulong 39
+
+const B16_UREG ulong 4
+const B16_STAGE_BYTES ulong 16384
+const B16_SMEM_BYTES ulong 32768
+const B16_THREADS ulong 256
+
+fn b16_pol_a mode ulong to ulong
+if eq mode BLAS_MODE_DW
+ret L2_EL
+end
+if eq mode BLAS_MODE_DX
+ret L2_LU
+end
+ret L2_NORM
+end
+
+fn b16_pol_b mode ulong to ulong
+if eq mode BLAS_MODE_DW
+ret L2_LU
+end
+ret L2_EL
+end
+
+fn b16_pol_st mode ulong epi ulong to ulong
+if eq mode BLAS_MODE_DW
+ret L2_EL
+end
+if eq epi BLAS_EPI_BF16_OUT
+ret L2_EL
+end
+ret L2_NORM
+end
+
+note Emit prologue: cbank loads, 8-wide L2 CTA swizzle, bounds exit, warp/thread coords
+fn b16_emit_prologue mode ulong to void
+note Global descriptor UR4:UR5 and kernel arguments
+v2_ldcu64 B16_UREG 856
+v2_ldc64 4 896
+v2_ldc64 6 904
+v2_ldc64 8 912
+v2_ldc64 10 920
+v2_ldc 12 928
+v2_ldc 13 932
+v2_ldc 14 936
+v2_ldc 15 940
+v2_ldc 16 944
+v2_ldc 17 948
+v2_ldc 18 952
+v2_ldc 19 956
+note Read thread and CTA indices
+v2_s2r 0 B16_SR_TID_X
+v2_s2r 1 B16_SR_CTAID_X
+v2_s2r 2 B16_SR_CTAID_Y
+v2_s2r 3 B16_SR_CTAID_Z
+v2_wait 7
+note 8-wide L2-swizzled CTA coordinates: bid_m = ctaid_x >> 3, bid_n = (ctaid_y << 3) + (ctaid_x & 7)
+v2_shr 20 1 3
+v2_andi 44 1 7
+v2_imadi 21 2 8 44
+note Early-out bounds check: exit if bid_m * 128 >= M or bid_n * 128 >= N
+v2_imadi 44 20 128 V2_RZ
+v2_isetp 0 44 12 CMP_GE
+v2_exit_p 0
+v2_imadi 45 21 128 V2_RZ
+v2_isetp 0 45 13 CMP_GE
+v2_exit_p 0
+note Warp decomposition (2x4 warp grid, 64x32 warp tile): warp_m in 0..1, warp_n in 0..3
+v2_shr 22 0 5
+v2_andi 23 0 31
+v2_shr 24 22 2
+v2_andi 25 22 3
+note Thread tile loader coords: load_row = tid >> 2 (0..63), load_col_b = (tid & 3) * 16
+v2_shr 26 0 2
+v2_andi 44 0 3
+v2_imadi 27 44 16 V2_RZ
+note XOR bank-swizzled SMEM write offsets (64B row stride, 8192B A + 8192B B per 16 KiB stage)
+v2_andi 44 26 3
+v2_imadi 45 44 16 V2_RZ
+v2_lop3 45 27 45 V2_RZ 60
+v2_imadi 28 26 64 45
+v2_movi 44 8192
+v2_iadd3 29 28 44 V2_RZ
+note Warp SMEM read offsets (64 rows/warp_m -> 4096B, 32 cols/warp_n -> 2048B)
+v2_imadi 44 24 4096 V2_RZ
+v2_imadi 30 23 64 44
+v2_imadi 45 25 2048 V2_RZ
+v2_imadi 31 23 64 45
+v2_movi 44 8192
+v2_iadd3 31 31 44 V2_RZ
+note Apply split-K slice offsets for DW mode (ZERO FP atomics: disjoint partial slice per ctaid_z)
+if eq mode BLAS_MODE_DW
+v2_imad 44 3 14 V2_RZ
+v2_imadw 4 44 2 4
+v2_imadw 6 44 2 6
+v2_imadwr 8 3 19 8
+end
+end
+
+note Compute initial 64-bit global pointers for double-half 128x32 A and B loads
+fn b16_emit_gmem_init to void
+note A tile rows: base_row = bid_m * 128 + load_row, second half at +64 rows
+v2_imadi 44 20 128 26
+v2_imadwr 32 44 15 4
+v2_movi 45 1
+v2_imadwr 32 45 27 32
+v2_movi 45 64
+v2_iadd3 44 44 45 V2_RZ
+v2_imadwr 34 44 15 4
+v2_movi 45 1
+v2_imadwr 34 45 27 34
+note B tile rows: base_col = bid_n * 128 + load_row, second half at +64 rows
+v2_imadi 44 21 128 26
+v2_imadwr 36 44 16 6
+v2_movi 45 1
+v2_imadwr 36 45 27 36
+v2_movi 45 64
+v2_iadd3 44 44 45 V2_RZ
+v2_imadwr 38 44 16 6
+v2_movi 45 1
+v2_imadwr 38 45 27 38
+end
+
+note Zero 32 FP32 accumulators (R64..R95) and prime double-buffer stage 0
+fn b16_emit_prime pa ulong pb ulong to void
+for i ulong 32
+v2_movz add 64 i
+end
+note Stage control constants: R40=k_iter(32), R41=stage_off(0), R43=16384
+v2_movi 40 32
+v2_movz 41
+v2_movi 43 B16_STAGE_BYTES
+note Prime K-block 0 directly in native BF16 (128-bit vector loads, ZERO FP32->BF16 cast)
+v2_ldg_pol 48 32 B16_UREG 0 SZ_128 pa
+v2_ldg_pol 52 34 B16_UREG 0 SZ_128 pa
+v2_ldg_pol 56 36 B16_UREG 0 SZ_128 pb
+v2_ldg_pol 60 38 B16_UREG 0 SZ_128 pb
+note Advance global pointers by BK * 2 = 64 bytes (64-bit carry-safe via IMAD.WIDE)
+v2_movi 44 1
+v2_imadw 32 44 64 32
+v2_imadw 34 44 64 34
+v2_imadw 36 44 64 36
+v2_imadw 38 44 64 38
+v2_wait 3
+note Store primed tile into stage 0 SMEM (A at +0/+4096, B at +0/+4096 from smem_wr_b)
+v2_sts 28 48 0 SZ_128
+v2_sts 28 52 4096 SZ_128
+v2_sts 29 56 0 SZ_128
+v2_sts 29 60 4096 SZ_128
+v2_bar
+end
+
+note Emit 8 independent HMMA.16816.F32.BF16 instructions for one K=16 substep (4-cycle spacing)
+fn b16_emit_hmma8 b0 ulong b1 ulong to void
+v2_hmma_bf16 64 96 b0 64 4
+v2_hmma_bf16 68 96 b1 68 4
+v2_hmma_bf16 72 100 b0 72 4
+v2_hmma_bf16 76 100 b1 76 4
+v2_hmma_bf16 80 104 b0 80 4
+v2_hmma_bf16 84 104 b1 84 4
+v2_hmma_bf16 88 108 b0 88 4
+v2_hmma_bf16 92 108 b1 92 4
+end
+
+note Emit pipelined double-buffered K-loop (16x HMMA.16816.F32.BF16 per K=32 block)
+fn b16_emit_kloop pa ulong pb ulong to void
+loop_pc = v2_pc
+note P0 = (k_iter < K): predicate next-stage global prefetch and loop back-edge
+v2_isetp 0 40 14 CMP_LT
+v2_lop3 42 41 43 V2_RZ 60
+note Issue async-overlapped next-K native BF16 loads (predicated @P0)
+v2_set_guard 1
+v2_ldg_pol 48 32 B16_UREG 0 SZ_128 pa
+v2_set_guard 1
+v2_ldg_pol 52 34 B16_UREG 0 SZ_128 pa
+v2_set_guard 1
+v2_ldg_pol 56 36 B16_UREG 0 SZ_128 pb
+v2_set_guard 1
+v2_ldg_pol 60 38 B16_UREG 0 SZ_128 pb
+note Compute current-stage SMEM read pointers in R44 (A) and R45 (B)
+v2_iadd3 44 30 41 V2_RZ
+v2_iadd3 45 31 41 V2_RZ
+note K-substep 0 (k=0..15): LDS.128 4x A quads + B0/B1 + prefetch B for k=16..31
+v2_lds 96 44 0 SZ_128
+v2_lds 100 44 1024 SZ_128
+v2_lds 104 44 2048 SZ_128
+v2_lds 108 44 3072 SZ_128
+v2_lds 112 45 0 SZ_128
+v2_lds 116 45 32 SZ_128
+v2_wait 3
+b16_emit_hmma8 112 114
+note K-substep 1 (k=16..31): LDS.128 4x A quads, consume prefetched B in R116..R119
+v2_lds 96 44 32 SZ_128
+v2_lds 100 44 1056 SZ_128
+v2_lds 104 44 2080 SZ_128
+v2_lds 108 44 3104 SZ_128
+v2_wait 3
+b16_emit_hmma8 116 118
+note Stage prefetched K+32 tile into alternate SMEM buffer (predicated @P0)
+v2_iadd3 44 28 42 V2_RZ
+v2_iadd3 45 29 42 V2_RZ
+v2_set_guard 1
+v2_sts 44 48 0 SZ_128
+v2_set_guard 1
+v2_sts 44 52 4096 SZ_128
+v2_set_guard 1
+v2_sts 45 56 0 SZ_128
+v2_set_guard 1
+v2_sts 45 60 4096 SZ_128
+note Advance global pointers by 64B, k_iter += 32, flip double-buffer stage
+v2_movi 44 1
+v2_imadw 32 44 64 32
+v2_imadw 34 44 64 34
+v2_imadw 36 44 64 36
+v2_imadw 38 44 64 38
+v2_movi 45 32
+v2_iadd3 40 40 45 V2_RZ
+v2_iadd3 41 42 V2_RZ V2_RZ
+v2_bar
+v2_bra_to 0 loop_pc
+end
+
+note Compute base epilogue output pointer R46:R47 (and residual/mask pointer R32:R33)
+fn b16_emit_epi_addr epi ulong to void
+note Row = bid_m * 128 + warp_m * 64 + (lane_id >> 2)
+v2_shr 44 23 2
+v2_imadi 45 24 64 44
+v2_imadi 44 20 128 45
+note Col bytes (FP32 = 4B, BF16 = 2B)
+v2_andi 45 23 3
+v2_imadi 26 25 32 V2_RZ
+v2_imadi 27 21 128 26
+v2_imadi 45 45 4 27
+v2_imadwr 46 44 17 8
+if eq epi BLAS_EPI_BF16_OUT
+v2_imadw 46 45 2 46
+else
+v2_imadw 46 45 4 46
+end
+if eq epi BLAS_EPI_ADD_RES
+v2_imadwr 32 44 17 10
+v2_imadw 32 45 4 32
+end
+if eq epi BLAS_EPI_RELU_MASK
+v2_imadi 45 20 16 24
+v2_imadw 32 45 128 10
+end
+end
+
+fn b16_emit_epi_none pol_st ulong to void
+for q ulong 8
+v2_stg_pol 46 add 64 mul q 4 B16_UREG mul q 16 SZ_128 pol_st
+end
+end
+
+fn b16_emit_epi_res pol_st ulong to void
+for q ulong 8
+off = mul q 16
+base = add 64 mul q 4
+v2_ldg_pol 120 32 B16_UREG off SZ_128 L2_NORM
+v2_wait 3
+v2_fadd base base 120
+v2_fadd add base 1 add base 1 121
+v2_fadd add base 2 add base 2 122
+v2_fadd add base 3 add base 3 123
+v2_stg_pol 46 base B16_UREG off SZ_128 pol_st
+end
+end
+
+fn b16_emit_epi_relu pol_st ulong to void
+note P1/P0 lane-0 predicate for 1-bit warp mask writeback
+for q ulong 8
+off = mul q 16
+base = add 64 mul q 4
+for c ulong 4
+r = add base c
+v2_fsetp 0 r V2_RZ CMP_GT
+v2_fsel r r V2_RZ 0
+v2_vote add 120 c V2_PT 0 0
+end
+v2_stg_pol 46 base B16_UREG off SZ_128 pol_st
+v2_isetp 0 23 V2_RZ CMP_EQ
+v2_set_guard 1
+v2_stg_pol 32 120 B16_UREG off SZ_128 L2_NORM
+end
+end
+
+fn b16_emit_epi_bf16 pol_st ulong to void
+note Pack 32 FP32 accumulators (R64..R95) -> 16 BF16x2 regs directly via F2FP.BF16 into L2
+for grp ulong 4
+b = add 64 mul grp 8
+v2_f2fp_bf16 120 b add b 1
+v2_f2fp_bf16 121 add b 2 add b 3
+v2_f2fp_bf16 122 add b 4 add b 5
+v2_f2fp_bf16 123 add b 6 add b 7
+v2_stg_pol 46 120 B16_UREG mul grp 16 SZ_128 pol_st
+end
+end
+
+fn blas_emit_bf16_128x128 slot ulong mode ulong epi ulong to ulong
+v2_begin slot B16_THREADS B16_SMEM_BYTES
+pa = b16_pol_a mode
+pb = b16_pol_b mode
+ps = b16_pol_st mode epi
+b16_emit_prologue mode
+b16_emit_gmem_init
+b16_emit_prime pa pb
+b16_emit_kloop pa pb
+b16_emit_epi_addr epi
+if eq epi BLAS_EPI_ADD_RES
+b16_emit_epi_res ps
+else
+if eq epi BLAS_EPI_RELU_MASK
+b16_emit_epi_relu ps
+else
+if eq epi BLAS_EPI_BF16_OUT
+b16_emit_epi_bf16 ps
+else
+b16_emit_epi_none ps
+end
+end
+end
+v2_exit
+ret v2_end 123
+end
+
+note Companion deterministic split-K tree reducer (ZERO FP atomics — Lock 1 compliant!).
+note Reduces S slices of L2-pinned FP32 partials into dW in fixed pairwise slice order:
+note   0x358 (856): UR4:UR5 global descriptor
+note   0x380 (896): ptr_partials u64 ([S, num_elems] FP32, L2.EL)
+note   0x388 (904): ptr_out      u64 ([num_elems] FP32 dW accumulator, L2.EL)
+note   0x390 (912): num_elems    u32 (multiple of 4)
+note   0x394 (916): split_k      u32 (S >= 1)
+note   0x398 (920): slice_stride u32 (bytes per slice = num_elems * 4)
+fn blas_emit_splitk_reduce slot ulong to ulong
+v2_begin slot B16_THREADS 0
+v2_ldcu64 B16_UREG 856
+v2_ldc64 4 896
+v2_ldc64 6 904
+v2_ldc 8 912
+v2_ldc 9 916
+v2_ldc 10 920
+v2_s2r 0 B16_SR_TID_X
+v2_s2r 1 B16_SR_CTAID_X
+v2_wait 7
+note Global vector index: elem_idx = (ctaid_x * 256 + tid) * 4
+v2_imadi 2 1 256 0
+v2_imadi 3 2 4 V2_RZ
+v2_isetp 0 3 8 CMP_GE
+v2_exit_p 0
+note Compute thread pointers: R12:R13 = &partials[0][elem_idx], R14:R15 = &dW[elem_idx]
+v2_imadw 12 3 4 4
+v2_imadw 14 3 4 6
+note Load existing dW[elem_idx..+3] pinned in L2 (R16..R19)
+v2_ldg_pol 16 14 B16_UREG 0 SZ_128 L2_EL
+v2_wait 3
+note Fixed-order pairwise slice loop: s = 0, 2, 4, ... < split_k
+v2_movz 11
+v2_movi 28 1
+v2_movi 29 2
+loop_pc = v2_pc
+note Slice s pointer in R12:R13, slice s+1 pointer in R30:R31
+v2_imadwr 30 28 10 12
+v2_ldg_pol 20 12 B16_UREG 0 SZ_128 L2_EL
+v2_iadd3 32 11 28 V2_RZ
+v2_isetp 0 32 9 CMP_LT
+v2_movz 24
+v2_movz 25
+v2_movz 26
+v2_movz 27
+v2_set_guard 1
+v2_ldg_pol 24 30 B16_UREG 0 SZ_128 L2_EL
+v2_wait 3
+note Pairwise sum t = P[s] + P[s+1], then deterministic accumulate dW += t
+for c ulong 4
+v2_fadd add 20 c add 20 c add 24 c
+v2_fadd add 16 c add 16 c add 20 c
+end
+note Advance slice pointer by 2 * slice_stride and s += 2
+v2_imadwr 12 29 10 12
+v2_iadd3 11 11 29 V2_RZ
+v2_isetp 0 11 9 CMP_LT
+v2_bra_to 0 loop_pc
+note Store updated dW back into L2 via STG.E.128.EL (ZERO FP atomics)
+v2_stg_pol 14 16 B16_UREG 0 SZ_128 L2_EL
+v2_exit
+ret v2_end 33
+end
