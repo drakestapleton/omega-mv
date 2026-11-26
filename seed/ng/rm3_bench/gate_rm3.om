@@ -1,0 +1,776 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/rm3_bench/gate_rm3.om: Pure Seeded OM-2 Verification Gate for RM3 Paired Efficiency Suite.
+note Linked after seed/ng/sha256.om:
+note   (printf 'om2\n'; cat seed/ng/sha256.om seed/ng/rm3_bench/gate_rm3.om) | seed/out/omc > gate_rm3
+note
+note Run on Spark:
+note   ./gate_rm3 OMC NG RM3_BENCH SCRATCH KERNELS_DIR
+note
+note Proves (fail-closed):
+note   1. Compiles real kernels (fib38, matmul) across all 4 arms (omc, ng @ng front-ir+opt+a64,
+note      gcc -O2 -static, gcc -O3 -static), measuring compile time via rm3_bench time_io.
+note   2. Runs rm3_bench run (interleaved paired timing + exact SHA-256 output parity check) across
+note      all 4 arms on both kernels -> exit 0, RM3_BENCH_PASS, exact output equality verified.
+note   3. 5 fail-closed negative controls:
+note      - neg01_wrong_output: planted mutant outputting fib(38)+1 -> rm3_bench exits 1 + R MISMATCH
+note      - neg02_bad_want: corrupted 64-hex WANT_SHA -> rm3_bench exits 1 + R MISMATCH
+note      - neg03_trap_arm: arm trapping with trap 1 (exit 101) -> rm3_bench exits 1 + R MISMATCH
+note      - neg04_missing_bin: nonexistent arm binary -> rm3_bench exits 1 + R BIN_ERR
+note      - neg05_bad_usage: invalid CLI mode -> rm3_bench exits 2
+
+global gr_omc uchar 512
+global gr_ng uchar 512
+global gr_rb uchar 512
+global gr_scr uchar 512
+global gr_kd uchar 512
+global gr_pa uchar 1024
+global gr_av uchar 8192
+global gr_stb uchar 4
+global gr_want uchar 64
+global gr_out uchar 65536
+global gr_buf uchar 262144
+global gr_dig uchar 32
+
+note gr_n: 0=omc_l 1=ng_l 2=rb_l 3=scr_l 4=kd_l 5=pa_l 6=av_l 7=av_c
+note       8=k_pass 9=neg_pass 10=fails 11=out_l
+global gr_n ulong 16
+
+text gr_s_usage "usage: gate_rm3 OMC NG RM3_BENCH SCRATCH KERNELS_DIR\n"
+text gr_s_fib "fib38"
+text gr_s_mm "matmul"
+text gr_s_gcc "/usr/bin/gcc"
+text gr_s_B "-B/usr/bin/"
+text gr_s_O2 "-O2"
+text gr_s_O3 "-O3"
+text gr_s_static "-static"
+text gr_s_o "-o"
+text gr_s_nul "/dev/null"
+text gr_s_run "run"
+text gr_s_timeio "time_io"
+text gr_s_bogus "bogus"
+text gr_s_1 "1"
+text gr_s_2 "2"
+text gr_s_3 "3"
+text gr_s_arm_omc "omc"
+text gr_s_arm_ng "ng"
+text gr_s_arm_o2 "gccO2"
+text gr_s_arm_o3 "gccO3"
+text gr_s_arm_mut "mutant"
+text gr_s_arm_trp "trapper"
+text gr_s_arm_mis "missing"
+text gr_s_p_fir "@ng front-ir\n"
+text gr_s_p_opt "@ng opt\n"
+text gr_s_p_a64 "@ng a64\n"
+text gr_s_sl "/"
+text gr_s_dot_om ".om"
+text gr_s_dot_c ".c"
+text gr_s_want_pfx "/want/"
+text gr_s_want_sfx ".sha256"
+text gr_s_b_omc "/b_omc"
+text gr_s_b_ng "/b_ng"
+text gr_s_b_o2 "/b_o2"
+text gr_s_b_o3 "/b_o3"
+text gr_s_b_mut "/b_mut"
+text gr_s_b_trp "/b_trp"
+text gr_s_b_mis "/no_such_bin"
+text gr_s_f_in1 "/ng.in1"
+text gr_s_f_ir "/ng.ir"
+text gr_s_f_in2 "/ng.in2"
+text gr_s_f_opt "/ng.opt"
+text gr_s_f_in3 "/ng.in3"
+text gr_s_f_mut "/mut.om"
+text gr_s_f_trp "/trp.om"
+text gr_s_f_out "/g.out"
+text gr_s_f_err "/g.err"
+text gr_s_f_tout "/t.out"
+text gr_s_mut_src "om2\ntext m \"39088170\\n\"\nfn main to int\nw = write 1 m 0 len m\nret 0\nend\n"
+text gr_s_trp_src "om2\nfn main to int\ntrap 1\nret 0\nend\n"
+text gr_s_bad_want "0000000000000000000000000000000000000000000000000000000000000000"
+text gr_s_m_pass "RM3_BENCH_PASS"
+text gr_s_m_mis "R MISMATCH"
+text gr_s_m_bin "R BIN_ERR"
+text gr_s_ok "OK   "
+text gr_s_fl "FAIL "
+text gr_s_nok "NEG_OK "
+text gr_s_nfl "NEG_FAIL "
+text gr_s_n1 "neg01_wrong_output"
+text gr_s_n2 "neg02_bad_want"
+text gr_s_n3 "neg03_trap_arm"
+text gr_s_n4 "neg04_missing_bin"
+text gr_s_n5 "neg05_bad_usage"
+text gr_s_rc " rc="
+text gr_s_gp "GATE_RM3 PASS kernels="
+text gr_s_gf "GATE_RM3 FAIL kernels="
+text gr_s_arms4 " arms=4 neg="
+text gr_s_fails " fail="
+text gr_s_nl "\n"
+
+note ---- Output Helpers ----------------------------------------------------------------------
+fn gr_w s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn gr_wn v ulong to void
+x = v
+i = ulong 32
+for j ulong 21
+i = sub i 1
+put gr_dig i uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 gr_dig i sub 32 i
+ret
+end
+end
+end
+
+note ---- Path, File, and Subprocess Helpers --------------------------------------------------
+fn gr_pclr to void
+put gr_n 5 0
+end
+
+fn gr_pc c ulong to void
+n = get gr_n 5
+if lt n len gr_pa
+put gr_pa n uchar c
+put gr_n 5 add n 1
+end
+end
+
+fn gr_pt s view uchar * to void
+for i ulong len s bound 1024
+gr_pc ulong get s i
+end
+end
+
+fn gr_ps_scr suf view uchar * to void
+gr_pclr
+for i ulong get gr_n 3 bound 512
+gr_pc ulong get gr_scr i
+end
+gr_pt suf
+end
+
+fn gr_ps_kfile knm view uchar * ext view uchar * to void
+gr_pclr
+for i ulong get gr_n 4 bound 512
+gr_pc ulong get gr_kd i
+end
+gr_pt gr_s_sl
+gr_pt knm
+gr_pt ext
+end
+
+fn gr_ps_want knm view uchar * to void
+gr_pclr
+for i ulong get gr_n 4 bound 512
+gr_pc ulong get gr_kd i
+end
+gr_pt gr_s_want_pfx
+gr_pt knm
+gr_pt gr_s_want_sfx
+end
+
+fn gr_ps_omc to void
+gr_pclr
+for i ulong get gr_n 0 bound 512
+gr_pc ulong get gr_omc i
+end
+end
+
+fn gr_ps_ng to void
+gr_pclr
+for i ulong get gr_n 1 bound 512
+gr_pc ulong get gr_ng i
+end
+end
+
+fn gr_ps_rb to void
+gr_pclr
+for i ulong get gr_n 2 bound 512
+gr_pc ulong get gr_rb i
+end
+end
+
+fn gr_fclo fd int to void
+if ge fd 0
+r = fclose fd
+end
+end
+
+fn gr_rdonly to int
+r = fopen gr_pa 0 get gr_n 5 524288 420
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn gr_wronly ex bool to int
+r = unlink gr_pa 0 get gr_n 5
+md = int 420
+if ex
+md = 493
+end
+x = fopen gr_pa 0 get gr_n 5 524865 md
+if lt x 0
+ret -1
+end
+ret int x
+end
+
+fn gr_aclr to void
+put gr_n 6 2
+put gr_n 7 0
+end
+
+fn gr_apa to void
+p = get gr_n 6
+n = get gr_n 5
+for j ulong n bound 1024
+put gr_av add add p 2 j get gr_pa j
+end
+put gr_av p uchar and n 255
+put gr_av add p 1 uchar shr n 8
+put gr_n 6 add p add n 2
+c = add get gr_n 7 1
+put gr_n 7 c
+put gr_av 0 uchar and c 255
+put gr_av 1 uchar shr c 8
+end
+
+fn gr_apa_txt s view uchar * to void
+gr_pclr
+gr_pt s
+gr_apa
+end
+
+fn gr_apa_scr suf view uchar * to void
+gr_ps_scr suf
+gr_apa
+end
+
+fn gr_apa_want to void
+gr_pclr
+for i ulong 64
+gr_pc ulong get gr_want i
+end
+gr_apa
+end
+
+fn gr_redir s int d int to void
+if ne dupfd s d 0 long d
+exit 127
+end
+end
+
+fn gr_spawn fi int fo int fe int to ulong
+if or lt fi 0 or lt fo 0 lt fe 0
+gr_fclo fi
+gr_fclo fo
+gr_fclo fe
+ret 512
+end
+pid = fork
+if lt pid 0
+exit 2
+end
+if eq pid 0
+gr_redir fi 0
+gr_redir fo 1
+gr_redir fe 2
+r = execprog gr_av 0 get gr_n 6
+exit 127
+end
+gr_fclo fi
+gr_fclo fo
+gr_fclo fe
+r = waitpid int pid gr_stb 0 len gr_stb 0
+if ne r pid
+exit 2
+end
+sig = ulong get gr_stb 0
+if ne sig 0
+ret add 256 sig
+end
+ret ulong get gr_stb 1
+end
+
+fn gr_write_scr suf view uchar * src view uchar * to bool
+gr_ps_scr suf
+fd = gr_wronly false
+if lt fd 0
+ret false
+end
+n = len src
+o = ulong 0
+while lt o n bound 65537
+k = write fd src o sub n o
+if le k 0
+gr_fclo fd
+ret false
+end
+o = add o ulong k
+end
+gr_fclo fd
+ret true
+end
+
+fn gr_prepend_file pfx view uchar * dst_suf view uchar * to bool
+note Reads currently loaded gr_pa file into gr_buf, writes pfx + gr_buf to SCRATCH/dst_suf
+fd1 = gr_rdonly
+if lt fd1 0
+ret false
+end
+n = ulong 0
+while lt n len gr_buf bound 262145
+k = read fd1 gr_buf n sub len gr_buf n
+if lt k 0
+gr_fclo fd1
+ret false
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+gr_fclo fd1
+gr_ps_scr dst_suf
+fd2 = gr_wronly false
+if lt fd2 0
+ret false
+end
+k1 = write fd2 pfx 0 len pfx
+if ne k1 long len pfx
+gr_fclo fd2
+ret false
+end
+o = ulong 0
+while lt o n bound 262145
+k2 = write fd2 gr_buf o sub n o
+if le k2 0
+gr_fclo fd2
+ret false
+end
+o = add o ulong k2
+end
+gr_fclo fd2
+ret true
+end
+
+fn gr_slurp_out to ulong
+gr_ps_scr gr_s_f_out
+fd = gr_rdonly
+if lt fd 0
+put gr_n 11 0
+ret 0
+end
+n = ulong 0
+while lt n len gr_out bound 65537
+k = read fd gr_out n sub len gr_out n
+if le k 0
+break
+end
+n = add n ulong k
+end
+gr_fclo fd
+put gr_n 11 n
+ret n
+end
+
+fn gr_out_has needle view uchar * to bool
+n = get gr_n 11
+m = len needle
+if lt n m
+ret false
+end
+lim = add sub n m 1
+for i ulong lim bound 65536
+ok = true
+for j ulong m bound 64
+if ne get gr_out add i j get needle j
+ok = false
+break
+end
+end
+if ok
+ret true
+end
+end
+ret false
+end
+
+fn gr_load_want knm view uchar * to bool
+gr_ps_want knm
+fd = gr_rdonly
+if lt fd 0
+ret false
+end
+n = ulong 0
+while lt n 64 bound 65
+k = read fd gr_want n sub 64 n
+if le k 0
+break
+end
+n = add n ulong k
+end
+gr_fclo fd
+ret eq n 64
+end
+
+fn gr_chmod_scr suf view uchar * to bool
+gr_ps_scr suf
+r = chmod gr_pa 0 get gr_n 5 493
+ret eq r 0
+end
+
+note ---- Compilation Helpers -----------------------------------------------------------------
+fn gr_compile_omc is_k bool src view uchar * bin_suf view uchar * to bool
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_timeio
+if is_k
+gr_ps_kfile src gr_s_dot_om
+else
+gr_ps_scr src
+end
+gr_apa
+gr_apa_scr bin_suf
+gr_apa_scr gr_s_f_err
+gr_ps_omc
+gr_apa
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_tout
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+if ne gr_spawn fi fo fe 0
+ret false
+end
+ret gr_chmod_scr bin_suf
+end
+
+fn gr_ng_step in_suf view uchar * out_suf view uchar * to bool
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_timeio
+gr_apa_scr in_suf
+gr_apa_scr out_suf
+gr_apa_scr gr_s_f_err
+gr_ps_ng
+gr_apa
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_tout
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+ret eq gr_spawn fi fo fe 0
+end
+
+fn gr_compile_ng knm view uchar * to bool
+gr_ps_kfile knm gr_s_dot_om
+if not gr_prepend_file gr_s_p_fir gr_s_f_in1
+ret false
+end
+if not gr_ng_step gr_s_f_in1 gr_s_f_ir
+ret false
+end
+gr_ps_scr gr_s_f_ir
+if not gr_prepend_file gr_s_p_opt gr_s_f_in2
+ret false
+end
+if not gr_ng_step gr_s_f_in2 gr_s_f_opt
+ret false
+end
+gr_ps_scr gr_s_f_opt
+if not gr_prepend_file gr_s_p_a64 gr_s_f_in3
+ret false
+end
+if not gr_ng_step gr_s_f_in3 gr_s_b_ng
+ret false
+end
+ret gr_chmod_scr gr_s_b_ng
+end
+
+fn gr_compile_gcc knm view uchar * opt_flag view uchar * bin_suf view uchar * to bool
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_timeio
+gr_apa_txt gr_s_nul
+gr_apa_txt gr_s_nul
+gr_apa_scr gr_s_f_err
+gr_apa_txt gr_s_gcc
+gr_apa_txt gr_s_B
+gr_apa_txt opt_flag
+gr_apa_txt gr_s_static
+gr_apa_txt gr_s_o
+gr_apa_scr bin_suf
+gr_ps_kfile knm gr_s_dot_c
+gr_apa
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_tout
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+ret eq gr_spawn fi fo fe 0
+end
+
+note ---- Positive 4-Arm Kernel Test ----------------------------------------------------------
+fn gr_test_kernel knm view uchar * to void
+if not gr_load_want knm
+gr_w gr_s_fl
+gr_w knm
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+ret
+end
+if not gr_compile_omc true knm gr_s_b_omc
+gr_w gr_s_fl
+gr_w knm
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+ret
+end
+if not gr_compile_ng knm
+gr_w gr_s_fl
+gr_w knm
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+ret
+end
+if not gr_compile_gcc knm gr_s_O2 gr_s_b_o2
+gr_w gr_s_fl
+gr_w knm
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+ret
+end
+if not gr_compile_gcc knm gr_s_O3 gr_s_b_o3
+gr_w gr_s_fl
+gr_w knm
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+ret
+end
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_run
+gr_apa_txt gr_s_1
+gr_apa_txt gr_s_3
+gr_ps_scr gr_s_sl
+gr_apa
+gr_apa_txt knm
+gr_apa_want
+gr_apa_txt gr_s_arm_omc
+gr_apa_scr gr_s_b_omc
+gr_apa_txt gr_s_arm_ng
+gr_apa_scr gr_s_b_ng
+gr_apa_txt gr_s_arm_o2
+gr_apa_scr gr_s_b_o2
+gr_apa_txt gr_s_arm_o3
+gr_apa_scr gr_s_b_o3
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_out
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+rc = gr_spawn fi fo fe
+ig = gr_slurp_out
+if and eq rc 0 gr_out_has gr_s_m_pass
+gr_w gr_s_ok
+gr_w knm
+gr_w gr_s_nl
+put gr_n 8 add get gr_n 8 1
+else
+gr_w gr_s_fl
+gr_w knm
+gr_w gr_s_rc
+gr_wn rc
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+end
+end
+
+note ---- 5 Fail-Closed Negative Controls -----------------------------------------------------
+fn gr_run_neg_case nm view uchar * kind ulong to void
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_run
+gr_apa_txt gr_s_1
+gr_apa_txt gr_s_2
+gr_ps_scr gr_s_sl
+gr_apa
+gr_apa_txt gr_s_fib
+gr_apa_want
+gr_apa_txt gr_s_arm_omc
+gr_apa_scr gr_s_b_omc
+if eq kind 1
+gr_apa_txt gr_s_arm_mut
+gr_apa_scr gr_s_b_mut
+end
+if eq kind 2
+gr_apa_txt gr_s_arm_omc
+gr_apa_scr gr_s_b_omc
+end
+if eq kind 3
+gr_apa_txt gr_s_arm_trp
+gr_apa_scr gr_s_b_trp
+end
+if eq kind 4
+gr_apa_txt gr_s_arm_mis
+gr_apa_scr gr_s_b_mis
+end
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_out
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+rc = gr_spawn fi fo fe
+ig = gr_slurp_out
+has_m = false
+if eq kind 4
+has_m = gr_out_has gr_s_m_bin
+else
+has_m = gr_out_has gr_s_m_mis
+end
+if and eq rc 1 has_m
+gr_w gr_s_nok
+gr_w nm
+gr_w gr_s_rc
+gr_wn rc
+gr_w gr_s_nl
+put gr_n 9 add get gr_n 9 1
+else
+gr_w gr_s_nfl
+gr_w nm
+gr_w gr_s_rc
+gr_wn rc
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+end
+end
+
+fn gr_run_neg_controls to void
+note Rebuild fib38 omc arm + load true fib38 want hash
+ig0 = gr_load_want gr_s_fib
+ig1 = gr_compile_omc true gr_s_fib gr_s_b_omc
+note neg01: planted wrong-output mutant (39088170 instead of 39088169)
+ig2 = gr_write_scr gr_s_f_mut gr_s_mut_src
+ig3 = gr_compile_omc false gr_s_f_mut gr_s_b_mut
+gr_run_neg_case gr_s_n1 1
+note neg02: corrupted WANT_SHA
+for i ulong 64
+put gr_want i get gr_s_bad_want i
+end
+gr_run_neg_case gr_s_n2 2
+note Restore true want hash for neg03 & neg04
+ig4 = gr_load_want gr_s_fib
+note neg03: trapping arm (trap 1 -> exit 101)
+ig5 = gr_write_scr gr_s_f_trp gr_s_trp_src
+ig6 = gr_compile_omc false gr_s_f_trp gr_s_b_trp
+gr_run_neg_case gr_s_n3 3
+note neg04: missing arm binary
+gr_run_neg_case gr_s_n4 4
+note neg05: invalid CLI mode -> exit 2
+gr_aclr
+gr_ps_rb
+gr_apa
+gr_apa_txt gr_s_bogus
+gr_pclr
+gr_pt gr_s_nul
+fi = gr_rdonly
+gr_ps_scr gr_s_f_out
+fo = gr_wronly false
+gr_ps_scr gr_s_f_err
+fe = gr_wronly false
+rc = gr_spawn fi fo fe
+if eq rc 2
+gr_w gr_s_nok
+gr_w gr_s_n5
+gr_w gr_s_rc
+gr_wn rc
+gr_w gr_s_nl
+put gr_n 9 add get gr_n 9 1
+else
+gr_w gr_s_nfl
+gr_w gr_s_n5
+gr_w gr_s_rc
+gr_wn rc
+gr_w gr_s_nl
+put gr_n 10 add get gr_n 10 1
+end
+end
+
+fn gr_load_args to bool
+l0 = argread 1 gr_omc 0 len gr_omc
+if le l0 0
+ret false
+end
+put gr_n 0 ulong l0
+l1 = argread 2 gr_ng 0 len gr_ng
+if le l1 0
+ret false
+end
+put gr_n 1 ulong l1
+l2 = argread 3 gr_rb 0 len gr_rb
+if le l2 0
+ret false
+end
+put gr_n 2 ulong l2
+l3 = argread 4 gr_scr 0 len gr_scr
+if le l3 0
+ret false
+end
+put gr_n 3 ulong l3
+l4 = argread 5 gr_kd 0 len gr_kd
+if le l4 0
+ret false
+end
+put gr_n 4 ulong l4
+ret true
+end
+
+fn main to int
+if ne argcnt 6
+r = write 2 gr_s_usage 0 len gr_s_usage
+ret 2
+end
+if not gr_load_args
+r = write 2 gr_s_usage 0 len gr_s_usage
+ret 2
+end
+gr_test_kernel gr_s_fib
+gr_test_kernel gr_s_mm
+gr_run_neg_controls
+fails = get gr_n 10
+if eq fails 0
+gr_w gr_s_gp
+else
+gr_w gr_s_gf
+end
+gr_wn get gr_n 8
+gr_w gr_s_arms4
+gr_wn get gr_n 9
+gr_w gr_s_fails
+gr_wn fails
+gr_w gr_s_nl
+if ne fails 0
+ret 1
+end
+ret 0
+end

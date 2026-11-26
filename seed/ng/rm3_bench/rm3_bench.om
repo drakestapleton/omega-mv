@@ -1,0 +1,725 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/rm3_bench/rm3_bench.om: Pure Seeded OM-2 Interleaved Paired A/B Benchmark Conductor
+note for Omega 1.0 RM3 Efficiency Suite.
+note Linked after seed/ng/sha256.om:
+note   (printf 'om2\n'; cat seed/ng/sha256.om seed/ng/rm3_bench/rm3_bench.om) | seed/out/omc > rm3_bench
+note
+note Modes:
+note   rm3_bench run WARM REPS SCRATCH CASE WANT_SHA ARM0 BIN0 [ARM1 BIN1 ...]
+note     1. Verifies every arm binary exists, hashes it (M rows: bytes + sha256).
+note     2. Preflight exact-output check across ALL arms FIRST (exit 0 & stdout sha256 == WANT_SHA).
+note        Fail-closed: exits 1 on ANY mismatch or nonzero exit before timing begins.
+note     3. Runs WARM warm-up rounds (warm=1) + REPS measured rounds (warm=0) in rotated interleaved
+note        order across all arms, timing each run with monons and verifying exit 0 + stdout sha256
+note        on every single execution.
+note     4. Computes exact integer median, min, max over the REPS measured wall_ns per arm (P rows)
+note        and summary (S row). Exit 0 iff fail=0, else exit 1.
+note   rm3_bench time_io IN_FILE OUT_FILE ERR_FILE CMD [ARGS...]
+note     Runs CMD ARGS... with stdin=IN_FILE, stdout=OUT_FILE, stderr=ERR_FILE, timing wall_ns via
+note     monons, printing "C <wall_ns> <exit_code>" on stdout and returning <exit_code>.
+note   rm3_bench check SCRATCH CASE WANT_SHA ARM BIN
+note     Single-arm exact output verification against WANT_SHA. Exit 0 match, 1 mismatch.
+
+const RM_MAX_ARMS ulong 8
+const RM_MAX_REPS ulong 64
+const RM_PATH_STRIDE ulong 512
+const RM_NAME_STRIDE ulong 64
+
+global rm_cmd uchar 64
+global rm_scr uchar 512
+global rm_case uchar 128
+global rm_want uchar 64
+global rm_arm_nm uchar 512
+global rm_arm_nl ulong 8
+global rm_arm_bp uchar 4096
+global rm_arm_bl ulong 8
+global rm_arm_sz ulong 8
+global rm_arm_sha uchar 512
+
+note Measured wall_ns matrix: arm * RM_MAX_REPS + rep
+global rm_wall ulong 512
+global rm_sort ulong 64
+
+global rm_pa uchar 1024
+global rm_av uchar 8192
+global rm_stb uchar 4
+global rm_hex uchar 64
+global rm_dig uchar 32
+global rm_tmp uchar 512
+
+note rm_n: 0=scr_l 1=case_l 2=narms 3=warm 4=reps 5=pa_l 6=av_l 7=av_c 8=ok_cnt 9=fail_cnt
+global rm_n ulong 16
+
+text rm_s_usage "usage: rm3_bench run WARM REPS SCRATCH CASE WANT_SHA ARM0 BIN0 ... | check SCRATCH CASE WANT_SHA ARM BIN | time_io IN OUT ERR CMD [ARGS...]\n"
+text rm_s_run "run"
+text rm_s_check "check"
+text rm_s_timeio "time_io"
+text rm_s_nul "/dev/null"
+text rm_s_rout "/rm3.out"
+text rm_s_rerr "/rm3.err"
+text rm_s_M "M "
+text rm_s_T "T "
+text rm_s_P "P "
+text rm_s_R "R MISMATCH "
+text rm_s_Rbin "R BIN_ERR "
+text rm_s_C "C "
+text rm_s_S "S "
+text rm_s_arms " arms="
+text rm_s_reps " reps="
+text rm_s_ok " ok="
+text rm_s_fail " fail="
+text rm_s_stat " status="
+text rm_s_got " got="
+text rm_s_want " want="
+text rm_s_pass "RM3_BENCH_PASS\n"
+text rm_s_bfail "RM3_BENCH_FAIL\n"
+text rm_s_sp " "
+text rm_s_nl "\n"
+
+note ---- Output Helpers ----------------------------------------------------------------------
+fn rm_w fd int s view uchar * to void
+r = write fd s 0 len s
+end
+
+fn rm_wn fd int v ulong to void
+x = v
+i = ulong 32
+for j ulong 21
+i = sub i 1
+put rm_dig i uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write fd rm_dig i sub 32 i
+ret
+end
+end
+end
+
+fn rm_w_case fd int to void
+r = write fd rm_case 0 get rm_n 1
+end
+
+fn rm_w_arm fd int a ulong to void
+o = mul a RM_NAME_STRIDE
+n = get rm_arm_nl a
+r = write fd rm_arm_nm o n
+end
+
+fn rm_w_hex fd int to void
+r = write fd rm_hex 0 64
+end
+
+note ---- String / Arg Parsing Helpers --------------------------------------------------------
+fn rm_eq_txt buf_n ulong s view uchar * to bool
+if ne buf_n len s
+ret false
+end
+for i ulong buf_n bound 64
+if ne get rm_cmd i get s i
+ret false
+end
+end
+ret true
+end
+
+fn rm_parse_u n ulong to ulong
+if eq n 0
+ret shl ulong 1 63
+end
+v = ulong 0
+for i ulong n bound 32
+c = ulong get rm_tmp i
+if or lt c 48 gt c 57
+ret shl ulong 1 63
+end
+v = add mul v 10 sub c 48
+end
+ret v
+end
+
+fn rm_is_hex64 n ulong to bool
+if ne n 64
+ret false
+end
+for i ulong 64
+c = ulong get rm_want i
+ok = and ge c 48 le c 57
+if and ge c 97 le c 102
+ok = true
+end
+if not ok
+ret false
+end
+end
+ret true
+end
+
+note ---- Path, File, and SHA-256 Helpers -----------------------------------------------------
+fn rm_pclr to void
+put rm_n 5 0
+end
+
+fn rm_pc c ulong to void
+n = get rm_n 5
+if lt n len rm_pa
+put rm_pa n uchar c
+put rm_n 5 add n 1
+end
+end
+
+fn rm_ps_txt s view uchar * to void
+for i ulong len s bound 1024
+rm_pc ulong get s i
+end
+end
+
+fn rm_ps_scr suf view uchar * to void
+rm_pclr
+sn = get rm_n 0
+for i ulong sn bound 512
+rm_pc ulong get rm_scr i
+end
+rm_ps_txt suf
+end
+
+fn rm_ps_arm a ulong to void
+rm_pclr
+o = mul a RM_PATH_STRIDE
+n = get rm_arm_bl a
+for i ulong n bound 512
+rm_pc ulong get rm_arm_bp add o i
+end
+end
+
+fn rm_fclo fd int to void
+if ge fd 0
+r = fclose fd
+end
+end
+
+fn rm_rdonly to int
+r = fopen rm_pa 0 get rm_n 5 524288 420
+if lt r 0
+ret -1
+end
+ret int r
+end
+
+fn rm_wronly to int
+x = fopen rm_pa 0 get rm_n 5 524865 420
+if lt x 0
+ret -1
+end
+ret int x
+end
+
+note Hash file at rm_pa into rm_hex[0..64); returns byte size or 2^63 on error
+fn rm_hash_pa to ulong
+fd = rm_rdonly
+if lt fd 0
+ret shl ulong 1 63
+end
+n = ulong 0
+cap = len sh_dat
+while lt n cap bound 16777217
+k = read fd sh_dat n sub cap n
+if lt k 0
+rm_fclo fd
+ret shl ulong 1 63
+end
+if eq k 0
+break
+end
+n = add n ulong k
+end
+rm_fclo fd
+sh_all n
+for i ulong 32
+b = uint get sh_dig i
+put rm_hex mul i 2 sh_hexd shr b 4
+put rm_hex add mul i 2 1 sh_hexd and b 15
+end
+ret n
+end
+
+fn rm_hex_eq_want to bool
+for i ulong 64
+if ne get rm_hex i get rm_want i
+ret false
+end
+end
+ret true
+end
+
+note ---- Subprocess Execution & Timing Helpers -----------------------------------------------
+fn rm_aclr to void
+put rm_n 6 2
+put rm_n 7 0
+end
+
+fn rm_apa to void
+p = get rm_n 6
+n = get rm_n 5
+for j ulong n bound 1024
+put rm_av add add p 2 j get rm_pa j
+end
+put rm_av p uchar and n 255
+put rm_av add p 1 uchar shr n 8
+put rm_n 6 add p add n 2
+c = add get rm_n 7 1
+put rm_n 7 c
+put rm_av 0 uchar and c 255
+put rm_av 1 uchar shr c 8
+end
+
+fn rm_redir s int d int to void
+if ne dupfd s d 0 long d
+exit 127
+end
+end
+
+note Spawn rm_av with fds (closed here). Returns packed (status << 48) | wall_ns_lo48
+fn rm_spawn_timed fi int fo int fe int to ulong
+if or lt fi 0 or lt fo 0 lt fe 0
+rm_fclo fi
+rm_fclo fo
+rm_fclo fe
+ret shl ulong 512 48
+end
+t0 = monons
+pid = fork
+if lt pid 0
+exit 2
+end
+if eq pid 0
+rm_redir fi 0
+rm_redir fo 1
+rm_redir fe 2
+r = execprog rm_av 0 get rm_n 6
+exit 127
+end
+rm_fclo fi
+rm_fclo fo
+rm_fclo fe
+r = waitpid int pid rm_stb 0 len rm_stb 0
+t1 = monons
+if ne r pid
+exit 2
+end
+dt = ulong 0
+if ge t1 t0
+dt = ulong sub t1 t0
+end
+sig = ulong get rm_stb 0
+st = ulong get rm_stb 1
+if ne sig 0
+st = add 256 sig
+end
+ret or shl st 48 and dt 0xffffffffffff
+end
+
+note Run arm binary a once, redirecting stdout/stderr to SCRATCH/rm3.{out,err}
+note Returns packed (status << 48) | wall_ns, and hashes stdout into rm_hex
+fn rm_exec_arm a ulong to ulong
+rm_aclr
+rm_ps_arm a
+rm_apa
+rm_pclr
+rm_ps_txt rm_s_nul
+fi = rm_rdonly
+rm_ps_scr rm_s_rout
+fo = rm_wronly
+rm_ps_scr rm_s_rerr
+fe = rm_wronly
+res = rm_spawn_timed fi fo fe
+rm_ps_scr rm_s_rout
+ig = rm_hash_pa
+ret res
+end
+
+note ---- Run & Check Modes -------------------------------------------------------------------
+fn rm_load_arm a ulong ai_nm ulong ai_bp ulong to bool
+ln = argread ai_nm rm_tmp 0 len rm_tmp
+if or le ln 0 gt ulong ln RM_NAME_STRIDE
+ret false
+end
+on = mul a RM_NAME_STRIDE
+for i ulong ulong ln bound 64
+put rm_arm_nm add on i get rm_tmp i
+end
+put rm_arm_nl a ulong ln
+lb = argread ai_bp rm_tmp 0 len rm_tmp
+if or le lb 0 gt ulong lb RM_PATH_STRIDE
+ret false
+end
+ob = mul a RM_PATH_STRIDE
+for i ulong ulong lb bound 512
+put rm_arm_bp add ob i get rm_tmp i
+end
+put rm_arm_bl a ulong lb
+ret true
+end
+
+fn rm_verify_bins to bool
+k = get rm_n 2
+for a ulong k bound 8
+rm_ps_arm a
+sz = rm_hash_pa
+if ge sz shl ulong 1 63
+rm_w 1 rm_s_Rbin
+rm_w_case 1
+rm_w 1 rm_s_sp
+rm_w_arm 1 a
+rm_w 1 rm_s_nl
+ret false
+end
+put rm_arm_sz a sz
+os = mul a 64
+for j ulong 64
+put rm_arm_sha add os j get rm_hex j
+end
+rm_w 1 rm_s_M
+rm_w_case 1
+rm_w 1 rm_s_sp
+rm_w_arm 1 a
+rm_w 1 rm_s_sp
+rm_wn 1 sz
+rm_w 1 rm_s_sp
+rm_w_hex 1
+rm_w 1 rm_s_nl
+end
+ret true
+end
+
+fn rm_report_mismatch a ulong st ulong to void
+rm_w 1 rm_s_R
+rm_w_case 1
+rm_w 1 rm_s_sp
+rm_w_arm 1 a
+rm_w 1 rm_s_stat
+rm_wn 1 st
+rm_w 1 rm_s_got
+rm_w_hex 1
+rm_w 1 rm_s_want
+r = write 1 rm_want 0 64
+rm_w 1 rm_s_nl
+end
+
+note Preflight: verify every arm produces exact exit=0 and stdout sha256 == WANT_SHA BEFORE timing
+fn rm_preflight to bool
+k = get rm_n 2
+for a ulong k bound 8
+res = rm_exec_arm a
+st = shr res 48
+if or ne st 0 not rm_hex_eq_want
+rm_report_mismatch a st
+ret false
+end
+end
+ret true
+end
+
+fn rm_sort_arm a ulong reps ulong to void
+base = mul a RM_MAX_REPS
+for i ulong reps bound 64
+put rm_sort i get rm_wall add base i
+end
+for i ulong reps bound 64
+if gt i 0
+key = get rm_sort i
+j = i
+while gt j 0 bound 64
+prev = get rm_sort sub j 1
+if le prev key
+break
+end
+put rm_sort j prev
+j = sub j 1
+end
+put rm_sort j key
+end
+end
+end
+
+fn rm_emit_stats to void
+k = get rm_n 2
+reps = get rm_n 4
+mid = div reps 2
+for a ulong k bound 8
+rm_sort_arm a reps
+rm_w 1 rm_s_P
+rm_w_case 1
+rm_w 1 rm_s_sp
+rm_w_arm 1 a
+rm_w 1 rm_s_sp
+rm_wn 1 get rm_sort mid
+rm_w 1 rm_s_sp
+rm_wn 1 get rm_sort 0
+rm_w 1 rm_s_sp
+rm_wn 1 get rm_sort sub reps 1
+rm_w 1 rm_s_sp
+rm_wn 1 get rm_arm_sz a
+rm_w 1 rm_s_nl
+end
+end
+
+fn rm_run_one rd ulong is_w ulong pos ulong a ulong to void
+res = rm_exec_arm a
+st = shr res 48
+dt = and res 0xffffffffffff
+ok = ulong 0
+if and eq st 0 rm_hex_eq_want
+ok = 1
+put rm_n 8 add get rm_n 8 1
+else
+put rm_n 9 add get rm_n 9 1
+rm_report_mismatch a st
+end
+if eq is_w 0
+mrep = sub rd get rm_n 3
+put rm_wall add mul a RM_MAX_REPS mrep dt
+end
+rm_w 1 rm_s_T
+rm_w_case 1
+rm_w 1 rm_s_sp
+rm_wn 1 rd
+rm_w 1 rm_s_sp
+rm_wn 1 is_w
+rm_w 1 rm_s_sp
+rm_wn 1 pos
+rm_w 1 rm_s_sp
+rm_w_arm 1 a
+rm_w 1 rm_s_sp
+rm_wn 1 dt
+rm_w 1 rm_s_sp
+rm_wn 1 st
+rm_w 1 rm_s_sp
+rm_wn 1 ok
+rm_w 1 rm_s_nl
+end
+
+fn rm_run_round rd ulong is_w ulong to void
+k = get rm_n 2
+rev = eq rem rd 2 1
+for pos ulong k bound 8
+idx = pos
+if rev
+idx = sub sub k 1 pos
+end
+a = rem add rd idx k
+rm_run_one rd is_w pos a
+end
+end
+
+fn rm_parse_run_hdr to bool
+lw = argread 2 rm_tmp 0 len rm_tmp
+if le lw 0
+ret false
+end
+warm = rm_parse_u ulong lw
+if ge warm 64
+ret false
+end
+lr = argread 3 rm_tmp 0 len rm_tmp
+if le lr 0
+ret false
+end
+reps = rm_parse_u ulong lr
+if or eq reps 0 gt reps RM_MAX_REPS
+ret false
+end
+put rm_n 3 warm
+put rm_n 4 reps
+ls = argread 4 rm_scr 0 len rm_scr
+if le ls 0
+ret false
+end
+put rm_n 0 ulong ls
+lc = argread 5 rm_case 0 len rm_case
+if le lc 0
+ret false
+end
+put rm_n 1 ulong lc
+lh = argread 6 rm_want 0 len rm_want
+if not rm_is_hex64 ulong lh
+ret false
+end
+ret true
+end
+
+fn rm_mode_run ac ulong to int
+if lt ac 9
+rm_w 2 rm_s_usage
+ret 2
+end
+rem_a = sub ac 7
+if ne rem rem_a 2 0
+rm_w 2 rm_s_usage
+ret 2
+end
+k = div rem_a 2
+if or eq k 0 gt k RM_MAX_ARMS
+rm_w 2 rm_s_usage
+ret 2
+end
+put rm_n 2 k
+if not rm_parse_run_hdr
+rm_w 2 rm_s_usage
+ret 2
+end
+for a ulong k bound 8
+if not rm_load_arm a add 7 mul a 2 add 8 mul a 2
+rm_w 2 rm_s_usage
+ret 2
+end
+end
+if not rm_verify_bins
+rm_w 1 rm_s_bfail
+ret 1
+end
+if not rm_preflight
+rm_w 1 rm_s_bfail
+ret 1
+end
+warm = get rm_n 3
+reps = get rm_n 4
+tot = add warm reps
+for rd ulong tot bound 128
+is_w = ulong 0
+if lt rd warm
+is_w = 1
+end
+rm_run_round rd is_w
+end
+rm_emit_stats
+rm_w 1 rm_s_S
+rm_w_case 1
+rm_w 1 rm_s_arms
+rm_wn 1 k
+rm_w 1 rm_s_reps
+rm_wn 1 reps
+rm_w 1 rm_s_ok
+rm_wn 1 get rm_n 8
+rm_w 1 rm_s_fail
+rm_wn 1 get rm_n 9
+rm_w 1 rm_s_nl
+if ne get rm_n 9 0
+rm_w 1 rm_s_bfail
+ret 1
+end
+rm_w 1 rm_s_pass
+ret 0
+end
+
+fn rm_mode_check ac ulong to int
+if ne ac 7
+rm_w 2 rm_s_usage
+ret 2
+end
+ls = argread 2 rm_scr 0 len rm_scr
+lc = argread 3 rm_case 0 len rm_case
+lh = argread 4 rm_want 0 len rm_want
+if or le ls 0 or le lc 0 not rm_is_hex64 ulong lh
+rm_w 2 rm_s_usage
+ret 2
+end
+put rm_n 0 ulong ls
+put rm_n 1 ulong lc
+put rm_n 2 1
+if not rm_load_arm 0 5 6
+rm_w 2 rm_s_usage
+ret 2
+end
+if not rm_verify_bins
+rm_w 1 rm_s_bfail
+ret 1
+end
+if not rm_preflight
+rm_w 1 rm_s_bfail
+ret 1
+end
+rm_w 1 rm_s_pass
+ret 0
+end
+
+fn rm_load_pa_arg idx ulong to bool
+l = argread idx rm_pa 0 len rm_pa
+if le l 0
+ret false
+end
+put rm_n 5 ulong l
+ret true
+end
+
+fn rm_mode_timeio ac ulong to int
+if lt ac 6
+rm_w 2 rm_s_usage
+ret 2
+end
+if not rm_load_pa_arg 2
+rm_w 2 rm_s_usage
+ret 2
+end
+fi = rm_rdonly
+if not rm_load_pa_arg 3
+rm_fclo fi
+rm_w 2 rm_s_usage
+ret 2
+end
+fo = rm_wronly
+if not rm_load_pa_arg 4
+rm_fclo fi
+rm_fclo fo
+rm_w 2 rm_s_usage
+ret 2
+end
+fe = rm_wronly
+rm_aclr
+nargs = sub ac 5
+for i ulong nargs bound 64
+if not rm_load_pa_arg add 5 i
+rm_fclo fi
+rm_fclo fo
+rm_fclo fe
+rm_w 2 rm_s_usage
+ret 2
+end
+rm_apa
+end
+res = rm_spawn_timed fi fo fe
+st = shr res 48
+dt = and res 0xffffffffffff
+rm_w 1 rm_s_C
+rm_wn 1 dt
+rm_w 1 rm_s_sp
+rm_wn 1 st
+rm_w 1 rm_s_nl
+if gt st 255
+ret 127
+end
+ret int st
+end
+
+fn main to int
+ac = argcnt
+if lt ac 2
+rm_w 2 rm_s_usage
+ret 2
+end
+lc = argread 1 rm_cmd 0 len rm_cmd
+if le lc 0
+rm_w 2 rm_s_usage
+ret 2
+end
+if rm_eq_txt ulong lc rm_s_run
+ret rm_mode_run ulong ac
+end
+if rm_eq_txt ulong lc rm_s_check
+ret rm_mode_check ulong ac
+end
+if rm_eq_txt ulong lc rm_s_timeio
+ret rm_mode_timeio ulong ac
+end
+rm_w 2 rm_s_usage
+ret 2
+end
