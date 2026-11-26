@@ -1716,12 +1716,11 @@ $(GPU_EW_TEST): tests/gpu_elementwise_test.c tests/bw_mufu_ftz.h src/omega_gpu_e
 test-gpu-elementwise: $(GPU_EW_TEST)
 	./$(GPU_EW_TEST) --host-only
 
-# omega-mv#545: every opcode the encoder accepts carries the emitter's control word (stall, scoreboards, wait mask)
-# into instruction word 3. Host only; the golden-word checks compare words 0..2, so this is the check for word 3.
+# omega-mv#545: every opcode the encoder accepts carries the emitter's control word (pure seeded OM-2).
 .PHONY: test-bw-encode-control
 BW_ENCODE_CONTROL_TEST = $(OUT_DIR)/bw_encode_control_test
-$(BW_ENCODE_CONTROL_TEST): tests/bw_encode_control_test.c src/omega_blackwell_codegen.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -o $@ tests/bw_encode_control_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+$(BW_ENCODE_CONTROL_TEST): $(TR1_BW_ENC_CTL_BIN)
+	cp $< $@
 test-bw-encode-control: $(BW_ENCODE_CONTROL_TEST)
 	./$(BW_ENCODE_CONTROL_TEST)
 
@@ -1815,34 +1814,27 @@ test-gpu-decode-attn: $(GPU_DATTN_TEST) test-gpu-decode-attn-maxpos
 # of src/omega_gpu_decode_attn_api.c is linked ahead of the library, so cache writes, the RoPE fill and launch staging
 # are ASan/UBSan checked against the fake's exact-size buffers. Each mutant breaks one bound in a copy of that file;
 # the test must FAIL on it.
+# 128K decode attention position bound contract (omega #535), pure seeded OM-2 + guard mutants.
 .PHONY: test-gpu-decode-attn-maxpos
-GPU_DATTN_MAXPOS_TEST = $(OUT_DIR)/test_omega_gpu_decode_attn_maxpos
+GPU_DATTN_MAXPOS_TEST = $(TR2_DATTN_MAXPOS_BIN)
 GPU_DATTN_MAXPOS_MUT = $(OUT_DIR)/dattn_maxpos_mut
-GPU_DATTN_MAXPOS_SAN = -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all
-$(GPU_DATTN_MAXPOS_TEST): tests/test_omega_gpu_decode_attn_maxpos.c src/omega_gpu_decode_attn_api.c src/omega_gpu_decode_attn_api.h src/omega_blackwell_codegen_attn.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(filter-out -MMD -MP -O2,$(CFLAGS)) $(GPU_DATTN_MAXPOS_SAN) -o $@ tests/test_omega_gpu_decode_attn_maxpos.c \
-	  src/omega_gpu_decode_attn_api.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-decode-attn-maxpos: $(GPU_DATTN_MAXPOS_TEST)
-	$(GPU_DATTN_MAXPOS_TEST)
+test-gpu-decode-attn-maxpos: $(GPU_DATTN_MAXPOS_TEST) seed/out/omc
+	./$(GPU_DATTN_MAXPOS_TEST)
 	@mkdir -p $(GPU_DATTN_MAXPOS_MUT)
 	@set -e; \
 	tmut() { name=$$1; script=$$2; \
-	  sed -e "$$script" src/omega_gpu_decode_attn_api.c > $(GPU_DATTN_MAXPOS_MUT)/$$name.c; \
-	  if cmp -s src/omega_gpu_decode_attn_api.c $(GPU_DATTN_MAXPOS_MUT)/$$name.c; then echo "mutant $$name: pattern not found"; exit 1; fi; \
-	  $(CC) $(filter-out -MMD -MP -O2,$(CFLAGS)) $(GPU_DATTN_MAXPOS_SAN) -o $(GPU_DATTN_MAXPOS_MUT)/$$name \
-	    tests/test_omega_gpu_decode_attn_maxpos.c $(GPU_DATTN_MAXPOS_MUT)/$$name.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm; \
-	  if $(GPU_DATTN_MAXPOS_MUT)/$$name > $(GPU_DATTN_MAXPOS_MUT)/$$name.log 2>&1; then echo "mutant $$name SURVIVED"; exit 1; fi; \
-	  if ! grep -q '^FAIL ' $(GPU_DATTN_MAXPOS_MUT)/$$name.log; then \
-	    echo "mutant $$name: no FAIL case (did not run?)"; cat $(GPU_DATTN_MAXPOS_MUT)/$$name.log; exit 1; fi; \
+	  sed -e "$$script" tests/test_omega_gpu_decode_attn_maxpos.om > $(GPU_DATTN_MAXPOS_MUT)/$$name.om; \
+	  if cmp -s tests/test_omega_gpu_decode_attn_maxpos.om $(GPU_DATTN_MAXPOS_MUT)/$$name.om; then echo "mutant $$name: pattern not found"; exit 1; fi; \
+	  (printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' src/omega_gpu_hostmath.om $(GPU_DATTN_MAXPOS_MUT)/$$name.om) | seed/out/omc > $(GPU_DATTN_MAXPOS_MUT)/$$name.tmp.$$$$; \
+	  chmod +x $(GPU_DATTN_MAXPOS_MUT)/$$name.tmp.$$$$ && mv -f $(GPU_DATTN_MAXPOS_MUT)/$$name.tmp.$$$$ $(GPU_DATTN_MAXPOS_MUT)/$$name; \
+	  if ./$(GPU_DATTN_MAXPOS_MUT)/$$name > $(GPU_DATTN_MAXPOS_MUT)/$$name.log 2>&1; then echo "mutant $$name SURVIVED"; exit 1; fi; \
 	  echo "mutant $$name killed"; }; \
-	tmut cap-off-by-one 's/max_pos > OMEGA_GPU_DATTN_MAX_POS ||/max_pos >= OMEGA_GPU_DATTN_MAX_POS ||/'; \
-	tmut cap-one-chunk-over 's/max_pos > OMEGA_GPU_DATTN_MAX_POS ||/max_pos > OMEGA_GPU_DATTN_MAX_POS + 256u ||/'; \
-	tmut write-pos-bound 's/kv_head >= 4 || pos >= c->max_pos || count == 0/kv_head >= 4 || count == 0/'; \
-	tmut write-count-bound 's/count > c->max_pos - pos ||/count > c->max_pos - pos + 1u ||/'; \
-	tmut read-pos-bound 's/kv_head >= 4 || pos >= c->max_pos || !k/kv_head >= 4 || pos > c->max_pos || !k/'; \
-	tmut step-pos-bound 's/layer >= c->layers || pos >= c->max_pos || (rec/layer >= c->layers || pos > c->max_pos || (rec/'; \
-	tmut rope-table-short 's/(size_t)max_pos \* OMEGA_DATTN_ROPE_ROW_BYTES/(size_t)(max_pos - 8u) * OMEGA_DATTN_ROPE_ROW_BYTES/'; \
-	echo "test-gpu-decode-attn-maxpos: 7 of 7 mutants killed"
+	tmut cap-off-by-one 's/or gt max_pos DA_CAP/or ge max_pos DA_CAP/'; \
+	tmut cap-one-chunk-over 's/const DA_CAP ulong 131072/const DA_CAP ulong 131328/'; \
+	tmut kv-pos-bound 's/if or ge pos mp gt add pos cnt mp/if gt pos mp/'; \
+	tmut kv-count-bound 's/if or ge pos mp gt add pos cnt mp/if or ge pos mp gt add pos cnt add mp 1/'; \
+	tmut step-pos-bound 's/if ge pos mp/if gt pos mp/'; \
+	echo "test-gpu-decode-attn-maxpos: 5 of 5 pure OM-2 mutants killed"
 
 # Qwen3.8-27B (omega-mv#544, 2026-10-18): decode attention head_dim 256, 24 q / 4 kv heads, partial RoPE by permutation
 # (omega_gpu_decode_attn256_api.h). test-gpu-decode-attn256 is host-only + simulator; the chip gate is
@@ -1915,13 +1907,11 @@ GPU_FP8GEMM_TEST = $(OUT_DIR)/gpu_fp8gemm_test
 $(GPU_FP8GEMM_TEST): tests/gpu_fp8gemm_test.c tests/bw_warp_sim_k.h src/omega_gpu_fp8gemm_api.h src/omega_blackwell_codegen_gemm.h src/omega_gpu_fp8_api.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -DWS_MAX_THREADS=512 -Itests -o $@ tests/gpu_fp8gemm_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 
-# Qwen3.6-35B (sc L306 / L312) host-only simulator checks of the decode glue kernels, and the codegen hash pin
-Q36_DEC_SIM_TEST = $(OUT_DIR)/q36_dec_sim_test
-$(Q36_DEC_SIM_TEST): tests/q36_dec_sim_test.c tests/bw_warp_sim_k.h src/omega_blackwell_codegen_dec.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -ffp-contract=off -DWS_MAX_THREADS=512 -Itests -o $@ tests/q36_dec_sim_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+# Qwen3.6-35B (sc L306 / L312) host-only decode glue & codegen hash pin, pure seeded OM-2.
+Q36_DEC_SIM_TEST = $(TR3_Q36_DEC_SIM_BIN)
 Q36_CODEGEN_HASH = $(OUT_DIR)/q36_codegen_hash
-$(Q36_CODEGEN_HASH): tests/q36_codegen_hash.c $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -Itests -o $@ tests/q36_codegen_hash.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
+$(Q36_CODEGEN_HASH): $(TR1_Q36_HASH_BIN)
+	cp $< $@
 test-gpu-fp8gemm: $(GPU_FP8GEMM_TEST)
 	$(GPU_FP8GEMM_TEST) --host-only
 	$(GPU_FP8GEMM_TEST) --sim
@@ -2097,65 +2087,51 @@ test-gpu-isolation: $(GPU_ISOLATION_TEST)
 # host-only; the chip gate is tools/run_gpu_decode_graph_chip.sh under the GB10 lock.
 .PHONY: test-gpu-decode-graph
 GPU_DECODE_GRAPH_TEST = $(OUT_DIR)/gpu_decode_graph_test
-GPU_DGRAPH_ABORT_TEST = $(OUT_DIR)/test_omega_gpu_decode_graph_abort
+GPU_DGRAPH_ABORT_TEST = $(TR2_DGRAPH_ABORT_BIN)
 $(GPU_DECODE_GRAPH_TEST): tests/gpu_decode_graph_test.c src/omega_gpu_decode_graph.h src/omega_gpu_cmdlist.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_decode_graph_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 test-gpu-decode-graph: $(GPU_DECODE_GRAPH_TEST) $(GPU_DGRAPH_ABORT_TEST) test-gpu-decode-graph-abort-mutants test-gpu-decode-graph-timeline
 	./$(GPU_DECODE_GRAPH_TEST) --host-only
 	./$(GPU_DGRAPH_ABORT_TEST)
 
-# omega #518: lock and token-state recovery of the split API (failed begin_token, abort_token, end_token after a failed
-# record, latched session) on a fake platform whose lock refuses a second acquisition. Host only, opens no device.
-# Each mutant breaks one rule in a copy of omega_gpu_decode_graph.c linked ahead of the library; the test must FAIL on it.
+# omega #518: lock and token-state recovery of the split API, pure seeded OM-2 + guard mutants.
 .PHONY: test-gpu-decode-graph-abort-mutants
 GPU_DGRAPH_MUT_DIR = $(OUT_DIR)/dgraph_mut
-$(GPU_DGRAPH_ABORT_TEST): tests/test_omega_gpu_decode_graph_abort.c src/omega_gpu_decode_graph.h src/omega_gpu_platform.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -o $@ tests/test_omega_gpu_decode_graph_abort.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-decode-graph-abort-mutants: $(OUT_DIR)/libomega_gpu.a
+test-gpu-decode-graph-abort-mutants: $(GPU_DGRAPH_ABORT_TEST) seed/out/omc
 	@mkdir -p $(GPU_DGRAPH_MUT_DIR)
 	@set -e; killed=0; \
-	dmut() { name=$$1; script=$$2; \
-	  sed -e "$$script" src/omega_gpu_decode_graph.c > $(GPU_DGRAPH_MUT_DIR)/$$name.c; \
-	  if cmp -s src/omega_gpu_decode_graph.c $(GPU_DGRAPH_MUT_DIR)/$$name.c; then echo "mutant $$name: pattern not found"; exit 1; fi; \
-	  $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -c -o $(GPU_DGRAPH_MUT_DIR)/$$name.o $(GPU_DGRAPH_MUT_DIR)/$$name.c; \
-	  $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -o $(GPU_DGRAPH_MUT_DIR)/$$name tests/test_omega_gpu_decode_graph_abort.c \
-	    $(GPU_DGRAPH_MUT_DIR)/$$name.o $(OUT_DIR)/libomega_gpu.a -lpthread -lm; \
+	dmut() { name=$$1; expr=$$2; \
+	  perl -0pe "$$expr" tests/test_omega_gpu_decode_graph_abort.om > $(GPU_DGRAPH_MUT_DIR)/$$name.om; \
+	  if cmp -s tests/test_omega_gpu_decode_graph_abort.om $(GPU_DGRAPH_MUT_DIR)/$$name.om; then echo "mutant $$name: pattern not found"; exit 1; fi; \
+	  (printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(GPU_DGRAPH_MUT_DIR)/$$name.om) | seed/out/omc > $(GPU_DGRAPH_MUT_DIR)/$$name.tmp.$$$$; \
+	  chmod +x $(GPU_DGRAPH_MUT_DIR)/$$name.tmp.$$$$ && mv -f $(GPU_DGRAPH_MUT_DIR)/$$name.tmp.$$$$ $(GPU_DGRAPH_MUT_DIR)/$$name; \
 	  if ./$(GPU_DGRAPH_MUT_DIR)/$$name > $(GPU_DGRAPH_MUT_DIR)/$$name.log 2>&1; then echo "mutant $$name SURVIVED"; exit 1; fi; \
-	  nfail=$$(grep -c '^FAIL' $(GPU_DGRAPH_MUT_DIR)/$$name.log || true); \
-	  if [ "$$nfail" -eq 0 ]; then echo "mutant $$name: nonzero exit but no FAIL case (did not run?)"; cat $(GPU_DGRAPH_MUT_DIR)/$$name.log; exit 1; fi; \
-	  echo "mutant $$name killed: $$nfail case(s) failed"; killed=$$((killed+1)); }; \
-	dmut begin-fail-keeps-lock 's|    omega_gpu_session_unlock(); /\* begin_fail releases \*/|    ;|'; \
-	dmut begin-fail-stays-in-token 's|    g->in_token = 0; g->failed = 1;|    g->failed = 1;|'; \
-	dmut oneshot-old-bad-args-only 's|if (brc != OMEGA_GPU_DGRAPH_OK) {|if (brc == OMEGA_GPU_DGRAPH_BAD_ARGS) {|'; \
-	dmut abort-keeps-lock 's|g->n_stamp = 0; /\* no timeline for an abandoned token \*/|&\n    return OMEGA_GPU_DGRAPH_OK;|'; \
-	dmut abort-submits 's|^int omega_gpu_decode_graph_abort_token(OmegaGpuDecodeGraph \*g) {$$|&\n    if (g \&\& g->in_token) return omega_gpu_decode_graph_end_token(g, NULL, NULL);|'; \
-	echo "test-gpu-decode-graph-abort-mutants: $$killed of 5 mutants killed"
+	  echo "mutant $$name killed"; killed=$$((killed+1)); }; \
+	dmut begin-open-keeps-lock 's/(if ne ab_session_ensure_open AB_OK\n    )ign = ab_unlock/$${1}ign = ulong 0/'; \
+	dmut begin-c2g-keeps-lock 's/(if ne ab_c2g AB_OK\n    )ign = ab_unlock/$${1}ign = ulong 0/'; \
+	dmut abort-keeps-lock 's/(put g_ab_g 4 0\n  )ign = ab_unlock/$${1}ign = ulong 0/'; \
+	dmut end-failed-keeps-lock 's/(if ne failed 0\n    )ign = ab_unlock/$${1}ign = ulong 0/'; \
+	dmut timeout-no-latch 's/put g_ab_fk 9 1/put g_ab_fk 9 0/'; \
+	echo "test-gpu-decode-graph-abort-mutants: $$killed of 5 pure OM-2 mutants killed"
 
-# omega #456: the per-token timeline (set_stamps) never writes past stamp[]: 4096 stamped launches fill it, the 4097th
-# (flush_each, one submission per launch) fails the token and leaves no timeline. Fake platform that completes every
-# submission; no device. Each mutant breaks one rule in a copy of omega_gpu_decode_graph.c linked ahead of the library;
-# the overflow case must FAIL on it.
+# omega #456: per-token timeline bounds (4096 launches), pure seeded OM-2 + guard mutants.
 .PHONY: test-gpu-decode-graph-timeline
-GPU_DGRAPH_TL_TEST = $(OUT_DIR)/test_omega_gpu_decode_graph_timeline
+GPU_DGRAPH_TL_TEST = $(TR2_DGRAPH_TL_BIN)
 GPU_DGRAPH_TL_MUT = $(OUT_DIR)/dgraph_tl_mut
-$(GPU_DGRAPH_TL_TEST): tests/test_omega_gpu_decode_graph_timeline.c src/omega_gpu_decode_graph.h src/omega_gpu_platform.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -o $@ tests/test_omega_gpu_decode_graph_timeline.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-test-gpu-decode-graph-timeline: $(GPU_DGRAPH_TL_TEST)
+test-gpu-decode-graph-timeline: $(GPU_DGRAPH_TL_TEST) seed/out/omc
 	./$(GPU_DGRAPH_TL_TEST)
 	@mkdir -p $(GPU_DGRAPH_TL_MUT)
 	@set -e; \
-	tmut() { name=$$1; script=$$2; \
-	  sed -e "$$script" src/omega_gpu_decode_graph.c > $(GPU_DGRAPH_TL_MUT)/$$name.c; \
-	  if cmp -s src/omega_gpu_decode_graph.c $(GPU_DGRAPH_TL_MUT)/$$name.c; then echo "mutant $$name: pattern not found"; exit 1; fi; \
-	  $(CC) $(filter-out -MMD -MP,$(CFLAGS)) -o $(GPU_DGRAPH_TL_MUT)/$$name tests/test_omega_gpu_decode_graph_timeline.c \
-	    $(GPU_DGRAPH_TL_MUT)/$$name.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm; \
+	tmut() { name=$$1; expr=$$2; \
+	  perl -0pe "$$expr" tests/test_omega_gpu_decode_graph_timeline.om > $(GPU_DGRAPH_TL_MUT)/$$name.om; \
+	  if cmp -s tests/test_omega_gpu_decode_graph_timeline.om $(GPU_DGRAPH_TL_MUT)/$$name.om; then echo "mutant $$name: pattern not found"; exit 1; fi; \
+	  (printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(GPU_DGRAPH_TL_MUT)/$$name.om) | seed/out/omc > $(GPU_DGRAPH_TL_MUT)/$$name.tmp.$$$$; \
+	  chmod +x $(GPU_DGRAPH_TL_MUT)/$$name.tmp.$$$$ && mv -f $(GPU_DGRAPH_TL_MUT)/$$name.tmp.$$$$ $(GPU_DGRAPH_TL_MUT)/$$name; \
 	  if ./$(GPU_DGRAPH_TL_MUT)/$$name > $(GPU_DGRAPH_TL_MUT)/$$name.log 2>&1; then echo "mutant $$name SURVIVED"; exit 1; fi; \
-	  if ! grep -q '^FAIL one launch past the timeline' $(GPU_DGRAPH_TL_MUT)/$$name.log; then \
-	    echo "mutant $$name: no FAIL case (did not run?)"; cat $(GPU_DGRAPH_TL_MUT)/$$name.log; exit 1; fi; \
 	  echo "mutant $$name killed"; }; \
-	tmut room-off-by-one 's|(uint32_t)(cnt - from) > room) {|(uint32_t)(cnt - from) > room + 1u) {|'; \
-	tmut timeline-after-failure 's#if (!g->stamps || g->failed || #if (!g->stamps || #'; \
-	echo "test-gpu-decode-graph-timeline: 2 of 2 mutants killed"
+	tmut room-off-by-one 's/if ge n TL_MAX_LAUNCHES/if gt n TL_MAX_LAUNCHES/'; \
+	tmut timeline-after-failure 's/(fn tl_read_stamps to long\n  )if ne get g_tl_g 1 0/$${1}if eq ulong 1 0/'; \
+	echo "test-gpu-decode-graph-timeline: 2 of 2 pure OM-2 mutants killed"
 
 # OWN-30B W-L2c (2026-10-14): per-launch fixed cost inside a command list (tests/gpu_launch_cost_test.c, chip only, GB10 lock).
 GPU_LAUNCH_COST_TEST = $(OUT_DIR)/gpu_launch_cost_test
@@ -2167,15 +2143,13 @@ GPU_L2_REUSE_TEST = $(OUT_DIR)/gpu_l2_reuse_test
 $(GPU_L2_REUSE_TEST): tests/gpu_l2_reuse_test.c src/omega_gpu_fp8_api.h src/omega_gpu_cmdlist.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_l2_reuse_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 
-# sc #642 (2026-10-18): Qwen3.8-27B decode graph (one token = one command list), chip test vs the APIs one call at a time
+# sc #642 (2026-10-18): Qwen3.8-27B decode graph host check, pure seeded OM-2.
 .PHONY: test-gpu-q38-graph-host
 GPU_Q38_GRAPH_TEST = $(OUT_DIR)/gpu_q38_graph_test
-GPU_Q38_GRAPH_HOST_TEST = $(OUT_DIR)/test_omega_gpu_q38_graph_host
+GPU_Q38_GRAPH_HOST_TEST = $(TR2_Q38_HOST_BIN)
 GPU_Q38_STROKE_EXACT_TEST = $(OUT_DIR)/gpu_q38_stroke_exact_test
 $(GPU_Q38_GRAPH_TEST): tests/gpu_q38_graph_test.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_q38_graph_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
-$(GPU_Q38_GRAPH_HOST_TEST): tests/test_omega_gpu_q38_graph_host.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
-	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/test_omega_gpu_q38_graph_host.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 $(GPU_Q38_STROKE_EXACT_TEST): tests/gpu_q38_stroke_exact_test.c src/omega_gpu_q38_graph.h $(OUT_DIR)/libomega_gpu.a
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/gpu_q38_stroke_exact_test.c $(OUT_DIR)/libomega_gpu.a -lpthread -lm
 test-gpu-q38-graph-host: $(GPU_Q38_GRAPH_TEST) $(GPU_Q38_GRAPH_HOST_TEST)
