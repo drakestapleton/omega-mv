@@ -20,11 +20,11 @@ Pure seeded OM-2 whole-unit power, thermal Control Barrier Function (CBF), and a
   - `/sys/devices/system/cpu/cpu{0..19}/acpi_cppc/feedback_ctrs` (`ref:<u64> del:<u64>`).
 - `watt_cbf.om` — Fixed-point Joules-per-bit (`TuringYield_J = delta_bits / delta_J`) Watt-budget allocator, Arboris anticipatory pre-cooling planner (burst lookahead -> pre-cool fan floor + pre-burst power trough), exact 1:1 fixed-point mirror of [`seed/helix/proofs/WattCBF.lean`](../../seed/helix/proofs/WattCBF.lean), and the 9-check core self-verification suite (`wc_run_core_gate`).
 - `wattd_main.om` — CLI (`omega-wattd sense`, `omega-wattd plan`, `omega-wattd gate`).
-- `gate_wattd.om` — Standalone 12-check pure-OM-2 verification gate (9 core checks + monotonicity sweeps, signed `ceilDiv` parity, and 64-case adversarial matrix).
+- `gate_wattd.om` — Standalone 13-check pure-OM-2 verification gate (9 core checks + unconditional monotonicity sweeps, full-`i64` signed `ceilDiv` parity, 128-case adversarial & idempotence matrix, and whole-unit/sensor-fault fail-closed tests).
 
 ## Formal Safety Proof
 
-[`seed/helix/proofs/WattCBF.lean`](../../seed/helix/proofs/WattCBF.lean) proves 28 theorems in standalone Lean 4 (`0 sorry`, standard axioms only, zero Mathlib dependency) covering the exact same constants, `ceilDiv`, `barrierH`, 2-node thermal update, and `cbfFilter` implemented in `watt_cbf.om`, including multi-step inductive safety (`cbf_multistep_temp_safe`), monotonicity, anticipatory pre-cooling (`precool_fan_mono_sink`), idempotence, and 4 non-vacuity negative controls (including an unclamped 90 W Trap-14 spike).
+[`seed/helix/proofs/WattCBF.lean`](../../seed/helix/proofs/WattCBF.lean) proves 32 theorems in standalone Lean 4 (`0 sorry`, standard axioms only, zero Mathlib dependency) covering the exact same constants, `ceilDiv`, `barrierH`, `rawHeatBudget`, `mustFailClosed`, 2-node thermal update, and `cbfFilter` implemented in `watt_cbf.om`, including unconditional admitted-command barrier safety (`cbf_admitted_barrier_safe`), multi-step inductive safety (`cbf_multistep_temp_safe`), unconditional budget monotonicity (`cbf_mono_pBudget_rails`), anticipatory pre-cooling (`precool_fan_mono_sink`), full command idempotence (`cbf_idempotent`), and 5 axiom-free non-vacuity negative controls (including an unclamped 90 W Trap-14 spike and reverse-conduction / overheated-heatsink fail-closed witnesses).
 
 ## Build & Verify (Linux AArch64, DGX Spark)
 

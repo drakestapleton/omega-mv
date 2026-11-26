@@ -55,13 +55,18 @@ end
 ret x
 end
 
-note Exact mirror of WattCBF.ceilDiv: rounds toward +infinity for b > 0
+note Exact mirror of WattCBF.ceilDiv: rounds toward +infinity for b > 0, overflow-free across i64
 fn wc_ceil_div a long b long to long
 requires gt b 0
-if ge a 0
-ret div add a sub b 1 b
+if lt a 0
+ret div a b
 end
-ret neg div neg a b
+q = div a b
+r = rem a b
+if gt r 0
+ret add q 1
+end
+ret q
 end
 
 note Exact mirror of WattCBF.barrierH: h = T_ceil - T_die - tau * dT
@@ -126,20 +131,52 @@ end
 ret true
 end
 
-note Exact mirror of WattCBF.maxHeatSafe
-fn wc_max_heat_safe st view WattThermal pol view WattPolicy to long
-td = get st t_die
-tc = get pol t_ceil
-if ge td tc
+note Exact mirror of WattCBF.rawHeatBudget
+fn wc_raw_heat_budget st view WattThermal pol view WattPolicy to long
+tau = get pol tau
+if lt tau 0
 ret 0
 end
-headroom = sub tc td
-dt_max = div headroom add get pol tau 1
-raw = add mul WATT_THERMAL_SCALE dt_max wc_die_cool_ds st
+headroom = sub get pol t_ceil get st t_die
+dt_max = div headroom add tau 1
+ret add mul WATT_THERMAL_SCALE dt_max wc_die_cool_ds st
+end
+
+note Exact mirror of WattCBF.maxHeatSafe
+fn wc_max_heat_safe st view WattThermal pol view WattPolicy to long
+tc = get pol t_ceil
+if ge get st t_die tc
+ret 0
+end
+if ge get st t_sink tc
+ret 0
+end
+if lt get pol tau 0
+ret 0
+end
+raw = wc_raw_heat_budget st pol
 if le raw 0
 ret 0
 end
 ret raw
+end
+
+note Exact mirror of WattCBF.mustFailClosed
+fn wc_must_fail_closed st view WattThermal pol view WattPolicy to bool
+if not wc_policy_valid pol
+ret true
+end
+tc = get pol t_ceil
+if ge get st t_die tc
+ret true
+end
+if ge get st t_sink tc
+ret true
+end
+if lt wc_raw_heat_budget st pol 0
+ret true
+end
+ret false
 end
 
 note Exact mirror of WattCBF.safeFanFloor
@@ -192,16 +229,7 @@ end
 note Exact 1:1 mirror of WattCBF.cbfFilter
 fn wc_cbf_filter st view WattThermal pol view WattPolicy prop view WattProp res edit WattCmd to void
 r1 = new WattProp 0 0 0 0
-if not wc_policy_valid pol
-put res p_gpu 0
-put res p_cpu 0
-put res p_unc 0
-put res fan_pct WATT_FAN_MAX
-put res fail_closed 1
-put res clamped 1
-ret
-end
-if ge get st t_die get pol t_ceil
+if wc_must_fail_closed st pol
 put res p_gpu 0
 put res p_cpu 0
 put res p_unc 0
@@ -245,20 +273,41 @@ end
 put res clamped cl
 end
 
-note Fixed-point Joules-per-bit metric: TuringYield_J = delta_bits / delta_J = (delta_bits * 1000) / delta_mj
+note Overflow-free exact floor((r * 1000) / m) for 0 <= r < m < 2^63 via 10-bit double-and-add
+fn wc_mul1000_div_u64 r ulong m ulong to ulong
+acc_q = ulong 0
+acc_r = ulong 0
+for k ulong 10
+acc_q = add acc_q acc_q
+acc_r = add acc_r acc_r
+if ge acc_r m
+acc_r = sub acc_r m
+acc_q = add acc_q 1
+end
+bit = and shr ulong 1000 sub 9 k 1
+if eq bit 1
+acc_r = add acc_r r
+if ge acc_r m
+acc_r = sub acc_r m
+acc_q = add acc_q 1
+end
+end
+end
+ret acc_q
+end
+
+note Fixed-point Joules-per-bit metric: TuringYield_J = delta_bits / delta_J = floor((delta_bits * 1000) / delta_mj)
 fn wc_turing_yield_bpj delta_bits long delta_mj long to long
 if or le delta_bits 0 le delta_mj 0
 ret 0
 end
-if gt delta_bits 9000000000000000
-note Avoid overflow on huge bit counts by dividing energy by 1000 J first
-dj = div delta_mj 1000
-if le dj 0
-ret delta_bits
+q = div delta_bits delta_mj
+r = rem delta_bits delta_mj
+if ge q 9000000000000000
+ret 9000000000000000000
 end
-ret div delta_bits dj
-end
-ret div mul delta_bits 1000 delta_mj
+frac = long wc_mul1000_div_u64 ulong r ulong delta_mj
+ret add mul q 1000 frac
 end
 
 note Mode-aware Watt-budget allocator with TuringYield_J efficiency tilting
@@ -367,6 +416,9 @@ fn wc_apply_precool st view WattThermal pol view WattPolicy burst_mw long burst_
 put plan precool_active 0
 put plan precool_fan 0
 put plan trough_mw 0
+if not wc_policy_valid pol
+ret
+end
 if or le burst_mw 0 le burst_sec 0
 ret
 end
@@ -418,7 +470,7 @@ text wg_m_t1_det " zones=7/7 cpus=20/20 cppc=20/20 hw_writes=0 tgpu_mc="
 text wg_m_t2_det " raw_90w_h=-700 cbf_gpu_mw=62640 cbf_h=668 fan=100"
 text wg_m_t3_det " raw_tdie_next=78375 raw_h=-1250 cbf_tdie_next<=78000 overtemp_fail_closed=1"
 text wg_m_t4_det " raw_120w>100w cbf_total_mw="
-text wg_m_t5_det " neg_budget=0 zero_budget=0 bad_ceil=0 bad_tau=0 fan=100"
+text wg_m_t5_det " neg_budget=0 zero_budget=0 bad_ceil=0 bad_tau=0 hot_sink=0 infeas_bar=0 fan=100"
 text wg_m_t6_det " bpj_hi="
 text wg_m_t6_det2 " bpj_lo="
 text wg_m_t7_det " precool_sink_mc="
@@ -455,25 +507,34 @@ ok = true
 if ne get g_wmeta 0 7
 ok = false
 end
+if ne get g_wmeta 13 1
+ok = false
+end
 if ne get g_wmeta 1 20
 ok = false
 end
 if ne get g_wmeta 2 20
 ok = false
 end
+for z ulong 7
+zt = get g_tz_mc z
+if or le zt 10000 ge zt 100000
+ok = false
+end
+if ne get g_tz_crit z WATT_T_CRIT_MC
+ok = false
+end
+end
 tgpu = get g_wmeta 5
-if or le tgpu 10000 ge tgpu 100000
-ok = false
-end
-if ne get g_tz_crit 5 WATT_T_CRIT_MC
-ok = false
-end
 aavg = get g_wmeta 3
 xavg = get g_wmeta 4
 if or lt aavg 338000 gt aavg 2808000
 ok = false
 end
 if or lt xavg 1378000 gt xavg 3900000
+ok = false
+end
+if or le get g_wmeta 10 0 le get g_wmeta 11 0
 ok = false
 end
 if ne get g_wmeta 12 0
@@ -688,6 +749,32 @@ end
 ret true
 end
 
+fn wg_t5b_hot_sink_and_infeas to bool
+pr = new WattProp 75000 17000 8000 60
+pr0 = new WattProp 0 0 0 30
+st_150 = new WattThermal 48700 150000 25000
+pol85 = new WattPolicy 100000 80000 85000 2
+if not wg_check_fail_closed st_150 pol85 pr
+ret false
+end
+st_inf = new WattThermal 77000 77900 25000
+pol78_20 = new WattPolicy 100000 80000 78000 20
+if not wg_check_fail_closed st_inf pol78_20 pr0
+ret false
+end
+st_rev = new WattThermal 77500 86000 25000
+pol78_2 = new WattPolicy 100000 80000 78000 2
+if not wg_check_fail_closed st_rev pol78_2 pr
+ret false
+end
+st_eq = new WattThermal 44000 40000 25000
+p_neg_g = new WattPolicy 100000 -1 85000 2
+if not wg_check_fail_closed st_eq p_neg_g pr
+ret false
+end
+ret true
+end
+
 fn wg_t5_invalid_refused to bool
 ok = true
 st = new WattThermal 44000 40000 25000
@@ -710,6 +797,9 @@ if not wg_check_fail_closed st p_lo_ceil pr
 ok = false
 end
 if not wg_check_fail_closed st p_neg_tau pr
+ok = false
+end
+if not wg_t5b_hot_sink_and_infeas
 ok = false
 end
 if ok
@@ -737,6 +827,16 @@ if ne get pl_hi bpj 5000
 ok = false
 end
 if ne get pl_lo bpj 100
+ok = false
+end
+note Exact huge-bit TuringYield_J boundaries (zero truncation or i64 overflow)
+if ne wc_turing_yield_bpj 9000000000000001 500 18000000000000002
+ok = false
+end
+if ne wc_turing_yield_bpj 9000000000000001 1999 4502251125562781
+ok = false
+end
+if ne wc_turing_yield_bpj 9000000000000001 1 9000000000000000000
 ok = false
 end
 if le get pl_hi p_gpu_req get pl_lo p_gpu_req
@@ -843,10 +943,35 @@ end
 ret ok
 end
 
+fn wg_check_idemp st view WattThermal pol view WattPolicy cmd view WattCmd to bool
+pr_re = new WattProp get cmd p_gpu get cmd p_cpu get cmd p_unc get cmd fan_pct
+cmd2 = new WattCmd 0 0 0 0 0 0
+wc_cbf_filter st pol pr_re cmd2
+if ne get cmd2 p_gpu get cmd p_gpu
+ret false
+end
+if ne get cmd2 p_cpu get cmd p_cpu
+ret false
+end
+if ne get cmd2 p_unc get cmd p_unc
+ret false
+end
+if ne get cmd2 fan_pct get cmd fan_pct
+ret false
+end
+if ne get cmd2 fail_closed get cmd fail_closed
+ret false
+end
+if eq get cmd fail_closed 0
+if ne get cmd2 clamped 0
+ret false
+end
+end
+ret true
+end
+
 fn wg_t8_step_check st edit WattThermal pol view WattPolicy pr_adv view WattProp to bool
 cmd = new WattCmd 0 0 0 0 0 0
-cmd2 = new WattCmd 0 0 0 0 0 0
-pr_re = new WattProp 0 0 0 0
 nxt = new WattThermal 0 0 0
 wc_cbf_filter st pol pr_adv cmd
 pg = get cmd p_gpu
@@ -869,18 +994,7 @@ h = wc_barrier_h 78000 get st t_die 2 dt
 if lt h 0
 ret false
 end
-put pr_re p_gpu pg
-put pr_re p_cpu pc
-put pr_re p_unc pu
-put pr_re fan_pct get cmd fan_pct
-wc_cbf_filter st pol pr_re cmd2
-if ne get cmd2 p_gpu pg
-ret false
-end
-if ne get cmd2 p_cpu pc
-ret false
-end
-if ne get cmd2 p_unc pu
+if not wg_check_idemp st pol cmd
 ret false
 end
 wc_step_thermal st cmd nxt
@@ -954,11 +1068,11 @@ end
 
 fn wg_t9_live_pipeline to bool
 st = new WattThermal 0 0 0
-ws_fill_thermal_state st
+live_ok = ws_fill_thermal_state st
 gd = wg_t9_eval st 90000 WATT_MODE_DECODE 85000 0
 g_tr = wg_t9_eval st 100000 WATT_MODE_TRAIN 78000 75000
 gi = wg_t9_eval st 25000 WATT_MODE_IDLE 85000 0
-ok = true
+ok = live_ok
 if lt gd 0
 ok = false
 end
