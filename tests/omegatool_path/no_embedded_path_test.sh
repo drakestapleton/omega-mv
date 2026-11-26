@@ -19,7 +19,7 @@
 # that the same bytes come out of a second copy at a different path. Host only, no chip.
 set -eu
 here=$(cd "$(dirname "$0")/../.." && pwd)
-phys=$(realpath "${PHYSICS_DIR:-../physics}")
+phys=$(realpath -m "${PHYSICS_DIR:-../physics}")
 tmp=$(mktemp -d /tmp/omega_nopath_XXXXXX); trap 'rm -rf "$tmp"' EXIT
 dig=""
 for n in alpha-checkout beta/deeper-checkout; do

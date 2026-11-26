@@ -43,8 +43,7 @@ SRCS = src/omega_om_units.c src/omega_canonical.c src/omega_validate.c src/omega
 	src/omega_vector.c src/omega_blackwell_encoder.c src/omega_blackwell_qmd.c \
 	src/omega_blackwell_realize.c src/omega_blackwell_submit.c src/omega_blackwell_engine.c src/omega_gpu_engine.c src/omega_blackwell_gates.c src/omega_blackwell_matmul.c src/omega_blackwell_codegen.c src/omega_gpu_session.c src/omega_gpu_platform.c src/omega_gpu_platform_linux.c src/omega_gpu_fmt.c src/omega_gpu_matmul_api.c src/omega_gpu_elementwise_api.c src/omega_gpu_attention_api.c src/omega_gpu_serving.c src/omega_world_gates.c src/omega_gpu_wait.c \
 	src/omega_evidence.c src/omega_clean_clone.c \
-	$(PHYSICS_DIR)/m16/m16_native.c $(PHYSICS_DIR)/nvrm/nvrm.c \
-	tools/omegatool.c
+	$(PHYSICS_DIR)/m16/m16_native.c $(PHYSICS_DIR)/nvrm/nvrm.c
 # OWN-30B cut 2 (2026-10-13): column windows over a resident bf16 tensor for the MoE path. New file,
 # adds exports only (8B decode-speed lane collision rule: no existing GPU source moves).
 SRCS += src/omega_gpu_moe_api.c
@@ -112,7 +111,7 @@ LEARNER = $(OUT_DIR)/crumbline-learner
 
 .PHONY: all clean check-physics-lock crumbline-learner test-crumbline test-m19 test test-m5 test-m6 test-m7 test-m8 test-m9 test-m10 test-m11 test-m12 test-m13 test-m14 test-m15 test-m17 test-r3 test-i11-wake-merge test-action-graph test-state-projection test-capability-query test-capability-graph test-skillroute-compose test-semantic-comm test-cognitive-routing test-sem-incremental test-branch-reuse test-jspace-prod test-plan-reuse test-cortex
 
-all: check-physics-lock $(TARGET)
+all: $(TARGET)
 
 check-physics-lock:
 	@if [ "$(PHYSICS_LOCK_CHECK)" != "0" ]; then \
@@ -148,7 +147,7 @@ $(OUT_DIR)/%.o: src/%.c | $(OUT_DIR)
 # The other objects take nothing from PHYSICS_DIR and are shared with physics-free builds
 # (crumbline-learner, omega, test-program-id), so they stay ungated.
 PHYSICS_STAMP = $(OUT_DIR)/physics.stamp
-PHYSICS_OBJS = $(addprefix $(OUT_DIR)/,m16_native.o nvrm.o omegatool.o omega_accelerator_world.o \
+PHYSICS_OBJS = $(addprefix $(OUT_DIR)/,m16_native.o nvrm.o omega_accelerator_world.o \
 	omega_blackwell_submit.o omega_blackwell_engine.o omega_blackwell_gates.o \
 	omega_gpu_platform_linux.o omega_world_gates.o omega_evidence.o)
 $(PHYSICS_STAMP): check-physics-lock | $(OUT_DIR)
@@ -171,11 +170,9 @@ test-crumbline: $(LEARNER)
 $(LEARNER): src/crumbline/crumbline.om tools/crumbline_learner.om seed/out/omc | $(OUT_DIR)
 	cat src/crumbline/crumbline.om tools/crumbline_learner.om | seed/out/omc > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
-$(OUT_DIR)/omegatool.o: tools/omegatool.c | $(OUT_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(TARGET): $(OBJS) | check-physics-lock
-	$(CC) $(CFLAGS) -o $@.tmp.$$$$ $(OBJS) && mv -f $@.tmp.$$$$ $@
+# Default `omegatool` binary: pure seeded OM-2 (tools/omegatool.om + src/*.om, physics-free).
+$(TARGET): $(OMEGATOOL_OM_SRCS) $(OMEGATOOL_OM_OMC) | $(OUT_DIR)
+	(printf 'om2\n'; sed -e '/^om2$$/d' -e 's/^export fn /fn /' $(OMEGATOOL_OM_SRCS)) | $(OMEGATOOL_OM_OMC) > $@.tmp.$$$$ && chmod +x $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
 test: $(TARGET)
 	./$(TARGET) --run-gates
@@ -2426,7 +2423,6 @@ test-vcstore-genesis: test-vcstore
 VC_BRIDGE_CORE = omega_program_ir omega_vc_bridge omega_resolve omega_receipt omega_blake3 omega_vcstore
 VC_BRIDGE_OBJS = $(addprefix $(OUT_DIR)/,$(addsuffix .o,$(VC_BRIDGE_CORE)))
 SRCS += $(patsubst %,src/%.c,$(VC_BRIDGE_CORE))
-$(TARGET): $(VC_BRIDGE_OBJS)
 -include $(VC_BRIDGE_OBJS:.o=.d)
 
 # test-genesis-real: the REAL VC-GENESIS-1 (src/omega_genesis.h) pinned against its audit record
@@ -2495,7 +2491,7 @@ test-vc-bridge: tests/test_omega_vc_bridge.c src/omega_vc_bridge.c src/omega_vc_
 # they compile the physics checkout path into the object (-DOMEGA_PHYSICS_DIR), which made the
 # archive digest depend on where physics was checked out. Without them libomega_gpu.a is
 # byte-identical for any PHYSICS_DIR and any omega checkout directory.
-GPU_API_OBJS = $(filter-out $(OUT_DIR)/omegatool.o $(OUT_DIR)/omega_blackwell_gates.o $(OUT_DIR)/omega_world_gates.o $(OUT_DIR)/omega_clean_clone.o,$(OBJS))
+GPU_API_OBJS = $(filter-out $(OUT_DIR)/omega_blackwell_gates.o $(OUT_DIR)/omega_world_gates.o $(OUT_DIR)/omega_clean_clone.o,$(OBJS))
 GPU_API_TEST = $(OUT_DIR)/gpu_matmul_api_test
 GPU_R4_RECEIPT = $(OUT_DIR)/gpu_matmul_r4_receipt
 $(OUT_DIR)/libomega_gpu.a: $(GPU_API_OBJS) | check-physics-lock

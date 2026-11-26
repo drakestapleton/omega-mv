@@ -66,11 +66,9 @@ if [ $rc -ne 0 ] && printf '%s\n' "$out" | head -1 | grep -q '^Usage:' && [ "$li
     ok "omegatool default: usage only, exit $rc, nothing run"
 else bad "omegatool with no argument ran something (exit $rc, $lines lines)"; fi
 
-# The reference modes, read from the one table the dispatcher uses.
-modes=$(awk '/^static const ReferenceMode reference_modes\[\] = \{/ {on = 1; next}
-             on && /^\};/ {exit}
-             on { if (match($0, /\{"[a-z0-9-]+"/)) print substr($0, RSTART + 2, RLENGTH - 3) }' \
-        tools/omegatool.c)
+# The reference modes, read from the one table the pure OM-2 dispatcher uses.
+modes=$(awk '/^text rm_[a-z0-9_]+ "[a-z0-9-]+"$/ { sub(/^[^"]*"/, ""); sub(/"$/, ""); print }' \
+        tools/omegatool.om)
 nmodes=$(printf '%s\n' "$modes" | grep -c .)
 if [ "$nmodes" -eq 16 ]; then ok "reference mode table: $nmodes modes"
 else bad "reference mode table has $nmodes modes, expected 16"; fi
