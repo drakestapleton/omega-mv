@@ -1,0 +1,1144 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/egraph/ir_egraph.om: Verified Equality-Saturation E-Graph Optimizer for ΩIR (pure OM-2).
+note Library unit (no om2 header, no fn main; all symbols eg3_* / EG3_*).
+note Supports both 32-bit and 64-bit wrapping arithmetic, all 18 verified EGP3 rewrite rules,
+note TargetDesc-parameterized extraction (addCost, mulCost, fmaCost, shlCost, bitCost),
+note strict refusal of token-bearing and convergent GPU ops, ΩIR block extraction bridge
+note (eg3_opt_ir_block), and full EGP3 binary structural proof certificate emission.
+
+note EGP3 node opcodes:
+note   1=CONST 2=SSA_VAL 3=ADD 4=SUB 5=MUL 6=FMA 7=SHL 8=SHR 9=AND 10=OR 11=XOR
+const EG3_OP_CONST ulong 1
+const EG3_OP_SSA ulong 2
+const EG3_OP_ADD ulong 3
+const EG3_OP_SUB ulong 4
+const EG3_OP_MUL ulong 5
+const EG3_OP_FMA ulong 6
+const EG3_OP_SHL ulong 7
+const EG3_OP_SHR ulong 8
+const EG3_OP_AND ulong 9
+const EG3_OP_OR ulong 10
+const EG3_OP_XOR ulong 11
+
+note Capacities and sentinels:
+const EG3_MAX_NODES ulong 512
+const EG3_SAT_CAP ulong 320
+const EG3_MAX_TRACE ulong 512
+const EG3_BUF_CAP ulong 131072
+const EG3_INF_COST ulong 999999
+const EG3_NONE ulong 999999
+const EG3_MASK32 ulong 4294967295
+
+note ΩIR extraction refusal codes:
+const EG3_ALLOW ulong 0
+const EG3_REFUSE_TOKEN ulong 1
+const EG3_REFUSE_CONVERGENT ulong 2
+const EG3_REFUSE_TYPE ulong 3
+const EG3_REFUSE_UNSUP ulong 4
+
+note Working e-graph tables (per expression / block):
+global eg3_par ulong 512
+global eg3_op ulong 512
+global eg3_a ulong 512
+global eg3_b ulong 512
+global eg3_c ulong 512
+global eg3_vlo ulong 512
+global eg3_vhi ulong 512
+global eg3_w ulong 512
+global eg3_fl ulong 512
+global eg3_cnt ulong 1
+global eg3_width ulong 1
+
+note Cost model parameters [0]=add [1]=mul [2]=fma [3]=shl [4]=bit and extraction arrays:
+global eg3_cparam ulong 8
+global eg3_cost ulong 512
+global eg3_dcost ulong 512
+global eg3_best ulong 512
+
+note Proof witness trace (rule_id, lhs_node, rhs_node) and rule-coverage bitmasks:
+global eg3_tr_rule ulong 512
+global eg3_tr_lhs ulong 512
+global eg3_tr_rhs ulong 512
+global eg3_trn ulong 1
+global eg3_rmask ulong 1
+global eg3_all_rmask ulong 1
+
+note EGP3 serialized binary certificate stream:
+global eg3_buf uchar 131072
+global eg3_bpos ulong 1
+global eg3_certs ulong 1
+
+note ΩIR block extraction mapping and telemetry:
+note eg3_ir_stat: [0]=ref_tok [1]=ref_conv [2]=ref_type [3]=ref_unsup [4]=extracted
+note              [5]=cost_before [6]=cost_after [7]=root_before [8]=root_after
+note              [9]=trace_cnt [10]=width [11]=cert_emitted
+global eg3_ir_val uint 256
+global eg3_ir_nod ulong 256
+global eg3_ir_vn ulong 1
+global eg3_ir_sn ulong 1
+global eg3_ir_stat ulong 16
+
+note ---- Cost Model Configuration ----------------------------------------------------------
+
+fn eg3_set_costs addC ulong mulC ulong fmaC ulong shlC ulong bitC ulong to void
+put eg3_cparam 0 addC
+put eg3_cparam 1 mulC
+put eg3_cparam 2 fmaC
+put eg3_cparam 3 shlC
+put eg3_cparam 4 bitC
+end
+
+note Derive (addCost, mulCost, fmaCost, shlCost, bitCost) from TargetDesc fields
+note (TDF_EXEC, TDF_MULLAT, TDF_DIVLAT, TDF_FEAT).
+fn eg3_set_target_costs execM ulong mulLat ulong divLat ulong feat ulong to void
+addC = ulong 1
+mulC = mulLat
+if eq mulC 0
+mulC = ulong 2
+end
+if eq execM 1
+addC = ulong 2
+if lt mulC 3
+mulC = ulong 3
+end
+end
+fmaC = add addC mulC
+fmaC = add fmaC 1
+if ne and feat 1 0
+if eq execM 1
+fmaC = ulong 2
+else
+fmaC = mulC
+end
+end
+eg3_set_costs addC mulC fmaC 1 1
+end
+
+fn eg3_set_costs_sm121 to void
+eg3_set_costs 2 3 2 1 1
+end
+
+fn eg3_set_costs_x925 to void
+eg3_set_costs 1 2 2 1 1
+end
+
+fn eg3_set_costs_a725 to void
+eg3_set_costs 1 3 3 1 1
+end
+
+note ---- Core E-Graph Primitives -----------------------------------------------------------
+
+fn eg3_reset widthBits ulong to void
+w = widthBits
+if ne w 64
+w = ulong 32
+end
+put eg3_width 0 w
+put eg3_cnt 0 0
+put eg3_trn 0 0
+put eg3_rmask 0 0
+end
+
+fn eg3_mask_val v ulong w ulong to ulong
+if eq w 32
+ret and v EG3_MASK32
+end
+ret v
+end
+
+fn eg3_node_val id ulong to ulong
+lo = get eg3_vlo id
+hi = get eg3_vhi id
+ret or lo shl hi 32
+end
+
+fn eg3_find x ulong to ulong
+c = x
+for i ulong 64
+p = get eg3_par c
+if eq p c
+ret c
+end
+c = p
+end
+ret c
+end
+
+fn eg3_add_raw op ulong a ulong b ulong c ulong val ulong to ulong
+id = get eg3_cnt 0
+if ge id EG3_MAX_NODES
+ret EG3_NONE
+end
+w = get eg3_width 0
+mv = val
+if eq op EG3_OP_CONST
+mv = eg3_mask_val val w
+end
+put eg3_cnt 0 add id 1
+put eg3_par id id
+put eg3_op id op
+put eg3_a id a
+put eg3_b id b
+put eg3_c id c
+put eg3_vlo id and mv EG3_MASK32
+put eg3_vhi id shr mv 32
+put eg3_w id w
+put eg3_fl id 0
+ret id
+end
+
+fn eg3_add_const val ulong to ulong
+w = get eg3_width 0
+mv = eg3_mask_val val w
+lo = and mv EG3_MASK32
+hi = shr mv 32
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i EG3_OP_CONST
+if eq get eg3_vlo i lo
+if eq get eg3_vhi i hi
+if eq get eg3_w i w
+ret i
+end
+end
+end
+end
+end
+ret eg3_add_raw EG3_OP_CONST 0 0 0 mv
+end
+
+fn eg3_add_ssa sid ulong to ulong
+w = get eg3_width 0
+lo = and sid EG3_MASK32
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i EG3_OP_SSA
+if eq get eg3_vlo i lo
+if eq get eg3_w i w
+ret i
+end
+end
+end
+end
+ret eg3_add_raw EG3_OP_SSA 0 0 0 lo
+end
+
+fn eg3_add_bin op ulong a ulong b ulong to ulong
+ret eg3_add_raw op a b 0 0
+end
+
+fn eg3_add_fma a ulong b ulong c ulong to ulong
+ret eg3_add_raw EG3_OP_FMA a b c 0
+end
+
+fn eg3_intern_bin op ulong a ulong b ulong to ulong
+if or ge a EG3_MAX_NODES ge b EG3_MAX_NODES
+ret EG3_NONE
+end
+ca = eg3_find a
+cb = eg3_find b
+w = get eg3_width 0
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i op
+if eq get eg3_w i w
+if eq eg3_find get eg3_a i ca
+if eq eg3_find get eg3_b i cb
+ret i
+end
+end
+end
+end
+end
+ret eg3_add_raw op a b 0 0
+end
+
+fn eg3_intern_fma a ulong b ulong c ulong to ulong
+if or ge a EG3_MAX_NODES or ge b EG3_MAX_NODES ge c EG3_MAX_NODES
+ret EG3_NONE
+end
+ca = eg3_find a
+cb = eg3_find b
+cc = eg3_find c
+w = get eg3_width 0
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i EG3_OP_FMA
+if eq get eg3_w i w
+if eq eg3_find get eg3_a i ca
+if eq eg3_find get eg3_b i cb
+if eq eg3_find get eg3_c i cc
+ret i
+end
+end
+end
+end
+end
+end
+ret eg3_add_raw EG3_OP_FMA a b c 0
+end
+
+fn eg3_union u ulong v ulong rule ulong to bool
+n = get eg3_cnt 0
+if or ge u n ge v n
+ret false
+end
+ru = eg3_find u
+rv = eg3_find v
+if eq ru rv
+ret false
+end
+t = get eg3_trn 0
+if ge t EG3_MAX_TRACE
+ret false
+end
+put eg3_par rv ru
+put eg3_tr_rule t rule
+put eg3_tr_lhs t u
+put eg3_tr_rhs t v
+put eg3_trn 0 add t 1
+if and ge rule 1 le rule 18
+put eg3_rmask 0 or get eg3_rmask 0 shl ulong 1 rule
+end
+ret true
+end
+
+note ---- Target-Parameterized Cost Model & Extraction --------------------------------------
+
+fn eg3_op_cost op ulong to ulong
+if or eq op EG3_OP_CONST eq op EG3_OP_SSA
+ret 0
+end
+if or eq op EG3_OP_ADD eq op EG3_OP_SUB
+ret get eg3_cparam 0
+end
+if eq op EG3_OP_MUL
+ret get eg3_cparam 1
+end
+if eq op EG3_OP_FMA
+ret get eg3_cparam 2
+end
+if or eq op EG3_OP_SHL eq op EG3_OP_SHR
+ret get eg3_cparam 3
+end
+ret get eg3_cparam 4
+end
+
+fn eg3_node_ec_cost id ulong to ulong
+op = get eg3_op id
+base = eg3_op_cost op
+if or eq op EG3_OP_CONST eq op EG3_OP_SSA
+ret 0
+end
+ca = get eg3_cost eg3_find get eg3_a id
+cb = get eg3_cost eg3_find get eg3_b id
+if or ge ca EG3_INF_COST ge cb EG3_INF_COST
+ret EG3_INF_COST
+end
+tot = add base add ca cb
+if eq op EG3_OP_FMA
+cc = get eg3_cost eg3_find get eg3_c id
+if ge cc EG3_INF_COST
+ret EG3_INF_COST
+end
+tot = add tot cc
+end
+ret tot
+end
+
+fn eg3_compute_dcosts to void
+n = get eg3_cnt 0
+for i ulong n bound 512
+op = get eg3_op i
+if or eq op EG3_OP_CONST eq op EG3_OP_SSA
+put eg3_dcost i 0
+else
+base = eg3_op_cost op
+da = get eg3_dcost get eg3_a i
+db = get eg3_dcost get eg3_b i
+tot = add base add da db
+if eq op EG3_OP_FMA
+tot = add tot get eg3_dcost get eg3_c i
+end
+put eg3_dcost i tot
+end
+end
+end
+
+fn eg3_compute_costs to void
+n = get eg3_cnt 0
+eg3_compute_dcosts
+for i ulong n bound 512
+put eg3_cost i EG3_INF_COST
+put eg3_best i i
+end
+for iter ulong 16
+for i ulong n bound 512
+c = eg3_node_ec_cost i
+r = eg3_find i
+cur = get eg3_cost r
+if lt c cur
+put eg3_cost r c
+put eg3_best r i
+else
+if and eq c cur lt c EG3_INF_COST
+b = get eg3_best r
+if lt get eg3_dcost i get eg3_dcost b
+put eg3_best r i
+end
+end
+end
+end
+end
+end
+
+fn eg3_get_cost x ulong to ulong
+ret get eg3_cost eg3_find x
+end
+
+fn eg3_get_best x ulong to ulong
+ret get eg3_best eg3_find x
+end
+
+fn eg3_best_of x ulong to ulong
+r = eg3_find x
+if lt get eg3_cost r EG3_INF_COST
+ret get eg3_best r
+end
+ret x
+end
+
+note ---- Constant, Power-of-Two, and E-Class Matching Helpers ------------------------------
+
+fn eg3_find_const id ulong want ulong to ulong
+c = eg3_find id
+w = get eg3_width 0
+mw = eg3_mask_val want w
+lo = and mw EG3_MASK32
+hi = shr mw 32
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i EG3_OP_CONST
+if eq eg3_find i c
+if eq get eg3_vlo i lo
+if eq get eg3_vhi i hi
+ret i
+end
+end
+end
+end
+end
+ret EG3_NONE
+end
+
+fn eg3_has_const id ulong want ulong to bool
+ret ne eg3_find_const id want EG3_NONE
+end
+
+note Return k if masked v == (1 << k) with 0 <= k < widthBits, else EG3_NONE.
+fn eg3_pow2_exp v ulong w ulong to ulong
+mv = eg3_mask_val v w
+if eq mv 0
+ret EG3_NONE
+end
+if ne and mv sub mv 1 0
+ret EG3_NONE
+end
+for k ulong w bound 64
+if eq shl ulong 1 k mv
+ret k
+end
+end
+ret EG3_NONE
+end
+
+note Find a power-of-two constant 1 << k (1 <= k < widthBits) in e-class of id; else EG3_NONE.
+fn eg3_find_pow2_ec id ulong to ulong
+c = eg3_find id
+w = get eg3_width 0
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i EG3_OP_CONST
+if eq eg3_find i c
+k = eg3_pow2_exp eg3_node_val i w
+if and ge k 1 lt k w
+ret k
+end
+end
+end
+end
+ret EG3_NONE
+end
+
+fn eg3_ec_has_bin ec ulong op ulong ca ulong cb ulong to bool
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i op
+if eq eg3_find i ec
+if eq eg3_find get eg3_a i ca
+if eq eg3_find get eg3_b i cb
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+fn eg3_ec_has_fma ec ulong ca ulong cb ulong cc ulong to bool
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i EG3_OP_FMA
+if eq eg3_find i ec
+if eq eg3_find get eg3_a i ca
+if eq eg3_find get eg3_b i cb
+if eq eg3_find get eg3_c i cc
+ret true
+end
+end
+end
+end
+end
+end
+ret false
+end
+
+fn eg3_ec_has_assoc ec ulong op ulong cx ulong cy ulong cz ulong to bool
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i op
+if eq eg3_find i ec
+if eq eg3_find get eg3_a i cx
+if eg3_ec_has_bin eg3_find get eg3_b i op cy cz
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+note ---- All 18 Verified Equality-Saturation Rewrite Rules ---------------------------------
+
+note Phase A1: identity, absorption, and self-cancellation rules (3,4,5,6,11,13,14,15,16,17)
+fn eg3_apply_a1_node i ulong to bool
+op = get eg3_op i
+a = get eg3_a i
+b = get eg3_b i
+ch = false
+if eq op EG3_OP_ADD
+if eg3_has_const b 0
+if eg3_union i a 3
+ch = true
+end
+end
+if eg3_has_const a 0
+if eg3_union i b 4
+ch = true
+end
+end
+ret ch
+end
+if eq op EG3_OP_MUL
+if eg3_has_const b 1
+if eg3_union i a 5
+ch = true
+end
+end
+z = eg3_find_const b 0
+if ne z EG3_NONE
+if eg3_union i z 6
+ch = true
+end
+end
+ret ch
+end
+if eq op EG3_OP_AND
+if eq eg3_find a eg3_find b
+if eg3_union i a 11
+ch = true
+end
+end
+ret ch
+end
+if eq op EG3_OP_SUB
+if eg3_has_const b 0
+if eg3_union i a 13
+ch = true
+end
+end
+if eq eg3_find a eg3_find b
+z = eg3_add_const 0
+if eg3_union i z 14
+ch = true
+end
+end
+ret ch
+end
+if eq op EG3_OP_XOR
+if eq eg3_find a eg3_find b
+z = eg3_add_const 0
+if eg3_union i z 15
+ch = true
+end
+end
+ret ch
+end
+if eq op EG3_OP_OR
+if eg3_has_const b 0
+if eg3_union i a 16
+ch = true
+end
+end
+ret ch
+end
+if eq op EG3_OP_SHL
+if eg3_has_const b 0
+if eg3_union i a 17
+ch = true
+end
+end
+ret ch
+end
+ret false
+end
+
+fn eg3_apply_phase_a1 to bool
+ch = false
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eg3_apply_a1_node i
+ch = true
+end
+end
+ret ch
+end
+
+note Rule 1: add(mul(a,b), c) -> fma(a,b,c)
+fn eg3_try_fma_l i ulong n ulong to bool
+ca = eg3_find get eg3_a i
+cnode = eg3_best_of get eg3_b i
+cc = eg3_find cnode
+ec = eg3_find i
+for j ulong n bound 512
+if eq get eg3_op j EG3_OP_MUL
+if eq eg3_find j ca
+ja = eg3_best_of get eg3_a j
+jb = eg3_best_of get eg3_b j
+if eg3_ec_has_fma ec eg3_find ja eg3_find jb cc
+ret false
+end
+nf = eg3_intern_fma ja jb cnode
+ret eg3_union i nf 1
+end
+end
+end
+ret false
+end
+
+note Rule 2: add(c, mul(a,b)) -> fma(a,b,c)
+fn eg3_try_fma_r i ulong n ulong to bool
+cb = eg3_find get eg3_b i
+cnode = eg3_best_of get eg3_a i
+cc = eg3_find cnode
+ec = eg3_find i
+for j ulong n bound 512
+if eq get eg3_op j EG3_OP_MUL
+if eq eg3_find j cb
+ja = eg3_best_of get eg3_a j
+jb = eg3_best_of get eg3_b j
+if eg3_ec_has_fma ec eg3_find ja eg3_find jb cc
+ret false
+end
+nf = eg3_intern_fma ja jb cnode
+ret eg3_union i nf 2
+end
+end
+end
+ret false
+end
+
+note Rule 12: fma(a,b,0) -> mul(a,b)
+fn eg3_try_fma_zero i ulong to bool
+if not eg3_has_const get eg3_c i 0
+ret false
+end
+a = eg3_best_of get eg3_a i
+b = eg3_best_of get eg3_b i
+if eg3_ec_has_bin eg3_find i EG3_OP_MUL eg3_find a eg3_find b
+ret false
+end
+nm = eg3_intern_bin EG3_OP_MUL a b
+ret eg3_union i nm 12
+end
+
+note Rule 18: mul(x, 1<<k) -> shl(x, k) for 1 <= k < width_bits
+fn eg3_try_mul_shl i ulong to bool
+k = eg3_find_pow2_ec get eg3_b i
+if eq k EG3_NONE
+ret false
+end
+x = eg3_best_of get eg3_a i
+ck = eg3_add_const k
+if eq ck EG3_NONE
+ret false
+end
+if eg3_ec_has_bin eg3_find i EG3_OP_SHL eg3_find x eg3_find ck
+ret false
+end
+ns = eg3_intern_bin EG3_OP_SHL x ck
+ret eg3_union i ns 18
+end
+
+note Phase A2a: FMA-zero unfusion and power-of-two shift strength reduction (12, 18)
+fn eg3_apply_phase_a2_sr to bool
+ch = false
+n = get eg3_cnt 0
+for i ulong n bound 512
+op = get eg3_op i
+if eq op EG3_OP_FMA
+if eg3_try_fma_zero i
+ch = true
+end
+end
+if eq op EG3_OP_MUL
+if eg3_try_mul_shl i
+ch = true
+end
+end
+end
+ret ch
+end
+
+note Phase A2b: FMA fusion (1, 2) using already-reduced best children
+fn eg3_apply_phase_a2_fma to bool
+ch = false
+n = get eg3_cnt 0
+for i ulong n bound 512
+if eq get eg3_op i EG3_OP_ADD
+if eg3_try_fma_l i n
+ch = true
+end
+if eg3_try_fma_r i n
+ch = true
+end
+end
+end
+ret ch
+end
+
+note Rule 7 (add_comm) and Rule 8 (mul_comm)
+fn eg3_try_comm i ulong op ulong rule ulong to bool
+if ge get eg3_cnt 0 EG3_SAT_CAP
+ret false
+end
+a = eg3_best_of get eg3_a i
+b = eg3_best_of get eg3_b i
+ca = eg3_find a
+cb = eg3_find b
+if eq ca cb
+ret false
+end
+if eg3_ec_has_bin eg3_find i op cb ca
+ret false
+end
+nv = eg3_intern_bin op b a
+ret eg3_union i nv rule
+end
+
+fn eg3_assoc_emit i ulong op ulong rule ulong x ulong y ulong z ulong to bool
+k = eg3_intern_bin op y z
+v = eg3_intern_bin op x k
+ret eg3_union i v rule
+end
+
+note Rule 9 (add_assoc) and Rule 10 (mul_assoc)
+fn eg3_try_assoc i ulong op ulong rule ulong n ulong to bool
+if ge add get eg3_cnt 0 2 EG3_SAT_CAP
+ret false
+end
+ca = eg3_find get eg3_a i
+z = eg3_best_of get eg3_b i
+for j ulong n bound 512
+if and ne j i eq get eg3_op j op
+if eq eg3_find j ca
+x = eg3_best_of get eg3_a j
+y = eg3_best_of get eg3_b j
+if not eg3_ec_has_assoc eg3_find i op eg3_find x eg3_find y eg3_find z
+if eg3_assoc_emit i op rule x y z
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+note Phase B: commutativity and associativity exploration (7,8,9,10)
+fn eg3_apply_phase_b to bool
+ch = false
+n = get eg3_cnt 0
+for i ulong n bound 512
+if ge get eg3_cnt 0 EG3_SAT_CAP
+ret ch
+end
+op = get eg3_op i
+if eq op EG3_OP_ADD
+if eg3_try_comm i EG3_OP_ADD 7
+ch = true
+end
+if eg3_try_assoc i EG3_OP_ADD 9 n
+ch = true
+end
+end
+if eq op EG3_OP_MUL
+if eg3_try_comm i EG3_OP_MUL 8
+ch = true
+end
+if eg3_try_assoc i EG3_OP_MUL 10 n
+ch = true
+end
+end
+end
+ret ch
+end
+
+fn eg3_saturate_inner to bool
+any = false
+for r ulong 6
+c1 = eg3_apply_phase_a1
+eg3_compute_costs
+c2 = eg3_apply_phase_a2_sr
+eg3_compute_costs
+c3 = eg3_apply_phase_a2_fma
+eg3_compute_costs
+if or c1 or c2 c3
+any = true
+else
+break
+end
+end
+ret any
+end
+
+fn eg3_saturate maxOuter ulong to void
+eg3_compute_costs
+z = eg3_saturate_inner
+for outer ulong maxOuter bound 16
+cb = eg3_apply_phase_b
+eg3_compute_costs
+if not cb
+break
+end
+ca = eg3_saturate_inner
+if not ca
+break
+end
+end
+z2 = eg3_saturate_inner
+end
+
+note ---- EGP3 Binary Structural Proof Certificate Serializer -------------------------------
+
+fn eg3_put_u32 off ulong v ulong to void
+put eg3_buf off uchar and v 255
+put eg3_buf add off 1 uchar and shr v 8 255
+put eg3_buf add off 2 uchar and shr v 16 255
+put eg3_buf add off 3 uchar and shr v 24 255
+end
+
+fn eg3_get_u32 off ulong to ulong
+b0 = ulong get eg3_buf off
+b1 = shl ulong get eg3_buf add off 1 8
+b2 = shl ulong get eg3_buf add off 2 16
+b3 = shl ulong get eg3_buf add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn eg3_cert_init to void
+put eg3_buf 0 69
+put eg3_buf 1 71
+put eg3_buf 2 80
+put eg3_buf 3 51
+eg3_put_u32 4 0
+put eg3_bpos 0 8
+put eg3_certs 0 0
+put eg3_all_rmask 0 0
+end
+
+fn eg3_cert_append fnIdx ulong blkIdx ulong rootBefore ulong rootAfter ulong to bool
+nc = get eg3_cnt 0
+nt = get eg3_trn 0
+p = get eg3_bpos 0
+need = add 28 add mul nc 32 mul nt 12
+if gt add p need EG3_BUF_CAP
+ret false
+end
+eg3_put_u32 p fnIdx
+eg3_put_u32 add p 4 blkIdx
+eg3_put_u32 add p 8 get eg3_width 0
+eg3_put_u32 add p 12 nc
+eg3_put_u32 add p 16 rootBefore
+eg3_put_u32 add p 20 rootAfter
+eg3_put_u32 add p 24 nt
+p = add p 28
+for i ulong nc bound 512
+eg3_put_u32 p get eg3_op i
+eg3_put_u32 add p 4 get eg3_a i
+eg3_put_u32 add p 8 get eg3_b i
+eg3_put_u32 add p 12 get eg3_c i
+eg3_put_u32 add p 16 get eg3_vlo i
+eg3_put_u32 add p 20 get eg3_vhi i
+eg3_put_u32 add p 24 get eg3_w i
+eg3_put_u32 add p 28 get eg3_fl i
+p = add p 32
+end
+for i ulong nt bound 512
+eg3_put_u32 p get eg3_tr_rule i
+eg3_put_u32 add p 4 get eg3_tr_lhs i
+eg3_put_u32 add p 8 get eg3_tr_rhs i
+p = add p 12
+end
+put eg3_bpos 0 p
+cc = add get eg3_certs 0 1
+put eg3_certs 0 cc
+eg3_put_u32 4 cc
+put eg3_all_rmask 0 or get eg3_all_rmask 0 get eg3_rmask 0
+ret true
+end
+
+fn eg3_write_fd fd int to bool
+n = get eg3_bpos 0
+w = write fd eg3_buf 0 n
+ret eq w long n
+end
+
+note ---- ΩIR Bridge (reads seed/ng/src/ir.om tables, strictly refuses token/convergent) ---
+
+fn eg3_ir_ty_width ty uint to ulong
+if or eq ty 4 eq ty 8
+ret 32
+end
+if or eq ty 5 eq ty 9
+ret 64
+end
+ret 0
+end
+
+note Strict eligibility filter for ΩIR ops:
+note   - Refuses convergent GPU ops (sync=44, shfl=45, mmald=104, mmast=105, mma=106)
+note   - Refuses all token-bearing ops (i_rtk != 0 or ir_htok != 0: load, store, chk.*, call, host, terminators)
+note   - Refuses non-32/64 integer types (e.g. f32, f64, tok, void, vectors)
+note   - Accepts only pure class-P wrapping arithmetic/bitwise ops
+fn eg3_ir_opcode_check op uint ty uint to ulong
+ir_rinit
+if or eq op 44 or eq op 45 or eq op 104 or eq op 105 eq op 106
+ret EG3_REFUSE_CONVERGENT
+end
+if or ne get i_rtk op 0 ne ir_htok op 0
+ret EG3_REFUSE_TOKEN
+end
+if eq eg3_ir_ty_width ty 0
+ret EG3_REFUSE_TYPE
+end
+if eq op 1
+ret EG3_ALLOW
+end
+if or eq op 10 or eq op 11 eq op 12
+ret EG3_ALLOW
+end
+if or eq op 16 or eq op 17 or eq op 18 eq op 20
+ret EG3_ALLOW
+end
+if eq op 21
+if or eq ty 4 eq ty 5
+ret EG3_ALLOW
+end
+ret EG3_REFUSE_TYPE
+end
+if eq op 46
+ret EG3_ALLOW
+end
+ret EG3_REFUSE_UNSUP
+end
+
+fn eg3_ir_op_check o uint to ulong
+ret eg3_ir_opcode_check uint get i_oop o get i_oty o
+end
+
+fn eg3_ir_to_eg_op op uint to ulong
+if eq op 1
+ret EG3_OP_CONST
+end
+if eq op 10
+ret EG3_OP_ADD
+end
+if eq op 11
+ret EG3_OP_SUB
+end
+if eq op 12
+ret EG3_OP_MUL
+end
+if eq op 46
+ret EG3_OP_FMA
+end
+if eq op 20
+ret EG3_OP_SHL
+end
+if eq op 21
+ret EG3_OP_SHR
+end
+if eq op 16
+ret EG3_OP_AND
+end
+if eq op 17
+ret EG3_OP_OR
+end
+if eq op 18
+ret EG3_OP_XOR
+end
+ret 0
+end
+
+fn eg3_ir_val_to_node v uint to ulong
+n = get eg3_ir_vn 0
+for i ulong n bound 256
+if eq get eg3_ir_val i v
+ret get eg3_ir_nod i
+end
+end
+sid = get eg3_ir_sn 0
+put eg3_ir_sn 0 add sid 1
+nid = eg3_add_ssa sid
+if lt n 256
+put eg3_ir_val n v
+put eg3_ir_nod n nid
+put eg3_ir_vn 0 add n 1
+end
+ret nid
+end
+
+fn eg3_ir_bind_val v uint nid ulong to void
+if eq v 0
+ret
+end
+n = get eg3_ir_vn 0
+if lt n 256
+put eg3_ir_val n v
+put eg3_ir_nod n nid
+put eg3_ir_vn 0 add n 1
+end
+end
+
+fn eg3_ir_import_op o uint to ulong
+op = uint get i_oop o
+if eq op 1
+nid = eg3_add_const get i_oim o
+eg3_ir_bind_val get i_ors o nid
+ret nid
+end
+eop = eg3_ir_to_eg_op op
+if eq op 46
+na = eg3_ir_val_to_node ir_arg o 0
+nb = eg3_ir_val_to_node ir_arg o 1
+nc = eg3_ir_val_to_node ir_arg o 2
+nid = eg3_add_fma na nb nc
+eg3_ir_bind_val get i_ors o nid
+ret nid
+end
+na = eg3_ir_val_to_node ir_arg o 0
+nb = eg3_ir_val_to_node ir_arg o 1
+nid = eg3_add_bin eop na nb
+eg3_ir_bind_val get i_ors o nid
+ret nid
+end
+
+fn eg3_ir_bump_ref chk ulong to void
+if eq chk EG3_REFUSE_TOKEN
+put eg3_ir_stat 0 add get eg3_ir_stat 0 1
+ret
+end
+if eq chk EG3_REFUSE_CONVERGENT
+put eg3_ir_stat 1 add get eg3_ir_stat 1 1
+ret
+end
+if eq chk EG3_REFUSE_TYPE
+put eg3_ir_stat 2 add get eg3_ir_stat 2 1
+ret
+end
+put eg3_ir_stat 3 add get eg3_ir_stat 3 1
+end
+
+fn eg3_ir_extract_blk b uint widthHint ulong to ulong
+w = widthHint
+if ne w 0
+eg3_reset w
+end
+lastRoot = EG3_NONE
+lastAny = EG3_NONE
+o = get i_bo1 b
+while ne o 0 bound 4096
+chk = eg3_ir_op_check o
+if eq chk EG3_ALLOW
+ow = eg3_ir_ty_width get i_oty o
+if eq w 0
+w = ow
+eg3_reset w
+end
+if eq ow w
+nid = eg3_ir_import_op o
+if ne nid EG3_NONE
+put eg3_ir_stat 4 add get eg3_ir_stat 4 1
+lastAny = nid
+if ne get i_oop o 1
+lastRoot = nid
+end
+end
+end
+else
+eg3_ir_bump_ref chk
+end
+o = get i_onx o
+end
+if eq lastRoot EG3_NONE
+ret lastAny
+end
+ret lastRoot
+end
+
+note Extract pure class-P arithmetic/bitwise ops from ΩIR block b, saturate via e-graph,
+note record EGP3 cert (when emitCert is true and trace/reduction holds), and return cost delta.
+fn eg3_opt_ir_block fnIdx ulong blkIdx ulong b uint widthHint ulong emitCert bool to ulong
+for i ulong 16
+put eg3_ir_stat i 0
+end
+put eg3_ir_vn 0 0
+put eg3_ir_sn 0 0
+lastRoot = eg3_ir_extract_blk b widthHint
+if eq lastRoot EG3_NONE
+ret 0
+end
+put eg3_ir_stat 10 get eg3_width 0
+eg3_compute_costs
+cbef = eg3_get_cost lastRoot
+eg3_saturate 2
+caft = eg3_get_cost lastRoot
+raft = eg3_get_best lastRoot
+put eg3_ir_stat 5 cbef
+put eg3_ir_stat 6 caft
+put eg3_ir_stat 7 lastRoot
+put eg3_ir_stat 8 raft
+put eg3_ir_stat 9 get eg3_trn 0
+if and emitCert and gt get eg3_trn 0 0 lt caft cbef
+if eg3_cert_append fnIdx blkIdx lastRoot raft
+put eg3_ir_stat 11 1
+end
+end
+if gt cbef caft
+ret sub cbef caft
+end
+ret 0
+end

@@ -1,0 +1,920 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/live/arboris_spec.om: Live Arboris Specialization & Self-Healing Controller.
+note Pure seeded OM-2 library unit (no om2 header, no fn main).
+note Integrates target_desc.om + isel.om + sm121_pe.om + fabric.om + crystallize.om into:
+note   1. O(1) bounded associative co-activation graph (as_coact) with spreading-activation prediction
+note   2. Hot-shape observation (as_observe) -> TID_A725 background specialization queue (TASK_BG_METABOLIC)
+note   3. 3-bit proof-gated specialization (as_specialize_slot): Contract(1) | EGP3(2) | Antibody#13-15+ORACLE(4) == 7
+note   4. Live ORACLE out-of-domain guard & automatic atomic fabWtbl rollback (as_dispatch_checked)
+note   5. Full telemetry counters (dispatches, spec hits, coact hits, refusals, rollbacks, latency saved)
+
+note 3-bit proof gate mask constants:
+const AS_PROOF_CONTRACT ulong 1
+const AS_PROOF_EGP3 ulong 2
+const AS_PROOF_ANTIBODY ulong 4
+const AS_PROOF_ALL ulong 7
+
+note Specialization kinds:
+const AS_KIND_GPU_GEMM ulong 1
+const AS_KIND_CRYSTALLIZE ulong 2
+
+note Specialization result / refusal codes:
+const AS_OK ulong 0
+const AS_ERR_SLOT ulong 1
+const AS_ERR_PROOF_CONTRACT ulong 2
+const AS_ERR_PROOF_EGP3 ulong 3
+const AS_ERR_PROOF_ANTIBODY ulong 4
+const AS_ERR_CONTRACT_SMEM ulong 5
+const AS_ERR_CONTRACT_OTHER ulong 6
+const AS_ERR_SYNTH_FAIL ulong 7
+const AS_ERR_SWAP_FAIL ulong 8
+
+note Last dispatch outcome codes:
+const AS_DISP_BASELINE ulong 0
+const AS_DISP_SPECIALIZED ulong 1
+const AS_DISP_ROLLBACK ulong 2
+
+note Alarm reason codes:
+const AS_ALARM_OOD ulong 1
+const AS_ALARM_ORACLE_MISMATCH ulong 2
+
+note Table capacities & sentinels:
+const AS_COACT_CAP ulong 64
+const AS_COACT_MASK ulong 63
+const AS_COACT_PROBES ulong 8
+const AS_JOB_CAP ulong 32
+const AS_ALARM_CAP ulong 32
+const AS_DEFAULT_THRESH ulong 4
+const AS_NONE ulong 999999
+
+note ---- Verified baseline mirror per fabWtbl slot (supports atomic rollback) ----
+global as_base_valid ulong 32
+global as_base_sem ulong 32
+global as_base_ptr ulong 32
+global as_base_tid ulong 32
+global as_base_mode ulong 32
+global as_base_cost ulong 32
+global as_slot_kind ulong 32
+global as_slot_spec_tid ulong 32
+global as_slot_m ulong 32
+global as_slot_k ulong 32
+global as_slot_n ulong 32
+global as_slot_dom_max ulong 32
+global as_slot_rolled ulong 32
+
+note ---- O(1) bounded associative co-activation graph (caller_sem -> callee_sem) ----
+global as_ca_used ulong 64
+global as_ca_src ulong 64
+global as_ca_dst ulong 64
+global as_ca_wt ulong 64
+
+note ---- O(1) per-caller top-prediction cache (Arboris spreading activation) ----
+global as_pred_used ulong 64
+global as_pred_src ulong 64
+global as_pred_dst ulong 64
+global as_pred_wt ulong 64
+global as_pred_tot ulong 64
+
+note ---- Live co-activation stream tracker ----
+global as_last_sem ulong 1
+global as_pending_pred ulong 1
+
+note ---- Background TID_A725 specialization job queue ----
+global as_hot_thresh ulong 1
+global as_job_cnt ulong 1
+global as_job_slot ulong 32
+global as_job_sem ulong 32
+global as_job_kind ulong 32
+global as_job_m ulong 32
+global as_job_k ulong 32
+global as_job_n ulong 32
+global as_job_exec_tid ulong 32
+global as_job_done ulong 32
+
+note ---- Alarm ring log (bounded 32 entries) ----
+global as_alarm_cnt ulong 1
+global as_alarm_slot ulong 32
+global as_alarm_x0 ulong 32
+global as_alarm_x1 ulong 32
+global as_alarm_code ulong 32
+
+note ---- Diagnostic & telemetry counters ----
+global as_last_status ulong 1
+global as_last_contract_err ulong 1
+global as_dispatches ulong 1
+global as_spec_hits ulong 1
+global as_coact_preds ulong 1
+global as_coact_hits ulong 1
+global as_coact_misses ulong 1
+global as_prefetch_cues ulong 1
+global as_swaps ulong 1
+global as_refusals ulong 1
+global as_alarms ulong 1
+global as_rollbacks ulong 1
+global as_latency_saved_ns ulong 1
+global as_jobs_scheduled ulong 1
+
+fn as_init to void
+for i ulong FAB_SLOTS
+put as_base_valid i 0
+put as_base_sem i 0
+put as_base_ptr i 0
+put as_base_tid i 0
+put as_base_mode i FAB_MODE_NONE
+put as_base_cost i 0
+put as_slot_kind i 0
+put as_slot_spec_tid i AS_NONE
+put as_slot_m i 0
+put as_slot_k i 0
+put as_slot_n i 0
+put as_slot_dom_max i 100
+put as_slot_rolled i 0
+end
+for j ulong AS_COACT_CAP
+put as_ca_used j 0
+put as_ca_src j 0
+put as_ca_dst j 0
+put as_ca_wt j 0
+put as_pred_used j 0
+put as_pred_src j 0
+put as_pred_dst j AS_NONE
+put as_pred_wt j 0
+put as_pred_tot j 0
+end
+for k ulong AS_JOB_CAP
+put as_job_slot k 0
+put as_job_sem k 0
+put as_job_kind k 0
+put as_job_m k 0
+put as_job_k k 0
+put as_job_n k 0
+put as_job_exec_tid k 0
+put as_job_done k 0
+end
+for m ulong AS_ALARM_CAP
+put as_alarm_slot m 0
+put as_alarm_x0 m 0
+put as_alarm_x1 m 0
+put as_alarm_code m 0
+end
+put as_last_sem 0 AS_NONE
+put as_pending_pred 0 AS_NONE
+put as_hot_thresh 0 AS_DEFAULT_THRESH
+put as_job_cnt 0 0
+put as_alarm_cnt 0 0
+put as_last_status 0 AS_DISP_BASELINE
+put as_last_contract_err 0 TDK_OK
+put as_dispatches 0 0
+put as_spec_hits 0 0
+put as_coact_preds 0 0
+put as_coact_hits 0 0
+put as_coact_misses 0 0
+put as_prefetch_cues 0 0
+put as_swaps 0 0
+put as_refusals 0 0
+put as_alarms 0 0
+put as_rollbacks 0 0
+put as_latency_saved_ns 0 0
+put as_jobs_scheduled 0 0
+end
+
+fn as_set_threshold thresh ulong to void
+if eq thresh 0
+put as_hot_thresh 0 1
+ret
+end
+put as_hot_thresh 0 thresh
+end
+
+fn as_set_slot_target slot ulong targetTid ulong to void
+if lt slot FAB_SLOTS
+put as_slot_spec_tid slot targetTid
+end
+end
+
+fn as_set_slot_dom slot ulong domMax ulong to void
+if lt slot FAB_SLOTS
+put as_slot_dom_max slot domMax
+end
+end
+
+note Register a verified cold baseline realization in fabWtbl and snapshot it for rollback!
+fn as_register_baseline slot ulong semId ulong codePtr ulong tid ulong mode ulong kind ulong to bool
+if ge slot FAB_SLOTS
+ret false
+end
+if not fabHotSwap slot semId codePtr tid mode AS_PROOF_ALL
+ret false
+end
+put as_base_valid slot 1
+put as_base_sem slot semId
+put as_base_ptr slot codePtr
+put as_base_tid slot tid
+put as_base_mode slot mode
+put as_base_cost slot get fabCostNs slot
+put as_slot_kind slot kind
+if eq kind AS_KIND_GPU_GEMM
+put as_slot_spec_tid slot TID_SM121
+else
+put as_slot_spec_tid slot TID_X925
+end
+put as_slot_dom_max slot get crDomMax 0
+ret true
+end
+
+note ---- Subsystem 1: Associative Co-Activation Graph (O(1) bounded) ----
+fn as_coact_hash2 a ulong b ulong to ulong
+h1 = mul a 2654435761
+h2 = mul b 2246822519
+ret and xor h1 h2 AS_COACT_MASK
+end
+
+fn as_coact_hash1 a ulong to ulong
+ret and mul a 2654435761 AS_COACT_MASK
+end
+
+fn as_coact_update_pred callerSem ulong calleeSem ulong wt ulong to void
+base = as_coact_hash1 callerSem
+for p ulong AS_COACT_PROBES
+idx = and add base p AS_COACT_MASK
+u = get as_pred_used idx
+if eq u 0
+put as_pred_used idx 1
+put as_pred_src idx callerSem
+put as_pred_dst idx calleeSem
+put as_pred_wt idx wt
+put as_pred_tot idx 1
+ret
+end
+if eq get as_pred_src idx callerSem
+put as_pred_tot idx add get as_pred_tot idx 1
+if ge wt get as_pred_wt idx
+put as_pred_dst idx calleeSem
+put as_pred_wt idx wt
+end
+ret
+end
+end
+end
+
+fn as_coact_has_cold_slot semId ulong to bool
+for i ulong FAB_SLOTS
+if eq get fabSem i semId
+if eq get fabMode i FAB_MODE_NEURAL
+ret true
+end
+end
+end
+ret false
+end
+
+note Record live (caller_sem, callee_sem) transition in O(1) associative table; returns new edge weight.
+fn as_coact callerSem ulong calleeSem ulong to ulong
+base = as_coact_hash2 callerSem calleeSem
+wt = ulong 0
+for p ulong AS_COACT_PROBES
+idx = and add base p AS_COACT_MASK
+u = get as_ca_used idx
+if eq u 0
+put as_ca_used idx 1
+put as_ca_src idx callerSem
+put as_ca_dst idx calleeSem
+put as_ca_wt idx 1
+wt = ulong 1
+break
+end
+if eq get as_ca_src idx callerSem
+if eq get as_ca_dst idx calleeSem
+wt = add get as_ca_wt idx 1
+put as_ca_wt idx wt
+break
+end
+end
+end
+if gt wt 0
+as_coact_update_pred callerSem calleeSem wt
+if as_coact_has_cold_slot calleeSem
+put as_prefetch_cues 0 add get as_prefetch_cues 0 1
+end
+end
+ret wt
+end
+
+note O(1) spreading-activation prediction: returns predicted next callee_sem or AS_NONE.
+fn as_coact_predict callerSem ulong to ulong
+base = as_coact_hash1 callerSem
+for p ulong AS_COACT_PROBES
+idx = and add base p AS_COACT_MASK
+if eq get as_pred_used idx 0
+ret AS_NONE
+end
+if eq get as_pred_src idx callerSem
+ret get as_pred_dst idx
+end
+end
+ret AS_NONE
+end
+
+note O(1) lookup of current transition weight for (callerSem, calleeSem).
+fn as_coact_weight callerSem ulong calleeSem ulong to ulong
+base = as_coact_hash2 callerSem calleeSem
+for p ulong AS_COACT_PROBES
+idx = and add base p AS_COACT_MASK
+if eq get as_ca_used idx 0
+ret 0
+end
+if eq get as_ca_src idx callerSem
+if eq get as_ca_dst idx calleeSem
+ret get as_ca_wt idx
+end
+end
+end
+ret 0
+end
+
+fn as_coact_reset_seq to void
+put as_last_sem 0 AS_NONE
+put as_pending_pred 0 AS_NONE
+end
+
+fn as_coact_reset_stats to void
+put as_coact_preds 0 0
+put as_coact_hits 0 0
+put as_coact_misses 0 0
+end
+
+note Advance live co-activation stream: score prior prediction, learn edge, emit next prefetch cue!
+fn as_coact_step curSem ulong to ulong
+pend = get as_pending_pred 0
+if ne pend AS_NONE
+put as_coact_preds 0 add get as_coact_preds 0 1
+if eq curSem pend
+put as_coact_hits 0 add get as_coact_hits 0 1
+else
+put as_coact_misses 0 add get as_coact_misses 0 1
+end
+end
+prev = get as_last_sem 0
+if ne prev AS_NONE
+if ne prev curSem
+w = as_coact prev curSem
+end
+end
+put as_last_sem 0 curSem
+nxt = as_coact_predict curSem
+put as_pending_pred 0 nxt
+ret nxt
+end
+
+note ---- Subsystem 2: Hot-Shape Observation -> TID_A725 Background Job Queue ----
+fn as_has_job semId ulong M ulong K ulong N ulong to bool
+cnt = get as_job_cnt 0
+for i ulong cnt bound 32
+if eq get as_job_sem i semId
+if eq get as_job_m i M
+if eq get as_job_k i K
+if eq get as_job_n i N
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+note Record live (semId, M, K, N) via fabObserveShape; schedule TID_A725 job when hits >= as_hot_thresh!
+fn as_observe wtblSlot ulong semId ulong M ulong K ulong N ulong to ulong
+hits = fabObserveShape semId M K N
+if ge hits get as_hot_thresh 0
+if not as_has_job semId M K N
+cnt = get as_job_cnt 0
+if lt cnt AS_JOB_CAP
+workerTid = fabScheduleApu TASK_BG_METABOLIC
+kind = ulong AS_KIND_GPU_GEMM
+if lt wtblSlot FAB_SLOTS
+sk = get as_slot_kind wtblSlot
+if ne sk 0
+kind = sk
+end
+end
+put as_job_slot cnt wtblSlot
+put as_job_sem cnt semId
+put as_job_kind cnt kind
+put as_job_m cnt M
+put as_job_k cnt K
+put as_job_n cnt N
+put as_job_exec_tid cnt workerTid
+put as_job_done cnt 0
+put as_job_cnt 0 add cnt 1
+put as_jobs_scheduled 0 add get as_jobs_scheduled 0 1
+end
+end
+end
+ret hits
+end
+
+fn as_pending_jobs to ulong
+cnt = get as_job_cnt 0
+remCnt = ulong 0
+for i ulong cnt bound 32
+if eq get as_job_done i 0
+remCnt = add remCnt 1
+end
+end
+ret remCnt
+end
+
+note ---- Subsystem 3: 3-Bit Proof Gate + Background Specialization ----
+note Antibody #13 (valid 16B SM121 framing, non-zero opcodes), #14 (stall >= 6), #15 (EXIT 0x794d terminator)
+fn as_verify_antibodies to bool
+n = get isLen 0
+if lt n 16
+ret false
+end
+if ne rem n 16 0
+ret false
+end
+if not peVerifySm121Antibodies
+ret false
+end
+insns = div n 16
+for i ulong insns bound 64
+off = mul i 16
+b0 = ulong get isBuf off
+b1 = ulong get isBuf add off 1
+op16 = or b0 shl b1 8
+if eq op16 0
+ret false
+end
+end
+lastOff = sub n 16
+eb0 = ulong get isBuf lastOff
+eb1 = ulong get isBuf add lastOff 1
+exitOp = or eb0 shl eb1 8
+if ne exitOp 31053
+ret false
+end
+exitStall = ulong get isBuf add lastOff 8
+if lt exitStall 6
+ret false
+end
+ret true
+end
+
+fn as_check_elf_magic em ulong to bool
+if ne get elfBuf 0 127
+ret false
+end
+if ne get elfBuf 1 69
+ret false
+end
+if ne get elfBuf 2 76
+ret false
+end
+if ne get elfBuf 3 70
+ret false
+end
+if ne ulong get elfBuf 18 em
+ret false
+end
+if ne get elfBuf 19 0
+ret false
+end
+ret true
+end
+
+note EGP3 structural dual-checker for specialized GPU SM121 realization
+fn as_check_egp3_gpu tid ulong cslot ulong to bool
+if ge cslot RC_CAP
+ret false
+end
+if ne get rcProof cslot AS_PROOF_ALL
+ret false
+end
+if eq isSelect tid OIR_ADD AS_NONE
+ret false
+end
+if eq isSelect tid OIR_MUL AS_NONE
+ret false
+end
+if eq isSelect tid OIR_RET AS_NONE
+ret false
+end
+reg = get peOut 0
+if lt reg PE_REGIME_GEMV_4R
+ret false
+end
+if gt reg PE_REGIME_HMMA_16816
+ret false
+end
+n = get isLen 0
+if lt n 16
+ret false
+end
+ret eq rem n 16 0
+end
+
+note EGP3 structural dual-checker for crystallized multi-ISA realization (A64 + x64 + RV64 + SM121)
+fn as_check_egp3_cryst to bool
+if eq get crFound 0 0
+ret false
+end
+nA64 = crEmitCrystallizedElf TID_X925
+if le nA64 120
+ret false
+end
+if not as_check_elf_magic 183
+ret false
+end
+nX64 = crEmitCrystallizedElf TID_X64_AVX2
+if le nX64 120
+ret false
+end
+if not as_check_elf_magic 62
+ret false
+end
+if not isCompileTestFn TID_RV64_RVV
+ret false
+end
+if ne get isLen 0 12
+ret false
+end
+if not isCompileTestFn TID_SM121
+ret false
+end
+ret eq get isLen 0 48
+end
+
+note ORACLE equivalence check: all live traces + independent in-domain holdout points match crNeuralOracle!
+fn as_check_oracle_equiv to bool
+op1 = get crOp1 0
+op2 = get crOp2 0
+cc = get crConstC 0
+if not crCheckCandAll op1 op2 cc
+ret false
+end
+if ne crEvalCand op1 op2 cc 1 1 crNeuralOracle 1 1
+ret false
+end
+if ne crEvalCand op1 op2 cc 13 17 crNeuralOracle 13 17
+ret false
+end
+ret eq crEvalCand op1 op2 cc 50 50 crNeuralOracle 50 50
+end
+
+fn as_mark_hist_spec semId ulong M ulong K ulong N ulong to void
+for i ulong FAB_HIST_CAP
+if fabMatchHist i semId M K N
+put fabHSpec i 1
+end
+end
+end
+
+fn as_refuse_missing_proof mask ulong to ulong
+if eq and mask AS_PROOF_CONTRACT 0
+ret AS_ERR_PROOF_CONTRACT
+end
+if eq and mask AS_PROOF_EGP3 0
+ret AS_ERR_PROOF_EGP3
+end
+if eq and mask AS_PROOF_ANTIBODY 0
+ret AS_ERR_PROOF_ANTIBODY
+end
+ret AS_OK
+end
+
+fn as_bump_refusal to void
+put as_refusals 0 add get as_refusals 0 1
+end
+
+fn as_gpu_check_contract targetTid ulong M ulong K ulong N ulong to ulong
+pePlanRegime M K N
+crc = tdCheckKernelContract targetTid
+put as_last_contract_err 0 crc
+if eq crc TDK_OK
+ret AS_OK
+end
+if eq crc TDK_ERR_SMEM
+ret AS_ERR_CONTRACT_SMEM
+end
+ret AS_ERR_CONTRACT_OTHER
+end
+
+fn as_gpu_eval_proofs targetTid ulong cslot ulong to ulong
+computed = ulong AS_PROOF_CONTRACT
+if as_check_egp3_gpu targetTid cslot
+computed = or computed AS_PROOF_EGP3
+end
+if as_verify_antibodies
+computed = or computed AS_PROOF_ANTIBODY
+end
+ret computed
+end
+
+fn as_specialize_gpu slot ulong M ulong K ulong N ulong proofMask ulong to ulong
+targetTid = get as_slot_spec_tid slot
+if eq targetTid AS_NONE
+targetTid = TID_SM121
+end
+note Bit 0: ngcheck / TargetDesc physical contract valid (pre-emit!)
+rc = as_gpu_check_contract targetTid M K N
+if ne rc AS_OK
+as_bump_refusal
+ret rc
+end
+rc = as_refuse_missing_proof proofMask
+if ne rc AS_OK
+as_bump_refusal
+ret rc
+end
+rc = peSpecializeW4Gemm get fabSem slot targetTid M K N
+if ne rc TDK_OK
+as_bump_refusal
+if eq rc TDK_ERR_SMEM
+ret AS_ERR_CONTRACT_SMEM
+end
+ret AS_ERR_CONTRACT_OTHER
+end
+cslot = get peOut 4
+note Ensure SM121 SASS buffer is populated for live EGP3 + Antibody #13-15 audit (even on cache hit)
+if not isCompileTestFn targetTid
+as_bump_refusal
+ret AS_ERR_PROOF_EGP3
+end
+eff = and as_gpu_eval_proofs targetTid cslot proofMask
+if ne eff AS_PROOF_ALL
+as_bump_refusal
+ret as_refuse_missing_proof eff
+end
+if not fabHotSwap slot get fabSem slot get rcPtr cslot targetTid FAB_MODE_GPU_NATIVE eff
+as_bump_refusal
+ret AS_ERR_SWAP_FAIL
+end
+put as_slot_m slot M
+put as_slot_k slot K
+put as_slot_n slot N
+as_mark_hist_spec get fabSem slot M K N
+put as_swaps 0 add get as_swaps 0 1
+ret AS_OK
+end
+
+fn as_cryst_check_contract targetTid ulong to ulong
+tdSetReq EXEC_SCALAR_SIMD 0 8 4 0 0
+crc = tdCheckKernelContract targetTid
+put as_last_contract_err 0 crc
+if ne crc TDK_OK
+ret AS_ERR_CONTRACT_OTHER
+end
+tdSetReq EXEC_SIMT_WARP 4096 40 32 0 0
+crc = tdCheckKernelContract TID_SM121
+put as_last_contract_err 0 crc
+if eq crc TDK_OK
+ret AS_OK
+end
+if eq crc TDK_ERR_SMEM
+ret AS_ERR_CONTRACT_SMEM
+end
+ret AS_ERR_CONTRACT_OTHER
+end
+
+fn as_cryst_eval_proofs to ulong
+computed = ulong AS_PROOF_CONTRACT
+if as_check_egp3_cryst
+computed = or computed AS_PROOF_EGP3
+end
+if as_verify_antibodies
+if as_check_oracle_equiv
+computed = or computed AS_PROOF_ANTIBODY
+end
+end
+ret computed
+end
+
+fn as_specialize_cryst slot ulong proofMask ulong to ulong
+targetTid = get as_slot_spec_tid slot
+if eq targetTid AS_NONE
+targetTid = TID_X925
+end
+note Bit 0: TargetDesc physical contract valid for CPU + SM121 targets
+rc = as_cryst_check_contract targetTid
+if ne rc AS_OK
+as_bump_refusal
+ret rc
+end
+rc = as_refuse_missing_proof proofMask
+if ne rc AS_OK
+as_bump_refusal
+ret rc
+end
+if not crSynthesizeFromTraces
+as_bump_refusal
+ret AS_ERR_SYNTH_FAIL
+end
+eff = and as_cryst_eval_proofs proofMask
+if ne eff AS_PROOF_ALL
+as_bump_refusal
+ret as_refuse_missing_proof eff
+end
+cslot = tdCacheInstall get fabSem slot targetTid tdGet targetTid TDF_FEAT 1 131072 eff
+if eq cslot AS_NONE
+as_bump_refusal
+ret AS_ERR_SWAP_FAIL
+end
+if not fabHotSwap slot get fabSem slot 131072 targetTid FAB_MODE_CRYSTALLIZED eff
+as_bump_refusal
+ret AS_ERR_SWAP_FAIL
+end
+put as_swaps 0 add get as_swaps 0 1
+ret AS_OK
+end
+
+note Unified 3-bit proof-gated specialization entry point (6 params).
+fn as_specialize_slot slot ulong kind ulong M ulong K ulong N ulong proofMask ulong to ulong
+if ge slot FAB_SLOTS
+put as_refusals 0 add get as_refusals 0 1
+ret AS_ERR_SLOT
+end
+if eq kind AS_KIND_GPU_GEMM
+ret as_specialize_gpu slot M K N proofMask
+end
+if eq kind AS_KIND_CRYSTALLIZE
+ret as_specialize_cryst slot proofMask
+end
+put as_refusals 0 add get as_refusals 0 1
+ret AS_ERR_SLOT
+end
+
+note Drain pending TID_A725 background specialization queue; returns count of atomic swaps.
+fn as_run_bg_queue proofMask ulong to ulong
+cnt = get as_job_cnt 0
+sw = ulong 0
+for i ulong cnt bound 32
+if eq get as_job_done i 0
+if eq get as_job_exec_tid i TID_A725
+rc = as_specialize_slot get as_job_slot i get as_job_kind i get as_job_m i get as_job_k i get as_job_n i proofMask
+if eq rc AS_OK
+put as_job_done i 1
+sw = add sw 1
+else
+put as_job_done i 2
+end
+end
+end
+end
+ret sw
+end
+
+note ---- Subsystem 4: Live ORACLE Out-of-Domain Guard & Automatic Rollback ----
+fn as_log_alarm slot ulong x0 ulong x1 ulong code ulong to void
+put as_alarms 0 add get as_alarms 0 1
+idx = get as_alarm_cnt 0
+if lt idx AS_ALARM_CAP
+put as_alarm_slot idx slot
+put as_alarm_x0 idx x0
+put as_alarm_x1 idx x1
+put as_alarm_code idx code
+put as_alarm_cnt 0 add idx 1
+end
+end
+
+fn as_rollback_slot slot ulong to bool
+if ge slot FAB_SLOTS
+ret false
+end
+if eq get as_base_valid slot 0
+ret false
+end
+bSem = get as_base_sem slot
+bPtr = get as_base_ptr slot
+bTid = get as_base_tid slot
+bMode = get as_base_mode slot
+if not fabHotSwap slot bSem bPtr bTid bMode AS_PROOF_ALL
+ret false
+end
+put as_rollbacks 0 add get as_rollbacks 0 1
+put as_slot_rolled slot add get as_slot_rolled slot 1
+ret true
+end
+
+fn as_record_savings slot ulong to void
+baseC = get as_base_cost slot
+curC = get fabCostNs slot
+if gt baseC curC
+put as_latency_saved_ns 0 add get as_latency_saved_ns 0 sub baseC curC
+end
+end
+
+fn as_cryst_in_dom slot ulong x0 ulong x1 ulong to bool
+domMax = get as_slot_dom_max slot
+cDom = get crDomMax 0
+if lt cDom domMax
+domMax = cDom
+end
+if gt x0 domMax
+ret false
+end
+ret le x1 domMax
+end
+
+fn as_dispatch_cryst slot ulong x0 ulong x1 ulong to ulong
+if eq get fabMode slot FAB_MODE_CRYSTALLIZED
+if as_cryst_in_dom slot x0 x1
+yFast = crEvalCand get crOp1 0 get crOp2 0 get crConstC 0 x0 x1
+yRef = crNeuralOracle x0 x1
+if eq yFast yRef
+put as_spec_hits 0 add get as_spec_hits 0 1
+as_record_savings slot
+put as_last_status 0 AS_DISP_SPECIALIZED
+ret yFast
+end
+as_log_alarm slot x0 x1 AS_ALARM_ORACLE_MISMATCH
+rb = as_rollback_slot slot
+put as_last_status 0 AS_DISP_ROLLBACK
+ret yRef
+end
+note Out-of-domain alarm: fall back to verified baseline neural oracle and atomically roll back fabWtbl!
+as_log_alarm slot x0 x1 AS_ALARM_OOD
+ySafe = crNeuralOracle x0 x1
+rb = as_rollback_slot slot
+put as_last_status 0 AS_DISP_ROLLBACK
+ret ySafe
+end
+put as_last_status 0 AS_DISP_BASELINE
+ret crCallOracle slot x0 x1
+end
+
+fn as_dispatch_gpu slot ulong x0 ulong x1 ulong to ulong
+mode = get fabMode slot
+yExact = mul x0 x1
+if eq mode FAB_MODE_GPU_NATIVE
+if eq x0 get as_slot_m slot
+if eq x1 get as_slot_k slot
+put as_spec_hits 0 add get as_spec_hits 0 1
+as_record_savings slot
+put as_last_status 0 AS_DISP_SPECIALIZED
+ret yExact
+end
+end
+as_log_alarm slot x0 x1 AS_ALARM_OOD
+rb = as_rollback_slot slot
+put as_last_status 0 AS_DISP_ROLLBACK
+ret yExact
+end
+put as_last_status 0 AS_DISP_BASELINE
+ret yExact
+end
+
+note Checked live dispatch through fabWtbl with co-activation tracking, ORACLE guard, and rollback!
+fn as_dispatch_checked slot ulong x0 ulong x1 ulong to ulong
+if ge slot FAB_SLOTS
+put as_last_status 0 AS_DISP_BASELINE
+ret 0
+end
+put as_dispatches 0 add get as_dispatches 0 1
+sem = get fabSem slot
+cue = as_coact_step sem
+kind = get as_slot_kind slot
+if eq kind AS_KIND_CRYSTALLIZE
+ret as_dispatch_cryst slot x0 x1
+end
+ret as_dispatch_gpu slot x0 x1
+end
+
+note ---- Subsystem 5: Telemetry Summary Getter ----
+fn as_telemetry_get metric ulong to ulong
+if eq metric 0
+ret get as_dispatches 0
+end
+if eq metric 1
+ret get as_spec_hits 0
+end
+if eq metric 2
+ret get as_coact_hits 0
+end
+if eq metric 3
+ret get as_refusals 0
+end
+if eq metric 4
+ret get as_rollbacks 0
+end
+if eq metric 5
+ret get as_latency_saved_ns 0
+end
+if eq metric 6
+ret get as_swaps 0
+end
+if eq metric 7
+ret get as_alarms 0
+end
+if eq metric 8
+ret get as_coact_preds 0
+end
+if eq metric 9
+ret get as_prefetch_cues 0
+end
+if eq metric 10
+ret get as_jobs_scheduled 0
+end
+ret 0
+end

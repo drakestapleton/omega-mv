@@ -1,0 +1,1180 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/gate-beyond-c.om: End-to-End Pure-OM-2 Integration Gate for Omega NG Beyond-C Pipeline.
+note Chains ALL 4 verified lanes into one live proof-carrying compilation & hot-swap pipeline:
+note   Stage 1: Real ΩIR blocks (32-bit & 64-bit, mixing pure + token + convergent ops) -> ir_egraph -> EGP3 cert
+note   Stage 2: Zero-shared-code egp3_checker (vc3_verify) over the live EGP3 bundle from Stage 1
+note   Stage 3: Canonical ir_wr binary ΩIR -> OMPK v1 pack (FIPS 180-4 SHA-256) + DAG resolution +
+note            TargetDesc physical contract check + pk_realize_on_arrive + semantic dedup
+note   Stage 4: Live Arboris (arboris_spec) co-activation learning + TID_A725 background specialization +
+note            proofMask==7 atomic fabHotSwap + specialized dispatch + OOD ORACLE alarm & rollback
+note   Stage 5: 8 fail-closed negative controls spanning all 4 lanes (non-pow2, token/convergent refusal,
+note            mutated EGP3 rule/root, 1-bit OMPK tamper, SMEM/AMX contract violation, proofMask!=7,
+note            arboris missing proof bits / SMEM refusal, Antibody #14 stall corruption)
+note   Stage 6 (when invoked as `gate-beyond-c NG_BIN SCRATCH`): live subprocess pipeline through the
+note            pinned `ng` binary testing ALL existing modes (`front-check`, `front-ir`, `ir-copy`,
+note            `opt`, `opt-count`, `a64` + executing emitted ELF) AND ALL 4 new modes (`egraph`,
+note            `verify`, `pack`, `realize`) + 4 CLI fail-closed negative controls!
+note
+note Link order (program mode, no om2 header — ir.om provides om2 at line 1):
+note   seed/ng/src/ir.om seed/ng/sha256.om seed/ng/target/target_desc.om seed/ng/target/isel.om
+note   seed/ng/target/sm121_pe.om seed/ng/target/fabric.om seed/ng/target/crystallize.om
+note   seed/ng/egraph/ir_egraph.om seed/ng/verify/egp3_checker.om seed/ng/pack/sem_pack.om
+note   seed/ng/live/arboris_spec.om seed/ng/gate-beyond-c.om
+
+global bc_dig uchar 24
+global bc_chk ulong 1
+global bc_neg ulong 1
+global bc_cli_chk ulong 1
+global bc_cli_neg ulong 1
+
+global bc_ir_bytes uchar 4096
+global bc_ir_len ulong 1
+global bc_ir2_bytes uchar 4096
+global bc_ir2_len ulong 1
+global bc_egp3_saved uchar 131072
+global bc_egp3_len ulong 1
+global bc_slots ulong 8
+global bc_sem_key ulong 1
+global bc_cslot ulong 1
+global bc_cptr ulong 1
+
+note Subprocess CLI test buffers (Stage 6)
+global bc_ngp uchar 2048
+global bc_ngl ulong 1
+global bc_scp uchar 2048
+global bc_scl ulong 1
+global bc_pa uchar 4096
+global bc_pl ulong 1
+global bc_av uchar 8192
+global bc_an ulong 2
+global bc_st uchar 4
+global bc_io uchar 131072
+global bc_io2 uchar 131072
+
+text bc_m_hdr "=== OMEGA NG BEYOND-C END-TO-END INTEGRATION GATE ===\n"
+text bc_m_pass "NG-BEYOND-C-GATE PASS checks="
+text bc_m_neg " neg_controls="
+text bc_m_certs " egp3_certs="
+text bc_m_swaps " swaps="
+text bc_m_rb " rollbacks="
+text bc_m_cli " cli_checks="
+text bc_m_cneg " cli_neg="
+text bc_m_nl "\n"
+text bc_m_fail "NG-BEYOND-C-GATE FAIL check="
+
+text bc_prog_om "fn main to int\na = uint 7\nb = uint 5\nc = uint 3\nx = add mul a 8 sub b b\ny = add x mul c 1\nret int y\nend\n"
+text bc_hdr_fc "@ng front-check\n"
+text bc_hdr_fi "@ng front-ir\n"
+text bc_hdr_ic "@ng ir-copy\n"
+text bc_hdr_op "@ng opt\n"
+text bc_hdr_oc "@ng opt-count\n"
+text bc_hdr_a6 "@ng a64\n"
+text bc_hdr_eg "@ng egraph\n"
+text bc_hdr_vr "@ng verify\n"
+text bc_hdr_pk "@ng pack\n"
+text bc_hdr_rl "@ng realize\n"
+text bc_hdr_rls "@ng realize sm121\n"
+text bc_hdr_bad "@ng unknown-mode\n"
+
+text bc_fn_in "/in.bin"
+text bc_fn_out "/out.bin"
+text bc_fn_err "/err.bin"
+text bc_fn_ir "/prog.ir"
+text bc_fn_eg "/prog.egp3"
+text bc_fn_pk "/prog.ompk"
+text bc_fn_elf "/prog.elf"
+
+text bc_pfx_opt "opt "
+text bc_pfx_ver "NG-VERIFY PASS"
+text bc_pfx_rlz "NG-REALIZE PASS"
+
+fn bc_wrt s view uchar * to void
+r = write 1 s 0 len s
+end
+
+fn bc_num v ulong to void
+x = v
+p = ulong 24
+for i ulong 21
+p = sub p 1
+put bc_dig p uchar add 48 rem x 10
+x = div x 10
+if eq x 0
+r = write 1 bc_dig p sub 24 p
+ret
+end
+end
+end
+
+fn bc_fail code ulong to int
+bc_wrt bc_m_fail
+bc_num code
+bc_wrt bc_m_nl
+ret int code
+end
+
+fn bc_add_chk n ulong to void
+put bc_chk 0 add get bc_chk 0 n
+end
+
+fn bc_add_neg to void
+put bc_neg 0 add get bc_neg 0 1
+end
+
+note ---- Stage 1: Real ΩIR blocks -> ir_egraph -> EGP3 binary certificate bundle ----
+
+fn bc_emit_mixed32 b uint p0 uint p1 uint p2 uint tok0 uint to uint
+o = ir_op b 70 0 0 3
+ir_set o 0 tok0
+ir_set o 1 p0
+ir_set o 2 p1
+tk = ir_otok o
+o = ir_op b 42 4 0 3
+ir_set o 0 tk
+ir_set o 1 p0
+ir_set o 2 p1
+o = ir_op b 43 0 0 4
+ir_set o 0 tk
+ir_set o 1 p0
+ir_set o 2 p1
+ir_set o 3 p2
+tk = ir_otok o
+o = ir_op b 44 0 0 1
+ir_set o 0 tk
+tk = ir_otok o
+o = ir_op b 45 4 0 2
+ir_set o 0 p0
+ir_set o 1 p1
+o = ir_op b 106 4 0 3
+ir_set o 0 p0
+ir_set o 1 p1
+ir_set o 2 p2
+ret tk
+end
+
+fn bc_build_ir32 to uint
+ir_init
+f = ir_fnew 0 0 4
+p0 = ir_fpar f 4
+p1 = ir_fpar f 4
+p2 = ir_fpar f 4
+b = ir_blk f
+tk = bc_emit_mixed32 b p0 p1 p2 ir_ftok f
+c0 = ir_res ir_op b 1 4 0 0
+c8 = ir_res ir_op b 1 4 8 0
+o = ir_op b 12 4 0 2
+ir_set o 0 p0
+ir_set o 1 c8
+v1 = ir_res o
+o = ir_op b 12 4 0 2
+ir_set o 0 v1
+ir_set o 1 p1
+v1 = ir_res o
+o = ir_op b 10 4 0 2
+ir_set o 0 p2
+ir_set o 1 c0
+v2 = ir_res o
+o = ir_op b 10 4 0 2
+ir_set o 0 v1
+ir_set o 1 v2
+v1 = ir_res o
+o = ir_op b 63 0 0 2
+ir_set o 0 tk
+ir_set o 1 v1
+ret b
+end
+
+fn bc_build_ir64 to uint
+ir_init
+f = ir_fnew 0 0 5
+p0 = ir_fpar f 5
+p1 = ir_fpar f 5
+p2 = ir_fpar f 5
+b = ir_blk f
+tk = ir_ftok f
+c1 = ir_res ir_op b 1 5 1 0
+c16 = ir_res ir_op b 1 5 16 0
+o = ir_op b 12 5 0 2
+ir_set o 0 p0
+ir_set o 1 c1
+v1 = ir_res o
+o = ir_op b 12 5 0 2
+ir_set o 0 v1
+ir_set o 1 c16
+v1 = ir_res o
+o = ir_op b 11 5 0 2
+ir_set o 0 p1
+ir_set o 1 p1
+v2 = ir_res o
+o = ir_op b 17 5 0 2
+ir_set o 0 p2
+ir_set o 1 v2
+v2 = ir_res o
+o = ir_op b 10 5 0 2
+ir_set o 0 v1
+ir_set o 1 v2
+v1 = ir_res o
+o = ir_op b 63 0 0 2
+ir_set o 0 tk
+ir_set o 1 v1
+ret b
+end
+
+fn bc_build_ir64_alt to uint
+ir_init
+f = ir_fnew 0 0 5
+p0 = ir_fpar f 5
+p1 = ir_fpar f 5
+p2 = ir_fpar f 5
+b = ir_blk f
+tk = ir_ftok f
+c4 = ir_res ir_op b 1 5 4 0
+o = ir_op b 20 5 0 2
+ir_set o 0 p0
+ir_set o 1 c4
+v1 = ir_res o
+o = ir_op b 10 5 0 2
+ir_set o 0 v1
+ir_set o 1 p2
+v1 = ir_res o
+o = ir_op b 63 0 0 2
+ir_set o 0 tk
+ir_set o 1 v1
+ret b
+end
+
+fn bc_stage1_egraph to int
+eg3_cert_init
+b32 = bc_build_ir32
+eg3_set_target_costs tdGet TID_SM121 TDF_EXEC tdGet TID_SM121 TDF_MULLAT tdGet TID_SM121 TDF_DIVLAT tdGet TID_SM121 TDF_FEAT
+d32 = eg3_opt_ir_block 0 0 b32 32 true
+if eq d32 0
+ret bc_fail 10
+end
+if ne get eg3_ir_stat 0 4
+ret bc_fail 11
+end
+if ne get eg3_ir_stat 1 3
+ret bc_fail 12
+end
+if ne get eg3_ir_stat 11 1
+ret bc_fail 13
+end
+
+b64 = bc_build_ir64
+eg3_set_target_costs tdGet TID_X925 TDF_EXEC tdGet TID_X925 TDF_MULLAT tdGet TID_X925 TDF_DIVLAT tdGet TID_X925 TDF_FEAT
+d64 = eg3_opt_ir_block 1 0 b64 64 true
+if eq d64 0
+ret bc_fail 14
+end
+if ne get eg3_ir_stat 11 1
+ret bc_fail 15
+end
+if ne get eg3_certs 0 2
+ret bc_fail 16
+end
+
+note Serialize canonical 64-bit ΩIR module via ir_wr for Stage 3 OMPK packing
+w1 = ir_wr
+if or lt w1 24 gt w1 4096
+ret bc_fail 17
+end
+for i ulong w1 bound 4096
+put bc_ir_bytes i ar_bg 1 i
+end
+put bc_ir_len 0 w1
+if or ne get bc_ir_bytes 0 79 ne get bc_ir_bytes 1 83
+ret bc_fail 18
+end
+
+note Build and serialize semantically equivalent alternate 64-bit ΩIR module (different bytes, same func_id)
+b64a = bc_build_ir64_alt
+w2 = ir_wr
+if or lt w2 24 gt w2 4096
+ret bc_fail 19
+end
+for i ulong w2 bound 4096
+put bc_ir2_bytes i ar_bg 1 i
+end
+put bc_ir2_len 0 w2
+
+note Snapshot live EGP3 bundle for Stage 2 and Stage 5 negative controls
+nb = get eg3_bpos 0
+if or lt nb 36 gt nb EG3_BUF_CAP
+ret bc_fail 20
+end
+for i ulong nb bound 131072
+put bc_egp3_saved i get eg3_buf i
+end
+put bc_egp3_len 0 nb
+bc_add_chk 11
+ret 0
+end
+
+note ---- Stage 2: Zero-shared-code egp3_checker over live Stage-1 EGP3 bundle ----
+
+fn bc_stage2_verify to int
+nb = get bc_egp3_len 0
+for i ulong nb bound 131072
+put vc3_buf i get bc_egp3_saved i
+end
+st = vc3_verify nb
+if ne st 0
+ret bc_fail 25
+end
+if ne get vc3_stat 0 2
+ret bc_fail 26
+end
+if eq get vc3_stat 1 0
+ret bc_fail 27
+end
+if ne get vc3_stat 2 8
+ret bc_fail 28
+end
+bc_add_chk 4
+ret 0
+end
+
+note ---- Stage 3: OMPK v1 Pack + DAG Resolve + TargetDesc Contract + Realization Dedup ----
+
+fn bc_load_ir1 to void
+pk_ir_reset
+n = get bc_ir_len 0
+for i ulong n bound 4096
+rc = pk_ir_push get bc_ir_bytes i
+end
+end
+
+fn bc_load_ir2 to void
+pk_ir_reset
+n = get bc_ir2_len 0
+for i ulong n bound 4096
+rc = pk_ir_push get bc_ir2_bytes i
+end
+end
+
+fn bc_stage3_pack to int
+pk_reset_all
+tdCacheInit
+
+note Pack leaf (real binary ΩIR #1) with canonical polynomial func_id
+pk_reset_builder
+bc_load_ir1
+pk_compute_poly_func_id 64 0 16 1
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 FEAT_FMA
+if ne pk_pack PK_OK
+ret bc_fail 30
+end
+if ne pk_verify PK_OK
+ret bc_fail 31
+end
+if ne pk_store_put PK_OK
+ret bc_fail 32
+end
+leafSlot = get pk_last_slot 0
+put bc_slots 0 leafSlot
+
+note Pack root (real binary ΩIR #2, different bytes, SAME func_id, importing leafSlot)
+pk_reset_builder
+bc_load_ir2
+pk_compute_poly_func_id 64 0 16 1
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 FEAT_FMA
+if ne pk_add_import_from_store leafSlot PK_OK
+ret bc_fail 33
+end
+if ne pk_pack PK_OK
+ret bc_fail 34
+end
+if ne pk_verify PK_OK
+ret bc_fail 35
+end
+if ne pk_store_put PK_OK
+ret bc_fail 36
+end
+rootSlot = get pk_last_slot 0
+put bc_slots 1 rootSlot
+if eq rootSlot leafSlot
+ret bc_fail 37
+end
+
+note DAG resolution rooted at rootSlot -> [leafSlot, rootSlot]
+pk_copy_store_sem_to_query rootSlot
+if ne pk_resolve_deps PK_OK
+ret bc_fail 38
+end
+if ne get pk_topo_len 0 2
+ret bc_fail 39
+end
+if or ne get pk_topo_order 0 leafSlot ne get pk_topo_order 1 rootSlot
+ret bc_fail 40
+end
+
+note Realize leaf on TID_X925 with full 3-bit proofMask == 7
+if ne pk_store_load leafSlot PK_OK
+ret bc_fail 41
+end
+xFeat = tdGet TID_X925 TDF_FEAT
+if ne pk_realize_on_arrive TID_X925 xFeat 4096 7 PK_OK
+ret bc_fail 42
+end
+if or ne get pk_real_out 2 0 ne get pk_real_out 5 1
+ret bc_fail 43
+end
+put bc_cslot 0 get pk_real_out 1
+put bc_sem_key 0 get pk_real_out 3
+put bc_cptr 0 get pk_real_out 4
+
+note Semantic dedup: realize root (different sem_id, SAME func_id) -> cache hit, 0 extra codegen!
+if ne pk_store_load rootSlot PK_OK
+ret bc_fail 44
+end
+if ne pk_realize_on_arrive TID_X925 xFeat 4096 7 PK_OK
+ret bc_fail 45
+end
+if ne get pk_real_out 2 1
+ret bc_fail 46
+end
+if or ne get pk_real_out 1 get bc_cslot 0 ne get pk_real_out 4 get bc_cptr 0
+ret bc_fail 47
+end
+if ne get pk_real_out 5 1
+ret bc_fail 48
+end
+
+note Pack & realize SM121 GPU kernel OMPK package on TID_SM121
+pk_reset_builder
+bc_load_ir1
+pk_set_req EXEC_SIMT_WARP 32768 64 32 MMA_16816_BF16 FEAT_HMMA16816
+if ne pk_pack PK_OK
+ret bc_fail 49
+end
+if ne pk_store_put PK_OK
+ret bc_fail 50
+end
+put bc_slots 2 get pk_last_slot 0
+smFeat = tdGet TID_SM121 TDF_FEAT
+if ne pk_realize_on_arrive TID_SM121 smFeat 4096 7 PK_OK
+ret bc_fail 51
+end
+if ne get pk_real_out 5 2
+ret bc_fail 52
+end
+bc_add_chk 22
+ret 0
+end
+
+note ---- Stage 4: Live Arboris (arboris_spec) proofMask==7 Hot-Swap & ORACLE Rollback ----
+
+fn bc_stage4_live to int
+isInitRules
+fabInit
+crInit
+as_init
+sem0 = get bc_sem_key 0
+sem1 = add sem0 1
+if not as_register_baseline 0 sem0 4096 TID_SM121 FAB_MODE_NEURAL AS_KIND_GPU_GEMM
+ret bc_fail 60
+end
+if not as_register_baseline 1 sem1 8192 TID_SM121 FAB_MODE_NEURAL AS_KIND_CRYSTALLIZE
+ret bc_fail 61
+end
+
+note Warmup + alternating calls train Arboris co-activation predictor & cross hot-shape threshold (>=4)
+for r ulong 4
+y0 = as_dispatch_checked 0 4 4096
+if ne y0 16384
+ret bc_fail 62
+end
+h0 = as_observe 0 sem0 4 4096 4096
+y1 = as_dispatch_checked 1 add r 2 add r 1
+h1 = as_observe 1 sem1 1 2 1
+end
+if ne as_pending_jobs 2
+ret bc_fail 63
+end
+if or ne get as_job_exec_tid 0 TID_A725 ne get as_job_exec_tid 1 TID_A725
+ret bc_fail 64
+end
+
+note Drain TID_A725 background queue with full proofMask == 7
+sw = as_run_bg_queue 7
+if ne sw 2
+ret bc_fail 65
+end
+if or ne get fabVer 0 2 ne get fabMode 0 FAB_MODE_GPU_NATIVE
+ret bc_fail 66
+end
+if or ne get fabVer 1 2 ne get fabMode 1 FAB_MODE_CRYSTALLIZED
+ret bc_fail 67
+end
+if ne get fabCostNs 1 500
+ret bc_fail 68
+end
+if not as_verify_antibodies
+ret bc_fail 69
+end
+
+note Run specialized dispatches -> confirm AS_DISP_SPECIALIZED & saved latency > 0
+y0 = as_dispatch_checked 0 4 4096
+if or ne y0 16384 ne get as_last_status 0 AS_DISP_SPECIALIZED
+ret bc_fail 70
+end
+y1 = as_dispatch_checked 1 7 5
+if or ne y1 36 ne get as_last_status 0 AS_DISP_SPECIALIZED
+ret bc_fail 71
+end
+if eq get as_latency_saved_ns 0 0
+ret bc_fail 72
+end
+
+note Out-of-domain input on crystallized slot 1 -> ORACLE alarm + atomic fabWtbl rollback!
+yOod = as_dispatch_checked 1 200 1
+if or ne yOod 603 ne get as_last_status 0 AS_DISP_ROLLBACK
+ret bc_fail 73
+end
+if or ne get as_alarms 0 1 ne get as_rollbacks 0 1
+ret bc_fail 74
+end
+if or ne get fabVer 1 3 ne get fabMode 1 FAB_MODE_NEURAL
+ret bc_fail 75
+end
+ySafe = as_dispatch_checked 1 7 5
+if or ne ySafe 36 ne get as_last_status 0 AS_DISP_BASELINE
+ret bc_fail 76
+end
+bc_add_chk 17
+ret 0
+end
+
+note ---- Stage 5: 8 Fail-Closed Negative Controls across all 4 Lanes ----
+
+fn bc_neg_1_to_4 to int
+note NC1 (Lane 1): non-power-of-two mul(r0, 6) never fires Rule 18; token/convergent opcodes refused
+eg3_set_costs_sm121
+eg3_reset 32
+r0 = eg3_add_ssa 0
+m6 = eg3_add_bin EG3_OP_MUL r0 eg3_add_const 6
+eg3_saturate 2
+if ne and get eg3_rmask 0 shl ulong 1 18 0
+ret bc_fail 80
+end
+if ne eg3_ir_opcode_check 42 4 EG3_REFUSE_TOKEN
+ret bc_fail 81
+end
+if ne eg3_ir_opcode_check 106 4 EG3_REFUSE_CONVERGENT
+ret bc_fail 82
+end
+bc_add_neg
+
+note NC2 (Lane 2): mutate rule ID of trace step 0 in live Stage-1 EGP3 cert -> vc3_verify refuses!
+nb = get bc_egp3_len 0
+for i ulong nb bound 131072
+put vc3_buf i get bc_egp3_saved i
+end
+nc0 = vc3_rdu32 20
+tr0 = add 36 mul nc0 32
+put vc3_buf tr0 uchar 99
+if eq vc3_verify nb 0
+ret bc_fail 83
+end
+bc_add_neg
+
+note NC3 (Lane 2): corrupt root_after of live Stage-1 EGP3 cert 0 to node 0 -> vc3_verify refuses!
+for i ulong nb bound 131072
+put vc3_buf i get bc_egp3_saved i
+end
+put vc3_buf 28 uchar 0
+put vc3_buf 29 uchar 0
+put vc3_buf 30 uchar 0
+put vc3_buf 31 uchar 0
+if eq vc3_verify nb 0
+ret bc_fail 84
+end
+bc_add_neg
+
+note NC4 (Lane 3): 1-bit tamper in embedded binary OSC1IR payload of live OMPK -> PK_ERR_DIGEST!
+cgBefore = get pk_real_out 5
+if ne pk_store_load get bc_slots 0 PK_OK
+ret bc_fail 85
+end
+orig = get pk_buf PK_HDR_LEN
+put pk_buf PK_HDR_LEN xor orig uchar 1
+if ne pk_verify PK_ERR_DIGEST
+ret bc_fail 86
+end
+if ne pk_realize_on_arrive TID_X925 tdGet TID_X925 TDF_FEAT 4096 7 PK_ERR_DIGEST
+ret bc_fail 87
+end
+if ne get pk_real_out 5 cgBefore
+ret bc_fail 88
+end
+bc_add_neg
+bc_add_chk 9
+ret 0
+end
+
+fn bc_neg_5_to_8 to int
+cgBefore = get pk_real_out 5
+note NC5 (Lane 3): TargetDesc physical contract violations refused BEFORE codegen
+pk_reset_builder
+bc_load_ir1
+pk_set_req EXEC_SIMT_WARP 131072 64 32 0 0
+if ne pk_pack PK_OK
+ret bc_fail 89
+end
+if ne pk_realize_on_arrive TID_SM121 tdGet TID_SM121 TDF_FEAT 8192 7 TDK_ERR_SMEM
+ret bc_fail 90
+end
+pk_reset_builder
+bc_load_ir1
+pk_set_req EXEC_SCALAR_SIMD 0 12 8 MMA_161616_AMX 0
+if ne pk_pack PK_OK
+ret bc_fail 91
+end
+if ne pk_realize_on_arrive TID_X64_AVX2 tdGet TID_X64_AVX2 TDF_FEAT 8192 7 TDK_ERR_MMA
+ret bc_fail 92
+end
+if ne get pk_real_out 5 cgBefore
+ret bc_fail 93
+end
+bc_add_neg
+
+note NC6 (Lane 3): unproven admission (proofMask=5 and proofMask=3) refused with PK_ERR_PROOF
+pk_reset_builder
+bc_load_ir1
+pk_set_req EXEC_SCALAR_SIMD 0 8 0 0 FEAT_FMA
+if ne pk_pack PK_OK
+ret bc_fail 94
+end
+if ne pk_realize_on_arrive TID_X925 tdGet TID_X925 TDF_FEAT 9999 5 PK_ERR_PROOF
+ret bc_fail 95
+end
+if ne pk_realize_on_arrive TID_X925 tdGet TID_X925 TDF_FEAT 9998 3 PK_ERR_PROOF
+ret bc_fail 96
+end
+bc_add_neg
+
+note NC7 (Lane 4): arboris_spec refuses proofMask=5, proofMask=3, and SMEM overflow (fabVer unchanged)
+v0 = get fabVer 0
+v1 = get fabVer 1
+ref0 = get as_refusals 0
+if ne as_specialize_slot 0 AS_KIND_GPU_GEMM 4 4096 4096 5 AS_ERR_PROOF_EGP3
+ret bc_fail 97
+end
+if ne as_specialize_slot 1 AS_KIND_CRYSTALLIZE 0 0 0 3 AS_ERR_PROOF_ANTIBODY
+ret bc_fail 98
+end
+if ne as_specialize_slot 0 AS_KIND_GPU_GEMM 8 4096 4096 7 AS_ERR_CONTRACT_SMEM
+ret bc_fail 99
+end
+if or ne get fabVer 0 v0 ne get fabVer 1 v1
+ret bc_fail 100
+end
+if ne get as_refusals 0 add ref0 3
+ret bc_fail 101
+end
+bc_add_neg
+
+note NC8 (Lane 4): Antibody #14 stall corruption trips as_verify_antibodies; restore recovers
+if not isCompileTestFn TID_SM121
+ret bc_fail 102
+end
+put isBuf 8 2
+if as_verify_antibodies
+ret bc_fail 103
+end
+if not isCompileTestFn TID_SM121
+ret bc_fail 104
+end
+if not as_verify_antibodies
+ret bc_fail 105
+end
+bc_add_neg
+bc_add_chk 17
+ret 0
+end
+
+note ---- Stage 6: Live `ng` CLI Subprocess Pipeline & CLI Negative Controls ----
+
+fn bc_spath suf view uchar * to void
+n = get bc_scl 0
+for i ulong n bound 2048
+put bc_pa i get bc_scp i
+end
+m = len suf
+for j ulong m bound 128
+put bc_pa add n j get suf j
+end
+put bc_pl 0 add n m
+end
+
+fn bc_wfile_io suf view uchar * n ulong mode int to bool
+bc_spath suf
+fd = fopen bc_pa 0 get bc_pl 0 577 mode
+if lt fd 0
+ret false
+end
+o = ulong 0
+while lt o n bound 131072
+k = write int fd bc_io o sub n o
+if le k 0
+r = fclose int fd
+ret false
+end
+o = add o ulong k
+end
+r = fclose int fd
+ret true
+end
+
+fn bc_rfile_io suf view uchar * to long
+bc_spath suf
+fd = fopen bc_pa 0 get bc_pl 0 0 0
+if lt fd 0
+ret long -1
+end
+n = ulong 0
+while lt n 131072 bound 2048
+k = read int fd bc_io n sub 131072 n
+if lt k 0
+r = fclose int fd
+ret long -1
+end
+if eq k 0
+r = fclose int fd
+ret long n
+end
+n = add n ulong k
+end
+r = fclose int fd
+ret long n
+end
+
+fn bc_rfile_io2 suf view uchar * to long
+bc_spath suf
+fd = fopen bc_pa 0 get bc_pl 0 0 0
+if lt fd 0
+ret long -1
+end
+n = ulong 0
+while lt n 131072 bound 2048
+k = read int fd bc_io2 n sub 131072 n
+if lt k 0
+r = fclose int fd
+ret long -1
+end
+if eq k 0
+r = fclose int fd
+ret long n
+end
+n = add n ulong k
+end
+r = fclose int fd
+ret long n
+end
+
+fn bc_write_in_hdr hdr view uchar * payLen ulong useIo2 bool to bool
+bc_spath bc_fn_in
+fd = fopen bc_pa 0 get bc_pl 0 577 420
+if lt fd 0
+ret false
+end
+k = write int fd hdr 0 len hdr
+if ne k long len hdr
+r = fclose int fd
+ret false
+end
+o = ulong 0
+while lt o payLen bound 131072
+if useIo2
+k = write int fd bc_io2 o sub payLen o
+else
+k = write int fd bc_io o sub payLen o
+end
+if le k 0
+r = fclose int fd
+ret false
+end
+o = add o ulong k
+end
+r = fclose int fd
+ret true
+end
+
+fn bc_write_in_text hdr view uchar * body view uchar * to bool
+bc_spath bc_fn_in
+fd = fopen bc_pa 0 get bc_pl 0 577 420
+if lt fd 0
+ret false
+end
+k1 = write int fd hdr 0 len hdr
+k2 = write int fd body 0 len body
+r = fclose int fd
+ret and eq k1 long len hdr eq k2 long len body
+end
+
+fn bc_exec_prog useNg bool to ulong
+put bc_av 0 1
+put bc_av 1 0
+if useNg
+n = get bc_ngl 0
+put bc_av 2 uchar and n 255
+put bc_av 3 uchar shr n 8
+for i ulong n bound 2048
+put bc_av add 4 i get bc_ngp i
+end
+put bc_an 0 add 4 n
+else
+bc_spath bc_fn_elf
+n = get bc_pl 0
+put bc_av 2 uchar and n 255
+put bc_av 3 uchar shr n 8
+for i ulong n bound 4096
+put bc_av add 4 i get bc_pa i
+end
+put bc_an 0 add 4 n
+end
+bc_spath bc_fn_in
+fi = fopen bc_pa 0 get bc_pl 0 0 0
+bc_spath bc_fn_out
+fo = fopen bc_pa 0 get bc_pl 0 577 493
+bc_spath bc_fn_err
+fe = fopen bc_pa 0 get bc_pl 0 577 420
+if or lt fi 0 or lt fo 0 lt fe 0
+ret 255
+end
+pid = fork
+if lt pid 0
+ret 254
+end
+if eq pid 0
+r = dupfd int fi 0 0
+r = dupfd int fo 1 0
+r = dupfd int fe 2 0
+r = execprog bc_av 0 get bc_an 0
+exit 127
+end
+r = fclose int fi
+r = fclose int fo
+r = fclose int fe
+w = waitpid int pid bc_st 0 4 0
+if ne w pid
+ret 253
+end
+if ne get bc_st 0 0
+ret add 256 ulong get bc_st 0
+end
+ret ulong get bc_st 1
+end
+
+fn bc_io_starts pfx view uchar * n ulong to bool
+m = len pfx
+if lt n m
+ret false
+end
+for i ulong m bound 64
+if ne get bc_io i get pfx i
+ret false
+end
+end
+ret true
+end
+
+fn bc_cli_existing to int
+note 1. @ng front-check on prog.om -> exit 0
+if not bc_write_in_text bc_hdr_fc bc_prog_om
+ret bc_fail 110
+end
+if ne bc_exec_prog true 0
+ret bc_fail 111
+end
+note 2. @ng front-ir on prog.om -> exit 0, valid OSC1IR saved to /prog.ir
+if not bc_write_in_text bc_hdr_fi bc_prog_om
+ret bc_fail 112
+end
+if ne bc_exec_prog true 0
+ret bc_fail 113
+end
+irn = bc_rfile_io bc_fn_out
+if lt irn 24
+ret bc_fail 114
+end
+if or ne get bc_io 0 79 ne get bc_io 1 83
+ret bc_fail 115
+end
+if not bc_wfile_io bc_fn_ir ulong irn 420
+ret bc_fail 116
+end
+note 3. @ng ir-copy on /prog.ir -> exit 0, byte-for-byte identical!
+irn2 = bc_rfile_io2 bc_fn_ir
+if not bc_write_in_hdr bc_hdr_ic ulong irn2 true
+ret bc_fail 117
+end
+if ne bc_exec_prog true 0
+ret bc_fail 118
+end
+cn = bc_rfile_io bc_fn_out
+if ne cn irn2
+ret bc_fail 119
+end
+for i ulong ulong cn bound 131072
+if ne get bc_io i get bc_io2 i
+ret bc_fail 120
+end
+end
+note 4. @ng opt & @ng opt-count on /prog.ir -> exit 0
+if not bc_write_in_hdr bc_hdr_op ulong irn2 true
+ret bc_fail 121
+end
+if ne bc_exec_prog true 0
+ret bc_fail 122
+end
+if not bc_write_in_hdr bc_hdr_oc ulong irn2 true
+ret bc_fail 123
+end
+if ne bc_exec_prog true 0
+ret bc_fail 124
+end
+ocn = bc_rfile_io bc_fn_out
+if lt ocn 4
+ret bc_fail 125
+end
+if not bc_io_starts bc_pfx_opt ulong ocn
+ret bc_fail 126
+end
+note 5. @ng a64 on /prog.ir -> valid AArch64 ELF -> execute -> exit 59!
+if not bc_write_in_hdr bc_hdr_a6 ulong irn2 true
+ret bc_fail 127
+end
+if ne bc_exec_prog true 0
+ret bc_fail 128
+end
+en = bc_rfile_io bc_fn_out
+if lt en 64
+ret bc_fail 129
+end
+if or ne get bc_io 0 127 ne get bc_io 1 69
+ret bc_fail 130
+end
+if not bc_wfile_io bc_fn_elf ulong en 493
+ret bc_fail 131
+end
+if ne bc_exec_prog false 59
+ret bc_fail 132
+end
+put bc_cli_chk 0 add get bc_cli_chk 0 6
+ret 0
+end
+
+fn bc_cli_new_modes to int
+irn = bc_rfile_io2 bc_fn_ir
+if lt irn 24
+ret bc_fail 135
+end
+note 6. @ng egraph on /prog.ir -> exit 0, valid EGP3 bundle with certs >= 1
+if not bc_write_in_hdr bc_hdr_eg ulong irn true
+ret bc_fail 136
+end
+if ne bc_exec_prog true 0
+ret bc_fail 137
+end
+egn = bc_rfile_io bc_fn_out
+if lt egn 36
+ret bc_fail 138
+end
+if or ne get bc_io 0 69 ne get bc_io 3 51
+ret bc_fail 139
+end
+if eq get bc_io 4 0
+ret bc_fail 140
+end
+if not bc_wfile_io bc_fn_eg ulong egn 420
+ret bc_fail 141
+end
+note 7. @ng verify on /prog.egp3 -> exit 0, stdout starts with NG-VERIFY PASS
+egn2 = bc_rfile_io2 bc_fn_eg
+if not bc_write_in_hdr bc_hdr_vr ulong egn2 true
+ret bc_fail 142
+end
+if ne bc_exec_prog true 0
+ret bc_fail 143
+end
+vn = bc_rfile_io bc_fn_out
+if lt vn 14
+ret bc_fail 144
+end
+if not bc_io_starts bc_pfx_ver ulong vn
+ret bc_fail 145
+end
+note 8. @ng pack on /prog.ir -> exit 0, valid OMPK v1 package
+irn = bc_rfile_io2 bc_fn_ir
+if lt irn 24
+ret bc_fail 146
+end
+if not bc_write_in_hdr bc_hdr_pk ulong irn true
+ret bc_fail 146
+end
+if ne bc_exec_prog true 0
+ret bc_fail 147
+end
+pkn = bc_rfile_io bc_fn_out
+if lt pkn 152
+ret bc_fail 148
+end
+if or ne get bc_io 0 79 ne get bc_io 3 75
+ret bc_fail 149
+end
+if not bc_wfile_io bc_fn_pk ulong pkn 420
+ret bc_fail 150
+end
+note 9. @ng realize on /prog.ompk -> exit 0, stdout starts with NG-REALIZE PASS
+pkn2 = bc_rfile_io2 bc_fn_pk
+if not bc_write_in_hdr bc_hdr_rl ulong pkn2 true
+ret bc_fail 151
+end
+if ne bc_exec_prog true 0
+ret bc_fail 152
+end
+rn = bc_rfile_io bc_fn_out
+if lt rn 15
+ret bc_fail 153
+end
+if not bc_io_starts bc_pfx_rlz ulong rn
+ret bc_fail 154
+end
+put bc_cli_chk 0 add get bc_cli_chk 0 4
+ret 0
+end
+
+fn bc_cli_negatives to int
+note CLI Neg 1: corrupt byte in /prog.egp3 -> @ng verify MUST exit nonzero!
+egn = bc_rfile_io2 bc_fn_eg
+if lt egn 36
+ret bc_fail 160
+end
+put bc_io2 sub ulong egn 12 uchar 99
+if not bc_write_in_hdr bc_hdr_vr ulong egn true
+ret bc_fail 161
+end
+if eq bc_exec_prog true 0
+ret bc_fail 162
+end
+put bc_cli_neg 0 add get bc_cli_neg 0 1
+
+note CLI Neg 2: corrupt 1 bit in /prog.ompk payload -> @ng realize MUST exit 13 (PK_ERR_DIGEST)!
+pkn = bc_rfile_io2 bc_fn_pk
+if lt pkn 152
+ret bc_fail 163
+end
+last = sub ulong pkn 1
+put bc_io2 last xor get bc_io2 last uchar 1
+if not bc_write_in_hdr bc_hdr_rl ulong pkn true
+ret bc_fail 164
+end
+if ne bc_exec_prog true 13
+ret bc_fail 165
+end
+put bc_cli_neg 0 add get bc_cli_neg 0 1
+
+note CLI Neg 3: valid CPU /prog.ompk targeting sm121 -> @ng realize sm121 MUST exit 1 (TDK_ERR_EXEC)!
+pkn = bc_rfile_io2 bc_fn_pk
+if not bc_write_in_hdr bc_hdr_rls ulong pkn true
+ret bc_fail 166
+end
+if ne bc_exec_prog true 1
+ret bc_fail 167
+end
+put bc_cli_neg 0 add get bc_cli_neg 0 1
+
+note CLI Neg 4: unknown mode -> MUST exit 2!
+if not bc_write_in_text bc_hdr_bad bc_prog_om
+ret bc_fail 168
+end
+if ne bc_exec_prog true 2
+ret bc_fail 169
+end
+put bc_cli_neg 0 add get bc_cli_neg 0 1
+ret 0
+end
+
+fn bc_stage6_cli to int
+nl = argread 1 bc_ngp 0 2047
+sl = argread 2 bc_scp 0 2047
+if or lt nl 1 lt sl 1
+ret bc_fail 109
+end
+put bc_ngl 0 ulong nl
+put bc_scl 0 ulong sl
+r = makedir bc_scp 0 ulong sl 493
+rc = bc_cli_existing
+if ne rc 0
+ret rc
+end
+rc = bc_cli_new_modes
+if ne rc 0
+ret rc
+end
+ret bc_cli_negatives
+end
+
+fn main to int
+ar_init
+tdInitAll
+put bc_chk 0 0
+put bc_neg 0 0
+put bc_cli_chk 0 0
+put bc_cli_neg 0 0
+bc_wrt bc_m_hdr
+
+rc = bc_stage1_egraph
+if ne rc 0
+ret rc
+end
+rc = bc_stage2_verify
+if ne rc 0
+ret rc
+end
+rc = bc_stage3_pack
+if ne rc 0
+ret rc
+end
+rc = bc_stage4_live
+if ne rc 0
+ret rc
+end
+rc = bc_neg_1_to_4
+if ne rc 0
+ret rc
+end
+rc = bc_neg_5_to_8
+if ne rc 0
+ret rc
+end
+if ne get bc_neg 0 8
+ret bc_fail 108
+end
+
+if ge argcnt 3
+rc = bc_stage6_cli
+if ne rc 0
+ret rc
+end
+end
+
+bc_wrt bc_m_pass
+bc_num get bc_chk 0
+bc_wrt bc_m_neg
+bc_num get bc_neg 0
+bc_wrt bc_m_certs
+bc_num get eg3_certs 0
+bc_wrt bc_m_swaps
+bc_num get as_swaps 0
+bc_wrt bc_m_rb
+bc_num get as_rollbacks 0
+bc_wrt bc_m_cli
+bc_num get bc_cli_chk 0
+bc_wrt bc_m_cneg
+bc_num get bc_cli_neg 0
+bc_wrt bc_m_nl
+ret 0
+end

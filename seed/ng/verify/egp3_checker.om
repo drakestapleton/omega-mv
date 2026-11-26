@@ -1,0 +1,773 @@
+note SPDX-License-Identifier: Apache-2.0
+note seed/ng/verify/egp3_checker.om: Standalone EGP3 Structural Proof Checker Library Unit.
+note ZERO code shared with seed/ng/egraph/ or seed/ng/src/ir.om.
+note Pure OM-1 compatible with OM-2 (no om2 line, no fn main, all symbols prefixed vc3_).
+note
+note Mirrors seed/helix/proofs/NgEGraphIR.lean (opcodes 1..11, rules 1..18, 32-bit and 64-bit).
+note
+note EGP3 binary format:
+note   Header (8 bytes):
+note     [0..3]  magic "EGP3" (69, 71, 80, 51)
+note     [4..7]  u32 LE cert_count
+note   Per cert (header 28 bytes):
+note     [+0..+3]   u32 LE fn_idx
+note     [+4..+7]   u32 LE blk_idx
+note     [+8..+11]  u32 LE width_bits (32 or 64)
+note     [+12..+15] u32 LE node_count (N, 1..4096)
+note     [+16..+19] u32 LE root_before (< N)
+note     [+20..+23] u32 LE root_after (< N)
+note     [+24..+27] u32 LE trace_count (T, 0..8192)
+note   N nodes * 32 bytes each (8 * u32 LE):
+note     (op, a, b, c, val_lo, val_hi, width, flags)
+note     Opcodes: 1=CONST 2=SSA_VAL 3=ADD 4=SUB 5=MUL 6=FMA 7=SHL 8=SHR 9=AND 10=OR 11=XOR
+note   T trace steps * 12 bytes each (3 * u32 LE):
+note     (rule_id, lhs_node, rhs_node)
+note
+note Rules 1..18:
+note   1:  add(mul(a,b), c) = fma(a,b,c)
+note   2:  add(c, mul(a,b)) = fma(a,b,c)
+note   3:  add(x, 0) = x
+note   4:  add(0, x) = x
+note   5:  mul(x, 1) = x
+note   6:  mul(x, 0) = 0
+note   7:  add(x, y) = add(y, x)
+note   8:  mul(x, y) = mul(y, x)
+note   9:  add(add(x,y), z) = add(x, add(y,z))
+note   10: mul(mul(x,y), z) = mul(x, mul(y,z))
+note   11: and(x, x) = x
+note   12: fma(a, b, 0) = mul(a, b)
+note   13: sub(x, 0) = x
+note   14: sub(x, x) = 0
+note   15: xor(x, x) = 0
+note   16: or(x, 0) = x
+note   17: shl(x, 0) = x
+note   18: mul(x, 1 <<< k) = shl(x, k) for k < width_bits
+note
+note Usage by caller:
+note   Populate vc3_buf[0..nbytes) and call vc3_verify nbytes.
+note   Returns 0 on PASS, nonzero failure code 1..11 on refusal (fail-closed).
+note   Summary stats in vc3_stat[0..5]:
+note     [0]=certs_ok [1]=steps_ok [2]=evals_ok [3]=fail_cert [4]=fail_detail [5]=fail_rule
+
+global vc3_buf uchar 1048576
+global vc3_par ulong 4096
+global vc3_rnk ulong 4096
+global vc3_op ulong 4096
+global vc3_a ulong 4096
+global vc3_b ulong 4096
+global vc3_c ulong 4096
+global vc3_val ulong 4096
+global vc3_vraw ulong 4096
+global vc3_wid ulong 4096
+global vc3_flg ulong 4096
+global vc3_evst ulong 4096
+global vc3_evvl ulong 4096
+global vc3_nc ulong 1
+global vc3_cw ulong 1
+global vc3_everr ulong 1
+global vc3_stat ulong 8
+
+fn vc3_rdu32 off ulong to ulong
+b0 = ulong get vc3_buf off
+b1 = shl ulong get vc3_buf add off 1 8
+b2 = shl ulong get vc3_buf add off 2 16
+b3 = shl ulong get vc3_buf add off 3 24
+ret or or b0 b1 or b2 b3
+end
+
+fn vc3_mask v ulong wid ulong to ulong
+if eq wid 32
+ret and v 4294967295
+end
+ret v
+end
+
+fn vc3_find x ulong to ulong
+cur = x
+for i ulong 64
+p = get vc3_par cur
+if eq p cur
+ret cur
+end
+gp = get vc3_par p
+put vc3_par cur gp
+cur = gp
+end
+ret cur
+end
+
+fn vc3_union u ulong v ulong to bool
+ru = vc3_find u
+rv = vc3_find v
+if eq ru rv
+ret false
+end
+ku = get vc3_rnk ru
+kv = get vc3_rnk rv
+if lt ku kv
+put vc3_par ru rv
+else
+if gt ku kv
+put vc3_par rv ru
+else
+put vc3_par rv ru
+put vc3_rnk ru add ku 1
+end
+end
+ret true
+end
+
+fn vc3_has_const id ulong want ulong to bool
+cid = vc3_find id
+n = get vc3_nc 0
+for i ulong n bound 4096
+if eq get vc3_op i 1
+if eq get vc3_val i want
+if eq vc3_find i cid
+ret true
+end
+end
+end
+end
+ret false
+end
+
+fn vc3_nodes_cong i ulong j ulong to bool
+op = get vc3_op i
+if ne op get vc3_op j
+ret false
+end
+if eq op 1
+ret eq get vc3_val i get vc3_val j
+end
+if eq op 2
+ret eq get vc3_vraw i get vc3_vraw j
+end
+if ne vc3_find get vc3_a i vc3_find get vc3_a j
+ret false
+end
+if ne vc3_find get vc3_b i vc3_find get vc3_b j
+ret false
+end
+if eq op 6
+ret eq vc3_find get vc3_c i vc3_find get vc3_c j
+end
+ret true
+end
+
+fn vc3_rebuild to void
+n = get vc3_nc 0
+chg = true
+while chg bound 16
+chg = false
+for i ulong n bound 4096
+j = add i 1
+while lt j n bound 4096
+if ne vc3_find i vc3_find j
+if vc3_nodes_cong i j
+if vc3_union i j
+chg = true
+end
+end
+end
+j = add j 1
+end
+end
+end
+end
+
+fn vc3_chk_fma u ulong v ulong comm bool to bool
+if ne get vc3_op u 3
+ret false
+end
+if ne get vc3_op v 6
+ret false
+end
+ms = get vc3_a u
+cs = get vc3_b u
+if comm
+ms = get vc3_b u
+cs = get vc3_a u
+end
+if ne vc3_find cs vc3_find get vc3_c v
+ret false
+end
+cm = vc3_find ms
+va = vc3_find get vc3_a v
+vb = vc3_find get vc3_b v
+n = get vc3_nc 0
+for j ulong n bound 4096
+if eq get vc3_op j 5
+if eq vc3_find j cm
+if eq vc3_find get vc3_a j va
+if eq vc3_find get vc3_b j vb
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+fn vc3_chk_comm u ulong v ulong want_op ulong to bool
+if ne get vc3_op u want_op
+ret false
+end
+if ne get vc3_op v want_op
+ret false
+end
+if ne vc3_find get vc3_a u vc3_find get vc3_b v
+ret false
+end
+ret eq vc3_find get vc3_b u vc3_find get vc3_a v
+end
+
+fn vc3_chk_assoc_inner j ulong v ulong u ulong want_op ulong to bool
+cx = vc3_find get vc3_a v
+if ne vc3_find get vc3_a j cx
+ret false
+end
+cy = vc3_find get vc3_b j
+cz = vc3_find get vc3_b u
+ck = vc3_find get vc3_b v
+n = get vc3_nc 0
+for k ulong n bound 4096
+if eq get vc3_op k want_op
+if eq vc3_find k ck
+if eq vc3_find get vc3_a k cy
+if eq vc3_find get vc3_b k cz
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+fn vc3_chk_assoc u ulong v ulong want_op ulong to bool
+if ne get vc3_op u want_op
+ret false
+end
+if ne get vc3_op v want_op
+ret false
+end
+cj = vc3_find get vc3_a u
+n = get vc3_nc 0
+for j ulong n bound 4096
+if eq get vc3_op j want_op
+if eq vc3_find j cj
+if vc3_chk_assoc_inner j v u want_op
+ret true
+end
+end
+end
+end
+ret false
+end
+
+fn vc3_chk_fma_zero u ulong v ulong to bool
+if ne get vc3_op u 6
+ret false
+end
+if ne get vc3_op v 5
+ret false
+end
+if not vc3_has_const get vc3_c u 0
+ret false
+end
+if ne vc3_find get vc3_a u vc3_find get vc3_a v
+ret false
+end
+ret eq vc3_find get vc3_b u vc3_find get vc3_b v
+end
+
+fn vc3_chk_r18 u ulong v ulong wid ulong to bool
+if ne get vc3_op u 5
+ret false
+end
+if ne get vc3_op v 7
+ret false
+end
+if ne vc3_find get vc3_a u vc3_find get vc3_a v
+ret false
+end
+ck = vc3_find get vc3_b v
+n = get vc3_nc 0
+for j ulong n bound 4096
+if eq get vc3_op j 1
+if eq vc3_find j ck
+kr = get vc3_vraw j
+if lt kr wid
+p2 = shl ulong 1 kr
+if vc3_has_const get vc3_b u p2
+ret true
+end
+end
+end
+end
+end
+ret false
+end
+
+fn vc3_chk_bin_id u ulong v ulong want_op ulong want_c ulong to bool
+if ne get vc3_op u want_op
+ret false
+end
+if not vc3_has_const get vc3_b u want_c
+ret false
+end
+ret eq vc3_find v vc3_find get vc3_a u
+end
+
+fn vc3_chk_self_zero u ulong v ulong want_op ulong to bool
+if ne get vc3_op u want_op
+ret false
+end
+if ne vc3_find get vc3_a u vc3_find get vc3_b u
+ret false
+end
+ret vc3_has_const v 0
+end
+
+fn vc3_chk_r1_10 rule ulong u ulong v ulong to bool
+if eq rule 1
+ret vc3_chk_fma u v false
+end
+if eq rule 2
+ret vc3_chk_fma u v true
+end
+if eq rule 3
+ret vc3_chk_bin_id u v 3 0
+end
+if eq rule 4
+if ne get vc3_op u 3
+ret false
+end
+if not vc3_has_const get vc3_a u 0
+ret false
+end
+ret eq vc3_find v vc3_find get vc3_b u
+end
+if eq rule 5
+ret vc3_chk_bin_id u v 5 1
+end
+if eq rule 6
+if ne get vc3_op u 5
+ret false
+end
+if not vc3_has_const get vc3_b u 0
+ret false
+end
+ret vc3_has_const v 0
+end
+if eq rule 7
+ret vc3_chk_comm u v 3
+end
+if eq rule 8
+ret vc3_chk_comm u v 5
+end
+if eq rule 9
+ret vc3_chk_assoc u v 3
+end
+if eq rule 10
+ret vc3_chk_assoc u v 5
+end
+ret false
+end
+
+fn vc3_chk_r11_18 rule ulong u ulong v ulong wid ulong to bool
+if eq rule 11
+if ne get vc3_op u 9
+ret false
+end
+if ne vc3_find get vc3_a u vc3_find get vc3_b u
+ret false
+end
+ret eq vc3_find v vc3_find get vc3_a u
+end
+if eq rule 12
+ret vc3_chk_fma_zero u v
+end
+if eq rule 13
+ret vc3_chk_bin_id u v 4 0
+end
+if eq rule 14
+ret vc3_chk_self_zero u v 4
+end
+if eq rule 15
+ret vc3_chk_self_zero u v 11
+end
+if eq rule 16
+ret vc3_chk_bin_id u v 10 0
+end
+if eq rule 17
+ret vc3_chk_bin_id u v 7 0
+end
+if eq rule 18
+ret vc3_chk_r18 u v wid
+end
+ret false
+end
+
+fn vc3_chk_dir rule ulong u ulong v ulong wid ulong to bool
+if le rule 10
+ret vc3_chk_r1_10 rule u v
+end
+ret vc3_chk_r11_18 rule u v wid
+end
+
+fn vc3_verify_step rule ulong u ulong v ulong to bool
+n = get vc3_nc 0
+if ge u n
+ret false
+end
+if ge v n
+ret false
+end
+if eq rule 0
+ret false
+end
+if gt rule 18
+ret false
+end
+wid = get vc3_cw 0
+if vc3_chk_dir rule u v wid
+ret true
+end
+if vc3_chk_dir rule v u wid
+ret true
+end
+vc3_rebuild
+if vc3_chk_dir rule u v wid
+ret true
+end
+ret vc3_chk_dir rule v u wid
+end
+
+fn vc3_env_val sid ulong env_t ulong wid ulong to ulong
+a = mul add sid 1 ulong 2654435761
+b = mul add env_t 1 ulong 6364136223846793005
+h = xor a b
+h = xor h shr h 17
+h = mul h ulong 1442695040888963407
+h = xor h add mul env_t 101 mul sid 31
+ret vc3_mask h wid
+end
+
+fn vc3_eval_bin op ulong va ulong vb ulong wid ulong to ulong
+if eq op 3
+ret vc3_mask add va vb wid
+end
+if eq op 4
+ret vc3_mask sub va vb wid
+end
+if eq op 5
+ret vc3_mask mul va vb wid
+end
+if eq op 7
+sh = and vb sub wid 1
+ret vc3_mask shl va sh wid
+end
+if eq op 8
+sh = and vb sub wid 1
+ret shr vc3_mask va wid sh
+end
+if eq op 9
+ret vc3_mask and va vb wid
+end
+if eq op 10
+ret vc3_mask or va vb wid
+end
+if eq op 11
+ret vc3_mask xor va vb wid
+end
+put vc3_everr 0 1
+ret 0
+end
+
+fn vc3_eval_node id ulong env_t ulong wid ulong depth ulong to ulong
+if ne get vc3_everr 0 0
+ret 0
+end
+if ge id get vc3_nc 0
+put vc3_everr 0 1
+ret 0
+end
+st = get vc3_evst id
+if eq st 2
+ret get vc3_evvl id
+end
+if eq st 1
+put vc3_everr 0 1
+ret 0
+end
+if gt depth 256
+put vc3_everr 0 1
+ret 0
+end
+put vc3_evst id 1
+op = get vc3_op id
+res = ulong 0
+if eq op 1
+res = vc3_mask get vc3_val id wid
+else
+if eq op 2
+res = vc3_env_val get vc3_vraw id env_t wid
+else
+nd = add depth 1
+va = vc3_eval_node get vc3_a id env_t wid nd
+vb = vc3_eval_node get vc3_b id env_t wid nd
+if eq op 6
+vc = vc3_eval_node get vc3_c id env_t wid nd
+res = vc3_mask add mul va vb vc wid
+else
+res = vc3_eval_bin op va vb wid
+end
+end
+end
+put vc3_evvl id res
+put vc3_evst id 2
+ret res
+end
+
+fn vc3_check_evals root_b ulong root_a ulong wid ulong to bool
+n = get vc3_nc 0
+for t ulong 4
+for i ulong n bound 4096
+put vc3_evst i 0
+end
+put vc3_everr 0 0
+v0 = vc3_eval_node root_b t wid 0
+v1 = vc3_eval_node root_a t wid 0
+if ne get vc3_everr 0 0
+ret false
+end
+if ne v0 v1
+ret false
+end
+end
+ret true
+end
+
+fn vc3_load_one i ulong p ulong nc ulong wid ulong to ulong
+op = vc3_rdu32 p
+if eq op 0
+ret 6
+end
+if gt op 11
+ret 6
+end
+nw = vc3_rdu32 add p 24
+if ne nw 0
+if ne nw wid
+ret 6
+end
+end
+put vc3_par i i
+put vc3_rnk i 0
+put vc3_op i op
+put vc3_wid i nw
+put vc3_flg i vc3_rdu32 add p 28
+na = vc3_rdu32 add p 4
+nb = vc3_rdu32 add p 8
+nc_op = vc3_rdu32 add p 12
+if gt op 2
+if ge na nc
+ret 6
+end
+if ge nb nc
+ret 6
+end
+if eq op 6
+if ge nc_op nc
+ret 6
+end
+end
+end
+put vc3_a i na
+put vc3_b i nb
+put vc3_c i nc_op
+vr = or vc3_rdu32 add p 16 shl vc3_rdu32 add p 20 32
+put vc3_vraw i vr
+put vc3_val i vc3_mask vr wid
+ret 0
+end
+
+fn vc3_load_nodes pos ulong nc ulong wid ulong to ulong
+p = pos
+for i ulong nc bound 4096
+ec = vc3_load_one i p nc wid
+if ne ec 0
+ret ec
+end
+p = add p 32
+end
+ret 0
+end
+
+fn vc3_replay_trace pos ulong nt ulong to ulong
+p = pos
+for s ulong nt bound 8192
+ru = vc3_rdu32 p
+lu = vc3_rdu32 add p 4
+rv = vc3_rdu32 add p 8
+if eq ru 0
+put vc3_stat 4 s
+put vc3_stat 5 ru
+ret 8
+end
+if gt ru 18
+put vc3_stat 4 s
+put vc3_stat 5 ru
+ret 8
+end
+n = get vc3_nc 0
+if ge lu n
+put vc3_stat 4 s
+put vc3_stat 5 ru
+ret 8
+end
+if ge rv n
+put vc3_stat 4 s
+put vc3_stat 5 ru
+ret 8
+end
+if not vc3_verify_step ru lu rv
+put vc3_stat 4 s
+put vc3_stat 5 ru
+ret 9
+end
+ign = vc3_union lu rv
+p = add p 12
+end
+ret 0
+end
+
+fn vc3_verify_cert pos ulong nbytes ulong ci ulong to long
+if gt 28 sub nbytes pos
+put vc3_stat 3 ci
+put vc3_stat 4 1
+ret long -4
+end
+wid = vc3_rdu32 add pos 8
+nc = vc3_rdu32 add pos 12
+if ne wid 32
+if ne wid 64
+put vc3_stat 3 ci
+put vc3_stat 4 wid
+ret long -4
+end
+end
+if eq nc 0
+put vc3_stat 3 ci
+put vc3_stat 4 nc
+ret long -5
+end
+if gt nc 4096
+put vc3_stat 3 ci
+put vc3_stat 4 nc
+ret long -5
+end
+root_b = vc3_rdu32 add pos 16
+root_a = vc3_rdu32 add pos 20
+nt = vc3_rdu32 add pos 24
+if ge root_b nc
+put vc3_stat 3 ci
+put vc3_stat 4 root_b
+ret long -5
+end
+if ge root_a nc
+put vc3_stat 3 ci
+put vc3_stat 4 root_a
+ret long -5
+end
+if gt nt 8192
+put vc3_stat 3 ci
+put vc3_stat 4 nt
+ret long -5
+end
+put vc3_nc 0 nc
+put vc3_cw 0 wid
+p = add pos 28
+if gt mul nc 32 sub nbytes p
+put vc3_stat 3 ci
+put vc3_stat 4 2
+ret long -6
+end
+ec = vc3_load_nodes p nc wid
+if ne ec 0
+put vc3_stat 3 ci
+put vc3_stat 4 ec
+ret long -6
+end
+p = add p mul nc 32
+if gt mul nt 12 sub nbytes p
+put vc3_stat 3 ci
+put vc3_stat 4 3
+ret long -7
+end
+vc3_rebuild
+ec = vc3_replay_trace p nt
+if ne ec 0
+put vc3_stat 3 ci
+ret neg long ec
+end
+p = add p mul nt 12
+vc3_rebuild
+if ne vc3_find root_b vc3_find root_a
+put vc3_stat 3 ci
+put vc3_stat 4 4
+ret long -10
+end
+if not vc3_check_evals root_b root_a wid
+put vc3_stat 3 ci
+put vc3_stat 4 5
+ret long -11
+end
+put vc3_stat 1 add get vc3_stat 1 nt
+put vc3_stat 2 add get vc3_stat 2 4
+ret long p
+end
+
+fn vc3_verify nbytes ulong to ulong
+for i ulong 8
+put vc3_stat i 0
+end
+if gt nbytes 1048576
+ret 1
+end
+if lt nbytes 8
+ret 1
+end
+if ne get vc3_buf 0 69
+ret 2
+end
+if ne get vc3_buf 1 71
+ret 2
+end
+if ne get vc3_buf 2 80
+ret 2
+end
+if ne get vc3_buf 3 51
+ret 2
+end
+cc = vc3_rdu32 4
+if gt cc 4096
+ret 3
+end
+pos = ulong 8
+for ci ulong cc bound 4096
+nxt = vc3_verify_cert pos nbytes ci
+if lt nxt 0
+ret ulong neg nxt
+end
+pos = ulong nxt
+end
+if ne pos nbytes
+ret 3
+end
+put vc3_stat 0 cc
+ret 0
+end
